@@ -60,6 +60,10 @@ _feats=""
 [ -n "${UNAOS_BOOTLOG:-}" ] && _feats="${_feats}bootlog,"
 [ -n "${UNAOS_PI:-}" ] && _feats="${_feats}pi,"
 [ -n "${UNAOS_USBDEBUG:-}" ] && _feats="${_feats}usbdebug,"
+# MT-INVESTIGATION (IVY): arm the Wellspring raw-multitouch mode probe on the EHCI trackpad path
+# (attended 2012 rMBP bench only — QEMU cannot produce Wellspring frames). Knob-off is
+# byte-identical: the whole probe is `#[cfg(feature = "mtraw")]`-compiled out.
+[ -n "${UNAOS_MTRAW:-}" ] && _feats="${_feats}mtraw,"
 [ -n "${UNAOS_SCHED_DEMO:-}" ] && _feats="${_feats}sched_demo,"
 # STOR-1: route x86 storage syscalls through the interrupt-driven storage service task (opt-in;
 # metal-pending). x86_64 only — a no-op on the aarch64 media below.

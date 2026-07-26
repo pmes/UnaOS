@@ -57,6 +57,13 @@ sched_demo = []
 # print each input event, so external USB storage/keyboard/mouse enumeration AND live keypresses /
 # mouse deltas are visible and photographable on metal. Enable via `UNAOS_USBDEBUG=1`.
 usbdebug = []
+# MT-INVESTIGATION (IVY): attended-bench-only probe for the Apple Wellspring trackpad's RAW
+# (multitouch) sensor mode on the EHCI path. Runs the documented normal->pause->raw mode-switch
+# sequence, hex-dumps the first few reports the endpoint then delivers, and restores the known-good
+# pointer mode so the trackpad keeps working. Enable via `UNAOS_MTRAW=1`. Default OFF: the whole
+# probe is `#[cfg]`-compiled out, so knob-off media are byte-identical. QEMU cannot produce
+# Wellspring frames — this knob is only meaningful on the 2012 rMBP bench.
+mtraw = []
 # STOR-1: interrupt-driven x86 storage — route each storage syscall through a scheduled kernel
 # "storage service task" that owns the xHCI BOT pump and blocks the submitter on a completion,
 # retiring the staged-buffer family (U6bx staged read / U9x flush queue / U10x op-queue) in favour

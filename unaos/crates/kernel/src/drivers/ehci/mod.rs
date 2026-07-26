@@ -191,6 +191,14 @@ pub struct Controller {
     /// hot-plug rescan in this arc, exhaustion is unreachable in practice and traced if hit.
     next_addr: u8,
     int_eps: Vec<IntEp>,
+    /// MT-INVESTIGATION (IVY, `mtraw` knob only): the trackpad target the raw-mode probe armed,
+    /// remembered so the service loop can restore the known-good pointer mode over EP0 once the
+    /// capture window closes. `None` until the probe runs, and again after the restore.
+    #[cfg(feature = "mtraw")]
+    mt_probe: Option<(Target, u8)>,
+    /// MT-INVESTIGATION: reports hex-dumped so far in the raw capture window.
+    #[cfg(feature = "mtraw")]
+    mt_dumped: u32,
 }
 
 // Raw pointers to identity-mapped DMA memory; access is serialized by the EHCI_HID mutex.
@@ -1000,8 +1008,16 @@ impl Controller {
         // switch is gated on `vendor_mt` (Report ID 0x44 + vendor page 0xFF00) — QEMU's usb-tablet
         // is a standard absolute pointer, never `vendor_mt`, so QEMU never takes this path. A
         // STALL/timeout on any stage is non-fatal (traced, then arm regardless).
+        //
+        // MT-INVESTIGATION (IVY): the `mtraw` knob swaps this ONE call for the raw-mode probe. The
+        // swap lives here rather than inside `bcm5974_mode_switch` so that knob-off the switch
+        // function keeps its exact name and body — default media stay byte-identical, symbols
+        // included, which a build-hash comparison of both trees confirmed.
         if layout.vendor_mt {
+            #[cfg(not(feature = "mtraw"))]
             self.bcm5974_mode_switch(t, intf);
+            #[cfg(feature = "mtraw")]
+            self.bcm5974_mt_raw_probe(t, intf);
         }
         self.arm_interrupt_ep(t, ep, mps.min(64), false, false, Some(layout));
         // GUI-WITNESS: the report-protocol pointer (the rMBP trackpad, incl. the Apple
@@ -1042,6 +1058,11 @@ impl Controller {
     /// streams needs no switch, so a failed handshake must not un-arm the endpoint — we trace and
     /// let the caller arm regardless. Only ever called on a recognised `vendor_mt` interface, so
     /// QEMU (whose usb-tablet is a standard absolute pointer) never reaches this code.
+    ///
+    /// MT-INVESTIGATION (IVY): this is also the state the `mtraw` raw-mode probe RESTORES to when
+    /// its capture window closes. The probe is selected at the CALL SITE (a `#[cfg]` pair there),
+    /// deliberately — so that knob-off this function's name and body stay verbatim what they were
+    /// and default media are byte-identical, symbol names included.
     unsafe fn bcm5974_mode_switch(&mut self, t: &Target, intf: u8) {
         // Stage 1 — read the current feature report.
         let read = self.control(
@@ -1084,6 +1105,110 @@ impl Controller {
                 ":: EHCI-HID: [{}] M1 bcm5974 SET_REPORT(feature) addr={} intf={} FAILED ({}) — endpoint armed, stream may stay silent ::",
                 self.idx, t.addr, intf, e
             ),
+        }
+    }
+
+    /// MT-INVESTIGATION (IVY) — write ONE value into byte 0 of the 8-byte mode feature report and
+    /// read it straight back. Returns the readback byte, or `None` if either leg failed.
+    ///
+    /// The read-pause-write ordering is the protocol fact taken from FreeBSD wsp.c (BSD-2-Clause;
+    /// see the PROVENANCE block on `BCM5974_MODE_NORMAL`): the current report is fetched, a pause
+    /// is taken, and only then is the modified report written. wsp pauses for a quarter second; we
+    /// use a much shorter settle because our control path is synchronous and already-completed by
+    /// the time it returns — the point of the pause is that the write must not race the read's
+    /// completion, which our blocking `control` already guarantees, so this is belt-and-braces.
+    #[cfg(feature = "mtraw")]
+    unsafe fn bcm5974_mode_write(&mut self, t: &Target, val: u8) -> Option<u8> {
+        // Read-modify-write: fetch the live report so the seven bytes we do NOT own are preserved.
+        let read_ok = self
+            .control(
+                t, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_VALUE, BCM5974_MODE_REQ_INDEX,
+                BCM5974_MODE_LEN, true,
+            )
+            .is_ok();
+        if !read_ok {
+            for k in 0..BCM5974_MODE_LEN as usize {
+                self.data_buf.add(k).write(0);
+            }
+        }
+        ehci_scout::settle_ms(5); // wsp-documented: pause between reading and writing the mode
+        self.data_buf.write(val);
+        if self
+            .control(
+                t, 0x21, BCM5974_MODE_WRITE_REQ, BCM5974_MODE_REQ_VALUE, BCM5974_MODE_REQ_INDEX,
+                BCM5974_MODE_LEN, false,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        ehci_scout::settle_ms(5);
+        // Read back so the witness records what the DEVICE thinks its mode is, not what we asked.
+        match self.control(
+            t, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_VALUE, BCM5974_MODE_REQ_INDEX,
+            BCM5974_MODE_LEN, true,
+        ) {
+            Ok(got) if got > 0 => Some(*self.data_buf),
+            _ => None,
+        }
+    }
+
+    /// MT-INVESTIGATION (IVY) — attempt the documented RAW (multitouch sensor) mode and open a
+    /// bounded capture window on whatever the endpoint then streams.
+    ///
+    /// Sequence (all four steps are wsp.c protocol facts, not copied code):
+    ///   1. write the NORMAL/HID selector 0x08 — wsp sets the OFF value first, unconditionally;
+    ///   2. pause;
+    ///   3. write the RAW selector 0x01 and read the mode byte back;
+    ///   4. arm the service loop to hex-dump the first `MT_RAW_DUMP_MAX` reports, after which it
+    ///      restores the known-good pointer mode so the trackpad keeps working for the rest of the
+    ///      sitting.
+    ///
+    /// Failure is NON-FATAL throughout: if either write stalls we log it and restore pointer mode
+    /// immediately, exactly as the default path tolerates a failed handshake.
+    #[cfg(feature = "mtraw")]
+    unsafe fn bcm5974_mt_raw_probe(&mut self, t: &Target, intf: u8) {
+        let off = self.bcm5974_mode_write(t, BCM5974_MODE_NORMAL);
+        serial_println!(
+            ":: EHCI-MT: [{}] mode-try val={:#04x} readback={} addr={} intf={} (step 1/2: normal) == witness ::",
+            self.idx, BCM5974_MODE_NORMAL,
+            match off { Some(v) => v, None => 0xFF }, t.addr, intf
+        );
+        ehci_scout::settle_ms(50); // wsp takes a long pause between the OFF and ON writes
+        let on = self.bcm5974_mode_write(t, BCM5974_MODE_VENDOR);
+        serial_println!(
+            ":: EHCI-MT: [{}] mode-try val={:#04x} readback={} addr={} intf={} (step 2/2: raw sensor) == witness ::",
+            self.idx, BCM5974_MODE_VENDOR,
+            match on { Some(v) => v, None => 0xFF }, t.addr, intf
+        );
+        match on {
+            Some(_) => {
+                // Capture window open — the service loop dumps and then restores.
+                self.mt_probe = Some((*t, intf));
+                self.mt_dumped = 0;
+            }
+            None => {
+                serial_println!(
+                    ":: EHCI-MT: [{}] raw mode-set FAILED — restoring pointer mode immediately ::",
+                    self.idx
+                );
+                self.bcm5974_mode_switch(t, intf);
+                serial_println!(":: EHCI-MT: [{}] mode-restored == witness ::", self.idx);
+            }
+        }
+    }
+
+    /// MT-INVESTIGATION (IVY) — close the capture window: put the pad back into the mode whose
+    /// 8-byte relative stream the landed pointer path decodes. Called from the service loop AFTER
+    /// its endpoint iteration has finished, so no endpoint borrow is live across the EP0 traffic.
+    #[cfg(feature = "mtraw")]
+    unsafe fn bcm5974_mt_restore(&mut self) {
+        if let Some((t, intf)) = self.mt_probe.take() {
+            self.bcm5974_mode_switch(&t, intf);
+            serial_println!(
+                ":: EHCI-MT: [{}] mode-restored addr={} intf={} after {} raw report(s) == witness ::",
+                self.idx, t.addr, intf, self.mt_dumped
+            );
         }
     }
 
@@ -1216,6 +1341,10 @@ impl Controller {
         }
         let idx = self.idx;
         let om = self.overlay_mode;
+        // MT-INVESTIGATION (IVY): local mirror of the capture-window counter, so the endpoint
+        // iteration below keeps its exclusive borrow of `int_eps` (the EP0 restore runs after).
+        #[cfg(feature = "mtraw")]
+        let mut mt_dumped = if self.mt_probe.is_some() { Some(self.mt_dumped) } else { None };
         for e in self.int_eps.iter_mut() {
             if e.dead {
                 continue;
@@ -1255,6 +1384,21 @@ impl Controller {
                         #[cfg(feature = "usbdebug")]
                         if e.reports <= 4 {
                             dump_vendor_report(idx, e.reports, report);
+                        }
+                        // MT-INVESTIGATION (IVY, `mtraw` only): the capture window. Hex-dump at
+                        // most `MT_RAW_DUMP_MAX` reports of at most `MT_RAW_DUMP_BYTES` bytes each
+                        // — bounded twice over, because the FTDI console is a 64 KiB drop-oldest
+                        // ring and an unbounded dump evicts the boot log that gives it context.
+                        // The pointer decode below still runs on these reports: if the raw mode
+                        // never engaged they are ordinary 0x02 relative reports and the cursor
+                        // keeps moving; if it DID engage, `decode_trackpad_rel`'s length + ID gate
+                        // rejects them and nothing is pushed. Either way no clamp is weakened.
+                        #[cfg(feature = "mtraw")]
+                        if let Some(n) = mt_dumped.as_mut() {
+                            if *n < MT_RAW_DUMP_MAX {
+                                *n += 1;
+                                dump_raw_report(idx, *n, &report[..report.len().min(MT_RAW_DUMP_BYTES)]);
+                            }
                         }
                         // M2 (RMBP-FIX silicon retarget): after the bcm5974 mode switch the internal
                         // trackpad does NOT stream the descriptor's opaque 0x44 / 511-byte multitouch
@@ -1365,6 +1509,16 @@ impl Controller {
                 core::ptr::write_volatile(&mut (*e.qh).overlay[0], e.qtd_phys as u32);
             }
         }
+        // MT-INVESTIGATION (IVY): the endpoint borrow is released here, so the EP0 restore is safe
+        // to run. Close the capture window as soon as it is full — the pad goes back to the mode
+        // the landed pointer path decodes, and the probe never fires again this boot.
+        #[cfg(feature = "mtraw")]
+        if let Some(n) = mt_dumped {
+            self.mt_dumped = n;
+            if n >= MT_RAW_DUMP_MAX {
+                self.bcm5974_mt_restore();
+            }
+        }
     }
 }
 
@@ -1436,6 +1590,40 @@ const BCM5974_MODE_REQ_INDEX: u16 = 0x0000; // wIndex: bcm5974 REQUEST_INDEX (NO
 const BCM5974_MODE_LEN: u16 = 8; // feature report length
 const BCM5974_MODE_VENDOR: u8 = 0x01; // byte 0 = raw multitouch (wellspring) mode
                                       // (0x08 would be the NORMAL single-touch compatibility mode)
+
+// MT-INVESTIGATION (IVY, 2026-07-25) — the NORMAL/HID-mode selector, and the ordered switch
+// sequence the raw probe below uses.
+//
+// PROVENANCE (cleanroom): FreeBSD `sys/dev/usb/input/wsp.c`, the Wellspring touchpad driver, is
+// **SPDX-License-Identifier: BSD-2-Clause** (Copyright (c) 2012 Huang Wen Hui) — permissively
+// licensed and therefore a lawful reference for a GPL-3.0-or-later kernel. Only PROTOCOL FACTS are
+// taken from it; no code is copied. The Linux `bcm5974` driver (GPLv2-only, incompatible with our
+// GPL-3.0-or-later) was NOT consulted. Facts used, all from wsp.c's TYPE2 parameter block, which is
+// the generation covering the 2012 retina MacBook Pro (Wellspring 7, 05ac:0262):
+//   * feature-report size 8, request index 0, switch byte index 0 — matches what this driver
+//     already sends and what our own metal GET_REPORT observed.
+//   * raw/sensor-mode ON selector = 0x01; HID/normal-mode OFF selector = 0x08.
+//   * the mode is set to the OFF value FIRST and only then to the ON value, with a pause between
+//     reading the current report and writing the new one. Our current single write skips both.
+//   * the raw stream is a BARE header+fingers packet with NO leading HID Report ID byte; TYPE2's
+//     header (offset to finger[0]) is 30 B and each finger record is 28 B, so a legal raw frame
+//     length satisfies `len >= 30 + 28` and `(len - 30) % 28 == 0`.
+//   * the driver's receive buffer is 1024 B — i.e. raw frames are far larger than the 64 B our
+//     interrupt buffer holds, so a raw frame will arrive TRUNCATED here until the buffer grows.
+// Our own metal observation adds the negative: the 8-byte Report-ID-0x02 packets we currently
+// stream are the HID-mode shape, not the raw shape — consistent with the mode switch never having
+// taken effect on this device.
+#[cfg(feature = "mtraw")]
+const BCM5974_MODE_NORMAL: u8 = 0x08;
+/// MT-INVESTIGATION: how many reports the raw probe hex-dumps before restoring pointer mode.
+/// Deliberately tiny — the FTDI console is a 64 KiB drop-oldest ring, and a Wellspring endpoint
+/// under a resting hand streams at ~100 reports/s; four dumps is a capture, forty is a flood that
+/// evicts the boot log that gives them context.
+#[cfg(feature = "mtraw")]
+const MT_RAW_DUMP_MAX: u32 = 4;
+/// MT-INVESTIGATION: hard cap on bytes hex-dumped per report (the interrupt buffer is 64 B).
+#[cfg(feature = "mtraw")]
+const MT_RAW_DUMP_BYTES: usize = 64;
 
 // EHCI-5 vendor-multitouch decode HYPOTHESIS (bcm5974 TYPE2 lead — CONFIRM AT METAL).
 // The Apple 0x44 report is opaque: its HID descriptor gives the total report size, not which
@@ -1766,6 +1954,30 @@ fn dump_vendor_report(idx: usize, count: u32, report: &[u8]) {
     }
     serial_println!(
         ":: EHCI-HID: [{}] vendor-multitouch raw report #{} ({} B): {} == witness ::",
+        idx, count, report.len(), hex
+    );
+}
+
+/// MT-INVESTIGATION (IVY) — hex-dump one report of the raw-mode capture window.
+///
+/// Kept separate from `dump_vendor_report` on purpose: that one is the `usbdebug` characterization
+/// dump and is already spoken for, while this line carries the `EHCI-MT:` prefix the sitting reads
+/// for. The `len=` field is the load-bearing datum — per FreeBSD wsp.c (BSD-2-Clause) a TYPE2 raw
+/// frame is `30 + 28*n` bytes with NO Report ID byte, so a length of 8 with a leading 0x02 means
+/// the pad is still in HID mode, whereas a length pinned at the endpoint's max packet size means a
+/// raw frame arrived and our 64 B interrupt buffer TRUNCATED it.
+#[cfg(feature = "mtraw")]
+fn dump_raw_report(idx: usize, count: u32, report: &[u8]) {
+    let mut hex = alloc::string::String::new();
+    for (k, b) in report.iter().enumerate() {
+        if k > 0 {
+            hex.push(' ');
+        }
+        hex.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        hex.push(char::from_digit((b & 0xF) as u32, 16).unwrap());
+    }
+    serial_println!(
+        ":: EHCI-MT: [{}] raw-report #{} len={} bytes={} == witness ::",
         idx, count, report.len(), hex
     );
 }
@@ -2116,6 +2328,10 @@ pub fn init() {
                         overlay_mode: false,
                         next_addr: 1,
                         int_eps: Vec::new(),
+                        #[cfg(feature = "mtraw")]
+                        mt_probe: None,
+                        #[cfg(feature = "mtraw")]
+                        mt_dumped: 0,
                     };
                     // Firmware-stale detection BEFORE any schedule programming: probe 2 showed
                     // Apple EFI leaves PSE=1 behind (its pre-boot keyboard), which HSE-halts

@@ -1236,6 +1236,83 @@ click nor desynchronize the edge state.
 no EHCI HID controller, so **no** QEMU gate can exercise this branch — QEMU proves non-regression only.
 The click behaviour is a **metal-only** verdict, taken at the attended rMBP sitting.
 
+### 10g. IVY MT-INVESTIGATION — where does true multitouch actually live? (`UNAOS_MTRAW`)
+
+§10e refuted the "descriptor-advertised 0x44 / 511-byte frame streams as-is" model: 736+ observed
+reports were all the 8-byte Report ID `0x02` relative shape. That left the real question open — the pad
+plainly *has* a multi-finger sensor, so what carries its data? This section records the cleanroom answer
+and the knob-gated groundwork that tests it at the bench.
+
+**Cleanroom sourcing.** UnaOS is GPL-3.0-or-later; the Linux `bcm5974` driver is GPLv2-**only** and
+therefore license-incompatible — it was **not** consulted. The reference used is FreeBSD
+`sys/dev/usb/input/wsp.c`, the Wellspring touchpad driver, which carries
+`SPDX-License-Identifier: BSD-2-Clause` (Copyright (c) 2012 Huang Wen Hui) — permissive, and lawful to
+learn protocol facts from. No code is copied; only the following facts are used, all from wsp.c's
+**TYPE2** parameter block, the generation covering the 2012 retina MacBook Pro (Wellspring 7,
+`05ac:0262`):
+
+| Fact (FreeBSD wsp.c, BSD-2-Clause) | Value | Bearing on our path |
+| --- | --- | --- |
+| feature-report size / request index / switch byte index | 8 / 0 / byte 0 | identical to what §10d already sends — **not** the discrepancy |
+| raw-sensor ON selector | `0x01` | identical to `BCM5974_MODE_VENDOR` — the value was never wrong |
+| HID/normal OFF selector | `0x08` | matches our own metal `GET_REPORT` readback `byte0=0x08` |
+| switch **ordering** | write the OFF value **first**, then the ON value, with a pause between reading and writing | **we do neither** — §10d issues a single GET→SET with no OFF write and no pause |
+| raw packet shape | bare header+fingers, **no leading Report ID byte**; TYPE2 header (offset to finger[0]) 30 B, finger record 28 B, so a legal frame is `30 + 28·n` bytes | our 8-byte `0x02` packets are the **HID-mode** shape, not the raw shape |
+| driver receive buffer | 1024 B | a raw frame is far larger than our 64 B interrupt buffer — it will arrive **truncated** until that buffer grows |
+
+**The working hypothesis this yields.** MT does *not* live on a different endpoint or interface (wsp
+reads the same interface-1 interrupt IN we already read) and the raw-mode selector we send is already
+the documented one. What differs is the **sequence**: the mode switch is issued as a bare single write.
+A pad that ignored or reverted the switch keeps emitting the compatibility-mode 8-byte packets — exactly
+what §10e observed. So the candidate answer is that raw mode never engaged, and the OFF→pause→ON
+ordering is what engages it.
+
+**The groundwork (knob-gated, `UNAOS_MTRAW=1`).** `bcm5974_mode_switch` dispatches to
+`bcm5974_mt_raw_probe`, which:
+
+1. writes the NORMAL selector `0x08` and reads the mode byte back;
+2. pauses;
+3. writes the RAW selector `0x01` and reads the mode byte back;
+4. opens a capture window: the service loop hex-dumps at most **4** reports of at most **64** bytes each
+   (`MT_RAW_DUMP_MAX` / `MT_RAW_DUMP_BYTES` — the FTDI console is a 64 KiB drop-oldest ring and the
+   endpoint streams at ~100 reports/s, so an unbounded dump evicts the boot log that gives it context);
+5. then restores the known-good pointer mode over EP0 (`bcm5974_mode_switch_normal`) so the trackpad
+   keeps working for the rest of the sitting. A failed raw write restores immediately instead.
+
+Every stage is non-fatal, exactly as §10d's handshake is: a stall logs and falls through to the restore.
+The pointer decode still runs on captured reports — `decode_trackpad_rel`'s length + Report-ID gate
+rejects anything that is not an 8-byte `0x02` report, so no input-safety clamp is loosened either way.
+
+Witnesses:
+
+```
+:: EHCI-MT: [i] mode-try val=0x08 readback=8 addr=A intf=1 (step 1/2: normal) == witness ::
+:: EHCI-MT: [i] mode-try val=0x01 readback=1 addr=A intf=1 (step 2/2: raw sensor) == witness ::
+:: EHCI-MT: [i] raw-report #1 len=L bytes=.. .. .. == witness ::
+:: EHCI-MT: [i] mode-restored addr=A intf=1 after 4 raw report(s) == witness ::
+```
+
+**Reading the capture.** `len=` is the load-bearing field:
+
+- `len=8` with a leading `02` → still HID mode; the OFF→pause→ON ordering did **not** engage raw mode
+  either, and the next candidate is a different interface/endpoint or a longer pause.
+- `len=` pinned at the endpoint's max packet size, with **no** leading `02` → a raw frame arrived and our
+  64 B interrupt buffer truncated it. The buffer must grow to `30 + 28·n` before the frame can be
+  decoded — that is the follow-on arc, not this one.
+
+**QEMU vs metal.** QEMU has no EHCI HID controller and never sets `vendor_mt` (its `usb-tablet` is a
+standard absolute pointer), so **no QEMU gate can produce a Wellspring frame or reach this probe at
+all**. The gates here prove only non-regression, and knob-off identity is measured the same way §10's
+fold measured it: `.text`/`.rodata` of the release x86 kernel are **byte-identical** knob-off (ELF
+section compare against the pre-arc tree — `.text` `35f4150a…`, `.rodata` `df4602f2…` on both), and the
+EHCI report-parser + vendor-multitouch self-tests are unchanged-green. Whole-file identity is broken by
+panic-`Location` line-number metadata and symbol-table shift, as it always is here — a lone comment line
+added to an otherwise untouched `ehci/mod.rs` moves the whole-file size by itself (902 568 B →
+902 624 B), which is why the section compare, not the file hash, is the gate. **Only the attended
+2012 rMBP bench can verify** (a) whether the OFF→pause→ON sequence changes the readback, (b) whether the
+streamed report length/shape changes, and (c) that after `mode-restored` the cursor still moves and
+clicks still register.
+
 ---
 
 ## 11. IVY — the delete-behind-a-hub investigation (BOT pump headroom)
