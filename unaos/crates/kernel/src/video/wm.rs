@@ -271,6 +271,69 @@ pub fn create(
         stride as usize,
         title,
         false,
+        None,
+    )
+}
+
+/// SPAWN-PLACE — the geometry a window of `w` x `h` source pixels WILL be given, computed before any
+/// row exists: `(scale, outer_w, outer_h)`, or `None` when the framebuffer is not ready.
+///
+/// This is the query half of [`create_at`]. A caller that wants its window at a particular place
+/// (centred, corner-pinned) has to know how big the window will BE before it can say where the box
+/// goes, and until this existed the only way to learn that was to create the window, read
+/// [`info`], and then [`move_to`] — by which time [`create`]'s own composite had already put a frame
+/// of that window on the panel at the tiler's origin. The scale comes from the same rule [`place`]
+/// applies, so the answer is not an estimate of the layout: it IS the layout.
+pub fn spawn_geometry(w: usize, h: usize) -> Option<(usize, usize, usize)> {
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        return None;
+    }
+    let info = fb.info();
+    let scale = place_scale(info.width, info.height, w, h);
+    Some((
+        scale,
+        w.saturating_mul(scale).saturating_add(2 * BORDER),
+        h.saturating_mul(scale)
+            .saturating_add(TITLE_H + 2 * BORDER),
+    ))
+}
+
+/// SPAWN-PLACE — [`create`] with the window's FINAL content origin supplied up front.
+///
+/// The invariant it exists to keep: **no pixel of a window is ever presented at a position it will
+/// not occupy.** `create` places by the tiler and composites the new row before returning, so a
+/// caller that follows it with [`move_to`] has already shown the window at the tiler's top-left
+/// origin for one frame, and has left an abandoned box behind for the move to erase. Observed on the
+/// metal (rMBP s41): both windows appeared at the top-left and jumped, and the vacated boxes stayed
+/// on glass. Supplying the origin here removes the first frame and the vacated box together —
+/// there is no move, so there is nothing to erase.
+///
+/// The row is PINNED (as `move_to` pins it), so the tiler leaves it where the caller put it. `(x, y)`
+/// is the CONTENT origin and is clamped to the panel on both bounds exactly as [`move_to`] clamps it;
+/// use [`spawn_geometry`] to size the outer box first.
+#[allow(clippy::too_many_arguments)]
+pub fn create_at(
+    owner_asid: u64,
+    surf: usize,
+    surf_len: usize,
+    w: u32,
+    h: u32,
+    stride: u32,
+    title: &[u8],
+    x: usize,
+    y: usize,
+) -> WinId {
+    create_inner(
+        owner_asid,
+        surf,
+        surf_len,
+        w as usize,
+        h as usize,
+        stride as usize,
+        title,
+        false,
+        Some((x, y)),
     )
 }
 
@@ -327,7 +390,7 @@ pub(super) fn compat_present(
         let _claim = COMPAT_CREATE.lock();
         let mut id = COMPAT_WIN.load(Ordering::Relaxed);
         if id == WIN_NONE || !is_compat_row(id) {
-            id = create_inner(0, surf, surf_len, w, h, stride, b"", true);
+            id = create_inner(0, surf, surf_len, w, h, stride, b"", true, None);
             if id == WIN_NONE {
                 return;
             }
@@ -481,6 +544,11 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
         let barrier = DrainBarrier::drain();
         erase(&[b]);
         damage_intersecting(b.0, b.1, b.2, b.3);
+        // MOVE-VACATE (x86 s42 probe, `[wc-x] move-vacate … desktop=5/5 stale=0/5`): the erase
+        // REACHES glass, but a desktop-layer present can later repaint the unoccluded box from
+        // content that predates it — the ghost is the LATER writer, not the erase. Same cure
+        // `reclaim` uses: force the next present to re-derive the whole surface.
+        super::screen::request_full_present();
         // Re-open before recompositing — a composite under a raised barrier is a no-op.
         drop(barrier);
         composite();
@@ -3421,6 +3489,7 @@ fn create_inner(
     stride: usize,
     title: &[u8],
     compat: bool,
+    at: Option<(usize, usize)>,
 ) -> WinId {
     if surf == 0 || w == 0 || h == 0 || stride == 0 || surf_len == 0 {
         return WIN_NONE;
@@ -3431,6 +3500,31 @@ fn create_inner(
     if w.saturating_mul(4) > stride || h.saturating_mul(stride) > surf_len {
         return WIN_NONE;
     }
+    // SPAWN-PLACE — resolve the caller's origin BEFORE the table lock (WRITER is never held across
+    // it, which is what keeps the WRITER/TABLE order acyclic here as it is in `move_to` and `place`).
+    // A framebuffer that is not ready leaves the row to the tiler, exactly as `move_to` declines.
+    let placed = at.and_then(|(x, y)| {
+        let fb = *super::WRITER.lock();
+        if !fb.is_ready() {
+            return None;
+        }
+        let info = fb.info();
+        let scale = place_scale(info.width, info.height, w, h);
+        // The same clamp `move_to` applies, for the same reason (F5: the kernel builds without
+        // overflow checks, so an unclamped origin would wrap in the geometry arithmetic).
+        let cw = w.saturating_mul(scale);
+        let ch = h.saturating_mul(scale);
+        let max_x = info.width.saturating_sub(cw + BORDER).max(BORDER);
+        let max_y = info
+            .height
+            .saturating_sub(ch + BORDER)
+            .max(TITLE_H + BORDER);
+        Some((
+            x.clamp(BORDER, max_x),
+            y.clamp(TITLE_H + BORDER, max_y),
+            scale,
+        ))
+    });
     let mut t = TABLE.lock();
     let slot = match t.rows.iter().position(|r| !r.used) {
         Some(s) => s,
@@ -3453,6 +3547,14 @@ fn create_inner(
     row.compat = compat;
     row.title_len = title.len().min(MAX_TITLE);
     row.title[..row.title_len].copy_from_slice(&title[..row.title_len]);
+    // SPAWN-PLACE — the row is born at its final geometry and PINNED, so the `place` below skips it
+    // and the `composite` below paints it exactly once, where it stays.
+    if let Some((x, y, scale)) = placed {
+        row.x = x;
+        row.y = y;
+        row.scale = scale;
+        row.pinned = true;
+    }
     t.rows[slot] = row;
     drop(t);
     // WC-D: ids are recycled slot aliases, so a fresh window in a used slot is a DIFFERENT window and
@@ -3542,6 +3644,18 @@ fn legibility_cap(ph: usize) -> usize {
 /// Scale rule: the largest integer factor whose scaled surface fits half the panel width and half its
 /// height — big enough that a 32x32 surface is legible on a 1920-wide panel, small enough that two
 /// windows sit side-by-side — **capped by [`legibility_cap`]**. Never 0.
+/// The tiler's SCALE RULE, factored out so [`spawn_geometry`] answers with the layout's own value
+/// rather than a second copy of it: the largest integer factor whose scaled surface fits half the
+/// panel width and half the layout area's height, capped by [`legibility_cap`], never 0. `usable_h`
+/// is derived here exactly as [`place`] derives it (PULSE-2's bottom-chrome reservation).
+fn place_scale(pw: usize, ph: usize, w: usize, h: usize) -> usize {
+    let usable_h = ph.saturating_sub(crate::ui_status::chrome_h(ph)).max(1);
+    (pw / 2 / w.max(1))
+        .min(usable_h / 2 / h.max(1))
+        .min(legibility_cap(ph))
+        .max(1)
+}
+
 fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]) {
     let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut nv = 0usize;
@@ -3555,8 +3669,6 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
     }
     let info = fb.info();
     let (pw, ph) = (info.width, info.height);
-
-    let cap = legibility_cap(ph);
 
     // PULSE-2 — the bottom chrome's reservation. `ui_status` owns the last `chrome_h(ph)` rows of the
     // panel: the CPU pulse instrument and the host/ip/clock status line. The tiler lays out against
@@ -3583,7 +3695,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
             continue;
         }
         let (w, h) = (r.w.max(1), r.h.max(1));
-        let scale = ((pw / 2 / w).min(usable_h / 2 / h)).min(cap).max(1);
+        let scale = place_scale(pw, ph, w, h);
         // F5 — saturating throughout; `w`/`h` come from the caller via `create`.
         let bw = w.saturating_mul(scale).saturating_add(2 * BORDER);
         let bh = h
