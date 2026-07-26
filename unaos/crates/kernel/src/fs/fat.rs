@@ -34,7 +34,8 @@
 
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_arch = "aarch64")]
+// aarch64: the F2 M3 witness counter. x86 + `witness`: the roster tripwire's overlap tallies.
+#[cfg(any(target_arch = "aarch64", feature = "witness"))]
 use core::sync::atomic::AtomicU32;
 
 /// Logical sector size we support. This equals the USB block device's block size (512 on every
@@ -392,25 +393,50 @@ fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
 /// Non-aarch64 (x86): the FAT-mutation lock is inert — see [`FAT_MUTATION`] for why masking IRQs across the
 /// x86 `hlt`-driven xHCI FAT path would hang. Byte-identical to the pre-F2 behaviour (a zero-cost passthrough).
 ///
-/// ⚠ THE X86 INVARIANT, STATED HONESTLY (2026-07-26). Because this is a passthrough, x86 has NO in-`fat.rs`
-/// serialization of FAT/directory mutation. What keeps the volume consistent is a discipline held ABOVE
-/// `fat.rs`, by its callers:
-///   * `irqstorage` ON: every storage syscall's create/grow/delete is submitted to the ONE storage service
-///     task (`drivers/xhci/irqstorage.rs`), which runs them one at a time at IF=1 — a real single writer.
-///   * `irqstorage` OFF: the mutating callers are the `witness`-gated U10x op drains and the shell, each of
-///     which runs as a sequenced one-shot / a single interactive task.
-///   * The FLIGHT RECORDER (`flight_recorder.rs`), which runs on the BSP main loop concurrently with all of
-///     the above, performs exactly ONE FAT mutation for the whole boot — reserving `UNAOS.LOG` at a fixed
-///     size on the first main-loop pass storage is up, BEFORE any fixture/launcher exists — and thereafter
-///     writes the log with `write_at` only (in place, no cluster alloc/free, no directory touch). It used to
-///     re-create the file every few thousand iterations, which made it a genuine SECOND unsynchronized
-///     writer and was the A/B-proven cause of cross-linked chains under the x86 storage batteries.
-/// If a NEW x86 caller needs to mutate the FAT concurrently with the above, it must join one of those
-/// schemes — do NOT make this lock real here; masking IRQs across the `hlt`-driven pump would hang the core.
-#[cfg(not(target_arch = "aarch64"))]
+/// ⚠ THE X86 INVARIANT, STATED HONESTLY (2026-07-26; ROSTER AUDITED 2026-07-27 — see the block below).
+/// Because this is a passthrough, x86 has NO in-`fat.rs` serialization of FAT/directory mutation. What keeps
+/// the volume consistent is a discipline held ABOVE `fat.rs`, by its callers. That discipline is now written
+/// down as a ROSTER, because it is caller-side and therefore only as good as the next caller added to it.
+///
+/// # THE X86 FAT-MUTATOR ROSTER (every x86 path that allocates/frees a cluster, writes a FAT entry, or
+/// RMWs a directory sector). Full derivation + the interleavings in
+/// `docs/dev/OS/07_USB_STORAGE/x86_interrupt_storage.md` ("x86 FAT concurrency audit").
+///
+/// | # | Mutator | Context (core) | Gate | Serialized by |
+/// |---|---------|----------------|------|---------------|
+/// | 1 | `flight_recorder::reserve_log` — `delete_located` + `create_in_root` + one `write_grow` | BSP main loop, IF=1, NOT a scheduled task | always (x86); ONE-SHOT for the whole boot | PROGRAM ORDER: its call site (`main.rs`) precedes every `U*_probe_once` and `install_probe_once` in the same iteration, and all of them gate on the same `block::info()` that has only just become `Some`. No other mutator can exist yet. |
+/// | 2 | `flight_recorder::write_log` — `write_at` only | BSP main loop | always | NOT A MUTATOR. Bounded to clusters already in the reserved chain; writes no FAT entry and no directory sector, so it cannot interact with any writer at all. |
+/// | 3 | storage service task — `create_in_root` / `write_grow` / `delete_located` / `write_at` (`drivers/xhci/irqstorage.rs`) | `storage-svc` task, AP[0], PRIO_HIGH | `irqstorage` | ONE task draining `REQ_QUEUE` one request at a time; every submitter blocks on the request's `done` semaphore. A real single writer for everything that reaches it. |
+/// | 4 | demo-chain pre-flights — `u10x_preflight_grow_file`, `u10_preflight_absent` (`arch/x86_64/syscall.rs`) | the `u6bx-launch`/`u7x-launch` LAUNCHER task, AP[1], PRIO_NORMAL | `witness` **and** `HELLO_STAGED` | PROGRAM ORDER on the ONE launcher task: each stage spins on the previous stage's `*_LAUNCH_DONE` before it starts, and mutates only BEFORE it spawns its fixture. |
+/// | 5 | demo-chain drains — `u10_drain_{grow,create_grow,create_grow_delete,delete}`, `flush_drain_one` | same launcher task | `witness` | ditto — reached only after the launcher has observed its fixture's teardown (`cleared`). |
+/// | 6 | `openf_release` / `u11m2_phase` — `submit_grow` / `submit_delete` | launcher task / fixture teardown | `irqstorage` | routed through row 3 (they are submitters, not mutators). |
+/// | 7 | **`shell::dispatch_command`** — `create_in_dir`, `create_dir`, `write_grow`, `delete_located`, `remove_dir`, `rename_entry`, `move_entry`, and a raw `write <lba> <byte>` | **BSP GUI main loop, INLINE** (`main.rs`'s `handle_key`), NOT a scheduled task | **NONE — compiled unconditionally** | **NOTHING.** See the rule below. |
+/// | 8 | `install::write_sectors` — raw GPT/FAT32 format writes | BSP main loop | `installdemo` | PROGRAM ORDER on the BSP loop; its blank-scratch-disk configuration leaves `HELLO_STAGED` false (rows 4/5 skip) and permanently fails row 1's reserve. |
+///
+/// VERDICT: rows 1–6 and 8 are genuinely sequenced. Row 7 is NOT — the shell mutates the volume from the BSP
+/// main loop with nothing between it and rows 3/4/5, which run on APs. It is unreachable in the QEMU
+/// batteries (headless `-display none`: no HID key event ever reaches `handle_key` on x86 — the `poll_input`
+/// feed in the main loop is aarch64-only) and harmless in shipping GUI/media builds (DEFAULT-QUIET leaves
+/// `witness` OFF, so rows 4–6 do not exist and the shell is the sole writer). It becomes a REAL second-writer
+/// window in exactly one configuration: an attended GUI boot built WITH `witness` (and/or `irqstorage`),
+/// where a keystroke dispatched while the launcher chain is mid-`write_grow` interleaves two unsynchronized
+/// cluster-chain mutations. Do not "fix" that here — see the rule.
+///
+/// THE RULE FOR A NEW X86 FAT WRITER: join one of the schemes above (submit through the storage service task,
+/// or run in program order on the BSP main loop ahead of the launchers), and add yourself to this roster.
+/// Do NOT make this lock real here: masking IRQs across the `hlt`-driven xHCI BOT pump would hang the core.
+#[cfg(all(not(target_arch = "aarch64"), not(feature = "witness")))]
 #[inline(always)]
 fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
     f()
+}
+
+/// Witness-build x86 [`with_fat_lock`]: the passthrough PLUS the roster tripwire (see
+/// [`x86_rmw_tripwire`]). Behaviourally identical — it only counts.
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+#[inline]
+fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
+    x86_rmw_tripwire(&FAT_RMW_INFLIGHT, &FAT_RMW_OVERLAPS, "FAT-table", f)
 }
 
 /// F3-M2: the DIRECTORY-sector mutation lock — the twin of [`FAT_MUTATION`] for the three directory-sector
@@ -437,12 +463,95 @@ fn with_dir_lock<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// Non-aarch64 (x86): the directory-mutation lock is inert — the [`with_fat_lock`] passthrough reasoning,
-/// including its "THE X86 INVARIANT, STATED HONESTLY" note (the caller-level discipline is what serializes
-/// x86 directory-sector RMWs; there is no lock here).
-#[cfg(not(target_arch = "aarch64"))]
+/// including its "THE X86 INVARIANT, STATED HONESTLY" note and the MUTATOR ROSTER there (the caller-level
+/// discipline is what serializes x86 directory-sector RMWs; there is no lock here).
+#[cfg(all(not(target_arch = "aarch64"), not(feature = "witness")))]
 #[inline(always)]
 fn with_dir_lock<R>(f: impl FnOnce() -> R) -> R {
     f()
+}
+
+/// Witness-build x86 [`with_dir_lock`]: the passthrough PLUS the roster tripwire (see [`x86_rmw_tripwire`]).
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+#[inline]
+fn with_dir_lock<R>(f: impl FnOnce() -> R) -> R {
+    x86_rmw_tripwire(&DIR_RMW_INFLIGHT, &DIR_RMW_OVERLAPS, "directory-sector", f)
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// X86 ROSTER TRIPWIRE (`witness` builds only) — make a violation of the caller-side single-writer discipline
+// documented on `with_fat_lock` SELF-REPORTING instead of showing up as a mystery cross-linked chain three
+// arcs later.
+//
+// WHAT IT WATCHES: the two seams that ARE real locks on aarch64 — the FAT-sector RMW (`with_fat_lock`) and the
+// directory-sector RMW (`with_dir_lock`). Those are precisely the spans where a second concurrent mutator
+// corrupts the volume, and they are provably NON-NESTING, so a nonzero in-flight count at entry means a
+// genuinely concurrent second mutator, never re-entrancy:
+//   * `with_fat_lock` is taken at exactly two sites — `set_fat_entry` and `alloc_cluster`'s compare-and-claim
+//     — and the claim body calls the lock-FREE `set_fat_entry_inner`, never `set_fat_entry` (that factoring
+//     exists because the aarch64 lock is non-reentrant, so a nest would DEADLOCK there — the invariant is
+//     enforced by aarch64, not merely assumed).
+//   * `with_dir_lock`'s six bodies are pure single-sector read-modify-writes; none calls another (composites
+//     like `create_dir`/`delete_located` call them SEQUENTIALLY), and `create_in_dir` dispatches to
+//     `create_in_root` BEFORE taking the lock. The two locks are also never nested in each other.
+//
+// COST WHEN OFF: none. The whole family (statics, helper, and the tripwire-flavoured `with_*_lock`) is behind
+// `feature = "witness"`, and the knob-off definitions above are the byte-identical `#[inline(always)]`
+// passthroughs — the DEFAULT-QUIET rule (boot/media builds leave `witness` off).
+// COST WHEN ON: two relaxed atomics per sector RMW. It NEVER prints in a correct run, so it cannot perturb a
+// battery verdict; the one line it can emit fires only when the roster has actually been violated.
+// aarch64 is untouched by design — it holds REAL locks, and this is an x86-only invariant.
+// ---------------------------------------------------------------------------------------------------------
+
+/// Mutators currently inside a FAT-sector RMW (`with_fat_lock`). See the block above.
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+static FAT_RMW_INFLIGHT: AtomicU32 = AtomicU32::new(0);
+/// Mutators currently inside a directory-sector RMW (`with_dir_lock`).
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+static DIR_RMW_INFLIGHT: AtomicU32 = AtomicU32::new(0);
+/// Sticky count of FAT-sector RMWs that began while another was already in flight.
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+static FAT_RMW_OVERLAPS: AtomicU32 = AtomicU32::new(0);
+/// Sticky count of directory-sector RMWs that began while another was already in flight.
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+static DIR_RMW_OVERLAPS: AtomicU32 = AtomicU32::new(0);
+/// One-shot latch so the tripwire reports at most ONE serial line per boot (a corrupting interleave tends to
+/// repeat, and a spamming witness is a worse witness).
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+static RMW_TRIPPED: AtomicBool = AtomicBool::new(false);
+
+/// Run one sector RMW with the roster tripwire around it: bump the in-flight count, and if it was ALREADY
+/// nonzero, record the overlap (and report it once). Purely observational — `f` runs unchanged either way.
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+#[inline]
+fn x86_rmw_tripwire<R>(
+    inflight: &AtomicU32,
+    overlaps: &AtomicU32,
+    what: &str,
+    f: impl FnOnce() -> R,
+) -> R {
+    if inflight.fetch_add(1, Ordering::AcqRel) != 0 {
+        overlaps.fetch_add(1, Ordering::Relaxed);
+        if !RMW_TRIPPED.swap(true, Ordering::Relaxed) {
+            serial_println!(
+                ":: FATRACE: SECOND CONCURRENT x86 {} MUTATOR DETECTED — the caller-side single-writer roster (see fs/fat.rs `with_fat_lock`) has been violated; expect cross-linked chains ::",
+                what
+            );
+        }
+    }
+    let r = f();
+    inflight.fetch_sub(1, Ordering::AcqRel);
+    r
+}
+
+/// Roster-tripwire tallies `(FAT-sector overlaps, directory-sector overlaps)` for the boot. Both `0` is the
+/// expected reading — it is the evidence that the caller-side discipline held for every RMW that actually ran.
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+pub fn x86_rmw_overlaps() -> (u32, u32) {
+    (
+        FAT_RMW_OVERLAPS.load(Ordering::Relaxed),
+        DIR_RMW_OVERLAPS.load(Ordering::Relaxed),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------------------
