@@ -130,8 +130,8 @@ Two registers, two boots, one rule.
 | `0x040` | `MAILBOX0` | `0x040` | | **`0x1000`** | ✅ PROVEN s29 |
 | `0x044` | `MAILBOX1` | `0x044` | | **`0x1100`** | ✅ PROVEN s30, s33boot2 |
 | `0x504` | `WRCMD_CMD` | `0x504` | | `0x14100` | DERIVED (untested — and the host side of this register faults, §5.4) |
-| `0x800` | `CC_SCRATCH[0]` | `0x800` | | `0x20000` | DERIVED (untested — pull 33 aboard, awaiting s37) |
-| `0x804` | `CC_SCRATCH[1]` | `0x804` | | `0x20100` | DERIVED (untested — pull 33 aboard, awaiting s37) |
+| `0x800` | `CC_SCRATCH[0]` | `0x800` | | `0x20000` | **PROVEN s37** — pull 33 image A acked on the first poll (`host-ack CC_SCRATCH[1]=00000001 iters=0`) |
+| `0x804` | `CC_SCRATCH[1]` | `0x804` | | `0x20100` | **PROVEN s37** — the ucode wrote its ack here; image B (flat ports) never ran |
 
 ### 3.3 The two errors this section exists to prevent
 
