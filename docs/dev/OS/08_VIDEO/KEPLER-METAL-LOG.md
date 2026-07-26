@@ -3,6 +3,65 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #37 (pull 33 FECS echo + poll-control, UnaOS-gemini@f8e3e2f3, 2026-07-26, fox-metal-r23s1n, s37boot1v2)
+
+**⭐⭐⭐ OUR MICROCODE ANSWERED A COMMAND. THE CONSTRUCTIVE ERA IS OPEN.**
+Coordinator awk-verified:
+```
+:: kepler: ucode-echo pre CC_SCRATCH[0]=00000000 CC_SCRATCH[1]=00000000 ::
+:: kepler: ucode-echo host-cmd CC_SCRATCH[0]=00000001 ::
+:: kepler: ucode-echo host-ack CC_SCRATCH[1]=00000001 iters=0 ::
+:: kepler: ucode-echo SUCCESS img=A ::
+:: kepler: ucode-echo final CC_SCRATCH[1]=00000001 cpuctl=00000000 ::
+```
+Image **A** — the DERIVED indexed ports I[0x20000]/I[0x20100] — acked on the
+FIRST poll (`iters=0`); image B (flat ports) never ran. Two things settle at
+once: (1) the host↔FECS command loop WORKS — we write a command, our own
+microcode reads it from inside the falcon and answers; (2) the indexed IO
+scheme `(X & 0xffc) << 6` is confirmed for the CC_SCRATCH family, extending
+the s29 mailbox proof to a second register family. The coordinator's
+must-fix amendment (the proposal shipped host offsets 0x800/0x804 as falcon
+port indices) was correct and the A/B fallback settled it in one boot —
+the second time that pattern has paid for itself.
+
+**⭐ POLL-CONTROL — THE CHIP'S OWN ERROR NAME IS A RED HERRING.**
+```
+:: kepler: poll-control valid-only chan=00002000 err=00000002 stat=00000000 ::
+```
+VALID written WITHOUT POLL_ENABLE, and the refusal is byte-identical:
+err=00000002, the code the chip documents as NO_POLL ("validated a channel
+with POLL_ENABLE, but poll area is disabled"). **POLL_ENABLE was never the
+subject of that complaint.** Twenty-eight sittings honored a reason name
+that does not describe its own precondition. What survives: err=2 means
+"channel table validate refused" and nothing finer; the poll-area lead
+(pulls 11/12, already refuted) stays dead; and the elimination stands
+undisturbed — the missing actor is still the FECS ctx machinery.
+
+**Correction to the relay (facts-first):** Fox flagged `stat=00000000` on
+the poll-control leg vs `stat=00000005` on the control as a POLL-related
+delta. It is not. The capture's own ordering shows stat=0 on BOTH
+`sched-status post-init` and `post-restore` — every pre-submit reading — and
+5 only at `post-submit`. The stat difference is submit-related, not
+poll-related. No new information there.
+
+**Storage leg — NOT RUN, not failed.** No `:: FR: UNAOS.LOG reserved … ::`
+line, and the reason is in the same capture: `BOT: … n=0 nowait=0
+storage_slot=0 route=0x0` — **no USB storage was attached to this boot**, so
+the reserve path (gated on `block::info()` returning Some) could never fire.
+The FAT single-writer fix's metal leg is still OWED and needs a stick
+present at the sitting.
+
+Other legs: console scale-4 confirmed on the wire (cell=32x32 cols=90
+rows=56) — the fbcon masked-layout/unmasked-paint restructure did not
+regress the wire; Peter's photo owed for the visual half. SMC rich and
+healthy: a `SMC-DIAG` first-failure timeline, recovery, `retries=4/4`, and a
+live `ac=derived:discharging` → `ac=derived:charging` transition when Peter
+plugged in — the derived-AC inference proven on metal in both directions.
+Unbounded echo poll caused no harm (boot healthy through 449+ SMC samples).
+
+Capture from mark s37boot1v2. ESP by coordinator (f8e3e2f3…), Fox
+sha-verified. NOTE: Fox seat handed s1n → s1o at this boundary.
+
 ## Sitting #36 (fence pull 32 register-side strip test, UnaOS-gemini@8d2baec0, 2026-07-26, fox-metal-r23s1n, s36boot1)
 
 **⭐⭐ FENCE ARC VERDICT — THE TENTH STRIP CLOSES THE INVESTIGATION: THE
