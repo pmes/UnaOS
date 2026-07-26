@@ -2713,3 +2713,151 @@ diagonals, title strip, lower border) and closes it:
 `UNAOS_WC=1`) and `./arroyo test-arm`: green. Neither gate exercises the compositor's x86 activation —
 see above — so SPAWN-PLACE's proof is the metal photo (no jump, no residue) plus the `[wc-x]
 spawn-place` line, and MOVE-VACATE's proof is its own read-back verdict on the same boot.
+
+### CURSOR-5 — the flash was our own arrow, and the lock class stops costing the whole sprite
+
+CURSOR-4 closed the 42 % straddle decline and Peter's attended **P64** verdict narrowed what was left
+to two sentences: *"mouse still spotty [over vug] and causes a flash in the vug display here and there
+if you tweak the mouse just so."* Two symptoms, two mechanisms. One is a proven ordering defect; the
+other is a duty cycle that CURSOR-3 and CURSOR-4 both left in place for the contended case.
+
+#### Mechanism A — the flash: a full undraw from inside an open overlay session
+
+**Proven by construction, not inferred from a symptom.** `composite_inner` ran in this order:
+
+1. `cursor::sprite_plan()` → `cursor::overlay_open(&p)` — the pass takes ownership of the overlay
+   session and snapshots the sprite's geometry and generation into `OVERLAY`.
+2. `cursor::undraw_within(&paint[..])` — the masked undraw hands back only the pixels this pass may
+   paint over.
+3. **`drain_deferred(&fb)`** — WC-L's deferred-erase drain, which calls `cursor::undraw()`: a *full*
+   undraw that clears `Sprite::drawn` and bumps `Sprite::epoch`.
+4. the window loop, each `stage_window` calling `cursor::compose_into(&layer, …, plan)`.
+
+Step 3 destroys the premise of step 4, and step 4 could not see it. `compose_into` may not take the
+`SPRITE` lock — it runs inside `wm`'s `BlitGuard` window, and F4's drain barrier spins IRQ-masked
+until every registered blit retires, so a second blocking lock in that wait set breaks its termination
+argument. It therefore validated the plan against `overlay_matches`, which compares the plan against
+*the session's own copy of the plan*. That copy is untouched by step 3. Every downstream compose
+matched, painted the arrow into the window's back layer, and the present put it on the panel — while
+the sprite module believed itself off-panel.
+
+The tail then completes the damage. `adopt_overlay` finds `!sp.drawn`, declares the session
+incoherent, and falls back to `refresh_locked`: `undraw_locked` is a no-op (nothing is drawn), and
+`draw_locked` reads the **front** for its save-under — where the overlay's own `FILL` is now sitting.
+The arrow is captured as "what was underneath", and it stands in the window's rect until something
+else damages that window. `repair` cannot mend it: `draw_locked` restored nothing, so no rect is
+handed to `damage_intersecting`.
+
+Its trigger set is exactly Peter's sentence. It needs the `DEFER` queue non-empty (an empty queue
+costs one relaxed load and returns before touching the sprite), which under VUGPAR means the focus
+tab-cycles at ~99 % core load that WC-L shipped for — and it needs the pointer over a presenting
+window. Rare, load-dependent, pointer-dependent: *here and there, if you tweak the mouse just so.*
+
+**Two fixes, one for each half of the race.**
+
+* **The drain moves ahead of the bracket.** With `drain_deferred` first, a drain that undraws leaves
+  `sprite_plan()` empty, no session is opened at all, and the pass's `Repaint` tail re-establishes the
+  sprite from the finished front buffer. Everything WC-L's placement argument required survives: the
+  drain still runs before the dirty-set snapshot, so the windows its `damage_intersecting` reaches are
+  repainted by *this* pass; it still runs outside the `BlitGuard` window, so neither `SPRITE` nor
+  `TABLE` enters the drain barrier's wait set; and it still reports `disturbed` when it undrew rather
+  than when it painted (WC-L MUST-FIX 1 — a drain whose boxes all re-defer has still taken the sprite
+  down, and an `Untouched` tail there would leave the pointer missing for as long as the contention
+  lasts).
+* **`compose_into` gets a lock-free generation check.** The ordering fix cannot reach the callers that
+  are not this pass: `wm::erase` on another core, and `repaint` from the render task. `cursor::EPOCH`
+  mirrors `Sprite::epoch` into an `AtomicU64`, bumped by the one `bump_epoch` helper every existing
+  bump now routes through, and `compose_into` compares `live_epoch()` against `plan.epoch` with a
+  relaxed load — no wait, no wait-set entry, no ordering obligation beyond "a stale read is a
+  conservative read". A mismatch declines the compose *totally*: nothing is written to the layer, and
+  the coverage bits inside this window's box are cleared so the tail repaints those pixels from the
+  finished front. That is CURSOR-3's fallback for one window, which is always available and always
+  correct.
+
+#### Mechanism B — the spottiness: the lock class took the whole sprite down
+
+Under CURSOR-4 a pass that lost the overlay session to another core fell all the way back to
+CURSOR-3's **whole-sprite** bracket — `cursor::undraw()`, the entire arrow off the panel for the
+length of the pass. That is precisely the duty cycle WC-I and CURSOR-4 spent two arcs removing,
+reinstated in full every time two cores composite at once. Under VUGPAR (vugband pinned at 99 % on
+three cores, the P64 reality) two-cores-at-once is not the exceptional case, it is the steady state.
+
+The undraw's reason has never been the session. A pixel must be handed back before a painter *in this
+pass* overwrites it, or the save-under goes stale — and `paint` is already the conservative union of
+exactly those extents. That argument is independent of who owns the overlay, so the mask applies to
+the sessionless path too: pixels this pass can reach come down, pixels it provably cannot stay on the
+panel. **WC-L's shape, exactly — defer the sprite operation, never drop the sprite.**
+
+The tail stays `Repaint`, not `Adopt`: no session means no coverage to install, and `refresh_locked`
+settles both classes in one acquisition — `undraw_locked` skips the pixels the mask handed back (their
+`saved` is stale by construction, which is what `Sprite::off` records) and restores the rest, then
+`draw_locked` re-establishes the whole sprite from the front, where every pixel now holds whichever
+painter's content is final.
+
+WC-F's reserved-box case keeps the full undraw and is now a separate branch rather than an `else`:
+that probe paints the **front** at the tail of the pass, outside any window box, so the paint set does
+not describe what it will touch and `repair` — which damages *windows* — could not mend a sprite pixel
+it took.
+
+#### The residual, made legible
+
+```
+[cursor5] rollup scope={fixture|desktop} stale_compose= adopt_incoh= selfsave= masked_nosession= drain_insession= -> VERDICT
+```
+
+Printed immediately after `[cursor3]`'s rollup, same scopes, same harness, so a bench capture reads
+"how often the mechanism ran" and "what it cost when it raced" as one block.
+
+* `stale_compose` — composes declined on a generation mismatch. **Mechanism A, caught rather than
+  painted.** Non-zero means the interleave still *happens* and is now absorbed; it measures contention,
+  not damage.
+* `adopt_incoh` — tails that found their session incoherent and fell back to the whole-sprite refresh.
+  Before CURSOR-5 this was the branch that stamped the arrow; it now merely costs a repaint.
+* `selfsave` — save-unders that read back **exactly** the colour the sprite paints at that pixel while
+  the module believed the sprite was not on the panel there. An **upper bound** on self-capture, not a
+  proof of it: window content is free to contain `FILL`-white or `SHADOW`-dark pixels of its own and
+  this cannot tell them apart. A boot where it stays 0 has provably not stamped; a boot where it
+  climbs in step with `stale_compose` is showing the mechanism still leaking.
+* `masked_nosession` — mechanism B's fix firing. Every one of these is a whole-sprite bracket that did
+  not happen.
+* `drain_insession` — the direct detector for mechanism A's ordering. **Must be 0**, because the
+  reorder makes it structurally impossible; a non-zero count means someone put the drain back inside
+  the bracket. It is the one line item that reads as a defect rather than as load, and the verdict says
+  `REGRESSED` on it. The spec `FORBID`s both the verdict and the field.
+
+Verdicts: `REGRESSED` (drain in session), `UNWITNESSED` (the sprite was never armed — QEMU, always),
+`RESIDUAL` (`selfsave > 0`), `COHERENT` otherwise.
+
+#### CURSOR-5 gate results (2026-07-26, QEMU raspi4b)
+
+`./arroyo kernel8-test 90` — **82/82 required witnesses, 0 forbidden**, 2192 lines scanned:
+
+```
+[cursor3] rollup scope=fixture planned=0 offers=0 taken=0 adopt=0 repaint=1 ensure=348 straddle=0 lock=0 budget=0 -> UNWITNESSED
+[cursor5] rollup scope=fixture stale_compose=0 adopt_incoh=0 selfsave=0 masked_nosession=0 drain_insession=0 -> UNWITNESSED
+```
+
+`./arroyo check`: both arches clean. `./arroyo kernel8`: clean.
+
+**What the gate does and does not prove, stated rather than implied.** QEMU raspi4b delivers no HID
+pointer report, so `pal::cursor::visible()` is false for the whole boot, the sprite is never drawn,
+and every CURSOR-5 counter is 0 by construction — `UNWITNESSED`, exactly as CURSOR-3's and CURSOR-4's
+rollups are. The gate proves no-regression: the window path still settles every pass through a tail,
+the reordered drain still delivers its deferred box `BUFFERED` one pass later (WC-L's fixture is
+unchanged and still passes), and nothing new is printed on a quiet boot.
+
+Mechanism A is proven **in code**, by the ordering above, and its fix is proven by the same reading.
+Neither mechanism can be *reproduced* on the gate. What rides the next metal boot is the observation,
+not the argument.
+
+#### Metal watch-list (CURSOR-5)
+
+* `drain_insession=0` — if this is ever non-zero, stop; the ordering has regressed.
+* `stale_compose` non-zero with `selfsave=0` is the **good** outcome: the race is happening and is
+  being declined instead of painted.
+* `selfsave` climbing with `stale_compose` would mean a third writer reaching the sprite's pixels that
+  neither the ordering nor the generation check covers. That is the next thread to pull.
+* `masked_nosession` non-zero on the bench is expected under VUGPAR and is the direct measure of
+  mechanism B's fix; `[cursor3]`'s `lock=` counts the same passes, so the two must agree.
+* The attended question is unchanged in shape: hold the pointer over a live vug under `vugband` load,
+  tweak it, and report whether the flash recurs and whether the spottiness is gone or merely reduced.

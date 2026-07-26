@@ -83,7 +83,7 @@
 //! keeps it visible over light and dark content alike.
 
 use super::FrameBuffer;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 
 /// 8×8 arrow mask, MSB = leftmost pixel. The same SHAPE `pal::cursor` draws, so the pointer is
@@ -210,6 +210,132 @@ static SPRITE: Mutex<Sprite> = Mutex::new(Sprite {
     unsupported: false,
 });
 
+/// CURSOR-5 — [`Sprite::epoch`], mirrored where a lock-free reader can see it.
+///
+/// ### The hole CURSOR-4 left, and why an atomic is the only shape that closes it
+/// [`compose_into`] runs inside `wm`'s `BlitGuard` window, so it may not take `SPRITE` (F4's drain
+/// barrier spins IRQ-masked until every registered blit retires, and a second blocking lock in that
+/// wait set breaks its termination argument). It therefore validated the plan against [`OVERLAY`]'s
+/// OWN copy of the geometry and generation — which is a copy of the plan, so the test could only ever
+/// answer "is this the plan the session was opened with", never "does that plan still describe the
+/// sprite".
+///
+/// Between `overlay_open` and `compose_into` the sprite can be taken off the panel by a full
+/// [`undraw`], from three callers that owe nothing to the pass: `wm::erase` on another core,
+/// `wm::drain_deferred` (which ran INSIDE the bracket until CURSOR-5 moved it ahead of it), and a
+/// [`repaint`] from the render task. Every one of those bumps the generation. `compose_into` could
+/// not see the bump, so it painted the sprite into the layer and the present put it on the panel —
+/// while the sprite module believed itself off-panel. The next [`draw_locked`] then read the front
+/// for its save-under, captured the overlay's own `FILL`, and the arrow stood in the window's rect
+/// until something else damaged that window. **That is the P64 "flash in the vug display".**
+///
+/// A relaxed load of one `u64` is admissible everywhere a lock is not: no wait, no wait-set entry,
+/// no ordering obligation beyond "a stale read is a conservative read". Staleness degrades in the
+/// safe direction — a compose that declines costs the pass its overlay for one window and falls back
+/// to the bracket, which is exactly what CURSOR-3 did for every window.
+static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// CURSOR-5 — the sprite generation, readable without the sprite lock. Only [`compose_into`] needs
+/// it; every other consumer holds `SPRITE` and reads the field directly.
+fn live_epoch() -> u64 {
+    EPOCH.load(Ordering::Relaxed)
+}
+
+/// CURSOR-5 — advance the generation. The ONE place `epoch` moves, so the mirror cannot drift from
+/// the field: a bump that forgot the atomic would leave `compose_into` trusting a retired plan, which
+/// is the defect this arc exists to close.
+fn bump_epoch(sp: &mut Sprite) {
+    sp.epoch = sp.epoch.wrapping_add(1);
+    EPOCH.store(sp.epoch, Ordering::Relaxed);
+}
+
+// ---- CURSOR-5 witnesses ------------------------------------------------------------------------
+//
+// The residual has to be VISIBLE in replay or the next bench verdict is another adjective. Each
+// counter names one mechanism, and each is zero on a boot where the mechanism did not run — which on
+// QEMU raspi4b is all of them, since no HID pointer report ever arrives and the sprite is never
+// drawn. The rollup says `UNWITNESSED` in exactly that case rather than `CLEAN`.
+
+/// A [`compose_into`] that declined because the plan's generation no longer matched the live sprite —
+/// mechanism A, caught rather than painted. Non-zero here means the interleave still HAPPENS and is
+/// now being absorbed; it is a measure of contention, not of damage.
+#[cfg(feature = "witness")]
+static C5_STALE_COMPOSE: AtomicU64 = AtomicU64::new(0);
+
+/// An [`adopt_overlay`] that found its session incoherent with the sprite (generation or geometry
+/// moved mid-pass) and fell back to the whole-sprite refresh. Before CURSOR-5 this was the branch
+/// that stamped the arrow; it is now the branch that merely costs a repaint.
+#[cfg(feature = "witness")]
+static C5_ADOPT_INCOH: AtomicU64 = AtomicU64::new(0);
+
+/// A save-under that read back EXACTLY the colour the sprite paints at that pixel, while the module
+/// believed the sprite was not on the panel there. An UPPER BOUND on self-capture, not a proof of it:
+/// window content is free to contain `FILL`-white or `SHADOW`-dark pixels of its own, and this cannot
+/// tell those apart from our own arrow. A boot where it stays 0 has provably not stamped; a boot
+/// where it climbs in step with `stale_compose` is showing the mechanism still leaking.
+#[cfg(feature = "witness")]
+static C5_SELF_SAVE: AtomicU64 = AtomicU64::new(0);
+
+/// Passes that lost the overlay session to another core and took a MASKED undraw anyway (CURSOR-5's
+/// change of shape for the lock class — see [`undraw_within`]'s caller in `wm::composite_inner`).
+/// Every one of these is a whole-sprite bracket that did not happen.
+#[cfg(feature = "witness")]
+static C5_MASKED_NOSESSION: AtomicU64 = AtomicU64::new(0);
+
+/// WC-L's drain observed an OPEN overlay session when it was about to undraw. The direct detector for
+/// the same-core half of mechanism A; it must be 0, because CURSOR-5 moved the drain ahead of the
+/// bracket. A non-zero count means someone reordered `composite_inner` and re-opened the hole.
+#[cfg(feature = "witness")]
+static C5_DRAIN_INSESSION: AtomicU64 = AtomicU64::new(0);
+
+/// CURSOR-5 — count a masked undraw taken without owning the session (called from `wm`).
+#[cfg(feature = "witness")]
+pub fn note_masked_nosession() {
+    C5_MASKED_NOSESSION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// CURSOR-5 — is a pass currently holding the overlay session? For WC-L's drain, which must not take
+/// the sprite down inside one. `try_lock`: an answer of "someone holds OVERLAY right now" is itself
+/// evidence a pass is mid-session, and blocking here would put `OVERLAY` into a wait the drain does
+/// not need.
+#[cfg(feature = "witness")]
+pub fn note_drain_undraw() {
+    let busy = match OVERLAY.try_lock() {
+        Some(g) => g.session,
+        None => true,
+    };
+    if busy {
+        C5_DRAIN_INSESSION.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// CURSOR-5 — the arc's rollup, printed by `wm` immediately after `[cursor3]`'s so the decline
+/// breakdown and the coherence residual read as one block.
+#[cfg(feature = "witness")]
+pub fn cursor5_rollup(scope: &str) {
+    let stale = C5_STALE_COMPOSE.load(Ordering::Relaxed);
+    let incoh = C5_ADOPT_INCOH.load(Ordering::Relaxed);
+    let selfsave = C5_SELF_SAVE.load(Ordering::Relaxed);
+    let masked = C5_MASKED_NOSESSION.load(Ordering::Relaxed);
+    let drain = C5_DRAIN_INSESSION.load(Ordering::Relaxed);
+    // `drain_insession` is the only line item that is a DEFECT rather than a cost: the reorder in
+    // `composite_inner` makes it structurally impossible, so a non-zero count is a regression in the
+    // ordering, not a symptom of load.
+    let verdict = if drain > 0 {
+        "REGRESSED"
+    } else if !armed() {
+        "UNWITNESSED"
+    } else if selfsave > 0 {
+        "RESIDUAL"
+    } else {
+        "COHERENT"
+    };
+    serial_println!(
+        "[cursor5] rollup scope={} stale_compose={} adopt_incoh={} selfsave={} masked_nosession={} drain_insession={} -> {}",
+        scope, stale, incoh, selfsave, masked, drain, verdict
+    );
+}
+
 /// CURSOR-1 witness latch — `[cursor] armed` prints once, at the first draw.
 static ARMED: AtomicBool = AtomicBool::new(false);
 
@@ -307,7 +433,7 @@ fn undraw_locked(sp: &mut Sprite) -> Option<(usize, usize, usize, usize)> {
         // saved patch is dropped because there is no surface left to restore it into.
         sp.drawn = false;
         sp.off.reset();
-        sp.epoch = sp.epoch.wrapping_add(1);
+        bump_epoch(sp);
         return None;
     }
     let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
@@ -329,7 +455,7 @@ fn undraw_locked(sp: &mut Sprite) -> Option<(usize, usize, usize, usize)> {
     flush_box(&fb, by, bh);
     sp.drawn = false;
     sp.off.reset();
-    sp.epoch = sp.epoch.wrapping_add(1);
+    bump_epoch(sp);
     Some((bx, by, bw, bh))
 }
 
@@ -638,6 +764,9 @@ pub struct Composed {
     pub missed: usize,
     /// The plan lock was held by another core; this offer did nothing at all.
     pub locked: bool,
+    /// CURSOR-5 — the plan's generation no longer matched the live sprite, so the sprite was NOT
+    /// composed into this layer. See [`EPOCH`]: this is the flash mechanism, declined.
+    pub stale: bool,
 }
 
 /// CURSOR-3 — the published plan. Separate from [`SPRITE`] on purpose: [`compose_into`] runs from
@@ -760,6 +889,29 @@ pub fn compose_into(layer: &FrameBuffer, ox: usize, oy: usize, plan: Plan) -> Co
     if !overlay_matches(&ov, &plan) {
         return out;
     }
+    // CURSOR-5 — and does that plan still describe the SPRITE? `overlay_matches` compares the plan
+    // against the session's copy OF THE PLAN, so it cannot answer this; [`EPOCH`] can, without a
+    // lock. A mismatch means the sprite has been taken off the panel (or moved) since this pass
+    // opened its session — `wm::erase` on another core, a render-task `repaint`, or, before CURSOR-5
+    // reordered it, WC-L's drain from inside this very pass. Composing now would put the arrow on the
+    // panel behind the module's back, and the next save-under would capture it: the P64 flash.
+    //
+    // Declining is total, not partial: nothing is written to the layer, and the coverage bits inside
+    // this window's box are cleared so the tail repaints those pixels from the finished front. That
+    // is CURSOR-3's fallback for one window, which is always available and always correct.
+    if live_epoch() != plan.epoch {
+        let mut covered = ov.covered;
+        for_each_sprite_pixel(plan.bx, plan.by, plan.bw, plan.bh, plan.s, |x, y, _c, i| {
+            if inside(x, y).is_some() {
+                covered.clear(i);
+            }
+        });
+        ov.covered = covered;
+        #[cfg(feature = "witness")]
+        C5_STALE_COMPOSE.fetch_add(1, Ordering::Relaxed);
+        out.stale = true;
+        return out;
+    }
 
     // Pass one: save the layer's own pixel under every sprite pixel this window owns. Runs to
     // completion before a single pixel is written, exactly as `draw_locked` does, so a failure
@@ -799,7 +951,7 @@ pub fn compose_into(layer: &FrameBuffer, ox: usize, oy: usize, plan: Plan) -> Co
             }
         });
         ov.covered = covered;
-        return Composed { taken: 0, missed, locked: false };
+        return Composed { taken: 0, missed, locked: false, stale: false };
     }
 
     for_each_sprite_pixel(plan.bx, plan.by, plan.bw, plan.bh, plan.s, |x, y, color, _i| {
@@ -885,6 +1037,10 @@ pub fn adopt_overlay() {
             }
             ov.session = false;
             ov.covered.reset();
+            #[cfg(feature = "witness")]
+            if !coherent {
+                C5_ADOPT_INCOH.fetch_add(1, Ordering::Relaxed);
+            }
             coherent
         };
         // The sprite's own generation moved under us (another core ran a full `repaint` mid-pass), or
@@ -942,12 +1098,22 @@ fn redraw_off_locked(sp: &mut Sprite, unsupported_now: &mut bool) {
     let mut failed = false;
     {
         let saved = &mut sp.saved;
-        for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, _c, i| {
+        for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
             if !off.get(i) || failed || i >= saved.len() {
                 return;
             }
             match fb.read_pixel(x, y) {
-                Some(orig) => saved[i] = orig,
+                Some(orig) => {
+                    // CURSOR-5 — same detector as `draw_locked`'s, and the same argument: `off` says
+                    // this pixel was handed back and nothing has re-delivered it, so our own fill has
+                    // no business being here.
+                    #[cfg(feature = "witness")]
+                    if orig == color {
+                        C5_SELF_SAVE.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = color;
+                    saved[i] = orig;
+                }
                 None => failed = true,
             }
         });
@@ -1004,12 +1170,26 @@ fn draw_locked(sp: &mut Sprite) -> Result<Option<(i32, i32)>, ()> {
     let mut failed = false;
     {
         let saved = &mut sp.saved;
-        for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, _c, i| {
+        for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
             if failed || i >= saved.len() {
                 return;
             }
             match fb.read_pixel(x, y) {
-                Some(orig) => saved[i] = orig,
+                Some(orig) => {
+                    // CURSOR-5 — the self-capture signature. The sprite is provably not on the panel
+                    // here (the undraw above took it down, or it was never up), so a pixel that
+                    // already holds the exact colour we are about to paint is either window content
+                    // that happens to match or an arrow some other writer put there behind our back.
+                    // Counted, not acted on: we cannot tell the two apart, and refusing the save
+                    // would leave the pixel unrestorable, which is strictly worse than one frame of
+                    // white. The count is what makes the residual legible in replay.
+                    #[cfg(feature = "witness")]
+                    if orig == color {
+                        C5_SELF_SAVE.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = color;
+                    saved[i] = orig;
+                }
                 None => failed = true,
             }
         });
@@ -1029,7 +1209,7 @@ fn draw_locked(sp: &mut Sprite) -> Result<Option<(i32, i32)>, ()> {
     // CURSOR-4: a full draw re-establishes the whole sprite from the front, so nothing is off-panel
     // and every `saved` entry is fresh. The generation bump retires any overlay plan still in flight.
     sp.off.reset();
-    sp.epoch = sp.epoch.wrapping_add(1);
+    bump_epoch(sp);
 
     for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, _i| {
         fb.put_pixel(x, y, color);

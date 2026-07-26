@@ -1194,6 +1194,41 @@ fn composite_inner() -> CursorTail {
     // outer box meets the sprite — so it can only be too large, never too small, and a pixel outside
     // it is a pixel this pass provably cannot reach.
     let mut disturbed = false;
+
+    // WC-L — DRAIN THE DEFERRED ERASES.
+    //
+    // CURSOR-5 MOVED THIS AHEAD OF THE CURSOR BRACKET, and the move is a correctness fix rather than
+    // a tidy-up. WC-L placed the drain between `overlay_open` and the window loop, so a pass could
+    // open an overlay session, mask-undraw the sprite for it, and then — from its OWN core, inside
+    // its own session — call `cursor::undraw()` through the drain. That full undraw takes the sprite
+    // down and bumps its generation; the session's copy of the plan is unchanged, so every
+    // `compose_into` downstream still matched, painted the arrow into a window's back layer, and
+    // presented it to the panel while the sprite module believed itself off-panel. The next
+    // save-under then read the front, captured the overlay's own `FILL`, and left the arrow standing
+    // in the window's rect until something else damaged that window. **That is Peter's P64 "flash in
+    // the vug display", and this ordering is what removes it**: with the drain first, a drain that
+    // undraws leaves `sprite_plan()` empty, no session is opened at all, and the pass's `Repaint`
+    // tail puts the sprite back from the finished front. A drain that paints nothing (the common
+    // case: an empty queue costs one relaxed load) leaves the bracket below exactly as it was.
+    //
+    // `cursor::compose_into`'s generation check closes the same hole for the callers this ordering
+    // cannot reach — `wm::erase` and `repaint` running on another core — so the two fixes are the
+    // same fix applied to the two halves of the race, not a belt and braces.
+    //
+    // Everything WC-L's placement argument required is preserved. The drain still runs BEFORE the
+    // dirty-set snapshot, so the windows its `damage_intersecting` reaches are repainted by THIS
+    // pass; it still runs outside the F4 `BlitGuard` window, so neither `SPRITE` nor `TABLE` enters
+    // the drain barrier's wait set. It reports `disturbed` when it took the sprite off the panel and
+    // not when it painted, for MUST-FIX 1's reason: a drain whose boxes all re-defer has still
+    // undrawn, and an `Untouched` tail there would leave the pointer missing for as long as the
+    // contention lasts.
+    {
+        let fb = *super::WRITER.lock();
+        if fb.is_ready() && drain_deferred(&fb) {
+            disturbed = true;
+        }
+    }
+
     let mut plan: Option<super::cursor::Plan> = None;
     let mut session = false;
     if let Some(p) = super::cursor::sprite_plan() {
@@ -1246,13 +1281,42 @@ fn composite_inner() -> CursorTail {
                 super::cursor::undraw_within(&paint[..npaint]);
                 #[cfg(feature = "witness")]
                 CUR3_PLANNED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            } else {
+            } else if reserved_hit {
+                // WC-F's probe paints the FRONT at the tail of this pass, OUTSIDE any window box, so
+                // the paint set below does not describe what it will touch and `repair` (which
+                // damages windows) could not mend a sprite pixel it took. The whole sprite comes off,
+                // as it has since CURSOR-3. Witness/baremetal-only, one region.
                 super::cursor::undraw();
                 #[cfg(feature = "witness")]
-                if reserved_hit {
-                    CUR3_DECL_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                } else {
+                CUR3_DECL_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            } else {
+                // CURSOR-5 — THE LOCK CLASS STOPS COSTING THE WHOLE SPRITE.
+                //
+                // Another pass owns the overlay session, so this one cannot split the sprite across
+                // staged presents. CURSOR-3 and CURSOR-4 answered that by taking the ENTIRE sprite
+                // off the panel for the length of the pass — which is the duty cycle WC-I and
+                // CURSOR-4 spent two arcs removing, reinstated in full every time two cores composite
+                // at once. Under VUGPAR (vugband pinned at 99% on three cores, the P64 reality) that
+                // is not the rare case, it is the steady state, and it is the surviving half of
+                // "spotty over the vug".
+                //
+                // The undraw's reason has never been the session. A pixel must be handed back before
+                // a painter in THIS pass overwrites it, or the save-under goes stale — and `paint` is
+                // already the conservative union of exactly those extents. That argument is
+                // independent of who owns the overlay, so the mask applies here too: pixels this pass
+                // can reach come down, pixels it provably cannot stay on the panel. WC-L's shape,
+                // exactly — DEFER the sprite operation, never DROP the sprite.
+                //
+                // The tail is `Repaint`, not `Adopt`: no session means no coverage to install, and
+                // `refresh_locked` settles both classes correctly in one acquisition — `undraw_locked`
+                // skips the pixels the mask handed back (their `saved` is stale by construction) and
+                // restores the rest, then `draw_locked` re-establishes the whole sprite from the
+                // finished front, where every pixel now holds whichever painter's content is final.
+                super::cursor::undraw_within(&paint[..npaint]);
+                #[cfg(feature = "witness")]
+                {
                     CUR3_DECL_LOCK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    super::cursor::note_masked_nosession();
                 }
             }
             disturbed = true;
@@ -1263,30 +1327,6 @@ fn composite_inner() -> CursorTail {
         WCI_CURSOR_PASSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if disturbed {
             WCI_CURSOR_BRACKETS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    // WC-L — DRAIN THE DEFERRED ERASES, before the dirty-set snapshot below.
-    //
-    // Placement is the whole point. Boxes land on the queue when `erase` could not take `STAGE`
-    // (P64: two focus tab-cycles at ~99% core load), and they are owed a desktop-colour repaint. Draining
-    // HERE means the `damage_intersecting` the drain performs is observed by the snapshot in the very
-    // next statement, so the windows the deferred paint reached are repainted by THIS pass — a
-    // deferral costs one frame of latency and never a second composite.
-    //
-    // Before the `BlitGuard`, for the reason the cursor bracket above states: the drain takes
-    // `SPRITE` (through `undraw`) and `TABLE`, and F4's termination argument requires that the only
-    // thing a draining teardown waits on is bounded blits, not another core's lock.
-    //
-    // The drain reports `disturbed` when it took the sprite off the panel — which is not the same as
-    // "it painted something", and the difference matters: a drain whose boxes all re-defer has still
-    // undrawn the sprite, and reporting `false` there would give the tail `Untouched` and leave the
-    // pointer missing for as long as the contention lasts. The caller's tail is what puts it back,
-    // which is `erase`'s existing contract and not a new one.
-    {
-        let fb = *super::WRITER.lock();
-        if fb.is_ready() && drain_deferred(&fb) {
-            disturbed = true;
         }
     }
 
@@ -2034,6 +2074,9 @@ fn cursor3_rollup(scope: &str) {
         "[cursor3] rollup scope={} planned={} offers={} taken={} adopt={} repaint={} ensure={} straddle={} lock={} budget={} -> {}",
         scope, planned, offers, taken, adopt, repaint, ensure, straddle, lock, budget, verdict
     );
+    // CURSOR-5 — the coherence residual, immediately after the decline breakdown so a bench capture
+    // shows "how often the mechanism ran" and "what it cost when it raced" as one block.
+    super::cursor::cursor5_rollup(scope);
 }
 
 /// WC-A — whether the first `[wc-a] composite` witness has been emitted (first composite only; a
@@ -2252,6 +2295,13 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
     // The sprite comes off the panel before the first fill byte lands, exactly as `erase` does it,
     // and the caller's tail puts it back. From here on EVERY return path must report `true`: the
     // sprite is off the panel whether or not a single box went on to stage successfully.
+    //
+    // CURSOR-5 — and this undraw must never land inside an open overlay session (see the placement
+    // note in `composite_inner`: that interleave is the P64 flash). The ordering makes it structurally
+    // impossible for this pass; the probe below catches a future reorder that puts it back, and its
+    // counter is the one line item in `[cursor5]` that reads as a defect rather than as load.
+    #[cfg(feature = "witness")]
+    super::cursor::note_drain_undraw();
     super::cursor::undraw();
     let info = fb.info();
     let row_bytes = info.stride * info.bytes_per_pixel;
