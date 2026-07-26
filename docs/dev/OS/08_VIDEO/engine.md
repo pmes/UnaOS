@@ -197,96 +197,159 @@ Serial evidence on entry/exit (headless-gate visible when scripted):
 :: PULSE: exit clean — N frames ::
 ```
 
-## 4c. PULSE-STRIP — the always-running pulse in the bottom status strip
+## 4c. PULSE-2 — the always-running pulse as a bottom instrument panel
 
-Peter's ask was "an always running pulse in a strip window/app at the bottom".
-It is answered by **extending the PI-UI-2 status strip** (`ui_status.rs`), not by
-adding a second bottom band and not by adding a windowed app.
+*Supersedes PULSE-STRIP, which put the pulse inside the PI-UI-2 status line.*
 
-**Why extend, not add.** The panel already has exactly one piece of bottom
-chrome: the PI-UI-2 strip — one `line_h` band pinned to the last row-pitch,
-already always-on, already refreshed at ~1 Hz, already drawn by the render task
-*after* the console so it sits on top, and already the console's bottom-row
-neighbour (the console layout, the `click1_hit_test` regions and the compositor's
-view of the band are all written against it). A second band would either fight
-that one for the same rows or push the console up a line. A window would be
-worse: a window is focusable, is in the z-order, is killable, and costs a task in
-a thread table KILLBOUND has just bounded at `NTHREAD=8` — which is precisely the
-list of things the ask says the pulse must *not* be. Extending the strip gives an
-always-visible, never-focusable, unkillable pulse for **zero new threads, zero new
-windows and zero new presents**.
+**Why it moved.** On the bench panel `ui::Metrics::for_height(1200)` is `scale=1`
+(the scale step is 900 rows and 1200 does not reach 2x), so the status band is
+12 px and PULSE-STRIP's bars came out ~30x4 — about a millimetre tall. Peter, at
+the bench: *"i meant for pulse to be in the ~20mm high gap at the bottom of the
+screen below the other windows not in your fake bar at the bottom like 1mm tall
+and 4mm long. don't try to fake a desktop just build test tools."*
 
-**Geometry** — all from `ui::Metrics` (§0), so it tracks the panel:
+Two rules come out of that, and both are general:
+
+1. **This panel is a test-tool surface, not a desktop imitation.** There is no
+   taskbar to dock into and no chrome to imitate. An instrument gets the room it
+   needs to be read at arm's length; sizing one to fit inside existing chrome is
+   how it became unreadable.
+2. **The bottom gap is real estate.** `wm::place` packs window boxes from the top;
+   below the lowest row there was a permanently unused strip above the status
+   line. That is where the pulse belongs.
+
+**Geometry** — a panel *fraction*, not a cell multiple. THE METRICS RULE still
+holds (nothing here is an absolute pixel), but an instrument that must read across
+a room is a function of the **panel**, not of the type size — which is exactly
+what `cell_h`-derived sizing got wrong.
 
 | quantity | derivation |
 | --- | --- |
-| band | `(0, height − line_h, width, line_h)` — unchanged, the strip's own band |
-| segment | `seg_w = max(cell_w/3, 2)`, `seg_h = max(cell_h/2, 3)`, `gap = max(scale,1)` |
-| bar | `PULSE_SEGS · (seg_w + gap)`, one per core, `cell_w` of air between cores |
-| bars origin | right-aligned: `x = width − margin − total_w`, vertically centred in the band |
+| band height | `clamp(ph/13, cell_h·8, ph/4)` — 92 px at 1200 rows, 64 px at 480 |
+| band box | `(x0, ph − line_h − band_h, x1 − x0, band_h)`, `[x0,x1)` from `free_span` |
+| row | `row_h = (band_h − 2·pad) / ncpu`, `pad = max(line_h/2, 2)` |
+| LED | pitch `max(row_h/2, 3)`, `gap = max(pitch/4, 1)`, `led_w = pitch − gap`, `led_h = row_h − max(row_h/4,1)` |
+| bar | every pixel between the `c<N>` label (`3·cell_w`) and the percent (`7·cell_w`) |
 
-Measured on the gate's 1920×1200 surface: `band=(0,1188,1920x12)`,
-`bars=(x=1764,w=144)`, `bar=30x4`, `seg=2x4`, `gap=1` — 4 cores. The bars are
-skipped entirely for a frame if the panel is too narrow to seat them one cell
-clear of the host/ip/clock text, so a 640×480 surface with a seeded clock degrades
-to the pre-arc strip rather than overprinting it.
+Measured on the gate's 1920x1200 surface: `panel=(280,1096,1480x92)`, `row_h=20`,
+`bar=(x=310,w=1380)`, `leds=138`, `led=8x15`, `reserved=104` — 4 cores.
 
-**Data path.** The same per-core busy/idle counters `pulse` and `top` read:
-`sched::meter_cpu_count` / `meter_cpu_ticks` / `meter_current_cpu`, classified by
-vug's `classify_load` (VUG-HONESTY, §4) and drawn by vug's `draw_pulse_bar` —
-which this arc made generic over `GneissPal` so the strip and the full-screen
-monitor share one widget and one palette. Lock-free relaxed loads, never on a
-scheduler path. `own_load` is passed as `0`: the strip is drawn by a *scheduled*
-task, so its core's counters tick like any other's and the demo-core fallback
-cannot fire; feeding it a render load would fabricate exactly what VUG-HONESTY
-closed.
+**Reserving the band honestly.** An instrument the tiler can park a window on top
+of is not an instrument. `ui_status::chrome_h(ph)` (pulse band + status line) is
+the reservation, and `wm::place` lays out against `ph − chrome_h` instead of `ph`:
+the scale rule reads the reduced height, and a row that would still overflow is
+clamped up so its box ends at the reservation. This is a **tiler bottom margin**,
+not a `wcf::reserved`-style box list, because the two answer different questions —
+WC-F's list lets the compositor *refuse to paint a probe* over a window already
+there, while this must stop the window arriving. It also does not fight
+`wm::occluders`/WC-I: occlusion decides who wins where regions overlap, and after
+the reservation they do not. (Occlusion is still inherited for free — the band
+draws into the `Screen` back buffer and `present_background` subtracts
+`occluders()` from every damaged row — so an explicitly `move_to`-pinned window is
+still handled.) `legibility_cap` still reads the full `ph`: the cap is a function
+of panel *density*, not of layout area.
 
-**Coexistence.** Focus is untouched — nothing here is a view, so nothing here can
-take TAB or steal a click. WC-I occlusion is inherited rather than re-implemented:
-the strip draws into the `Screen` back buffer, and `Screen::present_background`
-subtracts `wm::occluders()` from every damaged row, so a bar has never been a
-pixel under a window and still is not.
+**The one thing the band does not get: the corners.** WC-F's own reserved boxes
+live in these rows (a 264x256 ramp against the bottom-left corner, 144x64 twins
+against the bottom-right) and it paints them straight to the framebuffer at the
+tail of every composite. Neither can move — they are photographed by the bench
+operator and their geometry is a witnessed constant. So `free_span` narrows the
+instrument to the horizontal span WC-F leaves free rather than fighting it: 1480
+of 1920 px on the bench panel, 200 of 640 on the QEMU surface. Outside the WC-F
+build (x86, non-`baremetal`, no `witness`) the band is the full panel width.
 
-**Dirty pacing.** `ui_status` now has two entry points, and the split *is* the
-pacing:
+### The LED bar — sensitivity from width, smoothness from gradient
+
+Peter again, once the band existed: *"if pulse spans the entire bottom width of the
+screen there will be more leds to show sensitivity. with the better graphics can
+you have a gradient inside each led so it scales super smooth."*
+
+* **Sensitivity is LED count, and LED count is width.** The cores stack as
+  full-width rows rather than side-by-side quarters for exactly this reason:
+  quarters would give each core ~370 px and ~37 LEDs, stacked rows give each the
+  whole 1380 px and 138. Four times the resolution, at the cost of row height
+  (20 px rather than 92) — which is still five times what PULSE-STRIP drew and
+  comfortably taller than the 8 px label beside it. Sensitivity wins.
+* **Smoothness is the fill LENGTH, and the gradient is what makes a length out of
+  lamps.** `draw_led_bar` computes the load's fill as a continuous pixel length;
+  every LED fully inside it burns at full intensity, every LED outside draws the
+  dark track, and the one LED the boundary lands inside is lit *in proportion to
+  its coverage*. A rising load brightens the next lamp continuously and then hands
+  over to the one after it. Each LED also carries its own vertical lens gradient
+  (`LED_BANDS = 8` bands, triangular profile floored at 60%), so a lit lamp reads
+  as a lamp rather than as a flat rectangle.
+* **Per-mille, not percent.** At 1380 px of bar a 1% quantum is a 14 px jump — the
+  display would step where the machine is smooth. `vug::classify_load_scaled` is
+  the VUG-HONESTY rule stated once at an arbitrary full scale; `classify_load` is
+  that function at `full = 100`, so the existing honesty witness still covers every
+  branch, and the instrument calls it at `full = 1000`.
+* **Scale colour** runs green → amber → red across the bar, by **position** rather
+  than by load, so a given lamp's colour is stable and only the length moves. A VU
+  ramp reads before any digit does, which is the job of a bench instrument.
+* `PARKED` and idle keep their meanings verbatim: a parked core draws a cool
+  **dashed** track (grouped dashes, since 1-on-1-off at 138 LEDs is a grey haze),
+  never confusable with a 0% bar; an idle-but-scheduled core **breathes** a
+  sweeping block (PULSE-ALIVE).
+
+**The status line goes back to text only** — host / ip / clock, as it was before
+PULSE-STRIP. The miniature bars are superseded. `click1_hit_test` is unchanged:
+the strip's band is still `height − line_h`, and the instrument is not a view, so
+it takes neither TAB nor a click.
+
+**Data path.** Unchanged from PULSE-STRIP: the same per-core busy/idle counters
+`pulse` and `top` read (`sched::meter_cpu_count` / `meter_cpu_ticks` /
+`meter_current_cpu`), lock-free relaxed loads, never on a scheduler path.
+`own_load` is passed as `0` — the panel is drawn by a *scheduled* task, so its
+core's counters tick like any other's and the demo-core fallback cannot fire;
+feeding it a render load would fabricate exactly what VUG-HONESTY closed.
+
+**Dirty pacing.** Two entry points, and the split *is* the pacing:
 
 * `draw()` — unconditional, from cached loads. Taken on Key/Button, where the
-  console has just repainted over the band and the strip owes a redraw on top
+  console has just repainted over both bands and they owe a redraw on top
   regardless. No resample, so a keystroke storm cannot become a telemetry storm.
-* `tick()` — the paced path, taken on the 1 Hz `Event::Timer`. Samples at most
-  once per `PSTRIP_PERIOD_MS`, then redraws **only if** the composed text line or a
-  per-core load *quantized to a bar segment* changed, and returns whether it drew.
-  The render loop presents only on `true`.
+* `tick()` — the paced path, taken on the 1 Hz `Event::Timer`. Samples at most once
+  per `PSTRIP_PERIOD_MS`, then redraws **only if** the composed text line changed or
+  a core's **lit length moved by ≥ 1 px**, and returns whether it drew. The render
+  loop presents only on `true`.
 
-Quantizing to the segment is what makes "unchanged" mean "identical frame" rather
-than "identical number"; `PARKED` gets its own bucket so a park↔idle transition is
-never quantized away.
+The threshold moved from "quantized to a bar segment" to "one pixel of lit length"
+because that is now the finest difference the display can show — finer would be
+invisible, coarser would step under a gradient built to be smooth. `lit_px` is the
+single source of truth for both the draw and the dirty test, so "the picture
+changed" and "we redrew" cannot disagree. Idle cost is unchanged at ~0 redraws/s
+(an idle core's per-mille load is a hard 0 and its length does not move); the
+ceiling is one redraw per sample, i.e. 1 Hz. PULSE-ALIVE's breath is deliberately
+*not* a dirty source — it is wall-clock animation on a core reading a hard 0, and
+making it dirty would redraw every sample and turn `skipped=` into a constant zero.
+It advances on the frames the panel draws for other reasons.
 
 **The 1 Hz pulse itself** is `status_tick` on metal. That task is timer-gated and
-is *not* spawned under QEMU raspi4b (no Group-1 IRQ), which before this arc meant
-the strip only ever refreshed on a keystroke there — an always-running pulse would
-have been a frozen picture under the gate. The input service's QEMU poll-nap
-branch now carries the same 1 Hz post itself (a wall-clock compare per cooperative
-pass, gated on `SCREEN_APP_ACTIVE` exactly as `status_tick` is), so the cadence is
-real on both paths and still costs no task.
+is *not* spawned under QEMU raspi4b (no Group-1 IRQ), which before PULSE-STRIP
+meant the strip only ever refreshed on a keystroke there. The input service's QEMU
+poll-nap branch carries the same 1 Hz post itself (a wall-clock compare per
+cooperative pass, gated on `SCREEN_APP_ACTIVE` exactly as `status_tick` is), so the
+cadence is real on both paths and still costs no task.
 
 **Serial evidence** (`[pstrip]`), and the gate directives in
 `scripts/specs/pi4-regression.spec`:
 
 ```
-[pstrip] armed cores=4 band=(0,1188,1920x12) bars=(x=1764,w=144) bar=30x4 seg=2x4 gap=1 period=1000ms
+[pstrip] armed cores=4 panel=(280,1096,1480x92) row_h=20 bar=(x=310,w=1380) leds=138 led=8x15 gap=2 bands=8 full=1000 strip_h=12 reserved=104 period=1000ms
 [pstrip] rollup samples=10 redraws=1 skipped=9 rate=0.1/s period=1000ms
 ```
 
 The `armed` line is the creation geometry — the only checkable statement about how
-a strip nobody can see headless actually *looks*, and the place a hard-coded pixel
-would show up as a constant. The rollup is the pacing assertion: `samples` counts
-meter reads, `redraws` counts frames actually drawn and presented, and the spec
-REQUIREs a rollup with a non-zero `skipped=` — a second in which nothing moved a
-bar segment draws nothing at all. The rate is printed in **tenths** so the FORBID
-can bite: `rate=` at or above `5.0/s` sustained is the strip having become a
-spinner on the render core, i.e. the SCHED-6 regression re-entered through the
-pulse. Visual verdict is the bench's.
+a panel nobody can see headless actually *looks*, and the place a hard-coded pixel
+would show up as a constant that ignores `UNAOS_FBW`/`UNAOS_FBH`. `leds=` is the
+sensitivity number and the spec FORBIDs a single-digit count; `full=1000` is
+REQUIREd so a revert to percent is caught; `reserved=` is what the tiler subtracts.
+The rollup is the pacing assertion: `samples` counts meter reads, `redraws` counts
+frames actually drawn and presented, and the spec REQUIREs a rollup with a non-zero
+`skipped=`. The rate is printed in **tenths** so the FORBID can bite: `rate=` at or
+above `5.0/s` sustained is the panel having become a spinner on the render core,
+i.e. the SCHED-6 regression re-entered through the pulse. Visual verdict is the
+bench's.
 
 ## 5. Serial evidence
 

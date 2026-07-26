@@ -3024,6 +3024,21 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
 
     let cap = legibility_cap(ph);
 
+    // PULSE-2 — the bottom chrome's reservation. `ui_status` owns the last `chrome_h(ph)` rows of the
+    // panel: the CPU pulse instrument and the host/ip/clock status line. The tiler lays out against
+    // `usable_h` instead of `ph` so a window box is never *placed* into those rows in the first place.
+    //
+    // This is a vertical budget rather than a `wcf::reserved`-style box list because the two answer
+    // different questions: WC-F's list lets the compositor refuse to paint a probe over a window that
+    // is already there, while this must stop the window arriving. It also does not touch `occluders`
+    // (WC-I): occlusion decides who wins where regions overlap, and after the reservation they do not.
+    //
+    // Note the scale rule reads `usable_h` but `legibility_cap` still reads `ph` — the cap is a
+    // function of panel DENSITY (how big a font pixel wants to be), not of the layout area.
+    let usable_h = ph
+        .saturating_sub(crate::ui_status::chrome_h(ph))
+        .max(1);
+
     let mut t = TABLE.lock();
     let mut cx = GAP;
     let mut cy = GAP + TITLE_H + BORDER;
@@ -3034,7 +3049,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
             continue;
         }
         let (w, h) = (r.w.max(1), r.h.max(1));
-        let scale = ((pw / 2 / w).min(ph / 2 / h)).min(cap).max(1);
+        let scale = ((pw / 2 / w).min(usable_h / 2 / h)).min(cap).max(1);
         // F5 — saturating throughout; `w`/`h` come from the caller via `create`.
         let bw = w.saturating_mul(scale).saturating_add(2 * BORDER);
         let bh = h
@@ -3054,7 +3069,12 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         let before = outer_box(r);
         r.scale = scale;
         r.x = cx + BORDER;
-        r.y = cy;
+        // PULSE-2 — the last-resort clamp. The scale rule already keeps a single row inside
+        // `usable_h`, but rows STACK: enough windows and `cy` walks off the bottom. When that happens
+        // the window is pulled back up so its box ends at the reservation. Two windows overlapping
+        // each other is a legibility problem the operator can fix by closing one; a window over the
+        // instrument panel silently breaks the one surface that is supposed to be always readable.
+        r.y = cy.min(usable_h.saturating_sub(bh));
         r.damaged = true;
         if outer_box(r) != before && before.2 != 0 && before.3 != 0 {
             vacated[nv] = before;

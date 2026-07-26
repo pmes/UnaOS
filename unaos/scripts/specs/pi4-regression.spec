@@ -549,20 +549,48 @@ FORBID \[wc-k\] .*contig=no
 FORBID \[wc-k\] .*-> SPLIT
 FORBID \[wc-k\] .*-> AT-RISK
 FORBID \[wc-k\] .*-> UNSTAGED
-# --- PULSE-STRIP: the always-running per-core CPU pulse, docked in the PI-UI-2 bottom status strip.
-# ---    EXTENDS that strip rather than adding a second bottom band or a windowed app: the band is
-# ---    already the panel's bottom chrome and already refreshes at 1 Hz on the render task, so the
-# ---    pulse costs no thread (KILLBOUND bounds the table at 8), no window (nothing focusable, nothing
-# ---    killable, nothing in the z-order) and -- this is the point of the second directive -- no extra
-# ---    present. WC-I occlusion is inherited unchanged: the strip draws into the `Screen` back buffer
-# ---    and `present_background` subtracts `wm::occluders()` from every damaged row, so a bar has
-# ---    never been written under a window.
+# --- PULSE-2: the always-running per-core CPU pulse, as an INSTRUMENT PANEL in the standing gap at
+# ---    the bottom of the panel -- below the tiled windows, above the PI-UI-2 status line.
+# ---
+# ---    PULSE-STRIP put it inside the status line itself. On the bench panel `Metrics::for_height(1200)`
+# ---    is scale=1, so that band is 12 px and the bars came out ~30x4 -- about a millimetre tall.
+# ---    Peter's correction is binding and general: this panel is a TEST-TOOL SURFACE, not a desktop
+# ---    imitation, and an instrument gets the room it needs to be read at arm's length. So the pulse
+# ---    now owns a band ~1/13 of the panel tall with one labelled bar row per core, and the status
+# ---    line goes back to text only.
+# ---
+# ---    Everything PULSE-STRIP got right is unchanged and still asserted below: no thread (KILLBOUND
+# ---    bounds the table at 8), no window (nothing focusable, nothing killable, nothing in the
+# ---    z-order), no extra present. WC-I occlusion is still inherited rather than re-implemented --
+# ---    the band draws into the `Screen` back buffer and `present_background` subtracts
+# ---    `wm::occluders()` from every damaged row.
+# ---
+# ---    Peter's second directive, once the band existed: "if pulse spans the entire bottom width of
+# ---    the screen there will be more leds to show sensitivity. with the better graphics can you have
+# ---    a gradient inside each led so it scales super smooth." So each core's bar is a long row of LED
+# ---    segments (sensitivity IS segment count, and segment count is width -- which is why the cores
+# ---    stack as full-width rows rather than sitting in side-by-side quarters), and the fill is a
+# ---    continuous pixel LENGTH with the boundary LED lit in proportion to its coverage, so the meter
+# ---    scales smoothly instead of clicking between whole segments.
 # ---
 # ---    The `armed` line is the creation geometry, and it is the one thing a replay can check about
-# ---    the LOOK of a strip nobody can see headless: the band's origin and size, the bars' right-
-# ---    aligned x and total width, and the per-segment metrics -- all derived from `ui::Metrics`, so
-# ---    the line changes with the panel and a hard-coded pixel would show up here as a constant.
-REQUIRE \[pstrip\] armed cores=[0-9]+ band=\(0,[0-9]+,[0-9]+x[0-9]+\) bars=\(x=[0-9]+,w=[0-9]+\)
+# ---    the LOOK of a panel nobody can see headless: the reserved band's box, the per-core row pitch,
+# ---    the bar's x/width, and the LED metrics. `reserved=` is the number `wm::place` subtracts from
+# ---    its vertical budget so no tiled window is laid out over the instrument. All of it derives from
+# ---    the panel height and `ui::Metrics`, so a hard-coded pixel would show up here as a constant
+# ---    that ignores UNAOS_FB*.
+REQUIRE \[pstrip\] armed cores=[0-9]+ panel=\([0-9]+,[0-9]+,[0-9]+x[0-9]+\) row_h=[0-9]+ bar=\(x=[0-9]+,w=[0-9]+\) leds=[0-9]+ led=[0-9]+x[0-9]+ gap=[0-9]+ bands=[0-9]+ full=[0-9]+ strip_h=[0-9]+ reserved=[0-9]+
+# ---    The instrument must actually be seated: a zero-width band or a zero-height row is the
+# ---    "too small, skipped" degenerate path, and on the gate geometry it means the layout broke.
+FORBID \[pstrip\] armed .*panel=\([0-9]+,[0-9]+,0x[0-9]+\)
+FORBID \[pstrip\] armed .*row_h=0
+# ---    SENSITIVITY FLOOR. The LED count is the whole reason the instrument spans the width; a bar
+# ---    that has fallen back to a handful of fat segments is the PULSE-STRIP regression re-entered
+# ---    from the other side. Two digits minimum on the gate geometry (the bench panel draws ~140).
+FORBID \[pstrip\] armed .*leds=[0-9] led=
+# ---    Per-mille full scale, not percent: at ~1400 px of bar a 1% quantum is a 14 px jump and the
+# ---    gradient would be stepping under itself. Pin the scale so a revert to percent is caught.
+REQUIRE \[pstrip\] armed .*full=1000
 # ---    The rollup is the DIRTY-PACING assertion. `samples` counts meter reads (one a second);
 # ---    `redraws` counts frames actually drawn and presented. They are deliberately different
 # ---    numbers: a second in which no core's load moved a bar segment and the text line did not

@@ -221,15 +221,15 @@ const MAX_METER_CPUS: usize = 16;
 pub(crate) const PULSE_SEGS: usize = 10;
 
 // Meter palette (shared by the vug corner meters and the `pulse` full-screen monitor).
-const METER_DIM: u32 = 0x00_2A2432;
+pub(crate) const METER_DIM: u32 = 0x00_2A2432;
 const METER_LILAC: u32 = 0x00_B36BFF;
 pub(crate) const METER_PURPLE: u32 = 0x00_9B59B6;
 const METER_LABEL: u32 = 0x00_8A8296;
 /// PULSE-ALIVE breath colour — clearly brighter than `METER_DIM`, dimmer than a load fill: the one
 /// sweeping segment an idle-but-scheduled core lights so "alive and idle" reads at a glance.
-const METER_BREATH: u32 = 0x00_5F4E86;
+pub(crate) const METER_BREATH: u32 = 0x00_5F4E86;
 /// Parked dash colour — cooler/dimmer than `METER_DIM` so a broken track reads as "not participating".
-const METER_PARKED: u32 = 0x00_3A3550;
+pub(crate) const METER_PARKED: u32 = 0x00_3A3550;
 
 /// VUG-HONESTY parked-core marker (a load-array sentinel, disjoint from the 0..=100 percent range). A
 /// core whose pulse counters are frozen this window AND that is NOT the demo core is parked /
@@ -253,10 +253,29 @@ pub(crate) const PARKED: u32 = u32::MAX;
 ///                      counters are frozen between windows and this fallback still fabricated.) Report
 ///                      PARKED instead.
 pub(crate) fn classify_load(db: u64, di: u64, is_demo: bool, own_load: u32) -> u32 {
+    classify_load_scaled(db, di, is_demo, own_load, 100)
+}
+
+/// PULSE-2 — [`classify_load`] at an arbitrary full-scale, so a display with more resolution than
+/// "one bar in ten" can have more resolution than one percent.
+///
+/// The honesty rule is stated ONCE, here; `classify_load` is this function at `full = 100` and the
+/// VUG-HONESTY witness therefore still covers every branch of it. The instrument panel calls it at
+/// `full = 1000` (per-mille): its LED bar is ~1400 px wide on the bench panel, so a 1% quantum would
+/// be a 14 px jump — the display would step where the machine is smooth, which is exactly the
+/// "sensitivity" Peter asked the full width to buy. `own_load` is a percent by contract and is scaled
+/// to match. [`PARKED`] is `u32::MAX` and stays disjoint from `0..=full` at any sane scale.
+pub(crate) fn classify_load_scaled(
+    db: u64,
+    di: u64,
+    is_demo: bool,
+    own_load: u32,
+    full: u32,
+) -> u32 {
     if db + di > 0 {
-        ((db * 100) / (db + di)) as u32
+        ((db * full as u64) / (db + di)) as u32
     } else if is_demo {
-        own_load
+        (own_load as u64 * full as u64 / 100) as u32
     } else {
         PARKED
     }
