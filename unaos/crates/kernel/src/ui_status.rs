@@ -146,6 +146,67 @@
 //! live number and whether the source's own quantum (1% → 10‰) clears one pixel of lit length on THIS
 //! panel, so "the meter cannot show what the source can say" is caught in the gate.
 
+//! ## PULSE-4 — the latency budget, and why a mechanically-correct meter still read dead
+//!
+//! PULSE-3's fix works, and the P65 capture proves it mechanically: `src live=4/4 stepres=13px PASS`,
+//! rollups at `redraws=6-8/10 srcdelta=6-8`. The source is live, the meter can resolve it, and the
+//! strip redraws in most windows. Peter watching that same panel: *"well off live tracking"*.
+//!
+//! Both are true, because "the strip redraws" and "the strip tracks" are different claims. Adding up
+//! what stood between a load changing and a pixel moving:
+//!
+//! | term | before | worst case |
+//! |---|---|---|
+//! | source window (`busy_pct_recent`, rolling) | ~250 ms | 250 ms |
+//! | wake + sample cadence (`PSTRIP_PERIOD_MS`) | 1000 ms | 1000 ms |
+//! | dirty threshold (1 px of lit length) | 13 px per source quantum | 0 ms |
+//! | display filter | none | 0 ms |
+//! | **step → pixels** | | **~1.25 s** |
+//!
+//! **The cadence was the whole of it, and it was worse than a lag.** A second is already past the
+//! ~250–300 ms at which a human stops reading a meter as attached to the machine. But the sharper
+//! failure is the one an average latency hides: a burst SHORTER than the sample period could begin and
+//! end entirely between two samples and leave no mark on the panel whatsoever. Vugs churning in
+//! sub-second bursts were not being drawn late — they were not being drawn. Ten redraws a rollup, every
+//! one of them of a load the operator had already stopped seeing.
+//!
+//! The other two terms were not the defect and PULSE-4 does not touch them:
+//!
+//! * **The dirty threshold is already at the panel's floor.** It fires on one pixel of lit length, and
+//!   the P65 witness measured one source quantum at 13 px — thirteen times more movement than the test
+//!   needs. It cannot be the reason anything went unseen. (Sub-1% wander IS invisible, but that is the
+//!   SOURCE's quantum, not the threshold's: `busy_pct_recent` is a percent.)
+//! * **The ~250 ms source window is sched-lane and is left alone.** It now sets the floor of this
+//!   budget, so it is the next thing worth questioning if 250 ms cadence still does not satisfy the
+//!   eye — but narrowing it changes what `top` and `SCHED: load` report, and that is a scheduler
+//!   decision, not a display one. Flagged, not touched.
+//!
+//! So PULSE-4 is two changes, and they are a pair:
+//!
+//! 1. **[`PSTRIP_PERIOD_MS`] 1000 → 250** — one sample per source window, the fastest cadence at which
+//!    consecutive samples carry independent evidence. Worst-case step→pixels falls from ~1.25 s to
+//!    ~500 ms, and a 250 ms burst can no longer fall between samples. [`PSTRIP_PERIOD_TICKS`] carries
+//!    the same number to the metal `status-tick` wake, which is the outer term and would otherwise have
+//!    pinned the real cadence at 1 Hz no matter what this module asked for.
+//! 2. **Instant attack, ~1 s decay ([`attack_decay`])** — cadence alone makes a burst *drawn*; the
+//!    envelope makes it *seen*. A 250 ms spike at 4 Hz is a single frame; with the decay it is a peak
+//!    that falls away over about a second. The attack side has no filter at all, so nothing is traded
+//!    for the calm, and the fall is a bounded RATE rather than a geometric approach — it converges
+//!    exactly, within one decay constant, instead of creeping through the last few per-mille and
+//!    taxing the idle panel with seconds of decay repaints.
+//!
+//! **Dirty pacing is unchanged and the default-quiet law stands.** Cadence raises the ceiling on how
+//! fast the strip CAN respond; it repaints nothing that has not moved. An idle core still reads a hard
+//! 0, its lit length still does not move, and the idle panel's redraw rate is still set by the status
+//! text's seconds field at ~1/s — the same as at 1 Hz, four times the samples notwithstanding. The
+//! decay converges to an exact 0 rather than asymptoting, so a machine that goes quiet stops redrawing
+//! instead of creeping forever.
+//!
+//! The rollup carries the budget as a reading: `srate=` (achieved sample rate), `gapmax=` (its worst
+//! excursion) and `lat_max_ms=` (worst source-moved → pixels-on-panel, measured in-kernel). A wake that
+//! silently stays at 1 Hz shows up as `srate=1.0/s` however this module is configured, which is exactly
+//! the failure that would otherwise present as "PULSE-4 did nothing" on the bench and nowhere in a log.
+
 use crate::pal::GneissPal;
 use crate::vug::{METER_BREATH, METER_DIM, METER_PARKED, PARKED};
 use alloc::format;
@@ -245,9 +306,52 @@ pub fn draw<P: GneissPal>(pal: &mut P) {
 /// not for want of counters.)
 pub const PSTRIP_MAX_CPUS: usize = 8;
 
-/// The pulse sample period. One sample per second is the strip's own refresh cadence; sampling
-/// faster would only add telemetry reads the 1 Hz redraw could never show.
-pub const PSTRIP_PERIOD_MS: u64 = 1000;
+/// The pulse sample period — PULSE-4's headline change: **250 ms, not 1000**.
+///
+/// PULSE-2 set this to a second with the reasoning that "sampling faster would only add telemetry
+/// reads the 1 Hz redraw could never show". That reasoning was circular — the redraw could not show
+/// them *because the sample was the redraw's own cadence*. What it actually bought was the latency
+/// budget PULSE-4 exists to close (see the module note): a load step waited up to a full second to be
+/// sampled, and a burst shorter than the period could begin and end entirely between two samples and
+/// leave no mark on the panel at all.
+///
+/// 250 ms is chosen against the source rather than against a round number: `busy_pct_recent` is a
+/// rolling ~250 ms window, so one sample per window is the fastest cadence at which consecutive
+/// samples carry independent information. Sampling faster than the source's own window would re-read
+/// overlapping evidence — motion in the log with no new fact behind it.
+///
+/// Pacing is untouched by this: [`tick`] still draws only on a pixel of movement, so the idle panel's
+/// redraw rate is set by the status text's seconds field (~1/s) exactly as it was at 1 Hz. Cadence
+/// raises the CEILING on how fast the strip *can* respond; it does not repaint anything that has not
+/// moved. THE DEFAULT-QUIET LAW STANDS.
+pub const PSTRIP_PERIOD_MS: u64 = 250;
+
+/// Per-core display decay constant. PULSE-4: the meter attacks INSTANTLY (a rising load is displayed
+/// the sample it is read — a burst must never be averaged into invisibility) and falls back toward the
+/// live value over about this long.
+///
+/// Asymmetry is the whole point and it is not cosmetic smoothing. A symmetric filter would trade the
+/// burst away to buy the calm; instant attack keeps every peak the source reports, and the decay is
+/// what gives that peak enough dwell time on the panel for an eye to catch it. Without it a 250 ms
+/// spike is one 250 ms frame — technically drawn, humanly invisible. It also costs nothing in honesty:
+/// the displayed value is never HIGHER than something the source actually reported, and it converges
+/// to the live number exactly (see [`attack_decay`]'s 1‰ floor), so a decaying bar cannot park above a
+/// load that has genuinely gone away. It is also a BOUND, not a half-life: the fall is a rate of full
+/// scale per this interval, so a peak's dwell is exactly this long and then the panel is still again.
+const PSTRIP_DECAY_MS: u64 = 1000;
+
+/// The number of scheduler ticks (at the 250 Hz per-core tick) that make one [`PSTRIP_PERIOD_MS`].
+/// Exported so the metal `status-tick` wake and this module's own pacing are the SAME number by
+/// construction — a hard-coded `sleep_ticks(250)` beside a 250 ms period is how the wake and the
+/// sample silently drift apart, and the wake is the outer term of the latency budget.
+pub const PSTRIP_PERIOD_TICKS: u64 = {
+    let t = PSTRIP_PERIOD_MS * 250 / 1000;
+    if t == 0 {
+        1
+    } else {
+        t
+    }
+};
 
 /// Rollup period for the `[pstrip]` witness.
 const PSTRIP_ROLLUP_MS: u64 = 10_000;
@@ -262,8 +366,15 @@ struct PulseState {
     ncpu: usize,
     /// Previous `(busy, idle)` tick snapshot per core.
     prev: [(u64, u64); PSTRIP_MAX_CPUS],
-    /// Last window's displayed load per core (`0..=100`, or [`PARKED`]).
+    /// Last window's DISPLAYED load per core, in per-mille (or [`PARKED`]) — the value the bars are
+    /// drawn from and the value the dirty test measures. PULSE-4: this is the attack/decay envelope of
+    /// `raw`, not `raw` itself.
     load: [u32; PSTRIP_MAX_CPUS],
+    /// PULSE-4 — last window's RAW source reading per core, before the envelope. Kept separately so
+    /// `srcdelta` still counts movement of the SOURCE (its original meaning) rather than movement of
+    /// the display, which the decay would otherwise keep non-zero for a second after the machine went
+    /// quiet and quietly turn the stale-source alarm into a tautology.
+    raw: [u32; PSTRIP_MAX_CPUS],
     /// `ms()` of the last sample.
     last_ms: u64,
     /// FNV-1a of the last composed text line — the cheap "did the text change" test that avoids
@@ -276,6 +387,18 @@ struct PulseState {
     /// movement cleared a pixel of lit length. Printed beside `redraws` so a window that was skipped
     /// while the machine was changing is a reading in the log rather than a bench observation.
     srcdelta: u64,
+    /// PULSE-4 — the widest gap actually observed between two samples in this rollup, in ms. The
+    /// ACHIEVED cadence, as opposed to the requested one: the strip samples on a wake it does not own
+    /// (`status-tick` on metal, the input task's poll-nap under QEMU), so `PSTRIP_PERIOD_MS` is a floor
+    /// and this is what the machine really delivered.
+    gap_max_ms: u64,
+    /// PULSE-4 — open step-to-paint measurement: the earliest wall-clock ms at which the source change
+    /// now awaiting paint could have occurred (`sample_time - gap`, the conservative end of the window
+    /// it was detected in). `0` = nothing pending. Cleared by the paint that shows it.
+    pend_ms: u64,
+    /// PULSE-4 — worst step-to-paint latency in this rollup, in ms: source-moved → pixels-on-panel,
+    /// measured in-kernel. This is the number the arc is actually about.
+    lat_max_ms: u64,
     rollup_ms: u64,
     /// PULSE-3 — has the source witness been re-emitted at a rollup boundary yet? It fires once at
     /// arm time, which is the earliest moment the panel exists and therefore the moment MOST likely to
@@ -290,11 +413,15 @@ static PULSE: Mutex<PulseState> = Mutex::new(PulseState {
     ncpu: 0,
     prev: [(0, 0); PSTRIP_MAX_CPUS],
     load: [0; PSTRIP_MAX_CPUS],
+    raw: [0; PSTRIP_MAX_CPUS],
     last_ms: 0,
     text_hash: 0,
     samples: 0,
     redraws: 0,
     srcdelta: 0,
+    gap_max_ms: 0,
+    pend_ms: 0,
+    lat_max_ms: 0,
     rollup_ms: 0,
     src_reemitted: false,
 });
@@ -633,6 +760,43 @@ fn lit_px(g: &RowGeom, permille: u32) -> usize {
     g.bar_w * (permille as usize).min(PERMILLE_FULL as usize) / PERMILLE_FULL as usize
 }
 
+/// PULSE-4 — one sample of the per-core display envelope: **instant attack, ~[`PSTRIP_DECAY_MS`] decay**.
+///
+/// * `new >= prev` (or either side is [`PARKED`]): take `new` outright. A rising edge, and the
+///   park/unpark transition, are displayed the sample they are read. There is no rise-time filter
+///   anywhere in this path — the burst the operator is watching for is never averaged away.
+/// * `new < prev`: fall at a bounded RATE — full scale per [`PSTRIP_DECAY_MS`], i.e. 250‰ per sample at
+///   the 250 ms cadence. So a fall of any size completes within one decay constant, and a drop from
+///   pinned to idle dwells for exactly that second and no longer.
+///
+/// **A rate, deliberately, and not a geometric approach to the target.** The obvious filter closes a
+/// `dt/tau` fraction of the gap per sample, which is smoother-looking and wrong here for two reasons.
+/// It asymptotes — it would spend seconds creeping through the last few per-mille, and those are
+/// precisely the values whose lit length still moves a pixel, so the strip would keep redrawing long
+/// after the machine went quiet. That is a direct tax on the default-quiet law: a busy second would buy
+/// five or six seconds of decay repaints. A bounded rate converges EXACTLY, in at most
+/// `PSTRIP_DECAY_MS`, and then the panel is genuinely still. It also makes the dwell a number one can
+/// state rather than a half-life one has to reason about.
+///
+/// A consequence worth naming: a small fall (less than one step) is passed through untouched, so
+/// ordinary downward tracking is not smoothed at all — only a fall large enough to be a burst ending
+/// gets the dwell. That is the intended shape. The filter exists to hold PEAKS on the panel long enough
+/// to be seen, not to slow the meter down in general.
+///
+/// **This never invents a value the source did not report.** The output is always between the previous
+/// display and the current reading, both of which the source produced; it can lag a fall, never lead a
+/// rise, and never exceed the highest number the feed has actually said. VUG-HONESTY is intact —
+/// what would breach it is a smoothed value filling a GAP in the feed, and there is no gap: every
+/// sample has a live reading behind it.
+fn attack_decay(prev: u32, new: u32, dt_ms: u64) -> u32 {
+    if prev == PARKED || new == PARKED || new >= prev {
+        return new;
+    }
+    let dt = dt_ms.min(PSTRIP_DECAY_MS);
+    let step = ((PERMILLE_FULL as u64 * dt) / PSTRIP_DECAY_MS).max(1) as u32;
+    prev - step.min(prev - new)
+}
+
 /// Draw the instrument panel from the last sampled loads: clear the band, then one labelled LED row
 /// per core. Nothing here samples — [`tick`] owns the telemetry cadence.
 fn draw_panel<P: GneissPal>(pal: &mut P) {
@@ -792,7 +956,7 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
             // `leds=` is the SENSITIVITY number — LEDs per core bar, i.e. how fine a load change the
             // meter can articulate before the gradient takes over inside a single lamp.
             serial_println!(
-                "[pstrip] armed cores={} panel=({},{},{}x{}) row_h={} bar=(x={},w={}) leds={} led={}x{} gap={} bands={} full={} strip_h={} reserved={} period={}ms",
+                "[pstrip] armed cores={} panel=({},{},{}x{}) row_h={} bar=(x={},w={}) leds={} led={}x{} gap={} bands={} full={} strip_h={} reserved={} period={}ms attack=instant decay={}ms",
                 st.ncpu,
                 px,
                 py,
@@ -809,11 +973,20 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
                 PERMILLE_FULL,
                 m.line_h,
                 chrome_h(ph),
-                PSTRIP_PERIOD_MS
+                PSTRIP_PERIOD_MS,
+                PSTRIP_DECAY_MS
             );
             src_witness(&g, st.ncpu);
             changed = true; // first frame must paint the bars
         } else if now.wrapping_sub(st.last_ms) >= PSTRIP_PERIOD_MS {
+            // PULSE-4 — the ACHIEVED gap, before it is overwritten. The strip samples on somebody
+            // else's wake, so the requested period is a floor and this is the real one; it is also the
+            // conservative window a detected source change must have happened inside, which is what
+            // makes the step-to-paint number below an upper bound rather than an estimate.
+            let gap = now.wrapping_sub(st.last_ms);
+            if gap > st.gap_max_ms {
+                st.gap_max_ms = gap;
+            }
             st.last_ms = now;
             st.samples += 1;
             let demo = crate::arch::sched::meter_current_cpu();
@@ -845,14 +1018,19 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
                 let new = live_permille(c).unwrap_or_else(|| {
                     crate::vug::classify_load_scaled(db, di, c == demo, 0, PERMILLE_FULL)
                 });
-                if new != st.load[c] {
+                // `srcdelta` keeps its PULSE-3 meaning exactly: movement of the SOURCE, measured
+                // against the previous RAW reading, upstream of the envelope.
+                if new != st.raw[c] {
                     srcmoved = true;
                 }
+                st.raw[c] = new;
+                // PULSE-4 — the displayed value is the envelope of the source, not the source.
+                let disp = attack_decay(st.load[c], new, gap);
                 changed |= match &geo {
-                    Some(g) => lit_px(g, new) != lit_px(g, st.load[c]),
+                    Some(g) => lit_px(g, disp) != lit_px(g, st.load[c]),
                     // No seatable geometry: fall back to the number itself, so a panel too small to
                     // draw still never claims "unchanged" about a load that moved.
-                    None => new != st.load[c],
+                    None => disp != st.load[c],
                 };
                 // PULSE-ALIVE's breath sweep is deliberately NOT a dirty source, exactly as it was
                 // not one in PULSE-STRIP. It is wall-clock animation on a core reading a hard 0, so
@@ -861,7 +1039,16 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
                 // wearing a flag, which is the thing the spec's FORBID exists to catch. The breath
                 // advances on the frames the panel draws for other reasons, which once the clock is
                 // seeded is every second anyway.
-                st.load[c] = new;
+                st.load[c] = disp;
+            }
+            // PULSE-4 — open the step-to-paint stopwatch on the first sample that saw the source move
+            // and has not yet been shown. `now - gap` is the earliest instant the change could have
+            // happened, so the latency this yields is the worst case, not the flattering one. An
+            // already-open measurement is NOT restarted: a run of sub-pixel moves that only becomes
+            // visible on the fifth sample is a five-sample latency, and reporting it as one would hide
+            // precisely the "value wandered for a second before the bar admitted it" case.
+            if srcmoved && st.pend_ms == 0 {
+                st.pend_ms = now.wrapping_sub(gap).max(1);
             }
         }
         // The text line changes on its own clock (lease settling, SNTP seeding, the seconds field).
@@ -872,6 +1059,16 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
         }
         if changed {
             st.redraws += 1;
+            // PULSE-4 — close the stopwatch. `changed` is decided here and `draw` runs unconditionally
+            // on it at the bottom of this function, so this instant IS pixels-on-panel to within one
+            // band blit; there is no later point that would be more honest to measure at.
+            if st.pend_ms != 0 {
+                let lat = now.wrapping_sub(st.pend_ms);
+                if lat > st.lat_max_ms {
+                    st.lat_max_ms = lat;
+                }
+                st.pend_ms = 0;
+            }
         }
         if srcmoved {
             st.srcdelta += 1;
@@ -883,15 +1080,28 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
             // Fixed-point tenths: at a 10 s rollup an integer /s would truncate every honest rate
             // to 0 and the spec's busy-loop FORBID would have nothing to bite on.
             let rate_x10 = st.redraws.saturating_mul(10_000) / span.max(1);
+            // PULSE-4 — the ACHIEVED sample rate beside the requested period, and the worst
+            // source-moved → pixels-on-panel latency measured over the window. Together they are the
+            // whole latency budget as a reading: `srate` is the cadence the wake actually delivered
+            // (a metal `status-tick` that quietly stayed at 1 Hz would show as 1.0 here however this
+            // module is configured), `gapmax` is its worst excursion, and `lat_max_ms` is the number
+            // the operator's "laggy" verdict is about. `lat_max_ms=0` means no source movement was
+            // ever left waiting for a paint in this window.
+            let srate_x10 = st.samples.saturating_mul(10_000) / span.max(1);
             serial_println!(
-                "[pstrip] rollup samples={} redraws={} skipped={} srcdelta={} rate={}.{}/s period={}ms",
+                "[pstrip] rollup samples={} redraws={} skipped={} srcdelta={} rate={}.{}/s srate={}.{}/s gapmax={}ms lat_max_ms={} period={}ms decay={}ms",
                 st.samples,
                 st.redraws,
                 st.samples.saturating_sub(st.redraws),
                 st.srcdelta,
                 rate_x10 / 10,
                 rate_x10 % 10,
-                PSTRIP_PERIOD_MS
+                srate_x10 / 10,
+                srate_x10 % 10,
+                st.gap_max_ms,
+                st.lat_max_ms,
+                PSTRIP_PERIOD_MS,
+                PSTRIP_DECAY_MS
             );
             // PULSE-3 — re-state the source witness ONCE, at the first rollup. The arm-time fire is
             // taken the instant the panel exists, before every core has necessarily entered `run()`,
@@ -909,6 +1119,11 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
             st.samples = 0;
             st.redraws = 0;
             st.srcdelta = 0;
+            // `gap_max_ms` / `lat_max_ms` are per-window maxima, so they reset with the window.
+            // `pend_ms` deliberately does NOT: an open measurement spanning a rollup boundary is a
+            // real latency and gets reported in the window it finally lands in.
+            st.gap_max_ms = 0;
+            st.lat_max_ms = 0;
             st.rollup_ms = now;
         }
     }

@@ -448,6 +448,117 @@ a transient `live=0` is possible there and would otherwise stand as the log's on
 word on the feed; ten seconds of settled boot later the answer is not transient.
 Once only — insurance against an early fire, not a second periodic witness.
 
+### PULSE-4 — the latency budget: a correct meter that still read dead
+
+PULSE-3's fix works and the attended P65v2 capture proves it *mechanically*:
+`[pstrip] src live=4/4 stepres=13px PASS`, rollups at `redraws=6-8/10 srcdelta=6-8
+rate=0.5-0.7/s`. Peter, watching that same panel while vugs churned: **"well off
+live tracking"**. Both statements are true, because *"the strip redraws"* and
+*"the strip tracks"* are different claims. PULSE-4 is the second one.
+
+**The budget, term by term.** What stood between a load changing and a pixel moving:
+
+| term | before | worst case |
+|---|---|---|
+| source window (`busy_pct_recent`, rolling) | ~250 ms | 250 ms |
+| wake + sample cadence (`PSTRIP_PERIOD_MS`) | 1000 ms | 1000 ms |
+| dirty threshold (1 px of lit length) | 13 px per source quantum | 0 ms |
+| display filter | none | 0 ms |
+| **step → pixels** | | **~1.25 s** |
+
+**The cadence was the whole of it.** A second is already past the ~250–300 ms at
+which a human stops reading a meter as attached to the machine — but the sharper
+failure is one an average latency hides: **a burst shorter than the sample period
+could begin and end entirely between two samples and leave no mark on the panel at
+all.** Sub-second vug churn was not being drawn late; it was not being drawn. Six to
+eight redraws a window, every one of them of a load the operator had already stopped
+seeing. That is the gap between the log and the verdict.
+
+The other two terms were *not* the defect and are deliberately untouched:
+
+* **The dirty threshold is already at the panel's floor** — one pixel of lit length,
+  against 13 px of movement per source quantum. It cannot be why anything went
+  unseen. Sub-1% wander *is* invisible, but that is the SOURCE's quantum
+  (`busy_pct_recent` is a percent), not the threshold's.
+* **The ~250 ms source window is scheduler-lane and is left alone.** It now sets the
+  floor of this budget and is the next thing worth questioning if 250 ms cadence
+  still does not satisfy the eye — but narrowing it changes what `top` and
+  `SCHED: load` report, which is a scheduler decision, not a display one.
+  **Flagged, not touched.**
+
+**The fix is two changes, and they are a pair.**
+
+1. **`PSTRIP_PERIOD_MS` 1000 → 250.** One sample per source window — the fastest
+   cadence at which consecutive samples carry independent evidence; faster would
+   re-read overlapping evidence and put motion in the log with no new fact behind
+   it. Worst-case step→pixels falls from ~1.25 s to ~500 ms and a 250 ms burst can no
+   longer fall between samples. PULSE-2's stated reason for the second ("sampling
+   faster would only add reads the 1 Hz redraw could never show") was circular: the
+   redraw could not show them because the sample *was* the redraw's cadence.
+2. **Instant attack, ~1 s decay** (`attack_decay`). Cadence alone makes a burst
+   *drawn*; the envelope makes it *seen* — a 250 ms spike at 4 Hz is one frame,
+   which is technically drawn and humanly invisible. Rises are taken outright, with
+   no filter of any kind, so nothing is traded for the calm; falls proceed at a
+   bounded **rate** — full scale per decay constant — rather than as a geometric
+   approach to the target. That distinction is not cosmetic: a geometric filter
+   asymptotes, and the last few per-mille it creeps through are exactly the values
+   whose lit length still moves a pixel, so one busy second would buy five or six
+   seconds of decay repaints. A rate converges exactly, within one decay constant,
+   and then the panel is genuinely still. A fall smaller than one step passes through
+   untouched, so ordinary downward tracking is not slowed — only a fall big enough to
+   be a burst ending gets the dwell. It stays inside VUG-HONESTY because the displayed
+   value is always between two numbers the source actually reported — it can lag a
+   fall, never lead a rise, and never exceed the highest reading the feed has given.
+
+**The metal wake is the outer term**, and it was the trap: `status_tick`'s nap was a
+hard-coded `sleep_ticks(250)` — a literal second — beside a 1000 ms period constant.
+Raising `PSTRIP_PERIOD_MS` alone would have left metal sampling at 1 Hz regardless,
+i.e. PULSE-4 doing nothing on the only machine whose panel anyone watches. The nap
+now derives from `ui_status::PSTRIP_PERIOD_TICKS`, so the wake and the sample are the
+same number by construction. (The QEMU poll-nap branch already read the constant.)
+
+**Dirty pacing is unchanged and the default-quiet law stands.** Cadence raises the
+ceiling on how fast the strip *can* respond; it repaints nothing that has not moved.
+An idle core still reads a hard 0, its lit length still does not move, and the idle
+panel's redraw rate is still set by the status text's seconds field at ~1/s — the
+same as at 1 Hz, four times the samples notwithstanding. The decay converges to an
+exact 0 (a 1‰-per-sample floor under the geometric step) rather than asymptoting, so
+a machine that goes quiet stops redrawing instead of creeping forever. The spec's
+`rate < 5.0/s` FORBID and its non-zero `skipped=` REQUIRE both still hold.
+
+**Witnesses** — the budget as a reading, not as a bench observation:
+
+```
+[pstrip] armed cores=4 panel=(280,1096,1480x92) ... period=250ms attack=instant decay=1000ms
+[pstrip] rollup samples=40 redraws=10 skipped=30 srcdelta=12 rate=1.0/s srate=4.0/s gapmax=252ms lat_max_ms=254 period=250ms decay=1000ms
+```
+
+* `srate=` is the **achieved** sample rate and `gapmax=` its worst excursion. The
+  strip samples on a wake it does not own, so `PSTRIP_PERIOD_MS` is a floor and these
+  are what the machine really delivered — a wake that quietly stayed at 1 Hz reads
+  `srate=1.0/s` however this module is configured, which is precisely the failure
+  that would otherwise present as "PULSE-4 did nothing" on the bench and nowhere in
+  a log.
+* `lat_max_ms=` is the worst **source-moved → pixels-on-panel** latency in the
+  window, measured in-kernel. The stopwatch opens at `sample_time - gap` (the
+  earliest instant the detected change could have occurred, so the number is an upper
+  bound rather than a flattering one) and closes where `changed` is decided, which is
+  pixels-on-panel to within one band blit. An already-open measurement is never
+  restarted: a run of sub-pixel moves that only becomes visible on the fifth sample
+  is a five-sample latency, and reporting it as one would hide exactly the "the value
+  wandered for a second before the bar admitted it" case. `lat_max_ms=0` means no
+  source movement was ever left waiting for a paint.
+* `srcdelta=` keeps its PULSE-3 meaning exactly — it is measured against the previous
+  **raw** reading, upstream of the envelope. Measuring it on the display would keep
+  it non-zero for a second after the machine went quiet and turn the stale-source
+  alarm into a tautology.
+
+**The visual verdict remains the bench's.** QEMU can confirm the cadence, the pacing
+and the latency numbers; whether ~500 ms worst-case with a 1 s decay tail actually
+reads as *live* to someone watching vugs churn is a question only the panel in front
+of Peter can answer. If it still does not, the budget above says where the remaining
+time is: the ~250 ms source window, in the scheduler's lane.
+
 ## 5. Serial evidence
 
 `run_crystal` emits, when invoked:

@@ -3170,10 +3170,14 @@ fn render_service(_: usize) {
             let comps_per_s = s6_composites.saturating_mul(1000) / span.max(1);
             let mean_cyc = s6_cyc / s6_passes.max(1);
             serial_println!(
-                "[sched6] passes={}/s composites={}/s mean={} cyc/pass (dirty-paced strip@1Hz)",
+                // PULSE-4: the strip's cadence moved to 4 Hz; this witness's own 5 s span is
+                // deliberately UNCHANGED (wire volume). The label names the strip's rate, not this
+                // line's, so it tracks `PSTRIP_PERIOD_MS` rather than restating a stale literal.
+                "[sched6] passes={}/s composites={}/s mean={} cyc/pass (dirty-paced strip@{}ms)",
                 passes_per_s,
                 comps_per_s,
-                mean_cyc
+                mean_cyc,
+                unaos_kernel::ui_status::PSTRIP_PERIOD_MS
             );
             s6_passes = 0;
             s6_composites = 0;
@@ -3183,7 +3187,8 @@ fn render_service(_: usize) {
     }
 }
 
-/// PI-UI-2 status-strip refresh pulse (metal only): once per second, post an `Event::Timer` to
+/// PI-UI-2 status-strip refresh pulse (metal only): once per `ui_status::PSTRIP_PERIOD_MS` (PULSE-4:
+/// 250 ms, was a hard-coded second — see that module's latency-budget note), post an `Event::Timer` to
 /// GUI_CHANNEL so the render task re-draws the status strip (lease IP / wall clock advance) even when
 /// no keystroke is arriving. Mirrors the `rx_backstop` shape — a tiny periodic wake, off the render
 /// core's critical path. Gated on `timer::is_live()` at spawn (a `sleep_ticks` nap needs the timer
@@ -3191,10 +3196,14 @@ fn render_service(_: usize) {
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn status_tick(_: usize) {
     loop {
-        unaos_kernel::arch::sched::sleep_ticks(250); // ~1 s at the 250 Hz per-core tick
+        // PULSE-4: the wake cadence is DERIVED from the strip's own sample period, not hard-coded
+        // beside it. This was `sleep_ticks(250)` — a literal second — and it is the OUTER term of the
+        // strip's latency budget: raising `PSTRIP_PERIOD_MS` alone would have left metal sampling at
+        // 1 Hz regardless, i.e. PULSE-4 doing nothing on the only machine whose panel Peter watches.
+        unaos_kernel::arch::sched::sleep_ticks(unaos_kernel::ui_status::PSTRIP_PERIOD_TICKS);
         // GUI-CLICK-2: suppress the status-strip pulse while a full-screen app owns the screen.
         // render_service is blocked inside dispatch_command and cannot drain GUI_CHANNEL, so an
-        // ungated 1 Hz Timer would fill the 64-slot channel in ~64 s — a slow re-run of the exact
+        // ungated Timer would fill the 64-slot channel in ~16 s at PULSE-4's 4 Hz — a re-run of the exact
         // saturation the pointer-path gate prevents (and the strip is not visible under the app
         // anyway). The pulse resumes the instant the command returns.
         // GUI-WIRE: the watchdog escape hatch. If the active full-screen app has stopped making
