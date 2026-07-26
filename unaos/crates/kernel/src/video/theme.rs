@@ -18,17 +18,21 @@
 //!
 //! # Source of record
 //!
-//! `kits/crispy/theme.json` @ branch `us-crispy`, commit `08b42ede`. The host-side
-//! reader is `libs/quartzite/src/theme.rs` at the same commit.
+//! `kits/crispy/theme.json` @ branch `us-crispy-modern`, commit `0787ba9f`. The
+//! host-side reader is `libs/quartzite/src/theme.rs` at the same commit.
+//!
+//! CRISPY-PI-2 re-lifted this table from that commit, replacing the provisional
+//! `us-crispy` `08b42ede` values CRISPY-PI carried.
 //!
 //! **Shared-source law.** Both arches (aarch64 Pi 4 and x86_64) source chrome and
 //! desktop constants from *this* table, which in turn mirrors *that* json. No
 //! per-arch invented numbers, ever. If a value needs to change, it changes in the
 //! kit json first and is re-lifted here.
 //!
-//! **Taste gate is OPEN.** These values are provisional-but-current: the visual
-//! verdict has not been taken. A verdict change edits THIS FILE ONLY — every
-//! consumer reads the names, never the literals.
+//! **Taste gate is CLOSED — APPROVED** (iteration 3, Peter, 2026-07-26). These are
+//! no longer provisional: the visual verdict has been taken on the kit these
+//! numbers come from. A later verdict change edits THIS FILE ONLY — every consumer
+//! reads the names, never the literals.
 //!
 //! # Wiring status
 //!
@@ -78,7 +82,7 @@
 //! gloss ramp, for two independent reasons:
 //!
 //!  1. the gloss scalars are quantized here, and a quantized endpoint is not the f32
-//!     the host uses (`0.55` as `u8` would be `140`, i.e. `0.54902`);
+//!     the host uses (`0.5` as `u8` would be `128`, i.e. `0.50196`);
 //!  2. more fundamentally, the host does not round the *endpoints* at all — it
 //!     interpolates in f32 across the ramp and rounds each *composited per-pixel*
 //!     alpha. No table of endpoint constants can reproduce that by itself; matching
@@ -92,62 +96,82 @@
 //! any of this; only the *interpolation between* them carries the same caveat.
 
 // ---------------------------------------------------------------------------
-// Palette — 18 roles, packed 0x00RRGGBB.
+// Palette — 21 roles, packed 0x00RRGGBB. Every provenance comment below quotes
+// the json triple at `us-crispy-modern` `0787ba9f`.
 // ---------------------------------------------------------------------------
 
-/// `palette.chrome_face` = `[0.839, 0.835, 0.827]` — the window body fill.
-pub const CHROME_FACE: u32 = 0x00D6_D5D3;
+/// `palette.chrome_face` = `[0.925, 0.925, 0.933]` @ `0787ba9f` — the window body fill.
+pub const CHROME_FACE: u32 = 0x00EC_ECEE;
 
-/// `palette.bevel_light` = `[0.976, 0.973, 0.965]` — top/left bevel edge.
-pub const BEVEL_LIGHT: u32 = 0x00F9_F8F6;
+/// `palette.bevel_light` = `[1.0, 1.0, 1.0]` @ `0787ba9f` — top/left bevel edge.
+pub const BEVEL_LIGHT: u32 = 0x00FF_FFFF;
 
-/// `palette.bevel_shadow` = `[0.518, 0.514, 0.506]` — bottom/right bevel edge.
-pub const BEVEL_SHADOW: u32 = 0x0084_8381;
+/// `palette.bevel_shadow` = `[0.667, 0.667, 0.686]` @ `0787ba9f` — bottom/right bevel edge.
+pub const BEVEL_SHADOW: u32 = 0x00AA_AAAF;
 
-/// `palette.frame_line` = `[0.31, 0.306, 0.302]` — the outer keyline of the frame.
-pub const FRAME_LINE: u32 = 0x004F_4E4D;
+/// `palette.frame_line` = `[0.706, 0.706, 0.725]` @ `0787ba9f` — the outer keyline of the frame.
+pub const FRAME_LINE: u32 = 0x00B4_B4B9;
 
-/// `palette.title_active_top` = `[0.925, 0.929, 0.937]` — focused title gradient, top stop.
-pub const TITLE_ACTIVE_TOP: u32 = 0x00EC_EDEF;
+/// `palette.title_active_top` = `[0.933, 0.933, 0.945]` @ `0787ba9f` — focused title gradient, top stop.
+pub const TITLE_ACTIVE_TOP: u32 = 0x00EE_EEF1;
 
-/// `palette.title_active_bottom` = `[0.741, 0.749, 0.769]` — focused title gradient, bottom stop.
-pub const TITLE_ACTIVE_BOTTOM: u32 = 0x00BD_BFC4;
+/// `palette.title_active_bottom` = `[0.89, 0.89, 0.91]` @ `0787ba9f` — focused title gradient, bottom stop.
+pub const TITLE_ACTIVE_BOTTOM: u32 = 0x00E3_E3E8;
 
-/// `palette.title_inactive_top` = `[0.898, 0.894, 0.89]` — unfocused title gradient, top stop.
-pub const TITLE_INACTIVE_TOP: u32 = 0x00E5_E4E3;
+/// `palette.title_inactive_top` = `[0.957, 0.957, 0.961]` @ `0787ba9f` — unfocused title gradient, top stop.
+pub const TITLE_INACTIVE_TOP: u32 = 0x00F4_F4F5;
 
-/// `palette.title_inactive_bottom` = `[0.831, 0.827, 0.824]` — unfocused title gradient, bottom stop.
-pub const TITLE_INACTIVE_BOTTOM: u32 = 0x00D4_D3D2;
+/// `palette.title_inactive_bottom` = `[0.937, 0.937, 0.945]` @ `0787ba9f` — unfocused title gradient, bottom stop.
+pub const TITLE_INACTIVE_BOTTOM: u32 = 0x00EF_EFF1;
 
-/// `palette.title_text_active` = `[0.129, 0.133, 0.145]` — focused title caption ink.
-pub const TITLE_TEXT_ACTIVE: u32 = 0x0021_2225;
+/// `palette.title_text_active` = `[0.145, 0.149, 0.161]` @ `0787ba9f` — focused title caption ink.
+pub const TITLE_TEXT_ACTIVE: u32 = 0x0025_2629;
 
-/// `palette.title_text_inactive` = `[0.451, 0.451, 0.455]` — unfocused title caption ink.
-pub const TITLE_TEXT_INACTIVE: u32 = 0x0073_7374;
+/// `palette.title_text_inactive` = `[0.478, 0.478, 0.494]` @ `0787ba9f` — unfocused title caption ink.
+pub const TITLE_TEXT_INACTIVE: u32 = 0x007A_7A7E;
 
-/// `palette.button_face` = `[0.898, 0.894, 0.886]` — resting button face.
-pub const BUTTON_FACE: u32 = 0x00E5_E4E2;
+/// `palette.button_face` = `[0.973, 0.973, 0.98]` @ `0787ba9f` — resting button face.
+pub const BUTTON_FACE: u32 = 0x00F8_F8FA;
 
-/// `palette.button_face_pressed` = `[0.706, 0.702, 0.694]` — pressed button face.
-pub const BUTTON_FACE_PRESSED: u32 = 0x00B4_B3B1;
+/// `palette.button_face_pressed` = `[0.878, 0.878, 0.89]` @ `0787ba9f` — pressed button face.
+pub const BUTTON_FACE_PRESSED: u32 = 0x00E0_E0E3;
 
-/// `palette.button_text` = `[0.114, 0.114, 0.118]` — button label ink.
-pub const BUTTON_TEXT: u32 = 0x001D_1D1E;
+/// `palette.button_text` = `[0.125, 0.129, 0.141]` @ `0787ba9f` — button label ink.
+pub const BUTTON_TEXT: u32 = 0x0020_2124;
 
-/// `palette.content_fill` = `[0.96, 0.949, 0.918]` — content-region base fill.
+/// `palette.content_fill` = `[0.96, 0.949, 0.918]` @ `0787ba9f` — content-region base fill.
+///
+/// Unchanged across the CRISPY-PI-2 re-lift: iteration 3 kept the paper tone, and
+/// `content_surface.Paper.base_rgb` still agrees with it by construction.
 pub const CONTENT_FILL: u32 = 0x00F5_F2EA;
 
-/// `palette.content_text` = `[0.102, 0.098, 0.094]` — content-region ink.
-pub const CONTENT_TEXT: u32 = 0x001A_1918;
+/// `palette.content_text` = `[0.129, 0.125, 0.118]` @ `0787ba9f` — content-region ink.
+pub const CONTENT_TEXT: u32 = 0x0021_201E;
 
-/// `palette.scroll_track` = `[0.784, 0.78, 0.773]` — scrollbar trough.
-pub const SCROLL_TRACK: u32 = 0x00C8_C7C5;
+/// `palette.scroll_track` = `[0.949, 0.949, 0.957]` @ `0787ba9f` — scrollbar trough.
+pub const SCROLL_TRACK: u32 = 0x00F2_F2F4;
 
-/// `palette.scroll_thumb` = `[0.878, 0.875, 0.867]` — scrollbar thumb.
-pub const SCROLL_THUMB: u32 = 0x00E0_DFDD;
+/// `palette.scroll_thumb` = `[0.796, 0.796, 0.812]` @ `0787ba9f` — scrollbar thumb.
+pub const SCROLL_THUMB: u32 = 0x00CB_CBCF;
 
-/// `palette.accent` = `[0.278, 0.404, 0.596]` — selection / focus accent.
-pub const ACCENT: u32 = 0x0047_6798;
+/// `palette.accent` = `[0.29, 0.451, 0.667]` @ `0787ba9f` — selection / focus accent.
+pub const ACCENT: u32 = 0x004A_73AA;
+
+// ---------------------------------------------------------------------------
+// Title-bar controls. Iteration 3 replaces the single square `CONTROL_BOX` role
+// with three *circular* controls, each with its own fill: a left-to-right ramp of
+// the accent hue from darkest (close) to lightest (zoom). The geometry is still
+// one number — `CONTROL_BOX` below, now read as a circle's diameter.
+// ---------------------------------------------------------------------------
+
+/// `palette.control_close` = `[0.239, 0.373, 0.573]` @ `0787ba9f` — close control fill.
+pub const CONTROL_CLOSE: u32 = 0x003D_5F92;
+
+/// `palette.control_mid` = `[0.404, 0.549, 0.729]` @ `0787ba9f` — middle (minimise) control fill.
+pub const CONTROL_MID: u32 = 0x0067_8CBA;
+
+/// `palette.control_zoom` = `[0.573, 0.667, 0.788]` @ `0787ba9f` — zoom control fill.
+pub const CONTROL_ZOOM: u32 = 0x0092_AAC9;
 
 // ---------------------------------------------------------------------------
 // Gloss — `palette.gloss`. A white highlight applied with a two-stop alpha
@@ -162,56 +186,81 @@ pub const ACCENT: u32 = 0x0047_6798;
 /// Fixed-point scale for the gloss scalars: `Q16_ONE` represents `1.0`.
 pub const Q16_ONE: u32 = 65536;
 
-/// `palette.gloss.highlight` = `[1.0, 1.0, 1.0]` — the gloss colour.
+/// `palette.gloss.highlight` = `[1.0, 1.0, 1.0]` @ `0787ba9f` — the gloss colour.
+///
+/// Unchanged across the CRISPY-PI-2 re-lift; note that iteration 3 also takes
+/// `BEVEL_LIGHT` to pure white, so the two roles now coincide numerically. They stay
+/// separate names because they are separate roles in the json and may diverge again.
 pub const GLOSS_HIGHLIGHT: u32 = 0x00FF_FFFF;
 
-/// `palette.gloss.top_alpha` = `0.34` — gloss opacity at the top edge, Q16.
-pub const GLOSS_TOP_ALPHA_Q16: u32 = 22282;
+/// `palette.gloss.top_alpha` = `0.14` @ `0787ba9f` — gloss opacity at the top edge, Q16.
+pub const GLOSS_TOP_ALPHA_Q16: u32 = 9175;
 
-/// `palette.gloss.falloff` = `0.55` — gloss falloff shape parameter, Q16.
+/// `palette.gloss.falloff` = `0.5` @ `0787ba9f` — gloss falloff shape parameter, Q16.
 ///
 /// The host stores this as a unit scalar and clamps it to `[0.01, 1.0]` before use.
-pub const GLOSS_FALLOFF_Q16: u32 = 36045;
+pub const GLOSS_FALLOFF_Q16: u32 = 32768;
 
-/// `palette.gloss.bottom_alpha` = `0.06` — gloss opacity at the bottom edge, Q16.
-pub const GLOSS_BOTTOM_ALPHA_Q16: u32 = 3932;
+/// `palette.gloss.bottom_alpha` = `0.0` @ `0787ba9f` — gloss opacity at the bottom edge, Q16.
+///
+/// Iteration 3 takes the ramp to fully transparent at the bottom: the gloss now dies
+/// out entirely rather than leaving CRISPY-PI's `0.06` floor across the lower chrome.
+pub const GLOSS_BOTTOM_ALPHA_Q16: u32 = 0;
 
 // ---------------------------------------------------------------------------
 // Metrics — `metrics.*`, all integral in the json, all pixels unless noted.
 // ---------------------------------------------------------------------------
 
-/// `metrics.frame` = `8` — frame thickness, px.
-pub const FRAME: usize = 8;
+/// `metrics.frame` = `5` @ `0787ba9f` — frame thickness, px.
+pub const FRAME: usize = 5;
 
-/// `metrics.bevel` = `2` — bevel thickness, px.
-pub const BEVEL: usize = 2;
+/// `metrics.bevel` = `1` @ `0787ba9f` — bevel thickness, px. Iteration 3 makes the
+/// bevel a true hairline.
+pub const BEVEL: usize = 1;
 
-/// `metrics.title_height` = `28` — title bar height, px.
-pub const TITLE_HEIGHT: usize = 28;
+/// `metrics.title_height` = `34` @ `0787ba9f` — title bar height, px.
+pub const TITLE_HEIGHT: usize = 34;
 
-/// `metrics.corner_radius` = `6` — radius of the two *top* corners, px.
-pub const CORNER_RADIUS: usize = 6;
+/// `metrics.corner_radius` = `12` @ `0787ba9f` — radius of the two *top* corners, px.
+pub const CORNER_RADIUS: usize = 12;
 
-/// `metrics.scrollbar_width` = `16` — scrollbar width, px.
-pub const SCROLLBAR_WIDTH: usize = 16;
+/// `metrics.widget_radius` = `8` @ `0787ba9f` — corner radius for widgets (buttons and
+/// other raised controls), px. New in iteration 3.
+pub const WIDGET_RADIUS: usize = 8;
 
-/// `metrics.button_height` = `26` — button height, px.
-pub const BUTTON_HEIGHT: usize = 26;
+/// `metrics.well_radius` = `15` @ `0787ba9f` — corner radius for wells (recessed
+/// regions, e.g. a scroll trough or a content sink), px. New in iteration 3.
+pub const WELL_RADIUS: usize = 15;
 
-/// `metrics.button_pad_x` = `14` — horizontal padding inside a button, px.
-pub const BUTTON_PAD_X: usize = 14;
+/// `metrics.scrollbar_width` = `12` @ `0787ba9f` — scrollbar width, px.
+pub const SCROLLBAR_WIDTH: usize = 12;
 
-/// `metrics.gap` = `10` — standard gap between controls, px.
-pub const GAP: usize = 10;
+/// `metrics.button_height` = `28` @ `0787ba9f` — button height, px.
+pub const BUTTON_HEIGHT: usize = 28;
 
-/// `metrics.control_box` = `14` — side of a square title-bar control box, px.
-pub const CONTROL_BOX: usize = 14;
+/// `metrics.button_pad_x` = `18` @ `0787ba9f` — horizontal padding inside a button, px.
+pub const BUTTON_PAD_X: usize = 18;
 
-/// `metrics.text_px` = `15` — nominal text size, px.
+/// `metrics.gap` = `12` @ `0787ba9f` — standard gap between controls, px.
+pub const GAP: usize = 12;
+
+/// `metrics.control_box` = `12` @ `0787ba9f` — the title-bar control's extent, px.
+///
+/// Iteration 3's controls are **circles**, so this is read as a diameter (the square
+/// box CRISPY-PI named is gone along with its single fill colour). The json carries no
+/// separate radius key; `CONTROL_RADIUS` below is derived from this one number so that
+/// there is still exactly one lifted value.
+pub const CONTROL_BOX: usize = 12;
+
+/// Radius of a circular title-bar control, px — `CONTROL_BOX / 2`, derived here rather
+/// than lifted, because the json expresses the control's size only as `control_box`.
+pub const CONTROL_RADIUS: usize = CONTROL_BOX / 2;
+
+/// `metrics.text_px` = `15` @ `0787ba9f` — nominal text size, px.
 pub const TEXT_PX: usize = 15;
 
-/// `metrics.line_height_pct` = `155` — line height as a percent of `TEXT_PX`.
-pub const LINE_HEIGHT_PCT: usize = 155;
+/// `metrics.line_height_pct` = `165` @ `0787ba9f` — line height as a percent of `TEXT_PX`.
+pub const LINE_HEIGHT_PCT: usize = 165;
 
 // ---------------------------------------------------------------------------
 // Compile-time sanity. Every assertion below is a `const` evaluation: it costs
@@ -232,17 +281,25 @@ const _: () = {
     assert!(CONTROL_BOX > 0);
     assert!(TEXT_PX > 0);
     assert!(LINE_HEIGHT_PCT > 0);
-    // `corner_radius` may legitimately be 0 (square head), so it is only bounded.
+    // The three radii (`corner_radius`, `widget_radius`, `well_radius`) may each
+    // legitimately be 0 (a square head, a square widget, a square well), so they are
+    // bounded below rather than required positive.
 };
 
 /// Relationships the json's own numbers imply, and that the chrome geometry relies on.
 const _: () = {
     // The bevel is drawn inside the frame.
     assert!(BEVEL < FRAME);
-    // The rounded head must fit inside the title bar.
+    // The rounded head must fit inside the title bar: 12 < 34.
     assert!(CORNER_RADIUS < TITLE_HEIGHT);
-    // Title-bar controls must fit inside the title bar.
+    // Title-bar controls must fit inside the title bar: 12 < 34.
     assert!(CONTROL_BOX < TITLE_HEIGHT);
+    // A circular control needs a non-degenerate radius, or it cannot be drawn round.
+    assert!(CONTROL_RADIUS > 0);
+    // Both of a widget's corners must fit within its own height: 2*8 <= 28.
+    assert!(2 * WIDGET_RADIUS <= BUTTON_HEIGHT);
+    // A well's corner is a chrome-scale radius, not a window-scale one.
+    assert!(WELL_RADIUS < TITLE_HEIGHT);
     // A line of text is taller than the glyph box.
     assert!(LINE_HEIGHT_PCT > 100);
 };
@@ -251,7 +308,7 @@ const _: () = {
 /// palette carries no per-colour alpha. If a future kit adds alpha, this block is
 /// the tripwire that says so.
 const _: () = {
-    const ROLES: [u32; 19] = [
+    const ROLES: [u32; 22] = [
         CHROME_FACE,
         BEVEL_LIGHT,
         BEVEL_SHADOW,
@@ -270,6 +327,9 @@ const _: () = {
         SCROLL_TRACK,
         SCROLL_THUMB,
         ACCENT,
+        CONTROL_CLOSE,
+        CONTROL_MID,
+        CONTROL_ZOOM,
         GLOSS_HIGHLIGHT,
     ];
     let mut i = 0;
@@ -297,17 +357,31 @@ const _: () = {
     assert!(CONTENT_TEXT != CONTENT_FILL);
     assert!(SCROLL_THUMB != SCROLL_TRACK);
     assert!(ACCENT != CHROME_FACE);
+    // The three circular controls are a ramp: each must be visibly its own step, and
+    // each must stand off the title bar it sits on.
+    assert!(CONTROL_CLOSE != CONTROL_MID);
+    assert!(CONTROL_MID != CONTROL_ZOOM);
+    assert!(CONTROL_CLOSE != CONTROL_ZOOM);
+    assert!(CONTROL_CLOSE != TITLE_ACTIVE_TOP);
+    assert!(CONTROL_MID != TITLE_ACTIVE_TOP);
+    assert!(CONTROL_ZOOM != TITLE_ACTIVE_TOP);
     // The gloss must be lighter than what it glosses, or it is not a highlight.
     assert!(GLOSS_HIGHLIGHT != CHROME_FACE);
-    // The gloss fades downward.
+    // The gloss fades downward. Iteration 3 takes the bottom stop to exactly 0, so
+    // this is the assertion that the ramp still has a direction at all.
     assert!(GLOSS_TOP_ALPHA_Q16 > GLOSS_BOTTOM_ALPHA_Q16);
+    //
+    // NOTE: `BEVEL_LIGHT == GLOSS_HIGHLIGHT` at this commit (both pure white), so no
+    // distinctness is asserted between them — the json gives them the same value.
 };
 
 /// The gloss scalars are unit values, so no Q16 form may exceed `1.0`, and the
 /// falloff must be inside the `[0.01, 1.0]` band the host clamps it to.
+///
+/// `GLOSS_BOTTOM_ALPHA_Q16` is exactly `0` at this commit; a `<= Q16_ONE` bound on it
+/// would be vacuous, and the direction assertion above is what actually constrains it.
 const _: () = {
     assert!(GLOSS_TOP_ALPHA_Q16 <= Q16_ONE);
-    assert!(GLOSS_BOTTOM_ALPHA_Q16 <= Q16_ONE);
     assert!(GLOSS_FALLOFF_Q16 <= Q16_ONE);
     assert!(GLOSS_FALLOFF_Q16 >= Q16_ONE / 100);
 };
