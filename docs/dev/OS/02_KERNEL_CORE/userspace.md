@@ -1606,6 +1606,32 @@
     run completed, so a missing witness here is a GENUINE regression". Lane: `scripts/mbench.py`,
     `scripts/specs/pi4-regression.spec`, the `kernel8-test`/`battery` stanzas of `arroyo`, and this
     doc.
+- **VUGCLICK (a click stops killing the vug)** — an **app-only** arc: `crates/user-vug` + this doc, no
+  kernel change. P62 attended metal reported "vug is crashing". The wire showed no panic, no fault and a
+  clean load — what it showed was `:: UVUG: interactive takeover at frame 24340 ::` followed immediately
+  by `:: UVUG: interactive exit=click frames=36000 ::`, twice. The vugs were leaving through their own
+  **designed** click-to-exit path. That rule was written for the full-screen takeover era, when the vug
+  owned the panel and any click meant "done"; since **WC-C** there is no takeover mode left to reach —
+  `_start` calls `SYS_WIN_CREATE` unconditionally, so every vug is a windowed app tiled beside others. In
+  a windowed desktop a click is how you focus or interact, so "click exits" meant *every attempt to touch
+  a vug killed it*, and **WC-J**'s instant erase of a dead window removed the ghost that would otherwise
+  have shown it had exited — which is precisely why a designed exit read as a spontaneous crash.
+  **Change:** a click (button press→release with drag motion under `CLICK_THRESH`) now toggles a
+  **pause** of the rotation instead of exiting — harmless, reversible, and visible, and it prints
+  `:: UVUG: click pause=<0|1> ::` per toggle, which doubles as proof that a click reached EL0 (clicks are
+  human-rate, so the line cannot flood the log). A **drag** still rotates, unchanged (`DRAG_DIV` /
+  `DRAG_CLAMP` untouched). **ESC remains the keyboard exit** and is now the only operator-driven one — it
+  already existed (`K_ESC` = 0x1B), so no new key was added. The exit witness is made honest in the same
+  stroke: the interactive line's reason was previously spelled `key` or `click`, so a run that merely ran
+  out `INTERACTIVE_CAP` claimed a click that never happened; the pair is now
+  `:: UVUG: interactive exit=<key|frames> frames=<n> ::`. **Background persistence is unchanged by
+  construction:** the auto/deterministic path is untouched (no HID in QEMU → no events → no interactive
+  mode → the 300-frame `checksum=0xe68285b85121ac7c` witness is byte-identical), a DETACHED vug still
+  runs uncapped until `kill`, and this arc *removes* an exit path rather than adding one — nothing the
+  BGRUN-ST legs depend on (they kill runnable targets) changed. **Gates:** `./arroyo check` green both
+  arches; `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 90` + `mbench --replay` **77/77
+  including the COMPLETE markers, 0 forbidden** (the `UVUG:` / `EXEC-UVUG:` / BGRUN-ST witnesses all
+  green); `./arroyo test-arm` MISSION SUCCESS.
 
 ### x86_64 (branch `hw-rmbp`)
 

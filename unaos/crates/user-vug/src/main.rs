@@ -26,8 +26,20 @@
 //      rotates + projects the 14 crystal vertices (integer Q16.16 math reimplemented from the kernel
 //      vug.rs — no float), publishes the pixel coordinates, RELEASES both workers (the `phase` word),
 //      blocks on a FUTEX until both have ARRIVED (the `done` word), and PRESENTS (SYS_WIN_PRESENT).
-//   4. On exit (ESC / click, or the interactive frame cap) it signals the workers to leave, JOINs both,
+//   4. On exit (ESC, or the interactive frame cap) it signals the workers to leave, JOINs both,
 //      and prints its witness before exiting 0.
+//
+// VUGCLICK — CLICK SEMANTICS IN A WINDOWED WORLD. Until this arc a click EXITED the program. That rule
+// was written for the full-screen takeover era, where the vug owned the panel and any click meant "done".
+// Since WC-C there is no takeover mode left to reach: every vug creates its own compositor window
+// (SYS_WIN_CREATE, unconditional, below), tiled beside other windows. In that world clicking is how an
+// operator focuses or interacts with a window, so "click exits" meant every attempt to touch a vug killed
+// it — and with WC-J erasing a dead window instantly, the death read as a spontaneous crash (P62,
+// "vug is crashing", on a wire showing no panic, no fault, and the program's own designed exit path).
+// So: a click no longer exits. It toggles a PAUSE of the rotation — a harmless, visible, reversible
+// interaction that also proves the click reached EL0. A DRAG (motion at or over CLICK_THRESH between
+// press and release) still rotates, exactly as before. ESC remains the keyboard exit, unchanged and now
+// the only operator-driven one.
 //
 // TWO PATHS — deterministic auto (QEMU) vs interactive (metal). The switch is INPUT-DRIVEN, not
 // time-boxed (UVUG-4): the parent polls SYS_INPUT_POLL EVERY frame for the program's whole life, and
@@ -45,9 +57,9 @@
 //     mode at that frame: it prints `:: UVUG: interactive takeover at frame <n> ::` (proving the input
 //     arrived on metal), cancels the auto-tumble and the 300-frame cap, and switches to held-state
 //     control — WASD/arrows rotate (TRUE held state from KeyDown/KeyUp), Q/E zoom, a mouse drag rotates
-//     (per-frame clamped delta, full-panel-drag ≈ one revolution), a click or ESC exits. It runs until
-//     an exit event (bounded only by INTERACTIVE_CAP = 36000 frames as a safety) and prints
-//     `:: UVUG: interactive exit=<key|click> frames=<n> ::`. Interactive is metal-only (no HID in QEMU).
+//     (per-frame clamped delta, full-panel-drag ≈ one revolution), a click toggles pause, ESC exits. It
+//     runs until ESC (bounded only by INTERACTIVE_CAP = 36000 frames as a safety) and prints
+//     `:: UVUG: interactive exit=<key|frames> frames=<n> ::`. Interactive is metal-only (no HID in QEMU).
 //
 // Barrier direction split (deliberate, robust under QEMU raspi4b's lack of a Group-1 timer IRQ — see
 // docs userspace.md M6e): ARRIVAL (worker -> parent) is a real FUTEX (workers atomically bump `done` +
@@ -440,11 +452,13 @@ const MAX_DRAIN_PER_FRAME: u32 = 64;
 /// Accumulated input for one frame.
 #[derive(Default)]
 struct FrameInput {
-    any: bool,        // any event at all this frame (arms interactive mode)
-    exit_key: bool,   // ESC pressed
-    exit_click: bool, // a click (button press+release under the motion threshold)
-    mdx: i32,         // summed relative mouse dx while dragging
-    mdy: i32,         // summed relative mouse dy while dragging
+    any: bool,      // any event at all this frame (arms interactive mode)
+    exit_key: bool, // ESC pressed
+    /// VUGCLICK: a click (button press+release under the motion threshold). NO LONGER AN EXIT — see
+    /// the click-semantics note above `_start`'s frame loop. It toggles the pause state.
+    clicks: u32,
+    mdx: i32, // summed relative mouse dx while dragging
+    mdy: i32, // summed relative mouse dy while dragging
     /// UVUG-9: the drain hit `MAX_DRAIN_PER_FRAME` with the ring still non-empty — the freeze signature.
     saturated: bool,
 }
@@ -494,9 +508,9 @@ fn drain_input(held: &mut u32, dragging: &mut bool, drag_motion: &mut i32) -> Fr
                     *drag_motion = 0;
                     *held = 0;
                 } else {
-                    // Release edge: a click (little motion) exits; otherwise end the drag.
+                    // Release edge: little motion = a CLICK (pause toggle); otherwise it ended a drag.
                     if *drag_motion < CLICK_THRESH {
-                        fi.exit_click = true;
+                        fi.clicks += 1;
                     }
                     *dragging = false;
                 }
@@ -780,7 +794,8 @@ pub extern "C" fn _start() -> ! {
 
     let mut interactive = false; // flipped permanently by the first input event, at any frame
     let mut exit_key = false;
-    let mut exit_click = false;
+    // VUGCLICK: rotation pause, toggled by a click. Purely cosmetic and interactive-only.
+    let mut paused = false;
 
     let mut frame: u32 = 0;
     loop {
@@ -805,14 +820,28 @@ pub extern "C" fn _start() -> ! {
             if fi.exit_key {
                 exit_key = true;
             }
-            if fi.exit_click {
-                exit_click = true;
+            // VUGCLICK: a click toggles pause; it does NOT exit. Clicks are human-rate, so one line per
+            // toggle cannot flood the serial log, and the line doubles as proof that a click reached EL0.
+            let mut c = fi.clicks;
+            while c > 0 {
+                paused = !paused;
+                c -= 1;
+            }
+            if fi.clicks > 0 {
+                let mut pb = Buf::new();
+                pb.put(b":: UVUG: click pause=");
+                pb.put_dec(paused as u32);
+                pb.put(b" ::\n");
+                pb.flush();
             }
         }
 
         // --- fold input into rotation/zoom ---
         let manual = interactive && (held != 0 || (dragging && (fi.mdx != 0 || fi.mdy != 0)));
-        if manual {
+        if paused {
+            // VUGCLICK: clicked-to-pause — hold the current orientation. Rendering and presenting
+            // continue unchanged, so the window stays live (and killable) rather than going dark.
+        } else if manual {
             let mut yaw = 0i32;
             let mut pit = 0i32;
             if held & H_YAW_L != 0 {
@@ -919,7 +948,8 @@ pub extern "C" fn _start() -> ! {
 
         // --- exit conditions ---
         if interactive {
-            if exit_key || exit_click || frame >= INTERACTIVE_CAP {
+            // VUGCLICK: ESC (or the safety cap) ends an interactive run. A click does not.
+            if exit_key || frame >= INTERACTIVE_CAP {
                 break;
             }
         } else if !detached && frame >= AUTO_FRAMES {
@@ -945,7 +975,10 @@ pub extern "C" fn _start() -> ! {
     let mut buf = Buf::new();
     if interactive {
         buf.put(b":: UVUG: interactive exit=");
-        buf.put(if exit_key { b"key" } else { b"click" });
+        // VUGCLICK: the reason must be true. Pre-arc the only two spellings were `key` and `click`, so a
+        // run that ran out its INTERACTIVE_CAP reported `click` — a click that never happened. With click
+        // no longer an exit, the honest pair is `key` (ESC) and `frames` (the safety cap).
+        buf.put(if exit_key { b"key" } else { b"frames" });
         buf.put(b" frames=");
         buf.put_dec(frame);
         buf.put(b" ::\n");
