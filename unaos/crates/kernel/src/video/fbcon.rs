@@ -1068,9 +1068,25 @@ pub fn panel_console_window_open() -> wm::WinId {
     );
     surf_fb.fill_screen(BG_DEFAULT);
 
+    // SPAWN-PLACE — the OUTER box is centred on the panel and the row is created THERE, pinned.
+    // `wm::create` + `wm::move_to` reached the same place, but `create` composites the new row before
+    // it returns, so the console was shown once at the tiler's top-left origin and then jumped
+    // (observed on the metal, s41), leaving a 1314x750 box the move had to erase. `spawn_geometry`
+    // gives the box size before any row exists — the console's surface is far too large for the
+    // scale rule to magnify, so this is `scale = 1` and `ow`/`oh` are the surface plus chrome, as
+    // before. Pinning still keeps the tiler from walking the console around underneath the text.
+    let (_scale, ow, oh) = match wm::spawn_geometry(cw, ch) {
+        Some(g) => g,
+        None => {
+            serial_println!("[wc-x] console-window DECLINE reason=geometry-unavailable");
+            return wm::WIN_NONE;
+        }
+    };
+    let ox = pw.saturating_sub(ow) / 2;
+    let oy = ph.saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
     // Owner ASID 0 — the console belongs to the KERNEL. That keeps it out of `focus_ring` and out of
     // `close_owner`'s reach: no EL0 task can move, present or close the kernel's console.
-    let id = wm::create(
+    let id = wm::create_at(
         0,
         surf_fb.base(),
         len,
@@ -1078,19 +1094,13 @@ pub fn panel_console_window_open() -> wm::WinId {
         ch as u32,
         stride as u32,
         b"console",
+        ox + wm::BORDER,
+        oy + wm::TITLE_H + wm::BORDER,
     );
     if id == wm::WIN_NONE {
         serial_println!("[wc-x] console-window DECLINE reason=create-failed");
         return wm::WIN_NONE;
     }
-    // Centre the OUTER box on the panel and pin it (`move_to` takes the CONTENT origin, so the
-    // chrome offsets come back off the outer origin). Pinning keeps the tiler — which packs from the
-    // top-left as windows come and go — from walking the console around underneath the text.
-    let ow = cw + 2 * wm::BORDER;
-    let oh = ch + wm::TITLE_H + 2 * wm::BORDER;
-    let ox = pw.saturating_sub(ow) / 2;
-    let oy = ph.saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
-    wm::move_to(id, ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
 
     // Install the route. From the store's move into `FbCon` onwards, every glyph lands in the
     // window's surface.

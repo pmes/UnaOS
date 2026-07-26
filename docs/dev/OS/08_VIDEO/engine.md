@@ -2627,3 +2627,89 @@ find `DESKTOP_BG` byte-for-byte at 5/5 and 3/3 — the staged fill lands the ide
   construction and falls back correctly rather than losing pixels.
 * The cursor over a closing window: the sprite must reappear after the fill, never be erased into the
   desktop and never leave a stale patch — the `undraw`/composite bracket is the thing being watched.
+
+### SPAWN-PLACE — a window is never presented where it will not stay
+
+**The invariant:** *no pixel of a window is ever presented at a position it will not occupy.*
+
+Observed on the metal (rMBP s41, photo + wire): both windows the x86 activation opens — the console
+(`win=1`) and the calibration demo (`win=2`) — appeared at the panel's TOP-LEFT first and then jumped
+to their final places, leaving the vacated boxes on glass as residue.
+
+#### Root cause
+
+`wm::create` **composites before it returns**. That is deliberate and predates this arc (`create_inner`:
+"the window's kernel chrome is on the panel the moment the row exists … the create runs INSIDE the
+cursor bracket"), and a create takes its geometry from the TILER, which packs from the top-left. Both
+callers then computed the placement they actually wanted and applied it with `wm::move_to`:
+
+* `video/fbcon.rs::panel_console_window_open` — centre the console's outer box;
+* `video/wcx.rs::activate` — pin the demo into the bottom-right corner.
+
+So the sequence was create → composite at (GAP, GAP) → move_to → erase the abandoned box → composite
+again. Two consequences, and the second is the one that also fed the residue report: a full frame of
+each window is presented at the tiler's origin, and the move manufactures a vacated box that something
+then has to reclaim. `move_to` was doing its job; it was being asked a question that should never have
+been posed.
+
+#### The fix — geometry decided BEFORE the row exists
+
+`wm::create` takes no geometry, so two verbs were added beside it (both additive; no existing verb
+changed behaviour):
+
+* **`wm::spawn_geometry(w, h) -> Option<(scale, outer_w, outer_h)>`** — the size the window WILL be, from
+  the tiler's own scale rule, with no row in the table. The rule itself was factored out of `place`
+  into `place_scale(pw, ph, w, h)` and both call it, so this is the layout's answer and not a second
+  copy of it.
+* **`wm::create_at(…, x, y)`** — `create` with the final CONTENT origin supplied up front. The row is
+  born at that origin, `scale` set from the same rule, and `pinned` (as `move_to` pins it), so `place`
+  skips it and the create's own composite paints it once, where it stays. `(x, y)` is clamped on both
+  bounds exactly as `move_to` clamps it (F5).
+
+Both callers now query, place, then create. `panel_console_window_open` and `wcx::activate` contain no
+`move_to` at all; there is no first frame at the tiler's origin and no vacated box to reclaim.
+`wcx` reports it on the wire:
+
+```
+[wc-x] spawn-place win=2 box=770x526 at (2102,1116) (created in place, no move)
+```
+
+#### MOVE-VACATE — the read-back that decides the residue question
+
+The s41 wire also carried `[wc-k] erase box=1314x750 staged=yes … torn=yes -> BUFFERED` for the box the
+console vacated, while the panel kept the old pixels. Those two statements are not about the same
+thing: `[wc-k]` reports that `stage_fill` composed its row and copied it out, not that those rows are
+what the scan-out is showing when the shutter opens. (`torn=yes` on x86 is a timing verdict on an
+unsynced GOP — expected, and not evidence either way.)
+
+The code path is not in dispute: `wm::stage_fill` presents with `fb.blit(off, …)`, a direct
+`copy_nonoverlapping` into `FrameBuffer::base`, once per row, and `flush_range` — the documented x86
+no-op — only publishes what the blit already wrote. So the erase either lands in the front buffer or a
+LATER writer repaints those rows; the wire cannot tell which, and the x86 QEMU gate cannot reproduce
+it at all (`wcx::activate` is reached only from `kepler_display::takeover_display`, so a QEMU x86 boot
+logs zero `[wc-…]` lines — verified on the gate log for this arc).
+
+`wcx::move_vacate_probe` (witness builds, x86, one-shot) makes the next metal boot answer it by
+READING THE PANEL BACK, the way WC-J's verdicts do. It opens its own 8x8 scratch window in a clear
+corner — deliberately not a move of the console or the demo, which under SPAWN-PLACE never move —
+presents it, `move_to`s it once, samples five points in the vacated box (content origin, two content
+diagonals, title strip, lower border) and closes it:
+
+```
+[wc-x] move-vacate win=N scale=Sx from=(ax,ay) to=(bx,ay) box=WxH painted=true desktop=5/5 stale=0/5 -> PASS
+```
+
+* `desktop=5/5` — the erase reaches the glass. Residue in a photo is then a later writer over rows no
+  window covers any more; the desktop's own damage-limited present is the candidate to look at
+  (`screen::flush` subtracts the window layer's occluders from its damage, and `reclaim` deliberately
+  asks it for a full present), and the fix belongs on that path, not in `erase`.
+* `stale=5/5` — the window's own pixels survived the fill: the erase's rows and the window's rows
+  disagree about the box, and the fix belongs in `wm::erase` / `stage_fill`.
+* `painted=false` — the probe never owned its box; the leg proves nothing and says so.
+
+#### Gate results
+
+`./arroyo check` clean on both arches with `wc` off and on (witness on in both). `./arroyo test` (x86,
+`UNAOS_WC=1`) and `./arroyo test-arm`: green. Neither gate exercises the compositor's x86 activation —
+see above — so SPAWN-PLACE's proof is the metal photo (no jump, no residue) plus the `[wc-x]
+spawn-place` line, and MOVE-VACATE's proof is its own read-back verdict on the same boot.

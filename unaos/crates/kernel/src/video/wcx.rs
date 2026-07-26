@@ -216,35 +216,20 @@ pub fn activate() {
     // reference is formed is `paint_demo`, which carries the safety argument for it.
     let surf = core::ptr::addr_of_mut!(DEMO_SURF) as usize;
     let surf_len = DEMO_W * DEMO_H * 4;
-    // Owner ASID 0 — this window belongs to the KERNEL, not to any address space. It is therefore
-    // outside the focus ring (`focus_ring` skips owner 0) and outside `close_owner`'s reach, which
-    // is the correct reading: no EL0 task may present, move or close it.
-    let id = wm::create(
-        0,
-        surf,
-        surf_len,
-        DEMO_W as u32,
-        DEMO_H as u32,
-        (DEMO_W * 4) as u32,
-        b"unaos wc",
-    );
-    if id == wm::WIN_NONE {
-        serial_println!("[wc-x] activate DECLINE reason=create-failed");
-        return;
-    }
-
-    // Pin the demo's OUTER box into the panel's bottom-right corner. `move_to` takes the CONTENT
-    // origin, so the chrome offsets come back off the outer origin; it also pins the row, so the
-    // automatic tiling leaves it here rather than packing it to the top-left over the console.
-    // Overlapping the console window is intended: the demo was created later, so it has the higher
-    // z, and the overlap is what makes the occlusion visible in a bench photograph.
-    let (ow, oh) = match wm::info(id) {
-        Some(i) => (
-            i.w * i.scale + 2 * wm::BORDER,
-            i.h * i.scale + wm::TITLE_H + 2 * wm::BORDER,
-        ),
+    // SPAWN-PLACE — the demo's OUTER box is pinned into the panel's bottom-right corner, and the
+    // geometry is settled BEFORE the row exists. `wm::create` + `wm::move_to` computed the same
+    // placement, but only after `create` had already composited a frame of this window at the
+    // tiler's top-left origin — visible on the metal (s41) as a window that appears top-left and
+    // jumps, and as an abandoned box the move then has to erase. `spawn_geometry` answers the size
+    // question (the tiler's own scale rule) without a row, and `create_at` takes the content origin,
+    // so the first and only frame this window ever presents is at the position it keeps.
+    //
+    // Overlapping the console window is still intended: the demo is created later, so it has the
+    // higher z, and the overlap is what makes the occlusion visible in a bench photograph.
+    let (_scale, ow, oh) = match wm::spawn_geometry(DEMO_W, DEMO_H) {
+        Some(g) => g,
         None => {
-            serial_println!("[wc-x] activate DECLINE reason=row-vanished");
+            serial_println!("[wc-x] activate DECLINE reason=geometry-unavailable");
             return;
         }
     };
@@ -253,7 +238,28 @@ pub fn activate() {
         .saturating_sub(crate::ui_status::chrome_h(ph))
         .saturating_sub(oh)
         .saturating_sub(EDGE_GAP);
-    wm::move_to(id, ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
+    // Owner ASID 0 — this window belongs to the KERNEL, not to any address space. It is therefore
+    // outside the focus ring (`focus_ring` skips owner 0) and outside `close_owner`'s reach, which
+    // is the correct reading: no EL0 task may present, move or close it.
+    let id = wm::create_at(
+        0,
+        surf,
+        surf_len,
+        DEMO_W as u32,
+        DEMO_H as u32,
+        (DEMO_W * 4) as u32,
+        b"unaos wc",
+        ox + wm::BORDER,
+        oy + wm::TITLE_H + wm::BORDER,
+    );
+    if id == wm::WIN_NONE {
+        serial_println!("[wc-x] activate DECLINE reason=create-failed");
+        return;
+    }
+    serial_println!(
+        "[wc-x] spawn-place win={} box={}x{} at ({},{}) (created in place, no move)",
+        id, ow, oh, ox, oy
+    );
 
     DEMO_WIN.store(id, Ordering::Relaxed);
     let ok = wm::present(id);
@@ -267,4 +273,113 @@ pub fn activate() {
         );
         serial_println!("[wc-x] present win={} rows={}..{} ok={}", i.id, y0, y1, ok);
     }
+
+    #[cfg(feature = "witness")]
+    move_vacate_probe(pw, ph);
+}
+
+/// The probe surface for [`move_vacate_probe`] — one flat colour, chosen to be nothing else on the
+/// panel: not [`wm::DESKTOP_BG`], not the chrome, not any bar in the demo pattern.
+#[cfg(feature = "witness")]
+const PROBE_COL: u32 = 0x00FF_00FF;
+#[cfg(feature = "witness")]
+#[repr(align(4))]
+struct ProbeSurface([u32; 64]);
+#[cfg(feature = "witness")]
+static mut PROBE_SURF: ProbeSurface = ProbeSurface([PROBE_COL; 64]);
+
+/// MOVE-VACATE — does a moved window's vacated box actually reach the glass on x86?
+///
+/// The s41 metal sitting reported the panel keeping a moved window's old pixels while the wire said
+/// the erase was staged and delivered (`[wc-k] erase box=1314x750 staged=yes … -> BUFFERED`). The two
+/// statements cannot both be about the same instant, and the wire alone cannot say which one is
+/// wrong: `[wc-k]` reports that [`wm`]'s staged fill ran and copied its rows, not that those rows are
+/// what the scan-out is showing when the shutter opens. This probe closes that gap the way the
+/// compositor's other verdicts close theirs — by READING THE PANEL BACK.
+///
+/// Three answers, and they are mutually exclusive:
+///   * `desktop=5/5` — the erase reached the framebuffer. Any residue in a bench photo is then a
+///     LATER writer repainting those rows (the desktop's own damage-limited present is the candidate:
+///     `screen::flush` subtracts the window layer's occluders from its damage, so a box no window
+///     covers any more is a box the desktop layer is free to paint from its back buffer), not a
+///     failure of the erase, and the fix belongs on that path.
+///   * `desktop=0/5` with `painted=true` — the window's own pixels are still there: the erase's rows
+///     never landed where the window's rows landed, i.e. the two disagree about the box, and the fix
+///     belongs in `wm::erase`/`stage_fill`.
+///   * `painted=false` — the probe never owned its box in the first place; the leg proves nothing and
+///     says so rather than reporting a false PASS.
+///
+/// Deliberately a SCRATCH window rather than a move of the demo: the windows this module activates
+/// are now created in place and never move (SPAWN-PLACE), and moving one to test the move path would
+/// re-introduce on every witness boot exactly the defect that change removes. The probe opens its
+/// own 8x8 window in a clear corner, moves it once, reads back, and closes it — so it is also the
+/// only thing on the panel that a `move_to` disturbs.
+///
+/// Witness builds only, and one-shot.
+#[cfg(feature = "witness")]
+fn move_vacate_probe(pw: usize, ph: usize) {
+    let (scale, ow, oh) = match wm::spawn_geometry(8, 8) {
+        Some(g) => g,
+        None => return,
+    };
+    // Two disjoint boxes along the top edge, clear of the centred console and the corner demo.
+    let step = ow + 2 * EDGE_GAP;
+    if pw < 2 * step + EDGE_GAP || ph < oh + EDGE_GAP {
+        serial_println!("[wc-x] move-vacate SKIP (panel {}x{} too small)", pw, ph);
+        return;
+    }
+    let (ax, ay) = (EDGE_GAP, EDGE_GAP);
+    let bx = EDGE_GAP + step;
+
+    let surf = core::ptr::addr_of_mut!(PROBE_SURF) as usize;
+    let id = wm::create_at(
+        0,
+        surf,
+        core::mem::size_of::<ProbeSurface>(),
+        8,
+        8,
+        32,
+        b"vacate",
+        ax + wm::BORDER,
+        ay + wm::TITLE_H + wm::BORDER,
+    );
+    if id == wm::WIN_NONE {
+        serial_println!("[wc-x] move-vacate SKIP (create declined)");
+        return;
+    }
+    wm::present(id);
+
+    let read = |x: usize, y: usize| super::WRITER.lock().read_pixel(x, y).unwrap_or(0);
+    let (cx, cy) = (ax + wm::BORDER, ay + wm::TITLE_H + wm::BORDER);
+    let painted = read(cx + 1, cy + 1) == PROBE_COL;
+
+    // The move. Same verb an app's `WIN_MOVE` takes, so the path under test is the real one.
+    wm::move_to(id, bx + wm::BORDER, ay + wm::TITLE_H + wm::BORDER);
+
+    // Five points inside the box just vacated: content origin, two content diagonals, the title
+    // strip and the lower border — `vacate_selftest`'s sample set, for the same reason (a fill that
+    // covers the content but not the chrome is a different bug from one that covers neither).
+    let pts = [
+        (cx + 1, cy + 1),
+        (cx + 2, cy + 2),
+        (cx + 5, cy + 5),
+        (ax + ow / 2, ay + wm::TITLE_H / 2),
+        (ax + ow / 2, ay + oh - 1),
+    ];
+    let mut clean = 0usize;
+    let mut stale = 0usize;
+    for &(x, y) in pts.iter() {
+        let px = read(x, y);
+        if px == wm::DESKTOP_BG {
+            clean += 1;
+        } else if px == PROBE_COL {
+            stale += 1;
+        }
+    }
+    wm::close(id);
+    serial_println!(
+        "[wc-x] move-vacate win={} scale={}x from=({},{}) to=({},{}) box={}x{} painted={} desktop={}/5 stale={}/5 -> {}",
+        id, scale, ax, ay, bx, ay, ow, oh, painted, clean, stale,
+        if painted && clean == pts.len() { "PASS" } else { "FAIL" }
+    );
 }
