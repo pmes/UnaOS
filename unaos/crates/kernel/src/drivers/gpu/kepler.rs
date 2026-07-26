@@ -1181,6 +1181,35 @@ pub fn init(gpu: &GpuInfo) {
                                         fb_offset.is_some(),
                                         kdisp_trace[0], kdisp_trace[1], kdisp_trace[2], kdisp_trace[3],
                                         kdisp_trace[4], kdisp_trace[5], kdisp_trace[6]);
+
+                                    // ================= TERMINAL POKE — MUST BE LAST =================
+                                    // ⛔ ORDERING CONTRACT. This is the LAST kepler statement of the
+                                    // boot. Nothing below it, and nothing later in `init()`, may touch
+                                    // the FECS unit — no read, no write, no sweep. Anything added to
+                                    // the kepler leg sequence goes ABOVE this block, never below it.
+                                    //
+                                    // 0x409504 (WRCMD_CMD) is the poison offset: the first ACCESS to it
+                                    // faults and wedges every subsequent read in the FECS unit for the
+                                    // rest of the boot (s31 discovered, s32 confirmed with its own
+                                    // control frame, s34 convicted by elimination — falcon_microcode_
+                                    // spec.md §5.4). Pull 28 turned that into a standing ban on
+                                    // unproven writes into this unit. Peter lifted the ban on
+                                    // 2026-07-26 for EXACTLY this one write; the exemption does not
+                                    // generalise.
+                                    //
+                                    // Value 0 is the least-assumptive available: it asserts no command
+                                    // encoding, no bit layout, no field. The question is only whether
+                                    // the offset accepts a WRITE at all, given that every read of it
+                                    // faults and that nouveau drives this register on gk104 (§5.4).
+                                    //
+                                    // NO READBACK. A readback would be a read of the poisoning offset —
+                                    // the exact access s31 convicted. The witness is therefore printed
+                                    // BEFORE the write, so the capture proves the ordering: the line
+                                    // appears, then the write happens, and whether the boot survives
+                                    // past it is itself the observation. Nothing more is claimed.
+                                    serial_println!(":: kepler: terminal-poke 0x409504 wr=0 (post: no further FECS reads this boot) ::");
+                                    mmio_write(bar0, 0x409504, 0);
+                                    // ============ NOTHING BELOW THIS LINE MAY TOUCH FECS ============
                                 }
                             }
                         }

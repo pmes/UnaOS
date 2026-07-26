@@ -532,3 +532,38 @@ bound exit only:
 ```
 :: kepler: ctx-echo EXIT-BY-BOUND img=A iters=1048576 — command never observed ::
 ```
+## 10. The terminal poke — `0x409504`, once, last
+
+§5.4 established the poison law and pull 28 turned it into a standing ban on
+unproven writes into this unit. Peter lifted that ban on 2026-07-26 for exactly
+one write, and this section records its terms so the exemption cannot spread.
+
+**What it is.** A single write-only poke of `0` to host `0x409504`
+(`WRCMD_CMD`), as the **last kepler statement of the boot**.
+
+**Why `0`.** It is the least-assumptive value available: it asserts no command
+encoding, no bit layout, no field. We are testing whether the offset accepts a
+*write* at all, given that every *read* of it faults (s31/s32/s34) and that
+nouveau drives this register on gk104 (§5.4's "surprise value" note).
+
+**The ordering contract.** The poke sits at the end of the kepler leg sequence,
+after the late display recap, which is after the `ucode-post` sweep, the
+witness rematch and every other `0x409xxx` read in the boot. Nothing in
+`kepler::init()` touches the unit after it. This is the §5.4 rule applied
+literally — *put unproven offsets last, after every proven read has completed* —
+and it is why a poison, if the write triggers one, cannot confound a single
+earlier datum.
+
+**No readback.** A readback would be a read of the poisoning offset, which is
+the exact access s31 convicted. There is none. The witness is therefore printed
+**before** the write:
+
+```
+:: kepler: terminal-poke 0x409504 wr=0 (post: no further FECS reads this boot) ::
+```
+
+so the capture proves the ordering: the line appears, the write happens, and
+whether the boot continues cleanly past it is itself the observation. The
+evidence available from this leg is (a) the line appears at all, (b) the boot
+survives to its normal end markers, and (c) the *next* boot's rest values are
+unchanged. Nothing more is claimed.
