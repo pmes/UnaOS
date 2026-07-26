@@ -643,6 +643,47 @@ REQUIRE \[pstrip\] armed .*full=1000
 # ---    change draws nothing at all. Requiring a rollup whose `skipped=` is non-zero pins that the
 # ---    always-running pulse is genuinely paced and not a 1 Hz repaint wearing a flag.
 REQUIRE \[pstrip\] rollup samples=[0-9]+ redraws=[0-9]+ skipped=[1-9]
+# --- PULSE-3: THE SOURCE, not the pacing.
+# ---
+# ---    P64, attended, capture pi4-r23s1o. Three vugs held the cores at a sustained 99% and the
+# ---    vugband workers churned ~1M context switches a window; the strip printed
+# ---    `rollup samples=10 redraws=0 skipped=10` and Peter watched the gradient LEDs sit still.
+# ---    Verbatim: "gradient good but pulse not real-time".
+# ---
+# ---    The dirty test was right and the 1 Hz pace was right. The FEED was wrong. PULSE-STRIP took
+# ---    vug's VUG-1 M3b counters (`meter_cpu_ticks` -- CPU_BUSY/CPU_IDLE, bumped once per dispatch
+# ---    PASS) and PULSE-2 carried them forward. Those are pass counts, and the scheduler had already
+# ---    retired that metric: SCHED-5's own note is "TIME, NOT PASSES ... it counts scheduler
+# ---    activity, not CPU time". A core running CPU-bound tasks back to back dispatches at a
+# ---    near-constant rate and never reaches the empty-queue branch, so busy/(busy+idle) pins at full
+# ---    scale and stays flat while the utilization underneath it wanders. Hence a bar that never
+# ---    moved -- and hence `[spinhunt]`'s `load settled c2=53` disagreeing with SCHED's `c2=99%` in
+# ---    the same window: two sources, and the panel was reading the wrong one.
+# ---
+# ---    The strip now reads `sched::core_load().busy_pct_recent` -- the SCHED-5/SCHED-7 rolling
+# ---    ~250 ms CNTPCT busy-TIME fraction, the same number `top` and the `SCHED: load` heartbeat
+# ---    print, so instrument and console can no longer disagree about one core. `meter_cpu_ticks`
+# ---    remains the fallback for a core SCHED-8 reports untracked, which is where VUG-HONESTY's
+# ---    PARKED decision lives, so a frozen non-demo core still reads parked and never a fabricated bar.
+# ---
+# ---    `live=k/n` is the assertion that the strip is ON that feed: k counts cores returning a live
+# ---    number. `live=0/n` is the regression exactly -- every core back on the dispatch-pass
+# ---    fallback. (k==n is NOT required: a core legitimately outside `run()` is honestly untracked.)
+REQUIRE \[pstrip\] src live=[1-9][0-9]*/[0-9]+ quantum=[0-9]+ stepres=[0-9]+px mono=(yes|no) (PASS|FAIL)
+FORBID \[pstrip\] src live=0/
+# ---    The other half: a real-time source is worth nothing to a meter too coarse to render its
+# ---    steps. `stepres=` is what ONE source quantum (1% -> 10 permille) moves the lit length on this
+# ---    panel's bar; zero means the display quantizes the feed away and the bars would freeze again
+# ---    for a different reason. `mono=` catches a geometry collapsed to a constant fill being read as
+# ---    a steady load.
+FORBID \[pstrip\] src .*stepres=0px
+FORBID \[pstrip\] src .*mono=no
+FORBID \[pstrip\] src .*FAIL
+# ---    `srcdelta=` in the rollup is the replay-visible half of "not real-time": the count of windows
+# ---    in which the SOURCE moved, printed beside the count actually drawn. A busy window that reads
+# ---    `srcdelta=0` is a stale feed; a window with a large `srcdelta` and `redraws=0` is the dirty
+# ---    test swallowing real movement. Neither was legible in the P64 capture, and both are now.
+REQUIRE \[pstrip\] rollup .* srcdelta=[0-9]+ rate=
 # ---    The busy-loop FORBID. The rate is printed in tenths precisely so this can bite: anything at
 # ---    or above 5.0 presents/s sustained over a rollup window is the strip having become a spinner
 # ---    on the render core -- the SCHED-6 regression, re-entered through the pulse. 4.x and below is

@@ -108,6 +108,44 @@
 //! unchanged at ~0/s; the ceiling stays one redraw per sample, i.e. 1 Hz, well under the spec's 5.0/s
 //! busy-loop FORBID. The `[pstrip]` rollup reports samples and redraws so the pacing stays checkable.
 
+//! ## PULSE-3 — the strip must read the LIVE load source, not the dispatch-pass meter
+//!
+//! Peter's attended P64 verdict on the finished gradient instrument: *"gradient good but pulse not
+//! real-time"*. The capture (`pi4-r23s1o`) says the same thing in numbers — while three vugs held the
+//! cores at a sustained 99% and the vugband workers churned ~1M context switches a window, the strip
+//! printed `rollup samples=10 redraws=0 skipped=10`. Ten consecutive seconds in which the meter decided
+//! nothing on the panel had moved, against a machine that was visibly moving.
+//!
+//! The dirty test was not the defect. **The load source was.** PULSE-STRIP inherited `vug`'s VUG-1 M3b
+//! feed — `sched::meter_cpu_ticks`, the cumulative `CPU_BUSY`/`CPU_IDLE` counters that `dispatch_next`
+//! bumps once per dispatch PASS — and PULSE-2 carried it forward verbatim. Those are pass COUNTS, and
+//! the scheduler itself retired that metric two arcs earlier: SCHED-5's standing note, in
+//! `arch::aarch64::sched`, is *"TIME, NOT PASSES … it counts scheduler activity, not CPU time"*, and it
+//! moved `busy_pct_recent` onto a CNTPCT time base for exactly the reason that bit here. A core running
+//! CPU-bound tasks back to back dispatches at a near-constant rate and never reaches the empty-queue
+//! branch, so `db/(db+di)` pins at full scale and STAYS there: the ratio is flat while the utilization
+//! underneath it wanders. That is why the LEDs did not track, and why the `[spinhunt]` fixture's
+//! `load settled c2=53` and SCHED's `c2=99%` in the same window were never reconcilable — they are two
+//! different sources, and the strip was reading the wrong one.
+//!
+//! So [`live_permille`] takes the live SCHED-5/SCHED-7 feed (`sched::core_load(c).busy_pct_recent`, a
+//! busy-TIME fraction over a rolling ~250 ms window) as the strip's primary source. It is the same
+//! number `top` and the `SCHED: load` witness print, so the instrument and the console can no longer
+//! disagree about the same core. `meter_cpu_ticks` stays as the FALLBACK, and it keeps its whole
+//! VUG-HONESTY meaning: `core_load` reports `tracked=false` for a core that is not inside `run()`, and
+//! for such a core the tick deltas are consulted exactly as before — a frozen non-demo core still reads
+//! [`PARKED`] rather than a fabricated bar, and `vug::parked_display_witness` still covers that branch.
+//! On x86 (no `core_load`) the source is unchanged in every particular.
+//!
+//! **Pacing is unchanged and stays.** 1 Hz is not the defect — skipping a window whose values moved is.
+//! An idle desktop still reads a hard 0 on every core and still redraws nothing (default-quiet), and the
+//! rollup now carries `srcdelta=`: the count of windows in which the SOURCE moved, printed beside the
+//! count of windows actually drawn. A stale-source regression is then a plain reading — `srcdelta=0`
+//! across a busy window — instead of something only a bench operator with the panel in front of him can
+//! see. [`src_witness`] closes the other half at arm time, headless: it reports how many cores return a
+//! live number and whether the source's own quantum (1% → 10‰) clears one pixel of lit length on THIS
+//! panel, so "the meter cannot show what the source can say" is caught in the gate.
+
 use crate::pal::GneissPal;
 use crate::vug::{METER_BREATH, METER_DIM, METER_PARKED, PARKED};
 use alloc::format;
@@ -234,6 +272,10 @@ struct PulseState {
     /// Rollup accumulators.
     samples: u64,
     redraws: u64,
+    /// PULSE-3 — windows in which the SOURCE load moved on at least one core, whether or not that
+    /// movement cleared a pixel of lit length. Printed beside `redraws` so a window that was skipped
+    /// while the machine was changing is a reading in the log rather than a bench observation.
+    srcdelta: u64,
     rollup_ms: u64,
 }
 
@@ -246,8 +288,38 @@ static PULSE: Mutex<PulseState> = Mutex::new(PulseState {
     text_hash: 0,
     samples: 0,
     redraws: 0,
+    srcdelta: 0,
     rollup_ms: 0,
 });
+
+/// PULSE-3 — the strip's PRIMARY load source: this core's live busy-TIME fraction, in per-mille.
+///
+/// `sched::core_load(c).busy_pct_recent` is SCHED-5/SCHED-7's rolling ~250 ms CNTPCT accounting — the
+/// number `top` and the `SCHED: load` heartbeat report — so the instrument and the console are reading
+/// one feed. `None` means "no live number for this core": either the arch has no such accounting (x86)
+/// or SCHED-8's `tracked` flag says the core is not currently inside `run()` and its slot is a frozen
+/// snapshot. `None` sends the caller to the `meter_cpu_ticks` fallback, which is where VUG-HONESTY's
+/// PARKED decision lives — so this function never has to invent a load, and never gets the chance to.
+///
+/// Resolution note: the source is a percent, so its quantum is 10‰. That is coarser than the meter's
+/// 1‰ storage and deliberately not smoothed or interpolated here — a fabricated intermediate value is
+/// exactly the dishonesty VUG-HONESTY closed. [`src_witness`] reports what one quantum is worth in
+/// pixels on the live panel so the trade is checkable rather than assumed.
+#[allow(unused_variables)]
+fn live_permille(cpu: usize) -> Option<u32> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let ld = crate::arch::sched::core_load(cpu);
+        if ld.tracked {
+            return Some((ld.busy_pct_recent * 10).min(PERMILLE_FULL));
+        }
+        None
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        None
+    }
+}
 
 /// FNV-1a over the composed line. Only used to detect change, never stored as content.
 fn hash(s: &str) -> u64 {
@@ -589,6 +661,45 @@ fn draw_panel<P: GneissPal>(pal: &mut P) {
     }
 }
 
+/// The source quantum, in per-mille: [`live_permille`] is derived from a PERCENT, so the smallest step
+/// the live feed can express is 10‰. The meter stores per-mille; this is what the source can actually
+/// deliver into it.
+const SRC_QUANTUM_PERMILLE: u32 = 10;
+
+/// PULSE-3 — the arm-time source witness. Headless, deterministic, one line, no framebuffer read.
+///
+/// Two questions a replay could not previously answer about a panel nobody can see, and the two halves
+/// of the P64 defect:
+///
+/// * **Is the strip on the live feed?** `live=k/n` counts the cores for which [`live_permille`] returns
+///   a number this boot. `k=0` is the PULSE-3 regression exactly — every core back on the dispatch-pass
+///   fallback, which is where "not real-time" came from. (A core legitimately outside `run()` reports
+///   `tracked=false` and is not counted; that is why the assertion is `k>0`, not `k==n`.)
+/// * **Can the meter show what the source can say?** `stepres=` is the lit-length movement, in pixels,
+///   of ONE source quantum on THIS panel's bar geometry. Zero means the display quantizes the feed away
+///   — a real-time source feeding a meter too coarse to render its steps, which would present as the
+///   same frozen bars for a different reason. `mono=` checks the fill is strictly increasing across the
+///   scale, so a geometry that has collapsed to a constant is caught rather than read as "steady load".
+///
+/// `bar_w == 0` (a panel too small to seat rows) reports `stepres=0 mono=no` honestly and FAILs; the
+/// gate geometry seats the instrument, and a boot where it does not is a layout regression the `armed`
+/// line's own FORBIDs already name.
+fn src_witness(g: &RowGeom, ncpu: usize) {
+    let live = (0..ncpu).filter(|c| live_permille(*c).is_some()).count();
+    let stepres = lit_px(g, SRC_QUANTUM_PERMILLE).saturating_sub(lit_px(g, 0));
+    let mono = lit_px(g, 250) < lit_px(g, 500) && lit_px(g, 500) < lit_px(g, PERMILLE_FULL);
+    let pass = live > 0 && stepres > 0 && mono;
+    serial_println!(
+        "[pstrip] src live={}/{} quantum={} stepres={}px mono={} {}",
+        live,
+        ncpu,
+        SRC_QUANTUM_PERMILLE,
+        stepres,
+        if mono { "yes" } else { "no" },
+        if pass { "PASS" } else { "FAIL" }
+    );
+}
+
 /// PULSE-STRIP — the PACED entry point, called on the strip's own ~1 Hz refresh pulse (an
 /// `Event::Timer`). Samples the per-core meters at most once per [`PSTRIP_PERIOD_MS`], then redraws
 /// the band **only if** the composed text line or a quantized per-core load actually changed.
@@ -597,6 +708,8 @@ fn draw_panel<P: GneissPal>(pal: &mut P) {
 pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
     let now = crate::arch::ms();
     let mut changed = false;
+    // PULSE-3: did the SOURCE move this window, independently of whether the picture did?
+    let mut srcmoved = false;
     {
         let mut st = PULSE.lock();
         if st.rollup_ms == 0 {
@@ -646,6 +759,7 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
                 chrome_h(ph),
                 PSTRIP_PERIOD_MS
             );
+            src_witness(&g, st.ncpu);
             changed = true; // first frame must paint the bars
         } else if now.wrapping_sub(st.last_ms) >= PSTRIP_PERIOD_MS {
             st.last_ms = now;
@@ -672,7 +786,16 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
                 // `own_load` is 0: the strip is drawn by a SCHEDULED task, so its core's counters
                 // tick like every other core's and the demo-core fallback never fires here. Passing a
                 // fabricated render load would be exactly the dishonesty VUG-HONESTY closed.
-                let new = crate::vug::classify_load_scaled(db, di, c == demo, 0, PERMILLE_FULL);
+                // PULSE-3 — the LIVE busy-time fraction first; the dispatch-pass deltas only where
+                // there is no live number. The deltas are still consumed unconditionally above (the
+                // `prev` snapshot has to advance every window either way, or a core that later falls
+                // back would classify against a window minutes wide).
+                let new = live_permille(c).unwrap_or_else(|| {
+                    crate::vug::classify_load_scaled(db, di, c == demo, 0, PERMILLE_FULL)
+                });
+                if new != st.load[c] {
+                    srcmoved = true;
+                }
                 changed |= match &geo {
                     Some(g) => lit_px(g, new) != lit_px(g, st.load[c]),
                     // No seatable geometry: fall back to the number itself, so a panel too small to
@@ -698,6 +821,9 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
         if changed {
             st.redraws += 1;
         }
+        if srcmoved {
+            st.srcdelta += 1;
+        }
         // Rate-limited rollup: samples taken vs frames actually drawn. `redraws` well below `samples`
         // is the dirty-pacing proof; the per-second rate is what the spec's busy-loop FORBID reads.
         let span = now.wrapping_sub(st.rollup_ms);
@@ -706,16 +832,18 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
             // to 0 and the spec's busy-loop FORBID would have nothing to bite on.
             let rate_x10 = st.redraws.saturating_mul(10_000) / span.max(1);
             serial_println!(
-                "[pstrip] rollup samples={} redraws={} skipped={} rate={}.{}/s period={}ms",
+                "[pstrip] rollup samples={} redraws={} skipped={} srcdelta={} rate={}.{}/s period={}ms",
                 st.samples,
                 st.redraws,
                 st.samples.saturating_sub(st.redraws),
+                st.srcdelta,
                 rate_x10 / 10,
                 rate_x10 % 10,
                 PSTRIP_PERIOD_MS
             );
             st.samples = 0;
             st.redraws = 0;
+            st.srcdelta = 0;
             st.rollup_ms = now;
         }
     }

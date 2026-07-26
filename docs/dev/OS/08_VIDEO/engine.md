@@ -299,7 +299,8 @@ PULSE-STRIP. The miniature bars are superseded. `click1_hit_test` is unchanged:
 the strip's band is still `height − line_h`, and the instrument is not a view, so
 it takes neither TAB nor a click.
 
-**Data path.** Unchanged from PULSE-STRIP: the same per-core busy/idle counters
+**Data path (superseded by PULSE-3 below — kept for the record).** Unchanged from
+PULSE-STRIP: the same per-core busy/idle counters
 `pulse` and `top` read (`sched::meter_cpu_count` / `meter_cpu_ticks` /
 `meter_current_cpu`), lock-free relaxed loads, never on a scheduler path.
 `own_load` is passed as `0` — the panel is drawn by a *scheduled* task, so its
@@ -353,6 +354,76 @@ frames actually drawn and presented, and the spec REQUIREs a rollup with a non-z
 above `5.0/s` sustained is the panel having become a spinner on the render core,
 i.e. the SCHED-6 regression re-entered through the pulse. Visual verdict is the
 bench's.
+
+### PULSE-3 — the strip was reading the wrong load source
+
+Peter's attended verdict at P64, with the finished gradient instrument on the
+bench panel: *"gradient good but pulse not real-time"*. The gradient itself is
+settled — colours, geometry and the WC-F corner yield are not in question here.
+
+**What the capture said.** In `pi4-r23s1o`, three vugs held the cores at a
+sustained 99% and the vugband workers churned ~1M context switches per window.
+The strip printed, for ten seconds running:
+
+```
+[pstrip] rollup samples=10 redraws=0 skipped=10 rate=0.0/s period=1000ms
+[sched6] passes=1/s composites=0/s (dirty-paced strip@1Hz)
+```
+
+Ten consecutive windows in which the meter concluded that nothing on the panel had
+moved, against a machine that was visibly moving. The same capture's `[spinhunt]`
+fixture reported `load settled c2=53` while SCHED's own load line reported
+`c2=99%` in the same window — two numbers for one core, which is the tell.
+
+**Root cause: the feed, not the pacing.** The dirty test was correct and the 1 Hz
+pace was correct. PULSE-STRIP inherited `vug`'s VUG-1 M3b feed — `meter_cpu_ticks`,
+i.e. the cumulative `CPU_BUSY`/`CPU_IDLE` counters `dispatch_next` bumps once per
+dispatch **pass** — and PULSE-2 carried it forward verbatim. Those are pass counts,
+and the scheduler had already retired that metric two arcs earlier; SCHED-5's
+standing note in `arch/aarch64/sched.rs` says so in as many words: *"TIME, NOT
+PASSES … it counts scheduler activity, not CPU time"*. A core running CPU-bound
+tasks back to back dispatches at a near-constant rate and never reaches the
+empty-queue branch, so `db/(db+di)` pins at full scale and stays flat while the
+utilization underneath it wanders. A flat source through a correct dirty test is a
+frozen bar — exactly what Peter watched. It is also why `[spinhunt]` and SCHED
+could not be reconciled: the strip and the console were on different feeds.
+
+**The fix.** `live_permille(cpu)` makes `sched::core_load(cpu).busy_pct_recent` —
+the SCHED-5/SCHED-7 rolling ~250 ms CNTPCT busy-**time** fraction, the number `top`
+and the `SCHED: load` heartbeat already print — the strip's primary source. One
+feed, so the instrument and the console can no longer disagree about one core.
+`meter_cpu_ticks` stays as the fallback and keeps its full meaning: SCHED-8 reports
+`tracked=false` for a core not currently inside `run()`, and such a core is
+classified through `vug::classify_load_scaled` exactly as before, so a frozen
+non-demo core still reads `PARKED` rather than a fabricated bar and
+`parked_display_witness` still covers that branch. The tick deltas are still
+consumed every window whether or not they are used, or a core that later falls back
+would classify against a window minutes wide. On x86 there is no `core_load` and
+the source is unchanged in every particular.
+
+**Pacing is untouched.** 1 Hz stays; skipping a window whose values moved was the
+defect, and that was never the pace gate. An idle desktop still reads a hard 0 on
+every core, still moves no lit length, and still redraws nothing — the
+default-quiet contract and the spec's non-zero `skipped=` both hold.
+
+**Witnesses.** The rollup gains `srcdelta=`: windows in which the *source* moved,
+printed beside the windows actually drawn. A busy window reading `srcdelta=0` is a
+stale feed; a large `srcdelta` with `redraws=0` is the dirty test swallowing real
+movement. Neither was legible in the P64 capture. `[pstrip] src`, emitted once at
+arm time, closes the headless half:
+
+```
+[pstrip] src live=4/4 quantum=10 stepres=13px mono=yes PASS
+[pstrip] rollup samples=10 redraws=3 skipped=7 srcdelta=3 rate=0.3/s period=1000ms
+```
+
+`live=k/n` counts cores returning a live number; `live=0/n` is the PULSE-3
+regression exactly — every core back on the dispatch-pass fallback — and is
+FORBIDden. `k == n` is deliberately *not* required: a core legitimately outside
+`run()` is honestly untracked. `stepres=` is what one source quantum (the feed is a
+percent, so 10‰) moves the lit length on this panel's bar; `stepres=0px` would mean
+a real-time source feeding a meter too coarse to render its steps — the same frozen
+bars for a different reason — and is FORBIDden too, as is a non-monotonic fill.
 
 ## 5. Serial evidence
 
