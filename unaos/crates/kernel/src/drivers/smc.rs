@@ -530,15 +530,27 @@ pub mod battery {
     /// is unchanged and bounded.
     static RETRIES_SWEEP: AtomicU32 = AtomicU32::new(0);
     static RETRIES_TOTAL: AtomicU32 = AtomicU32::new(0);
+    /// RETRIES-LATCH: `RETRIES_SWEEP` is zeroed at the top of every sweep, but the witness does not
+    /// fire on every sweep (see `refresh_if_due`) — so a sweep whose count was never printed used to
+    /// vanish when the next sweep zeroed the counter, and the worst sweeps (total drop-out,
+    /// `present=false`) were exactly the silent ones. Every sweep now latches its final count here
+    /// before returning, and the witness reads the latch, so the number reported is the last sweep
+    /// that actually ran rather than whatever the current one happens to have reached.
+    static RETRIES_LAST: AtomicU32 = AtomicU32::new(0);
 
     fn note_retry() {
         RETRIES_SWEEP.fetch_add(1, Ordering::Relaxed);
         RETRIES_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// `(retries consumed by the last sweep, retries since boot)`.
+    /// Latch the in-flight sweep's retry count so it survives the next sweep's reset.
+    fn latch_retries() {
+        RETRIES_LAST.store(RETRIES_SWEEP.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
+    /// `(retries consumed by the last completed sweep, retries since boot)`.
     pub fn retry_counts() -> (u32, u32) {
-        (RETRIES_SWEEP.load(Ordering::Relaxed), RETRIES_TOTAL.load(Ordering::Relaxed))
+        (RETRIES_LAST.load(Ordering::Relaxed), RETRIES_TOTAL.load(Ordering::Relaxed))
     }
 
     /// A decoded battery reading. Every field is `Option` — a key the SMC lacks stays `None`
@@ -560,6 +572,10 @@ pub mod battery {
         /// AC adapter present (`AC-W` answered with a non-zero payload). Stays `None` on machines
         /// that lack the key entirely — the 2012 rMBP among them; see `ac_derived`.
         pub ac_present: Option<bool>,
+        /// `AC-W` was present-but-wedged: the bounded retry budget was exhausted on non-`Absent`
+        /// failures, so `ac_present` is `None` because of an SMC fault rather than because the key
+        /// does not exist. Distinguishes a live fault from the rMBP's stable key-less shape.
+        pub ac_stuck: bool,
         /// Charge state INFERRED from the `B0AC` sign when `AC-W` cannot answer (IVY-AC). Never a
         /// substitute for `ac_present` where that resolves; see [`AcDerived`] for the ambiguity.
         pub ac_derived: AcDerived,
@@ -573,6 +589,7 @@ pub mod battery {
         full_mah: None,
         rem_mah: None,
         ac_present: None,
+        ac_stuck: false,
         ac_derived: AcDerived::Unknown,
     });
     /// Last refresh time (ms); 0 = never. Throttles the port I/O off the per-frame path.
@@ -648,6 +665,7 @@ pub mod battery {
                     ":: SMC-BATT: sweep aborted — first key BRSC stuck (SMC unresponsive); remaining keys skipped (noted once) ::"
                 );
             }
+            latch_retries();
             return s; // all-None, present=false: the honest unresponsive snapshot
         }
         s.soc_pct = opt(first);
@@ -659,6 +677,12 @@ pub mod battery {
         // discipline as the numeric keys — a Stuck handshake gets one more chance before the field
         // becomes a hole; a clean Absent (the 2012 rMBP's answer: this machine has no AC-W) stops
         // immediately, and the derived state below takes over.
+        //
+        // AC-STUCK: exhausting the budget is NOT the same fact as a clean `Absent`, even though both
+        // leave `ac_present = None`. "This machine has no AC-W" (the 2012 rMBP) is a stable property
+        // the derived state legitimately covers; "AC-W is there but the handshake wedged" is a live
+        // SMC fault a sitting needs to see. `ac_stuck` records which of the two produced the hole.
+        s.ac_stuck = false;
         s.ac_present = 'acw: {
             for attempt in 0..READ_ATTEMPTS {
                 if attempt > 0 {
@@ -671,12 +695,14 @@ pub mod battery {
                     _ => {}
                 }
             }
+            s.ac_stuck = true; // budget exhausted on a non-Absent failure: wedged, not absent
             None
         };
         // IVY-AC: infer charge state from the B0AC sign. Computed always (it is cheap and costs no
         // port I/O); it is only *reported in place of* ac_present when AC-W could not answer.
         s.ac_derived = derive_ac(s.amp_ma);
         s.present = s.soc_pct.is_some() || s.volt_mv.is_some() || s.rem_mah.is_some();
+        latch_retries();
         s
     }
 
@@ -741,8 +767,11 @@ pub mod battery {
         // Fire the witness on the FIRST refresh (proves the M2 read path ran — the honest
         // `present=false` line on QEMU / a battery-less machine), then on the ~1 s cadence whenever
         // a battery is present so a sitting can watch discharge/charge track. Throttled above.
+        // RETRIES-LATCH (cont.): also fire whenever the sweep that just finished consumed retries,
+        // even on a `present=false` drop-out sweep — those are precisely the ones worth seeing.
+        let (rsweep, rtotal) = retry_counts();
         let mut w = WITNESSED.lock();
-        if !*w || s.present {
+        if !*w || s.present || rsweep > 0 {
             *w = true;
             // Absent keys print the "-" sentinel — never a number a reader could mistake for a real
             // value (0 mA is a plausible amperage, so `None` must NOT read as 0). snapshot() itself
@@ -752,13 +781,15 @@ pub mod battery {
             // `ac=` reports the DIRECT reading when AC-W answered; otherwise the IVY-AC inference
             // from the B0AC sign, tagged `derived:` so no reader can mistake it for a direct one.
             // `ac=?` now only appears when there is neither an AC-W answer nor a B0AC reading.
-            let ac = match (s.ac_present, s.ac_derived) {
-                (Some(true), _) => alloc::string::String::from("yes"),
-                (Some(false), _) => alloc::string::String::from("no"),
-                (None, AcDerived::Unknown) => alloc::string::String::from("?"),
-                (None, d) => alloc::format!("derived:{}", d.as_str()),
+            // A wedged AC-W reads `stuck` — a live SMC fault, distinct from `derived:…` (the key is
+            // genuinely absent and the B0AC sign stands in) and from `?` (no answer, nothing to infer).
+            let ac = match (s.ac_present, s.ac_stuck, s.ac_derived) {
+                (Some(true), _, _) => alloc::string::String::from("yes"),
+                (Some(false), _, _) => alloc::string::String::from("no"),
+                (None, true, _) => alloc::string::String::from("stuck"),
+                (None, false, AcDerived::Unknown) => alloc::string::String::from("?"),
+                (None, false, d) => alloc::format!("derived:{}", d.as_str()),
             };
-            let (rsweep, rtotal) = retry_counts();
             serial_println!(
                 ":: SMC-BATT: present={} soc={}% volt={}mV amp={}mA full={}mAh rem={}mAh ac={} retries={}/{} == witness ::",
                 s.present,

@@ -403,8 +403,9 @@ pub fn log_summary_once() {
         // behind-hub boot can be diffed line for line.
         let (peak, budget) = (BOT_PUMP_PEAK.load(Ordering::Relaxed), BOT_PUMP_BUDGET.load(Ordering::Relaxed));
         serial_println!(
-            ":: BOT: pump budget={} peak={} n={} timeouts={} storage_slot={} route={:#x} depth={} result=SUMMARY ::",
-            budget, peak, BOT_PUMP_COUNT.load(Ordering::Relaxed), BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed),
+            ":: BOT: pump budget={} peak={} n={} nowait={} timeouts={} storage_slot={} route={:#x} depth={} result=SUMMARY ::",
+            budget, peak, BOT_PUMP_COUNT.load(Ordering::Relaxed), BOT_PUMP_NOWAIT.load(Ordering::Relaxed),
+            BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed),
             x.storage_slot,
             x.slots[x.storage_slot as usize].route_string, x.slots[x.storage_slot as usize].route_depth);
     }
@@ -454,6 +455,11 @@ pub static BOT_PUMP_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static BOT_PUMP_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 /// The wall-clock budget (cycles) the most recent pump ran under — 0 until the first BOT transfer.
 pub static BOT_PUMP_BUDGET: AtomicU64 = AtomicU64::new(0);
+/// Pump entries that found NOTHING pending and returned immediately. These are not transfers and
+/// must not inflate `n=` — worse, they carry no slot, so the fabricated `route=0 depth=0` they used
+/// to be counted under made a behind-hub boot look like it had root-port traffic. Counted here and
+/// reported as `nowait=` instead.
+pub static BOT_PUMP_NOWAIT: AtomicU64 = AtomicU64::new(0);
 /// The peak last PRINTED as a `:: BOT: … result=OK ::` witness — the throttle reference, so a peak
 /// that creeps up in small steps still gets reported once it has doubled overall.
 static BOT_PUMP_REPORTED: AtomicU64 = AtomicU64::new(0);
@@ -3928,7 +3934,9 @@ impl XhciController {
                     return Ok(());
                 }
                 None => {
-                    Self::note_bot_pump(start, budget, route, depth, slot);
+                    // Nothing was pending: this pump entry did not wait on a transfer at all.
+                    // Counted separately (`nowait=`) so it cannot inflate `n=` against route 0.
+                    BOT_PUMP_NOWAIT.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
                 _ => {}
@@ -3988,9 +3996,10 @@ impl XhciController {
         if used >= reported.saturating_mul(2).max(1) {
             BOT_PUMP_REPORTED.store(used, Ordering::Relaxed);
             serial_println!(
-                ":: BOT: pump budget={} used={} peak={} route={:#x} depth={} slot={} n={} timeouts={} result=OK ::",
+                ":: BOT: pump budget={} used={} peak={} route={:#x} depth={} slot={} n={} nowait={} timeouts={} result=OK ::",
                 budget, used, used, route, depth, slot,
-                BOT_PUMP_COUNT.load(Ordering::Relaxed), BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed));
+                BOT_PUMP_COUNT.load(Ordering::Relaxed), BOT_PUMP_NOWAIT.load(Ordering::Relaxed),
+                BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed));
         }
     }
 

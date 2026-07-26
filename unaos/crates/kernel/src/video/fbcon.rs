@@ -66,6 +66,86 @@ const FG_DEFAULT: u32 = 0x00C0_C0C0; // light grey text
 const BG_DEFAULT: u32 = 0x0000_0000; // black background
 const PANIC_BG: u32 = 0x0030_0000; // dark red
 
+/// A unit of PIXEL work, produced by the layout pass and executed by the paint pass. Splitting
+/// the two is what lets the expensive half run outside the interrupt-masked region (see `_print`).
+/// Coordinates are absolute pixels on the draw surface.
+#[derive(Clone, Copy)]
+enum Op {
+    Glyph { ch: u8, x: usize, y: usize },
+    Fill { y0: usize, y1: usize },
+}
+
+/// Worst case ops emitted by one byte: a wrap `\n` (two band fills) plus the glyph itself.
+const OPS_PER_BYTE: usize = 3;
+
+/// A fixed-capacity op buffer — no allocation (fbcon runs pre-heap and from panic context).
+/// Overflow drops ops rather than growing; callers size `N` at `OPS_PER_BYTE * bytes`.
+struct OpList<const N: usize> {
+    ops: [Op; N],
+    n: usize,
+}
+
+impl<const N: usize> OpList<N> {
+    fn new() -> Self {
+        OpList { ops: [Op::Fill { y0: 0, y1: 0 }; N], n: 0 }
+    }
+    fn push(&mut self, op: Op) {
+        if self.n < N {
+            self.ops[self.n] = op;
+            self.n += 1;
+        }
+    }
+    fn as_slice(&self) -> &[Op] {
+        &self.ops[..self.n]
+    }
+}
+
+/// Paint one glyph's foreground pixels at (cx, cy). Cells are background-clean when first
+/// reached (initial fill / post-newline band fill), so no per-cell clear is needed.
+fn draw_glyph(surf: &FrameBuffer, ch: u8, cx: usize, cy: usize, fg: u32, s: usize) {
+    let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
+    // VPERF M4 (x86): hoist the per-pixel format decode out of the 8x8 bit loop — encode the
+    // foreground once, poke pre-encoded 4-byte pixels (bounds checks stay per pixel).
+    #[cfg(target_arch = "x86_64")]
+    if let Some(raw) = surf.encode4(fg) {
+        for (ry, byte) in bitmap.iter().enumerate() {
+            for rx in 0..8 {
+                if byte & (1 << rx) != 0 {
+                    // scale == 1 collapses to the original single poke.
+                    for dy in 0..s {
+                        for dx in 0..s {
+                            surf.put_raw4(cx + rx * s + dx, cy + ry * s + dy, raw);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    for (ry, byte) in bitmap.iter().enumerate() {
+        for rx in 0..8 {
+            if byte & (1 << rx) != 0 {
+                for dy in 0..s {
+                    for dx in 0..s {
+                        surf.put_pixel(cx + rx * s + dx, cy + ry * s + dy, fg);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Execute a planned op list against a surface. Touches ONLY pixels — no console state — so it is
+/// safe to run without the `FBCON` lock once the layout pass has reserved the cells.
+fn paint_ops(surf: &FrameBuffer, ops: &[Op], fg: u32, bg: u32, scale: usize) {
+    for op in ops {
+        match *op {
+            Op::Glyph { ch, x, y } => draw_glyph(surf, ch, x, y, fg, scale),
+            Op::Fill { y0, y1 } => surf.fill_rows(y0, y1, bg),
+        }
+    }
+}
+
 struct FbCon {
     fb: FrameBuffer,
     /// VPERF M2 (videocap bench lever): `fb` above is HEIGHT-CAPPED (its `info.height` is
@@ -202,79 +282,64 @@ impl FbCon {
         self.dirty_y1 = 0;
     }
 
-    /// Draw a glyph at pixel (cx, cy). Cells are background-clean when first reached (initial
-    /// fill / post-scroll clear), so we only paint the foreground pixels — no per-cell clear.
-    fn glyph(&self, ch: u8, cx: usize, cy: usize) {
-        let surf = self.draw_fb();
-        let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
-        let s = self.scale;
-        // VPERF M4 (x86): hoist the per-pixel format decode out of the 8x8 bit loop — encode the
-        // foreground once, poke pre-encoded 4-byte pixels (bounds checks stay per pixel).
-        #[cfg(target_arch = "x86_64")]
-        if let Some(raw) = surf.encode4(self.fg) {
-            for (ry, byte) in bitmap.iter().enumerate() {
-                for rx in 0..8 {
-                    if byte & (1 << rx) != 0 {
-                        // scale == 1 collapses to the original single poke.
-                        for dy in 0..s {
-                            for dx in 0..s {
-                                surf.put_raw4(cx + rx * s + dx, cy + ry * s + dy, raw);
-                            }
-                        }
-                    }
-                }
-            }
-            return;
-        }
-        for (ry, byte) in bitmap.iter().enumerate() {
-            for rx in 0..8 {
-                if byte & (1 << rx) != 0 {
-                    for dy in 0..s {
-                        for dx in 0..s {
-                            surf.put_pixel(cx + rx * s + dx, cy + ry * s + dy, self.fg);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// Advance to the next line — WRAP-AROUND rendering, never a scroll. At the bottom row the
     /// cursor wraps back to the top and overwrites the old pass line by line; the line AFTER the
     /// cursor is kept blank as the moving marker separating fresh text from the previous pass.
     /// Each newline costs two one-line band fills and the new glyphs — nothing moves, and the
     /// framebuffer is never read back (the WC/uncached readback of the old full-frame scroll was
     /// the rMBP's pixel-by-pixel boot killer).
-    fn newline(&mut self) {
+    ///
+    /// LAYOUT/PAINT SPLIT: this only advances the cursor and RESERVES the cells it will consume,
+    /// emitting the pixel work as ops. The caller decides when to execute them (see `Op`).
+    fn plan_newline<const N: usize>(&mut self, out: &mut OpList<N>) {
         self.col = 0;
         self.row = if self.row + 1 >= self.rows { 0 } else { self.row + 1 };
         let next = if self.row + 1 >= self.rows { 0 } else { self.row + 1 };
         let ch = self.cell_h;
         let y = self.row * ch;
-        self.draw_fb().fill_rows(y, y + ch, self.bg);
+        out.push(Op::Fill { y0: y, y1: y + ch });
         self.mark_rows(y, y + ch);
         if next != self.row {
             let ny = next * ch;
-            self.draw_fb().fill_rows(ny, ny + ch, self.bg);
+            out.push(Op::Fill { y0: ny, y1: ny + ch });
             self.mark_rows(ny, ny + ch);
         }
     }
 
-    fn write_byte(&mut self, b: u8) {
+    /// Layout half of `write_byte`: mutate the console state (cursor, dirty band) and append the
+    /// pixel work for this byte to `out`. Emits at most `OPS_PER_BYTE` ops.
+    fn plan_byte<const N: usize>(&mut self, b: u8, out: &mut OpList<N>) {
         match b {
-            b'\n' => self.newline(),
+            b'\n' => self.plan_newline(out),
             b'\r' => self.col = 0,
             0x20..=0x7E => {
                 if self.col >= self.cols {
-                    self.newline();
+                    self.plan_newline(out);
                 }
                 let cy = self.row * self.cell_h;
-                self.glyph(b, self.col * self.cell_w, cy);
+                out.push(Op::Glyph { ch: b, x: self.col * self.cell_w, y: cy });
                 self.mark_rows(cy, cy + self.cell_h);
                 self.col += 1;
             }
             _ => {} // ignore other control bytes
         }
+    }
+
+    /// Plan and paint one byte immediately (the classic, in-place path).
+    fn write_byte(&mut self, b: u8) {
+        let mut ops = OpList::<OPS_PER_BYTE>::new();
+        self.plan_byte(b, &mut ops);
+        paint_ops(self.draw_fb(), ops.as_slice(), self.fg, self.bg, self.scale);
+    }
+
+    /// Take the accumulated dirty band and reset it, for a caller that will flush it itself
+    /// (the deferred panel path flushes outside the lock). `(y0, y1)`, empty when `y0 >= y1`.
+    #[cfg(target_arch = "x86_64")]
+    fn take_dirty(&mut self) -> (usize, usize) {
+        let band = (self.dirty_y0, self.dirty_y1);
+        self.dirty_y0 = 0;
+        self.dirty_y1 = 0;
+        band
     }
 }
 
@@ -314,6 +379,12 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
     // can attribute source reads to VRAM (heap shadows/back buffers never match this range).
     #[cfg(all(target_arch = "x86_64", feature = "videobench"))]
     crate::video::vperf::set_vram_range(fb_addr as usize, fb_len);
+    // PANEL-CONSOLE is a property of the takeover seam, not of the console: `init` resets the
+    // cell size and scale back to the raw 8x8 font, so leaving the mirror armed across a re-init
+    // would keep painting the full stream at scale 1 (invisible on a Retina panel) with nothing
+    // having re-armed it. `panel_console_resume` re-arms it, and it alone.
+    #[cfg(target_arch = "x86_64")]
+    PANEL_CONSOLE.store(false, Ordering::Relaxed);
     crate::arch::without_interrupts(|| {
         let mut c = FBCON.lock();
         // VPERF M2 (videocap bench lever): cap the fbcon-PRIVATE handle's height. Capping the
@@ -374,6 +445,24 @@ pub fn _print(args: core::fmt::Arguments) {
     if !PANIC_MIRROR.load(Ordering::Relaxed) && !PANEL_CONSOLE.load(Ordering::Relaxed) {
         return;
     }
+    // PANEL-DEFER (x86): mirror through the split layout/paint path when the draw target is VRAM
+    // (no cached-RAM shadow) and we are not on the panic path. See `panel_mirror` for the invariant.
+    #[cfg(target_arch = "x86_64")]
+    if !PANIC_MIRROR.load(Ordering::Relaxed) {
+        let mut sink = PanelSink::new();
+        let _ = core::fmt::Write::write_fmt(&mut sink, args);
+        if sink.finish() {
+            return; // the split path owned this line (or there was nothing to paint)
+        }
+        // The route was decided against the split path on the FIRST flush — before any pixel was
+        // painted — so the line is still untouched and the classic path can render all of it.
+    }
+    print_masked(args);
+}
+
+/// The classic mirror: format straight into the console with interrupts masked for the whole
+/// line. Kept verbatim for the PANIC path and for aarch64.
+fn print_masked(args: core::fmt::Arguments) {
     crate::arch::without_interrupts(|| {
         if let Some(mut c) = FBCON.try_lock() {
             if c.ready {
@@ -385,6 +474,119 @@ pub fn _print(args: core::fmt::Arguments) {
             }
         }
     });
+}
+
+/// Bytes buffered before one layout/paint round-trip. Bounds the stack cost of the op buffer
+/// (`CHUNK * OPS_PER_BYTE` ops), which matters because an IRQ-context printer can nest inside the
+/// paint pass — see the invariant below.
+#[cfg(target_arch = "x86_64")]
+const CHUNK: usize = 16;
+
+/// PANEL-DEFER sink (finding: scale²-amplified VRAM pokes ran with IRQs masked).
+///
+/// THE MASK INVARIANT. The old `_print` held `without_interrupts` across the whole line, which on
+/// a PANEL_CONSOLE boot meant 10–20k uncached VRAM pokes per line with interrupts off — bad for the
+/// same boots that drive wall-clock USB pumps. What the mask actually protected was NOT the pixels:
+/// the lock is `try_lock`ed, so an IRQ-context printer could never deadlock on it in the first
+/// place. The mask bought exactly two things:
+///   (a) console STATE (cursor, grid, dirty band) is mutated atomically w.r.t. an IRQ-context
+///       printer on this CPU — two printers must not both believe they own the same cell;
+///   (b) a line contended by an IRQ printer was deferred rather than dropped from the panel.
+/// Only (a) is a correctness property, and it needs the mask for the LAYOUT half only. So layout
+/// (cursor advance + cell reservation + dirty-band accumulation) still runs masked and under the
+/// lock; the pixel work it plans runs afterwards with interrupts enabled and NO lock held.
+/// (b) is preserved too: an IRQ printer that lands mid-paint takes the lock (we are not holding
+/// it), reserves its OWN cells, and paints them — so the two paints touch DISJOINT pixels and
+/// merely interleave visually. Nothing re-enters the console state unserialised, so no re-entry
+/// AtomicBool is needed.
+///
+/// Two cases stay on the classic fully-masked path deliberately:
+///   * the PANIC path (`PANIC_MIRROR`) — a panic must never find the `FBCON` lock held by a
+///     preempted paint, so panic-path behaviour is byte-for-byte unchanged;
+///   * a cached-RAM shadow being attached — drawing then goes to cached RAM (cheap; the cost this
+///     fix targets does not exist) and presenting it needs the store, i.e. the lock, held anyway.
+#[cfg(target_arch = "x86_64")]
+struct PanelSink {
+    buf: [u8; CHUNK],
+    n: usize,
+    /// `false` until the first flush decides the route; `true` = split path owns this line.
+    split: bool,
+    /// Route decided yet?
+    decided: bool,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl PanelSink {
+    fn new() -> Self {
+        PanelSink { buf: [0u8; CHUNK], n: 0, split: false, decided: false }
+    }
+
+    fn flush(&mut self) {
+        if self.n == 0 {
+            return;
+        }
+        let n = self.n;
+        self.n = 0;
+        if self.decided && !self.split {
+            return; // classic route already handled the whole line
+        }
+        let bytes = &self.buf[..n];
+        // MASKED + LOCKED: layout only. No VRAM writes happen in here.
+        let plan = crate::arch::without_interrupts(|| {
+            let mut c = match FBCON.try_lock() {
+                Some(c) => c,
+                None => return None,
+            };
+            if !c.ready || c.shadow_store.is_some() {
+                return None;
+            }
+            let mut ops = OpList::<{ CHUNK * OPS_PER_BYTE }>::new();
+            for &b in bytes {
+                c.plan_byte(b, &mut ops);
+            }
+            let band = c.take_dirty();
+            Some((*c.draw_fb(), c.fg, c.bg, c.scale, ops, band))
+        });
+        let Some((surf, fg, bg, scale, ops, band)) = plan else {
+            if !self.decided {
+                self.decided = true;
+                self.split = false;
+            }
+            return;
+        };
+        self.decided = true;
+        self.split = true;
+        // UNMASKED, UNLOCKED: the expensive half.
+        paint_ops(&surf, ops.as_slice(), fg, bg, scale);
+        if band.1 > band.0 {
+            let info = surf.info();
+            let row_bytes = info.stride * info.bytes_per_pixel;
+            let y1 = band.1.min(info.height);
+            if y1 > band.0 {
+                surf.flush_range(band.0 * row_bytes, (y1 - band.0) * row_bytes);
+            }
+        }
+    }
+
+    /// Returns true when the split path owned this line (nothing more to do).
+    fn finish(&mut self) -> bool {
+        self.flush();
+        self.split || !self.decided
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl core::fmt::Write for PanelSink {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            self.buf[self.n] = b;
+            self.n += 1;
+            if self.n == CHUNK {
+                self.flush();
+            }
+        }
+        Ok(())
+    }
 }
 
 /// GUI-WITNESS on-panel milestone (QUIET-PANEL companion): paint ONE short line for a recorded
