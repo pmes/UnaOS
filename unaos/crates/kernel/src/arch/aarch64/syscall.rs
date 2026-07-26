@@ -10216,9 +10216,16 @@ unsafe extern "C" {
 // muddy a witness whose entire subject is the PARENT's core. One task per launch, three launches,
 // three parent placements.
 //
-// Parking (rather than spinning) also keeps the leg honest about what it does NOT measure: a parked
-// task leaves the run queue, so the three placements are decided against a nearly-flat load and what
-// the witness reads is the PLACEMENT POLICY, not a transient queue-depth artefact.
+// The fixture SPINS BOUNDEDLY FIRST, then parks — and the spin is load-bearing (U7FIX composition
+// lesson, 2026-07-26): an instant park leaves the run queue immediately, so the three placements
+// were decided against a nearly-flat load where `pick_cpu`'s busy-fraction tiebreak picks ONE
+// strictly-least core every time — `distinct=1`, legal, and the leg false-reds. The leg's teeth
+// came from AMBIENT boot noise (the old U7 yield-spam), which U7FIX removed. The bounded spin
+// (~4M iterations, a few ms on metal, tens under QEMU) keeps each prior fixture IN its core's
+// ready queue while the next placement is decided, so the first tiebreak (queue depth) avoids
+// used cores BY CONSTRUCTION — the spread is structural, not atmospheric. The spin is bounded so
+// the fixture still reaches its kill-aware futex park (an unbounded EL0 spin is unkillable under
+// QEMU — KILLBOUND's documented residual).
 //
 // FLAT image (no ELF magic), one code page, position-independent via `adr` — rides
 // `spawn_user_image_bg` with no fixture files on the card. The flat loader does not zero the data
@@ -10235,6 +10242,9 @@ __bgspread_blob_start:
     add  x21, x20, #0x1000                // x21 = the futex word (RW data page 1)
     str  xzr, [x21]                       // word = 0 (the recycled-backing guard)
     dmb  ish                              // publish the zero before the wait reads it
+    movz x22, #0x40, lsl #16              // ~4M-iteration BOUNDED spin: stay in the run queue
+2:  subs x22, x22, #1                     //   while the sibling placements are decided (the
+    b.ne 2b                               //   structural-spread guarantee; see block comment)
     mov  x0, x21                          // SYS_FUTEX(uaddr, FUTEX_WAIT=0, expect=0) -> parks forever
     mov  x1, #0
     mov  x2, #0
@@ -10510,8 +10520,13 @@ fn spinhunt_witness() {
 ///
 /// TEETH (the A/B). On the pre-arc code `spawn_user_image_bg` passed `this_cpu()`, and all `NBG`
 /// launches run from this one witness task on one core, so `distinct` is 1 BY CONSTRUCTION and the
-/// leg fails on every boot — it cannot pass for a lucky reason. With `CPU_AUTO` the rotating tie-break
-/// in `pick_cpu` fans consecutive equal-load placements across cores, so `distinct` is 2..=NBG.
+/// leg fails on every boot — it cannot pass for a lucky reason. With `CPU_AUTO`, spread is
+/// STRUCTURAL, not atmospheric (corrected 2026-07-26 after the U7FIX composition false-red): each
+/// fixture busy-spins boundedly before parking, so it still occupies its core's ready queue while
+/// the next placement is decided, and `pick_cpu`'s FIRST tiebreak (queue depth) avoids used cores
+/// by construction. The original claim leaned on the rotating tie-break, which only breaks FULL
+/// ties — the busy-fraction criterion almost never fully ties, and on a calm boot one strictly-least
+/// core legally won all three placements (`distinct=1`, correct policy, red leg).
 ///
 /// An honest skip on a boot with fewer than 2 online cores (the metal 3-of-4 variance in the spec
 /// header has a uniprocessor tail): with one candidate core there is no spread to observe, and a
