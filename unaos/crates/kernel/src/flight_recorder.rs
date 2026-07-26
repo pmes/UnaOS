@@ -30,15 +30,54 @@
 //!     what the log is for, and stops (counting dropped bytes) once full rather than evicting the head.
 //!   * **flush** — `service()` runs from the x86 main loop (right after `fat::probe_once`). Once a
 //!     block device is up it mounts the FAT volume and writes the ring to `/UNAOS.LOG` via the SAME
-//!     public `fat.rs` entry points the shell's `write` command uses (`find_located` /
-//!     `create_in_root` / `delete_located` / `write_grow` — call-never-edit; creating a file in an
-//!     existing FAT volume is not a format change). Write-through and bounded (a stalled USB write is
-//!     `FatError::Io`, never a hang). Failures are honest-and-silent: one witness line, never a panic,
-//!     never a block on boot. Re-flushes when the ring has grown since the last successful write,
-//!     rate-limited so late lines still reach the disk before a hard power-off without churning the FAT.
+//!     public `fat.rs` entry points the shell's `write` command uses (call-never-edit; creating a file
+//!     in an existing FAT volume is not a format change). Write-through and bounded (a stalled USB
+//!     write is `FatError::Io`, never a hang). Failures are honest-and-silent: one witness line, never
+//!     a panic, never a block on boot. Re-flushes when the ring has grown since the last successful
+//!     write, rate-limited so late lines still reach the disk before a hard power-off.
+//!
+//! # SINGLE FAT WRITER (2026-07-26) — why the flush RESERVES the file once and then writes IN PLACE
+//!
+//! The flush used to re-create `UNAOS.LOG` on every pass: `delete_located` (free ~32 clusters) +
+//! `create_in_root` (a root-directory-sector RMW) + `write_grow` (re-allocate + re-chain those
+//! clusters). That made the BSP main loop a SECOND, unsynchronized FAT/directory mutator running
+//! concurrently with the demo chain's writers on the AP cores (the U10/U10c/U10d op drains, the shell,
+//! the storage service task). `fs/fat.rs`'s `with_fat_lock` / `with_dir_lock` are deliberately INERT on
+//! x86 (masking IRQs across the `hlt`-driven xHCI BOT pump would hang the core — see their doc
+//! comments), so nothing serialized the two: A/B-proven cross-linked chains (`GROW.BIN` chain length
+//! 5/6 where 2 was expected) and delete-witness first-free snapshots stolen mid-verdict; recorder
+//! stubbed out -> 0/3 FAIL, recorder on -> 3/3 FAIL.
+//!
+//! The fix removes the recorder from the set of FAT mutators entirely, instead of trying to serialize
+//! two of them:
+//!
+//!   1. **RESERVE, once.** On the FIRST main-loop pass where a block device is present, the recorder
+//!      makes `UNAOS.LOG` exist at a FIXED `RESERVE_BYTES` size (create + one `write_grow` of zeros,
+//!      or reuse an already-large-enough entry from a previous boot untouched). This is the recorder's
+//!      ONLY lifetime FAT/directory mutation, and it is exclusive BY CONSTRUCTION, not by luck: it runs
+//!      on the BSP, in the main loop, at a call site that PRECEDES every fixture/launcher spawn in the
+//!      same iteration (`main.rs`: `flight_recorder::service()` sits above `u2_probe_once()` and the
+//!      whole `U*_probe_once` chain at both loop sites), and every other x86 FAT writer is gated on the
+//!      same `block::info()` that has only just become `Some`. No other writer can exist yet.
+//!   2. **Write IN PLACE, forever after.** Every later flush is a single `FatFs::write_at` over the
+//!      reserved chain: strictly bounded to clusters already in the file, never allocating or freeing a
+//!      cluster, never writing a FAT entry, never touching a directory sector (`fat.rs:1225` contract).
+//!      It therefore cannot interact with any other writer at all — not the demo chain, not the shell,
+//!      not the storage service task — under EITHER knob state.
+//!
+//! This is deliberately NOT "route the recorder through the `irqstorage` storage service task": that
+//! would only remove the race when `irqstorage` is ON, and the demo-chain writers (the `witness`-gated
+//! U10x drains) are a real second writer with the knob OFF too — which is precisely the configuration
+//! of the gate that was failing 3/3 (`UNAOS_HUBSTORAGE=1 ./arroyo test-fat sf 300`). The reserve-then-
+//! write-in-place shape is knob-agnostic and strictly stronger: after bootstrap the recorder is not a
+//! FAT writer at all, so there is nothing left to serialize.
+//!
+//! Cost of the shape: `UNAOS.LOG` is always `RESERVE_BYTES` on disk, with the captured log as its
+//! prefix, an explicit end-of-log marker line, and zero padding after it. The reserve is one bounded
+//! 64 KiB zero-fill at boot (the same order as the flush the old code did every 4096 iterations).
 
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use spin::Mutex;
 
 /// Ring capacity. A full vm-image boot to the shell is a few hundred short serial lines
@@ -127,7 +166,7 @@ fn captured_len() -> Option<usize> {
 /// The `dropped` trailer keeps a full-ring log self-describing.
 fn snapshot() -> Option<(alloc::vec::Vec<u8>, usize)> {
     let ring = RING.try_lock()?;
-    let mut out = alloc::vec::Vec::with_capacity(ring.len + 128);
+    let mut out = alloc::vec::Vec::with_capacity(ring.len + 256);
     // A self-identifying header IN THE FILE only (never emitted on the live serial stream, so the boot
     // output is byte-unchanged). Gives the tester a clear "this is a UnaOS boot log" marker and a
     // stable grep target — the bootloader's own banner runs in a separate UEFI binary before the
@@ -141,6 +180,15 @@ fn snapshot() -> Option<(alloc::vec::Vec<u8>, usize)> {
         );
         out.extend_from_slice(note.as_bytes());
     }
+    // An explicit end-of-log marker. The file is a FIXED-SIZE reservation (see the module doc), so the
+    // bytes after this line are zero padding, not log — say so in the file rather than leaving a reader
+    // to guess where the log stops.
+    let end = alloc::format!(
+        "\n:: FLIGHTREC: end of log ({} captured byte(s); the remainder of this {}-byte file is reserved padding) ::\n",
+        ring.len,
+        RESERVE_BYTES
+    );
+    out.extend_from_slice(end.as_bytes());
     Some((out, ring.len))
 }
 
@@ -149,14 +197,48 @@ const LOG_NAME: &str = "UNAOS.LOG";
 /// steadily-printing kernel does not churn the FAT. Boot is bounded, so this mostly bounds the tail.
 const FLUSH_EVERY_ITERS: u32 = 4096;
 
-/// Write `data` to `/UNAOS.LOG` (truncate-or-create at the volume root) via the shell's proven public
-/// `fat.rs` write path. Returns the bytes written or a `FatError`. Bounded + write-through by the
-/// block layer; never edits `fat.rs`.
-fn write_log(data: &[u8]) -> Result<usize, crate::fs::fat::FatError> {
+/// The FIXED on-disk size `UNAOS.LOG` is reserved at. Must hold the self-identifying header + the whole
+/// `RING_CAP` ring + the `dropped` note + the end-of-log marker, so a full ring never needs the file to
+/// grow — a grow would be a FAT mutation, and the whole point of the reservation is that the recorder
+/// performs exactly ONE of those, at boot, when it is provably the only writer. 512 bytes of slack over
+/// `RING_CAP` covers the three fixed-form trailer/header lines with room to spare.
+const RESERVE_BYTES: usize = RING_CAP + 512;
+
+/// Bootstrap state for the reservation. `0` = not attempted, `1` = reserved (`LOG_FIRST`/`LOG_SIZE` are
+/// live and flushes may write in place), `2` = permanently failed (no FAT volume, or an I/O/space error
+/// — never retried, so a broken volume is never churned).
+static RESERVED: AtomicU8 = AtomicU8::new(0);
+/// The reserved file's chain head + on-disk size, published by the bootstrap and read by every flush.
+/// Both are stable for the boot: `write_at` never changes either.
+static LOG_FIRST: AtomicU32 = AtomicU32::new(0);
+static LOG_SIZE: AtomicU32 = AtomicU32::new(0);
+/// Whether the next flush is the FIRST one over the reservation, which must therefore pad out to
+/// `RESERVE_BYTES` — clearing any stale tail left by a PREVIOUS boot in a reused file. Later flushes
+/// write only their (monotonically longer) prefix, which overwrites the previous flush's end marker.
+static PAD_NEXT: AtomicBool = AtomicBool::new(true);
+
+/// The recorder's ONE lifetime FAT/directory mutation: make `/UNAOS.LOG` exist at exactly
+/// `RESERVE_BYTES`. Returns `(first_cluster, on-disk size)`.
+///
+/// Three cases:
+///   * already present and already big enough (a previous boot of the same image) — reuse it UNTOUCHED,
+///     zero mutation at all;
+///   * present but too small / chainless (an old short log) — `delete_located` + `create_in_root` +
+///     one `write_grow` of zeros;
+///   * absent — `create_in_root` + one `write_grow` of zeros.
+///
+/// A directory under the name is a permanent failure (`IsDirectory`) — never delete it.
+fn reserve_log() -> Result<(u32, u32), crate::fs::fat::FatError> {
     use crate::fs::fat::{self, FatError};
     let fs = fat::mount()?;
-    // Truncate an existing UNAOS.LOG (free its chain, recreate a fresh 0-length entry), else create.
     let (dir_lba, dir_off) = match fs.find_located(LOG_NAME) {
+        Ok((de, _dl, _doff)) if de.is_dir => return Err(FatError::IsDirectory),
+        Ok((de, _dl, _doff))
+            if de.size as usize >= RESERVE_BYTES && de.first_cluster() >= 2 =>
+        {
+            // Big enough already: reuse the existing chain in place. NO FAT/dir mutation whatsoever.
+            return Ok((de.first_cluster(), de.size));
+        }
         Ok((de, dl, doff)) => {
             fs.delete_located(dl, doff, de.first_cluster())?;
             let (_, dl2, doff2) = fs.create_in_root(LOG_NAME, 0x20)?;
@@ -168,11 +250,27 @@ fn write_log(data: &[u8]) -> Result<usize, crate::fs::fat::FatError> {
         }
         Err(e) => return Err(e),
     };
+    // One bounded zero-fill grow (alloc + chain + zero + publish the size to the directory LAST). The
+    // heap buffer is fine here: the flush half runs at IF=1 from the main loop.
+    let zeros = alloc::vec![0u8; RESERVE_BYTES];
+    let (_written, new_size, first) = fs.write_grow(0, 0, dir_lba, dir_off, 0, &zeros)?;
+    if first < 2 || (new_size as usize) < RESERVE_BYTES {
+        return Err(FatError::NoSpace); // short reservation — refuse to write in place over it
+    }
+    Ok((first, new_size))
+}
+
+/// Write `data` to the reserved `/UNAOS.LOG` chain, IN PLACE. `write_at` is strictly bounded (clusters
+/// already in the chain only; no FAT entry written, no directory sector touched — `fat.rs:1225`), so
+/// this is NOT a FAT mutation and cannot race any other writer. Returns the bytes written.
+fn write_log(data: &[u8]) -> Result<usize, crate::fs::fat::FatError> {
+    let first = LOG_FIRST.load(Ordering::Acquire);
+    let size = LOG_SIZE.load(Ordering::Acquire);
+    let fs = crate::fs::fat::mount()?; // read-only: re-reads the BPB, mutates nothing
     if data.is_empty() {
         return Ok(0);
     }
-    let (written, _new_size, _first) = fs.write_grow(0, 0, dir_lba, dir_off, 0, data)?;
-    Ok(written)
+    fs.write_at(first, size, 0, data)
 }
 
 /// Drive the flight recorder from the x86 main loop (call every iteration; cheap when idle). Once a
@@ -186,6 +284,43 @@ pub fn service() {
 
     if crate::drivers::block::info().is_none() {
         return; // storage not up yet — nothing to flush to
+    }
+
+    // SINGLE FAT WRITER: reserve the file on the FIRST pass storage is present — before any fixture
+    // launcher / storage service submitter can exist (this call site precedes every `U*_probe_once` in
+    // the same main-loop iteration, and they gate on the same `block::info()`). This is the recorder's
+    // only FAT/directory mutation for the whole boot.
+    if RESERVED.load(Ordering::Acquire) == 0 {
+        match reserve_log() {
+            Ok((first, size)) => {
+                LOG_FIRST.store(first, Ordering::Release);
+                LOG_SIZE.store(size, Ordering::Release);
+                RESERVED.store(1, Ordering::Release);
+                serial_println!(
+                    ":: FR: {} reserved {} bytes @cluster {} — flushes are write-in-place only (single FAT writer preserved) ::",
+                    LOG_NAME,
+                    size,
+                    first
+                );
+            }
+            Err(e) => {
+                RESERVED.store(2, Ordering::Release);
+                use crate::fs::fat::FatError;
+                match e {
+                    // No FAT boot volume here (a raw/non-FAT stick, or no disk). The NORMAL case for the
+                    // default `test` (raw usb.img) — nowhere to record to, not an error. Silent.
+                    FatError::NotFat | FatError::NoDisk => {}
+                    _ => serial_println!(
+                        ":: FR: {} reservation failed ({:?}) — boot log not recorded to disk ::",
+                        LOG_NAME,
+                        e
+                    ),
+                }
+            }
+        }
+    }
+    if RESERVED.load(Ordering::Acquire) != 1 {
+        return; // no reservation (no FAT volume, or a permanent failure) — never write
     }
 
     let last = LAST_FLUSHED.load(Ordering::Relaxed);
@@ -210,17 +345,27 @@ pub fn service() {
 
     // Take the file bytes AND their captured length under ONE lock — so LAST_FLUSHED records exactly
     // what we wrote, never a contention-truncated snapshot marked as a full flush.
-    let (data, len) = match snapshot() {
+    let (mut data, len) = match snapshot() {
         Some(pair) => pair,
         None => return, // contended at the snapshot moment — retry next iteration, marker unchanged
     };
+    // The log can never exceed the reservation (RESERVE_BYTES = RING_CAP + slack), but clamp rather
+    // than trust the arithmetic: `write_at` would silently short-write anyway, and a truncated tail is
+    // better than a surprise.
+    data.truncate(RESERVE_BYTES);
+    if PAD_NEXT.swap(false, Ordering::Relaxed) {
+        // FIRST flush over the reservation: pad to the full file so a REUSED file's stale tail from a
+        // previous boot is cleared. Data sectors only — still not a FAT mutation.
+        data.resize(RESERVE_BYTES, 0);
+    }
     match write_log(&data) {
         Ok(written) => {
             LAST_FLUSHED.store(len, Ordering::Relaxed);
             if !ANNOUNCED.swap(true, Ordering::Relaxed) {
                 serial_println!(
-                    ":: FLIGHTREC: boot log -> {} ({} bytes) -> PASS ::",
+                    ":: FLIGHTREC: boot log -> {} ({} captured bytes into a {}-byte in-place write) -> PASS ::",
                     LOG_NAME,
+                    len,
                     written
                 );
             }

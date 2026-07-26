@@ -347,3 +347,51 @@ sequence with seat review between spine milestones.
 - The **single-writer-per-row invariant** (SECURITY.md U7x) is preserved by construction (§3.2).
 </content>
 </invoke>
+
+## 8. SINGLE FAT WRITER (2026-07-26) — the flight recorder is no longer a second mutator
+
+**Root cause (A/B-proven).** `fs/fat.rs`'s `with_fat_lock` / `with_dir_lock` are deliberately INERT on
+x86 (masking IRQs across the `hlt`-driven xHCI BOT pump would hang the core — §5), and their comments
+used to claim x86 had a "single FAT writer by construction". That was FALSE. The FLIGHT RECORDER
+(`flight_recorder.rs::service()`, called from the x86 main loop on the BSP) re-created `UNAOS.LOG` on a
+main-loop cadence — `delete_located` (free ~32 clusters) + `create_in_root` (a root-dir-sector RMW) +
+`write_grow` (re-allocate + re-chain) — CONCURRENTLY with the demo chain's writers on the AP cores.
+Symptoms: cross-linked chains (`GROW.BIN` chain length 5/6 where 2 was expected) and delete-witness
+first-free snapshots allocated out from under the verdict. Evidence: recorder stubbed out → 0/3 FAIL;
+recorder on → 3/3 FAIL on `UNAOS_HUBSTORAGE=1 ./arroyo test-fat sf 300`. BOT transport was clean
+(timeouts=0, ~730x headroom) — the fault was allocator concurrency, not the transport.
+
+**Fix — reserve once, then write in place.** The recorder is removed from the set of FAT mutators
+rather than being serialized against them:
+
+1. **RESERVE, once.** On the first main-loop pass where `block::info()` is `Some`, the recorder makes
+   `UNAOS.LOG` exist at a fixed `RESERVE_BYTES` (= `RING_CAP` + 512 = 66048). This is its ONLY lifetime
+   FAT/directory mutation, and it is exclusive **by construction**: the `flight_recorder::service()`
+   call site precedes every `U*_probe_once()` fixture/launcher spawn in the same main-loop iteration at
+   BOTH `main.rs` loop sites, and every other x86 FAT writer gates on the same `block::info()` that has
+   only just become `Some`. A file already ≥ `RESERVE_BYTES` from a previous boot is reused untouched
+   (zero mutation at all).
+2. **Write IN PLACE, forever after.** Every later flush is a single `FatFs::write_at` over the reserved
+   chain — strictly bounded to clusters already in the file, never allocating/freeing a cluster, never
+   writing a FAT entry, never touching a directory sector (`fat.rs` `write_at` contract). It therefore
+   cannot interact with any other writer at all.
+
+**Why not "route the recorder through the storage service task".** That would only close the race with
+`irqstorage` ON. The demo-chain writers are the `witness`-gated U10x op drains (`u10_drain_*`), which
+mutate the FAT directly from an AP launcher task with the knob OFF — which is exactly the configuration
+of the gate that was failing 3/3. The reserve-then-write-in-place shape is knob-agnostic and strictly
+stronger: after bootstrap there is nothing left to serialize.
+
+**Cost.** `UNAOS.LOG` is always 66048 bytes on disk: the captured log as its prefix, an explicit
+`:: FLIGHTREC: end of log (N captured byte(s); the remainder of this 66048-byte file is reserved
+padding) ::` marker, then zero padding. The reserve is one bounded 64 KiB zero-fill at boot.
+
+**Witnesses.** `:: FR: UNAOS.LOG reserved 66048 bytes @cluster N — flushes are write-in-place only
+(single FAT writer preserved) ::` (once, at bootstrap) and `:: FLIGHTREC: boot log -> UNAOS.LOG (N
+captured bytes into a 66048-byte in-place write) -> PASS ::` (once, first successful flush).
+
+**The x86 invariant, stated honestly** (now in `fat.rs`'s `with_fat_lock` / `with_dir_lock` non-aarch64
+doc comments, replacing the false claim): x86 has no in-`fat.rs` serialization. Consistency is a caller
+discipline — knob-on, the ONE storage service task runs every create/grow/delete one at a time at IF=1;
+knob-off, the mutating callers are sequenced one-shot fixtures and the interactive shell; and the
+recorder is not a mutator after boot. A NEW concurrent x86 FAT mutator must join one of those schemes.

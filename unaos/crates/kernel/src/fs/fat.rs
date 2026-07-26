@@ -391,6 +391,22 @@ fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
 
 /// Non-aarch64 (x86): the FAT-mutation lock is inert — see [`FAT_MUTATION`] for why masking IRQs across the
 /// x86 `hlt`-driven xHCI FAT path would hang. Byte-identical to the pre-F2 behaviour (a zero-cost passthrough).
+///
+/// ⚠ THE X86 INVARIANT, STATED HONESTLY (2026-07-26). Because this is a passthrough, x86 has NO in-`fat.rs`
+/// serialization of FAT/directory mutation. What keeps the volume consistent is a discipline held ABOVE
+/// `fat.rs`, by its callers:
+///   * `irqstorage` ON: every storage syscall's create/grow/delete is submitted to the ONE storage service
+///     task (`drivers/xhci/irqstorage.rs`), which runs them one at a time at IF=1 — a real single writer.
+///   * `irqstorage` OFF: the mutating callers are the `witness`-gated U10x op drains and the shell, each of
+///     which runs as a sequenced one-shot / a single interactive task.
+///   * The FLIGHT RECORDER (`flight_recorder.rs`), which runs on the BSP main loop concurrently with all of
+///     the above, performs exactly ONE FAT mutation for the whole boot — reserving `UNAOS.LOG` at a fixed
+///     size on the first main-loop pass storage is up, BEFORE any fixture/launcher exists — and thereafter
+///     writes the log with `write_at` only (in place, no cluster alloc/free, no directory touch). It used to
+///     re-create the file every few thousand iterations, which made it a genuine SECOND unsynchronized
+///     writer and was the A/B-proven cause of cross-linked chains under the x86 storage batteries.
+/// If a NEW x86 caller needs to mutate the FAT concurrently with the above, it must join one of those
+/// schemes — do NOT make this lock real here; masking IRQs across the `hlt`-driven pump would hang the core.
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
@@ -420,7 +436,9 @@ fn with_dir_lock<R>(f: impl FnOnce() -> R) -> R {
     })
 }
 
-/// Non-aarch64 (x86): the directory-mutation lock is inert — the [`with_fat_lock`] passthrough reasoning.
+/// Non-aarch64 (x86): the directory-mutation lock is inert — the [`with_fat_lock`] passthrough reasoning,
+/// including its "THE X86 INVARIANT, STATED HONESTLY" note (the caller-level discipline is what serializes
+/// x86 directory-sector RMWs; there is no lock here).
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 fn with_dir_lock<R>(f: impl FnOnce() -> R) -> R {
@@ -949,7 +967,8 @@ impl FatFs {
                 // Candidate. COMPARE-AND-CLAIM under FAT_MUTATION: re-read the entry inside the lock and
                 // claim (EOC) only if still free — a racing allocator that claimed it first loses us nothing
                 // but this re-check. The whole hold is one sector read + the bounded all-copies RMW (the
-                // `with_fat_lock` span rule). On x86 the lock is inert (single FAT writer by construction).
+                // `with_fat_lock` span rule). On x86 the lock is INERT — see `with_fat_lock` for what
+                // actually holds the x86 side together (it is NOT "one writer by construction").
                 let claimed = with_fat_lock(|| -> Result<bool, FatError> {
                     let mut cbuf = [0u8; SECTOR_SIZE];
                     read_sector(self.fat_start + sec, &mut cbuf)?;
