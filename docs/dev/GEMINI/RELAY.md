@@ -1,15 +1,19 @@
 # PETER'S RELAY SHEET — not for specialists. Coordinator overwrites this with
 # the message(s) Peter posts into each Gemini chat, verbatim.
-# (updated 2026-07-26: s36 folded — ARC VERDICT, the wall is the absent FECS ctx machinery; pull 33 = the new era)
+# (updated 2026-07-26: pull 33 APPROVED-WITH-CORRECTION — the IO ports are wrong, must-fix + A/B fallback)
 
 ## → kepler-fence session
 
-Fence: s36, and it's the verdict. Verbatim: `witness pre-rewrite PFIFO_CHAN[1]=00002000` → `witness post-bind PFIFO_CHAN[1]=00002000`. Not C0002000. The strip persists with CHAN_CUR and CHAN_NEXT bound, post-submit unchanged, rematch end err=00000002 stat=00000005 valid=00002000 — the tenth identical confirmation, and the last one we need.
+Fence: pull 33 approved in shape — the echo-loop design is right, the milestone split is right, and the citation discipline is what this era needs. But there is a MUST-FIX defect in the encoding, and it is the same class of error I made on pull 25, so I want it fixed the way that one got fixed.
 
-Step back and look at what ten sittings of elimination bought: the submit path WORKS (PLAYLIST_RD echoes our exact runlist), the falcon EXECUTES our code (F00DFACE, twice per boot, every boot), the CTXCTL surface is mapped and writable, the poison trigger is convicted and avoidable — and no host-reachable write moves the strip. The wall has exactly one account left: PFIFO's channel validation keys on state only the FECS context-switch microcode builds. We are done probing the wall. The next era builds the gatekeeper.
+⛔ THE IO PORTS ARE WRONG. Your listing uses 0x800 and 0x804 as Falcon IO port indices — those are HOST register offsets. The scheme we confirmed on metal at s29 is: host register X → falcon (X & 0xffc) << 6. That is why MAILBOX0 (host 0x040) is I[0x1000] and MAILBOX1 (host 0x044) is I[0x1100] — the values your own heartbeat ucode used successfully. Applying it: CC_SCRATCH[0] host 0x800 → I[0x20000]; CC_SCRATCH[1] host 0x804 → I[0x20100]. Those don't fit the I16 immediate form your listing uses, so both `mov`s need a different encoding (I32 form, or a sethi pair) — pick one and cite the form.
 
-PULL 33 INVITATION — the first FECS context ucode, proposal-first, and take the size seriously (this is a program, not a probe). From your own STUDY's phase list, propose the MINIMAL ucode that stands up just enough ctx machinery to flip validation — suggested shape, argue better if you see it: (1) self-init only as far as needed; (2) implement the smallest host↔FECS command loop on the CC_SCRATCH/WRCMD surface your study mapped (with 0x409504's poison behavior now understood, say explicitly how the ucode-side WRCMD interface relates to the host-side faulting offset — falcon-side IO may be exactly where WRCMD is legitimate); (3) the target observable: ENGINE_STATUS.CHAN_VALID asserting after a bind command, then the register-side strip test passing. Milestone it — pull 33 can be just the ucode skeleton + command-loop echo test (host writes a command, ucode acks in a scratch register), with ctx-state assertion as pull 34. Full annotated listing with per-instruction citations, as pull 25 set the precedent. Bound every loop.
+AMENDMENT 2 — A/B FALLBACK, exactly as pull 25 established: ship image A with the derived indexed ports and image B with the flat ports as you originally wrote them; run A first, fall back to B if no ack, label the attempt in the marker. One boot then settles the CC_SCRATCH port question no matter which derivation is right. That fallback is what confirmed I[0x1000] on metal, and it costs nothing here.
+
+AMENDMENT 3 — drop the gating premise from the prose. CTXCTL subunit gating was REFUTED at s33 (PIBUS_MMIO_HUB_ENABLE1=FFF9F4B0, bit 4 already set) and s34 (all five remaining offsets read real zeros). The true statement: the poison is per-offset, 0x409504 alone is convicted, and CC_SCRATCH is host-readable because it is simply a working offset. Whether the Falcon can reach WRCMD from inside the unit is an open question worth stating as one — it may well be the answer, but we haven't shown it.
+
+Everything else stands: bounded poll, no retries, FECS only, the proven upload/execute sequence, and keep the known-good image A execution witness running first as pull 27 did. Implement as approved + amendments, commit ALL docs+code, no push. Report "PUSH OWED: n". (I run all builds and gates.)
 
 ## → kepler-display session
 
-Display: idle, graduated, nothing owed. (For your interest: the fence lane just closed its ten-refutation elimination — the wall is the absent FECS context machinery, and the campaign turns constructive.)
+Display: idle and graduated. FYI the console gained a real improvement from a code review — the panel paint no longer runs with interrupts masked (layout planned under the lock, pixels painted outside it), which matters on boots driving USB deadlines. Next sitting re-verifies text on glass.
