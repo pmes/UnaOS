@@ -413,9 +413,12 @@ pub fn log_summary_once() {
         // emits whenever the peak doubles. Both carry route/depth, so a direct-attach boot and a
         // behind-hub boot can be diffed line for line.
         let (peak, budget) = (BOT_PUMP_PEAK.load(Ordering::Relaxed), BOT_PUMP_BUDGET.load(Ordering::Relaxed));
+        let n = BOT_PUMP_COUNT.load(Ordering::Relaxed);
+        let sum = BOT_PUMP_CYCLES.load(Ordering::Relaxed);
         serial_println!(
-            ":: BOT: pump budget={} peak={} n={} nowait={} timeouts={} storage_slot={} route={:#x} depth={} result=SUMMARY ::",
-            budget, peak, BOT_PUMP_COUNT.load(Ordering::Relaxed), BOT_PUMP_NOWAIT.load(Ordering::Relaxed),
+            ":: BOT: pump budget={} peak={} sum={} mean={} n={} nowait={} timeouts={} storage_slot={} route={:#x} depth={} result=SUMMARY ::",
+            budget, peak, sum, if n != 0 { sum / n } else { 0 },
+            n, BOT_PUMP_NOWAIT.load(Ordering::Relaxed),
             BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed),
             x.storage_slot,
             x.slots[x.storage_slot as usize].route_string, x.slots[x.storage_slot as usize].route_depth);
@@ -521,6 +524,13 @@ pub static BOT_PUMP_NOWAIT: AtomicU64 = AtomicU64::new(0);
 /// The peak last PRINTED as a `:: BOT: … result=OK ::` witness — the throttle reference, so a peak
 /// that creeps up in small steps still gets reported once it has doubled overall.
 static BOT_PUMP_REPORTED: AtomicU64 = AtomicU64::new(0);
+/// FRWRITE: the SUM, in `now_cycles` units, of every completed BOT pump wait. `peak=` alone cannot
+/// answer the question the 2026-07-26 metal capture posed — "is EVERY transaction slow, or was one
+/// outlier slow?" — because the peak witness is doubling-throttled: between a reported peak P and a
+/// timeout, every wait could have been anywhere in [0, 2P) and no line would say so. `sum/n` is the
+/// MEAN wait, and mean-vs-peak is exactly that discrimination. Reported as `sum=`/`mean=` on the
+/// SUMMARY and TIMEOUT lines only, so the per-transfer log stays byte-identical.
+pub static BOT_PUMP_CYCLES: AtomicU64 = AtomicU64::new(0);
 
 // --- FTDI TX pump headroom (PH-6) ---
 // The FTDI bulk-OUT pump used to be bounded by a raw iteration count (2000 `hlt()` yields), which
@@ -561,9 +571,13 @@ pub static BOT_RETRY_FAIL: AtomicU64 = AtomicU64::new(0);
 // command and is now holding sense data (CHECK CONDITION). Until this arc `bot_transfer` returned
 // such a result verbatim to the caller and never fetched the sense, so a device left in CHECK
 // CONDITION at runtime failed every subsequent command with nothing in the log saying why. The
-// exposure is real: the flight recorder issues a ~128-sector WRITE(10) burst on the boot volume on
-// every x86 boot. These counters stay at zero on a clean boot, so any non-zero reading is itself
-// the finding.
+// exposure is real: the flight recorder writes ~64 KiB to the boot volume on every x86 boot.
+// (FRWRITE 2026-07-26 — that is NOT "a ~128-sector WRITE(10) burst", as this comment used to claim.
+// `scsi_data_buffer` is 512 bytes (see `configure_bulk_endpoints_sync`) and every block-layer caller
+// passes `blocks = 1`, so the recorder's 64 KiB is ~129 SEPARATE single-sector WRITE(10)s, each
+// preceded by a single-sector READ(10) for the RMW, on top of the per-cluster zero-fills — several
+// hundred BOT transactions, not one burst. See usb_xhci.md §12.)
+// These counters stay at zero on a clean boot, so any non-zero reading is itself the finding.
 /// REQUEST SENSE fetches issued from the runtime `Failed`-CSW path (one per Failed CSW handled).
 pub static BOT_SENSE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Sense-driven single retries that came back `Passed` — transactions this arc rescued.
@@ -5606,10 +5620,13 @@ impl XhciController {
                 // the completion event was LOST (a wedged endpoint), not that the budget was tight;
                 // a `peak` sitting just under `budget` says the opposite. Metal reads the verdict off
                 // this one line instead of guessing.
+                let n = BOT_PUMP_COUNT.load(Ordering::Relaxed);
+                let sum = BOT_PUMP_CYCLES.load(Ordering::Relaxed);
                 serial_println!(
-                    ":: BOT: pump budget={} used={} peak={} route={:#x} depth={} slot={} n={} timeouts={} result=TIMEOUT ::",
-                    budget, elapsed, BOT_PUMP_PEAK.load(Ordering::Relaxed), route, depth, slot,
-                    BOT_PUMP_COUNT.load(Ordering::Relaxed), BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed));
+                    ":: BOT: pump budget={} used={} peak={} sum={} mean={} route={:#x} depth={} slot={} n={} timeouts={} result=TIMEOUT ::",
+                    budget, elapsed, BOT_PUMP_PEAK.load(Ordering::Relaxed), sum,
+                    if n != 0 { sum / n } else { 0 }, route, depth, slot,
+                    n, BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed));
                 return Err(BotError::Timeout);
             }
         }
@@ -5625,6 +5642,9 @@ impl XhciController {
     fn note_bot_pump(start: u64, budget: u64, route: u32, depth: u8, slot: u8) {
         let used = crate::arch::now_cycles().wrapping_sub(start);
         BOT_PUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+        // FRWRITE: accumulate EVERY wait, not just the record-setters — `sum/n` is the mean, and the
+        // mean is what separates "one slow outlier" from "the whole write path runs at 0.5 s/sector".
+        BOT_PUMP_CYCLES.fetch_add(used, Ordering::Relaxed);
         let prev = BOT_PUMP_PEAK.load(Ordering::Relaxed);
         if used <= prev {
             return;

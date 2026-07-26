@@ -386,9 +386,14 @@ stronger: after bootstrap there is nothing left to serialize.
 `:: FLIGHTREC: end of log (N captured byte(s); the remainder of this 66048-byte file is reserved
 padding) ::` marker, then zero padding. The reserve is one bounded 64 KiB zero-fill at boot.
 
-**Witnesses.** `:: FR: UNAOS.LOG reserved 66048 bytes @cluster N — flushes are write-in-place only
-(single FAT writer preserved) ::` (once, at bootstrap) and `:: FLIGHTREC: boot log -> UNAOS.LOG (N
-captured bytes into a 66048-byte in-place write) -> PASS ::` (once, first successful flush).
+**Witnesses.** `:: FR: UNAOS.LOG reserved 66048 bytes @cluster N reused=B — flushes are
+write-in-place only (single FAT writer preserved) ::` (once, at bootstrap) and
+`:: FLIGHTREC: boot log -> UNAOS.LOG (N captured bytes into a 66048-byte in-place write) -> PASS ::`
+(once, first successful flush). FRWRITE (2026-07-26): `reused=` says whether the reservation reused a
+previous boot's file. Only that case leaves a stale tail, so only that case pads the first flush out
+to `RESERVE_BYTES` — the create/grow cases just zero-filled the file, and padding it again cost ~129
+READ(10) + ~129 WRITE(10) single-sector BOT transactions. See
+[`usb_xhci.md`](../../../../../docs/dev/OS/07_USB_STORAGE/usb_xhci.md) §12.
 
 **The x86 invariant, stated honestly** (now in `fat.rs`'s `with_fat_lock` / `with_dir_lock` non-aarch64
 doc comments, replacing the false claim): x86 has no in-`fat.rs` serialization. Consistency is a caller

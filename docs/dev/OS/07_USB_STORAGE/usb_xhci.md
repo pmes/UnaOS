@@ -2589,6 +2589,199 @@ the finding.
 
 ---
 
+## 12. FRWRITE — why the x86 flight-recorder write times out on metal (2026-07-26)
+
+Two metal boots on the 2012 rMBP, with **two different USB sticks**, both timed out in the
+flight recorder's write path. Two sticks failing identically kills the device-fault
+hypothesis, so this section is a read of OUR write path, in code, with the arithmetic.
+
+### Metal ground truth
+
+* Boot 1 (stick A): `:: BLK: io-cause op=write lba=121 bot_err=Timeout ::`; recovery then got
+  `why=nocompletion` on every EP0 request, `csw_sig=0x0`.
+* Boot 2 (stick B, fresh 2 GB): `:: BOT: pump … used=1275711592 … n=1 timeouts=0 result=OK ::`,
+  then `:: BOT: pump … used=16163799966 n=68 timeouts=1 result=TIMEOUT ::` on
+  `op=write lba=9834`; first recovery `reset=fail halts=fail`, second `reset=ok halts=cleared`.
+* Both boots: `UNAOS.LOG` reservation failed.
+* QEMU: green, fast, every knob.
+
+TSC calibrated at ≈2.6938 GHz, so `used=1275711592` = **0.474 s** for ONE stage wait, and
+`budget=16163799966` = **6.000 s** (`hw_wait_budget()` 2 s × 3, `mod.rs` `pump_until_bot_done`).
+The QEMU comparator from §11 is `peak=32724164` over `n=2691` — 0.012 s. Metal's *first* wait
+is 39× QEMU's *worst*.
+
+### 12.1 What the FR reservation actually writes — the roadmap's "~128-sector WRITE(10) burst" is FALSE
+
+There is no burst. There cannot be one:
+
+* `flight_recorder.rs` `RESERVE_BYTES = RING_CAP + 512 = 66048` bytes = **129 sectors**, written
+  by `reserve_log()` as a single `fs.write_grow(0, 0, …, &zeros)` of a 66048-byte zero buffer.
+* `fat.rs::write_grow` step 3 is a **per-sector read-modify-write loop**: `read_sector(lba)` →
+  patch → `write_sector(lba)`, one sector at a time. `write_at` (every later flush) is the
+  identical shape.
+* `fat.rs::write_grow` step 2 calls `alloc_cluster()` per cluster, and `alloc_cluster` ends in
+  `zero_cluster(c)` — another per-sector write loop over the whole cluster — plus a FAT-region
+  scan from cluster 2 and a `set_fat_entry` RMW across all FAT copies.
+* `block.rs::write_block` / `read_block` hardcode `blocks = 1`: `storage_write10(lba, 1)`,
+  `storage_read10(lba, 1)`.
+* `xhci/mod.rs` `configure_bulk_endpoints_sync` allocates `scsi_data_buffer` with
+  `Layout::from_size_align(512, 64)` — **512 bytes**. A multi-block WRITE(10) is not merely
+  unused, it would overflow the only DMA buffer the storage slot owns.
+
+So the maximum transfer size per BOT transaction anywhere in this driver is **512 bytes**.
+Worked cost of one reservation on a 32 KiB-cluster volume (3 clusters for 66048 bytes):
+
+| stage | single-sector BOT transactions |
+| --- | --- |
+| `alloc_cluster` × 3 → `zero_cluster` (64 sectors each) | ~192 WRITE(10) |
+| FAT scans + `set_fat_entry` RMW (all copies) | ~20 mixed |
+| `write_grow` data RMW, 129 sectors | 129 READ(10) + 129 WRITE(10) |
+| directory `size` publish (RMW) | 2 |
+| *(pre-FRWRITE)* first flush pad to `RESERVE_BYTES` | 129 READ(10) + 129 WRITE(10) |
+| **total** | **≈730** |
+
+Each transaction awaits **two** Transfer Events (data stage, then CSW — the CBW TRB carries no
+IOC and is fire-and-forget), so the reservation is **≈1460 pump waits**. The roadmap's mental
+model was 1. The real number is three orders of magnitude larger.
+
+Boot 2 wedged at `n=68` — ≈34 transactions, roughly **5 % of the way into the reservation**.
+
+### 12.2 The data-stage TD shape — audited, and NOT the bug
+
+`bot_transfer_once` (`xhci/mod.rs`) builds the data stage as exactly **one Normal TRB**:
+
+```
+ring.push(Trb { parameter: data_phys, status: data_len,
+                control: (1 << 10) | (1 << 5) | (1 << 2) })   // Normal | IOC | ISP
+```
+
+`data_len` is always 512. Reviewed against the things that make a real EHCI-behind-xHCI
+(Panther Point) route misbehave, and cleared:
+
+* **No chaining needed and none present.** One TRB, one TD, one event. A 512-byte
+  64-byte-aligned buffer cannot cross a 64 KiB page boundary, so the classic
+  split-buffer requirement never arises.
+* **No Event Data TRB, correctly.** With a single-TRB TD, IOC on that TRB *is* the completion
+  event; an Event Data TRB would add nothing.
+* **No IDT misuse.** Immediate Data is never set; `parameter` is always a buffer address.
+* **Ring wrap is correct.** `ring.rs::push` writes a Link TRB with TC=1 at index
+  `num_trbs - 1` and toggles the cycle bit. Rings are 16 TRBs; a data-carrying BOT transaction
+  pushes 3, so the ring wraps every ~5 transactions — nothing special happens at 34.
+  The Link TRB is written lazily rather than at ring init; that is safe, because the untouched
+  slot holds an all-zero TRB whose cycle bit (0) stops a prefetching controller.
+
+**Therefore the "per-TRB event wait" hypothesis is REFUTED for the data stage: there is only
+one TRB.** 0.474 s is the latency of a single 512-byte transaction's single completion event,
+not 470 chained waits.
+
+### 12.3 The mechanism, named
+
+Two separate things, and they must not be conflated:
+
+**(M1) Transaction amplification — why it is always the FR write that dies.** The write path
+issues ~1460 awaited completion events to lay down 64 KiB. On QEMU each costs microseconds and
+nobody notices. On metal each costs a real USB round trip, and — critically — each one is an
+independent chance to hit whatever wedges this controller. The FR reservation is not the only
+FAT writer, it is simply the one that issues two orders of magnitude more transactions than
+anything else in the boot, so it is where a per-transaction failure probability first cashes
+out. `lba=121` (boot 1, FAT/reserved region) and `lba=9834` (boot 2, data region) are two
+different points inside the *same* long sequence — consistent with a per-transaction hazard,
+inconsistent with a specific bad LBA.
+
+**(M2) The wedge itself — a LOST completion event, not a tight budget.** The TIMEOUT line's own
+reading rule (`pump_until_bot_done`, the IVY comment) is: `used == budget` with `peak` far below
+it means the completion event never arrived. Boot 2 has exactly that — `used` = the full 6 s
+budget, last reported `peak` = 0.474 s, 12× smaller. The transfer did not run long; it never
+completed. The `why=nocompletion`/`csw_sig=0x0` on boot 1's recovery says the same thing on the
+other stick. Widening the budget would change nothing.
+
+### 12.4 The measurement gap this capture exposed
+
+`note_bot_pump` prints only when the peak **doubles**. Between the `n=1` line at 0.474 s and the
+`n=68` timeout, every one of the 67 intervening waits could have been anywhere in [0, 0.95 s)
+and no line would say so. The capture therefore **cannot** answer "is the whole write path
+running at half a second per sector, or was the first transaction a one-off spin-up?" — and
+that distinction decides whether M1 alone is fatal.
+
+Closed here by accumulating **every** wait: `BOT_PUMP_CYCLES` sums each completed pump wait, and
+the SUMMARY and TIMEOUT witnesses gained `sum=`/`mean=` (`sum / n`). Mean-vs-peak is exactly the
+discrimination that was missing. The per-transfer `result=OK` line is byte-unchanged.
+
+**QEMU calibration for the new field**, from this arc's gates — the reference metal is read against:
+
+```
+UNAOS_HUBSTORAGE=1 ./arroyo test-fat sf 300   (behind a hub, route=0x1 depth=1)
+:: BOT: pump budget=14397530250 peak=10277608 sum=1772213888 mean=236832 n=7483
+   nowait=0 timeouts=0 storage_slot=2 route=0x1 depth=1 result=SUMMARY ::
+
+UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo test 200   (root port)
+:: BOT: pump budget=14393257680 peak=30858468 sum=1963446398 mean=751990 n=2611
+   nowait=0 timeouts=0 storage_slot=1 route=0x0 depth=0 result=SUMMARY ::
+```
+
+So under QEMU `peak / mean` is 43× and 41× — a healthy transport is dominated by cheap
+transactions with a rare outlier. Metal's `peak` is 0.474 s; if metal's `mean` comes back within
+an order of magnitude of that, the transport is uniformly slow and M1 is fatal on its own.
+
+### 12.5 Changes landed in this arc
+
+1. `xhci/mod.rs` — `BOT_PUMP_CYCLES` accumulator in `note_bot_pump`; `sum=`/`mean=` fields added
+   to `:: BOT: pump … result=SUMMARY ::` and `:: BOT: pump … result=TIMEOUT ::`.
+2. `xhci/mod.rs` — the PH-2 comment claiming "a ~128-sector WRITE(10) burst" corrected to what
+   the code does (§12.1).
+3. `flight_recorder.rs` — `PAD_NEXT` now defaults to `false` and is set from a new `reused` flag
+   returned by `reserve_log()`. The pad exists only to clear a *previous boot's* stale tail, so
+   it is needed only in the reuse case; in the create/grow cases `reserve_log` has just
+   zero-filled the entire file, and the pad was rewriting known zeros at a cost of ~129
+   READ(10) + ~129 WRITE(10). **This removes ~258 of the ~730 transactions above (−35 %)** on
+   every first-time-reserve boot. The witness now reads
+   `:: FR: UNAOS.LOG reserved 66048 bytes @cluster N reused=false — … ::`.
+
+None of these is a fix for M2, and none is claimed to be. They shrink M1 by a third and make the
+next metal sitting able to *measure* M1 instead of inferring it.
+
+### 12.5a Gate hazard found while landing this — `builder/fat-*.img` is MUTATED in place
+
+QEMU writes the FAT test image **in place**: after `UNAOS_FATIMG=sf ./arroyo test`, the mtime of
+`builder/fat-sf.img` has moved and it carries that run's `UNAOS.LOG`, its allocations and its
+directory edits. Consecutive runs are therefore **not independent**, and a run against a dirty
+image is a different experiment from a run against a clean one — during this arc the
+`zeolite` DNS-sinkhole leg failed 3/3 on a carried-over image and passed 3/3 on a freshly built
+one, with the *identical* kernel. Always run `./arroyo fat-img` immediately before any
+`UNAOS_FATIMG=` / `test-fat` gate, and never A/B two kernels against the same image generation.
+
+### 12.6 The real fix, deferred as a brief (multi-block BOT transfers)
+
+The structural repair for M1 is to stop doing 512 bytes per USB round trip. Scoped:
+
+1. Grow `scsi_data_buffer` from 512 B to a bounded staging buffer (32–64 KiB), allocated with
+   64-byte alignment as now.
+2. Let `scsi_read10`/`scsi_write10` carry `blocks > 1` (the CDB already encodes it; only the
+   buffer size forbids it).
+3. Build the data stage as a **chained multi-TRB TD** — CH=1 on all but the last, IOC+ISP on the
+   last only, each TRB's buffer split at 64 KiB boundaries per xHCI 1.2 §4.11.7.1. This is where
+   an Event Data TRB may become worthwhile, and it is the only part with real xHCI risk.
+4. Add a multi-block entry point to `block.rs` and route `fat.rs`'s per-sector RMW loops through
+   it for runs of whole sectors (a full-sector overwrite needs no read at all — that alone is a
+   further 2× on every FAT write).
+
+Steps 1–3 are in the xHCI lane; step 4 touches `fs/fat.rs` and `drivers/block.rs`, which are not
+this arc's lane. That is why it is a brief and not a patch. Expected effect: the FR reservation
+drops from ~730 transactions to single digits, and M2 — whatever wedges one transaction on this
+controller — stops being reached hundreds of times per boot.
+
+### 12.7 What metal must verify next
+
+1. `mean=` on the SUMMARY/TIMEOUT lines. If `mean` is within a small factor of `peak`, every
+   transaction is slow and M1 is fatal on its own. If `mean` is orders below `peak`, the 0.474 s
+   was a one-off and M2 is the whole story.
+2. That `reused=false` appears on the first boot of a fresh stick and `reused=true` on the
+   second — and that the log content is still correct in both (no stale tail with `reused=true`).
+3. Whether the reservation now gets further before wedging (a higher `n=` on the TIMEOUT line),
+   which is the direct read of the −35 % transaction count.
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).

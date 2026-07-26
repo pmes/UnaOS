@@ -212,13 +212,25 @@ static RESERVED: AtomicU8 = AtomicU8::new(0);
 /// Both are stable for the boot: `write_at` never changes either.
 static LOG_FIRST: AtomicU32 = AtomicU32::new(0);
 static LOG_SIZE: AtomicU32 = AtomicU32::new(0);
-/// Whether the next flush is the FIRST one over the reservation, which must therefore pad out to
-/// `RESERVE_BYTES` — clearing any stale tail left by a PREVIOUS boot in a reused file. Later flushes
-/// write only their (monotonically longer) prefix, which overwrites the previous flush's end marker.
-static PAD_NEXT: AtomicBool = AtomicBool::new(true);
+/// Whether the next flush is the FIRST one over the reservation AND that reservation REUSED a file
+/// from a previous boot, so the first flush must pad out to `RESERVE_BYTES` to clear the stale tail.
+/// Later flushes write only their (monotonically longer) prefix, which overwrites the previous
+/// flush's end marker.
+///
+/// FRWRITE (2026-07-26): this used to default to `true`, so EVERY boot's first flush wrote the whole
+/// `RESERVE_BYTES` — including the boots where `reserve_log` had *just* zero-filled the entire file
+/// itself. On x86 a block write is one 512-byte WRITE(10) (`block.rs:277` passes `blocks = 1` into a
+/// 512-byte `scsi_data_buffer`), and `fat.rs::write_at` read-modify-writes every touched sector, so
+/// that redundant pad cost ~129 READ(10)s + ~129 WRITE(10)s — a doubling of the recorder's boot I/O
+/// spent overwriting known zeros with zeros. The pad is only ever needed in the ONE case that leaves
+/// a stale tail: reusing an already-large-enough file. `reserve_log` now says which case it took.
+static PAD_NEXT: AtomicBool = AtomicBool::new(false);
 
 /// The recorder's ONE lifetime FAT/directory mutation: make `/UNAOS.LOG` exist at exactly
-/// `RESERVE_BYTES`. Returns `(first_cluster, on-disk size)`.
+/// `RESERVE_BYTES`. Returns `(first_cluster, on-disk size, reused)`, where `reused` is true only in
+/// the first case below — the one that leaves a PREVIOUS boot's bytes on disk and therefore obliges
+/// the first flush to pad (see `PAD_NEXT`). In the other two cases this call has just zero-filled the
+/// whole file, so padding it again would be ~258 redundant single-sector BOT transactions.
 ///
 /// Three cases:
 ///   * already present and already big enough (a previous boot of the same image) — reuse it UNTOUCHED,
@@ -228,7 +240,7 @@ static PAD_NEXT: AtomicBool = AtomicBool::new(true);
 ///   * absent — `create_in_root` + one `write_grow` of zeros.
 ///
 /// A directory under the name is a permanent failure (`IsDirectory`) — never delete it.
-fn reserve_log() -> Result<(u32, u32), crate::fs::fat::FatError> {
+fn reserve_log() -> Result<(u32, u32, bool), crate::fs::fat::FatError> {
     use crate::fs::fat::{self, FatError};
     let fs = fat::mount()?;
     let (dir_lba, dir_off) = match fs.find_located(LOG_NAME) {
@@ -237,7 +249,7 @@ fn reserve_log() -> Result<(u32, u32), crate::fs::fat::FatError> {
             if de.size as usize >= RESERVE_BYTES && de.first_cluster() >= 2 =>
         {
             // Big enough already: reuse the existing chain in place. NO FAT/dir mutation whatsoever.
-            return Ok((de.first_cluster(), de.size));
+            return Ok((de.first_cluster(), de.size, true));
         }
         Ok((de, dl, doff)) => {
             fs.delete_located(dl, doff, de.first_cluster())?;
@@ -257,7 +269,7 @@ fn reserve_log() -> Result<(u32, u32), crate::fs::fat::FatError> {
     if first < 2 || (new_size as usize) < RESERVE_BYTES {
         return Err(FatError::NoSpace); // short reservation — refuse to write in place over it
     }
-    Ok((first, new_size))
+    Ok((first, new_size, false))
 }
 
 /// Write `data` to the reserved `/UNAOS.LOG` chain, IN PLACE. `write_at` is strictly bounded (clusters
@@ -292,15 +304,20 @@ pub fn service() {
     // only FAT/directory mutation for the whole boot.
     if RESERVED.load(Ordering::Acquire) == 0 {
         match reserve_log() {
-            Ok((first, size)) => {
+            Ok((first, size, reused)) => {
                 LOG_FIRST.store(first, Ordering::Release);
                 LOG_SIZE.store(size, Ordering::Release);
+                // FRWRITE: pad the first flush ONLY when we reused a previous boot's file — the
+                // create/grow paths just zero-filled it, so padding would rewrite known zeros at a
+                // cost of ~129 READ(10) + ~129 WRITE(10) single-sector BOT transactions.
+                PAD_NEXT.store(reused, Ordering::Relaxed);
                 RESERVED.store(1, Ordering::Release);
                 serial_println!(
-                    ":: FR: {} reserved {} bytes @cluster {} — flushes are write-in-place only (single FAT writer preserved) ::",
+                    ":: FR: {} reserved {} bytes @cluster {} reused={} — flushes are write-in-place only (single FAT writer preserved) ::",
                     LOG_NAME,
                     size,
-                    first
+                    first,
+                    reused
                 );
             }
             Err(e) => {
