@@ -1157,8 +1157,22 @@ unsafe extern "C" {
 // separate slots (each slot gets the whole blob; only the entry differs). Both are register-only (they write
 // no user stack; their only data reads are the RO code page and the launcher-owned GO word at window +0x3000,
 // which the KERNEL writes through the slot backing — the fixtures never store to it). Both poll cooperatively
-// (SYS_YIELD between attempts, bounded budgets), so the demo is deterministic under QEMU's cooperative
-// scheduling — no reliance on timer preemption.
+// (bounded budgets, one syscall between attempts), so the demo needs no timer preemption to make progress.
+//
+// U7FIX — the park primitive is `SYS_SLEEP_MS(1)`, NOT a bare `SYS_YIELD`, and that choice is load-bearing.
+// Every one of these budgets is a HANG GUARD whose only job is to outlast the LAUNCHER, and every launcher
+// deadline (`wait_while_secs(5/5/8)`) is denominated in WALL CLOCK. A bare-yield budget is denominated in
+// ITERATIONS, and the two currencies do not convert at a fixed rate: under QEMU an EL0 yield round trip is
+// emulated and costs ~1 ms, so 0x8000 of them outlast 30 s (measured); on real hardware, with a genuinely
+// idle sibling core, the same 0x8000 retire in single-digit MILLISECONDS. That is the whole of the P63
+// metal-only U7 failure: the child's GO park expired before the launcher — which had a full user-window
+// scrub and a ~110-character PL011 line at 115200 baud still to do — ever released GO. The child exited
+// with an empty witness, its teardown wiped the inbox the parent's t1 deposit was sitting in (so the
+// launcher's deposit poll then found nothing: `snap=false`), `U7_CHILD_USED` never rose, and the parent's
+// own iteration-bounded park expired across the launcher's 5 s timeout, reporting the partial `0x3`.
+// `SYS_SLEEP_MS` puts the fixtures back in the launcher's currency: it is a real 250 Hz tick sleep on metal
+// (0x8000 iterations ~= 131 s) and degrades to a cooperative yield on QEMU (~1 ms), so the budget comfortably
+// outlasts the launcher's ~18 s worst case in BOTH environments — and a parked fixture no longer spins a core.
 //
 // PARENT (`el0-u7parent`, pre-endowed: U7_DEST_IDX = a Child handle naming the child fixture; U7_SRC_IDX = a
 // full Console cap CAP_WRITE|CAP_GRANT):
@@ -1209,10 +1223,11 @@ __u7_prog_parent:
     add  x9, x9, #0x1000
     add  x9, x9, #0x1000
     add  x9, x9, #0x1000                   // x9 = GO VA (base + 0x3000; adds keep every imm in range)
-    movz x24, #0x8000                      // bounded poll budget
+    movz x24, #0x8000                      // bounded poll budget — see U7FIX: ~1 ms per iteration EVERYWHERE
 3:  ldr  x10, [x9]
     cbnz x10, 4f
-    mov  x8, #4                            // SYS_YIELD — cooperative, deterministic under QEMU
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — a WALL-CLOCK tick, not a bare yield (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 3b
@@ -1256,7 +1271,8 @@ __u7_prog_child:
     movz x24, #0x8000
 10: ldr  x10, [x11]
     cbnz x10, 11f
-    mov  x8, #4                            // SYS_YIELD
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 10b
@@ -1268,7 +1284,8 @@ __u7_prog_child:
     svc  #0
     tbnz x0, #63, 13f                      // negative -> yield + retry (bounded)
     b    14f
-13: mov  x8, #4                            // SYS_YIELD
+13: mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 12b
@@ -1296,7 +1313,8 @@ __u7_prog_child:
     tbnz x0, #63, 17f
     add  x23, x23, #4                      // b2: t2 received
     b    18f
-17: mov  x8, #4                            // SYS_YIELD
+17: mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 16b
@@ -17234,6 +17252,7 @@ fn u7_run(demo_cpu: usize) {
         proc_free(pi);
         return;
     };
+    let t_child_spawn = super::timer::cntpct(); // U7FIX: the child's park starts here
     let child_pid = super::sched::spawn_user_slot("el0-u7child", child.entry, child.sp, child.ttbr0, demo_cpu);
     // Publish the pid->ASID map (ASID first — the sys_spawn discipline — then the pid, the live key).
     PROCS[pi].asid.store(child.asid, Ordering::Release);
@@ -17250,6 +17269,7 @@ fn u7_run(demo_cpu: usize) {
     serial_println!(
         ":: U7: cross-process transfer — inbox-mediated SYS_XFER/SYS_RECV + sender revoke (single-writer preserved) ::"
     );
+    let t_parent_spawn = super::timer::cntpct(); // U7FIX: the parent's park starts here
     super::sched::spawn_user_slot("el0-u7parent", parent.entry, parent.sp, parent.ttbr0, demo_cpu);
 
     // 4. The single-writer witness: t1 pending in the child's inbox + the child's row still untouched
@@ -17261,13 +17281,39 @@ fn u7_run(demo_cpu: usize) {
         })
     });
     let snap_ok = deposit_seen && handle_row_is_clear(child.asid);
+
+    // U7FIX: how long the child actually had to sit parked before we released it. On P63 this is the
+    // interval its budget had to outlast — and did not.
+    let child_wait = super::timer::cntpct().wrapping_sub(t_child_spawn);
+    // U7FIX ASSERTION: the child must STILL BE PARKED at the moment we release it. A fixture that gave up
+    // mid-park has already run its `SYS_EXIT`, so `EL0_U7_DONE` counts it — a non-zero reading here is a
+    // parked-out fixture and nothing else (neither U7 program can legitimately exit before its GO). This is
+    // the check whose absence made P63 a puzzle: the witness bitmask reported the *consequence* (`child=0x0`)
+    // and left the *cause* to be inferred, when the launcher was holding the one fact that names it.
+    let child_parked_out = EL0_U7_DONE.load(Ordering::Acquire);
     u7_release_go(child.slot);
 
     // 5. Use-then-revoke sequencing: wait for the child's first successful write through the cap, then
     //    let the parent revoke.
     let _ = wait_while_secs(5, || U7_CHILD_USED.load(Ordering::Acquire) == 0);
     let used = U7_CHILD_USED.load(Ordering::Acquire);
+    // U7FIX: the parent's park is the LONGER of the two — it spans everything above, including the child's
+    // whole spawn/RECV/write leg. Same assertion, same reasoning: the parent must still be parked here, and
+    // `EL0_U7_DONE` may legitimately have counted the CHILD by now, so the parent's parked-out test is
+    // "more than the child has exited". Both intervals are reported so a shrinking margin is visible on the
+    // bench BEFORE it becomes a cliff.
+    let parent_wait = super::timer::cntpct().wrapping_sub(t_parent_spawn);
+    let parent_parked_out = EL0_U7_DONE.load(Ordering::Acquire) > 1;
     u7_release_go(parent.slot);
+    let frq = super::timer::cntfrq().max(1);
+    serial_println!(
+        ":: [u7fix] park margin — child parked {}ms before GO (parked_out={}), parent parked {}ms before GO \
+         (parked_out={}); park primitive=SYS_SLEEP_MS budget=0x8000 ::",
+        child_wait / (frq / 1000).max(1),
+        child_parked_out,
+        parent_wait / (frq / 1000).max(1),
+        parent_parked_out
+    );
 
     // 6a. Wait (bounded) for both sentinel exits, then snapshot the witnesses.
     let _ = wait_while_secs(8, || EL0_U7_DONE.load(Ordering::Acquire) < 2);

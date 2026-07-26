@@ -1167,6 +1167,77 @@
     `arch/aarch64/sched.rs` (`orphan_kill`) + `arch/aarch64/syscall.rs` (the `SYS_EXIT` hook, the fixture
     and the leg) + the spec + this doc. QEMU-green ≠ correct: the metal confirmation rides the attended
     sitting, where the property to watch is the `SCHED: load` line after a vug is killed and relaunched.
+- **U7FIX (this arc)** — the **iteration-denominated park**: a fixture wait bounded by a *count of syscalls*
+  standing in for a wait bounded by *time*. P63 was an attended boot, and U7 was the only failing line on a
+  tip QEMU gated 79/79 green:
+  `:: U7: cross-process transfer FAIL — parent=0x3 child=0x0 used=0 snap=false cleared=true killed=0 done=2 ::`
+  - **Decoding `parent=0x3` names the step.** The parent's witness bits are `b0` over-rights XFER refused,
+    `b1` XFER t1 deposited, `b2` XREVOKE t1 accepted, `b3` XFER t2 deposited. `0x3` is `b0|b1` and nothing
+    more, and the only path out of the parent between `b1` and `b2` is its **GO park** — so `0x3` is precisely
+    "the parent deposited t1 and then gave up waiting to be released." `child=0x0` is the same statement about
+    the child's own GO park, one step earlier.
+  - **Root cause: the launcher and the fixtures were bounded in different currencies.** Every launcher
+    deadline in `u7_run` is wall clock (`wait_while_secs(5)`, `(5)`, `(8)`); every fixture park was a budget
+    of `0x8000` iterations of `SYS_YIELD`. Those two do not convert at a fixed rate. Under QEMU an EL0 syscall
+    round trip is *emulated*, costing ~1 ms, so `0x8000` of them outlast **30 s** (measured directly, by
+    stalling the launcher that long and watching the parent still report `0xf`). On a Cortex-A72 with a
+    genuinely idle sibling core the same round trip is a few hundred nanoseconds, so the identical budget
+    retires in **single-digit milliseconds** — three orders of magnitude, entirely in the direction that
+    breaks. The fixture had been calibrated, implicitly and invisibly, against QEMU's emulation cost. The
+    header comment even advertised the mistake as a virtue: *"cooperative SYS_YIELD polling — deterministic
+    under QEMU."* It was deterministic under QEMU. That was the whole problem.
+  - **The whole wire line follows from that one fact.** The child's park expired while the launcher still had
+    a full user-window scrub, a slot build and a ~110-character PL011 line at 115200 baud to get through, so
+    the child exited with an empty witness (`child=0x0`, `used=0`, `done` +1). Its teardown then wiped its
+    ASID's transfer inbox — the `clear_handle_row` twin that drops a dying ASID's undelivered deposits — which
+    is the inbox the parent's t1 deposit was sitting in, so the launcher's deposit poll found nothing and
+    `snap=false`. `U7_CHILD_USED` never rose, so the launcher burned its full 5 s before releasing the
+    parent's GO, by which time the parent's park had expired too: `parent=0x3`, `done=2`. `cleared=true` and
+    `killed=0` because nothing actually malfunctioned — both fixtures shut down cleanly, having simply given
+    up. **Nothing was wrong with the transfer path itself**, which is the verdict worth stating plainly: this
+    is a fixture defect, not a `SYS_XFER` coherency bug, and the cross-core publish ordering was never
+    implicated once `parent=0x3` was decoded.
+  - **Not BG-SPREAD, despite the timing.** The obvious suspect was the commit immediately before, but the U7
+    fixtures are spawned `spawn_user_slot(.., demo_cpu)` — **caller-pinned**, never `CPU_AUTO` — so BG-SPREAD
+    cannot have moved them, and U7 runs at the head of the boot battery, before any `bg` launch exists to
+    stack. The defect is older than BG-SPREAD; P63 is simply the boot that happened to expose it.
+  - **Fix: put the fixtures back in the launcher's currency.** All four bounded parks (the parent's GO wait,
+    the child's GO wait, and the child's two `SYS_RECV` polls) now step on `SYS_SLEEP_MS(1)` instead of a bare
+    `SYS_YIELD`. On metal that is a real 250 Hz tick, so `0x8000` iterations is ~131 s — comfortably past the
+    launcher's ~18 s worst case — and a parked fixture stops spinning a core while it waits. On QEMU
+    `SYS_SLEEP_MS` has no delivered timer IRQ and falls back to a cooperative yield, so the demo stays
+    deterministic and needs no timer preemption to make progress, exactly as before. **Deliberately not
+    fixed by re-pinning or by enlarging the magic number**: either would have restored the green line while
+    leaving the units mismatched.
+  - **QEMU reproduced the failure but cannot gate the fix — stated plainly, because it constrains what the
+    witness is allowed to claim.** The shape reproduces readily: stall `u7_run` deliberately while the
+    fixtures are parked and the pre-fix tip returns P63's wire line exactly, `parent=0x3 child=0x0 used=0`,
+    both arms (3 s suffices with the child alone on the core; 8 s is needed once the parent shares
+    `demo_cpu` and each drains its budget at half rate). But `SYS_SLEEP_MS` **falls back to a cooperative
+    yield under QEMU**, since no timer IRQ is delivered there — so under QEMU the fixed park and the broken
+    park are the same instructions' worth of waiting, and a stall long enough to break one breaks the other.
+    A "stall and survive" leg would therefore have been a guard that only appeared to guard. It was built,
+    measured, and discarded; the fix's own confirmation belongs to the bench.
+  - **Witness: `:: [u7fix] park margin — … ::`,** `+1` spec REQUIRE and `+2` FORBIDs (79 → 80). What QEMU
+    *can* gate, and what P63 was actually missing, is an **assertion rather than a stall**: each fixture must
+    still be parked at the moment its GO is released. A fixture that gave up mid-park has already run its
+    `SYS_EXIT`, so `EL0_U7_DONE` counts it, and neither U7 program can legitimately exit before its GO — a
+    non-zero reading there is a parked-out fixture and nothing else. The launcher was holding that fact all
+    along and never looked at it, which is precisely why P63 reported the *consequence* (`child=0x0`) and left
+    the *cause* to be inferred from a bitmask. The line also reports both parks' measured durations, and those
+    numbers are the arc's most uncomfortable finding: **6 ms and 2 ms**. The launcher was never slow. The
+    pre-fix budget retired in single-digit milliseconds on metal, so the margin was never orders of magnitude
+    — it was the same order of magnitude as the wait, and P63 is simply the boot on which it lost. The margins
+    now print every boot, so the next erosion is visible before it is a failure.
+  - **Verified to have teeth (A/B).** Reverting only the park primitive, with a stall to expose it, the
+    witness reads `child parked 8005ms before GO (parked_out=2), parent parked 13001ms before GO
+    (parked_out=true)` and the gate drops to **78/80 with 2 forbidden hits** — and, unlike P63, the log now
+    *names the defect on its own line* instead of requiring the bitmask to be decoded.
+  - Gates: `./arroyo check` green x86_64 + aarch64; `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 90`
+    → **80/80 required witnesses, 0 forbidden**; `./arroyo test-arm` MISSION SUCCESS. Lane:
+    `arch/aarch64/syscall.rs` (the U7 fixture blob + `u7_run`) + the spec + this doc. QEMU-green ≠ correct:
+    the metal confirmation rides the next attended boot, where the property to watch is simply the U7 line —
+    `-> PASS` rather than the `parent=0x3` partial.
 - **BG-SPREAD (this arc)** — the **stacked background parent**: every `bg` launch pinned its parent task to
   the launcher's core, so background programs piled onto one core no matter how idle the rest of the machine
   was. P62 was an attended sitting: four bg vugs, each visibly slower than the last, while

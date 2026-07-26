@@ -71,6 +71,19 @@ REQUIRE U5: capabilities.*-> PASS
 REQUIRE U6: general object table.*-> PASS
 REQUIRE U6b: real File handles.*-> PASS
 REQUIRE U7: cross-process transfer.*-> PASS
+# U7FIX (P63 metal-only): the U7 fixtures' GO parks must outlast the LAUNCHER, and the launcher's deadlines
+# are wall-clock while a bare-yield park is denominated in ITERATIONS — ~1 ms each under QEMU's emulation but
+# a few hundred ns on a real idle A72 core. On metal the child gave up before GO was ever released
+# (`child=0x0 used=0 snap=false`, parent stuck at the partial `0x3`). The park primitive is SYS_SLEEP_MS now
+# (a real 250 Hz tick on metal; still a cooperative yield under QEMU, where nothing was broken).
+# NOTE what this REQUIRE can and cannot do: because SYS_SLEEP_MS degrades to a yield under QEMU, QEMU cannot
+# tell the fixed park from the broken one and CANNOT gate the fix itself — that confirmation is the bench's.
+# What it DOES gate, on both, is the launcher's new parked-out assertion: neither fixture may have exited
+# before its GO was released. That is the fact that names the defect directly, and its absence is what made
+# P63 a puzzle. The reported margins are also the early warning — they shrink before they cliff.
+REQUIRE \[u7fix\] park margin — child parked [0-9]+ms before GO \(parked_out=0\), parent parked [0-9]+ms before GO \(parked_out=false\); park primitive=SYS_SLEEP_MS budget=0x8000
+FORBID \[u7fix\] .*child parked [0-9]+ms before GO \(parked_out=[1-9]
+FORBID \[u7fix\] .*parent parked [0-9]+ms before GO \(parked_out=true
 REQUIRE U8: revocation trees.*-> PASS
 REQUIRE U9: real File writes.*-> PASS
 REQUIRE U10: file growth.*-> PASS
