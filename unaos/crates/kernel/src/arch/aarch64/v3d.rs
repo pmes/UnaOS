@@ -348,8 +348,26 @@ const PCTR_SRC_TMU_TCACHE_MISS: u32 = 25; // TMU tcache misses (a store to a fre
 // Slot 7 always carries the anchored `PCTR_SRC_CYCLE_COUNT` (32) as the instrument's own control: if it
 // reads zero the bank was never counting and every other slot in the bank is INCONCLUSIVE, not clean.
 const V3D63_SWEEP_SRC: [u32; 7] = [1, 10, 11, 12, 13, 28, 29];
-const V3D63_CTRL_SLOT: usize = 7; // slot 7 = src32 CYCLE_COUNT, the block-was-clocked control
 const V3D63_PCTR_MASK: u32 = 0xFF; // eight counters enabled (0..7)
+// **Slot 2 is RESERVED for `PCTR_SRC_CYCLE_COUNT` and the sweep may never occupy it.** `wait_fldone`
+// samples PCTR counter 2 on every bin wait and `emit_v3d55_clock_liveness` prints it as a hard hardware
+// verdict — `counter2(src32 CYCLE_COUNT)`, gated only on `PCTR_EN` bit 2 being set, which this bank
+// always sets. A sweep id parked in slot 2 would make all four banked rungs print a FABRICATED
+// "[v3d55] CYCLE_COUNT FLAT / the V3D core clock is NOT advancing" verdict off an unidentified mux, and
+// it would contradict this bank's own control. Pinning src32 to slot 2 keeps the pre-existing `[v3d55]`
+// witness truthful across V3D-63's rungs AND serves as this bank's control — one counter, both roles,
+// no re-labelling of an established witness string. The seven swept ids therefore live in slots
+// 0,1,3,4,5,6,7; `v3d63_slot` is the only place that mapping is written down.
+const V3D63_CTRL_SLOT: usize = 2; // slot 2 = src32 CYCLE_COUNT — the [v3d55] slot AND this bank's control
+
+/// PI-V3D-63 — sweep index → PCTR counter slot, skipping the reserved src32 control slot.
+const fn v3d63_slot(i: usize) -> usize {
+    if i < V3D63_CTRL_SLOT {
+        i
+    } else {
+        i + 1
+    }
+}
 
 // CLE (control-list executor) — CT1 is the RENDER queue. Submitting a job = write the ring's start
 // address to CT1QBA and its end address to CT1QEA; the hardware runs [BA, EA).
@@ -879,7 +897,7 @@ pub fn bringup(fb: Option<FbTarget>) {
     // only trustworthy if it says what is missing from it.
     if V3D_DEEP {
         serial_println!(
-            ":: V3D: [v3d] deep=on — slow banked-verdict probes ARMED: [v3d48] bisection ladder (6 rungs x ~0.5 s FLDONE backstop), [v3d59] frameclose (64 x 1 ms), [v3d58] rerender (extra CT1 job). Expect ~3.5 s of extra boot ::"
+            ":: V3D: [v3d] deep=on — slow banked-verdict probes ARMED: [v3d48] bisection ladder (6 rungs x ~0.5 s FLDONE backstop) + [v3d63] ptb-unit matrix (4 more rungs, same backstop) = 10 rungs, [v3d59] frameclose (64 x 1 ms), [v3d58] rerender (extra CT1 job). Expect ~5.5 s of extra boot — a stall of that length here is the BUDGET, not a hang ::"
         );
     } else {
         serial_println!(
@@ -6545,12 +6563,18 @@ impl V3d63Ctr {
     fn ctrl(&self) -> u32 {
         self.c[V3D63_CTRL_SLOT]
     }
-    /// Bitmask of the swept slots (0..6) that read nonzero.
+    /// Bitmask over the SWEEP INDEX (bit i = `V3D63_SWEEP_SRC[i]`) of sources that registered events.
+    ///
+    /// A counter's OVERFLOW bit is ORed in alongside its value: a source that wrapped exactly back to
+    /// zero across the frame would otherwise read as "never moved", which is the same silent-instrument
+    /// failure the campaign keeps having to unwind. Overflow is a positive statement that the counter
+    /// ran past its width, so it counts as movement.
     fn moved(&self) -> u32 {
         let mut m = 0u32;
         let mut i = 0;
         while i < V3D63_SWEEP_SRC.len() {
-            if self.c[i] != 0 {
+            let s = v3d63_slot(i);
+            if self.c[s] != 0 || self.ovf & (1 << s) != 0 {
                 m |= 1 << i;
             }
             i += 1;
@@ -6565,14 +6589,16 @@ impl V3d63Ctr {
 /// cleared and enabled (the mitigation for the non-deterministic source latch). Eight counters: slots
 /// 0..6 carry `V3D63_SWEEP_SRC`, slot 7 carries the anchored `PCTR_SRC_CYCLE_COUNT`.
 fn v3d63_pctr_arm() {
+    // Slots 0,1 = sweep[0,1]; slot 2 = src32 CYCLE_COUNT (RESERVED — see V3D63_CTRL_SLOT); slot 3 =
+    // sweep[2]. Slots 4..7 = sweep[3..7]. This packing IS `v3d63_slot`, written out in field order.
     let src_0_3 = (V3D63_SWEEP_SRC[0] & 0x7f)
         | ((V3D63_SWEEP_SRC[1] & 0x7f) << 8)
-        | ((V3D63_SWEEP_SRC[2] & 0x7f) << 16)
-        | ((V3D63_SWEEP_SRC[3] & 0x7f) << 24);
-    let src_4_7 = (V3D63_SWEEP_SRC[4] & 0x7f)
-        | ((V3D63_SWEEP_SRC[5] & 0x7f) << 8)
-        | ((V3D63_SWEEP_SRC[6] & 0x7f) << 16)
-        | ((PCTR_SRC_CYCLE_COUNT & 0x7f) << 24);
+        | ((PCTR_SRC_CYCLE_COUNT & 0x7f) << 16)
+        | ((V3D63_SWEEP_SRC[2] & 0x7f) << 24);
+    let src_4_7 = (V3D63_SWEEP_SRC[3] & 0x7f)
+        | ((V3D63_SWEEP_SRC[4] & 0x7f) << 8)
+        | ((V3D63_SWEEP_SRC[5] & 0x7f) << 16)
+        | ((V3D63_SWEEP_SRC[6] & 0x7f) << 24);
     mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0); // stop any prior arming before reprogramming
     dsb();
     mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3, src_0_3);
@@ -6608,8 +6634,9 @@ fn v3d63_pctr_read() -> V3d63Ctr {
 ///
 /// Every swept counter is printed as `srcNN=value` with NO name attached. That is deliberate and it is
 /// the honest form: this tree cannot cross-check those ids against the `enum drm_v3d_perfcnt` anchors
-/// (16/32), so it makes no claim about which unit each mux carries. Only slot 7 (src32 CYCLE_COUNT) is
-/// named, because only slot 7 is anchored.
+/// (16/32), so it makes no claim about which unit each mux carries. Only slot 2 (src32 CYCLE_COUNT) is
+/// named, because only slot 2 is anchored — and slot 2 is also the counter the pre-existing `[v3d55]`
+/// clock-liveness witness samples on every wait, which is exactly why the sweep may not occupy it.
 fn v3d63_emit_rung(what: &str, r: &V3d63Rung) {
     serial_println!(
         "::   [v3d63] rung {} — CL off={:#x} BA={:#010x} len={} retired={} | CT0LC={:#x} CT0PC={:#x} CT0CA={:#010x} CT0CS={:#010x}(CTRUN={}) PCS={:#010x}(BMACTIVE={} BMBUSY={}) | bank: src{}={} src{}={} src{}={} src{}={} src{}={} src{}={} src{}={} [ALL SEVEN UNIDENTIFIED — raw mux reads, no name claimed] | src32 CYCLE_COUNT={} (control) OVERFLOW={:#010x} ::",
@@ -6619,15 +6646,17 @@ fn v3d63_emit_rung(what: &str, r: &V3d63Rung) {
         r.pcs,
         (r.pcs & V3D_PCS_BMACTIVE != 0) as u32,
         (r.pcs & V3D_PCS_BMBUSY != 0) as u32,
-        V3D63_SWEEP_SRC[0], r.ctr.c[0],
-        V3D63_SWEEP_SRC[1], r.ctr.c[1],
-        V3D63_SWEEP_SRC[2], r.ctr.c[2],
-        V3D63_SWEEP_SRC[3], r.ctr.c[3],
-        V3D63_SWEEP_SRC[4], r.ctr.c[4],
-        V3D63_SWEEP_SRC[5], r.ctr.c[5],
-        V3D63_SWEEP_SRC[6], r.ctr.c[6],
+        V3D63_SWEEP_SRC[0], r.ctr.c[v3d63_slot(0)],
+        V3D63_SWEEP_SRC[1], r.ctr.c[v3d63_slot(1)],
+        V3D63_SWEEP_SRC[2], r.ctr.c[v3d63_slot(2)],
+        V3D63_SWEEP_SRC[3], r.ctr.c[v3d63_slot(3)],
+        V3D63_SWEEP_SRC[4], r.ctr.c[v3d63_slot(4)],
+        V3D63_SWEEP_SRC[5], r.ctr.c[v3d63_slot(5)],
+        V3D63_SWEEP_SRC[6], r.ctr.c[v3d63_slot(6)],
         r.ctr.ctrl(), r.ctr.ovf,
     );
+    // The [v3d55] clock-liveness line printed inside this rung's wait read THIS bank's slot 2, which is
+    // pinned to src32 — so that verdict is sound across V3D-63's rungs and needs no re-reading.
 }
 
 /// PI-V3D-63 — the arc's two discriminators, run as one 2×2 matrix on a single boot.
@@ -6738,7 +6767,7 @@ fn v3d63_ptb_unit_probes() {
         "at least one swept source moved on a frame containing ZERO primitives — whatever those muxes carry, it is not gated on primitive content. Identify the moving ids before reading anything into it"
     };
     serial_println!(
-        ":: V3D: [v3d63] ptbctr — DROPPED (not guessed): CLE-bin-thread-active-cycles, PTB-prims-binned, PTB-prims-clipped — none of the three can be cross-checked against this file's verified anchors (16 valid_instr, 32 cycle_count) and no `enum drm_v3d_perfcnt` copy exists in this tree; naming them would be the PI-V3D-4/6/7 fabricated-constant class. ARMED instead: raw sweep of UNIDENTIFIED source ids {:?} + src32 control | bank-counted(all rungs)={} | src32 empty {}/{} full {}/{} | moved-mask empty={:#04x} full={:#04x} (bit i = V3D63_SWEEP_SRC[i]) | OVERFLOW empty {:#010x}/{:#010x} full {:#010x}/{:#010x} — {} ::",
+        ":: V3D: [v3d63] ptbctr — DROPPED (not guessed): CLE-bin-thread-active-cycles, PTB-prims-binned, PTB-prims-clipped — none of the three can be cross-checked against this file's verified anchors (16 valid_instr, 32 cycle_count) and no `enum drm_v3d_perfcnt` copy exists in this tree; naming them would be the PI-V3D-4/6/7 fabricated-constant class. ARMED instead: raw sweep of UNIDENTIFIED source ids {:?} in slots 0,1,3,4,5,6,7 + src32 CYCLE_COUNT pinned to slot 2 (the slot [v3d55] clkliv samples every wait — the sweep may never occupy it) serving as this bank's control | bank-counted(all rungs)={} | src32 empty {}/{} full {}/{} | moved-mask empty={:#04x} full={:#04x} (bit i = V3D63_SWEEP_SRC[i]) | OVERFLOW empty {:#010x}/{:#010x} full {:#010x}/{:#010x} — {} ::",
         V3D63_SWEEP_SRC, ctrl_live as u32,
         e1.ctr.ctrl(), e2.ctr.ctrl(), f1.ctr.ctrl(), f2.ctr.ctrl(),
         moved_empty, moved_full,

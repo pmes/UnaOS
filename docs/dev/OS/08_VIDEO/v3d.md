@@ -2326,8 +2326,22 @@ What is armed instead is a **search, not a claim**: seven source ids
 (`V3D63_SWEEP_SRC = [1, 10, 11, 12, 13, 28, 29]`) written into the SRC mux and
 printed **raw, by index, with no semantic label** — the treatment V3D-60 gave the
 unsourced MMU interrupt halves. Writing an id into a 7-bit SRC field selects a mux;
-it asserts nothing about what that mux carries. Slot 7 always carries the anchored
-src32 `CYCLE_COUNT` as the bank's own control.
+it asserts nothing about what that mux carries.
+
+**PCTR slot 2 is reserved, and the sweep may never occupy it.** `wait_fldone` samples
+PCTR counter 2 on every bin wait and `emit_v3d55_clock_liveness` prints it as a hard
+hardware verdict — `counter2(src32 CYCLE_COUNT)` — gated only on `PCTR_EN` bit 2,
+which this bank always sets. A swept id parked there would have made all four banked
+rungs print a fabricated *"CYCLE_COUNT FLAT — the V3D core clock is NOT advancing"*
+off an unidentified mux, contradicting the bank's own control. `PCTR_SRC_CYCLE_COUNT`
+is therefore pinned to slot 2, where it keeps the established `[v3d55]` witness
+truthful **and** serves as this bank's control — one counter, both roles, no
+re-labelling of an existing witness string. The seven swept ids live in slots
+0,1,3,4,5,6,7; `v3d63_slot` is the single place that mapping is written down.
+
+A counter's `OVERFLOW` bit is ORed into the moved-mask alongside its value: a source
+that wrapped exactly back to zero would otherwise read as "never moved", which is the
+same silent-instrument failure this campaign keeps having to unwind.
 
 - src32 zero on any rung ⇒ the bank never counted ⇒ **INCONCLUSIVE**, explicitly not
   clean. Instrument first; read no slot as evidence.
