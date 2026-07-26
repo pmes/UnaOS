@@ -2126,7 +2126,7 @@ fn cursor3_rollup(scope: &str) {
     // CURSOR-6 — and what the PANEL got, which is the question neither of the two lines above can
     // reach: both are taken from inside the sprite's own bookkeeping, and an overwrite by a painter
     // that never consulted the module leaves that bookkeeping intact.
-    super::cursor::cursor6_rollup(scope);
+    super::cursor::cursor6_rollup(scope, planned);
 }
 
 /// WC-A — whether the first `[wc-a] composite` witness has been emitted (first composite only; a

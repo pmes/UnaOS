@@ -508,18 +508,29 @@ FORBID \[cursor5\] .*drain_insession=[1-9]
 #     (`cursor::live_box_relaxed`) that is readable from inside `wm`'s BlitGuard and the desktop's row
 #     loop, where the SPRITE lock may not be taken.
 #
-#     `desktop_over` must stay 0: the render task brackets its own `Screen::flush` with
-#     undraw/repaint, so a live sprite must never be seen by `present_background`. A non-zero count is
-#     a BROKEN BRACKET — the desktop erasing the arrow at flush rate — not load, which is why it is a
-#     FORBID rather than a watch-list item. `present_over` (window presents over an UNBRACKETED
-#     sprite) is the metal question and is deliberately NOT forbidden: it is the hypothesis this arc
-#     exists to test, and a gate that refused it would refuse the evidence.
+#     NOTHING HERE IS FORBIDDEN, and that is a decision rather than an omission.
 #
-#     UNWITNESSED on QEMU (no HID pointer, so the sprite is never drawn and the mirror is never set).
+#     `desktop_over` was a FORBID in the arc's first cut, on the reasoning that the render task
+#     brackets its own `Screen::flush` (undraw -> pal.render -> repaint) so a live sprite must never
+#     be seen by `present_background`. The reasoning is right about the bracket and wrong about the
+#     counter. The sprite mirror is deliberately OVER-COUNT-BIASED — `draw_locked` publishes BEFORE
+#     it paints, so that the probe can never MISS an overwrite — and the HID router calls
+#     `cursor::repaint` from its own core. An arrow arriving while a desktop flush is mid-loop
+#     therefore registers a real, healthy, transient overlap. Forbidding it would red a correct metal
+#     boot, and a false red costs Peter a bench sitting chasing a bug that is not there (the same
+#     trap CURSOR-5's `drain_insession` scoping was written to avoid). It is a VERDICT term
+#     (`-> UNBRACKETED`) and a watch-list item instead: a reader who sees it looks there first, and a
+#     SUSTAINED count — not a handful — is what would mean the bracket is genuinely broken.
+#
+#     `present_over` is the metal question this arc exists to ask, so forbidding it would refuse the
+#     evidence. `uncover_lost` is printed as `lost/planned` because the fix has a price (each one
+#     costs a whole-sprite refresh); it is a number to PRICE, not to fail on.
+#
+#     The REQUIRE is therefore the whole of the gate's claim: the line is wired and prints. On QEMU
+#     every field is 0 and the verdict is UNWITNESSED (no HID pointer, so the sprite is never drawn
+#     and the mirror never sets).
 #     See docs/dev/OS/08_VIDEO/engine.md §CURSOR-6.
 REQUIRE \[cursor6\] rollup scope=.* present_over=.* masked=.* desktop_over=.* mismatch=.* uncover_lost=.* ->
-FORBID \[cursor6\] .*-> UNBRACKETED
-FORBID \[cursor6\] .*desktop_over=[1-9]
 
 # --- WC-J — a closed window gives its panel rows BACK ------------------------------------------
 # ---    P61 (attended): four background vugs, some killed; the operator reported one crash, two

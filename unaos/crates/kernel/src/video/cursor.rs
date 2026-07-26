@@ -403,6 +403,12 @@ static LIVE_BOX: [AtomicUsize; 4] =
 /// CURSOR-6 — publish the sprite's box for the lock-free readers. Called wherever [`Sprite::drawn`]
 /// becomes true, so the mirror cannot drift from the field.
 fn publish_box(sp: &Sprite) {
+    // Down first, ALWAYS. The four coordinates are four separate stores, so a reader that caught
+    // them mid-update could assemble a box that never existed — new `bx` with old `bw`. Clearing the
+    // flag first makes that window unobservable rather than merely unlikely, and it costs one
+    // relaxed store on a path that already does five. The invariant is then unconditional: a `Some`
+    // answer from `live_box_relaxed` is always a box some sprite really occupied.
+    LIVE_ON.store(false, Ordering::Relaxed);
     LIVE_BOX[0].store(sp.bx, Ordering::Relaxed);
     LIVE_BOX[1].store(sp.by, Ordering::Relaxed);
     LIVE_BOX[2].store(sp.bw, Ordering::Relaxed);
@@ -487,8 +493,18 @@ static C6_UNCOVER_LOST: AtomicU64 = AtomicU64::new(0);
 ///
 /// The fix is the fallback the arc already trusts everywhere else: mark the session untrustworthy and
 /// let the tail take the whole-sprite refresh. One relaxed store inside the guard, consumed and
-/// cleared by `adopt_overlay` under the sprite lock. It cannot deadlock (no lock is taken) and it
-/// cannot leak across passes (the tail clears it unconditionally, on every exit).
+/// cleared by `adopt_overlay` under the sprite lock. It cannot deadlock (no lock is taken).
+///
+/// **The residual, stated rather than implied: the leak is bounded at one pass, not zero.** Only the
+/// session owner can set this (the flag is written from `draw_window`, which sees a plan only on a
+/// pass that opened a session) and only `adopt_overlay` clears it, so the ordinary path sets and
+/// retires it within the same pass. A pass that sets the flag and then settles on a `Repaint` tail
+/// instead of `Adopt` — the tail is chosen from `session`, so this needs the session to have been
+/// lost between the set and the tail — leaves the flag standing for the NEXT session to consume.
+/// That next pass takes a `refresh_locked` it did not itself earn: one whole-sprite repaint, one
+/// pass late, and then the flag is clear again. It cannot accumulate (an `AtomicBool`, not a count)
+/// and it cannot persist (the next adopt always swaps it down). A spurious repaint is the same cost
+/// this fix pays deliberately everywhere else, so the bound is the honest ceiling and not a hole.
 static UNCOVER_LOST: AtomicBool = AtomicBool::new(false);
 
 /// CURSOR-6 — record a dropped coverage clear. Called from `wm::draw_window`, inside the blit guard:
@@ -529,22 +545,33 @@ pub(super) fn note_desktop_over_sprite() {
 ///    its flush); non-zero is a broken bracket, not load.
 ///  * `mismatch` — [`compose_into`] declines where the open session did not describe the plan; the
 ///    last decline class that `offers - taken` could not account for.
-///  * `uncover_lost` — dropped coverage clears, each of which is now absorbed by a whole-sprite
-///    refresh rather than left to corrupt a session.
+///  * `uncover_lost` — dropped coverage clears, each absorbed by a whole-sprite refresh rather than
+///    left to corrupt a session. **Printed against `planned`, because the fix has a PRICE and the
+///    bench must be able to read it.** Each one costs the pass a `refresh_locked` — the whole-sprite
+///    duty cycle CURSOR-4 and CURSOR-5 spent two arcs removing — so `uncover_lost/planned` is the
+///    fraction of sessions paying it. A few per thousand is the absorbed race the fix is for; a
+///    large fraction under VUGPAR would mean the `try_lock` is contended often enough that the
+///    correct answer is to make `overlay_uncover` not need the lock, not to keep paying refreshes.
 ///
 /// QEMU raspi4b delivers no HID pointer report, so the sprite is never drawn, `live_box_relaxed()` is
 /// always `None`, and every counter here is 0 — reported as `UNWITNESSED`, never as `CLEAN`.
 #[cfg(feature = "witness")]
-pub fn cursor6_rollup(scope: &str) {
+pub fn cursor6_rollup(scope: &str, planned: u64) {
     let over = C6_PRESENT_OVER.load(Ordering::Relaxed);
     let masked = C6_PRESENT_MASKED.load(Ordering::Relaxed);
     let desktop = C6_DESKTOP_OVER.load(Ordering::Relaxed);
     let mismatch = C6_MISMATCH.load(Ordering::Relaxed);
     let lost = C6_UNCOVER_LOST.load(Ordering::Relaxed);
-    // `desktop_over` first: it is the only line item that is a broken BRACKET rather than a missing
-    // one, and a reader who sees it must stop there. `UNWITNESSED` covers both "no pointer ever
-    // existed" (QEMU) and "no present ever met the sprite" — `masked == 0` with an armed sprite means
-    // the mechanism was never exercised, and reporting `INTACT` there would be a vacuous pass.
+    // `desktop_over` first: of the three it is the one that would mean a BROKEN bracket rather than
+    // a missing one, so a reader who sees it should look there before anything else. It is a
+    // VERDICT term and no longer a gate FORBID — see the spec comment: this counter is
+    // over-count-biased by construction (the publish is deliberately early), and a desktop flush
+    // that races an arriving arrow is a real, healthy, transient overlap. Failing a metal boot on it
+    // would be a false red, and a false red costs Peter a bench sitting chasing nothing.
+    //
+    // `UNWITNESSED` covers both "no pointer ever existed" (QEMU) and "no present ever met the
+    // sprite": `over == masked == 0` means the mechanism was never exercised, and `INTACT` there
+    // would be a vacuous pass.
     let verdict = if desktop > 0 {
         "UNBRACKETED"
     } else if !armed() || (over == 0 && masked == 0) {
@@ -555,8 +582,8 @@ pub fn cursor6_rollup(scope: &str) {
         "INTACT"
     };
     serial_println!(
-        "[cursor6] rollup scope={} present_over={} masked={} desktop_over={} mismatch={} uncover_lost={} -> {}",
-        scope, over, masked, desktop, mismatch, lost, verdict
+        "[cursor6] rollup scope={} present_over={} masked={} desktop_over={} mismatch={} uncover_lost={}/{} -> {}",
+        scope, over, masked, desktop, mismatch, lost, planned, verdict
     );
 }
 
@@ -1329,18 +1356,26 @@ pub fn adopt_overlay() {
         // session that outlived its pass would lock the mechanism out for the rest of the boot.
         let coherent = {
             let mut ov = OVERLAY.lock();
-            // CURSOR-6 — `!uncover_lost` is a coherence term, not a diagnostic one. A dropped
-            // coverage clear means at least one `covered` bit describes a pixel some window has
-            // since overwritten, and the install below would hand that pixel's stale save to the
-            // module AND clear its `off` bit. Neither the generation nor the geometry moved, so no
-            // other term here can see it. Declining coherence routes the pass to `refresh_locked`,
-            // which re-establishes the whole sprite from the finished front buffer — CURSOR-3's
-            // fallback, always available and always correct.
-            let coherent = ov.session
+            // CURSOR-5's coherence question, computed on its OWN terms and nothing else: does the
+            // open session still describe the sprite that exists? This is what `adopt_incoh` counts,
+            // and it must stay answerable independently of anything CURSOR-6 added.
+            let c5_coherent = ov.session
                 && sp.drawn
-                && !uncover_lost
                 && ov.epoch == sp.epoch
                 && (ov.bx, ov.by, ov.bw, ov.bh, ov.s) == (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
+            // CURSOR-6 — `!uncover_lost` is a SECOND, independent reason to decline the install. A
+            // dropped coverage clear means at least one `covered` bit describes a pixel some window
+            // has since overwritten, and the install below would hand that pixel's stale save to the
+            // module AND clear its `off` bit. Neither the generation nor the geometry moved, so
+            // `c5_coherent` cannot see it. Declining routes the pass to `refresh_locked`, which
+            // re-establishes the whole sprite from the finished front buffer — CURSOR-3's fallback,
+            // always available and always correct.
+            //
+            // The two are AND-ed for the DECISION and counted SEPARATELY for the evidence. The first
+            // cut suppressed `adopt_incoh` whenever a lost clear coincided, which would have hidden
+            // a real CURSOR-5 incoherence behind a CURSOR-6 one — a silent counter, which is exactly
+            // the failure mode that made P65v2 unreadable.
+            let coherent = c5_coherent && !uncover_lost;
             if coherent {
                 // Install the layer-derived save-under for every pixel a present delivered. Those
                 // pixels are on the panel already — this is bookkeeping, not painting, which is what
@@ -1360,12 +1395,12 @@ pub fn adopt_overlay() {
             }
             ov.session = false;
             ov.covered.reset();
-            // CURSOR-6 — a pass declined for a LOST CLEAR is not a CURSOR-5 incoherence, and must not
-            // be counted as one: `[cursor5]`'s `adopt_incoh` names "the generation or the geometry
-            // moved mid-pass", and folding a different mechanism into it would make the next bench
-            // capture unreadable in exactly the way P65v2 was. It has its own counter.
+            // Counted on CURSOR-5's OWN predicate, so a lost clear can neither create nor mask an
+            // `adopt_incoh`. The two mechanisms overlap freely and each is counted where it belongs
+            // (`uncover_lost` is bumped at `note_uncover_lost`); a pass that hit both appears in
+            // both, which is the truth and is what lets a bench reader add them up.
             #[cfg(feature = "witness")]
-            if !coherent && !uncover_lost {
+            if !c5_coherent {
                 C5_ADOPT_INCOH.fetch_add(1, Ordering::Relaxed);
             }
             coherent

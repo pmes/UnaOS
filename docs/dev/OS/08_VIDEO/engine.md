@@ -2347,6 +2347,9 @@ session for the boot. `adopt` may therefore now exceed `taken`, which is why the
 
 #### Witnesses
 
+The shape **as CURSOR-4 left it** (see §CURSOR-6 for the current line, which appends
+`disjoint= partial=` after `straddle=` and `stale=` after `budget=`):
+
 ```
 [cursor3] rollup scope={fixture|desktop} planned= offers= taken= adopt= repaint= ensure= straddle= lock= budget= -> VERDICT
 ```
@@ -2359,6 +2362,11 @@ unchanged.
 * `straddle=` — offers where the sprite met the window's box only partially. Under CURSOR-3 every one
   of these was a whole-sprite decline; under CURSOR-4 they are composed **in part**, so this is now a
   measure of how often the split mechanism runs, not of a loss.
+  **Superseded by CURSOR-6:** this field does NOT mean what this paragraph says. `stage_window` offers
+  to every staged window, so a window the sprite is nowhere near produces `missed > 0` and was counted
+  here identically to a real partial carry — which is how the "48 % decline" reading arose. The
+  honest split is `disjoint=`/`partial=`; `straddle=` is retained only as their sum, for continuity
+  with P62/P64 captures. See §CURSOR-6.
 * `lock=` — a contended plan lock at either end: a `composite` that found another pass owning the
   session, or a `compose_into` that could not take `OVERLAY` inside the guard. Both fall back whole;
   neither spins under the guard.
@@ -2988,13 +2996,33 @@ state, retired by the tail on every exit — and folds it into the `coherent` te
 CURSOR-3's fallback: always available, always correct. A session mismatch still returns `true`, because
 for *that* case CURSOR-4's argument does hold — there is nothing of ours to clear.
 
-`C5_ADOPT_INCOH` is explicitly **not** bumped for a lost-clear decline. `[cursor5]`'s `adopt_incoh`
-names "the generation or the geometry moved mid-pass"; folding a second mechanism into it would make
-the next capture unreadable in precisely the way P65v2 was.
+The two coherence questions are **AND-ed for the decision and counted separately for the evidence.**
+`c5_coherent` (session, drawn, generation, geometry) is computed on CURSOR-5's own terms with no
+reference to the lost clear, and `adopt_incoh` is bumped on `!c5_coherent` alone; `coherent` is then
+`c5_coherent && !uncover_lost`. The arc's first cut suppressed `adopt_incoh` whenever a lost clear
+coincided, which would have hidden a **real** CURSOR-5 incoherence behind a CURSOR-6 one. A pass that
+hits both now appears in both, which is the truth and is what lets a bench reader add them up — a
+silent counter is exactly what made P65v2 unreadable, and the fix for that must not create another.
+
+**The fix has a price, and the rollup prints it.** Every dropped clear costs the pass a
+`refresh_locked` — the whole-sprite duty cycle CURSOR-4 and CURSOR-5 spent two arcs removing — so
+`uncover_lost` is reported as `lost/planned`, the fraction of sessions paying it. A few per thousand
+is the absorbed race the fix exists for. A large fraction under VUGPAR would mean the `try_lock` is
+contended often enough that the right answer is to make `overlay_uncover` not need the lock at all,
+rather than to keep buying correctness with refreshes; that is a next-arc decision the number makes
+available rather than one this arc pre-empts.
+
+**Residual, bounded at one pass rather than zero.** Only the session owner can set the flag and only
+`adopt_overlay` clears it, so the ordinary path sets and retires it within one pass. A pass that sets
+it and then settles on a `Repaint` tail (the session lost between the set and the tail) leaves it
+standing for the *next* session, which takes a `refresh_locked` it did not earn — one spurious
+whole-sprite repaint, one pass late, and then clear. It cannot accumulate (an `AtomicBool`, not a
+count) or persist (the next adopt always swaps it down). A spurious repaint is the same cost this fix
+pays deliberately everywhere else, so this is the honest ceiling, not a hole.
 
 #### INSTRUMENTED — the two overlap counters, and the fifth decline class
 
-`[cursor6] rollup scope=… present_over=N masked=N desktop_over=N mismatch=N uncover_lost=N -> V`
+`[cursor6] rollup scope=… present_over=N masked=N desktop_over=N mismatch=N uncover_lost=N/planned -> V`
 
 * **`present_over`** — a window present whose front-buffer row blit covered part of the live sprite box
   while the pass held **no overlay plan at all**, so nothing had handed those pixels back first. This
@@ -3009,16 +3037,22 @@ the next capture unreadable in precisely the way P65v2 was.
 * **`desktop_over`** — the same question for the desktop layer, taken in `Screen::present_background`
   over the spans that **survive** WC-I's occluder subtraction, and separately on the VUG-PAR band path
   (which returns before the serial loop and would otherwise be blind on the windowless full-screen
-  frame it exists for). The render task brackets its own flush (`cursor::undraw` → `pal.render` →
-  `cursor::repaint`), so this **must be 0**; non-zero means the bracket has a hole and the desktop is
-  erasing the arrow at flush rate. Latched per present, not per span — the unit that means something is
-  "one desktop present erased the arrow", and a per-span count would report the arrow's height.
+  frame it exists for). Latched per present, not per span — the unit that means something is "one
+  desktop present erased the arrow", and a per-span count would report the arrow's height.
+  **Not a gate FORBID, and that is a decision.** The render task brackets its own flush
+  (`cursor::undraw` → `pal.render` → `cursor::repaint`), which is why the first cut forbade any hit.
+  But the mirror is deliberately over-count-biased and the HID router calls `cursor::repaint` from its
+  own core, so an arrow *arriving* while a flush is mid-loop registers a real, healthy, transient
+  overlap. Failing a correct metal boot on that would cost Peter a sitting chasing nothing — the same
+  trap CURSOR-5's `drain_insession` core-scoping was written to avoid. It is a verdict term
+  (`-> UNBRACKETED`) and a watch-list item: a reader looks there first, and a **sustained** count, not
+  a handful, is what would mean the bracket is genuinely broken.
 * **`mismatch`** — a `compose_into` that declined because the open session did not describe *this* plan.
   CURSOR-4 left this exit silent, so it was the one decline class absent from `offers - taken`.
 * **`uncover_lost`** — dropped clears, each now absorbed by a whole-sprite refresh rather than left to
   corrupt a session.
 
-Verdicts: `UNBRACKETED` (`desktop_over > 0` — a broken bracket, not load; stop reading there),
+Verdicts: `UNBRACKETED` (`desktop_over > 0` — look there first; sustained, not a handful),
 `UNWITNESSED` (the sprite was never armed — QEMU, always — or no present ever met it, `over == masked
 == 0`), `OVERWRITTEN` (`present_over > 0`), `INTACT` otherwise.
 
@@ -3030,7 +3064,7 @@ Verdicts: `UNBRACKETED` (`desktop_over > 0` — a broken bracket, not load; stop
 ```
 [cursor3] rollup scope=fixture planned=0 offers=0 taken=0 adopt=0 repaint=1 ensure=348 straddle=0 disjoint=0 partial=0 lock=0 budget=0 stale=0 -> UNWITNESSED
 [cursor5] rollup scope=fixture stale_compose=0 adopt_incoh=0 selfsave=0 masked_nosession=0 drain_insession=0 -> UNWITNESSED
-[cursor6] rollup scope=fixture present_over=0 masked=0 desktop_over=0 mismatch=0 uncover_lost=0 -> UNWITNESSED
+[cursor6] rollup scope=fixture present_over=0 masked=0 desktop_over=0 mismatch=0 uncover_lost=0/0 -> UNWITNESSED
 ```
 
 Same caveat as every cursor arc, and it is load-bearing here: QEMU raspi4b delivers no HID pointer
@@ -3041,8 +3075,9 @@ in the sense that they are wired and quiet. What rides the next metal boot is th
 
 #### Metal watch-list (CURSOR-6)
 
-* `desktop_over=0` — if this is non-zero, **stop**: the desktop's bracket is broken and that is the
-  whole mechanism, no further hypothesis needed.
+* `desktop_over` — a handful is the arriving-arrow race and is expected; a count that tracks the
+  desktop's flush rate means the bracket is broken and that is the whole mechanism, no further
+  hypothesis needed. Deliberately not a gate FORBID (see above).
 * `present_over` non-zero **names** the mechanism: window presents are erasing an unbracketed arrow.
   The fix then belongs in the plan snapshot — `composite_inner` takes `sprite_plan()` once, before the
   dirty set, and a sprite that arrives after it is invisible to the whole pass.
@@ -3052,5 +3087,9 @@ in the sense that they are wired and quiet. What rides the next metal boot is th
 * `disjoint` should account for essentially all of the old `straddle`; `partial` is the honest count of
   how often the CURSOR-4 split runs. If `partial` turns out to be large after all, the straddle class is
   back on the table — the P65 reading was simply not able to say.
-* `uncover_lost` non-zero on the bench is the direct measure of the fix: each one is a session that
-  would have installed a stale save and is now taking a whole-sprite refresh instead.
+* `uncover_lost=N/planned=M` is the fix's PRICE as well as its measure: each one is a session that
+  would have installed a stale save and now takes a whole-sprite refresh instead. A few per thousand
+  is the absorbed race; a large fraction under VUGPAR means `overlay_uncover` should stop needing the
+  lock rather than keep buying correctness with refreshes.
+* `adopt_incoh` and `uncover_lost` overlap freely and are counted independently, so they may be added
+  up. Neither suppresses the other.
