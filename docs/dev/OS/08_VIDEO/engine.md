@@ -425,6 +425,29 @@ percent, so 10‰) moves the lit length on this panel's bar; `stepres=0px` would
 a real-time source feeding a meter too coarse to render its steps — the same frozen
 bars for a different reason — and is FORBIDden too, as is a non-monotonic fill.
 
+**A red must name the right subsystem**, which is why two of the witness's verdicts
+are skips rather than failures:
+
+* `stepres` is `bar_w / 100`, so on any panel whose bar is under 100 px it is zero
+  for a *geometry* reason — a shrunken `UNAOS_FBW`, a WC-F reservation that grew, a
+  layout regression. A blanket `stepres=0px` FORBID would report every one of those
+  as a source regression, backwards. Below the bound the witness refuses to state a
+  pixel resolution it cannot attribute: it prints `stepres=coarse` and verdicts
+  `SKIP-GEOM`, and the `armed` line's own geometry FORBIDs go red instead. So
+  `stepres=0px` is only ever printed by a panel wide enough to have resolved the
+  step, where it means exactly what the FORBID says it means.
+* **x86 is untouched by PULSE-3** — there is no `core_load` and therefore no live
+  feed to be on or off — so `live=0/n FAIL` would be a standing untruth in every
+  x86 log. The witness is cfg-gated to report `live=n/a … SKIP-ARCH` there. The
+  pi4 spec FORBIDs `SKIP-ARCH`, since an aarch64 boot printing it would mean the
+  cfg gate had inverted.
+
+The witness is re-emitted **once** at the first rollup. Its arm-time fire is taken
+the instant the panel exists, before every core has necessarily entered `run()`, so
+a transient `live=0` is possible there and would otherwise stand as the log's only
+word on the feed; ten seconds of settled boot later the answer is not transient.
+Once only — insurance against an early fire, not a second periodic witness.
+
 ## 5. Serial evidence
 
 `run_crystal` emits, when invoked:

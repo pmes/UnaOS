@@ -669,16 +669,30 @@ REQUIRE \[pstrip\] rollup samples=[0-9]+ redraws=[0-9]+ skipped=[1-9]
 # ---    `live=k/n` is the assertion that the strip is ON that feed: k counts cores returning a live
 # ---    number. `live=0/n` is the regression exactly -- every core back on the dispatch-pass
 # ---    fallback. (k==n is NOT required: a core legitimately outside `run()` is honestly untracked.)
-REQUIRE \[pstrip\] src live=[1-9][0-9]*/[0-9]+ quantum=[0-9]+ stepres=[0-9]+px mono=(yes|no) (PASS|FAIL)
+REQUIRE \[pstrip\] src live=[1-9][0-9]*/[0-9]+ quantum=[0-9]+ stepres=([0-9]+px|coarse) mono=(yes|no) (PASS|FAIL|SKIP-GEOM)
 FORBID \[pstrip\] src live=0/
 # ---    The other half: a real-time source is worth nothing to a meter too coarse to render its
 # ---    steps. `stepres=` is what ONE source quantum (1% -> 10 permille) moves the lit length on this
 # ---    panel's bar; zero means the display quantizes the feed away and the bars would freeze again
 # ---    for a different reason. `mono=` catches a geometry collapsed to a constant fill being read as
 # ---    a steady load.
+# ---
+# ---    A RED MUST NAME THE RIGHT SUBSYSTEM. `stepres` is bar_w/100, so on any panel whose bar is
+# ---    under 100 px it is zero for a GEOMETRY reason -- a shrunken UNAOS_FBW, a WC-F reservation
+# ---    that grew, a layout regression -- and a blanket `stepres=0px` FORBID would report every one
+# ---    of those as a SOURCE regression, i.e. exactly backwards. So the witness refuses to state a
+# ---    pixel resolution it cannot attribute: below the bound it prints `stepres=coarse` and verdicts
+# ---    SKIP-GEOM, and the geometry FORBIDs on the `armed` line above (`panel=..0x..`, `row_h=0`,
+# ---    single-digit `leds=`) are what go red instead. `stepres=0px` is therefore only ever printed
+# ---    by a panel wide enough to have resolved the step, where it does mean what this FORBID says.
 FORBID \[pstrip\] src .*stepres=0px
 FORBID \[pstrip\] src .*mono=no
 FORBID \[pstrip\] src .*FAIL
+# ---    x86 has no `core_load` and is deliberately untouched by PULSE-3, so there is no live feed to
+# ---    be on or off there; the witness reports `live=n/a ... SKIP-ARCH` on that arch rather than
+# ---    standing a permanent FAIL in every x86 log. This spec is pi4-only, so SKIP-ARCH must not
+# ---    appear here -- an aarch64 boot printing it would mean the cfg gate itself has inverted.
+FORBID \[pstrip\] src .*SKIP-ARCH
 # ---    `srcdelta=` in the rollup is the replay-visible half of "not real-time": the count of windows
 # ---    in which the SOURCE moved, printed beside the count actually drawn. A busy window that reads
 # ---    `srcdelta=0` is a stale feed; a window with a large `srcdelta` and `redraws=0` is the dirty

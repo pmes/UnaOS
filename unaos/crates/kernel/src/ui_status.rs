@@ -277,6 +277,12 @@ struct PulseState {
     /// while the machine was changing is a reading in the log rather than a bench observation.
     srcdelta: u64,
     rollup_ms: u64,
+    /// PULSE-3 — has the source witness been re-emitted at a rollup boundary yet? It fires once at
+    /// arm time, which is the earliest moment the panel exists and therefore the moment MOST likely to
+    /// catch a core that has not yet entered `run()` and to read a transient `live=0`. Re-emitting it
+    /// once at the first rollup — ten seconds of settled boot later — means an early fire can never
+    /// leave a permanent unexplained `live=0` as the log's only word on the subject.
+    src_reemitted: bool,
 }
 
 static PULSE: Mutex<PulseState> = Mutex::new(PulseState {
@@ -290,6 +296,7 @@ static PULSE: Mutex<PulseState> = Mutex::new(PulseState {
     redraws: 0,
     srcdelta: 0,
     rollup_ms: 0,
+    src_reemitted: false,
 });
 
 /// PULSE-3 — the strip's PRIMARY load source: this core's live busy-TIME fraction, in per-mille.
@@ -666,6 +673,13 @@ fn draw_panel<P: GneissPal>(pal: &mut P) {
 /// deliver into it.
 const SRC_QUANTUM_PERMILLE: u32 = 10;
 
+/// The bar width, in pixels, below which ONE source quantum cannot resolve to a whole pixel. The
+/// quantum is 1/100 of full scale, so a bar narrower than 100 px cannot render a 1% step however honest
+/// the feed is. See [`src_witness`] for why this bound has to exist *inside* the witness rather than in
+/// the spec: it separates a geometry fact from a source fact, and only the spec's `armed`-line FORBIDs
+/// can speak about geometry.
+const SRC_RESOLVABLE_BAR_PX: usize = 100;
+
 /// PULSE-3 — the arm-time source witness. Headless, deterministic, one line, no framebuffer read.
 ///
 /// Two questions a replay could not previously answer about a panel nobody can see, and the two halves
@@ -681,23 +695,61 @@ const SRC_QUANTUM_PERMILLE: u32 = 10;
 ///   same frozen bars for a different reason. `mono=` checks the fill is strictly increasing across the
 ///   scale, so a geometry that has collapsed to a constant is caught rather than read as "steady load".
 ///
-/// `bar_w == 0` (a panel too small to seat rows) reports `stepres=0 mono=no` honestly and FAILs; the
-/// gate geometry seats the instrument, and a boot where it does not is a layout regression the `armed`
-/// line's own FORBIDs already name.
+/// **A red here must name the right subsystem.** `stepres` is `bar_w / 100`, so on any panel whose bar
+/// is narrower than [`SRC_RESOLVABLE_BAR_PX`] it is zero *for a geometry reason* — a shrunken
+/// `UNAOS_FBW`, a WC-F reservation that grew, a layout regression. Letting the spec FORBID `stepres=0px`
+/// unconditionally would report every one of those as a SOURCE regression, which is the opposite of
+/// what this arc is about. So the witness refuses to state a pixel resolution it cannot honestly
+/// attribute: below the bound it prints `stepres=coarse` and verdicts `SKIP-GEOM`, and the geometry
+/// FORBIDs on the `armed` line (`panel=…0x…`, `row_h=0`, single-digit `leds=`) are what go red instead.
+/// `stepres=0px` is then only ever printed by a panel wide enough to have resolved the step — where it
+/// genuinely does mean the display is quantizing a live feed away.
+///
+/// **x86 has no `core_load`** and is deliberately unchanged by PULSE-3, so there is no live feed to be
+/// on or off there and `live=0/n FAIL` would be a standing untruth in every x86 log. The witness reports
+/// `live=n/a` and verdicts `SKIP-ARCH` instead; the x86 log carries no FAIL and the "unchanged in every
+/// particular" claim stays true.
 fn src_witness(g: &RowGeom, ncpu: usize) {
-    let live = (0..ncpu).filter(|c| live_permille(*c).is_some()).count();
-    let stepres = lit_px(g, SRC_QUANTUM_PERMILLE).saturating_sub(lit_px(g, 0));
     let mono = lit_px(g, 250) < lit_px(g, 500) && lit_px(g, 500) < lit_px(g, PERMILLE_FULL);
-    let pass = live > 0 && stepres > 0 && mono;
-    serial_println!(
-        "[pstrip] src live={}/{} quantum={} stepres={}px mono={} {}",
-        live,
-        ncpu,
-        SRC_QUANTUM_PERMILLE,
-        stepres,
-        if mono { "yes" } else { "no" },
-        if pass { "PASS" } else { "FAIL" }
-    );
+    let resolvable = g.bar_w >= SRC_RESOLVABLE_BAR_PX;
+    let stepres = lit_px(g, SRC_QUANTUM_PERMILLE).saturating_sub(lit_px(g, 0));
+    let step = if resolvable {
+        format!("{}px", stepres)
+    } else {
+        String::from("coarse")
+    };
+    #[cfg(target_arch = "aarch64")]
+    {
+        let live = (0..ncpu).filter(|c| live_permille(*c).is_some()).count();
+        let verdict = if live == 0 || !mono {
+            "FAIL"
+        } else if !resolvable {
+            "SKIP-GEOM"
+        } else if stepres == 0 {
+            "FAIL"
+        } else {
+            "PASS"
+        };
+        serial_println!(
+            "[pstrip] src live={}/{} quantum={} stepres={} mono={} {}",
+            live,
+            ncpu,
+            SRC_QUANTUM_PERMILLE,
+            step,
+            if mono { "yes" } else { "no" },
+            verdict
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = ncpu;
+        serial_println!(
+            "[pstrip] src live=n/a quantum={} stepres={} mono={} SKIP-ARCH",
+            SRC_QUANTUM_PERMILLE,
+            step,
+            if mono { "yes" } else { "no" }
+        );
+    }
 }
 
 /// PULSE-STRIP — the PACED entry point, called on the strip's own ~1 Hz refresh pulse (an
@@ -841,6 +893,19 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
                 rate_x10 % 10,
                 PSTRIP_PERIOD_MS
             );
+            // PULSE-3 — re-state the source witness ONCE, at the first rollup. The arm-time fire is
+            // taken the instant the panel exists, before every core has necessarily entered `run()`,
+            // so a transient `live=0` there is possible and would otherwise stand as the log's only
+            // word on the feed. Ten seconds of settled boot later the answer is not transient. Once
+            // only: this is insurance against an early fire, not a second periodic witness.
+            if !st.src_reemitted {
+                st.src_reemitted = true;
+                let m = pal.metrics();
+                let (px, _py, bw, bh) = panel_geometry(pal.width() as usize, pal.height() as usize);
+                if let Some(g) = row_geometry(&m, px, bw, bh, st.ncpu) {
+                    src_witness(&g, st.ncpu);
+                }
+            }
             st.samples = 0;
             st.redraws = 0;
             st.srcdelta = 0;
