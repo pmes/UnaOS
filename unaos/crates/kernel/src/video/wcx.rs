@@ -64,8 +64,13 @@
 //!
 //! Every pixel this module authors lands in [`DEMO_SURF`], a cached-RAM kernel surface. It performs
 //! no framebuffer write of its own and reads the front buffer never — `wm` owns the panel writes
-//! and does them through its staged path. There is no direct-front-buffer fallback in this file
-//! because there is no framebuffer write in this file.
+//! and does them through its staged path. There is no direct-front-buffer fallback in this file.
+//!
+//! The one exception, and its exact scope: [`activate`] clears the whole panel to `wm::DESKTOP_BG`
+//! once, BEFORE the first window exists (see the DESKTOP-CLEAR comment there). At that instant the
+//! compositor owns no pixels and no pass can be in flight, so the fill has no second writer to tear
+//! against. From the moment the console window is created onward, this file writes the framebuffer
+//! zero times.
 
 use super::wm;
 
@@ -162,6 +167,41 @@ pub fn activate() {
         let i = fb.info();
         (i.width, i.height)
     };
+    // WC-X DESKTOP-CLEAR — paint the whole panel to the desktop colour ONCE, here.
+    //
+    // Observed on the metal (s40 rMBP photo): everything painted to the panel BEFORE activation
+    // stays on glass forever — stray direct-painted fbcon rows across the top, and the pale
+    // rectangle top-left that kepler's display probe leaves behind. The compositor is not at fault
+    // and cannot fix it from inside a pass: `composite` paints its windows' boxes and `erase` paints
+    // boxes windows have vacated. Neither has any claim on panel pixels the window layer has never
+    // owned, so the pre-activation residue is outside every damage box there is.
+    //
+    // Why a DIRECT fill and not a staged one: `wm` exposes no full-panel erase or desktop-repaint
+    // verb (`erase` is private and box-scoped; `repaint` only re-damages existing window rows), and
+    // the WC-J reclaim path is likewise reached only through a window vacating a box. Rather than
+    // widen `wm`'s surface for a one-shot, this is the single case where a direct front-buffer write
+    // is sound: it runs BEFORE the first window exists, so the compositor owns no pixels at this
+    // instant, `STAGE` has no pass to collide with, and there is no second writer to tear against.
+    // The no-direct-writes law protects compositor-owned pixels from a second writer; there are no
+    // compositor-owned pixels yet. After the console window is created below, this file writes the
+    // framebuffer zero times, exactly as its module docs claim.
+    //
+    // CURSOR-1's bracket applies here for the same reason it applies to `erase`: if the sprite is on
+    // the panel, the fill would paint over it and its save-under would later restore pre-clear pixels
+    // as a stale patch. Take it off first; the first composite below puts it back.
+    {
+        super::cursor::undraw();
+        let fb = *super::WRITER.lock();
+        fb.fill_screen(wm::DESKTOP_BG);
+        fb.flush_all();
+    }
+    serial_println!(
+        "[wc-x] desktop-clear panel={}x{} bg={:08X}",
+        pw,
+        ph,
+        wm::DESKTOP_BG
+    );
+
     // RULED — the console becomes a window. Opened FIRST so the demo below carries the higher z.
     // Its own witness lines (`[wc-x] console-window …`) report the geometry and the panic fallback.
     let cwin = super::fbcon::panel_console_window_open();
