@@ -608,8 +608,32 @@ pub mod battery {
     /// One-per-transition serial note for a failed refresh while a good reading is held
     /// (BATMON-HOLD evidence line; cleared when a good reading returns).
     static HOLDING: Mutex<bool> = Mutex::new(false);
+    /// When the CURRENT hold began (ms); 0 = not holding. Drives `HOLD_NOTE_MS`.
+    static HOLD_SINCE: Mutex<u64> = Mutex::new(0);
+    /// Whether the CURRENT hold has printed its evidence line (so the release line pairs with it
+    /// and never appears alone).
+    static HOLD_NOTED: Mutex<bool> = Mutex::new(false);
+    /// Whether ANY hold has ever been announced. The first one always prints — that is the fact a
+    /// reader needs (this SMC drops sweeps) — and every later one has to earn it by lasting.
+    static HOLD_EVER: Mutex<bool> = Mutex::new(false);
+    /// Retry ROLLUP bookkeeping: the cumulative retry total a reader has already been shown, and
+    /// when the rollup last reported (0 = clock not started).
+    static ROLLED_TOTAL: Mutex<u32> = Mutex::new(0);
+    static ROLLED_MS: Mutex<u64> = Mutex::new(0);
 
     const REFRESH_MS: u64 = 1000;
+    /// QUIET-HOLD threshold. On the 2012 rMBP's flaky SMC a ONE-SWEEP drop-out is the normal case,
+    /// not an event: the `holding` / `hold released` pair fired every second on s39 metal. After the
+    /// first hold has been announced, a hold only earns a line once it has PERSISTED this long —
+    /// i.e. it is no longer a blip but an outage. A hold that never reaches it stays silent on both
+    /// ends (`HOLD_NOTED` keeps the release paired with its hold).
+    const HOLD_NOTE_MS: u64 = 5_000;
+    /// Retry ROLLUP period. `retries > 0` is NOT an event on this machine — s39 metal showed
+    /// `retries=2/2, 2/4, 6/14, 3/33, 4/44 …`, i.e. virtually every sweep consumes some, so keying
+    /// the witness on it re-printed at 1 Hz forever. Retry counts stay on the once-per-boot witness
+    /// line and on every state-change line; anything the reader has NOT already been shown is
+    /// reported by one rollup line, at most this often.
+    const RETRY_ROLLUP_MS: u64 = if cfg!(feature = "bootlog") { 60_000 } else { 300_000 };
     /// Per-key bounded retry budget (BATMON-HOLD hardening). Metal evidence (2026-07-18 sitting:
     /// Boot A `present=true soc=51%`, Boot B minutes later `present=false full=9962mAh`) shows
     /// individual key reads failing intermittently on the real SMC while others succeed in the same
@@ -755,15 +779,38 @@ pub mod battery {
             let mut h = HOLDING.lock();
             if *h {
                 *h = false;
-                serial_println!(":: SMC-BATT: good reading returned — hold released ::");
+                *HOLD_SINCE.lock() = 0;
+                // QUIET-HOLD: the release line exists to close the hold line. If the hold was never
+                // announced (a blip under `HOLD_NOTE_MS`), there is nothing to close — stay silent,
+                // so the pair can never appear half-printed.
+                let mut noted = HOLD_NOTED.lock();
+                if *noted {
+                    *noted = false;
+                    serial_println!(":: SMC-BATT: good reading returned — hold released ::");
+                }
             }
         } else if *GOOD_MS.lock() != 0 {
             let mut h = HOLDING.lock();
+            let mut since = HOLD_SINCE.lock();
             if !*h {
                 *h = true;
+                *since = now;
+                *HOLD_NOTED.lock() = false;
+            }
+            // QUIET-HOLD: announce the FIRST hold of the boot immediately (that this SMC drops
+            // sweeps at all is the fact worth having), and every later one only once it has lasted
+            // `HOLD_NOTE_MS` — a single-sweep drop-out is this machine's normal, and printing it
+            // scrolled the panel at 1 Hz on s39. Either way it prints at most once per hold.
+            let mut noted = HOLD_NOTED.lock();
+            let mut ever = HOLD_EVER.lock();
+            let held = now.wrapping_sub(*since);
+            if !*noted && (!*ever || held >= HOLD_NOTE_MS) {
+                *noted = true;
+                *ever = true;
                 serial_println!(
-                    ":: SMC-BATT: sweep failed (present=false) — holding last good reading (age {} ms) ::",
-                    now.wrapping_sub(*GOOD_MS.lock())
+                    ":: SMC-BATT: sweep failed (present=false) — holding last good reading (age {} ms, held {} ms) ::",
+                    now.wrapping_sub(*GOOD_MS.lock()),
+                    held
                 );
             }
         } else {
@@ -781,16 +828,34 @@ pub mod battery {
         // Under the `bootlog` feature (`UNAOS_BOOTLOG=1`, the boot-log-on-screen sitting mode) the
         // old full ~1 s cadence is restored unchanged, so a sitting can still watch discharge track.
         let (rsweep, rtotal) = retry_counts();
-        let state = (s.present, s.soc_pct, s.ac_present, s.ac_stuck, s.ac_derived);
         let mut w = WITNESSED.lock();
         let mut last = LAST_STATE.lock();
+        // QUIET-AC: the state key must carry the SETTLED ac shape, never the instantaneous one. On
+        // s39 metal a single dashed `B0AC` read makes `derive_ac(None)` return `Unknown` for exactly
+        // one sweep, which flipped the key twice (derived:… -> Unknown -> derived:…) and re-printed
+        // the witness at 1 Hz with a transient `ac=?`. A momentary hole is not a state change: when
+        // the derivation has nothing to say, the key keeps the last shape it did have. `ac_present`
+        // and `ac_stuck` are unaffected — those are answers, not inferences — and the printed line
+        // still reports the honest instantaneous value.
+        let ac_key = if matches!(s.ac_derived, AcDerived::Unknown) {
+            last.map_or(AcDerived::Unknown, |l| l.4)
+        } else {
+            s.ac_derived
+        };
+        let state = (s.present, s.soc_pct, s.ac_present, s.ac_stuck, ac_key);
         let changed = last.map_or(true, |l| l != state);
         // Two disjoint predicates, never OR-ed together, so the `bootlog` arm is *byte for byte* the
         // pre-audit condition and that mode's log is unchanged.
+        // RETRIES-LATCH RETIRED from the quiet arm (s39 metal): `retries > 0` is not a fire
+        // condition. `retries=2/2, 2/4, 6/14, 3/33, 4/44 …` — on this SMC virtually EVERY sweep
+        // consumes retries, so that disjunct made the predicate fire every second and the witness
+        // scrolled the glass exactly as before the quiet fix. The counts are not lost: they ride on
+        // the once-per-boot line and on every state-change line, and the ROLLUP below reports any
+        // the reader has not already been shown. The `bootlog` arm is untouched.
         let fire = if cfg!(feature = "bootlog") {
             !*w || s.present || rsweep > 0
         } else {
-            !*w || changed || rsweep > 0
+            !*w || changed
         };
         if fire {
             *w = true;
@@ -824,6 +889,37 @@ pub mod battery {
                 rsweep,
                 rtotal,
             );
+        }
+
+        // RETRY ROLLUP. The witness line above already carries `retries=SWEEP/TOTAL`, so whenever it
+        // fires the reader is up to date — record that and say nothing. Between fires, retries keep
+        // accruing invisibly; this reports the ones NOT yet shown, at most once per
+        // `RETRY_ROLLUP_MS`. That preserves the information the retired fire condition used to carry
+        // while costing one line per period instead of one per second.
+        //
+        // Under `bootlog` the arm above fires on every retrying sweep, so the delta is always
+        // consumed there and this never has anything to report — that mode's log is unchanged.
+        let mut rolled = ROLLED_TOTAL.lock();
+        let mut rolled_ms = ROLLED_MS.lock();
+        if fire {
+            *rolled = rtotal;
+            *rolled_ms = now;
+        } else {
+            if *rolled_ms == 0 {
+                *rolled_ms = now;
+            }
+            let unseen = rtotal.saturating_sub(*rolled);
+            if unseen > 0 && now.wrapping_sub(*rolled_ms) >= RETRY_ROLLUP_MS {
+                let window = now.wrapping_sub(*rolled_ms);
+                *rolled = rtotal;
+                *rolled_ms = now;
+                serial_println!(
+                    ":: SMC-BATT: retry rollup — {} retries in the last {} ms (total {}) == rollup ::",
+                    unseen,
+                    window,
+                    rtotal
+                );
+            }
         }
     }
 

@@ -105,13 +105,47 @@ scrolls the glass forever and ruins the photograph the sitting exists to produce
   included — it proves the M2 read path ran);
 * whenever the pack **state** changes — `present`, `soc_pct`, `ac_present`, `ac_stuck`,
   `ac_derived`. Voltage, amperage and remaining-mAh are deliberately **not** part of the state key:
-  they jitter on every sweep on real hardware, so keying on them would re-print at 1 Hz forever;
-* whenever the sweep consumed retries (`retries=n/…`, `n > 0`) — including a `present=false`
-  drop-out sweep. Those are exactly the ones worth seeing.
+  they jitter on every sweep on real hardware, so keying on them would re-print at 1 Hz forever.
 
-**No information is lost:** every state change and every retrying/failing sweep still prints, as do
-the one-per-transition BATMON-HOLD lines. Only an identical repeat of an unchanged reading is
-dropped. Under `UNAOS_BOOTLOG=1` (the `bootlog` feature — boot-log-held-on-screen sitting mode) the
+The `ac_derived` component of that key is the **settled** shape, not the instantaneous one. A single
+dashed `B0AC` read makes `derive_ac(None)` return `Unknown` for exactly one sweep; counting that as a
+state change flipped the key twice (`derived:… → Unknown → derived:…`) and re-printed the witness at
+1 Hz with a transient `ac=?`. When the derivation has nothing to say, the key keeps the last shape it
+did have. `ac_present` and `ac_stuck` are unaffected — those are answers, not inferences — and the
+printed line still reports the honest instantaneous value.
+
+#### Retries are not an event (s39)
+
+`retries > 0` used to be a third fire condition. On the 2012 rMBP's SMC it is not an event but the
+norm: the s39 metal boot showed `retries=2/2, 2/4, 6/14, 3/33, 4/44 …`, i.e. virtually every sweep
+consumes some, so the disjunct fired the predicate every second and the witness scrolled the glass
+exactly as it had before the quiet fix. It is retired from the quiet arm.
+
+The counts are not lost. They ride on the once-per-boot line and on every state-change line, and a
+**rollup** reports whatever the reader has not already been shown, at most once per
+`RETRY_ROLLUP_MS` (300 s quiet, 60 s under `bootlog`):
+
+```
+:: SMC-BATT: retry rollup — 41 retries in the last 300000 ms (total 44) == rollup ::
+```
+
+Whenever the witness line fires it carries `retries=SWEEP/TOTAL`, so the rollup consumes the delta
+and stays silent. Under `bootlog` the witness fires on every retrying sweep, so the delta is always
+consumed there and the rollup never has anything to report — that mode's log is unchanged.
+
+#### Holds must earn their line (s39)
+
+The BATMON-HOLD pair (`sweep failed (present=false) — holding` / `good reading returned — hold
+released`) also printed once per second on s39: on this SMC a **one-sweep** drop-out is normal, and
+each blip produced a full hold/release pair. The first hold of a boot still prints immediately —
+that this machine drops sweeps at all is the fact a reader needs — and every later hold prints only
+once it has **persisted** past `HOLD_NOTE_MS` (5 s), i.e. once it is an outage rather than a blip.
+The line carries the hold's own age (`held N ms`) alongside the cached reading's staleness. The
+release line prints only if its hold was announced, so the pair can never appear half-printed.
+
+**No information is lost:** every state change and every failing sweep that lasts still prints, and
+retry counts survive on the witness lines plus the rollup. Only identical repeats and sub-threshold
+blips are dropped. Under `UNAOS_BOOTLOG=1` (the `bootlog` feature — boot-log-held-on-screen sitting mode) the
 full ~1 s cadence is restored **exactly** as it was before this policy, so a sitting can still watch
 discharge track live; the two predicates are disjoint arms in `refresh_if_due()`, never OR-ed.
 
