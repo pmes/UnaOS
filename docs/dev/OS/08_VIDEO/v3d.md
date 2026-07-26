@@ -2384,6 +2384,15 @@ whose truth is already established, and classify each mux by behaviour alone.
 | **L2 render** | the known-good CT1 clear job — `clear_job(None)`, the retiring M3 job `[v3d58] rerender` already reuses (**no new job is invented**), panel blit suppressed, its own store byte-verified | real, completing render work |
 | **L3 bin** | one banked `Empty` rung of the `[v3d48]` ladder via `submit_bisect_rung_at(…, bank: true)` | the bin path — the frame opens and never retires, so a retirement-gated mux stays flat while a clock-derived one climbs through the ~0.5 s backstop |
 
+Two reading notes for capture work. **The permille is a leg-fraction, not a duty cycle** —
+on L2 it says what share of *that leg's own elapsed core cycles* the slot counted, and
+the leg spans the whole `clear_job` call (setup, kick, CT1 idle-wait, verify), not just
+the render frame; it is not "the render pipe was busy X‰ of the time". And the **L3 rung
+prints its own line under the `[v3d48]` tag**, not `[v3d64]`: `submit_bisect_rung_at`
+hard-labels its CL decode, Mesa diff and `wait_fldone` witnesses `v3d48 bisect` for every
+caller. Readers who count rungs by tag will see one extra `[v3d48]` rung on a
+`UNAOS_V3D_DEEP` boot; it belongs to this battery.
+
 Every slot is reported as a **permille ratio against `src32`'s delta on its own leg**.
 That is the whole point: a ratio held constant across three legs of wildly different
 duration and workload is a strong statement about what a mux is derived from — and one
@@ -2396,10 +2405,24 @@ one of four **behaviour classes**:
 
 | Class | Condition | Reading |
 |---|---|---|
-| `CLOCK-LIKE` | permille within `[900, 1100]` of `src32` on **every** valid leg, pure idle included | derived from the core clock, not from work |
-| `WORK-GATED-RENDER` | moved on L2 only; flat on L1 and L3 | gated on real render work |
+| `CLOCK-LIKE` | permille within `[900, 1100]` of `src32` on **every** valid leg, no overflow anywhere, **and L1 valid** | derived from the core clock, not from work |
+| `WORK-GATED-RENDER` | moved on L2 only; flat on L1 and L3, **and L1 valid** | gated on real render work |
 | `SILENT` | zero on every valid leg, **overflow included** | idle, a retiring render frame and a bin kick all left it flat |
+| `OTHER (RATIO UNUSABLE)` | moved, but latched an **overflow** on some valid leg | the raw value is a wrapped residue, so the permille is not a ratio and the slot is never band-tested; shorten the leg or re-measure |
+| `OTHER (IDLE-BLIND)` | would have been CLOCK-LIKE or WORK-GATED-RENDER, but **L1 was invalid** | the differential stands; the idle claim does not |
 | `OTHER` | moves, but neither 1:1 with `src32` nor render-only | read the per-leg permille: a ratio *held constant* across legs is clock-derived at that divisor; a ratio that *varies* is work-correlated |
+
+Two guards the table depends on. **Overflow disqualifies the ratio, it does not just flag
+it**: a wrapped `u32` is a residue rather than a delta, and a mux that wrapped once and
+landed inside the ±10% window would otherwise be published as CLOCK-LIKE off a truncated
+count — so any latched overflow on a valid leg forces `OTHER (RATIO UNUSABLE)` and the
+band test is never applied. And **both idle-asserting classes require L1 to be valid**.
+`CLOCK-LIKE` and `WORK-GATED-RENDER` each make a claim *about the idle leg* ("no work
+exists to gate on", "flat on idle"), and two valid legs out of three does not guarantee
+L1 is one of them. An invalid L1 is in fact the plausible failure here: `src32`
+`CYCLE_COUNT` reading zero across a pure-idle window is exactly what an activity-gated
+core clock would do. When L1 drops out the slot falls through to `OTHER (IDLE-BLIND)`,
+whose wording claims nothing about idle.
 
 A leg counts as a measurement only if **its own `src32` control moved**; a leg whose
 control read zero is INCONCLUSIVE, never "silent". Fewer than two valid legs ⇒ the whole

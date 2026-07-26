@@ -6852,7 +6852,17 @@ impl V3d64Leg {
             None => false,
         }
     }
-    /// This slot as permille of the leg's own src32 delta — the leg-independent quantity.
+    /// Did THIS slot latch an overflow on this leg? A wrapped counter's raw u32 is a residue, not a
+    /// delta, so its permille is meaningless and must never be band-tested (a mux that wrapped once and
+    /// landed inside the ±10% window would otherwise be classified CLOCK-LIKE off a truncated value).
+    fn ovf_i(&self, i: usize) -> bool {
+        match self.ctr {
+            Some(c) => c.ovf & (1 << v3d63_slot(i)) != 0,
+            None => false,
+        }
+    }
+    /// This slot as permille of the leg's own src32 delta — the leg-independent quantity. Valid ONLY
+    /// when `ovf_i` is clear; see there.
     fn permille(&self, i: usize) -> u64 {
         match self.ctr {
             Some(c) if c.ctrl() != 0 => (self.raw(i) as u64 * 1000) / c.ctrl() as u64,
@@ -6876,24 +6886,22 @@ impl V3d64Leg {
 /// PI-V3D-64 — classify one swept source id by BEHAVIOUR across the legs. No name is claimed, and none
 /// can be: the return value describes how a mux responded to known work, nothing about what it counts.
 fn v3d64_classify(legs: &[V3d64Leg; 3], i: usize) -> &'static str {
-    let mut valid_n = 0usize;
-    let mut k = 0usize;
-    while k < legs.len() {
-        if legs[k].valid() {
-            valid_n += 1;
-        }
-        k += 1;
-    }
-    if valid_n < 2 {
-        return "INCONCLUSIVE — fewer than two legs carried a live src32 control, so there is no differential to classify against. Not a class; instrument first";
-    }
+    // The caller has already guaranteed at least two valid legs (it prints `muxcal INCONCLUSIVE` and
+    // returns otherwise), so there is no under-populated case to handle here.
     let mut any_moved = false;
     let mut clocklike = true;
-    k = 0;
+    let mut wrapped = false;
+    let mut k = 0usize;
     while k < legs.len() {
         if legs[k].valid() {
             if legs[k].moved_i(i) {
                 any_moved = true;
+            }
+            // A wrapped slot's raw value is a residue: band-testing it would manufacture a CLOCK-LIKE
+            // verdict out of a truncated count. Overflow anywhere disqualifies the ratio outright.
+            if legs[k].ovf_i(i) {
+                wrapped = true;
+                clocklike = false;
             }
             let p = legs[k].permille(i);
             if !(V3D64_CLOCK_LO..=V3D64_CLOCK_HI).contains(&p) {
@@ -6905,11 +6913,19 @@ fn v3d64_classify(legs: &[V3d64Leg; 3], i: usize) -> &'static str {
     if !any_moved {
         return "SILENT — zero on every valid leg, overflow included: idle, a retiring render frame and a bin kick all left it flat";
     }
-    if clocklike {
-        return "CLOCK-LIKE — within tolerance of 1:1 with src32 CYCLE_COUNT on EVERY valid leg, including pure idle where no work exists to gate on. Derived from the core clock, not from work";
+    if wrapped {
+        return "OTHER (RATIO UNUSABLE) — this slot latched an OVERFLOW on at least one valid leg, so its raw value is a wrapped residue and its permille is not a ratio. It moved; it is explicitly NOT band-tested against src32 and CANNOT be classified CLOCK-LIKE from this boot. Shorten the leg or widen the counter and re-measure";
+    }
+    // CLOCK-LIKE and WORK-GATED-RENDER both make a claim ABOUT THE IDLE LEG ("no work exists to gate
+    // on" / "flat on idle"). Neither may be asserted when L1 dropped out — and an invalid L1 is the
+    // PLAUSIBLE failure here, since src32 CYCLE_COUNT reading zero in pure idle is exactly what an
+    // activity-gated clock would do. With L1 invalid the differential is real but idle-blind, so the
+    // slot falls through to OTHER, whose wording claims nothing about idle.
+    if clocklike && legs[0].valid() {
+        return "CLOCK-LIKE — within tolerance of 1:1 with src32 CYCLE_COUNT on EVERY valid leg, INCLUDING the pure-idle leg where no work exists to gate on. Derived from the core clock, not from work";
     }
     // Render-gated: moved on L2 (the retiring CT1 job) and on no other valid leg.
-    if legs[1].valid() && legs[1].moved_i(i) {
+    if legs[0].valid() && legs[1].valid() && legs[1].moved_i(i) {
         let mut only_render = true;
         k = 0;
         while k < legs.len() {
@@ -6919,8 +6935,11 @@ fn v3d64_classify(legs: &[V3d64Leg; 3], i: usize) -> &'static str {
             k += 1;
         }
         if only_render {
-            return "WORK-GATED-RENDER — moved ONLY on the retiring CT1 render leg, flat on idle and on the bin kick. Gated on real render work";
+            return "WORK-GATED-RENDER — moved ONLY on the retiring CT1 render leg, flat on the pure-idle leg and on the bin kick. Gated on real render work";
         }
+    }
+    if !legs[0].valid() && (clocklike || (legs[1].valid() && legs[1].moved_i(i))) {
+        return "OTHER (IDLE-BLIND) — the L1 idle leg carried no live src32 control, so this boot cannot say whether the mux runs with no work present. The cross-leg differential stands, but neither CLOCK-LIKE nor WORK-GATED-RENDER may be asserted without the idle leg; re-measure with a valid L1";
     }
     "OTHER — it moves, but neither 1:1 with src32 nor render-only. Read the per-leg permille above: a ratio HELD CONSTANT across legs is clock-derived at that divisor, a ratio that VARIES is work-correlated"
 }
