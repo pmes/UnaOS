@@ -164,6 +164,26 @@ impl TransferRing {
         }
     }
 
+    /// The value an xHCI **Set TR Dequeue Pointer** command (xHCI 1.2 §4.6.10 / §6.4.3.9) needs
+    /// to resynchronize the controller's dequeue pointer with THIS ring's enqueue pointer: the
+    /// physical address of the next slot the driver will `push` into, OR'd with the ring's current
+    /// cycle bit as DCS (Dequeue Cycle State).
+    ///
+    /// BOT error recovery uses it after a failed stage: the controller's dequeue pointer is then
+    /// parked somewhere behind the enqueue pointer, with one or more stranded TRBs (a queued CBW /
+    /// data / CSW the transaction never retired) between them. Restarting the endpoint without
+    /// moving the dequeue pointer would re-execute those stranded TRBs against a device that has
+    /// just been reset — the desynchronisation the recovery exists to end. Pointing the controller
+    /// at the enqueue slot discards exactly the stranded TRBs and nothing else.
+    ///
+    /// If the enqueue index is the ring's last slot, the next `push` writes a Link TRB there; the
+    /// controller reads it, follows it to index 0 and toggles its cycle — so pointing at that slot
+    /// is still correct and needs no special case.
+    pub fn enqueue_ptr_dcs(&self) -> u64 {
+        let dcs = if self.cycle_bit { 1u64 } else { 0u64 };
+        (self.get_ptr() + (self.enqueue_index as u64) * 16) | dcs
+    }
+
     /// Overwrite the TRB at `phys` IN PLACE with a Command No-Op (TRB type 23), preserving
     /// its cycle bit. Command-abort recovery: after CRCR.CA stops the ring, the controller's
     /// dequeue pointer still references the aborted command, and restarting the ring would

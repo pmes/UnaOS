@@ -82,6 +82,15 @@ mtraw_inject = ["mtraw"]
 # lands behind this knob until an attended 2012 bench confirms. x86_64 only. Enable via
 # `UNAOS_IRQSTORAGE=1`. See unaos/docs/dev/OS/07_USB_STORAGE/x86_interrupt_storage.md.
 irqstorage = []
+# BOT-RECOVER test hook: deterministic, ONE-SHOT synthetic Bulk-Only Transport failure, injected at
+# the CSW stage of the first WRITE(10). QEMU never times out a BOT transfer, so without this knob the
+# BOT Reset Recovery path (drivers/xhci/mod.rs::bot_recover) is metal-only and untestable in the
+# regression suite. With it, a headless run exercises the whole sequence — Bulk-Only Mass Storage
+# Reset, CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints, Stop/Reset Endpoint + Set TR Dequeue
+# Pointer, and the one bounded retry — against a device genuinely left parked in its CSW phase.
+# ATTENDED/TEST ONLY: never enable on boot media. Default OFF => byte-identical (fully cfg-compiled
+# out). Enable via `UNAOS_BOTFAULT=1`.
+botfaultinject = []
 # VPERF video-path bench instrumentation (x86_64 only — the module is additionally target-gated,
 # so aarch64 artifacts are byte-identical with this on or off): scroll/VRAM-read/put_pixel
 # counters + serial-only cadence lines, the effective framebuffer memory-type readout (MTRR +

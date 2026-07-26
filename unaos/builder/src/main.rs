@@ -59,6 +59,9 @@ fn main() {
     // (STOR-1) instead of the staged-buffer path. x86_64 only; a no-op on the aarch64 media the arroyo
     // script builds. Metal-pending, so it stays opt-in.
     if std::env::var("UNAOS_IRQSTORAGE").is_ok() { feats.push("irqstorage"); }
+    // UNAOS_BOTFAULT=1 injects ONE synthetic BOT failure (first WRITE(10), CSW stage) so the headless
+    // suite exercises the xHCI BOT Reset Recovery path. Test-only; never on boot media.
+    if std::env::var("UNAOS_BOTFAULT").is_ok() { feats.push("botfaultinject"); }
     // VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem readout,
     // display-BAR probe, scripted scroll scenario). x86_64-only module; default OFF.
     if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }

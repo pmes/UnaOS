@@ -1502,9 +1502,10 @@ the sitting having logged this as a **reseat watch-item**. No driver-side cause
 for the delete-behind-hub failure was found; the honest landing is
 **instrumentation + the two bound conversions below**, not a speculative fix.
 
-### Known gap, deliberately not closed here
+### Known gap — CLOSED by §11a below
 
-There is **no BOT error recovery**. `run_bot_stage` returns `Err` on a timeout and
+*(Historical statement of the gap, kept because §11a is its answer.)*
+There was **no BOT error recovery**. `run_bot_stage` returns `Err` on a timeout and
 nothing resets the endpoint (no Reset Endpoint / Set TR Dequeue, no Bulk-Only Mass
 Storage Reset, no CLEAR_FEATURE(ENDPOINT_HALT)), and `block.rs` does not retry. A
 single marginal timeout is therefore **terminal and desynchronising**: the stage's
@@ -1512,8 +1513,8 @@ TRB stays queued, the device is left mid-BOT, and later transactions see tag
 mismatches. That plausibly turns *one* hiccup behind a hub into a whole failing
 delete family. Closing it needs Reset-Endpoint + Set-TR-Dequeue plumbing that
 **no gate in this repo can exercise** (QEMU never times out — `timeouts=0` in every
-run above), so it is recorded here as the next storage arc rather than landed
-blind.
+run above), so it was recorded as the next storage arc rather than landed
+blind. **That arc is §11a.**
 
 ### Changes
 
@@ -1554,6 +1555,111 @@ on record.
 `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo test 200` 0 FAIL. `UNAOS_HUBSTORAGE=1
 ./arroyo test-fat sf 300` 0 FAIL, `U10d` + `U11m2` both PASS behind the hub.
 `./arroyo test-arm 120` 0 FAIL.
+
+---
+
+## 11a. BOT-RECOVER — Reset Recovery and one bounded retry
+
+The gap §11 recorded, closed. `bot_transfer` is now a thin wrapper: it runs the
+transaction once (`bot_transfer_once` — the unchanged CBW -> [DATA] -> CSW body), and
+on **any** failure other than `NoDevice` it runs Reset Recovery and retries the
+transaction **exactly once**. Recovery failure falls through to the pre-existing
+terminal `Err`, semantics unchanged.
+
+### The sequence (spec-cited)
+
+| # | Step | Citation |
+|---|------|----------|
+| 1 | **Bulk-Only Mass Storage Reset** — bmRequestType `0x21` (host->device, class, interface), bRequest `0xFF`, wValue 0, wIndex = `bInterfaceNumber` of the MSC interface, wLength 0. Returns the *device's* Bulk-Only state machine to "ready for CBW". | USB MSC **Bulk-Only Transport 1.0 §3.1**; invoked as part of Reset Recovery, **§5.3.3** |
+| 2 | **CLEAR_FEATURE(ENDPOINT_HALT)** on the bulk-IN and bulk-OUT endpoints — bmRequestType `0x02`, bRequest `0x01`, wValue 0 (`ENDPOINT_HALT`), wIndex = endpoint address. §3.1 explicitly does *not* clear the halts, which is why this is a separate step; it also resets the device-side data toggle. | **BOT 1.0 §5.3.3** steps 2-3, **§5.3.4** (stall handling); **USB 2.0 §9.4.1** |
+| 3 | **Stop Endpoint** (Running) or **Reset Endpoint** (Halted/Error) per bulk endpoint, then **Set TR Dequeue Pointer** to the driver's own enqueue pointer. | **xHCI 1.2 §4.6.9 / §4.6.8 / §4.6.10**; EP State read from the output Endpoint Context dword 0 bits 2:0, **§6.2.3** |
+
+Step 3 is not optional garnish: the USB-level reset in steps 1-2 is **invisible to the
+host controller**. Its endpoint contexts are still Halted or Running and its dequeue
+pointers still sit on the stranded TRBs of the failed transaction, so without it the
+retry would either be swallowed (a Halted EP ignores the doorbell) or would replay the
+stranded CBW/data/CSW at a device that has just been reset. The EP-state read exists
+because both commands are legal only from particular states — issued blind they return
+Context State Error (code 19). A plain timeout — the metal failure mode this targets —
+leaves the endpoint **Running**, so it takes the Stop-Endpoint arm, not the Reset arm.
+`TransferRing::enqueue_ptr_dcs()` supplies the new dequeue pointer with the ring's
+current cycle bit as DCS, restoring `controller-dequeue == driver-enqueue`.
+
+Every step is one bounded `sync_control` / `run_command_sync`. There is **no loop
+anywhere** in the recovery, and the retry count is a hard 1. `bot_recover` never calls
+`bot_transfer`, so recursion is structurally impossible.
+
+### Why retrying a WRITE is safe for FAT
+
+The retry is at the **CBW boundary**: `bot_transfer_once` rebuilds the CBW with a fresh
+`dCBWTag` and re-issues the identical CDB against the identical DMA buffer.
+
+- READ(10) is trivially idempotent.
+- WRITE(10) re-sends the **same bytes** from the **same** `scsi_data_buffer` to the
+  **same** LBA. `block.rs::write_block` stages the caller's buffer into that DMA buffer
+  and then calls `storage_write10`; the FAT layer's single-sector read-modify-writes
+  merge into that staged sector *before* the first attempt. Nothing between the two
+  attempts re-reads the media or re-derives content, so both attempts are byte-identical
+  whole-sector writes. Repeating an identical whole-sector write is idempotent by
+  construction — the hazard a naive retry would introduce (a partially applied write,
+  then a retry recomputed from the now-changed media) cannot arise here.
+
+The retry seam is therefore **inside** `bot_transfer`, not in `block.rs`: that is the
+only layer where the whole-CBW idempotence argument holds. `block.rs` is unchanged.
+
+### Fault injection (`UNAOS_BOTFAULT=1`)
+
+QEMU never times out a BOT transfer (`timeouts=0` in every run), so the recovery path
+would otherwise be metal-only and unexercised. The `botfaultinject` feature injects
+**exactly one** synthetic failure: at the CSW stage of the **first WRITE(10)**
+(deterministic — after storage bring-up and after the FAT mount). The data stage really
+lands first, so the device is genuinely left parked in its CSW phase with a stale CSW
+pending. That makes the run a real assertion rather than a smoke test: had Reset
+Recovery *not* resynchronised the device, the retry's fresh CBW would collect the stale
+CSW and fail on the tag mismatch. Default OFF and fully `#[cfg]`-compiled out —
+knob-off media are byte-identical. **Test-only; never on boot media.**
+
+### Changes
+
+- `bot_transfer` split into a recovery/retry wrapper + `bot_transfer_once`
+  (`drivers/xhci/mod.rs`).
+- `bot_recover` + `resync_bulk_ep` (`drivers/xhci/mod.rs`) — the sequence above.
+- `DeviceSlot::msc_intf` — `bInterfaceNumber` of the MSC interface, recorded on both the
+  root-port and hub-downstream discovery paths (`parse_msc_config` now returns it). It is
+  the `wIndex` of the class reset; recovery is not issuable without it.
+- `TransferRing::enqueue_ptr_dcs()` (`drivers/xhci/ring.rs`) — the Set TR Dequeue value.
+- `BOT_RECOVER_COUNT` / `BOT_RECOVER_OK` / `BOT_RETRY_OK` / `BOT_RETRY_FAIL` counters, so
+  metal can read recovery **frequency** and not just presence.
+- `botfaultinject` feature + `UNAOS_BOTFAULT` knob (`arroyo`, `builder`, kernel
+  `Cargo.toml`).
+
+### Witnesses
+
+```
+:: BOT: recover begin cause=… slot=… ep=…/… iface=… n=… ::
+:: BOT: recover done reset=ok|fail halts=cleared|fail ring=resync|fail ::
+:: BOT: retry result=pass|fail … recoveries=… retry_ok=… retry_fail=… ::
+:: BOT: fault-inject synthetic CSW-stage failure (slot …, once) ::   (UNAOS_BOTFAULT only)
+```
+
+Quiet boot: **zero** of these lines when nothing fails — all four are printed only from
+the failure path, and the counters stay at 0, so any non-zero reading is itself the
+finding.
+
+### What metal must verify
+
+1. Re-run the delete family behind the hub on the 2012 rMBP. If a `:: BOT: recover
+   begin ::` appears at all, the standing watch-item finally has a *cause* line — and if
+   it is followed by `recover done reset=ok halts=cleared ring=resync` +
+   `retry result=pass`, the hiccup was survived instead of cascading.
+2. Confirm the **Stop-Endpoint** arm is what a real timeout takes (EP State 1 = Running,
+   not 2 = Halted). Only metal can produce a real timeout.
+3. Confirm a real device accepts the Bulk-Only Mass Storage Reset on its reported
+   interface number (`iface=` in the begin witness) — QEMU's `usb-storage` accepts it on
+   interface 0; the rMBP's hubbed SD reader is the case that matters.
+4. Confirm the recovery's own control transfers do not themselves time out on a device
+   that is already sick (worst case adds ~3 EP0 budgets + 4 command budgets before the
+   terminal `Err` — bounded, but slower to fail than before).
 
 ---
 

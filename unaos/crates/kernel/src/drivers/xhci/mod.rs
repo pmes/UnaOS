@@ -419,6 +419,8 @@ pub static mut ERST_TABLE: ErstTable = ErstTable { entries: [ErstEntry { ring_ad
 static mut EVENT_RING_PHYS_BASE: u64 = 0;
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "botfaultinject")]
+use core::sync::atomic::AtomicBool;
 
 // --- Interrupt-driven xHCI (MSI-X via the local APIC) ---
 // These let the interrupt handler acknowledge the interrupter using ONLY raw MMIO and
@@ -455,6 +457,35 @@ pub static BOT_PUMP_BUDGET: AtomicU64 = AtomicU64::new(0);
 /// The peak last PRINTED as a `:: BOT: … result=OK ::` witness — the throttle reference, so a peak
 /// that creeps up in small steps still gets reported once it has doubled overall.
 static BOT_PUMP_REPORTED: AtomicU64 = AtomicU64::new(0);
+
+// --- BOT error recovery (USB Mass Storage Bulk-Only Transport 1.0 §5.3.3/§5.3.4, "Reset
+// Recovery") ---
+//
+// Until this arc there was NO error recovery anywhere on the BOT path: a failed stage returned
+// `Err`, nothing reset the endpoint or the device, and `block.rs` did not retry — so ONE marginal
+// timeout was terminal AND left the device desynchronised (its own state machine still parked in a
+// data or CSW phase, with the host's next CBW landing where a CSW was expected). These counters make
+// the frequency of recovery visible on metal; they stay at zero on a clean boot, so a non-zero
+// reading is itself the finding.
+/// Recovery sequences ATTEMPTED (one per failed BOT transaction that was eligible for recovery).
+pub static BOT_RECOVER_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Recovery sequences that completed every step successfully (and therefore earned the one retry).
+pub static BOT_RECOVER_OK: AtomicU64 = AtomicU64::new(0);
+/// Post-recovery retries that SUCCEEDED — i.e. transactions this arc rescued from a terminal error.
+pub static BOT_RETRY_OK: AtomicU64 = AtomicU64::new(0);
+/// Post-recovery retries that failed anyway (the caller still sees the terminal `Err`).
+pub static BOT_RETRY_FAIL: AtomicU64 = AtomicU64::new(0);
+
+/// Test-only deterministic fault injection (`UNAOS_BOTFAULT=1` -> feature `botfaultinject`).
+/// QEMU never times out a BOT transfer, so without this the recovery path is metal-only. Fires
+/// EXACTLY ONCE, on the first BOT transaction with an OUT data stage (a WRITE(10) — after storage
+/// bring-up and after the FAT mount, so the injection point is deterministic) and at the moment the
+/// CSW would be read: the data stage really lands, so the device is genuinely left parked in its CSW
+/// phase with a stale CSW pending. That makes the test a real assertion rather than a smoke test —
+/// if Reset Recovery did NOT resynchronise the device, the retry's fresh CBW would collect the stale
+/// CSW and fail on the tag mismatch.
+#[cfg(feature = "botfaultinject")]
+static BOT_FAULT_FIRED: AtomicBool = AtomicBool::new(false);
 
 /// Acknowledge an xHCI interrupt at the hardware level so the interrupter can raise again.
 /// Safe to call from interrupt context: it takes NO locks and does NO allocation — it clears
@@ -760,6 +791,11 @@ pub struct DeviceSlot {
     pub scsi_data_buffer: Option<*mut u8>, // data-stage buffer (>= one block)
     pub bulk_in_ep: u8,                    // bulk IN endpoint address (e.g. 0x81)
     pub bulk_out_ep: u8,                   // bulk OUT endpoint address (e.g. 0x02)
+    /// bInterfaceNumber of the Mass Storage (class 0x08) interface. This is the `wIndex` of the
+    /// Bulk-Only Mass Storage Reset class request (USB MSC Bulk-Only Transport 1.0 §3.1), so BOT
+    /// error recovery cannot be issued without it. 0 for non-storage slots (and the common
+    /// single-interface storage device legitimately uses interface 0).
+    pub msc_intf: u8,
 
     // --- XENUM-2: hub Status Change Endpoint (hot-plug behind a hub) ---
     /// True once this slot has been marked as a USB hub (set in `set_hub_slot_context`). Lets the
@@ -831,6 +867,7 @@ impl DeviceSlot {
             scsi_data_buffer: None,
             bulk_in_ep: 0,
             bulk_out_ep: 0,
+            msc_intf: 0,
             is_hub: false,
             hub_nbr_ports: 0,
             hub_int_ep: 0,
@@ -896,6 +933,7 @@ impl DeviceSlot {
         self.route_depth = 0;
         self.bulk_in_ep = 0;
         self.bulk_out_ep = 0;
+        self.msc_intf = 0;
     }
 }
 
@@ -1837,6 +1875,10 @@ impl XhciController {
                                         // Mass-storage tracking: collect the bulk IN/OUT
                                         // endpoints during the walk, configure once after.
                                         let mut is_mass_storage = false;
+                                        // bInterfaceNumber of the MSC interface — the `wIndex` of the
+                                        // Bulk-Only Mass Storage Reset (BOT 1.0 §3.1) that BOT error
+                                        // recovery issues. Recorded onto the slot with the endpoints.
+                                        let mut msc_intf: u8 = 0;
                                         // U2.5: FTDI FT232 tracking — its vendor-specific interface
                                         // (class 0xFF) carries the same bulk IN/OUT pair as MSC, so it
                                         // reuses the bulk-collection arm below.
@@ -1865,6 +1907,7 @@ impl XhciController {
                                                     // collect its bulk endpoints below and configure after the walk.
                                                     serial_println!("xHCI: >>> MASS STORAGE INTERFACE DETECTED (Class 0x08) <<<");
                                                     is_mass_storage = true;
+                                                    msc_intf = desc_data[offset + 2];
                                                 } else if current_intf_class == 0xFF {
                                                     // U2.5: a vendor-specific interface. The FTDI FT232 (device
                                                     // class 0x00 → Composite branch) exposes exactly one such
@@ -1913,6 +1956,7 @@ impl XhciController {
                                         if is_mass_storage {
                                             match (bulk_in, bulk_out) {
                                                 (Some((ia, im)), Some((oa, om))) => {
+                                                    self.slots[slot_id as usize].msc_intf = msc_intf;
                                                     self.configuring_slot = slot_id as u8;
                                                     self.configure_endpoints(slot_id as u8, ia, im, oa, om);
                                                 }
@@ -3531,10 +3575,195 @@ impl XhciController {
         }
     }
 
-    /// Execute a synchronous Bulk-Only Transport transaction: CBW -> (optional data) -> CSW.
-    /// MUST be called from a non-event context (controller lock held, event ring free) such
-    /// as the main loop or a shell command — never from inside handle_event_trb.
+    /// Execute a synchronous Bulk-Only Transport transaction, with ONE bounded Reset Recovery +
+    /// retry on failure (USB Mass Storage Class Bulk-Only Transport 1.0 §5.3.3 "Reset Recovery",
+    /// §5.3.4 "Stall Handling", §6.6.1 "CSW Not Valid"). MUST be called from a non-event context
+    /// (controller lock held, event ring free) such as the main loop or a shell command — never from
+    /// inside handle_event_trb.
+    ///
+    /// The retry re-runs the WHOLE transaction (`bot_transfer_once` rebuilds the CBW with a FRESH
+    /// dCBWTag and re-sends the identical CDB against the identical DMA buffer), which is what makes
+    /// it safe for the FAT layer:
+    ///   * READ(10) is trivially idempotent.
+    ///   * WRITE(10) is retried at the CBW boundary, so a retry writes the SAME sector with the SAME
+    ///     bytes from the SAME `scsi_data_buffer` the caller staged before the first attempt. The
+    ///     FAT layer's single-sector read-modify-writes stage the merged sector into that buffer and
+    ///     then call `storage_write10`; nothing between the two attempts re-reads or re-derives the
+    ///     content, so both attempts are byte-identical writes to one LBA. Repeating an identical
+    ///     whole-sector write is idempotent by construction — the failure mode a naive retry would
+    ///     introduce (a partially applied write followed by a retry recomputed from the now-changed
+    ///     media) cannot arise, because the retry never recomputes anything.
+    /// Recovery is skipped for `NoDevice` (there is nothing to reset) and, being bounded to exactly
+    /// one attempt, cannot loop: `bot_recover` itself uses only EP0 control transfers and command-ring
+    /// commands, never `bot_transfer`.
     pub fn bot_transfer(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32, dir: Direction)
+        -> Result<BotResult, BotError>
+    {
+        let first = self.bot_transfer_once(slot_id, cdb, data_phys, data_len, dir);
+        let cause = match first {
+            Ok(r) => return Ok(r),
+            Err(BotError::NoDevice) => return Err(BotError::NoDevice),
+            Err(e) => e,
+        };
+        if !self.bot_recover(slot_id, cause) {
+            // Recovery failed: the pre-existing terminal Err path, semantics unchanged.
+            return Err(cause);
+        }
+        let again = self.bot_transfer_once(slot_id, cdb, data_phys, data_len, dir);
+        match &again {
+            Ok(r) => {
+                BOT_RETRY_OK.fetch_add(1, Ordering::Relaxed);
+                serial_println!(
+                    ":: BOT: retry result=pass status={:?} residue={} recoveries={} retry_ok={} retry_fail={} ::",
+                    r.status, r.residue, BOT_RECOVER_COUNT.load(Ordering::Relaxed),
+                    BOT_RETRY_OK.load(Ordering::Relaxed), BOT_RETRY_FAIL.load(Ordering::Relaxed));
+            }
+            Err(e) => {
+                BOT_RETRY_FAIL.fetch_add(1, Ordering::Relaxed);
+                serial_println!(
+                    ":: BOT: retry result=fail err={:?} recoveries={} retry_ok={} retry_fail={} ::",
+                    e, BOT_RECOVER_COUNT.load(Ordering::Relaxed),
+                    BOT_RETRY_OK.load(Ordering::Relaxed), BOT_RETRY_FAIL.load(Ordering::Relaxed));
+            }
+        }
+        again
+    }
+
+    /// Bulk-Only Transport **Reset Recovery** for `slot_id` (MSC BOT 1.0 §5.3.3), plus the xHCI-side
+    /// hygiene the controller needs before the endpoints can be used again. Returns true only if
+    /// EVERY step succeeded — the caller retries only then, so a half-recovered device is never
+    /// driven further.
+    ///
+    /// Steps, in the spec's order:
+    ///  1. **Bulk-Only Mass Storage Reset** (BOT 1.0 §3.1): class request, bmRequestType 0x21
+    ///     (host->device, class, interface), bRequest 0xFF, wValue 0, wIndex = bInterfaceNumber of
+    ///     the mass-storage interface, wLength 0. This returns the DEVICE's Bulk-Only state machine
+    ///     to the "ready for CBW" state — the step that ends the desynchronisation. Per §3.1 it does
+    ///     NOT clear the endpoint halts, which is why step 2 exists.
+    ///  2. **CLEAR_FEATURE(ENDPOINT_HALT)** on both bulk endpoints (USB 2.0 §9.4.1, feature selector
+    ///     ENDPOINT_HALT = 0; BOT 1.0 §5.3.3 steps 2 and 3): bmRequestType 0x02 (host->device,
+    ///     standard, endpoint), bRequest 0x01, wValue 0, wIndex = endpoint ADDRESS (direction bit
+    ///     included). This also resets the endpoint's data toggle / sequence number device-side.
+    ///  3. **xHCI hygiene** (xHCI 1.2 §4.6.8 Reset Endpoint, §4.6.9 Stop Endpoint, §4.6.10 Set TR
+    ///     Dequeue Pointer) per bulk endpoint — see `resync_bulk_ep`. The USB-level reset above is
+    ///     invisible to the host controller: its endpoint contexts are still Halted or Running, and
+    ///     its dequeue pointers still sit on the stranded TRBs of the failed transaction. Without
+    ///     this the retry would either be refused (a Halted EP ignores the doorbell) or would replay
+    ///     the stranded CBW/data/CSW at a device that has just been reset.
+    fn bot_recover(&mut self, slot_id: u8, cause: BotError) -> bool {
+        let (in_ep, out_ep, iface) = {
+            let slot = &self.slots[slot_id as usize];
+            (slot.bulk_in_ep, slot.bulk_out_ep, slot.msc_intf)
+        };
+        if in_ep == 0 || out_ep == 0 {
+            return false;
+        }
+        let in_dci = ((in_ep & 0x0F) * 2) + 1;
+        let out_dci = (out_ep & 0x0F) * 2;
+        BOT_RECOVER_COUNT.fetch_add(1, Ordering::Relaxed);
+        serial_println!(
+            ":: BOT: recover begin cause={:?} slot={} ep={:#x}/{:#x} iface={} n={} ::",
+            cause, slot_id, in_ep, out_ep, iface, BOT_RECOVER_COUNT.load(Ordering::Relaxed));
+
+        // Any half-armed pending stage from the failed transaction must not be matched against an
+        // event raised during recovery's own control transfers.
+        self.bot_pending = None;
+
+        // 1. Bulk-Only Mass Storage Reset (BOT 1.0 §3.1).
+        let reset_ok = matches!(self.sync_control(slot_id, 0x21, 0xFF, 0, iface as u16, 0, 0, false), Ok(1));
+
+        // 2. CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints (USB 2.0 §9.4.1).
+        let in_clear = matches!(self.sync_control(slot_id, 0x02, 0x01, 0x0000, in_ep as u16, 0, 0, false), Ok(1));
+        let out_clear = matches!(self.sync_control(slot_id, 0x02, 0x01, 0x0000, out_ep as u16, 0, 0, false), Ok(1));
+        let halts_ok = in_clear && out_clear;
+
+        // 3. xHCI-side endpoint + ring resynchronisation.
+        let in_ring = self.resync_bulk_ep(slot_id, in_dci, true);
+        let out_ring = self.resync_bulk_ep(slot_id, out_dci, false);
+        let ring_ok = in_ring && out_ring;
+
+        serial_println!(
+            ":: BOT: recover done reset={} halts={} ring={} ::",
+            if reset_ok { "ok" } else { "fail" },
+            if halts_ok { "cleared" } else { "fail" },
+            if ring_ok { "resync" } else { "fail" });
+
+        let ok = reset_ok && halts_ok && ring_ok;
+        if ok {
+            BOT_RECOVER_OK.fetch_add(1, Ordering::Relaxed);
+        }
+        ok
+    }
+
+    /// Bring ONE bulk endpoint back to a usable, resynchronised state after a failed BOT stage.
+    ///
+    /// Reads the endpoint's current EP State from the OUTPUT device context (xHCI 1.2 §6.2.3,
+    /// Endpoint Context dword 0 bits 2:0; 0=Disabled 1=Running 2=Halted 3=Stopped 4=Error), because
+    /// both commands below are legal only from particular states and issuing them blind returns
+    /// Context State Error (completion code 19):
+    ///   * Halted (or Error) -> **Reset Endpoint** (§4.6.8) transitions it to Stopped.
+    ///   * Running -> **Stop Endpoint** (§4.6.9) transitions it to Stopped. A plain timeout (the
+    ///     metal failure mode this arc targets) leaves the endpoint Running with a TD still in
+    ///     flight, so this arm — not the Reset arm — is the one a timeout takes.
+    ///   * Already Stopped -> neither command is needed.
+    /// Then **Set TR Dequeue Pointer** (§4.6.10, legal from Stopped/Error) moves the controller's
+    /// dequeue pointer to the driver's enqueue pointer, discarding the stranded TRBs of the failed
+    /// transaction and restoring the invariant that controller-dequeue == driver-enqueue on an idle
+    /// ring. Every step is a single bounded `run_command_sync`; there is no loop.
+    fn resync_bulk_ep(&mut self, slot_id: u8, dci: u8, is_in: bool) -> bool {
+        let ep_state = {
+            let oc = self.slots[slot_id as usize].output_context;
+            if oc.is_null() {
+                return false;
+            }
+            unsafe { core::ptr::read_volatile((oc as *const u32).add(dci as usize * CTX_WORDS)) & 0x7 }
+        };
+        let ctx = ((dci as u32) << 16) | ((slot_id as u32) << 24);
+        match ep_state {
+            2 | 4 => {
+                // Reset Endpoint (TRB type 14). TSP left 0: the device-side toggle was already
+                // reset by CLEAR_FEATURE(ENDPOINT_HALT) above, so the controller must reset its own.
+                if !matches!(self.run_command_sync(Trb { parameter: 0, status: 0, control: (14 << 10) | ctx }), Ok((1, _))) {
+                    serial_println!("xHCI: BOT recover: Reset Endpoint failed (slot {} dci {})", slot_id, dci);
+                    return false;
+                }
+            }
+            1 => {
+                // Stop Endpoint (TRB type 15).
+                if !matches!(self.run_command_sync(Trb { parameter: 0, status: 0, control: (15 << 10) | ctx }), Ok((1, _))) {
+                    serial_println!("xHCI: BOT recover: Stop Endpoint failed (slot {} dci {})", slot_id, dci);
+                    return false;
+                }
+            }
+            3 => {}
+            _ => {
+                serial_println!("xHCI: BOT recover: endpoint unusable (slot {} dci {} state {})", slot_id, dci, ep_state);
+                return false;
+            }
+        }
+        // Drain any Transfer Events the stop/reset produced (a stopped TD posts one) so they cannot
+        // be mistaken for the retry's completion.
+        while self.drain_event_ring_once() {}
+
+        let deq = {
+            let slot = &self.slots[slot_id as usize];
+            let ring = if is_in { slot.bulk_in_ring.as_ref() } else { slot.bulk_out_ring.as_ref() };
+            match ring {
+                Some(r) => r.enqueue_ptr_dcs(),
+                None => return false,
+            }
+        };
+        // Set TR Dequeue Pointer (TRB type 16); Stream ID 0 for a non-streaming bulk endpoint.
+        if !matches!(self.run_command_sync(Trb { parameter: deq, status: 0, control: (16 << 10) | ctx }), Ok((1, _))) {
+            serial_println!("xHCI: BOT recover: Set TR Dequeue failed (slot {} dci {} deq {:#x})", slot_id, dci, deq);
+            return false;
+        }
+        true
+    }
+
+    /// The single-attempt Bulk-Only Transport transaction: CBW -> (optional data) -> CSW.
+    /// `bot_transfer` wraps this with Reset Recovery + one bounded retry.
+    fn bot_transfer_once(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32, dir: Direction)
         -> Result<BotResult, BotError>
     {
         let (cbw_phys, csw_phys, in_addr, out_addr) = {
@@ -3593,6 +3822,15 @@ impl XhciController {
         } else {
             // No data stage: fetch+send the CBW now; the CSW is queued next.
             self.ring_doorbell(slot_id, out_dci as u32);
+        }
+
+        // Test-only: deterministic synthetic failure at exactly this point (see BOT_FAULT_FIRED).
+        // The data stage above really landed, so returning here leaves the device parked in its CSW
+        // phase with a stale CSW pending — the strongest available stand-in for the metal timeout.
+        #[cfg(feature = "botfaultinject")]
+        if dir == Direction::Out && data_len > 0 && !BOT_FAULT_FIRED.swap(true, Ordering::Relaxed) {
+            serial_println!(":: BOT: fault-inject synthetic CSW-stage failure (slot {}, once) ::", slot_id);
+            return Err(BotError::Timeout);
         }
 
         // 3) CSW on bulk IN (13 bytes, IOC). The data stage (if any) has fully retired, so
@@ -5234,13 +5472,15 @@ impl XhciController {
         // at the device level — the interface descriptor is the only place to detect it. This
         // used to be HID-only, leaving a hubbed MSC device `other/unconfigured` forever (the
         // photographed metal failure). One storage device is supported, mirroring the root path.
-        if let Some(((in_addr, in_mps), (out_addr, out_mps))) = self.parse_msc_config(buf) {
+        if let Some(((in_addr, in_mps), (out_addr, out_mps), msc_intf)) = self.parse_msc_config(buf) {
             serial_println!(
                 "xHCI: >>> HUB DOWNSTREAM MASS STORAGE (slot {}, bulk in {:#x}/{} out {:#x}/{}) <<<",
                 slot_id, in_addr, in_mps, out_addr, out_mps);
             if self.storage_slot != 0 {
                 serial_println!("xHCI: storage slot {} already active; ignoring the hubbed device.", self.storage_slot);
             } else if self.configure_bulk_endpoints_sync(slot_id, in_addr, in_mps, out_addr, out_mps) {
+                // BOT error recovery's Bulk-Only Mass Storage Reset targets this interface.
+                self.slots[slot_id as usize].msc_intf = msc_intf;
                 // Defer SET_CONFIGURATION + SCSI bring-up to service_storage (same main-loop
                 // context, next hook) — identical hand-off to the root path's async completion.
                 self.storage_slot = slot_id;
@@ -5265,12 +5505,15 @@ impl XhciController {
     /// Parse a configuration descriptor (in `buf`) for a Mass-Storage-Class interface
     /// (bInterfaceClass 0x08 — matched at ANY subclass/protocol, like the root path) and collect
     /// its bulk IN/OUT endpoint pair. Returns ((in_addr, in_mps), (out_addr, out_mps)) or None.
-    fn parse_msc_config(&self, buf: u64) -> Option<((u8, u16), (u8, u16))> {
+    /// Also returns the MSC interface's `bInterfaceNumber` — the `wIndex` of the Bulk-Only Mass
+    /// Storage Reset (BOT 1.0 §3.1) that BOT error recovery issues.
+    fn parse_msc_config(&self, buf: u64) -> Option<((u8, u16), (u8, u16), u8)> {
         unsafe {
             let p = buf as *const u8;
             let total = ((*p.add(2) as usize) | ((*p.add(3) as usize) << 8)).min(64);
             let mut off = 0usize;
             let mut in_msc = false;
+            let mut msc_intf: u8 = 0;
             let mut bulk_in: Option<(u8, u16)> = None;
             let mut bulk_out: Option<(u8, u16)> = None;
             while off + 2 <= total {
@@ -5279,6 +5522,7 @@ impl XhciController {
                 if len == 0 { break; }
                 if dtype == 0x04 && off + 8 <= total {
                     in_msc = *p.add(off + 5) == 0x08;
+                    if in_msc { msc_intf = *p.add(off + 2); }
                 } else if dtype == 0x05 && in_msc && off + 6 <= total {
                     let ep_addr = *p.add(off + 2);
                     let attr = *p.add(off + 3);
@@ -5295,7 +5539,7 @@ impl XhciController {
                 off += len;
             }
             match (bulk_in, bulk_out) {
-                (Some(i), Some(o)) => Some((i, o)),
+                (Some(i), Some(o)) => Some((i, o, msc_intf)),
                 _ => None,
             }
         }
