@@ -101,12 +101,47 @@ pub struct Buf64(pub [u8; 64]);
 #[repr(C, align(64))]
 pub struct Buf256(pub [u8; 256]);
 
+// MT-INVESTIGATION (IVY) — the interrupt-endpoint RECEIVE buffer, sized by the `mtraw` knob.
+//
+// Knob-OFF (default): 64 B, exactly the `Buf64` shape this slot has always had — same size, same
+// alignment, same `DmaPool` layout, so default media stay byte-identical.
+//
+// Knob-ON: 1024 B. PROVENANCE (cleanroom, FreeBSD `sys/dev/usb/input/wsp.c`, SPDX BSD-2-Clause,
+// (c) 2012 Huang Wen Hui — permissive, lawful to take protocol facts from; the GPLv2-only Linux
+// `bcm5974` driver was NOT consulted): wsp declares `WSP_BUFFER_MAX 1024` and receives the whole
+// raw Wellspring frame into it. A TYPE2 raw frame is `30 + 28*n` bytes, so even a handful of
+// fingers overflows 64 B — the raw stream simply cannot be received without this growth.
+//
+// Alignment is 1024 knob-on ON PURPOSE: a 1024-byte buffer at a 1024-aligned address can never
+// cross a 4 KiB page, so ONE qTD buffer-page pointer still covers the whole transfer and
+// `buf[1..5]` stay zero (the invariant the `Qtd` doc-comment states). That is what makes the
+// multi-packet accumulation below safe with the existing single-qTD re-arm idiom.
+#[cfg(not(feature = "mtraw"))]
+pub const INT_BUF_LEN: usize = 64;
+/// Alignment `phys_of` enforces on the interrupt receive buffer (see `IntBuf`).
+#[cfg(not(feature = "mtraw"))]
+pub const INT_BUF_ALIGN: u64 = 64;
+/// The interrupt-endpoint receive buffer (see the `INT_BUF_LEN` block above).
+#[cfg(not(feature = "mtraw"))]
+#[repr(C, align(64))]
+pub struct IntBuf(pub [u8; INT_BUF_LEN]);
+
+#[cfg(feature = "mtraw")]
+pub const INT_BUF_LEN: usize = 1024;
+/// Alignment `phys_of` enforces on the interrupt receive buffer (see `IntBuf`).
+#[cfg(feature = "mtraw")]
+pub const INT_BUF_ALIGN: u64 = 1024;
+/// The interrupt-endpoint receive buffer (see the `INT_BUF_LEN` block above).
+#[cfg(feature = "mtraw")]
+#[repr(C, align(1024))]
+pub struct IntBuf(pub [u8; INT_BUF_LEN]);
+
 /// One statically-allocated interrupt-endpoint slot (QH + single re-armed qTD + report buffer).
 #[repr(C)]
 pub struct IntSlot {
     pub qh: Qh,
     pub qtd: Qtd,
-    pub buf: Buf64,
+    pub buf: IntBuf,
 }
 
 /// Static DMA pool for one controller — probe-5 metal experiment AND the permanent shape: the

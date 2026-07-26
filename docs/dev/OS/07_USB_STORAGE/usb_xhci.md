@@ -1313,6 +1313,129 @@ added to an otherwise untouched `ehci/mod.rs` moves the whole-file size by itsel
 streamed report length/shape changes, and (c) that after `mode-restored` the cursor still moves and
 clicks still register.
 
+#### 10g-2. MTRAW DECODE — receiving and decoding the raw TYPE2 frame
+
+The probe arc above deliberately stopped at "the frame arrives truncated". This follow-on lands the two
+things that were missing, so that the moment metal confirms raw mode engages, finger data flows on the
+**next** boot rather than needing another code arc. Same `mtraw` knob; knob-off still byte-identical.
+
+**How a >MPS report actually arrives on our interrupt-IN path.** Investigated and answered: **EHCI does
+the reassembly in hardware, and no software reassembly (or transfer-layer change) is needed.** A qTD's
+*Total Bytes To Transfer* field (EHCI 3.5.3) is not a packet size — the controller keeps issuing
+MPS-sized IN transactions against the **same** qTD, advancing the buffer pointer, until either `total`
+bytes have moved or the device returns a **short packet**, which retires the qTD and leaves the residue
+in Total Bytes. Our single-qTD re-arm idiom therefore already supports multi-packet reports; what it did
+*not* do was ask for more than one packet. Pre-arc, `arm_interrupt_ep` armed every endpoint with
+`total = mps` (≤ 64), so the controller stopped after exactly one transaction and the rest of a raw
+frame was dropped — precisely the truncation §10g predicted. Two changes fix it, both `mtraw`-gated:
+
+- `qh::IntBuf` (the per-endpoint receive buffer inside the static `DmaPool`) grows from 64 B to
+  **1024 B** — wsp's `WSP_BUFFER_MAX` — and is **1024-byte aligned**, so it can never cross a 4 KiB page
+  and the single qTD buffer-page pointer still covers the whole transfer (`buf[1..5]` stay zero).
+- the **vendor-multitouch endpoint only** is armed (and re-armed) with `total = INT_BUF_LEN` instead of
+  `total = mps`. Every other endpoint — keyboard, boot mouse, plain report pointer — keeps `total = mps`
+  verbatim. `report.len()` at the far end is then the true frame length, which is exactly the datum the
+  decoder length-validates on.
+
+**TYPE2 raw frame layout** (all offsets re-derived from FreeBSD `wsp.c`, SPDX BSD-2-Clause, (c) 2012
+Huang Wen Hui; no code copied; the GPLv2-only Linux `bcm5974` driver was **not** consulted). The frame
+carries **no** leading HID Report ID byte, so offsets are from byte 0. Header (`struct tp_header`,
+packed, little-endian — 30 B, which is exactly `FINGER_TYPE2 = 15*2`):
+
+| Off | Size | `wsp.c` field | Used here |
+| --- | --- | --- | --- |
+| 0 | 1 | `flag` | — |
+| 1 | 1 | `sn0` | — |
+| 2 | 2 | `wFixed0` | — |
+| 4 | 4 | `dwSn1` | — |
+| 8 | 4 | `dwFixed1` | — |
+| 12 | 2 | `wLength` | — |
+| **14** | 1 | `nfinger` | finger count (also `BUTTON_TYPE2 - 1`, the offset `wsp_intr_callback` reads it at) |
+| **15** | 1 | `ibt` | integrated-button byte (`BUTTON_TYPE2 = 15`) |
+| 16 | 12 | `wUnknown[6]` | — |
+| 28 | 1 | `q1` | — |
+| 29 | 1 | `q2` | — |
+
+Finger record (`struct tp_finger`, packed, little-endian, every field `int16` — 28 B, which is exactly
+`FSIZE_TYPE2 = 14*2`), repeated from offset 30 with `.delta = 0` for TYPE2:
+
+| Off | `wsp.c` field | Used here |
+| --- | --- | --- |
+| 0 | `origin` | — |
+| **2** | `abs_x` | X |
+| **4** | `abs_y` | Y (reported verbatim; wsp negates it — `sc->pos_y[i] = -f->abs_y` — only for its pointer path) |
+| 6 / 8 | `rel_x` / `rel_y` | — |
+| 10 / 12 | `tool_major` / `tool_minor` | — |
+| 14 | `orientation` | — |
+| **16** | `touch_major` | touch state (`!= 0` == in contact, wsp's own test) |
+| 18 | `touch_minor` | — |
+| 20 | `unused[2]` | — |
+| 24 | `pressure` | — |
+| 26 | `multi` | — |
+
+Frame-level rules taken from `wsp_intr_callback`: a frame is valid iff `len >= 30 + 28` **and**
+`(len - 30) % 28 == 0`; the finger count is range-checked against `MAX_FINGERS = 16`.
+
+**`decode_wellspring_type2` — bounded and hostile-input-safe.** The endpoint hands the decoder whatever
+the device put on the wire, so every one of those rules is a clamp, not an assumption:
+
+- the length gate above rejects anything that is not `30 + 28·n`. This is *also* what rejects the
+  ordinary 8-byte Report-ID-`0x02` HID-mode report — a pad that never left HID mode decodes to `None`,
+  never to garbage finger data.
+- the frame's finger-count byte is never trusted: it is clamped to `MAX_FINGERS` **and, independently,
+  to the number of records the frame's length can actually hold**. It can only ever name records that
+  exist.
+- every field read goes through `read_le16`, which returns `None` rather than reading past the end;
+  there is no indexing a short frame could drive out of bounds.
+- the decoder emits **no events and mutates no state**. Decode + witness only.
+
+**Event injection is a second, separate knob.** `mtraw_inject` (`UNAOS_MTRAW_INJECT=1`, implies `mtraw`)
+differences the first finger's absolute position into `pal::Event::Mouse` deltas (applying wsp's Y
+negation, clearing the reference on finger-up so a lift never emits a jump, and clamping each delta to
+±128 so a garbled coordinate cannot fling the cursor). It is **default OFF and expected to stay off**:
+the live pointer path remains the 8-byte `0x02` stream until metal proves raw mode is stable.
+
+Witnesses:
+
+```
+:: EHCI-MT: type2 self-test fingers=2 x0=1500 y0=-2000 touch0=90 button=0x01 ok=true
+   (len=86 hdr=30 fsize=28; count-clamp=true hid-reject=true ragged-reject=true empty-ok=true) == witness ::
+:: EHCI-MT: [i] type2 frame len=L mps=M fingers=N x0=X y0=Y touch0=T button=0xB == witness ::
+```
+
+The self-test runs once at driver init under `mtraw` and is the only QEMU-provable witness for the
+decoder: it feeds a synthetic 30 + 2×28 = 86-byte frame built at the cited offsets, then the hostile
+cases (a count byte claiming 255 in a two-record frame → clamped to 2; the real 8-byte `0x02` report →
+rejected; a length with a partial trailing record → rejected; a well-formed all-lifted frame → accepted
+with zero fingers). The live line is emitted for the same bounded first-`MT_RAW_DUMP_MAX` frames as the
+hex dump, so it is ring-safe at ~100 reports/s. **`len` vs `mps` on that line is the load-bearing
+evidence for the buffer growth**: `len > mps` means the controller accumulated a multi-packet frame into
+the grown buffer — something the pre-arc `total = mps` arming could never produce.
+
+**Gate reach — flagged.** `unaos/builder/src/main.rs` rebuilds the x86 kernel from its **own**
+env-derived feature list, and that list does not map `UNAOS_MTRAW`. So `UNAOS_MTRAW=1 ./arroyo test`
+builds the QEMU media *without* `mtraw` and the self-test never runs in the battery (`arroyo` pushes the
+feature to its own kernel build, which the builder then overwrites). Verified by adding the two-line
+mapping locally, at which point the self-test emits `ok=true` with every clamp green; the local edit was
+reverted rather than landed because `builder/` is outside this arc's lane. The integrator should add:
+
+```rust
+if std::env::var("UNAOS_MTRAW_INJECT").is_ok() { feats.push("mtraw_inject"); }
+else if std::env::var("UNAOS_MTRAW").is_ok() { feats.push("mtraw"); }
+```
+
+**Knob-off identity.** `.text` `2fa55ead…` / `.rodata` `60f3a313…` — byte-identical to the pre-arc tree
+(ELF section compare of `target/x86_64-unaos/release/unaos-kernel`, default feature set). Getting there
+required care worth recording: the natural refactor of hoisting the armed-total into one local changes
+`service_ehci_hid`'s codegen even when the knob-off *value* is identical (first +16 B, then a
+same-size register-allocation swap). The landed shape uses `#[cfg]` **pairs** whose knob-off member is
+the original expression verbatim and in place. Repetitive, deliberately.
+
+**What metal must still verify.** Everything §10g listed, plus: that a raw frame's `len` on the witness
+line exceeds `mps` (multi-packet accumulation actually happening), that `(len - 30) % 28 == 0` holds on
+the real stream, that `fingers` tracks the number of fingers actually on the pad, and that `x0`/`y0`
+move in the expected directions and ranges as a finger crosses the pad.
+
 ---
 
 ## 11. IVY — the delete-behind-a-hub investigation (BOT pump headroom)

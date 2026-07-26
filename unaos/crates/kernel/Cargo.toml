@@ -63,7 +63,17 @@ usbdebug = []
 # pointer mode so the trackpad keeps working. Enable via `UNAOS_MTRAW=1`. Default OFF: the whole
 # probe is `#[cfg]`-compiled out, so knob-off media are byte-identical. QEMU cannot produce
 # Wellspring frames — this knob is only meaningful on the 2012 rMBP bench.
+# Also (MTRAW DECODE): grows the interrupt-IN receive buffer to 1024 B (wsp's `WSP_BUFFER_MAX`) and
+# arms the vendor-multitouch endpoint's qTD for the whole buffer, so a >MPS raw frame is accumulated
+# by the controller instead of truncated at one packet; adds the TYPE2 frame decoder, its
+# QEMU-runnable self-test, and the bounded per-frame decode witness. Decode + witness ONLY — no
+# pointer events (see `mtraw_inject`).
 mtraw = []
+# MT-INVESTIGATION (IVY) debug SUB-KNOB of `mtraw`: additionally drive the pointer from the decoded
+# first finger (absolute TYPE2 coordinates differenced into `pal::Event::Mouse` deltas). Default OFF
+# and expected to STAY off until metal proves raw mode is stable — the live pointer path remains the
+# 8-byte Report-ID-0x02 stream. Enable via `UNAOS_MTRAW_INJECT=1` (implies `mtraw`).
+mtraw_inject = ["mtraw"]
 # STOR-1: interrupt-driven x86 storage — route each storage syscall through a scheduled kernel
 # "storage service task" that owns the xHCI BOT pump and blocks the submitter on a completion,
 # retiring the staged-buffer family (U6bx staged read / U9x flush queue / U10x op-queue) in favour

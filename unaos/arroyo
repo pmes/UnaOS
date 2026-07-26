@@ -64,6 +64,10 @@ _feats=""
 # (attended 2012 rMBP bench only — QEMU cannot produce Wellspring frames). Knob-off is
 # byte-identical: the whole probe is `#[cfg(feature = "mtraw")]`-compiled out.
 [ -n "${UNAOS_MTRAW:-}" ] && _feats="${_feats}mtraw,"
+# MT-INVESTIGATION (IVY) debug SUB-KNOB: also drive the pointer from the decoded first finger.
+# Implies `mtraw`. Default OFF — the live pointer path stays the 8-byte Report-ID-0x02 stream until
+# metal proves raw mode is stable.
+[ -n "${UNAOS_MTRAW_INJECT:-}" ] && _feats="${_feats}mtraw_inject,"
 [ -n "${UNAOS_SCHED_DEMO:-}" ] && _feats="${_feats}sched_demo,"
 # STOR-1: route x86 storage syscalls through the interrupt-driven storage service task (opt-in;
 # metal-pending). x86_64 only — a no-op on the aarch64 media below.

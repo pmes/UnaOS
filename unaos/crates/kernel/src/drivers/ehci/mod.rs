@@ -113,6 +113,16 @@ struct IntEp {
     /// CLICK-1: previous report's button bitmask, for button-DOWN edge detection (one
     /// `pal::Event::Button` per press, nothing on release/hold).
     prev_buttons: u8,
+    /// MT-INVESTIGATION (IVY, `mtraw` only): bytes ONE armed transfer may accept — `mps` for every
+    /// endpoint except the vendor-multitouch one, which is armed for the whole (grown) receive
+    /// buffer so the controller accumulates a >MPS raw frame into it. See `arm_interrupt_ep`.
+    #[cfg(feature = "mtraw")]
+    rx_total: u32,
+    /// MT-INVESTIGATION (IVY, `mtraw_inject` sub-knob only): previous decoded first-finger absolute
+    /// position, for turning TYPE2 absolute coordinates into pointer DELTAS. `None` until the first
+    /// touching frame and again on finger-up, so a lift never emits a jump.
+    #[cfg(feature = "mtraw_inject")]
+    mt_prev: Option<(i32, i32)>,
 }
 
 /// EHCI-4 M2 — the minimal field map a HID **pointer** report exposes, extracted by
@@ -1248,7 +1258,10 @@ impl Controller {
         let (Some(qh_phys), Some(qtd_phys), Some(buf_phys)) = (
             phys_of(qh, 32),
             phys_of(qtd, 32),
-            phys_of(buf, 64),
+            // MT-INVESTIGATION (IVY): `INT_BUF_ALIGN` is 64 knob-off (verbatim what this line
+            // always passed) and 1024 under `mtraw`, where the grown receive buffer must be
+            // page-crossing-free for the single qTD buffer pointer to cover it.
+            phys_of(buf, INT_BUF_ALIGN),
         ) else {
             serial_println!(
                 ":: EHCI-HID: [{}] STOP-NOTE int-EP slot failed the phys/alignment contract — endpoint skipped ::",
@@ -1257,6 +1270,33 @@ impl Controller {
             return;
         };
         self.int_next += 1;
+
+        // MT-INVESTIGATION (IVY) — how many bytes ONE armed transfer may accept.
+        //
+        // Knob-off this is `mps`, verbatim what it has always been: one MPS-sized transaction per
+        // service pass, which is all a HID boot report or an 8-byte 0x02 trackpad report needs.
+        //
+        // Knob-on, for the vendor-multitouch endpoint ONLY, it becomes the full receive buffer.
+        // This is the answer to "how do >MPS reports arrive on our int-IN path": EHCI does the
+        // reassembly IN HARDWARE. A qTD's Total Bytes To Transfer field (EHCI 3.5.3) is not a
+        // packet size — the controller keeps issuing MPS-sized IN transactions against the SAME
+        // qTD, advancing the buffer pointer, until either `total` bytes have moved or the device
+        // returns a SHORT packet (which retires the qTD and leaves the residue in Total Bytes).
+        // So a raw frame larger than MPS needs NO software reassembly and no transfer-layer
+        // change: it needs the qTD to be armed for more than one packet's worth, and a buffer big
+        // enough to land in. With `total == mps` (the pre-arc arming) the controller stops after
+        // exactly one packet and the rest of the frame is lost — which is precisely why the probe
+        // arc predicted a TRUNCATED capture. `report.len()` at the far end is therefore the true
+        // frame length whenever the frame is short of `total`, exactly the datum the decoder
+        // length-validates on.
+        #[cfg(not(feature = "mtraw"))]
+        let rx_total = mps as u32;
+        #[cfg(feature = "mtraw")]
+        let rx_total = if layout.as_ref().is_some_and(|l| l.vendor_mt) {
+            INT_BUF_LEN as u32
+        } else {
+            mps as u32
+        };
 
         (*qh).ep_chars = (t.addr as u32)
             | ((ep as u32) << 8)
@@ -1284,10 +1324,10 @@ impl Controller {
             (*qh).overlay[4] = 0;
             core::ptr::write_volatile(
                 &mut (*qh).overlay[2],
-                QTD_ACTIVE | QTD_CERR3 | ((mps as u32) << QTD_TOTAL_SHIFT) | QTD_PID_IN | QTD_IOC,
+                QTD_ACTIVE | QTD_CERR3 | (rx_total << QTD_TOTAL_SHIFT) | QTD_PID_IN | QTD_IOC,
             );
         } else {
-            write_qtd(qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC, mps as u32, buf_phys);
+            write_qtd(qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC, rx_total, buf_phys);
             (*qh).overlay[1] = PTR_TERMINATE;
             (*qh).overlay[2] = 0;
             (*qh).overlay[0] = qtd_phys as u32;
@@ -1322,6 +1362,10 @@ impl Controller {
             reports: 0,
             dead: false,
             prev_buttons: 0,
+            #[cfg(feature = "mtraw")]
+            rx_total,
+            #[cfg(feature = "mtraw_inject")]
+            mt_prev: None,
         });
     }
 
@@ -1365,11 +1409,27 @@ impl Controller {
                 e.dead = true;
                 continue;
             }
+            // MT-INVESTIGATION (IVY): bytes actually received = armed total minus the residue the
+            // controller left in Total Bytes To Transfer. Knob-off the armed total IS `e.mps`, so
+            // the expression is unchanged; knob-on, on the vendor-multitouch endpoint, it is the
+            // buffer size and the difference is the true length of a multi-packet raw frame.
+            // (Written as a `#[cfg]` PAIR rather than one hoisted local because hoisting would
+            // keep the value live across the decode block and cost 16 bytes of `.text` knob-off —
+            // this arc's default media must stay byte-identical.)
+            #[cfg(not(feature = "mtraw"))]
             let len = (e.mps as u32).saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
+            #[cfg(feature = "mtraw")]
+            let len = e.rx_total.saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
             if len > 0 {
                 // Boot reports are ≤ 8 B; a parsed report-pointer report can be longer (the
                 // buffer is 64 B), so cap by kind.
+                // MT-INVESTIGATION: knob-on the layout cap becomes the (grown) buffer length —
+                // still a hard cap, never larger than the allocation, so the slice below can
+                // never run off the buffer even if the controller reported nonsense residue.
+                #[cfg(not(feature = "mtraw"))]
                 let cap = if e.layout.is_some() { len.min(64) } else { len.min(8) };
+                #[cfg(feature = "mtraw")]
+                let cap = if e.layout.is_some() { len.min(INT_BUF_LEN) } else { len.min(8) };
                 let report = core::slice::from_raw_parts(e.buf, cap);
                 e.reports = e.reports.wrapping_add(1);
                 if let Some(l) = e.layout {
@@ -1398,8 +1458,21 @@ impl Controller {
                             if *n < MT_RAW_DUMP_MAX {
                                 *n += 1;
                                 dump_raw_report(idx, *n, &report[..report.len().min(MT_RAW_DUMP_BYTES)]);
+                                // MT-INVESTIGATION (IVY, decode prep): run the TYPE2 decoder on
+                                // the SAME bounded first-N frames and print one witness line. The
+                                // decoder is total — a non-raw (HID-mode) report simply fails its
+                                // length gate and the line says so — so this cannot misread the
+                                // 8-byte 0x02 stream as finger data.
+                                dump_type2_frame(idx, e.mps, report);
                             }
                         }
+                        // MT-INVESTIGATION (IVY, `mtraw_inject` sub-knob ONLY, default OFF): turn
+                        // the first finger's ABSOLUTE position into pointer deltas. Deliberately
+                        // gated behind a second knob: the pointer path stays 0x02-driven until
+                        // metal proves raw mode is stable, so the default `mtraw` build DECODES
+                        // and WITNESSES without ever touching the event queue.
+                        #[cfg(feature = "mtraw_inject")]
+                        mt_inject_first_finger(report, &mut e.mt_prev);
                         // M2 (RMBP-FIX silicon retarget): after the bcm5974 mode switch the internal
                         // trackpad does NOT stream the descriptor's opaque 0x44 / 511-byte multitouch
                         // frame — that hypothesis is REFUTED on this device path (the decode it drove,
@@ -1493,17 +1566,32 @@ impl Controller {
             // (overlay-direct; no qTD fetch — this metal) or refresh + point at the qTD.
             e.toggle = !e.toggle;
             let dt = if e.toggle { QTD_DT } else { 0 };
+            // MT-INVESTIGATION (IVY): re-arm for the SAME total the endpoint was armed with. Each
+            // statement is a `#[cfg]` PAIR whose knob-off member is the ORIGINAL expression,
+            // verbatim and in place. Every less repetitive shape tried here (one hoisted local, or
+            // a local inside each branch) changes `service_ehci_hid`'s register allocation — same
+            // instruction count, same symbol size, but NOT byte-identical, which this arc's default
+            // media must be. The duplication is the price of that guarantee.
             if om {
                 (*e.qh).overlay[0] = PTR_TERMINATE;
                 (*e.qh).overlay[1] = PTR_TERMINATE;
                 (*e.qh).overlay[3] = e.buf_phys as u32;
                 (*e.qh).overlay[4] = 0;
+                #[cfg(not(feature = "mtraw"))]
                 core::ptr::write_volatile(
                     &mut (*e.qh).overlay[2],
                     QTD_ACTIVE | QTD_CERR3 | ((e.mps as u32) << QTD_TOTAL_SHIFT) | QTD_PID_IN | QTD_IOC | dt,
                 );
+                #[cfg(feature = "mtraw")]
+                core::ptr::write_volatile(
+                    &mut (*e.qh).overlay[2],
+                    QTD_ACTIVE | QTD_CERR3 | (e.rx_total << QTD_TOTAL_SHIFT) | QTD_PID_IN | QTD_IOC | dt,
+                );
             } else {
+                #[cfg(not(feature = "mtraw"))]
                 write_qtd(e.qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC | dt, e.mps as u32, e.buf_phys);
+                #[cfg(feature = "mtraw")]
+                write_qtd(e.qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC | dt, e.rx_total, e.buf_phys);
                 (*e.qh).overlay[1] = PTR_TERMINATE;
                 core::ptr::write_volatile(&mut (*e.qh).overlay[2], 0);
                 core::ptr::write_volatile(&mut (*e.qh).overlay[0], e.qtd_phys as u32);
@@ -1621,9 +1709,75 @@ const BCM5974_MODE_NORMAL: u8 = 0x08;
 /// evicts the boot log that gives them context.
 #[cfg(feature = "mtraw")]
 const MT_RAW_DUMP_MAX: u32 = 4;
-/// MT-INVESTIGATION: hard cap on bytes hex-dumped per report (the interrupt buffer is 64 B).
+/// MT-INVESTIGATION: hard cap on bytes hex-dumped per report. Stays 64 even though the knob-on
+/// receive buffer is 1024 B: the point of the hex dump is the frame's HEAD (header + finger[0]),
+/// and a full 1024-byte line would evict the boot log from the 64 KiB drop-oldest FTDI ring. The
+/// `len=` field on the dump line still reports the TRUE received length, and the decode witness
+/// below reports the finger data from the whole frame.
 #[cfg(feature = "mtraw")]
 const MT_RAW_DUMP_BYTES: usize = 64;
+
+// ---------------------------------------------------------------------------------------------
+// MT-INVESTIGATION (IVY) — Wellspring TYPE2 RAW FRAME LAYOUT.
+//
+// PROVENANCE (cleanroom): FreeBSD `sys/dev/usb/input/wsp.c`, SPDX-License-Identifier
+// BSD-2-Clause, Copyright (c) 2012 Huang Wen Hui — permissively licensed, so lawful to take
+// protocol facts from for this GPL-3.0-or-later kernel. NO code is copied; only the numbers and
+// the validation rule below, each re-derived from the named declaration. The Linux `bcm5974`
+// driver is GPLv2-only (incompatible with GPL-3.0-or-later) and was NOT consulted.
+//
+// wsp.c declarations relied on, and what each gives us:
+//   * `#define FINGER_TYPE2 (15 * 2)`      -> 30 bytes of header before finger[0].
+//   * `#define FSIZE_TYPE2  (14 * 2)`      -> 28 bytes per finger record.
+//   * `wsp_tp[TYPE2] = { .offset = FINGER_TYPE2, .fsize = FSIZE_TYPE2, .delta = 0, ... }`
+//                                          -> no extra delta between header and finger[0]
+//                                             (TYPE4 has `.delta = 2`; TYPE2 does not).
+//   * `#define BUTTON_TYPE2 15`            -> the integrated-button byte is header offset 15,
+//     and `wsp_intr_callback` reads the finger COUNT at `params->tp->button - 1`, i.e. offset 14.
+//   * `struct tp_header` (packed, LE): flag@0, sn0@1, wFixed0@2, dwSn1@4, dwFixed1@8,
+//     wLength@12, nfinger@14, ibt@15, wUnknown[6]@16, q1@28, q2@29 — 30 bytes, which is exactly
+//     `FINGER_TYPE2` and independently confirms both the header size and the nfinger/ibt offsets.
+//   * `struct tp_finger` (packed, LE, all int16): origin@0, abs_x@2, abs_y@4, rel_x@6, rel_y@8,
+//     tool_major@10, tool_minor@12, orientation@14, touch_major@16, touch_minor@18,
+//     unused[2]@20, pressure@24, multi@26 — 28 bytes, exactly `FSIZE_TYPE2`.
+//   * `wsp_intr_callback` length gate:
+//         len >= offset + fsize  AND  (len - offset) % fsize == 0
+//     i.e. at least one whole finger record and no partial trailing record.
+//   * `#define MAX_FINGERS 16` with `ntouch` range-checked to `[0, MAX_FINGERS]` — the clamp we
+//     mirror, plus our own additional clamp to the number of records the frame actually carries.
+//   * `#define WSP_BUFFER_MAX 1024` — the receive-buffer size (see `qh::INT_BUF_LEN`).
+//   * finger presence: wsp treats `f->touch_major != 0` as the finger being in contact.
+//   * `sc->pos_y[i] = -f->abs_y` — wsp NEGATES Y for its pointer path (the sensor's Y grows the
+//     opposite way from screen Y). We report `abs_y` VERBATIM in the witness (so the metal capture
+//     is raw ground truth) and apply the negation only in the opt-in injection path below.
+//
+// The raw frame carries NO leading HID Report ID byte — offsets here are from byte 0 of the frame.
+/// Bytes of header before finger[0] (`FINGER_TYPE2`, corroborated by `struct tp_header`'s size).
+#[cfg(feature = "mtraw")]
+const WSP2_HDR_LEN: usize = 30;
+/// Bytes per finger record (`FSIZE_TYPE2`, corroborated by `struct tp_finger`'s size).
+#[cfg(feature = "mtraw")]
+const WSP2_FSIZE: usize = 28;
+/// Header offset of the finger count (`tp_header.nfinger`, = `BUTTON_TYPE2 - 1`).
+#[cfg(feature = "mtraw")]
+const WSP2_NFINGER_OFF: usize = 14;
+/// Header offset of the integrated-button byte (`tp_header.ibt`, = `BUTTON_TYPE2`).
+#[cfg(feature = "mtraw")]
+const WSP2_BUTTON_OFF: usize = 15;
+/// Finger-record offset of `abs_x` (int16 LE).
+#[cfg(feature = "mtraw")]
+const WSP2_F_ABS_X: usize = 2;
+/// Finger-record offset of `abs_y` (int16 LE).
+#[cfg(feature = "mtraw")]
+const WSP2_F_ABS_Y: usize = 4;
+/// Finger-record offset of `touch_major` (int16 LE); non-zero == the finger is in contact.
+#[cfg(feature = "mtraw")]
+const WSP2_F_TOUCH_MAJOR: usize = 16;
+/// Hard clamp on decoded fingers (`MAX_FINGERS`). Hostile/garbled input can put anything in the
+/// count byte; the decoder additionally clamps to the records the frame's LENGTH can hold, so the
+/// two together make an out-of-bounds read unreachable.
+#[cfg(feature = "mtraw")]
+const WSP2_MAX_FINGERS: usize = 16;
 
 // EHCI-5 vendor-multitouch decode HYPOTHESIS (bcm5974 TYPE2 lead — CONFIRM AT METAL).
 // The Apple 0x44 report is opaque: its HID descriptor gives the total report size, not which
@@ -1884,6 +2038,133 @@ fn decode_trackpad_rel(report: &[u8]) -> Option<(u8, i32, i32)> {
     Some((buttons, dx, dy))
 }
 
+/// MT-INVESTIGATION (IVY) — what `decode_wellspring_type2` extracts from one raw TYPE2 frame.
+/// Only the fields the arc actually needs: the frame-level count/button, and the FIRST finger's
+/// position + contact state (deeper multitouch is a later arc; the decoder validates the whole
+/// frame's shape either way, so it is a per-record loop away).
+#[cfg(feature = "mtraw")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Wsp2Frame {
+    /// Fingers reported, clamped to `WSP2_MAX_FINGERS` AND to the records the frame can hold.
+    fingers: u8,
+    /// `tp_header.ibt` — the integrated-button byte (this pad's click lives in the trackpad).
+    button: u8,
+    /// finger[0] `abs_x` (int16 LE, sign-extended). Zero when `fingers == 0`.
+    x0: i32,
+    /// finger[0] `abs_y` VERBATIM (int16 LE, sign-extended; wsp negates this for its pointer path
+    /// — we do not, so the witness prints sensor ground truth). Zero when `fingers == 0`.
+    y0: i32,
+    /// finger[0] `touch_major` (int16 LE, sign-extended); non-zero == in contact.
+    touch0: i32,
+}
+
+/// MT-INVESTIGATION (IVY) — decode one Apple Wellspring **TYPE2 raw multitouch frame**.
+///
+/// See the `WSP2_*` PROVENANCE block for the cleanroom source (FreeBSD wsp.c, BSD-2-Clause) and
+/// the per-field citations. This function is TOTAL and HOSTILE-INPUT-SAFE — the interrupt endpoint
+/// hands it whatever the device (or a malfunctioning/malicious device) put on the wire:
+///
+///   * `None` unless the length passes wsp's own gate — at least a header plus one whole finger
+///     record, and no partial trailing record. This is also what rejects the ordinary 8-byte
+///     Report-ID-0x02 HID-mode report, so a pad that never left HID mode decodes to `None` rather
+///     than to garbage finger data.
+///   * the finger count is read from the frame but never trusted: it is clamped to
+///     `WSP2_MAX_FINGERS` and, independently, to the number of records the frame's LENGTH can
+///     hold — so it can only ever name records that exist.
+///   * every field read goes through `read_le16`, which returns `None` rather than reading past
+///     the end. There is no indexing that a short frame could drive out of bounds.
+///
+/// Emits NO events and mutates NO state — decode + witness only (see `mt_inject_first_finger` for
+/// the opt-in pointer path).
+#[cfg(feature = "mtraw")]
+fn decode_wellspring_type2(frame: &[u8]) -> Option<Wsp2Frame> {
+    // wsp_intr_callback's gate, verbatim in intent: one whole finger record minimum, and the
+    // post-header remainder must divide evenly into finger records.
+    if frame.len() < WSP2_HDR_LEN + WSP2_FSIZE {
+        return None;
+    }
+    if (frame.len() - WSP2_HDR_LEN) % WSP2_FSIZE != 0 {
+        return None;
+    }
+    // Records the frame can actually hold — the clamp that makes the count byte harmless.
+    let records = (frame.len() - WSP2_HDR_LEN) / WSP2_FSIZE;
+    // Safe: the length gate above guarantees at least `WSP2_HDR_LEN` (30) bytes, and both offsets
+    // are < 30. Read through `get` regardless, so the two facts never have to be re-proved.
+    let button = *frame.get(WSP2_BUTTON_OFF)?;
+    let declared = *frame.get(WSP2_NFINGER_OFF)? as usize;
+    let fingers = declared.min(WSP2_MAX_FINGERS).min(records);
+    if fingers == 0 {
+        // A well-formed frame reporting no fingers: valid, just empty. (All fingers lifted.)
+        return Some(Wsp2Frame { fingers: 0, button, x0: 0, y0: 0, touch0: 0 });
+    }
+    // finger[0] begins immediately after the header (`.delta = 0` for TYPE2).
+    let f0 = WSP2_HDR_LEN;
+    let x0 = read_le16(frame, f0 + WSP2_F_ABS_X)? as i16 as i32;
+    let y0 = read_le16(frame, f0 + WSP2_F_ABS_Y)? as i16 as i32;
+    let touch0 = read_le16(frame, f0 + WSP2_F_TOUCH_MAJOR)? as i16 as i32;
+    Some(Wsp2Frame { fingers: fingers as u8, button, x0, y0, touch0 })
+}
+
+/// MT-INVESTIGATION (IVY) — one bounded witness line per captured frame on the LIVE path. Called
+/// only from inside the probe's `MT_RAW_DUMP_MAX` capture window, so it is ring-safe at the
+/// endpoint's ~100 reports/s. Prints the not-a-raw-frame case too: on a pad that never left HID
+/// mode that line IS the finding.
+///
+/// `mps` is printed alongside `len` because their relationship is the load-bearing evidence for the
+/// buffer growth: `len > mps` means the controller accumulated a MULTI-PACKET frame into the grown
+/// buffer (exactly what the pre-arc `total == mps` arming could never produce), while `len == mps`
+/// on a raw-shaped frame would mean we are still capped at one packet.
+#[cfg(feature = "mtraw")]
+fn dump_type2_frame(idx: usize, mps: u16, frame: &[u8]) {
+    match decode_wellspring_type2(frame) {
+        Some(f) => serial_println!(
+            ":: EHCI-MT: [{}] type2 frame len={} mps={} fingers={} x0={} y0={} touch0={} button={:#04x} == witness ::",
+            idx, frame.len(), mps, f.fingers, f.x0, f.y0, f.touch0, f.button
+        ),
+        None => serial_println!(
+            ":: EHCI-MT: [{}] type2 frame len={} mps={} fingers=n/a — not a TYPE2 raw frame (needs {}+{}*n bytes; HID-mode shape decodes here) == witness ::",
+            idx, frame.len(), mps, WSP2_HDR_LEN, WSP2_FSIZE
+        ),
+    }
+}
+
+/// MT-INVESTIGATION (IVY, `mtraw_inject` sub-knob ONLY — default OFF, and OFF is the shipping
+/// behaviour until metal proves raw mode is stable) — drive the pointer from the first finger.
+///
+/// TYPE2 coordinates are ABSOLUTE sensor units, while the landed EHCI pointer seam is
+/// `pal::Event::Mouse { x, y }` RELATIVE deltas, so we difference against the previous frame.
+/// `prev` is cleared whenever the finger is absent (`touch_major == 0`, wsp's own contact test) or
+/// the frame is not decodable, so a lift-and-replace never emits a jump. Deltas are clamped to a
+/// sane per-frame magnitude — a garbled coordinate must not fling the cursor.
+#[cfg(feature = "mtraw_inject")]
+fn mt_inject_first_finger(frame: &[u8], prev: &mut Option<(i32, i32)>) {
+    let Some(f) = decode_wellspring_type2(frame) else {
+        *prev = None;
+        return;
+    };
+    if f.fingers == 0 || f.touch0 == 0 {
+        *prev = None;
+        return;
+    }
+    // wsp uses `-abs_y` for its pointer path (sensor Y grows opposite to screen Y); apply that
+    // ONLY here, so the witness above keeps reporting the raw sensor value.
+    let (x, y) = (f.x0, -f.y0);
+    if let Some((px, py)) = *prev {
+        let dx = (x - px).clamp(-MT_INJECT_MAX_STEP, MT_INJECT_MAX_STEP);
+        let dy = (y - py).clamp(-MT_INJECT_MAX_STEP, MT_INJECT_MAX_STEP);
+        if dx != 0 || dy != 0 {
+            crate::pal::push_event(crate::pal::Event::Mouse { x: dx, y: dy });
+        }
+    }
+    *prev = Some((x, y));
+}
+
+/// MT-INVESTIGATION (`mtraw_inject`): per-frame delta clamp. The TYPE2 sensor spans a few thousand
+/// units edge to edge and streams at ~100 Hz, so a real swipe moves tens of units per frame; this
+/// bound is generous for real motion and hard against a garbled coordinate flinging the cursor.
+#[cfg(feature = "mtraw_inject")]
+const MT_INJECT_MAX_STEP: i32 = 128;
+
 /// EHCI-5 (REFUTED-HYPOTHESIS HISTORY — kept per the never-trash rule, exercised by
 /// `vendor_multitouch_selftest`, NO LONGER the live decode path): decode the FIRST finger of an
 /// Apple vendor-multitouch (`0x44`) report at the HYPOTHESIS offsets. The 0x44 / 511-byte
@@ -2006,6 +2287,70 @@ unsafe fn parser_selftest() {
         hostile_bounded, MAX_REPORT_FIELDS, legit_ok
     );
     vendor_multitouch_selftest();
+    // MT-INVESTIGATION (IVY, `mtraw` only): the ONLY QEMU-provable witness for the raw TYPE2
+    // decoder — QEMU has no Wellspring pad, so a synthetic frame stands in. Compiled out (and so
+    // silent) on a default build.
+    #[cfg(feature = "mtraw")]
+    wellspring_type2_selftest();
+}
+
+/// MT-INVESTIGATION (IVY) self-test (runs once at driver init under `mtraw`). Feeds
+/// `decode_wellspring_type2` a SYNTHETIC TYPE2 raw frame built at the cited wsp.c offsets — 30-byte
+/// header + TWO 28-byte finger records — and asserts the frame-level count and finger[0]'s
+/// position/contact come back exactly. Then the hostile cases, because this decoder runs on
+/// whatever a device puts on the wire: a lying finger count (0xFF in a frame that holds two
+/// records → clamped to 2, never an out-of-bounds read), the ordinary 8-byte HID-mode 0x02 report
+/// (rejected by the length gate — must NOT be misread as finger data), a length with a partial
+/// trailing record (rejected), and an empty-but-well-formed frame (accepted, zero fingers).
+#[cfg(feature = "mtraw")]
+unsafe fn wellspring_type2_selftest() {
+    // One well-formed 2-finger frame: 30 + 2*28 = 86 bytes.
+    const N: usize = WSP2_HDR_LEN + 2 * WSP2_FSIZE;
+    let mut frame = [0u8; N];
+    frame[WSP2_NFINGER_OFF] = 2;
+    frame[WSP2_BUTTON_OFF] = 0x01; // integrated button held
+    let f0 = WSP2_HDR_LEN;
+    let f1 = WSP2_HDR_LEN + WSP2_FSIZE;
+    frame[f0 + WSP2_F_ABS_X..f0 + WSP2_F_ABS_X + 2].copy_from_slice(&1500i16.to_le_bytes());
+    frame[f0 + WSP2_F_ABS_Y..f0 + WSP2_F_ABS_Y + 2].copy_from_slice(&(-2000i16).to_le_bytes());
+    frame[f0 + WSP2_F_TOUCH_MAJOR..f0 + WSP2_F_TOUCH_MAJOR + 2]
+        .copy_from_slice(&90i16.to_le_bytes());
+    frame[f1 + WSP2_F_ABS_X..f1 + WSP2_F_ABS_X + 2].copy_from_slice(&(-400i16).to_le_bytes());
+    frame[f1 + WSP2_F_ABS_Y..f1 + WSP2_F_ABS_Y + 2].copy_from_slice(&3100i16.to_le_bytes());
+    frame[f1 + WSP2_F_TOUCH_MAJOR..f1 + WSP2_F_TOUCH_MAJOR + 2]
+        .copy_from_slice(&70i16.to_le_bytes());
+    let good = decode_wellspring_type2(&frame);
+
+    // Hostile finger count: the frame holds two records, the count byte claims 255.
+    let mut liar = frame;
+    liar[WSP2_NFINGER_OFF] = 0xFF;
+    let clamped = decode_wellspring_type2(&liar).map(|f| f.fingers) == Some(2);
+
+    // The ordinary HID-mode report — must be REJECTED, not misread.
+    let hid = [0x02u8, 0x00, 0x05, 0xFB, 0x00, 0x00, 0x00, 0x00];
+    let hid_rejected = decode_wellspring_type2(&hid).is_none();
+    // A length with a partial trailing finger record — rejected.
+    let ragged = [0u8; WSP2_HDR_LEN + WSP2_FSIZE + 7];
+    let ragged_rejected = decode_wellspring_type2(&ragged).is_none();
+    // Well-formed, all fingers lifted — accepted with zero fingers, no coordinates.
+    let empty = [0u8; WSP2_HDR_LEN + WSP2_FSIZE];
+    let empty_ok = decode_wellspring_type2(&empty)
+        == Some(Wsp2Frame { fingers: 0, button: 0, x0: 0, y0: 0, touch0: 0 });
+
+    let (fingers, x0, y0, touch0, button) = match good {
+        Some(f) => (f.fingers, f.x0, f.y0, f.touch0, f.button),
+        None => (0, 0, 0, 0, 0),
+    };
+    let ok = good == Some(Wsp2Frame { fingers: 2, button: 0x01, x0: 1500, y0: -2000, touch0: 90 })
+        && clamped
+        && hid_rejected
+        && ragged_rejected
+        && empty_ok;
+    serial_println!(
+        ":: EHCI-MT: type2 self-test fingers={} x0={} y0={} touch0={} button={:#04x} ok={} (len={} hdr={} fsize={}; count-clamp={} hid-reject={} ragged-reject={} empty-ok={}) == witness ::",
+        fingers, x0, y0, touch0, button, ok, N, WSP2_HDR_LEN, WSP2_FSIZE,
+        clamped, hid_rejected, ragged_rejected, empty_ok
+    );
 }
 
 /// EHCI-5 self-test (runs once at driver init). The ONLY QEMU-provable witness for the vendor
