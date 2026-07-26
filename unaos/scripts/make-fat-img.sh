@@ -164,6 +164,19 @@ cat > "${MNT}/BLOCK.TXT" <<'EOF'
 EOF
 echo "    added BLOCK.TXT (zeolite hosts-format blocklist: ads.example, track.example, telemetry.example)"
 
+# PI-FS-3: plant VFAT LONG FILENAMES + a NESTED subdirectory tree so the read-only reader's LFN parse
+# and arbitrary-depth traversal are exercised in QEMU (UNAOS_FATIMG=1 ./arroyo test-arm). newfs_msdos +
+# cp generate real 0x0F LFN component slots for any name that is not a valid 8.3 short name; a mixed-case
+# and a spaces-and-mixed-case name each force an LFN run (the short entry mangles to e.g. LONGFI~1.TXT).
+printf 'this file has a VFAT long filename\n' > "${MNT}/Long Filename Example.txt"
+printf 'mixed-case long name (LFN, distinct short entry)\n' > "${MNT}/MixedCaseName.md"
+echo "    added LFN files (Long Filename Example.txt, MixedCaseName.md)"
+# Nested tree: root/subdir/nested with a file at the deepest level — proves traversal past one level.
+mkdir -p "${MNT}/subdir/Nested Directory"
+printf 'a file two levels deep\n' > "${MNT}/subdir/Nested Directory/deep file.txt"
+printf 'level one file\n' > "${MNT}/subdir/level1.txt"
+echo "    added nested tree (subdir/ -> 'Nested Directory'/ -> 'deep file.txt')"
+
 # Strip macOS metadata (AppleDouble ._ files, Spotlight/fseventsd) so `ls` shows a clean tree.
 sync
 find "$MNT" -name '._*' -delete 2>/dev/null || true

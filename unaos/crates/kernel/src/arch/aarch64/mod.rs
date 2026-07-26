@@ -212,6 +212,19 @@ fn boot_diagnostics() {
         if sctlr & 1 != 0 { "on" } else { "off" },
         (daif >> 6) & 0b1111,
     );
+    // UVUG7-W — WITNESS-STATE HONESTY. The `witness` cargo feature is DEFAULT-QUIET: `./arroyo kernel8`
+    // (the flashable media command) leaves it OFF, so every `#[cfg(feature = "witness")]` call site —
+    // including both `[uvug7]` sites — is compiled clean out of the image. Without this line a default
+    // boot log is INDISTINGUISHABLE from a witness-armed boot whose gate never became true, and a
+    // missing `[uvugN]` reads as a live bug rather than as absent code. That ambiguity is exactly what
+    // let P53's "[uvug7] never printed" mystery survive four metal boots (P53-P56) before the P57
+    // capture — staged from a witness-armed image — printed all four `[uvug7]` lines normally.
+    // Unconditional and self-describing, so the answer is always in the log itself.
+    serial_println!(
+        ":: AARCH64 build: witness={} — witness-gated [uvugN]/fixture lines are {} in this image ::",
+        if cfg!(feature = "witness") { "on" } else { "off" },
+        if cfg!(feature = "witness") { "PRESENT" } else { "ABSENT BY CONSTRUCTION (not failures)" },
+    );
 }
 
 pub fn hlt_loop() -> ! {
@@ -255,11 +268,21 @@ pub fn ticks() -> u64 {
     timer::ticks()
 }
 
-/// Milliseconds since boot. pi/virt: generic-timer heartbeat (ticks()*4 at 250 Hz). tegra (VUGFIX):
-/// see §VUGFIX — timerless EL1 falls back to CNTVCT/(CNTFRQ/1000); cfg on one line keeps pi/virt byte-identical.
+/// Milliseconds since boot, derived DIRECTLY from the free-running virtual counter (CNTVCT_EL0) and
+/// its rate (CNTFRQ_EL0): `ms = CNTVCT / (CNTFRQ/1000)`. Frequency-independent and core-count
+/// independent, correct on every path (pi / QEMU virt / tegra) with no cfg split.
+///
+/// UVUG-7 (P52, metal): the old `ticks()*4` assumed a single 250 Hz tick source. But `ticks()`
+/// (timer::TICKS) is bumped by EVERY core's periodic timer IRQ (see `timer::on_tick`), so on 4-core
+/// BCM2711 metal it advanced ~4x faster than 250 Hz — making `ms()` run ~4x fast, which drove
+/// typematic key-repeat ~4x too fast (one keypress emitted ~7 chars). CNTVCT counts at CNTFRQ
+/// regardless of how many cores tick or whether the tick IRQ is delivered at all, so this is immune
+/// to both faults. It also fixes QEMU raspi4b, where the tick IRQ is never delivered and `ticks()`
+/// (hence the old `ms()`) stayed frozen at 0.
 #[inline]
 pub fn ms() -> u64 {
-    { #[cfg(not(feature = "tegra"))] { ticks() * 4 } #[cfg(feature = "tegra")] { if timer::is_live() { ticks() * 4 } else { let khz = timer::cntfrq() / 1000; if khz == 0 { 0 } else { now_cycles() / khz } } } }
+    let khz = timer::cntfrq() / 1000;
+    if khz == 0 { 0 } else { now_cycles() / khz }
 }
 
 /// Free-running virtual cycle counter (CNTVCT_EL0). Monotonic and interrupt-flag-independent, like

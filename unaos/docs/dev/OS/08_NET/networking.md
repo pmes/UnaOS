@@ -18,7 +18,7 @@ DNS sinkhole (zeolite), and the boot connectivity witnesses — **by default**. 
 | :--- | :--- | :--- |
 | `ping` / `arp` / `netinfo` | **smoltcp** ICMP socket + interface (`smolnet.rs`) | hand-rolled `net::` engines (`drivers/e1000.rs`) |
 | ring-3 socket syscalls (SOCK-2..7) + zeolite | **smoltcp** (persistent `STACK`) | absent (feature not compiled) |
-| `connect` / `fetch` / `udpsend` | hand-rolled `net::tcp` / `net::udp` (smoltcp has no shell equivalent yet — SOCK-8+) | hand-rolled |
+| `connect` / `fetch` / `udpsend` | hand-rolled `net::tcp` / `net::udp` (smoltcp has no shell equivalent yet — SOCK-9+) | hand-rolled |
 | DHCP, TCP echo listener, boot connectivity self-test | hand-rolled (still runs alongside smoltcp) | hand-rolled |
 | aarch64 | **smoltcp is never compiled** (x86-only dep + arm_features strip) | identical — hand-rolled only |
 
@@ -710,6 +710,56 @@ Reproduce (hermetic, forward+suffix+metrics OK, serve PENDING): `./arroyo test 9
 composition (hosts-format blocklist from FAT): `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo
 test 200`. The over-the-wire serve leg is unchanged from SINKHOLE-1 (injector-driven; PENDING hermetically).
 
+## SOCK-8 — x86 DNS client on the shared `net_dns` (`pool.ntp.org` for SNTP)
+
+Until SOCK-8, smolnet had no way to turn a name into an address, so SNTP-X86 could only target the gateway.
+SOCK-8 gives smolnet a **resolver** built on the same hostile-input-hardened wire logic the pi/genet
+PI-NET-14 client uses — now **extracted to `crate::net_dns`**, exactly as SNTP-X86 extracted the SNTP parser
+to `crate::net_sntp`. `net_dns` is arch-neutral (`#![no_std]`, no `alloc`, no I/O) and carries three pieces:
+`build_query` (a minimal RD=1 A-record query, per-label ≤ 63 B **and** total encoded name ≤ 255 B — the one
+guard tighter than PI-NET-14), `skip_name` (the compression-loop-immune name walk — a pointer is a two-byte
+terminator that is **never dereferenced**, so a loop cannot form; reserved length bits rejected; label hop
+cap), and `parse_a` (txid match, QR check, RCODE→`ServerErr`, bounds-checked answer walk capped at 64, first
+A/IN/4-byte RDATA wins). genet migrates its `net14_*` onto this file in a later fold — the shared parser is
+byte-for-byte the hardened original plus the stricter total-name cap, so the migration is a strict tighten.
+
+### The mechanism
+
+`smolnet::resolve(host)` sends one A-record query over the **persistent UDP stack** to `dns_server()` and
+parses the reply with `net_dns::parse_a`. `dns_server()` prefers the **DHCP-provided DNS server** — captured
+in `dhcp_acquire` from the lease's `dhcpv4::Config::dns_servers` (first entry) into the `CURRENT_DNS` atomic,
+the smolnet analogue of the pi side's `NetConfig.dns` — and **falls back to the gateway** when the lease
+carried no DNS option. The socket is kernel-owned (`usize::MAX`, never a ring-3 slot), bound to an ephemeral
+port distinct from the SOCK-2 witness and the SNTP client, and always closed before return; a malformed /
+no-answer / server-error reply returns `None` so the caller can fall back. The **SNTP client now prefers a
+resolved `pool.ntp.org`** (`resolve(SNTP_POOL_HOST).unwrap_or_else(sntp_target)`), keeping the gateway
+fallback and the honest witnesses.
+
+### The witnesses
+
+The one-shot boot witness resolves `pool.ntp.org` and prints, e.g.:
+
+```
+:: SMOLNET: [dns] pool.ntp.org -> 93.184.216.34 (via 10.0.2.3) ::
+```
+
+Under the hermetic `./arroyo test` slirp backend slirp's built-in forwarder (`10.0.2.3`) forwards DNS to the
+host resolver, so a **live resolve may actually succeed** as a bonus witness; where the lease surfaces no DNS
+server the resolver falls back to the gateway (which answers no DNS) and prints the honest
+`:: SMOLNET: [dns] pool.ntp.org no answer (via <server>) ... ::` line — the mission stays green either way.
+The deterministic `witness`-battery gate proves the parser with canned datagrams in **any** environment,
+never depending on external reachability:
+
+```
+:: DNS-X86-GATE: x86 dns client battery PASS [w=0xf] (parse-A|reject-truncated|reject-loop|rcode) ::
+```
+
+`w` bits: `0x01` a well-formed A reply (with the universal compression pointer in the answer name, never
+dereferenced) parses to the exact address; `0x02` a truncated answer RR is rejected as `Malformed`; `0x04` a
+compression **loop** (a QNAME that is a self-pointer) is rejected **without hanging** — loop-immune by
+construction; `0x08` a non-zero RCODE (NXDOMAIN=3) surfaces as `ServerErr(3)`. It runs from `main.rs`
+alongside `sntp_x86_gate` (x86 + `witness` + `smolnet`). No new syscall.
+
 ## The road from here
 
 | Arc | Content |
@@ -723,4 +773,6 @@ test 200`. The over-the-wire serve leg is unchanged from SINKHOLE-1 (injector-dr
 | SOCK-7 | persistent-listener acceptor pool — `sys_listen` arms a listener that survives accepts; each `sys_accept` peels a fresh gen-fenced connection + re-arms the listener in place (buffer free-list, shape (i)); no new syscall; net-inject `sock7` two-connection witness |
 | SINKHOLE-1 (zeolite) | ring-3 DNS resolver/sinkhole — binds `:53`, blocks names from `BLOCK.TXT` (read via the S7 dynamic-open path) with `0.0.0.0`, forwards the rest to `10.0.2.3:53`; hardened hostile-payload parser; no new syscall; net-inject `dns` sinkhole witness |
 | **ZEOLITE-2** (zeolite, this) | real hosts-file blocklist ingest (IP + domain, `#`/`;` comments, blank lines — hostile-input-hardened); label-boundary suffix matching (a blocked base domain sinkholes its subdomains); resolver metrics (queries seen / blocked / forwarded — the honest source for a stats view); no new syscall |
-| SOCK-8+ | aarch64 NIC bring-up (Pi GENET); the rest of the DNS appliance (cache, query log, stats view, kit); retire the hand-rolled shell surface + `crates/net` DHCP |
+| **SNTP-X86** (CLOCK-1 x86 follow-up) | x86 smolnet SNTP client: one RFC 4330 client-mode request over the persistent UDP stack, reply parsed by the shared arch-neutral `crate::net_sntp` (ported from pi/genet PI-NET-16; genet migrates onto it later), then `crate::clock::set_anchor(unix, mono, Sntp{stratum})` — the x86 `time` verb gains a network writer. Targets a resolved `pool.ntp.org` when DNS is available (SOCK-8), else the live default gateway (DHCP-leased router / slirp 10.0.2.2). One-shot boot witness `:: SMOLNET: [sntp] <server> -> <ISO> (stratum N) ::` (honest `no reply` note under hermetic slirp — the gateway answers no NTP); the deterministic `witness`-battery gate `:: SNTP-X86-GATE: ... PASS [w=0x1f] ::` proves the parser + clock-anchor path with canned datagrams in any environment. No new syscall |
+| **SOCK-8** (x86 DNS, this) | x86 smolnet DNS client on the shared arch-neutral `crate::net_dns` (PI-NET-14 wire logic extracted, `net_sntp` pattern; genet migrates onto it later; the one strictly-stricter addition = a ≤ 255-octet total-name cap in `build_query`). `smolnet::resolve(host)` queries the DHCP-provided DNS server (`CURRENT_DNS` from the lease's `dns_servers`, the smolnet analogue of `NetConfig.dns`) with a gateway fallback, over the persistent UDP stack; the SNTP client now prefers a resolved `pool.ntp.org`. One-shot boot witness `:: SMOLNET: [dns] <host> -> <ip> (via <server>) ::` (honest `no answer` under a non-forwarding gateway; a live slirp resolve via 10.0.2.3 is a bonus); deterministic `witness`-battery gate `:: DNS-X86-GATE: ... PASS [w=0xf] ::` (well-formed A / truncated / compression-loop / rcode). No new syscall |
+| SOCK-9+ | aarch64 NIC bring-up (Pi GENET); genet migrates onto shared `net_dns`; the rest of the DNS appliance (cache, query log, stats view, kit); retire the hand-rolled shell surface + `crates/net` DHCP |

@@ -45,6 +45,7 @@
 #![cfg(any(feature = "net4", feature = "vnet", feature = "smolnet", feature = "genet"))]
 
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
@@ -137,9 +138,58 @@ impl<N: RawNic> TxToken for PhyTxToken<'_, N> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let n = len.min(self.buf.len());
         let r = f(&mut self.buf[..n]);
+        classify_tx(&self.buf[..n]);
         N::transmit(&self.buf[..n]);
         r
     }
+}
+
+// ── NET-ARP-1: TX-emission count witness ─────────────────────────────────────────────────────────
+//
+// The boot-P7/boot-29 question was "does smoltcp's poll ever get to EMIT?" — these counters answer it
+// on the wire side of the seam: every frame smoltcp hands the phy is classified as it crosses
+// `TxToken::consume` (i.e. the exact moment it is handed to the NIC TX ring), so the drivers' gated
+// `[netarp1] smoltcp emitted N frames (arp-reply=X dhcp=Y)` line is an emission proof, not a poll-loop
+// guess. Shared by every adapter (x86 smolnet counts too; only the aarch64 binds print the line today).
+
+static TX_TOTAL: AtomicU32 = AtomicU32::new(0);
+static TX_ARP_REPLY: AtomicU32 = AtomicU32::new(0);
+static TX_DHCP: AtomicU32 = AtomicU32::new(0);
+
+/// Classify one outbound L2 frame for the NET-ARP-1 emission witness: total, ARP replies
+/// (ethertype 0x0806, opcode 2) and DHCP client datagrams (IPv4/UDP 68 → 67).
+fn classify_tx(frame: &[u8]) {
+    TX_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if frame.len() < 14 {
+        return;
+    }
+    let et = u16::from_be_bytes([frame[12], frame[13]]);
+    if et == 0x0806 {
+        // ARP opcode is bytes 6..8 of the ARP payload (offset 20..22 in the frame); reply = 2.
+        if frame.len() >= 22 && frame[20] == 0 && frame[21] == 2 {
+            TX_ARP_REPLY.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if et == 0x0800 && frame.len() >= 14 + 20 && frame[23] == 17 {
+        // IPv4/UDP: ports sit right after the IHL-sized header.
+        let ihl = ((frame[14] & 0x0f) as usize) * 4;
+        let udp = 14 + ihl;
+        if frame.len() >= udp + 4 {
+            let sp = u16::from_be_bytes([frame[udp], frame[udp + 1]]);
+            let dp = u16::from_be_bytes([frame[udp + 2], frame[udp + 3]]);
+            if sp == 68 && dp == 67 {
+                TX_DHCP.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Snapshot the NET-ARP-1 emission counters: `(total, arp_reply, dhcp)`. Cumulative since boot.
+pub fn tx_emission_counts() -> (u32, u32, u32) {
+    (
+        TX_TOTAL.load(Ordering::Relaxed),
+        TX_ARP_REPLY.load(Ordering::Relaxed),
+        TX_DHCP.load(Ordering::Relaxed),
+    )
 }
 
 impl<N: RawNic, O: RxObserver> Device for SmoltcpPhy<N, O> {
@@ -207,6 +257,47 @@ pub struct NetConfig {
     pub prefix_len: u8,
     /// The default gateway / router.
     pub gw: [u8; 4],
+    /// The first DHCP-provided DNS server, if the lease carried one. `None` on the static-fallback
+    /// path (no DHCP), or when a lease offered no DNS option. Callers that need a resolver use this
+    /// when present and fall back to querying the gateway (`gw`) when it is `None`. Populated from
+    /// smoltcp's `dhcpv4::Config::dns_servers` (first entry) where the lease is processed.
+    pub dns: Option<[u8; 4]>,
+}
+
+// ── PI-UI-2: the settled-address snapshot ─────────────────────────────────────────────────────────
+//
+// A read-only, lock-free snapshot of the interface IPv4 the bring-up settled on, so a consumer that has
+// no business reaching into a driver's private `NetService`/socket state — the GUI status strip — can
+// display the address. `dhcp_or_static` (the single chokepoint EVERY arch's bring-up funnels through)
+// records the settled config here; `settled_ipv4()` reads it. Plain atomics: written once per bring-up
+// from the net core, read from the render core, so the strip never takes a net lock in the render path.
+
+/// True once a bring-up has settled and recorded an address (before that the strip shows "no lease").
+static NET_IP_PRESENT: AtomicBool = AtomicBool::new(false);
+/// The settled IPv4, octets packed big-endian (`a<<24 | b<<16 | c<<8 | d`).
+static NET_IP: AtomicU32 = AtomicU32::new(0);
+/// Whether the settled address came from a DHCP lease (`true`) or the static fallback (`false`).
+static NET_LEASED: AtomicBool = AtomicBool::new(false);
+
+/// Record the settled interface config for the read-only snapshot. Called from `dhcp_or_static` on
+/// each bring-up (both the lease and the static-fallback paths).
+fn record_settled(cfg: &NetConfig) {
+    NET_IP.store(u32::from_be_bytes(cfg.ip), Ordering::Relaxed);
+    NET_LEASED.store(cfg.leased, Ordering::Relaxed);
+    NET_IP_PRESENT.store(true, Ordering::Release); // publishes the two fields above
+}
+
+/// PI-UI-2: the settled interface IPv4 and whether it was DHCP-leased (`true`) or the static fallback
+/// (`false`), or `None` before any bring-up has completed. A lock-free snapshot for read-only
+/// consumers such as the GUI status strip.
+pub fn settled_ipv4() -> Option<([u8; 4], bool)> {
+    if !NET_IP_PRESENT.load(Ordering::Acquire) {
+        return None;
+    }
+    Some((
+        NET_IP.load(Ordering::Relaxed).to_be_bytes(),
+        NET_LEASED.load(Ordering::Relaxed),
+    ))
 }
 
 /// Apply an IPv4 address + default route to `iface` in place (replacing any prior config). Shared by
@@ -262,6 +353,9 @@ pub fn dhcp_or_static<D: Device>(
                 // the static gateway if the server offered none (rare, but keeps the route sane).
                 let gw = cfg.router.map(|r| r.octets()).unwrap_or(static_gw);
                 let srv = cfg.server.address.octets();
+                // Surface the first DHCP-provided DNS server (if any) so a resolver can use the real
+                // nameserver instead of falling back to the gateway (NET-14/NET-16 fold).
+                let dns = cfg.dns_servers.first().map(|a| a.octets());
                 apply_ipv4(iface, ip, prefix_len, gw);
                 serial_println!(
                     "{} NET: DHCP lease ip={}.{}.{}.{}/{} gw={}.{}.{}.{} (server {}.{}.{}.{}) => PASS ::",
@@ -270,7 +364,9 @@ pub fn dhcp_or_static<D: Device>(
                     gw[0], gw[1], gw[2], gw[3],
                     srv[0], srv[1], srv[2], srv[3],
                 );
-                return NetConfig { leased: true, ip, prefix_len, gw };
+                let cfg = NetConfig { leased: true, ip, prefix_len, gw, dns };
+                record_settled(&cfg); // PI-UI-2: publish the settled address for the GUI status strip
+                return cfg;
             }
             Some(dhcpv4::Event::Deconfigured) => {}
             None => {}
@@ -284,12 +380,15 @@ pub fn dhcp_or_static<D: Device>(
                 static_ip[0], static_ip[1], static_ip[2], static_ip[3], static_prefix,
                 static_gw[0], static_gw[1], static_gw[2], static_gw[3],
             );
-            return NetConfig {
+            let cfg = NetConfig {
                 leased: false,
                 ip: static_ip,
                 prefix_len: static_prefix,
                 gw: static_gw,
+                dns: None,
             };
+            record_settled(&cfg); // PI-UI-2: publish the static-fallback address for the GUI status strip
+            return cfg;
         }
     }
 }

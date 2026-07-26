@@ -17,6 +17,14 @@
 //! FAT16 / FAT32 reader (+ U9 in-place writer, + U10 grow/create allocator) built on the generic
 //! block device.
 //!
+//! PI-FS-3: the read walkers parse VFAT **long filenames** (the 0x0F-attribute LFN component slots that
+//! precede a short 8.3 entry) — accumulated across sector/cluster boundaries by [`LfnBuf`], checksum-
+//! validated against the short entry, and decoded UTF-16→UTF-8 into `DirEntry`'s inline long-name buffer.
+//! [`DirEntry::name`] returns the long name when present (else the 8.3 short name); `eq_name` matches
+//! EITHER spelling. **Subdirectory traversal** to arbitrary depth is served by [`FatFs::read_dir`] (the
+//! FAT16 fixed root, the FAT32 root cluster chain, and any subdirectory cluster chain all resolve through
+//! one API — a directory's `first_cluster()` is the chain head). All of this is strictly read-only.
+//!
 //! Handles both a **superfloppy** (the FAT BPB sits at LBA 0, no partition table) and an
 //! **MBR-partitioned** disk (an MBR at LBA 0 whose partition entry points at the BPB). All
 //! multi-byte on-disk fields are little-endian. Parsing is read-only — a mis-parse can at worst
@@ -69,12 +77,23 @@ pub enum FatKind {
     Fat32,
 }
 
-/// A parsed short (8.3) directory entry. Long-file-name (LFN) entries are skipped, so the name is
-/// the on-disk short name (uppercase, e.g. `KERNEL.ELF`).
+/// PI-FS-3: the widest long name we carry inline. A VFAT LFN is at most 255 UTF-16 code units; its
+/// UTF-8 encoding can be up to 3 bytes per BMP unit, so a fully-3-byte 255-unit name needs 765 bytes.
+/// We store the decoded UTF-8 inline (keeps `DirEntry: Copy` and `name() -> &str` — no signature churn
+/// on the presentation callers); a name whose UTF-8 would not fit falls back to its 8.3 short name.
+const LNAME_MAX: usize = 768;
+
+/// A parsed directory entry. Carries the on-disk short (8.3) name (uppercase, e.g. `KERNEL.ELF`) and,
+/// when VFAT long-file-name (LFN) entries preceded it and validated (PI-FS-3), the decoded UTF-8 long
+/// name. `name()` returns the long name when present, else the short; `eq_name` matches EITHER, so a
+/// lookup by the long spelling OR the 8.3 short both resolve.
 #[derive(Clone, Copy)]
 pub struct DirEntry {
-    name: [u8; 12], // "NAME.EXT", NUL-padded (max 8 + '.' + 3 = 12)
+    name: [u8; 12], // 8.3 short name: "NAME.EXT", NUL-padded (max 8 + '.' + 3 = 12)
     name_len: u8,
+    /// PI-FS-3: decoded UTF-8 long name; `lname_len == 0` means "no LFN — use the 8.3 short name".
+    lname: [u8; LNAME_MAX],
+    lname_len: u16,
     pub is_dir: bool,
     pub size: u32,
     first_cluster: u32,
@@ -111,17 +130,39 @@ impl FatTimestamp {
 }
 
 impl DirEntry {
-    /// The 8.3 name as text (e.g. `"KERNEL.ELF"`).
-    pub fn name(&self) -> &str {
+    /// The entry's short (8.3) name as text (e.g. `"KERNEL.ELF"`).
+    fn short_name(&self) -> &str {
         core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("?")
     }
 
-    /// Case-insensitive match against an 8.3 name (short names are stored uppercase on disk, so
-    /// `cat hello.txt` finds `HELLO.TXT`).
+    /// The display name: the decoded VFAT long name when one is present (PI-FS-3), else the 8.3 short
+    /// name. The long-name bytes are always valid UTF-8 (built by `LfnBuf::decode_into`), so the
+    /// `unwrap_or` fallback to the short name never triggers in practice.
+    pub fn name(&self) -> &str {
+        if self.lname_len > 0 {
+            core::str::from_utf8(&self.lname[..self.lname_len as usize]).unwrap_or_else(|_| self.short_name())
+        } else {
+            self.short_name()
+        }
+    }
+
+    /// Case-insensitive match against EITHER the long name or the 8.3 short name. Short names are stored
+    /// uppercase on disk (so `cat hello.txt` finds `HELLO.TXT`); with PI-FS-3 a lookup by the long
+    /// spelling (`cat .fseventsd`) also resolves. The long compare is ASCII-case-insensitive byte-wise —
+    /// exact for the ASCII names our callers use; non-ASCII long names match only by identical bytes.
     fn eq_name(&self, other: &str) -> bool {
-        let me = &self.name[..self.name_len as usize];
-        me.len() == other.len()
-            && me.iter().zip(other.bytes()).all(|(a, b)| a.eq_ignore_ascii_case(&b))
+        let short = &self.name[..self.name_len as usize];
+        if short.len() == other.len()
+            && short.iter().zip(other.bytes()).all(|(a, b)| a.eq_ignore_ascii_case(&b))
+        {
+            return true;
+        }
+        if self.lname_len > 0 {
+            let long = &self.lname[..self.lname_len as usize];
+            return long.len() == other.len()
+                && long.iter().zip(other.bytes()).all(|(a, b)| a.eq_ignore_ascii_case(&b));
+        }
+        false
     }
 
     /// The entry's first data cluster — the chain head a `read_at` walk starts from (U6b: `SYS_OPEN`
@@ -201,6 +242,8 @@ fn classify_dir_slot(e: &[u8]) -> DirSlot {
     DirSlot::Entry(DirEntry {
         name,
         name_len: n as u8,
+        lname: [0u8; LNAME_MAX],
+        lname_len: 0,
         is_dir: attr & 0x10 != 0,
         size: u32le(e, 28),
         first_cluster: ((u16le(e, 20) as u32) << 16) | u16le(e, 26) as u32,
@@ -270,14 +313,161 @@ fn format_83(name: &str) -> Option<[u8; 11]> {
     Some(out)
 }
 
-/// Parse one 512-byte directory sector, appending real file/dir entries to `out`. Returns `true`
-/// if a 0x00 (end-of-directory) marker was reached, telling the caller to stop scanning.
-fn scan_dir_sector(sec: &[u8; SECTOR_SIZE], out: &mut alloc::vec::Vec<DirEntry>) -> bool {
+/// PI-FS-3: the VFAT long-file-name checksum — computed over a short entry's 11 on-disk name bytes
+/// (Microsoft FAT spec). Every LFN component slot stores this checksum at offset 13; a component whose
+/// checksum disagrees with the short entry it precedes is orphaned (from a deleted/renamed file) and is
+/// discarded, so a stale LFN run can never mislabel a live short entry.
+fn lfn_checksum(short11: &[u8; 11]) -> u8 {
+    let mut sum: u8 = 0;
+    for &b in short11.iter() {
+        sum = (((sum & 1) << 7).wrapping_add(sum >> 1)).wrapping_add(b);
+    }
+    sum
+}
+
+/// PI-FS-3: accumulates the VFAT long-file-name component slots (attribute 0x0F) that physically PRECEDE
+/// a short (8.3) entry, then decodes them into a UTF-8 long name once the short entry is reached. LFN
+/// components appear in REVERSE order — the LAST component first, flagged by bit 6 (0x40) in its ordinal
+/// byte — so we see the highest ordinal first and place each component's 13 UTF-16 units at
+/// `(ordinal-1)*13`. A run is accepted only when it is contiguous (ordinals N..1 with no gap), every
+/// component carries the same checksum, and that checksum matches the short entry's name field. Any
+/// inconsistency (out-of-range ordinal, checksum split, non-descending sequence, a deleted/volume-label
+/// slot interrupting the run) marks the buffer broken and the entry falls back to its 8.3 short name.
+struct LfnBuf {
+    /// Up to 20 components × 13 UTF-16 code units (VFAT caps a name at 255 chars → ≤ 20 components).
+    units: [u16; 20 * 13],
+    max_ord: usize, // highest ordinal seen (0 = no active run)
+    prev_ord: usize, // last ordinal consumed, for the descend-by-one contiguity check
+    checksum: u8,
+    broken: bool,
+}
+
+impl LfnBuf {
+    fn new() -> Self {
+        LfnBuf { units: [0u16; 20 * 13], max_ord: 0, prev_ord: 0, checksum: 0, broken: false }
+    }
+
+    /// Drop any partially-accumulated run (a live short entry with no LFN, a deleted slot, a volume
+    /// label, or an inconsistency all break the run).
+    fn reset(&mut self) {
+        self.max_ord = 0;
+        self.prev_ord = 0;
+        self.broken = false;
+    }
+
+    /// Consume one 0x0F long-name component slot `e` (32 bytes).
+    fn push(&mut self, e: &[u8]) {
+        let b0 = e[0];
+        let is_last = b0 & 0x40 != 0;
+        let ord = (b0 & 0x1F) as usize;
+        let cksum = e[13];
+        if ord == 0 || ord > 20 {
+            self.broken = true; // impossible ordinal — poison the run
+            return;
+        }
+        if is_last {
+            // Start a fresh run: the last component (highest ordinal) leads the reversed sequence.
+            self.reset();
+            self.max_ord = ord;
+            self.checksum = cksum;
+            self.prev_ord = ord + 1; // so the contiguity check below accepts this first component
+        }
+        if self.max_ord == 0 {
+            self.broken = true; // a non-last component with no active run — orphan
+            return;
+        }
+        if cksum != self.checksum || ord + 1 != self.prev_ord {
+            self.broken = true; // checksum split, or a gap / non-descending ordinal
+            return;
+        }
+        self.prev_ord = ord;
+        // The 13 UTF-16 units live at three disjoint spans within the slot (offsets 1, 14, 28).
+        const OFFS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+        let base = (ord - 1) * 13;
+        for (k, &o) in OFFS.iter().enumerate() {
+            self.units[base + k] = u16le(e, o);
+        }
+    }
+
+    /// The short entry `short11` (its 11 on-disk name bytes) has been reached: if a complete, checksum-
+    /// matching LFN run accumulated, decode it into `de`'s long name. Consumes (resets) the run either
+    /// way, so the next entry starts clean.
+    fn attach(&mut self, short11: &[u8; 11], de: &mut DirEntry) {
+        let ok = self.max_ord != 0
+            && !self.broken
+            && self.prev_ord == 1 // descended contiguously all the way to component 1
+            && lfn_checksum(short11) == self.checksum;
+        if ok {
+            self.decode_into(de);
+        }
+        self.reset();
+    }
+
+    /// Decode the accumulated UTF-16 units (up to the 0x0000 terminator) into `de.lname` as UTF-8. On a
+    /// name whose UTF-8 would overflow `LNAME_MAX`, leaves `de` untouched (falls back to the 8.3 name).
+    fn decode_into(&self, de: &mut DirEntry) {
+        let total = self.max_ord * 13;
+        let mut n = 0usize;
+        while n < total && self.units[n] != 0x0000 {
+            n += 1; // stop at the NUL terminator; trailing 0xFFFF padding sits beyond it
+        }
+        let mut buf = [0u8; LNAME_MAX];
+        let mut len = 0usize;
+        for ch in core::char::decode_utf16(self.units[..n].iter().copied()) {
+            let c = ch.unwrap_or('\u{FFFD}');
+            let mut tmp = [0u8; 4];
+            let s = c.encode_utf8(&mut tmp);
+            if len + s.len() > LNAME_MAX {
+                return; // too long to carry inline — keep the 8.3 fallback
+            }
+            buf[len..len + s.len()].copy_from_slice(s.as_bytes());
+            len += s.len();
+        }
+        if len == 0 {
+            return;
+        }
+        de.lname = buf;
+        de.lname_len = len as u16;
+    }
+}
+
+/// Parse one 512-byte directory sector, appending real file/dir entries to `out`, threading the VFAT
+/// long-name accumulator `lfn` across sector (and cluster) boundaries so a long name split across the
+/// slot preceding a short entry is reassembled correctly. Returns `true` if a 0x00 (end-of-directory)
+/// marker was reached, telling the caller to stop scanning. LFN component slots (attr 0x0F) feed `lfn`;
+/// a deleted slot or volume label breaks any run in progress; each real short entry consumes the run.
+fn scan_dir_sector(
+    sec: &[u8; SECTOR_SIZE],
+    out: &mut alloc::vec::Vec<DirEntry>,
+    lfn: &mut LfnBuf,
+) -> bool {
     for i in 0..(SECTOR_SIZE / 32) {
-        match classify_dir_slot(&sec[i * 32..i * 32 + 32]) {
-            DirSlot::End => return true,
-            DirSlot::Skip => continue,
-            DirSlot::Entry(de) => out.push(de),
+        let e = &sec[i * 32..i * 32 + 32];
+        match e[0] {
+            0x00 => return true, // end of directory
+            0xE5 => {
+                lfn.reset(); // a deleted slot (incl. a deleted LFN component) interrupts any run
+                continue;
+            }
+            _ => {}
+        }
+        let attr = e[11];
+        if attr & 0x0F == 0x0F {
+            lfn.push(e); // long-name component
+            continue;
+        }
+        if attr & 0x08 != 0 {
+            lfn.reset(); // volume label — not a name, breaks a run
+            continue;
+        }
+        match classify_dir_slot(e) {
+            DirSlot::Entry(mut de) => {
+                let mut short11 = [0u8; 11];
+                short11.copy_from_slice(&e[0..11]);
+                lfn.attach(&short11, &mut de);
+                out.push(de);
+            }
+            _ => lfn.reset(),
         }
     }
     false
@@ -313,6 +503,14 @@ pub struct FatFs {
     /// rows never attach to this volume; a full byte-for-byte clone preserves both and is NOT rejected — offline
     /// tampering is out of scope).
     vol_id: u32,
+    /// PI-FS-5: `BS_VolLab`, the 11-byte volume label the formatter stamped into the boot sector (offset 0x2B on
+    /// FAT16, 0x47 on FAT32). Read-only; space-padded on disk, surfaced trimmed by [`FatFs::label`] for `diskinfo`.
+    /// A blank/`NO NAME    ` field renders as empty (the caller shows a `-` then).
+    vol_label: [u8; 11],
+    /// PIUSB-27: which block device every sector read of this volume routes to. `Default` for the
+    /// globally-registered device (SD on the Pi); `Usb` for a read-only mount of the USB stick read
+    /// straight through the xHCI controller.
+    source: BlockSource,
 }
 
 // ---- little-endian field readers ------------------------------------------------------------
@@ -335,10 +533,26 @@ fn u64le(b: &[u8], off: usize) -> u64 {
     (u32le(b, off) as u64) | ((u32le(b, off + 4) as u64) << 32)
 }
 
-/// Read one 512-byte sector at absolute `lba` into `buf`. Treats a short copy as I/O error, so
+/// PIUSB-27: which block device a `FatFs` reads through. `Default` is the globally-registered block device
+/// (`crate::drivers::block::read_block` — the microSD on the Pi, the USB stick on x86/QEMU); `Usb` reads the
+/// USB mass-storage stick DIRECTLY through the xHCI controller (`read_block_usb`), independent of the block
+/// layer's backend selector — so on the Pi (where the SD backend owns the global device) the USB stick can be
+/// mounted read-only alongside the SD-hosted unafs volume. A `Usb`-sourced mount is STRICTLY read-only: the
+/// write path (`write_sector`) refuses the `Usb` source, so no FAT/dir/data write can ever reach the stick.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BlockSource {
+    Default,
+    Usb,
+}
+
+/// Read one 512-byte sector at absolute `lba` into `buf` from `source`. Treats a short copy as I/O error, so
 /// callers can assume a full sector on success.
-fn read_sector(lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), FatError> {
-    match crate::drivers::block::read_block(lba, buf) {
+fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), FatError> {
+    let r = match source {
+        BlockSource::Default => crate::drivers::block::read_block(lba, buf),
+        BlockSource::Usb => crate::drivers::block::read_block_usb(lba, buf),
+    };
+    match r {
         Ok(n) if n >= SECTOR_SIZE => Ok(()),
         _ => Err(FatError::Io),
     }
@@ -347,11 +561,15 @@ fn read_sector(lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), FatError> {
 /// U9: write one full 512-byte sector at absolute `lba` from `buf`. The write half of `read_sector`; the
 /// caller supplies a whole sector (a read-modify-write already merged the changed bytes). Any block error
 /// is `FatError::Io`. Used ONLY by `write_at`, which passes only LBAs it walked out of an existing chain.
-fn write_sector(lba: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), FatError> {
-    match crate::drivers::block::write_block(lba, buf) {
-        Ok(()) => Ok(()),
-        Err(_) => Err(FatError::Io),
-    }
+/// USB-WRITE (supersedes PIUSB-27's blanket refusal): a `Usb`-sourced volume routes to the verified
+/// BOT WRITE(10) path (`write_block_usb`, MISSION-gated with an RMW+restore witness); any source
+/// without a verified write path would still be refused here.
+fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), FatError> {
+    let r = match source {
+        BlockSource::Default => crate::drivers::block::write_block(lba, buf),
+        BlockSource::Usb => crate::drivers::block::write_block_usb(lba, buf),
+    };
+    r.map_err(|_| FatError::Io)
 }
 
 /// F2 (SMP-hardening): the FAT-table mutation lock. Serializes the read-modify-write of a FAT sector so two
@@ -487,7 +705,12 @@ fn f2_witness_step() {
 /// also what distinguishes a superfloppy BPB from an MBR boot sector — an MBR's bootstrap bytes
 /// won't pass the jump-instruction, sector-size, and geometry-consistency gates. FAT12 and
 /// non-512-byte sectors are rejected as `Unsupported`.
-fn parse_bpb(sec: &[u8; SECTOR_SIZE], part_lba: u64, dev_blocks: u64) -> Result<FatFs, FatError> {
+fn parse_bpb(
+    sec: &[u8; SECTOR_SIZE],
+    part_lba: u64,
+    dev_blocks: u64,
+    source: BlockSource,
+) -> Result<FatFs, FatError> {
     // BS_JmpBoot (offset 0): a FAT VBR starts with EB xx 90 or E9 xx xx. Strong VBR discriminator.
     if !(sec[0] == 0xEB || sec[0] == 0xE9) {
         return Err(FatError::NotFat);
@@ -600,6 +823,12 @@ fn parse_bpb(sec: &[u8; SECTOR_SIZE], part_lba: u64, dev_blocks: u64) -> Result<
     // FAT32 (both well within the already-read boot sector). Read-only; used only as a UNAFS.ATR binding fingerprint.
     let vol_id = u32le(sec, if kind == FatKind::Fat32 { 0x43 } else { 0x27 });
 
+    // PI-FS-5: BS_VolLab — the formatter's 11-byte volume label. Extended-BPB field: offset 0x2B on FAT12/16,
+    // 0x47 on FAT32 (both within the already-read boot sector). Read-only, surfaced trimmed by `label()`.
+    let mut vol_label = [0u8; 11];
+    let lab_off = if kind == FatKind::Fat32 { 0x47 } else { 0x2B };
+    vol_label.copy_from_slice(&sec[lab_off..lab_off + 11]);
+
     Ok(FatFs {
         kind,
         part_lba,
@@ -615,6 +844,8 @@ fn parse_bpb(sec: &[u8; SECTOR_SIZE], part_lba: u64, dev_blocks: u64) -> Result<
         root_dir_sectors,
         count_of_clusters,
         vol_id,
+        vol_label,
+        source,
     })
 }
 
@@ -622,24 +853,36 @@ fn parse_bpb(sec: &[u8; SECTOR_SIZE], part_lba: u64, dev_blocks: u64) -> Result<
 /// LBA 0), a GPT (an `EFI PART` header at LBA 1 → partition entry → BPB), then a classic MBR at
 /// LBA 0 whose first FAT-typed partition entry points at the BPB.
 pub fn mount() -> Result<FatFs, FatError> {
-    let dev = crate::drivers::block::info().ok_or(FatError::NoDisk)?;
+    mount_source(BlockSource::Default)
+}
+
+/// PIUSB-27: mount a FAT volume from a chosen block `source`. `Default` is the globally-registered device
+/// (SD on the Pi); `Usb` reads the USB stick directly through the xHCI controller so it can be browsed
+/// read-only even while the SD backend owns the global block device. Geometry comes from the matching
+/// source (`info` / `usb_info`); the partition/BPB scan and every derived read route through `source`.
+pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
+    let dev = match source {
+        BlockSource::Default => crate::drivers::block::info(),
+        BlockSource::Usb => crate::drivers::block::usb_info(),
+    }
+    .ok_or(FatError::NoDisk)?;
     if dev.block_size != SECTOR_SIZE as u32 {
         return Err(FatError::Unsupported);
     }
     let dev_blocks = dev.num_blocks;
 
     let mut sec = [0u8; SECTOR_SIZE];
-    read_sector(0, &mut sec)?;
+    read_sector(source, 0, &mut sec)?;
 
     // 1) Superfloppy: LBA 0 is itself the BPB.
-    if let Ok(fs) = parse_bpb(&sec, 0, dev_blocks) {
+    if let Ok(fs) = parse_bpb(&sec, 0, dev_blocks, source) {
         return Ok(fs);
     }
 
     // 2) GPT: an "EFI PART" header at LBA 1 (LBA 0 is a protective MBR). Checked BEFORE the MBR scan
     //    because a GPT disk's protective MBR entry (type 0xEE, start LBA 1) would otherwise be
     //    misread as a classic partition and send us to parse a BPB at the GPT header sector.
-    if let Ok(fs) = scan_gpt(dev_blocks) {
+    if let Ok(fs) = scan_gpt(dev_blocks, source) {
         return Ok(fs);
     }
 
@@ -659,10 +902,10 @@ pub fn mount() -> Result<FatFs, FatError> {
                 continue;
             }
             let mut pbs = [0u8; SECTOR_SIZE];
-            if read_sector(start as u64, &mut pbs).is_err() {
+            if read_sector(source, start as u64, &mut pbs).is_err() {
                 continue;
             }
-            if let Ok(fs) = parse_bpb(&pbs, start as u64, dev_blocks) {
+            if let Ok(fs) = parse_bpb(&pbs, start as u64, dev_blocks, source) {
                 return Ok(fs);
             }
         }
@@ -675,12 +918,12 @@ pub fn mount() -> Result<FatFs, FatError> {
 /// partition entry array for the first entry whose start LBA holds a valid FAT BPB. Returns NotFat
 /// if there is no GPT or no FAT partition. Read-only; the scan is bounded (≤128 entries), and only
 /// entry sizes that divide a 512-byte sector (128 / 256) are handled so no entry straddles a read.
-fn scan_gpt(dev_blocks: u64) -> Result<FatFs, FatError> {
+fn scan_gpt(dev_blocks: u64, source: BlockSource) -> Result<FatFs, FatError> {
     if dev_blocks < 3 {
         return Err(FatError::NotFat);
     }
     let mut hdr = [0u8; SECTOR_SIZE];
-    read_sector(1, &mut hdr)?;
+    read_sector(source, 1, &mut hdr)?;
     if &hdr[0..8] != b"EFI PART" {
         return Err(FatError::NotFat);
     }
@@ -700,7 +943,7 @@ fn scan_gpt(dev_blocks: u64) -> Result<FatFs, FatError> {
             break;
         }
         if sec != cur_sec {
-            if read_sector(sec, &mut buf).is_err() {
+            if read_sector(source, sec, &mut buf).is_err() {
                 break;
             }
             cur_sec = sec;
@@ -715,10 +958,10 @@ fn scan_gpt(dev_blocks: u64) -> Result<FatFs, FatError> {
             continue;
         }
         let mut pbs = [0u8; SECTOR_SIZE];
-        if read_sector(first_lba, &mut pbs).is_err() {
+        if read_sector(source, first_lba, &mut pbs).is_err() {
             continue;
         }
-        if let Ok(fs) = parse_bpb(&pbs, first_lba, dev_blocks) {
+        if let Ok(fs) = parse_bpb(&pbs, first_lba, dev_blocks, source) {
             return Ok(fs);
         }
     }
@@ -808,7 +1051,7 @@ impl FatFs {
         }
         let within = (offset % SECTOR_SIZE as u64) as usize;
         let mut buf = [0u8; SECTOR_SIZE];
-        read_sector(self.fat_start + fat as u64 * self.fat_sz as u64 + sec, &mut buf)?;
+        read_sector(self.source, self.fat_start + fat as u64 * self.fat_sz as u64 + sec, &mut buf)?;
         Ok(match self.kind {
             FatKind::Fat16 => u16le(&buf, within) as u32,
             FatKind::Fat32 => u32le(&buf, within) & 0x0FFF_FFFF,
@@ -836,6 +1079,24 @@ impl FatFs {
     /// launcher computes the expected chain length rather than assuming a fixed 2.
     pub fn cluster_size(&self) -> u32 {
         self.sec_per_clus * self.bytes_per_sec
+    }
+
+    /// PI-FS-5: the volume's formatted usable capacity in bytes (`count_of_clusters * cluster_size`) — the
+    /// data-region size a `diskinfo` line reports for the FAT volume. Not the raw device size (which the block
+    /// geometry gives): this is what the filesystem actually addresses.
+    pub fn volume_bytes(&self) -> u64 {
+        self.count_of_clusters as u64 * self.cluster_size() as u64
+    }
+
+    /// PI-FS-5: the trimmed `BS_VolLab` volume label (ASCII, space-padded on disk). Returns an empty string when
+    /// the field is blank or the conventional `NO NAME` placeholder, so `diskinfo` can show a `-` instead.
+    pub fn label(&self) -> String {
+        let raw = core::str::from_utf8(&self.vol_label).unwrap_or("").trim_end_matches([' ', '\0']);
+        if raw.is_empty() || raw == "NO NAME" {
+            String::new()
+        } else {
+            String::from(raw)
+        }
     }
 
     /// The end-of-chain marker to write into a terminal cluster's FAT entry (`>= 0xFFF8` / `>= 0x0FFFFFF8`
@@ -877,7 +1138,7 @@ impl FatFs {
         let mut buf = [0u8; SECTOR_SIZE];
         for f in 0..self.num_fats as u64 {
             let lba = self.fat_start + f * self.fat_sz as u64 + sec;
-            read_sector(lba, &mut buf)?;
+            read_sector(self.source, lba, &mut buf)?;
             match self.kind {
                 FatKind::Fat16 => {
                     let v = (next & 0xFFFF) as u16;
@@ -889,7 +1150,7 @@ impl FatFs {
                     buf[within..within + 4].copy_from_slice(&v.to_le_bytes());
                 }
             }
-            write_sector(lba, &buf)?;
+            write_sector(self.source, lba, &buf)?;
         }
         Ok(())
     }
@@ -903,7 +1164,7 @@ impl FatFs {
         }
         let zeros = [0u8; SECTOR_SIZE];
         for s in 0..self.sec_per_clus as u64 {
-            write_sector(self.cluster_lba(cluster) + s, &zeros)?;
+            write_sector(self.source, self.cluster_lba(cluster) + s, &zeros)?;
         }
         Ok(())
     }
@@ -937,7 +1198,7 @@ impl FatFs {
                 break; // past the FAT region (defensive — parse_bpb already gates this)
             }
             if sec != loaded {
-                read_sector(self.fat_start + sec, &mut buf)?;
+                read_sector(self.source, self.fat_start + sec, &mut buf)?;
                 loaded = sec;
             }
             let within = (offset % SECTOR_SIZE as u64) as usize;
@@ -952,7 +1213,7 @@ impl FatFs {
                 // `with_fat_lock` span rule). On x86 the lock is inert (single FAT writer by construction).
                 let claimed = with_fat_lock(|| -> Result<bool, FatError> {
                     let mut cbuf = [0u8; SECTOR_SIZE];
-                    read_sector(self.fat_start + sec, &mut cbuf)?;
+                    read_sector(self.source, self.fat_start + sec, &mut cbuf)?;
                     let cur = match self.kind {
                         FatKind::Fat16 => u16le(&cbuf, within) as u32,
                         FatKind::Fat32 => u32le(&cbuf, within) & 0x0FFF_FFFF,
@@ -1035,9 +1296,10 @@ impl FatFs {
     fn read_fixed_root16(&self) -> Result<alloc::vec::Vec<DirEntry>, FatError> {
         let mut out = alloc::vec::Vec::new();
         let mut buf = [0u8; SECTOR_SIZE];
+        let mut lfn = LfnBuf::new();
         for s in 0..self.root_dir_sectors as u64 {
-            read_sector(self.root_dir_lba + s, &mut buf)?;
-            if scan_dir_sector(&buf, &mut out) {
+            read_sector(self.source, self.root_dir_lba + s, &mut buf)?;
+            if scan_dir_sector(&buf, &mut out, &mut lfn) {
                 break;
             }
         }
@@ -1052,13 +1314,14 @@ impl FatFs {
         let mut cluster = start;
         let mut hops = 0u32;
         let mut buf = [0u8; SECTOR_SIZE];
+        let mut lfn = LfnBuf::new();
         loop {
             if !self.valid_cluster(cluster) {
                 return Err(FatError::BadChain);
             }
             for s in 0..self.sec_per_clus as u64 {
-                read_sector(self.cluster_lba(cluster) + s, &mut buf)?;
-                if scan_dir_sector(&buf, &mut out) {
+                read_sector(self.source, self.cluster_lba(cluster) + s, &mut buf)?;
+                if scan_dir_sector(&buf, &mut out, &mut lfn) {
                     return Ok(out);
                 }
             }
@@ -1115,7 +1378,7 @@ impl FatFs {
                 return Err(FatError::BadChain);
             }
             for s in 0..self.sec_per_clus as u64 {
-                read_sector(self.cluster_lba(cluster) + s, &mut buf)?;
+                read_sector(self.source, self.cluster_lba(cluster) + s, &mut buf)?;
                 let take = core::cmp::min(remaining, SECTOR_SIZE);
                 out.extend_from_slice(&buf[..take]);
                 remaining -= take;
@@ -1189,7 +1452,7 @@ impl FatFs {
                         skip -= SECTOR_SIZE; // this whole sector is still before `start`
                         continue;
                     }
-                    read_sector(self.cluster_lba(cluster) + s, &mut buf)?;
+                    read_sector(self.source, self.cluster_lba(cluster) + s, &mut buf)?;
                     let from = skip; // nonzero only on the first partially-skipped sector
                     skip = 0;
                     let take = core::cmp::min(want, SECTOR_SIZE - from);
@@ -1278,9 +1541,9 @@ impl FatFs {
                     // Read-modify-write: read the sector, overwrite [from..from+take], write it back. Even a
                     // full-sector overwrite reads first (uniform RMW — the brief's "read-modify-write the
                     // touched sectors"; a partial first/last sector's untouched bytes MUST be preserved).
-                    read_sector(lba, &mut buf)?;
+                    read_sector(self.source, lba, &mut buf)?;
                     buf[from..from + take].copy_from_slice(&data[src_off..src_off + take]);
-                    write_sector(lba, &buf)?;
+                    write_sector(self.source, lba, &buf)?;
                     src_off += take;
                     want -= take;
                     if want == 0 {
@@ -1321,7 +1584,7 @@ impl FatFs {
         let mut buf = [0u8; SECTOR_SIZE];
         for s in 0..self.root_dir_sectors as u64 {
             let lba = self.root_dir_lba + s;
-            read_sector(lba, &mut buf)?;
+            read_sector(self.source, lba, &mut buf)?;
             for i in 0..(SECTOR_SIZE / 32) {
                 match classify_dir_slot(&buf[i * 32..i * 32 + 32]) {
                     DirSlot::End => return Err(FatError::NotFound),
@@ -1349,7 +1612,7 @@ impl FatFs {
             }
             for s in 0..self.sec_per_clus as u64 {
                 let lba = self.cluster_lba(cluster) + s;
-                read_sector(lba, &mut buf)?;
+                read_sector(self.source, lba, &mut buf)?;
                 for i in 0..(SECTOR_SIZE / 32) {
                     match classify_dir_slot(&buf[i * 32..i * 32 + 32]) {
                         DirSlot::End => return Err(FatError::NotFound),
@@ -1396,13 +1659,13 @@ impl FatFs {
         // same sector can no longer read-before-our-write and clobber this publish (or vice versa).
         with_dir_lock(|| {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(lba, &mut buf)?;
+            read_sector(self.source, lba, &mut buf)?;
             let hi = (first_cluster >> 16) as u16;
             let lo = (first_cluster & 0xFFFF) as u16;
             buf[off + 20..off + 22].copy_from_slice(&hi.to_le_bytes());
             buf[off + 26..off + 28].copy_from_slice(&lo.to_le_bytes());
             buf[off + 28..off + 32].copy_from_slice(&size.to_le_bytes());
-            write_sector(lba, &buf)?;
+            write_sector(self.source, lba, &buf)?;
             Ok(())
         })
     }
@@ -1427,7 +1690,7 @@ impl FatFs {
         }
         with_dir_lock(|| {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(lba, &mut buf)?;
+            read_sector(self.source, lba, &mut buf)?;
             let hi = (first_cluster >> 16) as u16;
             let lo = (first_cluster & 0xFFFF) as u16;
             buf[off + 20..off + 22].copy_from_slice(&hi.to_le_bytes());
@@ -1438,7 +1701,7 @@ impl FatFs {
                 buf[off + 22..off + 24].copy_from_slice(&mt.to_le_bytes());
                 buf[off + 24..off + 26].copy_from_slice(&md.to_le_bytes());
             }
-            write_sector(lba, &buf)?;
+            write_sector(self.source, lba, &buf)?;
             Ok(())
         })
     }
@@ -1512,9 +1775,9 @@ impl FatFs {
             let in_sec = in_clus % SECTOR_SIZE;
             let lba = self.cluster_lba(cluster) + sec_in_clus;
             let take = core::cmp::min(data.len() - written, SECTOR_SIZE - in_sec);
-            read_sector(lba, &mut buf)?;
+            read_sector(self.source, lba, &mut buf)?;
             buf[in_sec..in_sec + take].copy_from_slice(&data[written..written + take]);
-            write_sector(lba, &buf)?;
+            write_sector(self.source, lba, &buf)?;
             written += take;
             pos += take;
         }
@@ -1541,7 +1804,7 @@ impl FatFs {
         // JD6: this with_dir_lock slot-write body is TWINNED VERBATIM in `create_in_dir` — keep the two in sync.
         with_dir_lock(|| {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(lba, &mut buf)?;
+            read_sector(self.source, lba, &mut buf)?;
             // Write a fresh 32-byte entry: 11-byte name, attr, everything else zero (NTRes/times = 0,
             // first_cluster hi@20 lo@26 = 0, size@28 = 0). Never set the volume-label bit — a file/dir entry.
             for b in buf[off..off + 32].iter_mut() {
@@ -1554,7 +1817,7 @@ impl FatFs {
             let (mt, md) = crate::clock::fat_stamp();
             buf[off + 22..off + 24].copy_from_slice(&mt.to_le_bytes());
             buf[off + 24..off + 26].copy_from_slice(&md.to_le_bytes());
-            write_sector(lba, &buf)?;
+            write_sector(self.source, lba, &buf)?;
             // Re-parse the slot we just wrote so the returned DirEntry is byte-for-byte what a reader sees.
             match classify_dir_slot(&buf[off..off + 32]) {
                 DirSlot::Entry(de) => Ok((de, lba, off)),
@@ -1616,7 +1879,7 @@ impl FatFs {
         // ⚠ VERBATIM TWIN of `create_in_root`'s with_dir_lock block — keep in sync (seat review diffs these).
         with_dir_lock(|| {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(lba, &mut buf)?;
+            read_sector(self.source, lba, &mut buf)?;
             // Write a fresh 32-byte entry: 11-byte name, attr, everything else zero (NTRes/times = 0,
             // first_cluster hi@20 lo@26 = 0, size@28 = 0). Never set the volume-label bit — a file/dir entry.
             for b in buf[off..off + 32].iter_mut() {
@@ -1629,7 +1892,7 @@ impl FatFs {
             let (mt, md) = crate::clock::fat_stamp();
             buf[off + 22..off + 24].copy_from_slice(&mt.to_le_bytes());
             buf[off + 24..off + 26].copy_from_slice(&md.to_le_bytes());
-            write_sector(lba, &buf)?;
+            write_sector(self.source, lba, &buf)?;
             // Re-parse the slot we just wrote so the returned DirEntry is byte-for-byte what a reader sees.
             match classify_dir_slot(&buf[off..off + 32]) {
                 DirSlot::Entry(de) => Ok((de, lba, off)),
@@ -1688,9 +1951,18 @@ impl FatFs {
         buf[43] = 0x10;
         buf[52..54].copy_from_slice(&((parent_first_cluster >> 16) as u16).to_le_bytes());
         buf[58..60].copy_from_slice(&((parent_first_cluster & 0xFFFF) as u16).to_le_bytes());
+        // CLOCK-3: stamp the last-write time/date words (@0x16/@0x18) of BOTH `.` and `..` from the
+        // unified kernel clock, the same path every other fat.rs writer uses — a fresh subdir now carries
+        // a real mtime instead of the all-zero (dashed) placeholder. `(0, 0)` while the clock is unset,
+        // so the unset-boot on-disk bytes are byte-identical to the pre-CLOCK-3 zeroed field.
+        let (mt, md) = crate::clock::fat_stamp();
+        buf[22..24].copy_from_slice(&mt.to_le_bytes()); //  "."  time @0x16
+        buf[24..26].copy_from_slice(&md.to_le_bytes()); //  "."  date @0x18
+        buf[54..56].copy_from_slice(&mt.to_le_bytes()); //  ".." time @0x16 (entry base 32 + 22)
+        buf[56..58].copy_from_slice(&md.to_le_bytes()); //  ".." date @0x18 (entry base 32 + 24)
         // size@28..32 and @60..64 stay 0 (directories report size 0); the rest of the cluster is already
         // zero (alloc_cluster), so this one sector fully initializes the directory.
-        write_sector(self.cluster_lba(self_cluster), &buf)
+        write_sector(self.source, self.cluster_lba(self_cluster), &buf)
     }
 
     /// FATDIRS: create a subdirectory `name` in the directory at `parent_first_cluster` (`0` ⇒ the volume
@@ -1862,9 +2134,9 @@ impl FatFs {
         }
         with_dir_lock(|| {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(lba, &mut buf)?;
+            read_sector(self.source, lba, &mut buf)?;
             buf[off..off + 11].copy_from_slice(raw);
-            write_sector(lba, &buf)?;
+            write_sector(self.source, lba, &buf)?;
             Ok(())
         })
     }
@@ -1972,7 +2244,7 @@ impl FatFs {
         // move. A plain read of the source slot; the mutations below take their own DIR_MUTATION locks.
         let attr = {
             let mut sbuf = [0u8; SECTOR_SIZE];
-            read_sector(src_lba, &mut sbuf)?;
+            read_sector(self.source, src_lba, &mut sbuf)?;
             sbuf[src_off + 11]
         };
         // 1. Publish the DESTINATION entry FIRST (crash order). `create_in_dir` writes a fresh
@@ -2007,7 +2279,7 @@ impl FatFs {
         let mut buf = [0u8; SECTOR_SIZE];
         for s in 0..self.root_dir_sectors as u64 {
             let lba = self.root_dir_lba + s;
-            read_sector(lba, &mut buf)?;
+            read_sector(self.source, lba, &mut buf)?;
             for i in 0..(SECTOR_SIZE / 32) {
                 let b0 = buf[i * 32];
                 if b0 == 0x00 || b0 == 0xE5 {
@@ -2028,7 +2300,7 @@ impl FatFs {
             }
             for s in 0..self.sec_per_clus as u64 {
                 let lba = self.cluster_lba(cluster) + s;
-                read_sector(lba, &mut buf)?;
+                read_sector(self.source, lba, &mut buf)?;
                 for i in 0..(SECTOR_SIZE / 32) {
                     let b0 = buf[i * 32];
                     if b0 == 0x00 || b0 == 0xE5 {
@@ -2065,9 +2337,9 @@ impl FatFs {
         // sector can no longer resurrect the `0xE5` (lost-delete), nor this delete clobber its publish.
         with_dir_lock(|| {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(dir_lba, &mut buf)?;
+            read_sector(self.source, dir_lba, &mut buf)?;
             buf[dir_off] = 0xE5;
-            write_sector(dir_lba, &buf)?;
+            write_sector(self.source, dir_lba, &buf)?;
             Ok(())
         })
     }
@@ -2127,7 +2399,7 @@ impl FatFs {
                 break;
             }
             if sec != loaded {
-                read_sector(self.fat_start + sec, &mut buf)?;
+                read_sector(self.source, self.fat_start + sec, &mut buf)?;
                 loaded = sec;
             }
             let within = (offset % SECTOR_SIZE as u64) as usize;
@@ -2195,5 +2467,143 @@ pub fn probe_once() {
             }
         }
         Err(e) => serial_println!("FS: no FAT filesystem ({:?})", e),
+    }
+}
+
+/// PIUSB-27: map a [`FatError`] to a short human reason for the mount witness line.
+#[cfg(target_arch = "aarch64")]
+pub fn fat_reason(e: FatError) -> &'static str {
+    match e {
+        FatError::NoDisk => "no USB block device",
+        FatError::Unsupported => "unsupported sector geometry",
+        FatError::Io => "block I/O error",
+        FatError::NotFat => "no FAT partition/BPB found",
+        FatError::BadChain => "corrupt FAT chain",
+        FatError::NotFound => "entry not found",
+        FatError::IsDirectory => "is a directory",
+        _ => "mount failed",
+    }
+}
+
+/// PIUSB-27: mount the USB stick's FAT volume READ-ONLY and emit the storage-ready witness. Called from
+/// the xHCI storage bring-up event (`service_storage`) so it fires ONCE per bring-up and again on every
+/// hot-plug re-enumeration. Strictly read-only: the mount reads through [`BlockSource::Usb`] (the xHCI
+/// direct path), so it works even when the microSD owns the global block device. On success it prints the
+/// geometry (FAT type / size / cluster size) and the first-level entry list; on failure an honest reason.
+/// The live `GET /fs/usb` HTTP route re-mounts per request — this line is the boot/hot-plug evidence.
+/// PIUSB-27: main-loop hook — when the xHCI bring-up has raised the USB storage-ready edge, mount the
+/// stick's FAT volume read-only and emit the witness. Runs with the xHCI controller lock RELEASED (the
+/// mount re-locks it briefly through `read_block_usb`), exactly like `probe_once`; the edge re-arms on
+/// every hot-plug re-enumeration, so a re-inserted stick is re-mounted and re-witnessed. Safe to call
+/// every main-loop iteration — it no-ops until the edge is raised, then fires once per raise.
+#[cfg(target_arch = "aarch64")]
+pub fn piusb27_service() {
+    if crate::drivers::block::take_usb_ready() {
+        piusb27_mount_witness();
+    }
+}
+
+/// PIUSB-27: mount the USB stick's FAT volume READ-ONLY and emit the storage-ready witness — the
+/// geometry (FAT type / size / cluster size) and the first-level entry list on success, an honest reason
+/// on failure. The live `GET /fs/usb` HTTP route re-mounts per request; this line is the boot/hot-plug
+/// evidence. Strictly read-only: the mount reads through [`BlockSource::Usb`] (the xHCI direct path), so
+/// it works even when the microSD owns the global block device.
+#[cfg(target_arch = "aarch64")]
+pub fn piusb27_mount_witness() {
+    match mount_source(BlockSource::Usb) {
+        Ok(fs) => {
+            let kind = match fs.kind() {
+                FatKind::Fat16 => 16,
+                FatKind::Fat32 => 32,
+            };
+            let (bs, nb) = match crate::drivers::block::usb_info() {
+                Some(d) => (d.block_size as u64, d.num_blocks),
+                None => (SECTOR_SIZE as u64, 0),
+            };
+            let size_mib = nb.saturating_mul(bs) / (1024 * 1024);
+            serial_println!(
+                ":: piusb27: mounted FAT{} {} MiB cluster-size={}B as /fs/usb ::",
+                kind, size_mib, fs.cluster_size()
+            );
+            match fs.read_root() {
+                Ok(entries) => {
+                    let mut list = String::new();
+                    for de in &entries {
+                        if list.len() > 240 {
+                            list.push_str(" …");
+                            break;
+                        }
+                        if !list.is_empty() {
+                            list.push_str(", ");
+                        }
+                        if de.is_dir {
+                            list.push_str(de.name());
+                            list.push('/');
+                        } else {
+                            list.push_str(de.name());
+                        }
+                    }
+                    serial_println!(
+                        ":: piusb27: /fs/usb root: {} entries [{}] ::",
+                        entries.len(), list
+                    );
+                    // PI-FS-3: descend the tree to prove arbitrary-depth subdirectory traversal (root →
+                    // subdir → nested…). Bounded depth guards a malformed self-referential volume.
+                    piusb27_walk_subtree(&fs, &entries, "/fs/usb", 0);
+                }
+                Err(e) => serial_println!(":: piusb27: root read error ({}) ::", fat_reason(e)),
+            }
+            // PI-FS-5: prove the SHELL's `ls /usb` collector sees the same mount (the `:: ls1: /usb... ::`
+            // witness), so the shell and the `/fs/usb` HTTP route never disagree on the namespace.
+            crate::shell::pi_usb_ls_witness();
+        }
+        Err(e) => serial_println!(":: piusb27: no FAT volume ({}) ::", fat_reason(e)),
+    }
+}
+
+/// PI-FS-3: recursively list every subdirectory of `entries` (already-listed contents of the directory
+/// at `prefix`), emitting one witness line per subdirectory with its full path and entry list — the
+/// proof that traversal reaches arbitrary depth (FAT16 fixed root / FAT32 root chain / subdir cluster
+/// chains all resolve through `read_dir`). Skips the `.`/`..` self/parent links so the walk terminates,
+/// and caps depth at 8 as a belt-and-braces guard against a malformed self-referential volume (on top of
+/// `read_dir_chain`'s own chain-loop guard). aarch64-only, mirroring the witness it extends.
+#[cfg(target_arch = "aarch64")]
+fn piusb27_walk_subtree(fs: &FatFs, entries: &[DirEntry], prefix: &str, depth: u32) {
+    if depth >= 8 {
+        return;
+    }
+    for de in entries {
+        if !de.is_dir {
+            continue;
+        }
+        let nm = de.name();
+        if nm == "." || nm == ".." {
+            continue; // self/parent links — do not recurse
+        }
+        let path = alloc::format!("{}/{}", prefix, nm);
+        match fs.read_dir(de.first_cluster()) {
+            Ok(sub) => {
+                let mut list = String::new();
+                for e in &sub {
+                    if list.len() > 200 {
+                        list.push_str(" …");
+                        break;
+                    }
+                    if !list.is_empty() {
+                        list.push_str(", ");
+                    }
+                    list.push_str(e.name());
+                    if e.is_dir {
+                        list.push('/');
+                    }
+                }
+                serial_println!(
+                    ":: piusb27: {} ({} entries) [{}] ::",
+                    path, sub.len(), list
+                );
+                piusb27_walk_subtree(fs, &sub, &path, depth + 1);
+            }
+            Err(e) => serial_println!(":: piusb27: {} read error ({}) ::", path, fat_reason(e)),
+        }
     }
 }

@@ -122,30 +122,6 @@ fn classify_sector0(buf: &[u8; SECTOR]) -> &'static str {
     "unknown (no recognised signature)"
 }
 
-/// The built-in v1 payload — a small, self-describing marker/manifest blob. HONEST BY DESIGN (M2
-/// adjudication): a Pi "install" payload is ultimately the boot volume's FAT files (kernel8.img +
-/// start4.elf + config.txt — what the GPU ROM loads), i.e. the running system's own boot media. At this
-/// pre-shell BSP call site those files are not reachable as a readable clone source, so — rather than
-/// fake one — we write a marker the in-tree FAT reader can find, and FLAG the self-clone (copy the boot
-/// FAT files) as the named metal follow-up (mirrors the Orin INSTALL-2 self-clone). Spans several sectors
-/// so the extent machinery is exercised across a chain.
-#[cfg(feature = "piinstall_confirm")]
-fn installer_marker_payload() -> alloc::vec::Vec<u8> {
-    let mut v = alloc::vec::Vec::with_capacity(4096);
-    v.extend_from_slice(
-        b"UNAOS-INSTALL-PI marker payload v1\n\
-          Written by the booted UnaOS installer onto the Pi's emmc2 microSD.\n\
-          The v1 self-clone (copy the boot FAT files: kernel8.img/start4.elf/config.txt) is the\n\
-          named metal follow-up.\n",
-    );
-    let mut i: usize = 0;
-    while v.len() < 4096 {
-        v.push(((i.wrapping_mul(37).wrapping_add(13)) & 0xFF) as u8);
-        i += 1;
-    }
-    v
-}
-
 /// INSTALL-PI entry (Pi BSP boot path, post-`emmc2::probe`). Runs the three-gate escalation: census +
 /// announce (Gate 1), the armed scratch ladder (Gate 2), the destructive install (Gate 3). Each higher
 /// gate is compiled in only under its feature, so a plain `piinstall` build ends at the census.
@@ -275,16 +251,30 @@ fn restore_or_warn(lba: u64, stash: &[u8; SECTOR]) -> bool {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
-// Gate 3 — the DESTRUCTIVE install. Compiled out unless `piinstall_confirm`. Drives the arch-neutral
-// installer engine onto the seated microSD after the about-to-destroy announcement. Handles a NON-blank
-// card (unlike the engine's blank-only demo): announce it, then re-establish the FAT blank-precondition
-// by zeroing exactly the ESP metadata region before formatting — the Orin `install_flow` shape.
+// Gate 3 — the DESTRUCTIVE install: the SELF-CLONE (INSTALL-PI-2). Compiled out unless `piinstall_confirm`.
+// Drives the arch-neutral installer engine onto the seated microSD after the about-to-destroy announcement,
+// with the payload being the running system's OWN boot media — the card's FAT boot partition (kernel8.img /
+// config.txt / the firmware files the GPU ROM loads), cloned file-by-file onto a fresh GPT + FAT32 layout.
+//
+// SAME-DEVICE clone (the Pi analogue of the Orin §INSTALL-2, which clones a SEPARATE USB stick onto the SD):
+// the Pi has ONE block device — the seated card is BOTH the source boot media AND the install target. So the
+// source boot tree is SNAPSHOTTED WHOLE INTO MEMORY (`install::clone::snapshot`) BEFORE the first destructive
+// write; only then does the GPT + zero + FAT32 + tree-write pass run, mirroring the buffered tree back via the
+// engine's `TreeWriter`. Every cloned file is re-read off the card and sha-verified through the engine's own
+// `verify_extents` — the installer's content-verify. Handles a NON-blank card: announce it, then re-establish
+// the FAT blank-precondition by zeroing exactly the ESP metadata region before formatting.
+//
+// PARTITION RULING (byte-clone vs fresh-format): the boot FAT tree is cloned BY CONTENT (fresh FAT32 ESP,
+// files re-written + per-file sha-verified) — never a raw byte-clone. A source data/unafs partition is NOT
+// byte-copied: `write_gpt` lays a FRESH empty data partition. This follows the Orin §INSTALL-2 ruling and the
+// engine's verify discipline — every cloned byte must be file-sha-verifiable, which a raw partition image is
+// not, and the boot media the ROM needs is the FAT tree. See installer_engine.md §INSTALL-PI-2.
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
 
 #[cfg(feature = "piinstall_confirm")]
 fn install_to_pi(mut t: EmmcInstallTarget, sec0: &[u8; SECTOR]) {
     serial_println!(
-        "{} Gate 3 THIRD GATE (UNAOS_PIINSTALL_CONFIRM) — installing UnaOS onto the SEATED Pi microSD ::",
+        "{} Gate 3 THIRD GATE (UNAOS_PIINSTALL_CONFIRM) — self-cloning the running boot media onto the SEATED Pi microSD ::",
         PS
     );
     serial_println!(
@@ -300,20 +290,41 @@ fn install_to_pi(mut t: EmmcInstallTarget, sec0: &[u8; SECTOR]) {
     );
 
     match install_flow(&mut t) {
-        Ok(()) => serial_println!(":: INSTALL: pi emmc2 gpt+fat32+copy verify => PASS ::"),
+        Ok(n) => serial_println!(":: INSTALL: pi emmc2 gpt+zero+fat32+clone({} files) verify => PASS ::", n),
         Err(e) => serial_println!(":: INSTALL: pi emmc2 install => FAIL ({:?}) ::", e),
     }
 }
 
-/// The engine driver, factored out so `?` early-returns land on the single FAIL line above.
+/// The engine driver: returns the number of files cloned (so `?` early-returns land on the single FAIL line
+/// above). Snapshots the seated card's own boot tree into memory, then lays a fresh GPT + FAT32 and mirrors
+/// the buffered tree back onto it, sha-verifying every cloned file off the card.
 #[cfg(feature = "piinstall_confirm")]
-fn install_flow(t: &mut EmmcInstallTarget) -> Result<(), InstallError> {
-    use super::{fat32, gpt, hash, verify_extents};
+fn install_flow(t: &mut EmmcInstallTarget) -> Result<usize, InstallError> {
+    use super::{clone, fat32, gpt, verify_extents};
+
+    // 0) SNAPSHOT the source boot tree WHOLE into memory BEFORE any destructive write. The seated card is
+    //    both the source and the target, so once the GPT is rewritten the source is gone — buffer it first.
+    //    `fs::fat::mount()` reads `drivers::block` (the same emmc2 card the census bound); its FAT boot
+    //    partition is the running system's own boot media.
+    let tree = {
+        let src = crate::fs::fat::mount().map_err(|_| InstallError::NotReady)?;
+        serial_println!("{}   INSTALL: mounted the card's own boot partition — {} ::", PS, src.describe());
+        clone::snapshot(&src)?
+    };
+    if tree.file_count == 0 {
+        // A boot partition with no files is not a self to clone — refuse rather than "PASS" a hollow card.
+        serial_println!("{}   INSTALL: the card's boot partition carried no files to clone => FAIL ::", PS);
+        return Err(InstallError::BadArg);
+    }
+    serial_println!(
+        "{}   INSTALL: snapshotted the boot tree into memory — {} files, {} bytes (source now safe to overwrite) ::",
+        PS, tree.file_count, tree.total_bytes
+    );
 
     // 1) GPT: protective MBR + primary/backup + ESP + data, with the engine's own parse-back verify.
     let layout = gpt::write_gpt(t)?;
     serial_println!(
-        "{}   GPT written + parse-back verified — ESP LBA {}..{}, data LBA {}..{} of {} sectors ::",
+        "{}   INSTALL: GPT written + parse-back verified — ESP LBA {}..{}, data LBA {}..{} of {} sectors ::",
         PS, layout.esp_first_lba, layout.esp_last_lba, layout.data_first_lba, layout.data_last_lba,
         layout.total_sectors
     );
@@ -328,29 +339,42 @@ fn install_flow(t: &mut EmmcInstallTarget) -> Result<(), InstallError> {
         t.write_sectors(layout.esp_first_lba + s, &zero)?;
     }
     serial_println!(
-        "{}   zeroed {} ESP metadata sectors (reserved + both FATs) to re-establish the blank-precondition ::",
+        "{}   INSTALL: zeroed {} ESP metadata sectors (reserved + both FATs) to re-establish the blank-precondition ::",
         PS, blank_sectors
     );
 
     // 3) FAT32 format the ESP.
     let geom = fat32::format_esp(t, layout.esp_first_lba, esp_sectors)?;
     serial_println!(
-        "{}   ESP formatted FAT32 — fat_sz={}sec clusters={} data@vol+{} ::",
+        "{}   INSTALL: ESP formatted FAT32 — fat_sz={}sec clusters={} data@vol+{} ::",
         PS, geom.fat_sz, geom.count_of_clusters, geom.data_start
     );
 
-    // 4) Copy the v1 marker payload, recording extents; then content-verify by re-reading them off the card.
-    let payload = installer_marker_payload();
-    let payload_sha = hash::sha256(&payload);
-    let extents = fat32::write_payload_file(t, &geom, "UNAOS.IMG", &payload)?;
+    // 4) THE SELF-CLONE: mirror the buffered boot tree onto the freshly-formatted ESP, recording each
+    //    file's extents for the content-verify below.
+    let recs = clone::write_snapshot(t, geom, &tree)?;
+    let data_extents: usize = recs.iter().map(|r| r.extents.len()).sum();
     serial_println!(
-        "{}   copied UNAOS.IMG ({} bytes, {} extents) ::",
-        PS, payload.len(), extents.len()
+        "{}   INSTALL: cloned {} files ({} data extents) from the boot tree ::",
+        PS, recs.len(), data_extents
     );
-    if !verify_extents(t, &extents, &payload_sha)? {
-        serial_println!("{}   extent sha-verify => FAIL ::", PS);
-        return Err(InstallError::VerifyFailed);
+
+    // 5) Content-verify EVERY cloned file by re-reading its extents off the card and SHA-checking — the
+    //    installer's content-verify IS the bench's content-verify, now native. Print the per-file manifest
+    //    (the real manifest that replaces INSTALL-1's single UNAOS.IMG marker).
+    for r in &recs {
+        if !verify_extents(t, &r.extents, &r.sha)? {
+            serial_println!("{}   INSTALL: {} extent sha-verify => FAIL ::", PS, r.path);
+            return Err(InstallError::VerifyFailed);
+        }
+        serial_println!(
+            "{}   INSTALL: {} ({} B, {} extents) sha256={} => VERIFIED ::",
+            PS, r.path, r.size, r.extents.len(), clone::sha_hex(&r.sha)
+        );
     }
-    serial_println!("{}   extent sha-verify (re-read every written extent off the card) => PASS ::", PS);
-    Ok(())
+    serial_println!(
+        "{}   INSTALL: all {} cloned files re-read off the card + sha-verified => PASS ::",
+        PS, recs.len()
+    );
+    Ok(recs.len())
 }

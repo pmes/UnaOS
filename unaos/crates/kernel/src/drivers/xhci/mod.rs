@@ -18,6 +18,7 @@ pub mod trb;
 pub mod ring;
 pub mod event;
 pub mod context;
+pub mod dma_coherency;
 pub mod ftdi;
 // STOR-1: the interrupt-driven storage service task + BlockRequest submit/complete. x86_64 + the
 // `irqstorage` knob only — the default build never links it, so the staged storage path is untouched.
@@ -30,6 +31,12 @@ use self::event::{EventRing, ErstEntry, ErstTable};
 use self::context::{InputContext, DeviceContext, CTX_WORDS};
 use spin::Mutex;
 use alloc::vec::Vec;
+
+/// PIUSB-36 step 3: a dedicated static 512-byte buffer living in the kernel image's `.bss`
+/// (physical address typically <4 MiB — a wholly different region from the 32 MiB heap the SCSI
+/// data buffer comes from). One-boot experiment scratch only; read-only DMA target for the matrix.
+#[cfg(target_arch = "aarch64")]
+static mut PIUSB36_STATIC_BUF: [u8; 512] = [0; 512];
 
 /// Flip to `true` to restore the very verbose per-doorbell / per-event xHCI tracing.
 /// Left `false` so the serial log shows only milestones and errors.
@@ -117,10 +124,14 @@ pub(crate) const HID_SCANCODE_TO_ASCII: [(u8, u8); 104] = [
     (0x7F, 0x7F), // 0x4C: Delete
     (0, 0), // 0x4D: End
     (0, 0), // 0x4E: PageDown
-    (0, 0), // 0x4F: Right Arrow
-    (0, 0), // 0x50: Left Arrow
-    (0, 0), // 0x51: Down Arrow
-    (0, 0), // 0x52: Up Arrow
+    // HID-KEYS: arrow keys map into the C0 control range (no printable-ASCII collision), so a
+    // console consumer sees a distinct control byte and a game/UI consumer can bind them. Chosen
+    // consistent with the table's existing control-code convention (Esc 0x1B, Backspace 0x08,
+    // Delete 0x7F): 0x1C..0x1F, otherwise unused here. Shift does not change an arrow.
+    (0x1C, 0x1C), // 0x4F: Right Arrow
+    (0x1D, 0x1D), // 0x50: Left Arrow
+    (0x1E, 0x1E), // 0x51: Down Arrow
+    (0x1F, 0x1F), // 0x52: Up Arrow
     (0, 0), // 0x53: Num Lock
     (b'/', b'/'), // 0x54: Keypad /
     (b'*', b'*'), // 0x55: Keypad *
@@ -407,7 +418,56 @@ pub static mut ERST_TABLE: ErstTable = ErstTable { entries: [ErstEntry { ring_ad
 // Store Physical Address of the Event Ring for Runtime ERDP updates
 static mut EVENT_RING_PHYS_BASE: u64 = 0;
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+/// PIUSB-10: set true once USBSTS.CNR has been observed clear (in `init_interrupter`, immediately
+/// before the first op/runtime-register programming). `init_pointers` and `start` refuse to write
+/// their registers if this is false, so a controller that never reports Ready (a wedged CNR) fails
+/// LOUD and honestly instead of silently dropping every CRCR/DCBAAP/ERST/RS write into a not-ready
+/// controller. Defaults true so a path that never runs the wait behaves exactly as before; on x86
+/// CNR clears near-instantly, so this is always true and the guards are behaviourally invisible.
+static XHCI_CNR_OK: AtomicBool = AtomicBool::new(true);
+
+/// xHCI 5.4.1 / 4.2: after a Chip Hardware Reset (HCRST) software MUST NOT write ANY Doorbell,
+/// Operational, or Runtime (interrupter) register until USBSTS.CNR (Controller Not Ready, bit 11)
+/// reads 0. Intel clears CNR near-instantly, so on x86 this returns true on the first poll and is a
+/// behavioural no-op. The Pi's VL805 holds CNR set for up to ~100s of ms while it loads its internal
+/// firmware after HCRST, and — witnessed on metal (boot-P20: USBSTS=0x811, CNR=1) — every op/runtime
+/// register write issued while CNR=1 is silently DROPPED (CRCR/DCBAAP/ERST all read back 0, RS never
+/// latches). The pre-HCRST reset writes (USBCMD.RS clear to halt, then HCRST) are the ONLY register
+/// writes that legitimately precede this wait — per spec 4.2 the CNR wait belongs AFTER HCRST, which
+/// is exactly where this runs (the reset path is in `init()` / `reset()`; this gates the ring/
+/// interrupter programming that follows). Bounded by `hw_wait_budget()` (~2.5 s aarch64 / ~2 s x86,
+/// comfortably over the VL805's fw-load); a few-ms interval between polls. Returns false on timeout
+/// so the caller aborts loudly rather than programming a not-ready controller (no hang either way —
+/// the budget is a hard wall-clock bound).
+fn wait_for_cnr_clear(op_base: usize) -> bool {
+    let usbsts = (op_base + 0x04) as *const u32;
+    let budget = hw_wait_budget();
+    let start = crate::arch::now_cycles();
+    // A few-ms pause between polls so a slow fw-load is not hammered with back-to-back MMIO reads.
+    let poll_gap = (budget / 800).max(1);
+    let mut polls: u64 = 0;
+    loop {
+        polls += 1;
+        if unsafe { core::ptr::read_volatile(usbsts) } & (1 << 11) == 0 {
+            #[cfg(target_arch = "aarch64")]
+            serial_println!("xHCI: CNR cleared after {} polls", polls);
+            return true;
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) > budget {
+            serial_println!(
+                "xHCI: FATAL — USBSTS.CNR still 1 after {} polls (~{} cyc); aborting xHCI register programming (spec 5.4.1: op/runtime writes while CNR=1 are dropped)",
+                polls, budget
+            );
+            return false;
+        }
+        let gap_start = crate::arch::now_cycles();
+        while crate::arch::now_cycles().wrapping_sub(gap_start) < poll_gap {
+            core::hint::spin_loop();
+        }
+    }
+}
 
 // --- Interrupt-driven xHCI (MSI-X via the local APIC) ---
 // These let the interrupt handler acknowledge the interrupter using ONLY raw MMIO and
@@ -420,6 +480,20 @@ pub static XHCI_IR0_BASE: AtomicUsize = AtomicUsize::new(0);
 pub static XHCI_OP_BASE: AtomicUsize = AtomicUsize::new(0);
 /// Count of xHCI interrupts taken — a diagnostic to confirm the MSI-X path is live.
 pub static XHCI_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// PIUSB-39 witness counters. `MOUSE_REARM_COUNT` = every `queue_mouse_read` the transfer
+/// dispatch issued; `MOUSE_DISCARD_REARM_COUNT` = completions the dup-Success guard threw away
+/// but which STILL re-armed the interrupt-IN read (the pipeline-preserving exit the P54b metal
+/// fact needed). Bumped unconditionally (cheap relaxed adds); only the knob-gated witness prints.
+pub static MOUSE_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Completions the dup-Success GUARD discarded and re-armed (mismatching `param`, not the known
+/// dup) — the population the P54b fix is about.
+pub static MOUSE_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Re-arms driven by a non-halting ERROR completion on the pointer endpoint. A different
+/// population from `MOUSE_DISCARD_REARM_COUNT`: counted (and printed) separately so a metal
+/// capture can tell which hole it just watched get plugged. Halting errors are NOT counted here —
+/// they go to `service_hid_halts`, which prints its own line.
+pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Acknowledge an xHCI interrupt at the hardware level so the interrupter can raise again.
 /// Safe to call from interrupt context: it takes NO locks and does NO allocation — it clears
@@ -467,6 +541,72 @@ pub unsafe fn ring_doorbell_asm(doorbell_addr: u64, target: u32) {
     core::arch::asm!("dsb st", options(nostack, preserves_flags));
     core::ptr::write_volatile(doorbell_addr as *mut u32, target);
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Write a 64-bit xHCI operational/runtime register as an ordered pair of 32-bit
+/// stores — low dword first, then high dword. xHCI 5.1 explicitly permits every
+/// 64-bit register (CRCR, DCBAAP, ERSTBA, ERDP) to be accessed as two 32-bit
+/// registers, and this is the ONLY portable form.
+///
+/// PIUSB-21 root cause: on the Pi 4 the VL805 sits behind the brcmstb PCIe root
+/// complex, whose BAR window does not carry 8-byte MMIO TLPs. A single AArch64
+/// `str x` (64-bit store) is down-converted by the RC and the 32-bit data lane is
+/// REPLICATED into both dwords — a `0x02003240` DCBAAP write reads back
+/// `0x0200324002003240`, an ERSTBA/ERDP write likewise (`0x0015b7800015b780`,
+/// `0x0014fa400014fa40`). The mirrored high dword pushes every controller DMA base
+/// above 4 GiB, outside the RC_BAR2 inbound window (RAM @ 0, 4 GiB), so the command
+/// ring, ERST, and event ring all fetch from garbage: the ring shows CRR=1 but no
+/// command completes and no event is ever posted. Splitting into two 32-bit stores
+/// delivers the correct low dword and a true-zero high dword.
+///
+/// x86 is unaffected either way: Intel/AMD root complexes carry native 64-bit MMIO
+/// (no replication), and two 32-bit stores are byte-identical there — this mirrors
+/// Linux's universal `lo_hi_writeq`/`xhci_write_64`, so there is no x86 regression.
+#[inline(always)]
+unsafe fn write_reg64(reg: *mut u64, val: u64) {
+    let p = reg as *mut u32;
+    core::ptr::write_volatile(p, val as u32);
+    core::ptr::write_volatile(p.add(1), (val >> 32) as u32);
+}
+
+/// Read a 64-bit xHCI register as two 32-bit loads (low then high), reassembled.
+/// The same RC that replicates 64-bit stores also replicates 64-bit LOADS on the
+/// Pi (a single `ldr x` returns lo mirrored into hi); two 32-bit loads return the
+/// true low and high dwords. Byte-identical on x86.
+#[inline(always)]
+unsafe fn read_reg64(reg: *const u64) -> u64 {
+    let p = reg as *const u32;
+    let lo = core::ptr::read_volatile(p) as u64;
+    let hi = core::ptr::read_volatile(p.add(1)) as u64;
+    (hi << 32) | lo
+}
+
+/// Write the Event Ring Dequeue Pointer (ERDP, IR0 +0x18) as a **high-dword-first**
+/// pair of 32-bit stores — the reverse of `write_reg64`.
+///
+/// XHCI-INT root cause (PIUSB-22, the "one report then silent" wall). ERDP is the ONE
+/// 64-bit xHCI register with a *latch side effect*: its low dword carries EHB (bit 3,
+/// Event Handler Busy, RW1C) and DESI plus the low pointer bits, and the controller
+/// re-evaluates its event-ring free space — and clears EHB — the instant the low dword
+/// is written. `write_reg64` writes low-then-high (PIUSB-21 order, correct for the
+/// write-once init regs CRCR/DCBAAP/ERSTBA where nothing latches mid-pair). Applied to
+/// ERDP under the genuine two-store split that PIUSB-21 forces on the brcmstb RC, that
+/// order latches a TORN pointer: the low write commits the new low bits + clears EHB
+/// while the high dword still holds the previous value, so the controller computes a
+/// dequeue pointer with a stale (often mirror-garbage, >4 GiB) high dword, decides the
+/// ring is full, and stops posting transfer events — the interrupt-IN HID pipe delivers
+/// exactly one report then goes silent. The polled drain papers over it briefly (it reads
+/// the cycle bit straight from DRAM regardless of EHB) until the controller's producer
+/// catches the stale ERDP and halts. Writing HIGH first, then LOW (EHB + latch) last
+/// guarantees the full 64-bit pointer is in place before the controller latches.
+///
+/// x86 is unaffected: no RC replication, both stores land, and Intel/AMD re-evaluate on
+/// the complete pointer either order — byte-visible identical, MISSION gate unchanged.
+#[inline(always)]
+unsafe fn write_erdp(reg: *mut u64, val: u64) {
+    let p = reg as *mut u32;
+    core::ptr::write_volatile(p.add(1), (val >> 32) as u32); // high dword first
+    core::ptr::write_volatile(p, val as u32);                // low dword (EHB + latch) last
 }
 
 /// Direction of a Bulk-Only Transport data stage.
@@ -669,9 +809,22 @@ pub struct DeviceSlot {
     /// report (double cursor motion) AND re-arm a second read (ring over-arm). Set in
     /// `queue_mouse_read`, matched in `poll_events`/`handle_event_trb`.
     pub mouse_expect_phys: u64,
+    /// PIUSB-39: physical address of the PREVIOUS armed pointer TRB (the TD that was just
+    /// consumed, 0 = none yet). A genuine Panther-Point dup-Success names *that* TD — by then a
+    /// fresh read is already armed, so the dup must be discarded WITHOUT re-arming (re-arming
+    /// would over-arm the ring: the original UI1-MOUSE M2 hazard). Any OTHER mismatching `param`
+    /// is not a dup: it means the completion the endpoint just retired is one we cannot account
+    /// for, and the old `return` left the interrupt-IN endpoint permanently un-armed — the P54b
+    /// metal fact (mouse dead after an EL0 focus drop, keyboard alive). Those re-arm.
+    pub mouse_prev_phys: u64,
     /// Count of REAL (non-dup) pointer reports serviced since arming — drives the bounded serial
     /// mouse-witness (first report + every Nth), never one-line-per-report.
     pub mouse_report_count: u32,
+    /// GUI-CLICK-2: previous pointer-button bitmask for this slot, so the decode emits a
+    /// `pal::Event::Button` on the button-DOWN edge only (any bit going 0→1) and ignores the
+    /// matching release. Mirrors the EHCI press-edge idiom (ehci/mod.rs) and `CLICK1_PREV_MASK`.
+    /// 0 = no button held. Shared xHCI code: x86 xHCI mice track this identically.
+    pub mouse_prev_buttons: u8,
 
     pub is_keyboard: bool,
     pub keyboard_ep: u8,
@@ -693,6 +846,27 @@ pub struct DeviceSlot {
     /// mirrors the pointer path pre-emptively. Set in `queue_keyboard_read`, matched in the
     /// interrupt-IN transfer dispatch. On QEMU (no dup) `param` always matches, so it never trips.
     pub keyboard_expect_phys: u64,
+    /// PIUSB-39: physical address of the PREVIOUS armed keyboard TRB. Same discrimination as
+    /// `mouse_prev_phys`: a dup-Success for the consumed TD is discarded silently (a read is
+    /// already armed), any other mismatch discards the data but RE-ARMS the read.
+    pub keyboard_prev_phys: u64,
+    /// Count of boot-keyboard interrupt-IN reports serviced since the read was armed. Mirrors
+    /// `mouse_report_count`; drives the Pi-side PIUSB-13 `[enum]` first-report witness (the 0→1
+    /// edge is "the keyboard is live"). Inert on x86 (nothing reads it there).
+    pub keyboard_report_count: u32,
+    /// HID-KEYS: the six keycodes (report bytes 2..8) of this slot's PREVIOUS boot-keyboard
+    /// report. A boot report carries the FULL set of currently-pressed keys, so a keycode present
+    /// last report but absent now IS a release — the decode emits `pal::Event::KeyUp(ascii)` for
+    /// each such code (edge-detected here, mirroring the pointer-button press-edge idiom). All-zero
+    /// = no keys held. Seeded to zero at enumeration and cleared on slot reuse.
+    pub keyboard_prev_keys: [u8; 6],
+
+    /// HID-LED: current keyboard lock-LED bitmap for this slot (USB HID Output report,
+    /// LED usage page): bit0 = Num Lock, bit1 = Caps Lock, bit2 = Scroll Lock. Toggled on
+    /// the press edge of the corresponding lock key and pushed to the device via SET_REPORT
+    /// (0x21/0x09, wValue 0x0200). Caps also feeds the ascii case logic so the lit LED and the
+    /// typed case agree. Seeded to zero at enumeration and cleared on slot reuse.
+    pub keyboard_leds: u8,
 
     pub descriptor_buffer: *mut u8,
 
@@ -725,6 +899,11 @@ pub struct DeviceSlot {
     pub scsi_data_buffer: Option<*mut u8>, // data-stage buffer (>= one block)
     pub bulk_in_ep: u8,                    // bulk IN endpoint address (e.g. 0x81)
     pub bulk_out_ep: u8,                   // bulk OUT endpoint address (e.g. 0x02)
+    /// bInterfaceNumber of the Mass-Storage interface (SCSI Bulk-Only). This is the `wIndex` a
+    /// Bulk-Only Mass Storage Reset (`recover_bot_full`, PIUSB-38) targets. Captured in the config
+    /// walk when the class-0x08 interface is detected; 0 until then (the near-universal single-
+    /// interface stick, so 0 is also a safe default when the walk didn't record it).
+    pub storage_intf: u8,
 
     // --- XENUM-2: hub Status Change Endpoint (hot-plug behind a hub) ---
     /// True once this slot has been marked as a USB hub (set in `set_hub_slot_context`). Lets the
@@ -777,7 +956,9 @@ impl DeviceSlot {
             mouse_state: 0,
             mouse_ring: None,
             mouse_expect_phys: 0,
+            mouse_prev_phys: 0,
             mouse_report_count: 0,
+            mouse_prev_buttons: 0,
             is_keyboard: false,
             keyboard_ep: 0,
             keyboard_mps: 0,
@@ -786,6 +967,10 @@ impl DeviceSlot {
             keyboard_state: 0,
             keyboard_ring: None,
             keyboard_expect_phys: 0,
+            keyboard_prev_phys: 0,
+            keyboard_report_count: 0,
+            keyboard_prev_keys: [0; 6],
+            keyboard_leds: 0,
             descriptor_buffer: desc_buffer,
             ep0_expect_phys: 0,
             is_downstream: false,
@@ -796,6 +981,7 @@ impl DeviceSlot {
             scsi_data_buffer: None,
             bulk_in_ep: 0,
             bulk_out_ep: 0,
+            storage_intf: 0,
             is_hub: false,
             hub_nbr_ports: 0,
             hub_int_ep: 0,
@@ -847,7 +1033,17 @@ impl DeviceSlot {
         self.mouse_intf = 0;
         self.mouse_state = 0;
         self.mouse_expect_phys = 0;
+        self.mouse_prev_phys = 0;
         self.mouse_report_count = 0;
+        self.mouse_prev_buttons = 0;
+        // UVUG-5: a keyboard slot is being torn down (detach / disconnect / enum-recovery). Signal the
+        // host-side typematic tracker BEFORE clearing `is_keyboard`, so it can drop a key held at unplug —
+        // under SET_IDLE(0) that key's `KeyUp` will NEVER arrive, and without this the repeat synthesiser
+        // would inject `Event::Key` forever at the repeat rate. This is the single chokepoint every teardown
+        // path funnels through (dispose_disconnected_slots / recovery / dispose_downstream_slot).
+        if self.is_keyboard {
+            crate::pal::note_keyboard_detached();
+        }
         self.is_keyboard = false;
         self.keyboard_ep = 0;
         self.keyboard_mps = 0;
@@ -855,6 +1051,10 @@ impl DeviceSlot {
         self.keyboard_intf = 0;
         self.keyboard_state = 0;
         self.keyboard_expect_phys = 0;
+        self.keyboard_prev_phys = 0;
+        self.keyboard_report_count = 0;
+        self.keyboard_prev_keys = [0; 6];
+        self.keyboard_leds = 0;
         self.ep0_expect_phys = 0;
         self.is_downstream = false;
         self.route_string = 0;
@@ -951,6 +1151,12 @@ pub struct XhciController {
     /// protocol is the fixed [buttons, dx, dy] / [mods, resv, keys..] the decoders expect. Deferred
     /// to the main loop because it is a synchronous EP0 transfer (must not run in the event handler).
     hid_setproto_pending: Vec<u8>,
+    /// PIUSB-39 F1: HID interrupt-IN endpoints that completed with a HALTING error code and need
+    /// the full un-halt sequence before they can be re-armed. `(slot_id, is_mouse)`. Deferred to
+    /// the main loop for the same reason as `hid_setproto_pending`: the recovery is SYNCHRONOUS
+    /// (Reset Endpoint + Set TR Dequeue command TRBs, then an EP0 CLEAR_FEATURE) and must never
+    /// run re-entrantly inside the event-ring dispatch that noticed the error.
+    hid_halt_pending: Vec<(u8, bool)>,
     /// True while a port is mid-enumeration. Enumeration is serialized (one port at a time);
     /// this lets a hot-plug Connect Status Change event know whether to kick `start_next_port`
     /// immediately or just queue the port (the in-flight device's completion will drain it).
@@ -1087,6 +1293,7 @@ impl XhciController {
             hubs_pending: Vec::new(),
             hub_changes_pending: Vec::new(),
             hid_setproto_pending: Vec::new(),
+            hid_halt_pending: Vec::new(),
             enum_active: false,
             enumerating_port: 0,
             enum_saw_disconnect: false,
@@ -1153,10 +1360,24 @@ impl XhciController {
     /// the pushed TRB — the Command Completion event echoes it, so callers can match their own
     /// completion exactly (the root enumeration FSM tracks it in `enum_cmd_phys`; the sync hub
     /// path computes the same address in `run_command_sync`).
+    /// XHCI-COHERENCE: the context-bearing commands (ADDRESS_DEVICE=11, CONFIGURE_ENDPOINT=12,
+    /// EVALUATE_CONTEXT=13) carry an Input Context physical address in `parameter`; the controller
+    /// DMA-reads that struct when it consumes the command. Clean it to DRAM here — ONE chokepoint
+    /// for every context command, whichever builder produced it — so a non-snooping controller reads
+    /// the freshly-written context. No-op on coherent x86_64.
+    #[inline]
+    fn clean_cmd_input_ctx(trb: &Trb) {
+        let cmd_type = (trb.control >> 10) & 0x3F;
+        if matches!(cmd_type, 11 | 12 | 13) && trb.parameter != 0 {
+            dma_coherency::clean(trb.parameter as usize, core::mem::size_of::<InputContext>());
+        }
+    }
+
     pub fn send_command(&mut self, trb: Trb) -> Result<u64, &'static str> {
         if self.cmd_ring_stopped {
             return Err("command ring stopped (abort in progress)");
         }
+        Self::clean_cmd_input_ctx(&trb);
         let phys = {
             let mut g = COMMAND_RING.lock();
             let ring = g.as_mut().ok_or("command ring not initialised")?;
@@ -1299,9 +1520,11 @@ impl XhciController {
             core::ptr::write_volatile((self.op_base + 0x04) as *mut u32, 1 << 3);
 
             let new_dequeue_ptr = EVENT_RING_PHYS_BASE + (dequeue_index as u64 * 16);
-            // Bit 3 (EHB) is write-1-to-clear.
-            core::ptr::write_volatile((ir0_base + 0x18) as *mut u64, new_dequeue_ptr | 8);
-            xdbg!("xHCI: ERDP Advanced to {:#x}", new_dequeue_ptr);
+            // Bit 3 (EHB) is write-1-to-clear. High-dword-first (write_erdp) so the
+            // controller never latches a torn pointer when PIUSB-21 forces a real 32-bit
+            // split on the brcmstb RC — see write_erdp (XHCI-INT).
+            write_erdp((ir0_base + 0x18) as *mut u64, new_dequeue_ptr | 8);
+            xdbg!("[xhciint] ERDP advanced to {:#x} (EHB cleared, hi-first)", new_dequeue_ptr);
         }
     }
 
@@ -1664,6 +1887,63 @@ impl XhciController {
                                 self.queue_hub_change_read(slot_id as u8);
                                 return;
                             }
+
+                            // PIUSB-39: the SAME hole on the HID interrupt-IN endpoints. An ERROR
+                            // completion (STALL / transaction error / babble) on the pointer or
+                            // keyboard read falls straight through the success gate below, so the
+                            // read was never re-armed and the device went permanently dead — the
+                            // other half of the P54b metal fact (the mouse endpoint carries by far
+                            // the most traffic, so it is the one that loses this race). Trace and
+                            // re-arm, exactly as the hub Status Change Endpoint does; CErr=3 lets
+                            // the controller absorb transient errors itself, and the bounded
+                            // TransferRing keeps a truly wedged endpoint from looping the CPU.
+                            let (m_dci, k_dci, has_mbuf, has_kbuf) = {
+                                let s = &self.slots[slot_id as usize];
+                                let m = if s.is_mouse && s.mouse_ep != 0 {
+                                    Some((s.mouse_ep & 0x0F) * 2 + if (s.mouse_ep & 0x80) != 0 { 1 } else { 0 })
+                                } else { None };
+                                let k = if s.is_keyboard && s.keyboard_ep != 0 {
+                                    Some((s.keyboard_ep & 0x0F) * 2 + if (s.keyboard_ep & 0x80) != 0 { 1 } else { 0 })
+                                } else { None };
+                                (m, k, s.mouse_data_buffer.is_some() && s.mouse_ring.is_some(),
+                                 s.data_buffer.is_some() && s.keyboard_ring.is_some())
+                            };
+                            // A HALTING code leaves the endpoint in the Halted state, where it
+                            // IGNORES the doorbell: a bare re-queue would be a no-op and the
+                            // pointer would stay dead anyway. Those need the full un-halt
+                            // (Reset Endpoint + Set TR Dequeue + device CLEAR_FEATURE(HALT)),
+                            // which is synchronous and must not run inside this dispatch — queue
+                            // it for the main loop (`service_hid_halts`). Codes that leave the
+                            // endpoint RUNNING (e.g. 21 Ring Underrun / 22 Ring Overrun, 8 NAK,
+                            // vendor codes) just need the read re-armed here.
+                            // Halting: 2 Data Buffer Error, 3 Babble, 4 USB Transaction Error,
+                            // 5 TRB Error, 6 Stall (xHCI 1.1 Table 6-90 / §4.10.2.1).
+                            let halting = matches!(completion_code, 2 | 3 | 4 | 5 | 6);
+                            if m_dci == Some(endpoint_id as u8) && has_mbuf {
+                                Self::hid_error_witness(
+                                    "pointer", slot_id, completion_code, halting);
+                                if halting {
+                                    if !self.hid_halt_pending.contains(&(slot_id as u8, true)) {
+                                        self.hid_halt_pending.push((slot_id as u8, true));
+                                    }
+                                } else {
+                                    MOUSE_ERROR_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    self.queue_mouse_read(slot_id as u8);
+                                }
+                                return;
+                            }
+                            if k_dci == Some(endpoint_id as u8) && has_kbuf {
+                                Self::hid_error_witness(
+                                    "keyboard", slot_id, completion_code, halting);
+                                if halting {
+                                    if !self.hid_halt_pending.contains(&(slot_id as u8, false)) {
+                                        self.hid_halt_pending.push((slot_id as u8, false));
+                                    }
+                                } else {
+                                    self.queue_keyboard_read(slot_id as u8);
+                                }
+                                return;
+                            }
                         }
 
                         // UNA-19-REVEAL: If success or short packet, check buffer
@@ -1697,6 +1977,7 @@ impl XhciController {
                                     serial_println!("xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<");
                                     if self.slots[slot_id as usize].keyboard_state == 2 {
                                         self.slots[slot_id as usize].keyboard_state = 3;
+                                        self.slots[slot_id as usize].keyboard_report_count = 0;
                                         self.queue_keyboard_read(slot_id as u8);
                                     }
                                     if self.slots[slot_id as usize].mouse_state == 2 {
@@ -1740,6 +2021,9 @@ impl XhciController {
                                     serial_println!("xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<");
                                     unsafe {
                                         let desc_buf = self.slots[slot_id as usize].descriptor_buffer;
+                                        // XHCI-COHERENCE: consumer boundary — the descriptor was
+                                        // DMA-written by the controller; invalidate before reading. No-op x86.
+                                        dma_coherency::inval(desc_buf as usize, 256);
                                         let desc_data = core::slice::from_raw_parts(desc_buf, 256);
                                         let vid = (desc_data[8] as u16) | ((desc_data[9] as u16) << 8);
                                     let pid = (desc_data[10] as u16) | ((desc_data[11] as u16) << 8);
@@ -1830,6 +2114,10 @@ impl XhciController {
                                                     // collect its bulk endpoints below and configure after the walk.
                                                     serial_println!("xHCI: >>> MASS STORAGE INTERFACE DETECTED (Class 0x08) <<<");
                                                     is_mass_storage = true;
+                                                    // PIUSB-38: remember the MSC bInterfaceNumber
+                                                    // (descriptor byte +2) — the `wIndex` a Bulk-Only
+                                                    // Mass Storage Reset targets during reset recovery.
+                                                    self.slots[slot_id as usize].storage_intf = desc_data[offset + 2];
                                                 } else if current_intf_class == 0xFF {
                                                     // U2.5: a vendor-specific interface. The FTDI FT232 (device
                                                     // class 0x00 → Composite branch) exposes exactly one such
@@ -1941,12 +2229,40 @@ impl XhciController {
                                         // cursor motion and over-arm the interrupt-IN ring — the exact
                                         // EP0 hazard (`ep0_expect_phys`), applied to interrupt-IN. On
                                         // QEMU (no dup) `param` always matches, so this never trips.
+                                        //
+                                        // PIUSB-39: the guard STAYS (the dup hazard is real), but its
+                                        // exit must discard the DATA, never the PIPELINE. The old
+                                        // unconditional `return` retired the pointer interrupt-IN
+                                        // endpoint forever on ANY mismatched completion — the P54b
+                                        // metal fact (after an EL0 app's focus drop the mouse is
+                                        // permanently dead while the independently-armed keyboard
+                                        // keeps working). Discriminate:
+                                        //   * `param == mouse_prev_phys` — a genuine Panther-Point dup
+                                        //     for the TD we already consumed. A fresh read is ALREADY
+                                        //     armed, so re-arming here would over-arm the ring (the
+                                        //     exact UI1-MOUSE M2 hazard). Discard, do not re-arm.
+                                        //   * any other mismatch — the endpoint retired a TD we cannot
+                                        //     account for; nothing is guaranteed armed. Discard the
+                                        //     report, then RE-ARM so the pointer survives.
                                         if slot.mouse_expect_phys != 0 && param != slot.mouse_expect_phys {
+                                            let prev = slot.mouse_prev_phys;
+                                            let expect = slot.mouse_expect_phys;
+                                            let have_buf = slot.mouse_data_buffer.is_some()
+                                                && slot.mouse_ring.is_some();
                                             xdbg!("xHCI: stale/spurious pointer event (slot {}, trb {:#x}, expected {:#x}); ignoring.",
-                                                slot_id, param, slot.mouse_expect_phys);
+                                                slot_id, param, expect);
+                                            if param != prev && have_buf {
+                                                // Not the known dup — re-arm rather than lose the pointer.
+                                                MOUSE_DISCARD_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+                                                self.queue_mouse_read(slot_id as u8);
+                                                Self::piusb39_witness("guard");
+                                            }
                                             return;
                                         }
                                         if let Some(data_buf_ptr) = slot.mouse_data_buffer {
+                                            // XHCI-COHERENCE: consumer boundary — the interrupt-IN
+                                            // report was DMA-written; invalidate before decoding. No-op x86.
+                                            dma_coherency::inval(data_buf_ptr as usize, 512);
                                             let data_data = core::slice::from_raw_parts(data_buf_ptr, 512);
                                             let _buttons = data_data[0];
                                             // Metal diagnostic (parallels the keyboard dump): show the raw
@@ -2006,6 +2322,26 @@ impl XhciController {
                                             // `slot` (the shared borrow) is no longer read past here;
                                             // the &mut self accesses below are the count bump + re-arm.
 
+                                            // GUI-CLICK-2 / HID-KEYS: emit a Button on ANY mask
+                                            // change — both the press edge (a bit going 0→1) and the
+                                            // release edge (a bit going 1→0). The payload is always
+                                            // the CURRENT mask, so a consumer that only acts on
+                                            // presses stays correct (it sees a nonzero mask on press
+                                            // and a mask with the released bit cleared — often 0 — on
+                                            // release, which it ignores); a consumer that tracks
+                                            // held-state now gets the release it was missing (the
+                                            // GUI-CLICK-2b gap). A held button (unchanged mask) still
+                                            // does not re-fire. Shared xHCI code: x86 xHCI mice gain
+                                            // the same correct release edge (a fix, not a risk —
+                                            // EHCI keeps its own emit).
+                                            let prev_btn = self.slots[slot_id as usize].mouse_prev_buttons;
+                                            if buttons != prev_btn {
+                                                #[cfg(feature = "usbdebug")]
+                                                serial_println!("[hidkeys] button {:#04x} -> {:#04x} slot={}", prev_btn, buttons, slot_id);
+                                                crate::pal::push_event(crate::pal::Event::Button(buttons));
+                                            }
+                                            self.slots[slot_id as usize].mouse_prev_buttons = buttons;
+
                                             // UI1-MOUSE M1: bounded serial mouse-witness — first report
                                             // + every 32nd thereafter, NEVER one-per-report (that would
                                             // flood the FTDI on continuous motion). Uncounted
@@ -2036,12 +2372,30 @@ impl XhciController {
                                         // matches the armed read is real; a dup would double-inject
                                         // the keystrokes and over-arm the interrupt-IN ring. On QEMU
                                         // (no dup) `param` always matches, so this never trips.
+                                        // PIUSB-39: same pipeline-preserving exit as the pointer path
+                                        // (the keyboard carried the identical defect — only its lower
+                                        // traffic kept it from being observed on metal).
                                         if slot.keyboard_expect_phys != 0 && param != slot.keyboard_expect_phys {
+                                            let prev = slot.keyboard_prev_phys;
+                                            let expect = slot.keyboard_expect_phys;
+                                            let have_buf = slot.data_buffer.is_some()
+                                                && slot.keyboard_ring.is_some();
                                             xdbg!("xHCI: stale/spurious keyboard event (slot {}, trb {:#x}, expected {:#x}); ignoring.",
-                                                slot_id, param, slot.keyboard_expect_phys);
+                                                slot_id, param, expect);
+                                            if param != prev && have_buf {
+                                                self.queue_keyboard_read(slot_id as u8);
+                                            }
                                             return;
                                         }
                                         if let Some(data_buf_ptr) = slot.data_buffer {
+                                            // XHCI-COHERENCE: consumer boundary — the boot-keyboard
+                                            // report was DMA-written; invalidate before decoding. No-op x86.
+                                            dma_coherency::inval(data_buf_ptr as usize, 8);
+                                            // PIUSB-13: count every serviced keyboard report (the Pi-side
+                                            // `[enum]` observer watches the 0→1 edge for its first-report
+                                            // witness). Mirrors `mouse_report_count`; inert on x86.
+                                            self.slots[slot_id as usize].keyboard_report_count =
+                                                self.slots[slot_id as usize].keyboard_report_count.wrapping_add(1);
                                             let report = core::slice::from_raw_parts(data_buf_ptr, 8);
                                             // Metal diagnostic: dump the raw report bytes so that if a keyboard
                                             // interrupt-IN transfer arrives but decodes to nothing (e.g. the device is
@@ -2063,22 +2417,114 @@ impl XhciController {
                                             // Bytes 2-7: Key codes (up to 6 simultaneous keys)
                                             let modifiers = report[0];
                                             let shift = (modifiers & 0x22) != 0; // L-Shift (bit 1) or R-Shift (bit 5)
-                                            
+                                            // HID-LED: current caps-lock LED state feeds the ascii case
+                                            // logic so the lit LED and the typed case agree. Caps only
+                                            // inverts case for the alphabetic keycodes (0x04..=0x1D =
+                                            // a..z); digits/symbols are unaffected (caps XOR shift would
+                                            // wrongly shift them). effective_shift = shift ^ (caps & is_letter).
+                                            let caps = (self.slots[slot_id as usize].keyboard_leds & 0x02) != 0;
+
+                                            // HID-KEYS: snapshot this report's keycodes and the
+                                            // previous report's, so releases (a code present last
+                                            // report, absent now) can be edge-detected below. The
+                                            // KeyDown loop is unchanged — Key(ascii) still fires for
+                                            // every held key each report (natural repeats on resend),
+                                            // preserving every existing consumer.
+                                            let cur_keys: [u8; 6] = [
+                                                report[2], report[3], report[4],
+                                                report[5], report[6], report[7],
+                                            ];
+                                            let prev_keys = self.slots[slot_id as usize].keyboard_prev_keys;
+
                                             for i in 2..8 {
                                                 let keycode = report[i];
                                                 if keycode == 0 { continue; } // No key
                                                 if keycode == 1 { continue; } // ErrorRollOver
-                                                
+
                                                 if (keycode as usize) < HID_SCANCODE_TO_ASCII.len() {
                                                     let (unshifted, shifted) = HID_SCANCODE_TO_ASCII[keycode as usize];
-                                                    let ascii = if shift { shifted } else { unshifted };
+                                                    let is_letter = (0x04..=0x1D).contains(&keycode);
+                                                    let eff_shift = shift ^ (caps & is_letter);
+                                                    let ascii = if eff_shift { shifted } else { unshifted };
                                                     if ascii != 0 {
                                                         serial_println!("xHCI: KEY: '{}' (scancode {:#x})", ascii as char, keycode);
                                                         crate::pal::push_event(crate::pal::Event::Key(ascii));
                                                     }
                                                 }
                                             }
-                                            
+
+                                            // UVUG-6: feed the host-side typematic tracker at the HID REPORT
+                                            // level — BEFORE any EVENT_QUEUE push, so a release the queue may
+                                            // later DROP (full 64-slot ring) can never strand a held key. Pass
+                                            // the newest ascii pressed this report and the FULL currently-held
+                                            // ascii set; the tracker disarms the moment its key leaves the set.
+                                            #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+                                            {
+                                                let mut held: [u8; 6] = [0; 6];
+                                                let mut hn = 0usize;
+                                                let mut newest_press: u8 = 0;
+                                                for i in 2..8 {
+                                                    let keycode = report[i];
+                                                    if keycode == 0 || keycode == 1 { continue; }
+                                                    if (keycode as usize) < HID_SCANCODE_TO_ASCII.len() {
+                                                        let (unshifted, shifted) = HID_SCANCODE_TO_ASCII[keycode as usize];
+                                                        let is_letter = (0x04..=0x1D).contains(&keycode);
+                                                        let eff_shift = shift ^ (caps & is_letter);
+                                                        let ascii = if eff_shift { shifted } else { unshifted };
+                                                        if ascii != 0 {
+                                                            held[hn] = ascii;
+                                                            hn += 1;
+                                                            if !prev_keys.contains(&keycode) { newest_press = ascii; }
+                                                        }
+                                                    }
+                                                }
+                                                crate::pal::typematic_note_report(newest_press, &held[..hn]);
+                                            }
+
+                                            // HID-KEYS: key-UP edges. A boot report carries the FULL
+                                            // pressed-key set, so any keycode in the previous report
+                                            // that is absent now was released — emit KeyUp(ascii)
+                                            // once per such code. Shift state at release time is used
+                                            // for the ascii (consumers that care about identity match
+                                            // case-insensitively; e.g. GAME-MODE lowercases).
+                                            for &keycode in prev_keys.iter() {
+                                                if keycode == 0 || keycode == 1 { continue; }
+                                                if cur_keys.contains(&keycode) { continue; } // still held
+                                                if (keycode as usize) < HID_SCANCODE_TO_ASCII.len() {
+                                                    let (unshifted, shifted) = HID_SCANCODE_TO_ASCII[keycode as usize];
+                                                    let is_letter = (0x04..=0x1D).contains(&keycode);
+                                                    let eff_shift = shift ^ (caps & is_letter);
+                                                    let ascii = if eff_shift { shifted } else { unshifted };
+                                                    if ascii != 0 {
+                                                        #[cfg(feature = "usbdebug")]
+                                                        serial_println!("[hidkeys] keyup '{}' (scancode {:#x}) slot={}", ascii as char, keycode, slot_id);
+                                                        crate::pal::push_event(crate::pal::Event::KeyUp(ascii));
+                                                    }
+                                                }
+                                            }
+
+                                            self.slots[slot_id as usize].keyboard_prev_keys = cur_keys;
+
+                                            // HID-LED: lock-key press edges. A lock key present in this
+                                            // report but absent last report is a fresh press — toggle the
+                                            // matching LED bit and push the new bitmap to the device via
+                                            // SET_REPORT. Caps Lock (0x39, bit1) is the one Peter observed
+                                            // never lighting; Num Lock (0x53, bit0) and Scroll Lock (0x47,
+                                            // bit2) are toggled the same way for LED/state agreement.
+                                            let mut leds_changed = false;
+                                            for &(usage, bit) in &[(0x39u8, 0x02u8), (0x53u8, 0x01u8), (0x47u8, 0x04u8)] {
+                                                let pressed_now = cur_keys.contains(&usage);
+                                                let pressed_before = prev_keys.contains(&usage);
+                                                if pressed_now && !pressed_before {
+                                                    self.slots[slot_id as usize].keyboard_leds ^= bit;
+                                                    leds_changed = true;
+                                                }
+                                            }
+                                            if leds_changed {
+                                                let kbd_intf = self.slots[slot_id as usize].keyboard_intf;
+                                                self.set_hid_leds(slot_id as u8, kbd_intf);
+                                            }
+
                                             self.queue_keyboard_read(slot_id as u8);
                                         }
                                     } else if hub_int_dci == Some(endpoint_id as u8) {
@@ -2096,6 +2542,9 @@ impl XhciController {
                                         let change_buf = slot.hub_change_buffer;
                                         if let Some(buf_ptr) = change_buf {
                                             let len = Self::hub_change_bitmap_len(nbr_ports);
+                                            // XHCI-COHERENCE: consumer boundary — the status-change
+                                            // bitmap was DMA-written; invalidate before reading. No-op x86.
+                                            dma_coherency::inval(buf_ptr as usize, len);
                                             let bytes = core::slice::from_raw_parts(buf_ptr, len);
                                             // Bit 0 = the hub itself (over-current / local change).
                                             if (bytes[0] & 1) != 0 {
@@ -2178,6 +2627,12 @@ impl XhciController {
     }
 
     pub unsafe fn init_pointers(&mut self, ring_phys_addr: u64) {
+        // PIUSB-10: if CNR never cleared (init_interrupter aborted), do NOT program CRCR/DCBAAP —
+        // the controller is not ready and would silently drop the writes. Fail loud, skip cleanly.
+        if !XHCI_CNR_OK.load(Ordering::Acquire) {
+            serial_println!("xHCI: init_pointers SKIPPED — controller never left Not-Ready (CNR=1)");
+            return;
+        }
         unsafe {
             // 1. Allocate and set DCBAAP
             let dcbaap_size = (self.max_slots as usize + 1) * 8;
@@ -2186,7 +2641,7 @@ impl XhciController {
             self.dcbaap = dcbaap_ptr;
 
             let dcbaap_reg = (self.op_base + 0x30) as *mut u64;
-            core::ptr::write_volatile(dcbaap_reg, dcbaap_ptr as u64);
+            write_reg64(dcbaap_reg, dcbaap_ptr as u64);
             serial_println!("xHCI: DCBAAP set to {:#x}", dcbaap_ptr as u64);
 
             // 1b. SCRATCHPAD BUFFERS (xHCI spec 4.20). If the controller advertises Max Scratchpad
@@ -2204,25 +2659,55 @@ impl XhciController {
                 // PAGESIZE (op_base + 0x08): bit n set => the controller supports 2^(n+12)-byte
                 // pages; the scratchpad buffers must be that size and aligned. Use the smallest
                 // supported page size (lowest set bit).
+                // XCARVE-4: trust only the spec-sane low bits (4K/8K/16K/32K). An inherited
+                // controller taken over without HCRST (Tegra234 JB9G) can read back PAGESIZE with
+                // the mandatory 4 KiB bit CLEAR and garbage high bits — the raw lowest-set-bit
+                // math then demands an 8 MiB-aligned allocation whose placement overshoots the
+                // heap into firewalled carveout DRAM (the boots-13..22 SNOC RAS / sync-fault
+                // writer). Spec 5.4.3 makes 4 KiB mandatory, so garbage => 4 KiB fallback.
                 let pagesize = core::ptr::read_volatile((self.op_base + 0x08) as *const u32) & 0xFFFF;
-                let page_bytes = 1usize << (pagesize.trailing_zeros() + 12);
+                let sane = pagesize & 0x000F;
+                let page_bytes: usize =
+                    if sane == 0 { 0x1000 } else { 1usize << (sane.trailing_zeros() + 12) };
 
                 // The Scratchpad Buffer Array: one u64 physical pointer per buffer, page-aligned.
                 let arr_layout =
                     core::alloc::Layout::from_size_align(max_scratchpad * 8, page_bytes).unwrap();
                 let arr = alloc::alloc::alloc_zeroed(arr_layout) as *mut u64;
-                for i in 0..max_scratchpad {
-                    let buf_layout =
-                        core::alloc::Layout::from_size_align(page_bytes, page_bytes).unwrap();
-                    let buf = alloc::alloc::alloc_zeroed(buf_layout);
-                    // Identity-mapped heap: the allocation's virtual address IS its bus/phys address.
-                    *arr.add(i) = buf as u64;
+                let (heap_lo, heap_hi) = crate::allocator::heap_bounds();
+                if arr.is_null()
+                    || (arr as usize) < heap_lo
+                    || (arr as usize) + max_scratchpad * 8 > heap_hi
+                {
+                    serial_println!(
+                        "xHCI: scratchpad: array alloc unusable (arr={:#x} page_bytes={:#x} heap=[{:#x},{:#x})); skipping",
+                        arr as u64, page_bytes, heap_lo, heap_hi
+                    );
+                } else {
+                    for i in 0..max_scratchpad {
+                        let buf_layout =
+                            core::alloc::Layout::from_size_align(page_bytes, page_bytes).unwrap();
+                        let buf = alloc::alloc::alloc_zeroed(buf_layout);
+                        if buf.is_null() {
+                            break;
+                        }
+                        // Identity-mapped heap: the allocation's virtual address IS its bus/phys address.
+                        *arr.add(i) = buf as u64;
+                        // XHCI-COHERENCE: the controller DMA-reads/writes each scratchpad buffer as its
+                        // private working memory; clean the zeroed buffer to DRAM so a non-snooping
+                        // controller does not fault on stale contents. No-op x86.
+                        dma_coherency::clean(buf as usize, page_bytes);
+                    }
+                    *dcbaap_ptr.add(0) = arr as u64;
+                    // XHCI-COHERENCE: clean the scratchpad pointer array and the DCBAA[0] entry that
+                    // points at it — both are controller-read before/at RS=1. No-op x86.
+                    dma_coherency::clean(arr as usize, max_scratchpad * 8);
+                    dma_coherency::clean(dcbaap_ptr as usize, core::mem::size_of::<u64>());
+                    serial_println!(
+                        "xHCI: scratchpad: {} buffer(s) x {} bytes; DCBAA[0]={:#x} (heap PA in [{:#x},{:#x}))",
+                        max_scratchpad, page_bytes, arr as u64, heap_lo, heap_hi
+                    );
                 }
-                *dcbaap_ptr.add(0) = arr as u64;
-                serial_println!(
-                    "xHCI: scratchpad: {} buffer(s) x {} bytes; DCBAA[0]={:#x}",
-                    max_scratchpad, page_bytes, arr as u64
-                );
             } else {
                 serial_println!("xHCI: scratchpad: controller requests 0 buffers (none needed).");
             }
@@ -2232,16 +2717,35 @@ impl XhciController {
             // MUST set Bit 0 (RCS - Ring Cycle State) to 1 to match our initial Ring state.
             let crcr_reg = (self.op_base + 0x18) as *mut u64;
             let crcr_value = ring_phys_addr | 1;
-            core::ptr::write_volatile(crcr_reg, crcr_value);
+            write_reg64(crcr_reg, crcr_value);
             serial_println!("xHCI: CRCR set to {:#x}", crcr_value);
         }
     }
 
     // Call this AFTER init_pointers but BEFORE run
     pub fn init_interrupter(&mut self, event_ring_phys: u64, erst_table_phys: u64) {
+        // PIUSB-10: xHCI 5.4.1/4.2 — the FIRST register programming after HCRST (this writes the
+        // interrupter's ERST/ERSTBA/ERDP runtime regs; `init_pointers`/`start` write CRCR/DCBAAP/
+        // CONFIG/USBCMD after us). Gate ALL of it on USBSTS.CNR==0 so no write is dropped by a
+        // not-ready controller (the Pi VL805 holds CNR during fw-load; Intel clears it instantly, so
+        // this is a fast no-op on x86 and its register-write behaviour is byte-identical).
+        if !wait_for_cnr_clear(self.op_base) {
+            XHCI_CNR_OK.store(false, Ordering::Release);
+            return;
+        }
+        XHCI_CNR_OK.store(true, Ordering::Release);
         unsafe {
             // SAVE THIS for later use in the interrupt/event loop (ERDP updates)
             EVENT_RING_PHYS_BASE = event_ring_phys;
+
+            // XHCI-COHERENCE: zeroed-handoff for the event ring. `EventRing::new()` zeroed the ring
+            // into (dirty) cache lines; clean+invalidate so those zeros reach DRAM before the
+            // controller DMA-writes events into it, and no stale CPU line shadows the first event.
+            // This is the driver-internal replacement for PIUSB-8's external event-ring bridge.
+            dma_coherency::clean_inval(
+                event_ring_phys as usize,
+                event::EVENT_RING_SIZE * core::mem::size_of::<Trb>(),
+            );
 
             // 1. Calculate Runtime Base
             // Read RTSOFF (Offset 0x18 in Capability Regs)
@@ -2262,6 +2766,12 @@ impl XhciController {
                 _rsvd: 0,
                 _rsvd2: 0,
             };
+            // XHCI-COHERENCE: producer boundary — the controller DMA-reads the ERST when the
+            // interrupter is armed / ERSTBA is written below; clean the table to DRAM. No-op x86.
+            dma_coherency::clean(
+                core::ptr::addr_of!(ERST_TABLE) as usize,
+                core::mem::size_of::<ErstTable>(),
+            );
             EVENT_RING_PHYS_BASE = event_ring_phys;
 
             // 3. Write ERSTSZ (Segment Table Size) - Offset 0x08
@@ -2271,13 +2781,16 @@ impl XhciController {
 
             // 4. Write ERSTBA (Segment Table Base Address) - Offset 0x10
             let erstba_ptr = (ir0_base + 0x10) as *mut u64;
-            core::ptr::write_volatile(erstba_ptr, erst_table_phys);
+            write_reg64(erstba_ptr, erst_table_phys);
 
             // 5. Write ERDP (Event Ring Dequeue Pointer) - Offset 0x18
             // Initialize to the start of the ring.
             // PRESERVE BIT 3 (EHB - Event Handler Busy)? No, clear it initially.
             let erdp_ptr = (ir0_base + 0x18) as *mut u64;
-            core::ptr::write_volatile(erdp_ptr, event_ring_phys); // Pointer to the RING, not the table
+            // High-dword-first (write_erdp): even at init, guarantee the controller latches a
+            // complete pointer under the PIUSB-21 32-bit split — never a stale/mirrored high.
+            write_erdp(erdp_ptr, event_ring_phys); // Pointer to the RING, not the table
+            serial_println!("[xhciint] ERDP initialized to {:#018x} (hi-first, EHB clear)", event_ring_phys);
 
             // 5b. IMOD (Interrupter Moderation, +0x04): 0 = no moderation, fire ASAP.
             // (QEMU ignores moderation timing, but set it explicitly for clarity / real HW.)
@@ -2304,6 +2817,12 @@ impl XhciController {
     }
 
     pub fn start(&mut self) {
+        // PIUSB-10: if CNR never cleared, do NOT set CONFIG/RS=1 on a not-ready controller — fail
+        // loud and skip so RS never latches into a controller that dropped its ring/interrupter setup.
+        if !XHCI_CNR_OK.load(Ordering::Acquire) {
+            serial_println!("xHCI: start SKIPPED — controller never left Not-Ready (CNR=1); RS=1 not issued");
+            return;
+        }
         unsafe {
             // Program CONFIG.MaxSlotsEn (op_base + 0x38, bits 7:0) BEFORE Run, while the
             // controller is still halted. Without this the controller has zero usable
@@ -2334,6 +2853,52 @@ impl XhciController {
                 || (core::ptr::read_volatile(usbsts_ptr) & 1) == 0,
                 hw_wait_budget(), "USBSTS.HCH=0 (run)");
             serial_println!("xHCI: Controller Started!");
+
+            // PIUSB-9 witness (aarch64-only, minimal — x86 behaviour byte-identical): dump the
+            // controller-side view of the command ring + interrupter/event ring the instant RS
+            // latched. This is the "at RS=1" snapshot hypothesis (c) reads off. The VL805's
+            // ENABLE_SLOT never completes on metal (watchdog cmd=0x2002240 in heap PA); before we
+            // even doorbell a command, prove the poll-path plumbing the controller must fetch from:
+            //   * CRCR.CRR (bit3): 0 here is expected (ring idle, no command pushed yet); it should
+            //     go 1 once the first doorbell lands — the enable-slot watchdog witness reads it there.
+            //   * ERSTSZ==1 / ERSTBA==erst_table_phys / ERDP==event_ring_phys: if any reads back 0 or
+            //     a value we never wrote, the interrupter is misprogrammed and NO event can post on the
+            //     polled path regardless of IMAN — that is hypothesis (c). IMAN.IE is irrelevant to
+            //     polling but dumped so a masked-interrupter VL805 quirk is visible if it gates posting.
+            //   * DCBAAP readback: the controller DMA-reads this at the first slot command; a 0/torn
+            //     value would fail ENABLE_SLOT downstream.
+            // All heap pointers must be < 4 GiB and VA==PA (identity map) for the RC_BAR2 inbound
+            // window (RAM@0, 4 GiB) to translate them — the audit confirmed the heap is at PA
+            // 0x0200_0000..0x0500_0000, so these readbacks double as an inbound-window sanity check.
+            #[cfg(target_arch = "aarch64")]
+            {
+                // PIUSB-21: read 64-bit regs as two 32-bit loads so the witness prints the
+                // TRUE hi:lo (a single ldr mirrors lo->hi through the brcmstb RC). The raw
+                // single-load readback is dumped alongside so the mirror is still visible.
+                let crcr = read_reg64((self.op_base + 0x18) as *const u64);
+                let dcbaap = read_reg64((self.op_base + 0x30) as *const u64);
+                let dcbaap_raw = core::ptr::read_volatile((self.op_base + 0x30) as *const u64);
+                let usbcmd_rb = core::ptr::read_volatile(usbcmd_ptr);
+                let usbsts_rb = core::ptr::read_volatile(usbsts_ptr);
+                serial_println!(
+                    "xHCI: [aarch64] RS=1 witness: USBCMD={:#x}(RS={} INTE={}) USBSTS={:#x}(HCH={} HSE={} CNR={} HCE={}) CRCR={:#018x}(CRR={} CS={} CA={} RCS={}) DCBAAP={:#018x} DCBAAP_raw64={:#018x}",
+                    usbcmd_rb, usbcmd_rb & 1, (usbcmd_rb >> 2) & 1,
+                    usbsts_rb, usbsts_rb & 1, (usbsts_rb >> 2) & 1, (usbsts_rb >> 11) & 1, (usbsts_rb >> 12) & 1,
+                    crcr, (crcr >> 3) & 1, (crcr >> 1) & 1, (crcr >> 2) & 1, crcr & 1, dcbaap, dcbaap_raw
+                );
+                let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
+                if ir0 != 0 {
+                    let iman = core::ptr::read_volatile(ir0 as *const u32);
+                    let erstsz = core::ptr::read_volatile((ir0 + 0x08) as *const u32);
+                    let erstba = read_reg64((ir0 + 0x10) as *const u64);
+                    let erdp = read_reg64((ir0 + 0x18) as *const u64);
+                    serial_println!(
+                        "xHCI: [aarch64] RS=1 witness: IR0={:#x} IMAN={:#x}(IP={} IE={}) ERSTSZ={} ERSTBA={:#018x} ERDP={:#018x}(EHB={}) ERST[0].ring={:#018x}",
+                        ir0, iman, iman & 1, (iman >> 1) & 1, erstsz, erstba, erdp, (erdp >> 3) & 1,
+                        core::ptr::read_unaligned(core::ptr::addr_of!(ERST_TABLE.entries[0].ring_address))
+                    );
+                }
+            }
 
             // Power on all ports. Use the REAL MaxPorts (HCSPARAMS1 bits 24:31),
             // captured as self.max_ports. The previous code read bits 0:7, which is
@@ -2607,6 +3172,7 @@ impl XhciController {
                 ftdi::set_live(false);
             }
             self.hid_setproto_pending.retain(|s| *s != i as u8);
+            self.hid_halt_pending.retain(|(s, _)| *s != i as u8);
             self.hubs_pending.retain(|s| *s != i as u8);
             self.hub_changes_pending.retain(|(hs, _)| *hs != i as u8); // XENUM-2
             self.pending_ports.retain(|p| *p != port);
@@ -2768,6 +3334,7 @@ impl XhciController {
                 ftdi::set_live(false); // the console's slot is torn down — stop the drain
             }
             self.hid_setproto_pending.retain(|s| *s != i as u8);
+            self.hid_halt_pending.retain(|(s, _)| *s != i as u8);
             self.hubs_pending.retain(|s| *s != i as u8);
             self.hub_changes_pending.retain(|(hs, _)| *hs != i as u8); // XENUM-2
             self.slots[i].reset_soft_state();
@@ -2881,6 +3448,12 @@ impl XhciController {
                         unsafe {
                             if !self.dcbaap.is_null() {
                                 *self.dcbaap.add(slot as usize) = 0;
+                                // XHCI-COHERENCE: clean the cleared DCBAA entry so the controller
+                                // sees the slot released, not a stale output-context pointer. No-op x86.
+                                dma_coherency::clean(
+                                    self.dcbaap.add(slot as usize) as usize,
+                                    core::mem::size_of::<u64>(),
+                                );
                             }
                         }
                     }
@@ -2963,22 +3536,54 @@ impl XhciController {
                     serial_println!(
                         "xHCI: WATCHDOG: port {} stuck at '{}' (cmd={:#x}).",
                         port, self.enum_stage, self.enum_cmd_phys);
-                    // JB3 boot-8 experiment (Tegra-only, one line per watchdog): the SMMU
-                    // passes our stream fault-free yet no event ever appears — distinguish
-                    // "the controller's DMA write never reached DRAM" from "it landed but
-                    // the CPU's cached line is stale (fabric snooping dead post-EBS)" by
-                    // invalidating the CPU's copy of the event ring and re-checking.
-                    #[cfg(feature = "tegra")]
+                    // XHCI-COHERENCE (was JB3 boot-8, tegra-only; now general aarch64): on a
+                    // non-coherent bus the SMMU/RC passes our stream fault-free yet no event appears —
+                    // distinguish "the controller's DMA write never reached DRAM" from "it landed but
+                    // the CPU's cached line is stale". `has_event()` now invalidates the dequeue TRB's
+                    // line before its read on ALL aarch64 targets (the unified `dma_coherency` seam
+                    // that replaced `has_event_after_invalidate`), so this watchdog line simply
+                    // re-checks post-invalidate. Behaviour on tegra is identical to the old hack; the
+                    // Pi 4 (VL805) now gets the same forensic line.
+                    #[cfg(target_arch = "aarch64")]
                     {
+                        // PIUSB-9 witness (hypotheses b/d): read the command ring's controller-side
+                        // state AT the stall. The doorbell was rung when the command was pushed; by now
+                        // a healthy controller has fetched the TRB and posted a completion. CRCR.CRR
+                        // (bit3) is the discriminator:
+                        //   * CRR=1  -> the controller ACCEPTED the doorbell and the ring is RUNNING; it
+                        //              fetched (or is fetching) the ENABLE_SLOT TRB but never posted the
+                        //              completion event => a DMA/event-posting fault (hypothesis b: the
+                        //              completion write never reached DRAM / event ring), NOT a dead ring.
+                        //   * CRR=0  -> the controller NEVER started fetching: either the doorbell write
+                        //              was not observed, or the controller is running dead firmware that
+                        //              accepts MMIO but processes nothing (hypothesis d). CS/CA would only
+                        //              be set by an abort handshake we have not issued yet, so both 0 here.
+                        // enum_cmd_phys is the pushed TRB's PA (heap, <4 GiB); print it beside CRCR so the
+                        // log ties the stuck command to the ring the controller is (or isn't) fetching.
+                        let (crcr, usbcmd, usbsts) = unsafe {
+                            (
+                                read_reg64((self.op_base + 0x18) as *const u64),
+                                core::ptr::read_volatile(self.op_base as *const u32),
+                                core::ptr::read_volatile((self.op_base + 0x04) as *const u32),
+                            )
+                        };
+                        serial_println!(
+                            "xHCI: [aarch64] enable-slot stall witness: cmd_trb={:#x} CRCR={:#018x}(CRR={} CS={} CA={} RCS={}) USBCMD={:#x}(RS={}) USBSTS={:#x}(HCH={} HSE={} CNR={} HCE={}) => {}",
+                            self.enum_cmd_phys, crcr, (crcr >> 3) & 1, (crcr >> 1) & 1, (crcr >> 2) & 1, crcr & 1,
+                            usbcmd, usbcmd & 1,
+                            usbsts, usbsts & 1, (usbsts >> 2) & 1, (usbsts >> 11) & 1, (usbsts >> 12) & 1,
+                            if (crcr >> 3) & 1 == 1 { "CRR=1 ring RUNNING — fetched, no completion posted (DMA/event fault, hyp b)" }
+                            else { "CRR=0 ring NEVER STARTED — doorbell not observed or dead fw (hyp d)" }
+                        );
                         let landed = {
                             EVENT_RING
                                 .lock()
                                 .as_ref()
-                                .map(|r| r.has_event_after_invalidate())
+                                .map(|r| r.has_event())
                                 .unwrap_or(false)
                         };
                         serial_println!(
-                            "xHCI: [tegra] event ring after dc-civac: {}",
+                            "xHCI: [aarch64] event ring after dc-civac: {}",
                             if landed {
                                 "EVENT PRESENT — writes LAND, CPU snoop broken (coherency)"
                             } else {
@@ -3049,21 +3654,21 @@ impl XhciController {
         }
         let stage_stamp = self.enum_stage_set_at;
         let crcr_ptr = (self.op_base + 0x18) as *mut u64;
-        let crr_set = unsafe { (core::ptr::read_volatile(crcr_ptr) >> 3) & 1 != 0 };
+        let crr_set = unsafe { (read_reg64(crcr_ptr) >> 3) & 1 != 0 };
         if crr_set {
             self.cmd_ring_stopped = true;
             let rcs = COMMAND_RING.lock().as_ref()
                 .map(|r| r.trb_cycle(aborted))
                 .unwrap_or(1) as u64;
             unsafe {
-                core::ptr::write_volatile(crcr_ptr, aborted | rcs | (1 << 2));
+                write_reg64(crcr_ptr, aborted | rcs | (1 << 2));
             }
             serial_println!("xHCI: command abort issued (CRCR.CA, aborted TRB {:#x}).", aborted);
             let start = crate::arch::now_cycles();
             let budget = hw_wait_budget(); // ~2 s; Linux allows 5 s, but this is boot-critical
             loop {
                 while self.drain_event_ring_once() {}
-                let crr = unsafe { (core::ptr::read_volatile(crcr_ptr) >> 3) & 1 };
+                let crr = unsafe { (read_reg64(crcr_ptr) >> 3) & 1 };
                 if crr == 0 {
                     break;
                 }
@@ -3096,7 +3701,7 @@ impl XhciController {
             // 1. READ CRCR (Command Ring Control Register)
             // Offset 0x18 from OpBase
             let crcr_reg = (self.op_base + 0x18) as *const u64;
-            let crcr_raw = core::ptr::read_volatile(crcr_reg);
+            let crcr_raw = read_reg64(crcr_reg);
 
             // Mask bits 0-5 to get the pointer (address is 64-byte aligned, so low 6 bits are flags)
             let crcr_ptr = crcr_raw & !0x3F;
@@ -3266,6 +3871,11 @@ impl XhciController {
             let output_ctx_phys = output_ctx_virt as u64;
             let input_ctx_phys = input_ctx_virt as u64;
 
+            // XHCI-COHERENCE: zeroed-handoff boundary — the controller DMA-WRITES the output (device)
+            // context during ADDRESS_DEVICE; clean+invalidate so the zeros reach DRAM and the CPU's
+            // later read-back observes the controller's data, not a stale zero line. No-op x86.
+            dma_coherency::clean_inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
+
             // Store them in slot
             let slot = &mut self.slots[slot_id as usize];
             slot.input_context = input_ctx_virt;
@@ -3278,6 +3888,9 @@ impl XhciController {
             // Point the Slot ID entry to the Output Context
             let dcbaap_ptr = self.dcbaap;
             *dcbaap_ptr.add(slot_id as usize) = output_ctx_phys;
+            // XHCI-COHERENCE: producer boundary — the controller reads DCBAA[slot] to locate the
+            // output context during ADDRESS_DEVICE; clean the 8-byte entry to DRAM. No-op x86.
+            dma_coherency::clean(dcbaap_ptr.add(slot_id as usize) as usize, core::mem::size_of::<u64>());
             serial_println!("xHCI: DCBAAP[{}] linked to {:#x}", slot_id, output_ctx_phys);
 
             // 2. FILL INPUT CONTEXT (MANUAL OFFSET CALCULATION)
@@ -3368,7 +3981,11 @@ impl XhciController {
             let input_ctx_virt = slot.input_context;
             let output_ctx_virt = slot.output_context;
             let base_ptr = input_ctx_virt as *mut u32;
-            
+            // XHCI-COHERENCE: consumer boundary — the slot context copied out of the output context
+            // below was DMA-written by the controller (ADDRESS_DEVICE); invalidate so the copy reads
+            // fresh, not a stale cached line. No-op x86.
+            dma_coherency::inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
+
             let bulk_in_ring = ring::TransferRing::new(16);
             let bulk_in_phys = bulk_in_ring.get_ptr();
             slot.bulk_in_ring = Some(bulk_in_ring);
@@ -3512,8 +4129,17 @@ impl XhciController {
         let in_dci = ((in_addr & 0x0F) * 2) + 1;
         let out_dci = (out_addr & 0x0F) * 2;
 
+        // PIUSB-38: latched when the data stage halts (STALL/Babble). It steers the status stage
+        // into Reset Recovery: on a data-phase stall we still collect the CSW (resync), and if the
+        // CSW itself fails we escalate to a full Bulk-Only Mass Storage Reset.
+        let mut data_stalled = false;
         let tag = self.build_cbw(cbw_phys as *mut u8, data_len, dir, cdb);
         unsafe { core::ptr::write_bytes(csw_phys as *mut u8, 0, 13); }
+        // XHCI-COHERENCE: the CBW is CPU-written and DMA-read by the controller (bulk OUT) — clean it
+        // to DRAM before its doorbell. The CSW was just zeroed and the controller will DMA-write it —
+        // clean+invalidate the zeroed handoff so the later read observes the controller's status.
+        dma_coherency::clean(cbw_phys as usize, 31);
+        dma_coherency::clean_inval(csw_phys as usize, 13);
 
         // BOT phases are SERIALIZED: CBW -> [DATA] -> CSW, each transfer completing before
         // the next is queued — mirroring the Linux usb-storage bulk transport. We must NOT
@@ -3539,6 +4165,18 @@ impl XhciController {
                     self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap()
                 };
                 let base = ring.get_ptr();
+                // XHCI-COHERENCE: evict the data buffer to DRAM BEFORE the doorbell — for BOTH
+                // directions. OUT: the buffer is CPU-written and DMA-read, so the clean pushes the
+                // current bytes to DRAM. IN (PIUSB-34): the buffer is freshly `alloc_zeroed` (8 dirty
+                // zero lines) and reused across SCSI reads — a short prior read (READ CAPACITY = 8 B,
+                // INQUIRY = 36 B) only ever touches line 0, leaving lines 1..7 dirty-zero in cache. On
+                // the non-coherent Pi 4 PCIe path the controller DMA-writes the block straight to DRAM;
+                // a natural write-back of those stale dirty lines in the window around the DMA clobbers
+                // the just-written DRAM with zeros (Passed/residue=0/data=00). Cleaning here leaves no
+                // dirty line to lose, so the controller's DMA survives; the post-transfer invalidate
+                // below then drops the clean lines and the CPU parses fresh DRAM. This mirrors every
+                // other IN-arming site (interrupt-IN reports, control-IN, descriptor reads). No-op x86.
+                dma_coherency::clean(data_phys as usize, data_len as usize);
                 let idx = ring.push(Trb { parameter: data_phys, status: data_len,
                     control: (1 << 10) | (1 << 5) | (1 << 2) }).unwrap_or(0);
                 (if data_out { out_dci } else { in_dci }, base + (idx as u64) * 16)
@@ -3552,8 +4190,28 @@ impl XhciController {
             let code = self.run_bot_stage(slot_id, in_dci, out_dci, data_trb_phys)?;
             if code != 1 && code != 13 {
                 serial_println!("xHCI: BOT data stage error, completion code {}", code);
-                return if code == 4 || code == 6 { Err(BotError::Stall) }
-                       else { Err(BotError::TransferError(code)) };
+                if code == 4 || code == 6 {
+                    // PIUSB-38 / USB MSC BOT §6.7.2 (Reset Recovery, data-phase stall): the data
+                    // endpoint halted (STALL/Babble). Clear the halt on this bulk pipe, then STILL
+                    // proceed to the status stage below to collect the CSW — the device stalled the
+                    // DATA phase, not the command, so it is in its status phase and returns a Failed
+                    // CSW; reading it resynchronises both BOT state machines so the NEXT command
+                    // starts clean. An unrecovered data-phase stall that skipped the CSW was the P47
+                    // wedge (every later READ/SENSE/TUR on the slot then timed out). If the status
+                    // stage ALSO fails, we escalate to a full Bulk-Only reset below.
+                    self.recover_bulk_stall(slot_id, !data_out);
+                    data_stalled = true;
+                } else {
+                    return Err(BotError::TransferError(code));
+                }
+            }
+            // XHCI-COHERENCE: consumer boundary — an IN data stage's buffer was DMA-written by the
+            // controller; invalidate it here (ONE chokepoint for every SCSI IN reader: INQUIRY,
+            // READ CAPACITY, block reads) so callers parse fresh DRAM. No-op x86. Skip after a
+            // data-phase stall: the buffer holds no valid transfer, and the CSW below carries the
+            // real (Failed) verdict.
+            if !data_out && !data_stalled {
+                dma_coherency::inval(data_phys as usize, data_len as usize);
             }
         } else {
             // No data stage: fetch+send the CBW now; the CSW is queued next.
@@ -3570,15 +4228,35 @@ impl XhciController {
         };
         self.ring_doorbell(slot_id, in_dci as u32);
 
-        let code = self.run_bot_stage(slot_id, in_dci, out_dci, csw_trb_phys)?;
+        // PIUSB-38: if the status stage cannot even complete (times out) after a data-phase stall,
+        // the pipe is wedged — escalate to full Bulk-Only Reset Recovery before surfacing the error
+        // so the next command is not born onto a dead pipe.
+        let code = match self.run_bot_stage(slot_id, in_dci, out_dci, csw_trb_phys) {
+            Ok(c) => c,
+            Err(e) => {
+                if data_stalled { self.recover_bot_full(slot_id); }
+                return Err(e);
+            }
+        };
         if code != 1 && code != 13 {
             serial_println!("xHCI: BOT transfer error, completion code {}", code);
-            return if code == 4 || code == 6 { Err(BotError::Stall) }
-                   else { Err(BotError::TransferError(code)) };
+            if code == 4 || code == 6 {
+                // PIUSB-38 / USB MSC BOT §6.7.3 (status-phase stall): the CSW rides the bulk IN pipe;
+                // a halt here — or a status-phase halt after the data phase already stalled — leaves
+                // the IN endpoint dead. Clear this endpoint's halt, then perform FULL Bulk-Only Reset
+                // Recovery (device BOT reset + clear BOTH halts) so both state machines resync and no
+                // later command inherits the wedge.
+                self.recover_bulk_stall(slot_id, true);
+                self.recover_bot_full(slot_id);
+                return Err(BotError::Stall);
+            }
+            return Err(BotError::TransferError(code));
         }
 
         // 4) Validate the CSW.
         unsafe {
+            // XHCI-COHERENCE: consumer boundary — the CSW was DMA-written; invalidate before reading.
+            dma_coherency::inval(csw_phys as usize, 13);
             let csw = core::slice::from_raw_parts(csw_phys as *const u8, 13);
             let sig = (csw[0] as u32) | ((csw[1] as u32) << 8) | ((csw[2] as u32) << 16) | ((csw[3] as u32) << 24);
             let csw_tag = (csw[4] as u32) | ((csw[5] as u32) << 8) | ((csw[6] as u32) << 16) | ((csw[7] as u32) << 24);
@@ -3587,10 +4265,14 @@ impl XhciController {
 
             if sig != 0x53425355 {
                 serial_println!("xHCI: BOT bad CSW signature {:#x}", sig);
+                // PIUSB-38: a garbage CSW after a data-phase stall means the resync attempt did not
+                // land a valid status — the pipe is out of phase, so do full Reset Recovery.
+                if data_stalled { self.recover_bot_full(slot_id); }
                 return Err(BotError::BadCswSignature);
             }
             if csw_tag != tag {
                 serial_println!("xHCI: BOT CSW tag mismatch (got {:#x}, want {:#x})", csw_tag, tag);
+                if data_stalled { self.recover_bot_full(slot_id); }
                 return Err(BotError::TagMismatch);
             }
             let status = match bstatus {
@@ -3598,6 +4280,666 @@ impl XhciController {
                 2 => CswStatus::PhaseError, _ => CswStatus::Unknown,
             };
             Ok(BotResult { status, residue })
+        }
+    }
+
+    // ==================== PIUSB-36: read-wedge experiment matrix ====================
+
+    /// PIUSB-36 step 5: READ(10) LBA0 with the IN data stage split across TWO chained TRBs
+    /// (256 B + 256 B, chain bit on the first, IOC on the second) into `data_phys`. Everything
+    /// else mirrors `bot_transfer`'s IN path exactly (same clean-before-doorbell + post-invalidate
+    /// coherency, same serialized CBW -> DATA -> CSW). A TD-SHAPE variant: if a single-TRB 512 B
+    /// TD reads zeros but a two-TRB TD reads data (or vice-versa), the discriminator is TD shape,
+    /// not transfer length. Read-only, aarch64-only.
+    #[cfg(target_arch = "aarch64")]
+    fn piusb36_read10_two_trb(&mut self, slot_id: u8, data_phys: u64) -> Result<BotResult, BotError> {
+        let (cbw_phys, csw_phys, in_addr, out_addr) = {
+            let slot = &self.slots[slot_id as usize];
+            let cbw = match slot.cbw_buffer { Some(p) => p as u64, None => return Err(BotError::NoDevice) };
+            let csw = match slot.csw_buffer { Some(p) => p as u64, None => return Err(BotError::NoDevice) };
+            (cbw, csw, slot.bulk_in_ep, slot.bulk_out_ep)
+        };
+        if in_addr == 0 || out_addr == 0 { return Err(BotError::NoDevice); }
+        let in_dci = ((in_addr & 0x0F) * 2) + 1;
+        let out_dci = (out_addr & 0x0F) * 2;
+
+        let cdb = [0x28u8, 0, 0, 0, 0, 0, 0, 0, 1, 0]; // READ(10) LBA0, 1 block
+        let tag = self.build_cbw(cbw_phys as *mut u8, 512, Direction::In, &cdb);
+        unsafe { core::ptr::write_bytes(csw_phys as *mut u8, 0, 13); }
+        dma_coherency::clean(cbw_phys as usize, 31);
+        dma_coherency::clean_inval(csw_phys as usize, 13);
+
+        // 1) CBW on bulk OUT.
+        self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
+            .push(Trb { parameter: cbw_phys, status: 31, control: 1 << 10 }).ok();
+
+        // 2) Two chained IN data TRBs (256 B + 256 B). Clean the whole 512 B buffer to DRAM first,
+        //    exactly like the single-TRB IN path. The completion event (IOC) rides the SECOND TRB;
+        //    the first carries the CHAIN bit (1<<4) and no IOC. Wait on the second TRB's phys.
+        dma_coherency::clean(data_phys as usize, 512);
+        let data_trb_phys = {
+            let ring = self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap();
+            let base = ring.get_ptr();
+            // TRB 1: 256 B, CHAIN, no IOC.
+            ring.push(Trb { parameter: data_phys, status: 256, control: (1 << 10) | (1 << 4) }).ok();
+            // TRB 2: 256 B, IOC (1<<5) + ISP (1<<2).
+            let idx = ring.push(Trb { parameter: data_phys + 256, status: 256,
+                control: (1 << 10) | (1 << 5) | (1 << 2) }).unwrap_or(0);
+            base + (idx as u64) * 16
+        };
+        self.ring_doorbell(slot_id, out_dci as u32);
+        self.ring_doorbell(slot_id, in_dci as u32);
+        let code = self.run_bot_stage(slot_id, in_dci, out_dci, data_trb_phys)?;
+        if code != 1 && code != 13 {
+            if code == 4 || code == 6 { self.recover_bulk_stall(slot_id, true); return Err(BotError::Stall); }
+            return Err(BotError::TransferError(code));
+        }
+        dma_coherency::inval(data_phys as usize, 512);
+
+        // 3) CSW on bulk IN.
+        let csw_trb_phys = {
+            let ring = self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap();
+            let base = ring.get_ptr();
+            let idx = ring.push(Trb { parameter: csw_phys, status: 13, control: (1 << 10) | (1 << 5) }).unwrap_or(0);
+            base + (idx as u64) * 16
+        };
+        self.ring_doorbell(slot_id, in_dci as u32);
+        let code = self.run_bot_stage(slot_id, in_dci, out_dci, csw_trb_phys)?;
+        if code != 1 && code != 13 {
+            if code == 4 || code == 6 { self.recover_bulk_stall(slot_id, true); return Err(BotError::Stall); }
+            return Err(BotError::TransferError(code));
+        }
+        unsafe {
+            dma_coherency::inval(csw_phys as usize, 13);
+            let csw = core::slice::from_raw_parts(csw_phys as *const u8, 13);
+            let csw_tag = (csw[4] as u32) | ((csw[5] as u32) << 8) | ((csw[6] as u32) << 16) | ((csw[7] as u32) << 24);
+            let residue = (csw[8] as u32) | ((csw[9] as u32) << 8) | ((csw[10] as u32) << 16) | ((csw[11] as u32) << 24);
+            let status = match csw[12] { 0 => CswStatus::Passed, 1 => CswStatus::Failed, 2 => CswStatus::PhaseError, _ => CswStatus::Unknown };
+            if csw_tag != tag { return Err(BotError::TagMismatch); }
+            Ok(BotResult { status, residue })
+        }
+    }
+
+    /// PIUSB-36 witness printer: dump the first 16 bytes at `buf_phys` plus a discriminating
+    /// verdict. With a `pattern` byte the verdict separates the three outcomes that matter:
+    /// PATTERN-SURVIVED (the device never DMA-wrote), ZEROS (something wrote zeros over the
+    /// pattern), DATA (real bytes landed). Read-only.
+    #[cfg(target_arch = "aarch64")]
+    fn piusb36_report(label: &str, buf_phys: u64, status: CswStatus, residue: u32, pattern: Option<u8>) {
+        let d = unsafe { core::slice::from_raw_parts(buf_phys as *const u8, 16) };
+        let all_zero = d.iter().all(|&b| b == 0);
+        let verdict = match pattern {
+            Some(p) if d.iter().all(|&b| b == p) => "PATTERN-SURVIVED(device-never-wrote)",
+            _ if all_zero => "ZEROS(dma-wrote-zeros-or-nothing)",
+            _ => "DATA(real-bytes-landed)",
+        };
+        serial_println!(
+            ":: PIUSB: [piusb36] {} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+            label, buf_phys, status, residue, verdict,
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+            d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+    }
+
+    /// Busy-wait `ms` milliseconds off the free-running generic-timer counter (CNTVCT/CNTFRQ). Used
+    /// only by the PIUSB-36 posted-write-visibility step — never on any hot path.
+    #[cfg(target_arch = "aarch64")]
+    fn piusb36_delay_ms(ms: u64) {
+        let freq: u64;
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack, preserves_flags)); }
+        if freq == 0 { return; }
+        let budget = (freq / 1000).saturating_mul(ms);
+        let start = crate::arch::now_cycles();
+        while crate::arch::now_cycles().wrapping_sub(start) < budget { core::hint::spin_loop(); }
+    }
+
+    /// PIUSB-36: one-boot decisive experiment matrix for the Pi-only 512-B-read-returns-zeros wedge.
+    /// READ CAPACITY (8 B) and INQUIRY-adjacent control transfers DMA correctly to the SAME heap pool,
+    /// yet READ(10) 512 B returns Passed/residue=0/all-zero on Pi metal (P45), while the identical
+    /// code shape read REAL data in the early pre-SMP IRQ-masked phase (P38) and QEMU virt/x86 are
+    /// fine. This runs six read-only experiments in a single boot, each witnessed with first-16-bytes
+    /// + a pattern verdict, to corner the variable: buffer region, DMA-lands-zeros-vs-never-lands,
+    /// TD shape, mid-size transfer, and posted-write visibility. Bounded (~10 ms + transfers).
+    #[cfg(target_arch = "aarch64")]
+    fn piusb36_matrix(&mut self) {
+        let slot = self.storage_slot;
+        if slot == 0 { serial_println!(":: PIUSB: [piusb36] no storage slot — matrix skipped ::"); return; }
+        let databuf = match self.slots[slot as usize].scsi_data_buffer {
+            Some(p) => p as u64,
+            None => { serial_println!(":: PIUSB: [piusb36] no scsi_data_buffer — matrix skipped ::"); return; }
+        };
+        let read10_lba0 = [0x28u8, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+
+        serial_println!(":: PIUSB: [piusb36] === experiment matrix (read-only, one boot) === ::");
+
+        // --- Step 1: baseline READ(10) LBA0 into the CURRENT scsi_data_buffer (expect zeros on
+        //     metal). Establishes the wedge is live this boot before the discriminating variants. ---
+        match self.bot_transfer(slot, &read10_lba0, databuf, 512, Direction::In) {
+            Ok(r) => Self::piusb36_report("step1-baseline-scsibuf", databuf, r.status, r.residue, None),
+            Err(e) => serial_println!(":: PIUSB: [piusb36] step1 baseline ERR {:?} ::", e),
+        }
+
+        // --- Step 2: FRESH alloc_zeroed buffer PRE-FILLED with 0xA5, then READ(10) LBA0 into it.
+        //     PATTERN-SURVIVED => the device never wrote (DMA never landed); ZEROS => something wrote
+        //     zeros OVER the pattern (DMA landed zeros, or a stale write-back clobbered it); DATA =>
+        //     the block landed. This is the critical 'never-lands vs lands-zeros' discriminator. ---
+        {
+            let layout = core::alloc::Layout::from_size_align(512, 64).unwrap();
+            let fresh = unsafe { alloc::alloc::alloc_zeroed(layout) };
+            if fresh.is_null() {
+                serial_println!(":: PIUSB: [piusb36] step2 alloc failed ::");
+            } else {
+                unsafe { core::ptr::write_bytes(fresh, 0xA5, 512); }
+                match self.bot_transfer(slot, &read10_lba0, fresh as u64, 512, Direction::In) {
+                    Ok(r) => Self::piusb36_report("step2-fresh-A5-heap", fresh as u64, r.status, r.residue, Some(0xA5)),
+                    Err(e) => serial_println!(":: PIUSB: [piusb36] step2 fresh-A5 ERR {:?} ::", e),
+                }
+                unsafe { alloc::alloc::dealloc(fresh, layout); }
+            }
+        }
+
+        // --- Step 3: STATIC low buffer (kernel-image .bss, phys typically <4 MiB — a wholly
+        //     different region from the 32 MiB heap). Pre-filled 0xA5, same READ(10) LBA0. Tests
+        //     whether the wedge is region-specific (RC inbound-window / cache-color) vs universal. ---
+        {
+            let sbuf = core::ptr::addr_of_mut!(PIUSB36_STATIC_BUF) as *mut u8;
+            unsafe { core::ptr::write_bytes(sbuf, 0xA5, 512); }
+            match self.bot_transfer(slot, &read10_lba0, sbuf as u64, 512, Direction::In) {
+                Ok(r) => Self::piusb36_report("step3-static-A5-low", sbuf as u64, r.status, r.residue, Some(0xA5)),
+                Err(e) => serial_println!(":: PIUSB: [piusb36] step3 static ERR {:?} ::", e),
+            }
+        }
+
+        // --- Step 4: INQUIRY (36 B) into scsi_data_buffer — a MID-SIZE control point between the
+        //     8 B READ CAPACITY that works and the 512 B READ(10) that fails. If 36 B lands data,
+        //     the failure threshold sits above 36 B (points at a length/burst boundary). ---
+        {
+            let inquiry = [0x12u8, 0, 0, 0, 36, 0, 0, 0, 0, 0];
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 36); }
+            match self.bot_transfer(slot, &inquiry, databuf, 36, Direction::In) {
+                Ok(r) => Self::piusb36_report("step4-inquiry36-scsibuf", databuf, r.status, r.residue, Some(0xA5)),
+                Err(e) => serial_println!(":: PIUSB: [piusb36] step4 inquiry ERR {:?} ::", e),
+            }
+        }
+
+        // --- Step 5: READ(10) LBA0 as TWO chained TRBs (256 + 256) into scsi_data_buffer — a
+        //     TD-shape variant of the same 512 B transfer. Discriminates TD shape from length. ---
+        match self.piusb36_read10_two_trb(slot, databuf) {
+            Ok(r) => Self::piusb36_report("step5-two-trb-scsibuf", databuf, r.status, r.residue, None),
+            Err(e) => serial_println!(":: PIUSB: [piusb36] step5 two-TRB ERR {:?} ::", e),
+        }
+
+        // --- Step 6: POSTED-WRITE VISIBILITY. Re-read LBA0 (single TRB, 1 block): bot_transfer
+        //     invalidates + we snapshot immediately (A). Then wait 1 ms, invalidate the SAME buffer
+        //     AGAIN, and re-read (B) — WITHOUT re-issuing the transfer. If A is zeros but B is data,
+        //     the controller's PCIe-posted DMA write was not yet globally visible in DRAM when the
+        //     transfer event fired and we read it (the small-read race window closes for 512 B). If
+        //     A == B, no posted-write timing race — the wedge is not a visibility latency. ---
+        match self.bot_transfer(slot, &read10_lba0, databuf, 512, Direction::In) {
+            Ok(r) => {
+                let a: [u8; 16] = unsafe { core::ptr::read(databuf as *const [u8; 16]) };
+                Self::piusb36_delay_ms(1);
+                dma_coherency::inval(databuf as usize, 512);
+                let b: [u8; 16] = unsafe { core::ptr::read(databuf as *const [u8; 16]) };
+                let a_zero = a.iter().all(|&x| x == 0);
+                let b_zero = b.iter().all(|&x| x == 0);
+                let verdict = if a_zero && !b_zero { "POSTED-WRITE-RACE-CONFIRMED(A-zeros,B-data-after-1ms)" }
+                    else if a_zero && b_zero { "no-race(both-zero-after-1ms-delay)" }
+                    else { "immediate-read-already-had-data(no-race-hit)" };
+                serial_println!(
+                    ":: PIUSB: [piusb36] step6-posted-write buf={:#x} CSW={:?} residue={} verdict={} | A(immediate)={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} | B(+1ms+inval)={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                    databuf, r.status, r.residue, verdict,
+                    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+            }
+            Err(e) => serial_println!(":: PIUSB: [piusb36] step6 posted-write ERR {:?} ::", e),
+        }
+
+        serial_println!(":: PIUSB: [piusb36] === matrix complete === ::");
+    }
+
+    // ==================== PIUSB-37: chase the command itself ====================
+
+    /// PIUSB-37 helper: dump the first 16 bytes at `phys` with a zeros/pattern/data verdict.
+    #[cfg(target_arch = "aarch64")]
+    fn piusb37_dump16(label: &str, phys: u64, status: CswStatus, residue: u32) {
+        let d = unsafe { core::slice::from_raw_parts(phys as *const u8, 16) };
+        let verdict = if d.iter().all(|&b| b == 0) { "ZEROS" } else { "DATA(real-bytes-landed)" };
+        serial_println!(
+            ":: PIUSB: [piusb37] {} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+            label, phys, status, residue, verdict,
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+            d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+    }
+
+    /// PIUSB-37: chase the READ(10)-returns-zeros wedge into the SCSI command itself. With the
+    /// cache theory (§5a), the DMA-address theory (§5b), and — pending P46 — buffer/region/TD-shape/
+    /// posted-write visibility (§5c) all pointing away from our transport, the residual suspect is
+    /// the command or the device's response to it: a wrong LUN, a byte-swapped/zero transfer length,
+    /// or a pending UNIT ATTENTION (post power-on/reset) under which some bridges return zero-filled
+    /// data + GOOD status until the sense is cleared (which would explain why the early P38 path —
+    /// a different reset/clear sequence — read real sectors while the deferred path reads zeros).
+    /// Four read-only steps, each witnessed. aarch64-only; never compiled on x86.
+    #[cfg(target_arch = "aarch64")]
+    fn piusb37_matrix(&mut self) {
+        let slot = self.storage_slot;
+        if slot == 0 { serial_println!(":: PIUSB: [piusb37] no storage slot — matrix skipped ::"); return; }
+        let (databuf, cbw_phys) = {
+            let s = &self.slots[slot as usize];
+            match (s.scsi_data_buffer, s.cbw_buffer) {
+                (Some(d), Some(c)) => (d as u64, c as u64),
+                _ => { serial_println!(":: PIUSB: [piusb37] no data/cbw buffer — matrix skipped ::"); return; }
+            }
+        };
+        let read10_lba0 = [0x28u8, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+
+        serial_println!(":: PIUSB: [piusb37] === chase-the-command matrix (read-only, one boot) === ::");
+
+        // --- Step 1: CBW AUDIT. Build the exact 31-byte CBW that bot_transfer hands to the
+        //     controller (build_cbw writes the on-the-wire little-endian layout, so a post-build
+        //     dump IS what the VL805 DMA-reads) for READ(10) LBA0 and, as a reference, INQUIRY.
+        //     Decode + spec-check each field: dCBWSignature must be "USBC" (55 53 42 43),
+        //     dCBWDataTransferLength must be 512 for READ(10) / 36 for INQUIRY (little-endian),
+        //     bmCBWFlags 0x80 (device->host IN), bCBWLUN 0, bCBWCBLength = CDB len, and the CDB:
+        //     READ(10) opcode 0x28 with LBA + transfer-length-in-blocks BIG-endian; a wrong LUN, a
+        //     zero blocks field, or a byte-swapped LBA each yields exactly the zeros-with-Passed
+        //     signature. This only builds into the CBW buffer — it issues no transfer. ---
+        for (label, cdb, want_len) in [
+            ("READ10", &read10_lba0[..], 512u32),
+            ("INQUIRY", &[0x12u8, 0, 0, 0, 36, 0][..], 36u32),
+        ] {
+            let _ = self.build_cbw(cbw_phys as *mut u8, want_len, Direction::In, cdb);
+            let c = unsafe { core::slice::from_raw_parts(cbw_phys as *const u8, 31) };
+            let sig = (c[0] as u32) | ((c[1] as u32) << 8) | ((c[2] as u32) << 16) | ((c[3] as u32) << 24);
+            let tag = (c[4] as u32) | ((c[5] as u32) << 8) | ((c[6] as u32) << 16) | ((c[7] as u32) << 24);
+            let dxlen = (c[8] as u32) | ((c[9] as u32) << 8) | ((c[10] as u32) << 16) | ((c[11] as u32) << 24);
+            let flags = c[12]; let lun = c[13]; let cblen = c[14];
+            let sig_ok = sig == 0x43425355;
+            let len_ok = dxlen == want_len;
+            let flags_ok = flags == 0x80;
+            let lun_ok = lun == 0;
+            let cblen_ok = cblen as usize == cdb.len();
+            serial_println!(
+                ":: PIUSB: [piusb37] cbw-dump {} sig={:#010x}({}) tag={:#x} dCBWDataTransferLength={}({}) bmFlags={:#04x}({}) bCBWLUN={}({}) bCBWCBLength={}({}) ::",
+                label, sig, if sig_ok {"USBC-ok"} else {"BAD"}, tag,
+                dxlen, if len_ok {"ok"} else {"MISMATCH"},
+                flags, if flags_ok {"IN-ok"} else {"BAD"},
+                lun, if lun_ok {"ok"} else {"NONZERO!"},
+                cblen, if cblen_ok {"ok"} else {"MISMATCH"});
+            serial_println!(
+                ":: PIUSB: [piusb37] cbw-dump {} CDB= {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                label,
+                c[15], c[16], c[17], c[18], c[19], c[20], c[21], c[22],
+                c[23], c[24], c[25], c[26], c[27], c[28], c[29], c[30]);
+            if label == "READ10" {
+                // Opcode 0x28; LBA = c[17..21] BE; transfer length in blocks = c[22..24] BE.
+                let opcode = c[15];
+                let lba = ((c[17] as u32) << 24) | ((c[18] as u32) << 16) | ((c[19] as u32) << 8) | (c[20] as u32);
+                let blocks = ((c[22] as u16) << 8) | (c[23] as u16);
+                serial_println!(
+                    ":: PIUSB: [piusb37] cbw-dump READ10 decode: opcode={:#04x}({}) LBA(BE)={} blocks(BE)={} — {} ::",
+                    opcode, if opcode == 0x28 {"ok"} else {"BAD"}, lba, blocks,
+                    if opcode == 0x28 && lba == 0 && blocks == 1 { "CDB well-formed — command is NOT the fault" }
+                    else { "CDB MALFORMED — this alone would return zeros+Passed" });
+            }
+        }
+
+        // --- Step 2: command-set + known-nonzero-LBA matrix. READ(10) of mid-disk FAT-area LBAs
+        //     (8192, 16384) — if LBA0 is a zero-filled reserved sector but these read data, the wedge
+        //     is not universal. Then LBA0 via READ(12) (0xA8) and READ(16) (0x88): some bridges
+        //     mishandle one command-set variant while another works. All read-only, first-16 dumped. ---
+        for &lba in &[8192u32, 16384u32] {
+            let cdb = [0x28u8, 0,
+                (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
+                0, 0, 1, 0];
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
+            match self.bot_transfer(slot, &cdb, databuf, 512, Direction::In) {
+                Ok(r) => {
+                    let d = unsafe { core::slice::from_raw_parts(databuf as *const u8, 16) };
+                    let verdict = if d.iter().all(|&b| b == 0) { "ZEROS" } else { "DATA(real-bytes-landed)" };
+                    serial_println!(
+                        ":: PIUSB: [piusb37] read10-lba{} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                        lba, databuf, r.status, r.residue, verdict,
+                        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+                        d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+                }
+                Err(e) => serial_println!(":: PIUSB: [piusb37] read10-lba{} ERR {:?} ::", lba, e),
+            }
+        }
+        // READ(12) LBA0 (opcode 0xA8): LBA BE in bytes 2..6, transfer length BE (blocks) in 6..10.
+        {
+            let cdb = [0xA8u8, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0];
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
+            match self.bot_transfer(slot, &cdb, databuf, 512, Direction::In) {
+                Ok(r) => Self::piusb37_dump16("read12-lba0", databuf, r.status, r.residue),
+                Err(e) => serial_println!(":: PIUSB: [piusb37] read12-lba0 ERR {:?} ::", e),
+            }
+        }
+        // READ(16) LBA0 (opcode 0x88): LBA BE in bytes 2..10, transfer length BE (blocks) in 10..14.
+        {
+            let cdb = [0x88u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0];
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
+            match self.bot_transfer(slot, &cdb, databuf, 512, Direction::In) {
+                Ok(r) => Self::piusb37_dump16("read16-lba0", databuf, r.status, r.residue),
+                Err(e) => serial_println!(":: PIUSB: [piusb37] read16-lba0 ERR {:?} ::", e),
+            }
+        }
+
+        // --- Step 3: REQUEST SENSE immediately after a zeros-read. STRONG CANDIDATE: some bridges
+        //     return zero-filled data + GOOD status while a UNIT ATTENTION (power-on/reset, sense
+        //     key 0x06, ASC 0x29) is pending — the sense stays latched until read. Issue a READ(10)
+        //     LBA0 (the zeros-read), then REQUEST SENSE (0x03, 18 B) and decode the sense buffer:
+        //     response code, sense key, ASC/ASCQ. A non-zero sense key here is the smoking gun. ---
+        {
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0, 512); }
+            let read_res = self.bot_transfer(slot, &read10_lba0, databuf, 512, Direction::In);
+            match read_res {
+                Ok(r) => Self::piusb37_dump16("presense-read10-lba0", databuf, r.status, r.residue),
+                Err(e) => serial_println!(":: PIUSB: [piusb37] presense-read10 ERR {:?} ::", e),
+            }
+            let sense_cdb = [0x03u8, 0, 0, 0, 18, 0];
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0, 18); }
+            match self.bot_transfer(slot, &sense_cdb, databuf, 18, Direction::In) {
+                Ok(r) => {
+                    let s = unsafe { core::slice::from_raw_parts(databuf as *const u8, 18) };
+                    let resp = s[0] & 0x7f;
+                    let key = s[2] & 0x0f;
+                    let asc = s[12]; let ascq = s[13];
+                    let name = match key {
+                        0x00 => "NO SENSE", 0x02 => "NOT READY", 0x03 => "MEDIUM ERROR",
+                        0x04 => "HARDWARE ERROR", 0x05 => "ILLEGAL REQUEST",
+                        0x06 => "UNIT ATTENTION", 0x0b => "ABORTED COMMAND", _ => "other",
+                    };
+                    serial_println!(
+                        ":: PIUSB: [piusb37] REQUEST-SENSE CSW={:?} residue={} response={:#04x} key={:#x}({}) ASC={:#04x} ASCQ={:#04x} — {} ::",
+                        r.status, r.residue, resp, key, name, asc, ascq,
+                        if key == 0x06 { "UNIT ATTENTION PENDING — strong candidate for zeros-then-good" }
+                        else if key == 0x00 { "no pending sense — UA theory does NOT explain the zeros" }
+                        else { "pending non-UA sense condition" });
+                    serial_println!(
+                        ":: PIUSB: [piusb37] REQUEST-SENSE raw= {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8],
+                        s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17]);
+                }
+                Err(e) => serial_println!(":: PIUSB: [piusb37] REQUEST-SENSE ERR {:?} ::", e),
+            }
+        }
+
+        // --- Step 4: TEST UNIT READY drain + retry READ(10). Standard bring-up practice: issue
+        //     TUR / REQUEST SENSE until the unit reports ready (clearing any latched UA), THEN
+        //     re-read LBA0. If the zeros become data after the sense-clear, THAT is the fix: drain
+        //     TUR/sense before the first read. If they stay zeros, the UA theory is refuted and the
+        //     residual is a genuine device/transport response to the READ command itself. ---
+        {
+            let mut ready = false;
+            for attempt in 0..8 {
+                match self.scsi_test_unit_ready(slot) {
+                    Ok(CswStatus::Passed) => {
+                        serial_println!(":: PIUSB: [piusb37] TUR attempt {} => Passed (ready) ::", attempt);
+                        ready = true; break;
+                    }
+                    Ok(st) => {
+                        serial_println!(":: PIUSB: [piusb37] TUR attempt {} => {:?}; clearing sense ::", attempt, st);
+                        let sense_cdb = [0x03u8, 0, 0, 0, 18, 0];
+                        let _ = self.bot_transfer(slot, &sense_cdb, databuf, 18, Direction::In);
+                    }
+                    Err(e) => serial_println!(":: PIUSB: [piusb37] TUR attempt {} ERR {:?} ::", attempt, e),
+                }
+            }
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0, 512); }
+            match self.bot_transfer(slot, &read10_lba0, databuf, 512, Direction::In) {
+                Ok(r) => {
+                    Self::piusb37_dump16("postready-read10-lba0", databuf, r.status, r.residue);
+                    let d = unsafe { core::slice::from_raw_parts(databuf as *const u8, 16) };
+                    let still_zeros = d.iter().all(|&b| b == 0);
+                    serial_println!(
+                        ":: PIUSB: [piusb37] post-TUR verdict: ready={} data={} — {} ::",
+                        ready, if still_zeros {"ZEROS"} else {"REAL"},
+                        if !still_zeros { "SENSE-CLEAR IS THE FIX: drain TUR/REQUEST-SENSE before first read" }
+                        else { "still zeros after ready — UA/sense theory REFUTED; residual is READ-command response" });
+                }
+                Err(e) => serial_println!(":: PIUSB: [piusb37] postready-read10 ERR {:?} ::", e),
+            }
+        }
+
+        serial_println!(":: PIUSB: [piusb37] === chase-the-command matrix complete === ::");
+    }
+
+    // ==================== PIUSB-38: stall recovery + low-LBA-zeros bisect ====================
+
+    /// PIUSB-38: prove BOT Reset Recovery on the storage pipe, then run the low-LBA-zeros bisect.
+    /// Three read-only phases in one boot (each witnessed `:: PIUSB: [piusb38] ... ::`):
+    ///
+    ///   * **Phase 1 — induced-stall recovery.** Issue an UNSUPPORTED command (READ(16), opcode
+    ///     0x88) which the bench VL805 stick STALLs (completion code 4). `bot_transfer` now runs
+    ///     BOT Reset Recovery inline (clear the halt, collect the CSW to resync, escalate to a full
+    ///     Bulk-Only Mass Storage Reset if the status phase also fails). We then prove the pipe is
+    ///     ALIVE: TEST UNIT READY and REQUEST SENSE must COMPLETE (not Timeout) afterwards. Pre-P48
+    ///     the stall left the pipe wedged and every later command timed out (the P47 wall).
+    ///   * **Phase 2 — explicit full reset.** Call `recover_bot_full` directly and re-prove TUR, so
+    ///     the class-level reset path is exercised end to end even when Phase 1's inline recovery
+    ///     already sufficed.
+    ///   * **Phase 3 — low-LBA-zeros bisect.** Read a ladder LBA 0,1,2,4,8,…,8192 (same READ(10)
+    ///     CDB shape, only the LBA field differs), each with a zeros/data verdict + residue, to find
+    ///     the zeros→data boundary; then diff the LBA0 vs LBA8192 buffers (first differing byte).
+    ///     Because only the LBA field changes, any zeros-vs-data split is region-specific, not a
+    ///     command-shape fault (null-hypothesis-our-code: a buffer/cache/aliasing effect on the low
+    ///     region, not the SCSI command).
+    ///
+    /// Read-only (no WRITE(10)); bounded (≈20 transfers + a couple of resets). aarch64-only; never
+    /// compiled on x86. Inert in QEMU raspi4b (no VL805 → no storage slot); virt exercises every
+    /// step (READ(16) may be supported there — the recovery path stays correct either way).
+    #[cfg(target_arch = "aarch64")]
+    fn piusb38_matrix(&mut self) {
+        let slot = self.storage_slot;
+        if slot == 0 { serial_println!(":: PIUSB: [piusb38] no storage slot — matrix skipped ::"); return; }
+        let databuf = match self.slots[slot as usize].scsi_data_buffer {
+            Some(p) => p as u64,
+            None => { serial_println!(":: PIUSB: [piusb38] no scsi_data_buffer — matrix skipped ::"); return; }
+        };
+
+        serial_println!(":: PIUSB: [piusb38] === stall-recovery + low-LBA bisect (read-only, one boot) === ::");
+
+        // --- Phase 1: induce a stall, then prove the pipe recovered. ---
+        // READ(16), opcode 0x88, LBA0, 1 block — unsupported by many bulk bridges (STALL, code 4).
+        let read16_lba0 = [0x88u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0];
+        unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
+        match self.bot_transfer(slot, &read16_lba0, databuf, 512, Direction::In) {
+            Ok(r) => serial_println!(
+                ":: PIUSB: [piusb38] induced-read16 CSW={:?} residue={} (no stall — device accepted READ16) ::",
+                r.status, r.residue),
+            Err(BotError::Stall) => serial_println!(
+                ":: PIUSB: [piusb38] induced-read16 STALL — inline BOT reset-recovery ran ::"),
+            Err(e) => serial_println!(":: PIUSB: [piusb38] induced-read16 ERR {:?} (recovery ran) ::", e),
+        }
+        // The pipe must be ALIVE now: TUR + REQUEST SENSE must COMPLETE (not Timeout).
+        let tur1 = self.scsi_test_unit_ready(slot);
+        let sense_cdb = [0x03u8, 0, 0, 0, 18, 0];
+        unsafe { core::ptr::write_bytes(databuf as *mut u8, 0, 18); }
+        let sense1 = self.bot_transfer(slot, &sense_cdb, databuf, 18, Direction::In);
+        let recovered = !matches!(tur1, Err(BotError::Timeout))
+            && !matches!(sense1, Err(BotError::Timeout));
+        serial_println!(
+            ":: PIUSB: [piusb38] post-stall TUR={:?} REQUEST-SENSE={:?} — {} ::",
+            tur1, sense1.as_ref().map(|r| r.status),
+            if recovered { "PIPE RECOVERED (TUR+SENSE completed — stall no longer wedges the pipe)" }
+            else { "PIPE STILL WEDGED (a command timed out after the stall)" });
+
+        // --- Phase 2: exercise the full Bulk-Only Reset Recovery path explicitly, then re-prove. ---
+        self.recover_bot_full(slot);
+        let tur2 = self.scsi_test_unit_ready(slot);
+        serial_println!(
+            ":: PIUSB: [piusb38] post-full-reset TUR={:?} — {} ::",
+            tur2,
+            if matches!(tur2, Err(BotError::Timeout)) { "pipe dead after full reset" }
+            else { "pipe alive after full Bulk-Only Reset Recovery" });
+
+        // --- Phase 3: low-LBA-zeros bisect. Read ladder; find the zeros→data boundary. ---
+        let ladder: [u32; 15] = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+        let mut first_data_lba: Option<u32> = None;
+        let mut last_zero_lba: Option<u32> = None;
+        let mut lba0_first16 = [0u8; 16];
+        let mut lba8192_first16 = [0u8; 16];
+        for &lba in &ladder {
+            let cdb = [0x28u8, 0,
+                (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
+                0, 0, 1, 0]; // READ(10), 1 block
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
+            match self.bot_transfer(slot, &cdb, databuf, 512, Direction::In) {
+                Ok(r) => {
+                    let d = unsafe { core::slice::from_raw_parts(databuf as *const u8, 16) };
+                    let all_zero = d.iter().all(|&b| b == 0);
+                    let all_a5 = d.iter().all(|&b| b == 0xA5);
+                    let verdict = if all_a5 { "PATTERN-SURVIVED(device-never-wrote)" }
+                        else if all_zero { "ZEROS" } else { "DATA(real-bytes-landed)" };
+                    if lba == 0 { lba0_first16.copy_from_slice(d); }
+                    if lba == 8192 { lba8192_first16.copy_from_slice(d); }
+                    if !all_zero && !all_a5 && first_data_lba.is_none() { first_data_lba = Some(lba); }
+                    if all_zero { last_zero_lba = Some(lba); }
+                    serial_println!(
+                        ":: PIUSB: [piusb38] ladder-lba{} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                        lba, r.status, r.residue, verdict,
+                        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+                        d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+                }
+                Err(e) => serial_println!(":: PIUSB: [piusb38] ladder-lba{} ERR {:?} ::", lba, e),
+            }
+        }
+        // Boundary verdict.
+        match (last_zero_lba, first_data_lba) {
+            (Some(z), Some(d)) => serial_println!(
+                ":: PIUSB: [piusb38] bisect boundary: last-zeros=LBA{} first-data=LBA{} — zeros→data split IS region-specific (same CDB shape) ::", z, d),
+            (Some(z), None) => serial_println!(
+                ":: PIUSB: [piusb38] bisect boundary: ALL ladder LBAs zeros (last=LBA{}) — no data landed on any low LBA ::", z),
+            (None, Some(d)) => serial_println!(
+                ":: PIUSB: [piusb38] bisect boundary: data from the first LBA (LBA{}) — no low-LBA zeros this boot ::", d),
+            (None, None) => serial_println!(
+                ":: PIUSB: [piusb38] bisect boundary: no zeros and no data (pattern survived / errors) — see per-LBA lines ::"),
+        }
+        // Diff LBA0 vs LBA8192 (same READ(10) shape, only the LBA field differs).
+        let first_diff = (0..16).find(|&i| lba0_first16[i] != lba8192_first16[i]);
+        match first_diff {
+            Some(i) => serial_println!(
+                ":: PIUSB: [piusb38] lba0-vs-lba8192 diff: first differ at byte {} (lba0={:#04x} lba8192={:#04x}) — identical command path, divergent data ⇒ region/buffer effect not command-shape ::",
+                i, lba0_first16[i], lba8192_first16[i]),
+            None => serial_println!(
+                ":: PIUSB: [piusb38] lba0-vs-lba8192 diff: first-16 IDENTICAL (both {}) ::",
+                if lba0_first16.iter().all(|&b| b == 0) { "zeros" } else { "equal-nonzero" }),
+        }
+
+        serial_println!(":: PIUSB: [piusb38] === stall-recovery + low-LBA bisect complete === ::");
+    }
+
+    /// USB-WRITE-2: recover a halted bulk endpoint after a STALL (completion code 4) or Babble
+    /// (6) so one faulted transfer cannot dead-line every later BOT command on the slot. This is
+    /// the standard USB BOT clear-stall sequence, host + device side:
+    ///   1. **Reset Endpoint** (xHCI command TRB type 14): moves the endpoint context from the
+    ///      Halted state to Stopped and clears the host-side data-toggle/sequence.
+    ///   2. **Set TR Dequeue Pointer** (command TRB type 16): repoints the transfer ring's dequeue
+    ///      pointer PAST the faulted TRB (the current enqueue slot + live cycle), so restarting the
+    ///      endpoint does not re-fetch the command that stalled.
+    ///   3. **CLEAR_FEATURE(ENDPOINT_HALT)** (EP0 control, bmRequestType 0x02, bRequest 0x01,
+    ///      wValue 0 = ENDPOINT_HALT, wIndex = endpoint address): clears the DEVICE-side halt so it
+    ///      resumes accepting transactions on that pipe.
+    /// `ep_in` selects the bulk IN (CSW / READ data) vs bulk OUT (WRITE data) endpoint. Best-effort:
+    /// each step logs but the sequence proceeds — a device that NAKs one step should not block the
+    /// others. Runs in the same safe synchronous polled context as the BOT pump itself.
+    fn recover_bulk_stall(&mut self, slot_id: u8, ep_in: bool) {
+        let ep_addr = {
+            let slot = &self.slots[slot_id as usize];
+            if ep_in { slot.bulk_in_ep } else { slot.bulk_out_ep }
+        };
+        if ep_addr == 0 { return; }
+        let dci = ((ep_addr as u32) & 0x0F) * 2 + if ep_in { 1 } else { 0 };
+        serial_println!("xHCI: [usbw] bulk STALL recovery slot {} ep {:#04x} (dci {})", slot_id, ep_addr, dci);
+
+        // 1+2) Host-side: Reset Endpoint (Halted -> Stopped) + Set TR Dequeue past the faulted TRB.
+        self.reset_bulk_endpoint_host(slot_id, ep_in);
+
+        // 3) Device-side CLEAR_FEATURE(ENDPOINT_HALT) on EP0. wIndex carries the full endpoint
+        //    address (with the direction bit for an IN endpoint).
+        match self.sync_control(slot_id, 0x02, 0x01, 0x0000, ep_addr as u16, 0, 0, false) {
+            Ok(1) => {}
+            other => serial_println!("xHCI: [usbw] CLEAR_FEATURE(HALT) unexpected {:?}", other),
+        }
+    }
+
+    /// Host-side half of clearing a halted bulk endpoint: **Reset Endpoint** (command TRB type 14,
+    /// Halted -> Stopped, clears the host data-toggle/sequence) then **Set TR Dequeue Pointer**
+    /// (command TRB type 16, repoints the transfer ring past the faulted TRB). Shared by the
+    /// per-endpoint `recover_bulk_stall` and the class-level `recover_bot_full` (PIUSB-38) so both
+    /// resync the host ring state identically. Best-effort + logged; the caller issues the device-
+    /// side CLEAR_FEATURE(ENDPOINT_HALT) that pairs with it.
+    fn reset_bulk_endpoint_host(&mut self, slot_id: u8, ep_in: bool) {
+        let ep_addr = {
+            let slot = &self.slots[slot_id as usize];
+            if ep_in { slot.bulk_in_ep } else { slot.bulk_out_ep }
+        };
+        if ep_addr == 0 { return; }
+        let dci: u32 = ((ep_addr as u32) & 0x0F) * 2 + if ep_in { 1 } else { 0 };
+
+        // 1) Reset Endpoint: Halted -> Stopped, clears host sequence/toggle.
+        let reset_trb = Trb { parameter: 0, status: 0,
+            control: (14 << 10) | (dci << 16) | ((slot_id as u32) << 24) };
+        match self.run_command_sync(reset_trb) {
+            Ok((1, _)) => {}
+            other => serial_println!("xHCI: [usbw] Reset Endpoint unexpected {:?}", other),
+        }
+
+        // 2) Set TR Dequeue Pointer to the ring's current enqueue slot (past the faulted TRB).
+        let deq = {
+            let slot = &self.slots[slot_id as usize];
+            let ring = if ep_in { slot.bulk_in_ring.as_ref() } else { slot.bulk_out_ring.as_ref() };
+            ring.map(|r| r.dequeue_reset_target())
+        };
+        if let Some((phys, dcs)) = deq {
+            let deq_trb = Trb { parameter: phys | (dcs as u64), status: 0,
+                control: (16 << 10) | (dci << 16) | ((slot_id as u32) << 24) };
+            match self.run_command_sync(deq_trb) {
+                Ok((1, _)) => {}
+                other => serial_println!("xHCI: [usbw] Set TR Dequeue unexpected {:?}", other),
+            }
+        }
+    }
+
+    /// PIUSB-38: FULL BOT **Reset Recovery** — the class-level escalation the USB Mass-Storage
+    /// Bulk-Only Transport spec (§5.3.4) prescribes when clearing one endpoint's halt does not
+    /// un-wedge the pipe (the P47 wall: after an unrecovered stall on the storage slot, every later
+    /// READ / REQUEST-SENSE / TEST-UNIT-READY on that pipe timed out — the bulk pipe halted and
+    /// never recovered, while HID kept flowing, so the interrupter was NOT globally wedged; the
+    /// transfer path of the storage slot alone was dead). The sequence:
+    ///   1. **Bulk-Only Mass Storage Reset** — class request `bmRequestType 0x21` (host->device,
+    ///      class, interface), `bRequest 0xFF`, `wValue 0`, `wIndex = bInterfaceNumber`, no data.
+    ///      Resets the device's BOT state machine (it re-synchronises to expect a fresh CBW).
+    ///   2. For each bulk endpoint (IN, then OUT): host-side Reset Endpoint + Set TR Dequeue
+    ///      (`reset_bulk_endpoint_host`), then device-side CLEAR_FEATURE(ENDPOINT_HALT). Clearing
+    ///      both halts + resetting both host toggles leaves host and device agreeing on toggle and
+    ///      ring dequeue, so the NEXT CBW starts clean.
+    /// Best-effort: each step logs but the sequence proceeds — a device that NAKs one step must not
+    /// block the others. Runs in the same safe synchronous polled context as the BOT pump itself.
+    fn recover_bot_full(&mut self, slot_id: u8) {
+        let (in_ep, out_ep, intf) = {
+            let s = &self.slots[slot_id as usize];
+            (s.bulk_in_ep, s.bulk_out_ep, s.storage_intf)
+        };
+        serial_println!(
+            "xHCI: [usbw] FULL BOT reset-recovery slot {} (intf {}, bulk in {:#04x}/out {:#04x})",
+            slot_id, intf, in_ep, out_ep);
+
+        // 1) Bulk-Only Mass Storage Reset (class, targets the MSC interface).
+        match self.sync_control(slot_id, 0x21, 0xFF, 0x0000, intf as u16, 0, 0, false) {
+            Ok(1) => serial_println!("xHCI: [usbw] Bulk-Only Mass Storage Reset OK (slot {})", slot_id),
+            other => serial_println!("xHCI: [usbw] Bulk-Only Mass Storage Reset unexpected {:?}", other),
+        }
+
+        // 2) Clear both bulk halts (host ring reset + device CLEAR_FEATURE) — IN first, then OUT.
+        for ep_in in [true, false] {
+            let ep_addr = if ep_in { in_ep } else { out_ep };
+            if ep_addr == 0 { continue; }
+            self.reset_bulk_endpoint_host(slot_id, ep_in);
+            match self.sync_control(slot_id, 0x02, 0x01, 0x0000, ep_addr as u16, 0, 0, false) {
+                Ok(1) => {}
+                other => serial_println!("xHCI: [usbw] CLEAR_FEATURE(HALT) ep {:#04x} unexpected {:?}", ep_addr, other),
+            }
         }
     }
 
@@ -3799,9 +5141,17 @@ impl XhciController {
             vendor_s, product_s, block_size, num_blocks,
             (num_blocks * block_size as u64) / (1024 * 1024));
 
-        *crate::drivers::block::BLOCK_DEVICE.lock() = Some(crate::drivers::block::BlockDeviceInfo {
+        let dev_info = crate::drivers::block::BlockDeviceInfo {
             slot_id: slot, block_size, num_blocks, vendor, product,
-        });
+        };
+        // PIUSB-28: publish geometry through the backend-aware helper. It ALWAYS records the stick under
+        // the dedicated USB handle (so the read-only /fs/usb mount reaches it via `read_block_usb`) and
+        // raises the storage-ready edge (re-arming on every hot-plug re-enum, consumed OUTSIDE this
+        // controller lock since the FAT mount re-locks the controller). It claims the GLOBAL BLOCK_DEVICE
+        // only when USB is the active backend: on the Pi the microSD registered at BSP probe, so a later
+        // USB stick must NOT clobber the SD's geometry (PI-FS-2: a 14 MiB card reader bounded fresh unafs
+        // mounts → OutOfBounds(63)); on x86 the stick is the boot backend and still claims the global.
+        crate::drivers::block::publish_usb_geometry(dev_info);
         // GUI-WITNESS: the USB block device is up (geometry published). One of the "did storage come
         // up?" milestones a silent boot otherwise can't answer on-panel.
         crate::bootlog::record("block:up");
@@ -3814,6 +5164,37 @@ impl XhciController {
     /// sanity read of LBA 0.
     /// Multi-line dump of the live port + slot state for the shell `usbinfo` command — the metal
     /// diagnostic for "which USB devices enumerated, at what speed, and how far". Read-only.
+    /// PIUSB-13: read-only enumeration observability for the Pi-side `enumerate()` pump. These
+    /// expose the private root-enum FSM state (stage, in-flight port, last stall) and a structured
+    /// root-port snapshot so `piusb::enumerate` can emit the `:: PIUSB: [enum] ... ::` milestone
+    /// stream without duplicating the FSM. aarch64-gated: the block does not compile on x86, so x86
+    /// codegen is byte-identical (nothing there reads this state). All methods are pure reads with
+    /// no controller side effects.
+    #[cfg(target_arch = "aarch64")]
+    pub fn enum_stage_now(&self) -> &'static str { self.enum_stage }
+    /// Root port currently mid-enumeration (0 = none).
+    #[cfg(target_arch = "aarch64")]
+    pub fn enumerating_port_now(&self) -> u8 { self.enumerating_port }
+    /// Last recorded enumeration stall: (port, stage, why, completion-code, PORTSC). `None` until one.
+    #[cfg(target_arch = "aarch64")]
+    pub fn last_stall_now(&self) -> Option<(u8, &'static str, &'static str, u8, u32)> {
+        self.last_stall.as_ref().map(|s| (s.port, s.stage, s.why, s.code, s.portsc))
+    }
+    /// Total enumeration stalls this boot.
+    #[cfg(target_arch = "aarch64")]
+    pub fn stall_count_now(&self) -> u32 { self.stall_count }
+    /// Per-root-port snapshot for the observer: `(port, connected(CCS), xhci_speed_id)`.
+    /// Speed id: 1=FS 2=LS 3=HS 4=SS, 0 = none/untrained.
+    #[cfg(target_arch = "aarch64")]
+    pub fn root_ports_now(&self) -> Vec<(u8, bool, u32)> {
+        let mut v = Vec::new();
+        for p in 1..=self.max_ports {
+            let s = self.read_portsc(p);
+            v.push((p, (s & 1) != 0, (s >> 10) & 0xF));
+        }
+        v
+    }
+
     pub fn port_slot_summary(&self) -> Vec<alloc::string::String> {
         fn speed_name(s: u32) -> &'static str {
             match s { 1 => "FS", 2 => "LS", 3 => "HS", 4 => "SS", 0 => "-", _ => "?" }
@@ -3884,6 +5265,46 @@ impl XhciController {
             Err(e) => { serial_println!("xHCI: storage bring-up failed: {:?}", e); return; }
         }
 
+        // PIUSB-35: decisive DMA-address witness. P45 refuted the cache theory (the LBA0 read still
+        // returns all-zero with a Passed/residue=0 CSW even with PIUSB-34's clean-before-doorbell +
+        // post-invalidate), so the next suspect was the BCM2711 PCIe RC inbound window / DMA address:
+        // if the deferred-phase heap sat above the RC's reachable window (or needed a dma-ranges
+        // offset we don't apply), the VL805 would DMA the block into nowhere → stale zeros, while
+        // short control transfers using low buffers still worked. STATIC AUDIT REFUTES this: the
+        // aarch64 heap is placed at phys 0x0200_0000 (32 MiB), 64 MiB long (boot::MEM_REGIONS), RAM is
+        // identity-mapped (VA==PA in the low 1 GiB block), and init_heap_raw hands out from that
+        // physical region. The rings/DCBAA/event ring, the CBW buffer (DMA-READ by the device) and the
+        // CSW buffer (DMA-WRITTEN by the device — it returns Passed) ALL come from the same 32–96 MiB
+        // pool as scsi_data_buffer, and the RC inbound window is RAM@0 / 4 GiB / dma-ranges 1:1
+        // (offset 0; see piusb::M1 RC_BAR2). A working CSW-write to that pool cannot coexist with an
+        // unreachable data-write to the same pool. This witness prints the live physical addresses so
+        // P46 confirms on-metal that the data DMA target is in-window and below 3 GiB, retiring the
+        // address theory and redirecting to the length/TD-shape (or genuine device-side) discriminator.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let s = &self.slots[self.storage_slot as usize];
+            let databuf = s.scsi_data_buffer.map(|p| p as u64).unwrap_or(0);
+            let cbw = s.cbw_buffer.map(|p| p as u64).unwrap_or(0);
+            let csw = s.csw_buffer.map(|p| p as u64).unwrap_or(0);
+            let in_trb = s.bulk_in_ring.as_ref().map(|r| r.get_ptr()).unwrap_or(0);
+            // BCM2711 RC inbound window: RAM base 0, 4 GiB, dma-ranges 1:1 (cpu→pci offset 0).
+            const RC_INBOUND_BASE: u64 = 0;
+            const RC_INBOUND_SIZE: u64 = 0x1_0000_0000; // 4 GiB
+            const VL805_DMA_CEILING: u64 = 0xC000_0000; // classic <3 GiB VL805 DMA quirk boundary
+            let in_window = databuf >= RC_INBOUND_BASE && databuf < RC_INBOUND_BASE + RC_INBOUND_SIZE;
+            let below_3g = databuf < VL805_DMA_CEILING;
+            serial_println!(
+                ":: PIUSB: [piusb35] databuf phys={:#x} in_trb={:#x} cbw={:#x} csw={:#x} | rc-inbound=[{:#x},{:#x}) offset=0 (1:1) | databuf in_window={} below_3G={} — CBW(DMA-read)+CSW(DMA-write→Passed) share this pool; address theory {} ::",
+                databuf, in_trb, cbw, csw,
+                RC_INBOUND_BASE, RC_INBOUND_BASE + RC_INBOUND_SIZE,
+                in_window, below_3g,
+                if in_window && below_3g {
+                    "REFUTED on-metal (data DMA target reachable — look at length/TD-shape or device-side)"
+                } else {
+                    "HOLDS — data buffer is OUT of the reachable inbound window; move BOT buffers to a low DMA pool"
+                });
+        }
+
         // Sanity read of LBA 0.
         match self.storage_read10(0, 1) {
             Ok(res) => {
@@ -3898,11 +5319,336 @@ impl XhciController {
                         }
                         serial_println!("xHCI: [IRQ] xHCI interrupts taken so far: {}",
                             XHCI_IRQ_COUNT.load(Ordering::Relaxed));
+                        // PIUSB-25: Pi mass-storage enumeration + LBA0 read-proof witness. aarch64-gated
+                        // (byte-identical x86 codegen — nothing here changes the BOT/CSW core path; the
+                        // `data` slice is the block just read by the READ(10) above, invalidated at the
+                        // shared `bot_transfer` IN chokepoint so it is fresh DRAM on Pi silicon). Reports
+                        // the slot + geometry, the first 16 bytes hex, and a boot-sector sanity decode
+                        // (0x55AA signature, FAT/GPT hints). Read-only — never a write.
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            // USBW-1: report the USB device's OWN geometry. Reading the global
+                            // BLOCK_DEVICE here made this line print the microSD's 500224000 blocks
+                            // (244250 MiB) under a "storage enumerated" label on P57, two lines below
+                            // the true READ CAPACITY of 29120 blocks (14 MiB) — the mix-up that sent
+                            // the write self-test off the end of the reader.
+                            let (bs, nb, mib) = match crate::drivers::block::USB_BLOCK_DEVICE.lock().as_ref() {
+                                Some(d) => (d.block_size, d.num_blocks,
+                                            (d.num_blocks.saturating_mul(d.block_size as u64)) / (1024 * 1024)),
+                                None => (0, 0, 0),
+                            };
+                            serial_println!(
+                                ":: PIUSB: [piusb25] storage enumerated: slot {} bulk_in={:#04x} bulk_out={:#04x} block_size={} num_blocks={} ({} MiB) ::",
+                                self.storage_slot,
+                                self.slots[self.storage_slot as usize].bulk_in_ep,
+                                self.slots[self.storage_slot as usize].bulk_out_ep,
+                                bs, nb, mib);
+                            serial_println!(
+                                ":: PIUSB: [piusb25] READ(10) LBA0 CSW={:?} residue={} — first 16 bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                                res.status, res.residue,
+                                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                                data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]);
+                            let boot_sig = data[510] == 0x55 && data[511] == 0xAA;
+                            let gpt_protective = data[0x1C2] == 0xEE;   // protective-MBR partition type
+                            let fat16 = data[0x36..0x3B].starts_with(b"FAT");
+                            let fat32 = data[0x52..0x57].starts_with(b"FAT");
+                            let fs = if gpt_protective { "GPT (protective MBR)" }
+                                     else if fat32 { "FAT32 BPB" }
+                                     else if fat16 { "FAT12/16 BPB" }
+                                     else { "unrecognized/raw" };
+                            serial_println!(
+                                ":: PIUSB: [piusb25] boot-sector sanity: 0x55AA={} type={} ::",
+                                boot_sig, fs);
+                        }
+                    }
+                }
+                // PIUSB-34: fix-proof witness. Re-issue READ(10) LBA0 through the same BOT path
+                // (which now cleans the IN buffer before the doorbell AND invalidates after) and dump
+                // the first 16 bytes of the freshly-DMA'd + post-invalidate DRAM. On P44 this printed
+                // zeros; on P45 it must match the real boot sector. aarch64-only, read-only.
+                #[cfg(target_arch = "aarch64")]
+                if let Ok(re) = self.storage_read10(0, 1) {
+                    if let Some(p) = self.storage_data_ptr() {
+                        unsafe {
+                            let d = core::slice::from_raw_parts(p as *const u8, 16);
+                            serial_println!(
+                                ":: PIUSB: [piusb34] LBA0 re-read post-invalidate: CSW={:?} residue={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                                re.status, re.residue,
+                                d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+                                d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+                        }
                     }
                 }
             }
             Err(e) => serial_println!("xHCI: READ(10) LBA0 failed: {:?}", e),
         }
+
+        // PIUSB-36: one-boot decisive experiment matrix for the Pi-only 512-B-read-returns-zeros
+        // wedge (READ CAPACITY 8 B works, READ(10) 512 B returns Passed/residue=0/zeros). Read-only;
+        // aarch64 witness only — no-op on x86 (never compiled). Runs after the baseline witnesses so
+        // its buffer/TD-shape/posted-write experiments sit on the same enumerated slot.
+        #[cfg(target_arch = "aarch64")]
+        self.piusb36_matrix();
+
+        // PIUSB-37: chase the READ(10)-returns-zeros wedge into the SCSI command itself — CBW audit,
+        // command-set / known-nonzero-LBA matrix, REQUEST SENSE (UNIT ATTENTION candidate), and a
+        // TUR-drain-then-retry. Read-only; aarch64 witness only (no-op on x86). Runs after the
+        // piusb36 matrix so it sits on the same enumerated slot.
+        #[cfg(target_arch = "aarch64")]
+        self.piusb37_matrix();
+
+        // PIUSB-38: prove BOT Reset Recovery (induce a stall, then TUR/REQUEST-SENSE must still
+        // complete — the P47 wedge fix) and run the low-LBA-zeros bisect (read ladder 0..8192,
+        // zeros→data boundary, LBA0-vs-LBA8192 diff). Read-only; aarch64 witness only (no-op on
+        // x86). Runs after piusb37 on the same enumerated slot, before the write self-test.
+        #[cfg(target_arch = "aarch64")]
+        self.piusb38_matrix();
+
+        // USB-WRITE: prove the BOT WRITE(10) OUT path on the enumerated stick with a
+        // read-modify-write-restore of one scratch sector (byte-identical afterward).
+        self.mission_write_selftest();
+    }
+
+    /// USB-WRITE: MISSION write proof — a read-modify-write-restore of a single scratch sector well
+    /// past the filesystem area (the last block), leaving the medium BYTE-IDENTICAL. Exercises the
+    /// xHCI BOT WRITE(10) OUT data stage end to end (CBW OUT -> DATA OUT -> CSW) via the same
+    /// `storage_write10`/`storage_read10` the block layer uses, with a readback assertion after both
+    /// the pattern write AND the restore. Emits `[usbw] write lba=<n> ok` only when every step
+    /// verifies; ANY divergence emits a `-> FAIL` witness (which the battery's generic FAIL scan
+    /// catches) and NO success is claimed — no partial-write lie. Runs in the same safe non-event
+    /// context as the LBA0 sanity read; single-sector, bounded to the storage slot's own DMA buffer.
+    /// USBW-1: derive the **keep-out ceiling** — the first LBA on the USB medium that is provably
+    /// NOT claimed by on-disk structures — by parsing sector 0. The scratch sector must sit at or
+    /// above this. Returns `(ceiling, provenance)`; `ceiling == 0` means sector 0 carries no
+    /// recognizable container and the medium is raw.
+    ///
+    /// This exists because "near the end of the medium" is NOT the same as "clear of the
+    /// filesystem". The bench card is a **superfloppy**: the FAT16 BPB sits at LBA 0 with partition
+    /// offset 0, so the volume's LBA space IS the raw medium's and a whole-card volume runs to the
+    /// very last sector. Every top-of-medium candidate lands *inside* the live `/fs/usb` data
+    /// region — where `UNAOS.LOG` grows each boot, so tail clusters are not free by construction.
+    ///
+    /// Cases, fail-closed (an unreadable or ambiguous sector 0 yields the whole medium as keep-out,
+    /// which makes the caller skip rather than guess):
+    /// - **GPT** (protective MBR type 0xEE): the *backup GPT header lives in the last LBA*, so the
+    ///   top of the medium is the worst possible scratch. Whole medium.
+    /// - **MBR**: ceiling = the highest `start + size` over the valid primary entries.
+    /// - **FAT BPB at LBA 0** (superfloppy): ceiling = `BPB_TotSec16`, else `BPB_TotSec32`.
+    /// - **Raw**: ceiling 0.
+    fn usbw_keepout_ceiling(&mut self, nb: u64) -> (u64, &'static str) {
+        let ptr = match self.storage_data_ptr() { Some(p) => p, None => return (nb, "no-dma-buffer") };
+        match self.storage_read10(0, 1) {
+            Ok(r) if r.status == CswStatus::Passed => {}
+            _ => return (nb, "sector0-unreadable"),
+        }
+        let mut s0 = [0u8; 512];
+        unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, s0.as_mut_ptr(), 512); }
+
+        let le16 = |o: usize| (s0[o] as u32) | ((s0[o + 1] as u32) << 8);
+        let le32 = |o: usize| {
+            (s0[o] as u64) | ((s0[o + 1] as u64) << 8) | ((s0[o + 2] as u64) << 16)
+                | ((s0[o + 3] as u64) << 24)
+        };
+        let signed = s0[510] == 0x55 && s0[511] == 0xAA;
+
+        // A FAT BPB is identified by its structural fields, not by a string: 512-byte sectors, a
+        // power-of-two cluster size, at least one reserved sector and at least one FAT.
+        let bps = le16(11);
+        let spc = s0[13] as u32;
+        let rsvd = le16(14);
+        let nfats = s0[16] as u32;
+        let is_bpb = bps == 512 && spc != 0 && (spc & (spc - 1)) == 0 && rsvd != 0
+            && nfats >= 1 && nfats <= 2;
+
+        if signed {
+            // MBR-shaped table first — a protective 0xEE means GPT.
+            let mut max_end = 0u64;
+            let mut any = false;
+            for i in 0..4 {
+                let e = 446 + i * 16;
+                let ptype = s0[e + 4];
+                if ptype == 0x00 { continue; }
+                if ptype == 0xEE { return (nb, "gpt-protective (backup header in last LBA)"); }
+                let start = le32(e + 8);
+                let size = le32(e + 12);
+                if size == 0 { continue; }
+                any = true;
+                let end = start.saturating_add(size);
+                if end > max_end { max_end = end; }
+            }
+            if any { return (max_end.min(nb), "mbr-partition-table"); }
+            if is_bpb {
+                let tot = if le16(19) != 0 { le16(19) as u64 } else { le32(32) };
+                if tot != 0 { return (tot.min(nb), "fat-bpb superfloppy (BPB_TotSec)"); }
+                return (nb, "fat-bpb superfloppy (TotSec unreadable)");
+            }
+            // Signed, but neither a usable partition table nor a BPB — do not guess.
+            return (nb, "signed-but-unrecognized sector 0");
+        }
+        if is_bpb {
+            let tot = if le16(19) != 0 { le16(19) as u64 } else { le32(32) };
+            if tot != 0 { return (tot.min(nb), "fat-bpb superfloppy (BPB_TotSec, unsigned)"); }
+            return (nb, "fat-bpb superfloppy (TotSec unreadable)");
+        }
+        (0, "raw (no container in sector 0)")
+    }
+
+    fn mission_write_selftest(&mut self) {
+        // USBW-1: the scratch LBA MUST come from the USB stick's own READ CAPACITY, never from the
+        // global `block::info()`. On the Pi the microSD registers first and (since PIUSB-28) KEEPS the
+        // global, so `info()` returns the SD's geometry — P57 read 500224000 blocks (244250 MiB, the
+        // eMMC card) while the enumerated 'USB SD Reader' is 29120 blocks (14 MiB). The probe then
+        // addressed lba=500223999 over BOT, ~17000x past the reader's last LBA; the device answered
+        // correctly with CHECK CONDITION (CSW Failed, residue 512) after halting the data-IN, and the
+        // test mislabeled that honest out-of-range rejection as a transport stall. `usb_info()` is the
+        // dedicated USB handle published by the same enumeration that owns this BOT pipe. On x86
+        // `publish_usb_geometry` writes both handles, so this is byte-identical there.
+        let nb = match crate::drivers::block::usb_info() {
+            Some(d) => d.num_blocks,
+            None => {
+                // USBW-1: never skip silently — an unpublished USB handle used to make the whole
+                // write proof vanish without a trace, which is indistinguishable from "it ran".
+                serial_println!(
+                    ":: PIUSB: [usbw] scratch skipped: no USB block geometry published ::");
+                return;
+            }
+        };
+        if nb < 2 {
+            serial_println!(":: PIUSB: [usbw] scratch skipped: USB medium too small (num_blocks={}) ::", nb);
+            return;
+        }
+
+        // USBW-1: establish the keep-out ceiling BEFORE choosing a candidate. "Top of the medium" is
+        // not a safe scratch location by itself — on a superfloppy the FAT volume's LBA space IS the
+        // raw medium's, so a whole-card volume reaches the last sector and every top-of-medium
+        // candidate is inside the live data region.
+        let (ceiling, prov) = self.usbw_keepout_ceiling(nb);
+        let ptr = match self.storage_data_ptr() { Some(p) => p, None => return };
+
+        // USB-WRITE-2 (as amended by USBW-1): pick a scratch sector near the end of the medium but
+        // strictly ABOVE the keep-out ceiling, falling BACK progressively when a choice STALLs.
+        // Metal reality (P44): some sticks report a READ CAPACITY last-LBA they will then STALL a
+        // READ(10) against — the very-last sector is not always addressable. Try last, last-8,
+        // last-64 in order, keeping only candidates at/above the ceiling; each pre-read that halts is
+        // recovered inside `bot_transfer`, so the next candidate rides a clean pipe. When the
+        // container spans the medium there is NO safe sector and the probe skips outright — it does
+        // not fall back to writing inside a mounted volume.
+        serial_println!(
+            ":: PIUSB: [usbw] scratch geometry: USB last_lba={} (num_blocks={}), keep-out ceiling={} [{}] ::",
+            nb - 1, nb, ceiling, prov);
+        if ceiling >= nb {
+            serial_println!(
+                ":: PIUSB: [usbw] scratch skipped: on-disk container spans the medium ({}), no sector outside it — refusing to RMW inside a live volume ::",
+                prov);
+            return;
+        }
+        let mut lba = (nb - 1) as u32;
+        {
+            let mut candidates = [0u32; 3];
+            let mut ncand = 0usize;
+            for off in [1u64, 8, 64] {
+                // Strict `>` (lens fold): with nb == off the candidate would be LBA 0 — the boot
+                // sector, the one sector everything else treats as sacred. Only reachable on a raw
+                // 8/64-sector medium, but the "near the END of the medium" intent is absolute.
+                if nb > off && (nb - off) >= ceiling {
+                    candidates[ncand] = (nb - off) as u32;
+                    ncand += 1;
+                }
+            }
+            if ncand == 0 {
+                serial_println!(
+                    ":: PIUSB: [usbw] scratch skipped: no candidate at/above the keep-out ceiling {} ::",
+                    ceiling);
+                return;
+            }
+            lba = candidates[0];
+            let mut chosen: Option<u32> = None;
+            for i in 0..ncand {
+                let cand = candidates[i];
+                match self.storage_read10(cand, 1) {
+                    Ok(r) if r.status == CswStatus::Passed => { chosen = Some(cand); break; }
+                    other => {
+                        serial_println!(
+                            ":: PIUSB: [usbw] pre-read lba={} -> {:?}, falling back ::", cand, other);
+                    }
+                }
+            }
+            match chosen {
+                Some(c) => {
+                    if c != lba {
+                        serial_println!(":: PIUSB: [usbw] fallback lba={} ::", c);
+                    }
+                    lba = c;
+                }
+                None => {
+                    // USBW-1: do NOT call this "stalled" — that verdict was wrong on P57. Every
+                    // candidate came back as a COMPLETED BOT round trip whose CSW said Failed
+                    // (residue 512), i.e. the device rejected the command; stall recovery had already
+                    // run and cleared the halt, which is why the next candidate got a CSW at all.
+                    serial_println!(
+                        ":: PIUSB: [usbw] write lba={} -> FAIL (no readable scratch candidate; see per-candidate CSW above) ::",
+                        lba);
+                    return;
+                }
+            }
+        }
+
+        // 1) The chosen sector is already in the DMA buffer from its successful pre-read; stash the
+        //    ORIGINAL 512 bytes before we perturb it.
+        let mut orig = [0u8; 512];
+        unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, orig.as_mut_ptr(), 512); }
+
+        // 2) Stage a distinct pattern into the DMA buffer and WRITE it.
+        let mut pat = [0u8; 512];
+        for i in 0..512 { pat[i] = (orig[i] ^ 0xA5).wrapping_add(i as u8); }
+        unsafe { core::ptr::copy_nonoverlapping(pat.as_ptr(), ptr, 512); }
+        match self.storage_write10(lba, 1) {
+            Ok(r) if r.status == CswStatus::Passed => {}
+            other => {
+                serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (write {:?}) ::", lba, other);
+                self.restore_sector(lba, &orig); return;
+            }
+        }
+
+        // 3) READ back; the medium must now hold the pattern verbatim.
+        match self.storage_read10(lba, 1) {
+            Ok(r) if r.status == CswStatus::Passed => {}
+            other => {
+                serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (verify-read {:?}) ::", lba, other);
+                self.restore_sector(lba, &orig); return;
+            }
+        }
+        let mut rb = [0u8; 512];
+        unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, rb.as_mut_ptr(), 512); }
+        if rb != pat {
+            serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (readback mismatch) ::", lba);
+            self.restore_sector(lba, &orig); return;
+        }
+
+        // 4) RESTORE the original and confirm the medium is byte-identical again.
+        if !self.restore_sector(lba, &orig) {
+            serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (restore write) ::", lba); return;
+        }
+        match self.storage_read10(lba, 1) {
+            Ok(r) if r.status == CswStatus::Passed => {}
+            other => { serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (restore-verify {:?}) ::", lba, other); return; }
+        }
+        let mut chk = [0u8; 512];
+        unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, chk.as_mut_ptr(), 512); }
+        if chk != orig {
+            serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (not restored) ::", lba); return;
+        }
+
+        serial_println!(":: PIUSB: [usbw] write lba={} ok — RMW+readback+restore, medium byte-identical ::", lba);
+    }
+
+    /// USB-WRITE: stage `data` into the storage slot's DMA buffer and WRITE(10) it to `lba` (single
+    /// sector). Returns true iff the CSW reported Passed. Used to restore the scratch sector so the
+    /// medium is left byte-identical after the self-test.
+    fn restore_sector(&mut self, lba: u32, data: &[u8; 512]) -> bool {
+        let ptr = match self.storage_data_ptr() { Some(p) => p, None => return false };
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), ptr, 512); }
+        matches!(self.storage_write10(lba, 1), Ok(r) if r.status == CswStatus::Passed)
     }
 
     /// Main-loop hook (U2.5): bring up the FTDI console ONCE (SET_CONFIGURATION + the four FTDI
@@ -4028,6 +5774,9 @@ impl XhciController {
     /// OUT doorbell, and pump the event ring until its completion arrives (matched by TRB address).
     /// Returns the completion code. A slimmer twin of `run_bot_stage` (single stage, no CBW/CSW).
     fn ftdi_tx_stage(&mut self, slot_id: u8, out_dci: u8, data_phys: u64, len: u32) -> Result<u8, ()> {
+        // XHCI-COHERENCE: the TX staging buffer is CPU-written (drained from the serial ring) and
+        // DMA-read by the controller (bulk OUT); clean it to DRAM before its doorbell. No-op x86.
+        dma_coherency::clean(data_phys as usize, len as usize);
         let wait_trb_phys = {
             let ring = self.slots[slot_id as usize].bulk_out_ring.as_mut().ok_or(())?;
             let base = ring.get_ptr();
@@ -4085,6 +5834,14 @@ impl XhciController {
             | ((w_index as u64) << 32)
             | ((w_length as u64) << 48);
 
+        // XHCI-COHERENCE: producer-side eviction for the data buffer. Some callers pre-zero the buffer
+        // (e.g. the 8-byte MPS0-learn) or reuse it, leaving dirty CPU lines; clean them to DRAM BEFORE
+        // the controller DMAs so a delayed eviction can't later clobber its write (IN) or so it reads
+        // current bytes (OUT). The IN buffer is invalidated again after completion, below. No-op x86.
+        if w_length > 0 {
+            dma_coherency::clean(data_phys as usize, w_length as usize);
+        }
+
         // Setup stage. TRT: 0 = no data, 2 = OUT data, 3 = IN data.
         let trt: u32 = if w_length == 0 { 0 } else if dir_in { 3 } else { 2 };
         self.push_ep0(slot_id, Trb { parameter: setup, status: 8, control: (2 << 10) | (1 << 6) | (trt << 16) });
@@ -4119,6 +5876,12 @@ impl XhciController {
         let pump = self.pump_until_ep0_done(2000);
         let pending = self.ep0_pending.take();
         pump?;
+        // XHCI-COHERENCE: consumer boundary (one chokepoint for every control-IN reader — device /
+        // config / hub-status descriptors all land here). The controller DMA-wrote `data_phys`;
+        // invalidate the CPU's stale lines so the caller parses fresh DRAM. No-op x86.
+        if dir_in && w_length > 0 {
+            dma_coherency::inval(data_phys as usize, w_length as usize);
+        }
         let p = pending.ok_or(())?;
         // XENUM-3 M1: surface the actual transferred length. If the DATA stage reported a residual,
         // the read was short; with no data stage (zero-length control) the full "length" is 0.
@@ -4161,6 +5924,7 @@ impl XhciController {
             serial_println!("xHCI: run_command_sync refused: command ring stopped (abort in progress).");
             return Err(());
         }
+        Self::clean_cmd_input_ctx(&trb);
         let cmd_phys = {
             let mut g = COMMAND_RING.lock();
             let ring = g.as_mut().ok_or(())?;
@@ -4215,6 +5979,10 @@ impl XhciController {
     /// bring-up (safe polled context); the interrupt reads are already armed and keep delivering —
     /// the device just changes report format once this completes.
     pub fn service_hid_setproto(&mut self) {
+        // PIUSB-39 F1: drain any halted HID interrupt-IN endpoints first — they are dead until
+        // un-halted, and the recovery is synchronous like everything else in this hook. Hooked
+        // here so no caller outside the driver changes.
+        self.service_hid_halts();
         while let Some(slot) = self.hid_setproto_pending.pop() {
             // Only BOOT interfaces accept SET_PROTOCOL: proto 1 (keyboard) and proto 2 (relative
             // boot mouse). The absolute-pointer path (proto 0, e.g. usb-tablet / consumer-control)
@@ -4239,9 +6007,54 @@ impl XhciController {
             if boot_mouse && !self.set_hid_boot_protocol(slot, mouse_intf, "boot-mouse") {
                 continue;
             }
-            if kbd {
-                self.set_hid_boot_protocol(slot, kbd_intf, "keyboard");
+            if kbd && self.set_hid_boot_protocol(slot, kbd_intf, "keyboard") {
+                // HID-KEYS: SET_IDLE(0) on the keyboard interface. Duration 0 = "report only on
+                // change" (USB HID 1.11 §7.2.4): a keyboard that powered up with a nonzero idle
+                // rate (periodic resends) stops re-sending an unchanged report, so a held key is
+                // one press + one release edge rather than a stream of duplicate reports. Bounded
+                // and tolerated — some keyboards NAK/STALL it; we witness either way and move on.
+                // Only issued after SET_PROTOCOL succeeded (a STALL there halts EP0, so a following
+                // request would just time out).
+                self.set_hid_idle(slot, kbd_intf);
             }
+        }
+    }
+
+    /// HID-KEYS: HID class request SET_IDLE(duration=0, reportID=0) for one interface —
+    /// bmRequestType 0x21 (host->device, class, interface recipient), bRequest 0x0A,
+    /// wValue 0x0000 (duration high byte 0, report id low byte 0), wIndex = interface, no data.
+    /// Best-effort: logs a single `[hidkeys] set-idle ok/nak slot=N` witness and never bails the
+    /// caller (a NAK/STALL/timeout here is expected on some devices and is harmless — the decoders
+    /// still work, just without idle suppression).
+    fn set_hid_idle(&mut self, slot: u8, intf: u8) {
+        match self.sync_control(slot, 0x21, 0x0A, 0x0000, intf as u16, 0, 0, false) {
+            Ok(1) => serial_println!("[hidkeys] set-idle ok slot={} iface={}", slot, intf),
+            Ok(code) => serial_println!("[hidkeys] set-idle nak slot={} iface={} (code {})", slot, intf, code),
+            Err(()) => serial_println!("[hidkeys] set-idle nak slot={} iface={} (EP0 timeout)", slot, intf),
+        }
+    }
+
+    /// HID-LED: push this slot's current keyboard lock-LED bitmap to the device via SET_REPORT —
+    /// bmRequestType 0x21 (host->device, class, interface recipient), bRequest 0x09 (SET_REPORT),
+    /// wValue 0x0200 (report-type Output (0x02) << 8 | report-id 0), wIndex = interface, one data
+    /// byte OUT carrying the LED bitmap (bit0 Num, bit1 Caps, bit2 Scroll). The byte is staged in
+    /// this slot's descriptor_buffer (idle at report time — enumeration is long done). Best-effort:
+    /// logs a single `[hidled] caps=<0|1> set-report <ok|nak> slot=N` witness and tolerates a
+    /// NAK/STALL/timeout (some devices lack a settable Output report; the state is still tracked).
+    fn set_hid_leds(&mut self, slot: u8, intf: u8) {
+        let leds = self.slots[slot as usize].keyboard_leds;
+        let caps = (leds >> 1) & 1;
+        let buf = self.slots[slot as usize].descriptor_buffer;
+        if buf.is_null() {
+            serial_println!("[hidled] caps={} set-report nak slot={} (no buffer)", caps, slot);
+            return;
+        }
+        unsafe { core::ptr::write(buf, leds); }
+        let buf_phys = buf as u64;
+        match self.sync_control(slot, 0x21, 0x09, 0x0200, intf as u16, 1, buf_phys, false) {
+            Ok(1) => serial_println!("[hidled] caps={} set-report ok slot={}", caps, slot),
+            Ok(code) => serial_println!("[hidled] caps={} set-report nak slot={} (code {})", caps, slot, code),
+            Err(()) => serial_println!("[hidled] caps={} set-report nak slot={} (EP0 timeout)", caps, slot),
         }
     }
 
@@ -4402,6 +6215,9 @@ impl XhciController {
             core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
             base_ptr.add(1).write_volatile(1); // Input Control: A0 (slot context) only
 
+            // XHCI-COHERENCE: consumer boundary — invalidate the controller-written output context
+            // before copying its slot context out. No-op x86.
+            dma_coherency::inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
             let slot_ctx = base_ptr.add(CTX_WORDS);
             for i in 0..8 {
                 slot_ctx.add(i).write_volatile(core::ptr::read_volatile((output_ctx_virt as *const u32).add(i)));
@@ -4563,6 +6379,9 @@ impl XhciController {
             let base_ptr = input_ctx_virt as *mut u32;
             core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
 
+            // XHCI-COHERENCE: consumer boundary — invalidate the controller-written output context
+            // before reading its slot context (speed) and copying it out. No-op x86.
+            dma_coherency::inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
             // Interval encoding follows the hub's own speed (from its output slot context).
             let out_dw0 = core::ptr::read_volatile((output_ctx_virt as *const u32).add(0));
             let speed = (out_dw0 >> 20) & 0x0F;
@@ -4621,6 +6440,9 @@ impl XhciController {
         let Some(buf_ptr) = buf else { return; };
         let dci = ((ep & 0x0F) * 2 + 1) as u32; // interrupt IN
         let read_len = Self::hub_change_bitmap_len(nbr_ports) as u32;
+        // XHCI-COHERENCE: evict stale/dirty lines of the change buffer before arming the
+        // interrupt-IN read (controller DMA-writes it; completion path invalidates before reading).
+        dma_coherency::clean(buf_ptr as usize, read_len as usize);
         let in_trb = Trb {
             parameter: buf_ptr as u64,
             status: read_len,
@@ -4819,6 +6641,7 @@ impl XhciController {
                 ftdi::set_live(false);
             }
             self.hid_setproto_pending.retain(|s| *s != i as u8);
+            self.hid_halt_pending.retain(|(s, _)| *s != i as u8);
             self.hubs_pending.retain(|s| *s != i as u8);
             // A nested hub going away takes its own queued port changes with it.
             self.hub_changes_pending.retain(|(hs, _)| *hs != i as u8);
@@ -4853,6 +6676,11 @@ impl XhciController {
             let ep0_ring = ring::TransferRing::new(16);
             let ep0_ring_phys = ep0_ring.get_ptr();
 
+            // XHCI-COHERENCE: zeroed-handoff — the controller DMA-writes this output context during
+            // ADDRESS_DEVICE; clean+invalidate so its zeros reach DRAM and the CPU's read-back is
+            // fresh. No-op x86.
+            dma_coherency::clean_inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
+
             let slot = &mut self.slots[slot_id as usize];
             slot.input_context = input_ctx_virt;
             slot.output_context = output_ctx_virt;
@@ -4869,6 +6697,9 @@ impl XhciController {
             slot.route_depth = depth;
 
             *self.dcbaap.add(slot_id as usize) = output_ctx_virt as u64;
+            // XHCI-COHERENCE: producer boundary — clean the DCBAA entry the controller reads to
+            // locate this slot's output context. No-op x86.
+            dma_coherency::clean(self.dcbaap.add(slot_id as usize) as usize, core::mem::size_of::<u64>());
 
             let base_ptr = input_ctx_virt as *mut u32;
             core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
@@ -4999,6 +6830,9 @@ impl XhciController {
             // EP Type / CErr / TR Dequeue Pointer ADDRESS_DEVICE established; only MPS0 (DW1 bits 31:16)
             // changes. (Copying from 2*CTX_WORDS of the zeroed input would submit an EP-Type=0 / null-ring
             // context that strict silicon rejects.)
+            // XHCI-COHERENCE: consumer boundary — the live EP0 context copied out here was
+            // DMA-written by the controller at ADDRESS_DEVICE; invalidate before reading. No-op x86.
+            dma_coherency::inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
             let ep0_out = (output_ctx_virt as *const u32).add(CTX_WORDS);
             let ep0_in = base_ptr.add(2 * CTX_WORDS);
             for i in 0..8 {
@@ -5162,13 +6996,14 @@ impl XhciController {
         // at the device level — the interface descriptor is the only place to detect it. This
         // used to be HID-only, leaving a hubbed MSC device `other/unconfigured` forever (the
         // photographed metal failure). One storage device is supported, mirroring the root path.
-        if let Some(((in_addr, in_mps), (out_addr, out_mps))) = self.parse_msc_config(buf) {
+        if let Some(((in_addr, in_mps), (out_addr, out_mps), msc_intf)) = self.parse_msc_config(buf) {
             serial_println!(
                 "xHCI: >>> HUB DOWNSTREAM MASS STORAGE (slot {}, bulk in {:#x}/{} out {:#x}/{}) <<<",
                 slot_id, in_addr, in_mps, out_addr, out_mps);
             if self.storage_slot != 0 {
                 serial_println!("xHCI: storage slot {} already active; ignoring the hubbed device.", self.storage_slot);
             } else if self.configure_bulk_endpoints_sync(slot_id, in_addr, in_mps, out_addr, out_mps) {
+                self.slots[slot_id as usize].storage_intf = msc_intf; // PIUSB-38 reset-recovery wIndex
                 // Defer SET_CONFIGURATION + SCSI bring-up to service_storage (same main-loop
                 // context, next hook) — identical hand-off to the root path's async completion.
                 self.storage_slot = slot_id;
@@ -5193,12 +7028,16 @@ impl XhciController {
     /// Parse a configuration descriptor (in `buf`) for a Mass-Storage-Class interface
     /// (bInterfaceClass 0x08 — matched at ANY subclass/protocol, like the root path) and collect
     /// its bulk IN/OUT endpoint pair. Returns ((in_addr, in_mps), (out_addr, out_mps)) or None.
-    fn parse_msc_config(&self, buf: u64) -> Option<((u8, u16), (u8, u16))> {
+    fn parse_msc_config(&self, buf: u64) -> Option<((u8, u16), (u8, u16), u8)> {
         unsafe {
             let p = buf as *const u8;
             let total = ((*p.add(2) as usize) | ((*p.add(3) as usize) << 8)).min(64);
             let mut off = 0usize;
             let mut in_msc = false;
+            // PIUSB-38: the MSC bInterfaceNumber (descriptor byte +2) — the Bulk-Only Mass Storage
+            // Reset `wIndex`. Captured when the class-0x08 interface is seen so reset recovery
+            // targets the right interface for a hub-downstream stick.
+            let mut msc_intf: u8 = 0;
             let mut bulk_in: Option<(u8, u16)> = None;
             let mut bulk_out: Option<(u8, u16)> = None;
             while off + 2 <= total {
@@ -5207,6 +7046,7 @@ impl XhciController {
                 if len == 0 { break; }
                 if dtype == 0x04 && off + 8 <= total {
                     in_msc = *p.add(off + 5) == 0x08;
+                    if in_msc { msc_intf = *p.add(off + 2); }
                 } else if dtype == 0x05 && in_msc && off + 6 <= total {
                     let ep_addr = *p.add(off + 2);
                     let attr = *p.add(off + 3);
@@ -5223,7 +7063,7 @@ impl XhciController {
                 off += len;
             }
             match (bulk_in, bulk_out) {
-                (Some(i), Some(o)) => Some((i, o)),
+                (Some(i), Some(o)) => Some((i, o, msc_intf)),
                 _ => None,
             }
         }
@@ -5503,6 +7343,9 @@ impl XhciController {
             // the live EP Type / CErr / TR Dequeue Pointer that ADDRESS_DEVICE established; only
             // MPS0 changes. (Copying from 2*CTX_WORDS here would grab the zeroed EP1 region and
             // submit an EP-Type=0 / null-ring context the strict Tegra FW rejects with code 17.)
+            // XHCI-COHERENCE: consumer boundary — the live EP0 context copied out here was
+            // DMA-written by the controller at ADDRESS_DEVICE; invalidate before reading. No-op x86.
+            dma_coherency::inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
             let ep0_out = (output_ctx_virt as *const u32).add(CTX_WORDS);
             let ep0_in = base_ptr.add(2 * CTX_WORDS);
             for i in 0..8 {
@@ -5538,6 +7381,10 @@ impl XhciController {
             serial_println!("xHCI: CRITICAL ERROR - Descriptor Buffer Phys Addr is 0!");
             return;
         }
+        // XHCI-COHERENCE: evict any dirty/stale lines of the (reused) descriptor buffer before the
+        // controller DMA-writes the descriptor into it; the async completion parse invalidates before
+        // reading. No-op x86.
+        dma_coherency::clean(desc_phys as usize, 18);
 
         // 1. Setup Stage
         // 0x80 06 00 01 00 00 12 00
@@ -5586,6 +7433,9 @@ impl XhciController {
             serial_println!("xHCI: CRITICAL ERROR - Descriptor Buffer Phys Addr is 0!");
             return;
         }
+        // XHCI-COHERENCE: evict stale lines of the reused descriptor buffer before the controller
+        // DMA-writes the config descriptor (parse invalidates before reading). No-op x86.
+        dma_coherency::clean(desc_phys as usize, 64);
 
         // 1. Setup Stage
         // bmRequestType = 0x80 (Device to Host, Standard, Device)
@@ -5664,6 +7514,9 @@ impl XhciController {
             let output_ctx_virt = slot.output_context;
             let base_ptr = input_ctx_virt as *mut u32;
 
+            // XHCI-COHERENCE: consumer boundary — invalidate the controller-written output context
+            // before reading its speed and copying the slot context out below. No-op x86.
+            dma_coherency::inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
             // Speed (from the output slot context) governs the interval encoding for both endpoints.
             let out_dw0 = core::ptr::read_volatile((output_ctx_virt as *const u32).add(0));
             let speed = (out_dw0 >> 20) & 0x0F;
@@ -5805,6 +7658,130 @@ impl XhciController {
         }
     }
 
+    /// PIUSB-39 witness — one bounded line naming which population moved:
+    /// `[piusb39] mouse rearm=<n> discarded=<n> errrearm=<n> (<tag>)`. `tag` is `poll` (a normal
+    /// armed read), `guard` (the dup-Success guard discarded a completion and re-armed anyway) or
+    /// `halt` (a halted endpoint was un-halted and re-armed). Split counters because the three are
+    /// different populations: only `discarded` proves the guard's pipeline-preserving exit fired.
+    /// Knob-gated (`usbdebug`) and rate-limited — the pointer is the highest-traffic endpoint and
+    /// a self-sustaining error class would otherwise flood the FTDI at report rate.
+    #[allow(unused_variables)]
+    fn piusb39_witness(tag: &str) {
+        #[cfg(feature = "usbdebug")]
+        {
+            static LAST_MS: AtomicU64 = AtomicU64::new(0);
+            let now = crate::arch::ticks();
+            // First line always prints (LAST_MS == 0); after that, at most one per 250 ms.
+            let last = LAST_MS.load(Ordering::Relaxed);
+            if last != 0 && now.wrapping_sub(last) < 250 { return; }
+            LAST_MS.store(now.max(1), Ordering::Relaxed);
+            serial_println!(
+                "[piusb39] mouse rearm={} discarded={} errrearm={} ({})",
+                MOUSE_REARM_COUNT.load(Ordering::Relaxed),
+                MOUSE_DISCARD_REARM_COUNT.load(Ordering::Relaxed),
+                MOUSE_ERROR_REARM_COUNT.load(Ordering::Relaxed),
+                tag);
+        }
+    }
+
+    /// PIUSB-39 F3: rate-limited trace for a HID interrupt-IN error completion. Unconditional
+    /// (not knob-gated — a halted pointer is a real fault worth one line on any boot) but capped
+    /// at one line per 500 ms across both endpoints, because a non-halting error class repeats at
+    /// the endpoint's poll rate and would otherwise saturate the serial link.
+    fn hid_error_witness(what: &str, slot_id: u32, code: u32, halting: bool) {
+        static LAST_MS: AtomicU64 = AtomicU64::new(0);
+        static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+        let now = crate::arch::ticks();
+        let last = LAST_MS.load(Ordering::Relaxed);
+        if last != 0 && now.wrapping_sub(last) < 500 {
+            SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        LAST_MS.store(now.max(1), Ordering::Relaxed);
+        let dropped = SUPPRESSED.swap(0, Ordering::Relaxed);
+        serial_println!(
+            "xHCI: {} interrupt-IN error (slot {}, code {}); {} [+{} suppressed]",
+            what, slot_id, code,
+            if halting { "endpoint HALTED, queued for un-halt recovery" } else { "re-arming" },
+            dropped);
+    }
+
+    /// Main-loop hook (PIUSB-39 F1): un-halt and re-arm any HID interrupt-IN endpoint that took a
+    /// halting error completion. A Halted endpoint ignores the doorbell, so the plain re-queue the
+    /// event dispatch does for non-halting codes would be a silent no-op here — the pointer would
+    /// stay dead, which is the P54b-class hole for a stalling mouse. The sequence is the same pair
+    /// the bulk path uses (`reset_bulk_endpoint_host`), generalised over any DCI: **Reset
+    /// Endpoint** (TRB 14: Halted -> Stopped, clears the host sequence/toggle), **Set TR Dequeue
+    /// Pointer** (TRB 16: past the faulted TRB), then the device-side
+    /// `CLEAR_FEATURE(ENDPOINT_HALT)`, and finally the read is armed again. Synchronous, so it runs
+    /// here in the safe polled context rather than inside the event dispatch that noticed the error.
+    pub fn service_hid_halts(&mut self) {
+        while let Some((slot, is_mouse)) = self.hid_halt_pending.pop() {
+            if (slot as usize) >= self.slots.len() { continue; }
+            let (ep_addr, port, deq) = {
+                let s = &self.slots[slot as usize];
+                let ep = if is_mouse { s.mouse_ep } else { s.keyboard_ep };
+                let ring = if is_mouse { s.mouse_ring.as_ref() } else { s.keyboard_ring.as_ref() };
+                (ep, s.port_id, ring.map(|r| r.dequeue_reset_target()))
+            };
+            if ep_addr == 0 { continue; }
+            // A device that unplugged between the error and now: recovery would ring a doorbell
+            // for a completion that never arrives and burn the EP0 pump budget (same guard as
+            // `service_hid_setproto`). Hub-downstream slots carry port_id 0 -> treat as present.
+            if port != 0 && (self.read_portsc(port) & 1) == 0 {
+                serial_println!("xHCI: HID un-halt skipped for slot {} (device disconnected).", slot);
+                continue;
+            }
+            let dci: u32 = ((ep_addr as u32) & 0x0F) * 2 + if (ep_addr & 0x80) != 0 { 1 } else { 0 };
+            serial_println!(
+                "xHCI: [piusb39] un-halting {} interrupt-IN slot {} ep {:#04x} (dci {})",
+                if is_mouse { "pointer" } else { "keyboard" }, slot, ep_addr, dci);
+
+            // 1) Reset Endpoint: Halted -> Stopped.
+            let reset_trb = Trb { parameter: 0, status: 0,
+                control: (14 << 10) | (dci << 16) | ((slot as u32) << 24) };
+            match self.run_command_sync(reset_trb) {
+                Ok((1, _)) => {}
+                other => serial_println!("xHCI: [piusb39] Reset Endpoint unexpected {:?}", other),
+            }
+            // 2) Set TR Dequeue Pointer to the ring's current enqueue slot (past the faulted TRB).
+            if let Some((phys, dcs)) = deq {
+                let deq_trb = Trb { parameter: phys | (dcs as u64), status: 0,
+                    control: (16 << 10) | (dci << 16) | ((slot as u32) << 24) };
+                match self.run_command_sync(deq_trb) {
+                    Ok((1, _)) => {}
+                    other => serial_println!("xHCI: [piusb39] Set TR Dequeue unexpected {:?}", other),
+                }
+            }
+            // 3) Device-side CLEAR_FEATURE(ENDPOINT_HALT); wIndex = full endpoint address.
+            match self.sync_control(slot, 0x02, 0x01, 0x0000, ep_addr as u16, 0, 0, false) {
+                Ok(1) => {}
+                other => serial_println!("xHCI: [piusb39] CLEAR_FEATURE(HALT) unexpected {:?}", other),
+            }
+            // 4) The host ring dequeue moved; the old expectation is stale. Clear it so the first
+            //    completion after recovery is accepted, then arm the read.
+            {
+                let s = &mut self.slots[slot as usize];
+                if is_mouse { s.mouse_expect_phys = 0; s.mouse_prev_phys = 0; }
+                else { s.keyboard_expect_phys = 0; s.keyboard_prev_phys = 0; }
+            }
+            let armable = {
+                let s = &self.slots[slot as usize];
+                if is_mouse { s.mouse_data_buffer.is_some() && s.mouse_ring.is_some() }
+                else { s.data_buffer.is_some() && s.keyboard_ring.is_some() }
+            };
+            if armable {
+                if is_mouse {
+                    MOUSE_ERROR_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+                    self.queue_mouse_read(slot);
+                    Self::piusb39_witness("halt");
+                } else {
+                    self.queue_keyboard_read(slot);
+                }
+            }
+        }
+    }
+
     pub fn queue_mouse_read(&mut self, slot_id: u8) {
         unsafe {
             let ep_num = self.slots[slot_id as usize].mouse_ep & 0x0F;
@@ -5812,6 +7789,10 @@ impl XhciController {
             let dci = (ep_num * 2) + if dir_in { 1 } else { 0 };
 
             let data_phys = self.slots[slot_id as usize].mouse_data_buffer.unwrap() as u64;
+            // XHCI-COHERENCE: evict any stale/dirty lines of the report buffer before arming the
+            // interrupt-IN read (the controller DMA-writes it; the completion path invalidates before
+            // decoding). No-op x86.
+            dma_coherency::clean(data_phys as usize, self.slots[slot_id as usize].mouse_mps as usize);
 
             let in_trb = Trb {
                 parameter: data_phys,
@@ -5823,8 +7804,19 @@ impl XhciController {
             // dispatch can match a real completion against it and reject a Panther-Point
             // dup-Success for the already-consumed TD (see `mouse_expect_phys`).
             let ring_base = self.slots[slot_id as usize].mouse_ring.as_ref().unwrap().get_ptr();
+            // PIUSB-39: remember the TD we are retiring before overwriting the expectation — a
+            // genuine Panther-Point dup-Success names THAT address, and only that address may be
+            // discarded without a re-arm.
+            self.slots[slot_id as usize].mouse_prev_phys =
+                self.slots[slot_id as usize].mouse_expect_phys;
             self.slots[slot_id as usize].mouse_expect_phys =
                 ring_base + (idx as u64 * core::mem::size_of::<Trb>() as u64);
+            let rearms = MOUSE_REARM_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            // PIUSB-39 witness — knob-gated (usbdebug) and BOUNDED (first arm + every 256th), so a
+            // metal capture can read the pointer pipeline's liveness without flooding the FTDI.
+            if rearms == 1 || rearms % 256 == 0 {
+                Self::piusb39_witness("poll");
+            }
             self.ring_doorbell(slot_id, dci as u32);
             xdbg!("xHCI: Mouse Read Queued.");
         }
@@ -5837,6 +7829,10 @@ impl XhciController {
             let dci = (ep_num * 2) + if dir_in { 1 } else { 0 };
 
             let data_phys = self.slots[slot_id as usize].data_buffer.unwrap() as u64;
+            // XHCI-COHERENCE: evict stale/dirty lines of the report buffer before arming the
+            // interrupt-IN read (controller DMA-writes it; completion path invalidates before
+            // decoding). No-op x86.
+            dma_coherency::clean(data_phys as usize, self.slots[slot_id as usize].keyboard_mps as usize);
 
             let in_trb = Trb {
                 parameter: data_phys,
@@ -5848,6 +7844,9 @@ impl XhciController {
             // can match a real completion against it and reject a Panther-Point dup-Success for the
             // already-consumed TD (see `keyboard_expect_phys`). Mirrors `queue_mouse_read`.
             let ring_base = self.slots[slot_id as usize].keyboard_ring.as_ref().unwrap().get_ptr();
+            // PIUSB-39: mirror of `queue_mouse_read` — remember the TD being retired.
+            self.slots[slot_id as usize].keyboard_prev_phys =
+                self.slots[slot_id as usize].keyboard_expect_phys;
             self.slots[slot_id as usize].keyboard_expect_phys =
                 ring_base + (idx as u64 * core::mem::size_of::<Trb>() as u64);
             self.ring_doorbell(slot_id, dci as u32);

@@ -37,6 +37,10 @@ case "${1:-}" in
         export UNAOS_WITNESS="${UNAOS_WITNESS:-1}" ;;
 esac
 
+# BUILD-SHA-1: Export git SHA as UNAOS_GIT_SHA for compile-time embedding (option_env!("UNAOS_GIT_SHA")).
+# This makes the build ID available to all cargo invocations (check/test/kernel8/esp targets).
+export UNAOS_GIT_SHA="$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
+
 # Build flags shared by both targets
 NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec"
 
@@ -49,15 +53,33 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # usb-serial device (VID 0403 PID 6001) whose chardev is target/ftdi.log, so the x86 kernel's U2.5
 # FTDI console driver enumerates it and replays the boot log out the (emulated) cable. `is_ok()`
 # semantics — an EMPTY value counts as SET.
+#
+# WC-D: UNAOS_FBW / UNAOS_FBH are a PANEL-GEOMETRY OVERRIDE, not a cargo feature — they are read with
+# `option_env!` by arch/aarch64/mailbox.rs and replace the firmware-queried display mode (default unset =>
+# query the firmware, unchanged). They exist because QEMU raspi4b reports 640x480 while the bench Pi drives
+# 1920x1200, and the window compositor derives each window's integer upscale FROM the panel: the same
+# 128x128 window is scale 1 on the gate and scale 4 on the bench, so the gate cannot reach the bench's blit
+# path at all. `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test` reproduces bench geometry, and is the
+# configuration the WC-D `[wc-d] verify` verdict was cleared in. NOTE these change compiled-in behaviour:
+# a build made with them is NOT the flashable default image.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
 # commands; default OFF for boot/media builds). On x86 the builder re-derives features from env, so this
-# also flows through UNAOS_WITNESS there; on aarch64 virt/tegra `witness` gates nothing (all its call sites
-# are x86- or baremetal-scoped), so arming it for test-arm is a functional no-op that only reflects intent.
+# also flows through UNAOS_WITNESS there. NOTE (UVUG7-W): `witness` is NOT inert on aarch64 — an earlier
+# comment here claimed all its call sites were x86- or baremetal-scoped, and that was false. UVUG-7 added
+# two arch-wide aarch64 sites (`arch/aarch64/timer.rs::init` and `video/screen.rs::present_surface`), so
+# `test-arm` really does emit `[uvug7] ms clock` and `kernel8-test` emits both `[uvug7]` lines. The flip
+# side is what bit P53: `./arroyo kernel8` leaves the feature OFF, so a default flashable image contains
+# ZERO `uvug7` strings and the witness cannot fire. Every boot now states its own witness build state on
+# the `:: AARCH64 build: witness=... ::` line, so absence is never mistaken for failure again.
 [ -n "${UNAOS_WITNESS:-}" ] && _feats="${_feats}witness,"
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
 [ -n "${UNAOS_BOOTLOG:-}" ] && _feats="${_feats}bootlog,"
+# CLOCK-2: UNAOS_LOGTS=1 arms the `logts` feature — a compact timestamp prefix on each serial LINE
+# (monotonic ms → UTC after a civil anchor). UART byte-stream only; default OFF => serial byte-
+# identical (witness/mbench specs parse serial lines). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_LOGTS:-}" ] && _feats="${_feats}logts,"
 [ -n "${UNAOS_PI:-}" ] && _feats="${_feats}pi,"
 [ -n "${UNAOS_USBDEBUG:-}" ] && _feats="${_feats}usbdebug,"
 [ -n "${UNAOS_SCHED_DEMO:-}" ] && _feats="${_feats}sched_demo,"
@@ -253,6 +275,12 @@ _feats=""
 # aarch64. Default OFF => module + call site vanish, smoltcp not pulled, byte-identical. See
 # arch_arm64.md §PI-GENET and scripts/pi-genet-bench.md.
 [ -n "${UNAOS_GENET:-}" ] && _feats="${_feats}genet,"
+# PI-NET-13: UNAOS_NETTEST=1 arms the QEMU TCP/HTTP/mDNS regression gate — a hardware-free in-kernel
+# loopback seam + scripted smoltcp peer that drives the SAME pool/reaper/http/mdns service code the GENET
+# path runs (the GENET datapath no-ops under QEMU raspi4b, so this is the only off-metal coverage). Implies
+# `genet` (Cargo feature). Runs at the top of `genet_bringup` and prints `:: NET-GATE: ... PASS [w=0x..] ::`.
+# Pair with UNAOS_PI=1 on the kernel8-test battery: `UNAOS_NETTEST=1 UNAOS_PI=1 ./arroyo kernel8-test`.
+[ -n "${UNAOS_NETTEST:-}" ] && _feats="${_feats}nettest,genet,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"
@@ -726,8 +754,68 @@ EOF
 # and build a flashable .img for Raspberry Pi Imager. Links non-PIE at 0x80000 (aarch64-base.json,
 # relocation-model=static) with pi-baremetal.ld, then objcopy to a raw binary.
 KERNEL8_DIR="${WORKSPACE_DIR}/target/pi_baremetal"
-FW_ZIP="${WORKSPACE_DIR}/target/RPi4_UEFI_Firmware_v1.52.zip"
+# PIUSB-16: the Pi GPU firmware blobs we stage (start4.elf/fixup4.dat), the base DTB, and the
+# miniuart-bt overlay come from the OFFICIAL raspberrypi/firmware repo at a pinned stable tag — NOT
+# scavenged from a stale third-party UEFI bundle. The prior source (pftf/RPi4 UEFI v1.52, ~2023) is a
+# UEFI-oriented bundle whose old start4.elf did not run the stock power-on VL805/PCIe init this board's
+# updated bootloader (2026-05-17) expects — the VideoCore handed our kernel a PCIe RC left in reset
+# (RGR1_SW_INIT_1=0x3, PCIE_STATUS=0x0). FW_TAG matches the bootloader era so the VC does its normal
+# init + VL805 firmware push before handoff. Blobs are redistributable in binary form under
+# boot/LICENCE.broadcom (the same terms under which RPi OS ships them). "latest stable, always."
+FW_TAG="1.20260521"
+FW_CACHE="${WORKSPACE_DIR}/target/pi-firmware-${FW_TAG}"
+FW_RAW="https://raw.githubusercontent.com/raspberrypi/firmware/${FW_TAG}/boot"
+
+# BUILD-2 (concurrency safety): the whole kernel8() build stages into SHARED trees —
+# crates/user-blob/target, ${WORKSPACE_DIR}/target/*.bin, KERNEL8_DIR (wiped at entry) — and then
+# calls make-pi-img.sh on the ONE shared UnaOS-pi4-baremetal.img. Two concurrent `arroyo kernel8`
+# (or kernel8-test) runs in the same worktree race there: one run wipes/relinks a file the other's
+# objcopy is reading ("llvm-objcopy: No such file or directory") and both hit the make-pi-img
+# hdiutil/partitionDisk race. So the build critical section is serialized on a coarse lock, released
+# the moment the build finishes (BEFORE any QEMU phase — QEMU runs already use per-run ports/logs and
+# may overlap). make-pi-img.sh keeps its own finer lock too (defense in depth; instant when we hold
+# this one). Mechanism mirrors make-pi-img: mkdir-atomic lock, PID file, stale-break on dead holder
+# or age > K8_LOCK_STALE_SECS, bounded wait with dots. Env: UNAOS_K8_LOCK_WAIT_SECS / _STALE_SECS.
+K8_LOCKDIR="${WORKSPACE_DIR}/target/kernel8-build.lock"
+K8_LOCK_HELD=""
+k8_lock_release() {
+    [ -n "$K8_LOCK_HELD" ] && rm -rf "$K8_LOCKDIR" 2>/dev/null || true
+    K8_LOCK_HELD=""
+}
+k8_lock_acquire() {
+    local wait_secs="${UNAOS_K8_LOCK_WAIT_SECS:-1800}"
+    local stale_secs="${UNAOS_K8_LOCK_STALE_SECS:-1200}"
+    local waited=0 dotted=0 holder mtime now age
+    mkdir -p "${WORKSPACE_DIR}/target"
+    while ! mkdir "$K8_LOCKDIR" 2>/dev/null; do
+        holder=$(cat "$K8_LOCKDIR/pid" 2>/dev/null || echo "")
+        mtime=$(stat -f %m "$K8_LOCKDIR" 2>/dev/null || echo 0)
+        now=$(date +%s); age=$(( now - mtime ))
+        if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+            echo -e "${COLOR_YELLOW}kernel8: stale build lock reclaimed — holder PID $holder dead (age ${age}s)${COLOR_RESET}" >&2
+            rm -rf "$K8_LOCKDIR" 2>/dev/null || true; continue
+        fi
+        if [ "$age" -gt "$stale_secs" ]; then
+            echo -e "${COLOR_YELLOW}kernel8: stale build lock reclaimed — age ${age}s > ${stale_secs}s (holder PID ${holder:-unknown})${COLOR_RESET}" >&2
+            rm -rf "$K8_LOCKDIR" 2>/dev/null || true; continue
+        fi
+        if [ "$waited" -ge "$wait_secs" ]; then
+            echo "" >&2
+            echo -e "${COLOR_RED}kernel8: timed out after ${waited}s waiting for build lock held by PID ${holder:-unknown} ($K8_LOCKDIR)${COLOR_RESET}" >&2
+            exit 1
+        fi
+        [ "$dotted" -eq 0 ] && { printf 'kernel8: waiting for concurrent build lock (PID %s) ' "${holder:-unknown}" >&2; dotted=1; }
+        printf '.' >&2
+        sleep 3; waited=$(( waited + 3 ))
+    done
+    [ "$dotted" -eq 1 ] && echo "" >&2
+    echo $$ > "$K8_LOCKDIR/pid"
+    K8_LOCK_HELD=1
+    trap 'k8_lock_release' EXIT INT TERM
+}
+
 kernel8() {
+    k8_lock_acquire
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
 
     # M6c: build the EL0 user program as a SEPARATE link product (out of the kernel's .text) and
@@ -798,6 +886,80 @@ kernel8() {
     esac
     echo -e "${COLOR_GREEN}✅ midden EL0 program: midden_blob.bin (${msz} B)${COLOR_RESET}"
 
+    # ELF-1: build the minimal static ELF64 EL0 program (crates/user-elf) and — UNLIKE the flat blobs above
+    # — KEEP it as an ELF (strip-all removes section headers/symbols but preserves the ELF header + program
+    # headers + the two PT_LOAD segments). Its own workspace + linker script (user-elf.ld's PHDRS clause
+    # declares a R+X text segment and a R+W data segment); `-z max-page-size=0x1000` packs the segments on
+    # 4 KiB boundaries so the whole image fits the kernel's 16 KiB slot-window read cap. The kernel's aarch64
+    # loader (load_program_into_slot -> validate_elf) reads this back off the SD as ELFHELLO.ELF, validates
+    # the ident/type/machine, walks the PT_LOAD headers, and maps each segment with per-segment permissions.
+    echo -e "${COLOR_YELLOW}⚡ Building EL0 static-ELF program (crates/user-elf → target/ELFHELLO.ELF)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/user-elf"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+      cargo +nightly build --release -Z json-target-spec
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-elf/target/aarch64-base/release/user-elf" \
+      "${WORKSPACE_DIR}/target/ELFHELLO.ELF"
+    # It must exist, begin with the ELF magic (\x7fELF), and fit the slot window (USER_REGION_SIZE = 16 KiB;
+    # a larger image is BadSize at load). A wrong magic or oversize image is a build failure caught here.
+    [ -s "${WORKSPACE_DIR}/target/ELFHELLO.ELF" ] || { echo -e "${COLOR_RED}ERROR: ELFHELLO.ELF missing/empty — ELF build failed${COLOR_RESET}"; exit 1; }
+    emag="$(head -c 4 "${WORKSPACE_DIR}/target/ELFHELLO.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$emag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: ELFHELLO.ELF does not start with the ELF magic; first 4 bytes = ${emag}${COLOR_RESET}"; exit 1; }
+    esz="$(wc -c < "${WORKSPACE_DIR}/target/ELFHELLO.ELF" | tr -d ' ')"
+    [ "$esz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: ELFHELLO.ELF ${esz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ static-ELF EL0 program: ELFHELLO.ELF (${esz} B)${COLOR_RESET}"
+
+    # UVUG-1: build the static ELF64 EL0 mini-vug program (crates/user-vug) the SAME way as ELFHELLO — keep
+    # it AS AN ELF (strip-all preserves the ELF header + program headers + the two PT_LOAD segments). It maps
+    # an off-screen surface (SYS_FB_MAP), spawns 2 EL0 worker threads (SYS_THREAD_SPAWN) that render halves of
+    # an animated pattern under a FUTEX frame barrier, presents each frame (SYS_FB_PRESENT), then joins both
+    # (SYS_THREAD_JOIN) and prints its `:: UVUG: … ::` witness before exiting 0. Same linker script shape as
+    # ELFHELLO (user-vug.ld's PHDRS: a R+X text segment + a R+W data segment); `-z max-page-size=0x1000`
+    # packs the segments on 4 KiB boundaries so the whole image fits the kernel's 16 KiB slot window.
+    echo -e "${COLOR_YELLOW}⚡ Building EL0 mini-vug static-ELF program (crates/user-vug → target/VUG.ELF)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/user-vug"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+      cargo +nightly build --release -Z json-target-spec
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-vug/target/aarch64-base/release/user-vug" \
+      "${WORKSPACE_DIR}/target/VUG.ELF"
+    # It must exist, begin with the ELF magic (\x7fELF), and fit the slot window (USER_REGION_SIZE = 16 KiB;
+    # a larger image is BadSize at load). A wrong magic or oversize image is a build failure caught here.
+    [ -s "${WORKSPACE_DIR}/target/VUG.ELF" ] || { echo -e "${COLOR_RED}ERROR: VUG.ELF missing/empty — UVUG build failed${COLOR_RESET}"; exit 1; }
+    umag="$(head -c 4 "${WORKSPACE_DIR}/target/VUG.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$umag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: VUG.ELF does not start with the ELF magic; first 4 bytes = ${umag}${COLOR_RESET}"; exit 1; }
+    usz="$(wc -c < "${WORKSPACE_DIR}/target/VUG.ELF" | tr -d ' ')"
+    [ "$usz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: VUG.ELF ${usz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ static-ELF EL0 mini-vug program: VUG.ELF (${usz} B)${COLOR_RESET}"
+
+    # BGRUN-2: build the static ELF64 EL0 PERSISTENCE program (crates/user-stat) exactly like UVUG/ELFHELLO
+    # — keep it AS AN ELF (strip-all preserves the ELF header + program headers + the two PT_LOAD segments).
+    # It creates one 128x128 compositor window (SYS_WIN_CREATE), repaints its own pid + a frame counter + a
+    # sweep block, and NEVER exits on its own — `kill <pid>` is the whole remedy. That is what makes the
+    # WC-TAB window ring operator-verifiable: a backgrounded UVUG is unfocused, stays on its deterministic
+    # auto path and is gone in 300 frames, so two windows never coexisted long enough to TAB between them.
+    # Same linker script shape as UVUG (crates/user-stat/user-stat.ld — two PT_LOAD segments via a PHDRS
+    # clause); `-z max-page-size=0x1000` packs the segments on 4 KiB boundaries so the image fits the
+    # kernel's 16 KiB slot window.
+    echo -e "${COLOR_YELLOW}⚡ Building EL0 persistence static-ELF program (crates/user-stat → target/STAT.ELF)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/user-stat"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+      cargo +nightly build --release -Z json-target-spec
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-stat/target/aarch64-base/release/user-stat" \
+      "${WORKSPACE_DIR}/target/STAT.ELF"
+    # Same three checks as VUG: it must exist, begin with the ELF magic (\x7fELF), and fit the slot window
+    # (USER_REGION_SIZE = 16 KiB; a larger image is BadSize at load).
+    [ -s "${WORKSPACE_DIR}/target/STAT.ELF" ] || { echo -e "${COLOR_RED}ERROR: STAT.ELF missing/empty — STAT build failed${COLOR_RESET}"; exit 1; }
+    smag="$(head -c 4 "${WORKSPACE_DIR}/target/STAT.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$smag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: STAT.ELF does not start with the ELF magic; first 4 bytes = ${smag}${COLOR_RESET}"; exit 1; }
+    ssz="$(wc -c < "${WORKSPACE_DIR}/target/STAT.ELF" | tr -d ' ')"
+    [ "$ssz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: STAT.ELF ${ssz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ static-ELF EL0 persistence program: STAT.ELF (${ssz} B)${COLOR_RESET}"
+
     # K2 metal money-shot: UNAOS_K2_LEAVE=1 adds the `k2_leave` feature — k2_liveenf becomes a two-boot
     # cross-reboot power-cycle proof (boot-1 leaves a persisted owned file; boot-2 verifies the live boot
     # rebuild). OFF => the normal same-boot battery (byte-identical). For the ATTENDED Pi bench only.
@@ -809,6 +971,14 @@ kernel8() {
         K8_FEATS="${K8_FEATS},witness"
         echo -e "${COLOR_YELLOW}  • UNAOS_WITNESS: kernel8 carries the M6b..U7 fixture battery (CAPSTONE + PASS lines)${COLOR_RESET}"
     fi
+    # CLOCK-2: UNAOS_LOGTS=1 adds the `logts` feature — a compact timestamp prefix on each serial LINE
+    # (monotonic ms → UTC after a civil anchor). K8_FEATS is CURATED (does not draw from the general
+    # `_feats`), so the arm must be added here too or logts never reaches the Pi image. OFF => the
+    # prefix path is not compiled and serial is byte-identical.
+    if [ -n "${UNAOS_LOGTS:-}" ]; then
+        K8_FEATS="${K8_FEATS},logts"
+        echo -e "${COLOR_YELLOW}  • UNAOS_LOGTS: kernel8 serial lines carry a timestamp prefix (monotonic ms → UTC after sync)${COLOR_RESET}"
+    fi
     if [ -n "${UNAOS_K2_LEAVE:-}" ]; then
         K8_FEATS="${K8_FEATS},k2_leave"
         echo -e "${COLOR_YELLOW}  • UNAOS_K2_LEAVE: k2_liveenf → two-boot money-shot mode (boot-1 leaves K2PRIV.BIN; power-cycle; boot-2 verifies)${COLOR_RESET}"
@@ -819,6 +989,21 @@ kernel8() {
     if [ -n "${UNAOS_CORE3PROBE:-}" ]; then
         K8_FEATS="${K8_FEATS},core3probe"
         echo -e "${COLOR_YELLOW}  • UNAOS_CORE3PROBE: secondary stub raw-dumps MPIDR/EL/x0 to PL011 (see scripts/core3-probe-bench.md)${COLOR_RESET}"
+    fi
+    # SMP-7: UNAOS_SMP7=1 adds the `smp7` feature — per-core secondary bring-up evidence (release-write
+    # timestamp, check-in time + the MPIDR the AP derived for ITSELF, the bring-up stage it reached, any
+    # re-release count) and one `[smp7] cores online=<mask> missed=<mask> …` verdict after bring-up
+    # settles. Answers the P53 metal report ("only procs 2 & 4 running regularly") by separating "never
+    # left the spin-table" from "arrived and died in its own bring-up". UNAOS_SMP7_RETRY=1 additionally
+    # re-releases a NEVER-ARRIVED AP up to 3x (implies smp7). Both OFF => no [smp7] line and no retry;
+    # note the arc's ALWAYS-ON part (pre-release DC CIVAC over SECONDARY_STACKS) ships either way, so
+    # knob-off is byte-identical to the rest of SMP-7, not to the pre-arc image.
+    if [ -n "${UNAOS_SMP7_RETRY:-}" ]; then
+        K8_FEATS="${K8_FEATS},smp7_retry"
+        echo -e "${COLOR_YELLOW}  • UNAOS_SMP7_RETRY: re-release a never-arrived AP (3x) + the [smp7] bring-up evidence${COLOR_RESET}"
+    elif [ -n "${UNAOS_SMP7:-}" ]; then
+        K8_FEATS="${K8_FEATS},smp7"
+        echo -e "${COLOR_YELLOW}  • UNAOS_SMP7: per-core secondary bring-up evidence + the [smp7] online/missed verdict${COLOR_RESET}"
     fi
     # NS-SPAN (K7 WATCH rider): UNAOS_NSSPAN=1 adds the `nsspan` feature — instrument the IRQ-masked
     # namespace-lock hold at the three fused persist sites (revoke/grants/grow), tracking the per-site
@@ -836,6 +1021,39 @@ kernel8() {
         K8_FEATS="${K8_FEATS},v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D: V3D GPU foundation bring-up (probe/MMU/clear; attended-metal for positive verify)${COLOR_RESET}"
     fi
+    # V3D-DEEP: UNAOS_V3D_DEEP=1 adds the `v3d_deep` (+`v3d`) features — the SLOW half of the V3D
+    # diagnostic battery, whose verdicts are already banked on metal: the `[v3d48]` empty-frame bisection
+    # ladder (6 rungs x a ~0.5 s FLDONE anti-hang backstop each), the `[v3d59] frameclose` post-wedge time
+    # series (64 x 1 ms — banked DEAD-OPEN, zero bit changes), and the `[v3d58] rerender` negative control
+    # (an extra full CT1 clear job — banked clean). OFF (default) an armed V3D boot runs the FAST probes
+    # only — no multi-second stall at the M3 square — and prints one `[v3d] deep=off …` line naming what
+    # was skipped, so a wire read stays honest. Implies UNAOS_V3D.
+    if [ -n "${UNAOS_V3D_DEEP:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_deep,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_DEEP: the slow banked-verdict V3D probes (v3d48 ladder / v3d59 frameclose / v3d58 rerender) — adds ~3.5 s to an armed boot${COLOR_RESET}"
+    fi
+    # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
+    # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::
+    # spawn_joinable + JoinHandle join barrier), falling back to the single-core serial flush when no
+    # free AP is scheduled. OFF => the parallel machinery + its sched dependency vanish and flush is
+    # byte-identical to the serial VUG-FPS path. The `[vugfps]` witness reports `bands=N` (N>=2 reads
+    # the parallel win directly on metal; N=1 = serial/fallback). QEMU raspi4b stays deterministic
+    # (join is a correctness barrier; band count tracks the scheduled cores). See scripts/pi-vugpar-bench.md.
+    if [ -n "${UNAOS_VUGPAR:-}" ]; then
+        K8_FEATS="${K8_FEATS},vugpar"
+        echo -e "${COLOR_YELLOW}  • UNAOS_VUGPAR: band-parallel flush across free secondary cores (bands=N in [vugfps]; serial fallback)${COLOR_RESET}"
+    fi
+    # SMP-8: UNAOS_SMP8=1 adds the `smp8` feature — the `[smp8]` witness printing, per core, the raw
+    # CPUECTLR_EL1 that core read at EL2 in drop_to_el1 BEFORE any fix and whether the Cortex-A72 SMPEN
+    # bit (6) was already set by firmware. `smpen=0` on an AP = that core was handed to us outside
+    # cluster coherency (dead exclusive monitor => hangs on its first atomic), the candidate cause of
+    # the P53 "only 2 of 4 cores" report. The SMPEN *set* is always on (required config per the A72
+    # TRM); only the witness is knob-gated. OFF => the reporter + call site vanish. QEMU raspi4b may
+    # model the IMPDEF register as RAZ/WI (all cores read 0x0) — positive verification is metal.
+    if [ -n "${UNAOS_SMP8:-}" ]; then
+        K8_FEATS="${K8_FEATS},smp8"
+        echo -e "${COLOR_YELLOW}  • UNAOS_SMP8: [smp8] per-core pre-fix CPUECTLR_EL1 + SMPEN witness (the set itself is always on)${COLOR_RESET}"
+    fi
     # PI-USB-1: UNAOS_PIUSB=1 adds the `piusb` feature — the BCM2711 PCIe root complex + VL805 xHCI attach
     # (RC bridge reset / link-up / MEM-window, VL805 1106:3483 enumeration + BAR sizing, NOTIFY_XHCI_RESET
     # mailbox, polled shared-xHCI attach to the halted-but-decoding + ports-powered honesty line). The VL805
@@ -845,6 +1063,16 @@ kernel8() {
     if [ -n "${UNAOS_PIUSB:-}" ]; then
         K8_FEATS="${K8_FEATS},piusb"
         echo -e "${COLOR_YELLOW}  • UNAOS_PIUSB: BCM2711 PCIe RC + VL805 xHCI attach (attended-metal for positive verify)${COLOR_RESET}"
+    fi
+    # PIUSB-5: UNAOS_PIUSB_ADOPT=1 is read at compile time via option_env! in piusb.rs (cargo passes the
+    # env to rustc — the UNAOS_SMPPROBE precedent). It arms the adopt-don't-reset path: when the pre-reset
+    # firmware reference dump finds the VL805 xHC already DECODING, the bring-up SKIPS our destructive RC
+    # reset + VL805 fw reload and rides the firmware's working config (x86-XENUM inherited-controller
+    # road). Requires UNAOS_PIUSB=1 (the `piusb` feature); harmless/no-op otherwise. The read-only dump
+    # itself runs whenever piusb is on — this knob only gates whether we ACT on a live firmware state.
+    if [ -n "${UNAOS_PIUSB_ADOPT:-}" ]; then
+        export UNAOS_PIUSB_ADOPT
+        echo -e "${COLOR_YELLOW}  • UNAOS_PIUSB_ADOPT: adopt firmware-left VL805 xHC (skip RC reset) if the pre-reset dump reads it live${COLOR_RESET}"
     fi
     # PI-GENET: UNAOS_GENET=1 adds the `genet` feature — the BCM2711 on-board Gigabit Ethernet (Broadcom
     # GENET v5) driver + smoltcp bind (arch/aarch64/genet.rs), the Pi's FIRST network path. DTB-resolves
@@ -856,6 +1084,16 @@ kernel8() {
     if [ -n "${UNAOS_GENET:-}" ]; then
         K8_FEATS="${K8_FEATS},genet"
         echo -e "${COLOR_YELLOW}  • UNAOS_GENET: BCM2711 GENET v5 GbE + smoltcp bind (M1 probe classifies QEMU modelling; attended-metal for link/DHCP)${COLOR_RESET}"
+    fi
+    # PI-NET-13: UNAOS_NETTEST=1 adds the `nettest` (+`genet`) features — the hardware-free QEMU
+    # TCP/HTTP/mDNS regression gate. A pure in-kernel loopback seam + scripted smoltcp peer drive the SAME
+    # pool/reaper/http/mdns service code the GENET path runs (the GENET datapath no-ops on QEMU raspi4b, so
+    # this is the only off-metal coverage of the PI-NET-10/11/12 TCP behaviors). Runs at the top of
+    # `genet_bringup` and prints `:: NET-GATE: ... PASS [w=0x..] ::`. OFF => the loopback module + its call
+    # vanish and kernel8 is byte-identical to a plain build. Assert the NET-GATE PASS line on kernel8-test.
+    if [ -n "${UNAOS_NETTEST:-}" ]; then
+        K8_FEATS="${K8_FEATS},nettest,genet"
+        echo -e "${COLOR_YELLOW}  • UNAOS_NETTEST: QEMU TCP/HTTP/mDNS loopback gate (NET-GATE witness; hardware-free)${COLOR_RESET}"
     fi
     # INSTALL-PI: the UNAOS_PIINSTALL family — the installer engine's first LIVE end-to-end execution on the
     # Pi emmc2 microSD (install/pi.rs). Three-gate escalation; each knob adds the next feature (cargo also
@@ -886,15 +1124,20 @@ kernel8() {
       "${WORKSPACE_DIR}/target/aarch64-base/release/unaos-kernel" "$KERNEL8_DIR/kernel8.img"
     cp "${WORKSPACE_DIR}/scripts/pi-baremetal-config.txt" "$KERNEL8_DIR/config.txt"
 
-    # Standard Pi GPU firmware blobs (start4.elf/fixup4.dat) + base DTB + the miniuart-bt overlay,
-    # pulled from the cached pftf release zip (we use only its stock firmware files here).
-    if [ ! -f "$FW_ZIP" ]; then
-        echo -e "${COLOR_CYAN}⚡ Fetching Pi firmware (pftf v1.52)...${COLOR_RESET}"
-        curl -sL -o "$FW_ZIP" https://github.com/pftf/RPi4/releases/download/v1.52/RPi4_UEFI_Firmware_v1.52.zip
+    # PIUSB-16: stock Pi GPU firmware blobs (start4.elf/fixup4.dat) + base DTB + the miniuart-bt overlay,
+    # fetched from the OFFICIAL raspberrypi/firmware repo at the pinned FW_TAG (see the FW_* vars above)
+    # and cached under target/. These are the same blobs stock RPi OS ships; the VideoCore does its normal
+    # power-on VL805/PCIe bring-up from them before it hands off to kernel8.img.
+    if [ ! -d "$FW_CACHE" ]; then
+        echo -e "${COLOR_CYAN}⚡ Fetching official Pi firmware (raspberrypi/firmware ${FW_TAG})...${COLOR_RESET}"
+        mkdir -p "$FW_CACHE/overlays"
+        for f in start4.elf fixup4.dat bcm2711-rpi-4-b.dtb overlays/miniuart-bt.dtbo; do
+            curl -sfL -o "$FW_CACHE/$f" "$FW_RAW/$f" || { echo "firmware fetch failed: $f" >&2; rm -rf "$FW_CACHE"; exit 1; }
+        done
     fi
-    unzip -o -j "$FW_ZIP" start4.elf fixup4.dat bcm2711-rpi-4-b.dtb -d "$KERNEL8_DIR" >/dev/null
-    unzip -o -j "$FW_ZIP" "overlays/miniuart-bt.dtbo" -d "$KERNEL8_DIR/overlays" >/dev/null
-    echo -e "${COLOR_GREEN}✅ Boot files: ${KERNEL8_DIR}${COLOR_RESET}"
+    cp "$FW_CACHE/start4.elf" "$FW_CACHE/fixup4.dat" "$FW_CACHE/bcm2711-rpi-4-b.dtb" "$KERNEL8_DIR/"
+    cp "$FW_CACHE/overlays/miniuart-bt.dtbo" "$KERNEL8_DIR/overlays/"
+    echo -e "${COLOR_GREEN}✅ Boot files: ${KERNEL8_DIR} (firmware raspberrypi/firmware ${FW_TAG})${COLOR_RESET}"
 
     # M6g: carry the EL0 user blob onto the boot media as HELLO.BIN, next to kernel8.img in the FAT32
     # root (make-pi-img.sh ditto's the whole staging dir). On metal the kernel's M6g loader reads this
@@ -913,6 +1156,25 @@ kernel8() {
     # launcher spawns it for the round-trip + equivalence witnesses. Distinct 8.3 name => its own
     # IMAGE_SHA256 principal via the sole mint path.
     cp "${WORKSPACE_DIR}/target/midden_blob.bin" "$KERNEL8_DIR/MIDDEN.BIN"
+
+    # ELF-1: carry the minimal static ELF64 program onto the boot media as ELFHELLO.ELF (make-pi-img.sh
+    # ditto's the whole staging dir). The kernel's ELF1 witness reads it back off the SD, validates + maps
+    # its two PT_LOAD segments, and runs it at EL0. Distinct 8.3 name => its own IMAGE_SHA256 principal via
+    # the sole mint path. NEVER collides with the flat fixtures (HELLO/K2*/MIDDEN/SCRATCH/GROW .BIN).
+    cp "${WORKSPACE_DIR}/target/ELFHELLO.ELF" "$KERNEL8_DIR/ELFHELLO.ELF"
+
+    # UVUG-1: carry the mini-vug static ELF64 onto the boot media as VUG.ELF (make-pi-img.sh ditto's the
+    # whole staging dir). The kernel's UVUG witness reads it back off the SD through the VFS and runs it via
+    # the EXEC-1 `run_user_image` path (2 PT_LOAD segments, per-segment W^X); the panel `run /fat/VUG.ELF`
+    # runs the same bytes live. Distinct 8.3 name => its own IMAGE_SHA256 principal; never collides with the
+    # flat fixtures or ELFHELLO.ELF.
+    cp "${WORKSPACE_DIR}/target/VUG.ELF" "$KERNEL8_DIR/VUG.ELF"
+
+    # BGRUN-2: carry the persistence static ELF64 onto the boot media as STAT.ELF (make-pi-img.sh ditto's
+    # the whole staging dir). The BGRUN-ST persistence leg reads it back off the SD through the VFS and
+    # spawns it detached; the operator drives the same bytes with `bg /fat/STAT.ELF`. Distinct 8.3 name =>
+    # its own IMAGE_SHA256 principal; never collides with the flat fixtures, ELFHELLO.ELF or VUG.ELF.
+    cp "${WORKSPACE_DIR}/target/STAT.ELF" "$KERNEL8_DIR/STAT.ELF"
 
     # U9: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0 code).
     # 1 KiB (> 512 so fat::probe_once never cats it) of a known 0xEE filler; the u9 File-write demo opens it
@@ -948,6 +1210,9 @@ kernel8() {
 
     bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 64 "$UNAFS_K3_IMG"
     echo -e "${COLOR_GREEN}✅ Flashable image: target/UnaOS-pi4-baremetal.img — Imager → Use custom → microSD → SD slot.${COLOR_RESET}"
+    # BUILD-2: release the coarse build lock now that the image is complete — any QEMU phase that
+    # follows (kernel8-test / -run / install) uses per-run ports/logs and may overlap other runs.
+    k8_lock_release
 }
 
 # Boot the bare-metal kernel8.img on QEMU's `raspi4b` (emulated BCM2711) — the same flat binary the
@@ -975,8 +1240,15 @@ run_kernel8() {
 
 # Headless raspi4b test: boot kernel8.img, capture PL011 -> target/serial-pi.log and a QMP
 # screendump of the mailbox framebuffer -> target/pi-screen.png, then self-terminate.
+# MBENCH-HONEST: the DEFAULT WINDOW is 60 s, not the old 8 s. 8 s does not finish a pi4 boot on this
+# class of host — it kills QEMU part-way through the fixture cascade, so the twelve-plus witnesses that
+# print LAST never get a chance to. That shortfall reads as a regression in arcs that touched nothing,
+# and it cost four separate executors an investigation each in one round (one of them confirmed it by
+# gating a CLEAN base and getting the identical shortfall). The measured floor is 60 s; the spec header
+# in scripts/specs/pi4-regression.spec carries the per-window measurements. `kernel8-test` is pi4-only —
+# no x86/arm caller reaches this function — so raising the default changes nothing for them.
 test_kernel8() {
-    local secs="${1:-8}"
+    local secs="${1:-60}"
     kernel8 # always rebuild from current source (incremental; ~seconds) so we never test a stale image
     local logf="${WORKSPACE_DIR}/target/serial-pi.log"
     local png="${WORKSPACE_DIR}/target/pi-screen.png"
@@ -1003,6 +1275,29 @@ test_kernel8() {
     kill "$qpid" 2>/dev/null || true
     wait "$qpid" 2>/dev/null || true
     echo -e "${COLOR_GREEN}✅ Serial:${COLOR_RESET} ${logf}    ${COLOR_GREEN}Screen:${COLOR_RESET} ${png}"
+
+    # MBENCH-HONEST: ASSERT the capture we just took, and make this command's EXIT STATUS say so.
+    # Before this, `kernel8-test` printed a path and always exited 0 — the verdict lived in whatever
+    # the reader chose to grep for afterwards, which is precisely how a short boot came to be read as
+    # either a pass or a regression. mbench replays the checked-in witness spec and returns
+    #   0 PASS (63/63 required, 0 forbidden) | 1 FAIL (a genuine regression) | 3 TRUNCATED (the boot
+    #   was cut short — INCONCLUSIVE, neither a pass nor a regression; re-run with a longer window).
+    # UNAOS_K8T_ASSERT=0 opts out, for the deliberate off-spec configurations (UNAOS_SDIMG=0 no-card
+    # control, single-subsystem knob runs) where the full pi4 spec is not the contract being tested.
+    if [ "${UNAOS_K8T_ASSERT:-1}" != "0" ]; then
+        echo -e "${COLOR_CYAN}⚡ mbench: asserting the capture against scripts/specs/pi4-regression.spec${COLOR_RESET}"
+        # `|| mrc=$?` rather than a bare call + `$?`: this script runs under `set -e`, so a FAIL (1) or
+        # TRUNCATED (3) exit would otherwise abort here and swallow the explanation below.
+        local mrc=0
+        python3 "${WORKSPACE_DIR}/scripts/mbench.py" --replay "$logf" \
+            --spec "${WORKSPACE_DIR}/scripts/specs/pi4-regression.spec" --platform pi || mrc=$?
+        if [ "$mrc" -eq 3 ]; then
+            echo -e "${COLOR_YELLOW}⚠ kernel8-test: the boot was TRUNCATED at ${secs}s — this run proves NOTHING."
+            echo -e "  Missing witnesses here are NOT a regression. Re-run with a longer window: ./arroyo kernel8-test 60${COLOR_RESET}"
+        fi
+        return $mrc
+    fi
+    echo -e "${COLOR_YELLOW}  • UNAOS_K8T_ASSERT=0 — spec assertion SKIPPED; this run carries no verdict${COLOR_RESET}"
 }
 
 # INSTALL-PI live witness: the installer engine's FIRST full end-to-end execution that needs no bench.
@@ -1013,10 +1308,11 @@ test_kernel8() {
 # scratch image ON THE HOST (GPT signature + protective-MBR + FAT32 boot-sector label bytes at known
 # offsets) — the installer's claim verified from OUTSIDE the kernel. See installer_engine.md §INSTALL-PI.
 install_pi() {
-    local secs="${1:-12}"
+    local secs="${1:-30}"
     # Arm the three gates (cargo implies the lower two, but exporting all three makes the build log list
-    # every gate). Deliberately do NOT arm UNAOS_WITNESS — the scratch card is BLANK, so the fixture
-    # battery (which reads HELLO.BIN / the unafs volume back) must not run.
+    # every gate). Deliberately do NOT arm UNAOS_WITNESS — the scratch card carries only a boot FAT
+    # partition to self-clone, so the fixture battery (which reads HELLO.BIN / the unafs volume back on the
+    # kernel8-test fixture) must not run.
     export UNAOS_PIINSTALL=1 UNAOS_PIINSTALL_ARM=1 UNAOS_PIINSTALL_CONFIRM=1
     local scratch="${WORKSPACE_DIR}/target/pi-install-scratch.img"
     local logf="${WORKSPACE_DIR}/target/serial-pi-install.log"
@@ -1024,12 +1320,15 @@ install_pi() {
 
     kernel8 # rebuild kernel8.img from current source with the install gates armed
 
-    # A PRISTINE all-zero scratch card every run (blank => the installer's blank-check + its own
-    # zero-ESP-metadata pass both apply; nothing of the boot media is ever at risk — the kernel boots via
-    # QEMU -kernel, and this card is a throwaway).
-    echo -e "${COLOR_CYAN}⚡ Generating blank ${scratch_mib} MiB scratch SD image -> ${scratch}${COLOR_RESET}"
+    # INSTALL-PI-2 SELF-CLONE: the scratch card is NOT blank — it is a throwaway COPY of the running
+    # system's own boot media (an MBR/FAT32 boot partition carrying the freshly-built kernel8.img +
+    # config.txt + firmware, staged from KERNEL8_DIR). The booted installer mounts this partition, snapshots
+    # its boot tree into memory, then repartitions the SAME card to GPT+FAT32 and clones the buffered tree
+    # back — never the kernel8-test battery fixture. On metal the seated card IS the boot card; the three
+    # gates + about-to-destroy announcement are exactly the guard, and a metal leg wants a dedicated card.
+    echo -e "${COLOR_CYAN}⚡ Staging ${scratch_mib} MiB self-clone SOURCE card (own boot media) -> ${scratch}${COLOR_RESET}"
     rm -f "$scratch"
-    dd if=/dev/zero of="$scratch" bs=1048576 count="$scratch_mib" 2>/dev/null
+    bash "${WORKSPACE_DIR}/scripts/make-pi-install-src.sh" "$KERNEL8_DIR" "$scratch" "$scratch_mib"
 
     rm -f "$logf"
     echo -e "${COLOR_CYAN}⚡ INSTALL-PI live witness (${secs}s). Serial -> ${logf}${COLOR_RESET}"
@@ -1050,29 +1349,30 @@ install_pi() {
     # ── In-kernel verdict ──
     echo -e "${COLOR_YELLOW}── INSTALL-PI serial verdict ──${COLOR_RESET}"
     awk '/PIINSTALL|:: INSTALL:/' "$logf" || true
-    if awk '/:: INSTALL: pi emmc2 gpt\+fat32\+copy verify => PASS ::/' "$logf" | grep -q .; then
-        echo -e "${COLOR_GREEN}✅ in-kernel: install PASS line present${COLOR_RESET}"
+    if awk '/:: INSTALL: pi emmc2 gpt\+zero\+fat32\+clone\([0-9]+ files\) verify => PASS ::/' "$logf" | grep -q .; then
+        echo -e "${COLOR_GREEN}✅ in-kernel: self-clone install PASS line present${COLOR_RESET}"
     else
-        echo -e "${COLOR_RED}❌ in-kernel: install PASS line MISSING${COLOR_RESET}"
+        echo -e "${COLOR_RED}❌ in-kernel: self-clone install PASS line MISSING${COLOR_RESET}"
     fi
 
     # ── Host-side verification: read the scratch image back from OUTSIDE the kernel ──
     echo -e "${COLOR_YELLOW}── INSTALL-PI host-side verification (${scratch}) ──${COLOR_RESET}"
-    python3 - "$scratch" <<'PY'
-import sys
+    python3 - "$scratch" "$KERNEL8_DIR" <<'PY'
+import sys, hashlib, struct
 img = sys.argv[1]
+srcdir = sys.argv[2]
 SEC = 512
 ESP_LBA = 2048  # gpt::ESP_LBA_START
-with open(img, "rb") as f:
-    lba0 = f.read(SEC)
-    lba1 = f.read(SEC)
-    f.seek(ESP_LBA * SEC)
-    bs = f.read(SEC)
+f = open(img, "rb")
+def rd(lba, n=1):
+    f.seek(lba * SEC); return f.read(n * SEC)
+lba0 = rd(0); lba1 = rd(1); bs = rd(ESP_LBA)
 ok = True
 def check(name, cond):
     global ok
-    ok = ok and cond
+    ok = ok and bool(cond)
     print(("  PASS " if cond else "  FAIL ") + name)
+# ── Structures (GPT + FAT32) ──
 check("protective MBR 0x55AA signature", lba0[510:512] == b"\x55\xaa")
 check("protective MBR 0xEE GPT partition type @450", lba0[450] == 0xEE)
 check('primary GPT header "EFI PART" @LBA1', lba1[0:8] == b"EFI PART")
@@ -1080,6 +1380,77 @@ check("GPT header revision 1.0", lba1[8:12] == bytes([0,0,1,0]))
 check('FAT32 boot sector "FAT32" fs-type @ESP+82', bs[82:87] == b"FAT32")
 check('FAT32 volume label "UNAOS" @ESP+71', bs[71:76] == b"UNAOS")
 check("FAT32 boot sector 0x55AA @ESP+510", bs[510:512] == b"\x55\xaa")
+
+# ── INSTALL-PI-2 payload: read the CLONED boot files off the FAT32 ESP and byte-verify vs the source ──
+# Minimal FAT32 reader: parse the BPB, follow cluster chains through the FAT, walk directories.
+bps = struct.unpack_from("<H", bs, 11)[0]
+spc = bs[13]
+resv = struct.unpack_from("<H", bs, 14)[0]
+nfat = bs[16]
+fatsz = struct.unpack_from("<I", bs, 36)[0]
+rootc = struct.unpack_from("<I", bs, 44)[0]
+fat_lba = ESP_LBA + resv
+data_lba = ESP_LBA + resv + nfat * fatsz
+def clus_lba(c): return data_lba + (c - 2) * spc
+FATCACHE = {}
+def fat_next(c):
+    sec = c // (SEC // 4)
+    if sec not in FATCACHE:
+        FATCACHE[sec] = rd(fat_lba + sec)
+    v = struct.unpack_from("<I", FATCACHE[sec], (c % (SEC // 4)) * 4)[0] & 0x0FFFFFFF
+    return v
+def chain(c):
+    out = []
+    while 2 <= c < 0x0FFFFFF8 and len(out) < 1_000_000:
+        out.append(c); c = fat_next(c)
+    return out
+def read_clusters(c, nbytes):
+    b = bytearray()
+    for cl in chain(c):
+        b += rd(clus_lba(cl), spc)
+        if len(b) >= nbytes: break
+    return bytes(b[:nbytes])
+def read_dir(first):
+    ents = {}
+    raw = b"".join(rd(clus_lba(cl), spc) for cl in chain(first))
+    for o in range(0, len(raw), 32):
+        e = raw[o:o+32]
+        if not e or e[0] == 0x00: break
+        if e[0] == 0xE5: continue
+        attr = e[11]
+        if attr & 0x0F == 0x0F or attr & 0x08: continue  # LFN / volume label
+        base = e[0:8].rstrip(b" ").decode("latin1")
+        ext = e[8:11].rstrip(b" ").decode("latin1")
+        name = base + (("." + ext) if ext else "")
+        if name in (".", ".."): continue
+        fc = (struct.unpack_from("<H", e, 20)[0] << 16) | struct.unpack_from("<H", e, 26)[0]
+        size = struct.unpack_from("<I", e, 28)[0]
+        ents[name] = (fc, size, bool(attr & 0x10))
+    return ents
+def sha(b): return hashlib.sha256(b).hexdigest()
+def src_sha(path):
+    with open(path, "rb") as s: return sha(s.read())
+
+root = read_dir(rootc)
+# Root files cloned from KERNEL8_DIR — byte-verify each against its source.
+import os
+for cloned, src in [("KERNEL8.IMG","kernel8.img"), ("CONFIG.TXT","config.txt"),
+                    ("START4.ELF","start4.elf"), ("FIXUP4.DAT","fixup4.dat")]:
+    sp = os.path.join(srcdir, src)
+    if cloned not in root:
+        check("cloned root file present: " + cloned, False); continue
+    fc, size, isdir = root[cloned]
+    data = read_clusters(fc, size) if size else b""
+    match = (not os.path.isfile(sp)) or (sha(data) == src_sha(sp) and size == os.path.getsize(sp))
+    # If the source file is absent (e.g. firmware not staged), presence alone is the check.
+    check("cloned + byte-verified: %s (%d B)" % (cloned, size), match if os.path.isfile(sp) else True)
+# Subdirectory clone: OVERLAYS/ must exist as a directory and carry OVERLAY1.DAT.
+if "OVERLAYS" in root and root["OVERLAYS"][2]:
+    sub = read_dir(root["OVERLAYS"][0])
+    check("cloned subdir OVERLAYS/ carries OVERLAY1.DAT", "OVERLAY1.DAT" in sub)
+else:
+    check("cloned subdir OVERLAYS/ present", False)
+
 print("HOST-VERIFY: " + ("PASS" if ok else "FAIL"))
 sys.exit(0 if ok else 1)
 PY
@@ -1203,8 +1574,26 @@ battery() {
     _step "x86 test 25 (MISSION)"      "MISSION SUCCESS"     "$blog_dir/test-x86.log"     "$0" test 25
     _step "x86 test-fat sf 300"        "U11m2.*-> PASS"      "$blog_dir/test-fat.log"     test_fat_drop_retry "$blog_dir/test-fat.log"
     _step "arm virt v2 (MISSION)"      "MISSION SUCCESS"     "$blog_dir/test-arm-v2.log"  "$0" test-arm 22
+    # USB-WRITE: assert the BOT WRITE(10) RMW+readback+restore witness in the MISSION logs just run
+    # (cheap re-grep of the existing serial capture — no QEMU re-run). A `-> FAIL` usbw line is
+    # already caught by the generic FAIL scan; these steps require the positive `ok` witness present.
+    _step "x86 usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-x86.log"    cat "$blog_dir/test-x86.log"
+    _step "arm usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-arm.log"    cat "$blog_dir/test-arm-v2.log"
     _step "arm virt v3 (CAPSTONE 6/6)" "CAPSTONE COMPLETE"   "$blog_dir/test-arm-v3.log"  env UNAOS_GICV3=1 "$0" test-arm 40
-    _step "pi4 kernel8-test 35"        "CAPSTONE COMPLETE"   "$blog_dir/kernel8.log:target/serial-pi.log" "$0" kernel8-test 35
+    # MBENCH-HONEST: this step's verdict is now the MBENCH REPLAY's exit status, which `kernel8-test`
+    # propagates (see test_kernel8). It used to be a single `awk` for CAPSTONE COMPLETE against the
+    # serial log, and that assertion COULD NOT GO RED on a short boot: CAPSTONE prints ~line 111 of a
+    # ~1700-line capture, so every truncation this gate exists to catch still satisfied it while dozens
+    # of tail witnesses were missing. The pattern argument is deliberately EMPTY — the spec's 63
+    # REQUIRE/COUNT directives are the assertion now, and the generic `-> FAIL`/`FAIL ::` scan still
+    # runs against target/serial-pi.log (NOT against the step log, which quotes those strings as FORBID
+    # PATTERN TEXT in the verdict table and would false-red on every run).
+    _step "pi4 kernel8-test 60 (mbench 63/63)" ""            "$blog_dir/kernel8.log:target/serial-pi.log" "$0" kernel8-test 60
+    # A TRUNCATED pi4 step is red — but it is a DIFFERENT red from a regression, and the summary says so
+    # rather than leaving the reader to open the log and guess.
+    if awk 'BEGIN{f=1} /MBENCH TRUNCATED/{f=0} END{exit f}' "$blog_dir/kernel8.log" 2>/dev/null; then
+        results="${results}       ↳ TRUNCATED (INCONCLUSIVE): the pi boot was CUT SHORT, not regressed — re-run before bisecting (${blog_dir}/kernel8.log)\n"
+    fi
     _step "esp-jetson (links)"         ""                    "$blog_dir/esp-jetson.log"   env UNAOS_TEGRA=1 "$0" esp-jetson
 
     local passes; passes=$(awk '/-> PASS|: PASS/{n++} END{print n+0}' "$blog_dir/test-fat.log" target/serial-pi.log 2>/dev/null || echo '?')
@@ -1267,7 +1656,7 @@ case "${1:-}" in
         run_kernel8
         ;;
     kernel8-test|test-pi)
-        test_kernel8 "${2:-8}"
+        test_kernel8 "${2:-60}"   # MBENCH-HONEST: 8 s never finished a pi4 boot — see test_kernel8
         ;;
     kernel8-install|install-pi)
         install_pi "${2:-12}"

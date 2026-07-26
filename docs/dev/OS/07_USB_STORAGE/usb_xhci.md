@@ -22,6 +22,147 @@ tablet) are delivered through the same controller.
 | `event.rs` | The event ring (`EventRing`, the ERST table). |
 | `ring.rs` | Command/transfer rings (`TransferRing`). |
 | `context.rs` | Device/slot/endpoint context structures. |
+| `dma_coherency.rs` | The single DMA cache-maintenance seam (`clean` / `clean_inval` / `inval`). |
+
+### DMA coherency (XHCI-COHERENCE)
+
+Every xHCI DMA structure (command ring, event ring + ERST, DCBAA, device/input
+contexts, scratchpad, transfer rings, transfer buffers) is allocated from the
+Write-Back **cacheable** heap. On an I/O-coherent host (x86_64, and the Intel xHCI
+on the 2012 rMBP) the CPU caches and the controller's DMA path snoop each other, so
+a bare `fence`/`dmb` suffices. On a **non-coherent** bus they do not: the BCM2711
+PCIe root complex → VIA VL805 path never snoops the A72 caches (PIUSB-8), and the
+Tegra234 XUSB fabric loses its `dma-coherent` handoff at ExitBootServices. There the
+CPU must **clean** (write-back) memory it produces before the controller reads it,
+and **invalidate** memory the controller produces before the CPU reads it.
+
+`dma_coherency` is the one seam that does this. Its three functions are gated by
+`target_arch`, **not** by a board feature — so both aarch64 boards (Pi 4, Jetson)
+get maintenance from a single path, while on x86_64 every function is an
+`#[inline(always)]` empty body that compiles to nothing (the coherent path is
+byte-identical to before the seam existed). Maintenance is applied at each
+producer/consumer boundary:
+
+| Structure | Boundary | Op | Site |
+| --- | --- | --- | --- |
+| Command / transfer ring TRBs | after CPU push, before doorbell | clean | `ring::write_trb` / `push_noop` / `replace_with_noop` |
+| Ring zeroed handoff | after `alloc_zeroed`, before controller fetch | clean | `ring::TransferRing::new` |
+| Event ring dequeue | before CPU read | clean+inval | `event::EventRing::has_event` |
+| Event ring zeroed handoff | before controller writes | clean+inval | `init_interrupter` |
+| Input context | before its command | clean | `send_command` / `run_command_sync` (one chokepoint for ADDRESS_DEVICE/CONFIGURE_ENDPOINT/EVALUATE_CONTEXT) |
+| Output (device) context | zeroed handoff / before CPU read-back | clean+inval / inval | `address_device`, `address_downstream` / the context builders |
+| DCBAA entry | after CPU write, before controller read | clean | `address_device`, `address_downstream`, disable-slot |
+| DCBAA[0] + scratchpad array/buffers | before RS=1 | clean | `init_pointers` |
+| ERST table | before ERSTBA / RS=1 | clean | `init_interrupter` |
+| Control-IN data (descriptors, hub status) | evict before / invalidate after transfer | clean / inval | `sync_control`, `request_device_descriptor`, `request_configuration_descriptor` |
+| Interrupt-IN reports (kbd/mouse/hub-change) | evict before arm / invalidate before decode | clean / inval | `queue_*_read` / the transfer-event dispatch |
+| BOT CBW / CSW / SCSI data | evict before (both dirs), invalidate IN after | clean / clean+inval / inval | `bot_transfer` |
+| FTDI TX staging buffer | before doorbell | clean | `ftdi_tx_stage` |
+
+This **unifies** the old tegra-only `EventRing::has_event_after_invalidate` (its
+`dc civac` is now the general aarch64 `has_event` path — identical behavior on
+tegra, and the Pi 4 gets it too) and **retires** PIUSB-8's external attach-side
+bridge in `arch/aarch64/piusb.rs` (which could only reach the three `pub` ring/ERST
+structures; the internal contexts/DCBAA/scratchpad/transfer buffers are now covered
+by construction). Stale-DMA of the command/event rings — a controller reading a
+stale command ring and a CPU polling a stale event ring — is fixed at the source.
+
+> **Coherency was NOT the sole cause of the Pi 4 enable-slot stall.** Full-driver DMA
+> maintenance (this seam) landed at boot-P19 and the VL805's `ENABLE_SLOT` **still**
+> stalled — so the non-coherent-DMA hypothesis is *refuted as the sole cause* on
+> metal. The real defect was controller-firmware readiness, not cache coherency
+> (§1a).
+
+### 1a. VL805 firmware-load ordering (Pi 4) — the CNR wall
+
+Every USB-A port on the Pi 4 hangs off one endpoint: the VIA **VL805** xHCI behind
+the BCM2711 PCIe root complex (attach + the 0xdeaddead root-port memory-window fix
+are in [`arch_arm64.md` §PI-USB](../01_BOOT_HAL/arch_arm64.md)). Once config and
+memory cycles reached the controller, the `ENABLE_SLOT` command stalled through
+every coherency and ring hypothesis. The root cause, witnessed on metal:
+
+- **CNR (Controller Not Ready) drops op/runtime-register writes (PIUSB-10,
+  `726eb24b`).** At the moment the driver programmed the interrupter / CRCR / DCBAAP
+  / ERST and set `RS = 1`, boot-P20's PIUSB-9 witnesses read `USBSTS = 0x811`
+  (**CNR = 1**) and **every op/runtime-register write read back 0**. Per xHCI spec
+  **§5.4.1 / §4.2**, software must not write any Doorbell, Operational, or Runtime
+  register after `HCRST` until `USBSTS.CNR` clears. Intel clears CNR near-instantly
+  (x86 never noticed); the VL805 holds it up to ~100s of ms **while it loads its
+  internal firmware**, so the Pi silently dropped every register write — the entire
+  enable-slot saga was writes into a not-ready controller.
+
+  The fix adds `wait_for_cnr_clear()`: a bounded (`hw_wait_budget`, ~2.5 s) poll of
+  `USBSTS.CNR` at the *top* of `init_interrupter` — the first register programming
+  after `HCRST`, immediately before ERST/CRCR/DCBAAP/CONFIG/RS. Only the pre-CNR
+  halt + `HCRST` reset writes precede the wait (spec-correct). On success it emits
+  `xHCI: CNR cleared after N polls`; on timeout it fails **loud** and sets
+  `XHCI_CNR_OK = false`, which makes `init_pointers` and `start` skip their register
+  writes (loud, no hang) rather than program a not-ready controller. x86 behaviour is
+  byte-identical (CNR is always clear there).
+
+- **The mailbox NOTIFY reports hollow success (PIUSB-11, in flight).** With the CNR
+  wait in place at boot-P21, `wait_for_cnr_clear` **timed out** — the VL805's CNR
+  never cleared, meaning its **internal firmware never booted**. The RPi firmware
+  mailbox `NOTIFY_XHCI_RESET` returns `SUCCESS` *without* a running controller
+  firmware behind it — a hollow success. **PIUSB-11 is in flight**: NOTIFY-before-reset
+  ordering per the Linux VL805 quirk, with the `d03115` board-revision decode still
+  pending.
+
+---
+
+### 1b. Post-CNR enumeration witness (PIUSB-13)
+
+Once the CNR wall (§1a) falls, the VL805 root ports must be walked to a live HID
+keyboard: port scan → reset → speed → **Enable Slot** → **ADDRESS_DEVICE** (input
+context = slot + EP0 sized to the trained speed) → GET_DESCRIPTOR(device, config) →
+select the boot-protocol keyboard interface → SET_CONFIGURATION → SET_PROTOCOL(boot)
+→ arm the interrupt-IN endpoint → decode boot-keyboard reports (scancode → ASCII).
+
+**None of that machinery is Pi-specific.** The entire FSM lives in the shared
+`drivers/xhci` driver (`service_enum` / `service_hid_setproto` / `poll_events`, the
+`HID_SCANCODE_TO_ASCII` table, the `xHCI: KEY: '…'` report line) and is driven
+verbatim by the Pi's post-heap `piusb::enumerate()` pump — the same code the x86
+rMBP and the Jetson run. PIUSB-13 therefore adds **no enumeration control flow**; it
+adds an *observer* (`EnumWitness` in `arch/aarch64/piusb.rs`) that snapshots the
+driver's read-only state each pump tick (~2 ms cadence) and emits one
+`:: PIUSB: [enum] … ::` milestone line per stage transition, so a single metal boot
+localizes exactly how far a keyboard got — and, on failure, the stage + completion
+code that stopped it. The state the observer reads (`enum_stage_now`,
+`enumerating_port_now`, `last_stall_now`, `stall_count_now`, `root_ports_now`, and
+the new `DeviceSlot::keyboard_report_count`) is exposed through **aarch64-gated,
+read-only accessors** on the shared `XhciController`; the `#[cfg(target_arch =
+"aarch64")]` block does not compile on x86, so x86 codegen is byte-identical.
+
+**Gating (inert while CNR is stuck).** `enumerate()` returns at the `XHCI_READY`
+gate in QEMU raspi4b (no VL805 modelled — nothing is built), and on a metal boot
+where the CNR wall is still up, `RS=1` is dropped, so no port ever connects, no
+enum stage ever advances, and no slot is ever assigned. Every edge test in the
+observer is then a no-op and it stays **silent** — it speaks only once real
+enumeration makes progress. The Pi QEMU battery is unchanged (0 FAIL); the path is
+metal-only by construction.
+
+**Expected metal witness sequence** (keyboard in a VL805 root port, CNR cleared):
+
+```
+:: PIUSB: [enum] observer armed … ::
+:: PIUSB: [enum] port P connect (device attached) ::
+:: PIUSB: [enum] port P trained speed High-Speed (xhci speed id 3) ::
+:: PIUSB: [enum] port P stage -> enable-slot ::
+:: PIUSB: [enum] port P stage -> address-device ::
+:: PIUSB: [enum] slot N addressed (root port P) ::
+:: PIUSB: [enum] port P stage -> dev-desc ::
+:: PIUSB: [enum] port P stage -> cfg-desc ::
+:: PIUSB: [enum] port P stage -> set-config ::
+:: PIUSB: [enum] slot N HID boot-keyboard armed (interrupt-IN ep 0x81 mps 8, root port P) ::
+:: PIUSB: [enum] slot N first keyboard report received — HID pipe live … ::
+xHCI: KEY: 'a' (scancode 0x4)
+```
+
+A `:: PIUSB: [enum] STALL port P @ stage <S> (<why>, completion code C) PORTSC=0x… ::`
+line replaces the milestone that never came: the stage names *where* it stopped
+(`enable-slot`, `address-device`, `set-config`, …) and code `C` names *why* (xHCI
+completion code — e.g. 4 = USB Transaction Error, 5 = TRB Error, 17 = Parameter
+Error, 19 = Context State Error), so one boot localizes the failure.
 
 ---
 
@@ -42,6 +183,65 @@ budget (`wait_until`) so a wedged controller cannot hang the boot.
 
 Boot evidence: `xHCI: Controller Started!`, `MaxSlots=64, MaxPorts=8`,
 `Interrupter 0 enabled (IMAN.IE set, interrupt-driven)`.
+
+### 2a. 64-bit register access — split 32-bit writes (PIUSB-21)
+
+Every 64-bit xHCI operational/runtime register (`CRCR`, `DCBAAP`, `ERSTBA`,
+`ERDP`) is written and read through `write_reg64` / `read_reg64` (mod.rs), which
+issue an ordered **pair of 32-bit MMIO accesses** (low dword first, then high) —
+the form xHCI 5.1 explicitly permits and Linux uses universally (`lo_hi_writeq`).
+
+This is mandatory on the Pi 4. The VL805 sits behind the brcmstb PCIe root
+complex, whose BAR window does **not** carry 8-byte MMIO TLPs: a single AArch64
+`str x` (64-bit store) is down-converted and its 32-bit data lane is **replicated
+into both dwords**. A `0x02003240` DCBAAP write read back `0x0200324002003240`;
+`ERSTBA`/`ERDP` likewise (`0x0015b7800015b780`, `0x0014fa400014fa40`). The
+mirrored high dword pushes every controller DMA base above 4 GiB — outside the
+`RC_BAR2` inbound window (RAM @ 0, 4 GiB) — so the command ring, ERST, and event
+ring all fetch from unmapped addresses: the ring reports `CRR=1` (running) but no
+command ever completes and **no event is ever posted** (the PIUSB-20 enable-slot
+wall). Splitting into two 32-bit stores delivers the correct low dword and a
+true-zero high dword; the controller's DMA bases land inside the window and
+completions post.
+
+x86 is unaffected: Intel/AMD root complexes carry native 64-bit MMIO (no
+replication), and the two-write form is byte-identical there — no regression, and
+the x86 MISSION-SUCCESS storage gate is unchanged. The RS=1 witness now prints
+`DCBAAP` reassembled from two 32-bit reads alongside the raw single-load readback
+(`DCBAAP_raw64`), so the replication is directly observable on the wire.
+
+### 2b. P31b metal result — enable-slot and HID keyboard enumeration (PIUSB-21 / PIUSB-22)
+
+**P31b METAL RESULT (2026-07-23): the 64-bit-MMIO lo/hi fix CONFIRMED** — enable-slot completed, slots 2/3 addressed, HID boot-keyboard ARMED, first report received, mouse witness up: **FIRST USB INPUT DEVICE ENUMERATED ON PI SILICON.** Residual: interrupt-IN pipe delivers one report then goes silent (no xHCI: KEY lines under typing) — **PIUSB-22 in flight** (re-queue / ERDP EHB write-order under the new lo/hi split / SET_IDLE fork).
+
+### 2c. ERDP write-order under the 32-bit split (XHCI-INT)
+
+The ERDP (Event Ring Dequeue Pointer, IR0 +0x18) is the one 64-bit xHCI register
+with a **latch side effect**: its low dword carries EHB (bit 3, Event Handler Busy,
+RW1C) and DESI alongside the low pointer bits, and the controller re-evaluates its
+event-ring free space — and clears EHB — the instant the low dword is written. The
+PIUSB-21 helper `write_reg64` writes **low-then-high**, which is correct for the
+write-once init registers (CRCR/DCBAAP/ERSTBA: nothing latches mid-pair, RS=1 latches
+them once). Applied to ERDP under the genuine two-store split that PIUSB-21 forces on
+the brcmstb RC, that order latches a **torn** pointer — the low write commits the new
+low bits and clears EHB while the high dword still holds its previous (often
+mirror-garbage, >4 GiB) value. The controller then computes a dequeue pointer with a
+stale high dword, decides the event ring is full, and stops posting transfer events:
+the interrupt-IN HID pipe delivers **exactly one report, then goes silent** (the P31b
+residual). The polled drain papers over it briefly — `has_event` reads the cycle bit
+straight from DRAM regardless of EHB — until the controller's producer catches the
+stale ERDP and halts.
+
+Fix (`write_erdp`, mod.rs): write the **high dword first, then the low dword** (EHB +
+latch) last, so the full 64-bit pointer is in place before the controller latches.
+Used at both ERDP sites — `init_interrupter` (initial dequeue = ring base) and
+`advance_erdp` (per-event advance with EHB clear). x86 is byte-visible identical (no
+RC replication; both stores land, Intel/AMD re-evaluate on the complete pointer either
+order) — the MISSION-SUCCESS storage gate is unchanged. Witness `[xhciint] ERDP
+initialized to <phys> (hi-first, EHB clear)` at bring-up on both arches; per-event
+advances log `[xhciint] ERDP advanced to <phys>` under the xdbg gate. QEMU raspi4b
+models no PCIe RC/VL805, so the Pi witness is metal-only; the aarch64 `virt` MISSION
+gate exercises the path and carries the witness.
 
 ---
 
@@ -91,6 +291,486 @@ The shell exposes these as `diskinfo`, `read <lba>`, and `write <lba> <byte>`.
 
 Boot evidence: `xHCI: READ(10) LBA0 CSW status=Passed residue=0`,
 `xHCI: >>> MISSION SUCCESS (BOT + CSW). TARGET ACQUIRED. <<<`.
+
+### 5a. BOT IN data buffer must be evicted before the doorbell (PIUSB-34)
+
+On P44 metal the Pi 4 read LBA0 of a known-good FAT stick as **all zeros** with a
+**passing** CSW (`residue=0`) — repeatably — while READ CAPACITY(10) returned the
+correct geometry. Both commands ride the identical `bot_transfer` path against the
+same reused `scsi_data_buffer`, so the discriminator was purely transfer length.
+
+Root cause (our code, not the hardware): the BOT **IN** data stage relied *only* on
+the post-transfer `inval`, and — unlike every other IN-arming site in the driver —
+did **not** clean the data buffer *before* the doorbell. The 512-byte buffer is
+`alloc_zeroed` (eight dirty zero cache lines) and reused across SCSI commands; a
+short prior IN (READ CAPACITY = 8 B, INQUIRY = 36 B) only ever touches line 0,
+leaving lines 1..7 dirty-zero in the A72 D-cache. On the non-coherent BCM2711 PCIe →
+VL805 path the controller DMA-writes the block straight to DRAM; a natural
+write-back of those stale dirty lines in the window around the DMA clobbers the
+just-written DRAM with zeros. READ CAPACITY / INQUIRY escaped because they only span
+line 0, which the immediately-prior transfer's `inval` had already dropped.
+
+Fix: `bot_transfer` now cleans the IN data buffer to DRAM *before* the doorbell
+(the OUT path already did), so no dirty line survives to lose; the post-transfer
+`inval` still drops the clean lines so the CPU parses fresh DRAM. This matches the
+convention at every interrupt-IN / control-IN / descriptor arming site. Witness:
+`[piusb34] LBA0 re-read post-invalidate: … <first-16 bytes>` (P44 zeros → P45 real
+boot sector).
+
+### 5b. DMA-address audit — the inbound-window theory is REFUTED (PIUSB-35)
+
+P45 metal **refuted** the PIUSB-34 cache theory: with the clean-before-doorbell +
+post-invalidate in place, READ(10) LBA0 *still* returned all-zero with a Passed /
+`residue=0` CSW, while READ CAPACITY(10) still returned correct geometry and the
+last-sector RMW candidates (last, −8, −64) all reported `Err(Stall)` (the new stall
+recovery works — the pipe survives and enumeration completes). Prime new suspect:
+the BCM2711 PCIe RC **inbound window / DMA address** — if the deferred-phase heap sat
+above the RC's reachable window (or needed a `dma-ranges` offset we don't apply), the
+VL805 would DMA the block into nowhere (stale zeros) while short control transfers on
+low buffers still worked.
+
+**Static audit refutes it.** The aarch64 bare-metal kernel heap is placed at physical
+`0x0200_0000` (32 MiB), 64 MiB long (`boot::MEM_REGIONS`; `HEAP_SIZE` = 48 MiB), RAM
+is identity-mapped (VA==PA in the low 1 GiB Normal block), and `init_heap_raw` hands
+out addresses straight from that physical region. Every DMA structure — transfer
+rings, DCBAA, the event ring, the CBW buffer (DMA-**read** by the device) and the CSW
+buffer (DMA-**written** by the device, returning **Passed**) — comes from the *same*
+32–96 MiB pool as `scsi_data_buffer`, which is deep inside the RC inbound window
+(RAM@0, 4 GiB, `dma-ranges` 1:1, offset 0; see `piusb::M1` RC_BAR2) and far below the
+classic <3 GiB VL805 DMA quirk boundary. A working CSW-write to that pool cannot
+coexist with an unreachable data-write to the same pool, and READ CAPACITY reuses the
+identical buffer (killing the offset variant too). No address fix is warranted.
+
+Witness (P46, aarch64): `[piusb35] databuf phys=… in_trb=… cbw=… csw=… |
+rc-inbound=[0x0,0x100000000) offset=0 | databuf in_window=… below_3G=… — … address
+theory REFUTED on-metal …`. When P46 confirms `in_window=true below_3G=true`, the
+address theory is dead on-metal and the discriminator returns to transfer
+length / TD-shape (READ CAPACITY 8 B works, READ(10) 512 B zeros) or a genuine
+device-side cause — *not* the DMA address.
+
+### 5c. PIUSB-36 — the one-boot read-wedge experiment matrix
+
+With the address theory refuted (§5b) and the cache theory refuted (§5a), the Pi-only
+symptom is sharp: READ CAPACITY(10) (8 B) and every control transfer DMA correctly to
+the same heap pool, yet READ(10) (512 B) returns `Passed`/`residue=0`/**all-zero** on
+metal — while the *identical code shape* read real data in the early, pre-SMP,
+IRQs-masked bring-up phase (P38) and QEMU virt/x86 are always fine. `service_storage`
+runs a self-contained, read-only **experiment matrix** (`piusb36_matrix`, aarch64-only,
+byte-identical no-op on x86) that fires six discriminating reads in one boot, each
+witnessed with the first 16 bytes plus a pattern verdict:
+
+| Step | Experiment | What it isolates |
+| --- | --- | --- |
+| 1 | READ(10) LBA0 into the current `scsi_data_buffer` | baseline — confirms the wedge is live this boot |
+| 2 | Same, into a FRESH `alloc_zeroed` buffer PRE-FILLED with `0xA5` | `PATTERN-SURVIVED` (device never wrote) vs `ZEROS` (something wrote zeros over the pattern) vs `DATA` — the decisive *never-lands* vs *lands-zeros* split |
+| 3 | Same, into a STATIC `.bss` buffer (`PIUSB36_STATIC_BUF`, phys typically <4 MiB) | region dependence (RC inbound-window / cache-color) vs universal |
+| 4 | INQUIRY (36 B) into `scsi_data_buffer` | a MID-SIZE control point between 8 B-works and 512 B-fails — where the threshold sits |
+| 5 | READ(10) LBA0 as TWO chained TRBs (256 + 256) | TD *shape* vs transfer *length* |
+| 6 | READ(10) LBA0, snapshot immediately (A), then wait 1 ms, invalidate the SAME buffer again, re-read (B) | posted-write **visibility**: `A=zeros,B=data` ⇒ the controller's PCIe-posted DMA write was not yet globally visible when the transfer event fired and we invalidated+read |
+
+Two structural facts anchor the analysis. First, the DATA-stage completion is **explicitly
+awaited**, matched by the data TRB's own physical address in `run_bot_stage` /
+`drain_event_ring_once` (not merely inferred from the CSW stage), so a logical "we read
+before the transfer finished" ordering bug is excluded — leaving posted-write *visibility*
+(transfer event ≠ DMA globally-visible in DRAM) as the live timing hypothesis step 6
+tests. Second, the early phase (P38) ran with IRQs masked pre-SMP, whereas the deferred
+phase (`service_storage`) runs on the BSP with IRQs and the preemptive timer scheduler
+live; the whole transaction is held under `XHCI_CONTROLLER.lock()` with a polled event
+pump (no scheduler yield between doorbell and the invalidate+read), so a context switch
+cannot interpose between them — but the two phases differ in bus/interrupt activity, which
+is exactly what a posted-write visibility window would be sensitive to.
+
+Witness lines: `:: PIUSB: [piusb36] step<N>-<label> buf=… CSW=… residue=… verdict=… — <16 bytes> ::`
+(step 6 prints both the immediate `A` and the `+1ms+inval` `B` snapshots). In QEMU virt
+(coherent) all six steps read real data and step 6 reports `no-race-hit`; the P46 metal
+run reads the verdicts as the decision tree — step 2 splits never-lands from lands-zeros,
+step 6 confirms/refutes the posted-write race, steps 3–5 localize region/threshold/TD-shape.
+
+### 5d. PIUSB-37 — chase the command into the CBW/sense (read-only)
+
+With §5a–§5c pointing away from our transport, `piusb37_matrix` (aarch64-only, read-only)
+corners the residual on the SCSI-command side in one boot: (1) a **CBW audit** — build the
+exact 31-byte CBW and spec-check every field + decode the READ(10) CDB (a wrong LUN,
+byte-swapped LBA, or zero blocks each produce the same zeros+`Passed` signature); (2) a
+command-set / known-nonzero-LBA matrix (READ(10) of LBA 8192/16384, plus READ(12)/READ(16)
+of LBA0); (3) **REQUEST SENSE** immediately after a zeros-read (a pending UNIT ATTENTION,
+key 0x06, is the bridge-returns-zeros-then-GOOD candidate); (4) a **TUR drain + retry**.
+The P47 capture read the CBW as **byte-perfect** (`command is NOT the fault`) and LBA
+8192/16384 returned real non-zero data with `residue 0` — proving the transport/DMA/BOT are
+sound and the wedge is confined to the low-LBA region — while READ(12)/READ(16) STALLed
+(unsupported by the bridge, expected). Witness: `:: PIUSB: [piusb37] … ::`.
+
+### 5e. PIUSB-38 — BOT stall recovery + event-ring resilience + low-LBA bisect
+
+The P47 boot exposed the real defect the §5d probes uncovered: after the READ(12)/READ(16)
+STALLs, **every** later command on the storage slot — REQUEST SENSE, TEST UNIT READY (×8),
+the retry READ(10) — **timed out**. The bulk pipe halted and never recovered: our stack ran
+a per-endpoint clear-stall but never completed BOT **Reset Recovery**, so the device and host
+BOT state machines stayed out of phase and the storage slot's transfer events stopped. (HID
+recovered independently via a hub re-enumeration in the same boot, so the interrupter was
+**not** globally wedged — the shared single-owner event drain kept advancing ERDP and
+clearing `IMAN.IP` for HID; only the storage slot's *transfer* path was dead.)
+
+**Stall recovery (`bot_transfer` + `recover_bot_full`).** On a bulk STALL/Babble the driver
+now follows the USB Mass-Storage Bulk-Only Reset-Recovery contract:
+
+- **Data-phase stall (§6.7.2):** clear the halt on the bulk pipe (`recover_bulk_stall`:
+  Reset Endpoint → Set TR Dequeue → device CLEAR_FEATURE(ENDPOINT_HALT)), then **still
+  collect the CSW** so both state machines resync — the device stalled the data, not the
+  command, so it is in its status phase and returns a `Failed` CSW. Skipping this CSW was the
+  P47 wedge.
+- **Status-phase stall, or a data-phase stall whose CSW also fails (§6.7.3 / §5.3.4):**
+  escalate to **full Reset Recovery** (`recover_bot_full`): a **Bulk-Only Mass Storage Reset**
+  (class request `bmRequestType 0x21`, `bRequest 0xFF`, `wIndex =` the captured MSC
+  `bInterfaceNumber` — `DeviceSlot::storage_intf`), then Reset-Endpoint + Set-TR-Dequeue +
+  CLEAR_FEATURE(ENDPOINT_HALT) on **both** bulk endpoints. Host and device toggles/ring
+  dequeues realign, so the next CBW starts clean.
+
+**Event-ring resilience.** Error/stall transfer TRBs are dispatched through the same single
+`drain_event_ring_once` owner as every other event, which advances the ERDP and clears
+`IMAN.IP` **unconditionally** after each `handle_event_trb` — so one bad pipe can never starve
+the interrupter, and recovery (which itself pumps the event ring via the synchronous command /
+control paths) lets unrelated HID `xHCI: KEY` events keep draining during an induced storage
+stall.
+
+**Low-LBA bisect.** `piusb38_matrix` (aarch64-only, read-only) then proves recovery and
+localizes the §5c/§5d wedge in one boot: it (1) **induces** a stall (READ(16)) and confirms
+TEST UNIT READY + REQUEST SENSE **complete** afterwards (`PIPE RECOVERED`), (2) exercises
+`recover_bot_full` explicitly and re-proves TUR, and (3) reads a ladder **LBA 0,1,2,4,…,8192**
+(same READ(10) CDB shape, only the LBA field varies) with a per-LBA zeros/data verdict, then
+reports the zeros→data **boundary** and the first byte at which LBA0 and LBA8192 differ.
+Because only the LBA field changes, any zeros-vs-data split is **region-specific, not a
+command-shape fault** (null-hypothesis-our-code: a buffer/cache/aliasing effect on the low
+region). Witness: `:: PIUSB: [piusb38] … ::`. Inert on QEMU raspi4b (no VL805 → no storage
+slot); QEMU virt exercises the whole path (the full-reset TUR passes and the ladder reads real
+LBA0 data), byte-identical no-op on x86.
+
+### 5f. USBW-1 — the write self-test addressed the wrong disk (P57)
+
+P57 ended the MISSION write proof with
+
+```
+:: PIUSB: [usbw] write lba=500223999 -> FAIL (pre-read all candidates stalled) ::
+```
+
+Both halves of that line were wrong, and the cause was **ours**, not the reader's.
+
+**The geometry mix-up.** `mission_write_selftest` picked its scratch sector from the *global*
+`block::info()`. On the Pi that global belongs to the **microSD**: the BSP registers the eMMC2
+card at probe time (`:: M6g: SD card @0xfe340000 identified — 500224000 blocks (244250 MiB) ::`),
+and PIUSB-28 deliberately keeps `BLOCK_DEVICE` pinned to the SD so a later-enumerated stick
+cannot clobber it. The enumerated USB device is a different disk entirely — its own READ
+CAPACITY, printed two lines earlier in the same boot, is
+`Disk 'Generic' 'USB SD Reader' block_size=512 num_blocks=29120 (14 MiB)`. The probe therefore
+aimed `lba = 500224000 - 1` — the SD's last block — down the **USB BOT pipe**, roughly 17,000×
+past the reader's last LBA of 29119. All three fallback candidates (last, last-8, last-64) were
+equally out of range.
+
+**The device was right.** Each candidate came back `Ok(BotResult { status: Failed, residue: 512 })`
+— a *completed* BOT round trip whose CSW reports CHECK CONDITION. The reader halted the data-IN,
+our §5e stall recovery cleared the halt and still collected the CSW exactly as designed (the
+`[usbw] bulk STALL recovery slot 2 ep 0x82` lines preceding each verdict), which is precisely why
+the next candidate got a clean pipe and its own CSW. Recovery **engaged and worked**; the failure
+label "all candidates stalled" described a transport fault that never happened. **Not** a
+device quirk, and unrelated to the separate s1j finding that this card's front sectors read as
+zeros.
+
+**Fix, part 1 — the right disk.** `mission_write_selftest` now sources its geometry from
+`block::usb_info()` — the dedicated `USB_BLOCK_DEVICE` handle published by the very enumeration
+that owns this BOT pipe — so the scratch LBA is always bounded by the stick's own capacity. The
+PIUSB-25 "storage enumerated" witness had the same defect (it read `BLOCK_DEVICE`, so it reported
+the SD's 500224000 blocks under a USB label, contradicting the READ CAPACITY line just above it)
+and now reads `USB_BLOCK_DEVICE` too. On x86 `publish_usb_geometry` writes both handles, so **the
+geometry source is byte-identical there**; the serial output does gain the new witness lines
+below.
+
+**Fix, part 2 — the right *sector*, which part 1 alone got wrong.** Correcting the disk made the
+scratch write *reachable* for the first time, and it would have landed **inside the live `/fs/usb`
+volume**. The bench reader's card is a **superfloppy**: PIUSB-25 reports sector 0 as
+unrecognized/raw, and `mount_source` succeeds off a BPB at LBA 0 with partition offset 0 — so the
+volume's LBA space **is** the raw medium's. A whole-card FAT16 therefore runs to sector 29119 and
+all three candidates (29119, 29112, 29056) sit within it, the latter two plausibly in the data
+region (1024 B clusters, and `UNAOS.LOG` grows on that volume every boot, so tail clusters are not
+free by construction). A failed `restore_sector` or a power loss mid-RMW would leave 512 bytes of
+XOR pattern in a live file.
+
+"Near the end of the medium" is **not** the same as "clear of the filesystem", and the old
+USB-WRITE-2 comment ("NEVER near low (filesystem) LBAs") encoded exactly that false equivalence.
+The real rule is **above the volume**, not top-of-medium. `usbw_keepout_ceiling` now parses sector
+0 and returns the first LBA provably outside any on-disk container, fail-closed:
+
+| sector 0 | ceiling |
+|---|---|
+| GPT protective MBR (type 0xEE) | whole medium — the **backup GPT header occupies the last LBA**, making top-of-medium the worst possible scratch |
+| MBR partition table | highest `start + size` over the valid primary entries |
+| FAT BPB at LBA 0 (superfloppy) | `BPB_TotSec16`, else `BPB_TotSec32` |
+| raw / no recognizable container | 0 |
+| unreadable or signed-but-unrecognized | whole medium (skip) |
+
+Candidates below the ceiling are discarded; when the container **spans the medium** there is no
+safe sector and the probe **skips outright** with
+`[usbw] scratch skipped: on-disk container spans the medium (…)` rather than falling back to
+writing inside a mounted volume. On the bench reader that is the expected outcome: a whole-card
+FAT16 superfloppy leaves nowhere to scratch, so the metal write proof is **skipped, not faked**.
+Exercising it on metal needs a medium with slack above the volume (or a dedicated scratch stick) —
+flagged for the integrator.
+
+The keep-out ceiling is witnessed on every boot as part of the geometry line
+(`[usbw] scratch geometry: USB last_lba=… (num_blocks=…), keep-out ceiling=… [provenance]`), and
+every skip path — including an unpublished USB handle, which used to `return` silently — now emits
+a `scratch skipped:` line, so the write proof can never vanish traceless. The
+all-candidates-exhausted verdict no longer claims "stalled"; it points at the per-candidate CSWs
+above it.
+
+The genuine end-of-medium fallback ladder from USB-WRITE-2 (P44: some sticks STALL a READ(10)
+against the very last LBA they report) is retained — applied to the right disk, and now clamped to
+the keep-out ceiling.
+
+On the default QEMU media (`builder/usb.img`, a raw pattern image with no container in sector 0)
+the ceiling is 0 and the proof runs at the last LBA exactly as before.
+
+---
+
+### 5g. PIUSB-40 — stage timing on the Pi 4 COLD-BUILD path, and the ladders that were bounded
+
+**The observation (metal P59b, two data points).** When the Pi 4 firmware hands the kernel a PCIe
+root complex still held in reset —
+
+```
+fw RC: RGR1_SW_INIT_1=0x00000003 PCIE_STATUS=0x00000000 (PHYLINKUP=false DL_ACTIVE=false)
+PIUSB-16: ENTRY link state ... -> VC left RC in reset — COLD-BUILD path (M1 reset → M2 → M3)
+```
+
+— boot **visibly pauses for roughly three minutes** (operator-timed). When the firmware leaves the
+link up (the ADOPT path), boot is fast. Whether the RC comes up in reset varies boot to boot; the
+cold-vs-warm power pattern behind it is not yet characterized.
+
+**Why a stopwatch could not localize it.** The COLD-BUILD path is a serial chain of stages, several
+of which emit no serial output between entry and exit. An operator can time the whole chain but not
+attribute it. The instrumentation below closes that gap.
+
+#### The stage-timing instrument
+
+Every bring-up stage in `arch/aarch64/piusb.rs` is bracketed off `CNTVCT` (the free-running generic
+counter — always live, no init, no interrupt dependency) and emits exactly one line:
+
+```
+:: PIUSB: [piusb40] stage=<name> took=<ms>ms (t=<ms>ms) ::
+```
+
+| Stage | What it covers | Budget on the wire |
+| --- | --- | --- |
+| `census-power-clock` | the `[piusb32]` mailbox power/clock census | 3 mailbox calls, 500 ms each on timeout |
+| `fw-state-dump` | PIUSB-5 read-only pre-reset dump | RC-own reads; CAP ladder only when link-up |
+| `entry-link-discriminator` | the PIUSB-16 entry PCIE_STATUS/RGR1 reads | 2 RC-own reads |
+| `dump-linkdown-rc-claim` | the link-down fall-through's `witness_rc_cpu_claim` | RC-own MISC/BAR2 reads |
+| `dump-linkdown-serror-drain` | the fall-through's SError drain window | no loop; bounded by construction |
+| `m1-rc-bringup` | whole M1 (bridge reset → windows → PERST → link) | sum of the two below plus ~2 ms of pulses |
+| `m1-perst-settle` | the mandated post-PERST-deassert wait | fixed 100 ms (Linux `PCIE_RESET_CONFIG_WAIT_MS`) |
+| `m1-link-train-poll` | PHYLINKUP+DL_ACTIVE poll | 100 ms backstop |
+| `m2-enumerate-vl805` | whole M2 (bus/mem windows, BAR sizing, NOTIFY) | ~210 ms of settles + mailbox |
+| `m2-mmio-verify` | pre-NOTIFY CAP[0] ladder over the outbound window | see ladder cap below |
+| `m3-attach-xhci` | whole M3 | sum of the three below |
+| `m3-cap-probe` | CAP[0] ladder at the assigned BAR | see ladder cap below |
+| `m3-notify` | pre-HCRST NOTIFY + decode re-assert | mailbox + ~10 ms |
+| `m3-xhci-handoff` | `xhci::init` — halt, HCRST, CNR | **3 × `hw_wait_budget()` ≈ 8.3 s worst** |
+| `enum-notify` / `enum-xhci-handoff` | the deferred half's reload + second handoff | as above |
+| `enum-rings-rs1` | rings, interrupter, RS=1 | CNR wait ≈ 2.8 s worst |
+| `enum-pump` | the bounded polled enumeration walk | 30 s backstop, early exit on armed/ready |
+| `bringup-total` / `enum-total` | the two halves end to end | — |
+
+The instrument is always-on **within the `piusb` knob** and costs one counter read plus one serial
+line per stage. It performs **no MMIO of its own**, so it is safe at every point it is placed. Every
+`[piusb40]` line sits past a gate QEMU `raspi4b` never crosses (`bringup_inner` returns at the
+`pcie@` DTB census; `enumerate` returns at the `XHCI_READY` gate), so a QEMU boot — knob on or off —
+emits **zero** `[piusb40]` lines and a byte-identical log.
+
+#### What was trimmed: the cost-blind poison-retry ladders
+
+Three places read the **outbound memory window** in a fixed retry loop shaped
+`while tries < N { settle_ms(5); read; }` — the PIUSB-5 fw-CAP probe (4 tries), the PIUSB-15
+pre-NOTIFY MMIO verify (8), and the M3 CAP probe (8). Each was *budgeted as if a try cost its
+settle*, i.e. "8 tries ≈ 40 ms".
+
+That accounting is wrong on the COLD-BUILD path. These are **memory** cycles into the RC's outbound
+window, not RC-own APB reads. A memory cycle the RC cannot forward is not answered — it is absorbed
+by the bridge's completion-timeout machinery, and this is the same mechanism already documented in
+this subsystem as stalling the CPU on the bus "for a pathologically long time" (the boot-P4 lesson
+that put the link-down MMIO gate in). A ladder that reads as a 40 ms budget can therefore spend
+**minutes**, serially, printing nothing between tries. Two such ladders back to back are the leading
+explanation for the three minutes, and the `m2-mmio-verify` / `m3-cap-probe` lines now measure it
+directly.
+
+All three now route through one helper, `mmio_settle_read`, bounded three ways — and it matters which
+one is load-bearing:
+
+1. the original try count (unchanged — a healthy decode still completes identically);
+2. **the safety bound**: a total wall-clock cap, `MMIO_LADDER_BUDGET_MS = 60`. This is what actually
+   bounds the ladder. It is ≈12× the 5 ms inter-try settle these ladders were written around, so it
+   never bites on a link that answers at all;
+3. **a diagnostic label**, not a second bound: a per-read cost check, `MMIO_ABORT_COST_MS = 20`. The
+   ladder measures each read and, when one exceeds it, stops early and *names why*:
+
+   ```
+   [piusb40] mmio-ladder @ 0x…: try N took …ms (>= 20ms) — consistent with the RC absorbing this read
+   as a completion timeout rather than answering it; … Ladder STOPPED at …ms
+   ```
+
+The honest reading of (3): a read that expensive is *consistent with* a master-abort being absorbed,
+and continuing would buy the same abort at the same price — but the check is there to **explain** the
+time, not to be the thing that limits it. Strip it out and the wall budget still holds. 20 ms is far
+above any honest Device-nGnRnE read (sub-microsecond off a decoding BAR) and far below the
+multi-second stalls metal has shown, so it separates the cases without cutting a real answer short.
+Because `MRS CNTPCT_EL0` is not ordered against a Device load, the measured load is `dsb sy`-bracketed
+on both sides — without that the cost can under-report an absorbed read and the diagnostic silently
+never fires (the wall budget would still catch it, but the diagnostic is the point of the arc).
+
+Both terminal arms log. The exhaustion arm distinguishes "wall budget reached" from "try count reached
+within budget", and the M2/M3 fail-closed messages carry the ladder's elapsed ms and whether it was cut
+on per-read cost. The callers' fail-closed branches are unchanged — the verdict just arrives sooner.
+
+**The residual is not zero.** The cost check fires *after* the offending read has already been paid,
+and there are three ladders on the cold-build path, so the trimmed path still absorbs on the order of
+**~3× one completion timeout** (plus the 60 ms caps) rather than the ~8+8+4 aborts the fixed ladders
+could pay. If one completion timeout is itself seconds, the pause shrinks substantially but does not
+vanish — and the true per-abort cost is exactly what the `took=` figure in the `mmio-ladder` line will
+report for the first time. That residual is on the metal watch-list below, not claimed as fixed.
+
+**What was deliberately NOT trimmed.**
+
+- The **100 ms post-PERST-deassert settle** (`m1-perst-settle`). Mandated by the PCIe CEM T_PVPERL /
+  device-ready window and by Linux `brcm_pcie_start_link`; PIUSB-17 exists precisely because
+  skipping it produced the CNR wall. Bracketed only, so the log accounts for it honestly.
+- The **100 ms PCIe config-request window** in M2 and the SCB/CNR settles from PIUSB-16/17/18.
+- The **`xhci::init` timeouts** (`m3-xhci-handoff`, ~8.3 s worst on a firmwareless controller, paid
+  **twice** — once early, once in the deferred half). These come from `hw_wait_budget()`
+  (150e6 CNTVCT ticks ≈ 2.8 s at the Pi's 54 MHz) in `drivers/xhci` and `arch/aarch64/mod.rs` —
+  **shared kernel-core, outside the Pi track's lane**. This arc measures the stage instead of
+  re-cutting it, so the owning lane gets evidence before a shared timeout is touched.
+
+#### Wedge-path audit (the P59a full boot wedge)
+
+An earlier same-day boot did not merely pause — the wire went dead immediately after
+
+```
+fw left RC in reset — nothing to adopt/probe (…); skipping child-config + CAP probe (…)
+```
+
+and the machine was power-cycled. The audit question was whether that fall-through performs an MMIO
+the skip was supposed to avoid.
+
+**Verdict: it does not.** Everything after that line touches only the RC's **own** register block —
+`witness_rc_cpu_claim` reads `MISC_CTRL` and `RC_BAR2_CONFIG_LO/HI`, the same MISC block whose ten
+reads immediately above already answered (bracketed by the `piusb31` enter/exit pair, which printed).
+No child config, no outbound-window memory cycle, no mailbox. The wedge is **not** a mis-skipped
+downstream MMIO on this path, and no new guard is warranted there.
+
+What remains unproven is *which* of three silent candidates ate the boot: the MISC_CTRL/RC_BAR2
+reads, the SError drain window, or the caller's next stage (M1). None of them printed anything, which
+is why P59a's log could not separate them. The three brackets `dump-linkdown-rc-claim`,
+`dump-linkdown-serror-drain`, `entry-link-discriminator` and `m1-rc-bringup` now make the next boot
+name it: **whichever `[piusb40]` line is missing is the stage that wedged.** The bracket chain is
+gap-free from the census through the end of M3, so a wedge cannot be misattributed to a neighbouring
+stage — the PIUSB-16 entry reads in particular used to sit in an unbracketed gap that would have
+pointed the finger at M1.
+
+#### Metal watch-list
+
+- Which `[piusb40]` stage carries the bulk of the pause — the expectation is
+  `m2-mmio-verify` + `m3-cap-probe`, and a `mmio-ladder … STOPPED` line would confirm the
+  completion-timeout mechanism outright.
+- `m3-xhci-handoff` and `enum-xhci-handoff`: if these show ~2.8 s multiples, the shared
+  `hw_wait_budget` is a real share of the pause and the finding goes to the owning lane.
+- On the wedge path: which of the three link-down brackets fails to print.
+- Whether the ladder cap ever fires on a boot that *would* have succeeded (it should not — the
+  budget is ≫ the healthy path's cost; a `STOPPED` line on an otherwise-good boot would mean
+  `MMIO_ABORT_COST_MS` is too tight).
+- **The residual.** The trim does not take the cold-build path to zero: the cost check fires only
+  after the offending read is paid, so ~3× one completion timeout (one per ladder) plus the caps
+  remains. The `took=…ms` figure in the first `mmio-ladder` line is the first real measurement of what
+  one absorbed read costs on this silicon — it turns the remaining pause from an estimate into a
+  number, and decides whether a further arc is warranted.
+- Whether the `exhausted … WALL BUDGET reached` arm appears instead of the cost-cut arm: that would
+  mean the aborts are individually cheap but numerous, a different shape of problem than the one this
+  arc reasoned from.
+
+### 5h. PIUSB-41/42 — the P60 verdict: the pause was our own diagnostic dump
+
+**The measurement.** P60 is the first real cold-boot run of the 5g bracket chain, and it settles the
+watch-list above. Total PCIe/VL805 bring-up: **141.8 s**. The stage table:
+
+| Stage | `took=` | Reading |
+| --- | --- | --- |
+| `fw-state-dump` | **129 688 ms** | the pause |
+| `dump-linkdown-rc-claim` | **32 410 ms** | nested inside the above |
+| `m1-rc-bringup` | 340 ms | functional, fast |
+| `m2-enumerate-vl805` | 564 ms | functional, fast |
+| `m3-attach-xhci` | 332 ms | functional, fast |
+| `m3-xhci-handoff` / `enum-xhci-handoff` | 18 ms / 21 ms | no 2.8 s multiple |
+
+Three prior hypotheses die on this table. The `m2-mmio-verify` + `m3-cap-probe` ladders are **not**
+where the time goes — M2 and M3 together are under a second. The shared `hw_wait_budget()` escalation
+is **refuted**: the handoffs cost tens of milliseconds, not 2.8 s multiples, so nothing needs to go to
+the owning lane. And the pause is not in bring-up at all: **every functional stage is fast.** The
+carriers are both *our own read-only diagnostic dump* on the link-down path.
+
+**The mechanism.** `dump_firmware_state`'s link-down path performs **13 bare RC-APB reads** — ten in
+the register dump plus three in `witness_rc_cpu_claim`. 129.7 s / 13 ≈ **10 s per read**, and the
+nested figure agrees independently: 32.41 s / 3 ≈ 10.8 s per read. So when the firmware hands us
+`RGR1_SW_INIT_1=0x3` (INIT_GENERIC|PERST — the RC held in reset, `PHYLINKUP=false`), the RC's **own**
+APB block does not answer promptly either: each 32-bit load is absorbed by the bridge's
+completion-timeout machinery and stalls the CPU ~10 s. This is the boot-P4 mechanism, but applied to
+the RC register block rather than to downstream/outbound cycles — the link-down gate never claimed to
+protect against it, because RC-own reads had always been assumed safe *and* cheap. They are safe. They
+are not cheap.
+
+Two consequences follow. First, `MMIO_LADDER_BUDGET_MS` does **not** apply here: these are bare `r()`
+loads, and the 60 ms wall only caps `mmio_settle_read` ladders. Second — the important one — the cost
+is **linear in the number of registers we choose to dump**. The pause was never a hardware budget; it
+was a per-register price multiplied by a diagnostic we had no reason to keep paying every boot.
+
+**The fix (default-quiet law).** The dump's family is confirmed: on the fw-left-RC-in-reset path it
+has only ever reported the firmware's teardown, and M1 reprograms every register it reads moments
+later, proving the result with its own readback line. So:
+
+- the eight extra RC-own register reads (bus window, WIN0 ×5, RC_BAR2 ×2) and the whole
+  `witness_rc_cpu_claim` witness now require the **`usbdebug`** feature (`UNAOS_USBDEBUG=1`);
+- the default path reads only the **two** registers the gate genuinely needs — `RGR1_SW_INIT_1` and
+  `PCIE_MISC_PCIE_STATUS`, which drive both the link-down gate and PIUSB-16's discriminator — and
+  prints one summary line naming the mode and the knob;
+- the skipped witness prints a one-line placeholder saying what it would have cost and how to get it.
+
+Expected cold-boot effect: the link-down path's **13 slow reads become 2**, so `fw-state-dump` should
+fall from 129 688 ms to **~20 s** (2 × ~10 s). The per-read price is self-consistent inside P60 and is
+not a single division: the dump's *own* ten reads cost 129.688 − 32.410 = **97.3 s ≈ 9.7 s each**, and
+the nested witness's three cost **32.41 / 3 ≈ 10.8 s each**.
+
+**What did not change.** No bring-up step, mandated settle, ordering, or protection is touched; the
+link-down gate is the same gate reading the same two registers; the fail-closed branches are
+unchanged. Every `[piusb40]` bracket still emits `stage=… took=…`, so the 5g wedge-localization
+property survives intact — and on the skipped path a near-zero `dump-linkdown-rc-claim took=` is now
+itself the evidence that the stage was *skipped* rather than *wedged*.
+
+**Composed with PIUSB-42 — the discriminator stops paying twice.** PIUSB-41 left one residual: PIUSB-16's
+`entry-link-discriminator` re-read the same two registers microseconds after the dump read them, with no
+intervening write. That is now fixed in the same change. `dump_firmware_state` **returns**
+`(RGR1_SW_INIT_1, PCIE_STATUS)` — the pair it reads unconditionally, above the `deep` gate, on every path
+including both early returns — and the discriminator consumes it instead of re-reading. The values are
+seconds stale by then, and that is sound by construction rather than by hope: the dump is read-only
+("BEFORE any RC reset" is its whole contract), the only writer of `RGR1_SW_INIT_1` here is M1, which runs
+strictly *after* the discriminator and gated *on* its verdict, and `PCIE_STATUS` only moves on a link event
+M1 has not yet triggered. Same gate, same verdict, same PIUSB-16 witness line with the same values.
+
+**How much that second fix is worth is bounded, not extrapolated — and the two numbers disagree.** A
+uniform 2 × ~10 s per-read extrapolation predicts ~21 s, but P60's own total does not leave room for it:
+141.8 s − 129.688 s (dump) − 1.236 s (m1 340 + m2 564 + m3 332) = **10.9 s for `census-power-clock` *plus*
+the discriminator combined**. So the duplicated pair cost **at most ~10.9 s**, and ~21 s must not be
+quoted as measured. P60's table does not cite the stage's own `took=` — the stage *is* bracketed (5g added
+it), the figure simply was not carried across — so the split between the census and the discriminator is
+unresolved in the evidence we have. Consequently the expected composed cold-boot total is a **band, ~21 s
+to ~32 s** (down from 141.8 s), its width being exactly that unresolved split. The next cold boot settles
+it directly: the bracket stays, so `entry-link-discriminator took=` collapsing to ~0 while
+`census-power-clock` shows its true cost separates the two for good.
 
 ---
 
@@ -147,6 +827,55 @@ and the transfer dispatch processes only the completion whose TRB matches — a 
 (pointing at the already-consumed TD) is ignored, so the same report is never decoded
 twice (which would double cursor motion) and the ring is never over-armed. QEMU posts
 no dup, so `param` always matches and the guard is transparent there.
+
+**PIUSB-39 — the guard must discard the data, never the pipeline.** As first written the
+guard's only exit was `return`, which skipped the `queue_mouse_read` re-arm. A *single*
+mismatching completion therefore retired the pointer interrupt-IN endpoint permanently,
+while the keyboard's independently-armed endpoint carried on — exactly the P54b metal
+fact (after an EL0 app's interactive takeover ends, the mouse is dead and the keyboard
+still types). The guard stays (the dup hazard is real); its exit now discriminates using
+`mouse_prev_phys`, the address of the TD `queue_mouse_read` last retired:
+
+- `param == mouse_prev_phys` — a genuine Panther-Point dup for the already-consumed TD.
+  A fresh read is *already* armed, so the dup is discarded **without** re-arming (that is
+  the original UI1-MOUSE M2 protection, preserved unchanged).
+- any other mismatch — the endpoint retired a TD we cannot account for, so nothing is
+  guaranteed armed. The report is discarded and the read is **re-armed**.
+
+The same two dead-pipeline holes existed on the *error* side: a completion code other
+than 1/13 on either HID interrupt-IN endpoint fell through the success gate without a
+re-arm. Both now trace and recover, and the recovery is **split by completion code**,
+because a bare re-queue is a no-op on a halted endpoint (it ignores the doorbell until
+Reset Endpoint):
+
+- **Halting codes** — 2 (Data Buffer Error), 3 (Babble), 4 (USB Transaction Error),
+  5 (TRB Error), 6 (Stall). The endpoint is Halted, so `(slot, is_mouse)` is queued on
+  `hid_halt_pending` and the main-loop `service_hid_halts` runs the full un-halt:
+  **Reset Endpoint** (TRB 14) → **Set TR Dequeue Pointer** (TRB 16, past the faulted
+  TRB) → device `CLEAR_FEATURE(ENDPOINT_HALT)` → clear the stale `*_expect_phys`/
+  `*_prev_phys` (the ring dequeue moved) → arm the read. This is the same pair the bulk
+  clear-halt path uses (`reset_bulk_endpoint_host`, §7g), generalised over any DCI. It is
+  deferred to the main loop for the same reason `SET_PROTOCOL(boot)` is: the sequence is
+  synchronous command + EP0 traffic and must never run re-entrantly inside the event-ring
+  dispatch that noticed the error. A slot that unplugged in between is skipped
+  (root `PORTSC.CCS`), and slot teardown drops its queued entries.
+- **Non-halting codes** — the endpoint is still Running; the read is re-armed inline, as
+  the hub Status Change Endpoint does (§7d).
+
+The keyboard guard carries the identical fix (`keyboard_prev_phys`); only its lower
+traffic kept the defect from being observed on metal.
+
+*Witness (knob-gated, `usbdebug`, rate-limited to one line per 250 ms).*
+`[piusb39] mouse rearm=<n> discarded=<n> errrearm=<n> (<tag>)` — the three counters are
+distinct populations and the tag names which one moved: `poll` (a normal armed read;
+printed on the first arm and every 256th), `guard` (the dup-Success guard discarded a
+completion and re-armed anyway), `halt` (a halted endpoint was un-halted and re-armed).
+`discarded > 0` on a metal capture is direct proof the *guard's* pipeline-preserving exit
+fired where the old code would have killed the pointer; `errrearm > 0` proves the *error*
+path recovered. The error trace itself (`xHCI: pointer interrupt-IN error ...`) is
+unconditional but capped at one line per 500 ms with a `[+N suppressed]` tail — the
+pointer is the highest-rate endpoint and a Running-state error class self-sustains at
+report rate.
 
 ### 7b. Serial mouse-witness (bench-assertable)
 

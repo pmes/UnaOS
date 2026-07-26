@@ -1,0 +1,115 @@
+
+========== VS variant: is_coord=1  (COORD/BIN shader) ==========
+threads=4  vpm_input_size=0  vpm_output_size=1  vcm_cache_size=4  separate_segments=0
+vattr_sizes[0..3]=4,0,0,0  uses_vid=0 uses_iid=0
+-- uniform stream (count=8) --
+  u[ 0] VIEWPORT_X_SCALE   data=0x00000000 (0)
+  u[ 1] CONSTANT           data=0x00000000 (0)
+  u[ 2] CONSTANT           data=0x00000001 (1)
+  u[ 3] CONSTANT           data=0x00000002 (2)
+  u[ 4] CONSTANT           data=0x00000003 (3)
+  u[ 5] VIEWPORT_Y_SCALE   data=0x00000000 (0)
+  u[ 6] CONSTANT           data=0x00000004 (4)
+  u[ 7] CONSTANT           data=0x00000005 (5)
+-- QPU words (22 instructions) --
+  [ 0] 0x3c403186bb800000  nop                           ; nop                         ; ldunif
+  [ 1] 0x3d903186bb800000  nop                           ; nop                         ; ldunifrf.r0
+  [ 2] 0x3d906183bc800000  ldvpmv_in rf3, r0             ; nop                         ; ldunifrf.r1
+  [ 3] 0x559081c4bcb810c0  ldvpmv_in rf4, r1             ; fmul rf7, rf3, r5           ; ldunifrf.r2
+  [ 4] 0x3d90e185bc802000  ldvpmv_in rf5, r2             ; nop                         ; ldunifrf.r3
+  [ 5] 0x3d912186bc803000  ldvpmv_in rf6, r3             ; nop                         ; ldunifrf.r4
+  [ 6] 0x3c402188ba82e180  recip rf8, rf6                ; nop                         ; ldunif
+  [ 7] 0x54002000f89f00c4  stvpmv r0, rf3                ; fmul r0, rf4, r4
+  [ 8] 0x54003106bbf801c8  nop                           ; fmul r4, rf7, rf8
+  [ 9] 0x54002000f8e31108  stvpmv r1, rf4                ; fmul r0, r0, rf8
+  [10] 0x3c003181f6804000  ffloor r1, r4                 ; nop
+  [11] 0x3c002180f8832140  stvpmv r2, rf5                ; nop
+  [12] 0x3c003184f5839000  ftoiz r4, r1                  ; nop
+  [13] 0x3c002180f8833180  stvpmv r3, rf6                ; nop
+  [14] 0x3c003182f6800000  ffloor r2, r0                 ; nop
+  [15] 0x3c402180f8825000  stvpmv r5, r4                 ; nop                         ; ldunif
+  [16] 0x3c003180f583a000  ftoiz r0, r2                  ; nop
+  [17] 0x3c002180f8805000  stvpmv r5, r0                 ; nop
+  [18] 0x3c003186bb816000  vpmwt -                       ; nop
+  [19] 0x3c203186bb800000  nop                           ; nop                         ; thrsw
+  [20] 0x3c003186bb800000  nop                           ; nop
+  [21] 0x3c003186bb800000  nop                           ; nop
+
+========== VS variant: is_coord=0  (RENDER VS) ==========
+threads=4  vpm_input_size=0  vpm_output_size=1  vcm_cache_size=4  separate_segments=0
+vattr_sizes[0..3]=4,0,0,0  uses_vid=0 uses_iid=0
+-- uniform stream (count=10) --
+  u[ 0] VIEWPORT_X_SCALE   data=0x00000000 (0)
+  u[ 1] CONSTANT           data=0x00000000 (0)
+  u[ 2] CONSTANT           data=0x00000003 (3)
+  u[ 3] CONSTANT           data=0x00000001 (1)
+  u[ 4] VIEWPORT_Y_SCALE   data=0x00000000 (0)
+  u[ 5] CONSTANT           data=0x00000002 (2)
+  u[ 6] VIEWPORT_Z_SCALE   data=0x00000000 (0)
+  u[ 7] VIEWPORT_Z_OFFSET  data=0x00000000 (0)
+  u[ 8] CONSTANT           data=0x00000000 (0)
+  u[ 9] CONSTANT           data=0x00000003 (3)
+-- QPU words (21 instructions) --
+  [ 0] 0x3c403186bb800000  nop                           ; nop                         ; ldunif
+  [ 1] 0x3d903186bb800000  nop                           ; nop                         ; ldunifrf.r0
+  [ 2] 0x3d906183bc800000  ldvpmv_in rf3, r0             ; nop                         ; ldunifrf.r1
+  [ 3] 0x558160c4bcb810c0  ldvpmv_in rf4, r1             ; fmul r3, rf3, r5            ; ldunifrf.rf5
+  [ 4] 0x3d90a187ba82e100  recip rf7, rf4                ; nop                         ; ldunifrf.r2
+  [ 5] 0x3c402186bc806140  ldvpmv_in rf6, rf5            ; nop                         ; ldunif
+  [ 6] 0x55906108bc585180  ldvpmv_in rf8, r5             ; fmul r4, rf6, r2            ; ldunifrf.r1
+  [ 7] 0x54003006bbcc01c0  nop                           ; fmul r0, r3, rf7
+  [ 8] 0x54003083f6d001c0  ffloor r3, r0                 ; fmul r2, r4, rf7
+  [ 9] 0x54003101f53bb200  ftoiz r1, r3                  ; fmul r4, rf8, r1
+  [10] 0x5590b0c0f6d021c0  ffloor r0, r2                 ; fmul r3, r4, rf7            ; ldunifrf.r2
+  [11] 0x3d903184f5838000  ftoiz r4, r0                  ; nop                         ; ldunifrf.r0
+  [12] 0x3c002180f8808000  stvpmv r0, r1                 ; nop
+  [13] 0x3c0031810581a000  fadd r1, r2, r3               ; nop
+  [14] 0x3c002180f8826140  stvpmv rf5, r4                ; nop
+  [15] 0x3c402180f880d000  stvpmv r5, r1                 ; nop                         ; ldunif
+  [16] 0x3c002180f88351c0  stvpmv r5, rf7                ; nop
+  [17] 0x3c003186bb816000  vpmwt -                       ; nop
+  [18] 0x3c203186bb800000  nop                           ; nop                         ; thrsw
+  [19] 0x3c003186bb800000  nop                           ; nop
+  [20] 0x3c003186bb800000  nop                           ; nop
+
+========== PROBE VS (coord + SSBO store of attr inputs) ==========
+threads=2  tmu_count=1  uniforms=12  words=25
+-- uniform stream --
+  u[ 0] CONSTANT           0x00000000
+  u[ 1] CONSTANT           0x00000001
+  u[ 2] CONSTANT           0x00000002
+  u[ 3] CONSTANT           0x00000003
+  u[ 4] (other)            0x00000000
+  u[ 5] CONSTANT           0xfffffffc
+  u[ 6] VIEWPORT_X_SCALE   0x00000000
+  u[ 7] VIEWPORT_Y_SCALE   0x00000000
+  u[ 8] CONSTANT           0x00000002
+  u[ 9] CONSTANT           0x00000003
+  u[10] CONSTANT           0x00000004
+  u[11] CONSTANT           0x00000005
+-- QPU words --
+  [ 0] 0x3c403186bb800000  nop                           ; nop                         ; ldunif
+  [ 1] 0x3d902183bc805000  ldvpmv_in rf3, r5             ; nop                         ; ldunifrf.r0
+  [ 2] 0x3d9072c6bbf800c0  nop                           ; mov tmud, rf3               ; ldunifrf.r1
+  [ 3] 0x3d90a184bc800000  ldvpmv_in rf4, r0             ; nop                         ; ldunifrf.r2
+  [ 4] 0x3d90e185bc801000  ldvpmv_in rf5, r1             ; nop                         ; ldunifrf.r3
+  [ 5] 0x3c0032c6bbf80100  nop                           ; mov tmud, rf4
+  [ 6] 0x3c002186bc802000  ldvpmv_in rf6, r2             ; nop
+  [ 7] 0x3c0032c6bbf80140  nop                           ; mov tmud, rf5
+  [ 8] 0x3c0032c6bbf80180  nop                           ; mov tmud, rf6
+  [ 9] 0x3c003346bbec0000  nop                           ; mov tmuau, r3
+  [10] 0x3d912180f88350c0  stvpmv r5, rf3                ; nop                         ; ldunifrf.r4
+  [11] 0x54402047ba9af0c6  recip rf7, rf6                ; fmul r1, rf3, r4            ; ldunif
+  [12] 0x544020c0f8bb0100  stvpmv r0, rf4                ; fmul r3, rf4, r5            ; ldunif
+  [13] 0x54402080f8e75147  stvpmv r5, rf5                ; fmul r2, r1, rf7            ; ldunif
+  [14] 0x54003004f6cc21c0  ffloor r4, r2                 ; fmul r0, r3, rf7
+  [15] 0x3c402180f8835180  stvpmv r5, rf6                ; nop                         ; ldunif
+  [16] 0x3c003181f583c000  ftoiz r1, r4                  ; nop
+  [17] 0x3c003182f6800000  ffloor r2, r0                 ; nop
+  [18] 0x3c602180f880d000  stvpmv r5, r1                 ; nop                         ; thrsw; ldunif
+  [19] 0x3c203183f583a000  ftoiz r3, r2                  ; nop                         ; thrsw
+  [20] 0x3c002180f881d000  stvpmv r5, r3                 ; nop
+  [21] 0x3c003186bb816000  vpmwt -                       ; nop
+  [22] 0x3c203184bb815000  tmuwt r4                      ; nop                         ; thrsw
+  [23] 0x3c003186bb800000  nop                           ; nop
+  [24] 0x3c003186bb800000  nop                           ; nop

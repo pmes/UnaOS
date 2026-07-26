@@ -512,6 +512,40 @@ fn apply_ipv4_config(stack: &mut SmolStack, cidr: Ipv4Cidr, gw: Ipv4Address) {
     });
     let _ = stack.iface.routes_mut().remove_default_ipv4_route();
     let _ = stack.iface.routes_mut().add_default_ipv4_route(gw);
+    // SNTP-X86: record the live default gateway so the SNTP client can target it (a DHCP lease's router
+    // replaces the static slirp gateway here). Packed big-endian into an atomic (0 = never configured).
+    let o = gw.octets();
+    CURRENT_GW.store(u32::from_be_bytes([o[0], o[1], o[2], o[3]]), Ordering::Relaxed);
+}
+
+/// SNTP-X86: the live default gateway (big-endian octets), updated by every `apply_ipv4_config`. The SNTP
+/// client targets it as the time source (slirp's usernet gateway 10.0.2.2 answers as a router; a DHCP
+/// lease's router option replaces it). `0` = never configured — the client falls back to `GATEWAY_IP`.
+static CURRENT_GW: AtomicU32 = AtomicU32::new(0);
+
+/// The current SNTP time-source target: the live default gateway, or the static slirp gateway before any
+/// config. When DNS is available (SOCK-8), the SNTP client prefers a resolved `pool.ntp.org`; this gateway
+/// is the fallback SNTP responder — on real hardware behind a router that runs NTP, or a LAN time server.
+fn sntp_target() -> [u8; 4] {
+    match CURRENT_GW.load(Ordering::Relaxed) {
+        0 => GATEWAY_IP,
+        v => v.to_be_bytes(),
+    }
+}
+
+/// SOCK-8: the DHCP-provided DNS server (big-endian octets), recorded by `dhcp_acquire` from the lease's
+/// `dhcpv4::Config::dns_servers` (first entry). `0` = no lease / the lease offered no DNS option — the
+/// resolver then falls back to querying the gateway. (slirp's DHCP offers 10.0.2.3, its built-in forwarder.)
+static CURRENT_DNS: AtomicU32 = AtomicU32::new(0);
+
+/// SOCK-8: the resolver's nameserver target — the DHCP-provided DNS server if the boot lease carried one,
+/// else the live default gateway (`sntp_target`'s gateway). On slirp this resolves to 10.0.2.3 (the lease's
+/// DNS option), which forwards to the host resolver; on real hardware it is the LAN/ISP nameserver.
+fn dns_server() -> [u8; 4] {
+    match CURRENT_DNS.load(Ordering::Relaxed) {
+        0 => sntp_target(),
+        v => v.to_be_bytes(),
+    }
 }
 
 /// SOCK-5 (shaped by the review fix): run the interface's DHCPv4 client to a lease and apply it —
@@ -529,6 +563,9 @@ fn dhcp_acquire() {
     }
     let mut leased: Option<Ipv4Cidr> = None;
     let mut router: Option<Ipv4Address> = None;
+    // SOCK-8: the first DHCP-provided DNS server, captured alongside the address/router so the resolver can
+    // query the real nameserver instead of falling back to the gateway.
+    let mut dns_srv: Option<Ipv4Address> = None;
     let mut spent = 0i64;
     'acquire: while spent < DHCP_PUMP {
         let mut g = STACK.lock();
@@ -549,6 +586,7 @@ fn dhcp_acquire() {
                 Some(dhcpv4::Event::Configured(cfg)) => {
                     leased = Some(cfg.address);
                     router = cfg.router;
+                    dns_srv = cfg.dns_servers.first().copied();
                     break 'acquire;
                 }
                 Some(dhcpv4::Event::Deconfigured) | None => {}
@@ -572,6 +610,11 @@ fn dhcp_acquire() {
             GATEWAY_IP[3],
         ));
         apply_ipv4_config(stack, cidr, gw);
+        // SOCK-8: record the leased DNS server (if any) so the resolver targets the real nameserver.
+        if let Some(d) = dns_srv {
+            let o = d.octets();
+            CURRENT_DNS.store(u32::from_be_bytes([o[0], o[1], o[2], o[3]]), Ordering::Relaxed);
+        }
         let addr = cidr.address().octets();
         serial_println!(
             ":: SOCK-5: smoltcp dhcpv4 lease {}.{}.{}.{}/{} gw {} — witness OK ::",
@@ -1529,4 +1572,387 @@ pub fn witness_tick6() {
             WITNESS6_STATE.store(if state == 2 { 1 } else { 3 }, Ordering::Relaxed);
         }
     }
+}
+
+// =============================================================================
+// SNTP-X86 (CLOCK-1 x86 follow-up): the x86 smolnet SNTP CLIENT that anchors the shared kernel clock.
+//
+// The pi/genet stack learns civil time over SNTP (PI-NET-16); CLOCK-1 gave both arches the shared
+// `crate::clock` civil service (`set_anchor`/`unix_now`/`iso8601_now`), but x86 had no network writer —
+// `time` there stayed `unsynced` until a manual `setdate`. This closes that gap: one RFC 4330 client-mode
+// request over the PERSISTENT UDP stack, its reply parsed by the shared, hostile-input-hardened
+// `crate::net_sntp` parser, then `crate::clock::set_anchor(unix, mono, Sntp{stratum})`.
+//
+// Target: UnaOS smolnet has no DNS client yet (SOCK-8+), so the client cannot resolve `pool.ntp.org`. It
+// targets the LIVE default gateway (`sntp_target()` — the DHCP-leased router, or slirp's 10.0.2.2). Under
+// the hermetic `./arroyo test` slirp backend the gateway does NOT answer :123, so the boot witness prints
+// the honest `no reply` one-liner and the clock stays unsynced; the deterministic `sntp_x86_gate` (below,
+// `witness`-feature) proves the parser + clock-anchor path with canned datagrams in ANY environment. On
+// real hardware behind a router/LAN server that answers NTP, the same client anchors `time` for real.
+// =============================================================================
+
+/// SNTP-X86 client ephemeral source port — distinct from the SOCK-2 witness (49200) so a co-resident
+/// witness never collides on a bound port.
+const SNTP_SPORT: u16 = 49250;
+
+/// SNTP-X86: one bounded, non-blocking sync attempt against `server`. Opens a kernel-owned UDP socket in
+/// the persistent set (`usize::MAX` owner — never a ring-3 slot, so no task teardown frees it), binds the
+/// ephemeral client port, sends the 48-byte client request to `server:123`, pumps for the reply, and
+/// parses it. On a usable reply it anchors `crate::clock` as `Sntp{stratum}` (capturing the monotonic tick
+/// in the same breath) and returns `(unix_secs, stratum)`. `None` on no NIC / no reply / KoD / malformed —
+/// the caller emits the honest witness. The socket is always closed before returning.
+pub fn sntp_sync_once(server: [u8; 4]) -> Option<(u64, u8)> {
+    let sid = stack_open(usize::MAX)?;
+    let mut req = [0u8; crate::net_sntp::SNTP_LEN];
+    crate::net_sntp::build_request(&mut req);
+    let _ = stack_bind(sid, SNTP_SPORT);
+    let _ = stack_sendto(sid, server, crate::net_sntp::NTP_PORT, &req);
+    let mut buf = [0u8; 64];
+    let got = stack_recvfrom(sid, &mut buf);
+    stack_close(sid);
+    let (_src, _port, n) = got?;
+    match crate::net_sntp::parse(&buf[..n]) {
+        crate::net_sntp::Sntp::Ok { unix_secs, stratum } => {
+            // Capture the monotonic tick "in the same breath" as the anchor, per the CLOCK-1 seam.
+            let mono = crate::clock::mono_ticks().unwrap_or(0);
+            crate::clock::set_anchor(unix_secs, mono, crate::clock::ClockSource::Sntp { stratum });
+            Some((unix_secs, stratum))
+        }
+        _ => None, // KoD / malformed / short — do not touch the clock
+    }
+}
+
+/// True once the SNTP-X86 boot witness has run (one-shot).
+static WITNESS_SNTP_DONE: AtomicBool = AtomicBool::new(false);
+/// service_net call counter — settle well past the SOCK-1..6 witnesses (and the boot DHCP) before syncing.
+static WITNESS_SNTP_TICKS: AtomicU32 = AtomicU32::new(0);
+/// Warm up past SOCK-6's witness (WARMUP 56) so the boot self-test, the ICMP/UDP/TCP/server witnesses, and
+/// the SOCK-5 DHCP lease all settle — the SNTP client then targets the leased router if DHCP replaced it.
+const WITNESS_SNTP_WARMUP: u32 = 72;
+
+/// SNTP-X86 boot witness: knob-on, one-shot — sync the shared clock from the live gateway over SNTP and
+/// emit the witness line. Runs on the BSP main loop from `service_net`, AFTER the NET_DEVICE guard drops
+/// (the pump re-locks NET_DEVICE per ring op). Hermetically the gateway is silent, so this prints the
+/// honest `no reply` note once; on real hardware with an NTP-answering router it anchors `time` for real.
+/// No-op once done / no NIC.
+pub fn witness_tick_sntp() {
+    if WITNESS_SNTP_DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    if WITNESS_SNTP_TICKS.fetch_add(1, Ordering::Relaxed) < WITNESS_SNTP_WARMUP {
+        return;
+    }
+    if e1000::hw_addr().is_none() {
+        return;
+    }
+    WITNESS_SNTP_DONE.store(true, Ordering::Relaxed);
+
+    // SOCK-8: prefer a resolved `pool.ntp.org` when DNS is available; fall back to the live gateway if the
+    // resolve fails (no lease DNS / no reply). Either way the target is an honest, reachable-or-not IP the
+    // witness prints. Under hermetic slirp the resolve may actually succeed (10.0.2.3 forwards to the host),
+    // but the SNTP leg then still needs an NTP-answering server on that address to anchor `time`.
+    let server = resolve(SNTP_POOL_HOST).unwrap_or_else(sntp_target);
+    match sntp_sync_once(server) {
+        Some((unix, stratum)) => {
+            let mut iso = [0u8; 24];
+            let n = crate::clock::render_iso8601(unix, &mut iso);
+            let iso_str = core::str::from_utf8(&iso[..n]).unwrap_or("????");
+            serial_println!(
+                ":: SMOLNET: [sntp] {} -> {} (stratum {}) ::",
+                e1000::fmt_ip(&server),
+                iso_str,
+                stratum
+            );
+        }
+        None => {
+            serial_println!(
+                ":: SMOLNET: [sntp] {} no reply — clock unsynced (gateway answers no NTP under hermetic slirp; needs a real NTP server) ::",
+                e1000::fmt_ip(&server)
+            );
+        }
+    }
+}
+
+// --- SNTP-X86 deterministic gate (witness-feature): the parser + clock-anchor path, canned + hermetic ---
+
+/// The injected wall-clock instant the SNTP gate scripts: 2026-07-22T15:30:45Z. Mirrors pi/genet's NET16
+/// fixture so the two arches assert the SAME round-trip anchor. `INJ_UNIX` is its UTC Unix second;
+/// `INJ_ISO` the string `crate::clock::render_iso8601` must reproduce from it.
+#[cfg(feature = "witness")]
+const INJ_UNIX: u64 = 1_784_734_245;
+#[cfg(feature = "witness")]
+const INJ_ISO: &str = "2026-07-22T15:30:45Z";
+
+/// SNTP-X86 deterministic gate (armed by the `witness` battery feature): drive canned SNTP datagrams
+/// through the shared `crate::net_sntp` parser and the `crate::clock` anchor path, asserting each outcome,
+/// with NO NIC or network required — so `./arroyo test` proves x86 SNTP correctness in any environment.
+/// Prints the self-checking `:: SNTP-X86-GATE: ... PASS [w=0x..] ::` line the x86 battery asserts.
+/// Bitmask `w`: 0x01 well-formed reply parses to the exact Unix second AND renders to `INJ_ISO`; 0x02 a
+/// short (<48 B) datagram is rejected; 0x04 stratum 0 surfaces as Kiss-o'-Death; 0x08 an LI=3 alarm reply
+/// is rejected; 0x10 a live parse anchors `crate::clock` as `Sntp{stratum}` and the anchored ISO is
+/// exactly `INJ_ISO`.
+#[cfg(feature = "witness")]
+pub fn sntp_x86_gate() {
+    use crate::net_sntp::{self, Sntp};
+    let mut w: u32 = 0;
+
+    // 0x01 — well-formed reply: exact Unix second + ISO round-trip.
+    let good = net_sntp::build_reply(INJ_UNIX, 0, 4, 4, 2);
+    let parse_ok = match net_sntp::parse(&good) {
+        Sntp::Ok { unix_secs, stratum } => {
+            let mut iso = [0u8; 24];
+            let n = crate::clock::render_iso8601(unix_secs, &mut iso);
+            unix_secs == INJ_UNIX
+                && stratum == 2
+                && core::str::from_utf8(&iso[..n]) == Ok(INJ_ISO)
+        }
+        _ => false,
+    };
+    if parse_ok {
+        w |= 0x01;
+    }
+    serial_println!(
+        ":: [sntp-x86] parse well-formed => {} ::",
+        if parse_ok { "resolved+ISO PASS" } else { "FAIL" }
+    );
+
+    // 0x02 — reject a short packet.
+    let rej_short = matches!(net_sntp::parse(&good[..40]), Sntp::Malformed);
+    if rej_short {
+        w |= 0x02;
+    }
+    serial_println!(
+        ":: [sntp-x86] reject short packet => {} ::",
+        if rej_short { "malformed PASS" } else { "FAIL" }
+    );
+
+    // 0x04 — surface stratum-0 Kiss-o'-Death.
+    let kod = net_sntp::build_reply(INJ_UNIX, 0, 4, 4, 0);
+    let is_kod = matches!(net_sntp::parse(&kod), Sntp::KissOfDeath);
+    if is_kod {
+        w |= 0x04;
+    }
+    serial_println!(
+        ":: [sntp-x86] surface KoD (stratum 0) => {} ::",
+        if is_kod { "KoD PASS" } else { "FAIL" }
+    );
+
+    // 0x08 — reject an LI=3 alarm reply.
+    let alarm = net_sntp::build_reply(INJ_UNIX, 3, 4, 4, 2);
+    let rej_alarm = matches!(net_sntp::parse(&alarm), Sntp::Malformed);
+    if rej_alarm {
+        w |= 0x08;
+    }
+    serial_println!(
+        ":: [sntp-x86] reject LI=3 alarm => {} ::",
+        if rej_alarm { "malformed PASS" } else { "FAIL" }
+    );
+
+    // 0x10 — the live anchor path: parse a canned reply and set the shared clock, then assert the
+    // deterministic (non-extrapolated) anchor renders exactly INJ_ISO and is tagged Sntp{2}. Uses
+    // `raw_anchor` so the free-running TSC never races the assertion.
+    let set_ok = match net_sntp::parse(&good) {
+        Sntp::Ok { unix_secs, stratum } => {
+            let mono = crate::clock::mono_ticks().unwrap_or(0);
+            crate::clock::set_anchor(unix_secs, mono, crate::clock::ClockSource::Sntp { stratum });
+            match crate::clock::raw_anchor() {
+                Some((anchor_unix, crate::clock::ClockSource::Sntp { stratum: s })) => {
+                    let mut iso = [0u8; 24];
+                    let n = crate::clock::render_iso8601(anchor_unix, &mut iso);
+                    s == 2 && core::str::from_utf8(&iso[..n]) == Ok(INJ_ISO)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    if set_ok {
+        w |= 0x10;
+    }
+    serial_println!(
+        ":: [sntp-x86] canned reply sets clock => {} ::",
+        if set_ok { "2026-07-22T15:30:45Z PASS" } else { "FAIL" }
+    );
+
+    let pass = w == 0x1f;
+    serial_println!(
+        ":: SNTP-X86-GATE: x86 sntp client battery {} [w=0x{:x}] (parse-ok+iso|reject-short|kod|reject-alarm|set-clock) ::",
+        if pass { "PASS" } else { "FAIL" },
+        w
+    );
+}
+
+// =============================================================================
+// SOCK-8 (ROADMAP §1b): the x86 smolnet DNS CLIENT over the shared, arch-neutral `crate::net_dns`.
+//
+// Until now smolnet had no way to turn a name into an address, so SNTP-X86 could only target the gateway.
+// SOCK-8 gives smolnet a resolver built on the SAME hostile-input-hardened wire logic the pi/genet
+// PI-NET-14 client uses — now extracted to `crate::net_dns` (the `net_sntp` sharing pattern), which genet
+// migrates onto in a later fold. `resolve()` sends one A-record query over the PERSISTENT UDP stack to the
+// DHCP-provided DNS server (`dns_server()` — the lease's DNS option, else the gateway) and parses the reply
+// with `net_dns::parse_a`. The SNTP client now prefers a resolved `pool.ntp.org` (see `witness_tick_sntp`).
+//
+// Under the hermetic `./arroyo test` slirp backend, slirp's DHCP offers 10.0.2.3 as the DNS server AND
+// forwards queries to the host resolver, so a live boot resolve may actually SUCCEED — captured as a bonus
+// witness. The deterministic `dns_x86_gate` (below, `witness`-feature) proves the parser with canned
+// datagrams in ANY environment and NEVER depends on external reachability.
+// =============================================================================
+
+/// The host the SNTP client resolves for its time source (RFC-standard NTP pool name).
+const SNTP_POOL_HOST: &str = "pool.ntp.org";
+/// SOCK-8 resolver ephemeral source port — distinct from the SOCK-2 witness (49200) and the SNTP client
+/// (49250) so a co-resident witness never collides on a bound port.
+const DNS_SPORT: u16 = 49260;
+/// A fixed transaction id for the resolver's queries. `parse_a` requires the reply to echo it (a mismatch
+/// is a stale/spoofed datagram). ASCII "SD" (Sock-Dns).
+const DNS_TXID: u16 = 0x5344;
+
+/// SOCK-8: resolve `host` to a single IPv4 A record via one bounded, non-blocking UDP query to the
+/// DHCP-provided DNS server (`dns_server()`, gateway fallback). Opens a kernel-owned UDP socket in the
+/// persistent set (`usize::MAX` owner — never a ring-3 slot, so no task teardown frees it), binds the
+/// ephemeral client port, sends the A-record query to `server:53`, pumps for the reply, and parses it with
+/// the shared, hostile-input-hardened `crate::net_dns::parse_a`. Returns the four address octets on a
+/// resolved A record, or `None` on no NIC / query-build failure / no reply / a malformed / no-answer /
+/// server-error reply. The socket is always closed before returning.
+pub fn resolve(host: &str) -> Option<[u8; 4]> {
+    let server = dns_server();
+    let mut qbuf = [0u8; 300];
+    let qlen = crate::net_dns::build_query(&mut qbuf, DNS_TXID, host)?;
+    let sid = stack_open(usize::MAX)?;
+    let _ = stack_bind(sid, DNS_SPORT);
+    let _ = stack_sendto(sid, server, crate::net_dns::DNS_PORT, &qbuf[..qlen]);
+    let mut buf = [0u8; 512];
+    let got = stack_recvfrom(sid, &mut buf);
+    stack_close(sid);
+    let (_src, _port, n) = got?;
+    match crate::net_dns::parse_a(&buf[..n], DNS_TXID) {
+        crate::net_dns::Dns::Resolved(ip) => Some(ip),
+        _ => None, // malformed / no A record / server error — the caller falls back
+    }
+}
+
+/// True once the SOCK-8 boot DNS witness has run (one-shot).
+static WITNESS_DNS_DONE: AtomicBool = AtomicBool::new(false);
+/// service_net call counter — settle past the SOCK-5 DHCP lease (so `dns_server()` sees the leased DNS) but
+/// before the SNTP witness, which reuses the resolver.
+static WITNESS_DNS_TICKS: AtomicU32 = AtomicU32::new(0);
+/// Warm up past SOCK-6's witness (WARMUP 56) + the DHCP lease, and ahead of the SNTP witness (WARMUP 72).
+const WITNESS_DNS_WARMUP: u32 = 64;
+
+/// SOCK-8 boot DNS witness: knob-on, one-shot — resolve `pool.ntp.org` through the shared DNS client and
+/// emit the witness line. Runs on the BSP main loop from `service_net`, AFTER the NET_DEVICE guard drops
+/// (the UDP pump re-locks NET_DEVICE per ring op). Under hermetic slirp the resolve may SUCCEED (10.0.2.3
+/// forwards to the host resolver) — captured as the live-resolve witness; if it times out, the honest
+/// `no answer` line prints instead. Either way the mission stays green. No-op once done / no NIC.
+pub fn witness_tick_dns() {
+    if WITNESS_DNS_DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    if WITNESS_DNS_TICKS.fetch_add(1, Ordering::Relaxed) < WITNESS_DNS_WARMUP {
+        return;
+    }
+    if e1000::hw_addr().is_none() {
+        return;
+    }
+    WITNESS_DNS_DONE.store(true, Ordering::Relaxed);
+
+    let server = dns_server();
+    match resolve(SNTP_POOL_HOST) {
+        Some(ip) => serial_println!(
+            ":: SMOLNET: [dns] {} -> {} (via {}) ::",
+            SNTP_POOL_HOST,
+            e1000::fmt_ip(&ip),
+            e1000::fmt_ip(&server)
+        ),
+        None => serial_println!(
+            ":: SMOLNET: [dns] {} no answer (via {}) — resolver reachable only where the nameserver replies ::",
+            SNTP_POOL_HOST,
+            e1000::fmt_ip(&server)
+        ),
+    }
+}
+
+// --- SOCK-8 deterministic gate (witness-feature): the DNS parser, canned + hermetic ---
+
+/// SOCK-8 deterministic gate (armed by the `witness` battery feature): drive canned DNS datagrams through
+/// the shared `crate::net_dns` parser, asserting each outcome, with NO NIC or network required — so
+/// `./arroyo test` proves x86 DNS parsing correctness in any environment. Prints the self-checking
+/// `:: DNS-X86-GATE: ... PASS [w=0x..] ::` line the x86 battery asserts. Bitmask `w`: 0x01 a well-formed A
+/// reply (with the universal compression pointer in the answer name, NEVER dereferenced) parses to the
+/// exact address; 0x02 a truncated reply (RR cut short) is rejected as `Malformed`; 0x04 a compression LOOP
+/// (a QNAME that is a self-pointer) is rejected WITHOUT hanging (loop-immune by construction); 0x08 a
+/// non-zero RCODE (NXDOMAIN=3) surfaces as `ServerErr(3)`.
+#[cfg(feature = "witness")]
+pub fn dns_x86_gate() {
+    use crate::net_dns::{self, Dns};
+    let mut w: u32 = 0;
+
+    // 0x01 — well-formed A reply parses to the exact address. The answer name is a compression pointer
+    // (0xc0 0x0c) exactly as a real resolver emits — `parse_a` accepts it as a name terminator without
+    // dereferencing it, and still extracts the A RDATA.
+    let mut good = [0u8; 512];
+    let gp = net_dns::build_a_reply(&mut good, DNS_TXID, "example.com", [93, 184, 216, 34], 0, 1)
+        .unwrap_or(0);
+    let parse_ok = matches!(net_dns::parse_a(&good[..gp], DNS_TXID), Dns::Resolved([93, 184, 216, 34]));
+    if parse_ok {
+        w |= 0x01;
+    }
+    serial_println!(
+        ":: [dns-x86] parse well-formed A => {} ::",
+        if parse_ok { "93.184.216.34 PASS" } else { "FAIL" }
+    );
+
+    // 0x02 — a truncated reply (the answer RR cut off mid-header) is rejected. Chop the well-formed reply
+    // to just past the question so the single claimed answer's fixed header runs off the end.
+    let trunc_len = gp.saturating_sub(8); // drop the last 8 bytes of the 16-byte answer RR
+    let rej_trunc = matches!(net_dns::parse_a(&good[..trunc_len], DNS_TXID), Dns::Malformed);
+    if rej_trunc {
+        w |= 0x02;
+    }
+    serial_println!(
+        ":: [dns-x86] reject truncated answer => {} ::",
+        if rej_trunc { "malformed PASS" } else { "FAIL" }
+    );
+
+    // 0x04 — a compression LOOP is rejected without hanging. The QNAME at offset 12 is a self-referential
+    // pointer (0xc0 0x0c → points at itself); `skip_name` treats it as a two-byte terminator and does NOT
+    // follow it (loop-immune by construction), so the walk terminates — and because the claimed single
+    // answer is absent, the parse is rejected as Malformed rather than looping forever.
+    let loop_pkt: [u8; 18] = [
+        0x53, 0x44, // txid = DNS_TXID
+        0x81, 0x80, // QR=1 RD=1 RA=1, rcode 0
+        0x00, 0x01, // QDCOUNT = 1
+        0x00, 0x01, // ANCOUNT = 1 (claimed, but absent)
+        0x00, 0x00, 0x00, 0x00, // NS/AR = 0
+        0xc0, 0x0c, // QNAME = pointer to offset 12 (itself) — a compression loop
+        0x00, 0x01, // QTYPE A
+        0x00, 0x01, // QCLASS IN
+    ];
+    let rej_loop = matches!(net_dns::parse_a(&loop_pkt, DNS_TXID), Dns::Malformed);
+    if rej_loop {
+        w |= 0x04;
+    }
+    serial_println!(
+        ":: [dns-x86] reject compression loop (no hang) => {} ::",
+        if rej_loop { "malformed PASS" } else { "FAIL" }
+    );
+
+    // 0x08 — a non-zero RCODE surfaces as ServerErr. Build an NXDOMAIN (rcode 3), zero answers.
+    let mut nx = [0u8; 64];
+    let np = net_dns::build_a_reply(&mut nx, DNS_TXID, "nope.example", [0, 0, 0, 0], 3, 0).unwrap_or(0);
+    let is_nx = matches!(net_dns::parse_a(&nx[..np], DNS_TXID), Dns::ServerErr(3));
+    if is_nx {
+        w |= 0x08;
+    }
+    serial_println!(
+        ":: [dns-x86] surface NXDOMAIN (rcode 3) => {} ::",
+        if is_nx { "ServerErr(3) PASS" } else { "FAIL" }
+    );
+
+    let pass = w == 0x0f;
+    serial_println!(
+        ":: DNS-X86-GATE: x86 dns client battery {} [w=0x{:x}] (parse-A|reject-truncated|reject-loop|rcode) ::",
+        if pass { "PASS" } else { "FAIL" },
+        w
+    );
 }
