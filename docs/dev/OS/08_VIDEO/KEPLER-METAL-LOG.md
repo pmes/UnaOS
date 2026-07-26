@@ -3,6 +3,39 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sittings #38–#40 (GR6 self-run bench, UnaOS-gemini@400ff065→1441b631, 2026-07-26, capture rmbp-gr6)
+
+**⭐⭐ s40: THE CONSOLE OPENED IN A COMPOSITOR WINDOW ON METAL — the x86 desktop era.**
+Peter's photo received (console window centered with kernel text; calibration demo
+window bottom-right, R/G/B bands + diagonal + checker correct, so channel order,
+scale and rows survive the composite path). Wire chain:
+`:: video: WRITER seeded base=90020000 len=29491200 panel=2880x1800 stride=4096px pitch=16384B bpp=4 ::` →
+`[wc-x] console-window win=1 panel=2880x1800 surf=1312x736 box=1314x750 at (783,444) cell=32x32 cols=41 rows=23` →
+`[wc-x] console-route first-paint win=1` → `[wc-x] console-window panic-fallback armed win=1` →
+`[wc-x] demo win=2 surf=96x64 at (2103,1117) scale=8x z=2` → `[wc-x] present win=2 rows=1104..1630 ok=true`.
+
+- **s39 (0c4eb448+WC): console window DECLINED** — `[wc-x] activate DECLINE reason=fb-not-ready`.
+  Root cause: `video::WRITER` was seeded at main.rs step 3, long AFTER the kepler
+  takeover where wcx::activate runs; fbcon worked because it reads BootInfo directly.
+  Fixed by seeding WRITER beside fbcon::init from the same triple (5701b9a8). Units
+  audit: stride is pixels end-to-end; no consumer carries its own pitch assumption.
+- **SMC quiet: proven at s40** — 2 lines the whole boot (one-shot unresponsive note +
+  first-fire witness). s39 had shown the first quiet attempt (1c870527) still scrolling
+  at 1 Hz because retries>0 fired every sweep on this SMC (retries=2..7 per second is
+  this machine's normal). Fix 1441b631: retries → rollup (300 s quiet / 60 s bootlog),
+  holds must persist 5 s to print, transient `ac=?` not a state change.
+- **⛔ FAT metal leg: FAILED twice identically (s39, s40), stick on slot 1** —
+  `:: BOT: pump … timeouts=1 …` → `:: BOT: recover begin cause=Timeout slot=1 ep=0x82/0x1 …` →
+  `:: BOT: recover done reset=fail halts=fail ring=resync ::` →
+  `:: FR: UNAOS.LOG reservation failed (Io) ::`. The x86 FAT fix stays metal-UNPROVEN
+  (not disproven). Instrumentation landed (9f6db8ea): next boot carries per-stage
+  completion codes + EP states + CSW evidence; the verdict table is in usb_xhci.md §BOTEV.
+- **s40 photo residue (cosmetic): pre-activation paints stay on glass** — stray direct
+  fbcon rows top + kepler probe rectangle top-left; the compositor never cleared the
+  panel at activation. Desktop-clear fix in flight for s41.
+- s38 (400ff065, no WC): boot healthy, quiet-witness fix rode it; FAT leg first
+  attempted here (boot2, data stick) — same recover/Io signature as above.
+
 ## Sitting #37 (pull 33 FECS echo + poll-control, UnaOS-gemini@f8e3e2f3, 2026-07-26, fox-metal-r23s1n, s37boot1v2)
 
 **⭐⭐⭐ OUR MICROCODE ANSWERED A COMMAND. THE CONSTRUCTIVE ERA IS OPEN.**
