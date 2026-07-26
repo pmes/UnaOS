@@ -3,6 +3,72 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #42 (GR6 self-run bench, UnaOS-gemini@a8efc15d-era, 2026-07-26, capture rmbp-gr6)
+
+**⭐ THE s41 RESIDUE QUESTION IS ANSWERED — `[wc-x] move-vacate win=3 … painted=true
+desktop=5/5 stale=0/5 -> PASS`.** The erase DOES reach glass; every sampled point in a
+vacated box read desktop background. Per the probe's own verdict table the ghost boxes
+were a LATER writer (the desktop layer repainting an unoccluded box), so the fix is the
+`move_to`→`request_full_present` one-liner on the pi4 side — relayed, and it rides their
+SPAWN-PLACE take-back. Combined with SPAWN-PLACE itself (windows now created at their
+final origin — `[wc-x] spawn-place win=2 … (created in place, no move)`), no window on
+this boot ever moved.
+- **⭐ CLICK-3 PROVEN ON METAL:** `:: PTR: [1] press seen=16 delivered=16 recovered=15 ::`
+  — **15 of 16 of Peter's clicks would have been EATEN** by the stale button latch before
+  this fix; delivered now equals seen. The mechanism (a missed release report at
+  frame-rate polling leaves `prev_buttons` latched down; motion was the only reset) is
+  confirmed by the recovery count itself.
+- **SMC quiet: 9 lines for the whole boot** (from ~1 Hz forever at s39, ~every few seconds
+  at s41) — the presence-flap debounce closed the last leak.
+- Fence unchanged and repeatable: `ctx-echo img=A ack=1 mb0=1 phase=4`, terminal poke
+  harmless, `runlist-scan verdict occupied_mask=4 alias_i2_base=match alias_i2_len=match`
+  (the sibling-runlist sweep's first metal read).
+- No storage attached this boot (`storage_slot=0`) — FAT leg not exercised.
+- **⛔ INSTGUI SHIPPED DISABLED — a build-system asymmetry, worth remembering:** the
+  installer compiled green under every `./arroyo check`, but ESP/media builds are produced
+  by `builder/`, which re-derives features from env and had no `UNAOS_INSTGUI` mapping. A
+  knob added only to `arroyo` is invisible to media. Fixed (`c117e0e2`); s43 carries
+  13 `instgui` symbols in `kernel.elf`, verified by `strings` before staging. **New staging
+  habit: verify the feature's symbols are IN the artifact, not merely that the build was
+  green.**
+
+## Sitting #41 (GR6 self-run bench, UnaOS-gemini@65faec32, 2026-07-26, capture rmbp-gr6, three-lane evidence boot + photo)
+
+**⭐ FENCE: the echo's split observables all landed and 0x409504 TOOK ITS FIRST WRITE HARMLESSLY.**
+`ctx-echo img=A ack=00000001 mb0=00000001 phase=00000004` (iters=0 again — ucode read a value,
+reported it via MAILBOX0, stamped all phases, exited bounded) → … →
+`:: kepler: terminal-poke 0x409504 wr=0 ::` → `[NVIDIA] Initialization complete` and the boot
+sailed on. The poison register is writable without consequence to the boot.
+
+**⭐ PLATFORM: the FAT wedge is DIAGNOSED — the stick goes catatonic on write; xHCI is healthy.**
+Evidence chain (first metal run of 9f6db8ea): `recover entry … cmdring=running` →
+`stage=msc-reset ok=no cc=0 why=nocompletion` + both `clear-halt … why=nocompletion` (all three
+are DEVICE requests via EP0) while the xHCI COMMANDS all succeed (`stop-ep ok=yes cc=1`,
+`set-deq ok=yes` with ctxdeq actually moving) → `recover evidence … csw_sig=0x0` (device never
+answered) → `:: BLK: io-cause op=write lba=121 bot_err=Timeout ::`. Verdict per the BOTEV table:
+transport wedge in the DEVICE, not our state machine — WRITE(10) kills it, then it answers
+nothing, including control requests. **Next discriminator: same boot, DIFFERENT stick** (asked).
+
+**s41boot2 (fresh 2 GB stick, UNAOS-DATA): THE DEVICE HYPOTHESIS IS DEAD — two sticks,
+same signature; suspect OUR write path.** One transaction succeeded but took ~0.47 s
+(`used=1275711592` at 2.693 GHz, n=1 result=OK — pathological); the FR burst write to
+lba 9834 then consumed the FULL ~6 s budget (`used=16163799966 ≈ budget`) and timed out.
+First recovery failed as before; a SECOND recovery on this stick SUCCEEDED
+(`reset=ok halts=cleared`), so boot 1's catatonic-device read doesn't generalize either.
+Working hypothesis for the analysis arc (out): per-TRB event accounting or data-stage
+shape makes large writes cost ~4–7 ms/TRB on metal (0.47 s ≈ a TRB chain at tick-latency
+waits) — QEMU never shows it because virtual completion is instant.
+
+**UI: desktop-clear worked (photo: clean blue desktop), console window + [wc-k] vocabulary live —
+and the photo found THREE new defects, all fix-arcs spawned:**
+- Windows create at (0,0), first-present there, then move — the vacated boxes stay on glass
+  (staged erases report BUFFERED torn=yes but never land). Photo shows both ghost boxes.
+- SMC still prints every few seconds: `present=true/false` FLAPPING — each flip is a state
+  change under the s40 predicate; presence needs the held value in the key (same class as ac=?).
+- Trackpad (Peter, live interaction): two stationary clicks in a row — second click ignored;
+  slide-then-click registers. Pointer-path repeat-click defect, investigation arc out.
+- `torn=yes` consistently on big x86 erases — possibly benign (no vsync on GOP); flagged to pi4.
+
 ## Sittings #38–#40 (GR6 self-run bench, UnaOS-gemini@400ff065→1441b631, 2026-07-26, capture rmbp-gr6)
 
 **⭐⭐ s40: THE CONSOLE OPENED IN A COMPOSITOR WINDOW ON METAL — the x86 desktop era.**
