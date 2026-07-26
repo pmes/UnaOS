@@ -542,10 +542,31 @@ pub fn _print(args: core::fmt::Arguments) {
 ///
 /// No-op when the console is not routed — which is every build without `wc`, every boot before the
 /// window is opened, and every moment after a panic tore the route down.
+/// INSTGUI: while a modal dialog owns the screen the console STOPS PRESENTING to glass —
+/// its surface still takes the glyphs and serial still carries every line, but a boot that
+/// keeps printing must not repaint a 1 MPx window behind the dialog on every line. (`wm`'s
+/// dirty set closes upward over occlusion, so each console line was repainting the dialog
+/// too: that is the flicker Peter saw on s43.) Suspension is presentation-only.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static CONSOLE_PRESENT_SUSPENDED: AtomicBool = AtomicBool::new(false);
+
+/// INSTGUI seam: suspend/resume the console window's presents (see the static above).
+/// Resuming forces one present so the console shows everything it accumulated.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn console_present_suspend(on: bool) {
+    CONSOLE_PRESENT_SUSPENDED.store(on, Ordering::Relaxed);
+    if !on {
+        route_present();
+    }
+}
+
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn route_present() {
     let id = CONSOLE_WIN.load(Ordering::Relaxed);
     if id == wm::WIN_NONE {
+        return;
+    }
+    if CONSOLE_PRESENT_SUSPENDED.load(Ordering::Relaxed) {
         return;
     }
     // Re-entry: see `ROUTE_BUSY`.
@@ -565,6 +586,11 @@ fn route_present() {
 #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
 #[inline]
 fn route_present() {}
+
+/// No-op off the wc path (see the x86 definition).
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+#[inline]
+pub fn console_present_suspend(_on: bool) {}
 
 /// The classic mirror: format straight into the console with interrupts masked for the whole
 /// line. Kept verbatim for the PANIC path and for aarch64.

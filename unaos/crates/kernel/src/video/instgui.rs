@@ -183,7 +183,12 @@ fn repaint() {
             let n = devices(&mut devs);
             let sel = SEL.load(Ordering::Relaxed) as usize;
             if n == 0 {
-                text(px, lx, 90, b"(no disks present - attach one)", theme::TITLE_TEXT_INACTIVE);
+                // Storage enumerates asynchronously (USB bring-up finishes well after the
+                // compositor activates), so "none yet" is the normal opening state — say so,
+                // and keep re-checking (`service`) rather than freezing the first answer.
+                text(px, lx, 84, b"No disks yet - waiting for USB", theme::CONTENT_TEXT);
+                text(px, lx, 84 + CELL + 6, b"enumeration. Attach a disk and", theme::TITLE_TEXT_INACTIVE);
+                text(px, lx, 84 + 2 * (CELL + 6), b"it appears here by itself.", theme::TITLE_TEXT_INACTIVE);
             }
             for i in 0..n {
                 let d = devs[i].unwrap();
@@ -203,9 +208,13 @@ fn repaint() {
                 line[tail..].copy_from_slice(s);
                 text(px, lx + 8, ry, &line[..(W - 2 * lx - 16) / CELL], theme::CONTENT_TEXT);
             }
-            text(px, lx, H - 92, b"Up/Down select   Enter continue", theme::TITLE_TEXT_INACTIVE);
-            text(px, lx, H - 92 + CELL + 4, b"Esc close installer", theme::TITLE_TEXT_INACTIVE);
-            button(px, W - 190, H - 52, 160, b"Continue", true);
+            // Exits are ALWAYS on screen: an installer that can only go forward is a trap.
+            text(px, lx, H - 100, b"w/s select   Enter continue", theme::TITLE_TEXT_INACTIVE);
+            text(px, lx, H - 100 + CELL + 4, b"Esc boot this live system", theme::TITLE_TEXT_INACTIVE);
+            text(px, lx, H - 100 + 2 * (CELL + 4), b"q  halt the machine", theme::TITLE_TEXT_INACTIVE);
+            if n > 0 {
+                button(px, W - 190, H - 52, 160, b"Continue", true);
+            }
         }
         State::Warn => {
             // The warning panel: CRISPY has no alarm red by design; the accent
@@ -317,7 +326,12 @@ pub fn open() {
         return;
     }
     WIN.store(id, Ordering::Relaxed);
-    serial_println!("[wc-x] instgui open win={} box={}x{} at ({},{})", id, ow, oh, ox, oy);
+    // The dialog is modal over the GLASS: the console keeps taking glyphs and serial keeps
+    // every line, but it stops presenting until we close. Without this, each boot message
+    // repaints the console window AND (through wm's upward occlusion closure) this dialog —
+    // ~24 ms of GOP writes per line, which reads as a hard flicker.
+    super::fbcon::console_present_suspend(true);
+    serial_println!("[wc-x] instgui open win={} box={}x{} at ({},{}) (console presents suspended)", id, ow, oh, ox, oy);
     repaint();
 }
 
@@ -327,14 +341,46 @@ fn close() {
         wm::close(id);
     }
     *STATE.lock() = State::Closed;
-    serial_println!("[wc-x] instgui closed");
+    // The console gets the glass back and repaints everything it accumulated.
+    super::fbcon::console_present_suspend(false);
+    serial_println!("[wc-x] instgui closed — console presents resumed, booting on");
 }
+
+/// Main-loop hook, every frame: re-check the disk list (storage enumerates long after the
+/// dialog opens) and repaint only when it actually changed, so this costs nothing per frame
+/// on a settled machine.
+pub fn service() {
+    if *STATE.lock() != State::Choose {
+        return;
+    }
+    let mut devs: [Option<block::BlockDeviceInfo>; 2] = [None; 2];
+    let n = devices(&mut devs);
+    let sig = devs
+        .iter()
+        .flatten()
+        .fold(n as u64, |a, d| a ^ (d.slot_id as u64) << 8 ^ d.num_blocks);
+    if LAST_SIG.swap(sig, Ordering::Relaxed) != sig {
+        repaint();
+    }
+}
+
+/// Signature of the last disk list painted (count ^ slot ^ size), so `service` repaints on a
+/// real change rather than every frame.
+static LAST_SIG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// Main-loop hook: returns true if the key belonged to the installer.
 pub fn consume_key(c: u8) -> bool {
     let st = *STATE.lock();
     if st == State::Closed {
         return false;
+    }
+    // Halt is offered from every screen: an installer must always be leaveable.
+    if c == b'q' && st != State::Running {
+        serial_println!("[wc-x] instgui halt requested — parking the machine (power off is safe)");
+        close();
+        loop {
+            crate::hlt();
+        }
     }
     match (st, c) {
         (State::Choose, b'\x1b') => close(),
@@ -351,6 +397,11 @@ pub fn consume_key(c: u8) -> bool {
             repaint();
         }
         (State::Choose, b'\r') | (State::Choose, b'\n') => {
+            // No disk, no warning screen — advancing to "erase what?" would be nonsense.
+            let mut devs: [Option<block::BlockDeviceInfo>; 2] = [None; 2];
+            if devices(&mut devs) == 0 {
+                return true;
+            }
             *STATE.lock() = State::Warn;
             repaint();
         }

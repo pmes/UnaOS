@@ -1209,6 +1209,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Enter on its warning screen is the ONLY trigger — the engine must not fire on its own.
         #[cfg(all(target_arch = "x86_64", feature = "installdemo", not(feature = "instgui")))]
         unaos_kernel::install::install_probe_once();
+        // INSTGUI: pick up disks that enumerate after the dialog opened (repaints only on change).
+        #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))]
+        unaos_kernel::video::instgui::service();
         // One-shot USB topology dump to serial (enumeration diagnosis; `usbinfo` shows it live).
         unaos_kernel::drivers::xhci::log_summary_once();
 
