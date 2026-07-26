@@ -402,12 +402,15 @@ fn components(rel: &str) -> impl Iterator<Item = &str> {
 /// it mounts through, so ONE `MountTable` can carry BOTH FAT volumes the Pi
 /// exposes at once — the SD boot partition ([`Default`](crate::fs::fat::BlockSource::Default),
 /// at `/fat`) and the hot-plugged USB stick ([`Usb`](crate::fs::fat::BlockSource::Usb),
-/// at `/usb`) — each reaching its own device. A `Usb`-sourced mount is **strictly
-/// read-only by construction** (PIUSB-27: the block layer's `write_sector`
-/// refuses any non-`Default` source, so no FAT/dir/data write can ever reach the
-/// stick); the adapter mirrors that guard at the VFS layer, refusing every write
-/// verb with [`VfsError::Unsupported`] BEFORE it touches the block path, so a
-/// caller gets a clean "read-only volume" answer rather than an opaque I/O error.
+/// at `/usb`) — each reaching its own device.
+///
+/// USBFALL F3 (was PIUSB-27): a `Usb`-sourced mount is **no longer read-only by
+/// construction**. USB-WRITE routed `fat::write_sector`'s `Usb` arm to the verified
+/// BOT WRITE(10) path, and [`FatBackend::read_only`] already reports `false` for
+/// every source on aarch64 — so FAT/dir/data writes DO reach the stick and the
+/// adapter passes write verbs through rather than refusing them. The residual cost
+/// is documented on `fat::with_fat_lock` (a `Usb` sector RMW is held under masked
+/// IRQs for the BOT deadline, not for a polled transfer).
 pub struct FatBackend {
     volume: String,
     /// The volume principal every object on this foreign volume inherits.

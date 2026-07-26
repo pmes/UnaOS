@@ -177,6 +177,45 @@ pub fn register_sd(dev: BlockDeviceInfo) {
     BACKEND.store(BACKEND_SD, Ordering::Release);
 }
 
+/// USBFALL F1: one-shot latch for the fail-closed refusal witness, so a write-heavy caller that keeps
+/// retrying cannot flood the console with the same line.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static SUBST_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// USBFALL F1: close the fail-OPEN backend substitution on the Pi bare-metal build.
+///
+/// On `aarch64 + baremetal` the canonical `Default` backend is the microSD: `emmc2::probe()` runs on the BSP
+/// synchronously (`main.rs`), long before any FAT-writing consumer, and flips `BACKEND` to `BACKEND_SD` from
+/// `register_sd`. If the card fails identify, `BACKEND` stays `BACKEND_XHCI` — and a later-enumerated USB
+/// stick populates the global `BLOCK_DEVICE` via `publish_usb_geometry`, at which point every
+/// `BlockSource::Default` WRITE silently lands on somebody's USB stick instead of the boot card. That is a
+/// fail-open SUBSTITUTION of one physical device for another, and it is what this refuses: on a build whose
+/// canonical backend is SD, a `Default` write with no registered SD returns `NotReady` and says so on serial
+/// once, producing an honest "no writable volume" boot instead of misdirected writes.
+///
+/// Deliberately WRITES ONLY. Reads may still fall through to the BOT path — a read cannot corrupt the wrong
+/// device, and the USB mount has its own dedicated `read_block_usb` handle regardless.
+///
+/// Deliberately `baremetal`-gated, NOT a blanket "xHCI writes are suspect" rule. On QEMU-virt aarch64
+/// (`test-arm`) and on x86 the SD backend is never compiled, xHCI IS the legitimate sole backend, and this
+/// function does not exist — those builds keep their pre-USBFALL write path byte-for-byte. The refusal is
+/// about substitution on a platform that has a canonical backend, not about xHCI.
+///
+/// Byte-inert on a healthy SD boot: `BACKEND_SD` is set before the first FAT write, so this returns `Ok`
+/// without touching the console.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn guard_default_write_backend() -> Result<(), BlockError> {
+    if BACKEND.load(Ordering::Acquire) == BACKEND_SD {
+        return Ok(());
+    }
+    if !SUBST_REFUSED.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            ":: USBFALL: no SD backend registered — refusing Default WRITE (would land on the USB stick) ::"
+        );
+    }
+    Err(BlockError::NotReady)
+}
+
 /// Read one block (`lba`) into `buf`. Locks BLOCK_DEVICE only briefly (to read geometry),
 /// then locks the xHCI controller — never both at once — so there is no nested-lock deadlock.
 /// Returns the number of bytes copied.
@@ -208,6 +247,11 @@ pub fn read_block(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 
 /// Write one block (`lba`) from `buf` (zero-padded to the block size).
 pub fn write_block(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    // USBFALL F1: fail CLOSED rather than substituting the USB stick for a missing SD card. See
+    // `guard_default_write_backend` — compiled only where SD is the canonical backend (Pi bare-metal).
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    guard_default_write_backend()?;
+
     let dev = info().ok_or(BlockError::NotReady)?;
     if lba >= dev.num_blocks {
         return Err(BlockError::BadLba);

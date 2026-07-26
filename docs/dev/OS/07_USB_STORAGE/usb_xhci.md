@@ -1945,6 +1945,53 @@ SUCCESS, the `usb-tablet` report-pointer path arms unchanged. `./arroyo test-arm
 
 ---
 
+## 11. USBFALL — fail-closed backend substitution + an honest FAT lock span
+
+USB-WRITE made `BlockSource::Usb` writable. Two things had quietly gone stale behind that change; USBFALL
+fixes both without touching the xHCI driver or the BOT deadline.
+
+**F1 — the `Default` write no longer falls through to the stick.** On `aarch64 + baremetal` the canonical
+block backend is the microSD: `emmc2::probe()` runs on the BSP synchronously, before any FAT-writing
+consumer, and `register_sd` flips `BACKEND` to `BACKEND_SD`. If the card fails identify, `BACKEND` stays
+`BACKEND_XHCI`, a later-enumerated USB stick populates the global `BLOCK_DEVICE` through
+`publish_usb_geometry`, and from then on every `BlockSource::Default` **write** silently lands on the
+stick — one physical device substituted for another, with no error anywhere. `write_block` now calls
+`guard_default_write_backend` first: with no SD registered it returns `BlockError::NotReady` and prints
+`:: USBFALL: no SD backend registered — refusing Default WRITE … ::` once. A failed identify produces an
+honest no-writable-volume boot instead of misdirected writes. Reads deliberately still fall through (a read
+cannot corrupt the wrong device, and the USB mount has its own `read_block_usb` handle). The guard is
+`baremetal`-gated on purpose: on QEMU-virt aarch64 (`test-arm`) and on x86 the SD backend is never compiled,
+xHCI **is** the legitimate sole backend, and the function does not exist — those builds are byte-identical
+to pre-USBFALL. The rule is about substitution on a platform that has a canonical backend, not about xHCI.
+
+**F2 — the lock span, stated per source.** `fat.rs`'s `with_fat_lock` justified holding `FAT_MUTATION`
+across block I/O with "the aarch64 I/O is polled, so the span is a couple of bounded polled sector
+transfers". That premise is source-blind. On `BlockSource::Usb` the same RMW runs
+`write_block_usb → storage_write10 → scsi_write10 → bot_transfer → pump_until_bot_done`, whose deadline is
+`hw_wait_budget() * 3` = 450 M CNTVCT ticks (~8 s at 54 MHz) and whose pump body executes `wfi` under the
+`PSTATE.I` this very hold masked. It is bounded and it is not a deadlock — WFI wakes on a pending physical
+interrupt with I set — but a failing transfer means a multi-second non-preemptible hold (×`num_fats`) with
+the scheduler stopped. The LOCK SPAN paragraph now states `Default` and `Usb` separately, and every `FatFs`
+call site takes the lock through `with_fat_lock_src`/`with_dir_lock_src`, which carry the `BlockSource`
+explicitly so a newly added source must answer the paragraph rather than inherit the polled premise. The
+span itself is unchanged (narrowing it for one source would fork the RMW's atomicity argument; shortening
+the deadline belongs to the xHCI layer). What is added is evidence: `note_masked_usb_hold` witnesses the
+first masked-IRQ hold taken on a `Usb` volume, behind `UNAOS_WITNESS` — compiled out of a default-quiet
+build. **Still owed from metal:** the actual stall on a *failing* BOT write under a held FAT lock; QEMU's
+BOT does not fail the way a real stick does.
+
+**F3 — the stale read-only assertions retired.** `fat.rs`'s `BlockSource` doc, both `piusb27_*` mount
+comments, `fs/vfs.rs`'s `FatBackend` doc and `genet.rs`'s `/fs/usb` route comment each still claimed the
+PIUSB-27 invariant that `write_sector` refuses any non-`Default` source and no write can reach the stick.
+USB-WRITE removed it; `FatBackend::read_only` already returns `false` for every source on aarch64. Each now
+says what is true, and distinguishes "this route only reads" from "this source cannot be written".
+
+**Gates (USBFALL).** `./arroyo check` green both arches; `./arroyo kernel8` clean; `./arroyo kernel8-test 90`
+MBENCH PASS 80/80 required, 0 forbidden; `./arroyo test-arm` MISSION SUCCESS. No USBFALL line appears in
+either log — byte-inert on the healthy-SD boot path, which is the point.
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).
