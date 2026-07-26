@@ -2383,19 +2383,70 @@ knob-off media are byte-identical. **Test-only; never on boot media.**
   metal can read recovery **frequency** and not just presence.
 - `botfaultinject` feature + `UNAOS_BOTFAULT` knob (`arroyo`, `builder`, kernel
   `Cargo.toml`).
+- BOTEV (instrumentation, no behaviour change): `ep_state_of` / `ep_ctx_deq` /
+  `recover_cmd` (`drivers/xhci/mod.rs`) — bounded context reads and the
+  `(ok, cc, why)` rendering of one recovery command; `TransferRing::contains`
+  (`drivers/xhci/ring.rs`) — names the pipe a stranded TRB belongs to;
+  `io_cause_witness` (`drivers/block.rs`) — the once-per-direction concrete cause behind
+  `BlockError::Io`.
 
 ### Witnesses
 
 ```
 :: BOT: recover begin cause=… slot=… ep=…/… iface=… n=… ::
+:: BOT: recover entry epin=… epout=… indci=… outdci=… cmdring=running|stopped ::
+:: BOT: recover stage=msc-reset iface=… ok=yes|no cc=… why=… epin=…->… epout=…->… ::
+:: BOT: recover stage=clear-halt ep=0x… dci=… ok=yes|no cc=… why=… epstate=…->… ::
+:: BOT: resync stage=reset-ep|stop-ep|skip dci=… dir=in|out ok=yes|no cc=… why=… epstate=…->… ::
+:: BOT: resync stage=set-deq dci=… dir=in|out ok=yes|no cc=… why=… epstate=…->… want=0x… ctxdeq=0x…->0x… ::
+:: BOT: resync stage=read-state dci=… dir=in|out ok=no why=no-output-context|ep-unusable[ epstate=…->…] ::
+:: BOT: resync note dci=… dir=in|out illegal-reset-on-state|illegal-stop-on-state read=… now=… — Context State Error on Reset Endpoint|Stop Endpoint ::
 :: BOT: recover done reset=ok|fail halts=cleared|fail ring=resync|fail ::
+:: BOT: recover evidence cause=… pipe=in|out|unknown|none wait_trb=0x… stage_done=yes|no stage_cc=… csw_sig=0x… csw_tag=0x… residue=… csw_status=… epin=… epout=… ::
 :: BOT: retry result=pass|fail … recoveries=… retry_ok=… retry_fail=… ::
 :: BOT: fault-inject synthetic CSW-stage failure (slot …, once) ::   (UNAOS_BOTFAULT only)
+:: BLK: io-cause op=read|write|read-usb|write-usb lba=… bot_err=… (first, once) ::
+:: BLK: io-cause op=read|write|read-usb|write-usb lba=… csw_status=… residue=… (first, once) ::
 ```
 
-Quiet boot: **zero** of these lines when nothing fails — all four are printed only from
-the failure path, and the counters stay at 0, so any non-zero reading is itself the
-finding.
+Quiet boot: **zero** of these lines when nothing fails — every one is printed only from a
+failure path, and the counters stay at 0, so any non-zero reading is itself the finding.
+
+**BOTEV — reading the evidence fields.** The 2026-07-26 rMBP capture reported
+`recover done reset=fail halts=fail` with no way to tell *why*; the stage lines above close
+that gap without touching the recovery sequence.
+
+- `epstate` / `epin` / `epout` — the EP State field of the endpoint's OUTPUT context
+  (xHCI 1.2 §6.2.3: `0`=Disabled `1`=Running `2`=Halted `3`=Stopped `4`=Error, `255`=no
+  output context), sampled immediately **before** and **after** each stage. A stage that
+  reports `ok=yes` but leaves the state unchanged is doing nothing.
+- `cc` / `why` — the outcome of the one bounded command or control transfer the stage
+  issues. `why=ok` (cc 1 = Success); `why=cc-error` — it completed with an error code, and
+  `cc` names it (`19` = Context State Error, i.e. the command was illegal from the state
+  the controller actually held); `why=nocompletion` — **no completion event arrived inside
+  the wall-clock budget**, so `cc` is meaningless and the ring/pipe is not being consumed;
+  `why=cmdring-stopped` — the command ring is parked by an abort in progress and the
+  command was never pushed.
+- `ctxdeq=A->B` on `set-deq` — the controller's own TR Dequeue Pointer from the output
+  context, before and after, against the `want=` value the command carried. Proves whether
+  Set TR Dequeue *moved* the controller or merely returned Success.
+- `recover evidence` — printed **once**, only when `recover done` reports any `fail`. It
+  carries the failed transaction's own state: `pipe`/`wait_trb` = which bulk ring held the
+  stranded TRB the timed-out stage was waiting on; `stage_done`/`stage_cc` = whether that
+  stage ever reported a completion; `csw_sig`/`csw_tag`/`residue`/`csw_status` = the CSW
+  buffer as the controller left it. A CSW signature of `0x53425355` here means the status
+  actually landed and only its event went missing — a different fault from a pipe that
+  never answered (signature `0x0`, the pre-transfer zero fill).
+- `:: BLK: io-cause … ::` — the concrete SCSI/BOT reason for a block failure, latched to
+  the first read failure and the first write failure of a boot. `BlockError::Io` and
+  `FatError::Io` discard it one frame below, which is why the flight recorder could only
+  say `:: FR: UNAOS.LOG reservation failed (Io) ::`. Pure logging: the returned error is
+  unchanged.
+
+All of this is instrumentation only — no retry was added, no wait was lengthened, and the
+command sequence is byte-for-byte the one described above. The `resync note` lines record
+the documented illegal-command-for-state case as *evidence*; correcting the sequence is a
+later arc, gated on an evidence boot.
 
 ### What metal must verify
 

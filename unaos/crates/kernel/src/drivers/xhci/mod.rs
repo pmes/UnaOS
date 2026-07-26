@@ -4409,6 +4409,56 @@ impl XhciController {
         again
     }
 
+    /// BOTEV: read one endpoint's EP State field from the OUTPUT device context (xHCI 1.2 §6.2.3,
+    /// Endpoint Context dword 0 bits 2:0; 0=Disabled 1=Running 2=Halted 3=Stopped 4=Error).
+    /// Returns `0xFF` when the slot has no output context (nothing to read). One bounded volatile
+    /// read, no command, no wait — safe to call before and after every recovery stage.
+    fn ep_state_of(&self, slot_id: u8, dci: u8) -> u8 {
+        let oc = self.slots[slot_id as usize].output_context;
+        if oc.is_null() {
+            return 0xFF;
+        }
+        (unsafe { core::ptr::read_volatile((oc as *const u32).add(dci as usize * CTX_WORDS)) } & 0x7) as u8
+    }
+
+    /// BOTEV: the controller's own TR Dequeue Pointer for one endpoint, out of the OUTPUT device
+    /// context (xHCI 1.2 §6.2.3, Endpoint Context dwords 2:3 — bit 0 is the Dequeue Cycle State,
+    /// kept here because a witness wants the raw field). `0` when the slot has no output context.
+    /// Two bounded volatile reads; this is how a boot capture shows whether Set TR Dequeue actually
+    /// moved the controller, rather than merely returning success.
+    fn ep_ctx_deq(&self, slot_id: u8, dci: u8) -> u64 {
+        let oc = self.slots[slot_id as usize].output_context;
+        if oc.is_null() {
+            return 0;
+        }
+        let base = unsafe { (oc as *const u32).add(dci as usize * CTX_WORDS) };
+        let lo = unsafe { core::ptr::read_volatile(base.add(2)) } as u64;
+        let hi = unsafe { core::ptr::read_volatile(base.add(3)) } as u64;
+        lo | (hi << 32)
+    }
+
+    /// BOTEV: run ONE recovery-stage xHCI command and render its outcome for a witness:
+    /// `(ok, completion_code, why)`. A bare `Result` cannot distinguish the three ways a stage
+    /// fails, and the metal capture that motivated this arc reported only `fail`:
+    ///   * `why="ok"` — completion code 1 (Success).
+    ///   * `why="cc-error"` — the command completed, but with an error code (`cc` carries it; 19 =
+    ///     Context State Error, i.e. the command was illegal from the endpoint's actual state).
+    ///   * `why="nocompletion"` — no Command Completion Event arrived inside the wall-clock budget
+    ///     (`cc` is meaningless, reported 0): the command ring is not being consumed.
+    ///   * `why="cmdring-stopped"` — the command ring is parked by an abort in progress, so
+    ///     `run_command_sync` refuses before pushing anything.
+    /// No retry, no extra wait: exactly the one bounded `run_command_sync` the caller already made.
+    fn recover_cmd(&mut self, trb: Trb) -> (bool, u8, &'static str) {
+        if self.cmd_ring_stopped {
+            return (false, 0, "cmdring-stopped");
+        }
+        match self.run_command_sync(trb) {
+            Ok((1, _)) => (true, 1, "ok"),
+            Ok((cc, _)) => (false, cc, "cc-error"),
+            Err(()) => (false, 0, "nocompletion"),
+        }
+    }
+
     /// Bring ONE bulk endpoint back to a usable, resynchronised state after a failed BOT stage.
     ///
     /// Reads the endpoint's current EP State from the OUTPUT device context (xHCI 1.2 §6.2.3,
@@ -4424,33 +4474,75 @@ impl XhciController {
     /// dequeue pointer to the driver's enqueue pointer, discarding the stranded TRBs of the failed
     /// transaction and restoring the invariant that controller-dequeue == driver-enqueue on an idle
     /// ring. Every step is a single bounded `run_command_sync`; there is no loop.
+    ///
+    /// BOTEV: every stage is witnessed with its completion code AND the EP State before/after, so a
+    /// capture distinguishes "command ring dead" (`why=nocompletion`) from "command refused"
+    /// (`why=cc-error cc=19`) from "the state-aware arm chose wrong" (the `epstate` transition did
+    /// not happen). The command SEQUENCE is untouched by this instrumentation.
     fn resync_bulk_ep(&mut self, slot_id: u8, dci: u8, is_in: bool) -> bool {
-        let ep_state = {
-            let oc = self.slots[slot_id as usize].output_context;
-            if oc.is_null() {
-                return false;
-            }
-            unsafe { core::ptr::read_volatile((oc as *const u32).add(dci as usize * CTX_WORDS)) & 0x7 }
-        };
+        if self.slots[slot_id as usize].output_context.is_null() {
+            serial_println!(
+                ":: BOT: resync stage=read-state dci={} dir={} ok=no why=no-output-context ::",
+                dci, if is_in { "in" } else { "out" });
+            return false;
+        }
+        let dir = if is_in { "in" } else { "out" };
+        let ep_state = self.ep_state_of(slot_id, dci) as u32;
         let ctx = ((dci as u32) << 16) | ((slot_id as u32) << 24);
         match ep_state {
             2 | 4 => {
                 // Reset Endpoint (TRB type 14). TSP left 0: the device-side toggle was already
                 // reset by CLEAR_FEATURE(ENDPOINT_HALT) above, so the controller must reset its own.
-                if !matches!(self.run_command_sync(Trb { parameter: 0, status: 0, control: (14 << 10) | ctx }), Ok((1, _))) {
+                let (ok, cc, why) = self.recover_cmd(Trb { parameter: 0, status: 0, control: (14 << 10) | ctx });
+                let after = self.ep_state_of(slot_id, dci);
+                serial_println!(
+                    ":: BOT: resync stage=reset-ep dci={} dir={} ok={} cc={} why={} epstate={}->{} ::",
+                    dci, dir, if ok { "yes" } else { "no" }, cc, why, ep_state, after);
+                if !ok {
+                    if cc == 19 {
+                        // BOTEV (evidence only, no behaviour change): Context State Error means the
+                        // controller's EP State was NOT the Halted/Error we read from the output
+                        // context — i.e. Reset Endpoint was illegal at the moment it was issued
+                        // (xHCI 1.2 §4.6.8: legal only from Halted/Error). Either the context read is
+                        // stale or the state changed under us. The fix arc follows the evidence boot.
+                        serial_println!(
+                            ":: BOT: resync note dci={} dir={} illegal-reset-on-state read={} now={} — Context State Error on Reset Endpoint ::",
+                            dci, dir, ep_state, after);
+                    }
                     serial_println!("xHCI: BOT recover: Reset Endpoint failed (slot {} dci {})", slot_id, dci);
                     return false;
                 }
             }
             1 => {
                 // Stop Endpoint (TRB type 15).
-                if !matches!(self.run_command_sync(Trb { parameter: 0, status: 0, control: (15 << 10) | ctx }), Ok((1, _))) {
+                let (ok, cc, why) = self.recover_cmd(Trb { parameter: 0, status: 0, control: (15 << 10) | ctx });
+                let after = self.ep_state_of(slot_id, dci);
+                serial_println!(
+                    ":: BOT: resync stage=stop-ep dci={} dir={} ok={} cc={} why={} epstate={}->{} ::",
+                    dci, dir, if ok { "yes" } else { "no" }, cc, why, ep_state, after);
+                if !ok {
+                    if cc == 19 {
+                        // BOTEV (evidence only): Stop Endpoint is legal only from Running
+                        // (xHCI 1.2 §4.6.9); a Context State Error says the endpoint was not
+                        // Running when the command executed, so the state-aware arm chose on a
+                        // stale read.
+                        serial_println!(
+                            ":: BOT: resync note dci={} dir={} illegal-stop-on-state read={} now={} — Context State Error on Stop Endpoint ::",
+                            dci, dir, ep_state, after);
+                    }
                     serial_println!("xHCI: BOT recover: Stop Endpoint failed (slot {} dci {})", slot_id, dci);
                     return false;
                 }
             }
-            3 => {}
+            3 => {
+                serial_println!(
+                    ":: BOT: resync stage=skip dci={} dir={} ok=yes cc=0 why=already-stopped epstate={}->{} ::",
+                    dci, dir, ep_state, ep_state);
+            }
             _ => {
+                serial_println!(
+                    ":: BOT: resync stage=read-state dci={} dir={} ok=no why=ep-unusable epstate={}->{} ::",
+                    dci, dir, ep_state, ep_state);
                 serial_println!("xHCI: BOT recover: endpoint unusable (slot {} dci {} state {})", slot_id, dci, ep_state);
                 return false;
             }
@@ -4464,11 +4556,24 @@ impl XhciController {
             let ring = if is_in { slot.bulk_in_ring.as_ref() } else { slot.bulk_out_ring.as_ref() };
             match ring {
                 Some(r) => { let (phys, dcs) = r.dequeue_reset_target(); phys | (dcs as u64) }
-                None => return false,
+                None => {
+                    serial_println!(
+                        ":: BOT: resync stage=set-deq dci={} dir={} ok=no why=no-ring ::", dci, dir);
+                    return false;
+                }
             }
         };
+        let before_state = self.ep_state_of(slot_id, dci);
+        let before_deq = self.ep_ctx_deq(slot_id, dci);
         // Set TR Dequeue Pointer (TRB type 16); Stream ID 0 for a non-streaming bulk endpoint.
-        if !matches!(self.run_command_sync(Trb { parameter: deq, status: 0, control: (16 << 10) | ctx }), Ok((1, _))) {
+        let (ok, cc, why) = self.recover_cmd(Trb { parameter: deq, status: 0, control: (16 << 10) | ctx });
+        let after_state = self.ep_state_of(slot_id, dci);
+        let after_deq = self.ep_ctx_deq(slot_id, dci);
+        serial_println!(
+            ":: BOT: resync stage=set-deq dci={} dir={} ok={} cc={} why={} epstate={}->{} want={:#x} ctxdeq={:#x}->{:#x} ::",
+            dci, dir, if ok { "yes" } else { "no" }, cc, why,
+            before_state, after_state, deq, before_deq, after_deq);
+        if !ok {
             serial_println!("xHCI: BOT recover: Set TR Dequeue failed (slot {} dci {} deq {:#x})", slot_id, dci, deq);
             return false;
         }
@@ -5297,26 +5402,66 @@ impl XhciController {
             ":: BOT: recover begin cause={:?} slot={} ep={:#x}/{:#x} iface={} n={} ::",
             cause, slot_id, in_ep, out_ep, intf, BOT_RECOVER_COUNT.load(Ordering::Relaxed));
 
+        // BOTEV: snapshot the failed transaction's stage state BEFORE it is dropped — the pending
+        // record is the only in-kernel trace of which TRB the timed-out stage was waiting on. Read
+        // only; the clear below is unchanged.
+        let failed = self.bot_pending;
         // Any half-armed pending stage from the failed transaction must not be matched against an
         // event raised during recovery's own control transfers.
         self.bot_pending = None;
 
+        // BOTEV: EP State of both bulk endpoints as recovery FINDS them (xHCI 1.2 §6.2.3:
+        // 0=Disabled 1=Running 2=Halted 3=Stopped 4=Error). A plain timeout should leave them
+        // Running; a stall should leave the faulted one Halted. Anything else means the driver's
+        // model of the pipe is wrong before a single recovery command is issued.
+        let (in_s0, out_s0) = (self.ep_state_of(slot_id, in_dci), self.ep_state_of(slot_id, out_dci));
+        serial_println!(
+            ":: BOT: recover entry epin={} epout={} indci={} outdci={} cmdring={} ::",
+            in_s0, out_s0, in_dci, out_dci,
+            if self.cmd_ring_stopped { "stopped" } else { "running" });
+
         // 1) Bulk-Only Mass Storage Reset (class, targets the MSC interface).
-        let reset_ok = match self.sync_control(slot_id, 0x21, 0xFF, 0x0000, intf as u16, 0, 0, false) {
+        let reset_res = self.sync_control(slot_id, 0x21, 0xFF, 0x0000, intf as u16, 0, 0, false);
+        let reset_ok = match reset_res {
             Ok(1) => { serial_println!("xHCI: [usbw] Bulk-Only Mass Storage Reset OK (slot {})", slot_id); true }
             other => { serial_println!("xHCI: [usbw] Bulk-Only Mass Storage Reset unexpected {:?}", other); false }
         };
+        {
+            // BOTEV: the class reset rides EP0, so its failure has three shapes — an error
+            // completion code, a control transfer that never completed, or a missing EP0 ring.
+            let (cc, why) = match reset_res {
+                Ok(1) => (1u8, "ok"),
+                Ok(c) => (c, "cc-error"),
+                Err(()) => (0, "nocompletion"),
+            };
+            serial_println!(
+                ":: BOT: recover stage=msc-reset iface={} ok={} cc={} why={} epin={}->{} epout={}->{} ::",
+                intf, if reset_ok { "yes" } else { "no" }, cc, why,
+                in_s0, self.ep_state_of(slot_id, in_dci),
+                out_s0, self.ep_state_of(slot_id, out_dci));
+        }
 
         // 2) CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints — IN first, then OUT (§5.3.3).
         let mut halts_ok = true;
-        for ep_addr in [in_ep, out_ep] {
-            match self.sync_control(slot_id, 0x02, 0x01, 0x0000, ep_addr as u16, 0, 0, false) {
+        for (ep_addr, dci) in [(in_ep, in_dci), (out_ep, out_dci)] {
+            let before = self.ep_state_of(slot_id, dci);
+            let r = self.sync_control(slot_id, 0x02, 0x01, 0x0000, ep_addr as u16, 0, 0, false);
+            match r {
                 Ok(1) => {}
                 other => {
                     serial_println!("xHCI: [usbw] CLEAR_FEATURE(HALT) ep {:#04x} unexpected {:?}", ep_addr, other);
                     halts_ok = false;
                 }
             }
+            let (cc, why) = match r {
+                Ok(1) => (1u8, "ok"),
+                Ok(c) => (c, "cc-error"),
+                Err(()) => (0, "nocompletion"),
+            };
+            serial_println!(
+                ":: BOT: recover stage=clear-halt ep={:#x} dci={} ok={} cc={} why={} epstate={}->{} ::",
+                ep_addr, dci, if matches!(r, Ok(1)) { "yes" } else { "no" }, cc, why,
+                before, self.ep_state_of(slot_id, dci));
         }
 
         // 3) xHCI-side endpoint + ring resynchronisation (state-aware: Reset vs Stop Endpoint).
@@ -5331,6 +5476,44 @@ impl XhciController {
             if ring_ok { "resync" } else { "fail" });
 
         let ok = reset_ok && halts_ok && ring_ok;
+        if !ok {
+            // BOTEV: ONE follow-up line carrying the failed transaction's own state — which pipe its
+            // stranded TRB sat on, whether its stage ever reported done and with what completion
+            // code, and the CSW buffer as the controller left it (the CSW is DMA-written, so on a
+            // timeout it is normally still the pre-transfer zero fill; a VALID signature here means
+            // the status actually landed and only the event went missing — a completely different
+            // fault). Reads only; the CSW buffer is invalidated first because the controller may
+            // have written it behind our cache (no-op on x86).
+            let (ring_name, wait_trb, stage_done, stage_cc) = match failed {
+                Some(p) => {
+                    let slot = &self.slots[slot_id as usize];
+                    let name = if slot.bulk_in_ring.as_ref().is_some_and(|r| r.contains(p.wait_trb_phys)) {
+                        "in"
+                    } else if slot.bulk_out_ring.as_ref().is_some_and(|r| r.contains(p.wait_trb_phys)) {
+                        "out"
+                    } else {
+                        "unknown"
+                    };
+                    (name, p.wait_trb_phys, p.done, p.completion_code)
+                }
+                None => ("none", 0, false, 0),
+            };
+            let (sig, ctag, residue, bstatus) = match self.slots[slot_id as usize].csw_buffer {
+                Some(p) => unsafe {
+                    dma_coherency::inval(p as usize, 13);
+                    let c = core::slice::from_raw_parts(p as *const u8, 13);
+                    let rd = |o: usize| (c[o] as u32) | ((c[o + 1] as u32) << 8)
+                        | ((c[o + 2] as u32) << 16) | ((c[o + 3] as u32) << 24);
+                    (rd(0), rd(4), rd(8), c[12])
+                },
+                None => (0, 0, 0, 0xFF),
+            };
+            serial_println!(
+                ":: BOT: recover evidence cause={:?} pipe={} wait_trb={:#x} stage_done={} stage_cc={} csw_sig={:#x} csw_tag={:#x} residue={} csw_status={} epin={} epout={} ::",
+                cause, ring_name, wait_trb, if stage_done { "yes" } else { "no" }, stage_cc,
+                sig, ctag, residue, bstatus,
+                self.ep_state_of(slot_id, in_dci), self.ep_state_of(slot_id, out_dci));
+        }
         if ok {
             BOT_RECOVER_OK.fetch_add(1, Ordering::Relaxed);
         }

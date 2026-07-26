@@ -31,6 +31,38 @@ pub enum BlockError {
     BadLba,
 }
 
+/// BOTEV: one-shot latches for the "concrete cause" witness below. `BlockError::Io` is the coarse
+/// verdict every FAT-layer error collapses to (`FatError::Io`), which is why the flight recorder
+/// could only report `:: FR: UNAOS.LOG reservation failed (Io) ::` on metal — the SCSI/BOT reason
+/// (a `BotError` variant, or a non-`Passed` CSW with its residue) was discarded one frame below.
+/// Latched per direction so the FIRST read failure and the FIRST write failure each get exactly one
+/// line for the whole boot: enough to name the cause, incapable of flooding a wedged pipe's log.
+static IO_WITNESS_READ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static IO_WITNESS_WRITE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// BOTEV: print the concrete SCSI/BOT cause of ONE failed block operation, at most once per
+/// direction per boot, then let the caller collapse it to `BlockError::Io` exactly as before. A
+/// `bot_err` names the transport fault (`Timeout` = the pipe the BOT recovery witnesses describe);
+/// a `csw_status` names a completed transaction the DEVICE rejected, with its residue. Pure
+/// logging: no retry, no state change, no bearing on the returned error.
+fn io_cause_witness(
+    op: &str,
+    lba: u64,
+    outcome: Result<crate::drivers::xhci::BotResult, crate::drivers::xhci::BotError>,
+) {
+    let latch = if op.as_bytes().first() == Some(&b'r') { &IO_WITNESS_READ } else { &IO_WITNESS_WRITE };
+    if latch.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    match outcome {
+        Ok(res) => serial_println!(
+            ":: BLK: io-cause op={} lba={} csw_status={:?} residue={} (first, once) ::",
+            op, lba, res.status, res.residue),
+        Err(e) => serial_println!(
+            ":: BLK: io-cause op={} lba={} bot_err={:?} (first, once) ::", op, lba, e),
+    }
+}
+
 /// Geometry + identity of the enumerated mass-storage device.
 #[derive(Clone, Copy)]
 pub struct BlockDeviceInfo {
@@ -99,7 +131,10 @@ pub fn read_block_usb(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
     let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
     match xhci.storage_read10(lba as u32, 1) {
         Ok(res) if res.status == CswStatus::Passed => {}
-        _ => return Err(BlockError::Io),
+        other => {
+            io_cause_witness("read-usb", lba, other);
+            return Err(BlockError::Io);
+        }
     }
     let src = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
     let n = (dev.block_size as usize).min(buf.len());
@@ -133,7 +168,10 @@ pub fn write_block_usb(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     }
     match xhci.storage_write10(lba as u32, 1) {
         Ok(res) if res.status == CswStatus::Passed => Ok(()),
-        _ => Err(BlockError::Io),
+        other => {
+            io_cause_witness("write-usb", lba, other);
+            Err(BlockError::Io)
+        }
     }
 }
 
@@ -198,7 +236,12 @@ pub fn read_block(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 
     match xhci.storage_read10(lba as u32, 1) {
         Ok(res) if res.status == CswStatus::Passed => {}
-        _ => return Err(BlockError::Io),
+        other => {
+            // BOTEV: name the concrete SCSI/BOT cause once before it collapses into
+            // `BlockError::Io` / `FatError::Io`.
+            io_cause_witness("read", lba, other);
+            return Err(BlockError::Io);
+        }
     }
     let src = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
     let n = (dev.block_size as usize).min(buf.len());
@@ -233,6 +276,11 @@ pub fn write_block(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     }
     match xhci.storage_write10(lba as u32, 1) {
         Ok(res) if res.status == CswStatus::Passed => Ok(()),
-        _ => Err(BlockError::Io),
+        other => {
+            // BOTEV: this is the line that turns the flight recorder's `(Io)` into a diagnosis —
+            // `/UNAOS.LOG`'s reservation writes come through here.
+            io_cause_witness("write", lba, other);
+            Err(BlockError::Io)
+        }
     }
 }

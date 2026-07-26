@@ -179,6 +179,13 @@ impl TransferRing {
         Some(idx)
     }
 
+    /// BOTEV: does `phys` address a TRB inside THIS ring? Pure predicate over `index_of`, no reads
+    /// of device memory. Used by the BOT recovery witness to name which pipe (bulk IN vs bulk OUT)
+    /// the timed-out transfer was waiting on, from nothing but the stranded TRB address.
+    pub fn contains(&self, phys: u64) -> bool {
+        self.index_of(phys).is_some()
+    }
+
     /// The cycle bit currently stored in the TRB at `phys` (1 if out of range — a safe
     /// default for composing a CRCR RCS). Used by the command-abort handshake.
     pub fn trb_cycle(&self, phys: u64) -> u32 {
