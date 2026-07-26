@@ -26,6 +26,22 @@ pub mod regs {
     // PDISPLAY — Display Engine
     pub const NV_PDISPLAY_BASE: usize = 0x0061_0000;
     pub const NV_PDISPLAY_SIZE: usize = 0x0001_0000; // Scan 64KB of display engine regs
+
+    /// Host register offset (from the Falcon unit base) → Falcon IO index.
+    ///
+    /// Microcode reaches the unit registers with `iowr`/`iord` on IO space, NOT
+    /// at the host MMIO offset. Metal-proven at s29: MAILBOX0 (host `+0x040`)
+    /// written via `iowrs I[0x1000]` returned the exact authored `F00DFACE`.
+    /// This has been derived wrong twice (pull 25's flat `0x40`, pull 33's raw
+    /// `0x800`/`0x804`) — derive ucode port immediates here, never by hand.
+    /// See `docs/dev/OS/08_VIDEO/falcon_microcode_spec.md` §3.
+    pub const fn falcon_io(host_off: u32) -> u32 {
+        (host_off & 0xffc) << 6
+    }
+
+    // The two mappings metal has proven, checked at compile time.
+    const _: () = assert!(falcon_io(0x040) == 0x1000); // MAILBOX0, s29
+    const _: () = assert!(falcon_io(0x044) == 0x1100); // MAILBOX1, s30 heartbeat
 }
 
 /// s26/s28 FTDI-ring budget: the 0x640000 window is PARKED (triple-refuted),
