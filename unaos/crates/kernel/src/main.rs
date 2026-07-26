@@ -87,6 +87,40 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         boot_info.framebuffer_info,
     );
 
+    // 0a. WRITER-SEED (x86). `video::WRITER` and fbcon are two handles to the SAME physical
+    //     framebuffer, and `WRITER` is the one every panel-geometry consumer reads (`wm`'s
+    //     composite path, `cursor`, `screen`, `wcx::activate`). Until this seam existed, x86
+    //     seeded it only far down `kernel_main` (step 3's `framebuffer_addr != 0` block), which is
+    //     AFTER the Kepler takeover runs — so `wcx::activate` found `is_ready() == false` and
+    //     declined the console window on metal (`[wc-x] activate DECLINE reason=fb-not-ready`)
+    //     while fbcon was fully live on the very same surface. A `WRITER` that lies about the
+    //     panel is a general defect, not a compositor one, so this is UNCONDITIONAL — not gated on
+    //     `wc`. It takes the identical BootInfo triple fbcon just took, so the two handles cannot
+    //     disagree by construction; `FrameBufferInfo.stride` is in PIXELS on both sides (the byte
+    //     pitch fbcon witnesses is `stride * bytes_per_pixel`, derived at print time), so there is
+    //     no unit conversion to get wrong. Precedent: the aarch64 tegra path already pairs
+    //     `fbcon::init` with the same `WRITER.lock().init` on the same triple (JD2, below); the
+    //     later step-3 seeding stays exactly as it is and is now an idempotent re-init.
+    #[cfg(target_arch = "x86_64")]
+    if boot_info.framebuffer_addr != 0 && boot_info.framebuffer_size != 0 {
+        unaos_kernel::video::WRITER.lock().init(
+            boot_info.framebuffer_addr as usize,
+            boot_info.framebuffer_size,
+            boot_info.framebuffer_info,
+        );
+        let i = boot_info.framebuffer_info;
+        serial_println!(
+            ":: video: WRITER seeded base={:08X} len={} panel={}x{} stride={}px pitch={}B bpp={} ::",
+            boot_info.framebuffer_addr,
+            boot_info.framebuffer_size,
+            i.width,
+            i.height,
+            i.stride,
+            i.stride * i.bytes_per_pixel,
+            i.bytes_per_pixel,
+        );
+    }
+
     // 0b. Jetson Orin Nano (tegra): install the kernel's own MMU (JM3), bring up the GIC + timer on the
     //     boot core (JM4), then drop EL2 -> EL1 and run the scheduler + CAPSTONE at EL1 (JM6). The
     //     UEFI-handoff tables map RAM but NOT the Tegra peripheral MMIO (JM2 R4: the kernel faulted on its
