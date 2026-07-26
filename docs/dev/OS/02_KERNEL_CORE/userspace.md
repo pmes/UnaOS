@@ -545,8 +545,9 @@
   1 brad/frame), runs to `AUTO_FRAMES` = 300 total, FNV-1a-checksums the final surface, and prints the **unchanged
   witness** `:: UVUG: frames=300 threads=2 checksum=<hex> ::` before exiting 0 (the checksum is a pure function
   of the frame-300 geometry, so it is deterministic and thread-interleaving-independent). The interactive path is
-  metal-only, runs until an exit event (bounded by `INTERACTIVE_CAP` = 36000 frames), and prints
-  `:: UVUG: interactive exit=<key|click> frames=<n> ::`. The program is now written in Rust (a tiny `_start` in
+  metal-only, runs until an exit event, and prints `:: UVUG: interactive exit=<key|frames …> frames=<n> ::`.
+  (`INTERACTIVE_CAP` = 36000 frames is still a bound in **fixture mode** — a foreground launch — but a
+  detached/desktop vug waives it and runs unbounded; see **VUGLIFE** below.) The program is now written in Rust (a tiny `_start` in
   `.text.entry` + the worker entry, syscalls via inline-asm helpers) rather than a single asm stream, staying
   position-independent (relocation-model=static → adrp/add, **zero relocations** in the linked image; verified)
   and fitting the 16 KiB window (12568-byte ELF, two PT_LOAD segments, per-segment W^X). QEMU-verified
@@ -1764,6 +1765,36 @@
   arches; `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 90` + `mbench --replay` **77/77
   including the COMPLETE markers, 0 forbidden** (the `UVUG:` / `EXEC-UVUG:` / BGRUN-ST witnesses all
   green); `./arroyo test-arm` MISSION SUCCESS.
+
+- **VUGLIFE (desktop vugs stop dying of old age)** — an **app-only** arc: `crates/user-vug` + this doc, no
+  kernel change. P64 attended metal: four vugs "crashed" as the operator tabbed between them. The wire
+  again showed no panic and no fault — it showed
+  `:: UVUG: interactive exit=frames frames=<N> ::` four times, `N` = 36000 … 271484. The cause is
+  `INTERACTIVE_CAP`, the last surviving **demo-era run deadline**, and the interaction that makes it lethal
+  is subtle: under **VUG-BG** a DETACHED vug runs its auto path *uncapped*, so a desktop vug can sit at
+  hundreds of thousands of frames; the cap is only ever tested on the interactive branch, so it is tested
+  for the very first time at the instant the operator TABS TO THE WINDOW and the first input event flips
+  `interactive` on — and the program exits immediately. Hence `N` far above the 36000 cap, and hence
+  "it crashes when I touch it". Same relic family as **VUGCLICK**: a designed exit that a long-lived
+  windowed desktop turned into a crash. **Change — split by LAUNCH MODE, using state the program already
+  has** (the info-page `DETACHED` bit at `base + 0x4000`, offset `0x20`, bit 0), not a kernel-side special
+  case:
+  - **Detached (`bg /fat/VUG.ELF` — the desktop spawn): UNBOUNDED.** It exits on **ESC** or `kill`, never
+    on a frame counter. At the frame the old cap would have fired it prints exactly one
+    `[vuglife] budget waived (interactive) frames=<n>` line (latched, not per-frame) — a positive witness,
+    so the next attended boot **proves** the waiver fired instead of inferring it from an absence.
+  - **Foreground (`run`, and every fixture/battery launch): the bounded budget STAYS.** Gate liveness
+    depends on a vug that terminates and the batteries drive foreground launches, so nothing that could
+    hang `kernel8-test` was relaxed. When that exit is taken the reason now names its own cause:
+    `:: UVUG: interactive exit=frames (budget, fixture mode) frames=<n> ::`.
+
+  **Untouched by construction:** the deterministic auto path (`AUTO_FRAMES` = 300 and the checksum
+  witness), UVUG-8's takeover/deadline logic, and the `EL0_FOCUSED_PRESENT_COUNT` cap. **Gates:**
+  `./arroyo check` green both arches; `./arroyo kernel8` clean; `UNAOS_FBW=1920 UNAOS_FBH=1200
+  ./arroyo kernel8-test 90` → **84/84 required witnesses, 0 forbidden**, with
+  `:: UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c ::` byte-identical and the BGRUN-ST /
+  `EXEC-UVUG` legs unchanged in timing. The waived-budget path is metal-only (no HID in QEMU → no
+  interactive mode), so it is **unverified in QEMU by nature** and is for the next attended boot to confirm.
 
 ### x86_64 (branch `hw-rmbp`)
 

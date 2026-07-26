@@ -58,8 +58,29 @@
 //     arrived on metal), cancels the auto-tumble and the 300-frame cap, and switches to held-state
 //     control — WASD/arrows rotate (TRUE held state from KeyDown/KeyUp), Q/E zoom, a mouse drag rotates
 //     (per-frame clamped delta, full-panel-drag ≈ one revolution), a click toggles pause, ESC exits. It
-//     runs until ESC (bounded only by INTERACTIVE_CAP = 36000 frames as a safety) and prints
-//     `:: UVUG: interactive exit=<key|frames> frames=<n> ::`. Interactive is metal-only (no HID in QEMU).
+//     runs until ESC and prints `:: UVUG: interactive exit=<key|frames …> frames=<n> ::`.
+//     Interactive is metal-only (no HID in QEMU).
+//
+// VUGLIFE — DESKTOP VUGS DO NOT DIE OF OLD AGE. INTERACTIVE_CAP was the last surviving demo-era run
+// deadline, and it killed exactly the vugs an operator was using. The kill is worse than the number
+// suggests: a DETACHED vug already runs its auto path uncapped (VUG-BG), so it can sit on the desktop
+// for hundreds of thousands of frames — and the moment the operator TABS TO IT, the first input event
+// flips `interactive` on, the already-past cap is tested for the first time, and the program exits
+// instantly. That is P64's "the vugs crash as I tab": four deaths, all
+// `:: UVUG: interactive exit=frames frames=<36000..271484> ::`, no fault anywhere on the wire — the
+// same shape as the VUGCLICK relic, a designed exit that a long-lived desktop turned into a crash.
+//
+// The split is by LAUNCH MODE, which the program can already see (the info-page DETACHED bit), not by
+// a kernel-side special case:
+//   * DETACHED (`bg /fat/VUG.ELF` — the desktop spawn): UNBOUNDED. It exits on ESC or `kill`, never on
+//     a frame counter. At the frame the old cap would have fired it prints ONE
+//     `[vuglife] budget waived (interactive) frames=<n>` line and keeps running, so the next attended
+//     boot PROVES the waiver fired rather than inferring it from an absence.
+//   * FOREGROUND (`run`, and every fixture/battery launch — `uvug_witness`, BGRUN-ST): the bounded
+//     budget STAYS. Gate liveness depends on a vug that terminates, and a foreground run is exactly
+//     what the batteries drive. When that exit is taken it now says
+//     `exit=frames (budget, fixture mode)`, so no future sitting re-diagnoses this as a crash.
+// The deterministic AUTO path (AUTO_FRAMES = 300, the checksum witness) is untouched in both modes.
 //
 // Barrier direction split (deliberate, robust under QEMU raspi4b's lack of a Group-1 timer IRQ — see
 // docs userspace.md M6e): ARRIVAL (worker -> parent) is a real FUTEX (workers atomically bump `done` +
@@ -285,7 +306,9 @@ static mut PY: [i32; 14] = [0; 14]; // projected pixel Y per vertex
 
 const PHASE_EXIT: u32 = u32::MAX;
 const AUTO_FRAMES: u32 = 300; // deterministic QEMU path length (used only while no input ever arrives)
-const INTERACTIVE_CAP: u32 = 36000; // interactive safety bound
+// VUGLIFE: the interactive budget. It is a real deadline ONLY in fixture mode (a foreground launch —
+// `run`, and every battery leg); a detached/desktop vug waives it once and runs unbounded.
+const INTERACTIVE_CAP: u32 = 36000; // interactive frame budget (fixture mode); waived when detached
 
 // Drag-rotate sensitivity (UVUG-4). The kernel game-mode (vug.rs) maps pointer motion 1 px = 1 brad
 // with no scaling; Peter found that too twitchy. The panel is ~1920 px wide (mailbox FALLBACK_W), so we
@@ -796,6 +819,8 @@ pub extern "C" fn _start() -> ! {
     let mut exit_key = false;
     // VUGCLICK: rotation pause, toggled by a click. Purely cosmetic and interactive-only.
     let mut paused = false;
+    // VUGLIFE: one-shot latch for the waived-budget witness (detached/interactive only).
+    let mut budget_waived = false;
 
     let mut frame: u32 = 0;
     loop {
@@ -948,9 +973,27 @@ pub extern "C" fn _start() -> ! {
 
         // --- exit conditions ---
         if interactive {
-            // VUGCLICK: ESC (or the safety cap) ends an interactive run. A click does not.
-            if exit_key || frame >= INTERACTIVE_CAP {
+            // VUGCLICK: ESC ends an interactive run. A click does not.
+            if exit_key {
                 break;
+            }
+            // VUGLIFE: the frame budget binds only a FIXTURE-mode (foreground) run. A detached vug is a
+            // desktop window with an operator in front of it: waive the budget once, say so on the wire,
+            // and keep tumbling until ESC or `kill`. The witness is one-shot — `budget_waived` latches —
+            // because the test is true on every frame after the cap, and a per-frame line would drown
+            // the serial log it exists to be found in.
+            if frame >= INTERACTIVE_CAP {
+                if !detached {
+                    break;
+                }
+                if !budget_waived {
+                    budget_waived = true;
+                    let mut wb = Buf::new();
+                    wb.put(b"[vuglife] budget waived (interactive) frames=");
+                    wb.put_dec(frame);
+                    wb.put(b"\n");
+                    wb.flush();
+                }
             }
         } else if !detached && frame >= AUTO_FRAMES {
             // No input has ever arrived (QEMU): the deterministic auto path ends at 300 frames — the
@@ -978,7 +1021,14 @@ pub extern "C" fn _start() -> ! {
         // VUGCLICK: the reason must be true. Pre-arc the only two spellings were `key` and `click`, so a
         // run that ran out its INTERACTIVE_CAP reported `click` — a click that never happened. With click
         // no longer an exit, the honest pair is `key` (ESC) and `frames` (the safety cap).
-        buf.put(if exit_key { b"key" } else { b"frames" });
+        // VUGLIFE: the `frames` spelling now names its own cause. Post-arc it can only be reached by a
+        // FOREGROUND (fixture/battery) run — a detached desktop vug waives the budget instead — so the
+        // line says so, and the next sitting that meets it need not re-derive that this was designed.
+        buf.put(if exit_key {
+            b"key" as &[u8]
+        } else {
+            b"frames (budget, fixture mode)"
+        });
         buf.put(b" frames=");
         buf.put_dec(frame);
         buf.put(b" ::\n");
