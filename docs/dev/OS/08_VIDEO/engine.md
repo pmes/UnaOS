@@ -2702,15 +2702,16 @@ find `DESKTOP_BG` byte-for-byte at 5/5 and 3/3 — the staged fill lands the ide
 ## 9. CRISPY-PI — the theme table (`video/theme.rs`)
 
 The Crispy desktop theme now exists kernel-side as a `const` table:
-`crates/kernel/src/video/theme.rs`. It carries the 18 palette roles (chrome face,
+`crates/kernel/src/video/theme.rs`. It carries the 21 palette roles (chrome face,
 the two bevels, frame keyline, the four title-gradient stops, the two title inks,
-button face/pressed/ink, content fill/ink, scroll track/thumb, accent) plus the
-gloss highlight and its two alpha scalars, and all eleven metrics (`frame`,
-`bevel`, `title_height`, `corner_radius`, `scrollbar_width`, `button_height`,
+button face/pressed/ink, content fill/ink, scroll track/thumb, accent, and the
+three circular title-bar controls) plus the gloss highlight and its three scalars,
+and all thirteen metrics (`frame`, `bevel`, `title_height`, `corner_radius`,
+`widget_radius`, `well_radius`, `scrollbar_width`, `button_height`,
 `button_pad_x`, `gap`, `control_box`, `text_px`, `line_height_pct`).
 
 **The shared-source law.** The source of record is `kits/crispy/theme.json` @
-`us-crispy` `08b42ede`, read on the host by `libs/quartzite/src/theme.rs`. Both
+`us-crispy-modern` `0787ba9f`, read on the host by `libs/quartzite/src/theme.rs`. Both
 arches — aarch64 Pi 4 and x86_64 — source their chrome and desktop constants from
 this one table, and the table mirrors that one json. No per-arch invented numbers.
 A value changes in the kit json first, then is re-lifted here.
@@ -2725,8 +2726,8 @@ rounding at authoring time is what keeps the kernel free of float at runtime.
 **How far the fidelity claim reaches.** Bit-for-bit agreement with a
 quartzite-drawn pixel holds for **flat fills** — any surface painted with a palette
 role at full opacity. It does *not* extend to the gloss ramp. Two independent
-reasons: a quantized endpoint is not the host's f32 (`0.55` as `u8` would be `140`,
-i.e. `0.54902`); and, more fundamentally, the host never rounds the endpoints at
+reasons: a quantized endpoint is not the host's f32 (`0.5` as `u8` would be `128`,
+i.e. `0.50196`); and, more fundamentally, the host never rounds the endpoints at
 all — it interpolates in f32 across the ramp and rounds each *composited per-pixel*
 alpha, which no table of endpoint constants can reproduce by itself. Matching it is
 a property of the interpolator the wiring arc writes. The three gloss scalars are
@@ -2745,9 +2746,10 @@ multi-octave noise generator, a rasterizer concern. It belongs beside the
 surface/material code when it lands, reading `base_rgb` from `CONTENT_FILL` (the
 two agree by construction). This table stays palette + metrics only.
 
-**Taste gate is OPEN.** These values are provisional-but-current — the visual
-verdict has not been taken. Because every consumer will read the names and never
-the literals, a verdict change edits that one file.
+**Taste gate is CLOSED — APPROVED** (iteration 3, Peter, 2026-07-26). The visual
+verdict has been taken on the kit these numbers come from, so they are no longer
+provisional. Because every consumer will read the names and never the literals, a
+later verdict change still edits that one file.
 
 **Wiring is a follow-up arc.** Nothing consumes the table yet; `wm.rs`,
 `screen.rs` and fbcon are untouched by CRISPY-PI. The module is byte-inert by
@@ -2755,6 +2757,69 @@ construction (all `const`, no statics, no code, compile-time-only assertions), a
 that was verified rather than assumed: `target/pi_baremetal/kernel8.img` hashes
 identically with and without the change. `./arroyo check` clean on both arches;
 `./arroyo kernel8-test 90` MBENCH 80/80 required witnesses, 0 forbidden.
+
+#### CRISPY-PI-2 — the re-lift from the approved kit
+
+CRISPY-PI lifted `us-crispy` `08b42ede` with the taste gate open, and said in as many
+words that a verdict change would edit that one file. The verdict came in on
+**iteration 3** (Peter, 2026-07-26) and moved the source of record to
+`us-crispy-modern` `0787ba9f`. CRISPY-PI-2 is that edit, and it is the shared-source
+law working as designed: the kit changed first, the table followed, and no consumer
+had to be touched because there are still no consumers reading literals.
+
+Nothing structural changed. The rounding rule was **re-verified at the new commit**,
+not assumed: `libs/quartzite/src/theme.rs` @ `0787ba9f` still converts a channel with
+`(v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8`, so every literal was re-derived in `f32`
+by that same rule. Colours are still `0x00RRGGBB` with no invented alpha, the gloss
+scalars are still Q16, the Paper block is still not lifted for the same
+material-versus-chrome reason, and the fidelity claim still reaches exactly as far as
+flat fills.
+
+What moved:
+
+* **Palette.** 19 of the 21 roles changed value; `content_fill` and `gloss.highlight`
+  are byte-identical to CRISPY-PI's. The kit as a whole moves lighter and cooler — the
+  chrome face goes `0x00D6D5D3` → `0x00ECECEE`, the frame keyline lifts from near-black
+  `0x004F4E4D` to a mid grey `0x00B4B4B9`, and the title gradients compress into a much
+  shallower ramp.
+* **The controls.** `CONTROL_BOX`'s single square role is gone; iteration 3 draws
+  **three circles**, each with its own fill — `CONTROL_CLOSE`, `CONTROL_MID`,
+  `CONTROL_ZOOM`, a ramp of the accent hue from darkest to lightest. The json carries no
+  separate radius key, so the geometry stays one lifted number (`control_box`, now read
+  as a diameter) with `CONTROL_RADIUS` derived from it.
+* **New metrics.** `widget_radius` = 8 and `well_radius` = 15 — the kit now distinguishes
+  a raised widget's corner from a recessed well's, where before every corner was the
+  window's.
+* **Gloss.** `0.14 / 0.5 / 0.0`, down from `0.34 / 0.55 / 0.06`: a much subtler
+  highlight that now dies out completely at the bottom instead of leaving a floor.
+
+**The assertions were re-derived, not carried.** The const-assert blocks state
+relations the *new* json implies. Two are worth naming because they are exactly the
+traps a mechanical re-lift sets. `BEVEL_LIGHT` and `GLOSS_HIGHLIGHT` are both pure
+white at this commit, so no distinctness is asserted between them and a comment says
+why — asserting it would fail the build, and silently dropping it would lose the fact.
+`GLOSS_BOTTOM_ALPHA_Q16` is exactly `0`, which makes the old `<= Q16_ONE` bound on it
+vacuously true, so it is removed in favour of the direction assertion
+(`TOP > BOTTOM`) that still does real work. `CORNER_RADIUS < TITLE_HEIGHT` survives on
+the new numbers (12 < 34), as does `CONTROL_BOX < TITLE_HEIGHT`; new bounds cover the
+two new radii and the circular control.
+
+**Still byte-inert, still verified rather than assumed.**
+`target/pi_baremetal/kernel8.img` hashes `104981f1864f2bbf…` both with and without the
+change — the table has no consumers, so a wholesale swap of every literal in it must
+not move a single byte of the image, and does not.
+
+##### CRISPY-PI-2 gate results (2026-07-26, QEMU raspi4b)
+
+`./arroyo check`: both arches clean. `./arroyo kernel8`: clean.
+`./arroyo kernel8-test`: **84/84 required witnesses, 0 forbidden**, 3123 lines scanned.
+
+One process note worth keeping. At the brief's 90 s window the harness returned
+84/84 with 0 forbidden but marked the capture `TRUNCATED (INCONCLUSIVE)` — the boot
+was cut mid-line at 1991 lines. Every witness had in fact printed, so it was tempting
+to read it as a pass; it is not one, by the harness's own rule, and it was re-run at
+150 s to get the conclusive 3123-line result above. A green count inside a truncated
+capture proves only that nothing had failed *yet*.
 
 ### WC-L — the staged erase loses its DIRECT fallback
 
