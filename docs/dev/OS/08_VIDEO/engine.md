@@ -3495,11 +3495,16 @@ in the sense that they are wired and quiet. What rides the next metal boot is th
 * `adopt_incoh` and `uncover_lost` overlap freely and are counted independently, so they may be added
   up. Neither suppresses the other.
 
-### WEDGE-1 — the drain barrier's termination proof, and the two things that broke it
+### WEDGE-1 — P66's mechanism is UNKNOWN; this arc hardens and instruments
 
-P66 hard-locked the bench. Six vugs (PROCS-6), the operator click-pausing them one at a time and
-tab-cycling between them, and then the wire went silent: no panic, no exception, no watchdog line.
-The last thing it said was
+**Verdict first: this arc did not root-cause P66.** It landed two safe-direction changes and two
+instruments so that the next wedge of this shape names itself. Nothing below should be read as a
+diagnosis, and P66 must not be retired on it.
+
+#### What P66 actually showed
+
+Six vugs (PROCS-6), the operator click-pausing them one at a time and tab-cycling between them, and
+then the wire went silent: no panic, no exception, no watchdog line. The last two lines were
 
 ```
 [wc-fv] focus raise asid=0x6 windows=1 top_win=6 z=131 shell_z=120
@@ -3507,112 +3512,114 @@ The last thing it said was
 ```
 
 Three of four cores reporting `--` — `tracked()` false, i.e. they had stopped folding load spans
-altogether — with c2 still turning over at 54 %. Not a slow machine: three cores that had left the
-dispatch loop and were never coming back. In the four raises before it, `[sched6] mean` had climbed
-351 188 → 2 253 430 → 6 233 952 → 8 502 171 cyc/pass, so the composite path was already being
-strangled before it stopped.
+altogether — with c2 still turning over at 54 %. In the four raises before it, `[sched6] mean` climbed
+351 188 → 2 253 430 → 6 233 952 → 8 502 171 cyc/pass, so the composite path was being strangled before
+it stopped. **Three cores left the dispatch loop and did not come back. Why, is not known.**
 
-#### The wait set was not what the barrier assumed
+#### The hypothesis this arc proposed, and why it is retracted
 
-`DrainBarrier::drain` (`video/wm.rs`) spins on `BLIT_ACTIVE == 0`. It reaches that spin from
-`sched::exit` — whose *first* act is `mask_irq()` — via `boot::teardown_user_slot` →
-`syscall::clear_handle_row` → `wm::close_owner`. So the spinning core is **IRQ-masked and
-unpreemptible**, which is exactly why it stops folding load spans and prints `--`.
+The first cut of this section argued the wedge was `DrainBarrier::drain` (which does spin IRQ-masked
+and unpreemptible, reached from `sched::exit` → `boot::teardown_user_slot` →
+`syscall::clear_handle_row` → `close_owner`) waiting on a composite that was itself blocked on the
+`WRITER.lock()` taken inside the `BlitGuard` window, with `SPRITE` dragged into the wait set behind it
+and SPREAD-2's band placement amplifying one dead core into three.
 
-Its termination argument is explicit and correct as written: with the barrier up, no new composite can
-register, so the wait set is *fixed at entry, finite, and every member is running a bounded
-panel-clipped blit*. The argument depends entirely on that last clause — and P66's composite path had
-stopped honouring it. Inside the `BlitGuard` window, `composite_inner` took a **blocking**
-`WRITER.lock()`. `WRITER` is ordered *under* `SPRITE` (`cursor::undraw_locked`, `draw_locked` and
-`redraw_off_locked` all take it with the sprite lock held), so acquiring it inside the guard admitted
-`SPRITE` — and every holder of it — into the drain's wait set through the back door. That is precisely
-what the `SPRITE` placement note at the head of `composite_inner` exists to forbid; the note guarded
-the front door and the ordering walked in the back.
+**Review refuted it on four independent points, all of them checkable and all of them decisive:**
 
-**The fix is an ordering change and nothing else.** The framebuffer handle is `Copy` and nothing
-between the two points consumed it, so the acquisition is hoisted above `BlitGuard::enter()`. Same
-value, same early return, one fewer blocking lock in the wait set. The `is_ready()` early return now
-precedes the registration, which is strictly better: a pass that cannot draw no longer registers as
-in-flight at all.
+1. All 27 `WRITER.lock()` sites in the tree are single-statement `Copy` reads (`*WRITER.lock()`); the
+   guard dies at the semicolon. No holder ever blocks on a second lock, so `WRITER` cannot convoy.
+2. `SPRITE` is the **outer** lock of the `SPRITE → WRITER` pair. The claimed back-door runs backwards:
+   a wait set containing `WRITER` does not thereby contain `SPRITE`.
+3. `JoinHandle::join` blocks the **task**, not the core — it is a semaphore park. A flusher stuck on a
+   band does not stop its core from dispatching, so it cannot produce a `--` reading.
+4. `BlitGuard::enter` has exactly **one** call site (`wm.rs`, inside `composite_inner`) and is never
+   reached from `flush_parallel`. The proposed composite-versus-band interaction does not exist.
 
-Two blocking acquisitions remain inside the guard on **witness** builds and are recorded here rather
-than fixed, because both are `#[cfg(feature = "witness")]`-gated instrumentation and removing them is a
-larger change than this arc's brief: the `serial_println!` calls in `verify_window` and the pass tail
-(`SERIAL_PORT.lock()`, held across a per-byte UART write), and `stage_window`'s `try_reserve`/`resize`
-into the global allocator on buffer growth. Neither is unbounded, but neither is a panel-clipped blit
-either. The metal image is a witness build, so this is live.
+The retracted argument is kept here, and in the code comments at both sites, so it is not re-derived
+by the next reader.
 
-#### The amplifier: one masked core became three
+#### What landed, and on what grounds
 
-A single IRQ-masked core is a lost core, not a lost machine. What took the other two was SPREAD-2's
-band placement.
+Both changes are justified on their own merits as safe-direction hardening. Neither is claimed to fix
+anything observed.
 
-`flush_parallel` picks helper cores, then spawns a band task on each with `spawn_joinable(..., cpu)`.
-A concrete cpu argument sets `steal_ok: false` (`arch/aarch64/sched.rs`), so the band is **pinned and
-unstealable**, and `JoinHandle::join` has **no timeout** — its own doc says a task that never runs
-leaves the joiner blocked forever. Hand a band to a core that has stopped dispatching and the flushing
-task parks permanently. The flusher is a compositor path, so it takes its window's damage, its
-`BlitGuard`, and in turn any teardown's drain barrier down with it.
+* **The framebuffer handle is taken before `BlitGuard::enter()`** (`video/wm.rs`). A pure ordering
+  change — the handle is `Copy`, same value, same early return. Independent of any wedge theory it is
+  strictly better: the `is_ready()` early return now precedes registration, so a pass that cannot draw
+  no longer registers as in-flight at all, and the barrier waits on a slightly narrower window.
+* **Band eligibility is freshness, not `tracked`** (`video/screen.rs`, `arch/aarch64/sched.rs`). This
+  closes a genuine latent defect that is *not* the wedge: bands spawn pinned (`steal_ok: false`) with
+  an untimed `join()`, so a band handed to a core that has stopped dispatching parks its flusher
+  permanently. `tracked`'s ~2-window (~500 ms) slack exists to keep a live core off the `--` *display*
+  during a slow rollover and is far too loose to gate a scheduling decision. `CoreLoad` now carries
+  `fold_age_cyc` and `sched::dispatch_fresh_cyc()` (~30 ms) is the bound. A live core folds a span
+  every dispatch pass and keeps its full fan-out; when no helper qualifies, `flush_parallel` returns
+  `false` and the byte-identical serial path presents the frame. **Scope, stated: a parked flusher
+  costs a vug its render task. It does not stall a core and cannot explain P66.**
 
-The eligibility test was `load.tracked`, and `tracked` is the wrong question. Its own doc says what it
-is for: keeping a genuinely-scheduled core off the `--` **display** during a slow rollover, for which
-its ~2-window (~500 ms) slack is right. As a *scheduling* predicate that slack is fatal — for half a
-second after a core stops dispatching it still answers `true`, and at six vugs' frame rates that is
-dozens of bands pinned onto a dead core. Three cores wedged, one alive, is the shape that falls out.
+#### The guard-window invariant, stated honestly
 
-`CoreLoad` now also carries `fold_age_cyc`, the raw quantity `tracked()` thresholds, and
-`sched::dispatch_fresh_cyc()` (one eighth of a load window, ~30 ms) is the bound for "may I give this
-core work only it can run". A live core folds a span every dispatch pass and cannot trip it, so the
-calm and loaded cases keep their full fan-out; a core that has stopped is disqualified within a frame
-or two instead of within half a second. When no helper qualifies, `flush_parallel` returns `false` and
-the byte-identical serial path presents the frame — the fallback that was always there.
+It is **not** "no blocking lock is acquired inside the `BlitGuard` window" — that is false, and was
+false before this arc. On witness builds the window contains:
 
-Nothing here weakens a protection. The barrier still waits out every registered blit: returning early
-would hand a teardown's about-to-be-unmapped surface to an in-flight blit, and no diagnostic is worth
-that.
+| Site | Lock | Why it is a bounded hold |
+|---|---|---|
+| `[wc-a]` / `[wc-c]` pass-tail prints, every print in `verify_window` | `SERIAL_PORT` | TX FIFO waits are explicitly spin-bounded (`arch/aarch64/serial.rs`, `break` past 1 000 000 spins) |
+| `wcg::begin` / `wcg::end` / `wcg::stage_flush` | `SERIAL_PORT`, `FBCON` | same bound; `FBCON` is `try_lock` on every print path |
+| `stage_window` buffer growth | global allocator | `allocate_first_fit` is O(free list) |
 
-#### The tripwire
+The invariant the barrier actually needs is weaker and true:
 
-The drain spin is where a wedge of this shape lands, and it was the one place that could not say so.
-It now counts its spins and, once per boot past a threshold no bounded blit can reach (~10^8 spin
-hints), prints
+> **No lock acquired inside the window has a holder that can block unboundedly.**
 
-```
-:: [wedge1] DRAIN STALLED core=N blit_active=M pending=K spins=... == tripwire ::
-```
+The three exceptions above are audited against exactly that and pass. They are recorded rather than
+removed: stripping instrumentation was not this arc's brief.
 
-and goes back to spinning. Honest about its own risk: the core is IRQ-masked and `serial_println!`
-takes a blocking lock, so if the wedge is *in* the serial path the tripwire blocks — but that path was
-spinning here forever anyway, so it is strictly no worse, and on every other shape it converts a silent
-hang into a named one.
+#### The spinlock hypothesis, checked and closed
+
+The one account that would explain three cores leaving the dispatch loop at once is "something blocks
+unboundedly with a spinlock held". A focused pass over every `spin::Mutex` reachable from the storm
+path — `WRITER`, `TABLE`, `DEFER`, `STAGE`, `COMPAT_CREATE`, `SPRITE`, `OVERLAY`, `SERIAL_PORT`,
+`FBCON`, the global allocator, `sched::RUN_QUEUES` — asking only whether a holder can spin or block
+without bound while holding, and whether it is taken IRQ-masked: **nothing qualifies.** The two
+genuinely unbounded constructs on the path (`DrainBarrier::drain`'s spin, `flush_parallel`'s untimed
+join) are both reached with no lock held. `SPRITE`/`OVERLAY` were also checked for an ABBA inversion
+and are clean — `adopt_overlay` is the only site holding both, always `SPRITE → OVERLAY`, and nothing
+holds `OVERLAY` while blocking on `SPRITE`.
+
+That closes the hypothesis without producing a suspect. **The tripwires below are P67's answer.**
+
+#### The instruments
+
+* `DrainBarrier::drain` counts its spins and, once per boot past a threshold no bounded blit can reach
+  (~10⁸ spin hints), prints
+  `:: [wedge1] DRAIN STALLED core=N blit_active=M pending=K spins=... == tripwire ::`
+  and goes back to spinning. The spin is unchanged — returning early would hand a teardown's
+  about-to-be-unmapped surface to an in-flight blit. Honest about its own risk: the core is IRQ-masked
+  and `serial_println!` takes a blocking lock, so if a future wedge is *in* the serial path the
+  tripwire blocks — but that path was spinning forever anyway, so it is strictly no worse.
+* `[spread2] ... stale N` counts band placements declined for staleness.
 
 #### WEDGE-1 gate results (2026-07-26, QEMU raspi4b)
 
 `./arroyo check` green both arches; `kernel8` clean; `kernel8-test 150` — **MBENCH PASS, 86/86
-required witnesses, 0 forbidden, 4137 lines scanned**.
+required witnesses, 0 forbidden**.
 
-**What QEMU did not prove, stated plainly.** The gate emits no `[spread2]` and no `[vugfps] bands=`
-line at all — before this change or after. The parallel flush path is not reached by the regression
-boot (it needs `vugpar` + `baremetal`, live vugs, and `PAR_MIN_ROWS` of damage), so the gate proves
-compilation, no-regression, and that the fallback is intact. It does **not** exercise the fix. The
-wedge itself needs a real EL0 teardown racing three or more concurrent flushers on four cores; that is
-a bench condition, not a QEMU one, and no fixture short of reproducing the whole storm would change
-that honestly.
+**What QEMU did not prove.** The gate emits no `[spread2]` and no `[vugfps] bands=` line at all, before
+this change or after: the parallel flush path is not reached by the regression boot (it needs `vugpar`
++ `baremetal`, live vugs, and `PAR_MIN_ROWS` of damage). The gate proves compilation, no-regression,
+and an intact serial fallback. It does not exercise either change.
 
 #### Metal watch-list (WEDGE-1)
 
-* `[spread2] ... stale N` is the arc's one falsifiable number. Every increment is a band that *would*
-  have been pinned — non-stealable, untimed join — onto a core that was not dispatching. On a calm
-  boot it must be 0; a live core cannot trip a ~30 ms bound. **Non-zero on the bench is the P66
-  precondition being reached and declined** — the difference between believing the mechanism and
-  watching it happen. Deliberately not a gate FORBID: a decline is the safe outcome, not a failure.
-* `[wedge1] DRAIN STALLED` naming a core converts the next silent wedge into a located one. Read
-  `blit_active` with it: a small non-zero count is a composite that cannot finish, and the next
-  question is which lock it is on — the two witness-gated ones above are the standing suspects.
-* If the machine wedges again with `stale 0` and no tripwire line, the drain barrier is not the site
-  and this hypothesis retires. The remaining candidates from the P66 read, none of which survived
-  scrutiny but none of which are disproven: `overlay_open`'s blocking `OVERLAY.lock()` convoying
-  behind `adopt_overlay`'s SPRITE→OVERLAY chain, and the allocator lock under `stage_window` growth.
-* `SPRITE`/`OVERLAY` were checked for an ABBA inversion and are clean: `adopt_overlay` is the only
-  site holding both, always SPRITE→OVERLAY, and nothing anywhere holds `OVERLAY` while blocking on
-  `SPRITE`. That thread is closed.
+* `[spread2] ... stale N` non-zero means cores are dropping out of the dispatch loop long enough to be
+  caught — a fact currently unmeasured and worth having. It is **not** confirmation of any account of
+  P66. Deliberately not a gate FORBID: a decline is the safe outcome, not a failure.
+* `[wedge1] DRAIN STALLED` naming a core would locate the next wedge at this spin. Read `blit_active`
+  with it: a small non-zero count is a composite that cannot finish, and the next question is which
+  lock it is on.
+* **If the machine wedges again with `stale 0` and no tripwire line, neither instrument is at the
+  site** — which is the likely outcome given the refutation above, and is itself information. The
+  three cores that stopped are the thing to chase; the next arc should get a per-core heartbeat that
+  survives an IRQ-masked spin (the tripwire only fires from inside one specific loop) before it
+  theorises further.
