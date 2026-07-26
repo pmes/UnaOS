@@ -7611,6 +7611,8 @@ struct Proc {
     done: crate::arch::sched::Semaphore,
 }
 /// A small cap « USER_SLOTS: if it exhausts, sys_spawn returns -EAGAIN, never grows the slot pool.
+/// DIVERGENCE: aarch64 raised its own cap to 6 in PROCS-6 (background apps filling a panel); these
+/// tables are per-arch and the numbers are not required to track each other.
 const MAX_PROCS: usize = 4;
 static PROCS: [Proc; MAX_PROCS] = [const {
     Proc {

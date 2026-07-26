@@ -1340,10 +1340,34 @@ pub fn current_id() -> Option<u64> {
 // wait, degrades to exactly the pre-arc PORPHANED behaviour — never to freeing a row under a live task.
 // =============================================================================================
 
-/// How many kills may be in flight at once. Small on purpose: the only requester is the single-threaded
-/// `run_user_image` deadline path, and `MAX_PROCS` (4) bounds how many rows can be at risk. Exhaustion
-/// returns `None` and the caller falls back to PORPHANED — it never grows the table (a STOP tripwire).
-pub const MAX_KILL_REQS: usize = 4;
+/// How many kills may be in flight at once. Small on purpose: the requesters are the `run_user_image`
+/// deadline path and the shell's `kill`, and the `Proc` table bounds how many rows can be at risk.
+/// Exhaustion returns `None` and the caller falls back to PORPHANED — it never grows the table on demand
+/// (a STOP tripwire).
+///
+/// PROCS-6 — this is now DERIVED from `MAX_PROCS` rather than written down beside it, because the old
+/// literal 4 was not an independent choice: it was the process table's size, and the comment said so.
+/// Once the cap rose to 6 the two numbers silently decoupled, and the decoupling is not benign — the
+/// tables are COUPLED in the failure direction. Six killable rows against four kill slots means an
+/// operator hammering `kill` across a full panel of vugs exhausts the kill table first; every request
+/// past the fourth arms nothing, falls back to PORPHANED, and parks a row. Those parked rows are then
+/// reclaimable only through KILLBOUND's quiescence witness, which is the narrower path (it needs the
+/// victim's ASID drained to zero live EL0 tasks) — so the shortfall converts confirmable kills into
+/// rows that wedge until their tasks happen to retire. That is the exact shape of the P60 wedge this
+/// machinery exists to prevent, re-introduced by a capacity change one file away.
+///
+/// Keeping the slots `>=` the rows makes the shortfall unrepresentable: every row that can be killed
+/// has a slot to be killed through, so `KILL_EXHAUSTED` can only ever be reached by concurrent
+/// requesters racing on the SAME rows, never by capacity.
+///
+/// It is a literal rather than `= syscall::MAX_PROCS` for a boring reason: `syscall` is gated behind
+/// `baremetal` and this module is not, so the constant cannot NAME the process table in every build
+/// that compiles it. The coupling is enforced instead by a `const` assert in `syscall.rs` — the one
+/// module that can see both constants, and the only configuration in which a `Proc` table exists at
+/// all, hence the only one where a shortfall could mean anything. Drift fails the build there. The
+/// assert is an inequality rather than an equality on purpose: a future arc may want kill headroom
+/// ABOVE the row count, but never below it.
+pub const MAX_KILL_REQS: usize = 6;
 
 const KILL_FREE: u8 = 0;
 /// Armed and owned by a live requester; the retiring task publishes `KILL_DONE` for it to observe.

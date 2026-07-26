@@ -1010,7 +1010,24 @@
     table and the slot pool exhaust together and disguise every slot-pressure failure as a table-full
     one), `wm::MAX_WINDOWS` = 8 compositor rows (only EL0 programs mint windows; the shell console is
     desktop-level, so 6 windowed bg programs fit with room over), and the shell's 8-slot `BG_JOBS`.
-    The first two are now compile-time assertions beside the constant rather than prose. The cost is
+    The first two are now compile-time assertions beside the constant rather than prose (the slot one
+    as `MAX_PROCS <= USER_SLOTS - 2`, the margin the sentence above actually promises — a bare `<`
+    would have permitted 7, satisfying the letter while starving exactly those two callers).
+    - **The kill table is COUPLED to the cap, and is now derived from it.** `sched::MAX_KILL_REQS` was
+      the literal `4`, and its rationale was openly "`MAX_PROCS` bounds how many rows can be at risk" —
+      so it was never an independent choice, and raising the cap silently decoupled them. The shortfall
+      is not benign: 6 killable rows against 4 kill slots means an operator hammering `kill` across a
+      full panel of vugs exhausts the kill table first, and every request past the fourth arms nothing,
+      falls back to `PORPHANED` and parks a row — reclaimable then only through KILLBOUND's narrower
+      quiescence witness (which needs the victim's ASID drained). That is the shape of the P60 wedge
+      this machinery exists to prevent, re-introduced by a capacity change one file away. It is now
+      `MAX_KILL_REQS = MAX_PROCS` with an assert holding `MAX_PROCS <= MAX_KILL_REQS`, which makes the
+      shortfall unrepresentable: `KILL_EXHAUSTED` becomes reachable only by concurrent requesters
+      racing the same rows, never by capacity. The assert is an inequality on purpose — kill headroom
+      above the row count is allowed, below it never.
+    - **x86_64 keeps its own `MAX_PROCS = 4`.** The tables are per-arch and are not required to track
+      each other; the divergence is noted at both constants so it is discoverable from either side.
+    The cost is
     two more static rows plus their `done` waiter reservations — a few hundred bytes, entirely off the
     per-slot `SLOT_BACKING` budget, which `USER_SLOTS` governs and this change does not touch.
     Witnessed once per boot by `:: BGRUN-ST: process table capacity = 6 rows (bg programs alive at

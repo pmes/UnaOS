@@ -2986,9 +2986,29 @@ static PROCS: [Proc; MAX_PROCS] = [const {
 /// A row that cannot be given an address space is a row that can only ever hand back `-EAGAIN` from deeper
 /// in the launch, and a kernel row the shell cannot record is a job the operator can neither see nor reap
 /// (`bg` kills such a spawn rather than leak it). Both must stay strictly above the cap.
+///
+/// SCOPE, so nobody reads more into a green `arroyo check` than is there: this module is gated behind
+/// `baremetal`, so these asserts are evaluated by the `kernel8` build and NOT by `check` (which builds
+/// aarch64 without the feature). That is the right place for them — it is the only configuration in
+/// which a `Proc` table, an EL0 slot pool and a kill table all exist — but `check` alone does not
+/// witness them. Each was verified to fire by negative test rather than assumed.
 const _: () = {
-    assert!(MAX_PROCS < super::boot::USER_SLOTS, "MAX_PROCS must leave EL0 slots free");
+    // Strictly below, by the margin the doc actually promises: two slots kept free so a foreground
+    // `run` and the launcher fixtures' scratch tenancies can still get an address space with every
+    // background row occupied. `< USER_SLOTS` alone would have permitted 7, which satisfies the letter
+    // of "leaves slots free" while starving exactly the two callers that need one.
+    assert!(MAX_PROCS <= super::boot::USER_SLOTS - 2, "MAX_PROCS must leave 2 EL0 slots free");
     assert!(MAX_PROCS <= crate::video::wm::MAX_WINDOWS, "every bg program must be able to own a window");
+    // The KILL table, which is coupled to this one in the FAILURE direction: a row that can be killed
+    // needs a slot to be killed through, or `bg_kill` arms nothing, falls back to PORPHANED and parks
+    // the row — recoverable then only via KILLBOUND's narrower quiescence witness. `sched.rs` cannot
+    // name `MAX_PROCS` (it compiles in non-baremetal builds, where `syscall` is gated out), so the
+    // coupling is asserted from this side, which is also the only configuration where a `Proc` table
+    // exists and a shortfall could mean anything.
+    assert!(
+        MAX_PROCS <= super::sched::MAX_KILL_REQS,
+        "every killable Proc row must have a kill slot to be killed through"
+    );
 };
 
 /// The parent's WITNESS (reported via SYS_REPORT): `U4_WITNESS_TOKEN` (nonzero) iff it reaped BOTH children
