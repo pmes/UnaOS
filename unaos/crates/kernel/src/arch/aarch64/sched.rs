@@ -440,6 +440,16 @@ impl CoreAccount {
         now_cyc().wrapping_sub(last) < load_window_cyc().saturating_mul(2)
     }
 
+    /// WEDGE-1 — cycles since the last fold, or `u64::MAX` if this core has never folded a span.
+    /// The raw quantity `tracked()` thresholds; see `CoreLoad::fold_age_cyc`.
+    fn fold_age_cyc(&self) -> u64 {
+        let last = self.last_acct_cyc.load(Ordering::Relaxed);
+        if last == 0 {
+            return u64::MAX;
+        }
+        now_cyc().wrapping_sub(last)
+    }
+
     /// Read the last-task triple with a bounded seqlock retry. `&'static str` reconstruction is sound:
     /// the writer only ever publishes a live `'static` name's `(ptr, len)` pair, and the seqlock
     /// guarantees the reader sees a matching pair (never a torn ptr-from-A / len-from-B).
@@ -490,6 +500,28 @@ pub struct CoreLoad {
     /// frozen last-window snapshot. Honest views (`SCHED: load` line, `top`) render an untracked core as
     /// `--`; the liveness gate still reads the raw `busy_pct_recent`/`ctx_switches` so it stays green.
     pub tracked: bool,
+    /// WEDGE-1 — CNTPCT cycles since this core last folded a load span, i.e. how long since it was
+    /// provably going round the dispatch loop. `u64::MAX` when it has never folded one.
+    ///
+    /// `tracked` answers "is this number worth PRINTING", and its ~2-window (~500 ms) slack is right
+    /// for that: it keeps a genuinely-scheduled core off the `--` display during a slow rollover.
+    /// That slack is wrong for a caller asking "may I hand this core work it alone can run" — for
+    /// 500 ms after a core stops dispatching, `tracked` still says yes. `fold_age_cyc` is the raw
+    /// measurement under both questions, so such a caller can pick its own, much tighter bound.
+    /// See `video::screen::flush_parallel`'s helper gate for the P66 wedge this exists for.
+    pub fold_age_cyc: u64,
+}
+
+/// WEDGE-1 — the freshness bound a caller should use before handing a core work that ONLY that core
+/// can run (a pinned, non-stealable task with an untimed join). One eighth of a load window, ~30 ms:
+/// a core inside `run()` folds a span every dispatch pass — orders of magnitude more often than this
+/// — so a live core never trips it, while a core that has stopped dispatching is disqualified within
+/// a frame or two rather than the ~500 ms `tracked()` allows.
+///
+/// Deliberately conservative in the safe direction: a false "not fresh" costs one band of parallelism
+/// for one frame, a false "fresh" costs a task parked forever.
+pub fn dispatch_fresh_cyc() -> u64 {
+    (load_window_cyc() / 8).max(1)
 }
 
 /// SCHED-2 — read this core's live load: recent busy percent (rolling window), cumulative context
@@ -497,7 +529,14 @@ pub struct CoreLoad {
 /// (the shell `top` verb, the witnesses). Introspection only — never consulted on a scheduling path.
 pub fn core_load(core: usize) -> CoreLoad {
     if core >= NUM_CPUS {
-        return CoreLoad { busy_pct_recent: 0, ctx_switches: 0, last_task_id: 0, last_task: "-", tracked: false };
+        return CoreLoad {
+            busy_pct_recent: 0,
+            ctx_switches: 0,
+            last_task_id: 0,
+            last_task: "-",
+            tracked: false,
+            fold_age_cyc: u64::MAX,
+        };
     }
     let acct = &ACCT[core];
     let (last_task_id, last_task) = acct.last_task();
@@ -507,6 +546,7 @@ pub fn core_load(core: usize) -> CoreLoad {
         last_task_id,
         last_task,
         tracked: acct.tracked(),
+        fold_age_cyc: acct.fold_age_cyc(),
     }
 }
 
