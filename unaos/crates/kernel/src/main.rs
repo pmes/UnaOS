@@ -287,6 +287,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     {
         let online = unaos_kernel::arch::smp::online_secondaries();
+
+        // INROUTE: the router selftest runs HERE — before `start_aps`, and therefore before the first EL0
+        // slot in this boot exists. Its correctness depends on OWNING the global input focus and
+        // `pal::EVENT_QUEUE` for the length of the test, and this is the only point in the boot where that
+        // ownership is structural rather than hoped for. See `input_router_selftest` for the race this
+        // placement closes.
+        input_router_selftest();
+
         unaos_kernel::arch::sched::start_aps(&online);
 
         // M6g Part B: probe the microSD (EMMC2 first, legacy SDHCI fallback) and register it as the block
@@ -964,10 +972,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let online = unaos_kernel::arch::smp::online_secondaries();
         if let (Some(&render_cpu), Some(&input_cpu)) = (online.first(), online.last()) {
             GUI_CHANNEL.init(); // reserve waiter capacity on the BSP before the tasks block on it
-            // INPUT-WIRE: prove the router->ring path once, HERE — before any input/render service task is
-            // spawned, so EVENT_QUEUE is empty and no EL0 slot is live (a deterministic, non-perturbing
-            // window). The ELF-5 witness proves ring->EL0-drain; this closes the router half.
-            input_router_selftest();
+            // INROUTE: `input_router_selftest` used to run HERE. It does not any more — see its own doc
+            // comment and the call site up in the `start_aps` block. The claim this comment used to make
+            // ("EVENT_QUEUE is empty and no EL0 slot is live") was false at this point in the boot: the
+            // whole M6b..U7 fixture cascade is already spawned and running on the APs, holding ASIDs 1-8.
             typematic_selftest(); // UVUG-6: prove the dropped-KeyUp wedge is closed (report-level + guards)
             unaos_kernel::arch::serial::RX_READY.init(); // M5c: the RX-wake semaphore's waiter list
             unaos_kernel::video::fbcon::detach();
@@ -2172,16 +2180,47 @@ fn route_input_to_active_el0() -> usize {
 /// is BYPASSED (GUI_SENT unchanged — the events did NOT leak into the render channel). The ring -> EL0 drain
 /// half is proven by the ELF-5 `:: EL0: input test … ::` witness; together they cover the full HID->EL0 path.
 /// HONEST QEMU NOTE: the real HID *edge* (a USB keypress landing in EVENT_QUEUE) is metal-only — QEMU raspi4b
-/// delivers no HID — so this drives the router with a synthetically pushed event. Called ONCE on the BSP
-/// before the input/render service tasks are spawned, when EVENT_QUEUE is guaranteed empty (no producer has
-/// run) and no EL0 slot is live, so ASID 1 is a safe fake target and the test perturbs nothing.
+/// delivers no HID — so this drives the router with a synthetically pushed event.
+///
+/// INROUTE — WHERE THIS RUNS, AND WHY IT MOVED. Called ONCE on the BSP from the `start_aps` block, BEFORE the
+/// secondaries are started. That placement is load-bearing, not cosmetic.
+///
+/// The test borrows the two pieces of GLOBAL input state — `EL0_INPUT_ACTIVE` (it fakes focus onto ASID 1)
+/// and `pal::EVENT_QUEUE` (it pushes synthetic events and expects to be the one who drains them) — and then
+/// COUNTS deliveries. Any concurrent owner of either one makes the count wrong. Its old home was next to the
+/// input/render task spawn, under a comment claiming "EVENT_QUEUE is empty and no EL0 slot is live". That was
+/// simply untrue by then: the M6b..U7 fixture cascade is spawned far earlier and is running on the APs, and
+/// `M6d` alone holds all eight slots — ASIDs 1 through 8. So the fake target ASID 1 was a REAL, LIVE slot
+/// belonging to a fixture, and when that fixture exited mid-test its teardown ran
+/// `clear_handle_row(1)` -> `EL0_INPUT_ACTIVE.compare_exchange(1, 0)`, revoking the focus this test had just
+/// set. A router pass that had already enqueued the Key then found no active target for the Mouse and
+/// returned `routed=1`: the observed `:: EL0: input router — routed=1|0 … :: FAIL ::`, ~1 boot in 7 under
+/// contention. Nothing was dropped by the queue (`[uvug10] evq drop` stayed 0) and nothing leaked to
+/// GUI_CHANNEL — the events were simply routed to a focus that no longer existed.
+///
+/// The revocation itself is CORRECT and is deliberately left alone: a torn-down slot must stop receiving
+/// input, and the pre-launch discard in `el0_input_set_active` is likewise correct for real input (an event
+/// queued before an app existed was never meant for it — UVUG-8r2). The bug was the test's precondition, so
+/// the fix is to make the precondition TRUE by construction: run before any EL0 slot in this boot exists.
+/// Serialising structurally beats the alternatives — giving the test a private sink would stop exercising
+/// the real global seam, which is the entire point of the witness, and any "retry on mismatch" would just
+/// launder a real race into a slower green.
+///
+/// The `[inroute]` line below is the standing evidence that the window stayed clean: it reports the focus
+/// revocation count across the measurement window (`revokes=0` is the healthy reading) alongside the drained
+/// counts, so a future regression that re-introduces a concurrent owner is diagnosable from the log alone
+/// rather than by re-deriving the race.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn input_router_selftest() {
     use core::sync::atomic::Ordering;
     use unaos_kernel::arch::aarch64::syscall as sc;
     let sent0 = GUI_SENT.load(Ordering::Relaxed);
-    // Fake focus: ASID 1 is a valid ring index (the per-ASID rings exist independent of slot liveness); no
-    // real EL0 slot is allocated this early in boot, so nothing else targets it. Setting focus resets the ring.
+    // INROUTE: bracket the measurement window with the focus-revocation counter (see `el0_focus_revokes`).
+    let revokes0 = sc::el0_focus_revokes();
+    // Fake focus: ASID 1 is a valid ring index (the per-ASID rings exist independent of slot liveness), and
+    // at THIS call site no EL0 slot has been allocated yet in this boot — the secondaries that run the fixture
+    // cascade are not started until the line after this call returns, so nothing else can target ASID 1 or
+    // revoke our focus (INROUTE; the `revokes=0` line below is the running proof). Setting focus resets the ring.
     sc::el0_input_set_active(1);
     unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(b'R'));
     unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Mouse { x: 3, y: -4 });
@@ -2222,6 +2261,18 @@ fn input_router_selftest() {
     // A focus change clears the latch — a fresh `run` always starts disengaged (deadline fully armed).
     sc::el0_input_set_active(0); // restore: no active EL0 focus for the real boot
     let takeover_cleared = sc::el0_takeover_active() == 0;
+    // INROUTE: the race window's own witness, printed BEFORE the verdict so a FAIL is always accompanied by
+    // its diagnosis. `revokes` counts slot teardowns that revoked the live focus while this test was
+    // measuring — the exact event that produced the historical `routed=1` flake. A healthy boot reads
+    // `revokes=0` here, because this runs before any EL0 slot exists; anything else means a concurrent owner
+    // of the global focus has been reintroduced ahead of this call site and the count below cannot be trusted.
+    serial_println!(
+        "[inroute] router window — routed={} stale_dropped={} revokes={} gui_sent_delta={}",
+        routed,
+        stale_dropped as u8,
+        sc::el0_focus_revokes().wrapping_sub(revokes0),
+        sent1.wrapping_sub(sent0)
+    );
     if routed == 2 && sent1 == sent0 {
         serial_println!(
             ":: EL0: input router — routed=2 (key+mouse) to active-focus ring, Timer dropped, GUI_CHANNEL bypassed :: PASS ::"

@@ -3825,7 +3825,19 @@ pub fn clear_handle_row(asid: u64) {
     // ELF-5: reset this ASID's input ring (a reused ASID inherits no stale input event), and if it was the
     // registered active input target, clear the designation so the router stops enqueueing to a dead slot.
     clear_input_row(asid);
-    let _ = EL0_INPUT_ACTIVE.compare_exchange(asid, 0, Ordering::AcqRel, Ordering::Acquire);
+    // INROUTE: this CAS is a FOCUS REVOCATION, and it is asynchronous with respect to whoever currently
+    // holds focus — it fires on the dying slot's core the instant that slot tears down. Count it. The
+    // count is the evidence line for the one race this seam can lose an event to: a router pass that
+    // read a live focus, then found it revoked between two enqueues, silently delivers fewer events than
+    // it drained. That is CORRECT for a real app (a dead slot must stop receiving input), but it is
+    // indistinguishable from a routing bug in any witness that counts deliveries — see
+    // `input_router_selftest`, which used to borrow ASID 1 while the fixture cascade was recycling it.
+    if EL0_INPUT_ACTIVE
+        .compare_exchange(asid, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        EL0_FOCUS_REVOKES.fetch_add(1, Ordering::Relaxed);
+    }
     // UVUG-8r2: companion clear for the takeover latch. Without it a torn-down ASID could leave its takeover
     // engaged, and a REUSED ASID would inherit it — the next `run` into the same slot would start with its
     // deadline already suspended. CAS on `asid` so we only ever clear OUR OWN latch, never a live one belonging
@@ -11252,6 +11264,17 @@ static EL0_INPUT_TAIL: [AtomicU32; super::boot::USER_SLOTS + 1] =
 /// The ASID of the process currently designated to RECEIVE input (0 = none). The router enqueues only into
 /// this process's ring — the ELF-5 twin of `SCREEN_APP_ACTIVE`. Set via `el0_input_set_active`.
 static EL0_INPUT_ACTIVE: AtomicU64 = AtomicU64::new(0);
+
+/// INROUTE: how many times a SLOT TEARDOWN revoked the live input focus (`clear_handle_row`'s CAS actually
+/// fired — the dying ASID *was* the focused one). Zero on a boot where no focused program ever exited; it
+/// climbs by one per focused program that ends. Read by `input_router_selftest`'s `[inroute]` witness to
+/// prove its measurement window was not crossed by a revocation.
+static EL0_FOCUS_REVOKES: AtomicU64 = AtomicU64::new(0);
+
+/// INROUTE — see [`EL0_FOCUS_REVOKES`]. Public so the boot witness in `main.rs` can bracket its own window.
+pub fn el0_focus_revokes() -> u64 {
+    EL0_FOCUS_REVOKES.load(Ordering::Relaxed)
+}
 
 /// UVUG-8: the ASID of the EL0 app that has entered INTERACTIVE TAKEOVER (0 = none). An EL0 full-screen app
 /// (`run /fat/VUG.ELF`) flips to interactive mode the instant it drains its FIRST real input event (the

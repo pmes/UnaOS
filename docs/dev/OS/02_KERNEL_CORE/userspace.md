@@ -495,6 +495,36 @@
     `SYS_INPUT_POLL`, drawing/responding to input — the last delivery gap in the EL0-vug ladder.
     Lane: `main.rs` (the router branch + `route_input_to_active_el0` + `input_router_selftest`) + the
     `run_user_image` focus-registration call site in `arch/aarch64/syscall.rs` + this doc.
+- **INROUTE (landed 2026-07-25)** — the router selftest above was **flaky**, roughly 1 boot in 7 under a loaded
+  cascade: `:: EL0: input router — routed=1|0 gui_sent_delta=0 :: FAIL ::`, seen by two independent executors on
+  unrelated diffs, so the race predated both. **Root cause:** the selftest's stated precondition was false. It
+  borrows the two pieces of *global* input state — it fakes focus onto **ASID 1** and pushes synthetic events
+  into `pal::EVENT_QUEUE` — and then counts deliveries, so any concurrent owner of either makes the count wrong.
+  Its call site sat beside the input/render task spawn under the comment "EVENT_QUEUE is empty and no EL0 slot is
+  live". By that point in the boot the whole M6b..U7 fixture cascade has been spawned and is running on the APs,
+  and **M6d alone holds all eight slots, ASIDs 1–8** (`:: M6d: per-task address spaces (8 slots, ASID 1-8…) ::`
+  prints ~27 lines *before* the selftest's own verdict). ASID 1 was therefore a real, live fixture slot: when
+  that fixture exited mid-test its teardown ran `clear_handle_row(1)` → `EL0_INPUT_ACTIVE.compare_exchange(1, 0)`
+  and **revoked the focus the test had just set**. A router pass that had already enqueued the Key found no
+  active target for the Mouse and returned `routed=1`. Nothing was dropped by the queue (`[uvug10] evq drop`
+  stayed `0`) and nothing leaked into `GUI_CHANNEL` — the events were routed to a focus that no longer existed.
+  **Real input is unaffected, and neither mechanism is a bug:** revoking focus on teardown is required (a dead
+  slot must stop receiving input), and `el0_input_set_active`'s pre-launch discard is correct for a real
+  keystroke too (UVUG-8r2 — an event queued before an app existed was never meant for it). The defect was the
+  *test's* precondition. **Fix:** make the precondition true by construction — `input_router_selftest()` now runs
+  from the `start_aps` block **before the secondaries are started**, the only point in the boot where sole
+  ownership of focus and `EVENT_QUEUE` is structural. Rejected: a private sink for the synthetic events (it
+  would stop exercising the real global seam, which is the entire point of the witness) and any retry-on-mismatch
+  (launders a real race into a slower green). **Witness:** a new `[inroute] router window — routed=2
+  stale_dropped=1 revokes=0 gui_sent_delta=0` line prints before the verdict; `revokes` is a new counter
+  incremented whenever a slot teardown actually revokes the *live* focus (`el0_focus_revokes()`), so `revokes=0`
+  is the standing proof the measurement window stayed clean and a reintroduced concurrent owner is diagnosable
+  from the log alone. **Gate:** the `:: EL0: input router … PASS ::` and `[inroute] … revokes=0` lines are both
+  REQUIREs in `pi4-regression.spec` now (the FAIL half was already covered by the default `FAIL ::` FORBID, but
+  nothing required the PASS, so a selftest that silently stopped running went green). A/B: the interleaving
+  forced deterministically at the old call site reproduces `routed=1`; 20 consecutive runs on the fixed build are
+  clean. Lane: `main.rs` (call site + `input_router_selftest` witness) + `arch/aarch64/syscall.rs`
+  (`EL0_FOCUS_REVOKES` at the teardown CAS) + `scripts/specs/pi4-regression.spec` + this doc.
 - **UVUG-3 (landed 2026-07-23)** — the mini-vug becomes the first **interactive** EL0 application. `crates/user-vug`
   is rewritten from the UVUG-1 animated gradient into a real **vug-style wireframe quartz crystal**: the Q16.16
   fixed-point sin table, rotation (yaw-then-pitch), and the 14-vertex elongated hexagonal bipyramid are

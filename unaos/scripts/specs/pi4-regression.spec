@@ -255,6 +255,16 @@ FORBID BANDY-GRANT:.*FAIL
 # ---    0x48221e4101db3924 (see userspace.md); this is the current one.
 REQUIRE UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c
 #
+# --- 1b. INROUTE: the HID->EL0 router witness. The FAIL half was already covered by the default
+# ---     `FAIL ::` FORBID, but nothing REQUIRED the PASS — a selftest that stopped running, or one
+# ---     whose call site was cfg'd out of the boot, went green by silence. Both halves are pinned
+# ---     now, and the `revokes=0` line pins the PRECONDITION the arc fixed: this test must own the
+# ---     global input focus for its window, so a slot teardown revoking focus mid-measurement (which
+# ---     is what made it flake ~1 boot in 7) fails the gate instead of merely being unlucky.
+REQUIRE EL0: input router — routed=2 .*GUI_CHANNEL bypassed :: PASS
+REQUIRE \[inroute\] router window — routed=2 stale_dropped=1 revokes=0
+FORBID EL0: input router.*FAIL
+#
 # --- 2. The el0-wcb window-verb ledger, ALL THIRTEEN bits. The literal mask matters: a partial
 # ---    mask still prints `witness=0x...` and the verdict already refuses it, but pinning 0x1fff
 # ---    here means a silently NARROWED ledger (bits removed from the fixture) also fails.
