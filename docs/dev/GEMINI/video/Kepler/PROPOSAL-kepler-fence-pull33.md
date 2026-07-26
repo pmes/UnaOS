@@ -1,4 +1,38 @@
-STATUS: PROPOSED
+STATUS: APPROVED-WITH-CORRECTION (GR5, 2026-07-26). THREE BINDING AMENDMENTS,
+the first of which is a MUST-FIX defect:
+
+1. ⛔ **THE IO PORTS ARE WRONG — 0x800/0x804 ARE HOST OFFSETS, NOT FALCON
+   PORT INDICES.** The empirically confirmed scheme (s29, proven by the A/B
+   fallback on metal, canon in KEPLER-METAL-LOG) is: host register X →
+   falcon `(X & 0xffc) << 6`. MAILBOX0 host 0x040 → I[0x1000]; MAILBOX1
+   host 0x044 → I[0x1100]. Therefore CC_SCRATCH[0] host 0x800 →
+   `(0x800 & 0xffc) << 6` = **I[0x20000]**, and CC_SCRATCH[1] host 0x804 →
+   **I[0x20100]**. Those do not fit the I16 immediate form the listing uses,
+   so both `mov` encodings must change (use the I32/`mov $rX, imm32` form or
+   build the value with a sethi pair, and re-cite the form you pick). This is
+   the same class of error as the pull-25 port amendment I got wrong — derive
+   it, print it, and let metal confirm.
+2. **A/B FALLBACK, as pull 25 established.** Emit TWO images: A with the
+   derived indexed ports (I[0x20000]/I[0x20100]) and B with the flat ports
+   (I[0x800]/I[0x804]) exactly as originally proposed. Run A first; if no ack,
+   run B and label each attempt in the marker (`ucode ctx img=A|B`). One boot
+   then settles the port question for the CC_SCRATCH family regardless of
+   which derivation is right — the A/B fallback is what confirmed 0x1000 on
+   metal and it costs us nothing here.
+3. **DROP THE GATING PREMISE FROM THE PROSE.** The CTXCTL subunit-gating
+   theory was REFUTED at s33 (PIBUS_MMIO_HUB_ENABLE1=FFF9F4B0, bit 4 already
+   SET) and s34 (all five remaining offsets read real zeros). The correct
+   statement is: the poison is PER-OFFSET and 0x409504 alone is convicted;
+   CC_SCRATCH is host-readable because it is a working offset, not because a
+   subunit gate spares it. Whether the Falcon can reach WRCMD from inside is
+   an open question, not an established mechanism — say so.
+
+Everything else approved as proposed: the echo-loop design, the milestone
+split (skeleton now, ctx-state assertion as pull 34), bounded poll, no
+retries, FECS only, and keeping the pull-25/26 execution sequence
+(seed → page-padded upload → verify-gate → DMACTL clear → BOOTVEC → CPUCTL)
+which is proven. Also keep image A of the old ucode running first as the
+known-good execution witness, as pull 27 did.
 
 # PROPOSAL: kepler-fence pull 33 - K-GPU-4 Milestone 5 (FECS Command Loop Skeleton)
 
