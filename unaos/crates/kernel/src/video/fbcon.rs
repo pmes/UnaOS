@@ -805,6 +805,52 @@ pub fn panel_console_resume() -> usize {
     n + 1
 }
 
+/// WC-X86 — **PROVISIONAL.** Give the bottom `reserve_px` pixels of the panel to the compositor by
+/// shortening the console's ROW GRID, and return the number of text rows the console keeps.
+///
+/// ### Why this exists, and why it is provisional
+///
+/// Console pixel ownership is an OPEN parameter: the two candidate answers are a reserved band (the
+/// console keeps a contiguous slice of the panel and the compositor owns the rest) and
+/// console-as-window (the console becomes an ordinary row in the window table, composited like any
+/// other surface). Peter has not ruled. **This function is the band answer, chosen as the
+/// provisional default because it is the one that changes nothing about how the console PAINTS** —
+/// the compositor already paints only the boxes its windows occupy (`wm::composite` has no
+/// full-desktop fill), so the only fact the two subsystems must agree on is which rows the console
+/// may scroll into.
+///
+/// It therefore touches exactly one thing: `rows`, the console's grid height. Every glyph, scroll
+/// and clear path is byte-for-byte the code it was — they are all expressed in terms of `rows`, so
+/// clamping it here is the whole of the band. Nothing about this call is load-bearing for the
+/// console-as-window answer; when that ruling lands, this function is deleted, not rewritten.
+///
+/// Best-effort and idempotent-ish: the reserve is measured against the panel's real height each
+/// time, and the console always keeps at least one row (a zero-row console would scroll forever).
+/// Returns `0` if the console is not ready.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn panel_console_reserve_band(reserve_px: usize) -> usize {
+    let mut rows = 0usize;
+    crate::arch::without_interrupts(|| {
+        if let Some(mut c) = FBCON.try_lock() {
+            if !c.ready || c.cell_h == 0 {
+                return;
+            }
+            let h = c.fb.info().height;
+            let keep_px = h.saturating_sub(reserve_px);
+            c.rows = (keep_px / c.cell_h).max(1);
+            // The cursor may already be sitting inside the band the compositor is about to own.
+            // Home it rather than clamp it: a clamped row would have the next line overwrite the
+            // console's own last line, which reads as a dropped log line.
+            if c.row >= c.rows {
+                c.row = 0;
+                c.col = 0;
+            }
+            rows = c.rows;
+        }
+    });
+    rows
+}
+
 /// Repaint the screen as a panic backdrop (dark red) and home the cursor, so the panic message
 /// that follows is unmissable on hardware. Best-effort: `try_lock` to avoid hanging if the lock
 /// was held when the panic fired. Re-enables the serial mirror first (the GUI may have detached

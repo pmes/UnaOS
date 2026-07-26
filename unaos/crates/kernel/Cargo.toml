@@ -10,6 +10,14 @@ default = []
 nvidia-kepler = []
 nvidia-kepler-takeover = []
 nvidia-kepler-fifo = []
+# WC-X86: bring the window compositor (`video::wm`) up on the x86 panel path. Compiles
+# `video/wcx.rs` — the activation seam, the provisional console band and the one kernel-drawn demo
+# window — and its single call site at the end of `kepler_display::takeover_display`. Nothing in
+# `wm`/`cursor` changes; this feature only *activates* what is already arch-neutral there.
+# x86_64-only module. DEFAULT OFF => module + call site vanish and every artifact (x86 and aarch64)
+# is byte-identical. Enable via `UNAOS_WC=1` (needs UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach
+# the seam).
+wc = []
 intel-ivb = []
 unaos_ivb = ["unaos-boot-info/unaos_ivb"]
 # DEFAULT-QUIET (witness): gate the battery of EL0/kernel fixtures that RE-PROVE long-metal-confirmed

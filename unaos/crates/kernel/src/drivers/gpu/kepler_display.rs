@@ -444,6 +444,15 @@ pub unsafe fn takeover_display(
     let repainted = crate::video::fbcon::panel_console_resume();
     serial_println!(":: kdisp: console-repaint rows={} ::", repainted);
 
+    // WC-X86 seam. Strictly AFTER the console resume above, and for the same reason the console
+    // resume is strictly after the calibration draw: this is the first line at which the panel is
+    // settled — the scan-out has been repointed, the pattern cleared, the console re-homed on the
+    // real surface. Activating the compositor any earlier would put windows on a surface the
+    // takeover is about to repoint, and the takeover would win silently. Knob-gated (`UNAOS_WC=1`),
+    // so this call site does not exist in a default build.
+    #[cfg(feature = "wc")]
+    crate::video::wcx::activate();
+
     // Completed fb-draw cycle: return the gop pointer so the late recap
     // (kepler.rs, printed inside the FTDI-ring window) can prove this leg ran.
     Some(gop_vram_offset)

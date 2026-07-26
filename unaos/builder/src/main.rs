@@ -111,6 +111,11 @@ fn main() {
     if std::env::var("UNAOS_KEPLER").is_ok() { feats.push("nvidia-kepler"); }
     if std::env::var("UNAOS_KEPLER_TAKEOVER").is_ok() { feats.push("nvidia-kepler-takeover"); }
     if std::env::var("UNAOS_KEPLER_FIFO").is_ok() { feats.push("nvidia-kepler-fifo"); }
+    // WC-X86: UNAOS_WC=1 arms the window compositor on the x86 panel path (video/wcx.rs) — activated
+    // at the END of the Kepler takeover seam, after `fbcon::panel_console_resume`. x86_64-only
+    // module; DEFAULT OFF => module + call site unlinked => byte-identical media. Needs
+    // UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach its seam. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_WC").is_ok() { feats.push("wc"); }
     // IVB-iGPU: UNAOS_IVB=1 arms the Intel HD 4000 ground-truth probe (sitting #6). Kept in sync
     // with arroyo's mapping — boot-1 of sitting #6 shipped WITHOUT this line and carried no probe.
     // unaos_ivb rides the same knob: it adds the teardown-trace fields to the SHARED BootInfo
