@@ -116,6 +116,11 @@ fn main() {
     // module; DEFAULT OFF => module + call site unlinked => byte-identical media. Needs
     // UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach its seam. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WC").is_ok() { feats.push("wc"); }
+    // INSTGUI: UNAOS_INSTGUI=1 opens the graphical installer dialog on the wc desktop. The cargo
+    // feature implies `wc` + `installdemo`, but this list is what reaches the KERNEL build for
+    // media, so the knob must be mapped here too (arroyo's own list only covers non-media paths —
+    // that asymmetry is why s42 shipped without the dialog).
+    if std::env::var("UNAOS_INSTGUI").is_ok() { feats.push("instgui"); }
     // IVB-iGPU: UNAOS_IVB=1 arms the Intel HD 4000 ground-truth probe (sitting #6). Kept in sync
     // with arroyo's mapping — boot-1 of sitting #6 shipped WITHOUT this line and carried no probe.
     // unaos_ivb rides the same knob: it adds the teardown-trace fields to the SHARED BootInfo
