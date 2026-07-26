@@ -1195,9 +1195,11 @@ impl FatFs {
     fn set_fat_entry(&self, cluster: u32, next: u32) -> Result<(), FatError> {
         // F2: serialize the WHOLE all-copies RMW under `FAT_MUTATION`. A concurrent writer mutating a
         // different entry in this same sector (or the other FAT copy) can no longer read-before-our-write and
-        // then clobber our update. The lock spans ONLY the bounded `num_fats` read-modify-write, so on aarch64
-        // the hold is a couple of polled sector transfers with no scheduler yield (see `with_fat_lock`). On
-        // x86 `with_fat_lock` is a zero-cost passthrough.
+        // then clobber our update. The lock spans ONLY the bounded `num_fats` read-modify-write — never a
+        // free-search or a data-cluster loop. USBFALL F2: what that span COSTS depends on `self.source`, and
+        // the claim is stated per-source on `with_fat_lock`'s LOCK SPAN paragraph (`Default` = bounded polled
+        // sector transfers; `Usb` = the BOT deadline with `wfi` under masked IRQs). Read it there rather than
+        // assuming "polled" here. On x86 `with_fat_lock` is a zero-cost passthrough.
         with_fat_lock_src(self.source, "set_fat_entry", || self.set_fat_entry_inner(cluster, next))
     }
 

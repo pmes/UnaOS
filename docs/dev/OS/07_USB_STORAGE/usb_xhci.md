@@ -1958,8 +1958,13 @@ consumer, and `register_sd` flips `BACKEND` to `BACKEND_SD`. If the card fails i
 stick — one physical device substituted for another, with no error anywhere. `write_block` now calls
 `guard_default_write_backend` first: with no SD registered it returns `BlockError::NotReady` and prints
 `:: USBFALL: no SD backend registered — refusing Default WRITE … ::` once. A failed identify produces an
-honest no-writable-volume boot instead of misdirected writes. Reads deliberately still fall through (a read
-cannot corrupt the wrong device, and the USB mount has its own `read_block_usb` handle). The guard is
+honest no-writable-volume boot instead of misdirected writes. `FatBackend::read_only()` reflects the same
+condition (`drivers::block::default_writable()`), so a `Default` mount on a no-SD Pi answers "read-only
+volume" (`VfsError::Unsupported`) **up front** rather than looking writable and failing late with an opaque
+`Io` on every write — that late-failure asymmetry was the honesty gap in the first cut of F1. Reads
+deliberately still fall through (a read cannot corrupt the wrong device, and the USB mount has its own
+`read_block_usb` handle) — the residual is ledgered in [`SECURITY.md`](../../SECURITY.md): a no-SD Pi can
+still *read* a `Default` volume off a substituted stick. The guard is
 `baremetal`-gated on purpose: on QEMU-virt aarch64 (`test-arm`) and on x86 the SD backend is never compiled,
 xHCI **is** the legitimate sole backend, and the function does not exist — those builds are byte-identical
 to pre-USBFALL. The rule is about substitution on a platform that has a canonical backend, not about xHCI.
@@ -1977,8 +1982,11 @@ explicitly so a newly added source must answer the paragraph rather than inherit
 span itself is unchanged (narrowing it for one source would fork the RMW's atomicity argument; shortening
 the deadline belongs to the xHCI layer). What is added is evidence: `note_masked_usb_hold` witnesses the
 first masked-IRQ hold taken on a `Usb` volume, behind `UNAOS_WITNESS` — compiled out of a default-quiet
-build. **Still owed from metal:** the actual stall on a *failing* BOT write under a held FAT lock; QEMU's
-BOT does not fail the way a real stick does.
+build. **This witness is METAL-ONLY, not merely default-quiet.** No QEMU gate can fire it: `kernel8-test`
+mounts only `Default` (SD) volumes and the raspi4b model enumerates no storage stick, and `test-arm` never
+compiles the `Usb`-vs-`Default` distinction the same way. Its absence from the gate logs proves nothing
+about the path — it proves only non-regression. **Still owed from metal:** the line itself, and the actual
+stall on a *failing* BOT write under a held FAT lock; QEMU's BOT does not fail the way a real stick does.
 
 **F3 — the stale read-only assertions retired.** `fat.rs`'s `BlockSource` doc, both `piusb27_*` mount
 comments, `fs/vfs.rs`'s `FatBackend` doc and `genet.rs`'s `/fs/usb` route comment each still claimed the
@@ -1988,7 +1996,8 @@ says what is true, and distinguishes "this route only reads" from "this source c
 
 **Gates (USBFALL).** `./arroyo check` green both arches; `./arroyo kernel8` clean; `./arroyo kernel8-test 90`
 MBENCH PASS 80/80 required, 0 forbidden; `./arroyo test-arm` MISSION SUCCESS. No USBFALL line appears in
-either log — byte-inert on the healthy-SD boot path, which is the point.
+either log: the F1 refusal is byte-inert on the healthy-SD boot path (which is the point), and the F2
+witness is metal-only (see above — its absence is non-regression, not evidence).
 
 ---
 

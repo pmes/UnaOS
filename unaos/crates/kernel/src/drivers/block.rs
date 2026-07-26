@@ -204,8 +204,22 @@ static SUBST_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// Byte-inert on a healthy SD boot: `BACKEND_SD` is set before the first FAT write, so this returns `Ok`
 /// without touching the console.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn default_writable() -> bool {
+    BACKEND.load(Ordering::Acquire) == BACKEND_SD
+}
+
+/// USBFALL F1: targets without the SD backend (x86, QEMU-virt aarch64) have no substitution to refuse — the
+/// enumerated device IS the canonical `Default` backend, so `Default` writes are available whenever the block
+/// layer has one at all. Constant `true` keeps `write_block` and every `read_only()` consumer byte-identical
+/// to pre-USBFALL there.
+#[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+pub fn default_writable() -> bool {
+    true
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn guard_default_write_backend() -> Result<(), BlockError> {
-    if BACKEND.load(Ordering::Acquire) == BACKEND_SD {
+    if default_writable() {
         return Ok(());
     }
     if !SUBST_REFUSED.swap(true, Ordering::Relaxed) {
