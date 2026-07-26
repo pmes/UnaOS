@@ -32,6 +32,11 @@ WORKSPACE_DIR="$(cd "$(dirname "$0")" && pwd)"
 # from its OWN env-driven feature list) also pushes it. `battery` is deliberately NOT armed here: each of
 # its sub-invocations (`"$0" test`, `"$0" test-arm`, `"$0" kernel8-test`) re-enters this case and self-arms,
 # while its `"$0" esp-jetson` sub-invocation does NOT — keeping the jetson media witness-free (byte-identity).
+# SOURCE-ALONG (UNAOS_NOSRC): `esp-x86`/`esp-arm`/`esp-jetson` pack the source tree that built the
+# media onto the media itself (SRC.TGZ + SRC.SHA at the volume root) — self-hosting rung 1 and GPLv3
+# source availability by construction. UNAOS_NOSRC=1 skips the step (tight media / CI speed). The
+# size-budgeted images (`fat-img`/`test-fat`, `vm-image`, `kernel8`) deliberately do NOT carry it.
+# See docs/dev/OS/10_INSTALL/source_along.md.
 case "${1:-}" in
     test|test-x86|test_x86|test-fat|test_fat|test-arm|test-aarch64|kernel8-test|test-pi)
         export UNAOS_WITNESS="${UNAOS_WITNESS:-1}" ;;
@@ -654,6 +659,53 @@ build_both() {
 
 # --- Real-hardware boot media (build + package an ESP, no QEMU) ---
 
+# sha256 of a file on stdout — shasum (macOS) then sha256sum (Linux); empty if neither exists.
+sha256_of() {
+    if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+    else echo ""; fi
+}
+
+# SOURCE-ALONG: every piece of UnaOS boot media carries the source tree that built it.
+#   (a) self-hosting rung 1 — the code travels with the machine that runs it;
+#   (b) GPL-3.0-or-later source availability BY CONSTRUCTION — the corresponding source ships
+#       on the same medium as the binary, so there is never a separate written-offer step.
+# Packs `git archive HEAD | gzip` (TRACKED files only — no target/, no untracked junk) to
+# <media>/SRC.TGZ plus <media>/SRC.SHA carrying the tarball's sha256 and the exact provenance
+# (commit / branch / `git describe --always --dirty`). A dirty working tree is STAMPED -dirty but
+# the archive is HEAD — committed state, never the dirt. ~6 MiB compressed today.
+# Skippable with UNAOS_NOSRC=1 (tight media, CI speed); default ON for the esp-* media commands.
+# See docs/dev/OS/10_INSTALL/source_along.md.
+pack_source_along() {
+    local dest="$1"
+    if [ -n "${UNAOS_NOSRC:-}" ]; then
+        rm -f "$dest/SRC.TGZ" "$dest/SRC.SHA" 2>/dev/null || true
+        echo -e "${COLOR_YELLOW}⚡ SOURCE-ALONG skipped (UNAOS_NOSRC=1) — no SRC.TGZ on this media${COLOR_RESET}"
+        return 0
+    fi
+    local root; root="$(git -C "$WORKSPACE_DIR" rev-parse --show-toplevel 2>/dev/null || echo "")"
+    if [ -z "$root" ]; then
+        echo -e "${COLOR_YELLOW}⚠ SOURCE-ALONG: not a git checkout — no SRC.TGZ packed${COLOR_RESET}"
+        return 0
+    fi
+    [ -d "$dest" ] || { echo -e "${COLOR_RED}ERROR: SOURCE-ALONG destination ${dest} does not exist${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_CYAN}⚡ SOURCE-ALONG: packing the source tree onto the media (SRC.TGZ)...${COLOR_RESET}"
+    if ! git -C "$root" archive --format=tar HEAD | gzip -9 > "$dest/SRC.TGZ"; then
+        echo -e "${COLOR_RED}ERROR: git archive HEAD failed — SRC.TGZ not written${COLOR_RESET}"; exit 1
+    fi
+    [ -s "$dest/SRC.TGZ" ] || { echo -e "${COLOR_RED}ERROR: SRC.TGZ is empty${COLOR_RESET}"; exit 1; }
+    local sha; sha="$(sha256_of "$dest/SRC.TGZ")"
+    [ -n "$sha" ] || { echo -e "${COLOR_RED}ERROR: no shasum/sha256sum on PATH — cannot stamp SRC.SHA${COLOR_RESET}"; exit 1; }
+    {
+        echo "${sha}  SRC.TGZ"
+        echo "commit   $(git -C "$root" rev-parse HEAD)"
+        echo "branch   $(git -C "$root" rev-parse --abbrev-ref HEAD)"
+        echo "describe $(git -C "$root" describe --always --dirty)"
+    } > "$dest/SRC.SHA"
+    echo -e "${COLOR_GREEN}✅ SRC.TGZ: $(wc -c < "$dest/SRC.TGZ" | tr -d ' ') bytes${COLOR_RESET}"
+    echo -e "   sha256: ${sha}   (SRC.SHA beside it: sha + commit/branch/describe)"
+}
+
 # x86_64 ESP for the MacBook (UEFI). Copy the packaged directory's contents onto a FAT32 USB
 # stick (so it has /EFI/BOOT/BOOTX64.EFI and /kernel.elf), then boot the Mac holding Option.
 esp_x86() {
@@ -662,7 +714,12 @@ esp_x86() {
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
+    pack_source_along "${WORKSPACE_DIR}/target/x86_64_esp"
     echo -e "${COLOR_GREEN}✅ x86 ESP: ${WORKSPACE_DIR}/target/x86_64_esp/ (incl. HELLO.BIN for the U2 loader)${COLOR_RESET}"
+    local _kelf="${WORKSPACE_DIR}/target/x86_64_esp/kernel.elf"
+    [ -f "$_kelf" ] && echo -e "   kernel.elf sha256: $(sha256_of "$_kelf")"
+    [ -f "${WORKSPACE_DIR}/target/x86_64_esp/SRC.TGZ" ] && \
+      echo -e "   SRC.TGZ    sha256: $(sha256_of "${WORKSPACE_DIR}/target/x86_64_esp/SRC.TGZ")"
     echo -e "   Copy its contents to a FAT32 USB root, then boot the Mac holding ⌥ Option → 'EFI Boot'."
 }
 
@@ -673,6 +730,11 @@ esp_x86() {
 # builder/src/vm_image.rs); no host mkfs/hdiutil. Writes ONLY to target/vm/ (never disturbs the
 # target/ state the test harness uses) and prints the image path + sha256.
 vm_image() {
+    # SOURCE-ALONG: the VM image's ESP is a FIXED 64 MiB FAT (vm_image.rs ESP_BYTES) built by
+    # copying whatever sits in target/x86_64_esp — so a SRC.TGZ left there by an earlier esp-x86
+    # would silently ride along and eat the budget. Media packaging for the VM image is out of this
+    # arc's scope, so strip it and keep the image byte-comparable to the pre-SOURCE-ALONG one.
+    rm -f "${WORKSPACE_DIR}/target/x86_64_esp/SRC.TGZ" "${WORKSPACE_DIR}/target/x86_64_esp/SRC.SHA" 2>/dev/null || true
     local git7; git7="$(cd "$WORKSPACE_DIR" && git rev-parse --short=7 HEAD 2>/dev/null || echo 0000000)"
     echo -e "${COLOR_CYAN}⚡ Building x86 boot products + packaging VM image (unaos-x86-${git7}.img)...${COLOR_RESET}"
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it into the ESP as HELLO.BIN
@@ -709,6 +771,11 @@ vm_image() {
 # ESP is packaged first (so EFI/ + kernel.elf populate the volume), then builds a partitioned image
 # (MBR@LBA0 -> BPB) and a superfloppy (BPB@LBA0). Test with `UNAOS_FATIMG=1 ./arroyo test`.
 fat_img() {
+    # SOURCE-ALONG stays OFF for the FAT test fixtures: these are size-budgeted images (96 MiB FAT32,
+    # 32 MiB FAT16) whose contents the kernel's read-only FAT tests enumerate — a multi-MiB SRC.TGZ
+    # is neither wanted nor budgeted there. Also strip one left by a previous esp-x86 run.
+    export UNAOS_NOSRC=1
+    rm -f "${WORKSPACE_DIR}/target/x86_64_esp/SRC.TGZ" "${WORKSPACE_DIR}/target/x86_64_esp/SRC.SHA" 2>/dev/null || true
     build_user_hello_x86   # U2: ensure target/hello.bin is fresh even if the ESP is reused below
     if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
@@ -731,6 +798,7 @@ test_fat() {
     local layout="${1:-part}"
     local secs="${2:-30}"
     case "$layout" in part|gpt|p16|sf) ;; *) echo "usage: ./arroyo test-fat [part|gpt|p16|sf] [secs]"; exit 1;; esac
+    export UNAOS_NOSRC=1   # SOURCE-ALONG off for the FAT test fixtures (see fat_img)
     esp_x86
     bash "${WORKSPACE_DIR}/scripts/make-fat-img.sh" "$layout"
     export UNAOS_FATIMG="$layout"
@@ -741,7 +809,10 @@ test_fat() {
 # Tianocore RPi4 EDK2 firmware (RPI_EFI.fd + the Pi firmware blobs).
 esp_arm() {
     prepare_aarch64
+    pack_source_along "$ESP_DIR_ARM"
     echo -e "${COLOR_GREEN}✅ aarch64 ESP: ${ESP_DIR_ARM}${COLOR_RESET}"
+    echo -e "   kernel.elf sha256: $(sha256_of "${ESP_DIR_ARM}/kernel.elf")"
+    [ -f "${ESP_DIR_ARM}/SRC.TGZ" ] && echo -e "   SRC.TGZ    sha256: $(sha256_of "${ESP_DIR_ARM}/SRC.TGZ")"
     echo -e "   Copy its contents to a FAT32 SD card together with the RPi4 EDK2 UEFI firmware."
 }
 
@@ -765,7 +836,9 @@ esp_jetson() {
     fi
     echo -e "${COLOR_YELLOW}⚡ kernel features (jetson): ${_feats%,}${COLOR_RESET}"
     prepare_aarch64
+    pack_source_along "$ESP_DIR_ARM"
     echo -e "${COLOR_GREEN}✅ Jetson ESP (tegra): ${ESP_DIR_ARM}${COLOR_RESET}"
+    [ -f "${ESP_DIR_ARM}/SRC.TGZ" ] && echo -e "   SRC.TGZ sha256: $(sha256_of "${ESP_DIR_ARM}/SRC.TGZ")"
     cat <<EOF
 
   Make Orin boot media (macOS), then boot it:
@@ -773,7 +846,7 @@ esp_jetson() {
          diskutil list                                      # find your USB (external, physical)
          diskutil eraseDisk "MS-DOS FAT32" UNAOS MBRFormat /dev/diskN
     2. Copy the ESP on (no macOS AppleDouble junk), then eject:
-         COPYFILE_DISABLE=1 cp -R "${ESP_DIR_ARM}/EFI" "${ESP_DIR_ARM}/kernel.elf" /Volumes/UNAOS/
+         COPYFILE_DISABLE=1 cp -R "${ESP_DIR_ARM}"/EFI "${ESP_DIR_ARM}"/kernel.elf "${ESP_DIR_ARM}"/SRC.* /Volumes/UNAOS/
          sync && diskutil eject /dev/diskN
     3. Plug into an Orin USB-A port, attach a DisplayPort monitor at power-on, then power on.
     4. In the UEFI Shell (tap ESC during boot if it does not drop there):
