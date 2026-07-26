@@ -522,6 +522,21 @@ pub static BOT_PUMP_NOWAIT: AtomicU64 = AtomicU64::new(0);
 /// that creeps up in small steps still gets reported once it has doubled overall.
 static BOT_PUMP_REPORTED: AtomicU64 = AtomicU64::new(0);
 
+// --- FTDI TX pump headroom (PH-6) ---
+// The FTDI bulk-OUT pump used to be bounded by a raw iteration count (2000 `hlt()` yields), which
+// measures nothing and means nothing: on a core whose timer is off, `hlt()` busy-spins and 2000
+// passes expire in microseconds — a starved pump and a dead endpoint then produce the identical
+// log. Converted to the same `now_cycles`/`hw_wait_budget()` wall-clock deadline the BOT pump uses,
+// with the same counters, so the GUI-media boot that reads this log can tell the two apart.
+/// High-water mark, in `now_cycles` units, of the time ONE FTDI TX transfer spent in the pump.
+static FTDI_PUMP_PEAK: AtomicU64 = AtomicU64::new(0);
+/// Total FTDI TX pump waits that completed.
+static FTDI_PUMP_COUNT: AtomicU64 = AtomicU64::new(0);
+/// FTDI TX pump waits that hit the wall-clock deadline.
+static FTDI_PUMP_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+/// The peak last PRINTED as a `:: FTDI: … result=OK ::` witness — the doubling throttle's reference.
+static FTDI_PUMP_REPORTED: AtomicU64 = AtomicU64::new(0);
+
 // --- BOT error recovery (USB Mass Storage Bulk-Only Transport 1.0 §5.3.3/§5.3.4, "Reset
 // Recovery") ---
 //
@@ -6235,20 +6250,28 @@ impl XhciController {
             completion_code: 0,
         });
         self.ring_doorbell(slot_id, out_dci as u32);
-        let pump = self.pump_until_ftdi_done(2000);
+        let pump = self.pump_until_ftdi_done();
         let pending = self.ftdi_pending.take();
         pump?;
         Ok(pending.ok_or(())?.completion_code)
     }
 
-    /// Pump the event ring until the in-flight FTDI TX transfer reports done (or the iteration budget
-    /// is exhausted). Unrelated events are dispatched normally during the wait. Mirrors
-    /// `pump_until_bot_done`.
-    fn pump_until_ftdi_done(&mut self, max_iters: u64) -> Result<(), ()> {
-        let mut iters: u64 = 0;
+    /// Pump the event ring until the in-flight FTDI TX transfer reports done, or a WALL-CLOCK
+    /// budget is exhausted. Unrelated events are dispatched normally during the wait. Mirrors
+    /// `pump_until_bot_done`, including its budget idiom: a `now_cycles`/`hw_wait_budget()`
+    /// deadline, NOT a raw iteration count — so the pump is correct regardless of how long each
+    /// `crate::hlt()` yields. Where a timer is live `hlt()` costs a tick per empty pass, but on a
+    /// timerless core it busy-spins and a fixed iteration budget would expire in microseconds,
+    /// long before a real completion lands. `now_cycles` (rdtsc / CNTVCT) advances either way.
+    fn pump_until_ftdi_done(&mut self) -> Result<(), ()> {
+        let start = crate::arch::now_cycles();
+        let budget = crate::arch::hw_wait_budget();
         loop {
             match &self.ftdi_pending {
-                Some(p) if p.done => return Ok(()),
+                Some(p) if p.done => {
+                    Self::note_ftdi_pump(start, budget);
+                    return Ok(());
+                }
                 None => return Ok(()),
                 _ => {}
             }
@@ -6256,11 +6279,37 @@ impl XhciController {
                 continue;
             }
             crate::hlt();
-            iters += 1;
-            if iters >= max_iters {
-                serial_println!("xHCI: FTDI TX pump TIMEOUT after {} yields", iters);
+            let elapsed = crate::arch::now_cycles().wrapping_sub(start);
+            if elapsed >= budget {
+                FTDI_PUMP_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                serial_println!(
+                    ":: FTDI: tx pump budget={} used={} n={} timeouts={} result=TIMEOUT ::",
+                    budget, elapsed, FTDI_PUMP_COUNT.load(Ordering::Relaxed),
+                    FTDI_PUMP_TIMEOUTS.load(Ordering::Relaxed));
                 return Err(());
             }
+        }
+    }
+
+    /// Fold ONE completed FTDI TX pump wait into the headroom counters, and print the
+    /// `:: FTDI: … result=OK ::` witness when it sets a high-water mark that at least DOUBLES the
+    /// last reported one — the same log-scale throttle `note_bot_pump` uses, so the console's
+    /// serial traffic cannot flood a default-quiet boot while the LAST such line still reports the
+    /// true worst-case TX wait the run needed.
+    fn note_ftdi_pump(start: u64, budget: u64) {
+        let used = crate::arch::now_cycles().wrapping_sub(start);
+        FTDI_PUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+        if used <= FTDI_PUMP_PEAK.load(Ordering::Relaxed) {
+            return;
+        }
+        FTDI_PUMP_PEAK.store(used, Ordering::Relaxed);
+        let reported = FTDI_PUMP_REPORTED.load(Ordering::Relaxed);
+        if used >= reported.saturating_mul(2).max(1) {
+            FTDI_PUMP_REPORTED.store(used, Ordering::Relaxed);
+            serial_println!(
+                ":: FTDI: tx pump budget={} used={} n={} timeouts={} result=OK ::",
+                budget, used, FTDI_PUMP_COUNT.load(Ordering::Relaxed),
+                FTDI_PUMP_TIMEOUTS.load(Ordering::Relaxed));
         }
     }
 

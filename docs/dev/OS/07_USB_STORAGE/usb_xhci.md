@@ -2270,6 +2270,28 @@ blind. **That arc is §11a.**
 :: BOT: pump budget=… peak=… n=… timeouts=… storage_slot=… route=… depth=… result=SUMMARY ::
 ```
 
+### PH-6 — the FTDI TX pump joins the wall-clock regime
+
+`pump_until_ftdi_done` (the bulk-OUT pump behind the USB-serial console) was the last
+**2000-iteration** budget in `drivers/xhci/mod.rs`. It is now a
+`now_cycles`/`hw_wait_budget()` deadline taken at entry, exactly as `pump_until_bot_done`
+does it, and its caller `ftdi_tx_stage` no longer passes an iteration count. The
+one-shot `xHCI: FTDI TX pump TIMEOUT after N yields` line — which reported yields, a
+quantity with no fixed duration — is replaced by the witness pair below: a completed
+wait prints on a peak that at least DOUBLES the last reported one (the same log-scale
+throttle `note_bot_pump` uses, so console traffic cannot flood a default-quiet boot),
+and a timeout prints unconditionally.
+
+Read `used` against `budget` the same way as for BOT: `used == budget` with a low
+running peak says the completion event was **lost**; a peak sitting just under `budget`
+says the budget was **tight**. Without this pair a GUI-media boot cannot distinguish a
+starved FTDI pump from a dead one — which is why it lands before that boot.
+
+```
+:: FTDI: tx pump budget=… used=… n=… timeouts=… result=OK ::
+:: FTDI: tx pump budget=… used=… n=… timeouts=… result=TIMEOUT ::
+```
+
 ### What metal must verify
 
 Re-run the behind-hub leg and read the `:: BOT: … ::` lines. If the delete family
