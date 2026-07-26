@@ -2360,3 +2360,91 @@ Programming order is the exact `v3d_perfmon_start` idiom already used by
 source-selects to retire before the counters are cleared and enabled. Only PCTR
 config registers are written — no CLE/PTB state is touched, no GMP write, no
 `MMU_CTL` change, no new MMIO window.
+
+---
+
+## 37. Calibrating the seven muxes against known ground truth (V3D-64)
+
+V3D-63 armed a raw sweep of seven **unidentified** PCTR source ids and refused to name
+them. P65v2 metal (capture `pi4-r23s1o`) came back with a shape: on zero-primitive bin
+rungs `src13 ≈ 161M` and `src28 ≈ 645M` against the `src32 CYCLE_COUNT` control's
+`≈ 645M`, with `src1/10/11/12/29` flat at 0. `src28` looks 1:1 with the core clock and
+`src13` looks like clock/4 — but "looks like" is precisely the reasoning that produced
+the PI-V3D-4/6/7 fabricated constants. This tree still carries no `enum drm_v3d_perfcnt`
+to transcribe from, and **naming an id from memory remains banned**.
+
+The honest identification channel is **calibration**: run the same bank across legs
+whose truth is already established, and classify each mux by behaviour alone.
+
+### The three legs
+
+| Leg | What it is | Ground truth it supplies |
+|---|---|---|
+| **L1 idle** | a fixed `V3D64_IDLE_MS` (4 ms) wall-clock window off CNTPCT, **no job submitted** | there is no work, so anything that accumulates here is clock-derived |
+| **L2 render** | the known-good CT1 clear job — `clear_job(None)`, the retiring M3 job `[v3d58] rerender` already reuses (**no new job is invented**), panel blit suppressed, its own store byte-verified | real, completing render work |
+| **L3 bin** | one banked `Empty` rung of the `[v3d48]` ladder via `submit_bisect_rung_at(…, bank: true)` | the bin path — the frame opens and never retires, so a retirement-gated mux stays flat while a clock-derived one climbs through the ~0.5 s backstop |
+
+Every slot is reported as a **permille ratio against `src32`'s delta on its own leg**.
+That is the whole point: a ratio held constant across three legs of wildly different
+duration and workload is a strong statement about what a mux is derived from — and one
+this file can make **without a name**.
+
+### The classification table shape
+
+Per swept id, one line: the raw value and permille on each leg, each leg's validity, and
+one of four **behaviour classes**:
+
+| Class | Condition | Reading |
+|---|---|---|
+| `CLOCK-LIKE` | permille within `[900, 1100]` of `src32` on **every** valid leg, pure idle included | derived from the core clock, not from work |
+| `WORK-GATED-RENDER` | moved on L2 only; flat on L1 and L3 | gated on real render work |
+| `SILENT` | zero on every valid leg, **overflow included** | idle, a retiring render frame and a bin kick all left it flat |
+| `OTHER` | moves, but neither 1:1 with `src32` nor render-only | read the per-leg permille: a ratio *held constant* across legs is clock-derived at that divisor; a ratio that *varies* is work-correlated |
+
+A leg counts as a measurement only if **its own `src32` control moved**; a leg whose
+control read zero is INCONCLUSIVE, never "silent". Fewer than two valid legs ⇒ the whole
+battery prints `muxcal INCONCLUSIVE` and classifies nothing. A leg that did not run at
+all (L2 with no passing M3 baseline, L3 fail-closed on a range escape) is printed as
+**NOT RUN**, never folded in as a zero. `OVERFLOW` is ORed into movement throughout, so
+a mux that wrapped exactly to zero cannot read as flat.
+
+### Expected outcome tree on metal
+
+Against the P65v2 shape, the discriminating outcomes are:
+
+- **`src28` CLOCK-LIKE** (≈1000‰ on all three legs, idle included) ⇒ it is a second
+  core-clock-derived counter, and every P65v2 reading of it as PTB/CLE activity is void.
+- **`src28` OTHER, ≈1000‰ on L3 but ≈0 on L1** ⇒ it is *not* free-running: it is gated on
+  something the bin kick supplies, and the 1:1 with `src32` on bin rungs was a
+  coincidence of the backstop window. This is the outcome that would make it interesting.
+- **`src13` OTHER at a constant ≈250‰ across all three legs** ⇒ clock/4, confirmed as a
+  fixed divisor of the same clock rather than a work counter.
+- **`src13` ≈250‰ on L3 but a different ratio on L2** ⇒ work-correlated, and the
+  clock/4 reading is retracted.
+- **`src1/10/11/12/29` SILENT across all three legs** ⇒ five muxes that a retiring render
+  frame does not move either. Their silence on the bin path stops being evidence about
+  the PTB specifically.
+- **any of the five moving on L2 only** ⇒ `WORK-GATED-RENDER`, the first positive
+  identification of a work-gated mux in this sweep.
+
+### What is deliberately NOT claimed
+
+**No source id is named here, and none may be inferred from these lines.** A class says
+how a mux responded to a pure-idle window, a retiring CT1 render frame and a bin kick. It
+says nothing about which unit it counts.
+
+**The standing rule this arc establishes:** when a later arc transcribes an id from
+`enum drm_v3d_perfcnt` and cross-checks it against this file's verified anchors (16
+`valid_instr`, 32 `cycle_count`), **the transcribed name must match the class measured
+here, or the transcription is rejected.** A name implying render or primitive work on a
+mux measured `CLOCK-LIKE`, or a clock/cycle name on a mux measured `WORK-GATED-RENDER`,
+is mis-transcribed. Calibration checks the transcription, never the reverse.
+
+Slot 2 stays `PCTR_SRC_CYCLE_COUNT` under the `[v3d55]`/`V3D63_CTRL_SLOT` contract — the
+slot `wait_fldone` samples for its clock-liveness verdict *and* this bank's own control —
+so the L3 leg's `[v3d55]` line remains truthful. Writes are **PCTR config registers
+only**, the same `v3d63_pctr_arm` idiom: no `CT*`/GMP/`MMU_CTL` write beyond what the
+reused legs already perform, and no new MMIO window. The battery is `UNAOS_V3D_DEEP`-gated
+and hub-identity gated, printing an explicit `SKIPPED` line when the block is down — QEMU
+raspi4b returns at `BLOCK-DOWN` long before it runs, so `kernel8-test` green for this arc
+means **no regression, nothing more**.
