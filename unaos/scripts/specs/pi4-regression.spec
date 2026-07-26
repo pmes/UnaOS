@@ -492,6 +492,22 @@ FORBID \[wc-h\] .*-> UNSTAGED
 #     pointer), COMPOSED on metal (overlay taken). See docs/dev/OS/08_VIDEO/engine.md §CURSOR-3.
 REQUIRE \[cursor3\] rollup scope=.* planned=.* offers=.* taken=.* adopt=.* repaint=.* ensure=.* ->
 
+# --- CURSOR-5 — sprite/compositor coherence residual (printed right after [cursor3]'s rollup) ---
+#     P64 (attended): "mouse still spotty [over vug] and causes a flash in the vug display here and
+#     there if you tweak the mouse just so". The flash was WC-L's deferred-erase drain calling a FULL
+#     `cursor::undraw` from INSIDE an open overlay session: the session's plan still matched, so the
+#     staged presents kept composing the arrow onto the panel while the sprite module believed itself
+#     off-panel, and the next save-under captured its own fill. CURSOR-5 moved the drain ahead of the
+#     bracket and gave `compose_into` a lock-free generation check.
+#
+#     `drain_insession` is the direct detector for the ordering and must stay 0 — a non-zero count
+#     means someone put the drain back inside the bracket. UNWITNESSED on QEMU (no HID pointer, so
+#     the sprite is never drawn); COHERENT/RESIDUAL on metal.
+#     See docs/dev/OS/08_VIDEO/engine.md §CURSOR-5.
+REQUIRE \[cursor5\] rollup scope=.* stale_compose=.* adopt_incoh=.* selfsave=.* masked_nosession=.* drain_insession=.* ->
+FORBID \[cursor5\] .*-> REGRESSED
+FORBID \[cursor5\] .*drain_insession=[1-9]
+
 # --- WC-J — a closed window gives its panel rows BACK ------------------------------------------
 # ---    P61 (attended): four background vugs, some killed; the operator reported one crash, two
 # ---    FROZEN windows and one still running, and `jobs` then showed all four pids exited 0 and
