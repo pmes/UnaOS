@@ -240,9 +240,12 @@ static SPREAD2_FRAMES: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomi
 /// This is the arc's one directly-falsifiable metal number, and it is why it is a counter rather than
 /// a comment. Every increment is a band that WOULD have been pinned — non-stealable, untimed join —
 /// onto a core that was not dispatching. On a calm boot it must stay 0: a live core folds a span
-/// every dispatch pass and cannot trip a ~30 ms bound. A non-zero reading on the bench is the P66
-/// wedge's precondition being reached and declined, and it is the difference between "we believe the
-/// mechanism" and "we watched it happen".
+/// every dispatch pass and cannot trip a ~30 ms bound.
+///
+/// What a non-zero reading means, and what it does NOT: it means cores are dropping out of the
+/// dispatch loop long enough to be caught, which is a fact worth having and currently unmeasured. It
+/// is NOT evidence for any particular account of the P66 wedge — that mechanism is unknown, and this
+/// counter is instrumentation for the next boot rather than confirmation of a diagnosis.
 #[cfg(all(feature = "vugpar", feature = "baremetal"))]
 static WEDGE1_STALE_DECLINED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -921,31 +924,35 @@ impl Screen {
         let mut hbusy = [0u32; MAX_BANDS - 1];
         let mut nh = 0usize;
         let mut c = 0usize;
-        // WEDGE-1 — ELIGIBILITY IS *FRESHNESS*, NOT `tracked`. A band task is spawned PINNED to the
-        // core chosen here (`spawn_joinable` with a concrete cpu sets `steal_ok: false`), so no other
-        // core may ever steal it, and the join below has NO TIMEOUT. Handing a band to a core that has
-        // stopped going round its dispatch loop therefore parks THIS task forever — and the flushing
-        // task is a compositor path, so a forever-parked flusher takes its window's damage, its
-        // `BlitGuard` and eventually a teardown's IRQ-masked drain barrier down with it. That is the
-        // P66 wedge's amplifier: one core stuck (a `DrainBarrier::drain` spin, IRQ-masked from
-        // `sched::exit`) becomes three cores stuck, one per flusher that pinned a band to it.
+        // WEDGE-1 — ELIGIBILITY IS *FRESHNESS*, NOT `tracked`. **Hardening against a latent hazard;
+        // NOT a diagnosed cause of the P66 wedge, whose mechanism is unknown.**
         //
-        // `tracked` was the wrong gate for this question and says so in its own doc: its ~2-window
+        // The hazard is real and independent of P66. A band task is spawned PINNED to the core chosen
+        // here (`spawn_joinable` with a concrete cpu sets `steal_ok: false`), so no other core may ever
+        // steal it, and the join below has NO TIMEOUT — its own doc says a task that never runs leaves
+        // the joiner blocked forever. Hand a band to a core that has stopped going round its dispatch
+        // loop and this flusher parks permanently.
+        //
+        // Scope it honestly: `JoinHandle::join` blocks the TASK, not the core. The flusher's own core
+        // keeps dispatching other work, so this costs a vug its render task — it does not by itself
+        // stall a core, and it is nowhere near sufficient to explain three cores leaving the dispatch
+        // loop at once. It is worth closing because a permanently parked render task is a real defect,
+        // not because it explains the bench.
+        //
+        // `tracked` is the wrong gate for this question and says so in its own doc: its ~2-window
         // (~500 ms) slack exists to keep a genuinely-scheduled core off the `--` DISPLAY during a slow
-        // rollover. For half a second after a core stops dispatching it still reads `true`, which at
-        // 6 vugs' frame rates is dozens of bands pinned onto a dead core. `dispatch_fresh_cyc` is the
-        // tight bound for "may I give this core work only it can run".
+        // rollover. For half a second after a core stops dispatching it still reads `true`.
+        // `dispatch_fresh_cyc` is the tight bound for "may I give this core work only it can run".
         //
         // This does not weaken the parallel path: a live core folds a span every dispatch pass and can
         // never trip the bound, so the calm and loaded cases alike keep their full fan-out. It only
-        // declines the one placement that could never have completed.
+        // declines a placement that could not have completed.
         let fresh = sched::dispatch_fresh_cyc();
         while c < ncpu {
             let load = sched::core_load(c);
             if c != self_cpu && load.tracked && load.fold_age_cyc >= fresh {
                 WEDGE1_STALE_DECLINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            }
-            if c != self_cpu && load.tracked && load.fold_age_cyc < fresh {
+            } else if c != self_cpu && load.tracked {
                 let busy = load.busy_pct_recent;
                 if nh < MAX_BANDS - 1 {
                     // Insertion sort into the kept set: ascending `busy`.

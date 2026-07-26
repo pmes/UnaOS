@@ -508,7 +508,9 @@ pub struct CoreLoad {
     /// That slack is wrong for a caller asking "may I hand this core work it alone can run" — for
     /// 500 ms after a core stops dispatching, `tracked` still says yes. `fold_age_cyc` is the raw
     /// measurement under both questions, so such a caller can pick its own, much tighter bound.
-    /// See `video::screen::flush_parallel`'s helper gate for the P66 wedge this exists for.
+    /// See `video::screen::flush_parallel`'s helper gate, which uses it to avoid pinning a
+    /// non-stealable band onto a core that is not dispatching. (Hardening: that hazard is real on its
+    /// own terms and is NOT a diagnosed cause of the P66 wedge, whose mechanism is unknown.)
     pub fold_age_cyc: u64,
 }
 

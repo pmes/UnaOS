@@ -1339,24 +1339,23 @@ fn composite_inner() -> CursorTail {
         }
     }
 
-    // WEDGE-1 — THE FRAMEBUFFER HANDLE IS TAKEN *BEFORE* THE GUARD, and that ordering is a
-    // correctness constraint of exactly the kind stated for `SPRITE` at the head of this function.
+    // WEDGE-1 — the framebuffer handle is taken BEFORE the guard. **Hardening, not a fix for a
+    // diagnosed defect: the P66 wedge's mechanism is UNKNOWN and this is not it.**
     //
-    // `DrainBarrier::drain` spins IRQ-MASKED and unpreemptible until `BLIT_ACTIVE` reaches zero (see
-    // its termination note), and it reaches that state from `sched::exit` — which calls `mask_irq()`
-    // as its first act — via `boot::teardown_user_slot` -> `syscall::clear_handle_row` ->
-    // `close_owner`. Its termination argument is that every member of the wait set is running "a
-    // bounded panel-clipped blit". A BLOCKING lock acquired after `BlitGuard::enter()` breaks that
-    // argument outright: it puts that lock, and transitively every lock ordered above it, into the
-    // drain's wait set. `WRITER` is ordered UNDER `SPRITE` (`cursor::undraw_locked`, `draw_locked`,
-    // `redraw_off_locked` all take it with the sprite lock held), so taking it inside the guard
-    // admitted `SPRITE` into the wait set through the back door — the very thing the `SPRITE`
-    // placement note above exists to forbid.
+    // The first cut of this change claimed the old ordering was the wedge, on the argument that
+    // `WRITER` is ordered under `SPRITE` and so admitted the sprite lock into the drain barrier's
+    // wait set. That argument is WRONG and is recorded here so it is not re-derived: every one of the
+    // 27 `WRITER.lock()` sites in the tree is a single-statement `Copy` read (`*WRITER.lock()`) whose
+    // guard dies at the semicolon, so no holder ever blocks on a second lock; and `SPRITE` is the
+    // OUTER lock of the pair, so the implication runs the other way round anyway.
     //
-    // The handle is `Copy` and nothing between here and the old acquisition site consumed it, so
-    // hoisting is a pure ordering change: same value, same early return, one fewer blocking lock
-    // inside the guard. The `is_ready` early return now precedes the registration, which is strictly
-    // better — a pass that cannot draw no longer registers as in-flight at all.
+    // What survives is the safe direction. `DrainBarrier::drain` spins IRQ-masked and unpreemptible
+    // (reached from `sched::exit`, which masks first), and the fewer blocking acquisitions inside the
+    // window it waits on, the tighter its termination argument is. The handle is `Copy` and nothing
+    // between here and the old site consumed it, so this is a pure ordering change: same value, same
+    // early return, one fewer blocking lock inside the guard. The `is_ready` early return now precedes
+    // the registration, which is strictly better on its own — a pass that cannot draw no longer
+    // registers as in-flight at all.
     let fb = *super::WRITER.lock();
     if !fb.is_ready() {
         return tail_of(disturbed, session);
@@ -1837,9 +1836,24 @@ impl DrainBarrier {
         // lock BEFORE the clearing critical section (so it registered, and is counted here) or AFTER
         // (so it sees the raised barrier and never registers).
         //
-        // WEDGE-1 — THE TRIPWIRE. P66 wedged three of four cores here with nothing on the wire: no
-        // panic, no exception, just `SCHED: load c0=-- c1=-- c3=--` and silence. This spin is the
-        // place a wedge of that shape lands, and it was the one place that could not say so.
+        // WEDGE-1 — THE TRIPWIRE. P66 wedged three of four cores with nothing on the wire: no panic,
+        // no exception, just `SCHED: load c0=-- c1=-- c3=--` and silence. **That wedge's mechanism is
+        // UNKNOWN — this spin is not known to be the site.** It is instrumented because it is one of
+        // the few places in the kernel that can consume a core silently and forever, so if the next
+        // wedge does land here it will say so instead of being guessed at.
+        //
+        // THE GUARD-WINDOW INVARIANT, stated honestly. It is NOT "no blocking lock is acquired after
+        // `BlitGuard::enter()`" — that is false and always has been. On witness builds the window
+        // contains `serial_println!` (the `[wc-a]`/`[wc-c]` lines and every print in `verify_window`),
+        // `wcg::begin`/`end`, and `stage_window`'s `try_reserve`/`resize` into the global allocator on
+        // buffer growth. The invariant this barrier actually needs is weaker and true:
+        //
+        //     no lock acquired inside the window has a holder that can block UNBOUNDEDLY.
+        //
+        // The exceptions above are audited against exactly that and pass: `SERIAL_PORT`'s TX waits are
+        // explicitly spin-bounded, `FBCON` is `try_lock` on every print path, and the allocator's
+        // `allocate_first_fit` is O(free list). They are listed in docs §WEDGE-1 as bounded-hold
+        // exceptions rather than removed, because removing instrumentation is not this arc's business.
         //
         // The spin is UNCHANGED — the barrier still waits out every registered blit, because
         // returning early would hand a teardown's about-to-be-unmapped surface to an in-flight blit,
