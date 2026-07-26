@@ -86,11 +86,40 @@ per-cell path exists.
 `smc::battery::snapshot()` reads the charge/voltage/amperage keys into a `BatterySnapshot` whose
 every field is `Option` — a key the SMC lacks stays `None` (honest absence, never a placeholder).
 `refresh_if_due()` throttles the port I/O to ~1 s and caches the snapshot; it emits a
-`:: SMC-BATT: … ::` witness (once on the first read, then on the cadence when a battery is present),
-and `battery::cached()` feeds the on-screen meter. The meter is rendered by the vug meter surface
+`:: SMC-BATT: … ::` witness (see the quiet-boot policy below), and `battery::cached()` feeds the
+on-screen meter. The meter is rendered by the vug meter surface
 (`vug::draw_meters`, the "BATT" bar + readout) and — because the serial-less metal debug view mirrors
 serial to the framebuffer — the `SMC-BATT` line is also on-screen in the `UNAOS_USBDEBUG` boot Peter
 photographs at the sitting.
+
+### Quiet-boot witness policy
+
+**Invariant: on a quiet attended boot, each periodic witness appears in the log exactly once —
+nothing scrolls.** This is a *UI* requirement, not log hygiene: `PANEL_CONSOLE` mirrors every
+`serial_println!` to the panel at the GUI takeover seam, so anything that re-prints on a timer
+scrolls the glass forever and ruins the photograph the sitting exists to produce.
+
+`SMC-BATT` therefore fires:
+
+* once on the first refresh (the honest `present=false` line on QEMU / a battery-less machine
+  included — it proves the M2 read path ran);
+* whenever the pack **state** changes — `present`, `soc_pct`, `ac_present`, `ac_stuck`,
+  `ac_derived`. Voltage, amperage and remaining-mAh are deliberately **not** part of the state key:
+  they jitter on every sweep on real hardware, so keying on them would re-print at 1 Hz forever;
+* whenever the sweep consumed retries (`retries=n/…`, `n > 0`) — including a `present=false`
+  drop-out sweep. Those are exactly the ones worth seeing.
+
+**No information is lost:** every state change and every retrying/failing sweep still prints, as do
+the one-per-transition BATMON-HOLD lines. Only an identical repeat of an unchanged reading is
+dropped. Under `UNAOS_BOOTLOG=1` (the `bootlog` feature — boot-log-held-on-screen sitting mode) the
+full ~1 s cadence is restored **exactly** as it was before this policy, so a sitting can still watch
+discharge track live; the two predicates are disjoint arms in `refresh_if_due()`, never OR-ed.
+
+The same audit was applied to the other periodic witnesses in that main-loop service group, all of
+which were already once-only and needed no change: `bootlog::service_serial_dump` (re-dumps only
+when the milestone ring has **grown**), `flight_recorder::service` (`ANNOUNCED` latch — one
+`FLIGHTREC:` PASS or error line per boot), and `xhci::log_summary_once` (fires on the exact 2000th
+main-loop pass).
 
 The M2 key decode (ui16 big-endian for voltage/capacity, signed for amperage, `BRSC` as %) is the
 documented standard for the era and is **provisional** until the M1 metal inventory confirms it; the

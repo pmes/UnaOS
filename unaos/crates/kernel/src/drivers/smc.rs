@@ -599,6 +599,12 @@ pub mod battery {
     static GOOD_MS: Mutex<u64> = Mutex::new(0);
     /// Whether the boot witness line has fired (once, when the first real reading lands).
     static WITNESSED: Mutex<bool> = Mutex::new(false);
+    /// QUIET-WITNESS state key: the fields whose change makes a re-print worth a reader's attention.
+    /// `present`, the charge percentage and the AC shape are the *state* of the pack; `volt/amp/rem`
+    /// jitter every sweep on real hardware, so keying on them would re-print at 1 Hz forever and
+    /// scroll the panel (`PANEL_CONSOLE` mirrors serial to the glass) — the exact thing the quiet-boot
+    /// witness policy forbids. `None` = nothing witnessed yet.
+    static LAST_STATE: Mutex<Option<(bool, Option<u16>, Option<bool>, bool, AcDerived)>> = Mutex::new(None);
     /// One-per-transition serial note for a failed refresh while a good reading is held
     /// (BATMON-HOLD evidence line; cleared when a good reading returns).
     static HOLDING: Mutex<bool> = Mutex::new(false);
@@ -764,15 +770,31 @@ pub mod battery {
             *CACHE.lock() = s;
         }
 
-        // Fire the witness on the FIRST refresh (proves the M2 read path ran — the honest
-        // `present=false` line on QEMU / a battery-less machine), then on the ~1 s cadence whenever
-        // a battery is present so a sitting can watch discharge/charge track. Throttled above.
-        // RETRIES-LATCH (cont.): also fire whenever the sweep that just finished consumed retries,
-        // even on a `present=false` drop-out sweep — those are precisely the ones worth seeing.
+        // QUIET-WITNESS (panel-witness audit): a quiet attended boot must show this witness EXACTLY
+        // ONCE — `PANEL_CONSOLE` mirrors every `serial_println!` to the panel at the takeover seam, so
+        // an unconditional 1 Hz re-print scrolls the glass forever and ruins any photograph of the
+        // boot. Fire on the FIRST refresh (proves the M2 read path ran — the honest `present=false`
+        // line on QEMU / a battery-less machine), then only when the *state* changed (see
+        // `LAST_STATE`) or when the sweep consumed retries (RETRIES-LATCH: those are precisely the
+        // ones worth seeing, `present=false` drop-outs included). Information is preserved — every
+        // state change and every retrying sweep still prints; only the identical-repeat is dropped.
+        // Under the `bootlog` feature (`UNAOS_BOOTLOG=1`, the boot-log-on-screen sitting mode) the
+        // old full ~1 s cadence is restored unchanged, so a sitting can still watch discharge track.
         let (rsweep, rtotal) = retry_counts();
+        let state = (s.present, s.soc_pct, s.ac_present, s.ac_stuck, s.ac_derived);
         let mut w = WITNESSED.lock();
-        if !*w || s.present || rsweep > 0 {
+        let mut last = LAST_STATE.lock();
+        let changed = last.map_or(true, |l| l != state);
+        // Two disjoint predicates, never OR-ed together, so the `bootlog` arm is *byte for byte* the
+        // pre-audit condition and that mode's log is unchanged.
+        let fire = if cfg!(feature = "bootlog") {
+            !*w || s.present || rsweep > 0
+        } else {
+            !*w || changed || rsweep > 0
+        };
+        if fire {
             *w = true;
+            *last = Some(state);
             // Absent keys print the "-" sentinel — never a number a reader could mistake for a real
             // value (0 mA is a plausible amperage, so `None` must NOT read as 0). snapshot() itself
             // keeps the honest `None`; only this human-facing witness applies the sentinel.
