@@ -41,7 +41,21 @@
 //! Colours are packed `0x00RRGGBB` — the json palette carries **no per-colour alpha**
 //! (every role is a 3-element sRGB triple), so the top byte is zero rather than an
 //! invented opaque `0xFF`. The gloss layer is the one place alpha appears, and it
-//! appears there as *separate scalar fields*, lifted below as `u8` 0..=255.
+//! appears there as *separate scalar fields*, lifted below as **Q16 fixed point**
+//! (`value * 65536`) rather than `u8` — see the fidelity note.
+//!
+//! # What is NOT lifted
+//!
+//! The json's `content_surface.Paper` block (`base_rgb`, `algo: "Laid"`,
+//! `amplitude: 0.02`, `scale: 4.0`, `octaves: 3`, `seed: 4223012511`) is
+//! **deliberately absent**, not an oversight. It is a *material* — quartzite's
+//! `surface.rs` layer, a procedurally generated paper texture that a content region
+//! composites under its content — not chrome, and not a constant: lifting it means
+//! porting a multi-octave noise generator, which is a rasterizer concern. When it
+//! lands it belongs beside the surface/material code (`docs/dev/OS/08_VIDEO/`
+//! rasterizer lane), reading `base_rgb` from `CONTENT_FILL` here — the two agree by
+//! construction, both being `[0.96, 0.949, 0.918]`. This module stays palette +
+//! metrics only.
 //!
 //! # The pinned rounding rule
 //!
@@ -54,9 +68,28 @@
 //! i.e. **clamp to `[0,1]`, multiply by 255, add 0.5, then truncate toward zero**
 //! (`as u8` on a non-negative `f32` truncates) — round-half-up on the f32 product,
 //! evaluated in `f32` precision at every step. Every literal below was produced by
-//! that exact rule, in f32, from the json value quoted in its provenance comment, so
-//! a kernel-drawn pixel and a quartzite-drawn pixel agree bit for bit. No float math
-//! survives into the kernel: the rounding happened here, at authoring time.
+//! that exact rule, in f32, from the json value quoted in its provenance comment. No
+//! float math survives into the kernel: the rounding happened here, at authoring time.
+//!
+//! # How far the fidelity claim reaches
+//!
+//! Bit-for-bit agreement with a quartzite-drawn pixel holds for **flat fills** — any
+//! surface painted with a palette role at full opacity. It does **not** extend to the
+//! gloss ramp, for two independent reasons:
+//!
+//!  1. the gloss scalars are quantized here, and a quantized endpoint is not the f32
+//!     the host uses (`0.55` as `u8` would be `140`, i.e. `0.54902`);
+//!  2. more fundamentally, the host does not round the *endpoints* at all — it
+//!     interpolates in f32 across the ramp and rounds each *composited per-pixel*
+//!     alpha. No table of endpoint constants can reproduce that by itself; matching
+//!     it is a property of the interpolator the wiring arc writes.
+//!
+//! So the gloss scalars below are carried at **Q16** (`value * 65536`, same
+//! round-half-up rule) rather than `u8`: Q16 makes the endpoint error ~4e-6 instead
+//! of ~2e-3, which keeps the residual error entirely in the interpolator where it
+//! belongs, and leaves no lossy `u8` sitting here as a trap for the wiring arc. The
+//! gradient stops (`TITLE_*_TOP`/`BOTTOM`) are exact colours and are unaffected by
+//! any of this; only the *interpolation between* them carries the same caveat.
 
 // ---------------------------------------------------------------------------
 // Palette — 18 roles, packed 0x00RRGGBB.
@@ -118,24 +151,30 @@ pub const ACCENT: u32 = 0x0047_6798;
 
 // ---------------------------------------------------------------------------
 // Gloss — `palette.gloss`. A white highlight applied with a two-stop alpha
-// falloff. The alphas are the json's own scalars, lifted through the same
-// `to_u8` rule so the compositor can work in integer alpha.
+// falloff. The three scalars are unit values in the json; they are carried here as
+// **Q16 fixed point** (`value * 65536`, same round-half-up rule) rather than `u8`,
+// because they are ramp *endpoints* fed to an interpolator, not final pixel alphas.
+// See the module header: the gloss ramp is explicitly outside the bit-for-bit
+// claim, and Q16 keeps the endpoint error negligible so the only error left is the
+// interpolator's own. Convert to 0..=255 at the point of use.
 // ---------------------------------------------------------------------------
+
+/// Fixed-point scale for the gloss scalars: `Q16_ONE` represents `1.0`.
+pub const Q16_ONE: u32 = 65536;
 
 /// `palette.gloss.highlight` = `[1.0, 1.0, 1.0]` — the gloss colour.
 pub const GLOSS_HIGHLIGHT: u32 = 0x00FF_FFFF;
 
-/// `palette.gloss.top_alpha` = `0.34` — gloss opacity at the top edge (0..=255).
-pub const GLOSS_TOP_ALPHA: u8 = 87;
+/// `palette.gloss.top_alpha` = `0.34` — gloss opacity at the top edge, Q16.
+pub const GLOSS_TOP_ALPHA_Q16: u32 = 22282;
 
-/// `palette.gloss.falloff` = `0.55` — gloss falloff shape parameter, as 0..=255.
+/// `palette.gloss.falloff` = `0.55` — gloss falloff shape parameter, Q16.
 ///
-/// The host stores this as a unit scalar and clamps it to `[0.01, 1.0]` before use;
-/// the fixed-point form here is the same number, ready for integer interpolation.
-pub const GLOSS_FALLOFF: u8 = 140;
+/// The host stores this as a unit scalar and clamps it to `[0.01, 1.0]` before use.
+pub const GLOSS_FALLOFF_Q16: u32 = 36045;
 
-/// `palette.gloss.bottom_alpha` = `0.06` — gloss opacity at the bottom edge (0..=255).
-pub const GLOSS_BOTTOM_ALPHA: u8 = 15;
+/// `palette.gloss.bottom_alpha` = `0.06` — gloss opacity at the bottom edge, Q16.
+pub const GLOSS_BOTTOM_ALPHA_Q16: u32 = 3932;
 
 // ---------------------------------------------------------------------------
 // Metrics — `metrics.*`, all integral in the json, all pixels unless noted.
@@ -261,5 +300,14 @@ const _: () = {
     // The gloss must be lighter than what it glosses, or it is not a highlight.
     assert!(GLOSS_HIGHLIGHT != CHROME_FACE);
     // The gloss fades downward.
-    assert!(GLOSS_TOP_ALPHA > GLOSS_BOTTOM_ALPHA);
+    assert!(GLOSS_TOP_ALPHA_Q16 > GLOSS_BOTTOM_ALPHA_Q16);
+};
+
+/// The gloss scalars are unit values, so no Q16 form may exceed `1.0`, and the
+/// falloff must be inside the `[0.01, 1.0]` band the host clamps it to.
+const _: () = {
+    assert!(GLOSS_TOP_ALPHA_Q16 <= Q16_ONE);
+    assert!(GLOSS_BOTTOM_ALPHA_Q16 <= Q16_ONE);
+    assert!(GLOSS_FALLOFF_Q16 <= Q16_ONE);
+    assert!(GLOSS_FALLOFF_Q16 >= Q16_ONE / 100);
 };

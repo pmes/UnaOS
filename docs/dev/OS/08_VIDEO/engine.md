@@ -2626,9 +2626,30 @@ the json palette carries no per-colour alpha, so the top byte is zero rather tha
 an invented `0xFF`. Each literal was produced from its json triple by quartzite's
 own converter, `to_u8(v) = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8` — clamp,
 ×255, +0.5, truncate toward zero, evaluated in `f32` at every step. Doing that
-rounding at authoring time is what keeps the kernel free of float at runtime while
-staying bit-identical to a quartzite-drawn pixel. The gloss alphas are lifted
-through the same rule into `u8` 0..=255.
+rounding at authoring time is what keeps the kernel free of float at runtime.
+
+**How far the fidelity claim reaches.** Bit-for-bit agreement with a
+quartzite-drawn pixel holds for **flat fills** — any surface painted with a palette
+role at full opacity. It does *not* extend to the gloss ramp. Two independent
+reasons: a quantized endpoint is not the host's f32 (`0.55` as `u8` would be `140`,
+i.e. `0.54902`); and, more fundamentally, the host never rounds the endpoints at
+all — it interpolates in f32 across the ramp and rounds each *composited per-pixel*
+alpha, which no table of endpoint constants can reproduce by itself. Matching it is
+a property of the interpolator the wiring arc writes. The three gloss scalars are
+therefore carried at **Q16** (`value × 65536`, same round-half-up rule) rather
+than `u8`, cutting endpoint error from ~2e-3 to ~4e-6 so the only residual error
+sits in the interpolator where it belongs, and leaving no lossy `u8` in the table
+as a trap. The title gradient *stops* are exact colours; only the interpolation
+between them carries the same caveat.
+
+**What is not lifted.** The json's `content_surface.Paper` block (`base_rgb`,
+`algo: "Laid"`, `amplitude: 0.02`, `scale: 4.0`, `octaves: 3`, `seed: 4223012511`)
+is deliberately absent, not an oversight. It is a *material* — quartzite's
+`surface.rs` layer, a procedural paper texture a content region composites under
+its content — not chrome, and not a constant: lifting it means porting a
+multi-octave noise generator, a rasterizer concern. It belongs beside the
+surface/material code when it lands, reading `base_rgb` from `CONTENT_FILL` (the
+two agree by construction). This table stays palette + metrics only.
 
 **Taste gate is OPEN.** These values are provisional-but-current — the visual
 verdict has not been taken. Because every consumer will read the names and never
