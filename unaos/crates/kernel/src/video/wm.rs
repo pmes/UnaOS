@@ -544,6 +544,11 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
         let barrier = DrainBarrier::drain();
         erase(&[b]);
         damage_intersecting(b.0, b.1, b.2, b.3);
+        // MOVE-VACATE (x86 s42 probe, `[wc-x] move-vacate … desktop=5/5 stale=0/5`): the erase
+        // REACHES glass, but a desktop-layer present can later repaint the unoccluded box from
+        // content that predates it — the ghost is the LATER writer, not the erase. Same cure
+        // `reclaim` uses: force the next present to re-derive the whole surface.
+        super::screen::request_full_present();
         // Re-open before recompositing — a composite under a raised barrier is a no-op.
         drop(barrier);
         composite();
