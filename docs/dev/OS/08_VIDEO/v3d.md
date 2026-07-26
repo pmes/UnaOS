@@ -2277,3 +2277,72 @@ not previously reach becomes reachable, and no CLE or PTB state is touched. Its 
 reads plus a sentinel seed into an unmapped page no job can address. The same poison-honest hub-identity
 gate applies, so QEMU `raspi4b` prints none of it — **P62 metal reads `[v3d62] mmufix` and
 `[v3d62] fault`.**
+
+## 36. Inside the PTB frame unit — the first two discriminators (V3D-63)
+
+Every instrument *outside* the PTB frame open/close unit now reads clean, so V3D-63
+attacks two of the three claims the campaign still carries as facts but has never
+falsified: that the control list executed (C1), and that items were fed to the PTB
+(C2). Two probes, one boot, both `UNAOS_V3D_DEEP`-gated (each rung carries the
+ladder's ~0.5 s `FLDONE` backstop) and both dormant on QEMU raspi4b, which models no
+V3D block and returns at `BLOCK-DOWN` long before they run. `kernel8-test` green for
+this arc means **no regression, nothing more**.
+
+Both probes are driven from one 2×2 matrix at the tail of `empty_frame_bisection`:
+`{Empty, Full}` × `{CL@0x35000, CL@0x39000}`, four kicks, one PCTR bank armed across
+each. `submit_bisect_rung_at` is the generalised rung submitter — same byte-for-byte
+kick as the `[v3d48]` ladder, with the CL's arena offset chosen by the caller.
+
+### `[v3d63] ctrartifact` — is `CT0LC` a counter or a mirror?
+
+The campaign's most-cited fact rests on `CT0LC` 0→`0x10000` and `CT0PC` 0→3, and
+`0x10000` is bit-identical to `OFF_BIN_CL`. Publishing the *same* content at two
+arena offsets separates the two readings; adding the `Empty`/`Full` axis separates
+"placement-independent" from "content-dependent" instead of confounding them.
+
+| Reading | Verdict |
+|---|---|
+| `CT0LC` echoes the CL's own offset/BA at both placements | **C1 falsified** — mirror, not count; re-aim at the CT0 kick / bin-thread start |
+| `CT0LC` changes with placement, content held fixed | C1's evidence contaminated; "the list executed" is unproven |
+| `CT0LC` placement-independent *and* content-dependent | **C1 stands**, now on a controlled reading |
+| `CT0LC` independent of both | evidence inert — cite it neither way |
+| `CT0PC` nonzero on a zero-primitive rung | **C2 loses its last support**, independently of RANK 1 |
+
+`CT0CS`'s `CTRUN` at wait-exit is printed per rung as a second, independent read on
+whether the bin control thread ever started.
+
+### `[v3d63] ptbctr` — the counter bank, and what it deliberately does not claim
+
+The arc asked for three *named* sources: CLE bin-thread active cycles, PTB
+primitives-binned, PTB primitives-clipped. **All three are DROPPED, not guessed, and
+the witness line says so on every boot.** This file admits a PCTR source id only when
+it falls between the two verified anchors — 16 `QPU_CYCLES_VALID_INSTR` and 32
+`CYCLE_COUNT` (the latter pinned to `v3d_regs.h V3D_PCTR_CYCLE_COUNT(ver)=32` for
+ver<71). Every candidate for those three names lies *outside* that bracket, and this
+tree carries no copy of `enum drm_v3d_perfcnt` to transcribe from. Naming them from
+memory is precisely the fabricated-constant class of PI-V3D-4/6/7.
+
+What is armed instead is a **search, not a claim**: seven source ids
+(`V3D63_SWEEP_SRC = [1, 10, 11, 12, 13, 28, 29]`) written into the SRC mux and
+printed **raw, by index, with no semantic label** — the treatment V3D-60 gave the
+unsourced MMU interrupt halves. Writing an id into a 7-bit SRC field selects a mux;
+it asserts nothing about what that mux carries. Slot 7 always carries the anchored
+src32 `CYCLE_COUNT` as the bank's own control.
+
+- src32 zero on any rung ⇒ the bank never counted ⇒ **INCONCLUSIVE**, explicitly not
+  clean. Instrument first; read no slot as evidence.
+- src32 live and every swept source zero on all four rungs ⇒ seven unidentified event
+  sources are silent on a demonstrably clocked block. This becomes evidence *about the
+  PTB/CLE* only once a source id is transcribed from the uapi enum and cross-checked
+  against the 16/32 anchors — the next arc's first task.
+- swept sources move on `Full` and stay zero on the zero-primitive rungs ⇒ a
+  content-dependent signal, the signature a genuine primitive/thread counter shows.
+  Identify the moving ids before naming what they prove.
+- any swept source moves on a zero-primitive frame ⇒ whatever the mux carries is not
+  gated on primitive content.
+
+Programming order is the exact `v3d_perfmon_start` idiom already used by
+`pctr_setup_cs_witness`, including the PI-V3D-39 SRC read-back that forces the posted
+source-selects to retire before the counters are cleared and enabled. Only PCTR
+config registers are written — no CLE/PTB state is touched, no GMP write, no
+`MMU_CTL` change, no new MMIO window.

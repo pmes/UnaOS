@@ -323,6 +323,34 @@ const PCTR_SRC_QPU_CYCLES_WAITING_TMU: u32 = 17; // QPU cycles stalled waiting o
 const PCTR_SRC_TMU_TCACHE_ACCESS: u32 = 24; // TMU tcache accesses (per TMU op that touches the cache)
 const PCTR_SRC_TMU_TCACHE_MISS: u32 = 25; // TMU tcache misses (a store to a fresh line misses)
 
+// ─── PI-V3D-63 (RANK 1, `ptbctr`) — the PTB/CLE-side counter bank. ───────────────────────────────────
+//
+// The arc's brief asks for three NAMED sources: a CLE bin-thread active-cycles counter, a PTB
+// primitives-binned counter, and a PTB primitives-clipped/discarded counter. **None of the three can be
+// cross-checked here.** The file's sourcing rule (see the PI-V3D-33 block above) admits a source id only
+// when it falls BETWEEN the two verified anchors — 16 `QPU_CYCLES_VALID_INSTR` and 32 `CYCLE_COUNT`,
+// the latter pinned to `v3d_regs.h V3D_PCTR_CYCLE_COUNT(ver)=32` for ver<71. Every candidate for those
+// three names lies OUTSIDE that bracket (the PTB primitive family below index 14, the CLE thread family
+// above 25), and this tree carries no copy of `enum drm_v3d_perfcnt` to transcribe from. Naming them
+// from memory is exactly the fabricated-constant bug class this campaign has been convicted of three
+// times (PI-V3D-4/6/7), so:
+//
+//   **All three NAMED sources are DROPPED, not guessed.** The witness line says so on every boot.
+//
+// What is armed instead is a SEARCH, not a claim: the seven source ids below are written into the SRC
+// mux and their counters are printed RAW, by index, with NO semantic label — the same treatment V3D-60
+// gave the unsourced MMU interrupt halves. Writing an id into a 7-bit SRC field selects a mux; it
+// asserts nothing about what that mux carries. The identification, if it comes, comes from the
+// DIFFERENTIAL (a zero-primitive frame vs. the full draw, the same bank on both), never from us. The ids
+// bracket the two families the brief names — the sub-14 primitive/front-end region and the post-25
+// thread/stall region — chosen as a search window and defensible only as one.
+//
+// Slot 7 always carries the anchored `PCTR_SRC_CYCLE_COUNT` (32) as the instrument's own control: if it
+// reads zero the bank was never counting and every other slot in the bank is INCONCLUSIVE, not clean.
+const V3D63_SWEEP_SRC: [u32; 7] = [1, 10, 11, 12, 13, 28, 29];
+const V3D63_CTRL_SLOT: usize = 7; // slot 7 = src32 CYCLE_COUNT, the block-was-clocked control
+const V3D63_PCTR_MASK: u32 = 0xFF; // eight counters enabled (0..7)
+
 // CLE (control-list executor) — CT1 is the RENDER queue. Submitting a job = write the ring's start
 // address to CT1QBA and its end address to CT1QEA; the hardware runs [BA, EA).
 const V3D_CLE_CT0CS: usize = 0x0100; // CT0 (bin) control/status — witness only (render job uses CT1)
@@ -563,6 +591,14 @@ const _: () = assert!(OFF_PROBE_BIN_OVERFLOW + PROBE_BIN_OVERFLOW_BYTES <= ARENA
 const OFF_BISECT_NULL_CODE: usize = 0x38000; // NULL coord shader: the 4-word Mesa thread-end tail
 const OFF_BISECT_NULL_SHADREC: usize = 0x38400; // shader record whose CS/VS/FS select the NULL program
 const _: () = assert!(OFF_BISECT_NULL_SHADREC + 36 + 16 <= ARENA_BYTES);
+
+// PI-V3D-63 (RANK 2, `ctrartifact`) — the RELOCATED bin control list. The whole probe is a placement
+// differential: the SAME `BinContent` published at two different arena offsets, so a `CT0LC` that reads
+// back the list's own base (the P45 reading `CT0LC=0x10000` is bit-identical to `OFF_BIN_CL`) is
+// distinguishable from a `CT0LC` that counts list items. One free page above the bisection scratch.
+const OFF_V3D63_BIN_CL_ALT: usize = 0x39000;
+const _: () = assert!(OFF_V3D63_BIN_CL_ALT + 0x1000 <= ARENA_BYTES);
+const _: () = assert!(OFF_V3D63_BIN_CL_ALT >= OFF_BISECT_NULL_SHADREC + 0x400);
 
 // ─── The V3D buffer arena. One page-aligned static in BSS. Because the bare-metal kernel is
 // identity-mapped in low RAM (VA == PA), the address of this static IS its ARM physical address,
@@ -6194,7 +6230,24 @@ fn submit_bisect_rung(rung: &str, content: BinContent, shadrec_off: usize) {
 /// PI-V3D-50 empty-after-fix re-run (post-reset-cycle) can print under `[v3d50]` while the bisection
 /// ladder keeps its `[v3d48]` tag.
 fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec_off: usize) {
-    let bin_len = build_bin_cl_content(OFF_PROBE_BIN_CL, shadrec_off, 1, content);
+    submit_bisect_rung_at(tag, rung, content, shadrec_off, OFF_PROBE_BIN_CL, false);
+}
+
+/// As `submit_bisect_rung_tagged`, but with the CL's arena offset chosen by the caller and an optional
+/// PI-V3D-63 counter bank armed across the kick. `cl_off` is what makes the V3D-63 RANK 2 placement
+/// differential possible: the identical `content` is published at two offsets, so a `CT0LC` that mirrors
+/// the list's base separates from a `CT0LC` that counts items. When `bank` is set, the V3D-63 sweep bank
+/// (see `V3D63_SWEEP_SRC`) is armed immediately before the GO and read at wait-exit — the counters then
+/// span exactly this frame. Returns the readback so the caller can compare rungs against each other.
+fn submit_bisect_rung_at(
+    tag: &str,
+    rung: &str,
+    content: BinContent,
+    shadrec_off: usize,
+    cl_off: usize,
+    bank: bool,
+) -> Option<V3d63Rung> {
+    let bin_len = build_bin_cl_content(cl_off, shadrec_off, 1, content);
 
     // Fresh, coherent bin scratch + overflow pool for this rung (reuses the M4 / probe regions).
     fill_region(OFF_TILESTATE, TILE_STATE_BYTES, 0);
@@ -6205,9 +6258,9 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
         arena_write_u32(OFF_PROBE_BIN_OVERFLOW + i, 0);
     }
     cache::clean_range(arena_phys() + OFF_PROBE_BIN_OVERFLOW, PROBE_BIN_OVERFLOW_BYTES);
-    cache::clean_range(arena_phys() + OFF_PROBE_BIN_CL, bin_len);
+    cache::clean_range(arena_phys() + cl_off, bin_len);
 
-    let bin_ba = (arena_phys() + OFF_PROBE_BIN_CL) as u32;
+    let bin_ba = (arena_phys() + cl_off) as u32;
     let bin_ea = bin_ba + bin_len as u32;
     let tile_alloc = (arena_phys() + OFF_BIN_TILEALLOC) as u32;
     let ts = (arena_phys() + OFF_TILESTATE) as u32;
@@ -6216,13 +6269,13 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
         || !arena_contains(ts as usize, TILE_STATE_BYTES)
     {
         serial_println!(":: V3D: [{}] {} — range escapes the arena, skipping (fail-closed) ::", tag, rung);
-        return;
+        return None;
     }
     // Decode the rung's CL packet-by-packet so the log shows exactly which packets this rung submitted.
-    decode_cl_packets("v3d48 bisect", OFF_PROBE_BIN_CL, bin_len);
+    decode_cl_packets("v3d48 bisect", cl_off, bin_len);
     // PI-V3D-57: the same list again, read back from the published bytes and packing-checked field by
     // field against the audited v42 encoding (see the packing-consistency note on v3d57_cl_mesa_diff).
-    v3d57_cl_mesa_diff("v3d48 bisect", OFF_PROBE_BIN_CL, bin_len);
+    v3d57_cl_mesa_diff("v3d48 bisect", cl_off, bin_len);
 
     clear_mmu_fault_latch("v3d48 bisect pre-kick");
     // PI-V3D-57: kernel-exact ORDER — BPOS=0 before the invalidate and before the CT0 tile-memory latch.
@@ -6271,6 +6324,12 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
     mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
     dsb();
     let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    // PI-V3D-63 (RANK 1): arm the sweep bank LAST before the GO, so the counters span this frame and
+    // nothing else. Writes only PCTR config registers — the same registers `pctr_setup_cs_witness`
+    // already writes for the coord-shader witness; no CLE/PTB state is touched.
+    if bank {
+        v3d63_pctr_arm();
+    }
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
     dsb();
     // PI-V3D-54 (RANK 2): audit the latched queue registers vs the intended [BA,EA) + built length BEFORE
@@ -6280,6 +6339,24 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
     let idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CT1CS_CTRUN, "CT0 v3d48 bisect");
     // PI-V3D-54 (RANK 1): trace the CL progression across this rung's retire-wait.
     let (sts, us, retired) = wait_fldone("v3d48 bisect", bin_ba, bin_ea);
+    // PI-V3D-63: stop + read the sweep bank at wait-exit, BEFORE the post-kick latch clear and before any
+    // richer readback perturbs the block. The CT0/PCS words below are the RANK 2 placement witness.
+    let v3d63 = if bank {
+        Some(V3d63Rung {
+            rung_off: cl_off as u32,
+            bin_ba,
+            bin_len: bin_len as u32,
+            retired,
+            ct0lc: mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0LC),
+            ct0pc: mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0PC),
+            ct0ca: mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA),
+            ct0cs: mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS),
+            pcs: mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS),
+            ctr: v3d63_pctr_read(),
+        })
+    } else {
+        None
+    };
     let bfc_after = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
     let pcs = mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS);
     // The empty-frame verdict is the discriminator the whole arc turns on; every richer rung's verdict is
@@ -6354,6 +6431,7 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
         );
     }
     clear_mmu_fault_latch("v3d48 bisect post-kick");
+    v3d63
 }
 
 /// PI-V3D-48 — the empty-frame bisection ladder. Runs a sequence of increasingly-populated bin frames on
@@ -6431,6 +6509,242 @@ fn empty_frame_bisection() {
     submit_bisect_rung("empty-frame", BinContent::Empty, OFF_SHADREC);
     submit_bisect_rung("state-no-prims", BinContent::StateNoPrims, OFF_SHADREC);
     submit_bisect_rung("prims-null-shader", BinContent::PrimsNullShader, OFF_BISECT_NULL_SHADREC);
+    // PI-V3D-63: the two PTB-unit discriminators ride the tail of the ladder — same boot, same block
+    // state, and after every banked rung above has printed.
+    v3d63_ptb_unit_probes();
+}
+
+/// PI-V3D-63 — one banked rung's readback: the RANK 2 placement witness (the CT0/PCS words) plus the
+/// RANK 1 counter bank read across the same frame. Compared across rungs by `v3d63_ptb_unit_probes`.
+#[derive(Clone, Copy)]
+struct V3d63Rung {
+    rung_off: u32,  // the CL's ARENA OFFSET — the value a base-mirroring CT0LC would echo
+    bin_ba: u32,    // the CL's PHYSICAL base as latched into CT0QBA
+    bin_len: u32,   // built list length in bytes
+    retired: bool,
+    ct0lc: u32,
+    ct0pc: u32,
+    ct0ca: u32,
+    ct0cs: u32,
+    pcs: u32,
+    ctr: V3d63Ctr,
+}
+
+/// PI-V3D-63 — the eight PCTR outputs of one sweep bank, plus the latched overflow mask. Slots 0..6 are
+/// `V3D63_SWEEP_SRC` (UNIDENTIFIED source ids, printed raw); slot 7 is the anchored src32 CYCLE_COUNT
+/// control that decides whether the bank counted at all.
+#[derive(Clone, Copy, Default)]
+struct V3d63Ctr {
+    c: [u32; 8],
+    ovf: u32,
+}
+
+impl V3d63Ctr {
+    /// The anchored control — total core cycles across the frame. Zero ⇒ the bank never counted and
+    /// every other slot is INCONCLUSIVE, never "clean".
+    fn ctrl(&self) -> u32 {
+        self.c[V3D63_CTRL_SLOT]
+    }
+    /// Bitmask of the swept slots (0..6) that read nonzero.
+    fn moved(&self) -> u32 {
+        let mut m = 0u32;
+        let mut i = 0;
+        while i < V3D63_SWEEP_SRC.len() {
+            if self.c[i] != 0 {
+                m |= 1 << i;
+            }
+            i += 1;
+        }
+        m
+    }
+}
+
+/// PI-V3D-63 (RANK 1) — arm the sweep bank. Programming order is the exact Linux
+/// `v3d_perfmon.c::v3d_perfmon_start` idiom the file already uses in `pctr_setup_cs_witness`, including
+/// the PI-V3D-39 SRC read-back that forces the posted source-selects to retire before the counters are
+/// cleared and enabled (the mitigation for the non-deterministic source latch). Eight counters: slots
+/// 0..6 carry `V3D63_SWEEP_SRC`, slot 7 carries the anchored `PCTR_SRC_CYCLE_COUNT`.
+fn v3d63_pctr_arm() {
+    let src_0_3 = (V3D63_SWEEP_SRC[0] & 0x7f)
+        | ((V3D63_SWEEP_SRC[1] & 0x7f) << 8)
+        | ((V3D63_SWEEP_SRC[2] & 0x7f) << 16)
+        | ((V3D63_SWEEP_SRC[3] & 0x7f) << 24);
+    let src_4_7 = (V3D63_SWEEP_SRC[4] & 0x7f)
+        | ((V3D63_SWEEP_SRC[5] & 0x7f) << 8)
+        | ((V3D63_SWEEP_SRC[6] & 0x7f) << 16)
+        | ((PCTR_SRC_CYCLE_COUNT & 0x7f) << 24);
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0); // stop any prior arming before reprogramming
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3, src_0_3);
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_4_7, src_4_7);
+    dsb();
+    // PI-V3D-39: read the selects back so the posted stores RETIRE and the mux is provably latched.
+    let _srclat = mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3)
+        | mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_4_7);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_CLR, V3D63_PCTR_MASK); // zero WHILE stopped
+    mmio_write(V3D_CORE0_BASE, V3D_PCTR_0_OVERFLOW, V3D63_PCTR_MASK); // clear latched overflow
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, V3D63_PCTR_MASK); // enable LAST, from a clean zero
+    dsb();
+}
+
+/// PI-V3D-63 (RANK 1) — read the eight counters, latch the overflow mask, and stop the bank.
+fn v3d63_pctr_read() -> V3d63Ctr {
+    dsb();
+    let mut out = V3d63Ctr::default();
+    let mut i = 0usize;
+    while i < 8 {
+        out.c[i] = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 4 * i);
+        i += 1;
+    }
+    out.ovf = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_OVERFLOW);
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0); // stop counting
+    dsb();
+    out
+}
+
+/// PI-V3D-63 — print one banked rung: the RANK 2 placement words and the RANK 1 raw counter bank.
+///
+/// Every swept counter is printed as `srcNN=value` with NO name attached. That is deliberate and it is
+/// the honest form: this tree cannot cross-check those ids against the `enum drm_v3d_perfcnt` anchors
+/// (16/32), so it makes no claim about which unit each mux carries. Only slot 7 (src32 CYCLE_COUNT) is
+/// named, because only slot 7 is anchored.
+fn v3d63_emit_rung(what: &str, r: &V3d63Rung) {
+    serial_println!(
+        "::   [v3d63] rung {} — CL off={:#x} BA={:#010x} len={} retired={} | CT0LC={:#x} CT0PC={:#x} CT0CA={:#010x} CT0CS={:#010x}(CTRUN={}) PCS={:#010x}(BMACTIVE={} BMBUSY={}) | bank: src{}={} src{}={} src{}={} src{}={} src{}={} src{}={} src{}={} [ALL SEVEN UNIDENTIFIED — raw mux reads, no name claimed] | src32 CYCLE_COUNT={} (control) OVERFLOW={:#010x} ::",
+        what, r.rung_off, r.bin_ba, r.bin_len, r.retired as u32,
+        r.ct0lc, r.ct0pc, r.ct0ca, r.ct0cs,
+        (r.ct0cs & V3D_CLE_CT1CS_CTRUN != 0) as u32,
+        r.pcs,
+        (r.pcs & V3D_PCS_BMACTIVE != 0) as u32,
+        (r.pcs & V3D_PCS_BMBUSY != 0) as u32,
+        V3D63_SWEEP_SRC[0], r.ctr.c[0],
+        V3D63_SWEEP_SRC[1], r.ctr.c[1],
+        V3D63_SWEEP_SRC[2], r.ctr.c[2],
+        V3D63_SWEEP_SRC[3], r.ctr.c[3],
+        V3D63_SWEEP_SRC[4], r.ctr.c[4],
+        V3D63_SWEEP_SRC[5], r.ctr.c[5],
+        V3D63_SWEEP_SRC[6], r.ctr.c[6],
+        r.ctr.ctrl(), r.ctr.ovf,
+    );
+}
+
+/// PI-V3D-63 — the arc's two discriminators, run as one 2×2 matrix on a single boot.
+///
+/// **RANK 2 `ctrartifact`** — falsify `CT0LC`/`CT0PC` as counters. The campaign's most-cited fact ("the
+/// control list executed") rests on `CT0LC` 0→`0x10000` and `CT0PC` 0→3, and `0x10000` is bit-identical
+/// to `OFF_BIN_CL`. So publish the SAME `BinContent` at two arena offsets (`OFF_PROBE_BIN_CL` and
+/// `OFF_V3D63_BIN_CL_ALT`) and submit both. A base-mirroring `CT0LC` tracks the placement; a counting
+/// `CT0LC` does not. The second axis is content/length: an `Empty` rung and a `Full` rung at each
+/// offset, so "placement-independent" and "content-dependent" are separated instead of confounded.
+/// `CT0PC` read on a rung with literally zero primitives is the independent kill-shot for C2.
+///
+/// **RANK 1 `ptbctr`** — the same counter bank armed across all four rungs. See the `V3D63_SWEEP_SRC`
+/// block for why all three of the brief's NAMED sources are DROPPED and a raw, unlabeled sweep is armed
+/// instead. The bank's own control is src32 `CYCLE_COUNT`; if it reads zero the bank never counted and
+/// the whole RANK 1 verdict is INCONCLUSIVE, never clean.
+///
+/// Poison-honest: gated on a live hub-identity read, and prints an explicit SKIPPED line when the block
+/// is down. QEMU raspi4b models no V3D block at all and returns at `BLOCK-DOWN` long before this runs,
+/// so this probe is dormant there — `kernel8-test` green means NO REGRESSION and nothing more.
+fn v3d63_ptb_unit_probes() {
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down => {
+            serial_println!(
+                ":: V3D: [v3d63] SKIPPED — hub IDENT0 reads 0x00000000 (block absent/unpowered; the QEMU raspi4b signature). Neither ptbctr nor ctrartifact was measured this boot; no verdict is implied ::"
+            );
+            return;
+        }
+        V3dPresence::Poison(w) => {
+            serial_println!(
+                ":: V3D: [v3d63] SKIPPED — hub IDENT0 reads poison {:#010x} (open-bus / firmware fill, not a live register). Neither ptbctr nor ctrartifact was measured this boot; no verdict is implied ::",
+                w
+            );
+            return;
+        }
+    }
+    serial_println!(
+        ":: V3D: [v3d63] ptb-unit probes — 2x2 matrix (Empty|Full) x (CL@{:#x}|CL@{:#x}), one PCTR sweep bank armed across every rung. RANK 2 reads the placement differential on CT0LC/CT0PC; RANK 1 reads the bank. Each rung carries the same ~0.5 s FLDONE backstop as the ladder above ::",
+        OFF_PROBE_BIN_CL, OFF_V3D63_BIN_CL_ALT
+    );
+
+    let e1 = submit_bisect_rung_at("v3d63", "empty@base", BinContent::Empty, OFF_SHADREC, OFF_PROBE_BIN_CL, true);
+    let e2 = submit_bisect_rung_at("v3d63", "empty@alt", BinContent::Empty, OFF_SHADREC, OFF_V3D63_BIN_CL_ALT, true);
+    let f1 = submit_bisect_rung_at("v3d63", "full@base", BinContent::Full, OFF_SHADREC, OFF_PROBE_BIN_CL, true);
+    let f2 = submit_bisect_rung_at("v3d63", "full@alt", BinContent::Full, OFF_SHADREC, OFF_V3D63_BIN_CL_ALT, true);
+
+    let (e1, e2, f1, f2) = match (e1, e2, f1, f2) {
+        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        _ => {
+            serial_println!(
+                ":: V3D: [v3d63] ctrartifact/ptbctr INCONCLUSIVE — at least one of the four rungs fail-closed before its kick (see the range-escapes line above), so neither the placement differential nor the counter bank has its full matrix. Instrument first; read no verdict off a partial matrix ::"
+            );
+            return;
+        }
+    };
+    v3d63_emit_rung("empty@base", &e1);
+    v3d63_emit_rung("empty@alt", &e2);
+    v3d63_emit_rung("full@base", &f1);
+    v3d63_emit_rung("full@alt", &f2);
+
+    // ── RANK 2 verdict — is CT0LC a mirror or a counter? ─────────────────────────────────────────────
+    let lc_tracks_place = e1.ct0lc != e2.ct0lc || f1.ct0lc != f2.ct0lc;
+    let lc_tracks_content = e1.ct0lc != f1.ct0lc;
+    let lc_echoes_off = e1.ct0lc == e1.rung_off && e2.ct0lc == e2.rung_off;
+    let lc_echoes_ba = e1.ct0lc == e1.bin_ba && e2.ct0lc == e2.bin_ba;
+    let lc_echoes_len = e1.ct0lc == e1.bin_len && e2.ct0lc == e2.bin_len;
+    let ct_verdict = if lc_echoes_off || lc_echoes_ba {
+        "CT0LC READS BACK THE LIST'S OWN ADDRESS at BOTH placements — it is a MIRROR, not a count. C1 (\"the control list executed\") is FALSIFIED on its primary evidence: the whole campaign's 0x10000 reading was OFF_BIN_CL echoed back. Re-aim at the CT0 kick / bin-thread start, and re-read every PTB verdict as taken on a thread that may never have run"
+    } else if lc_tracks_place {
+        "CT0LC CHANGED with the CL's placement while the content was held fixed — it carries an address-derived term, not a pure item count. C1's evidence is CONTAMINATED at minimum; treat \"the control list executed\" as unproven"
+    } else if lc_tracks_content {
+        "CT0LC is PLACEMENT-INDEPENDENT and CONTENT-DEPENDENT (same value at both offsets, different between Empty and Full) — it behaves as a genuine list-item counter. C1 STANDS, and now on a controlled reading instead of a coincidental one"
+    } else {
+        "CT0LC is placement-independent but ALSO content-independent — it reads the same on a zero-packet frame and the full draw. That is not a count of anything this frame contains; C1's evidence is INERT (neither mirror-proven nor counter-proven). Do not cite it either way"
+    };
+    // CT0PC on a rung with literally zero primitives is C2's independent test.
+    let pc_verdict = if e1.ct0pc == 0 && e2.ct0pc == 0 {
+        "CT0PC reads 0 on both zero-primitive rungs — consistent with a real primitive count, and it removes the P45 CT0PC=3 reading's ambiguity only if the Full rungs above read nonzero"
+    } else {
+        "CT0PC reads NONZERO on a frame containing literally zero primitives — CT0PC is NOT a primitive count, and C2 (\"items were fed to the PTB\") loses its last support independently of RANK 1"
+    };
+    serial_println!(
+        ":: V3D: [v3d63] ctrartifact — CT0LC empty {:#x}@{:#x} vs {:#x}@{:#x} | full {:#x}@{:#x} vs {:#x}@{:#x} | echoes-offset={} echoes-BA={} echoes-len={} tracks-placement={} tracks-content={} || CT0PC empty {:#x}/{:#x} full {:#x}/{:#x} (zero-prim rungs read {:#x},{:#x}) | CT0CS CTRUN-at-exit empty {}/{} full {}/{} — {} ; {} ::",
+        e1.ct0lc, e1.rung_off, e2.ct0lc, e2.rung_off,
+        f1.ct0lc, f1.rung_off, f2.ct0lc, f2.rung_off,
+        lc_echoes_off as u32, lc_echoes_ba as u32, lc_echoes_len as u32,
+        lc_tracks_place as u32, lc_tracks_content as u32,
+        e1.ct0pc, e2.ct0pc, f1.ct0pc, f2.ct0pc, e1.ct0pc, e2.ct0pc,
+        (e1.ct0cs & V3D_CLE_CT1CS_CTRUN != 0) as u32,
+        (e2.ct0cs & V3D_CLE_CT1CS_CTRUN != 0) as u32,
+        (f1.ct0cs & V3D_CLE_CT1CS_CTRUN != 0) as u32,
+        (f2.ct0cs & V3D_CLE_CT1CS_CTRUN != 0) as u32,
+        ct_verdict, pc_verdict,
+    );
+
+    // ── RANK 1 verdict — did the bank count, and did anything move? ──────────────────────────────────
+    let ctrl_live = e1.ctr.ctrl() != 0 && e2.ctr.ctrl() != 0 && f1.ctr.ctrl() != 0 && f2.ctr.ctrl() != 0;
+    let moved_empty = e1.ctr.moved() | e2.ctr.moved();
+    let moved_full = f1.ctr.moved() | f2.ctr.moved();
+    let ptb_verdict = if !ctrl_live {
+        "INCONCLUSIVE — the bank's own src32 CYCLE_COUNT control read ZERO on at least one rung, so the counter block was not counting and NOTHING here is a measurement. Instrument first: fix the arming before any slot in this bank is read as evidence. This is explicitly NOT a clean result"
+    } else if moved_empty == 0 && moved_full == 0 {
+        "the block was demonstrably CLOCKED (src32 nonzero on every rung) and NOT ONE swept source registered a single event — on the full draw as well as on the zero-primitive frames. Read with the standing caveat that this tree cannot say what these seven muxes carry: it is evidence that seven unidentified event sources are silent, and it becomes evidence about the PTB/CLE only once a source id is transcribed from `enum drm_v3d_perfcnt` and cross-checked against the 16/32 anchors. That transcription is the next arc's first task"
+    } else if moved_full != 0 && moved_empty == 0 {
+        "swept sources moved on the FULL draw and stayed ZERO on the zero-primitive frames — a content-dependent signal, which is exactly the signature a genuine primitive/thread counter would show. Identify the moving ids against the uapi enum before naming what they prove; the differential itself is sound regardless"
+    } else {
+        "at least one swept source moved on a frame containing ZERO primitives — whatever those muxes carry, it is not gated on primitive content. Identify the moving ids before reading anything into it"
+    };
+    serial_println!(
+        ":: V3D: [v3d63] ptbctr — DROPPED (not guessed): CLE-bin-thread-active-cycles, PTB-prims-binned, PTB-prims-clipped — none of the three can be cross-checked against this file's verified anchors (16 valid_instr, 32 cycle_count) and no `enum drm_v3d_perfcnt` copy exists in this tree; naming them would be the PI-V3D-4/6/7 fabricated-constant class. ARMED instead: raw sweep of UNIDENTIFIED source ids {:?} + src32 control | bank-counted(all rungs)={} | src32 empty {}/{} full {}/{} | moved-mask empty={:#04x} full={:#04x} (bit i = V3D63_SWEEP_SRC[i]) | OVERFLOW empty {:#010x}/{:#010x} full {:#010x}/{:#010x} — {} ::",
+        V3D63_SWEEP_SRC, ctrl_live as u32,
+        e1.ctr.ctrl(), e2.ctr.ctrl(), f1.ctr.ctrl(), f2.ctr.ctrl(),
+        moved_empty, moved_full,
+        e1.ctr.ovf, e2.ctr.ovf, f1.ctr.ovf, f2.ctr.ovf,
+        ptb_verdict,
+    );
 }
 
 /// Read a little-endian u32 out of the arena at `off` (probe scratch readback).
