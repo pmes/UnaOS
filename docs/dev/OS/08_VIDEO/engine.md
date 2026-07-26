@@ -2661,3 +2661,113 @@ construction (all `const`, no statics, no code, compile-time-only assertions), a
 that was verified rather than assumed: `target/pi_baremetal/kernel8.img` hashes
 identically with and without the change. `./arroyo check` clean on both arches;
 `./arroyo kernel8-test 90` MBENCH 80/80 required witnesses, 0 forbidden.
+
+### WC-L — the staged erase loses its DIRECT fallback
+
+WC-K staged the desktop fill but kept `fill_rect` as the last resort, and reported it. The metal
+answered on the P64 attended boot (capture `pi4-r23s1o`, lines 2041/2054):
+
+```
+[wc-k] erase box=514x526 staged=no reason=lock -> DIRECT
+```
+
+Twice, both on focus tab-cycle transitions (`[wc-c] focus tab-cycle`, `[wc-fv] focus shell hidden=2`)
+under ~99% core load. Every other erase that boot was `staged=yes … -> BUFFERED` and the rollup said
+`TEAR-FREE`. The spec FORBIDs both `staged=no` and `-> DIRECT`, so this was a structural red, not a
+cosmetic one: under the exact conditions the discipline exists for — contention — the erase path was
+writing the desktop fill straight into the buffer the HVS was scanning, which is the writing shape
+WC-G convicted and WC-K existed to remove. **The fallback did not make WC-K robust; it made WC-K
+conditional on nothing else wanting the lock.**
+
+#### Deferred damage, not a direct write
+
+There is no direct fill behind `stage_fill` any more. The four decline reasons split by whether a
+retry can ever succeed, and the split is the design:
+
+* **`lock`, `alloc` — transient.** Another core holds `STAGE` right now, or the heap could not grow
+  right now. The box is pushed onto `DEFER` as *deferred damage* — a desktop-colour repaint owed —
+  and `drain_deferred` erases it through the staged path on the next composite pass.
+* **`geom`, `cap` — permanent for that box.** A degenerate rect and an over-cap row are the same next
+  pass as this one, so deferring them would queue work that can never come off and the drain would
+  re-defer forever. They are dropped, counted as `declines`, and reported `-> LOST` so the existing
+  `-> UNSTAGED` FORBID catches them. Neither is reachable on any panel this kernel drives (a single
+  row is at most `width * 4` bytes, three orders of magnitude under `MAX_STAGE_BYTES`); the branch
+  exists so that if one ever becomes reachable it is a loud red rather than a silent spin.
+
+The drain is **WC-J's `reclaim` shape reused, not a second queue with its own rules**: erase,
+`damage_intersecting`, `request_full_present`. It runs at the head of `composite_inner`, *before* the
+dirty-set snapshot, so the windows the deferred paint reached are repainted by that same pass — a
+deferral costs one frame of latency and never a second composite. It runs *before* the F4
+`BlitGuard` for the reason the WC-I cursor bracket states: it acquires `SPRITE` (through `undraw`)
+and `TABLE`, and the drain barrier's termination argument requires that a draining teardown wait only
+on bounded blits, never on another core's lock.
+
+**Lock order.** `DEFER` is a leaf. It is acquired only by `defer_erase` and `drain_deferred`, held for
+an array copy, and no other lock — `TABLE`, `STAGE`, `WRITER`, `SPRITE` — is ever taken while it is
+held. The queue is emptied into a local snapshot before any staging is attempted, and the `alloc`
+path drops the `STAGE` guard before queueing. That is what lets `DEFER` use a blocking `lock()` where
+`STAGE` uses `try_lock`: a deferral has nowhere left to fall back to, so losing a box would lose the
+repaint outright, and a leaf held across no acquisition cannot invert anything. No new inversion is
+introduced.
+
+On a full queue (`MAX_DEFER` = `MAX_WINDOWS`) a box is unioned into slot 0 rather than dropped. Sound
+for the same reason `reclaim` is: the drain re-damages every window the painted box intersects, so
+enlarging it costs repaint work and can never leave a window with a bite taken out of it. Dropping
+would leave a dead window's last frame on the panel for the rest of the boot — the P61 ghost.
+
+**Arch-neutral.** The deferred-erase path — queue, drain, defer/drop decision, the `DEFER_*` reason
+constants — is uncfg'd and compiled on x86 too, because removing a direct front-buffer write is a
+correctness change and `wm.rs` is shared. Only the *reporting* is gated: `video::wcg` is
+`aarch64 + witness` only (pre-existing, `video/mod.rs`), so no `[wc-k]` line of any kind is reachable
+on x86 — which also means neither `staged=no` nor `-> DIRECT` can be printed on either arch.
+
+#### The witness
+
+`staged=defer` and `-> DEFERRED`, deliberately **not** `staged=no`/`-> DIRECT`. Both forbidden strings
+name the tearing regime; a deferral is neither, and giving it that vocabulary would either fail honest
+boots or force the FORBID to be loosened — and the FORBID is the arc's verdict. Deferral lines are
+unbudgeted to a 16-line spam bound, on WC-K's reasoning: what they report is a fill the panel has *not
+received yet*, and a boot that starts deferring after the rollup has fired must still be visible.
+
+The rollup gains `defers=`, `redefers=` and `coalesced=`. None of them enters the verdict precedence:
+a deferral arrived through the staged path one pass late, so it neither tore nor went direct, and
+demoting `TEAR-FREE` for it would make the honest report of contention indistinguishable from the
+regime the arc removed. `redefers=` is the one to watch — non-zero means the staging lock is contended
+for longer than a composite interval.
+
+#### The QEMU fixture, and what it does not prove
+
+QEMU has no contention of its own, which is exactly why WC-K shipped a fallback nobody had seen fire.
+A witness build therefore forces **one** deferral per boot: a one-shot latch in `stage_fill`, the WC-H
+fallback fixture's shape, gated on `!requeued` so the drain's retry is guaranteed to take the real
+staged path and the queued box is provably delivered rather than cycling.
+
+It proves the `-> DEFERRED` line, the queue round trip, the drain's re-damage, and the `BUFFERED`
+erase one pass later. It does **not** prove behaviour under genuine lock contention; that proof rides
+the next metal boot, and `redefers=` is where it will show.
+
+#### WC-L gate results (2026-07-26, QEMU raspi4b)
+
+`./arroyo kernel8-test 90` — **81/81 required witnesses, 0 forbidden**, 1886 lines scanned:
+
+```
+[wc-k] erase box=192x192 staged=defer reason=lock requeued=no -> DEFERRED
+[wc-k] erase box=192x192 staged=yes rowbytes=768 runs=192 contig=yes compose_us=178 present_us=542 rectscan_us=6666 torn=no -> BUFFERED
+[wc-k] erase box=130x142 staged=yes rowbytes=520 runs=142 contig=yes compose_us=7 present_us=182 rectscan_us=4930 torn=no -> BUFFERED
+[wc-k] rollup scope=fills samples=4 rows=618 torn=0 noncontig=0 declines=0 defers=1 redefers=0 coalesced=0 maxpresent_us=542 frame_us=16667 -> TEAR-FREE
+```
+
+The forced 192x192 deferral comes back `BUFFERED` on the next pass — the round trip, end to end.
+`declines=0`, `redefers=0`, `coalesced=0`. `./arroyo check`: both arches clean.
+
+#### Metal watch-list (WC-L)
+
+* The two P64 `-> DIRECT` lines must not recur — they are now unreachable by construction, so their
+  return would mean a fallback was reintroduced, not that contention got worse.
+* `defers=` non-zero on the bench is *expected and fine*; `redefers=` non-zero is the signal that the
+  staging lock is held longer than a composite interval.
+* Tab-cycle focus transitions under load: a deferred erase is one frame late, so a vacated box may
+  show its old contents for a single frame. That is the accepted cost. What must never appear is a
+  *partially* filled box or a horizontal band boundary.
+* `coalesced=` non-zero would mean more than `MAX_WINDOWS` boxes owed at once — worth understanding,
+  though the union keeps it correct.

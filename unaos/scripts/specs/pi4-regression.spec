@@ -562,6 +562,29 @@ FORBID \[wc-k\] .*contig=no
 FORBID \[wc-k\] .*-> SPLIT
 FORBID \[wc-k\] .*-> AT-RISK
 FORBID \[wc-k\] .*-> UNSTAGED
+# --- WC-L: the direct fallback is GONE. P64 (capture pi4-r23s1o) caught WC-K's last resort firing
+# ---    twice on focus tab-cycle transitions at ~99% core load --
+# ---    `[wc-k] erase box=514x526 staged=no reason=lock -> DIRECT` -- which is the exact
+# ---    front-buffer writing shape WC-G convicted and WC-K existed to remove. A fill that cannot
+# ---    take the staging lock is now queued as DEFERRED DAMAGE and erased through the staged path
+# ---    by the next composite pass, which also re-damages the windows the paint reached (WC-J's
+# ---    `reclaim` shape, reused). One frame late is a cost; a torn front-buffer write is a defect.
+# ---
+# ---    The two FORBIDs above are therefore now unreachable BY CONSTRUCTION rather than by luck:
+# ---    no emitter in `wcg` can produce `staged=no` or `-> DIRECT` for `[wc-k]` at all. They stay,
+# ---    because they are where a reintroduced fallback would land.
+# ---
+# ---    `-> DEFERRED` is REQUIRED, not merely permitted: a witness build forces exactly one
+# ---    deferral per boot (the one-shot fixture in `wm::stage_fill`), because QEMU has no
+# ---    contention of its own and a path whose only witness is a hardware boot is a path that
+# ---    regresses between hardware boots -- which is how WC-K shipped a fallback nobody had seen
+# ---    fire. The `BUFFERED` line the drain produces one pass later is covered by the REQUIRE above.
+# ---
+# ---    `staged=drop`/`-> LOST` is a fill that could neither stage nor defer (permanent `geom`/`cap`
+# ---    reasons, unreachable on any panel this kernel drives). It feeds `declines=` and so the
+# ---    `-> UNSTAGED` FORBID; the explicit FORBID here names the symptom as well as the verdict.
+REQUIRE \[wc-k\] erase box=.* staged=defer reason=.* requeued=no -> DEFERRED
+FORBID \[wc-k\] .*-> LOST
 # --- PULSE-2: the always-running per-core CPU pulse, as an INSTRUMENT PANEL in the standing gap at
 # ---    the bottom of the panel -- below the tiled windows, above the PI-UI-2 status line.
 # ---

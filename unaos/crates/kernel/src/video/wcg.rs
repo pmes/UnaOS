@@ -421,17 +421,17 @@ pub fn stage_flush(id: u32) {
 /// a one-off, few enough that the serial writes do not perturb a close path.
 const E_SAMPLES: u32 = 4;
 
-/// Decline lines to print before going quiet. Deliberately LARGER than [`E_SAMPLES`], and
+/// Deferral lines to print before going quiet. Deliberately LARGER than [`E_SAMPLES`], and
 /// deliberately NOT the same budget.
 ///
 /// WC-H's `stage_decline` shares one budget between successes and declines, which leaves a real
 /// blind spot: a boot that stages its first four composites and declines every one thereafter stops
 /// printing, and the rollup that already fired cannot retract. That is survivable there because a
 /// window composites continuously and the counters keep moving. It is not survivable here, because
-/// the FORBID on a direct fill is this arc's whole verdict — WC-G convicted this exact writing
-/// pattern, and a direct fill that appears only after the rollup has printed must still fail the
-/// gate. So a decline is printed whether or not the sample budget is spent, and only a boot that
-/// declines pathologically (more than this many) goes quiet, with the counter still running.
+/// what a deferral reports is a fill the panel has NOT received yet, and a boot that starts
+/// deferring only after the rollup has printed must still be visible on the wire. So a deferral is
+/// printed whether or not the sample budget is spent, and only a boot that defers pathologically
+/// (more than this many) goes quiet, with the counters still running.
 const E_DECL_LINES: u32 = 16;
 
 /// Staged fills recorded so far, capped at [`E_SAMPLES`] for line purposes.
@@ -440,21 +440,81 @@ static E_TAKEN: AtomicU32 = AtomicU32::new(0);
 static E_TORN: AtomicU32 = AtomicU32::new(0);
 /// Staged fills whose present was not `h` contiguous, row-stepped runs. Structural, not timing.
 static E_NONCONTIG: AtomicU32 = AtomicU32::new(0);
-/// Fills that fell back to the direct `fill_rect` — the pre-WC-K tearing regime.
+/// Fills the panel never received.
+///
+/// Under WC-K this meant "fell back to the direct `fill_rect`" — the tearing regime. WC-L removed
+/// that fallback, so the count now means the strictly worse and strictly rarer thing: a fill that
+/// could neither stage NOR be deferred, because its decline reason (`geom`, `cap`) is permanent for
+/// that box and requeueing it would spin the drain forever. The `-> UNSTAGED` verdict this drives is
+/// therefore still exactly right: those panel rows hold whatever the departed window left there, and
+/// no later pass is going to fix them. Neither reason is reachable on any panel this kernel drives.
 static E_DECLINE: AtomicU32 = AtomicU32::new(0);
-/// Decline lines emitted, capped at [`E_DECL_LINES`].
+/// WC-L — fills that could not reach the back layer on their first attempt and were queued as
+/// deferred damage instead of written direct. Not a defect: the fill still arrives through the
+/// staged path, one composite pass later.
+static E_DEFER: AtomicU32 = AtomicU32::new(0);
+/// WC-L — deferred boxes that were still unable to stage when the drain retried them, and went back
+/// on the queue. A steady-state non-zero here means the staging lock is contended for longer than a
+/// composite interval, which is worth seeing even though the outcome is still tear-free.
+static E_REDEFER: AtomicU32 = AtomicU32::new(0);
+/// WC-L — deferred boxes absorbed into an existing queue entry's bounding box because the queue was
+/// full. Sound (the drain re-damages every window the enlarged box reaches, exactly as WC-J's
+/// `reclaim` does), but it repaints more panel than strictly owed, so it is counted.
+static E_COALESCE: AtomicU32 = AtomicU32::new(0);
+/// Deferral lines emitted, capped at [`E_DECL_LINES`].
 static E_DECL_LINES_OUT: AtomicU32 = AtomicU32::new(0);
 /// The largest present-phase duration seen across staged fills, in microseconds.
 static E_MAXPRES: AtomicU64 = AtomicU64::new(0);
 /// Total panel rows presented by staged fills — the size of what this discipline now covers.
 static E_ROWS: AtomicU64 = AtomicU64::new(0);
 
-/// WC-K — record a desktop fill that did NOT reach the back layer and ran the direct `fill_rect`.
+/// WC-L — record a desktop fill that could not reach the back layer on this attempt and was queued
+/// as DEFERRED DAMAGE rather than written straight to the front buffer.
+///
+/// This replaces WC-K's `erase_decline`, and the replacement is the whole of WC-L. WC-K staged the
+/// erase but kept a direct `fill_rect` as the last resort, so under real contention — the P64
+/// attended boot, two focus tab-cycle transitions at ~99% core load — the erase path took
+/// `reason=lock` and wrote the desktop fill DIRECTLY into the buffer the HVS was scanning. That is
+/// the exact writing shape WC-G convicted and WC-K existed to remove, so the fallback did not make
+/// the arc robust, it made the arc conditional. There is now no direct fill to fall back to: the box
+/// goes on [`super::wm`]'s deferred-erase queue and the next composite pass erases it through the
+/// staged path. One frame late is a cost; a direct front-buffer write is a defect.
+///
+/// The line deliberately says `staged=defer`, not `staged=no`. The spec FORBIDs `staged=no` and
+/// `-> DIRECT` because both name the tearing regime; a deferral is neither, and giving it the
+/// forbidden vocabulary would either fail honest boots or force the FORBID to be loosened — and the
+/// FORBID is the arc's verdict.
 ///
 /// The reasons are [`super::wm::stage_window`]'s, reused rather than duplicated: the two staging
-/// paths decline for the same four causes and a separate vocabulary would only invite the two to
+/// paths defer for the same four causes and a separate vocabulary would only invite the two to
 /// drift.
-pub fn erase_decline(w: usize, h: usize, reason: u32) {
+pub fn erase_defer(w: usize, h: usize, reason: u32, requeued: bool) {
+    E_DEFER.fetch_add(1, Ordering::Relaxed);
+    if requeued {
+        E_REDEFER.fetch_add(1, Ordering::Relaxed);
+    }
+    let n = E_DECL_LINES_OUT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > E_DECL_LINES {
+        E_DECL_LINES_OUT.store(E_DECL_LINES + 1, Ordering::Relaxed);
+        return;
+    }
+    serial_println!(
+        "[wc-k] erase box={}x{} staged=defer reason={} requeued={} -> DEFERRED",
+        w,
+        h,
+        decl_name(reason),
+        if requeued { "yes" } else { "no" }
+    );
+}
+
+/// WC-L — record a desktop fill that was DROPPED: it could not stage, and its reason is permanent
+/// for that box, so deferring it would put work on the queue that can never come off. The panel rows
+/// keep whatever was there. This is a defect, and it is meant to read as one — it feeds `declines=`
+/// and so the rollup's `-> UNSTAGED`, which the spec FORBIDs.
+///
+/// Shares [`E_DECL_LINES`]'s budget with the deferral lines: both describe a fill that did not
+/// arrive, and a boot producing enough of either to exhaust the budget has already said so.
+pub fn erase_drop(w: usize, h: usize, reason: u32) {
     E_DECLINE.fetch_add(1, Ordering::Relaxed);
     let n = E_DECL_LINES_OUT.fetch_add(1, Ordering::Relaxed) + 1;
     if n > E_DECL_LINES {
@@ -462,11 +522,18 @@ pub fn erase_decline(w: usize, h: usize, reason: u32) {
         return;
     }
     serial_println!(
-        "[wc-k] erase box={}x{} staged=no reason={} -> DIRECT",
+        "[wc-k] erase box={}x{} staged=drop reason={} -> LOST",
         w,
         h,
         decl_name(reason)
     );
+}
+
+/// WC-L — record a deferred box absorbed into an existing queue entry because the queue was full.
+/// Counted rather than printed per event: coalescing is bounded work on a bounded queue, and the
+/// rollup's `coalesced=` is where a boot that is doing it constantly becomes visible.
+pub fn erase_coalesce() {
+    E_COALESCE.fetch_add(1, Ordering::Relaxed);
 }
 
 /// WC-K — report one staged desktop fill: the box, the composed row, how long the compose and the
@@ -540,8 +607,14 @@ pub fn erase_note(
         // observable inside a boot can distinguish "the erase path is finished" from "the next app
         // has not closed a window yet", so this line claims only the fills it has SEEN. The
         // "did a direct fill ever happen, anywhere, at any point" question is the spec's FORBID on
-        // `-> DIRECT`, which needs no completeness claim and which the unbudgeted decline lines keep
-        // reachable for the whole boot.
+        // `-> DIRECT`, which needs no completeness claim and which — after WC-L — no emitter in this
+        // module can produce at all.
+        //
+        // WC-L: `defers`/`redefers`/`coalesced` deliberately do NOT enter the precedence. A deferral
+        // is a fill that arrived through the staged path one pass late, so it neither tore nor went
+        // direct, and demoting the verdict for it would make the honest report of contention
+        // indistinguishable from the regime the arc removed. They are reported as counts because
+        // the operator wants to know contention happened, not because it invalidates TEAR-FREE.
         let torn_n = E_TORN.load(Ordering::Relaxed);
         let nc = E_NONCONTIG.load(Ordering::Relaxed);
         let decl = E_DECLINE.load(Ordering::Relaxed);
@@ -555,12 +628,15 @@ pub fn erase_note(
             "TEAR-FREE"
         };
         serial_println!(
-            "[wc-k] rollup scope=fills samples={} rows={} torn={} noncontig={} declines={} maxpresent_us={} frame_us={} -> {}",
+            "[wc-k] rollup scope=fills samples={} rows={} torn={} noncontig={} declines={} defers={} redefers={} coalesced={} maxpresent_us={} frame_us={} -> {}",
             n,
             E_ROWS.load(Ordering::Relaxed),
             torn_n,
             nc,
             decl,
+            E_DEFER.load(Ordering::Relaxed),
+            E_REDEFER.load(Ordering::Relaxed),
+            E_COALESCE.load(Ordering::Relaxed),
             E_MAXPRES.load(Ordering::Relaxed),
             FRAME_US,
             verdict

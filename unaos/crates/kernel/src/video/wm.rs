@@ -591,9 +591,25 @@ pub const DESKTOP_BG: u32 = 0x002D_2B55;
 ///
 /// [`stage_fill`] gives it the WC-H discipline, and deliberately not a third one: compose in cached
 /// RAM, present as contiguous full-width row copies out of the same [`STAGE`] buffer, under the same
-/// cap, the same `try_lock`, and the same four fall-back declines. The fallback direct fill remains
-/// as the last resort, and — per WC-H's `stage_decline` precedent — a decline is a SAMPLE that says
-/// so on the wire, because a silent fallback here is precisely the tearing regime the arc removes.
+/// cap, and the same `try_lock`.
+///
+/// ### WC-L — why there is no direct fallback any more
+///
+/// WC-K kept `fill_rect` as the last resort when staging was unavailable, and reported it. The P64
+/// attended boot showed what that costs: on two focus tab-cycle transitions under ~99% core load the
+/// erase path could not take [`STAGE`] and wrote a 514x526 desktop fill DIRECTLY into the buffer the
+/// HVS was scanning — `[wc-k] erase box=514x526 staged=no reason=lock -> DIRECT`, twice. Every other
+/// fill that boot was `BUFFERED`. So the fallback did not make the discipline robust; it made it
+/// conditional on nothing else wanting the lock, and it re-introduced under load exactly the last
+/// direct front-buffer writer WC-K existed to remove.
+///
+/// The fallback is therefore GONE. When [`stage_fill`] cannot stage, the box is pushed onto
+/// [`DEFER`] as deferred damage — desktop-colour repaint owed — and [`drain_deferred`], at the head
+/// of the next composite pass, erases it through the staged path and re-damages the windows the
+/// paint reached. This is not a second queue with its own rules: it is WC-J's `reclaim` shape
+/// (erase, `damage_intersecting`, `request_full_present`) applied to a box whose erase arrived one
+/// pass late. A one-frame-late desktop repaint is a cost the panel can absorb; a torn front-buffer
+/// write is not.
 ///
 /// ### Cursor coherence
 ///
@@ -628,10 +644,12 @@ fn erase(boxes: &[(usize, usize, usize, usize)]) {
         }
         // F6 — clip before iterating, as in `draw_window`.
         let (w, h) = (w.min(info.width - x), h.min(info.height - y));
-        // WC-K — staged first; the direct fill is the fallback, and `stage_fill` has already said on
-        // the wire which one this was.
-        if !stage_fill(&fb, x, y, w, h, DESKTOP_BG) {
-            fb.fill_rect(x, y, w, h, DESKTOP_BG);
+        // WC-L — staged or nothing. A box that cannot stage becomes deferred damage; it does NOT
+        // reach the panel through this call, so the cache flush below is skipped for it too (there
+        // is nothing of ours in those rows to publish, and flushing them would push whatever the
+        // window left there back out as if it were fresh).
+        if !stage_fill(&fb, x, y, w, h, DESKTOP_BG, false) {
+            continue;
         }
         let y0 = y.min(info.height);
         let y1 = (y + h).min(info.height);
@@ -1168,6 +1186,27 @@ fn composite_inner() -> CursorTail {
         WCI_CURSOR_PASSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if disturbed {
             WCI_CURSOR_BRACKETS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    // WC-L — DRAIN THE DEFERRED ERASES, before the dirty-set snapshot below.
+    //
+    // Placement is the whole point. Boxes land on the queue when `erase` could not take `STAGE`
+    // (P64: two focus tab-cycles at ~99% core load), and they are owed a desktop-colour repaint. Draining
+    // HERE means the `damage_intersecting` the drain performs is observed by the snapshot in the very
+    // next statement, so the windows the deferred paint reached are repainted by THIS pass — a
+    // deferral costs one frame of latency and never a second composite.
+    //
+    // Before the `BlitGuard`, for the reason the cursor bracket above states: the drain takes
+    // `SPRITE` (through `undraw`) and `TABLE`, and F4's termination argument requires that the only
+    // thing a draining teardown waits on is bounded blits, not another core's lock.
+    //
+    // The drain reports `disturbed` because it takes the sprite off the panel; the caller's tail is
+    // what puts it back, which is `erase`'s existing contract and not a new one.
+    {
+        let fb = *super::WRITER.lock();
+        if fb.is_ready() && drain_deferred(&fb) {
+            disturbed = true;
         }
     }
 
@@ -1967,6 +2006,155 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
         && b.1 < a.1.saturating_add(a.3)
 }
 
+// ---- WC-L: the deferred-erase queue ------------------------------------------------------------
+
+/// Deferred erase boxes held at once. [`MAX_WINDOWS`] because the deferred set is bounded by the
+/// same thing every other erase set in this module is: the boxes a re-tile or a teardown can vacate
+/// in one operation is at most the live window count. Overflow is not dropped — it coalesces (see
+/// [`defer_erase`]) — so this is a fidelity bound, not a correctness one.
+const MAX_DEFER: usize = MAX_WINDOWS;
+
+/// Why a fill could not stage. These mirror `wcg`'s `DECL_*`, and the mirror is not duplication for
+/// its own sake: `wcg` is compiled only for `aarch64 + witness`, while WC-L's decision about what to
+/// do with a fill that cannot stage — defer it or drop it — is a CORRECTNESS decision that every
+/// build makes, witness or not. The reason therefore has to exist outside the witness. The `const`
+/// assertions below tie the two vocabularies together at compile time on the builds that have both,
+/// so a renumbering in `wcg` cannot silently mislabel these lines.
+const DEFER_GEOM: u32 = 1;
+const DEFER_CAP: u32 = 2;
+const DEFER_LOCK: u32 = 3;
+const DEFER_ALLOC: u32 = 4;
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+const _: () = assert!(
+    DEFER_GEOM == super::wcg::DECL_GEOM
+        && DEFER_CAP == super::wcg::DECL_CAP
+        && DEFER_LOCK == super::wcg::DECL_LOCK
+        && DEFER_ALLOC == super::wcg::DECL_ALLOC
+);
+
+/// WC-L — panel boxes owed a desktop-colour repaint that could not be staged when they were vacated.
+///
+/// Drained by [`drain_deferred`] at the head of every composite pass.
+///
+/// **Lock discipline.** This is a LEAF: it is acquired only by [`defer_erase`] and
+/// [`drain_deferred`], it is held for an array copy and nothing else, and no other lock of this
+/// module — `TABLE`, `STAGE`, `WRITER`, the cursor module's `SPRITE` — is ever taken while it is
+/// held. That is what lets it use a blocking `lock()` where [`STAGE`] uses `try_lock`: a deferral
+/// has nowhere left to fall back to, so losing a box here would lose the repaint outright, and a
+/// leaf held for a bounded array write cannot deadlock. The converse order is the one that matters
+/// and it is the one the code takes: `STAGE` (released) → `DEFER`, and `DEFER` (released) →
+/// `STAGE`/`TABLE` in the drain. No new inversion is introduced because `DEFER` is never held across
+/// any acquisition at all.
+static DEFER: Mutex<([(usize, usize, usize, usize); MAX_DEFER], usize)> =
+    Mutex::new(([(0, 0, 0, 0); MAX_DEFER], 0));
+
+/// Cheap "is anything owed" flag, mirroring `DEFER.1` and maintained under the lock. The drain runs
+/// at the head of every composite — which is every window present, on every core — so the common
+/// case must cost one relaxed load and no lock traffic at all.
+static DEFER_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// WC-L — one-shot latch for the deferral fixture in [`stage_fill`]. Witness builds only.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static DEFER_FIXTURE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// WC-L — queue a clipped panel box for a desktop repaint the staged path could not deliver now.
+///
+/// `requeued` distinguishes a box deferred at its original erase from one the drain retried and
+/// could still not stage; both are honest, but a boot doing the second is telling the operator the
+/// staging lock is contended for longer than a composite interval.
+///
+/// On a full queue the box is UNIONED into slot 0 rather than dropped. The union is sound for the
+/// same reason WC-J's `reclaim` is: the drain re-damages every window the painted box intersects, so
+/// enlarging the box costs repaint work and can never leave a window with a bite taken out of it.
+/// Dropping, by contrast, would leave a dead window's last frame on the panel for the rest of the
+/// boot — the P61 ghost.
+fn defer_erase(x: usize, y: usize, w: usize, h: usize, reason: u32, requeued: bool) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    {
+        let mut q = DEFER.lock();
+        let (boxes, n) = &mut *q;
+        if *n < MAX_DEFER {
+            boxes[*n] = (x, y, w, h);
+            *n += 1;
+        } else {
+            let (bx, by, bw, bh) = boxes[0];
+            let x0 = bx.min(x);
+            let y0 = by.min(y);
+            let x1 = (bx + bw).max(x + w);
+            let y1 = (by + bh).max(y + h);
+            boxes[0] = (x0, y0, x1 - x0, y1 - y0);
+            #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+            super::wcg::erase_coalesce();
+        }
+        DEFER_N.store(*n, core::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    super::wcg::erase_defer(w, h, reason, requeued);
+    #[cfg(not(all(target_arch = "aarch64", feature = "witness")))]
+    let _ = (reason, requeued);
+}
+
+/// WC-L — erase the boxes owed from earlier passes, through the staged path, and re-damage what the
+/// paint reached. Returns `true` if anything was painted.
+///
+/// Called from [`composite_inner`] BEFORE the dirty-set snapshot, so the windows this re-damages are
+/// repainted by the very pass that did the erasing rather than by some later one. It runs outside
+/// the F4 `BlitGuard` window on purpose: it acquires the cursor module's `SPRITE` (via `undraw`) and
+/// `TABLE`, and the drain barrier's termination argument requires that neither be in its wait set.
+///
+/// The queue is emptied into a local snapshot before any staging is attempted, so `DEFER` is not
+/// held across `STAGE` or `TABLE`; a box that still cannot stage goes back on through
+/// [`defer_erase`] after the lock has been released and retaken.
+fn drain_deferred(fb: &super::FrameBuffer) -> bool {
+    if DEFER_N.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let (boxes, n) = {
+        let mut q = DEFER.lock();
+        let snap = *q;
+        q.1 = 0;
+        DEFER_N.store(0, core::sync::atomic::Ordering::Relaxed);
+        snap
+    };
+    if n == 0 {
+        return false;
+    }
+    // The sprite comes off the panel before the first fill byte lands, exactly as `erase` does it,
+    // and the caller's tail puts it back — `composite_inner` reports `disturbed` for this drain so
+    // the tail is `Repaint` rather than `Untouched`.
+    super::cursor::undraw();
+    let info = fb.info();
+    let row_bytes = info.stride * info.bytes_per_pixel;
+    let mut painted = false;
+    for &(x, y, w, h) in boxes[..n].iter() {
+        // Re-clip: a coalesced union is a synthesised box, and the panel geometry it was clipped
+        // against belonged to the original erase.
+        if w == 0 || h == 0 || x >= info.width || y >= info.height {
+            continue;
+        }
+        let (w, h) = (w.min(info.width - x), h.min(info.height - y));
+        if !stage_fill(fb, x, y, w, h, DESKTOP_BG, true) {
+            // `stage_fill` re-queued it; leave the panel alone and try again next pass.
+            continue;
+        }
+        let y0 = y.min(info.height);
+        let y1 = (y + h).min(info.height);
+        if y1 > y0 {
+            fb.flush_range(y0 * row_bytes, (y1 - y0) * row_bytes);
+        }
+        damage_intersecting(x, y, w, h);
+        painted = true;
+    }
+    if painted {
+        // WC-J's third step: only the desktop can put its own content (console text, status strip)
+        // back under a departed window; the erase above can only paint `DESKTOP_BG`.
+        super::screen::request_full_present();
+    }
+    painted
+}
+
 // ---- WC-H: the window back-layer ---------------------------------------------------------------
 
 /// WC-H — hard ceiling on the staging buffer, in bytes. A window whose clipped outer box needs more
@@ -2411,37 +2599,92 @@ fn stage_window(
 /// into the desktop's pad. Invisible on this panel (the pad is not scanned), but the back layer's
 /// "every pixel the present copies was written by this pass" invariant is load-bearing and cheap to
 /// keep honest for one row.
-fn stage_fill(fb: &super::FrameBuffer, x: usize, y: usize, w: usize, h: usize, color: u32) -> bool {
-    // Every exit below is a DECLINE: this fill reaches the panel through the pre-WC-K direct
-    // `fill_rect` — the tearing regime — and the witness must say so.
-    macro_rules! decline {
+#[allow(clippy::too_many_arguments)]
+fn stage_fill(
+    fb: &super::FrameBuffer,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: u32,
+    requeued: bool,
+) -> bool {
+    // WC-L — the four decline reasons split by whether RETRYING can ever succeed, and the split is
+    // load-bearing rather than tidy.
+    //
+    // `lock` and `alloc` are TRANSIENT: another core holds `STAGE` right now, or the heap could not
+    // grow right now. Both are answered by trying again a pass later, so the box is DEFERRED — the
+    // fill does not reach the panel in this call, and `drain_deferred` delivers it through this same
+    // staged path next composite. There is no direct `fill_rect` behind this function any more.
+    macro_rules! defer {
         ($reason:expr) => {{
-            #[cfg(all(target_arch = "aarch64", feature = "witness"))]
-            super::wcg::erase_decline(w, h, $reason);
+            defer_erase(x, y, w, h, $reason, requeued);
             return false;
         }};
+    }
+    // `geom` and `cap` are PERMANENT for a given box: a degenerate rect and an over-cap row are the
+    // same next pass as this one, so deferring them would put a box on the queue that can never come
+    // off it, and the drain would re-defer it forever. They are DROPPED instead, and counted as
+    // declines — which is what they are, a fill the panel never received — so the rollup's
+    // `-> UNSTAGED` FORBID catches them. Neither is reachable on any panel this kernel drives (a
+    // single row is at most `width * 4` bytes, three orders of magnitude under `MAX_STAGE_BYTES`);
+    // the branch exists so that if one ever becomes reachable it is a loud red and not a silent
+    // spin.
+    macro_rules! drop_fill {
+        ($reason:expr) => {{
+            // Named unconditionally: the reason is part of the CORRECTNESS decision (drop, not
+            // defer) on every build, and only its reporting is witness-gated.
+            let _reason: u32 = $reason;
+            #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+            super::wcg::erase_drop(w, h, _reason);
+            return false;
+        }};
+    }
+    // WC-L DEFERRAL FIXTURE (witness builds only) — force exactly one deferral per boot, on the
+    // first erase that is not already a drain retry.
+    //
+    // QEMU never reaches this path on its own, and that is precisely why WC-K shipped with a direct
+    // fallback nobody had seen fire: the condition needs a second core wanting `STAGE` at the moment
+    // a window is torn down, which took a 1920x1200 bench panel at ~99% load to produce, twice, in
+    // one attended boot. A path whose only witness is a hardware boot is a path that regresses
+    // between hardware boots. The latch is the WC-H fallback fixture's shape, for the same reason and
+    // with the same one-shot discipline: `swap(true)` so it can fire at most once, and gated on
+    // `!requeued` so the drain's retry is guaranteed to take the real staged path and the queued box
+    // is provably delivered rather than cycling.
+    //
+    // What it proves in `kernel8-test`: the `-> DEFERRED` line, the queue round trip, the drain's
+    // `damage_intersecting` re-damage, and the `BUFFERED` erase that follows one pass later. What it
+    // does NOT prove is behaviour under genuine lock contention — for that the proof still rides a
+    // metal boot, and the rollup's `redefers=` is where it will show.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    {
+        if !requeued && !DEFER_FIXTURE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            defer!(DEFER_LOCK);
+        }
     }
     let info = fb.info();
     let bpp = info.bytes_per_pixel;
     if w == 0 || h == 0 || bpp == 0 {
-        decline!(super::wcg::DECL_GEOM);
+        drop_fill!(DEFER_GEOM);
     }
     // Caller clipped `(x, y, w, h)` to the panel, so neither product can wrap.
     let row_bytes = w * bpp;
     let fb_row = info.stride * bpp;
     if row_bytes == 0 || row_bytes > MAX_STAGE_BYTES {
-        decline!(super::wcg::DECL_CAP);
+        drop_fill!(DEFER_CAP);
     }
     let mut stage = match STAGE.try_lock() {
         Some(g) => g,
-        None => decline!(super::wcg::DECL_LOCK),
+        None => defer!(DEFER_LOCK),
     };
     if stage.len() < row_bytes {
         let add = row_bytes - stage.len();
         // Same `try_reserve` + `resize` contract as `stage_window`: an exhausted heap declines here
         // rather than panicking from a close path.
         if stage.try_reserve(add).is_err() {
-            decline!(super::wcg::DECL_ALLOC);
+            // Drop the guard before queueing: `DEFER` must never be taken while `STAGE` is held.
+            drop(stage);
+            defer!(DEFER_ALLOC);
         }
         stage.resize(row_bytes, 0);
     }
