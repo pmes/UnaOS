@@ -229,19 +229,35 @@ trace; the number is a one-per-window rollup, every `SPREAD2_WINDOW` (60)
 parallel frames:
 
 ```
-:: [spread2] window 60 frames cores 4 bands 60,60,38,60 rows 3755,3149,1781,1939 ratio 210 ::
+:: [spread2] window 60 frames cores 4 bands 60,60,38,60 rows 3755,3149,1781,1939 rpb 6258,5248,4686,3231 ratio 193 ::
 ```
 
-`cores` is how many cores took rows, `bands`/`rows` are per-core totals for the
-window, and `ratio` is max/min rows in hundredths (100 = perfectly even). In the
-reading above the outlier is core 2, which was only `tracked` for 38 of the 60
-frames — participation, not weighting.
+`cores` is how many cores drew bands, `bands`/`rows` are per-core totals for the
+window, `rpb` is rows-per-band in hundredths, and `ratio` is max/min **`rpb`** in
+hundredths (100 = perfectly even).
+
+The normalization is the point. Raw row totals are not comparable across cores:
+core 2 above was `tracked` for only 38 of the 60 frames, so it drew fewer bands
+and its row total is low for a reason that has nothing to do with the split —
+a raw max/min would have read 210 and blamed the weighting for participation.
+Dividing by each core's own band count makes the ratio a statement about
+weighting alone.
+
+Normalized, the metric has a **structural bound**: headroom runs from 100 down to
+`HEADROOM_FLOOR` (25), so the fattest average band can legitimately be 4x the
+thinnest and no more. That makes 5x a real tripwire rather than a guess. A core
+that draws bands but accumulates zero rows for an entire window reports a `9999`
+sentinel — with `PAR_MIN_ROWS` at 64 and the floor holding the thinnest band well
+above zero, that state is pathological, not an edge case, so it trips rather than
+reporting a benign 0.
 
 Because `vugpar` is off unless `UNAOS_VUGPAR=1`, the default regression log has
-no `[spread2]` line at all, so the spec carries **FORBIDs** rather than a
-REQUIRE (`cores 1`, and `ratio` of four digits or more): zero hits on a default
-log, real assertions on a `UNAOS_VUGPAR=1` log. BG-SPREAD's `BGSPREAD` leg is
-unaffected — it is ASID/parent-placement keyed and reads no band state.
+no `[spread2]` line at all, so the spec carries a **FORBID** rather than a
+REQUIRE — `ratio` of 500 or more: zero hits on a default log, a real assertion on
+a `UNAOS_VUGPAR=1` log. There is deliberately no `cores 1` tripwire; `nh == 0`
+exits to the serial path before any rollup, so `nbands` is always >= 2 and such a
+line cannot print. BG-SPREAD's `BGSPREAD` leg is unaffected — it is
+ASID/parent-placement keyed and reads no band state.
 
 ### BSP scheduling + work stealing (aarch64, SMP-BAL)
 

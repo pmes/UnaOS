@@ -794,9 +794,13 @@ FORBID BGSPREAD: .*-> FAIL
 # SPREAD-2 — VUG-PAR band distribution. The `[spread2]` rollup only exists when the image carries the
 # `vugpar` feature (UNAOS_VUGPAR=1), which the default suite does not set, so these are FORBIDs rather
 # than a REQUIRE: zero hits on a default log, real assertions on a UNAOS_VUGPAR=1 log. Under vugpar the
-# rollup reads e.g. `cores 4 bands 60,60,38,60 rows 3755,3149,1781,1939 ratio 210`.
-# A fan-out that collapsed onto one core — the pre-SPREAD-2 pathology taken to its limit.
-FORBID \[spread2\] .* cores 1
-# Rows off by 10x or worse between the busiest and idlest participating core: the weighting inverted or
-# ran away, which the HEADROOM_FLOOR clamp is meant to make unreachable.
-FORBID \[spread2\] .* ratio [0-9]{4,}
+# rollup reads e.g. `cores 4 bands 60,60,38,60 rows 3755,3149,1781,1939 rpb 6258,5248,4686,3231 ratio 193`.
+#
+# `ratio` is max/min ROWS-PER-BAND in hundredths, not max/min rows: a core that goes tracked late in a
+# window draws fewer bands, and comparing its raw row total would red a perfectly healthy split.
+# Normalized, the weights are bounded — headroom runs 100 down to HEADROOM_FLOOR (25), so the fattest
+# average band can legitimately be 4x the thinnest and no more. 5x or worse means the weighting
+# inverted or ran away (or the `lo == 0` sentinel fired: a core drew bands but no rows all window).
+# There is deliberately no `cores 1` tripwire: `nh == 0` exits to the serial path before any rollup,
+# so nbands is always >= 2 and such a line cannot print.
+FORBID \[spread2\] .* ratio ([5-9][0-9]{2}|[0-9]{4,})

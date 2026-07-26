@@ -264,26 +264,35 @@ fn spread2_note(self_cpu: usize, helpers: &[usize], jobs: &[BandJob]) {
 
     let mut bands = [0u32; SPREAD2_CORES];
     let mut rows = [0u32; SPREAD2_CORES];
+    // ROWS-PER-BAND in hundredths. Raw `rows` cannot be compared across cores: a core that goes
+    // `tracked` late in the window (AP late-online, vug churn) takes fewer BANDS, so its row total is
+    // low for a reason that has nothing to do with the split. Normalizing by that core's own band
+    // count is what makes the ratio a statement about WEIGHTING rather than about participation.
+    let mut rpb = [0u32; SPREAD2_CORES];
     let mut hi = 0u32;
     let mut lo = u32::MAX;
     let mut live = 0usize;
     for c in 0..SPREAD2_CORES {
         bands[c] = SPREAD2_BANDS[c].swap(0, Ordering::Relaxed);
         rows[c] = SPREAD2_ROWS[c].swap(0, Ordering::Relaxed);
-        if rows[c] > 0 {
-            hi = hi.max(rows[c]);
-            lo = lo.min(rows[c]);
+        if bands[c] > 0 {
+            rpb[c] = (rows[c] as u64 * 100 / bands[c] as u64) as u32;
+            hi = hi.max(rpb[c]);
+            lo = lo.min(rpb[c]);
             live += 1;
         }
     }
     if live == 0 {
         return;
     }
-    // Ratio in hundredths, so the witness carries two decimals without float formatting.
-    let ratio = if lo == 0 { 0 } else { (hi as u64 * 100 / lo as u64) as u32 };
+    // Ratio of the fattest to the thinnest average band, in hundredths (100 = perfectly even).
+    // `lo == 0` means a core drew bands but no rows for a whole window — with `PAR_MIN_ROWS` at 64 and
+    // the floor bounding the thinnest band well above zero, that is pathological, not an edge case, so
+    // it reports as a sentinel that trips the spec rather than as a benign 0.
+    let ratio = if lo == 0 { 9999 } else { (hi as u64 * 100 / lo as u64) as u32 };
 
     serial_println!(
-        ":: [spread2] window {} frames cores {} bands {},{},{},{} rows {},{},{},{} ratio {} ::",
+        ":: [spread2] window {} frames cores {} bands {},{},{},{} rows {},{},{},{} rpb {},{},{},{} ratio {} ::",
         SPREAD2_WINDOW,
         live,
         bands[0],
@@ -294,6 +303,10 @@ fn spread2_note(self_cpu: usize, helpers: &[usize], jobs: &[BandJob]) {
         rows[1],
         rows[2],
         rows[3],
+        rpb[0],
+        rpb[1],
+        rpb[2],
+        rpb[3],
         ratio
     );
 }
