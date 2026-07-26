@@ -1205,7 +1205,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // (1-byte-corruption-caught) test, and the post-write refusal guard — emitting the
         // `:: INSTALL: gpt+fat32+copy verify => PASS ::` witness. One-shot + gated on storage. No-op
         // (module absent) without the feature; never touches the boot ESP (a separate ide-hd).
-        #[cfg(all(target_arch = "x86_64", feature = "installdemo"))]
+        // INSTGUI supersedes the auto-probe: when the graphical installer is armed, the attended
+        // Enter on its warning screen is the ONLY trigger — the engine must not fire on its own.
+        #[cfg(all(target_arch = "x86_64", feature = "installdemo", not(feature = "instgui")))]
         unaos_kernel::install::install_probe_once();
         // One-shot USB topology dump to serial (enumeration diagnosis; `usbinfo` shows it live).
         unaos_kernel::drivers::xhci::log_summary_once();
@@ -1234,6 +1236,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 unaos_kernel::pal::Event::None => break,
                 unaos_kernel::pal::Event::Key(c) => {
                     had_event = true;
+                    // INSTGUI — while the installer dialog is open it owns the keyboard;
+                    // the console resumes the moment it closes.
+                    #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))]
+                    if unaos_kernel::video::instgui::consume_key(c) {
+                        continue;
+                    }
                     // `handle_key` returns true if the command took over the whole screen (e.g.
                     // `vug`); stop draining this frame so a keystroke already queued behind Enter
                     // can't paint the console back over the full-screen output — present it alone,

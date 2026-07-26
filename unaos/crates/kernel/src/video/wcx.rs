@@ -276,6 +276,11 @@ pub fn activate() {
 
     #[cfg(feature = "witness")]
     move_vacate_probe(pw, ph);
+
+    // INSTGUI — the graphical installer dialog, in front of everything (created last = top z).
+    // Double-gated: `wc` (this module) AND `instgui` (`UNAOS_INSTGUI=1`).
+    #[cfg(feature = "instgui")]
+    super::instgui::open();
 }
 
 /// The probe surface for [`move_vacate_probe`] — one flat colour, chosen to be nothing else on the

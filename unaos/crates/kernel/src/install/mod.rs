@@ -249,6 +249,23 @@ pub fn run_demo() {
 /// One-shot boot-loop entry: run the INSTALL witness exactly once, the first time a block device is
 /// present (the armed scratch disk enumerates asynchronously over usb-storage). Mirrors the
 /// `fat::probe_once` / `u2_probe_once` idiom used by the other x86 storage witnesses.
+/// INSTGUI seam: the graphical installer's go-button. Same engine run as
+/// [`run_demo`] — same blank-check refusal, same verify ladder, same serial
+/// verdicts — returning the outcome so the GUI can show a verdict screen. The
+/// GUI adds an attended confirmation in FRONT of the engine; it removes nothing.
+pub fn run_gui() -> bool {
+    match run_demo_inner() {
+        Ok(()) => {
+            serial_println!(":: INSTALL: gpt+fat32+copy verify => PASS (instgui) ::");
+            true
+        }
+        Err(e) => {
+            serial_println!(":: INSTALL: engine => REFUSED/FAIL ({:?}) (instgui) ::", e);
+            false
+        }
+    }
+}
+
 pub fn install_probe_once() {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);

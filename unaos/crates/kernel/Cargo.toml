@@ -21,6 +21,8 @@ nvidia-kepler-fifo = []
 # is byte-identical. Enable via `UNAOS_WC=1` (needs UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach
 # the seam).
 wc = []
+# INSTGUI: the graphical installer window (UNAOS_INSTGUI=1; requires wc + the x86 engine).
+instgui = ["wc", "installdemo"]
 intel-ivb = []
 unaos_ivb = ["unaos-boot-info/unaos_ivb"]
 # DEFAULT-QUIET (witness): gate the battery of EL0/kernel fixtures that RE-PROVE long-metal-confirmed

@@ -69,6 +69,15 @@ pub mod vperf;
 // AND knob-gated (`UNAOS_WC=1`), so aarch64 and every default x86 artifact are byte-identical.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod wcx;
+// CRISPY-PI theme const table — carried verbatim from hw-pi4 (single-author law: edits flow
+// through the pi4 seat from the taste-gate). Declared for INSTGUI's use; full chrome wiring
+// (wm/fbcon reading these instead of their own constants) remains the later lockstep arc.
+pub mod theme;
+// INSTGUI — the first graphical installer: a kernel-owned, CRISPY-themed window over the
+// installer engine (choose disk → erase warning → engine run → verdict). x86-only, and gated
+// on BOTH `wc` (it is a compositor client) and `instgui` (`UNAOS_INSTGUI=1`).
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))]
+pub mod instgui;
 
 pub use framebuffer::FrameBuffer;
 pub use screen::Screen;
