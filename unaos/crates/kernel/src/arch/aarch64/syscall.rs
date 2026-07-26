@@ -2933,10 +2933,30 @@ const PORPHANED: u8 = 3;
 
 /// The process table: parent + up to a few children. Static so it OUTLIVES each child's `Task` Box (which is
 /// freed on exit) and each child's slot teardown — the reap accounting must survive both. `MAX_PROCS` is a
-/// small cap « USER_SLOTS (8): if it exhausts, sys_spawn returns `-EAGAIN`, never grows the slot pool (a STOP
-/// tripwire). `done` is posted exactly once by the child (its exit OR its kill path) and waited exactly once
-/// by the parent's sys_wait, so a reaped-then-reused entry always starts at 0 permits (no drain needed).
-const MAX_PROCS: usize = 4;
+/// cap strictly below USER_SLOTS (8): if it exhausts, sys_spawn returns `-EAGAIN`, never grows the slot pool (a
+/// STOP tripwire). `done` is posted exactly once by the child (its exit OR its kill path) and waited exactly
+/// once by the parent's sys_wait, so a reaped-then-reused entry always starts at 0 permits (no drain needed).
+///
+/// PROCS-6 — raised 4 -> 6, so the operator can fill the panel with background vugs. What the raise had to
+/// clear, and why 6 and not more:
+///   * EVERY consumer is parametric. The reserve/free/find/census loops are `0..MAX_PROCS`, the reap
+///     accounting is per-row CAS, and both scavenges (BGRUN-SCAV's PEXITED reclaim, KILLBOUND's PORPHANED
+///     reclaim behind its quiescence witness) sweep the same range. There is no bitmask, no packed index,
+///     no fixed-width field anywhere keyed on the old 4 — nothing to widen.
+///   * ADDRESS SPACES still bind last, not first. Each live row costs one EL0 slot/ASID out of
+///     `USER_SLOTS` = 8, so 6 concurrent background programs leave 2 free for a foreground `run` and for
+///     the launcher fixtures' scratch tenancies. 8 would make the Proc table and the slot pool exhaust
+///     together and turn every slot-pressure failure into a table-full one; 6 keeps the pool the honest
+///     backstop it was designed to be. That headroom is the reason this is 6.
+///   * WINDOWS fit. `video::wm::MAX_WINDOWS` is 8 and only EL0 programs mint windows (the shell console
+///     is desktop-level, not a wm row), so 6 windowed bg programs sit inside the compositor table with
+///     room to spare, and the tiler's wrap-and-stack keeps every box clear of the `ui_status` chrome.
+///   * SHELL side fits. `shell::BG_JOBS` is 8 rows, still strictly above this cap.
+///   * COST is two more static rows (`Proc` is two atomics, a status, a state byte and a `Semaphore`) plus
+///     the two extra `done.init()` waiter reservations of `WAIT_CAPACITY` boxes — a few hundred bytes of
+///     BSS and heap, entirely off the per-slot `SLOT_BACKING` budget, which `USER_SLOTS` governs and this
+///     change does not touch.
+const MAX_PROCS: usize = 6;
 struct Proc {
     /// The child task id; the sys_wait key. 0 while an entry is FREE or a claim's pid is not yet stored.
     pid: AtomicU64,
@@ -2961,6 +2981,15 @@ static PROCS: [Proc; MAX_PROCS] = [const {
         done: super::sched::Semaphore::new(0),
     }
 }; MAX_PROCS];
+
+/// PROCS-6 — the cap's two structural neighbours, enforced at compile time rather than left to a comment.
+/// A row that cannot be given an address space is a row that can only ever hand back `-EAGAIN` from deeper
+/// in the launch, and a kernel row the shell cannot record is a job the operator can neither see nor reap
+/// (`bg` kills such a spawn rather than leak it). Both must stay strictly above the cap.
+const _: () = {
+    assert!(MAX_PROCS < super::boot::USER_SLOTS, "MAX_PROCS must leave EL0 slots free");
+    assert!(MAX_PROCS <= crate::video::wm::MAX_WINDOWS, "every bg program must be able to own a window");
+};
 
 /// The parent's WITNESS (reported via SYS_REPORT): `U4_WITNESS_TOKEN` (nonzero) iff it reaped BOTH children
 /// by handle with exit status 0, else 0. `u4_launcher`'s verdict demands it be non-zero (and no kill). A
@@ -3191,7 +3220,7 @@ fn proc_reserve() -> Option<usize> {
     // EXITED and that nobody has reaped. BGRUN-1's stated position was that holding those rows is
     // "honest: a shell that never runs `jobs` eventually gets 'process table full', not silent loss" —
     // and that is right about the STATUS, but it makes a table of CORPSES indistinguishable from a table
-    // of running programs at the point where it matters most: `MAX_PROCS` is 4, so four short-lived
+    // of running programs at the point where it matters most: `MAX_PROCS` is 6, so six short-lived
     // launches with no intervening `jobs` deny the operator the very shell verb that would clear them.
     //
     // The trade is explicit, and it is the lesser loss: an unobserved EXIT STATUS is dropped (a later
@@ -3227,7 +3256,7 @@ fn proc_reserve() -> Option<usize> {
     // owner timed out or was killed WITHOUT the kill confirming, parked terminal-but-owned. Pre-arc such
     // a row was IMMORTAL unless the victim happened to die through one of the two reclaim hooks
     // (`note_killed_task_retired`, which needs an ARMED kill slot, or the orphan's own SYS_EXIT). Neither
-    // fires when the kill table was exhausted at arm time (`KILL_EXHAUSTED`), so four such rows wedge
+    // fires when the kill table was exhausted at arm time (`KILL_EXHAUSTED`), so `MAX_PROCS` such rows wedge
     // `bg` for the rest of the boot — the hard, user-visible end of the P60 report.
     //
     // SMP SAFETY — the reclaim is gated on a POSITIVE QUIESCENCE WITNESS, never on elapsed time and
@@ -3397,7 +3426,7 @@ fn proc_find_orphaned(pid: u64) -> Option<usize> {
 /// call, the app can reach SYS_EXIT: it takes the live-child arm (the row is still `PRUNNING`), stores
 /// `PEXITED`, posts `done`, and retires. A blind store would then park a row whose task is already DEAD, and
 /// nothing would ever reclaim it — `proc_find_orphaned` is consulted only from the task's own exit/kill paths,
-/// which never run again. Four such races would exhaust `MAX_PROCS` until reboot. On CAS failure the task
+/// which never run again. `MAX_PROCS` such races would exhaust the table until reboot. On CAS failure the task
 /// died in the window, so the row is simply FREED here (returning `false` so the caller can report honestly).
 ///
 /// The stray `done` permit that death posted must be consumed before the row is recycled, or the
@@ -9559,13 +9588,25 @@ fn bgrun_witness(_demo_cpu: usize) {
     // the operator actually hit: launch short-lived bg programs WITHOUT running `jobs` between them, and
     // the exited-unreaped rows accumulate until `proc_reserve` has nothing left to hand out — a table of
     // corpses reads exactly like a table of running programs, and the spawn fails with
-    // "process table full (run `jobs` to reap exited background programs)". With MAX_PROCS = 4 that is
-    // four launches deep.
+    // "process table full (run `jobs` to reap exited background programs)". With MAX_PROCS = 6 that is
+    // six launches deep.
     //
     // The leg spawns ELFHELLO `MAX_PROCS + 2` times, waiting for each to EXIT but deliberately never
     // reaping, and REQUIREs every spawn to succeed. Without the scavenge in `proc_reserve` this fails on
     // the launch after the table fills — which is the point: the leg is written to go red on the bug.
+    //
+    // PROCS-6 — the launch count is DERIVED from the cap, not written down, so raising the cap moves the
+    // fill point and the leg keeps its teeth for free: at 6 rows it now drives 8 launches, of which the
+    // last two can only be served by the PEXITED scavenge. Had it been a literal 6 the raise would have
+    // made the leg vacuous (six launches into a six-row table never fill it), which is exactly the
+    // failure mode a capacity change is supposed to expose rather than hide. The rollup below prints the
+    // capacity once so a log tells you which table the leg was actually exercising.
     {
+        serial_println!(
+            ":: BGRUN-ST: process table capacity = {} rows (bg programs alive at once; EL0 slots {}) ::",
+            MAX_PROCS,
+            super::boot::USER_SLOTS
+        );
         let mut spawned = 0usize;
         let mut failed_at = usize::MAX;
         for n in 0..(MAX_PROCS + 2) {

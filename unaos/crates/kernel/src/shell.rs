@@ -3576,9 +3576,12 @@ struct BgJob {
 }
 
 /// BGRUN-1: the shell's job table. Bounded like every table in this kernel. LENS CORRECTION
-/// (round 1): the binding resource is the Proc table (`MAX_PROCS` = 4), not the 8 EL0 address-space
-/// slots — so the real ceiling is 3 bg jobs alongside one foreground `run`, and this table's
-/// full arm is reachable only if MAX_PROCS grows past it. 8 slots kept (harmless headroom).
+/// (round 1): the binding resource is the Proc table (`MAX_PROCS`), not the 8 EL0 address-space
+/// slots — so the real ceiling is `MAX_PROCS - 1` bg jobs alongside one foreground `run`, and this
+/// table's full arm is reachable only if MAX_PROCS grows past it. 8 slots kept (harmless headroom).
+/// PROCS-6 raised the cap to 6: 6 bg jobs with no foreground `run` (5 with one), still under this
+/// table's 8 and under the compositor's 8 windows, so the full arm remains unreachable — kept anyway,
+/// because it is what makes an untrackable job impossible rather than merely unlikely.
 /// Shell access is single-task, but the Mutex keeps the invariant explicit rather than relying on it.
 #[cfg(feature = "baremetal")]
 static BG_JOBS: spin::Mutex<[Option<BgJob>; 8]> = spin::Mutex::new([None; 8]);

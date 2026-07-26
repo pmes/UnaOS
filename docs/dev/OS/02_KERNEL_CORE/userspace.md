@@ -997,8 +997,24 @@
   - **`jobs` is the SOLE reaper**: a bg row stays claimed after exit (`PEXITED`, `done` posted) until
     `bg_poll(reap=true)` consumes the permit and frees it — bounded and honest (a shell that never reaps
     eventually reads "process table full", not silent loss). The shell records jobs in a bounded 8-slot
-    table (8 — headroom over the true ceiling, the Proc table's MAX_PROCS = 4, which binds first: 3 bg
-    jobs alongside one foreground `run`); a spawn the table cannot record is killed, not leaked.
+    table (8 — headroom over the true ceiling, the Proc table's **MAX_PROCS = 6**, which binds first: 6 bg
+    jobs, or 5 alongside one foreground `run`); a spawn the table cannot record is killed, not leaked.
+  - **The capacity, and why it is 6 (`PROCS-6`).** The cap was 4; it is 6 so the operator can fill the
+    panel with background vugs. Nothing else moved, because every consumer of the cap is parametric —
+    the reserve/free/find/census sweeps are `0..MAX_PROCS`, reap accounting is per-row CAS, and both
+    scavenges (`BGRUN-SCAV`'s `PEXITED` reclaim and `KILLBOUND`'s `PORPHANED` reclaim behind its
+    quiescence witness) walk the same range. There is no bitmask and no packed index keyed on the old
+    value. The three neighbouring tables all stay strictly above it: `USER_SLOTS` = 8 EL0 address
+    spaces (so 6 live bg programs still leave 2 for a foreground `run` and for the launcher fixtures'
+    scratch tenancies — this headroom is the reason the cap is 6 and not 8, which would make the Proc
+    table and the slot pool exhaust together and disguise every slot-pressure failure as a table-full
+    one), `wm::MAX_WINDOWS` = 8 compositor rows (only EL0 programs mint windows; the shell console is
+    desktop-level, so 6 windowed bg programs fit with room over), and the shell's 8-slot `BG_JOBS`.
+    The first two are now compile-time assertions beside the constant rather than prose. The cost is
+    two more static rows plus their `done` waiter reservations — a few hundred bytes, entirely off the
+    per-slot `SLOT_BACKING` budget, which `USER_SLOTS` governs and this change does not touch.
+    Witnessed once per boot by `:: BGRUN-ST: process table capacity = 6 rows (bg programs alive at
+    once; EL0 slots 8) ::`, with a spec REQUIRE, so a silent regression of the cap fails there.
   - **`kill <pid>`** is the SKILL-1 primitive (ASID-scoped so ELF-2 siblings die too), condensed: bounded
     confirm wait, post-arm already-dead retract, `PORPHANED` fallback with the kill left armed. A
     CONFIRMED kill reaps the row in place, both arms (a dispatch-boundary kill never reaches SYS_EXIT,
@@ -1404,7 +1420,8 @@
       those lines with the two bg'd vugs is what produced the "they exited instantly" reading.
   - **REAL, and fixed: exited-unreaped rows deny launches.** BGRUN-1 held that a row stays claimed until
     `jobs` reaps it, and called the resulting "process table full" *honest* — right about the exit STATUS,
-    wrong about the ergonomics. `MAX_PROCS` is **4**, so four short-lived `bg` launches with no
+    wrong about the ergonomics. `MAX_PROCS` was **4** at the time (**6** since `PROCS-6`), so four
+    short-lived `bg` launches with no
     intervening `jobs` exhaust the table, and the operator is refused by a table of corpses with the exact
     message `process table full (run `jobs` to reap exited background programs)`.
     - **The fix (`BGRUN-SCAV`)** is the minimal one: when `proc_reserve` finds no `PFREE` row it makes a
@@ -1418,9 +1435,12 @@
       — the reclaim prints `:: BGRUN-SCAV: process table full — reclaimed row N from EXITED unreaped
       pid=… (status=… DISCARDED; `jobs` will read `gone`) ::`.
     - **Witness: `BGRUN-ST` leg 1b**, `+1` spec REQUIRE (59 → 60). It spawns ELFHELLO `MAX_PROCS + 2`
-      times, waits for each to exit, and pointedly **never reaps**, requiring all six to succeed. It was
-      verified to be a real instrument rather than a decoration: with the scavenge disabled the leg goes
+      times, waits for each to exit, and pointedly **never reaps**, requiring every one to succeed. It was
+      verified to be a real instrument rather than a decoration: with the scavenge disabled the leg went
       **red at the fifth launch** — `slot reclaim — spawn 4 of 6 refused (table full on corpses) -> FAIL`.
+      Because the count is **derived** from the cap rather than written down, `PROCS-6` moved the fill
+      point without touching the leg: at 6 rows it drives **8** launches, the last two of which only the
+      scavenge can serve. Had the leg hard-coded 6 the raise would have made it vacuous.
   - **VUG-BG lifecycle (lens):** the detached bit is now cleared in `boot::teardown_user_slot`'s
     final-release arm, beside `clear_handle_row` and before `SLOT_USED` is released. ASIDs recycle, and
     `run_user_image`/`spawn_user_image_bg` only cover the two FAT-image launchers — `sys_spawn`'s

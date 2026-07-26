@@ -336,8 +336,13 @@ FORBID \[wc-fv\] focus-vis .*-> FAIL
 # ---   races its own exit. Leg 3 keeps the persistence proof regardless: STAT.ELF has no exit condition
 # ---   AT ALL, focused or not, where VUG's persistence is conditional on the detached bit.
 REQUIRE BGRUN-ST: spawn->exit->reap PASS
+# --- PROCS-6: the cap itself, pinned. The reclaim leg below drives MAX_PROCS+2 launches, so its own
+# ---   PASS text cannot tell you which capacity it exercised; this line can, and a silent regression
+# ---   of the cap back to 4 (or a raise past the EL0 slot pool) fails HERE rather than mysteriously.
+REQUIRE BGRUN-ST: process table capacity = 6 rows \(bg programs alive at once; EL0 slots 8\)
 # --- BGRUN-SCAV: exited-but-unreaped rows must not deny a launch the machine can satisfy. MAX_PROCS+2
-# ---   bg launches with NO intervening reap; every one must succeed. Goes red on the pre-fix kernel.
+# ---   bg launches with NO intervening reap; every one must succeed (8 launches at the PROCS-6 cap, the
+# ---   last two served only by the PEXITED scavenge). Goes red on the pre-fix kernel.
 REQUIRE BGRUN-ST: slot reclaim PASS
 REQUIRE BGRUN-ST: kill mid-run PASS \(pid=[0-9]+, killed — row reaped
 REQUIRE BGRUN-ST: persist\+kill PASS \(pid=[0-9]+,
