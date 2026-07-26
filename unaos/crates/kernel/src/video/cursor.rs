@@ -113,6 +113,46 @@ const SHADOW: u32 = 0x0010_1014;
 const MAX_SIDE: usize = (crate::ui::BASE_CELL + 1) * crate::ui::SCALE_MAX;
 const MAX_PIX: usize = MAX_SIDE * MAX_SIDE;
 
+/// CURSOR-4 — a per-painted-pixel bit set over [`for_each_sprite_pixel`]'s scan order.
+///
+/// The sprite is no longer an all-or-nothing object: after CURSOR-4 a pass may take PART of it off
+/// the panel (the part the pass is about to paint over) and deliver PART of it through a window's
+/// staged present. Both of those are per-pixel facts about a ~50–800 entry set, so they are stored
+/// as bits rather than as rectangles — the union of "the boxes this pass will paint" is not a box,
+/// and approximating it with one is what forced CURSOR-3's whole-box decline in the first place.
+const MASK_WORDS: usize = MAX_PIX.div_ceil(64);
+
+#[derive(Clone, Copy)]
+struct Bits([u64; MASK_WORDS]);
+
+impl Bits {
+    const EMPTY: Bits = Bits([0; MASK_WORDS]);
+    #[inline]
+    fn get(&self, i: usize) -> bool {
+        i < MAX_PIX && self.0[i / 64] & (1u64 << (i % 64)) != 0
+    }
+    #[inline]
+    fn set(&mut self, i: usize) {
+        if i < MAX_PIX {
+            self.0[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+    #[inline]
+    fn clear(&mut self, i: usize) {
+        if i < MAX_PIX {
+            self.0[i / 64] &= !(1u64 << (i % 64));
+        }
+    }
+    fn reset(&mut self) {
+        self.0 = [0; MASK_WORDS];
+    }
+}
+
+/// CURSOR-4 — is panel point `(x, y)` inside any of `boxes`?
+fn in_any(boxes: &[(usize, usize, usize, usize)], x: usize, y: usize) -> bool {
+    boxes.iter().any(|&(bx, by, bw, bh)| x >= bx && y >= by && x < bx + bw && y < by + bh)
+}
+
 
 /// Sprite state. `drawn` is the only thing that decides whether `saved` means anything.
 ///
@@ -136,6 +176,21 @@ struct Sprite {
     /// [`for_each_sprite_pixel`] walks. Only painted pixels are saved: the rest of the box was never
     /// modified, so restoring it would be a write — and a race — with nothing to fix.
     saved: [u32; MAX_PIX],
+    /// CURSOR-4 — painted-pixel indices this sprite is NOT currently on the panel at, because a
+    /// masked undraw ([`undraw_within`]) put the original back ahead of a compositor pass that is
+    /// about to paint those pixels. `saved[i]` is STALE for exactly these indices: the pixel has
+    /// been handed back, and whatever lands there next belongs to the painter, not to us.
+    ///
+    /// Meaningful only while `drawn`. Every full [`undraw_locked`] / [`draw_locked`] cycle resets it,
+    /// so the two states cannot drift: `drawn && off.get(i)` is "hole", `drawn && !off.get(i)` is
+    /// "ours, and `saved[i]` says what it covers".
+    off: Bits,
+    /// CURSOR-4 — bumped by every full undraw and every draw. An overlay plan carries the generation
+    /// it was taken at, and a plan whose generation no longer matches describes a sprite that has
+    /// since been taken down and put back somewhere else — so its layer-derived save-under must not
+    /// be installed. This is what makes the split sprite safe against a concurrent [`repaint`]:
+    /// the mismatch is detected rather than merged.
+    epoch: u64,
     /// Fail-closed latch: a panel whose format has no colour inverse (`read_pixel` returns `None`,
     /// e.g. the lossy `U8` layout) cannot be saved from, so the sprite is never drawn on it. Better
     /// no cursor than a trail of wrongly-restored pixels across the desktop.
@@ -150,6 +205,8 @@ static SPRITE: Mutex<Sprite> = Mutex::new(Sprite {
     bh: 0,
     s: 0,
     saved: [0; MAX_PIX],
+    off: Bits::EMPTY,
+    epoch: 0,
     unsupported: false,
 });
 
@@ -249,17 +306,30 @@ fn undraw_locked(sp: &mut Sprite) -> Option<(usize, usize, usize, usize)> {
         // down. Handled anyway so the state can never become "drawn, with no way to undraw"; the
         // saved patch is dropped because there is no surface left to restore it into.
         sp.drawn = false;
+        sp.off.reset();
+        sp.epoch = sp.epoch.wrapping_add(1);
         return None;
     }
     let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
+    let off = sp.off;
     let saved = &sp.saved;
     for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
+        // CURSOR-4: a pixel already handed back by a masked undraw is not ours and `saved[i]` is
+        // stale for it. Restoring it here would stamp pre-pass content over whatever the compositor
+        // has since put there — the exact stale-restore hazard the colour guard exists to prevent,
+        // except that the colour guard cannot see it (the compositor may legitimately have painted
+        // `FILL` there, and more importantly the guard would pass on any pixel the pass left alone).
+        if off.get(i) {
+            return;
+        }
         if i < saved.len() && fb.read_pixel(x, y) == Some(color) {
             fb.put_pixel(x, y, saved[i]);
         }
     });
     flush_box(&fb, by, bh);
     sp.drawn = false;
+    sp.off.reset();
+    sp.epoch = sp.epoch.wrapping_add(1);
     Some((bx, by, bw, bh))
 }
 
@@ -309,16 +379,83 @@ pub struct Plan {
     pub bw: usize,
     pub bh: usize,
     pub s: usize,
+    /// CURSOR-4 — the sprite generation this plan was taken at. Every consumer re-checks it, so a
+    /// plan that outlived the sprite it describes is discarded rather than applied.
+    pub epoch: u64,
 }
 
 /// CURSOR-3 — the sprite's current geometry, or `None` when it is not on the panel.
 pub fn sprite_plan() -> Option<Plan> {
     let sp = SPRITE.lock();
     if sp.drawn {
-        Some(Plan { bx: sp.bx, by: sp.by, bw: sp.bw, bh: sp.bh, s: sp.s })
+        Some(Plan { bx: sp.bx, by: sp.by, bw: sp.bw, bh: sp.bh, s: sp.s, epoch: sp.epoch })
     } else {
         None
     }
+}
+
+/// CURSOR-4 — take off the panel ONLY the sprite pixels that fall inside `boxes`, and leave the rest
+/// exactly where they are.
+///
+/// ### Why the bracket had to become partial
+/// CURSOR-3's bracket is all-or-nothing: if any window overlaps the sprite's box, the WHOLE sprite
+/// comes off the panel for the length of the pass. For a sprite resting ON a window's border that is
+/// the worst of both worlds — the part hanging over the desktop is taken down even though nothing in
+/// the pass is ever going to write there, and it is that part, blinking at present rate, that Peter
+/// still sees at P62.
+///
+/// The undraw exists for one reason: a pixel some painter in this pass is about to overwrite must be
+/// handed back BEFORE the overwrite, or the save-under would be stale and the restore would stamp
+/// pre-pass content into a window's rect. That reason applies per PIXEL, not per sprite. `boxes` is
+/// the compositor's conservative union of the extents it may paint (every live window above the
+/// shell whose outer box meets the sprite), so a pixel outside all of them is a pixel no painter in
+/// this pass can reach — and taking it down buys nothing and costs a visible hole.
+///
+/// Pixels that ARE handed back are recorded in [`Sprite::off`]; the pass's tail
+/// ([`adopt_overlay`]) is what owes every one of them a pixel again, either from a window's staged
+/// present or from a save-and-draw against the finished front buffer.
+///
+/// Returns the rect that was written, for [`repair`]. Conservative (the whole box) rather than the
+/// touched subset — `repair` marks windows damaged, and a narrow rect would be a narrower repair.
+pub fn undraw_within(boxes: &[(usize, usize, usize, usize)]) {
+    let restored = {
+        let mut sp = SPRITE.lock();
+        undraw_within_locked(&mut sp, boxes)
+    };
+    repair(restored);
+}
+
+fn undraw_within_locked(
+    sp: &mut Sprite,
+    boxes: &[(usize, usize, usize, usize)],
+) -> Option<(usize, usize, usize, usize)> {
+    if !sp.drawn {
+        return None;
+    }
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        return undraw_locked(sp);
+    }
+    let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
+    let mut off = sp.off;
+    {
+        let saved = &sp.saved;
+        for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
+            if off.get(i) || !in_any(boxes, x, y) {
+                return;
+            }
+            // Same colour guard as the full undraw, and for the same reason: a pixel another painter
+            // has already taken is theirs, and putting our saved value back would be the stale
+            // restore. The bit is set either way — guarded or not, this pixel is no longer ours.
+            if i < saved.len() && fb.read_pixel(x, y) == Some(color) {
+                fb.put_pixel(x, y, saved[i]);
+            }
+            off.set(i);
+        });
+    }
+    sp.off = off;
+    flush_box(&fb, by, bh);
+    Some((bx, by, bw, bh))
 }
 
 /// WC-I — the sprite's CURRENT panel box, or `None` when it is not on the panel.
@@ -437,27 +574,70 @@ fn refresh_locked(
 /// the sprite's own `FILL`, and the next restore would stamp a white arrow permanently into the
 /// window's rect.
 ///
-/// ### Whole-box containment, and why the partial case is deliberately NOT handled
-/// The overlay is taken only when the sprite's box lies ENTIRELY inside the window's clipped outer
-/// box. A straddling sprite would need per-pixel bookkeeping of which pixels came from the layer and
-/// which from the front, merged across the several windows and the desktop a single sprite can span
-/// — bookkeeping whose failure mode is a stamped arrow. A straddling sprite keeps WC-I's bracket
-/// exactly as it is: correct, and no worse than today. The 36 px sprite is inside the window it is
-/// pointing at for all but its own width at the frame, so the case that is fixed is the case Peter
-/// reported.
+/// ### CURSOR-4 — the straddling sprite, and the provenance argument that makes it sound
+/// CURSOR-3 took the overlay only when the sprite's box lay ENTIRELY inside one window's clipped
+/// outer box, and declined otherwise, because "which pixels came from the layer and which from the
+/// front" is per-pixel bookkeeping whose failure mode is a white arrow stamped into a window. The
+/// P62 wire says that decline is 42% of offers, and a pointer resting ON a window border straddles
+/// on every single pass — so the decline is not a rare miss, it IS the flicker.
+///
+/// CURSOR-4 does the bookkeeping, explicitly, with each pixel's provenance named:
+///
+/// * **In-layer pixels** — saved from the BACK LAYER and painted into it, exactly as CURSOR-3 does.
+///   The layer holds this window's freshly composed content and nothing else, so the save is the
+///   window's own pixel and can never be the sprite's `FILL`: the layer is private to this pass, the
+///   sprite has never been written to it before [`compose_into`] runs, and `paint_window` fills the
+///   whole clipped box densely just above.
+/// * **Out-of-layer pixels** — never read from the front HERE. They are left off the panel by the
+///   masked undraw and settled by [`adopt_overlay`], AFTER every window in the pass has presented,
+///   by reading the finished front buffer. That read is sound for the same reason [`draw_locked`]'s
+///   is: at that instant the sprite is provably not on those pixels (the masked undraw took them
+///   down and nothing has put them back), so the save-under cannot capture our own fill.
+/// * **Pixels no painter in this pass can reach** — never taken down at all, so there is nothing to
+///   save and nothing to restore. This is the class that carries most of the fix: a sprite hanging
+///   off a window edge over bare desktop now simply stays on the panel through the present.
+///
+/// The dangerous middle case — a pixel one window composes and a HIGHER window then overwrites
+/// directly — is closed by [`overlay_uncover`]: every window that paints its box without composing
+/// the sprite into it clears the coverage bits inside that box, and windows are drawn back-to-front,
+/// so the topmost painter of each pixel is the one whose verdict survives. A pixel that ends the
+/// pass uncovered is a pixel the tail repaints from the front, which is CURSOR-3's bracket narrowed
+/// to exactly the pixels that still need it.
+///
+/// ### One session per pass, and why a second concurrent pass declines instead of merging
+/// Coverage accumulates across the several windows of ONE pass, so it cannot be a last-writer-wins
+/// slot any more. `session` makes the accumulation single-owner: the pass that opens it owns the
+/// overlay until its tail closes it, and a second `composite` on another core finds it busy, takes
+/// no plan, and runs CURSOR-3's whole-sprite bracket. Merging two passes' coverage instead would let
+/// pass B's reset erase pass A's bits, and pass A's tail would then "restore" pixels that already
+/// carry the sprite from B's layer — reading `FILL` as the under-pixel and stamping the arrow.
 struct Overlay {
-    /// Whether [`compose_into`] has published a plan that [`adopt_overlay`] has not yet consumed.
-    valid: bool,
+    /// CURSOR-4 — a pass owns the overlay from [`overlay_open`] to [`adopt_overlay`].
+    session: bool,
+    /// The sprite generation the session was opened at (see [`Sprite::epoch`]).
+    epoch: u64,
     bx: usize,
     by: usize,
     bw: usize,
     bh: usize,
     s: usize,
-    /// How many entries of `saved` [`compose_into`] wrote — the sprite's painted-pixel count at that
-    /// geometry, in [`for_each_sprite_pixel`]'s scan order, the same order [`draw_locked`] uses.
-    n: usize,
-    /// What the BACK LAYER held under each painted pixel: the window's own composed content.
+    /// CURSOR-4 — painted-pixel indices whose `saved` entry has been filled FROM A BACK LAYER and
+    /// whose pixel that layer's present has delivered to the panel.
+    covered: Bits,
+    /// What the BACK LAYER held under each covered pixel: the window's own composed content.
     saved: [u32; MAX_PIX],
+}
+
+/// CURSOR-4 — what one window's overlay offer did, for the compositor's witness.
+#[derive(Clone, Copy, Default)]
+pub struct Composed {
+    /// Painted sprite pixels composed into this window's layer.
+    pub taken: usize,
+    /// Painted sprite pixels that fell outside this window's box — the straddle, now carried by the
+    /// tail rather than costing the whole sprite its overlay.
+    pub missed: usize,
+    /// The plan lock was held by another core; this offer did nothing at all.
+    pub locked: bool,
 }
 
 /// CURSOR-3 — the published plan. Separate from [`SPRITE`] on purpose: [`compose_into`] runs from
@@ -470,15 +650,77 @@ struct Overlay {
 /// **Lock order: `SPRITE` → `OVERLAY`.** [`adopt_overlay`] takes both, in that order, outside the
 /// guard; [`compose_into`] takes only this one. No cycle exists and none may be introduced.
 static OVERLAY: Mutex<Overlay> = Mutex::new(Overlay {
-    valid: false,
+    session: false,
+    epoch: 0,
     bx: 0,
     by: 0,
     bw: 0,
     bh: 0,
     s: 0,
-    n: 0,
+    covered: Bits::EMPTY,
     saved: [0; MAX_PIX],
 });
+
+/// CURSOR-4 — open the pass's overlay session, or report that another pass owns it.
+///
+/// Called from `composite_inner` BEFORE the masked undraw and before the `BlitGuard` is registered,
+/// so the decision "this pass will split the sprite" is made once and everything downstream follows
+/// it. `false` means the caller must fall back to CURSOR-3's whole-sprite bracket: full undraw,
+/// `Repaint` tail, no plan handed to any window.
+///
+/// `lock()` rather than `try_lock()` is admissible here for the same reason `sprite_plan()`'s is —
+/// this runs outside the guard, so this lock is not in F4's drain wait set. Inside the guard the
+/// overlay is only ever `try_lock`ed.
+pub fn overlay_open(plan: &Plan) -> bool {
+    let mut ov = OVERLAY.lock();
+    if ov.session {
+        return false;
+    }
+    ov.session = true;
+    ov.epoch = plan.epoch;
+    ov.bx = plan.bx;
+    ov.by = plan.by;
+    ov.bw = plan.bw;
+    ov.bh = plan.bh;
+    ov.s = plan.s;
+    ov.covered.reset();
+    true
+}
+
+/// CURSOR-4 — does `ov` still describe the sprite `plan` was taken from?
+fn overlay_matches(ov: &Overlay, plan: &Plan) -> bool {
+    ov.session
+        && ov.epoch == plan.epoch
+        && (ov.bx, ov.by, ov.bw, ov.bh, ov.s) == (plan.bx, plan.by, plan.bw, plan.bh, plan.s)
+}
+
+/// CURSOR-4 — this window painted its box and did NOT compose the sprite into it, so every sprite
+/// pixel inside that box belongs to the window now. Clearing the coverage bits is what makes the
+/// tail repaint them from the front instead of trusting a lower window's layer save that this
+/// window's pixels have since overwritten.
+///
+/// Called for every drawn window that overlaps the sprite and did not take the overlay — the direct
+/// (unstaged) path, a window an instrument excluded, a compat row, and a contended plan lock alike.
+/// `try_lock` only: this runs inside the `BlitGuard` window. A contended clear is safe to skip
+/// because the only writer that could be holding it is another pass, which has already declined to
+/// share the session — its coverage is not ours to correct.
+pub fn overlay_uncover(plan: &Plan, bx: usize, by: usize, bw: usize, bh: usize) {
+    let mut ov = match OVERLAY.try_lock() {
+        Some(g) => g,
+        None => return,
+    };
+    if !overlay_matches(&ov, plan) {
+        return;
+    }
+    let boxes = [(bx, by, bw, bh)];
+    let mut covered = ov.covered;
+    for_each_sprite_pixel(plan.bx, plan.by, plan.bw, plan.bh, plan.s, |x, y, _c, i| {
+        if in_any(&boxes, x, y) {
+            covered.clear(i);
+        }
+    });
+    ov.covered = covered;
+}
 
 /// CURSOR-3 — paint the sprite into a staged back layer, saving what it covers FROM THAT LAYER.
 ///
@@ -490,57 +732,89 @@ static OVERLAY: Mutex<Overlay> = Mutex::new(Overlay {
 ///
 /// Takes NO framebuffer lock and NOT the sprite lock — every input is either an argument or the
 /// layer itself, which the caller already owns exclusively through WC-H's `STAGE` guard.
-pub fn compose_into(layer: &FrameBuffer, ox: usize, oy: usize, plan: Plan) -> bool {
-    if plan.s == 0 || plan.bw == 0 || plan.bh == 0 || plan.bx < ox || plan.by < oy {
-        return false;
+/// CURSOR-4 — now PARTIAL: the sprite is clipped to the layer, the intersecting pixels ride this
+/// window's present, and the remainder is left to the tail. See [`Overlay`] for the provenance
+/// argument each class rests on.
+pub fn compose_into(layer: &FrameBuffer, ox: usize, oy: usize, plan: Plan) -> Composed {
+    let mut out = Composed::default();
+    if plan.s == 0 || plan.bw == 0 || plan.bh == 0 {
+        return out;
     }
-    let (lx, ly) = (plan.bx - ox, plan.by - oy);
     let li = layer.info();
-    // Whole-box containment, re-checked against the layer's own extent rather than trusted: a
-    // partially contained sprite would save part of its under-pixels from the layer and would need
-    // the rest from the front, which is the bookkeeping this arc declines to do.
-    if lx + plan.bw > li.width || ly + plan.bh > li.height {
-        return false;
-    }
+    // The layer's extent IS the window's clipped outer box, at panel origin `(ox, oy)`. A sprite
+    // pixel is this window's iff it lands inside it.
+    let inside = |x: usize, y: usize| -> Option<(usize, usize)> {
+        if x < ox || y < oy {
+            return None;
+        }
+        let (lx, ly) = (x - ox, y - oy);
+        if lx < li.width && ly < li.height { Some((lx, ly)) } else { None }
+    };
     let mut ov = match OVERLAY.try_lock() {
         Some(g) => g,
-        None => return false,
+        None => {
+            out.locked = true;
+            return out;
+        }
     };
+    if !overlay_matches(&ov, &plan) {
+        return out;
+    }
+
+    // Pass one: save the layer's own pixel under every sprite pixel this window owns. Runs to
+    // completion before a single pixel is written, exactly as `draw_locked` does, so a failure
+    // partway leaves the window's composed content untouched.
     let mut failed = false;
-    let mut n = 0usize;
+    let mut mine = Bits::EMPTY;
+    let mut taken = 0usize;
+    let mut missed = 0usize;
     {
         let saved = &mut ov.saved;
-        for_each_sprite_pixel(lx, ly, plan.bw, plan.bh, plan.s, |x, y, _c, i| {
+        for_each_sprite_pixel(plan.bx, plan.by, plan.bw, plan.bh, plan.s, |x, y, _c, i| {
+            let Some((lx, ly)) = inside(x, y) else {
+                missed += 1;
+                return;
+            };
             if failed || i >= saved.len() {
                 failed = true;
                 return;
             }
-            match layer.read_pixel(x, y) {
+            match layer.read_pixel(lx, ly) {
                 Some(orig) => {
                     saved[i] = orig;
-                    n = i + 1;
+                    mine.set(i);
+                    taken += 1;
                 }
                 None => failed = true,
             }
         });
     }
     if failed {
-        // Nothing has been written to the layer yet — the save pass runs to completion first, exactly
-        // as `draw_locked` does — so declining here leaves the window's pixels untouched.
-        ov.valid = false;
-        return false;
+        // This window's box reverts to "the window's own pixels": nothing was written to the layer,
+        // and the tail owes those sprite pixels a save-and-draw against the front.
+        let mut covered = ov.covered;
+        for_each_sprite_pixel(plan.bx, plan.by, plan.bw, plan.bh, plan.s, |x, y, _c, i| {
+            if inside(x, y).is_some() {
+                covered.clear(i);
+            }
+        });
+        ov.covered = covered;
+        return Composed { taken: 0, missed, locked: false };
     }
-    for_each_sprite_pixel(lx, ly, plan.bw, plan.bh, plan.s, |x, y, color, _i| {
-        layer.put_pixel(x, y, color);
+
+    for_each_sprite_pixel(plan.bx, plan.by, plan.bw, plan.bh, plan.s, |x, y, color, _i| {
+        if let Some((lx, ly)) = inside(x, y) {
+            layer.put_pixel(lx, ly, color);
+        }
     });
-    ov.valid = true;
-    ov.bx = plan.bx;
-    ov.by = plan.by;
-    ov.bw = plan.bw;
-    ov.bh = plan.bh;
-    ov.s = plan.s;
-    ov.n = n;
-    true
+    // Accumulate, do not replace: several windows of one pass may each carry part of one sprite, and
+    // back-to-front order means a later window's verdict for a shared pixel is the one that lands.
+    for w in 0..MASK_WORDS {
+        ov.covered.0[w] |= mine.0[w];
+    }
+    out.taken = taken;
+    out.missed = missed;
+    out
 }
 
 /// The panel origin the sprite WOULD be drawn at right now — [`draw_locked`]'s clip, without the
@@ -581,37 +855,54 @@ pub fn adopt_overlay() {
     let mut armed_at: Option<(i32, i32)> = None;
     let mut unsupported_now = false;
     let want = current_origin();
-    let mut pre_restored = None;
     let restored = {
         let mut sp = SPRITE.lock();
-        let installed = {
+        // CURSOR-4 — the session closes here, unconditionally, whatever the pass managed. `composite`
+        // routes every exit through its tail, so this is the one place that can release it, and a
+        // session that outlived its pass would lock the mechanism out for the rest of the boot.
+        let coherent = {
             let mut ov = OVERLAY.lock();
-            if !ov.valid {
-                false
-            } else {
-                ov.valid = false;
-                // Another painter's sprite comes off the panel BEFORE the plan is installed, or its
-                // save-under would be lost and its pixels left behind.
-                pre_restored = undraw_locked(&mut sp);
-                let n = ov.n.min(sp.saved.len()).min(ov.saved.len());
-                sp.saved[..n].copy_from_slice(&ov.saved[..n]);
-                sp.bx = ov.bx;
-                sp.by = ov.by;
-                sp.bw = ov.bw;
-                sp.bh = ov.bh;
-                sp.s = ov.s;
-                sp.drawn = true;
-                true
+            let coherent = ov.session
+                && sp.drawn
+                && ov.epoch == sp.epoch
+                && (ov.bx, ov.by, ov.bw, ov.bh, ov.s) == (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
+            if coherent {
+                // Install the layer-derived save-under for every pixel a present delivered. Those
+                // pixels are on the panel already — this is bookkeeping, not painting, which is what
+                // makes the composed path cheaper than the bracket as well as steadier.
+                let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
+                let covered = ov.covered;
+                let src = &ov.saved;
+                let mut off = sp.off;
+                let dst = &mut sp.saved;
+                for_each_sprite_pixel(bx, by, bw, bh, s, |_x, _y, _c, i| {
+                    if covered.get(i) && i < dst.len() && i < src.len() {
+                        dst[i] = src[i];
+                        off.clear(i);
+                    }
+                });
+                sp.off = off;
             }
+            ov.session = false;
+            ov.covered.reset();
+            coherent
         };
-        // Aligned and visible: the panel is already right, and the module now agrees with it. This is
-        // the steady state while the pointer rests over a presenting window — zero pixels touched per
-        // present, where WC-I paid a restore→save→draw and a hole in between.
-        if installed
+        // The sprite's own generation moved under us (another core ran a full `repaint` mid-pass), or
+        // the pointer has moved since the plan was taken, or it has gone invisible: none of the
+        // per-pixel state describes the panel any more, so fall back to the whole-sprite refresh.
+        // `undraw_locked` skips the off-panel pixels rather than stamping their stale saves, and
+        // `draw_locked` then re-establishes the sprite entirely from the finished front buffer.
+        if coherent
             && want == Some((sp.bx, sp.by))
             && crate::pal::cursor::visible()
             && !sp.unsupported
         {
+            // The straddle remainder: pixels the masked undraw took down that no layer delivered —
+            // over bare desktop, over a window that declined the overlay, or over a window this pass
+            // never drew. The front buffer is finished now, so a save-and-draw here has exactly
+            // `draw_locked`'s provenance, and it touches strictly FEWER front pixels than CURSOR-3's
+            // bracket, which repainted the whole sprite.
+            redraw_off_locked(&mut sp, &mut unsupported_now);
             None
         } else {
             refresh_locked(&mut sp, &mut armed_at, &mut unsupported_now)
@@ -623,11 +914,60 @@ pub fn adopt_overlay() {
     if let Some((px, py)) = armed_at {
         serial_println!("[cursor] armed x={} y={}", px, py);
     }
-    // Both rects, and both outside the sprite lock: the pre-restore is another painter's sprite that
-    // was taken down before the plan was installed, and `repair`'s contract (mark, never composite)
-    // applies to it identically.
-    repair(pre_restored);
     repair(restored);
+}
+
+/// CURSOR-4 — put back the sprite pixels that are still off the panel, saving each from the FRONT.
+///
+/// Runs only from [`adopt_overlay`]'s aligned branch, i.e. with the pass finished and the sprite's
+/// geometry unchanged since the plan was taken. Every pixel it touches is one the masked undraw
+/// handed back and nothing has re-delivered, so reading the front cannot read our own fill.
+fn redraw_off_locked(sp: &mut Sprite, unsupported_now: &mut bool) {
+    let mut any = false;
+    for w in 0..MASK_WORDS {
+        if sp.off.0[w] != 0 {
+            any = true;
+            break;
+        }
+    }
+    if !any {
+        return;
+    }
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        return;
+    }
+    let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
+    let mut off = sp.off;
+    let mut failed = false;
+    {
+        let saved = &mut sp.saved;
+        for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, _c, i| {
+            if !off.get(i) || failed || i >= saved.len() {
+                return;
+            }
+            match fb.read_pixel(x, y) {
+                Some(orig) => saved[i] = orig,
+                None => failed = true,
+            }
+        });
+    }
+    if failed {
+        // Same fail-closed rule as `draw_locked`: a panel we cannot read back from gets no cursor.
+        // The pixels stay off (they hold the compositor's content, which is correct) and the next
+        // `refresh_locked` will find `unsupported` and leave the sprite down for good.
+        sp.unsupported = true;
+        *unsupported_now = true;
+        return;
+    }
+    for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
+        if off.get(i) {
+            fb.put_pixel(x, y, color);
+            off.clear(i);
+        }
+    });
+    sp.off = off;
+    flush_box(&fb, by, bh);
 }
 
 /// Save-under and draw, with the lock held. `Ok(Some(pos))` when this was the first draw of the boot
@@ -686,6 +1026,10 @@ fn draw_locked(sp: &mut Sprite) -> Result<Option<(i32, i32)>, ()> {
     sp.bh = bh;
     sp.s = s;
     sp.drawn = true;
+    // CURSOR-4: a full draw re-establishes the whole sprite from the front, so nothing is off-panel
+    // and every `saved` entry is fresh. The generation bump retires any overlay plan still in flight.
+    sp.off.reset();
+    sp.epoch = sp.epoch.wrapping_add(1);
 
     for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, _i| {
         fb.put_pixel(x, y, color);

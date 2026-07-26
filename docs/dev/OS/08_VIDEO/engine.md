@@ -2205,6 +2205,174 @@ exists so a pointerless run can never be read as evidence for the mechanism.
   a visible step in flicker at the frame is the containment rule doing its job, not a defect.
 * A cursor left over a window while WC-D or WC-G spends its one-shot budget will bracket for those
   few passes. Early-boot only, and `[cursor3] present tail=repaint` names it.
+
+> **Superseded by CURSOR-4 (below).** Whole-box containment is gone: the straddling sprite is now
+> composed in part and settled per pixel, and the "visible step in flicker at the frame" that this
+> watch-list called expected behaviour was, on the P62 evidence, the flicker itself.
+
+### CURSOR-4 — the split sprite: the straddle stops costing the overlay
+
+CURSOR-3 removed the flicker for a sprite lying *wholly* inside one window. P62 (attended bench)
+showed Peter still seeing flicker over vugs, and the wire quantified it:
+
+```
+[cursor3] rollup scope=desktop planned=2481 offers=4181 taken=2427 adopt=2427 repaint=121 ensure=92247 -> COMPOSED
+```
+
+58% of sprite-touching presents composed through the overlay and were clean by construction. The
+other ~42% declined and fell back to WC-I's undraw/redraw bracket, and **every declined pass is a
+visible sprite gap**. The decline rate *is* the flicker. CURSOR-3's own documentation named the
+dominant reason: whole-box containment. A pointer resting on a window's border straddles on every
+single pass, indefinitely — plausibly the exact pointer position P62 was run at.
+
+#### Why the bracket had to become partial, not just wider
+
+The undraw exists for one reason: a pixel some painter in this pass is about to overwrite must be
+handed back *before* the overwrite, or the save-under is stale and the restore stamps pre-pass
+content into a window's rect. **That reason applies per pixel, not per sprite.** CURSOR-3 applied it
+per sprite, so a sprite half over a window and half over bare desktop had its desktop half taken down
+too — for a pass that provably could never write there. That half then blinked at present rate for
+nothing.
+
+So the bracket is now masked. `composite_inner` already derived the conservative set of extents the
+pass may paint (every live window above the shell whose outer box meets the sprite); it now collects
+that set rather than reducing it to a boolean, and hands it to `cursor::undraw_within`, which restores
+**only** the sprite pixels inside it and leaves the rest on the panel untouched. Pixels handed back
+are recorded per pixel in `Sprite::off`.
+
+#### Three provenances, named per pixel
+
+Every painted sprite pixel ends a CURSOR-4 pass in exactly one of three classes:
+
+| class | save-under comes from | when it reaches the panel |
+|---|---|---|
+| **composed** | the window's **back layer** (`compose_into`) | inside that window's row copies — no undraw phase at all |
+| **remainder** | the **front buffer**, read in the tail (`redraw_off_locked`) | after every window has presented |
+| **untouched** | unchanged — it was never taken down | it never left |
+
+The provenance hazard CURSOR-3 declined to take on is closed by *where* each read happens, not by a
+per-pixel colour heuristic:
+
+* The **layer** read cannot capture the sprite's own `FILL`: the layer is private to this pass,
+  `paint_window` fills the whole clipped box densely immediately above, and `compose_into` is the
+  first and only writer of the sprite into it.
+* The **front** read cannot capture the sprite's own `FILL` either, because it happens only in
+  `adopt_overlay`'s aligned branch and only for pixels whose `off` bit is still set — i.e. pixels the
+  masked undraw took down and *nothing* has put back. This is exactly `draw_locked`'s provenance,
+  narrowed to a subset.
+* The **untouched** class needs no argument: neither the panel nor `saved[i]` changed.
+
+`undraw_locked` (the full undraw) now skips `off` pixels rather than restoring them. It must: their
+`saved` entry is stale by construction, and the colour guard cannot detect that — the guard passes on
+any pixel the pass left alone.
+
+#### The dangerous middle case, and how it is closed
+
+A pixel composed into a *lower* window's layer and then overwritten directly by a *higher* window
+would be marked "delivered" while actually holding window content — and the tail would decline to
+repaint it, leaving a hole. So coverage is not only accumulated, it is **revoked**:
+`overlay_uncover` clears the coverage bits inside the box of every drawn window that did *not*
+compose the sprite into it (direct path, instrument exclusion, compat row, contended plan lock,
+unreadable layer). Windows are drawn back-to-front, so the **topmost painter of each pixel is the one
+whose verdict the tail acts on**. A window that never draws this pass never claims coverage, so its
+pixels fall to the remainder class — correct by default.
+
+Note the consequence for the instrument exclusions: an excluded window is still handed the plan's
+*geometry*, and only the compose is suppressed. Withholding the plan entirely (CURSOR-3's shape)
+would leave that window unable to revoke coverage.
+
+#### One session per pass
+
+Coverage accumulates across the several windows of one pass, so the overlay can no longer be a
+last-writer-wins slot. `overlay_open` makes it single-owner for the pass: a second concurrent
+`composite` on another core finds it busy, takes no plan, and runs CURSOR-3's whole-sprite bracket
+(counted under `lock=`). Merging two passes' coverage would let pass B's reset erase pass A's bits,
+and pass A's tail would then "restore" pixels already carrying the sprite from B's layer — reading
+`FILL` as the under-pixel and stamping the arrow permanently. The session is closed in
+`adopt_overlay`, and `composite` routes **every** exit through its tail, so it cannot leak.
+
+A `Sprite::epoch` counter — bumped by every full undraw and every draw, and carried on the `Plan` —
+retires any plan whose sprite has since been taken down and put back elsewhere by a concurrent
+`repaint`. The mismatch is detected and falls back to a whole-sprite refresh rather than merging.
+
+#### Tail selection changed with it
+
+`tail_of` now keys on **"does this pass own the overlay session"**, not "did some window carry the
+sprite". Forced, not cosmetic: a pass that opened a session has left sprite pixels off the panel
+whether or not any layer took them, and only `adopt_overlay` knows how to settle them (install the
+covered ones, repaint the remainder, close the session). A `Repaint` tail there would leak the
+session for the boot. `adopt` may therefore now exceed `taken`, which is why the rollup's old
+`adopt > taken → INCOHERENT` clause is gone.
+
+#### Every invariant, still preserved
+
+* **`SPRITE` never joins F4's drain wait set.** `overlay_open` and `undraw_within` run in exactly the
+  place WC-I put the bracket decision — before the `BlitGuard` registration. Inside the guard,
+  `compose_into` and `overlay_uncover` take only `OVERLAY`, and only with `try_lock`. `adopt_overlay`
+  takes `SPRITE` in the tail, after the guard is dropped. Lock order `SPRITE → OVERLAY`, unchanged.
+* **The no-intersect path costs the same.** One `sprite_plan()` and the `Untouched` tail, exactly as
+  before; nothing on that path was touched.
+* **No extra front-buffer writes.** The composed class writes zero front pixels (unchanged from
+  CURSOR-3); the remainder class writes a *subset* of what CURSOR-3's bracket repainted; the
+  untouched class writes none where CURSOR-3 wrote all of them. CURSOR-4 is a strict reduction.
+* **No verified pixel is ever read with the sprite on it.** The masked undraw takes down every sprite
+  pixel inside *every* overlapping window's box — including the one being verified — and the tail runs
+  after `wcg::end` and `verify_window` have returned. WC-G / WC-D / WC-F exclusions are unchanged in
+  effect; they now suppress the compose rather than the plan.
+* **Save-under provenance is sound for the split sprite**, per the three-class table above.
+* **`ensure_drawn` and `erase` semantics are untouched.**
+
+#### Witnesses
+
+```
+[cursor3] rollup scope={fixture|desktop} planned= offers= taken= adopt= repaint= ensure= straddle= lock= budget= -> VERDICT
+```
+
+The three new fields are the **decline breakdown** CURSOR-3 lacked — its `offers - taken` was one
+number covering three causes, so it could not say which was worth fixing. Appended after the existing
+fields, so the spec's `[cursor3] rollup` assertion and the `[cursor3] present` sample line are both
+unchanged.
+
+* `straddle=` — offers where the sprite met the window's box only partially. Under CURSOR-3 every one
+  of these was a whole-sprite decline; under CURSOR-4 they are composed **in part**, so this is now a
+  measure of how often the split mechanism runs, not of a loss.
+* `lock=` — a contended plan lock at either end: a `composite` that found another pass owning the
+  session, or a `compose_into` that could not take `OVERLAY` inside the guard. Both fall back whole;
+  neither spins under the guard.
+* `budget=` — an instrument forbade the compose (live WC-G probe, unspent WC-D bit) or a WC-F reserved
+  box overlapped the sprite. All one-shots.
+
+#### Gate scope, stated honestly
+
+```
+[cursor3] rollup scope=fixture planned=0 offers=0 taken=0 adopt=0 repaint=0 ensure=349 straddle=0 lock=0 budget=0 -> UNWITNESSED
+```
+
+**QEMU still cannot witness this fix, and the new counters read 0 for the same reason as the old
+ones.** raspi4b delivers no HID pointer report, so `pal::cursor::visible()` is false for the whole
+boot, the sprite is never drawn, `sprite_plan()` is always `None`, no session is ever opened and no
+offer is ever made. `UNWITNESSED` is the correct and only honest verdict here; the gate proves
+**no-regression only**.
+
+`UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 90` → MBENCH **77/77 required, 0 forbidden**
+(2184 lines scanned); `./arroyo test-arm` → **MISSION SUCCESS**; `./arroyo check` green both arches.
+Every `[wc-d]` / `[wc-g]` / `[wc-h]` / `[wc-i]` / `[wc-k]` witness unchanged.
+
+#### Metal watch-list
+
+* **The line to read: declines near zero with the pointer parked ON a window border over a live vug.**
+  Expect `taken` to track `offers` closely and `straddle > 0` — a straddle is now a *composed* pass,
+  not a declined one. The operator reading is a cursor that stays solid on the border, where before it
+  blinked on every present.
+* `lock=` should stay small. If it is material, the next step is a per-window plan slot instead of one
+  global session — measured first, which the breakdown now allows.
+* `budget=` is early-boot only (one-shot instruments) and should stop growing once WC-D and WC-G have
+  spent their budgets.
+* A cursor over bare desktop is unchanged: `ensure` tail, no session, no bracket.
+* Watch for a **stamped arrow** — a white glyph frozen inside a window's rect. That is the failure
+  mode the provenance argument above exists to prevent, and it would mean a save-under captured
+  `FILL`. The gate cannot exercise it; it is the first thing to look for on metal.
+
 ### WC-J — a closed window gives its panel rows back
 
 #### The observation (P61, attended bench)
