@@ -207,6 +207,97 @@ fn band_worker(arg: usize) {
     band_run(unsafe { &*(arg as *const BandJob) });
 }
 
+/// SPREAD-2 — the floor under a core's headroom weight. A core reading 100% busy still gets
+/// `HEADROOM_FLOOR/100` of an equal share rather than an empty band: the blit is memory-bound, a
+/// saturated core is not a stalled one, and a hard zero would let one bad window's reading park a
+/// whole core's worth of rows on its neighbours.
+#[cfg(all(feature = "vugpar", feature = "baremetal"))]
+const HEADROOM_FLOOR: u32 = 25;
+
+/// SPREAD-2 — frames per `[spread2]` rollup. The witness is one line per window, not per band per
+/// frame; the per-spawn `SCHED: task 'vugband'` line stays the trace, this is the number.
+#[cfg(all(feature = "vugpar", feature = "baremetal"))]
+const SPREAD2_WINDOW: u32 = 60;
+
+/// SPREAD-2 — widest core count the rollup counters cover (`NUM_CPUS` upper bound; `video` does not
+/// depend on the arch scheduler's array shape).
+#[cfg(all(feature = "vugpar", feature = "baremetal"))]
+const SPREAD2_CORES: usize = 8;
+
+#[cfg(all(feature = "vugpar", feature = "baremetal"))]
+static SPREAD2_BANDS: [core::sync::atomic::AtomicU32; SPREAD2_CORES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; SPREAD2_CORES];
+#[cfg(all(feature = "vugpar", feature = "baremetal"))]
+static SPREAD2_ROWS: [core::sync::atomic::AtomicU32; SPREAD2_CORES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; SPREAD2_CORES];
+#[cfg(all(feature = "vugpar", feature = "baremetal"))]
+static SPREAD2_FRAMES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// SPREAD-2 — a core's share weight from its momentary busy fraction. Headroom, floored; an equal
+/// set of weights reproduces the old uniform split exactly.
+#[cfg(all(feature = "vugpar", feature = "baremetal"))]
+fn headroom_weight(busy_pct: u32) -> u32 {
+    100u32.saturating_sub(busy_pct.min(100)).max(HEADROOM_FLOOR)
+}
+
+/// SPREAD-2 — accumulate this frame's band placement and, once per `SPREAD2_WINDOW` frames, emit the
+/// distribution rollup: per-core band counts, per-core rows, and the max/min row ratio in hundredths
+/// over the cores that actually took rows. `ratio 100` is a perfectly even spread; the P65v2 state
+/// (two cores carrying two vugs' bands, two carrying one) is what this line exists to make numeric.
+#[cfg(all(feature = "vugpar", feature = "baremetal"))]
+fn spread2_note(self_cpu: usize, helpers: &[usize], jobs: &[BandJob]) {
+    use core::sync::atomic::Ordering;
+
+    for (b, job) in jobs.iter().enumerate() {
+        let core = if b == 0 { self_cpu } else { helpers[b - 1] };
+        if core >= SPREAD2_CORES {
+            continue;
+        }
+        SPREAD2_BANDS[core].fetch_add(1, Ordering::Relaxed);
+        SPREAD2_ROWS[core].fetch_add(job.yb1.saturating_sub(job.yb0) as u32, Ordering::Relaxed);
+    }
+
+    if SPREAD2_FRAMES.fetch_add(1, Ordering::Relaxed) + 1 < SPREAD2_WINDOW {
+        return;
+    }
+    SPREAD2_FRAMES.store(0, Ordering::Relaxed);
+
+    let mut bands = [0u32; SPREAD2_CORES];
+    let mut rows = [0u32; SPREAD2_CORES];
+    let mut hi = 0u32;
+    let mut lo = u32::MAX;
+    let mut live = 0usize;
+    for c in 0..SPREAD2_CORES {
+        bands[c] = SPREAD2_BANDS[c].swap(0, Ordering::Relaxed);
+        rows[c] = SPREAD2_ROWS[c].swap(0, Ordering::Relaxed);
+        if rows[c] > 0 {
+            hi = hi.max(rows[c]);
+            lo = lo.min(rows[c]);
+            live += 1;
+        }
+    }
+    if live == 0 {
+        return;
+    }
+    // Ratio in hundredths, so the witness carries two decimals without float formatting.
+    let ratio = if lo == 0 { 0 } else { (hi as u64 * 100 / lo as u64) as u32 };
+
+    serial_println!(
+        ":: [spread2] window {} frames cores {} bands {},{},{},{} rows {},{},{},{} ratio {} ::",
+        SPREAD2_WINDOW,
+        live,
+        bands[0],
+        bands[1],
+        bands[2],
+        bands[3],
+        rows[0],
+        rows[1],
+        rows[2],
+        rows[3],
+        ratio
+    );
+}
+
 /// FOCUS-VIS — a pending request for the NEXT desktop present to repaint the WHOLE panel.
 ///
 /// The desktop (`Screen`) presents only its own damage, so a region the *window layer* overwrote is
@@ -731,15 +822,43 @@ impl Screen {
         // Enumerate free helper cores: scheduled (inside `run()`) and not this core. `tracked` is the
         // honest "is this core live in the scheduler" signal, so QEMU (however many cores it releases)
         // and metal (at least core 2 free) both get a deterministic, real band count.
+        // SPREAD-2 — rank the candidates by MOMENTARY LOAD (`busy_pct_recent`, ascending) before the
+        // `MAX_BANDS - 1` cap bites, so a capped fan-out claims the idlest cores rather than the
+        // lowest-numbered ones. On a 4-core Pi the cap equals the candidate count and this ordering is
+        // a no-op on the SET (it only decides which helper draws which band); it is the general-case
+        // half of the fix, and the band SIZING below is the half that moves the metal numbers.
         let self_cpu = sched::meter_current_cpu();
         let ncpu = sched::meter_cpu_count();
         let mut helpers = [0usize; MAX_BANDS - 1];
+        let mut hbusy = [0u32; MAX_BANDS - 1];
         let mut nh = 0usize;
         let mut c = 0usize;
-        while c < ncpu && nh < MAX_BANDS - 1 {
-            if c != self_cpu && sched::core_load(c).tracked {
-                helpers[nh] = c;
-                nh += 1;
+        while c < ncpu {
+            let load = sched::core_load(c);
+            if c != self_cpu && load.tracked {
+                let busy = load.busy_pct_recent;
+                if nh < MAX_BANDS - 1 {
+                    // Insertion sort into the kept set: ascending `busy`.
+                    let mut i = nh;
+                    while i > 0 && hbusy[i - 1] > busy {
+                        helpers[i] = helpers[i - 1];
+                        hbusy[i] = hbusy[i - 1];
+                        i -= 1;
+                    }
+                    helpers[i] = c;
+                    hbusy[i] = busy;
+                    nh += 1;
+                } else if busy < hbusy[nh - 1] {
+                    // Full: displace the busiest kept candidate, then re-sink into place.
+                    let mut i = nh - 1;
+                    while i > 0 && hbusy[i - 1] > busy {
+                        helpers[i] = helpers[i - 1];
+                        hbusy[i] = hbusy[i - 1];
+                        i -= 1;
+                    }
+                    helpers[i] = c;
+                    hbusy[i] = busy;
+                }
             }
             c += 1;
         }
@@ -761,18 +880,41 @@ impl Screen {
             bpp,
         };
 
-        // Partition [y_lo, y_hi) into `nbands` contiguous slices. Band boundaries via `y_lo + span*b/nbands`
-        // so the ranges tile the extent exactly with no gap or overlap.
+        // SPREAD-2 — partition [y_lo, y_hi) into `nbands` contiguous slices sized by each executing
+        // core's HEADROOM (`100 - busy_pct_recent`, floored), not by an equal split. Band 0 runs on
+        // `self_cpu`, band b on `helpers[b - 1]`.
+        //
+        // Why sizing and not placement: with `MAX_BANDS == 4` on a 4-core Pi the helper set is every
+        // other core, so no re-placement can change WHICH cores work — two vugs each claim all three
+        // of their peers and the doubly-claimed cores saturate (P65v2: c0=99 c1=68 c2=99 c3=63).
+        // Weighting the slices is what lets a core already carrying the other vug's band take less.
+        //
+        // Stability: `busy_pct_recent` is a ~250 ms window and frames land far inside it, so the signal
+        // low-passes the per-frame feedback rather than oscillating with it. `HEADROOM_FLOOR` keeps a
+        // saturated core from being handed a degenerate empty band and bounds how far the split can
+        // concentrate. When every headroom is equal the prefix sums reduce to `span * b / nbands`
+        // exactly — the calm/idle boot keeps its former byte-identical partition.
         let span = y_hi - y_lo;
+        let mut w = [0u32; MAX_BANDS];
+        w[0] = headroom_weight(sched::core_load(self_cpu).busy_pct_recent);
+        for b in 1..nbands {
+            w[b] = headroom_weight(sched::core_load(helpers[b - 1]).busy_pct_recent);
+        }
+        let mut prefix = [0u32; MAX_BANDS + 1];
+        for b in 0..nbands {
+            prefix[b + 1] = prefix[b] + w[b];
+        }
+        let total_w = prefix[nbands] as usize; // >= nbands * HEADROOM_FLOOR > 0
         let mut jobs: [BandJob; MAX_BANDS] =
             [BandJob { common: &common, yb0: 0, yb1: 0 }; MAX_BANDS];
         for b in 0..nbands {
             jobs[b] = BandJob {
                 common: &common,
-                yb0: y_lo + span * b / nbands,
-                yb1: y_lo + span * (b + 1) / nbands,
+                yb0: y_lo + span * prefix[b] as usize / total_w,
+                yb1: y_lo + span * prefix[b + 1] as usize / total_w,
             };
         }
+        spread2_note(self_cpu, &helpers[..nh], &jobs[..nbands]);
 
         // Dispatch bands 1..nbands to helper APs; run band 0 on this core while they work; then join.
         // `jobs`/`common` stay on this frame — the joins below keep it alive until every band returns.

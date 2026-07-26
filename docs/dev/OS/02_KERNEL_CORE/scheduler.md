@@ -183,6 +183,66 @@ that share this module.
 > practice; those files are outside the scheduler lane, so SCHED-3 lands the
 > mechanism + witness and leaves the call-site conversion to a net/main arc.
 
+### Band-parallel work distribution (aarch64, SPREAD-2)
+
+`Screen::flush_parallel` (VUG-PAR, `video/screen.rs`, feature `vugpar`) splits a
+frame's damaged scanline extent into contiguous bands, runs band 0 inline and
+dispatches the rest to helper APs via `sched::spawn_joinable`, then joins. The
+join is a correctness barrier, and the band slots stay `steal_ok: false` — a
+band must not migrate mid-frame, so **no-migrate is a real constraint and
+stays**.
+
+What was not real was the *distribution*. Two attended vugs (P65v2) sat at
+`c0=99% c1=68% c2=99% c3=63%`: two cores pinned, two loafing. The helper set is
+built as "every tracked core that is not mine", and with `MAX_BANDS == 4` on a
+four-core Pi that cap equals the candidate count — so each vug independently
+claimed all three of its peers, the cores claimed by *both* vugs saturated, and
+each vug's own core stayed comparatively idle. This is BG-SPREAD's finding one
+layer down: the placement was **inherited from the topology, not chosen** —
+nothing consulted load. But unlike BG-SPREAD the cure is not re-placement:
+when the helper set is forced, no reordering can change *which* cores work.
+
+SPREAD-2 therefore fixes distribution in two parts:
+
+- **Sizing (the part that moves the numbers).** Band widths are prefix sums of
+  each executing core's *headroom* — `100 - busy_pct_recent`, floored at
+  `HEADROOM_FLOOR` (25) — instead of an equal `span * b / nbands` split. A core
+  already carrying the other vug's band is handed proportionally fewer rows.
+  When all headrooms are equal the prefix sums reduce to `span * b / nbands`
+  exactly, so an idle or calm boot keeps its former byte-identical partition.
+- **Ranking (the general case).** Candidate helpers are insertion-sorted by
+  `busy_pct_recent` ascending before the `MAX_BANDS - 1` cap applies, so a
+  fan-out that *is* capped below the candidate count (more cores than bands, as
+  on tegra) claims the idlest cores rather than the lowest-numbered ones. On a
+  four-core Pi this is a no-op on the set and only decides which helper draws
+  which band.
+
+The floor matters: the blit is memory-bound and a saturated core is not a
+stalled one, so a 100%-busy core still takes `25/100` of an equal share rather
+than an empty band. It also bounds how far one bad reading can concentrate the
+split. Feedback is stable because `busy_pct_recent` is a ~250 ms window while
+frames land far inside it — the signal low-passes the per-frame response instead
+of oscillating with it.
+
+**Witness.** The per-spawn `SCHED: task 'vugband' -> core N` line remains the
+trace; the number is a one-per-window rollup, every `SPREAD2_WINDOW` (60)
+parallel frames:
+
+```
+:: [spread2] window 60 frames cores 4 bands 60,60,38,60 rows 3755,3149,1781,1939 ratio 210 ::
+```
+
+`cores` is how many cores took rows, `bands`/`rows` are per-core totals for the
+window, and `ratio` is max/min rows in hundredths (100 = perfectly even). In the
+reading above the outlier is core 2, which was only `tracked` for 38 of the 60
+frames — participation, not weighting.
+
+Because `vugpar` is off unless `UNAOS_VUGPAR=1`, the default regression log has
+no `[spread2]` line at all, so the spec carries **FORBIDs** rather than a
+REQUIRE (`cores 1`, and `ratio` of four digits or more): zero hits on a default
+log, real assertions on a `UNAOS_VUGPAR=1` log. BG-SPREAD's `BGSPREAD` leg is
+unaffected — it is ASID/parent-placement keyed and reads no band state.
+
 ### BSP scheduling + work stealing (aarch64, SMP-BAL)
 
 SCHED-3 balances at **spawn**, but a task's cost is unknown then and wake bursts

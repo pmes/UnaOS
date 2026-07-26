@@ -790,3 +790,13 @@ FORBID SPINHUNT: .*-> FAIL
 # ---    tie-break in `pick_cpu` gives 2..=3. See docs/dev/OS/02_KERNEL_CORE/userspace.md BG-SPREAD.
 REQUIRE BGSPREAD: 3 bg launches over [0-9]+ online cores -> cores [0-9]+,[0-9]+,[0-9]+ distinct=[2-9] \(want >= 2\) PASS
 FORBID BGSPREAD: .*-> FAIL
+
+# SPREAD-2 — VUG-PAR band distribution. The `[spread2]` rollup only exists when the image carries the
+# `vugpar` feature (UNAOS_VUGPAR=1), which the default suite does not set, so these are FORBIDs rather
+# than a REQUIRE: zero hits on a default log, real assertions on a UNAOS_VUGPAR=1 log. Under vugpar the
+# rollup reads e.g. `cores 4 bands 60,60,38,60 rows 3755,3149,1781,1939 ratio 210`.
+# A fan-out that collapsed onto one core — the pre-SPREAD-2 pathology taken to its limit.
+FORBID \[spread2\] .* cores 1
+# Rows off by 10x or worse between the busiest and idlest participating core: the weighting inverted or
+# ran away, which the HEADROOM_FLOOR clamp is meant to make unreachable.
+FORBID \[spread2\] .* ratio [0-9]{4,}
