@@ -52,6 +52,10 @@ impl SpecifiedStyle {
         if let Some(j) = self.justify {
             node_style.justify_content = Some(j);
         }
+        if let Some((w, _)) = self.paint.border {
+            let b = LengthPercentage::length(w);
+            node_style.border = Rect { left: b, right: b, top: b, bottom: b };
+        }
     }
 }
 
@@ -62,7 +66,17 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
     match prop {
         "display" => match value {
             "none" => style.display = Some(Display::None),
-            "flex" | "block" | "inline-block" | "list-item" => style.display = Some(Display::Flex),
+            // Column-flex approximations of block-ish display types.
+            "flex" | "block" | "inline-block" | "inline-flex" | "inline" | "list-item"
+            | "flow-root" | "table" | "table-cell" | "table-caption" | "table-row-group"
+            | "table-header-group" | "table-footer-group" => {
+                style.display = Some(Display::Flex)
+            }
+            "table-row" => {
+                style.display = Some(Display::Flex);
+                style.flex_direction = Some(FlexDirection::Row);
+            }
+            "inherit" | "initial" | "unset" | "revert" => {}
             other => crate::ledger::record_css(&format!("display:{}", other)),
         },
         "flex-direction" => match value {
@@ -147,6 +161,59 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             Some(b) => style.paint.bold = Some(b),
             None => crate::ledger::record_css(&format!("font-weight-value:{}", clip(value))),
         },
+        "line-height" => {
+            let v = value.trim();
+            let factor = if let Some(px) = v.strip_suffix("px").and_then(|n| n.trim().parse::<f32>().ok()) {
+                Some(px / 16.0)
+            } else if v == "normal" {
+                Some(1.2)
+            } else {
+                v.parse::<f32>().ok()
+            };
+            match factor {
+                Some(f) => style.paint.line_height = Some(f),
+                None => crate::ledger::record_css(&format!("line-height-value:{}", clip(value))),
+            }
+        }
+        "border" | "outline" => {
+            let v = value.trim();
+            if v == "none" || v == "0" {
+                style.paint.border = None;
+                return;
+            }
+            let mut width = 1.0f32;
+            let mut color = (128, 128, 128);
+            let mut got_any = false;
+            for part in v.split_whitespace() {
+                if let Some(px) = part.strip_suffix("px").and_then(|n| n.parse::<f32>().ok()) {
+                    width = px;
+                    got_any = true;
+                } else if matches!(part, "solid" | "dotted" | "dashed" | "double" | "groove" | "ridge" | "inset" | "outset") {
+                    got_any = true;
+                } else if let Some(c) = parse_color_str(part) {
+                    color = c;
+                    got_any = true;
+                }
+            }
+            if got_any {
+                style.paint.border = Some((width, color));
+            } else {
+                crate::ledger::record_css(&format!("border-value:{}", clip(value)));
+            }
+        }
+        "border-color" => {
+            if let Some(c) = parse_color_str(value) {
+                let w = style.paint.border.map(|(w, _)| w).unwrap_or(1.0);
+                style.paint.border = Some((w, c));
+            }
+        }
+        "border-width" => {
+            if let Some(w) = parse_px(value) {
+                let c = style.paint.border.map(|(_, c)| c).unwrap_or((128, 128, 128));
+                style.paint.border = Some((w, c));
+            }
+        }
+        "border-style" => {} // stroke style is uniform; nothing to record
         other => crate::ledger::record_css(&format!("property:{}", other)),
     }
 }
@@ -249,6 +316,8 @@ fn apply_stylesheet(layout_tree: &mut LayoutTree, css: &str, depth: u8) {
             if style.paint.color.is_some() { entry.color = style.paint.color; }
             if style.paint.font_size.is_some() { entry.font_size = style.paint.font_size; }
             if style.paint.bold.is_some() { entry.bold = style.paint.bold; }
+            if style.paint.border.is_some() { entry.border = style.paint.border; }
+            if style.paint.line_height.is_some() { entry.line_height = style.paint.line_height; }
         }
     }
 }

@@ -14,6 +14,7 @@ struct Inherited {
     color: (u8, u8, u8),
     font_size: f32,
     bold: bool,
+    line_height: f32, // multiplier of font size
 }
 
 use crate::layout::default_font_size;
@@ -55,6 +56,7 @@ fn draw_text(
     max_width: f32,
     font: &Font,
     font_size: f32,
+    line_height_mult: f32,
     color: (u8, u8, u8),
     surface: &mut [u8],
     width: u32,
@@ -64,7 +66,9 @@ fn draw_text(
     let metrics = font.metrics();
     let scale = font_size / metrics.units_per_em as f32;
     let ascent = metrics.ascent * scale;
-    let line_height = (metrics.ascent - metrics.descent + metrics.line_gap) * scale;
+    let natural = (metrics.ascent - metrics.descent + metrics.line_gap) * scale;
+    // 0.0 = "normal": use the font's natural line height.
+    let line_height = if line_height_mult > 0.0 { font_size * line_height_mult } else { natural };
 
     let mut pen_x = 0.0f32;
     let mut line = 0u32;
@@ -203,6 +207,10 @@ pub fn render_frame(
                     inherited.bold
                         || matches!(tag, "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th"),
                 );
+                if let Some(lh) = spec.line_height {
+                    inherited.line_height = lh;
+                }
+
                 inherited.color = spec.color.unwrap_or(if tag == "a" {
                     (0, 0, 238) // UA default link blue
                 } else {
@@ -253,6 +261,28 @@ pub fn render_frame(
                     }
                 }
 
+                if let Some((bw, bc)) = spec.border {
+                    let bw = bw.max(1.0) as u32;
+                    let x_start = ((current_x as i32) - sx).max(0) as u32;
+                    let y_start = ((current_y as i32) - sy).max(0) as u32;
+                    let end_x = x_start
+                        .saturating_add(layout_box.size.width.max(0.0) as u32)
+                        .min(width);
+                    let end_y = y_start
+                        .saturating_add(layout_box.size.height.max(0.0) as u32)
+                        .min(height);
+                    for y in y_start..end_y {
+                        for x in x_start..end_x {
+                            let on_edge = x < x_start + bw
+                                || x >= end_x.saturating_sub(bw)
+                                || y < y_start + bw
+                                || y >= end_y.saturating_sub(bw);
+                            if on_edge && in_damage(x, y, damage_rects) {
+                                put_px(surface, width, x, y, bc);
+                            }
+                        }
+                    }
+                }
             } else if dom_node.as_text().is_some() {
                 let font = if inherited.bold { font_bold } else { font };
                 if let Some(font) = font {
@@ -266,6 +296,7 @@ pub fn render_frame(
                             layout_box.size.width.max(1.0),
                             font,
                             inherited.font_size,
+                            inherited.line_height,
                             inherited.color,
                             surface,
                             width,
@@ -291,6 +322,7 @@ pub fn render_frame(
         color: (0, 0, 0),
         font_size: 16.0,
         bold: false,
+        line_height: 0.0, // natural
     };
     draw_node(
         layout.root_node,

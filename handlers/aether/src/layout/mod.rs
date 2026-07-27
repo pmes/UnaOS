@@ -10,6 +10,11 @@ pub struct PaintStyle {
     pub color: Option<(u8, u8, u8)>,
     pub font_size: Option<f32>,
     pub bold: Option<bool>,
+    /// (width px, color). Painted as a rect stroke.
+    pub border: Option<(f32, (u8, u8, u8))>,
+    /// Resolved line height: multiplier of font size (px values are
+    /// converted at parse time against the 16px base — approximation).
+    pub line_height: Option<f32>,
 }
 
 pub struct LayoutTree {
@@ -198,20 +203,25 @@ pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
 pub fn remeasure(tree: &mut LayoutTree) {
     // Pass 1: resolve font size down the box tree for text leaves, and
     // intrinsic sizes for images.
-    let mut text_info: HashMap<taffy::NodeId, (String, f32)> = HashMap::new();
+    let mut text_info: HashMap<taffy::NodeId, (String, f32, f32)> = HashMap::new();
     let mut img_info: HashMap<taffy::NodeId, (f32, f32)> = HashMap::new();
     fn resolve(
         node_id: taffy::NodeId,
-        inherited: f32,
+        inherited: (f32, f32), // (font size, line-height multiplier; 0 = natural)
         tree: &LayoutTree,
-        out: &mut HashMap<taffy::NodeId, (String, f32)>,
+        out: &mut HashMap<taffy::NodeId, (String, f32, f32)>,
         imgs: &mut HashMap<taffy::NodeId, (f32, f32)>,
     ) {
         let mut size = inherited;
         if let Some(dom_node) = tree.node_map.get(&node_id) {
             if let Some(el) = dom_node.as_element() {
-                let spec = tree.paint_map.get(&node_id).and_then(|p| p.font_size);
-                size = spec.unwrap_or_else(|| default_font_size(el.name.local.as_ref(), inherited));
+                let paint = tree.paint_map.get(&node_id);
+                size.0 = paint
+                    .and_then(|p| p.font_size)
+                    .unwrap_or_else(|| default_font_size(el.name.local.as_ref(), inherited.0));
+                if let Some(lh) = paint.and_then(|p| p.line_height) {
+                    size.1 = lh;
+                }
                 if el.name.local.as_ref() == "img" {
                     let attrs = el.attributes.borrow();
                     // width/height attributes win; else intrinsic dimensions.
@@ -232,7 +242,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 let text = dom_node.text_contents();
                 let text = text.trim().to_string();
                 if !text.is_empty() {
-                    out.insert(node_id, (text, inherited));
+                    out.insert(node_id, (text, inherited.0, inherited.1));
                 }
             }
         }
@@ -242,7 +252,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
             }
         }
     }
-    resolve(tree.root_node, 16.0, tree, &mut text_info, &mut img_info);
+    resolve(tree.root_node, (16.0, 0.0), tree, &mut text_info, &mut img_info);
 
     // Taffy caches leaf measurements; a cascade pass can change resolved
     // font sizes without touching the leaf's style, so stale cached sizes
@@ -270,14 +280,14 @@ pub fn remeasure(tree: &mut LayoutTree) {
                     height: known.height.unwrap_or(h),
                 };
             }
-            let Some((text, font_size)) = text_info.get(&node_id) else {
+            let Some((text, font_size, line_mult)) = text_info.get(&node_id) else {
                 return Size { width: known.width.unwrap_or(0.0), height: known.height.unwrap_or(0.0) };
             };
             let wrap_width = known.width.unwrap_or(match avail.width {
                 AvailableSpace::Definite(w) => w,
                 _ => 800.0,
             });
-            let (w, h) = measure_text(font.as_deref(), text, *font_size, wrap_width.max(1.0));
+            let (w, h) = measure_text(font.as_deref(), text, *font_size, *line_mult, wrap_width.max(1.0));
             Size {
                 width: known.width.unwrap_or(w),
                 height: known.height.unwrap_or(h),
@@ -292,6 +302,7 @@ fn measure_text(
     font: Option<&font_kit::font::Font>,
     text: &str,
     font_size: f32,
+    line_mult: f32,
     max_width: f32,
 ) -> (f32, f32) {
     let Some(font) = font else {
@@ -299,7 +310,8 @@ fn measure_text(
     };
     let metrics = font.metrics();
     let scale = font_size / metrics.units_per_em as f32;
-    let line_height = (metrics.ascent - metrics.descent + metrics.line_gap) * scale;
+    let natural = (metrics.ascent - metrics.descent + metrics.line_gap) * scale;
+    let line_height = if line_mult > 0.0 { font_size * line_mult } else { natural };
     let space = font_size * 0.3;
 
     let mut pen = 0.0f32;
