@@ -175,6 +175,56 @@ mod tests {
     }
 
     #[test]
+    fn test_css_selectors_and_specified_only_application() {
+        let html = r#"<html><body>
+            <div class="hero other">a</div>
+            <p id="lead">b</p>
+            <p>c</p>
+        </body></html>"#;
+        let document = dom::parse_html(html);
+        let mut layout_tree = layout::compute_layout(&document);
+        css::apply_css(&mut layout_tree, r#"
+            .hero { background-color: red; }
+            #lead { color: #00ff00; }
+            p { font-size: 20px; }
+        "#);
+
+        let mut hero_bg = None;
+        let mut lead_color = None;
+        let mut plain_p = None;
+        for (node_id, dom_node) in &layout_tree.node_map {
+            let Some(el) = dom_node.as_element() else { continue };
+            let attrs = el.attributes.borrow();
+            let paint = layout_tree.paint_map.get(node_id).copied().unwrap_or_default();
+            if attrs.get("class") == Some("hero other") {
+                hero_bg = paint.background;
+            } else if attrs.get("id") == Some("lead") {
+                lead_color = paint.color;
+                assert_eq!(paint.font_size, Some(20.0), "tag rule must still apply to #lead");
+            } else if el.name.local.as_ref() == "p" {
+                plain_p = Some(paint);
+            }
+        }
+        assert_eq!(hero_bg, Some((255, 0, 0)), "class selector must match");
+        assert_eq!(lead_color, Some((0, 255, 0)), "id selector must match");
+        let plain_p = plain_p.expect("plain <p> present");
+        assert_eq!(plain_p.font_size, Some(20.0));
+        assert_eq!(plain_p.background, None, "rule must not leak unspecified properties");
+
+        // A rule specifying only a color must not reset flex_direction to Row.
+        let mut col_ok = false;
+        for (node_id, dom_node) in &layout_tree.node_map {
+            if let Some(el) = dom_node.as_element() {
+                if el.name.local.as_ref() == "body" {
+                    let s = layout_tree.taffy.style(*node_id).unwrap();
+                    col_ok = s.flex_direction == taffy::style::FlexDirection::Column;
+                }
+            }
+        }
+        assert!(col_ok, "unspecified flex-direction must stay Column");
+    }
+
+    #[test]
     fn test_ledger_records_unimplemented_apis() {
         crate::ledger::reset();
         let html = r#"<html><head><style>
