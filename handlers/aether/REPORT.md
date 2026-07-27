@@ -104,3 +104,48 @@ Implemented all milestones per the adversarial review criteria and PLAN-aether-b
 - Created Qt stubs in `vessels/aether-shell/src/shell_qt.rs` via `cxx-qt`. Fully staged for C++ integration bridging in future iterations once the QML frontend is assembled.
 
 **Oracle Verification**: `cargo check -p aether-shell --features gtk` passes successfully. `cargo check -p aether-shell --features qt` and `--target x86_64-apple-darwin` pass structurally on host.
+
+---
+
+## M5 breadth loop (Fable solo, 2026-07-27) — 24 rounds, ledger-driven
+
+Method: each round runs the headless `aether render` oracle against a real
+corpus (example.com, Hacker News, Wikipedia, rust-lang.org), reads the API
+coverage ledger for the top gaps, closes them with offline fixtures, and
+commits only on green gates (`cargo test -p aether`, `cargo check -p
+aether-shell`). Grew from 7 tests to 25.
+
+**DONE this loop:**
+- Coverage ledger wired (was dead code) + headless render/PNG/ledger oracle.
+- Paint pipeline: real font-kit glyph text, per-node bg/color, inheritance,
+  UA link blue + heading sizes; no more gray-box renderer.
+- CSS: real selector matching (kuchiki/servo selectors), full cascade with
+  specificity + source order across all sheets, @media (viewport-driven) and
+  @supports (honest capability set) evaluation, rgb/rgba/hex/named colors,
+  px/em/%/keyword font sizes, font-weight/bold, borders, line-height,
+  display-value breadth, position:absolute/fixed + insets, box shorthands,
+  text-align, neutral keywords.
+- Layout: text measurement, inline-flow approximation, image intrinsic sizing,
+  UA margins/list-indents/control sizes, hidden/aria-hidden, display:none skip,
+  engine-driven viewport (Resize reflows).
+- Resources: external stylesheets fetched; images fetched/decoded/blitted;
+  data: URI images (base64).
+- JS (M3): setAttribute/getAttribute/innerHTML/textContent/appendChild are real
+  DOM mutations; addEventListener + click dispatch with bubbling; mutation →
+  relayout loop.
+- Forms: Enter → GET (query) / POST (urlencoded) → navigation.
+- br line breaks, link/`<u>` underlines.
+
+**M4 (YouTube) — PARTIAL, STOP-and-report:**
+Resolver + typed errors + Stria PlayMedia handoff restored from history and
+wired (offline suite green). LIVE resolve FAILS: as of 2026-07 innertube
+requires PO-token attestation for keyless clients (probed ANDROID/IOS/
+ANDROID_TESTSUITE/MEDIA_CONNECT_FRONTEND — all failedPrecondition/UNPLAYABLE
+without a poToken). Proceeding needs a poToken/attestation path, which weighs
+against the plan's legal ground rules. **Decision escalated to the plan owner.**
+The `AETHER_YT_LIVE=1` gated test fails by design (typed Parse error, no
+fabricated success); default gates stay green.
+
+**Not yet done:** specificity is per-property last-wins within equal
+specificity (no !important priority tiers), no float/grid, no SVG, no
+background-image, absolute boxes without insets land at parent origin.
