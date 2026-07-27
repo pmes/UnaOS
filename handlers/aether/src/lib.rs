@@ -484,7 +484,12 @@ impl AetherEngine {
         }
         
         if add_history {
-            self.history.truncate(self.history_idx);
+            // Drop any forward entries beyond the current position, then
+            // append. (Truncating AT the index wiped the current entry too —
+            // history never grew past one, so Back never had anywhere to go.)
+            if !self.history.is_empty() {
+                self.history.truncate(self.history_idx + 1);
+            }
             self.history.push(url.to_string());
             self.history_idx = self.history.len() - 1;
         }

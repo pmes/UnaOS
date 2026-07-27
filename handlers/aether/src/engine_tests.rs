@@ -841,6 +841,26 @@ mod tests {
         assert_eq!(sources, vec![("https://example.com/media/clip.webm".to_string(), "video/webm".to_string())]);
     }
 
+    /// History: load A, B, C → back lands on B then A; a new load from B
+    /// drops the forward tail. (Truncate-at-index wiped the whole history,
+    /// so Back never worked in the shell.)
+    #[test]
+    fn test_history_back_forward() {
+        let mut engine = crate::AetherEngine::new();
+        for url in ["https://a.test/", "https://b.test/", "https://c.test/"] {
+            engine.load_html_styled(url, "<html><body>x</body></html>", &[], true);
+        }
+        assert_eq!(engine.history.len(), 3, "three loads must record three entries");
+        assert_eq!(engine.get_back_url().as_deref(), Some("https://b.test/"));
+        assert_eq!(engine.get_back_url().as_deref(), Some("https://a.test/"));
+        assert_eq!(engine.get_back_url(), None, "at the oldest entry");
+        assert_eq!(engine.get_forward_url().as_deref(), Some("https://b.test/"));
+        // New navigation from B drops C.
+        engine.load_html_styled("https://d.test/", "<html><body>x</body></html>", &[], true);
+        assert_eq!(engine.history, vec!["https://a.test/", "https://b.test/", "https://d.test/"]);
+        assert_eq!(engine.get_forward_url(), None, "forward tail dropped");
+    }
+
     /// float:left/right sizes to content and hugs its edge (approximation).
     #[test]
     fn test_float_approximation() {

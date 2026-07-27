@@ -159,6 +159,11 @@ impl Engine {
                          addListener: function () {}, removeListener: function () {},
                          addEventListener: function () {}, removeEventListener: function () {} };
             };
+            globalThis.Image = function (w, h) {
+                this.width = w || 0; this.height = h || 0;
+                this.src = ''; this.complete = false;
+                this.addEventListener = function () {};
+            };
             globalThis.navigator = {
                 userAgent: 'UnaOS Aether/0.1.0',
                 language: 'en-US', languages: ['en-US'],
