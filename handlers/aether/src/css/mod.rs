@@ -13,6 +13,10 @@ pub(crate) struct SpecifiedStyle {
     pub flex_direction: Option<FlexDirection>,
     pub width: Option<Dimension>,
     pub height: Option<Dimension>,
+    pub max_width: Option<Dimension>,
+    pub max_height: Option<Dimension>,
+    pub min_width: Option<Dimension>,
+    pub min_height: Option<Dimension>,
     pub padding: Option<Rect<LengthPercentage>>,
     pub margin: Option<Rect<LengthPercentageAuto>>,
     pub position: Option<taffy::style::Position>,
@@ -35,6 +39,19 @@ impl SpecifiedStyle {
             node_style.size.height = h;
             node_style.min_size.height = h;
         }
+        // min wins over max in taffy, and blocks carry a UA min-height
+        // default — a specified max must clear it (an explicit min-* below
+        // still overrides, it folds after).
+        if let Some(v) = self.max_width {
+            node_style.max_size.width = v;
+            node_style.min_size.width = Dimension::auto();
+        }
+        if let Some(v) = self.max_height {
+            node_style.max_size.height = v;
+            node_style.min_size.height = Dimension::auto();
+        }
+        if let Some(v) = self.min_width { node_style.min_size.width = v; }
+        if let Some(v) = self.min_height { node_style.min_size.height = v; }
         if let Some(p) = self.padding {
             node_style.padding = p;
         }
@@ -88,6 +105,18 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
         },
         "width" => style.width = parse_dimension_str(value),
         "height" => style.height = parse_dimension_str(value),
+        "max-width" => style.max_width = parse_dimension_str(value),
+        "max-height" => style.max_height = parse_dimension_str(value),
+        "min-width" => style.min_width = parse_dimension_str(value),
+        "min-height" => style.min_height = parse_dimension_str(value),
+        // overflow hidden/clip/auto/scroll all CLIP paint here (no inner
+        // scrollbars yet — clipping is the honest approximation; visible
+        // overflow was smearing collapsed menus over the page).
+        "overflow" | "overflow-x" | "overflow-y" => match value {
+            "hidden" | "clip" | "auto" | "scroll" => style.paint.clip = Some(true),
+            "visible" => style.paint.clip = Some(false),
+            _ => {}
+        },
         "padding" => style.padding = parse_sides(value, |v| parse_length_percentage_str(v)),
         "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
             if let Some(v) = parse_length_percentage_str(value) {
@@ -508,6 +537,7 @@ fn apply_spec_to_node(
     if style.paint.line_height.is_some() { entry.line_height = style.paint.line_height; }
     if style.paint.bg_image.is_some() { entry.bg_image = style.paint.bg_image.clone(); }
     if style.paint.hidden.is_some() { entry.hidden = style.paint.hidden; }
+    if style.paint.clip.is_some() { entry.clip = style.paint.clip; }
 }
 
 /// Applies a set of stylesheets as ONE cascade — rules from every sheet
@@ -771,7 +801,8 @@ fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
         ($($f:ident),*) => { $( if src.$f.is_some() { dst.$f = src.$f; } )* };
     }
     take!(display, flex_direction, width, height, padding, margin, position,
-          inset_top, inset_left, inset_right, inset_bottom, justify, align_self);
+          inset_top, inset_left, inset_right, inset_bottom, justify, align_self,
+          max_width, max_height, min_width, min_height);
     let p = &src.paint;
     if p.background.is_some() { dst.paint.background = p.background; }
     if p.color.is_some() { dst.paint.color = p.color; }
@@ -781,6 +812,7 @@ fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
     if p.line_height.is_some() { dst.paint.line_height = p.line_height; }
     if p.bg_image.is_some() { dst.paint.bg_image = p.bg_image.clone(); }
     if p.hidden.is_some() { dst.paint.hidden = p.hidden; }
+    if p.clip.is_some() { dst.paint.clip = p.clip; }
 }
 
 /// Evaluates an @media condition against the fixed viewport. Comma = OR,
@@ -828,6 +860,8 @@ fn property_supported(prop: &str) -> bool {
             | "position" | "top" | "left" | "right" | "bottom" | "text-align"
             | "background-color" | "background" | "background-image" | "color"
             | "font-size" | "font-weight" | "line-height" | "visibility"
+            | "max-width" | "max-height" | "min-width" | "min-height"
+            | "overflow" | "overflow-x" | "overflow-y"
             | "border" | "outline" | "border-color" | "border-width" | "border-style"
     )
 }

@@ -447,6 +447,10 @@ impl AetherEngine {
             }
         }
         
+        // Drain zero-delay boot timers before first layout — pages queue
+        // their init through setTimeout(0) and expect it before paint.
+        let _ = js_engine.context.run_jobs();
+
         let mut sheets: Vec<String> = Vec::new();
         if let Ok(styles) = document.select("style") {
             for style_node in styles {

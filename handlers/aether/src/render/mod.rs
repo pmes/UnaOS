@@ -20,6 +20,14 @@ struct Inherited {
 
 use crate::layout::default_font_size;
 
+/// Screen-space clip rect (x0, y0, x1, y1), already scroll-adjusted.
+type Clip = (f32, f32, f32, f32);
+
+fn in_clip(x: u32, y: u32, clip: Clip) -> bool {
+    let (x0, y0, x1, y1) = clip;
+    (x as f32) >= x0 && (x as f32) < x1 && (y as f32) >= y0 && (y as f32) < y1
+}
+
 fn in_damage(x: u32, y: u32, damage_rects: &[(u32, u32, u32, u32)]) -> bool {
     damage_rects
         .iter()
@@ -64,6 +72,7 @@ fn draw_text(
     width: u32,
     height: u32,
     damage_rects: &[(u32, u32, u32, u32)],
+    clip: Clip,
 ) {
     let metrics = font.metrics();
     let scale = font_size / metrics.units_per_em as f32;
@@ -126,7 +135,7 @@ fn draw_text(
                                     continue;
                                 }
                                 let (px, py) = (dst_x as u32, dst_y as u32);
-                                if px < width && py < height && in_damage(px, py, damage_rects) {
+                                if px < width && py < height && in_damage(px, py, damage_rects) && in_clip(px, py, clip) {
                                     blend_px(surface, width, px, py, color, cov);
                                 }
                             }
@@ -145,7 +154,7 @@ fn draw_text(
                 let uy = uy as u32;
                 if uy < height {
                     for x in x0..x1 {
-                        if in_damage(x, uy, damage_rects) {
+                        if in_damage(x, uy, damage_rects) && in_clip(x, uy, clip) {
                             put_px(surface, width, x, uy, color);
                         }
                     }
@@ -207,6 +216,7 @@ pub fn render_frame(
         sx: i32,
         sy: i32,
         damage_rects: &[(u32, u32, u32, u32)],
+        clip: Clip,
     ) {
         // display:none subtrees exist in the tree with zero-size boxes;
         // they must not paint (their text would smear at the parent origin).
@@ -270,7 +280,7 @@ pub fn render_frame(
                         .min(height);
                     for y in y_start..end_y {
                         for x in x_start..end_x {
-                            if in_damage(x, y, damage_rects) {
+                            if in_damage(x, y, damage_rects) && in_clip(x, y, clip) {
                                 put_px(surface, width, x, y, bg);
                             }
                         }
@@ -292,7 +302,7 @@ pub fn render_frame(
                     let (off_u, off_v) = ((iw - crop_w) / 2.0, (ih - crop_h) / 2.0);
                     for y in y_start..end_y {
                         for x in x_start..end_x {
-                            if !in_damage(x, y, damage_rects) {
+                            if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
                                 continue;
                             }
                             let u = (off_u + (x - x_start) as f32 / bw * crop_w) as u32;
@@ -360,6 +370,7 @@ pub fn render_frame(
                                 width,
                                 height,
                                 damage_rects,
+                                clip,
                             );
                         }
                     }
@@ -381,7 +392,7 @@ pub fn render_frame(
                                 || x >= end_x.saturating_sub(bw)
                                 || y < y_start + bw
                                 || y >= end_y.saturating_sub(bw);
-                            if on_edge && in_damage(x, y, damage_rects) {
+                            if on_edge && in_damage(x, y, damage_rects) && in_clip(x, y, clip) {
                                 put_px(surface, width, x, y, bc);
                             }
                         }
@@ -407,17 +418,39 @@ pub fn render_frame(
                             width,
                             height,
                             damage_rects,
+                            clip,
                         );
                     }
                 }
             }
         }
 
+        // overflow != visible: children clip to this box's screen rect.
+        let child_clip = if layout
+            .paint_map
+            .get(&node_id)
+            .and_then(|p| p.clip)
+            .unwrap_or(false)
+        {
+            let bx0 = current_x - sx as f32;
+            let by0 = current_y - sy as f32;
+            (
+                clip.0.max(bx0),
+                clip.1.max(by0),
+                clip.2.min(bx0 + layout_box.size.width.max(0.0)),
+                clip.3.min(by0 + layout_box.size.height.max(0.0)),
+            )
+        } else {
+            clip
+        };
+        if child_clip.2 <= child_clip.0 || child_clip.3 <= child_clip.1 {
+            return; // fully clipped out — nothing below can paint
+        }
         if let Ok(children) = layout.taffy.children(node_id) {
             for child in children {
                 draw_node(
                     child, current_x, current_y, inherited, layout, font, font_bold, surface,
-                    width, height, sx, sy, damage_rects,
+                    width, height, sx, sy, damage_rects, child_clip,
                 );
             }
         }
@@ -444,5 +477,6 @@ pub fn render_frame(
         sx,
         sy,
         damage_rects,
+        (0.0, 0.0, width as f32, height as f32),
     );
 }

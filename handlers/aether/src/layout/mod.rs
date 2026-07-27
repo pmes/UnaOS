@@ -19,6 +19,8 @@ pub struct PaintStyle {
     pub bg_image: Option<String>,
     /// visibility:hidden / opacity:0 — box keeps its space, paints nothing.
     pub hidden: Option<bool>,
+    /// overflow != visible — descendants clip to this box's rect.
+    pub clip: Option<bool>,
 }
 
 pub struct LayoutTree {

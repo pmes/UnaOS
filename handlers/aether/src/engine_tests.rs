@@ -639,6 +639,51 @@ mod tests {
             "toggle must drop 'hidden'; querySelectorAll must count 2");
     }
 
+    /// The collapsed-menu pattern: max-height:0 + overflow:hidden must
+    /// clamp layout AND clip paint (its text was smearing over the page).
+    #[test]
+    fn test_max_height_overflow_clip() {
+        let html = r#"<html><body>
+            <div id="menu">MENU CONTENT THAT MUST NOT PAINT</div>
+        </body></html>"#;
+        let document = dom::parse_html(html);
+        let mut layout_tree = layout::compute_layout(&document);
+        css::apply_css(&mut layout_tree, "#menu { max-height: 0; overflow: hidden; }");
+        for (node_id, dom_node) in &layout_tree.node_map {
+            let Some(el) = dom_node.as_element() else { continue };
+            if el.attributes.borrow().get("id") == Some("menu") {
+                let l = layout_tree.taffy.layout(*node_id).unwrap();
+                assert_eq!(l.size.height, 0.0, "max-height:0 must clamp the box");
+            }
+        }
+        let mut surface = vec![0u8; 800 * 600 * 4];
+        crate::render::render_frame(&layout_tree, &mut surface, 800, 600, 0.0, 0.0, &[(0, 0, 800, 600)]);
+        let inked = surface.chunks_exact(4).any(|p| p[0] < 200 && p[3] == 255);
+        assert!(!inked, "clipped menu must leave no ink");
+    }
+
+    /// setTimeout(0) work queued during page scripts runs BEFORE first
+    /// layout (load drains the job queue).
+    #[test]
+    fn test_boot_timers_drain_before_layout() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled(
+            "https://example.com/",
+            r#"<html><body><div id="x">a</div>
+               <script>
+                 setTimeout(function () {
+                   document.getElementById('x').setAttribute('data-boot', 'ran');
+                 }, 0);
+               </script></body></html>"#,
+            &[],
+            true,
+        );
+        let doc = engine.document.clone().unwrap();
+        let x = doc.select("#x").unwrap().next().unwrap();
+        assert_eq!(x.attributes.borrow().get("data-boot"), Some("ran"),
+            "zero-delay boot timer must run during load");
+    }
+
     /// float:left/right sizes to content and hugs its edge (approximation).
     #[test]
     fn test_float_approximation() {
