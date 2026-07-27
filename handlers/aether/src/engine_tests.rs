@@ -260,6 +260,26 @@ mod tests {
     }
 
     #[test]
+    fn test_form_submission_builds_get_url() {
+        let html = r#"<html><body>
+            <form action="/search" method="get">
+                <input name="q" value="una os">
+                <input name="lang" value="en">
+            </form>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("https://example.com/page", html, true);
+        let doc = engine.document.as_ref().unwrap();
+        let input = doc.select("input").unwrap().next().unwrap();
+        let od = engine
+            .build_form_submission(input.as_node())
+            .expect("submission built");
+        assert_eq!(od.url, "https://example.com/search?q=una+os&lang=en");
+        assert_eq!(od.method, crate::forms::HttpMethod::Get);
+        assert!(od.body.is_none());
+    }
+
+    #[test]
     fn test_click_dispatch_and_relayout() {
         let html = r#"<html><body>
             <div id="btn">Click me</div>

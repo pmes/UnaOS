@@ -54,6 +54,25 @@ pub async fn fetch_document(input: &str) -> Result<String> {
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Failed to fetch URL")))
 }
 
+/// POSTs a urlencoded form body and returns the response document.
+pub async fn post_document(url: &str, body: &str) -> Result<String> {
+    let client = Client::builder().user_agent("UnaOS Aether/0.1.0").build()?;
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body.to_string())
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("HTTP Error: {}", response.status());
+    }
+    let bytes = response.bytes().await.context("Failed to read body")?;
+    if bytes.len() > 10 * 1024 * 1024 {
+        anyhow::bail!("Response body exceeds size limit");
+    }
+    String::from_utf8(bytes.to_vec()).context("Invalid UTF-8")
+}
+
 /// Collects absolute URLs of `<link rel="stylesheet">` sheets in `html`,
 /// resolved against `base_url`. Pure (no network) — unit-testable offline.
 pub fn collect_stylesheet_urls(base_url: &str, html: &str) -> Vec<String> {

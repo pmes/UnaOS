@@ -55,7 +55,7 @@ fn is_inline(name: &str) -> bool {
     matches!(
         name,
         "a" | "span" | "b" | "strong" | "i" | "em" | "u" | "s" | "code" | "small" | "big"
-            | "sup" | "sub" | "label" | "abbr" | "cite" | "q" | "time" | "img" | "wbr"
+            | "sup" | "sub" | "label" | "abbr" | "cite" | "q" | "time" | "img" | "wbr" | "br"
             | "td" | "th" | "button" | "input" | "select"
     )
 }
@@ -193,6 +193,14 @@ pub fn compute_layout_sized(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
             },
             ..Default::default()
         };
+
+        // <br>: a zero-height full-width item forces a wrap break in the
+        // inline row without adding vertical space of its own.
+        if tag == "br" {
+            style.size.width = Dimension::percent(1.0);
+            style.size.height = Dimension::length(0.0);
+            style.min_size = Size { width: Dimension::auto(), height: Dimension::length(0.0) };
+        }
 
         // Inline style="..." — paint properties plus width/height.
         let mut paint = PaintStyle::default();

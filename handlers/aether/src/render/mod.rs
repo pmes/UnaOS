@@ -15,6 +15,7 @@ struct Inherited {
     font_size: f32,
     bold: bool,
     line_height: f32, // multiplier of font size
+    underline: bool,
 }
 
 use crate::layout::default_font_size;
@@ -58,6 +59,7 @@ fn draw_text(
     font_size: f32,
     line_height_mult: f32,
     color: (u8, u8, u8),
+    underline: bool,
     surface: &mut [u8],
     width: u32,
     height: u32,
@@ -133,6 +135,22 @@ fn draw_text(
                 }
             }
             pen_x += advance;
+        }
+        if underline && word_width > 0.0 {
+            let baseline_y = origin_y + line as f32 * line_height + ascent;
+            let uy = (baseline_y + 2.0) as i32;
+            if uy >= 0 {
+                let x0 = (origin_x + pen_x - word_width).max(0.0) as u32;
+                let x1 = ((origin_x + pen_x) as u32).min(width);
+                let uy = uy as u32;
+                if uy < height {
+                    for x in x0..x1 {
+                        if in_damage(x, uy, damage_rects) {
+                            put_px(surface, width, x, uy, color);
+                        }
+                    }
+                }
+            }
         }
         pen_x += space;
     }
@@ -221,6 +239,9 @@ pub fn render_frame(
                     inherited.line_height = lh;
                 }
 
+                if tag == "a" || tag == "u" {
+                    inherited.underline = true;
+                }
                 inherited.color = spec.color.unwrap_or(if tag == "a" {
                     (0, 0, 238) // UA default link blue
                 } else {
@@ -294,6 +315,7 @@ pub fn render_frame(
                                 inherited.font_size.min(14.0),
                                 inherited.line_height,
                                 (60, 60, 60),
+                                false,
                                 surface,
                                 width,
                                 height,
@@ -340,6 +362,7 @@ pub fn render_frame(
                             inherited.font_size,
                             inherited.line_height,
                             inherited.color,
+                            inherited.underline,
                             surface,
                             width,
                             height,
@@ -365,6 +388,7 @@ pub fn render_frame(
         font_size: 16.0,
         bold: false,
         line_height: 0.0, // natural
+        underline: false,
     };
     draw_node(
         layout.root_node,

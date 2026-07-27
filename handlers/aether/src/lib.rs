@@ -180,7 +180,8 @@ impl AetherEngine {
                 }
             }
             api::events::Event::KeyDown(key) => {
-                if let Some(node) = &self.focused_node {
+                let focused = self.focused_node.clone();
+                if let Some(node) = focused.as_ref() {
                     if let Some(el) = node.as_element() {
                         if &*el.name.local == "input" {
                             if key == "BackSpace" {
@@ -191,7 +192,24 @@ impl AetherEngine {
                                 self.needs_repaint = true;
                                 self.damage_rects.push((0, 0, self.width, self.height));
                             } else if key == "Return" {
-                                // Form submission logic
+                                if let Some(doc_req) = self.build_form_submission(node) {
+                                    let _ = tokio::task::block_in_place(|| {
+                                        tokio::runtime::Handle::current().block_on(async {
+                                            match doc_req.method {
+                                                forms::HttpMethod::Get => {
+                                                    let _ = self.load_url_internal(&doc_req.url, true).await;
+                                                }
+                                                forms::HttpMethod::Post => {
+                                                    let body = doc_req.body.unwrap_or_default();
+                                                    match net::post_document(&doc_req.url, &body).await {
+                                                        Ok(html) => self.load_html(&doc_req.url, &html, true),
+                                                        Err(e) => self.load_error_page(&doc_req.url, &e.to_string()),
+                                                    }
+                                                }
+                                            }
+                                        })
+                                    });
+                                }
                             }
                         }
                     }
@@ -225,6 +243,54 @@ impl AetherEngine {
                 }
             }
         }
+    }
+
+    /// Builds a form submission from the focused control's enclosing <form>:
+    /// collects named inputs, resolves the action against the current page.
+    fn build_form_submission(&self, control: &kuchiki::NodeRef) -> Option<forms::OpenDocument> {
+        // Walk up to the enclosing form.
+        let mut cur = Some(control.clone());
+        let form_node = loop {
+            let n = cur?;
+            if let Some(el) = n.as_element() {
+                if &*el.name.local == "form" {
+                    break n;
+                }
+            }
+            cur = n.parent();
+        };
+
+        let form_el = form_node.as_element()?;
+        let attrs = form_el.attributes.borrow();
+        let action = attrs.get("action").unwrap_or("").to_string();
+        let method = if attrs.get("method").map(|m| m.eq_ignore_ascii_case("post")).unwrap_or(false) {
+            forms::HttpMethod::Post
+        } else {
+            forms::HttpMethod::Get
+        };
+        drop(attrs);
+
+        // Resolve action against the current page URL.
+        let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
+        let resolved = if action.is_empty() {
+            base.clone()
+        } else {
+            url::Url::parse(&base)
+                .and_then(|b| b.join(&action))
+                .map(|u| u.to_string())
+                .unwrap_or(action)
+        };
+
+        let mut form = forms::Form::new(resolved, method);
+        if let Ok(inputs) = form_node.select("input, textarea, select") {
+            for input in inputs {
+                let attrs = input.attributes.borrow();
+                let Some(name) = attrs.get("name") else { continue };
+                let value = attrs.get("value").unwrap_or("").to_string();
+                form.add_input(name.to_string(), value);
+            }
+        }
+        Some(form.submit())
     }
 
     pub async fn go_back(&mut self) {
