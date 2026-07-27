@@ -124,6 +124,11 @@ pub fn decode_svg(bytes: &[u8]) -> Option<image::RgbaImage> {
     image::RgbaImage::from_raw(w, h, data)
 }
 
+/// The current page's base url (set by set_page).
+pub fn page_base() -> String {
+    STORE.with(|s| s.borrow().base_url.clone())
+}
+
 /// Resolves a possibly-relative URL against a base.
 pub fn resolve(base: &str, src: &str) -> String {
     if src.starts_with("http://") || src.starts_with("https://") || src.starts_with("data:") {

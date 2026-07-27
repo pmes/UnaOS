@@ -824,7 +824,12 @@ fn media_matches(condition: &str, vw: f32) -> bool {
     }
     condition.split(',').any(|clause| {
         clause.split(" and ").all(|part| {
-            let p = part.trim().trim_start_matches('(').trim_end_matches(')').trim();
+            let p = part.trim();
+            // `not X` negates one clause term.
+            if let Some(rest) = p.strip_prefix("not ") {
+                return !media_matches(rest.trim(), vw);
+            }
+            let p = p.trim_start_matches('(').trim_end_matches(')').trim();
             match p {
                 "screen" | "all" => true,
                 "print" => false,
@@ -834,6 +839,16 @@ fn media_matches(condition: &str, vw: f32) -> bool {
                         match feature.trim() {
                             "min-width" => parse_px(value).map(|v| vw >= v).unwrap_or(false),
                             "max-width" => parse_px(value).map(|v| vw <= v).unwrap_or(false),
+                            // Honest environment answers, matching the JS
+                            // matchMedia prelude: light scheme, motion ok,
+                            // hover-capable pointer, landscape viewport.
+                            "prefers-color-scheme" => value == "light",
+                            "prefers-reduced-motion" => value == "no-preference",
+                            "prefers-reduced-transparency" => value == "no-preference",
+                            "prefers-contrast" => value == "no-preference",
+                            "hover" | "any-hover" => value == "hover",
+                            "pointer" | "any-pointer" => value == "fine",
+                            "orientation" => value == "landscape",
                             f => {
                                 crate::ledger::record_css(&format!("media-feature:{}", f));
                                 false
@@ -1124,5 +1139,14 @@ mod tests {
         assert!(media_matches("(max-width: 900px)", 800.0));
         assert!(media_matches("print, screen", 800.0));
         assert!(!media_matches("(prefers-reduced-motion: reduce)", 800.0));
+        // Honest environment answers + `not` negation.
+        assert!(media_matches("(prefers-color-scheme: light)", 800.0));
+        assert!(!media_matches("(prefers-color-scheme: dark)", 800.0));
+        assert!(media_matches("(prefers-reduced-motion: no-preference)", 800.0));
+        assert!(media_matches("(hover: hover)", 800.0));
+        assert!(media_matches("(orientation: landscape)", 800.0));
+        assert!(!media_matches("not all", 800.0));
+        assert!(media_matches("not print", 800.0));
+        assert!(!media_matches("screen and not (min-width: 600px)", 800.0));
     }
 }

@@ -744,6 +744,35 @@ mod tests {
         assert_eq!(b.attributes.borrow().get("data-r"), Some("none|wrap|2|a|b|P"));
     }
 
+    /// The fetch wrapper is whatwg-shaped: Promise → Response.ok/json(),
+    /// verified offline by mocking the native layer underneath it.
+    #[test]
+    fn test_fetch_wrapper_shape() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled(
+            "https://example.com/",
+            r#"<html><body><div id="x">a</div></body></html>"#,
+            &[],
+            true,
+        );
+        let js = engine.js_engine.as_mut().unwrap();
+        js.execute(r#"
+            __native_fetch = function (u, m, b) {
+                return { status: 200, url: u, body: '{"n": 7, "method": "' + m + '"}' };
+            };
+            fetch('/api/data', { method: 'POST', body: 'p=1' })
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .then(function (j) {
+                    document.getElementById('x').setAttribute('data-n', String(j.n) + j.method);
+                });
+        "#).expect("fetch chain must run");
+        let _ = js.context.run_jobs();
+        let doc = engine.document.clone().unwrap();
+        let x = doc.select("#x").unwrap().next().unwrap();
+        assert_eq!(x.attributes.borrow().get("data-n"), Some("7POST"),
+            "fetch → json → DOM mutation must complete through the job queue");
+    }
+
     /// float:left/right sizes to content and hugs its edge (approximation).
     #[test]
     fn test_float_approximation() {

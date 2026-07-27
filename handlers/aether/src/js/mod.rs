@@ -100,6 +100,7 @@ impl Engine {
             state.mutated = false;
         });
 
+        crate::api::fetch::reset_budget();
         let mut context = crate::event_loop::create_context();
         
         let _ = context.eval(boa_engine::Source::from_bytes("globalThis.__handlers = [];"));

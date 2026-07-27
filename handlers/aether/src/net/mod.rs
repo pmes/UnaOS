@@ -142,7 +142,7 @@ pub fn collect_scripts(base_url: &str, html: &str) -> (Vec<Option<String>>, Vec<
             if let Some(src) = attrs.get("src") {
                 let abs = crate::images::resolve(base_url, src);
                 if abs.starts_with("http://") || abs.starts_with("https://") {
-                    if external.len() >= 30 {
+                    if external.len() >= 50 {
                         crate::ledger::record_js("script-fetch-cap-reached");
                         continue;
                     }
