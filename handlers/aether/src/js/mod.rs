@@ -104,6 +104,34 @@ impl Engine {
         let mut context = crate::event_loop::create_context();
         
         let _ = context.eval(boa_engine::Source::from_bytes("globalThis.__handlers = [];"));
+        // Environment prelude: globals every real-world bundle expects.
+        // requestAnimationFrame deliberately never fires its callback — an
+        // immediate call turns rAF render loops into unbounded recursion.
+        let _ = context.eval(boa_engine::Source::from_bytes(
+            r#"
+            globalThis.self = globalThis;
+            globalThis.requestAnimationFrame = function (cb) { return 0; };
+            globalThis.cancelAnimationFrame = function () {};
+            globalThis.matchMedia = function (q) {
+                // Honest answers for the two families sites branch on:
+                // we are a light-scheme 800px-wide viewport. Everything
+                // else is false.
+                var m = false;
+                var mw;
+                if (/prefers-color-scheme:\s*light/.test(q)) { m = true; }
+                else if ((mw = /min-width:\s*(\d+)/.exec(q))) { m = 800 >= +mw[1]; }
+                else if ((mw = /max-width:\s*(\d+)/.exec(q))) { m = 800 <= +mw[1]; }
+                return { matches: m, media: q,
+                         addListener: function () {}, removeListener: function () {},
+                         addEventListener: function () {}, removeEventListener: function () {} };
+            };
+            globalThis.navigator = {
+                userAgent: 'UnaOS Aether/0.1.0',
+                language: 'en-US', languages: ['en-US'],
+                platform: 'UnaOS', cookieEnabled: false,
+            };
+            "#,
+        ));
         Self::setup_console(&mut context);
         Self::setup_document(&mut context, document);
         crate::api::window::setup_window(&mut context);
@@ -329,7 +357,93 @@ impl Engine {
                 boa_engine::string::JsString::from("addEventListener"),
                 2,
             )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let selector = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                    let arr = boa_engine::object::builtins::JsArray::new(ctx);
+                    if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
+                        if let Ok(matches) = n.select(&selector) {
+                            for m in matches.take(256) {
+                                let wrapped = Self::wrap_node(ctx, m.as_node().clone());
+                                let _ = arr.push(wrapped, ctx);
+                            }
+                        }
+                    }
+                    Ok(arr.into())
+                }),
+                boa_engine::string::JsString::from("querySelectorAll"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let name = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                    if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
+                        if let Some(el) = n.as_element() {
+                            el.attributes.borrow_mut().remove(name.as_str());
+                            DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+                        }
+                    }
+                    Ok(JsValue::undefined())
+                }),
+                boa_engine::string::JsString::from("removeAttribute"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let child_id = args.get(0).and_then(|v| v.as_object()).and_then(|o| o.get(boa_engine::string::JsString::from("__node_id"), ctx).ok()).and_then(|v| v.as_number()).unwrap_or(-1.0) as i32;
+                    let (parent, child) = DOM_STATE.with(|s| (s.borrow().get_node(id), s.borrow().get_node(child_id)));
+                    if let (Some(p), Some(c)) = (parent, child) {
+                        if c.parent().map_or(false, |cp| cp == p) {
+                            c.detach();
+                            DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+                        }
+                    }
+                    Ok(args.get(0).cloned().unwrap_or_default())
+                }),
+                boa_engine::string::JsString::from("removeChild"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    // className(): getter; className(v): setter.
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) else { return Ok(JsValue::undefined()) };
+                    let Some(el) = n.as_element() else { return Ok(JsValue::undefined()) };
+                    if let Some(v) = args.get(0) {
+                        let v = v.to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                        el.attributes.borrow_mut().insert("class", v);
+                        DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+                        Ok(JsValue::undefined())
+                    } else {
+                        let v = el.attributes.borrow().get("class").unwrap_or("").to_string();
+                        Ok(JsValue::new(boa_engine::string::JsString::from(v)))
+                    }
+                }),
+                boa_engine::string::JsString::from("className"),
+                1,
+            )
             .build();
+
+        // classList: add/remove/toggle/contains over the class attribute.
+        let class_list = ObjectInitializer::new(context)
+            .property(boa_engine::string::JsString::from("__node_id"), doc_id, Attribute::all())
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| { Self::class_op(this, args, ctx, "add") }),
+                boa_engine::string::JsString::from("add"), 1)
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| { Self::class_op(this, args, ctx, "remove") }),
+                boa_engine::string::JsString::from("remove"), 1)
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| { Self::class_op(this, args, ctx, "toggle") }),
+                boa_engine::string::JsString::from("toggle"), 1)
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| { Self::class_op(this, args, ctx, "contains") }),
+                boa_engine::string::JsString::from("contains"), 1)
+            .build();
+        let _ = js_node.set(boa_engine::string::JsString::from("classList"), class_list, false, context);
 
         
         let style_obj = ObjectInitializer::new(context).build();
@@ -338,9 +452,57 @@ impl Engine {
         js_node.into()
     }
 
+    /// Shared classList operation over the class attribute.
+    fn class_op(this: &JsValue, args: &[JsValue], ctx: &mut Context, op: &str) -> JsResult<JsValue> {
+        let id = this
+            .as_object()
+            .and_then(|o| o.get(boa_engine::string::JsString::from("__node_id"), ctx).ok())
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0) as i32;
+        let name = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+        let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) else { return Ok(JsValue::undefined()) };
+        let Some(el) = n.as_element() else { return Ok(JsValue::undefined()) };
+        let current = el.attributes.borrow().get("class").unwrap_or("").to_string();
+        let mut classes: Vec<&str> = current.split_whitespace().collect();
+        let has = classes.contains(&name.as_str());
+        match op {
+            "contains" => return Ok(JsValue::from(has)),
+            "add" if !has => classes.push(&name),
+            "remove" => classes.retain(|c| *c != name),
+            "toggle" => {
+                if has { classes.retain(|c| *c != name); } else { classes.push(&name); }
+            }
+            _ => {}
+        }
+        let joined = classes.join(" ");
+        el.attributes.borrow_mut().insert("class", joined);
+        DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+        if op == "toggle" {
+            return Ok(JsValue::from(!has));
+        }
+        Ok(JsValue::undefined())
+    }
+
     fn setup_document(context: &mut Context, doc: NodeRef) {
+        // documentElement / body / head wrapped as real node properties —
+        // `document.documentElement.classList.add('js')` is the canonical
+        // app-shell boot line.
+        let mut extras: Vec<(&str, NodeRef)> = Vec::new();
+        for (prop, sel) in [("documentElement", "html"), ("body", "body"), ("head", "head")] {
+            if let Ok(mut m) = doc.select(sel) {
+                if let Some(el) = m.next() {
+                    extras.push((prop, el.as_node().clone()));
+                }
+            }
+        }
         let js_doc = Self::wrap_node(context, doc);
-        context.register_global_property(boa_engine::string::JsString::from("document"), js_doc, Attribute::all());
+        if let Some(obj) = js_doc.as_object() {
+            for (prop, node) in extras {
+                let wrapped = Self::wrap_node(context, node);
+                let _ = obj.set(boa_engine::string::JsString::from(prop), wrapped, false, context);
+            }
+        }
+        let _ = context.register_global_property(boa_engine::string::JsString::from("document"), js_doc, Attribute::all());
     }
     
     pub fn execute(&mut self, script: &str) -> JsResult<JsValue> {

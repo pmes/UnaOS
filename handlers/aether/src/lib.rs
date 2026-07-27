@@ -387,6 +387,26 @@ impl AetherEngine {
     /// Like `load_html`, with pre-fetched external stylesheets (see
     /// `net::fetch_page`) applied after the document's own `<style>` blocks.
     pub fn load_html_styled(&mut self, url: &str, html: &str, external_css: &[String], add_history: bool) {
+        self.load_impl(url, html, external_css, None, add_history);
+    }
+
+    /// Loads a fully fetched Page: installs its images and runs its scripts
+    /// (inline AND fetched external, in document order) — the charter path
+    /// for scripted sites: the page's own JS drives its state; no per-site
+    /// code anywhere.
+    pub fn load_page(&mut self, page: net::Page, add_history: bool) {
+        images::set_page(&page.base_url, page.images);
+        self.load_impl(&page.base_url, &page.html, &page.sheets, Some(&page.scripts), add_history);
+    }
+
+    fn load_impl(
+        &mut self,
+        url: &str,
+        html: &str,
+        external_css: &[String],
+        scripts_override: Option<&[String]>,
+        add_history: bool,
+    ) {
         let document = dom::parse_html(html);
         
         self.title = "Aether Browser".to_string();
@@ -403,11 +423,26 @@ impl AetherEngine {
         }
         
         let mut js_engine = js::Engine::new(document.clone());
-        if let Ok(scripts) = document.select("script") {
-            for script_node in scripts {
-                let text = script_node.as_node().text_contents();
-                if !text.trim().is_empty() {
-                    let _ = js_engine.execute(&text);
+        match scripts_override {
+            Some(scripts) => {
+                for text in scripts {
+                    if let Err(e) = js_engine.execute(text) {
+                        let msg = e.to_string();
+                        ledger::record_js(&format!("script-error:{}", &msg[..msg.len().min(64)]));
+                    }
+                }
+            }
+            None => {
+                if let Ok(scripts) = document.select("script") {
+                    for script_node in scripts {
+                        let text = script_node.as_node().text_contents();
+                        if !text.trim().is_empty() {
+                            if let Err(e) = js_engine.execute(&text) {
+                                let msg = e.to_string();
+                                ledger::record_js(&format!("script-error:{}", &msg[..msg.len().min(64)]));
+                            }
+                        }
+                    }
                 }
             }
         }

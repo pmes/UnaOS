@@ -302,38 +302,40 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Scans raw CSS text for `--name: value` declarations into the map.
+/// Scans CSS text for `--name: value` declarations in DOCUMENT-SCOPED
+/// rules only (:root/html/body/*). Theme-variant rules like
+/// `.dark-mode { --bg: black }` must NOT poison the flat token map —
+/// that class isn't on the document (a flat map has no element scope;
+/// scoped redefinitions stay honest gaps).
 fn collect_custom_props(css: &str, map: &mut std::collections::HashMap<String, String>) {
-    let bytes = css.as_bytes();
     let mut i = 0;
-    while let Some(pos) = css[i..].find("--") {
-        let start = i + pos;
-        i = start + 2;
-        // Custom property declarations begin a declaration: preceded by
-        // '{', ';', or whitespace-after-those; cheap check: previous
-        // non-space char must be '{' or ';'.
-        let prev = css[..start].trim_end().chars().last();
-        if !matches!(prev, Some('{') | Some(';') | None) {
+    while let Some(open) = css[i..].find('{') {
+        let open = i + open;
+        // Prelude: back to the previous '}' , ';', or start.
+        let prelude_start = css[..open].rfind(['}', ';', '{']).map(|p| p + 1).unwrap_or(0);
+        let prelude = css[prelude_start..open].trim();
+        let Some(close) = css[open..].find('}') else { break };
+        let close = open + close;
+        let body = &css[open + 1..close];
+        i = close + 1;
+        let doc_scoped = !prelude.is_empty()
+            && prelude.split(',').any(|s| matches!(s.trim(), ":root" | "html" | "body" | "*" | "html body"));
+        if !doc_scoped || !body.contains("--") {
             continue;
         }
-        let name_end = css[start..]
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-            .map(|o| start + o)
-            .unwrap_or(bytes.len());
-        if css[name_end..].trim_start().as_bytes().first() != Some(&b':') {
-            continue;
+        for decl in body.split(';') {
+            let Some((name, value)) = decl.split_once(':') else { continue };
+            let name = name.trim();
+            let value = value.trim();
+            if name.starts_with("--")
+                && name.len() > 2
+                && name[2..].chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && !value.is_empty()
+                && value.len() < 512
+            {
+                map.insert(name.to_string(), value.to_string());
+            }
         }
-        let val_start = name_end + css[name_end..].find(':').unwrap() + 1;
-        let val_end = css[val_start..]
-            .find([';', '}'])
-            .map(|o| val_start + o)
-            .unwrap_or(css.len());
-        let name = css[start..name_end].to_string();
-        let value = css[val_start..val_end].trim().to_string();
-        if name.len() > 2 && !value.is_empty() && value.len() < 512 {
-            map.insert(name, value);
-        }
-        i = val_end;
     }
 }
 

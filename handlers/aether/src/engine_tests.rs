@@ -591,6 +591,54 @@ mod tests {
         assert!(!inked, "hidden subtrees must leave the surface uninked");
     }
 
+    /// Script collection preserves document order and skips non-JS types;
+    /// the classList/querySelectorAll/documentElement DOM surface drives
+    /// real mutations that survive into relayout.
+    #[test]
+    fn test_script_pipeline_and_dom_surface() {
+        let html = r#"<html><head>
+            <script src="/a.js"></script>
+            <script type="application/ld+json">{"not":"js"}</script>
+            <script>inline1()</script>
+            <script src="https://cdn.x.com/b.js"></script>
+        </head><body></body></html>"#;
+        let (slots, external) = crate::net::collect_scripts("https://example.com/", html);
+        assert_eq!(slots.len(), 3, "ld+json must not occupy a slot");
+        assert_eq!(slots[1].as_deref(), Some("inline1()"));
+        assert_eq!(external, vec![
+            (0, "https://example.com/a.js".to_string()),
+            (2, "https://cdn.x.com/b.js".to_string()),
+        ]);
+
+        // DOM surface: the canonical app-shell boot line + query breadth.
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled(
+            "https://example.com/",
+            r#"<html class="no-js"><body>
+                <div class="menu hidden" id="m">menu</div>
+                <p class="item">a</p><p class="item">b</p>
+            </body></html>"#,
+            &[],
+            true,
+        );
+        let js = engine.js_engine.as_mut().unwrap();
+        js.execute(r#"
+            document.documentElement.classList.remove('no-js');
+            document.documentElement.classList.add('js');
+            var m = document.getElementById('m');
+            m.classList.toggle('hidden');
+            m.removeAttribute('data-x');
+            var items = document.querySelectorAll('p.item');
+            m.className(m.className() + ' count-' + items.length);
+        "#).expect("script must run clean");
+        let doc = engine.document.clone().unwrap();
+        let html_el = doc.select("html").unwrap().next().unwrap();
+        assert_eq!(html_el.attributes.borrow().get("class"), Some("js"));
+        let m = doc.select("#m").unwrap().next().unwrap();
+        assert_eq!(m.attributes.borrow().get("class"), Some("menu count-2"),
+            "toggle must drop 'hidden'; querySelectorAll must count 2");
+    }
+
     /// float:left/right sizes to content and hugs its edge (approximation).
     #[test]
     fn test_float_approximation() {

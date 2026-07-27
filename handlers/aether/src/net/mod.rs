@@ -120,6 +120,45 @@ pub struct Page {
     pub html: String,
     pub sheets: Vec<String>,
     pub images: Vec<(String, image::RgbaImage)>,
+    /// Script sources in DOCUMENT ORDER: inline bodies and fetched external
+    /// `src` texts interleaved as they appear (execution order matters).
+    pub scripts: Vec<String>,
+}
+
+/// Collects the page's scripts in document order: inline text directly,
+/// external `src` resolved to absolute URLs for the caller to fetch into
+/// the matching slot. Non-JS types (json/ld+json/template) are skipped.
+pub fn collect_scripts(base_url: &str, html: &str) -> (Vec<Option<String>>, Vec<(usize, String)>) {
+    let document = crate::dom::parse_html(html);
+    let mut slots: Vec<Option<String>> = Vec::new();
+    let mut external: Vec<(usize, String)> = Vec::new();
+    if let Ok(scripts) = document.select("script") {
+        for script in scripts {
+            let attrs = script.attributes.borrow();
+            let ty = attrs.get("type").unwrap_or("").trim().to_ascii_lowercase();
+            if !(ty.is_empty() || ty.contains("javascript") || ty == "module") {
+                continue;
+            }
+            if let Some(src) = attrs.get("src") {
+                let abs = crate::images::resolve(base_url, src);
+                if abs.starts_with("http://") || abs.starts_with("https://") {
+                    if external.len() >= 30 {
+                        crate::ledger::record_js("script-fetch-cap-reached");
+                        continue;
+                    }
+                    external.push((slots.len(), abs));
+                    slots.push(None);
+                }
+                continue;
+            }
+            drop(attrs);
+            let text = script.as_node().text_contents();
+            if !text.trim().is_empty() {
+                slots.push(Some(text));
+            }
+        }
+    }
+    (slots, external)
 }
 
 /// Collects absolute `<img src>` URLs (capped; data:/svg skipped for now).
@@ -243,7 +282,25 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
             Err(_) => crate::ledger::record_dom(&format!("img-fetch-failed:{}", &img_url[..img_url.len().min(48)])),
         }
     }
-    Ok(Page { base_url: base, html, sheets, images })
+    // Scripts: inline bodies fill their slots directly; externals fetch
+    // concurrently into theirs (2 MB/script cap — failures ledger and the
+    // slot drops, later scripts still run).
+    let (mut slots, external) = collect_scripts(&base, &html);
+    let script_results = futures_util::future::join_all(
+        external
+            .into_iter()
+            .map(|(slot, u)| async move { (slot, fetch_document(&u).await, u) }),
+    )
+    .await;
+    for (slot, result, url) in script_results {
+        match result {
+            Ok(text) if text.len() <= 2 * 1024 * 1024 => slots[slot] = Some(text),
+            Ok(_) => crate::ledger::record_js(&format!("script-too-large:{}", &url[..url.len().min(48)])),
+            Err(_) => crate::ledger::record_js(&format!("script-fetch-failed:{}", &url[..url.len().min(48)])),
+        }
+    }
+    let scripts = slots.into_iter().flatten().collect();
+    Ok(Page { base_url: base, html, sheets, images, scripts })
 }
 
 #[cfg(test)]

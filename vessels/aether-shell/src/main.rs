@@ -49,8 +49,7 @@ fn main() {
                             SMessage::OpenDocument { url } => {
                                 match aether::net::fetch_page(&url).await {
                                     Ok(page) => {
-                                        aether::images::set_page(&page.base_url, page.images);
-                                        engine.load_html_styled(&url, &page.html, &page.sheets, true)
+                                        engine.load_page(page, true)
                                     }
                                     Err(e) => engine.load_error_page(&url, &e.to_string()),
                                 }
@@ -58,15 +57,13 @@ fn main() {
                             SMessage::BrowserNavBack => {
                                 if let Some(url) = engine.get_back_url() {
                                     let page = aether::net::fetch_page(&url).await.unwrap_or_default();
-                                    aether::images::set_page(&page.base_url, page.images);
-                                    engine.load_html_styled(&url, &page.html, &page.sheets, false);
+                                    engine.load_page(page, false);
                                 }
                             }
                             SMessage::BrowserNavForward => {
                                 if let Some(url) = engine.get_forward_url() {
                                     let page = aether::net::fetch_page(&url).await.unwrap_or_default();
-                                    aether::images::set_page(&page.base_url, page.images);
-                                    engine.load_html_styled(&url, &page.html, &page.sheets, false);
+                                    engine.load_page(page, false);
                                 }
                             }
                             SMessage::BrowserNavReload => {
