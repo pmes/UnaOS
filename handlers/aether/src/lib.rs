@@ -257,6 +257,12 @@ impl AetherEngine {
     }
 
     pub fn load_html(&mut self, url: &str, html: &str, add_history: bool) {
+        self.load_html_styled(url, html, &[], add_history)
+    }
+
+    /// Like `load_html`, with pre-fetched external stylesheets (see
+    /// `net::fetch_page`) applied after the document's own `<style>` blocks.
+    pub fn load_html_styled(&mut self, url: &str, html: &str, external_css: &[String], add_history: bool) {
         let document = dom::parse_html(html);
         
         self.title = "Aether Browser".to_string();
@@ -288,6 +294,9 @@ impl AetherEngine {
                 let text = style_node.as_node().text_contents();
                 css::apply_css(&mut layout_tree, &text);
             }
+        }
+        for sheet in external_css {
+            css::apply_css(&mut layout_tree, sheet);
         }
         
         self.document = Some(document);

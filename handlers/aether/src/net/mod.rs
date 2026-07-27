@@ -54,9 +54,74 @@ pub async fn fetch_document(input: &str) -> Result<String> {
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Failed to fetch URL")))
 }
 
+/// Collects absolute URLs of `<link rel="stylesheet">` sheets in `html`,
+/// resolved against `base_url`. Pure (no network) — unit-testable offline.
+pub fn collect_stylesheet_urls(base_url: &str, html: &str) -> Vec<String> {
+    let document = crate::dom::parse_html(html);
+    let base = url::Url::parse(base_url).ok();
+    let mut out = Vec::new();
+    if let Ok(links) = document.select("link") {
+        for link in links {
+            let attrs = link.attributes.borrow();
+            let is_sheet = attrs
+                .get("rel")
+                .map(|r| r.split_whitespace().any(|w| w.eq_ignore_ascii_case("stylesheet")))
+                .unwrap_or(false);
+            if !is_sheet {
+                continue;
+            }
+            let Some(href) = attrs.get("href") else { continue };
+            let resolved = match &base {
+                Some(b) => b.join(href).map(|u| u.to_string()).ok(),
+                None => Some(href.to_string()),
+            };
+            if let Some(u) = resolved {
+                if u.starts_with("http://") || u.starts_with("https://") {
+                    out.push(u);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Fetches a page AND its external stylesheets: the async half of the
+/// fetch-then-apply pattern. Sheet failures are skipped (and ledgered),
+/// never fatal to the page load.
+pub async fn fetch_page(input: &str) -> Result<(String, Vec<String>)> {
+    let html = fetch_document(input).await?;
+    let base = normalize_url(input)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| input.to_string());
+    let mut sheets = Vec::new();
+    for sheet_url in collect_stylesheet_urls(&base, &html) {
+        match fetch_document(&sheet_url).await {
+            Ok(css) => sheets.push(css),
+            Err(_) => crate::ledger::record_css(&format!("stylesheet-fetch-failed:{}", sheet_url)),
+        }
+    }
+    Ok((html, sheets))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_collect_stylesheet_urls() {
+        let html = r#"<html><head>
+            <link rel="stylesheet" href="/main.css">
+            <link rel="stylesheet" href="https://cdn.example.org/x.css">
+            <link rel="icon" href="/favicon.ico">
+            <link href="/no-rel.css">
+        </head><body></body></html>"#;
+        let urls = collect_stylesheet_urls("https://example.com/page/", html);
+        assert_eq!(urls, vec![
+            "https://example.com/main.css".to_string(),
+            "https://cdn.example.org/x.css".to_string(),
+        ]);
+    }
 
     #[test]
     fn test_normalize_url() {
