@@ -43,6 +43,26 @@ fn is_non_rendered(name: &str) -> bool {
     matches!(name, "head" | "script" | "style" | "title" | "meta" | "link" | "template")
 }
 
+/// Inline-level elements: they size to content and flow in wrapping rows.
+fn is_inline(name: &str) -> bool {
+    matches!(
+        name,
+        "a" | "span" | "b" | "strong" | "i" | "em" | "u" | "s" | "code" | "small" | "big"
+            | "sup" | "sub" | "label" | "abbr" | "cite" | "q" | "time" | "img" | "wbr"
+            | "td" | "th" | "button" | "input" | "select"
+    )
+}
+
+/// True when a DOM node lays out as inline content (text or inline element).
+fn is_inline_node(node: &NodeRef) -> bool {
+    if node.as_text().is_some() {
+        return true;
+    }
+    node.as_element()
+        .map(|el| is_inline(el.name.local.as_ref()))
+        .unwrap_or(false)
+}
+
 pub fn compute_layout(dom: &NodeRef) -> LayoutTree {
     let mut taffy = taffy::TaffyTree::new();
     let mut node_map = HashMap::new();
@@ -72,22 +92,55 @@ pub fn compute_layout(dom: &NodeRef) -> LayoutTree {
             }
         }
 
+        let tag = dom_node
+            .as_element()
+            .map(|el| el.name.local.as_ref().to_string())
+            .unwrap_or_default();
+        let inline = is_inline_node(dom_node);
+        // A box whose rendered children are all inline content flows them as
+        // a wrapping row (the inline-formatting-context approximation).
+        let children_inline = dom_node.children().any(|_| true)
+            && dom_node
+                .children()
+                .filter(|c| {
+                    c.as_element().is_some()
+                        || c.as_text().is_some() && !c.text_contents().trim().is_empty()
+                })
+                .all(|c| is_inline_node(&c));
+
         let mut style = Style {
             display: Display::Flex,
-            flex_direction: FlexDirection::Column,
+            flex_direction: if tag == "tr" || (children_inline && !child_ids.is_empty()) {
+                FlexDirection::Row
+            } else {
+                FlexDirection::Column
+            },
+            flex_wrap: if children_inline && !child_ids.is_empty() {
+                taffy::style::FlexWrap::Wrap
+            } else {
+                taffy::style::FlexWrap::NoWrap
+            },
+            align_items: if children_inline && !child_ids.is_empty() {
+                Some(taffy::style::AlignItems::BASELINE)
+            } else {
+                None
+            },
             size: Size {
-                width: Dimension::percent(1.0),
+                width: if inline { Dimension::auto() } else { Dimension::percent(1.0) },
                 height: Dimension::auto(),
             },
             min_size: Size {
                 width: Dimension::auto(),
-                height: Dimension::length(20.0),
+                height: if inline { Dimension::auto() } else { Dimension::length(20.0) },
             },
-            margin: Rect {
-                left: LengthPercentage::length(2.0).into(),
-                right: LengthPercentage::length(2.0).into(),
-                top: LengthPercentage::length(2.0).into(),
-                bottom: LengthPercentage::length(2.0).into(),
+            margin: {
+                let m = if inline { 0.0 } else { 2.0 };
+                Rect {
+                    left: LengthPercentage::length(m).into(),
+                    right: LengthPercentage::length(m).into(),
+                    top: LengthPercentage::length(m).into(),
+                    bottom: LengthPercentage::length(m).into(),
+                }
             },
             ..Default::default()
         };
@@ -112,20 +165,125 @@ pub fn compute_layout(dom: &NodeRef) -> LayoutTree {
     let root_node = build_taffy_tree(dom, &mut taffy, &mut node_map, &mut paint_map)
         .unwrap_or_else(|| taffy.new_leaf(Style::default()).unwrap());
 
-    let size = Size {
-        width: AvailableSpace::Definite(800.0),
-        height: AvailableSpace::Definite(600.0),
-    };
-
-    taffy.compute_layout(root_node, size).unwrap();
-
-    LayoutTree {
+    let mut tree = LayoutTree {
         taffy,
         root_node,
         node_map,
         paint_map,
         dirty: false,
+    };
+    remeasure(&mut tree);
+    tree
+}
+
+/// UA default font sizes per element (shared with the renderer).
+pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
+    match tag {
+        "h1" => 32.0,
+        "h2" => 24.0,
+        "h3" => 19.0,
+        "h4" => 16.0,
+        "small" => 13.0,
+        _ => inherited,
     }
+}
+
+/// Recomputes layout with real text measurement: resolves each text run's
+/// inherited font size, then lets taffy size text leaves by wrapped extent.
+/// Called after building the tree and after every cascade application.
+pub fn remeasure(tree: &mut LayoutTree) {
+    // Pass 1: resolve font size down the box tree for text leaves.
+    let mut text_info: HashMap<taffy::NodeId, (String, f32)> = HashMap::new();
+    fn resolve(
+        node_id: taffy::NodeId,
+        inherited: f32,
+        tree: &LayoutTree,
+        out: &mut HashMap<taffy::NodeId, (String, f32)>,
+    ) {
+        let mut size = inherited;
+        if let Some(dom_node) = tree.node_map.get(&node_id) {
+            if let Some(el) = dom_node.as_element() {
+                let spec = tree.paint_map.get(&node_id).and_then(|p| p.font_size);
+                size = spec.unwrap_or_else(|| default_font_size(el.name.local.as_ref(), inherited));
+            } else if dom_node.as_text().is_some() {
+                let text = dom_node.text_contents();
+                let text = text.trim().to_string();
+                if !text.is_empty() {
+                    out.insert(node_id, (text, inherited));
+                }
+            }
+        }
+        if let Ok(children) = tree.taffy.children(node_id) {
+            for child in children {
+                resolve(child, size, tree, out);
+            }
+        }
+    }
+    resolve(tree.root_node, 16.0, tree, &mut text_info);
+
+    let font = crate::fonts::FontEngine::new().load_font(
+        &[font_kit::family_name::FamilyName::SansSerif],
+        &font_kit::properties::Properties::new(),
+    );
+
+    let viewport = Size {
+        width: AvailableSpace::Definite(800.0),
+        height: AvailableSpace::Definite(600.0),
+    };
+    let _ = tree.taffy.compute_layout_with_measure(
+        tree.root_node,
+        viewport,
+        |known, avail, node_id, _ctx, _style| {
+            let Some((text, font_size)) = text_info.get(&node_id) else {
+                return Size { width: known.width.unwrap_or(0.0), height: known.height.unwrap_or(0.0) };
+            };
+            let wrap_width = known.width.unwrap_or(match avail.width {
+                AvailableSpace::Definite(w) => w,
+                _ => 800.0,
+            });
+            let (w, h) = measure_text(font.as_deref(), text, *font_size, wrap_width.max(1.0));
+            Size {
+                width: known.width.unwrap_or(w),
+                height: known.height.unwrap_or(h),
+            }
+        },
+    );
+}
+
+/// Measures wrapped text: returns (widest line, total height). Mirrors the
+/// renderer's wrap algorithm so painted text fits its measured box.
+fn measure_text(
+    font: Option<&font_kit::font::Font>,
+    text: &str,
+    font_size: f32,
+    max_width: f32,
+) -> (f32, f32) {
+    let Some(font) = font else {
+        return (max_width, font_size * 1.25);
+    };
+    let metrics = font.metrics();
+    let scale = font_size / metrics.units_per_em as f32;
+    let line_height = (metrics.ascent - metrics.descent + metrics.line_gap) * scale;
+    let space = font_size * 0.3;
+
+    let mut pen = 0.0f32;
+    let mut lines = 1u32;
+    let mut widest = 0.0f32;
+    for word in text.split_whitespace() {
+        let word_width: f32 = word
+            .chars()
+            .filter_map(|c| font.glyph_for_char(c))
+            .filter_map(|g| font.advance(g).ok())
+            .map(|a| a.x() * scale)
+            .sum();
+        if pen > 0.0 && pen + word_width > max_width {
+            lines += 1;
+            pen = 0.0;
+        }
+        pen += word_width + space;
+        widest = widest.max(pen);
+    }
+    (widest.min(max_width), lines as f32 * line_height)
 }
 
 /// Applies a `style="..."` attribute through the shared declaration parser.

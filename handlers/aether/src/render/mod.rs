@@ -16,17 +16,7 @@ struct Inherited {
     bold: bool,
 }
 
-/// Default font sizes per element (rough UA-stylesheet equivalents).
-fn default_font_size(tag: &str, inherited: f32) -> f32 {
-    match tag {
-        "h1" => 32.0,
-        "h2" => 24.0,
-        "h3" => 19.0,
-        "h4" => 16.0,
-        "small" => 13.0,
-        _ => inherited,
-    }
-}
+use crate::layout::default_font_size;
 
 fn in_damage(x: u32, y: u32, damage_rects: &[(u32, u32, u32, u32)]) -> bool {
     damage_rects

@@ -94,14 +94,8 @@ fn clip(v: &str) -> &str {
 pub fn apply_css(layout_tree: &mut LayoutTree, css: &str) {
     apply_stylesheet(layout_tree, css, 0);
 
-    // set_style only marks nodes dirty; the boxes are stale until recomputed.
-    let _ = layout_tree.taffy.compute_layout(
-        layout_tree.root_node,
-        taffy::geometry::Size {
-            width: AvailableSpace::Definite(800.0),
-            height: AvailableSpace::Definite(600.0),
-        },
-    );
+    // set_style only marks nodes dirty; re-lay out with text measurement.
+    crate::layout::remeasure(layout_tree);
 }
 
 fn apply_stylesheet(layout_tree: &mut LayoutTree, css: &str, depth: u8) {
