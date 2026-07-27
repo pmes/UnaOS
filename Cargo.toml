@@ -55,3 +55,13 @@ default-members = [
 # cascade on a rule-heavy page (wikipedia) costs ~40s CPU without this.
 [profile.dev.package."*"]
 opt-level = 2
+
+# The browser's own hot loops (pixel blits, glyph rasterization, cascade)
+# live in these crates — run them optimized in dev too. Debugging them
+# means flipping these to 0 locally, not shipping a pokey browser daily.
+[profile.dev.package.aether]
+opt-level = 2
+[profile.dev.package.quartzite]
+opt-level = 2
+[profile.dev.package.aether-shell]
+opt-level = 2

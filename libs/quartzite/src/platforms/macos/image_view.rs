@@ -282,8 +282,27 @@ define_class!(
         fn key_down(&self, event: &AnyObject) {
             let chars: Option<Retained<NSString>> =
                 unsafe { msg_send![event, charactersIgnoringModifiers] };
-            let handled = match chars.map(|s| s.to_string()) {
-                Some(s) if s == "0" || s == "f" || s == "F" => {
+            let text = chars.map(|s| s.to_string()).unwrap_or_default();
+            // Browser surface: keys are page input (focused field editing),
+            // not viewer shortcuts.
+            if let Some(syn) = self.ivars().synapse.borrow().as_ref() {
+                let mut it = text.chars();
+                match (it.next(), it.next()) {
+                    (Some('\u{7f}'), None) | (Some('\u{8}'), None) => {
+                        syn.fire(bandy::SMessage::BrowserKey("BackSpace".into()));
+                    }
+                    (Some('\r'), None) | (Some('\n'), None) => {
+                        syn.fire(bandy::SMessage::BrowserKey("Return".into()));
+                    }
+                    (Some(c), _) if !c.is_control() => {
+                        syn.fire(bandy::SMessage::BrowserText(text));
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            let handled = match text.as_str() {
+                "0" | "f" | "F" => {
                     self.reset_to_fit();
                     true
                 }

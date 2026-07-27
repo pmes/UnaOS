@@ -56,6 +56,110 @@ fn blend_px(surface: &mut [u8], width: u32, x: u32, y: u32, (r, g, b): (u8, u8, 
     }
 }
 
+/// Rasterized-glyph cache: font-kit rasterization dominated scroll
+/// repaints (every damage strip re-rendered every glyph). Keyed by
+/// (bold, glyph id, quarter-px font size); holds the coverage bitmap and
+/// its raster-bounds origin. Cleared implicitly by process lifetime —
+/// glyphs are font-global, not page-scoped.
+type GlyphKey = (bool, u32, u32);
+struct CachedGlyph {
+    origin: (i32, i32),
+    w: i32,
+    h: i32,
+    cov: Vec<u8>,
+}
+thread_local! {
+    static GLYPHS: std::cell::RefCell<std::collections::HashMap<GlyphKey, Option<CachedGlyph>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn rasterize_glyph_cached(
+    font: &Font,
+    bold: bool,
+    glyph_id: u32,
+    font_size: f32,
+) -> Option<(i32, i32, i32, i32)> {
+    let key = (bold, glyph_id, (font_size * 4.0) as u32);
+    GLYPHS.with(|g| {
+        if !g.borrow().contains_key(&key) {
+            let computed = (|| {
+                let bounds = font
+                    .raster_bounds(
+                        glyph_id,
+                        font_size,
+                        Transform2F::default(),
+                        HintingOptions::None,
+                        RasterizationOptions::GrayscaleAa,
+                    )
+                    .ok()?;
+                if bounds.size().x() <= 0 || bounds.size().y() <= 0 {
+                    return None;
+                }
+                let mut canvas = Canvas::new(bounds.size(), Format::A8);
+                font.rasterize_glyph(
+                    &mut canvas,
+                    glyph_id,
+                    font_size,
+                    Transform2F::from_translation(-bounds.origin().to_f32()),
+                    HintingOptions::None,
+                    RasterizationOptions::GrayscaleAa,
+                )
+                .ok()?;
+                Some(CachedGlyph {
+                    origin: (bounds.origin().x(), bounds.origin().y()),
+                    w: bounds.size().x(),
+                    h: bounds.size().y(),
+                    cov: canvas.pixels,
+                })
+            })();
+            g.borrow_mut().insert(key, computed);
+        }
+        g.borrow()
+            .get(&key)
+            .and_then(|o| o.as_ref())
+            .map(|c| (c.origin.0, c.origin.1, c.w, c.h))
+    })
+}
+
+/// Blends one cached glyph's coverage at (px_x baseline-relative already applied by caller).
+#[allow(clippy::too_many_arguments)]
+fn blit_cached_glyph(
+    bold: bool,
+    glyph_id: u32,
+    font_size: f32,
+    origin_x: f32,
+    baseline_y: f32,
+    color: (u8, u8, u8),
+    surface: &mut [u8],
+    width: u32,
+    height: u32,
+    damage_rects: &[(u32, u32, u32, u32)],
+    clip: Clip,
+) {
+    let key = (bold, glyph_id, (font_size * 4.0) as u32);
+    GLYPHS.with(|g| {
+        let g = g.borrow();
+        let Some(Some(c)) = g.get(&key) else { return };
+        for row in 0..c.h {
+            for col in 0..c.w {
+                let cov = c.cov[(row * c.w + col) as usize];
+                if cov == 0 {
+                    continue;
+                }
+                let dst_x = origin_x + (c.origin.0 + col) as f32;
+                let dst_y = baseline_y + (c.origin.1 + row) as f32;
+                if dst_x < 0.0 || dst_y < 0.0 {
+                    continue;
+                }
+                let (px, py) = (dst_x as u32, dst_y as u32);
+                if px < width && py < height && in_damage(px, py, damage_rects) && in_clip(px, py, clip) {
+                    blend_px(surface, width, px, py, color, cov);
+                }
+            }
+        }
+    });
+}
+
 /// Draws `text` starting at (origin_x, origin_y), wrapping at `max_width`.
 #[allow(clippy::too_many_arguments)]
 fn draw_text(
@@ -64,6 +168,7 @@ fn draw_text(
     origin_y: f32,
     max_width: f32,
     font: &Font,
+    bold: bool,
     font_size: f32,
     line_height_mult: f32,
     color: (u8, u8, u8),
@@ -102,46 +207,12 @@ fn draw_text(
             let Some(glyph_id) = font.glyph_for_char(c) else { continue };
             let advance = font.advance(glyph_id).map(|a| a.x() * scale).unwrap_or(font_size * 0.5);
             let baseline_y = origin_y + line as f32 * line_height + ascent;
-
-            if let Ok(bounds) = font.raster_bounds(
-                glyph_id,
-                font_size,
-                Transform2F::default(),
-                HintingOptions::None,
-                RasterizationOptions::GrayscaleAa,
-            ) {
-                if bounds.size().x() > 0 && bounds.size().y() > 0 {
-                    let mut canvas = Canvas::new(bounds.size(), Format::A8);
-                    if font
-                        .rasterize_glyph(
-                            &mut canvas,
-                            glyph_id,
-                            font_size,
-                            Transform2F::from_translation(-bounds.origin().to_f32()),
-                            HintingOptions::None,
-                            RasterizationOptions::GrayscaleAa,
-                        )
-                        .is_ok()
-                    {
-                        for row in 0..bounds.size().y() {
-                            for col in 0..bounds.size().x() {
-                                let cov = canvas.pixels[(row * canvas.stride as i32 + col) as usize];
-                                if cov == 0 {
-                                    continue;
-                                }
-                                let dst_x = origin_x + pen_x + (bounds.origin().x() + col) as f32;
-                                let dst_y = baseline_y + (bounds.origin().y() + row) as f32;
-                                if dst_x < 0.0 || dst_y < 0.0 {
-                                    continue;
-                                }
-                                let (px, py) = (dst_x as u32, dst_y as u32);
-                                if px < width && py < height && in_damage(px, py, damage_rects) && in_clip(px, py, clip) {
-                                    blend_px(surface, width, px, py, color, cov);
-                                }
-                            }
-                        }
-                    }
-                }
+            if rasterize_glyph_cached(font, bold, glyph_id, font_size).is_some() {
+                blit_cached_glyph(
+                    bold, glyph_id, font_size,
+                    origin_x + pen_x, baseline_y,
+                    color, surface, width, height, damage_rects, clip,
+                );
             }
             pen_x += advance;
         }
@@ -362,6 +433,7 @@ pub fn render_frame(
                                 current_y - sy as f32 + 3.0,
                                 layout_box.size.width.max(8.0) - 8.0,
                                 font,
+                                false,
                                 inherited.font_size.min(14.0),
                                 inherited.line_height,
                                 (60, 60, 60),
@@ -410,6 +482,7 @@ pub fn render_frame(
                             current_y - sy as f32,
                             layout_box.size.width.max(1.0),
                             font,
+                            inherited.bold,
                             inherited.font_size,
                             inherited.line_height,
                             inherited.color,

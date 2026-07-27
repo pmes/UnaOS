@@ -73,7 +73,12 @@ fn main() {
                                 }
                             }
                             SMessage::BrowserNavReload => {
-                                // Reload logic not directly supported by get_forward_url, ignoring for now or using current
+                                if let Some(url) = engine.history.get(engine.history_idx).cloned() {
+                                    match aether::net::fetch_page(&url).await {
+                                        Ok(page) => engine.load_page(page, false),
+                                        Err(e) => engine.load_error_page(&url, &e.to_string()),
+                                    }
+                                }
                             }
                             SMessage::BrowserScroll(dx, dy) => {
                                 engine.handle_event(aether::api::events::Event::Scroll(dx, dy));
