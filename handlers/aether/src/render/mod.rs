@@ -190,6 +190,16 @@ pub fn render_frame(
         sy: i32,
         damage_rects: &[(u32, u32, u32, u32)],
     ) {
+        // display:none subtrees exist in the tree with zero-size boxes;
+        // they must not paint (their text would smear at the parent origin).
+        if layout
+            .taffy
+            .style(node_id)
+            .map(|s| s.display == taffy::style::Display::None)
+            .unwrap_or(false)
+        {
+            return;
+        }
         let Ok(layout_box) = layout.taffy.layout(node_id) else { return };
         let current_x = abs_x + layout_box.location.x;
         let current_y = abs_y + layout_box.location.y;
