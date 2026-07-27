@@ -538,6 +538,59 @@ mod tests {
         assert_eq!(paint.font_size, Some(20.0), "plain tag rule still applies");
     }
 
+    /// Custom properties resolve through var() (flat page-global map),
+    /// including fallbacks, nesting, and rgb(var(--x)) composition.
+    #[test]
+    fn test_custom_property_resolution() {
+        let html = r#"<html><body><p id="x">a</p><p id="y">b</p></body></html>"#;
+        let document = dom::parse_html(html);
+        let mut layout_tree = layout::compute_layout(&document);
+        css::apply_css(&mut layout_tree, r#"
+            :root { --brand-rgb: 10, 20, 30; --accent: #ff0000; }
+            #x { color: rgb(var(--brand-rgb)); background-color: var(--missing, var(--accent)); }
+            #y { color: var(--nope); }
+        "#);
+        for (node_id, dom_node) in &layout_tree.node_map {
+            let Some(el) = dom_node.as_element() else { continue };
+            let paint = layout_tree.paint_map.get(node_id).cloned().unwrap_or_default();
+            match el.attributes.borrow().get("id") {
+                Some("x") => {
+                    assert_eq!(paint.color, Some((10, 20, 30)), "rgb(var()) must compose");
+                    assert_eq!(paint.background, Some((255, 0, 0)), "fallback chain must resolve");
+                }
+                Some("y") => assert_eq!(paint.color, None, "unknown var without fallback stays unset"),
+                _ => {}
+            }
+        }
+    }
+
+    /// visibility:hidden and opacity:0 keep layout space but paint nothing.
+    #[test]
+    fn test_visibility_hidden_paints_nothing() {
+        let html = r#"<html><body>
+            <div id="v" style="width: 100px; height: 40px">SECRET</div>
+            <div id="o" style="width: 100px; height: 40px">ALSO</div>
+        </body></html>"#;
+        let document = dom::parse_html(html);
+        let mut layout_tree = layout::compute_layout(&document);
+        css::apply_css(&mut layout_tree, "#v { visibility: hidden; } #o { opacity: 0; }");
+        for (node_id, dom_node) in &layout_tree.node_map {
+            let Some(el) = dom_node.as_element() else { continue };
+            let id = el.attributes.borrow().get("id").map(|s| s.to_string());
+            if matches!(id.as_deref(), Some("v") | Some("o")) {
+                let paint = layout_tree.paint_map.get(node_id).cloned().unwrap_or_default();
+                assert_eq!(paint.hidden, Some(true), "{:?} must be paint-hidden", id);
+                let l = layout_tree.taffy.layout(*node_id).unwrap();
+                assert!(l.size.height >= 40.0, "hidden box must keep its layout space");
+            }
+        }
+        // And the renderer honors it: paint the frame, assert no glyph ink.
+        let mut surface = vec![0u8; 800 * 600 * 4];
+        crate::render::render_frame(&layout_tree, &mut surface, 800, 600, 0.0, 0.0, &[(0, 0, 800, 600)]);
+        let inked = surface.chunks_exact(4).any(|p| p[0] < 200 && p[3] == 255);
+        assert!(!inked, "hidden subtrees must leave the surface uninked");
+    }
+
     /// float:left/right sizes to content and hugs its edge (approximation).
     #[test]
     fn test_float_approximation() {

@@ -209,10 +209,37 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             Some(b) => style.paint.bold = Some(b),
             None => crate::ledger::record_css(&format!("font-weight-value:{}", clip(value))),
         },
+        "visibility" => match value {
+            "hidden" | "collapse" => style.paint.hidden = Some(true),
+            "visible" => style.paint.hidden = Some(false),
+            "inherit" | "initial" | "unset" => {}
+            other => crate::ledger::record_css(&format!("visibility:{}", other)),
+        },
+        // Only full transparency is honored (no compositing): opacity:0
+        // hides like visibility:hidden; anything else paints normally.
+        "opacity" => {
+            if let Ok(a) = value.parse::<f32>() {
+                if a == 0.0 {
+                    style.paint.hidden = Some(true);
+                } else if style.paint.hidden == Some(true) {
+                    style.paint.hidden = Some(false);
+                }
+            }
+        }
         "line-height" => {
             let v = value.trim();
             let factor = if let Some(px) = v.strip_suffix("px").and_then(|n| n.trim().parse::<f32>().ok()) {
                 Some(px / 16.0)
+            } else if let Some(n) = v
+                .strip_suffix("rem")
+                .or_else(|| v.strip_suffix("em"))
+                .and_then(|n| n.trim().parse::<f32>().ok())
+            {
+                // 1.5rem = 24px against the 16px base = 1.5x (approximation:
+                // em treated like rem, not parent-relative).
+                Some(n)
+            } else if let Some(pct) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
+                Some(pct / 100.0)
             } else if v == "normal" {
                 Some(1.2)
             } else {
@@ -264,6 +291,98 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
         "border-style" => {} // stroke style is uniform; nothing to record
         other => crate::ledger::record_css(&format!("property:{}", other)),
     }
+}
+
+thread_local! {
+    /// Custom properties (--x: value) gathered from the current page's
+    /// sheets, last-wins. A flat global map — no per-element cascade of
+    /// custom props yet (the dominant design-token-on-:root pattern works;
+    /// element-scoped overrides don't and stay visible in the ledger).
+    static CUSTOM_PROPS: std::cell::RefCell<std::collections::HashMap<String, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Scans raw CSS text for `--name: value` declarations into the map.
+fn collect_custom_props(css: &str, map: &mut std::collections::HashMap<String, String>) {
+    let bytes = css.as_bytes();
+    let mut i = 0;
+    while let Some(pos) = css[i..].find("--") {
+        let start = i + pos;
+        i = start + 2;
+        // Custom property declarations begin a declaration: preceded by
+        // '{', ';', or whitespace-after-those; cheap check: previous
+        // non-space char must be '{' or ';'.
+        let prev = css[..start].trim_end().chars().last();
+        if !matches!(prev, Some('{') | Some(';') | None) {
+            continue;
+        }
+        let name_end = css[start..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .map(|o| start + o)
+            .unwrap_or(bytes.len());
+        if css[name_end..].trim_start().as_bytes().first() != Some(&b':') {
+            continue;
+        }
+        let val_start = name_end + css[name_end..].find(':').unwrap() + 1;
+        let val_end = css[val_start..]
+            .find([';', '}'])
+            .map(|o| val_start + o)
+            .unwrap_or(css.len());
+        let name = css[start..name_end].to_string();
+        let value = css[val_start..val_end].trim().to_string();
+        if name.len() > 2 && !value.is_empty() && value.len() < 512 {
+            map.insert(name, value);
+        }
+        i = val_end;
+    }
+}
+
+/// Substitutes `var(--x)` / `var(--x, fallback)` from the page's custom
+/// property map. Unknown vars use the fallback or resolve to "" (which the
+/// property parser then ledgers). Depth-capped against cycles.
+pub(crate) fn resolve_vars(value: &str, depth: u8) -> String {
+    if depth > 4 || !value.contains("var(") {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(pos) = rest.find("var(") {
+        out.push_str(&rest[..pos]);
+        let inner_start = pos + 4;
+        // Find the matching ')' (fallbacks may contain nested parens).
+        let mut depth_p = 1i32;
+        let mut end = None;
+        for (o, c) in rest[inner_start..].char_indices() {
+            match c {
+                '(' => depth_p += 1,
+                ')' => {
+                    depth_p -= 1;
+                    if depth_p == 0 {
+                        end = Some(inner_start + o);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            out.push_str(&rest[pos..]);
+            return out;
+        };
+        let inner = &rest[inner_start..end];
+        let (name, fallback) = match inner.split_once(',') {
+            Some((n, f)) => (n.trim(), Some(f.trim())),
+            None => (inner.trim(), None),
+        };
+        let resolved = CUSTOM_PROPS.with(|m| m.borrow().get(name).cloned());
+        match resolved.or_else(|| fallback.map(|f| f.to_string())) {
+            Some(v) => out.push_str(&resolve_vars(&v, depth + 1)),
+            None => crate::ledger::record_css(&format!("var-unresolved:{}", clip(name))),
+        }
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Extracts the url from a `url(...)` component (quotes stripped). Returns
@@ -386,6 +505,7 @@ fn apply_spec_to_node(
     if style.paint.border.is_some() { entry.border = style.paint.border; }
     if style.paint.line_height.is_some() { entry.line_height = style.paint.line_height; }
     if style.paint.bg_image.is_some() { entry.bg_image = style.paint.bg_image.clone(); }
+    if style.paint.hidden.is_some() { entry.hidden = style.paint.hidden; }
 }
 
 /// Applies a set of stylesheets as ONE cascade — rules from every sheet
@@ -394,6 +514,14 @@ fn apply_spec_to_node(
 /// normal rules, below `!important` rules; inline `!important` wins all.
 pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     let vw = layout_tree.viewport.0;
+    // Custom properties first, so every rule's var() can resolve.
+    CUSTOM_PROPS.with(|m| {
+        let mut map = m.borrow_mut();
+        map.clear();
+        for css in sheets {
+            collect_custom_props(css, &mut map);
+        }
+    });
     let mut rules = Vec::new();
     for css in sheets {
         collect_rules(css, 0, &mut rules, vw);
@@ -616,9 +744,9 @@ pub(crate) fn parse_declaration_block_tiers(body: &str) -> (SpecifiedStyle, Spec
         {
             Some(v) => {
                 has_important = true;
-                apply_declaration(&prop, v.trim(), &mut important);
+                apply_declaration(&prop, &resolve_vars(v.trim(), 0), &mut important);
             }
-            None => apply_declaration(&prop, value, &mut normal),
+            None => apply_declaration(&prop, &resolve_vars(value, 0), &mut normal),
         }
     }
     (normal, important, has_important)
@@ -650,6 +778,7 @@ fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
     if p.border.is_some() { dst.paint.border = p.border; }
     if p.line_height.is_some() { dst.paint.line_height = p.line_height; }
     if p.bg_image.is_some() { dst.paint.bg_image = p.bg_image.clone(); }
+    if p.hidden.is_some() { dst.paint.hidden = p.hidden; }
 }
 
 /// Evaluates an @media condition against the fixed viewport. Comma = OR,
@@ -696,7 +825,7 @@ fn property_supported(prop: &str) -> bool {
             | "margin-top" | "margin-right" | "margin-bottom" | "margin-left"
             | "position" | "top" | "left" | "right" | "bottom" | "text-align"
             | "background-color" | "background" | "background-image" | "color"
-            | "font-size" | "font-weight" | "line-height"
+            | "font-size" | "font-weight" | "line-height" | "visibility"
             | "border" | "outline" | "border-color" | "border-width" | "border-style"
     )
 }

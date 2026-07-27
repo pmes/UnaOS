@@ -218,6 +218,17 @@ pub fn render_frame(
         {
             return;
         }
+        // visibility:hidden / opacity:0 keep their space but paint nothing;
+        // approximation: the whole subtree skips (no visibility:visible
+        // re-reveal inside a hidden ancestor).
+        if layout
+            .paint_map
+            .get(&node_id)
+            .and_then(|p| p.hidden)
+            .unwrap_or(false)
+        {
+            return;
+        }
         let Ok(layout_box) = layout.taffy.layout(node_id) else { return };
         let current_x = abs_x + layout_box.location.x;
         let current_y = abs_y + layout_box.location.y;

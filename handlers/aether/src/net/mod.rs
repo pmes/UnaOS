@@ -1,6 +1,19 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 
+/// One shared HTTP client: connection pooling + TLS session reuse across
+/// every fetch of a page load (a per-fetch Client paid a fresh handshake
+/// for each of yahoo's dozens of resources).
+fn client() -> &'static Client {
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .user_agent("UnaOS Aether/0.1.0")
+            .build()
+            .expect("http client")
+    })
+}
+
 pub fn normalize_url(input: &str) -> Vec<String> {
     if input.starts_with("file://") {
         return vec![];
@@ -21,10 +34,7 @@ pub async fn fetch_document(input: &str) -> Result<String> {
         anyhow::bail!("Invalid URL");
     }
 
-    let client = Client::builder()
-        .user_agent("UnaOS Aether/0.1.0")
-        .build()?;
-        
+    let client = client();
     let mut last_err = None;
     for url in urls {
         match client.get(&url).send().await {
@@ -56,8 +66,7 @@ pub async fn fetch_document(input: &str) -> Result<String> {
 
 /// POSTs a urlencoded form body and returns the response document.
 pub async fn post_document(url: &str, body: &str) -> Result<String> {
-    let client = Client::builder().user_agent("UnaOS Aether/0.1.0").build()?;
-    let response = client
+    let response = client()
         .post(url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body.to_string())
@@ -168,8 +177,7 @@ pub fn collect_css_image_urls(base_url: &str, texts: &[&str], out: &mut Vec<Stri
 
 /// Fetches raw bytes (images etc), same limits as fetch_document.
 pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
-    let client = Client::builder().user_agent("UnaOS Aether/0.1.0").build()?;
-    let response = client.get(url).send().await?;
+    let response = client().get(url).send().await?;
     if !response.status().is_success() {
         anyhow::bail!("HTTP Error: {}", response.status());
     }
@@ -189,9 +197,17 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
         .into_iter()
         .next()
         .unwrap_or_else(|| input.to_string());
+    // All stylesheets fetch CONCURRENTLY (a page with a dozen sheets paid
+    // a dozen round-trips in series before this).
+    let sheet_results = futures_util::future::join_all(
+        collect_stylesheet_urls(&base, &html)
+            .into_iter()
+            .map(|u| async move { (fetch_document(&u).await, u) }),
+    )
+    .await;
     let mut sheets = Vec::new();
-    for sheet_url in collect_stylesheet_urls(&base, &html) {
-        match fetch_document(&sheet_url).await {
+    for (result, sheet_url) in sheet_results {
+        match result {
             Ok(css) => sheets.push(css),
             Err(_) => crate::ledger::record_css(&format!("stylesheet-fetch-failed:{}", sheet_url)),
         }
@@ -204,9 +220,16 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
     let mut css_texts: Vec<&str> = vec![&html];
     css_texts.extend(sheets.iter().map(|s| s.as_str()));
     collect_css_image_urls(&base, &css_texts, &mut wanted);
+    // Images likewise fetch concurrently; decode stays on this thread.
+    let img_results = futures_util::future::join_all(
+        wanted
+            .into_iter()
+            .map(|u| async move { (fetch_bytes(&u).await, u) }),
+    )
+    .await;
     let mut images = Vec::new();
-    for img_url in wanted {
-        match fetch_bytes(&img_url).await {
+    for (result, img_url) in img_results {
+        match result {
             Ok(bytes) => {
                 let decoded = image::load_from_memory(&bytes)
                     .ok()

@@ -17,6 +17,8 @@ pub struct PaintStyle {
     pub line_height: Option<f32>,
     /// background-image url (as written; resolved via images::get at paint).
     pub bg_image: Option<String>,
+    /// visibility:hidden / opacity:0 — box keeps its space, paints nothing.
+    pub hidden: Option<bool>,
 }
 
 pub struct LayoutTree {
