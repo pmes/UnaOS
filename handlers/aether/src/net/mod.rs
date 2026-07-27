@@ -85,10 +85,58 @@ pub fn collect_stylesheet_urls(base_url: &str, html: &str) -> Vec<String> {
     out
 }
 
-/// Fetches a page AND its external stylesheets: the async half of the
-/// fetch-then-apply pattern. Sheet failures are skipped (and ledgered),
-/// never fatal to the page load.
-pub async fn fetch_page(input: &str) -> Result<(String, Vec<String>)> {
+/// Everything a page load needs, fetched up front (fetch-then-apply).
+#[derive(Default)]
+pub struct Page {
+    pub base_url: String,
+    pub html: String,
+    pub sheets: Vec<String>,
+    pub images: Vec<(String, image::RgbaImage)>,
+}
+
+/// Collects absolute `<img src>` URLs (capped; data:/svg skipped for now).
+pub fn collect_image_urls(base_url: &str, html: &str) -> Vec<String> {
+    let document = crate::dom::parse_html(html);
+    let mut out = Vec::new();
+    if let Ok(imgs) = document.select("img") {
+        for img in imgs {
+            let attrs = img.attributes.borrow();
+            let Some(src) = attrs.get("src") else { continue };
+            if src.starts_with("data:") || src.ends_with(".svg") {
+                crate::ledger::record_dom(&format!("img-src-unsupported:{}", &src[..src.len().min(24)]));
+                continue;
+            }
+            let abs = crate::images::resolve(base_url, src);
+            if (abs.starts_with("http://") || abs.starts_with("https://")) && !out.contains(&abs) {
+                out.push(abs);
+            }
+            if out.len() >= 30 {
+                crate::ledger::record_dom("img-fetch-cap-reached");
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Fetches raw bytes (images etc), same limits as fetch_document.
+pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
+    let client = Client::builder().user_agent("UnaOS Aether/0.1.0").build()?;
+    let response = client.get(url).send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("HTTP Error: {}", response.status());
+    }
+    let bytes = response.bytes().await.context("Failed to read body")?;
+    if bytes.len() > 10 * 1024 * 1024 {
+        anyhow::bail!("Response body exceeds size limit");
+    }
+    Ok(bytes.to_vec())
+}
+
+/// Fetches a page, its external stylesheets, and its images: the async
+/// half of the fetch-then-apply pattern. Resource failures are skipped
+/// (and ledgered), never fatal to the page load.
+pub async fn fetch_page(input: &str) -> Result<Page> {
     let html = fetch_document(input).await?;
     let base = normalize_url(input)
         .into_iter()
@@ -101,7 +149,17 @@ pub async fn fetch_page(input: &str) -> Result<(String, Vec<String>)> {
             Err(_) => crate::ledger::record_css(&format!("stylesheet-fetch-failed:{}", sheet_url)),
         }
     }
-    Ok((html, sheets))
+    let mut images = Vec::new();
+    for img_url in collect_image_urls(&base, &html) {
+        match fetch_bytes(&img_url).await {
+            Ok(bytes) => match image::load_from_memory(&bytes) {
+                Ok(img) => images.push((img_url, img.to_rgba8())),
+                Err(_) => crate::ledger::record_dom(&format!("img-decode-failed:{}", &img_url[..img_url.len().min(48)])),
+            },
+            Err(_) => crate::ledger::record_dom(&format!("img-fetch-failed:{}", &img_url[..img_url.len().min(48)])),
+        }
+    }
+    Ok(Page { base_url: base, html, sheets, images })
 }
 
 #[cfg(test)]

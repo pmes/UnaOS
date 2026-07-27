@@ -20,7 +20,10 @@ pub async fn render_headless(
             engine.load_html(&url, &html, true);
         }
         (None, Some(url)) => match crate::net::fetch_page(url).await {
-            Ok((html, sheets)) => engine.load_html_styled(url, &html, &sheets, true),
+            Ok(page) => {
+                crate::images::set_page(&page.base_url, page.images);
+                engine.load_html_styled(url, &page.html, &page.sheets, true)
+            }
             Err(e) => engine.load_error_page(url, &e.to_string()),
         },
         (None, None) => anyhow::bail!("render needs a URL or --html <file>"),

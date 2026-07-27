@@ -192,19 +192,38 @@ pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
 /// inherited font size, then lets taffy size text leaves by wrapped extent.
 /// Called after building the tree and after every cascade application.
 pub fn remeasure(tree: &mut LayoutTree) {
-    // Pass 1: resolve font size down the box tree for text leaves.
+    // Pass 1: resolve font size down the box tree for text leaves, and
+    // intrinsic sizes for images.
     let mut text_info: HashMap<taffy::NodeId, (String, f32)> = HashMap::new();
+    let mut img_info: HashMap<taffy::NodeId, (f32, f32)> = HashMap::new();
     fn resolve(
         node_id: taffy::NodeId,
         inherited: f32,
         tree: &LayoutTree,
         out: &mut HashMap<taffy::NodeId, (String, f32)>,
+        imgs: &mut HashMap<taffy::NodeId, (f32, f32)>,
     ) {
         let mut size = inherited;
         if let Some(dom_node) = tree.node_map.get(&node_id) {
             if let Some(el) = dom_node.as_element() {
                 let spec = tree.paint_map.get(&node_id).and_then(|p| p.font_size);
                 size = spec.unwrap_or_else(|| default_font_size(el.name.local.as_ref(), inherited));
+                if el.name.local.as_ref() == "img" {
+                    let attrs = el.attributes.borrow();
+                    // width/height attributes win; else intrinsic dimensions.
+                    let attr_px = |name: &str| {
+                        attrs.get(name).and_then(|v| v.trim().parse::<f32>().ok())
+                    };
+                    let intrinsic = attrs
+                        .get("src")
+                        .and_then(crate::images::get)
+                        .map(|i| (i.width() as f32, i.height() as f32));
+                    let w = attr_px("width").or(intrinsic.map(|(w, _)| w));
+                    let h = attr_px("height").or(intrinsic.map(|(_, h)| h));
+                    if let (Some(w), Some(h)) = (w, h) {
+                        imgs.insert(node_id, (w, h));
+                    }
+                }
             } else if dom_node.as_text().is_some() {
                 let text = dom_node.text_contents();
                 let text = text.trim().to_string();
@@ -215,11 +234,11 @@ pub fn remeasure(tree: &mut LayoutTree) {
         }
         if let Ok(children) = tree.taffy.children(node_id) {
             for child in children {
-                resolve(child, size, tree, out);
+                resolve(child, size, tree, out, imgs);
             }
         }
     }
-    resolve(tree.root_node, 16.0, tree, &mut text_info);
+    resolve(tree.root_node, 16.0, tree, &mut text_info, &mut img_info);
 
     let font = crate::fonts::FontEngine::new().load_font(
         &[font_kit::family_name::FamilyName::SansSerif],
@@ -234,6 +253,12 @@ pub fn remeasure(tree: &mut LayoutTree) {
         tree.root_node,
         viewport,
         |known, avail, node_id, _ctx, _style| {
+            if let Some(&(w, h)) = img_info.get(&node_id) {
+                return Size {
+                    width: known.width.unwrap_or(w),
+                    height: known.height.unwrap_or(h),
+                };
+            }
             let Some((text, font_size)) = text_info.get(&node_id) else {
                 return Size { width: known.width.unwrap_or(0.0), height: known.height.unwrap_or(0.0) };
             };

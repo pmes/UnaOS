@@ -226,6 +226,33 @@ pub fn render_frame(
                         }
                     }
                 }
+
+                if tag == "img" {
+                    if let Some(img) = el.attributes.borrow().get("src").and_then(crate::images::get) {
+                        let x_start = ((current_x as i32) - sx).max(0) as u32;
+                        let y_start = ((current_y as i32) - sy).max(0) as u32;
+                        let bw = layout_box.size.width.max(1.0);
+                        let bh = layout_box.size.height.max(1.0);
+                        let end_x = x_start.saturating_add(bw as u32).min(width);
+                        let end_y = y_start.saturating_add(bh as u32).min(height);
+                        for y in y_start..end_y {
+                            for x in x_start..end_x {
+                                if !in_damage(x, y, damage_rects) {
+                                    continue;
+                                }
+                                // Nearest-neighbor sample into the layout box.
+                                let u = ((x - x_start) as f32 / bw * img.width() as f32) as u32;
+                                let v = ((y - y_start) as f32 / bh * img.height() as f32) as u32;
+                                let px = img.get_pixel(u.min(img.width() - 1), v.min(img.height() - 1));
+                                let [r, g, b, a] = px.0;
+                                if a > 0 {
+                                    blend_px(surface, width, x, y, (r, g, b), a);
+                                }
+                            }
+                        }
+                    }
+                }
+
             } else if dom_node.as_text().is_some() {
                 let font = if inherited.bold { font_bold } else { font };
                 if let Some(font) = font {
