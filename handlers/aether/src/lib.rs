@@ -36,6 +36,8 @@ pub struct AetherEngine {
     /// All stylesheet text applied to the current document (document
     /// <style> blocks + external sheets), kept for script-driven relayout.
     pub stylesheets: Vec<String>,
+    /// Play request staged by a media-element click: (url, title, mime).
+    pending_media: Option<(String, String, String)>,
 }
 
 impl AetherEngine {
@@ -56,6 +58,7 @@ impl AetherEngine {
             focused_node: None,
             surface: vec![255; 800 * 600 * 4],
             stylesheets: Vec::new(),
+            pending_media: None,
         }
     }
 
@@ -226,6 +229,22 @@ impl AetherEngine {
                             self.relayout();
                         }
                     }
+                    // A click on (or inside) a media element is a play
+                    // request: stage the resolved stream for the shell to
+                    // hand to Stria (PlayMedia passthrough, no site code).
+                    let mut cur = Some(node.clone());
+                    while let Some(n) = cur {
+                        if let Some(el) = n.as_element() {
+                            let tag = el.name.local.as_ref();
+                            if tag == "video" || tag == "audio" {
+                                if let Some((src, mime)) = self.media_source_for(&n) {
+                                    self.pending_media = Some((src, self.title.clone(), mime));
+                                }
+                                break;
+                            }
+                        }
+                        cur = n.parent();
+                    }
                     if let Some(el) = node.as_element() {
                         if &*el.name.local == "a" {
                             if let Some(href) = el.attributes.borrow().get("href") {
@@ -350,6 +369,54 @@ impl AetherEngine {
 
     pub fn load_html(&mut self, url: &str, html: &str, add_history: bool) {
         self.load_html_styled(url, html, &[], add_history)
+    }
+
+    /// The staged play request from the last media-element click, if any.
+    /// The shell consumes this and fires SMessage::PlayMedia toward Stria.
+    pub fn take_pending_media(&mut self) -> Option<(String, String, String)> {
+        self.pending_media.take()
+    }
+
+    /// Resolves one media element's playable source: its own src, else the
+    /// first <source> child's. Returns (absolute url, mime).
+    fn media_source_for(&self, node: &kuchiki::NodeRef) -> Option<(String, String)> {
+        let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
+        let pick = |el: &kuchiki::ElementData| -> Option<(String, String)> {
+            let attrs = el.attributes.borrow();
+            let src = attrs.get("src").filter(|s| !s.is_empty())?.to_string();
+            let abs = images::resolve(&base, &src);
+            let mime = attrs
+                .get("type")
+                .map(str::to_string)
+                .unwrap_or_else(|| Self::mime_for(&abs).to_string());
+            Some((abs, mime))
+        };
+        if let Some(el) = node.as_element() {
+            if let Some(found) = pick(el) {
+                return Some(found);
+            }
+        }
+        for child in node.children() {
+            if let Some(el) = child.as_element() {
+                if el.name.local.as_ref() == "source" {
+                    if let Some(found) = pick(el) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn mime_for(url: &str) -> &'static str {
+        match url.rsplit('.').next() {
+            Some("mp4") => "video/mp4",
+            Some("webm") => "video/webm",
+            Some("mp3") => "audio/mpeg",
+            Some("ogg") => "audio/ogg",
+            Some("wav") => "audio/wav",
+            _ => "application/octet-stream",
+        }
     }
 
     /// Media the current page references, ready to hand to Stria. We own the

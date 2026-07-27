@@ -811,6 +811,36 @@ mod tests {
         // completing at all proves termination.
     }
 
+    /// Clicking a media element (or a child of one) stages a PlayMedia
+    /// handoff with the page-resolved stream — the charter passthrough.
+    #[test]
+    fn test_media_click_stages_playmedia() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled(
+            "https://example.com/watch/",
+            r#"<html><body>
+                <video style="width: 300px; height: 150px">
+                    <source src="/media/clip.webm" type="video/webm">
+                </video>
+                <p>after</p>
+            </body></html>"#,
+            &[],
+            true,
+        );
+        engine.render_frame();
+        // Click inside the video box (top-left area of the page).
+        engine.handle_event(crate::api::events::Event::MouseDown(50.0, 50.0));
+        engine.handle_event(crate::api::events::Event::MouseUp(50.0, 50.0));
+        let staged = engine.take_pending_media().expect("click must stage media");
+        assert_eq!(staged.0, "https://example.com/media/clip.webm");
+        assert_eq!(staged.2, "video/webm");
+        assert!(engine.take_pending_media().is_none(), "take must consume");
+
+        // media_sources still reports the page's streams for enumeration.
+        let sources = engine.media_sources();
+        assert_eq!(sources, vec![("https://example.com/media/clip.webm".to_string(), "video/webm".to_string())]);
+    }
+
     /// float:left/right sizes to content and hugs its edge (approximation).
     #[test]
     fn test_float_approximation() {

@@ -78,6 +78,15 @@ fn main() {
                             SMessage::BrowserScroll(dx, dy) => {
                                 engine.handle_event(aether::api::events::Event::Scroll(dx, dy));
                             }
+                            SMessage::BrowserClick(x, y) => {
+                                engine.handle_event(aether::api::events::Event::MouseDown(x, y));
+                                engine.handle_event(aether::api::events::Event::MouseUp(x, y));
+                                // A media-element click stages a play request:
+                                // hand the page's own stream to Stria.
+                                if let Some((url, title, mime)) = engine.take_pending_media() {
+                                    engine_tx.fire(SMessage::PlayMedia { url, title, mime });
+                                }
+                            }
                             SMessage::BrowserResize(w, h) => {
                                 engine.handle_event(aether::api::events::Event::Resize(w, h));
                             }

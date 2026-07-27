@@ -95,6 +95,10 @@ pub struct FacetImageIvars {
     drag_anchor: Cell<Option<(f64, f64)>>,
     /// The live mouse-move tracking area (rebuilt from `updateTrackingAreas`).
     tracking: RefCell<Option<Retained<AnyObject>>>,
+    /// Browser mode: when set, pointer input forwards to the engine over
+    /// this synapse (clicks as surface-pixel BrowserClick, wheel as
+    /// BrowserScroll) instead of driving facet zoom/pan.
+    synapse: RefCell<Option<bandy::Synapse>>,
 }
 
 define_class!(
@@ -116,6 +120,7 @@ define_class!(
                 cursor: Cell::new(None),
                 drag_anchor: Cell::new(None),
                 tracking: RefCell::new(None),
+                synapse: RefCell::new(None),
             });
             unsafe { msg_send![super(this), initWithFrame: frame] }
         }
@@ -165,6 +170,15 @@ define_class!(
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &AnyObject) {
             let dy: f64 = unsafe { msg_send![event, scrollingDeltaY] };
+            if let Some(syn) = self.ivars().synapse.borrow().as_ref() {
+                // Browser surface: wheel scrolls the page (deltaY > 0 is
+                // fingers-down/content-up in natural scrolling; the engine
+                // wants positive dy = scroll further down the document).
+                if dy != 0.0 {
+                    syn.fire(bandy::SMessage::BrowserScroll(0.0, -dy * 3.0));
+                }
+                return;
+            }
             let precise: bool = unsafe { msg_send![event, hasPreciseScrollingDeltas] };
             if dy == 0.0 {
                 return;
@@ -215,8 +229,26 @@ define_class!(
         }
 
         #[unsafe(method(mouseUp:))]
-        fn mouse_up(&self, _event: &AnyObject) {
+        fn mouse_up(&self, event: &AnyObject) {
             self.ivars().drag_anchor.set(None);
+            let syn = self.ivars().synapse.borrow().clone();
+            if let Some(syn) = syn {
+                // Map the view point through the aspect-fit transform into
+                // surface pixels (unflipped view: invert Y for the top-left
+                // origin the engine uses).
+                let (vx, vy) = self.event_point(event);
+                let bounds = self.bounds();
+                if let Some((dx, dy, dw, dh)) = self.image_dest(bounds) {
+                    let (iw, ih) = *self.ivars().size.borrow();
+                    if dw > 0.0 && dh > 0.0 && iw > 0 && ih > 0 {
+                        let px = (vx - dx) / dw * iw as f64;
+                        let py = ih as f64 - ((vy - dy) / dh * ih as f64);
+                        if px >= 0.0 && px < iw as f64 && py >= 0.0 && py < ih as f64 {
+                            syn.fire(bandy::SMessage::BrowserClick(px, py));
+                        }
+                    }
+                }
+            }
         }
 
         #[unsafe(method(mouseEntered:))]
@@ -650,6 +682,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
 
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0));
     let view = FacetImageView::new(mtm, frame);
+    *view.ivars().synapse.borrow_mut() = Some(synapse.clone());
 
     let bound = std::sync::Arc::new(dispatch2::MainThreadBound::new(view.clone(), mtm));
     let mut rx = synapse.subscribe();
