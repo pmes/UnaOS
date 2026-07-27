@@ -655,7 +655,14 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
     let mut rx = synapse.subscribe();
 
     let target_id = id.to_string();
-    tokio::spawn(async move {
+    // The AppKit main thread has no tokio reactor; give the subscription loop
+    // its own thread + current-thread runtime and hop frames back via GCD.
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("surface subscription runtime");
+        rt.block_on(async move {
         loop {
             match rx.recv().await {
                 Ok(bandy::SMessage::SurfaceBlit { url, width, height, pixels }) => {
@@ -672,6 +679,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
+        });
     });
 
     Retained::into_super(view)

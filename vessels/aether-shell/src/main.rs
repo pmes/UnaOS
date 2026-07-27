@@ -21,7 +21,7 @@ fn main() {
             // Initial render
             let _damages = engine.render_frame();
             engine_tx.fire(SMessage::SurfaceBlit {
-                url: engine.title.clone(),
+                url: "viewport".into(),
                 width: engine.width,
                 height: engine.height,
                 pixels: engine.surface().to_vec(),
@@ -36,7 +36,7 @@ fn main() {
                             let damages = engine.render_frame();
                             if !damages.is_empty() {
                                 engine_tx.fire(SMessage::SurfaceBlit {
-                                    url: engine.title.clone(),
+                                    url: "viewport".into(),
                                     width: engine.width,
                                     height: engine.height,
                                     pixels: engine.surface().to_vec(),
