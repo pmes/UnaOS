@@ -143,17 +143,46 @@ pub fn compute_layout(dom: &NodeRef) -> LayoutTree {
                 width: if inline { Dimension::auto() } else { Dimension::percent(1.0) },
                 height: Dimension::auto(),
             },
-            min_size: Size {
-                width: Dimension::auto(),
-                height: if inline { Dimension::auto() } else { Dimension::length(20.0) },
+            min_size: match tag.as_str() {
+                // UA default control sizes so empty controls are visible.
+                "input" | "select" => Size {
+                    width: Dimension::length(160.0),
+                    height: Dimension::length(24.0),
+                },
+                "textarea" => Size {
+                    width: Dimension::length(160.0),
+                    height: Dimension::length(60.0),
+                },
+                "button" => Size {
+                    width: Dimension::length(24.0),
+                    height: Dimension::length(24.0),
+                },
+                _ => Size {
+                    width: Dimension::auto(),
+                    height: if inline { Dimension::auto() } else { Dimension::length(20.0) },
+                },
             },
             margin: {
-                let m = if inline { 0.0 } else { 2.0 };
+                // UA default spacing: block gaps for paragraphs/headings,
+                // list indentation, nothing for inline content.
+                let (v, left) = if inline {
+                    (0.0, 0.0)
+                } else {
+                    match tag.as_str() {
+                        "p" | "blockquote" | "pre" => (8.0, 2.0),
+                        "h1" | "h2" => (12.0, 2.0),
+                        "h3" | "h4" | "h5" | "h6" => (10.0, 2.0),
+                        "ul" | "ol" => (8.0, 24.0),
+                        "li" => (2.0, 4.0),
+                        "body" => (8.0, 8.0),
+                        _ => (2.0, 2.0),
+                    }
+                };
                 Rect {
-                    left: LengthPercentage::length(m).into(),
-                    right: LengthPercentage::length(m).into(),
-                    top: LengthPercentage::length(m).into(),
-                    bottom: LengthPercentage::length(m).into(),
+                    left: LengthPercentage::length(left).into(),
+                    right: LengthPercentage::length(2.0_f32.min(left)).into(),
+                    top: LengthPercentage::length(v).into(),
+                    bottom: LengthPercentage::length(v).into(),
                 }
             },
             ..Default::default()

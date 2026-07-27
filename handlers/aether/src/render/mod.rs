@@ -271,7 +271,39 @@ pub fn render_frame(
                     }
                 }
 
-                if let Some((bw, bc)) = spec.border {
+                // Form controls get a UA border and their value text.
+                let is_control = matches!(tag, "input" | "textarea" | "select" | "button");
+                let border = spec.border.or(if is_control { Some((1.0, (118, 118, 118))) } else { None });
+                if is_control && tag != "button" {
+                    if let Some(font) = font {
+                        let attrs = el.attributes.borrow();
+                        let value = attrs
+                            .get("value")
+                            .filter(|v| !v.is_empty())
+                            .or_else(|| attrs.get("placeholder"))
+                            .unwrap_or("")
+                            .to_string();
+                        drop(attrs);
+                        if !value.is_empty() {
+                            draw_text(
+                                &value,
+                                current_x - sx as f32 + 4.0,
+                                current_y - sy as f32 + 3.0,
+                                layout_box.size.width.max(8.0) - 8.0,
+                                font,
+                                inherited.font_size.min(14.0),
+                                inherited.line_height,
+                                (60, 60, 60),
+                                surface,
+                                width,
+                                height,
+                                damage_rects,
+                            );
+                        }
+                    }
+                }
+
+                if let Some((bw, bc)) = border {
                     let bw = bw.max(1.0) as u32;
                     let x_start = ((current_x as i32) - sx).max(0) as u32;
                     let y_start = ((current_y as i32) - sy).max(0) as u32;
