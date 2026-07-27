@@ -169,11 +169,31 @@ impl Engine {
                 this.src = ''; this.complete = false;
                 this.addEventListener = function () {};
             };
+            var __mkStorage = function () {
+                var m = {};
+                return {
+                    getItem: function (k) { return Object.prototype.hasOwnProperty.call(m, k) ? m[k] : null; },
+                    setItem: function (k, v) { m[k] = String(v); },
+                    removeItem: function (k) { delete m[k]; },
+                    clear: function () { m = {}; },
+                    key: function (i) { return Object.keys(m)[i] || null; },
+                    get length() { return Object.keys(m).length; },
+                };
+            };
+            globalThis.localStorage = __mkStorage();
+            globalThis.sessionStorage = __mkStorage();
             globalThis.navigator = {
                 userAgent: 'UnaOS Aether/0.1.0',
                 language: 'en-US', languages: ['en-US'],
                 platform: 'UnaOS', cookieEnabled: false,
+                sendBeacon: function () { return true; },
             };
+            globalThis.requestIdleCallback = function (cb) {
+                return setTimeout(function () {
+                    cb({ didTimeout: false, timeRemaining: function () { return 50; } });
+                }, 0);
+            };
+            globalThis.cancelIdleCallback = function () {};
             "#,
         ));
         Self::setup_console(&mut context);
@@ -413,6 +433,34 @@ impl Engine {
             }
             Ok(JsValue::null())
         });
+        let get_parent_element = Self::native(context, |this, _args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::null()) };
+            let mut cur = n.parent();
+            while let Some(p) = cur {
+                if p.as_element().is_some() {
+                    return Ok(Self::wrap_node(ctx, p));
+                }
+                cur = p.parent();
+            }
+            Ok(JsValue::null())
+        });
+        let get_first_any_child = Self::native(context, |this, _args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::null()) };
+            match n.first_child() {
+                Some(c) => Ok(Self::wrap_node(ctx, c)),
+                None => Ok(JsValue::null()),
+            }
+        });
+        let get_child_nodes = Self::native(context, |this, _args, ctx| {
+            let arr = boa_engine::object::builtins::JsArray::new(ctx);
+            if let Some(n) = Self::this_node(this, ctx) {
+                for child in n.children().take(512) {
+                    let wrapped = Self::wrap_node(ctx, child);
+                    let _ = arr.push(wrapped, ctx);
+                }
+            }
+            Ok(arr.into())
+        });
         let get_tag = Self::native(context, |this, _args, ctx| {
             let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
             let tag = n
@@ -476,6 +524,14 @@ impl Engine {
                     Ok(JsValue::undefined())
                 }),
                 boa_engine::string::JsString::from("createElement"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|_, args, ctx| {
+                    let text = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                    Ok(Self::wrap_node(ctx, kuchiki::NodeRef::new_text(text)))
+                }),
+                boa_engine::string::JsString::from("createTextNode"),
                 1,
             )
             .function(
@@ -552,6 +608,59 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    // Removal is index-tombstoning: registrations are matched
+                    // positionally with the JS __handlers array, so the pair
+                    // (node, event) just stops matching.
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let event = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                    DOM_STATE.with(|s| {
+                        for (nid, ev) in s.borrow_mut().handlers.iter_mut() {
+                            if *nid == id && *ev == event {
+                                ev.clear(); // never matches a real event name again
+                            }
+                        }
+                    });
+                    Ok(JsValue::undefined())
+                }),
+                boa_engine::string::JsString::from("removeEventListener"),
+                2,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let name = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                    let has = DOM_STATE.with(|s| s.borrow().get_node(id))
+                        .and_then(|n| n.as_element().map(|el| el.attributes.borrow().get(name.as_str()).is_some()))
+                        .unwrap_or(false);
+                    Ok(JsValue::from(has))
+                }),
+                boa_engine::string::JsString::from("hasAttribute"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|_, _, _| Ok(JsValue::undefined())),
+                boa_engine::string::JsString::from("focus"),
+                0,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|_, _, _| Ok(JsValue::undefined())),
+                boa_engine::string::JsString::from("blur"),
+                0,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, _args, ctx| {
+                    // click(): dispatch to registered handlers.
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
+                        dispatch_event(ctx, &n, "click");
+                    }
+                    Ok(JsValue::undefined())
+                }),
+                boa_engine::string::JsString::from("click"),
+                0,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
                     let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
                     let selector = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
                     let arr = boa_engine::object::builtins::JsArray::new(ctx);
@@ -622,6 +731,18 @@ impl Engine {
             .accessor(
                 boa_engine::string::JsString::from("parentNode"),
                 Some(get_parent), None, Attribute::all(),
+            )
+            .accessor(
+                boa_engine::string::JsString::from("parentElement"),
+                Some(get_parent_element), None, Attribute::all(),
+            )
+            .accessor(
+                boa_engine::string::JsString::from("firstChild"),
+                Some(get_first_any_child), None, Attribute::all(),
+            )
+            .accessor(
+                boa_engine::string::JsString::from("childNodes"),
+                Some(get_child_nodes), None, Attribute::all(),
             )
             .accessor(
                 boa_engine::string::JsString::from("children"),
@@ -769,6 +890,54 @@ impl Engine {
         let _ = context.register_global_property(boa_engine::string::JsString::from("document"), js_doc, Attribute::all());
     }
     
+    /// Points window.location (and document.cookie's empty jar) at the
+    /// loaded page. Plain data properties — enough for the hostname/
+    /// pathname branching real scripts do at boot.
+    pub fn set_location(&mut self, url: &str) {
+        let parsed = url::Url::parse(url).ok();
+        let host = parsed.as_ref().and_then(|u| u.host_str()).unwrap_or("");
+        let path = parsed.as_ref().map(|u| u.path()).unwrap_or("/");
+        let protocol = parsed
+            .as_ref()
+            .map(|u| format!("{}:", u.scheme()))
+            .unwrap_or_else(|| "https:".to_string());
+        let search = parsed
+            .as_ref()
+            .and_then(|u| u.query())
+            .map(|q| format!("?{}", q))
+            .unwrap_or_default();
+        let origin = parsed
+            .as_ref()
+            .map(|u| format!("{}//{}", protocol, u.host_str().unwrap_or("")))
+            .unwrap_or_default();
+        let esc = |s: &str| s.replace('\\', "").replace('\'', "");
+        let script = format!(
+            r#"
+            if (typeof location !== 'undefined' && location) {{
+                location.href = '{href}';
+                location.hostname = '{host}';
+                location.host = '{host}';
+                location.pathname = '{path}';
+                location.protocol = '{protocol}';
+                location.search = '{search}';
+                location.hash = '';
+                location.origin = '{origin}';
+                if (typeof window !== 'undefined' && window) {{ window.location = location; }}
+            }}
+            if (typeof document !== 'undefined' && document && document.cookie === undefined) {{
+                document.cookie = '';
+            }}
+            "#,
+            href = esc(url),
+            host = esc(host),
+            path = esc(path),
+            protocol = esc(&protocol),
+            search = esc(&search),
+            origin = esc(&origin),
+        );
+        let _ = self.execute(&script);
+    }
+
     pub fn execute(&mut self, script: &str) -> JsResult<JsValue> {
         use boa_engine::Source;
         self.context.eval(Source::from_bytes(script))

@@ -512,12 +512,24 @@ impl AetherEngine {
         }
         
         let mut js_engine = js::Engine::new(document.clone());
+        js_engine.set_location(url);
+        // UNAOS_JSDEBUG=1: trace each script's index/head/outcome to stderr
+        // (which script kills a page's boot is otherwise invisible).
+        let js_debug = std::env::var("UNAOS_JSDEBUG").is_ok();
         match scripts_override {
             Some(scripts) => {
-                for text in scripts {
-                    if let Err(e) = js_engine.execute(text) {
-                        let msg = e.to_string();
-                        ledger::record_js(&format!("script-error:{}", &msg[..msg.len().min(64)]));
+                for (i, text) in scripts.iter().enumerate() {
+                    let head: String = text.chars().take(60).filter(|c| !c.is_control()).collect();
+                    match js_engine.execute(text) {
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if js_debug {
+                                eprintln!("[jsdebug] script {} ERR: {} | head: {}", i, &msg[..msg.len().min(120)], head);
+                            }
+                            ledger::record_js(&format!("script-error:{}", &msg[..msg.len().min(64)]));
+                        }
+                        Ok(_) if js_debug => eprintln!("[jsdebug] script {} ok | head: {}", i, head),
+                        Ok(_) => {}
                     }
                 }
             }
