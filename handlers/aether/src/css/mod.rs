@@ -223,14 +223,53 @@ fn clip(v: &str) -> &str {
     &v[..v.len().min(24)]
 }
 
+/// One applicable rule: a single compiled selector with its declarations.
+struct Rule {
+    selector: kuchiki::Selector,
+    style: std::rc::Rc<SpecifiedStyle>,
+}
+
 pub fn apply_css(layout_tree: &mut LayoutTree, css: &str) {
-    apply_stylesheet(layout_tree, css, 0);
+    apply_stylesheets(layout_tree, std::slice::from_ref(&css.to_string()));
+}
+
+/// Applies a set of stylesheets as ONE cascade — rules from every sheet
+/// sort together by (specificity, source order), so a later sheet's less
+/// specific rule no longer beats an earlier sheet's more specific one.
+pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
+    let mut rules = Vec::new();
+    for css in sheets {
+        collect_rules(css, 0, &mut rules);
+    }
+    rules.sort_by(|a, b| a.selector.specificity().cmp(&b.selector.specificity()));
+
+    for rule in &rules {
+        let style = &rule.style;
+        for (node_id, dom_node) in &layout_tree.node_map {
+            let Some(el_ref) = dom_node.clone().into_element_ref() else { continue };
+            if !rule.selector.matches(&el_ref) {
+                continue;
+            }
+            if let Ok(node_style_ref) = layout_tree.taffy.style(*node_id) {
+                let mut node_style = node_style_ref.clone();
+                style.fold_into(&mut node_style);
+                let _ = layout_tree.taffy.set_style(*node_id, node_style);
+            }
+            let entry = layout_tree.paint_map.entry(*node_id).or_default();
+            if style.paint.background.is_some() { entry.background = style.paint.background; }
+            if style.paint.color.is_some() { entry.color = style.paint.color; }
+            if style.paint.font_size.is_some() { entry.font_size = style.paint.font_size; }
+            if style.paint.bold.is_some() { entry.bold = style.paint.bold; }
+            if style.paint.border.is_some() { entry.border = style.paint.border; }
+            if style.paint.line_height.is_some() { entry.line_height = style.paint.line_height; }
+        }
+    }
 
     // set_style only marks nodes dirty; re-lay out with text measurement.
     crate::layout::remeasure(layout_tree);
 }
 
-fn apply_stylesheet(layout_tree: &mut LayoutTree, css: &str, depth: u8) {
+fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>) {
     if depth > 4 {
         return; // pathological nesting guard
     }
@@ -275,13 +314,13 @@ fn apply_stylesheet(layout_tree: &mut LayoutTree, css: &str, depth: u8) {
                 "media" => {
                     let condition = prelude.trim_start_matches("@media").trim();
                     if media_matches(condition) {
-                        apply_stylesheet(layout_tree, &body, depth + 1);
+                        collect_rules(&body, depth + 1, rules);
                     }
                 }
                 "supports" => {
                     let condition = prelude.trim_start_matches("@supports").trim();
                     if supports_matches(condition) {
-                        apply_stylesheet(layout_tree, &body, depth + 1);
+                        collect_rules(&body, depth + 1, rules);
                     }
                 }
                 other => crate::ledger::record_css(&format!("at-rule:@{}", other)),
@@ -298,26 +337,9 @@ fn apply_stylesheet(layout_tree: &mut LayoutTree, css: &str, depth: u8) {
             }
         };
 
-        let style = parse_declaration_block(&body);
-
-        // Apply only the specified declarations to matching nodes.
-        for (node_id, dom_node) in &layout_tree.node_map {
-            let Some(el_ref) = dom_node.clone().into_element_ref() else { continue };
-            if !selectors.matches(&el_ref) {
-                continue;
-            }
-            if let Ok(node_style_ref) = layout_tree.taffy.style(*node_id) {
-                let mut node_style = node_style_ref.clone();
-                style.fold_into(&mut node_style);
-                let _ = layout_tree.taffy.set_style(*node_id, node_style);
-            }
-            let entry = layout_tree.paint_map.entry(*node_id).or_default();
-            if style.paint.background.is_some() { entry.background = style.paint.background; }
-            if style.paint.color.is_some() { entry.color = style.paint.color; }
-            if style.paint.font_size.is_some() { entry.font_size = style.paint.font_size; }
-            if style.paint.bold.is_some() { entry.bold = style.paint.bold; }
-            if style.paint.border.is_some() { entry.border = style.paint.border; }
-            if style.paint.line_height.is_some() { entry.line_height = style.paint.line_height; }
+        let style = std::rc::Rc::new(parse_declaration_block(&body));
+        for selector in selectors.0 {
+            rules.push(Rule { selector, style: style.clone() });
         }
     }
 }

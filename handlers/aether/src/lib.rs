@@ -64,9 +64,7 @@ impl AetherEngine {
     pub fn relayout(&mut self) {
         let Some(document) = self.document.clone() else { return };
         let mut layout_tree = layout::compute_layout(&document);
-        for sheet in &self.stylesheets {
-            css::apply_css(&mut layout_tree, sheet);
-        }
+        css::apply_stylesheets(&mut layout_tree, &self.stylesheets);
         self.layout_tree = Some(layout_tree);
         self.needs_repaint = true;
         self.damage_rects.push((0, 0, self.width, self.height));
@@ -324,9 +322,7 @@ impl AetherEngine {
         sheets.extend(external_css.iter().cloned());
 
         let mut layout_tree = layout::compute_layout(&document);
-        for sheet in &sheets {
-            css::apply_css(&mut layout_tree, sheet);
-        }
+        css::apply_stylesheets(&mut layout_tree, &sheets);
         self.stylesheets = sheets;
         
         self.document = Some(document);
