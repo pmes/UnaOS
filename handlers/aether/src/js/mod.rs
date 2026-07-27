@@ -169,8 +169,30 @@ impl Engine {
                 1,
             )
             .function(
-                NativeFunction::from_fn_ptr(|_, _, _| {
-                    crate::ledger::record_js("Element.innerHTML");
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let node = DOM_STATE.with(|s| s.borrow().get_node(id));
+                    let Some(n) = node else { return Ok(JsValue::undefined()) };
+                    if args.is_empty() {
+                        // Getter: serialize children markup.
+                        let html: String = n.children().map(|c| c.to_string()).collect();
+                        return Ok(JsValue::new(boa_engine::string::JsString::from(html)));
+                    }
+                    let html = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                    for child in n.children() {
+                        child.detach();
+                    }
+                    // Parse as a document and graft the body's children.
+                    let frag = kuchiki::parse_html().one(html);
+                    if let Ok(mut bodies) = frag.select("body") {
+                        if let Some(body) = bodies.next() {
+                            let children: Vec<_> = body.as_node().children().collect();
+                            for child in children {
+                                child.detach();
+                                n.append(child);
+                            }
+                        }
+                    }
                     Ok(JsValue::undefined())
                 }),
                 boa_engine::string::JsString::from("innerHTML"),
@@ -197,12 +219,35 @@ impl Engine {
                 1,
             )
             .function(
-                NativeFunction::from_fn_ptr(|_, _, _| {
-                    crate::ledger::record_js("Element.setAttribute");
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let name = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                    let value = args.get(1).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                    if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
+                        if let Some(el) = n.as_element() {
+                            el.attributes.borrow_mut().insert(name.as_str(), value);
+                        }
+                    }
                     Ok(JsValue::undefined())
                 }),
                 boa_engine::string::JsString::from("setAttribute"),
                 2,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let name = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                    if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
+                        if let Some(el) = n.as_element() {
+                            if let Some(v) = el.attributes.borrow().get(name.as_str()) {
+                                return Ok(JsValue::new(boa_engine::string::JsString::from(v)));
+                            }
+                        }
+                    }
+                    Ok(JsValue::null())
+                }),
+                boa_engine::string::JsString::from("getAttribute"),
+                1,
             )
             .function(
                 NativeFunction::from_fn_ptr(|_, _, _| {

@@ -258,8 +258,34 @@ mod tests {
         use crate::ledger::ApiCategory;
         assert!(snap.contains(ApiCategory::Css, "property:filter"), "unhandled CSS property must be recorded");
         assert!(snap.contains(ApiCategory::Css, "display:grid"), "unhandled display value must be recorded");
-        assert!(snap.contains(ApiCategory::Js, "Element.setAttribute"), "no-op setAttribute must be recorded");
         assert!(snap.contains(ApiCategory::Js, "EventTarget.addEventListener"), "no-op addEventListener must be recorded");
+    }
+
+    #[test]
+    fn test_js_dom_mutations_are_real() {
+        let html = r#"<html><body>
+            <div id="t">old</div>
+            <script>
+                var el = document.getElementById("t");
+                el.setAttribute("data-x", "42");
+                el.innerHTML("<p>new <b>content</b></p>");
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://jsdom", html, true);
+
+        let doc = engine.document.as_ref().unwrap();
+        let el = doc.select("#t").unwrap().next().expect("#t present");
+        assert_eq!(
+            el.attributes.borrow().get("data-x"),
+            Some("42"),
+            "setAttribute must mutate the DOM"
+        );
+        assert!(
+            doc.select("#t b").unwrap().next().is_some(),
+            "innerHTML must replace children with parsed markup"
+        );
+        assert_eq!(el.as_node().text_contents().trim(), "new content");
     }
 
     #[tokio::test]

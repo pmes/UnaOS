@@ -211,6 +211,12 @@ fn apply_stylesheet(layout_tree: &mut LayoutTree, css: &str, depth: u8) {
                         apply_stylesheet(layout_tree, &body, depth + 1);
                     }
                 }
+                "supports" => {
+                    let condition = prelude.trim_start_matches("@supports").trim();
+                    if supports_matches(condition) {
+                        apply_stylesheet(layout_tree, &body, depth + 1);
+                    }
+                }
                 other => crate::ledger::record_css(&format!("at-rule:@{}", other)),
             }
             continue;
@@ -295,6 +301,42 @@ fn media_matches(condition: &str) -> bool {
             }
         })
     })
+}
+
+/// Properties this engine genuinely implements (the honest support set
+/// for @supports; extend when apply_declaration grows an arm).
+fn property_supported(prop: &str) -> bool {
+    matches!(
+        prop,
+        "display" | "flex-direction" | "width" | "height" | "padding" | "margin"
+            | "padding-top" | "padding-right" | "padding-bottom" | "padding-left"
+            | "margin-top" | "margin-right" | "margin-bottom" | "margin-left"
+            | "position" | "top" | "left" | "right" | "bottom" | "text-align"
+            | "background-color" | "background" | "color" | "font-size" | "font-weight"
+    )
+}
+
+/// Evaluates an @supports condition against our real capability set.
+/// `not` inverts; and/or compose; unknown syntax evaluates false.
+fn supports_matches(condition: &str) -> bool {
+    let c = condition.trim();
+    if let Some(rest) = c.strip_prefix("not ") {
+        return !supports_matches(rest);
+    }
+    if c.contains(" or ") {
+        return c.split(" or ").any(supports_matches);
+    }
+    if c.contains(" and ") {
+        return c.split(" and ").all(supports_matches);
+    }
+    let inner = c.trim().trim_start_matches('(').trim_end_matches(')').trim();
+    match inner.split_once(':') {
+        Some((prop, _value)) => property_supported(prop.trim()),
+        None => {
+            crate::ledger::record_css(&format!("supports-condition:{}", clip(inner)));
+            false
+        }
+    }
 }
 
 /// Parses a CSS color from a string: named, #rgb/#rrggbb, rgb()/rgba().
