@@ -195,7 +195,7 @@ mod tests {
         for (node_id, dom_node) in &layout_tree.node_map {
             let Some(el) = dom_node.as_element() else { continue };
             let attrs = el.attributes.borrow();
-            let paint = layout_tree.paint_map.get(node_id).copied().unwrap_or_default();
+            let paint = layout_tree.paint_map.get(node_id).cloned().unwrap_or_default();
             if attrs.get("class") == Some("hero other") {
                 hero_bg = paint.background;
             } else if attrs.get("id") == Some("lead") {
@@ -215,7 +215,7 @@ mod tests {
         for (node_id, dom_node) in &layout_tree.node_map {
             let Some(el) = dom_node.as_element() else { continue };
             if el.attributes.borrow().get("class") == Some("hero other") {
-                let paint = layout_tree.paint_map.get(node_id).copied().unwrap_or_default();
+                let paint = layout_tree.paint_map.get(node_id).cloned().unwrap_or_default();
                 assert_eq!(paint.color, Some((0, 0, 128)), "descendant selector must match");
                 assert_eq!(paint.font_size, Some(30.0), "compound selector must match");
             }
@@ -405,5 +405,101 @@ mod tests {
         );
         let ledger_text = std::fs::read_to_string(&ledger_path).unwrap();
         assert!(ledger_text.contains("Aether M5 API Ledger"), "ledger dump must be written");
+    }
+
+    /// !important is a real cascade tier: it beats higher specificity and
+    /// inline styles; inline !important beats sheet !important.
+    #[test]
+    fn test_important_cascade_tier() {
+        let html = r#"<html><body>
+            <p id="lead" style="color: purple">a</p>
+            <p id="second" style="color: teal !important">b</p>
+        </body></html>"#;
+        let document = dom::parse_html(html);
+        let mut layout_tree = layout::compute_layout(&document);
+        css::apply_css(&mut layout_tree, r#"
+            p { color: red !important; font-size: 20px !important; }
+            #lead { color: blue; font-size: 30px; }
+        "#);
+        for (node_id, dom_node) in &layout_tree.node_map {
+            let Some(el) = dom_node.as_element() else { continue };
+            let paint = layout_tree.paint_map.get(node_id).cloned().unwrap_or_default();
+            match el.attributes.borrow().get("id") {
+                Some("lead") => {
+                    assert_eq!(paint.color, Some((255, 0, 0)),
+                        "sheet !important must beat higher specificity AND inline");
+                    assert_eq!(paint.font_size, Some(20.0));
+                }
+                Some("second") => {
+                    assert_eq!(paint.color, Some((0, 128, 128)),
+                        "inline !important must beat sheet !important");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Inline style="" beats normal sheet rules of any specificity.
+    #[test]
+    fn test_inline_beats_normal_rules() {
+        let html = r#"<html><body><p id="x" style="color: green">a</p></body></html>"#;
+        let document = dom::parse_html(html);
+        let mut layout_tree = layout::compute_layout(&document);
+        css::apply_css(&mut layout_tree, "#x { color: red; }");
+        let paint = layout_tree.node_map.iter()
+            .find(|(_, n)| n.as_element().map_or(false, |e| e.attributes.borrow().get("id") == Some("x")))
+            .map(|(id, _)| layout_tree.paint_map.get(id).cloned().unwrap_or_default())
+            .unwrap();
+        assert_eq!(paint.color, Some((0, 128, 0)), "inline must beat normal id rule");
+    }
+
+    /// position:absolute with no insets keeps its static (in-flow) position
+    /// instead of pinning to the parent origin over its siblings.
+    #[test]
+    fn test_absolute_without_insets_stays_in_flow() {
+        let html = r#"<html><body>
+            <div id="a">first</div>
+            <div id="b">second</div>
+            <div id="c">third</div>
+        </body></html>"#;
+        let document = dom::parse_html(html);
+        let mut layout_tree = layout::compute_layout(&document);
+        css::apply_css(&mut layout_tree, r#"
+            #b { position: absolute; }
+            #c { position: absolute; top: 5px; left: 5px; }
+        "#);
+        for (node_id, dom_node) in &layout_tree.node_map {
+            let Some(el) = dom_node.as_element() else { continue };
+            let s = layout_tree.taffy.style(*node_id).unwrap();
+            match el.attributes.borrow().get("id") {
+                Some("b") => assert_eq!(s.position, taffy::style::Position::Relative,
+                    "no insets → static-position fallback"),
+                Some("c") => assert_eq!(s.position, taffy::style::Position::Absolute,
+                    "insets specified → genuinely absolute"),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_background_image_parse_and_url_collection() {
+        assert_eq!(css::extract_css_url("url(/img/hero.png)"), Some("/img/hero.png".into()));
+        assert_eq!(css::extract_css_url(r#"url("a.jpg") no-repeat center"#), Some("a.jpg".into()));
+        assert_eq!(css::extract_css_url("linear-gradient(red, blue)"), None);
+
+        let html = r#"<html><body><div style="background-image: url('/hero.png')">x</div></body></html>"#;
+        let document = dom::parse_html(html);
+        let layout_tree = layout::compute_layout(&document);
+        let has_bg = layout_tree.paint_map.values().any(|p| p.bg_image.as_deref() == Some("/hero.png"));
+        assert!(has_bg, "inline background-image must reach the paint map");
+
+        let mut urls = Vec::new();
+        crate::net::collect_css_image_urls(
+            "https://example.com/page",
+            &[".hero { background: #333 url(/img/bg.jpg) }", "body { background-image: url(x.svg) }"],
+            &mut urls,
+        );
+        assert_eq!(urls, vec!["https://example.com/img/bg.jpg".to_string()],
+            "raster css urls resolve; svg skipped");
     }
 }

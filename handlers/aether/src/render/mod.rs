@@ -225,7 +225,7 @@ pub fn render_frame(
         let mut inherited = inherited;
 
         if let Some(dom_node) = layout.node_map.get(&node_id) {
-            let spec = layout.paint_map.get(&node_id).copied().unwrap_or_default();
+            let spec = layout.paint_map.get(&node_id).cloned().unwrap_or_default();
 
             if let Some(el) = dom_node.as_element() {
                 let tag = el.name.local.as_ref();
@@ -261,6 +261,35 @@ pub fn render_frame(
                         for x in x_start..end_x {
                             if in_damage(x, y, damage_rects) {
                                 put_px(surface, width, x, y, bg);
+                            }
+                        }
+                    }
+                }
+
+                // background-image paints over the color, under content,
+                // scaled to cover the box (aspect-preserving center crop).
+                if let Some(img) = spec.bg_image.as_deref().and_then(crate::images::get) {
+                    let x_start = ((current_x as i32) - sx).max(0) as u32;
+                    let y_start = ((current_y as i32) - sy).max(0) as u32;
+                    let bw = layout_box.size.width.max(1.0);
+                    let bh = layout_box.size.height.max(1.0);
+                    let end_x = x_start.saturating_add(bw as u32).min(width);
+                    let end_y = y_start.saturating_add(bh as u32).min(height);
+                    let (iw, ih) = (img.width() as f32, img.height() as f32);
+                    let scale = (bw / iw).max(bh / ih);
+                    let (crop_w, crop_h) = (bw / scale, bh / scale);
+                    let (off_u, off_v) = ((iw - crop_w) / 2.0, (ih - crop_h) / 2.0);
+                    for y in y_start..end_y {
+                        for x in x_start..end_x {
+                            if !in_damage(x, y, damage_rects) {
+                                continue;
+                            }
+                            let u = (off_u + (x - x_start) as f32 / bw * crop_w) as u32;
+                            let v = (off_v + (y - y_start) as f32 / bh * crop_h) as u32;
+                            let px = img.get_pixel(u.min(img.width() - 1), v.min(img.height() - 1));
+                            let [r, g, b, a] = px.0;
+                            if a > 0 {
+                                blend_px(surface, width, x, y, (r, g, b), a);
                             }
                         }
                     }

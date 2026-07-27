@@ -141,6 +141,35 @@ pub fn collect_image_urls(base_url: &str, html: &str) -> Vec<String> {
     out
 }
 
+/// Collects absolute raster `url(...)` references from CSS text (external
+/// sheets, <style> blocks, style="" attrs — callers pass raw text; the scan
+/// is textual so it needs no CSS object model). Capped like images.
+pub fn collect_css_image_urls(base_url: &str, texts: &[&str], out: &mut Vec<String>) {
+    let raster = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"];
+    for text in texts {
+        let mut rest: &str = text;
+        while let Some(pos) = rest.find("url(") {
+            rest = &rest[pos + 4..];
+            let Some(end) = rest.find(')') else { break };
+            let inner = rest[..end].trim().trim_matches(|c| c == '"' || c == '\'').trim();
+            rest = &rest[end..];
+            let path_end = inner.find(['?', '#']).unwrap_or(inner.len());
+            let is_raster = raster.iter().any(|ext| inner[..path_end].to_ascii_lowercase().ends_with(ext));
+            if !is_raster {
+                continue;
+            }
+            let abs = crate::images::resolve(base_url, inner);
+            if (abs.starts_with("http://") || abs.starts_with("https://")) && !out.contains(&abs) {
+                out.push(abs);
+            }
+            if out.len() >= 50 {
+                crate::ledger::record_css("css-image-fetch-cap-reached");
+                return;
+            }
+        }
+    }
+}
+
 /// Fetches raw bytes (images etc), same limits as fetch_document.
 pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
     let client = Client::builder().user_agent("UnaOS Aether/0.1.0").build()?;
@@ -171,8 +200,16 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
             Err(_) => crate::ledger::record_css(&format!("stylesheet-fetch-failed:{}", sheet_url)),
         }
     }
+    // <img> srcs plus CSS background images (scanned from the html — which
+    // carries <style> blocks and style="" attrs — and every fetched sheet).
+    // CSS urls resolve against the page base; a sheet-relative path on
+    // another host will miss and ledger as img-missing (honest gap).
+    let mut wanted = collect_image_urls(&base, &html);
+    let mut css_texts: Vec<&str> = vec![&html];
+    css_texts.extend(sheets.iter().map(|s| s.as_str()));
+    collect_css_image_urls(&base, &css_texts, &mut wanted);
     let mut images = Vec::new();
-    for img_url in collect_image_urls(&base, &html) {
+    for img_url in wanted {
         match fetch_bytes(&img_url).await {
             Ok(bytes) => match image::load_from_memory(&bytes) {
                 Ok(img) => images.push((img_url, img.to_rgba8())),

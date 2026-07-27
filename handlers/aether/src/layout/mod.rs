@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 /// Specified paint properties for one box. `None` = not specified here;
 /// color and font-size inherit down the tree at render time.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PaintStyle {
     pub background: Option<(u8, u8, u8)>,
     pub color: Option<(u8, u8, u8)>,
@@ -15,6 +15,8 @@ pub struct PaintStyle {
     /// Resolved line height: multiplier of font size (px values are
     /// converted at parse time against the 16px base — approximation).
     pub line_height: Option<f32>,
+    /// background-image url (as written; resolved via images::get at paint).
+    pub bg_image: Option<String>,
 }
 
 pub struct LayoutTree {
@@ -388,5 +390,5 @@ fn measure_text(
 fn apply_inline_style(inline: &str, style: &mut Style, paint: &mut PaintStyle) {
     let spec = crate::css::parse_declaration_block(inline);
     spec.fold_into(style);
-    *paint = spec.paint;
+    *paint = spec.paint.clone();
 }

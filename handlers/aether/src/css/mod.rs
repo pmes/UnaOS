@@ -135,8 +135,39 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             "left" | "start" | "justify" => style.justify = Some(taffy::style::JustifyContent::START),
             other => crate::ledger::record_css(&format!("text-align:{}", other)),
         },
-        "background-color" | "background" => {
+        "background-color" => {
             if !is_neutral_keyword(value) {
+                match parse_color_str(value) {
+                    Some(c) => style.paint.background = Some(c),
+                    None => crate::ledger::record_css(&format!("background-value:{}", clip(value))),
+                }
+            }
+        }
+        "background-image" => match extract_css_url(value) {
+            Some(u) => style.paint.bg_image = Some(u),
+            None => {
+                if !is_neutral_keyword(value) {
+                    crate::ledger::record_css(&format!("background-image-value:{}", clip(value)));
+                }
+            }
+        },
+        "background" => {
+            // Shorthand: a color and/or an image url; other components
+            // (position/repeat/size) are ignored — cover paint below.
+            if let Some(u) = extract_css_url(value) {
+                style.paint.bg_image = Some(u);
+            }
+            let mut got_color = false;
+            for part in value.split_whitespace() {
+                if part.starts_with("url(") { continue; }
+                if let Some(c) = parse_color_str(part) {
+                    style.paint.background = Some(c);
+                    got_color = true;
+                    break;
+                }
+            }
+            // Function colors with spaces (rgb(1, 2, 3)) survive as whole-value.
+            if !got_color && !is_neutral_keyword(value) && style.paint.bg_image.is_none() {
                 match parse_color_str(value) {
                     Some(c) => style.paint.background = Some(c),
                     None => crate::ledger::record_css(&format!("background-value:{}", clip(value))),
@@ -216,51 +247,141 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
     }
 }
 
+/// Extracts the url from a `url(...)` component (quotes stripped). Returns
+/// None for gradients/none/values without a url() component.
+pub(crate) fn extract_css_url(value: &str) -> Option<String> {
+    let start = value.find("url(")?;
+    let rest = &value[start + 4..];
+    let end = rest.find(')')?;
+    let inner = rest[..end].trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    if inner.is_empty() || inner.starts_with("data:image/svg") {
+        return None;
+    }
+    Some(inner.to_string())
+}
+
 /// Truncates a value for a stable, bounded ledger key.
 fn clip(v: &str) -> &str {
     &v[..v.len().min(24)]
 }
 
 /// One applicable rule: a single compiled selector with its declarations.
+/// A rule with `!important` declarations is split in two — the important
+/// half carries `important: true` and applies in a later cascade tier.
 struct Rule {
     selector: kuchiki::Selector,
     style: std::rc::Rc<SpecifiedStyle>,
+    important: bool,
 }
 
 pub fn apply_css(layout_tree: &mut LayoutTree, css: &str) {
     apply_stylesheets(layout_tree, std::slice::from_ref(&css.to_string()));
 }
 
+/// Applies one specified-declaration set to one node (layout fold + paint
+/// merge). Records absolute-positioning facts for the static-position
+/// fixup that runs after the cascade.
+fn apply_spec_to_node(
+    layout_tree: &mut LayoutTree,
+    node_id: taffy::NodeId,
+    style: &SpecifiedStyle,
+    abs_nodes: &mut std::collections::HashSet<taffy::NodeId>,
+    inset_nodes: &mut std::collections::HashSet<taffy::NodeId>,
+) {
+    if let Ok(node_style_ref) = layout_tree.taffy.style(node_id) {
+        let mut node_style = node_style_ref.clone();
+        style.fold_into(&mut node_style);
+        let _ = layout_tree.taffy.set_style(node_id, node_style);
+    }
+    match style.position {
+        Some(taffy::style::Position::Absolute) => { abs_nodes.insert(node_id); }
+        Some(taffy::style::Position::Relative) => { abs_nodes.remove(&node_id); }
+        None => {}
+    }
+    if style.inset_top.is_some() || style.inset_left.is_some()
+        || style.inset_right.is_some() || style.inset_bottom.is_some()
+    {
+        inset_nodes.insert(node_id);
+    }
+    let entry = layout_tree.paint_map.entry(node_id).or_default();
+    if style.paint.background.is_some() { entry.background = style.paint.background; }
+    if style.paint.color.is_some() { entry.color = style.paint.color; }
+    if style.paint.font_size.is_some() { entry.font_size = style.paint.font_size; }
+    if style.paint.bold.is_some() { entry.bold = style.paint.bold; }
+    if style.paint.border.is_some() { entry.border = style.paint.border; }
+    if style.paint.line_height.is_some() { entry.line_height = style.paint.line_height; }
+    if style.paint.bg_image.is_some() { entry.bg_image = style.paint.bg_image.clone(); }
+}
+
 /// Applies a set of stylesheets as ONE cascade — rules from every sheet
-/// sort together by (specificity, source order), so a later sheet's less
-/// specific rule no longer beats an earlier sheet's more specific one.
+/// sort together by (importance, specificity, source order). Inline
+/// `style=""` declarations slot in at their CSS priority: above all
+/// normal rules, below `!important` rules; inline `!important` wins all.
 pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     let vw = layout_tree.viewport.0;
     let mut rules = Vec::new();
     for css in sheets {
         collect_rules(css, 0, &mut rules, vw);
     }
-    rules.sort_by(|a, b| a.selector.specificity().cmp(&b.selector.specificity()));
+    rules.sort_by(|a, b| {
+        a.important
+            .cmp(&b.important)
+            .then(a.selector.specificity().cmp(&b.selector.specificity()))
+    });
 
-    for rule in &rules {
-        let style = &rule.style;
-        for (node_id, dom_node) in &layout_tree.node_map {
-            let Some(el_ref) = dom_node.clone().into_element_ref() else { continue };
-            if !rule.selector.matches(&el_ref) {
-                continue;
+    // Inline style="" tiers, parsed once per node.
+    let node_ids: Vec<taffy::NodeId> = layout_tree.node_map.keys().copied().collect();
+    let mut inline_tiers: Vec<(taffy::NodeId, SpecifiedStyle, SpecifiedStyle, bool)> = Vec::new();
+    for node_id in &node_ids {
+        let Some(dom_node) = layout_tree.node_map.get(node_id) else { continue };
+        let Some(el) = dom_node.as_element() else { continue };
+        let Some(inline) = el.attributes.borrow().get("style").map(|s| s.to_string()) else { continue };
+        let (normal, important, has_important) = parse_declaration_block_tiers(&inline);
+        inline_tiers.push((*node_id, normal, important, has_important));
+    }
+
+    let mut abs_nodes = std::collections::HashSet::new();
+    let mut inset_nodes = std::collections::HashSet::new();
+
+    let mut apply_rules = |layout_tree: &mut LayoutTree,
+                           rules: &[&Rule],
+                           abs: &mut std::collections::HashSet<taffy::NodeId>,
+                           ins: &mut std::collections::HashSet<taffy::NodeId>| {
+        for rule in rules {
+            for node_id in &node_ids {
+                let Some(dom_node) = layout_tree.node_map.get(node_id) else { continue };
+                let Some(el_ref) = dom_node.clone().into_element_ref() else { continue };
+                if !rule.selector.matches(&el_ref) {
+                    continue;
+                }
+                apply_spec_to_node(layout_tree, *node_id, &rule.style, abs, ins);
             }
-            if let Ok(node_style_ref) = layout_tree.taffy.style(*node_id) {
-                let mut node_style = node_style_ref.clone();
-                style.fold_into(&mut node_style);
-                let _ = layout_tree.taffy.set_style(*node_id, node_style);
-            }
-            let entry = layout_tree.paint_map.entry(*node_id).or_default();
-            if style.paint.background.is_some() { entry.background = style.paint.background; }
-            if style.paint.color.is_some() { entry.color = style.paint.color; }
-            if style.paint.font_size.is_some() { entry.font_size = style.paint.font_size; }
-            if style.paint.bold.is_some() { entry.bold = style.paint.bold; }
-            if style.paint.border.is_some() { entry.border = style.paint.border; }
-            if style.paint.line_height.is_some() { entry.line_height = style.paint.line_height; }
+        }
+    };
+
+    let normal: Vec<&Rule> = rules.iter().filter(|r| !r.important).collect();
+    let important: Vec<&Rule> = rules.iter().filter(|r| r.important).collect();
+
+    apply_rules(layout_tree, &normal, &mut abs_nodes, &mut inset_nodes);
+    for (node_id, normal_spec, _, _) in &inline_tiers {
+        apply_spec_to_node(layout_tree, *node_id, normal_spec, &mut abs_nodes, &mut inset_nodes);
+    }
+    apply_rules(layout_tree, &important, &mut abs_nodes, &mut inset_nodes);
+    for (node_id, _, important_spec, has_important) in &inline_tiers {
+        if *has_important {
+            apply_spec_to_node(layout_tree, *node_id, important_spec, &mut abs_nodes, &mut inset_nodes);
+        }
+    }
+
+    // Static-position fallback: `position:absolute` with no inset specified
+    // keeps its in-flow (static) position in real CSS. Taffy would pin such
+    // a box to the parent origin, smearing it over siblings (the wikipedia
+    // header overlap), so leave it in flow instead.
+    for node_id in abs_nodes.difference(&inset_nodes) {
+        if let Ok(style_ref) = layout_tree.taffy.style(*node_id) {
+            let mut s = style_ref.clone();
+            s.position = taffy::style::Position::Relative;
+            let _ = layout_tree.taffy.set_style(*node_id, s);
         }
     }
 
@@ -336,27 +457,77 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
             }
         };
 
-        let style = std::rc::Rc::new(parse_declaration_block(&body));
+        let (normal, important, has_important) = parse_declaration_block_tiers(&body);
+        let normal = std::rc::Rc::new(normal);
         for selector in selectors.0 {
-            rules.push(Rule { selector, style: style.clone() });
+            rules.push(Rule { selector, style: normal.clone(), important: false });
+        }
+        if has_important {
+            // Selector isn't Clone; the important tier compiles its own copy.
+            if let Ok(selectors) = kuchiki::Selectors::compile(&prelude) {
+                let important = std::rc::Rc::new(important);
+                for selector in selectors.0 {
+                    rules.push(Rule { selector, style: important.clone(), important: true });
+                }
+            }
         }
     }
 }
 
-/// Parses a `prop: value; prop: value` declaration block (no braces).
-pub(crate) fn parse_declaration_block(body: &str) -> SpecifiedStyle {
-    let mut style = SpecifiedStyle::default();
+/// Parses a declaration block into (normal, !important) tiers plus a flag
+/// saying whether the important tier holds anything. Declarations split by
+/// their own priority, per CSS — not per rule.
+pub(crate) fn parse_declaration_block_tiers(body: &str) -> (SpecifiedStyle, SpecifiedStyle, bool) {
+    let mut normal = SpecifiedStyle::default();
+    let mut important = SpecifiedStyle::default();
+    let mut has_important = false;
     for decl in body.split(';') {
         let Some((prop, value)) = decl.split_once(':') else { continue };
         let prop = prop.trim().to_ascii_lowercase();
         if prop.is_empty() || prop.starts_with("--") {
             continue; // custom properties: no cascade var() support yet
         }
-        // Strip !important — priority handling is source-order for now.
-        let value = value.trim().trim_end_matches("!important").trim();
-        apply_declaration(&prop, value, &mut style);
+        let value = value.trim();
+        match value
+            .strip_suffix("!important")
+            .or_else(|| value.strip_suffix("! important"))
+        {
+            Some(v) => {
+                has_important = true;
+                apply_declaration(&prop, v.trim(), &mut important);
+            }
+            None => apply_declaration(&prop, value, &mut normal),
+        }
     }
-    style
+    (normal, important, has_important)
+}
+
+/// Parses a `prop: value; prop: value` declaration block (no braces) into a
+/// single set — `!important` declarations simply win within the block. Used
+/// where tiers don't matter (build-time inline defaults).
+pub(crate) fn parse_declaration_block(body: &str) -> SpecifiedStyle {
+    let (mut normal, important, has_important) = parse_declaration_block_tiers(body);
+    if has_important {
+        merge_specified(&mut normal, &important);
+    }
+    normal
+}
+
+/// Overlays `src`'s specified fields onto `dst`.
+fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
+    macro_rules! take {
+        ($($f:ident),*) => { $( if src.$f.is_some() { dst.$f = src.$f; } )* };
+    }
+    take!(display, flex_direction, width, height, padding, margin, position,
+          inset_top, inset_left, inset_right, inset_bottom, justify);
+    let p = &src.paint;
+    if p.background.is_some() { dst.paint.background = p.background; }
+    if p.color.is_some() { dst.paint.color = p.color; }
+    if p.font_size.is_some() { dst.paint.font_size = p.font_size; }
+    if p.bold.is_some() { dst.paint.bold = p.bold; }
+    if p.border.is_some() { dst.paint.border = p.border; }
+    if p.line_height.is_some() { dst.paint.line_height = p.line_height; }
+    if p.bg_image.is_some() { dst.paint.bg_image = p.bg_image.clone(); }
 }
 
 /// Evaluates an @media condition against the fixed viewport. Comma = OR,
@@ -402,7 +573,9 @@ fn property_supported(prop: &str) -> bool {
             | "padding-top" | "padding-right" | "padding-bottom" | "padding-left"
             | "margin-top" | "margin-right" | "margin-bottom" | "margin-left"
             | "position" | "top" | "left" | "right" | "bottom" | "text-align"
-            | "background-color" | "background" | "color" | "font-size" | "font-weight"
+            | "background-color" | "background" | "background-image" | "color"
+            | "font-size" | "font-weight" | "line-height"
+            | "border" | "outline" | "border-color" | "border-width" | "border-style"
     )
 }
 
