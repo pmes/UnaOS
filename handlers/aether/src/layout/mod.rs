@@ -10,8 +10,9 @@ pub struct PaintStyle {
     pub color: Option<(u8, u8, u8)>,
     pub font_size: Option<f32>,
     pub bold: Option<bool>,
-    /// (width px, color). Painted as a rect stroke.
-    pub border: Option<(f32, (u8, u8, u8))>,
+    /// Per-side borders [top, right, bottom, left]: (width px, color).
+    /// None side = no stroke. Whole-Option None = unspecified.
+    pub border: Option<[Option<(f32, (u8, u8, u8))>; 4]>,
     /// Resolved line height: multiplier of font size (px values are
     /// converted at parse time against the 16px base — approximation).
     pub line_height: Option<f32>,
@@ -21,6 +22,10 @@ pub struct PaintStyle {
     pub hidden: Option<bool>,
     /// overflow != visible — descendants clip to this box's rect.
     pub clip: Option<bool>,
+    /// text-decoration underline on/off (None = tag default).
+    pub underline: Option<bool>,
+    /// white-space:nowrap — text measures and draws on one line.
+    pub nowrap: Option<bool>,
 }
 
 pub struct LayoutTree {
@@ -272,13 +277,13 @@ pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
 pub fn remeasure(tree: &mut LayoutTree) {
     // Pass 1: resolve font size down the box tree for text leaves, and
     // intrinsic sizes for images.
-    let mut text_info: HashMap<taffy::NodeId, (String, f32, f32)> = HashMap::new();
+    let mut text_info: HashMap<taffy::NodeId, (String, f32, f32, bool)> = HashMap::new();
     let mut img_info: HashMap<taffy::NodeId, (f32, f32)> = HashMap::new();
     fn resolve(
         node_id: taffy::NodeId,
-        inherited: (f32, f32), // (font size, line-height multiplier; 0 = natural)
+        inherited: (f32, f32, bool), // (font size, line-height mult; 0 = natural, nowrap)
         tree: &LayoutTree,
-        out: &mut HashMap<taffy::NodeId, (String, f32, f32)>,
+        out: &mut HashMap<taffy::NodeId, (String, f32, f32, bool)>,
         imgs: &mut HashMap<taffy::NodeId, (f32, f32)>,
     ) {
         let mut size = inherited;
@@ -290,6 +295,9 @@ pub fn remeasure(tree: &mut LayoutTree) {
                     .unwrap_or_else(|| default_font_size(el.name.local.as_ref(), inherited.0));
                 if let Some(lh) = paint.and_then(|p| p.line_height) {
                     size.1 = lh;
+                }
+                if let Some(nw) = paint.and_then(|p| p.nowrap) {
+                    size.2 = nw;
                 }
                 if el.name.local.as_ref() == "img" {
                     let attrs = el.attributes.borrow();
@@ -310,7 +318,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 let text = dom_node.text_contents();
                 let text = text.trim().to_string();
                 if !text.is_empty() {
-                    out.insert(node_id, (text, inherited.0, inherited.1));
+                    out.insert(node_id, (text, inherited.0, inherited.1, inherited.2));
                 }
             }
         }
@@ -320,7 +328,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
             }
         }
     }
-    resolve(tree.root_node, (16.0, 0.0), tree, &mut text_info, &mut img_info);
+    resolve(tree.root_node, (16.0, 0.0, false), tree, &mut text_info, &mut img_info);
 
     // Taffy caches leaf measurements; a cascade pass can change resolved
     // font sizes without touching the leaf's style, so stale cached sizes
@@ -349,14 +357,15 @@ pub fn remeasure(tree: &mut LayoutTree) {
                     height: known.height.unwrap_or(h),
                 };
             }
-            let Some((text, font_size, line_mult)) = text_info.get(&node_id) else {
+            let Some((text, font_size, line_mult, nowrap)) = text_info.get(&node_id) else {
                 return Size { width: known.width.unwrap_or(0.0), height: known.height.unwrap_or(0.0) };
             };
             let wrap_width = known.width.unwrap_or(match avail.width {
                 AvailableSpace::Definite(w) => w,
                 _ => vw_cap,
             });
-            let (w, h) = measure_text(font.as_deref(), text, *font_size, *line_mult, wrap_width.max(1.0));
+            let effective_wrap = if *nowrap { f32::MAX } else { wrap_width.max(1.0) };
+            let (w, h) = measure_text(font.as_deref(), text, *font_size, *line_mult, effective_wrap);
             Size {
                 width: known.width.unwrap_or(w),
                 height: known.height.unwrap_or(h),

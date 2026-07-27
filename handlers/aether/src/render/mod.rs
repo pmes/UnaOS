@@ -16,6 +16,7 @@ struct Inherited {
     bold: bool,
     line_height: f32, // multiplier of font size
     underline: bool,
+    nowrap: bool,
 }
 
 use crate::layout::default_font_size;
@@ -334,6 +335,12 @@ pub fn render_frame(
                 if tag == "a" || tag == "u" {
                     inherited.underline = true;
                 }
+                if let Some(u) = spec.underline {
+                    inherited.underline = u;
+                }
+                if let Some(nw) = spec.nowrap {
+                    inherited.nowrap = nw;
+                }
                 inherited.color = spec.color.unwrap_or(if tag == "a" {
                     (0, 0, 238) // UA default link blue
                 } else {
@@ -416,7 +423,11 @@ pub fn render_frame(
 
                 // Form controls get a UA border and their value text.
                 let is_control = matches!(tag, "input" | "textarea" | "select" | "button");
-                let border = spec.border.or(if is_control { Some((1.0, (118, 118, 118))) } else { None });
+                let border = spec.border.or(if is_control {
+                    Some([Some((1.0, (118, 118, 118))); 4])
+                } else {
+                    None
+                });
                 if is_control && tag != "button" {
                     if let Some(font) = font {
                         let attrs = el.attributes.borrow();
@@ -449,8 +460,7 @@ pub fn render_frame(
                     }
                 }
 
-                if let Some((bw, bc)) = border {
-                    let bw = bw.max(1.0) as u32;
+                if let Some(sides) = border {
                     let x_start = ((current_x as i32) - sx).max(0) as u32;
                     let y_start = ((current_y as i32) - sy).max(0) as u32;
                     let end_x = x_start
@@ -459,16 +469,27 @@ pub fn render_frame(
                     let end_y = y_start
                         .saturating_add(layout_box.size.height.max(0.0) as u32)
                         .min(height);
-                    for y in y_start..end_y {
-                        for x in x_start..end_x {
-                            let on_edge = x < x_start + bw
-                                || x >= end_x.saturating_sub(bw)
-                                || y < y_start + bw
-                                || y >= end_y.saturating_sub(bw);
-                            if on_edge && in_damage(x, y, damage_rects) && in_clip(x, y, clip) {
-                                put_px(surface, width, x, y, bc);
+                    // [top, right, bottom, left], each side its own stroke.
+                    let mut stroke = |x0: u32, y0: u32, x1: u32, y1: u32, color: (u8, u8, u8)| {
+                        for y in y0..y1.min(height) {
+                            for x in x0..x1.min(width) {
+                                if in_damage(x, y, damage_rects) && in_clip(x, y, clip) {
+                                    put_px(surface, width, x, y, color);
+                                }
                             }
                         }
+                    };
+                    if let Some((w, c)) = sides[0] {
+                        stroke(x_start, y_start, end_x, y_start.saturating_add(w.max(1.0) as u32), c);
+                    }
+                    if let Some((w, c)) = sides[2] {
+                        stroke(x_start, end_y.saturating_sub(w.max(1.0) as u32), end_x, end_y, c);
+                    }
+                    if let Some((w, c)) = sides[3] {
+                        stroke(x_start, y_start, x_start.saturating_add(w.max(1.0) as u32), end_y, c);
+                    }
+                    if let Some((w, c)) = sides[1] {
+                        stroke(end_x.saturating_sub(w.max(1.0) as u32), y_start, end_x, end_y, c);
                     }
                 }
             } else if dom_node.as_text().is_some() {
@@ -481,7 +502,7 @@ pub fn render_frame(
                             text,
                             current_x - sx as f32,
                             current_y - sy as f32,
-                            layout_box.size.width.max(1.0),
+                            if inherited.nowrap { f32::MAX } else { layout_box.size.width.max(1.0) },
                             font,
                             inherited.bold,
                             inherited.font_size,
@@ -536,6 +557,7 @@ pub fn render_frame(
         bold: false,
         line_height: 0.0, // natural
         underline: false,
+        nowrap: false,
     };
     draw_node(
         layout.root_node,

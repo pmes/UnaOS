@@ -933,6 +933,44 @@ mod tests {
         );
     }
 
+    /// Per-side borders, text-decoration override, white-space:nowrap.
+    #[test]
+    fn test_side_borders_decoration_nowrap() {
+        let html = r#"<html><body>
+            <div id="b" style="width: 60px; height: 30px">x</div>
+            <a id="a" href="/">nolink</a>
+            <span id="n">one two three four five six seven eight nine ten</span>
+        </body></html>"#;
+        let document = dom::parse_html(html);
+        let mut layout_tree = layout::compute_layout(&document);
+        css::apply_css(&mut layout_tree, r#"
+            #b { border-bottom: 3px solid red; }
+            #a { text-decoration: none; }
+            #n { white-space: nowrap; }
+        "#);
+        for (node_id, dom_node) in &layout_tree.node_map {
+            let Some(el) = dom_node.as_element() else { continue };
+            let paint = layout_tree.paint_map.get(node_id).cloned().unwrap_or_default();
+            match el.attributes.borrow().get("id") {
+                Some("b") => {
+                    let sides = paint.border.expect("side border set");
+                    assert_eq!(sides[2], Some((3.0, (255, 0, 0))), "bottom side only");
+                    assert_eq!(sides[0], None, "top untouched");
+                    let s = layout_tree.taffy.style(*node_id).unwrap();
+                    assert_eq!(s.border.bottom, taffy::style::LengthPercentage::length(3.0));
+                    assert_eq!(s.border.top, taffy::style::LengthPercentage::length(0.0));
+                }
+                Some("a") => assert_eq!(paint.underline, Some(false), "decoration none overrides link default"),
+                Some("n") => {
+                    assert_eq!(paint.nowrap, Some(true));
+                    let l = layout_tree.taffy.layout(*node_id).unwrap();
+                    assert!(l.size.height < 40.0, "nowrap text must measure one line: {}", l.size.height);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// float:left/right sizes to content and hugs its edge (approximation).
     #[test]
     fn test_float_approximation() {

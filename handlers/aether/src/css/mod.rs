@@ -26,6 +26,7 @@ pub(crate) struct SpecifiedStyle {
     pub inset_bottom: Option<LengthPercentageAuto>,
     pub justify: Option<taffy::style::JustifyContent>,
     pub align_self: Option<taffy::style::AlignSelf>,
+    pub box_sizing: Option<taffy::style::BoxSizing>,
     pub paint: PaintStyle,
 }
 
@@ -71,9 +72,12 @@ impl SpecifiedStyle {
         if let Some(a) = self.align_self {
             node_style.align_self = Some(a);
         }
-        if let Some((w, _)) = self.paint.border {
-            let b = LengthPercentage::length(w);
-            node_style.border = Rect { left: b, right: b, top: b, bottom: b };
+        if let Some(sides) = self.paint.border {
+            let w = |i: usize| LengthPercentage::length(sides[i].map(|(w, _)| w).unwrap_or(0.0));
+            node_style.border = Rect { top: w(0), right: w(1), bottom: w(2), left: w(3) };
+        }
+        if let Some(bs) = self.box_sizing {
+            node_style.box_sizing = bs;
         }
     }
 }
@@ -289,17 +293,25 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 None => crate::ledger::record_css(&format!("line-height-value:{}", clip(value))),
             }
         }
-        "border" | "outline" => {
+        "border-top" | "border-right" | "border-bottom" | "border-left" => {
             let v = value.trim();
+            let side = match prop {
+                "border-top" => 0,
+                "border-right" => 1,
+                "border-bottom" => 2,
+                _ => 3,
+            };
+            let mut sides = style.paint.border.unwrap_or_default();
             if v == "none" || v == "0" {
-                style.paint.border = None;
+                sides[side] = None;
+                style.paint.border = Some(sides);
                 return;
             }
             let mut width = 1.0f32;
             let mut color = (128, 128, 128);
             let mut got_any = false;
             for part in v.split_whitespace() {
-                if let Some(px) = part.strip_suffix("px").and_then(|n| n.parse::<f32>().ok()) {
+                if let Some(px) = parse_px(part).filter(|_| part.ends_with("px") || part.ends_with("em")) {
                     width = px;
                     got_any = true;
                 } else if matches!(part, "solid" | "dotted" | "dashed" | "double" | "groove" | "ridge" | "inset" | "outset") {
@@ -310,21 +322,72 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 }
             }
             if got_any {
-                style.paint.border = Some((width, color));
+                sides[side] = Some((width, color));
+                style.paint.border = Some(sides);
+            }
+        }
+        "text-decoration" | "text-decoration-line" => {
+            let v = value.trim();
+            if v.contains("underline") {
+                style.paint.underline = Some(true);
+            } else if v.starts_with("none") {
+                style.paint.underline = Some(false);
+            }
+        }
+        "white-space" => match value {
+            "nowrap" | "pre" => style.paint.nowrap = Some(true),
+            "normal" | "pre-wrap" | "pre-line" | "break-spaces" => style.paint.nowrap = Some(false),
+            _ => {}
+        },
+        "box-sizing" => match value {
+            "border-box" => style.box_sizing = Some(taffy::style::BoxSizing::BorderBox),
+            "content-box" => style.box_sizing = Some(taffy::style::BoxSizing::ContentBox),
+            _ => {}
+        },
+        "border" | "outline" => {
+            let v = value.trim();
+            if v == "none" || v == "0" {
+                style.paint.border = Some([None; 4]);
+                return;
+            }
+            let mut width = 1.0f32;
+            let mut color = (128, 128, 128);
+            let mut got_any = false;
+            for part in v.split_whitespace() {
+                if let Some(px) = parse_px(part).filter(|_| part.chars().next().map_or(false, |c| c.is_ascii_digit() || c == '.')) {
+                    width = px;
+                    got_any = true;
+                } else if matches!(part, "solid" | "dotted" | "dashed" | "double" | "groove" | "ridge" | "inset" | "outset") {
+                    got_any = true;
+                } else if let Some(c) = parse_color_str(part) {
+                    color = c;
+                    got_any = true;
+                }
+            }
+            if got_any {
+                style.paint.border = Some([Some((width, color)); 4]);
             } else {
                 crate::ledger::record_css(&format!("border-value:{}", clip(value)));
             }
         }
         "border-color" => {
             if let Some(c) = parse_color_str(value) {
-                let w = style.paint.border.map(|(w, _)| w).unwrap_or(1.0);
-                style.paint.border = Some((w, c));
+                let mut sides = style.paint.border.unwrap_or([Some((1.0, (128, 128, 128))); 4]);
+                for side in sides.iter_mut() {
+                    let w = side.map(|(w, _)| w).unwrap_or(1.0);
+                    *side = Some((w, c));
+                }
+                style.paint.border = Some(sides);
             }
         }
         "border-width" => {
             if let Some(w) = parse_px(value) {
-                let c = style.paint.border.map(|(_, c)| c).unwrap_or((128, 128, 128));
-                style.paint.border = Some((w, c));
+                let mut sides = style.paint.border.unwrap_or([Some((1.0, (128, 128, 128))); 4]);
+                for side in sides.iter_mut() {
+                    let c = side.map(|(_, c)| c).unwrap_or((128, 128, 128));
+                    *side = Some((w, c));
+                }
+                style.paint.border = Some(sides);
             }
         }
         "border-style" => {} // stroke style is uniform; nothing to record
@@ -655,6 +718,8 @@ fn apply_spec_to_node(
     if style.paint.bg_image.is_some() { entry.bg_image = style.paint.bg_image.clone(); }
     if style.paint.hidden.is_some() { entry.hidden = style.paint.hidden; }
     if style.paint.clip.is_some() { entry.clip = style.paint.clip; }
+    if style.paint.underline.is_some() { entry.underline = style.paint.underline; }
+    if style.paint.nowrap.is_some() { entry.nowrap = style.paint.nowrap; }
 }
 
 /// Applies a set of stylesheets as ONE cascade — rules from every sheet
@@ -894,6 +959,20 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
             continue;
         }
 
+        // Pseudo-element rules (::before/::after/…) style generated boxes
+        // we don't create (no `content` support): known-unsupported, one
+        // ledger key — not thousands of compile failures.
+        if prelude.split(',').all(|sel| {
+            let sel = sel.trim();
+            sel.contains("::")
+                || [":before", ":after", ":placeholder", ":selection", ":marker",
+                    ":first-line", ":first-letter", ":backdrop"]
+                    .iter()
+                    .any(|p| sel.contains(p))
+        }) {
+            crate::ledger::record_css("pseudo-element-rule");
+            continue;
+        }
         // Compile with kuchiki's real selector engine (servo selectors).
         let selectors = match kuchiki::Selectors::compile(&prelude) {
             Ok(s) => s,
@@ -974,7 +1053,7 @@ fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
     }
     take!(display, flex_direction, width, height, padding, margin, position,
           inset_top, inset_left, inset_right, inset_bottom, justify, align_self,
-          max_width, max_height, min_width, min_height);
+          max_width, max_height, min_width, min_height, box_sizing);
     let p = &src.paint;
     if p.background.is_some() { dst.paint.background = p.background; }
     if p.color.is_some() { dst.paint.color = p.color; }
@@ -985,6 +1064,8 @@ fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
     if p.bg_image.is_some() { dst.paint.bg_image = p.bg_image.clone(); }
     if p.hidden.is_some() { dst.paint.hidden = p.hidden; }
     if p.clip.is_some() { dst.paint.clip = p.clip; }
+    if p.underline.is_some() { dst.paint.underline = p.underline; }
+    if p.nowrap.is_some() { dst.paint.nowrap = p.nowrap; }
 }
 
 /// Evaluates an @media condition against the fixed viewport. Comma = OR,
@@ -1050,6 +1131,8 @@ fn property_supported(prop: &str) -> bool {
             | "max-width" | "max-height" | "min-width" | "min-height"
             | "overflow" | "overflow-x" | "overflow-y"
             | "border" | "outline" | "border-color" | "border-width" | "border-style"
+            | "border-top" | "border-right" | "border-bottom" | "border-left"
+            | "text-decoration" | "text-decoration-line" | "white-space" | "box-sizing"
     )
 }
 
