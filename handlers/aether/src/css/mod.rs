@@ -5,36 +5,6 @@ use taffy::prelude::*;
 use taffy::style::{Dimension, Display, FlexDirection, LengthPercentage, LengthPercentageAuto};
 use taffy::geometry::Rect;
 
-/// A simple selector this cascade can match. Anything more complex
-/// (descendant combinators, pseudo-classes, attribute selectors) is
-/// recorded in the ledger and the rule is skipped, not misapplied.
-#[derive(Debug, Clone)]
-enum SimpleSelector {
-    Tag(String),
-    Class(String),
-    Id(String),
-}
-
-impl SimpleSelector {
-    fn matches(&self, el: &kuchiki::ElementData) -> bool {
-        match self {
-            SimpleSelector::Tag(t) => el.name.local.as_ref() == t,
-            SimpleSelector::Class(c) => el
-                .attributes
-                .borrow()
-                .get("class")
-                .map(|v| v.split_whitespace().any(|cls| cls == c))
-                .unwrap_or(false),
-            SimpleSelector::Id(i) => el
-                .attributes
-                .borrow()
-                .get("id")
-                .map(|v| v == i.as_str())
-                .unwrap_or(false),
-        }
-    }
-}
-
 /// Declarations a rule actually specified. Only `Some` fields are applied,
 /// so a rule never stomps another rule's (or the UA default's) values.
 #[derive(Default)]
@@ -53,74 +23,53 @@ pub fn apply_css(layout_tree: &mut LayoutTree, css: &str) {
     let mut parser = Parser::new(&mut input);
 
     loop {
-        // Parse the selector list up to the next `{`.
-        let mut selectors: Vec<SimpleSelector> = Vec::new();
-        let mut current: Option<SimpleSelector> = None;
-        let mut complex = false;
+        // Slice the raw selector prelude up to the next `{`, then compile it
+        // with kuchiki's real selector engine (servo `selectors` underneath).
+        let start = parser.position();
         let mut saw_block = false;
+        let mut at_rule: Option<String> = None;
 
         loop {
-            let Ok(token) = parser.next_including_whitespace() else { break };
+            let Ok(token) = parser.next() else { break };
             match token {
                 Token::CurlyBracketBlock => {
                     saw_block = true;
                     break;
                 }
-                Token::WhiteSpace(_) => {
-                    // A second component after whitespace = descendant combinator.
-                    if current.is_some() {
-                        // Peek continues in the outer loop; mark complex only
-                        // if another component follows before `{`.
-                    }
-                }
-                Token::Comma => {
-                    if let Some(sel) = current.take() {
-                        selectors.push(sel);
-                    }
-                }
-                Token::Ident(name) => {
-                    if current.is_some() {
-                        complex = true; // "div p" — descendant, unsupported
-                    }
-                    current = Some(SimpleSelector::Tag(name.as_ref().to_string()));
-                }
-                Token::Delim('.') => {
-                    if let Ok(Token::Ident(name)) = parser.next_including_whitespace() {
-                        if current.is_some() {
-                            complex = true; // compound like div.warn
-                        }
-                        current = Some(SimpleSelector::Class(name.as_ref().to_string()));
-                    }
-                }
-                Token::Hash(v) | Token::IDHash(v) => {
-                    if current.is_some() {
-                        complex = true;
-                    }
-                    current = Some(SimpleSelector::Id(v.as_ref().to_string()));
-                }
                 Token::AtKeyword(kw) => {
-                    crate::ledger::record_css(&format!("at-rule:@{}", kw));
-                    complex = true;
+                    at_rule = Some(kw.as_ref().to_string());
                 }
-                _ => {
-                    complex = true; // pseudo-classes, attributes, combinators...
-                }
+                _ => {}
             }
-        }
-        if let Some(sel) = current.take() {
-            selectors.push(sel);
         }
         if !saw_block {
             break; // end of stylesheet
         }
-        if complex || selectors.is_empty() {
-            crate::ledger::record_css("selector:unsupported-complex");
+
+        if let Some(kw) = at_rule {
+            // @media/@supports etc: skip the block honestly for now.
+            crate::ledger::record_css(&format!("at-rule:@{}", kw));
             let _ = parser.parse_nested_block(|p| {
                 while p.next().is_ok() {}
                 Ok::<(), cssparser::ParseError<'_, ()>>(())
             });
             continue;
         }
+
+        let prelude = parser.slice_from(start);
+        let selector_text = prelude.trim_end().trim_end_matches('{').trim();
+        let compiled = kuchiki::Selectors::compile(selector_text);
+        let selectors = match compiled {
+            Ok(s) => s,
+            Err(_) => {
+                crate::ledger::record_css(&format!("selector-compile-failed:{}", selector_text));
+                let _ = parser.parse_nested_block(|p| {
+                    while p.next().is_ok() {}
+                    Ok::<(), cssparser::ParseError<'_, ()>>(())
+                });
+                continue;
+            }
+        };
 
         {
             {
@@ -212,8 +161,8 @@ pub fn apply_css(layout_tree: &mut LayoutTree, css: &str) {
                     if let Ok(style) = block_parser {
                         // Apply only the specified declarations to matching nodes.
                         for (node_id, dom_node) in &layout_tree.node_map {
-                            let Some(el) = dom_node.as_element() else { continue };
-                            if !selectors.iter().any(|s| s.matches(el)) {
+                            let Some(el_ref) = dom_node.clone().into_element_ref() else { continue };
+                            if !selectors.matches(&el_ref) {
                                 continue;
                             }
                             if let Ok(node_style_ref) = layout_tree.taffy.style(*node_id) {

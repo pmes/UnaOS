@@ -206,6 +206,20 @@ mod tests {
             }
         }
         assert_eq!(hero_bg, Some((255, 0, 0)), "class selector must match");
+
+        // Descendant and compound selectors via the real selector engine.
+        css::apply_css(&mut layout_tree, r#"
+            body .hero { color: navy; }
+            div.other { font-size: 30px; }
+        "#);
+        for (node_id, dom_node) in &layout_tree.node_map {
+            let Some(el) = dom_node.as_element() else { continue };
+            if el.attributes.borrow().get("class") == Some("hero other") {
+                let paint = layout_tree.paint_map.get(node_id).copied().unwrap_or_default();
+                assert_eq!(paint.color, Some((0, 0, 128)), "descendant selector must match");
+                assert_eq!(paint.font_size, Some(30.0), "compound selector must match");
+            }
+        }
         assert_eq!(lead_color, Some((0, 255, 0)), "id selector must match");
         let plain_p = plain_p.expect("plain <p> present");
         assert_eq!(plain_p.font_size, Some(20.0));
