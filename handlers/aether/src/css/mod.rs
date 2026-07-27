@@ -442,6 +442,113 @@ struct Rule {
     style: std::rc::Rc<SpecifiedStyle>,
     important: bool,
     key: RuleKey,
+    plan: MatchPlan,
+    /// Every depth-0 `.class`/`#id` in the selector: ALL must exist
+    /// somewhere on the page for the rule to possibly match. Real pages
+    /// ship swaths of feature-flag rules whose flag class is absent —
+    /// they drop before any matching.
+    required: Vec<(bool, String)>, // (is_id, name)
+}
+
+/// How a rule matches. A single compound of tag/id/class simple selectors
+/// (no combinators, no pseudo/attr) — the overwhelming majority on real
+/// pages — matches with precomputed per-element sets; everything else goes
+/// through the real selector engine. The profiled wall was kuchiki's
+/// has_class re-splitting class strings during ancestor walks.
+enum MatchPlan {
+    Simple {
+        tag: Option<String>,
+        id: Option<String>,
+        classes: Vec<String>,
+    },
+    Engine,
+}
+
+/// Collects the depth-0 class/id tokens a selector REQUIRES on the page.
+/// Tokens inside parens (:not(.x), :is(...)) or brackets are skipped —
+/// they are not unconditional requirements.
+fn required_tokens(selector_text: &str) -> Vec<(bool, String)> {
+    let s = selector_text;
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' | b'(' => depth += 1,
+            b']' | b')' => depth -= 1,
+            m @ (b'.' | b'#') if depth == 0 => {
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len() {
+                    let c = bytes[j] as char;
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                // Escaped names (backslash) aren't parsed — no requirement.
+                if j > start && (j >= bytes.len() || bytes[j] != b'\\') {
+                    out.push((m == b'#', s[start..j].to_string()));
+                }
+                i = j;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Derives the MatchPlan from a single selector's text.
+fn match_plan(selector_text: &str) -> MatchPlan {
+    let s = selector_text.trim();
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth -= 1,
+            ' ' | '\t' | '>' | '+' | '~' if depth == 0 => return MatchPlan::Engine,
+            ':' | '[' if depth == 0 => return MatchPlan::Engine,
+            _ => {}
+        }
+    }
+    if s.contains(':') || s.contains('[') {
+        return MatchPlan::Engine;
+    }
+    // Compound of [tag]?(#id|.class)*
+    let mut tag = None;
+    let mut id = None;
+    let mut classes = Vec::new();
+    let mut rest = s;
+    // Leading tag or universal.
+    let head_end = rest.find(['.', '#']).unwrap_or(rest.len());
+    let head = &rest[..head_end];
+    if !head.is_empty() && head != "*" {
+        if !head.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return MatchPlan::Engine;
+        }
+        tag = Some(head.to_ascii_lowercase());
+    }
+    rest = &rest[head_end..];
+    while !rest.is_empty() {
+        let marker = rest.as_bytes()[0];
+        let body = &rest[1..];
+        let end = body.find(['.', '#']).unwrap_or(body.len());
+        let name = &body[..end];
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return MatchPlan::Engine;
+        }
+        match marker {
+            b'.' => classes.push(name.to_string()),
+            b'#' => id = Some(name.to_string()),
+            _ => return MatchPlan::Engine,
+        }
+        rest = &body[end..];
+    }
+    MatchPlan::Simple { tag, id, classes }
 }
 
 /// Rule-hash key: the rightmost compound's most selective simple selector.
@@ -567,16 +674,39 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     // Element refs computed ONCE — matching is O(rules × elements) either
     // way, but the per-pair node_map lookup + ref construction was the
     // hot-path churn on rule-heavy pages.
-    let elements: Vec<(taffy::NodeId, kuchiki::NodeDataRef<kuchiki::ElementData>)> = layout_tree
+    // Element refs + local match facts (tag/id/classes) computed ONCE:
+    // simple compound rules match on these sets directly, bypassing the
+    // selector engine (whose has_class re-split class strings on every
+    // test — the profiled hot path).
+    struct ElemInfo {
+        el_ref: kuchiki::NodeDataRef<kuchiki::ElementData>,
+        tag: String,
+        id_attr: Option<String>,
+        classes: std::collections::HashSet<String>,
+    }
+    let elements: Vec<(taffy::NodeId, ElemInfo)> = layout_tree
         .node_map
         .iter()
         .filter_map(|(id, n)| n.clone().into_element_ref().map(|el| (*id, el)))
+        .map(|(id, el_ref)| {
+            let attrs = el_ref.attributes.borrow();
+            let info = ElemInfo {
+                tag: el_ref.name.local.as_ref().to_ascii_lowercase(),
+                id_attr: attrs.get("id").map(str::to_string),
+                classes: attrs
+                    .get("class")
+                    .map(|c| c.split_whitespace().map(str::to_string).collect())
+                    .unwrap_or_default(),
+                el_ref: { drop(attrs); el_ref },
+            };
+            (id, info)
+        })
         .collect();
 
     // Inline style="" tiers, parsed once per node.
     let mut inline_tiers: Vec<(taffy::NodeId, SpecifiedStyle, SpecifiedStyle, bool)> = Vec::new();
-    for (node_id, el_ref) in &elements {
-        let Some(inline) = el_ref.attributes.borrow().get("style").map(|s| s.to_string()) else { continue };
+    for (node_id, info) in &elements {
+        let Some(inline) = info.el_ref.attributes.borrow().get("style").map(|s| s.to_string()) else { continue };
         let (normal, important, has_important) = parse_declaration_block_tiers(&inline);
         inline_tiers.push((*node_id, normal, important, has_important));
     }
@@ -586,7 +716,30 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     // instead of one per matching rule.
     let mut acc: std::collections::HashMap<taffy::NodeId, SpecifiedStyle> =
         std::collections::HashMap::new();
+    // Page-level presence sets for the requirement filter.
+    let mut page_classes: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut page_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (_, info) in &elements {
+        for c in &info.classes {
+            page_classes.insert(c.as_str());
+        }
+        if let Some(id) = &info.id_attr {
+            page_ids.insert(id.as_str());
+        }
+    }
+
     let merge_rules = |rules: &[&Rule], acc: &mut std::collections::HashMap<taffy::NodeId, SpecifiedStyle>| {
+        // Drop rules requiring a class/id absent from the entire page.
+        let rules: Vec<&Rule> = rules
+            .iter()
+            .filter(|r| {
+                r.required.iter().all(|(is_id, name)| {
+                    if *is_id { page_ids.contains(name.as_str()) } else { page_classes.contains(name.as_str()) }
+                })
+            })
+            .copied()
+            .collect();
+        let rules = &rules[..];
         // Rule hash: an element only tests rules whose rightmost key it
         // carries (plus Universal), in original (cascade) index order.
         use std::collections::HashMap;
@@ -603,30 +756,33 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
             }
         }
         let mut candidates: Vec<usize> = Vec::new();
-        for (node_id, el_ref) in &elements {
+        for (node_id, info) in &elements {
             candidates.clear();
             candidates.extend_from_slice(&universal);
-            if let Some(v) = by_tag.get(el_ref.name.local.as_ref()) {
+            if let Some(v) = by_tag.get(info.tag.as_str()) {
                 candidates.extend_from_slice(v);
             }
-            {
-                let attrs = el_ref.attributes.borrow();
-                if let Some(id) = attrs.get("id") {
-                    if let Some(v) = by_id.get(id) {
-                        candidates.extend_from_slice(v);
-                    }
+            if let Some(id) = &info.id_attr {
+                if let Some(v) = by_id.get(id.as_str()) {
+                    candidates.extend_from_slice(v);
                 }
-                if let Some(classes) = attrs.get("class") {
-                    for class in classes.split_whitespace() {
-                        if let Some(v) = by_class.get(class) {
-                            candidates.extend_from_slice(v);
-                        }
-                    }
+            }
+            for class in &info.classes {
+                if let Some(v) = by_class.get(class.as_str()) {
+                    candidates.extend_from_slice(v);
                 }
             }
             candidates.sort_unstable();
             for &i in candidates.iter() {
-                if rules[i].selector.matches(el_ref) {
+                let matched = match &rules[i].plan {
+                    MatchPlan::Simple { tag, id, classes } => {
+                        tag.as_deref().map_or(true, |t| t == info.tag)
+                            && id.as_deref().map_or(true, |x| info.id_attr.as_deref() == Some(x))
+                            && classes.iter().all(|c| info.classes.contains(c))
+                    }
+                    MatchPlan::Engine => rules[i].selector.matches(&info.el_ref),
+                };
+                if matched {
                     merge_specified(acc.entry(*node_id).or_default(), &rules[i].style);
                 }
             }
@@ -740,16 +896,22 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
         let (normal, important, has_important) = parse_declaration_block_tiers(&body);
         let normal = std::rc::Rc::new(normal);
         for selector in selectors.0 {
-            let key = rule_key(&selector.to_string());
-            rules.push(Rule { selector, style: normal.clone(), important: false, key });
+            let text = selector.to_string();
+            let key = rule_key(&text);
+            let plan = match_plan(&text);
+            let required = required_tokens(&text);
+            rules.push(Rule { selector, style: normal.clone(), important: false, key, plan, required });
         }
         if has_important {
             // Selector isn't Clone; the important tier compiles its own copy.
             if let Ok(selectors) = kuchiki::Selectors::compile(&prelude) {
                 let important = std::rc::Rc::new(important);
                 for selector in selectors.0 {
-                    let key = rule_key(&selector.to_string());
-                    rules.push(Rule { selector, style: important.clone(), important: true, key });
+                    let text = selector.to_string();
+                    let key = rule_key(&text);
+                    let plan = match_plan(&text);
+                    let required = required_tokens(&text);
+                    rules.push(Rule { selector, style: important.clone(), important: true, key, plan, required });
                 }
             }
         }

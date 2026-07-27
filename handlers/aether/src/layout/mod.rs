@@ -81,6 +81,15 @@ pub fn compute_layout(dom: &NodeRef) -> LayoutTree {
 }
 
 pub fn compute_layout_sized(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
+    let mut tree = build_tree(dom, vw, vh);
+    remeasure(&mut tree);
+    tree
+}
+
+/// Builds the box tree WITHOUT the measuring layout pass. Callers that
+/// immediately run a cascade (which remeasures at the end) use this — the
+/// double full layout per page load was a profiled cost.
+pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
     let mut taffy = taffy::TaffyTree::new();
     let mut node_map = HashMap::new();
     let mut paint_map = HashMap::new();
@@ -228,16 +237,14 @@ pub fn compute_layout_sized(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
     let root_node = build_taffy_tree(dom, &mut taffy, &mut node_map, &mut paint_map)
         .unwrap_or_else(|| taffy.new_leaf(Style::default()).unwrap());
 
-    let mut tree = LayoutTree {
+    LayoutTree {
         taffy,
         root_node,
         node_map,
         paint_map,
         viewport: (vw, vh),
         dirty: false,
-    };
-    remeasure(&mut tree);
-    tree
+    }
 }
 
 /// UA default font sizes per element (shared with the renderer).
@@ -370,16 +377,33 @@ fn measure_text(
     let line_height = if line_mult > 0.0 { font_size * line_mult } else { natural };
     let space = font_size * 0.3;
 
+    // Advance cache: taffy's flexbox runs several measure passes per node
+    // and the per-char glyph lookup was hot. Advances are in FONT UNITS
+    // (size-independent); scale applies after.
+    thread_local! {
+        static ADVANCES: std::cell::RefCell<HashMap<char, f32>> = RefCell::new(HashMap::new());
+    }
+    use std::cell::RefCell;
+    let advance_units = |c: char| -> f32 {
+        ADVANCES.with(|m| {
+            if let Some(a) = m.borrow().get(&c) {
+                return *a;
+            }
+            let a = font
+                .glyph_for_char(c)
+                .and_then(|g| font.advance(g).ok())
+                .map(|a| a.x())
+                .unwrap_or(0.0);
+            m.borrow_mut().insert(c, a);
+            a
+        })
+    };
+
     let mut pen = 0.0f32;
     let mut lines = 1u32;
     let mut widest = 0.0f32;
     for word in text.split_whitespace() {
-        let word_width: f32 = word
-            .chars()
-            .filter_map(|c| font.glyph_for_char(c))
-            .filter_map(|g| font.advance(g).ok())
-            .map(|a| a.x() * scale)
-            .sum();
+        let word_width: f32 = word.chars().map(|c| advance_units(c) * scale).sum();
         if pen > 0.0 && pen + word_width > max_width {
             lines += 1;
             pen = 0.0;

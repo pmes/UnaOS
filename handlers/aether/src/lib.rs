@@ -72,7 +72,7 @@ impl AetherEngine {
     /// the page's stylesheets. The M3 mutation→relayout half-loop.
     pub fn relayout(&mut self) {
         let Some(document) = self.document.clone() else { return };
-        let mut layout_tree = layout::compute_layout_sized(&document, self.width as f32, self.height as f32);
+        let mut layout_tree = layout::build_tree(&document, self.width as f32, self.height as f32);
         css::apply_stylesheets(&mut layout_tree, &self.stylesheets);
         self.layout_tree = Some(layout_tree);
         self.needs_repaint = true;
@@ -544,7 +544,7 @@ impl AetherEngine {
         }
         sheets.extend(external_css.iter().cloned());
 
-        let mut layout_tree = layout::compute_layout_sized(&document, self.width as f32, self.height as f32);
+        let mut layout_tree = layout::build_tree(&document, self.width as f32, self.height as f32);
         css::apply_stylesheets(&mut layout_tree, &sheets);
         self.stylesheets = sheets;
         
