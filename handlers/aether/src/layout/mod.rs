@@ -128,69 +128,9 @@ pub fn compute_layout(dom: &NodeRef) -> LayoutTree {
     }
 }
 
-/// Applies a `style="..."` attribute: paint properties into `paint`,
-/// px width/height into the taffy style. Unknown declarations go to the ledger.
+/// Applies a `style="..."` attribute through the shared declaration parser.
 fn apply_inline_style(inline: &str, style: &mut Style, paint: &mut PaintStyle) {
-    for decl in inline.split(';') {
-        let Some((prop, value)) = decl.split_once(':') else { continue };
-        let prop = prop.trim().to_ascii_lowercase();
-        let value = value.trim();
-        match prop.as_str() {
-            "background-color" | "background" => {
-                if crate::css::is_neutral_keyword(value) {
-                    // transparent/inherit/initial — nothing to paint, not a gap
-                } else {
-                    match crate::css::parse_color_str(value) {
-                        Some(c) => paint.background = Some(c),
-                        None => crate::ledger::record_css(&format!("background-value:{}", value)),
-                    }
-                }
-            }
-            "color" => {
-                if !crate::css::is_neutral_keyword(value) {
-                    match crate::css::parse_color_str(value) {
-                        Some(c) => paint.color = Some(c),
-                        None => crate::ledger::record_css(&format!("color-value:{}", value)),
-                    }
-                }
-            }
-            "font-size" => match crate::css::parse_font_size(value) {
-                Some(px) => paint.font_size = Some(px),
-                None => crate::ledger::record_css(&format!("font-size-value:{}", value)),
-            },
-            "font-weight" => match crate::css::parse_font_weight(value) {
-                Some(b) => paint.bold = Some(b),
-                None => crate::ledger::record_css(&format!("font-weight-value:{}", value)),
-            },
-            "width" => {
-                if let Some(px) = crate::css::parse_px(value) {
-                    style.size.width = Dimension::length(px);
-                }
-            }
-            "height" => {
-                if let Some(px) = crate::css::parse_px(value) {
-                    style.size.height = Dimension::length(px);
-                    style.min_size.height = Dimension::length(px);
-                }
-            }
-            "padding" => {
-                if let Some(px) = crate::css::parse_px(value) {
-                    let lp = LengthPercentage::length(px);
-                    style.padding = Rect { left: lp, right: lp, top: lp, bottom: lp };
-                }
-            }
-            "margin" => {
-                if let Some(px) = crate::css::parse_px(value) {
-                    let m = LengthPercentageAuto::length(px);
-                    style.margin = Rect { left: m, right: m, top: m, bottom: m };
-                }
-            }
-            "display" => match value {
-                "none" => style.display = Display::None,
-                "flex" | "block" => style.display = Display::Flex,
-                other => crate::ledger::record_css(&format!("display:{}", other)),
-            },
-            other => crate::ledger::record_css(&format!("inline-property:{}", other)),
-        }
-    }
+    let spec = crate::css::parse_declaration_block(inline);
+    spec.fold_into(style);
+    *paint = spec.paint;
 }
