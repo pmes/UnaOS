@@ -125,6 +125,10 @@ pub fn compute_layout(dom: &NodeRef) -> LayoutTree {
             } else {
                 None
             },
+            // Inline boxes keep their measured width; the row wraps instead
+            // of shrinking them (shrunk text would draw more lines than the
+            // measured height and overlap the next block).
+            flex_shrink: if inline { 0.0 } else { 1.0 },
             size: Size {
                 width: if inline { Dimension::auto() } else { Dimension::percent(1.0) },
                 height: Dimension::auto(),
@@ -239,6 +243,13 @@ pub fn remeasure(tree: &mut LayoutTree) {
         }
     }
     resolve(tree.root_node, 16.0, tree, &mut text_info, &mut img_info);
+
+    // Taffy caches leaf measurements; a cascade pass can change resolved
+    // font sizes without touching the leaf's style, so stale cached sizes
+    // survive set_style dirtying. Invalidate every measured leaf.
+    for node_id in text_info.keys().chain(img_info.keys()) {
+        let _ = tree.taffy.mark_dirty(*node_id);
+    }
 
     let font = crate::fonts::FontEngine::new().load_font(
         &[font_kit::family_name::FamilyName::SansSerif],
