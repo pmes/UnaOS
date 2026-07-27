@@ -505,6 +505,23 @@ mod tests {
         ], "raster AND svg css urls resolve against the base");
     }
 
+    /// A sheet-relative url() fetches from the SHEET's host but stores a
+    /// page-base paint key too (paint resolves raw urls against the page).
+    #[test]
+    fn test_css_image_refs_sheet_base() {
+        let mut refs = Vec::new();
+        crate::net::collect_css_image_refs(
+            "https://cdn.example.org/styles/main.css",
+            "https://example.com/page/",
+            ".hero { background-image: url(../img/bg.png) }",
+            &mut refs,
+        );
+        assert_eq!(refs, vec![(
+            "https://cdn.example.org/img/bg.png".to_string(),
+            "https://example.com/img/bg.png".to_string(),
+        )]);
+    }
+
     /// SVG decodes to straight-alpha RGBA, from bytes and from a plain
     /// (non-base64) data: URI.
     #[test]

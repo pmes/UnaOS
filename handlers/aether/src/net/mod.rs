@@ -189,27 +189,50 @@ pub fn collect_image_urls(base_url: &str, html: &str) -> Vec<String> {
 /// sheets, <style> blocks, style="" attrs — callers pass raw text; the scan
 /// is textual so it needs no CSS object model). Capped like images.
 pub fn collect_css_image_urls(base_url: &str, texts: &[&str], out: &mut Vec<String>) {
-    let raster = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"];
+    let mut refs = Vec::new();
     for text in texts {
-        let mut rest: &str = text;
-        while let Some(pos) = rest.find("url(") {
-            rest = &rest[pos + 4..];
-            let Some(end) = rest.find(')') else { break };
-            let inner = rest[..end].trim().trim_matches(|c| c == '"' || c == '\'').trim();
-            rest = &rest[end..];
-            let path_end = inner.find(['?', '#']).unwrap_or(inner.len());
-            let is_raster = raster.iter().any(|ext| inner[..path_end].to_ascii_lowercase().ends_with(ext));
-            if !is_raster {
-                continue;
-            }
-            let abs = crate::images::resolve(base_url, inner);
-            if (abs.starts_with("http://") || abs.starts_with("https://")) && !out.contains(&abs) {
-                out.push(abs);
-            }
-            if out.len() >= 50 {
-                crate::ledger::record_css("css-image-fetch-cap-reached");
-                return;
-            }
+        collect_css_image_refs(base_url, base_url, text, &mut refs);
+    }
+    for (fetch_url, _key) in refs {
+        if !out.contains(&fetch_url) {
+            out.push(fetch_url);
+        }
+    }
+}
+
+/// Scans one CSS text for raster/svg `url(...)` refs. `fetch_base` is the
+/// owning sheet's URL (relative paths live on ITS host); `paint_base` is
+/// the page base — paint-time lookup resolves raw urls against the page,
+/// so each ref carries both the fetch URL and the paint-lookup key.
+pub fn collect_css_image_refs(
+    fetch_base: &str,
+    paint_base: &str,
+    text: &str,
+    out: &mut Vec<(String, String)>,
+) {
+    let raster = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"];
+    let mut rest: &str = text;
+    while let Some(pos) = rest.find("url(") {
+        rest = &rest[pos + 4..];
+        let Some(end) = rest.find(')') else { break };
+        let inner = rest[..end].trim().trim_matches(|c| c == '"' || c == '\'').trim();
+        rest = &rest[end..];
+        let path_end = inner.find(['?', '#']).unwrap_or(inner.len());
+        let is_raster = raster.iter().any(|ext| inner[..path_end].to_ascii_lowercase().ends_with(ext));
+        if !is_raster {
+            continue;
+        }
+        let fetch_url = crate::images::resolve(fetch_base, inner);
+        if !(fetch_url.starts_with("http://") || fetch_url.starts_with("https://")) {
+            continue;
+        }
+        let key = crate::images::resolve(paint_base, inner);
+        if !out.iter().any(|(f, _)| *f == fetch_url) {
+            out.push((fetch_url, key));
+        }
+        if out.len() >= 50 {
+            crate::ledger::record_css("css-image-fetch-cap-reached");
+            return;
         }
     }
 }
@@ -245,29 +268,37 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
     )
     .await;
     let mut sheets = Vec::new();
+    let mut sheet_sources: Vec<(String, String)> = Vec::new(); // (sheet url, css)
     for (result, sheet_url) in sheet_results {
         match result {
-            Ok(css) => sheets.push(css),
+            Ok(css) => {
+                sheets.push(css.clone());
+                sheet_sources.push((sheet_url, css));
+            }
             Err(_) => crate::ledger::record_css(&format!("stylesheet-fetch-failed:{}", sheet_url)),
         }
     }
-    // <img> srcs plus CSS background images (scanned from the html — which
-    // carries <style> blocks and style="" attrs — and every fetched sheet).
-    // CSS urls resolve against the page base; a sheet-relative path on
-    // another host will miss and ledger as img-missing (honest gap).
-    let mut wanted = collect_image_urls(&base, &html);
-    let mut css_texts: Vec<&str> = vec![&html];
-    css_texts.extend(sheets.iter().map(|s| s.as_str()));
-    collect_css_image_urls(&base, &css_texts, &mut wanted);
+    // <img> srcs plus CSS background images. Each css ref carries a fetch
+    // URL (relative to its OWNING sheet's host) and a paint-lookup key
+    // (page-base resolution, which is what images::get computes at paint);
+    // the decoded image is stored under both.
+    let mut refs: Vec<(String, String)> = collect_image_urls(&base, &html)
+        .into_iter()
+        .map(|u| (u.clone(), u))
+        .collect();
+    collect_css_image_refs(&base, &base, &html, &mut refs);
+    for (sheet_url, css) in &sheet_sources {
+        collect_css_image_refs(sheet_url, &base, css, &mut refs);
+    }
     // Images likewise fetch concurrently; decode stays on this thread.
     let img_results = futures_util::future::join_all(
-        wanted
+        refs
             .into_iter()
-            .map(|u| async move { (fetch_bytes(&u).await, u) }),
+            .map(|(u, key)| async move { (fetch_bytes(&u).await, u, key) }),
     )
     .await;
     let mut images = Vec::new();
-    for (result, img_url) in img_results {
+    for (result, img_url, key) in img_results {
         match result {
             Ok(bytes) => {
                 let decoded = image::load_from_memory(&bytes)
@@ -275,7 +306,12 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
                     .map(|i| i.to_rgba8())
                     .or_else(|| crate::images::decode_svg(&bytes));
                 match decoded {
-                    Some(img) => images.push((img_url, img)),
+                    Some(img) => {
+                        if key != img_url {
+                            images.push((key, img.clone()));
+                        }
+                        images.push((img_url, img));
+                    }
                     None => crate::ledger::record_dom(&format!("img-decode-failed:{}", &img_url[..img_url.len().min(48)])),
                 }
             }
