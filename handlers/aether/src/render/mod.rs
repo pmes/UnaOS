@@ -17,6 +17,7 @@ struct Inherited {
     line_height: f32, // multiplier of font size
     underline: bool,
     nowrap: bool,
+    family: u8, // 0 sans, 1 serif, 2 mono
 }
 
 use crate::layout::default_font_size;
@@ -62,7 +63,7 @@ fn blend_px(surface: &mut [u8], width: u32, x: u32, y: u32, (r, g, b): (u8, u8, 
 /// (bold, glyph id, quarter-px font size); holds the coverage bitmap and
 /// its raster-bounds origin. Cleared implicitly by process lifetime —
 /// glyphs are font-global, not page-scoped.
-type GlyphKey = (bool, u32, u32);
+type GlyphKey = (u8, u32, u32); // (family*2+bold, glyph, quarter-px size)
 struct CachedGlyph {
     origin: (i32, i32),
     w: i32,
@@ -76,11 +77,11 @@ thread_local! {
 
 fn rasterize_glyph_cached(
     font: &Font,
-    bold: bool,
+    font_key: u8,
     glyph_id: u32,
     font_size: f32,
 ) -> Option<(i32, i32, i32, i32)> {
-    let key = (bold, glyph_id, (font_size * 4.0) as u32);
+    let key = (font_key, glyph_id, (font_size * 4.0) as u32);
     GLYPHS.with(|g| {
         if !g.borrow().contains_key(&key) {
             let computed = (|| {
@@ -125,7 +126,7 @@ fn rasterize_glyph_cached(
 /// Blends one cached glyph's coverage at (px_x baseline-relative already applied by caller).
 #[allow(clippy::too_many_arguments)]
 fn blit_cached_glyph(
-    bold: bool,
+    font_key: u8,
     glyph_id: u32,
     font_size: f32,
     origin_x: f32,
@@ -137,7 +138,7 @@ fn blit_cached_glyph(
     damage_rects: &[(u32, u32, u32, u32)],
     clip: Clip,
 ) {
-    let key = (bold, glyph_id, (font_size * 4.0) as u32);
+    let key = (font_key, glyph_id, (font_size * 4.0) as u32);
     GLYPHS.with(|g| {
         let g = g.borrow();
         let Some(Some(c)) = g.get(&key) else { return };
@@ -169,7 +170,7 @@ fn draw_text(
     origin_y: f32,
     max_width: f32,
     font: &Font,
-    bold: bool,
+    font_key: u8,
     font_size: f32,
     line_height_mult: f32,
     color: (u8, u8, u8),
@@ -208,9 +209,9 @@ fn draw_text(
             let Some(glyph_id) = font.glyph_for_char(c) else { continue };
             let advance = font.advance(glyph_id).map(|a| a.x() * scale).unwrap_or(font_size * 0.5);
             let baseline_y = origin_y + line as f32 * line_height + ascent;
-            if rasterize_glyph_cached(font, bold, glyph_id, font_size).is_some() {
+            if rasterize_glyph_cached(font, font_key, glyph_id, font_size).is_some() {
                 blit_cached_glyph(
-                    bold, glyph_id, font_size,
+                    font_key, glyph_id, font_size,
                     origin_x + pen_x, baseline_y,
                     color, surface, width, height, damage_rects, clip,
                 );
@@ -328,6 +329,9 @@ pub fn render_frame(
                     inherited.bold
                         || matches!(tag, "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th"),
                 );
+                inherited.family = spec
+                    .family
+                    .unwrap_or_else(|| crate::layout::default_family(tag, inherited.family));
                 if let Some(lh) = spec.line_height {
                     inherited.line_height = lh;
                 }
@@ -445,7 +449,7 @@ pub fn render_frame(
                                 current_y - sy as f32 + 3.0,
                                 layout_box.size.width.max(8.0) - 8.0,
                                 font,
-                                false,
+                                0,
                                 inherited.font_size.min(14.0),
                                 inherited.line_height,
                                 (60, 60, 60),
@@ -493,7 +497,21 @@ pub fn render_frame(
                     }
                 }
             } else if dom_node.as_text().is_some() {
-                let font = if inherited.bold { font_bold } else { font };
+                // Family font first (serif/mono), falling back to the
+                // preloaded sans pair; bold uses the sans-bold face for
+                // non-sans families (approximation).
+                let fam_font = if inherited.family != 0 && !inherited.bold {
+                    crate::layout::family_font(inherited.family)
+                } else {
+                    None
+                };
+                let font = if fam_font.is_some() {
+                    &fam_font
+                } else if inherited.bold {
+                    font_bold
+                } else {
+                    font
+                };
                 if let Some(font) = font {
                     let text = dom_node.text_contents();
                     let text = text.trim();
@@ -504,7 +522,7 @@ pub fn render_frame(
                             current_y - sy as f32,
                             if inherited.nowrap { f32::MAX } else { layout_box.size.width.max(1.0) },
                             font,
-                            inherited.bold,
+                            inherited.family * 2 + if inherited.bold { 1 } else { 0 },
                             inherited.font_size,
                             inherited.line_height,
                             inherited.color,
@@ -558,6 +576,7 @@ pub fn render_frame(
         line_height: 0.0, // natural
         underline: false,
         nowrap: false,
+        family: 0,
     };
     draw_node(
         layout.root_node,

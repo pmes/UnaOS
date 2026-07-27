@@ -244,6 +244,19 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 }
             }
         }
+        "font-family" => {
+            let v = value.to_ascii_lowercase();
+            let fam = if v.contains("monospace") || v.contains("courier") || v.contains("menlo") || v.contains("consolas") || v.contains("mono") {
+                2
+            } else if v.contains("sans") {
+                0
+            } else if v.contains("serif") || v.contains("georgia") || v.contains("times") || v.contains("libertine") {
+                1
+            } else {
+                0
+            };
+            style.paint.family = Some(fam);
+        }
         "font-size" => match parse_font_size(value) {
             Some(px) => style.paint.font_size = Some(px),
             None => crate::ledger::record_css(&format!("font-size-value:{}", clip(value))),
@@ -720,6 +733,7 @@ fn apply_spec_to_node(
     if style.paint.clip.is_some() { entry.clip = style.paint.clip; }
     if style.paint.underline.is_some() { entry.underline = style.paint.underline; }
     if style.paint.nowrap.is_some() { entry.nowrap = style.paint.nowrap; }
+    if style.paint.family.is_some() { entry.family = style.paint.family; }
 }
 
 /// Applies a set of stylesheets as ONE cascade — rules from every sheet
@@ -1066,6 +1080,7 @@ fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
     if p.clip.is_some() { dst.paint.clip = p.clip; }
     if p.underline.is_some() { dst.paint.underline = p.underline; }
     if p.nowrap.is_some() { dst.paint.nowrap = p.nowrap; }
+    if p.family.is_some() { dst.paint.family = p.family; }
 }
 
 /// Evaluates an @media condition against the fixed viewport. Comma = OR,
@@ -1133,6 +1148,7 @@ fn property_supported(prop: &str) -> bool {
             | "border" | "outline" | "border-color" | "border-width" | "border-style"
             | "border-top" | "border-right" | "border-bottom" | "border-left"
             | "text-decoration" | "text-decoration-line" | "white-space" | "box-sizing"
+            | "font-family"
     )
 }
 

@@ -26,6 +26,8 @@ pub struct PaintStyle {
     pub underline: Option<bool>,
     /// white-space:nowrap — text measures and draws on one line.
     pub nowrap: Option<bool>,
+    /// Font family class: 0 = sans (default), 1 = serif, 2 = monospace.
+    pub family: Option<u8>,
 }
 
 pub struct LayoutTree {
@@ -259,6 +261,38 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
     }
 }
 
+/// UA default font FAMILY per element: code-ish tags are monospace.
+pub fn default_family(tag: &str, inherited: u8) -> u8 {
+    match tag {
+        "code" | "pre" | "kbd" | "samp" | "tt" => 2,
+        _ => inherited,
+    }
+}
+
+/// Loads the (family, bold=false) fonts once per thread: [sans, serif, mono].
+pub fn family_font(family: u8) -> Option<std::sync::Arc<font_kit::font::Font>> {
+    thread_local! {
+        static FONTS: std::cell::RefCell<[Option<Option<std::sync::Arc<font_kit::font::Font>>>; 3]> =
+            const { std::cell::RefCell::new([None, None, None]) };
+    }
+    let idx = (family as usize).min(2);
+    FONTS.with(|f| {
+        let mut f = f.borrow_mut();
+        if f[idx].is_none() {
+            let name = match idx {
+                1 => font_kit::family_name::FamilyName::Serif,
+                2 => font_kit::family_name::FamilyName::Monospace,
+                _ => font_kit::family_name::FamilyName::SansSerif,
+            };
+            f[idx] = Some(
+                crate::fonts::FontEngine::new()
+                    .load_font(&[name], &font_kit::properties::Properties::new()),
+            );
+        }
+        f[idx].clone().flatten()
+    })
+}
+
 /// UA default font sizes per element (shared with the renderer).
 pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
     match tag {
@@ -277,13 +311,13 @@ pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
 pub fn remeasure(tree: &mut LayoutTree) {
     // Pass 1: resolve font size down the box tree for text leaves, and
     // intrinsic sizes for images.
-    let mut text_info: HashMap<taffy::NodeId, (String, f32, f32, bool)> = HashMap::new();
+    let mut text_info: HashMap<taffy::NodeId, (String, f32, f32, bool, u8)> = HashMap::new();
     let mut img_info: HashMap<taffy::NodeId, (f32, f32)> = HashMap::new();
     fn resolve(
         node_id: taffy::NodeId,
-        inherited: (f32, f32, bool), // (font size, line-height mult; 0 = natural, nowrap)
+        inherited: (f32, f32, bool, u8), // (font size, line-height; 0=natural, nowrap, family)
         tree: &LayoutTree,
-        out: &mut HashMap<taffy::NodeId, (String, f32, f32, bool)>,
+        out: &mut HashMap<taffy::NodeId, (String, f32, f32, bool, u8)>,
         imgs: &mut HashMap<taffy::NodeId, (f32, f32)>,
     ) {
         let mut size = inherited;
@@ -299,6 +333,9 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 if let Some(nw) = paint.and_then(|p| p.nowrap) {
                     size.2 = nw;
                 }
+                size.3 = paint
+                    .and_then(|p| p.family)
+                    .unwrap_or_else(|| default_family(el.name.local.as_ref(), inherited.3));
                 if el.name.local.as_ref() == "img" {
                     let attrs = el.attributes.borrow();
                     // width/height attributes win; else intrinsic dimensions.
@@ -318,7 +355,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 let text = dom_node.text_contents();
                 let text = text.trim().to_string();
                 if !text.is_empty() {
-                    out.insert(node_id, (text, inherited.0, inherited.1, inherited.2));
+                    out.insert(node_id, (text, inherited.0, inherited.1, inherited.2, inherited.3));
                 }
             }
         }
@@ -328,7 +365,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
             }
         }
     }
-    resolve(tree.root_node, (16.0, 0.0, false), tree, &mut text_info, &mut img_info);
+    resolve(tree.root_node, (16.0, 0.0, false, 0), tree, &mut text_info, &mut img_info);
 
     // Taffy caches leaf measurements; a cascade pass can change resolved
     // font sizes without touching the leaf's style, so stale cached sizes
@@ -357,7 +394,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
                     height: known.height.unwrap_or(h),
                 };
             }
-            let Some((text, font_size, line_mult, nowrap)) = text_info.get(&node_id) else {
+            let Some((text, font_size, line_mult, nowrap, family)) = text_info.get(&node_id) else {
                 return Size { width: known.width.unwrap_or(0.0), height: known.height.unwrap_or(0.0) };
             };
             let wrap_width = known.width.unwrap_or(match avail.width {
@@ -365,7 +402,9 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 _ => vw_cap,
             });
             let effective_wrap = if *nowrap { f32::MAX } else { wrap_width.max(1.0) };
-            let (w, h) = measure_text(font.as_deref(), text, *font_size, *line_mult, effective_wrap);
+            let fam_font = family_font(*family);
+            let use_font = fam_font.as_deref().or(font.as_deref());
+            let (w, h) = measure_text_family(use_font, *family, text, *font_size, *line_mult, effective_wrap);
             Size {
                 width: known.width.unwrap_or(w),
                 height: known.height.unwrap_or(h),
@@ -378,6 +417,17 @@ pub fn remeasure(tree: &mut LayoutTree) {
 /// renderer's wrap algorithm so painted text fits its measured box.
 fn measure_text(
     font: Option<&font_kit::font::Font>,
+    text: &str,
+    font_size: f32,
+    line_mult: f32,
+    max_width: f32,
+) -> (f32, f32) {
+    measure_text_family(font, 0, text, font_size, line_mult, max_width)
+}
+
+fn measure_text_family(
+    font: Option<&font_kit::font::Font>,
+    family: u8,
     text: &str,
     font_size: f32,
     line_mult: f32,
@@ -396,12 +446,12 @@ fn measure_text(
     // and the per-char glyph lookup was hot. Advances are in FONT UNITS
     // (size-independent); scale applies after.
     thread_local! {
-        static ADVANCES: std::cell::RefCell<HashMap<char, f32>> = RefCell::new(HashMap::new());
+        static ADVANCES: std::cell::RefCell<HashMap<(u8, char), f32>> = RefCell::new(HashMap::new());
     }
     use std::cell::RefCell;
     let advance_units = |c: char| -> f32 {
         ADVANCES.with(|m| {
-            if let Some(a) = m.borrow().get(&c) {
+            if let Some(a) = m.borrow().get(&(family, c)) {
                 return *a;
             }
             let a = font
@@ -409,7 +459,7 @@ fn measure_text(
                 .and_then(|g| font.advance(g).ok())
                 .map(|a| a.x())
                 .unwrap_or(0.0);
-            m.borrow_mut().insert(c, a);
+            m.borrow_mut().insert((family, c), a);
             a
         })
     };

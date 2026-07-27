@@ -971,6 +971,43 @@ mod tests {
         }
     }
 
+    /// font-family classes: css keywords map to sans/serif/mono; code-ish
+    /// tags default to monospace; the mono face measures wider than sans.
+    #[test]
+    fn test_font_family_classes() {
+        let html = r#"<html><body>
+            <p id="s">iiiiiiiiii</p>
+            <code id="m">iiiiiiiiii</code>
+            <p id="g" style="font-family: Georgia, serif">x</p>
+        </body></html>"#;
+        let document = dom::parse_html(html);
+        let mut layout_tree = layout::compute_layout(&document);
+        css::apply_css(&mut layout_tree, "");
+        // Measure the TEXT LEAVES (the block boxes stretch to the row).
+        let mut sans_w = 0.0f32;
+        let mut mono_w = 0.0f32;
+        for (node_id, dom_node) in &layout_tree.node_map {
+            if let Some(el) = dom_node.as_element() {
+                let paint = layout_tree.paint_map.get(node_id).cloned().unwrap_or_default();
+                if el.attributes.borrow().get("id") == Some("g") {
+                    assert_eq!(paint.family, Some(1), "Georgia maps to serif");
+                }
+                continue;
+            }
+            if dom_node.as_text().is_some() && dom_node.text_contents().trim() == "iiiiiiiiii" {
+                let w = layout_tree.taffy.layout(*node_id).unwrap().size.width;
+                let parent_tag = dom_node
+                    .parent()
+                    .and_then(|p| p.as_element().map(|e| e.name.local.as_ref().to_string()))
+                    .unwrap_or_default();
+                if parent_tag == "code" { mono_w = w; } else { sans_w = w; }
+            }
+        }
+        // Ten 'i's: monospace is far wider than proportional sans.
+        assert!(mono_w > sans_w * 1.5,
+            "mono must measure wider: mono={} sans={}", mono_w, sans_w);
+    }
+
     /// float:left/right sizes to content and hugs its edge (approximation).
     #[test]
     fn test_float_approximation() {
