@@ -124,10 +124,6 @@ pub fn collect_image_urls(base_url: &str, html: &str) -> Vec<String> {
             if src.starts_with("data:") {
                 continue; // decoded synchronously at load, no fetch needed
             }
-            if src.ends_with(".svg") {
-                crate::ledger::record_dom(&format!("img-src-unsupported:{}", &src[..src.len().min(24)]));
-                continue;
-            }
             let abs = crate::images::resolve(base_url, src);
             if (abs.starts_with("http://") || abs.starts_with("https://")) && !out.contains(&abs) {
                 out.push(abs);
@@ -145,7 +141,7 @@ pub fn collect_image_urls(base_url: &str, html: &str) -> Vec<String> {
 /// sheets, <style> blocks, style="" attrs — callers pass raw text; the scan
 /// is textual so it needs no CSS object model). Capped like images.
 pub fn collect_css_image_urls(base_url: &str, texts: &[&str], out: &mut Vec<String>) {
-    let raster = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"];
+    let raster = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"];
     for text in texts {
         let mut rest: &str = text;
         while let Some(pos) = rest.find("url(") {
@@ -211,10 +207,16 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
     let mut images = Vec::new();
     for img_url in wanted {
         match fetch_bytes(&img_url).await {
-            Ok(bytes) => match image::load_from_memory(&bytes) {
-                Ok(img) => images.push((img_url, img.to_rgba8())),
-                Err(_) => crate::ledger::record_dom(&format!("img-decode-failed:{}", &img_url[..img_url.len().min(48)])),
-            },
+            Ok(bytes) => {
+                let decoded = image::load_from_memory(&bytes)
+                    .ok()
+                    .map(|i| i.to_rgba8())
+                    .or_else(|| crate::images::decode_svg(&bytes));
+                match decoded {
+                    Some(img) => images.push((img_url, img)),
+                    None => crate::ledger::record_dom(&format!("img-decode-failed:{}", &img_url[..img_url.len().min(48)])),
+                }
+            }
             Err(_) => crate::ledger::record_dom(&format!("img-fetch-failed:{}", &img_url[..img_url.len().min(48)])),
         }
     }

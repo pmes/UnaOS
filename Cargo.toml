@@ -48,3 +48,9 @@ default-members = [
     "tools/unafs_bench",
     "tools/sentinel"
 ]
+
+# Dev builds keep our crates debuggable but compile dependencies optimized —
+# selector matching / HTML parsing / rasterization live in deps, and a debug
+# cascade on a rule-heavy page (wikipedia) costs ~40s CPU without this.
+[profile.dev.package."*"]
+opt-level = 2

@@ -499,7 +499,59 @@ mod tests {
             &[".hero { background: #333 url(/img/bg.jpg) }", "body { background-image: url(x.svg) }"],
             &mut urls,
         );
-        assert_eq!(urls, vec!["https://example.com/img/bg.jpg".to_string()],
-            "raster css urls resolve; svg skipped");
+        assert_eq!(urls, vec![
+            "https://example.com/img/bg.jpg".to_string(),
+            "https://example.com/x.svg".to_string(),
+        ], "raster AND svg css urls resolve against the base");
+    }
+
+    /// SVG decodes to straight-alpha RGBA, from bytes and from a plain
+    /// (non-base64) data: URI.
+    #[test]
+    fn test_svg_decode() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="#ff0000"/></svg>"##;
+        let img = crate::images::decode_svg(svg).expect("svg must decode");
+        assert_eq!((img.width(), img.height()), (10, 10));
+        assert_eq!(img.get_pixel(5, 5).0, [255, 0, 0, 255]);
+
+        let uri = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'><rect width='4' height='4' fill='%2300ff00'/></svg>";
+        let img = crate::images::get(uri).expect("plain svg data uri must decode");
+        assert_eq!(img.get_pixel(1, 1).0, [0, 255, 0, 255]);
+    }
+
+    /// :hover/:focus rules must not apply to a static render.
+    #[test]
+    fn test_hover_focus_not_applied() {
+        let html = r#"<html><body><a id="x" href="/">link</a></body></html>"#;
+        let document = dom::parse_html(html);
+        let mut layout_tree = layout::compute_layout(&document);
+        css::apply_css(&mut layout_tree, r#"
+            a:hover { color: red; }
+            a:focus { color: yellow; }
+            a { font-size: 20px; }
+        "#);
+        let paint = layout_tree.node_map.iter()
+            .find(|(_, n)| n.as_element().map_or(false, |e| e.name.local.as_ref() == "a"))
+            .map(|(id, _)| layout_tree.paint_map.get(id).cloned().unwrap_or_default())
+            .unwrap();
+        assert_eq!(paint.color, None, ":hover/:focus must not match a static render");
+        assert_eq!(paint.font_size, Some(20.0), "plain tag rule still applies");
+    }
+
+    /// float:left/right sizes to content and hugs its edge (approximation).
+    #[test]
+    fn test_float_approximation() {
+        let html = r#"<html><body><div id="f">float</div><div>after</div></body></html>"#;
+        let document = dom::parse_html(html);
+        let mut layout_tree = layout::compute_layout(&document);
+        css::apply_css(&mut layout_tree, "#f { float: right; }");
+        for (node_id, dom_node) in &layout_tree.node_map {
+            let Some(el) = dom_node.as_element() else { continue };
+            if el.attributes.borrow().get("id") == Some("f") {
+                let s = layout_tree.taffy.style(*node_id).unwrap();
+                assert_eq!(s.align_self, Some(taffy::style::AlignSelf::END));
+                assert_eq!(s.size.width, taffy::style::Dimension::auto());
+            }
+        }
     }
 }

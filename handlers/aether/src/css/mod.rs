@@ -21,6 +21,7 @@ pub(crate) struct SpecifiedStyle {
     pub inset_right: Option<LengthPercentageAuto>,
     pub inset_bottom: Option<LengthPercentageAuto>,
     pub justify: Option<taffy::style::JustifyContent>,
+    pub align_self: Option<taffy::style::AlignSelf>,
     pub paint: PaintStyle,
 }
 
@@ -49,6 +50,9 @@ impl SpecifiedStyle {
         if let Some(v) = self.inset_bottom { node_style.inset.bottom = v; }
         if let Some(j) = self.justify {
             node_style.justify_content = Some(j);
+        }
+        if let Some(a) = self.align_self {
+            node_style.align_self = Some(a);
         }
         if let Some((w, _)) = self.paint.border {
             let b = LengthPercentage::length(w);
@@ -129,6 +133,21 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
         "left" => style.inset_left = parse_length_percentage_auto_str(value),
         "right" => style.inset_right = parse_length_percentage_auto_str(value),
         "bottom" => style.inset_bottom = parse_length_percentage_auto_str(value),
+        // Float approximation: no real float layout (text does not wrap
+        // around the box), but a floated box sizes to content and hugs its
+        // edge instead of stretching full width.
+        "float" => match value {
+            "left" => {
+                style.width = Some(Dimension::auto());
+                style.align_self = Some(taffy::style::AlignSelf::START);
+            }
+            "right" => {
+                style.width = Some(Dimension::auto());
+                style.align_self = Some(taffy::style::AlignSelf::END);
+            }
+            "none" | "inherit" | "initial" | "unset" => {}
+            other => crate::ledger::record_css(&format!("float:{}", other)),
+        },
         "text-align" => match value {
             "center" => style.justify = Some(taffy::style::JustifyContent::CENTER),
             "right" | "end" => style.justify = Some(taffy::style::JustifyContent::END),
@@ -254,7 +273,7 @@ pub(crate) fn extract_css_url(value: &str) -> Option<String> {
     let rest = &value[start + 4..];
     let end = rest.find(')')?;
     let inner = rest[..end].trim().trim_matches(|c| c == '"' || c == '\'').trim();
-    if inner.is_empty() || inner.starts_with("data:image/svg") {
+    if inner.is_empty() {
         return None;
     }
     Some(inner.to_string())
@@ -272,6 +291,62 @@ struct Rule {
     selector: kuchiki::Selector,
     style: std::rc::Rc<SpecifiedStyle>,
     important: bool,
+    key: RuleKey,
+}
+
+/// Rule-hash key: the rightmost compound's most selective simple selector.
+/// An element only needs to test rules whose key it can possibly satisfy —
+/// the standard cascade optimization (matching was the profiled hot path).
+#[derive(Debug, PartialEq)]
+enum RuleKey {
+    Id(String),
+    Class(String),
+    Tag(String),
+    Universal,
+}
+
+/// Derives the RuleKey from a single selector's text. Conservative: any
+/// pseudo/attr syntax in the rightmost compound falls back to Universal
+/// (always tested) rather than risking a wrong bucket.
+fn rule_key(selector_text: &str) -> RuleKey {
+    let s = selector_text.trim();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth -= 1,
+            ' ' | '\t' | '>' | '+' | '~' if depth == 0 => start = i + c.len_utf8(),
+            _ => {}
+        }
+    }
+    let comp = s[start..].trim();
+    // Pseudo-classes and attribute selectors only NARROW a compound, so the
+    // simple-selector prefix before the first ':'/'[' is still a valid
+    // bucket key ("li:first-child" can only match an <li>). A compound that
+    // STARTS with ':'/'[' gives no such guarantee → Universal.
+    let comp = &comp[..comp.find([':', '[']).unwrap_or(comp.len())];
+    if let Some(p) = comp.rfind('.') {
+        let rest = &comp[p + 1..];
+        let end = rest.find(['.', '#']).unwrap_or(rest.len());
+        if !rest[..end].is_empty() {
+            return RuleKey::Class(rest[..end].to_string());
+        }
+    }
+    if let Some(p) = comp.rfind('#') {
+        let rest = &comp[p + 1..];
+        let end = rest.find(['.', '#']).unwrap_or(rest.len());
+        if !rest[..end].is_empty() {
+            return RuleKey::Id(rest[..end].to_string());
+        }
+    }
+    let end = comp.find(['.', '#']).unwrap_or(comp.len());
+    let tag = comp[..end].trim();
+    if tag.is_empty() || tag == "*" {
+        RuleKey::Universal
+    } else {
+        RuleKey::Tag(tag.to_ascii_lowercase())
+    }
 }
 
 pub fn apply_css(layout_tree: &mut LayoutTree, css: &str) {
@@ -329,32 +404,71 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
             .then(a.selector.specificity().cmp(&b.selector.specificity()))
     });
 
+    // Element refs computed ONCE — matching is O(rules × elements) either
+    // way, but the per-pair node_map lookup + ref construction was the
+    // hot-path churn on rule-heavy pages.
+    let elements: Vec<(taffy::NodeId, kuchiki::NodeDataRef<kuchiki::ElementData>)> = layout_tree
+        .node_map
+        .iter()
+        .filter_map(|(id, n)| n.clone().into_element_ref().map(|el| (*id, el)))
+        .collect();
+
     // Inline style="" tiers, parsed once per node.
-    let node_ids: Vec<taffy::NodeId> = layout_tree.node_map.keys().copied().collect();
     let mut inline_tiers: Vec<(taffy::NodeId, SpecifiedStyle, SpecifiedStyle, bool)> = Vec::new();
-    for node_id in &node_ids {
-        let Some(dom_node) = layout_tree.node_map.get(node_id) else { continue };
-        let Some(el) = dom_node.as_element() else { continue };
-        let Some(inline) = el.attributes.borrow().get("style").map(|s| s.to_string()) else { continue };
+    for (node_id, el_ref) in &elements {
+        let Some(inline) = el_ref.attributes.borrow().get("style").map(|s| s.to_string()) else { continue };
         let (normal, important, has_important) = parse_declaration_block_tiers(&inline);
         inline_tiers.push((*node_id, normal, important, has_important));
     }
 
-    let mut abs_nodes = std::collections::HashSet::new();
-    let mut inset_nodes = std::collections::HashSet::new();
-
-    let mut apply_rules = |layout_tree: &mut LayoutTree,
-                           rules: &[&Rule],
-                           abs: &mut std::collections::HashSet<taffy::NodeId>,
-                           ins: &mut std::collections::HashSet<taffy::NodeId>| {
-        for rule in rules {
-            for node_id in &node_ids {
-                let Some(dom_node) = layout_tree.node_map.get(node_id) else { continue };
-                let Some(el_ref) = dom_node.clone().into_element_ref() else { continue };
-                if !rule.selector.matches(&el_ref) {
-                    continue;
+    // Accumulate each node's winning declarations in cascade order, then
+    // apply ONCE per node — one taffy style clone/set per styled node
+    // instead of one per matching rule.
+    let mut acc: std::collections::HashMap<taffy::NodeId, SpecifiedStyle> =
+        std::collections::HashMap::new();
+    let merge_rules = |rules: &[&Rule], acc: &mut std::collections::HashMap<taffy::NodeId, SpecifiedStyle>| {
+        // Rule hash: an element only tests rules whose rightmost key it
+        // carries (plus Universal), in original (cascade) index order.
+        use std::collections::HashMap;
+        let mut by_id: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut by_class: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut by_tag: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut universal: Vec<usize> = Vec::new();
+        for (i, rule) in rules.iter().enumerate() {
+            match &rule.key {
+                RuleKey::Id(k) => by_id.entry(k).or_default().push(i),
+                RuleKey::Class(k) => by_class.entry(k).or_default().push(i),
+                RuleKey::Tag(k) => by_tag.entry(k).or_default().push(i),
+                RuleKey::Universal => universal.push(i),
+            }
+        }
+        let mut candidates: Vec<usize> = Vec::new();
+        for (node_id, el_ref) in &elements {
+            candidates.clear();
+            candidates.extend_from_slice(&universal);
+            if let Some(v) = by_tag.get(el_ref.name.local.as_ref()) {
+                candidates.extend_from_slice(v);
+            }
+            {
+                let attrs = el_ref.attributes.borrow();
+                if let Some(id) = attrs.get("id") {
+                    if let Some(v) = by_id.get(id) {
+                        candidates.extend_from_slice(v);
+                    }
                 }
-                apply_spec_to_node(layout_tree, *node_id, &rule.style, abs, ins);
+                if let Some(classes) = attrs.get("class") {
+                    for class in classes.split_whitespace() {
+                        if let Some(v) = by_class.get(class) {
+                            candidates.extend_from_slice(v);
+                        }
+                    }
+                }
+            }
+            candidates.sort_unstable();
+            for &i in candidates.iter() {
+                if rules[i].selector.matches(el_ref) {
+                    merge_specified(acc.entry(*node_id).or_default(), &rules[i].style);
+                }
             }
         }
     };
@@ -362,15 +476,21 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     let normal: Vec<&Rule> = rules.iter().filter(|r| !r.important).collect();
     let important: Vec<&Rule> = rules.iter().filter(|r| r.important).collect();
 
-    apply_rules(layout_tree, &normal, &mut abs_nodes, &mut inset_nodes);
+    merge_rules(&normal, &mut acc);
     for (node_id, normal_spec, _, _) in &inline_tiers {
-        apply_spec_to_node(layout_tree, *node_id, normal_spec, &mut abs_nodes, &mut inset_nodes);
+        merge_specified(acc.entry(*node_id).or_default(), normal_spec);
     }
-    apply_rules(layout_tree, &important, &mut abs_nodes, &mut inset_nodes);
+    merge_rules(&important, &mut acc);
     for (node_id, _, important_spec, has_important) in &inline_tiers {
         if *has_important {
-            apply_spec_to_node(layout_tree, *node_id, important_spec, &mut abs_nodes, &mut inset_nodes);
+            merge_specified(acc.entry(*node_id).or_default(), important_spec);
         }
+    }
+
+    let mut abs_nodes = std::collections::HashSet::new();
+    let mut inset_nodes = std::collections::HashSet::new();
+    for (node_id, spec) in &acc {
+        apply_spec_to_node(layout_tree, *node_id, spec, &mut abs_nodes, &mut inset_nodes);
     }
 
     // Static-position fallback: `position:absolute` with no inset specified
@@ -460,14 +580,16 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
         let (normal, important, has_important) = parse_declaration_block_tiers(&body);
         let normal = std::rc::Rc::new(normal);
         for selector in selectors.0 {
-            rules.push(Rule { selector, style: normal.clone(), important: false });
+            let key = rule_key(&selector.to_string());
+            rules.push(Rule { selector, style: normal.clone(), important: false, key });
         }
         if has_important {
             // Selector isn't Clone; the important tier compiles its own copy.
             if let Ok(selectors) = kuchiki::Selectors::compile(&prelude) {
                 let important = std::rc::Rc::new(important);
                 for selector in selectors.0 {
-                    rules.push(Rule { selector, style: important.clone(), important: true });
+                    let key = rule_key(&selector.to_string());
+                    rules.push(Rule { selector, style: important.clone(), important: true, key });
                 }
             }
         }
@@ -519,7 +641,7 @@ fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
         ($($f:ident),*) => { $( if src.$f.is_some() { dst.$f = src.$f; } )* };
     }
     take!(display, flex_direction, width, height, padding, margin, position,
-          inset_top, inset_left, inset_right, inset_bottom, justify);
+          inset_top, inset_left, inset_right, inset_bottom, justify, align_self);
     let p = &src.paint;
     if p.background.is_some() { dst.paint.background = p.background; }
     if p.color.is_some() { dst.paint.color = p.color; }
@@ -808,6 +930,23 @@ mod tests {
         assert_eq!(parse_color_str("rgba(10, 20, 30, 0)"), None);
         assert_eq!(parse_color_str("#abc"), Some((170, 187, 204)));
         assert_eq!(parse_color_str("#336699"), Some((51, 102, 153)));
+    }
+
+    #[test]
+    fn test_rule_key() {
+        assert_eq!(rule_key("div.hero"), RuleKey::Class("hero".into()));
+        assert_eq!(rule_key("#nav > ul li.item"), RuleKey::Class("item".into()));
+        assert_eq!(rule_key("body #main"), RuleKey::Id("main".into()));
+        assert_eq!(rule_key("nav ul > li"), RuleKey::Tag("li".into()));
+        assert_eq!(rule_key("*"), RuleKey::Universal);
+        // Pseudo/attr narrow a compound; the prefix still buckets it.
+        assert_eq!(rule_key("li:first-child"), RuleKey::Tag("li".into()));
+        assert_eq!(rule_key("input[type=text]"), RuleKey::Tag("input".into()));
+        assert_eq!(rule_key(".menu:hover"), RuleKey::Class("menu".into()));
+        assert_eq!(rule_key(":checked"), RuleKey::Universal);
+        assert_eq!(rule_key("[hidden]"), RuleKey::Universal);
+        // Combinator inside a functional pseudo must not split the compound.
+        assert_eq!(rule_key(":is(a > b).x"), RuleKey::Universal);
     }
 
     #[test]

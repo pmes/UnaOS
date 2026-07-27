@@ -54,22 +54,74 @@ pub fn get(src: &str) -> Option<Rc<image::RgbaImage>> {
     })
 }
 
-/// Decodes the payload of a data: URI (base64 raster formats only).
+/// Decodes the payload of a data: URI (base64 raster, or SVG in base64 or
+/// percent-encoded/plain form).
 fn decode_data_uri(rest: &str) -> Option<image::RgbaImage> {
     use base64::Engine as _;
     let (meta, payload) = rest.split_once(',')?;
-    if !meta.contains("base64") || meta.contains("svg") {
-        crate::ledger::record_dom("img-data-uri-unsupported");
-        return None;
+    let bytes = if meta.contains("base64") {
+        base64::engine::general_purpose::STANDARD.decode(payload.trim()).ok()?
+    } else {
+        // Plain/percent-encoded payload (common for inline SVG).
+        percent_decode(payload).into_bytes()
+    };
+    let decoded = if meta.contains("svg") {
+        decode_svg(&bytes)
+    } else {
+        image::load_from_memory(&bytes).ok().map(|i| i.to_rgba8())
+    };
+    if decoded.is_none() {
+        crate::ledger::record_dom("img-data-uri-decode-failed");
     }
-    let bytes = base64::engine::general_purpose::STANDARD.decode(payload.trim()).ok()?;
-    match image::load_from_memory(&bytes) {
-        Ok(img) => Some(img.to_rgba8()),
-        Err(_) => {
-            crate::ledger::record_dom("img-data-uri-decode-failed");
-            None
+    decoded
+}
+
+/// Minimal %XX decoder for data: URI payloads ('+' left as-is per RFC 2397).
+fn percent_decode(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Rasterizes SVG bytes at the document's intrinsic size (capped) into a
+/// straight-alpha RGBA image.
+pub fn decode_svg(bytes: &[u8]) -> Option<image::RgbaImage> {
+    let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok()?;
+    let size = tree.size();
+    // Cap the raster so a viewBox-huge svg cannot allocate wildly; the
+    // renderer scales at paint time anyway.
+    let scale = (1024.0 / size.width().max(size.height())).min(1.0);
+    let w = (size.width() * scale).ceil().max(1.0) as u32;
+    let h = (size.height() * scale).ceil().max(1.0) as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    // tiny-skia pixels are premultiplied; the blitters expect straight alpha.
+    let mut data = pixmap.take();
+    for px in data.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        if a > 0 && a < 255 {
+            px[0] = (px[0] as u32 * 255 / a).min(255) as u8;
+            px[1] = (px[1] as u32 * 255 / a).min(255) as u8;
+            px[2] = (px[2] as u32 * 255 / a).min(255) as u8;
         }
     }
+    image::RgbaImage::from_raw(w, h, data)
 }
 
 /// Resolves a possibly-relative URL against a base.
