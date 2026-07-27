@@ -177,6 +177,16 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             "none" | "inherit" | "initial" | "unset" => {}
             other => crate::ledger::record_css(&format!("float:{}", other)),
         },
+        // The image-replacement idiom: a huge negative text-indent hides
+        // the fallback text (the visible wordmark is a sibling image).
+        // Small indents are ignored (no first-line indent support).
+        "text-indent" => {
+            if let Some(px) = parse_px(value) {
+                if px <= -999.0 {
+                    style.paint.hidden = Some(true);
+                }
+            }
+        }
         "text-align" => match value {
             "center" => style.justify = Some(taffy::style::JustifyContent::CENTER),
             "right" | "end" => style.justify = Some(taffy::style::JustifyContent::END),
@@ -1153,9 +1163,17 @@ pub fn parse_font_weight(value: &str) -> Option<bool> {
     }
 }
 
-/// Parses "NNpx" (or a bare number) into pixels.
+/// Parses a length into pixels: px, rem/em (16px base — em is not
+/// parent-relative, same approximation as font-size), or a bare number.
 pub fn parse_px(value: &str) -> Option<f32> {
     let v = value.trim();
+    if let Some(n) = v
+        .strip_suffix("rem")
+        .or_else(|| v.strip_suffix("em"))
+        .and_then(|n| n.trim().parse::<f32>().ok())
+    {
+        return Some(n * 16.0);
+    }
     v.strip_suffix("px").unwrap_or(v).trim().parse::<f32>().ok()
 }
 
