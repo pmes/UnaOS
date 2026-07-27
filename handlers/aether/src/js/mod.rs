@@ -159,6 +159,11 @@ impl Engine {
                          addListener: function () {}, removeListener: function () {},
                          addEventListener: function () {}, removeEventListener: function () {} };
             };
+            globalThis.Element = function () {};
+            Element.prototype = {};
+            globalThis.Node = function () {};
+            Node.prototype = {};
+            globalThis.HTMLElement = Element;
             globalThis.Image = function (w, h) {
                 this.width = w || 0; this.height = h || 0;
                 this.src = ''; this.complete = false;
