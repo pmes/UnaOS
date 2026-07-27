@@ -30,6 +30,9 @@ enum Commands {
         /// Ledger dump path
         #[arg(long, default_value = "aether-ledger.txt")]
         ledger: std::path::PathBuf,
+        /// Scroll offset (px) before rendering — audit below the fold
+        #[arg(long, default_value_t = 0.0)]
+        scroll: f64,
     },
 }
 
@@ -89,9 +92,9 @@ async fn main() -> Result<()> {
             
             ignite(synapse).await?;
         }
-        Commands::Render { url, html, out, ledger } => {
+        Commands::Render { url, html, out, ledger, scroll } => {
             let (w, h, missing) =
-                aether::headless::render_headless(url.as_deref(), html.as_deref(), out, ledger).await?;
+                aether::headless::render_headless_scrolled(url.as_deref(), html.as_deref(), out, ledger, *scroll).await?;
             println!(
                 "rendered {}x{} -> {} | {} missing APIs -> {}",
                 w, h, out.display(), missing, ledger.display()

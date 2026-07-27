@@ -102,7 +102,10 @@ pub fn collect_image_urls(base_url: &str, html: &str) -> Vec<String> {
         for img in imgs {
             let attrs = img.attributes.borrow();
             let Some(src) = attrs.get("src") else { continue };
-            if src.starts_with("data:") || src.ends_with(".svg") {
+            if src.starts_with("data:") {
+                continue; // decoded synchronously at load, no fetch needed
+            }
+            if src.ends_with(".svg") {
                 crate::ledger::record_dom(&format!("img-src-unsupported:{}", &src[..src.len().min(24)]));
                 continue;
             }

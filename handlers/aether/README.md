@@ -63,3 +63,5 @@ document for inspection.
 - `pathfinder_geometry` — font-kit's own geometry types (Transform2F, vectors),
   required to call its glyph rasterizer for text rendering; no new transitive
   weight (already in-tree via font-kit).
+- `base64` — decoding `data:image/...;base64` URIs (already in-tree via other
+  workspace deps; latest stable).

@@ -83,6 +83,11 @@ pub fn compute_layout(dom: &NodeRef) -> LayoutTree {
             if is_non_rendered(el.name.local.as_ref()) {
                 return None;
             }
+            // The HTML hidden attribute / aria-hidden remove the subtree.
+            let attrs = el.attributes.borrow();
+            if attrs.get("hidden").is_some() || attrs.get("aria-hidden") == Some("true") {
+                return None;
+            }
         } else if dom_node.as_text().is_some() {
             // Whitespace-only text produces no box.
             if dom_node.text_contents().trim().is_empty() {

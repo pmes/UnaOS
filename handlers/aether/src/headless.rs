@@ -10,6 +10,17 @@ pub async fn render_headless(
     out: &Path,
     ledger_path: &Path,
 ) -> anyhow::Result<(u32, u32, usize)> {
+    render_headless_scrolled(url, html_file, out, ledger_path, 0.0).await
+}
+
+/// render_headless with a pre-render scroll offset (below-the-fold audits).
+pub async fn render_headless_scrolled(
+    url: Option<&str>,
+    html_file: Option<&Path>,
+    out: &Path,
+    ledger_path: &Path,
+    scroll: f64,
+) -> anyhow::Result<(u32, u32, usize)> {
     crate::ledger::reset();
     let mut engine = AetherEngine::new();
 
@@ -29,6 +40,10 @@ pub async fn render_headless(
         (None, None) => anyhow::bail!("render needs a URL or --html <file>"),
     }
 
+    if scroll > 0.0 {
+        engine.scroll_y = scroll;
+        engine.damage_rects.push((0, 0, engine.width, engine.height));
+    }
     engine.render_frame();
 
     let (w, h) = (engine.width, engine.height);
