@@ -57,3 +57,9 @@ document for inspection.
 - [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)
   — the handler/vessel/Bandy component model.
 - [`docs/CODEX.md`](../../docs/CODEX.md) — the full handler manifest.
+
+## Dependency notes
+
+- `pathfinder_geometry` — font-kit's own geometry types (Transform2F, vectors),
+  required to call its glyph rasterizer for text rendering; no new transitive
+  weight (already in-tree via font-kit).

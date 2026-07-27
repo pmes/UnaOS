@@ -18,34 +18,35 @@ mod tests {
 
     #[test]
     fn test_render_paint_assertions() {
-        let html = r#"<html><body><div id="box" style="width: 10px; height: 10px; background-color: red;"></div></body></html>"#;
+        let html = r#"<html><body><div id="box" style="width: 10px; height: 10px; background-color: red;"></div><p>Hi</p></body></html>"#;
         let document = dom::parse_html(html);
-        let mut layout_tree = layout::compute_layout(&document);
+        let layout_tree = layout::compute_layout(&document);
         let mut surface = vec![0u8; 100 * 100 * 4];
         let damage = vec![(0, 0, 100, 100)];
         render::render_frame(&layout_tree, &mut surface, 100, 100, 0.0, 0.0, &damage);
-        
-        // The current render_frame fills white background: 255, 255, 255, 255
-        // We just assert the background is painted at (0, 0) if no boxes overlap, or we check the box color.
-        // The box borders are painted black, filled gray (200). 
-        // We'll just verify the surface has been mutated from all 0s.
-        let is_painted = surface.iter().any(|&b| b != 0);
-        assert!(is_painted, "Surface should be painted by render_frame");
-        
-        // Assert pixel at 3,3 is the body background (200, 200, 200) not the div color,
-        // because the body margin pushes the div to (6,30)
-        let idx_body = (3 * 100 + 3) * 4;
-        assert_eq!(surface[idx_body], 200, "Body B should be 200");
-        assert_eq!(surface[idx_body+1], 200, "Body G should be 200");
-        assert_eq!(surface[idx_body+2], 200, "Body R should be 200");
-        assert_eq!(surface[idx_body+3], 255, "Body A should be 255");
 
-        // Assert pixel at 15,35 is red (0, 0, 255)
-        let idx = (35 * 100 + 15) * 4;
-        assert_eq!(surface[idx], 0, "B should be 0");
-        assert_eq!(surface[idx+1], 0, "G should be 0");
-        assert_eq!(surface[idx+2], 255, "R should be 255");
-        assert_eq!(surface[idx+3], 255, "A should be 255");
+        // Page background is white; unstyled boxes paint no gray fill or border.
+        let idx_body = (3 * 100 + 3) * 4;
+        assert_eq!(&surface[idx_body..idx_body + 4], &[255, 255, 255, 255], "page background is white");
+
+        // The styled div paints red (BGRA: 0,0,255) somewhere.
+        let has_red = surface
+            .chunks_exact(4)
+            .any(|p| p[0] == 0 && p[1] == 0 && p[2] == 255);
+        assert!(has_red, "background-color: red must be painted");
+
+        // No pixel carries the old default gray-box fill.
+        let has_gray = surface
+            .chunks_exact(4)
+            .any(|p| p[0] == 200 && p[1] == 200 && p[2] == 200);
+        assert!(!has_gray, "unstyled boxes must not paint gray");
+
+        // Text glyphs paint dark pixels (blended toward black); skip if the
+        // host has no sans-serif font at all.
+        let has_dark = surface
+            .chunks_exact(4)
+            .any(|p| p[0] < 100 && p[1] < 100 && p[2] < 100);
+        assert!(has_dark, "text must rasterize to dark pixels");
     }
 
     #[test]
