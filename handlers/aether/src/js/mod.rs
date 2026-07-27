@@ -15,6 +15,8 @@ thread_local! {
         document: None,
         nodes: HashMap::new(),
         next_id: 1,
+        mutated: false,
+        handlers: Vec::new(),
     });
 }
 
@@ -22,6 +24,54 @@ pub(crate) struct DomState {
     pub(crate) document: Option<NodeRef>,
     pub(crate) nodes: HashMap<i32, NodeRef>,
     pub(crate) next_id: i32,
+    /// Set by mutating DOM bindings; the engine consumes it to relayout.
+    pub(crate) mutated: bool,
+    /// (node id, event name) registrations; the callbacks themselves live
+    /// in the JS global `__handlers` array (GC objects must not outlive
+    /// the boa context, so Rust never holds them).
+    pub(crate) handlers: Vec<(i32, String)>,
+}
+
+/// True (and cleared) if the DOM was mutated by script since last asked.
+pub fn take_mutated() -> bool {
+    DOM_STATE.with(|s| std::mem::take(&mut s.borrow_mut().mutated))
+}
+
+/// Dispatches `event` to listeners on `node` and its ancestors (capture-less
+/// bubble). Returns true if any handler ran. Registrations are matched via
+/// DOM_STATE indices; the callbacks are fetched from the JS `__handlers`
+/// array by position, so no GC object crosses into Rust storage.
+pub fn dispatch_event(context: &mut Context, node: &NodeRef, event: &str) -> bool {
+    // Find matching registration indices first — handlers may mutate the DOM.
+    let mut indices = Vec::new();
+    DOM_STATE.with(|s| {
+        let s = s.borrow();
+        let mut cur = Some(node.clone());
+        while let Some(n) = cur {
+            for (idx, (id, ev)) in s.handlers.iter().enumerate() {
+                if ev == event {
+                    if let Some(reg) = s.nodes.get(id) {
+                        if reg == &n {
+                            indices.push(idx);
+                        }
+                    }
+                }
+            }
+            cur = n.parent();
+        }
+    });
+    for idx in &indices {
+        let _ = context.eval(boa_engine::Source::from_bytes(&format!(
+            "if (globalThis.__handlers && globalThis.__handlers[{}]) globalThis.__handlers[{}]();",
+            idx, idx
+        )));
+    }
+    if !indices.is_empty() {
+        DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+        true
+    } else {
+        false
+    }
 }
 
 impl DomState {
@@ -47,10 +97,13 @@ impl Engine {
             let mut state = state.borrow_mut();
             state.document = Some(document.clone());
             state.nodes.clear();
+            state.handlers.clear();
+            state.mutated = false;
         });
 
         let mut context = crate::event_loop::create_context();
         
+        let _ = context.eval(boa_engine::Source::from_bytes("globalThis.__handlers = [];"));
         Self::setup_console(&mut context);
         Self::setup_document(&mut context, document);
         crate::api::window::setup_window(&mut context);
@@ -162,6 +215,7 @@ impl Engine {
                     
                     if let (Some(p), Some(c)) = (parent, child) {
                         p.append(c);
+                        DOM_STATE.with(|s| s.borrow_mut().mutated = true);
                     }
                     Ok(JsValue::undefined())
                 }),
@@ -193,6 +247,7 @@ impl Engine {
                             }
                         }
                     }
+                    DOM_STATE.with(|s| s.borrow_mut().mutated = true);
                     Ok(JsValue::undefined())
                 }),
                 boa_engine::string::JsString::from("innerHTML"),
@@ -211,6 +266,7 @@ impl Engine {
                                 child.detach();
                             }
                             n.append(kuchiki::NodeRef::new_text(text));
+                            DOM_STATE.with(|s| s.borrow_mut().mutated = true);
                         }
                     }
                     Ok(JsValue::undefined())
@@ -226,6 +282,7 @@ impl Engine {
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
                         if let Some(el) = n.as_element() {
                             el.attributes.borrow_mut().insert(name.as_str(), value);
+                            DOM_STATE.with(|s| s.borrow_mut().mutated = true);
                         }
                     }
                     Ok(JsValue::undefined())
@@ -250,8 +307,23 @@ impl Engine {
                 1,
             )
             .function(
-                NativeFunction::from_fn_ptr(|_, _, _| {
-                    crate::ledger::record_js("EventTarget.addEventListener");
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let event = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                    if let Some(cb) = args.get(1).and_then(|v| v.as_object()) {
+                        // The callback lives in the JS __handlers array; Rust
+                        // records only (node id, event) at the same index.
+                        let global = ctx.global_object();
+                        if let Ok(arr_val) = global.get(boa_engine::string::JsString::from("__handlers"), ctx) {
+                            if let Some(arr) = arr_val.as_object() {
+                                if let Ok(len_v) = arr.get(boa_engine::string::JsString::from("length"), ctx) {
+                                    let len = len_v.as_number().unwrap_or(0.0) as u32;
+                                    let _ = arr.set(len, JsValue::from(cb.clone()), false, ctx);
+                                    DOM_STATE.with(|s| s.borrow_mut().handlers.push((id, event)));
+                                }
+                            }
+                        }
+                    }
                     Ok(JsValue::undefined())
                 }),
                 boa_engine::string::JsString::from("addEventListener"),

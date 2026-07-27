@@ -33,6 +33,9 @@ pub struct AetherEngine {
     pub title: String,
     pub focused_node: Option<kuchiki::NodeRef>,
     pub surface: Vec<u8>,
+    /// All stylesheet text applied to the current document (document
+    /// <style> blocks + external sheets), kept for script-driven relayout.
+    pub stylesheets: Vec<String>,
 }
 
 impl AetherEngine {
@@ -52,7 +55,21 @@ impl AetherEngine {
             title: "Aether Browser".to_string(),
             focused_node: None,
             surface: vec![255; 800 * 600 * 4],
+            stylesheets: Vec::new(),
         }
+    }
+
+    /// Rebuilds layout from the (possibly script-mutated) DOM and re-applies
+    /// the page's stylesheets. The M3 mutation→relayout half-loop.
+    pub fn relayout(&mut self) {
+        let Some(document) = self.document.clone() else { return };
+        let mut layout_tree = layout::compute_layout(&document);
+        for sheet in &self.stylesheets {
+            css::apply_css(&mut layout_tree, sheet);
+        }
+        self.layout_tree = Some(layout_tree);
+        self.needs_repaint = true;
+        self.damage_rects.push((0, 0, self.width, self.height));
     }
 
     pub fn surface(&self) -> &[u8] {
@@ -63,7 +80,10 @@ impl AetherEngine {
         if let Some(js) = &mut self.js_engine {
             let _ = js.context.run_jobs();
         }
-        
+        if js::take_mutated() {
+            self.relayout();
+        }
+
         let needs_repaint = self.needs_repaint;
         self.needs_repaint = false;
         needs_repaint
@@ -182,6 +202,13 @@ impl AetherEngine {
             api::events::Event::MouseDown(_x, _y) => {}
             api::events::Event::MouseUp(x, y) => {
                 if let Some(node) = self.hit_test(x, y) {
+                    // Script click handlers run first (bubbling); a handled
+                    // click still follows links, matching default behavior.
+                    if let Some(js_engine) = &mut self.js_engine {
+                        if js::dispatch_event(&mut js_engine.context, &node, "click") {
+                            self.relayout();
+                        }
+                    }
                     if let Some(el) = node.as_element() {
                         if &*el.name.local == "a" {
                             if let Some(href) = el.attributes.borrow().get("href") {
@@ -288,16 +315,19 @@ impl AetherEngine {
             }
         }
         
-        let mut layout_tree = layout::compute_layout(&document);
+        let mut sheets: Vec<String> = Vec::new();
         if let Ok(styles) = document.select("style") {
             for style_node in styles {
-                let text = style_node.as_node().text_contents();
-                css::apply_css(&mut layout_tree, &text);
+                sheets.push(style_node.as_node().text_contents());
             }
         }
-        for sheet in external_css {
+        sheets.extend(external_css.iter().cloned());
+
+        let mut layout_tree = layout::compute_layout(&document);
+        for sheet in &sheets {
             css::apply_css(&mut layout_tree, sheet);
         }
+        self.stylesheets = sheets;
         
         self.document = Some(document);
         self.layout_tree = Some(layout_tree);

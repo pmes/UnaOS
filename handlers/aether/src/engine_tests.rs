@@ -246,9 +246,7 @@ mod tests {
         </style></head><body>
             <div id="t">x</div>
             <script>
-                var el = document.getElementById("t");
-                el.setAttribute("data-x", "1");
-                el.addEventListener("click", function() {});
+                clearTimeout(1);
             </script>
         </body></html>"#;
         let mut engine = crate::AetherEngine::new();
@@ -258,7 +256,67 @@ mod tests {
         use crate::ledger::ApiCategory;
         assert!(snap.contains(ApiCategory::Css, "property:filter"), "unhandled CSS property must be recorded");
         assert!(snap.contains(ApiCategory::Css, "display:grid"), "unhandled display value must be recorded");
-        assert!(snap.contains(ApiCategory::Js, "EventTarget.addEventListener"), "no-op addEventListener must be recorded");
+        assert!(snap.contains(ApiCategory::Js, "window.clearTimeout"), "no-op clearTimeout must be recorded");
+    }
+
+    #[test]
+    fn test_click_dispatch_and_relayout() {
+        let html = r#"<html><body>
+            <div id="btn">Click me</div>
+            <script>
+                document.getElementById("btn").addEventListener("click", function() {
+                    document.getElementById("btn").textContent("clicked!");
+                });
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://events", html, true);
+
+        // Find the button's on-screen position from the layout tree.
+        let (bx, by) = {
+            let layout = engine.layout_tree.as_ref().unwrap();
+            let mut found = None;
+            for (node_id, dom_node) in &layout.node_map {
+                if let Some(el) = dom_node.as_element() {
+                    if el.attributes.borrow().get("id") == Some("btn") {
+                        // Accumulate absolute position by walking from root.
+                        fn abs_pos(
+                            target: taffy::NodeId,
+                            node: taffy::NodeId,
+                            x: f32,
+                            y: f32,
+                            layout: &crate::layout::LayoutTree,
+                        ) -> Option<(f32, f32)> {
+                            let l = layout.taffy.layout(node).ok()?;
+                            let (nx, ny) = (x + l.location.x, y + l.location.y);
+                            if node == target {
+                                return Some((nx, ny));
+                            }
+                            for child in layout.taffy.children(node).ok()? {
+                                if let Some(hit) = abs_pos(target, child, nx, ny, layout) {
+                                    return Some(hit);
+                                }
+                            }
+                            None
+                        }
+                        found = abs_pos(*node_id, layout.root_node, 0.0, 0.0, layout);
+                    }
+                }
+            }
+            let (x, y) = found.expect("#btn laid out");
+            (x + 4.0, y + 4.0)
+        };
+
+        engine.handle_event(crate::api::events::Event::MouseUp(bx as f64, by as f64));
+
+        let doc = engine.document.as_ref().unwrap();
+        let el = doc.select("#btn").unwrap().next().unwrap();
+        assert_eq!(
+            el.as_node().text_contents().trim(),
+            "clicked!",
+            "click handler must run and mutate the DOM"
+        );
+        assert!(engine.needs_repaint, "mutation must schedule a repaint");
     }
 
     #[test]
