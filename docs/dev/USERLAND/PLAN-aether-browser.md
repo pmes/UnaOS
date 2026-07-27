@@ -56,17 +56,22 @@ signs off on the wording before any code lands.
   `fetch` a checked-in JSON and render it) → assert the post-script display list matches a
   golden; event fixture (a click handler that mutates) round-trips.
 
-### M4 — YouTube playback (via resolver + Stria) — **the requested win, landed early**
-- `src/yt/` — innertube resolver (the ANDROID/IOS client context returns direct,
-  non-ciphered stream URLs — no signature JS needed). Parse watch/short/ID; typed `Resolved`
-  (title, author, duration, format list); typed errors (unavailable/age-gated/live/
-  region-locked/ciphered-only) — no catch-alls.
-- Playback: Aether resolves, selects `best_progressive()`, and hands the stream URL +
-  metadata to **Stria** over `SMessage` (add `SMessage::PlayMedia { url, title, mime }` if
-  absent; Stria owns decode/present per charter). Aether does NOT decode video itself.
-- Oracle: fixture-JSON unit tests for parse + selection + every error class (offline);
-  `--live`-gated (`AETHER_YT_LIVE=1`) resolve of one public video asserts a plausible URL;
-  the attended check is a YouTube video PLAYING through Stria on the host.
+### M4 — Media playback (page stream → Stria) — **the requested win, landed early**
+**Revised 2026-07-27 (Peter):** no site-specific resolver. The earlier innertube
+approach reverse-engineered YouTube's private API — a hack that (a) breaks the moment
+YouTube changes its client contract (it since added PO-token attestation, so keyless
+resolve is dead) and (b) walks straight into the plan's own legal ground rules. It is
+**removed**. We own the browser AND the OS: a media element's source is already ours.
+- `AetherEngine::media_sources()` — after a page loads, collect the resolved
+  `<video>`/`<audio>`/`<source>` `src` (absolute URL + mime); hand each to **Stria**
+  over `SMessage::PlayMedia { url, title, mime }` (variant already in bandy). Same
+  passthrough as audio — Aether renders, Stria decodes/presents. Aether never decodes.
+- This is media-source-agnostic: it plays whatever the page exposes, no per-site code.
+  For sites that hide the stream behind a scripted player (YouTube's SPA), the media
+  surfaces once M6's SPA/MSE path runs the player JS — at which point the SAME
+  passthrough carries it to Stria. No special case, no private-API scraping, ever.
+- Oracle: offline unit test asserts media_sources() resolves relative/absolute srcs and
+  mimes; the attended check is a page with a direct `<video src>` PLAYING through Stria.
 
 ### M5 — CSS + web-platform breadth
 - Real CSS cascade/specificity (`selectors` + a cascade over the taffy layout), fonts,
@@ -107,7 +112,9 @@ signs off on the wording before any code lands.
    ledger real, not empty-because-silent.
 6. Fixtures genuine; unit tests hit no network; `--live` gated.
 7. Dependency hygiene (each justified; no yt-dlp; no YouTube-specific crates).
-8. YouTube plays at M4 through the resolver+Stria path — proven before the M6 SPA work.
+8. Media plays at M4 through the page-stream→Stria passthrough (media_sources →
+   `PlayMedia`) — NO site-specific resolver, no private-API scraping. A page with a
+   direct `<video src>` plays through Stria before the M6 SPA work.
 
 ## Deliverables
 Branch `gemini/aether-browser`, clean `aether:`-prefixed commits, README rewritten AFTER M0,

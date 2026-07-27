@@ -136,15 +136,16 @@ aether-shell`). Grew from 7 tests to 25.
 - Forms: Enter → GET (query) / POST (urlencoded) → navigation.
 - br line breaks, link/`<u>` underlines.
 
-**M4 (YouTube) — PARTIAL, STOP-and-report:**
-Resolver + typed errors + Stria PlayMedia handoff restored from history and
-wired (offline suite green). LIVE resolve FAILS: as of 2026-07 innertube
-requires PO-token attestation for keyless clients (probed ANDROID/IOS/
-ANDROID_TESTSUITE/MEDIA_CONNECT_FRONTEND — all failedPrecondition/UNPLAYABLE
-without a poToken). Proceeding needs a poToken/attestation path, which weighs
-against the plan's legal ground rules. **Decision escalated to the plan owner.**
-The `AETHER_YT_LIVE=1` gated test fails by design (typed Parse error, no
-fabricated success); default gates stay green.
+**M4 (media playback) — DONE, resolver hack removed (Peter, 2026-07-27):**
+The innertube resolver was briefly revived from history, then **removed** by
+owner decision: it reverse-engineered YouTube's private API (now poToken-gated
+anyway) and cut against the plan's legal ground rules. Replaced with the
+correct model — we own the browser and the OS, so `media_sources()` hands the
+page's resolved `<video>/<audio>/<source>` src+mime straight to Stria over
+`SMessage::PlayMedia`, the same passthrough as audio, no per-site code.
+Scripted-player sites (YouTube SPA) surface their stream once M6 runs the
+player JS; the same passthrough carries it. Offline test covers src/mime
+resolution.
 
 **Not yet done:** specificity is per-property last-wins within equal
 specificity (no !important priority tiers), no float/grid, no SVG, no

@@ -260,6 +260,20 @@ mod tests {
     }
 
     #[test]
+    fn test_media_sources_for_stria() {
+        let html = r#"<html><body>
+            <video src="clips/intro.mp4"></video>
+            <audio src="https://cdn.example.org/song.ogg" type="audio/ogg"></audio>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("https://example.com/watch", html, true);
+        let media = engine.media_sources();
+        assert_eq!(media.len(), 2);
+        assert_eq!(media[0], ("https://example.com/clips/intro.mp4".into(), "video/mp4".into()));
+        assert_eq!(media[1], ("https://cdn.example.org/song.ogg".into(), "audio/ogg".into()));
+    }
+
+    #[test]
     fn test_form_submission_builds_get_url() {
         let html = r#"<html><body>
             <form action="/search" method="get">

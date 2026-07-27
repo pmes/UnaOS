@@ -10,7 +10,6 @@ pub mod css;
 
 pub mod headless;
 pub mod ledger;
-pub mod yt;
 pub mod storage;
 pub mod workers;
 pub mod event_loop;
@@ -351,6 +350,38 @@ impl AetherEngine {
 
     pub fn load_html(&mut self, url: &str, html: &str, add_history: bool) {
         self.load_html_styled(url, html, &[], add_history)
+    }
+
+    /// Media the current page references, ready to hand to Stria. We own the
+    /// browser and the OS, so a `<video>`/`<audio>` source the page already
+    /// resolved is ours to play — same passthrough as audio, no site-specific
+    /// resolver. Returns (absolute src, mime) for each playable element.
+    pub fn media_sources(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let Some(doc) = &self.document else { return out };
+        let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
+        let Ok(media) = doc.select("video, audio, source") else { return out };
+        for el in media {
+            let attrs = el.attributes.borrow();
+            let Some(src) = attrs.get("src") else { continue };
+            if src.is_empty() {
+                continue;
+            }
+            let abs = images::resolve(&base, src);
+            let mime = attrs.get("type").map(str::to_string).unwrap_or_else(|| {
+                match abs.rsplit('.').next() {
+                    Some("mp4") => "video/mp4",
+                    Some("webm") => "video/webm",
+                    Some("mp3") => "audio/mpeg",
+                    Some("ogg") => "audio/ogg",
+                    Some("wav") => "audio/wav",
+                    _ => "application/octet-stream",
+                }
+                .to_string()
+            });
+            out.push((abs, mime));
+        }
+        out
     }
 
     /// Like `load_html`, with pre-fetched external stylesheets (see

@@ -57,29 +57,19 @@ pub async fn ignite(synapse: Synapse) -> Result<()> {
                 match msg {
                     SMessage::OpenDocument { url } => {
                         println!("Received OpenDocument for {}", url);
-                        // YouTube URLs resolve to a direct stream and hand off
-                        // to Stria (charter: Aether renders, Stria plays).
-                        if aether::yt::extract_video_id(&url).is_some()
-                            && (url.contains("youtube.com") || url.contains("youtu.be"))
-                        {
-                            match aether::yt::resolve(&url).await {
-                                Ok(resolved) => match resolved.best_progressive() {
-                                    Some(fmt) => {
-                                        println!("Resolved '{}' — handing to Stria", resolved.title);
-                                        synapse.fire(SMessage::PlayMedia {
-                                            url: fmt.url.clone(),
-                                            title: resolved.title.clone(),
-                                            mime: fmt.mime_type.clone(),
-                                        });
-                                    }
-                                    None => eprintln!("No progressive format for {}", url),
-                                },
-                                Err(e) => eprintln!("Resolve failed for {}: {}", url, e),
-                            }
-                            continue;
-                        }
                         if let Err(e) = engine.load_url(&url).await {
                             eprintln!("Failed to load url {}: {}", url, e);
+                        }
+                        // Charter: Aether renders, Stria plays. Any media the
+                        // page resolved is handed straight to Stria — the OS
+                        // owns the stream, no site-specific resolver.
+                        for (media_url, mime) in engine.media_sources() {
+                            println!("Handing media to Stria: {}", media_url);
+                            synapse.fire(SMessage::PlayMedia {
+                                url: media_url,
+                                title: engine.title.clone(),
+                                mime,
+                            });
                         }
                     }
                     _ => {}
