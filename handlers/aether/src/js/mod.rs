@@ -167,6 +167,28 @@ impl Engine {
         context.register_global_callable(boa_engine::string::JsString::from("clearTimeout"), 1, clear_timeout).unwrap();
     }
 
+    /// Resolves the DOM node behind a wrapped JS object (via __node_id).
+    fn this_node(this: &JsValue, ctx: &mut Context) -> Option<NodeRef> {
+        let id = this
+            .as_object()?
+            .get(boa_engine::string::JsString::from("__node_id"), ctx)
+            .ok()?
+            .as_number()? as i32;
+        DOM_STATE.with(|s| s.borrow().get_node(id))
+    }
+
+    /// Builds a native JsFunction for accessor slots.
+    fn native(
+        context: &mut Context,
+        f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+    ) -> boa_engine::object::builtins::JsFunction {
+        boa_engine::object::FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_fn_ptr(f),
+        )
+        .build()
+    }
+
     pub(crate) fn wrap_node(context: &mut Context, node: NodeRef) -> JsValue {
         let doc_id = DOM_STATE.with(|s| s.borrow_mut().register_node(node.clone()));
         
@@ -175,6 +197,88 @@ impl Engine {
         } else {
             false
         };
+
+        // Accessor pairs must exist before ObjectInitializer borrows context.
+        let get_inner_html = Self::native(context, |this, _args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
+            let html: String = n.children().map(|c| c.to_string()).collect();
+            Ok(JsValue::new(boa_engine::string::JsString::from(html)))
+        });
+        let set_inner_html = Self::native(context, |this, args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
+            let html = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+            for child in n.children() {
+                child.detach();
+            }
+            let frag = kuchiki::parse_html().one(html);
+            if let Ok(mut bodies) = frag.select("body") {
+                if let Some(body) = bodies.next() {
+                    let children: Vec<_> = body.as_node().children().collect();
+                    for child in children {
+                        child.detach();
+                        n.append(child);
+                    }
+                }
+            }
+            DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+            Ok(JsValue::undefined())
+        });
+        let get_text = Self::native(context, |this, _args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
+            Ok(JsValue::new(boa_engine::string::JsString::from(n.text_contents())))
+        });
+        let set_text = Self::native(context, |this, args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
+            let text = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+            for child in n.children() {
+                child.detach();
+            }
+            n.append(kuchiki::NodeRef::new_text(text));
+            DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+            Ok(JsValue::undefined())
+        });
+        let get_class = Self::native(context, |this, _args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
+            let v = n.as_element().and_then(|el| el.attributes.borrow().get("class").map(|s| s.to_string())).unwrap_or_default();
+            Ok(JsValue::new(boa_engine::string::JsString::from(v)))
+        });
+        let set_class = Self::native(context, |this, args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
+            let v = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+            if let Some(el) = n.as_element() {
+                el.attributes.borrow_mut().insert("class", v);
+                DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+            }
+            Ok(JsValue::undefined())
+        });
+        let get_id_attr = Self::native(context, |this, _args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
+            let v = n.as_element().and_then(|el| el.attributes.borrow().get("id").map(|s| s.to_string())).unwrap_or_default();
+            Ok(JsValue::new(boa_engine::string::JsString::from(v)))
+        });
+        let set_id_attr = Self::native(context, |this, args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
+            let v = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+            if let Some(el) = n.as_element() {
+                el.attributes.borrow_mut().insert("id", v);
+                DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+            }
+            Ok(JsValue::undefined())
+        });
+        let get_value = Self::native(context, |this, _args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
+            let v = n.as_element().and_then(|el| el.attributes.borrow().get("value").map(|s| s.to_string())).unwrap_or_default();
+            Ok(JsValue::new(boa_engine::string::JsString::from(v)))
+        });
+        let set_value = Self::native(context, |this, args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
+            let v = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+            if let Some(el) = n.as_element() {
+                el.attributes.borrow_mut().insert("value", v);
+                DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+            }
+            Ok(JsValue::undefined())
+        });
 
         let js_node = ObjectInitializer::new(context)
             .property(
@@ -247,58 +351,6 @@ impl Engine {
                     Ok(JsValue::undefined())
                 }),
                 boa_engine::string::JsString::from("appendChild"),
-                1,
-            )
-            .function(
-                NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
-                    let node = DOM_STATE.with(|s| s.borrow().get_node(id));
-                    let Some(n) = node else { return Ok(JsValue::undefined()) };
-                    if args.is_empty() {
-                        // Getter: serialize children markup.
-                        let html: String = n.children().map(|c| c.to_string()).collect();
-                        return Ok(JsValue::new(boa_engine::string::JsString::from(html)));
-                    }
-                    let html = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
-                    for child in n.children() {
-                        child.detach();
-                    }
-                    // Parse as a document and graft the body's children.
-                    let frag = kuchiki::parse_html().one(html);
-                    if let Ok(mut bodies) = frag.select("body") {
-                        if let Some(body) = bodies.next() {
-                            let children: Vec<_> = body.as_node().children().collect();
-                            for child in children {
-                                child.detach();
-                                n.append(child);
-                            }
-                        }
-                    }
-                    DOM_STATE.with(|s| s.borrow_mut().mutated = true);
-                    Ok(JsValue::undefined())
-                }),
-                boa_engine::string::JsString::from("innerHTML"),
-                1,
-            )
-            .function(
-                NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
-                    let node = DOM_STATE.with(|s| s.borrow().get_node(id));
-                    if let Some(n) = node {
-                        if args.is_empty() {
-                            return Ok(JsValue::new(boa_engine::string::JsString::from(n.text_contents())));
-                        } else {
-                            let text = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
-                            for child in n.children() {
-                                child.detach();
-                            }
-                            n.append(kuchiki::NodeRef::new_text(text));
-                            DOM_STATE.with(|s| s.borrow_mut().mutated = true);
-                        }
-                    }
-                    Ok(JsValue::undefined())
-                }),
-                boa_engine::string::JsString::from("textContent"),
                 1,
             )
             .function(
@@ -405,24 +457,25 @@ impl Engine {
                 boa_engine::string::JsString::from("removeChild"),
                 1,
             )
-            .function(
-                NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    // className(): getter; className(v): setter.
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
-                    let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) else { return Ok(JsValue::undefined()) };
-                    let Some(el) = n.as_element() else { return Ok(JsValue::undefined()) };
-                    if let Some(v) = args.get(0) {
-                        let v = v.to_string(ctx).unwrap_or_default().to_std_string_escaped();
-                        el.attributes.borrow_mut().insert("class", v);
-                        DOM_STATE.with(|s| s.borrow_mut().mutated = true);
-                        Ok(JsValue::undefined())
-                    } else {
-                        let v = el.attributes.borrow().get("class").unwrap_or("").to_string();
-                        Ok(JsValue::new(boa_engine::string::JsString::from(v)))
-                    }
-                }),
+            .accessor(
+                boa_engine::string::JsString::from("innerHTML"),
+                Some(get_inner_html), Some(set_inner_html), Attribute::all(),
+            )
+            .accessor(
+                boa_engine::string::JsString::from("textContent"),
+                Some(get_text), Some(set_text), Attribute::all(),
+            )
+            .accessor(
                 boa_engine::string::JsString::from("className"),
-                1,
+                Some(get_class), Some(set_class), Attribute::all(),
+            )
+            .accessor(
+                boa_engine::string::JsString::from("id"),
+                Some(get_id_attr), Some(set_id_attr), Attribute::all(),
+            )
+            .accessor(
+                boa_engine::string::JsString::from("value"),
+                Some(get_value), Some(set_value), Attribute::all(),
             )
             .build();
 

@@ -299,7 +299,7 @@ mod tests {
             <div id="btn">Click me</div>
             <script>
                 document.getElementById("btn").addEventListener("click", function() {
-                    document.getElementById("btn").textContent("clicked!");
+                    document.getElementById("btn").textContent = "clicked!";
                 });
             </script>
         </body></html>"#;
@@ -360,7 +360,7 @@ mod tests {
             <script>
                 var el = document.getElementById("t");
                 el.setAttribute("data-x", "42");
-                el.innerHTML("<p>new <b>content</b></p>");
+                el.innerHTML = "<p>new <b>content</b></p>";
             </script>
         </body></html>"#;
         let mut engine = crate::AetherEngine::new();
@@ -646,7 +646,7 @@ mod tests {
             m.classList.toggle('hidden');
             m.removeAttribute('data-x');
             var items = document.querySelectorAll('p.item');
-            m.className(m.className() + ' count-' + items.length);
+            m.className = m.className + ' count-' + items.length;
         "#).expect("script must run clean");
         let doc = engine.document.clone().unwrap();
         let html_el = doc.select("html").unwrap().next().unwrap();
