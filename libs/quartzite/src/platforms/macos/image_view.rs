@@ -141,6 +141,12 @@ define_class!(
         #[unsafe(method(setFrameSize:))]
         fn set_frame_size(&self, new_size: NSSize) {
             let _: () = unsafe { msg_send![super(self), setFrameSize: new_size] };
+            // Browser surface: the viewport changed — the ENGINE reflows the
+            // page to the new size and blits fresh pixels; nothing scales.
+            if let Some(syn) = self.ivars().synapse.borrow().as_ref() {
+                let (w, h) = (new_size.width.max(1.0) as u32, new_size.height.max(1.0) as u32);
+                syn.fire(bandy::SMessage::BrowserResize(w, h));
+            }
             self.setNeedsDisplay(true);
         }
 
@@ -196,7 +202,7 @@ define_class!(
         fn magnify_with_event(&self, event: &AnyObject) {
             // `magnification` is the incremental pinch delta for this event.
             let mag: f64 = unsafe { msg_send![event, magnification] };
-            if mag == 0.0 {
+            if mag == 0.0 || self.ivars().synapse.borrow().is_some() {
                 return;
             }
             let at = self.event_point(event);
@@ -215,6 +221,9 @@ define_class!(
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &AnyObject) {
+            if self.ivars().synapse.borrow().is_some() {
+                return; // browser surface: no picture panning
+            }
             let (nx, ny) = self.event_window_point(event);
             if let Some((ax, ay)) = self.ivars().drag_anchor.get() {
                 let (px, py) = self.ivars().pan.get();
@@ -444,6 +453,14 @@ impl FacetImageView {
         if iw == 0 || ih == 0 {
             return None;
         }
+        // Browser surface: the engine owns layout — draw its pixels 1:1,
+        // pinned to the TOP-left (unflipped view: top = origin.y + height).
+        if self.ivars().synapse.borrow().is_some() {
+            let (dw, dh) = (iw as f64, ih as f64);
+            let dx = bounds.origin.x;
+            let dy = bounds.origin.y + bounds.size.height - dh;
+            return Some((dx, dy, dw, dh));
+        }
         let base = self.base_scale(bounds, iw, ih);
         let scale = base * self.ivars().zoom.get();
         let dw = iw as f64 * scale;
@@ -527,8 +544,11 @@ impl FacetImageView {
             msg_send![rep_ref, drawInRect: dest]
         };
 
-        // The pixel readout overlay, if the cursor is over the image.
-        self.draw_readout(bounds, (dx, dy, dw, dh));
+        // The pixel readout overlay (facet only — a browser page is not
+        // an inspected picture).
+        if self.ivars().synapse.borrow().is_none() {
+            self.draw_readout(bounds, (dx, dy, dw, dh));
+        }
     }
 
     /// Map the current cursor to a source pixel and draw the readout overlay.
