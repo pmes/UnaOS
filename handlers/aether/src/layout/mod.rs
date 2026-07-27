@@ -22,6 +22,8 @@ pub struct LayoutTree {
     pub root_node: taffy::NodeId,
     pub node_map: HashMap<taffy::NodeId, NodeRef>, // Maps layout boxes back to DOM nodes
     pub paint_map: HashMap<taffy::NodeId, PaintStyle>,
+    /// Viewport this tree lays out against (media queries + wrap width).
+    pub viewport: (f32, f32),
     pub dirty: bool,
 }
 
@@ -34,7 +36,7 @@ impl LayoutTree {
         if !self.dirty {
             return;
         }
-        let new_tree = compute_layout(dom);
+        let new_tree = compute_layout_sized(dom, self.viewport.0, self.viewport.1);
         self.taffy = new_tree.taffy;
         self.root_node = new_tree.root_node;
         self.node_map = new_tree.node_map;
@@ -69,6 +71,10 @@ fn is_inline_node(node: &NodeRef) -> bool {
 }
 
 pub fn compute_layout(dom: &NodeRef) -> LayoutTree {
+    compute_layout_sized(dom, 800.0, 600.0)
+}
+
+pub fn compute_layout_sized(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
     let mut taffy = taffy::TaffyTree::new();
     let mut node_map = HashMap::new();
     let mut paint_map = HashMap::new();
@@ -213,6 +219,7 @@ pub fn compute_layout(dom: &NodeRef) -> LayoutTree {
         root_node,
         node_map,
         paint_map,
+        viewport: (vw, vh),
         dirty: false,
     };
     remeasure(&mut tree);
@@ -301,9 +308,10 @@ pub fn remeasure(tree: &mut LayoutTree) {
     );
 
     let viewport = Size {
-        width: AvailableSpace::Definite(800.0),
-        height: AvailableSpace::Definite(600.0),
+        width: AvailableSpace::Definite(tree.viewport.0),
+        height: AvailableSpace::Definite(tree.viewport.1),
     };
+    let vw_cap = tree.viewport.0;
     let _ = tree.taffy.compute_layout_with_measure(
         tree.root_node,
         viewport,
@@ -319,7 +327,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
             };
             let wrap_width = known.width.unwrap_or(match avail.width {
                 AvailableSpace::Definite(w) => w,
-                _ => 800.0,
+                _ => vw_cap,
             });
             let (w, h) = measure_text(font.as_deref(), text, *font_size, *line_mult, wrap_width.max(1.0));
             Size {

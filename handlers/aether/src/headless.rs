@@ -21,8 +21,22 @@ pub async fn render_headless_scrolled(
     ledger_path: &Path,
     scroll: f64,
 ) -> anyhow::Result<(u32, u32, usize)> {
+    render_headless_opts(url, html_file, out, ledger_path, scroll, 800, 600).await
+}
+
+/// Fully-parameterized headless render: scroll offset and viewport size.
+pub async fn render_headless_opts(
+    url: Option<&str>,
+    html_file: Option<&Path>,
+    out: &Path,
+    ledger_path: &Path,
+    scroll: f64,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<(u32, u32, usize)> {
     crate::ledger::reset();
     let mut engine = AetherEngine::new();
+    engine.handle_event(crate::api::events::Event::Resize(width, height));
 
     match (html_file, url) {
         (Some(path), _) => {

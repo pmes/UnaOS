@@ -33,6 +33,12 @@ enum Commands {
         /// Scroll offset (px) before rendering — audit below the fold
         #[arg(long, default_value_t = 0.0)]
         scroll: f64,
+        /// Viewport width
+        #[arg(long, default_value_t = 800)]
+        width: u32,
+        /// Viewport height
+        #[arg(long, default_value_t = 600)]
+        height: u32,
     },
 }
 
@@ -92,9 +98,10 @@ async fn main() -> Result<()> {
             
             ignite(synapse).await?;
         }
-        Commands::Render { url, html, out, ledger, scroll } => {
-            let (w, h, missing) =
-                aether::headless::render_headless_scrolled(url.as_deref(), html.as_deref(), out, ledger, *scroll).await?;
+        Commands::Render { url, html, out, ledger, scroll, width, height } => {
+            let (w, h, missing) = aether::headless::render_headless_opts(
+                url.as_deref(), html.as_deref(), out, ledger, *scroll, *width, *height,
+            ).await?;
             println!(
                 "rendered {}x{} -> {} | {} missing APIs -> {}",
                 w, h, out.display(), missing, ledger.display()

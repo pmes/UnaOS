@@ -4,8 +4,6 @@ use taffy::prelude::*;
 use taffy::style::{Dimension, Display, FlexDirection, LengthPercentage, LengthPercentageAuto};
 use taffy::geometry::Rect;
 
-/// The viewport media queries are evaluated against (engine default surface).
-const VIEWPORT_W: f32 = 800.0;
 
 /// Declarations a rule actually specified. Only `Some` fields are applied,
 /// so a rule never stomps another rule's (or the UA default's) values.
@@ -237,9 +235,10 @@ pub fn apply_css(layout_tree: &mut LayoutTree, css: &str) {
 /// sort together by (specificity, source order), so a later sheet's less
 /// specific rule no longer beats an earlier sheet's more specific one.
 pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
+    let vw = layout_tree.viewport.0;
     let mut rules = Vec::new();
     for css in sheets {
-        collect_rules(css, 0, &mut rules);
+        collect_rules(css, 0, &mut rules, vw);
     }
     rules.sort_by(|a, b| a.selector.specificity().cmp(&b.selector.specificity()));
 
@@ -269,7 +268,7 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     crate::layout::remeasure(layout_tree);
 }
 
-fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>) {
+fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
     if depth > 4 {
         return; // pathological nesting guard
     }
@@ -313,14 +312,14 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>) {
             match kw.as_str() {
                 "media" => {
                     let condition = prelude.trim_start_matches("@media").trim();
-                    if media_matches(condition) {
-                        collect_rules(&body, depth + 1, rules);
+                    if media_matches(condition, vw) {
+                        collect_rules(&body, depth + 1, rules, vw);
                     }
                 }
                 "supports" => {
                     let condition = prelude.trim_start_matches("@supports").trim();
                     if supports_matches(condition) {
-                        collect_rules(&body, depth + 1, rules);
+                        collect_rules(&body, depth + 1, rules, vw);
                     }
                 }
                 other => crate::ledger::record_css(&format!("at-rule:@{}", other)),
@@ -363,7 +362,7 @@ pub(crate) fn parse_declaration_block(body: &str) -> SpecifiedStyle {
 /// Evaluates an @media condition against the fixed viewport. Comma = OR,
 /// "and" = AND. Unknown features evaluate false (and are ledgered), so a
 /// query is never wrongly applied.
-fn media_matches(condition: &str) -> bool {
+fn media_matches(condition: &str, vw: f32) -> bool {
     if condition.is_empty() {
         return true;
     }
@@ -377,8 +376,8 @@ fn media_matches(condition: &str) -> bool {
                     if let Some((feature, value)) = p.split_once(':') {
                         let value = value.trim();
                         match feature.trim() {
-                            "min-width" => parse_px(value).map(|v| VIEWPORT_W >= v).unwrap_or(false),
-                            "max-width" => parse_px(value).map(|v| VIEWPORT_W <= v).unwrap_or(false),
+                            "min-width" => parse_px(value).map(|v| vw >= v).unwrap_or(false),
+                            "max-width" => parse_px(value).map(|v| vw <= v).unwrap_or(false),
                             f => {
                                 crate::ledger::record_css(&format!("media-feature:{}", f));
                                 false
@@ -640,12 +639,13 @@ mod tests {
 
     #[test]
     fn test_media_matches() {
-        assert!(media_matches("screen"));
-        assert!(!media_matches("print"));
-        assert!(media_matches("screen and (min-width: 600px)"));
-        assert!(!media_matches("screen and (min-width: 1200px)"));
-        assert!(media_matches("(max-width: 900px)"));
-        assert!(media_matches("print, screen"));
-        assert!(!media_matches("(prefers-reduced-motion: reduce)"));
+        assert!(media_matches("screen", 800.0));
+        assert!(!media_matches("print", 800.0));
+        assert!(media_matches("screen and (min-width: 600px)", 800.0));
+        assert!(!media_matches("screen and (min-width: 1200px)", 800.0));
+        assert!(media_matches("screen and (min-width: 1200px)", 1280.0));
+        assert!(media_matches("(max-width: 900px)", 800.0));
+        assert!(media_matches("print, screen", 800.0));
+        assert!(!media_matches("(prefers-reduced-motion: reduce)", 800.0));
     }
 }
