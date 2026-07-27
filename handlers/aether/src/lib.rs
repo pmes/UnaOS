@@ -447,8 +447,11 @@ impl AetherEngine {
             }
         }
         
-        // Drain zero-delay boot timers before first layout — pages queue
-        // their init through setTimeout(0) and expect it before paint.
+        // Drain zero-delay boot timers, then fire queued rAF callbacks in
+        // bounded passes (framework render paths), then drain the promise
+        // work they spawned — all before first layout.
+        let _ = js_engine.context.run_jobs();
+        let _ = js_engine.execute("__drainRaf && __drainRaf();");
         let _ = js_engine.context.run_jobs();
 
         let mut sheets: Vec<String> = Vec::new();

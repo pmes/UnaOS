@@ -773,6 +773,44 @@ mod tests {
             "fetch → json → DOM mutation must complete through the job queue");
     }
 
+    /// rAF callbacks fire once per load in bounded passes: a framework
+    /// paint lands in the DOM; a self-re-registering animation loop
+    /// terminates instead of recursing; XHR completes synchronously.
+    #[test]
+    fn test_raf_bounded_drain_and_xhr() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled(
+            "https://example.com/",
+            r#"<html><body><div id="x">a</div>
+               <script>
+                 var loops = 0;
+                 function animate() { loops++; requestAnimationFrame(animate); }
+                 requestAnimationFrame(animate);
+                 requestAnimationFrame(function (ts) {
+                   document.getElementById('x').setAttribute('data-paint', 'ts' + (ts > 0));
+                 });
+                 var xhr = new XMLHttpRequest();
+                 xhr.open('GET', '/api');
+                 xhr.onload = function () {
+                   document.getElementById('x').setAttribute('data-xhr', 'state' + xhr.readyState);
+                 };
+                 __native_fetch = function () { return { status: 200, url: '/api', body: 'ok' }; };
+                 xhr.send();
+                 document.getElementById('x').setAttribute('data-loops-pre', String(loops));
+               </script></body></html>"#,
+            &[],
+            true,
+        );
+        let doc = engine.document.clone().unwrap();
+        let x = doc.select("#x").unwrap().next().unwrap();
+        let attrs = x.attributes.borrow();
+        assert_eq!(attrs.get("data-paint"), Some("tstrue"), "one-shot rAF must fire with a timestamp");
+        assert_eq!(attrs.get("data-xhr"), Some("state4"), "XHR onload must fire synchronously");
+        assert_eq!(attrs.get("data-loops-pre"), Some("0"), "rAF must NOT fire during script execution");
+        // The animation loop ran bounded passes (8) and stopped — the load
+        // completing at all proves termination.
+    }
+
     /// float:left/right sizes to content and hugs its edge (approximation).
     #[test]
     fn test_float_approximation() {

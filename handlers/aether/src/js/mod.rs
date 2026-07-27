@@ -110,8 +110,42 @@ impl Engine {
         let _ = context.eval(boa_engine::Source::from_bytes(
             r#"
             globalThis.self = globalThis;
-            globalThis.requestAnimationFrame = function (cb) { return 0; };
-            globalThis.cancelAnimationFrame = function () {};
+            // rAF: callbacks queue and fire in bounded passes at load
+            // (see __drainRaf) — an unbounded immediate fire would turn
+            // render loops into recursion; never firing starved
+            // framework paints.
+            globalThis.__raf = [];
+            globalThis.__rafClock = 0;
+            globalThis.requestAnimationFrame = function (cb) {
+                __raf.push(cb);
+                return __raf.length;
+            };
+            globalThis.cancelAnimationFrame = function (id) {
+                if (id > 0 && id <= __raf.length) { __raf[id - 1] = null; }
+            };
+            // Bounded drain: each pass runs the current batch once; new
+            // registrations wait for the next pass; after 8 passes what
+            // keeps re-registering is an animation loop and is dropped.
+            globalThis.__drainRaf = function () {
+                var passes = 0;
+                while (__raf.length && passes < 8) {
+                    var batch = __raf;
+                    __raf = [];
+                    __rafClock += 16;
+                    for (var i = 0; i < batch.length; i++) {
+                        if (batch[i]) { try { batch[i](__rafClock); } catch (e) {} }
+                    }
+                    passes++;
+                }
+                __raf = [];
+            };
+            globalThis.performance = {
+                now: function () { return __rafClock; },
+                mark: function () {}, measure: function () {},
+                getEntriesByName: function () { return []; },
+                getEntriesByType: function () { return []; },
+                timing: {}, timeOrigin: 0,
+            };
             globalThis.matchMedia = function (q) {
                 // Honest answers for the two families sites branch on:
                 // we are a light-scheme 800px-wide viewport. Everything

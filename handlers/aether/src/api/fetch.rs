@@ -135,6 +135,44 @@ pub fn init(context: &mut Context) {
             };
             return Promise.resolve(resp);
         };
+
+        // XMLHttpRequest over the same native layer (sync completion —
+        // handlers fire from send(), matching our fetch-then-apply model).
+        globalThis.XMLHttpRequest = function () {
+            this.readyState = 0;
+            this.status = 0;
+            this.responseText = '';
+            this.response = '';
+            this._listeners = {};
+        };
+        XMLHttpRequest.prototype.open = function (method, url) {
+            this._method = String(method || 'GET');
+            this._url = String(url || '');
+            this.readyState = 1;
+        };
+        XMLHttpRequest.prototype.setRequestHeader = function () {};
+        XMLHttpRequest.prototype.getResponseHeader = function () { return null; };
+        XMLHttpRequest.prototype.addEventListener = function (ev, cb) {
+            (this._listeners[ev] = this._listeners[ev] || []).push(cb);
+        };
+        XMLHttpRequest.prototype.send = function (body) {
+            var r = __native_fetch(this._url, this._method, body != null ? String(body) : '');
+            if (r) {
+                this.status = r.status;
+                this.responseText = r.body;
+                this.response = r.body;
+            }
+            this.readyState = 4;
+            var self_ = this;
+            var fire = function (name) {
+                if (typeof self_['on' + name] === 'function') { try { self_['on' + name](); } catch (e) {} }
+                var ls = self_._listeners[name] || [];
+                for (var i = 0; i < ls.length; i++) { try { ls[i].call(self_); } catch (e) {} }
+            };
+            fire('readystatechange');
+            fire(r ? 'load' : 'error');
+            fire('loadend');
+        };
         "#,
     ));
 }
