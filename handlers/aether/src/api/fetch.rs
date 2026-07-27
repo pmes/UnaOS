@@ -1,4 +1,4 @@
-use boa_engine::{Context, JsResult, JsValue, native_function::NativeFunction};
+use boa_engine::{Context, native_function::NativeFunction};
 
 pub fn init(context: &mut Context) {
     let _f = NativeFunction::from_fn_ptr(|_this, _args, ctx| {

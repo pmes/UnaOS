@@ -1,6 +1,6 @@
 use boa_engine::{
     context::ContextBuilder,
-    job::{SimpleJobExecutor, NativeJob},
+    job::SimpleJobExecutor,
     native_function::NativeFunction,
     Context, JsData, JsResult, JsValue, Trace, Finalize, JsString
 };

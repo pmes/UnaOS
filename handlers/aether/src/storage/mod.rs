@@ -2,12 +2,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use boa_engine::{
-    Context, JsResult, JsValue, JsArgs, JsString, js_string,
+    Context, JsResult, JsValue, JsString, js_string,
     class::{Class, ClassBuilder},
     native_function::NativeFunction,
     Trace, Finalize,
 };
-use boa_gc::{empty_trace, custom_trace};
 
 #[derive(Debug, Trace, Finalize)]
 pub struct LocalStorage {

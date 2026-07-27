@@ -1,6 +1,6 @@
 use objc2::rc::{Allocated, Retained};
 use objc2::{msg_send, ClassType};
-use objc2_app_kit::{NSStackView, NSView, NSUserInterfaceLayoutOrientation};
+use objc2_app_kit::{NSStackView, NSView};
 use objc2_foundation::{MainThreadMarker, NSRect, NSPoint, NSSize};
 
 use crate::tetra::TetraNode;

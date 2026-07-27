@@ -1,9 +1,8 @@
 use boa_engine::{
-    Context, JsValue, JsResult, JsError,
+    Context, JsValue, JsResult,
     native_function::NativeFunction,
     object::ObjectInitializer,
     property::Attribute,
-    context::ContextBuilder,
 };
 use kuchiki::traits::*;
 use kuchiki::NodeRef;
@@ -171,7 +170,7 @@ impl Engine {
     pub(crate) fn wrap_node(context: &mut Context, node: NodeRef) -> JsValue {
         let doc_id = DOM_STATE.with(|s| s.borrow_mut().register_node(node.clone()));
         
-        let is_video = if let Some(el) = node.into_element_ref() {
+        let _is_video = if let Some(el) = node.into_element_ref() {
             el.name.local.to_string() == "video"
         } else {
             false

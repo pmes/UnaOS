@@ -2,9 +2,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-/// Decoded images for the current page, keyed by ABSOLUTE url.
-/// Thread-local like js::DOM_STATE — the engine, layout, and renderer all
-/// run on one thread; callers populate it via `set_page` before load.
+// Decoded images for the current page, keyed by ABSOLUTE url.
+// Thread-local like js::DOM_STATE — the engine, layout, and renderer all
+// run on one thread; callers populate it via `set_page` before load.
 thread_local! {
     static STORE: RefCell<PageImages> = RefCell::new(PageImages {
         base_url: String::new(),

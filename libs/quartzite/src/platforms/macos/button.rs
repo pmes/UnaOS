@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use objc2::{define_class, msg_send, ClassType, DeclaredClass};
 use objc2::rc::{Retained, Allocated};
 use objc2::runtime::AnyObject;
-use objc2_app_kit::{NSButton, NSView, NSBezelStyle};
+use objc2_app_kit::{NSButton, NSView};
 use objc2_foundation::{NSRect, NSPoint, NSSize, NSString};
 
 use bandy::{SMessage, Synapse};

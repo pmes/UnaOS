@@ -10,8 +10,14 @@ fn main() {
     let engine_tx = synapse.clone();
     let mut engine_rx = synapse.subscribe();
     
-    // Spawn the Engine Thread
-    thread::spawn(move || {
+    // Spawn the Engine Thread. Big stack: boa's parser/interpreter is
+    // recursive-descent and real-world page bundles nest deeply — the
+    // 2 MB default overflows (debug frames especially) once external
+    // scripts execute.
+    thread::Builder::new()
+        .name("aether-engine".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let local = LocalSet::new();
         
@@ -87,7 +93,8 @@ fn main() {
                 }
             }
         });
-    });
+    })
+    .expect("spawn engine thread");
 
     let aether_ui = quartzite::tetra::TetraNode::VStack(vec![
         quartzite::tetra::TetraNode::HStack(vec![

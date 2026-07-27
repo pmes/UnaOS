@@ -657,7 +657,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
     let target_id = id.to_string();
     // The AppKit main thread has no tokio reactor; give the subscription loop
     // its own thread + current-thread runtime and hop frames back via GCD.
-    std::thread::spawn(move || {
+    std::thread::Builder::new().name("surface-blit".into()).spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -680,7 +680,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
             }
         }
         });
-    });
+    }).expect("spawn surface-blit thread");
 
     Retained::into_super(view)
 }
