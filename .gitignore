@@ -24,3 +24,4 @@ evidence.txt
 cargo_check.log
 jetson-serial.log
 pi-serial.log
+aether-ledger.txt
