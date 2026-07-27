@@ -886,6 +886,53 @@ mod tests {
         }
     }
 
+    /// Lifecycle: DOMContentLoaded/load fire during load (document AND
+    /// window registrations); srcset picks the viewport-fit candidate;
+    /// scroll clamps to the document.
+    #[test]
+    fn test_lifecycle_srcset_scroll_clamp() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled(
+            "https://example.com/",
+            r#"<html><body><div id="x" style="height: 900px">tall</div>
+               <script>
+                 document.addEventListener('DOMContentLoaded', function () {
+                   document.getElementById('x').setAttribute('data-dcl', 'y');
+                 });
+                 window.addEventListener('load', function () {
+                   document.getElementById('x').setAttribute('data-load', 'y');
+                 });
+               </script></body></html>"#,
+            &[],
+            true,
+        );
+        let doc = engine.document.clone().unwrap();
+        let x = doc.select("#x").unwrap().next().unwrap();
+        assert_eq!(x.attributes.borrow().get("data-dcl"), Some("y"), "DOMContentLoaded fires at load");
+        assert_eq!(x.attributes.borrow().get("data-load"), Some("y"), "window load fires at load");
+
+        // Scroll clamp: content ~900px+chrome, viewport 600 — huge scroll
+        // must stop near (content - viewport), not run away.
+        engine.handle_event(crate::api::events::Event::Scroll(0.0, 100000.0));
+        assert!(engine.scroll_y < 2000.0, "scroll must clamp to the document: {}", engine.scroll_y);
+        assert!(engine.scroll_y > 100.0, "tall page must allow some scroll: {}", engine.scroll_y);
+
+        // srcset: smallest sufficient width wins; density ranks vs 800.
+        assert_eq!(
+            crate::images::pick_srcset("/a-400.png 400w, /a-1200.png 1200w, /a-900.png 900w"),
+            Some("/a-900.png".to_string())
+        );
+        assert_eq!(
+            crate::images::pick_srcset("/lo.png 1x, /hi.png 2x"),
+            Some("/lo.png".to_string()),
+            "1x = 800 effective, smallest sufficient"
+        );
+        assert_eq!(
+            crate::images::pick_srcset("/only-small.png 200w"),
+            Some("/only-small.png".to_string())
+        );
+    }
+
     /// float:left/right sizes to content and hugs its edge (approximation).
     #[test]
     fn test_float_approximation() {

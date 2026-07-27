@@ -140,7 +140,14 @@ impl AetherEngine {
         match event {
             api::events::Event::Scroll(_dx, dy) => {
                 let old_sy = self.scroll_y;
-                self.scroll_y = (self.scroll_y + dy).max(0.0);
+                // Clamp to the document: [0, content height - viewport].
+                let max_scroll = self
+                    .layout_tree
+                    .as_ref()
+                    .and_then(|t| t.taffy.layout(t.root_node).ok().map(|l| l.size.height))
+                    .map(|h| (h as f64 - self.height as f64).max(0.0))
+                    .unwrap_or(f64::MAX);
+                self.scroll_y = (self.scroll_y + dy).clamp(0.0, max_scroll);
                 let actual_dy = self.scroll_y - old_sy;
                 let idy = actual_dy as i32;
 
@@ -532,6 +539,11 @@ impl AetherEngine {
         // Drain zero-delay boot timers, then fire queued rAF callbacks in
         // bounded passes (framework render paths), then drain the promise
         // work they spawned — all before first layout.
+        let _ = js_engine.context.run_jobs();
+        // Lifecycle events pages gate init on, then the rAF passes, then
+        // the promise work all of it spawned.
+        js::dispatch_event(&mut js_engine.context, &document, "DOMContentLoaded");
+        js::dispatch_event(&mut js_engine.context, &document, "load");
         let _ = js_engine.context.run_jobs();
         let _ = js_engine.execute("__drainRaf && __drainRaf();");
         let _ = js_engine.context.run_jobs();

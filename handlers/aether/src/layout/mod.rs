@@ -297,9 +297,8 @@ pub fn remeasure(tree: &mut LayoutTree) {
                     let attr_px = |name: &str| {
                         attrs.get(name).and_then(|v| v.trim().parse::<f32>().ok())
                     };
-                    let intrinsic = attrs
-                        .get("src")
-                        .and_then(crate::images::get)
+                    let intrinsic = crate::images::effective_img_src(&attrs)
+                        .and_then(|s| crate::images::get(&s))
                         .map(|i| (i.width() as f32, i.height() as f32));
                     let w = attr_px("width").or(intrinsic.map(|(w, _)| w));
                     let h = attr_px("height").or(intrinsic.map(|(_, h)| h));

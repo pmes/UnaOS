@@ -388,7 +388,8 @@ pub fn render_frame(
                 }
 
                 if tag == "img" {
-                    if let Some(img) = el.attributes.borrow().get("src").and_then(crate::images::get) {
+                    let src = crate::images::effective_img_src(&el.attributes.borrow());
+                    if let Some(img) = src.as_deref().and_then(crate::images::get) {
                         let x_start = ((current_x as i32) - sx).max(0) as u32;
                         let y_start = ((current_y as i32) - sy).max(0) as u32;
                         let bw = layout_box.size.width.max(1.0);

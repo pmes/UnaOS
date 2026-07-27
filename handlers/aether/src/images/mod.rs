@@ -124,6 +124,52 @@ pub fn decode_svg(bytes: &[u8]) -> Option<image::RgbaImage> {
     image::RgbaImage::from_raw(w, h, data)
 }
 
+/// Picks the srcset candidate best suited to our 800px viewport: the
+/// smallest width descriptor >= 800, else the largest available. Density
+/// descriptors (2x) rank as 800*density. Deterministic — the fetch side
+/// and the paint side both call this, so the store key always matches.
+pub fn pick_srcset(srcset: &str) -> Option<String> {
+    let mut best: Option<(f32, String)> = None; // (effective width, url)
+    for cand in srcset.split(',') {
+        let mut parts = cand.split_whitespace();
+        let url = parts.next()?.to_string();
+        let desc = parts.next().unwrap_or("1x");
+        let w = if let Some(n) = desc.strip_suffix('w').and_then(|n| n.parse::<f32>().ok()) {
+            n
+        } else if let Some(n) = desc.strip_suffix('x').and_then(|n| n.parse::<f32>().ok()) {
+            800.0 * n
+        } else {
+            800.0
+        };
+        let better = match &best {
+            None => true,
+            Some((bw, _)) => {
+                let (cur_ok, new_ok) = (*bw >= 800.0, w >= 800.0);
+                match (cur_ok, new_ok) {
+                    (true, true) => w < *bw,   // smallest sufficient
+                    (false, true) => true,      // sufficient beats too-small
+                    (true, false) => false,
+                    (false, false) => w > *bw,  // largest of the too-smalls
+                }
+            }
+        };
+        if better {
+            best = Some((w, url));
+        }
+    }
+    best.map(|(_, u)| u)
+}
+
+/// The effective source of an <img>: srcset choice first, else src.
+pub fn effective_img_src(attrs: &kuchiki::Attributes) -> Option<String> {
+    if let Some(srcset) = attrs.get("srcset") {
+        if let Some(u) = pick_srcset(srcset) {
+            return Some(u);
+        }
+    }
+    attrs.get("src").map(str::to_string)
+}
+
 /// The current page's base url (set by set_page).
 pub fn page_base() -> String {
     STORE.with(|s| s.borrow().base_url.clone())

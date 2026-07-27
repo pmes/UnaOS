@@ -168,7 +168,8 @@ pub fn collect_image_urls(base_url: &str, html: &str) -> Vec<String> {
     if let Ok(imgs) = document.select("img") {
         for img in imgs {
             let attrs = img.attributes.borrow();
-            let Some(src) = attrs.get("src") else { continue };
+            let Some(src) = crate::images::effective_img_src(&attrs) else { continue };
+            let src = src.as_str();
             if src.starts_with("data:") {
                 continue; // decoded synchronously at load, no fetch needed
             }

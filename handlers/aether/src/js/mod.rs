@@ -175,6 +175,20 @@ impl Engine {
         Self::setup_document(&mut context, document);
         crate::api::window::setup_window(&mut context);
         crate::api::events::init(&mut context);
+        // window/global listeners route to the document, whose dispatch
+        // path is real — load/DOMContentLoaded registrations land there.
+        let _ = context.eval(boa_engine::Source::from_bytes(
+            r#"
+            globalThis.addEventListener = function (ev, cb) {
+                document.addEventListener(ev, cb);
+            };
+            globalThis.removeEventListener = function () {};
+            if (typeof window !== 'undefined' && window) {
+                window.addEventListener = globalThis.addEventListener;
+                window.removeEventListener = globalThis.removeEventListener;
+            }
+            "#,
+        ));
         
         Self { context }
     }
