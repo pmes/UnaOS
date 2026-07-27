@@ -38,6 +38,11 @@ pub struct AetherEngine {
     pub stylesheets: Vec<String>,
     /// Play request staged by a media-element click: (url, title, mime).
     pending_media: Option<(String, String, String)>,
+    /// Navigation staged by a link click or form submit. The SHELL performs
+    /// it asynchronously: the engine thread runs a current-thread runtime,
+    /// where tokio::task::block_in_place panics — the old inline block here
+    /// killed the engine thread on the first link click.
+    pending_nav: Option<forms::OpenDocument>,
 }
 
 impl AetherEngine {
@@ -59,6 +64,7 @@ impl AetherEngine {
             surface: vec![255; 800 * 600 * 4],
             stylesheets: Vec::new(),
             pending_media: None,
+            pending_nav: None,
         }
     }
 
@@ -196,22 +202,7 @@ impl AetherEngine {
                                 self.damage_rects.push((0, 0, self.width, self.height));
                             } else if key == "Return" {
                                 if let Some(doc_req) = self.build_form_submission(node) {
-                                    let _ = tokio::task::block_in_place(|| {
-                                        tokio::runtime::Handle::current().block_on(async {
-                                            match doc_req.method {
-                                                forms::HttpMethod::Get => {
-                                                    let _ = self.load_url_internal(&doc_req.url, true).await;
-                                                }
-                                                forms::HttpMethod::Post => {
-                                                    let body = doc_req.body.unwrap_or_default();
-                                                    match net::post_document(&doc_req.url, &body).await {
-                                                        Ok(html) => self.load_html(&doc_req.url, &html, true),
-                                                        Err(e) => self.load_error_page(&doc_req.url, &e.to_string()),
-                                                    }
-                                                }
-                                            }
-                                        })
-                                    });
+                                    self.pending_nav = Some(doc_req);
                                 }
                             }
                         }
@@ -245,19 +236,32 @@ impl AetherEngine {
                         }
                         cur = n.parent();
                     }
-                    if let Some(el) = node.as_element() {
-                        if &*el.name.local == "a" {
-                            if let Some(href) = el.attributes.borrow().get("href") {
-                                let href = href.to_string();
-                                let _ = tokio::task::block_in_place(|| {
-                                    tokio::runtime::Handle::current().block_on(async {
-                                        let _ = self.load_url_internal(&href, true).await;
-                                    })
-                                });
+                    // The hit is the DEEPEST box — usually the text run
+                    // inside the link — so walk ancestors for the <a>.
+                    let mut cur = Some(node.clone());
+                    while let Some(n) = cur {
+                        if let Some(el) = n.as_element() {
+                            match el.name.local.as_ref() {
+                                "a" => {
+                                    if let Some(href) = el.attributes.borrow().get("href") {
+                                        let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
+                                        let url = images::resolve(&base, href);
+                                        self.pending_nav = Some(forms::OpenDocument {
+                                            url,
+                                            method: forms::HttpMethod::Get,
+                                            body: None,
+                                        });
+                                    }
+                                    break;
+                                }
+                                "input" | "textarea" | "select" => {
+                                    self.focused_node = Some(n.clone());
+                                    break;
+                                }
+                                _ => {}
                             }
-                        } else if &*el.name.local == "input" {
-                            self.focused_node = Some(node);
                         }
+                        cur = n.parent();
                     }
                 }
             }
@@ -369,6 +373,12 @@ impl AetherEngine {
 
     pub fn load_html(&mut self, url: &str, html: &str, add_history: bool) {
         self.load_html_styled(url, html, &[], add_history)
+    }
+
+    /// The staged navigation from the last link click / form submit, if
+    /// any. The shell consumes it and drives the async load.
+    pub fn take_pending_nav(&mut self) -> Option<forms::OpenDocument> {
+        self.pending_nav.take()
     }
 
     /// The staged play request from the last media-element click, if any.

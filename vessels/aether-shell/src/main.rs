@@ -98,6 +98,26 @@ fn main() {
                             }
                             _ => {}
                         }
+                        // A link click or form submit staged a navigation;
+                        // run it here where awaiting is legal (the engine
+                        // thread must never block on the runtime itself).
+                        if let Some(nav) = engine.take_pending_nav() {
+                            match nav.method {
+                                aether::forms::HttpMethod::Get => {
+                                    match aether::net::fetch_page(&nav.url).await {
+                                        Ok(page) => engine.load_page(page, true),
+                                        Err(e) => engine.load_error_page(&nav.url, &e.to_string()),
+                                    }
+                                }
+                                aether::forms::HttpMethod::Post => {
+                                    let body = nav.body.unwrap_or_default();
+                                    match aether::net::post_document(&nav.url, &body).await {
+                                        Ok(html) => engine.load_html(&nav.url, &html, true),
+                                        Err(e) => engine.load_error_page(&nav.url, &e.to_string()),
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

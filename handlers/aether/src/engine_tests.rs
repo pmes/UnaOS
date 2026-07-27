@@ -77,11 +77,11 @@ mod tests {
             input { width: 100px; height: 30px; }
         </style></head><body>
             <a id="link" href="https://example.com/dest">Link</a>
-            <input id="field" type="text" value="hello" />
+            <form action="/search"><input id="field" name="q" type="text" value="hello" /></form>
         </body></html>"#;
         
         let mut engine = crate::AetherEngine::new();
-        engine.load_html("https://example.com/", html, false);
+        engine.load_html("https://example.com/", html, true);
         engine.render_frame(); // to compute bounds
         
         // Find link and field absolute coordinates by walking layout tree
@@ -136,14 +136,19 @@ mod tests {
             assert_eq!(el.attributes.borrow().get("value"), Some("hello worl"));
         }
         
-        // Enter submitting the form (offline)
+        // Enter stages the form submission (the shell performs it async —
+        // blocking on the engine thread killed it on current-thread runtimes).
         engine.handle_event(crate::api::events::Event::KeyDown("Return".to_string()));
-        
-        // 2. hit-test -> link navigation
+        let nav = engine.take_pending_nav().expect("Return must stage the form nav");
+        assert_eq!(nav.url, "https://example.com/search?q=hello+worl", "form nav resolves against page");
+
+        // 2. hit-test -> link click stages a GET navigation
         engine.handle_event(crate::api::events::Event::MouseDown(link_x, link_y));
         engine.handle_event(crate::api::events::Event::MouseUp(link_x, link_y));
-        
-
+        let nav = engine.take_pending_nav().expect("link click must stage nav");
+        assert_eq!(nav.url, "https://example.com/dest");
+        assert_eq!(nav.method, crate::forms::HttpMethod::Get);
+        assert!(engine.take_pending_nav().is_none(), "take must consume");
     }
 
     #[tokio::test]
