@@ -80,7 +80,10 @@ impl Engine {
 
         crate::api::fetch::init(context);
 
-        let clear_timeout = NativeFunction::from_fn_ptr(|_, _, _| Ok(JsValue::undefined()));
+        let clear_timeout = NativeFunction::from_fn_ptr(|_, _, _| {
+            crate::ledger::record_js("window.clearTimeout");
+            Ok(JsValue::undefined())
+        });
         context.register_global_callable(boa_engine::string::JsString::from("clearTimeout"), 1, clear_timeout).unwrap();
     }
 
@@ -166,7 +169,10 @@ impl Engine {
                 1,
             )
             .function(
-                NativeFunction::from_fn_ptr(|_, _, _| Ok(JsValue::undefined())),
+                NativeFunction::from_fn_ptr(|_, _, _| {
+                    crate::ledger::record_js("Element.innerHTML");
+                    Ok(JsValue::undefined())
+                }),
                 boa_engine::string::JsString::from("innerHTML"),
                 1,
             )
@@ -191,12 +197,18 @@ impl Engine {
                 1,
             )
             .function(
-                NativeFunction::from_fn_ptr(|_, _, _| Ok(JsValue::undefined())),
+                NativeFunction::from_fn_ptr(|_, _, _| {
+                    crate::ledger::record_js("Element.setAttribute");
+                    Ok(JsValue::undefined())
+                }),
                 boa_engine::string::JsString::from("setAttribute"),
                 2,
             )
             .function(
-                NativeFunction::from_fn_ptr(|_, _, _| Ok(JsValue::undefined())),
+                NativeFunction::from_fn_ptr(|_, _, _| {
+                    crate::ledger::record_js("EventTarget.addEventListener");
+                    Ok(JsValue::undefined())
+                }),
                 boa_engine::string::JsString::from("addEventListener"),
                 2,
             )

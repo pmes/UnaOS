@@ -172,4 +172,55 @@ mod tests {
             engine.borrow_mut().tick();
         }).await;
     }
+
+    #[test]
+    fn test_ledger_records_unimplemented_apis() {
+        crate::ledger::reset();
+        let html = r#"<html><head><style>
+            div { position: absolute; display: grid; }
+        </style></head><body>
+            <div id="t">x</div>
+            <script>
+                var el = document.getElementById("t");
+                el.setAttribute("data-x", "1");
+                el.addEventListener("click", function() {});
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://ledger", html, true);
+
+        let snap = crate::ledger::snapshot();
+        use crate::ledger::ApiCategory;
+        assert!(snap.contains(ApiCategory::Css, "property:position"), "unhandled CSS property must be recorded");
+        assert!(snap.contains(ApiCategory::Css, "display:grid"), "unhandled display value must be recorded");
+        assert!(snap.contains(ApiCategory::Js, "Element.setAttribute"), "no-op setAttribute must be recorded");
+        assert!(snap.contains(ApiCategory::Js, "EventTarget.addEventListener"), "no-op addEventListener must be recorded");
+    }
+
+    #[tokio::test]
+    async fn test_headless_render_writes_png_and_ledger() {
+        let dir = std::env::temp_dir().join("aether_headless_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = dir.join("fixture.html");
+        std::fs::write(&fixture, r#"<html><body>
+            <div style="width: 50px; height: 50px; background-color: red;"></div>
+            <p>hello</p>
+        </body></html>"#).unwrap();
+        let out = dir.join("out.png");
+        let ledger_path = dir.join("ledger.txt");
+
+        let (w, h, _missing) = crate::headless::render_headless(
+            None, Some(&fixture), &out, &ledger_path,
+        ).await.unwrap();
+
+        let img = image::open(&out).unwrap().to_rgba8();
+        assert_eq!((img.width(), img.height()), (w, h));
+        let first = *img.get_pixel(0, 0);
+        assert!(
+            img.pixels().any(|p| *p != first),
+            "rendered PNG must not be a single flat color"
+        );
+        let ledger_text = std::fs::read_to_string(&ledger_path).unwrap();
+        assert!(ledger_text.contains("Aether M5 API Ledger"), "ledger dump must be written");
+    }
 }

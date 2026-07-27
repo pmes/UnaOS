@@ -36,7 +36,9 @@ pub fn apply_css(layout_tree: &mut LayoutTree, css: &str) {
                                                 match ident.as_ref() {
                                                     "flex" => style.display = Display::Flex,
                                                     "none" => style.display = Display::None,
-                                                    _ => {}
+                                                    other => {
+                                                        crate::ledger::record_css(&format!("display:{}", other));
+                                                    }
                                                 }
                                             }
                                         }
@@ -69,7 +71,9 @@ pub fn apply_css(layout_tree: &mut LayoutTree, css: &str) {
                                                 style.margin = Rect { left: lp.clone(), right: lp.clone(), top: lp.clone(), bottom: lp };
                                             }
                                         }
-                                        _ => {}
+                                        other => {
+                                            crate::ledger::record_css(&format!("property:{}", other));
+                                        }
                                     }
                                 }
                             }

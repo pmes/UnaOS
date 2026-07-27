@@ -1,7 +1,40 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
+
+thread_local! {
+    /// The live ledger for this thread. The engine, JS bindings, and CSS
+    /// cascade all run on one thread (same idiom as js::DOM_STATE), so a
+    /// thread-local is the honest single collection point.
+    static LEDGER: RefCell<ApiCoverageLedger> = RefCell::new(ApiCoverageLedger::new());
+}
+
+/// Records a missing DOM API on the thread's live ledger.
+pub fn record_dom(api_name: &str) {
+    LEDGER.with(|l| l.borrow_mut().record_dom(api_name));
+}
+
+/// Records a missing CSS feature on the thread's live ledger.
+pub fn record_css(api_name: &str) {
+    LEDGER.with(|l| l.borrow_mut().record_css(api_name));
+}
+
+/// Records a missing JS API on the thread's live ledger.
+pub fn record_js(api_name: &str) {
+    LEDGER.with(|l| l.borrow_mut().record_js(api_name));
+}
+
+/// Returns a snapshot of the thread's live ledger.
+pub fn snapshot() -> ApiCoverageLedger {
+    LEDGER.with(|l| l.borrow().clone())
+}
+
+/// Clears the thread's live ledger (test isolation, or per-page resets).
+pub fn reset() {
+    LEDGER.with(|l| *l.borrow_mut() = ApiCoverageLedger::new());
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ApiCategory {
@@ -55,6 +88,21 @@ impl ApiCoverageLedger {
     /// Convenience method for recording a missing JS API.
     pub fn record_js(&mut self, api_name: &str) {
         self.record(ApiCategory::Js, api_name);
+    }
+
+    /// Number of distinct missing APIs recorded.
+    pub fn len(&self) -> usize {
+        self.missing_apis.len()
+    }
+
+    /// True when nothing has been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.missing_apis.is_empty()
+    }
+
+    /// True if the given API name was recorded under the given category.
+    pub fn contains(&self, category: ApiCategory, api_name: &str) -> bool {
+        self.missing_apis.contains_key(&(category, api_name.to_string()))
     }
 
     /// Dumps the current ledger state to a file in a human-readable format.

@@ -17,6 +17,20 @@ enum Commands {
     Open {
         url: String,
     },
+    /// Headless render: fetch (or read --html), render once, write PNG + ledger, exit
+    Render {
+        /// URL to load (ignored when --html is given)
+        url: Option<String>,
+        /// Load this local HTML file instead of fetching a URL
+        #[arg(long)]
+        html: Option<std::path::PathBuf>,
+        /// PNG output path
+        #[arg(long, default_value = "aether-render.png")]
+        out: std::path::PathBuf,
+        /// Ledger dump path
+        #[arg(long, default_value = "aether-ledger.txt")]
+        ledger: std::path::PathBuf,
+    },
 }
 
 use bandy::synapse::Synapse;
@@ -74,6 +88,14 @@ async fn main() -> Result<()> {
             });
             
             ignite(synapse).await?;
+        }
+        Commands::Render { url, html, out, ledger } => {
+            let (w, h, missing) =
+                aether::headless::render_headless(url.as_deref(), html.as_deref(), out, ledger).await?;
+            println!(
+                "rendered {}x{} -> {} | {} missing APIs -> {}",
+                w, h, out.display(), missing, ledger.display()
+            );
         }
     }
 
