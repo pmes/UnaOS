@@ -15,8 +15,14 @@ pub(crate) struct SpecifiedStyle {
     pub flex_direction: Option<FlexDirection>,
     pub width: Option<Dimension>,
     pub height: Option<Dimension>,
-    pub padding: Option<LengthPercentage>,
-    pub margin: Option<LengthPercentageAuto>,
+    pub padding: Option<Rect<LengthPercentage>>,
+    pub margin: Option<Rect<LengthPercentageAuto>>,
+    pub position: Option<taffy::style::Position>,
+    pub inset_top: Option<LengthPercentageAuto>,
+    pub inset_left: Option<LengthPercentageAuto>,
+    pub inset_right: Option<LengthPercentageAuto>,
+    pub inset_bottom: Option<LengthPercentageAuto>,
+    pub justify: Option<taffy::style::JustifyContent>,
     pub paint: PaintStyle,
 }
 
@@ -31,10 +37,20 @@ impl SpecifiedStyle {
             node_style.min_size.height = h;
         }
         if let Some(p) = self.padding {
-            node_style.padding = Rect { left: p, right: p, top: p, bottom: p };
+            node_style.padding = p;
         }
         if let Some(m) = self.margin {
-            node_style.margin = Rect { left: m, right: m, top: m, bottom: m };
+            node_style.margin = m;
+        }
+        if let Some(pos) = self.position {
+            node_style.position = pos;
+        }
+        if let Some(v) = self.inset_top { node_style.inset.top = v; }
+        if let Some(v) = self.inset_left { node_style.inset.left = v; }
+        if let Some(v) = self.inset_right { node_style.inset.right = v; }
+        if let Some(v) = self.inset_bottom { node_style.inset.bottom = v; }
+        if let Some(j) = self.justify {
+            node_style.justify_content = Some(j);
         }
     }
 }
@@ -56,8 +72,57 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
         },
         "width" => style.width = parse_dimension_str(value),
         "height" => style.height = parse_dimension_str(value),
-        "padding" => style.padding = parse_length_percentage_str(value),
-        "margin" => style.margin = parse_length_percentage_auto_str(value),
+        "padding" => style.padding = parse_sides(value, |v| parse_length_percentage_str(v)),
+        "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
+            if let Some(v) = parse_length_percentage_str(value) {
+                let mut p = style.padding.unwrap_or(Rect {
+                    left: LengthPercentage::length(0.0),
+                    right: LengthPercentage::length(0.0),
+                    top: LengthPercentage::length(0.0),
+                    bottom: LengthPercentage::length(0.0),
+                });
+                match prop {
+                    "padding-top" => p.top = v,
+                    "padding-right" => p.right = v,
+                    "padding-bottom" => p.bottom = v,
+                    _ => p.left = v,
+                }
+                style.padding = Some(p);
+            }
+        }
+        "margin" => style.margin = parse_sides(value, |v| parse_length_percentage_auto_str(v)),
+        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
+            if let Some(v) = parse_length_percentage_auto_str(value) {
+                let mut m = style.margin.unwrap_or(Rect {
+                    left: LengthPercentageAuto::length(0.0),
+                    right: LengthPercentageAuto::length(0.0),
+                    top: LengthPercentageAuto::length(0.0),
+                    bottom: LengthPercentageAuto::length(0.0),
+                });
+                match prop {
+                    "margin-top" => m.top = v,
+                    "margin-right" => m.right = v,
+                    "margin-bottom" => m.bottom = v,
+                    _ => m.left = v,
+                }
+                style.margin = Some(m);
+            }
+        }
+        "position" => match value {
+            "absolute" | "fixed" => style.position = Some(taffy::style::Position::Absolute),
+            "static" | "relative" | "sticky" => style.position = Some(taffy::style::Position::Relative),
+            other => crate::ledger::record_css(&format!("position:{}", other)),
+        },
+        "top" => style.inset_top = parse_length_percentage_auto_str(value),
+        "left" => style.inset_left = parse_length_percentage_auto_str(value),
+        "right" => style.inset_right = parse_length_percentage_auto_str(value),
+        "bottom" => style.inset_bottom = parse_length_percentage_auto_str(value),
+        "text-align" => match value {
+            "center" => style.justify = Some(taffy::style::JustifyContent::CENTER),
+            "right" | "end" => style.justify = Some(taffy::style::JustifyContent::END),
+            "left" | "start" | "justify" => style.justify = Some(taffy::style::JustifyContent::START),
+            other => crate::ledger::record_css(&format!("text-align:{}", other)),
+        },
         "background-color" | "background" => {
             if !is_neutral_keyword(value) {
                 match parse_color_str(value) {
@@ -323,6 +388,20 @@ pub fn parse_font_weight(value: &str) -> Option<bool> {
 pub fn parse_px(value: &str) -> Option<f32> {
     let v = value.trim();
     v.strip_suffix("px").unwrap_or(v).trim().parse::<f32>().ok()
+}
+
+/// Parses a 1-4 value box shorthand ("10px", "0 auto", "1px 2px 3px 4px")
+/// into a sides rect using CSS's top/right/bottom/left expansion.
+fn parse_sides<T: Copy>(value: &str, parse_one: impl Fn(&str) -> Option<T>) -> Option<Rect<T>> {
+    let parts: Vec<T> = value.split_whitespace().map(|p| parse_one(p)).collect::<Option<_>>()?;
+    let (t, r, b, l) = match parts.as_slice() {
+        [a] => (*a, *a, *a, *a),
+        [v, h] => (*v, *h, *v, *h),
+        [t, h, b] => (*t, *h, *b, *h),
+        [t, r, b, l] => (*t, *r, *b, *l),
+        _ => return None,
+    };
+    Some(Rect { top: t, right: r, bottom: b, left: l })
 }
 
 fn parse_dimension_str(value: &str) -> Option<Dimension> {

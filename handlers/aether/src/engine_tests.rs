@@ -242,7 +242,7 @@ mod tests {
     fn test_ledger_records_unimplemented_apis() {
         crate::ledger::reset();
         let html = r#"<html><head><style>
-            div { position: absolute; display: grid; }
+            div { filter: blur(2px); display: grid; }
         </style></head><body>
             <div id="t">x</div>
             <script>
@@ -256,7 +256,7 @@ mod tests {
 
         let snap = crate::ledger::snapshot();
         use crate::ledger::ApiCategory;
-        assert!(snap.contains(ApiCategory::Css, "property:position"), "unhandled CSS property must be recorded");
+        assert!(snap.contains(ApiCategory::Css, "property:filter"), "unhandled CSS property must be recorded");
         assert!(snap.contains(ApiCategory::Css, "display:grid"), "unhandled display value must be recorded");
         assert!(snap.contains(ApiCategory::Js, "Element.setAttribute"), "no-op setAttribute must be recorded");
         assert!(snap.contains(ApiCategory::Js, "EventTarget.addEventListener"), "no-op addEventListener must be recorded");
