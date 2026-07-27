@@ -10,6 +10,7 @@ pub mod css;
 
 pub mod headless;
 pub mod ledger;
+pub mod yt;
 pub mod storage;
 pub mod workers;
 pub mod event_loop;
