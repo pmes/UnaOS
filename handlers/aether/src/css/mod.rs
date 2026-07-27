@@ -175,20 +175,28 @@ pub fn apply_css(layout_tree: &mut LayoutTree, css: &str) {
                                             style.margin = parse_length_percentage_auto(first_val.as_ref());
                                         }
                                         "background-color" | "background" => {
-                                            match color_from_token(first_val.as_ref()) {
-                                                Some(c) => style.paint.background = Some(c),
-                                                None => crate::ledger::record_css("background-value:unsupported"),
+                                            if !token_is_neutral(first_val.as_ref()) {
+                                                match color_from_token(first_val.as_ref()) {
+                                                    Some(c) => style.paint.background = Some(c),
+                                                    None => crate::ledger::record_css("background-value:unsupported"),
+                                                }
                                             }
                                         }
-                                        "color" => match color_from_token(first_val.as_ref()) {
-                                            Some(c) => style.paint.color = Some(c),
-                                            None => crate::ledger::record_css("color-value:unsupported"),
-                                        },
-                                        "font-size" => match first_val.as_ref() {
-                                            Some(Token::Dimension { value, unit, .. }) if unit.as_ref() == "px" => {
-                                                style.paint.font_size = Some(*value);
+                                        "color" => {
+                                            if !token_is_neutral(first_val.as_ref()) {
+                                                match color_from_token(first_val.as_ref()) {
+                                                    Some(c) => style.paint.color = Some(c),
+                                                    None => crate::ledger::record_css("color-value:unsupported"),
+                                                }
                                             }
-                                            _ => crate::ledger::record_css("font-size-value:unsupported"),
+                                        }
+                                        "font-size" => match font_size_from_token(first_val.as_ref()) {
+                                            Some(px) => style.paint.font_size = Some(px),
+                                            None => crate::ledger::record_css("font-size-value:unsupported"),
+                                        },
+                                        "font-weight" => match font_weight_from_token(first_val.as_ref()) {
+                                            Some(b) => style.paint.bold = Some(b),
+                                            None => crate::ledger::record_css("font-weight-value:unsupported"),
                                         },
                                         other => {
                                             crate::ledger::record_css(&format!("property:{}", other));
@@ -226,6 +234,7 @@ pub fn apply_css(layout_tree: &mut LayoutTree, css: &str) {
                             if style.paint.background.is_some() { entry.background = style.paint.background; }
                             if style.paint.color.is_some() { entry.color = style.paint.color; }
                             if style.paint.font_size.is_some() { entry.font_size = style.paint.font_size; }
+                            if style.paint.bold.is_some() { entry.bold = style.paint.bold; }
                         }
                     }
                 }
@@ -267,6 +276,80 @@ pub fn parse_color_str(value: &str) -> Option<(u8, u8, u8)> {
         return None;
     }
     named_color(v)
+}
+
+/// Keywords that specify "no concrete value here" — not coverage gaps.
+pub fn is_neutral_keyword(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "transparent" | "inherit" | "initial" | "unset" | "currentcolor" | "none"
+    )
+}
+
+fn token_is_neutral(token: Option<&Token>) -> bool {
+    matches!(token, Some(Token::Ident(v)) if is_neutral_keyword(v.as_ref()))
+}
+
+const BASE_FONT_PX: f32 = 16.0;
+
+/// Parses a font-size string: px, em/rem (relative to the 16px UA base —
+/// approximation, not parent-relative), %, or absolute keywords.
+pub fn parse_font_size(value: &str) -> Option<f32> {
+    let v = value.trim().to_ascii_lowercase();
+    if let Some(px) = v.strip_suffix("px").and_then(|n| n.trim().parse::<f32>().ok()) {
+        return Some(px);
+    }
+    if let Some(em) = v
+        .strip_suffix("rem")
+        .or_else(|| v.strip_suffix("em"))
+        .and_then(|n| n.trim().parse::<f32>().ok())
+    {
+        return Some(em * BASE_FONT_PX);
+    }
+    if let Some(pct) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
+        return Some(pct / 100.0 * BASE_FONT_PX);
+    }
+    match v.as_str() {
+        "xx-small" => Some(9.0),
+        "x-small" => Some(10.0),
+        "small" => Some(13.0),
+        "medium" => Some(16.0),
+        "large" => Some(18.0),
+        "x-large" => Some(24.0),
+        "xx-large" => Some(32.0),
+        _ => v.parse::<f32>().ok(),
+    }
+}
+
+fn font_size_from_token(token: Option<&Token>) -> Option<f32> {
+    match token {
+        Some(Token::Dimension { value, unit, .. }) => match unit.as_ref() {
+            "px" => Some(*value),
+            "em" | "rem" => Some(value * BASE_FONT_PX),
+            _ => None,
+        },
+        Some(Token::Percentage { unit_value, .. }) => Some(unit_value * BASE_FONT_PX),
+        Some(Token::Ident(kw)) => parse_font_size(kw.as_ref()),
+        _ => None,
+    }
+}
+
+/// Parses a font-weight into "bold or not".
+pub fn parse_font_weight(value: &str) -> Option<bool> {
+    let v = value.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "bold" | "bolder" => Some(true),
+        "normal" | "lighter" => Some(false),
+        _ => v.parse::<f32>().ok().map(|n| n >= 600.0),
+    }
+}
+
+fn font_weight_from_token(token: Option<&Token>) -> Option<bool> {
+    match token {
+        Some(Token::Ident(kw)) => parse_font_weight(kw.as_ref()),
+        Some(Token::Number { value, .. }) => Some(*value >= 600.0),
+        _ => None,
+    }
 }
 
 /// Parses "NNpx" (or a bare number) into pixels.
@@ -317,6 +400,27 @@ fn hex_color(hex: &str) -> Option<(u8, u8, u8)> {
             Some((r, g, b))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_font_size_and_weight_parsing() {
+        assert_eq!(parse_font_size("14px"), Some(14.0));
+        assert_eq!(parse_font_size("1.5em"), Some(24.0));
+        assert_eq!(parse_font_size("2rem"), Some(32.0));
+        assert_eq!(parse_font_size("110%"), Some(17.6));
+        assert_eq!(parse_font_size("medium"), Some(16.0));
+        assert_eq!(parse_font_size("banana"), None);
+        assert_eq!(parse_font_weight("bold"), Some(true));
+        assert_eq!(parse_font_weight("400"), Some(false));
+        assert_eq!(parse_font_weight("700"), Some(true));
+        assert!(is_neutral_keyword("transparent"));
+        assert!(is_neutral_keyword("Inherit"));
+        assert!(!is_neutral_keyword("red"));
     }
 }
 

@@ -13,6 +13,7 @@ use taffy::prelude::*;
 struct Inherited {
     color: (u8, u8, u8),
     font_size: f32,
+    bold: bool,
 }
 
 /// Default font sizes per element (rough UA-stylesheet equivalents).
@@ -167,8 +168,14 @@ pub fn render_frame(
         }
     }
 
-    let font = crate::fonts::FontEngine::new()
-        .load_font(&[FamilyName::SansSerif], &Properties::new());
+    let font_engine = crate::fonts::FontEngine::new();
+    let font = font_engine.load_font(&[FamilyName::SansSerif], &Properties::new());
+    let font_bold = font_engine
+        .load_font(
+            &[FamilyName::SansSerif],
+            Properties::new().weight(font_kit::properties::Weight::BOLD),
+        )
+        .or_else(|| font.clone());
 
     let sy = scroll_y as i32;
     let sx = scroll_x as i32;
@@ -181,6 +188,7 @@ pub fn render_frame(
         inherited: Inherited,
         layout: &LayoutTree,
         font: &Option<Arc<Font>>,
+        font_bold: &Option<Arc<Font>>,
         surface: &mut [u8],
         width: u32,
         height: u32,
@@ -201,6 +209,10 @@ pub fn render_frame(
                 let tag = el.name.local.as_ref();
                 inherited.font_size =
                     spec.font_size.unwrap_or_else(|| default_font_size(tag, inherited.font_size));
+                inherited.bold = spec.bold.unwrap_or(
+                    inherited.bold
+                        || matches!(tag, "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th"),
+                );
                 inherited.color = spec.color.unwrap_or(if tag == "a" {
                     (0, 0, 238) // UA default link blue
                 } else {
@@ -225,6 +237,7 @@ pub fn render_frame(
                     }
                 }
             } else if dom_node.as_text().is_some() {
+                let font = if inherited.bold { font_bold } else { font };
                 if let Some(font) = font {
                     let text = dom_node.text_contents();
                     let text = text.trim();
@@ -250,8 +263,8 @@ pub fn render_frame(
         if let Ok(children) = layout.taffy.children(node_id) {
             for child in children {
                 draw_node(
-                    child, current_x, current_y, inherited, layout, font, surface, width, height,
-                    sx, sy, damage_rects,
+                    child, current_x, current_y, inherited, layout, font, font_bold, surface,
+                    width, height, sx, sy, damage_rects,
                 );
             }
         }
@@ -260,6 +273,7 @@ pub fn render_frame(
     let root_inherited = Inherited {
         color: (0, 0, 0),
         font_size: 16.0,
+        bold: false,
     };
     draw_node(
         layout.root_node,
@@ -268,6 +282,7 @@ pub fn render_frame(
         root_inherited,
         layout,
         &font,
+        &font_bold,
         surface,
         width,
         height,

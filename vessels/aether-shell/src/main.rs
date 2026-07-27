@@ -47,22 +47,21 @@ fn main() {
                     Ok(msg) = engine_rx.recv() => {
                         match msg {
                             SMessage::OpenDocument { url } => {
-                                let content = match aether::net::fetch_document(&url).await {
-                                    Ok(c) => c,
-                                    Err(e) => format!("<html><body><h1>Error</h1><p>{}</p></body></html>", e),
-                                };
-                                engine.load_html(&url, &content, true);
+                                match aether::net::fetch_page(&url).await {
+                                    Ok((html, sheets)) => engine.load_html_styled(&url, &html, &sheets, true),
+                                    Err(e) => engine.load_error_page(&url, &e.to_string()),
+                                }
                             }
                             SMessage::BrowserNavBack => {
                                 if let Some(url) = engine.get_back_url() {
-                                    let content = aether::net::fetch_document(&url).await.unwrap_or_default();
-                                    engine.load_html(&url, &content, false);
+                                    let (html, sheets) = aether::net::fetch_page(&url).await.unwrap_or_default();
+                                    engine.load_html_styled(&url, &html, &sheets, false);
                                 }
                             }
                             SMessage::BrowserNavForward => {
                                 if let Some(url) = engine.get_forward_url() {
-                                    let content = aether::net::fetch_document(&url).await.unwrap_or_default();
-                                    engine.load_html(&url, &content, false);
+                                    let (html, sheets) = aether::net::fetch_page(&url).await.unwrap_or_default();
+                                    engine.load_html_styled(&url, &html, &sheets, false);
                                 }
                             }
                             SMessage::BrowserNavReload => {
