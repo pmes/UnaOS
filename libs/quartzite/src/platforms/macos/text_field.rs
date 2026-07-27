@@ -43,6 +43,7 @@ pub fn bootstrap_text_field(
     synapse: Synapse,
 ) -> Retained<NSView> {
     unsafe {
+        let is_url_bar = matches!(text_action, TextAction::OpenDocument);
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(600.0, 24.0));
         let field: Allocated<UnaTextField> = msg_send![UnaTextField::class(), alloc];
         let field: Retained<UnaTextField> = msg_send![field, initWithFrame: frame];

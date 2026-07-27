@@ -124,6 +124,9 @@ pub enum SMessage {
     BrowserResize(u32, u32),
     BrowserKey(String),
     BrowserText(String),
+    /// Engine → chrome: the current document url changed (link click,
+    /// back/forward, redirect); the address bar mirrors it.
+    BrowserUrlChanged(String),
 
     // --- EDITOR (The Code Pane) ---
     /// Load a document into the active editor pane. Fired when a file is

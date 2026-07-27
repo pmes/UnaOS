@@ -53,7 +53,14 @@ impl LayoutTree {
 
 /// Elements whose subtrees produce no boxes.
 fn is_non_rendered(name: &str) -> bool {
-    matches!(name, "head" | "script" | "style" | "title" | "meta" | "link" | "template")
+    // noscript: scripting IS enabled here (page scripts run), so its
+    // fallback content must not render. iframe/object/embed: no frame
+    // support yet — an empty box is honest, raw content leaking is not.
+    matches!(
+        name,
+        "head" | "script" | "style" | "title" | "meta" | "link" | "template"
+            | "noscript" | "iframe" | "object" | "embed"
+    )
 }
 
 /// Inline-level elements: they size to content and flow in wrapping rows.

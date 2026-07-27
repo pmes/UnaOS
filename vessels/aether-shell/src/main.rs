@@ -34,6 +34,7 @@ fn main() {
             });
             
             let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(16));
+            let mut last_url: Option<String> = None;
             
             loop {
                 tokio::select! {
@@ -121,6 +122,14 @@ fn main() {
                                         Err(e) => engine.load_error_page(&nav.url, &e.to_string()),
                                     }
                                 }
+                            }
+                        }
+                        // Mirror the engine's current url into the address
+                        // bar (covers clicks, back/forward, reload, typing).
+                        if let Some(current) = engine.history.get(engine.history_idx) {
+                            if last_url.as_deref() != Some(current.as_str()) {
+                                last_url = Some(current.clone());
+                                engine_tx.fire(SMessage::BrowserUrlChanged(current.clone()));
                             }
                         }
                     }

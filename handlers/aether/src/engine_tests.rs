@@ -866,6 +866,26 @@ mod tests {
         assert_eq!(engine.get_forward_url(), None, "forward tail dropped");
     }
 
+    /// noscript fallback and iframe innards must not render (scripting is
+    /// enabled; frames are unsupported empty boxes).
+    #[test]
+    fn test_noscript_iframe_hidden() {
+        let html = r#"<html><body>
+            <noscript>&lt;iframe src="x"&gt;NOSCRIPT LEAK&lt;/iframe&gt;</noscript>
+            <iframe src="https://x.test/">FRAME FALLBACK</iframe>
+            <p>visible</p>
+        </body></html>"#;
+        let document = dom::parse_html(html);
+        let layout_tree = layout::compute_layout(&document);
+        for (_, dom_node) in &layout_tree.node_map {
+            let text = dom_node.text_contents();
+            if dom_node.as_text().is_some() {
+                assert!(!text.contains("NOSCRIPT LEAK"), "noscript content must produce no box");
+                assert!(!text.contains("FRAME FALLBACK"), "iframe content must produce no box");
+            }
+        }
+    }
+
     /// float:left/right sizes to content and hugs its edge (approximation).
     #[test]
     fn test_float_approximation() {
