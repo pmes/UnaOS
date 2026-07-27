@@ -701,6 +701,49 @@ mod tests {
             "zero-delay boot timer must run during load");
     }
 
+    /// el.style.x = ... writes the inline style attribute (replacing the
+    /// property, keeping the rest) and traversal getters walk elements.
+    #[test]
+    fn test_style_assignment_and_traversal() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled(
+            "https://example.com/",
+            r#"<html><body>
+                <div id="wrap" style="color: red; display: block">
+                    <p id="a">one</p>
+                    text between
+                    <p id="b">two</p>
+                </div>
+            </body></html>"#,
+            &[],
+            true,
+        );
+        let js = engine.js_engine.as_mut().unwrap();
+        js.execute(r#"
+            var w = document.getElementById('wrap');
+            w.style.display = 'none';
+            w.style.maxHeight = '0';
+            var a = document.getElementById('a');
+            var result = [
+                w.style.display,
+                a.parentNode.id,
+                w.children.length,
+                w.firstElementChild.id,
+                a.nextElementSibling.id,
+                a.tagName,
+            ].join('|');
+            document.getElementById('b').setAttribute('data-r', result);
+        "#).expect("script must run clean");
+        let doc = engine.document.clone().unwrap();
+        let w = doc.select("#wrap").unwrap().next().unwrap();
+        let style = w.attributes.borrow().get("style").unwrap().to_string();
+        assert!(style.contains("color: red"), "untouched decls survive: {}", style);
+        assert!(style.contains("display: none"), "assignment replaces: {}", style);
+        assert!(style.contains("max-height: 0"), "camelCase maps to kebab: {}", style);
+        let b = doc.select("#b").unwrap().next().unwrap();
+        assert_eq!(b.attributes.borrow().get("data-r"), Some("none|wrap|2|a|b|P"));
+    }
+
     /// float:left/right sizes to content and hugs its edge (approximation).
     #[test]
     fn test_float_approximation() {

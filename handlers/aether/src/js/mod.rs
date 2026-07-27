@@ -167,6 +167,45 @@ impl Engine {
         context.register_global_callable(boa_engine::string::JsString::from("clearTimeout"), 1, clear_timeout).unwrap();
     }
 
+    /// Writes one declaration into a node's inline style attribute,
+    /// replacing any existing declaration for the property.
+    fn set_style_prop(node: &NodeRef, prop: &str, value: &str) {
+        let Some(el) = node.as_element() else { return };
+        let current = el.attributes.borrow().get("style").unwrap_or("").to_string();
+        let mut decls: Vec<String> = current
+            .split(';')
+            .filter_map(|d| {
+                let d = d.trim();
+                if d.is_empty() {
+                    return None;
+                }
+                match d.split_once(':') {
+                    Some((p, _)) if p.trim().eq_ignore_ascii_case(prop) => None,
+                    _ => Some(d.to_string()),
+                }
+            })
+            .collect();
+        if !value.trim().is_empty() {
+            decls.push(format!("{}: {}", prop, value.trim()));
+        }
+        el.attributes.borrow_mut().insert("style", decls.join("; "));
+        DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+    }
+
+    /// Reads one declaration back from the inline style attribute.
+    fn get_style_prop(node: &NodeRef, prop: &str) -> String {
+        let Some(el) = node.as_element() else { return String::new() };
+        let current = el.attributes.borrow().get("style").unwrap_or("").to_string();
+        for d in current.split(';') {
+            if let Some((p, v)) = d.split_once(':') {
+                if p.trim().eq_ignore_ascii_case(prop) {
+                    return v.trim().to_string();
+                }
+            }
+        }
+        String::new()
+    }
+
     /// Resolves the DOM node behind a wrapped JS object (via __node_id).
     fn this_node(this: &JsValue, ctx: &mut Context) -> Option<NodeRef> {
         let id = this
@@ -278,6 +317,50 @@ impl Engine {
                 DOM_STATE.with(|s| s.borrow_mut().mutated = true);
             }
             Ok(JsValue::undefined())
+        });
+
+        let get_parent = Self::native(context, |this, _args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::null()) };
+            match n.parent() {
+                Some(parent) => Ok(Self::wrap_node(ctx, parent)),
+                None => Ok(JsValue::null()),
+            }
+        });
+        let get_children = Self::native(context, |this, _args, ctx| {
+            let arr = boa_engine::object::builtins::JsArray::new(ctx);
+            if let Some(n) = Self::this_node(this, ctx) {
+                for child in n.children().filter(|c| c.as_element().is_some()).take(256) {
+                    let wrapped = Self::wrap_node(ctx, child);
+                    let _ = arr.push(wrapped, ctx);
+                }
+            }
+            Ok(arr.into())
+        });
+        let get_first_child = Self::native(context, |this, _args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::null()) };
+            match n.children().find(|c| c.as_element().is_some()) {
+                Some(c) => Ok(Self::wrap_node(ctx, c)),
+                None => Ok(JsValue::null()),
+            }
+        });
+        let get_next_sibling = Self::native(context, |this, _args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::null()) };
+            let mut cur = n.next_sibling();
+            while let Some(sib) = cur {
+                if sib.as_element().is_some() {
+                    return Ok(Self::wrap_node(ctx, sib));
+                }
+                cur = sib.next_sibling();
+            }
+            Ok(JsValue::null())
+        });
+        let get_tag = Self::native(context, |this, _args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
+            let tag = n
+                .as_element()
+                .map(|el| el.name.local.as_ref().to_ascii_uppercase())
+                .unwrap_or_default();
+            Ok(JsValue::new(boa_engine::string::JsString::from(tag)))
         });
 
         let js_node = ObjectInitializer::new(context)
@@ -477,6 +560,26 @@ impl Engine {
                 boa_engine::string::JsString::from("value"),
                 Some(get_value), Some(set_value), Attribute::all(),
             )
+            .accessor(
+                boa_engine::string::JsString::from("parentNode"),
+                Some(get_parent), None, Attribute::all(),
+            )
+            .accessor(
+                boa_engine::string::JsString::from("children"),
+                Some(get_children), None, Attribute::all(),
+            )
+            .accessor(
+                boa_engine::string::JsString::from("firstElementChild"),
+                Some(get_first_child), None, Attribute::all(),
+            )
+            .accessor(
+                boa_engine::string::JsString::from("nextElementSibling"),
+                Some(get_next_sibling), None, Attribute::all(),
+            )
+            .accessor(
+                boa_engine::string::JsString::from("tagName"),
+                Some(get_tag), None, Attribute::all(),
+            )
             .build();
 
         // classList: add/remove/toggle/contains over the class attribute.
@@ -498,7 +601,57 @@ impl Engine {
         let _ = js_node.set(boa_engine::string::JsString::from("classList"), class_list, false, context);
 
         
-        let style_obj = ObjectInitializer::new(context).build();
+        // style: accessor per supported property, reading/writing the
+        // element's inline style attribute (el.style.display = 'none' is
+        // the other canonical mutation form besides class toggling).
+        const STYLE_PROPS: &[(&str, &str)] = &[
+            ("display", "display"), ("visibility", "visibility"),
+            ("background", "background"), ("backgroundColor", "background-color"),
+            ("backgroundImage", "background-image"), ("color", "color"),
+            ("width", "width"), ("height", "height"),
+            ("maxWidth", "max-width"), ("maxHeight", "max-height"),
+            ("minWidth", "min-width"), ("minHeight", "min-height"),
+            ("opacity", "opacity"), ("fontSize", "font-size"),
+            ("fontWeight", "font-weight"), ("lineHeight", "line-height"),
+            ("position", "position"), ("top", "top"), ("left", "left"),
+            ("right", "right"), ("bottom", "bottom"),
+            ("overflow", "overflow"), ("margin", "margin"),
+            ("padding", "padding"), ("border", "border"),
+            ("textAlign", "text-align"), ("cssFloat", "float"),
+        ];
+        let style_obj = ObjectInitializer::new(context)
+            .property(boa_engine::string::JsString::from("__node_id"), doc_id, Attribute::all())
+            .build();
+        for (js_name, css_name) in STYLE_PROPS {
+            let getter = boa_engine::object::FunctionObjectBuilder::new(
+                context.realm(),
+                NativeFunction::from_copy_closure(move |this, _args, ctx| {
+                    let Some(n) = Engine::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
+                    Ok(JsValue::new(boa_engine::string::JsString::from(Engine::get_style_prop(&n, css_name))))
+                }),
+            )
+            .build();
+            let setter = boa_engine::object::FunctionObjectBuilder::new(
+                context.realm(),
+                NativeFunction::from_copy_closure(move |this, args, ctx| {
+                    let Some(n) = Engine::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
+                    let v = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                    Engine::set_style_prop(&n, css_name, &v);
+                    Ok(JsValue::undefined())
+                }),
+            )
+            .build();
+            let _ = style_obj.define_property_or_throw(
+                boa_engine::string::JsString::from(*js_name),
+                boa_engine::property::PropertyDescriptor::builder()
+                    .get(getter)
+                    .set(setter)
+                    .enumerable(true)
+                    .configurable(true)
+                    .build(),
+                context,
+            );
+        }
         let _ = js_node.set(boa_engine::string::JsString::from("style"), style_obj, false, context);
 
         js_node.into()

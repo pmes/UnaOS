@@ -43,6 +43,7 @@ default-members = [
     "vessels/phonolite",
     "vessels/facet",
     "vessels/una",
+    "vessels/aether-shell",
     "tools/vertex",
     "tools/unafs",
     "tools/unafs_bench",
