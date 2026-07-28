@@ -23,14 +23,25 @@ fn main() {
         
         local.block_on(&rt, async move {
             let mut engine = AetherEngine::new();
-            
+
+            // The engine surface is BGRA (headless swaps 0<->2 when writing
+            // PNGs); quartzite's set_frame contract is RGBA. Swap on the way
+            // out so the viewport isn't presented channel-swapped.
+            fn surface_rgba(engine: &AetherEngine) -> Vec<u8> {
+                let mut px = engine.surface().to_vec();
+                for p in px.chunks_exact_mut(4) {
+                    p.swap(0, 2);
+                }
+                px
+            }
+
             // Initial render
             let _damages = engine.render_frame();
             engine_tx.fire(SMessage::SurfaceBlit {
                 url: "viewport".into(),
                 width: engine.width,
                 height: engine.height,
-                pixels: engine.surface().to_vec(),
+                pixels: surface_rgba(&engine),
             });
             
             let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(16));
@@ -46,7 +57,7 @@ fn main() {
                                     url: "viewport".into(),
                                     width: engine.width,
                                     height: engine.height,
-                                    pixels: engine.surface().to_vec(),
+                                    pixels: surface_rgba(&engine),
                                 });
                             }
                         }

@@ -148,8 +148,12 @@ impl AetherEngine {
                     .map(|h| (h as f64 - self.height as f64).max(0.0))
                     .unwrap_or(f64::MAX);
                 self.scroll_y = (self.scroll_y + dy).clamp(0.0, max_scroll);
-                let actual_dy = self.scroll_y - old_sy;
-                let idy = actual_dy as i32;
+                // Integer shift must equal the difference of the TRUNCATED
+                // positions the renderer will actually paint at — deriving it
+                // from the fractional delta lets retained pixels drift against
+                // fresh paint under precise-trackpad deltas (duplicated lines
+                // a few px apart).
+                let idy = (self.scroll_y as i32) - (old_sy as i32);
 
                 if idy != 0 {
                     let w = self.width as usize;
