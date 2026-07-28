@@ -680,6 +680,241 @@ impl Engine {
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
                     let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let parent = DOM_STATE.with(|s| s.borrow().get_node(id));
+
+                    let new_node_id = args.get(0).and_then(|v| v.as_object()).and_then(|o| o.get(boa_engine::string::JsString::from("__node_id"), ctx).ok()).and_then(|v| v.as_number()).unwrap_or(-1.0) as i32;
+                    let new_node = DOM_STATE.with(|s| s.borrow().get_node(new_node_id));
+
+                    let ref_arg = args.get(1);
+                    let ref_node_id = if let Some(r) = ref_arg {
+                        if r.is_null() || r.is_undefined() {
+                            None
+                        } else {
+                            r.as_object().and_then(|o| o.get(boa_engine::string::JsString::from("__node_id"), ctx).ok()).and_then(|v| v.as_number()).map(|n| n as i32)
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let (Some(p), Some(n)) = (parent, new_node) {
+                        if let Some(ref_id) = ref_node_id {
+                            if let Some(r) = DOM_STATE.with(|s| s.borrow().get_node(ref_id)) {
+                                r.insert_before(n);
+                            }
+                        } else {
+                            p.append(n);
+                        }
+                        DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+                    }
+                    Ok(args.get(0).cloned().unwrap_or_default())
+                }),
+                boa_engine::string::JsString::from("insertBefore"),
+                2,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let parent = DOM_STATE.with(|s| s.borrow().get_node(id));
+
+                    let new_node_id = args.get(0).and_then(|v| v.as_object()).and_then(|o| o.get(boa_engine::string::JsString::from("__node_id"), ctx).ok()).and_then(|v| v.as_number()).unwrap_or(-1.0) as i32;
+                    let new_node = DOM_STATE.with(|s| s.borrow().get_node(new_node_id));
+
+                    let old_node_id = args.get(1).and_then(|v| v.as_object()).and_then(|o| o.get(boa_engine::string::JsString::from("__node_id"), ctx).ok()).and_then(|v| v.as_number()).unwrap_or(-1.0) as i32;
+                    let old_node = DOM_STATE.with(|s| s.borrow().get_node(old_node_id));
+
+                    if let (Some(p), Some(n), Some(o)) = (parent, new_node, old_node) {
+                        if o.parent().map_or(false, |cp| cp == p) {
+                            o.insert_before(n.clone());
+                            o.detach();
+                            DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+                        }
+                    }
+                    Ok(args.get(1).cloned().unwrap_or_default())
+                }),
+                boa_engine::string::JsString::from("replaceChild"),
+                2,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
+                        let html = n.to_string();
+                        let frag = kuchiki::parse_html().one(html);
+                        let cloned = if let Ok(mut bodies) = frag.select("body") {
+                            if let Some(body) = bodies.next() {
+                                if let Some(first_child) = body.as_node().children().next() {
+                                    first_child.clone()
+                                } else {
+                                    return Ok(JsValue::undefined());
+                                }
+                            } else {
+                                return Ok(JsValue::undefined());
+                            }
+                        } else {
+                            return Ok(JsValue::undefined());
+                        };
+
+                        cloned.detach();
+
+                        let deep = args.get(0).cloned().unwrap_or(JsValue::from(false)).to_boolean();
+                        if !deep {
+                            for child in cloned.children().collect::<Vec<_>>() {
+                                child.detach();
+                            }
+                        }
+
+                        return Ok(Self::wrap_node(ctx, cloned));
+                    }
+                    Ok(JsValue::undefined())
+                }),
+                boa_engine::string::JsString::from("cloneNode"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let tag = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                    let arr = boa_engine::object::builtins::JsArray::new(ctx);
+                    if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
+                        if let Ok(matches) = n.select(&tag) {
+                            for m in matches.take(256) {
+                                let wrapped = Self::wrap_node(ctx, m.as_node().clone());
+                                let _ = arr.push(wrapped, ctx);
+                            }
+                        }
+                    }
+                    Ok(arr.into())
+                }),
+                boa_engine::string::JsString::from("getElementsByTagName"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let cls = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                    let arr = boa_engine::object::builtins::JsArray::new(ctx);
+                    if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
+                        let selector = format!(".{}", cls);
+                        if let Ok(matches) = n.select(&selector) {
+                            for m in matches.take(256) {
+                                let wrapped = Self::wrap_node(ctx, m.as_node().clone());
+                                let _ = arr.push(wrapped, ctx);
+                            }
+                        }
+                    }
+                    Ok(arr.into())
+                }),
+                boa_engine::string::JsString::from("getElementsByClassName"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let other_id = args.get(0).and_then(|v| v.as_object()).and_then(|o| o.get(boa_engine::string::JsString::from("__node_id"), ctx).ok()).and_then(|v| v.as_number()).unwrap_or(-1.0) as i32;
+
+                    let (this_node, other_node) = DOM_STATE.with(|s| {
+                        let state = s.borrow();
+                        (state.get_node(id), state.get_node(other_id))
+                    });
+
+                    let result = if let (Some(this), Some(other)) = (this_node, other_node) {
+                        if this == other {
+                            true
+                        } else {
+                            let mut cur = other.parent();
+                            let mut found = false;
+                            while let Some(p) = cur {
+                                if p == this {
+                                    found = true;
+                                    break;
+                                }
+                                cur = p.parent();
+                            }
+                            found
+                        }
+                    } else {
+                        false
+                    };
+
+                    Ok(JsValue::from(result))
+                }),
+                boa_engine::string::JsString::from("contains"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let selector = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+
+                    let result = if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
+                        if let Ok(mut matches) = n.select(&selector) {
+                            matches.any(|m| m.as_node() == &n)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    Ok(JsValue::from(result))
+                }),
+                boa_engine::string::JsString::from("matches"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let selector = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+
+                    if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
+                        let mut cur = Some(n);
+                        while let Some(node) = cur {
+                            if let Ok(mut matches) = node.select(&selector) {
+                                if matches.any(|m| m.as_node() == &node) {
+                                    return Ok(Self::wrap_node(ctx, node));
+                                }
+                            }
+                            cur = node.parent();
+                        }
+                    }
+                    Ok(JsValue::null())
+                }),
+                boa_engine::string::JsString::from("closest"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, _args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
+                        n.detach();
+                        DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+                    }
+                    Ok(JsValue::undefined())
+                }),
+                boa_engine::string::JsString::from("remove"),
+                0,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let evt = args.get(0).cloned().unwrap_or_default();
+
+                    if let Some(evt_obj) = evt.as_object() {
+                        if let Ok(type_val) = evt_obj.get(boa_engine::string::JsString::from("type"), ctx) {
+                            let event_type = type_val.to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                            if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
+                                dispatch_event(ctx, &n, &event_type);
+                            }
+                        }
+                    }
+                    Ok(JsValue::from(true))
+                }),
+                boa_engine::string::JsString::from("dispatchEvent"),
+                1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|this, args, ctx| {
+                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
                     let name = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
                         if let Some(el) = n.as_element() {
