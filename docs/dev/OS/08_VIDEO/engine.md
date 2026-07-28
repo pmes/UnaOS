@@ -3123,6 +3123,136 @@ The forced 192x192 deferral comes back `BUFFERED` on the next pass — the round
 * `coalesced=` non-zero would mean more than `MAX_WINDOWS` boxes owed at once — worth understanding,
   though the union keeps it correct.
 
+### WC-M — the staging cap stops being a present cap
+
+WC-H bounded the window back-layer with `MAX_STAGE_BYTES` (4 MiB, `video/wm.rs`) and made an over-cap
+box **decline to the DIRECT path** — the pre-WC-H, per-pixel, scan-out-visible upscale that WC-G
+convicted. That was defensible while every window was small. It stops being defensible the moment the
+console becomes a window: the bench panel is 1920x1200 ARGB, so one full-panel box is ~8.8 MiB, over
+twice the cap. The largest and most conspicuous present in the system was precisely the one guaranteed
+to tear, and `[wc-h] win=… staged=no reason=cap -> DIRECT` was the whole of the design's answer.
+
+This is the same mistake WC-K already fixed once, in the fill path and for the same reason. WC-K's own
+comment says it outright: refusing to allocate `w * h` for a full-panel erase "is what makes a
+full-panel erase fit under `MAX_STAGE_BYTES` at all instead of declining on the cap and falling
+straight back into the tearing regime for the largest boxes, which are exactly the ones that tear
+worst." A fill escaped by composing one row; a window cannot, because its rows all differ. So it gets
+the other escape: **stage it in bands.**
+
+#### The banding
+
+`chunk_rows = MAX_STAGE_BYTES / row_bytes` — how many whole rows of the box fit under the cap. The
+pass composes band 0 into `STAGE` and presents its rows, then composes band 1 into the *same* buffer
+and presents those, until the box is done. Three properties carry the design:
+
+* **The band is the only thing that changed about the compose.** `paint_window` is still called with
+  the whole box (`bx, by, bw, bh`) so the chrome and the upscale keep their true geometry across a
+  seam; what moves is the *destination origin*, which is now the band's first panel row. That makes
+  the destination-local vertical origin **signed** — every band after the first has the box's top
+  border, its title strip and its first source rows above its own row 0 — so `lby`/`cy` are `isize`,
+  the three chrome writes go through a clipping `fill_rect_v`, and `draw_title` takes an `isize` `y`.
+* **The present is bit-for-bit WC-H's present.** One bulk `copy_nonoverlapping` per row, at the
+  panel's row stride, over the band's rows. Nothing about the panel-facing half was redesigned.
+* **A banded present costs ONE compose, not one per band.** `paint_window` starts each band at the
+  first source row that lands in it (`sy_first`, which also handles a source row straddling the seam
+  under `dup` replication) and `break`s at the first row past it. Without that the scheme would be
+  quadratic in band count.
+
+**A single band is the pre-WC-M path, exactly.** When the box fits the cap, `chunk_rows == bh`, the
+loop runs once at origin `(bx, by)`, the vertical origins are non-negative, the buffer is the size
+WC-H allocated, and the sprite offer is unconditional as before. Every window on the bench today and
+every window in the QEMU regression takes that branch, which is why the small-present fast path is
+unchanged rather than merely equivalent.
+
+The only cap decline left is a box whose **single row** exceeds 4 MiB — a 1 048 576-pixel scanline,
+unreachable on any panel this kernel can address. `DECL_CAP` is kept for it rather than deleted.
+
+#### The visibility window, stated honestly
+
+**A banded present is not atomic, and this arc does not claim it is.** Band 0's rows are on the panel
+while band 1 is still composing, so for the length of one band's compose the panel can hold the new
+top of the window over the old bottom of it. What is guaranteed instead:
+
+* **Every seam is a full ROW boundary.** A band is a whole number of complete rows, each still
+  delivered in one bulk copy, so no scanline is ever half-old and half-new. The horizontal tear WC-G
+  convicted and WC-H removed cannot return through this path.
+* **The seam count is bounded and known**: at most `ceil(bh / chunk_rows) - 1`, at fixed row offsets,
+  for one compose each. A 1920x1200 box at 4 bytes/pixel is 546 rows per band — 3 bands, 2 seams.
+* **Nothing is lost or duplicated.** Each row is composed by exactly one band and presented once, and
+  `paint_window`'s dense border fill covers each band completely, so WC-H's "every pixel the present
+  copies was written by this pass" invariant holds per band.
+
+The atomic alternative — one buffer the size of the whole box — *is* the panel-sized allocation the
+cap exists to refuse. What banding replaces is not an atomic present; it is the DIRECT path, whose
+entire scattered upscale was visible to the scan-out from the first poke to the last. A bounded number
+of row-aligned seams is strictly better than that, and that is the whole of the trade.
+
+One mitigation, named as a mitigation and not a guarantee: `draw_window`'s single `flush_range` still
+runs once, after all bands, over the box's whole row span, so on the non-coherent Pi 4 the bands tend
+to become visible together. A cache line may be evicted at any point, so the seams above are described
+as real.
+
+#### What did NOT change
+
+* **Deferred erase is untouched.** WC-K/WC-L's `stage_fill` / `defer_erase` / `drain_deferred` path is
+  not modified by this arc — same one-row compose, same transient/permanent decline split, same
+  absence of a `fill_rect` fallback. `MAX_STAGE_BYTES` still bounds `stage_fill`'s single row, which
+  is the one place the constant is still a hard refusal.
+* **No new lock, no new lock order, no new spinning.** `STAGE` is taken once, with `try_lock`, and
+  held across all bands of one present — the same guard, the same duration class, the same holder. No
+  lock is acquired inside the band loop that was not acquired inside WC-H's single pass, so the
+  `BlitGuard` window's audited-exception list (WEDGE-1) is unchanged and needs no new entry. The hold
+  is *longer* on a banded present, which is a hold-time change and not a class change: the holder
+  still cannot block unboundedly, which is the invariant the drain barrier actually needs.
+* **No protection weakened.** No page permission, checksum or bounds check is relaxed; the band layer
+  is bounded by its own `len` and `height`, which is a *tighter* fence on the compose than WC-H's
+  full-box layer was.
+* **No witness signature moved.** `wcg::stage_note` is called once per present as before, with the
+  two halves accumulated across bands, so `[wc-h]` reports the same two quantities for the same
+  operation. That keeps `video/wcg.rs` out of the diff — deliberate, because the x86 tree wants this
+  change and the smaller the arch-neutral surface, the cleaner that port is.
+
+#### WC-M gate results
+
+**NOT RUN — recorded as not run.** This session's environment has no `cc` (the host build scripts for
+`heapless`/`smoltcp`/`compiler_builtins` cannot link), no libc development files, and no
+`qemu-system-aarch64`. `./arroyo check` fails with ``error: linker `cc` not found`` before reaching
+any kernel source, and `./arroyo kernel8-test 150` cannot start. **No claim is made about either
+gate.**
+
+What *was* run: the four changed functions (`fill_rect_v`, `paint_window`, `draw_title`,
+`stage_window`) were extracted against a stub `FrameBuffer`/`Window` and type-checked with
+`rustc --emit=metadata`, in both the plain and the `aarch64 + witness` arm (cfg attributes stripped,
+witness callees stubbed). Both compile clean, no errors and no warnings. That covers the
+signed/unsigned arithmetic, which is this arc's only real compile risk. It is **not** a substitute for
+either gate: the next session on a complete toolchain must run `./arroyo check` (both arches) and
+`./arroyo kernel8-test 150` and record the verdicts here before this is treated as landed.
+
+Note for whoever runs it: the QEMU raspi4b panel is 640x480, so every window in the regression is a
+single band and the expected result is a *no-change* pass — `[wc-h] … -> BUFFERED`, the
+`reason=fixture -> DIRECT` line, and the `-> TEAR-FREE` rollup, unchanged. To exercise the banding at
+all the run needs the bench geometry: `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 150`.
+
+#### Metal watch-list (WC-M)
+
+* **A `[wc-h] … -> BUFFERED` line whose `bytes=` exceeds 4 194 304 is the arc working.** No such line
+  could exist before WC-M; it is the banding's own witness, and no new instrument was needed to get
+  it. `box=` alongside it names the geometry that banded.
+* `reason=cap -> DIRECT` should now be **unreachable**. If it appears, a box's single row is over the
+  cap — which would mean a panel width this kernel was never supposed to see, and is worth stopping
+  for rather than explaining away.
+* `compose_us`/`present_us` on a banded present are sums over the bands. `torn=` compares the *total*
+  present against the *whole box's* scan time, which is the right comparison for "did the panel outrun
+  us", but it cannot see a seam. **The seam is a visual check, not a counter** — a full-panel window
+  redrawing under load should show no horizontal band boundary settling in at a fixed row. If one is
+  visible, the mitigation above is failing and the honest fix is a vblank-aware present, not a bigger
+  cap.
+* The sprite is offered to at most one band, and only to a band containing its box outright, so a
+  pointer resting on a seam takes the WC-I repaint tail instead of riding the present. Expect overlay
+  take-rates to dip slightly while the pointer sits on a seam row of a banded window; a large dip
+  would mean the seam placement wants to avoid the sprite, which this arc deliberately does not
+  attempt.
+
 ### CURSOR-5 — the flash was our own arrow, and the lock class stops costing the whole sprite
 
 CURSOR-4 closed the 42 % straddle decline and Peter's attended **P64** verdict narrowed what was left
