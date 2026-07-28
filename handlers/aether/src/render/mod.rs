@@ -14,10 +14,12 @@ struct Inherited {
     color: (u8, u8, u8),
     font_size: f32,
     bold: bool,
+    italic: bool,
     line_height: f32, // multiplier of font size
     underline: bool,
     nowrap: bool,
     family: u8, // 0 sans, 1 serif, 2 mono
+    text_transform: u8, // 0 = none, 1 = uppercase, 2 = lowercase, 3 = capitalize
 }
 
 use crate::layout::default_font_size;
@@ -160,6 +162,28 @@ fn blit_cached_glyph(
             }
         }
     });
+}
+
+/// Transforms text based on text-transform property: 0 = none, 1 = uppercase, 2 = lowercase, 3 = capitalize.
+fn transform_text(text: &str, transform: u8) -> String {
+    match transform {
+        1 => text.to_uppercase(),
+        2 => text.to_lowercase(),
+        3 => {
+            // capitalize: uppercase first letter of each word
+            text.split_whitespace()
+                .map(|word| {
+                    let mut chars = word.chars();
+                    match chars.next() {
+                        None => String::new(),
+                        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        _ => text.to_string(),
+    }
 }
 
 /// Draws `text` starting at (origin_x, origin_y), wrapping at `max_width`.
@@ -329,11 +353,17 @@ pub fn render_frame(
                     inherited.bold
                         || matches!(tag, "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th"),
                 );
+                inherited.italic = spec.italic.unwrap_or(
+                    inherited.italic || matches!(tag, "i" | "em"),
+                );
                 inherited.family = spec
                     .family
                     .unwrap_or_else(|| crate::layout::default_family(tag, inherited.family));
                 if let Some(lh) = spec.line_height {
                     inherited.line_height = lh;
+                }
+                if let Some(tt) = spec.text_transform {
+                    inherited.text_transform = tt;
                 }
 
                 if tag == "a" || tag == "u" {
@@ -427,11 +457,23 @@ pub fn render_frame(
 
                 // Form controls get a UA border and their value text.
                 let is_control = matches!(tag, "input" | "textarea" | "select" | "button");
-                let border = spec.border.or(if is_control {
+                let mut border = spec.border.or(if is_control {
                     Some([Some((1.0, (118, 118, 118))); 4])
                 } else {
                     None
                 });
+                // Apply border-*-width overrides if present
+                if let Some(sides) = &mut border {
+                    if let Some(widths) = &spec.border_width {
+                        for (i, width) in widths.iter().enumerate() {
+                            if let Some(w) = width {
+                                if let Some((_, c)) = sides[i] {
+                                    sides[i] = Some((*w, c));
+                                }
+                            }
+                        }
+                    }
+                }
                 if is_control && tag != "button" {
                     if let Some(font) = font {
                         let attrs = el.attributes.borrow();
@@ -516,8 +558,9 @@ pub fn render_frame(
                     let text = dom_node.text_contents();
                     let text = text.trim();
                     if !text.is_empty() {
+                        let text = transform_text(text, inherited.text_transform);
                         draw_text(
-                            text,
+                            &text,
                             current_x - sx as f32,
                             current_y - sy as f32,
                             if inherited.nowrap { f32::MAX } else { layout_box.size.width.max(1.0) },
@@ -573,10 +616,12 @@ pub fn render_frame(
         color: (0, 0, 0),
         font_size: 16.0,
         bold: false,
+        italic: false,
         line_height: 0.0, // natural
         underline: false,
         nowrap: false,
         family: 0,
+        text_transform: 0,
     };
     draw_node(
         layout.root_node,

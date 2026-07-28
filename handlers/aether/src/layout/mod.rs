@@ -28,6 +28,20 @@ pub struct PaintStyle {
     pub nowrap: Option<bool>,
     /// Font family class: 0 = sans (default), 1 = serif, 2 = monospace.
     pub family: Option<u8>,
+    /// Font style: 0 = normal, 1 = italic.
+    pub italic: Option<bool>,
+    /// Text transform: 0 = none, 1 = uppercase, 2 = lowercase, 3 = capitalize.
+    pub text_transform: Option<u8>,
+    /// border-top-width, border-right-width, border-bottom-width, border-left-width.
+    /// Overrides border[side].0 if set.
+    pub border_width: Option<[Option<f32>; 4]>,
+    /// background-size: (width, height) in pixels or as fractional shorthand values.
+    /// Empty string means default (cover), other values stored as-is for rendering.
+    pub bg_size: Option<String>,
+    /// background-position: stored as-is for rendering (e.g., "center", "50% 50%").
+    pub bg_position: Option<String>,
+    /// background-repeat: 0 = repeat, 1 = no-repeat, 2 = repeat-x, 3 = repeat-y.
+    pub bg_repeat: Option<u8>,
 }
 
 pub struct LayoutTree {

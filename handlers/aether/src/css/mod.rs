@@ -197,6 +197,13 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             "left" | "start" | "justify" => style.justify = Some(taffy::style::JustifyContent::START),
             other => crate::ledger::record_css(&format!("text-align:{}", other)),
         },
+        "justify-content" => match value {
+            "center" => style.justify = Some(taffy::style::JustifyContent::CENTER),
+            "flex-end" | "end" => style.justify = Some(taffy::style::JustifyContent::END),
+            "flex-start" | "start" => style.justify = Some(taffy::style::JustifyContent::START),
+            "inherit" | "initial" | "unset" => {}
+            other => crate::ledger::record_css(&format!("justify-content-value:{}", other)),
+        },
         "background-color" => {
             if !is_neutral_keyword(value) {
                 match parse_color_str(value) {
@@ -357,6 +364,52 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             "content-box" => style.box_sizing = Some(taffy::style::BoxSizing::ContentBox),
             _ => {}
         },
+        "font-style" => match value {
+            "italic" | "oblique" => style.paint.italic = Some(true),
+            "normal" => style.paint.italic = Some(false),
+            _ => {}
+        },
+        "text-transform" => match value {
+            "uppercase" => style.paint.text_transform = Some(1),
+            "lowercase" => style.paint.text_transform = Some(2),
+            "capitalize" => style.paint.text_transform = Some(3),
+            "none" | "normal" => style.paint.text_transform = Some(0),
+            _ => {}
+        },
+        "background-size" => {
+            if !is_neutral_keyword(value) {
+                style.paint.bg_size = Some(value.to_string());
+            }
+        }
+        "background-position" => {
+            if !is_neutral_keyword(value) {
+                style.paint.bg_position = Some(value.to_string());
+            }
+        }
+        "background-repeat" => match value {
+            "no-repeat" => style.paint.bg_repeat = Some(1),
+            "repeat-x" => style.paint.bg_repeat = Some(2),
+            "repeat-y" => style.paint.bg_repeat = Some(3),
+            "repeat" => style.paint.bg_repeat = Some(0),
+            _ => {}
+        },
+        "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
+            if let Some(w) = parse_px(value) {
+                let side = match prop {
+                    "border-top-width" => 0,
+                    "border-right-width" => 1,
+                    "border-bottom-width" => 2,
+                    _ => 3,
+                };
+                let mut widths = style.paint.border_width.unwrap_or([None; 4]);
+                widths[side] = Some(w);
+                style.paint.border_width = Some(widths);
+            }
+        }
+        // border-radius: parsed but not rendered (taffy doesn't support it yet).
+        // At minimum, stops the property from appearing in unsupported ledgers.
+        "border-radius" | "border-top-left-radius" | "border-top-right-radius"
+        | "border-bottom-left-radius" | "border-bottom-right-radius" => {} // silently ignore; taffy limitation
         "border" | "outline" => {
             let v = value.trim();
             if v == "none" || v == "0" {
@@ -1140,14 +1193,15 @@ fn property_supported(prop: &str) -> bool {
         "display" | "flex-direction" | "width" | "height" | "padding" | "margin"
             | "padding-top" | "padding-right" | "padding-bottom" | "padding-left"
             | "margin-top" | "margin-right" | "margin-bottom" | "margin-left"
-            | "position" | "top" | "left" | "right" | "bottom" | "text-align"
+            | "position" | "top" | "left" | "right" | "bottom" | "text-align" | "justify-content"
             | "background-color" | "background" | "background-image" | "color"
             | "font-size" | "font-weight" | "line-height" | "visibility"
             | "max-width" | "max-height" | "min-width" | "min-height"
             | "overflow" | "overflow-x" | "overflow-y"
             | "border" | "outline" | "border-color" | "border-width" | "border-style"
             | "border-top" | "border-right" | "border-bottom" | "border-left"
-            | "text-decoration" | "text-decoration-line" | "white-space" | "box-sizing"
+            | "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width"
+            | "text-decoration" | "text-decoration-line" | "text-transform" | "white-space" | "box-sizing"
             | "font-family"
     )
 }
