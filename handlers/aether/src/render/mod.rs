@@ -19,6 +19,9 @@ struct Inherited {
     underline: bool,
     nowrap: bool,
     family: u8, // 0 sans, 1 serif, 2 mono
+    /// The image-replacement idiom: this subtree's text is off-box, but
+    /// its boxes and backgrounds still paint.
+    text_hidden: bool,
     text_transform: u8, // 0 = none, 1 = uppercase, 2 = lowercase, 3 = capitalize
 }
 
@@ -162,6 +165,173 @@ fn blit_cached_glyph(
             }
         }
     });
+}
+
+/// How one background (or mask) layer maps onto a box: the painted image
+/// rectangle in box-local coordinates plus the repeat mode.
+#[derive(Clone, Copy)]
+struct BgGeometry {
+    off_x: f32,
+    off_y: f32,
+    w: f32,
+    h: f32,
+    repeat: u8, // 0 repeat, 1 no-repeat, 2 repeat-x, 3 repeat-y
+}
+
+impl BgGeometry {
+    /// Maps a box-local pixel to image-space UV, honouring the repeat mode.
+    /// None = this pixel is outside every tile of the layer.
+    fn sample(&self, lx: f32, ly: f32, iw: u32, ih: u32) -> Option<(u32, u32)> {
+        let (rx, ry) = (matches!(self.repeat, 0 | 2), matches!(self.repeat, 0 | 3));
+        let mut u = lx - self.off_x;
+        let mut v = ly - self.off_y;
+        if rx {
+            u = u.rem_euclid(self.w);
+        } else if u < 0.0 || u >= self.w {
+            return None;
+        }
+        if ry {
+            v = v.rem_euclid(self.h);
+        } else if v < 0.0 || v >= self.h {
+            return None;
+        }
+        Some((
+            ((u / self.w * iw as f32) as u32).min(iw.saturating_sub(1)),
+            ((v / self.h * ih as f32) as u32).min(ih.saturating_sub(1)),
+        ))
+    }
+}
+
+/// Resolves one length/percentage component against a reference length.
+/// Returns None for `auto` and unparsed values.
+fn bg_length(token: &str, reference: f32) -> Option<f32> {
+    let t = token.trim();
+    if let Some(p) = t.strip_suffix('%') {
+        return p.parse::<f32>().ok().map(|p| p / 100.0 * reference);
+    }
+    for unit in ["px", "pt", "rem", "em"] {
+        if let Some(n) = t.strip_suffix(unit) {
+            let n: f32 = n.trim().parse().ok()?;
+            return Some(match unit {
+                "px" => n,
+                "pt" => n * 4.0 / 3.0,
+                _ => n * default_font_size("", 16.0),
+            });
+        }
+    }
+    t.parse::<f32>().ok().filter(|n| *n == 0.0)
+}
+
+/// Resolves background-size / background-position / background-repeat into
+/// the painted rectangle. `size`/`position` are the declared strings (None
+/// = CSS initial: `auto` and `0% 0%`).
+fn resolve_bg_geometry(
+    size: Option<&str>,
+    position: Option<&str>,
+    repeat: Option<u8>,
+    box_w: f32,
+    box_h: f32,
+    img_w: f32,
+    img_h: f32,
+) -> BgGeometry {
+    // --- background-size ---
+    let (mut w, mut h) = (img_w, img_h);
+    match size.map(str::trim) {
+        Some("cover") | Some("contain") => {
+            let s = if size == Some("cover") {
+                (box_w / img_w).max(box_h / img_h)
+            } else {
+                (box_w / img_w).min(box_h / img_h)
+            };
+            w = img_w * s;
+            h = img_h * s;
+        }
+        Some(v) if !v.is_empty() && v != "auto" => {
+            let mut it = v.split_whitespace();
+            let a = it.next().unwrap_or("auto");
+            let b = it.next();
+            let rw = bg_length(a, box_w);
+            let rh = b.and_then(|b| bg_length(b, box_h));
+            match (rw, rh) {
+                // One value (or an explicit `auto` partner): the other axis
+                // keeps the intrinsic aspect ratio.
+                (Some(rw), None) => {
+                    w = rw;
+                    h = img_h * (rw / img_w);
+                }
+                (None, Some(rh)) => {
+                    h = rh;
+                    w = img_w * (rh / img_h);
+                }
+                (Some(rw), Some(rh)) => {
+                    w = rw;
+                    h = rh;
+                }
+                (None, None) => {}
+            }
+        }
+        _ => {}
+    }
+    let (w, h) = (w.max(0.01), h.max(0.01));
+
+    // --- background-position ---
+    let mut off_x = 0.0;
+    let mut off_y = 0.0;
+    if let Some(pos) = position {
+        let tokens: Vec<&str> = pos.split_whitespace().collect();
+        // Keyword tokens name their own axis; anything else fills
+        // horizontal-then-vertical in source order.
+        let mut horiz: Option<&str> = None;
+        let mut vert: Option<&str> = None;
+        for t in &tokens {
+            match *t {
+                "left" | "right" => horiz = Some(t),
+                "top" | "bottom" => vert = Some(t),
+                "center" => {
+                    if horiz.is_none() && vert.is_some() {
+                        horiz = Some("center");
+                    } else if horiz.is_none() {
+                        horiz = Some("center");
+                    } else if vert.is_none() {
+                        vert = Some("center");
+                    }
+                }
+                other => {
+                    if horiz.is_none() {
+                        horiz = Some(other);
+                    } else if vert.is_none() {
+                        vert = Some(other);
+                    }
+                }
+            }
+        }
+        // A lone horizontal keyword/value centres nothing vertically: the
+        // vertical component defaults to `center` per the CSS grammar only
+        // when a keyword was used; a bare length defaults to 0 for the
+        // second component in the one-value form -> `center` per spec.
+        let resolve = |tok: Option<&str>, free: f32, span: f32| -> f32 {
+            match tok {
+                None | Some("left") | Some("top") => 0.0,
+                Some("right") | Some("bottom") => free,
+                Some("center") => free / 2.0,
+                Some(t) => {
+                    if t.ends_with('%') {
+                        bg_length(t, free).unwrap_or(0.0)
+                    } else {
+                        bg_length(t, span).unwrap_or(0.0)
+                    }
+                }
+            }
+        };
+        off_x = resolve(horiz, box_w - w, box_w);
+        off_y = resolve(
+            if tokens.len() == 1 && vert.is_none() { Some("center") } else { vert },
+            box_h - h,
+            box_h,
+        );
+    }
+
+    BgGeometry { off_x, off_y, w, h, repeat: repeat.unwrap_or(0) }
 }
 
 /// Transforms text based on text-transform property: 0 = none, 1 = uppercase, 2 = lowercase, 3 = capitalize.
@@ -375,54 +545,107 @@ pub fn render_frame(
                 if let Some(nw) = spec.nowrap {
                     inherited.nowrap = nw;
                 }
+                if spec.text_hidden == Some(true) {
+                    inherited.text_hidden = true;
+                }
                 inherited.color = spec.color.unwrap_or(if tag == "a" {
                     (0, 0, 238) // UA default link blue
                 } else {
                     inherited.color
                 });
 
+                let bw = layout_box.size.width.max(0.0);
+                let bh = layout_box.size.height.max(0.0);
+                // Box-local origin in screen space (may be negative when
+                // scrolled past; the painted span is clamped, the local
+                // coordinate is not — that is what keeps a positioned
+                // background aligned while scrolling).
+                let box_sx = current_x - sx as f32;
+                let box_sy = current_y - sy as f32;
+                let x_start = (box_sx.max(0.0)) as u32;
+                let y_start = (box_sy.max(0.0)) as u32;
+                let end_x = ((box_sx + bw).max(0.0) as u32).min(width);
+                let end_y = ((box_sy + bh).max(0.0) as u32).min(height);
+
+                // mask-image is an alpha stencil over this box's background
+                // paint: the fill only lands where the mask is opaque. A
+                // declared-but-unresolvable mask suppresses the fill —
+                // painting the raw box would show a solid blob where the
+                // page means an icon glyph.
+                let mask = spec.mask_image.as_ref().map(|url| {
+                    crate::images::get(url).map(|img| {
+                        let g = resolve_bg_geometry(
+                            spec.mask_size.as_deref(),
+                            spec.mask_position.as_deref(),
+                            spec.mask_repeat,
+                            bw,
+                            bh,
+                            img.width() as f32,
+                            img.height() as f32,
+                        );
+                        (img, g)
+                    })
+                });
+                let mask_alpha = |x: u32, y: u32| -> u8 {
+                    match &mask {
+                        None => 255,
+                        Some(None) => 0,
+                        Some(Some((img, g))) => {
+                            let (lx, ly) = (x as f32 - box_sx, y as f32 - box_sy);
+                            match g.sample(lx, ly, img.width(), img.height()) {
+                                Some((u, v)) => img.get_pixel(u, v).0[3],
+                                None => 0,
+                            }
+                        }
+                    }
+                };
+                if matches!(mask, Some(None)) {
+                    crate::ledger::record_css("mask-image-unresolved");
+                }
+
                 if let Some(bg) = spec.background {
-                    let x_start = ((current_x as i32) - sx).max(0) as u32;
-                    let y_start = ((current_y as i32) - sy).max(0) as u32;
-                    let end_x = x_start
-                        .saturating_add(layout_box.size.width.max(0.0) as u32)
-                        .min(width);
-                    let end_y = y_start
-                        .saturating_add(layout_box.size.height.max(0.0) as u32)
-                        .min(height);
                     for y in y_start..end_y {
                         for x in x_start..end_x {
-                            if in_damage(x, y, damage_rects) && in_clip(x, y, clip) {
-                                put_px(surface, width, x, y, bg);
+                            if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                                continue;
+                            }
+                            match mask_alpha(x, y) {
+                                0 => {}
+                                255 => put_px(surface, width, x, y, bg),
+                                a => blend_px(surface, width, x, y, bg, a),
                             }
                         }
                     }
                 }
 
                 // background-image paints over the color, under content,
-                // scaled to cover the box (aspect-preserving center crop).
+                // honouring background-size / -position / -repeat (the
+                // sprite-sheet idiom is exactly a positioned no-repeat
+                // layer of an intrinsically-sized sheet).
                 if let Some(img) = spec.bg_image.as_deref().and_then(crate::images::get) {
-                    let x_start = ((current_x as i32) - sx).max(0) as u32;
-                    let y_start = ((current_y as i32) - sy).max(0) as u32;
-                    let bw = layout_box.size.width.max(1.0);
-                    let bh = layout_box.size.height.max(1.0);
-                    let end_x = x_start.saturating_add(bw as u32).min(width);
-                    let end_y = y_start.saturating_add(bh as u32).min(height);
-                    let (iw, ih) = (img.width() as f32, img.height() as f32);
-                    let scale = (bw / iw).max(bh / ih);
-                    let (crop_w, crop_h) = (bw / scale, bh / scale);
-                    let (off_u, off_v) = ((iw - crop_w) / 2.0, (ih - crop_h) / 2.0);
+                    let g = resolve_bg_geometry(
+                        spec.bg_size.as_deref(),
+                        spec.bg_position.as_deref(),
+                        spec.bg_repeat,
+                        bw,
+                        bh,
+                        img.width() as f32,
+                        img.height() as f32,
+                    );
                     for y in y_start..end_y {
                         for x in x_start..end_x {
                             if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
                                 continue;
                             }
-                            let u = (off_u + (x - x_start) as f32 / bw * crop_w) as u32;
-                            let v = (off_v + (y - y_start) as f32 / bh * crop_h) as u32;
-                            let px = img.get_pixel(u.min(img.width() - 1), v.min(img.height() - 1));
-                            let [r, g, b, a] = px.0;
+                            let Some((u, v)) =
+                                g.sample(x as f32 - box_sx, y as f32 - box_sy, img.width(), img.height())
+                            else {
+                                continue;
+                            };
+                            let [r, gr, b, a] = img.get_pixel(u, v).0;
+                            let a = (a as u32 * mask_alpha(x, y) as u32 / 255) as u8;
                             if a > 0 {
-                                blend_px(surface, width, x, y, (r, g, b), a);
+                                blend_px(surface, width, x, y, (r, gr, b), a);
                             }
                         }
                     }
@@ -538,7 +761,7 @@ pub fn render_frame(
                         stroke(end_x.saturating_sub(w.max(1.0) as u32), y_start, end_x, end_y, c);
                     }
                 }
-            } else if dom_node.as_text().is_some() {
+            } else if dom_node.as_text().is_some() && !inherited.text_hidden {
                 // Family font first (serif/mono), falling back to the
                 // preloaded sans pair; bold uses the sans-bold face for
                 // non-sans families (approximation).
@@ -621,6 +844,7 @@ pub fn render_frame(
         underline: false,
         nowrap: false,
         family: 0,
+        text_hidden: false,
         text_transform: 0,
     };
     draw_node(

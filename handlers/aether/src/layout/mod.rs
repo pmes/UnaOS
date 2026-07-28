@@ -42,6 +42,16 @@ pub struct PaintStyle {
     pub bg_position: Option<String>,
     /// background-repeat: 0 = repeat, 1 = no-repeat, 2 = repeat-x, 3 = repeat-y.
     pub bg_repeat: Option<u8>,
+    /// The image-replacement idiom (text-indent:-9999px): the fallback TEXT
+    /// is hidden, but the box and its background image still paint.
+    pub text_hidden: Option<bool>,
+    /// mask-image url — an alpha stencil for this box's background paint.
+    pub mask_image: Option<String>,
+    /// mask-size / mask-position / mask-repeat, same grammar as their
+    /// background-* counterparts.
+    pub mask_size: Option<String>,
+    pub mask_position: Option<String>,
+    pub mask_repeat: Option<u8>,
 }
 
 pub struct LayoutTree {

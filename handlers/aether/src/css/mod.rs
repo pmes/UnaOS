@@ -181,13 +181,16 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             "none" | "inherit" | "initial" | "unset" => {}
             other => crate::ledger::record_css(&format!("float:{}", other)),
         },
-        // The image-replacement idiom: a huge negative text-indent hides
-        // the fallback text (the visible wordmark is a sibling image).
-        // Small indents are ignored (no first-line indent support).
+        // The image-replacement idiom: a huge negative text-indent pushes
+        // the fallback text off-box while the element's own background
+        // image stays visible (Wikipedia's sprite wordmark is exactly
+        // this). Hiding the whole box would drop that image — only the
+        // TEXT goes away. Small indents are ignored (no first-line
+        // indent support).
         "text-indent" => {
             if let Some(px) = parse_px(value) {
                 if px <= -999.0 {
-                    style.paint.hidden = Some(true);
+                    style.paint.text_hidden = Some(true);
                 }
             }
         }
@@ -221,10 +224,41 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             }
         },
         "background" => {
-            // Shorthand: a color and/or an image url; other components
-            // (position/repeat/size) are ignored — cover paint below.
+            // Shorthand: a color and/or an image url, plus the repeat
+            // keyword and a `position / size` pair when present.
             if let Some(u) = extract_css_url(value) {
                 style.paint.bg_image = Some(u);
+            }
+            // Components outside url(...) — the url may itself hold slashes
+            // and keywords, so scan only what is left after removing it.
+            let outside = strip_css_urls(value);
+            for part in outside.split_whitespace() {
+                if let Some(r) = parse_repeat(part) {
+                    style.paint.bg_repeat = Some(r);
+                }
+            }
+            if let Some((pos, size)) = outside.split_once('/') {
+                let pos: String = pos
+                    .split_whitespace()
+                    .filter(|t| is_position_token(t))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !pos.is_empty() {
+                    style.paint.bg_position = Some(pos);
+                }
+                let size = size.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+                if !size.is_empty() {
+                    style.paint.bg_size = Some(size);
+                }
+            } else {
+                let pos: String = outside
+                    .split_whitespace()
+                    .filter(|t| is_position_token(t))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !pos.is_empty() {
+                    style.paint.bg_position = Some(pos);
+                }
             }
             let mut got_color = false;
             for part in value.split_whitespace() {
@@ -281,12 +315,12 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
         // Only full transparency is honored (no compositing): opacity:0
         // hides like visibility:hidden; anything else paints normally.
         "opacity" => {
+            // Always specified, both ways: a higher-specificity opacity:1
+            // has to be able to un-hide what an earlier opacity:0 rule hid,
+            // and that only works if the winning declaration merges a value
+            // instead of leaving the field unspecified.
             if let Ok(a) = value.parse::<f32>() {
-                if a == 0.0 {
-                    style.paint.hidden = Some(true);
-                } else if style.paint.hidden == Some(true) {
-                    style.paint.hidden = Some(false);
-                }
+                style.paint.hidden = Some(a == 0.0);
             }
         }
         "line-height" => {
@@ -386,13 +420,44 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 style.paint.bg_position = Some(value.to_string());
             }
         }
-        "background-repeat" => match value {
-            "no-repeat" => style.paint.bg_repeat = Some(1),
-            "repeat-x" => style.paint.bg_repeat = Some(2),
-            "repeat-y" => style.paint.bg_repeat = Some(3),
-            "repeat" => style.paint.bg_repeat = Some(0),
-            _ => {}
+        "background-repeat" => {
+            if let Some(r) = parse_repeat(value) {
+                style.paint.bg_repeat = Some(r);
+            }
+        }
+        // mask-image (and the -webkit- alias) turns the box's background
+        // paint into a stencil: the mask's alpha decides where the fill
+        // lands. The icon-font-replacement idiom (a solid background-color
+        // shaped by an SVG mask) is the whole reason UI icons exist as
+        // one-colour boxes; without the stencil they paint as blobs.
+        "mask-image" | "-webkit-mask-image" => match extract_css_url(value) {
+            Some(u) => style.paint.mask_image = Some(u),
+            None => {
+                if !is_neutral_keyword(value) {
+                    crate::ledger::record_css(&format!("mask-image-value:{}", clip(value)));
+                }
+            }
         },
+        "mask" | "-webkit-mask" => {
+            if let Some(u) = extract_css_url(value) {
+                style.paint.mask_image = Some(u);
+            }
+        }
+        "mask-size" | "-webkit-mask-size" => {
+            if !is_neutral_keyword(value) {
+                style.paint.mask_size = Some(value.to_string());
+            }
+        }
+        "mask-position" | "-webkit-mask-position" => {
+            if !is_neutral_keyword(value) {
+                style.paint.mask_position = Some(value.to_string());
+            }
+        }
+        "mask-repeat" | "-webkit-mask-repeat" => {
+            if let Some(r) = parse_repeat(value) {
+                style.paint.mask_repeat = Some(r);
+            }
+        }
         "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
             if let Some(w) = parse_px(value) {
                 let side = match prop {
@@ -436,7 +501,21 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 crate::ledger::record_css(&format!("border-value:{}", clip(value)));
             }
         }
+        "border-style" => {
+            // A styleless border draws nothing, whatever its width says.
+            if matches!(value.trim(), "none" | "hidden") {
+                style.paint.border = Some([None; 4]);
+            }
+        }
         "border-color" => {
+            // `transparent` (or a fully transparent rgba) is how a page
+            // says "keep the box, drop the stroke" — the UA control border
+            // must go with it, or every quiet button paints an empty frame.
+            let v = value.trim().to_ascii_lowercase();
+            if v == "transparent" || (v.starts_with("rgba(") && parse_color_str(&v).is_none()) {
+                style.paint.border = Some([None; 4]);
+                return;
+            }
             if let Some(c) = parse_color_str(value) {
                 let mut sides = style.paint.border.unwrap_or([Some((1.0, (128, 128, 128))); 4]);
                 for side in sides.iter_mut() {
@@ -491,8 +570,8 @@ fn collect_custom_props(css: &str, map: &mut std::collections::HashMap<String, S
         if !doc_scoped || !body.contains("--") {
             continue;
         }
-        for decl in body.split(';') {
-            let Some((name, value)) = decl.split_once(':') else { continue };
+        for decl in split_declarations(body) {
+            let Some((name, value)) = split_declaration(decl) else { continue };
             let name = name.trim();
             let value = value.trim();
             if name.starts_with("--")
@@ -566,6 +645,48 @@ pub(crate) fn extract_css_url(value: &str) -> Option<String> {
         return None;
     }
     Some(inner.to_string())
+}
+
+/// Removes every `url(...)` token from a value, leaving the other
+/// shorthand components (a url can contain slashes, spaces and keywords
+/// that would otherwise be mistaken for them).
+pub(crate) fn strip_css_urls(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("url(") {
+        out.push_str(&rest[..start]);
+        out.push(' ');
+        match rest[start + 4..].find(')') {
+            Some(end) => rest = &rest[start + 4 + end + 1..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// background-repeat / mask-repeat keyword: 0 repeat, 1 no-repeat,
+/// 2 repeat-x, 3 repeat-y. `space`/`round` approximate to repeat.
+pub(crate) fn parse_repeat(value: &str) -> Option<u8> {
+    match value.trim() {
+        "no-repeat" => Some(1),
+        "repeat-x" => Some(2),
+        "repeat-y" => Some(3),
+        "repeat" | "space" | "round" | "repeat repeat" => Some(0),
+        _ => None,
+    }
+}
+
+/// True for a token that can only be a background-position component
+/// (keyword, percentage or length) — used to pick the position out of the
+/// `background` shorthand without mistaking a colour or repeat keyword.
+fn is_position_token(t: &str) -> bool {
+    let t = t.trim();
+    if matches!(t, "left" | "right" | "top" | "bottom" | "center") {
+        return true;
+    }
+    t.ends_with('%') && t[..t.len() - 1].parse::<f32>().is_ok()
+        || t.ends_with("px") && t[..t.len() - 2].trim().parse::<f32>().is_ok()
 }
 
 /// Truncates a value for a stable, bounded ledger key.
@@ -775,18 +896,25 @@ fn apply_spec_to_node(
         inset_nodes.insert(node_id);
     }
     let entry = layout_tree.paint_map.entry(node_id).or_default();
-    if style.paint.background.is_some() { entry.background = style.paint.background; }
-    if style.paint.color.is_some() { entry.color = style.paint.color; }
-    if style.paint.font_size.is_some() { entry.font_size = style.paint.font_size; }
-    if style.paint.bold.is_some() { entry.bold = style.paint.bold; }
-    if style.paint.border.is_some() { entry.border = style.paint.border; }
-    if style.paint.line_height.is_some() { entry.line_height = style.paint.line_height; }
-    if style.paint.bg_image.is_some() { entry.bg_image = style.paint.bg_image.clone(); }
-    if style.paint.hidden.is_some() { entry.hidden = style.paint.hidden; }
-    if style.paint.clip.is_some() { entry.clip = style.paint.clip; }
-    if style.paint.underline.is_some() { entry.underline = style.paint.underline; }
-    if style.paint.nowrap.is_some() { entry.nowrap = style.paint.nowrap; }
-    if style.paint.family.is_some() { entry.family = style.paint.family; }
+    merge_paint(entry, &style.paint);
+}
+
+/// Overlays `src`'s specified paint fields onto `dst`. ONE list, used by
+/// every cascade path — a field missing here is a declaration that parses
+/// and then never reaches the renderer.
+fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
+    macro_rules! copy {
+        ($($f:ident),* $(,)?) => { $( if src.$f.is_some() { dst.$f = src.$f; } )* };
+    }
+    macro_rules! clone {
+        ($($f:ident),* $(,)?) => { $( if src.$f.is_some() { dst.$f = src.$f.clone(); } )* };
+    }
+    copy!(
+        background, color, font_size, bold, border, line_height, hidden, clip, underline,
+        nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
+        mask_repeat,
+    );
+    clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position);
 }
 
 /// Applies a set of stylesheets as ONE cascade — rules from every sheet
@@ -1077,12 +1205,66 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
 /// Parses a declaration block into (normal, !important) tiers plus a flag
 /// saying whether the important tier holds anything. Declarations split by
 /// their own priority, per CSS — not per rule.
+/// Splits a declaration block on the semicolons that actually separate
+/// declarations — a `;` inside url(), a function, or a string does not
+/// (`background:url(data:image/svg+xml;base64,...)` is one declaration,
+/// and splitting it naively truncates the value at the media type).
+pub(crate) fn split_declarations(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut depth) = (0usize, 0i32);
+    let mut quote: Option<char> = None;
+    for (i, c) in body.char_indices() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                '(' => depth += 1,
+                ')' => depth = (depth - 1).max(0),
+                ';' if depth == 0 => {
+                    out.push(&body[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    out.push(&body[start..]);
+    out
+}
+
+/// Splits `prop: value` at the separating colon — the first colon outside
+/// any function/string, so a data: URI value survives intact.
+pub(crate) fn split_declaration(decl: &str) -> Option<(&str, &str)> {
+    let (mut depth, mut quote) = (0i32, None::<char>);
+    for (i, c) in decl.char_indices() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                '(' => depth += 1,
+                ')' => depth = (depth - 1).max(0),
+                ':' if depth == 0 => return Some((&decl[..i], &decl[i + 1..])),
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
 pub(crate) fn parse_declaration_block_tiers(body: &str) -> (SpecifiedStyle, SpecifiedStyle, bool) {
     let mut normal = SpecifiedStyle::default();
     let mut important = SpecifiedStyle::default();
     let mut has_important = false;
-    for decl in body.split(';') {
-        let Some((prop, value)) = decl.split_once(':') else { continue };
+    for decl in split_declarations(body) {
+        let Some((prop, value)) = split_declaration(decl) else { continue };
         let prop = prop.trim().to_ascii_lowercase();
         if prop.is_empty() || prop.starts_with("--") {
             continue; // custom properties: no cascade var() support yet
@@ -1121,19 +1303,7 @@ fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
     take!(display, flex_direction, width, height, padding, margin, position,
           inset_top, inset_left, inset_right, inset_bottom, justify, align_self,
           max_width, max_height, min_width, min_height, box_sizing);
-    let p = &src.paint;
-    if p.background.is_some() { dst.paint.background = p.background; }
-    if p.color.is_some() { dst.paint.color = p.color; }
-    if p.font_size.is_some() { dst.paint.font_size = p.font_size; }
-    if p.bold.is_some() { dst.paint.bold = p.bold; }
-    if p.border.is_some() { dst.paint.border = p.border; }
-    if p.line_height.is_some() { dst.paint.line_height = p.line_height; }
-    if p.bg_image.is_some() { dst.paint.bg_image = p.bg_image.clone(); }
-    if p.hidden.is_some() { dst.paint.hidden = p.hidden; }
-    if p.clip.is_some() { dst.paint.clip = p.clip; }
-    if p.underline.is_some() { dst.paint.underline = p.underline; }
-    if p.nowrap.is_some() { dst.paint.nowrap = p.nowrap; }
-    if p.family.is_some() { dst.paint.family = p.family; }
+    merge_paint(&mut dst.paint, &src.paint);
 }
 
 /// Evaluates an @media condition against the fixed viewport. Comma = OR,

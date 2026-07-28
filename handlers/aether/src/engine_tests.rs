@@ -1008,6 +1008,64 @@ mod tests {
             "mono must measure wider: mono={} sans={}", mono_w, sans_w);
     }
 
+    /// The sprite-sheet idiom: a data:-URI-bearing declaration block must
+    /// survive the `;` inside the URI, and background-position / -size /
+    /// -repeat must all reach the paint map (they are what selects the
+    /// slice of the sheet; without them the whole sheet paints).
+    #[test]
+    fn test_sprite_background_declarations_reach_paint() {
+        let html = r#"<html><body><span id="s">Wikipedia</span></body></html>"#;
+        let document = dom::parse_html(html);
+        let mut layout_tree = layout::compute_layout(&document);
+        css::apply_css(
+            &mut layout_tree,
+            "#s { background: url(data:image/svg+xml;base64,AAAA) no-repeat; \
+                  background-position: 0 -304px; background-size: 100%; \
+                  text-indent: -10000px; mask-image: url(m.svg) }",
+        );
+        let p = layout_tree
+            .node_map
+            .iter()
+            .find_map(|(id, n)| {
+                let el = n.as_element()?;
+                (el.attributes.borrow().get("id") == Some("s")).then(|| layout_tree.paint_map.get(id))?
+            })
+            .expect("styled span has a paint entry");
+        assert_eq!(p.bg_image.as_deref(), Some("data:image/svg+xml;base64,AAAA"),
+            "the `;` inside a data: URI must not split the declaration");
+        assert_eq!(p.bg_position.as_deref(), Some("0 -304px"));
+        assert_eq!(p.bg_size.as_deref(), Some("100%"));
+        assert_eq!(p.bg_repeat, Some(1));
+        assert_eq!(p.mask_image.as_deref(), Some("m.svg"));
+        // Image replacement hides the TEXT, never the box's background.
+        assert_eq!(p.text_hidden, Some(true));
+        assert_eq!(p.hidden, None);
+    }
+
+    /// A later, more specific `opacity: 1` un-hides what `opacity: 0` hid,
+    /// and `border-color: transparent` drops the UA control stroke.
+    #[test]
+    fn test_opacity_and_transparent_border_override() {
+        let html = r#"<html><body class="on"><button class="b" id="q">go</button></body></html>"#;
+        let document = dom::parse_html(html);
+        let mut layout_tree = layout::compute_layout(&document);
+        css::apply_css(
+            &mut layout_tree,
+            ".b { opacity: 0; border: 1px solid #000 } \
+             .on .b { opacity: 1; border-color: transparent }",
+        );
+        let p = layout_tree
+            .node_map
+            .iter()
+            .find_map(|(id, n)| {
+                let el = n.as_element()?;
+                (el.attributes.borrow().get("id") == Some("q")).then(|| layout_tree.paint_map.get(id))?
+            })
+            .expect("button has a paint entry");
+        assert_eq!(p.hidden, Some(false), "opacity:1 must win over an earlier opacity:0");
+        assert_eq!(p.border, Some([None; 4]), "transparent border-color = no stroke");
+    }
+
     /// float:left/right sizes to content and hugs its edge (approximation).
     #[test]
     fn test_float_approximation() {
