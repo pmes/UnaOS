@@ -553,8 +553,15 @@ impl AetherEngine {
         // work they spawned — all before first layout.
         let _ = js_engine.context.run_jobs();
         // Lifecycle events pages gate init on, then the rAF passes, then
-        // the promise work all of it spawned.
+        // the promise work all of it spawned. readyState advances with the
+        // events rather than sitting at one value, so the
+        // `readyState === 'loading' ? wait : run now` fork every bundle
+        // writes takes the branch it would take in a browser.
+        let _ = js_engine.execute("document.readyState = 'interactive';");
+        js::dispatch_event(&mut js_engine.context, &document, "readystatechange");
         js::dispatch_event(&mut js_engine.context, &document, "DOMContentLoaded");
+        let _ = js_engine.execute("document.readyState = 'complete';");
+        js::dispatch_event(&mut js_engine.context, &document, "readystatechange");
         js::dispatch_event(&mut js_engine.context, &document, "load");
         let _ = js_engine.context.run_jobs();
         let _ = js_engine.execute("__drainRaf && __drainRaf();");

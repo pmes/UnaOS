@@ -1082,4 +1082,80 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_document_cookie_round_trips_through_the_jar() {
+        // Script-set cookies land in the same session jar the network stack
+        // sends from, and read back through the accessor for this origin.
+        let html = r#"<html><body><div id="out"></div>
+            <script>
+                document.cookie = 'theme=dark; Path=/';
+                document.cookie = 'sid=xyz; Path=/';
+                document.getElementById('out').textContent = document.cookie;
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("https://cookie-doc.example/page", html, true);
+
+        let doc = engine.document.as_ref().unwrap();
+        let out = doc.select("#out").unwrap().next().unwrap();
+        let seen = out.as_node().text_contents();
+        assert!(seen.contains("theme=dark"), "document.cookie read back {seen:?}");
+        assert!(seen.contains("sid=xyz"), "document.cookie read back {seen:?}");
+        // Same jar the wire uses, and host-scoped.
+        let sent = crate::net::cookies_for("https://cookie-doc.example/other");
+        assert!(sent.contains("theme=dark"), "jar would send {sent:?}");
+        assert_eq!(crate::net::cookies_for("https://elsewhere.example/"), "");
+    }
+
+    #[test]
+    fn test_create_element_direct_construction_and_platform_breadth() {
+        // createElement builds the node directly: unknown/custom tags work,
+        // and the result appends into the live tree.
+        let html = r#"<html><body><div id="host"></div>
+            <script>
+                var custom = document.createElement('my-widget');
+                custom.setAttribute('data-k', 'v');
+                custom.textContent = 'hi';
+                document.getElementById('host').appendChild(custom);
+                var c = document.createComment('note');
+                document.getElementById('host').appendChild(c);
+                var probe = document.createElement('div');
+                probe.style.display = 'none';
+                probe.id = 'probe';
+                probe.textContent = [
+                    typeof queueMicrotask,
+                    typeof MutationObserver,
+                    typeof MessageChannel,
+                    btoa('hi'),
+                    atob('aGk='),
+                    getComputedStyle(custom).display,
+                    document.readyState,
+                ].join('|');
+                document.getElementById('host').appendChild(probe);
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://create", html, true);
+
+        let doc = engine.document.as_ref().unwrap();
+        let made = doc.select("#host my-widget").unwrap().next()
+            .expect("custom tag must construct and attach");
+        assert_eq!(made.attributes.borrow().get("data-k"), Some("v"));
+        assert_eq!(made.as_node().text_contents(), "hi");
+
+        let probe = doc.select("#probe").unwrap().next().unwrap();
+        let fields: Vec<String> = probe.as_node().text_contents()
+            .split('|').map(|s| s.to_string()).collect();
+        assert_eq!(fields[0], "function", "queueMicrotask");
+        assert_eq!(fields[1], "function", "MutationObserver");
+        assert_eq!(fields[2], "function", "MessageChannel");
+        assert_eq!(fields[3], "aGk=", "btoa");
+        assert_eq!(fields[4], "hi", "atob");
+        // Inline style wins in getComputedStyle; nothing is invented.
+        assert_eq!(fields[5], "block", "initial display for an undeclared element");
+        assert_eq!(fields[6], "loading", "readyState while scripts execute");
+        // ...and it advances by the time the lifecycle events have fired.
+        assert!(doc.select("#host").unwrap().next().is_some());
+    }
 }

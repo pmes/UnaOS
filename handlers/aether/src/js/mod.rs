@@ -19,6 +19,18 @@ thread_local! {
     });
 }
 
+thread_local! {
+    /// URL of the page currently booted in this context. Plain Rust string
+    /// (never a GC object), so native accessors — `document.cookie` — can
+    /// reach it without holding anything that outlives the boa context.
+    static PAGE_URL: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// The current page's URL, as last set by `Engine::set_location`.
+pub fn page_url() -> String {
+    PAGE_URL.with(|u| u.borrow().clone())
+}
+
 pub(crate) struct DomState {
     pub(crate) document: Option<NodeRef>,
     pub(crate) nodes: HashMap<i32, NodeRef>,
@@ -71,6 +83,31 @@ pub fn dispatch_event(context: &mut Context, node: &NodeRef, event: &str) -> boo
     } else {
         false
     }
+}
+
+/// Builds a detached HTML-namespace element node directly — no parser, no
+/// throwaway document, no selector round-trip (which silently failed for any
+/// tag the HTML parser refuses to nest, and for custom elements).
+///
+/// The `QualName` is cloned off an element that already exists in the
+/// document and retargeted at `local`, rather than written out with
+/// `ns!(html)`: kuchiki 0.8 builds on html5ever 0.25, while this crate's own
+/// `html5ever` dependency is 0.39, so the 0.39 `QualName`/`ns!` types are a
+/// different type from the one `NodeRef::new_element` accepts and cannot be
+/// passed to it. Cloning keeps the namespace exactly right by construction.
+/// Any local name works, including unknown and custom tags.
+pub(crate) fn new_html_element(local: &str) -> Option<NodeRef> {
+    let doc = DOM_STATE.with(|s| s.borrow().document.clone())?;
+    // First element in document order is <html> — html-namespaced.
+    let mut name = doc
+        .inclusive_descendants()
+        .find_map(|n| n.as_element().map(|el| el.name.clone()))?;
+    name.prefix = None;
+    name.local = local.trim().to_ascii_lowercase().as_str().into();
+    Some(NodeRef::new_element(
+        name,
+        std::iter::empty::<(kuchiki::ExpandedName, kuchiki::Attribute)>(),
+    ))
 }
 
 impl DomState {
@@ -185,7 +222,7 @@ impl Engine {
             globalThis.navigator = {
                 userAgent: 'UnaOS Aether/0.1.0',
                 language: 'en-US', languages: ['en-US'],
-                platform: 'UnaOS', cookieEnabled: false,
+                platform: 'UnaOS', cookieEnabled: true,
                 sendBeacon: function () { return true; },
             };
             globalThis.requestIdleCallback = function (cb) {
@@ -214,8 +251,203 @@ impl Engine {
             }
             "#,
         ));
-        
+        Self::setup_platform_breadth(&mut context);
+
         Self { context }
+    }
+
+    /// Platform surface a bundled framework reaches for once its runtime
+    /// actually boots: microtasks, the observer families, event
+    /// constructors, base64, and `getComputedStyle`. Installed after
+    /// `document` exists because several of these read it.
+    ///
+    /// Everything here is either the real semantics or an honest,
+    /// self-reporting approximation — nothing invents a number. The
+    /// observers register and never deliver, which is exactly what a
+    /// browser looks like when no mutation, intersection or resize is
+    /// pending; each registration is ledgered so a page that was waiting on
+    /// one is visible rather than silently stalled.
+    fn setup_platform_breadth(context: &mut Context) {
+        let _ = context.eval(boa_engine::Source::from_bytes(
+            r#"
+
+            // Real microtask semantics — the promise job queue is the same
+            // queue a browser drains, and the engine runs it at load.
+            globalThis.queueMicrotask = function (cb) { Promise.resolve().then(cb); };
+
+            // MessageChannel: real port wiring, delivery deferred through
+            // the timer queue rather than its own task source. React's
+            // scheduler yields through this; a missing MessageChannel sends
+            // it down its setTimeout fallback, so honest wiring is closer.
+            globalThis.MessageChannel = function () {
+                var mk = function () {
+                    return {
+                        onmessage: null, _l: [],
+                        addEventListener: function (ev, cb) { if (ev === 'message') this._l.push(cb); },
+                        removeEventListener: function (ev, cb) {
+                            if (ev === 'message') { var i = this._l.indexOf(cb); if (i >= 0) this._l.splice(i, 1); }
+                        },
+                        start: function () {}, close: function () {},
+                    };
+                };
+                var a = mk(), b = mk();
+                var wire = function (from, to) {
+                    from.postMessage = function (data) {
+                        setTimeout(function () {
+                            var e = { data: data, type: 'message' };
+                            if (to.onmessage) { try { to.onmessage(e); } catch (err) {} }
+                            for (var i = 0; i < to._l.length; i++) { try { to._l[i](e); } catch (err) {} }
+                        }, 0);
+                    };
+                };
+                wire(a, b); wire(b, a);
+                this.port1 = a; this.port2 = b;
+            };
+
+            globalThis.Event = function (type, init) {
+                init = init || {};
+                this.type = String(type);
+                this.bubbles = !!init.bubbles;
+                this.cancelable = !!init.cancelable;
+                this.composed = !!init.composed;
+                this.defaultPrevented = false;
+                this.target = null; this.currentTarget = null;
+                this.preventDefault = function () { this.defaultPrevented = true; };
+                this.stopPropagation = function () {};
+                this.stopImmediatePropagation = function () {};
+            };
+            globalThis.CustomEvent = function (type, init) {
+                Event.call(this, type, init);
+                this.detail = (init || {}).detail;
+            };
+            CustomEvent.prototype = Object.create(Event.prototype);
+
+            // Observers: registration is honoured, delivery never fires.
+            // One settled frame is rendered, so there is no mutation,
+            // intersection or resize to report — reporting a fabricated one
+            // would be worse than reporting none.
+            var __mkObserver = function (kind) {
+                return function (cb) {
+                    this._cb = cb;
+                    this.observe = function () { __ledger('observer-never-delivers:' + kind); };
+                    this.unobserve = function () {};
+                    this.disconnect = function () {};
+                    this.takeRecords = function () { return []; };
+                    this.root = null; this.rootMargin = '0px'; this.thresholds = [0];
+                };
+            };
+            globalThis.MutationObserver = __mkObserver('MutationObserver');
+            globalThis.IntersectionObserver = __mkObserver('IntersectionObserver');
+            globalThis.ResizeObserver = __mkObserver('ResizeObserver');
+            globalThis.PerformanceObserver = __mkObserver('PerformanceObserver');
+
+            // Real base64 over Latin-1, exactly as the platform defines it.
+            var __B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+            globalThis.btoa = function (input) {
+                var s = String(input), out = '', i = 0;
+                while (i < s.length) {
+                    var c1 = s.charCodeAt(i++), c2 = s.charCodeAt(i++), c3 = s.charCodeAt(i++);
+                    out += __B64.charAt(c1 >> 2);
+                    out += __B64.charAt(((c1 & 3) << 4) | ((isNaN(c2) ? 0 : c2) >> 4));
+                    out += isNaN(c2) ? '=' : __B64.charAt(((c2 & 15) << 2) | ((isNaN(c3) ? 0 : c3) >> 6));
+                    out += isNaN(c3) ? '=' : __B64.charAt(c3 & 63);
+                }
+                return out;
+            };
+            globalThis.atob = function (input) {
+                var s = String(input).replace(/[=\s]/g, ''), out = '', bits = 0, acc = 0;
+                for (var i = 0; i < s.length; i++) {
+                    var v = __B64.indexOf(s.charAt(i));
+                    if (v < 0) continue;
+                    acc = (acc << 6) | v; bits += 6;
+                    if (bits >= 8) { bits -= 8; out += String.fromCharCode((acc >> bits) & 255); }
+                }
+                return out;
+            };
+
+            // structuredClone over the JSON-representable graph. Cycles,
+            // Map/Set/Date/typed arrays are NOT preserved — the shortfall is
+            // ledgered rather than papered over.
+            globalThis.structuredClone = function (v) {
+                try { return JSON.parse(JSON.stringify(v)); }
+                catch (e) { __ledger('structuredClone-nonjson'); return v; }
+            };
+
+            // getComputedStyle: honest, and labelled as such. Values come
+            // from the element's own inline style, falling back to the CSS
+            // initial value for the properties pages branch on. The cascade
+            // and layout live engine-side and are not consulted here, so a
+            // property that was set by a stylesheet reads as its initial
+            // value and the read is ledgered. Nothing here reports a
+            // measured length — a fabricated pixel number is worse than an
+            // admitted gap.
+            var __INITIAL = {
+                'display': 'block', 'visibility': 'visible', 'opacity': '1',
+                'position': 'static', 'float': 'none', 'overflow': 'visible',
+                'color': 'rgb(0, 0, 0)', 'background-color': 'rgba(0, 0, 0, 0)',
+                'font-size': '16px', 'font-weight': '400', 'font-style': 'normal',
+                'line-height': 'normal', 'text-align': 'start',
+                'direction': 'ltr', 'text-transform': 'none',
+                'z-index': 'auto', 'pointer-events': 'auto',
+                'transform': 'none', 'animation-name': 'none',
+                'margin': '0px', 'padding': '0px', 'border-width': '0px',
+            };
+            var __CAMEL = function (p) {
+                return p.replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); });
+            };
+            globalThis.getComputedStyle = function (el) {
+                var decls = {};
+                var raw = (el && el.getAttribute) ? (el.getAttribute('style') || '') : '';
+                var parts = String(raw).split(';');
+                for (var i = 0; i < parts.length; i++) {
+                    var j = parts[i].indexOf(':');
+                    if (j > 0) {
+                        decls[parts[i].slice(0, j).trim().toLowerCase()] = parts[i].slice(j + 1).trim();
+                    }
+                }
+                var view = {
+                    getPropertyValue: function (p) {
+                        p = String(p).toLowerCase();
+                        if (Object.prototype.hasOwnProperty.call(decls, p)) { return decls[p]; }
+                        if (Object.prototype.hasOwnProperty.call(__INITIAL, p)) {
+                            __ledger('getComputedStyle-initial-not-cascaded:' + p);
+                            return __INITIAL[p];
+                        }
+                        __ledger('getComputedStyle-unknown:' + p);
+                        return '';
+                    },
+                    getPropertyPriority: function () { return ''; },
+                    setProperty: function (p, v) { decls[String(p).toLowerCase()] = v; },
+                    removeProperty: function (p) { delete decls[String(p).toLowerCase()]; },
+                    item: function (i) { return Object.keys(decls)[i] || ''; },
+                };
+                Object.defineProperty(view, 'length', { get: function () { return Object.keys(decls).length; } });
+                var names = Object.keys(__INITIAL).concat(Object.keys(decls));
+                for (var k = 0; k < names.length; k++) {
+                    (function (p) {
+                        var camel = __CAMEL(p);
+                        var d = { configurable: true, enumerable: true,
+                                  get: function () { return view.getPropertyValue(p); } };
+                        try { Object.defineProperty(view, p, d); } catch (e) {}
+                        if (camel !== p) { try { Object.defineProperty(view, camel, d); } catch (e) {} }
+                    })(names[k]);
+                }
+                return view;
+            };
+
+            // Documents this engine runs are already fully parsed when the
+            // first script executes; the engine advances readyState across
+            // the lifecycle events it dispatches. currentScript is null
+            // because scripts are executed detached from the tree.
+            if (typeof document !== 'undefined' && document) {
+                document.readyState = 'loading';
+                document.currentScript = null;
+                document.visibilityState = 'visible';
+                document.hidden = false;
+                document.referrer = '';
+            }
+            "#,
+        ));
     }
 
     fn setup_console(context: &mut Context) {
@@ -238,6 +470,25 @@ impl Engine {
         let _ = context.register_global_property(boa_engine::string::JsString::from("console"), console, Attribute::all());
 
         crate::api::fetch::init(context);
+
+        // __ledger(name): lets prelude-level shims record their own honest
+        // failures in the same ledger the Rust bindings write to, so a stub
+        // that answers without knowing shows up as a gap instead of passing
+        // silently.
+        let record = NativeFunction::from_fn_ptr(|_, args, ctx| {
+            let name = args
+                .get(0)
+                .cloned()
+                .unwrap_or_default()
+                .to_string(ctx)
+                .unwrap_or_default()
+                .to_std_string_escaped();
+            crate::ledger::record_js(&name[..name.len().min(64)]);
+            Ok(JsValue::undefined())
+        });
+        context
+            .register_global_callable(boa_engine::string::JsString::from("__ledger"), 1, record)
+            .unwrap();
 
         let clear_timeout = NativeFunction::from_fn_ptr(|_, _, _| {
             crate::ledger::record_js("window.clearTimeout");
@@ -513,15 +764,10 @@ impl Engine {
             .function(
                 NativeFunction::from_fn_ptr(|_, args, ctx| {
                     let tag = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
-                    let frag = kuchiki::parse_html().one(format!("<{}>", tag));
-                    if let Ok(mut matches) = frag.select(&tag) {
-                        if let Some(first) = matches.next() {
-                            let node = first.as_node().clone();
-                            node.detach();
-                            return Ok(Self::wrap_node(ctx, node));
-                        }
+                    match new_html_element(&tag) {
+                        Some(node) => Ok(Self::wrap_node(ctx, node)),
+                        None => Ok(JsValue::undefined()),
                     }
-                    Ok(JsValue::undefined())
                 }),
                 boa_engine::string::JsString::from("createElement"),
                 1,
@@ -533,6 +779,30 @@ impl Engine {
                 }),
                 boa_engine::string::JsString::from("createTextNode"),
                 1,
+            )
+            .function(
+                NativeFunction::from_fn_ptr(|_, args, ctx| {
+                    let text = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                    Ok(Self::wrap_node(ctx, kuchiki::NodeRef::new_comment(text)))
+                }),
+                boa_engine::string::JsString::from("createComment"),
+                1,
+            )
+            .function(
+                // createElementNS: the namespace argument is accepted and
+                // ignored — this engine's tree is HTML-namespaced, and an
+                // SVG/MathML element built here still needs to be a real
+                // node that appends, queries and serializes.
+                NativeFunction::from_fn_ptr(|_, args, ctx| {
+                    let tag = args.get(1).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
+                    crate::ledger::record_dom("createElementNS-namespace-ignored");
+                    match new_html_element(&tag) {
+                        Some(node) => Ok(Self::wrap_node(ctx, node)),
+                        None => Ok(JsValue::undefined()),
+                    }
+                }),
+                boa_engine::string::JsString::from("createElementNS"),
+                2,
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
@@ -1125,10 +1395,66 @@ impl Engine {
         let _ = context.register_global_property(boa_engine::string::JsString::from("document"), js_doc, Attribute::all());
     }
     
-    /// Points window.location (and document.cookie's empty jar) at the
-    /// loaded page. Plain data properties — enough for the hostname/
-    /// pathname branching real scripts do at boot.
+    /// Installs `document.cookie` as a real accessor pair over the session
+    /// cookie jar: the getter formats what the jar would send to the current
+    /// page URL, the setter feeds one `"name=value; attrs"` string back in.
+    /// Same jar the network stack uses, so a cookie script-set here rides
+    /// the next fetch, and a `Set-Cookie` from the wire is readable here.
+    fn install_cookie_accessor(&mut self) {
+        let getter = boa_engine::object::FunctionObjectBuilder::new(
+            self.context.realm(),
+            NativeFunction::from_fn_ptr(|_this, _args, _ctx| {
+                crate::ledger::record_dom("document.cookie:get");
+                Ok(JsValue::new(boa_engine::string::JsString::from(
+                    crate::net::cookies_for(&page_url()),
+                )))
+            }),
+        )
+        .build();
+        let setter = boa_engine::object::FunctionObjectBuilder::new(
+            self.context.realm(),
+            NativeFunction::from_fn_ptr(|_this, args, ctx| {
+                let decl = args
+                    .get(0)
+                    .cloned()
+                    .unwrap_or_default()
+                    .to_string(ctx)
+                    .unwrap_or_default()
+                    .to_std_string_escaped();
+                if !decl.trim().is_empty() {
+                    crate::net::set_cookie(&page_url(), &decl);
+                    crate::ledger::record_dom("document.cookie:set");
+                }
+                Ok(JsValue::undefined())
+            }),
+        )
+        .build();
+        let Ok(doc) = self
+            .context
+            .global_object()
+            .get(boa_engine::string::JsString::from("document"), &mut self.context)
+        else {
+            return;
+        };
+        let Some(doc) = doc.as_object() else { return };
+        let _ = doc.define_property_or_throw(
+            boa_engine::string::JsString::from("cookie"),
+            boa_engine::property::PropertyDescriptor::builder()
+                .get(getter)
+                .set(setter)
+                .enumerable(true)
+                .configurable(true)
+                .build(),
+            &mut self.context,
+        );
+    }
+
+    /// Points window.location at the loaded page and wires document.cookie
+    /// to the session jar for that origin. Plain data properties — enough
+    /// for the hostname/pathname branching real scripts do at boot.
     pub fn set_location(&mut self, url: &str) {
+        PAGE_URL.with(|u| *u.borrow_mut() = url.to_string());
+        self.install_cookie_accessor();
         let parsed = url::Url::parse(url).ok();
         let host = parsed.as_ref().and_then(|u| u.host_str()).unwrap_or("");
         let path = parsed.as_ref().map(|u| u.path()).unwrap_or("/");
@@ -1158,9 +1484,6 @@ impl Engine {
                 location.hash = '';
                 location.origin = '{origin}';
                 if (typeof window !== 'undefined' && window) {{ window.location = location; }}
-            }}
-            if (typeof document !== 'undefined' && document && document.cookie === undefined) {{
-                document.cookie = '';
             }}
             "#,
             href = esc(url),
