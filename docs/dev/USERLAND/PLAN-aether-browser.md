@@ -166,3 +166,28 @@ border-radius (taffy limitation). No @supports claims for non-painting propertie
 **Gates:** cargo test -p aether 41/41 green; cargo check -p aether-shell green; corpus
 renders unchanged (wiki/HN/example.com sweep intact; portal/yahoo render improved, gaps
 honestly ledgered).
+
+## Status — fleet rounds 52–61 (2026-07-28, Fox + Opus executors)
+
+Second wave, executor-fleet mode (Fox briefs/reviews/commits; Opus low/med lanes):
+session cookie jar + real `document.cookie` (9e25108c, bbdc4221); `window ===
+globalThis` — the portal 'not callable' root cause (0ab9e212); mask-image alpha
+stencils, paren-aware declaration splitting, real background geometry, opacity
+cascade merge — portal language ring renders (0d350947); CSS content-type sniffing
+for extensionless image/mask URLs (336a63e8); CSS math `calc/min/max/clamp` +
+honest mask `@supports` — wiki search icon whole (c1999452); platform APIs (URL,
+TextEncoder, AbortController, DOMParser, urandom crypto — 7c238d23);
+`element.dataset` + DOM interface constructor chain (f05b884c); escape-aware rule
+keys + partial selector lists + viewport units + honest UA defaults — yahoo
+above-fold renders real content (7553a0f8); real `document.currentScript` +
+wrapper prototype inheritance/instanceof (7d5dca0d). Diagnostics grew
+UNAOS_JSEVAL/JSDUMP/JSPRELUDE/LAYOUTDUMP. Tests 41 → 61.
+
+**Open queue:** yahoo next blocker `new URL(undefined)` in an app chunk (boa gives
+no JS stack); src/href attribute reflection on wrapped elements; wiki quiet-button
+border remnant; `extract_css_url` CSS-string escapes (latent until ::after paints);
+`html5ever = "0.39"` is an unused direct dependency (integrator, removal);
+upload.wikimedia.org rate-limits our UA (429s, pre-existing). Peter GUI drive
+checklist: URL-bar/page focus handoff both directions, links + URL bar follow,
+Back/Forward/Reload, wheel scroll, typing in fields, portal language ring visible,
+media click → PlayMedia.
