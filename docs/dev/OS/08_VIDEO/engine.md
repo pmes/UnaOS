@@ -3495,6 +3495,129 @@ in the sense that they are wired and quiet. What rides the next metal boot is th
 * `adopt_incoh` and `uncover_lost` overlap freely and are counted independently, so they may be added
   up. Neither suppresses the other.
 
+### CURSOR-7 — the window present stops erasing the sprite
+
+CURSOR-6's counter was answered on silicon. P67v2, instrumented boot:
+
+```
+[cursor6] scope=desktop present_over=9 masked=519 uncover_lost=0/524 -> OVERWRITTEN
+```
+
+`uncover_lost=0` retires CURSOR-6's own fix as a live mechanism and CURSOR-5's paths with it: nothing
+is leaking there. What remains is `present_over` — window presents landing on a live arrow that
+nothing had handed back, about nine per second — beside the bench symptom, heavy tearing on pointer
+motion and a spotty cursor under a six-vug storm. This arc closes that class.
+
+#### The two things `present_over` was counting
+
+**One was a misclassification, and naming it is not a softening.** CURSOR-6 split the two classes on
+`cur.is_some()` — whether an overlay PLAN reached `draw_window`. But a pass that loses `overlay_open`
+to a concurrent composite (the VUGPAR steady state, and CURSOR-5's whole subject) takes no plan and
+still calls `undraw_within_nosession` over its paint set and still settles on a `Repaint` tail. Those
+pixels *were* handed back and *are* owed a repaint; they were being charged as defects. The split is
+now taken on the pass's `disturbed`, which is exactly "this pass's tail owes the sprite a repaint" —
+`Adopt` and `Repaint` both do, `Untouched` does not.
+
+**The rest was real, and its shape is the plan snapshot.** `composite_inner` calls `sprite_plan()`
+once, before the dirty-set snapshot; a sprite that ARRIVES or MOVES after that instant is invisible to
+the entire pass. The HID router repaints the arrow at report rate (~125 Hz) from its own core while
+presents run from the presenting task's core, so pointer motion is precisely the regime that maximises
+the race — which is why the bench symptom is tearing *on movement*. The pass then blitted window
+content over the arrow, took an `Untouched` tail (`ensure_drawn`, a no-op while `sp.drawn`), and
+**nothing repainted it until the pointer moved again**. Every CURSOR-5 counter reads `COHERENT`
+throughout, because the sprite module's own bookkeeping never learns anything happened.
+
+#### The mechanism: arm inside the guard, repair at the tail
+
+The natural fix — hide the sprite before the blit, restore after — is not available where the blit
+happens. `draw_window`/`stage_window` run inside `wm`'s `BlitGuard` window, and F4's drain barrier
+spins IRQ-masked and unpreemptible until every registered blit retires: a blocking `SPRITE`
+acquisition there is exactly the wait its termination argument excludes (§WEDGE-1's audited-exception
+list is law, and this arc adds nothing to it). CURSOR-3/4/5 spend their whole design on that
+constraint; the only sprite work admissible inside the guard is `OVERLAY.try_lock` and relaxed atomics.
+
+So the detection stays where it was and gains a consequence:
+
+* `draw_window`, after the present, tests `live_box_relaxed()` against this window's clipped outer box
+  — two relaxed atomics, no lock, unchanged. The call is **no longer `#[cfg(feature = "witness")]`**:
+  it is mechanism now, and a production build that skipped it would keep the defect.
+* When the pass is not `bracketed`, `note_present_over_sprite` sets `cursor::PRESENT_DIRTY`, one
+  relaxed store. No lock, no allocation, no serial, nothing added to the drain's wait set.
+* `wm::composite` — outside the guard, on exactly the footing the `Repaint` tail has had since WC-I —
+  `take_present_dirty()`s the flag and runs a whole-sprite `cursor::repaint()`. That is
+  "composite the sprite on top after the blit": `undraw_locked`'s colour guard declines the pixels the
+  present overwrote (so no stale content is stamped into a window's rect), and `draw_locked` then
+  re-establishes the arrow and its save-under from the finished front buffer.
+
+Three details are load-bearing:
+
+* **The flag is read BEFORE the tail runs.** A pass already headed for `Repaint` does not repaint
+  twice; a pass headed for `Untouched` is upgraded to `Repaint`.
+* **`Adopt` is never downgraded.** `adopt_overlay` is the only closer of the overlay session — a pass
+  that skipped it would leak the session and lock the overlay mechanism out for the rest of the boot.
+  The repair is appended *after* it instead.
+* **The flag is global and coalescing.** The sprite is global and the repair is whole-sprite, so a
+  pass on core B repairing an arrow core A trampled is the right outcome, not a crossed wire. N
+  unbracketed presents cost at most one repaint per tail — the fix must not reinstate the per-present
+  duty cycle WC-I and CURSOR-4 spent two arcs removing.
+
+#### The residual, stated rather than implied
+
+The arrow is absent from the panel between the offending blit and the tail — the rest of the window
+loop, bounded by one composite pass. This does **not** make the present atomic with the sprite; the
+path that is atomic (`compose_into`, the sprite riding the present inside the back layer) is unchanged
+and still carries the bracketed case. What changes is that the absence is bounded by a pass instead of
+being unbounded, and the module's belief about the panel is re-established every time it is falsified.
+
+Cost, in the steady state: a stationary pointer over a live vug makes `hit` true, so `disturbed` is
+true, so nothing arms — the fix is silent. Arming happens when the sprite arrived or moved after the
+plan snapshot, i.e. during motion, where the HID path is repainting the arrow anyway. The extra
+repaints are co-timed with the symptom they fix.
+
+#### What the counters mean now
+
+`[cursor6] rollup scope=… present_over=N masked=N repaired=N desktop_over=N mismatch=N uncover_lost=N/planned -> V`
+
+* **`masked`** now includes the sessionless masked undraw (split on `disturbed`, not `cur.is_some()`),
+  so it will be larger on the next metal boot than P67v2's 519 and `present_over` correspondingly
+  smaller. That is the reclassification, not an improvement, and the two must be read together.
+* **`present_over`** is no longer an unrepaired overwrite. Each one now arms a tail repaint, so it is
+  a **cost** counter — how often the sprite must be re-established from the finished front — rather
+  than a damage counter.
+* **`repaired`** is new: tail repairs actually taken. The flag coalesces, so this counts repair
+  PASSES, never presents or pixels; `repaired <= present_over` always, and a ratio well under 1 means
+  several presents per pass met the arrow and were settled together — the fix working, not a gap.
+* **Verdicts.** `UNBRACKETED` (`desktop_over > 0`, unchanged, look there first); `UNWITNESSED`
+  (`over == masked == 0`, or the sprite was never armed — QEMU, always); **`OVERWRITTEN` now means
+  `present_over > 0` AND `repaired == 0`**, i.e. presents met the arrow and nothing repaired it, which
+  is a regression in `wm::composite`'s tail rather than a steady state; `REPAIRED` (`present_over > 0`
+  with repairs running); `INTACT` otherwise.
+
+#### CURSOR-7 gate results
+
+Not run in this session's environment: the container has no C compiler (`cc`/`gcc` absent, no glibc
+link objects) and no `qemu-system-aarch64`, so `./arroyo check` cannot build the host build scripts
+(`heapless`, `smoltcp`, `compiler_builtins`) and `./arroyo kernel8-test` cannot boot. Both files were
+parse-checked with `rustfmt` and the change is reviewed by construction. **`./arroyo check` and
+`./arroyo kernel8-test 150` are owed before this arc is merged.** As with every cursor arc, the QEMU
+gate can only prove wiring and no-regression: raspi4b delivers no HID pointer report, the sprite is
+never drawn, `live_box_relaxed()` is `None` for the whole boot, and every counter above is 0
+(`UNWITNESSED`).
+
+#### Metal watch-list (CURSOR-7)
+
+* `repaired > 0` with the tearing gone is the arc landing. `repaired` climbing while the symptom
+  survives means the repair is running and is not sufficient — the next thread is the plan snapshot
+  itself (make the pass see a sprite that arrives mid-pass), not another counter.
+* `present_over > 0` with `repaired == 0` is `OVERWRITTEN` and means the tail is not consuming the
+  flag. That is a code regression in `wm::composite`, not load.
+* `present_over` should fall sharply against P67v2's 9/s purely from the reclassification, with the
+  balance appearing in `masked`. If it does not, the sessionless path is not the bulk of it and the
+  arriving-sprite race is larger than assumed.
+* Watch `[cursor3]`'s `repaint=` beside `repaired=`: the tail repaint is a whole-sprite duty cycle,
+  and if it starts tracking the present rate rather than the motion rate the fix has become the
+  churn WC-I removed and belongs behind a rate limit or in the plan snapshot instead.
+
 ### WEDGE-1 — P66's mechanism is UNKNOWN; this arc hardens and instruments
 
 **Verdict first: this arc did not root-cause P66.** It landed two safe-direction changes and two

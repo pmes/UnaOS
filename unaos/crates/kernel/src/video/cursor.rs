@@ -515,16 +515,85 @@ pub fn note_uncover_lost() {
     C6_UNCOVER_LOST.fetch_add(1, Ordering::Relaxed);
 }
 
-/// CURSOR-6 — count a window present that landed on the live sprite box. `planned` says whether the
-/// pass held an overlay plan, which is exactly whether the sprite was bracketed first — and therefore
-/// which of the two classes this present belongs to.
+/// CURSOR-7 — the arc's mechanism, in one bit: a window present has just written front-buffer pixels
+/// that the live sprite was occupying, and NOTHING in that pass owes them a repaint.
+///
+/// ### Why the repair is at the pass TAIL and not before the blit
+/// The obvious shape — hide the sprite before the blit, put it back after — is not available where the
+/// blit happens. `draw_window`/`stage_window` run inside `wm`'s `BlitGuard` window, and F4's drain
+/// barrier spins IRQ-masked and unpreemptible until every registered blit retires; a blocking `SPRITE`
+/// acquisition there is exactly the wait its termination argument excludes (docs/dev/OS/08_VIDEO
+/// §WEDGE-1's audited-exception list). CURSOR-3/4/5 already spend their whole design on that
+/// constraint: the only sprite work admissible inside the guard is `OVERLAY.try_lock` and relaxed
+/// atomics. So this flag is a relaxed store inside the guard, and the *repair* is `cursor::repaint()`
+/// run from `wm::composite`, outside the guard, on the same footing as the `Repaint` tail that has
+/// existed since WC-I. No new lock, no new lock ORDER, and nothing added to the drain's wait set.
+///
+/// ### What that leaves, stated rather than implied
+/// The sprite is absent from the panel for the interval between the offending blit and the tail — the
+/// length of the rest of the window loop, bounded by one composite pass. That is a strictly shorter
+/// absence than the defect it replaces, which was UNBOUNDED: before CURSOR-7 the pass's tail was
+/// `Untouched` (`ensure_drawn`, a no-op while `sp.drawn`), so the module believed the arrow was on a
+/// panel that no longer held it and nothing repainted it until the pointer moved again. "Composite the
+/// sprite on top after the blit" is what this is; it is not a claim to have made the present atomic
+/// with the sprite. The path that IS atomic — `compose_into`, the sprite riding the present inside the
+/// layer — is unchanged and still carries the bracketed case.
+///
+/// ### Global, coalescing, and consumed by whichever tail gets there first
+/// One `AtomicBool` for the whole system, not one per pass: the sprite is global, the repair is
+/// whole-sprite, and a pass on core B repairing an arrow core A trampled is the correct outcome, not a
+/// crossed wire. Coalescing means N unbracketed presents cost at most one repaint per tail, which is
+/// the point — the fix must not reinstate the per-present duty cycle WC-I and CURSOR-4 removed.
+///
+/// `Release`/`Acquire`: the store publishes "the panel no longer holds the arrow where the module
+/// thinks it does", and what must not be reordered against it is the present's own pixel writes.
+static PRESENT_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// CURSOR-7 — tail repairs actually taken. `repaired <= present_over` by construction (the flag
+/// coalesces), so this counts REPAIR PASSES, never pixels or presents; see [`cursor6_rollup`].
 #[cfg(feature = "witness")]
-pub fn note_present_over_sprite(planned: bool) {
-    if planned {
+static C7_REPAIRED: AtomicU64 = AtomicU64::new(0);
+
+/// CURSOR-6/7 — count a window present that landed on the live sprite box, and, when nothing in that
+/// pass owes the sprite a repaint, ARM the tail repair.
+///
+/// `bracketed` is the pass's `disturbed`: this pass took the sprite down (fully or masked) and its
+/// tail is therefore `Repaint` or `Adopt`, both of which put the arrow back. CURSOR-6 asked the
+/// narrower question `cur.is_some()` — whether an overlay PLAN was in hand — which counted the
+/// sessionless masked-undraw path (`overlay_open` refused by a concurrent pass, the VUGPAR steady
+/// state) as unbracketed although its `undraw_within_nosession` had handed the pixels back and its
+/// `Repaint` tail owed them a repaint. That misclassification is a large part of P67v2's
+/// `present_over=9/s`, and correcting it is not a softening: the class that remains is exactly the one
+/// with no repair behind it, which is the one this arc closes.
+///
+/// No longer witness-gated — the flag is now MECHANISM. The counters stay gated; the store and the
+/// `live_box_relaxed` test that precedes it are two relaxed atomics on a path that already blits a
+/// window's worth of rows.
+pub fn note_present_over_sprite(bracketed: bool) {
+    if !bracketed {
+        PRESENT_DIRTY.store(true, Ordering::Release);
+    }
+    #[cfg(feature = "witness")]
+    if bracketed {
         C6_PRESENT_MASKED.fetch_add(1, Ordering::Relaxed);
     } else {
         C6_PRESENT_OVER.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// CURSOR-7 — consume the tail-repair flag. `true` obliges the caller to run [`repaint`] once the
+/// pass's own tail has been settled.
+///
+/// A swap, not a load: the flag is a request for ONE whole-sprite repaint, and leaving it standing
+/// would make every later pass pay for a present that has already been repaired. Called from
+/// `wm::composite` only, outside the `BlitGuard` window.
+pub fn take_present_dirty() -> bool {
+    let dirty = PRESENT_DIRTY.swap(false, Ordering::AcqRel);
+    #[cfg(feature = "witness")]
+    if dirty {
+        C7_REPAIRED.fetch_add(1, Ordering::Relaxed);
+    }
+    dirty
 }
 
 /// CURSOR-6 — count a desktop present that landed on the live sprite (from `Screen::present_background`).
@@ -539,8 +608,19 @@ pub(super) fn note_desktop_over_sprite() {
 /// the arc:
 ///  * `present_over` / `masked` — a window present took the arrow's pixels. `masked` is the healthy
 ///    case (the pass bracketed the sprite first and its tail owes them a repaint) and is the
-///    denominator; `present_over` is the same event with no bracket at all, and non-zero there NAMES
-///    the mechanism.
+///    denominator; `present_over` is the same event with no bracket of the pass's own.
+///    **CURSOR-7 changed what both mean, in two ways, and the change is deliberate.** First, the
+///    split is now taken on the pass's `disturbed` rather than on `cur.is_some()`, so the sessionless
+///    masked undraw — which DOES hand the pixels back and DOES take a `Repaint` tail — counts as
+///    `masked` instead of as a defect. Second, `present_over` is no longer an unrepaired overwrite:
+///    each one arms `PRESENT_DIRTY` and is settled by a tail repaint. It is now a COST counter (how
+///    often the sprite has to be re-established from the finished front) rather than a damage counter,
+///    and `repaired` is what says the mechanism ran.
+///  * `repaired` — CURSOR-7 tail repairs taken. The flag COALESCES, so this counts repair PASSES:
+///    `repaired <= present_over` always, and a ratio well under 1 means several presents per pass met
+///    the arrow and were settled together, which is the fix working as intended rather than a gap.
+///    `present_over > 0` with `repaired == 0` is the one reading that means the mechanism is NOT
+///    running — that is a regression in `wm::composite`'s tail, not load.
 ///  * `desktop_over` — the same question for the desktop layer. Must be 0 (the render task brackets
 ///    its flush); non-zero is a broken bracket, not load.
 ///  * `mismatch` — [`compose_into`] declines where the open session did not describe the plan; the
@@ -562,6 +642,7 @@ pub fn cursor6_rollup(scope: &str, planned: u64) {
     let desktop = C6_DESKTOP_OVER.load(Ordering::Relaxed);
     let mismatch = C6_MISMATCH.load(Ordering::Relaxed);
     let lost = C6_UNCOVER_LOST.load(Ordering::Relaxed);
+    let repaired = C7_REPAIRED.load(Ordering::Relaxed);
     // `desktop_over` first: of the three it is the one that would mean a BROKEN bracket rather than
     // a missing one, so a reader who sees it should look there before anything else. It is a
     // VERDICT term and no longer a gate FORBID — see the spec comment: this counter is
@@ -572,18 +653,26 @@ pub fn cursor6_rollup(scope: &str, planned: u64) {
     // `UNWITNESSED` covers both "no pointer ever existed" (QEMU) and "no present ever met the
     // sprite": `over == masked == 0` means the mechanism was never exercised, and `INTACT` there
     // would be a vacuous pass.
+    //
+    // CURSOR-7 — `OVERWRITTEN` no longer means "presents met the arrow"; it means "presents met the
+    // arrow AND NOTHING REPAIRED IT", which is now a regression in `wm::composite`'s tail rather than
+    // the steady state P67v2 measured. The repaired case gets its own word instead of being folded
+    // into `INTACT`: an arrow that is re-established once per pass is genuinely better than one that
+    // was never disturbed, and saying so is what keeps the next bench reading honest.
     let verdict = if desktop > 0 {
         "UNBRACKETED"
     } else if !armed() || (over == 0 && masked == 0) {
         "UNWITNESSED"
-    } else if over > 0 {
+    } else if over > 0 && repaired == 0 {
         "OVERWRITTEN"
+    } else if over > 0 {
+        "REPAIRED"
     } else {
         "INTACT"
     };
     serial_println!(
-        "[cursor6] rollup scope={} present_over={} masked={} desktop_over={} mismatch={} uncover_lost={}/{} -> {}",
-        scope, over, masked, desktop, mismatch, lost, planned, verdict
+        "[cursor6] rollup scope={} present_over={} masked={} repaired={} desktop_over={} mismatch={} uncover_lost={}/{} -> {}",
+        scope, over, masked, repaired, desktop, mismatch, lost, planned, verdict
     );
 }
 
