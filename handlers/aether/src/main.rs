@@ -77,15 +77,13 @@ pub async fn ignite(synapse: Synapse) -> Result<()> {
             }
             // Engine tick
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(16)), if engine.document.is_some() => {
-                if let Some(js) = &mut engine.js_engine {
-                    let _ = js.context.run_jobs();
-                }
-                
-                if engine.needs_repaint {
+                // engine.tick() — NOT a bare run_jobs(): page timers live in
+                // the event_loop timer queue now, and only tick() fires them
+                // (bounded to one generation per turn).
+                if engine.tick() {
                     // We let the shells handle repaint, so the handler mode doesn't need to do surface blits here,
                     // but we will keep this loop alive for JS timers/jobs.
                     // If we need to send a frame back through bandy in the future, we do it here.
-                    engine.needs_repaint = false;
                 }
             }
         }

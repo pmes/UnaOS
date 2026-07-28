@@ -191,3 +191,59 @@ upload.wikimedia.org rate-limits our UA (429s, pre-existing). Peter GUI drive
 checklist: URL-bar/page focus handoff both directions, links + URL bar follow,
 Back/Forward/Reload, wheel scroll, typing in fields, portal language ring visible,
 media click → PlayMedia.
+
+## Event loop: a real timer queue (2026-07-28)
+
+**Incident.** `setTimeout` ignored its delay and enqueued the callback as an
+immediate boa job; `AetherEngine::tick()` then called `Context::run_jobs()`,
+and boa's `SimpleJobExecutor::run_jobs` runs *until the queue is empty*. Any
+page whose timer callback re-arms `setTimeout` — every poll loop on the web,
+including the search UI's typing poll — refilled the queue faster than the
+drain emptied it. One `tick()` never returned: the engine thread pegged inside
+it, the shell's `select!` loop starved, and navigation went dead. Reproduced
+live on a search page; headless loads survived only because the pathological
+timers start on interaction.
+
+**Fix (structural, not a heuristic).** Timers no longer touch the job queue.
+
+- Callbacks live in the JS global `__timers` array, mirrored by index — the
+  `__handlers` discipline (a GC object must never sit in a Rust
+  `thread_local`). Freed slots are recycled through `__timerFree`.
+- The schedule lives in a Rust `thread_local` queue in `event_loop`:
+  `(id, slot, due_ms, interval)`, on a monotonic `Instant`-based millisecond
+  clock. `setTimeout`/`setInterval` return real incrementing ids;
+  `clearTimeout`/`clearInterval` tombstone both halves.
+- `fire_due_timers` snapshots the due set **before running any callback**, so a
+  timer armed or re-armed inside a callback cannot be fired by the tick that
+  armed it. Each tick therefore fires at most one generation, capped at
+  `MAX_FIRES_PER_TICK` (256, ledgered on overflow). That is the boundedness
+  guarantee, by construction.
+- Intervals re-arm at fire time (no drift compounding, no catch-up burst) and
+  clamp to the spec's 4 ms minimum.
+- `AetherJobExecutor` replaces `SimpleJobExecutor`: microtask semantics
+  unchanged (a drain still settles the chain, so promise work completes within
+  one tick), but a throwing job is ledgered and the drain continues instead of
+  discarding every remaining job, and the drain stops after 50 000 jobs or
+  500 ms with a `job-drain-cap` line rather than pegging the thread.
+- Load-time drains are the bounded `boot_drain`: 8 passes, each advancing the
+  timer clock one frame and firing only what is due. Zero-delay boot timers
+  still run before first layout (existing oracle preserved); an infinitely
+  re-arming boot timer costs 8 passes instead of the whole load.
+- `clearTimeout` had been registered a second time as a ledgered no-op in
+  `setup_console`, silently overwriting the real one — removed.
+
+**Known hazard, pre-existing (not introduced here):** boa panics
+(`RuntimeLimit ... cannot be converted to an opaque type`) when its runtime
+limit trips inside a promise reaction — `new_promise_reaction_job` calls
+`to_opaque` on the rejection reason. It reproduces intermittently on the search
+page during the load-time drain and kills the process. Needs its own arc
+(catch at the drain boundary, or raise/lower the limits deliberately). Timer
+callbacks are deliberately *not* wrapped in a JS `try/catch` for the same
+reason — a JS `catch` would materialize that error and panic; they propagate to
+Rust, which ledgers `timer-callback-threw` and continues.
+
+**Gates:** `cargo check -p aether -p aether-shell` green; `cargo test -p aether`
+69/69 green (4 new: one-generation-per-tick under self-re-arm, clearTimeout,
+setInterval/clearInterval across a driven clock, MessageChannel delivery).
+Oracles: google.com, google search results, wikipedia portal, HN, example.com
+all complete and render.

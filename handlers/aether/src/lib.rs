@@ -83,8 +83,17 @@ impl AetherEngine {
         &self.surface
     }
 
+    /// One turn of the event loop: fire the timers due right now, then settle
+    /// the microtasks they queued.
+    ///
+    /// Both halves are bounded by construction (see `event_loop`): the due set
+    /// is snapshotted before any callback runs, so a callback that re-arms
+    /// itself waits for the NEXT tick, and the job drain has a ceiling. A tick
+    /// therefore always returns — which is the whole point, since the shell's
+    /// `select!` loop cannot service navigation while it is inside one.
     pub fn tick(&mut self) -> bool {
         if let Some(js) = &mut self.js_engine {
+            event_loop::fire_due_timers(&mut js.context);
             let _ = js.context.run_jobs();
         }
         if js::take_mutated() {
@@ -605,7 +614,12 @@ impl AetherEngine {
         // Drain zero-delay boot timers, then fire queued rAF callbacks in
         // bounded passes (framework render paths), then drain the promise
         // work they spawned — all before first layout.
-        let _ = js_engine.context.run_jobs();
+        //
+        // `boot_drain` is the bounded form of what used to be a bare
+        // `run_jobs()`: a fixed number of passes, each advancing the timer
+        // clock one frame and firing only what is due, so a boot timer that
+        // re-arms itself costs N passes instead of the whole load.
+        event_loop::boot_drain(&mut js_engine.context);
         // Lifecycle events pages gate init on, then the rAF passes, then
         // the promise work all of it spawned. readyState advances with the
         // events rather than sitting at one value, so the
@@ -617,9 +631,9 @@ impl AetherEngine {
         let _ = js_engine.execute("document.readyState = 'complete';");
         js::dispatch_event(&mut js_engine.context, &document, "readystatechange");
         js::dispatch_event(&mut js_engine.context, &document, "load");
-        let _ = js_engine.context.run_jobs();
-        let _ = js_engine.execute("__drainRaf && __drainRaf();");
-        let _ = js_engine.context.run_jobs();
+        event_loop::boot_drain(&mut js_engine.context);
+        js::drain_raf(&mut js_engine.context);
+        event_loop::boot_drain(&mut js_engine.context);
 
         // UNAOS_JSEVAL=<expr>: evaluate one expression against the booted page
         // and print its value. The post-boot DOM/JS state is otherwise opaque

@@ -6,8 +6,87 @@ use boa_engine::{
 };
 use kuchiki::traits::*;
 use kuchiki::NodeRef;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+
+// ---------------------------------------------------------------------------
+// Engine poisoning: no page may kill the process
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Set once a Rust panic has unwound out of running JS. Everything past
+    /// that point refuses to run more script in this context.
+    static POISONED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// True once a panic has unwound out of this context's JS. The DOM built so
+/// far is still good and still renders; only further script is refused.
+pub fn engine_poisoned() -> bool {
+    POISONED.with(Cell::get)
+}
+
+/// Clears the poison. Only a fresh page (a fresh `Context`) may do this.
+pub(crate) fn clear_poison() {
+    POISONED.with(|p| p.set(false));
+}
+
+/// Truncates on a char boundary — `&s[..n]` panics mid-codepoint, and every
+/// string reaching the ledger here came from a page.
+fn clip(s: &str, n: usize) -> &str {
+    let mut end = s.len().min(n);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Runs one Rust -> JS boundary with the process protected from a panic
+/// raised *inside* the engine.
+///
+/// # Why a `catch_unwind` and not just careful code
+///
+/// boa itself panics on paths a page can reach. The confirmed one:
+/// `JsNativeError::RuntimeLimit` — thrown when a page exceeds boa's VM stack
+/// or recursion ceiling — has no opaque JS representation, so
+/// `JsError::to_opaque` panics outright (boa 0.21 `error.rs:1260`). The error
+/// is also uncatchable in JS (`is_catchable` is false for it), so it walks
+/// straight out to the nearest *Rust* caller. When that caller is ours it is
+/// an ordinary `Err` we ledger. When it is boa's own promise machinery it is
+/// not: `new_promise_reaction_job` converts a rejected handler's error with
+/// `to_opaque`, and panics. A page that trips the ceiling inside a `.then()`
+/// therefore takes the whole browser down from *inside* boa, where no
+/// `Result` of ours can see it — observed on roughly two google-search loads
+/// in five. [`create_context`](crate::event_loop::create_context) raises the
+/// ceiling so ordinary pages never reach it; this is the backstop that makes
+/// the invariant absolute rather than probable.
+///
+/// After a catch the VM is left mid-frame — logically inconsistent, though
+/// not memory-unsafe (every `RefCell`/GC borrow guard releases while
+/// unwinding). So the context is *poisoned*: no further JS runs on it, the
+/// event is ledgered, and the DOM renders as it stands. `AssertUnwindSafe` is
+/// exactly that assertion, and the poison flag is what makes it true.
+pub fn guarded<T>(label: &str, f: impl FnOnce() -> T) -> Option<T> {
+    if engine_poisoned() {
+        return None;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => Some(v),
+        Err(payload) => {
+            POISONED.with(|p| p.set(true));
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic>".to_string());
+            crate::ledger::record_js(&format!(
+                "js-engine-poisoned:{}:{}",
+                label,
+                clip(&msg, 64)
+            ));
+            None
+        }
+    }
+}
 
 thread_local! {
     pub(crate) static DOM_STATE: RefCell<DomState> = RefCell::new(DomState {
@@ -93,10 +172,14 @@ pub fn dispatch_event(context: &mut Context, node: &NodeRef, event: &str) -> boo
         }
     });
     for idx in &indices {
-        let _ = context.eval(boa_engine::Source::from_bytes(&format!(
-            "if (globalThis.__handlers && globalThis.__handlers[{}]) globalThis.__handlers[{}]();",
-            idx, idx
-        )));
+        // One handler per guarded call: a panic inside one poisons the engine
+        // and skips the rest, instead of taking the process with it.
+        guarded("event-handler", || {
+            let _ = context.eval(boa_engine::Source::from_bytes(&format!(
+                "if (globalThis.__handlers && globalThis.__handlers[{}]) globalThis.__handlers[{}]();",
+                idx, idx
+            )));
+        });
     }
     if !indices.is_empty() {
         DOM_STATE.with(|s| s.borrow_mut().mutated = true);
@@ -104,6 +187,21 @@ pub fn dispatch_event(context: &mut Context, node: &NodeRef, event: &str) -> boo
     } else {
         false
     }
+}
+
+/// The DOM node id a wrapper method's `this` points at, or 0 for none.
+///
+/// `this` is whatever the page passed: `Node.prototype.appendChild.call(null,
+/// x)`, a method pulled off a wrapper and invoked bare, a callback whose
+/// receiver got lost — all legal JS, all landing here with a non-object
+/// `this`. Unwrapping that was a live process-killer (observed on google
+/// search); 0 is not a node id, so every caller already treats it as "no
+/// node" and the call becomes the harmless no-op a browser's would throw for.
+fn this_node_id(this: &JsValue, ctx: &mut Context) -> i32 {
+    this.as_object()
+        .and_then(|o| o.get(boa_engine::string::JsString::from("__node_id"), ctx).ok())
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0) as i32
 }
 
 /// Builds a detached HTML-namespace element node directly — no parser, no
@@ -230,21 +328,25 @@ impl Engine {
             globalThis.cancelAnimationFrame = function (id) {
                 if (id > 0 && id <= __raf.length) { __raf[id - 1] = null; }
             };
-            // Bounded drain: each pass runs the current batch once; new
-            // registrations wait for the next pass; after 8 passes what
-            // keeps re-registering is an animation loop and is dropped.
-            globalThis.__drainRaf = function () {
-                var passes = 0;
-                while (__raf.length && passes < 8) {
-                    var batch = __raf;
-                    __raf = [];
-                    __rafClock += 16;
-                    for (var i = 0; i < batch.length; i++) {
-                        if (batch[i]) { try { batch[i](__rafClock); } catch (e) {} }
-                    }
-                    passes++;
-                }
+            // Bounded drain, driven from Rust (js::drain_raf): each pass takes
+            // the current batch, new registrations wait for the next pass, and
+            // after 8 passes what keeps re-registering is an animation loop
+            // and is dropped. The two halves are separate so Rust can call one
+            // callback at a time: a throw then propagates out to the Rust
+            // caller, which ledgers it and moves to the next callback. A JS
+            // `catch` here could only swallow it — and would never even see
+            // boa's uncatchable RuntimeLimit, the one error that matters.
+            globalThis.__rafCur = [];
+            globalThis.__rafTake = function () {
+                __rafCur = __raf;
                 __raf = [];
+                __rafClock += 16;
+                return __rafCur.length;
+            };
+            globalThis.__rafFire = function (i) {
+                var cb = __rafCur[i];
+                __rafCur[i] = null;
+                if (typeof cb === 'function') { cb(__rafClock); }
             };
             globalThis.performance = {
                 now: function () { return __rafClock; },
@@ -358,7 +460,7 @@ impl Engine {
                     cb({ didTimeout: false, timeRemaining: function () { return 50; } });
                 }, 0);
             };
-            globalThis.cancelIdleCallback = function () {};
+            globalThis.cancelIdleCallback = function (id) { clearTimeout(id); };
             "#,
         ));
         Self::setup_console(&mut context);
@@ -460,6 +562,10 @@ impl Engine {
             // the timer queue rather than its own task source. React's
             // scheduler yields through this; a missing MessageChannel sends
             // it down its setTimeout fallback, so honest wiring is closer.
+            // The `setTimeout(..., 0)` below is a real queue entry now (see
+            // `event_loop`): it delivers in the boot drain during load, and
+            // one generation per `tick()` afterwards — a port that re-posts
+            // on delivery yields the thread instead of holding it.
             globalThis.MessageChannel = function () {
                 var mk = function () {
                     return {
@@ -779,7 +885,10 @@ impl Engine {
                 NativeFunction::from_fn_ptr(|_, args, context| {
                     let mut output = String::new();
                     for arg in args {
-                        output.push_str(&arg.to_string(context).unwrap().to_std_string_escaped());
+                        // `String(arg)` runs the page's `toString`/`Symbol
+                        // .toPrimitive`, which may throw — propagate it as a
+                        // JS error rather than unwrapping into a process abort.
+                        output.push_str(&arg.to_string(context)?.to_std_string_escaped());
                         output.push(' ');
                     }
                     println!("{}", output);
@@ -812,11 +921,11 @@ impl Engine {
             .register_global_callable(boa_engine::string::JsString::from("__ledger"), 1, record)
             .unwrap();
 
-        let clear_timeout = NativeFunction::from_fn_ptr(|_, _, _| {
-            crate::ledger::record_js("window.clearTimeout");
-            Ok(JsValue::undefined())
-        });
-        context.register_global_callable(boa_engine::string::JsString::from("clearTimeout"), 1, clear_timeout).unwrap();
+        // `clearTimeout` used to be registered here as a ledgered no-op —
+        // which silently OVERWROTE the real one, since this runs after
+        // `create_context`. The timer queue in `event_loop` implements it for
+        // real now (tombstoning both the Rust record and the JS callback
+        // slot), so nothing is installed here.
     }
 
     /// Writes one declaration into a node's inline style attribute,
@@ -1076,7 +1185,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let target_id = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
                     let node = DOM_STATE.with(|s| s.borrow().get_node(id));
                     if let Some(n) = node {
@@ -1093,7 +1202,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let selector = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
                     let node = DOM_STATE.with(|s| s.borrow().get_node(id));
                     if let Some(n) = node {
@@ -1153,7 +1262,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let parent = DOM_STATE.with(|s| s.borrow().get_node(id));
                     
                     let child_id = args.get(0).and_then(|v| v.as_object()).and_then(|o| o.get(boa_engine::string::JsString::from("__node_id"), ctx).ok()).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
@@ -1170,7 +1279,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let name = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
                     let value = args.get(1).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
@@ -1186,7 +1295,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let name = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
                         if let Some(el) = n.as_element() {
@@ -1202,7 +1311,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let event = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
                     if let Some(cb) = args.get(1).and_then(|v| v.as_object()) {
                         // The callback lives in the JS __handlers array; Rust
@@ -1228,7 +1337,7 @@ impl Engine {
                     // Removal is index-tombstoning: registrations are matched
                     // positionally with the JS __handlers array, so the pair
                     // (node, event) just stops matching.
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let event = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
                     DOM_STATE.with(|s| {
                         for (nid, ev) in s.borrow_mut().handlers.iter_mut() {
@@ -1244,7 +1353,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let name = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
                     let has = DOM_STATE.with(|s| s.borrow().get_node(id))
                         .and_then(|n| n.as_element().map(|el| el.attributes.borrow().get(name.as_str()).is_some()))
@@ -1267,7 +1376,7 @@ impl Engine {
             .function(
                 NativeFunction::from_fn_ptr(|this, _args, ctx| {
                     // click(): dispatch to registered handlers.
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
                         dispatch_event(ctx, &n, "click");
                     }
@@ -1278,7 +1387,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let selector = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
                     let arr = boa_engine::object::builtins::JsArray::new(ctx);
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
@@ -1296,7 +1405,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let parent = DOM_STATE.with(|s| s.borrow().get_node(id));
 
                     let new_node_id = args.get(0).and_then(|v| v.as_object()).and_then(|o| o.get(boa_engine::string::JsString::from("__node_id"), ctx).ok()).and_then(|v| v.as_number()).unwrap_or(-1.0) as i32;
@@ -1330,7 +1439,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let parent = DOM_STATE.with(|s| s.borrow().get_node(id));
 
                     let new_node_id = args.get(0).and_then(|v| v.as_object()).and_then(|o| o.get(boa_engine::string::JsString::from("__node_id"), ctx).ok()).and_then(|v| v.as_number()).unwrap_or(-1.0) as i32;
@@ -1353,7 +1462,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
                         let html = n.to_string();
                         let frag = kuchiki::parse_html().one(html);
@@ -1389,7 +1498,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let tag = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
                     let arr = boa_engine::object::builtins::JsArray::new(ctx);
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
@@ -1407,7 +1516,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let cls = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
                     let arr = boa_engine::object::builtins::JsArray::new(ctx);
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
@@ -1426,7 +1535,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let other_id = args.get(0).and_then(|v| v.as_object()).and_then(|o| o.get(boa_engine::string::JsString::from("__node_id"), ctx).ok()).and_then(|v| v.as_number()).unwrap_or(-1.0) as i32;
 
                     let (this_node, other_node) = DOM_STATE.with(|s| {
@@ -1460,7 +1569,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let selector = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
 
                     let result = if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
@@ -1480,7 +1589,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let selector = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
 
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
@@ -1501,7 +1610,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, _args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
                         n.detach();
                         DOM_STATE.with(|s| s.borrow_mut().mutated = true);
@@ -1513,7 +1622,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let evt = args.get(0).cloned().unwrap_or_default();
 
                     if let Some(evt_obj) = evt.as_object() {
@@ -1531,7 +1640,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let name = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
                         if let Some(el) = n.as_element() {
@@ -1546,7 +1655,7 @@ impl Engine {
             )
             .function(
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
-                    let id = this.as_object().unwrap().get(boa_engine::string::JsString::from("__node_id"), ctx).unwrap_or(JsValue::undefined()).as_number().unwrap_or(0.0) as i32;
+                    let id = this_node_id(this, ctx);
                     let child_id = args.get(0).and_then(|v| v.as_object()).and_then(|o| o.get(boa_engine::string::JsString::from("__node_id"), ctx).ok()).and_then(|v| v.as_number()).unwrap_or(-1.0) as i32;
                     let (parent, child) = DOM_STATE.with(|s| (s.borrow().get_node(id), s.borrow().get_node(child_id)));
                     if let (Some(p), Some(c)) = (parent, child) {
@@ -1993,8 +2102,65 @@ impl Engine {
         let _ = self.execute(&script);
     }
 
+    /// Evaluates one script in this page's realm.
+    ///
+    /// Guarded: a panic raised inside boa (see [`guarded`]) poisons the engine
+    /// and comes back as an ordinary `Err`, so a script can end the page's JS
+    /// but never the process. Subsequent calls on a poisoned engine return the
+    /// same `Err` without running anything.
     pub fn execute(&mut self, script: &str) -> JsResult<JsValue> {
         use boa_engine::Source;
-        self.context.eval(Source::from_bytes(script))
+        let ctx = &mut self.context;
+        guarded("script", || ctx.eval(Source::from_bytes(script))).unwrap_or_else(|| {
+            Err(boa_engine::JsNativeError::error()
+                .with_message("js engine poisoned")
+                .into())
+        })
     }
+}
+
+/// Runs the queued `requestAnimationFrame` callbacks in bounded passes.
+///
+/// The pass model is the prelude's from before (each pass runs the batch that
+/// was registered when it began; what re-registers gets the next pass; eight
+/// passes and the rest is an animation loop, dropped) — but the *loop* now
+/// lives here rather than in JS. The old JS `try { cb() } catch (e) {}` gave
+/// per-callback isolation by swallowing every error silently, and could not
+/// have done otherwise: boa's `RuntimeLimit` is uncatchable in JS, so the one
+/// error worth knowing about was the one that catch could never report.
+/// Driving the callbacks one at a time from Rust keeps the isolation and
+/// ledgers what threw.
+pub fn drain_raf(context: &mut Context) {
+    use boa_engine::Source;
+    for _ in 0..8 {
+        let taken = guarded("raf-batch", || {
+            context
+                .eval(Source::from_bytes("__rafTake()"))
+                .ok()
+                .and_then(|v| v.as_number())
+                .unwrap_or(0.0) as usize
+        });
+        let Some(n) = taken else { return };
+        if n == 0 {
+            break;
+        }
+        for i in 0..n {
+            let ran = guarded("raf-callback", || {
+                context.eval(Source::from_bytes(&format!("__rafFire({})", i)))
+            });
+            match ran {
+                // A callback that throws is ledgered and the pass continues —
+                // what a browser's animation-frame task source does too.
+                Some(Err(e)) => crate::ledger::record_js(&format!(
+                    "raf-callback-threw:{}",
+                    clip(&e.to_string(), 64)
+                )),
+                Some(Ok(_)) => {}
+                None => return,
+            }
+        }
+    }
+    let _ = guarded("raf-clear", || {
+        context.eval(Source::from_bytes("__raf = []; __rafCur = [];"))
+    });
 }
