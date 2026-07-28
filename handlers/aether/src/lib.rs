@@ -516,15 +516,44 @@ impl AetherEngine {
         // UNAOS_JSDEBUG=1: trace each script's index/head/outcome to stderr
         // (which script kills a page's boot is otherwise invisible).
         let js_debug = std::env::var("UNAOS_JSDEBUG").is_ok();
+        // UNAOS_JSDUMP=<dir>: write every script's full source to
+        // <dir>/script-<NNN>.js before running it. A minified bundle's text is
+        // otherwise unreachable from outside (inline scripts never hit the
+        // network, and the fetched ones are concatenated in document order),
+        // so the only way to read the expression a stack trace points at is to
+        // dump exactly what the engine was handed.
+        let js_dump = std::env::var("UNAOS_JSDUMP").ok();
+        // UNAOS_JSPRELUDE=<file>: evaluate a script of our own *before* the
+        // page's, in the same realm. `UNAOS_JSEVAL` only reaches post-boot
+        // state, which is useless when boot itself throws — a prelude can wrap
+        // a global a bundle is about to install and report what flowed through
+        // it. Diagnostic only; never set in normal operation.
+        if let Ok(path) = std::env::var("UNAOS_JSPRELUDE") {
+            match std::fs::read_to_string(&path) {
+                Ok(src) => {
+                    if let Err(e) = js_engine.execute(&src) {
+                        eprintln!("[jsprelude] ERR: {}", e);
+                    }
+                }
+                Err(e) => eprintln!("[jsprelude] cannot read {}: {}", path, e),
+            }
+        }
         match scripts_override {
             Some(scripts) => {
                 for (i, text) in scripts.iter().enumerate() {
+                    if let Some(dir) = &js_dump {
+                        let _ = std::fs::create_dir_all(dir);
+                        let _ = std::fs::write(format!("{}/script-{:03}.js", dir, i), text);
+                    }
                     let head: String = text.chars().take(60).filter(|c| !c.is_control()).collect();
                     match js_engine.execute(text) {
                         Err(e) => {
                             let msg = e.to_string();
                             if js_debug {
-                                eprintln!("[jsdebug] script {} ERR: {} | head: {}", i, &msg[..msg.len().min(120)], head);
+                                // Full message + stack: the ledger keeps a
+                                // 64-char digest, but a truncated stack names
+                                // no frames, which is the whole point here.
+                                eprintln!("[jsdebug] script {} ERR: {}\n  | head: {}", i, msg, head);
                             }
                             ledger::record_js(&format!("script-error:{}", &msg[..msg.len().min(64)]));
                         }

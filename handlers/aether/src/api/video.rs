@@ -5,20 +5,25 @@ use boa_engine::{
     property::Attribute,
 };
 
-/// Initializes the global HTMLVideoElement constructor
-pub fn init(context: &mut Context) {
-    let video_constructor = NativeFunction::from_fn_ptr(|_, _, context| {
-        Ok(create_video_element(context))
-    });
+/// Media-element setup.
+///
+/// This used to register a global `HTMLVideoElement` whose call returned a
+/// fresh playback object. Two things were wrong with that. `new
+/// HTMLVideoElement()` throws "Illegal constructor" in every browser — the
+/// name is an interface, not a factory — and registering it here overwrote
+/// the real interface constructor the JS prelude installs, leaving the name
+/// bound to a native function with no `prototype`. Any page doing
+/// `el instanceof HTMLVideoElement` (player code does, constantly) got a
+/// TypeError instead of a boolean, and the whole `HTML*Element` family lost
+/// one member.
+///
+/// The interface constructor is the prelude's job, so there is nothing to
+/// install here; the element factory below stays available for the media
+/// lane to attach to real `<video>` nodes.
+pub fn init(_context: &mut Context) {}
 
-    let _ = context.register_global_callable(
-        boa_engine::string::JsString::from("HTMLVideoElement"),
-        0,
-        video_constructor,
-    );
-}
-
-/// Creates a new JS object that represents a <video> element
+/// Creates a new JS object that represents a <video> element.
+#[allow(dead_code)]
 pub fn create_video_element(context: &mut Context) -> JsValue {
     let obj = ObjectInitializer::new(context)
         .property(

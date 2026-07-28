@@ -613,6 +613,59 @@ mod tests {
         assert!(!inked, "hidden subtrees must leave the surface uninked");
     }
 
+    /// Empty container/portal divs are zero-tall and carry no UA margin, so
+    /// a deep app shell does not push its first real content off the fold,
+    /// and `border-width: 0` (the opening line of every CSS reset) draws
+    /// nothing rather than outlining every box with a hairline.
+    #[test]
+    fn test_empty_shell_boxes_cost_nothing() {
+        let html = r#"<html><body><div><div><div>
+            <div id="portals"><div></div><div></div><div></div><div></div><div></div>
+            <div></div><div></div><div></div><div></div><div></div></div>
+            <p id="lead">LEAD STORY</p>
+        </div></div></div></body></html>"#;
+        let mut tree = layout::compute_layout(&dom::parse_html(html));
+        let find = |tree: &layout::LayoutTree, want: &str| {
+            tree.node_map
+                .iter()
+                .find(|(_, n)| {
+                    n.as_element()
+                        .and_then(|e| e.attributes.borrow().get("id").map(str::to_string))
+                        .as_deref()
+                        == Some(want)
+                })
+                .map(|(id, _)| *id)
+                .unwrap()
+        };
+        let portals = find(&tree, "portals");
+        assert_eq!(
+            tree.taffy.layout(portals).unwrap().size.height,
+            0.0,
+            "ten empty divs must occupy no vertical space"
+        );
+        // The lead paragraph sits near the top, not ~250px down.
+        let mut y = 0.0;
+        let mut cur = find(&tree, "lead");
+        loop {
+            y += tree.taffy.layout(cur).unwrap().location.y;
+            match tree.taffy.parent(cur) {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        assert!(y < 40.0, "lead content pushed to y={} by empty shell boxes", y);
+
+        // border-width:0 with a style and colour still set paints nothing.
+        css::apply_css(&mut tree, "* { border: 1px solid rgb(200,0,0); border-width: 0 }");
+        let mut surface = vec![255u8; 800 * 600 * 4];
+        crate::render::render_frame(&tree, &mut surface, 800, 600, 0.0, 0.0, &[(0, 0, 800, 600)]);
+        let red = surface
+            .chunks_exact(4)
+            .filter(|p| p[2] > 150 && p[1] < 80 && p[0] < 80)
+            .count();
+        assert_eq!(red, 0, "zero-width borders must not paint ({} px inked)", red);
+    }
+
     /// Script collection preserves document order and skips non-JS types;
     /// the classList/querySelectorAll/documentElement DOM surface drives
     /// real mutations that survive into relayout.
@@ -1356,5 +1409,88 @@ mod tests {
         assert_eq!(f[7], "true", "two draws differ — the fill is not fixed");
         assert_eq!(f[8], "true", "randomUUID is a well-formed v4");
         assert_eq!(f[9], "true", "randomUUID does not repeat");
+    }
+
+    /// `element.dataset` is a live view over `data-*` attributes, in both
+    /// directions and through delete — a snapshot object would pass the
+    /// first read and lose everything after it. Next.js reads
+    /// `documentElement.dataset.dplId` and then deletes it during its
+    /// bootstrap, which is the shape exercised here.
+    #[test]
+    fn dataset_is_a_live_view_over_data_attributes() {
+        let html = r#"<html><body>
+            <div id="host" data-dpl-id="sha-1" data-plain="p"></div>
+            <script>
+                var h = document.getElementById('host');
+                var out = [];
+                out.push(h.dataset.dplId);
+                out.push(String(h.dataset.missing));
+                out.push(Object.keys(h.dataset).sort().join(','));
+                h.dataset.newKey = 'v';
+                out.push(h.getAttribute('data-new-key'));
+                h.setAttribute('data-from-attr', 'a');
+                out.push(h.dataset.fromAttr);
+                delete h.dataset.dplId;
+                out.push(String(h.dataset.dplId) + '/' + String(h.getAttribute('data-dpl-id')));
+                out.push(String('plain' in h.dataset) + ',' + String('nope' in h.dataset));
+                out.push(String(typeof document.dataset));
+                var probe = document.createElement('div');
+                probe.id = 'probe';
+                probe.textContent = out.join('|');
+                document.body.appendChild(probe);
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://dataset", html, true);
+        let doc = engine.document.as_ref().unwrap();
+        let probe = doc.select("#probe").unwrap().next().expect("probe must attach");
+        let f: Vec<String> = probe.as_node().text_contents().split('|').map(String::from).collect();
+        assert_eq!(f[0], "sha-1", "data-dpl-id reads back as dplId");
+        assert_eq!(f[1], "undefined", "an absent data-* name is undefined, not empty string");
+        assert_eq!(f[2], "dplId,plain", "enumeration lists exactly the data-* attributes");
+        assert_eq!(f[3], "v", "a dataset write lands on the real attribute");
+        assert_eq!(f[4], "a", "an attribute write is visible through dataset");
+        assert_eq!(f[5], "undefined/null", "delete removes the attribute itself");
+        assert_eq!(f[6], "true,false", "`in` follows the attribute list");
+        assert_eq!(f[7], "undefined", "non-elements have no dataset");
+    }
+
+    /// The `HTML*Element` interface constructors exist as one prototype
+    /// chain. Bundles feature-detect them by name (a missing name is a
+    /// ReferenceError that kills the whole script) and branch on
+    /// `instanceof`, so identity and inheritance both have to hold.
+    #[test]
+    fn dom_interface_constructors_form_a_chain() {
+        let html = r#"<html><body>
+            <script>
+                var out = [];
+                out.push([typeof HTMLScriptElement, typeof HTMLDialogElement,
+                          typeof HTMLAnchorElement, typeof HTMLVideoElement].join(','));
+                out.push(String(Object.create(HTMLAnchorElement.prototype) instanceof HTMLElement));
+                out.push(String(Object.create(HTMLDivElement.prototype) instanceof Node));
+                out.push(String(Object.create(HTMLVideoElement.prototype) instanceof HTMLMediaElement));
+                out.push(String(Object.create(Text.prototype) instanceof CharacterData));
+                out.push(String(Object.create(HTMLElement.prototype) instanceof HTMLScriptElement));
+                var threw = '';
+                try { new HTMLScriptElement(); } catch (e) { threw = e.name; }
+                out.push(threw);
+                var probe = document.createElement('div');
+                probe.id = 'probe';
+                probe.textContent = out.join('|');
+                document.body.appendChild(probe);
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://interfaces", html, true);
+        let doc = engine.document.as_ref().unwrap();
+        let probe = doc.select("#probe").unwrap().next().expect("probe must attach");
+        let f: Vec<String> = probe.as_node().text_contents().split('|').map(String::from).collect();
+        assert_eq!(f[0], "function,function,function,function", "the family is installed whole");
+        assert_eq!(f[1], "true", "HTMLAnchorElement inherits from HTMLElement");
+        assert_eq!(f[2], "true", "the chain reaches Node");
+        assert_eq!(f[3], "true", "<video> hangs off HTMLMediaElement");
+        assert_eq!(f[4], "true", "Text inherits from CharacterData");
+        assert_eq!(f[5], "false", "inheritance does not run the wrong way");
+        assert_eq!(f[6], "TypeError", "the interfaces are not callable constructors");
     }
 }

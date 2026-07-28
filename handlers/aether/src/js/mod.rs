@@ -123,6 +123,55 @@ impl DomState {
     }
 }
 
+/// `data-*` attribute name for a `dataset` property name, per the WHATWG
+/// DOMStringMap mapping: every ASCII uppercase letter becomes `-` plus its
+/// lowercase form, and the whole thing is prefixed `data-`.
+///
+/// `None` for the one shape the spec rejects — a `-` already followed by an
+/// ASCII lowercase letter has no round trip back, so the setter throws
+/// rather than writing an attribute it could never read again.
+fn dataset_attr_name(prop: &str) -> Option<String> {
+    let b = prop.as_bytes();
+    for i in 0..b.len() {
+        if b[i] == b'-' && b.get(i + 1).is_some_and(u8::is_ascii_lowercase) {
+            return None;
+        }
+    }
+    let mut out = String::from("data-");
+    for c in prop.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('-');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+/// `dataset` property name for a `data-*` attribute — the inverse mapping:
+/// `-` followed by an ASCII lowercase letter collapses to that letter
+/// uppercased, any other `-` stays literal. `None` for attributes outside
+/// the `data-` namespace.
+fn dataset_prop_name(attr: &str) -> Option<String> {
+    let rest = attr.strip_prefix("data-")?;
+    let mut out = String::new();
+    let mut it = rest.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '-' {
+            if let Some(n) = it.peek().copied() {
+                if n.is_ascii_lowercase() {
+                    it.next();
+                    out.push(n.to_ascii_uppercase());
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
 pub struct Engine {
     pub context: Context,
 }
@@ -196,11 +245,69 @@ impl Engine {
                          addListener: function () {}, removeListener: function () {},
                          addEventListener: function () {}, removeEventListener: function () {} };
             };
-            globalThis.Element = function () {};
-            Element.prototype = {};
-            globalThis.Node = function () {};
-            Node.prototype = {};
-            globalThis.HTMLElement = Element;
+            // DOM interface constructors, as a real prototype chain rather
+            // than three unrelated stubs. Bundles reach for these two ways:
+            // `x instanceof HTMLAnchorElement` to branch, and
+            // `window.HTMLDialogElement` / `'HTMLScriptElement' in window`
+            // to feature-detect. A missing name is a ReferenceError that
+            // kills the whole script, so the family is installed whole —
+            // every interface a browser exposes for an HTML element, each
+            // inheriting from HTMLElement -> Element -> Node -> EventTarget
+            // exactly as the spec lays them out. They are not callable:
+            // `new HTMLScriptElement()` throws "Illegal constructor", which
+            // is what a browser does too.
+            (function () {
+                var mk = function (name, parent) {
+                    var f = function () { throw new TypeError('Illegal constructor'); };
+                    f.prototype = Object.create(parent ? parent.prototype : Object.prototype);
+                    Object.defineProperty(f.prototype, 'constructor',
+                        { value: f, writable: true, configurable: true });
+                    try { Object.defineProperty(f, 'name', { value: name, configurable: true }); }
+                    catch (e) {}
+                    globalThis[name] = f;
+                    return f;
+                };
+                var EventTarget = mk('EventTarget', null);
+                var Node = mk('Node', EventTarget);
+                var Element = mk('Element', Node);
+                var HTMLElement = mk('HTMLElement', Element);
+                mk('Document', Node);
+                mk('DocumentFragment', Node);
+                mk('ShadowRoot', globalThis.DocumentFragment);
+                mk('DocumentType', Node);
+                var CharacterData = mk('CharacterData', Node);
+                mk('Text', CharacterData);
+                mk('Comment', CharacterData);
+                mk('CDATASection', globalThis.Text);
+                mk('ProcessingInstruction', CharacterData);
+                mk('Attr', Node);
+                mk('SVGElement', Element);
+                mk('HTMLDocument', globalThis.Document);
+                // One interface per tag family, spelled the way the spec
+                // spells it (the name is the observable thing here).
+                var tags = [
+                    'Anchor', 'Area', 'BR', 'Base', 'Body', 'Button',
+                    'Canvas', 'DList', 'Data', 'DataList', 'Details', 'Dialog',
+                    'Div', 'Embed', 'FieldSet', 'Font', 'Form', 'Frame',
+                    'FrameSet', 'HR', 'Head', 'Heading', 'Html', 'IFrame',
+                    'Image', 'Input', 'LI', 'Label', 'Legend', 'Link', 'Map',
+                    'Marquee', 'Menu', 'Meta', 'Meter', 'Mod', 'OList',
+                    'Object', 'OptGroup', 'Option', 'Output', 'Paragraph',
+                    'Param', 'Picture', 'Pre', 'Progress', 'Quote', 'Script',
+                    'Select', 'Slot', 'Source', 'Span', 'Style', 'TableCaption',
+                    'TableCell', 'TableCol', 'TableRow', 'TableSection',
+                    'Table', 'Template', 'TextArea', 'Time', 'Title', 'Track',
+                    'UList', 'Unknown',
+                ];
+                for (var i = 0; i < tags.length; i++) {
+                    mk('HTML' + tags[i] + 'Element', HTMLElement);
+                }
+                // <audio>/<video> hang off HTMLMediaElement, not straight
+                // off HTMLElement — player code branches on exactly that.
+                var HTMLMediaElement = mk('HTMLMediaElement', HTMLElement);
+                mk('HTMLAudioElement', HTMLMediaElement);
+                mk('HTMLVideoElement', HTMLMediaElement);
+            })();
             globalThis.Image = function (w, h) {
                 this.width = w || 0; this.height = h || 0;
                 this.src = ''; this.complete = false;
@@ -234,6 +341,10 @@ impl Engine {
             "#,
         ));
         Self::setup_console(&mut context);
+        // `__makeDataset` must exist before any node is wrapped — the
+        // `dataset` accessor installed by `wrap_node` calls it — and
+        // `setup_document` wraps the document immediately.
+        Self::setup_dataset(&mut context);
         Self::setup_document(&mut context, document);
         crate::api::window::setup_window(&mut context);
         crate::api::events::init(&mut context);
@@ -441,15 +552,164 @@ impl Engine {
 
             // Documents this engine runs are already fully parsed when the
             // first script executes; the engine advances readyState across
-            // the lifecycle events it dispatches. currentScript is null
-            // because scripts are executed detached from the tree.
+            // the lifecycle events it dispatches.
+            //
+            // currentScript stays null: the engine executes scripts from a
+            // list collected off the tree, and that list carries only source
+            // text, so the element a running script came from is genuinely
+            // not known here. It reads as an accessor rather than a plain
+            // null so a page that depended on it lands in the ledger instead
+            // of failing silently — Next.js, for one, asserts on it and
+            // aborts its whole bootstrap when it is null.
             if (typeof document !== 'undefined' && document) {
                 document.readyState = 'loading';
-                document.currentScript = null;
+                Object.defineProperty(document, 'currentScript', {
+                    get: function () { __ledger('document.currentScript:null'); return null; },
+                    configurable: true,
+                });
                 document.visibilityState = 'visible';
                 document.hidden = false;
                 document.referrer = '';
             }
+            "#,
+        ));
+    }
+
+    /// `element.dataset` — a real live `DOMStringMap` over the element's
+    /// `data-*` attributes, not a snapshot object.
+    ///
+    /// It has to be live in both directions: bundles read a value the
+    /// server rendered into the markup and then `delete` it (Next.js reads
+    /// `documentElement.dataset.dplId` for its deployment id and removes it
+    /// so a later hydration pass cannot see a stale one), and app shells
+    /// write `dataset.*` as state that CSS attribute selectors then match.
+    /// A plain object copy would serve the first read and silently lose
+    /// every write, so the map is a `Proxy` whose traps go straight to the
+    /// attribute list — the same `kuchiki` attributes selectors and
+    /// `getAttribute` see. Nothing is cached; nothing is invented.
+    fn setup_dataset(context: &mut Context) {
+        fn node_of(args: &[JsValue], ctx: &mut Context) -> Option<NodeRef> {
+            let id = args.first()?.to_number(ctx).ok()? as i32;
+            DOM_STATE.with(|s| s.borrow().get_node(id))
+        }
+        fn key_of(args: &[JsValue], ctx: &mut Context) -> String {
+            args.get(1)
+                .cloned()
+                .unwrap_or_default()
+                .to_string(ctx)
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default()
+        }
+
+        let get = NativeFunction::from_fn_ptr(|_this, args, ctx| {
+            let (Some(node), key) = (node_of(args, ctx), key_of(args, ctx)) else {
+                return Ok(JsValue::undefined());
+            };
+            let Some(attr) = dataset_attr_name(&key) else { return Ok(JsValue::undefined()) };
+            let Some(el) = node.as_element() else { return Ok(JsValue::undefined()) };
+            let v = el.attributes.borrow().get(attr.as_str()).map(str::to_string);
+            Ok(match v {
+                Some(v) => JsValue::new(boa_engine::string::JsString::from(v)),
+                None => JsValue::undefined(),
+            })
+        });
+        let set = NativeFunction::from_fn_ptr(|_this, args, ctx| {
+            let (Some(node), key) = (node_of(args, ctx), key_of(args, ctx)) else {
+                return Ok(JsValue::from(false));
+            };
+            let Some(attr) = dataset_attr_name(&key) else {
+                // The spec throws SyntaxError here; ledger it and refuse the
+                // write rather than storing an attribute that could never be
+                // read back through the same map.
+                crate::ledger::record_dom("dataset:invalid-name");
+                return Ok(JsValue::from(false));
+            };
+            let value = args
+                .get(2)
+                .cloned()
+                .unwrap_or_default()
+                .to_string(ctx)
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default();
+            let Some(el) = node.as_element() else { return Ok(JsValue::from(false)) };
+            el.attributes.borrow_mut().insert(attr.as_str(), value);
+            DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+            Ok(JsValue::from(true))
+        });
+        let del = NativeFunction::from_fn_ptr(|_this, args, ctx| {
+            let (Some(node), key) = (node_of(args, ctx), key_of(args, ctx)) else {
+                return Ok(JsValue::from(true));
+            };
+            let Some(attr) = dataset_attr_name(&key) else { return Ok(JsValue::from(true)) };
+            if let Some(el) = node.as_element() {
+                if el.attributes.borrow_mut().remove(attr.as_str()).is_some() {
+                    DOM_STATE.with(|s| s.borrow_mut().mutated = true);
+                }
+            }
+            Ok(JsValue::from(true))
+        });
+        let keys = NativeFunction::from_fn_ptr(|_this, args, ctx| {
+            let arr = boa_engine::object::builtins::JsArray::new(ctx);
+            if let Some(node) = node_of(args, ctx) {
+                if let Some(el) = node.as_element() {
+                    let names: Vec<String> = el
+                        .attributes
+                        .borrow()
+                        .map
+                        .iter()
+                        .filter(|(name, _)| name.ns.is_empty())
+                        .filter_map(|(name, _)| dataset_prop_name(&name.local))
+                        .collect();
+                    for n in names {
+                        let _ = arr.push(
+                            JsValue::new(boa_engine::string::JsString::from(n)),
+                            ctx,
+                        );
+                    }
+                }
+            }
+            Ok(arr.into())
+        });
+
+        let _ = context.register_global_callable("__dataset_get".into(), 2, get);
+        let _ = context.register_global_callable("__dataset_set".into(), 3, set);
+        let _ = context.register_global_callable("__dataset_delete".into(), 2, del);
+        let _ = context.register_global_callable("__dataset_keys".into(), 1, keys);
+
+        let _ = context.eval(boa_engine::Source::from_bytes(
+            r#"
+            // DOMStringMap: every trap reaches the attribute list, so the
+            // map is a view rather than a copy. Symbol keys are not data-*
+            // names and are left to the (empty) target.
+            globalThis.__makeDataset = function (id) {
+                return new Proxy(Object.create(null), {
+                    get: function (t, k) {
+                        if (typeof k !== 'string') { return t[k]; }
+                        return __dataset_get(id, k);
+                    },
+                    set: function (t, k, v) {
+                        if (typeof k !== 'string') { t[k] = v; return true; }
+                        return __dataset_set(id, k, v);
+                    },
+                    deleteProperty: function (t, k) {
+                        if (typeof k !== 'string') { delete t[k]; return true; }
+                        return __dataset_delete(id, k);
+                    },
+                    has: function (t, k) {
+                        if (typeof k !== 'string') { return k in t; }
+                        return __dataset_get(id, k) !== undefined;
+                    },
+                    ownKeys: function () { return __dataset_keys(id); },
+                    getOwnPropertyDescriptor: function (t, k) {
+                        if (typeof k !== 'string') {
+                            return Object.getOwnPropertyDescriptor(t, k);
+                        }
+                        var v = __dataset_get(id, k);
+                        if (v === undefined) { return undefined; }
+                        return { value: v, writable: true, enumerable: true, configurable: true };
+                    },
+                });
+            };
             "#,
         ));
     }
@@ -651,6 +911,30 @@ impl Engine {
                 DOM_STATE.with(|s| s.borrow_mut().mutated = true);
             }
             Ok(JsValue::undefined())
+        });
+
+        // dataset is built on demand rather than eagerly per wrapped node:
+        // every node wrap would otherwise pay for a Proxy the page may never
+        // touch. Non-elements have no attributes and so no dataset at all,
+        // which is what a browser reports for the document and for text.
+        let get_dataset = Self::native(context, |this, _args, ctx| {
+            let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
+            if n.as_element().is_none() {
+                return Ok(JsValue::undefined());
+            }
+            let Some(id) = this
+                .as_object()
+                .and_then(|o| o.get(boa_engine::string::JsString::from("__node_id"), ctx).ok())
+            else {
+                return Ok(JsValue::undefined());
+            };
+            let make = ctx
+                .global_object()
+                .get(boa_engine::string::JsString::from("__makeDataset"), ctx)?;
+            let Some(make) = make.as_callable() else {
+                return Ok(JsValue::undefined());
+            };
+            make.call(&JsValue::undefined(), &[id], ctx)
         });
 
         let get_parent = Self::native(context, |this, _args, ctx| {
@@ -1268,6 +1552,10 @@ impl Engine {
             .accessor(
                 boa_engine::string::JsString::from("tagName"),
                 Some(get_tag), None, Attribute::all(),
+            )
+            .accessor(
+                boa_engine::string::JsString::from("dataset"),
+                Some(get_dataset), None, Attribute::all(),
             )
             .build();
 
