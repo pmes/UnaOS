@@ -1841,6 +1841,60 @@
   `:: UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c ::` byte-identical and the BGRUN-ST /
   `EXEC-UVUG` legs unchanged in timing. The waived-budget path is metal-only (no HID in QEMU → no
   interactive mode), so it is **unverified in QEMU by nature** and is for the next attended boot to confirm.
+- **EL0IN-FOCUS (the pointer stops being dead until first focus)** — P67v2 attended metal: after boot, mouse
+  movement produced **no cursor motion at all** until the operator focused the shell window; from that moment
+  the pointer was alive for the rest of the boot. The cause is a **self-disabling predicate** in the EL0 input
+  router, and the chain is short enough to state in full:
+  1. `pump_usb_into_gui` (`main.rs:2503`) branches on `el0_input_active() != 0` **first**. With a windowed EL0
+     app focused — the ordinary desktop state after `run` / `bg` — every drained pal event goes to
+     `route_input_to_active_el0` and the function `return`s. `render_service`'s `Event::Mouse` /
+     `Event::MouseAbsolute` arms (`main.rs:3122` / `3135`) — the `pal::cursor::move_rel` callers on the Pi's
+     **live** GUI path — are unreachable in that state. (The main/GUI loop's own arms at `main.rs:1199` are
+     the pre-scheduler loop that does not run on Pi baremetal+fb; `vug.rs`'s are inside kernel full-screen
+     apps, a different branch of the same pump.)
+  2. Inside the router, FOCUS-VIS's system-cursor keep-alive was gated on `pal::cursor::has_reported()`
+     (`main.rs:2137`, pre-fix), whose latch (`cursor::LAST_INPUT_MS`) is stamped **only** by `move_rel` /
+     `set_abs`.
+  3. So on a boot where focus reached an EL0 app **before** the first pointer report, both paths that could
+     set the latch were unreachable: the shell arms by (1), the router arm by its own gate. The predicate
+     could only become true through a path it had itself disabled — the shared pointer position never moved,
+     `cursor::visible()` stayed false, and `video::cursor::repaint` drew nothing. Reports were **not lost**:
+     `el0_input_enqueue` delivered them and `[el0in] routed N event(s) to active EL0 ring` fired throughout.
+     What was dead was the *system cursor*, not the routing.
+  4. TAB to the shell → `el0_input_set_active(0)` → the next pump pass takes the bare-shell drain →
+     `gui_send` → `render_service`'s ungated `move_rel` → latch stamped. `has_reported()` is true from then
+     on, so the router's keep-alive works for the rest of the boot. Exactly the observed "dead, then alive".
+
+  **Fix (small, `main.rs`-only):** scope the guard to what it was actually protecting. It existed so the
+  boot-time `input_router_selftest`, which drives the real router with a **synthetic** `Event::Mouse`, would
+  not arm a cursor and print `[cursor] armed` on a QEMU panel that has no pointer. That is now a
+  `ROUTER_SELFTEST` flag, set for the duration of the selftest and cleared after its last router call: the
+  synthetic events still arm nothing and **QEMU gate output is unchanged**, while every *real* pointer report
+  moves the system cursor from the first report of the boot regardless of who holds focus.
+  `pal::cursor::has_reported()` is kept (it is still the honest "does this machine have a pointer?"
+  predicate) but now has no callers; its doc comment records why it stopped being the router's gate.
+  Lane: `main.rs` + one doc comment in `pal.rs` + this doc. `video/wm.rs` and `video/cursor.rs` untouched.
+
+  **Audited and deliberately NOT fixed here — click-to-focus does not exist.** The brief's second half
+  ("clicks should focus-raise what is under the cursor") is not a regression; it was never built. Focus
+  changes have exactly three sources: `run_user_image`'s grant and clear
+  (`arch/aarch64/syscall.rs:7034` / `7175`) and the TAB ring (`wc_shell_focus_key` → `el0_input_set_active`
+  → `wm::focus_changed`, `syscall.rs:11777`). The pointer-button path has **no window hit-test at all** —
+  while an EL0 app holds focus a `Button` goes straight into its ring via `route_input_to_active_el0`, and on
+  the shell path `click1_dispatch` (`main.rs:3022`) hit-tests only *console vs status strip*
+  (`click1_hit_test`, `main.rs:2980`), never the `wm` window table. A click on an unfocused window is
+  therefore delivered to the **focused** app instead: the aarch64 reading of the x86 CLICK-3 "15/16 clicks
+  eaten" datum is that the clicks are not dropped, they are routed to the wrong window because nothing maps
+  cursor position → window. Building it means a new `wm` hit-test seam (position → window id → owner ASID)
+  plus a focus-set on the press edge — a new feature in the compositor's shared convergence surface, not a
+  small fix. Left for its own arc.
+
+  **Gates:** the session that made this change ran in a container with **no C toolchain (`cc` absent, so
+  every build script fails) and no `qemu-system-aarch64`**, so `./arroyo check` and `./arroyo kernel8-test`
+  **could not be run and are unverified**; only a parse-level syntax check of the two edited files was
+  possible. The change is metal-behaviour-only by construction (QEMU raspi4b delivers no HID, so no real
+  pointer report exists on any gate boot, and the selftest's synthetic events stay suppressed exactly as
+  before), but the gates still owe a run before this is trusted.
 
 - **VUGPAUSE (a paused vug stops burning cores)** — an **app-only** arc: `crates/user-vug` + this doc, no
   kernel change. **VUGCLICK** made a click *pause* a vug, and that is as far as it went: pause froze the
