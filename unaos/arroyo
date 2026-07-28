@@ -483,7 +483,8 @@ prepare_aarch64() {
     local USB_IMG="${WORKSPACE_DIR}/builder/usb.img"
     if [ ! -f "$USB_IMG" ]; then
         echo -e "${COLOR_YELLOW}⚡ Creating usb.img (64 MiB, signed)...${COLOR_RESET}"
-        dd if=/dev/zero of="$USB_IMG" bs=1m count=0 seek=64 2>/dev/null
+        # bs in bytes: GNU dd (Linux) rejects the BSD `1m` suffix
+        dd if=/dev/zero of="$USB_IMG" bs=1048576 count=0 seek=64 2>/dev/null
         printf 'UNA-OS-DISK-001-ALPHA' | dd of="$USB_IMG" conv=notrunc 2>/dev/null
     fi
 }
@@ -789,7 +790,9 @@ k8_lock_acquire() {
     mkdir -p "${WORKSPACE_DIR}/target"
     while ! mkdir "$K8_LOCKDIR" 2>/dev/null; do
         holder=$(cat "$K8_LOCKDIR/pid" 2>/dev/null || echo "")
-        mtime=$(stat -f %m "$K8_LOCKDIR" 2>/dev/null || echo 0)
+        # BSD stat first, GNU stat second — the `|| echo 0` fallback alone would make every
+        # contended wait on Linux read age=huge and false-reclaim a live holder's lock
+        mtime=$(stat -f %m "$K8_LOCKDIR" 2>/dev/null || stat -c %Y "$K8_LOCKDIR" 2>/dev/null || echo 0)
         now=$(date +%s); age=$(( now - mtime ))
         if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
             echo -e "${COLOR_YELLOW}kernel8: stale build lock reclaimed — holder PID $holder dead (age ${age}s)${COLOR_RESET}" >&2

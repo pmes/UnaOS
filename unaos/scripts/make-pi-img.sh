@@ -32,6 +32,15 @@
 set -euo pipefail
 SRC="${1:?src dir}"; OUT="${2:?out.img}"; SIZE_MB="${3:-256}"; UNAFS_IMG="${4:-}"
 
+# Host-OS branch (2026-07-28, bench moved to Linux): Darwin keeps the hdiutil/diskutil path
+# below byte-identical; Linux builds the SAME layout rootlessly — hand-written MBR entry,
+# mkfs.fat --offset for the FAT32 volume, mcopy (mtools) for the boot files. The byte-offset
+# tail (0x0C type patch + unafs partition 2) is shared by both.
+OS="$(uname -s)"
+fsize() { if [ "$OS" = Darwin ]; then stat -f %z "$1"; else stat -c %s "$1"; fi; }
+fmtime() { if [ "$OS" = Darwin ]; then stat -f %m "$1" 2>/dev/null || echo 0; else stat -c %Y "$1" 2>/dev/null || echo 0; fi; }
+sha16() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1"; else sha256sum "$1"; fi | cut -c1-16; }
+
 # ---- BUILD-2 concurrency guards -------------------------------------------------------------
 LOCK_WAIT_SECS="${MAKEPI_LOCK_WAIT_SECS:-1200}"   # a waiter blocks at most this long
 LOCK_STALE_SECS="${MAKEPI_LOCK_STALE_SECS:-900}"  # a lock older than this (w/ dead PID or not) is breakable
@@ -50,7 +59,7 @@ fi
 
 cleanup() {
     local rc=$?
-    [ -n "$DEV" ] && hdiutil detach "$DEV" >/dev/null 2>&1 || true
+    [ -n "$DEV" ] && [ "$OS" = Darwin ] && hdiutil detach "$DEV" >/dev/null 2>&1 || true
     [ -n "$MNT" ] && rmdir "$MNT" 2>/dev/null || true
     [ -n "$LOCK_HELD" ] && rm -rf "$LOCKDIR" 2>/dev/null || true
     return $rc
@@ -59,6 +68,7 @@ trap cleanup EXIT INT TERM
 
 # Detach any lingering hdiutil attach of THIS image (crashed-run strand). Whole-disk devices only.
 reclaim_stale_attach() {
+    [ "$OS" = Darwin ] || return 0   # Linux never attaches the image as a device
     local devs
     devs=$(hdiutil info 2>/dev/null | awk -v want="$OUT_ABS" '
         /^image-path[ \t]*:/ { p=$0; sub(/^image-path[ \t]*:[ \t]*/,"",p); path=p }
@@ -75,7 +85,7 @@ acquire_lock() {
     local waited=0 dotted=0 holder mtime now age
     while ! mkdir "$LOCKDIR" 2>/dev/null; do
         holder=$(cat "$LOCKDIR/pid" 2>/dev/null || echo "")
-        mtime=$(stat -f %m "$LOCKDIR" 2>/dev/null || echo 0)
+        mtime=$(fmtime "$LOCKDIR")
         now=$(date +%s); age=$(( now - mtime ))
         if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
             echo "make-pi-img: stale lock reclaimed — holder PID $holder is dead (lock age ${age}s)" >&2
@@ -110,7 +120,7 @@ reclaim_stale_attach
 UNAFS_MB=8
 if [ -n "$UNAFS_IMG" ]; then
     [ -f "$UNAFS_IMG" ] || { echo "unafs image not found: $UNAFS_IMG" >&2; exit 1; }
-    UNAFS_BYTES=$(stat -f %z "$UNAFS_IMG")
+    UNAFS_BYTES=$(fsize "$UNAFS_IMG")
     [ "$UNAFS_BYTES" -le $((UNAFS_MB * 1024 * 1024)) ] || {
         echo "unafs image ${UNAFS_BYTES}B exceeds the ${UNAFS_MB}MB reserved tail" >&2; exit 1; }
     FAT_SPEC="$((SIZE_MB - UNAFS_MB))M"
@@ -118,42 +128,64 @@ else
     FAT_SPEC="100%"
 fi
 
-dd if=/dev/zero of="$OUT" bs=1m count="$SIZE_MB" 2>/dev/null
-DEV=$(hdiutil attach -nomount "$OUT" | awk 'NR==1{print $1; exit}')
-# (cleanup trap already installed above detaches $DEV on any exit path)
-if [ -n "$UNAFS_IMG" ]; then
-    diskutil partitionDisk "$DEV" 2 MBR "MS-DOS FAT32" UNAOS-PI "$FAT_SPEC" "Free Space" FREE R >/dev/null
+le32() { # $1 = u32 value -> 4 LE bytes on stdout
+    printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' \
+        $(($1 & 255)) $((($1 >> 8) & 255)) $((($1 >> 16) & 255)) $((($1 >> 24) & 255)))"
+}
+
+if [ "$OS" = Darwin ]; then
+    dd if=/dev/zero of="$OUT" bs=1m count="$SIZE_MB" 2>/dev/null
+    DEV=$(hdiutil attach -nomount "$OUT" | awk 'NR==1{print $1; exit}')
+    # (cleanup trap already installed above detaches $DEV on any exit path)
+    if [ -n "$UNAFS_IMG" ]; then
+        diskutil partitionDisk "$DEV" 2 MBR "MS-DOS FAT32" UNAOS-PI "$FAT_SPEC" "Free Space" FREE R >/dev/null
+    else
+        diskutil partitionDisk "$DEV" 1 MBR "MS-DOS FAT32" UNAOS-PI 100% >/dev/null
+    fi
+    # NEVER address the volume by /Volumes name: if a physical card/stick named UNAOS is mounted,
+    # partitionDisk's auto-mount lands the image at "/Volumes/UNAOS 1" and a name-addressed ditto
+    # writes onto the PHYSICAL medium (found the hard way, 2026-07-07: a Pi boot set ditto'd onto
+    # the Orin boot stick). Detach and re-attach the image at a private mountpoint instead — the
+    # ditto target is then the image by construction, whatever else is mounted.
+    hdiutil detach "$DEV" >/dev/null
+    DEV=""
+    MNT=$(mktemp -d "${TMPDIR:-/tmp}/unaos-pi-img.XXXXXX")
+    DEV=$(hdiutil attach -mountpoint "$MNT" "$OUT" | awk 'NR==1{print $1; exit}')
+    # (cleanup trap detaches $DEV and rmdir's $MNT on any exit path)
+    ditto "$SRC" "$MNT"
+    dot_clean -m "$MNT" 2>/dev/null || true
+    hdiutil detach "$DEV" >/dev/null
+    DEV=""
+    rmdir "$MNT" 2>/dev/null || true
+    MNT=""
 else
-    diskutil partitionDisk "$DEV" 1 MBR "MS-DOS FAT32" UNAOS-PI 100% >/dev/null
+    # Linux: no device attach at all — the image is only ever addressed as a file, so the
+    # /Volumes-class hazard above cannot arise. Same layout as diskutil produces: partition 1
+    # from the 1 MB boundary (LBA 2048) to FAT_SPEC, typed 0x0C below, label UNAOS-PI.
+    dd if=/dev/zero of="$OUT" bs=1048576 count="$SIZE_MB" 2>/dev/null
+    P1_START=2048
+    if [ -n "$UNAFS_IMG" ]; then
+        P1_COUNT=$(( (SIZE_MB - UNAFS_MB) * 2048 - P1_START ))
+    else
+        P1_COUNT=$(( SIZE_MB * 2048 - P1_START ))
+    fi
+    # MBR entry 1 at 446: status 0x00, CHS fillers 0xFF (LBA world), type 0x0C, start, count;
+    # boot signature 0x55AA at 510.
+    { printf '\x00\xff\xff\xff\x0c\xff\xff\xff'; le32 "$P1_START"; le32 "$P1_COUNT"; } \
+        | dd of="$OUT" bs=1 seek=446 count=16 conv=notrunc 2>/dev/null
+    printf '\x55\xaa' | dd of="$OUT" bs=1 seek=510 count=2 conv=notrunc 2>/dev/null
+    # -F 32 forced: mkfs.fat would pick FAT16 at this size, and the Pi GPU ROM wants FAT32.
+    mkfs.fat -F 32 -n UNAOS-PI -S 512 --offset "$P1_START" "$OUT" $(( P1_COUNT / 2 )) >/dev/null
+    mcopy -s -i "$OUT@@$(( P1_START * 512 ))" "$SRC"/* ::/
 fi
-# NEVER address the volume by /Volumes name: if a physical card/stick named UNAOS is mounted,
-# partitionDisk's auto-mount lands the image at "/Volumes/UNAOS 1" and a name-addressed ditto
-# writes onto the PHYSICAL medium (found the hard way, 2026-07-07: a Pi boot set ditto'd onto
-# the Orin boot stick). Detach and re-attach the image at a private mountpoint instead — the
-# ditto target is then the image by construction, whatever else is mounted.
-hdiutil detach "$DEV" >/dev/null
-DEV=""
-MNT=$(mktemp -d "${TMPDIR:-/tmp}/unaos-pi-img.XXXXXX")
-DEV=$(hdiutil attach -mountpoint "$MNT" "$OUT" | awk 'NR==1{print $1; exit}')
-# (cleanup trap detaches $DEV and rmdir's $MNT on any exit path)
-ditto "$SRC" "$MNT"
-dot_clean -m "$MNT" 2>/dev/null || true
-hdiutil detach "$DEV" >/dev/null
-DEV=""
-rmdir "$MNT" 2>/dev/null || true
-MNT=""
 # The Pi GPU ROM wants the FAT32 partition typed 0x0C (LBA); diskutil makes 0x0B (CHS). Patch the MBR
-# partition-1 type byte at offset 450.
+# partition-1 type byte at offset 450. (The Linux branch already wrote 0x0C; idempotent there.)
 printf '\x0c' | dd of="$OUT" bs=1 seek=450 count=1 conv=notrunc 2>/dev/null
 
 # BeFS-K3: write the unafs partition — MBR entry 2 (type 0x7f, offset 462) pointing at the
 # reserved tail, then the raw volume bytes at that LBA. Done entirely by byte offset into the
 # detached image file, so no volume ever mounts and no /Volumes name is ever addressed.
 if [ -n "$UNAFS_IMG" ]; then
-    le32() { # $1 = u32 value -> 4 LE bytes on stdout
-        printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' \
-            $(($1 & 255)) $((($1 >> 8) & 255)) $((($1 >> 16) & 255)) $((($1 >> 24) & 255)))"
-    }
     # Partition 1 extent from its MBR entry (LBA start at 454, sector count at 458, both LE u32).
     P1_START=$(dd if="$OUT" bs=1 skip=454 count=4 2>/dev/null | od -An -tu4 | tr -d ' ')
     P1_COUNT=$(dd if="$OUT" bs=1 skip=458 count=4 2>/dev/null | od -An -tu4 | tr -d ' ')
@@ -169,4 +201,4 @@ if [ -n "$UNAFS_IMG" ]; then
     dd if="$UNAFS_IMG" of="$OUT" bs=512 seek="$P2_START" conv=notrunc 2>/dev/null
     echo "unafs partition: LBA $P2_START, $P2_COUNT sectors (volume $(du -h "$UNAFS_IMG" | cut -f1))"
 fi
-echo "built $OUT  ($(du -h "$OUT" | cut -f1), sha256 $(shasum -a 256 "$OUT" | cut -c1-16)...)"
+echo "built $OUT  ($(du -h "$OUT" | cut -f1), sha256 $(sha16 "$OUT")...)"
