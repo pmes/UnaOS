@@ -29,6 +29,16 @@
 #      we proceed.
 # Everything below the guards is byte-identical to the pre-BUILD-2 script (layout, ditto,
 # UNAOS-PI label, MBR patching). Env knobs: MAKEPI_LOCK_WAIT_SECS, MAKEPI_LOCK_STALE_SECS.
+#
+# SOURCE-ALONG: every image carries the exact source tree that built it, as two extra files in
+# the FAT32 root next to kernel8.img:
+#   SRC.TGZ — a DETERMINISTIC gzip'd tar of the repo source (no target/, no .git/, nothing
+#             .gitignore'd), so a running system (and the ledger) can always answer "what code
+#             is this"; same tree in => same bytes out.
+#   SRC.SHA — one line: "<sha256>  SRC.TGZ", verifiable with `sha256sum -c` against SRC.TGZ.
+# Both 8.3-clean, so the kernel's read-only FAT reader can name them. Default ON (measured
+# +1.3 s / 5.24 MiB on the pi4 tree — far under the "slow enough to skip for tests" bar);
+# UNAOS_NOSRC=1 skips the whole block. See docs/dev/OS/01_BOOT_HAL/arch_arm64.md §SOURCE-ALONG.
 set -euo pipefail
 SRC="${1:?src dir}"; OUT="${2:?out.img}"; SIZE_MB="${3:-256}"; UNAFS_IMG="${4:-}"
 
@@ -39,7 +49,8 @@ SRC="${1:?src dir}"; OUT="${2:?out.img}"; SIZE_MB="${3:-256}"; UNAFS_IMG="${4:-}
 OS="$(uname -s)"
 fsize() { if [ "$OS" = Darwin ]; then stat -f %z "$1"; else stat -c %s "$1"; fi; }
 fmtime() { if [ "$OS" = Darwin ]; then stat -f %m "$1" 2>/dev/null || echo 0; else stat -c %Y "$1" 2>/dev/null || echo 0; fi; }
-sha16() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1"; else sha256sum "$1"; fi | cut -c1-16; }
+sha256hex() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1"; else sha256sum "$1"; fi | awk '{print $1}'; }
+sha16() { sha256hex "$1" | cut -c1-16; }
 
 # ---- BUILD-2 concurrency guards -------------------------------------------------------------
 LOCK_WAIT_SECS="${MAKEPI_LOCK_WAIT_SECS:-1200}"   # a waiter blocks at most this long
@@ -48,6 +59,7 @@ LOCKDIR="${OUT}.buildlock"
 LOCK_HELD=""   # set once we own LOCKDIR
 DEV=""         # current hdiutil device; cleanup detaches it
 MNT=""         # current private mountpoint; cleanup rmdir's it
+SRCPKG=""      # SOURCE-ALONG scratch dir (SRC.TGZ/SRC.SHA); cleanup rm -rf's it
 
 # Absolute OUT path, for matching hdiutil info's resolved image-path (dirname must exist; the
 # .img itself may not yet). Falls back to OUT verbatim if the dir cannot be resolved.
@@ -61,6 +73,7 @@ cleanup() {
     local rc=$?
     [ -n "$DEV" ] && [ "$OS" = Darwin ] && hdiutil detach "$DEV" >/dev/null 2>&1 || true
     [ -n "$MNT" ] && rmdir "$MNT" 2>/dev/null || true
+    [ -n "$SRCPKG" ] && rm -rf "$SRCPKG" 2>/dev/null || true
     [ -n "$LOCK_HELD" ] && rm -rf "$LOCKDIR" 2>/dev/null || true
     return $rc
 }
@@ -128,6 +141,97 @@ else
     FAT_SPEC="100%"
 fi
 
+# ---- SOURCE-ALONG: build SRC.TGZ + SRC.SHA -------------------------------------------------
+# Determinism is the whole point (the ledger compares SRC.SHA across builds), so the tarball is a
+# pure function of the source TREE — not of the clock, the uid, the readdir order, or which commit
+# happens to be checked out:
+#   * content set: taken from git, so target/, .git/ and everything .gitignore'd are excluded by
+#     construction (no exclude list to drift).
+#   * dirty worktrees: we do NOT stash and do NOT touch the real index. `git read-tree` + `git add -A`
+#     against a THROWAWAY GIT_INDEX_FILE builds a tree object from the working tree (uncommitted edits
+#     and untracked-but-not-ignored files included), which `git write-tree` names. On a clean worktree
+#     that tree is bit-identical to HEAD^{tree}, so clean and dirty take the same code path.
+#   * bytes: `git archive` of a TREE (never a commit — a commit-ish would inject a pax_global_header
+#     carrying the commit sha, making the same tree hash differently from different branches). Entries
+#     come out sorted, uid/gid 0, mode normalized. `--mtime` is REQUIRED and must be an approxidate git
+#     actually parses: "@0" is NOT parsed and silently falls back to *now* (measured), so we pin
+#     1980-01-01 (@315532800, the FAT epoch) and the tar is stable across runs.
+#   * gzip -n: no name, no timestamp in the gzip header. The tar is written to a FILE first and then
+#     compressed; `git archive | gzip` streaming was measured to emit different deflate block
+#     boundaries run to run.
+# Non-git source trees (e.g. an image rebuilt from an unpacked SRC.TGZ — the self-hosting rung) fall
+# back to GNU tar's --sort/--mtime/--owner flags over an explicit sorted member list, which gives the
+# same determinism (it cannot honor .gitignore — it prunes .git/ and target/ by name). If neither git
+# nor a GNU tar is present we FAIL the build rather than ship an image whose SRC.SHA would be a lie;
+# UNAOS_NOSRC=1 is how an operator acknowledges building a source-less image on purpose.
+SRC_ROOT="${UNAOS_SRC_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+SRC_TGZ=""; SRC_SHA=""
+if [ "${UNAOS_NOSRC:-0}" = 1 ]; then
+    echo "make-pi-img: SOURCE-ALONG skipped (UNAOS_NOSRC=1) — image will NOT carry its source" >&2
+else
+    SRCPKG=$(mktemp -d "${TMPDIR:-/tmp}/unaos-srcalong.XXXXXX")
+    SRC_TGZ="$SRCPKG/SRC.TGZ"; SRC_SHA="$SRCPKG/SRC.SHA"
+    if git -C "$SRC_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+        (
+            cd "$SRC_ROOT"
+            export GIT_INDEX_FILE="$SRCPKG/index"
+            git read-tree HEAD
+            git add -A .
+            tree=$(git write-tree)
+            git archive --format=tar --mtime=@315532800 "$tree" > "$SRCPKG/src.tar"
+        )
+    elif tar --sort=name --version >/dev/null 2>&1; then
+        # No git => no .gitignore to consult; we can only prune .git/ and target/ by name. The member
+        # list is built explicitly (find | sed | sort + --no-recursion) so entry names come out
+        # repo-root-relative with NO "./" prefix, byte-matching the git-archive path's naming.
+        (cd "$SRC_ROOT" && find . -mindepth 1 \
+            \( -name .git -o -name target \) -prune -o -print) \
+            | sed 's|^\./||' | LC_ALL=C sort > "$SRCPKG/list"
+        tar --sort=name --mtime=@315532800 --owner=0 --group=0 --numeric-owner --no-recursion \
+            -C "$SRC_ROOT" -cf "$SRCPKG/src.tar" -T "$SRCPKG/list"
+        rm -f "$SRCPKG/list"
+    else
+        echo "make-pi-img: SOURCE-ALONG unavailable — $SRC_ROOT is not a git worktree and this host's" >&2
+        echo "             tar lacks --sort/--mtime (no deterministic tarball possible). Set UNAOS_NOSRC=1" >&2
+        echo "             to acknowledge, or build from a git checkout." >&2
+        exit 1
+    fi
+    gzip -n -c "$SRCPKG/src.tar" > "$SRC_TGZ"
+    rm -f "$SRCPKG/src.tar"
+    printf '%s  SRC.TGZ\n' "$(sha256hex "$SRC_TGZ")" > "$SRC_SHA"
+fi
+
+# Size check BEFORE we format anything: refuse to build rather than let mcopy/ditto truncate the
+# payload into a too-small volume. FAT32 overhead (2 FATs + reserved + cluster round-up) is a low
+# single-digit MB at these sizes; SLACK_MB is the honest margin.
+FAT_MB=$(( SIZE_MB ))
+if [ -n "$UNAFS_IMG" ]; then FAT_MB=$(( SIZE_MB - UNAFS_MB )); fi
+SLACK_MB=4
+PAYLOAD_BYTES=0
+for f in "$SRC"/*; do [ -e "$f" ] || continue; PAYLOAD_BYTES=$(( PAYLOAD_BYTES + $(du -sk "$f" | awk '{print $1}') * 1024 )); done
+if [ -n "$SRC_TGZ" ]; then PAYLOAD_BYTES=$(( PAYLOAD_BYTES + $(fsize "$SRC_TGZ") + $(fsize "$SRC_SHA") )); fi
+FAT_CAP_BYTES=$(( (FAT_MB - SLACK_MB) * 1024 * 1024 ))
+if [ "$PAYLOAD_BYTES" -gt "$FAT_CAP_BYTES" ]; then
+    echo "make-pi-img: FAT partition too small — payload $(( PAYLOAD_BYTES / 1024 / 1024 )) MB (incl." >&2
+    echo "             $( [ -n "$SRC_TGZ" ] && echo "SRC.TGZ $(( $(fsize "$SRC_TGZ") / 1024 / 1024 )) MB" || echo 'no SRC.TGZ')) exceeds ${FAT_MB} MB FAT minus ${SLACK_MB} MB slack." >&2
+    echo "             GROW the size_mb argument in arroyo's make-pi-img.sh call (currently ${SIZE_MB} MB)." >&2
+    exit 1
+fi
+
+# Read SRC.TGZ back OUT of the finished volume and re-hash it against SRC.SHA. This is the whole
+# point of the size check made honest: a FAT that silently dropped or truncated the payload fails
+# here, at build time, instead of on a flashed card. $1 = the read-back copy.
+srcalong_verify() {
+    local got want
+    got=$(sha256hex "$1")
+    want=$(awk '{print $1}' < "$SRC_SHA")
+    if [ "$got" != "$want" ]; then
+        echo "make-pi-img: SOURCE-ALONG readback MISMATCH — SRC.TGZ in the image hashes $got," >&2
+        echo "             SRC.SHA says $want. The FAT volume did not take the payload intact." >&2
+        exit 1
+    fi
+}
+
 le32() { # $1 = u32 value -> 4 LE bytes on stdout
     printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' \
         $(($1 & 255)) $((($1 >> 8) & 255)) $((($1 >> 16) & 255)) $((($1 >> 24) & 255)))"
@@ -153,6 +257,12 @@ if [ "$OS" = Darwin ]; then
     DEV=$(hdiutil attach -mountpoint "$MNT" "$OUT" | awk 'NR==1{print $1; exit}')
     # (cleanup trap detaches $DEV and rmdir's $MNT on any exit path)
     ditto "$SRC" "$MNT"
+    # SOURCE-ALONG: the tarball lives outside $SRC (make-pi-img never mutates its input staging dir),
+    # so it is copied into the FAT root explicitly, after the staging tree.
+    if [ -n "$SRC_TGZ" ]; then
+        cp "$SRC_TGZ" "$SRC_SHA" "$MNT/"
+        srcalong_verify "$MNT/SRC.TGZ"
+    fi
     dot_clean -m "$MNT" 2>/dev/null || true
     hdiutil detach "$DEV" >/dev/null
     DEV=""
@@ -177,6 +287,13 @@ else
     # -F 32 forced: mkfs.fat would pick FAT16 at this size, and the Pi GPU ROM wants FAT32.
     mkfs.fat -F 32 -n UNAOS-PI -S 512 --offset "$P1_START" "$OUT" $(( P1_COUNT / 2 )) >/dev/null
     mcopy -s -i "$OUT@@$(( P1_START * 512 ))" "$SRC"/* ::/
+    # SOURCE-ALONG (see the Darwin branch note): copied explicitly, not via $SRC.
+    if [ -n "$SRC_TGZ" ]; then
+        mcopy -o -i "$OUT@@$(( P1_START * 512 ))" "$SRC_TGZ" "$SRC_SHA" ::/
+        mcopy -n -i "$OUT@@$(( P1_START * 512 ))" ::/SRC.TGZ "$SRCPKG/readback.tgz"
+        srcalong_verify "$SRCPKG/readback.tgz"
+        rm -f "$SRCPKG/readback.tgz"
+    fi
 fi
 # The Pi GPU ROM wants the FAT32 partition typed 0x0C (LBA); diskutil makes 0x0B (CHS). Patch the MBR
 # partition-1 type byte at offset 450. (The Linux branch already wrote 0x0C; idempotent there.)
@@ -200,5 +317,8 @@ if [ -n "$UNAFS_IMG" ]; then
         | dd of="$OUT" bs=1 seek=462 count=16 conv=notrunc 2>/dev/null
     dd if="$UNAFS_IMG" of="$OUT" bs=512 seek="$P2_START" conv=notrunc 2>/dev/null
     echo "unafs partition: LBA $P2_START, $P2_COUNT sectors (volume $(du -h "$UNAFS_IMG" | cut -f1))"
+fi
+if [ -n "$SRC_TGZ" ]; then
+    echo "source-along: SRC.TGZ $(( $(fsize "$SRC_TGZ") / 1024 )) KiB in the FAT root, SRC.SHA $(cut -c1-16 < "$SRC_SHA")... (tree $SRC_ROOT)"
 fi
 echo "built $OUT  ($(du -h "$OUT" | cut -f1), sha256 $(sha16 "$OUT")...)"
