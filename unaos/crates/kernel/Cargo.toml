@@ -79,6 +79,17 @@ k2_leave = []
 # Read-only telemetry; DEFAULT OFF => the reporter and its call site vanish. The SMPEN *set* itself is
 # always on (required configuration per the A72 TRM, not a workaround). Enable via `UNAOS_SMP8=1`.
 smp8 = []
+# WEDGE-2: last-words breadcrumbs for the TAB->focus-raise chain (`src/wedge2.rs`). Writes a fixed
+# four-byte token (`<F1>`..`<F9>`, plus `<f7>`/`<f8>` for a CONCURRENT composite on another core)
+# straight at the UART data register BEFORE each phase of the chain — lock-free, unbuffered, bounded —
+# so that when a core dies with IRQs masked mid-phase the LAST token on the torn wire names the phase
+# that died. P66/P67v2/P68 (silicon) and x86 s44 all ended with `[wc-fv] focus raise` then silence,
+# with WEDGE-1's `DRAIN STALLED` tripwire never firing, so the mechanism is arch-neutral and lives
+# somewhere in that chain. INSTRUMENTATION ONLY — no fix, no behaviour change, no new locks, and the
+# breadcrumb path takes NO existing lock. DEFAULT OFF => every call site vanishes, `mark` is an empty
+# inline fn, and no `<F` token exists in the image (the regression gate runs knob-off and must be
+# unchanged-green). Enable via `UNAOS_WEDGE2=1`. Token table: docs/dev/OS/08_VIDEO/engine.md §WEDGE-2.
+wedge2 = []
 # Run the SMP scheduler demo/self-test at boot (spawns demo threads across the APs, incl. the RwLock
 # torn-read check). Opt-in via `UNAOS_SCHED_DEMO=1`: it's a QEMU-verified smoke test whose tick-based
 # timing stalls boot for minutes on real hardware (uncalibrated APIC timer). Off => scheduler still

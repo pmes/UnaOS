@@ -106,6 +106,11 @@ pub mod user;
 pub mod splash;
 pub mod vug;
 pub mod gui_watchdog;
+// WEDGE-2: the last-words breadcrumb instrument for the TAB->focus-raise chain. ALWAYS declared (its
+// public surface degrades to empty `#[inline(always)]` shims when the `wedge2` feature is off), so the
+// call sites in `video/wm.rs` and the focus seam stay `#[cfg]`-free and arch-neutral — which is what
+// makes this diff inheritable by the x86 tree. Knob-off is byte-inert.
+pub mod wedge2;
 
 pub fn init() {
     arch::init();

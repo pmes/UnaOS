@@ -85,3 +85,34 @@ macro_rules! serial_println {
     () => ($crate::arch::serial::_print(format_args!("\n")));
     ($($arg:tt)*) => ($crate::arch::serial::_print(format_args!("{}\n", format_args!($($arg)*))));
 }
+
+/// WEDGE-2 — the x86_64 half of the breadcrumb seam: one byte at the UART, **taking no lock**.
+///
+/// Deliberately NOT `SERIAL1`: that is a `Mutex<Option<Uart16550Tty<_>>>`, and a breadcrumb whose job
+/// is to survive a core dying with IRQs masked must never be able to block. This is the bare 16550
+/// sequence instead — a bounded poll of `LSR` bit 5 (transmitter holding register empty) at
+/// `0x3F8 + 5`, then one `out` to the THR at `0x3F8`. It acquires nothing: not `SERIAL1`, not `FBCON`,
+/// not the video locks, not the allocator — all of which are reachable from the focus chain WEDGE-2
+/// instruments. The spin is bounded so a machine with no 16550 degrades instead of hanging.
+///
+/// s44 (the x86 reproduction, capture truncated mid-word) is why this exists on this arch at all: the
+/// mechanism is arch-neutral, so the instrumentation has to be portable and only this function is not.
+/// See `crate::wedge2` for the token table and the interleaving trade-off.
+#[cfg(feature = "wedge2")]
+#[inline(never)]
+pub fn wedge2_raw_byte(byte: u8) {
+    use x86_64::instructions::port::Port;
+    unsafe {
+        let mut lsr: Port<u8> = Port::new(0x3F8 + 5);
+        let mut thr: Port<u8> = Port::new(0x3F8);
+        let mut spins: u32 = 0;
+        while (lsr.read() & (1 << 5)) == 0 {
+            spins += 1;
+            if spins > 1_000_000 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        thr.write(byte);
+    }
+}

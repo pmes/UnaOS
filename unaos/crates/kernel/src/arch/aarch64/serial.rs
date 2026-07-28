@@ -145,6 +145,26 @@ lazy_static! {
     pub static ref SERIAL_PORT: Mutex<SerialPort> = Mutex::new(SerialPort::new());
 }
 
+/// WEDGE-2 — the aarch64 half of the breadcrumb seam: one byte at the UART, **taking no lock**.
+///
+/// `SerialPort::write_byte` is already exactly that — a bounded volatile poll of the PL011 `FR`
+/// TX-full bit (or the Tegra NS16550 `LSR`) followed by one volatile store to the data register. It
+/// is a method on a unit struct, so calling it does NOT require `SERIAL_PORT`, and nothing in
+/// `crate::wedge2`'s call chain acquires `SERIAL_PORT`, `FBCON`, `WRITER`, `TABLE`, `SPRITE` or the
+/// allocator. That is the whole property WEDGE-2 needs: every one of those locks is reachable from
+/// the focus chain being instrumented, so a breadcrumb that could block on one would be missing in
+/// precisely the runs it exists for. The cost is that a token may interleave with another core's
+/// in-progress `serial_println!` line; see `crate::wedge2` for why that is the right trade for a
+/// last-words instrument.
+///
+/// The x86 tree inherits WEDGE-2 by porting this one function (`arch/x86_64/serial.rs`) — everything
+/// above it is arch-neutral.
+#[cfg(feature = "wedge2")]
+#[inline(never)]
+pub fn wedge2_raw_byte(byte: u8) {
+    SerialPort.write_byte(byte);
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     // Guard the serial lock with interrupts masked (matching x86) so an interrupt handler that

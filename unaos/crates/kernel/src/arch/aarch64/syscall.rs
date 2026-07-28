@@ -11731,6 +11731,11 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
         crate::pal::Event::KeyUp(K_TAB) => false,
         _ => return false,
     };
+    // WEDGE-2 `<F1>` — a TAB edge has been recognised and the chain begins. Emitted BEFORE
+    // `focus_ring`, which takes the window TABLE lock: a `<F1>` with no successor means the chain
+    // died reading the ring, i.e. against `TABLE`. Both entry points (the in-ring router seam and
+    // `wc_shell_focus_key`) funnel through this one body, so one token covers both.
+    crate::wedge2::mark("<F1>");
     let mut ring = [0u64; crate::video::wm::MAX_WINDOWS];
     let n = crate::video::wm::focus_ring(&mut ring);
     let cur = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
@@ -11774,7 +11779,16 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
     if next == cur {
         return true;
     }
+    // WEDGE-2 `<F2>` — the ring was read and a destination chosen; the focus PRIMITIVE is next.
+    // `el0_input_set_active` clears the target's ring and drains up to 64 events off
+    // `pal::EVENT_QUEUE` (a bounded loop against a live producer), so a `<F2>` with no `<F3>` puts
+    // the death in the input-queue drain rather than anywhere in the compositor.
+    crate::wedge2::mark("<F2>");
     el0_input_set_active(next);
+    // WEDGE-2 `<F3>` — focus routing has moved; the VISIBLE half is next. This is the seam the three
+    // silicon wedges all crossed: `[wc-fv] focus raise` is printed from inside `focus_changed`, so
+    // every recorded wedge got at least this far.
+    crate::wedge2::mark("<F3>");
     // FOCUS-VIS — the other half of a focus change. `el0_input_set_active` moves where KEYSTROKES go;
     // this moves what the PANEL shows. P59's bench report is what happens when only the first exists:
     // `[wc-c] focus tab-cycle` fired on every press and nothing on screen moved, so the newly focused
@@ -11782,6 +11796,12 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
     // `focus_changed` treats it as a first-class member of the z-order (raise the shell, drop the
     // windows below it, ask the desktop for a full present) rather than as "no window focused".
     crate::video::wm::focus_changed(next);
+    // WEDGE-2 `<F9>` — `focus_changed` RETURNED and this core is about to fall back into the input
+    // pump. A wire that reaches `<F9>` has exonerated the whole focus path for that press. The
+    // `[wc-c]` line below is the ordinary witness, but it takes the serial lock and is buffered
+    // behind it, so the TOKEN is what proves the return, not the line. (The chain claim is released
+    // inside `focus_changed` itself, on every path out of it — see the note there.)
+    crate::wedge2::mark("<F9>");
     serial_println!(
         "[wc-c] focus tab-cycle {} -> {} (ring of {} + shell)",
         cur,
