@@ -1939,6 +1939,77 @@
   report — the idle path itself is metal-only by nature (no HID in QEMU → no pause), so it is
   **unverified in QEMU** and is for the next attended boot to confirm; what QEMU proves is the negative,
   that the deterministic path is untouched.
+- **KEYSTAT (this arc)** — an **audit** arc: two P69 attended anomalies traced to their exact
+  predicates. One reporting hole fixed (`arch/aarch64/exceptions.rs`); the other chain is named and
+  left alone, because its fix lands outside this arc's lane.
+
+  **Anomaly 1 — "key repeat times out".** Holding a key repeats for a while and then stops with the
+  key still down. There is no repeat *counter* and no per-hold budget; the bound is a **liveness
+  window**, and there are two of them. `typematic_tick` (`pal.rs`) picks the window at
+  `let window = if STREAMS_WHILE_HELD { LIVENESS_MS } else { HOLD_MAX_MS }` and disarms on
+  `last != 0 && now - last > window` — `KEY_P1 = 0`, repeat over.
+  - **Chain A — the UVUG-9 backstop.** `HOLD_MAX_MS = 30_000`. A strict `SET_IDLE(0)` keyboard sends
+    one report on the press and nothing more, so `LAST_REPORT_MS` freezes at the press and the hold
+    ends at 30 s (~750 characters at `RATE_MS = 40`). This is **deliberate** — UVUG-9 chose a coarse
+    finite bound over "forever" — and it announces itself: `[uvug9] typematic hold-max …`.
+  - **Chain B — the sticky streaming verdict.** `STREAMS_WHILE_HELD` latches once
+    `IDLE_RUN_TO_LATCH = 4` consecutive byte-identical held-set reports arrive during a hold, and is
+    **sticky for the rest of the boot** (cleared only on a keyboard detach). Once latched the window
+    is `LIVENESS_MS = 1000` for *every* later hold, so a keyboard that re-reports only
+    intermittently — or with a period above 1 s — stops after ~15 repeats. That disarm is
+    **deliberately silent** (see the comment at the `window == HOLD_MAX_MS` guard: the tight window's
+    disarm "is the ordinary, expected end of a hold"), so chain B leaves *nothing* on the wire and is
+    indistinguishable at the bench from the ~10-repeat stop UVUG-9 exists to have removed.
+  - **The distinguishing evidence is one line:** `[uvug9] typematic hold-max` present ⇒ chain A (30 s,
+    by design); absent ⇒ chain B.
+  - **What is arguably a bug, and why it is not fixed here.** Neither disarm re-arms. Re-arming
+    requires a PRESS edge (`typematic_note_report` stores `KEY_P1` only when `newest_press != 0`), so
+    a report that positively proves the key is *still held* (`held.contains(&k)`) cannot restart the
+    repeat — the operator must lift and re-press. For chain B that is a plain non-re-arming cap: the
+    tracker disarms on silence and then ignores the very evidence that would refute it. The repair
+    belongs in `crates/kernel/src/pal.rs`, which is **outside this arc's lane** (`arch/aarch64` +
+    `user-stat`), so it is recorded here rather than attempted. Suggested shape for whoever owns it:
+    on a post-disarm report whose held set still contains the last-armed ascii, re-arm at
+    `DELAY_MS`; and scope the `STREAMS_WHILE_HELD` verdict to the hold that earned it rather than to
+    the boot.
+
+  **Anomaly 2 — a `stat` instance died with nothing on the wire.** `kill <pid>` answered
+  ``already exited — run `jobs` to reap it``, which is `bg_kill`'s **`PEXITED`** early-out. Working
+  back from that state, a `Proc` row on aarch64 reaches `PEXITED` from exactly three places, and only
+  two of them can name a `bg` app:
+  1. **`SYS_EXIT`, generic live-child arm** (`syscall.rs`, `proc_find_running` → `status`/`PEXITED`/
+     `done.post()`) — **silent by design**; a normal EL0 exit prints nothing.
+  2. **fault-kill** (`record_el0_kill`'s EXEC-1 arm → `EXEC_KILLED_STATUS` + `PEXITED`), always
+     preceded by the `:: EL0 FAULT: … KILLED … ::` line in `aarch64_el0_fault_handler`.
+  3. the named-fixture arms (`u4-child`, `el0-u7*`, K2/midden, …) — unreachable for a `bg` app.
+
+  Everything else that retires an EL0 task leaves the row **`PRUNNING`**, not `PEXITED`:
+  `kill_check_current` and `retire_killed` (SKILL-1's two kill boundaries) post no status, so a
+  SKILL-1 kill reads as `running` / `kill armed but unconfirmed`, never `already exited`. The
+  `[uvug8]` orphan arms and the `BGRUN-SCAV` / `KILLBOUND` reclaims all print, and the latter two
+  leave `gone`, not `already exited`.
+
+  **`crates/user-stat` has no designed exit that could account for it.** The loop has no frame cap,
+  no timeout and no input-driven quit (it never calls `SYS_INPUT_POLL` at all); `SYS_WIN_PRESENT`'s
+  return is explicitly discarded and `getinfo()` falls back to pid 0 rather than exiting. The single
+  `exit(1)` is the `SYS_WIN_CREATE` failure at startup — before any window exists, so it cannot
+  explain an app that was on the panel — and it prints `:: STAT: SYS_WIN_CREATE failed ::` first.
+  (`ALIVE_MARK = 40` is a one-shot print, not a cap.) The VUGLIFE-era "run deadline masquerading as a
+  crash" shape is **not** present in this app.
+
+  **Which leaves the reporting hole, and it is a real one.** A fatal EL0 fault does print — but the
+  line named only the **task name**, and every `bg` launch runs under the single literal `"bg-el0"`
+  (`spawn_user_image_bg`). With two `STAT.ELF` instances on the panel, the line said "one of them
+  died" and nothing more; the operator's `kill <pid>` was the first evidence of *which*, and the
+  death reads as silent. **Fix:** `aarch64_el0_fault_handler` now prints
+  `:: EL0 FAULT: task '<name>' pid=<n> KILLED — EC=… ISS=… ELR=… FAR=… ::`. `pid` comes from
+  `sched::current_id()` — the same id `SYS_GETPID`/`SYS_GETINFO` return, the same value
+  `spawn_user_slot` gave the `Proc` row, the same number `jobs` prints, `kill` takes and the app
+  draws in its own window. It is **lock-free** (one `percpu` read, one `Acquire` load, one field
+  read), which is the binding constraint on this path: the handler runs at EL1 with DAIF masked on
+  the faulting task's own kernel stack and must not reach for anything the interrupted context could
+  hold. One line per kill, bounded, no new state. No spec pattern matched the old text, so
+  `pi4-regression.spec` needed no change.
 
 ### x86_64 (branch `hw-rmbp`)
 
