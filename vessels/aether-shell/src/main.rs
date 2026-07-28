@@ -4,6 +4,45 @@ use bandy::{SMessage, Synapse};
 // use quartzite::browser::bootstrap_browser;
 use aether::AetherEngine;
 
+/// Collapse a burst of shell messages that arrived while the engine was busy.
+///
+/// A single live-resize drag or a flick of the wheel can deposit dozens of
+/// messages in the broadcast channel while one relayout is running; replaying
+/// all of them means the viewport chases a backlog instead of the cursor.
+/// Two shapes, and only two:
+///
+///   * **Resize: last wins.** Every `BrowserResize` in the batch except the
+///     final one is dropped — intermediate geometries are pure work with no
+///     observable result. The survivor keeps its original position so
+///     ordering against navigation/clicks is preserved.
+///   * **Scroll: sum.** Adjacent `BrowserScroll` messages merge by adding
+///     their deltas — a scroll is a *displacement*, so dropping one would
+///     lose distance. Non-adjacent scrolls (something happened in between)
+///     are left alone.
+///
+/// Everything else passes through untouched, in order.
+fn coalesce(batch: Vec<SMessage>) -> Vec<SMessage> {
+    let last_resize = batch
+        .iter()
+        .rposition(|m| matches!(m, SMessage::BrowserResize(..)));
+    let mut out: Vec<SMessage> = Vec::with_capacity(batch.len());
+    for (i, msg) in batch.into_iter().enumerate() {
+        match msg {
+            SMessage::BrowserResize(..) if Some(i) != last_resize => continue,
+            SMessage::BrowserScroll(dx, dy) => {
+                if let Some(SMessage::BrowserScroll(px, py)) = out.last_mut() {
+                    *px += dx;
+                    *py += dy;
+                } else {
+                    out.push(SMessage::BrowserScroll(dx, dy));
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn main() {
     let synapse = Synapse::new();
     
@@ -62,75 +101,91 @@ fn main() {
                             }
                         }
                     }
-                    Ok(msg) = engine_rx.recv() => {
-                        match msg {
-                            SMessage::OpenDocument { url } => {
-                                match aether::net::fetch_page(&url).await {
-                                    Ok(page) => {
-                                        engine.load_page(page, true)
-                                    }
-                                    Err(e) => engine.load_error_page(&url, &e.to_string()),
-                                }
+                    Ok(first) = engine_rx.recv() => {
+                        // One relayout can take seconds on a heavy page, and a
+                        // live-resize drag keeps firing the whole time. Take
+                        // everything that is already waiting, collapse the
+                        // stale work out of it, and act on what is left — so
+                        // the viewport follows the cursor instead of replaying
+                        // a backlog of geometries nobody will ever see.
+                        let mut batch = vec![first];
+                        loop {
+                            match engine_rx.try_recv() {
+                                Ok(m) => batch.push(m),
+                                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                                Err(_) => break,
                             }
-                            SMessage::BrowserNavBack => {
-                                if let Some(url) = engine.get_back_url() {
-                                    let page = aether::net::fetch_page(&url).await.unwrap_or_default();
-                                    engine.load_page(page, false);
-                                }
-                            }
-                            SMessage::BrowserNavForward => {
-                                if let Some(url) = engine.get_forward_url() {
-                                    let page = aether::net::fetch_page(&url).await.unwrap_or_default();
-                                    engine.load_page(page, false);
-                                }
-                            }
-                            SMessage::BrowserNavReload => {
-                                if let Some(url) = engine.history.get(engine.history_idx).cloned() {
+                        }
+                        for msg in coalesce(batch) {
+                            match msg {
+                                SMessage::OpenDocument { url } => {
                                     match aether::net::fetch_page(&url).await {
-                                        Ok(page) => engine.load_page(page, false),
+                                        Ok(page) => {
+                                            engine.load_page(page, true)
+                                        }
                                         Err(e) => engine.load_error_page(&url, &e.to_string()),
                                     }
                                 }
-                            }
-                            SMessage::BrowserScroll(dx, dy) => {
-                                engine.handle_event(aether::api::events::Event::Scroll(dx, dy));
-                            }
-                            SMessage::BrowserClick(x, y) => {
-                                engine.handle_event(aether::api::events::Event::MouseDown(x, y));
-                                engine.handle_event(aether::api::events::Event::MouseUp(x, y));
-                                // A media-element click stages a play request:
-                                // hand the page's own stream to Stria.
-                                if let Some((url, title, mime)) = engine.take_pending_media() {
-                                    engine_tx.fire(SMessage::PlayMedia { url, title, mime });
-                                }
-                            }
-                            SMessage::BrowserResize(w, h) => {
-                                engine.handle_event(aether::api::events::Event::Resize(w, h));
-                            }
-                            SMessage::BrowserKey(key) => {
-                                engine.handle_event(aether::api::events::Event::KeyDown(key));
-                            }
-                            SMessage::BrowserText(text) => {
-                                engine.handle_event(aether::api::events::Event::Text(text));
-                            }
-                            _ => {}
-                        }
-                        // A link click or form submit staged a navigation;
-                        // run it here where awaiting is legal (the engine
-                        // thread must never block on the runtime itself).
-                        if let Some(nav) = engine.take_pending_nav() {
-                            match nav.method {
-                                aether::forms::HttpMethod::Get => {
-                                    match aether::net::fetch_page(&nav.url).await {
-                                        Ok(page) => engine.load_page(page, true),
-                                        Err(e) => engine.load_error_page(&nav.url, &e.to_string()),
+                                SMessage::BrowserNavBack => {
+                                    if let Some(url) = engine.get_back_url() {
+                                        let page = aether::net::fetch_page(&url).await.unwrap_or_default();
+                                        engine.load_page(page, false);
                                     }
                                 }
-                                aether::forms::HttpMethod::Post => {
-                                    let body = nav.body.unwrap_or_default();
-                                    match aether::net::post_document(&nav.url, &body).await {
-                                        Ok(html) => engine.load_html(&nav.url, &html, true),
-                                        Err(e) => engine.load_error_page(&nav.url, &e.to_string()),
+                                SMessage::BrowserNavForward => {
+                                    if let Some(url) = engine.get_forward_url() {
+                                        let page = aether::net::fetch_page(&url).await.unwrap_or_default();
+                                        engine.load_page(page, false);
+                                    }
+                                }
+                                SMessage::BrowserNavReload => {
+                                    if let Some(url) = engine.history.get(engine.history_idx).cloned() {
+                                        match aether::net::fetch_page(&url).await {
+                                            Ok(page) => engine.load_page(page, false),
+                                            Err(e) => engine.load_error_page(&url, &e.to_string()),
+                                        }
+                                    }
+                                }
+                                SMessage::BrowserScroll(dx, dy) => {
+                                    engine.handle_event(aether::api::events::Event::Scroll(dx, dy));
+                                }
+                                SMessage::BrowserClick(x, y) => {
+                                    engine.handle_event(aether::api::events::Event::MouseDown(x, y));
+                                    engine.handle_event(aether::api::events::Event::MouseUp(x, y));
+                                    // A media-element click stages a play request:
+                                    // hand the page's own stream to Stria.
+                                    if let Some((url, title, mime)) = engine.take_pending_media() {
+                                        engine_tx.fire(SMessage::PlayMedia { url, title, mime });
+                                    }
+                                }
+                                SMessage::BrowserResize(w, h) => {
+                                    engine.handle_event(aether::api::events::Event::Resize(w, h));
+                                }
+                                SMessage::BrowserKey(key) => {
+                                    engine.handle_event(aether::api::events::Event::KeyDown(key));
+                                }
+                                SMessage::BrowserText(text) => {
+                                    engine.handle_event(aether::api::events::Event::Text(text));
+                                }
+                                _ => {}
+                            }
+                            // A link click or form submit staged a navigation;
+                            // run it here where awaiting is legal (the engine
+                            // thread must never block on the runtime itself).
+                            if let Some(nav) = engine.take_pending_nav() {
+                                match nav.method {
+                                    aether::forms::HttpMethod::Get => {
+                                        match aether::net::fetch_page(&nav.url).await {
+                                            Ok(page) => engine.load_page(page, true),
+                                            Err(e) => engine.load_error_page(&nav.url, &e.to_string()),
+                                        }
+                                    }
+                                    aether::forms::HttpMethod::Post => {
+                                        let body = nav.body.unwrap_or_default();
+                                        match aether::net::post_document(&nav.url, &body).await {
+                                            Ok(html) => engine.load_html(&nav.url, &html, true),
+                                            Err(e) => engine.load_error_page(&nav.url, &e.to_string()),
+                                        }
                                     }
                                 }
                             }

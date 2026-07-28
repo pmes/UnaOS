@@ -99,7 +99,22 @@ pub struct FacetImageIvars {
     /// this synapse (clicks as surface-pixel BrowserClick, wheel as
     /// BrowserScroll) instead of driving facet zoom/pan.
     synapse: RefCell<Option<bandy::Synapse>>,
+
+    /// True between `viewWillStartLiveResize` and `viewDidEndLiveResize` —
+    /// i.e. while the user is dragging a window edge. Resize notifications to
+    /// the engine are throttled for the duration (see `maybe_fire_resize`).
+    live_resize: Cell<bool>,
+    /// When the last `BrowserResize` went out, for the live-resize throttle.
+    last_resize_fire: Cell<Option<std::time::Instant>>,
+    /// The geometry of the last `BrowserResize` we fired — the engine gets a
+    /// given size at most once (dedupes the guaranteed end-of-drag fire against
+    /// a throttled one that already carried the same size).
+    last_resize_sent: Cell<Option<(u32, u32)>>,
 }
+
+/// Coarse tracking cadence during a live-resize drag: one `BrowserResize` per
+/// this interval, plus a guaranteed final one when the drag ends.
+const LIVE_RESIZE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
 define_class!(
     #[unsafe(super(NSView))]
@@ -121,6 +136,9 @@ define_class!(
                 drag_anchor: Cell::new(None),
                 tracking: RefCell::new(None),
                 synapse: RefCell::new(None),
+                live_resize: Cell::new(false),
+                last_resize_fire: Cell::new(None),
+                last_resize_sent: Cell::new(None),
             });
             unsafe { msg_send![super(this), initWithFrame: frame] }
         }
@@ -143,10 +161,28 @@ define_class!(
             let _: () = unsafe { msg_send![super(self), setFrameSize: new_size] };
             // Browser surface: the viewport changed — the ENGINE reflows the
             // page to the new size and blits fresh pixels; nothing scales.
-            if let Some(syn) = self.ivars().synapse.borrow().as_ref() {
-                let (w, h) = (new_size.width.max(1.0) as u32, new_size.height.max(1.0) as u32);
-                syn.fire(bandy::SMessage::BrowserResize(w, h));
-            }
+            // A relayout costs real time on a heavy page, so a drag gets a
+            // coarse cadence, not one reflow per AppKit resize event. Any
+            // resize that is NOT a drag (zoom button, programmatic setFrame,
+            // window restore) still fires immediately.
+            self.maybe_fire_resize(new_size);
+            self.setNeedsDisplay(true);
+        }
+
+        // -- live resize: throttle during the drag, one guaranteed final -----
+        #[unsafe(method(viewWillStartLiveResize))]
+        fn view_will_start_live_resize(&self) {
+            let _: () = unsafe { msg_send![super(self), viewWillStartLiveResize] };
+            self.ivars().live_resize.set(true);
+        }
+
+        #[unsafe(method(viewDidEndLiveResize))]
+        fn view_did_end_live_resize(&self) {
+            let _: () = unsafe { msg_send![super(self), viewDidEndLiveResize] };
+            self.ivars().live_resize.set(false);
+            // The drag settled: the engine must end up laid out for the size
+            // the user actually let go at, whatever the throttle last sent.
+            self.fire_resize(self.frame().size);
             self.setNeedsDisplay(true);
         }
 
@@ -420,6 +456,41 @@ impl FacetImageView {
         self.reset_to_fit();
     }
 
+    // -- browser resize notification ----------------------------------------
+
+    /// Notify the engine of a new viewport size, honouring the live-resize
+    /// throttle. No-op outside browser mode.
+    fn maybe_fire_resize(&self, new_size: NSSize) {
+        if self.ivars().synapse.borrow().is_none() {
+            return;
+        }
+        if self.ivars().live_resize.get() {
+            let now = std::time::Instant::now();
+            if let Some(last) = self.ivars().last_resize_fire.get() {
+                if now.duration_since(last) < LIVE_RESIZE_INTERVAL {
+                    // Skipped: the drag keeps going and `viewDidEndLiveResize`
+                    // guarantees the final size reaches the engine regardless.
+                    return;
+                }
+            }
+        }
+        self.fire_resize(new_size);
+    }
+
+    /// Fire `BrowserResize` for `size` unless the engine already has exactly
+    /// that geometry. Browser mode only.
+    fn fire_resize(&self, size: NSSize) {
+        let syn = self.ivars().synapse.borrow().clone();
+        let Some(syn) = syn else { return };
+        let (w, h) = (size.width.max(1.0) as u32, size.height.max(1.0) as u32);
+        if self.ivars().last_resize_sent.get() == Some((w, h)) {
+            return;
+        }
+        self.ivars().last_resize_sent.set(Some((w, h)));
+        self.ivars().last_resize_fire.set(Some(std::time::Instant::now()));
+        syn.fire(bandy::SMessage::BrowserResize(w, h));
+    }
+
     // -- interaction --------------------------------------------------------
 
     /// Reset the zoom to aspect-fit and clear any pan.
@@ -551,8 +622,17 @@ impl FacetImageView {
     fn render(&self) {
         let bounds = self.bounds();
 
-        // The field.
-        let field = NSColor::colorWithSRGBRed_green_blue_alpha(FIELD.0, FIELD.1, FIELD.2, 1.0);
+        // The field. In browser mode the bitmap is drawn 1:1 at the top-left,
+        // so during a live resize the view is routinely larger than the last
+        // blit — the uncovered band is page background (white), not the
+        // viewer's dark console field, so a widening drag reads as "the page
+        // has not caught up yet" rather than as garbage.
+        let browser = self.ivars().synapse.borrow().is_some();
+        let field = if browser {
+            NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 1.0)
+        } else {
+            NSColor::colorWithSRGBRed_green_blue_alpha(FIELD.0, FIELD.1, FIELD.2, 1.0)
+        };
         field.set();
         objc2_app_kit::NSRectFill(bounds);
 
@@ -575,7 +655,7 @@ impl FacetImageView {
 
         // The pixel readout overlay (facet only — a browser page is not
         // an inspected picture).
-        if self.ivars().synapse.borrow().is_none() {
+        if !browser {
             self.draw_readout(bounds, (dx, dy, dw, dh));
         }
     }
