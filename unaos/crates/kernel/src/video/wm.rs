@@ -2272,6 +2272,10 @@ fn cursor3_rollup(scope: &str) {
     // reach: both are taken from inside the sprite's own bookkeeping, and an overwrite by a painter
     // that never consulted the module leaves that bookkeeping intact.
     super::cursor::cursor6_rollup(scope, planned);
+    // CURSOR-8 — and what the repair COST, which is the question CURSOR-7 left a reader unable to ask:
+    // `[cursor6] repaired=` says how often the arrow was rebuilt, and this says how often that was
+    // asked for and what declined the rest. The two lines are adjacent because they share a counter.
+    super::cursor::cursor8_rollup(scope);
 }
 
 /// WC-A — whether the first `[wc-a] composite` witness has been emitted (first composite only; a

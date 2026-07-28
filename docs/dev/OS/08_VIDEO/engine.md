@@ -3748,6 +3748,163 @@ never drawn, `live_box_relaxed()` is `None` for the whole boot, and every counte
   and if it starts tracking the present rate rather than the motion rate the fix has become the
   churn WC-I removed and belongs behind a rate limit or in the plan snapshot instead.
 
+> **That last bullet was the arc's own tripwire, and P69 tripped it.** See §CURSOR-8.
+
+### CURSOR-8 — the repair is a request, not a command
+
+CURSOR-7's watch-list named the failure mode and P69 met it, minutes after the bench boot: *"mouse
+worse than ever over a vug — unusable"*, plus *"keystrokes visible in the background cause flashes in
+the vug"*. The tail repair was tracking the PRESENT rate.
+
+#### The cost model that was wrong
+
+CURSOR-7 reasoned: *a stationary pointer over a live vug makes `hit` true, so `disturbed` is true, so
+nothing arms — the fix is silent, and arming only happens during motion.* That is true of a SINGLE
+compositing core and false of the VUGPAR steady state, which is the only state the symptom lives in.
+The unbracketed-and-live combination is common there, and structurally so:
+
+* a masked undraw on core A deliberately does **not** retract `LIVE_ON` (part of the sprite is still
+  up; a reader that concluded "no sprite" would undercount exactly the straddle case CURSOR-6 was
+  built to see), so the box stays advertised for the whole of A's bracket;
+* meanwhile core B enters `composite_inner`, its own `sprite_plan()` comes back empty or its own
+  window set does not meet the sprite, so B's `disturbed` is false;
+* B blits, `live_box_relaxed()` says the box is live, `bracketed` is false — B arms;
+* `verify_window` also passes `bracketed = false` unconditionally, by CURSOR-7's own conservative
+  choice, so every read-back verify arms too.
+
+Six vugs at ~50 fps is several hundred armings a second, and CURSOR-7 granted every request.
+
+#### The loop, and why the keystroke report is the same bug
+
+The repair is not merely expensive; it is **self-sustaining**:
+
+1. a vug presents; the present meets the live sprite box unbracketed (above);
+2. `PRESENT_DIRTY` is armed; the consuming tail runs a whole-sprite `cursor::repaint()`;
+3. `repaint` ends in `cursor::repair`, which calls `wm::damage_intersecting` over the restored rect —
+   marking every window UNDER the sprite damaged. That is by design and predates this arc: the colour
+   guard can leave stale pixels inside a window's rect and only a redraw from the app's surface mends
+   them;
+4. the next composite therefore re-blits that whole window from its surface — and that present meets
+   the sprite again, at (1).
+
+The cursor is unusable because it spends its life mid-restore — precisely the duty cycle WC-I and
+CURSOR-3 exist to remove — and the vug flashes because every turn of the loop re-blits it whole.
+
+**The keystroke flash is the second-order view of the same loop, and is NOT a separate seed.** A
+keystroke echoes to the console; the console is the DESKTOP surface, not a window; `Screen::flush`
+ends in `wm::service_damage`, which exists to service exactly the damage `cursor::repair` leaves
+behind. So each keypress *cashes* the sprite damage the repair storm had already queued, into a full
+re-blit of the focused vug — one flash per keypress. No console pixel ever lands on the vug: WC-I's
+`occluders` subtraction in `Screen::present_background` removes the window boxes from the desktop's
+own damage before it copies, and `[cursor6] desktop_over` is the counter that would say otherwise (it
+must stay 0, and a non-zero reading there would be a *different* bug and its own seed). The keystroke
+supplies the CADENCE, not the pixels. Bounding the repair rate bounds both symptoms; if the flashes
+survive with `[cursor8] suppressed_rate` climbing and `repairs` at the motion rate, then the console
+present is an independent mechanism after all and gets its own arc.
+
+#### What landed
+
+Nothing about the arming changed — the flag still means what CURSOR-7 says it means, and it is still
+a relaxed store inside the `BlitGuard` window. What moved is the DECISION to spend a repaint on it,
+into `cursor::take_present_dirty`, which runs outside the guard where a clock and the sprite's own
+generation are readable. Two tests, cheapest first, both lock-free, no new lock and no new lock order
+(§WEDGE-1's list is untouched):
+
+* **Stale** — `live_epoch() != PRESENT_DIRTY_EPOCH` (the generation recorded at arming time) means a
+  full restore → save → draw cycle has run since the offending present: from the HID router's
+  `repaint`, from `wm::erase`, or from the deferred-erase drain. That cycle already re-established the
+  arrow and its save-under from the finished front, so the request is stale and buys nothing. This is
+  the "were the sprite's pixels actually disturbed" test in the only form affordable here: the
+  pixel-exact form (compare the panel against `Sprite::saved` over the box) is a read-back of exactly
+  the pixels the repair would rewrite, with `SPRITE` held — it *is* the repair.
+* **Rate** — at most one granted repair per `REPAIR_MIN_MS` = **8 ms**, the 125 Hz HID report period.
+  The bound is the MOTION rate because motion is the only thing a whole-sprite repaint can
+  legitimately track, and the router already pays a repaint per report. A parked sprite over a
+  churning vug now repairs at 125 Hz worst case instead of at aggregate present rate, which puts the
+  loop's gain below one. A frame bound (16 ms) would leave a visibly late arrow on a fast drag; a
+  present-rate bound is the thing being removed.
+
+**A deferred request is re-armed, never dropped.** Deferring by up to 8 ms is a bounded latency;
+dropping is the unbounded absence CURSOR-7 exists to close, and the two must not be conflated. The
+first pass past the floor takes it, and a pass always comes — every present runs a tail, and
+`service_damage` runs on the desktop's cadence even with no window presenting.
+
+The clock is read through a lane-local `mono_now_hz()` in `video/cursor.rs`, calling the same public
+arch accessors `clock::monotonic()` calls (`arch::timer::cntfrq` + `arch::now_cycles` on aarch64;
+`arch::apic::tsc_hz` + `arch::now_cycles` on x86_64). `clock` exposes whole `uptime_secs()` and raw
+`mono_ticks()` but no millisecond reading outside the `logts` feature, and adding one is an edit to a
+shared kernel-core file outside this arc's lane. **It is duplication, it is flagged as duplication in
+the source, and it should be folded into `clock` as a `pub fn mono_ms()` when a session owns that
+file.** Where no counter is readable the repair is granted *and counted as `unclocked`*: declining
+would reinstate CURSOR-6's unbounded absence on a machine whose only fault is an uncalibrated
+counter, and granting silently would let the rollup read as paced when it is not.
+
+`wm.rs`'s diff is one call — the new rollup, beside `[cursor6]`'s. `composite`'s tail is unchanged:
+it still asks `take_present_dirty()` and still appends the repair after `Adopt` rather than
+downgrading it. The whole mechanism sits in the consumer, which is what kept the shared-surface diff
+to a single line ahead of the CLICK-ROUTE arc.
+
+#### What the counters mean now
+
+`[cursor8] repair rate scope=… requests=N repairs=N suppressed_stale=N suppressed_rate=N unclocked=N floor_ms=8 -> V`
+
+* **`requests`** — flag CONSUMPTIONS, not armings. The flag coalesces, so `requests <= present_over`
+  by construction, and the ratio between them is how much the coalescing already absorbs.
+* **`repairs`** — GRANTED, and the same counter as `[cursor6] repaired=`. Two lines that disagreed
+  about how often the arrow was rebuilt would be worse than one.
+* **`suppressed_stale`** — a full sprite cycle beat us to it. Load, not damage.
+* **`suppressed_rate`** — inside the floor, DEFERRED (re-armed), never lost. This is the number that
+  says the storm was actually caught.
+* **`unclocked`** — granted with no floor applied. Must be 0 on both bench platforms (CNTFRQ is
+  architectural on the Pi; x86 is calibrated long before the GUI); non-zero means the limiter is not
+  RUNNING, which reads differently from "not needed".
+* **Verdicts.** `UNCLOCKED` (checked first — any unclocked grant makes the rest unreadable);
+  `UNWITNESSED` (`requests == 0`, which on QEMU raspi4b is every boot); `LIMITED`
+  (`suppressed_rate > 0`, the limiter biting); `PACED` otherwise.
+
+`[cursor6] repaired=` narrows in the same breath: it now counts GRANTED repairs, so
+`repaired / present_over` is the coalescing AND the limiter together, and `[cursor8]` splits the two.
+`present_over > 0 && repaired == 0` therefore acquires a second, benign reading it did not have under
+CURSOR-7 — every request so far fell inside the floor — and the `OVERWRITTEN` verdict is kept, with
+the instruction to read the next line rather than to go looking in `wm::composite`.
+
+#### CURSOR-8 gate results (2026-07-28, QEMU raspi4b)
+
+Both gates RUN and green in this session. The container's missing `cc`/`qemu-system-aarch64` were
+bridged with `/run/host` wrappers; the host toolchain additionally needed `--sysroot=/run/host` to
+reach glibc's link objects (the container ships a runtime libc but no crt objects or `.so` link
+scripts), which is what defeated the CURSOR-7 session.
+
+```
+./arroyo check          ✅ x86_64 OK   ✅ aarch64 OK
+UNAOS_QMP_PORT=4487 ./arroyo kernel8-test 210
+  ✅ MBENCH PASS — 86/86 required witnesses, 0 forbidden hit(s), 15593 lines scanned
+[cursor8] repair rate scope=fixture requests=0 repairs=0 suppressed_stale=0 suppressed_rate=0 unclocked=0 floor_ms=8 -> UNWITNESSED
+```
+
+`UNWITNESSED` is the only honest QEMU verdict, and the reason the gate proves wiring and
+no-regression only: raspi4b delivers no HID pointer report, so the sprite is never drawn,
+`live_box_relaxed()` is `None` for the whole boot, and nothing can arm. **CURSOR-7's own gates were
+never run; this run is the first to cover both arcs**, and it clears CURSOR-7's outstanding debt.
+
+#### Metal watch-list (CURSOR-8)
+
+* The arc lands if the mouse is usable over a presenting vug with `suppressed_rate` climbing and
+  `repairs` sitting near the motion rate. That is the storm caught and the repair still working.
+* `repairs` still tracking present rate with `suppressed_rate == 0` means 8 ms is too low a floor for
+  the observed present rate — but check `unclocked` first, because an unreadable counter produces the
+  same shape for a completely different reason.
+* `suppressed_stale` large relative to `requests` is good news and a hint: most requests are already
+  being settled by somebody else's full cycle, and the arming test in `draw_window` could then be
+  narrowed further (the next candidate: do not arm at all while another core holds an overlay
+  session).
+* Flashes in the vug surviving a green `[cursor8]` retires the "same mechanism family" finding above
+  and makes the console present its own seed. `[cursor6] desktop_over` is the first counter to read
+  in that case; it must still be 0.
+* `[cursor3] repaint=` beside `[cursor8] repairs=` remains the honest ratio to watch. CURSOR-7's
+  tripwire is still armed — this arc bounded the RATE, it did not remove the whole-sprite duty cycle,
+  and the structural fix (a plan snapshot that sees a sprite arriving mid-pass) is still owed.
+
 ### WEDGE-1 — P66's mechanism is UNKNOWN; this arc hardens and instruments
 
 **Verdict first: this arc did not root-cause P66.** It landed two safe-direction changes and two

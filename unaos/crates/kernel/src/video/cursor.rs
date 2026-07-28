@@ -547,12 +547,146 @@ pub fn note_uncover_lost() {
 ///
 /// `Release`/`Acquire`: the store publishes "the panel no longer holds the arrow where the module
 /// thinks it does", and what must not be reordered against it is the present's own pixel writes.
+///
+/// ### CURSOR-8 — the flag is a REQUEST, and [`take_present_dirty`] is now the thing that judges it
+/// CURSOR-7 shipped with the arming and the granting fused: every consumer that saw the flag up ran a
+/// whole-sprite [`repaint`]. Its own author wrote the failure condition down (engine.md §CURSOR-7):
+/// *if `repaint=` starts tracking the PRESENT rate rather than the MOTION rate, the fix has become the
+/// churn WC-I removed and belongs behind a rate limit.* P69 is that condition, met — see
+/// [`REPAIR_MIN_MS`] for the loop it closes. The flag still means exactly what it meant; the decision
+/// to spend a repaint on it moved into the consumer, where a clock and the sprite's own generation are
+/// readable and the blit guard is gone.
 static PRESENT_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// CURSOR-8 — [`live_epoch`] as it stood when [`PRESENT_DIRTY`] was last armed.
+///
+/// The cheap half of "were the sprite's pixels ACTUALLY disturbed since the last repair", and the
+/// only half that is affordable here. The expensive half — compare the panel against `Sprite::saved`
+/// across the whole box — costs a read-back of exactly the pixels the repair would rewrite, so it IS
+/// the repair, and it would need `SPRITE` held while the front is read. What a generation comparison
+/// buys instead, for one `Acquire` load and no lock: every full undraw and every draw bumps the epoch
+/// ([`bump_epoch`]), so `live_epoch() != PRESENT_DIRTY_EPOCH` at consume time means a complete
+/// restore → save → draw cycle has run since the offending present — from the HID router's
+/// [`repaint`], from `wm::erase`, from the deferred-erase drain — and that cycle has already
+/// re-established the arrow and its save-under from the finished front. The request is stale, and
+/// granting it would buy nothing but another turn of the loop.
+///
+/// Written BEFORE the flag and read AFTER it, so a consumer that observes the flag up observes an
+/// epoch no NEWER than the arming. An epoch one arming stale can only make this test conservative: it
+/// declines to suppress and falls through to the rate floor, which is the safe direction.
+static PRESENT_DIRTY_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// CURSOR-8 — the monotonic counter reading at the last GRANTED repair, in [`mono_now_hz`]'s units.
+/// `0` means "none yet this boot", which the elapsed test reads as overdue.
+static LAST_REPAIR_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// CURSOR-8 — the floor between two granted tail repairs, in milliseconds.
+///
+/// ### The loop this number breaks
+/// P69: "mouse worse than ever over a vug — unusable", and "keystrokes typed into the background
+/// console flash the vug". Both are one positive feedback loop, and CURSOR-7 closed it:
+///
+/// 1. a vug presents (~50 fps each, several of them, from several cores at once);
+/// 2. the present meets the live sprite box while the presenting pass held no bracket of its own —
+///    which in the VUGPAR steady state is the COMMON case, not a rare one: a masked undraw on core A
+///    deliberately does not retract [`LIVE_ON`] (part of the sprite is still up, and a reader that
+///    concluded "no sprite" would undercount the straddle case CURSOR-6 exists to see), while core B's
+///    own `sprite_plan()` came back empty — so B is unbracketed over a box that is still advertised;
+/// 3. so the present arms [`PRESENT_DIRTY`], and B's tail runs a whole-sprite [`repaint`];
+/// 4. [`repaint`] ends in [`repair`], which calls `wm::damage_intersecting` over the restored rect —
+///    marking every window UNDER the sprite damaged, by design (the colour guard can leave stale
+///    pixels inside a window's rect and only a redraw from the app's surface mends them);
+/// 5. the next composite therefore re-blits that whole window from its surface — and that present
+///    meets the sprite again, at (2).
+///
+/// The cursor is unusable because it spends its life mid-restore, which is exactly the duty cycle WC-I
+/// and CURSOR-3 were built to remove; the vug flashes because every turn of the loop re-blits it
+/// whole. The keystroke report is the SECOND-ORDER view of the same loop: a keystroke echoes to the
+/// console, the console is the DESKTOP surface, and `Screen::flush` ends in `wm::service_damage` —
+/// which exists to service exactly the damage `cursor::repair` leaves behind, and so cashes the queued
+/// sprite damage into a full re-blit of the focused vug, one flash per keypress. No console pixel ever
+/// lands on the vug (WC-I's `occluders` subtraction sees to that, and `desktop_over` is the counter
+/// that would say otherwise); the keystroke supplies only the CADENCE that pays out damage the repair
+/// storm had already queued.
+///
+/// ### Why 8 ms and not a frame
+/// The bound has to be the MOTION rate, because motion is the only thing a whole-sprite repaint can
+/// legitimately track: a 125 Hz HID mouse reports every 8 ms, and the router's own repaint on that
+/// path is a cost the design already accepts. So a parked sprite over a churning vug repairs at 125 Hz
+/// worst case instead of at aggregate present rate, the loop's gain drops below one, and nothing a
+/// pointer report would have repainted anyway is delayed by more than one report period. A frame-rate
+/// bound (16 ms) would leave a visibly late arrow on a fast drag; a present-rate bound is the thing
+/// being removed.
+const REPAIR_MIN_MS: u64 = 8;
+
+/// CURSOR-8 — the monotonic counter and its frequency, or `None` where this machine has no
+/// trustworthy one.
+///
+/// A LANE-LOCAL mirror of the private `clock::monotonic()` seam, and named as one: `clock` exposes
+/// whole `uptime_secs()` and raw `mono_ticks()`, but no MILLISECOND reading outside the `logts`
+/// feature, and adding one is an edit to a shared kernel-core file this arc's brief does not cover.
+/// Both arms call the same public arch accessors `clock::monotonic()` calls, so the two cannot
+/// disagree about the timebase. **Fold this into `clock` as a `pub fn mono_ms()` when a session owns
+/// that file** — it is duplication, it is flagged as duplication, and it is two arms to delete.
+#[cfg(target_arch = "aarch64")]
+fn mono_now_hz() -> Option<(u64, u64)> {
+    let hz = crate::arch::timer::cntfrq();
+    if hz == 0 {
+        return None; // defensive: a zero CNTFRQ would make the division meaningless
+    }
+    Some((crate::arch::now_cycles(), hz))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn mono_now_hz() -> Option<(u64, u64)> {
+    // The invariant-TSC bit is `clock`'s honesty contract for a WALL clock. Here the only question is
+    // whether an 8 ms interval can be measured at all, and a calibrated frequency is the whole of it.
+    let hz = crate::arch::apic::tsc_hz();
+    if hz == 0 {
+        return None; // calibration never ran or was rejected
+    }
+    Some((crate::arch::now_cycles(), hz))
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn mono_now_hz() -> Option<(u64, u64)> {
+    None
+}
 
 /// CURSOR-7 — tail repairs actually taken. `repaired <= present_over` by construction (the flag
 /// coalesces), so this counts REPAIR PASSES, never pixels or presents; see [`cursor6_rollup`].
+///
+/// CURSOR-8 — and it now counts GRANTED repairs only: a pass that found the flag up and declined it
+/// (stale generation, or inside the rate floor) does NOT increment this. That is what keeps
+/// `[cursor6] repaired=` the answer to "how often did the panel actually get a fresh arrow" rather
+/// than "how often was one asked for" — the ask is `present_over`, and the gap between the two is the
+/// whole of `[cursor8]`.
 #[cfg(feature = "witness")]
 static C7_REPAIRED: AtomicU64 = AtomicU64::new(0);
+
+/// CURSOR-8 — repair requests observed by a consumer: the denominator of the `[cursor8]` rollup.
+/// Distinct from `present_over`, which counts ARMINGS: the flag coalesces, so several armings between
+/// two tails are one request here, and `requests <= present_over` always.
+#[cfg(feature = "witness")]
+static C8_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// CURSOR-8 — requests declined because [`live_epoch`] had moved since the arming: a full sprite cycle
+/// already re-established the arrow, so the repair had nothing left to do.
+#[cfg(feature = "witness")]
+static C8_SUPPRESSED_STALE: AtomicU64 = AtomicU64::new(0);
+
+/// CURSOR-8 — requests declined because the last granted repair was less than [`REPAIR_MIN_MS`] ago.
+/// The request is NOT dropped: the flag is re-armed, and the first pass past the floor takes it. So
+/// this counts DEFERRALS, never losses, and it is the number that says the storm was actually caught.
+#[cfg(feature = "witness")]
+static C8_SUPPRESSED_RATE: AtomicU64 = AtomicU64::new(0);
+
+/// CURSOR-8 — repairs granted on a machine with no readable monotonic counter, where the floor cannot
+/// be applied at all and CURSOR-7's unbounded behaviour stands. Must be 0 on the Pi (CNTFRQ is
+/// architectural) and on any x86 past APIC calibration; non-zero says the rate limit is not RUNNING,
+/// which is a different reading from "not needed".
+#[cfg(feature = "witness")]
+static C8_UNCLOCKED: AtomicU64 = AtomicU64::new(0);
 
 /// CURSOR-6/7 — count a window present that landed on the live sprite box, and, when nothing in that
 /// pass owes the sprite a repaint, ARM the tail repair.
@@ -571,6 +705,13 @@ static C7_REPAIRED: AtomicU64 = AtomicU64::new(0);
 /// window's worth of rows.
 pub fn note_present_over_sprite(bracketed: bool) {
     if !bracketed {
+        // CURSOR-8 — the generation FIRST, the flag second, and both plain stores. The consumer reads
+        // them the other way round (flag, then epoch), so an observer that sees the flag up cannot see
+        // an epoch newer than this arming; it can see an OLDER one if a second core armed in between,
+        // and that direction is harmless (it declines to suppress, and the rate floor still applies).
+        // One extra relaxed store on a path that has just blitted a window's worth of rows, and still
+        // nothing here that the drain barrier could ever wait on.
+        PRESENT_DIRTY_EPOCH.store(live_epoch(), Ordering::Relaxed);
         PRESENT_DIRTY.store(true, Ordering::Release);
     }
     #[cfg(feature = "witness")]
@@ -587,13 +728,117 @@ pub fn note_present_over_sprite(bracketed: bool) {
 /// A swap, not a load: the flag is a request for ONE whole-sprite repaint, and leaving it standing
 /// would make every later pass pay for a present that has already been repaired. Called from
 /// `wm::composite` only, outside the `BlitGuard` window.
+///
+/// ### CURSOR-8 — and it is a request to be JUDGED, not a command
+/// CURSOR-7 granted every request, so `repaint=` tracked the aggregate PRESENT rate; P69 is what that
+/// costs on a panel with several presenting vugs (see [`REPAIR_MIN_MS`] for the loop, both of P69's
+/// symptoms, and why the bound is the HID report period). Two tests stand between the request and the
+/// repaint, cheapest first, and both are lock-free — this runs outside the `BlitGuard` window, but it
+/// also runs on the tail of every composite on the machine, so it stays off `SPRITE` on cost grounds
+/// alone:
+///
+/// * **stale** — the generation moved since the arming, so a full restore → save → draw cycle has
+///   already put the arrow back from the finished front. Nothing to repair. This is the "was the
+///   sprite actually disturbed" test in the only form that is affordable here; see
+///   [`PRESENT_DIRTY_EPOCH`] for why the pixel-exact form is not.
+/// * **rate** — the last granted repair was less than [`REPAIR_MIN_MS`] ago. **The request is re-armed
+///   rather than dropped**: deferring a repair by up to 8 ms is a bounded latency, dropping one is the
+///   unbounded absence CURSOR-7 exists to close, and the two must not be confused. The first pass past
+///   the floor takes it, and a pass will come — every present runs a tail, and `service_damage` runs on
+///   the desktop's cadence even when no window presents at all.
+///
+/// The re-arm is a plain `store(true)`, not a compare-exchange: a concurrent arming that raced it can
+/// only be asking for the same thing, and the epoch it stored is at worst one arming stale — which
+/// [`PRESENT_DIRTY_EPOCH`] documents as the conservative direction. Nothing here spins, and nothing
+/// here can fail to make progress: every path is a bounded number of atomic operations.
 pub fn take_present_dirty() -> bool {
-    let dirty = PRESENT_DIRTY.swap(false, Ordering::AcqRel);
-    #[cfg(feature = "witness")]
-    if dirty {
-        C7_REPAIRED.fetch_add(1, Ordering::Relaxed);
+    if !PRESENT_DIRTY.swap(false, Ordering::AcqRel) {
+        return false;
     }
-    dirty
+    #[cfg(feature = "witness")]
+    C8_REQUESTS.fetch_add(1, Ordering::Relaxed);
+
+    // Read AFTER the flag — see `note_present_over_sprite` for the pairing.
+    if live_epoch() != PRESENT_DIRTY_EPOCH.load(Ordering::Relaxed) {
+        #[cfg(feature = "witness")]
+        C8_SUPPRESSED_STALE.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+
+    let (now, hz) = match mono_now_hz() {
+        Some(t) => t,
+        None => {
+            // No measurable interval on this machine: grant, and SAY SO. Declining instead would
+            // reinstate CURSOR-6's unbounded absence on a machine whose only fault is an uncalibrated
+            // counter, and granting silently would let `[cursor8]` read as paced when it is not.
+            #[cfg(feature = "witness")]
+            {
+                C8_UNCLOCKED.fetch_add(1, Ordering::Relaxed);
+                C7_REPAIRED.fetch_add(1, Ordering::Relaxed);
+            }
+            return true;
+        }
+    };
+    let floor = hz.saturating_mul(REPAIR_MIN_MS) / 1000;
+    let last = LAST_REPAIR_TICKS.load(Ordering::Relaxed);
+    // `wrapping_sub` on a free-running counter, then an unsigned compare: a counter that wrapped (or a
+    // `last` written by a core whose reading ran marginally ahead) yields a huge elapsed and grants,
+    // which is the safe direction — the failure mode of this limiter must be an extra repaint, never a
+    // withheld one.
+    if last != 0 && now.wrapping_sub(last) < floor {
+        #[cfg(feature = "witness")]
+        C8_SUPPRESSED_RATE.fetch_add(1, Ordering::Relaxed);
+        PRESENT_DIRTY.store(true, Ordering::Release);
+        return false;
+    }
+    LAST_REPAIR_TICKS.store(now, Ordering::Relaxed);
+    #[cfg(feature = "witness")]
+    C7_REPAIRED.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// CURSOR-8 — the arc's one-line rollup: how many tail-repair requests were made, how many were
+/// GRANTED, and which test declined the rest.
+///
+/// Printed after `[cursor6]`'s, because it is that line's footnote: `[cursor6] present_over=` is the
+/// ask and `repaired=` is the grant, and this says what happened in between. The reading that matters
+/// on the bench is `suppressed_rate` climbing while `repairs` stays near the motion rate — that is the
+/// present-rate storm being caught. `requests > 0` with `suppressed_rate == 0` and a large `repairs`
+/// is CURSOR-7's behaviour, i.e. the limiter is not biting and the floor may be too low.
+///
+/// * **`requests`** — flag consumptions, not armings. The flag coalesces, so this is `<= present_over`
+///   by construction and the ratio between them is how much the coalescing is already absorbing.
+/// * **`repairs`** — granted, and identical to `[cursor6] repaired=`. Both are the same counter, on
+///   purpose: two lines that disagreed about how often the arrow was rebuilt would be worse than one.
+/// * **`suppressed_stale`** — a full sprite cycle beat us to it. Load, not damage.
+/// * **`suppressed_rate`** — inside the floor, DEFERRED (re-armed), not lost.
+/// * **`unclocked`** — granted without a floor because no monotonic counter was readable. Must be 0
+///   on both bench platforms; non-zero means the limiter is not running.
+///
+/// `UNWITNESSED` where no request ever arrived, which on QEMU raspi4b is every boot: no HID pointer
+/// report means the sprite is never drawn, `live_box_relaxed()` is always `None`, and nothing can arm.
+/// The gate therefore proves no-regression only, and the verdict says so rather than reading `PACED`
+/// vacuously.
+#[cfg(feature = "witness")]
+pub fn cursor8_rollup(scope: &str) {
+    let requests = C8_REQUESTS.load(Ordering::Relaxed);
+    let repairs = C7_REPAIRED.load(Ordering::Relaxed);
+    let stale = C8_SUPPRESSED_STALE.load(Ordering::Relaxed);
+    let rate = C8_SUPPRESSED_RATE.load(Ordering::Relaxed);
+    let unclocked = C8_UNCLOCKED.load(Ordering::Relaxed);
+    let verdict = if unclocked > 0 {
+        "UNCLOCKED"
+    } else if requests == 0 {
+        "UNWITNESSED"
+    } else if rate > 0 {
+        "LIMITED"
+    } else {
+        "PACED"
+    };
+    serial_println!(
+        "[cursor8] repair rate scope={} requests={} repairs={} suppressed_stale={} suppressed_rate={} unclocked={} floor_ms={} -> {}",
+        scope, requests, repairs, stale, rate, unclocked, REPAIR_MIN_MS, verdict
+    );
 }
 
 /// CURSOR-6 — count a desktop present that landed on the live sprite (from `Screen::present_background`).
@@ -621,6 +866,14 @@ pub(super) fn note_desktop_over_sprite() {
 ///    the arrow and were settled together, which is the fix working as intended rather than a gap.
 ///    `present_over > 0` with `repaired == 0` is the one reading that means the mechanism is NOT
 ///    running — that is a regression in `wm::composite`'s tail, not load.
+///    **CURSOR-8 — `repaired` is now GRANTED repairs.** A request the rate floor deferred or the
+///    generation test found stale does not count here, so the ratio `repaired / present_over` is no
+///    longer only the coalescing: it is the coalescing AND the limiter, and `[cursor8]` immediately
+///    below splits the two. `present_over > 0 && repaired == 0` therefore has a second, benign
+///    reading it did not have before — every request so far fell inside the floor — and `[cursor8]`
+///    is what tells the two apart. `OVERWRITTEN` is kept as the verdict because the panel outcome is
+///    the same either way for the length of that window, and a reader who sees it should look at the
+///    next line rather than at `wm::composite`.
 ///  * `desktop_over` — the same question for the desktop layer. Must be 0 (the render task brackets
 ///    its flush); non-zero is a broken bracket, not load.
 ///  * `mismatch` — [`compose_into`] declines where the open session did not describe the plan; the
