@@ -1158,4 +1158,110 @@ mod tests {
         // ...and it advances by the time the lifecycle events have fired.
         assert!(doc.select("#host").unwrap().next().is_some());
     }
+
+    /// URL/URLSearchParams over the `url` crate, and UTF-8
+    /// TextEncoder/TextDecoder. Relative resolution, component writes and
+    /// the live searchParams link are all checked against the real answers.
+    #[test]
+    fn test_url_and_text_codec_platform_apis() {
+        let html = r#"<html><body><div id="host"></div>
+            <script>
+                var u = new URL('../c/d.html?x=1&y=two#frag', 'https://ex.test:8443/a/b/page');
+                var sp = new URLSearchParams('a=1&b=hello+world&a=2');
+                var u2 = new URL('https://ex.test/p');
+                u2.searchParams.set('q', 'a b&c');
+                u2.pathname = '/other';
+                var enc = new TextEncoder().encode('héllo€');
+                var dec = new TextDecoder().decode(enc);
+                var probe = document.createElement('div');
+                probe.id = 'probe';
+                probe.textContent = [
+                    u.href, u.origin, u.hostname, u.port, u.pathname, u.search, u.hash,
+                    u.searchParams.get('y'),
+                    sp.getAll('a').join(','), sp.get('b'), sp.toString(),
+                    u2.href,
+                    Array.prototype.slice.call(enc).join(','),
+                    dec, String(dec === 'héllo€'),
+                ].join('|');
+                document.getElementById('host').appendChild(probe);
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://url", html, true);
+        let doc = engine.document.as_ref().unwrap();
+        let probe = doc.select("#probe").unwrap().next().expect("probe must attach");
+        let f: Vec<String> = probe.as_node().text_contents().split('|').map(String::from).collect();
+        assert_eq!(f[0], "https://ex.test:8443/a/c/d.html?x=1&y=two#frag", "relative resolution");
+        assert_eq!(f[1], "https://ex.test:8443", "origin");
+        assert_eq!(f[2], "ex.test", "hostname");
+        assert_eq!(f[3], "8443", "port");
+        assert_eq!(f[4], "/a/c/d.html", "pathname");
+        assert_eq!(f[5], "?x=1&y=two", "search");
+        assert_eq!(f[6], "#frag", "hash");
+        assert_eq!(f[7], "two", "searchParams.get");
+        assert_eq!(f[8], "1,2", "getAll keeps repeats in order");
+        assert_eq!(f[9], "hello world", "'+' decodes to space");
+        assert_eq!(f[10], "a=1&b=hello+world&a=2", "form-urlencoded round trip");
+        assert_eq!(f[11], "https://ex.test/other?q=a+b%26c", "live searchParams + path write");
+        // 'héllo€' = 68 C3A9 6C 6C 6F E282AC
+        assert_eq!(f[12], "104,195,169,108,108,111,226,130,172", "UTF-8 encode");
+        assert_eq!(f[14], "true", "decode round-trips");
+    }
+
+    /// AbortController's object graph, DOMParser over the real HTML parser,
+    /// and crypto backed by OS entropy.
+    #[test]
+    fn test_abort_domparser_and_crypto() {
+        let html = r#"<html><body><div id="host"></div>
+            <script>
+                var log = [];
+                var ac = new AbortController();
+                ac.signal.addEventListener('abort', function () { log.push('l1'); });
+                ac.signal.onabort = function () { log.push('onabort'); };
+                var before = ac.signal.aborted;
+                ac.abort('why');
+                ac.abort('twice');
+
+                var pd = new DOMParser().parseFromString(
+                    '<html><body><p class="x">parsed</p><i id="j">y</i></body></html>', 'text/html');
+                var pText = pd.querySelector('p.x').textContent;
+                var pId = pd.getElementById('j').textContent;
+
+                var a = new Uint8Array(16), b = new Uint8Array(16);
+                crypto.getRandomValues(a); crypto.getRandomValues(b);
+                var same = 0, inRange = true;
+                for (var i = 0; i < 16; i++) {
+                    if (a[i] === b[i]) { same++; }
+                    if (!(a[i] >= 0 && a[i] <= 255)) { inRange = false; }
+                }
+                var uu = crypto.randomUUID();
+
+                var probe = document.createElement('div');
+                probe.id = 'probe';
+                probe.textContent = [
+                    String(before), String(ac.signal.aborted), String(ac.signal.reason),
+                    log.join(','), pText, pId,
+                    String(inRange), String(same < 12),
+                    String(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uu)),
+                    String(uu !== crypto.randomUUID()),
+                ].join('|');
+                document.getElementById('host').appendChild(probe);
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://abort", html, true);
+        let doc = engine.document.as_ref().unwrap();
+        let probe = doc.select("#probe").unwrap().next().expect("probe must attach");
+        let f: Vec<String> = probe.as_node().text_contents().split('|').map(String::from).collect();
+        assert_eq!(f[0], "false", "signal starts unaborted");
+        assert_eq!(f[1], "true", "abort flips aborted");
+        assert_eq!(f[2], "why", "reason is recorded");
+        assert_eq!(f[3], "onabort,l1", "abort dispatches once, to onabort then listeners");
+        assert_eq!(f[4], "parsed", "DOMParser document answers querySelector");
+        assert_eq!(f[5], "y", "DOMParser document answers getElementById");
+        assert_eq!(f[6], "true", "getRandomValues stays inside the element width");
+        assert_eq!(f[7], "true", "two draws differ — the fill is not fixed");
+        assert_eq!(f[8], "true", "randomUUID is a well-formed v4");
+        assert_eq!(f[9], "true", "randomUUID does not repeat");
+    }
 }

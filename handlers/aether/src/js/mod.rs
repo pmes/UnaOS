@@ -252,6 +252,10 @@ impl Engine {
             "#,
         ));
         Self::setup_platform_breadth(&mut context);
+        // URL/URLSearchParams, TextEncoder/Decoder, AbortController,
+        // DOMParser and crypto. After breadth (and after `fetch` exists —
+        // the abort shim wraps it) because it builds on both.
+        crate::api::platform::init(&mut context);
 
         Self { context }
     }

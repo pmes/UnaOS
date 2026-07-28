@@ -7,3 +7,4 @@ pub mod video;
 pub mod cssom;
 pub mod window;
 pub mod a11y;
+pub mod platform;
