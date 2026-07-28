@@ -23,6 +23,7 @@ pub mod paper_board;
 pub mod spline;
 pub mod tone_panel;
 pub mod window_chrome;
+pub mod window_title;
 pub mod workspace;
 pub mod tetra_eval;
 pub mod button;
@@ -393,7 +394,11 @@ impl Backend {
         tetra_node: crate::tetra::TetraNode,
         synapse: bandy::Synapse,
     ) -> Self {
-        Self::new_vessel(app_id, title, content_size, move |_window| {
+        Self::new_vessel(app_id, title, content_size, move |window| {
+            // The title bar mirrors the engine: page `<title>` and favicon
+            // arrive over bandy and are written onto this window. Inert for a
+            // tetra vessel that is not a browser — nothing else fires those.
+            crate::platforms::macos::window_title::bind_browser_title(window, synapse.clone());
             crate::platforms::macos::tetra_eval::eval_tetra(tetra_node, synapse.clone())
         })
     }

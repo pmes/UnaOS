@@ -171,6 +171,10 @@ pub struct Page {
     /// fetches collapse), so the ordinal is what lets the loader hand
     /// `document.currentScript` the element a running script came from.
     pub script_nodes: Vec<usize>,
+    /// Absolute URL of the page's favicon ([`favicon_url`]), resolved at parse
+    /// time but NOT fetched here — the shell fetches it after the page is
+    /// delivered so chrome decoration never delays a load.
+    pub favicon: Option<String>,
 }
 
 /// One collected script slot: the ordinal of its `<script>` element among
@@ -225,6 +229,80 @@ pub fn collect_scripts(base_url: &str, html: &str) -> (Vec<ScriptSlot>, Vec<(usi
         }
     }
     (slots, external)
+}
+
+/// The absolute URL of the page's favicon: the first `<link>` whose `rel`
+/// names an icon (`icon`, `shortcut icon`, `apple-touch-icon`, and the
+/// `-precomposed` variant), any `sizes`; falling back to `<origin>/favicon.ico`
+/// — the convention every server still honours. Pure (no network).
+///
+/// `data:` hrefs are skipped: the chrome wants bytes it can fetch, and the
+/// inline case is rare enough not to be worth a second decode path here.
+pub fn favicon_url(base_url: &str, html: &str) -> Option<String> {
+    const ICON_RELS: &[&str] = &[
+        "icon",
+        "shortcut",
+        "apple-touch-icon",
+        "apple-touch-icon-precomposed",
+    ];
+    let document = crate::dom::parse_html(html);
+    if let Ok(links) = document.select("link") {
+        for link in links {
+            let attrs = link.attributes.borrow();
+            let is_icon = attrs
+                .get("rel")
+                .map(|r| {
+                    r.split_whitespace()
+                        .any(|w| ICON_RELS.iter().any(|k| w.eq_ignore_ascii_case(k)))
+                })
+                .unwrap_or(false);
+            if !is_icon {
+                continue;
+            }
+            let Some(href) = attrs.get("href") else { continue };
+            if href.trim().is_empty() || href.trim_start().starts_with("data:") {
+                continue;
+            }
+            let abs = crate::images::resolve(base_url, href.trim());
+            if abs.starts_with("http://") || abs.starts_with("https://") {
+                return Some(abs);
+            }
+        }
+    }
+    // No declared icon: the well-known location on the page's own origin.
+    let mut origin = url::Url::parse(base_url).ok()?;
+    if !(origin.scheme() == "http" || origin.scheme() == "https") {
+        return None;
+    }
+    origin.set_path("/favicon.ico");
+    origin.set_query(None);
+    origin.set_fragment(None);
+    Some(origin.to_string())
+}
+
+/// Fetches and decodes a favicon (the URL from [`favicon_url`]) to tightly
+/// packed RGBA, returning `(width, height, rgba)`.
+///
+/// Deliberately NOT awaited inside [`fetch_page`]: the icon is chrome
+/// decoration, so it must never sit between the user and a rendered document —
+/// the caller runs this *after* the page is delivered. Failures are silent
+/// (`None`): a missing `/favicon.ico` is the overwhelmingly common case, not an
+/// error worth a ledger line.
+///
+/// ICO is handled by the `image` crate's ico decoder (it picks the largest
+/// contained image); PNG/JPEG/GIF/WebP/BMP go through the same decoder, and an
+/// SVG icon falls back to the rasterizer the page images use.
+pub async fn fetch_favicon(url: &str) -> Option<(u32, u32, Vec<u8>)> {
+    let bytes = fetch_image_bytes(url).await.ok()?;
+    let decoded = image::load_from_memory(&bytes)
+        .ok()
+        .map(|i| i.to_rgba8())
+        .or_else(|| crate::images::decode_svg(&bytes))?;
+    let (w, h) = decoded.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h, decoded.into_raw()))
 }
 
 /// Collects absolute `<img src>` URLs (capped; data:/svg skipped for now).
@@ -397,6 +475,12 @@ pub fn sniff_image_kind(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"BM") {
         return Some("image/bmp");
     }
+    // ICO / CUR: a 2-byte zero reserved field, then type 1 (icon) or 2
+    // (cursor), little-endian. Favicons still ship as .ico from plenty of
+    // origins, and some serve them as application/octet-stream.
+    if bytes.len() >= 6 && bytes.starts_with(b"\x00\x00") && (bytes[2] == 1 || bytes[2] == 2) && bytes[3] == 0 {
+        return Some("image/x-icon");
+    }
     let head = &bytes[..bytes.len().min(1024)];
     if head.windows(4).any(|w| w.eq_ignore_ascii_case(b"<svg")) {
         return Some("image/svg+xml");
@@ -550,7 +634,8 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
             script_nodes.push(slot.ordinal);
         }
     }
-    Ok(Page { base_url: base, html, sheets, images, scripts, script_nodes })
+    let favicon = favicon_url(&base, &html);
+    Ok(Page { base_url: base, html, sheets, images, scripts, script_nodes, favicon })
 }
 
 #[cfg(test)]
@@ -604,11 +689,73 @@ mod tests {
     }
 
     #[test]
+    fn test_favicon_url() {
+        // First icon link wins, sizes ignored, resolved against the base.
+        let html = r#"<html><head>
+            <link rel="stylesheet" href="/main.css">
+            <link rel="apple-touch-icon" sizes="180x180" href="/touch.png">
+            <link rel="shortcut icon" href="icons/fav.ico">
+        </head></html>"#;
+        assert_eq!(
+            favicon_url("https://example.com/page/", html),
+            Some("https://example.com/touch.png".to_string())
+        );
+        // No declared icon: the well-known origin path, query/fragment dropped.
+        assert_eq!(
+            favicon_url("https://example.com/deep/page?q=1#frag", "<html></html>"),
+            Some("https://example.com/favicon.ico".to_string())
+        );
+        // data: hrefs are skipped — the chrome wants bytes it can fetch.
+        assert_eq!(
+            favicon_url(
+                "https://example.com/",
+                r#"<link rel="icon" href="data:image/png;base64,AAAA">"#
+            ),
+            Some("https://example.com/favicon.ico".to_string())
+        );
+        assert_eq!(favicon_url("not a url", "<html></html>"), None);
+    }
+
+    /// The `image` crate's **ico** decoder must be compiled in: `.ico` is
+    /// still what most origins serve at `/favicon.ico`, and a missing decoder
+    /// would fail silently (`fetch_favicon` returns `None` on any decode
+    /// error). Builds a real single-entry ICO wrapping a PNG and decodes it
+    /// through the same `image::load_from_memory` call the favicon path uses.
+    #[test]
+    fn test_ico_decoder_is_available() {
+        use image::ImageEncoder as _;
+        let mut png = Vec::new();
+        let pixel = [0u8, 0, 255, 255];
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&pixel, 1, 1, image::ExtendedColorType::Rgba8)
+            .expect("encode png");
+
+        let mut ico = Vec::new();
+        ico.extend_from_slice(&[0, 0]); // reserved
+        ico.extend_from_slice(&[1, 0]); // type: icon
+        ico.extend_from_slice(&[1, 0]); // one entry
+        ico.extend_from_slice(&[1, 1, 0, 0]); // 1x1, no palette, reserved
+        ico.extend_from_slice(&[1, 0]); // color planes
+        ico.extend_from_slice(&[32, 0]); // bits per pixel
+        ico.extend_from_slice(&(png.len() as u32).to_le_bytes());
+        ico.extend_from_slice(&22u32.to_le_bytes()); // offset past the header
+        ico.extend_from_slice(&png);
+
+        assert_eq!(sniff_image_kind(&ico), Some("image/x-icon"));
+        let decoded = image::load_from_memory(&ico)
+            .expect("image crate must decode ICO (default `ico` feature)")
+            .to_rgba8();
+        assert_eq!(decoded.dimensions(), (1, 1));
+        assert_eq!(decoded.into_raw(), pixel);
+    }
+
+    #[test]
     fn test_sniff_image_kind() {
         assert_eq!(sniff_image_kind(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
         assert_eq!(sniff_image_kind(b"\xff\xd8\xff\xe0"), Some("image/jpeg"));
         assert_eq!(sniff_image_kind(b"GIF89a..."), Some("image/gif"));
         assert_eq!(sniff_image_kind(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(sniff_image_kind(b"\x00\x00\x01\x00\x01\x00"), Some("image/x-icon"));
         assert_eq!(
             sniff_image_kind(b"<?xml version=\"1.0\"?><!-- c --><svg xmlns=\"...\"/>"),
             Some("image/svg+xml")

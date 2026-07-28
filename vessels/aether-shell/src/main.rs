@@ -85,7 +85,13 @@ fn main() {
             
             let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(16));
             let mut last_url: Option<String> = None;
-            
+            let mut last_title: Option<String> = None;
+            // The favicon url of the page whose icon the chrome is already
+            // showing, and the one a load just staged (fetched at the choke
+            // point below, off the critical path).
+            let mut last_favicon: Option<String> = None;
+            let mut pending_favicon: Option<String> = None;
+
             loop {
                 tokio::select! {
                     _ = tick_interval.tick() => {
@@ -121,6 +127,7 @@ fn main() {
                                 SMessage::OpenDocument { url } => {
                                     match aether::net::fetch_page(&url).await {
                                         Ok(page) => {
+                                            pending_favicon = page.favicon.clone();
                                             engine.load_page(page, true)
                                         }
                                         Err(e) => engine.load_error_page(&url, &e.to_string()),
@@ -129,19 +136,24 @@ fn main() {
                                 SMessage::BrowserNavBack => {
                                     if let Some(url) = engine.get_back_url() {
                                         let page = aether::net::fetch_page(&url).await.unwrap_or_default();
+                                        pending_favicon = page.favicon.clone();
                                         engine.load_page(page, false);
                                     }
                                 }
                                 SMessage::BrowserNavForward => {
                                     if let Some(url) = engine.get_forward_url() {
                                         let page = aether::net::fetch_page(&url).await.unwrap_or_default();
+                                        pending_favicon = page.favicon.clone();
                                         engine.load_page(page, false);
                                     }
                                 }
                                 SMessage::BrowserNavReload => {
                                     if let Some(url) = engine.history.get(engine.history_idx).cloned() {
                                         match aether::net::fetch_page(&url).await {
-                                            Ok(page) => engine.load_page(page, false),
+                                            Ok(page) => {
+                                                pending_favicon = page.favicon.clone();
+                                                engine.load_page(page, false)
+                                            }
                                             Err(e) => engine.load_error_page(&url, &e.to_string()),
                                         }
                                     }
@@ -176,7 +188,10 @@ fn main() {
                                 match nav.method {
                                     aether::forms::HttpMethod::Get => {
                                         match aether::net::fetch_page(&nav.url).await {
-                                            Ok(page) => engine.load_page(page, true),
+                                            Ok(page) => {
+                                                pending_favicon = page.favicon.clone();
+                                                engine.load_page(page, true)
+                                            }
                                             Err(e) => engine.load_error_page(&nav.url, &e.to_string()),
                                         }
                                     }
@@ -201,6 +216,32 @@ fn main() {
                     if last_url.as_deref() != Some(current.as_str()) {
                         last_url = Some(current.clone());
                         engine_tx.fire(SMessage::BrowserUrlChanged(current.clone()));
+                    }
+                }
+                // The window title mirrors the same truth: whatever the engine
+                // parsed out of `<title>` for the document it is now showing.
+                // Deduped like the url — a script that rewrites document.title
+                // off the tick reaches the title bar, but an unchanged title
+                // costs nothing.
+                if last_title.as_deref() != Some(engine.title.as_str()) {
+                    last_title = Some(engine.title.clone());
+                    engine_tx.fire(SMessage::BrowserTitleChanged(engine.title.clone()));
+                }
+                // The favicon is chrome decoration: the page is already loaded
+                // and about to blit, so the icon fetch is detached onto the
+                // LocalSet rather than awaited here. Nothing downstream waits
+                // on it, and a failure is simply no icon.
+                if let Some(fav) = pending_favicon.take() {
+                    if last_favicon.as_deref() != Some(fav.as_str()) {
+                        last_favicon = Some(fav.clone());
+                        let tx = engine_tx.clone();
+                        tokio::task::spawn_local(async move {
+                            if let Some((width, height, rgba)) =
+                                aether::net::fetch_favicon(&fav).await
+                            {
+                                tx.fire(SMessage::BrowserFaviconChanged { width, height, rgba });
+                            }
+                        });
                     }
                 }
             }
