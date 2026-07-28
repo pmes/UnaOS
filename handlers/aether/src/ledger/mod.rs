@@ -53,6 +53,59 @@ impl std::fmt::Display for ApiCategory {
     }
 }
 
+/// Longest record name the ledger keeps. JS error digests carry whole boa
+/// stack traces; past this the tail is noise for aggregation.
+const MAX_NAME_LEN: usize = 200;
+
+/// Flattens a record name to exactly one dump line.
+///
+/// The dump format is one record per line, `category | name | count`, and
+/// automated aggregation parses it that way — so a name must contain no
+/// line breaks (boa stack traces are multi-line) and no `|` of its own.
+/// Newlines become `; `, other control characters and whitespace runs
+/// become a single space, `|` becomes `/`, and the result is capped at
+/// [`MAX_NAME_LEN`] characters. Sanitizing at RECORD time (rather than at
+/// dump time) makes the one-record-one-line invariant hold by construction,
+/// including for callers that read names back out of a snapshot.
+pub fn sanitize_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().min(MAX_NAME_LEN));
+    let mut pending_space = false;
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        let mapped: Option<char> = match c {
+            '\r' | '\n' => {
+                // CRLF is one break, not two.
+                if c == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                if !out.is_empty() {
+                    out.push(';');
+                }
+                pending_space = true;
+                None
+            }
+            '|' => Some('/'),
+            c if c.is_control() || c.is_whitespace() => {
+                pending_space = !out.is_empty();
+                None
+            }
+            c => Some(c),
+        };
+        if let Some(c) = mapped {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            if out.chars().count() >= MAX_NAME_LEN {
+                out.push('…');
+                return out;
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// A ledger to record unsupported/unimplemented API calls during
 /// layout and JavaScript execution. This implements the "honest failure"
 /// system to avoid silently ignoring missing functionality.
@@ -71,7 +124,7 @@ impl ApiCoverageLedger {
 
     /// Records an unimplemented API call.
     pub fn record(&mut self, category: ApiCategory, api_name: &str) {
-        let key = (category, api_name.to_string());
+        let key = (category, sanitize_name(api_name));
         *self.missing_apis.entry(key).or_insert(0) += 1;
     }
 
@@ -102,7 +155,8 @@ impl ApiCoverageLedger {
 
     /// True if the given API name was recorded under the given category.
     pub fn contains(&self, category: ApiCategory, api_name: &str) -> bool {
-        self.missing_apis.contains_key(&(category, api_name.to_string()))
+        self.missing_apis
+            .contains_key(&(category, sanitize_name(api_name)))
     }
 
     /// Dumps the current ledger state to a file in a human-readable format.

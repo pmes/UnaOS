@@ -91,11 +91,63 @@ fn is_non_rendered(name: &str) -> bool {
     // noscript: scripting IS enabled here (page scripts run), so its
     // fallback content must not render. iframe/object/embed: no frame
     // support yet — an empty box is honest, raw content leaking is not.
+    // option/optgroup: a <select>'s choices live in a popup, not in flow —
+    // boxed, every select dumped its whole option list as page text.
     matches!(
         name,
         "head" | "script" | "style" | "title" | "meta" | "link" | "template"
             | "noscript" | "iframe" | "object" | "embed"
+            | "option" | "optgroup"
     )
+}
+
+/// The (submit value, display label) of a `<select>`'s selected option:
+/// the first option carrying `selected`, else the first option at all.
+/// Value is the option's `value` attribute, falling back to its text —
+/// the HTML rule. Label is always the option's text.
+fn select_selected_option(select: &NodeRef) -> Option<(String, String)> {
+    let mut first: Option<(String, String)> = None;
+    for desc in select.descendants() {
+        let Some(el) = desc.as_element() else { continue };
+        if el.name.local.as_ref() != "option" {
+            continue;
+        }
+        let label = desc.text_contents().split_whitespace().collect::<Vec<_>>().join(" ");
+        let attrs = el.attributes.borrow();
+        let selected = attrs.get("selected").is_some();
+        let value = attrs
+            .get("value")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| label.clone());
+        drop(attrs);
+        let pair = (value, label);
+        if selected {
+            return Some(pair);
+        }
+        if first.is_none() {
+            first = Some(pair);
+        }
+    }
+    first
+}
+
+/// Publishes a `<select>`'s effective value onto the element, so the paint
+/// path (which draws a control's `value` attribute) and form submission
+/// (which reads the same attribute) both see the selected option rather
+/// than nothing. `data-aether-label` carries the human-visible text, which
+/// differs from the submit value whenever the option has a `value` attr
+/// (`<option value=en>English</option>`).
+fn publish_select_value(node: &NodeRef) {
+    let Some(el) = node.as_element() else { return };
+    if el.name.local.as_ref() != "select" {
+        return;
+    }
+    let Some((value, label)) = select_selected_option(node) else { return };
+    let mut attrs = el.attributes.borrow_mut();
+    if attrs.get("value").is_none_or(|v| v.is_empty()) {
+        attrs.insert("value", value);
+    }
+    attrs.insert("data-aether-label", label);
 }
 
 /// Inline-level elements: they size to content and flow in wrapping rows.
@@ -245,6 +297,10 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
                 return None;
             }
         }
+
+        // A <select> keeps its box but not its options: publish the selected
+        // option onto the element so the control paints/submits a value.
+        publish_select_value(dom_node);
 
         let mut kids: Vec<(taffy::NodeId, bool)> = Vec::new();
         for child in dom_node.children() {
