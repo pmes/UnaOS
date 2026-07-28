@@ -124,14 +124,17 @@ fn main() {
                                 }
                             }
                         }
-                        // Mirror the engine's current url into the address
-                        // bar (covers clicks, back/forward, reload, typing).
-                        if let Some(current) = engine.history.get(engine.history_idx) {
-                            if last_url.as_deref() != Some(current.as_str()) {
-                                last_url = Some(current.clone());
-                                engine_tx.fire(SMessage::BrowserUrlChanged(current.clone()));
-                            }
-                        }
+                    }
+                }
+                // One choke point for the address bar: whatever the last turn
+                // of the loop did — link click, form submit, Back, Forward,
+                // Reload, typed url, or a script-driven navigation run off the
+                // tick — the engine's current history entry is the truth, and
+                // any change to it is mirrored to the chrome exactly once.
+                if let Some(current) = engine.history.get(engine.history_idx) {
+                    if last_url.as_deref() != Some(current.as_str()) {
+                        last_url = Some(current.clone());
+                        engine_tx.fire(SMessage::BrowserUrlChanged(current.clone()));
                     }
                 }
             }
