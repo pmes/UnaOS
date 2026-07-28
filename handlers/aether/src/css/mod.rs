@@ -840,7 +840,19 @@ fn is_position_token(t: &str) -> bool {
 
 /// Truncates a value for a stable, bounded ledger key.
 fn clip(v: &str) -> &str {
-    &v[..v.len().min(24)]
+    clip_n(v, 24)
+}
+
+/// Truncates to at most `n` bytes, on a char boundary.
+fn clip_n(v: &str, n: usize) -> &str {
+    if v.len() <= n {
+        return v;
+    }
+    let mut end = n;
+    while end > 0 && !v.is_char_boundary(end) {
+        end -= 1;
+    }
+    &v[..end]
 }
 
 /// One applicable rule: a single compiled selector with its declarations.
@@ -850,6 +862,10 @@ struct Rule {
     selector: kuchiki::Selector,
     style: std::rc::Rc<SpecifiedStyle>,
     important: bool,
+    /// Cascade weight. Normally the compiled selector's own specificity;
+    /// a selector recovered by lowering carries the specificity of the
+    /// ORIGINAL construct instead (`:where()`'s arguments weigh nothing).
+    specificity: kuchiki::Specificity,
     key: RuleKey,
     plan: MatchPlan,
     /// Every depth-0 `.class`/`#id` in the selector: ALL must exist
@@ -1137,7 +1153,444 @@ pub(crate) fn split_selector_list(prelude: &str) -> Vec<&str> {
     out
 }
 
-/// Compiles a selector list, keeping every selector the engine accepts.
+// ---------------------------------------------------------------------
+// Selector lowering (rewrite-before-compile salvage)
+//
+// Servo's selector parser is a 2019-era snapshot: `:is()`, `:where()`,
+// `:has()`, `:focus-visible`, `:focus-within`, `:not()` with an argument
+// LIST, every pseudo-element, and most form-state pseudo-classes are all
+// rejected outright — and a rejected selector drops the WHOLE RULE, not one
+// declaration. On a modern component/utility stylesheet that is hundreds of
+// live rules lost with nothing on screen to show for it.
+//
+// The salvage runs ONLY after a member has already failed to compile, so
+// the fast path (whole list compiles first try) pays nothing. Each failing
+// member is rewritten to a semantically equivalent form the parser does
+// accept; whatever survives is compiled, and whatever cannot be rewritten
+// is ledgered under a NAMED bucket so every dropped rule has a reason.
+// ---------------------------------------------------------------------
+
+/// Pseudo-classes naming a dynamic state this engine never enters: there is
+/// no pointer, no focus, and no navigation target in a static render.
+///
+/// `:hover`/`:active`/`:focus`/`:visited` are the interesting precedent —
+/// servo's parser *accepts* them, so today they compile into rules that
+/// simply never match (`engine_tests::test_hover_focus_not_applied` pins
+/// exactly that). The names below are their unparseable siblings; dropping
+/// such a member reproduces the same observable behaviour instead of
+/// throwing away the rest of the selector list along with it.
+const DYNAMIC_STATE_PSEUDOS: &[&str] = &[
+    "hover", "active", "focus", "focus-visible", "focus-within", "focus-ring",
+    "visited", "target", "target-within", "user-invalid", "user-valid",
+    "autofill", "-webkit-autofill", "-moz-focusring", "-moz-drag-over",
+    "-moz-focus-inner", "modal", "popover-open", "fullscreen", "open",
+    "picture-in-picture", "playing", "paused", "current", "past", "future",
+    "local-link", "muted", "seeking", "stalled", "buffering",
+];
+
+/// Form/validity pseudo-classes whose state we do not model. (`:required`
+/// and `:optional` are deliberately absent — they lower to an attribute
+/// test; `:checked`/`:disabled`/`:enabled`/`:indeterminate` already parse.)
+const FORM_STATE_PSEUDOS: &[&str] = &[
+    "valid", "invalid", "in-range", "out-of-range", "read-only", "read-write",
+    "placeholder-shown", "default", "blank", "user-error",
+];
+
+/// Pseudo-ELEMENTS that predate the `::` spelling, including the vendor
+/// placeholder spellings every reset sheet still ships. A rule targeting
+/// any pseudo-element styles a generated box we never create, so it can
+/// never match our tree — that is a known, quiet non-application, not a
+/// parse defect, and it shares the existing `pseudo-element-rule` key.
+const LEGACY_PSEUDO_ELEMENTS: &[&str] = &[
+    "before", "after", "first-line", "first-letter",
+    "-ms-input-placeholder", "-moz-placeholder", "-webkit-input-placeholder",
+    "-ms-clear", "-ms-reveal", "-ms-expand", "-ms-check",
+];
+
+/// Vendor prefixes. An unrecognised `:-vendor-thing` pseudo-CLASS is always
+/// some UI or media state (`:-moz-ui-invalid`, `:-ms-fullscreen`,
+/// `:-o-prefocus`) that a static render never enters, so it gets its own
+/// named bucket rather than the residual compile-failure key.
+const VENDOR_PREFIXES: &[&str] = &["-webkit-", "-moz-", "-ms-", "-o-"];
+
+/// Functional pseudo-classes that are pure selector GROUPING: the element
+/// matches if it matches any argument. Includes the legacy spellings that
+/// shipped before `:is()` was standardised.
+const GROUPING_PSEUDOS: &[&str] =
+    &["is", "where", "matches", "any", "-moz-any", "-webkit-any"];
+
+/// Byte index of the `)` matching the `(` at `open`.
+fn matching_paren(s: &str, open: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let (mut depth, mut i) = (0i32, open);
+    let mut quote: Option<u8> = None;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\\' {
+            i += 2;
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => quote = Some(c),
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Locates the first `:name(...)` at nesting depth 0 whose name is listed.
+/// Returns `(colon index, lowercased name, open paren, close paren)`.
+fn find_functional(s: &str, names: &[&str]) -> Option<(usize, String, usize, usize)> {
+    let b = s.as_bytes();
+    let (mut depth, mut i) = (0i32, 0usize);
+    let mut quote: Option<u8> = None;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\\' {
+            i += 2;
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => quote = Some(c),
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b':' if depth == 0 => {
+                let start = i + 1;
+                let mut j = start;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-') {
+                    j += 1;
+                }
+                if j > start && j < b.len() && b[j] == b'(' {
+                    let name = s[start..j].to_ascii_lowercase();
+                    if names.iter().any(|n| *n == name) {
+                        if let Some(close) = matching_paren(s, j) {
+                            return Some((i, name, j, close));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Every pseudo token at nesting depth 0: `(is_pseudo_element, name)`.
+/// Depth 0 only, deliberately — a `:focus-visible` inside `:is(...)` kills
+/// only its own branch, and is seen after the group is distributed.
+fn depth0_pseudos(s: &str) -> Vec<(bool, String)> {
+    let b = s.as_bytes();
+    let (mut depth, mut i) = (0i32, 0usize);
+    let mut quote: Option<u8> = None;
+    let mut out = Vec::new();
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\\' {
+            i += 2;
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => quote = Some(c),
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b':' if depth == 0 => {
+                let mut start = i + 1;
+                let is_element = start < b.len() && b[start] == b':';
+                if is_element {
+                    start += 1;
+                }
+                let mut j = start;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-') {
+                    j += 1;
+                }
+                if j > start {
+                    out.push((is_element, s[start..j].to_ascii_lowercase()));
+                }
+                i = j;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// True when the selector has a depth-0 combinator (i.e. is not a single
+/// compound). Used to decide whether a group argument can be substituted.
+fn is_complex(s: &str) -> bool {
+    let b = s.as_bytes();
+    let (mut depth, mut i) = (0i32, 0usize);
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b' ' | b'\t' | b'\n' | b'>' | b'+' | b'~' if depth == 0 => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True when the span `[before, after)` is a whole compound on its own —
+/// i.e. what surrounds it is a combinator, a comma, or nothing.
+fn is_whole_compound(s: &str, before: usize, after: usize) -> bool {
+    let edge = |c: Option<char>| {
+        matches!(c, None | Some(' ') | Some('\t') | Some('\n') | Some('>') | Some('+') | Some('~') | Some(','))
+    };
+    edge(s[..before].chars().next_back()) && edge(s[after..].chars().next())
+}
+
+/// Classifies a member that no rewrite can save, returning its ledger
+/// bucket. Only depth-0 syntax is considered.
+fn unmatchable_bucket(sel: &str) -> Option<&'static str> {
+    if sel.contains('&') {
+        return Some("selector-nesting");
+    }
+    for (is_element, name) in depth0_pseudos(sel) {
+        if is_element || LEGACY_PSEUDO_ELEMENTS.contains(&name.as_str()) {
+            // Vendor pseudo-elements (`::-webkit-input-placeholder`,
+            // `::-moz-focus-inner`, `::-webkit-scrollbar`, …) land here too:
+            // a box we never generate, so the rule can never apply.
+            return Some("pseudo-element-rule");
+        }
+        match name.as_str() {
+            // Real work, a later arc: `:has()` needs forward matching.
+            "has" => return Some("selector-has"),
+            "host" | "host-context" | "defined" | "part" | "slotted" => {
+                return Some("selector-shadow-dom")
+            }
+            "lang" | "dir" => return Some("selector-lang-dir"),
+            n if DYNAMIC_STATE_PSEUDOS.contains(&n) => return Some("selector-dynamic-state"),
+            n if FORM_STATE_PSEUDOS.contains(&n) => return Some("selector-form-state"),
+            // `:-moz-any()`/`:-webkit-any()` are vendor spellings of a
+            // GROUP, not a state — they lower, so never bucket them here.
+            n if GROUPING_PSEUDOS.contains(&n) => {}
+            n if VENDOR_PREFIXES.iter().any(|p| n.starts_with(p)) => {
+                return Some("selector-vendor-pseudo")
+            }
+            _ => {}
+        }
+    }
+    if sel.contains(":nth") && sel.contains(" of ") {
+        return Some("selector-nth-of");
+    }
+    // `:not(X)` where X is something we cannot EVALUATE (as opposed to
+    // something that never matches) makes the whole negation unknown —
+    // report X's bucket rather than silently over-matching by dropping it.
+    let mut rest = sel;
+    while let Some((_, _, open, close)) = find_functional(rest, &["not"]) {
+        for arg in split_selector_list(&rest[open + 1..close]) {
+            if never_matches(arg) {
+                continue; // a tautology; `rewrite_not` deletes it
+            }
+            match unmatchable_bucket(arg) {
+                Some(b) => return Some(b),
+                None => {}
+            }
+        }
+        rest = &rest[close + 1..];
+    }
+    None
+}
+
+/// True when this argument of a `:not()` can never match anything we
+/// render, which makes the negation unconditionally true.
+fn never_matches(arg: &str) -> bool {
+    matches!(
+        unmatchable_bucket(arg),
+        Some("pseudo-element-rule") | Some("selector-dynamic-state")
+            | Some("selector-form-state") | Some("selector-shadow-dom")
+            | Some("selector-vendor-pseudo")
+    )
+}
+
+/// Rewrites one depth-0 `:not(...)`: an argument LIST becomes a chain of
+/// single-argument negations (`:not(a, b)` ≡ `:not(a):not(b)`, and servo
+/// only parses the latter), and arguments that can never match are dropped
+/// because negating them is a tautology (`.x:not(:focus-visible)` styles
+/// `.x` in a render that never focuses anything).
+fn rewrite_not(text: &str) -> Option<String> {
+    let (colon, _, open, close) = find_functional(text, &["not"])?;
+    let args = split_selector_list(&text[open + 1..close]);
+    let kept: Vec<&str> = args.iter().copied().filter(|a| !never_matches(a)).collect();
+    let replacement = if kept.is_empty() {
+        if is_whole_compound(text, colon, close + 1) { "*".to_string() } else { String::new() }
+    } else {
+        kept.iter().map(|a| format!(":not({a})")).collect::<Vec<_>>().join("")
+    };
+    let out = format!("{}{}{}", &text[..colon], replacement, &text[close + 1..]);
+    (out != text).then_some(out)
+}
+
+/// A candidate selector plus the selector whose specificity the cascade
+/// should charge it. The two differ only where `:where()` was distributed:
+/// `:where()`'s arguments contribute NOTHING to specificity, so the twin
+/// keeps the same shape with the argument replaced by a hole. Compiling
+/// the twin and reading its specificity is exact for the common case.
+type Candidate = (String, String);
+
+/// Distributes the first depth-0 grouping pseudo over its arguments:
+/// `a :is(b, c)` -> `a b`, `a c`.
+///
+/// An argument that is itself complex can only be substituted when the
+/// group stands alone as a whole compound: `a :is(b > c)` -> `a b > c` is
+/// sound, `a.x:is(b > c)` is not (it would need the compound folded onto
+/// the argument's subject), so that argument is dropped and ledgered.
+///
+/// Specificity: for `:where()` the twin loses the argument entirely, which
+/// is exact. For `:is()` each branch is charged its OWN specificity rather
+/// than the spec's "max over all arguments" — a documented approximation
+/// that can only under-charge a branch, and one that keeps every rule
+/// alive. Dropped rules are worse than slightly-wrong specificity.
+fn distribute_grouping(text: &str, spec: &str) -> Option<Vec<Candidate>> {
+    let (colon, name, open, close) = find_functional(text, GROUPING_PSEUDOS)?;
+    // The twin has had the SAME rewrites applied, so its first depth-0
+    // group is the same construct — unless an argument we already spliced
+    // in carried a nested group, which the twin dropped. Detect that and
+    // fall back to approximating the specificity with the rewritten form.
+    let twin = find_functional(spec, GROUPING_PSEUDOS)
+        .filter(|(_, n, _, _)| *n == name);
+    let whole = is_whole_compound(text, colon, close + 1);
+    let (pre, suf) = (&text[..colon], &text[close + 1..]);
+    let mut out = Vec::new();
+    for arg in split_selector_list(&text[open + 1..close]) {
+        if is_complex(arg) && !whole {
+            crate::ledger::record_css("selector-group-complex-arg");
+            continue;
+        }
+        let matched = format!("{pre}{arg}{suf}");
+        let twin_text = match &twin {
+            Some((tc, _, _, tclose)) => {
+                let fill = if name == "where" {
+                    if whole { "*" } else { "" }
+                } else {
+                    arg
+                };
+                format!("{}{}{}", &spec[..*tc], fill, &spec[tclose + 1..])
+            }
+            None => {
+                if name == "where" {
+                    crate::ledger::record_css("selector-where-specificity-approx");
+                }
+                matched.clone()
+            }
+        };
+        out.push((matched, twin_text));
+    }
+    Some(out)
+}
+
+/// Form pseudo-classes that are really attribute tests in disguise.
+fn rewrite_form_shorthand(text: &str) -> Option<String> {
+    for (from, to) in [(":required", "[required]"), (":optional", ":not([required])")] {
+        if text.contains(from) {
+            return Some(text.replace(from, to));
+        }
+    }
+    None
+}
+
+/// One rewrite step on a candidate, cheapest first. `None` = nothing left
+/// to try.
+fn rewrite_once((text, spec): &Candidate) -> Option<Vec<Candidate>> {
+    if let Some(t) = rewrite_not(text) {
+        let s = rewrite_not(spec).unwrap_or_else(|| t.clone());
+        return Some(vec![(t, s)]);
+    }
+    if let Some(v) = distribute_grouping(text, spec) {
+        return Some(v);
+    }
+    if let Some(t) = rewrite_form_shorthand(text) {
+        let s = rewrite_form_shorthand(spec).unwrap_or_else(|| t.clone());
+        return Some(vec![(t, s)]);
+    }
+    None
+}
+
+/// Salvages one selector-list member servo rejected, pushing whatever
+/// compiles onto `out` with the specificity the cascade should charge it.
+fn lower_member(part: &str, out: &mut Vec<(kuchiki::Selector, kuchiki::Specificity)>) {
+    // Bounded: a pathological nest of groups must not explode. Real pages
+    // sit far under this (`:is()` lists are short and rarely nested).
+    const BUDGET: usize = 48;
+    let mut work: Vec<Candidate> = vec![(part.to_string(), part.to_string())];
+    let mut done: Vec<Candidate> = Vec::new();
+    let mut steps = 0usize;
+    while let Some(cand) = work.pop() {
+        steps += 1;
+        if steps > BUDGET || work.len() + done.len() > BUDGET {
+            crate::ledger::record_css("selector-lower-budget");
+            break;
+        }
+        if kuchiki::Selectors::compile(&cand.0).is_ok() {
+            done.push(cand);
+            continue;
+        }
+        if let Some(bucket) = unmatchable_bucket(&cand.0) {
+            crate::ledger::record_css(bucket);
+            continue;
+        }
+        match rewrite_once(&cand) {
+            Some(next) => work.extend(next),
+            None => crate::ledger::record_css(&format!(
+                "selector-compile-failed:{}",
+                clip_n(&cand.0, 96)
+            )),
+        }
+    }
+    if !done.is_empty() {
+        // Telemetry: this rule is only alive because it was rewritten, and
+        // its match set is equivalent-modulo-the-approximations documented
+        // on `distribute_grouping`. One record per rescued member.
+        crate::ledger::record_css("selector-lowered");
+    }
+    for (text, spec) in done {
+        let Ok(sels) = kuchiki::Selectors::compile(&text) else { continue };
+        let charged = kuchiki::Selectors::compile(&spec)
+            .ok()
+            .and_then(|s| s.0.first().map(|sel| sel.specificity()));
+        for sel in sels.0 {
+            let s = charged.unwrap_or_else(|| sel.specificity());
+            out.push((sel, s));
+        }
+    }
+}
+
+/// Compiles a selector list, keeping every selector the engine accepts,
+/// paired with the specificity the cascade should charge it.
 ///
 /// Servo's selector parser rejects the whole list when ANY member uses
 /// syntax it doesn't implement. Component CSS (and every Tailwind build)
@@ -1145,24 +1598,30 @@ pub(crate) fn split_selector_list(prelude: &str) -> Vec<&str> {
 /// would otherwise discard the declarations for all its siblings — on a
 /// typical shell that is hundreds of live rules lost, which is why whole
 /// headers and nav bars never got their layout properties. Recompiling
-/// member-by-member keeps the supported ones and ledgers only the rest.
-fn compile_selector_list(prelude: &str) -> Option<kuchiki::Selectors> {
+/// member-by-member keeps the supported ones; lowering (above) recovers
+/// most of the rest; only what is left is ledgered.
+fn compile_selector_list(prelude: &str) -> Vec<(kuchiki::Selector, kuchiki::Specificity)> {
+    let mut out = Vec::new();
+    // Fast path: the whole list parses, no salvage machinery runs at all.
     if let Ok(s) = kuchiki::Selectors::compile(prelude) {
-        return Some(s);
+        for sel in s.0 {
+            let spec = sel.specificity();
+            out.push((sel, spec));
+        }
+        return out;
     }
-    let parts = split_selector_list(prelude);
-    let mut kept = Vec::new();
-    for part in parts {
+    for part in split_selector_list(prelude) {
         match kuchiki::Selectors::compile(part) {
-            Ok(s) => kept.extend(s.0),
-            Err(_) => crate::ledger::record_css(&format!("selector-compile-failed:{}", clip(part))),
+            Ok(s) => {
+                for sel in s.0 {
+                    let spec = sel.specificity();
+                    out.push((sel, spec));
+                }
+            }
+            Err(_) => lower_member(part, &mut out),
         }
     }
-    if kept.is_empty() {
-        None
-    } else {
-        Some(kuchiki::Selectors(kept))
-    }
+    out
 }
 
 pub fn apply_css(layout_tree: &mut LayoutTree, css: &str) {
@@ -1238,7 +1697,7 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     rules.sort_by(|a, b| {
         a.important
             .cmp(&b.important)
-            .then(a.selector.specificity().cmp(&b.selector.specificity()))
+            .then(a.specificity.cmp(&b.specificity))
     });
 
     // Element refs computed ONCE — matching is O(rules × elements) either
@@ -1468,32 +1927,31 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
             crate::ledger::record_css("pseudo-element-rule");
             continue;
         }
-        // Compile with kuchiki's real selector engine (servo selectors).
-        let selectors = match compile_selector_list(&prelude) {
-            Some(s) => s,
-            None => continue,
-        };
+        // Compile with kuchiki's real selector engine (servo selectors),
+        // salvaging modern syntax it rejects (see `lower_member`).
+        let selectors = compile_selector_list(&prelude);
+        if selectors.is_empty() {
+            continue;
+        }
 
         let (normal, important, has_important) = parse_declaration_block_tiers(&body);
         let normal = std::rc::Rc::new(normal);
-        for selector in selectors.0 {
+        for (selector, specificity) in selectors {
             let text = selector.to_string();
             let key = rule_key(&text);
             let plan = match_plan(&text);
             let required = required_tokens(&text);
-            rules.push(Rule { selector, style: normal.clone(), important: false, key, plan, required });
+            rules.push(Rule { selector, style: normal.clone(), important: false, specificity, key, plan, required });
         }
         if has_important {
             // Selector isn't Clone; the important tier compiles its own copy.
-            if let Some(selectors) = compile_selector_list(&prelude) {
-                let important = std::rc::Rc::new(important);
-                for selector in selectors.0 {
-                    let text = selector.to_string();
-                    let key = rule_key(&text);
-                    let plan = match_plan(&text);
-                    let required = required_tokens(&text);
-                    rules.push(Rule { selector, style: important.clone(), important: true, key, plan, required });
-                }
+            let important = std::rc::Rc::new(important);
+            for (selector, specificity) in compile_selector_list(&prelude) {
+                let text = selector.to_string();
+                let key = rule_key(&text);
+                let plan = match_plan(&text);
+                let required = required_tokens(&text);
+                rules.push(Rule { selector, style: important.clone(), important: true, specificity, key, plan, required });
             }
         }
     }
@@ -2156,6 +2614,135 @@ mod tests {
         assert_eq!(rule_key(r".w-1\/2"), RuleKey::Class("w-1/2".into()));
         assert_eq!(rule_key(r".h-\[5\.75rem\]"), RuleKey::Class("h-[5.75rem]".into()));
         assert_eq!(rule_key(r"div .md\:grid-cols-2"), RuleKey::Class("md:grid-cols-2".into()));
+    }
+
+    /// Colour of the element with `id` after applying `css` to `html`.
+    fn color_of(html: &str, css: &str, id: &str) -> Option<(u8, u8, u8)> {
+        let mut tree = crate::layout::compute_layout(&crate::dom::parse_html(html));
+        apply_css(&mut tree, css);
+        for (node_id, dom_node) in &tree.node_map {
+            let Some(el) = dom_node.as_element() else { continue };
+            if el.attributes.borrow().get("id") == Some(id) {
+                return tree.paint_map.get(node_id).and_then(|p| p.color);
+            }
+        }
+        None
+    }
+
+    const LOWER_HTML: &str = r#"<html><body>
+        <div id="a" class="x"><span id="s">s</span></div>
+        <p id="b" class="y">y</p>
+        <input id="i" required>
+    </body></html>"#;
+
+    /// `:is()`/`:where()` are not in servo's 2019 selector set. Distributing
+    /// them over their arguments keeps the rule alive.
+    #[test]
+    fn test_lower_is_where_distributes() {
+        for sel in [
+            "body :is(.x, .y)",
+            "body :where(.x, .y)",
+            "body :matches(.x, .y)",
+            "body :-moz-any(.x, .y)",
+        ] {
+            let css = format!("{sel} {{ color: rgb(1, 2, 3); }}");
+            assert_eq!(color_of(LOWER_HTML, &css, "a"), Some((1, 2, 3)), "{sel}");
+            assert_eq!(color_of(LOWER_HTML, &css, "b"), Some((1, 2, 3)), "{sel}");
+        }
+        // Mid-compound, and with a complex argument in whole-compound
+        // position — `div :is(.x > span)` must reach the span.
+        assert_eq!(
+            color_of(LOWER_HTML, "p:is(.y, .z) { color: rgb(4, 5, 6); }", "b"),
+            Some((4, 5, 6))
+        );
+        assert_eq!(
+            color_of(LOWER_HTML, "body :is(.x > span) { color: rgb(7, 8, 9); }", "s"),
+            Some((7, 8, 9))
+        );
+    }
+
+    /// `:where()` contributes NOTHING to specificity, so a later-but-plainer
+    /// rule of equal weight wins on source order and a heavier one always
+    /// wins. Distributing must not smuggle the argument's weight in.
+    #[test]
+    fn test_lower_where_specificity() {
+        // `:where(.x)` weighs nothing => `#a:where(.x)` is (1,0,0), which a
+        // two-class selector (0,2,0) must NOT beat.
+        let css = r#"
+            #a:where(.x) { color: rgb(1, 1, 1); }
+            .x.x { color: rgb(2, 2, 2); }
+        "#;
+        assert_eq!(color_of(LOWER_HTML, css, "a"), Some((1, 1, 1)));
+        // `:is(.x)` DOES weigh: here the `:is` branch is (0,2,0) and, tied
+        // with the plain rule, later source order wins.
+        let css = r#"
+            .y:is(.y) { color: rgb(1, 1, 1); }
+            .y.y { color: rgb(2, 2, 2); }
+        "#;
+        assert_eq!(color_of(LOWER_HTML, css, "b"), Some((2, 2, 2)));
+    }
+
+    /// Servo parses `:not(simple)` only. An argument LIST becomes a chain,
+    /// and an argument that can never match makes the negation a tautology.
+    #[test]
+    fn test_lower_not_list_and_tautology() {
+        assert_eq!(
+            color_of(LOWER_HTML, ".x:not(.q, .r) { color: rgb(1, 2, 3); }", "a"),
+            Some((1, 2, 3))
+        );
+        assert_eq!(
+            color_of(LOWER_HTML, ".x:not(.q, .x) { color: rgb(1, 2, 3); }", "a"),
+            None,
+            "a negation that DOES match must still exclude the element"
+        );
+        // `:focus-visible` is a state we never enter, so negating it is
+        // always true — the rule must apply, not be dropped.
+        assert_eq!(
+            color_of(LOWER_HTML, ".x:not(:focus-visible) { color: rgb(4, 5, 6); }", "a"),
+            Some((4, 5, 6))
+        );
+    }
+
+    /// `:required`/`:optional` are attribute tests in disguise.
+    #[test]
+    fn test_lower_required_optional() {
+        assert_eq!(
+            color_of(LOWER_HTML, "input:required { color: rgb(1, 2, 3); }", "i"),
+            Some((1, 2, 3))
+        );
+        assert_eq!(
+            color_of(LOWER_HTML, "input:optional { color: rgb(1, 2, 3); }", "i"),
+            None
+        );
+    }
+
+    /// Everything that cannot be lowered still drops — but only its own
+    /// list member, and each under a named bucket rather than the residual
+    /// compile-failure key.
+    #[test]
+    fn test_lower_buckets() {
+        for (sel, bucket) in [
+            (".x:has(> span)", "selector-has"),
+            (".x:focus-within", "selector-dynamic-state"),
+            (".x:-moz-ui-invalid", "selector-vendor-pseudo"),
+            (".x:placeholder-shown", "selector-form-state"),
+            (".x:lang(en)", "selector-lang-dir"),
+            (".x::-webkit-input-placeholder", "pseudo-element-rule"),
+            (".x:-ms-input-placeholder", "pseudo-element-rule"),
+            (".x:not(:has(> span))", "selector-has"),
+        ] {
+            crate::ledger::reset();
+            // The sibling member must survive the unsupported one.
+            let css = format!("{sel}, .y {{ color: rgb(1, 2, 3); }}");
+            assert_eq!(color_of(LOWER_HTML, &css, "b"), Some((1, 2, 3)), "{sel}");
+            assert_eq!(color_of(LOWER_HTML, &css, "a"), None, "{sel} must not match");
+            let dump = format!("{:?}", crate::ledger::snapshot());
+            assert!(dump.contains(bucket), "{sel} should ledger {bucket}: {dump}");
+            assert!(
+                !dump.contains("selector-compile-failed"),
+                "{sel} should have a NAMED bucket, not the residual key"
+            );
+        }
     }
 
     /// A selector list survives one unsupported member: the rest of the

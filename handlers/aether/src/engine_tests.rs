@@ -251,7 +251,7 @@ mod tests {
         </style></head><body>
             <div id="t">x</div>
             <script>
-                clearTimeout(1);
+                new MutationObserver(function () {}).observe(document.body);
             </script>
         </body></html>"#;
         let mut engine = crate::AetherEngine::new();
@@ -261,7 +261,11 @@ mod tests {
         use crate::ledger::ApiCategory;
         assert!(snap.contains(ApiCategory::Css, "property:filter"), "unhandled CSS property must be recorded");
         assert!(snap.contains(ApiCategory::Css, "display:grid"), "unhandled display value must be recorded");
-        assert!(snap.contains(ApiCategory::Js, "window.clearTimeout"), "no-op clearTimeout must be recorded");
+        // clearTimeout used to be the JS-side example here; it is a real
+        // implementation now (see event_loop), so the honest never-delivers
+        // shim stands in for the "shim reports itself" contract.
+        assert!(snap.contains(ApiCategory::Js, "observer-never-delivers:MutationObserver"),
+            "a shim that answers without knowing must record itself");
     }
 
     #[test]
@@ -819,6 +823,161 @@ mod tests {
         let x = doc.select("#x").unwrap().next().unwrap();
         assert_eq!(x.attributes.borrow().get("data-boot"), Some("ran"),
             "zero-delay boot timer must run during load");
+    }
+
+    /// Reads `expr` off a booted page as a number.
+    fn js_num(engine: &mut crate::AetherEngine, expr: &str) -> f64 {
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let v = js.execute(expr).expect("probe must evaluate");
+        v.to_number(&mut js.context).expect("probe must be numeric")
+    }
+
+    /// THE incident regression: a `setTimeout` callback that re-arms itself
+    /// must not be able to hold a tick forever.
+    ///
+    /// The old wiring made every timer an immediate boa job, and `run_jobs`
+    /// drains until the queue is EMPTY — a self-re-arming poll timer (which is
+    /// what google's search UI starts on typing) refilled it faster than the
+    /// drain emptied it, so `tick()` never returned and the shell's select!
+    /// loop starved. Now the due set is snapshotted before any callback runs:
+    /// each tick fires exactly one generation, whatever the callback does.
+    #[test]
+    fn test_self_rearming_timer_fires_one_generation_per_tick() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled(
+            "https://example.com/",
+            r#"<html><body><div id="x">a</div>
+               <script>
+                 window.__n = 0;
+                 function poll() { window.__n++; setTimeout(poll, 0); }
+                 setTimeout(poll, 0);
+               </script></body></html>"#,
+            &[],
+            true,
+        );
+        // The load itself terminated (it would not have, before), and the boot
+        // drain is bounded to its pass count rather than the queue emptying.
+        let boot = js_num(&mut engine, "window.__n");
+        assert!(boot >= 1.0, "a zero-delay boot timer must run during load");
+        assert!(
+            boot <= 3.0 * crate::event_loop::BOOT_PASSES as f64,
+            "boot drain must be bounded to its passes (3 stages x {}), saw {}",
+            crate::event_loop::BOOT_PASSES,
+            boot
+        );
+        // From here the clock only moves when we move it: each tick must add
+        // exactly one generation, no matter how eagerly the callback re-arms.
+        crate::event_loop::freeze_clock();
+        for i in 1..=5 {
+            engine.tick();
+            assert_eq!(
+                js_num(&mut engine, "window.__n"),
+                boot + i as f64,
+                "tick {} must fire exactly one generation",
+                i
+            );
+        }
+    }
+
+    /// clearTimeout cancels a pending timer — both halves, the Rust record and
+    /// the JS callback slot.
+    #[test]
+    fn test_clear_timeout_cancels() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled(
+            "https://example.com/",
+            r#"<html><body><div id="x">a</div>
+               <script>window.__n = 0;</script></body></html>"#,
+            &[],
+            true,
+        );
+        crate::event_loop::freeze_clock();
+        {
+            let js = engine.js_engine.as_mut().unwrap();
+            js.execute(
+                "window.__id = setTimeout(function () { window.__n++; }, 50);
+                 window.__kept = setTimeout(function () { window.__n += 100; }, 50);
+                 clearTimeout(window.__id);",
+            )
+            .expect("arming must run clean");
+        }
+        assert_eq!(crate::event_loop::armed_count(), 1, "cleared timer must leave the queue");
+        crate::event_loop::advance_clock(50);
+        engine.tick();
+        assert_eq!(
+            js_num(&mut engine, "window.__n"),
+            100.0,
+            "the cleared callback must never run; the other one must"
+        );
+    }
+
+    /// setInterval repeats across ticks and clearInterval stops it. The clock
+    /// is the seam — no test anywhere sleeps.
+    #[test]
+    fn test_set_interval_repeats_until_cleared() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled(
+            "https://example.com/",
+            r#"<html><body><div id="x">a</div>
+               <script>window.__n = 0;</script></body></html>"#,
+            &[],
+            true,
+        );
+        crate::event_loop::freeze_clock();
+        {
+            let js = engine.js_engine.as_mut().unwrap();
+            js.execute("window.__iv = setInterval(function () { window.__n++; }, 50);")
+                .expect("arming must run clean");
+        }
+        engine.tick();
+        assert_eq!(js_num(&mut engine, "window.__n"), 0.0, "not due yet");
+        for i in 1..=3 {
+            crate::event_loop::advance_clock(50);
+            engine.tick();
+            assert_eq!(js_num(&mut engine, "window.__n"), i as f64, "one fire per period");
+        }
+        // A period that elapsed several times over still fires ONCE per tick:
+        // re-arming happens at fire time, so a fallen-behind interval never
+        // bursts to catch up.
+        crate::event_loop::advance_clock(500);
+        engine.tick();
+        assert_eq!(js_num(&mut engine, "window.__n"), 4.0, "no catch-up burst");
+
+        {
+            let js = engine.js_engine.as_mut().unwrap();
+            js.execute("clearInterval(window.__iv);").expect("clear must run clean");
+        }
+        assert_eq!(crate::event_loop::armed_count(), 0, "clearInterval empties the queue");
+        crate::event_loop::advance_clock(500);
+        engine.tick();
+        assert_eq!(js_num(&mut engine, "window.__n"), 4.0, "cleared interval must stop");
+    }
+
+    /// MessageChannel delivers through the timer queue — React's scheduler
+    /// yields on exactly this, so a port that never delivers stalls a page.
+    #[test]
+    fn test_message_channel_delivers_through_timer_queue() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled(
+            "https://example.com/",
+            r#"<html><body><div id="x">a</div>
+               <script>
+                 var ch = new MessageChannel();
+                 ch.port1.onmessage = function (e) {
+                   document.getElementById('x').setAttribute('data-msg', String(e.data));
+                 };
+                 ch.port2.postMessage('yielded');
+               </script></body></html>"#,
+            &[],
+            true,
+        );
+        let doc = engine.document.clone().unwrap();
+        let x = doc.select("#x").unwrap().next().unwrap();
+        assert_eq!(
+            x.attributes.borrow().get("data-msg"),
+            Some("yielded"),
+            "postMessage must be delivered by the boot drain"
+        );
     }
 
     /// el.style.x = ... writes the inline style attribute (replacing the
@@ -1648,6 +1807,7 @@ mod tests {
             images: Vec::new(),
             scripts,
             script_nodes,
+            favicon: None,
         };
         let mut engine = crate::AetherEngine::new();
         engine.load_page(page, true);
@@ -1750,5 +1910,285 @@ mod tests {
             let b = &scrolled[y * row..y * row + row];
             assert_eq!(a, b, "row {y} at scroll {s} does not match the unscrolled frame");
         }
+    }
+
+    #[test]
+    fn test_select_options_produce_no_boxes() {
+        let html = r#"<html><body><select name="lang">
+            <optgroup label="Group"><option value="de">Deutsch</option></optgroup>
+            <option value="en" selected>English</option>
+        </select></body></html>"#;
+        let document = dom::parse_html(html);
+        let tree = layout::compute_layout(&document);
+
+        for node in tree.node_map.values() {
+            if let Some(el) = node.as_element() {
+                let tag = el.name.local.as_ref();
+                assert!(
+                    tag != "option" && tag != "optgroup",
+                    "<{tag}> must produce no box — its text belongs in the popup, not the page"
+                );
+            }
+            if let Some(text) = node.as_text() {
+                let t = text.borrow();
+                assert!(
+                    !t.contains("Deutsch") && !t.contains("English"),
+                    "option text leaked into the box tree: {t:?}"
+                );
+            }
+        }
+
+        // The selected option must reach the control paint/submit path.
+        let select = document.select_first("select").unwrap();
+        let attrs = select.attributes.borrow();
+        assert_eq!(attrs.get("value"), Some("en"), "select submits the selected option's value");
+        assert_eq!(
+            attrs.get("data-aether-label"),
+            Some("English"),
+            "select paints the selected option's text"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Process survival: no page may kill the browser
+    // -----------------------------------------------------------------------
+
+    /// boa's `RuntimeLimit` error has no opaque JS form: the moment it reaches
+    /// a promise reaction, boa's own `to_opaque` PANICS
+    /// (`new_promise_reaction_job`). That killed the whole process on roughly
+    /// two google-search loads in five. The engine must survive it: the panic
+    /// is caught at the job boundary, the context is poisoned, and the DOM
+    /// stands. The VM ceiling is squeezed here to make the trip deterministic
+    /// — a real page reaches the same code by being large.
+    #[test]
+    fn test_runtime_limit_in_promise_reaction_does_not_kill_the_process() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled(
+            "https://example.com/",
+            r#"<html><body><div id="x">kept</div></body></html>"#,
+            &[],
+            true,
+        );
+        {
+            let js = engine.js_engine.as_mut().unwrap();
+            js.context.runtime_limits_mut().set_stack_size_limit(64);
+            js.execute(
+                "window.__settled = 0;
+                 Promise.resolve().then(function () {
+                     function f(n) { return n <= 0 ? 0 : f(n - 1) + 1; }
+                     return f(100000);
+                 }).then(function () { window.__settled = 1; });",
+            )
+            .expect("arming the reaction must run clean");
+        }
+        assert!(!crate::js::engine_poisoned(), "not poisoned before the job runs");
+
+        // The panic happens in here. Reaching the next line at all is the test.
+        engine.tick();
+
+        assert!(
+            crate::js::engine_poisoned(),
+            "a caught engine panic must poison the context"
+        );
+        {
+            let js = engine.js_engine.as_mut().unwrap();
+            assert!(
+                js.execute("1 + 1").is_err(),
+                "a poisoned engine refuses further script instead of running it on a broken VM"
+            );
+        }
+        // The DOM built before the panic is still intact and still renders.
+        let document = engine.document.as_ref().expect("document survives");
+        assert!(
+            document.select_first("#x").is_ok(),
+            "the DOM must render as it stands after the engine is poisoned"
+        );
+        crate::js::clear_poison();
+    }
+
+    /// The other half of the same story. `RuntimeLimit` is *uncatchable* in JS
+    /// (boa 0.21 `JsNativeErrorKind::is_catchable`), so a page's own `catch`
+    /// never sees it and it propagates straight out to whichever Rust caller
+    /// is nearest. Where that caller is ours — the timer dispatcher — it is an
+    /// ordinary `Err`: ledgered, generation continues, nothing poisoned. Only
+    /// boa's internal promise-job caller turns it into a panic, which is why
+    /// the guard exists and why it must not fire here.
+    #[test]
+    fn test_runtime_limit_in_timer_callback_is_an_ordinary_error() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled(
+            "https://example.com/",
+            r#"<html><body><div id="x">a</div></body></html>"#,
+            &[],
+            true,
+        );
+        crate::event_loop::freeze_clock();
+        {
+            let js = engine.js_engine.as_mut().unwrap();
+            js.context.runtime_limits_mut().set_stack_size_limit(64);
+            js.execute(
+                "window.__caught = 0; window.__after = 0;
+                 setTimeout(function () {
+                     try {
+                         (function f(n) { return n <= 0 ? 0 : f(n - 1) + 1; })(100000);
+                     } catch (e) { window.__caught = 1; }
+                 }, 10);
+                 setTimeout(function () { window.__after = 1; }, 10);",
+            )
+            .expect("arming must run clean");
+        }
+        crate::event_loop::advance_clock(10);
+
+        engine.tick();
+
+        assert!(
+            !crate::js::engine_poisoned(),
+            "a limit trip our own dispatcher catches is an error, not an engine panic"
+        );
+        assert_eq!(
+            js_num(&mut engine, "window.__caught"),
+            0.0,
+            "RuntimeLimit is uncatchable in JS: the page's own catch must not see it"
+        );
+        assert_eq!(
+            js_num(&mut engine, "window.__after"),
+            1.0,
+            "one callback hitting the ceiling must not stop the rest of the generation"
+        );
+    }
+
+    /// DOM wrapper methods invoked with a non-object `this` — `appendChild
+    /// .call(null, x)`, a method pulled off its receiver — used to unwrap a
+    /// `None` and abort the process. Observed live on google search.
+    #[test]
+    fn test_dom_methods_with_detached_this_do_not_panic() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled(
+            "https://example.com/",
+            r#"<html><body><div id="x">a</div></body></html>"#,
+            &[],
+            true,
+        );
+        let js = engine.js_engine.as_mut().unwrap();
+        js.execute(
+            "var d = document.getElementById('x');
+             var f = d.appendChild;
+             window.__r = 0;
+             try { f.call(null, document.createElement('span')); } catch (e) { window.__r = 1; }
+             try { d.setAttribute.call(undefined, 'a', 'b'); } catch (e) { window.__r = 1; }
+             try { d.removeChild.call(7, d); } catch (e) { window.__r = 1; }",
+        )
+        .expect("a detached receiver must not take the process down");
+        assert!(
+            !crate::js::engine_poisoned(),
+            "a detached receiver is an ordinary no-op, not an engine panic"
+        );
+    }
+
+    /// `console.log` runs the page's own `toString`. One that throws used to
+    /// unwrap into a process abort.
+    #[test]
+    fn test_console_log_with_throwing_tostring_does_not_panic() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled("https://example.com/", "<html><body>a</body></html>", &[], true);
+        let js = engine.js_engine.as_mut().unwrap();
+        js.execute(
+            "window.__r = 0;
+             try { console.log({ toString: function () { throw new Error('no'); } }); }
+             catch (e) { window.__r = 1; }",
+        )
+        .expect("a throwing toString must surface as a JS error, not a panic");
+        assert!(!crate::js::engine_poisoned(), "no engine panic");
+    }
+
+    /// The rAF drain is bounded and driven from Rust: each pass runs the batch
+    /// registered when it began, a callback that throws is ledgered and the
+    /// pass continues, and a self-re-registering render loop is cut off.
+    #[test]
+    fn test_raf_drain_is_bounded_and_isolates_throwing_callbacks() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled("https://example.com/", "<html><body>a</body></html>", &[], true);
+        {
+            let js = engine.js_engine.as_mut().unwrap();
+            js.execute(
+                "window.__n = 0; window.__loops = 0;
+                 requestAnimationFrame(function () { window.__n++; throw new Error('bad'); });
+                 requestAnimationFrame(function () { window.__n++; });
+                 (function loop() {
+                     requestAnimationFrame(function () { window.__loops++; loop(); });
+                 })();",
+            )
+            .expect("registration must run clean");
+            crate::js::drain_raf(&mut js.context);
+        }
+        assert_eq!(
+            js_num(&mut engine, "window.__n"),
+            2.0,
+            "a throwing callback must not stop the rest of its batch"
+        );
+        assert_eq!(
+            js_num(&mut engine, "window.__loops"),
+            8.0,
+            "a self-re-registering render loop gets exactly the bounded pass count"
+        );
+    }
+
+    #[test]
+    fn test_ledger_dump_is_one_record_per_line() {
+        let mut ledger = crate::ledger::ApiCoverageLedger::new();
+        let multiline = "js-error:TypeError: x is not a function\n    at foo (eval:1:1)\r\n    at bar | baz (eval:2:2)";
+        ledger.record(crate::ledger::ApiCategory::Js, multiline);
+        ledger.record(crate::ledger::ApiCategory::Js, multiline);
+        ledger.record(crate::ledger::ApiCategory::Dom, &"x".repeat(500));
+
+        let path = std::env::temp_dir().join("aether_ledger_multiline_test.txt");
+        ledger.dump_to_file(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let records: Vec<&str> = text.lines().skip(4).filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(records.len(), 2, "one line per record, got: {records:#?}");
+        for line in &records {
+            let cols: Vec<&str> = line.split('|').collect();
+            assert_eq!(cols.len(), 3, "record must parse as category|name|count: {line:?}");
+            assert!(
+                cols[2].trim().parse::<usize>().is_ok(),
+                "count column must be a number: {line:?}"
+            );
+            assert!(cols[1].trim().chars().count() <= 201, "name must be capped: {line:?}");
+        }
+        let js = records.iter().find(|l| l.starts_with("JS")).unwrap();
+        assert!(js.trim_end().ends_with(" 2"), "both records merged into one count: {js:?}");
+    }
+
+    /// Modern selector syntax servo's parser rejects must not take the
+    /// whole rule with it. `:is()`/`:where()` lower by distribution, and
+    /// `:focus-visible` joins `:hover` as a state a static render never
+    /// enters — dropped, not fatal to its siblings in the list.
+    #[test]
+    fn test_modern_selector_syntax_lowered() {
+        let html = r#"<html><body>
+            <nav id="n" class="hdr"><a id="a" class="lnk" href="/">x</a></nav>
+        </body></html>"#;
+        let document = dom::parse_html(html);
+        let mut layout_tree = layout::compute_layout(&document);
+        css::apply_css(&mut layout_tree, r#"
+            nav :is(.lnk, .btn) { font-size: 20px; }
+            :where(.hdr) { color: rgb(1, 2, 3); }
+            .lnk:focus-visible, .hdr:has(> form) { color: rgb(9, 9, 9); }
+            .lnk:not(:focus-visible) { font-weight: bold; }
+        "#);
+        let paint = |id: &str| {
+            layout_tree.node_map.iter()
+                .find(|(_, n)| n.as_element().map_or(false, |e| {
+                    e.attributes.borrow().get("id") == Some(id)
+                }))
+                .map(|(nid, _)| layout_tree.paint_map.get(nid).cloned().unwrap_or_default())
+                .unwrap()
+        };
+        assert_eq!(paint("a").font_size, Some(20.0), ":is() must distribute");
+        assert_eq!(paint("n").color, Some((1, 2, 3)), ":where() must distribute");
+        assert_eq!(paint("a").color, None, ":focus-visible/:has must not match");
+        assert_eq!(paint("a").bold, Some(true), ":not(:focus-visible) is a tautology");
     }
 }
