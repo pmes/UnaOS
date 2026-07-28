@@ -1842,6 +1842,50 @@
   `EXEC-UVUG` legs unchanged in timing. The waived-budget path is metal-only (no HID in QEMU → no
   interactive mode), so it is **unverified in QEMU by nature** and is for the next attended boot to confirm.
 
+- **VUGPAUSE (a paused vug stops burning cores)** — an **app-only** arc: `crates/user-vug` + this doc, no
+  kernel change. **VUGCLICK** made a click *pause* a vug, and that is as far as it went: pause froze the
+  frame's **advance** (the orientation stopped changing) while the frame **loop** kept running at full
+  rate. Every paused frame still drained input, released both workers, rasterised 128×128 twice,
+  futex-barriered and **presented** — redrawing a surface that could not differ from the one already on
+  the panel. P67v2 paid for that on silicon: six click-paused vugs, six full render pipelines, cores
+  pinned with every crystal standing still. **Change:** when the vug is `paused` **and** its render state
+  is unchanged since the last present, the frame is skipped in full — no `PHASE` store (the workers stay
+  parked on their yield-poll instead of rasterising), no inline raster, no barrier, **no present**. The
+  idle loop is the input half of the normal frame plus one `SYS_YIELD`, and nothing else.
+  - **The predicate** is `paused && presented && presented_overlay == (detached || interactive) &&
+    ay == last_ay && ax == last_ax && dist == last_dist`, compared against the state recorded at the last
+    present. The `presented` term means the first frame is never skipped; the `presented_overlay` term
+    means the frame that first turns the VUGFPS overlay on is never skipped; the three state terms are
+    everything this program can put on its surface. **The first frame after unpause, or after any state
+    change, renders normally** — the predicate simply stops holding.
+  - **Unpause latency is one idle iteration** (a poll plus a yield), because the click that unpauses,
+    ESC, and a drag are all drained by the same `drain_input` the rendering path uses. There is no
+    separate wake channel to get wrong.
+  - **Never a park.** VUGGUARD/P60's lesson is that a vug blocked in an unbounded `futex_wait` is an
+    unkillable empty window. This idle path blocks on nothing: it is a runnable yield loop, so the
+    window stays live, `kill` works, and the compositor sees an ordinary running process.
+  - **`frame` counts frames PRESENTED**, so it does not advance while idled. That is what makes the
+    **VUGFPS** readout honest: the once-per-second refresh (now factored into `fps_refresh`, called from
+    *both* the rendering path and the idle loop) keeps running and the rate falls to **0** rather than
+    freezing on a stale number. A changed digit is the only thing that can still reach the panel while
+    idled — overlay only, one present, at most once per second. `draw_fps` therefore clears a **fixed
+    maximum-width** backing box (`FPS_BOX_W`) rather than one sized to the current digit count: with no
+    band clear behind it, a shrinking readout (47 → 0) would otherwise strand the old digit's pixels.
+  - **A foreground (fixture-mode) vug held paused also stops consuming `INTERACTIVE_CAP`.** Deliberate,
+    not a hole: pause is operator-driven, so a paused foreground vug is one an operator is holding, and
+    it still exits on **ESC** or `kill`. No battery leg can reach it — QEMU delivers no HID.
+  - **Witness:** one `[vugpause] idle engaged frame=<n>` at the first engagement, latched, never
+    per-frame (the same discipline as `[vuglife] budget waived`).
+
+  **Untouched by construction:** `paused` is set only inside the `interactive` branch, and `interactive`
+  is armed only by a real input event — QEMU raspi4b delivers no HID, so the deterministic auto path
+  never evaluates the idle predicate as true and its geometry, code shape and 300-frame
+  `checksum=0xe68285b85121ac7c` witness are unchanged. `draw_fps` is likewise reached only when
+  `detached || interactive`, which the foreground auto path is not. **Gates:** see the arc's landing
+  report — the idle path itself is metal-only by nature (no HID in QEMU → no pause), so it is
+  **unverified in QEMU** and is for the next attended boot to confirm; what QEMU proves is the negative,
+  that the deterministic path is untouched.
+
 ### x86_64 (branch `hw-rmbp`)
 
 - **U1a** — first ring-3 round-trip (the x86 mirror of aarch64 M6a). A

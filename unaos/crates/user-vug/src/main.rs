@@ -83,6 +83,37 @@
 //     prose qualifier outside it — so no future sitting re-diagnoses this as a crash.
 // The deterministic AUTO path (AUTO_FRAMES = 300, the checksum witness) is untouched in both modes.
 //
+// VUGPAUSE — A PAUSED VUG MUST NOT BURN A CORE. VUGCLICK made a click PAUSE the rotation, and that is
+// where it stopped: pause froze the frame's ADVANCE (the orientation stopped changing) but the frame
+// LOOP kept running at full rate — every paused frame still drained input, released both workers,
+// rasterised 128x128 twice, futex-barriered and PRESENTED, redrawing a surface that could not differ
+// from the one already on the panel. P67v2 paid for that on silicon: six click-paused vugs, six full
+// render pipelines, cores pinned with the crystals standing still.
+//
+// So: when the vug is `paused` AND its render state (orientation, zoom, and the displayed fps digits —
+// everything this program can put on its surface) is UNCHANGED since the last present, the frame is
+// SKIPPED entirely — no worker release, no rasterise, no barrier, no present. The parent polls input
+// and calls `SYS_YIELD`, which is the whole idle loop. Consequences, each deliberate:
+//   * UNPAUSE LATENCY is one idle iteration — a poll plus a yield — because the idle loop is exactly
+//     the input half of the normal frame. The click that unpauses, ESC, and a drag are all seen on the
+//     very next pass, and the first frame after ANY state change renders normally.
+//   * THE WINDOW STAYS LIVE AND KILLABLE. VUGGUARD's P60 lesson is that a vug which parks in an
+//     unbounded `futex_wait` is an unkillable empty window; this idle path never blocks on anything. It
+//     is a runnable yield loop, so `kill` and the compositor see an ordinary running process.
+//   * `frame` COUNTS FRAMES PRESENTED, so it does not advance while idled. That is what makes the
+//     VUGFPS readout honest: the once-per-second refresh keeps running FROM the idle loop and the
+//     rate falls to 0 rather than freezing at a stale number. A changed digit is the one thing that can
+//     still redraw while idled — overlay only, then one present, at most once per second.
+//   * THE DETERMINISTIC AUTO PATH CANNOT REACH THIS. `paused` is set only inside the `interactive`
+//     branch, and interactive is armed only by a real input event; QEMU raspi4b delivers no HID, so the
+//     300-frame checksum run never evaluates the idle predicate as true. The auto path's geometry, its
+//     code shape and its checksum are untouched by construction, and `kernel8-test` proves it.
+//   * A FOREGROUND (fixture-mode) vug held paused therefore also stops consuming INTERACTIVE_CAP. That
+//     is correct rather than a hole: pause is operator-driven, so a paused foreground vug is one an
+//     operator is holding, and it still exits on ESC or `kill`. No battery leg can reach it (no HID).
+// A one-shot `[vugpause] idle engaged frame=<n>` names the first engagement on the wire; it is latched,
+// never per-frame.
+//
 // Barrier direction split (deliberate, robust under QEMU raspi4b's lack of a Group-1 timer IRQ — see
 // docs userspace.md M6e): ARRIVAL (worker -> parent) is a real FUTEX (workers atomically bump `done` +
 // SYS_FUTEX WAKE, the parent SYS_FUTEX WAITs); RELEASE (parent -> worker) is a SYS_YIELD poll on `phase`
@@ -677,17 +708,25 @@ fn getinfo_ticks() -> u64 {
     info[1]
 }
 
+/// Widest backing box the readout ever paints: 3 digits at 6 px advance + 2 px pad.
+const FPS_BOX_W: i32 = 3 * 6 + 3;
+
 /// Draw the current fps (clamped to 999) in the top-left corner over whatever the frame rendered.
 /// Runs in the PARENT, after the frame barrier and before the present, so no worker is writing.
+///
+/// VUGPAUSE: the backing box is the FIXED maximum width, not the current digit count's. On the
+/// rendering path the band clear wipes the corner every frame so either would do; on the VUGPAUSE idle
+/// path there is no band clear, so a readout shrinking (e.g. 47 -> 0) would leave the old digit's
+/// pixels stranded. Clearing the same box every time makes the overlay self-erasing. Checksum-safe:
+/// this function is called only when `detached || interactive`, which the foreground auto path is not.
 unsafe fn draw_fps(surf: *mut u8, fps: u32) {
     let v = fps.min(999);
     let n: i32 = if v >= 100 { 3 } else if v >= 10 { 2 } else { 1 };
-    // Backing box so the digits stay readable over the wireframe: n digits at 6 px advance + 2 px pad.
     let mut y = 0;
     while y < 11 {
         let row = surf.add((y as usize) * STRIDE) as *mut u32;
         let mut x = 0usize;
-        while x < (n * 6 + 3) as usize {
+        while x < FPS_BOX_W as usize {
             row.add(x).write_volatile(BG);
             x += 1;
         }
@@ -705,6 +744,33 @@ unsafe fn draw_fps(surf: *mut u8, fps: u32) {
         div /= 10;
         i += 1;
     }
+}
+
+/// Fold the kernel tick clock into the displayed fps, refreshing at most once per second. `ticks`/`mark`
+/// are the (tick, frame) pair sampled at the last refresh; `frame` counts frames PRESENTED. Returns the
+/// value to display — unchanged until a full second of ticks has passed.
+///
+/// VUGPAUSE calls this from the idle loop as well as from the rendering frame path, so a pause-idled vug
+/// keeps its once-per-second refresh alive. Because `frame` does not advance while idled, the quotient
+/// falls to 0 — the readout tells the truth (this vug is presenting nothing) instead of freezing on the
+/// last rate it happened to be running at.
+fn fps_refresh(ticks: &mut u64, mark: &mut u32, fps: u32, frame: u32) -> u32 {
+    let now = getinfo_ticks();
+    if now > *ticks {
+        let dt = (now - *ticks) as u32;
+        if dt >= TICK_HZ {
+            // frames since last refresh, scaled to per-second at the 250 Hz tick.
+            let v = ((frame.wrapping_sub(*mark) as u64 * TICK_HZ as u64 + (dt / 2) as u64) / dt as u64) as u32;
+            *ticks = now;
+            *mark = frame;
+            return v;
+        }
+    } else if now != 0 && now < *ticks {
+        // A stale first read (getinfo error returned 0) — resync rather than divide nonsense.
+        *ticks = now;
+        *mark = frame;
+    }
+    fps
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -917,6 +983,17 @@ pub extern "C" fn _start() -> ! {
     let mut fps_frame: u32 = 0;
     let mut fps: u32 = 0;
 
+    // VUGPAUSE: the render state of the LAST PRESENT. The idle path engages only when a present has
+    // actually happened (so the first frame is never skipped), when the overlay state of that present
+    // matches what this frame would draw (so the frame that turns the overlay on is never skipped), and
+    // when nothing that reaches the surface has changed since.
+    let mut presented = false;
+    let mut presented_overlay = false;
+    let mut last_ay: i32 = 0;
+    let mut last_ax: i32 = 0;
+    let mut last_dist: Fx = 0;
+    let mut idle_witnessed = false;
+
     let mut frame: u32 = 0;
     loop {
         // --- input (polled EVERY frame for the program's whole life) ---
@@ -959,8 +1036,9 @@ pub extern "C" fn _start() -> ! {
         // --- fold input into rotation/zoom ---
         let manual = interactive && (held != 0 || (dragging && (fi.mdx != 0 || fi.mdy != 0)));
         if paused {
-            // VUGCLICK: clicked-to-pause — hold the current orientation. Rendering and presenting
-            // continue unchanged, so the window stays live (and killable) rather than going dark.
+            // VUGCLICK: clicked-to-pause — hold the current orientation. VUGPAUSE: holding it is now
+            // also what lets the frame below be skipped entirely; the window stays live because the
+            // idle path keeps polling and yielding, not because it keeps redrawing.
         } else if manual {
             let mut yaw = 0i32;
             let mut pit = 0i32;
@@ -994,6 +1072,54 @@ pub extern "C" fn _start() -> ! {
             // checksum is a pure function of the frame count.
             ay = (ay + 3) & 0xFF;
             ax = (ax + 1) & 0xFF;
+        }
+
+        // --- VUGPAUSE: a paused vug whose surface cannot have changed renders NOTHING ---
+        // The predicate is the honest one: paused, something already presented, the overlay in the
+        // state the last present left it, and the full render state (yaw, pitch, zoom) identical. When
+        // it holds, this frame would recompute the identical projection, rasterise the identical
+        // pixels and present the identical surface — so it is skipped in full: no PHASE store (the
+        // workers stay parked on their poll instead of rasterising), no inline raster, no barrier, no
+        // present, and `frame` does not advance because no frame was presented.
+        //
+        // What DOES run is the input half plus one `SYS_YIELD` — the loop is bounded and runnable by
+        // construction, never a park (VUGGUARD/P60), so the window stays live and `kill`-able and the
+        // click that unpauses is acted on within one iteration.
+        if paused
+            && presented
+            && presented_overlay == (detached || interactive)
+            && ay == last_ay
+            && ax == last_ax
+            && dist == last_dist
+        {
+            if !idle_witnessed {
+                idle_witnessed = true;
+                let mut ib = Buf::new();
+                ib.put(b"[vugpause] idle engaged frame=");
+                ib.put_dec(frame);
+                ib.put(b"\n");
+                ib.flush();
+            }
+            // ESC is honoured from the idle loop exactly as from a rendered frame.
+            if exit_key {
+                break;
+            }
+            // Keep the fps readout alive and honest (it falls to 0 — `frame` is frozen). A changed
+            // digit is the only thing that can still reach the panel while idled: overlay only, one
+            // present, at most once per second.
+            if detached || interactive {
+                let v = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame);
+                if v != fps {
+                    fps = v;
+                    unsafe { draw_fps(surf, fps) };
+                    let rc = unsafe { sys1(SYS_WIN_PRESENT, win) };
+                    if rc >> 63 != 0 {
+                        stall_witness(&W_PRESENT, frame, b"present", b"rc", (rc as i64).unsigned_abs() as u32);
+                    }
+                }
+            }
+            sys_yield();
+            continue;
         }
 
         // --- transform + publish, then release any LIVE workers ---
@@ -1057,21 +1183,7 @@ pub extern "C" fn _start() -> ! {
 
         // --- VUGFPS: measure, refresh once per second, draw (desktop/interactive only) ---
         if detached || interactive {
-            let now = getinfo_ticks();
-            if now > fps_ticks {
-                let dt = (now - fps_ticks) as u32;
-                if dt >= TICK_HZ {
-                    // frames since last refresh, scaled to per-second at the 250 Hz tick.
-                    fps = ((frame.wrapping_sub(fps_frame) as u64 * TICK_HZ as u64 + (dt / 2) as u64)
-                        / dt as u64) as u32;
-                    fps_ticks = now;
-                    fps_frame = frame;
-                }
-            } else if now != 0 && now < fps_ticks {
-                // A stale first read (getinfo error returned 0) — resync rather than divide nonsense.
-                fps_ticks = now;
-                fps_frame = frame;
-            }
+            fps = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame);
             unsafe { draw_fps(surf, fps) };
         }
 
@@ -1084,6 +1196,13 @@ pub extern "C" fn _start() -> ! {
         if rc >> 63 != 0 {
             stall_witness(&W_PRESENT, frame, b"present", b"rc", (rc as i64).unsigned_abs() as u32);
         }
+        // VUGPAUSE: this is now the surface the panel is showing — record what produced it, so the next
+        // frame can tell whether it would draw anything different.
+        presented = true;
+        presented_overlay = detached || interactive;
+        last_ay = ay;
+        last_ax = ax;
+        last_dist = dist;
         frame += 1;
 
         // --- exit conditions ---
