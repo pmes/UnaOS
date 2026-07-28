@@ -1,5 +1,36 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
+use reqwest::cookie::{CookieStore, Jar};
+use std::sync::Arc;
+
+/// Process-wide, in-memory cookie jar (session-scoped: nothing is written
+/// to disk, so quitting Aether logs you out). Shared by every client we
+/// build, so a Set-Cookie collected on one navigation is sent on the next
+/// and on subresource/script fetches to the same host.
+pub fn cookie_jar() -> Arc<Jar> {
+    static JAR: std::sync::OnceLock<Arc<Jar>> = std::sync::OnceLock::new();
+    JAR.get_or_init(|| Arc::new(Jar::default())).clone()
+}
+
+/// Cookies the jar would send to `url`, formatted as a `Cookie:` header
+/// value (`"a=b; c=d"`), or `""` when the jar has none for that host.
+/// Read API for `document.cookie` (JS lane wires it up).
+pub fn cookies_for(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else { return String::new() };
+    cookie_jar()
+        .cookies(&parsed)
+        .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+/// Blocking client builder for the sync JS paths (`fetch`/XHR run on their
+/// own thread, off the tokio runtime). Pre-wired to the shared jar so those
+/// requests carry — and record — the same cookies as the page load.
+pub fn blocking_client_builder() -> reqwest::blocking::ClientBuilder {
+    reqwest::blocking::Client::builder()
+        .user_agent("UnaOS Aether/0.1.0")
+        .cookie_provider(cookie_jar())
+}
 
 /// One shared HTTP client: connection pooling + TLS session reuse across
 /// every fetch of a page load (a per-fetch Client paid a fresh handshake
@@ -9,6 +40,7 @@ fn client() -> &'static Client {
     CLIENT.get_or_init(|| {
         Client::builder()
             .user_agent("UnaOS Aether/0.1.0")
+            .cookie_provider(cookie_jar())
             .build()
             .expect("http client")
     })
@@ -357,6 +389,17 @@ mod tests {
             "https://example.com/main.css".to_string(),
             "https://cdn.example.org/x.css".to_string(),
         ]);
+    }
+
+    #[test]
+    fn test_cookie_jar_round_trip() {
+        let url = url::Url::parse("https://cookie-test.example/page").unwrap();
+        cookie_jar().add_cookie_str("sid=abc123; Path=/", &url);
+        let sent = cookies_for("https://cookie-test.example/other");
+        assert!(sent.contains("sid=abc123"), "jar sent {sent:?}");
+        // Host-scoped: a different host sees nothing.
+        assert_eq!(cookies_for("https://other.example/"), "");
+        assert_eq!(cookies_for("not a url"), "");
     }
 
     #[test]
