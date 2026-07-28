@@ -103,6 +103,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 const SYS_WRITE: u64 = 1;
 const SYS_EXIT: u64 = 2;
 const SYS_YIELD: u64 = 4;
+const SYS_GETINFO: u64 = 7;
 const SYS_THREAD_SPAWN: u64 = 21;
 const SYS_THREAD_EXIT: u64 = 22;
 const SYS_THREAD_JOIN: u64 = 23;
@@ -619,6 +620,94 @@ fn stall_witness(latch: &AtomicU32, frame: u32, phase: &[u8], label: &[u8], valu
 }
 
 // ---------------------------------------------------------------------------------------------
+// VUGFPS — the on-window frames-per-second readout.
+//
+// The stagger observation (s1p: replacement vugs visibly outpace the originals) needs a PER-VUG
+// number, and the serial line cannot carry one per frame for six windows. So each vug measures and
+// draws its own rate in its top-left corner: frames presented per second, from `SYS_GETINFO`'s
+// `ticks` field (the 250 Hz scheduler tick — the only EL0-reachable clock; CNTVCT_EL0 is not
+// EL0-enabled). One getinfo per frame is one syscall beside the existing input poll; the displayed
+// value refreshes once per second, so the digits are readable rather than flickering.
+//
+// CHECKSUM DISCIPLINE: the overlay is drawn ONLY when `detached || interactive` — a desktop
+// (`bg`) or operator-driven vug. The FOREGROUND auto path (every fixture/battery leg, the QEMU
+// 300-frame checksum witness) takes neither branch and its surface stays byte-identical.
+// ---------------------------------------------------------------------------------------------
+const TICK_HZ: u32 = 250; // kernel scheduler tick rate (timer.rs TICK_HZ)
+const FPS_C: u32 = 0xFFE8_C98A; // fps digits — warm amber, same as user-stat's pid
+
+/// 5x7 digit glyphs, one byte per row, bit 4 = leftmost column (verbatim from user-stat).
+static GLYPHS: [[u8; 7]; 10] = [
+    [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110], // 0
+    [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110], // 1
+    [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111], // 2
+    [0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110], // 3
+    [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010], // 4
+    [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110], // 5
+    [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110], // 6
+    [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000], // 7
+    [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110], // 8
+    [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100], // 9
+];
+
+/// Draw one digit at (x, y), 1:1 scale (5x7 px — the window is only 128 wide).
+unsafe fn draw_digit(surf: *mut u8, d: usize, x: i32, y: i32, color: u32) {
+    let g = &GLYPHS[d % 10];
+    let mut row = 0i32;
+    while row < 7 {
+        let bits = g[row as usize];
+        let mut col = 0i32;
+        while col < 5 {
+            if bits & (1 << (4 - col)) != 0 {
+                put_px(surf, x + col, y + row, color);
+            }
+            col += 1;
+        }
+        row += 1;
+    }
+}
+
+/// `SYS_GETINFO` -> the kernel's 250 Hz tick count, or 0 on error (a 0 delta just skips the update).
+fn getinfo_ticks() -> u64 {
+    let mut info = [0u64; 2]; // {pid, ticks}, #[repr(C)] — see kernel sys_getinfo
+    let p = info.as_mut_ptr() as u64;
+    if unsafe { sys1(SYS_GETINFO, p) } >> 63 != 0 {
+        return 0;
+    }
+    info[1]
+}
+
+/// Draw the current fps (clamped to 999) in the top-left corner over whatever the frame rendered.
+/// Runs in the PARENT, after the frame barrier and before the present, so no worker is writing.
+unsafe fn draw_fps(surf: *mut u8, fps: u32) {
+    let v = fps.min(999);
+    let n: i32 = if v >= 100 { 3 } else if v >= 10 { 2 } else { 1 };
+    // Backing box so the digits stay readable over the wireframe: n digits at 6 px advance + 2 px pad.
+    let mut y = 0;
+    while y < 11 {
+        let row = surf.add((y as usize) * STRIDE) as *mut u32;
+        let mut x = 0usize;
+        while x < (n * 6 + 3) as usize {
+            row.add(x).write_volatile(BG);
+            x += 1;
+        }
+        y += 1;
+    }
+    let mut i = 0i32;
+    let mut div = 1u32;
+    let mut k = 1i32;
+    while k < n {
+        div *= 10;
+        k += 1;
+    }
+    while i < n {
+        draw_digit(surf, ((v / div) % 10) as usize, 2 + i * 6, 2, FPS_C);
+        div /= 10;
+        i += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Transform: rotate + project the 14 vertices into PX/PY.
 // ---------------------------------------------------------------------------------------------
 fn project(base: &[(Fx, Fx, Fx); 14], ay: i32, ax: i32, dist: Fx) {
@@ -823,6 +912,11 @@ pub extern "C" fn _start() -> ! {
     // VUGLIFE: one-shot latch for the waived-budget witness (detached/interactive only).
     let mut budget_waived = false;
 
+    // VUGFPS measurement state: the tick/frame pair at the last displayed-value refresh.
+    let mut fps_ticks: u64 = getinfo_ticks();
+    let mut fps_frame: u32 = 0;
+    let mut fps: u32 = 0;
+
     let mut frame: u32 = 0;
     loop {
         // --- input (polled EVERY frame for the program's whole life) ---
@@ -959,6 +1053,26 @@ pub extern "C" fn _start() -> ! {
                 break;
             }
             futex_wait(core::ptr::addr_of!(DONE), d);
+        }
+
+        // --- VUGFPS: measure, refresh once per second, draw (desktop/interactive only) ---
+        if detached || interactive {
+            let now = getinfo_ticks();
+            if now > fps_ticks {
+                let dt = (now - fps_ticks) as u32;
+                if dt >= TICK_HZ {
+                    // frames since last refresh, scaled to per-second at the 250 Hz tick.
+                    fps = ((frame.wrapping_sub(fps_frame) as u64 * TICK_HZ as u64 + (dt / 2) as u64)
+                        / dt as u64) as u32;
+                    fps_ticks = now;
+                    fps_frame = frame;
+                }
+            } else if now != 0 && now < fps_ticks {
+                // A stale first read (getinfo error returned 0) — resync rather than divide nonsense.
+                fps_ticks = now;
+                fps_frame = frame;
+            }
+            unsafe { draw_fps(surf, fps) };
         }
 
         // --- present ---
