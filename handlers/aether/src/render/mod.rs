@@ -747,20 +747,26 @@ pub fn render_frame(
                 if tag == "img" {
                     let src = crate::images::effective_img_src(&el.attributes.borrow());
                     if let Some(img) = src.as_deref().and_then(crate::images::get) {
-                        let x_start = ((current_x as i32) - sx).max(0) as u32;
-                        let y_start = ((current_y as i32) - sy).max(0) as u32;
+                        // The painted SPAN clamps to the viewport; the box
+                        // ORIGIN must not. Clamping the origin re-anchors a
+                        // scrolled-off image to the viewport edge, so it
+                        // stops moving with the page — and an incremental
+                        // scroll (shift-and-repaint-the-strip) then leaves a
+                        // train of copies down the viewport.
                         let bw = layout_box.size.width.max(1.0);
                         let bh = layout_box.size.height.max(1.0);
-                        let end_x = x_start.saturating_add(bw as u32).min(width);
-                        let end_y = y_start.saturating_add(bh as u32).min(height);
+                        let x_start = box_sx.max(0.0) as u32;
+                        let y_start = box_sy.max(0.0) as u32;
+                        let end_x = ((box_sx + bw).max(0.0) as u32).min(width);
+                        let end_y = ((box_sy + bh).max(0.0) as u32).min(height);
                         for y in y_start..end_y {
                             for x in x_start..end_x {
-                                if !in_damage(x, y, damage_rects) {
+                                if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
                                     continue;
                                 }
                                 // Nearest-neighbor sample into the layout box.
-                                let u = ((x - x_start) as f32 / bw * img.width() as f32) as u32;
-                                let v = ((y - y_start) as f32 / bh * img.height() as f32) as u32;
+                                let u = ((x as f32 - box_sx) / bw * img.width() as f32).max(0.0) as u32;
+                                let v = ((y as f32 - box_sy) / bh * img.height() as f32).max(0.0) as u32;
                                 let px = img.get_pixel(u.min(img.width() - 1), v.min(img.height() - 1));
                                 let [r, g, b, a] = px.0;
                                 if a > 0 {
@@ -823,18 +829,25 @@ pub fn render_frame(
                 }
 
                 if let Some(sides) = border {
-                    let x_start = ((current_x as i32) - sx).max(0) as u32;
-                    let y_start = ((current_y as i32) - sy).max(0) as u32;
-                    let end_x = x_start
-                        .saturating_add(layout_box.size.width.max(0.0) as u32)
-                        .min(width);
-                    let end_y = y_start
-                        .saturating_add(layout_box.size.height.max(0.0) as u32)
-                        .min(height);
+                    // Same rule as the background/image spans: x_start..end_x
+                    // is the CLAMPED screen span of the unclamped box origin
+                    // (box_sx/box_sy). Re-deriving the end from a clamped
+                    // start pins a scrolled-off box's borders to the viewport
+                    // edge and repeats them on every scroll strip.
                     // [top, right, bottom, left], each side its own stroke.
-                    let mut stroke = |x0: u32, y0: u32, x1: u32, y1: u32, color: (u8, u8, u8)| {
-                        for y in y0..y1.min(height) {
-                            for x in x0..x1.min(width) {
+                    // Sides are expressed in unclamped screen floats and the
+                    // stroke clips them into the viewport, so a box whose
+                    // bottom edge lies below the fold does not stamp its
+                    // bottom border across the last visible row.
+                    let (bx0, by0) = (box_sx, box_sy);
+                    let (bx1, by1) = (box_sx + bw, box_sy + bh);
+                    let mut stroke = |x0: f32, y0: f32, x1: f32, y1: f32, color: (u8, u8, u8)| {
+                        let x0 = x0.max(0.0) as u32;
+                        let y0 = y0.max(0.0) as u32;
+                        let x1 = (x1.max(0.0) as u32).min(width);
+                        let y1 = (y1.max(0.0) as u32).min(height);
+                        for y in y0..y1 {
+                            for x in x0..x1 {
                                 if in_damage(x, y, damage_rects) && in_clip(x, y, clip) {
                                     put_px(surface, width, x, y, color);
                                 }
@@ -846,18 +859,18 @@ pub fn render_frame(
                     // common declaration on the web (every Tailwind/reset
                     // preflight opens with it); rounding it up to a hairline
                     // outlines every box on the page.
-                    let px = |w: f32| if w > 0.0 { w.max(1.0) as u32 } else { 0 };
+                    let px = |w: f32| if w > 0.0 { w.max(1.0) } else { 0.0 };
                     if let Some((w, c)) = sides[0].filter(|(w, _)| *w > 0.0) {
-                        stroke(x_start, y_start, end_x, y_start.saturating_add(px(w)), c);
+                        stroke(bx0, by0, bx1, by0 + px(w), c);
                     }
                     if let Some((w, c)) = sides[2].filter(|(w, _)| *w > 0.0) {
-                        stroke(x_start, end_y.saturating_sub(px(w)), end_x, end_y, c);
+                        stroke(bx0, by1 - px(w), bx1, by1, c);
                     }
                     if let Some((w, c)) = sides[3].filter(|(w, _)| *w > 0.0) {
-                        stroke(x_start, y_start, x_start.saturating_add(px(w)), end_y, c);
+                        stroke(bx0, by0, bx0 + px(w), by1, c);
                     }
                     if let Some((w, c)) = sides[1].filter(|(w, _)| *w > 0.0) {
-                        stroke(end_x.saturating_sub(px(w)), y_start, end_x, end_y, c);
+                        stroke(bx1 - px(w), by0, bx1, by1, c);
                     }
                 }
             } else if dom_node.as_text().is_some() && !inherited.text_hidden {

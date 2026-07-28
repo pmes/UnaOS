@@ -1605,4 +1605,95 @@ mod tests {
             .to_std_string_escaped();
         assert_eq!(seen, "s0,s2", "each script saw its OWN element");
     }
+
+    /// Every decode path must hand the renderer straight-alpha RGBA in the
+    /// same channel order, so one pure-blue source paints one pure-blue box
+    /// whether it arrived as PNG, JPEG, or SVG. (The surface is BGRA — see
+    /// render::put_px — so blue lands in byte 0.)
+    #[test]
+    fn test_image_decode_channel_order_matches_across_formats() {
+        use base64::Engine as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let blue = image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 255, 255]));
+
+        let mut png = std::io::Cursor::new(Vec::new());
+        blue.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let mut jpg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(blue.clone())
+            .to_rgb8()
+            .write_to(&mut jpg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let svg = b"<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'>\
+                    <rect width='8' height='8' fill='#0000ff'/></svg>";
+
+        let html = format!(
+            r#"<html><body style="margin:0">
+               <img id="p" style="width:20px;height:20px" src="data:image/png;base64,{}">
+               <img id="j" style="width:20px;height:20px" src="data:image/jpeg;base64,{}">
+               <img id="s" style="width:20px;height:20px" src="data:image/svg+xml;base64,{}">
+               </body></html>"#,
+            b64(png.get_ref()),
+            b64(jpg.get_ref()),
+            b64(svg),
+        );
+        let mut tree = layout::compute_layout(&dom::parse_html(&html));
+        css::apply_css(&mut tree, "");
+        let mut surface = vec![255u8; 200 * 200 * 4];
+        render::render_frame(&tree, &mut surface, 200, 200, 0.0, 0.0, &[(0, 0, 200, 200)]);
+
+        // Blue must dominate: byte 0 (B) high, bytes 1/2 (G/R) low. A
+        // channel swap or a premultiply mismatch on any single path shows
+        // up as an orange/red box and fails here.
+        let blueish = surface
+            .chunks_exact(4)
+            .filter(|p| p[0] > 200 && p[1] < 60 && p[2] < 60)
+            .count();
+        let redish = surface
+            .chunks_exact(4)
+            .filter(|p| p[2] > 200 && p[1] < 60 && p[0] < 60)
+            .count();
+        assert!(blueish >= 3 * 20 * 20 - 40, "three 20x20 blue boxes expected, got {blueish} px");
+        assert_eq!(redish, 0, "no decode path may swap R and B ({redish} red px)");
+    }
+
+    /// Painting is a pure function of the document translated by the scroll
+    /// offset: the frame at scroll S must equal the frame at scroll 0 shifted
+    /// up by S. Clamping a box ORIGIN into the viewport (rather than only its
+    /// painted span) pins scrolled-off images and borders to the viewport
+    /// edge, and the shell's shift-and-repaint-the-strip scroll then smears
+    /// copies of them down the page.
+    #[test]
+    fn test_paint_translates_with_scroll() {
+        use base64::Engine as _;
+        let blue = image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 255, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        blue.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let src = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png.get_ref())
+        );
+        let html = format!(
+            r#"<html><body style="margin:0">
+               <div style="height:60px"></div>
+               <img style="width:120px;height:90px" src="{src}">
+               <div style="height:400px;border:3px solid rgb(0,128,0)">boxed</div>
+               <img style="width:120px;height:90px" src="{src}">
+               <div style="height:900px"></div>
+               </body></html>"#
+        );
+        let (w, h, s) = (300u32, 400u32, 150u32);
+        let mut tree = layout::compute_layout(&dom::parse_html(&html));
+        css::apply_css(&mut tree, "");
+        let mut base = vec![255u8; (w * (h + s) * 4) as usize];
+        render::render_frame(&tree, &mut base, w, h + s, 0.0, 0.0, &[(0, 0, w, h + s)]);
+        let mut scrolled = vec![255u8; (w * h * 4) as usize];
+        render::render_frame(&tree, &mut scrolled, w, h, 0.0, s as f64, &[(0, 0, w, h)]);
+
+        let row = (w * 4) as usize;
+        for y in 0..h as usize {
+            let a = &base[(y + s as usize) * row..(y + s as usize) * row + row];
+            let b = &scrolled[y * row..y * row + row];
+            assert_eq!(a, b, "row {y} at scroll {s} does not match the unscrolled frame");
+        }
+    }
 }
