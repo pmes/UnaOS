@@ -164,17 +164,38 @@ pub struct Page {
     /// Script sources in DOCUMENT ORDER: inline bodies and fetched external
     /// `src` texts interleaved as they appear (execution order matters).
     pub scripts: Vec<String>,
+    /// Parallel to `scripts`: each entry is the source script's ordinal
+    /// among ALL `<script>` elements in the parsed document. The slot list
+    /// is not aligned with the element list (non-JS types are filtered, the
+    /// fetch cap drops a tail, empty inline bodies take no slot, and failed
+    /// fetches collapse), so the ordinal is what lets the loader hand
+    /// `document.currentScript` the element a running script came from.
+    pub script_nodes: Vec<usize>,
+}
+
+/// One collected script slot: the ordinal of its `<script>` element among
+/// all script elements in the document, plus its source text (`None` until
+/// an external fetch fills it in).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptSlot {
+    pub ordinal: usize,
+    pub text: Option<String>,
 }
 
 /// Collects the page's scripts in document order: inline text directly,
 /// external `src` resolved to absolute URLs for the caller to fetch into
 /// the matching slot. Non-JS types (json/ld+json/template) are skipped.
-pub fn collect_scripts(base_url: &str, html: &str) -> (Vec<Option<String>>, Vec<(usize, String)>) {
+/// Every slot carries the ordinal of the `<script>` element it came from so
+/// the caller can re-find that element in its own parse of the same HTML.
+pub fn collect_scripts(base_url: &str, html: &str) -> (Vec<ScriptSlot>, Vec<(usize, String)>) {
     let document = crate::dom::parse_html(html);
-    let mut slots: Vec<Option<String>> = Vec::new();
+    let mut slots: Vec<ScriptSlot> = Vec::new();
     let mut external: Vec<(usize, String)> = Vec::new();
     if let Ok(scripts) = document.select("script") {
-        for script in scripts {
+        // Counts EVERY script element, filtered or not — the ordinal has to
+        // address the caller's `select("script")` enumeration, which does no
+        // filtering of its own.
+        for (ordinal, script) in scripts.enumerate() {
             let attrs = script.attributes.borrow();
             let ty = attrs.get("type").unwrap_or("").trim().to_ascii_lowercase();
             if !(ty.is_empty() || ty.contains("javascript") || ty == "module") {
@@ -192,14 +213,14 @@ pub fn collect_scripts(base_url: &str, html: &str) -> (Vec<Option<String>>, Vec<
                         continue;
                     }
                     external.push((slots.len(), abs));
-                    slots.push(None);
+                    slots.push(ScriptSlot { ordinal, text: None });
                 }
                 continue;
             }
             drop(attrs);
             let text = script.as_node().text_contents();
             if !text.trim().is_empty() {
-                slots.push(Some(text));
+                slots.push(ScriptSlot { ordinal, text: Some(text) });
             }
         }
     }
@@ -516,13 +537,20 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
     .await;
     for (slot, result, url) in script_results {
         match result {
-            Ok(text) if text.len() <= 2 * 1024 * 1024 => slots[slot] = Some(text),
+            Ok(text) if text.len() <= 2 * 1024 * 1024 => slots[slot].text = Some(text),
             Ok(_) => crate::ledger::record_js(&format!("script-too-large:{}", &url[..url.len().min(48)])),
             Err(_) => crate::ledger::record_js(&format!("script-fetch-failed:{}", &url[..url.len().min(48)])),
         }
     }
-    let scripts = slots.into_iter().flatten().collect();
-    Ok(Page { base_url: base, html, sheets, images, scripts })
+    let mut scripts = Vec::new();
+    let mut script_nodes = Vec::new();
+    for slot in slots {
+        if let Some(text) = slot.text {
+            scripts.push(text);
+            script_nodes.push(slot.ordinal);
+        }
+    }
+    Ok(Page { base_url: base, html, sheets, images, scripts, script_nodes })
 }
 
 #[cfg(test)]

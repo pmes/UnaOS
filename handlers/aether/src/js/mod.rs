@@ -31,6 +31,27 @@ pub fn page_url() -> String {
     PAGE_URL.with(|u| u.borrow().clone())
 }
 
+thread_local! {
+    /// The `<script>` element whose source is executing right now, or `None`
+    /// between scripts. A plain `NodeRef` (never a GC object), same
+    /// discipline as `PAGE_URL`: the `document.currentScript` accessor wraps
+    /// it on demand, so nothing here outlives the boa context.
+    static CURRENT_SCRIPT: RefCell<Option<NodeRef>> = const { RefCell::new(None) };
+}
+
+/// Sets (or with `None` clears) the element `document.currentScript` reports.
+/// The loader brackets each script's execution with this; everything that
+/// runs later — timer/rAF drains, promise jobs, event callbacks — sees
+/// `null`, which is what the spec requires of those contexts anyway.
+pub fn set_current_script(node: Option<NodeRef>) {
+    CURRENT_SCRIPT.with(|c| *c.borrow_mut() = node);
+}
+
+/// The element a running script came from, if one is running.
+pub fn current_script() -> Option<NodeRef> {
+    CURRENT_SCRIPT.with(|c| c.borrow().clone())
+}
+
 pub(crate) struct DomState {
     pub(crate) document: Option<NodeRef>,
     pub(crate) nodes: HashMap<i32, NodeRef>,
@@ -368,7 +389,52 @@ impl Engine {
         // the abort shim wraps it) because it builds on both.
         crate::api::platform::init(&mut context);
 
-        Self { context }
+        let mut engine = Self { context };
+        engine.install_current_script_accessor();
+        engine
+    }
+
+    /// `document.currentScript` as a real accessor over the loader's
+    /// currently-executing `<script>` element: the wrapped element while a
+    /// classic script runs, `null` otherwise (between scripts, and inside
+    /// every callback/promise/timer continuation — our timer and rAF drains
+    /// run after the script list, so that falls out for free).
+    ///
+    /// Webpack's chunk loader reads it to derive `__webpack_public_path__`
+    /// and throws `InvariantError: Expected document.currentScript to be a
+    /// <script> element` on null, which aborts the whole bundle boot.
+    fn install_current_script_accessor(&mut self) {
+        let getter = boa_engine::object::FunctionObjectBuilder::new(
+            self.context.realm(),
+            NativeFunction::from_fn_ptr(|_this, _args, ctx| match current_script() {
+                Some(node) => {
+                    crate::ledger::record_dom("document.currentScript:element");
+                    Ok(Engine::wrap_node(ctx, node))
+                }
+                None => {
+                    crate::ledger::record_dom("document.currentScript:null");
+                    Ok(JsValue::null())
+                }
+            }),
+        )
+        .build();
+        let Ok(doc) = self
+            .context
+            .global_object()
+            .get(boa_engine::string::JsString::from("document"), &mut self.context)
+        else {
+            return;
+        };
+        let Some(doc) = doc.as_object() else { return };
+        let _ = doc.define_property_or_throw(
+            boa_engine::string::JsString::from("currentScript"),
+            boa_engine::property::PropertyDescriptor::builder()
+                .get(getter)
+                .enumerable(true)
+                .configurable(true)
+                .build(),
+            &mut self.context,
+        );
     }
 
     /// Platform surface a bundled framework reaches for once its runtime
@@ -554,19 +620,11 @@ impl Engine {
             // first script executes; the engine advances readyState across
             // the lifecycle events it dispatches.
             //
-            // currentScript stays null: the engine executes scripts from a
-            // list collected off the tree, and that list carries only source
-            // text, so the element a running script came from is genuinely
-            // not known here. It reads as an accessor rather than a plain
-            // null so a page that depended on it lands in the ledger instead
-            // of failing silently — Next.js, for one, asserts on it and
-            // aborts its whole bootstrap when it is null.
+            // `document.currentScript` is installed natively (see
+            // install_current_script_accessor) — it reports the real
+            // <script> element the loader is executing.
             if (typeof document !== 'undefined' && document) {
                 document.readyState = 'loading';
-                Object.defineProperty(document, 'currentScript', {
-                    get: function () { __ledger('document.currentScript:null'); return null; },
-                    configurable: true,
-                });
                 document.visibilityState = 'visible';
                 document.hidden = false;
                 document.referrer = '';
@@ -824,6 +882,7 @@ impl Engine {
 
     pub(crate) fn wrap_node(context: &mut Context, node: NodeRef) -> JsValue {
         let doc_id = DOM_STATE.with(|s| s.borrow_mut().register_node(node.clone()));
+        let interface = Self::interface_name(&node);
         
         let _is_video = if let Some(el) = node.into_element_ref() {
             el.name.local.to_string() == "video"
@@ -1631,7 +1690,153 @@ impl Engine {
         }
         let _ = js_node.set(boa_engine::string::JsString::from("style"), style_obj, false, context);
 
+        // Wire the wrapper's prototype to the DOM interface its node
+        // actually is, so `el instanceof HTMLAnchorElement`, `instanceof
+        // HTMLElement` and `instanceof Node` all answer the way a browser
+        // answers. Everything above is an OWN property of the wrapper, so
+        // this only adds inheritance — no behavior already installed can be
+        // shadowed by it.
+        if let Some(proto) = Self::interface_prototype(context, interface) {
+            js_node.set_prototype(Some(proto));
+        }
+
         js_node.into()
+    }
+
+    /// The DOM interface a node presents, spelled the way the spec spells
+    /// it. Element names map through the tag families the prelude installs;
+    /// anything unrecognized is an unknown element, which is what a browser
+    /// reports for it too.
+    fn interface_name(node: &NodeRef) -> &'static str {
+        if node.as_document().is_some() {
+            return "HTMLDocument";
+        }
+        if node.as_text().is_some() {
+            return "Text";
+        }
+        if node.as_comment().is_some() {
+            return "Comment";
+        }
+        if node.as_doctype().is_some() {
+            return "DocumentType";
+        }
+        let Some(el) = node.as_element() else { return "Node" };
+        // Namespace decides first: an <a> or <title> inside <svg> is an
+        // SVG element, not the HTML interface of the same name.
+        if el.name.ns.as_ref() == "http://www.w3.org/2000/svg" {
+            return "SVGElement";
+        }
+        Self::html_interface_for_tag(el.name.local.as_ref())
+    }
+
+    /// tag name -> HTML interface. One arm per family exactly as the spec
+    /// groups them (h1..h6 share HTMLHeadingElement, td/th share
+    /// HTMLTableCellElement, del/ins share HTMLModElement, and the long
+    /// tail of semantic tags is plain HTMLElement).
+    fn html_interface_for_tag(tag: &str) -> &'static str {
+        match tag {
+            "a" => "HTMLAnchorElement",
+            "area" => "HTMLAreaElement",
+            "audio" => "HTMLAudioElement",
+            "base" => "HTMLBaseElement",
+            "blockquote" | "q" => "HTMLQuoteElement",
+            "body" => "HTMLBodyElement",
+            "br" => "HTMLBRElement",
+            "button" => "HTMLButtonElement",
+            "canvas" => "HTMLCanvasElement",
+            "caption" => "HTMLTableCaptionElement",
+            "col" | "colgroup" => "HTMLTableColElement",
+            "data" => "HTMLDataElement",
+            "datalist" => "HTMLDataListElement",
+            "del" | "ins" => "HTMLModElement",
+            "details" => "HTMLDetailsElement",
+            "dialog" => "HTMLDialogElement",
+            "div" => "HTMLDivElement",
+            "dl" => "HTMLDListElement",
+            "embed" => "HTMLEmbedElement",
+            "fieldset" => "HTMLFieldSetElement",
+            "font" => "HTMLFontElement",
+            "form" => "HTMLFormElement",
+            "frame" => "HTMLFrameElement",
+            "frameset" => "HTMLFrameSetElement",
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => "HTMLHeadingElement",
+            "head" => "HTMLHeadElement",
+            "hr" => "HTMLHRElement",
+            "html" => "HTMLHtmlElement",
+            "iframe" => "HTMLIFrameElement",
+            "img" => "HTMLImageElement",
+            "input" => "HTMLInputElement",
+            "label" => "HTMLLabelElement",
+            "legend" => "HTMLLegendElement",
+            "li" => "HTMLLIElement",
+            "link" => "HTMLLinkElement",
+            "map" => "HTMLMapElement",
+            "marquee" => "HTMLMarqueeElement",
+            "menu" => "HTMLMenuElement",
+            "meta" => "HTMLMetaElement",
+            "meter" => "HTMLMeterElement",
+            "object" => "HTMLObjectElement",
+            "ol" => "HTMLOListElement",
+            "optgroup" => "HTMLOptGroupElement",
+            "option" => "HTMLOptionElement",
+            "output" => "HTMLOutputElement",
+            "p" => "HTMLParagraphElement",
+            "param" => "HTMLParamElement",
+            "picture" => "HTMLPictureElement",
+            "pre" | "listing" | "xmp" => "HTMLPreElement",
+            "progress" => "HTMLProgressElement",
+            "script" => "HTMLScriptElement",
+            "select" => "HTMLSelectElement",
+            "slot" => "HTMLSlotElement",
+            "source" => "HTMLSourceElement",
+            "span" => "HTMLSpanElement",
+            "style" => "HTMLStyleElement",
+            "table" => "HTMLTableElement",
+            "tbody" | "thead" | "tfoot" => "HTMLTableSectionElement",
+            "td" | "th" => "HTMLTableCellElement",
+            "template" => "HTMLTemplateElement",
+            "textarea" => "HTMLTextAreaElement",
+            "time" => "HTMLTimeElement",
+            "title" => "HTMLTitleElement",
+            "tr" => "HTMLTableRowElement",
+            "track" => "HTMLTrackElement",
+            "ul" => "HTMLUListElement",
+            "video" => "HTMLVideoElement",
+            // The semantic long tail — abbr, article, section, strong, and
+            // every custom `<my-widget>` a framework defines — is plain
+            // HTMLElement in a browser, not an unknown element.
+            "abbr" | "address" | "article" | "aside" | "b" | "bdi" | "bdo" | "cite" | "code"
+            | "dd" | "dfn" | "dt" | "em" | "figcaption" | "figure" | "footer" | "header"
+            | "hgroup" | "i" | "kbd" | "main" | "mark" | "nav" | "noscript" | "rp" | "rt"
+            | "ruby" | "s" | "samp" | "search" | "section" | "small" | "strong" | "sub"
+            | "summary" | "sup" | "u" | "var" | "wbr" => "HTMLElement",
+            // Hyphenated names are custom elements, which are HTMLElement.
+            other if other.contains('-') => "HTMLElement",
+            _ => "HTMLUnknownElement",
+        }
+    }
+
+    /// `globalThis[name].prototype`, falling back through
+    /// HTMLUnknownElement to HTMLElement if the realm lacks the interface.
+    fn interface_prototype(
+        context: &mut Context,
+        name: &str,
+    ) -> Option<boa_engine::JsObject> {
+        for candidate in [name, "HTMLUnknownElement", "HTMLElement"] {
+            let global = context.global_object();
+            let Ok(ctor) = global.get(boa_engine::string::JsString::from(candidate), context) else {
+                continue;
+            };
+            let Some(ctor) = ctor.as_object() else { continue };
+            let Ok(proto) = ctor.get(boa_engine::string::JsString::from("prototype"), context)
+            else {
+                continue;
+            };
+            if let Some(proto) = proto.as_object() {
+                return Some(proto);
+            }
+        }
+        None
     }
 
     /// Shared classList operation over the class attribute.

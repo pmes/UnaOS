@@ -679,7 +679,14 @@ mod tests {
         </head><body></body></html>"#;
         let (slots, external) = crate::net::collect_scripts("https://example.com/", html);
         assert_eq!(slots.len(), 3, "ld+json must not occupy a slot");
-        assert_eq!(slots[1].as_deref(), Some("inline1()"));
+        assert_eq!(slots[1].text.as_deref(), Some("inline1()"));
+        // Ordinals address the ELEMENT list, which the ld+json script is in:
+        // slot 1 is element 2, slot 2 is element 3.
+        assert_eq!(
+            slots.iter().map(|s| s.ordinal).collect::<Vec<_>>(),
+            vec![0, 2, 3],
+            "slot ordinals must skip the filtered ld+json element"
+        );
         assert_eq!(external, vec![
             (0, "https://example.com/a.js".to_string()),
             (2, "https://cdn.x.com/b.js".to_string()),
@@ -1492,5 +1499,110 @@ mod tests {
         assert_eq!(f[4], "true", "Text inherits from CharacterData");
         assert_eq!(f[5], "false", "inheritance does not run the wrong way");
         assert_eq!(f[6], "TypeError", "the interfaces are not callable constructors");
+    }
+
+    /// Wrapped nodes carry the prototype of the interface they actually are,
+    /// so `instanceof` on a REAL element — not just on a synthetic
+    /// `Object.create` — answers the way a browser answers. And
+    /// `document.currentScript` is the running `<script>` element, which is
+    /// what webpack's chunk loader asserts on before it will boot.
+    #[test]
+    fn wrapped_nodes_inherit_their_interface_and_currentscript_is_real() {
+        let html = r#"<html><body>
+            <a id="lnk" href="/x">x</a>
+            <my-widget id="custom"></my-widget>
+            <blink id="weird"></blink>
+            <script id="s1">
+                var cs = document.currentScript;
+                var a = document.getElementById('lnk');
+                var out = [];
+                out.push(String(a instanceof HTMLAnchorElement));
+                out.push(String(a instanceof HTMLElement));
+                out.push(String(a instanceof Node));
+                out.push(String(a instanceof HTMLDivElement));
+                out.push(String(document.getElementById('custom') instanceof HTMLElement));
+                out.push(String(document.getElementById('weird') instanceof HTMLUnknownElement));
+                out.push(cs ? cs.tagName : 'null');
+                out.push(cs ? String(cs instanceof HTMLScriptElement) : 'null');
+                out.push(cs ? cs.id : 'null');
+                // Own behavior must survive the prototype wiring.
+                a.classList.add('marked');
+                out.push(a.getAttribute('href'));
+                // Deferred contexts see null, per spec.
+                var later = 'unset';
+                Promise.resolve().then(function () {
+                    later = String(document.currentScript);
+                    var p = document.createElement('p');
+                    p.id = 'later';
+                    p.textContent = later;
+                    document.body.appendChild(p);
+                });
+                var probe = document.createElement('div');
+                probe.id = 'probe';
+                probe.textContent = out.join('|');
+                document.body.appendChild(probe);
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://protos", html, true);
+        let doc = engine.document.as_ref().unwrap();
+        let probe = doc.select("#probe").unwrap().next().expect("probe must attach");
+        let f: Vec<String> = probe.as_node().text_contents().split('|').map(String::from).collect();
+        assert_eq!(f[0], "true", "<a> is an HTMLAnchorElement");
+        assert_eq!(f[1], "true", "and an HTMLElement");
+        assert_eq!(f[2], "true", "and a Node");
+        assert_eq!(f[3], "false", "but not some other element's interface");
+        assert_eq!(f[4], "true", "custom elements are HTMLElement");
+        assert_eq!(f[5], "true", "unrecognized tags are HTMLUnknownElement");
+        assert_eq!(f[6], "SCRIPT", "currentScript is the running script element");
+        assert_eq!(f[7], "true", "and it presents as HTMLScriptElement");
+        assert_eq!(f[8], "s1", "and it is THAT script, identified by its own attrs");
+        assert_eq!(f[9], "/x", "own properties still win over the prototype");
+        let later = doc.select("#later").unwrap().next().expect("microtask must run");
+        assert_eq!(
+            later.as_node().text_contents(),
+            "null",
+            "currentScript is null outside a running script"
+        );
+    }
+
+    /// The fetched-page path: the collected source list is NOT aligned with
+    /// the document's `<script>` elements (a non-JS type sits between them
+    /// here), so `currentScript` has to follow the per-slot ordinal rather
+    /// than the slot index. Getting that wrong hands a script the wrong
+    /// element, which is worse than handing it none.
+    #[test]
+    fn current_script_follows_the_slot_ordinal_not_the_slot_index() {
+        let html = r#"<html><body>
+            <script id="s0">A()</script>
+            <script type="application/ld+json">{"not":"js"}</script>
+            <script id="s2">B()</script>
+        </body></html>"#;
+        let (slots, external) = crate::net::collect_scripts("https://example.com/", html);
+        assert!(external.is_empty());
+        let scripts: Vec<String> = vec![
+            "window.__seen = [document.currentScript.id];".to_string(),
+            "window.__seen.push(document.currentScript.id);".to_string(),
+        ];
+        let script_nodes: Vec<usize> = slots.iter().map(|s| s.ordinal).collect();
+        assert_eq!(script_nodes, vec![0, 2]);
+        let page = crate::net::Page {
+            base_url: "https://example.com/".to_string(),
+            html: html.to_string(),
+            sheets: Vec::new(),
+            images: Vec::new(),
+            scripts,
+            script_nodes,
+        };
+        let mut engine = crate::AetherEngine::new();
+        engine.load_page(page, true);
+        let js = engine.js_engine.as_mut().unwrap();
+        let seen = js
+            .execute("window.__seen.join(',')")
+            .unwrap()
+            .to_string(&mut js.context)
+            .unwrap()
+            .to_std_string_escaped();
+        assert_eq!(seen, "s0,s2", "each script saw its OWN element");
     }
 }

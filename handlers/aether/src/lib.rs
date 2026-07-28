@@ -480,7 +480,13 @@ impl AetherEngine {
     /// code anywhere.
     pub fn load_page(&mut self, page: net::Page, add_history: bool) {
         images::set_page(&page.base_url, page.images);
-        self.load_impl(&page.base_url, &page.html, &page.sheets, Some(&page.scripts), add_history);
+        self.load_impl(
+            &page.base_url,
+            &page.html,
+            &page.sheets,
+            Some((&page.scripts, &page.script_nodes)),
+            add_history,
+        );
     }
 
     fn load_impl(
@@ -488,7 +494,7 @@ impl AetherEngine {
         url: &str,
         html: &str,
         external_css: &[String],
-        scripts_override: Option<&[String]>,
+        scripts_override: Option<(&[String], &[usize])>,
         add_history: bool,
     ) {
         let document = dom::parse_html(html);
@@ -538,9 +544,21 @@ impl AetherEngine {
                 Err(e) => eprintln!("[jsprelude] cannot read {}: {}", path, e),
             }
         }
+        // The `<script>` elements of THIS parse, in document order. The
+        // fetched script list carries, per source text, the ordinal of the
+        // element it came from (the two lists are not aligned — non-JS
+        // types, the fetch cap and failed fetches all drop entries), so this
+        // is what gives `document.currentScript` a real element to report.
+        let script_elements: Vec<kuchiki::NodeRef> = document
+            .select("script")
+            .map(|m| m.map(|el| el.as_node().clone()).collect())
+            .unwrap_or_default();
         match scripts_override {
-            Some(scripts) => {
+            Some((scripts, script_nodes)) => {
                 for (i, text) in scripts.iter().enumerate() {
+                    js::set_current_script(
+                        script_nodes.get(i).and_then(|o| script_elements.get(*o)).cloned(),
+                    );
                     if let Some(dir) = &js_dump {
                         let _ = std::fs::create_dir_all(dir);
                         let _ = std::fs::write(format!("{}/script-{:03}.js", dir, i), text);
@@ -563,20 +581,23 @@ impl AetherEngine {
                 }
             }
             None => {
-                if let Ok(scripts) = document.select("script") {
-                    for script_node in scripts {
-                        let text = script_node.as_node().text_contents();
-                        if !text.trim().is_empty() {
-                            if let Err(e) = js_engine.execute(&text) {
-                                let msg = e.to_string();
-                                ledger::record_js(&format!("script-error:{}", &msg[..msg.len().min(64)]));
-                            }
+                for script_node in &script_elements {
+                    let text = script_node.text_contents();
+                    if !text.trim().is_empty() {
+                        js::set_current_script(Some(script_node.clone()));
+                        if let Err(e) = js_engine.execute(&text) {
+                            let msg = e.to_string();
+                            ledger::record_js(&format!("script-error:{}", &msg[..msg.len().min(64)]));
                         }
                     }
                 }
             }
         }
-        
+        // Out of the script list: everything after this — lifecycle events,
+        // timer and rAF drains, promise jobs — must see currentScript null,
+        // which is what the spec requires of those contexts anyway.
+        js::set_current_script(None);
+
         // Drain zero-delay boot timers, then fire queued rAF callbacks in
         // bounded passes (framework render paths), then drain the promise
         // work they spawned — all before first layout.
