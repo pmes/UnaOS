@@ -2589,3 +2589,121 @@ plus the hub-identity gate, with an explicit `SKIPPED` line when the block is do
 returns at `BLOCK-DOWN` long before it. The `PASS`/`REJECTED` verdict is **metal-attended,
 always**. `kernel8-test` green for this arc means the default boot is byte-inert and the
 suite did not regress, and nothing more.
+
+### Outcome on metal — `REJECTED` (recorded here, drives V3D-66)
+
+The P69 metal boot ran the check and it **rejected** the name: `src28` measured
+**`CLOCK-LIKE`** — 1:1 with the `src32 CYCLE_COUNT` control on *every* leg, the pure-idle
+leg included, where `BIN_ACTIVE`'s own P1 predicate requires zero. Per the rule as written,
+the name is **withdrawn** and `src28` reverts to a raw unnamed mux; nothing in this tree
+cites it as the binner.
+
+What that does and does not implicate is exactly what the reject wording pre-committed to.
+The six-for-six index cross-check is independent of the measurement and **stands**, so the
+enum reading is right; the fault is downstream of it — on this silicon the 7-bit `SRC`
+field does not select the enum's source for every id. **`id↔mux` validity is partial, and
+partial per id.** That is the standing caveat every later arc must carry, and it is the
+reason §39 measures instead of transcribing.
+
+## 39. Widening the sweep to the PTB-neighbourhood ids — measurement, not transcription (V3D-66)
+
+With `id↔mux` only partially valid, a name lifted from the enum is worth exactly the
+behaviour that backs it. V3D-66 therefore adds **eight more source ids** to the calibration
+and publishes their raw counts and behaviour classes. **It names nothing.** Transcription is
+left to V3D-67, which will have these classes to be judged against.
+
+### The eight ids, cited exactly
+
+Same header, same copy, same enum as V3D-65 — `include/uapi/drm/v3d_drm.h`, read from
+`/usr/src/kernels/7.1.5-200.fc44.x86_64/include/uapi/drm/v3d_drm.h` (reachable from the
+session sandbox as `/run/host/usr/src/kernels/…`), the anonymous `enum { V3D_PERFCNT_* }`
+whose first member `V3D_PERFCNT_FEP_VALID_PRIMTS_NO_PIXELS` is index 0 and whose own
+comment scopes these indices to V3D 4.2 — this hardware.
+
+| id | enum member in that copy | line |
+|---|---|---|
+| 30 | `V3D_PERFCNT_L2T_HITS` | `v3d_drm.h:653` |
+| 31 | `V3D_PERFCNT_L2T_MISSES` | `v3d_drm.h:654` |
+| 33 | `V3D_PERFCNT_QPU_CYCLES_STALLED_VERTEX_COORD_USER` | `v3d_drm.h:656` |
+| 34 | `V3D_PERFCNT_QPU_CYCLES_STALLED_FRAGMENT` | `v3d_drm.h:657` |
+| 35 | `V3D_PERFCNT_PTB_PRIMS_BINNED` | `v3d_drm.h:658` |
+| 36 | `V3D_PERFCNT_AXI_WRITES_WATCH_0` | `v3d_drm.h:659` |
+| 37 | `V3D_PERFCNT_AXI_READS_WATCH_0` | `v3d_drm.h:660` |
+| 38 | `V3D_PERFCNT_AXI_WRITE_STALLS_WATCH_0` | `v3d_drm.h:661` |
+
+**A correction to the brief that raised this arc, recorded rather than quietly absorbed.**
+The set was requested as "the `PTB_BLOCKED_CYCLES` / `PTB_PRIMS_BINNED` family". There is
+**no `V3D_PERFCNT_PTB_BLOCKED_CYCLES` in this header at all** — `grep PTB` over the enum
+returns exactly seven members (10 `PRIM_VIEWPOINT_DISCARD`, 11 `PRIM_CLIP`, 12 `PRIM_REV`,
+35 `PRIMS_BINNED`, plus `PTB_MEM_WRITES`, `PTB_MEM_READS`, `PTB_W_MEM_WORDS` in the
+AXI/memory tail). Of the eight indices above exactly **one**, 35, is a PTB member. The set
+is swept as given because the set is what the brief pinned, and because — after the V3D-65
+reject — what an id's enum member *says* is not what licenses anything. It is a **search
+window** and is defensible only as one; 35's PTB name buys it no head start over the other
+seven.
+
+### Batching against the PCTR slot count
+
+The bank is **eight counters** (`V3D_V4_PCTR_0_SRC_0_3` / `_4_7`, one 7-bit `SRC` field
+each) and **slot 2 is permanently reserved** for the `src32 CYCLE_COUNT` control per the
+`[v3d55]`/`V3D63_CTRL_SLOT` contract — `wait_fldone` samples PCTR counter 2 on every bin
+wait and prints a hard clock-liveness verdict off it. Seven usable sweep slots, and
+`V3D63_SWEEP_SRC`'s seven ids already fill them. So the eight new ids run as **two extra
+passes of four**: a fresh arm of the same bank with only slots 0,1,2,3,4 enabled
+(`V3D66_PCTR_MASK = 0x1F`), the same `v3d63_slot` packing, the same control in slot 2, and
+each pass **re-runs all three legs** so every permille is taken against a control measured
+on its own pass. Slots 5..7 are left unselected *and* disabled, so an unselected mux can
+never be mistaken for a measurement.
+
+The legs are V3D-64's, unchanged and reused, no new job class invented: **L1** a 4 ms pure
+idle window with nothing submitted, **L2** the known-good `clear_job` (only a job that
+passed is ground truth), **L3** one banked `Empty` rung of the `[v3d48]` ladder. The L3 rung
+is submitted with `bank: false` so it does not re-arm the seven-id bank over ours; the pass
+arms and reads its own bank around the kick. `V3D63_SWEEP_SRC` and everything `[v3d63]`,
+`[v3d64]` and `[v3d65]` print are untouched.
+
+### The new class — `WORK-GATED-BIN`
+
+V3D-64's vocabulary had `WORK-GATED-RENDER` but no mirror on the bin side; a mux that moved
+only on a bin kick printed a bare `OTHER`. V3D-66 splits that case out, **defined by
+predicate and by nothing else**:
+
+> the L1 idle leg is **valid** *and* the L3 bin leg is **valid** *and* the slot **moved** on
+> L3 (raw ≠ 0 or a latched overflow) *and* the slot did **not** move on L1 *and* the slot did
+> not move on L2 if L2 is valid.
+
+It requires a valid L1 on purpose: "moves only on bin" is a claim about the idle leg, and a
+boot whose L1 dropped out cannot make it — such a slot falls through to V3D-64's own
+`OTHER (IDLE-BLIND)` wording, which claims nothing about idle. It **cannot collide with
+`CLOCK-LIKE`**: the predicate demands a valid L1 on which the slot read zero, whose permille
+is 0 and therefore outside the ±10 % band `CLOCK-LIKE` requires on every valid leg. The
+split is a **refinement of `OTHER`**, not a reinterpretation of any class V3D-64 already
+published — `[v3d63]`/`[v3d64]`/`[v3d65]` still call `v3d64_classify` directly and their
+output is byte-identical.
+
+A mux in `WORK-GATED-BIN` is the thing the render CLE's wall actually needs: a candidate
+witness for whether the binner emits anything at all. V3D-67 may test a PTB name against it —
+under the rule, and only under the rule.
+
+### What is deliberately NOT claimed
+
+- **No id is named.** Not 35, whose enum member is `PTB_PRIMS_BINNED`. The wire lines print
+  `srcNN=value` and a class, with the standing caveat that V3D-65 proved `id↔mux` validity
+  partial on this silicon.
+- **No class is a semantic.** A class says how a mux responded to a pure-idle window, a
+  retiring CT1 render frame and a bin kick. It says nothing about which unit it counts.
+- **The standing rule is unchanged and restated on the wire:** a transcribed name must match
+  the class measured here or the transcription is rejected. Calibration checks the
+  transcription, never the reverse.
+
+### Cost, gating and where the verdict is taken
+
+Two passes × (a 4 ms idle window + one CT1 clear job + one banked `Empty` rung with its
+~0.5 s `FLDONE` backstop) = **two more rungs and ~1 s of extra deep boot**; the `[v3d]
+deep=on` budget line now reads **13 rungs / ~7 s**. Gating is V3D-64's, unchanged:
+`UNAOS_V3D_DEEP` plus the hub-identity gate, with an explicit `SKIPPED` line when the block
+is down. Writes are PCTR config registers only — no new MMIO window, no new job, no new CL.
+
+**QEMU raspi4b models no V3D block**, so `[v3d66]` never runs there and every class below is
+**metal-attended**. `kernel8-test` green for this arc means the default boot is byte-inert
+and the suite did not regress, and nothing more.

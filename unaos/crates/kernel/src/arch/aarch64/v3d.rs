@@ -897,7 +897,7 @@ pub fn bringup(fb: Option<FbTarget>) {
     // only trustworthy if it says what is missing from it.
     if V3D_DEEP {
         serial_println!(
-            ":: V3D: [v3d] deep=on — slow banked-verdict probes ARMED: [v3d48] bisection ladder (6 rungs x ~0.5 s FLDONE backstop) + [v3d63] ptb-unit matrix (4 more rungs, same backstop) + [v3d64] muxcal (1 more rung + a 4 ms idle window + 1 extra CT1 job) = 11 rungs, [v3d59] frameclose (64 x 1 ms), [v3d58] rerender (extra CT1 job). Expect ~6 s of extra boot — a stall of that length here is the BUDGET, not a hang ::"
+            ":: V3D: [v3d] deep=on — slow banked-verdict probes ARMED: [v3d48] bisection ladder (6 rungs x ~0.5 s FLDONE backstop) + [v3d63] ptb-unit matrix (4 more rungs, same backstop) + [v3d64] muxcal (1 more rung + a 4 ms idle window + 1 extra CT1 job) + [v3d66] ptbsweep (2 passes x [1 rung + a 4 ms idle window + 1 extra CT1 job]) = 13 rungs, [v3d59] frameclose (64 x 1 ms), [v3d58] rerender (extra CT1 job). Expect ~7 s of extra boot — a stall of that length here is the BUDGET, not a hang ::"
         );
     } else {
         serial_println!(
@@ -6257,6 +6257,9 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
 /// the list's base separates from a `CT0LC` that counts items. When `bank` is set, the V3D-63 sweep bank
 /// (see `V3D63_SWEEP_SRC`) is armed immediately before the GO and read at wait-exit — the counters then
 /// span exactly this frame. Returns the readback so the caller can compare rungs against each other.
+/// With `bank` clear the return still carries the rung's identity and its `retired` verdict (the RANK 2
+/// words and the counters read zero and must not be cited) — `None` means fail-closed before the kick,
+/// and only that. See the PI-V3D-66 note at the `else` branch below.
 fn submit_bisect_rung_at(
     tag: &str,
     rung: &str,
@@ -6373,7 +6376,26 @@ fn submit_bisect_rung_at(
             ctr: v3d63_pctr_read(),
         })
     } else {
-        None
+        // PI-V3D-66: when `bank` is clear the caller may have armed its OWN counter bank around this
+        // kick (the widened four-id sweep does exactly that), so this function must neither arm nor
+        // read the PCTR here — but the caller still needs to know whether the rung KICKED and whether
+        // it RETIRED. The unbanked variant therefore returns the rung's identity plus `retired`, with
+        // the RANK 2 register witnesses left at zero and an all-zero `ctr`. **No extra MMIO is issued
+        // on the unbanked path**, so the [v3d48]/[v3d50]/[v3d51]/[v3d53] ladder rungs behave and print
+        // exactly as they did before this arc. `None` still means, and only means, "fail-closed before
+        // the kick" — never "did not retire".
+        Some(V3d63Rung {
+            rung_off: cl_off as u32,
+            bin_ba,
+            bin_len: bin_len as u32,
+            retired,
+            ct0lc: 0,
+            ct0pc: 0,
+            ct0ca: 0,
+            ct0cs: 0,
+            pcs: 0,
+            ctr: V3d63Ctr::default(),
+        })
     };
     let bfc_after = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
     let pcs = mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS);
@@ -6535,6 +6557,11 @@ fn empty_frame_bisection() {
     // `[v3d58] rerender` is last in `probe_job`: a retiring render frame perturbs register/cache state
     // that every bin readback above is taken on.
     v3d64_mux_calibration();
+    // PI-V3D-66: the widened sweep rides the very tail, AFTER v3d64 — same reasoning as v3d64's own
+    // placement (its legs run CT1 jobs and banked bin rungs, so every bin readback above must already
+    // have been taken), and it must follow v3d64 specifically because its verdict is read against the
+    // classes v3d64/v3d65 established on this same boot.
+    v3d66_ptb_sweep();
 }
 
 /// PI-V3D-63 — one banked rung's readback: the RANK 2 placement witness (the CT0/PCS words) plus the
@@ -7263,6 +7290,316 @@ fn v3d65_anchor_check(legs: &[V3d64Leg; 3]) {
             p1 as u32, p2 as u32, p3 as u32, V3D65_SRC_ID
         );
     }
+}
+
+// ─── PI-V3D-66 (`ptbsweep`) — widen the calibration sweep to the PTB-neighbourhood ids. MEASURE ONLY ─
+//
+// ── What V3D-65 actually settled, and why this arc names nothing ────────────────────────────────────
+// V3D-65 transcribed src28 = `V3D_PERFCNT_BIN_ACTIVE` from the uapi enum and submitted it to V3D-64's
+// rail. **The anchor check REJECTED it**: on metal src28 measured CLOCK-LIKE — 1:1 with the src32
+// CYCLE_COUNT control on EVERY leg including the pure-idle one, where by the name's own predicate a bin
+// counter must read zero. The six-for-six index cross-check (14/16/17/24/25/32 land on the names this
+// file already gave them) is independent of that outcome and STANDS, so the enum reading is right and
+// the fault is downstream of it: on this silicon the 7-bit SRC field does not select the enum's source
+// for every id. **id↔mux validity is PARTIAL, and it is partial in a way we cannot predict per id.**
+//
+// That is the whole reason this arc is a MEASUREMENT and not a transcription. With id↔mux only
+// partially valid, a name carried over from the enum is worth exactly as much as the behaviour that
+// backs it — so V3D-66 widens the bank, measures the new muxes across the SAME three legs of known
+// ground truth, and publishes the raw numbers and the behaviour classes. **NOTHING is named here.**
+// Transcription is left to V3D-67, which will have this arc's classes to be judged against.
+//
+// ── The candidate ids, cited exactly ────────────────────────────────────────────────────────────────
+// Same header, same copy, same enum as V3D-65:
+//
+//   file : include/uapi/drm/v3d_drm.h  (Linux uapi header)
+//   copy : /usr/src/kernels/7.1.5-200.fc44.x86_64/include/uapi/drm/v3d_drm.h — Fedora `kernel-devel`
+//          for the build host's own running kernel (reachable here as /run/host/usr/src/kernels/…)
+//   what : the anonymous `enum { V3D_PERFCNT_* }` at the tail of the header, first member
+//          `V3D_PERFCNT_FEP_VALID_PRIMTS_NO_PIXELS` at index 0; the enum's own comment scopes these
+//          indices to V3D 4.2 — THIS hardware.
+//
+// The eight indices this arc adds, transcribed with their enum members as they appear in that copy
+// (line numbers are that file's):
+//
+//   30 → V3D_PERFCNT_L2T_HITS                              (v3d_drm.h:653)
+//   31 → V3D_PERFCNT_L2T_MISSES                            (v3d_drm.h:654)
+//   33 → V3D_PERFCNT_QPU_CYCLES_STALLED_VERTEX_COORD_USER  (v3d_drm.h:656)
+//   34 → V3D_PERFCNT_QPU_CYCLES_STALLED_FRAGMENT           (v3d_drm.h:657)
+//   35 → V3D_PERFCNT_PTB_PRIMS_BINNED                      (v3d_drm.h:658)
+//   36 → V3D_PERFCNT_AXI_WRITES_WATCH_0                    (v3d_drm.h:659)
+//   37 → V3D_PERFCNT_AXI_READS_WATCH_0                     (v3d_drm.h:660)
+//   38 → V3D_PERFCNT_AXI_WRITE_STALLS_WATCH_0              (v3d_drm.h:661)
+//
+// **A correction to the brief that raised this arc, recorded rather than quietly absorbed.** The set
+// was requested as "the PTB_BLOCKED_CYCLES / PTB_PRIMS_BINNED family". In THIS header there is no
+// `V3D_PERFCNT_PTB_BLOCKED_CYCLES` at all — `grep PTB` over the enum returns exactly seven members
+// (10 PRIM_VIEWPOINT_DISCARD, 11 PRIM_CLIP, 12 PRIM_REV, 35 PRIMS_BINNED, plus PTB_MEM_WRITES,
+// PTB_MEM_READS, PTB_W_MEM_WORDS in the AXI/memory tail). Of the eight indices above exactly ONE, 35,
+// is a PTB member; 30/31 are L2T, 33/34 are QPU stall counters and 36/37/38 are AXI watch-0 counters.
+// The indices are swept as given because the SET is what the brief pinned and because — after V3D-65 —
+// what an id's enum member SAYS is not what licenses anything anyway. The window is swept as a search
+// window, and it is defensible only as one. What each mux turns out to be is decided below by
+// behaviour, and 35's PTB name buys it no head start over the other seven.
+//
+// ── Batching against the PCTR slot count ────────────────────────────────────────────────────────────
+// The hardware bank is EIGHT counters (`V3D_V4_PCTR_0_SRC_0_3` / `_4_7`, one 7-bit SRC field each), and
+// slot 2 is permanently reserved for the src32 CYCLE_COUNT control per the `[v3d55]`/`V3D63_CTRL_SLOT`
+// contract — `wait_fldone` samples PCTR counter 2 on every bin wait and prints a hard clock-liveness
+// verdict off it, so a sweep id parked there would fabricate that verdict. Seven usable sweep slots,
+// and `[v3d63]`'s seven ids already occupy all of them. The eight new ids therefore cannot ride the
+// existing bank at all, and they do not: they run as TWO ADDITIONAL PASSES of four, each pass a fresh
+// arm of the same 8-counter bank with only slots 0,1,2,3,4 enabled (`V3D66_PCTR_MASK`), the same
+// `v3d63_slot` packing, the same src32 control in slot 2 — and each pass re-runs the SAME three legs so
+// every permille ratio is taken against a control measured on its own pass. Slots 5..7 are left
+// unselected AND disabled in `PCTR_EN`; they are never read and never printed.
+//
+// The existing `V3D63_SWEEP_SRC` bank is untouched — `[v3d63]` and `[v3d64]`/`[v3d65]` print exactly
+// what they printed before this arc, byte for byte.
+//
+// ── Cost ────────────────────────────────────────────────────────────────────────────────────────────
+// Two passes x (a 4 ms idle window + one CT1 clear job + one banked Empty bin rung with its ~0.5 s
+// FLDONE backstop) = 2 more rungs and ~1 s of extra deep boot. The `[v3d] deep=on` budget line is
+// updated to say so.
+//
+// Writes: PCTR config registers only (the `v3d63_pctr_arm` idiom), plus the legs' own already-existing
+// submissions. No new MMIO window, no new job, no new CL.
+
+/// PI-V3D-66 — pass A of the widened sweep. Raw indices; NO name is attached to any of them.
+const V3D66_BATCH_A: [u32; 4] = [30, 31, 33, 34];
+/// PI-V3D-66 — pass B of the widened sweep. Raw indices; NO name is attached to any of them.
+const V3D66_BATCH_B: [u32; 4] = [35, 36, 37, 38];
+/// PI-V3D-66 — counters enabled per pass: slots 0,1,3,4 carry the four swept ids and slot 2 carries the
+/// reserved src32 CYCLE_COUNT control. Slots 5..7 stay DISABLED so an unselected mux (SRC field 0) can
+/// never be mistaken for a measurement.
+const V3D66_PCTR_MASK: u32 = 0x1F;
+
+/// PI-V3D-66 — arm the bank for one four-id pass. Identical programming order to `v3d63_pctr_arm`
+/// (stop → program SRC → read back the selects so the posted stores retire, per PI-V3D-39 → clear
+/// counters and overflow WHILE stopped → enable last), differing only in the narrower enable mask.
+fn v3d66_pctr_arm(batch: &[u32; 4]) {
+    // Slot packing IS `v3d63_slot`: 0→0, 1→1, control→2, 2→3, 3→4. Slots 5..7 select source 0 but are
+    // masked out of PCTR_EN below, so they never count and are never read.
+    let src_0_3 = (batch[0] & 0x7f)
+        | ((batch[1] & 0x7f) << 8)
+        | ((PCTR_SRC_CYCLE_COUNT & 0x7f) << 16)
+        | ((batch[2] & 0x7f) << 24);
+    let src_4_7 = batch[3] & 0x7f;
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3, src_0_3);
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_4_7, src_4_7);
+    dsb();
+    // PI-V3D-39: read the selects back so the posted stores RETIRE and the mux is provably latched.
+    let _srclat = mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3)
+        | mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_4_7);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_CLR, V3D63_PCTR_MASK); // clear all eight regardless
+    mmio_write(V3D_CORE0_BASE, V3D_PCTR_0_OVERFLOW, V3D63_PCTR_MASK);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, V3D66_PCTR_MASK); // enable LAST, from a clean zero
+    dsb();
+}
+
+/// PI-V3D-66 — classify one swept mux by BEHAVIOUR across the three legs, with one class more than
+/// `[v3d64]` had vocabulary for.
+///
+/// **`WORK-GATED-BIN`, defined by predicate and by nothing else:**
+///
+/// > the L1 idle leg is VALID **and** the L3 bin leg is VALID **and** the slot MOVED on L3 (raw != 0 or
+/// > a latched overflow) **and** the slot did NOT move on L1 **and** the slot did not move on L2 if L2
+/// > is valid.
+///
+/// In words: it moves on a bin kick and on nothing else that this boot can show it. It is the exact
+/// mirror of `[v3d64]`'s `WORK-GATED-RENDER` about the other work leg, and it is the class the render
+/// CLE's wall actually needs — a mux in it is a candidate witness for whether the binner emits anything
+/// at all, and V3D-67 may test a PTB name against it.
+///
+/// The predicate requires L1 valid on purpose: "moves only on bin" is a claim about the idle leg, and
+/// a boot whose L1 dropped out cannot make it. Such a slot falls through to `[v3d64]`'s own
+/// `OTHER (IDLE-BLIND)` wording, which claims nothing about idle.
+///
+/// `WORK-GATED-BIN` cannot collide with `CLOCK-LIKE`: the predicate requires a VALID L1 on which the
+/// slot read zero, whose permille is 0 and therefore outside the ±10% band `v3d64_classify` requires on
+/// every valid leg. Under the old vocabulary such a slot printed a bare `OTHER`; the split is a
+/// refinement of `OTHER`, not a reinterpretation of any class `[v3d64]` already published. `[v3d63]`,
+/// `[v3d64]` and `[v3d65]` keep calling `v3d64_classify` directly and their output is unchanged.
+fn v3d66_classify(legs: &[V3d64Leg; 3], i: usize) -> &'static str {
+    if legs[0].valid()
+        && legs[2].valid()
+        && legs[2].moved_i(i)
+        && !legs[0].moved_i(i)
+        && !(legs[1].valid() && legs[1].moved_i(i))
+    {
+        return "WORK-GATED-BIN — moved ONLY on the bin-kick leg: flat on the pure-idle window where no work exists to gate on, flat on the retiring CT1 render frame, and moving on the banked Empty bin rung. Gated on bin-side work and on nothing else this boot can show it. NO NAME IS CLAIMED — this says how the mux responded, not which unit it counts";
+    }
+    v3d64_classify(legs, i)
+}
+
+/// PI-V3D-66 — emit one pass's raw bank for one leg. Four swept ids, printed by index, unnamed.
+fn v3d66_emit_leg(pass: &str, batch: &[u32; 4], leg: &V3d64Leg, note: &str) {
+    if leg.ctr.is_none() {
+        serial_println!(
+            "::   [v3d66] pass {} leg {} — NOT RUN ({}) — this leg contributes no reading; the classification below is taken on the legs that did run and says so ::",
+            pass, leg.tag, note
+        );
+        return;
+    }
+    serial_println!(
+        "::   [v3d66] pass {} leg {} — {} | src32 CYCLE_COUNT={} (control, valid={}) | src{}={} src{}={} src{}={} src{}={} [ALL FOUR UNIDENTIFIED — raw mux reads, NO name claimed: V3D-65 proved id↔mux validity is PARTIAL on this silicon] | OVERFLOW={:#010x} ::",
+        pass, leg.tag, note, leg.ctrl(), leg.valid() as u32,
+        batch[0], leg.raw(0),
+        batch[1], leg.raw(1),
+        batch[2], leg.raw(2),
+        batch[3], leg.raw(3),
+        leg.ovf(),
+    );
+}
+
+/// PI-V3D-66 — run ONE four-id pass across the same three legs `[v3d64]` calibrates on, then classify.
+///
+/// The legs are reproduced from `v3d64_mux_calibration` deliberately rather than shared: each pass must
+/// carry its OWN src32 control, measured on its own arm, or the permille ratios would be taken against
+/// a control from a different window. No new job class is invented — L2 is the same known-good
+/// `clear_job`, L3 the same banked `Empty` rung of the `[v3d48]` ladder.
+fn v3d66_run_pass(pass: &str, batch: &[u32; 4]) {
+    // ── L1 — pure idle. Arm, burn a fixed CNTPCT window with no submission, read. ────────────────────
+    let frq = super::timer::cntfrq();
+    let t0 = super::timer::cntpct();
+    v3d66_pctr_arm(batch);
+    settle_ms(V3D64_IDLE_MS);
+    let l1 = v3d63_pctr_read();
+    let idle_us = (super::timer::cntpct().wrapping_sub(t0)).saturating_mul(1_000_000) / frq.max(1);
+
+    // ── L2 — the known-good CT1 render job. Only a job that PASSED is ground truth. ──────────────────
+    let render_ran = V3D58_RENDER_RAN.load(Ordering::Acquire);
+    let render_ok = V3D58_RENDER_OK.load(Ordering::Acquire);
+    let (l2, l2_note) = if !render_ran || !render_ok {
+        (None, "the M3 clear job did not pass earlier this boot, so there is no known-good render leg to calibrate against")
+    } else {
+        v3d66_pctr_arm(batch);
+        let ok = clear_job(None); // panel blit suppressed; re-seeds + byte-verifies its own target
+        let c = v3d63_pctr_read();
+        if ok {
+            (Some(c), "CT1 clear job RETIRED and byte-verified — real render work")
+        } else {
+            (
+                Some(c),
+                "CT1 clear job FAILED its verify on THIS run — the bank spans a render frame that did not complete; read this leg as work-attempted, not work-retired",
+            )
+        }
+    };
+
+    // ── L3 — the bin-side leg. The banked rung arms the [v3d63] bank itself, so this pass re-arms its
+    //    own four-id bank around the submission instead of reading the rung's returned counters
+    //    (`bank: false` — the rung must NOT re-arm the seven-id [v3d63] bank over ours). Slot 2 still
+    //    carries src32 CYCLE_COUNT, so the `[v3d55]` clock-liveness line `wait_fldone` prints from PCTR
+    //    counter 2 inside this rung's wait remains truthful, exactly as under the [v3d63] bank.
+    v3d66_pctr_arm(batch);
+    let l3r = submit_bisect_rung_at(
+        "v3d66",
+        "bin-empty",
+        BinContent::Empty,
+        OFF_SHADREC,
+        OFF_PROBE_BIN_CL,
+        false,
+    );
+    let l3 = v3d63_pctr_read();
+    let (l3_ctr, l3_note) = match l3r {
+        Some(r) => (
+            Some(l3),
+            if r.retired {
+                "Empty bin rung RETIRED — bin work that completed"
+            } else {
+                "Empty bin rung did NOT retire (the banked wedge) — the bank spans an OPEN bin frame plus its ~0.5 s FLDONE backstop"
+            },
+        ),
+        None => (None, "the rung fail-closed before its kick (range escape)"),
+    };
+
+    let legs = [
+        V3d64Leg { tag: "L1 idle", ctr: Some(l1) },
+        V3d64Leg { tag: "L2 render", ctr: l2 },
+        V3d64Leg { tag: "L3 bin", ctr: l3_ctr },
+    ];
+
+    serial_println!(
+        "::   [v3d66] pass {} — swept ids {:?} in PCTR slots 0,1,3,4 with src32 CYCLE_COUNT pinned to slot 2 (PCTR_EN={:#04x}); L1 idle span_us={} (target {} ms) ::",
+        pass, batch, V3D66_PCTR_MASK, idle_us, V3D64_IDLE_MS
+    );
+    v3d66_emit_leg(pass, batch, &legs[0], "no job submitted");
+    v3d66_emit_leg(pass, batch, &legs[1], l2_note);
+    v3d66_emit_leg(pass, batch, &legs[2], l3_note);
+
+    let mut valid_n = 0usize;
+    let mut k = 0usize;
+    while k < legs.len() {
+        if legs[k].valid() {
+            valid_n += 1;
+        }
+        k += 1;
+    }
+    if valid_n < 2 {
+        serial_println!(
+            ":: V3D: [v3d66] pass {} INCONCLUSIVE — only {} of 3 legs carried a live src32 CYCLE_COUNT control (L1={} L2={} L3={}). A classification needs at least two legs to differentiate across; NOTHING in this pass is a measurement and no mux is classified. This is explicitly NOT a clean result ::",
+            pass, valid_n, legs[0].ctrl(), legs[1].ctrl(), legs[2].ctrl()
+        );
+        return;
+    }
+
+    let mut i = 0usize;
+    while i < batch.len() {
+        serial_println!(
+            "::   [v3d66] pass {} src{} — L1 idle={} ({} permille of src32) | L2 render={} ({} permille) | L3 bin={} ({} permille) | valid L1={} L2={} L3={} — CLASS: {} ::",
+            pass, batch[i],
+            legs[0].raw(i), legs[0].permille(i),
+            legs[1].raw(i), legs[1].permille(i),
+            legs[2].raw(i), legs[2].permille(i),
+            legs[0].valid() as u32, legs[1].valid() as u32, legs[2].valid() as u32,
+            v3d66_classify(&legs, i),
+        );
+        i += 1;
+    }
+
+    serial_println!(
+        ":: V3D: [v3d66] pass {} verdict — {} of 3 legs valid; ids {:?} classified by BEHAVIOUR ONLY (CLOCK-LIKE / WORK-GATED-RENDER / WORK-GATED-BIN / SILENT / OTHER). NO source id is named in this pass and none may be inferred from it. THE STANDING RULE, UNCHANGED: when a later arc transcribes one of these ids from `enum drm_v3d_perfcnt`, the transcribed NAME MUST MATCH THE CLASS MEASURED HERE or the transcription is REJECTED — calibration checks the transcription, never the reverse. V3D-65 already exercised that rule to a REJECT (src28 = BIN_ACTIVE measured CLOCK-LIKE and the name was withdrawn), which is why this arc lands measurements and leaves naming to V3D-67: the enum reading survived, the id↔MUX mapping on this silicon did not, and only behaviour can tell the two apart ::",
+        pass, valid_n, batch
+    );
+}
+
+/// PI-V3D-66 — the widened sweep: two four-id passes over the PTB-neighbourhood candidate indices.
+///
+/// Poison-honest and hub-gated exactly like `[v3d64]`: an explicit `SKIPPED` line when the block is
+/// down, and every leg that does not run is REPORTED as not-run rather than folded in as a zero. QEMU
+/// raspi4b models no V3D block, so this is dormant there and `kernel8-test` green means NO REGRESSION
+/// and nothing more — the classes below are METAL-ATTENDED, always.
+fn v3d66_ptb_sweep() {
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down => {
+            serial_println!(
+                ":: V3D: [v3d66] SKIPPED — hub IDENT0 reads 0x00000000 (block absent/unpowered; the QEMU raspi4b signature). No pass was measured this boot and NO mux was classified; no verdict is implied ::"
+            );
+            return;
+        }
+        V3dPresence::Poison(w) => {
+            serial_println!(
+                ":: V3D: [v3d66] SKIPPED — hub IDENT0 reads poison {:#010x} (open-bus / firmware fill, not a live register). No pass was measured this boot and NO mux was classified; no verdict is implied ::",
+                w
+            );
+            return;
+        }
+    }
+    serial_println!(
+        ":: V3D: [v3d66] ptbsweep — widening the [v3d64] calibration to eight more source ids from the SAME uapi enum copy (/usr/src/kernels/7.1.5-200.fc44.x86_64/include/uapi/drm/v3d_drm.h): {:?} then {:?}. Seven sweep slots exist per bank (slot 2 is reserved for the src32 CYCLE_COUNT control), so these run as TWO passes of four, each re-running the same three legs (L1 {} ms pure idle / L2 the known-good CT1 clear job / L3 one banked Empty bin rung) with its own control. This probe MEASURES; it names NOTHING ::",
+        V3D66_BATCH_A, V3D66_BATCH_B, V3D64_IDLE_MS
+    );
+    v3d66_run_pass("A", &V3D66_BATCH_A);
+    v3d66_run_pass("B", &V3D66_BATCH_B);
+    serial_println!(
+        ":: V3D: [v3d66] ptbsweep verdict — eight ids swept across two passes, {:?} + {:?}, every one of them RAW and UNNAMED. What the enum calls them is recorded in the source comment and is deliberately NOT printed on the wire, because V3D-65 proved on this silicon that an enum member and the mux its index selects can disagree: the six-for-six index cross-check (14/16/17/24/25/32) stands, and src28 = BIN_ACTIVE was still REJECTED for measuring CLOCK-LIKE on a pure-idle leg. id↔mux validity is therefore PARTIAL and per-id, and a name is licensed only by behaviour. THE STANDING RULE: a transcribed name must match the class measured here or it is REJECTED; calibration checks the transcription, never the reverse. Transcription is V3D-67's job, and it now has classes to be judged against ::",
+        V3D66_BATCH_A, V3D66_BATCH_B
+    );
 }
 
 /// Read a little-endian u32 out of the arena at `off` (probe scratch readback).
