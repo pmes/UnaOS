@@ -25,6 +25,7 @@ pub(crate) struct SpecifiedStyle {
     pub inset_right: Option<LengthPercentageAuto>,
     pub inset_bottom: Option<LengthPercentageAuto>,
     pub justify: Option<taffy::style::JustifyContent>,
+    pub align_items: Option<taffy::style::AlignItems>,
     pub align_self: Option<taffy::style::AlignSelf>,
     pub box_sizing: Option<taffy::style::BoxSizing>,
     pub paint: PaintStyle,
@@ -69,6 +70,18 @@ impl SpecifiedStyle {
         if let Some(j) = self.justify {
             node_style.justify_content = Some(j);
         }
+        // align-items only reaches ROW boxes. A column box here is the
+        // block-container approximation, not a real column flex container:
+        // an `align-items:center` written for a row would land on its CROSS
+        // axis and centre the page's block content horizontally.
+        if let Some(a) = self.align_items {
+            if matches!(
+                node_style.flex_direction,
+                FlexDirection::Row | FlexDirection::RowReverse
+            ) {
+                node_style.align_items = Some(a);
+            }
+        }
         if let Some(a) = self.align_self {
             node_style.align_self = Some(a);
         }
@@ -92,7 +105,10 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             // Column-flex approximations of block-ish display types.
             "flex" | "block" | "inline-block" | "inline-flex" | "inline" | "list-item"
             | "flow-root" | "table" | "table-cell" | "table-caption" | "table-row-group"
-            | "table-header-group" | "table-footer-group" => {
+            | "table-header-group" | "table-footer-group"
+            // Legacy/prefixed flexbox spellings are the same box type here.
+            | "-webkit-box" | "-webkit-inline-box" | "-webkit-flex" | "-webkit-inline-flex"
+            | "-ms-flexbox" | "-ms-inline-flexbox" | "-moz-box" => {
                 style.display = Some(Display::Flex)
             }
             "table-row" => {
@@ -194,16 +210,33 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 }
             }
         }
+        // text-align is INHERITED: it aligns the inline content of every
+        // descendant block, not just this box's own flex children. The
+        // paint field carries it down (see layout::remeasure); the justify
+        // here is the immediate effect on this box's own row.
         "text-align" => match value {
-            "center" => style.justify = Some(taffy::style::JustifyContent::CENTER),
-            "right" | "end" => style.justify = Some(taffy::style::JustifyContent::END),
-            "left" | "start" | "justify" => style.justify = Some(taffy::style::JustifyContent::START),
+            "center" | "-webkit-center" | "-moz-center" => {
+                style.justify = Some(taffy::style::JustifyContent::CENTER);
+                style.paint.text_align = Some(1);
+            }
+            "right" | "end" => {
+                style.justify = Some(taffy::style::JustifyContent::END);
+                style.paint.text_align = Some(2);
+            }
+            "left" | "start" | "justify" => {
+                style.justify = Some(taffy::style::JustifyContent::START);
+                style.paint.text_align = Some(0);
+            }
+            "inherit" | "initial" | "unset" | "revert" => {}
             other => crate::ledger::record_css(&format!("text-align:{}", other)),
         },
         "justify-content" => match value {
             "center" => style.justify = Some(taffy::style::JustifyContent::CENTER),
             "flex-end" | "end" => style.justify = Some(taffy::style::JustifyContent::END),
-            "flex-start" | "start" => style.justify = Some(taffy::style::JustifyContent::START),
+            "flex-start" | "start" | "normal" => style.justify = Some(taffy::style::JustifyContent::START),
+            "space-between" => style.justify = Some(taffy::style::JustifyContent::SPACE_BETWEEN),
+            "space-around" => style.justify = Some(taffy::style::JustifyContent::SPACE_AROUND),
+            "space-evenly" => style.justify = Some(taffy::style::JustifyContent::SPACE_EVENLY),
             "inherit" | "initial" | "unset" => {}
             other => crate::ledger::record_css(&format!("justify-content-value:{}", other)),
         },
@@ -263,6 +296,21 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             let mut got_color = false;
             for part in value.split_whitespace() {
                 if part.starts_with("url(") { continue; }
+                // Non-colour shorthand components (position, repeat,
+                // attachment, origin/clip box, the `/` size separator) are
+                // not colour candidates — probing them logged a bogus
+                // `named-color:` miss for every sprite background on a page.
+                if is_position_token(part)
+                    || parse_repeat(part).is_some()
+                    || part.starts_with('/')
+                    || matches!(
+                        part,
+                        "scroll" | "fixed" | "local" | "border-box" | "padding-box"
+                            | "content-box" | "text" | "cover" | "contain" | "none"
+                    )
+                {
+                    continue;
+                }
                 if let Some(c) = parse_color_str(part) {
                     style.paint.background = Some(c);
                     got_color = true;
@@ -298,6 +346,70 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             };
             style.paint.family = Some(fam);
         }
+        // The `font` shorthand: [style] [weight] size[/line-height] family.
+        // Legacy pages set their controls entirely through it
+        // (`font:15px sans-serif`), so ignoring it left every such element
+        // at the inherited size and family.
+        "font" => {
+            if matches!(value, "inherit" | "initial" | "unset" | "revert")
+                || matches!(
+                    value,
+                    "caption" | "icon" | "menu" | "message-box" | "small-caption" | "status-bar"
+                )
+            {
+                return;
+            }
+            let mut rest = value;
+            // Leading style / variant / weight / stretch keywords.
+            loop {
+                let Some((head, tail)) = rest.split_once(char::is_whitespace) else { break };
+                let h = head.trim().to_ascii_lowercase();
+                if h == "italic" || h == "oblique" {
+                    style.paint.italic = Some(true);
+                } else if h == "normal" || h == "small-caps" || h.starts_with("ultra")
+                    || h.starts_with("extra") || h == "condensed" || h == "expanded"
+                    || h == "semi-condensed" || h == "semi-expanded"
+                {
+                    // no effect here, but still part of the prefix
+                } else if let Some(b) = parse_font_weight(&h) {
+                    style.paint.bold = Some(b);
+                } else {
+                    break;
+                }
+                rest = tail.trim_start();
+            }
+            // size[/line-height] then the family list.
+            let (size_part, family) = match rest.find(char::is_whitespace) {
+                Some(i) => (&rest[..i], rest[i..].trim()),
+                None => (rest, ""),
+            };
+            let (size, line) = match size_part.split_once('/') {
+                Some((s, l)) => (s, Some(l)),
+                None => (size_part, None),
+            };
+            match parse_font_size(size) {
+                Some(px) => style.paint.font_size = Some(px),
+                None => {
+                    crate::ledger::record_css(&format!("font-shorthand:{}", clip(value)));
+                    return;
+                }
+            }
+            if let Some(l) = line {
+                apply_declaration("line-height", l, style);
+            }
+            if !family.is_empty() {
+                apply_declaration("font-family", family, style);
+            }
+        }
+        "align-items" | "align-content" => match value {
+            "center" => style.align_items = Some(taffy::style::AlignItems::CENTER),
+            "flex-end" | "end" => style.align_items = Some(taffy::style::AlignItems::END),
+            "flex-start" | "start" => style.align_items = Some(taffy::style::AlignItems::START),
+            "baseline" => style.align_items = Some(taffy::style::AlignItems::BASELINE),
+            "stretch" | "normal" => style.align_items = Some(taffy::style::AlignItems::STRETCH),
+            "inherit" | "initial" | "unset" => {}
+            other => crate::ledger::record_css(&format!("align-items-value:{}", other)),
+        },
         "font-size" => match parse_font_size(value) {
             Some(px) => style.paint.font_size = Some(px),
             None => crate::ledger::record_css(&format!("font-size-value:{}", clip(value))),
@@ -536,6 +648,33 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             }
         }
         "border-style" => {} // stroke style is uniform; nothing to record
+        // Vendor-prefixed spellings of properties this engine implements
+        // with the SAME value grammar. Only these are aliased: the old
+        // `-webkit-box-*` flexbox properties (box-flex/box-align/box-pack)
+        // take different values and stay honestly unimplemented.
+        other
+            if other
+                .strip_prefix("-webkit-")
+                .or_else(|| other.strip_prefix("-moz-"))
+                .or_else(|| other.strip_prefix("-ms-"))
+                .or_else(|| other.strip_prefix("-o-"))
+                .is_some_and(|base| {
+                    matches!(
+                        base,
+                        "box-sizing" | "background-size" | "background-position"
+                            | "background-repeat" | "align-items" | "align-content"
+                            | "align-self" | "justify-content" | "flex-direction"
+                            | "flex-wrap" | "opacity" | "border-radius"
+                    )
+                }) =>
+        {
+            let base = other
+                .trim_start_matches("-webkit-")
+                .trim_start_matches("-moz-")
+                .trim_start_matches("-ms-")
+                .trim_start_matches("-o-");
+            apply_declaration(base, value, style);
+        }
         other => crate::ledger::record_css(&format!("property:{}", other)),
     }
 }
@@ -685,8 +824,18 @@ fn is_position_token(t: &str) -> bool {
     if matches!(t, "left" | "right" | "top" | "bottom" | "center") {
         return true;
     }
-    t.ends_with('%') && t[..t.len() - 1].parse::<f32>().is_ok()
-        || t.ends_with("px") && t[..t.len() - 2].trim().parse::<f32>().is_ok()
+    // A bare `0` is a valid position component and the commonest one:
+    // `background:url(sprite.png) 0 -261px repeat-x` dropped its x offset,
+    // leaving a one-value position that shifted the sprite in the wrong axis.
+    if t == "0" {
+        return true;
+    }
+    for unit in ["px", "em", "rem", "pt", "%"] {
+        if let Some(n) = t.strip_suffix(unit) {
+            return !n.is_empty() && n.trim().parse::<f32>().is_ok();
+        }
+    }
+    false
 }
 
 /// Truncates a value for a stable, bounded ledger key.
@@ -1062,7 +1211,7 @@ fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
     copy!(
         background, color, font_size, bold, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
-        mask_repeat,
+        mask_repeat, text_align,
     );
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position);
 }
@@ -1449,7 +1598,7 @@ fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
         ($($f:ident),*) => { $( if src.$f.is_some() { dst.$f = src.$f; } )* };
     }
     take!(display, flex_direction, width, height, padding, margin, position,
-          inset_top, inset_left, inset_right, inset_bottom, justify, align_self,
+          inset_top, inset_left, inset_right, inset_bottom, justify, align_items, align_self,
           max_width, max_height, min_width, min_height, box_sizing);
     merge_paint(&mut dst.paint, &src.paint);
 }
@@ -1512,6 +1661,7 @@ fn property_supported(prop: &str) -> bool {
             | "padding-top" | "padding-right" | "padding-bottom" | "padding-left"
             | "margin-top" | "margin-right" | "margin-bottom" | "margin-left"
             | "position" | "top" | "left" | "right" | "bottom" | "text-align" | "justify-content"
+            | "font" | "align-items" | "align-content"
             | "background-color" | "background" | "background-image" | "color"
             | "background-size" | "background-position" | "background-repeat"
             // Alpha-stencil masks really are implemented (render::draw_node),
@@ -1618,6 +1768,14 @@ pub fn parse_font_size(value: &str) -> Option<f32> {
     }
     if let Some(pct) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
         return Some(pct / 100.0 * BASE_FONT_PX);
+    }
+    // Absolute print units. Legacy pages still size their small print in
+    // pt (`font-size:10pt` on a footer), and dropping them left that text
+    // at the inherited 16px.
+    for (unit, per_px) in [("pt", 96.0 / 72.0), ("pc", 16.0), ("in", 96.0), ("cm", 96.0 / 2.54), ("mm", 96.0 / 25.4)] {
+        if let Some(n) = v.strip_suffix(unit).and_then(|n| n.trim().parse::<f32>().ok()) {
+            return Some(n * per_px);
+        }
     }
     match v.as_str() {
         "xx-small" => Some(9.0),
@@ -1917,6 +2075,10 @@ fn named_color(name: &str) -> Option<(u8, u8, u8)> {
         "aqua" | "cyan" => Some((0, 255, 255)),
         "fuchsia" | "magenta" => Some((255, 0, 255)),
         "lime" => Some((0, 255, 0)),
+        // Keywords that ARE valid colour syntax but carry no paintable RGB
+        // here. They are answered, not missing — ledgering them buried the
+        // real unknown-colour misses under `transparent` noise.
+        "transparent" | "currentcolor" | "inherit" | "initial" | "unset" | "revert" | "none" => None,
         other => {
             crate::ledger::record_css(&format!("named-color:{}", clip(other)));
             None

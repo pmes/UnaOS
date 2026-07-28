@@ -52,6 +52,10 @@ pub struct PaintStyle {
     pub mask_size: Option<String>,
     pub mask_position: Option<String>,
     pub mask_repeat: Option<u8>,
+    /// text-align: 0 = left/start, 1 = center, 2 = right/end. INHERITED —
+    /// remeasure walks it down the box tree and turns it into the flex
+    /// alignment of each descendant's own formatting context.
+    pub text_align: Option<u8>,
 }
 
 pub struct LayoutTree {
@@ -104,14 +108,88 @@ fn is_inline(name: &str) -> bool {
     )
 }
 
+/// Quirks mode: no doctype at all, or anything other than a bare
+/// `<!DOCTYPE html>`. Only the handful of rendering quirks this engine
+/// actually implements key off it.
+pub fn is_quirks(dom: &NodeRef) -> bool {
+    let doc = if dom.as_document().is_some() {
+        dom.clone()
+    } else {
+        let mut n = dom.clone();
+        while let Some(p) = n.parent() {
+            n = p;
+        }
+        n
+    };
+    for child in doc.children() {
+        if let Some(dt) = child.as_doctype() {
+            return !(dt.name.eq_ignore_ascii_case("html")
+                && dt.public_id.is_empty()
+                && dt.system_id.is_empty());
+        }
+    }
+    true
+}
+
+/// Table-internal boxes. They are neither block nor inline level: their
+/// parent lays them out by table rules, so the inline/block machinery
+/// (anonymous block boxes, the inline-with-block-children demotion) must
+/// leave them alone.
+fn is_table_part(name: &str) -> bool {
+    matches!(
+        name,
+        "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption"
+            | "colgroup" | "col"
+    )
+}
+
+/// True when the node produces a box at all (mirrors the build-time skips).
+fn generates_box(node: &NodeRef) -> bool {
+    if let Some(el) = node.as_element() {
+        if is_non_rendered(el.name.local.as_ref()) {
+            return false;
+        }
+        let attrs = el.attributes.borrow();
+        if attrs.get("hidden").is_some() || attrs.get("aria-hidden") == Some("true") {
+            return false;
+        }
+        if el.name.local.as_ref() == "input"
+            && attrs.get("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("hidden"))
+        {
+            return false;
+        }
+        true
+    } else {
+        node.as_text().is_some() && !node.text_contents().trim().is_empty()
+    }
+}
+
 /// True when a DOM node lays out as inline content (text or inline element).
 fn is_inline_node(node: &NodeRef) -> bool {
     if node.as_text().is_some() {
         return true;
     }
-    node.as_element()
-        .map(|el| is_inline(el.name.local.as_ref()))
-        .unwrap_or(false)
+    let Some(el) = node.as_element() else { return false };
+    let tag = el.name.local.as_ref();
+    if !is_inline(tag) {
+        return false;
+    }
+    // Table cells flow by table rules whatever they contain.
+    if is_table_part(tag) {
+        return true;
+    }
+    // An inline element that CONTAINS block-level children is broken around
+    // them by CSS; the practical approximation is to lay it out as a block.
+    // Treated as inline it shrank to fit while its block children still
+    // wanted 100% — <span id=footer> wrapping the whole page footer came out
+    // half width.
+    // Tag-level test only (no recursion): the check runs at every level of
+    // the build, and a subtree-deep test would make it quadratic.
+    !node.children().any(|c| {
+        generates_box(&c)
+            && c.as_element()
+                .is_some_and(|e| !is_inline(e.name.local.as_ref()))
+    })
 }
 
 pub fn compute_layout(dom: &NodeRef) -> LayoutTree {
@@ -139,6 +217,7 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
         taffy: &mut taffy::TaffyTree,
         node_map: &mut HashMap<taffy::NodeId, NodeRef>,
         paint_map: &mut HashMap<taffy::NodeId, PaintStyle>,
+        quirks: bool,
     ) -> Option<taffy::NodeId> {
         if let Some(el) = dom_node.as_element() {
             if is_non_rendered(el.name.local.as_ref()) {
@@ -149,6 +228,17 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
             if attrs.get("hidden").is_some() || attrs.get("aria-hidden") == Some("true") {
                 return None;
             }
+            // <input type=hidden> is a form value carrier, not a control:
+            // the UA sheet gives it display:none. Pages carry many of them
+            // (tokens, locale, charset); boxed, they paint as a stack of
+            // phantom fields above the real content.
+            if el.name.local.as_ref() == "input"
+                && attrs
+                    .get("type")
+                    .is_some_and(|t| t.trim().eq_ignore_ascii_case("hidden"))
+            {
+                return None;
+            }
         } else if dom_node.as_text().is_some() {
             // Whitespace-only text produces no box.
             if dom_node.text_contents().trim().is_empty() {
@@ -156,12 +246,67 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
             }
         }
 
-        let mut child_ids = Vec::new();
+        let mut kids: Vec<(taffy::NodeId, bool)> = Vec::new();
         for child in dom_node.children() {
-            if let Some(id) = build_taffy_tree(&child, taffy, node_map, paint_map) {
-                child_ids.push(id);
+            if let Some(id) = build_taffy_tree(&child, taffy, node_map, paint_map, quirks) {
+                kids.push((id, is_inline_node(&child)));
             }
         }
+        let any_inline = kids.iter().any(|&(_, i)| i);
+        let any_block = kids.iter().any(|&(_, i)| !i);
+        // Mixed inline and block siblings: CSS wraps each run of consecutive
+        // inline children in an ANONYMOUS BLOCK BOX, which is what keeps them
+        // flowing on a shared line. Without it the whole container fell back
+        // to a column and every inline sibling got its own full-width row —
+        // two submit buttons meant to sit side by side stacked instead.
+        let parent_tag = dom_node.as_element().map(|el| el.name.local.as_ref().to_string());
+        let table_container = parent_tag
+            .as_deref()
+            .is_some_and(|t| is_table_part(t) && !matches!(t, "td" | "th" | "caption"));
+        let child_ids: Vec<taffy::NodeId> = if any_inline && any_block && !table_container {
+            let mut out: Vec<taffy::NodeId> = Vec::new();
+            let mut run: Vec<taffy::NodeId> = Vec::new();
+            let mut flush = |run: &mut Vec<taffy::NodeId>,
+                             out: &mut Vec<taffy::NodeId>,
+                             taffy: &mut taffy::TaffyTree| {
+                // A run of ONE keeps its place as a direct child: it already
+                // had a line to itself, and boxing it would hide its own
+                // alignment (the float/align_self approximation) from the
+                // real container. Only runs that must SHARE a line need the
+                // anonymous box.
+                if run.len() < 2 {
+                    out.append(run);
+                    return;
+                }
+                let anon = Style {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: taffy::style::FlexWrap::Wrap,
+                    align_items: Some(taffy::style::AlignItems::BASELINE),
+                    size: Size { width: Dimension::percent(1.0), height: Dimension::auto() },
+                    ..Default::default()
+                };
+                if let Ok(id) = taffy.new_with_children(anon, run) {
+                    paint_map.insert(id, PaintStyle::default());
+                    out.push(id);
+                } else {
+                    out.append(run);
+                }
+                run.clear();
+            };
+            for &(id, inline) in &kids {
+                if inline {
+                    run.push(id);
+                } else {
+                    flush(&mut run, &mut out, taffy);
+                    out.push(id);
+                }
+            }
+            flush(&mut run, &mut out, taffy);
+            out
+        } else {
+            kids.iter().map(|&(id, _)| id).collect()
+        };
 
         let tag = dom_node
             .as_element()
@@ -265,8 +410,32 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
         // Inline style="..." — paint properties plus width/height.
         let mut paint = PaintStyle::default();
         if let Some(el) = dom_node.as_element() {
+            // UA / presentational alignment defaults, applied BEFORE the
+            // author cascade so any real rule wins: <center> and <th> centre
+            // their content, and the legacy align="" attribute still aligns.
+            paint.text_align = match tag.as_str() {
+                "center" | "th" => Some(1),
+                // The quirks-mode table quirk: a table does NOT inherit
+                // text-align from its ancestors. Every legacy page that
+                // wraps its layout table in <center> (Hacker News) relies
+                // on it — without the reset the whole page centres.
+                "table" if quirks => Some(0),
+                _ => None,
+            };
+            if let Some(a) = el.attributes.borrow().get("align") {
+                match a.trim().to_ascii_lowercase().as_str() {
+                    "center" | "middle" => paint.text_align = Some(1),
+                    "right" => paint.text_align = Some(2),
+                    "left" => paint.text_align = Some(0),
+                    _ => {}
+                }
+            }
             if let Some(inline) = el.attributes.borrow().get("style") {
+                let saved = paint.text_align;
                 apply_inline_style(inline, &mut style, &mut paint);
+                if paint.text_align.is_none() {
+                    paint.text_align = saved;
+                }
             }
         }
 
@@ -279,7 +448,7 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
         }
     }
 
-    let root_node = build_taffy_tree(dom, &mut taffy, &mut node_map, &mut paint_map)
+    let root_node = build_taffy_tree(dom, &mut taffy, &mut node_map, &mut paint_map, is_quirks(dom))
         .unwrap_or_else(|| taffy.new_leaf(Style::default()).unwrap());
 
     LayoutTree {
@@ -336,10 +505,60 @@ pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
     }
 }
 
+/// Walks the INHERITED text-align down the box tree and turns it into the
+/// flex alignment of each box's own formatting context: a row (an inline
+/// formatting context) aligns along its main axis, a column aligns its
+/// children on the cross axis. Only boxes with no explicit alignment of
+/// their own are touched, so a real `justify-content`/`text-align` rule
+/// anywhere down the tree still wins.
+fn propagate_text_align(tree: &mut LayoutTree) {
+    fn walk(tree: &mut LayoutTree, id: taffy::NodeId, inherited: Option<u8>) {
+        let effective = tree
+            .paint_map
+            .get(&id)
+            .and_then(|p| p.text_align)
+            .or(inherited);
+        if let Some(align) = effective.filter(|&a| a != 0) {
+            if let Ok(st) = tree.taffy.style(id) {
+                let mut st = st.clone();
+                let row = matches!(
+                    st.flex_direction,
+                    FlexDirection::Row | FlexDirection::RowReverse
+                );
+                let mut changed = false;
+                if row && st.justify_content.is_none() {
+                    st.justify_content = Some(if align == 1 {
+                        taffy::style::JustifyContent::CENTER
+                    } else {
+                        taffy::style::JustifyContent::END
+                    });
+                    changed = true;
+                } else if !row && st.align_items.is_none() {
+                    st.align_items = Some(if align == 1 {
+                        taffy::style::AlignItems::CENTER
+                    } else {
+                        taffy::style::AlignItems::END
+                    });
+                    changed = true;
+                }
+                if changed {
+                    let _ = tree.taffy.set_style(id, st);
+                }
+            }
+        }
+        let kids = tree.taffy.children(id).unwrap_or_default();
+        for k in kids {
+            walk(tree, k, effective);
+        }
+    }
+    walk(tree, tree.root_node, None);
+}
+
 /// Recomputes layout with real text measurement: resolves each text run's
 /// inherited font size, then lets taffy size text leaves by wrapped extent.
 /// Called after building the tree and after every cascade application.
 pub fn remeasure(tree: &mut LayoutTree) {
+    propagate_text_align(tree);
     // Pass 1: resolve font size down the box tree for text leaves, and
     // intrinsic sizes for images.
     let mut text_info: HashMap<taffy::NodeId, (String, f32, f32, bool, u8)> = HashMap::new();

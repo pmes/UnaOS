@@ -278,6 +278,61 @@ mod tests {
         assert_eq!(media[1], ("https://cdn.example.org/song.ogg".into(), "audio/ogg".into()));
     }
 
+    /// <input type=hidden> is a value carrier, not a control: it must
+    /// generate no box at all. Boxed, a page's tokens and locale fields
+    /// painted as a stack of phantom bordered fields.
+    #[test]
+    fn test_hidden_input_generates_no_box() {
+        let html = r#"<html><body>
+            <input type="hidden" name="ie" value="ISO-8859-1">
+            <input type="HIDDEN" name="hl" value="en">
+            <input type="text" name="q">
+        </body></html>"#;
+        let tree = layout::compute_layout(&dom::parse_html(html));
+        let inputs: Vec<_> = tree
+            .node_map
+            .values()
+            .filter(|n| n.as_element().is_some_and(|e| &*e.name.local == "input"))
+            .collect();
+        assert_eq!(inputs.len(), 1, "only the visible input generates a box");
+        assert_eq!(
+            inputs[0]
+                .as_element()
+                .unwrap()
+                .attributes
+                .borrow()
+                .get("type"),
+            Some("text")
+        );
+    }
+
+    /// Inline siblings mixed with block siblings get an anonymous block box
+    /// so they still share a line — two submit buttons between two divs
+    /// belong side by side, not stacked.
+    #[test]
+    fn test_mixed_inline_and_block_children_share_a_line() {
+        let html = r#"<html><body style="margin:0"><div style="width:600px">
+            <div style="height:10px"></div>
+            <span style="width:80px;height:20px">one</span>
+            <span style="width:80px;height:20px">two</span>
+            <div style="height:10px"></div>
+        </div></body></html>"#;
+        let mut tree = layout::compute_layout(&dom::parse_html(html));
+        css::apply_css(&mut tree, "");
+        let mut ys = Vec::new();
+        let mut xs = Vec::new();
+        for (id, node) in &tree.node_map {
+            if node.as_element().is_some_and(|e| &*e.name.local == "span") {
+                let l = tree.taffy.layout(*id).unwrap();
+                xs.push(l.location.x);
+                ys.push(l.location.y);
+            }
+        }
+        assert_eq!(xs.len(), 2, "both spans laid out");
+        assert_eq!(ys[0], ys[1], "spans share a line (anonymous block box)");
+        assert_ne!(xs[0], xs[1], "spans sit beside each other");
+    }
+
     #[test]
     fn test_form_submission_builds_get_url() {
         let html = r#"<html><body>
