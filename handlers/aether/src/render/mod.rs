@@ -23,6 +23,10 @@ struct Inherited {
     /// its boxes and backgrounds still paint.
     text_hidden: bool,
     text_transform: u8, // 0 = none, 1 = uppercase, 2 = lowercase, 3 = capitalize
+    /// Content box (screen space: x, y, w, h) of an enclosing button-like
+    /// control. A `<button>`'s label is an ordinary text child, so the box it
+    /// must be centred in is only known from the ancestor.
+    center_box: Option<(f32, f32, f32, f32)>,
 }
 
 use crate::layout::default_font_size;
@@ -476,6 +480,43 @@ fn draw_text(
     }
 }
 
+/// Single-line advance width of `text`, measured EXACTLY the way `draw_text`
+/// lays it out (per-glyph advances, one `font_size * 0.3` space between
+/// words). Centering a control label with any other measurement drifts.
+fn measure_text_width(text: &str, font: &Font, font_size: f32) -> f32 {
+    let metrics = font.metrics();
+    let scale = font_size / metrics.units_per_em as f32;
+    let space = font_size * 0.3;
+    let mut total = 0.0f32;
+    let mut words = 0u32;
+    for word in text.split_whitespace() {
+        total += word
+            .chars()
+            .filter_map(|c| font.glyph_for_char(c))
+            .filter_map(|g| font.advance(g).ok())
+            .map(|a| a.x() * scale)
+            .sum::<f32>();
+        words += 1;
+    }
+    total + space * words.saturating_sub(1) as f32
+}
+
+/// (ascent, descent) in pixels at `font_size` — descent is positive-down, so
+/// the inked extent of one line is `ascent + descent`.
+fn text_extents(font: &Font, font_size: f32) -> (f32, f32) {
+    let metrics = font.metrics();
+    let scale = font_size / metrics.units_per_em as f32;
+    (metrics.ascent * scale, -metrics.descent * scale)
+}
+
+/// `draw_text` origin_y that puts the FIRST line's inked extent centred on
+/// `center_y`. `draw_text` adds the ascent to reach the baseline, so the
+/// origin sits half an inked line above the centre.
+fn centered_line_origin_y(font: &Font, font_size: f32, center_y: f32) -> f32 {
+    let (ascent, descent) = text_extents(font, font_size);
+    center_y - (ascent + descent) / 2.0
+}
+
 /// UNAOS_LAYOUTDUMP=<max-depth>: writes the computed box tree (tag, id/class,
 /// rect, display, paint gates) to stderr. Diagnostic only — off by default.
 pub fn dump_layout(layout: &LayoutTree) {
@@ -796,25 +837,83 @@ pub fn render_frame(
                         }
                     }
                 }
+                // Content box in screen space — the label/value area, inside
+                // the UA border and any author padding.
+                let (pad, bord) = (layout_box.padding, layout_box.border);
+                let inset_l = pad.left + bord.left;
+                let inset_r = pad.right + bord.right;
+                let content_x = box_sx + inset_l;
+                let content_y = box_sy + pad.top + bord.top;
+                let content_w = (bw - inset_l - inset_r).max(0.0);
+                let content_h = (bh - pad.top - bord.top - pad.bottom - bord.bottom).max(0.0);
+                // A push button's label centres on both axes; a text field's
+                // value stays left-aligned but rides the vertical middle,
+                // which is what makes native fields look "in" their box.
+                let is_push_button = tag == "button"
+                    || (tag == "input"
+                        && el
+                            .attributes
+                            .borrow()
+                            .get("type")
+                            .map(|t| {
+                                let t = t.to_ascii_lowercase();
+                                matches!(t.as_str(), "submit" | "button" | "reset")
+                            })
+                            .unwrap_or(false));
+                if is_push_button {
+                    inherited.center_box = Some((content_x, content_y, content_w, content_h));
+                }
+
                 if is_control && tag != "button" {
                     if let Some(font) = font {
                         let attrs = el.attributes.borrow();
-                        let value = attrs
-                            .get("value")
+                        // A <select> paints the SELECTED OPTION'S TEXT, not
+                        // its submit value: layout publishes the visible label
+                        // as data-aether-label, so "English" shows where the
+                        // value attribute would only say "en".
+                        let value = (tag == "select")
+                            .then(|| attrs.get("data-aether-label"))
+                            .flatten()
+                            .filter(|v| !v.is_empty())
+                            .or_else(|| attrs.get("value"))
                             .filter(|v| !v.is_empty())
                             .or_else(|| attrs.get("placeholder"))
                             .unwrap_or("")
                             .to_string();
                         drop(attrs);
                         if !value.is_empty() {
+                            let fs = inherited.font_size.min(14.0);
+                            let text_w = measure_text_width(&value, font, fs);
+                            // <input>/<select> are single-line by definition —
+                            // their value rides the vertical middle however
+                            // tall the author makes the box, which is what
+                            // native fields do. A <textarea> is a multi-line
+                            // edit surface: its text starts at the top.
+                            let single_line = tag != "textarea" && content_h > 0.0;
+                            let (tx, ty, max_w) = if is_push_button && text_w <= content_w {
+                                (
+                                    content_x + (content_w - text_w) / 2.0,
+                                    centered_line_origin_y(font, fs, content_y + content_h / 2.0),
+                                    content_w.max(1.0),
+                                )
+                            } else {
+                                let left = box_sx + inset_l.max(4.0);
+                                let max_w = (bw - inset_l.max(4.0) - inset_r.max(4.0)).max(1.0);
+                                let ty = if single_line {
+                                    centered_line_origin_y(font, fs, content_y + content_h / 2.0)
+                                } else {
+                                    box_sy + pad.top + bord.top + 3.0
+                                };
+                                (left, ty, max_w)
+                            };
                             draw_text(
                                 &value,
-                                current_x - sx as f32 + 4.0,
-                                current_y - sy as f32 + 3.0,
-                                layout_box.size.width.max(8.0) - 8.0,
+                                tx,
+                                ty,
+                                max_w,
                                 font,
                                 0,
-                                inherited.font_size.min(14.0),
+                                fs,
                                 inherited.line_height,
                                 (60, 60, 60),
                                 false,
@@ -894,11 +993,31 @@ pub fn render_frame(
                     let text = text.trim();
                     if !text.is_empty() {
                         let text = transform_text(text, inherited.text_transform);
-                        draw_text(
-                            &text,
+                        // A <button>'s label is an ordinary text child, so it
+                        // is centred here against the ancestor control's
+                        // content box — but only when the measured run fits on
+                        // one line inside it, so a button wrapping rich or
+                        // overflowing content keeps normal flow painting.
+                        let centered = inherited.center_box.and_then(|(cx, cy, cw, ch)| {
+                            let tw = measure_text_width(&text, font, inherited.font_size);
+                            (tw <= cw && cw > 0.0).then(|| {
+                                (
+                                    cx + (cw - tw) / 2.0,
+                                    centered_line_origin_y(font, inherited.font_size, cy + ch / 2.0),
+                                    cw.max(1.0),
+                                )
+                            })
+                        });
+                        let (tx, ty, max_w) = centered.unwrap_or((
                             current_x - sx as f32,
                             current_y - sy as f32,
                             if inherited.nowrap { f32::MAX } else { layout_box.size.width.max(1.0) },
+                        ));
+                        draw_text(
+                            &text,
+                            tx,
+                            ty,
+                            max_w,
                             font,
                             inherited.family * 2 + if inherited.bold { 1 } else { 0 },
                             inherited.font_size,
@@ -958,6 +1077,7 @@ pub fn render_frame(
         family: 0,
         text_hidden: false,
         text_transform: 0,
+        center_box: None,
     };
     draw_node(
         layout.root_node,
