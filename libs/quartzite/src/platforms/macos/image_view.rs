@@ -156,12 +156,22 @@ define_class!(
             objc2::runtime::Bool::YES
         }
 
+        #[unsafe(method(resignFirstResponder))]
+        fn resign_first_responder(&self) -> objc2::runtime::Bool {
+            // Clean resignation when another responder takes focus (e.g., the URL
+            // TextField). Return YES to allow the transition.
+            objc2::runtime::Bool::YES
+        }
+
         #[unsafe(method(viewDidMoveToWindow))]
         fn view_did_move_to_window(&self) {
-            // Become first responder so reset-to-fit key events land here even
-            // before the first click.
-            if let Some(window) = self.window() {
-                let _: bool = unsafe { msg_send![&window, makeFirstResponder: self] };
+            // Become first responder only in facet mode (not browser mode).
+            // In browser mode, let the window manage focus so the URL TextField
+            // can accept input naturally; the view becomes first responder on click.
+            if self.ivars().synapse.borrow().is_none() {
+                if let Some(window) = self.window() {
+                    let _: bool = unsafe { msg_send![&window, makeFirstResponder: self] };
+                }
             }
         }
 
