@@ -900,6 +900,66 @@ static ONLINE_MASK: [AtomicBool; NUM_CPUS] = [const { AtomicBool::new(false) }; 
 /// the scan starts at a rotating offset so consecutive auto-placements fan out instead of stacking.
 static AUTO_ROTATE: AtomicUsize = AtomicUsize::new(0);
 
+// SPREAD-3 — COMMITTED LOAD, NOT AN INSTANTANEOUS SNAPSHOT.
+//
+// SCHED-3's two placement signals are both blind to the thing EL0 spawns actually create: a long-lived,
+// compute-bound resident that is RUNNING rather than QUEUED.
+//
+//   * ready-queue DEPTH (`RunQueue::len`) counts tasks WAITING in the queue. The task a core is
+//     currently executing lives in `SCHED[cpu].current`, NOT in `RUN_QUEUES[cpu]` — so a core spinning
+//     flat-out inside one compute-bound vug reads depth 0, exactly like a genuinely idle core.
+//   * the rolling busy fraction (`CoreAccount::busy_pct`) is a ~250 ms LAGGING window. A burst of
+//     spawns issued inside one window all read the SAME pre-burst percentage, so they all agree on the
+//     same "least busy" core and all land on it.
+//
+// Together those produce the P68 measurement (27 bg-el0 -> c3, 18 -> c0, 8 -> c1, ~0 -> c2 while
+// c0/c3 sat at 99% and c1/c2 at ~80%): placement keeps re-reading a signal that has not yet caught up
+// with the placements it already made, and because the scheduler is no-migrate, nothing ever corrects
+// it. Operator-visible as stagger inversion — vugs launched early run slower than their replacements.
+//
+// The fix is to make the placement decision account for what has ALREADY been committed to a core:
+// a per-core count of LIVE EL0 residents, incremented at the moment of placement (before the enqueue,
+// so it is visible to the very next spawn) and decremented when the task is reaped. It is O(1), needs
+// no new Task field (an EL0 task is exactly one with a non-zero `user_entry`), carries no migration
+// machinery, and — unlike depth and busy_pct — it cannot lag the decisions it is meant to inform.
+
+/// SPREAD-3 — live EL0 residents committed to each core. Bumped by every EL0 spawn path
+/// (`spawn_user_inner`, `spawn_user_thread`) at placement time and dropped on every reap path
+/// (`exit`, `retire_killed`). This is the COMMITTED-load signal `pick_cpu` reads first: unlike
+/// ready-queue depth it counts a task that is currently RUNNING, and unlike the rolling busy window
+/// it updates synchronously with the placement rather than ~250 ms later.
+static EL0_RESIDENTS: [AtomicUsize; NUM_CPUS] = [const { AtomicUsize::new(0) }; NUM_CPUS];
+
+/// SPREAD-3 — commit one EL0 resident to `cpu`. Called BEFORE the run-queue push so a concurrent
+/// `pick_cpu` on another core can never place a second resident against a stale count. Returns the
+/// new (inclusive) resident count, which the placement witness prints.
+///
+/// `allow(dead_code)`: the only callers are the two EL0 spawn paths, which are `baremetal`-gated (the
+/// `virt`/JC3 aarch64 build runs kernel threads only and creates no EL0 task). The RELEASE side stays
+/// ungated because `exit()` is shared by both worlds — it simply never fires there (`user_entry == 0`).
+#[allow(dead_code)]
+#[inline]
+fn el0_resident_enter(cpu: usize) -> usize {
+    if cpu >= NUM_CPUS {
+        return 0;
+    }
+    EL0_RESIDENTS[cpu].fetch_add(1, Ordering::AcqRel) + 1
+}
+
+/// SPREAD-3 — release one EL0 resident from `cpu` (task reaped). Saturating at zero: an accounting
+/// slip must never underflow into `usize::MAX` and permanently exclude a healthy core from placement.
+/// EL0 tasks are `steal_ok = false` (never migrated), so the `cpu` recorded at spawn is still the
+/// core being released here.
+#[inline]
+fn el0_resident_leave(cpu: usize) {
+    if cpu >= NUM_CPUS {
+        return;
+    }
+    let _ = EL0_RESIDENTS[cpu].fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        if n == 0 { None } else { Some(n - 1) }
+    });
+}
+
 /// Register `cpu` as an online, scheduling core — a candidate for `CPU_AUTO` load-balanced placement.
 /// Called by the BSP as it releases the APs (`start_aps`); idempotent, introspection-only bookkeeping
 /// (no effect on any existing caller-pinned spawn, so boot behavior is byte-identical without CPU_AUTO).
@@ -910,26 +970,44 @@ pub fn mark_online(cpu: usize) {
 }
 
 /// Resolve a requested `cpu` to a concrete core. An explicit index passes through verbatim (the
-/// no-migrate pin contract). `CPU_AUTO` selects the least-loaded online core: minimum ready-queue
-/// depth first, then the lower rolling-window busy fraction, then a rotating cursor for round-robin
-/// spread on ties. Falls back to core 0 only if no core is online yet (early BSP staging).
+/// no-migrate pin contract). `CPU_AUTO` selects the least-loaded online core, keyed in this order:
+///
+///   1. SPREAD-3 — fewest COMMITTED live EL0 residents (`EL0_RESIDENTS`). This is the only signal
+///      that is already true at the instant of the decision, so N spawns in a burst spread instead of
+///      all agreeing on one core. It is the primary key precisely because a running compute-bound EL0
+///      task is invisible to both keys below.
+///   2. minimum ready-queue DEPTH — the classic "will this task wait" signal, still the right
+///      discriminator between cores carrying equal resident counts.
+///   3. lower rolling-window busy fraction, then
+///   4. a rotating cursor, so cores that tie on every measurable signal fill round-robin.
+///
+/// Keys 2-4 are SCHED-3's chain, unchanged; SPREAD-3 only puts committed load ahead of them. When no
+/// EL0 task exists (the `virt`/JC3 kernel-thread builds, and the placement-spread witness that runs
+/// at the top of `start_aps`) every core reads 0 residents, key 1 is a universal tie, and placement
+/// is byte-identical to SCHED-3. Falls back to core 0 only if no core is online yet (early BSP staging).
 fn pick_cpu(requested: usize) -> usize {
     if requested != CPU_AUTO {
         return requested;
     }
     let rot = AUTO_ROTATE.fetch_add(1, Ordering::Relaxed);
     let mut best: Option<usize> = None;
+    let mut best_res = usize::MAX;
     let mut best_depth = usize::MAX;
     let mut best_pct = u32::MAX;
     for i in 0..NUM_CPUS {
-        let cpu = (rot + i) % NUM_CPUS; // rotating start => equal-load cores fill round-robin
+        let cpu = (rot + i) % NUM_CPUS; // rotating start => fully-tied cores fill round-robin
         if !ONLINE_MASK[cpu].load(Ordering::Acquire) {
             continue;
         }
+        let res = EL0_RESIDENTS[cpu].load(Ordering::Acquire);
         let depth = RUN_QUEUES[cpu].lock().len();
         let pct = ACCT[cpu].busy_pct();
-        if depth < best_depth || (depth == best_depth && pct < best_pct) {
+        let better = res < best_res
+            || (res == best_res
+                && (depth < best_depth || (depth == best_depth && pct < best_pct)));
+        if better {
             best = Some(cpu);
+            best_res = res;
             best_depth = depth;
             best_pct = pct;
         }
@@ -1091,16 +1169,27 @@ fn spawn_user_inner(
     // SKILL-1: count this task against its address-space slot BEFORE the push, so it is countable before
     // it can ever be dispatched (and thus before any ASID-scoped kill could observe a short count).
     asid_thread_enter(user_ttbr0);
+    // SPREAD-3: commit this EL0 resident to its core BEFORE the enqueue, so the very next `pick_cpu`
+    // already sees it. PINNED EL0 spawns are counted too — the pin is honored verbatim (placement is
+    // untouched), but the residents it parks on that core are real committed load and a later
+    // `CPU_AUTO` placement must see them.
+    let residents = el0_resident_enter(cpu);
     RUN_QUEUES[cpu].lock().push(task);
     // PI-SCHED-1 — placement witness for EL0 tasks (the vug/midden GUI-app loads land here — the
-    // "all vug load on core 2" sighting). Same `pi`-gating + rationale as `spawn_inner`.
+    // "all vug load on core 2" sighting). Same `pi`-gating + rationale as `spawn_inner`. SPREAD-3 folds
+    // the counted value into the existing `policy:` field (shape unchanged, still one parseable line)
+    // so the next attended boot can check the accounting against the observed spread. `residents` is
+    // INCLUSIVE of this task: it is the committed count on that core after this placement.
     #[cfg(feature = "pi")]
     serial_println!(
-        ":: SCHED: task '{}' -> core {} (policy: {} EL0, no-migrate) ::",
+        ":: SCHED: task '{}' -> core {} (policy: {} EL0 residents={}, no-migrate) ::",
         name,
         cpu,
-        if requested_cpu == CPU_AUTO { "load-balanced" } else { "caller-pinned" }
+        if requested_cpu == CPU_AUTO { "load-balanced" } else { "caller-pinned" },
+        residents
     );
+    #[cfg(not(feature = "pi"))]
+    let _ = residents;
     poke_cpu(cpu);
     id
 }
@@ -1157,13 +1246,19 @@ pub fn spawn_user_thread(
     // SKILL-1: this is the path that MAKES a slot multi-threaded, so it is the one the ASID-scoped kill
     // exists for — count the sibling before it can be dispatched.
     asid_thread_enter(user_ttbr0);
+    // SPREAD-3: a shared-ASID EL0 thread burns a core exactly like a slot task does — count it as a
+    // committed resident on the same terms (before the enqueue; released on its `exit()`).
+    let residents = el0_resident_enter(cpu);
     RUN_QUEUES[cpu].lock().push(task);
     #[cfg(feature = "pi")]
     serial_println!(
-        ":: SCHED: thread '{}' -> core {} (ELF-2 shared-ASID EL0 thread, no-migrate) ::",
+        ":: SCHED: thread '{}' -> core {} (ELF-2 shared-ASID EL0 thread residents={}, no-migrate) ::",
         name,
-        cpu
+        cpu,
+        residents
     );
+    #[cfg(not(feature = "pi"))]
+    let _ = residents;
     poke_cpu(cpu);
     JoinHandle { done, id }
 }
@@ -1772,6 +1867,13 @@ pub fn kill_check_current() {
 fn retire_killed(idx: usize, task: Box<Task>) {
     let tid = task.id;
     let ttbr0 = task.user_ttbr0;
+    // SPREAD-3: the off-CPU reap arm — release this task's committed EL0 residency. Mirrors the
+    // `exit()` arm exactly (same `user_entry != 0` EL0 test, same recorded `cpu`), because a killed
+    // vug frees its core just as thoroughly as one that returned, and a resident that is never
+    // released would permanently bias placement away from a core that is in fact idle.
+    if task.user_entry != 0 {
+        el0_resident_leave(task.cpu as usize);
+    }
     // M6d: the same slot retirement `exit()` performs, executed on the scheduler stack. Legal here for
     // the same reason it is legal there — the kernel half of every root is Global and identical, so
     // repointing TTBR0 to the boot root pulls nothing out from under the running (scheduler) context.
@@ -1830,6 +1932,14 @@ pub fn exit() -> ! {
         // SKILL-1: drop this task out of its address space's live-thread count — on EVERY exit path, not
         // just the killed one, or the count drifts and a later ASID-scoped kill would never confirm.
         let remaining = asid_thread_leave((*raw).user_ttbr0);
+        // SPREAD-3: the on-CPU reap arm — release this task's committed EL0 residency. `user_entry != 0`
+        // is exactly the EL0 test used at placement (kernel threads are constructed with `user_entry: 0`),
+        // so increment and decrement cover the same population. `exit()` is the single funnel for every
+        // non-killed retirement — `sys_exit`, `SYS_THREAD_EXIT`, the M6b fault-kill, `kill_check_current`
+        // and a kernel entry's return all land here — so one decrement here covers them all.
+        if (*raw).user_entry != 0 {
+            el0_resident_leave((*raw).cpu as usize);
+        }
         // Settle any kill request naming this task (by tid, or by ASID for a whole-process kill). Placed
         // HERE — after the slot teardown and the joiner post, with only the state store and the final
         // switch left.

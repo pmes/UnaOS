@@ -162,7 +162,9 @@ placement for tasks with no core affinity:
   never a candidate), pick the minimum **ready-queue depth** first, tie-broken by
   the lower rolling-window busy fraction (SCHED-2), then a rotating cursor so
   equal-load cores fill round-robin. Placement runs on the spawn path only (never
-  the switch hot path), so the brief per-queue depth read is free.
+  the switch hot path), so the brief per-queue depth read is free. *(SPREAD-3,
+  below, puts a committed-EL0-residents count ahead of depth as the primary key;
+  the rest of this chain is unchanged and still decides every tie.)*
 
 The `SCHED: task ... -> core N` placement witness line now reports the policy
 (`load-balanced` vs `caller-pinned`). The `SCHED: load` heartbeat format is
@@ -258,6 +260,73 @@ a `UNAOS_VUGPAR=1` log. There is deliberately no `cores 1` tripwire; `nh == 0`
 exits to the serial path before any rollup, so `nbands` is always >= 2 and such a
 line cannot print. BG-SPREAD's `BGSPREAD` leg is unaffected — it is
 ASID/parent-placement keyed and reads no band state.
+
+### Committed-load EL0 placement (aarch64, SPREAD-3)
+
+SPREAD-2 fixed how a *single* frame's work is divided. SPREAD-3 fixes the layer
+above it: where a *newly spawned* EL0 task is put in the first place.
+
+The measurement (P68, from the serial wire) was that `bg-el0` launches placed by
+`load-balanced EL0` did not spread at all — **27** landed on core 3, **18** on
+core 0, **8** on core 1, and essentially none on core 2, while sustained load
+read `c0=99% c3=99%` against `c1/c2 ≈ 80%`. Because the scheduler is no-migrate,
+nothing could ever undo it. Operator-visible as **stagger inversion**: vugs
+launched early, onto cores that were about to become crowded, ran visibly slower
+than their later replacements, which landed on the cores the early ones had left
+empty.
+
+Neither of SCHED-3's two signals can see an EL0 vug:
+
+- **Ready-queue depth** (`RunQueue::len`) counts tasks *waiting*. The task a core
+  is *executing* lives in `SCHED[cpu].current`, not in `RUN_QUEUES[cpu]` — so a
+  core spinning flat-out inside one compute-bound vug reads depth 0, exactly like
+  a genuinely idle core. Depth is the wrong shape for long-lived compute.
+- **`busy_pct_recent`** is a ~250 ms *lagging* window. That low-pass is a virtue
+  for SPREAD-2's per-frame feedback and a defect here: a burst of spawns issued
+  inside one window all read the same pre-burst percentage, all agree on the same
+  "least busy" core, and all land on it. That is the 27-in-a-row shape.
+
+So placement kept re-reading a signal that had not yet caught up with the
+placements it had already made. The fix is to make the decision account for what
+is already **committed**:
+
+- **`EL0_RESIDENTS[NUM_CPUS]`** — a per-core count of live EL0 residents,
+  incremented in `el0_resident_enter` at the moment of placement (**before** the
+  run-queue push, so it is visible to the very next `pick_cpu`, including one
+  running concurrently on another core) and released in `el0_resident_leave` on
+  reap. Both EL0 spawn paths count (`spawn_user_inner` for slot tasks,
+  `spawn_user_thread` for shared-ASID threads); both reap paths release (`exit`
+  for every normal/fault/on-CPU-kill retirement, `retire_killed` for the off-CPU
+  kill arm). An EL0 task is exactly one with a non-zero `user_entry`, so no new
+  `Task` field was needed, and EL0 tasks are `steal_ok: false`, so the `cpu`
+  recorded at spawn is still the core being released. The decrement saturates at
+  zero — an accounting slip must not underflow to `usize::MAX` and permanently
+  exclude a healthy core.
+- **`pick_cpu` keys on residents first**, then falls through to SCHED-3's
+  unchanged chain: depth, then busy fraction, then the rotating cursor. Explicit
+  pins are still honored verbatim, and pinned EL0 spawns are *counted* even though
+  their placement is untouched — a pinned vug is real committed load that a later
+  `CPU_AUTO` placement must see.
+
+The accounting is O(1), adds no migration machinery, and — unlike depth and
+`busy_pct_recent` — cannot lag the decisions it exists to inform. Where no EL0
+task exists (the `virt`/JC3 kernel-thread builds; `placement_spread_witness`,
+which runs at the top of `start_aps`) every core reads 0 residents, the new key
+is a universal tie, and placement is byte-identical to SCHED-3.
+
+**Witness.** The existing per-spawn line carries the counted value in its
+existing `policy:` field, so it stays one parseable line and the
+`SCHED: task '…' -> core N` prefix the pi4 spec matches on is unchanged:
+
+```
+:: SCHED: task 'bg-el0' -> core 2 (policy: load-balanced EL0 residents=1, no-migrate) ::
+```
+
+`residents` is **inclusive** of the task just placed — the committed count on
+that core after this placement. The next attended boot therefore proves the
+accounting directly: successive `bg-el0` launches should walk the cores rather
+than repeating one, and `residents` should climb evenly across them instead of
+running up on a single core.
 
 ### BSP scheduling + work stealing (aarch64, SMP-BAL)
 
