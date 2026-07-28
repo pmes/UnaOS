@@ -258,11 +258,15 @@ pub mod cursor {
     /// without the auto-hide half). Distinct from `visible()` because it answers a different question:
     /// "does this machine have a working pointer?", not "should the arrow be on screen right now?".
     ///
-    /// It exists so the EL0 input router can keep the sprite alive while an app holds focus WITHOUT
-    /// arming a cursor that never existed. QEMU raspi4b delivers no HID pointer, but the boot-time
-    /// `input_router_selftest` pushes a synthetic `Event::Mouse` through the real router to prove the
-    /// routing path; gating on this keeps that synthetic event from stamping the activity clock,
-    /// drawing a sprite, and printing `[cursor] armed` on a gate that has no pointer at all.
+    /// It was introduced so the EL0 input router could keep the sprite alive while an app holds focus
+    /// WITHOUT arming a cursor that never existed (QEMU raspi4b delivers no HID pointer, but the
+    /// boot-time `input_router_selftest` pushes a synthetic `Event::Mouse` through the real router).
+    ///
+    /// EL0IN-FOCUS retired that use: this latch can only ever be SET by the very code it was gating, so
+    /// on a boot where an EL0 app took focus before the first real pointer report it stayed false
+    /// forever and the cursor was dead until the operator TAB'd back to the shell. The router now
+    /// scopes the guard to the selftest's own call instead (`ROUTER_SELFTEST` in `main.rs`). Kept as the
+    /// honest "does this machine have a working pointer?" predicate, distinct from `visible()`.
     pub fn has_reported() -> bool {
         LAST_INPUT_MS.load(Ordering::Relaxed) != 0
     }

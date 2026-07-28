@@ -2175,6 +2175,15 @@ fn pal_height_hint() -> i32 {
     unaos_kernel::video::WRITER.lock().info().height as i32
 }
 
+/// EL0IN-FOCUS: true only while `input_router_selftest` is inside `route_input_to_active_el0`. That test
+/// pushes SYNTHETIC pointer events through the real router, and on a QEMU gate with no HID they would
+/// otherwise be the first "pointer report" of the boot — arming the system cursor, painting a sprite and
+/// printing `[cursor] armed` on a panel that has no pointer. The router's cursor keep-alive skips its work
+/// while this is set, which is the narrowest possible form of the guard: every REAL report (there can be
+/// none while the BSP is inside the selftest — the HID pump task is not spawned yet) moves the cursor.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static ROUTER_SELFTEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// INPUT-WIRE (ELF-5 router fold): drain every pending pal event into the ACTIVE EL0 program's per-process
 /// input ring via the `el0_input_enqueue` seam. The single choke point for router->ring delivery — called by
 /// `pump_usb_into_gui` when an EL0 app holds input focus, and exercised directly by `input_router_selftest`.
@@ -2198,12 +2207,26 @@ fn route_input_to_active_el0() -> usize {
         // Delivery is unchanged — the event still goes to the app, which is what focus means; this only
         // keeps the kernel's own pointer state and its top-most sprite current alongside it.
         //
-        // Gated on `has_reported()`: the boot-time `input_router_selftest` drives this exact function
-        // with a SYNTHETIC `Event::Mouse` against a fake focus, and on a QEMU gate with no HID that
-        // would otherwise be the first "pointer report" of the boot — arming a cursor, painting a sprite
-        // and printing `[cursor] armed` on a panel that has no pointer. A machine with a real pointer
-        // has always armed it through the shell loop first (focus is the shell at boot).
-        if unaos_kernel::pal::cursor::has_reported() {
+        // EL0IN-FOCUS — WHY THIS GATE IS NO LONGER `has_reported()`. FOCUS-VIS gated the keep-alive on
+        // `pal::cursor::has_reported()` to keep the boot-time `input_router_selftest` — which drives this
+        // exact function with a SYNTHETIC `Event::Mouse` against a fake focus — from arming a cursor and
+        // printing `[cursor] armed` on a QEMU gate that has no pointer at all. The stated premise was that
+        // "a machine with a real pointer has always armed it through the shell loop first (focus is the
+        // shell at boot)". That premise is false whenever an EL0 app takes focus BEFORE the first pointer
+        // report of the boot — `run`/`bg` a windowed app, then touch the mouse — which is the ordinary
+        // desktop bring-up. In that state `has_reported()` is still false, so this block is skipped; the
+        // shell arms (`render_service`'s `Mouse` arm, the only OTHER `move_rel` caller on this arch) are
+        // unreachable because `pump_usb_into_gui` took the `el0_input_active() != 0` branch; and nothing
+        // else in the kernel can ever set the latch. So the predicate could only become true through a
+        // path the predicate itself had disabled: the pointer stayed dead — no motion, no sprite — until
+        // the operator TAB'd focus back to the shell, at which point the shell drain armed it and the
+        // cursor came alive for the rest of the boot (P67v2, bench).
+        //
+        // The gate is therefore scoped to the thing it was actually protecting: the selftest's own call.
+        // `ROUTER_SELFTEST` is true only for the few instructions that test spends inside this function,
+        // so its synthetic events still arm nothing and the QEMU gate output is unchanged — while a REAL
+        // pointer report moves the system cursor from the first report of the boot, whoever holds focus.
+        if !ROUTER_SELFTEST.load(core::sync::atomic::Ordering::Relaxed) {
             match ev {
                 unaos_kernel::pal::Event::Mouse { x, y } if x != 0 || y != 0 => {
                     unaos_kernel::pal::cursor::move_rel(
@@ -2284,6 +2307,10 @@ fn input_router_selftest() {
     use core::sync::atomic::Ordering;
     use unaos_kernel::arch::aarch64::syscall as sc;
     let sent0 = GUI_SENT.load(Ordering::Relaxed);
+    // EL0IN-FOCUS: mark the whole measurement window as the selftest's, so the router's cursor keep-alive
+    // ignores the synthetic pointer events below (no `[cursor] armed` on a panel with no pointer). Cleared
+    // unconditionally before the verdict is printed; nothing here can early-return between the two.
+    ROUTER_SELFTEST.store(true, Ordering::Relaxed);
     // INROUTE: bracket the measurement window with the focus-revocation counter (see `el0_focus_revokes`).
     let revokes0 = sc::el0_focus_revokes();
     // Fake focus: ASID 1 is a valid ring index (the per-ASID rings exist independent of slot liveness), and
@@ -2329,6 +2356,8 @@ fn input_router_selftest() {
     let rearm_fires = sc::run_deadline_timed_out(false, rearm_start + deadline + 1, rearm_start, deadline);
     // A focus change clears the latch — a fresh `run` always starts disengaged (deadline fully armed).
     sc::el0_input_set_active(0); // restore: no active EL0 focus for the real boot
+    // EL0IN-FOCUS: last router call is done — hand the cursor keep-alive back to real input.
+    ROUTER_SELFTEST.store(false, Ordering::Relaxed);
     let takeover_cleared = sc::el0_takeover_active() == 0;
     // INROUTE: the race window's own witness, printed BEFORE the verdict so a FAIL is always accompanied by
     // its diagnosis. `revokes` counts slot teardowns that revoked the live focus while this test was
