@@ -2638,6 +2638,37 @@ fn pump_usb_into_gui() {
             unaos_kernel::pal::Event::Button(mask) => {
                 uvug9_shell_input_witness(false);
                 piusb24_pointer_witness(0, 0, Some(mask));
+                // CLICK-ROUTE — click-to-focus from the SHELL slot. Focus is 0 here, so today every
+                // button goes to `gui_send` -> `click1_dispatch`, whose only hit-test is console vs
+                // status strip: a click on a live window (a `bg` app's, say) does nothing at all.
+                // `wc_click_route` hit-tests the pointer against the window layer; on a hit it raises
+                // that window through the ordinary focus primitive, and the press then belongs to the
+                // app, not the console. On a MISS it consumes nothing and the console keeps the click.
+                //
+                // BREAK on a raise, exactly as the TAB interception above breaks and for the same
+                // reason: this loop's destination is fixed at `gui_send`, but focus has just moved, so
+                // every remaining event belongs to the newly-focused app. The next pump pass takes the
+                // `el0_input_active() != 0` routing branch and re-reads the target per event.
+                //
+                // The press itself is delivered HERE rather than left for that next pass because
+                // `el0_input_set_active` DRAINS `pal::EVENT_QUEUE` as part of granting focus (a fresh
+                // focus starts clean — the UVUG-8r2 contract), so an event left behind would not
+                // survive the raise. `el0_input_enqueue` funnels back through `wc_click_route`, which
+                // sees no edge the second time (the mask tracker already advanced) and delivers.
+                //
+                // POSITION FRESHNESS, stated: on this path the shared cursor is moved by
+                // `render_service`'s Mouse arms, one GUI_CHANNEL hop downstream, so the hit-test reads
+                // the position as of the last motion report the render task has already consumed. A
+                // click is preceded by the pointer coming to rest, so the lag is nil in practice; the
+                // EL0-focus path has no such gap (the router moves the cursor itself — FOCUS-VIS).
+                let before = unaos_kernel::arch::aarch64::syscall::el0_input_active();
+                if unaos_kernel::arch::aarch64::syscall::wc_click_route(ev) {
+                    continue;
+                }
+                if unaos_kernel::arch::aarch64::syscall::el0_input_active() != before {
+                    unaos_kernel::arch::aarch64::syscall::el0_input_enqueue(ev);
+                    break;
+                }
                 gui_send(ev);
             }
             _ => {}

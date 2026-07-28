@@ -1902,6 +1902,109 @@
   pointer report exists on any gate boot, and the selftest's synthetic events stay suppressed exactly as
   before), but the gates still owe a run before this is trusted.
 
+- **CLICK-ROUTE (a click goes to the window under the cursor, not to whoever is focused)** — the arc
+  EL0IN-FOCUS deferred, built. **P69, attended:** *"out of focus clicks cause the focused vug to stop."*
+  Clicking anywhere — another window, the desktop, the console — click-paused the **focused** vug, because
+  the `Button` event was delivered to the focused app's ring regardless of pointer position. That is the
+  audit's finding acted on rather than restated: focus had exactly three sources (the `run` grant, its
+  clear, and the TAB ring), and the button path had **no window hit-test at all**.
+
+  **The seam (`video/wm.rs`, ~40 lines):** `pub fn hit_test(x, y) -> Option<(WinId, owner_asid, z)>` — the
+  topmost **visible** window whose outer box (chrome included) contains the point. Read-only, one `TABLE`
+  lock, a scan of eight rows, **no new lock and no new lock order**; the same shape as `focus_ring` and
+  `occluders`. Two exclusions, both inherited rather than invented:
+    - **Below the shell is not hittable.** "Visible" is a *position*, not a flag: `SHELL_Z` is allocated
+      out of the same counter window z's come from, so `above_shell` — the predicate the **compositor**
+      uses to decide whether a row draws at all — is the predicate used here. What you can click is
+      exactly what you can see, so clicking a console that covers a window reaches the console.
+    - **Compat rows are excluded,** for the reason `focus_ring` excludes them: the full-screen
+      `present_surface` shim carries owner ASID 0 and is not addressable as a focus target, so a "hit" on
+      one would name nobody. A full-screen app reads as *no hit*, and the router's fallback is what keeps
+      its clicks working (below).
+  This is deliberately the whole of the window system's contribution — the convergence surface the x86
+  tree inherits under GR7. The **policy** lives in the arch input router, not in `wm`.
+
+  **The routing rule (`arch/aarch64/syscall.rs::wc_click_route`), on a PRESS edge:**
+    - **hit on a DIFFERENT window than the focused one** → raise it first through the *one* focus
+      primitive that exists — `el0_input_set_active` then `wm::focus_changed`, in that order, exactly as
+      `wc_focus_key` calls them — then let the press fall through to the enqueue, which re-reads the now
+      **new** active ASID and delivers there. No second focus path was invented: this is a new **caller**
+      of the WEDGE path, so a click-driven raise emits the same `<F1>`–`<F9>` breadcrumbs a TAB does.
+    - **hit on the focused window** → delivered exactly as before. The common case, unchanged.
+    - **no window hit** → the click is the desktop's or the console's, not the focused app's, so it is
+      **consumed** rather than delivered. That single arm is P69's fix. Two deliberate limits on it:
+      with focus at the **shell** (`cur == 0`) nothing is consumed — the caller's normal path *is* the
+      shell path (`gui_send` → `click1_dispatch`), which is where a desktop click belongs; and if the
+      focused app owns **no hittable window at all** the press is delivered as before, because that is the
+      **full-screen** app (its compat row covers the panel but can never be hit) and dropping its clicks
+      would break UVUG's own click-to-exit.
+    - A miss **does not move focus.** `focus_changed(0)` gives `SHELL_Z` the fresh z and buries every
+      window under the console (the FOCUS-VIS "shell" leg), which is a far larger claim than P69 makes.
+      Routing a click and moving focus are separate decisions here; only the hit arm does both.
+
+  **Press/release pairing.** A release delivered to an app that never saw the press is a **fabricated
+  click** — for a click-to-pause vug, an invented click. So the release edge is never hit-tested and never
+  re-routed: it is compared against `CLICK_PRESS_TARGET` (where the press went, or a `DROP` sentinel) and
+  either follows the press or is dropped. A TAB, or the app exiting, between press and release costs the
+  release; it never fabricates one in a second app. The router keeps its **own** previous-mask tracker
+  rather than sharing `main.rs`'s `CLICK1_PREV_MASK`: that one belongs to `click1_dispatch` and only ever
+  sees the events that actually *reach* the shell. `wc_click_route` is idempotent per edge (the mask is
+  swapped on entry), which is what lets the shell caller re-enter it through `el0_input_enqueue`.
+
+  **Two callers, one body,** mirroring `wc_focus_key` / `wc_shell_focus_key`:
+    - `el0_input_enqueue` — the single choke point every event bound for an EL0 ring passes through, right
+      after the TAB interception and for the same reason. A consumed click returns `false` (**not**
+      queued), so `[el0in] routed N` stays truthful.
+    - the **bare-shell drain** in `pump_usb_into_gui` — click-to-focus from the shell slot, where today a
+      click on a live `bg` app's window does nothing at all. On a raise it delivers the press itself and
+      **breaks** the loop, exactly as the TAB interception breaks: that loop's destination is fixed at
+      `gui_send` but focus has just moved. The press is delivered *there* rather than left for the next
+      pump pass because `el0_input_set_active` drains `pal::EVENT_QUEUE` as part of granting focus (the
+      UVUG-8r2 "a fresh focus starts clean" contract), so an event left behind would not survive the raise.
+
+  **Untouched by construction:** the TAB ring and both run-grant focus sources; `focus_changed` and the
+  WEDGE breadcrumb chain (new caller, not a new path); `click1_dispatch` and its console/status-strip
+  hit-test, which still owns every click that misses the window layer; and the `SCREEN_APP_ACTIVE`
+  peek/requeue branch, where the events belong to a kernel full-screen app's own drain.
+
+  **Residual, stated:** on the shell path the shared cursor is moved by `render_service` one `GUI_CHANNEL`
+  hop downstream of the router, so the hit-test reads the position as of the last motion report the render
+  task has already consumed. A click is preceded by the pointer coming to rest, so the lag is nil in
+  practice; the EL0-focus path has no such gap (FOCUS-VIS made the router move the cursor itself).
+
+  **Witnesses.** `[clickroute] press hit asid=<a> win=<w> (was <b>)` — emitted on the **refocus arm only**,
+  the one arm that changes behaviour, and human-rate by construction, so it needs no throttle. Plus a
+  headless-drivable selftest, `wm::hittest_selftest`, ordered after every one-shot per-window latch and
+  self-cleaning on the FOCUS-VIS pattern: two windows at one origin, five legs — *inside* (the stack is
+  addressable), *topmost* (the **later** window owns the overlap, not the first matching row), *raise*
+  (after `focus_changed(A)` the same point hits A — the z-order and the click-order are one order),
+  *outside* (misses are misses; the desktop arm consumes on the strength of a `None`), *hidden* (after
+  `focus_changed(0)` the shell is above both and the point hits nothing). A table test rather than a
+  read-back, because unlike FOCUS-VIS the question is about an **ASID**, not a colour — and because the
+  pointer is exactly what QEMU raspi4b does not have.
+
+  **Gates (all run this session; container `cc`/`ld`/`qemu-system-aarch64` bridged from `/run/host` with
+  `--sysroot=/run/host`, the CURSOR-8 recipe):**
+    - `./arroyo check` → ✅ x86_64 OK, ✅ aarch64 OK.
+    - `UNAOS_QMP_PORT=4501 ./arroyo kernel8-test 210` → **✅ MBENCH PASS — 86/86 required witnesses,
+      0 forbidden hit(s), 26281 lines scanned**, with
+      `[clickroute] hit-test at (215,135) inside=true topmost=true raise=true outside=true hidden=true -> PASS`
+      and `:: EL0: input router — routed=2 (key+mouse) … :: PASS ::` unchanged (the router selftest pushes
+      Key/Mouse/Timer and **no** Button, so it never consults the hit-test and stays deterministic).
+    - the aarch64/virt leg: `./arroyo test-arm` could not resolve AAVMF firmware in this container (arroyo
+      searches five absolute paths, none writable here and no override knob), so the run was performed by
+      **replicating `test_aarch64`'s QEMU invocation verbatim** against the ESP arroyo had just packaged,
+      with `QEMU_EFI-pflash.raw` bridged from `/run/host` — 4202 serial lines, **0 FAIL, 0 panic**, boot
+      complete through `block:up`, `MOUSE-1` enumerating the `usb-tablet`. It is a no-regression leg by
+      construction as well as by observation: the routing changes live in the Pi router
+      (`pump_usb_into_gui`, `baremetal`-gated) and in `el0_input_enqueue`, which has no caller on virt, and
+      the window-verb witness block that hosts `hittest_selftest` does not run there at all.
+    - **Metal is what proves the arc.** QEMU raspi4b delivers no HID, so no real `Button` exists on any
+      gate boot and **every routing arm above is unverified in QEMU by nature**; the gates prove the
+      hit-test, the wiring, and no regression. The next attended boot should see `[clickroute] press hit`
+      on a click into an unfocused window, and — the actual P69 verdict — a focused vug that **keeps
+      running** when the operator clicks somewhere else.
+
 - **VUGPAUSE (a paused vug stops burning cores)** — an **app-only** arc: `crates/user-vug` + this doc, no
   kernel change. **VUGCLICK** made a click *pause* a vug, and that is as far as it went: pause froze the
   frame's **advance** (the orientation stopped changing) while the frame **loop** kept running at full

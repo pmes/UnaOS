@@ -11787,6 +11787,14 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
     if wc_focus_key(ev) {
         return true;
     }
+    // CLICK-ROUTE: the pointer's twin of the line above, and in the same place for the same reason —
+    // this is the single choke point every event bound for an EL0 ring passes through, so it is where
+    // "who is this click FOR?" gets asked. `true` means the click was addressed to the desktop and is
+    // consumed; `false` may mean the routing raised a NEW window to focus, in which case the load
+    // below picks up the new ASID and the press lands in the right ring on the way past.
+    if wc_click_route(ev) {
+        return false; // consumed, not queued — `[el0in] routed` must stay truthful
+    }
     let asid = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
     if asid == 0 || asid as usize > super::boot::USER_SLOTS {
         return false;
@@ -12022,6 +12030,155 @@ pub fn wc_shell_focus_key(ev: crate::pal::Event) -> bool {
         return false; // an app owns input — the router seam handles TAB, not us
     }
     wc_focus_key(ev)
+}
+
+// ---- CLICK-ROUTE: a pointer button goes to the window UNDER THE CURSOR ------------------------
+
+/// CLICK-ROUTE: the pointer-button bitmask as the ROUTER last saw it, so this layer can tell a PRESS
+/// edge (a bit going 0->1) from a RELEASE edge (1->0) from an unchanged held state.
+///
+/// Deliberately its OWN tracker and not a share of `main.rs`'s `CLICK1_PREV_MASK`: that one belongs to
+/// the shell's `click1_dispatch` and only ever sees the events that actually REACH the shell. Routing
+/// decisions are made upstream of that, on events the shell may never see, so the two masks track two
+/// different populations by design. They cannot disagree in a way that matters — `click1_dispatch`
+/// still sees a coherent press/release sequence for whatever subset it receives, because this layer
+/// routes whole pairs (below) and never splits one.
+static CLICK_PREV_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// CLICK-ROUTE sentinel: the outstanding press was NOT delivered to any ring, so its release must not
+/// be either. `u64::MAX` is not a valid ASID (`USER_SLOTS` is single digits), so it cannot collide.
+const CLICK_TARGET_DROP: u64 = u64::MAX;
+
+/// CLICK-ROUTE: where the outstanding PRESS was delivered, so the matching RELEASE follows it.
+/// An ASID (0 = the shell path), or [`CLICK_TARGET_DROP`] when the press was deliberately consumed.
+///
+/// **A press/release pair must never be split across two apps.** A release delivered to an app that
+/// never saw the press is a fabricated click — it is exactly the dropped-edge shape UVUG-6 spent an
+/// arc removing from the typematic path, and on the button path it is worse: the receiving app sees a
+/// button go up that never went down, which for a click-to-pause vug is an invented click. So the
+/// release edge is not re-routed at all; it is compared against this and either follows the press or
+/// is dropped.
+static CLICK_PRESS_TARGET: AtomicU64 = AtomicU64::new(CLICK_TARGET_DROP);
+
+/// CLICK-ROUTE: the current pointer position in PANEL pixels — the point a click is addressed to.
+/// Reads the shared cursor state every other pointer consumer reads (`pal::cursor`, the same state
+/// `click1_dispatch` hit-tests and the compositor draws), clamped by the live panel geometry.
+///
+/// Locks: the framebuffer info lock, then the cursor position lock, and both are released before
+/// `wm::hit_test` takes the window TABLE lock. No nesting, so no new lock order (§WEDGE-1).
+fn click_pointer_pos() -> (i32, i32) {
+    let (w, h) = {
+        let info = crate::video::WRITER.lock().info();
+        (info.width as i32, info.height as i32)
+    };
+    crate::pal::cursor::pos(w, h)
+}
+
+/// CLICK-ROUTE: does `asid` own a HITTABLE window? (i.e. is it in the focus ring — a live, non-compat
+/// window with a real owner). The fallback predicate for a miss: see [`wc_click_route`].
+fn click_owner_is_windowed(asid: u64) -> bool {
+    if asid == 0 {
+        return false;
+    }
+    let mut ring = [0u64; crate::video::wm::MAX_WINDOWS];
+    let n = crate::video::wm::focus_ring(&mut ring);
+    ring[..n].contains(&asid)
+}
+
+/// CLICK-ROUTE — **route a pointer button by POSITION rather than by focus.**
+///
+/// ### The defect
+/// P69, attended: "out of focus clicks cause the focused vug to stop". The EL0IN-FOCUS audit named the
+/// mechanism exactly — the Button path has no window hit-test anywhere in it, so under EL0 focus a
+/// button report goes straight to the focused app's ring whatever the pointer is pointing at. Click
+/// the desktop, click another window, click the console: the focused vug gets the click and pauses.
+/// (The audit also reframed x86's CLICK-3 "15/16 clicks eaten" as MIS-ROUTED rather than dropped, so
+/// this seam is written to be inherited by the x86 tree rather than duplicated there.)
+///
+/// ### The rule, on a PRESS edge
+/// Hit-test the cursor ([`crate::video::wm::hit_test`] — topmost visible window containing the point):
+///  * **a DIFFERENT window than the focused one** — raise it to focus FIRST, through the one focus
+///    primitive that exists (`el0_input_set_active` + `wm::focus_changed`, in that order, exactly as
+///    `wc_focus_key` calls them), then let the press fall through to the enqueue, which now reads the
+///    NEW active ASID and delivers there. Click-to-focus, with no second focus path invented for it:
+///    this is a new CALLER of the WEDGE path, so a click-driven raise emits the same `<F1>`-`<F9>`
+///    breadcrumbs a TAB does, which is desirable — the breadcrumbs cover both callers.
+///  * **the FOCUSED window** — deliver exactly as before. This is the no-change case and it is the
+///    common one.
+///  * **no window** — the click landed on the desktop or the console. It is not the focused app's
+///    click, so it is CONSUMED here rather than delivered: that single arm is what P69 is asking for.
+///    Two deliberate limits on it:
+///      - With focus at the SHELL (`cur == 0`) nothing is consumed — the caller's normal path IS the
+///        shell path (`gui_send` -> `click1_dispatch`), which is where a desktop click belongs.
+///      - If the focused app owns no hittable window at all ([`click_owner_is_windowed`] false), the
+///        press is delivered as before. That is the FULL-SCREEN app: a compat row covers the panel but
+///        carries owner ASID 0 and so can never be hit, and dropping its clicks would break UVUG's own
+///        click-to-exit. A miss over a full-screen app is a hit on that app, not on the desktop.
+///
+/// A miss does NOT move focus. Raising the shell on a desktop click would bury every window under the
+/// console (`focus_changed(0)` gives SHELL_Z the fresh z — the FOCUS-VIS "shell" leg), which is a far
+/// bigger claim than P69 makes and would make the desktop unusable. Routing the click and moving focus
+/// are separate decisions here, and only the hit arm does both.
+///
+/// ### The RELEASE edge follows the press, and is never re-routed
+/// See [`CLICK_PRESS_TARGET`]. The release is delivered iff the focus is still the one the press was
+/// delivered to; otherwise it is dropped. So a TAB (or an app exit) between press and release costs
+/// the release, never a fabricated one in a second app.
+///
+/// Returns `true` when the event was CONSUMED and the caller must not deliver or forward it; `false`
+/// means "carry on with your normal path" — including the refocus case, where the caller's normal path
+/// now leads to a different ring than it did one instruction ago.
+///
+/// Idempotent per edge: the mask tracker is swapped on entry, so a second call with the same mask sees
+/// no edge and answers `false`. The shell caller relies on that (it calls `el0_input_enqueue`, which
+/// funnels through here again) — one report produces one decision.
+pub fn wc_click_route(ev: crate::pal::Event) -> bool {
+    let crate::pal::Event::Button(mask) = ev else {
+        return false;
+    };
+    let prev = CLICK_PREV_MASK.swap(mask as u32, Ordering::Relaxed) as u8;
+    let cur = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
+    if mask & !prev != 0 {
+        // PRESS edge.
+        let (x, y) = click_pointer_pos();
+        match crate::video::wm::hit_test(x, y) {
+            Some((win, owner, _z)) if owner != cur => {
+                // The ONLY line this arc adds to serial, and only on the arm that changes behaviour:
+                // a click that MOVED focus. Human-rate by construction (one line per click that lands
+                // on a window other than the focused one), so it needs no throttle of its own.
+                serial_println!(
+                    "[clickroute] press hit asid={} win={} (was {})",
+                    owner, win, cur
+                );
+                el0_input_set_active(owner);
+                crate::video::wm::focus_changed(owner);
+                CLICK_PRESS_TARGET.store(owner, Ordering::Release);
+                false
+            }
+            Some(_) => {
+                CLICK_PRESS_TARGET.store(cur, Ordering::Release);
+                false
+            }
+            None => {
+                if click_owner_is_windowed(cur) {
+                    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                    true
+                } else {
+                    CLICK_PRESS_TARGET.store(cur, Ordering::Release);
+                    false
+                }
+            }
+        }
+    } else if prev & !mask != 0 {
+        // RELEASE edge — follow the press, or drop. Never hit-tested: the release belongs to whoever
+        // received the press, not to whatever the pointer has since been dragged over.
+        let target = CLICK_PRESS_TARGET.load(Ordering::Acquire);
+        target == CLICK_TARGET_DROP || target != cur
+    } else {
+        // Unchanged mask (a re-report of a held button, or the idempotent second call described
+        // above): no edge, no decision.
+        false
+    }
 }
 
 /// The ASID currently designated to receive input (0 = none) — the read side of `el0_input_set_active`.
@@ -12831,6 +12988,11 @@ fn wcb_launcher(_demo_cpu: usize) {
     // WC-I: the arc's rollup, last — it reports counters the two selftests above contribute to.
     #[cfg(feature = "witness")]
     crate::video::wm::wci_rollup();
+    // CLICK-ROUTE: the hit-test witness, AFTER the rollup — it mints two rows of its own, and the
+    // rollup reports counters those rows would otherwise perturb. Self-cleaning (closes its windows,
+    // restores SHELL_Z/FOCUS_ASID, repaints), so nothing after it sees a changed table.
+    #[cfg(feature = "witness")]
+    crate::video::wm::hittest_selftest();
 }
 
 // =============================================================================================
