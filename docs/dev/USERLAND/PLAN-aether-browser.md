@@ -121,3 +121,48 @@ Branch `gemini/aether-browser`, clean `aether:`-prefixed commits, README rewritt
 all tests green (`cargo test` in `handlers/aether`), and `handlers/aether/REPORT.md`: what
 each milestone built, what was deliberately deferred, every deviation from this plan with its
 reason and the fixture that proves it.
+
+## Status — M5 breadth (rounds 46–51, 2026-07-27 to 2026-07-28)
+
+**M5 in flight:** CSS + web-platform breadth, ledger-driven. Executor: Haiku (lanes A/B);
+Fox coordinated review.
+
+**Closed this round:**
+- **rem/em lengths** (2c0fe408): parse_px understands both; base 16px approximation threads
+  through cascade, inheritance, measurement cache, and paint. Wikipedia portal now coherent
+  (globally centered via rem-sized insets).
+- **DOM API breadth** (c6e72828): getElementsByTagName/ClassName, matches, closest, contains,
+  hasAttribute, removeEventListener, focus/blur, click() dispatch, createTextNode;
+  localStorage/sessionStorage (in-memory, persistence queued); window.location real per-page
+  (hostname, pathname, protocol, origin; scripts branch at boot); UNAOS_JSDEBUG=1 traces
+  each page script's outcome.
+- **DOM surgery** (132338a6, 630a5c5c): insertBefore (spec append on null), replaceChild,
+  cloneNode (shallow/deep); Element/Node/HTMLElement feature-detect globals. Portal's
+  language-ring sort script now reaches the insertBefore call (prior: ReferenceError killed
+  DOM surgery entirely).
+- **Text & layout** (339fc3bd, f24bc5e3): per-side borders (border-{top,right,bottom,left}-width
+  longhands, asymmetric taffy space), text-decoration none/underline overrides UA link
+  default, white-space:nowrap threads measure+draw (one-line text), box-sizing border-box/
+  content-box, text-transform uppercase/lowercase/capitalize painted, justify-content
+  center/start/end wired to taffy.
+- **Font families** (d3bb9229): three family classes (0 sans, 1 serif, 2 mono); keyword+common-name
+  matching; threaded cascade, inheritance, measurement (per-family advance cache), paint
+  (per-family font loading, thread-local cache keyed family*2+bold). code/pre/kbd/samp/tt
+  default monospace. Georgia→serif mapping verified.
+- **Quartzite integration** (904c4280): browser surface yields focus to the URL field on
+  activation.
+
+**Deliberately quiet (parsed, not painted):** font-style, background-size/position/repeat,
+border-radius (taffy limitation). No @supports claims for non-painting properties.
+
+**Not yet closed:**
+- **Wikipedia article black box** — layout-architecture issue (executor verdict; not missing
+  declaration). Stays queued.
+- **Portal wordmark clip + language ring** — portal ring hidden under live load; execution-order
+  context bug in the portal's own JS, not a missing API name. insertBefore reachable; next
+  gap in its call path is ledgered, queued.
+- **Yahoo hydration tail** — deferred.
+
+**Gates:** cargo test -p aether 41/41 green; cargo check -p aether-shell green; corpus
+renders unchanged (wiki/HN/example.com sweep intact; portal/yahoo render improved, gaps
+honestly ledgered).
