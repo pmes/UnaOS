@@ -781,6 +781,68 @@ pub fn focus_ring(out: &mut [u64; MAX_WINDOWS]) -> usize {
     n
 }
 
+/// CLICK-ROUTE — **which window owns the panel pixel `(x, y)`?** The topmost VISIBLE window whose
+/// outer box (chrome included) contains the point, as `(window id, owner asid, z)`; `None` for a
+/// point the window layer does not own (the desktop, the console, or a window the shell hides).
+///
+/// ### Why this exists
+/// The EL0IN-FOCUS audit established that the pointer-button path has **no window hit-test at all**:
+/// focus has exactly three sources (the `run` grant, the grant's clear, and the TAB ring), and a
+/// `Button` under EL0 focus goes straight to the focused app's ring regardless of where the pointer
+/// is. That is P69's bench symptom in one sentence — clicking *anywhere* click-pauses the *focused*
+/// vug, because the click was never addressed to a window in the first place. This function is the
+/// missing address lookup, and it is deliberately the whole of the window system's contribution:
+/// the routing policy built on it lives in the arch input router, not here.
+///
+/// ### The visibility rule is the z-order rule
+/// "Visible" is not a flag on the row — it is a POSITION. `SHELL_Z` is allocated out of the same
+/// counter window z's come from, so a row with `z < SHELL_Z` is below the shell, is not composited
+/// at all, and the console owns those pixels (see [`above_shell`]). Such a row is therefore **not
+/// hittable**: clicking the console must reach the console, not a window buried under it. Using the
+/// same predicate the compositor uses is the point — what you can click is exactly what you can see.
+///
+/// ### Compat rows are excluded, for the same reason [`focus_ring`] excludes them
+/// A compat row is the full-screen `present_surface` shim; it carries owner ASID 0 (the hook has no
+/// ASID to pass), so it is not addressable as a focus target and a "hit" on one would name nobody.
+/// A full-screen app therefore reads as *no hit* here, and the router's fallback — deliver as before
+/// — is what keeps its clicks working.
+///
+/// ### Cost and locks
+/// One `TABLE` lock, a scan of eight rows, no allocation, no nested lock, no new lock order — the
+/// same shape as [`focus_ring`] and [`occluders`]. A SNAPSHOT, never a handle: the caller acts on the
+/// asid it gets back through the ordinary focus primitive, which re-validates for itself.
+///
+/// Ties in `z` break by id, matching [`composite`]'s back-to-front order, so "topmost" here and
+/// "drawn last" there are the same window by construction.
+pub fn hit_test(x: i32, y: i32) -> Option<(WinId, u64, u32)> {
+    if x < 0 || y < 0 {
+        return None;
+    }
+    let (px, py) = (x as usize, y as usize);
+    let shell = shell_z();
+    let t = TABLE.lock();
+    let mut best: Option<(WinId, u64, u32)> = None;
+    for r in t.rows.iter() {
+        if !r.used || r.compat || r.owner_asid == 0 || !above_shell(r, shell) {
+            continue;
+        }
+        let (bx, by, bw, bh) = outer_box(r);
+        if bw == 0 || bh == 0 {
+            continue;
+        }
+        // Saturating adds mirror `outer_box`'s own saturation: an absurd box clips, it never wraps
+        // into a small one that would silently stop being hittable.
+        if px < bx || py < by || px >= bx.saturating_add(bw) || py >= by.saturating_add(bh) {
+            continue;
+        }
+        match best {
+            Some((bid, _, bz)) if (r.z, r.id) <= (bz, bid) => {}
+            _ => best = Some((r.id, r.owner_asid, r.z)),
+        }
+    }
+    best
+}
+
 /// FOCUS-VIS — **make a focus change VISIBLE.** The one seam the focus owner calls after
 /// `el0_input_set_active`; `asid == 0` means the SHELL slot of the ring.
 ///
@@ -4118,4 +4180,122 @@ fn reclaim(vacated: &[(usize, usize, usize, usize)]) {
         damage_intersecting(x, y, w, h);
     }
     super::screen::request_full_present();
+}
+
+// ---- CLICK-ROUTE witness -----------------------------------------------------------------------
+
+/// CLICK-ROUTE witness surface: one solid 8x8 ARGB8888 patch in kernel rodata, on the same terms as
+/// the FOCUS-VIS surfaces (static so the selftest allocates nothing; read-only because the compositor
+/// only ever reads a window's surface). Both probe windows share it — this witness reads the TABLE,
+/// not the panel, so the colours carry no verdict and there is no reason to have two.
+#[cfg(feature = "witness")]
+static HT_SURF: [u32; 64] = [0x0020_C080; 64];
+
+/// CLICK-ROUTE — the HIT-TEST witness: does [`hit_test`] name the window an operator would say they
+/// clicked on?
+///
+/// ### Why this one is a TABLE test and not a read-back
+/// FOCUS-VIS reads the scan-out back because its question ("is the focused window frontmost?") is a
+/// question about PIXELS, and kernel state had already been observed lying about it. This question is
+/// different in kind: `hit_test` is a pure function of the window table and the z-order, its answer is
+/// an ASID rather than a colour, and the property that matters is that it agrees with the compositor's
+/// own visibility predicate. Asserting that directly is both stronger and drivable on a headless gate
+/// with no pointer at all — which matters, because the pointer is exactly what QEMU raspi4b does not
+/// have, and the routing this feeds is otherwise metal-only.
+///
+/// ### The five legs, over two windows placed at ONE origin
+/// 1. **inside** — a point inside the shared content area hits SOMETHING (the stack is addressable).
+/// 2. **topmost** — that something is B, the later-created window, which is the one in front. A
+///    hit-test that returned the first matching row instead of the frontmost would fail here and
+///    nowhere else, and it would mis-route every click on an overlap.
+/// 3. **raise** — after `focus_changed(A)` the same point hits A. Raising changes who owns the pixel,
+///    so it must change who owns the click; this is the leg that ties the two orders together.
+/// 4. **outside** — a point clear of both boxes hits nothing. Misses must be misses: the router's
+///    desktop arm consumes the click on the strength of a `None`, so a false hit here would hand the
+///    console's clicks to an app.
+/// 5. **hidden** — after `focus_changed(0)` the shell is above both windows, they stop compositing,
+///    and the same inside point hits nothing. Visibility is a POSITION in the shared z-order, and what
+///    you can click has to be what you can see: clicking a console that covers a window must reach the
+///    console. This is [`above_shell`] holding on the input side as well as the drawing side.
+///
+/// Self-cleaning on the FOCUS-VIS pattern: both windows are closed, `SHELL_Z` and `FOCUS_ASID` are
+/// restored (this calls `focus_changed` with SYNTHETIC asids, which must not be left naming an address
+/// space that does not exist), and the live set is repainted. `witness`-gated, one-shot, and ordered
+/// after every one-shot per-window latch so it cannot burn one with its own rows.
+#[cfg(feature = "witness")]
+pub fn hittest_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!("[clickroute] hit-test -> SKIP (framebuffer not ready)");
+        return;
+    }
+    let info = fb.info();
+    if info.width < 128 || info.height < 128 {
+        serial_println!(
+            "[clickroute] hit-test -> SKIP (panel {}x{} too small)",
+            info.width, info.height
+        );
+        return;
+    }
+
+    const ASID_A: u64 = 0xC0A;
+    const ASID_B: u64 = 0xC0B;
+    let s = &raw const HT_SURF as usize;
+    let len = core::mem::size_of_val(&HT_SURF);
+    // 8x8 ARGB8888, stride 32 BYTES (= 8 px) — the FOCUS-VIS surface geometry exactly. The compositor
+    // picks the upscale itself (`place_scale`), so the content extent is read back from the row below
+    // rather than assumed here.
+    let wa = create(ASID_A, s, len, 8, 8, 32, b"ht-a");
+    let wb = create(ASID_B, s, len, 8, 8, 32, b"ht-b");
+    if wa == WIN_NONE || wb == WIN_NONE {
+        serial_println!("[clickroute] hit-test -> SKIP (window table full: a={} b={})", wa, wb);
+        close(wa);
+        close(wb);
+        return;
+    }
+
+    // One origin for both (so exactly one can own the probe point), upper-middle, clear of WC-F's
+    // reserved boxes at the bottom edge. `move_to` pins the rows against the tiler.
+    let ox = info.width / 3;
+    let oy = info.height / 4 + TITLE_H + BORDER;
+    move_to(wa, ox, oy);
+    move_to(wb, ox, oy);
+
+    // Inside the shared content area; and a point clear of the outer box in BOTH axes. The scale is
+    // the compositor's, read back from the row, so the miss point is derived from the geometry the
+    // window actually has rather than from a number this witness would have to keep in sync.
+    let scale = self::info(wa).map(|i| i.scale).unwrap_or(1);
+    let (ix, iy) = ((ox + 2) as i32, (oy + 2) as i32);
+    let miss = (8 * scale + BORDER + 4) as i32;
+    let (ox_miss, oy_miss) = (ox as i32 + miss, oy as i32 + miss);
+
+    let inside = hit_test(ix, iy);
+    let inside_ok = inside.is_some();
+    let topmost_ok = inside.map(|(_, a, _)| a) == Some(ASID_B);
+    focus_changed(ASID_A);
+    let raise_ok = hit_test(ix, iy).map(|(_, a, _)| a) == Some(ASID_A);
+    let outside_ok = hit_test(ox_miss, oy_miss).is_none();
+    focus_changed(0);
+    let hidden_ok = hit_test(ix, iy).is_none();
+    let ok = inside_ok && topmost_ok && raise_ok && outside_ok && hidden_ok;
+    serial_println!(
+        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} hidden={} -> {}",
+        ix, iy, inside_ok, topmost_ok, raise_ok, outside_ok, hidden_ok,
+        if ok { "PASS" } else { "FAIL" }
+    );
+
+    close(wa);
+    close(wb);
+    // Same restore FOCUS-VIS owes and for the same reasons: drop the shell back to the bottom of the
+    // z-order, un-name the synthetic focus owner, and repaint the live set (this selftest's
+    // `focus_changed(0)` leg pushed EVERY live window below the shell and consumed its damage flag).
+    SHELL_Z.store(0, Ordering::Release);
+    FOCUS_ASID.store(0, Ordering::Release);
+    repaint();
 }

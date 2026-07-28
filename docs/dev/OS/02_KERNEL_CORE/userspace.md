@@ -1694,6 +1694,368 @@
   including the COMPLETE markers, 0 forbidden** (the `UVUG:` / `EXEC-UVUG:` / BGRUN-ST witnesses all
   green); `./arroyo test-arm` MISSION SUCCESS.
 
+- **VUGLIFE (desktop vugs stop dying of old age)** — an **app-only** arc: `crates/user-vug` + this doc, no
+  kernel change. P64 attended metal: four vugs "crashed" as the operator tabbed between them. The wire
+  again showed no panic and no fault — it showed
+  `:: UVUG: interactive exit=frames frames=<N> ::` four times, `N` = 36000 … 271484. The cause is
+  `INTERACTIVE_CAP`, the last surviving **demo-era run deadline**, and the interaction that makes it lethal
+  is subtle: under **VUG-BG** a DETACHED vug runs its auto path *uncapped*, so a desktop vug can sit at
+  hundreds of thousands of frames; the cap is only ever tested on the interactive branch, so it is tested
+  for the very first time at the instant the operator TABS TO THE WINDOW and the first input event flips
+  `interactive` on — and the program exits immediately. Hence `N` far above the 36000 cap, and hence
+  "it crashes when I touch it". Same relic family as **VUGCLICK**: a designed exit that a long-lived
+  windowed desktop turned into a crash. **Change — split by LAUNCH MODE, using state the program already
+  has** (the info-page `DETACHED` bit at `base + 0x4000`, offset `0x20`, bit 0), not a kernel-side special
+  case:
+  - **Detached (`bg /fat/VUG.ELF` — the desktop spawn): UNBOUNDED.** It exits on **ESC** or `kill`, never
+    on a frame counter. At the frame the old cap would have fired it prints exactly one
+    `[vuglife] budget waived (interactive) frames=<n>` line (latched, not per-frame) — a positive witness,
+    so the next attended boot **proves** the waiver fired instead of inferring it from an absence.
+  - **Foreground (`run`, and every fixture/battery launch): the bounded budget STAYS.** Gate liveness
+    depends on a vug that terminates and the batteries drive foreground launches, so nothing that could
+    hang `kernel8-test` was relaxed. When that exit is taken the reason now names its own cause:
+    `:: UVUG: interactive exit=frames_budget frames=<n> (fixture mode) ::`. The reason is deliberately a
+    **single bare token** — bench parsing reads `exit=(\w+)`, so the prose qualifier rides outside every
+    parsed field rather than inside the `exit=` one.
+
+  **Qualifying clause on "detached ⇒ unbounded":** the waiver depends on `set_detached`/`is_detached`,
+  whose backing store is a **64-bit ASID bitmask**; ASIDs ≥ 64 are silently ignored and read back as *not
+  detached*, so such a vug would still die at the cap. This is **unreachable today** — `boot::USER_SLOTS`
+  = 8 and ASID = slot + 1, so ASID ≤ 8 — and a `debug_assert!(asid < 64)` in `set_detached` now pins that
+  relationship, so widening the slot table past 63 without widening the mask trips in debug rather than
+  silently un-waiving desktop vugs.
+
+  **Untouched by construction:** the deterministic auto path (`AUTO_FRAMES` = 300 and the checksum
+  witness), UVUG-8's takeover/deadline logic, and the `EL0_FOCUSED_PRESENT_COUNT` cap. **Gates:**
+  `./arroyo check` green both arches; `./arroyo kernel8` clean; `UNAOS_FBW=1920 UNAOS_FBH=1200
+  ./arroyo kernel8-test 90` → **84/84 required witnesses, 0 forbidden**, with
+  `:: UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c ::` byte-identical and the BGRUN-ST /
+  `EXEC-UVUG` legs unchanged in timing. The waived-budget path is metal-only (no HID in QEMU → no
+  interactive mode), so it is **unverified in QEMU by nature** and is for the next attended boot to confirm.
+- **EL0IN-FOCUS (the pointer stops being dead until first focus)** — P67v2 attended metal: after boot, mouse
+  movement produced **no cursor motion at all** until the operator focused the shell window; from that moment
+  the pointer was alive for the rest of the boot. The cause is a **self-disabling predicate** in the EL0 input
+  router, and the chain is short enough to state in full:
+  1. `pump_usb_into_gui` (`main.rs:2503`) branches on `el0_input_active() != 0` **first**. With a windowed EL0
+     app focused — the ordinary desktop state after `run` / `bg` — every drained pal event goes to
+     `route_input_to_active_el0` and the function `return`s. `render_service`'s `Event::Mouse` /
+     `Event::MouseAbsolute` arms (`main.rs:3122` / `3135`) — the `pal::cursor::move_rel` callers on the Pi's
+     **live** GUI path — are unreachable in that state. (The main/GUI loop's own arms at `main.rs:1199` are
+     the pre-scheduler loop that does not run on Pi baremetal+fb; `vug.rs`'s are inside kernel full-screen
+     apps, a different branch of the same pump.)
+  2. Inside the router, FOCUS-VIS's system-cursor keep-alive was gated on `pal::cursor::has_reported()`
+     (`main.rs:2137`, pre-fix), whose latch (`cursor::LAST_INPUT_MS`) is stamped **only** by `move_rel` /
+     `set_abs`.
+  3. So on a boot where focus reached an EL0 app **before** the first pointer report, both paths that could
+     set the latch were unreachable: the shell arms by (1), the router arm by its own gate. The predicate
+     could only become true through a path it had itself disabled — the shared pointer position never moved,
+     `cursor::visible()` stayed false, and `video::cursor::repaint` drew nothing. Reports were **not lost**:
+     `el0_input_enqueue` delivered them and `[el0in] routed N event(s) to active EL0 ring` fired throughout.
+     What was dead was the *system cursor*, not the routing.
+  4. TAB to the shell → `el0_input_set_active(0)` → the next pump pass takes the bare-shell drain →
+     `gui_send` → `render_service`'s ungated `move_rel` → latch stamped. `has_reported()` is true from then
+     on, so the router's keep-alive works for the rest of the boot. Exactly the observed "dead, then alive".
+
+  **Fix (small, `main.rs`-only):** scope the guard to what it was actually protecting. It existed so the
+  boot-time `input_router_selftest`, which drives the real router with a **synthetic** `Event::Mouse`, would
+  not arm a cursor and print `[cursor] armed` on a QEMU panel that has no pointer. That is now a
+  `ROUTER_SELFTEST` flag, set for the duration of the selftest and cleared after its last router call: the
+  synthetic events still arm nothing and **QEMU gate output is unchanged**, while every *real* pointer report
+  moves the system cursor from the first report of the boot regardless of who holds focus.
+  `pal::cursor::has_reported()` is kept (it is still the honest "does this machine have a pointer?"
+  predicate) but now has no callers; its doc comment records why it stopped being the router's gate.
+  Lane: `main.rs` + one doc comment in `pal.rs` + this doc. `video/wm.rs` and `video/cursor.rs` untouched.
+
+  **Audited and deliberately NOT fixed here — click-to-focus does not exist.** The brief's second half
+  ("clicks should focus-raise what is under the cursor") is not a regression; it was never built. Focus
+  changes have exactly three sources: `run_user_image`'s grant and clear
+  (`arch/aarch64/syscall.rs:7034` / `7175`) and the TAB ring (`wc_shell_focus_key` → `el0_input_set_active`
+  → `wm::focus_changed`, `syscall.rs:11777`). The pointer-button path has **no window hit-test at all** —
+  while an EL0 app holds focus a `Button` goes straight into its ring via `route_input_to_active_el0`, and on
+  the shell path `click1_dispatch` (`main.rs:3022`) hit-tests only *console vs status strip*
+  (`click1_hit_test`, `main.rs:2980`), never the `wm` window table. A click on an unfocused window is
+  therefore delivered to the **focused** app instead: the aarch64 reading of the x86 CLICK-3 "15/16 clicks
+  eaten" datum is that the clicks are not dropped, they are routed to the wrong window because nothing maps
+  cursor position → window. Building it means a new `wm` hit-test seam (position → window id → owner ASID)
+  plus a focus-set on the press edge — a new feature in the compositor's shared convergence surface, not a
+  small fix. Left for its own arc.
+
+  **Gates:** the session that made this change ran in a container with **no C toolchain (`cc` absent, so
+  every build script fails) and no `qemu-system-aarch64`**, so `./arroyo check` and `./arroyo kernel8-test`
+  **could not be run and are unverified**; only a parse-level syntax check of the two edited files was
+  possible. The change is metal-behaviour-only by construction (QEMU raspi4b delivers no HID, so no real
+  pointer report exists on any gate boot, and the selftest's synthetic events stay suppressed exactly as
+  before), but the gates still owe a run before this is trusted.
+
+- **CLICK-ROUTE (a click goes to the window under the cursor, not to whoever is focused)** — the arc
+  EL0IN-FOCUS deferred, built. **P69, attended:** *"out of focus clicks cause the focused vug to stop."*
+  Clicking anywhere — another window, the desktop, the console — click-paused the **focused** vug, because
+  the `Button` event was delivered to the focused app's ring regardless of pointer position. That is the
+  audit's finding acted on rather than restated: focus had exactly three sources (the `run` grant, its
+  clear, and the TAB ring), and the button path had **no window hit-test at all**.
+
+  **The seam (`video/wm.rs`, ~40 lines):** `pub fn hit_test(x, y) -> Option<(WinId, owner_asid, z)>` — the
+  topmost **visible** window whose outer box (chrome included) contains the point. Read-only, one `TABLE`
+  lock, a scan of eight rows, **no new lock and no new lock order**; the same shape as `focus_ring` and
+  `occluders`. Two exclusions, both inherited rather than invented:
+    - **Below the shell is not hittable.** "Visible" is a *position*, not a flag: `SHELL_Z` is allocated
+      out of the same counter window z's come from, so `above_shell` — the predicate the **compositor**
+      uses to decide whether a row draws at all — is the predicate used here. What you can click is
+      exactly what you can see, so clicking a console that covers a window reaches the console.
+    - **Compat rows are excluded,** for the reason `focus_ring` excludes them: the full-screen
+      `present_surface` shim carries owner ASID 0 and is not addressable as a focus target, so a "hit" on
+      one would name nobody. A full-screen app reads as *no hit*, and the router's fallback is what keeps
+      its clicks working (below).
+  This is deliberately the whole of the window system's contribution — the convergence surface the x86
+  tree inherits under GR7. The **policy** lives in the arch input router, not in `wm`.
+
+  **The routing rule (`arch/aarch64/syscall.rs::wc_click_route`), on a PRESS edge:**
+    - **hit on a DIFFERENT window than the focused one** → raise it first through the *one* focus
+      primitive that exists — `el0_input_set_active` then `wm::focus_changed`, in that order, exactly as
+      `wc_focus_key` calls them — then let the press fall through to the enqueue, which re-reads the now
+      **new** active ASID and delivers there. No second focus path was invented: this is a new **caller**
+      of the WEDGE path, so a click-driven raise emits the same `<F1>`–`<F9>` breadcrumbs a TAB does.
+    - **hit on the focused window** → delivered exactly as before. The common case, unchanged.
+    - **no window hit** → the click is the desktop's or the console's, not the focused app's, so it is
+      **consumed** rather than delivered. That single arm is P69's fix. Two deliberate limits on it:
+      with focus at the **shell** (`cur == 0`) nothing is consumed — the caller's normal path *is* the
+      shell path (`gui_send` → `click1_dispatch`), which is where a desktop click belongs; and if the
+      focused app owns **no hittable window at all** the press is delivered as before, because that is the
+      **full-screen** app (its compat row covers the panel but can never be hit) and dropping its clicks
+      would break UVUG's own click-to-exit.
+    - A miss **does not move focus.** `focus_changed(0)` gives `SHELL_Z` the fresh z and buries every
+      window under the console (the FOCUS-VIS "shell" leg), which is a far larger claim than P69 makes.
+      Routing a click and moving focus are separate decisions here; only the hit arm does both.
+
+  **Press/release pairing.** A release delivered to an app that never saw the press is a **fabricated
+  click** — for a click-to-pause vug, an invented click. So the release edge is never hit-tested and never
+  re-routed: it is compared against `CLICK_PRESS_TARGET` (where the press went, or a `DROP` sentinel) and
+  either follows the press or is dropped. A TAB, or the app exiting, between press and release costs the
+  release; it never fabricates one in a second app. The router keeps its **own** previous-mask tracker
+  rather than sharing `main.rs`'s `CLICK1_PREV_MASK`: that one belongs to `click1_dispatch` and only ever
+  sees the events that actually *reach* the shell. `wc_click_route` is idempotent per edge (the mask is
+  swapped on entry), which is what lets the shell caller re-enter it through `el0_input_enqueue`.
+
+  **Two callers, one body,** mirroring `wc_focus_key` / `wc_shell_focus_key`:
+    - `el0_input_enqueue` — the single choke point every event bound for an EL0 ring passes through, right
+      after the TAB interception and for the same reason. A consumed click returns `false` (**not**
+      queued), so `[el0in] routed N` stays truthful.
+    - the **bare-shell drain** in `pump_usb_into_gui` — click-to-focus from the shell slot, where today a
+      click on a live `bg` app's window does nothing at all. On a raise it delivers the press itself and
+      **breaks** the loop, exactly as the TAB interception breaks: that loop's destination is fixed at
+      `gui_send` but focus has just moved. The press is delivered *there* rather than left for the next
+      pump pass because `el0_input_set_active` drains `pal::EVENT_QUEUE` as part of granting focus (the
+      UVUG-8r2 "a fresh focus starts clean" contract), so an event left behind would not survive the raise.
+
+  **Untouched by construction:** the TAB ring and both run-grant focus sources; `focus_changed` and the
+  WEDGE breadcrumb chain (new caller, not a new path); `click1_dispatch` and its console/status-strip
+  hit-test, which still owns every click that misses the window layer; and the `SCREEN_APP_ACTIVE`
+  peek/requeue branch, where the events belong to a kernel full-screen app's own drain.
+
+  **Residual, stated:** on the shell path the shared cursor is moved by `render_service` one `GUI_CHANNEL`
+  hop downstream of the router, so the hit-test reads the position as of the last motion report the render
+  task has already consumed. A click is preceded by the pointer coming to rest, so the lag is nil in
+  practice; the EL0-focus path has no such gap (FOCUS-VIS made the router move the cursor itself).
+
+  **Witnesses.** `[clickroute] press hit asid=<a> win=<w> (was <b>)` — emitted on the **refocus arm only**,
+  the one arm that changes behaviour, and human-rate by construction, so it needs no throttle. Plus a
+  headless-drivable selftest, `wm::hittest_selftest`, ordered after every one-shot per-window latch and
+  self-cleaning on the FOCUS-VIS pattern: two windows at one origin, five legs — *inside* (the stack is
+  addressable), *topmost* (the **later** window owns the overlap, not the first matching row), *raise*
+  (after `focus_changed(A)` the same point hits A — the z-order and the click-order are one order),
+  *outside* (misses are misses; the desktop arm consumes on the strength of a `None`), *hidden* (after
+  `focus_changed(0)` the shell is above both and the point hits nothing). A table test rather than a
+  read-back, because unlike FOCUS-VIS the question is about an **ASID**, not a colour — and because the
+  pointer is exactly what QEMU raspi4b does not have.
+
+  **Gates (all run this session; container `cc`/`ld`/`qemu-system-aarch64` bridged from `/run/host` with
+  `--sysroot=/run/host`, the CURSOR-8 recipe):**
+    - `./arroyo check` → ✅ x86_64 OK, ✅ aarch64 OK.
+    - `UNAOS_QMP_PORT=4501 ./arroyo kernel8-test 210` → **✅ MBENCH PASS — 86/86 required witnesses,
+      0 forbidden hit(s), 26281 lines scanned**, with
+      `[clickroute] hit-test at (215,135) inside=true topmost=true raise=true outside=true hidden=true -> PASS`
+      and `:: EL0: input router — routed=2 (key+mouse) … :: PASS ::` unchanged (the router selftest pushes
+      Key/Mouse/Timer and **no** Button, so it never consults the hit-test and stays deterministic).
+    - the aarch64/virt leg: `./arroyo test-arm` could not resolve AAVMF firmware in this container (arroyo
+      searches five absolute paths, none writable here and no override knob), so the run was performed by
+      **replicating `test_aarch64`'s QEMU invocation verbatim** against the ESP arroyo had just packaged,
+      with `QEMU_EFI-pflash.raw` bridged from `/run/host` — 4202 serial lines, **0 FAIL, 0 panic**, boot
+      complete through `block:up`, `MOUSE-1` enumerating the `usb-tablet`. It is a no-regression leg by
+      construction as well as by observation: the routing changes live in the Pi router
+      (`pump_usb_into_gui`, `baremetal`-gated) and in `el0_input_enqueue`, which has no caller on virt, and
+      the window-verb witness block that hosts `hittest_selftest` does not run there at all.
+    - **Metal is what proves the arc.** QEMU raspi4b delivers no HID, so no real `Button` exists on any
+      gate boot and **every routing arm above is unverified in QEMU by nature**; the gates prove the
+      hit-test, the wiring, and no regression. The next attended boot should see `[clickroute] press hit`
+      on a click into an unfocused window, and — the actual P69 verdict — a focused vug that **keeps
+      running** when the operator clicks somewhere else.
+
+- **VUGPAUSE (a paused vug stops burning cores)** — an **app-only** arc: `crates/user-vug` + this doc, no
+  kernel change. **VUGCLICK** made a click *pause* a vug, and that is as far as it went: pause froze the
+  frame's **advance** (the orientation stopped changing) while the frame **loop** kept running at full
+  rate. Every paused frame still drained input, released both workers, rasterised 128×128 twice,
+  futex-barriered and **presented** — redrawing a surface that could not differ from the one already on
+  the panel. P67v2 paid for that on silicon: six click-paused vugs, six full render pipelines, cores
+  pinned with every crystal standing still. **Change:** when the vug is `paused` **and** its render state
+  is unchanged since the last present, the frame is skipped in full — no `PHASE` store (the workers stay
+  parked on their yield-poll instead of rasterising), no inline raster, no barrier, **no present**. The
+  idle loop is the input half of the normal frame plus one `SYS_YIELD`, and nothing else.
+  - **The predicate** is `paused && presented && presented_overlay == (detached || interactive) &&
+    ay == last_ay && ax == last_ax && dist == last_dist`, compared against the state recorded at the last
+    present. The `presented` term means the first frame is never skipped; the `presented_overlay` term
+    means the frame that first turns the VUGFPS overlay on is never skipped; the three state terms are
+    everything this program can put on its surface. **The first frame after unpause, or after any state
+    change, renders normally** — the predicate simply stops holding.
+  - **Unpause latency is one idle iteration** (a poll plus a yield), because the click that unpauses,
+    ESC, and a drag are all drained by the same `drain_input` the rendering path uses. There is no
+    separate wake channel to get wrong.
+  - **Never a park.** VUGGUARD/P60's lesson is that a vug blocked in an unbounded `futex_wait` is an
+    unkillable empty window. This idle path blocks on nothing: it is a runnable yield loop, so the
+    window stays live, `kill` works, and the compositor sees an ordinary running process.
+  - **`frame` counts frames PRESENTED**, so it does not advance while idled. That is what makes the
+    **VUGFPS** readout honest: the once-per-second refresh (now factored into `fps_refresh`, called from
+    *both* the rendering path and the idle loop) keeps running and the rate falls to **0** rather than
+    freezing on a stale number. A changed digit is the only thing that can still reach the panel while
+    idled — overlay only, one present, at most once per second. `draw_fps` therefore clears a **fixed
+    maximum-width** backing box (`FPS_BOX_W`) rather than one sized to the current digit count: with no
+    band clear behind it, a shrinking readout (47 → 0) would otherwise strand the old digit's pixels.
+  - **A foreground (fixture-mode) vug held paused also stops consuming `INTERACTIVE_CAP`.** Deliberate,
+    not a hole: pause is operator-driven, so a paused foreground vug is one an operator is holding, and
+    it still exits on **ESC** or `kill`. No battery leg can reach it — QEMU delivers no HID.
+  - **Witness:** one `[vugpause] idle engaged frame=<n>` at the first engagement, latched, never
+    per-frame (the same discipline as `[vuglife] budget waived`).
+
+  **Untouched by construction:** `paused` is set only inside the `interactive` branch, and `interactive`
+  is armed only by a real input event — QEMU raspi4b delivers no HID, so the deterministic auto path
+  never evaluates the idle predicate as true and its geometry, code shape and 300-frame
+  `checksum=0xe68285b85121ac7c` witness are unchanged. `draw_fps` is likewise reached only when
+  `detached || interactive`, which the foreground auto path is not. **Gates:** see the arc's landing
+  report — the idle path itself is metal-only by nature (no HID in QEMU → no pause), so it is
+  **unverified in QEMU** and is for the next attended boot to confirm; what QEMU proves is the negative,
+  that the deterministic path is untouched.
+- **KEYSTAT (this arc)** — an **audit** arc: two P69 attended anomalies traced to their exact
+  predicates. One reporting hole fixed (`arch/aarch64/exceptions.rs`); the other chain is named and
+  left alone, because its fix lands outside this arc's lane.
+
+  **Anomaly 1 — "key repeat times out".** Holding a key repeats for a while and then stops with the
+  key still down. There is no repeat *counter* and no per-hold budget; the bound is a **liveness
+  window**, and there are two of them. `typematic_tick` (`pal.rs`) picks the window at
+  `let window = if STREAMS_WHILE_HELD { LIVENESS_MS } else { HOLD_MAX_MS }` and disarms on
+  `last != 0 && now - last > window` — `KEY_P1 = 0`, repeat over.
+  - **Chain A — the UVUG-9 backstop.** `HOLD_MAX_MS = 30_000`. A strict `SET_IDLE(0)` keyboard sends
+    one report on the press and nothing more, so `LAST_REPORT_MS` freezes at the press and the hold
+    ends at 30 s (~750 characters at `RATE_MS = 40`). This is **deliberate** — UVUG-9 chose a coarse
+    finite bound over "forever" — and it announces itself: `[uvug9] typematic hold-max …`.
+  - **Chain B — the sticky streaming verdict.** `STREAMS_WHILE_HELD` latches once
+    `IDLE_RUN_TO_LATCH = 4` consecutive byte-identical held-set reports arrive during a hold, and is
+    **sticky for the rest of the boot** (cleared only on a keyboard detach). Once latched the window
+    is `LIVENESS_MS = 1000` for *every* later hold, so a keyboard that re-reports only
+    intermittently — or with a period above 1 s — stops after ~15 repeats. That disarm is
+    **deliberately silent** (see the comment at the `window == HOLD_MAX_MS` guard: the tight window's
+    disarm "is the ordinary, expected end of a hold"), so chain B leaves *nothing* on the wire and is
+    indistinguishable at the bench from the ~10-repeat stop UVUG-9 exists to have removed.
+  - **The distinguishing evidence is one line:** `[uvug9] typematic hold-max` present ⇒ chain A (30 s,
+    by design); absent ⇒ chain B.
+  - **What is arguably a bug, and why it is not fixed here.** Neither disarm re-arms. Re-arming
+    requires a PRESS edge (`typematic_note_report` stores `KEY_P1` only when `newest_press != 0`), so
+    a report that positively proves the key is *still held* (`held.contains(&k)`) cannot restart the
+    repeat — the operator must lift and re-press. For chain B that is a plain non-re-arming cap: the
+    tracker disarms on silence and then ignores the very evidence that would refute it. The repair
+    belongs in `crates/kernel/src/pal.rs`, which is **outside this arc's lane** (`arch/aarch64` +
+    `user-stat`), so it is recorded here rather than attempted. Suggested shape for whoever owns it:
+    on a post-disarm report whose held set still contains the last-armed ascii, re-arm at
+    `DELAY_MS`; and scope the `STREAMS_WHILE_HELD` verdict to the hold that earned it rather than to
+    the boot.
+
+  **Anomaly 2 — a `stat` instance died with nothing on the wire.** `kill <pid>` answered
+  ``already exited — run `jobs` to reap it``, which is `bg_kill`'s **`PEXITED`** early-out. Working
+  back from that state, a `Proc` row on aarch64 reaches `PEXITED` from exactly three places, and only
+  two of them can name a `bg` app:
+  1. **`SYS_EXIT`, generic live-child arm** (`syscall.rs`, `proc_find_running` → `status`/`PEXITED`/
+     `done.post()`) — **silent by design**; a normal EL0 exit prints nothing.
+  2. **fault-kill** (`record_el0_kill`'s EXEC-1 arm → `EXEC_KILLED_STATUS` + `PEXITED`), always
+     preceded by the `:: EL0 FAULT: … KILLED … ::` line in `aarch64_el0_fault_handler`.
+  3. the named-fixture arms (`u4-child`, `el0-u7*`, K2/midden, …) — unreachable for a `bg` app.
+
+  Everything else that retires an EL0 task leaves the row **`PRUNNING`**, not `PEXITED`:
+  `kill_check_current` and `retire_killed` (SKILL-1's two kill boundaries) post no status, so a
+  SKILL-1 kill reads as `running` / `kill armed but unconfirmed`, never `already exited`. The
+  `[uvug8]` orphan arms and the `BGRUN-SCAV` / `KILLBOUND` reclaims all print, and the latter two
+  leave `gone`, not `already exited`.
+
+  **`crates/user-stat` has no designed exit that could account for it.** The loop has no frame cap,
+  no timeout and no input-driven quit (it never calls `SYS_INPUT_POLL` at all); `SYS_WIN_PRESENT`'s
+  return is explicitly discarded and `getinfo()` falls back to pid 0 rather than exiting. The single
+  `exit(1)` is the `SYS_WIN_CREATE` failure at startup — before any window exists, so it cannot
+  explain an app that was on the panel — and it prints `:: STAT: SYS_WIN_CREATE failed ::` first.
+  (`ALIVE_MARK = 40` is a one-shot print, not a cap.) The VUGLIFE-era "run deadline masquerading as a
+  crash" shape is **not** present in this app.
+
+  **Which leaves the reporting hole, and it is a real one.** A fatal EL0 fault does print — but the
+  line named only the **task name**, and every `bg` launch runs under the single literal `"bg-el0"`
+  (`spawn_user_image_bg`). With two `STAT.ELF` instances on the panel, the line said "one of them
+  died" and nothing more; the operator's `kill <pid>` was the first evidence of *which*, and the
+  death reads as silent. **Fix:** `aarch64_el0_fault_handler` now prints
+  `:: EL0 FAULT: task '<name>' pid=<n> KILLED — EC=… ISS=… ELR=… FAR=… ::`. `pid` comes from
+  `sched::current_id()` — the same id `SYS_GETPID`/`SYS_GETINFO` return, the same value
+  `spawn_user_slot` gave the `Proc` row, the same number `jobs` prints, `kill` takes and the app
+  draws in its own window. It is **lock-free** (one `percpu` read, one `Acquire` load, one field
+  read), which is the binding constraint on this path: the handler runs at EL1 with DAIF masked on
+  the faulting task's own kernel stack and must not reach for anything the interrupted context could
+  hold. One line per kill, bounded, no new state. No spec pattern matched the old text, so
+  `pi4-regression.spec` needed no change.
+
+- **VUGMIN-A (a vug nobody can see stops burning cores too)** — Peter's ruling at **P69**: *"if vug is
+  minimized it should shut off."* The audit that opened the arc found there is **no minimize feature in
+  UnaOS at all** — no `minimized` field on the window table, no minimize verb on `wm`, no chrome
+  hit-testing; `theme::CONTROL_MID` is documented as the "minimise" control fill and has no consumer
+  outside `theme.rs`'s own self-tests. What *does* exist is the state Peter was describing:
+  `wm::focus_changed`'s **shell arm** (the operator TABs to the console) pushes every window below
+  `SHELL_Z` and erases its box. The vug is gone from the panel and its frame loop runs at full rate
+  against a surface the compositor will not read — VUGPAUSE's disease with a different trigger. So the
+  honest name for the state is **HIDDEN**, no new verb is needed, and the cure is VUGPAUSE's idle loop
+  rather than a second mechanism.
+  - **Kernel side.** `HIDDEN_ASIDS: AtomicU64` in `arch/aarch64/syscall.rs`, a deliberate mirror of
+    VUG-BG's `DETACHED_ASIDS` down to the 64-bit bound and the fail-safe direction, published as
+    **bit 1** of the info-page process-flags word (see the layout table above). Public
+    `set_hidden(asid, on)` is the seam for `video::wm`; `clear_hidden(asid)` is called from
+    `boot::teardown_user_slot`'s final-release arm beside `clear_detached`, under the same ordering rule.
+    That clear matters *more* than bit 0's: ASIDs are recycled, and a stale hidden bit would give the next
+    tenant a vug that comes up **already idling** — a window that never draws — having never been hidden.
+  - **The setter is the publisher.** Unlike bit 0, bit 1 changes under a running process, and the
+    info-page writers run only on create/map. Without republishing from `set_hidden` the bit would be an
+    unobservable atomic and the whole mechanism inert.
+  - **EL0 side.** `user-vug` keeps the info-page pointer instead of discarding it after the `DETACHED`
+    read, and polls bit 1 every frame (one `read_volatile` of a mapped word — cheaper than the branch
+    that consumes it). `hidden` folds with `paused` into `frozen`, which replaces `paused` in **two**
+    places, both load-bearing: the **orientation fold** and the **skip predicate's first conjunct**. The
+    fold is the one that is easy to miss — on the auto path the else-arm advances the idle tumble every
+    frame, so without it `ay != last_ay` would hold forever, the predicate could never once be true, and
+    the vug would read its own hidden bit correctly and burn the core anyway. The other four conjuncts are
+    untouched, so a vug hidden before its first present still renders that frame, and the frame that
+    restores it to the panel is an ordinary rendered frame from the preserved state — **restore is a
+    resume, not a jump**.
+  - **One difference from pause, and it is the ruling itself:** the once-per-second fps refresh does
+    **not** run while hidden. A paused vug is on the panel and its readout is owed to the operator; a
+    hidden vug's refresh is discarded by the compositor, so drawing it is the very waste this arc ends,
+    merely at one hertz instead of sixty.
+  - **`SYS_WIN_PRESENT` is not cheap while hidden**, contrary to the assumption the arc started from:
+    `sys_win_present` → `wm_bridge::present` → `wm::present` ends in an unconditional `composite()`, with
+    no visibility predicate anywhere on the path. Suppressing it kernel-side is a `wm.rs` change and is
+    left to VUGMIN-B; the EL0 idle loop is what stops the presents from being issued in the first place.
+  - **Witness:** one-shot `[vugmin] idle engaged frame=<n>`, mirroring `[vugpause]` and on its **own**
+    latch — the two idle reasons are different system facts and a shared latch would let whichever
+    happened first silence the other forever.
+
+  **DORMANT AS SHIPPED, and deliberately so.** VUGMIN-A is plumbing only: **nothing calls `set_hidden`
+  yet**, so bit 1 reads a constant `0` and no EL0 branch above it is reachable. The two call sites belong
+  in `video::wm` (the shell arm that hides, the raise path that unhides), and `wm.rs` was another
+  session's lane during this arc — hence the split. **VUGMIN-B** is that wiring, plus the `wm.rs` present
+  suppression, and until it lands this arc changes no observable behaviour on hardware. The deterministic
+  QEMU auto path is untouched now and stays untouched after B, for a stronger reason than pause's: a
+  headless run has no HID, so nothing ever TABs to the shell, so nothing is ever hidden — the 300-frame
+  `checksum=0xe68285b85121ac7c` witness proves it on both sides of the change.
+
 ### x86_64 (branch `hw-rmbp`)
 
 - **U1a** — first ring-3 round-trip (the x86 mirror of aarch64 M6a). A
