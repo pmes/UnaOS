@@ -85,6 +85,11 @@ _feats=""
 # (monotonic ms → UTC after a civil anchor). UART byte-stream only; default OFF => serial byte-
 # identical (witness/mbench specs parse serial lines). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_LOGTS:-}" ] && _feats="${_feats}logts,"
+# WEDGE-2: UNAOS_WEDGE2=1 arms the `wedge2` feature — raw-UART `<F1>`..`<F9>` breadcrumbs along the
+# TAB->focus-raise chain, written BEFORE each phase so a core that dies IRQ-masked mid-phase still
+# names it on the torn wire. Instrumentation only; default OFF => call sites vanish. See the kernel8
+# knob block below and docs/dev/OS/08_VIDEO/engine.md §WEDGE-2.
+[ -n "${UNAOS_WEDGE2:-}" ] && _feats="${_feats}wedge2,"
 [ -n "${UNAOS_PI:-}" ] && _feats="${_feats}pi,"
 [ -n "${UNAOS_USBDEBUG:-}" ] && _feats="${_feats}usbdebug,"
 # MT-INVESTIGATION (IVY): arm the Wellspring raw-multitouch mode probe on the EHCI trackpad path
@@ -1163,6 +1168,20 @@ kernel8() {
     if [ -n "${UNAOS_SMP8:-}" ]; then
         K8_FEATS="${K8_FEATS},smp8"
         echo -e "${COLOR_YELLOW}  • UNAOS_SMP8: [smp8] per-core pre-fix CPUECTLR_EL1 + SMPEN witness (the set itself is always on)${COLOR_RESET}"
+    fi
+    # WEDGE-2: UNAOS_WEDGE2=1 adds the `wedge2` feature — last-words breadcrumbs along the whole
+    # TAB->focus-raise chain. A fixed four-byte token (`<F1>`..`<F9>`, plus `<f7>`/`<f8>` for a
+    # concurrent composite on ANOTHER core) is written straight at the UART data register BEFORE each
+    # phase: lock-free, unbuffered, bounded. P66/P67v2/P68 (silicon) and x86 s44 all ended with
+    # `[wc-fv] focus raise` and then total silence, with WEDGE-1's `DRAIN STALLED` tripwire never
+    # firing — a core dying with IRQs masked mid-phase, which no buffered print can name. The LAST
+    # token on the torn wire is the phase that died. INSTRUMENTATION ONLY (no fix, no behaviour
+    # change, no new or taken locks); the tokens can interleave with another core's in-progress serial
+    # line, which is the accepted cost of taking no lock. OFF => call sites vanish and the image holds
+    # no `<F` token. Token table: docs/dev/OS/08_VIDEO/engine.md §WEDGE-2.
+    if [ -n "${UNAOS_WEDGE2:-}" ]; then
+        K8_FEATS="${K8_FEATS},wedge2"
+        echo -e "${COLOR_YELLOW}  • UNAOS_WEDGE2: <F1>..<F9> raw-UART breadcrumbs on the TAB->focus-raise chain (tokens may interleave with other serial lines — by design)${COLOR_RESET}"
     fi
     # PI-USB-1: UNAOS_PIUSB=1 adds the `piusb` feature — the BCM2711 PCIe root complex + VL805 xHCI attach
     # (RC bridge reset / link-up / MEM-window, VL805 1106:3483 enumeration + BAR sizing, NOTIFY_XHCI_RESET

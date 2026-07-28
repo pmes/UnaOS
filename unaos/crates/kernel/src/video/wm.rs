@@ -814,6 +814,11 @@ pub fn focus_ring(out: &mut [u64; MAX_WINDOWS]) -> usize {
 /// what was already damaged. Safe to call on every focus change, including no-op ones.
 pub fn focus_changed(asid: u64) {
     use core::sync::atomic::Ordering;
+    // WEDGE-2 `<F4>` — the focus RAISE begins, and this core claims the chain (so a composite pass on
+    // any other core can report itself as concurrent until `<F9>`). Emitted before the `TABLE` lock
+    // that does the z-bump: a `<F4>` with no `<F5>` puts the death on `TABLE`.
+    crate::wedge2::chain_enter();
+    crate::wedge2::mark("<F4>");
     let mut raised = 0usize;
     let mut first_id = WIN_NONE;
     let mut newz = 0u32;
@@ -871,6 +876,11 @@ pub fn focus_changed(asid: u64) {
         }
     }
 
+    // WEDGE-2 `<F5>` — the z-bump is done and the table guard is dropped; the immediate REPAINT half
+    // (`erase` of the vacated boxes, then the desktop's full-present request) is next. Both touch the
+    // framebuffer and the sprite; a `<F5>` with no `<F6>` puts the death there rather than in the
+    // composite pass.
+    crate::wedge2::mark("<F5>");
     if nhidden > 0 {
         // Desktop colour under the vacated boxes NOW (visible immediately), console TEXT over it at the
         // desktop's next present. Splitting it that way is what keeps the response instant without this
@@ -890,7 +900,19 @@ pub fn focus_changed(asid: u64) {
         );
     }
     let _ = (raised, first_id, newz);
+    // WEDGE-2 `<F6>` — the `[wc-fv]` line above is the LAST thing every recorded wedge printed, so
+    // this token is the one that matters most: it is emitted after that line and before the composite
+    // pass. `<F6>` present with nothing after it says the chain survived the print and died inside
+    // `composite`; `<F5>` with no `<F6>` says it never got out of the erase/present-request half, i.e.
+    // the `[wc-fv]` print itself (which takes the serial lock) was the last step.
+    crate::wedge2::mark("<F6>");
     composite();
+    // WEDGE-2 — close the chain window here rather than at `<F9>`, so it is released on EVERY path out
+    // of `focus_changed` (the FOCUS-VIS selftest calls this function too, and a claim left standing
+    // would make every later composite in the boot report `<f7>`/`<f8>` forever). `<F9>` is then a
+    // pure marker at the return site. A chain the wedge kills mid-flight leaves the claim set, which
+    // costs nothing: that core is not coming back.
+    crate::wedge2::chain_exit();
 }
 
 /// FOCUS-VIS — whether `r` composites at all, i.e. whether it sits ABOVE the shell in the one z-order
@@ -1377,6 +1399,18 @@ fn composite_inner() -> CursorTail {
     // early return, one fewer blocking lock inside the guard. The `is_ready` early return now precedes
     // the registration, which is strictly better on its own — a pass that cannot draw no longer
     // registers as in-flight at all.
+    // WEDGE-2 `<F7>` (owner core) / `<f7>` (any OTHER core compositing while the chain is open) — the
+    // deferred-erase drain and the cursor bracket are behind us; the `WRITER` read, the `TABLE`
+    // snapshot and the `BlitGuard` registration are next. This is the region WEDGE-1 hardened and the
+    // region whose drain barrier WEDGE-1's silent tripwire exonerated, so a `<F7>`/`<f7>` terminus is
+    // the strongest single fact this instrument can produce.
+    //
+    // The lowercase twin is the reason the vug storm is in the evidence at all: six vugs present
+    // continuously, so several cores are inside this pass whenever a TAB lands, and a wire that ends
+    // `<F7><f7><f7>` reads very differently from one that ends `<F7>` alone. Passes that run with NO
+    // focus change in flight stay silent — otherwise the steady-state present rate would bury the
+    // chain.
+    crate::wedge2::mark_composite("<F7>", "<f7>");
     let fb = *super::WRITER.lock();
     if !fb.is_ready() {
         return tail_of(disturbed, session);
@@ -1444,6 +1478,12 @@ fn composite_inner() -> CursorTail {
     // window in this pass is judged against a single focus owner, so no pass can draw two highlights.
     let focus = focus_asid();
 
+    // WEDGE-2 `<F8>` (owner core) / `<f8>` (a concurrent core) — the guard is HELD, the damage set is
+    // closed and ordered, and the back-to-front BLIT LOOP is next. The pairing is what makes this
+    // token worth its bytes: `<F7>` with no `<F8>` means the death is in the guard-registration
+    // window (`WRITER`/`TABLE`/`BlitGuard`), while `<F8>` with no `<F9>` means it is in the blit loop
+    // proper — `draw_window`, the WC-G/WC-D witnesses, or the sprite overlay they drive.
+    crate::wedge2::mark_composite("<F8>", "<f8>");
     let mut drawn = 0usize;
     // CURSOR-3 — did any window in this pass carry the sprite through its staged present? Back-to-
     // front order means the LAST window to take the overlay is the topmost one that fully contains

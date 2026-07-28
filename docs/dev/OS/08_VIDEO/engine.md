@@ -3475,3 +3475,118 @@ and an intact serial fallback. It does not exercise either change.
   three cores that stopped are the thing to chase; the next arc should get a per-core heartbeat that
   survives an IRQ-masked spin (the tripwire only fires from inside one specific loop) before it
   theorises further.
+
+### WEDGE-2 — breadcrumbs, so the next wedge names its dying step
+
+WEDGE-1 ended with a request written into its own watch-list: *get a per-core heartbeat that survives
+an IRQ-masked spin before theorising further.* This is that instrument. **It is instrumentation only
+— no fix, no behaviour change, no new lock, and no existing lock taken on the breadcrumb path.** It
+adds nothing to a default image.
+
+#### The evidence it was built against
+
+Four lockups, three of them silicon, all under a six-vug storm during TAB cycling:
+
+| Run | Machine | Last thing on the wire |
+| --- | --- | --- |
+| P66 | Pi 4 bare metal | pointer/click traffic, then `[wc-fv] focus raise asid=0x…`, then total silence |
+| P67v2 | Pi 4 bare metal | the same shape |
+| P68 | Pi 4 bare metal | the same shape |
+| s44 | x86 | the same shape, with the serial capture truncated **mid-word** |
+
+Two facts fall straight out of that table and are treated as settled here rather than re-litigated:
+
+* **The drain barrier is exonerated.** WEDGE-1's `[wedge1] DRAIN STALLED` tripwire fires from inside
+  the drain-barrier spin, and it stayed silent all three times. Whatever stops the machine, it is not
+  that loop.
+* **The mechanism is ARCH-NEUTRAL.** s44 reproduces the identical death shape on x86, so it lives in
+  the shared wm/compositor/input-routing/sched interplay, not in anything BCM2711-specific.
+
+The mid-word truncation is the design constraint. A core that stops mid-print with IRQs masked (or
+every core stopping at once) takes any buffered or deferred output down with it, and no panic handler
+runs. So the only instrument that can speak is one that has already spoken: **a token written BEFORE
+each phase, straight at the UART, unbuffered.**
+
+#### The chain, and the token table
+
+Read the wire's LAST token as the phase that died — or, equivalently, the phase whose successor never
+started. Tokens are four bytes, angle-bracketed, and no other line in the tree emits that shape.
+
+| Token | Emitted at | The phase it opens |
+| --- | --- | --- |
+| `<F1>` | `arch/aarch64/syscall.rs` — `wc_focus_key`, after the TAB edge is recognised | `wm::focus_ring` — reads the ring under the window `TABLE` lock. Both entry points (the in-ring router seam and `wc_shell_focus_key`) funnel through this one body. |
+| `<F2>` | `wc_focus_key`, destination chosen | `el0_input_set_active` — clears the target's ring and drains up to 64 events off `pal::EVENT_QUEUE` against a live producer |
+| `<F3>` | `wc_focus_key`, focus routing moved | `wm::focus_changed` — the visible half. Every recorded wedge got at least this far. |
+| `<F4>` | `video/wm.rs` — `focus_changed` entry (also claims the chain) | the `TABLE` critical section that does the z-bump / shell raise |
+| `<F5>` | `focus_changed`, table guard dropped | `erase` of the vacated boxes + `screen::request_full_present` |
+| `<F6>` | `focus_changed`, after the `[wc-fv]` line | `composite()` — **the highest-value token**: `[wc-fv] focus raise` is the last line every wedge printed, so `<F6>` present with nothing after it says the chain survived that print and died in the composite pass, while `<F5>` with no `<F6>` says the print itself was the last step |
+| `<F7>` / `<f7>` | `composite_inner`, drain + cursor bracket done | the `WRITER` read, the `TABLE` snapshot and the `BlitGuard` registration — the region WEDGE-1 hardened |
+| `<F8>` / `<f8>` | `composite_inner`, guard held and damage set closed | the back-to-front blit loop — `draw_window`, the WC-G/WC-D witnesses, the sprite overlay |
+| `<F9>` | `wc_focus_key`, `focus_changed` returned | return to the input pump. A wire that reaches `<F9>` has exonerated the whole focus path for that press. |
+
+**Uppercase vs lowercase.** `<F7>`/`<F8>` are the core that owns the focus change; `<f7>`/`<f8>` are
+some OTHER core entering the same two phases while the chain is open. The six-vug storm is in the
+evidence precisely because several cores are inside the composite pass whenever a TAB lands, and a
+wire ending `<F7><f7><f7>` reads very differently from one ending `<F7>` alone. A composite pass
+running with no focus change in flight stays silent — otherwise the steady-state present rate would
+bury the chain in tokens. The claim is taken at `<F4>` and released at the end of `focus_changed`
+(not at `<F9>`), so every path out of that function — including the FOCUS-VIS selftest's three calls —
+releases it. Note the tokens do **not** encode a core id; `<f7>` says "not the chain's core", nothing
+finer.
+
+#### The write primitive, and its lock analysis
+
+`crate::wedge2::mark` calls `arch::serial::wedge2_raw_byte`, which is a **lock-free, bounded** poll of
+the UART's TX-ready flag followed by one volatile store to its data register — on aarch64 the PL011
+`FR`/`DR` pair (reusing the existing `SerialPort::write_byte`, which is a method on a unit struct and
+therefore needs no `SERIAL_PORT` guard); on x86_64 the bare 16550 `LSR`/`THR` sequence at `0x3F8`,
+deliberately *not* the `SERIAL1` mutex.
+
+It acquires **nothing**: not `SERIAL_PORT`/`SERIAL1`, not `FBCON`, not `WRITER`, not `TABLE`, not
+`SPRITE`, not the allocator. That is the whole property, and it is not a nicety — every one of those
+locks is reachable from the focus chain being instrumented, so a breadcrumb that could block on one
+would be missing in exactly the runs it exists for. It is also why the tokens do not go through
+`serial_println!`, which masks interrupts and takes the serial lock. Compare WEDGE-1's tripwire, which
+does take that lock and says so: that was acceptable there because the alternative on the serial-path
+wedge was spinning forever anyway; here it would defeat the instrument outright.
+
+**The cost, stated plainly.** Taking no lock means a token CAN land in the middle of another core's
+`serial_println!` line and split it. For a last-words instrument that is the right trade: an
+interleaved `<F6>` is still perfectly legible inside any other text, whereas a token serialised behind
+a lock is a token the wedge eats. The knob gate is what keeps anyone else from paying for it.
+
+#### Knob and arch seam
+
+`UNAOS_WEDGE2=1` arms the `wedge2` feature. Default OFF: `mark` becomes an empty
+`#[inline(always)]` function, its argument is a dead constant, and the image contains no `<F` token at
+all (verified by `strings`, both directions — see the gate results). Everything except
+`wedge2_raw_byte` is arch-neutral, so the x86 tree inherits this by porting one function —
+**instrumentation, not theories.**
+
+#### WEDGE-2 gate results (2026-07-28)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
+* `UNAOS_QMP_PORT=4491 ./arroyo kernel8-test 150` (knob **OFF**) — **`✅ MBENCH PASS — 86/86 required
+  witnesses, 0 forbidden hit(s), 12417 lines scanned`**.
+* `strings -a target/pi_baremetal/kernel8.img | grep -oE '<[Ff][1-9]>'` on the knob-OFF image — **0
+  hits**.
+* `UNAOS_WEDGE2=1 ./arroyo kernel8`, then the same census on the armed image — **all eleven tokens
+  present exactly once**: `<F1> <F2> <F3> <F4> <F5> <F6> <F7> <F8> <F9> <f7> <f8>`.
+
+The QEMU gate proves compilation, no-regression, and byte-inert knob-off. It does **not** exercise the
+instrument: raspi4b delivers no HID pointer, there is no operator to press TAB, and there is no
+six-vug storm. Positive verification is a wedge on the bench.
+
+#### Metal watch-list (WEDGE-2)
+
+* Read the **last** token, not the last line. The `[wc-c]`/`[wc-fv]` lines are buffered behind the
+  serial lock; the tokens are not, so on a torn wire they are the more recent evidence.
+* `<F6>` as the terminus locates the wedge inside `composite`, which is where the WEDGE-1 refutation
+  already pointed and is the outcome to expect. `<F7>` vs `<F8>` then splits it: guard registration
+  versus the blit loop.
+* `<F5>` as the terminus is the surprise result and would move the whole investigation — it would mean
+  the `[wc-fv]` print itself (i.e. the serial lock) is the last step, not the compositor.
+* Any `<f7>`/`<f8>` trailing the owner's last token names a second core that was inside the same
+  region — the first direct evidence about whether this is a one-core death or a pile-up.
+* A wire that reaches `<F9>` and wedges later has exonerated the focus chain for that press, and the
+  next instrument belongs downstream in the pump.
