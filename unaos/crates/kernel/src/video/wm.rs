@@ -2492,15 +2492,28 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
 
 // ---- WC-H: the window back-layer ---------------------------------------------------------------
 
-/// WC-H — hard ceiling on the staging buffer, in bytes. A window whose clipped outer box needs more
-/// than this composes on the DIRECT path instead (the pre-WC-H behaviour): the fallback is always
-/// available, so the cap bounds the compositor's memory rather than its correctness. 4 MiB covers a
-/// 1024x1024 box at 4 bytes/pixel — comfortably past the bench's 128x128@4x window (~514x526, 1.08
-/// MiB) and far short of a panel-sized allocation.
+/// WC-H — hard ceiling on the staging buffer, in bytes. 4 MiB covers a 1024x1024 box at 4
+/// bytes/pixel — comfortably past the bench's 128x128@4x window (~514x526, 1.08 MiB) and far short
+/// of a panel-sized allocation.
+///
+/// ### WC-M — this is a ceiling on the BUFFER, no longer a ceiling on the PRESENT
+///
+/// WC-H made an over-cap box decline to the DIRECT path — the pre-WC-H, tearing regime — which was
+/// defensible while the only windows were small. It stops being defensible the moment the console
+/// becomes a window: the bench panel is 1920x1200 ARGB, ~8.8 MiB for one full-panel box, so the
+/// largest and most visible present in the system was the one guaranteed to tear.
+///
+/// [`stage_window`] now stages such a box in row-bands that each fit under this cap, so the cap
+/// bounds the compositor's memory *and nothing else*. The only geometry that still declines on it is
+/// one whose SINGLE ROW does not fit, which is unreachable on any panel this kernel can address (4
+/// MiB is a 1 048 576-pixel row). See [`stage_window`] for the banding and for the visibility window
+/// it costs.
 const MAX_STAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// WC-H — the window back-layer's memory: one buffer, allocated on first use at the size the largest
-/// window needs and reused by every composite thereafter.
+/// window needs and reused by every composite thereafter. WC-M: "what the window needs" is capped at
+/// [`MAX_STAGE_BYTES`], because a box past the cap is staged one band at a time through this same
+/// buffer rather than declining — the buffer never grows past the cap, whatever the panel's size.
 ///
 /// This is the one heap allocation this module makes, and the module header's "no heap in the
 /// compositor" note is narrowed rather than contradicted: the allocation happens on GROWTH only (the
@@ -2697,11 +2710,41 @@ fn draw_window(
     overlaid
 }
 
+/// WC-M — [`super::FrameBuffer::fill_rect`] with a vertical origin that may lie ABOVE the
+/// destination's row 0. The rows above are dropped and the remainder is filled at its true position;
+/// everything else clips inside `fill_rect` exactly as before. For `y >= 0` this IS
+/// `fill_rect(x, y as usize, w, h, color)` — the direct path and every single-band stage take that
+/// branch, so neither sees any change at all.
+fn fill_rect_v(dst: &super::FrameBuffer, x: usize, y: isize, w: usize, h: usize, color: u32) {
+    if y >= 0 {
+        dst.fill_rect(x, y as usize, w, h, color);
+        return;
+    }
+    let skip = (-y) as usize;
+    if skip >= h {
+        return;
+    }
+    dst.fill_rect(x, 0, w, h - skip, color);
+}
+
 /// WC-H — paint the window's chrome and upscaled content into `dst`, whose origin sits at panel
 /// coordinate `(ox, oy)`. The two callers differ only in that origin: the direct path passes the
 /// front framebuffer with `(0, 0)`, the staged path passes the back layer with the outer box's
 /// top-left. Every clip bound is still derived from the PANEL (`pw`/`ph`), so both paths draw the
 /// identical pixel set — the back layer is exactly `bw x bh` of it, addressed from a different zero.
+///
+/// ### WC-M — `oy` may now sit BELOW the box's top edge
+///
+/// A chunked stage paints the same window once per row-band, with `dst` covering only that band and
+/// `oy` at the band's first panel row. Every band after the first therefore has the box's top border,
+/// its title strip and its first source rows ABOVE its own row 0, so the destination-local vertical
+/// origin is SIGNED. `bx`/`by`/`bw`/`bh` still describe the whole box (the chrome geometry must not
+/// move between bands) and `dst`'s own height is what bounds the band.
+///
+/// The horizontal axis is untouched: bands split on full rows only, so `ox` never exceeds `bx`.
+///
+/// When `oy <= by` — the direct path, and any stage that fits the cap in one band — every value
+/// below is non-negative and every call is the pre-WC-M call with the pre-WC-M arguments.
 #[allow(clippy::too_many_arguments)]
 fn paint_window(
     dst: &super::FrameBuffer,
@@ -2717,7 +2760,9 @@ fn paint_window(
     focused: bool,
     dup: bool,
 ) {
-    let (lbx, lby) = (bx.saturating_sub(ox), by.saturating_sub(oy));
+    let lbx = bx.saturating_sub(ox);
+    // WC-M — signed: a band below the first has the box's top edge above its own row 0.
+    let lby = by as isize - oy as isize;
     if !r.compat {
         // Frame: fill the whole outer box in the border colour, then lay the title strip and the
         // content over it. The only pixels that survive are the 1-px frame itself.
@@ -2733,9 +2778,22 @@ fn paint_window(
         } else {
             (CHROME_BORDER, CHROME_TITLE_BG)
         };
-        dst.fill_rect(lbx, lby, bw, bh, border);
-        dst.fill_rect(lbx + BORDER, lby + BORDER, bw.saturating_sub(2 * BORDER), TITLE_H, title_bg);
-        draw_title(dst, r, lbx + BORDER + 2, lby + BORDER + 2, bw.saturating_sub(2 * BORDER + 4));
+        fill_rect_v(dst, lbx, lby, bw, bh, border);
+        fill_rect_v(
+            dst,
+            lbx + BORDER,
+            lby + BORDER as isize,
+            bw.saturating_sub(2 * BORDER),
+            TITLE_H,
+            title_bg,
+        );
+        draw_title(
+            dst,
+            r,
+            lbx + BORDER + 2,
+            lby + BORDER as isize + 2,
+            bw.saturating_sub(2 * BORDER + 4),
+        );
     }
 
     if r.x >= pw || r.y >= ph {
@@ -2752,7 +2810,9 @@ fn paint_window(
     let cols = vis_cols.min(r.stride / 4);
     let rows = vis_rows.min(r.surf_len / r.stride);
 
-    let (cx, cy) = (r.x.saturating_sub(ox), r.y.saturating_sub(oy));
+    let cx = r.x.saturating_sub(ox);
+    // WC-M — signed, for the same reason `lby` is: the content's first rows are above a later band.
+    let cy = r.y as isize - oy as isize;
     let dinfo = dst.info();
     let (dw, dh, dbpp) = (dinfo.width, dinfo.height, dinfo.bytes_per_pixel);
     // WC-H — the upscale's vertical runs, written once and replicated. A nearest-neighbour upscale
@@ -2769,16 +2829,37 @@ fn paint_window(
     let dup = dup && r.scale > 1 && dbpp != 0 && dinfo.stride == dw;
     let surf = r.surf as *const u8;
     for row in 0..rows {
+        // WC-M — where this source row's `scale` destination lines start, in the DESTINATION's own
+        // coordinates. Negative means the row begins above `dst`'s row 0, which only a chunked
+        // stage's second-or-later band can produce.
+        let dy0 = cy + (row * r.scale) as isize;
+        if dy0 >= dh as isize {
+            // Rows only descend from here, so nothing further can land in `dst`. Behaviourally
+            // identical to the pre-WC-M loop, every one of whose remaining writes `put_pixel`
+            // rejected on the same bound — it just stops paying for them, which is what keeps a
+            // banded present the cost of ONE compose rather than one per band.
+            break;
+        }
+        // The first line of this source row that lands inside `dst`. Zero everywhere except at a
+        // band's top edge, where a source row can straddle the boundary: the lines above it were
+        // composed and presented by the previous band, and the ones from here are this band's.
+        let sy_first = if dy0 < 0 { (-dy0) as usize } else { 0 };
+        if sy_first >= r.scale {
+            continue;
+        }
         let row_base = row * r.stride;
-        let lines = if dup { 1 } else { r.scale };
+        // `dup` composes exactly one line per source row and replicates it; without it every line is
+        // written per-pixel. Either way the run starts at the first line this destination can hold.
+        let sy_end = if dup { sy_first + 1 } else { r.scale };
         for col in 0..cols {
             // Unaligned-safe read of the ARGB8888 pixel; low 24 bits are RRGGBB (alpha ignored —
             // this arc composites opaquely). In bounds by construction: `row < surf_len / stride`
             // and `col < stride / 4`, so `row_base + col * 4 + 4 <= surf_len`.
             let px = unsafe { core::ptr::read_unaligned(surf.add(row_base + col * 4) as *const u32) }
                 & 0x00FF_FFFF;
-            for sy in 0..lines {
-                let dy = cy + row * r.scale + sy;
+            for sy in sy_first..sy_end {
+                // `sy >= sy_first` makes `dy0 + sy` non-negative by construction.
+                let dy = (dy0 + sy as isize) as usize;
                 for sx in 0..r.scale {
                     dst.put_pixel(cx + col * r.scale + sx, dy, px);
                 }
@@ -2790,7 +2871,10 @@ fn paint_window(
         // Replicate the composed line over the remaining `scale - 1` lines of this source row. The
         // segment is exactly the span `put_pixel` accepted above: the clip is the destination's own
         // width, the same bound that decided which pokes landed.
-        let y0 = cy + row * r.scale;
+        // WC-M — the line that was actually composed above, which is the row's first line inside
+        // `dst` and not necessarily its first line overall. Replicating from any other one would
+        // read rows this band does not hold.
+        let y0 = (dy0 + sy_first as isize) as usize;
         if y0 >= dh || cx >= dw {
             continue;
         }
@@ -2804,8 +2888,8 @@ fn paint_window(
         // bounds-checks the destination and uses `copy_nonoverlapping`; the ranges are disjoint
         // because `y` is strictly greater than `y0`.
         let line = unsafe { core::slice::from_raw_parts((dst.base_addr() + src_off) as *const u8, seg) };
-        for sy in 1..r.scale {
-            let y = y0 + sy;
+        for sy in (sy_first + 1)..r.scale {
+            let y = (dy0 + sy as isize) as usize;
             if y >= dh {
                 break;
             }
@@ -2819,8 +2903,56 @@ fn paint_window(
 /// is unavailable, leaving the front untouched so the caller can run the direct path.
 ///
 /// The four declines are all "fall back", never "fail": a compat row (see [`draw_window`]), a box
-/// over [`MAX_STAGE_BYTES`], a lock another core holds, and an allocator that cannot grow the
-/// buffer. None of them can lose a window.
+/// whose single ROW is over [`MAX_STAGE_BYTES`], a lock another core holds, and an allocator that
+/// cannot grow the buffer. None of them can lose a window.
+///
+/// ### WC-M — over-cap boxes are BANDED, not declined
+///
+/// WC-H sized the buffer to the whole box and declined anything larger. The bench panel is 1920x1200
+/// ARGB — ~8.8 MiB for one full-panel box, over twice the cap — so a console-as-a-window, the single
+/// largest and most conspicuous present the compositor will ever run, was exactly the present that
+/// fell back into the tearing regime WC-H exists to remove.
+///
+/// The buffer now holds a BAND: `chunk_rows = MAX_STAGE_BYTES / row_bytes` full rows of the box. The
+/// pass composes band 0 and presents its rows, then composes band 1 into the same buffer and presents
+/// those, and so on. Each band's present is the WC-H present unchanged — one bulk
+/// `copy_nonoverlapping` per row, at the panel's row stride — and `paint_window` draws the whole
+/// window each time with the band's origin as its destination zero, so the chrome and the upscale
+/// keep their true geometry across the seam. A band costs only its own rows: `paint_window` starts at
+/// the first source row that lands in the band and breaks at the first that lands past it, so a
+/// banded present is one compose's worth of per-pixel work, not one per band.
+///
+/// **A single band is the pre-WC-M path exactly.** When the box fits the cap, `chunk_rows == bh`, the
+/// loop runs once with origin `(bx, by)`, `paint_window` sees a non-negative vertical origin, the
+/// buffer is the same size WC-H allocated, and the sprite offer is unconditional as before. Every
+/// window on the bench today and every window in the QEMU regression takes that branch.
+///
+/// ### The visibility window, stated honestly
+///
+/// **A banded present is NOT atomic, and this arc does not claim it is.** The rows of band 0 are on
+/// the panel while band 1 is still being composed, so for the length of one band's compose the panel
+/// can hold the new top of the window over the old bottom of it. What the arc DOES guarantee:
+///
+/// * **Every seam is a full ROW boundary.** A band is a whole number of complete rows and each row
+///   still reaches the panel in one bulk copy, so no scanline is ever half-old and half-new — which
+///   is the artifact WC-G convicted and WC-H removed. The horizontal tear WC-H was built against
+///   cannot come back through this path.
+/// * **The seam is bounded and known**: at most `ceil(bh / chunk_rows) - 1` of them, at the row
+///   offsets the banding picks, for one compose each.
+/// * **Nothing is lost or duplicated.** Every row of the box is composed by exactly one band and
+///   presented exactly once, and `paint_window`'s dense border fill covers each band completely, so
+///   the "every pixel the present copies was written by this pass" invariant holds per band.
+///
+/// The alternative that WOULD be atomic — one buffer the size of the whole box — is the panel-sized
+/// allocation the cap exists to refuse. What this replaces is not an atomic present; it is the DIRECT
+/// path, whose entire scattered per-pixel upscale was visible to the scan-out from the first poke to
+/// the last. A bounded number of row-aligned seams is strictly better than that, and is the whole of
+/// the trade.
+///
+/// One thing that does NOT change: [`draw_window`]'s single `flush_range` still runs once, after all
+/// bands, over the box's whole row span. On the non-coherent Pi 4 the bands therefore tend to become
+/// visible together rather than one at a time — a mitigation worth having and NOT a guarantee (a
+/// cache line may be evicted at any point), which is why the seams above are described as real.
 #[allow(clippy::too_many_arguments)]
 fn stage_window(
     fb: &super::FrameBuffer,
@@ -2878,10 +3010,15 @@ fn stage_window(
     }
     // `bw <= pw` and `bh <= ph` (both clipped by the caller), so neither product can wrap.
     let row_bytes = bw * bpp;
-    let need = row_bytes * bh;
-    if need == 0 || need > MAX_STAGE_BYTES {
+    // WC-M — the cap sizes a BAND, not the present. `chunk_rows` is how many whole rows of this box
+    // fit under it; `bh` of them when the box fits outright, which is the pre-WC-M allocation and the
+    // pre-WC-M single-pass present. Zero means one ROW does not fit — the only cap decline left, and
+    // unreachable at any panel width this kernel can address.
+    let chunk_rows = if row_bytes == 0 { 0 } else { (MAX_STAGE_BYTES / row_bytes).min(bh) };
+    if chunk_rows == 0 {
         decline!(super::wcg::DECL_CAP);
     }
+    let need = row_bytes * chunk_rows;
     let mut stage = match STAGE.try_lock() {
         Some(g) => g,
         None => decline!(super::wcg::DECL_LOCK),
@@ -2896,59 +3033,101 @@ fn stage_window(
         stage.resize(need, 0);
     }
 
+    // WC-M — the two halves are now accumulated ACROSS bands rather than read off one pair of
+    // timestamps, so `[wc-h]` keeps reporting the same two quantities for the same present: all of
+    // this window's compose, and all of its panel-facing copy. `stage_note` takes them as
+    // `(t_end, t0, t1)` differences, so a zero base and two running totals feed it unchanged — no
+    // witness signature moves for this arc, which is what lets the x86 tree take this diff as-is.
     #[cfg(feature = "witness")]
-    let t0 = crate::arch::now_cycles();
+    let (mut compose_cyc, mut present_cyc) = (0u64, 0u64);
 
-    // The back layer: same pixel format and bytes/pixel as the panel (so the composed bytes ARE the
-    // panel's bytes and the present is a straight copy), but its own stride — the box width, with no
-    // panel margin — which is what makes each row a single contiguous run.
-    let mut layer = super::FrameBuffer::new();
-    layer.init(
-        stage.as_mut_ptr() as usize,
-        need,
-        unaos_boot_info::FrameBufferInfo {
-            width: bw,
-            height: bh,
-            stride: bw,
-            bytes_per_pixel: bpp,
-            pixel_format: info.pixel_format,
-        },
-    );
-    paint_window(&layer, r, bx, by, bx, by, bw, bh, pw, ph, focused, true);
-
-    // CURSOR-3 — the sprite, LAST into the layer and therefore on top of the window's own content,
-    // and still before a single byte reaches the panel. `compose_into` declines (leaving the layer
-    // exactly as `paint_window` left it) unless the sprite's box is wholly inside this box; it takes
-    // no lock of the sprite module's, only the plan's own `try_lock`, so nothing here enters F4's
-    // drain wait set. Counted either way, so a boot that never manages the overlay says so.
-    if let Some(plan) = cur {
-        let c = super::cursor::compose_into(&layer, bx, by, plan);
-        *overlaid |= c.taken > 0;
-        #[cfg(feature = "witness")]
-        note_cursor_overlay(&c);
-    }
-
-    #[cfg(feature = "witness")]
-    let t1 = crate::arch::now_cycles();
-
-    // Present: one bulk copy per row. This is the whole of what the scan-out can catch mid-flight,
-    // and it is the same primitive and the same shape as `Screen::present_background`'s damage-rect
-    // flush.
     let fb_row = info.stride * bpp;
-    for y in 0..bh {
-        let src = y * row_bytes;
-        fb.blit((by + y) * fb_row + bx * bpp, &stage[src..src + row_bytes]);
+    // WC-M — one band per turn. `band` is the box-relative row the buffer currently holds.
+    let mut band = 0usize;
+    while band < bh {
+        let rows = chunk_rows.min(bh - band);
+
+        #[cfg(feature = "witness")]
+        let b0 = crate::arch::now_cycles();
+
+        // The back layer: same pixel format and bytes/pixel as the panel (so the composed bytes ARE
+        // the panel's bytes and the present is a straight copy), but its own stride — the box width,
+        // with no panel margin — which is what makes each row a single contiguous run. WC-M: its
+        // HEIGHT is the band's, and its length the band's bytes, so every clip `put_pixel` and `blit`
+        // already performed now also fences the compose to the rows this buffer holds.
+        let mut layer = super::FrameBuffer::new();
+        layer.init(
+            stage.as_mut_ptr() as usize,
+            rows * row_bytes,
+            unaos_boot_info::FrameBufferInfo {
+                width: bw,
+                height: rows,
+                stride: bw,
+                bytes_per_pixel: bpp,
+                pixel_format: info.pixel_format,
+            },
+        );
+        // The BOX is still `(bx, by, bw, bh)` — chrome geometry must not move between bands — while
+        // the destination ORIGIN is the band's first panel row. That difference is the whole of the
+        // banding as `paint_window` sees it.
+        paint_window(&layer, r, bx, by + band, bx, by, bw, bh, pw, ph, focused, true);
+
+        // CURSOR-3 — the sprite, LAST into the layer and therefore on top of the window's own
+        // content, and still before a single byte reaches the panel. `compose_into` declines (leaving
+        // the layer exactly as `paint_window` left it) unless the sprite's box is wholly inside this
+        // box; it takes no lock of the sprite module's, only the plan's own `try_lock`, so nothing
+        // here enters F4's drain wait set. Counted either way, so a boot that never manages the
+        // overlay says so.
+        //
+        // WC-M — the offer is made AT MOST ONCE per pass, never once per band. A single-band present
+        // offers unconditionally, exactly as before this arc. A BANDED present offers only to a band
+        // whose rows contain the sprite's box outright: composing a sprite across two bands would
+        // open two overlay sessions inside one composite and publish two plans for one `adopt`, and
+        // no part of CURSOR-3's provenance argument covers that. A sprite straddling a seam is
+        // therefore taken by nobody, `overlaid` stays false, and the caller's WC-I repaint tail puts
+        // it back from the finished front — the same fallback every other decline already uses.
+        if let Some(plan) = cur {
+            let whole = chunk_rows >= bh
+                || (plan.by >= by + band && plan.by + plan.bh <= by + band + rows);
+            if whole {
+                let c = super::cursor::compose_into(&layer, bx, by + band, plan);
+                *overlaid |= c.taken > 0;
+                #[cfg(feature = "witness")]
+                note_cursor_overlay(&c);
+            }
+        }
+
+        #[cfg(feature = "witness")]
+        let b1 = crate::arch::now_cycles();
+
+        // Present: one bulk copy per row. This is the whole of what the scan-out can catch
+        // mid-flight, and it is the same primitive and the same shape as
+        // `Screen::present_background`'s damage-rect flush.
+        for y in 0..rows {
+            let src = y * row_bytes;
+            fb.blit((by + band + y) * fb_row + bx * bpp, &stage[src..src + row_bytes]);
+        }
+
+        #[cfg(feature = "witness")]
+        {
+            compose_cyc += b1.saturating_sub(b0);
+            present_cyc += crate::arch::now_cycles().saturating_sub(b1);
+        }
+        band += rows;
     }
 
+    // `bytes` is the WHOLE box, not the buffer: it is what reached the panel, and on a banded present
+    // it is the number that says banding happened at all (a `-> BUFFERED` line whose `bytes=` exceeds
+    // `MAX_STAGE_BYTES` could not have been staged before this arc).
     #[cfg(feature = "witness")]
     super::wcg::stage_note(
         r.id,
         bw,
         bh,
-        need,
-        crate::arch::now_cycles(),
-        t0,
-        t1,
+        row_bytes * bh,
+        compose_cyc + present_cyc,
+        0,
+        compose_cyc,
         ph,
     );
     true
@@ -3125,7 +3304,12 @@ fn stage_fill(
 
 /// Draw the kernel's copy of the window title into the title strip, 8x8 glyphs, clipped to `max_w`
 /// pixels. Non-printable bytes render as a space, so a hostile title can only ever paint blanks.
-fn draw_title(fb: &super::FrameBuffer, r: &Window, x: usize, y: usize, max_w: usize) {
+/// WC-M — `y` is SIGNED because a chunked stage paints the box into one row-band at a time and the
+/// title sits in the box's first rows, above every band but the first. Glyph rows landing above the
+/// destination are dropped; the rest are drawn at their true position, and `put_pixel` clips the
+/// bottom as it always did. For `y >= 0` — the direct path, and any stage that fits in one band —
+/// this is byte-for-byte the pre-WC-M loop.
+fn draw_title(fb: &super::FrameBuffer, r: &Window, x: usize, y: isize, max_w: usize) {
     let cols = max_w / 8;
     for (i, &b) in r.title[..r.title_len].iter().enumerate() {
         if i >= cols {
@@ -3134,9 +3318,13 @@ fn draw_title(fb: &super::FrameBuffer, r: &Window, x: usize, y: usize, max_w: us
         let ch = if (0x20..0x7f).contains(&b) { b } else { b' ' };
         let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
         for (ry, byte) in bitmap.iter().enumerate() {
+            let dy = y + ry as isize;
+            if dy < 0 {
+                continue;
+            }
             for rx in 0..8 {
                 if byte & (1 << rx) != 0 {
-                    fb.put_pixel(x + i * 8 + rx, y + ry, CHROME_TITLE_FG);
+                    fb.put_pixel(x + i * 8 + rx, dy as usize, CHROME_TITLE_FG);
                 }
             }
         }
