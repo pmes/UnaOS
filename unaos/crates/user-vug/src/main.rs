@@ -114,6 +114,42 @@
 // A one-shot `[vugpause] idle engaged frame=<n>` names the first engagement on the wire; it is latched,
 // never per-frame.
 //
+// VUGMIN — A VUG NOBODY CAN SEE MUST NOT BURN A CORE EITHER. Peter's ruling at P69: "if vug is minimized
+// it should shut off". The audit that opened this arc found that UnaOS has no minimize verb and needs
+// none — the state he named ALREADY exists under another name. `wm::focus_changed`'s shell arm (the
+// operator TABs to the console) pushes every window below `SHELL_Z` and erases its box: the vug is gone
+// from the panel, and its frame loop keeps running at full rate against a surface the compositor will
+// not read. That is VUGPAUSE's exact disease with a different trigger, so it takes VUGPAUSE's exact cure
+// rather than a second mechanism.
+//
+// The kernel publishes "every window you own is hidden" as bit 1 of the RO info page's process-flags
+// word. This program polls it EVERY FRAME — unlike bit 0 (DETACHED), which is fixed before the process
+// runs and is read once at start-up — because it changes underneath a running vug. The poll is one
+// `read_volatile` of a mapped word; it costs less than the branch consuming it, which is why it is
+// unconditional rather than sampled.
+//
+// `hidden` then joins `paused` into `frozen`, and `frozen` replaces `paused` in TWO places, both
+// load-bearing:
+//   * THE ORIENTATION FOLD. A hidden vug holds its orientation exactly as a paused one does. This is not
+//     cosmetic: on the AUTO path the else-arm advances the idle tumble every frame, so without the fold
+//     `ay != last_ay` would hold forever and the skip predicate below could never once be true — the vug
+//     would read its own hidden bit correctly and burn the core anyway.
+//   * THE SKIP PREDICATE's first conjunct, and only the first. `presented` and the state conjuncts still
+//     gate, so a vug hidden before its first present still renders that frame, and the frame that
+//     restores it to the panel is an ordinary rendered frame from the preserved state — restore is a
+//     resume, not a jump.
+// One difference from pause, and it is the ruling itself: the once-per-second fps refresh does NOT run
+// while hidden. A paused vug is on the panel and its readout is owed to the operator; a hidden vug's
+// refresh would be discarded by the compositor, so drawing it is the very waste this arc ends, merely at
+// one hertz. A one-shot `[vugmin] idle engaged frame=<n>` mirrors `[vugpause]`, on its own latch so
+// neither reason can silence the other.
+//
+// DORMANT AS SHIPPED (VUGMIN-A). No kernel path sets bit 1 yet: the two `wm` call sites belong to
+// VUGMIN-B, since `wm.rs` is another session's lane this arc. The bit therefore reads a constant 0 and
+// nothing above is reachable. Note the auto path is untouched even once B lands, and for a stronger
+// reason than pause's: a headless QEMU run has no HID, so nothing ever TABs to the shell, so nothing is
+// ever hidden. `kernel8-test`'s 300-frame checksum proves it both before and after.
+//
 // Barrier direction split (deliberate, robust under QEMU raspi4b's lack of a Group-1 timer IRQ — see
 // docs userspace.md M6e): ARRIVAL (worker -> parent) is a real FUTEX (workers atomically bump `done` +
 // SYS_FUTEX WAKE, the parent SYS_FUTEX WAITs); RELEASE (parent -> worker) is a SYS_YIELD poll on `phase`
@@ -904,7 +940,15 @@ pub extern "C" fn _start() -> ! {
     //
     // Read AFTER SYS_WIN_CREATE, which is what maps the info page and publishes the word — reading it
     // before the window exists would fault on an unmapped VA.
-    let detached = unsafe { ((base + 0x4000) as *const u32).add(0x20 / 4).read_volatile() } & 1 != 0;
+    //
+    // VUGMIN: the same word carries bit 1 = HIDDEN, so the pointer is kept rather than the read being
+    // thrown away. The two bits are read on DIFFERENT schedules and that difference is the whole design:
+    // bit 0 is fixed before the process runs, so one read here is complete; bit 1 changes under a running
+    // process (the operator TABs to the shell and back), so it is re-read every frame in the loop below.
+    // The page is mapped EL0-RO for this process's whole life and a `read_volatile` of a mapped word is
+    // a single load — polling it per frame costs less than the branch that consumes it.
+    let flags_p = unsafe { ((base + 0x4000) as *const u32).add(0x20 / 4) };
+    let detached = unsafe { flags_p.read_volatile() } & 1 != 0;
     let surf_va = base + 0x5000;
     SURF.store(surf_va, Ordering::Release);
     let surf = surf_va as *mut u8;
@@ -993,6 +1037,10 @@ pub extern "C" fn _start() -> ! {
     let mut last_ax: i32 = 0;
     let mut last_dist: Fx = 0;
     let mut idle_witnessed = false;
+    // VUGMIN: a SEPARATE one-shot latch from `idle_witnessed`. The two idle reasons are different facts
+    // about the system — "the operator paused this vug" and "this vug is off-screen" — and a shared latch
+    // would let whichever happened first silence the other forever. One line each, at most, per run.
+    let mut min_witnessed = false;
 
     let mut frame: u32 = 0;
     loop {
@@ -1033,12 +1081,35 @@ pub extern "C" fn _start() -> ! {
             }
         }
 
+        // --- VUGMIN: is this vug currently off-screen? ---
+        // Peter's ruling, P69: "if vug is minimized it should shut off". In UnaOS the state he is naming
+        // is HIDDEN — `wm::focus_changed`'s shell arm pushes every window below `SHELL_Z` and erases its
+        // box, so the vug is gone from the panel while its frame loop runs at full rate. The kernel
+        // publishes that fact as bit 1 of the process-flags word; this is the poll.
+        //
+        // DORMANT UNTIL VUGMIN-B. Nothing in the kernel sets the bit yet (the `wm` call sites are another
+        // session's lane this arc), so today this load always yields 0 and every branch below it is not
+        // taken. That is also exactly why the deterministic auto path is unaffected and the 300-frame
+        // checksum is byte-identical — but note that it would remain byte-identical even once the bit is
+        // live, because nothing in a headless QEMU run ever TABs to the shell.
+        let hidden = unsafe { flags_p.read_volatile() } & 2 != 0;
+        // The state that must HOLD STILL for a frame to be skippable. `paused` is the operator's explicit
+        // request; `hidden` is the same conclusion reached from the other direction — pixels nobody can
+        // see are not worth computing. They are folded into one word here rather than at the predicate
+        // because BOTH halves need them, and the fold below is the half that is easy to miss: without it
+        // a hidden auto-path vug would advance its idle tumble every frame, `ay != last_ay` would hold
+        // forever, and the skip predicate could never once be true. The vug would poll a bit it correctly
+        // read and burn the core anyway.
+        let frozen = paused || hidden;
+
         // --- fold input into rotation/zoom ---
         let manual = interactive && (held != 0 || (dragging && (fi.mdx != 0 || fi.mdy != 0)));
-        if paused {
+        if frozen {
             // VUGCLICK: clicked-to-pause — hold the current orientation. VUGPAUSE: holding it is now
             // also what lets the frame below be skipped entirely; the window stays live because the
-            // idle path keeps polling and yielding, not because it keeps redrawing.
+            // idle path keeps polling and yielding, not because it keeps redrawing. VUGMIN: a hidden
+            // vug holds the identical way, so the orientation the operator left on screen is the
+            // orientation they get back — restore is a resume, not a jump.
         } else if manual {
             let mut yaw = 0i32;
             let mut pit = 0i32;
@@ -1085,17 +1156,40 @@ pub extern "C" fn _start() -> ! {
         // What DOES run is the input half plus one `SYS_YIELD` — the loop is bounded and runnable by
         // construction, never a park (VUGGUARD/P60), so the window stays live and `kill`-able and the
         // click that unpauses is acted on within one iteration.
-        if paused
+        //
+        // VUGMIN widens the FIRST conjunct only, via `frozen`, and deliberately leaves the other four
+        // alone. `presented` still gates, so a vug hidden before its first present renders that first
+        // frame normally rather than idling on an empty surface; the overlay and orientation conjuncts
+        // still gate, so the frame that restores the vug to the panel is a normal rendered frame. The
+        // render state is preserved across the whole hidden interval, which is what makes restore a
+        // resume. Nothing else about the loop changes: same input drain, same yield, same liveness.
+        if frozen
             && presented
             && presented_overlay == (detached || interactive)
             && ay == last_ay
             && ax == last_ax
             && dist == last_dist
         {
-            if !idle_witnessed {
-                idle_witnessed = true;
+            // Name the REASON this idle engaged, not merely that it did — the two are different system
+            // facts and the operator debugging a vug that stopped moving needs to know which. `hidden`
+            // wins the tie because it is the stronger claim: a vug that is BOTH paused and hidden is
+            // off-screen, and that is what an operator wants told.
+            //
+            // ONE emit site, a chosen tag and a chosen latch, rather than two blocks. Not style: this
+            // program is linked into a 16 KiB `USER_REGION_SIZE` and `arroyo` refuses the image outright
+            // if it does not fit. Duplicating the `Buf` + `put_dec` + `flush` sequence for the second
+            // message built a VUG.ELF of 16664 bytes — 280 over the limit, a hard build failure; sharing
+            // the body links at 12568. The two LATCHES stay separate, which is the part that matters:
+            // neither idle reason may silence the other's one-shot line.
+            let (tag, latch): (&[u8], &mut bool) = if hidden {
+                (b"[vugmin] idle engaged frame=", &mut min_witnessed)
+            } else {
+                (b"[vugpause] idle engaged frame=", &mut idle_witnessed)
+            };
+            if !*latch {
+                *latch = true;
                 let mut ib = Buf::new();
-                ib.put(b"[vugpause] idle engaged frame=");
+                ib.put(tag);
                 ib.put_dec(frame);
                 ib.put(b"\n");
                 ib.flush();
@@ -1107,7 +1201,15 @@ pub extern "C" fn _start() -> ! {
             // Keep the fps readout alive and honest (it falls to 0 — `frame` is frozen). A changed
             // digit is the only thing that can still reach the panel while idled: overlay only, one
             // present, at most once per second.
-            if detached || interactive {
+            //
+            // VUGMIN: not while HIDDEN. This is the one place the two idle reasons must behave
+            // differently, and the difference is the ruling itself. A paused vug is ON the panel, so its
+            // readout is something the operator can see and is owed. A hidden vug is not on the panel at
+            // all — every pixel of that refresh is discarded by the compositor — so drawing it would be
+            // exactly the "still burning CPU while minimized" that this arc exists to end, merely at one
+            // hertz instead of sixty. `fps` is left holding its last value; it is stale only while
+            // nobody can read it, and the first rendered frame after restore resumes the refresh.
+            if !hidden && (detached || interactive) {
                 let v = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame);
                 if v != fps {
                     fps = v;

@@ -658,13 +658,19 @@
     | offset | contents |
     | :--- | :--- |
     | `0x00`–`0x1B` | legacy ELF-3 header — magic, w, h, stride, format, size, surface-offset (describes region slot 0) |
-    | `0x20` | **VUG-BG process flags** — bit 0 = `DETACHED` (launched by `bg`, not `run`); rest reserved, zero |
+    | `0x20` | **process flags** — bit 0 = `DETACHED` (VUG-BG: launched by `bg`, not `run`); bit 1 = `HIDDEN` (VUGMIN: every window this process owns sits below the shell's z); rest reserved, zero |
     | `0x24`–`0x3F` | reserved, zero |
     | `0x40 + rslot*0x20` | per region slot — magic, win id, w, h, stride, format, surface-offset; magic 0 = no live window |
 
     Both info-page publishers write the flags word (the legacy header is only refreshed for region slot 0,
     so the per-window publisher writes it too — a process whose first window landed on a higher slot would
-    otherwise read a zeroed, i.e. wrongly "not detached", word).
+    otherwise read a zeroed, i.e. wrongly "not detached", word). Both now go through one
+    `fb_info_flags(slot)` helper, so a future bit cannot reintroduce that split-publisher bug.
+    **The two bits have different lifetimes, and EL0 must read them differently.** Bit 0 is fixed before
+    the process runs, so the write the window verbs perform anyway is always in time and one read at
+    start-up is complete. Bit 1 **changes under a running process**, so `set_hidden` republishes the flags
+    word itself (only that `u32`, single-copy-atomic on the A72 — a concurrent EL0 read sees the old value
+    or the new one, never a tear); EL0 polls it **per frame**.
     `SYS_FB_PRESENT` deliberately does **not** require a window-table row — it presents the region-slot-0
     surface with the legacy accounting either way, so the ELF-3 fb-test verdict cannot regress on table
     exhaustion.
@@ -2010,6 +2016,57 @@
   the faulting task's own kernel stack and must not reach for anything the interrupted context could
   hold. One line per kill, bounded, no new state. No spec pattern matched the old text, so
   `pi4-regression.spec` needed no change.
+
+- **VUGMIN-A (a vug nobody can see stops burning cores too)** — Peter's ruling at **P69**: *"if vug is
+  minimized it should shut off."* The audit that opened the arc found there is **no minimize feature in
+  UnaOS at all** — no `minimized` field on the window table, no minimize verb on `wm`, no chrome
+  hit-testing; `theme::CONTROL_MID` is documented as the "minimise" control fill and has no consumer
+  outside `theme.rs`'s own self-tests. What *does* exist is the state Peter was describing:
+  `wm::focus_changed`'s **shell arm** (the operator TABs to the console) pushes every window below
+  `SHELL_Z` and erases its box. The vug is gone from the panel and its frame loop runs at full rate
+  against a surface the compositor will not read — VUGPAUSE's disease with a different trigger. So the
+  honest name for the state is **HIDDEN**, no new verb is needed, and the cure is VUGPAUSE's idle loop
+  rather than a second mechanism.
+  - **Kernel side.** `HIDDEN_ASIDS: AtomicU64` in `arch/aarch64/syscall.rs`, a deliberate mirror of
+    VUG-BG's `DETACHED_ASIDS` down to the 64-bit bound and the fail-safe direction, published as
+    **bit 1** of the info-page process-flags word (see the layout table above). Public
+    `set_hidden(asid, on)` is the seam for `video::wm`; `clear_hidden(asid)` is called from
+    `boot::teardown_user_slot`'s final-release arm beside `clear_detached`, under the same ordering rule.
+    That clear matters *more* than bit 0's: ASIDs are recycled, and a stale hidden bit would give the next
+    tenant a vug that comes up **already idling** — a window that never draws — having never been hidden.
+  - **The setter is the publisher.** Unlike bit 0, bit 1 changes under a running process, and the
+    info-page writers run only on create/map. Without republishing from `set_hidden` the bit would be an
+    unobservable atomic and the whole mechanism inert.
+  - **EL0 side.** `user-vug` keeps the info-page pointer instead of discarding it after the `DETACHED`
+    read, and polls bit 1 every frame (one `read_volatile` of a mapped word — cheaper than the branch
+    that consumes it). `hidden` folds with `paused` into `frozen`, which replaces `paused` in **two**
+    places, both load-bearing: the **orientation fold** and the **skip predicate's first conjunct**. The
+    fold is the one that is easy to miss — on the auto path the else-arm advances the idle tumble every
+    frame, so without it `ay != last_ay` would hold forever, the predicate could never once be true, and
+    the vug would read its own hidden bit correctly and burn the core anyway. The other four conjuncts are
+    untouched, so a vug hidden before its first present still renders that frame, and the frame that
+    restores it to the panel is an ordinary rendered frame from the preserved state — **restore is a
+    resume, not a jump**.
+  - **One difference from pause, and it is the ruling itself:** the once-per-second fps refresh does
+    **not** run while hidden. A paused vug is on the panel and its readout is owed to the operator; a
+    hidden vug's refresh is discarded by the compositor, so drawing it is the very waste this arc ends,
+    merely at one hertz instead of sixty.
+  - **`SYS_WIN_PRESENT` is not cheap while hidden**, contrary to the assumption the arc started from:
+    `sys_win_present` → `wm_bridge::present` → `wm::present` ends in an unconditional `composite()`, with
+    no visibility predicate anywhere on the path. Suppressing it kernel-side is a `wm.rs` change and is
+    left to VUGMIN-B; the EL0 idle loop is what stops the presents from being issued in the first place.
+  - **Witness:** one-shot `[vugmin] idle engaged frame=<n>`, mirroring `[vugpause]` and on its **own**
+    latch — the two idle reasons are different system facts and a shared latch would let whichever
+    happened first silence the other forever.
+
+  **DORMANT AS SHIPPED, and deliberately so.** VUGMIN-A is plumbing only: **nothing calls `set_hidden`
+  yet**, so bit 1 reads a constant `0` and no EL0 branch above it is reachable. The two call sites belong
+  in `video::wm` (the shell arm that hides, the raise path that unhides), and `wm.rs` was another
+  session's lane during this arc — hence the split. **VUGMIN-B** is that wiring, plus the `wm.rs` present
+  suppression, and until it lands this arc changes no observable behaviour on hardware. The deterministic
+  QEMU auto path is untouched now and stays untouched after B, for a stronger reason than pause's: a
+  headless run has no HID, so nothing ever TABs to the shell, so nothing is ever hidden — the 300-frame
+  `checksum=0xe68285b85121ac7c` witness proves it on both sides of the change.
 
 ### x86_64 (branch `hw-rmbp`)
 

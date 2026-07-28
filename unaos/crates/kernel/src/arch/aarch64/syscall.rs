@@ -10871,18 +10871,124 @@ fn is_detached(asid: u64) -> bool {
     DETACHED_ASIDS.load(Ordering::Acquire) & (1u64 << asid) != 0
 }
 
+/// VUGMIN — one bit per ASID: set while every window that address space owns is HIDDEN, i.e. sitting
+/// below `video::wm`'s `SHELL_Z` and therefore not composited onto the panel at all. Peter's word for
+/// this state is "minimized" (P69: *"if vug is minimized it should shut off"*), and the audit that
+/// opened this arc established that UnaOS has no separate minimize verb and needs none: the shell-focus
+/// arm of `wm::focus_changed` ALREADY pushes every window below the shell's z and erases their boxes.
+/// A vug in that state is invisible and still rendering at full rate — six of them still burn six cores.
+/// So the bit names the condition that actually exists (HIDDEN), not a feature that does not.
+///
+/// A deliberate mirror of `DETACHED_ASIDS` above, down to the 64-bit bound and the fail-safe direction,
+/// for the same reason: the reader is the FB info-page writer, reached with the window table lock held.
+///
+/// DORMANT AS SHIPPED. VUGMIN-A is the plumbing only — nobody calls [`set_hidden`] yet, so the bit is
+/// always 0 and every path below is byte-identical to before. VUGMIN-B wires the two call sites in
+/// `video::wm` (the shell arm that hides, and the raise path that unhides); that file is another
+/// session's lane this arc, which is why the halves are split. Until then EL0's poll is a poll of a
+/// constant zero — correct, cheap, and provably inert.
+static HIDDEN_ASIDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// VUGMIN — record whether ASID `asid`'s windows are currently hidden below the shell. Public because
+/// its callers are VUGMIN-B's, in `video::wm`: this module owns the bitmask and the info page, `wm` owns
+/// the z-order that decides the answer, and this is the seam between them.
+///
+/// Out-of-range ASIDs are ignored on the same argument `set_detached` makes, and fail the same safe way
+/// — an unrepresentable ASID reads back "not hidden", i.e. keeps rendering. A vug that idles when it
+/// should not is a vug that stops responding; a vug that renders when it could idle merely wastes the
+/// core it wastes today. The cheap failure is the one to fail into.
+#[allow(dead_code)] // VUGMIN-B supplies the callers; see the DORMANT note above.
+pub fn set_hidden(asid: u64, on: bool) {
+    debug_assert!(
+        asid < 64,
+        "VUGMIN hidden bitmask is 64-wide; USER_SLOTS grew past it"
+    );
+    if asid == 0 || asid >= 64 {
+        return;
+    }
+    let bit = 1u64 << asid;
+    if on {
+        HIDDEN_ASIDS.fetch_or(bit, Ordering::Release);
+    } else {
+        HIDDEN_ASIDS.fetch_and(!bit, Ordering::Release);
+    }
+    // THE SETTER IS THE PUBLISHER, and it has to be. Bit 0 could leave publication to the info-page
+    // writers because "was I launched detached" is fixed before the process runs, so the write that
+    // `sys_win_create` performs anyway is always in time. Bit 1 CHANGES UNDER A RUNNING PROCESS, and the
+    // info-page writers run only on create/map — a vug that is hidden while it renders would never see
+    // the bit at all, and the whole mechanism would be an unobservable atomic. Republishing here is what
+    // makes EL0's per-frame poll able to observe anything, and it keeps VUGMIN-B to a bare call.
+    //
+    // Only the flags WORD is rewritten: the geometry fields belong to the info-page writers, which own
+    // the window table's view of them, and touching them from here would race those writers for no
+    // reason. A u32 store is single-copy-atomic on this A72, so a concurrent EL0 read sees the old value
+    // or the new one and never a tear.
+    //
+    // Writing a slot with no live window is harmless and deliberately unguarded: the page is per-slot
+    // kernel backing that exists for the slot's whole life, teardown zeroes it, and `clear_hidden` at the
+    // teardown funnel means a dead slot's word cannot outlive its owner.
+    let slot = (asid - 1) as usize;
+    if slot < super::boot::USER_SLOTS {
+        let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
+        // SAFETY: `slot < USER_SLOTS` is the bound `slot_fb_info_ptr` itself asserts, and `FB_INFO_FLAGS`
+        // is inside the info page — the same pointer and index the two info-page writers use.
+        unsafe { info.add(FB_INFO_FLAGS).write_volatile(fb_info_flags(slot)) };
+    }
+}
+
+/// VUGMIN — clear ASID `asid`'s hidden bit. Called from `boot::teardown_user_slot`'s FINAL-release arm
+/// beside `clear_detached`, under the identical ordering rule and for the identical reason: ASIDs are
+/// RECYCLED, so without this a slot last used by a vug that was hidden when it died would hand its stale
+/// bit to the next tenant — which would come up already idling, having never been hidden at all. That is
+/// the worse of the two failure directions (a window that draws nothing), so it is the one closed here
+/// at the funnel rather than at each launcher.
+#[cfg(feature = "baremetal")]
+pub fn clear_hidden(asid: u64) {
+    set_hidden(asid, false);
+}
+
+/// VUGMIN — are ASID `asid`'s windows currently hidden below the shell?
+fn is_hidden(asid: u64) -> bool {
+    if asid == 0 || asid >= 64 {
+        return false;
+    }
+    HIDDEN_ASIDS.load(Ordering::Acquire) & (1u64 << asid) != 0
+}
+
 /// VUG-BG — u32 index of the PROCESS-FLAGS word in the RO info page, in the reserved gap between the
-/// legacy ELF-3 header (`[0x00..0x1C]`) and the per-window entries (`0x40 + r*0x20`). Bit 0 = DETACHED.
+/// legacy ELF-3 header (`[0x00..0x1C]`) and the per-window entries (`0x40 + r*0x20`). Bit 0 = DETACHED,
+/// bit 1 = HIDDEN (VUGMIN).
 const FB_INFO_FLAGS: usize = 0x20 / 4;
 /// VUG-BG — bit 0 of `FB_INFO_FLAGS`: this process was launched by `bg`, not by `run`.
 const FB_FLAG_DETACHED: u32 = 1 << 0;
+/// VUGMIN — bit 1 of `FB_INFO_FLAGS`: every window this process owns is hidden below the shell's z, so
+/// nothing it renders can reach the panel. EL0 polls this EVERY FRAME (unlike bit 0, which a program
+/// reads once at start-up), because unlike "was I launched detached" it changes under a running process.
+const FB_FLAG_HIDDEN: u32 = 1 << 1;
+
+/// VUG-BG + VUGMIN — the PROCESS-FLAGS word for `slot`, as published into its RO info page. Factored out
+/// because BOTH info-page writers must publish the identical word: `fb_info_write_legacy` refreshes only
+/// region slot 0, so a process whose first window landed on a higher slot would otherwise read a zeroed
+/// flags word from `fb_info_write_win` — the bug VUG-BG already had to fix once for bit 0 alone. One
+/// function means bit 2 cannot reintroduce it. `slot + 1` is the ASID (every caller derives
+/// `slot = asid - 1` from `win_caller_slot`).
+fn fb_info_flags(slot: usize) -> u32 {
+    let asid = slot as u64 + 1;
+    let mut f = 0u32;
+    if is_detached(asid) {
+        f |= FB_FLAG_DETACHED;
+    }
+    if is_hidden(asid) {
+        f |= FB_FLAG_HIDDEN;
+    }
+    f
+}
 
 fn fb_info_write_legacy(slot: usize) {
     let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
     // VUG-BG: the process-flags word rides along with every legacy-header publication, so it is present
-    // by the time any window verb has returned a mapped surface to the caller. `slot + 1` is the ASID
-    // (`win_caller_slot` returns the ASID and every caller derives `slot = asid - 1`).
-    let flags = if is_detached(slot as u64 + 1) { FB_FLAG_DETACHED } else { 0 };
+    // by the time any window verb has returned a mapped surface to the caller.
+    let flags = fb_info_flags(slot);
     unsafe {
         info.add(FB_INFO_FLAGS).write_volatile(flags);
         info.add(0).write_volatile(FB_MAGIC);
@@ -11146,7 +11252,10 @@ fn win_resolve(asid: u64, win: u64) -> Result<(usize, WinEntry), i64> {
 /// region slot. Layout of the page (all u32, little-endian):
 ///   [0x00..0x1C] the LEGACY ELF-3 header — magic, w, h, stride, format, size, surface_offset — which
 ///                keeps describing region slot 0 so the existing VUG.ELF reads exactly what it always did;
-///   [0x20]       VUG-BG process flags — bit 0 = DETACHED (the process was launched by `bg`, not `run`);
+///   [0x20]       process flags — bit 0 = DETACHED (VUG-BG: launched by `bg`, not `run`); bit 1 =
+///                HIDDEN (VUGMIN: every window this process owns sits below the shell's z, so nothing it
+///                renders reaches the panel). Bit 0 is fixed for the process's life; bit 1 is live and
+///                republished by `set_hidden` itself, so EL0 polls it per frame;
 ///   [0x40 + r*0x20] per region slot `r`: magic, win_id, w, h, stride, size, surface_offset-from-info-base.
 /// A region slot with no live window keeps a zeroed entry (magic 0), so EL0 can tell live from stale.
 fn fb_info_write_win(slot: usize, id: usize, e: &WinEntry) {
@@ -11156,7 +11265,7 @@ fn fb_info_write_win(slot: usize, id: usize, e: &WinEntry) {
     // VUG-BG: publish the process-flags word here too. The legacy header (which also writes it) is only
     // refreshed for region slot 0, so a process whose FIRST window landed on a higher slot would
     // otherwise read a zeroed — i.e. wrongly "not detached" — flags word.
-    let flags = if is_detached(slot as u64 + 1) { FB_FLAG_DETACHED } else { 0 };
+    let flags = fb_info_flags(slot);
     unsafe {
         info.add(FB_INFO_FLAGS).write_volatile(flags);
         let p = info.add(0x40 / 4 + (e.rslot as usize) * (0x20 / 4));

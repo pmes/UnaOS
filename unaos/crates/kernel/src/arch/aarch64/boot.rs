@@ -864,6 +864,12 @@ pub unsafe fn teardown_user_slot(asid: u64) {
     // the dozen in-kernel `alloc_user_slot` fixture launchers — without asking each of them to remember.
     // One durable line at the funnel beats a rule every future launcher has to be told about.
     super::syscall::clear_detached(asid);
+    // VUGMIN teardown-clear: the same funnel and the same ordering, for the HIDDEN bit. It matters MORE
+    // here than for DETACHED, not less: a stale detached bit gives the next tenant an uncapped frame
+    // budget, whereas a stale hidden bit gives it a vug that comes up already idling — a window that
+    // never draws — having never been hidden at all. Both bits are per-ASID and ASIDs are recycled, so
+    // both are cleared here, before the slot is released for reuse below.
+    super::syscall::clear_hidden(asid);
     SLOT_USED[(asid - 1) as usize].store(false, Ordering::Release);
 }
 
