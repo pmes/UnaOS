@@ -23,6 +23,15 @@ pub fn cookies_for(url: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Write API for `document.cookie`: adds one `"name=value; attrs"` string to
+/// the shared jar, scoped to `url`. Malformed urls are dropped silently, as
+/// a browser drops a cookie it cannot scope.
+pub fn set_cookie(url: &str, cookie_str: &str) {
+    if let Ok(parsed) = url::Url::parse(url) {
+        cookie_jar().add_cookie_str(cookie_str, &parsed);
+    }
+}
+
 /// Blocking client builder for the sync JS paths (`fetch`/XHR run on their
 /// own thread, off the tokio runtime). Pre-wired to the shared jar so those
 /// requests carry — and record — the same cookies as the page load.
@@ -174,7 +183,11 @@ pub fn collect_scripts(base_url: &str, html: &str) -> (Vec<Option<String>>, Vec<
             if let Some(src) = attrs.get("src") {
                 let abs = crate::images::resolve(base_url, src);
                 if abs.starts_with("http://") || abs.starts_with("https://") {
-                    if external.len() >= 50 {
+                    // Code-split app shells emit their runtime LAST: a cap
+                    // that drops the tail drops the bootstrap, and every
+                    // chunk already fetched sits inert. 192 clears the
+                    // real-world spread (Yahoo's app router: 52).
+                    if external.len() >= 192 {
                         crate::ledger::record_js("script-fetch-cap-reached");
                         continue;
                     }
@@ -233,6 +246,58 @@ pub fn collect_css_image_urls(base_url: &str, texts: &[&str], out: &mut Vec<Stri
     }
 }
 
+/// CSS properties whose value positions an IMAGE. A `url()` in one of these
+/// is worth fetching even without a recognizable file extension; a `url()` in
+/// `src:` (@font-face) or `cursor:` is not.
+const IMAGE_POSITION_PROPS: &[&str] = &[
+    "background",
+    "background-image",
+    "mask",
+    "mask-image",
+    "-webkit-mask",
+    "-webkit-mask-image",
+    "list-style-image",
+    "border-image",
+    "border-image-source",
+    "content",
+];
+
+/// The property name of the declaration containing byte offset `at`, i.e.
+/// the text between the previous `;`/`{`/`}` and the next `:`.
+fn declaring_property(text: &str, at: usize) -> &str {
+    let head = &text[..at];
+    let decl_start = head.rfind([';', '{', '}']).map(|i| i + 1).unwrap_or(0);
+    let decl = &head[decl_start..];
+    match decl.find(':') {
+        Some(i) => decl[..i].trim(),
+        None => "",
+    }
+}
+///
+/// Extensionless / query-bearing `url()`s are worth a fetch-and-sniff when
+/// (a) they sit in an image-position property, and (b) the path does not
+/// carry a *known non-image* extension. MediaWiki icon masks look like
+/// `/w/load.php?...&image=search&format=original`: no suffix at all, but a
+/// real SVG on the wire. A `.woff2` in `background` still gets skipped.
+fn sniffable_ref(text: &str, url_pos: usize, inner: &str) -> bool {
+    let prop = declaring_property(text, url_pos).to_ascii_lowercase();
+    if !IMAGE_POSITION_PROPS.contains(&prop.as_str()) {
+        return false;
+    }
+    let path_end = inner.find(['?', '#']).unwrap_or(inner.len());
+    let has_query = inner[path_end..].starts_with('?');
+    if has_query {
+        return true; // a query means the path's suffix says nothing (load.php)
+    }
+    // No query: trust an extension if there is one — it isn't an image type
+    // (we already checked the raster list), so don't spend a request on it.
+    let tail = inner[..path_end].rsplit('/').next().unwrap_or("");
+    match tail.rfind('.') {
+        Some(dot) => dot + 1 >= tail.len(), // trailing dot only = no extension
+        None => true,
+    }
+}
+
 /// Scans one CSS text for raster/svg `url(...)` refs. `fetch_base` is the
 /// owning sheet's URL (relative paths live on ITS host); `paint_base` is
 /// the page base — paint-time lookup resolves raw urls against the page,
@@ -244,15 +309,21 @@ pub fn collect_css_image_refs(
     out: &mut Vec<(String, String)>,
 ) {
     let raster = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"];
-    let mut rest: &str = text;
-    while let Some(pos) = rest.find("url(") {
-        rest = &rest[pos + 4..];
-        let Some(end) = rest.find(')') else { break };
-        let inner = rest[..end].trim().trim_matches(|c| c == '"' || c == '\'').trim();
-        rest = &rest[end..];
+    let mut idx = 0usize;
+    while let Some(rel) = text[idx..].find("url(") {
+        let start = idx + rel;
+        let after = start + 4;
+        let Some(end_rel) = text[after..].find(')') else { break };
+        let end = after + end_rel;
+        let inner = text[after..end].trim().trim_matches(|c| c == '"' || c == '\'').trim();
+        idx = end;
+        if inner.is_empty() || inner.starts_with('#') || inner.starts_with("data:") {
+            continue; // fragment refs (svg <mask id>) and inline data both need no fetch
+        }
         let path_end = inner.find(['?', '#']).unwrap_or(inner.len());
-        let is_raster = raster.iter().any(|ext| inner[..path_end].to_ascii_lowercase().ends_with(ext));
-        if !is_raster {
+        let path = inner[..path_end].to_ascii_lowercase();
+        let is_raster = raster.iter().any(|ext| path.ends_with(ext));
+        if !is_raster && !sniffable_ref(text, start, inner) {
             continue;
         }
         let fetch_url = crate::images::resolve(fetch_base, inner);
@@ -263,7 +334,10 @@ pub fn collect_css_image_refs(
         if !out.iter().any(|(f, _)| *f == fetch_url) {
             out.push((fetch_url, key));
         }
-        if out.len() >= 50 {
+        // Cap on the whole ref list (img srcs land here first). A skin like
+        // Vector spends dozens of refs on icon sprites alone, so 50 cut off
+        // the masks; 200 still bounds a hostile sheet.
+        if out.len() >= 200 {
             crate::ledger::record_css("css-image-fetch-cap-reached");
             return;
         }
@@ -281,6 +355,80 @@ pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
         anyhow::bail!("Response body exceeds size limit");
     }
     Ok(bytes.to_vec())
+}
+
+/// Identifies image bytes by magic number. `None` = not an image we decode.
+/// SVG is text, so it is recognized by an `<svg` tag near the head of the
+/// document (an XML prolog / comment / doctype may precede it).
+pub fn sniff_image_kind(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    let head = &bytes[..bytes.len().min(1024)];
+    if head.windows(4).any(|w| w.eq_ignore_ascii_case(b"<svg")) {
+        return Some("image/svg+xml");
+    }
+    None
+}
+
+/// Fetches image bytes with content sniffing: the `Content-Type` header
+/// decides when it is an `image/*` (or uselessly generic), otherwise the
+/// magic bytes do. A non-image response is rejected after ~1 KiB rather
+/// than buffered whole; the 10 MB body cap matches `fetch_bytes`.
+pub async fn fetch_image_bytes(url: &str) -> Result<Vec<u8>> {
+    let mut response = client().get(url).send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("HTTP Error: {}", response.status());
+    }
+    let ctype = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let header_image = ctype.starts_with("image/");
+    // A generic/absent type tells us nothing — fall through to magic bytes.
+    let header_useless = ctype.is_empty()
+        || ctype == "application/octet-stream"
+        || ctype == "binary/octet-stream"
+        || ctype == "text/plain";
+    if !header_image && !header_useless {
+        anyhow::bail!("not an image: {}", ctype);
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let mut sniffed = header_image;
+    while let Some(chunk) = response.chunk().await.context("Failed to read body")? {
+        buf.extend_from_slice(&chunk);
+        if buf.len() > 10 * 1024 * 1024 {
+            anyhow::bail!("Response body exceeds size limit");
+        }
+        if !sniffed && buf.len() >= 1024 {
+            if sniff_image_kind(&buf).is_none() {
+                anyhow::bail!("not an image (magic bytes)");
+            }
+            sniffed = true;
+        }
+    }
+    if !sniffed && sniff_image_kind(&buf).is_none() {
+        anyhow::bail!("not an image (magic bytes)");
+    }
+    Ok(buf)
 }
 
 /// Fetches a page, its external stylesheets, and its images: the async
@@ -323,12 +471,17 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
     for (sheet_url, css) in &sheet_sources {
         collect_css_image_refs(sheet_url, &base, css, &mut refs);
     }
-    // Images likewise fetch concurrently; decode stays on this thread.
-    let img_results = futures_util::future::join_all(
+    // Images fetch concurrently but BOUNDED: a skin's icon sprites plus a
+    // page's photos run to the hundreds, and firing them all at once earns
+    // 429s from upload.wikimedia.org. Decode stays on this thread.
+    use futures_util::StreamExt as _;
+    let img_results: Vec<_> = futures_util::stream::iter(
         refs
             .into_iter()
-            .map(|(u, key)| async move { (fetch_bytes(&u).await, u, key) }),
+            .map(|(u, key)| async move { (fetch_image_bytes(&u).await, u, key) }),
     )
+    .buffer_unordered(8)
+    .collect()
     .await;
     let mut images = Vec::new();
     for (result, img_url, key) in img_results {
@@ -348,7 +501,7 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
                     None => crate::ledger::record_dom(&format!("img-decode-failed:{}", &img_url[..img_url.len().min(48)])),
                 }
             }
-            Err(_) => crate::ledger::record_dom(&format!("img-fetch-failed:{}", &img_url[..img_url.len().min(48)])),
+            Err(e) => crate::ledger::record_dom(&format!("img-fetch-failed:{}: {e}", &img_url[..img_url.len().min(48)])),
         }
     }
     // Scripts: inline bodies fill their slots directly; externals fetch
@@ -400,6 +553,40 @@ mod tests {
         // Host-scoped: a different host sees nothing.
         assert_eq!(cookies_for("https://other.example/"), "");
         assert_eq!(cookies_for("not a url"), "");
+    }
+
+    /// Extensionless / query-bearing url()s: fetched from image-position
+    /// properties (MediaWiki icon masks), skipped elsewhere.
+    #[test]
+    fn test_css_image_refs_extensionless() {
+        let css = "\
+            .icon { mask-image: url(/w/load.php?modules=x&image=search&format=original) }\
+            .b { background-image: url(/icons/search) }\
+            @font-face { src: url(/fonts/x.php?family=a) }\
+            .c { cursor: url(/cur/hand) }\
+            .d { background: url(/style/theme.css) }\
+            .e { mask-image: url(#inline-mask) }";
+        let mut refs = Vec::new();
+        collect_css_image_refs("https://example.com/", "https://example.com/", css, &mut refs);
+        let got: Vec<&str> = refs.iter().map(|(f, _)| f.as_str()).collect();
+        assert_eq!(got, vec![
+            "https://example.com/w/load.php?modules=x&image=search&format=original",
+            "https://example.com/icons/search",
+        ]);
+    }
+
+    #[test]
+    fn test_sniff_image_kind() {
+        assert_eq!(sniff_image_kind(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(sniff_image_kind(b"\xff\xd8\xff\xe0"), Some("image/jpeg"));
+        assert_eq!(sniff_image_kind(b"GIF89a..."), Some("image/gif"));
+        assert_eq!(sniff_image_kind(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(
+            sniff_image_kind(b"<?xml version=\"1.0\"?><!-- c --><svg xmlns=\"...\"/>"),
+            Some("image/svg+xml")
+        );
+        assert_eq!(sniff_image_kind(b"<!doctype html><html>"), None);
+        assert_eq!(sniff_image_kind(b"{\"error\":\"nope\"}"), None);
     }
 
     #[test]
