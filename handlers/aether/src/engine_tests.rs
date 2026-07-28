@@ -1042,6 +1042,99 @@ mod tests {
         assert_eq!(p.hidden, None);
     }
 
+    /// CSS math functions resolve to pixels: nesting, operator precedence,
+    /// unit mixing, min/max/clamp, and an honest None for a percentage with
+    /// no reference.
+    #[test]
+    fn test_css_math_functions() {
+        use crate::css::{eval_length, parse_px};
+        assert_eq!(eval_length("calc(1rem + 4px)", None), Some(20.0));
+        assert_eq!(eval_length("calc(max(calc(1rem + 4px),10px))", None), Some(20.0));
+        assert_eq!(eval_length("max(calc(1rem - 4px),10px)", None), Some(12.0));
+        assert_eq!(eval_length("min(2rem, 12px, 40px)", None), Some(12.0));
+        assert_eq!(eval_length("clamp(10px, 1rem, 12px)", None), Some(12.0));
+        assert_eq!(eval_length("calc(2px + 3px * 4)", None), Some(14.0));
+        assert_eq!(eval_length("calc(100% - 20px)", Some(200.0)), Some(180.0));
+        // No percentage reference: unresolvable, not a silent 0.
+        assert_eq!(eval_length("calc(100% - 20px)", None), None);
+        assert_eq!(eval_length("calc(1px / 0)", None), None);
+        assert_eq!(eval_length("rotate(20deg)", None), None);
+        // parse_px routes math functions through the evaluator; plain
+        // lengths keep their old fast path.
+        assert_eq!(parse_px("calc(1rem + 4px)"), Some(20.0));
+        assert_eq!(parse_px("12px"), Some(12.0));
+    }
+
+    /// The component-CSS icon idiom: the box is sized by `calc()`, and the
+    /// mask geometry lives behind `@supports (mask-image: none)`. Both must
+    /// land, or the stencil paints oversized in a min-width-floor box (the
+    /// icon shows only its top-left corner).
+    #[test]
+    fn test_supports_mask_branch_and_calc_icon_box() {
+        let html = r#"<html><body><span id="i" class="icon"></span></body></html>"#;
+        let document = dom::parse_html(html);
+        let mut layout_tree = layout::compute_layout(&document);
+        css::apply_css(
+            &mut layout_tree,
+            ".icon { min-width: 10px; min-height: 10px; display: inline-block; \
+                     width: calc(var(--fs, 1rem) + 4px); height: calc(var(--fs, 1rem) + 4px); \
+                     mask-image: url(icon.svg) } \
+             @supports not ((-webkit-mask-image: none) or (mask-image: none)) { \
+                .icon { background-size: 99px } } \
+             @supports (-webkit-mask-image: none) or (mask-image: none) { \
+                .icon { mask-position: center; mask-repeat: no-repeat; \
+                        mask-size: calc(max(calc(var(--fs, 1rem) + 4px),10px)) } }",
+        );
+        let (node_id, _) = layout_tree
+            .node_map
+            .iter()
+            .find(|(_, n)| {
+                n.as_element()
+                    .is_some_and(|e| e.attributes.borrow().get("id") == Some("i"))
+            })
+            .map(|(id, n)| (*id, n.clone()))
+            .expect("styled span is in the layout tree");
+        let p = layout_tree.paint_map.get(&node_id).cloned().unwrap_or_default();
+        assert_eq!(p.mask_position.as_deref(), Some("center"), "@supports mask branch must apply");
+        assert_eq!(p.mask_repeat, Some(1));
+        assert_eq!(p.mask_size.as_deref(), Some("calc(max(calc(1rem + 4px),10px))"));
+        // The `@supports not (...)` fallback branch must NOT apply.
+        assert_eq!(p.bg_size, None, "mask support means the background fallback is dead");
+        let l = layout_tree.taffy.layout(node_id).unwrap();
+        assert_eq!(l.size.width, 20.0, "calc() width must beat the min-width floor");
+        assert_eq!(l.size.height, 20.0);
+    }
+
+    /// A mask sized by a math function must fit the box exactly: the sampler
+    /// covers the whole element, not a corner of an oversized stencil.
+    #[test]
+    fn test_mask_geometry_fits_box() {
+        // 20x20 element, 20x20 stencil, mask-size max(calc(1rem+4px),10px):
+        // the four corners of the box map to the four corners of the image.
+        let g = crate::render::test_bg_geometry(
+            Some("max(calc(1rem + 4px),10px)"),
+            Some("center"),
+            Some(1),
+            20.0,
+            20.0,
+            20.0,
+            20.0,
+        );
+        assert_eq!((g.0, g.1, g.2, g.3), (0.0, 0.0, 20.0, 20.0));
+        // Without math support the size would fall back to intrinsic and a
+        // half-size box would clip; check the centring path too.
+        let g = crate::render::test_bg_geometry(
+            Some("calc(1rem - 6px)"),
+            Some("center"),
+            Some(1),
+            20.0,
+            20.0,
+            20.0,
+            20.0,
+        );
+        assert_eq!((g.0, g.1, g.2, g.3), (5.0, 5.0, 10.0, 10.0));
+    }
+
     /// A later, more specific `opacity: 1` un-hides what `opacity: 0` hid,
     /// and `border-color: transparent` drops the UA control stroke.
     #[test]

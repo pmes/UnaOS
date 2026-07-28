@@ -206,6 +206,10 @@ impl BgGeometry {
 /// Returns None for `auto` and unparsed values.
 fn bg_length(token: &str, reference: f32) -> Option<f32> {
     let t = token.trim();
+    // calc()/min()/max()/clamp() — component CSS states icon metrics this way.
+    if t.contains('(') {
+        return crate::css::eval_length(t, Some(reference));
+    }
     if let Some(p) = t.strip_suffix('%') {
         return p.parse::<f32>().ok().map(|p| p / 100.0 * reference);
     }
@@ -220,6 +224,30 @@ fn bg_length(token: &str, reference: f32) -> Option<f32> {
         }
     }
     t.parse::<f32>().ok().filter(|n| *n == 0.0)
+}
+
+/// Splits a background-/mask- component list on whitespace that sits outside
+/// any parentheses, so `max(calc(1rem + 4px), 10px)` stays one token.
+fn split_components(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0i32, 0usize);
+    for (i, c) in value.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            c if c.is_whitespace() && depth <= 0 => {
+                if i > start {
+                    out.push(&value[start..i]);
+                }
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if start < value.len() {
+        out.push(&value[start..]);
+    }
+    out
 }
 
 /// Resolves background-size / background-position / background-repeat into
@@ -247,7 +275,7 @@ fn resolve_bg_geometry(
             h = img_h * s;
         }
         Some(v) if !v.is_empty() && v != "auto" => {
-            let mut it = v.split_whitespace();
+            let mut it = split_components(v).into_iter();
             let a = it.next().unwrap_or("auto");
             let b = it.next();
             let rw = bg_length(a, box_w);
@@ -278,7 +306,7 @@ fn resolve_bg_geometry(
     let mut off_x = 0.0;
     let mut off_y = 0.0;
     if let Some(pos) = position {
-        let tokens: Vec<&str> = pos.split_whitespace().collect();
+        let tokens: Vec<&str> = split_components(pos);
         // Keyword tokens name their own axis; anything else fills
         // horizontal-then-vertical in source order.
         let mut horiz: Option<&str> = None;
@@ -332,6 +360,22 @@ fn resolve_bg_geometry(
     }
 
     BgGeometry { off_x, off_y, w, h, repeat: repeat.unwrap_or(0) }
+}
+
+/// Test hook: the resolved background/mask rectangle as
+/// `(off_x, off_y, w, h)`. Keeps `BgGeometry` private to the renderer.
+#[cfg(test)]
+pub(crate) fn test_bg_geometry(
+    size: Option<&str>,
+    position: Option<&str>,
+    repeat: Option<u8>,
+    box_w: f32,
+    box_h: f32,
+    img_w: f32,
+    img_h: f32,
+) -> (f32, f32, f32, f32) {
+    let g = resolve_bg_geometry(size, position, repeat, box_w, box_h, img_w, img_h);
+    (g.off_x, g.off_y, g.w, g.h)
 }
 
 /// Transforms text based on text-transform property: 0 = none, 1 = uppercase, 2 = lowercase, 3 = capitalize.

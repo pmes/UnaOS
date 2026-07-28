@@ -1366,6 +1366,12 @@ fn property_supported(prop: &str) -> bool {
             | "position" | "top" | "left" | "right" | "bottom" | "text-align" | "justify-content"
             | "background-color" | "background" | "background-image" | "color"
             | "background-size" | "background-position" | "background-repeat"
+            // Alpha-stencil masks really are implemented (render::draw_node),
+            // so the component idiom `@supports (mask-image: none)` must take
+            // the mask branch, not the background-image fallback branch.
+            | "mask" | "mask-image" | "mask-size" | "mask-position" | "mask-repeat"
+            | "-webkit-mask" | "-webkit-mask-image" | "-webkit-mask-size"
+            | "-webkit-mask-position" | "-webkit-mask-repeat"
             | "font-size" | "font-weight" | "line-height" | "visibility"
             | "max-width" | "max-height" | "min-width" | "min-height"
             | "overflow" | "overflow-x" | "overflow-y"
@@ -1488,9 +1494,13 @@ pub fn parse_font_weight(value: &str) -> Option<bool> {
 }
 
 /// Parses a length into pixels: px, rem/em (16px base — em is not
-/// parent-relative, same approximation as font-size), or a bare number.
+/// parent-relative, same approximation as font-size), a math function
+/// (`calc()`/`min()`/`max()`/`clamp()`), or a bare number.
 pub fn parse_px(value: &str) -> Option<f32> {
     let v = value.trim();
+    if v.contains('(') {
+        return eval_length(v, None);
+    }
     if let Some(n) = v
         .strip_suffix("rem")
         .or_else(|| v.strip_suffix("em"))
@@ -1499,6 +1509,161 @@ pub fn parse_px(value: &str) -> Option<f32> {
         return Some(n * 16.0);
     }
     v.strip_suffix("px").unwrap_or(v).trim().parse::<f32>().ok()
+}
+
+/// Evaluates a CSS math expression into pixels: `calc()`, `min()`, `max()`,
+/// `clamp()`, nested parentheses and `+ - * /` over absolute lengths
+/// (px, pt, rem/em at the 16px base) and percentages. `reference` is the
+/// percentage basis; without one a percentage term makes the whole
+/// expression unresolvable so the caller can fall back honestly.
+///
+/// Modern component CSS states nearly every box metric as
+/// `calc(var(--x) + 4px)` / `max(..., 10px)`; without this the declaration
+/// is dropped and the element collapses to its min-* floor.
+pub fn eval_length(value: &str, reference: Option<f32>) -> Option<f32> {
+    let mut p = MathParser { s: value.trim().as_bytes(), i: 0, reference };
+    let v = p.expr()?;
+    p.ws();
+    if p.i != p.s.len() {
+        return None;
+    }
+    v.is_finite().then_some(v)
+}
+
+struct MathParser<'a> {
+    s: &'a [u8],
+    i: usize,
+    reference: Option<f32>,
+}
+
+impl MathParser<'_> {
+    fn ws(&mut self) {
+        while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
+            self.i += 1;
+        }
+    }
+    fn eat(&mut self, c: u8) -> bool {
+        self.ws();
+        if self.i < self.s.len() && self.s[self.i] == c {
+            self.i += 1;
+            return true;
+        }
+        false
+    }
+    /// sum := product (('+' | '-') product)*
+    fn expr(&mut self) -> Option<f32> {
+        let mut acc = self.product()?;
+        loop {
+            self.ws();
+            match self.s.get(self.i) {
+                Some(b'+') => {
+                    self.i += 1;
+                    acc += self.product()?;
+                }
+                Some(b'-') => {
+                    self.i += 1;
+                    acc -= self.product()?;
+                }
+                _ => return Some(acc),
+            }
+        }
+    }
+    /// product := unary (('*' | '/') unary)*
+    fn product(&mut self) -> Option<f32> {
+        let mut acc = self.unary()?;
+        loop {
+            self.ws();
+            match self.s.get(self.i) {
+                Some(b'*') => {
+                    self.i += 1;
+                    acc *= self.unary()?;
+                }
+                Some(b'/') => {
+                    self.i += 1;
+                    let d = self.unary()?;
+                    if d == 0.0 {
+                        return None;
+                    }
+                    acc /= d;
+                }
+                _ => return Some(acc),
+            }
+        }
+    }
+    fn unary(&mut self) -> Option<f32> {
+        self.ws();
+        if self.eat(b'-') {
+            return self.unary().map(|v| -v);
+        }
+        if self.eat(b'+') {
+            return self.unary();
+        }
+        self.atom()
+    }
+    /// atom := '(' sum ')' | function '(' args ')' | number [unit]
+    fn atom(&mut self) -> Option<f32> {
+        self.ws();
+        if self.eat(b'(') {
+            let v = self.expr()?;
+            return self.eat(b')').then_some(v);
+        }
+        let start = self.i;
+        while self
+            .s
+            .get(self.i)
+            .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'-')
+        {
+            self.i += 1;
+        }
+        if self.i > start {
+            let name = std::str::from_utf8(&self.s[start..self.i]).ok()?.to_ascii_lowercase();
+            if !self.eat(b'(') {
+                return None;
+            }
+            let mut args = vec![self.expr()?];
+            while self.eat(b',') {
+                args.push(self.expr()?);
+            }
+            if !self.eat(b')') {
+                return None;
+            }
+            return match (name.as_str(), args.len()) {
+                ("calc", 1) => Some(args[0]),
+                ("min", _) => args.iter().copied().reduce(f32::min),
+                ("max", _) => args.iter().copied().reduce(f32::max),
+                ("clamp", 3) => Some(args[1].clamp(args[0], args[2])),
+                _ => None,
+            };
+        }
+        // number [unit]
+        let nstart = self.i;
+        while self
+            .s
+            .get(self.i)
+            .is_some_and(|c| c.is_ascii_digit() || *c == b'.')
+        {
+            self.i += 1;
+        }
+        if self.i == nstart {
+            return None;
+        }
+        let n: f32 = std::str::from_utf8(&self.s[nstart..self.i]).ok()?.parse().ok()?;
+        let ustart = self.i;
+        if self.s.get(self.i) == Some(&b'%') {
+            self.i += 1;
+            return self.reference.map(|r| n / 100.0 * r);
+        }
+        while self.s.get(self.i).is_some_and(|c| c.is_ascii_alphabetic()) {
+            self.i += 1;
+        }
+        let unit = std::str::from_utf8(&self.s[ustart..self.i]).ok()?.to_ascii_lowercase();
+        match unit.as_str() {
+            "" | "px" => Some(n),
+            "pt" => Some(n * 4.0 / 3.0),
+            "rem" | "em" => Some(n * 16.0),
+            _ => None,
+        }
+    }
 }
 
 /// Parses a 1-4 value box shorthand ("10px", "0 auto", "1px 2px 3px 4px")
