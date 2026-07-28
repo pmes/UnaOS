@@ -128,6 +128,8 @@ pub fn compute_layout_sized(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
 /// immediately run a cascade (which remeasures at the end) use this — the
 /// double full layout per page load was a profiled cost.
 pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
+    // Inline `style="height:100vh"` resolves against this same viewport.
+    crate::css::set_viewport(vw, vh);
     let mut taffy = taffy::TaffyTree::new();
     let mut node_map = HashMap::new();
     let mut paint_map = HashMap::new();
@@ -216,10 +218,11 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
                     width: Dimension::length(24.0),
                     height: Dimension::length(24.0),
                 },
-                _ => Size {
-                    width: Dimension::auto(),
-                    height: if inline { Dimension::auto() } else { Dimension::length(20.0) },
-                },
+                // Everything else: no UA minimum. An empty block box is
+                // zero-tall in CSS; a floor here compounds — pages mount
+                // dozens of empty container/portal divs, and 20px each
+                // pushed the real content below the fold.
+                _ => Size { width: Dimension::auto(), height: Dimension::auto() },
             },
             margin: {
                 // UA default spacing: block gaps for paragraphs/headings,
@@ -232,9 +235,13 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
                         "h1" | "h2" => (12.0, 2.0),
                         "h3" | "h4" | "h5" | "h6" => (10.0, 2.0),
                         "ul" | "ol" => (8.0, 24.0),
-                        "li" => (2.0, 4.0),
+                        "li" => (0.0, 4.0),
                         "body" => (8.0, 8.0),
-                        _ => (2.0, 2.0),
+                        // Generic blocks have NO UA margin in CSS. The old
+                        // 2px-all-round default accumulated once per nesting
+                        // level: a 12-deep shell gained ~24px of indent and
+                        // ~48px of vertical air before any content.
+                        _ => (0.0, 0.0),
                     }
                 };
                 Rect {

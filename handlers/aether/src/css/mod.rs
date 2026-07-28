@@ -737,22 +737,37 @@ fn required_tokens(selector_text: &str) -> Vec<(bool, String)> {
         match bytes[i] {
             b'[' | b'(' => depth += 1,
             b']' | b')' => depth -= 1,
+            b'\\' => i += 1, // escaped char is literal, never a marker
             m @ (b'.' | b'#') if depth == 0 => {
+                // An escaped character inside an identifier (`.md\:block`,
+                // `.w-1\/2`) is part of the NAME; consume it and record the
+                // unescaped token the DOM actually carries.
                 let start = i + 1;
                 let mut j = start;
+                let mut name = String::new();
                 while j < bytes.len() {
                     let c = bytes[j] as char;
-                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    if c == '\\' && j + 1 < bytes.len() {
+                        // Only single-character escapes are handled; a hex
+                        // escape (`\3a `) would need the full CSS grammar.
+                        let n = bytes[j + 1] as char;
+                        if n.is_ascii_hexdigit() {
+                            name.clear();
+                            break;
+                        }
+                        name.push(n);
+                        j += 2;
+                    } else if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        name.push(c);
                         j += 1;
                     } else {
                         break;
                     }
                 }
-                // Escaped names (backslash) aren't parsed — no requirement.
-                if j > start && (j >= bytes.len() || bytes[j] != b'\\') {
-                    out.push((m == b'#', s[start..j].to_string()));
+                if !name.is_empty() {
+                    out.push((m == b'#', name));
                 }
-                i = j;
+                i = j.max(start);
                 continue;
             }
             _ => {}
@@ -827,14 +842,49 @@ enum RuleKey {
 /// (always tested) rather than risking a wrong bucket.
 fn rule_key(selector_text: &str) -> RuleKey {
     let s = selector_text.trim();
-    let mut depth = 0i32;
+    // The rightmost compound, honouring CSS identifier escapes: `\:` and
+    // `\[` inside a class name (`.md\:block`, `.w-1\/2`) are ORDINARY
+    // characters, not the start of a pseudo-class or attribute selector.
+    // Reading them as syntax bucketed every responsive/state utility class
+    // under a truncated key no element could ever carry, so the rule was
+    // never even tested — the whole `md:`/`lg:` layer of a utility-CSS page
+    // silently did nothing.
+    let cut = |hay: &str, stops: &[char]| -> usize {
+        let (mut depth, mut esc) = (0i32, false);
+        for (i, c) in hay.char_indices() {
+            if esc {
+                esc = false;
+                continue;
+            }
+            match c {
+                '\\' => esc = true,
+                // Stop test comes FIRST: `[` is itself a stop character for
+                // the pseudo/attr cut, so it must not open a group before
+                // being recognised (`input[type=text]` keys on `input`).
+                c if depth <= 0 && stops.contains(&c) => return i,
+                '[' | '(' => depth += 1,
+                ']' | ')' => depth -= 1,
+                _ => {}
+            }
+        }
+        hay.len()
+    };
+    // Last unescaped depth-0 combinator starts the rightmost compound.
     let mut start = 0;
-    for (i, c) in s.char_indices() {
-        match c {
-            '[' | '(' => depth += 1,
-            ']' | ')' => depth -= 1,
-            ' ' | '\t' | '>' | '+' | '~' if depth == 0 => start = i + c.len_utf8(),
-            _ => {}
+    {
+        let (mut depth, mut esc) = (0i32, false);
+        for (i, c) in s.char_indices() {
+            if esc {
+                esc = false;
+                continue;
+            }
+            match c {
+                '\\' => esc = true,
+                '[' | '(' => depth += 1,
+                ']' | ')' => depth -= 1,
+                ' ' | '\t' | '>' | '+' | '~' if depth <= 0 => start = i + c.len_utf8(),
+                _ => {}
+            }
         }
     }
     let comp = s[start..].trim();
@@ -842,27 +892,127 @@ fn rule_key(selector_text: &str) -> RuleKey {
     // simple-selector prefix before the first ':'/'[' is still a valid
     // bucket key ("li:first-child" can only match an <li>). A compound that
     // STARTS with ':'/'[' gives no such guarantee → Universal.
-    let comp = &comp[..comp.find([':', '[']).unwrap_or(comp.len())];
-    if let Some(p) = comp.rfind('.') {
-        let rest = &comp[p + 1..];
-        let end = rest.find(['.', '#']).unwrap_or(rest.len());
-        if !rest[..end].is_empty() {
-            return RuleKey::Class(rest[..end].to_string());
+    let comp = &comp[..cut(comp, &[':', '['])];
+    // Rightmost unescaped '.' / '#' marker in the compound.
+    let (mut last_dot, mut last_hash, mut first_marker) = (None, None, None);
+    {
+        let mut esc = false;
+        for (i, c) in comp.char_indices() {
+            if esc {
+                esc = false;
+                continue;
+            }
+            match c {
+                '\\' => esc = true,
+                '.' | '#' => {
+                    if first_marker.is_none() {
+                        first_marker = Some(i);
+                    }
+                    if c == '.' {
+                        last_dot = Some(i);
+                    } else {
+                        last_hash = Some(i);
+                    }
+                }
+                _ => {}
+            }
         }
     }
-    if let Some(p) = comp.rfind('#') {
+    // Strips the backslashes from an escaped identifier so the key matches
+    // the class/id string the DOM actually carries.
+    let unescape = |s: &str| -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut esc = false;
+        for c in s.chars() {
+            if esc {
+                out.push(c);
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    if let Some(p) = last_dot {
         let rest = &comp[p + 1..];
-        let end = rest.find(['.', '#']).unwrap_or(rest.len());
-        if !rest[..end].is_empty() {
-            return RuleKey::Id(rest[..end].to_string());
+        let name = unescape(&rest[..cut(rest, &['.', '#'])]);
+        if !name.is_empty() {
+            return RuleKey::Class(name);
         }
     }
-    let end = comp.find(['.', '#']).unwrap_or(comp.len());
+    if let Some(p) = last_hash {
+        let rest = &comp[p + 1..];
+        let name = unescape(&rest[..cut(rest, &['.', '#'])]);
+        if !name.is_empty() {
+            return RuleKey::Id(name);
+        }
+    }
+    let end = first_marker.unwrap_or(comp.len());
     let tag = comp[..end].trim();
     if tag.is_empty() || tag == "*" {
         RuleKey::Universal
     } else {
         RuleKey::Tag(tag.to_ascii_lowercase())
+    }
+}
+
+/// Splits a selector list on the commas that actually separate selectors:
+/// a comma inside `:is(...)`, `[attr="a,b"]`, or any function is part of
+/// one selector, not a separator.
+pub(crate) fn split_selector_list(prelude: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start, mut quote, mut escaped) = (0i32, 0usize, None::<char>, false);
+    for (i, c) in prelude.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            q if Some(q) == quote => quote = None,
+            _ if quote.is_some() => {}
+            '"' | '\'' => quote = Some(c),
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth <= 0 => {
+                out.push(prelude[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(prelude[start..].trim());
+    out.retain(|s| !s.is_empty());
+    out
+}
+
+/// Compiles a selector list, keeping every selector the engine accepts.
+///
+/// Servo's selector parser rejects the whole list when ANY member uses
+/// syntax it doesn't implement. Component CSS (and every Tailwind build)
+/// ships long comma lists where one `:focus-visible` or `:has()` member
+/// would otherwise discard the declarations for all its siblings — on a
+/// typical shell that is hundreds of live rules lost, which is why whole
+/// headers and nav bars never got their layout properties. Recompiling
+/// member-by-member keeps the supported ones and ledgers only the rest.
+fn compile_selector_list(prelude: &str) -> Option<kuchiki::Selectors> {
+    if let Ok(s) = kuchiki::Selectors::compile(prelude) {
+        return Some(s);
+    }
+    let parts = split_selector_list(prelude);
+    let mut kept = Vec::new();
+    for part in parts {
+        match kuchiki::Selectors::compile(part) {
+            Ok(s) => kept.extend(s.0),
+            Err(_) => crate::ledger::record_css(&format!("selector-compile-failed:{}", clip(part))),
+        }
+    }
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kuchiki::Selectors(kept))
     }
 }
 
@@ -923,6 +1073,7 @@ fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
 /// normal rules, below `!important` rules; inline `!important` wins all.
 pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     let vw = layout_tree.viewport.0;
+    set_viewport(vw, layout_tree.viewport.1);
     // Custom properties first, so every rule's var() can resolve.
     CUSTOM_PROPS.with(|m| {
         let mut map = m.borrow_mut();
@@ -1169,12 +1320,9 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
             continue;
         }
         // Compile with kuchiki's real selector engine (servo selectors).
-        let selectors = match kuchiki::Selectors::compile(&prelude) {
-            Ok(s) => s,
-            Err(_) => {
-                crate::ledger::record_css(&format!("selector-compile-failed:{}", clip(&prelude)));
-                continue;
-            }
+        let selectors = match compile_selector_list(&prelude) {
+            Some(s) => s,
+            None => continue,
         };
 
         let (normal, important, has_important) = parse_declaration_block_tiers(&body);
@@ -1188,7 +1336,7 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
         }
         if has_important {
             // Selector isn't Clone; the important tier compiles its own copy.
-            if let Ok(selectors) = kuchiki::Selectors::compile(&prelude) {
+            if let Some(selectors) = compile_selector_list(&prelude) {
                 let important = std::rc::Rc::new(important);
                 for selector in selectors.0 {
                     let text = selector.to_string();
@@ -1501,6 +1649,9 @@ pub fn parse_px(value: &str) -> Option<f32> {
     if v.contains('(') {
         return eval_length(v, None);
     }
+    if let Some(px) = parse_viewport_length(v) {
+        return Some(px);
+    }
     if let Some(n) = v
         .strip_suffix("rem")
         .or_else(|| v.strip_suffix("em"))
@@ -1509,6 +1660,45 @@ pub fn parse_px(value: &str) -> Option<f32> {
         return Some(n * 16.0);
     }
     v.strip_suffix("px").unwrap_or(v).trim().parse::<f32>().ok()
+}
+
+thread_local! {
+    /// Viewport the cascade resolves `vh`/`vw` against. Set by the layout
+    /// builder and the cascade entry point; both know the real size.
+    static VIEWPORT: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((800.0, 600.0)) };
+}
+
+/// Records the viewport that viewport-relative units resolve against.
+pub fn set_viewport(w: f32, h: f32) {
+    VIEWPORT.with(|v| v.set((w.max(1.0), h.max(1.0))));
+}
+
+/// Resolves a viewport-relative length (`vh`, `vw`, `vmin`, `vmax`, and the
+/// dynamic/small/large `dvh`/`svh`/`lvh` family — with no browser chrome to
+/// collapse, all three equal the viewport). `height: 100vh` is how nearly
+/// every modern shell states its full-height column; dropping it collapsed
+/// those columns to their content and stacked the page wrong.
+pub(crate) fn parse_viewport_length(v: &str) -> Option<f32> {
+    let v = v.trim();
+    let (vw, vh) = VIEWPORT.with(|c| c.get());
+    // Longest suffixes first: `dvh` must not be read as `vh` with a stray d.
+    for (unit, basis) in [
+        ("dvmin", vw.min(vh)), ("svmin", vw.min(vh)), ("lvmin", vw.min(vh)),
+        ("dvmax", vw.max(vh)), ("svmax", vw.max(vh)), ("lvmax", vw.max(vh)),
+        ("vmin", vw.min(vh)), ("vmax", vw.max(vh)),
+        ("dvh", vh), ("svh", vh), ("lvh", vh),
+        ("dvw", vw), ("svw", vw), ("lvw", vw),
+        ("vh", vh), ("vw", vw),
+    ] {
+        if let Some(n) = v.strip_suffix(unit) {
+            let n = n.trim();
+            // Guard against `rem`/`em` etc. ending in a matched substring.
+            if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+') {
+                return n.parse::<f32>().ok().map(|n| n / 100.0 * basis);
+            }
+        }
+    }
+    None
 }
 
 /// Evaluates a CSS math expression into pixels: `calc()`, `min()`, `max()`,
@@ -1661,7 +1851,8 @@ impl MathParser<'_> {
             "" | "px" => Some(n),
             "pt" => Some(n * 4.0 / 3.0),
             "rem" | "em" => Some(n * 16.0),
-            _ => None,
+            // `calc(100vh - 64px)` is the standard full-height idiom.
+            u => parse_viewport_length(&format!("{}{}", n, u)),
         }
     }
 }
@@ -1796,6 +1987,67 @@ mod tests {
         assert_eq!(rule_key("[hidden]"), RuleKey::Universal);
         // Combinator inside a functional pseudo must not split the compound.
         assert_eq!(rule_key(":is(a > b).x"), RuleKey::Universal);
+        // Escaped punctuation is part of the identifier, not syntax: the
+        // bucket key must be the class string the DOM actually carries.
+        assert_eq!(rule_key(r".md\:block"), RuleKey::Class("md:block".into()));
+        assert_eq!(rule_key(r".lg\:flex:hover"), RuleKey::Class("lg:flex".into()));
+        assert_eq!(rule_key(r".w-1\/2"), RuleKey::Class("w-1/2".into()));
+        assert_eq!(rule_key(r".h-\[5\.75rem\]"), RuleKey::Class("h-[5.75rem]".into()));
+        assert_eq!(rule_key(r"div .md\:grid-cols-2"), RuleKey::Class("md:grid-cols-2".into()));
+    }
+
+    /// A selector list survives one unsupported member: the rest of the
+    /// list still compiles and still styles its elements.
+    #[test]
+    fn test_selector_list_partial_compile() {
+        let mut tree = crate::layout::compute_layout(&crate::dom::parse_html(
+            r#"<html><body><div class="md:block" id="a">x</div><p id="b">y</p></body></html>"#,
+        ));
+        // `:has()`/`:focus-visible` are not in this engine's selector set;
+        // the `p` and the escaped utility class must still get their colour.
+        apply_css(
+            &mut tree,
+            r#"p:has(> em), .md\:block, p { color: rgb(1, 2, 3); }"#,
+        );
+        let mut painted = 0;
+        for (node_id, dom_node) in &tree.node_map {
+            let Some(el) = dom_node.as_element() else { continue };
+            let id = el.attributes.borrow().get("id").map(str::to_string);
+            if matches!(id.as_deref(), Some("a") | Some("b")) {
+                assert_eq!(
+                    tree.paint_map.get(node_id).and_then(|p| p.color),
+                    Some((1, 2, 3)),
+                    "{:?} lost its declarations to an unsupported list member",
+                    id
+                );
+                painted += 1;
+            }
+        }
+        assert_eq!(painted, 2);
+    }
+
+    #[test]
+    fn test_viewport_units() {
+        set_viewport(1000.0, 500.0);
+        assert_eq!(parse_px("100vh"), Some(500.0));
+        assert_eq!(parse_px("50vw"), Some(500.0));
+        assert_eq!(parse_px("100dvh"), Some(500.0));
+        assert_eq!(parse_px("100svh"), Some(500.0));
+        assert_eq!(parse_px("100vmin"), Some(500.0));
+        assert_eq!(parse_px("100vmax"), Some(1000.0));
+        assert_eq!(eval_length("calc(100vh - 64px)", None), Some(436.0));
+        // Units that merely contain "vw"/"vh" letters must not be misread.
+        assert_eq!(parse_px("2rem"), Some(32.0));
+        assert_eq!(parse_px("10px"), Some(10.0));
+        set_viewport(800.0, 600.0);
+    }
+
+    #[test]
+    fn test_split_selector_list() {
+        assert_eq!(split_selector_list("a, b"), vec!["a", "b"]);
+        assert_eq!(split_selector_list(":is(a, b), c"), vec![":is(a, b)", "c"]);
+        assert_eq!(split_selector_list(r#"[x="a,b"], d"#), vec![r#"[x="a,b"]"#, "d"]);
+        assert_eq!(split_selector_list("*,:after,:before"), vec!["*", ":after", ":before"]);
     }
 
     #[test]

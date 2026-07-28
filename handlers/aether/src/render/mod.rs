@@ -476,6 +476,54 @@ fn draw_text(
     }
 }
 
+/// UNAOS_LAYOUTDUMP=<max-depth>: writes the computed box tree (tag, id/class,
+/// rect, display, paint gates) to stderr. Diagnostic only — off by default.
+pub fn dump_layout(layout: &LayoutTree) {
+    let Ok(max_depth) = std::env::var("UNAOS_LAYOUTDUMP") else { return };
+    let max_depth: usize = max_depth.trim().parse().unwrap_or(6);
+    fn walk(layout: &LayoutTree, id: NodeId, x: f32, y: f32, depth: usize, max_depth: usize) {
+        let Ok(b) = layout.taffy.layout(id) else { return };
+        let (cx, cy) = (x + b.location.x, y + b.location.y);
+        if depth <= max_depth {
+            let st = layout.taffy.style(id);
+            let disp = st.map(|s| format!("{:?}", s.display)).unwrap_or_default();
+            let p = layout.paint_map.get(&id);
+            let mut desc = String::new();
+            if let Some(n) = layout.node_map.get(&id) {
+                if let Some(el) = n.as_element() {
+                    desc.push_str(el.name.local.as_ref());
+                    let a = el.attributes.borrow();
+                    if let Some(i) = a.get("id") {
+                        desc.push_str(&format!("#{}", i));
+                    }
+                    if let Some(c) = a.get("class") {
+                        desc.push_str(&format!(".{}", &c[..c.len().min(60)]));
+                    }
+                } else if n.as_text().is_some() {
+                    let t = n.text_contents();
+                    let t = t.trim();
+                    desc = format!("\"{}\"", &t[..t.len().min(40)]);
+                }
+            }
+            eprintln!(
+                "{:indent$}{} @({:.0},{:.0}) {:.0}x{:.0} {} hid={:?} clip={:?}",
+                "", desc, cx, cy, b.size.width, b.size.height, disp,
+                p.and_then(|p| p.hidden), p.and_then(|p| p.clip),
+                indent = depth * 2,
+            );
+        }
+        if depth >= max_depth {
+            return;
+        }
+        if let Ok(kids) = layout.taffy.children(id) {
+            for k in kids {
+                walk(layout, k, cx, cy, depth + 1, max_depth);
+            }
+        }
+    }
+    walk(layout, layout.root_node, 0.0, 0.0, 0, max_depth);
+}
+
 pub fn render_frame(
     layout: &LayoutTree,
     surface: &mut [u8],
@@ -488,6 +536,7 @@ pub fn render_frame(
     if damage_rects.is_empty() {
         return;
     }
+    dump_layout(layout);
 
     // Clear damaged regions to the page background.
     for &(dx, dy, dw, dh) in damage_rects {
@@ -792,17 +841,23 @@ pub fn render_frame(
                             }
                         }
                     };
-                    if let Some((w, c)) = sides[0] {
-                        stroke(x_start, y_start, end_x, y_start.saturating_add(w.max(1.0) as u32), c);
+                    // A zero-width side draws NOTHING. `border-width: 0`
+                    // with a style and colour still set is the single most
+                    // common declaration on the web (every Tailwind/reset
+                    // preflight opens with it); rounding it up to a hairline
+                    // outlines every box on the page.
+                    let px = |w: f32| if w > 0.0 { w.max(1.0) as u32 } else { 0 };
+                    if let Some((w, c)) = sides[0].filter(|(w, _)| *w > 0.0) {
+                        stroke(x_start, y_start, end_x, y_start.saturating_add(px(w)), c);
                     }
-                    if let Some((w, c)) = sides[2] {
-                        stroke(x_start, end_y.saturating_sub(w.max(1.0) as u32), end_x, end_y, c);
+                    if let Some((w, c)) = sides[2].filter(|(w, _)| *w > 0.0) {
+                        stroke(x_start, end_y.saturating_sub(px(w)), end_x, end_y, c);
                     }
-                    if let Some((w, c)) = sides[3] {
-                        stroke(x_start, y_start, x_start.saturating_add(w.max(1.0) as u32), end_y, c);
+                    if let Some((w, c)) = sides[3].filter(|(w, _)| *w > 0.0) {
+                        stroke(x_start, y_start, x_start.saturating_add(px(w)), end_y, c);
                     }
-                    if let Some((w, c)) = sides[1] {
-                        stroke(end_x.saturating_sub(w.max(1.0) as u32), y_start, end_x, end_y, c);
+                    if let Some((w, c)) = sides[1].filter(|(w, _)| *w > 0.0) {
+                        stroke(end_x.saturating_sub(px(w)), y_start, end_x, end_y, c);
                     }
                 }
             } else if dom_node.as_text().is_some() && !inherited.text_hidden {
