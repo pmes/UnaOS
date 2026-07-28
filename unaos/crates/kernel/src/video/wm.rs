@@ -1131,12 +1131,33 @@ pub fn count() -> usize {
 /// [`super::cursor::compose_into`]) the panel already has it, and the tail's job is to tell the
 /// sprite module so rather than to paint anything: [`super::cursor::adopt_overlay`] installs the
 /// plan and, in the common case, writes no pixels at all.
+/// CURSOR-7 — a FOURTH outcome, layered on the three above rather than replacing any of them. A
+/// present in this pass (or a concurrent one) wrote over a live sprite that no bracket had handed
+/// back, so the panel no longer holds the arrow the module believes is on it. The blit itself cannot
+/// repair that — it runs inside the `BlitGuard` window, where `SPRITE` may not be taken — so the
+/// repair is a whole-sprite [`super::cursor::repaint`] here, outside the guard, on exactly the footing
+/// the `Repaint` tail has had since WC-I. See `cursor::PRESENT_DIRTY`.
 pub fn composite() {
-    let tail = composite_inner();
+    let mut tail = composite_inner();
+    // CURSOR-7 — read BEFORE the tail runs, so a repaint the tail is already going to do is not
+    // duplicated, and a pass that would otherwise have done nothing at all is upgraded.
+    let dirty = super::cursor::take_present_dirty();
+    if dirty && tail == CursorTail::Untouched {
+        tail = CursorTail::Repaint;
+    }
     #[cfg(feature = "witness")]
     note_cursor_tail(tail);
     match tail {
-        CursorTail::Adopt => super::cursor::adopt_overlay(),
+        CursorTail::Adopt => {
+            // `adopt_overlay` is the ONLY closer of the overlay session, so `Adopt` is never
+            // downgraded — a pass that skipped it would leak the session and lock the whole overlay
+            // mechanism out for the rest of the boot. The repair is appended AFTER it instead: the
+            // session is closed and the sprite is then re-established from the finished front.
+            super::cursor::adopt_overlay();
+            if dirty {
+                super::cursor::repaint();
+            }
+        }
         CursorTail::Repaint => super::cursor::repaint(),
         CursorTail::Untouched => super::cursor::ensure_drawn(),
     }
@@ -1489,6 +1510,10 @@ fn composite_inner() -> CursorTail {
             focus != 0 && focus == rows[i].owner_asid,
             plan,
             may_overlay,
+            // CURSOR-7 — `disturbed`, not `plan.is_some()`: the question the present-overlap test has
+            // to answer is "does this pass's TAIL owe the sprite a repaint", and both `Adopt` and
+            // `Repaint` do. It is final by here (nothing below the bracket block writes it).
+            disturbed,
         );
         #[cfg(feature = "witness")]
         if let Some(p) = wcg_probe {
@@ -1735,7 +1760,11 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
     let focus = focus_asid();
     // CURSOR-3: `None` — this redraw exists to put the window's OWN pixels back after the invalidate,
     // and it runs on the one pass whose read-back forbade the overlay in the first place.
-    draw_window(fb, r, focus != 0 && focus == r.owner_asid, None, false);
+    // CURSOR-7: `bracketed = false`, conservatively. This redraw does not know the enclosing pass's
+    // `disturbed`, and the safe direction is to assume nothing owes the sprite a repaint: a live arrow
+    // under these rows then arms the tail repair. The cost of being wrong is one spurious whole-sprite
+    // repaint on the one-shot verify pass per window; the cost of the other guess is an erased arrow.
+    draw_window(fb, r, focus != 0 && focus == r.owner_asid, None, false, false);
 }
 
 /// WC-D — window ids whose [`verify_window`] verdict has already been emitted (bit `id`), so the read-back
@@ -2575,6 +2604,7 @@ fn draw_window(
     focused: bool,
     cur: Option<super::cursor::Plan>,
     may_overlay: bool,
+    bracketed: bool,
 ) -> bool {
     // `stride`/`scale` are divisors below and `surf_len` bounds the reads, so all four are checked
     // here rather than trusted from the row.
@@ -2616,30 +2646,39 @@ fn draw_window(
             super::cursor::note_uncover_lost();
         }
     }
-    // CURSOR-6 — THE DIRECT MEASUREMENT. This window's pixels are on the panel now; did they land on
-    // a LIVE arrow, and was the arrow protected when they did?
+    // CURSOR-6 — THE DIRECT MEASUREMENT, and CURSOR-7 — THE REPAIR IT ARMS. This window's pixels are
+    // on the panel now; did they land on a LIVE arrow, and was the arrow protected when they did?
     //
-    // `cur.is_some()` is exactly "this pass opened an overlay session and mask-undrew the sprite over
-    // every window that meets it" — the paint set `composite_inner` builds is independent of the
-    // per-window `may_overlay` exclusion, so a plan in hand means the bracket ran whether or not this
-    // particular window was allowed to compose. Those pixels were handed back before the blit and the
-    // pass's tail owes them a repaint: healthy, and counted as the denominator.
+    // `bracketed` is the pass's `disturbed`: it took the sprite down — fully, or masked to its paint
+    // set — and its tail is therefore `Adopt` or `Repaint`, both of which put the arrow back. Those
+    // pixels are owed a repaint by construction: healthy, and counted as the denominator.
     //
-    // `cur.is_none()` with a live sprite over this box is the defect. The pass took no plan — the
-    // sprite was not on the panel when `sprite_plan()` was called, or no window met it then — and it
-    // is now blitting window content over an arrow nothing handed back. Those pixels hold the arrow
-    // before the blit and window content after it, no path tells the sprite module, and the module's
-    // own bookkeeping stays perfectly self-consistent throughout. That is why every CURSOR-5 counter
-    // can read `COHERENT` while the panel is spotty, and it is the one thing none of them can see.
+    // CURSOR-6 asked the narrower question `cur.is_some()`, and so charged the SESSIONLESS masked
+    // undraw — the `overlay_open` refusal that IS the VUGPAR steady state — as an unbracketed
+    // overwrite, although that path hands the pixels back (`undraw_within_nosession`) and takes a
+    // `Repaint` tail. Part of P67v2's `present_over=9/s` was that misclassification. The rest was real,
+    // and is what follows.
     //
-    // `live_box_relaxed` is two relaxed atomics and no lock, so this is admissible inside the
-    // `BlitGuard` window where `sprite_box()` (which takes `SPRITE`) would not be. Diagnostic only —
-    // no pixel decision is taken from it, so a box one pointer report stale costs precision and
-    // nothing else.
-    #[cfg(feature = "witness")]
+    // `!bracketed` with a live sprite over this box is the real defect: the pass took no plan and no
+    // bracket — the sprite was not on the panel when `sprite_plan()` was called, or no window met it
+    // then, and it has arrived or moved since — so this blit is writing window content over an arrow
+    // nothing handed back, no path tells the sprite module, and the module's own bookkeeping stays
+    // perfectly self-consistent throughout. That is why every CURSOR-5 counter can read `COHERENT`
+    // while the panel is spotty. Before CURSOR-7 the pass's tail was then `Untouched` — `ensure_drawn`,
+    // a no-op while `sp.drawn` — and NOTHING repainted the arrow until the pointer moved again.
+    //
+    // Nothing here can repair it: this runs inside the `BlitGuard` window, where taking `SPRITE` would
+    // put a blocking wait into F4's drain barrier (§WEDGE-1). So the call ARMS a relaxed flag, and
+    // `composite` consumes it after the guard is gone and turns the pass's tail into a whole-sprite
+    // repaint. See `cursor::PRESENT_DIRTY` for why the tail is the only admissible place.
+    //
+    // No longer `#[cfg(feature = "witness")]`: the arming is MECHANISM now, not instrumentation, and a
+    // production build that skipped it would keep the defect. `live_box_relaxed` is two relaxed atomics
+    // and no lock, which is exactly what makes it admissible here. The box may be one pointer report
+    // stale and is deliberately over-count-biased, so its worst outcome is a spurious tail repaint.
     if let Some(sb) = super::cursor::live_box_relaxed() {
         if boxes_overlap(sb, (bx, by, bw, bh)) {
-            super::cursor::note_present_over_sprite(cur.is_some());
+            super::cursor::note_present_over_sprite(bracketed);
         }
     }
 
