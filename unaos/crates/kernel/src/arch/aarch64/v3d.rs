@@ -7096,6 +7096,173 @@ fn v3d64_mux_calibration() {
         ":: V3D: [v3d64] muxcal verdict — {} of 3 legs valid; sweep ids {:?} classified by BEHAVIOUR ONLY (CLOCK-LIKE / WORK-GATED-RENDER / SILENT / OTHER). NO source id is named here and none may be inferred from this line: a class says how a mux responded to a pure-idle window, a retiring CT1 render frame and a bin kick, and says nothing about which unit it counts. THE STANDING RULE THIS ESTABLISHES: when a later arc transcribes an id from `enum drm_v3d_perfcnt` and cross-checks it against this file's verified anchors (16 valid_instr, 32 cycle_count), the transcribed NAME MUST MATCH THE CLASS MEASURED HERE — a name implying render/primitive work on a mux measured CLOCK-LIKE, or a clock/cycle name on a mux measured WORK-GATED-RENDER, is REJECTED as mis-transcribed. Calibration checks the transcription, never the reverse ::",
         valid_n, V3D63_SWEEP_SRC
     );
+
+    // PI-V3D-65: submit this arc's single transcribed source id to the rule the line above establishes.
+    // It reads the SAME legs — no extra job, no extra register write, no second measurement.
+    v3d65_anchor_check(&legs);
+}
+
+// ─── PI-V3D-65 (`srcname`) — transcribe ONE PCTR source id and let V3D-64's calibration judge it. ────
+//
+// V3D-63 DROPPED three named sources rather than guess them; V3D-64 closed with a standing rule: when
+// an id is finally transcribed, THE NAME MUST MATCH THE MEASURED CLASS or the transcription is
+// REJECTED. This arc transcribes exactly ONE id and submits it to that rule in the same boot, on the
+// same legs, with a verdict word printed on the wire.
+//
+// ── SOURCE, cited exactly ───────────────────────────────────────────────────────────────────────────
+// The blocker V3D-63 and V3D-64 both recorded — "this tree carries no copy of `enum drm_v3d_perfcnt`
+// to transcribe from" — is RETIRED. The build host carries the Linux uapi header itself:
+//
+//   file : include/uapi/drm/v3d_drm.h  (Linux uapi header)
+//   copy : /usr/src/kernels/7.1.5-200.fc44.x86_64/include/uapi/drm/v3d_drm.h — Fedora `kernel-devel`
+//          for 7.1.5-200.fc44, the build host's own running kernel (reachable from this sandbox as
+//          /run/host/usr/src/kernels/7.1.5-200.fc44.x86_64/include/uapi/drm/v3d_drm.h)
+//   what : the anonymous `enum { V3D_PERFCNT_* }` at the tail of the header, first member
+//          `V3D_PERFCNT_FEP_VALID_PRIMTS_NO_PIXELS` at index 0.
+//   note : the enum's own comment says these indices "are only valid for V3D 4.2". This hardware IS
+//          V3D 4.2 (Pi 4), so that deprecation note is a POSITIVE applicability statement for us, not
+//          a warning against use. Newer cores must query DRM_IOCTL_V3D_PERFMON_GET_COUNTER instead;
+//          we are not a newer core.
+//
+// ── INDEX CROSS-CHECK — what licenses the transcription ─────────────────────────────────────────────
+// This is a strictly stronger check than V3D-63's "must fall between the 16/32 anchors" bracket rule.
+// Counting that enum from 0, EVERY source id this file already carries from earlier arcs lands on
+// exactly the name it was given — six for six, no misses:
+//
+//   14 → QPU_ACTIVE_CYCLES_VERTEX_COORD_USER   (PCTR_SRC_QPU_ACTIVE_CYCLES_VERTEX_COORD_USER)
+//   16 → QPU_CYCLES_VALID_INSTR                (PCTR_SRC_QPU_CYCLES_VALID_INSTR)      — anchor
+//   17 → QPU_CYCLES_TMU_STALL                  (PCTR_SRC_QPU_CYCLES_WAITING_TMU)
+//   24 → TMU_TCACHE_ACCESS                     (PCTR_SRC_TMU_TCACHE_ACCESS)
+//   25 → TMU_TCACHE_MISS                       (PCTR_SRC_TMU_TCACHE_MISS)
+//   32 → CYCLE_COUNT                           (PCTR_SRC_CYCLE_COUNT)                 — anchor
+//
+// 32 == CYCLE_COUNT independently re-pins the `v3d_regs.h V3D_PCTR_CYCLE_COUNT(ver)=32` anchor for
+// ver<71 from a second, unrelated file. Six independent hits with zero misses is not an accident of
+// ordering: on 4.2 the enum INDEX IS the hardware source id, exactly as this file has assumed since
+// PI-V3D-21 — now demonstrated rather than assumed.
+//
+// ── THE ONE ID, and why this one ────────────────────────────────────────────────────────────────────
+// Index 28 is `V3D_PERFCNT_BIN_ACTIVE`. It is picked over every other candidate because it is the only
+// id that is BOTH bin/PTB-side AND already carries a MEASURED V3D-64 behaviour class on this same boot:
+//
+//   * It is the sweep's one mover. P65v2 metal (capture pi4-r23s1o) read src28 ≈ 645M against a src32
+//     CYCLE_COUNT control of ≈ 645M on ZERO-primitive bin rungs — the only swept slot at 1:1 there.
+//     V3D-64 flagged that as the ambiguity worth resolving: free-running clock, or gated on something
+//     the bin kick supplies? Under the name BIN_ACTIVE the second reading is the live one, and it is
+//     the campaign's first direct observable OF THE BINNER: the frame opens, the bin unit stays ACTIVE
+//     for the whole ~0.5 s FLDONE backstop, and it still never retires. "The binner is engaged and
+//     never finishes" is precisely the wall this track has been circling.
+//   * Every other bin/PTB-side candidate in the enum (35 PTB_PRIMS_BINNED, the PTB_MEM_* family, 57
+//     CLE_ACTIVE) is NOT in `V3D63_SWEEP_SRC`, so its name would land beyond the reach of V3D-64's
+//     rail this boot — an UNCHECKED name, which is the exact thing this arc exists to refuse. One id,
+//     and it must be one that calibration can actually judge.
+//   * The five confirmed-silent ids (1, 10, 11, 12, 29) are checkable but uninformative: a SILENT
+//     measurement is consistent with almost any name on a bin path that bins no primitives.
+//
+// This arc names ONE id. 1, 10, 11, 12, 13 and 29 stay RAW and UNNAMED — the V3D-63 treatment holds
+// for them, and nothing below may be read as naming them by adjacency.
+const V3D65_SRC_ID: u32 = 28;
+const V3D65_SRC_NAME: &str = "V3D_PERFCNT_BIN_ACTIVE";
+
+/// PI-V3D-65 — where `V3D65_SRC_ID` sits in the `[v3d63]` sweep, or `None` if a later edit drops it
+/// from the bank. Resolved from `V3D63_SWEEP_SRC` rather than hard-coded, so the anchor-check cannot
+/// silently read the wrong slot if the sweep is ever reordered.
+const fn v3d65_sweep_index() -> Option<usize> {
+    let mut i = 0usize;
+    while i < V3D63_SWEEP_SRC.len() {
+        if V3D63_SWEEP_SRC[i] == V3D65_SRC_ID {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// PI-V3D-65 — the anchor check. Reads the legs `[v3d64]` already measured and asks whether the
+/// transcribed NAME survives them.
+///
+/// The predicates are derived from the name and from nothing else. `BIN_ACTIVE` means "the binner is
+/// active", so, in V3D-64's own vocabulary:
+///
+///   * **P1 idle-flat** — L1 is a pure-idle window with NO job submitted. A counter of bin activity
+///     MUST read zero there (overflow included). If it ticks with no bin work, it is measuring the
+///     clock, not the binner, and the name is wrong.
+///   * **P2 bin-live** — L3 is the banked `Empty` rung, whose bin frame demonstrably OPENS and is held
+///     open across the ~0.5 s backstop. A counter of bin activity MUST move there. A `SILENT`
+///     measurement falsifies the name just as hard as a clock-like one.
+///   * **P3 class** — consequently the measured V3D-64 class must be neither `CLOCK-LIKE` nor
+///     `SILENT`. P3 is redundant with P1+P2 by construction; it is evaluated anyway so the verdict is
+///     stated against the published class string and not only against raw slot values.
+///
+/// **L2 is REPORTED and is NOT a reject condition.** Whether a CT1-only clear job spins the bin unit
+/// is a question the name `BIN_ACTIVE` does not settle, and an anchor-check may not reject on a
+/// prediction the name never made. It is printed so the capture carries the observation.
+///
+/// A verdict requires L1 and L3 to be VALID legs (their own src32 control moved). Without them the
+/// probe prints INCONCLUSIVE and says neither PASS nor REJECTED — a name is never confirmed off an
+/// uninstrumented bank, which is the failure mode this whole campaign keeps unwinding.
+///
+/// QEMU raspi4b models no V3D PCTR block at all; this never runs there (the caller returns at the hub
+/// identity gate with a `SKIPPED` line). The verdict below is METAL-ATTENDED, always.
+fn v3d65_anchor_check(legs: &[V3d64Leg; 3]) {
+    let i = match v3d65_sweep_index() {
+        Some(i) => i,
+        None => {
+            serial_println!(
+                ":: V3D: [v3d65] anchor-check SKIPPED — src{} ({}) is not carried in the [v3d63] sweep bank {:?}, so V3D-64 measured no class for it and this transcription has NOTHING to be checked against. An unchecked name is not published: re-add the id to the sweep or drop the transcription ::",
+                V3D65_SRC_ID, V3D65_SRC_NAME, V3D63_SWEEP_SRC
+            );
+            return;
+        }
+    };
+
+    serial_println!(
+        ":: V3D: [v3d65] srcname — ONE source id transcribed from `enum {{ V3D_PERFCNT_* }}` in Linux uapi include/uapi/drm/v3d_drm.h (host copy: /usr/src/kernels/7.1.5-200.fc44.x86_64/…), whose own comment scopes those indices to V3D 4.2 — THIS hardware. Licensed by a six-for-six index cross-check against the ids this file already carries (14 vertex_coord_user, 16 valid_instr, 17 tmu_stall, 24 tcache_access, 25 tcache_miss, 32 cycle_count), which also re-pins the v3d_regs.h CYCLE_COUNT=32 anchor from a second file. TRANSCRIBED: src{} = {} (sweep index {}, PCTR slot {}). No other swept id is named — 1/10/11/12/13/29 stay RAW per [v3d63] ::",
+        V3D65_SRC_ID, V3D65_SRC_NAME, i, v3d63_slot(i)
+    );
+
+    let class = v3d64_classify(legs, i);
+
+    if !legs[0].valid() || !legs[2].valid() {
+        serial_println!(
+            ":: V3D: [v3d65] anchor-check INCONCLUSIVE — the check needs BOTH the L1 idle leg (for the idle-flat predicate) and the L3 bin leg (for the bin-live predicate) to have carried a live src32 control, and this boot had L1 valid={} (src32={}) L3 valid={} (src32={}). NO verdict is returned: the name {} is NEITHER confirmed NOR rejected here, and must not be cited either way off this boot. Instrument the bank and re-measure ::",
+            legs[0].valid() as u32, legs[0].ctrl(),
+            legs[2].valid() as u32, legs[2].ctrl(),
+            V3D65_SRC_NAME
+        );
+        return;
+    }
+
+    let p1 = !legs[0].moved_i(i); // idle-flat
+    let p2 = legs[2].moved_i(i); // bin-live
+    let p3 = !class.starts_with("CLOCK-LIKE") && !class.starts_with("SILENT");
+    let pass = p1 && p2 && p3;
+
+    serial_println!(
+        "::   [v3d65] anchor-check predicates for src{} = {} — P1 idle-flat (L1 raw={} ovf={}, must be 0/0): {} | P2 bin-live (L3 raw={} ovf={}, must MOVE): {} | P3 measured class is neither CLOCK-LIKE nor SILENT: {} | observed L2 render raw={} ovf={} ({}‰ of src32) — REPORTED ONLY, not a reject condition: the name BIN_ACTIVE makes no claim about whether a CT1-only clear job spins the bin unit ::",
+        V3D65_SRC_ID, V3D65_SRC_NAME,
+        legs[0].raw(i), legs[0].ovf_i(i) as u32, if p1 { "HOLDS" } else { "FAILS" },
+        legs[2].raw(i), legs[2].ovf_i(i) as u32, if p2 { "HOLDS" } else { "FAILS" },
+        if p3 { "HOLDS" } else { "FAILS" },
+        legs[1].raw(i), legs[1].ovf_i(i) as u32, legs[1].permille(i),
+    );
+    serial_println!(
+        "::   [v3d65] measured class for src{} (from [v3d64], this boot, these legs) — {} ::",
+        V3D65_SRC_ID, class
+    );
+
+    if pass {
+        serial_println!(
+            ":: V3D: [v3d65] anchor-check VERDICT: PASS — src{} = {} survives V3D-64's rail. It is FLAT across a pure-idle window with no job submitted, and it MOVES on a bin kick whose frame opens and never retires. Every predicate the NAME makes is borne out by behaviour measured independently of the name. The campaign therefore has, for the first time, a NAMED bin-side observable: BIN_ACTIVE says the bin unit IS ENGAGED across the whole FLDONE backstop while the frame still fails to close — the binner is not absent and not asleep, it is running and not finishing. Read with two standing limits: this confirms the ID↔NAME transcription and the mux's behaviour, NOT any semantic beyond \"bin unit active\"; and it names ONE id — 1/10/11/12/13/29 remain unnamed ::",
+            V3D65_SRC_ID, V3D65_SRC_NAME
+        );
+    } else {
+        serial_println!(
+            ":: V3D: [v3d65] anchor-check VERDICT: REJECTED — src{} = {} does NOT survive V3D-64's rail (P1 idle-flat={} P2 bin-live={} P3 class={}). The transcription is treated as MIS-APPLIED and the name is WITHDRAWN: src{} reverts to a RAW unnamed mux under the [v3d63] treatment and NOTHING in this file may cite it as the binner. Note what is and is not implicated — the index cross-check (six-for-six against 14/16/17/24/25/32) is independent of this outcome, so the likely fault is the id↔MUX mapping on this silicon (a SRC field that does not select the enum's source on 4.2), not the enum reading. Calibration checks the transcription, never the reverse ::",
+            V3D65_SRC_ID, V3D65_SRC_NAME,
+            p1 as u32, p2 as u32, p3 as u32, V3D65_SRC_ID
+        );
+    }
 }
 
 /// Read a little-endian u32 out of the arena at `off` (probe scratch readback).

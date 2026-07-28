@@ -2471,3 +2471,121 @@ reused legs already perform, and no new MMIO window. The battery is `UNAOS_V3D_D
 and hub-identity gated, printing an explicit `SKIPPED` line when the block is down — QEMU
 raspi4b returns at `BLOCK-DOWN` long before it runs, so `kernel8-test` green for this arc
 means **no regression, nothing more**.
+
+---
+
+## 38. The first named source id — transcription under the calibration rail (V3D-65)
+
+V3D-63 **dropped** three named PCTR sources rather than guess them, and V3D-64 closed with
+a standing rule: when an id is finally transcribed, *the name must match the measured
+class, or the transcription is rejected*. V3D-65 transcribes exactly **one** id and
+submits it to that rule, in the same boot, on the same legs, with a verdict word on the
+wire.
+
+### The blocker is retired — where the enum came from
+
+Both prior arcs recorded the same wall: *"this tree carries no copy of `enum
+drm_v3d_perfcnt` to transcribe from"*. It is no longer true of the build host.
+
+| | |
+|---|---|
+| **File** | `include/uapi/drm/v3d_drm.h` — the Linux uapi header |
+| **Copy read** | `/usr/src/kernels/7.1.5-200.fc44.x86_64/include/uapi/drm/v3d_drm.h` (Fedora `kernel-devel` for 7.1.5-200.fc44, the build host's own running kernel; reachable from the session sandbox as `/run/host/usr/src/kernels/7.1.5-200.fc44.x86_64/…`) |
+| **What** | the anonymous `enum { V3D_PERFCNT_* }` at the tail of the header, first member `V3D_PERFCNT_FEP_VALID_PRIMTS_NO_PIXELS` at index 0 |
+| **Applicability** | the enum's own comment scopes those indices to **V3D 4.2**. This hardware *is* V3D 4.2, so the deprecation note is a positive applicability statement for us. Newer cores must query `DRM_IOCTL_V3D_PERFMON_GET_COUNTER`; we are not a newer core. |
+
+### What licenses the transcription — a six-for-six index cross-check
+
+This is strictly stronger than V3D-63's "must fall between the 16/32 anchors" bracket
+rule. Counting that enum from 0, **every** source id this file already carries from
+earlier arcs lands on exactly the name it was given — six hits, zero misses:
+
+| id | enum member at that index | this file's constant |
+|---|---|---|
+| 14 | `QPU_ACTIVE_CYCLES_VERTEX_COORD_USER` | `PCTR_SRC_QPU_ACTIVE_CYCLES_VERTEX_COORD_USER` |
+| 16 | `QPU_CYCLES_VALID_INSTR` | `PCTR_SRC_QPU_CYCLES_VALID_INSTR` — **anchor** |
+| 17 | `QPU_CYCLES_TMU_STALL` | `PCTR_SRC_QPU_CYCLES_WAITING_TMU` |
+| 24 | `TMU_TCACHE_ACCESS` | `PCTR_SRC_TMU_TCACHE_ACCESS` |
+| 25 | `TMU_TCACHE_MISS` | `PCTR_SRC_TMU_TCACHE_MISS` |
+| 32 | `CYCLE_COUNT` | `PCTR_SRC_CYCLE_COUNT` — **anchor** |
+
+`32 == CYCLE_COUNT` independently re-pins the `v3d_regs.h V3D_PCTR_CYCLE_COUNT(ver)=32`
+anchor from a second, unrelated file. Six independent hits with no misses is not an
+accident of ordering: on 4.2 the **enum index is the hardware source id**, exactly as this
+file has assumed since PI-V3D-21 — now demonstrated rather than assumed.
+
+### The one id, and why this one
+
+**Index 28 is `V3D_PERFCNT_BIN_ACTIVE`.** It is picked over every other candidate because
+it is the only id that is *both* bin/PTB-side *and* already carries a **measured V3D-64
+behaviour class** on the same boot:
+
+- **It is the sweep's one mover.** P65v2 metal (capture `pi4-r23s1o`) read `src28 ≈ 645M`
+  against a `src32 CYCLE_COUNT` control of `≈ 645M` on zero-primitive bin rungs — the only
+  swept slot at 1:1 there. V3D-64 flagged exactly that as the ambiguity worth resolving:
+  free-running clock, or gated on something the bin kick supplies? Under the name
+  `BIN_ACTIVE` the second reading is the live one, and it is the campaign's first direct
+  observable *of the binner*: the frame opens, the bin unit stays active across the whole
+  ~0.5 s `FLDONE` backstop, and it still never retires. "The binner is engaged and never
+  finishes" is precisely the wall this track has been circling.
+- **Every other bin/PTB-side candidate is out of reach of the rail this boot.** 35
+  `PTB_PRIMS_BINNED`, the `PTB_MEM_*` family and 57 `CLE_ACTIVE` are not in
+  `V3D63_SWEEP_SRC`, so naming one of them would publish an **unchecked** name — the exact
+  thing this arc exists to refuse. One id, and it must be one calibration can judge.
+- **The five confirmed-silent ids (1, 10, 11, 12, 29) are checkable but uninformative.** A
+  `SILENT` measurement is consistent with almost any name on a bin path that bins no
+  primitives.
+
+**Ids 1, 10, 11, 12, 13 and 29 stay raw and unnamed.** The V3D-63 treatment holds for them
+and nothing in the V3D-65 lines may be read as naming them by adjacency.
+
+### `[v3d65] srcname` — the anchor check
+
+The predicates are derived from the name and from nothing else. `BIN_ACTIVE` means "the
+bin unit is active", so, in V3D-64's own vocabulary:
+
+| Predicate | Leg | What the name requires | Failing it means |
+|---|---|---|---|
+| **P1 idle-flat** | L1 pure idle, no job submitted | reads **zero**, overflow included | it ticks with no bin work ⇒ it measures the clock, not the binner |
+| **P2 bin-live** | L3 banked `Empty` rung, frame opens and holds open across the backstop | **moves** | a `SILENT` mux is not a bin-activity counter |
+| **P3 class** | — | measured class is neither `CLOCK-LIKE` nor `SILENT` | states the verdict against the *published* class string, not only raw slot values |
+
+P3 is redundant with P1+P2 by construction; it is evaluated anyway so the verdict is
+pinned to the class line a reader actually sees.
+
+**L2 is reported and is *not* a reject condition.** Whether a CT1-only clear job spins the
+bin unit is a question the name `BIN_ACTIVE` does not settle, and an anchor check may not
+reject on a prediction the name never made. The L2 raw value, overflow flag and permille
+are printed so the capture carries the observation.
+
+**A verdict requires L1 and L3 to be valid legs** (each leg's own `src32` control moved).
+Without them the probe prints `anchor-check INCONCLUSIVE` and says **neither PASS nor
+REJECTED** — a name is never confirmed off an uninstrumented bank, which is the failure
+mode this campaign keeps unwinding.
+
+### The two outcomes, and what each does and does not license
+
+- **`PASS`** — src28 is flat across a pure-idle window and moves on a bin kick whose frame
+  opens and never retires. Every predicate the name makes is borne out by behaviour
+  measured independently of the name. The campaign then has a **named bin-side
+  observable**: the bin unit *is engaged* across the whole `FLDONE` backstop while the
+  frame still fails to close — the binner is not absent and not asleep, it is running and
+  not finishing. Two standing limits: this confirms the **id↔name transcription and the
+  mux's behaviour**, not any semantic beyond "bin unit active"; and it names **one** id.
+- **`REJECTED`** — the name is **withdrawn**, src28 reverts to a raw unnamed mux under the
+  V3D-63 treatment, and nothing in the tree may cite it as the binner. Note what a reject
+  does *not* implicate: the six-for-six index cross-check is independent of the
+  measurement, so the likely fault would be the **id↔mux mapping on this silicon** (a SRC
+  field that does not select the enum's source on 4.2), not the enum reading.
+
+### Cost, gating and where the verdict is taken
+
+The check adds **no job, no leg, no register write and no second measurement** — it reads
+the three legs `[v3d64]` already measured, inside `v3d64_mux_calibration`, after that
+probe's own verdict line. It therefore inherits V3D-64's gating unchanged: `UNAOS_V3D_DEEP`
+plus the hub-identity gate, with an explicit `SKIPPED` line when the block is down.
+
+**QEMU raspi4b models no V3D PCTR block at all**, so this never runs there — the caller
+returns at `BLOCK-DOWN` long before it. The `PASS`/`REJECTED` verdict is **metal-attended,
+always**. `kernel8-test` green for this arc means the default boot is byte-inert and the
+suite did not regress, and nothing more.
