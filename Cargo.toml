@@ -20,6 +20,7 @@ members = [
     "handlers/amber_bytes",
     "handlers/stria",
     "handlers/aether",
+    "handlers/principia",
     # "handlers/vug",
     "tools/vertex",
     "tools/unafs",

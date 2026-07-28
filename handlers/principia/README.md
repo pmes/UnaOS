@@ -4,10 +4,98 @@
 domain service responsible for persistent system settings — owning where they
 live, validating changes, and broadcasting the results to the rest of userspace.
 
-## What it does today
+## Preferences — the settings surface
 
-The current implementation is a single capability: managing the **UnaOS system
-root** (the workspace path the rest of the system operates against).
+Principia owns the **preference store**: the namespaced, typed, persistent
+settings the rest of userspace reads. This is the mechanism behind the OS
+Settings surface; it is live today and serves over the bus.
+
+### Addressing and types
+
+A preference is addressed by a **namespace** — a per-app/domain string
+(`aether`, `stria`, `system`) — and a **dotted key** within it (`homepage`,
+`window.width`). A value is one of four scalar types (`bandy::PrefValue`):
+`Str`, `Int`, `Float`, `Bool`. That domain is exactly what a TOML scalar carries
+losslessly, so nothing is retyped by a save/load cycle (a whole-numbered float
+stays a float).
+
+**Defaults live with the consumer, never in the store.** A `get` on an unset key
+answers `None`; the consumer applies its own default. The store therefore never
+has to know what any app considers reasonable, and a settings file only ever
+contains choices a user actually made.
+
+### File format
+
+`~/.config/unaos/preferences.toml` (resolved via `dirs::config_dir()`): one TOML
+table per namespace, dotted keys expanded into sub-tables. It is meant to be
+readable and hand-editable.
+
+```toml
+[aether]
+homepage = "https://una.os/"
+
+[aether.window]
+height = 800
+width = 1280
+```
+
+Because a key expands into TOML tables, a key cannot be both a value and a
+table: `window` and `window.width` collide. The collision is rejected at set
+time (with a `PrefError`), so the in-memory cache never holds something that
+cannot be persisted. Namespaces and key segments are non-empty `[A-Za-z0-9_-]`
+identifiers.
+
+**Every write is atomic**: a set serializes the whole document to a sibling temp
+file in the same directory, flushes and `fsync`s it, then `rename`s it over the
+real file. A concurrent reader — or a crash — sees the old file or the new one,
+never a partial one. If the write fails, the in-memory cache is rolled back, so
+cache and file never disagree. A malformed file on load is an error rather than
+a silent empty start (which would let the next set overwrite a user's settings
+with nothing); the handler then serves an empty store from a quarantine name and
+leaves the original untouched.
+
+### Bus verbs
+
+All carried on `SMessage::Principia(PrincipiaCommand)`:
+
+| Direction | Message | Behaviour |
+| --- | --- | --- |
+| In | `PrefGet { ns, key }` | Read one preference. |
+| Out | `PrefValueIs { ns, key, value: Option<PrefValue> }` | The answer; `None` = unset. |
+| In | `PrefSet { ns, key, value }` | Validate, persist atomically. |
+| Out | `PrefChanged { ns, key, value }` | Broadcast after every successful set — both the acknowledgement and the live-update signal running apps subscribe to. |
+| Out | `PrefError { ns, key, message }` | A rejected set (bad namespace/key, path collision, failed persist). |
+| In | `PrefList { ns }` | Every key set in one namespace. |
+| Out | `PrefListIs { ns, entries: Vec<(String, PrefValue)> }` | The answer, sorted by key; an unknown namespace lists empty. |
+
+### Running it
+
+`principia::ignite(synapse)` subscribes and serves the loop. When a caller needs
+to fire commands immediately after spawning, `principia::serve(synapse, rx,
+handler)` takes a receiver the caller subscribed *before* the spawn, so nothing
+in between is missed. `Principia::with_config_dir(dir)` opens the handler against
+an explicit config lobe (tests, and any future multi-profile boot).
+
+### Queued
+
+- **Live update on external change.** Principia is the writer of record; an edit
+  made to `preferences.toml` underneath a running Principia is not noticed until
+  the next load. A file watcher that reloads and emits `PrefChanged` per delta
+  is the follow-up.
+- **The GUI surface.** Settings are served but have no face yet; a quartzite
+  view over `PrefList`/`PrefSet` is the natural next step, and the schema needed
+  to render a *good* one (labels, ranges, enums per key) is not defined.
+- **First consumers.** Aether's homepage (`aether`.`homepage`) and window size
+  (`aether`.`window.width` / `window.height`) are the intended first two;
+  wiring them belongs to the aether-shell lane, not here.
+- **Policy levels for helm.** The charter's law layer (below) rides this same
+  store once the first drivable domain lands — the store is the mechanism, the
+  levels themselves are not yet defined.
+
+## The system root
+
+The original capability, unchanged: managing the **UnaOS system root** (the
+workspace path the rest of the system operates against).
 
 `src/lib.rs` exposes a `Principia` struct:
 
@@ -31,17 +119,19 @@ UnaOS handlers communicate over **Bandy**, the userspace message bus
 multi-producer/multi-consumer broadcast channel. Handlers do not call each other
 directly — they publish and subscribe to `SMessage`.
 
-Principia uses two variants of `SMessage::Principia(PrincipiaCommand)`
-(`libs/bandy/src/signals.rs`):
+Principia's vocabulary is the `PrincipiaCommand` sub-enum
+(`libs/bandy/src/signals.rs`): the preference verbs tabled above, plus the
+system-root pair:
 
 | Direction | Message | Behaviour |
 | --- | --- | --- |
 | In  | `PrincipiaCommand::SetSystemRoot(PathBuf)` | Validate the path; if valid, persist it and emit the change below. |
 | Out | `PrincipiaCommand::SystemRootChanged(PathBuf)` | Confirms the new root to any subscriber (e.g. the GUI, Matrix). |
 
-`process_impulse` returns the `SystemRootChanged` message on success and `None`
-otherwise; the caller is responsible for publishing the returned message on the
-Synapse.
+`process_impulse` takes one inbound message and returns at most one outbound
+message, which the caller publishes; `serve`/`ignite` are the loop that does
+that against a live Synapse. Replies and broadcasts are inert as input —
+Principia hears its own output on the broadcast bus and must not answer it.
 
 ## Safety levels — the law an AI runs under (planned)
 
@@ -71,14 +161,12 @@ first drivable domain lands.
 
 ## Status
 
-**Partial — design-stage beyond the system-root capability.**
+**Live for preferences and the system root; design-stage beyond them.**
 
-- The system-root logic above is implemented and self-contained.
-- This crate currently has **no `Cargo.toml`** and is **not a workspace member**,
-  so it does not build as part of `cargo build`. It also does not yet expose the
-  conventional async entry point (`ignite(synapse: Synapse, …)`) or a subscribe
-  loop that drives `process_impulse` from live Synapse traffic; integrating it
-  into a vessel is outstanding work.
+- The preference store and the system-root logic are implemented, tested
+  (`cargo test -p principia`) and served over the Synapse. The crate is a
+  workspace member and exposes the conventional entry point (`ignite`/`serve`);
+  no vessel binds it yet.
 - The broader vision for Principia — a schema-driven settings UI generated from
   per-handler configuration schemas, versioned config via the Vairë handler,
   semantic validation of risky settings via the Vein handler, and host

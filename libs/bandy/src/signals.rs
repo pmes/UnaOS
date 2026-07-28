@@ -127,6 +127,15 @@ pub enum SMessage {
     /// Engine → chrome: the current document url changed (link click,
     /// back/forward, redirect); the address bar mirrors it.
     BrowserUrlChanged(String),
+    /// Engine → chrome: the current document's `<title>` changed. Fired from
+    /// the same post-navigation choke point as [`SMessage::BrowserUrlChanged`],
+    /// deduped against the last one sent; the window title bar mirrors it.
+    BrowserTitleChanged(String),
+    /// Engine → chrome: the current document's favicon, decoded to tightly
+    /// packed 8-bit RGBA (`width * height * 4`, row-major, top row first).
+    /// Fetched *after* the page is delivered, so it never delays a load; an
+    /// absent or undecodable icon simply fires nothing.
+    BrowserFaviconChanged { width: u32, height: u32, rgba: Vec<u8> },
 
     // --- EDITOR (The Code Pane) ---
     /// Load a document into the active editor pane. Fired when a file is
@@ -208,10 +217,109 @@ pub enum SMessage {
     UiReady,
 }
 
+/// A typed preference value — the whole value domain of the Principia
+/// preference store. Deliberately small: these four types are exactly what a
+/// TOML scalar can carry losslessly, so a value survives the round trip
+/// store → file → store → bus without widening or coercion. Externally tagged
+/// on the wire (the enum default) so `Float(1.0)` cannot come back as `Int(1)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PrefValue {
+    Str(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+impl PrefValue {
+    /// The value's type name (`"string" | "int" | "float" | "bool"`) — for
+    /// logs, diagnostics and a future schema surface.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            PrefValue::Str(_) => "string",
+            PrefValue::Int(_) => "int",
+            PrefValue::Float(_) => "float",
+            PrefValue::Bool(_) => "bool",
+        }
+    }
+}
+
+impl From<String> for PrefValue {
+    fn from(v: String) -> Self {
+        PrefValue::Str(v)
+    }
+}
+impl From<&str> for PrefValue {
+    fn from(v: &str) -> Self {
+        PrefValue::Str(v.to_string())
+    }
+}
+impl From<i64> for PrefValue {
+    fn from(v: i64) -> Self {
+        PrefValue::Int(v)
+    }
+}
+impl From<f64> for PrefValue {
+    fn from(v: f64) -> Self {
+        PrefValue::Float(v)
+    }
+}
+impl From<bool> for PrefValue {
+    fn from(v: bool) -> Self {
+        PrefValue::Bool(v)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PrincipiaCommand {
     SetSystemRoot(PathBuf),
     SystemRootChanged(PathBuf),
+
+    // --- PREFERENCES (the settings surface) ---
+    // Namespaces are per-app/domain strings ("aether", "stria", "system");
+    // keys are dotted paths within a namespace ("homepage", "window.width").
+    // Defaults live with the consumer, never in the store — an unset key
+    // answers `None`.
+    /// Ask for one preference. Answered by [`PrincipiaCommand::PrefValueIs`].
+    PrefGet { ns: String, key: String },
+    /// The answer to a [`PrincipiaCommand::PrefGet`]: `None` = unset (the
+    /// consumer applies its own default).
+    PrefValueIs {
+        ns: String,
+        key: String,
+        value: Option<PrefValue>,
+    },
+    /// Write one preference. On success the store persists atomically and
+    /// [`PrincipiaCommand::PrefChanged`] is broadcast; on rejection
+    /// [`PrincipiaCommand::PrefError`] comes back instead.
+    PrefSet {
+        ns: String,
+        key: String,
+        value: PrefValue,
+    },
+    /// Ask for every set key in one namespace. Answered by
+    /// [`PrincipiaCommand::PrefListIs`].
+    PrefList { ns: String },
+    /// The answer to a [`PrincipiaCommand::PrefList`]: every `(key, value)`
+    /// currently set in `ns`, sorted by key. An unknown namespace lists empty.
+    PrefListIs {
+        ns: String,
+        entries: Vec<(String, PrefValue)>,
+    },
+    /// Broadcast after every successful set: the new value of `ns`/`key`.
+    /// This is both the set's acknowledgement and the live-update signal every
+    /// running consumer subscribes to.
+    PrefChanged {
+        ns: String,
+        key: String,
+        value: PrefValue,
+    },
+    /// A rejected preference operation (malformed namespace/key, a key that
+    /// collides with an existing dotted path, or a failed persist).
+    PrefError {
+        ns: String,
+        key: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
