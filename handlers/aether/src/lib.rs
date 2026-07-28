@@ -560,6 +560,22 @@ impl AetherEngine {
         let _ = js_engine.execute("__drainRaf && __drainRaf();");
         let _ = js_engine.context.run_jobs();
 
+        // UNAOS_JSEVAL=<expr>: evaluate one expression against the booted page
+        // and print its value. The post-boot DOM/JS state is otherwise opaque
+        // from outside; this is the probe for "did that global/class land?".
+        if let Ok(expr) = std::env::var("UNAOS_JSEVAL") {
+            match js_engine.execute(&expr) {
+                Ok(v) => {
+                    let s = v
+                        .to_string(&mut js_engine.context)
+                        .map(|s| s.to_std_string_escaped())
+                        .unwrap_or_else(|_| "<unprintable>".to_string());
+                    eprintln!("[jseval] {}", s);
+                }
+                Err(e) => eprintln!("[jseval] ERR: {}", e),
+            }
+        }
+
         let mut sheets: Vec<String> = Vec::new();
         if let Ok(styles) = document.select("style") {
             for style_node in styles {

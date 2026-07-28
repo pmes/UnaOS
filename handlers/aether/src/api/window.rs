@@ -3,8 +3,17 @@ use boa_engine::{
     object::ObjectInitializer,
     property::Attribute,
     native_function::NativeFunction,
+    JsObject,
 };
 
+/// Installs the window/global surface.
+///
+/// `window` is the global object itself, exactly as in a browser: every
+/// global — `setTimeout`, `document`, `fetch`, whatever a later prelude or
+/// binding adds — is reachable as `window.x` for free, and `window.x = v`
+/// creates a real global. Modelling it as a separate stub object (which is
+/// what this used to do) makes `window.setTimeout` undefined while
+/// `setTimeout` works, which is a difference no real page expects.
 pub fn setup_window(context: &mut Context) {
     let location = ObjectInitializer::new(context)
         .property(
@@ -42,38 +51,6 @@ pub fn setup_window(context: &mut Context) {
         )
         .build();
 
-    let navigator = ObjectInitializer::new(context)
-        .property(
-            boa_engine::string::JsString::from("userAgent"),
-            boa_engine::string::JsString::from("UnaOS Aether/0.1.0"),
-            Attribute::all(),
-        )
-        .build();
-
-    let window = ObjectInitializer::new(context)
-        .property(
-            boa_engine::string::JsString::from("location"),
-            location.clone(),
-            Attribute::all(),
-        )
-        .property(
-            boa_engine::string::JsString::from("history"),
-            history.clone(),
-            Attribute::all(),
-        )
-        .property(
-            boa_engine::string::JsString::from("navigator"),
-            navigator.clone(),
-            Attribute::all(),
-        )
-        .build();
-
-    let _ = context.register_global_property(
-        boa_engine::string::JsString::from("window"),
-        window.clone(),
-        Attribute::all(),
-    );
-
     let _ = context.register_global_property(
         boa_engine::string::JsString::from("location"),
         location,
@@ -86,9 +63,36 @@ pub fn setup_window(context: &mut Context) {
         Attribute::all(),
     );
 
-    let _ = context.register_global_property(
-        boa_engine::string::JsString::from("navigator"),
-        navigator,
-        Attribute::all(),
-    );
+    // The prelude installs a fuller `navigator` (language, platform,
+    // sendBeacon, ...); only fill in a minimal one if nothing is there, and
+    // never clobber what is.
+    let have_navigator = context
+        .global_object()
+        .get(boa_engine::string::JsString::from("navigator"), context)
+        .map(|v| v.is_object())
+        .unwrap_or(false);
+    if !have_navigator {
+        let navigator = ObjectInitializer::new(context)
+            .property(
+                boa_engine::string::JsString::from("userAgent"),
+                boa_engine::string::JsString::from("UnaOS Aether/0.1.0"),
+                Attribute::all(),
+            )
+            .build();
+        let _ = context.register_global_property(
+            boa_engine::string::JsString::from("navigator"),
+            navigator,
+            Attribute::all(),
+        );
+    }
+
+    // window === globalThis === self === top === parent.
+    let global: JsObject = context.global_object();
+    for name in ["window", "self", "top", "parent"] {
+        let _ = context.register_global_property(
+            boa_engine::string::JsString::from(name),
+            JsValue::from(global.clone()),
+            Attribute::all(),
+        );
+    }
 }

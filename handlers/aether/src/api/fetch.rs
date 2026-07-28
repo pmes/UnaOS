@@ -38,8 +38,9 @@ fn native_fetch(url: &str, method: &str, body: &str) -> Option<(u16, String, Str
     let body = body.to_string();
     let abs_thread = abs.clone();
     let result = std::thread::spawn(move || -> Option<(u16, String)> {
-        let client = reqwest::blocking::Client::builder()
-            .user_agent("UnaOS Aether/0.1.0")
+        // Shared jar: JS-initiated requests carry and record the same
+        // cookies as the page load that spawned them.
+        let client = crate::net::blocking_client_builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .ok()?;
