@@ -1365,6 +1365,7 @@ fn property_supported(prop: &str) -> bool {
             | "margin-top" | "margin-right" | "margin-bottom" | "margin-left"
             | "position" | "top" | "left" | "right" | "bottom" | "text-align" | "justify-content"
             | "background-color" | "background" | "background-image" | "color"
+            | "background-size" | "background-position" | "background-repeat"
             | "font-size" | "font-weight" | "line-height" | "visibility"
             | "max-width" | "max-height" | "min-width" | "min-height"
             | "overflow" | "overflow-x" | "overflow-y"
