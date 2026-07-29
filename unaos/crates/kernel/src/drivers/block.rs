@@ -205,6 +205,89 @@ pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
     set_usb_ready();
 }
 
+/// USB-UNPLUG: retract the geometry a USB mass-storage device published, when its xHCI slot is torn
+/// down on a physical disconnect. This is the missing half of [`publish_usb_geometry`]: before it, the
+/// xHCI layer handled removal correctly at ITS level (slot bindings cleared, DISABLE_SLOT queued —
+/// the metal wire shows `[Port 1] slot 1 torn down on disconnect` / `DISABLE_SLOT slot 1 -> code 1`)
+/// but nothing downstream ever heard about it, so `BLOCK_DEVICE` / `USB_BLOCK_DEVICE` kept a dead
+/// device forever. Every consumer that re-reads the registry each pass — the graphical installer's
+/// per-frame disk list (`video::instgui::devices`), the shell's `df`, the FAT mounts — therefore went
+/// on offering an unplugged disk as a live install target, and a replug (which lands on a NEW slot
+/// number) simply overwrote the entry rather than adding a second one, hiding the leak.
+///
+/// ### Matching is by slot id, never by "the USB backend"
+/// The retraction fires only for a registry entry whose `slot_id` EQUALS the torn-down xHCI slot. That
+/// single rule gets three cases right at once:
+/// - **x86 (this track):** the stick owns both handles, both carry its slot, both clear.
+/// - **Pi / aarch64 with a microSD:** `register_sd` publishes the card with `slot_id: 0` and xHCI slot
+///   0 is never a live device slot, so a USB disconnect can never retract the SD's global geometry —
+///   without this function needing to know the `BACKEND` selector at all.
+/// - **Slot-id reuse:** an id freed by DISABLE_SLOT and later handed to some other device cannot
+///   retract a disk that has since republished under a different slot, because the stored id is
+///   compared, not merely the fact that *a* slot went away.
+///
+/// ### In-flight I/O
+/// There is no dangling handle to chase. Every block entry point ([`read_block`], [`write_block`],
+/// [`read_block_usb`], [`write_block_usb`]) re-reads the registry through `info()` / `usb_info()` on
+/// EVERY call and geometry-bounds the LBA against that snapshot, so the first operation issued after
+/// the retraction fails honestly with [`BlockError::NotReady`] instead of transferring against a dead
+/// slot — the same shape as the BOT timeout path, which likewise reports the failure rather than
+/// pretending a transfer completed. A FAT mount is a by-value `FatFs` re-derived from a fresh
+/// `mount()`, so an existing mount does not keep the geometry alive either; its next sector read is
+/// what surfaces the loss. Callers holding a long synchronous job (the installer engine) see the same
+/// error on their next block op and abort with it.
+///
+/// The pending storage-ready edge is dropped as part of the retraction: an edge raised by the attach
+/// but not yet consumed by the main loop would otherwise drive a FAT mount against a disk that is no
+/// longer there. A replug re-raises it from `publish_usb_geometry` in the normal way.
+///
+/// Returns true if a registry entry was actually retracted (i.e. this slot WAS the storage device).
+pub fn unpublish_usb_geometry(slot_id: u8) -> bool {
+    // Slot 0 is the xHCI "no slot" sentinel and also the id `register_sd` stamps on the microSD.
+    // Neither is ever a device whose disconnect we are being told about.
+    if slot_id == 0 {
+        return false;
+    }
+
+    // Snapshot the identity BEFORE clearing, so the witness below can name the disk that left.
+    // Each handle is taken on its own — never both at once — so this adds no lock ordering to the
+    // block layer. Clearing is guarded per handle by its own slot match, because on the Pi the global
+    // may legitimately be the microSD while the USB handle is the stick, and only the latter must go.
+    let mut departing: Option<BlockDeviceInfo> = None;
+    {
+        let mut usb = USB_BLOCK_DEVICE.lock();
+        if (*usb).map(|d| d.slot_id) == Some(slot_id) {
+            departing = *usb;
+            *usb = None;
+        }
+    }
+    {
+        let mut glob = BLOCK_DEVICE.lock();
+        if (*glob).map(|d| d.slot_id) == Some(slot_id) {
+            if departing.is_none() {
+                departing = *glob;
+            }
+            *glob = None;
+        }
+    }
+    let Some(dev) = departing else {
+        return false;
+    };
+    // Drop an unconsumed attach edge: there is nothing left to mount.
+    USB_STORAGE_READY.store(false, core::sync::atomic::Ordering::Release);
+
+    // The removal witness. QEMU cannot hot-unplug a device here, so this line is what proves on the
+    // next attended metal boot that the disconnect actually reached the block registry — the exact
+    // evidence whose absence defined this defect.
+    let product = core::str::from_utf8(&dev.product).unwrap_or("?").trim_end();
+    let vendor = core::str::from_utf8(&dev.vendor).unwrap_or("?").trim_end();
+    serial_println!(
+        ":: BLK: removed '{}' '{}' (xhci slot {} disconnect) ::",
+        vendor, product, slot_id
+    );
+    true
+}
+
 /// M6g: register the microSD (EMMC2/SDHCI) as the block backend — publish its geometry AND flip the
 /// selector so `read_block` (and, since U9, `write_block`) route to `drivers::emmc2`. Called once, from
 /// the bare-metal BSP probe after a successful card init (`emmc2::probe`). aarch64 bare-metal only; x86

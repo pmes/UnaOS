@@ -3298,6 +3298,17 @@ impl XhciController {
                 self.storage_pending_bringup = false;
                 self.storage_note = "storage device disconnected";
             }
+            // USB-UNPLUG: the xHCI-level teardown above only clears the CONTROLLER's binding. The
+            // block registry this device published into on attach (`block::publish_usb_geometry`,
+            // called from the SCSI bring-up) is a separate global, and until this call it kept the
+            // dead disk forever — so the installer's per-frame disk list went on offering an
+            // unplugged stick as an install target. Retract by slot id, unconditionally for every
+            // disposed slot rather than only when `storage_slot` still points here: the registry
+            // itself decides whether this slot was the storage device (a non-storage slot simply
+            // doesn't match), which keeps the retraction correct even if some earlier path already
+            // zeroed `storage_slot`. A replug enumerates as a NEW slot and republishes through the
+            // normal attach path, so the entry is fresh rather than duplicated.
+            crate::drivers::block::unpublish_usb_geometry(i as u8);
             if self.ftdi_configuring_slot == i as u8 {
                 self.ftdi_configuring_slot = 0;
             }
@@ -7342,6 +7353,10 @@ impl XhciController {
                 self.storage_pending_bringup = false;
                 self.storage_note = "hub-downstream storage disconnected";
             }
+            // USB-UNPLUG: same retraction as the root-port teardown — a disk pulled from a HUB port
+            // must leave the block registry too, or the installer keeps listing it. Slot-id matched,
+            // so only the slot that actually published geometry is retracted.
+            crate::drivers::block::unpublish_usb_geometry(i as u8);
             if self.configuring_slot == i as u8 { self.configuring_slot = 0; }
             if self.ftdi_configuring_slot == i as u8 { self.ftdi_configuring_slot = 0; }
             if self.ftdi_slot == i as u8 {

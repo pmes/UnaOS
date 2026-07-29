@@ -360,6 +360,16 @@ pub fn service() {
         .flatten()
         .fold(n as u64, |a, d| a ^ (d.slot_id as u64) << 8 ^ d.num_blocks);
     if LAST_SIG.swap(sig, Ordering::Relaxed) != sig {
+        // USB-UNPLUG: the list can now SHRINK (a disconnect retracts the block-registry entry via
+        // `block::unpublish_usb_geometry`), which it never could before — attach was the only event
+        // the registry reported. A selection index left pointing past the end of the shortened list
+        // would silently be clamped to row 0 by the warning screen, i.e. the operator's highlighted
+        // choice would become a DIFFERENT disk than the one they were looking at. Clamp here, where
+        // the change is detected and before the repaint that redraws the highlight.
+        let last = n.saturating_sub(1) as u8;
+        if SEL.load(Ordering::Relaxed) > last {
+            SEL.store(last, Ordering::Relaxed);
+        }
         repaint();
     }
 }
