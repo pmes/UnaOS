@@ -122,6 +122,150 @@ stability, not the absolute number, is the property being defended. Six consecut
 `UNAOS_WC=1 ./arroyo test 45` runs on this change: 37 PASS / 0 FAIL every run, 72/72 distinct
 `[serwit]` lines every run, zero drop markers.
 
+## SERWIT-2 — the four mirror taps
+
+`_print` does not write to one sink, it writes to five. SERWIT-1 fixed the primary wire; hanging off
+the same seam are four **mirrors**, every one of which had the identical `try_lock`-and-discard shape
+with no counter anywhere:
+
+| Tap | File | Sink | Verdict |
+|---|---|---|---|
+| `fbcon` | `video/fbcon.rs` | the on-screen console | **legitimately lossy — counted and announced** |
+| `ftdi` | `drivers/xhci/ftdi.rs` | the FTDI cable (the bench's own capture) | **fixed** — staged, no loss |
+| `tste` | `selftest.rs` | the boot-verdict replay ring | **fixed** — lock removed entirely |
+| `flightrec` | `flight_recorder.rs` | `UNAOS.LOG` | **fixed** — staged, no loss |
+
+The aggravating fact: all four run **outside `SERIAL1` and outside the interrupt mask** (the arch
+`_print` calls them after the locked region), so they are contended by every core at once — including
+on the very lines the primary wire is busy deferring. They were not a rarer instance of the defect;
+under a multi-core burst they were a worse one.
+
+### Not every tap owes the same thing
+
+`try_lock`-and-never-block stays the rule everywhere: a mirror that could block would be able to stall
+the primary wire, and that inversion is worse than the drop it would replace. What changed is the
+failure branch, and the right answer differs by tap.
+
+* **Sinks whose content is evidence** (`ftdi`, `flightrec`, `tste`) must not lose lines at all. Their
+  sinks are cheap — a memcpy into a byte ring, a 42-byte record — so the SERWIT-1 discipline
+  transplants directly: defer into a lock-free `LineRing` (a generic form of the staging ring) and let
+  the next holder drain it, in order, before writing its own line. `tste` goes further and drops its
+  `Mutex` outright: a fixed array of fixed-size records needs only an atomic index claim, so there is
+  no lock left to lose and no contention-loss path at all.
+* **Sinks that are a view** (`fbcon`) stay lossy on purpose. Painting a deferred backlog would put
+  glyph work inside the masked, locked critical section PANEL-DEFER exists to keep short, and the line
+  is on the wire regardless — the panel is the one sink whose loss costs no evidence. Its obligation is
+  the weaker half of the law: every miss is counted and announced, on the panel (`[fbcon] N line(s)
+  missed the panel`) and on the wire (`[mirror] fbcon: …`).
+
+fbcon also has a second, subtler loss the split paint path introduced: if the **first** chunk of a line
+wins the console lock and a **later** one loses it, the panel shows a line that stops mid-word with no
+indication that it does. That is counted separately as a `torn` line and announced like a drop.
+
+### Accounting
+
+Each tap keeps a `TapCounters` ledger and satisfies
+
+```
+submitted == absorbed + dropped + suppressed + in_flight   (± the sampling window, see below)
+```
+
+`suppressed` is a line the tap **declined by policy** — the GUI owns the panel, quiet-panel is in
+force, the line is not a verdict line. Separating "declined on purpose" from "lost" is the whole point:
+lumping them would make a silently-lossy tap indistinguishable from a correctly-quiet one.
+
+The six counters cannot be read as one instant without a lock, and a lock on the print path is the one
+thing this work forbids. So a snapshot taken while another core sits between its `submit()` and its
+outcome shows that line as unaccounted. **At most one such line can exist per core**, so the tolerance
+is not a fudge factor — it is the core-count ceiling (`MIRROR_WINDOW = 64`). A sampling artefact is
+bounded and vanishes on the next sample; a genuine accounting hole grows without bound with traffic.
+
+### Announcement channels
+
+Each tap announces through **its own** channel, because the reader who needs to know a tap lied is the
+reader of that tap — and they are different people:
+
+* `ftdi` injects `[ftdi] N console line(s) lost to contention` **into the capture stream**. On the 2012
+  rMBP there is no 16550, so on an attended metal sitting the cable is not a mirror of the evidence, it
+  *is* the evidence; a counter the sitting never sees would be worthless.
+* `fbcon` paints its marker on the glass.
+* `flightrec`'s byte-drop note already goes into `UNAOS.LOG`.
+* `tste`'s ring-full count is already printed by `run()`.
+* All four are *also* announced on the wire by `serial_ring::mirror_service()`, polled from the x86
+  main loop. It is self-rate-limiting (the pending counter is swapped to zero by the announcement), so
+  a healthy tap prints nothing at all.
+
+### The SERWIT-2 verdict
+
+Emitted once, on entry to the main loop, after the boot fixtures — SERWIT-1's own multi-core burst
+included — have run through all four taps under real contention. PASS requires the conservation law to
+balance on **all four** taps and zero loss on the **three evidence** taps. `fbcon`'s misses are
+reported but not fatal: the property being proven for a view is that a miss is visible, not that it
+never happens.
+
+## SERWIT-2W — the slot width was a guess, and it was wrong
+
+The aarch64 seat gated SERWIT-1 into their tree and immediately saw `truncated 1`: their F3/K1 witness
+lines run past 340 characters and the 240-byte slot clipped them. **A truncated verdict line breaks an
+`awk` tally exactly as badly as a lost one**, so on that tree the law was not actually held — the
+transport was still corrupting evidence under contention, just more quietly than before.
+
+So the width was measured. All 2786 `serial_print!`/`serial_println!` format strings in the kernel were
+reconstructed (`\`-continuations joined, placeholders charged a pessimistic 20 bytes each):
+
+```
+  > 240 chars: 264 format strings   ← 9.5% of the tree truncated at the old width
+  > 340 chars:  97                  ← the aarch64 seat's floor is NOT the maximum
+  > 512 chars:  21
+  > 768 chars:   6
+  > 896 chars:   1
+  measured maximum: 1291 chars      arch/aarch64/v3d.rs, the v3d59 audit note — a pure
+                                    literal, so this is exact, not an estimate
+```
+
+1291 + newline = **1292 bytes of true worst case**. The chosen width is **1536**: 244 bytes (19%) of
+headroom over it, 655 over the entire rest of the tree.
+
+* **Not 1024** (which would cover 2785 of 2786): it would leave exactly one line truncating on every
+  boot that enables it, and a truncation counter that is permanently non-zero for a known-benign reason
+  is a counter people learn to ignore. At 1536 the counter reads 0, so any non-zero reading is news.
+* **One width, not per-arch**: the >340 population spans both arches — `v3d.rs` and `rtl8168_tegra.rs`
+  on aarch64, `video/wcf.rs`'s `[wc-f]` scanout rollups and `arch/x86_64/syscall.rs`'s S9 verdicts on
+  x86. Two per-arch numbers would each be sized against one seat's lines and silently wrong for the
+  other's, which is the precise failure being closed. Both seats read one number.
+* **Cost**: 64 × 1536 = 96 KiB of `.bss` per staging ring × 3 rings (wire, FTDI, recorder) = 288 KiB,
+  uniform on both arches, present on metal.
+
+Truncation is still counted, still announced, and now **self-evident on the wire**: a clipped line has
+its tail overwritten in place with `…⟨SERWIT-2W: line truncated here⟩`, so a human reading a capture
+cannot mistake a cut line for a complete one. Overwriting rather than appending is deliberate — a
+marker that only appeared when there happened to be room would be absent exactly on the longest lines.
+
+Two silent-truncation bugs of the same family were found and closed while sizing this:
+
+* `flight_recorder::capture` formatted each line into a **256-byte stack buffer** before copying it in,
+  so `UNAOS.LOG` was quietly clipping the widest diagnostics it exists to preserve. The buffer is gone;
+  `LogRing` is the `fmt::Write` sink now, so lines are formatted straight into the ring, whole.
+* `selftest::capture` formatted into a **200-byte** buffer and then searched it for `-> PASS`, with the
+  comment "the verdict marker is early in the line". The marker is at the **end** of the line, by the
+  tree's own convention. Any verdict line over 200 bytes therefore had its marker chopped off before
+  the search ran, and the fixture was **not recorded at all** — not dropped-and-counted, not truncated,
+  simply absent from `tste`'s table as if it had never executed. Replaced with a streaming scanner with
+  no width limit.
+
+### The SERWIT-3 leg
+
+Every SERWIT worker now also emits one line at the widest realistic size (1287 bytes — within five
+bytes of the measured worst case) **through the contended path**, end-sentinelled:
+
+```
+awk '/SERWIT3-END/' target/serial.log | wc -l     # must equal the worker count
+```
+
+Truncation takes the tail, so a clipped probe loses its sentinel by construction. The in-kernel
+assertion (`TRUNCATED` delta == 0 across the stress window) and the on-the-wire sentinel count are
+independent, for the same reason SERWIT-1 sequence-numbers its burst.
+
 ## aarch64
 
 The PL011/Tegra path did **not** share the drop defect: its `_print` used a blocking `SERIAL_PORT.lock()`,

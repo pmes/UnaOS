@@ -24,7 +24,7 @@ use crate::video::FrameBuffer;
 use crate::video::wm;
 #[cfg(target_arch = "x86_64")]
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 use unaos_boot_info::FrameBufferInfo;
 
@@ -523,8 +523,15 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
 /// deadlock: interrupts are masked and the lock is `try_lock`ed, so a contended line just skips
 /// the screen (serial still has it) rather than spinning.
 pub fn _print(args: core::fmt::Arguments) {
+    // SERWIT-2: every exit from this function charges the fbcon tap exactly once — absorbed (it reached
+    // the panel), suppressed (declined by policy) or dropped (contended, and GONE from the panel).
+    // Before this arc there was no counter of any kind, so a panel that was quiet because policy said
+    // so was indistinguishable from a panel that was quiet because it lost the lock.
+    let tap = &crate::serial_ring::TAP_FBCON;
+    tap.submit();
     // Once the GUI owns the screen, don't mirror to the framebuffer (serial still gets it).
     if GUI_ACTIVE.load(Ordering::Relaxed) {
+        tap.suppress();
         return;
     }
     // QUIET-PANEL (x86): no full-stream mirroring. Headless/test builds paint nothing at all;
@@ -535,6 +542,7 @@ pub fn _print(args: core::fmt::Arguments) {
     // has handed the GOP surface back, kernel console text is meant to be ON the panel.
     #[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
     if !PANIC_MIRROR.load(Ordering::Relaxed) && !PANEL_CONSOLE.load(Ordering::Relaxed) {
+        tap.suppress();
         return;
     }
     // PANEL-DEFER (x86): mirror through the split layout/paint path when the draw target is VRAM
@@ -544,7 +552,13 @@ pub fn _print(args: core::fmt::Arguments) {
         let mut sink = PanelSink::new();
         let _ = core::fmt::Write::write_fmt(&mut sink, args);
         if sink.finish() {
-            return; // the split path owned this line (or there was nothing to paint)
+            // The split path owned this line, or there was nothing to paint at all.
+            if sink.split {
+                tap.absorb();
+            } else {
+                tap.suppress();
+            }
+            return;
         }
         // The route was decided against the split path on the FIRST flush — before any pixel was
         // painted — so the line is still untouched and the classic path can render all of it.
@@ -743,11 +757,24 @@ pub fn console_present_suspend(_on: bool) {}
 /// The classic mirror: format straight into the console with interrupts masked for the whole
 /// line. Kept verbatim for the PANIC path and for aarch64.
 fn print_masked(args: core::fmt::Arguments) {
+    let tap = &crate::serial_ring::TAP_FBCON;
     let mut drew = false;
+    let mut ready = false;
     let mut band = None;
     crate::arch::without_interrupts(|| {
         if let Some(mut c) = FBCON.try_lock() {
+            ready = true;
             if c.ready {
+                // SERWIT-2: the panel's OWN announcement channel. A reader looking at the glass cannot
+                // see a counter, so the gap is named where the gap is — one marker per burst, painted
+                // ahead of the line that finally got the lock.
+                let missed = PANEL_UNANNOUNCED.swap(0, Ordering::Relaxed);
+                if missed > 0 {
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut Sink { con: &mut c },
+                        format_args!("[fbcon] {} line(s) missed the panel\n", missed),
+                    );
+                }
                 let _ = core::fmt::Write::write_fmt(&mut Sink { con: &mut c }, args);
                 // Clean just the freshly-drawn rows out to RAM (no-op off the Pi). fbcon pokes
                 // pixels directly rather than via `blit`, so this is what keeps the boot log visible
@@ -763,12 +790,29 @@ fn print_masked(args: core::fmt::Arguments) {
     // `route_present` is a no-op) or "routed and nothing to say", and the whole-box present is the
     // honest answer to the second: this path has no per-chunk state to have accumulated.
     if drew {
+        tap.absorb();
         match band {
             Some(b) => route_present_rows(b),
             None => route_present(),
         }
+    } else if ready {
+        // Lock taken, console not up yet. Declined by policy, not lost.
+        tap.suppress();
+    } else {
+        // THE DROP. `try_lock` lost to a printer on another core (or an IRQ printer nested on this
+        // one) and this line will never appear on the panel. It is legitimately lost — see the tap
+        // discipline in `serial_ring`: painting a deferred backlog would put glyph work inside the
+        // masked critical section PANEL-DEFER exists to keep short, and a mirror that can stall the
+        // primary wire is worse than one that drops. But it is no longer lost SILENTLY.
+        tap.drop_line();
+        PANEL_UNANNOUNCED.fetch_add(1, Ordering::Relaxed);
     }
 }
+
+/// Panel misses not yet announced ON THE PANEL. Separate from the tap ledger's own pending counter so
+/// the glass and the wire do not consume each other's news — the person at the bench sees only the
+/// glass, and the person reading `serial.log` sees only the wire.
+static PANEL_UNANNOUNCED: AtomicU64 = AtomicU64::new(0);
 
 /// Bytes buffered before one layout/paint round-trip. Bounds the stack cost of the op buffer
 /// (`CHUNK * OPS_PER_BYTE` ops), which matters because an IRQ-context printer can nest inside the
@@ -889,6 +933,17 @@ impl PanelSink {
             if !self.decided {
                 self.decided = true;
                 self.split = false;
+            } else if self.split {
+                // SERWIT-2 — THE MID-LINE TEAR. The FIRST chunk of this line won the lock and painted;
+                // a LATER one lost it, so the panel now shows a line that stops in the middle with no
+                // indication that it does. `_print`'s fallback to `print_masked` cannot rescue this
+                // one: that fallback is sound only while the route is undecided (nothing painted yet),
+                // and re-running the whole line here would DUPLICATE the part already on the glass.
+                //
+                // So the tail is legitimately lost, and — like every other loss in this arc — it is
+                // counted and announced rather than left to look like a short line.
+                crate::serial_ring::TAP_FBCON.tear();
+                PANEL_UNANNOUNCED.fetch_add(1, Ordering::Relaxed);
             }
             return;
         };

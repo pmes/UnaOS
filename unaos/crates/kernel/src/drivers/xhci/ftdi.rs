@@ -33,7 +33,7 @@
 //! ROOT-PORT only this arc (the hub-downstream walk is HID-only); FTDI behind a hub is a future arc.
 
 use core::fmt;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spin::Mutex;
 
 /// FT232 identity as emulated by QEMU `usb-serial` (and the real FT232R cable).
@@ -113,15 +113,110 @@ static RING: Mutex<Ring> = Mutex::new(Ring::new());
 /// bulk-OUT drain ever times out or errors — the kernel must never wedge on console TX.
 static LIVE: AtomicBool = AtomicBool::new(false);
 
+/// SERWIT-2 staging ring for the FTDI mirror. See [`mirror`].
+///
+/// 64 slots × 240 bytes ≈ 15 KiB of `.bss`, sized to the same worst burst as the primary wire's ring:
+/// every other core can queue several whole lines while one core holds `RING` for a memcpy and still
+/// not reach the end. It is a `LineRing` and not a second byte ring on purpose — deferral must preserve
+/// WHOLE LINES, or a contended capture reads as interleaved garbage rather than as an ordered log.
+static STAGE: crate::serial_ring::LineRing<64, 240> = crate::serial_ring::LineRing::new();
+
+/// Losses not yet announced IN THE CAPTURE STREAM. Deliberately separate from the tap ledger's own
+/// pending counter: the wire's announcement (`serial_ring::mirror_service`) and the cable's must not
+/// consume each other's news — a bench sitting reads the cable and never sees the wire, and a log
+/// reader sees the wire and never sees the cable.
+static UNANNOUNCED: AtomicU32 = AtomicU32::new(0);
+
+/// Lines staged for the cable but not yet copied into the capture ring.
+pub fn staged_in_flight() -> u64 {
+    STAGE.in_flight()
+}
+
 /// Append a formatted `_print` to the boot-capture ring.
 ///
-/// **try_lock only, never blocks** — the exact discipline of the SERIAL1 `_print` path: on lock
-/// contention the whole message is dropped (we cannot touch the ring without the lock, and we must
-/// not risk a panic-time self-deadlock by blocking); on ring overflow the oldest bytes are dropped
-/// and counted (see [`Ring::push_byte`]). The single lock means push and drain never tear.
+/// **try_lock only, never blocks** — the discipline of the SERIAL1 `_print` path, and non-negotiable:
+/// this runs OUTSIDE `SERIAL1` and OUTSIDE the interrupt mask, so every core reaches it at once, and a
+/// mirror that could block here would be able to stall the primary wire. That inversion would be worse
+/// than any drop.
+///
+/// **SERWIT-2 — what changed.** The failure branch used to be nothing: on contention the whole
+/// formatted line evaporated, with no counter anywhere. That is the costliest instance of the defect in
+/// the tree, because THIS IS THE BENCH'S OWN CAPTURE PATH — the 2012 rMBP has no 16550, so on an
+/// attended metal sitting the FTDI cable is not a mirror of the evidence, it IS the evidence. It lost
+/// lines precisely when the machine was busiest, which is the only moment the wedge and cursor
+/// investigations care about, and it lost them invisibly.
+///
+/// Now: take the ring if it is free (draining anyone else's staged lines first, so deferral never
+/// reorders the capture); otherwise defer the whole line into the lock-free [`STAGE`] ring; and if that
+/// is full too, try the ring once more before giving up — the retry is free (`try_lock`) and turns most
+/// of what would remain into a hit. Only after all three does a line count as lost, and a lost line is
+/// COUNTED and announced IN THE CAPTURE STREAM ITSELF (see [`drain_staged_into`]), which is the only
+/// channel a bench sitting has.
 pub fn mirror(args: fmt::Arguments) {
+    let tap = &crate::serial_ring::TAP_FTDI;
+    tap.submit();
     if let Some(mut ring) = RING.try_lock() {
+        drain_staged_into(&mut ring);
         let _ = fmt::write(&mut *ring, args);
+        tap.absorb();
+        return;
+    }
+    match STAGE.stage(args) {
+        crate::serial_ring::Staged::Whole => {
+            tap.note_staged();
+            return;
+        }
+        crate::serial_ring::Staged::Truncated => {
+            // Sealed with a visible marker in the capture; counted and announced like a loss.
+            tap.note_staged();
+            tap.tear();
+            UNANNOUNCED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        crate::serial_ring::Staged::Full => {}
+    }
+    // Staging ring full: one free retry at the sink before the line is declared lost.
+    if let Some(mut ring) = RING.try_lock() {
+        drain_staged_into(&mut ring);
+        let _ = fmt::write(&mut *ring, args);
+        tap.absorb();
+        return;
+    }
+    tap.drop_line();
+    UNANNOUNCED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Copy every staged line into the capture ring, in order, and put any un-announced loss into the
+/// stream as a real line.
+///
+/// **Caller must hold `RING`** — that is what makes the drainer unique. No print, no allocation and no
+/// second lock happens in here, so it is safe from the same IRQ-masked print context `mirror` is.
+fn drain_staged_into(ring: &mut Ring) {
+    let n = STAGE.drain(|s| {
+        for &b in s.as_bytes() {
+            ring.push_byte(b);
+        }
+    });
+    crate::serial_ring::TAP_FTDI.absorb_n(n);
+    // The cable's own channel. A capture that is short must say so on the capture, not only in a
+    // counter the reader of the capture will never see.
+    let pending = UNANNOUNCED.swap(0, Ordering::Relaxed);
+    if pending > 0 {
+        let mut buf = [0u8; 96];
+        let mut w = crate::serial_ring::BoundedWriter {
+            buf: buf.as_mut_ptr(),
+            cap: buf.len(),
+            n: 0,
+            truncated: false,
+        };
+        let _ = fmt::Write::write_fmt(
+            &mut w,
+            format_args!("\n[ftdi] {} console line(s) lost to contention\n", pending),
+        );
+        let len = w.n;
+        for &b in &buf[..len] {
+            ring.push_byte(b);
+        }
     }
 }
 
@@ -150,6 +245,10 @@ pub fn set_live(v: bool) {
 /// `dst` must point to a writable region of at least `max` bytes.
 pub unsafe fn drain_into(dst: *mut u8, max: usize) -> usize {
     let mut ring = RING.lock();
+    // SERWIT-2: fold anything staged by a contended `mirror` into the capture BEFORE deciding what to
+    // push out the cable, so a staged line reaches the wire on this pass rather than waiting for the
+    // next print. A quiet machine that stopped printing must not leave its last lines in the ring.
+    drain_staged_into(&mut ring);
     let n = max.min(ring.len);
     for i in 0..n {
         let idx = (ring.head + i) % CAP;
