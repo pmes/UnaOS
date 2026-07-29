@@ -336,6 +336,13 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         }
     }
 
+    // SDHC-1 (milestone 1): storage-class PCI census + the read-only SD Host Controller
+    // version/capability probe. Runs HERE — after the GPU dispatch (paging + the frame allocator
+    // the MMIO mapping needs are long up) and BEFORE the network block, which `return`s early on a
+    // non-Intel NIC and would otherwise swallow the witness on the 2012 rMBP (Broadcom Wi-Fi).
+    // Read-only end to end: no reset, no clock/power programming, no command, no config write.
+    crate::drivers::sdhc::probe();
+
     // Network controller (PCI class 0x02 = Network, subclass 0x00 = Ethernet).
     // QEMU's e1000 (82540EM) lands here; bring it up for polled RX.
     if let Some((bus, slot, func)) = crate::drivers::pci::PciScanner::find_device(0x02, 0x00) {

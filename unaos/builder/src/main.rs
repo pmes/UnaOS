@@ -588,6 +588,29 @@ fn main() {
     }
     cmd.arg("-device").arg("e1000e,netdev=n0,mac=52:54:00:12:34:56");
 
+    // SDHC-1 (DEFAULT-ON, opt out with UNAOS_NOSDHCI=1): attach QEMU's generic PCI SD host
+    // controller (`sdhci-pci`, which reports the SAME class triple as the rMBP's reader — class
+    // 0x08 / subclass 0x05) with an SD card plugged into it, so the read-only SDHC-1 discovery
+    // probe has QEMU coverage: `[PCI-STOR]` sees a storage-class function and `[sdhc]` reads a
+    // real Host Controller Version + Capabilities out of BAR0. Attached LAST so no existing
+    // device's PCI slot assignment moves. The card image is a blank 16 MiB (power-of-two, which
+    // QEMU's sd-card requires) file in target/ — milestone 1 transfers no data, it only needs the
+    // slot to read as occupied so the present-state witness is not trivially empty.
+    // Kept in sync with unaos/arroyo (UNAOS_NOSDHCI).
+    if std::env::var("UNAOS_NOSDHCI").is_err() {
+        let sd_image = target_dir.join("sdcard.img");
+        if !sd_image.exists() {
+            let f = std::fs::File::create(&sd_image).expect("failed to create target/sdcard.img");
+            f.set_len(16 * 1024 * 1024).expect("failed to size target/sdcard.img");
+        }
+        cmd.arg("-device").arg("sdhci-pci,id=sdhci0")
+           .arg("-drive").arg(format!("if=none,id=sdcard0,format=raw,file={}", sd_image.display()))
+           // QEMU names sdhci-pci's child bus plainly `sd-bus` (hw/sd/sdhci.c), not `<id>.sd-bus`.
+           .arg("-device").arg("sd-card,bus=sd-bus,drive=sdcard0");
+        println!("   SDHC-1 (default-on): sdhci-pci + sd-card attached ({}) — read-only SDHCI discovery target (UNAOS_NOSDHCI=1 to opt out)",
+            sd_image.display());
+    }
+
     // DIAGNOSTIC: append arbitrary QEMU args from UNAOS_QEMU_EXTRA (whitespace-split), e.g.
     // `-d guest_errors -trace usb_xhci_* -trace usb_msd_*`, so we can capture QEMU's own
     // tracing of the xHCI/SCSI path. In test mode QEMU's stderr is redirected to a file.

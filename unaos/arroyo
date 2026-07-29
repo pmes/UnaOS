@@ -414,6 +414,20 @@ case "${UNAOS_FATIMG:-}" in
     *) STICK_IMG="${UNAOS_FATIMG}";;
 esac
 
+# SDHC-1 (x86 `test`/`x86`, DEFAULT-ON): builder/src/main.rs attaches QEMU's generic PCI SD host
+# controller (`sdhci-pci` — the SAME class 0x08/subclass 0x05 triple as the 2012 rMBP's built-in
+# card reader) with a blank 16 MiB card (target/sdcard.img) in its slot, so the kernel's read-only
+# SDHCI discovery probe has QEMU coverage: `[PCI-STOR]` inventories a storage-class function and
+# `[sdhc]` reads a live Host Controller Version + Capabilities out of BAR0. UNAOS_NOSDHCI=1 OPTS OUT
+# (no controller, no card => the `[sdhc] no SD host controller found` control line). This is a QEMU
+# ARG knob only — no kernel feature, so the media is byte-identical whichever way it points. The
+# builder reads the variable from the inherited environment; echoed here so `./arroyo` is the one
+# place every knob is documented. Kept in sync with builder/src/main.rs.
+if [ -n "${UNAOS_NOSDHCI:-}" ]; then
+    export UNAOS_NOSDHCI
+    echo -e "${COLOR_YELLOW}⚡ UNAOS_NOSDHCI: no sdhci-pci/sd-card in QEMU — SDHC-1 probe reports no controller${COLOR_RESET}"
+fi
+
 # --- Build Functions ---
 
 build_kernel_x86_64() {

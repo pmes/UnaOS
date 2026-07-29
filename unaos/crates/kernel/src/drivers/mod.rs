@@ -14,6 +14,11 @@ pub mod ehci;
 pub mod smc;
 pub mod block;
 pub mod e1000;
+// SDHC-1 (milestone 1): read-only SD Host Controller discovery on x86 — the 2012 rMBP's built-in
+// card reader. Version/capability/present-state reads only; issues no MMIO write at all, so it is
+// unconditional on this arch (there is no state it can perturb).
+#[cfg(target_arch = "x86_64")]
+pub mod sdhc;
 // M6g: the BCM2711 EMMC2/SDHCI microSD driver backing the block layer on the bare-metal Pi 4.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 pub mod emmc2;
