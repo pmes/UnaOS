@@ -118,6 +118,45 @@ a **busy** pass (a task was dispatched) or an **idle** pass (empty run queue).
   Self-healing: a core re-entering `run()` refreshes the stamp and reports live
   numbers again. General across boards — the same guard covers the x86 BSP inline
   loop and any parked/never-scheduled core.
+- **The window is aged at READ time, not only at dispatch boundaries (PULSE-5).**
+  SCHED-5/SCHED-7/SCHED-8 all fold at the same two points — after `switch_context`
+  returns, and at the bottom of `run()`'s pass — and both are **dispatch
+  boundaries**. So the reported number was only ever as fresh as the core's last
+  boundary. Best case that is a *previous* window, 250–500 ms old by construction
+  (the P69 sighting: "45% unused" printed while vugs were starving). Worst case a
+  single compute-bound task holds the core, nothing is folded, nothing rolls, and
+  `recent_pct` freezes at its **pre-storm value for the whole span** — total on QEMU
+  raspi4b, where no Group-1 timer delivery means no preemption to break the span at
+  all; on metal the ~12 ms quantum breaks it, but the value still lags a window and
+  the core trips SCHED-8's ~500 ms staleness bound whenever a fold gap exceeds it,
+  at which point the honest views drop to `--` and `ui_status::live_permille`
+  returns `None` — *the busiest core on the machine reporting "no live number"*.
+  That matters because two consumers are **decision** paths, not displays:
+  `pick_cpu`'s tie-break and `video::screen::flush_parallel`'s helper ranking +
+  headroom weights, both of which a stale-low percent steers *toward* the saturated
+  core. PULSE-5 publishes the execution span's start (`CoreAccount::run_t0`, one
+  relaxed store before `switch_context`, cleared by the fold) and has `busy_pct()`
+  add `now - run_t0` into the window when the value is **read**: a whole window
+  covered by one span reads 100% outright; otherwise the measured part is reported
+  at full weight and only the *unmeasured remainder* of the window is filled from
+  the last completed window's rate, so the historical term's weight decays to zero
+  as the window fills. `tracked()` gains the matching arm — a core with a live span
+  is being accounted by definition — while `fold_age_cyc` is left untouched, so
+  WEDGE-1's much tighter "may I pin work here" gate still reads the raw fold age.
+  **Why not account-at-tick** (roll the window from the 250 Hz timer IRQ): the tick
+  is metal-only, so it would be dead code in the very gate that has to prove it and
+  would leave the total-freeze case unfixed on QEMU; it cannot see the in-flight
+  span without moving the busy anchor out of `dispatch_next`'s stack frame into
+  shared, interrupt-reentrant state *on the switch path*; and it would pay on every
+  tick of every core forever, where age-on-read pays only when someone asks.
+  Ordering: the fold clears `run_t0` **before** publishing `win_busy_cyc`
+  (`Release`), the reader loads `win_busy_cyc` (`Acquire`) **before** `run_t0`, so a
+  span can never be counted twice; the converse skew under-counts by one span for
+  one read, which is exactly the pre-PULSE-5 behaviour. Hot-path cost: one relaxed
+  store on the context-switch path, one relaxed store in the fold, one
+  `Relaxed`→`Release` upgrade on an existing store; a read costs two atomic loads,
+  one CNTPCT read and integer math. Nothing is locked and SPREAD-3's residents
+  accounting is untouched.
 - **Context-switch count.** A cumulative `ctx_switches` per core (one per busy
   dispatch).
 - **Last-scheduled task.** Id + `&'static str` name of the last task dispatched
@@ -137,6 +176,22 @@ IRQ). A non-degeneracy witness (`load_accounting_witness`) runs in the pi
 `kernel8-test` battery after the cooperative demo and asserts the accounting is
 live — at least one core busy and the context-switch counter advanced — catching
 a regression that freezes it: `:: AARCH64 SCHED: load-accounting PASS (...) ::`.
+
+PULSE-5 adds one line beside both of those, emitted by `pulse5_witness()`:
+
+```
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms span_max=0ms window=250ms folds=0
+```
+
+`live cN` is how long that core has been inside its *current* task at this
+instant — the term the percents now include and previously omitted entirely;
+`span_max` is the worst such span seen (i.e. how stale the old `recent_pct` would
+have been, invisibly, for that long); `folds` counts windows still closed by the
+dispatch-boundary path, which is unchanged — reads simply no longer wait on it.
+It is emitted from the metal heartbeat (inheriting that line's change-only
+suppression, so no steady-state chatter) and once from `load_accounting_witness`,
+so the QEMU battery — where `timer_preempt` never runs — still exercises and shows
+the aged read.
 
 ### Load-balanced placement (aarch64, SCHED-3)
 
@@ -309,7 +364,13 @@ is already **committed**:
   `CPU_AUTO` placement must see.
 
 The accounting is O(1), adds no migration machinery, and — unlike depth and
-`busy_pct_recent` — cannot lag the decisions it exists to inform. Where no EL0
+`busy_pct_recent` — cannot lag the decisions it exists to inform. (PULSE-5 has
+since removed the worst of `busy_pct_recent`'s lag by aging the in-flight
+execution span in at read time, so a core running one compute-bound task no
+longer reports its pre-storm percent indefinitely. It is still a rolling window
+and still cannot see a spawn that has not started executing, which is exactly why
+committed residents remain **key 1** and are not superseded by the fresher
+percent.) Where no EL0
 task exists (the `virt`/JC3 kernel-thread builds; `placement_spread_witness`,
 which runs at the top of `start_aps`) every core reads 0 residents, the new key
 is a universal tie, and placement is byte-identical to SCHED-3.

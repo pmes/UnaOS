@@ -327,6 +327,51 @@ fn load_window_cyc() -> u64 {
 /// Sentinel `recent_pct` meaning "no window has completed yet" (fall back to the partial window).
 const LOAD_PCT_NONE: u32 = u32::MAX;
 
+// PULSE-5 — A WINDOW THAT CLOSES ONLY AT A DISPATCH BOUNDARY CANNOT REPORT A CORE THAT NEVER
+// REACHES ONE.
+//
+// SCHED-5/SCHED-7 fold a span into the window at exactly two points: after `switch_context` returns
+// (busy) and at the bottom of `run()`'s pass (idle). Both are DISPATCH BOUNDARIES. So the reported
+// number — `recent_pct`, the last COMPLETED window — is only as fresh as the core's last boundary:
+//
+//   * best case (a core cycling the loop): the value is a *previous* window, i.e. 250-500 ms old
+//     by construction. That is the P69 shape — "45% unused" printed while vugs were starving.
+//   * worst case (one compute-bound task holding the core): the busy span is UNBOUNDED — nothing is
+//     folded and nothing rolls, so `recent_pct` freezes at its pre-storm value for as long as the
+//     task runs. In the QEMU raspi4b gate there is no Group-1 timer delivery at all, so there is no
+//     preemption to break the span and the freeze is total; on metal the quantum (3 ticks, ~12 ms)
+//     does break it, but the value still lags a whole window, and the core trips SCHED-8's
+//     `tracked()` staleness bound whenever a fold gap exceeds ~500 ms — at which point every honest
+//     consumer (`SCHED: load`, `top`, `ui_status::live_permille`) drops to `--`/no-live-number and
+//     the status strip falls back to the coarse dispatch-pass classifier.
+//
+// Everything downstream of that number inherits the lag, and two of the consumers are DECISION
+// paths, not displays: `pick_cpu`'s tie-break key 4 (placement) and `video::screen::flush_parallel`'s
+// helper ranking + headroom weights (which core gets a render band). A stale-low percent on a
+// saturated core therefore attracts MORE work to the core that is already the problem.
+//
+// THE FIX IS AGE-ON-READ, not account-at-tick. `busy_pct()` now adds the CURRENTLY-EXECUTING span
+// (`now - run_t0`) into the window's busy total at READ time, so a long-running task's core reads
+// honestly busy within a single read, with no dispatch boundary required. See `run_t0` and
+// `busy_pct` for the mechanism and the ordering argument.
+//
+// Why not account-at-tick (close/roll the window from the 250 Hz timer IRQ)? Three reasons, in
+// order of weight:
+//   1. The tick does not exist where the bug is worst. `timer::on_tick` / `timer_preempt` are
+//      METAL-ONLY — QEMU raspi4b never delivers the timer PPI — so a tick-driven window would be
+//      dead code in the gate that has to prove it, and would leave the total-freeze case unfixed on
+//      exactly the platform where the span is never broken at all.
+//   2. It cannot see the in-flight span without moving state. The busy anchor (`busy_t0`) is a
+//      LOCAL in `dispatch_next`, live on the scheduler stack across `switch_context`; a tick
+//      handler firing on top of the running task would have to take ownership of that anchor and
+//      re-publish a partial span — i.e. push state the dispatch path exclusively owns into a
+//      shared, interrupt-reentrant location, on the switch path, to buy a COARSER answer.
+//   3. The cost lands on the wrong path. Account-at-tick pays on every tick of every core forever;
+//      age-on-read pays only when someone asks, and readers are the rare path (a 4 Hz strip, a
+//      1024-tick witness, placement).
+// Age-on-read costs ONE relaxed store on the dispatch path, one relaxed store in the fold, and one
+// extra sysreg read + two loads per READ. It is strictly cheaper and strictly fresher.
+
 /// One core's load accounting slot. All fields written ONLY by the owning core's scheduler loop
 /// (single-writer, Relaxed); read cross-core by introspection. The last-task triple is seqlock-
 /// protected (odd `last_seq` = write in progress) so a reader never reconstructs a torn `&str`.
@@ -340,6 +385,22 @@ struct CoreAccount {
     win_idle_cyc: AtomicU64,
     /// Busy percent (0..=100) of the last COMPLETED window, or `LOAD_PCT_NONE` before the first.
     recent_pct: AtomicU32,
+    /// PULSE-5 — CNTPCT timestamp at which the CURRENTLY-EXECUTING task's span began on this core,
+    /// or 0 when this core is not inside a task (scheduler overhead, idle, or it left `run()`).
+    /// Published by the owning core immediately before `switch_context` and cleared by the fold in
+    /// `account()`; it is the ONLY thing a reader needs to age the in-flight span (`now - run_t0`)
+    /// into the current window, which is what makes `busy_pct()` independent of dispatch boundaries.
+    ///
+    /// ORDERING (the one subtle part). A cross-core reader must never count the same span twice —
+    /// once as `now - run_t0` and again inside `win_busy_cyc` after the fold folded it. The writer's
+    /// order in `account()` is: clear `run_t0` (Relaxed) THEN publish `win_busy_cyc` (Release). The
+    /// reader's order in `busy_pct()` is: load `win_busy_cyc` (Acquire) THEN load `run_t0`
+    /// (Relaxed). If the reader's Acquire load observes the post-fold busy total it
+    /// synchronizes-with that Release store, so the preceding `run_t0 = 0` is visible to its later
+    /// load and the span cannot be added twice. The converse skew (reader sees the pre-fold total
+    /// and a freshly-cleared `run_t0`) merely UNDER-counts by one span for one read — which is
+    /// exactly the pre-PULSE-5 behaviour, so it is never worse than the code it replaces.
+    run_t0: AtomicU64,
     /// SCHED-8 — CNTPCT timestamp of the most recent `account()` fold (0 = never accounted). A core
     /// running `run()` folds a busy OR idle span every dispatch pass, so this stays fresh; a core that
     /// left `run()` (the Pi/tegra BSP `hlt_loop`s after spawning services; the virt boot core spin-loops
@@ -365,6 +426,7 @@ impl CoreAccount {
             win_busy_cyc: AtomicU64::new(0),
             win_idle_cyc: AtomicU64::new(0),
             recent_pct: AtomicU32::new(LOAD_PCT_NONE),
+            run_t0: AtomicU64::new(0),
             last_acct_cyc: AtomicU64::new(0),
             last_seq: AtomicU64::new(0),
             last_id: AtomicU64::new(0),
@@ -383,16 +445,22 @@ impl CoreAccount {
         // SCHED-8: mark the slot fresh — every dispatch pass in `run()` folds a span, so a core still
         // inside the scheduler keeps this current; a core that left `run()` stops touching it (goes STALE).
         self.last_acct_cyc.store(now_cyc(), Ordering::Relaxed);
+        // PULSE-5: any fold ENDS the in-flight span — whatever was executing has now been measured
+        // and is about to land in `win_busy_cyc`, so a reader must stop aging it. Cleared BEFORE the
+        // busy total is published (Release, below) so the pair can never be read as a double count;
+        // see `run_t0`'s ordering note. One relaxed store; no branch, both call sites covered.
+        self.run_t0.store(0, Ordering::Relaxed);
         let busy = self.win_busy_cyc.load(Ordering::Relaxed) + busy_cyc;
         let idle = self.win_idle_cyc.load(Ordering::Relaxed) + idle_cyc;
         let total = busy + idle;
         if total >= load_window_cyc() {
             self.recent_pct.store((busy * 100 / total) as u32, Ordering::Relaxed); // total>=budget>0
-            self.win_busy_cyc.store(0, Ordering::Relaxed);
             self.win_idle_cyc.store(0, Ordering::Relaxed);
+            self.win_busy_cyc.store(0, Ordering::Release); // PULSE-5: publishes the `run_t0` clear
+            PULSE5_FOLD_WINDOWS.fetch_add(1, Ordering::Relaxed);
         } else {
-            self.win_busy_cyc.store(busy, Ordering::Relaxed);
             self.win_idle_cyc.store(idle, Ordering::Relaxed);
+            self.win_busy_cyc.store(busy, Ordering::Release); // PULSE-5: publishes the `run_t0` clear
         }
     }
 
@@ -409,19 +477,65 @@ impl CoreAccount {
         self.last_seq.store(seq + 2, Ordering::Release); // even: stable
     }
 
-    /// Busy percent (0..=100) for `core_load`: the last completed window, or the partial window if
-    /// none has completed yet (0 when the core has never run a pass).
-    fn busy_pct(&self) -> u32 {
-        let recent = self.recent_pct.load(Ordering::Relaxed);
-        if recent != LOAD_PCT_NONE {
-            return recent;
-        }
-        let busy = self.win_busy_cyc.load(Ordering::Relaxed);
-        let total = busy + self.win_idle_cyc.load(Ordering::Relaxed);
-        if total == 0 {
+    /// PULSE-5 — CNTPCT cycles the core has ALREADY spent inside the task it is executing right now,
+    /// or 0 if it is not inside one. This is the quantity SCHED-5's fold cannot see until the task
+    /// switches back, and therefore the quantity whose absence froze `busy_pct` under a compute-bound
+    /// task. One relaxed load + one sysreg read; safe from any core (CNTPCT is system-global, so
+    /// `now - run_t0` is a real elapsed span whichever core evaluates it).
+    #[inline]
+    fn live_span_cyc(&self) -> u64 {
+        let t0 = self.run_t0.load(Ordering::Relaxed);
+        if t0 == 0 {
             0
         } else {
-            (busy * 100 / total) as u32
+            now_cyc().wrapping_sub(t0)
+        }
+    }
+
+    /// PULSE-5 — busy percent (0..=100) for `core_load`, computed for the window AS IT STANDS NOW
+    /// rather than as of the last completed one. Three cases, in the order they are tested:
+    ///
+    ///   1. The in-flight span alone covers a whole window: the last ~250 ms were, in their
+    ///      entirety, this core executing one task. That is 100%, and no other term can change it —
+    ///      this is the compute-bound case the arc exists for, and it is now a single read away
+    ///      from the truth instead of an unbounded wait for a dispatch boundary.
+    ///   2. The current (partial) window plus the in-flight span already spans a full window's
+    ///      worth of measured time: report that occupancy directly. No stale term is consulted.
+    ///   3. The window is still short: report the measured part at full weight and fill only the
+    ///      REMAINDER of the window from the last completed window's rate. This is what keeps the
+    ///      number continuous — a core that has just rolled its window does not drop to a noisy
+    ///      two-millisecond sample — while bounding how much of the answer can be historical: the
+    ///      stale term's weight is exactly the fraction of the window not yet measured, and it
+    ///      decays to zero as the window fills. Before any window has completed (`LOAD_PCT_NONE`)
+    ///      there is no historical rate, so it falls through to the measured part alone.
+    ///
+    /// Read order (`win_busy_cyc` Acquire, then `run_t0`) is load-bearing against double-counting a
+    /// span that the fold has just banked; see `run_t0`. Lock-free, allocation-free, callable from
+    /// any core, and cheap enough for `pick_cpu`: two atomic loads, one sysreg read, integer math.
+    fn busy_pct(&self) -> u32 {
+        let budget = load_window_cyc();
+        // Acquire pairs with `account`'s Release store; it must be read BEFORE `run_t0`.
+        let win_busy = self.win_busy_cyc.load(Ordering::Acquire);
+        let win_idle = self.win_idle_cyc.load(Ordering::Relaxed);
+        let live = self.live_span_cyc();
+        if live >= budget {
+            return 100; // case 1 — the whole window is one uninterrupted execution span
+        }
+        let busy = win_busy + live;
+        let elapsed = busy + win_idle;
+        let recent = self.recent_pct.load(Ordering::Relaxed);
+        if elapsed >= budget || recent == LOAD_PCT_NONE {
+            // case 2 (and the pre-first-window fallback): measured time only.
+            if elapsed == 0 {
+                0
+            } else {
+                ((busy * 100 / elapsed) as u32).min(100)
+            }
+        } else {
+            // case 3 — measured part at full weight, the unmeasured remainder at the last window's
+            // rate. `busy` < 2*budget and `recent` <= 100, so both products stay far inside u64.
+            let rem = budget - elapsed;
+            (((busy * 100 + recent as u64 * rem) / budget) as u32).min(100)
         }
     }
 
@@ -436,6 +550,20 @@ impl CoreAccount {
         let last = self.last_acct_cyc.load(Ordering::Relaxed);
         if last == 0 {
             return false; // never accounted — this core has not run the scheduler loop
+        }
+        // PULSE-5: a core with an IN-FLIGHT execution span is being accounted by definition — it is
+        // inside `run()`, executing a dispatched task, and `busy_pct()` now measures that span
+        // live. Before this arm, a core holding one compute-bound task for longer than two windows
+        // went `--` at exactly the moment it was the busiest thing on the machine: the fold gap
+        // aged past the staleness bound, `SCHED: load` printed `--`, and `ui_status::live_permille`
+        // returned None so the status strip fell back to the dispatch-pass classifier — the
+        // "45% unused while vugs starved" reading. The fold-age bound below still governs every
+        // core that is NOT executing (BSP `hlt_loop`, post-CAPSTONE spin, never-scheduled), which
+        // is the case SCHED-8 introduced it for; `fold_age_cyc` is deliberately left untouched, so
+        // WEDGE-1's much tighter "may I pin work here" gate keeps reading the raw fold age and
+        // still disqualifies a core that is not going round the dispatch loop.
+        if self.run_t0.load(Ordering::Relaxed) != 0 {
+            return true;
         }
         now_cyc().wrapping_sub(last) < load_window_cyc().saturating_mul(2)
     }
@@ -487,6 +615,10 @@ pub struct CoreLoad {
     /// SCHED-5 — busy TIME fraction (0..=100): CNTPCT cycles spent executing tasks over the most recent
     /// ~250 ms window (was, pre-SCHED-5, the fraction of dispatch PASSES that ran work — a cadence proxy
     /// that read ~50% for a task waking once per tick; now it is real CPU utilization).
+    ///
+    /// PULSE-5 — and it is CURRENT, not last-window. The value includes the span the core is executing
+    /// at this instant, so a core inside a multi-second compute-bound task reads ~100% on the first
+    /// read rather than reporting its pre-storm percent until the task ends. See `CoreAccount::busy_pct`.
     pub busy_pct_recent: u32,
     /// Cumulative context switches into a task on this core since boot.
     pub ctx_switches: u64,
@@ -910,7 +1042,11 @@ static AUTO_ROTATE: AtomicUsize = AtomicUsize::new(0);
 //     flat-out inside one compute-bound vug reads depth 0, exactly like a genuinely idle core.
 //   * the rolling busy fraction (`CoreAccount::busy_pct`) is a ~250 ms LAGGING window. A burst of
 //     spawns issued inside one window all read the SAME pre-burst percentage, so they all agree on the
-//     same "least busy" core and all land on it.
+//     same "least busy" core and all land on it. (PULSE-5 has since removed the WORST of that lag —
+//     `busy_pct` now ages the in-flight execution span in at read time, so a core running one
+//     compute-bound task no longer reports its pre-storm percent indefinitely. It is still a rolling
+//     window and still cannot see a spawn that has not started executing, which is precisely why the
+//     committed-residents key below remains key 1 and is NOT superseded by the fresher percent.)
 //
 // Together those produce the P68 measurement (27 bg-el0 -> c3, 18 -> c0, 8 -> c1, ~0 -> c2 while
 // c0/c3 sat at 99% and c1/c2 at ~80%): placement keeps re-reading a signal that has not yet caught up
@@ -2118,6 +2254,12 @@ fn dispatch_next(cpu: usize) -> bool {
     // that fired while it ran) — the "busy" time for time-based load accounting. Two sysreg reads per
     // dispatch, off the per-instruction path.
     let busy_t0 = now_cyc();
+    // PULSE-5: publish that anchor before switching in, so the span is READABLE while it is still
+    // running instead of only after it ends. One relaxed store, no sysreg read of its own (it
+    // reuses the `busy_t0` this path already took), no ordering constraint on the switch. It is
+    // cleared by the fold below (`account`). This single store is the whole cost of the fix on the
+    // context-switch path.
+    ACCT[cpu].run_t0.store(busy_t0, Ordering::Relaxed);
     unsafe {
         switch_context(SCHED[cpu].scheduler_sp.as_ptr(), entry_sp);
     }
@@ -3937,6 +4079,24 @@ static LOAD_WITNESS_LAST: AtomicU64 = AtomicU64::new(u64::MAX);
 /// `ctx_switches` sum snapshot at the last emission, to derive the per-window context-switch delta.
 static LOAD_WITNESS_CTX: AtomicU64 = AtomicU64::new(0);
 
+/// PULSE-5 — count of load windows closed by a FOLD (`account` reaching the budget at a dispatch
+/// boundary). It is the denominator of the arc's claim: reads are no longer waiting on these. Bumped
+/// once per window per core (~4/s/core), never per dispatch, so it adds nothing measurable to the
+/// switch path.
+static PULSE5_FOLD_WINDOWS: AtomicU64 = AtomicU64::new(0);
+/// PULSE-5 — high-water in-flight execution span (CNTPCT cycles) seen at witness sample time. This is
+/// the staleness that used to be invisible: pre-PULSE-5 a span this long contributed NOTHING to the
+/// reported percent until it ended. Sampled only by the witness (~1 s cadence, metal-only), so it is
+/// a floor on the true maximum, never an inflation of it.
+static PULSE5_SPAN_MAX_CYC: AtomicU64 = AtomicU64::new(0);
+
+/// CNTPCT cycles → milliseconds, for witness output only. Uses the same cached CNTFRQ the load window
+/// is derived from, so the two numbers are always expressed against one clock.
+fn cyc_to_ms(cyc: u64) -> u64 {
+    let frq = load_window_cyc().saturating_mul(4).max(1); // load_window_cyc() == CNTFRQ/4
+    cyc / (frq / 1000).max(1)
+}
+
 /// SCHED-2 periodic load heartbeat: called once per `timer_preempt` (per core, per tick, metal-only).
 /// The core whose atomic increment lands exactly on the `LOAD_WITNESS_INTERVAL` boundary is the sole
 /// emitter for that window (fetch_add hands each multiple to exactly one core), so there is no
@@ -3973,6 +4133,36 @@ fn load_witness_tick() {
     serial_println!(
         ":: SCHED: load c0={} c1={} c2={} c3={} (ctx +{}/win) ::",
         c(0), c(1), c(2), c(3), ctx_delta
+    );
+    pulse5_witness();
+}
+
+/// PULSE-5 — the proof line for age-on-read. It says three things and nothing else: how long each
+/// core has been inside its current task RIGHT NOW (`live cN=..ms` — the term the reported percents
+/// now include and previously omitted entirely), the worst such span seen so far (`span_max` — the
+/// staleness the old `recent_pct` would have been carrying, invisibly, for that whole span), and how
+/// many windows the FOLD path closed (`folds` — unchanged machinery, kept so the line shows the
+/// dispatch-boundary path still working rather than replaced; reads simply no longer wait on it).
+/// A `span_max` well past `window` beside a `SCHED: load` line that still reads honestly busy is the
+/// whole arc in one line.
+///
+/// Two callers, deliberately: `load_witness_tick` (metal, the attended-boot proof, inheriting that
+/// line's change-only suppression so it adds no steady-state chatter) and `load_accounting_witness`
+/// (once, in the QEMU battery — otherwise nothing in the gate exercises the aged read at all, since
+/// `timer_preempt` never runs on raspi4b). Reads only; safe from any core.
+fn pulse5_witness() {
+    let mut live_ms = [0u64; 4];
+    for cpu in 0..NUM_CPUS.min(4) {
+        let span = ACCT[cpu].live_span_cyc();
+        PULSE5_SPAN_MAX_CYC.fetch_max(span, Ordering::Relaxed);
+        live_ms[cpu] = cyc_to_ms(span);
+    }
+    serial_println!(
+        "[pulse5] live c0={}ms c1={}ms c2={}ms c3={}ms span_max={}ms window={}ms folds={}",
+        live_ms[0], live_ms[1], live_ms[2], live_ms[3],
+        cyc_to_ms(PULSE5_SPAN_MAX_CYC.load(Ordering::Relaxed)),
+        cyc_to_ms(load_window_cyc()),
+        PULSE5_FOLD_WINDOWS.load(Ordering::Relaxed),
     );
 }
 
@@ -4028,6 +4218,9 @@ pub fn load_accounting_witness() {
             any_busy, any_ctx
         );
     }
+    // PULSE-5: the aged-read state behind the percents just asserted, on the one path the QEMU
+    // battery actually reaches. Separate line, so the PASS/FAIL line the gate matches is untouched.
+    pulse5_witness();
 }
 
 /// M3b/M4a/M4-capstone: turn on preemptive scheduling and put a workload on the APs, then flip
