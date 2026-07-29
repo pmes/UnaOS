@@ -4253,3 +4253,92 @@ wiring and no-regression only. The line carries its evidence on the bench.
   `[wc-h] staged=no reason=` next.
 * **`[cursor12]` appearing at all on an rmbp capture** is itself the first result: it means the x86
   track can finally see the cursor mechanism it has been tuning blind.
+
+### CURSOR-WCR — the pointer path's uncached read cost, and where the second repaint actually is
+
+The x86 pointer complaint after CURSOR-X86 ("mouse still very laggy") was attributed to a double
+`video::cursor::repaint()` per HID report at `main.rs:2238/2242` and `main.rs:3232/3241`. **That
+attribution is wrong, and acting on it would have broken the Pi.** Both of those functions —
+`route_input_to_active_el0` and `render_service` — are `#[cfg(all(target_arch = "aarch64", feature =
+"baremetal"))]`. `pal::cursor::SPRITE_OWNS_PAINT` is `false` on aarch64, so `repaint_on_move` is a
+no-op there and those explicit `repaint()` calls are the *only* thing that paints the compositor
+sprite on the Pi render path. They are load-bearing, not redundant, and they do not exist on x86 at
+all.
+
+#### Where the x86 report really goes
+
+One pointer report through `kernel_main`'s console loop runs **four** front-buffer pixel walks, i.e.
+two whole repaints' worth of read-back:
+
+| # | site | walk |
+|---|------|------|
+| 1 | `pal::cursor::restore` → `video::cursor::undraw` | colour-guard read of every painted pixel |
+| 2 | `pal::cursor::move_rel` → `repaint` → `draw_locked` | save-under read of every painted pixel |
+| 3 | `TargetPal::render` → `cursor::undraw` (the flush bracket) | colour-guard read |
+| 4 | `TargetPal::render` → `cursor::ensure_drawn` → `draw_locked` | save-under read |
+
+`draw_over` → `ensure_drawn` between 2 and 3 is the documented idempotent no-op.
+
+#### The arithmetic
+
+The sprite is 8×8 arrow blocks plus a one-block drop shadow, `9·s` px square at block scale
+`s = clamp(height/900, 1, 4)`. Painted (and therefore read) pixels are `36·s²`: 28 arrow blocks plus
+the 8 shadow blocks the arrow does not already cover. The bench rMBP panel is 2880×1800, so `s = 2`
+and `N = 144`. (`s = 4` needs a ≥3600 px-tall panel; no bench machine has one.)
+
+`FrameBuffer::read_pixel` issues **three** separate `read_volatile` byte loads per pixel, and the
+panel is WC-mapped (`x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4)`) — WC is uncacheable for reads, so
+each byte load is its own aperture round trip.
+
+| | aperture read transactions per HID report |
+|---|---|
+| before | 4 walks × `N` px × 3 bytes = `12N` = **1728** at `s=2` |
+| after | 3 walks × `N` px × 1 word = `3N` = **432** at `s=2` |
+
+**4× overall**, from two independent changes:
+
+* **`PanelRead` (`video/cursor.rs`)** — where the layout is a full 4-byte pixel with a 4-byte-aligned
+  base (every x86 panel this kernel has met), one aligned volatile `u32` load returns the same three
+  colour bytes in one transaction. The read-side twin of the 3:1 `put_raw4`/`encode4` already take on
+  the write side. Values are `read_pixel`'s exactly — same bounds tests, same `0x00RRGGBB` inverse,
+  `None` on `U8` as before — so no save-under, colour-guard or fail-closed verdict changes. Applied
+  to all five front-buffer walks (`undraw_locked`, `undraw_within_locked`, `settle_pending_locked`,
+  `redraw_off_locked`, `draw_locked`); `compose_into`'s read of the RAM back layer is untouched.
+  x86-gated, like its write-side twins: aarch64's panel is cached RAM where three byte loads are
+  three L1 hits, and on that arch `PanelRead::of` never reports a fast path.
+* **Walk 1 deleted on x86 (`main.rs`)** — the leading `pal::cursor::restore` in the console loop's
+  `Mouse`/`MouseAbsolute` arms was `video::cursor::undraw()` immediately in front of a `repaint`
+  whose own `undraw_locked` performs the same restore. Beyond the wasted walk it cleaned WHOLE
+  SCANLINES (`flush_box`) where the repaint's `FlushUnion` cleans only the sprite's columns, it
+  published the panel with the arrow down and not yet back — the intermediate publication CURSOR-10
+  exists to remove — and it issued a second `damage_intersecting` per report. Kept unconditionally on
+  the back-buffer targets, where `restore` really is the only thing that takes the sprite off.
+
+#### Refused, with the reason
+
+* **Reusing the undraw's read values as the draw's save-under.** In `refresh_locked` the two walks
+  are one lock acquisition apart and largely overlap, so the second walk's `N` reads look free. They
+  are not: the front buffer has writers that do not hold `SPRITE` (that is why the colour guard
+  exists), and serving the save-under from the undraw's snapshot widens the stale-restore window from
+  "a painter wrote between our draw and this read" to "…or during the undraw walk". The failure mode
+  is a `FILL` stamped inside a window's rect — a `[wc-d] -> FAIL` the Pi spec forbids — and it is not
+  provable from QEMU, which delivers no pointer at all. Not taken.
+* **Skipping walks 3 and 4 — `TargetPal::render`'s bracket — when the present will write nothing.**
+  This is the remaining 2× and it is the right next move: on a motion-only pass the `Screen` has zero
+  damage, `present_background` returns early without touching the front, and the bracket's two walks
+  are pure waste. It cannot be done from `pal.rs` alone, because the gate needs two facts `Screen`
+  does not expose: whether the damage set is empty, and whether `FULL_PRESENT` is latched. Skipping
+  on a stale guess erases the arrow until the next report. **`video/screen.rs` is owned by a
+  concurrent editor, so this is flagged rather than taken** — it wants a `Screen::present_pending()`
+  predicate (damage non-empty ∨ `FULL_PRESENT`), after which `render`'s bracket becomes conditional
+  and the report cost falls to `2N`.
+
+#### Gate results (CURSOR-WCR)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**, no new warnings.
+* `UNAOS_WC=1 ./arroyo test 75` — **36 PASS / 0 FAIL on three consecutive runs.**
+* `./arroyo test-arm 22` — banner, clean boot through USB enumeration, 0 FAIL.
+
+QEMU delivers no pointer report, so neither change is exercised by the suites: the gates prove
+compile and no-regression only. The 4× is arithmetic on the bench panel's geometry and is carried by
+the next attended sitting.

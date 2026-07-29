@@ -1178,6 +1178,96 @@ fn for_each_sprite_pixel(
     }
 }
 
+/// CURSOR-WCR — one panel pixel read back as ONE bus transaction, where the layout allows it.
+///
+/// ### Why the read side needed its own primitive
+/// Every pixel walk in this module that touches the FRONT buffer is a read-back: the colour guard in
+/// [`undraw_locked`] asks "is our own colour still there", and the save-under in [`draw_locked`] asks
+/// "what is underneath". [`FrameBuffer::read_pixel`] answers both by decoding the layout per call and
+/// issuing THREE separate `read_volatile`s, one per colour byte. On a cached surface that costs
+/// nothing measurable. On the rMBP it does: the panel is WC-mapped (`x86 fb-wc: retyped 15 leaf(s) WC
+/// (PAT PA4)`), WC memory is UNCACHEABLE for reads, and an uncached byte load is a full round trip to
+/// the aperture that no cache line amortises. So a `refresh_locked` pair — undraw then draw, one per
+/// pointer report — pays six aperture round trips per painted pixel, at the trackpad's ~125 Hz.
+///
+/// Where the layout is a full 4-byte pixel (every x86 panel this kernel has met: `bytes_per_pixel`
+/// 4, `Rgb` or `Bgr`), the three colour bytes are three quarters of ONE aligned 32-bit word, and one
+/// aligned load returns all of them in one transaction. That is a 3:1 cut in aperture traffic on
+/// exactly the two walks the pointer path runs per report, and it is the read-side twin of the 3:1
+/// [`FrameBuffer::put_raw4`] already takes on the write side.
+///
+/// ### What is NOT changed
+/// The values. This is `read_pixel`'s contract, byte for byte: the same bounds tests (off-panel and
+/// past the mapped length both answer `None`), the same `0x00RRGGBB` inverse of `put_pixel`'s
+/// encoding, and `None` on any layout without one — `U8` averages and is not invertible, so it takes
+/// the slow path and refuses there exactly as before. The load stays `volatile`, so it is still not
+/// hoisted across or folded with the stores the same walk performs.
+///
+/// The decision is made ONCE per walk ([`PanelRead::of`]), not once per pixel: the per-pixel cost is
+/// a bounds test, a load and a shift. The fast path additionally requires a 4-byte-aligned base, so
+/// the load can never be an unaligned access even in principle; every framebuffer this kernel maps is
+/// page-aligned, and one that somehow is not simply falls back.
+///
+/// ### Arch scope
+/// x86_64 only, and deliberately: WC read cost is what motivates it, `put_raw4`/`encode4` are already
+/// x86-gated for the same reason, and the aarch64 panel is cached RAM where the three byte loads are
+/// three L1 hits. On aarch64 `of` never reports a fast path and every call is `read_pixel` verbatim.
+#[derive(Clone, Copy)]
+struct PanelRead {
+    fb: FrameBuffer,
+    /// `Some((base, row_bytes, bgr))` when the aligned-word path applies; `None` = defer to
+    /// [`FrameBuffer::read_pixel`].
+    fast: Option<(usize, usize, bool)>,
+}
+
+impl PanelRead {
+    /// Decide the read path for one pixel walk over `fb`.
+    fn of(fb: &FrameBuffer) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let info = fb.info();
+            let base = fb.base_addr();
+            let bgr = match info.pixel_format {
+                unaos_boot_info::PixelFormat::Bgr => true,
+                unaos_boot_info::PixelFormat::Rgb => false,
+                _ => return Self { fb: *fb, fast: None },
+            };
+            if base != 0 && base % 4 == 0 && info.bytes_per_pixel == 4 {
+                return Self { fb: *fb, fast: Some((base, info.stride * 4, bgr)) };
+            }
+        }
+        Self { fb: *fb, fast: None }
+    }
+
+    /// Read one pixel as `0x00RRGGBB`. Identical in value to `fb.read_pixel(x, y)`.
+    #[inline]
+    fn pixel(&self, x: usize, y: usize) -> Option<u32> {
+        if let Some((base, row_bytes, bgr)) = self.fast {
+            let info = self.fb.info();
+            if x >= info.width || y >= info.height {
+                return None;
+            }
+            let offset = y * row_bytes + x * 4;
+            if offset + 4 > self.fb.len() {
+                return None;
+            }
+            // SAFETY: bounds-checked against the mapped length above, and 4-byte aligned (the base
+            // is, and the offset is a multiple of 4). Volatile for the same reason `read_pixel`'s
+            // byte loads are: this walk's own stores must not be folded into it.
+            let v = unsafe { core::ptr::read_volatile((base + offset) as *const u32) };
+            // `put_pixel` lays the bytes down as [b,g,r] (Bgr) or [r,g,b] (Rgb); a little-endian word
+            // load returns them in that order from the low byte up. Bgr is therefore the identity
+            // under a 24-bit mask, and Rgb is that with the outer two bytes exchanged.
+            return Some(if bgr {
+                v & 0x00FF_FFFF
+            } else {
+                ((v & 0xFF) << 16) | (v & 0xFF00) | ((v >> 16) & 0xFF)
+            });
+        }
+        self.fb.read_pixel(x, y)
+    }
+}
+
 /// Clean the panel rows the box spans, so the non-coherent HVS sees the change. Whole scanlines at
 /// the panel's stride — the same discipline `wm::draw_window` and `Screen::flush` use.
 ///
@@ -1332,6 +1422,9 @@ fn undraw_locked(
     let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
     let off = sp.off;
     let saved = &sp.saved;
+    // CURSOR-WCR — the colour guard below is one FRONT-buffer read per painted pixel, and this walk
+    // is one of the two `refresh_locked` runs per pointer report. Decide the read path once.
+    let rd = PanelRead::of(&fb);
     for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
         // CURSOR-4: a pixel already handed back by a masked undraw is not ours and `saved[i]` is
         // stale for it. Restoring it here would stamp pre-pass content over whatever the compositor
@@ -1341,7 +1434,7 @@ fn undraw_locked(
         if off.get(i) {
             return;
         }
-        if i < saved.len() && fb.read_pixel(x, y) == Some(color) {
+        if i < saved.len() && rd.pixel(x, y) == Some(color) {
             fb.put_pixel(x, y, saved[i]);
         }
     });
@@ -1595,13 +1688,15 @@ fn settle_pending_locked(sp: &mut Sprite, unsupported_now: &mut bool) {
     let off = sp.off;
     let mut wrote = false;
     let mut failed = false;
+    // CURSOR-WCR — one FRONT read per deferred pixel; decide the read path once for the walk.
+    let rd = PanelRead::of(&fb);
     {
         let saved = &mut sp.saved;
         for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
             if !deferred.get(i) || off.get(i) || i >= saved.len() || failed {
                 return;
             }
-            match fb.read_pixel(x, y) {
+            match rd.pixel(x, y) {
                 // Untouched: the arrow is still on glass and `saved[i]` still describes what is
                 // under it. This is the pixel class the arc exists to produce.
                 Some(now) if now == color => {}
@@ -1702,6 +1797,8 @@ fn undraw_within_locked(
     let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
     let mut off = sp.off;
     let mut handed_back = 0usize;
+    // CURSOR-WCR — the masked undraw's colour guard is the same FRONT read; same one-off decision.
+    let rd = PanelRead::of(&fb);
     {
         let saved = &sp.saved;
         for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
@@ -1712,7 +1809,7 @@ fn undraw_within_locked(
             // Same colour guard as the full undraw, and for the same reason: a pixel another painter
             // has already taken is theirs, and putting our saved value back would be the stale
             // restore. The bit is set either way — guarded or not, this pixel is no longer ours.
-            if i < saved.len() && fb.read_pixel(x, y) == Some(color) {
+            if i < saved.len() && rd.pixel(x, y) == Some(color) {
                 fb.put_pixel(x, y, saved[i]);
             }
             off.set(i);
@@ -2318,13 +2415,15 @@ fn redraw_off_locked(sp: &mut Sprite, unsupported_now: &mut bool) {
     let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
     let mut off = sp.off;
     let mut failed = false;
+    // CURSOR-WCR — the off-pixel settle is a FRONT save-under read per pixel; same one-off decision.
+    let rd = PanelRead::of(&fb);
     {
         let saved = &mut sp.saved;
         for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
             if !off.get(i) || failed || i >= saved.len() {
                 return;
             }
-            match fb.read_pixel(x, y) {
+            match rd.pixel(x, y) {
                 Some(orig) => {
                     // CURSOR-5 — same detector as `draw_locked`'s, and the same argument: `off` says
                     // this pixel was handed back and nothing has re-delivered it, so our own fill has
@@ -2393,17 +2492,22 @@ fn draw_locked(
     let bw = side.min(info.width - bx);
     let bh = side.min(info.height - by);
 
-    // Save-under, PAINTED PIXELS ONLY (~50 reads at scale 1, against 1296 for the whole box). The
-    // per-frame cost matters here because WC-E composites on every desktop flush, which brackets this
-    // module ~20 times a second on the bench.
+    // Save-under, PAINTED PIXELS ONLY (36 reads at scale 1, 144 at the bench panel's scale 2, against
+    // 1296 for the whole box). The per-frame cost matters here because WC-E composites on every
+    // desktop flush, which brackets this module ~20 times a second on the bench — and, since
+    // CURSOR-X86, `pal::cursor`'s repaint choke point runs it once per HID report at ~125 Hz.
+    //
+    // CURSOR-WCR — and on an x86 WC panel each of those reads is an aperture round trip, so the walk
+    // takes the aligned-word path: one transaction per pixel instead of three. See `PanelRead`.
     let mut failed = false;
+    let rd = PanelRead::of(&fb);
     {
         let saved = &mut sp.saved;
         for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
             if failed || i >= saved.len() {
                 return;
             }
-            match fb.read_pixel(x, y) {
+            match rd.pixel(x, y) {
                 Some(orig) => {
                     // CURSOR-5 — the self-capture signature. The sprite is provably not on the panel
                     // here (the undraw above took it down, or it was never up), so a pixel that

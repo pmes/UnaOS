@@ -1276,11 +1276,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     // CURSOR-X86: on this target these three verbs now drive the COMPOSITOR SPRITE
                     // (`video::cursor`, front buffer, above the window layer) rather than a
                     // back-buffer sprite — `pal::cursor::SPRITE_OWNS_PAINT` carries the whole
-                    // argument. The sequence is unchanged and still correct: `restore` takes the
-                    // arrow off, `move_rel` repaints it at the new position on the report itself,
-                    // and `draw_over` is the idempotent tail. What changed is that the arrow no
-                    // longer needs the `pal.render()` below to reach the glass, and no longer
-                    // disappears under a window.
+                    // argument. The sequence is unchanged and still correct: `move_rel` repaints the
+                    // arrow at the new position on the report itself, and `draw_over` is the
+                    // idempotent tail. What changed is that the arrow no longer needs the
+                    // `pal.render()` below to reach the glass, and no longer disappears under a
+                    // window.
+                    //
+                    // CURSOR-WCR — and the leading `restore` is gone WHERE THE SPRITE OWNS THE PAINT,
+                    // because there it was `video::cursor::undraw()` immediately in front of a
+                    // `repaint` whose own `undraw_locked` performs the same restore. Two restores,
+                    // one of them wasted, is the cheap half of the cost; the expensive halves are
+                    // that the standalone `undraw` cleans WHOLE SCANLINES (`flush_box`) where the
+                    // repaint's union cleans only the sprite's columns, that it publishes the panel
+                    // with the arrow taken down and not yet put back — the intermediate publication
+                    // CURSOR-10 exists to remove — and that it issues a second
+                    // `damage_intersecting` per report. Kept unconditionally on the back-buffer
+                    // targets, where `restore` really is the only thing that takes the sprite off
+                    // and `move_rel` paints nothing.
+                    #[cfg(not(target_arch = "x86_64"))]
                     unaos_kernel::pal::cursor::restore(&mut pal);
                     unaos_kernel::pal::cursor::move_rel(
                         x, y,
@@ -1292,6 +1305,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
                     had_event = true;
                     // CURSOR-SAVE-UNDER: absolute report (0..=32767 HID space), same sprite.
+                    // CURSOR-WCR: leading restore dropped where the sprite owns the paint — see the
+                    // relative arm above for the whole argument.
+                    #[cfg(not(target_arch = "x86_64"))]
                     unaos_kernel::pal::cursor::restore(&mut pal);
                     unaos_kernel::pal::cursor::set_abs(
                         x, y,
