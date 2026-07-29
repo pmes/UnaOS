@@ -249,6 +249,17 @@ fn main() {
         println!("   WINX: target/VUG-X86.ELF absent — ESP has no VUG.ELF (run via ./arroyo esp-x86)");
     }
 
+    // PULSE-1: the x86 EL0 cpu-pulse monitor (crates/user-pulse, built by arroyo's build_user_pulse_x86 to
+    // target/PULSE-X86.ELF), staged as PULSE.ELF exactly like STAT.ELF/VUG.ELF above and for the same
+    // reasons — un-suffixed on the volume so `bg /fat/PULSE.ELF` reads the same on both arches.
+    let pulse_elf = target_dir.join("PULSE-X86.ELF");
+    if pulse_elf.exists() {
+        std::fs::copy(&pulse_elf, esp_dir.join("PULSE.ELF")).unwrap();
+        println!("   PULSE: copied PULSE.ELF onto the ESP (bg /fat/PULSE.ELF)");
+    } else {
+        println!("   PULSE: target/PULSE-X86.ELF absent — ESP has no PULSE.ELF (run via ./arroyo esp-x86)");
+    }
+
     // -----------------------------------------------------------------------------------------
     // WINX-7 PKG — the DATA tree: the EL0 artifacts staged for the volume the RUNNING KERNEL reads.
     //
@@ -290,6 +301,7 @@ fn main() {
         (target_dir.join("hello.bin"), "HELLO.BIN"),
         (target_dir.join("STAT-X86.ELF"), "STAT.ELF"),
         (target_dir.join("VUG-X86.ELF"), "VUG.ELF"),
+        (target_dir.join("PULSE-X86.ELF"), "PULSE.ELF"),
     ] {
         if src.exists() {
             std::fs::copy(&src, data_dir.join(dst)).unwrap();

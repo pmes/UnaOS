@@ -354,6 +354,79 @@ above `5.0/s` sustained is the panel having become a spinner on the render core,
 i.e. the SCHED-6 regression re-entered through the pulse. Visual verdict is the
 bench's.
 
+## 4d. `PULSE.ELF` — the windowed pulse (PULSE-1)
+
+`pulse` and the PULSE-2 panel are both *in-kernel* drawing loops, and both own
+the geometry they draw into: the shell verb takes the whole screen, the panel
+owns a reserved band. Neither can sit on the desktop beside another window, be
+backgrounded, TAB'd to or moved. **`PULSE.ELF` (`crates/user-pulse`) is the same
+instrument as a ring-3 window** — sibling to `STAT.ELF` and `VUG.ELF`, launched
+with `bg /fat/PULSE.ELF`, killed with `kill <pid>` or ESC in its own window.
+
+**What it draws.** A 128×128 ARGB8888 window (`SYS_WIN_CREATE`, one window
+slot), one row per core: the core number, a `PULSE_SEGS`-segment bar filled ∝
+that core's load over the refresh window, and a 4-character verdict cell. The
+metrics are derived from the core count, so 1 core and 16 cores both fit the one
+slot. Refresh is **~4 Hz** (`REFRESH_MS = 250`), which is both the repaint period
+and the delta window the percent is computed over.
+
+**Where the numbers come from.** `SYS_CPUPULSE(49)` (see
+`02_KERNEL_CORE/userspace.md`) hands EL0 the *raw cumulative* per-core
+`(busy, idle)` tick counts plus the core the caller is executing on. The app
+keeps the previous snapshot and does its own windowed delta math. **The kernel
+sampler is untouched** — `vug::CpuPulse` remains the only place those counters
+are maintained, and this is a read of the same two accessors it reads.
+
+**The honesty rule crosses the boundary with it.** `vug::classify_load`'s
+two-source rule is restated in the app's `classify`, and the three cases keep the
+kernel's visual idioms — copied palette values (`METER_*`), not linked code,
+because EL0 cannot link kernel code:
+
+| counters this window | core | bar | cell |
+| :--- | :--- | :--- | :--- |
+| moved (`db + di > 0`) | any | filled ∝ busy fraction (`METER_PURPLE`), rest `METER_DIM` | `  N%` |
+| moved, fraction 0 | any | the PULSE-ALIVE breath — one swept segment in `METER_BREATH` | `  0%` |
+| **frozen** | the observer's own | the breath | `run` |
+| **frozen** | any other | **DASHED** — alternate segments in `METER_PARKED` | `park` |
+
+The last row is the VUG-HONESTY invariant: a core nothing schedules must never
+read like an idle one, and must never be given a fabricated percent. The
+third row is where a ring-3 observer *differs* from the kernel loop and says so:
+the kernel credits a frozen demo core with the render loop's own measured busy%,
+which is a second measurement a windowed app does not have — so the app claims
+life (`run`) and no load, rather than inventing a number.
+
+**The baseline is not a reading.** The startup sample is cumulative counters with
+no window behind them; painting it would show every core frozen-and-parked, which
+is a fact about the instrument and not about the machine. The app therefore
+sleeps one refresh interval before its first sample, and the first frame it ever
+presents already has a real window behind it.
+
+**Serial evidence** (one start line, one alive line, one close line — a
+long-lived app is never a firehose):
+
+```
+:: PULSE-A: start pid=<n> win=<id> ncpu=<n> cpu=<n> segs=10 ::
+:: PULSE-A: first-window c0 busy/idle=0/0 -> park ::
+:: PULSE-A: first-window c1 busy/idle=0/255 -> 0% ::
+:: PULSE-A: first-window c2 busy/idle=<n>/<n> -> <n>% (observer) ::
+:: PULSE-A: alive pid=<n> frames=8 ::
+:: PULSE-A: closed pid=<n> frames=<n> ::
+```
+
+The `first-window` lines are the EL0 twin of `CpuPulse::refresh`'s per-core
+tick-delta evidence, and they are what makes "the app drew something" and "the app
+drew the RIGHT something" distinguishable to a headless gate — the bars themselves
+are invisible there. They are emitted **one per core** rather than as one wide
+line: on a contended serial path a wide line gets TORN by another core's writer
+(observed on this arc's first FAT-attached run, shredded mid-line by a `[wc-d]
+verify` line), and evidence an unrelated writer can shred is not evidence. One-shot
+and bounded at 16 lines. A garbled `SYS_CPUPULSE` payload shows up here as absurd
+deltas rather than as a plausible picture.
+
+The end-to-end gate witness is kernel-side and FAT-attached — see `PULSE-W` in
+`02_KERNEL_CORE/userspace.md`.
+
 ## 5. Serial evidence
 
 `run_crystal` emits, when invoked:

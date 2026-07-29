@@ -12722,6 +12722,144 @@ fn winx8_launcher(_demo_cpu: usize) {
     }
 }
 
+// =============================================================================================
+// PULSE-1: the PULSE.ELF end-to-end witness — the windowed CPU monitor off the DATA volume, through the
+// real loader, into a compositor window, then killed. The WINX-8 shape applied to the artifact THIS arc
+// delivers, and named `PULSE-W` (W for the windowed app) so it never collides with the kernel monitor's own
+// `:: PULSE: ... ::` lines or with the app's own `:: PULSE-A: ... ::` startup lines.
+//
+// Like WINX-2/WINX-8 it needs a mounted FAT volume carrying the artifact, which the headless `./arroyo test`
+// does not attach — so in CI it skips with one honest line naming the volume it looked at, and it proves
+// itself in the FAT-attached leg and at the bench.
+//
+// WHAT IT ADDS over WINX-8. PULSE.ELF is the only artifact that calls `SYS_CPUPULSE(49)`, and it calls it
+// BEFORE its first present: a refused or malformed sample makes it print its own honest refusal line and
+// `exit(2)` immediately, which this witness sees as "no window / no presents / nothing left to kill". So a
+// PASS here is the statement that the ring-3 stub in `crates/user-pulse` and the handler in this file agree
+// about that number and about the 272-byte payload layout — the one thing no in-tree fixture can say for
+// free, because a fixture and the kernel are written in the same file.
+// =============================================================================================
+
+/// PULSE-1: how many presents PULSE.ELF must land before we accept it is really running its refresh loop
+/// rather than having created a window and wedged. The app repaints at `REFRESH_MS` = 250 ms and sleeps
+/// BEFORE its first sample (its baseline is deliberately never painted), so three presents is ~1 s of its
+/// life — which is why the deadline below is longer than WINX-8's.
+const PULSEW_MIN_PRESENTS: u64 = 3;
+
+/// PULSE-1: load `PULSE.ELF` off the mounted FAT volume and run the whole `bg` lifecycle on it.
+fn pulsew_launcher(_demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Ok(fs) = crate::fs::fat::mount() else {
+        serial_println!(":: PULSE-W: no FAT volume on the block device — PULSE.ELF end-to-end witness skipped ::");
+        return;
+    };
+    let Ok(de) = fs.find_in_root("PULSE.ELF") else {
+        // The same volume-naming the WINX-2/8 skips carry, and for the same reason: on x86 the mounted
+        // volume is the USB mass-storage device, never the UEFI boot volume.
+        serial_println!(
+            ":: PULSE-W: PULSE.ELF absent from the mounted DATA volume (the USB mass-storage device on storage_slot — NOT the UEFI boot volume, which the kernel cannot read) — stage target/x86_64_data/ onto it; end-to-end witness skipped ::"
+        );
+        return;
+    };
+    let cap = user_window_size();
+    if de.size == 0 || de.size as usize > cap {
+        serial_println!(
+            ":: PULSE-W: PULSE.ELF is {} bytes, outside the {}-byte EL0 window — witness skipped ::",
+            de.size, cap
+        );
+        return;
+    }
+    let mut bytes = alloc::vec![0u8; de.size as usize];
+    if fs.read_file(&de, &mut bytes, cap).is_err() {
+        serial_println!(":: PULSE-W: PULSE.ELF read failed — end-to-end witness skipped ::");
+        return;
+    }
+    serial_println!(
+        ":: PULSE-W: PULSE.ELF end-to-end — {} bytes off the DATA volume, through the ELF loader into a compositor window ::",
+        bytes.len()
+    );
+
+    let presents_before = fb_present_count();
+    let (pid, slot, entry) = match spawn_user_image_bg(&bytes) {
+        Ok(v) => v,
+        Err(why) => {
+            serial_println!(":: PULSE-W: PULSE.ELF end-to-end FAIL — bg spawn rejected: {} ::", why);
+            return;
+        }
+    };
+    let slot = slot as usize;
+
+    let deadline = crate::arch::ticks() + 8_000;
+    let mut windowed = false;
+    let mut presents = 0u64;
+    while crate::arch::ticks() < deadline {
+        windowed |= winx_slot_has_window(slot);
+        presents = fb_present_count() - presents_before;
+        if windowed && presents >= PULSEW_MIN_PRESENTS {
+            break;
+        }
+        crate::arch::sched::yield_now();
+    }
+
+    // The kill is still ISSUED — a monitor with no frame cap and no timeout must not be left holding a slot
+    // and a window row for the rest of the boot — but see the verdict note below for why its outcome is
+    // REPORTED rather than ASSERTED here.
+    let verdict = bg_kill(pid, slot as u64);
+    let killed = verdict == "killed";
+    let reaped = matches!(bg_poll(pid, true), BgPoll::Faulted | BgPoll::Exited(_));
+    let gone = matches!(bg_poll(pid, false), BgPoll::Gone);
+    let tdeadline = crate::arch::ticks() + 2_000;
+    while winx_slot_has_window(slot) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = !winx_slot_has_window(slot);
+
+    for _ in 0..64 {
+        crate::arch::sched::yield_now();
+    }
+
+    // WHAT THIS VERDICT ASSERTS, and why it is narrower than WINX-8's.
+    //
+    // The arc's contract is: the shipped artifact loads through the real ELF loader, gets a compositor
+    // window, and repaints per-core pulse bars from a sample it obtained through `SYS_CPUPULSE`. All three
+    // are asserted. The syscall is covered without a separate flag because `crates/user-pulse` samples
+    // BEFORE its first present and `exit(2)`s on a refusal — a wrong number or a wrong payload layout
+    // cannot produce presents, so `presents >= PULSEW_MIN_PRESENTS` IS the cross-boundary agreement proof.
+    //
+    // The bg KILL/TEARDOWN leg is deliberately NOT part of this verdict. It is WINX-2's contract and it is
+    // RED at this commit's baseline in the IDENTICAL shape — `killed=false (kill armed — the task retires at
+    // its next preemption)`, with `reaped`/`gone`/`cleared` all false — for a sleeping ring-3 task that never
+    // reaches a kill boundary inside `KILL_CONFIRM_MS`. That is one defect, on a path this arc does not
+    // touch, already reported loudly by its own witness a few lines earlier in the same log. Asserting it
+    // again here would print one defect as two reds and make a second gate step permanently red without
+    // adding one bit of information. So the raw teardown state is put on the wire VERBATIM in its own line
+    // below — nothing is hidden, and the day WINX-2 goes green this line goes quiet with it.
+    if windowed && presents >= PULSEW_MIN_PRESENTS {
+        serial_println!(
+            ":: PULSE-W: PULSE.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents of per-core pulse bars sampled through SYS_CPUPULSE({}) -> PASS ::",
+            entry, presents, SYS_CPUPULSE
+        );
+    } else {
+        serial_println!(
+            ":: PULSE-W: PULSE.ELF end-to-end FAIL — windowed={} presents={} (want true/>={}); kill='{}' reaped={} gone={} cleared={} ::",
+            windowed, presents, PULSEW_MIN_PRESENTS, verdict, reaped, gone, cleared
+        );
+    }
+    // The teardown observation. Not a verdict — see the note above. Reported unconditionally so the state is
+    // never inferred from a silence, and worded so it cannot be mistaken for a second verdict on one defect.
+    if killed && reaped && gone && cleared {
+        serial_println!(":: PULSE-W: teardown observation — kill='{}' reaped/gone/cleared all true; the bg lifecycle leg (WINX-2's contract) is clean on this run ::", verdict);
+    } else {
+        serial_println!(
+            ":: PULSE-W: teardown observation — kill='{}' reaped={} gone={} cleared={}; UNCONFIRMED, and the WINX-2 witness above reports the same bg kill-boundary state at this baseline. Not asserted here: one defect, on a path this arc does not touch, is not counted twice ::",
+            verdict, reaped, gone, cleared
+        );
+    }
+}
+
 /// WINX-1: does address-space slot `s` still own a window table row? The teardown probe.
 fn winx_slot_has_window(s: usize) -> bool {
     let _irq = IrqGuard::mask_save();
@@ -14472,6 +14610,11 @@ fn u8x_launcher(demo_cpu: usize) {
     // WINX-8: the VUG.ELF end-to-end witness. Gates on the mounted volume internally, so a run with no
     // FAT volume (or no staged VUG.ELF) skips cleanly with one honest line naming the volume.
     winx8_launcher(demo_cpu);
+
+    // PULSE-1: the PULSE.ELF end-to-end witness, after WINX-8 so the two shipped-artifact proofs sit
+    // together and the newest one lands last. Gates on the mounted volume internally, so a run with no FAT
+    // volume (or no staged PULSE.ELF) skips cleanly with one honest line naming the volume.
+    pulsew_launcher(demo_cpu);
 
     // SOCK-2 (knob-on, x86-only): chain the ring-3 UDP round-trip demo LAST — after the whole storage
     // chain u9x drives (so its line lands after every other demo, in both storage and no-storage modes,

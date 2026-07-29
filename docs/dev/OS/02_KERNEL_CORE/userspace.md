@@ -714,6 +714,52 @@
     itself at the bench.
   - Lane: `arch/x86_64/{elf,syscall,memory,mod}.rs` + `shell.rs` + `crates/user-stat` + `arroyo` +
     `builder/src/main.rs` + `scripts/make-fat-img.sh` + docs.
+- **PULSE-1 (`PULSE.ELF` — the windowed pulse)** — the third shipped EL0 app, and the first one that needs a
+  new syscall. The kernel already had a full BeOS-Pulse homage (the `pulse` shell verb, `vug::run_pulse`,
+  the `CpuPulse` sampler, `draw_pulse_bar`, `PULSE_SEGS`, the park-vs-idle DASHED distinction) — but as an
+  in-kernel full-screen mode it cannot sit on the desktop beside anything else, be backgrounded, TAB'd to
+  or moved, and every pixel of it is drawn in ring 0. PULSE-1 brings that instrument into a compositor
+  window as a ring-3 program, sibling to `STAT.ELF` and `VUG.ELF`. Drawing details and the per-case visual
+  table are in [`08_VIDEO/engine.md` §4d](../08_VIDEO/engine.md).
+  - **`SYS_CPUPULSE = 49`** (both arches; see the number table below) writes the fixed 272-byte
+    `#[repr(C)] { ncpu: u64, demo: u64, ticks: [(u64, u64); 16] }` sample through the validated
+    `copy_to_user` seam — `sys_getinfo`'s shape and `sys_getinfo`'s validation exactly, so a bad pointer is
+    an `-EFAULT` RETURN and never a task-kill. It reads the same three accessors the in-kernel sampler
+    reads (`sched::meter_cpu_count` / `meter_cpu_ticks` / `meter_current_cpu`); **the sampler itself is
+    untouched** — there stays exactly one place the counters are maintained.
+  - **Why raw counters and not a percent.** "Load" is only defined relative to a refresh window the KERNEL
+    does not own, and a caller handed a pre-cooked percent could not tell an honest 0% from a FROZEN
+    counter — which is the one distinction `vug::classify_load` exists to preserve. So the verb reports
+    facts (cumulative counts, plus the core the caller is executing on) and EL0 keeps the previous snapshot
+    and applies the rule itself. `PULSE_MAX_CPUS = 16` is ABI, deliberately NOT read from
+    `vug::MAX_METER_CPUS` (the in-kernel scratch cap, free to change without breaking a shipped binary);
+    they are equal today.
+  - **The honesty rule crosses the boundary.** `classify` in `crates/user-pulse` restates
+    `vug::classify_load`: counters moved -> the honest busy fraction; frozen and NOT the observer's core ->
+    `park` on a DASHED bar, never a percent and never a 0%; frozen and the observer's OWN core -> `run` on
+    the breath bar. The last case is the one honest divergence from the kernel loop, and it is a
+    subtraction: the kernel credits a frozen demo core with its render loop's measured busy%, a second
+    measurement a windowed app does not have, so the app claims life and no load rather than inventing a
+    number. The startup sample is a BASELINE, never painted — the app sleeps one refresh interval before
+    its first reading.
+  - **Packaging.** `crates/user-pulse` is arch-split exactly like `user-stat` (shared app logic, two
+    `cfg`-selected `sysabi` modules, `user-pulse.ld` / `user-pulse-x86.ld` with the same two-PT_LOAD PHDRS
+    shape). arroyo's `build_user_pulse_x86` produces `target/PULSE-X86.ELF` (asserting ELF magic,
+    `e_machine == 0x3e`, `<= 16384` bytes) and `build_user_aarch64` produces `target/PULSE.ELF`;
+    `builder/src/main.rs` and `scripts/make-fat-img.sh` stage it as **`PULSE.ELF`** on the ESP, in the
+    `target/x86_64_data/` DATA tree, and on the pi4 media. It builds soft-float from the shared
+    `x86_64-unknown-none.json`, matching the kernel's CR4.OSFXSR=0 ring-3 fence. **Operator command:
+    `bg /fat/PULSE.ELF`**; ESC in its window or `kill <pid>` stops it.
+  - **Witness.** `:: PULSE-W: PULSE.ELF end-to-end — loaded (entry <va>) + windowed + N presents of
+    per-core pulse bars sampled through SYS_CPUPULSE(49), killed + reaped, teardown clean -> PASS ::`, the
+    WINX-8 shape applied to this artifact, chained after `winx8_launcher`. It is the only leg that proves
+    `SYS_CPUPULSE` works across the privilege boundary: the app samples BEFORE its first present and
+    `exit(2)`s on a refusal, so a broken number or payload layout shows up here as no window, no presents,
+    and nothing left to kill. FAT-attached only — it skips with one honest line naming the volume when no
+    block device is attached, exactly like WINX-2/WINX-8, and has its own `battery` step.
+  - Lane: `arch/{x86_64,aarch64}/syscall.rs` + `crates/user-pulse` + `arroyo` + `builder/src/main.rs` +
+    `scripts/make-fat-img.sh` + docs. `sched.rs` untouched on both arches (the meter accessors were
+    already `pub`); `vug.rs` untouched.
 - **WC-B (this arc)** — the **window surface/verb seam**: the syscall half of the window-compositor arc
   (unit WC-A owns the compositor core in `video/`). Four new verbs, `SYS_WIN_CREATE = 29`,
   `SYS_WIN_PRESENT = 30`, `SYS_WIN_MOVE = 31`, `SYS_WIN_CLOSE = 32` (28 stays reserved for the deferred
@@ -2317,9 +2363,13 @@ Conventions shared across arches:
   | 30 | `SYS_WIN_PRESENT` | win | 0 / `-errno` | aarch64 **WC-B** — damage-mark + composite the window; `-EBADF` unknown/free id, `-EACCES` owned by another ASID. Bumps the focus-scoped present counter under the same focus guard as `SYS_FB_PRESENT` (the UVUG-8r2 cap reads it) |
   | 31 | `SYS_WIN_MOVE` | win, x, y | 0 / `-errno` | aarch64 **WC-B** — reposition the window's top-left in screen space; same ownership gate, `-EINVAL` outside ±4096 |
   | 32 | `SYS_WIN_CLOSE` | win | 0 / `-errno` | aarch64 **WC-B** — unmap the surface (leaves revert to the reserved EL1-only descriptors) and free the row; same ownership gate |
+  | 49 | `SYS_CPUPULSE` | ptr | 0 / `-EFAULT` | **PULSE-1** (both arches) — writes the fixed 272-byte `{ncpu, demo, [(busy, idle); 16]}` per-core load sample via `copy_to_user`. RAW CUMULATIVE counters, never a percent: "load" is defined only over a refresh window the kernel does not own, and collapsing the counts would destroy the frozen-vs-idle distinction `vug::classify_load` exists to preserve. `demo` is the core the CALLER is executing on. Reads the same `sched::meter_cpu_*` accessors the in-kernel `CpuPulse` sampler reads — the sampler itself is untouched |
 
   aarch64 leads 4–9 (M6f 4–7, M7 8–9) and 21–23 (ELF-2 threading); the x86 U-side port adopts the same
   numbers so the arches stay aligned (x86 adds SMAP considerations aarch64's PAN-less A72 lacks).
+  (Numbers 40–48 are the x86-only SOCK-2/3/6 socket surface — `SYS_SOCKET`=40 … `SYS_ACCEPT`=48 — documented in
+  their SOCK entries. 49 is `SYS_CPUPULSE`, minted by PULSE-1 at the end of the space and implemented on BOTH
+  arches even though only x86 ships an app for it today: a number names the same verb everywhere.)
 - **User faults kill the task, kernel faults stay fatal.** Fault accounting
   is matched (task, vector/EC, address) so demos assert exact outcomes.
 - **User pages are never executable-and-writable**; code pages are read-only

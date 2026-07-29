@@ -543,6 +543,36 @@ build_user_vug_x86() {
     echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 mini-vug program: VUG-X86.ELF (${vsz} B)${COLOR_RESET}"
 }
 
+# PULSE-1: build the x86_64 static ELF64 EL0 CPU-PULSE MONITOR (crates/user-pulse → target/PULSE-X86.ELF).
+# The exact shape of build_user_stat_x86 / build_user_vug_x86 above: same linker-script SHAPE
+# (crates/user-pulse/user-pulse-x86.ld — two PT_LOAD segments via a PHDRS clause), same four assertions,
+# same explicit `--target` to override the crate's aarch64 default so the two arches' builds land in
+# separate target subdirectories and never clobber each other.
+#
+# What this program exercises that its two siblings do not: SYS_CPUPULSE(49). A build of it that links, runs
+# and draws is the end-to-end statement that the ring-3 stub in crates/user-pulse and the kernel handler in
+# arch/x86_64/syscall.rs agree about that number AND about the 272-byte payload layout.
+build_user_pulse_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 cpu-pulse static-ELF program (crates/user-pulse → target/PULSE-X86.ELF)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-pulse"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-pulse/target/x86_64-unknown-none/release/user-pulse" \
+      "${WORKSPACE_DIR}/target/PULSE-X86.ELF"
+    [ -s "${WORKSPACE_DIR}/target/PULSE-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: PULSE-X86.ELF missing/empty — x86 PULSE build failed${COLOR_RESET}"; exit 1; }
+    local pmag; pmag="$(head -c 4 "${WORKSPACE_DIR}/target/PULSE-X86.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$pmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: PULSE-X86.ELF does not start with the ELF magic; first 4 bytes = ${pmag}${COLOR_RESET}"; exit 1; }
+    local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/PULSE-X86.ELF" | tr -d ' \n')"
+    [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: PULSE-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/PULSE-X86.ELF" | tr -d ' ')"
+    [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: PULSE-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 cpu-pulse program: PULSE-X86.ELF (${psz} B)${COLOR_RESET}"
+}
+
 build_kernel_aarch64() {
     echo -e "${COLOR_YELLOW}⚡ Building aarch64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
@@ -563,6 +593,7 @@ launch_x86_64() {
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
+    build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_kernel_x86_64
 
     echo -e "${COLOR_CYAN}⚡ Launching x86_64 via Builder (kernel + bootloader + QEMU)...${COLOR_RESET}"
@@ -698,6 +729,7 @@ test_x86_64() {
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
+    build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_kernel_x86_64
 
     # VPERF: UNAOS_QMP_SHOT=<png path> arms a QMP framebuffer screendump of the headless x86 run
@@ -826,6 +858,7 @@ esp_x86() {
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP as HELLO.BIN
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
+    build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -864,6 +897,7 @@ vm_image() {
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it into the ESP as HELLO.BIN
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
+    build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     cd "$WORKSPACE_DIR/builder"
     UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -905,6 +939,7 @@ fat_img() {
     build_user_hello_x86   # U2: ensure target/hello.bin is fresh even if the ESP is reused below
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
+    build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
         esp_x86
@@ -1196,6 +1231,30 @@ kernel8() {
     [ "$ssz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: STAT.ELF ${ssz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
     echo -e "${COLOR_GREEN}✅ static-ELF EL0 persistence program: STAT.ELF (${ssz} B)${COLOR_RESET}"
 
+    # PULSE-1: build the static ELF64 EL0 CPU-PULSE MONITOR (crates/user-pulse) exactly like STAT/UVUG. It
+    # creates one 128x128 compositor window and draws one segmented pulse bar per core — the kernel `pulse`
+    # verb's instrument as a ring-3 window — reading the per-core counters through SYS_CPUPULSE(49) and doing
+    # its own windowed delta math. Same linker script shape (crates/user-pulse/user-pulse.ld — two PT_LOAD
+    # segments via a PHDRS clause) and the same three assertions as STAT.
+    #
+    # It is built on aarch64 as well as x86 even though the x86 desktop is where it ships first: the crate is
+    # arch-neutral above its two syscall stubs, and a build that links here is the standing proof that the
+    # aarch64 half of the shared syscall number stays in agreement with the x86 half.
+    echo -e "${COLOR_YELLOW}⚡ Building EL0 cpu-pulse static-ELF program (crates/user-pulse → target/PULSE.ELF)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/user-pulse"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+      cargo +nightly build --release -Z json-target-spec
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-pulse/target/aarch64-base/release/user-pulse" \
+      "${WORKSPACE_DIR}/target/PULSE.ELF"
+    [ -s "${WORKSPACE_DIR}/target/PULSE.ELF" ] || { echo -e "${COLOR_RED}ERROR: PULSE.ELF missing/empty — PULSE build failed${COLOR_RESET}"; exit 1; }
+    pmag="$(head -c 4 "${WORKSPACE_DIR}/target/PULSE.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$pmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: PULSE.ELF does not start with the ELF magic; first 4 bytes = ${pmag}${COLOR_RESET}"; exit 1; }
+    psz="$(wc -c < "${WORKSPACE_DIR}/target/PULSE.ELF" | tr -d ' ')"
+    [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: PULSE.ELF ${psz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ static-ELF EL0 cpu-pulse program: PULSE.ELF (${psz} B)${COLOR_RESET}"
+
     # K2 metal money-shot: UNAOS_K2_LEAVE=1 adds the `k2_leave` feature — k2_liveenf becomes a two-boot
     # cross-reboot power-cycle proof (boot-1 leaves a persisted owned file; boot-2 verifies the live boot
     # rebuild). OFF => the normal same-boot battery (byte-identical). For the ATTENDED Pi bench only.
@@ -1425,6 +1484,10 @@ kernel8() {
     # spawns it detached; the operator drives the same bytes with `bg /fat/STAT.ELF`. Distinct 8.3 name =>
     # its own IMAGE_SHA256 principal; never collides with the flat fixtures, ELFHELLO.ELF or VUG.ELF.
     cp "${WORKSPACE_DIR}/target/STAT.ELF" "$KERNEL8_DIR/STAT.ELF"
+
+    # PULSE-1: carry the cpu-pulse static ELF64 onto the boot media as PULSE.ELF, same reasoning as STAT
+    # above — a distinct 8.3 name, its own IMAGE_SHA256 principal, driven by `bg /fat/PULSE.ELF`.
+    cp "${WORKSPACE_DIR}/target/PULSE.ELF" "$KERNEL8_DIR/PULSE.ELF"
 
     # U9: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0 code).
     # 1 KiB (> 512 so fat::probe_once never cats it) of a known 0xEE filler; the u9 File-write demo opens it
@@ -1848,6 +1911,11 @@ battery() {
     # trusting the absence of a negative — is what makes that impossible to repeat.
     _step "x86 STAT.ELF off FAT (WINX-2)" "WINX-2: STAT.ELF end-to-end .* -> PASS" "$blog_dir/winx2-fat.log" cat "$blog_dir/test-fat.log"
     _step "x86 VUG.ELF off FAT (WINX-8)"  "WINX-8: VUG.ELF end-to-end .* -> PASS"  "$blog_dir/winx8-fat.log" cat "$blog_dir/test-fat.log"
+    # PULSE-1: the third shipped EL0 app on that same path. Same cheap re-grep of the `test-fat` capture, and
+    # the same reason it is its own step rather than trusting the absence of a FAIL: the witness SKIPS with one
+    # honest line when no block device is attached, so on a plain `./arroyo test` its absence is silence, not
+    # red. It is also the only leg that proves SYS_CPUPULSE(49) works across the privilege boundary.
+    _step "x86 PULSE.ELF off FAT (PULSE-W)" "PULSE-W: PULSE.ELF end-to-end .* -> PASS" "$blog_dir/pulsew-fat.log" cat "$blog_dir/test-fat.log"
     _step "arm virt v3 (CAPSTONE 6/6)" "CAPSTONE COMPLETE"   "$blog_dir/test-arm-v3.log"  env UNAOS_GICV3=1 "$0" test-arm 40
     # MBENCH-HONEST: this step's verdict is now the MBENCH REPLAY's exit status, which `kernel8-test`
     # propagates (see test_kernel8). It used to be a single `awk` for CAPSTONE COMPLETE against the

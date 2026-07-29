@@ -115,6 +115,17 @@ stage_contents() {
         echo "    WARNING: ${VUG_ELF} absent — image has no VUG.ELF (run './arroyo fat-img' via arroyo)"
     fi
 
+    # PULSE-1: the x86 EL0 cpu-pulse monitor (crates/user-pulse → target/PULSE-X86.ELF, built by arroyo's
+    # build_user_pulse_x86). Same shape, same freshness argument and same un-suffixed on-volume name as the
+    # STAT.ELF / VUG.ELF hunks above. This is the file the PULSE-W end-to-end witness looks for by name.
+    local PULSE_ELF="${WORKSPACE_DIR}/target/PULSE-X86.ELF"
+    if [ -f "$PULSE_ELF" ]; then
+        COPYFILE_DISABLE=1 cp "$PULSE_ELF" "${S}/PULSE.ELF"
+        echo "    added PULSE.ELF ($(wc -c < "$PULSE_ELF" | tr -d ' ') bytes) for the run/bg loader"
+    else
+        echo "    WARNING: ${PULSE_ELF} absent — image has no PULSE.ELF (run './arroyo fat-img' via arroyo)"
+    fi
+
     # U9x M2: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0
     # code). 1 KiB of 0xEE filler, mirroring the pi4 image plant (arroyo's kernel8 SCRATCH.BIN block): the
     # U9x fixture opens it RW, seeks to 520, overwrites a 16-byte pattern, and the launcher flushes that
@@ -175,7 +186,7 @@ EOF
     echo "    added nested tree (subdir/ -> 'Nested Directory'/ -> 'deep file.txt')"
 
     # WINX-7 PKG: the x86 DATA volume tree (target/x86_64_data) is what the KERNEL reads on metal —
-    # HELLO.BIN / STAT.ELF / VUG.ELF / hello.txt. Copied LAST so a one-device QEMU image carries exactly
+    # HELLO.BIN / STAT.ELF / VUG.ELF / PULSE.ELF / hello.txt. Copied LAST so a one-device QEMU image carries exactly
     # the bytes a staged stick would, including hello.txt's "DATA volume" probe line.
     if [ -d "$DATA_DIR" ]; then
         COPYFILE_DISABLE=1 cp -R "${DATA_DIR}/." "${S}/"

@@ -690,19 +690,25 @@ pub extern "C" fn _start() -> ! {
             // payload — a wrong struct layout shows up here as absurd deltas, not as a plausible picture.
             if !said_window {
                 said_window = true;
-                let mut b = Buf::new();
-                b.put(b":: PULSE-A: first-window per-core busy/idle deltas + verdict - ");
+                // ONE LINE PER CORE, not one line for all of them. A single wide line is what the kernel's
+                // twin emits, and on a contended serial path it gets TORN: another core's writer lands in
+                // the middle of it and the tail of the evidence is unreadable (observed on the first
+                // FAT-attached run of this arc, shredded by a `[wc-d] verify` line). Evidence an unrelated
+                // writer can shred is not evidence. Each core's verdict now stands alone and short, so an
+                // interleave can cost at most one core's reading instead of all of them. Bounded: `ncpu`
+                // lines, one-shot, at most 16.
                 let mut c = 0usize;
                 while c < now.ncpu {
                     let db = now.ticks[c].0.wrapping_sub(base_ticks[c].0);
                     let di = now.ticks[c].1.wrapping_sub(base_ticks[c].1);
-                    b.put(b"c");
+                    let mut b = Buf::new();
+                    b.put(b":: PULSE-A: first-window c");
                     b.put_dec(c as u64);
-                    b.put(b":");
+                    b.put(b" busy/idle=");
                     b.put_dec(db);
                     b.put(b"/");
                     b.put_dec(di);
-                    b.put(b"=");
+                    b.put(b" -> ");
                     match load[c] {
                         PARKED => b.put(b"park"),
                         RUNNING => b.put(b"run"),
@@ -711,11 +717,13 @@ pub extern "C" fn _start() -> ! {
                             b.put(b"%");
                         }
                     }
-                    b.put(b" ");
+                    if c == now.demo {
+                        b.put(b" (observer)");
+                    }
+                    b.put(b" ::\n");
+                    b.flush();
                     c += 1;
                 }
-                b.put(b"::\n");
-                b.flush();
             }
             prev = now;
         }
