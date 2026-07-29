@@ -618,6 +618,27 @@ const OFF_V3D63_BIN_CL_ALT: usize = 0x39000;
 const _: () = assert!(OFF_V3D63_BIN_CL_ALT + 0x1000 <= ARENA_BYTES);
 const _: () = assert!(OFF_V3D63_BIN_CL_ALT >= OFF_BISECT_NULL_SHADREC + 0x400);
 
+// PI-V3D-68 — the frame-geometry ladder's own TILE-STATE DATA ARRAY (the CT0QTS target).
+//
+// Every bin frame this campaign has ever submitted — every rung of every arc — used the SAME 64x64
+// frame, which at the 64x64 bin tile Mesa picks for 1 RT / 32 bpp / no MSAA is exactly ONE tile, and
+// therefore a 256 B TSDA at `OFF_TILESTATE` (whose page has room for 16 tiles at most). A geometry
+// ladder needs a bigger array than that page can hold, and it must not disturb the region every banked
+// verdict above was taken on. So the ladder gets a dedicated 24 KiB region in the arena tail.
+//
+// SIZING, with the tile-size contingency stated rather than assumed. This tree's established tile size
+// for our configuration is 64x64 (see the `TILE_STATE_TILES` note). If that were wrong and the real bin
+// tile were 32x32, every geometry below would carry FOUR TIMES the tiles. The region is sized so that
+// even under that contingency the largest rung's TSDA still fits INSIDE it — 256x256 is 16 tiles at
+// 64x64 (4 KiB) and 64 tiles at 32x32 (16 KiB), both under 24 KiB — so a mis-estimated tile size can
+// cost the ladder a reading, never a write outside the arena. `v3d68_geom_sound` enforces exactly that
+// bound at run time, and the ladder fail-closes rather than kick a rung it cannot bound.
+const OFF_V3D68_TSDA: usize = 0x3A000;
+const V3D68_TSDA_BYTES: usize = 0x6000; // 24 KiB = 96 tiles at 256 B/tile
+const _: () = assert!(OFF_V3D68_TSDA + V3D68_TSDA_BYTES <= ARENA_BYTES);
+const _: () = assert!(OFF_V3D68_TSDA >= OFF_V3D63_BIN_CL_ALT + 0x1000);
+const _: () = assert!(OFF_V3D68_TSDA % 32 == 0); // CT0QTS carries the base in its upper bits (ENABLE=bit1)
+
 // ─── The V3D buffer arena. One page-aligned static in BSS. Because the bare-metal kernel is
 // identity-mapped in low RAM (VA == PA), the address of this static IS its ARM physical address,
 // which is exactly what the V3D MMU page table and the control lists need. Sized generously and
@@ -897,7 +918,7 @@ pub fn bringup(fb: Option<FbTarget>) {
     // only trustworthy if it says what is missing from it.
     if V3D_DEEP {
         serial_println!(
-            ":: V3D: [v3d] deep=on — slow banked-verdict probes ARMED: [v3d48] bisection ladder (6 rungs x ~0.5 s FLDONE backstop) + [v3d63] ptb-unit matrix (4 more rungs, same backstop) + [v3d64] muxcal (1 more rung + a 4 ms idle window + 1 extra CT1 job) + [v3d66] ptbsweep (2 passes x [1 rung + a 4 ms idle window + 1 extra CT1 job]) = 13 rungs, [v3d59] frameclose (64 x 1 ms), [v3d58] rerender (extra CT1 job). Expect ~7 s of extra boot — a stall of that length here is the BUDGET, not a hang ::"
+            ":: V3D: [v3d] deep=on — slow banked-verdict probes ARMED: [v3d48] bisection ladder (6 rungs x ~0.5 s FLDONE backstop) + [v3d63] ptb-unit matrix (4 more rungs, same backstop) + [v3d64] muxcal (1 more rung + a 4 ms idle window + 1 extra CT1 job) + [v3d66] ptbsweep (2 passes x [1 rung + a 4 ms idle window + 1 extra CT1 job]) + [v3d68] binwall (4 more rungs, same backstop, plus a poison fill/scan of a 24 KiB tile-state region and the 32 KiB pool per rung) = 17 rungs, [v3d59] frameclose (64 x 1 ms), [v3d58] rerender (extra CT1 job). Expect ~9 s of extra boot — a stall of that length here is the BUDGET, not a hang ::"
         );
     } else {
         serial_println!(
@@ -3776,6 +3797,24 @@ fn build_bin_cl_generic(cl_off: usize, shadrec_off: usize, num_attrs: u32) -> us
 /// the top down. The prologue (NUMBER_OF_LAYERS, TILE_BINNING_MODE_CFG, FLUSH_VCD_CACHE, START_TILE_BINNING)
 /// and the terminating FLUSH are common to every rung — those are the frame-level handshake under test.
 fn build_bin_cl_content(cl_off: usize, shadrec_off: usize, num_attrs: u32, content: BinContent) -> usize {
+    build_bin_cl_content_geom(cl_off, shadrec_off, num_attrs, content, TARGET_W, TARGET_H)
+}
+
+/// PI-V3D-68 — `build_bin_cl_content` with the FRAME GEOMETRY parameterised.
+///
+/// `fb_w`/`fb_h` land in `TILE_BINNING_MODE_CFG`'s width/height fields (both `minus_one`) and NOWHERE
+/// ELSE: the clip window, viewport offset and clipper scaling stay at their `TARGET_W`/`TARGET_H` values
+/// on every rung, so the geometry ladder varies EXACTLY ONE thing — the frame the PTB is told to tile —
+/// and a `Full` rung at a larger frame draws the same triangle into the same corner tile. Passing
+/// `(TARGET_W, TARGET_H)` reproduces the pre-V3D-68 byte stream exactly; every existing caller does.
+fn build_bin_cl_content_geom(
+    cl_off: usize,
+    shadrec_off: usize,
+    num_attrs: u32,
+    content: BinContent,
+    fb_w: usize,
+    fb_h: usize,
+) -> usize {
     let shadrec = (arena_phys() + shadrec_off) as u32;
     let mut w = RclWriter::new(cl_off);
 
@@ -3792,8 +3831,8 @@ fn build_bin_cl_content(cl_off: usize, shadrec_off: usize, num_attrs: u32, conte
             .f(4, 2, TILE_ALLOC_BLOCK_SIZE_64B) // tile allocation (overflow) block size 64b
             .f(8, 4, 0) // Number of Render Targets (minus_one: 1 → 0)
             .f(12, 2, INTERNAL_BPP_32) // Maximum BPP of all render targets
-            .f(32, 16, (TARGET_W - 1) as u64) // Width in pixels (minus_one)
-            .f(48, 16, (TARGET_H - 1) as u64) // Height in pixels (minus_one)
+            .f(32, 16, (fb_w - 1) as u64) // Width in pixels (minus_one) — PI-V3D-68: the ladder's variable
+            .f(48, 16, (fb_h - 1) as u64) // Height in pixels (minus_one)
             .done(),
     );
     // Flush any stale VCD, disable any leftover occlusion-query state, then START_TILE_BINNING (must
@@ -6268,13 +6307,57 @@ fn submit_bisect_rung_at(
     cl_off: usize,
     bank: bool,
 ) -> Option<V3d63Rung> {
-    let bin_len = build_bin_cl_content(cl_off, shadrec_off, 1, content);
+    submit_bisect_rung_geom(tag, rung, content, shadrec_off, cl_off, bank, None)
+}
+
+/// PI-V3D-68 — `submit_bisect_rung_at` with the frame GEOMETRY parameterised.
+///
+/// `geom == None` is the pre-V3D-68 rung, byte for byte: a `TARGET_W`x`TARGET_H` frame, the 256 B
+/// tile-state array at `OFF_TILESTATE`, and both bin regions ZERO-filled before the kick. Every
+/// `[v3d48]`/`[v3d50]`/`[v3d51]`/`[v3d53]`/`[v3d63]`/`[v3d66]` caller passes `None` and is unaffected.
+///
+/// `geom == Some(g)` is the ladder rung and changes exactly three coupled things, all of them the one
+/// variable: (a) `TILE_BINNING_MODE_CFG`'s width/height; (b) the tile-state array, which MUST scale with
+/// the tile count or the frame is mis-programmed rather than merely re-shaped — so the rung is handed
+/// the dedicated `OFF_V3D68_TSDA` region, sized to the whole 24 KiB regardless of the rung so an
+/// under-provisioned TSDA can never be the confound; (c) the packing witness's expected width/height.
+/// It also POISONS the tile-state array and the tile-alloc pool instead of zeroing them ([v3d56]'s
+/// index-encoding seed), because "the PTB wrote zeros" and "the PTB wrote nothing" are different answers
+/// and a zero-filled region cannot tell them apart.
+fn submit_bisect_rung_geom(
+    tag: &str,
+    rung: &str,
+    content: BinContent,
+    shadrec_off: usize,
+    cl_off: usize,
+    bank: bool,
+    geom: Option<V3d68Geom>,
+) -> Option<V3d63Rung> {
+    let (fb_w, fb_h) = match geom {
+        Some(g) => (g.w, g.h),
+        None => (TARGET_W, TARGET_H),
+    };
+    let exp_tiles = match geom {
+        Some(g) => g.tiles(),
+        None => TILE_STATE_TILES,
+    };
+    let (ts_off, ts_bytes) = match geom {
+        Some(_) => (OFF_V3D68_TSDA, V3D68_TSDA_BYTES),
+        None => (OFF_TILESTATE, TILE_STATE_BYTES),
+    };
+    let bin_len = build_bin_cl_content_geom(cl_off, shadrec_off, 1, content, fb_w, fb_h);
 
     // Fresh, coherent bin scratch + overflow pool for this rung (reuses the M4 / probe regions).
-    fill_region(OFF_TILESTATE, TILE_STATE_BYTES, 0);
-    fill_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES, 0);
-    cache::clean_range(arena_phys() + OFF_TILESTATE, TILE_STATE_BYTES);
-    cache::clean_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+    if geom.is_some() {
+        // PI-V3D-68: poison, not zero — see the doc comment above. `v3d56_poison_region` cleans to PoC.
+        v3d56_poison_region(ts_off, ts_bytes);
+        v3d56_poison_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+    } else {
+        fill_region(OFF_TILESTATE, TILE_STATE_BYTES, 0);
+        fill_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES, 0);
+        cache::clean_range(arena_phys() + OFF_TILESTATE, TILE_STATE_BYTES);
+        cache::clean_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+    }
     for i in (0..PROBE_BIN_OVERFLOW_BYTES).step_by(4) {
         arena_write_u32(OFF_PROBE_BIN_OVERFLOW + i, 0);
     }
@@ -6284,10 +6367,10 @@ fn submit_bisect_rung_at(
     let bin_ba = (arena_phys() + cl_off) as u32;
     let bin_ea = bin_ba + bin_len as u32;
     let tile_alloc = (arena_phys() + OFF_BIN_TILEALLOC) as u32;
-    let ts = (arena_phys() + OFF_TILESTATE) as u32;
+    let ts = (arena_phys() + ts_off) as u32;
     if !arena_contains(bin_ba as usize, bin_len)
         || !arena_contains(tile_alloc as usize, BIN_TILEALLOC_BYTES)
-        || !arena_contains(ts as usize, TILE_STATE_BYTES)
+        || !arena_contains(ts as usize, ts_bytes)
     {
         serial_println!(":: V3D: [{}] {} — range escapes the arena, skipping (fail-closed) ::", tag, rung);
         return None;
@@ -6296,7 +6379,7 @@ fn submit_bisect_rung_at(
     decode_cl_packets("v3d48 bisect", cl_off, bin_len);
     // PI-V3D-57: the same list again, read back from the published bytes and packing-checked field by
     // field against the audited v42 encoding (see the packing-consistency note on v3d57_cl_mesa_diff).
-    v3d57_cl_mesa_diff("v3d48 bisect", cl_off, bin_len);
+    v3d57_cl_mesa_diff_geom("v3d48 bisect", cl_off, bin_len, fb_w, fb_h, exp_tiles);
 
     clear_mmu_fault_latch("v3d48 bisect pre-kick");
     // PI-V3D-57: kernel-exact ORDER — BPOS=0 before the invalidate and before the CT0 tile-memory latch.
@@ -6562,6 +6645,12 @@ fn empty_frame_bisection() {
     // have been taken), and it must follow v3d64 specifically because its verdict is read against the
     // classes v3d64/v3d65 established on this same boot.
     v3d66_ptb_sweep();
+    // PI-V3D-68: the frame-geometry ladder rides the very tail, after every banked verdict and every
+    // calibration leg above has been taken. It is placed last for two reasons beyond the standing one
+    // (its rungs perturb the block): it is the ONLY battery that re-points CT0QTS at a different
+    // tile-state region and that publishes POISON rather than zeros into the shared bin regions, so
+    // every reading taken above is taken on the arrangement those verdicts were banked under.
+    v3d68_binner_wall();
 }
 
 /// PI-V3D-63 — one banked rung's readback: the RANK 2 placement witness (the CT0/PCS words) plus the
@@ -7599,6 +7688,412 @@ fn v3d66_ptb_sweep() {
     serial_println!(
         ":: V3D: [v3d66] ptbsweep verdict — eight ids swept across two passes, {:?} + {:?}, every one of them RAW and UNNAMED. What the enum calls them is recorded in the source comment and is deliberately NOT printed on the wire, because V3D-65 proved on this silicon that an enum member and the mux its index selects can disagree: the six-for-six index cross-check (14/16/17/24/25/32) stands, and src28 = BIN_ACTIVE was still REJECTED for measuring CLOCK-LIKE on a pure-idle leg. id↔mux validity is therefore PARTIAL and per-id, and a name is licensed only by behaviour. THE STANDING RULE: a transcribed name must match the class measured here or it is REJECTED; calibration checks the transcription, never the reverse. Transcription is V3D-67's job, and it now has classes to be judged against ::",
         V3D66_BATCH_A, V3D66_BATCH_B
+    );
+}
+
+// ─── PI-V3D-68 (`binwall`) — vary the FRAME, the one input the campaign has never varied. ───────────
+//
+// THE WALL, restated so the ladder below is read against it and not against a theory: on Pi 4 silicon
+// the binner frame handshake never completes. `BMACTIVE` sets at the GO and never clears, `BMBUSY`
+// never sets, `BFC` stays flat, `FLDONE` never fires, `INT_STS` reads 0 after the full backstop — while
+// CT1 render frames on the same block retire and byte-verify every boot. Submission ([v3d54]), register
+// mirrors ([v3d23/49]), reset ([v3d50]), the L2T window and flush mode ([v3d51/53]), packet encoding
+// ([v3d57]), the MMU and GMP with the fault policy armed ([v3d60/62]), the clock domain ([v3d55/64])
+// and the CL-epilogue question ([v3d59] T4: `v3dX(bcl_epilogue)` emits a bare FLUSH — no
+// INCREMENT_SEMAPHORE, no FLUSH_ALL_STATE — so our terminator is already mainline-exact) are all closed.
+//
+// WHAT IS LEFT UNVARIED. Go back through every rung this campaign has ever kicked — `[v3d40]`'s probe,
+// the six `[v3d48]` ladder rungs, `[v3d50/51/53]`, `[v3d63]`'s 2x2, `[v3d64]`/`[v3d66]`'s L3 legs, the
+// real M4 draw. Every single one of them programmed the SAME `TILE_BINNING_MODE_CFG`: a 64x64 frame,
+// which at this tree's established 64x64 bin tile is EXACTLY ONE TILE. The campaign has varied the CL's
+// content, its placement, its length, the cache mode around it, the reset before it and the interrupt
+// policy over it — and has never once varied the frame the PTB was asked to tile. §31's audit proved
+// that one geometry is encoded exactly as Mesa encodes it; it could not prove that geometry is one the
+// PTB can close, because it never compared it with another.
+//
+// A one-tile frame is the most degenerate legal frame there is, and it is the frame on which the
+// campaign's most load-bearing fact — "an empty bin frame MUST retire" — was measured. That premise is
+// itself unvaried: it is sourced from the kernel's `v3d_bin_job_run`, which asserts nothing of the kind,
+// and NO Mesa path ever submits one (gallium drops a job whose draw bounds enclose nothing; v3dv never
+// starts a frame it will not draw into). "The empty frame did not retire" may simply be the hardware's
+// honest answer to a question no driver asks.
+//
+// So this arc varies the frame, on both axes at once, and reads four things per rung: whether it
+// retired, whether ANY register reading moved with tile count, whether the PTB's reservation pointer
+// scaled with tile count, and whether a poisoned tile-state array 16x larger than the old one caught a
+// single PTB byte.
+//
+// THE RESERVATION PREDICTION — the part that can produce a POSITIVE PTB-side signal on a frame that
+// never retires. Mesa `v3d_util.c::v3d_tile_alloc_sizes` states that the PTB requests the tile-alloc
+// INITIAL block PER TILE at `START_TILE_BINNING`, before and independent of any primitive, then
+// allocates in aligned 4 KiB chunks (two of them up front). §30 measured `BPCA` advancing by EXACTLY
+// `align(1*128, 4096) + 8192 = 0x3000` on the one-tile frame — the formula's value to the byte, over a
+// pool the poison proved untouched. That single calibration point cannot separate "the PTB reserved
+// per-tile" from "the PTB grabs three 4 KiB chunks regardless". A 16-tile frame reserves 2048 B, which
+// still rounds to 0x3000 — but under the 32x32 tile contingency the same frame is 64 tiles and reserves
+// 8192 B, which rounds to 0x4000. So the ladder's `BPCA` column measures the effective tile size AND
+// tests the per-tile reservation model at the same time, on a wedged frame, without needing a retire.
+//
+// WHAT IS DELIBERATELY NOT ARMED. `BXCF` (PTB binner extra config) is read and printed per rung and is
+// never written — mainline writes it from no path, and a rung that both re-shaped the frame and poked an
+// undocumented PTB config register would discriminate nothing. `MISCCFG.QRMAXCNT` stays disarmed for the
+// same reason and by the standing `V3D55_ARM_QRMAXCNT` decision. `CTRSTA` stays disarmed. No new MMIO
+// window is opened, no GMP or `MMU_CTL` write is made, and the real M4 draw is untouched.
+
+/// PI-V3D-68 — the bin tile this tree's configuration selects: 1 RT, 32 bpp internal, no MSAA, no
+/// double-buffer, which is Mesa's largest tile. Established in the `TILE_STATE_TILES` note, not
+/// re-derived here; the ladder's own `BPCA` column is what tests it on silicon.
+const V3D68_BIN_TILE_W: usize = 64;
+const V3D68_BIN_TILE_H: usize = 64;
+/// PI-V3D-68 — the tile-size contingency factor the arena bound is taken against: if the real bin tile
+/// were 32x32 rather than 64x64, every rung would carry 4x the tiles. A rung is only kicked when its
+/// TSDA fits the dedicated region even at that factor (`v3d68_geom_sound`).
+const V3D68_TILE_CONTINGENCY: usize = 4;
+
+/// PI-V3D-68 — one rung's frame geometry. The ONLY thing that differs between ladder rungs of the same
+/// `BinContent`.
+#[derive(Clone, Copy)]
+struct V3d68Geom {
+    w: usize,
+    h: usize,
+}
+
+impl V3d68Geom {
+    const fn tiles_x(&self) -> usize {
+        (self.w + V3D68_BIN_TILE_W - 1) / V3D68_BIN_TILE_W
+    }
+    const fn tiles_y(&self) -> usize {
+        (self.h + V3D68_BIN_TILE_H - 1) / V3D68_BIN_TILE_H
+    }
+    /// Tile count under this tree's established 64x64 bin tile (1 layer).
+    const fn tiles(&self) -> usize {
+        self.tiles_x() * self.tiles_y()
+    }
+    /// Tile count under the 32x32 contingency — what the frame would carry if the established tile size
+    /// were wrong. Only ever used to BOUND the TSDA, never to claim a reading.
+    const fn tiles_contingent(&self) -> usize {
+        self.tiles() * V3D68_TILE_CONTINGENCY
+    }
+    /// The `BPCA` advance Mesa's `v3d_tile_alloc_sizes` reservation predicts for this frame:
+    /// `align(tiles * V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE, 4096) + 8192`, with the initial block at 128 B
+    /// (`v3d_limits.h`, and the enum our `TILE_BINNING_MODE_CFG` programs).
+    const fn predicted_bpca(&self, tiles: usize) -> u32 {
+        ((tiles * 128).next_multiple_of(4096) + 8192) as u32
+    }
+}
+
+/// PI-V3D-68 — a rung may only be kicked when BOTH tile-size readings of its TSDA fit the dedicated
+/// region. Fail-closed: a geometry that cannot be bounded is reported and skipped, never kicked.
+fn v3d68_geom_sound(g: &V3d68Geom) -> bool {
+    g.tiles_contingent() * TILE_STATE_BYTES_PER_TILE <= V3D68_TSDA_BYTES
+        && BIN_TILEALLOC_BYTES >= (g.tiles_contingent() * 128).next_multiple_of(4096) + 8192
+}
+
+/// PI-V3D-68 — the ladder. Three `Empty` frames of growing tile count, then the smallest non-empty
+/// frame at a non-degenerate geometry. The first entry is the campaign's banked frame, re-run here as
+/// the in-boot control so every other rung is read as a differential against it and not against a
+/// reading from another boot.
+const V3D68_LADDER: [(&str, V3d68Geom, BinContent); 4] = [
+    ("empty 64x64 (1 tile — the banked control)", V3d68Geom { w: 64, h: 64 }, BinContent::Empty),
+    ("empty 128x128 (4 tiles)", V3d68Geom { w: 128, h: 128 }, BinContent::Empty),
+    ("empty 256x256 (16 tiles)", V3d68Geom { w: 256, h: 256 }, BinContent::Empty),
+    ("minprim 256x256 (16 tiles, full draw)", V3d68Geom { w: 256, h: 256 }, BinContent::Full),
+];
+
+/// PI-V3D-68 — one rung's measured surface beyond what `V3d63Rung` already carries.
+#[derive(Clone, Copy)]
+struct V3d68Read {
+    kicked: bool,
+    retired: bool,
+    tiles: usize,
+    pcs: u32,
+    ct0ca: u32,
+    ct0cs: u32,
+    ct0lc: u32,
+    ct0pc: u32,
+    bfc: u32,
+    bpca_adv: u32,
+    bpcs: u32,
+    bpos: u32,
+    bxcf: u32,
+    int_sts: u32,
+    flush_done: bool,
+    ts_touched: u32,
+    pool_touched: u32,
+}
+
+impl V3d68Read {
+    const NOT_RUN: Self = Self {
+        kicked: false,
+        retired: false,
+        tiles: 0,
+        pcs: 0,
+        ct0ca: 0,
+        ct0cs: 0,
+        ct0lc: 0,
+        ct0pc: 0,
+        bfc: 0,
+        bpca_adv: 0,
+        bpcs: 0,
+        bpos: 0,
+        bxcf: 0,
+        int_sts: 0,
+        flush_done: false,
+        ts_touched: 0,
+        pool_touched: 0,
+    };
+    /// The bits this rung contributes to the "did ANYTHING respond to the frame shape?" comparison.
+    /// Deliberately EXCLUDES `bpca_adv` and the touched counts, which are compared separately: they are
+    /// the quantitative predictions, and folding them into a bare equality would let a matching
+    /// prediction read as "no response".
+    fn shape_signature(&self) -> (u32, u32, u32, u32, u32, u32, u32, u32, u32) {
+        // `CT0CA` and `BPCS`/`BPOS` belong here: every `Empty` rung publishes a byte-identical control
+        // list (only the two width/height fields differ, at a fixed length), so all three are directly
+        // comparable across the geometry axis.
+        (
+            self.pcs, self.ct0cs, self.ct0lc, self.ct0pc, self.bfc, self.int_sts, self.ct0ca,
+            self.bpcs, self.bpos,
+        )
+    }
+}
+
+/// PI-V3D-68 — kick one ladder rung and read everything the arc needs off it.
+///
+/// The rung itself is `submit_bisect_rung_geom` — the SAME kick sequence, cache maintenance, submission
+/// audit and `FLDONE` backstop the `[v3d48]` ladder uses, with the geometry supplied. `bank: true` so
+/// the `[v3d63]` sweep bank spans the frame and slot 2 keeps the `[v3d55]` clock-liveness witness
+/// truthful inside the wait, exactly as under `[v3d63]`.
+fn v3d68_run_rung(name: &str, g: &V3d68Geom, content: BinContent) -> V3d68Read {
+    if !v3d68_geom_sound(g) {
+        serial_println!(
+            ":: V3D: [v3d68] {} — NOT RUN (fail-closed): a {}x{} frame is {} tiles at the established 64x64 bin tile and {} under the 32x32 contingency, whose tile-state array ({} B) exceeds the dedicated {} B region. A geometry this ladder cannot BOUND is never kicked; this rung contributes no reading and is not folded in as a zero ::",
+            name, g.w, g.h, g.tiles(), g.tiles_contingent(),
+            g.tiles_contingent() * TILE_STATE_BYTES_PER_TILE, V3D68_TSDA_BYTES
+        );
+        return V3d68Read::NOT_RUN;
+    }
+    let ts = (arena_phys() + OFF_V3D68_TSDA) as u32;
+    let pool = (arena_phys() + OFF_BIN_TILEALLOC) as u32;
+    // `OFF_SHADREC` for every rung: the `Full` rung reuses the real M4 shader record and vertex data
+    // that `probe_job` already published and byte-audited, so the non-empty rung introduces no new
+    // shader, no new record and no new geometry — only the frame it is binned into differs.
+    let r = submit_bisect_rung_geom("v3d68", name, content, OFF_SHADREC, OFF_PROBE_BIN_CL, true, Some(*g));
+    let r = match r {
+        Some(r) => r,
+        None => {
+            serial_println!(
+                ":: V3D: [v3d68] {} — NOT RUN: the rung fail-closed before its kick (range escape, see the line above). No reading ::",
+                name
+            );
+            return V3d68Read::NOT_RUN;
+        }
+    };
+    // PTB-side registers, read before anything else perturbs the block.
+    let bpca = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA);
+    let bpcs = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCS);
+    let bpos = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPOS);
+    let bxcf = mmio_read(V3D_CORE0_BASE, V3D_PTB_BXCF);
+    let int_sts = mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS);
+    let bfc = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    // The [v3d56] evidence-integrity rule: an "untouched" readback is only evidence if the L2T
+    // write-back actually finished, so keep the completion bit and print it with the verdict.
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_FLUSH);
+    let flush_done = wait_bit_clear(
+        V3D_CORE0_BASE,
+        V3D_CTL_L2TCACTL,
+        V3D_L2TCACTL_L2TFLS,
+        "L2T write-back (v3d68 geom scan)",
+    );
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_SLCACTL, V3D_SLCACTL_INVALIDATE_ALL);
+    dsb();
+    cache::invalidate_range(arena_phys() + OFF_V3D68_TSDA, V3D68_TSDA_BYTES);
+    cache::invalidate_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+    dsb();
+    let ts_scan = v3d56_scan(ts, V3D68_TSDA_BYTES);
+    let pool_scan = v3d56_scan(pool, BIN_TILEALLOC_BYTES);
+    v3d56_emit_scan("v3d68", "tile-state (24 KiB, whole region)", ts, &ts_scan, flush_done);
+    v3d56_emit_scan("v3d68", "tile-alloc pool", pool, &pool_scan, flush_done);
+
+    let adv = bpca.wrapping_sub(pool);
+    let pred_est = g.predicted_bpca(g.tiles());
+    let pred_cont = g.predicted_bpca(g.tiles_contingent());
+    serial_println!(
+        ":: V3D: [v3d68] {} — {}x{} frame, {} tiles (64x64 tile) / {} tiles (32x32 contingency) | retired={} BFC={:#010x} PCS={:#010x}(BMACTIVE={} BMBUSY={} BMOOM={}) CT0CA={:#010x} CT0CS={:#010x}(CTRUN={}) CT0LC={:#x} CT0PC={:#x} INT_STS={:#010x} | PTB: BPCA advance={:#x} vs predicted {:#x} (64x64 tile) / {:#x} (32x32) — match64={} match32={} | BPCS={:#x} BPOS={:#x} BXCF={:#010x}(CLIPDISA={} RWORDERDISA={}, READ ONLY — never written by us or by mainline) | poison: tile-state touched={} of {} words, pool touched={} of {} words, L2T write-back completed={} ::",
+        name, g.w, g.h, g.tiles(), g.tiles_contingent(),
+        r.retired as u32, bfc, r.pcs,
+        (r.pcs & V3D_PCS_BMACTIVE != 0) as u32,
+        (r.pcs & V3D_PCS_BMBUSY != 0) as u32,
+        (r.pcs & V3D_PCS_BMOOM != 0) as u32,
+        r.ct0ca, r.ct0cs,
+        (r.ct0cs & V3D_CLE_CT1CS_CTRUN != 0) as u32,
+        r.ct0lc, r.ct0pc, int_sts,
+        adv, pred_est, pred_cont,
+        (adv == pred_est) as u32, (adv == pred_cont) as u32,
+        bpcs, bpos, bxcf,
+        (bxcf & V3D_PTB_BXCF_CLIPDISA != 0) as u32,
+        (bxcf & V3D_PTB_BXCF_RWORDERDISA != 0) as u32,
+        ts_scan.zeroed + ts_scan.overwritten, ts_scan.words,
+        pool_scan.zeroed + pool_scan.overwritten, pool_scan.words,
+        flush_done as u32,
+    );
+    V3d68Read {
+        kicked: true,
+        retired: r.retired,
+        tiles: g.tiles(),
+        pcs: r.pcs,
+        ct0ca: r.ct0ca,
+        ct0cs: r.ct0cs,
+        ct0lc: r.ct0lc,
+        ct0pc: r.ct0pc,
+        bfc,
+        bpca_adv: adv,
+        bpcs,
+        bpos,
+        bxcf,
+        int_sts,
+        flush_done,
+        ts_touched: ts_scan.zeroed + ts_scan.overwritten,
+        pool_touched: pool_scan.zeroed + pool_scan.overwritten,
+    }
+}
+
+/// PI-V3D-68 — the frame-geometry / minimal-non-empty-frame battery.
+///
+/// Poison-honest and hub-gated exactly like `[v3d63]`/`[v3d64]`/`[v3d66]`: an explicit `SKIPPED` line
+/// when the block is down, and a rung that did not run is REPORTED as not-run rather than folded in as a
+/// zero. QEMU raspi4b models no V3D block and returns at `BLOCK-DOWN` long before this runs, so the
+/// whole battery is dormant there and `kernel8-test` green for this arc means NO REGRESSION and nothing
+/// more — every verdict below is metal-attended.
+fn v3d68_binner_wall() {
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down => {
+            serial_println!(
+                ":: V3D: [v3d68] SKIPPED — hub IDENT0 reads 0x00000000 (block absent/unpowered; the QEMU raspi4b signature). No frame geometry was varied this boot and NO verdict is implied ::"
+            );
+            return;
+        }
+        V3dPresence::Poison(w) => {
+            serial_println!(
+                ":: V3D: [v3d68] SKIPPED — hub IDENT0 reads poison {:#010x} (open-bus / firmware fill, not a live register). No frame geometry was varied this boot and NO verdict is implied ::",
+                w
+            );
+            return;
+        }
+    }
+    serial_println!(
+        ":: V3D: [v3d68] binwall — varying the ONE input this campaign has never varied: the FRAME. Every rung ever kicked ([v3d40], the six [v3d48] rungs, [v3d50/51/53], [v3d63]'s 2x2, [v3d64]/[v3d66]'s L3 legs, the M4 draw) programmed the same 64x64 TILE_BINNING_MODE_CFG = exactly ONE 64x64 tile, the most degenerate legal frame there is. Ladder: {} rungs, Empty at 1 / 4 / 16 tiles then the smallest non-empty frame at 16 tiles, each with the [v3d48] kick sequence and its ~0.5 s FLDONE backstop, each writing a POISONED {} B tile-state array (16x the old 256 B detector) and a poisoned {} B pool. Reads per rung: retire, the CT0/PCS words, the PTB reservation pointer against Mesa's per-tile formula, and whether a single PTB byte landed anywhere ::",
+        V3D68_LADDER.len(), V3D68_TSDA_BYTES, BIN_TILEALLOC_BYTES
+    );
+
+    let mut reads = [V3d68Read::NOT_RUN; 4];
+    let mut i = 0usize;
+    while i < V3D68_LADDER.len() {
+        let (name, g, content) = V3D68_LADDER[i];
+        reads[i] = v3d68_run_rung(name, &g, content);
+        i += 1;
+    }
+
+    // ── Aggregate the ladder ─────────────────────────────────────────────────────────────────────────
+    let mut kicked = 0u32;
+    let mut retired_any = false;
+    let mut retired_mask = 0u32;
+    let mut wrote_any = false;
+    // Evidence-integrity gate for the poison column ([v3d55]/[v3d56] rule): an "untouched" readback is
+    // only evidence when the L2T write-back it was taken behind actually completed. Any rung whose drain
+    // did not finish disqualifies the "PTB wrote nothing" reading for the WHOLE ladder — it is never
+    // silently downgraded to a clean result.
+    let mut drains_all_done = true;
+    // BXCF is the one PTB configuration register this campaign has ever observed and never controlled.
+    // Track it across the rungs so the verdict can say whether it is inert state or something that moves.
+    let mut bxcf_first: Option<u32> = None;
+    let mut bxcf_stable = true;
+    let mut i = 0usize;
+    while i < reads.len() {
+        if reads[i].kicked {
+            kicked += 1;
+            if reads[i].retired {
+                retired_any = true;
+                retired_mask |= 1 << i;
+            }
+            if reads[i].ts_touched != 0 || reads[i].pool_touched != 0 {
+                wrote_any = true;
+            }
+            if !reads[i].flush_done {
+                drains_all_done = false;
+            }
+            match bxcf_first {
+                None => bxcf_first = Some(reads[i].bxcf),
+                Some(b) => {
+                    if reads[i].bxcf != b {
+                        bxcf_stable = false;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    if kicked < 2 {
+        serial_println!(
+            ":: V3D: [v3d68] binwall INCONCLUSIVE — only {} of {} rungs kicked, so there is no differential to read. A geometry ladder needs at least two frames to compare; NOTHING here is a measurement and no candidate is excluded. This is explicitly NOT a clean result ::",
+            kicked, V3D68_LADDER.len()
+        );
+        return;
+    }
+
+    // Did ANY register reading respond to the frame shape? Compare every kicked Empty rung against the
+    // first kicked one. The `Full` rung is excluded from this comparison — it varies content as well as
+    // shape, so a difference there would not be attributable to geometry.
+    let mut base: Option<usize> = None;
+    let mut shape_responded = false;
+    let mut bpca_responded = false;
+    let mut i = 0usize;
+    while i < reads.len() {
+        // Ladder entries 0..2 are the Empty rungs; entry 3 is the Full one (see V3D68_LADDER).
+        if reads[i].kicked && i < 3 {
+            match base {
+                None => base = Some(i),
+                Some(b) => {
+                    if reads[i].shape_signature() != reads[b].shape_signature() {
+                        shape_responded = true;
+                    }
+                    if reads[i].bpca_adv != reads[b].bpca_adv {
+                        bpca_responded = true;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    // Did the minimal non-empty frame at a non-degenerate geometry behave differently from the empty one
+    // at the SAME geometry? Entries 2 and 3 are the matched pair.
+    let content_pair = reads[2].kicked && reads[3].kicked;
+    let content_responded =
+        content_pair && reads[2].shape_signature() != reads[3].shape_signature();
+
+    let verdict = if retired_any {
+        "A BIN FRAME RETIRED. The wall is not unconditional: the frame the PTB was asked to tile was the wall, or part of it. Read the retired-mask against the ladder — a retire on a multi-tile EMPTY frame means the one-tile frame is the defect and every 'empty does not retire' verdict in this campaign was measured on a degenerate frame; a retire only on the non-empty rung means a 4.2 binner does not close a frame it was given nothing to bin, and the campaign's most load-bearing premise is RETRACTED. Either way the next arc is a bring-up arc, not a probe arc"
+    } else if !drains_all_done {
+        "no rung retired, and the poison column CANNOT be read: at least one rung's L2T write-back did not complete inside its backstop, so bytes the PTB may have written could still be parked in the cache. The retire and register columns above stand on their own (they are MMIO reads, not memory reads); the 'PTB wrote nothing' reading is INCONCLUSIVE for this ladder and must not be cited. Instrument first — re-run and read the drain-completion column before any memory-side verdict"
+    } else if wrote_any {
+        "no rung retired, but the PTB WROTE — poison was disturbed in the tile-state array or the pool on at least one rung. That is the first bin-side memory traffic this campaign has ever caught, and it was caught by growing the detector, not by changing the engine. The wall is now strictly downstream of the write: item-accept and pool-write both happen, and only frame-close does not. Take the touched extents per rung as the next arc's handle"
+    } else if shape_responded || bpca_responded {
+        "no rung retired and no byte landed, but the frame unit IS RESPONSIVE to the frame shape — a reading moved with tile count. Whatever moved is a live handle on a unit the campaign has been treating as inert: it proves the geometry reaches the PTB front end, which means the front end is running and the wall sits behind a stage that geometry can still reach. Name the moving column and drive the next arc off it"
+    } else {
+        "no rung retired, no byte landed, and EVERY reading is bit-identical across 1, 4 and 16 tiles and across empty vs non-empty content. Frame geometry is now EXCLUDED with the same force as encoding, submission, cache mode, reset, MMU and clock: the bin pipeline responds to nothing this driver can put in front of it. That removes the last shape- or content-shaped theory on the board and leaves exactly two never-written mainline-defined configuration registers — PTB BXCF (printed per rung above, read-only here) and MISCCFG.QRMAXCNT (disarmed since V3D-55) — plus the possibility that this block needs an initialisation this campaign has not found. Report the BXCF column with this verdict; it is the only PTB configuration state we have ever observed and never controlled"
+    };
+    serial_println!(
+        ":: V3D: [v3d68] binwall verdict — kicked={}/{} | retired-any={} (mask={:#06b}) | PTB wrote anywhere={} (L2T drains all completed={} — the poison column is evidence only when this is 1) | register readings responded to tile count={} | BPCA reservation responded to tile count={} | empty-vs-non-empty at the same 16-tile geometry differed={} (pair present={}) | BXCF={:#010x} stable across rungs={} (READ ONLY; never written by us or by mainline) | tiles per rung = {}/{}/{}/{} — {} ::",
+        kicked, V3D68_LADDER.len(), retired_any as u32, retired_mask,
+        wrote_any as u32, drains_all_done as u32,
+        shape_responded as u32, bpca_responded as u32,
+        content_responded as u32, content_pair as u32,
+        bxcf_first.unwrap_or(0), bxcf_stable as u32,
+        reads[0].tiles, reads[1].tiles, reads[2].tiles, reads[3].tiles,
+        verdict,
+    );
+    serial_println!(
+        ":: V3D: [v3d68] binwall scope — this battery varied FRAME GEOMETRY and FRAME CONTENT and nothing else. It did NOT write BXCF, MISCCFG.QRMAXCNT or CTRSTA, did not touch the GMP or MMU_CTL, opened no new MMIO window, and left the real M4 draw untouched. The BPCA columns are read against Mesa v3d_util.c::v3d_tile_alloc_sizes (the PTB reserves the INITIAL block PER TILE at START_TILE_BINNING, then allocates aligned 4 KiB chunks); a match at BOTH tile-size hypotheses on the same rung means the prediction did not discriminate on this frame and the tile size stays as established, NOT as measured ::"
     );
 }
 
@@ -8995,6 +9490,22 @@ fn v3d57_field(name: &str, ours: u64, want: u64) -> u32 {
 /// length we used vs Mesa's, then one `v3d57_field` line per field. Closes with the prologue-ORDER check
 /// and the tile-memory sizing check (the two things the CL bytes alone cannot show). Read-only.
 fn v3d57_cl_mesa_diff(tag: &str, off: usize, len: usize) {
+    v3d57_cl_mesa_diff_geom(tag, off, len, TARGET_W, TARGET_H, TILE_STATE_TILES);
+}
+
+/// PI-V3D-68 — `v3d57_cl_mesa_diff` with the EXPECTED frame geometry (and the tile count derived from
+/// it) supplied by the caller, so a geometry-ladder rung is packing-checked against the encoding it
+/// actually intended instead of printing two DIVERGE lines for the one field the rung is varying on
+/// purpose. Passing `(TARGET_W, TARGET_H, TILE_STATE_TILES)` reproduces the pre-V3D-68 output byte for
+/// byte; the plain `v3d57_cl_mesa_diff` above does exactly that for every pre-existing caller.
+fn v3d57_cl_mesa_diff_geom(
+    tag: &str,
+    off: usize,
+    len: usize,
+    exp_w: usize,
+    exp_h: usize,
+    exp_tiles: usize,
+) {
     if !V3D57_CL_AUDIT {
         return;
     }
@@ -9069,8 +9580,8 @@ fn v3d57_cl_mesa_diff(tag: &str, off: usize, len: usize) {
                 diverged += v3d57_field("max BPP of all RTs (enum)", getb(p, 12, 2), 0); // internal bpp 32
                 diverged += v3d57_field("multisample mode 4x", getb(p, 14, 1), 0); // job->msaa = false
                 diverged += v3d57_field("double-buffer in non-ms", getb(p, 15, 1), 0); // job->double_buffer = false
-                diverged += v3d57_field("width in px (minus_one)", getb(p, 32, 16), (TARGET_W - 1) as u64);
-                diverged += v3d57_field("height in px (minus_one)", getb(p, 48, 16), (TARGET_H - 1) as u64);
+                diverged += v3d57_field("width in px (minus_one)", getb(p, 32, 16), (exp_w - 1) as u64);
+                diverged += v3d57_field("height in px (minus_one)", getb(p, 48, 16), (exp_h - 1) as u64);
             }
             P_OCCLUSION_QUERY_COUNTER => {
                 // gallium's OQ-disable: cl_emit(..., counter) with the address left at its 0 default.
@@ -9161,15 +9672,20 @@ fn v3d57_cl_mesa_diff(tag: &str, off: usize, len: usize) {
     // is derived from it — `TILE_STATE_BYTES == TILE_STATE_TILES * TILE_STATE_BYTES_PER_TILE` holds by
     // definition, so comparing those two would print an unreachable DIVERGE arm. The literal 256 is the
     // closing line of Mesa `v3d_tile_alloc_sizes` (v3d_util.c): tile_state = layers·tiles_x·tiles_y·256.
-    let ts_want = TILE_STATE_TILES * 256;
+    let ts_want = exp_tiles * 256;
+    // PI-V3D-68: both sizings are now taken against the rung's OWN tile count. For every pre-V3D-68
+    // caller `exp_tiles == TILE_STATE_TILES == 1` and `ts_ours`/`alloc_min` collapse to the constants
+    // this line has always printed, so the output is unchanged for them.
+    let ts_ours = if exp_tiles == TILE_STATE_TILES { TILE_STATE_BYTES } else { V3D68_TSDA_BYTES };
+    let alloc_min = (exp_tiles * 128).next_multiple_of(4096) + 8192;
     serial_println!(
         ":: V3D: [v3d57] {} verdict — packets={} packing-diverged={} prologue-order={} (CFG->[VCD]->[OQ]->START, terminator FLUSH/4 not FLUSH_ALL_STATE/5, no INCREMENT_SEMAPHORE) | tile-STATE bytes ours={} mesa={} ({} tile x 256, v3d_tile_alloc_sizes) {} | tile-ALLOC bytes ours={} mesa-min={} (align(tiles*128,4096)+8192) {} ::",
         tag, idx, diverged,
         if order_ok { "OK" } else { "DIVERGE" },
-        TILE_STATE_BYTES, ts_want, TILE_STATE_TILES,
-        if TILE_STATE_BYTES == ts_want { "OK" } else { "DIVERGE" },
-        BIN_TILEALLOC_BYTES, MESA_MIN_TILE_ALLOC_BYTES,
-        if BIN_TILEALLOC_BYTES >= MESA_MIN_TILE_ALLOC_BYTES { "OK" } else { "DIVERGE" },
+        ts_ours, ts_want, exp_tiles,
+        if ts_ours >= ts_want { "OK" } else { "DIVERGE" },
+        BIN_TILEALLOC_BYTES, alloc_min,
+        if BIN_TILEALLOC_BYTES >= alloc_min { "OK" } else { "DIVERGE" },
     );
 }
 

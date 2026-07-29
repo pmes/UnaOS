@@ -2707,3 +2707,128 @@ is down. Writes are PCTR config registers only — no new MMIO window, no new jo
 **QEMU raspi4b models no V3D block**, so `[v3d66]` never runs there and every class below is
 **metal-attended**. `kernel8-test` green for this arc means the default boot is byte-inert
 and the suite did not regress, and nothing more.
+
+---
+
+## 40. Varying the frame — the one input the campaign never varied (V3D-68)
+
+Nine arcs have varied the control list's content, its placement, its length, the cache mode
+around it, the reset before it, the interrupt policy over it and the counter bank across it.
+Go back through every bin frame this campaign has ever kicked — `[v3d40]`'s probe, the six
+`[v3d48]` ladder rungs, `[v3d50]`/`[v3d51]`/`[v3d53]`, `[v3d63]`'s 2×2 matrix,
+`[v3d64]`/`[v3d66]`'s L3 legs, the real M4 draw — and every single one of them programmed the
+**same** `TILE_BINNING_MODE_CFG`: a 64×64 frame, which at this tree's established 64×64 bin
+tile is **exactly one tile**. §31 proved that geometry is encoded exactly as Mesa encodes it.
+It could not prove it is a geometry the PTB can close, because it never compared it with
+another. A one-tile frame is the most degenerate legal frame there is, and it is the frame on
+which the campaign's most load-bearing fact was measured.
+
+That fact is itself unvaried. "An empty bin frame must retire" is sourced from the kernel's
+`v3d_bin_job_run`, which asserts nothing of the kind, and **no Mesa path ever submits one** —
+gallium drops a job whose draw bounds enclose nothing; v3dv never starts a frame it will not
+draw into. "The empty frame did not retire" may simply be the hardware's honest answer to a
+question no driver asks.
+
+### The candidate ranking, and what already excludes each
+
+| Rank | Candidate | Excluding evidence |
+|---|---|---|
+| **1** | **Frame geometry / tile count** — `TILE_BINNING_MODE_CFG` width/height, and the tile-state array that must scale with it | **Nothing.** §31 audited the *encoding* of one geometry, never a second geometry. Unvaried in every arc. |
+| **2** | **The empty-frame premise** — a minimal *non-empty* frame at a *non-degenerate* geometry | Partially varied: `Full` at 64×64 also wedges (§22). What was never varied is content **×** geometry jointly. |
+| **3** | **Tile-alloc pool arming** — is the pool consulted, or merely latched? | `BMOOM=0`, `OUTOMEM` never fired (§23) — consistent with "pool fine" *and* with "pool never consulted". `BPCS` reloads from the `CT0QMS` write (§32 S1), so the register path is live. Armed here as a **witness**, not a perturbation. |
+| 4 | The CL epilogue — `HALT` vs `FLUSH` vs `FLUSH_ALL_STATE`, `INCREMENT_SEMAPHORE` | **CLOSED by §33 T4**: `v3dX(bcl_epilogue)` emits a bare `FLUSH` (4) — no `INCREMENT_SEMAPHORE`, no `FLUSH_ALL_STATE`. Our terminator is already mainline-exact. Not armed. |
+| 5 | `CT0CA` vs `CT0EA` end condition | `CT0CA` reaches `EA` every rung and the submit audit is byte-exact (§28 `[v3d54]`). The CLE demonstrably consumed the `FLUSH`. Not armed. |
+| 6 | PTB output address config (`CT0QMA`/`QMS`/`QTS`) | Byte-exact against `v3d_bin_job_run`, echoes verified (§23 `[v3d49]`); the uapi confirms `qma`=tile alloc, `qms`=its size, `qts`=tile state — our mapping. Not armed. |
+| 7 | L2T / slice-cache interposition on PTB writes | The `[v3d51]` FLUSH vs `[v3d53]` kernel-exact CLEAR differential wedged both ways (§29), and CT1 stores land through the same L2T. Not armed. |
+| 8 | Clock / power gating of the PTB sub-unit | `clkdom` ACTIVE at 500 MHz, `clkliv` Δ249 M (§29); `src32 CYCLE_COUNT ≈ 645 M` across the bin leg (§37). The block is clocked. `MISCCFG.QRMAXCNT` stays disarmed per `V3D55_ARM_QRMAXCNT`. |
+| 9 | GCA / GMP interposition | `PROT_ENABLE=0`, `gmpdelta` clean, and V3D-62's armed fault policy caught nothing on either channel (§35, §"fault-reporting instrument"). GCA is a `ver<41` path. Not armed. |
+| — | `BXCF` (PTB binner extra config) | Mainline defines it and **writes it from no path**. Read and printed per rung; **never written** — a rung that both re-shaped the frame and poked an undocumented PTB config register would discriminate nothing. |
+
+### The battery — `[v3d68] binwall`
+
+Four rungs, `UNAOS_V3D_DEEP`-gated, riding the very tail of `empty_frame_bisection` (after
+every banked verdict and every calibration leg, because this is the only battery that
+re-points `CT0QTS` and publishes poison rather than zeros into the shared bin regions).
+
+| Rung | Frame | Tiles | Content | What it discriminates |
+|---|---|---|---|---|
+| 1 | 64×64 | 1 | `Empty` | the campaign's banked frame, re-run **in this boot** so every other rung is a differential against a same-boot control, not against another capture |
+| 2 | 128×128 | 4 | `Empty` | geometry alone |
+| 3 | 256×256 | 16 | `Empty` | geometry alone, at 16× the tile count |
+| 4 | 256×256 | 16 | `Full` | the smallest non-empty frame at a **non-degenerate** geometry — same shader record, same vertex data, same triangle as M4; only the frame it is binned into differs |
+
+Each rung is `submit_bisect_rung_geom` — the identical `[v3d48]` kick sequence, cache
+maintenance, `[v3d54]` submission audit and ~0.5 s `FLDONE` backstop — with three coupled
+changes that are the one variable: the CFG packet's width/height, a dedicated 24 KiB
+tile-state array at `OFF_V3D68_TSDA` (sized to the whole region regardless of the rung, so an
+under-provisioned TSDA can never be the confound), and the packing witness's expected
+width/height. Clip window, viewport offset and clipper scaling stay at their 64×64 values on
+every rung.
+
+Both bin regions are **poisoned**, not zeroed, with `[v3d56]`'s index-encoding seed: "the PTB
+wrote zeros" and "the PTB wrote nothing" are different answers, and the old detector was
+256 bytes. This one is 24 KiB.
+
+### The reservation prediction — a positive PTB signal without a retire
+
+Mesa `v3d_util.c::v3d_tile_alloc_sizes` states that the PTB requests the tile-alloc **initial
+block per tile** at `START_TILE_BINNING`, before and independent of any primitive, then
+allocates in aligned 4 KiB chunks (two up front). §30 measured `BPCA` advancing by exactly
+`align(1·128, 4096) + 8192 = 0x3000` on the one-tile frame — the formula's value to the byte,
+over a pool the poison proved untouched. **One calibration point cannot separate "reserved
+per tile" from "grabs three 4 KiB chunks regardless."**
+
+A 16-tile frame reserves 2048 B, which still rounds to `0x3000`. Under the 32×32 tile-size
+contingency the *same* frame is 64 tiles and reserves 8192 B, which rounds to `0x4000`. So the
+`BPCA` column measures the effective tile size **and** tests the per-tile reservation model at
+the same time, **on a frame that never retires**. Both predictions are printed per rung with
+their own match flags; a match at both hypotheses means the prediction did not discriminate on
+that frame, and the tile size stays *as established*, never *as measured*.
+
+### The outcome tree
+
+- **Any rung retires** ⇒ the wall is not unconditional. A retire on a multi-tile **empty**
+  frame means the one-tile frame was the defect and every "empty does not retire" verdict in
+  this campaign was measured on a degenerate frame. A retire only on the **non-empty** rung
+  means a 4.2 binner does not close a frame it was given nothing to bin, and the campaign's
+  most load-bearing premise is **retracted**. Either way the next arc is a bring-up arc.
+- **No retire, but poison disturbed** ⇒ the first bin-side memory traffic the campaign has ever
+  caught, caught by growing the detector rather than changing the engine. The wall moves
+  strictly downstream of the write.
+- **No retire, no byte, but a reading moved with tile count** ⇒ the frame unit *is* responsive
+  to frame shape. Geometry reaches the PTB front end, so the front end is running.
+- **No retire, no byte, every reading bit-identical across 1/4/16 tiles and across
+  empty/non-empty** ⇒ frame geometry is excluded with the same force as encoding, submission,
+  cache mode, reset, MMU and clock. That removes the last shape- or content-shaped theory on
+  the board and leaves exactly two never-written mainline-defined configuration registers —
+  PTB `BXCF` and `MISCCFG.QRMAXCNT` — plus the possibility that this block needs an
+  initialisation the campaign has not found.
+
+Two guards the tree depends on. **Fewer than two rungs kicked ⇒ `INCONCLUSIVE`**, never a clean
+result: a geometry ladder with one frame has no differential. And **the poison column is
+evidence only when every rung's L2T write-back completed** — a rung whose drain did not finish
+disqualifies the memory-side reading for the whole ladder, while the retire and register
+columns (MMIO reads, not memory reads) stand on their own.
+
+### Fail-closed sizing
+
+A rung is kicked only when its tile-state array fits the dedicated region **under both tile-size
+hypotheses**: 256×256 is 16 tiles at 64×64 (4 KiB) and 64 tiles at 32×32 (16 KiB), both under
+24 KiB. `v3d68_geom_sound` enforces that bound plus the Mesa-minimum pool at the contingent
+tile count, and a geometry that cannot be bounded is **reported and skipped, never kicked** — a
+mis-estimated tile size can cost the ladder a reading, never a write outside the arena.
+
+### Cost, gating and what is not armed
+
+Four more rungs with their `FLDONE` backstops plus a poison fill and scan of a 24 KiB tile-state
+region and the 32 KiB pool per rung; the `[v3d] deep=on` budget line now reads **17 rungs /
+~9 s**. Writes are the rungs' own already-existing kick sequence and the PCTR config the
+`[v3d63]` bank arms — **no `BXCF` write, no `QRMAXCNT` write, no `CTRSTA`, no GMP or `MMU_CTL`
+change, no new MMIO window, and the real M4 draw untouched.**
+
+The gating is verified by building `kernel8` both ways: the armed-with-deep image carries 12
+`[v3d68]` strings, the armed-without-deep image carries **zero** and is 54,720 bytes smaller.
+**QEMU raspi4b models no V3D block**, so the battery returns at its hub-identity gate with an
+explicit `SKIPPED` line and every verdict here is **metal-attended**; `kernel8-test` green for
+this arc (86/86) means the default boot is byte-inert and the suite did not regress, and
+nothing more.
