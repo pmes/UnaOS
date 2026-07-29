@@ -204,6 +204,17 @@ const SYS_WIN_CREATE: u64 = 29;
 const SYS_WIN_PRESENT: u64 = 30;
 const SYS_WIN_MOVE: u64 = 31;
 const SYS_WIN_CLOSE: u64 = 32;
+/// PULSE-1: SYS_CPUPULSE(ptr) -> 0 / -EFAULT — the per-core load SAMPLE, copied out to EL0. 49 is the next
+/// free number in the shared space (48, x86's `SYS_ACCEPT`, was the high-water mark on either arch); the
+/// number is minted HERE as well as on x86 because a syscall number names the same verb everywhere, and a
+/// windowed pulse app is not an x86-only idea even though x86 is where it ships first.
+///
+/// It hands out the RAW CUMULATIVE per-core `(busy, idle)` counts plus the caller's own core index, never a
+/// percent: "load" is only defined relative to a refresh window the kernel does not own, and collapsing
+/// cumulative counts into a percent would destroy the one distinction `vug::classify_load` exists to
+/// preserve — a core whose counters are FROZEN over the observer's window is parked, not idle. EL0 keeps the
+/// previous snapshot and applies that rule itself (`crates/user-pulse`).
+const SYS_CPUPULSE: u64 = 49;
 
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
@@ -6048,6 +6059,9 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_WIN_PRESENT => sys_win_present(a0),
         SYS_WIN_MOVE => sys_win_move(a0, a1, a2),
         SYS_WIN_CLOSE => sys_win_close(a0),
+        // PULSE-1: the per-core load sample, at its shared cross-arch number. Unconditional, like the
+        // window verbs — the sampler it reads (`sched::meter_cpu_*`) is compiled in every configuration.
+        SYS_CPUPULSE => sys_cpupulse(a0),
         SYS_EXIT => {
             // SPINHUNT — PROCESS exit terminates the ADDRESS SPACE, not just this task. Placed at the
             // very top of the arm, before every name-routed short-circuit below (each of which ends in
@@ -6554,6 +6568,73 @@ fn sys_getinfo(user_ptr: u64) -> i64 {
         core::slice::from_raw_parts(
             &info as *const UserInfo as *const u8,
             core::mem::size_of::<UserInfo>(),
+        )
+    };
+    match copy_to_user(user_ptr, bytes, bytes.len()) {
+        Ok(()) => 0,
+        Err(Efault) => EFAULT,
+    }
+}
+
+// =============================================================================================
+// PULSE-1 — SYS_CPUPULSE(49): the per-core load SAMPLE for an EL0 monitor.
+//
+// The kernel already samples per-core busy/idle ticks for its own full-screen `pulse` monitor and the vug
+// corner meters (`vug::CpuPulse`). This verb exposes the SAME accessors that sampler reads
+// (`sched::meter_cpu_count` / `meter_cpu_ticks` / `meter_current_cpu`) to EL0, so a WINDOWED pulse app can
+// be an EL0 program rather than a second in-kernel drawing loop. The kernel-side sampler is untouched by
+// this arc — there is exactly one place the counters are maintained, and this is a read of it.
+//
+// WHAT IS AND IS NOT DECIDED HERE. The kernel reports facts: how many cores the meter covers, each core's
+// CUMULATIVE (busy, idle) tick counts, and which core the CALLER is executing on. It does NOT compute a
+// percent and it does NOT flag a core parked — both are functions of a REFRESH WINDOW the kernel does not
+// own. `demo` is the core running THIS syscall, i.e. the core running the observer, which is the same role
+// the field plays in `CpuPulse::refresh` (the core running the render loop), so EL0's frozen-counter
+// disambiguation reads exactly like the kernel's. A `demo` value >= `ncpu` is possible in principle and is
+// reported honestly rather than clamped: the caller then finds no core matching it, and every frozen core
+// reads parked.
+// =============================================================================================
+
+/// PULSE-1: the ABI cap on cores `SYS_CPUPULSE` reports. Fixed, because it sizes a `#[repr(C)]` struct an
+/// EL0 program declares from the documented ABI — it is ABI, not an implementation detail, and deliberately
+/// NOT read from `vug::MAX_METER_CPUS` (the in-kernel meter's scratch cap, free to change without breaking
+/// a shipped EL0 binary). They happen to be equal today at 16. Same constant, same value, on x86.
+const PULSE_MAX_CPUS: usize = 16;
+
+/// PULSE-1: `SYS_CPUPULSE`'s payload. `#[repr(C)]` plain-old-data, no padding (all `u64`), field-for-field
+/// identical to the x86 twin, so one arch-neutral EL0 program reads the same little-endian words on either
+/// arch: `ncpu` at 0, `demo` at 8, then `PULSE_MAX_CPUS` pairs of `(busy, idle)` cumulative tick counts —
+/// core `c`'s busy count at `16 + c*16`, its idle count at `24 + c*16`. 272 bytes total. Entries at or past
+/// `ncpu` are zeroed, never stale.
+#[repr(C)]
+struct UserPulse {
+    ncpu: u64,
+    demo: u64,
+    ticks: [u64; PULSE_MAX_CPUS * 2],
+}
+
+/// PULSE-1: `SYS_CPUPULSE(user_ptr)` — write the per-core load sample to the caller's buffer via
+/// `copy_to_user`. Returns 0, or `-EFAULT` if the pointer/length fails validation (e.g. aimed at the RO code
+/// page) — an error RETURN, never a task-kill, exactly like `sys_getinfo`, whose shape and validation this
+/// is: one fixed-size struct through the one checked seam.
+fn sys_cpupulse(user_ptr: u64) -> i64 {
+    let ncpu = PULSE_MAX_CPUS.min(super::sched::meter_cpu_count());
+    let mut p = UserPulse {
+        ncpu: ncpu as u64,
+        demo: super::sched::meter_current_cpu() as u64,
+        ticks: [0u64; PULSE_MAX_CPUS * 2],
+    };
+    for c in 0..ncpu {
+        let (busy, idle) = super::sched::meter_cpu_ticks(c);
+        p.ticks[c * 2] = busy;
+        p.ticks[c * 2 + 1] = idle;
+    }
+    // SAFETY: view `p` as its raw bytes for the copy; `UserPulse` is `#[repr(C)]` plain-old-data with no
+    // padding (all u64), so the byte view is exactly the fields in declaration order.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &p as *const UserPulse as *const u8,
+            core::mem::size_of::<UserPulse>(),
         )
     };
     match copy_to_user(user_ptr, bytes, bytes.len()) {

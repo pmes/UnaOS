@@ -212,6 +212,19 @@ const SYS_SOCK_RECV: u64 = 46;
 const SYS_LISTEN: u64 = 47;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
 const SYS_ACCEPT: u64 = 48;
+// PULSE-1: SYS_CPUPULSE(ptr) -> 0 / -EFAULT — the per-core load SAMPLE, copied out to ring 3. 49 is the
+// next free number in the shared space (48, `SYS_ACCEPT`, was the high-water mark on either arch), and the
+// number is minted on BOTH arches per the shared-numbering law even though only the x86 desktop ships an
+// app for it today. Unconditional, like the window verbs: the sampler it reads (`sched::meter_cpu_*`) is
+// compiled in every configuration, and a program that never calls it pays nothing.
+//
+// It hands out the RAW CUMULATIVE counters, not percentages. The windowed delta math and the display
+// decision (`vug::classify_load`'s two-source rule) belong to whoever is drawing, because "load" is only
+// defined relative to a refresh window the KERNEL does not know — and because a caller handed a pre-cooked
+// percent could not tell an honest 0% from a FROZEN counter, which is the one distinction
+// `vug::classify_load` exists to preserve. Handing out `(busy, idle)` per core plus the observer's own core
+// index gives ring 3 every input that rule needs, and no fabricated ones.
+const SYS_CPUPULSE: u64 = 49;
 
 /// Base of the ring-3 window: 1 TiB — a FRESH top-level slot (PML4 index 2) above the firmware
 /// identity map, so mapping it touches no kernel state. `setup` proves it unmapped before use.
@@ -2523,6 +2536,10 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_THREAD_EXIT => sys_thread_exit(), // never returns
         SYS_FUTEX => sys_futex(a0, a1, a2),
         SYS_INPUT_POLL => sys_input_poll(),
+        // PULSE-1: the per-core load sample. Unconditional for the same reason the window verbs are —
+        // core EL0 surface a monitoring app is written against, backed by a sampler that is always
+        // compiled.
+        SYS_CPUPULSE => sys_cpupulse(a0),
         SYS_SPAWN => sys_spawn(),
         SYS_WAIT => sys_wait(a0),
         SYS_CAP => sys_cap(a0, a1, a2),
@@ -2940,6 +2957,79 @@ fn sys_getinfo(user_ptr: u64) -> i64 {
         core::slice::from_raw_parts(
             &info as *const UserInfo as *const u8,
             core::mem::size_of::<UserInfo>(),
+        )
+    };
+    match copy_to_user(user_ptr, bytes) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+// =============================================================================================
+// PULSE-1 — SYS_CPUPULSE(49): the per-core load SAMPLE for a ring-3 monitor.
+//
+// The kernel already samples per-core busy/idle ticks for its own full-screen `pulse` monitor and the vug
+// corner meters (`vug::CpuPulse`). This verb exposes the SAME two accessors that sampler reads
+// (`sched::meter_cpu_count` / `meter_cpu_ticks` / `meter_current_cpu`) to EL0, so a WINDOWED pulse app can
+// be a ring-3 program rather than a second in-kernel drawing loop. The kernel-side sampler is untouched by
+// this arc — there is exactly one place the counters are maintained, and this is a read of it.
+//
+// WHAT IS AND IS NOT DECIDED HERE. The kernel reports facts: how many cores the meter covers, each core's
+// CUMULATIVE (busy, idle) tick counts, and which core the CALLER is executing on. It does NOT compute a
+// percent, and it does NOT flag a core as parked. Both of those are functions of a REFRESH WINDOW the
+// kernel does not own: `vug::classify_load`'s rule needs the DELTA over the observer's window, and the
+// distinction it protects — a core whose counters are FROZEN over that window is parked, not idle — is
+// destroyed the moment cumulative counts are collapsed into a percent. Ring 3 therefore keeps the previous
+// snapshot and applies that rule itself; see `crates/user-pulse`, which restates it verbatim.
+//
+// `demo` is `meter_current_cpu()`: the core running THIS syscall, i.e. the core running the observer. That
+// is the same role the field plays in `CpuPulse::refresh` (the core running the render loop), so the
+// caller's frozen-counter disambiguation reads exactly like the kernel's. A `demo` value >= `ncpu` is
+// possible in principle (a core outside the meter's coverage) and is reported honestly rather than
+// clamped — the caller then simply finds no core matching it, and every frozen core reads parked.
+// =============================================================================================
+
+/// PULSE-1: the ABI cap on cores `SYS_CPUPULSE` reports. Fixed, because it sizes a `#[repr(C)]` struct a
+/// ring-3 program declares from this document — it is ABI, not an implementation detail, and it is
+/// deliberately NOT read from `vug::MAX_METER_CPUS` (that constant is the in-kernel meter's scratch cap and
+/// is free to change without breaking a shipped EL0 binary). They happen to be equal today at 16.
+const PULSE_MAX_CPUS: usize = 16;
+
+/// PULSE-1: `SYS_CPUPULSE`'s payload. `#[repr(C)]` plain-old-data, no padding (all `u64`), so the byte
+/// layout is stable for the ring-3 program that reads it back: `ncpu` at 0, `demo` at 8, then
+/// `PULSE_MAX_CPUS` pairs of `(busy, idle)` cumulative tick counts, core-major — core `c`'s busy count at
+/// `16 + c*16`, its idle count at `24 + c*16`. 272 bytes total. Entries at or past `ncpu` are zeroed, never
+/// stale: a caller that trusts `ncpu` and one that scans the whole array agree.
+#[repr(C)]
+struct UserPulse {
+    ncpu: u64,
+    demo: u64,
+    ticks: [u64; PULSE_MAX_CPUS * 2],
+}
+
+/// PULSE-1: `SYS_CPUPULSE(user_ptr)` — write the per-core load sample to the caller's buffer through the
+/// validated `copy_to_user` seam. Returns 0, or `-EFAULT` if the destination fails validation (outside the
+/// ring-3 window, wrapping, or aimed at the read-only code page — `UserAccess::Write` starts past page 0).
+/// An error RETURN, never a task-kill: a bad pointer is a ring-3 mistake, not a kernel-integrity event.
+/// Exactly `sys_getinfo`'s shape and exactly its validation — a fixed-size struct through the one seam.
+fn sys_cpupulse(user_ptr: u64) -> i64 {
+    let ncpu = PULSE_MAX_CPUS.min(crate::arch::sched::meter_cpu_count());
+    let mut p = UserPulse {
+        ncpu: ncpu as u64,
+        demo: crate::arch::sched::meter_current_cpu() as u64,
+        ticks: [0u64; PULSE_MAX_CPUS * 2],
+    };
+    for c in 0..ncpu {
+        let (busy, idle) = crate::arch::sched::meter_cpu_ticks(c);
+        p.ticks[c * 2] = busy;
+        p.ticks[c * 2 + 1] = idle;
+    }
+    // SAFETY: view `p` as its raw bytes for the copy; `UserPulse` is `#[repr(C)]` plain-old-data with no
+    // padding (all u64), so the byte view is exactly the fields in declaration order.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &p as *const UserPulse as *const u8,
+            core::mem::size_of::<UserPulse>(),
         )
     };
     match copy_to_user(user_ptr, bytes) {
