@@ -1692,7 +1692,24 @@ pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
             let mut claimed = None;
             for b in FUTEX.iter() {
                 b.lock_raw();
-                if b.key.load(Ordering::Relaxed) == 0 {
+                // FUTEX-DUP — the claim pass JOINS a bucket another waiter keyed to `key` between our
+                // find scan above and this pass. The find scan holds each bucket lock only while it
+                // inspects that bucket, so it is not atomic across the table, and IF=0 buys nothing
+                // here: this is SMP with a scheduler per CPU. Two waiters entering together on a key
+                // with no standing bucket could therefore both finish the find scan empty, and a
+                // claim pass testing `== 0` ALONE would mint a SECOND bucket for the same key.
+                //
+                // ONE BUCKET PER KEY IS NO LONGER ASSUMED. This check closes the wide window; the
+                // full scan in `futex_wake` is what makes duplicates harmless rather than merely
+                // rare, and is the correctness argument (a bucket freed by a concurrent drain and
+                // reclaimed for `key` mid-scan is a sliver no claim-side test can close).
+                let k = b.key.load(Ordering::Relaxed);
+                if k == key {
+                    FUTEX_DUP.fetch_add(1, Ordering::Relaxed);
+                    claimed = Some(b);
+                    break;
+                }
+                if k == 0 {
                     b.key.store(key, Ordering::Relaxed);
                     claimed = Some(b);
                     break;
@@ -1759,19 +1776,57 @@ pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
     FutexWait::Woken
 }
 
+/// FUTEX-DUP — times either side OBSERVED a second bucket serving one key: the claim pass finding the
+/// key already claimed since its own find scan, or a wake finding waiters in more than one bucket for
+/// its key. Expected to read 0 on a healthy boot; nonzero is the double-claim race observed AND
+/// absorbed (before this arc the wake side's `break`-after-first-match made the second bucket's waiter
+/// a permanent strand — a parked EL0 worker nothing would ever name again).
+static FUTEX_DUP: AtomicU64 = AtomicU64::new(0);
+/// FUTEX-DUP — per-event line budget, on the same terms as every other rate-limited witness here: the
+/// first few occurrences name themselves on the wire, [`futex_dup_witness`] carries the steady state.
+/// A wake/claim path must never print unconditionally — `user-vug` reaches both once per frame.
+static FUTEX_DUP_LOG: AtomicU32 = AtomicU32::new(0);
+const FUTEX_DUP_LOG_MAX: u32 = 8;
+
+/// FUTEX-DUP — read the absorbed-race count (0 on a healthy boot).
+pub fn futex_dup_count() -> u64 {
+    FUTEX_DUP.load(Ordering::Relaxed)
+}
+
+/// FUTEX-DUP — the rollup line, emitted once from the WINX-7 futex verdict rather than from any futex
+/// path, so the count is on the wire in every headless boot without a hot path ever printing.
+pub fn futex_dup_witness() {
+    serial_println!(
+        "[futexdup] observed={} (duplicate same-key buckets absorbed; 0 = the race never happened)",
+        FUTEX_DUP.load(Ordering::Relaxed)
+    );
+}
+
 /// FUTEX_WAKE: wake up to `n` waiters parked on `key`; returns how many were actually woken. Releases
 /// the bucket back to free once its last waiter leaves. Waiters are re-readied OUTSIDE the bucket
 /// lock (the run-queue lock must never nest under a wait-queue lock — the `Semaphore::post` rule).
+///
+/// FUTEX-DUP — the scan visits EVERY bucket serving `key`, and exits early only once `n` waiters have
+/// been woken. One bucket per key is an invariant `futex_wait`'s claim pass now defends but cannot
+/// guarantee, so THIS is where correctness lives: a wake that stopped at the first match would leave
+/// a duplicate bucket's waiters parked on a key no later wake would ever reach. The added cost on the
+/// ordinary single-bucket wake is one pass over the remaining bucket keys — a lock, a load, an unlock
+/// each, with no waiter traffic.
 pub fn futex_wake(key: u64, n: usize) -> usize {
     debug_assert!(key != 0, "futex key must be non-zero");
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
     let mut woken = 0usize;
+    // Buckets that held at least one waiter for `key` — more than one IS the race, seen.
+    let mut buckets_served = 0u32;
     for b in FUTEX.iter() {
         b.lock_raw();
         if b.key.load(Ordering::Relaxed) != key {
             b.unlock_raw();
             continue;
+        }
+        if !b.waiters_empty() {
+            buckets_served += 1;
         }
         while woken < n {
             let next = unsafe { (*b.waiters.get()).pop_front() };
@@ -1794,7 +1849,23 @@ pub fn futex_wake(key: u64, n: usize) -> usize {
             b.key.store(0, Ordering::Relaxed); // last waiter gone — release the bucket
         }
         b.unlock_raw();
-        break;
+        if woken >= n {
+            break; // the wake's budget is spent; semantics are unchanged from the first-match scan
+        }
+    }
+    if buckets_served > 1 {
+        // Seen and absorbed. Worth a line while the count is small, because this exact shape used to
+        // be a silent permanent strand rather than an event.
+        FUTEX_DUP.fetch_add(1, Ordering::Relaxed);
+        if FUTEX_DUP_LOG.fetch_add(1, Ordering::Relaxed) < FUTEX_DUP_LOG_MAX {
+            serial_println!(
+                "[futexdup] wake key={:#x} buckets={} woken={} n={} (double-claim absorbed)",
+                key,
+                buckets_served,
+                woken,
+                n
+            );
+        }
     }
     if was_enabled {
         x86_64::instructions::interrupts::enable();

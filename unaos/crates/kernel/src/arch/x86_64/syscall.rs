@@ -12452,6 +12452,13 @@ fn winx7_launcher(_demo_cpu: usize) {
         crate::arch::sched::yield_now();
     }
 
+    // FUTEX-DUP: the double-claim witness, reported once per boot from the futex's own verdict site
+    // rather than from `futex_wait`/`futex_wake` (both of which `user-vug` reaches once per frame).
+    // `observed=0` is the healthy reading; nonzero says the race happened and the wake-side full scan
+    // absorbed it — the verdict below deliberately does NOT gate on it, because absorbing the race is
+    // correct behaviour and a boot that observes one is still a passing boot.
+    crate::arch::sched::futex_dup_witness();
+
     let threads_ok = spawned - spawned_before == 2
         && joined - joined_before == 2
         && exited - exited_before == 2;
