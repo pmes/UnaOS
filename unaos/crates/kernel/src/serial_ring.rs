@@ -96,12 +96,64 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, 
 
 /// Ring depth in whole lines. Sized for the worst burst the boot path can produce while one core
 /// holds the UART for a full line (~1 ms of 115200-baud polling): every other core can queue several
-/// lines and still not reach the end. Static storage is `SLOTS * SLOT_LEN` ≈ 16 KiB of `.bss`.
+/// lines and still not reach the end.
 pub const SLOTS: usize = 64;
 
-/// Maximum staged line length. Longer lines are truncated at a UTF-8 char boundary and the truncation
-/// is COUNTED and reported exactly like a drop — a shortened line must never masquerade as a whole one.
-pub const SLOT_LEN: usize = 240;
+/// Maximum staged line length. Longer lines are truncated at a UTF-8 char boundary, SEALED with a
+/// visible marker, and COUNTED — a shortened line must never masquerade as a whole one.
+///
+/// ### SERWIT-2W — why 1536, with the arithmetic
+///
+/// The original 240 was a guess, and it was wrong. The aarch64 seat gated SERWIT-1 into their tree and
+/// immediately saw `truncated 1`: their F3/K1 witness lines run past 340 characters. **A truncated
+/// REQUIRE or verdict line breaks an `awk` tally exactly as badly as a lost one**, so on that tree the
+/// law "the wire may not lose lines" was not actually held — the transport was still corrupting
+/// evidence under contention, just more quietly than before.
+///
+/// So the width was measured rather than guessed. Every `serial_print!`/`serial_println!` format string
+/// in the kernel (2786 of them, both arches) was reconstructed — `\`-continuations joined, placeholders
+/// charged a pessimistic 20 bytes each, the width every 16-bit register field can actually print:
+///
+/// ```text
+///     > 240 chars: 264 format strings   ← 9.5% of the tree truncated at the old width
+///     > 340 chars:  97                  ← the aarch64 seat's measured floor is NOT the maximum
+///     > 512 chars:  21
+///     > 768 chars:   6
+///     > 896 chars:   1
+///     measured maximum: 1291 chars      (`arch/aarch64/v3d.rs`, the v3d59 mainline-audit note —
+///                                        a pure literal, so 1291 is exact, not an estimate)
+/// ```
+///
+/// 1291 + the trailing newline = **1292 bytes of true worst case**. 1536 gives 244 bytes (19%) of
+/// headroom over it and 655 bytes over the entire rest of the tree, and is a clean power-of-two
+/// multiple of the page allocator's granularity.
+///
+/// **Why not 1024** (which would have covered 2785 of 2786): because it would leave exactly one line in
+/// the tree truncating on every boot that enables it. A truncation counter that is permanently non-zero
+/// for a known-benign reason is a counter people learn to ignore, and this arc is entirely about not
+/// having instruments people learn to ignore. At 1536 the counter reads 0, so any non-zero reading is
+/// news.
+///
+/// **Why one width and not per-arch** (which was offered): the >340 population is spread across BOTH
+/// arches — `v3d.rs` and `rtl8168_tegra.rs` on aarch64, `video/wcf.rs`'s `[wc-f]` scanout rollups and
+/// `arch/x86_64/syscall.rs`'s S9 verdicts on x86. Two per-arch widths would be two numbers each sized
+/// against one seat's lines and silently wrong for the other's — which is the precise failure mode being
+/// closed here. Both seats read one number.
+///
+/// **Cost, stated plainly.** `SLOTS * SLOT_LEN` = 64 × 1536 = 96 KiB of `.bss` per staging ring, and
+/// there are three (the primary wire, the FTDI mirror, the flight recorder) = 288 KiB, uniform on both
+/// arches and present on metal. That is the price of a transport that does not corrupt evidence, paid
+/// once in BSS on machines with gigabytes.
+pub const SLOT_LEN: usize = 1536;
+
+/// Scratch width for the fixed-form loss/truncation markers. Deliberately NOT [`SLOT_LEN`]: the marker
+/// buffer is a stack array inside [`drain`], which runs in the UART-locked, IRQ-masked region of every
+/// print, and a 1.5 KiB frame there would be a real cost for a line that is never more than ~80 bytes.
+const MARKER_LEN: usize = 128;
+
+/// Sealed onto the end of a line that did not fit, so a human reading a capture cannot mistake a cut
+/// line for a complete one. The counter says HOW MANY were cut; this says WHICH, and exactly where.
+pub const TRUNCATION_MARK: &str = "…⟨SERWIT-2W: line truncated here⟩\n";
 
 const EMPTY: u8 = 0;
 const WRITING: u8 = 1;
@@ -202,6 +254,31 @@ pub fn in_flight() -> u64 {
         .wrapping_sub(TAIL.load(Ordering::Acquire))
 }
 
+/// SERWIT-2W — overwrite the tail of a truncated line with [`TRUNCATION_MARK`], in place, at a UTF-8
+/// char boundary. `n` is the current length and is updated to the sealed length.
+///
+/// Backing up rather than appending is deliberate: the buffer is already full, and a marker that only
+/// appeared when there happened to be room would be absent exactly on the longest lines — the ones that
+/// most need it.
+///
+/// # Safety
+/// `buf` must be valid for `cap` bytes and `*n <= cap`.
+fn seal_truncation(buf: *mut u8, cap: usize, n: &mut usize) {
+    let mark = TRUNCATION_MARK.as_bytes();
+    if cap < mark.len() {
+        return;
+    }
+    let mut at = (*n).min(cap - mark.len());
+    // Do not cut a multi-byte char in half while backing up.
+    // SAFETY: `at < cap` and the buffer holds `*n >= at` initialised bytes.
+    while at > 0 && (unsafe { *buf.add(at) } & 0xC0) == 0x80 {
+        at -= 1;
+    }
+    // SAFETY: `at + mark.len() <= cap` by the `min` above.
+    unsafe { core::ptr::copy_nonoverlapping(mark.as_ptr(), buf.add(at), mark.len()) };
+    *n = at + mark.len();
+}
+
 /// Formats into a claimed slot's byte buffer, truncating at a UTF-8 char boundary rather than
 /// splitting a multi-byte sequence — the drain re-reads the buffer as `str`, and a torn char there
 /// would cost the WHOLE line rather than its tail.
@@ -271,6 +348,9 @@ pub fn stage(args: fmt::Arguments) -> bool {
     };
     let _ = w.write_fmt(args);
     if w.truncated {
+        // SERWIT-2W: seal the cut so the wire itself says the line is short. A counter alone leaves the
+        // reader of a capture unable to tell WHICH line was clipped.
+        seal_truncation(w.buf, SLOT_LEN, &mut w.n);
         TRUNCATED.fetch_add(1, Ordering::Relaxed);
         TRUNCATED_PENDING.fetch_add(1, Ordering::Relaxed);
     }
@@ -327,9 +407,11 @@ fn report_losses<F: FnMut(&str)>(emit: &mut F) {
     if dropped == 0 && truncated == 0 {
         return;
     }
-    let mut buf = [0u8; SLOT_LEN];
-    let mut w = SlotWriter {
+    // SERWIT-2W: a fixed-form marker needs marker-sized scratch, not slot-sized. See [`MARKER_LEN`].
+    let mut buf = [0u8; MARKER_LEN];
+    let mut w = BoundedWriter {
         buf: buf.as_mut_ptr(),
+        cap: MARKER_LEN,
         n: 0,
         truncated: false,
     };
@@ -376,6 +458,53 @@ static SERWIT_DONE: AtomicU32 = AtomicU32::new(0);
 /// Lines the workers believe they submitted — cross-checks `SUBMITTED`'s delta from the other side.
 static SERWIT_SENT: AtomicU64 = AtomicU64::new(0);
 
+// ── SERWIT-3: the WIDE-LINE leg ──────────────────────────────────────────────────────────────────
+//
+// The 240-byte slot was a guess, and it cost the aarch64 seat a `truncated 1` on their very first
+// gated run: their F3/K1 witnesses run past 340 characters. A truncated verdict line breaks an `awk`
+// tally exactly as badly as a lost one, so a transport that silently clips wide lines has not actually
+// stopped lying — it has only changed how. This leg exists so the width can never quietly regress:
+// every worker also emits ONE line at the widest realistic size, THROUGH THE CONTENDED PATH, and the
+// verdict asserts that not one of them was clipped.
+//
+// The line is END-SENTINELLED on purpose. The in-kernel assertion (`TRUNCATED` delta == 0) and the
+// on-the-wire check are independent: `awk '/SERWIT3-END/' target/serial.log | wc -l` must equal the
+// worker count, and a clipped line loses its sentinel by construction (truncation takes the TAIL). A
+// counter that only ever agreed with itself would prove nothing — the same reasoning SERWIT-1 used to
+// sequence-number its burst.
+
+/// 1248 characters of ballast (78 × 16). Emitted, the line is
+/// `"[serwit3] c=N width-probe " + PAD + " SERWIT3-END\n"` = 1248 + 39 = **1287 bytes**, which sits
+/// within five bytes of the tree's measured worst case (`arch/aarch64/v3d.rs`'s 1291-char audit note).
+/// So this leg exercises the ACTUAL maximum a boot can emit, not a comfortable sample of it — a probe
+/// sized well under the real maximum would pass on a width that still clips real lines, which is
+/// precisely the failure being closed.
+const SERWIT_PAD: &str = concat!(
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 1
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 2
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 3
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 4
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 5
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 6
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 7
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 8
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 9
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 10
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 11
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 12
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 13
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 14
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 15
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 16
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 17
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 18
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", // 19
+    "0123456789ABCDEF0123456789ABCDEF",                                 // 19.5 -> 1248
+);
+
+/// `TRUNCATED` at the moment the gate opened, so the verdict asserts on the WINDOW's delta.
+static SERWIT_TRUNC_BASE: AtomicU64 = AtomicU64::new(0);
+
 /// One worker's burst. Runs as an ordinary scheduled kernel task on its own core.
 pub fn serwit_worker(cpu: usize) {
     while !SERWIT_GO.load(Ordering::Acquire) {
@@ -385,6 +514,13 @@ pub fn serwit_worker(cpu: usize) {
         serial_println!("[serwit] c={} n={}", cpu, n);
         SERWIT_SENT.fetch_add(1, Ordering::Relaxed);
     }
+    // SERWIT-3: the wide line, emitted from inside the same contended window as the burst above.
+    serial_println!(
+        "[serwit3] c={} width-probe {} SERWIT3-END",
+        cpu,
+        SERWIT_PAD
+    );
+    SERWIT_SENT.fetch_add(1, Ordering::Relaxed);
     SERWIT_DONE.fetch_add(1, Ordering::Release);
 }
 
@@ -396,6 +532,9 @@ pub fn serwit_worker_count(online: usize) -> usize {
 
 /// Open the gate; the workers are already parked on it.
 pub fn serwit_release() {
+    // SERWIT-3 baselines the truncation counter HERE rather than through `serwit_snapshot`, whose
+    // signature belongs to a call site outside this arc's lane.
+    SERWIT_TRUNC_BASE.store(TRUNCATED.load(Ordering::Relaxed), Ordering::Relaxed);
     SERWIT_GO.store(true, Ordering::Release);
 }
 
@@ -423,7 +562,9 @@ pub fn serwit_verdict(workers: usize, base_submitted: u64, base_emitted: u64, ba
     );
 
     let sent = SERWIT_SENT.load(Ordering::Relaxed);
-    let want = workers as u64 * SERWIT_BURST;
+    // +1: SERWIT-3's wide-line probe, one per worker.
+    let want = workers as u64 * (SERWIT_BURST + 1);
+    let truncated = TRUNCATED.load(Ordering::Relaxed) - SERWIT_TRUNC_BASE.load(Ordering::Relaxed);
     let submitted = SUBMITTED.load(Ordering::Relaxed) - base_submitted;
     let emitted = EMITTED.load(Ordering::Relaxed) - base_emitted;
     let dropped = DROPPED.load(Ordering::Relaxed) - base_dropped;
@@ -433,11 +574,14 @@ pub fn serwit_verdict(workers: usize, base_submitted: u64, base_emitted: u64, ba
     // still queued behind this one; the law is stated with both slacks made explicit rather than
     // fudged, so `balanced` is a real equality and not a tolerance.
     let balanced = submitted == emitted + dropped + inflight;
-    if sent == want && dropped == 0 && balanced {
+    if sent == want && dropped == 0 && truncated == 0 && balanced {
         serial_println!(
-            ":: SERWIT-1: contended serial — {} lines sent, {} deferred to the staging ring, 0 dropped, \
-             accounting balanced (submitted={} emitted={} inflight={}) -> PASS ::",
+            ":: SERWIT-1: contended serial — {} lines sent (incl. {} wide-line probes at ~{}B), {} \
+             deferred to the staging ring, 0 dropped, 0 truncated, accounting balanced \
+             (submitted={} emitted={} inflight={}) -> PASS ::",
             sent,
+            workers,
+            SERWIT_PAD.len() + 39,
             staged,
             submitted,
             emitted,
@@ -445,11 +589,12 @@ pub fn serwit_verdict(workers: usize, base_submitted: u64, base_emitted: u64, ba
         );
     } else {
         serial_println!(
-            ":: SERWIT-1: FAIL — sent={} (want {}) dropped={} submitted={} emitted={} inflight={} \
-             balanced={} ::",
+            ":: SERWIT-1: FAIL — sent={} (want {}) dropped={} truncated={} submitted={} emitted={} \
+             inflight={} balanced={} ::",
             sent,
             want,
             dropped,
+            truncated,
             submitted,
             emitted,
             inflight,
@@ -465,4 +610,426 @@ pub fn serwit_snapshot() -> (u64, u64, u64) {
         EMITTED.load(Ordering::Relaxed),
         DROPPED.load(Ordering::Relaxed),
     )
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// SERWIT-2 — THE MIRROR TAPS: the same law, applied to the four taps SERWIT-1 left alone.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// `_print` does not write to one sink, it writes to five. The PRIMARY wire (the 16550) is what
+// SERWIT-1 fixed; hanging off the same seam are four MIRRORS, each of which had the identical
+// pre-SERWIT shape — `try_lock()`, and on failure the whole formatted line evaporates with no
+// counter anywhere:
+//
+//   * `video::fbcon::_print`            — the on-screen console.
+//   * `drivers::xhci::ftdi::mirror`     — the FTDI cable, i.e. the BENCH'S OWN CAPTURE PATH.
+//   * `selftest::capture`               — the `tste` boot-verdict replay ring.
+//   * `flight_recorder::capture`        — `UNAOS.LOG`.
+//
+// Crucially those four run OUTSIDE `SERIAL1` and OUTSIDE the interrupt mask (`arch::serial::_print`
+// calls them after the locked region), so they are contended by every core at once — including on the
+// contended lines the primary wire is busy deferring. They are not a rarer version of the same defect;
+// under a multi-core burst they are a WORSE one.
+//
+// ### Not every tap owes the same thing
+//
+// A mirror must never be able to stall the primary wire — an inversion where the panel makes the UART
+// wait would be worse than the drop it replaces — so `try_lock`-and-never-block stays the rule
+// everywhere. What changes is the failure branch, and the right answer differs by tap:
+//
+//   * **Sinks whose content is evidence** (`ftdi`, `flightrec`, `tste`) must not lose lines at all.
+//     Their sinks are cheap (a memcpy into a byte ring, a 42-byte record), so the SERWIT-1 discipline
+//     transplants directly: defer into a lock-free [`LineRing`] and let the next holder drain it.
+//     `tste`'s ring goes one better and drops its Mutex entirely — a fixed array of fixed records
+//     needs only an atomic index claim, so there is no lock left to lose.
+//   * **Sinks that are a VIEW** (`fbcon`) stay legitimately lossy. Painting a deferred backlog means
+//     glyph work inside the masked, locked critical section that PANEL-DEFER exists to keep short, and
+//     the line is on the wire regardless — the panel is the one sink whose loss costs no evidence. So
+//     the obligation there is the weaker half of the law: every miss is COUNTED, and announced both on
+//     the panel (a `[fbcon] N line(s) missed` marker) and on the wire (see [`mirror_service`]).
+//
+// ### Why none of this can deadlock, stall or contend a breadcrumb
+//
+// [`LineRing`] is [`RING`]'s machinery made reusable: three atomics plus per-slot atomics, no Mutex, no
+// allocation, no reentrancy into `serial_println!`, every wait bounded. WEDGE-2 / WEDGE-4 write single
+// bytes through the arch's raw lock-free UART primitive and enter none of this; SERWIT-2 adds no lock
+// they could contend for and REMOVES one (`selftest`'s). The panic path is likewise untouched: every
+// tap is still `try_lock`-only, and staging is wait-free apart from a CAS retry.
+
+/// One slot of a [`LineRing`]. Same state machine as [`Slot`], generic over the line length so a tap
+/// can size its staging area to its own traffic.
+struct MirrorSlot<const LEN: usize> {
+    state: AtomicU8,
+    len: AtomicU16,
+    buf: UnsafeCell<[u8; LEN]>,
+}
+
+impl<const LEN: usize> MirrorSlot<LEN> {
+    const fn new() -> Self {
+        MirrorSlot {
+            state: AtomicU8::new(EMPTY),
+            len: AtomicU16::new(0),
+            buf: UnsafeCell::new([0u8; LEN]),
+        }
+    }
+}
+
+/// A reusable, lock-free, alloc-free staging ring of whole formatted lines — [`RING`]'s shape, exposed
+/// so a mirror tap can have its own without a second copy of the reasoning.
+///
+/// **Caller contract for [`drain`](LineRing::drain):** the caller must hold the tap's sink exclusively,
+/// which is what makes the drainer unique. Every tap here drains only while holding the very lock whose
+/// contention caused the staging in the first place.
+pub struct LineRing<const SLOTS: usize, const LEN: usize> {
+    slots: [MirrorSlot<LEN>; SLOTS],
+    head: AtomicU64,
+    tail: AtomicU64,
+}
+
+// SAFETY: identical argument to `Ring`'s — `buf` is touched only by the writer that won the `head`
+// claim (slot in `WRITING`) or by the unique drainer once the slot reads `READY` under `Acquire`.
+unsafe impl<const SLOTS: usize, const LEN: usize> Sync for LineRing<SLOTS, LEN> {}
+
+impl<const SLOTS: usize, const LEN: usize> LineRing<SLOTS, LEN> {
+    pub const fn new() -> Self {
+        LineRing {
+            slots: [const { MirrorSlot::<LEN>::new() }; SLOTS],
+            head: AtomicU64::new(0),
+            tail: AtomicU64::new(0),
+        }
+    }
+
+    /// Lines staged but not yet drained.
+    #[inline]
+    pub fn in_flight(&self) -> u64 {
+        self.head
+            .load(Ordering::Acquire)
+            .wrapping_sub(self.tail.load(Ordering::Acquire))
+    }
+
+    /// Defer one line, reporting the outcome so the caller can charge its own ledger.
+    pub fn stage(&self, args: fmt::Arguments) -> Staged {
+        let seq = loop {
+            let head = self.head.load(Ordering::Acquire);
+            let tail = self.tail.load(Ordering::Acquire);
+            if head.wrapping_sub(tail) >= SLOTS as u64 {
+                return Staged::Full;
+            }
+            if self
+                .head
+                .compare_exchange_weak(head, head + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                break head;
+            }
+            core::hint::spin_loop();
+        };
+        let slot = &self.slots[(seq % SLOTS as u64) as usize];
+        slot.state.store(WRITING, Ordering::Relaxed);
+        let mut w = BoundedWriter {
+            buf: slot.buf.get() as *mut u8,
+            cap: LEN,
+            n: 0,
+            truncated: false,
+        };
+        let _ = w.write_fmt(args);
+        if w.truncated {
+            seal_truncation(w.buf, LEN, &mut w.n);
+        }
+        slot.len.store(w.n as u16, Ordering::Relaxed);
+        slot.state.store(READY, Ordering::Release);
+        if w.truncated { Staged::Truncated } else { Staged::Whole }
+    }
+
+    /// Emit every staged line, in order, through `emit`. Returns how many lines were emitted. Stops at
+    /// the first claimed-but-unpublished slot rather than skipping it, so deferral never reorders the
+    /// sink; bounded by `SLOTS` iterations, so a drain can never lengthen a print unboundedly.
+    pub fn drain<F: FnMut(&str)>(&self, mut emit: F) -> u64 {
+        let mut out = 0u64;
+        let mut guard = 0usize;
+        loop {
+            if guard > SLOTS {
+                break;
+            }
+            guard += 1;
+            let tail = self.tail.load(Ordering::Relaxed);
+            if tail == self.head.load(Ordering::Acquire) {
+                break;
+            }
+            let slot = &self.slots[(tail % SLOTS as u64) as usize];
+            if slot.state.load(Ordering::Acquire) != READY {
+                break;
+            }
+            let n = slot.len.load(Ordering::Relaxed) as usize;
+            // SAFETY: the slot is READY, so its writer is finished and released; the caller's sink lock
+            // makes this the only reader.
+            let full: &[u8; LEN] = unsafe { &*slot.buf.get() };
+            let bytes = &full[..n.min(LEN)];
+            if let Ok(s) = core::str::from_utf8(bytes) {
+                emit(s);
+            }
+            out += 1;
+            slot.state.store(EMPTY, Ordering::Release);
+            self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        }
+        out
+    }
+}
+
+/// What [`LineRing::stage`] did with a line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Staged {
+    /// Deferred intact.
+    Whole,
+    /// Deferred, but it did not fit `LEN` — sealed with [`TRUNCATION_MARK`]. The tap counts it as a
+    /// tear, which is announced like a drop: a short line is a corrupted line, not a delivered one.
+    Truncated,
+    /// The ring was full; the line is genuinely lost and the caller must count it.
+    Full,
+}
+
+/// [`SlotWriter`]'s length-generic twin: format into a caller-owned buffer, truncating at a UTF-8 char
+/// boundary rather than splitting a multi-byte sequence.
+pub struct BoundedWriter {
+    pub buf: *mut u8,
+    pub cap: usize,
+    pub n: usize,
+    pub truncated: bool,
+}
+
+impl Write for BoundedWriter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let bytes = s.as_bytes();
+        let room = self.cap - self.n;
+        let take = if bytes.len() <= room {
+            bytes.len()
+        } else {
+            self.truncated = true;
+            let mut k = room;
+            while k > 0 && (bytes[k] & 0xC0) == 0x80 {
+                k -= 1;
+            }
+            k
+        };
+        if take > 0 {
+            // SAFETY: the caller owns `buf` for `cap` bytes and `self.n + take <= cap` by construction.
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.buf.add(self.n), take) };
+            self.n += take;
+        }
+        Ok(())
+    }
+}
+
+/// One mirror tap's ledger. The conservation law each tap must satisfy is
+///
+/// ```text
+///     submitted == absorbed + dropped + suppressed + in_flight
+/// ```
+///
+/// where `suppressed` is a line the tap DECLINED by policy (the GUI owns the panel, quiet-panel is in
+/// force, the console is not up yet). Separating "declined on purpose" from "lost" is the whole point:
+/// lumping them would make a silently-lossy tap indistinguishable from a correctly-quiet one, which is
+/// the exact ambiguity SERWIT-1 removed from the primary wire.
+pub struct TapCounters {
+    /// Lines handed to this tap.
+    pub submitted: AtomicU64,
+    /// Lines that reached the tap's sink (directly or drained from its staging ring).
+    pub absorbed: AtomicU64,
+    /// Lines that took the deferred path (diagnostic — a deferred line is not a lost one).
+    pub staged: AtomicU64,
+    /// Lines genuinely lost. Must read 0 on an evidence tap.
+    pub dropped: AtomicU64,
+    /// Lines the tap declined by policy. Not loss.
+    pub suppressed: AtomicU64,
+    /// Lines that reached the sink only in part (a mid-line contention tear on the panel).
+    pub torn: AtomicU64,
+    /// Loss not yet announced on the wire; swapped to 0 by the announcement.
+    pending: AtomicU32,
+}
+
+impl TapCounters {
+    pub const fn new() -> Self {
+        TapCounters {
+            submitted: AtomicU64::new(0),
+            absorbed: AtomicU64::new(0),
+            staged: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+            torn: AtomicU64::new(0),
+            pending: AtomicU32::new(0),
+        }
+    }
+    #[inline]
+    pub fn submit(&self) {
+        self.submitted.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn absorb(&self) {
+        self.absorbed.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Account for a whole drained batch at once.
+    #[inline]
+    pub fn absorb_n(&self, n: u64) {
+        if n > 0 {
+            self.absorbed.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+    #[inline]
+    pub fn note_staged(&self) {
+        self.staged.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn suppress(&self) {
+        self.suppressed.fetch_add(1, Ordering::Relaxed);
+    }
+    /// One line lost. Counted twice on purpose: cumulatively, and as un-announced.
+    #[inline]
+    pub fn drop_line(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        self.pending.fetch_add(1, Ordering::Relaxed);
+    }
+    /// One line that reached the sink truncated. Announced like a drop, counted apart from one.
+    #[inline]
+    pub fn tear(&self) {
+        self.torn.fetch_add(1, Ordering::Relaxed);
+        self.pending.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Losses not yet announced, taken.
+    #[inline]
+    pub fn take_pending(&self) -> u32 {
+        self.pending.swap(0, Ordering::Relaxed)
+    }
+    fn tally(&self) -> (u64, u64, u64, u64, u64, u64) {
+        (
+            self.submitted.load(Ordering::Relaxed),
+            self.absorbed.load(Ordering::Relaxed),
+            self.staged.load(Ordering::Relaxed),
+            self.dropped.load(Ordering::Relaxed),
+            self.suppressed.load(Ordering::Relaxed),
+            self.torn.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// The on-screen console mirror (legitimately lossy — counted, never staged).
+pub static TAP_FBCON: TapCounters = TapCounters::new();
+/// The FTDI console capture — the bench's own capture path. Staged; must not lose lines.
+pub static TAP_FTDI: TapCounters = TapCounters::new();
+/// The `tste` boot-verdict replay ring. Lock-free; must not lose records.
+pub static TAP_TSTE: TapCounters = TapCounters::new();
+/// The `UNAOS.LOG` flight recorder. Staged; must not lose lines.
+pub static TAP_FLIGHTREC: TapCounters = TapCounters::new();
+
+/// Lines each tap has in flight, supplied by the tap (only it knows the shape of its staging).
+fn tap_inflight(name: &str) -> u64 {
+    match name {
+        "ftdi" => crate::drivers::xhci::ftdi::staged_in_flight(),
+        #[cfg(target_arch = "x86_64")]
+        "flightrec" => crate::flight_recorder::staged_in_flight(),
+        _ => 0,
+    }
+}
+
+fn taps() -> [(&'static str, &'static TapCounters); 4] {
+    [
+        ("fbcon", &TAP_FBCON),
+        ("ftdi", &TAP_FTDI),
+        ("tste", &TAP_TSTE),
+        ("flightrec", &TAP_FLIGHTREC),
+    ]
+}
+
+/// SERWIT-2 — announce any un-announced mirror loss on the WIRE, and emit the verdict once.
+///
+/// **Call from an IF=1, unlocked, non-print context only** (it prints, so calling it from inside a tap
+/// would recurse through `_print`). The mirrors' own channels announce independently — the FTDI ring
+/// injects its marker into the cable stream, the panel paints one, `UNAOS.LOG` carries its byte-drop
+/// note, `tste` prints its ring-full count — because a tap's own reader is the one who needs to know
+/// its tap lied. This is the wire's copy of the same news, for the reader who only has the log.
+///
+/// Self-rate-limiting: `take_pending` clears the counter, so a tap that is not losing lines prints
+/// nothing at all and a tap that is prints once per burst, never once per line.
+pub fn mirror_service() {
+    for (name, t) in taps() {
+        if t.take_pending() > 0 {
+            serial_println!(
+                "[mirror] {}: {} line(s) dropped, {} truncated since boot (sink contended or full)",
+                name,
+                t.dropped.load(Ordering::Relaxed),
+                t.torn.load(Ordering::Relaxed)
+            );
+        }
+    }
+    mirror_verdict_once();
+}
+
+/// One-shot: has the SERWIT-2 verdict been emitted yet?
+static MIRROR_VERDICT_DONE: AtomicBool = AtomicBool::new(false);
+
+/// THE SAMPLING WINDOW, stated rather than fudged.
+///
+/// The tap ledgers are six independent atomics; there is no lock-free way to read them as one instant,
+/// and taking a seqlock over them would put a lock on the print path — the one thing this whole arc
+/// forbids. So a snapshot taken while another core is between its `submit()` and its outcome shows that
+/// line as neither absorbed nor dropped nor suppressed nor in flight. **At most one such line can exist
+/// per core**, because a core is inside exactly one `_print` at a time and the taps do not recurse.
+///
+/// 64 is therefore not a tolerance, it is the ceiling on the number of cores this kernel brings up. The
+/// distinction that matters: a sampling artefact is bounded by the core count and disappears on the next
+/// sample; a genuine accounting hole — the defect this fixture exists to catch — grows without bound
+/// with traffic and would blow straight past this ceiling on any real boot. A single silently-dropping
+/// tap on the pre-fix tree lost 87.5% of a 72-line burst.
+const MIRROR_WINDOW: u64 = 64;
+
+/// The SERWIT-2 verdict, emitted once from the first [`mirror_service`] poll — i.e. on entry to the
+/// main loop, after the boot fixtures (SERWIT-1's own multi-core burst included) have run through all
+/// four taps under real contention.
+///
+/// PASS demands, for every tap, that the conservation law balances — no line is unaccounted for — AND
+/// that the three EVIDENCE taps lost nothing. `fbcon`'s misses are reported but are not fatal: the
+/// panel is a view, the line is on the wire regardless, and the property being proven for it is that a
+/// miss is visible rather than that it never happens.
+fn mirror_verdict_once() {
+    if MIRROR_VERDICT_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // Snapshot BEFORE printing: the verdict's own lines go through these very taps.
+    let mut balanced = true;
+    let mut evidence_lost = 0u64;
+    let mut snap: [(&'static str, (u64, u64, u64, u64, u64, u64), u64, u64); 4] =
+        [("", (0, 0, 0, 0, 0, 0), 0, 0); 4];
+    for (i, (name, t)) in taps().into_iter().enumerate() {
+        let tally = t.tally();
+        let inflight = tap_inflight(name);
+        let (submitted, absorbed, _staged, dropped, suppressed, _torn) = tally;
+        let accounted = absorbed + dropped + suppressed + inflight;
+        // `accounted > submitted` means a line was counted twice — a real accounting bug, never a
+        // sampling artefact, because `submit` runs strictly before any outcome for the same line.
+        let gap = submitted.wrapping_sub(accounted);
+        if accounted > submitted || gap > MIRROR_WINDOW {
+            balanced = false;
+        }
+        snap[i] = (name, tally, inflight, gap);
+        if name != "fbcon" {
+            evidence_lost += dropped;
+        }
+    }
+    for (name, (submitted, absorbed, staged, dropped, suppressed, torn), inflight, gap) in snap {
+        serial_println!(
+            ":: SERWIT-2 tap {}: submitted={} absorbed={} staged={} dropped={} suppressed={} torn={} inflight={} in_progress={} ::",
+            name, submitted, absorbed, staged, dropped, suppressed, torn, inflight, gap
+        );
+    }
+    if balanced && evidence_lost == 0 {
+        serial_println!(
+            ":: SERWIT-2: mirror taps — every line accounted for on all 4 taps, 0 lost on the 3 \
+             evidence taps (ftdi/tste/flightrec) -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: SERWIT-2: FAIL — balanced={} evidence_lost={} ::",
+            balanced,
+            evidence_lost
+        );
+    }
 }

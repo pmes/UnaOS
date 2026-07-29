@@ -52,66 +52,108 @@ struct LogRing {
     dropped: usize,
 }
 
+impl LogRing {
+    /// Append what fits, counting what does not. The ring keeps the EARLIEST bytes (the banner and the
+    /// self-tests, which is what the log is for) and stops when full rather than evicting the head.
+    fn append(&mut self, bytes: &[u8]) {
+        let room = RING_CAP - self.len;
+        if room == 0 {
+            self.dropped = self.dropped.saturating_add(bytes.len());
+            return;
+        }
+        let n = core::cmp::min(room, bytes.len());
+        let at = self.len;
+        self.buf[at..at + n].copy_from_slice(&bytes[..n]);
+        self.len += n;
+        if n < bytes.len() {
+            self.dropped = self.dropped.saturating_add(bytes.len() - n);
+        }
+    }
+}
+
 static RING: Mutex<LogRing> = Mutex::new(LogRing {
     buf: [0u8; RING_CAP],
     len: 0,
     dropped: 0,
 });
 
-/// A tiny alloc-free `fmt::Write` sink: format `Arguments` into a fixed stack buffer so `capture`
-/// touches the heap never (safe from any print context). Lines longer than the buffer are truncated
-/// (boot lines are short); the newline the caller appended is inside `args`.
-struct StackBuf {
-    buf: [u8; 256],
-    len: usize,
-}
-impl StackBuf {
-    fn new() -> Self {
-        StackBuf { buf: [0u8; 256], len: 0 }
-    }
-    fn as_bytes(&self) -> &[u8] {
-        &self.buf[..self.len]
-    }
-}
-impl fmt::Write for StackBuf {
+/// SERWIT-2W: `capture` used to format each line into a 256-byte stack buffer and copy that in, which
+/// **silently truncated every line longer than 256 bytes** — 264 of the tree's format strings exceed
+/// even 240 (see `serial_ring::SLOT_LEN`), so `UNAOS.LOG` was quietly clipping the widest diagnostics
+/// it existed to preserve. The buffer is gone: `LogRing` is itself the `fmt::Write` sink now, so a line
+/// is formatted STRAIGHT into the ring, whole, with no intermediate width limit and no stack frame at
+/// all. The only bound left is the ring's own capacity, which was always counted.
+impl fmt::Write for LogRing {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for &b in s.as_bytes() {
-            if self.len >= self.buf.len() {
-                break; // truncate silently
-            }
-            self.buf[self.len] = b;
-            self.len += 1;
-        }
+        self.append(s.as_bytes());
         Ok(())
     }
 }
 
+/// SERWIT-2 staging ring for the recorder tap. See [`capture`].
+///
+/// 64 slots × 240 bytes ≈ 15 KiB of `.bss`, the same depth as the primary wire's and the FTDI mirror's.
+static STAGE: crate::serial_ring::LineRing<64, 240> = crate::serial_ring::LineRing::new();
+
+/// Lines staged for the log but not yet copied into the capture ring.
+pub fn staged_in_flight() -> u64 {
+    STAGE.in_flight()
+}
+
 /// Additive hook on the serial print seam. Append the formatted line's bytes to the ring. Zero
-/// behaviour change to what is printed; alloc-free; `try_lock` only (drops on contention) so it is
-/// safe from IRQ-masked print contexts. Never takes the xHCI lock and never allocates.
+/// behaviour change to what is printed; alloc-free; `try_lock` only, so it is safe from IRQ-masked
+/// print contexts. Never takes the xHCI lock and never allocates.
+///
+/// **SERWIT-2 — what changed, and what deliberately did NOT.** The contention branch used to be
+/// nothing: the comment called this "a diagnostic ring, not a ledger" and reasoned that contention was
+/// rare because the serial lock serialises prints. That reasoning was wrong in one specific way — this
+/// tap runs OUTSIDE the serial lock and outside the mask (`arch/x86_64/serial.rs` calls it after the
+/// locked region), so every core arrives here at once and contention is not rare at all, it is the
+/// normal state under a multi-core burst. `UNAOS.LOG` is the whole log a consumer of the shareable
+/// `vm-image` will ever have; a hole in it is indistinguishable from a boot that never printed.
+///
+/// So a contended line is now DEFERRED into the lock-free [`STAGE`] ring and folded in by the next
+/// holder, in order. **No I/O is introduced anywhere near this path** — that was the risk worth naming,
+/// because `service()` below does real FAT block writes. The drain is a `copy_from_slice` into a static
+/// byte array and nothing else: no mount, no allocation, no block device, no `hlt`. The recorder's I/O
+/// stays exactly where it was, in the IF=1 main loop. Overflow of the byte ring itself is unchanged and
+/// still counted into `dropped`, which `snapshot` already writes into the file.
 pub fn capture(args: fmt::Arguments) {
-    let mut sb = StackBuf::new();
-    let _ = fmt::write(&mut sb, args);
-    let bytes = sb.as_bytes();
-    if bytes.is_empty() {
+    let tap = &crate::serial_ring::TAP_FLIGHTREC;
+    tap.submit();
+    if let Some(mut ring) = RING.try_lock() {
+        drain_staged(&mut ring);
+        let _ = fmt::write(&mut *ring, args);
+        tap.absorb();
         return;
     }
-    if let Some(mut ring) = RING.try_lock() {
-        let room = RING_CAP - ring.len;
-        if room == 0 {
-            ring.dropped = ring.dropped.saturating_add(bytes.len());
+    match STAGE.stage(args) {
+        crate::serial_ring::Staged::Whole => {
+            tap.note_staged();
             return;
         }
-        let n = core::cmp::min(room, bytes.len());
-        let at = ring.len;
-        ring.buf[at..at + n].copy_from_slice(&bytes[..n]);
-        ring.len += n;
-        if n < bytes.len() {
-            ring.dropped = ring.dropped.saturating_add(bytes.len() - n);
+        crate::serial_ring::Staged::Truncated => {
+            tap.note_staged();
+            tap.tear();
+            return;
         }
+        crate::serial_ring::Staged::Full => {}
     }
-    // Lock contended -> drop silently (a diagnostic ring, not a ledger). Prints are serialised by the
-    // serial lock the caller already holds, so contention here is rare.
+    // Staging ring full: one free retry at the sink before the line is declared lost.
+    if let Some(mut ring) = RING.try_lock() {
+        drain_staged(&mut ring);
+        let _ = fmt::write(&mut *ring, args);
+        tap.absorb();
+        return;
+    }
+    tap.drop_line();
+}
+
+/// Fold every staged line into the byte ring, in order. **Caller must hold `RING`.** Pure memcpy — see
+/// the I/O note in [`capture`].
+fn drain_staged(ring: &mut LogRing) {
+    let n = STAGE.drain(|s| ring.append(s.as_bytes()));
+    crate::serial_ring::TAP_FLIGHTREC.absorb_n(n);
 }
 
 /// Current number of captured bytes (for the flush's grow-detection). Cheap `try_lock`; `None` if the
@@ -183,6 +225,15 @@ pub fn service() {
     static LAST_FLUSHED: AtomicUsize = AtomicUsize::new(usize::MAX); // MAX = never flushed
     static ITERS: AtomicUsize = AtomicUsize::new(0);
     static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+
+    // SERWIT-2: poll the mirror-tap ledgers and put any un-announced loss on the wire, plus the
+    // one-shot verdict. This lives HERE, ahead of the storage gate, for a plain reason: the
+    // announcement must run from an IF=1, unlocked, NON-PRINT context (announcing from inside a tap
+    // would recurse through `_print`), and `service()` is the only such site on the x86 main loop that
+    // this arc's lane owns. It is a few relaxed atomic loads on the idle path and prints nothing at all
+    // when no tap has lost anything. It must precede the `block::info()` early return, or a machine
+    // with no storage would never announce.
+    crate::serial_ring::mirror_service();
 
     if crate::drivers::block::info().is_none() {
         return; // storage not up yet — nothing to flush to
