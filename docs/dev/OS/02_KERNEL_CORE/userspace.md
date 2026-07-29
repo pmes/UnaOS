@@ -2171,6 +2171,60 @@
   headless run has no HID, so nothing ever TABs to the shell, so nothing is ever hidden — the 300-frame
   `checksum=0xe68285b85121ac7c` witness proves it on both sides of the change.
 
+- **VUGMIN-B (the bit gets a writer, and the compositor stops doing invisible work)** — the second half
+  of VUGMIN. A's bit was set by nobody; B is the two call sites in `video::wm` and the kernel-side
+  present suppression A's audit measured. With it the mechanism is **live**: TAB to the shell and every
+  vug on the panel goes to its VUGPAUSE idle loop; TAB back and it resumes from preserved state.
+  - **The seam is a DIRECT CALL, not a registered callback.** `wm.rs` already reaches
+    `crate::arch::aarch64::now_cycles()` from the composite path under a plain `cfg`, so a callback table
+    would be a second, weaker convention for the same thing — and a seam whose entire content is "one
+    `u64`, one `bool`, no return value" earns no indirection. `wm::vugmin_publish` wraps
+    `set_hidden` under `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]`, which is exactly
+    the gate `arch::aarch64::syscall` itself carries; on x86_64 and on the hosted aarch64 build it
+    compiles to nothing.
+  - **One predicate, both arms.** `focus_changed` does not reason about "which arm am I in". After the
+    z-order has settled — still under `TABLE` — `vugmin_scan` walks the eight rows once and returns
+    `(owner asid, hidden?)` for every live owner; the guard drops, and each pair is published. The shell
+    arm therefore hides every owner because every owner *is* below the new `SHELL_Z`, and a raise unhides
+    the owner it raised because that owner is now above it. The published value is a function of the
+    table's actual state rather than of the code path that reached it.
+  - **The quantifier is per-owner and all-or-nothing.** `owner_hidden(asid)` is true only when EVERY
+    live, non-compat window that ASID owns sits below `SHELL_Z` — an app with one window still on the
+    panel is not hidden however many of its others are buried, which matters because the focus ring is
+    keyed by ASID and raises an app's windows together. Single-window vugs are the case that actually
+    occurs; the quantifier is what stops a two-window app being told to idle while half of it is visible.
+    An owner with no live window answers `false` (the empty case falls to the safe side, keep rendering),
+    and ASID 0 — the compat/console path — is never marked, for `above_shell`'s reason: a compat row is
+    not a focus target and can never be raised back over a shell that overtook it.
+  - **Present suppression.** `wm::present` still marks the row `damaged` and `presented` exactly as
+    before, still takes WC-G's owner-declared checksum (that number is about the surface, not about the
+    panel, and dropping it while hidden would make the `app` leg disagree with itself) — and then
+    **returns without calling `composite()`** when the presenting owner is hidden. The pass would have
+    read the surface, clipped it, and written it nowhere: `composite` draws only rows satisfying
+    `above_shell`, and by hypothesis none of this owner's do. Nothing is deferred; a pass is skipped, not
+    owed. On unhide the panel is repainted from the LATEST surface content by `focus_changed`'s own
+    unconditional `composite()` (the call after the `<F6>` wedge mark), which the raise arm has already
+    re-marked the raised rows damaged for. The EL0 idle loop stops most presents from being issued at
+    all; this makes the ones that still arrive — a vug hidden mid-frame, a program that never polls the
+    bit — cost one table scan instead of a full compositor pass.
+  - **No new lock, and nothing called out from under `TABLE`.** `set_hidden` takes no lock at all: an
+    `AtomicU64` RMW plus one `write_volatile` of a `u32` into the slot's info page, whose address is pure
+    pointer arithmetic (`slot_fb_info_ptr` is base + offset and a `debug_assert!`). It would be safe to
+    call with the table held; it is called after the guard drops anyway, because "snapshot under the
+    lock, act after it" is the shape every other outward call in `wm.rs` has, and keeping that a rule
+    beats auditing it case by case. The publish is unconditional — `set_hidden` is idempotent, and
+    skipping it on the strength of `wm`'s witness-side shadow would let one stale bit (ASID recycle
+    clears the real one through `boot::teardown_user_slot`, behind `wm`'s back) leave a fresh tenant
+    permanently idling.
+  - **Witness:** `[vugmin] wm scope=<s> hides=<n> unhides=<n> presents_skipped=<n> hidden_now=<n> -> …`,
+    printed from the tail of `wci_rollup_scoped` beside the other compositor rollups, because
+    `presents_skipped` is a subtraction from the `cursor_passes` on the line above it. `hides`/`unhides`
+    count STATE TRANSITIONS, not focus changes, off a `wm`-local shadow mask whose only job that is.
+    The verdict is `DORMANT` when `hides == 0` rather than `CLEAN`: the headless gate has no HID, so
+    nothing ever TABs to the shell, so all three counters are 0 there and the line's honest claim is
+    "wired, and nothing hid by accident" — the number that carries the arc is `hides > 0` on the bench.
+    The 300-frame `checksum=0xe68285b85121ac7c` is byte-identical across B, as predicted.
+
 ### x86_64 (branch `hw-rmbp`)
 
 - **U1a** — first ring-3 round-trip (the x86 mirror of aarch64 M6a). A

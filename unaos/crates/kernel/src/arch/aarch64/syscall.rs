@@ -10882,11 +10882,11 @@ fn is_detached(asid: u64) -> bool {
 /// A deliberate mirror of `DETACHED_ASIDS` above, down to the 64-bit bound and the fail-safe direction,
 /// for the same reason: the reader is the FB info-page writer, reached with the window table lock held.
 ///
-/// DORMANT AS SHIPPED. VUGMIN-A is the plumbing only — nobody calls [`set_hidden`] yet, so the bit is
-/// always 0 and every path below is byte-identical to before. VUGMIN-B wires the two call sites in
-/// `video::wm` (the shell arm that hides, and the raise path that unhides); that file is another
-/// session's lane this arc, which is why the halves are split. Until then EL0's poll is a poll of a
-/// constant zero — correct, cheap, and provably inert.
+/// LIVE AS OF VUGMIN-B. The two call sites are in `video::wm`: `focus_changed` publishes the predicate
+/// for every live owner after each focus change (the shell arm hides them all, a raise unhides the owner
+/// it raised), and `wm::present` reads the same predicate off the window table to suppress a composite
+/// no one can see. Headless QEMU still reads a constant 0 — no HID means nothing ever TABs to the
+/// shell, so nothing is ever hidden there and the deterministic checksum is unchanged.
 static HIDDEN_ASIDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// VUGMIN — record whether ASID `asid`'s windows are currently hidden below the shell. Public because
@@ -10897,7 +10897,6 @@ static HIDDEN_ASIDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// — an unrepresentable ASID reads back "not hidden", i.e. keeps rendering. A vug that idles when it
 /// should not is a vug that stops responding; a vug that renders when it could idle merely wastes the
 /// core it wastes today. The cheap failure is the one to fail into.
-#[allow(dead_code)] // VUGMIN-B supplies the callers; see the DORMANT note above.
 pub fn set_hidden(asid: u64, on: bool) {
     debug_assert!(
         asid < 64,

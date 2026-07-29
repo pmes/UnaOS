@@ -235,6 +235,134 @@ pub fn shell_z() -> u32 {
     SHELL_Z.load(core::sync::atomic::Ordering::Acquire)
 }
 
+// ---- VUGMIN-B: hidden-owner plumbing -----------------------------------------------------------
+
+/// VUGMIN-B — `wm`'s SHADOW of the hidden bitmask `arch::aarch64::syscall` owns, one bit per ASID.
+///
+/// It exists for the WITNESS and for nothing else. The authoritative bit lives in `HIDDEN_ASIDS` over
+/// in the syscall layer (that module owns the info page it is published through); this side only needs
+/// to know whether a given [`vugmin_publish`] call was a TRANSITION, so `hides`/`unhides` count state
+/// changes rather than the number of times focus moved. The publish itself is issued unconditionally
+/// (see `vugmin_publish`), so a shadow that drifts — ASID recycle clears the real bit through
+/// `boot::teardown_user_slot` without telling `wm` — can miscount a rollup but can never leave the real
+/// bit wrong. The counters are the soft thing here; the mechanism is not.
+#[cfg(feature = "witness")]
+static VUGMIN_SHADOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// VUGMIN-B — owners this module has pushed below the shell, owners it has brought back, and presents
+/// whose `composite()` was suppressed because the presenting owner was hidden. Reported by
+/// [`vugmin_rollup`], beside [`wci_rollup_scoped`]'s line.
+#[cfg(feature = "witness")]
+static VUGMIN_HIDES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static VUGMIN_UNHIDES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static VUGMIN_SKIPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// VUGMIN-B — is every live, non-compat window owned by `asid` sitting BELOW `shell`?
+///
+/// The predicate is deliberately **per-owner and all-or-nothing**: an app may own several windows (the
+/// focus ring is keyed by ASID and [`focus_changed`] raises them together), and an app with one window
+/// still on the panel is not hidden however many of its others are buried. Single-window vugs are the
+/// case that actually occurs; the quantifier is what keeps a two-window app from being told to idle
+/// while the operator is looking at half of it.
+///
+/// Answers `false` for an owner with no live window at all — "hidden" is a claim about windows that
+/// exist, and the empty case falls to the same safe side `set_hidden` fails to (keep rendering).
+///
+/// Compat rows are excluded for [`above_shell`]'s reason: a compat row carries owner ASID 0, is not a
+/// focus target, and can never be raised back over a shell that overtook it. ASID 0 is never marked.
+///
+/// Caller holds `TABLE`. One scan of eight rows, no allocation, no nested lock.
+fn owner_hidden(t: &Table, asid: u64, shell: u32) -> bool {
+    if asid == 0 {
+        return false;
+    }
+    let mut any = false;
+    for r in t.rows.iter() {
+        if !r.used || r.compat || r.owner_asid != asid {
+            continue;
+        }
+        any = true;
+        if above_shell(r, shell) {
+            return false;
+        }
+    }
+    any
+}
+
+/// VUGMIN-B — publish `asid`'s hidden state to the syscall layer, and count the transition.
+///
+/// **The seam is a DIRECT CALL, not a registered callback.** `video::wm` is not arch-neutral in
+/// practice: it already reaches `crate::arch::aarch64::now_cycles()` directly from the composite path
+/// under a plain `#[cfg(target_arch = "aarch64")]`, so a callback table here would be a second, weaker
+/// convention for the same thing — and a seam whose whole content is "one `u64`, one `bool`, no return
+/// value" earns no indirection. The `cfg` is what keeps the other builds honest — `arch::aarch64::syscall`
+/// is itself gated behind `baremetal`, so the call is compiled in exactly where the info page it
+/// publishes through exists, and everywhere else (x86_64, the hosted aarch64 build) this is nothing.
+///
+/// **Never called with `TABLE` held, and it would be safe if it were.** `set_hidden` takes NO LOCK: it
+/// is an `AtomicU64` `fetch_or`/`fetch_and` followed by one `write_volatile` of a `u32` into the slot's
+/// info page, whose address is pure pointer arithmetic (`slot_fb_info_ptr` = base + offset, a
+/// `debug_assert!` and nothing else). The page is per-slot kernel backing that lives as long as the
+/// slot, so there is no allocation, no mapping change and no serial print on the path. Callers here
+/// still publish OUTSIDE the table lock, because a snapshot taken under the lock and applied after it
+/// is the shape every other outward call in this file already has, and it keeps the rule ("no calls
+/// out from under `TABLE`") a rule rather than a case-by-case audit.
+///
+/// The publish is UNCONDITIONAL — `set_hidden` is idempotent, and skipping it on the strength of
+/// [`VUGMIN_SHADOW`] would let one stale shadow bit (ASID recycle clears the real bit behind `wm`'s
+/// back) leave a fresh tenant permanently idling. Republishing a bit that is already right costs one
+/// `u32` store on a path that runs at operator speed.
+fn vugmin_publish(asid: u64, hidden: bool) {
+    if asid == 0 || asid >= 64 {
+        return;
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    crate::arch::aarch64::syscall::set_hidden(asid, hidden);
+    #[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+    let _ = hidden;
+    #[cfg(feature = "witness")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let bit = 1u64 << asid;
+        let before = if hidden {
+            VUGMIN_SHADOW.fetch_or(bit, Relaxed)
+        } else {
+            VUGMIN_SHADOW.fetch_and(!bit, Relaxed)
+        };
+        if (before & bit != 0) != hidden {
+            if hidden {
+                VUGMIN_HIDES.fetch_add(1, Relaxed);
+            } else {
+                VUGMIN_UNHIDES.fetch_add(1, Relaxed);
+            }
+        }
+    }
+}
+
+/// VUGMIN-B — snapshot, for every live owner in the table, whether that owner is now hidden.
+///
+/// Returns the filled prefix length of `out`. Taken under `TABLE` by [`focus_changed`] right after the
+/// z-order has moved, and applied through [`vugmin_publish`] once the guard is dropped: recomputing the
+/// predicate for EVERY owner (rather than only the ones this call touched) is what makes both arms of
+/// the focus change one code path, and what keeps the answer a function of the table's actual state
+/// instead of of the arm that got there.
+fn vugmin_scan(t: &Table, shell: u32, out: &mut [(u64, bool); MAX_WINDOWS]) -> usize {
+    let mut n = 0usize;
+    for r in t.rows.iter() {
+        if !r.used || r.compat || r.owner_asid == 0 {
+            continue;
+        }
+        if out[..n].iter().any(|&(a, _)| a == r.owner_asid) {
+            continue;
+        }
+        out[n] = (r.owner_asid, owner_hidden(t, r.owner_asid, shell));
+        n += 1;
+    }
+    n
+}
+
 /// Create a window owned by `owner_asid` over the caller's ARGB8888 surface at `surf` (EL1-visible
 /// address, `surf_len` bytes long, `stride` bytes per row) with source dimensions `w` x `h` and a
 /// short `title` (truncated to [`MAX_TITLE`]).
@@ -451,6 +579,20 @@ pub fn close_compat() -> bool {
 /// performs its ownership check, its checksum and its focused-present accounting, then calls this.
 ///
 /// Returns `false` if `id` names no live window.
+///
+/// ### VUGMIN-B — a hidden owner's present does not composite
+/// If every window the presenting owner holds is below `SHELL_Z`, the pass would read the surface,
+/// clip it, and write it nowhere the operator can see: [`composite`] draws only rows that satisfy
+/// [`above_shell`], and by hypothesis none of this owner's do. The VUGMIN-A audit measured this as the
+/// missing half of the mechanism — the EL0 idle loop stops *most* presents from being issued, and this
+/// makes the ones that still arrive (a vug hidden mid-frame, a program that does not poll the bit at
+/// all, the frame in flight when the operator TABbed away) cost a table scan instead of a full pass.
+///
+/// **The row is still marked `damaged` and `presented` exactly as before**, and that is what makes the
+/// suppression invisible on unhide: `focus_changed`'s raise arm re-marks the raised rows damaged and
+/// ends in its own unconditional `composite()` (the call after the `<F6>` wedge mark), so the first
+/// thing the panel gets back is a full repaint from the LATEST surface content, not from whatever the
+/// last composited frame happened to be. Nothing is deferred here; a pass is skipped, not owed.
 pub fn present(id: WinId) -> bool {
     // WC-G — the surface as the OWNER declared it finished. Taken here and nowhere else: this is the
     // one moment the owner is provably not writing (it is parked inside `SYS_WIN_PRESENT`), so it is
@@ -459,9 +601,12 @@ pub fn present(id: WinId) -> bool {
     // across, and the surface cannot be unmapped underneath it while the owner is in the syscall.
     #[cfg(all(target_arch = "aarch64", feature = "witness"))]
     let mut probe: Option<(usize, usize)> = None;
+    // VUGMIN-B — is the presenting owner hidden? Read under the same guard that marks the row, so the
+    // answer and the mark are taken against one table state.
+    let skip;
     {
         let mut t = TABLE.lock();
-        match row_mut(&mut t, id) {
+        let owner = match row_mut(&mut t, id) {
             Some(r) => {
                 r.damaged = true;
                 r.presented = true;
@@ -469,13 +614,25 @@ pub fn present(id: WinId) -> bool {
                 if !r.compat {
                     probe = Some((r.surf, r.surf_len));
                 }
+                // A compat row reports owner 0, which `owner_hidden` answers `false` for: the compat /
+                // console path is never suppressed.
+                if r.compat { 0 } else { r.owner_asid }
             }
             None => return false,
-        }
+        };
+        skip = owner_hidden(&t, owner, SHELL_Z.load(core::sync::atomic::Ordering::Acquire));
     }
     #[cfg(all(target_arch = "aarch64", feature = "witness"))]
     if let Some((surf, surf_len)) = probe {
+        // WC-G's checksum is the OWNER's declaration of its own surface and is independent of whether
+        // those pixels reach the panel, so it is taken on the suppressed path too — dropping it would
+        // make the `app` leg disagree with itself the moment a window went behind the shell.
         super::wcg::on_present(id, surf, surf_len);
+    }
+    if skip {
+        #[cfg(feature = "witness")]
+        VUGMIN_SKIPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return true;
     }
     composite();
     true
@@ -887,6 +1044,10 @@ pub fn focus_changed(asid: u64) {
     // Boxes of windows this call pushed BELOW the shell — the pixels the console is about to own.
     let mut hidden = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut nhidden = 0usize;
+    // VUGMIN-B — (owner asid, is it now hidden) for every live owner, snapshotted under the table lock
+    // below and published to the syscall layer after the guard drops. See [`vugmin_scan`].
+    let mut marks = [(0u64, false); MAX_WINDOWS];
+    let nmarks;
 
     // FOCUS-HL: take the focus owner BEFORE the table lock, so the composite at the end of this call
     // already draws the new highlight. The window that is LOSING focus must be repainted too — the raise
@@ -936,6 +1097,18 @@ pub fn focus_changed(asid: u64) {
                 raised += 1;
             }
         }
+        // VUGMIN-B — the z-order is now final for this focus change, so this is the one moment the
+        // hidden predicate has a settled answer. Snapshot only; the publication is outside the guard.
+        nmarks = vugmin_scan(&t, SHELL_Z.load(Ordering::Acquire), &mut marks);
+    }
+
+    // VUGMIN-B — tell the syscall layer who is hidden now. `TABLE` is dropped: `set_hidden` takes no
+    // lock (atomics + one `u32` info-page store), so this is a convention rather than a necessity, but
+    // it is the file's convention. Both directions come from the same scan — the shell arm hides every
+    // owner at once, a raise unhides exactly the owner it raised, and an owner whose state did not
+    // change is republished with the value it already had.
+    for &(asid, hid) in marks[..nmarks].iter() {
+        vugmin_publish(asid, hid);
     }
 
     // WEDGE-2 `<F5>` — the z-bump is done and the table guard is dropped; the immediate REPAINT half
@@ -2338,6 +2511,32 @@ fn cursor3_rollup(scope: &str) {
     // `[cursor6] repaired=` says how often the arrow was rebuilt, and this says how often that was
     // asked for and what declined the rest. The two lines are adjacent because they share a counter.
     super::cursor::cursor8_rollup(scope);
+    // VUGMIN-B — and who the window layer told to go to sleep, on the same line block for the same
+    // reason: it is a fact about this compositor's passes, and the number it reports (`presents
+    // skipped`) is a subtraction from `cursor_passes` above.
+    vugmin_rollup(scope);
+}
+
+/// VUGMIN-B — the hidden-owner rollup: how many owners `wm` pushed below the shell, how many it brought
+/// back, and how many `SYS_WIN_PRESENT` composites that cost nothing were suppressed.
+///
+/// **Honest scope on the gate.** The headless QEMU run has no HID, so nothing ever TABs to the shell,
+/// so `focus_changed(0)` is never reached from an operator and no owner is ever hidden. All three
+/// counters are 0 there and the verdict says `DORMANT` rather than `CLEAN` — the line proves the
+/// counters are wired and that nothing hid by accident, which is exactly the claim a headless run can
+/// support. The number that carries the arc is `hides > 0` on the bench, where a shell TAB exists.
+#[cfg(feature = "witness")]
+fn vugmin_rollup(scope: &str) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let hides = VUGMIN_HIDES.load(Relaxed);
+    let unhides = VUGMIN_UNHIDES.load(Relaxed);
+    let skipped = VUGMIN_SKIPPED.load(Relaxed);
+    let live = VUGMIN_SHADOW.load(Relaxed).count_ones();
+    let verdict = if hides == 0 { "DORMANT" } else { "ENGAGED" };
+    serial_println!(
+        "[vugmin] wm scope={} hides={} unhides={} presents_skipped={} hidden_now={} -> {}",
+        scope, hides, unhides, skipped, live, verdict
+    );
 }
 
 /// WC-A — whether the first `[wc-a] composite` witness has been emitted (first composite only; a
