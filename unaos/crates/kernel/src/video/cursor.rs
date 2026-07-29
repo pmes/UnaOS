@@ -558,6 +558,66 @@ pub fn note_uncover_lost() {
 /// readable and the blit guard is gone.
 static PRESENT_DIRTY: AtomicBool = AtomicBool::new(false);
 
+/// CURSOR-9 — has any painter written front-buffer pixels inside the live sprite box since the sprite
+/// was last drawn?
+///
+/// ### The leg of the P69 loop CURSOR-8 did not reach
+/// CURSOR-8 rate-limited the loop's REPAIR leg (`PRESENT_DIRTY` → [`take_present_dirty`] → a tail
+/// [`repaint`]). It left the loop's other leg untouched, and that leg is not driven by presents at all:
+///
+/// 1. a pointer report calls [`repaint`], which ends in [`repair`];
+/// 2. [`repair`] calls `wm::damage_intersecting` over the whole sprite box, UNCONDITIONALLY —
+///    so every window under the pointer is marked damaged 125 times a second;
+/// 3. the next composite (any vug's present, or `Screen::flush` → `wm::service_damage`, whose own
+///    contract is "service the damage `cursor::repair` left") therefore re-blits that window;
+/// 4. that pass takes the cursor bracket (`composite_inner`'s `undraw_within*`), so the arrow comes
+///    OFF the panel before `paint_window` composes the window off-screen and stays off until the row
+///    blit or the pass tail puts it back — milliseconds, at composite cadence.
+///
+/// Nothing in that chain needs the window to be presenting anything of its own: the damage is
+/// manufactured by the cursor. **That is why a PARKED vug flickers exactly like a running one, and why
+/// the bare desktop is clean** — over the desktop step 2 marks no window, so step 3 never happens and
+/// `composite_inner` never brackets the sprite at all (WC-I).
+///
+/// ### Why the flag is the exact predicate rather than a rate limit
+/// [`repair`] exists for ONE residual, named at [`undraw_locked`]: the colour guard cannot tell our own
+/// `FILL`/`SHADOW` from a painter's content that happens to equal it, so a restore can put a stale
+/// pixel inside a window's rect. That residual requires **some painter to have written into the sprite
+/// box between our draw and this undraw**. `wm::draw_window` already computes that predicate for every
+/// window present it makes (`live_box_relaxed()` + `boxes_overlap`, already un-gated mechanism), so the
+/// answer is available for one relaxed store on a path that has just blitted a window's worth of rows.
+/// A pointer report over a window nobody has painted since the arrow went down provably cannot have
+/// produced a stale restore, and damaging that window buys nothing but a turn of the loop above.
+///
+/// This is a narrowing of WHEN the repair is requested, not a weakening of what it does: every path
+/// that can trample the sprite still arms it, and an armed request is serviced exactly as before.
+///
+/// ### The painters this does NOT hear from, stated rather than implied
+/// * `Screen::present_background` — the desktop's flush is bracketed by the render task
+///   (`cursor::undraw` → `pal.render` → `cursor::repaint`), so the sprite is provably not on the panel
+///   while it runs and there is nothing for a repair to mend. A broken bracket is what
+///   `note_desktop_over_sprite` is the designated detector for, and it must be 0.
+/// * `wm::erase` / `drain_deferred` — both undraw FIRST and then run their own `damage_intersecting`
+///   over the boxes they painted, so the repair they owe does not come from here.
+/// * WC-F's ground-truth probe — paints the front OUTSIDE any window box, after the pass. It arms this
+///   flag explicitly from `composite_inner`'s `reserved_hit` branch, so that path is unchanged.
+/// * `fbcon`'s serial mirror on a `UNAOS_BOOTLOG` build. It does not arm, so a console line painted
+///   into the sprite box would no longer provoke the repair. Named as a residual: that build already
+///   has a second unsynchronised front-buffer writer, and the sprite's colour guard is what stands
+///   between it and a stale patch either way.
+///
+/// `Release`/`Acquire`, on the same argument as [`PRESENT_DIRTY`]: the store publishes "the panel under
+/// the arrow is not what the module saved", and what must not be reordered against it is the painter's
+/// own pixel writes.
+static TOUCHED_SINCE_DRAW: AtomicBool = AtomicBool::new(false);
+
+/// CURSOR-9 — arm the repair for a painter that reaches the front buffer outside `draw_window`'s
+/// present path. Called from `composite_inner`'s WC-F `reserved_hit` branch, which paints the front at
+/// the tail of the pass and outside every window box.
+pub fn note_sprite_touched() {
+    TOUCHED_SINCE_DRAW.store(true, Ordering::Release);
+}
+
 /// CURSOR-8 — [`live_epoch`] as it stood when [`PRESENT_DIRTY`] was last armed.
 ///
 /// The cheap half of "were the sprite's pixels ACTUALLY disturbed since the last repair", and the
@@ -704,6 +764,11 @@ static C8_UNCLOCKED: AtomicU64 = AtomicU64::new(0);
 /// `live_box_relaxed` test that precedes it are two relaxed atomics on a path that already blits a
 /// window's worth of rows.
 pub fn note_present_over_sprite(bracketed: bool) {
+    // CURSOR-9 — BOTH arms. This is not the repair REQUEST (that is `PRESENT_DIRTY`, below, and it is
+    // deliberately the unbracketed case only); it is the answer to "could a painter have taken one of
+    // our pixels since the arrow went down", which a bracketed present answers just as affirmatively
+    // as an unbracketed one. See `TOUCHED_SINCE_DRAW`.
+    TOUCHED_SINCE_DRAW.store(true, Ordering::Release);
     if !bracketed {
         // CURSOR-8 — the generation FIRST, the flag second, and both plain stores. The consumer reads
         // them the other way round (flag, then epoch), so an observer that sees the flag up cannot see
@@ -1030,6 +1095,11 @@ fn undraw_locked(sp: &mut Sprite) -> Option<(usize, usize, usize, usize)> {
         retract_box();
         return None;
     }
+    // CURSOR-9 — consumed HERE, not in `repair`: `repaint` is undraw-then-draw under one acquisition,
+    // and `draw_locked` clears the flag, so a consumer downstream of the draw would never see the
+    // disturbance the undraw it is repairing was answering. Swap, so one painter's trample buys one
+    // repair rather than every later report's.
+    let touched = TOUCHED_SINCE_DRAW.swap(false, Ordering::AcqRel);
     let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
     let off = sp.off;
     let saved = &sp.saved;
@@ -1054,7 +1124,10 @@ fn undraw_locked(sp: &mut Sprite) -> Option<(usize, usize, usize, usize)> {
     // same reason: the window in which the mirror disagrees with the panel must always be the one
     // where it claims a sprite that is not there, never the one where it denies a sprite that is.
     retract_box();
-    Some((bx, by, bw, bh))
+    // CURSOR-9 — the rect is the REPAIR REQUEST, and it is owed only where a painter could have taken
+    // one of our pixels. `None` here means "restored, provably exactly, nothing to mend"; the pixels
+    // went back either way.
+    if touched { Some((bx, by, bw, bh)) } else { None }
 }
 
 /// Restore the pixels the sprite is covering and forget them. A no-op when the sprite is not on the
@@ -1083,6 +1156,11 @@ pub fn undraw() {
 /// **Lock order, stated once: `SPRITE` → `TABLE`, never the reverse.** This runs with the sprite lock
 /// RELEASED, and nothing in `wm` calls into this module while holding the window table — both
 /// `composite`'s bracket and `erase`'s undraw run outside it. Any future caller must keep that order.
+///
+/// **CURSOR-9 — `None` now has two meanings, and both are "nothing to mend".** It has always meant
+/// "the sprite was not on the panel"; it now also means "the sprite was restored, and no painter has
+/// written inside its box since it was drawn, so the colour guard's residual cannot have bitten".
+/// See [`TOUCHED_SINCE_DRAW`] for the predicate and for the painters it does not hear from.
 fn repair(restored: Option<(usize, usize, usize, usize)>) {
     if let Some((x, y, w, h)) = restored {
         super::wm::damage_intersecting(x, y, w, h);
@@ -1216,6 +1294,9 @@ fn undraw_within_locked(
         // redundant — and harmless either way, since it reports zero pixels handed back.
         return (undraw_locked(sp), 0);
     }
+    // CURSOR-9 — same consumption as the full undraw, and for the same reason. Taken AFTER the
+    // `is_ready` delegation above, which consumes it itself.
+    let touched = TOUCHED_SINCE_DRAW.swap(false, Ordering::AcqRel);
     let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
     let mut off = sp.off;
     let mut handed_back = 0usize;
@@ -1237,7 +1318,7 @@ fn undraw_within_locked(
     }
     sp.off = off;
     flush_box(&fb, by, bh);
-    (Some((bx, by, bw, bh)), handed_back)
+    (if touched { Some((bx, by, bw, bh)) } else { None }, handed_back)
 }
 
 /// WC-I — the sprite's CURRENT panel box, or `None` when it is not on the panel.
@@ -1918,6 +1999,13 @@ fn draw_locked(sp: &mut Sprite) -> Result<Option<(i32, i32)>, ()> {
     // sprite" while the arrow was already on the panel would UNDERCOUNT the very overwrite the mirror
     // exists to detect, and an early publish can only over-count (a painter charged for a pixel the
     // arrow had not reached yet). Bias the diagnostic towards false positives, never false negatives.
+    //
+    // CURSOR-9 — and the disturbance flag is cleared HERE, before the pixels go down, for the same
+    // bias: a painter that tramples the arrow while this loop is still running arms it again and is
+    // charged for a sprite it may only partly have met, which costs one spurious repair. Clearing
+    // after the paint would instead swallow that painter's arming, which is the direction that leaves
+    // a stale pixel inside a window's rect.
+    TOUCHED_SINCE_DRAW.store(false, Ordering::Release);
     publish_box(sp);
 
     for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, _i| {

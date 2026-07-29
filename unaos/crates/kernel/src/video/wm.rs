@@ -1396,6 +1396,12 @@ fn composite_inner() -> CursorTail {
                 // the paint set below does not describe what it will touch and `repair` (which
                 // damages windows) could not mend a sprite pixel it took. The whole sprite comes off,
                 // as it has since CURSOR-3. Witness/baremetal-only, one region.
+                //
+                // CURSOR-9 — and the probe is one of the two front-buffer painters that do NOT reach
+                // `draw_window`, so it arms the repair explicitly rather than being heard about
+                // through `note_present_over_sprite`. Without this the probe's pixels inside the
+                // sprite box would be restored over without the affected windows being damaged.
+                super::cursor::note_sprite_touched();
                 super::cursor::undraw();
                 #[cfg(feature = "witness")]
                 CUR3_DECL_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
