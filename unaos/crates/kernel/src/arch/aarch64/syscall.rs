@@ -12239,15 +12239,12 @@ fn click_pointer_pos() -> (i32, i32) {
     crate::pal::cursor::pos(w, h)
 }
 
-/// CLICK-ROUTE: does `asid` own a HITTABLE window? (i.e. is it in the focus ring — a live, non-compat
-/// window with a real owner). The fallback predicate for a miss: see [`wc_click_route`].
-fn click_owner_is_windowed(asid: u64) -> bool {
-    if asid == 0 {
-        return false;
-    }
-    let mut ring = [0u64; crate::video::wm::MAX_WINDOWS];
-    let n = crate::video::wm::focus_ring(&mut ring);
-    ring[..n].contains(&asid)
+/// CLICK-SHELL r2 — **does the FOCUSED app own the panel even though it owns no window?** The one
+/// exemption the miss arm of [`wc_click_route`] grants: a full-screen app presenting through the
+/// compat row (`SYS_FB_PRESENT`). See that function's "which app owns a pixel nothing hit-tests to"
+/// note for why this replaced the focus-ring test.
+fn click_owner_is_fullscreen(asid: u64) -> bool {
+    asid != 0 && crate::video::wm::compat_live()
 }
 
 /// CLICK-ROUTE — **route a pointer button by POSITION rather than by focus.**
@@ -12276,10 +12273,31 @@ fn click_owner_is_windowed(asid: u64) -> bool {
 ///      - With focus at the SHELL (`cur == 0`) nothing is consumed — the caller's normal path IS the
 ///        shell path (`gui_send` -> `click1_dispatch`), which is where a desktop click belongs, and the
 ///        focus is already where the miss would put it.
-///      - If the focused app owns no hittable window at all ([`click_owner_is_windowed`] false), the
-///        press is delivered as before. That is the FULL-SCREEN app: a compat row covers the panel but
-///        carries owner ASID 0 and so can never be hit, and dropping its clicks would break UVUG's own
-///        click-to-exit. A miss over a full-screen app is a hit on that app, not on the desktop.
+///      - If a FULL-SCREEN app is presenting ([`click_owner_is_fullscreen`]), the press is delivered
+///        as before: a compat row covers the panel but carries owner ASID 0 and so can never be hit,
+///        and dropping its clicks would break UVUG's own click-to-exit. A miss over a full-screen app
+///        is a hit on that app, not on the desktop.
+///
+/// ### CLICK-SHELL r2 — which app owns a pixel that hit-tests to nothing (P72, bench)
+/// CLICK-SHELL shipped that second limit as `click_owner_is_windowed(cur)` — "deliver unless the
+/// focused app is in the focus ring". That is not the question. The exemption exists for the app that
+/// owns the PANEL without owning a window, and the focus ring answers a different question: it lists
+/// apps that own a window at all. The two answers coincide only while every focused app is either
+/// windowed or full-screen, and the bench state that falsifies it is ordinary — a focused app holding
+/// the keyboard with NO window and NO compat row:
+///   * a `run` program between the focus grant in `run_user_image` and its first present (or one that
+///     never presents at all — every batch program, for its whole run);
+///   * a windowed app that has closed its last window and kept running.
+/// In that state every desktop press took the `else` arm and was delivered to an app that owns nothing
+/// on the panel, so the miss arm never fired and printed no line. TAB did not rescue it in one press
+/// either: `wc_focus_key`'s unknown-focus arm sends a focus that is in no ring slot to `ring[0]`, not
+/// to the shell, so the operator had to cycle the WHOLE ring before the shell slot came up. That is
+/// P72's report exactly — "the shell can't be focused until it's cycled through a tab sequence".
+///
+/// So the predicate now asks the question the exemption was written for, directly: is a full-screen
+/// app presenting ([`crate::video::wm::compat_live`])? `hit_test` has already answered "no WINDOW owns
+/// this pixel"; the compat row is the only other thing that can own it. Everything else is the
+/// desktop, whoever holds focus and whether or not they own a window.
 ///
 /// ### CLICK-SHELL — a miss moves focus to the SHELL
 /// CLICK-ROUTE shipped this arm as "consume, but do not move focus", on the reasoning that raising the
@@ -12342,8 +12360,8 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                 false
             }
             None => {
-                if click_owner_is_windowed(cur) {
-                    // CLICK-SHELL: the desktop was clicked while a windowed app held focus. Same
+                if cur != 0 && !click_owner_is_fullscreen(cur) {
+                    // CLICK-SHELL: the desktop was clicked while some app held focus. Same
                     // human-rate reasoning as the hit arm's line — one line per click that moves
                     // focus, so no throttle is owed.
                     serial_println!(

@@ -2049,6 +2049,55 @@
       on a click into an unfocused window, and — the actual P69 verdict — a focused vug that **keeps
       running** when the operator clicks somewhere else.
 
+- **CLICK-SHELL / CLICK-SHELL r2 (a desktop click focuses the shell — for every focus, not just a
+  windowed one)** — two rulings against the CLICK-ROUTE bullet's last sub-point above, which is now
+  superseded and left standing only as the record of what was tried.
+
+  **CLICK-SHELL (P71, attended).** "A miss does not move focus" left the out-of-focus vug holding the
+  keyboard while the operator was demonstrably interacting with the shell, and left `TAB` as the only
+  gesture that reaches the console at all. The miss arm now does what the hit arm does with the shell as
+  the target: the one focus primitive, `el0_input_set_active(0)` then `wm::focus_changed(0)`, which is
+  literally the shell slot of `wc_focus_key`'s ring — no second shell-focus state. The burial of every
+  window under the console is the intended effect and is the same z-order move `TAB`-to-shell has always
+  made. The press stays **consumed** (`CLICK_TARGET_DROP`, so the release is dropped with it): a
+  press/release pair must not be split, and the console never saw the press edge.
+
+  **CLICK-SHELL r2 (P72, attended):** *"shell can't be focused until it's cycled through a tab
+  sequence."* CLICK-SHELL shipped its full-screen exemption as `click_owner_is_windowed(cur)` — deliver
+  unless the focused app is in the **focus ring**. That is the wrong question. The exemption exists for
+  the app that owns the **panel** without owning a window; the focus ring answers "does this app own a
+  window at all", and the two coincide only while every focused app is either windowed or full-screen.
+  The bench state that falsifies it is ordinary — a focused app with **no window and no compat row**:
+  a `run` program between the focus grant in `run_user_image` and its first present (or one that never
+  presents, i.e. every batch program, for its whole run), or a windowed app that closed its last window
+  and kept running. There, every desktop press took the deliver arm, went to an app that owns nothing on
+  the panel, and printed no line at all — which is why the P72 capture has only two `press miss` lines
+  in eleven thousand. `TAB` did not rescue it in one press either: `wc_focus_key`'s unknown-focus arm
+  sends a focus that is in no ring slot to `ring[0]`, **not** to the shell, so the operator had to cycle
+  the whole ring before the shell slot came up. That is the report, verbatim.
+
+  **Fix:** the predicate asks the question the exemption was written for. `wm::compat_live()` (new,
+  read-only, `COMPAT_WIN` + the existing `is_compat_row` identity test) answers "is a full-screen app
+  presenting"; the router's miss arm becomes `cur != 0 && !click_owner_is_fullscreen(cur)`. `hit_test`
+  has already answered "no **window** owns this pixel", and the compat row is the only other thing that
+  can own it — so everything else is the desktop, whoever holds focus. UVUG's click-to-exit is untouched
+  (a live compat row still delivers); the `cur == 0` no-op is unchanged; `TAB`, `focus_changed` and the
+  press/release pairing are untouched.
+
+  **Witness.** `hittest_selftest` gains **leg 7, `bare=`** — the same press from a focus that owns
+  nothing (synthetic ASID `0xC0C`, never passed to `create`), asserting the press is consumed **and**
+  both halves of the focus primitive moved to the shell (`el0_input_active() == 0` *and* `FOCUS_ASID ==
+  0`); `skip` when a compat row is live, since that is the arm it must not assert against. Leg 6
+  (`shell=`) covers the windowed focus and passed on every gate boot for the whole time the bench could
+  not click into the shell — leg 7 is the honesty repair. Verified by reverting the predicate alone:
+  `bare=false -> FAIL`, one forbidden hit, gate red.
+
+  **Gates:** `./arroyo check` ✅ x86_64 / ✅ aarch64; `./arroyo kernel8-test` **✅ MBENCH PASS — 86/86,
+  0 forbidden**, with
+  `[clickroute] hit-test at (215,135) inside=true topmost=true raise=true outside=true hidden=true shell=true bare=true -> PASS`
+  and both legs' router lines (`press miss … (was 3082)`, `press miss … (was 3084)`). **Metal still
+  proves the arc** — QEMU raspi4b delivers no HID, so the live arms remain unverified in QEMU by nature.
+
 - **VUGPAUSE (a paused vug stops burning cores)** — an **app-only** arc: `crates/user-vug` + this doc, no
   kernel change. **VUGCLICK** made a click *pause* a vug, and that is as far as it went: pause froze the
   frame's **advance** (the orientation stopped changing) while the frame **loop** kept running at full

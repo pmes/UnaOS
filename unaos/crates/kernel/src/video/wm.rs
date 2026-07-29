@@ -558,6 +558,20 @@ fn is_compat_row(id: WinId) -> bool {
     row(&t, id).map(|r| r.compat).unwrap_or(false)
 }
 
+/// CLICK-SHELL r2 — **is a FULL-SCREEN app presenting right now?** i.e. does a live compat row exist.
+///
+/// The compat row is the `SYS_FB_PRESENT` shim's window: at most one exists system-wide (WC-A
+/// serialises its creation), it is created by the first full-screen present and closed at the
+/// presenting slot's teardown (`close_compat`). It carries owner ASID 0 and is exempt from
+/// [`hit_test`] and [`focus_ring`] alike, so from the router's side a full-screen app is invisible in
+/// every window query — which is exactly why the router needs to be able to ask this question
+/// directly. See `wc_click_route`'s miss arm: a press that hit-tests to nothing is a DESKTOP press
+/// unless a full-screen app owns the panel, in which case it is that app's press.
+pub fn compat_live() -> bool {
+    let id = COMPAT_WIN.load(core::sync::atomic::Ordering::Relaxed);
+    id != WIN_NONE && is_compat_row(id)
+}
+
 /// WC-A / F3 — close the compat window, if one exists. **WC-B must call this from the EL0 teardown
 /// seam** — the same place in `clear_handle_row` that calls [`close_owner`] — because the compat row
 /// has no real owner ASID (`present_surface` is reached through the `SYS_FB_PRESENT` hook, whose
@@ -4433,6 +4447,11 @@ static HT_SURF: [u32; 64] = [0x0020_C080; 64];
 ///    pointer on a headless gate, so it is parked at panel centre — but that is a fact about the
 ///    fixture set, not something this witness may assume), and DORMANT on builds where the router does
 ///    not exist (x86_64 and the hosted aarch64 build).
+/// 7. **bare** (CLICK-SHELL r2, P72) — leg 6's press again, from a focus that owns NO window and no
+///    compat row. Leg 6 asserts the policy for a WINDOWED focus, which is the case CLICK-SHELL got
+///    right; leg 7 asserts it for the focus that owns nothing on the panel, which is the case it got
+///    wrong and which this suite reported PASS on for the whole time the bench could not click into
+///    the shell. See [`clickshell_windowless_leg`].
 ///
 /// Self-cleaning on the FOCUS-VIS pattern: both windows are closed, `SHELL_Z` and `FOCUS_ASID` are
 /// restored (this calls `focus_changed` with SYNTHETIC asids, which must not be left naming an address
@@ -4474,6 +4493,49 @@ fn clickshell_leg(asid: u64, _ix: i32, _iy: i32, _w: i32, _h: i32) -> Option<boo
     None
 }
 
+/// CLICK-SHELL r2 (P72) — leg 7 of [`hittest_selftest`], and the leg that would have caught the metal
+/// defect leg 6 slept through.
+///
+/// Leg 6 drives the miss arm with a focus that owns a window, which is the case CLICK-SHELL got right;
+/// it therefore passed on the gate for the whole time the bench could not click into the shell. The
+/// state that failed is the one leg 6 has no fixture for: a focus that owns **no window and no compat
+/// row** — a `run` program before its first present, a batch program that never presents, a windowed
+/// app that closed its last window. On the shipped predicate
+/// (`click_owner_is_windowed`) that focus took the DELIVER arm, so the press went to an app that owns
+/// nothing on the panel and the shell was reachable only by cycling the entire TAB ring.
+///
+/// `asid` is a synthetic owner of nothing. The fixture is `focus_changed(asid)` (which raises no
+/// window — it only publishes `FOCUS_ASID`) plus `el0_input_set_active(asid)`, so BOTH halves of the
+/// focus primitive name a windowless owner; the leg then drives one PRESS edge and requires the press
+/// to be CONSUMED and both halves to have moved to the shell (`el0_input_active() == 0` **and**
+/// `FOCUS_ASID == 0`), which is precisely the state a TAB-to-shell leaves. Checking `FOCUS_ASID` as
+/// well as the router's active ASID is the point: "focus moved" means the routing half and the VISIBLE
+/// half both moved, and a fix that did only the first would read as focused and look unfocused.
+///
+/// SKIPs (`None`) when a compat row is live, since that is the one state whose press is legitimately
+/// delivered rather than consumed — the exemption this leg must not assert against. A release edge
+/// follows for leg 6's reason: the router's press tracker is left as it was found.
+#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal"))]
+fn clickshell_windowless_leg(asid: u64) -> Option<bool> {
+    use crate::arch::aarch64::syscall as sc;
+    if compat_live() {
+        return None; // a full-screen app owns the panel: the deliver arm, not this leg's fixture
+    }
+    focus_changed(asid); // no window to raise — this only names the windowless owner
+    sc::el0_input_set_active(asid);
+    let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
+    let refocused = sc::el0_input_active() == 0;
+    let visible = FOCUS_ASID.load(core::sync::atomic::Ordering::Acquire) == 0;
+    let _ = sc::wc_click_route(crate::pal::Event::Button(0));
+    Some(consumed && refocused && visible)
+}
+
+/// CLICK-SHELL r2, DORMANT half: no arch router in this build, so leg 7 asserts nothing.
+#[cfg(all(feature = "witness", not(all(target_arch = "aarch64", feature = "baremetal"))))]
+fn clickshell_windowless_leg(_asid: u64) -> Option<bool> {
+    None
+}
+
 #[cfg(feature = "witness")]
 pub fn hittest_selftest() {
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -4498,6 +4560,9 @@ pub fn hittest_selftest() {
 
     const ASID_A: u64 = 0xC0A;
     const ASID_B: u64 = 0xC0B;
+    /// CLICK-SHELL r2 leg 7's owner: synthetic, and deliberately never passed to `create` — the leg
+    /// needs a focus that owns NOTHING.
+    const ASID_C: u64 = 0xC0C;
     let s = &raw const HT_SURF as usize;
     let len = core::mem::size_of_val(&HT_SURF);
     // 8x8 ARGB8888, stride 32 BYTES (= 8 px) — the FOCUS-VIS surface geometry exactly. The compositor
@@ -4540,11 +4605,24 @@ pub fn hittest_selftest() {
     // then drive one PRESS edge through the router with the pointer wherever it actually is. The
     // fixture is only valid if that point hits nothing: `shell` is the verdict, `None` = not asserted.
     let shell: Option<bool> = clickshell_leg(ASID_A, ix, iy, info.width as i32, info.height as i32);
-    let ok = inside_ok && topmost_ok && raise_ok && outside_ok && hidden_ok && shell != Some(false);
+
+    // Leg 7 — CLICK-SHELL r2 (P72). The same press, from a focus that owns NO window and no compat
+    // row. Leg 6 covers the windowed focus and passed on this gate throughout the bench defect; this
+    // is the leg that fails without the predicate fix. ASID_C owns nothing by construction.
+    let bare: Option<bool> = clickshell_windowless_leg(ASID_C);
+
+    let ok = inside_ok
+        && topmost_ok
+        && raise_ok
+        && outside_ok
+        && hidden_ok
+        && shell != Some(false)
+        && bare != Some(false);
     serial_println!(
-        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} hidden={} shell={} -> {}",
+        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} hidden={} shell={} bare={} -> {}",
         ix, iy, inside_ok, topmost_ok, raise_ok, outside_ok, hidden_ok,
         match shell { Some(true) => "true", Some(false) => "false", None => "skip" },
+        match bare { Some(true) => "true", Some(false) => "false", None => "skip" },
         if ok { "PASS" } else { "FAIL" }
     );
 
