@@ -2446,8 +2446,8 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ### SOCK-3 — `sys_connect`/`sys_send`/`sys_sock_recv` (TCP client) over the persistent smoltcp stack 🔬 `net-sock1`
 - **What:** the third [§1b](ROADMAP.md) arc — TCP **client** sockets (numbers **23–25**), ring 3's first
-  byte stream. `sys_socket` gains `SOCK_STREAM(1)` → TCP; `sys_connect`(23) active-opens to a peer,
-  `sys_send`(24) streams bytes, `sys_sock_recv`(25) reads them (named so — `SYS_RECV = 14` is the
+  byte stream. `sys_socket` gains `SOCK_STREAM(1)` → TCP; `sys_connect`(44) active-opens to a peer,
+  `sys_send`(45) streams bytes, `sys_sock_recv`(46) reads them (named so — `SYS_RECV = 14` is the
   capability-transfer inbox recv). Same `UNAOS_SMOLNET` knob, x86-only, byte-identical knob-off / aarch64.
 - **On the SOCK-2 stack:** a TCP socket rides the existing `STACK` singleton + `reg` registry; a slot now
   carries a `SockKind` tag and, for TCP, its own static stream ring buffers (`TCP_RX/TX_DATA`, 2 KiB each,
@@ -2487,9 +2487,16 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 ## net-sock1 track — 2026-07-12 (SOCK-2 — the UDP socket syscall family: ring 3 reaches the network)
 
 ### SOCK-2 — `sys_socket`/`bind`/`sendto`/`recvfrom` over a persistent smoltcp `SocketSet` 🔬 `net-sock1`
-- **What:** the second [§1b](ROADMAP.md) arc — the UDP socket syscall family (numbers **19–22**), the
-  first time ring 3 reaches the network. `sys_socket`(19) mints a UDP socket, `sys_bind`(20) names a
-  local port, `sys_sendto`(21)/`sys_recvfrom`(22) move datagrams. Same `UNAOS_SMOLNET` knob, x86-only,
+- **SOCKNUM (WINX-1, 2026-07-29):** the whole socket family moved from **19–27** to **40–48** (relative
+  order preserved). 19–27 collided with aarch64's `MSEND`/`MRECV`/`THREAD_SPAWN`/`THREAD_EXIT`/
+  `THREAD_JOIN`/`FB_MAP`/`FB_PRESENT`/`FUTEX`/`INPUT_POLL`, violating the cross-arch shared-number law
+  (a syscall number names the same verb on every arch). It went unnoticed because x86 compiled no
+  window/thread verbs and aarch64 compiles no socket verbs; bringing the x86 WINDOW verbs up made it
+  load-bearing. The numbers quoted below are the CURRENT ones. See
+  [`08_NET/networking.md`](../unaos/docs/dev/OS/08_NET/networking.md) § SOCKNUM.
+- **What:** the second [§1b](ROADMAP.md) arc — the UDP socket syscall family (numbers **40–43**, landed as 19–22), the
+  first time ring 3 reaches the network. `sys_socket`(40) mints a UDP socket, `sys_bind`(41) names a
+  local port, `sys_sendto`(42)/`sys_recvfrom`(43) move datagrams. Same `UNAOS_SMOLNET` knob, x86-only,
   byte-identical knob-off / aarch64.
 - **Persistent stack:** `smolnet.rs` gains a persistent `Interface` + `SocketSet` singleton (`STACK`,
   a `spin::Mutex<Option<SmolStack>>` mirroring `NET_DEVICE`) that outlives individual syscalls (a UDP

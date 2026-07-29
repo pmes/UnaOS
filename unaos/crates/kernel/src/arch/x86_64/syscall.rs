@@ -123,14 +123,35 @@ const SYS_FGRANT: u64 = 18;
 // (NON-BLOCKING — the IF-masked handler cannot block; smolnet drives a bounded poll pump). x86-only,
 // `smolnet` feature (DEFAULT-ON since SMOLNET-DEFAULT; dropped under `UNAOS_NOSMOLNET=1`); aarch64 /
 // opt-out never compile these arms (byte-identical).
+//
+// SOCKNUM (WINX-1): the family lives at 40..=48, NOT at the 19..=27 it originally claimed. The
+// SHARED-NUMBER LAW is that a syscall NUMBER means the same verb on every arch — the ABI is described
+// as Linux-style and cross-arch shared, and ring-3 programs above the per-arch asm stubs are meant to
+// be arch-neutral Rust that names verbs by number. The original SOCK-2/3/6 numbering broke that law
+// silently, because aarch64 had already spent 19..=27:
+//     19 MSEND      20 MRECV       21 THREAD_SPAWN  22 THREAD_EXIT  23 THREAD_JOIN
+//     24 FB_MAP     25 FB_PRESENT  26 FUTEX         27 INPUT_POLL
+// Nothing caught it: the two families never had to coexist, since x86 compiled no window/thread verbs
+// and aarch64 compiles no socket verbs. The collision only becomes load-bearing when x86 grows the
+// WINDOW verbs (WINX-1) and, later, the thread/futex/input verbs — at which point `SYS_INPUT_POLL` and
+// `SYS_ACCEPT` would both have to be 27 in the SAME dispatch. Moving the x86-only family (the arch that
+// is alone in using these ids) to a free contiguous block at 40..=48 restores the law and leaves
+// 19..=27 meaning on x86 exactly what it means on aarch64. RELATIVE ORDER is preserved, so the family
+// reads the same and a reviewer can diff it by inspection.
+//
+// This is a ring-3 ABI BREAK by construction, and deliberately a cheap one: every caller of these
+// numbers is IN-TREE (the inline-asm fixtures below), there is no out-of-tree x86 socket binary, and
+// the SOCK-2/3/4/6 + zeolite legs of the headless suite are the completeness proof — a missed
+// reference cannot pass, because a fixture that keeps the old immediate lands in an unrelated arm (or
+// `-ENOSYS`) and fails its verdict.
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_SOCKET: u64 = 19;
+const SYS_SOCKET: u64 = 40;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_BIND: u64 = 20;
+const SYS_BIND: u64 = 41;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_SENDTO: u64 = 21;
+const SYS_SENDTO: u64 = 42;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_RECVFROM: u64 = 22;
+const SYS_RECVFROM: u64 = 43;
 // SOCK-3 (ROADMAP §1b): the TCP CLIENT socket syscalls — ring 3's first byte stream. A TCP socket is
 // minted by `SYS_SOCKET` with type SOCK_STREAM(1) (the same `KIND_SOCKET` capability, gen-fenced value
 // word). CONNECT(handle, msg_ptr, msg_len) active-opens to the peer in `msg`'s 8-byte
@@ -141,18 +162,18 @@ const SYS_RECVFROM: u64 = 22;
 // `CAP_WRITE`, recv needs `CAP_READ`, connect needs `CAP_WRITE` (a configuring authority, like bind).
 // x86-only, knob-on; aarch64 / knob-off never compile these arms (byte-identical).
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_CONNECT: u64 = 23;
+const SYS_CONNECT: u64 = 44;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_SEND: u64 = 24;
+const SYS_SEND: u64 = 45;
 // `SYS_SOCK_RECV` (not `SYS_RECV` — 14 is the capability-transfer inbox recv) — the stream recv.
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_SOCK_RECV: u64 = 25;
+const SYS_SOCK_RECV: u64 = 46;
 // SOCK-6: TCP SERVER sockets — `SYS_LISTEN` arms a passive listener, `SYS_ACCEPT` polls for an inbound
 // connection and mints a fresh `KIND_SOCKET` handle for it (the ring 3 now ACCEPTS inbound TCP).
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_LISTEN: u64 = 26;
+const SYS_LISTEN: u64 = 47;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-const SYS_ACCEPT: u64 = 27;
+const SYS_ACCEPT: u64 = 48;
 
 /// Base of the ring-3 window: 1 TiB — a FRESH top-level slot (PML4 index 2) above the firmware
 /// identity map, so mapping it touches no kernel state. `setup` proves it unmapped before use.
@@ -9644,7 +9665,7 @@ unaos_user_sock2_blob_start:
     .globl unaos_user_sock2
 unaos_user_sock2:
     xor r12, r12                              // witness = 0
-    mov rax, 19                               // SYS_SOCKET(AF_INET=2, SOCK_DGRAM=2, proto=0)
+    mov rax, 40                               // SYS_SOCKET(AF_INET=2, SOCK_DGRAM=2, proto=0)
     mov rdi, 2
     mov rsi, 2
     mov rdx, 0
@@ -9653,7 +9674,7 @@ unaos_user_sock2:
     js 8f                                     // socket failed (<0) -> exit witness=0
     mov r13, rax                              // r13 = socket handle
     or r12, 1                                 // bit0: socket ok
-    mov rax, 20                               // SYS_BIND(handle, local port 49222)
+    mov rax, 41                               // SYS_BIND(handle, local port 49222)
     mov rdi, r13
     mov rsi, 49222
     syscall
@@ -9663,7 +9684,7 @@ unaos_user_sock2:
     lea r14, [rip + unaos_user_sock2_blob_start]
     add r14, 0x1000                           // r14 -> this blob's data page (recv buffer)
     mov r15, 16                               // outer sendto+recvfrom retry budget
-2:  mov rax, 21                               // SYS_SENDTO(handle, msg_ptr, 32)
+2:  mov rax, 42                               // SYS_SENDTO(handle, msg_ptr, 32)
     mov rdi, r13
     lea rsi, [rip + unaos_user_sock2_msg]
     mov rdx, 32
@@ -9671,7 +9692,7 @@ unaos_user_sock2:
     test rax, rax
     js 3f                                     // sendto -EAGAIN -> retry this round
     or r12, 4                                 // bit2: sendto succeeded
-    mov rax, 22                               // SYS_RECVFROM(handle, buf, 64)
+    mov rax, 43                               // SYS_RECVFROM(handle, buf, 64)
     mov rdi, r13
     mov rsi, r14
     mov rdx, 64
@@ -9788,7 +9809,7 @@ fn sock2_launcher(demo_cpu: usize) {
         return;
     };
     serial_println!(
-        ":: SOCK-2: ring-3 udp sockets — sys_socket(19)/bind(20)/sendto(21)/recvfrom(22), a datagram round-trip over the persistent smoltcp stack ::"
+        ":: SOCK-2: ring-3 udp sockets — sys_socket(40)/bind(41)/sendto(42)/recvfrom(43), a datagram round-trip over the persistent smoltcp stack ::"
     );
     crate::arch::sched::spawn_user_in_space("sock2-udp", fix.entry, fix.sp, demo_cpu, fix.cr3);
 
@@ -9848,7 +9869,7 @@ unaos_user_sock3_blob_start:
     .globl unaos_user_sock3
 unaos_user_sock3:
     xor r12, r12                              // witness = 0
-    mov rax, 19                               // SYS_SOCKET(AF_INET=2, SOCK_STREAM=1, proto=0)
+    mov rax, 40                               // SYS_SOCKET(AF_INET=2, SOCK_STREAM=1, proto=0)
     mov rdi, 2
     mov rsi, 1
     mov rdx, 0
@@ -9860,7 +9881,7 @@ unaos_user_sock3:
     lea r14, [rip + unaos_user_sock3_blob_start]
     add r14, 0x1000                           // r14 -> this blob's data page (recv buffer, writable)
     mov r15, 32                               // connect poll budget (-EINPROGRESS retries)
-9:  mov rax, 23                               // SYS_CONNECT(handle, msg_ptr=[ip][port], 8)
+9:  mov rax, 44                               // SYS_CONNECT(handle, msg_ptr=[ip][port], 8)
     mov rdi, r13
     lea rsi, [rip + unaos_user_sock3_msg]
     mov rdx, 8
@@ -9873,7 +9894,7 @@ unaos_user_sock3:
     jnz 9b
     jmp 8f                                    // connect budget exhausted -> exit
 5:  or r12, 2                                 // bit1: connect established
-    mov rax, 24                               // SYS_SEND(handle, query, 26)
+    mov rax, 45                               // SYS_SEND(handle, query, 26)
     mov rdi, r13
     lea rsi, [rip + unaos_user_sock3_query]
     mov rdx, 26
@@ -9882,7 +9903,7 @@ unaos_user_sock3:
     jl 8f                                     // send <= 0 -> exit (no bit2)
     or r12, 4                                 // bit2: send ok
     mov r15, 64                               // recv poll budget (-EAGAIN retries)
-6:  mov rax, 25                               // SYS_RECV(handle, buf, 64)
+6:  mov rax, 46                               // SYS_RECV(handle, buf, 64)
     mov rdi, r13
     mov rsi, r14
     mov rdx, 64
@@ -9993,7 +10014,7 @@ fn sock3_launcher(demo_cpu: usize) {
         return;
     };
     serial_println!(
-        ":: SOCK-3: ring-3 tcp sockets — sys_socket(SOCK_STREAM)/connect(23)/send(24)/recv(25), a byte-stream round-trip over the persistent smoltcp stack ::"
+        ":: SOCK-3: ring-3 tcp sockets — sys_socket(SOCK_STREAM)/connect(44)/send(45)/recv(46), a byte-stream round-trip over the persistent smoltcp stack ::"
     );
     crate::arch::sched::spawn_user_in_space("sock3-tcp", fix.entry, fix.sp, demo_cpu, fix.cr3);
 
@@ -10067,7 +10088,7 @@ unaos_user_sock4_blob_start:
     .globl unaos_user_sock4_grantor
 unaos_user_sock4_grantor:
     xor  r12d, r12d                           // witness = 0
-    mov  rax, 19                              // SYS_SOCKET(AF_INET=2, SOCK_DGRAM=2, proto=0)
+    mov  rax, 40                              // SYS_SOCKET(AF_INET=2, SOCK_DGRAM=2, proto=0)
     mov  rdi, 2
     mov  rsi, 2
     mov  rdx, 0
@@ -10102,7 +10123,7 @@ unaos_user_sock4_grantor:
     dec  r14
     jnz  2b
     jmp  8f                                    // GO never released -> partial witness (verdict FAILs)
-3:  mov  rax, 21                               // SYS_SENDTO(h, msg, 32) — the socket MOVED away at grantee RECV
+3:  mov  rax, 42                               // SYS_SENDTO(h, msg, 32) — the socket MOVED away at grantee RECV
     mov  rdi, r13
     lea  rsi, [rip + unaos_user_sock4_msg]
     mov  rdx, 32
@@ -10140,7 +10161,7 @@ unaos_user_sock4_grantee:
     jmp  19f                                   // nothing ever arrived -> partial witness
 14: mov  r13, rax                              // r13 = socket handle (migrated to us at RECV)
     or   r12, 1                                // bit0: received
-    mov  rax, 20                               // SYS_BIND(h, 49223) — proves the moved cap resolves + CAP_WRITE
+    mov  rax, 41                               // SYS_BIND(h, 49223) — proves the moved cap resolves + CAP_WRITE
     mov  rdi, r13
     mov  rsi, 49223
     syscall
@@ -10150,7 +10171,7 @@ unaos_user_sock4_grantee:
     lea  r14, [rip + unaos_user_sock4_blob_start]
     add  r14, 0x1000                            // r14 -> recv buffer (grantee's own RW data page)
     mov  r15, 16                                // sendto+recvfrom retry budget
-15: mov  rax, 21                                // SYS_SENDTO(h, msg, 32)
+15: mov  rax, 42                                // SYS_SENDTO(h, msg, 32)
     mov  rdi, r13
     lea  rsi, [rip + unaos_user_sock4_msg]
     mov  rdx, 32
@@ -10158,7 +10179,7 @@ unaos_user_sock4_grantee:
     test rax, rax
     js   16f                                    // sendto -EAGAIN -> retry this round
     or   r12, 4                                 // bit2: sendto succeeded
-    mov  rax, 22                                // SYS_RECVFROM(h, buf, 64)
+    mov  rax, 43                                // SYS_RECVFROM(h, buf, 64)
     mov  rdi, r13
     mov  rsi, r14
     mov  rdx, 64
@@ -10670,7 +10691,7 @@ zdns_st2:
     test rax, rax
     jnz zdns_serve                            // blocked(1) / malformed(2) -> unexpected, skip forward
     or r12, 16                                // bit4: una.os NOT blocked (forward decision)
-    mov rax, 19                               // SYS_SOCKET(AF_INET=2, SOCK_DGRAM=2, 0)
+    mov rax, 40                               // SYS_SOCKET(AF_INET=2, SOCK_DGRAM=2, 0)
     mov rdi, 2
     mov rsi, 2
     xor rdx, rdx
@@ -10678,7 +10699,7 @@ zdns_st2:
     test rax, rax
     js zdns_serve
     mov r13, rax                              // r13 = upstream socket
-    mov rax, 20                               // SYS_BIND(handle, 49260)
+    mov rax, 41                               // SYS_BIND(handle, 49260)
     mov rdi, r13
     mov rsi, 49260
     syscall
@@ -10686,14 +10707,14 @@ zdns_st2:
                                               // a medium with no upstream — the socket injector — fails fast
                                               // and the SERVE leg starts promptly, overlapping the injector)
 zdns_fwd_loop:
-    mov rax, 21                               // SYS_SENDTO(handle, msg, len)
+    mov rax, 42                               // SYS_SENDTO(handle, msg, len)
     mov rdi, r13
     lea rsi, [rip + zdns_fwdmsg]              // [10.0.2.3][53 LE][pad] + una.os DNS payload
     mov rdx, [rip + zdns_fwdmsglen]
     syscall
     test rax, rax
     js zdns_fwd_retry
-    mov rax, 22                               // SYS_RECVFROM(handle, UPRECV, 512)
+    mov rax, 43                               // SYS_RECVFROM(handle, UPRECV, 512)
     mov rdi, r13
     lea rsi, [r14 + 0x1400]                   // UPRECV
     mov rdx, 512
@@ -10725,7 +10746,7 @@ zdns_fwd_done:
 
 zdns_serve:
     // --- (3) SERVE: bind UDP :53, recvfrom a bounded window; a blocked name -> 0.0.0.0 to the client ---
-    mov rax, 19                               // SYS_SOCKET(AF_INET, SOCK_DGRAM, 0)
+    mov rax, 40                               // SYS_SOCKET(AF_INET, SOCK_DGRAM, 0)
     mov rdi, 2
     mov rsi, 2
     xor rdx, rdx
@@ -10733,7 +10754,7 @@ zdns_serve:
     test rax, rax
     js zdns_exit
     mov r13, rax                              // r13 = serve socket
-    mov rax, 20                               // SYS_BIND(handle, 53)
+    mov rax, 41                               // SYS_BIND(handle, 53)
     mov rdi, r13
     mov rsi, 53
     syscall
@@ -10744,7 +10765,7 @@ zdns_serve:
                                               // first round (fast exit); hermetically all rounds run to their
                                               // -EAGAIN budget then the fixture exits (the PENDING path).
 zdns_serve_loop:
-    mov rax, 22                               // SYS_RECVFROM(serve, RECVBUF, 512)
+    mov rax, 43                               // SYS_RECVFROM(serve, RECVBUF, 512)
     mov rdi, r13
     lea rsi, [r14 + 0x800]                    // RECVBUF = [8-byte src hdr][DNS query]
     mov rdx, 512
@@ -10769,7 +10790,7 @@ zdns_serve_loop:
     call zdns_build_sinkhole                  // rax = response DNS length
     add rax, 8                                // + the 8-byte dst header
     mov rdx, rax
-    mov rax, 21                               // SYS_SENDTO(serve, RESPBUF, 8+resp)
+    mov rax, 42                               // SYS_SENDTO(serve, RESPBUF, 8+resp)
     mov rdi, r13
     lea rsi, [r14 + 0x1000]
     syscall
