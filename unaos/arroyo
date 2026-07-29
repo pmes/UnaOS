@@ -1057,6 +1057,18 @@ kernel8() {
         K8_FEATS="${K8_FEATS},v3d_deep,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_DEEP: the slow banked-verdict V3D probes (v3d48 ladder / v3d59 frameclose / v3d58 rerender) — adds ~3.5 s to an armed boot${COLOR_RESET}"
     fi
+    # PI-V3D-69: UNAOS_V3D69_REENABLE=1 adds the `v3d69_reenable` (+`v3d_deep`,+`v3d`) features — the
+    # WRITE half of the initialisation-diff arc. The READ half (the `[v3d69] fabric` stations: PM_GRAFX,
+    # both V3D async-AXI-bridge control words in both candidate ASB blocks, V3D_MMUC_CONTROL) rides
+    # UNAOS_V3D_DEEP and writes nothing. This knob adds the one rung that re-runs mainline's
+    # `bcm2835_asb_power_on` ON half and re-kicks the `[v3d69]` control rung behind it, so the retire
+    # verdict either side of the re-enable is a same-boot differential. Gated on the FINDING as well as
+    # on the knob: when the read half reports a clean fabric the rung declines, writes nothing and says
+    # so on the wire. Implies UNAOS_V3D_DEEP. See docs/dev/OS/08_VIDEO/v3d.md §41.
+    if [ -n "${UNAOS_V3D69_REENABLE:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d69_reenable,v3d_deep,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D69_REENABLE: re-run the mainline PM/ASB enable sequence and re-kick the [v3d69] control rung (declines when the fabric already reads clean)${COLOR_RESET}"
+    fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::
     # spawn_joinable + JoinHandle join barrier), falling back to the single-core serial flush when no

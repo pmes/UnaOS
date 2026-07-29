@@ -2832,3 +2832,140 @@ The gating is verified by building `kernel8` both ways: the armed-with-deep imag
 explicit `SKIPPED` line and every verdict here is **metal-attended**; `kernel8-test` green for
 this arc (86/86) means the default boot is byte-inert and the suite did not regress, and
 nothing more.
+
+---
+
+## 41. Diffing the initialisation paths — reading the fabric, not the engine (V3D-69)
+
+§40 excluded frame geometry and frame content with the same force as encoding, submission, cache
+mode, reset, MMU and clock, and named what was left: PTB `BXCF` (mainline defines it and writes it
+from no path), `MISCCFG.QRMAXCNT` (disarmed since §29), **or an initialisation this campaign has not
+found**. Nine arcs had varied the state this driver puts *in front of* the block. This one stops
+probing our own state and reconstructs what mainline does between cold power and its first
+successful bin kick, then diffs.
+
+### 41.1 The reconstructed mainline path
+
+Sourced from working knowledge of the Linux tree (`drivers/soc/bcm/bcm2835-power.c`,
+`drivers/gpu/drm/v3d/*`, `arch/arm/boot/dts/bcm2711.dtsi`). **No network was available**, so every
+step below is a reconstruction from memory and each one carries its own confidence marker. A step
+marked **UNCERTAIN** is one this tree must not treat as settled.
+
+| # | Stage | Step | Confidence |
+|---|---|---|---|
+| 1 | firmware | `start4.elf` powers the GRAFX rail, runs the inrush/POWOK/ISPOW/MEMREP/ISFUNC ramp and leaves the V3D clock present | established (this is why our mailbox `SET_DOMAIN_STATE` domain 10 ACKs) |
+| 2 | DT | `v3d` node: `power-domains = <&pm GRAFX_V3D>`, `resets = <&pm BCM2835_RESET_V3D>`, `clocks = <&firmware_clocks 5>`, `reg` = hub + core0 | high |
+| 3 | DT | `pm` node carries **three** reg ranges: `pm` (VC `0x7e100000`), `asb` (VC `0x7e00a000`), `rpivid_asb` (VC `0x7ec11000`) | high on the count and on `rpivid_asb`; **UNCERTAIN** on the legacy `asb` base |
+| 4 | `bcm2835-power` | `bcm2835_power_power_on(PM_GRAFX)` — the POWUP → POWOK → ISPOW → MEMREP/MRDONE → ISFUNC ramp — **returns early on BCM2711** (`if (power->rpivid_asb) return 0`): the firmware owns it | high; this tree has asserted it since §PI-V3D-3 |
+| 5 | `bcm2835-power` | `bcm2835_asb_power_on(PM_GRAFX, ASB_V3D_M_CTRL, ASB_V3D_S_CTRL, PM_V3DRSTN)`: enable the domain clock, ~1 µs settle, **deassert `PM_V3DRSTN`** (bit 6, PM password), then `bcm2835_asb_enable` the **master** then the **slave** bridge | high on the sequence and on bit 6 |
+| 6 | `bcm2835-power` | `bcm2835_asb_control` **re-routes** `ASB_V3D_{S,M}_CTRL` to the `rpivid_asb` block whenever that block is present — always, on BCM2711 | high |
+| 7 | `bcm2835-power` | ASB word bits: `REQ_STOP`(0), `ACK`(1), `EMPTY`(2), `FULL`(3); enable = clear `REQ_STOP` with the PM password, then poll until `ACK` clears | high on 0/1, medium on 2/3 |
+| 8 | `bcm2835-power` | Generic PM word bits `POWUP`(3) `POWOK`(4) `ISFUNC`(5) `MRDONE`(7) `MEMREP`(8) `ISPOW`(9) `ENAB`(12), inrush shift 13 | **UNCERTAIN** — reconstructed, and it collides with the per-domain reset-bit defines in the same word |
+| 9 | v3d probe | `clk_prepare_enable`, `devm_reset_control_get`, ioremap `hub` + `core0` (`gca`/`bridge` are `ver<41` only) | high |
+| 10 | v3d probe | read `V3D_HUB_IDENT1`, derive `ver = tver*10 + rev` | established (§35, §"V3D-61") |
+| 11 | v3d probe | `dma_set_mask_and_coherent(...)` before any DMA allocation | **UNCERTAIN** on the mask width |
+| 12 | `v3d_gem_init` | allocate a **4 MiB** page table (zeroed) and a 4 KiB MMU scratch page; `drm_mm_init` starts at **page 1** — "various bits of HW treat 0 as special" | high on the shape, medium on the size |
+| 13 | `v3d_init_hw_state` → `v3d_init_core` | `MISCCFG.OVRTMUOUT` only when `ver < 41`; then `L2TFLSTA = 0`, `L2TFLEND = ~0` | high — mirrored since §PI-V3D-51 |
+| 14 | `v3d_mmu_set_page_table` | `MMU_PT_PA_BASE = pt_paddr >> 12`; `MMU_CTL = ENABLE \| PT_INVALID_{ENABLE,ABORT,INT} \| WRITE_VIOLATION_{ABORT,INT} \| CAP_EXCEEDED_{ABORT,INT}`; `MMU_ILLEGAL_ADDR = scratch_pfn \| ENABLE` | high — mirrored, §"V3D-62" |
+| 15 | `v3d_mmu_flush_all` | `MMUC_CONTROL = FLUSH \| ENABLE`, wait the flush out, then `MMU_CTL \|= TLB_CLEAR` and wait | high on the writes, medium on the wait bits |
+| 16 | `v3d_irq_enable` | unmask the core working set **and** the hub half | high — mirrored, §26 |
+| 17 | first job | `v3d_bin_job_run`: `CT0QMA`/`CT0QMS`, `CT0QTS \| ENABLE`(bit 1), then `CT0QBA`/`CT0QEA` as the GO | established, byte-exact since §23 |
+
+### 41.2 The diff against our bring-up
+
+We boot bare-metal off `start4.elf` with no Linux, so anything the DT/power framework does that the
+firmware does not do by default is a candidate hole.
+
+| Mainline step | Ours | Status |
+|---|---|---|
+| 1, 4 (firmware rail + ramp) | mailbox `SET_DOMAIN_STATE` domain 10, `SET_CLOCK_RATE` id 5 @ 500 MHz, `SET_CLOCK_STATE` | **covered**, and mainline skips the ramp on BCM2711 anyway |
+| 5 (`PM_V3DRSTN` + both bridges) | `v3d_reset_cycle` = OFF half then `enable_pm_asb` | **written, never read back as a verdict** → the V3D-69 read half |
+| 6 (which ASB block) | we drive `rpivid_asb` at `0xFEC1_1000` | **written, never falsified** → the V3D-69 routing column |
+| 7 (`EMPTY`/`FULL`) | never read | **never looked at** → new columns |
+| 12 (page table shape) | identity-mapped arena only; iova ≠ 0 by construction | equivalent-in-effect; the "page 0 is special" rule is respected |
+| 13, 14, 16, 17 | mirrored byte-exact | covered (§26, §29, §35, §"V3D-62") |
+| 15 (`MMUC_CONTROL`) | we write `FLUSH \| ENABLE` in `program_mmu` | **written, never read back** → the V3D-69 `MMUC` column |
+| 11 (DMA mask) | N/A — no DMA API; physical addresses throughout | not a hole |
+
+### 41.3 The ranked holes
+
+1. **`MMUC_CONTROL.ENABLE` never confirmed latched.** Cheapest to check, and a real defect if it
+   reads clear. It would not by itself explain a *bin-exclusive* wall — the render path crosses the
+   same MMU — so it is a thing to fix and re-measure, not a verdict on the binner.
+2. **ASB routing.** If `ASB_V3D_{S,M}_CTRL` are not actually backed at `0xFEC1_1000`, every release
+   this driver has issued since PI-V3D-3 landed on a window nobody reads. The `BRDG_VERSION` word
+   is the falsifier, and the legacy-block column is the cross-check.
+3. **The PM_GRAFX isolation bits.** Mainline never writes them on BCM2711, so a divergence here is
+   a firmware-configuration finding, not a driver one — and the bit map is UNCERTAIN, so the raw
+   word gets primary billing and the decode is explicitly hedged.
+4. **The ASB master-bridge hypothesis** — ranked **last**, deliberately.
+
+### 41.4 Why the bridge hypothesis is ranked last
+
+The attractive story: the binner's AXI path through the master bridge was never enabled, so the
+block is alive on the register bus (every MMIO read works, every job latches, every register echoes)
+yet cannot master a write to memory — which matches *every* observation, including the total absence
+of an error or an interrupt.
+
+It does not survive contact with the render engine. On this same block, this same boot: a **CT1
+render job retires and lands CPU-verified pixels in arena memory** (§`[v3d58] xengine`); the **CLE
+fetches every bin control list out of DRAM** and `CT0CA` walks it to `EA` (§28); and the **V3D MMU's
+own page-table walk is a memory read**. V3D 4.2 puts *one* master port behind the hub MMU per core —
+the PTB does not have a private one — so those three facts are direct evidence that the master
+bridge passes both reads and writes. A stopped master would take the render path and the list fetch
+down with the binner, and it demonstrably does not.
+
+That is a refutation on inference, and the inference rests on a block diagram this tree has never
+read a register out of. Hence the arc: four MMIO reads settle the branch on the wire instead.
+
+### 41.5 The rungs
+
+**Read half — `[v3d69] fabric` (rides `UNAOS_V3D_DEEP`, writes nothing).** Two stations, either side
+of one banked `Empty` control rung that is the `[v3d48]` kick verbatim. Each station is nine MMIO
+loads inside the Device window `boot.rs` already maps — no new mapping:
+
+| Column | Read | Mainline expectation |
+|---|---|---|
+| `PM_GRAFX` raw + `V3DRSTN` | `PM_BASE + 0x10c` | `V3DRSTN` **set** |
+| `PM_GRAFX` POWUP/POWOK/ISFUNC/MRDONE/MEMREP/ISPOW/ENAB | same word | *whatever `start4.elf` left* — mainline never writes them on BCM2711; map **UNCERTAIN** |
+| `rpivid_asb` `BRDG_VERSION`, `CPR_CTRL` | `0xFEC1_1000 + 0x00/0x04` | a plausible identity word — the "is this window the ASB?" falsifier |
+| `ASB_V3D_M_CTRL` / `S_CTRL` + `REQ_STOP`/`ACK`/`EMPTY`/`FULL` | `+0x0c` / `+0x08` | `REQ_STOP = 0` **and** `ACK = 0` on both |
+| legacy `asb` `BRDG_VERSION` / `M_CTRL` / `S_CTRL` | `0xFE00_A000` (**UNCERTAIN base**) | some *other* peripheral's bridges, or dead — routing falsifier only |
+| `V3D_MMUC_CONTROL` + `ENABLE`/`FLUSH` | hub `+0x1000` | `ENABLE` **set** |
+
+**Write half — `[v3d69] reenable` (separate knob `UNAOS_V3D69_REENABLE`, off by default even on a
+deep boot).** Re-runs mainline's `bcm2835_asb_power_on` ON half (`enable_pm_asb`) and re-kicks the
+control rung, so the retire verdict either side is a same-boot differential. It is **gated on the
+finding as well as on the knob**: when the read half reports a clean fabric it declines, writes
+nothing, and says so — re-releasing an already-released bridge perturbs a live block and the outcome
+would be uninterpretable either way.
+
+### 41.6 Expected wire, per outcome branch
+
+- **`BRDG_VERSION` not plausible** ⇒ no bridge reading may be cited at all; the release writes have
+  been going somewhere unverified since PI-V3D-3. Establish the base from the DT — do not run
+  another rung.
+- **Either bridge reads `REQ_STOP=1` or `ACK=1`** ⇒ the campaign's model of its own block is wrong
+  and the render evidence has to be re-read. This is the only branch on which the write half is
+  meaningful. Read it against `[v3d58] xengine` and the legacy-routing column *before* arming.
+- **Bridges released, `MMUC_CONTROL.ENABLE` clear** ⇒ a genuine initialisation hole, and the first
+  one this arc found. Fix, then re-measure; it is not a binner verdict.
+- **Fabric clean** ⇒ the bridge hypothesis is **closed on a measurement** rather than on inference,
+  and PM/ASB power sequencing joins the excluded list alongside encoding, submission, cache mode,
+  reset, MMU, clock, frame geometry and frame content. The initialisation this campaign has not
+  found is not in this layer.
+
+The `EMPTY`/`FULL` columns are a **two-sample read either side of a ~0.5 s wait, not a sampler**:
+"EMPTY at both stations" is consistent with a bridge that was busy and drained, and is evidence of
+nothing on its own. Only `REQ_STOP`/`ACK` carry a verdict, and the witness says so.
+
+### 41.7 Gating and cost
+
+One more rung on a deep boot (the `[v3d] deep=on` budget line now reads **18 rungs / ~9.5 s**) plus
+nine MMIO reads per station. Verified by building `kernel8` three ways: **no deep** carries **zero**
+`v3d69` strings; **deep** carries the read half only (11, and **zero** `[v3d69] reenable`); **deep +
+`UNAOS_V3D69_REENABLE`** carries 16, including the 3 reenable lines — 1,856 bytes larger. QEMU
+raspi4b models neither V3D nor the `rpivid_asb` block, so the probe returns at its hub-identity gate
+with an explicit `SKIPPED` line; `kernel8-test` green for this arc (86/86) means the default boot is
+byte-inert and the suite did not regress, **and nothing more**. Every verdict in §41 is
+metal-attended.

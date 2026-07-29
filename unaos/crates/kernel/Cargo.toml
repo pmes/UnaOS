@@ -381,6 +381,16 @@ v3d = ["baremetal"]
 # `UNAOS_V3D=1 UNAOS_V3D_DEEP=1 UNAOS_PI=1 ./arroyo kernel8`. See docs/dev/OS/08_VIDEO/v3d.md.
 v3d_deep = ["v3d"]
 
+# PI-V3D-69: the WRITE half of the initialisation-diff arc. The READ half (`[v3d69] fabric` stations —
+# PM_GRAFX, both V3D async-AXI-bridge control words in both candidate ASB blocks, V3D_MMUC_CONTROL)
+# rides `v3d_deep` and is read-only. THIS feature adds the one rung that WRITES: it re-runs mainline's
+# `bcm2835_asb_power_on` ON half and re-kicks the `[v3d69]` control rung behind it. It is a separate
+# knob because it perturbs a live block, and it is gated on the finding as well as on the knob — when
+# the read half reports a clean fabric the rung declines and says so, writing nothing. Requires
+# `v3d_deep`. Enable via `UNAOS_V3D=1 UNAOS_V3D_DEEP=1 UNAOS_V3D69_REENABLE=1 UNAOS_PI=1 ./arroyo
+# kernel8`. See docs/dev/OS/08_VIDEO/v3d.md §41.
+v3d69_reenable = ["v3d_deep"]
+
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
 # the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding

@@ -81,6 +81,45 @@ const ASB_V3D_M_CTRL: usize = 0x0C; // V3D master AXI bridge control
 const ASB_REQ_STOP: u32 = 1 << 0; // request the bridge stopped (clear to release)
 const ASB_ACK: u32 = 1 << 1; // bridge stopped acknowledge (clears when released)
 
+// ─── PI-V3D-69: the rest of the ASB register file, and the second (legacy) ASB block. ─────────────
+// `bcm2835-power.c` names four bits in an ASB control word — `ASB_REQ_STOP` (0), `ASB_ACK` (1),
+// `ASB_EMPTY` (2), `ASB_FULL` (3) — and only ever READS/WRITES the first two. The other two describe
+// the bridge's transaction FIFO and are exactly the never-looked-at state this arc opens: a bridge that
+// is released (REQ_STOP=0, ACK=0) but whose FIFO never leaves EMPTY across a leg saw no traffic.
+// `ASB_BRDG_VERSION` (0x00) is the block's own identity word — the falsifier for "is this window even
+// the ASB?": a plausible version constant means the base is right, 0x0/0xffffffff means it is not and
+// every other reading from this block is void.
+const ASB_BRDG_VERSION: usize = 0x00;
+const ASB_CPR_CTRL: usize = 0x04;
+const ASB_EMPTY: u32 = 1 << 2; // bridge transaction FIFO empty
+const ASB_FULL: u32 = 1 << 3; // bridge transaction FIFO full
+// The `pm` node carries THREE reg ranges on BCM2711 — "pm" (VC 0x7e100000), "asb" (VC 0x7e00a000) and
+// "rpivid_asb" (VC 0x7ec11000) — and `bcm2835_asb_control` routes ASB_V3D_{S,M}_CTRL to the rpivid
+// block whenever it is present, which on BCM2711 is always. We already drive the rpivid block. Reading
+// the SAME two offsets out of the LEGACY block as well is the routing falsifier: if the V3D bridge is
+// actually backed there and not in rpivid_asb, our release wrote a register nobody reads and the
+// bridge was never released at all. ARM PA = VC bus address with the 0x7exxxxxx → 0xFExxxxxx fixup;
+// same Device-nGnRnE GiB already mapped by boot.rs L1[3], so this opens no new MMU mapping.
+// UNCERTAIN: the legacy block's base offset (0x7e00a000) is from memory of the bcm2711 DT `pm` node and
+// is NOT independently corroborated in this tree — the version word above is what decides whether the
+// legacy column may be cited at all.
+const LEGACY_ASB_BASE: usize = 0xFE00_A000;
+
+// PM_GRAFX field map from `bcm2835-power.c`'s generic power-domain bits. Only `PM_V3DRSTN` (bit 6,
+// above) is corroborated in this tree — this driver writes it and metal echoes it. The rest of this map
+// is RECONSTRUCTED FROM MEMORY of the mainline header and is UNCERTAIN; the `[v3d69]` witness therefore
+// prints the RAW word first and gives every decoded field below the caveat it deserves. In particular
+// `bcm2835_power_power_on` (the POWUP → POWOK → ISPOW → MEMREP/MRDONE → ISFUNC ramp these bits belong
+// to) returns EARLY on BCM2711 — the firmware owns that sequence — so mainline never writes them either
+// and the expectation is "whatever start4.elf left", not "what Linux programmed".
+const PM_POWUP: u32 = 1 << 3;
+const PM_POWOK: u32 = 1 << 4;
+const PM_ISFUNC: u32 = 1 << 5;
+const PM_MRDONE: u32 = 1 << 7;
+const PM_MEMREP: u32 = 1 << 8;
+const PM_ISPOW: u32 = 1 << 9;
+const PM_ENAB: u32 = 1 << 12;
+
 // ─── Hub registers (offset from V3D_HUB_BASE), per v3d_regs.h. ───
 const V3D_HUB_IDENT0: usize = 0x0008;
 const V3D_HUB_IDENT1: usize = 0x000C;
@@ -918,7 +957,7 @@ pub fn bringup(fb: Option<FbTarget>) {
     // only trustworthy if it says what is missing from it.
     if V3D_DEEP {
         serial_println!(
-            ":: V3D: [v3d] deep=on — slow banked-verdict probes ARMED: [v3d48] bisection ladder (6 rungs x ~0.5 s FLDONE backstop) + [v3d63] ptb-unit matrix (4 more rungs, same backstop) + [v3d64] muxcal (1 more rung + a 4 ms idle window + 1 extra CT1 job) + [v3d66] ptbsweep (2 passes x [1 rung + a 4 ms idle window + 1 extra CT1 job]) + [v3d68] binwall (4 more rungs, same backstop, plus a poison fill/scan of a 24 KiB tile-state region and the 32 KiB pool per rung) = 17 rungs, [v3d59] frameclose (64 x 1 ms), [v3d58] rerender (extra CT1 job). Expect ~9 s of extra boot — a stall of that length here is the BUDGET, not a hang ::"
+            ":: V3D: [v3d] deep=on — slow banked-verdict probes ARMED: [v3d48] bisection ladder (6 rungs x ~0.5 s FLDONE backstop) + [v3d63] ptb-unit matrix (4 more rungs, same backstop) + [v3d64] muxcal (1 more rung + a 4 ms idle window + 1 extra CT1 job) + [v3d66] ptbsweep (2 passes x [1 rung + a 4 ms idle window + 1 extra CT1 job]) + [v3d68] binwall (4 more rungs, same backstop, plus a poison fill/scan of a 24 KiB tile-state region and the 32 KiB pool per rung) + [v3d69] initdiff (1 more rung, same backstop, between two READ-ONLY PM/ASB/MMUC fabric stations) = 18 rungs, [v3d59] frameclose (64 x 1 ms), [v3d58] rerender (extra CT1 job). Expect ~9.5 s of extra boot — a stall of that length here is the BUDGET, not a hang ::"
         );
     } else {
         serial_println!(
@@ -4428,6 +4467,22 @@ fn build_probe_shader_record() -> u32 {
 /// `[v3d] deep=off …` line naming exactly what was skipped, so a wire read is never silently short.
 const V3D_DEEP: bool = cfg!(feature = "v3d_deep");
 
+/// PI-V3D-69 — the READ-ONLY half of the initialisation-diff arc: the `[v3d69] fabric` stations, which
+/// read the power/bridge state between the SoC and the V3D block (PM_GRAFX, both V3D ASB control words
+/// in both candidate ASB blocks, the MMU-cache enable) and print it against what mainline's
+/// `bcm2835_asb_power_on` + `v3d_mmu_set_page_table` leave behind. Pure MMIO reads plus one banked
+/// control rung; rides `V3D_DEEP` because its differential station sits either side of that rung.
+const V3D69_FABRIC: bool = V3D_DEEP;
+
+/// PI-V3D-69 — the WRITE half, deliberately on its own knob (`UNAOS_V3D69_REENABLE=1`, feature
+/// `v3d69_reenable`) and OFF by default even on a deep boot. It re-runs the mainline enable sequence
+/// (`enable_pm_asb` = deassert PM_V3DRSTN, release the master then the slave bridge) and re-kicks the
+/// `[v3d69]` control rung. It is a SEPARATE knob because it is the only part of this arc that writes,
+/// and because it is only meaningful on the one outcome branch where the read half found a bridge that
+/// is NOT released: re-releasing an already-released bridge perturbs a live block for nothing. When the
+/// knob is armed but the read half found the fabric clean, the rung declines to run and says so.
+const V3D69_REENABLE: bool = cfg!(feature = "v3d69_reenable");
+
 /// Gate for the `[v3d58] station` progression sampling and the `[v3d58] xengine` asymmetry line.
 /// Read-only MMIO; one flip to `false` silences both. Cheap — default-on.
 const V3D58_STATIONS: bool = true;
@@ -6651,6 +6706,11 @@ fn empty_frame_bisection() {
     // tile-state region and that publishes POISON rather than zeros into the shared bin regions, so
     // every reading taken above is taken on the arrangement those verdicts were banked under.
     v3d68_binner_wall();
+    // PI-V3D-69: the initialisation diff rides the very tail, after [v3d68]. Its pre-station is meant
+    // to read the SoC↔V3D fabric as it stood through the WHOLE battery above, so it wants every other
+    // rung already behind it; and its own control rung must not sit in front of a reading another
+    // verdict is banked on.
+    v3d69_fabric_probe();
 }
 
 /// PI-V3D-63 — one banked rung's readback: the RANK 2 placement witness (the CT0/PCS words) plus the
@@ -8094,6 +8154,288 @@ fn v3d68_binner_wall() {
     );
     serial_println!(
         ":: V3D: [v3d68] binwall scope — this battery varied FRAME GEOMETRY and FRAME CONTENT and nothing else. It did NOT write BXCF, MISCCFG.QRMAXCNT or CTRSTA, did not touch the GMP or MMU_CTL, opened no new MMIO window, and left the real M4 draw untouched. The BPCA columns are read against Mesa v3d_util.c::v3d_tile_alloc_sizes (the PTB reserves the INITIAL block PER TILE at START_TILE_BINNING, then allocates aligned 4 KiB chunks); a match at BOTH tile-size hypotheses on the same rung means the prediction did not discriminate on this frame and the tile size stays as established, NOT as measured ::"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// PI-V3D-69 — the initialisation diff: read the FABRIC, not the engine.
+//
+// Every arc from V3D-40 to V3D-68 probed state this driver puts in front of the block: the control
+// list, its placement, the caches around it, the reset before it, the interrupt policy over it, the
+// counter bank across it, and finally (V3D-68) the frame itself. V3D-68's verdict named what is left:
+// PTB `BXCF` (which mainline defines and writes from no path), `MISCCFG.QRMAXCNT` (disarmed since
+// V3D-55), or an initialisation this campaign has not found. This arc goes after the third.
+//
+// The reconstruction of mainline's cold-power → first-bin-kick path (see v3d.md §41) puts exactly four
+// things between the SoC and a binner that can master a write, and this driver has only ever WRITTEN
+// three of them and never READ any of them back as a verdict:
+//   1. PM_GRAFX — the graphics power-domain word. Mainline's BCM2711 path writes only PM_V3DRSTN here
+//      (`bcm2835_power_power_on` returns early when `rpivid_asb` is present), so the isolation/power
+//      bits are the FIRMWARE's business and the honest expectation is "start4.elf left them sane".
+//   2. ASB_V3D_M_CTRL / ASB_V3D_S_CTRL — the two async AXI bridges. Released = REQ_STOP clear AND ACK
+//      clear. We write the release; we have never read the words back as an independent verdict, and
+//      we have never looked at the FIFO half of the word (EMPTY/FULL) at all.
+//   3. Which ASB BLOCK backs those two offsets — `bcm2835_asb_control` re-routes them to `rpivid_asb`
+//      on BCM2711. If that routing is wrong in this driver, our release landed on a dead window.
+//   4. V3D_MMUC_CONTROL.ENABLE — the MMU cache. `v3d_mmu_flush_all` writes FLUSH|ENABLE and this
+//      driver mirrors that write, but nothing has ever read the register back to confirm the ENABLE
+//      bit LATCHED.
+//
+// **The hypothesis this arc was built to test, and why it is ranked LAST, not first.** The attractive
+// story is that the binner's AXI path through the master bridge was never enabled: the block would
+// then be alive on the register bus (every MMIO read works, jobs latch, registers echo) yet unable to
+// master a write to memory — which matches every observation this campaign has, including the total
+// absence of an error or an interrupt. It does not survive contact with the render engine. A CT1
+// render job on this same block, this same boot, retires and lands CPU-verified pixels in arena memory
+// (`[v3d58] xengine`); the CLE fetches every bin control list out of DRAM and `CT0CA` walks it to `EA`;
+// and the V3D MMU's own page-table walk is a memory read. V3D 4.2 puts ONE master port behind the hub
+// MMU per core — the PTB does not have a private one — so those three facts are direct evidence that
+// the master bridge passes both reads and writes. A stopped master bridge would take the render path
+// and the list fetch down with the binner, and it demonstrably does not.
+//
+// That is a refutation on inference, though, and the inference rests on a block diagram this tree has
+// never read a register out of. The stations below cost four MMIO reads and settle the branch on the
+// wire instead: if the words come back released, the hypothesis is closed with a measurement rather
+// than an argument, and §41's ranking stands unchanged; if either bridge reads STOPPED, the campaign's
+// model of its own block was wrong and the render evidence has to be re-read.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// One station's read of the SoC↔V3D fabric. Pure MMIO reads, no writes, no waits.
+#[derive(Clone, Copy)]
+struct V3d69Fabric {
+    pm_grafx: u32,
+    ver: u32,   // rpivid_asb BRDG_VERSION — the "is this window the ASB?" falsifier
+    cpr: u32,   // rpivid_asb CPR_CTRL
+    m: u32,     // rpivid_asb ASB_V3D_M_CTRL — the master bridge, the one a PTB write would cross
+    s: u32,     // rpivid_asb ASB_V3D_S_CTRL
+    lver: u32,  // legacy asb BRDG_VERSION — the routing falsifier
+    lm: u32,    // legacy asb ASB_V3D_M_CTRL
+    ls: u32,    // legacy asb ASB_V3D_S_CTRL
+    mmuc: u32,  // V3D_MMUC_CONTROL — the MMU cache enable, written by us and never read back
+}
+
+impl V3d69Fabric {
+    /// Released, per `bcm2835_asb_control(.., enable=true)`: REQ_STOP written clear and ACK observed
+    /// clear. Both halves, because a bridge that acknowledges STOPPED while REQ_STOP reads clear is a
+    /// bridge that did not take our write.
+    fn released(w: u32) -> bool {
+        w & ASB_REQ_STOP == 0 && w & ASB_ACK == 0
+    }
+    fn m_released(&self) -> bool {
+        Self::released(self.m)
+    }
+    fn s_released(&self) -> bool {
+        Self::released(self.s)
+    }
+    /// A plausible ASB identity word: not all-zero (absent/unpowered) and not all-ones (open bus).
+    fn window_live(v: u32) -> bool {
+        v != 0x0000_0000 && v != 0xFFFF_FFFF && v != 0xDEAD_BEEF
+    }
+    /// The whole fabric as mainline would leave it after `bcm2835_asb_power_on` + the MMU set.
+    fn clean(&self) -> bool {
+        self.pm_grafx & PM_V3DRSTN != 0
+            && self.m_released()
+            && self.s_released()
+            && self.mmuc & V3D_MMUC_CONTROL_ENABLE != 0
+    }
+    /// Everything that could differ between two stations, folded to one word for the differential.
+    fn signature(&self) -> u32 {
+        self.pm_grafx ^ self.m.rotate_left(8) ^ self.s.rotate_left(16) ^ self.mmuc.rotate_left(24)
+    }
+}
+
+/// Take one fabric station. READ ONLY — nine MMIO loads, every one of them inside the Device-nGnRnE
+/// window boot.rs already maps, and every one of them poison-tolerant (an absent block reads 0 or
+/// 0xffffffff and the emitter says so rather than decoding it).
+fn v3d69_read_fabric() -> V3d69Fabric {
+    V3d69Fabric {
+        pm_grafx: mmio_read(PM_BASE, PM_GRAFX),
+        ver: mmio_read(RPIVID_ASB_BASE, ASB_BRDG_VERSION),
+        cpr: mmio_read(RPIVID_ASB_BASE, ASB_CPR_CTRL),
+        m: mmio_read(RPIVID_ASB_BASE, ASB_V3D_M_CTRL),
+        s: mmio_read(RPIVID_ASB_BASE, ASB_V3D_S_CTRL),
+        lver: mmio_read(LEGACY_ASB_BASE, ASB_BRDG_VERSION),
+        lm: mmio_read(LEGACY_ASB_BASE, ASB_V3D_M_CTRL),
+        ls: mmio_read(LEGACY_ASB_BASE, ASB_V3D_S_CTRL),
+        mmuc: mmio_read(V3D_HUB_BASE, V3D_MMUC_CONTROL),
+    }
+}
+
+/// Emit one `[v3d69] fabric` station: the raw words first, the decodes second, the caveats attached to
+/// the fields that carry them.
+fn v3d69_emit_fabric(station: &str, f: &V3d69Fabric) {
+    serial_println!(
+        ":: V3D: [v3d69] fabric ({}) — PM_GRAFX={:#010x} V3DRSTN(bit6, CORROBORATED)={} | UNCERTAIN map: POWUP={} POWOK={} ISFUNC={} MRDONE={} MEMREP={} ISPOW={} ENAB={} (mainline's BCM2711 path never writes these — bcm2835_power_power_on returns early when rpivid_asb is present — so they are the FIRMWARE's, and the expectation is 'start4.elf left them sane', not 'Linux programmed them') ::",
+        station,
+        f.pm_grafx,
+        (f.pm_grafx & PM_V3DRSTN != 0) as u32,
+        (f.pm_grafx & PM_POWUP != 0) as u32,
+        (f.pm_grafx & PM_POWOK != 0) as u32,
+        (f.pm_grafx & PM_ISFUNC != 0) as u32,
+        (f.pm_grafx & PM_MRDONE != 0) as u32,
+        (f.pm_grafx & PM_MEMREP != 0) as u32,
+        (f.pm_grafx & PM_ISPOW != 0) as u32,
+        (f.pm_grafx & PM_ENAB != 0) as u32,
+    );
+    serial_println!(
+        ":: V3D: [v3d69] fabric ({}) rpivid_asb@{:#x} — BRDG_VERSION={:#010x} (window live={}) CPR_CTRL={:#010x} | M_CTRL={:#010x} REQ_STOP={} ACK={} EMPTY={} FULL={} released={} | S_CTRL={:#010x} REQ_STOP={} ACK={} EMPTY={} FULL={} released={} — the MASTER word is the one a PTB write would have to cross ::",
+        station,
+        RPIVID_ASB_BASE,
+        f.ver,
+        V3d69Fabric::window_live(f.ver) as u32,
+        f.cpr,
+        f.m,
+        (f.m & ASB_REQ_STOP != 0) as u32,
+        (f.m & ASB_ACK != 0) as u32,
+        (f.m & ASB_EMPTY != 0) as u32,
+        (f.m & ASB_FULL != 0) as u32,
+        f.m_released() as u32,
+        f.s,
+        (f.s & ASB_REQ_STOP != 0) as u32,
+        (f.s & ASB_ACK != 0) as u32,
+        (f.s & ASB_EMPTY != 0) as u32,
+        (f.s & ASB_FULL != 0) as u32,
+        f.s_released() as u32,
+    );
+    serial_println!(
+        ":: V3D: [v3d69] fabric ({}) legacy asb@{:#x} (UNCERTAIN base, from the bcm2711 `pm` node's second reg range) — BRDG_VERSION={:#010x} (window live={}) M_CTRL={:#010x} S_CTRL={:#010x} — ROUTING falsifier only: bcm2835_asb_control re-routes ASB_V3D_{{S,M}}_CTRL to rpivid_asb whenever that block is present, which on BCM2711 is always, so these two words should be some OTHER peripheral's bridges or dead. If the legacy words look like released V3D bridges and the rpivid ones do not, this driver has been releasing the wrong window since PI-V3D-3 ::",
+        station,
+        LEGACY_ASB_BASE,
+        f.lver,
+        V3d69Fabric::window_live(f.lver) as u32,
+        f.lm,
+        f.ls,
+    );
+    serial_println!(
+        ":: V3D: [v3d69] fabric ({}) V3D_MMUC_CONTROL={:#010x} ENABLE={} FLUSH={} — mainline v3d_mmu_flush_all writes FLUSH|ENABLE and this driver mirrors it in program_mmu; this is the FIRST read-back. ENABLE=0 here means the MMU cache never latched on and every V3D memory access this campaign has measured ran with it off ::",
+        station,
+        f.mmuc,
+        (f.mmuc & V3D_MMUC_CONTROL_ENABLE != 0) as u32,
+        (f.mmuc & V3D_MMUC_CONTROL_FLUSH != 0) as u32,
+    );
+}
+
+/// PI-V3D-69 — the fabric probe. Two read-only stations either side of one banked `Empty` control rung,
+/// then the verdict; and, on its own knob and only on the one outcome branch that makes it meaningful,
+/// the mainline re-enable + re-kick.
+///
+/// Placed at the very tail of `empty_frame_bisection`, after `[v3d68]` — the same reasoning every
+/// battery before it carries (it must not perturb a reading another verdict is banked on), plus its
+/// own: the pre-station is meant to read the fabric as it stood through the WHOLE diagnostic battery,
+/// so it wants every other rung already behind it.
+fn v3d69_fabric_probe() {
+    if !V3D69_FABRIC {
+        return;
+    }
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down => {
+            serial_println!(
+                ":: V3D: [v3d69] SKIPPED — hub IDENT0 reads 0x00000000 (block absent/unpowered; the QEMU raspi4b signature). The PM/ASB fabric was NOT read this boot and NO verdict is implied — in particular, QEMU models neither the rpivid_asb block nor V3D, so a fabric reading here would be a reading of nothing ::"
+            );
+            return;
+        }
+        V3dPresence::Poison(w) => {
+            serial_println!(
+                ":: V3D: [v3d69] SKIPPED — hub IDENT0 reads poison {:#010x} (open-bus / firmware fill, not a live register). The PM/ASB fabric was NOT read this boot and NO verdict is implied ::",
+                w
+            );
+            return;
+        }
+    }
+    serial_println!(
+        ":: V3D: [v3d69] initdiff — nine arcs probed the state this driver puts in front of the block and [v3d68] excluded the last of it. This one reads the FABRIC BETWEEN the SoC and the block instead: PM_GRAFX, both V3D async-AXI-bridge control words in BOTH candidate ASB blocks, and the MMU-cache enable — every one of them written at some point by this driver or by firmware, and not one of them ever READ BACK as a verdict. Two read-only stations either side of one banked Empty control rung. The bridge hypothesis (a master bridge that passes register reads but not memory writes) is ranked LAST and not first, because a CT1 render frame retires and lands pixels through the same single master port this same boot — see the [v3d58] xengine line. These stations settle that branch on the wire instead of on inference ::"
+    );
+
+    let pre = v3d69_read_fabric();
+    v3d69_emit_fabric("pre-rung ", &pre);
+
+    // One banked Empty control rung, so the post-station reads the fabric as a bin kick left it. This
+    // is the [v3d48] rung verbatim (same content, same CL offset, same cache maintenance, same ~0.5 s
+    // FLDONE backstop) — the arc adds no new engine behaviour, only two stations around it.
+    let rung = submit_bisect_rung_tagged("v3d69", "fabric-control", BinContent::Empty, OFF_SHADREC);
+    let _ = rung;
+
+    let post = v3d69_read_fabric();
+    v3d69_emit_fabric("post-rung", &post);
+
+    let moved = pre.signature() != post.signature();
+    let m_fifo_moved = (pre.m & (ASB_EMPTY | ASB_FULL)) != (post.m & (ASB_EMPTY | ASB_FULL));
+    let window_ok = V3d69Fabric::window_live(pre.ver);
+    let verdict = if !window_ok {
+        "the rpivid_asb BRDG_VERSION word is NOT a plausible identity (all-zero, all-ones or poison), so this arc cannot cite ANY bridge reading: the base this driver has been writing since PI-V3D-3 may not be the ASB at all. That is itself the finding — the release writes went somewhere unverified. Nothing here excludes or confirms the bridge hypothesis; the next step is to establish the block base from the DT, not to run another rung"
+    } else if !pre.m_released() || !pre.s_released() {
+        "A V3D ASB BRIDGE IS NOT RELEASED. The block answers every register read and latches every job while a bridge that its memory traffic must cross reads STOPPED. This contradicts the render evidence ([v3d58] xengine: a CT1 frame retired and landed CPU-verified pixels through what this campaign believed was the same single master port) — so either the two engines do NOT share a master, or one of these two readings is not what it appears. Do not act on this line alone: re-read it against the xengine verdict and the legacy-block routing column above, and only then arm UNAOS_V3D69_REENABLE"
+    } else if pre.mmuc & V3D_MMUC_CONTROL_ENABLE == 0 {
+        "both bridges are released and PM_GRAFX has V3DRSTN deasserted, but V3D_MMUC_CONTROL.ENABLE READS BACK CLEAR — the MMU cache this driver believed it enabled in program_mmu never latched. That is a genuine initialisation hole and the first one this arc has found: mainline's v3d_mmu_flush_all leaves ENABLE set and every V3D memory access it makes runs behind it. It does NOT by itself explain a bin-exclusive wall (the render path crosses the same MMU), so it is a defect to fix and then re-measure, not a verdict on the binner"
+    } else {
+        "THE FABRIC IS CLEAN. PM_GRAFX has V3DRSTN deasserted, both V3D async AXI bridges read released (REQ_STOP=0, ACK=0) in the rpivid_asb block mainline routes them to, and the MMU cache reads ENABLEd. The bridge hypothesis — a master AXI path that passes register reads but not PTB memory writes — is now CLOSED ON A MEASUREMENT rather than on the render-path inference, and PM/ASB power sequencing joins encoding, submission, cache mode, reset, MMU, clock, frame geometry and frame content on the excluded list. The initialisation this campaign has not found is not in this layer"
+    };
+    serial_println!(
+        ":: V3D: [v3d69] initdiff verdict — rpivid window live={} | PM_GRAFX V3DRSTN={} | M released={} S released={} | MMUC ENABLE={} | fabric changed across the bin rung={} (master FIFO EMPTY/FULL changed={}) | fabric clean vs mainline={} — {} ::",
+        window_ok as u32,
+        (pre.pm_grafx & PM_V3DRSTN != 0) as u32,
+        pre.m_released() as u32,
+        pre.s_released() as u32,
+        (pre.mmuc & V3D_MMUC_CONTROL_ENABLE != 0) as u32,
+        moved as u32,
+        m_fifo_moved as u32,
+        pre.clean() as u32,
+        verdict,
+    );
+    serial_println!(
+        ":: V3D: [v3d69] initdiff scope — the stations above are READS. Nothing in this arc wrote PM_GRAFX, either ASB block, MMUC_CONTROL, BXCF, MISCCFG or CTRSTA; the one rung is the existing [v3d48] Empty kick unchanged; the real M4 draw is untouched. The FIFO (EMPTY/FULL) columns are a two-sample read either side of a ~0.5 s wait, NOT a sampler: 'EMPTY across both stations' is consistent with a bridge that was busy and drained, and is evidence of NOTHING on its own. Only the REQ_STOP/ACK columns carry a verdict ::"
+    );
+
+    v3d69_reenable_rung(&pre);
+}
+
+/// PI-V3D-69 — the WRITE half, on its own `UNAOS_V3D69_REENABLE` knob. Runs the mainline enable
+/// sequence (`enable_pm_asb`: deassert PM_V3DRSTN, then release the master and the slave bridge, each
+/// with the PM password and a bounded ACK wait) and re-kicks the `[v3d69]` control rung, so the retire
+/// verdict either side of the re-enable is a same-boot differential.
+///
+/// It DECLINES to run when the read half found the fabric already clean. That is not timidity: writing
+/// a release to an already-released bridge is a perturbation of a live block that can only add a
+/// confound to every reading banked after it, and the outcome would be uninterpretable either way.
+fn v3d69_reenable_rung(pre: &V3d69Fabric) {
+    if !V3D69_REENABLE {
+        return;
+    }
+    if pre.clean() {
+        serial_println!(
+            ":: V3D: [v3d69] reenable DECLINED — UNAOS_V3D69_REENABLE is armed, but the read half found the fabric CLEAN (V3DRSTN deasserted, both bridges released, MMUC enabled). Re-running the enable sequence on an already-enabled fabric writes PM_GRAFX and both bridge words for nothing and would leave every later reading on this boot standing behind an unnecessary perturbation. The rung is gated on the finding, not on the knob; nothing was written ::"
+        );
+        return;
+    }
+    serial_println!(
+        ":: V3D: [v3d69] reenable ARMED — the read half found the fabric NOT clean, so the mainline enable sequence (bcm2835_asb_power_on's ON half: set PM_V3DRSTN with the PM password, then clear ASB_REQ_STOP on the MASTER and then the SLAVE, each with a bounded ACK-clear wait) runs now and the [v3d69] control rung is re-kicked behind it. Read the two rungs as a differential: a retire ONLY on the second means the fabric was the wall ::"
+    );
+    enable_pm_asb();
+    settle_ms(2);
+    let after = v3d69_read_fabric();
+    v3d69_emit_fabric("re-enabled", &after);
+    let _ = submit_bisect_rung_tagged(
+        "v3d69",
+        "fabric-control-after-reenable",
+        BinContent::Empty,
+        OFF_SHADREC,
+    );
+    let fixed = after.clean();
+    serial_println!(
+        ":: V3D: [v3d69] reenable verdict — fabric clean AFTER the sequence={} (M released {}->{}, S released {}->{}, V3DRSTN {}->{}) — {} ::",
+        fixed as u32,
+        pre.m_released() as u32,
+        after.m_released() as u32,
+        pre.s_released() as u32,
+        after.s_released() as u32,
+        (pre.pm_grafx & PM_V3DRSTN != 0) as u32,
+        (after.pm_grafx & PM_V3DRSTN != 0) as u32,
+        if fixed {
+            "the enable sequence MOVED the fabric into the mainline state. Read the two [v3d69] fabric-control rungs above: if the second retired and the first did not, the wall was the un-released fabric and this is the end of the campaign's bin question; if neither retired, the fabric was genuinely not the wall and this arc has excluded it by construction rather than by inference"
+        } else {
+            "the enable sequence did NOT move the fabric into the mainline state — the bridge words did not take the release even with the PM password. That is a hardware-or-address finding, not a driver one: either the block base is wrong (see the legacy-asb routing column) or the bridge is held by something outside this driver's reach. STOP and report; do not iterate on writes to a window that does not answer"
+        },
     );
 }
 
