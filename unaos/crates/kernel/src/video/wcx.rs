@@ -260,11 +260,14 @@ pub fn activate() {
         .saturating_sub(crate::ui_status::chrome_h(ph))
         .saturating_sub(oh)
         .saturating_sub(EDGE_GAP);
-    // Owner ASID 0 — this window belongs to the KERNEL, not to any address space. It is therefore
-    // outside the focus ring (`focus_ring` skips owner 0) and outside `close_owner`'s reach, which
-    // is the correct reading: no EL0 task may present, move or close it.
+    // CLICK-X86 — owner [`wm::KERNEL_OWNER_DESKTOP`]: this window belongs to the KERNEL, not to any
+    // address space, and both consequences that reading was chosen for still hold — it is outside the
+    // focus ring (`focus_ring` skips the reserved band) and outside `close_owner`'s reach (which
+    // refuses it), so no EL0 task may present, move or close it. It is now HITTABLE, which owner 0
+    // silently prevented: the demo is panel furniture in the corner and the operator will click it.
+    // A distinct band value from the console's, so a click raises exactly the window under the hand.
     let id = wm::create_at(
-        0,
+        wm::KERNEL_OWNER_DESKTOP,
         surf,
         surf_len,
         DEMO_W as u32,

@@ -1382,10 +1382,14 @@ pub fn panel_console_window_open() -> wm::WinId {
     };
     let ox = pw.saturating_sub(ow) / 2;
     let oy = ph.saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
-    // Owner ASID 0 — the console belongs to the KERNEL. That keeps it out of `focus_ring` and out of
-    // `close_owner`'s reach: no EL0 task can move, present or close the kernel's console.
+    // CLICK-X86 — owner [`wm::KERNEL_OWNER_CONSOLE`]: the console still belongs to the KERNEL, and
+    // both properties owner 0 was chosen for hold unchanged — it is out of `focus_ring` (which skips
+    // the reserved band) and out of `close_owner`'s reach (which refuses it). What changes is the
+    // third, unargued consequence of owner 0: `hit_test` skipped it, so the largest object on the
+    // panel — the console the operator types into — resolved to `None` for every pointer press and
+    // could not be clicked at all. A kernel row is furniture, and furniture is clickable.
     let id = wm::create_at(
-        0,
+        wm::KERNEL_OWNER_CONSOLE,
         surf_fb.base(),
         len,
         cw as u32,

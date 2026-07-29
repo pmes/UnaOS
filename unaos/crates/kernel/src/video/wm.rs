@@ -277,6 +277,60 @@ pub fn focus_asid() -> u64 {
     FOCUS_ASID.load(core::sync::atomic::Ordering::Acquire)
 }
 
+// ---- CLICK-X86: the KERNEL's own windows get an owner, so that they can be CLICKED ---------------
+
+/// CLICK-X86 — base of the reserved band of owner ASIDs meaning **"the kernel owns this window"**.
+/// Values in `[KERNEL_OWNER_BASE, KERNEL_OWNER_BASE + 0xFF]` are handed to [`create_at`] by the
+/// kernel's own furniture (the panel console, the desktop demo); no address space can ever hold one
+/// (a real owner is a slot or ASID with a single-digit ceiling), and the band is far below
+/// `u64::MAX`, which the input router reserves as its own drop sentinel.
+///
+/// ### Why this exists — the argument for changing owner 0
+/// The console and the demo shipped as owner `0`, and both sites justified that by two consequences:
+/// such a row is outside [`focus_ring`] (no `TAB` cycles to the kernel's console) and outside
+/// [`close_owner`]'s reach (no EL0 task can close, move or present the kernel's window). Both are
+/// correct and both are preserved here — `focus_ring` skips this band explicitly, and `close_owner`
+/// refuses it outright.
+///
+/// What owner 0 ALSO bought was never argued for anywhere: [`hit_test`] skips owner 0, so the two
+/// largest objects on the x86 panel — the console the operator types into and the demo window in the
+/// corner — resolved to `None` for every pointer press. That is not a policy, it is a side effect of
+/// encoding "the kernel owns it" and "nobody owns it" in one value. Splitting them is the whole of
+/// this change: a kernel row is now HITTABLE (it is furniture on the panel and the operator will
+/// click it) while remaining unreachable as an EL0 focus target or an EL0 teardown victim.
+///
+/// A hit on such a row is not a hit on an app, so the router turns it into a shell-focus decision
+/// rather than a delivery — see `arch::x86_64::syscall::wc_click_route`.
+pub const KERNEL_OWNER_BASE: u64 = 0xFFFF_FF00;
+
+/// CLICK-X86: the panel console's row (`fbcon::panel_console_window_open`). Distinct from
+/// [`KERNEL_OWNER_DESKTOP`] so that [`focus_changed`] raises exactly the window that was clicked —
+/// one shared kernel owner would raise all of the furniture together and make "click the demo" and
+/// "click the console" indistinguishable z-order moves.
+pub const KERNEL_OWNER_CONSOLE: u64 = KERNEL_OWNER_BASE + 1;
+
+/// CLICK-X86: the desktop demo window's row (`wcx::activate`). See [`KERNEL_OWNER_CONSOLE`].
+pub const KERNEL_OWNER_DESKTOP: u64 = KERNEL_OWNER_BASE + 2;
+
+/// CLICK-X86 — is `asid` in the reserved kernel-owner band? See [`KERNEL_OWNER_BASE`].
+///
+/// `false` for `0`, which still means "nobody owns this row" (the compat shim's own rows, and the
+/// transient witness probes that must stay unclickable).
+pub fn is_kernel_owner(asid: u64) -> bool {
+    asid >= KERNEL_OWNER_BASE && asid <= KERNEL_OWNER_BASE + 0xFF
+}
+
+/// CLICK-X86 — is a FULL-SCREEN app presenting through the compat row right now?
+///
+/// The one question [`hit_test`] deliberately cannot answer: a compat row covers the panel but carries
+/// owner ASID 0 and is excluded from the scan, so a press over a full-screen app reads as a MISS. The
+/// router's desktop arm consumes a miss, which would break such an app's clicks, so it asks this
+/// first. Cheap: one atomic load plus, at most, one table lookup.
+pub fn compat_live() -> bool {
+    let id = COMPAT_WIN.load(core::sync::atomic::Ordering::Acquire);
+    id != WIN_NONE && is_compat_row(id)
+}
+
 /// FOCUS-VIS — the shell's current z. See [`SHELL_Z`].
 pub fn shell_z() -> u32 {
     SHELL_Z.load(core::sync::atomic::Ordering::Acquire)
@@ -664,6 +718,15 @@ pub fn close(id: WinId) -> bool {
 /// (`clear_handle_row`) calls this so a dead ASID can never leave a window compositing from a
 /// surface whose address space is gone.
 pub fn close_owner(owner_asid: u64) -> usize {
+    // CLICK-X86: the kernel's own furniture is not an EL0 teardown victim. Owner 0 was unreachable
+    // here only because no teardown seam ever passes 0; the reserved band is unreachable because this
+    // refuses it outright, which is the stronger of the two statements and the one the `fbcon`/`wcx`
+    // comments actually claimed. See [`KERNEL_OWNER_BASE`]. (The owner-0 case is deliberately left
+    // alone — no caller passes it, and narrowing this guard to the new band keeps every existing
+    // caller's behaviour bit-for-bit.)
+    if is_kernel_owner(owner_asid) {
+        return 0;
+    }
     let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut n = 0;
     {
@@ -840,7 +903,11 @@ pub fn focus_ring(out: &mut [u64; MAX_WINDOWS]) -> usize {
     let mut ids = [(0u32, 0u64); MAX_WINDOWS];
     let mut m = 0usize;
     for r in t.rows.iter() {
-        if r.used && !r.compat && r.owner_asid != 0 {
+        // CLICK-X86: kernel-owned rows (the console, the desktop demo) are skipped for the same
+        // reason owner-0 rows are — they name no address space, so they are not a focus target the
+        // ring can hand the keyboard to. This is the half of the owner-0 contract the reserved band
+        // preserves exactly; what it drops is `hit_test`'s exclusion. See [`KERNEL_OWNER_BASE`].
+        if r.used && !r.compat && r.owner_asid != 0 && !is_kernel_owner(r.owner_asid) {
             ids[m] = (r.id, r.owner_asid);
             m += 1;
         }
@@ -4719,10 +4786,18 @@ pub fn hittest_selftest() {
 
     close(wa);
     close(wb);
-    // Same restore FOCUS-VIS owes and for the same reasons: drop the shell back to the bottom of the
-    // z-order, un-name the synthetic focus owner, and repaint the live set (this selftest's
-    // `focus_changed(0)` leg pushed EVERY live window below the shell and consumed its damage flag).
+    focus_reset();
+}
+
+/// CLICK-X86 — the restore every selftest that drives [`focus_changed`] with SYNTHETIC owners owes:
+/// drop the shell back to the bottom of the z-order, un-name the focus owner (it must not be left
+/// naming an address space that does not exist), and repaint the live set (a `focus_changed(0)` leg
+/// pushes every live window below the shell and consumes its damage flag).
+#[cfg(feature = "witness")]
+pub fn focus_reset() {
+    use core::sync::atomic::Ordering;
     SHELL_Z.store(0, Ordering::Release);
     FOCUS_ASID.store(0, Ordering::Release);
     repaint();
 }
+
