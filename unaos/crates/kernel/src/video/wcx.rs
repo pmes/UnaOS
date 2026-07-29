@@ -202,6 +202,28 @@ pub fn activate() {
         wm::DESKTOP_BG
     );
 
+    // WC-BBSYNC — the glass is now `DESKTOP_BG`; make the DESKTOP LAYER agree with it.
+    //
+    // The desktop layer is `screen::Screen`, and at this instant it does not exist: this seam runs
+    // from inside PCI enumeration (`kepler::init` -> `takeover_display`), and `kernel_main` does not
+    // build the GUI loop's `Screen` until far below. A `Screen` built after a takeover allocates its
+    // back store zeroed and arms FULL-PANEL damage, so the desktop layer would come up holding BLACK
+    // over a panel this fill just made `DESKTOP_BG`, with the damage to ship that black already set —
+    // the same shape as the s41 ghost-box finding, where the desktop repaints an unoccluded box from
+    // content that predates it. (On the nominal path the shell console's first full clear happens to
+    // use the same number and lands before the first present, so the black does not currently reach
+    // the glass. That is a coincidence between two independently-declared constants, not a guarantee.)
+    //
+    // So this records the colour rather than filling a buffer: the desktop layer adopts it when it is
+    // constructed and reports `[wc-x] backbuffer resync WxH` on the wire there. The colour source is
+    // `wm::DESKTOP_BG` — the same constant the fill above used — and no new one is invented. The
+    // adoption is a back-buffer (cached RAM) fill; nothing reads the panel back.
+    super::screen::adopt_desktop_bg(wm::DESKTOP_BG);
+    serial_println!(
+        "[wc-x] backbuffer resync ARMED bg={:08X} (desktop layer not yet constructed)",
+        wm::DESKTOP_BG
+    );
+
     // RULED — the console becomes a window. Opened FIRST so the demo below carries the higher z.
     // Its own witness lines (`[wc-x] console-window …`) report the geometry and the panic fallback.
     let cwin = super::fbcon::panel_console_window_open();
