@@ -2487,6 +2487,70 @@
   - **Gates:** `./arroyo check` green both arches; `./arroyo kernel8-test` **MBENCH PASS 86/86, 0
     forbidden**, `UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c` unchanged.
 
+- **VUG-PACE (a vug runs at the machine's speed, not the scheduler's)** — an **app-only** arc:
+  `crates/user-vug` + this doc, no kernel change. P73 on silicon: *"there's a delay to a vug speeding up
+  when it's the only one running"*, and *"vug still wants to go back to what it thinks its fps is supposed
+  to be even though it could run faster."*
+  - **There was never an fps target to go back to.** The audit that opened the arc looked for the ceiling
+    the symptom implies and found none, in either layer: no sleep, no frame budget, no target-rate
+    throttle in `user-vug`'s loop; and no per-process pacing under `SYS_WIN_PRESENT` — `present_surface_common`
+    checksums, counts and composites, and returns. The plateau was real; the target was not.
+  - **Root cause: the frame barrier parked on its FIRST pass.** The parent stored the release and went
+    straight into `futex_wait` on `DONE`. A park costs a wake plus a **dispatch**, and dispatch latency is
+    a property of the run queue, not of how much CPU is spare — under raspi4b's missing Group-1 timer IRQ
+    the woken parent runs when whatever holds its core yields. Two workers arrive per frame, so a healthy
+    frame paid **two** of those round trips, and the frame time was floored by them. A floor made of
+    dispatch latency does not fall when the machine empties out, and a stable floor quantises the VUGFPS
+    readout to a stable-looking number — which is exactly the "fps it thinks it's supposed to be".
+  - **And it latched.** `WORKER_SPIN_YIELDS` is what keeps a worker off the park path. Frames slow enough
+    to outlast that spin add a park/wake to each worker's release too, which lengthens the frame, which
+    keeps the workers parked. Contention could push a vug into that state and the state's own cost held it
+    there after the contention left — the "delay to speeding up", with no memory of the contention anywhere
+    in the program.
+  - **The fix: the barrier waits the way the workers already wait.** `BARRIER_SPIN_YIELDS` (64) passes of
+    `SYS_YIELD` polling `DONE`, then `futex_wait` — VUGPAUSE-2's spin-then-park, applied to the direction
+    it was not applied to. This is adaptive with **no estimate and no window**, which is why the speed-up
+    is immediate rather than earned back over an interval: cores free ⇒ `SYS_YIELD` finds nothing else to
+    run and returns at once, so the parent sees the arrival the instant the worker stores it (no wake, no
+    dispatch, no floor); contended ⇒ `SYS_YIELD` is a real handoff on every pass, so the spin cannot
+    starve a sibling and the wait degrades to cooperative rather than to a hog; genuinely long wait ⇒ the
+    spin is bounded and the park is still underneath it. The budget is re-armed **every frame**, so no
+    frame's contention is carried into the next.
+  - **Sized as a latency threshold, not a rate.** 64 against the worker's 4096, because this budget is
+    spent every frame on a healthy run rather than once per idle interval: enough passes that an arrival
+    which is merely a raster away is never parked for, few enough that a genuinely contended wait reaches
+    the park after a bounded handful of syscalls. `passes` still counts only **parked** passes, so
+    `BARRIER_PASS_BUDGET` and the `phase=barrier` retirement deadline keep their old meaning.
+  - **The idle path keeps its design, and gains the parking it was missing (P73 mouse-preempt triage,
+    Fix C).** VUGPAUSE's skip predicate required the frame's render state to ALREADY equal the last
+    presented state — `ay == last_ay && ax == last_ax && dist == last_dist` — before it would idle. That
+    was an equality test standing in for an invariant that holds by construction: while `frozen` the
+    orientation fold runs its empty arm, so `ay`/`ax`/`dist` are assigned nowhere and **cannot** change.
+    The comparison could therefore only ever fail on the TRANSITION frame — and there it failed **closed**,
+    refusing to park a vug frozen mid-motion and leaving it running the full frame loop indefinitely. The
+    wire datum is `[vugpause2] blocked=` pinned at **8192 across ~500 s of saturation**: under load the
+    fleet stopped parking at all. The three conjuncts are gone (with `last_ay`/`last_ax`/`last_dist`, which
+    nothing else read), so the FIRST frozen frame parks, unconditionally. `presented` and the overlay
+    conjunct still gate. The whole cost is that a vug frozen mid-motion holds the previous frame's surface
+    rather than the one it froze on — one tumble step, 3 brads, on a crystal that has just stopped moving.
+  - **Otherwise the idle contract is untouched:** the `SYS_INPUT_WAIT` park, the hidden-vs-paused split on
+    the fps refresh, and the workers' own spin-then-park all stand as VUGPAUSE-2 designed them. The arc
+    removes a floor from the **rendering** path and a false guard from the **entry** to the idle one.
+  - **Size — the constraint that shaped the patch.** VUGPAUSE-2 landed `.text` at exactly `0x2000` with
+    zero headroom, so both changes had to be **bought**, not added: the naive barrier alone built a
+    16664 B image, over `USER_REGION_SIZE`. Four economies, none of them behavioural — fold the spin
+    counter into the existing `passes` counter (8268 → 8220); collapse `draw_fps`'s digit-count/divisor
+    derivation from a `while k < n { div *= 10 }` loop into one ladder (8220 → 8188); evaluate
+    `detached || interactive` once per frame instead of at four sites (8196 → suppressed the Fix C
+    regrowth); and PRE-JOIN `stall_witness`'s phase name and detail label into one literal at each of the
+    three call sites, which deletes three `put` calls and two arguments (→ **8022 B**). `VUG.ELF` links at
+    **12568 B**, the same size as the pre-arc image, and the next arc inherits ~170 bytes of headroom
+    rather than none.
+  - **Gates:** `./arroyo check` green both arches; `./arroyo kernel8-test` **MBENCH PASS 86/86, 0
+    forbidden, 4758 lines scanned**, `UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c` unchanged —
+    the barrier change alters only WHEN the parent observes an arrival, never any value that reaches the
+    surface, so the deterministic 300-frame witness is untouched by construction and in fact.
+
 ### x86_64 (branch `hw-rmbp`)
 
 - **U1a** — first ring-3 round-trip (the x86 mirror of aarch64 M6a). A

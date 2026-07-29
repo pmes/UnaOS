@@ -130,11 +130,14 @@
 //
 // `hidden` then joins `paused` into `frozen`, and `frozen` replaces `paused` in TWO places, both
 // load-bearing:
-//   * THE ORIENTATION FOLD. A hidden vug holds its orientation exactly as a paused one does. This is not
-//     cosmetic: on the AUTO path the else-arm advances the idle tumble every frame, so without the fold
-//     `ay != last_ay` would hold forever and the skip predicate below could never once be true — the vug
-//     would read its own hidden bit correctly and burn the core anyway.
-//   * THE SKIP PREDICATE's first conjunct, and only the first. `presented` and the state conjuncts still
+//   * THE ORIENTATION FOLD. A hidden vug holds its orientation exactly as a paused one does. It was
+//     written to keep the skip predicate reachable (the predicate then compared this frame's orientation
+//     against the last presented one, and an advancing idle tumble made that comparison fail forever);
+//     VUG-PACE removed that comparison, so what the fold now carries is the whole of restore-as-a-resume —
+//     without it a hidden vug's crystal would drift through the hidden interval and JUMP when it came
+//     back. It is also the invariant the predicate now rests on: while frozen, the render state cannot
+//     change, because this arm is the one that runs.
+//   * THE SKIP PREDICATE's first conjunct, and only the first. `presented` and the overlay conjunct still
 //     gate, so a vug hidden before its first present still renders that frame, and the frame that
 //     restores it to the panel is an ordinary rendered frame from the preserved state — restore is a
 //     resume, not a jump.
@@ -149,6 +152,28 @@
 // nothing above is reachable. Note the auto path is untouched even once B lands, and for a stronger
 // reason than pause's: a headless QEMU run has no HID, so nothing ever TABs to the shell, so nothing is
 // ever hidden. `kernel8-test`'s 300-frame checksum proves it both before and after.
+//
+// VUG-PACE — A VUG RUNS AT THE MACHINE'S SPEED, NOT THE SCHEDULER'S. P73: "there's a delay to a vug
+// speeding up when it's the only one running", and "vug still wants to go back to what it thinks its fps is
+// supposed to be even though it could run faster". There is no fps target in this program and never has
+// been — no sleep, no frame budget, no throttle, and none in the kernel's present path either. The plateau
+// was the FRAME BARRIER parking on its first pass: a park costs a wake plus a dispatch, dispatch latency
+// belongs to the run queue rather than to the spare CPU, and two arrivals per frame put two of those round
+// trips under every healthy frame. A floor made of dispatch latency does not fall when the machine empties
+// out, and a stable floor quantises the VUGFPS readout into a number that looks like a target.
+//
+// The barrier now waits the way the workers already wait — `BARRIER_SPIN_YIELDS` passes of `SYS_YIELD`,
+// then `futex_wait` — which is adaptive with no estimate and no window, so the frame AFTER contention drops
+// is already faster. The long argument, including why the spin cannot become a hog and what it cost in
+// bytes, sits at the barrier itself.
+//
+// The same arc carries the P73 mouse-preempt triage's Fix C, on the OTHER side of the loop: the skip
+// predicate's orientation conjuncts required the render state to already match the last present before it
+// would park, which could only ever fail on the transition frame and failed CLOSED there — a vug frozen
+// mid-motion kept running the whole frame loop instead of parking (`[vugpause2] blocked=` pinned at 8192
+// across ~500 s of saturation). They are gone; the invariant they were testing holds by construction. The
+// rest of VUGPAUSE-2's idle contract is untouched: paused, hidden and idle vugs still park in
+// `SYS_INPUT_WAIT` exactly as designed.
 //
 // Barrier direction split (deliberate, robust under QEMU raspi4b's lack of a Group-1 timer IRQ — see
 // docs userspace.md M6e): ARRIVAL (worker -> parent) is a real FUTEX (workers atomically bump `done` +
@@ -262,6 +287,21 @@ fn exit(code: i32) -> ! {
 //     the pair measured 0x201c against 0x1fe8).
 //   * `wake_phase`/`phase_exit` are cheaper OUT of line, because what they share is a whole stub with its
 //     arguments already fixed. Folding the two `PHASE_EXIT` sites into `phase_exit` was the last 12 bytes.
+// VUG-PACE worked against that wall and had to BUY everything it added. Its four economies, in case a later
+// arc needs the same tricks, none of them behavioural:
+//   * FOLD A NEW LOOP COUNTER INTO AN EXISTING ONE where their meanings allow it — the barrier's spin
+//     budget rides `passes` rather than a second `spins`, worth 48 bytes (8268 -> 8220).
+//   * REPLACE A DERIVED VALUE COMPUTED BY A LOOP WITH A LADDER OF CONSTANTS — `draw_fps` derived its
+//     leading power of ten with `while k < n { div *= 10 }`; one `if/else if/else` yielding the pair is
+//     32 bytes cheaper (8220 -> 8188).
+//   * EVALUATE A REPEATED PREDICATE ONCE — `detached || interactive` was inline at four sites in the frame
+//     loop and is now the `overlay` local.
+//   * PRE-JOIN LITERALS AT THE CALL SITE. `stall_witness` assembled `phase`, a separator, `label` and `=`
+//     from two slices with four `put` calls; passing ONE joined literal (`b"barrier done="`) emits the same
+//     bytes with three fewer calls and two fewer arguments at each of three sites — 174 bytes, the largest
+//     single saving in the file (8196 -> 8022).
+// Landed at 8022, so the next arc inherits ~170 bytes rather than none. Spend them knowing the ceiling is
+// a cliff, not a slope: one byte past 0x2000 costs a whole 4 KiB page and the build.
 #[inline(always)]
 fn futex_wait(word: *const AtomicU32, val: u32) {
     unsafe { sys3(SYS_FUTEX, word as u64, 0, val as u64) };
@@ -415,6 +455,13 @@ const PHASE_EXIT: u32 = u32::MAX;
 /// vug a few milliseconds of yielding ONCE per idle interval, while too short a spin puts a park/wake pair
 /// in the middle of every rendered frame, which is the shape that failed the checksum run.
 const WORKER_SPIN_YIELDS: u32 = 4096;
+/// VUG-PACE: the PARENT's mirror of `WORKER_SPIN_YIELDS` — `SYS_YIELD` passes the frame barrier spends
+/// polling `DONE` before it parks on it. Two orders smaller than the worker's on purpose: this budget is
+/// spent EVERY frame on a healthy run rather than once per idle interval, so it is sized as a latency
+/// threshold — enough passes that an arrival which is merely a raster away is never parked for, few enough
+/// that a genuinely contended wait reaches the park after a bounded handful of syscalls. Re-armed per frame,
+/// so nothing about one frame's contention is carried into the next.
+const BARRIER_SPIN_YIELDS: u32 = 64;
 const AUTO_FRAMES: u32 = 300; // deterministic QEMU path length (used only while no input ever arrives)
 // VUGLIFE: the interactive budget. It is a real deadline ONLY in fixture mode (a foreground launch —
 // `run`, and every battery leg); a detached/desktop vug waives it once and runs unbounded.
@@ -738,8 +785,14 @@ static W_POLL: AtomicU32 = AtomicU32::new(0);
 static W_BARRIER: AtomicU32 = AtomicU32::new(0);
 static W_PRESENT: AtomicU32 = AtomicU32::new(0);
 
-/// Emit one `[uvug9] stall` line: `frame`, the phase name, and one labelled detail value.
-fn stall_witness(latch: &AtomicU32, frame: u32, phase: &[u8], label: &[u8], value: u32) {
+/// Emit one `[uvug9] stall` line: `frame`, then `tail` — the phase name and the detail label, PRE-JOINED
+/// by the caller as one literal (`b"barrier done="`), followed by the detail value.
+///
+/// VUG-PACE, size only: the emitted bytes are unchanged. The phase name and the label used to arrive as two
+/// slices and be assembled here with three more `put` calls (one for each of the separator, the label and
+/// the `=`); each of those is an argument triple plus a call at a site that runs at most once per program.
+/// Joining them at the literal moves the assembly to link time and pays for part of the barrier's spin.
+fn stall_witness(latch: &AtomicU32, frame: u32, tail: &[u8], value: u32) {
     if latch.swap(1, Ordering::Relaxed) != 0 {
         return; // already reported this phase — never flood the serial line
     }
@@ -747,10 +800,7 @@ fn stall_witness(latch: &AtomicU32, frame: u32, phase: &[u8], label: &[u8], valu
     b.put(b"[uvug9] stall frame=");
     b.put_dec(frame);
     b.put(b" phase=");
-    b.put(phase);
-    b.put(b" ");
-    b.put(label);
-    b.put(b"=");
+    b.put(tail);
     b.put_dec(value);
     b.put(b"\n");
     b.flush();
@@ -827,7 +877,16 @@ const FPS_BOX_W: i32 = 3 * 6 + 3;
 /// this function is called only when `detached || interactive`, which the foreground auto path is not.
 unsafe fn draw_fps(surf: *mut u8, fps: u32) {
     let v = fps.min(999);
-    let n: i32 = if v >= 100 { 3 } else if v >= 10 { 2 } else { 1 };
+    // VUG-PACE, size only (no behaviour change): the digit count and its leading power of ten come out of
+    // ONE ladder. The old form derived `div` from `n` with a `while k < n { div *= 10 }` loop, and this
+    // program pays for every instruction — see the SIZE note. The barrier's spin budget was bought here.
+    let (n, mut div) = if v >= 100 {
+        (3i32, 100u32)
+    } else if v >= 10 {
+        (2, 10)
+    } else {
+        (1, 1)
+    };
     let mut y = 0;
     while y < 11 {
         let row = surf.add((y as usize) * STRIDE) as *mut u32;
@@ -839,12 +898,6 @@ unsafe fn draw_fps(surf: *mut u8, fps: u32) {
         y += 1;
     }
     let mut i = 0i32;
-    let mut div = 1u32;
-    let mut k = 1i32;
-    while k < n {
-        div *= 10;
-        k += 1;
-    }
     while i < n {
         draw_digit(surf, ((v / div) % 10) as usize, 2 + i * 6, 2, FPS_C);
         div /= 10;
@@ -1103,9 +1156,6 @@ pub extern "C" fn _start() -> ! {
     // when nothing that reaches the surface has changed since.
     let mut presented = false;
     let mut presented_overlay = false;
-    let mut last_ay: i32 = 0;
-    let mut last_ax: i32 = 0;
-    let mut last_dist: Fx = 0;
     let mut idle_witnessed = false;
     // VUGMIN: a SEPARATE one-shot latch from `idle_witnessed`. The two idle reasons are different facts
     // about the system — "the operator paused this vug" and "this vug is off-screen" — and a shared latch
@@ -1119,7 +1169,7 @@ pub extern "C" fn _start() -> ! {
         if fi.saturated {
             // UVUG-9: the drain spent its whole frame budget with events still queued. Pre-fix this loop had
             // no budget to spend and simply never returned — the P54b freeze. Report once and carry on.
-            stall_witness(&W_POLL, frame, b"poll", b"drained", MAX_DRAIN_PER_FRAME);
+            stall_witness(&W_POLL, frame, b"poll drained=", MAX_DRAIN_PER_FRAME);
         }
         if !interactive && fi.any {
             // First input at any frame takes over: cancel the auto-tumble + the 300-frame cap and
@@ -1151,6 +1201,12 @@ pub extern "C" fn _start() -> ! {
             }
         }
 
+        // VUG-PACE, size only: "does this vug draw the VUGFPS overlay?" evaluated ONCE per frame. Both
+        // inputs are settled by here — `detached` before the loop, `interactive` by the block just above —
+        // and the answer is wanted at four sites below (the skip predicate, the idle refresh, the render
+        // refresh, and the record of what was presented). Four inline copies is four times the branch.
+        let overlay = detached || interactive;
+
         // --- VUGMIN: is this vug currently off-screen? ---
         // Peter's ruling, P69: "if vug is minimized it should shut off". In UnaOS the state he is naming
         // is HIDDEN — `wm::focus_changed`'s shell arm pushes every window below `SHELL_Z` and erases its
@@ -1166,10 +1222,11 @@ pub extern "C" fn _start() -> ! {
         // The state that must HOLD STILL for a frame to be skippable. `paused` is the operator's explicit
         // request; `hidden` is the same conclusion reached from the other direction — pixels nobody can
         // see are not worth computing. They are folded into one word here rather than at the predicate
-        // because BOTH halves need them, and the fold below is the half that is easy to miss: without it
-        // a hidden auto-path vug would advance its idle tumble every frame, `ay != last_ay` would hold
-        // forever, and the skip predicate could never once be true. The vug would poll a bit it correctly
-        // read and burn the core anyway.
+        // because BOTH halves need them, and the fold below is the half that is easy to miss: it is what
+        // holds the orientation still across the whole frozen interval, so restore is a resume rather than
+        // a jump — and, since VUG-PACE, it is also the INVARIANT the skip predicate rests on instead of an
+        // equality test (a frozen vug's render state cannot change, because the empty arm is the one that
+        // runs).
         let frozen = paused || hidden;
 
         // --- fold input into rotation/zoom ---
@@ -1227,19 +1284,25 @@ pub extern "C" fn _start() -> ! {
         // construction, never a park (VUGGUARD/P60), so the window stays live and `kill`-able and the
         // click that unpauses is acted on within one iteration.
         //
-        // VUGMIN widens the FIRST conjunct only, via `frozen`, and deliberately leaves the other four
-        // alone. `presented` still gates, so a vug hidden before its first present renders that first
-        // frame normally rather than idling on an empty surface; the overlay and orientation conjuncts
-        // still gate, so the frame that restores the vug to the panel is a normal rendered frame. The
-        // render state is preserved across the whole hidden interval, which is what makes restore a
-        // resume. Nothing else about the loop changes: same input drain, same yield, same liveness.
-        if frozen
-            && presented
-            && presented_overlay == (detached || interactive)
-            && ay == last_ay
-            && ax == last_ax
-            && dist == last_dist
-        {
+        // VUGMIN widened the FIRST conjunct only, via `frozen`. `presented` still gates, so a vug hidden
+        // before its first present renders that first frame normally rather than idling on an empty
+        // surface; the overlay conjunct still gates, so the frame that turns the readout on is never
+        // skipped. The render state is preserved across the whole hidden interval, which is what makes
+        // restore a resume.
+        //
+        // VUG-PACE (P73 mouse-preempt triage, Fix C) — THE ORIENTATION CONJUNCTS ARE GONE, and the reason
+        // is that they were an equality test standing in for an INVARIANT that holds by construction. While
+        // `frozen`, the fold above executes its empty arm: `ay`, `ax` and `dist` are assigned nowhere else
+        // in this loop, so a frozen vug's render state CANNOT change. Comparing it against the last
+        // presented state could therefore only ever fail on the TRANSITION frame — and when it failed there
+        // it failed CLOSED, refusing to park a vug that was frozen mid-motion and leaving it spinning the
+        // full frame loop forever, which is the opposite of what the predicate exists to do. The wire datum
+        // is `[vugpause2] blocked=` pinned at 8192 across ~500 s of saturation: under load the fleet stopped
+        // parking altogether. Dropping the three conjuncts makes the first frozen frame the one that parks,
+        // unconditionally. Its whole cost is that a vug frozen mid-motion holds the surface of the PREVIOUS
+        // frame rather than of the frame it froze on — one tumble step, 3 brads, on a crystal that has just
+        // stopped moving — and `last_ay`/`last_ax`/`last_dist` go with them, since nothing else read them.
+        if frozen && presented && presented_overlay == overlay {
             // Name the REASON this idle engaged, not merely that it did — the two are different system
             // facts and the operator debugging a vug that stopped moving needs to know which. `hidden`
             // wins the tie because it is the stronger claim: a vug that is BOTH paused and hidden is
@@ -1279,14 +1342,14 @@ pub extern "C" fn _start() -> ! {
             // exactly the "still burning CPU while minimized" that this arc exists to end, merely at one
             // hertz instead of sixty. `fps` is left holding its last value; it is stale only while
             // nobody can read it, and the first rendered frame after restore resumes the refresh.
-            if !hidden && (detached || interactive) {
+            if !hidden && overlay {
                 let v = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame);
                 if v != fps {
                     fps = v;
                     unsafe { draw_fps(surf, fps) };
                     let rc = unsafe { sys1(SYS_WIN_PRESENT, win) };
                     if rc >> 63 != 0 {
-                        stall_witness(&W_PRESENT, frame, b"present", b"rc", (rc as i64).unsigned_abs() as u32);
+                        stall_witness(&W_PRESENT, frame, b"present rc=", (rc as i64).unsigned_abs() as u32);
                     }
                 }
             }
@@ -1353,6 +1416,41 @@ pub extern "C" fn _start() -> ! {
         // drops `live` to zero and takes both bands inline for the rest of the run. Every later frame
         // then renders and presents with no wait at all. UVUG-9 printed the same witness and went
         // straight back into `futex_wait`, i.e. it diagnosed the wedge and then re-entered it.
+        //
+        // VUG-PACE — SPIN, THEN PARK, ON THIS SIDE TOO. Until this arc the parent PARKED on the very first
+        // pass: it stored the release, then immediately `futex_wait`ed on `DONE`. That single line was the
+        // program's whole frame pace, and it paced by the wrong quantity. A park costs a WAKE plus a
+        // DISPATCH, and dispatch latency is a property of the scheduler, not of how much CPU is spare: the
+        // woken parent runs when its core next picks it, which on a raspi4b with no Group-1 timer IRQ means
+        // when whatever is running there yields. Two workers arrive per frame, so a healthy frame paid TWO
+        // of those round trips, and the frame time was floored by them at a value that does not fall when
+        // the machine empties out. That is P73 exactly: "a delay to a vug speeding up when it's the only one
+        // running", and a rate that "goes back to what it thinks its fps is supposed to be" — the plateau
+        // was never a target fps (this program has never had one, no sleep, no budget, no target), it was
+        // the round-trip floor quantising the readout to a stable-looking number.
+        //
+        // It also LATCHED. `WORKER_SPIN_YIELDS` passes are what keep a worker off the park path; frames slow
+        // enough to outlast that spin put a park/wake in each worker's release too, which lengthens the
+        // frame, which keeps them parked. Contention could enter that state and its own cost would hold it
+        // there after the contention left.
+        //
+        // So the barrier waits the way the workers already wait, and for the reasons VUGPAUSE-2 gave for
+        // them: `BARRIER_SPIN_YIELDS` passes of `SYS_YIELD` first, `futex_wait` only after. This is adaptive
+        // with NO estimate and NO window, which is why the speed-up is immediate rather than earned back
+        // over some interval:
+        //   * CORES FREE — `SYS_YIELD` finds nothing else to run and returns at once, so the parent sees the
+        //     arrival the instant the worker stores it. No wake, no dispatch, no floor. The frame runs at
+        //     whatever the raster and the present cost, which is the definition of "as fast as the machine
+        //     allows", and the very NEXT frame after contention drops is already faster — there is no state
+        //     carried between frames for a stale one to live in (`spins` is re-armed here every frame).
+        //   * CONTENDED — `SYS_YIELD` is a real handoff: the parent gives its core to whoever wants it on
+        //     every pass, so spinning here cannot starve a sibling. It degrades to cooperative, not to a hog.
+        //   * TRULY LONG WAIT — the spin is bounded and the park is still underneath it, so a wedged or
+        //     retired worker costs a parked task, not a burned core. VUGPAUSE-2's idle contract is untouched:
+        //     nothing here runs on the idle/hidden/paused path, which still parks in `SYS_INPUT_WAIT`.
+        // `BARRIER_SPIN_YIELDS` is a LATENCY threshold, not a rate: short enough that a genuinely contended
+        // wait reaches the park after a bounded handful of syscalls, long enough that no healthy frame ever
+        // does. `passes` still counts only PARKED passes, so `BARRIER_PASS_BUDGET` keeps its old meaning.
         let mut passes: u32 = 0;
         while live > 0 {
             let d = DONE.load(Ordering::Acquire);
@@ -1360,8 +1458,10 @@ pub extern "C" fn _start() -> ! {
                 break;
             }
             passes = passes.wrapping_add(1);
-            if passes == BARRIER_PASS_BUDGET {
-                stall_witness(&W_BARRIER, frame, b"barrier", b"done", d);
+            if passes <= BARRIER_SPIN_YIELDS {
+                sys_yield();
+            } else if passes == BARRIER_PASS_BUDGET {
+                stall_witness(&W_BARRIER, frame, b"barrier done=", d);
                 // A worker still alive will see this and leave. VUGPAUSE-2: "will see this" now requires a
                 // WAKE as well as a store — a worker that parked cannot poll its way to the sentinel — so
                 // this is `phase_exit`, not a bare store. Without the wake, retirement would leave a live
@@ -1378,12 +1478,13 @@ pub extern "C" fn _start() -> ! {
                 join_a = false;
                 join_b = false;
                 break;
+            } else {
+                futex_wait(core::ptr::addr_of!(DONE), d);
             }
-            futex_wait(core::ptr::addr_of!(DONE), d);
         }
 
         // --- VUGFPS: measure, refresh once per second, draw (desktop/interactive only) ---
-        if detached || interactive {
+        if overlay {
             fps = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame);
             unsafe { draw_fps(surf, fps) };
         }
@@ -1395,15 +1496,12 @@ pub extern "C" fn _start() -> ! {
         // believed it was drawing. An error has bit 63 set (negative errno), exactly like an empty input poll.
         let rc = unsafe { sys1(SYS_WIN_PRESENT, win) };
         if rc >> 63 != 0 {
-            stall_witness(&W_PRESENT, frame, b"present", b"rc", (rc as i64).unsigned_abs() as u32);
+            stall_witness(&W_PRESENT, frame, b"present rc=", (rc as i64).unsigned_abs() as u32);
         }
         // VUGPAUSE: this is now the surface the panel is showing — record what produced it, so the next
         // frame can tell whether it would draw anything different.
         presented = true;
-        presented_overlay = detached || interactive;
-        last_ay = ay;
-        last_ax = ax;
-        last_dist = dist;
+        presented_overlay = overlay;
         frame += 1;
 
         // --- exit conditions ---
