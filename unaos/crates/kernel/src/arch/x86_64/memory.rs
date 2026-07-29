@@ -329,12 +329,71 @@ impl PageTable {
     }
 }
 
-/// A slot's user backing store: `U3_WINDOW_PAGES` contiguous 4 KiB frames (code + data + 2 stack).
+// =================================================================================================
+// WINX-1 — the per-process off-screen FRAMEBUFFER REGION (SYS_WIN_CREATE / SYS_WIN_PRESENT).
+//
+// The x86 twin of aarch64 `boot.rs`'s ELF-3/WC-B FB hole, with the SAME VA layout, because the layout
+// is part of the window ABI: an EL0 program reads its surface at a FIXED offset from its own window
+// base, and `crates/user-stat` / `crates/user-vug` hardcode `base + 0x5000`. Layout in the hole
+// immediately above the 16 KiB program window:
+//
+//     [+0x4000]                          the RO info page (1 page) — geometry the app reads
+//     [+0x5000 + w * FB_WIN_SLOT_SIZE]   window `w`'s RW surface slot (16 pages), w in 0..FB_WIN_SLOTS
+//
+// EL0 NEVER gets the real scan-out: it owns only these off-screen surface bytes, and the kernel
+// composites them through SYS_WIN_PRESENT. A surface is negotiated at create time and only its
+// PAGE-MULTIPLE size is actually mapped — the rest of the 64 KiB slot stays UNMAPPED (leaf 0), so
+// nothing beyond the negotiated surface is reachable from ring 3.
+//
+// THE PROGRAM WINDOW IS UNCHANGED. `U3_WINDOW_PAGES` still means exactly what it always meant — the 4
+// pages of code + data + 2 stack that `build_slot` maps eagerly and that `syscall::USER_WINDOW_PAGES`
+// mirrors. The FB region is a SEPARATE, ADDITIONAL range mapped lazily. That is deliberate: it means
+// the two `USER_WINDOW_PAGES` consumers in `syscall.rs` — `record_ring3_kill`'s expected-fault window
+// and `user_range_ok`'s syscall-buffer bound — keep their current meaning with no edit and no audit
+// hole. A fault in the FB hole is correctly NOT the expected U1b fault, and a surface VA is correctly
+// NOT a legal syscall buffer (the fail-closed direction, and what aarch64's `user_range_ok` also does).
+//
+// ONE PT STILL SUFFICES. The slot's single PT covers 512 pages = 2 MiB from `USER_BASE`, and the whole
+// region is `0x85000` = 133 pages, so the FB leaves land in `SLOT_PT[s]` alongside the program window
+// — no new table level, and `build_slot`'s PML4[2]→PDPT[0]→PD[0]→PT wiring is untouched.
+
+/// WINX-1: the read-only geometry page (1 page), at `USER_BASE + 0x4000`.
+pub const FB_INFO_SIZE: usize = 0x1000;
+/// WINX-1: window surface slots per address space. Matches the compositor's fixed window table
+/// (`video::wm::MAX_WINDOWS`) and `syscall::WIN_MAX`. STOP tripwire: like `USER_SLOTS` this cap is
+/// deliberate — do not raise it for a demo.
+pub const FB_WIN_SLOTS: usize = 8;
+/// WINX-1: VA reserved per window surface slot — 64 KiB = 16 pages = a 128x128 ARGB8888 surface.
+pub const FB_WIN_SLOT_SIZE: usize = 0x1_0000;
+/// WINX-1: the largest surface edge a window may negotiate (128 * 128 * 4 == `FB_WIN_SLOT_SIZE`).
+pub const FB_WIN_MAX_W: u32 = 128;
+pub const FB_WIN_MAX_H: u32 = 128;
+/// WINX-1: the whole FB hole reserved above the program window.
+pub const FB_REGION_SIZE: usize = FB_INFO_SIZE + FB_WIN_SLOTS * FB_WIN_SLOT_SIZE; // 0x81000
+/// WINX-1: byte offset of the info page from the slot's window base.
+pub const FB_INFO_OFF: usize = U3_WINDOW_PAGES * 4096; // 0x4000
+/// WINX-1: byte offset of window surface slot 0 from the slot's window base.
+pub const FB_SURFACE_OFF: usize = FB_INFO_OFF + FB_INFO_SIZE; // 0x5000
+
+/// WINX-1: total per-slot backing — the 16 KiB program window plus the FB hole. Mirrors aarch64's
+/// `USER_STATIC_SIZE` (0x85000). 8 slots of this is ~4.25 MiB of `.bss`, the price of a static pool
+/// with no user-memory allocator; a real allocator is the same later arc `USER_SLOTS` is waiting on.
+const USER_STATIC_SIZE: usize = U3_WINDOW_PAGES * 4096 + FB_REGION_SIZE;
+const _: () = assert!(USER_STATIC_SIZE == 0x85000);
+/// The whole region must fit the ONE per-slot PT (512 * 4 KiB = 2 MiB), or the FB leaves would spill
+/// into a page table `build_slot` never wired.
+const _: () = assert!(USER_STATIC_SIZE <= 512 * 4096);
+/// A 128x128 ARGB8888 surface must fit a window's VA slot exactly.
+const _: () = assert!((FB_WIN_MAX_W * FB_WIN_MAX_H * 4) as usize == FB_WIN_SLOT_SIZE);
+
+/// A slot's user backing store: the `U3_WINDOW_PAGES` program frames (code + data + 2 stack) followed
+/// by the FB region's frames. Page-aligned, and `USER_STATIC_SIZE` is itself a page multiple, so the
+/// array stride keeps every slot's frames page-aligned.
 #[repr(C, align(4096))]
-struct Backing([u8; U3_WINDOW_PAGES * 4096]);
+struct Backing([u8; USER_STATIC_SIZE]);
 impl Backing {
     const fn zeroed() -> Self {
-        Backing([0; U3_WINDOW_PAGES * 4096])
+        Backing([0; USER_STATIC_SIZE])
     }
 }
 
@@ -382,6 +441,117 @@ pub fn slot_backing_ptr(s: usize) -> *mut u8 {
 /// The per-process CR3 value (its PML4 physical base) for slot `s`.
 pub fn slot_cr3(s: usize) -> u64 {
     slot_pml4_ptr(s) as u64
+}
+
+// -------------------------------------------------------------------------------------------------
+// WINX-1 — FB region accessors + lazy mapping.
+//
+// The KERNEL identity pointers below are how the compositor and the info-page writer touch these
+// bytes: the backing is `.bss`, so its address IS its physical address and its kernel VA. EL0 sees the
+// same frames at `USER_BASE + offset` in its own address space, and only after the matching `map_*`
+// call. Nothing here reads or writes through the ring-3 VA.
+//
+// WHY WRITE THE PT DIRECTLY rather than reuse `map_user_page`: that helper walks from the LIVE CR3
+// (so it can only map the currently-installed slot) and asserts the leaf was empty (so it cannot be
+// idempotent). Both are wrong here — a window verb may run for a slot while a different CR3 is live,
+// and a re-create of region slot 0 must be able to re-install the same leaves. Writing `SLOT_PT[s]`
+// through its identity pointer is the same thing `build_slot` does, and reaches any slot from any
+// context.
+
+/// WINX-1: kernel identity pointer to slot `s`'s RO info page.
+pub fn slot_fb_info_ptr(s: usize) -> *mut u8 {
+    debug_assert!(s < USER_SLOTS);
+    unsafe { slot_backing_ptr(s).add(FB_INFO_OFF) }
+}
+
+/// WINX-1: kernel identity pointer to slot `s`'s window surface slot `w`.
+pub fn slot_fb_win_surface_ptr(s: usize, w: usize) -> *mut u8 {
+    debug_assert!(s < USER_SLOTS && w < FB_WIN_SLOTS);
+    unsafe { slot_backing_ptr(s).add(FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE) }
+}
+
+/// WINX-1: the EL0 VA of window surface slot `w`. The SAME VA in every process slot; the FRAME differs
+/// per process (its own backing), installed by `map_slot_fb_win`. This is the VA an EL0 program
+/// computes as `its own window base + 0x5000 + w * 0x10000`.
+pub fn fb_win_surface_va(w: usize) -> u64 {
+    debug_assert!(w < FB_WIN_SLOTS);
+    super::syscall::USER_BASE + (FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE) as u64
+}
+
+/// WINX-1: install one leaf of slot `s`'s FB region at byte offset `off` from the window base.
+/// `writable` distinguishes the RW surface pages from the RO info page. Always NX — nothing in the FB
+/// region is code, and a surface EL0 could execute would be a W^X hole by construction.
+///
+/// IDEMPOTENT by design (a re-create of the same region slot re-installs identical leaves). The `invlpg`
+/// is unconditional and cheap: mapping a previously-NOT-PRESENT leaf needs no shootdown on x86 (a
+/// non-present translation is never cached), and re-mapping an identical leaf is a no-op, so this only
+/// has to cover the case where a leaf's flags changed. Cross-core staleness is not reachable here: a
+/// slot's user leaves are only ever touched by a window verb running in that slot, or by teardown, which
+/// reloads CR3 (a full non-global flush) before the slot can be reused.
+unsafe fn map_slot_fb_page(s: usize, off: usize, writable: bool) {
+    debug_assert!(s < USER_SLOTS && off + 4096 <= USER_STATIC_SIZE);
+    let va = super::syscall::USER_BASE + off as u64;
+    let frame = slot_backing_ptr(s) as u64 + off as u64;
+    let mut flags = PTE_PRESENT | PTE_USER | PTE_NX;
+    if writable {
+        flags |= PTE_WRITABLE;
+    }
+    unsafe {
+        *slot_pt_ptr(s).add(pt_index(va)) = (frame & PTE_ADDR) | flags;
+        invlpg(va);
+    }
+}
+
+/// WINX-1: map slot `s`'s RO info page (EL0 read-only — the kernel publishes geometry there and EL0
+/// must not be able to forge it; the kernel writes through the identity alias, never this leaf).
+/// Idempotent — every window create calls it.
+pub unsafe fn map_slot_fb_info(s: usize) {
+    unsafe { map_slot_fb_page(s, FB_INFO_OFF, false) };
+}
+
+/// WINX-1: map exactly `pages` pages of slot `s`'s window surface slot `w` (EL0 RW, NX). Only the
+/// NEGOTIATED page-multiple size is mapped; the rest of the 64 KiB VA slot stays unmapped, so a program
+/// that walks past its own surface takes a contained ring-3 fault instead of reading a neighbour window.
+pub unsafe fn map_slot_fb_win(s: usize, w: usize, pages: usize) {
+    debug_assert!(w < FB_WIN_SLOTS && pages <= FB_WIN_SLOT_SIZE / 4096);
+    let base = FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE;
+    for p in 0..pages {
+        unsafe { map_slot_fb_page(s, base + p * 4096, true) };
+    }
+}
+
+/// WINX-1: the `map_slot_fb_win` inverse, for window close and slot teardown. Clears the leaves back to
+/// NOT-PRESENT and shoots them down — this direction DOES need the `invlpg`, because the mapping was
+/// live and is cached. The backing bytes are left as they are; `build_slot`'s next tenant zeroes what it
+/// maps, and an unmapped frame is unreachable from ring 3 regardless.
+pub unsafe fn unmap_slot_fb_win(s: usize, w: usize, pages: usize) {
+    debug_assert!(s < USER_SLOTS && w < FB_WIN_SLOTS && pages <= FB_WIN_SLOT_SIZE / 4096);
+    let base = FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE;
+    for p in 0..pages {
+        let va = super::syscall::USER_BASE + (base + p * 4096) as u64;
+        unsafe {
+            *slot_pt_ptr(s).add(pt_index(va)) = 0;
+            invlpg(va);
+        }
+    }
+}
+
+/// WINX-1: drop every FB leaf of slot `s` — the info page and all window surface slots — and zero the
+/// region's backing bytes. Called from slot teardown so a RECYCLED slot can never inherit the previous
+/// tenant's window pixels or a stale geometry page. `build_slot` only rebuilds the 16 KiB program
+/// window, so without this a fresh tenant's first `SYS_WIN_CREATE` would map a slot still holding the
+/// last tenant's frame.
+pub unsafe fn clear_slot_fb(s: usize) {
+    debug_assert!(s < USER_SLOTS);
+    for w in 0..FB_WIN_SLOTS {
+        unsafe { unmap_slot_fb_win(s, w, FB_WIN_SLOT_SIZE / 4096) };
+    }
+    let info_va = super::syscall::USER_BASE + FB_INFO_OFF as u64;
+    unsafe {
+        *slot_pt_ptr(s).add(pt_index(info_va)) = 0;
+        invlpg(info_va);
+        core::ptr::write_bytes(slot_backing_ptr(s).add(FB_INFO_OFF), 0, FB_REGION_SIZE);
+    }
 }
 
 /// U4x: the address-space SLOT the caller is currently running in, matched from the LIVE CR3 against
@@ -523,6 +693,13 @@ pub fn free_user_space_by_cr3(cr3: u64) {
             // Both user-task teardown paths funnel through here — normal `exit` and the KillSwitch reap
             // of a never-exiting preemptible ring-3 task — so the clear rides both.
             super::syscall::clear_handle_row(s);
+            // WINX-1 teardown-clear, on the same clear-before-release discipline as the handle row:
+            // retire this slot's compositor windows FIRST (so nothing is left composing from backing
+            // we are about to unmap), then drop the FB leaves and zero the region. Both must precede
+            // the used-flag release, or a concurrent `alloc_user_space` could claim the slot and its
+            // first `SYS_WIN_CREATE` would land on the previous tenant's live window rows.
+            super::syscall::win_close_slot(s);
+            unsafe { clear_slot_fb(s) };
             SLOT_USED[s].store(false, Ordering::Release);
             return;
         }

@@ -44,6 +44,11 @@ const SYS_EXIT: u64 = 2;
 const SYS_YIELD: u64 = 4;
 const SYS_SLEEP_MS: u64 = 5;
 const SYS_GETINFO: u64 = 7;
+// WINX-1: the WINDOW verbs, at the shared numbers the aarch64 WC-B arc minted. 31 (`SYS_WIN_MOVE`) and
+// 32 (`SYS_WIN_CLOSE`) are reserved but not implemented this arc: nothing x86 runs asks to reposition or
+// explicitly retire a window, and a window is retired correctly at slot teardown (`win_close_slot`).
+const SYS_WIN_CREATE: u64 = 29;
+const SYS_WIN_PRESENT: u64 = 30;
 // U4x: the process-model pair (same numbers as aarch64 U4). `sys_spawn` loads the fixed on-disk
 // program (`HELLO.BIN`) into a fresh slot, runs it ring-3 as a CHILD, and returns a small HANDLE
 // index into the caller's per-process handle table; `sys_wait(handle)` blocks until that child exits
@@ -2306,6 +2311,14 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         U11M2_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // WINX-1: the window fixture writes only its own data page and its own mapped surface, so a fault-kill
+    // means a window verb mapped something wrong (or failed to map it) — a real WINX-1 bug, its own
+    // counter, never the U1b `killed_unexpected` count. Not in PROCS, so the launcher times out to FAIL on
+    // `WINX_DONE`.
+    if name == "winx-app" {
+        WINX_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     // SOCK-2: the UDP round-trip fixture is register + inline-data only (its only user store is the recv
     // buffer in its own data page) and well-behaved; a kill is a real SOCK-2 bug — its own counter, never
     // the U1b `killed_unexpected` count. Not in PROCS, so the launcher times out to FAIL on `SOCK2_DONE`.
@@ -2393,6 +2406,11 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         SYS_YIELD => sys_yield(),
         SYS_SLEEP_MS => sys_sleep_ms(a0),
         SYS_GETINFO => sys_getinfo(a0),
+        // WINX-1: the window verbs. Unconditional, like the process verbs — `video::wm` is arch-neutral
+        // and always compiled; the `wc` feature only controls whether the compositor is ACTIVATED on the
+        // x86 panel, and a refused `wm::create` degrades to a surface with no compositor row.
+        SYS_WIN_CREATE => sys_win_create(a0, a1),
+        SYS_WIN_PRESENT => sys_win_present(a0),
         SYS_SPAWN => sys_spawn(),
         SYS_WAIT => sys_wait(a0),
         SYS_CAP => sys_cap(a0, a1, a2),
@@ -2615,6 +2633,14 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                     U11M2_WITNESS.store(a0 as u32, Ordering::Release);
                     U11M2_DONE.fetch_add(1, Ordering::AcqRel);
                 }
+                Some("winx-app") => {
+                    // WINX-1: the window fixture conveys its 7-bit witness bitmask as its exit STATUS
+                    // (routed by name, the same u5x/u9x/sock2 idiom — x86 has no SYS_REPORT). No planted
+                    // Proc entry (a register + inline-data fixture), so it takes the ordinary by-name
+                    // path. `WINX_DONE` gates the launcher's read.
+                    WINX_WITNESS.store(a0 as u32, Ordering::Release);
+                    WINX_DONE.fetch_add(1, Ordering::AcqRel);
+                }
                 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
                 Some("sock2-udp") => {
                     // SOCK-2: the UDP round-trip fixture conveys its 5-bit witness bitmask as its exit STATUS
@@ -2824,6 +2850,330 @@ fn sys_yield() -> i64 {
 fn sys_sleep_ms(ms: u64) -> i64 {
     crate::arch::sched::sleep_ms(ms);
     0
+}
+
+// =============================================================================================
+// WINX-1 — the WINDOW SURFACE/VERB SEAM. The x86 twin of the aarch64 WC-B block, wired to the SAME
+// arch-neutral compositor (`video::wm`), which has always been arch-neutral and until now had no x86
+// caller other than `video/wcx.rs`'s kernel-drawn demo window.
+//
+// TWO INDICES, deliberately distinct (the aarch64 distinction, and it matters for the same reasons):
+//   * the WINDOW ID (0..WIN_MAX) — GLOBAL, what EL0 passes to the verbs;
+//   * the REGION SLOT (0..FB_WIN_SLOTS) — PER-ADDRESS-SPACE, which 64 KiB surface slot of the owner's
+//     own FB region backs it. Region slots are allocated lowest-first per slot, so a process's FIRST
+//     window always lands on region slot 0 — the VA (`base + 0x5000`) that `crates/user-stat` and
+//     `crates/user-vug` compute. Collapsing the two would be wrong in both directions: a global surface
+//     index would leak one process's surface VA layout into another's address space, and a per-process
+//     window id would make ids ambiguous to the compositor.
+//
+// OWNERSHIP IS AUTHORITATIVE HERE, not in the compositor. Every verb resolves the caller's address-space
+// SLOT from the live CR3 (`memory::current_slot` — the x86 stand-in for aarch64's ASID, the same read
+// every handle gate uses) and refuses a window it does not own, errno-for-errno with the handle gates:
+// `-EBADF` for an id out of range or free (the `sys_close` shape), `-EACCES` for a live window belonging
+// to another slot (the rights-denial shape). Keeping the check on this side means the seam to `wm`
+// carries no security weight.
+//
+// WHAT THIS ARC DOES NOT BRING OVER from aarch64, deliberately: the `SYS_FB_MAP`/`SYS_FB_PRESENT` compat
+// pair (24/25) and their legacy info-page header. Those exist on aarch64 only to keep a pre-WC VUG.ELF
+// binary byte-identical; x86 has no such binary to preserve, so the compat path would be dead weight
+// carrying real complexity (`win_bind_compat`, the WIN_NONE present branch, `close_compat`). x86 gets
+// the window verbs and only the window verbs. The numbers stay reserved.
+//
+// SLOT 0 IS NOT A WINDOW OWNER. `memory::current_slot()` returns `None` for the shared kernel window
+// (the U1a/U1b/U2 tasks, which have no private address space and therefore no FB region); those callers
+// get `-EINVAL`, the same refusal aarch64 gives ASID 0.
+
+/// WINX-1: the fixed window count. Matches `memory::FB_WIN_SLOTS` and the compositor's fixed table.
+/// STOP tripwire: a deliberate cap, like `USER_SLOTS` — do not raise it for a demo.
+const WIN_MAX: usize = 8;
+const _: () = assert!(WIN_MAX == crate::arch::x86_64::memory::FB_WIN_SLOTS);
+const _: () = assert!(WIN_MAX <= crate::video::wm::MAX_WINDOWS);
+
+/// WINX-1: one window table row. `owner == WIN_OWNER_FREE` means FREE. Unlike aarch64 — where ASID 0 is
+/// the shared context and so doubles as the free marker — x86 slot 0 is a REAL address space, so the
+/// table needs an explicit sentinel rather than reusing 0.
+#[derive(Clone, Copy)]
+struct WinEntry {
+    owner: usize,
+    rslot: u8,
+    pages: u8,
+    w: u16,
+    h: u16,
+    /// The compositor's OWN id for this window (`video::wm::WinId`), or `wm::WIN_NONE` when `wm::create`
+    /// refused (table full, framebuffer not ready, geometry rejected). The two id spaces are separate:
+    /// THIS table is authoritative for allocation and ownership, while `wm` mints its own id out of its
+    /// own table. Storing wm's id here IS the binding — every later `wm` call goes through this field,
+    /// never through a coincidence of the two indices lining up (they do not: wm ids are `1..=MAX_WINDOWS`).
+    wm_id: crate::video::wm::WinId,
+}
+
+/// WINX-1: the free-row sentinel. `usize::MAX` is not a reachable slot index (`USER_SLOTS` is 8).
+const WIN_OWNER_FREE: usize = usize::MAX;
+
+impl WinEntry {
+    const FREE: WinEntry = WinEntry {
+        owner: WIN_OWNER_FREE,
+        rslot: 0,
+        pages: 0,
+        w: 0,
+        h: 0,
+        wm_id: crate::video::wm::WIN_NONE,
+    };
+}
+
+/// WINX-1: the window table. Taken IRQ-masked via `IrqGuard` on EVERY access — it is acquired from
+/// syscall context (preemptible) AND from the teardown path (`free_user_space_by_cr3` ->
+/// `win_close_slot`), the exact asymmetry `IrqGuard` exists to close. Held across the page-table
+/// maintenance in `sys_win_create` so a create and a teardown on two cores cannot interleave their
+/// leaf edits on the same slot.
+static WINDOWS: SpinMutex<[WinEntry; WIN_MAX]> = SpinMutex::new([WinEntry::FREE; WIN_MAX]);
+
+/// WINX-1: resolve the caller's address-space slot for a window verb. `-EINVAL` from the shared kernel
+/// window (no private slot => no FB region), matching aarch64's refusal for ASID 0.
+fn win_caller_slot() -> Result<usize, i64> {
+    crate::arch::x86_64::memory::current_slot().ok_or(EINVAL)
+}
+
+/// WINX-1: pages needed for a `w` x `h` ARGB8888 surface — the negotiated PAGE-MULTIPLE size. `None` if
+/// the geometry is out of range (0, or beyond `FB_WIN_MAX_W/H`), so every caller is fail-closed by shape.
+fn win_pages_for(w: u32, h: u32) -> Option<usize> {
+    use crate::arch::x86_64::memory::{FB_WIN_MAX_H, FB_WIN_MAX_W};
+    if w == 0 || h == 0 || w > FB_WIN_MAX_W || h > FB_WIN_MAX_H {
+        return None;
+    }
+    Some((w as usize) * 4 * (h as usize)).map(|b| b.div_ceil(0x1000))
+}
+
+/// WINX-1: publish window `id`'s geometry into the owner's RO info page, at the per-window entry for its
+/// region slot. Layout of the page (all u32, little-endian) — the aarch64 layout, so one arch-neutral
+/// program parses both:
+///   `[0x40 + r*0x20]` per region slot `r`: magic, win_id, w, h, stride, size, surface-offset-from-info-base.
+/// A region slot with no live window keeps a zeroed entry (magic 0), so EL0 can tell live from stale.
+/// Written through the KERNEL identity pointer — the EL0 alias of this page is read-only, which is the
+/// point: a program cannot forge the geometry the compositor was told about.
+///
+/// The `[0x00..0x1C]` legacy ELF-3 header and the `[0x20]` process-flags word are aarch64-only (they
+/// serve `SYS_FB_MAP` and `bg`-detached launches, neither of which x86 has this arc) and stay zeroed.
+fn fb_info_write_win(slot: usize, id: usize, e: &WinEntry) {
+    use crate::arch::x86_64::memory as mem;
+    let info = mem::slot_fb_info_ptr(slot) as *mut u32;
+    let off = mem::FB_INFO_SIZE + (e.rslot as usize) * mem::FB_WIN_SLOT_SIZE;
+    unsafe {
+        let p = info.add(0x40 / 4 + (e.rslot as usize) * (0x20 / 4));
+        p.add(0).write_volatile(FB_MAGIC);
+        p.add(1).write_volatile(id as u32);
+        p.add(2).write_volatile(e.w as u32);
+        p.add(3).write_volatile(e.h as u32);
+        p.add(4).write_volatile(e.w as u32 * 4);
+        p.add(5).write_volatile((e.pages as usize * 0x1000) as u32);
+        p.add(6).write_volatile(off as u32);
+    }
+}
+
+/// WINX-1: the info-page entry magic — 'UWIN' little-endian. Same value the aarch64 header uses, so a
+/// program can validate the entry it reads on either arch.
+const FB_MAGIC: u32 = 0x4E49_5755;
+
+/// WINX-1: `SYS_WIN_CREATE(w, h)` -> window id (0..WIN_MAX), or a negative errno.
+///
+/// Allocates the lowest free REGION slot for this address space (so a process's first window is region
+/// slot 0, the VA its program computes), claims a global window id, maps the info page plus EXACTLY the
+/// negotiated pages of the surface slot, binds a compositor window, and publishes the geometry.
+///
+/// Errno shapes: `-EINVAL` from the shared kernel window or a degenerate/oversized geometry; `-EMFILE`
+/// when this process already holds `FB_WIN_SLOTS` windows (the caller's own limit); `-ENFILE` when the
+/// global table is full (a system limit). The split mirrors `SYS_OPEN`'s EMFILE/ENFILE distinction.
+///
+/// The out-of-range geometry test happens on the u64 arguments BEFORE any narrowing, so a huge value
+/// cannot wrap into a legal one on the cast.
+fn sys_win_create(w: u64, h: u64) -> i64 {
+    use crate::arch::x86_64::memory as mem;
+    let slot = match win_caller_slot() {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if w > mem::FB_WIN_MAX_W as u64 || h > mem::FB_WIN_MAX_H as u64 {
+        return EINVAL;
+    }
+    let (w32, h32) = (w as u32, h as u32);
+    let pages = match win_pages_for(w32, h32) {
+        Some(p) => p,
+        None => return EINVAL,
+    };
+    let _irq = IrqGuard::mask_save();
+    let mut t = WINDOWS.lock();
+    // Lowest-free REGION slot for this address space.
+    let rslot = match (0..WIN_MAX)
+        .find(|&r| !(0..WIN_MAX).any(|i| t[i].owner == slot && t[i].rslot as usize == r))
+    {
+        Some(r) => r,
+        None => return EMFILE,
+    };
+    let id = match (0..WIN_MAX).find(|&i| t[i].owner == WIN_OWNER_FREE) {
+        Some(i) => i,
+        None => return ENFILE,
+    };
+    let mut e = WinEntry {
+        owner: slot,
+        rslot: rslot as u8,
+        pages: pages as u8,
+        w: w32 as u16,
+        h: h32 as u16,
+        wm_id: crate::video::wm::WIN_NONE,
+    };
+    // Map the info page (idempotent) and exactly the negotiated surface pages, under the table lock so
+    // no concurrent teardown can edit the same leaves mid-sequence. The surface is ZEROED first, through
+    // the kernel identity alias: a recycled REGION slot within a live address space (create, close,
+    // create) must not hand the new window the old window's pixels, and the app has not drawn yet.
+    unsafe {
+        core::ptr::write_bytes(
+            mem::slot_fb_win_surface_ptr(slot, rslot),
+            0,
+            pages * 0x1000,
+        );
+        mem::map_slot_fb_info(slot);
+        mem::map_slot_fb_win(slot, rslot, pages);
+    }
+    // Bind the compositor window BEFORE publishing the row, so the row is never visible to another core
+    // with a stale `wm_id`. The surface pointer is the kernel's identity view of the leaves just mapped,
+    // and `surf_len` is the REAL byte length of that mapped slot (`pages * 0x1000`, the page-multiple
+    // this verb negotiated) — never a recomputed `h * stride`. That distinction is wm's F1 extent
+    // contract: `w`/`h`/`stride` are EL0-influenced, `pages` comes from the mapping code, and it is
+    // `surf_len` that bounds every source read the compositor performs.
+    e.wm_id = wc_shim::create(
+        slot as u64,
+        mem::slot_fb_win_surface_ptr(slot, rslot) as usize,
+        pages * 0x1000,
+        w32,
+        h32,
+        w32 * 4,
+        id,
+    );
+    t[id] = e;
+    fb_info_write_win(slot, id, &e);
+    drop(t);
+    serial_println!(
+        ":: wc-x86: SYS_WIN_CREATE slot={} win={} rslot={} {}x{} pages={} wm_id={} ::",
+        slot, id, rslot, w32, h32, pages, e.wm_id
+    );
+    id as i64
+}
+
+/// WINX-1: `SYS_WIN_PRESENT(win)` -> 0, or a negative errno. Damage-mark + composite the caller's
+/// window. Ownership-gated (`-EBADF` unresolvable, `-EACCES` another process's live window).
+///
+/// LOCK SPAN — the ownership check, the geometry snapshot AND the present run under ONE continuous hold
+/// of the window table lock, for the reason the aarch64 twin documents: resolving the row, dropping the
+/// lock, then presenting would leave a real window in which a close+create pair on other cores recycles
+/// this id to a DIFFERENT process, and the composite would land the caller's pixels under the new
+/// owner's window identity. Holding across the composite is what makes the id the compositor is handed
+/// provably still the id we validated. The cost is a bounded blit inside an IRQ-masked spinlock, bounded
+/// by the 64 KiB surface cap.
+///
+/// LOCK ORDER: `WINDOWS` is the OUTERMOST lock; `video::wm`'s own state is acquired strictly inside it
+/// (`wc_shim::present` is called with `WINDOWS` held, never the reverse). The reverse edge does not
+/// exist by construction — neither `video/wm.rs` nor `video/screen.rs` references the syscall layer, so
+/// nothing under `wm` can call back into a window verb.
+fn sys_win_present(win: u64) -> i64 {
+    let slot = match win_caller_slot() {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if win >= WIN_MAX as u64 {
+        return EBADF;
+    }
+    let id = win as usize;
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    if t[id].owner == WIN_OWNER_FREE {
+        return EBADF;
+    }
+    if t[id].owner != slot {
+        return EACCES;
+    }
+    let e = t[id];
+    FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
+    wc_shim::present(e.wm_id);
+    drop(t);
+    0
+}
+
+/// WINX-1: total `SYS_WIN_PRESENT` calls that reached the compositor — the headless witness's proof that
+/// a present actually happened, independent of whether a panel was attached.
+static FB_PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// WINX-1: read the present counter (the fixture verdict reads it).
+pub fn fb_present_count() -> u64 {
+    FB_PRESENT_COUNT.load(Ordering::Acquire)
+}
+
+/// WINX-1: retire every window owned by address-space slot `s`. Called from
+/// `memory::free_user_space_by_cr3` before the FB leaves are dropped and the slot released, so a
+/// recycled slot inherits no live compositor row pointing into backing about to be reused.
+///
+/// The rows are collected and the table lock RELEASED before `wm::close` runs: `close` executes a drain
+/// barrier that spins on in-flight composites, and a `WINDOWS`-holding thread inside that barrier would
+/// deadlock against a `sys_win_present` waiting for `WINDOWS` on another core. This is the same
+/// lock-order rule the aarch64 twin states — `wm::close`/`close_owner` are the one pair that must NOT be
+/// called with the window table held.
+pub fn win_close_slot(s: usize) {
+    let mut doomed = [crate::video::wm::WIN_NONE; WIN_MAX];
+    {
+        let _irq = IrqGuard::mask_save();
+        let mut t = WINDOWS.lock();
+        for i in 0..WIN_MAX {
+            if t[i].owner == s {
+                doomed[i] = t[i].wm_id;
+                t[i] = WinEntry::FREE;
+            }
+        }
+    }
+    for id in doomed {
+        wc_shim::destroy(id);
+    }
+}
+
+/// WINX-1: the `video::wm` seam. Every compositor call the window verbs make goes through here, so the
+/// coupling to the arch-neutral compositor is one small, reviewable surface rather than scattered calls.
+mod wc_shim {
+    use crate::video::wm::{self, WinId, WIN_NONE};
+
+    /// `video::wm::create`. `surf_len` is the REAL mapped-slot byte length, the bound wm's F1 extent
+    /// contract requires; `id` is our own row index, used only to build the KERNEL-OWNED title — an app
+    /// never supplies its window's title, because chrome is kernel-drawn, always, so a program cannot
+    /// paint something that looks like another window's frame. Returns wm's id, or `WIN_NONE` if the
+    /// compositor refused (table full, framebuffer not ready, geometry rejected).
+    ///
+    /// A refusal is NOT an error for the syscall: the window still exists as far as this process is
+    /// concerned (its surface is mapped and its own), it simply has no compositor row, so presents are
+    /// accounted and dropped. That is the fail-closed direction — nothing extra is exposed to EL0 — and
+    /// it keeps a headless run (no panel, `wm` never ready) from failing a program that only draws.
+    pub fn create(
+        owner: u64,
+        surf: usize,
+        surf_len: usize,
+        w: u32,
+        h: u32,
+        stride: u32,
+        id: usize,
+    ) -> WinId {
+        let title = [b'e', b'l', b'0', b' ', b'w', b'i', b'n', b' ', b'0' + (id as u8 % 10)];
+        wm::create(owner, surf, surf_len, w, h, stride, &title)
+    }
+
+    /// `video::wm::present` — damage-mark and run the compositor pass. Called with `WINDOWS` held.
+    pub fn present(id: WinId) {
+        if id != WIN_NONE {
+            wm::present(id);
+        }
+    }
+
+    /// `video::wm::close`. Runs a drain barrier, so every caller invokes it with `WINDOWS` RELEASED.
+    pub fn destroy(id: WinId) {
+        if id != WIN_NONE {
+            wm::close(id);
+        }
+    }
 }
 
 // =============================================================================
@@ -4699,6 +5049,7 @@ const ENOENT: i64 = -2; // SYS_OPEN: no staged file by that name (the staged set
 const EIO: i64 = -5; // SYS_READ: a live descriptor over an unstaged source — a kernel bug; fail closed
 const EMFILE: i64 = -24; // SYS_OPEN: the caller's open-file table is full
 const EBADF: i64 = -9; // U11x SYS_CLOSE: no such handle (already closed / never opened / oob / stale-slot)
+const ENFILE: i64 = -23; // WINX-1 SYS_WIN_CREATE: the GLOBAL window table is full (vs EMFILE = this caller's)
 const EBUSY: i64 = -16; // U11x M2: O_CREAT of a name whose deferred on-disk DELETE has not drained yet
 const ENOSPC: i64 = -28; // U10: the FAT volume (or the one-page grow-staging buffer) is full
 // SOCK-3 TCP-only errnos (cfg-gated so knob-off / aarch64 emit no unused-const warning).
@@ -9742,6 +10093,253 @@ fn u8_kernel_check() -> bool {
     ok
 }
 
+// =============================================================================================
+// WINX-1: the ring-3 WINDOW fixture + its launcher. The x86 proof that an EL0 program can put a window
+// on the compositor and present into it — the first one that ever could.
+//
+// It is an INLINE, position-independent blob (the sock2/u9x/u11x idiom — NOT an on-disk ELF), because
+// x86 has no EL0 ELF loader yet: `run_user_image`/`spawn_user_image_bg` and the `run`/`bg` shell verbs
+// are `#[cfg(feature = "baremetal")]`, i.e. aarch64 Pi-4-only, and building that loader is its own arc.
+// The inline blob proves the SYSCALL SURFACE and the compositor binding, which is what this arc owes;
+// running `crates/user-stat`'s actual ELF on x86 is the next arc's deliverable, and it will exercise
+// exactly these verbs through exactly these paths.
+//
+// The fixture deliberately proves the FAIL-CLOSED direction too (bit6): a present of a window id it
+// never created is `-EBADF`. A window verb suite that only proved the happy path would not have caught
+// an ownership gate that admitted everything.
+// =============================================================================================
+
+// WINX-1 ring-3 fixture. Register + inline-data only. Runs correctly at any VA (RIP-relative). Witness
+// bits (accumulated in r12, conveyed as the exit status):
+//   bit0 SYS_GETINFO returned 0 with a non-zero pid · bit1 SYS_WIN_CREATE returned an id >= 0 ·
+//   bit2 SYS_WIN_PRESENT returned 0 · bit3 the surface read back the pattern it wrote (the mapping is
+//   really RW and really ours) · bit4 SYS_SLEEP_MS returned 0 · bit5 SYS_YIELD returned 0 ·
+//   bit6 SYS_WIN_PRESENT of a never-created id is -EBADF. ALL = 0x7F.
+// The callee-saved r12-r15 survive syscalls (the C dispatcher preserves them; the sysret tail scrubs
+// only rdi/rsi/rdx/r8-r10). The surface store is `rep stosd` — 16384 dwords of a recognizable ARGB
+// value — so a panel photograph and the kernel-side checksum see the same bytes.
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_winx_blob_start
+unaos_user_winx_blob_start:
+    .balign 16
+    .globl unaos_user_winx
+unaos_user_winx:
+    xor r12, r12                              // witness = 0
+    lea r15, [rip + unaos_user_winx_blob_start]   // r15 = this program's window base (USER_BASE)
+
+    // (0) SYS_GETINFO(&info) -> 0, into the DATA page (base + 0x1000). The RO code page would be
+    //     -EFAULT by design (copy_to_user's write range starts past page 0), so this also proves the
+    //     dest validation accepts a legitimate writable target.
+    mov rax, 7                                // SYS_GETINFO
+    lea rdi, [r15 + 0x1000]
+    syscall
+    test rax, rax
+    jnz 1f                                    // non-zero -> no bit0
+    cmp qword ptr [r15 + 0x1000], 0           // info.pid must be a real task id
+    je 1f
+    or r12, 1                                 // bit0: getinfo ok, pid non-zero
+1:
+    // (1) SYS_WIN_CREATE(128, 128) -> window id. Fail-closed: without a window there is no surface to
+    //     write, so a negative return skips straight to the exit with the bits accumulated so far.
+    mov rax, 29                               // SYS_WIN_CREATE
+    mov rdi, 128
+    mov rsi, 128
+    syscall
+    test rax, rax
+    js 8f
+    mov r13, rax                              // r13 = window id
+    or r12, 2                                 // bit1: create ok
+
+    // (2) Paint the surface. It lives at this program's own window base + 0x5000 (region slot 0 — the
+    //     first window a process creates always lands there, which is the whole point of allocating
+    //     region slots lowest-first). 128*128 = 16384 ARGB8888 pixels.
+    lea r14, [r15 + 0x5000]                   // r14 = surface VA
+    cld
+    mov rdi, r14
+    mov eax, 0xFF20C0FF                       // opaque cyan-ish — recognizable on glass and in a checksum
+    mov rcx, 16384
+    rep stosd
+
+    // (3) Read the pattern back through the same mapping: proves the leaves really are EL0-RW and
+    //     really are this process's own frames, not a stale or shared one.
+    cmp dword ptr [r14], 0xFF20C0FF
+    jne 2f
+    cmp dword ptr [r14 + 65532], 0xFF20C0FF   // last pixel of the 64 KiB surface
+    jne 2f
+    or r12, 8                                 // bit3: surface readback matches
+2:
+    // (4) SYS_WIN_PRESENT(win) -> 0.
+    mov rax, 30                               // SYS_WIN_PRESENT
+    mov rdi, r13
+    syscall
+    test rax, rax
+    jnz 3f
+    or r12, 4                                 // bit2: present ok
+3:
+    // (5) SYS_SLEEP_MS(1) -> 0. The pacing verb a windowed app calls once per frame.
+    mov rax, 5                                // SYS_SLEEP_MS
+    mov rdi, 1
+    syscall
+    test rax, rax
+    jnz 4f
+    or r12, 16                                // bit4: sleep ok
+4:
+    // (6) SYS_YIELD -> 0.
+    mov rax, 4                                // SYS_YIELD
+    syscall
+    test rax, rax
+    jnz 5f
+    or r12, 32                                // bit5: yield ok
+5:
+    // (7) A SECOND present, to prove the verb is repeatable across a sleep+yield (a one-shot present
+    //     that wedged the compositor would still have set bit2).
+    mov rax, 30                               // SYS_WIN_PRESENT
+    mov rdi, r13
+    syscall
+
+    // (8) FAIL-CLOSED: present a window id this process never created. WIN_MAX-1 = 7 is in range but
+    //     free, so the ownership gate must answer -EBADF (-9), not 0.
+    mov rax, 30                               // SYS_WIN_PRESENT
+    mov rdi, 7
+    syscall
+    cmp rax, -9                               // -EBADF
+    jne 8f
+    or r12, 64                                // bit6: unowned present refused -EBADF
+8:  mov rax, 2                                // SYS_EXIT(witness)
+    mov rdi, r12
+    syscall
+1:  jmp 1b                                    // sys_exit never returns; guard
+
+    .globl unaos_user_winx_blob_end
+unaos_user_winx_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_winx_blob_start: u8;
+    static unaos_user_winx_blob_end: u8;
+    static unaos_user_winx: u8;
+}
+
+/// WINX-1: the ring-3 fixture's witness bitmask (its exit status), routed by name in `SYS_EXIT`.
+/// `WINX_DONE` gates the launcher's read; `WINX_KILLED` counts a (bug) fault-kill of the well-behaved
+/// fixture — a non-zero value means the window verbs faulted a program that did nothing wrong.
+static WINX_WITNESS: AtomicU32 = AtomicU32::new(0);
+static WINX_DONE: AtomicU32 = AtomicU32::new(0);
+static WINX_KILLED: AtomicU32 = AtomicU32::new(0);
+/// All seven witness bits set = create + paint + readback + present + pace + fail-closed refusal.
+const WINX_WITNESS_ALL: u32 = 0x7F;
+
+/// WINX-1: the ARGB8888 value the fixture paints its whole surface with. The launcher re-reads the
+/// KERNEL identity view of the surface after the fixture exits and checks this value, which is the
+/// independent proof that ring-3's stores landed in the frames the compositor was handed — not merely
+/// that the syscalls returned 0.
+const WINX_FILL: u32 = 0xFF20_C0FF;
+
+/// Build the WINX-1 fixture slot (the `sock2_build` shape): allocate a private slot, scrub the program
+/// window, copy the blob into its RX-RO code page through the identity alias, return the run params.
+/// `None` on slot-alloc failure. The FB region is NOT pre-mapped — mapping it is `SYS_WIN_CREATE`'s job,
+/// and that it starts unmapped is part of what the fixture proves.
+fn winx_build() -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_winx_blob_start as usize;
+    let bend = &raw const unaos_user_winx_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "WINX-1 blob does not fit in a code page");
+    let off = (&raw const unaos_user_winx as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// WINX-1 launcher + verdict. Chained off `u8x_launcher` after the storage chain, BEFORE the
+/// network-gated SOCK demos, so its line lands in a stable position whether or not a NIC is present and
+/// whether or not `smolnet` is compiled.
+///
+/// Flow: one-shot; build + spawn the `winx-app` fixture; wait (bounded) for its witness exit; then run
+/// the KERNEL-SIDE checks the fixture cannot run on itself — the surface really holds the pattern (read
+/// through the kernel identity alias, not the ring-3 VA), the present counter really advanced, and the
+/// slot tore down clean. PASS iff every witness bit is set AND the kernel-side checks agree AND no kill.
+///
+/// PANEL-INDEPENDENT by construction: a headless run has no ready framebuffer, so `wm::create` refuses
+/// and `wm_id` is `WIN_NONE` — the syscalls still succeed, the surface is still mapped and painted, and
+/// the present counter still advances. The verdict is therefore about the SYSCALL SURFACE, which is what
+/// QEMU can honestly witness; the compositor binding is what `UNAOS_WC=1` on the bench proves.
+fn winx_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let presents_before = fb_present_count();
+    let Some(fix) = winx_build() else {
+        serial_println!(":: WINX-1: no free address-space slot — window demo skipped ::");
+        return;
+    };
+    serial_println!(
+        ":: WINX-1: ring-3 windows — SYS_WIN_CREATE(29)/SYS_WIN_PRESENT(30) + SYS_GETINFO(7)/SYS_SLEEP_MS(5)/SYS_YIELD(4), an EL0 program paints a compositor window ::"
+    );
+    crate::arch::sched::spawn_user_in_space("winx-app", fix.entry, fix.sp, demo_cpu, fix.cr3);
+
+    let vdeadline = crate::arch::ticks() + 10_000;
+    while WINX_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let witness = WINX_WITNESS.load(Ordering::Acquire);
+    let killed = WINX_KILLED.load(Ordering::Acquire);
+
+    // Kernel-side proof #1: the surface frames really hold what ring 3 wrote. Read through the KERNEL
+    // identity pointer — the same pointer the compositor was handed — so this is independent of whether
+    // the ring-3 mapping was ever correct in the direction the fixture tested.
+    let surf = crate::arch::memory::slot_fb_win_surface_ptr(fix.slot, 0) as *const u32;
+    let painted = unsafe { surf.read_volatile() == WINX_FILL && surf.add(16383).read_volatile() == WINX_FILL };
+
+    // Kernel-side proof #2: presents actually reached the compositor seam (two of them — the fixture
+    // presents once, sleeps/yields, and presents again).
+    let presents = fb_present_count() - presents_before;
+
+    // Teardown proof: the fixture's exit freed its slot, which retires its windows and drops its FB
+    // leaves. Poll bounded; the window table row for this slot must go free.
+    let tdeadline = crate::arch::ticks() + 2000;
+    while winx_slot_has_window(fix.slot) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = !winx_slot_has_window(fix.slot);
+
+    if witness == WINX_WITNESS_ALL && painted && presents >= 2 && cleared && killed == 0 {
+        serial_println!(
+            ":: WINX-1: ring-3 windows — create/paint/readback/present OK, sleep+yield OK, unowned present -EBADF, surface verified kernel-side, {} presents, teardown clean -> PASS ::",
+            presents
+        );
+    } else {
+        serial_println!(
+            ":: WINX-1: ring-3 windows FAIL — witness={:#x} painted={} presents={} cleared={} killed={} done={} (want {:#x}/true/>=2/true/0/1) ::",
+            witness,
+            painted,
+            presents,
+            cleared,
+            killed,
+            WINX_DONE.load(Ordering::Acquire),
+            WINX_WITNESS_ALL
+        );
+    }
+}
+
+/// WINX-1: does address-space slot `s` still own a window table row? The teardown probe.
+fn winx_slot_has_window(s: usize) -> bool {
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    (0..WIN_MAX).any(|i| t[i].owner == s)
+}
+
 // =============================================================================
 // SOCK-2: the ring-3 UDP round-trip fixture + its launcher (x86-only, knob-on). The fixture is an
 // INLINE, position-independent blob (the u9x/u11x idiom — NOT an on-disk bin) that makes the four new
@@ -11460,6 +12058,12 @@ fn u8x_launcher(demo_cpu: usize) {
     // teardown), so a slot is free for U9x. U9x gates on the block device itself, so the no-storage control
     // path stays free of U9x lines too.
     u9x_launcher(demo_cpu);
+
+    // WINX-1: chain the ring-3 WINDOW demo after the storage chain and BEFORE the network-gated SOCK
+    // demos, so its line lands in a stable position whether or not a NIC is present and whether or not
+    // `smolnet` is compiled. Unconditional (no feature gate): the window verbs are core process surface,
+    // and `video::wm` is arch-neutral and always compiled. aarch64 never reaches this launcher at all.
+    winx_launcher(demo_cpu);
 
     // SOCK-2 (knob-on, x86-only): chain the ring-3 UDP round-trip demo LAST — after the whole storage
     // chain u9x drives (so its line lands after every other demo, in both storage and no-storage modes,

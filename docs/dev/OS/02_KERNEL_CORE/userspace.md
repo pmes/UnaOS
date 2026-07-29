@@ -617,6 +617,57 @@
   deliberately preferred over the catastrophic wedge it guards. **UVUG-9 retired that trade** — see below.
   Lane: `pal.rs` (tracker + queue depth) + `drivers/xhci/mod.rs` (report-level feed) + `main.rs` (pump call +
   selftest) + this doc.
+- **WINX-1 (x86)** — the **window verbs on x86**. Everything in the WC-B bullet below describes aarch64;
+  until this arc x86 had none of it, and `video::wm` — arch-neutral since WC-A — had no ring-3 caller on
+  x86 at all (only `video/wcx.rs`'s kernel-drawn demo window). WINX-1 brings up the x86 half.
+  - **Numbers.** `SYS_YIELD = 4`, `SYS_SLEEP_MS = 5`, `SYS_GETINFO = 7`, `SYS_WIN_CREATE = 29`,
+    `SYS_WIN_PRESENT = 30` — the SHARED numbers, same verbs, same contracts as the aarch64 twins.
+    Landing them required first moving the x86 socket family off 19–27, which had silently collided with
+    aarch64's `MSEND`/`MRECV`/`THREAD_*`/`FB_*`/`FUTEX`/`INPUT_POLL`; see
+    [`08_NET/networking.md`](../08_NET/networking.md) § SOCKNUM. 31/32 (`WIN_MOVE`/`WIN_CLOSE`) are
+    reserved but unimplemented — nothing x86 runs repositions or explicitly retires a window, and a window
+    is retired correctly at slot teardown.
+  - **FB region.** `arch/x86_64/memory.rs` grows each slot's backing from the 4-page program window
+    (`0x4000`) to `0x85000`, using the SAME VA layout as aarch64 because that layout is part of the window
+    ABI: RO info page at `+0x4000`, then 8 × 64 KiB surface slots from `+0x5000`. An EL0 program computes
+    its surface as `its own window base + 0x5000`, identically on both arches. Only the negotiated
+    `ceil(w*4*h / 4096)` pages are mapped; the rest of the slot stays NOT-PRESENT, so a program cannot
+    reach past its own surface. Leaves are EL0-RW + **NX** (nothing in the FB region is code).
+  - **The program window is unchanged.** `U3_WINDOW_PAGES` / `syscall::USER_WINDOW_PAGES` still mean the
+    4 code+data+stack pages, and the FB region is a separate, lazily-mapped range. That is deliberate: the
+    two `USER_WINDOW_PAGES` consumers — `record_ring3_kill`'s expected-fault window and `user_range_ok`'s
+    syscall-buffer bound — keep their meaning with no edit. A fault in the FB hole is correctly *not* the
+    expected U1b fault, and a surface VA is correctly *not* a legal syscall buffer (the same fail-closed
+    choice aarch64's `user_range_ok` makes).
+  - **One PT still suffices.** The whole `0x85000` region is 133 pages inside the slot's single 512-entry
+    PT, so `build_slot`'s PML4[2]→PDPT[0]→PD[0]→PT wiring is untouched. Mapping writes `SLOT_PT[s]`
+    through its identity pointer rather than `map_user_page`, which walks the *live* CR3 (so it could only
+    map the currently-installed slot) and asserts the leaf empty (so it could not be idempotent).
+  - **Ownership + lock order.** Ownership is authoritative in the syscall layer, keyed by address-space
+    SLOT (`memory::current_slot`, the x86 stand-in for aarch64's ASID): `-EBADF` for an id out of range or
+    free, `-EACCES` for another process's live window. `WINDOWS` is the outermost lock and `video::wm`'s
+    state is acquired strictly inside it; `wm::close` runs a drain barrier and is therefore the one call
+    made with `WINDOWS` released (`win_close_slot` collects rows, drops the lock, then closes).
+  - **Teardown.** `free_user_space_by_cr3` retires the slot's compositor windows and drops + zeroes its FB
+    region before releasing the used-flag, so a recycled slot inherits no live window row and no previous
+    tenant's pixels.
+  - **Not brought over, deliberately:** the `SYS_FB_MAP`/`SYS_FB_PRESENT` compat pair (24/25) and the
+    legacy info-page header. They exist on aarch64 only to keep a pre-WC `VUG.ELF` binary byte-identical;
+    x86 has no such binary, so the compat path would be dead weight carrying real complexity. The numbers
+    stay reserved.
+  - **Witness.** `:: WINX-1: ring-3 windows — ... -> PASS ::`, driven by an inline ring-3 fixture
+    (`winx-app`) that getinfos, creates a 128×128 window, paints it, reads the pattern back, presents,
+    sleeps, yields, presents again, and proves a present of a never-created id is `-EBADF` (witness
+    `0x7F`). The launcher adds kernel-side checks the fixture cannot run on itself: the surface really
+    holds the pattern when read through the kernel identity alias, the present counter really advanced,
+    and the slot tore down clean. Under `UNAOS_WC=1` the compositor's own verifier independently confirms
+    it: `[wc-d] verify win=1 surf=128x128 scale=2x ... checked=65536 bad_cache=0 bad_ram=0 nonzero=65536
+    -> PASS`.
+  - **Why an inline fixture and not `STAT.ELF`.** x86 has no EL0 ELF loader: `run_user_image` /
+    `spawn_user_image_bg` and the `run`/`bg`/`jobs`/`kill` shell verbs are `#[cfg(feature = "baremetal")]`,
+    i.e. aarch64 Pi-4-only. Building that loader is the next arc; it will exercise exactly these verbs
+    through exactly these paths, at which point `crates/user-stat` runs on x86 glass.
+  - Lane: `arch/x86_64/syscall.rs` + `arch/x86_64/memory.rs` + docs. `video/wm.rs` untouched.
 - **WC-B (this arc)** — the **window surface/verb seam**: the syscall half of the window-compositor arc
   (unit WC-A owns the compositor core in `video/`). Four new verbs, `SYS_WIN_CREATE = 29`,
   `SYS_WIN_PRESENT = 30`, `SYS_WIN_MOVE = 31`, `SYS_WIN_CLOSE = 32` (28 stays reserved for the deferred
