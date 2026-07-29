@@ -819,6 +819,167 @@ fn irq_restore(daif: u64) {
     unsafe { core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack, preserves_flags)) };
 }
 
+// --- WEDGE-4 — the run-queue lock discipline, and the instruments that witness a breach. ---
+
+/// WEDGE-4 — which run-queue section (if any) the core at this index is currently inside.
+/// `0` = none; otherwise `((queue + 1) << 32) | (owner tid as u32)`.
+///
+/// Two consumers, both diagnostic: `timer_preempt` reads THIS core's word to catch a preempt landing
+/// inside a section (probe W4-A — the precondition for the wedge, which the masking below makes
+/// impossible, so a line from it means the discipline has been breached again), and `wedge4_rq_stall`
+/// scans all cores to name the holder of a queue it could not acquire (probe W4-B). Sections never
+/// nest — every acquisition below takes exactly one queue and drops it before taking another — so a
+/// single word per core is enough.
+static IN_RQ_SECTION: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+
+/// WEDGE-4 W4-B — try_lock attempts before a run-queue acquisition is declared stalled. Same order as
+/// WEDGE-1's `DRAIN_STALL_SPINS`: far beyond any legitimate hold (push/pop are O(NUM_PRIORITIES), the
+/// aging sweep O(ready tasks)), so reaching it means the holder is off-CPU and never coming back.
+const RQ_STALL_SPINS: u64 = 1 << 26;
+
+/// WEDGE-4 W4-A — cap on the preempt-in-section witness, so a breach reports itself without flooding.
+const W4A_PRINT_MAX: u32 = 8;
+static W4A_PRINTS: AtomicU32 = AtomicU32::new(0);
+
+type RqLockGuard = spin::MutexGuard<'static, RunQueue, spin::Spin>;
+
+/// WEDGE-4 — one raw byte at the UART, taking NO lock. Same seam as WEDGE-2's breadcrumbs
+/// (`crate::arch::serial::wedge2_raw_byte` is this call): a bounded volatile poll of the PL011 TX-full
+/// bit and one volatile store. `serial_println!` cannot be used here — it masks IRQ and takes the
+/// serial lock, and this instrument exists precisely for a core that is spinning IRQ-masked forever.
+#[inline(never)]
+fn w4_str(s: &str) {
+    for b in s.as_bytes() {
+        super::serial::SerialPort.write_byte(*b);
+    }
+}
+
+/// WEDGE-4 — a decimal integer through the same lock-free seam (no formatter, no allocation).
+#[inline(never)]
+fn w4_dec(v: u64) {
+    let mut buf = [0u8; 20];
+    let mut n = 0;
+    let mut v = v;
+    loop {
+        buf[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while n > 0 {
+        n -= 1;
+        super::serial::SerialPort.write_byte(buf[n]);
+    }
+}
+
+/// WEDGE-4 W4-B — the wedge namer: one line identifying the queue that could not be acquired and, if
+/// some core is inside a section on it, that section's owner. Emitted ONCE per stalled acquisition
+/// (at exactly `RQ_STALL_SPINS`); the caller then keeps spinning, so behaviour is unchanged and this
+/// only makes a silent wedge legible.
+#[inline(never)]
+fn wedge4_rq_stall(core: usize, queue: usize) {
+    w4_str("\r\n[wedge4] RQ STALL core=");
+    w4_dec(core as u64);
+    w4_str(" queue=");
+    w4_dec(queue as u64);
+    for c in 0..NUM_CPUS {
+        let s = IN_RQ_SECTION[c].load(Ordering::Acquire);
+        if s != 0 && (s >> 32) == queue as u64 + 1 {
+            w4_str(" owner_core=");
+            w4_dec(c as u64);
+            w4_str(" owner_tid=");
+            w4_dec(s & 0xffff_ffff);
+            break;
+        }
+    }
+    w4_str("\r\n");
+}
+
+/// WEDGE-4 W4-B — acquire `queue`'s lock, spinning as before, but bounded well enough to say so once.
+#[inline]
+fn rq_lock_witnessed(queue: usize, core: usize) -> RqLockGuard {
+    let mut spins: u64 = 0;
+    loop {
+        if let Some(guard) = RUN_QUEUES[queue].try_lock() {
+            return guard;
+        }
+        spins = spins.wrapping_add(1);
+        if spins == RQ_STALL_SPINS {
+            wedge4_rq_stall(core, queue);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// WEDGE-4 — the tid dispatched on `cpu` right now, or 0 outside a scheduled task. Owner attribution
+/// for the probes only; relaxed, and the `&'static`-lifetime Box is live for as long as it is
+/// `current`.
+#[inline]
+fn current_tid_relaxed(cpu: usize) -> u64 {
+    let raw = SCHED[cpu].current.load(Ordering::Relaxed) as *const Task;
+    if raw.is_null() { 0 } else { unsafe { (*raw).id } }
+}
+
+/// WEDGE-4 — a held run-queue lock together with the IRQ state it masked. See [`rq`].
+struct RqGuard {
+    daif: u64,
+    core: usize,
+    guard: Option<RqLockGuard>,
+}
+
+impl Drop for RqGuard {
+    fn drop(&mut self) {
+        self.guard = None; // release the spinlock FIRST
+        IN_RQ_SECTION[self.core].store(0, Ordering::Release);
+        irq_restore(self.daif); // then restore the caller's IRQ state (nested masks stay masked)
+    }
+}
+
+impl Deref for RqGuard {
+    type Target = RunQueue;
+    fn deref(&self) -> &RunQueue {
+        self.guard.as_ref().expect("rq: guard released while borrowed")
+    }
+}
+
+impl DerefMut for RqGuard {
+    fn deref_mut(&mut self) -> &mut RunQueue {
+        self.guard.as_mut().expect("rq: guard released while borrowed")
+    }
+}
+
+/// WEDGE-4 — take `queue`'s run-queue lock with IRQ MASKED for exactly the length of the hold. This is
+/// the only admissible way to acquire `RUN_QUEUES`.
+///
+/// `RUN_QUEUES` is a bare `spin::Mutex` with no interrupt discipline of its own, while the scheduler
+/// side (`dispatch_next`, `make_ready`, `try_steal`) takes it IRQ-masked. Before this, the spawn and
+/// placement paths took the same lock from ordinary preemptible task context: a timer preempt landing
+/// inside one of those sections froze the holder, and every masked acquisition of that queue then span
+/// forever — a 100%-busy core that dispatches nothing, panics nothing and prints nothing, cascading to
+/// its siblings through `try_steal`'s all-queues peek. Masking closes the window; nothing else changes,
+/// and no protection is weakened.
+///
+/// The hold is the whole span, so keep it as short as it already was (`RunQueue::push` may reallocate
+/// under it — pre-existing, and the heap lock stays innermost).
+#[inline]
+fn rq(queue: usize) -> RqGuard {
+    let daif = irq_save_mask();
+    let core = percpu::this_cpu().cpu_index as usize;
+    let guard = rq_lock_witnessed(queue, core);
+    debug_assert_eq!(
+        IN_RQ_SECTION[core].load(Ordering::Relaxed),
+        0,
+        "rq: run-queue sections must not nest"
+    );
+    IN_RQ_SECTION[core].store(
+        ((queue as u64 + 1) << 32) | (current_tid_relaxed(core) & 0xffff_ffff),
+        Ordering::Release,
+    );
+    RqGuard { daif, core, guard: Some(guard) }
+}
+
 // `switch_context(old_sp: *mut u64, new_sp: u64)` — AAPCS64: x0 = old_sp, x1 = new_sp. Saves DAIF +
 // the callee-saved registers (x19-x30 and d8-d15) of the current context onto the current stack,
 // stores the resulting SP through `old_sp`, loads `new_sp`, restores that context's registers +
@@ -1136,7 +1297,7 @@ fn pick_cpu(requested: usize) -> usize {
             continue;
         }
         let res = EL0_RESIDENTS[cpu].load(Ordering::Acquire);
-        let depth = RUN_QUEUES[cpu].lock().len();
+        let depth = rq(cpu).len();
         let pct = ACCT[cpu].busy_pct();
         let better = res < best_res
             || (res == best_res
@@ -1186,7 +1347,7 @@ fn spawn_inner(
         // spawned onto an explicit core is pinned there (no-migrate), so stealing never touches it.
         steal_ok: requested_cpu == CPU_AUTO,
     });
-    RUN_QUEUES[cpu].lock().push(task);
+    rq(cpu).push(task);
     // PI-SCHED-1 — placement witness. The scheduler PINS a task to the caller-chosen core and never
     // migrates it (see `Task.cpu` / `make_ready`), so the placement is decided entirely at the spawn
     // site; this line makes that decision auditable (the probe's core deliverable). Gated behind the
@@ -1310,7 +1471,7 @@ fn spawn_user_inner(
     // untouched), but the residents it parks on that core are real committed load and a later
     // `CPU_AUTO` placement must see them.
     let residents = el0_resident_enter(cpu);
-    RUN_QUEUES[cpu].lock().push(task);
+    rq(cpu).push(task);
     // PI-SCHED-1 — placement witness for EL0 tasks (the vug/midden GUI-app loads land here — the
     // "all vug load on core 2" sighting). Same `pi`-gating + rationale as `spawn_inner`. SPREAD-3 folds
     // the counted value into the existing `policy:` field (shape unchanged, still one parseable line)
@@ -1385,7 +1546,7 @@ pub fn spawn_user_thread(
     // SPREAD-3: a shared-ASID EL0 thread burns a core exactly like a slot task does — count it as a
     // committed resident on the same terms (before the enqueue; released on its `exit()`).
     let residents = el0_resident_enter(cpu);
-    RUN_QUEUES[cpu].lock().push(task);
+    rq(cpu).push(task);
     #[cfg(feature = "pi")]
     serial_println!(
         ":: SCHED: thread '{}' -> core {} (ELF-2 shared-ASID EL0 thread residents={}, no-migrate) ::",
@@ -1430,7 +1591,7 @@ pub fn other_online_cpu(not: usize) -> usize {
         if c == not || !ONLINE_MASK[c].load(Ordering::Acquire) {
             continue;
         }
-        let depth = RUN_QUEUES[c].lock().len();
+        let depth = rq(c).len();
         if depth < best_depth {
             best_depth = depth;
             best = Some(c);
@@ -1535,7 +1696,7 @@ fn make_ready(task: Box<Task>) {
     let target = task.cpu as usize;
     debug_assert!(target < NUM_CPUS, "make_ready: cpu out of range");
     task.state.store(STATE_READY, Ordering::Release);
-    RUN_QUEUES[target].lock().push(task);
+    rq(target).push(task);
     poke_cpu(target);
 }
 
@@ -2147,6 +2308,19 @@ pub fn timer_preempt() {
     // the aggregate cadence; the emit itself is change-only and single-core per window (see the fn).
     load_witness_tick();
     let cpu = percpu::this_cpu().cpu_index as usize;
+    // WEDGE-4 W4-A — the fix's own tripwire. Every run-queue section now runs IRQ-masked (`rq`), so a
+    // timer IRQ can no longer land inside one and this word must read 0 here. A line from it means the
+    // discipline has been breached again — i.e. some acquisition reached the lock without masking.
+    let section = IN_RQ_SECTION[cpu].load(Ordering::Acquire);
+    if section != 0 && W4A_PRINTS.fetch_add(1, Ordering::Relaxed) < W4A_PRINT_MAX {
+        w4_str("\r\n[wedge4] preempt-in-section core=");
+        w4_dec(cpu as u64);
+        w4_str(" queue=");
+        w4_dec((section >> 32) - 1);
+        w4_str(" tid=");
+        w4_dec(section & 0xffff_ffff);
+        w4_str("\r\n");
+    }
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     if raw.is_null() {
         return; // scheduler/idle context, or an unscheduled core (the BSP)
@@ -2189,7 +2363,7 @@ fn dispatch_next(cpu: usize) -> bool {
     // and pop share the lock; `age` carries surplus credit past `AGE_TICKS`, so a coarse cadence loses
     // nothing. Owning-CPU-only counters (Relaxed). See `AGE_TICKS` for why the clock is passes, not ticks.
     let next = {
-        let mut q = RUN_QUEUES[cpu].lock();
+        let mut q = rq(cpu);
         let passes = SCHED[cpu].age_passes.fetch_add(1, Ordering::Relaxed) + 1;
         let elapsed = passes - SCHED[cpu].age_last_sweep.load(Ordering::Relaxed);
         if elapsed >= AGING_INTERVAL {
@@ -2287,7 +2461,7 @@ fn dispatch_next(cpu: usize) -> bool {
             // which also re-zeroes its aging clock — a task only ages while it sits WAITING.
             debug_assert_eq!(park, PARK_NONE, "non-blocked task carried a park action");
             task.state.store(STATE_READY, Ordering::Release);
-            RUN_QUEUES[cpu].lock().push(task);
+            rq(cpu).push(task);
         }
     }
     true
@@ -2436,7 +2610,7 @@ fn try_steal(cpu: usize) -> bool {
         if c == cpu || !ONLINE_MASK[c].load(Ordering::Acquire) {
             continue;
         }
-        let depth = RUN_QUEUES[c].lock().len();
+        let depth = rq(c).len();
         if depth > best_depth {
             best_depth = depth;
             victim = Some(c);
@@ -2448,7 +2622,7 @@ fn try_steal(cpu: usize) -> bool {
     };
     // 2. Steal under the victim's lock only (re-check depth — it may have drained since the peek).
     let stolen = {
-        let mut vq = RUN_QUEUES[v].lock();
+        let mut vq = rq(v);
         if vq.len() < STEAL_MIN_DEPTH {
             None
         } else {
@@ -2462,7 +2636,7 @@ fn try_steal(cpu: usize) -> bool {
     // 3. Re-home onto this core and enqueue (we exclusively own the Box here).
     let name = task.name;
     task.cpu = cpu as u32;
-    RUN_QUEUES[cpu].lock().push(task);
+    rq(cpu).push(task);
     // Rate-limited steal witness (pi-gated: fires on the target + kernel8-test, byte-identical elsewhere).
     #[cfg(feature = "pi")]
     if STEAL_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < STEAL_LOG_MAX {
@@ -3733,7 +3907,7 @@ fn skill_rerun_body(_: usize) {
 /// never be interrupted — it would wedge this single cooperative core. That trigger is metal-only.
 #[cfg(feature = "pi")]
 pub fn skill_kill_witness(cpu: usize) {
-    let queue_empty = || RUN_QUEUES[cpu].lock().len() == 0;
+    let queue_empty = || rq(cpu).len() == 0;
     let slots_free = || {
         (0..MAX_KILL_REQS).all(|i| KILLS[i].state.load(Ordering::Acquire) == KILL_FREE)
     };
@@ -4406,7 +4580,7 @@ fn spawn_stealable_on(name: &'static str, entry: fn(usize), arg: usize, cpu: usi
         user_ttbr0: 0,
         steal_ok: true, // the point of the fixture: movable, but staged on one core
     });
-    RUN_QUEUES[cpu].lock().push(task);
+    rq(cpu).push(task);
     poke_cpu(cpu);
 }
 
