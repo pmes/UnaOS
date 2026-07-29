@@ -1255,8 +1255,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // This GUI loop is shared, but the router is x86-only — aarch64 routes EL0 input from its
             // own path in `arch/aarch64` and has no `arch::x86_64` module to name, so the call is
             // split rather than gated inside the callee.
+            //
+            // CLICK-X86 — and a pointer BUTTON is ADDRESSED before it is DELIVERED. `el0_input_route`
+            // routes by FOCUS: whatever it is handed goes to whoever holds the keyboard. That is right
+            // for a keystroke and wrong for a click, which belongs to the window UNDER THE CURSOR, so
+            // `wc_click_route` runs first and hit-tests the press. It answers `true` only when it has
+            // CONSUMED the event (a press on kernel furniture or on the bare desktop, and the release
+            // that follows one); otherwise the ordinary path continues underneath it, addressed to
+            // whatever focus the router just left in place — which on a raise is the newly focused
+            // window, so `el0_input_route` pushes the press into the ring of the window that was
+            // clicked. Non-`Button` events are returned untouched, so keys and motion are unaffected.
+            //
+            // `Event::Unknown` for a consumed click, and never `Event::None`: `None` is this loop's
+            // end-of-queue sentinel, so returning it would truncate the drain at the first click.
             #[cfg(target_arch = "x86_64")]
-            let ev = unaos_kernel::arch::x86_64::syscall::el0_input_route(pal.poll_event());
+            let ev = {
+                let raw = pal.poll_event();
+                if unaos_kernel::arch::x86_64::syscall::wc_click_route(raw) {
+                    unaos_kernel::pal::Event::Unknown
+                } else {
+                    unaos_kernel::arch::x86_64::syscall::el0_input_route(raw)
+                }
+            };
             #[cfg(not(target_arch = "x86_64"))]
             let ev = pal.poll_event();
             match ev {
@@ -1327,6 +1347,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                         pal.height() as i32,
                     );
                     unaos_kernel::pal::cursor::draw_over(&mut pal);
+                }
+                // CLICK-X86 — the PRESS arm. Before this arc the drain's `match` ended `_ => {}` with
+                // no `Event::Button` arm at all: HID pushed presses onto the queue and this loop
+                // popped and DISCARDED them, which is the whole of the "clicks get eaten" complaint on
+                // this arch and the reason the "out-of-focus click stops my app" complaint could never
+                // have had a mechanism either.
+                //
+                // Reaching this arm now means the press was NOT consumed by `wc_click_route` above and
+                // NOT taken by an EL0 ring — i.e. it is the SHELL's click. The shell on x86 has no
+                // click model of its own yet (aarch64's `click1_dispatch` is that arch's scheduled
+                // render service, which does not run here), so there is nothing to dispatch it to and
+                // the arm is deliberately empty of policy. What it must do is count as activity, so
+                // the loop presents this pass and does not `hlt` on a click; and the press is already
+                // on the wire from the router's `[clickroute]` line, which is where the disposition is
+                // recorded. When x86 grows a shell click model this is the one place it attaches.
+                //
+                // x86-gated: this loop is shared, and on aarch64 a Button still falls through the
+                // catch-all exactly as it did (that arch routes clicks from its own drains), so this
+                // arc leaves that target's behaviour untouched.
+                #[cfg(target_arch = "x86_64")]
+                unaos_kernel::pal::Event::Button(_mask) => {
+                    had_event = true;
                 }
                 // Timer / Unknown: nothing to do.
                 _ => {}

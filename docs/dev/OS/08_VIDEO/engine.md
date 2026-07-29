@@ -4596,28 +4596,161 @@ callers are missing. When the press path arrives, this line is what distinguishe
 window" from "never resolved one" — which is the discrimination the operator's two standing
 complaints ("clicks eaten" vs. "out-of-focus clicks stop the focused app") have never had on x86.
 
-### The prerequisite chain, in order
+### The prerequisite chain — CLOSED (CLICK-X86 r2, 2026-07-29)
 
-A future x86 click arc needs these, and needs them in this order:
+The four items the audit above listed as unwritten are written. Recorded in the audit's own order,
+each with what actually landed:
 
-1. **A press dispatch site.** `main.rs`'s x86 event drain needs an `Event::Button` arm. This is the
-   blocking item and it is **outside the video lane** — one arm beside the existing `Mouse` /
-   `MouseAbsolute` arms in `kernel_main`'s inner drain loop (the `_ => {}` at the end of that `match`
-   is where the press dies today). Nothing downstream can be exercised until it exists, which is why
-   this arc landed the instrument and not a router: a router with no call site is mechanism nobody
-   can see, and that is the thing CLICK-PLAIN was written against.
-2. **Focusable windows.** `wcx.rs`/`fbcon.rs` create their rows with owner ASID 0, which `hit_test`
-   and `focus_ring` both skip. Either those rows get real owners, or x86 click routing addresses only
-   `SYS_WIN_CREATE` windows and the console keeps every other click.
-3. **`SYS_INPUT_POLL` (27) and per-address-space input rings** — the x86 twin of the aarch64 EL0
-   input seam. Only then does "the press is delivered" name anything.
-4. **The router itself**, in `arch/x86_64/syscall.rs`, written to the CLICK-PLAIN contract: press
-   hit-tests the pointer; a hit on a different window raises it through `wm::focus_changed` **and**
-   the press still delivers; wake edges run BEFORE the push; the release follows the recorded press
-   target so a press/release pair is never split and no click is fabricated in an app that did not
-   see the press.
+1. **A press dispatch site — done.** `main.rs`'s x86 drain has an `Event::Button` arm, and the routing
+   decision runs one step earlier still: the drain calls
+   `arch::x86_64::syscall::wc_click_route(raw)` *before* `el0_input_route`, because `el0_input_route`
+   routes by FOCUS and a click belongs to the window under the cursor. The arm is `#[cfg]`-gated to
+   x86 (the loop is shared with aarch64-UEFI, which routes clicks from its own drains).
+2. **Focusable windows — done, via a reserved kernel-owner band.** See the next subsection; this was
+   the item that needed an argument rather than an edit.
+3. **`SYS_INPUT_POLL` (27) and per-address-space input rings — already done** by WINX-7, which landed
+   while the audit was being written. "The press is delivered" now names something.
+4. **The router — done**, in `arch/x86_64/syscall.rs`, built to CLICK-PLAIN directly. x86 has never
+   passed through the CLICK-SWALLOW shape and will not.
 
-### Gate results (CLICK-X86, 2026-07-29, QEMU)
+### Window ownership: `KERNEL_OWNER_*`, a band that is hittable but not focusable
+
+The audit's finding 5 stated the blocker: every persistent x86 window carries owner ASID 0, and
+`hit_test` skips owner 0, so a wired hit-test resolves `None` for the console and the desktop demo —
+the two largest objects on the panel and the ones the operator will actually click.
+
+`fbcon.rs`'s owner-0 choice was deliberate and documented, so changing it needed an argument. The
+argument is that the comment justifies owner 0 by exactly **two** consequences, and neither is the one
+being changed:
+
+* the row is outside `focus_ring` — no keyboard-focus cycle can hand the keyboard to the kernel's
+  console; and
+* the row is outside `close_owner`'s reach — no EL0 task can move, present or close it.
+
+Being **unhittable** was never argued for anywhere. It is a side effect of encoding two different
+facts — "the kernel owns this" and "nobody owns this" — in one value. So the fix splits them rather
+than overturning the decision:
+
+* `wm::KERNEL_OWNER_BASE` (`0xFFFF_FF00`) names a reserved band of owner ASIDs meaning *the kernel
+  owns this window*. `KERNEL_OWNER_CONSOLE` and `KERNEL_OWNER_DESKTOP` are distinct values in it, so a
+  click raises exactly the window under the hand rather than all of the furniture together.
+* `focus_ring` skips the band explicitly — property one, preserved.
+* `close_owner` refuses the band outright — property two, preserved, and *strengthened*: owner 0 was
+  safe only because no teardown seam happens to pass 0.
+* `hit_test` needs no change: the band is non-zero, so kernel rows became hittable by construction.
+* Owner 0 keeps its remaining meaning — *nobody owns this row* — held by the compat shim's rows and by
+  the transient witness probes, which must stay unclickable.
+
+**A second, separate ownership fix.** `SYS_WIN_CREATE` was handing the compositor an *unbiased* slot
+number while `EL0_INPUT_ACTIVE` carries `slot + 1`. Because x86 slot 0 is a real address space, the
+first program to launch got a window with `owner_asid == 0` — skipped by both `hit_test` and
+`focus_ring`, i.e. neither clickable nor tabbable, silently and only for slot 0. The owner is now
+`slot + 1`, so the value `hit_test` returns is the value the router compares against the input focus,
+with no conversion at the one seam that decides who receives a keystroke.
+
+### The router: `wc_click_route`, and the one arm that is x86-specific
+
+On a PRESS edge the point is hit-tested and lands in one of four arms:
+
+| hit | disposition | focus | press |
+| --- | --- | --- | --- |
+| a window owned by another address space | `raise+deliver` | `set_active(owner)` then `focus_changed(owner)` | **delivered** into the raised owner's ring |
+| the already-focused window | `deliver` | unchanged | delivered |
+| a KERNEL-owned row (console, demo) | `consume` | `set_active(0)` — keyboard to the shell | consumed |
+| nothing (bare desktop) | `consume` | `set_active(0)` | consumed |
+
+with the two CLICK-SHELL r2 limits on the last arm intact: with focus already at the shell nothing is
+consumed, and a full-screen app presenting through the compat row is exempt (`wm::compat_live`, added
+here) because a compat row covers the panel but carries owner 0 and can never be hit.
+
+The RELEASE edge is never re-hit-tested. `CLICK_PRESS_TARGET` records where the press went and the
+release either follows it or is dropped — a press/release pair is never split across two apps, and no
+release is ever delivered to an app that did not see the press.
+
+**The one arm that differs from aarch64, and why.** On the kernel-row and desktop arms this router
+calls `el0_input_set_active(0)` but does **not** call `wm::focus_changed(0)`. On aarch64 the shell is
+the desktop layer *beneath* the window layer, so raising `SHELL_Z` reveals the console. On x86 the
+console **is a window row** (`fbcon::panel_console_window_open`), so raising `SHELL_Z` above every
+window would push the console below the shell, stop it compositing and erase it to the desktop colour
+— it would blank the console the operator just clicked. The kernel row's own z-bump
+(`focus_changed(owner)`, which touches only that owner's rows) is the correct raise on this arch, and
+`SHELL_Z` is left where it is. The selftest asserts that `SHELL_Z` does not move.
+
+### The witness: one line per press, and it separates the two complaints
+
+`[clickroute]` gains a per-press row beside the existing hit-test verdict — the same vocabulary, not a
+second one:
+
+```
+[clickroute] press at (x,y) win=N owner=0xA was=F -> <disposition> deliver=D
+```
+
+Human-rate by construction (a hand cannot click faster than serial can print), so it carries no
+throttle. It resolves the operator's two standing complaints in one sitting:
+
+* **"the click was eaten"** — press the pad and **no `[clickroute] press` line appears at all**. The
+  press never reached the router; the defect is upstream in HID or the queue and no routing change can
+  fix it. Before this arc *every* x86 press was in this state, silently.
+* **"the click was mis-routed"** — a line appears and its `win=`/`owner=` name something other than the
+  window the hand was over, or `deliver=` names an asid other than that window's owner.
+* **"an out-of-focus click stopped my app"** — a line whose `was=` names the focused app while
+  `deliver=` is 0 or another asid is positive proof the rule held: the press went where the hand
+  pointed, not to whoever held the keyboard.
+
+`deliver=0` means the press entered no app's ring. `click_stats()` carries the `(presses, delivered)`
+rollup for a coarser read.
+
+### Coverage: `clickroute_selftest`, headless-drivable
+
+QEMU delivers no pointer, so coverage extends `hittest_selftest`'s idiom one layer up: the press
+POSITION is a parameter (`wc_click_route_at`) rather than a read of the cursor, and every claim is
+made against the window table and the input rings rather than against the panel. Where
+`hittest_selftest` asserts *which window owns a pixel*, this asserts *who receives the press*.
+
+Six legs, each a distinct failure direction: `hit` (three disjoint probe rows resolve to their own
+owners), `deliver` (a press over an unfocused window is **not** consumed and moves focus — the
+direction CLICK-SWALLOW would fail), `depth` (the press then actually lands in that ring, and its
+release follows it — 1 then 2), `kernel` (a press on kernel furniture is consumed, hands the keyboard
+to the shell, and does not move `SHELL_Z`), `desktop` (a press on an unowned point is consumed and
+hands the keyboard to the shell; reported as `skip` rather than a false verdict if the live panel
+leaves no unowned point), and `nofab` (the release after a consumed press is dropped, never
+delivered).
+
+The probe rows are deliberately three DISJOINT boxes, not `hittest_selftest`'s stacked pair: this
+witness raises windows as part of the decisions it is testing, and overlapping boxes would let a raise
+silently turn the "different window" leg into the "already focused" one.
+
+### Interaction with the full-screen `vug` demo: none
+
+`vug.rs`'s `drain_input` reads `crate::pal::pump_and_poll()` directly and treats `Event::Button(_)` as
+its exit gesture. That is a *different drain*: while the full-screen demo is presenting, `handle_key`
+has taken over and `kernel_main`'s inner drain — the only place `wc_click_route` is called from — is
+not running. The router is never interposed on the demo's events, its click-to-exit is unchanged, and
+this arc adds no call into `pump_and_poll`. (The compat-row exemption in the desktop arm is the
+belt-and-braces half of the same statement, for a *ring-3* full-screen app presenting through
+`SYS_FB_PRESENT` while the main drain does run.)
+
+### Gate results (CLICK-X86 r2, 2026-07-29, QEMU)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
+* `UNAOS_WC=1 ./arroyo test 90` — **42 PASS lines / 0 FAIL**; measured baseline at `aed91dc0` was
+  **41 / 0**. The +1 is the new `[clickroute] route ... -> PASS` verdict and nothing else moved.
+* `./arroyo test-arm 22` — boots to `gui:handoff`, banner present, **0 FAIL**, identical to the
+  measured baseline. aarch64 is behaviour-inert: the `main.rs` Button arm is `#[cfg]`-gated to x86,
+  the `wm.rs` additions are new items plus one `focus_ring` predicate and one `close_owner` guard that
+  are both unreachable on a target where no row ever carries a band owner, and `fbcon.rs`'s console
+  window is itself x86-only.
+
+x86 wire lines, this arc:
+
+```
+[clickroute] press at (482,215) win=2 owner=0x2 was=1 -> raise+deliver deliver=2
+[clickroute] press at (536,215) win=3 owner=0xffffff7f was=1 -> consume deliver=0
+[clickroute] press at (2,2) win=0 owner=0x0 was=1 -> consume deliver=0
+[clickroute] route hit=true deliver=true depth=1/2 kernel=true desktop=true nofab=true -> PASS
+```
+
+### Gate results (CLICK-X86 r1 — the audit arc, 2026-07-29, QEMU)
 
 * `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
 * `UNAOS_WC=1 ./arroyo test 90`, two consecutive runs — **39 PASS lines / 0 FAIL** each

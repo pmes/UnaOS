@@ -3166,8 +3166,15 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // this verb negotiated) — never a recomputed `h * stride`. That distinction is wm's F1 extent
     // contract: `w`/`h`/`stride` are EL0-influenced, `pages` comes from the mapping code, and it is
     // `surf_len` that bounds every source read the compositor performs.
+    // CLICK-X86 — the compositor owner is `slot + 1`, the SAME `+1` bias `EL0_INPUT_ACTIVE` carries,
+    // and for the same reason stated there: x86 slot 0 is a REAL address space, so an unbiased owner
+    // of 0 is indistinguishable from wm's "nobody owns this row". Unbiased, the first program to
+    // launch got a window that `hit_test` skipped (`owner_asid == 0`) and `focus_ring` skipped, i.e.
+    // it could be neither clicked nor tabbed to — silently, and only for slot 0. Biased, the value
+    // `hit_test` returns is the value the router compares against `EL0_INPUT_ACTIVE` with no
+    // conversion at the one seam that decides who receives a keystroke.
     e.wm_id = wc_shim::create(
-        slot as u64,
+        (slot as u64) + 1,
         mem::slot_fb_win_surface_ptr(slot, rslot) as usize,
         pages * 0x1000,
         w32,
@@ -3300,6 +3307,9 @@ mod wc_shim {
     /// concerned (its surface is mapped and its own), it simply has no compositor row, so presents are
     /// accounted and dropped. That is the fail-closed direction — nothing extra is exposed to EL0 — and
     /// it keeps a headless run (no panel, `wm` never ready) from failing a program that only draws.
+    /// CLICK-X86: `owner` is the `+1`-BIASED slot (`slot + 1`), matching `EL0_INPUT_ACTIVE`, so that
+    /// `wm::hit_test`'s answer is directly comparable with the input focus and slot 0's windows are
+    /// not mistaken for wm's ownerless rows.
     pub fn create(
         owner: u64,
         surf: usize,
@@ -3576,6 +3586,447 @@ fn sys_input_poll() -> i64 {
     let packed = EL0_INPUT_BUF[slot][(head as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
     EL0_INPUT_HEAD[slot].store(head.wrapping_add(1), Ordering::Release); // consume AFTER the load
     packed as i64
+}
+
+/// CLICK-X86 witness read: how many events sit UNREAD in the ring of the `+1`-biased slot `active`.
+/// `0` for the shell slot and for anything outside the private-slot range (they have no ring). The
+/// selftest's only way to say "the press was DELIVERED" rather than "the router said it would be".
+pub fn el0_input_depth(active: u64) -> u32 {
+    if active == 0 {
+        return 0;
+    }
+    let slot = (active - 1) as usize;
+    if slot >= crate::arch::memory::USER_SLOTS {
+        return 0;
+    }
+    EL0_INPUT_TAIL[slot]
+        .load(Ordering::Acquire)
+        .wrapping_sub(EL0_INPUT_HEAD[slot].load(Ordering::Acquire))
+}
+
+// =============================================================================================
+// CLICK-X86 — A POINTER PRESS GOES TO THE WINDOW UNDER THE CURSOR.
+//
+// Built directly to the CLICK-PLAIN contract (the aarch64 seat's `475c51d3`); the superseded
+// CLICK-SWALLOW shape (`1ed1c725`, "a focus-changing press is never also app input") is deliberately
+// never passed through on this arch. The principle both arcs converged on: prefer a rule that is
+// true UNCONDITIONALLY over one that is true given hidden state. A focus-changing press DELIVERS.
+//
+// ### What was here before: nothing
+// The x86 event drain's `match` ended `_ => {}`. There was no `Event::Button` arm at all — HID pushed
+// presses onto the queue and this drain popped and DISCARDED them. `wm::focus_changed` and
+// `wm::hit_test` had no x86 callers; `FOCUS_ASID` was written only by wm's own selftests. So BOTH of
+// the operator's standing complaints on x86 metal — that clicks get "eaten", and that out-of-focus
+// clicks stop the focused app — named a mechanism that did not exist. Neither could ever have been
+// right, and neither could be told apart on the wire. That is what this section supplies.
+//
+// ### The rule, entire
+// **A press goes to the window under the cursor, and if that window was not focused, the focus goes
+// there first.** Nothing about the press's DELIVERY is conditional on which window happened to hold
+// focus when the hand moved; what a delivered click MEANS is the app's decision, made in the app.
+// =============================================================================================
+
+/// CLICK-X86: the pointer-button bitmask as the ROUTER last saw it, so this layer can tell a PRESS
+/// edge (a bit going 0->1) from a RELEASE edge (1->0) from an unchanged held state. Its own tracker,
+/// not shared with any drain: routing decisions are made upstream of every consumer, on events some
+/// consumers never see.
+static CLICK_PREV_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// CLICK-X86 sentinel: the outstanding press was NOT delivered to any ring, so its release must not be
+/// either. `u64::MAX` is not a valid biased slot (`USER_SLOTS` is single digits) and sits far above
+/// `wm::KERNEL_OWNER_BASE`, so it cannot collide with either population.
+const CLICK_TARGET_DROP: u64 = u64::MAX;
+
+/// CLICK-X86: where the outstanding PRESS was delivered, so the matching RELEASE follows it. A biased
+/// slot (0 = the shell path), or [`CLICK_TARGET_DROP`] when the press was consumed here.
+///
+/// **A press/release pair must never be split across two apps.** A release delivered to an app that
+/// never saw the press is a FABRICATED click — the receiving app sees a button go up that never went
+/// down, which for a click-to-pause program is an invented click. So the release edge is never
+/// re-hit-tested; it is compared against this and either follows the press or is dropped.
+static CLICK_PRESS_TARGET: AtomicU64 = AtomicU64::new(CLICK_TARGET_DROP);
+
+/// CLICK-X86 accounting, for the rollup: press edges seen, and press edges DELIVERED into some ring.
+static CLICK_PRESSES: AtomicU64 = AtomicU64::new(0);
+static CLICK_DELIVERED: AtomicU64 = AtomicU64::new(0);
+
+/// CLICK-X86: `(presses, delivered)` — every press edge the router judged, and how many of them were
+/// addressed to an EL0 ring. The difference is the count of presses that belonged to the shell.
+pub fn click_stats() -> (u64, u64) {
+    (
+        CLICK_PRESSES.load(Ordering::Acquire),
+        CLICK_DELIVERED.load(Ordering::Acquire),
+    )
+}
+
+/// CLICK-X86: the current pointer position in PANEL pixels — the point a click is addressed to. Reads
+/// the shared cursor state every other pointer consumer reads (the same state the compositor draws),
+/// clamped by the live panel geometry.
+///
+/// Locks: the framebuffer info lock, then the cursor position lock, and both are released before
+/// `wm::hit_test` takes the window TABLE lock. No nesting, so no new lock order.
+fn click_pointer_pos() -> (i32, i32) {
+    let (w, h) = {
+        let info = crate::video::WRITER.lock().info();
+        (info.width as i32, info.height as i32)
+    };
+    crate::pal::cursor::pos(w, h)
+}
+
+/// CLICK-X86 — **route a pointer button by POSITION rather than by focus.** The shell's event drain
+/// calls this on every event, BEFORE `el0_input_route`; non-`Button` events return `false` untouched.
+///
+/// Returns `true` when the event was CONSUMED and the caller must not deliver or forward it. Under
+/// CLICK-PLAIN that is only the arms with no app to deliver to (a press on kernel furniture or on the
+/// bare desktop, and the release that follows one). `false` means "carry on with your normal path",
+/// with whatever focus this call left in place — unchanged on a press to the already-focused window,
+/// and the newly RAISED owner on a press that moved focus to a window.
+///
+/// See [`wc_click_route_at`] for the rule and its argument; this is that function at the live cursor.
+///
+/// Idempotent per edge: the mask tracker is swapped on entry, so a second call with the same mask
+/// sees no edge and answers `false`.
+pub fn wc_click_route(ev: crate::pal::Event) -> bool {
+    let (x, y) = match ev {
+        crate::pal::Event::Button(_) => click_pointer_pos(),
+        _ => return false, // no position read for an event that cannot be a click
+    };
+    wc_click_route_at(ev, x, y)
+}
+
+/// CLICK-X86 — [`wc_click_route`] with the press POSITION supplied rather than read from the cursor.
+///
+/// The position is a parameter so that this decision is drivable with **no pointer at all**, which is
+/// the only way it can be covered in QEMU (the gate runs headless and delivers no HID pointer). It is
+/// the same idiom `wm::hittest_selftest` uses — assert against the window TABLE, not against the
+/// panel — extended one layer up, from "which window owns this pixel" to "who receives this press".
+///
+/// ### The rule, on a PRESS edge
+/// Hit-test the point (`wm::hit_test` — the topmost visible window whose outer box contains it):
+///
+///  * **a window owned by a DIFFERENT address space than the focused one** — raise it to focus
+///    through the one focus primitive that exists (`el0_input_set_active` then `wm::focus_changed`,
+///    in that order), and then **DELIVER the press to it**. The wake half runs FIRST and in full, so
+///    by the time the caller pushes, `EL0_INPUT_ACTIVE` already names the raised owner and the press
+///    lands in the ring of the window that was clicked. Click-to-focus, with no second focus path
+///    invented for it.
+///
+///    This is the CLICK-PLAIN decision, and it is the one thing this arc most deliberately does not
+///    inherit from CLICK-SWALLOW. Withholding the focus-changing press makes a click's effect depend
+///    on invisible state — which window held focus, whether this was the first click or the second —
+///    which is precisely what an operator cannot model. The router's job is ROUTING; the app decides
+///    what a delivered click means.
+///
+///  * **the FOCUSED window** — deliver exactly as before. The no-change case, and the common one.
+///
+///  * **a KERNEL-OWNED window** (`wm::is_kernel_owner` — the panel console, the desktop demo) — the
+///    click landed on the kernel's furniture, which owns no address space and has no input ring. Two
+///    things happen and they are separate: the row is RAISED (`focus_changed(owner)`, so the click
+///    has a visible effect — the console comes to the front under the hand), and the KEYBOARD goes
+///    back to the shell (`el0_input_set_active(0)`), because the console is the shell's surface and
+///    clicking it must be how the operator reaches it. The press itself is consumed: on x86 the shell
+///    has no click consumer at all, so there is nothing to deliver it to, and re-addressing it after
+///    the fact would split a pair whose press edge no consumer saw.
+///
+///    **`focus_changed(0)` is NOT called here, and the difference is x86-specific.** On aarch64 the
+///    shell is the desktop layer BENEATH the window layer, so raising `SHELL_Z` reveals the console.
+///    On x86 the console IS a window row (`fbcon::panel_console_window_open`), so raising `SHELL_Z`
+///    above every window would push the console below the shell, stop it compositing and erase it to
+///    the desktop colour — it would blank the console the operator just clicked. The kernel row's own
+///    z-bump is the correct raise on this arch and `SHELL_Z` is left where it is.
+///
+///  * **no window** — the bare desktop. Not the focused app's click, so it is consumed rather than
+///    delivered, and the keyboard goes back to the shell for the same reason the kernel-row arm gives
+///    (clicking a window focuses it; clicking the desktop must focus the desktop). Two limits, the
+///    same two CLICK-SHELL r2 settled: with focus already at the shell nothing is consumed and no
+///    focus move is made, and a FULL-SCREEN app presenting through the compat row is exempt — a
+///    compat row covers the panel but carries owner ASID 0, so it can never be hit, and a miss over a
+///    full-screen app is a hit on that app.
+///
+/// ### The RELEASE edge follows the press, and is never re-routed
+/// See [`CLICK_PRESS_TARGET`]. The release is delivered iff the focus is still the one the press was
+/// delivered to; otherwise it is dropped. A focus change (or an app exit) between press and release
+/// costs the release, never a fabricated one in a second app.
+pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
+    let crate::pal::Event::Button(mask) = ev else {
+        return false;
+    };
+    let prev = CLICK_PREV_MASK.swap(mask as u32, Ordering::Relaxed) as u8;
+    let cur = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
+    if mask & !prev != 0 {
+        // PRESS edge.
+        CLICK_PRESSES.fetch_add(1, Ordering::Relaxed);
+        match crate::video::wm::hit_test(x, y) {
+            // KERNEL FURNITURE — raise it, hand the keyboard to the shell, consume the press.
+            Some((win, owner, _z)) if crate::video::wm::is_kernel_owner(owner) => {
+                clickroute_witness(x, y, win, owner, cur, "consume", 0);
+                el0_input_set_active(0);
+                crate::video::wm::focus_changed(owner);
+                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                true
+            }
+            // A DIFFERENT app's window — raise it, then deliver the press into its ring.
+            Some((win, owner, _z)) if owner != cur => {
+                clickroute_witness(x, y, win, owner, cur, "raise+deliver", owner);
+                // The wake half, in order: the focus arrival first, then the raise. Only then does
+                // the caller push — and by then `EL0_INPUT_ACTIVE` is `owner`.
+                el0_input_set_active(owner);
+                crate::video::wm::focus_changed(owner);
+                // The release must follow the press into the SAME ring: record the raised owner, not
+                // the sentinel, so the pair is delivered whole.
+                CLICK_PRESS_TARGET.store(owner, Ordering::Release);
+                CLICK_DELIVERED.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            // The ALREADY-FOCUSED window — the no-change case.
+            Some((win, owner, _z)) => {
+                clickroute_witness(x, y, win, owner, cur, "deliver", cur);
+                CLICK_PRESS_TARGET.store(cur, Ordering::Release);
+                CLICK_DELIVERED.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            None => {
+                // A full-screen app presenting through the compat row owns every pixel that
+                // hit-tests to nothing. `hit_test` has already said no WINDOW owns this point; the
+                // compat row is the only other thing that can.
+                if cur != 0 && !crate::video::wm::compat_live() {
+                    clickroute_witness(x, y, crate::video::wm::WIN_NONE, 0, cur, "consume", 0);
+                    el0_input_set_active(0);
+                    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                    true
+                } else {
+                    let how = if cur == 0 { "shell" } else { "fullscreen" };
+                    clickroute_witness(x, y, crate::video::wm::WIN_NONE, 0, cur, how, cur);
+                    CLICK_PRESS_TARGET.store(cur, Ordering::Release);
+                    if cur != 0 {
+                        CLICK_DELIVERED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    false
+                }
+            }
+        }
+    } else if prev & !mask != 0 {
+        // RELEASE edge — follow the press, or drop. Never hit-tested: the release belongs to whoever
+        // received the press, not to whatever the pointer has since been dragged over.
+        let target = CLICK_PRESS_TARGET.load(Ordering::Acquire);
+        target == CLICK_TARGET_DROP || target != cur
+    } else {
+        // Unchanged mask (a re-report of a held button, or an idempotent second call): no edge.
+        false
+    }
+}
+
+/// CLICK-X86 — the witness, and the ONE line the operator's two standing complaints are separated on.
+///
+/// It extends the existing `[clickroute]` vocabulary rather than inventing a second one: the same tag
+/// `wm::hittest_selftest` already prints under, now carrying a per-press row. One line per press edge,
+/// human-rate by construction (a hand cannot click faster than serial can print), so it needs no
+/// throttle of its own.
+///
+/// **How it tells the two complaints apart, in one sitting.**
+///  * *"the click was EATEN"* — press the pad and NO `[clickroute] press` line appears. The press
+///    never reached the router: the defect is upstream, in HID or the queue, and no routing change
+///    can fix it. (Before this arc every press on x86 was in exactly this state, silently.)
+///  * *"the click was MIS-ROUTED"* — a line appears, and its `win=`/`owner=` name something other
+///    than the window the hand was over, or `deliver=` names an asid other than that window's owner.
+///    The press arrived and was addressed wrongly, and the defect is in the hit-test or in this
+///    policy.
+///  * *"the out-of-focus click stopped my app"* — a line whose `was=` names the focused app while
+///    `deliver=` names 0 or another asid is the proof that this arc's rule held: the press went where
+///    the hand pointed, not to whoever had the keyboard.
+///
+/// `deliver=0` means the press was NOT put in any app's ring (the shell's, the desktop's, or the
+/// kernel furniture's arm); `win=` is `wm::WIN_NONE` when the point resolved to no window at all.
+fn clickroute_witness(x: i32, y: i32, win: u32, owner: u64, was: u64, how: &str, deliver: u64) {
+    serial_println!(
+        "[clickroute] press at ({},{}) win={} owner={:#x} was={} -> {} deliver={}",
+        x, y, win, owner, was, how, deliver
+    );
+}
+
+/// The probe surface for [`clickroute_selftest`] — 8x8 ARGB8888, the `hittest_selftest` geometry.
+#[cfg(feature = "witness")]
+#[repr(align(4))]
+struct ClickSurf([u32; 64]);
+#[cfg(feature = "witness")]
+static CLICK_SURF: ClickSurf = ClickSurf([0x0020_4060; 64]);
+
+/// CLICK-X86 — the ROUTING witness: `wm::hittest_selftest` asserts *which window owns a pixel*; this
+/// asserts *who receives the press*, which is the layer the operator's two complaints live in.
+///
+/// Headless-drivable, on the same idiom and for the same reason: QEMU delivers no pointer at all, so
+/// the position is a PARAMETER (`wc_click_route_at`) rather than a read of the cursor, and every claim
+/// is made against the window table and the input rings rather than against the panel.
+///
+/// ### The legs, each a distinct failure direction
+///  1. **hit** — the probe point resolves to the topmost probe window (`B`). The address lookup is
+///     `hittest_selftest`'s business; this only establishes the fixture.
+///  2. **deliver** — with focus on `A`, a press over `B` is NOT consumed and moves focus to `B`. This
+///     is the CLICK-PLAIN decision itself, and the direction CLICK-SWALLOW would fail: under that
+///     superseded shape the focus-changing press is swallowed and this leg reads `false`.
+///  3. **depth** — the press then actually LANDS in `B`'s ring (depth 1), and its RELEASE follows it
+///     into the same ring (depth 2). A press/release pair delivered whole to one app, which is what
+///     makes a fabricated half-click impossible.
+///  4. **kernel** — a press over a KERNEL-owned row (the console, the demo — hittable since this arc)
+///     is consumed and hands the keyboard back to the shell, and does NOT move `SHELL_Z` (which on
+///     x86 would blank the console window it just raised).
+///  5. **desktop** — a press over a point no window owns is consumed and hands the keyboard back to
+///     the shell. Skipped, and said so, if the live panel leaves no unowned point to probe.
+///  6. **nofab** — the release that follows a CONSUMED press is dropped rather than delivered. A
+///     release in an app that never saw the press is a fabricated click; the sentinel forbids it.
+///
+/// Self-cleaning: the probe rows are closed, the input focus is restored to whatever held it, and
+/// `wm::focus_reset` un-names the synthetic focus owner.
+#[cfg(feature = "witness")]
+pub fn clickroute_selftest() {
+    use crate::pal::Event;
+    use crate::video::wm;
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let (pw, ph) = {
+        let fb = *crate::video::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!("[clickroute] route -> SKIP (framebuffer not ready)");
+            return;
+        }
+        let i = fb.info();
+        (i.width, i.height)
+    };
+    if pw < 256 || ph < 256 {
+        serial_println!("[clickroute] route -> SKIP (panel {}x{} too small)", pw, ph);
+        return;
+    }
+
+    // Biased slots, i.e. the values `SYS_WIN_CREATE` now hands the compositor and the values
+    // `EL0_INPUT_ACTIVE` carries — the whole point of the bias is that these are the SAME numbers.
+    const OWNER_A: u64 = 1; // slot 0
+    const OWNER_B: u64 = 2; // slot 1
+    // In the reserved kernel band, so `wm::is_kernel_owner` answers for it exactly as it does for the
+    // real console row, without this witness disturbing the real console row.
+    const OWNER_K: u64 = wm::KERNEL_OWNER_BASE + 0x7F;
+
+    let s = &raw const CLICK_SURF as usize;
+    let len = core::mem::size_of_val(&CLICK_SURF);
+    let wa = wm::create(OWNER_A, s, len, 8, 8, 32, b"cr-a");
+    let wb = wm::create(OWNER_B, s, len, 8, 8, 32, b"cr-b");
+    let wk = wm::create(OWNER_K, s, len, 8, 8, 32, b"cr-k");
+    if wa == wm::WIN_NONE || wb == wm::WIN_NONE || wk == wm::WIN_NONE {
+        serial_println!(
+            "[clickroute] route -> SKIP (window table full: a={} b={} k={})",
+            wa, wb, wk
+        );
+        wm::close(wa);
+        wm::close(wb);
+        wm::close(wk);
+        return;
+    }
+
+    // Three DISJOINT origins in a row, deliberately not the stacked pair `hittest_selftest` uses:
+    // this witness raises windows as part of the decisions it is testing (`focus_changed` bumps the
+    // focused owner's z), so overlapping probe boxes would let a raise silently change which window
+    // owns a probe point and turn the "different window" leg into the "already focused" one. Pinned
+    // with `move_to` against the tiler; the span is read back from the row the compositor actually
+    // made, so the spacing tracks the panel's own scale rule rather than a number kept in sync here.
+    let ox = pw / 3;
+    let oy = ph / 4 + wm::TITLE_H + wm::BORDER;
+    wm::move_to(wa, ox, oy);
+    let scale = wm::info(wa).map(|i| i.scale).unwrap_or(1);
+    let span = 8 * scale + 2 * wm::BORDER + wm::TITLE_H + 8;
+    let (bxo, kxo) = (ox + span, ox + 2 * span);
+    wm::move_to(wb, bxo, oy);
+    wm::move_to(wk, kxo, oy);
+    let (apx, apy) = ((ox + 2) as i32, (oy + 2) as i32);
+    let (bpx, bpy) = ((bxo + 2) as i32, (oy + 2) as i32);
+    let (kpx, kpy) = ((kxo + 2) as i32, (oy + 2) as i32);
+
+    // Leg 1 — the fixture: three disjoint boxes, each owned by exactly the owner that made it.
+    let hit_ok = wm::hit_test(apx, apy).map(|(_, a, _)| a) == Some(OWNER_A)
+        && wm::hit_test(bpx, bpy).map(|(_, a, _)| a) == Some(OWNER_B)
+        && wm::hit_test(kpx, kpy).map(|(_, a, _)| a) == Some(OWNER_K);
+    let _ = (apx, apy);
+
+    // The DESKTOP probe point, found rather than assumed: on x86 the console is itself a window and
+    // now hittable, so most of the panel is owned. Report a skip rather than a false verdict if the
+    // live panel leaves nothing unowned.
+    let corners = [
+        (2i32, 2i32),
+        (pw as i32 - 3, 2),
+        (2, ph as i32 - 3),
+        (pw as i32 - 3, ph as i32 - 3),
+    ];
+    let desktop_pt = corners.iter().copied().find(|&(x, y)| wm::hit_test(x, y).is_none());
+
+    let saved_focus = el0_input_active();
+
+    // Leg 2/3 — focus on A, press over B. Delivered, not swallowed; the pair lands whole in B's ring.
+    el0_input_set_active(OWNER_A);
+    wm::focus_changed(OWNER_A);
+    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+    let press_consumed = wc_click_route_at(Event::Button(1), bpx, bpy);
+    let raised_ok = el0_input_active() == OWNER_B;
+    let deliver_ok = !press_consumed && raised_ok && el0_input_enqueue(Event::Button(1));
+    let depth_press = el0_input_depth(OWNER_B);
+    let rel_consumed = wc_click_route_at(Event::Button(0), bpx, bpy);
+    let rel_ok = !rel_consumed && el0_input_enqueue(Event::Button(0));
+    let depth_rel = el0_input_depth(OWNER_B);
+    let depth_ok = depth_press == 1 && depth_rel == 2 && rel_ok;
+
+    // Leg 4 — a press over KERNEL furniture, from a live app focus. Consumed; keyboard to the shell;
+    // the raise is the row's own z-bump and `SHELL_Z` must not move.
+    el0_input_set_active(OWNER_A);
+    wm::focus_changed(OWNER_A);
+    let shell_z_before = wm::shell_z();
+    let kernel_consumed = wc_click_route_at(Event::Button(1), kpx, kpy);
+    let kernel_ok =
+        kernel_consumed && el0_input_active() == 0 && wm::shell_z() == shell_z_before;
+
+    // Leg 6 — the release after a CONSUMED press is dropped, never delivered.
+    let nofab_ok = wc_click_route_at(Event::Button(0), kpx, kpy);
+
+    // Leg 5 — a press over the bare desktop, from a live app focus.
+    let desktop_ok = match desktop_pt {
+        Some((x, y)) => {
+            el0_input_set_active(OWNER_A);
+            wm::focus_changed(OWNER_A);
+            let consumed = wc_click_route_at(Event::Button(1), x, y);
+            let ok = consumed && el0_input_active() == 0;
+            wc_click_route_at(Event::Button(0), x, y);
+            Some(ok)
+        }
+        None => None,
+    };
+
+    let ok = hit_ok
+        && deliver_ok
+        && depth_ok
+        && kernel_ok
+        && nofab_ok
+        && desktop_ok.unwrap_or(true);
+    serial_println!(
+        "[clickroute] route hit={} deliver={} depth={}/{} kernel={} desktop={} nofab={} -> {}",
+        hit_ok,
+        deliver_ok,
+        depth_press,
+        depth_rel,
+        kernel_ok,
+        match desktop_ok {
+            Some(v) => if v { "true" } else { "false" },
+            None => "skip",
+        },
+        nofab_ok,
+        if ok { "PASS" } else { "FAIL" }
+    );
+
+    wm::close(wa);
+    wm::close(wb);
+    wm::close(wk);
+    el0_input_set_active(saved_focus);
+    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+    wm::focus_reset();
 }
 
 // =============================================================================================
@@ -11365,15 +11816,17 @@ fn winx_launcher(demo_cpu: usize) {
     // window must be gone — the `cleared` poll above is exactly that — before rows that would burn
     // them appear. That is the same ordering rule aarch64 states at its own call site.
     //
-    // What this does NOT do, stated so the next reader does not infer it: it does not give x86 click
-    // ROUTING. On this arch a pointer press is still dropped by the main event drain (which has no
-    // `Event::Button` arm at all), `wm::focus_changed` has no caller outside `wm` itself, and there
-    // are no ring-3 input rings for a press to be delivered into. The hit-test is the address lookup
-    // a routing policy would be built on; this line is the standing proof that the lookup is sound on
-    // x86 geometry, so when the press path does arrive a `[clickroute]` line already distinguishes
-    // "resolved the wrong window" from "never resolved one".
+    // CLICK-X86 — the press path has since ARRIVED, so the two witnesses now run as a pair and this
+    // paragraph records the division of labour rather than the old absence. `hittest_selftest` asserts
+    // the ADDRESS LOOKUP (which window owns a pixel); `clickroute_selftest`, immediately below,
+    // asserts the ROUTING built on it (who receives the press). Order matters for the same reason
+    // stated above — both mint rows of their own, so they belong after every one-shot per-window latch
+    // — and `hittest_selftest` goes first because its `focus_changed(0)` leg is the more disruptive of
+    // the two and it restores `SHELL_Z`/`FOCUS_ASID` before returning.
     #[cfg(feature = "witness")]
     crate::video::wm::hittest_selftest();
+    #[cfg(feature = "witness")]
+    clickroute_selftest();
 }
 
 // =============================================================================================
