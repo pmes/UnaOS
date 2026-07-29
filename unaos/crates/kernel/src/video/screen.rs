@@ -911,131 +911,11 @@ impl Screen {
     /// actually marked (chiefly `cursor::repair`, whose "marks only" contract needs a pass within a
     /// frame). `wm::repaint` is still called on the one path that could still intrude: a present that
     /// reports it did not apply the subtraction exactly.
-    /// ### CURSOR-13 — the sprite bracket moves INSIDE this function, and it CLOSES BEFORE THE
-    /// COMPOSITE
-    ///
-    /// This is the fix for the P74 `nosprite` verdict: `[cursor12] passes=42 nosprite=42`, i.e. 100%
-    /// of composite passes on the bench found `cursor::sprite_plan()` empty, so no plan was taken, no
-    /// window was ever offered the sprite, and `cursor::compose_into` — the whole of CURSOR-3/4/11 —
-    /// was unreachable. The mechanism was a CALL-GRAPH fact, not a race.
-    ///
-    /// This function has two halves and they have opposite requirements of the sprite:
-    ///
-    /// * [`present_background`] is a DIRECT front-buffer writer. It copies back-buffer rows over the
-    ///   scan-out and knows nothing about the sprite (it subtracts the WINDOW layer's boxes, never the
-    ///   sprite's). It must therefore run with the arrow OFF the panel, or it both erases the arrow and
-    ///   invalidates its save-under — the next restore would stamp pre-flush desktop content back over
-    ///   whatever this present just put down.
-    /// * [`super::wm::service_damage`] → `wm::composite` is a COMPOSE-THROUGH writer. Its entire
-    ///   sprite mechanism is conditional on `cursor::sprite_plan()` returning `Some` at the top of
-    ///   `composite_inner`. It must therefore run with the arrow ON the panel, or it degrades to the
-    ///   pre-CURSOR-3 world in which the compositor is simply blind to the cursor and window rows land
-    ///   on top of it.
-    ///
-    /// Before CURSOR-13 the bracket was owned by the CALLER — `pal::TargetPal::render` on x86, the
-    /// render task on aarch64 (the CURSOR-1 contract) — and a caller's bracket necessarily spans BOTH
-    /// halves, because a caller cannot see the seam between them. So the second half inherited the
-    /// first half's requirement, inverted: `sp.drawn == false` at every flush-reached composite, by the
-    /// bracket's own design, every time, on both arches. Two mechanisms were solving the same problem
-    /// stacked, and the older one (the caller bracket) structurally starved the newer one.
-    ///
-    /// The seam is visible from HERE and nowhere else, which is why the bracket belongs here. The
-    /// undraw still immediately precedes `present_background` — so CURSOR-9's stated invariant ("the
-    /// sprite is provably not on the panel while `present_background` runs", the reason that painter
-    /// does not arm `TOUCHED_SINCE_DRAW`, and the reason CURSOR-6's `note_desktop_over_sprite` must
-    /// read 0) is preserved EXACTLY. What changes is that the bracket now CLOSES at the seam instead
-    /// of after the composite, so the composite below sees the panel state every other composite in
-    /// the tree sees: a live sprite, with a plan to take.
-    ///
-    /// ### Why the desktop bracket is RETAINED and not folded into the pend/defer class
-    ///
-    /// It would be tempting to give `present_background` the CURSOR-11 treatment — leave the arrow on
-    /// glass, record the pixels as owed, settle at a tail — and it is not available to it. A deferral
-    /// needs four things the desktop present does not have: an overlay SESSION, a staged LAYER to
-    /// paint the arrow into, COVERAGE to install as the new save-under, and an `adopt_overlay` tail to
-    /// settle against a finished front. `present_background` is a RAW BLIT: it copies `back_store`
-    /// rows straight into the scan-out with no staging step at all, and WC-I's occluder subtraction
-    /// covers the WINDOW layer only, never the sprite. That is exactly the reason `composite_inner`'s
-    /// sessionless arm is forbidden to defer and must take `undraw_within_nosession` instead — the
-    /// same rule, applied to the same missing precondition.
-    ///
-    /// So the honest residual, stated: the arrow still comes off the panel once per desktop flush, for
-    /// the length of the desktop blit. That cost is not NEW — the caller bracket paid it too, and paid
-    /// it over the composite as well — so CURSOR-13 strictly SHORTENS the sprite's off-panel duty
-    /// cycle on this path rather than lengthening it. Removing it entirely needs `present_background`
-    /// to stage like `wm`'s `STAGE` layer does, which is a larger arc than this one.
-    ///
-    /// ### Why `repaint` and not `ensure_drawn` as the close
-    ///
-    /// On the ordinary path the two are equivalent: the `undraw` above has already set `sp.drawn =
-    /// false`, so `repaint`'s internal `undraw_locked` returns immediately with `None`, its `repair`
-    /// tail damages nothing, and what remains is the same single `draw_locked` that `ensure_drawn`
-    /// would have run. Neither manufactures window damage on this path, so the CURSOR-8/P69 loop
-    /// (repaint → repair → damage → composite → re-blit → overwrite → repaint) gains no new leg here.
-    ///
-    /// `repaint` is chosen for the one case where they DIFFER: a pointer report on another core that
-    /// redraws the sprite between our `undraw` and this close. `ensure_drawn` would see `drawn == true`
-    /// and do nothing — leaving a sprite whose save-under was captured in the middle of the desktop
-    /// blit, i.e. stale by construction. `repaint` restores and re-saves against the FINISHED front,
-    /// which is the correct answer, and in that case its `repair` tail hands real damage to the
-    /// `service_damage` on the very next line — mending CURSOR-9's colour-guard residual within the
-    /// same flush instead of at some later frame.
-    ///
-    /// ### The caller brackets become degenerate rather than wrong
-    ///
-    /// Nothing outside this file has to change for this to be correct, and that is deliberate — the
-    /// change has to be liftable verbatim by the other seat. The x86 caller bracket is
-    /// `pal::TargetPal::render`'s `undraw` … `ensure_drawn`, and it degenerates COMPLETELY against
-    /// this shape: its `undraw` finds the sprite already down when the inner one has run, and its
-    /// `ensure_drawn` — an idempotent close by construction — finds it already up and returns. It
-    /// therefore cannot re-starve the composite, which is why the x86 fix is this function alone.
-    /// (`main.rs`'s `render_service` bracket is `cfg(aarch64 + baremetal)` and is byte-inert on x86.)
-    ///
-    /// An outer `undraw` … `repaint` — the aarch64 render task's contract — is still CORRECT over
-    /// this shape (a restore → save → draw at the same position over a finished front is exactly
-    /// `CursorTail::Repaint`, which every composite in the tree already runs) but costs one redundant
-    /// cycle per desktop frame, so deleting it is a strict cost win. Trimming either outer bracket is
-    /// a follow-up for the owners of those files, not a correctness requirement of this one.
-    ///
-    /// ### What must move on the wire
-    ///
-    /// `[cursor12]`'s dominant term must stop being `nosprite`. With the pointer over a window,
-    /// flush-reached passes should now report `planned` as the dominant term, `[cursor3] rollup`
-    /// should show `offers` and `taken` non-zero for the first time outside its selftest, and
-    /// `[cursor11] px_deferred` should be non-zero for the first time outside ITS selftest. `nosprite`
-    /// must survive ONLY for genuinely hidden-pointer passes (before the first pointer report of a
-    /// boot, and after the CURSOR-HIDE auto-hide expires). `nohit` rising instead means the operator
-    /// was over bare desktop, which is not a refutation.
-    ///
-    /// **The hole detector for the RETAINED desktop bracket is `[cursor6] desktop_over=`, and it must
-    /// stay 0.** That counter is `note_desktop_over_sprite`, armed from inside `present_background`
-    /// when a surviving blit span lands on a live sprite box. Non-zero means the `undraw` below is not
-    /// covering the desktop blit any more and the desktop is erasing the arrow at flush rate.
-    ///
-    /// QEMU cannot answer any of this: neither gate machine delivers a pointer report, so the sprite
-    /// is never drawn, and `nosprite = passes` there is the honest reading rather than a regression.
-    /// The verdict is owed by the next attended bench boot, on both arches.
     pub fn flush(&mut self) {
-        // CURSOR-13 — open the bracket. Idempotent when a caller already holds one (the common case
-        // today): an `undraw` of a sprite that is not on the panel restores nothing, returns `None`,
-        // and so owes `repair` no damage either.
-        super::cursor::undraw();
         let intruded = self.present_background();
-        // CURSOR-13 — CLOSE the bracket, HERE, before anything composites. This single line is what
-        // makes `sprite_plan()` non-empty for every composite reached through the desktop's flush,
-        // and so what makes compose-through reachable at all on this path. `repaint` rather than
-        // `ensure_drawn` — equivalent on the ordinary path, and the correct answer when a pointer
-        // report on another core redrew the sprite mid-blit; see the function comment.
-        super::cursor::repaint();
         // Only when background pixels actually landed ON a window — which, with the subtraction in
         // place, is the fallback path only. `repaint` self-guards on there being a window layer to
         // restore (one table-lock acquisition, then out).
-        //
-        // Both arms now run with the arrow ON the panel and take the ordinary compositor bracket
-        // (`composite_inner`'s plan → `defer_within` on the session arm, `undraw_within_nosession` on
-        // the sessionless one, the whole-sprite `undraw` on the WC-F reserved arm). That is the same
-        // treatment a present-reached composite has had since CURSOR-3; the flush path simply stops
-        // being excluded from it.
         if intruded {
             super::wm::repaint();
         } else {
@@ -1158,18 +1038,12 @@ impl Screen {
         let bpp = self.info.bytes_per_pixel;
         let stride = self.info.stride;
         let mut flushed: u64 = 0;
-        // CURSOR-6 — the sprite's box, once for the whole present, read WITHOUT the sprite lock. This
-        // half of the flush is bracketed — CURSOR-13 moved the bracket's OPEN to `flush` itself, one
-        // statement in front of this call, so the guarantee is now local and stronger than the caller
-        // contract it replaced. A live sprite must never be seen here; if one is, the bracket has a
+        // CURSOR-6 — the sprite's box, once for the whole present, read WITHOUT the sprite lock. The
+        // desktop's flush is bracketed by the render task (`cursor::undraw` → `pal.render` →
+        // `cursor::repaint`), so a live sprite must never be seen here; if one is, the bracket has a
         // hole and the desktop is erasing the arrow at flush rate — the spotty symptom, from the
         // other layer. Diagnostic only: nothing below is conditional on it, so a stale answer costs
         // precision and never a pixel.
-        //
-        // CURSOR-13 — note what this probe does NOT cover and must not be read as covering: the
-        // COMPOSITE half of `flush` deliberately runs with the sprite up. This probe is inside
-        // `present_background`, which is entirely inside the bracket, so its "must be 0" reading is
-        // unchanged by that.
         #[cfg(feature = "witness")]
         let sprite_box = super::cursor::live_box_relaxed();
         #[cfg(feature = "witness")]

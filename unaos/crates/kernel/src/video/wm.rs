@@ -2426,28 +2426,14 @@ static CUR3_DECL_STALE: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// CURSOR-12 — passes where `cursor::sprite_plan()` returned `None`: the sprite was not on the panel
 /// when the bracket was decided, so no plan could be taken and no window could be offered one.
 ///
-/// **This WAS the whole story on both arches, and it was a CALL-GRAPH fact rather than a race.**
-/// `Screen::flush` ends in `wm::service_damage()` → `composite()`, and the render task bracketed its
-/// own flush with `cursor::undraw()` … `cursor::repaint()` (x86: `pal::TargetPal::render`, with
-/// `main.rs`'s console loop layered on top; aarch64: the Pi render task, the CURSOR-1 contract). So
-/// every composite reached through the desktop's flush ran BETWEEN the undraw and the repaint — with
-/// `sp.drawn == false`, by the caller's own design. `sprite_plan()` was `None` for structural reasons
-/// on that path, every time, on both arches, and compose-through could only ever run on a composite
-/// reached from `wm::present` — which on the x86 bench is suspended while the installer is up. Hence
-/// the P74 reading: `passes=42 nosprite=42`, 100%.
-///
-/// **CURSOR-13 removed the cause, and this counter is the acceptance instrument for it.**
-/// `Screen::flush` now owns the bracket itself and CLOSES it at the seam — after
-/// `present_background` (the direct front-buffer writer that genuinely needs the arrow down) and
-/// BEFORE `service_damage` (the compose-through writer that needs it up). See `Screen::flush`. A
-/// flush-reached composite therefore takes its plan exactly like a present-reached one.
-///
-/// What this counter must read after CURSOR-13, and it is how both seats judge the change on metal:
-/// with the pointer parked over a window, `planned` becomes the dominant term and `[cursor3]
-/// rollup`'s `offers`/`taken` go non-zero for the first time outside the selftest. A `nosprite` that
-/// survives is now a REAL answer — the pointer was hidden (before the boot's first report, or after
-/// CURSOR-HIDE's auto-hide) — rather than a structural one. `nosprite` still ≈ `passes` on an
-/// attended boot with a live pointer refutes the change.
+/// **The leading hypothesis for both arches, and it is a CALL-GRAPH fact rather than a race.**
+/// `Screen::flush` ends in `wm::service_damage()` → `composite()`, and the render task brackets its
+/// own flush with `cursor::undraw()` … `cursor::repaint()` (x86: `main.rs`'s console loop; aarch64:
+/// the Pi render task, the CURSOR-1 contract). So every composite reached through the desktop's flush
+/// runs BETWEEN the undraw and the repaint — with `sp.drawn == false`, by the caller's own design.
+/// `sprite_plan()` is `None` for structural reasons on that path, every time, on both arches.
+/// Compose-through can only ever run on a composite reached from `wm::present`, and on the x86 bench
+/// the console's presents are suspended while the installer is up.
 #[cfg(feature = "witness")]
 static CUR12_NOSPRITE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -2492,12 +2478,9 @@ static CUR12_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// Printed beside `[cursor3] rollup`, because it is the line that makes `offers=0` legible. The
 /// reading is a single dominant term:
 ///
-/// * **`nosprite` ≈ `passes`** — the render-bracket call graph above. This was the P74 reading on
-///   both arches and CURSOR-13 is the fix: `Screen::flush` now closes its bracket before it
-///   composites. Post-CURSOR-13 this term means the pointer was genuinely hidden; if it is still ≈
-///   `passes` on an attended boot with a live pointer, CURSOR-13 did not take and the flush path is
-///   being bracketed from somewhere else as well (check for an outer `undraw` whose close is a
-///   `repaint` that never runs, and the aarch64 render task's own contract).
+/// * **`nosprite` ≈ `passes`** — the render-bracket call graph above. The fix is not in the cursor
+///   module at all: it is that `Screen::flush` composites from inside a bracket that has just taken
+///   the sprite down. Compose-through cannot run on that path by construction.
 /// * **`nohit` ≈ `passes`** — the operator simply was not pointing at a window. Not a defect; check
 ///   the sitting, not the code.
 /// * **`excl_probe` / `excl_unverified` non-trivial** — the instrument is suppressing the mechanism,
