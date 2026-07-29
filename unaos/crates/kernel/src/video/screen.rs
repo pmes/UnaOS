@@ -658,8 +658,50 @@ impl Screen {
     /// actually marked (chiefly `cursor::repair`, whose "marks only" contract needs a pass within a
     /// frame). `wm::repaint` is still called on the one path that could still intrude: a present that
     /// reports it did not apply the subtraction exactly.
+    ///
+    /// ### CURSOR-13 — one owner for the sprite, and the bracket moved INSIDE
+    ///
+    /// The render task used to wrap this whole call in `cursor::undraw()` … `cursor::repaint()`
+    /// (the CURSOR-1 contract, on both arches). That bracket is correct for the DESKTOP half and
+    /// fatal to the WINDOW half: the composite below is reached from inside it, so
+    /// `cursor::sprite_plan()` saw `sp.drawn == false` on 100% of flush-path passes, and CURSOR-3's
+    /// compose-through — plus CURSOR-11's deferral — was structurally unreachable there. That is
+    /// P74's `[cursor12] … -> nosprite` on GR7 s48 silicon (42/42) and the same reading on x86.
+    /// Two mechanisms owned the sprite and the older one starved the newer.
+    ///
+    /// The bracket is not deleted, it is NARROWED to the half that needs it, and it lives here
+    /// rather than in the caller so no flush site has to remember it (the same argument that split
+    /// [`present_background`] out in the first place):
+    ///
+    /// * **[`present_background`] stays bracketed.** It is a raw desktop blit into the front
+    ///   framebuffer. It subtracts the WINDOW layer's boxes (WC-I) and knows nothing about the
+    ///   sprite, so a live arrow standing over desktop would be overwritten and its save-under left
+    ///   describing pixels that are no longer there. There is no compose-through to engage on this
+    ///   path — the desktop is not a staged surface — so a bracket here costs exactly one
+    ///   restore/save/draw per present and buys coherence. `cursor::note_desktop_over_sprite`
+    ///   (CURSOR-6) remains what it always was: a hole detector for THIS bracket, expected 0.
+    /// * **The composite below runs with the sprite ON GLASS.** `sprite_plan()` returns a real plan,
+    ///   so the pass takes the machinery that already exists: a staged window composes the arrow into
+    ///   its own rows (`compose_into`/`adopt_overlay`), CURSOR-11's pend class defers the handback
+    ///   with its coverage-install-first settle, and the DIRECT/unstaged and sessionless arms take
+    ///   their own brackets exactly as they do on the present path today
+    ///   (`undraw_within_nosession`). Nothing new is invented; the path is simply no longer
+    ///   pre-emptied of its subject.
+    ///
+    /// Ordering is load-bearing in both directions. `cursor::repaint` is called AFTER
+    /// `present_background` and BEFORE the composite so the save-under is taken against a front
+    /// buffer whose desktop is already final; and its `repair` tail damages every window the restore
+    /// crossed, which the composite on the very next line then services within this same flush —
+    /// CURSOR-9's colour-guard residual is therefore mended sooner than before, not later.
+    /// `TOUCHED_SINCE_DRAW` is untouched: a present landing under a live sprite still arms the
+    /// repair through `note_present_over_sprite`, and it now has a live sprite to arm it for.
     pub fn flush(&mut self) {
+        // CURSOR-13 — the DESKTOP bracket. Opens here, closes before the window layer is touched.
+        super::cursor::undraw();
         let intruded = self.present_background();
+        // CURSOR-13 — bracket CLOSED. Everything below composites with the arrow on the panel, which
+        // is the whole point of this arc: `sprite_plan()` must be able to answer.
+        super::cursor::repaint();
         // Only when background pixels actually landed ON a window — which, with the subtraction in
         // place, is the fallback path only. `repaint` self-guards on there being a window layer to
         // restore (one table-lock acquisition, then out).
@@ -783,12 +825,14 @@ impl Screen {
         let bpp = self.info.bytes_per_pixel;
         let stride = self.info.stride;
         let mut flushed: u64 = 0;
-        // CURSOR-6 — the sprite's box, once for the whole present, read WITHOUT the sprite lock. The
-        // desktop's flush is bracketed by the render task (`cursor::undraw` → `pal.render` →
-        // `cursor::repaint`), so a live sprite must never be seen here; if one is, the bracket has a
-        // hole and the desktop is erasing the arrow at flush rate — the spotty symptom, from the
-        // other layer. Diagnostic only: nothing below is conditional on it, so a stale answer costs
-        // precision and never a pixel.
+        // CURSOR-6 — the sprite's box, once for the whole present, read WITHOUT the sprite lock. This
+        // function is bracketed by `flush` (`cursor::undraw` → here → `cursor::repaint`; CURSOR-13
+        // narrowed that bracket from the whole flush to this call, and the bracket's OWNER moved from
+        // the render task to `flush` itself — the invariant this witness tests did not change). So a
+        // live sprite must never be seen here; if one is, the bracket has a hole and the desktop is
+        // erasing the arrow at flush rate — the spotty symptom, from the other layer. Diagnostic
+        // only: nothing below is conditional on it, so a stale answer costs precision and never a
+        // pixel.
         #[cfg(feature = "witness")]
         let sprite_box = super::cursor::live_box_relaxed();
         #[cfg(feature = "witness")]

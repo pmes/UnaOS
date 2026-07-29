@@ -1369,8 +1369,13 @@ fn undraw_locked(
 /// Restore the pixels the sprite is covering and forget them. A no-op when the sprite is not on the
 /// panel, so every painter may call it unconditionally.
 ///
-/// Called by [`super::wm::composite`], `wm`'s desktop erase, and the render task around its
-/// `Screen::flush` — i.e. by everything that writes to the front framebuffer.
+/// Called by [`super::wm::composite`], `wm`'s desktop erase, and `Screen::flush` around its desktop
+/// blit — i.e. by everything that writes to the front framebuffer.
+///
+/// CURSOR-13 — that last caller used to be the RENDER TASK, wrapping the whole of `Screen::flush`,
+/// which put the flush's window composite inside the bracket too and left [`sprite_plan`] answering
+/// `None` on every one of those passes. The bracket now belongs to `Screen::flush` and covers only
+/// `present_background`; the composite that follows it runs with the sprite on the panel.
 pub fn undraw() {
     let restored = {
         let mut sp = SPRITE.lock();

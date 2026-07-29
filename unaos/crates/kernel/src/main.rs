@@ -3334,11 +3334,20 @@ fn render_service(_: usize) {
         if dirty {
             // CURSOR-1: `Screen::flush` copies back-buffer pixels over the front framebuffer's
             // damaged rects, which would both clobber the sprite and invalidate its save-under. Take
-            // it off first, present, put it back on top — the render task's own ordering, matching
-            // the bracket `wm::composite` applies on the window side.
-            unaos_kernel::video::cursor::undraw();
+            // it off first, present, put it back on top.
+            //
+            // CURSOR-13: that bracket now lives INSIDE `Screen::flush`, around the desktop blit
+            // alone, and it is deliberately not restated here. `flush` is `present_background` (a raw
+            // desktop blit, which still needs the bracket) FOLLOWED BY the window composite (which
+            // must NOT be inside one). Wrapping the pair from out here put every flush-reached
+            // composite between an `undraw` and a `repaint`, so `cursor::sprite_plan()` returned
+            // `None` on 100% of those passes and compose-through could never engage — P74's
+            // `[cursor12] -> nosprite`, on both arches, for structural reasons. See `Screen::flush`
+            // for the full single-owner argument. The cost is unchanged (one restore/save/draw per
+            // present, just scoped to the half that needs it), and every other flush site on this
+            // arch — the boot present above, `rast_demo`, the `video::witness` fixtures — now gets
+            // the desktop bracket without having to remember it.
             pal.render();
-            unaos_kernel::video::cursor::repaint();
             s6_composites += 1;
         }
         s6_cyc += unaos_kernel::arch::now_cycles().wrapping_sub(t0);

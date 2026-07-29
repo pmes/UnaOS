@@ -2627,14 +2627,19 @@ static CUR3_DECL_STALE: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// CURSOR-12 — passes where `cursor::sprite_plan()` returned `None`: the sprite was not on the panel
 /// when the bracket was decided, so no plan could be taken and no window could be offered one.
 ///
-/// **The leading hypothesis for both arches, and it is a CALL-GRAPH fact rather than a race.**
-/// `Screen::flush` ends in `wm::service_damage()` → `composite()`, and the render task brackets its
-/// own flush with `cursor::undraw()` … `cursor::repaint()` (x86: `main.rs`'s console loop; aarch64:
-/// the Pi render task, the CURSOR-1 contract). So every composite reached through the desktop's flush
-/// runs BETWEEN the undraw and the repaint — with `sp.drawn == false`, by the caller's own design.
-/// `sprite_plan()` is `None` for structural reasons on that path, every time, on both arches.
-/// Compose-through can only ever run on a composite reached from `wm::present`, and on the x86 bench
-/// the console's presents are suspended while the installer is up.
+/// **This was the leading hypothesis for both arches, it was confirmed, and CURSOR-13 fixed it.**
+/// `Screen::flush` ends in `wm::service_damage()` → `composite()`, and the render task used to
+/// bracket its own flush with `cursor::undraw()` … `cursor::repaint()` (x86: `main.rs`'s console
+/// loop; aarch64: the Pi render task, the CURSOR-1 contract). Every composite reached through the
+/// desktop's flush therefore ran BETWEEN the undraw and the repaint — with `sp.drawn == false`, by
+/// the caller's own design — so this counter read ≈ `passes` for structural reasons, every time, on
+/// both arches, and compose-through could only ever run on a composite reached from `wm::present`.
+///
+/// CURSOR-13 narrowed that bracket to the desktop blit alone and moved it inside `Screen::flush`
+/// (see that function). Flush-reached composites now enter with the arrow on the panel, so this
+/// counter is no longer structurally pinned: post-fix it should fall to the passes where the pointer
+/// is genuinely hidden (before the first report of the boot, or after CURSOR-HIDE's idle expiry) —
+/// and on a QEMU boot, which has no pointer at all, it legitimately stays at `passes`.
 #[cfg(feature = "witness")]
 static CUR12_NOSPRITE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 

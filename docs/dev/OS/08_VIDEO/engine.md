@@ -4605,3 +4605,131 @@ wiring and no-regression only. The line carries its evidence on the bench.
   `[wc-h] staged=no reason=` next.
 * **`[cursor12]` appearing at all on an rmbp capture** is itself the first result: it means the x86
   track can finally see the cursor mechanism it has been tuning blind.
+
+### CURSOR-13 — one owner for the sprite: the flush-path bracket dies, composite carries the arrow
+
+CURSOR-12 asked which predicate killed the offer and the wire answered on the first sitting. GR7 s48
+silicon, `[cursor12] … nosprite=N passes=N -> nosprite`, 42 samples out of 42, and the same reading
+on the x86 seat. Compose-through was not rare, it was **unreachable** — and the reason is a call
+graph, not a race.
+
+#### The mechanism, in one paragraph
+
+`Screen::flush` is two things bolted together: `present_background`, a raw desktop blit into the
+front framebuffer, and then the window layer (`wm::service_damage` → `composite`, or `wm::repaint` on
+the intrusion fallback). The render task wrapped **the pair** in `cursor::undraw()` …
+`cursor::repaint()` — the CURSOR-1 contract, on both arches (aarch64: `main.rs::render_service`;
+x86: the console loop). So every composite reached through the desktop's flush ran *between* the
+undraw and the repaint, which is to say with `sp.drawn == false`, which is to say
+`cursor::sprite_plan()` returned `None`, which is to say the pass could not take a plan, could not
+open an overlay session, could not offer a window anything, and could not reach CURSOR-11's pend
+class either. Two mechanisms owned the sprite on that path and the older one starved the newer. Our
+own P74 `BRACKETED` lines are the same fact seen from the other end.
+
+Note what this was *not*: not a lock, not a budget, not a contended `try_lock`, not the
+witness-exclusion pair. Every counter CURSOR-3/4/5 added measures declines that happen *downstream*
+of a plan being taken. There was never a plan.
+
+#### The fix: narrow the bracket, and move its owner
+
+The bracket is not deleted. It is scoped to the half that needs it, and it moves from the caller into
+`Screen::flush` itself:
+
+```
+flush():
+    cursor::undraw()          // CURSOR-13 — desktop bracket OPEN
+    present_background()      // raw desktop blit; subtracts window boxes (WC-I), not the sprite
+    cursor::repaint()         // CURSOR-13 — desktop bracket CLOSED
+    wm::service_damage()      // composite runs with the arrow ON GLASS
+```
+
+and `render_service`'s `if dirty { … }` arm becomes a bare `pal.render()`.
+
+**Why `present_background` keeps its bracket.** It is not a window composite and there is no
+compose-through to engage there — the desktop is not a staged surface, so there is no layer into
+which the arrow could be composed. It writes desktop pixels straight at the panel and it knows
+nothing about the sprite (its WC-I subtraction covers the *window* layer only), so a live arrow
+standing over desktop would be overwritten and its save-under left describing pixels that are no
+longer on the panel. Bracketing it costs exactly one restore/save/draw per present — the same cost
+the old bracket paid — and buys the coherence the sprite module's save-under depends on. Extending
+CURSOR-11's pend to cover it was considered and rejected: pend defers a handback because a *staged*
+surface will carry the pixels through, and settles against the finished front through
+`adopt_overlay`. The desktop blit stages nothing and there is no session to install coverage into, so
+a deferral there would have nothing to settle it — the exact reason the sessionless composite arm
+(`undraw_within_nosession`) is not allowed to defer either.
+
+**Why it lives in `flush` and not in the render task.** Same argument that split `present_background`
+out in the first place: no flush site should have to remember the bracket. The boot present, the
+`rast_demo` path and the `video::witness` fixtures all get it now without restating it, and there is
+exactly one place where the desktop-vs-sprite ordering is written down.
+
+#### What the composite half now does
+
+With the arrow on glass, `sprite_plan()` returns a real plan and the flush-reached pass takes the
+machinery that has been sitting there since CURSOR-3, unchanged:
+
+* a staged window opens the overlay session, `defer_within` writes no pixels, `compose_into` paints
+  the arrow into the staged rows, and `adopt_overlay` installs the covered pixels before the deferred
+  ones are settled — CURSOR-11's coverage-install-first ordering, which is what keeps the save-under
+  answerable against a *finished* front;
+* a WC-F reserved box, or a pass that cannot get the session, takes its whole-sprite /
+  `undraw_within_nosession` bracket exactly as it does on the `wm::present` path today. That
+  distinction already existed; CURSOR-13 adds no new class.
+
+#### Coherence consequences, stated
+
+* **Save-under.** `cursor::repaint` is called *after* `present_background` and *before* the
+  composite, so the arrow's save-under is taken against a front buffer whose desktop is already
+  final. Window pixels under the arrow may still change during the composite that follows — and that
+  is precisely the case the pend/adopt path exists to settle, per pixel, against the finished front.
+* **CURSOR-9 / `TOUCHED_SINCE_DRAW`.** Untouched, and now actually exercised on this path: a present
+  landing under a live sprite arms the repair through `note_present_over_sprite`, and there is at
+  last a live sprite for it to arm for. The colour-guard residual is repaired *sooner* than before,
+  not later — `repaint`'s own `repair` tail damages every window the restore crossed, and the
+  composite on the very next line services that damage inside the same flush.
+* **CURSOR-6 / `note_desktop_over_sprite`.** Its meaning is unchanged: it is the hole detector for
+  the desktop bracket, and the bracket still exists. Expected 0. A non-zero reading now means the
+  narrowed bracket has a hole, which is a strictly easier thing to locate than before.
+* **`[wc-d]`.** The FORBID set is the correctness backstop for exactly this change — it read the
+  scan-out back inside a window's rect and must never find a sprite pixel there. It is the composite
+  path's brackets and the compose-through/adopt settle, not the flush caller's bracket, that make
+  that true; CURSOR-13 removes nothing `[wc-d]` was resting on.
+
+#### Expected wire (bench)
+
+Post-fix, with the pointer over a window:
+
+```
+[cursor12] offer scope=… passes=N nosprite=0 nohit=… reserved=0 nosession=… planned=P>0 … -> …
+[cursor3]  rollup scope=… planned=P>0 offers=O>0 taken=T>0 adopt=… repaint=… ensure=… -> …
+[cursor11] compose-through scope=… passes=P bracketed=B px_deferred=D>0 px_installed=I px_redrawn=R
+```
+
+`nosprite` must fall to the passes where the pointer is *genuinely* hidden — before the first report
+of the boot, and after CURSOR-HIDE's ~1.5 s idle expiry. `nosprite ≈ passes` with a pointer moving on
+the panel means the fix did not take. With the pointer over the desktop the honest answer is
+`nohit ≈ passes`, not `nosprite`. `[cursor6] desktop_over=` must stay 0.
+
+#### Gate results (CURSOR-13, 2026-07-29, QEMU raspi4b)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
+* `./arroyo kernel8-test 210` — **`✅ MBENCH PASS — 86/86 required witnesses, 0 forbidden hit(s)`**,
+  21270 lines scanned. `[wc-d] … -> PASS` throughout; `[wc-i] rollup … -> CLEAN`
+  (`intrusions=0`, `cursor_passes=350`, `cursor_brackets=1`).
+* `[cursor12] offer scope=fixture passes=350 nosprite=350 … -> nosprite` and
+  `[cursor6] … desktop_over=0 … -> UNWITNESSED`.
+
+**QEMU raspi4b has no pointer**, so the sprite is never drawn, `nosprite=passes` is the *correct*
+reading there and cannot move. The gate proves no-regression only. The verdict is owed by the bench.
+
+#### Metal watch-list (CURSOR-13)
+
+* **`[cursor12] nosprite` still ≈ `passes` with the pointer live over a window** — the fix did not
+  take; look for a second bracket around a flush site.
+* **`[cursor6] desktop_over` > 0** — the narrowed desktop bracket has a hole; the desktop is erasing
+  the arrow at flush rate.
+* **`[cursor11] px_deferred` > 0 with `px_installed + px_redrawn` lagging it persistently** — the
+  settle is not keeping up and the save-under is going stale; that is CURSOR-11's territory, now
+  reachable for the first time.
+* **A spotty or trailing arrow over the desktop** — the desktop bracket, not the composite path.
+  Over a *window*, it is the composite path.
