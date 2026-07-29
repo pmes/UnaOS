@@ -3747,3 +3747,26 @@ six-vug storm. Positive verification is a wedge on the bench.
   region — the first direct evidence about whether this is a one-core death or a pile-up.
 * A wire that reaches `<F9>` and wedges later has exonerated the focus chain for that press, and the
   next instrument belongs downstream in the pump.
+
+### WEDGE-4 probe (x86) — `<W1>`/`<W2>`, the run-queue preempt window
+
+Two more tokens ride the same raw-byte primitive and the same `UNAOS_WEDGE2` knob, emitted by
+`arch/x86_64/sched.rs` (module `wedge4`). They exist because the x86 tree CONFIRMED the shape the
+pi seat's W4 candidate predicted (relay r23s1q): the dispatcher (`run`) and `timer_preempt` operate
+IRQ-masked, while the spawn/wake paths (`spawn_inner`, `spawn_user_inner`, `make_ready`) acquire a
+`RUN_QUEUES` lock with IF possibly 1. A quantum expiry inside that window switches the holder out
+mid-hold, and the scheduler context then spins IRQ-masked on a lock whose holder can only run again
+through this very dispatcher — permanent, silent, no panic, no Pi hardware required.
+
+| Token | Meaning |
+|---|---|
+| `<W1>` | `timer_preempt` is switching away from a task that is INSIDE an unmasked run-queue critical section. The window is real and was just hit; whether a wedge follows depends on who needs that lock next. Capped at 16 emits. |
+| `<W2>` | the dispatcher's run-queue acquisition (loop-top pop or the switch-back requeue) exceeded a ~2e8-poll spin bound (seconds). The wedge is HAPPENING on this core, named at wedge time. After the token the path blocks exactly as the un-instrumented one would. Capped at 4 emits. |
+
+`<W1>` without `<W2>` on a healthy boot = the window fires and survives (the next acquirer was not
+this CPU's masked dispatcher). `<W2>` on the wire at wedge time = the candidate is CONFIRMED on
+silicon and the fix is the aarch64-spec'd one: mask IRQs across the spawn-path acquisitions —
+masking only, weakens nothing. Note the x86 wedge (s44) died with NO focus chain in flight — the
+`<F*>` chain cannot fire on an x86 image (no TAB router yet; `focus_changed` has no production
+caller, so its tokens dead-strip) — which is exactly why the sched-side probes are the x86
+instrument of record for this hunt.

@@ -454,6 +454,81 @@ lazy_static! {
         core::array::from_fn(|_| SpinMutex::new(VecDeque::with_capacity(RUNQ_CAPACITY)));
 }
 
+/// WEDGE-4 probe (x86 half of the cross-arch W4 candidate, relayed r23s1q). `RUN_QUEUES`' doc says
+/// the lock is "held only briefly" — but briefly is not the same as ATOMICALLY. The dispatcher
+/// (`run`) and `timer_preempt` both operate with IF=0, while the spawn/wake paths (`spawn_inner`,
+/// `spawn_user_inner`, `make_ready`) acquire a queue lock with IF possibly 1. A quantum expiry
+/// landing inside one of those unmasked critical sections switches the holder out MID-HOLD; the
+/// scheduler context then takes `RUN_QUEUES[cpu].lock()` IRQ-masked and spins on a lock whose
+/// holder can only ever run again through this very dispatcher. Permanent, silent, no panic —
+/// the P66/P68/s44 death shape, needing no Pi hardware.
+///
+/// Two probes, both using the WEDGE-2 raw-byte primitive (no lock, bounded poll) so the instrument
+/// cannot itself block on anything the dying chain holds:
+/// * `<W1>` — `timer_preempt` fired while this CPU was inside an unmasked run-queue critical
+///   section AND is about to context-switch away from it. The window exists; capped at 16 emits.
+/// * `<W2>` — the dispatcher's own run-queue acquisition exceeded its spin bound (~seconds). The
+///   wedge is HAPPENING on this core, named at wedge time instead of spinning silently. Capped at
+///   4 emits, then falls back to the ordinary blocking acquisition (behaviour unchanged).
+///
+/// Knob-gated with the rest of the wedge instrumentation family (`UNAOS_WEDGE2=1`): default-off
+/// builds carry no flag writes, no tokens, no extra branch in the dispatch loop.
+#[cfg(feature = "wedge2")]
+mod wedge4 {
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /// Per-CPU: "this CPU is inside a run-queue critical section it entered with IRQs unmasked."
+    /// Set BEFORE the acquisition begins (the spin is part of the window) and cleared after the
+    /// guard drops. Relaxed everywhere: it gates a diagnostic token and orders nothing.
+    pub static IN_RQ: [AtomicBool; super::MAX_CPUS] =
+        [const { AtomicBool::new(false) }; super::MAX_CPUS];
+    static W1_EMITS: AtomicU32 = AtomicU32::new(0);
+    static W2_EMITS: AtomicU32 = AtomicU32::new(0);
+
+    /// Mark this CPU inside the window. Caller clears with [`leave`] on the same CPU — the spawn
+    /// paths run preemptible, but a preempted task resumes on the queue-owning CPU it was pinned
+    /// to, so the flag it set is the flag it clears.
+    pub fn enter(cpu: usize) {
+        IN_RQ[cpu].store(true, Ordering::Relaxed);
+    }
+    pub fn leave(cpu: usize) {
+        IN_RQ[cpu].store(false, Ordering::Relaxed);
+    }
+
+    // Through `wedge2::mark`, not a local loop: `mark` is `#[inline(never)]`, which is what keeps
+    // the token a real string in the image — the strings census depends on that (a local loop gets
+    // unrolled into byte constants and the census reads 0 for a token that emits fine).
+    fn emit(counter: &AtomicU32, cap: u32, tok: &str) {
+        if counter.fetch_add(1, Ordering::Relaxed) < cap {
+            crate::wedge2::mark(tok);
+        }
+    }
+
+    /// W4-A: called from `timer_preempt` (IF=0) just before it switches away from the current task.
+    pub fn note_preempt_in_rq(cpu: usize) {
+        if IN_RQ[cpu].load(Ordering::Relaxed) {
+            emit(&W1_EMITS, 16, "<W1>");
+        }
+    }
+
+    /// W4-B: acquire `m` with a bounded spin; name the stall on the wire if the bound trips, then
+    /// block exactly as the un-instrumented path would. The bound (~2e8 polls) is seconds of wall
+    /// clock — three orders of magnitude past any legitimate hold of this lock.
+    pub fn lock_or_squawk<'a, T>(m: &'a super::SpinMutex<T>) -> spin::MutexGuard<'a, T, spin::Spin> {
+        let mut spins: u64 = 0;
+        loop {
+            if let Some(g) = m.try_lock() {
+                return g;
+            }
+            spins += 1;
+            if spins == 200_000_000 {
+                emit(&W2_EMITS, 4, "<W2>");
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// A parked sleeper: its wake deadline (owning CPU's tick count) and the task.
 struct Sleeper {
     deadline: u64,
@@ -605,7 +680,14 @@ fn spawn_inner(
         kill: None,
     });
 
+    // WEDGE-4 `<W1>` window: this acquisition can run with IF=1; see `wedge4`.
+    #[cfg(feature = "wedge2")]
+    let w4cpu = percpu::this_cpu().cpu_index as usize;
+    #[cfg(feature = "wedge2")]
+    wedge4::enter(w4cpu);
     RUN_QUEUES[target_cpu].lock().push(task);
+    #[cfg(feature = "wedge2")]
+    wedge4::leave(w4cpu);
     poke_for(target_cpu, priority);
     id
 }
@@ -797,7 +879,14 @@ fn spawn_user_inner(
         preemptible,
         kill,
     });
+    // WEDGE-4 `<W1>` window: this acquisition can run with IF=1; see `wedge4`.
+    #[cfg(feature = "wedge2")]
+    let w4cpu = percpu::this_cpu().cpu_index as usize;
+    #[cfg(feature = "wedge2")]
+    wedge4::enter(w4cpu);
     RUN_QUEUES[target_cpu].lock().push(task);
+    #[cfg(feature = "wedge2")]
+    wedge4::leave(w4cpu);
     poke_for(target_cpu, PRIO_NORMAL);
     id
 }
@@ -978,7 +1067,14 @@ fn make_ready(task: Box<Task>) {
     let prio = task.priority;
     debug_assert!(target < MAX_CPUS, "make_ready: cpu out of range");
     task.state.store(STATE_READY, Ordering::Release);
+    // WEDGE-4 `<W1>` window: this acquisition can run with IF=1; see `wedge4`.
+    #[cfg(feature = "wedge2")]
+    let w4cpu = percpu::this_cpu().cpu_index as usize;
+    #[cfg(feature = "wedge2")]
+    wedge4::enter(w4cpu);
     RUN_QUEUES[target].lock().push(task);
+    #[cfg(feature = "wedge2")]
+    wedge4::leave(w4cpu);
     poke_for(target, prio);
 }
 
@@ -1850,7 +1946,11 @@ pub fn timer_preempt() {
         return;
     }
 
-    // Preempt. We are already IF=0 (interrupt gate) and hold no lock.
+    // Preempt. We are already IF=0 (interrupt gate) and hold no lock — but the task we are about
+    // to switch AWAY from may hold one. WEDGE-4 `<W1>`: if it is inside an unmasked run-queue
+    // critical section, this switch is the wedge candidate's trigger, named on the wire.
+    #[cfg(feature = "wedge2")]
+    wedge4::note_preempt_in_rq(cpu);
     unsafe {
         (*raw).state.store(STATE_READY, Ordering::Release);
         switch_context(&raw mut (*raw).ctx_rsp, SCHED[cpu].scheduler_rsp.load(Ordering::Acquire));
@@ -1902,6 +2002,12 @@ fn run() -> ! {
         // at base with a fresh clock, are visible to it) and BEFORE the pop, so a task cannot be
         // dispatched before it is aged in the same pass.
         let next = {
+            // WEDGE-4 `<W2>`: this is THE acquisition the candidate mechanism wedges — IRQ-masked,
+            // spinning on a lock whose holder this dispatcher itself preempted. Bounded, so the
+            // wire names the stall instead of the core dying silently.
+            #[cfg(feature = "wedge2")]
+            let mut q = wedge4::lock_or_squawk(&RUN_QUEUES[cpu]);
+            #[cfg(not(feature = "wedge2"))]
             let mut q = RUN_QUEUES[cpu].lock();
             let now = percpu::this_cpu().ticks.load(Ordering::Relaxed);
             let elapsed = now.wrapping_sub(last_age);
@@ -2002,6 +2108,10 @@ fn run() -> ! {
                             // transient promotion down by one toward base rather than re-basing, so a
                             // task dispatched mid-climb re-climbs at most one level (the aging refinement).
                             task.state.store(STATE_READY, Ordering::Release);
+                            // WEDGE-4 `<W2>`: same masked-context acquisition as the loop top.
+                            #[cfg(feature = "wedge2")]
+                            wedge4::lock_or_squawk(&RUN_QUEUES[cpu]).requeue(task);
+                            #[cfg(not(feature = "wedge2"))]
                             RUN_QUEUES[cpu].lock().requeue(task);
                         }
                     }
