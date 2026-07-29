@@ -1344,29 +1344,8 @@ pub extern "C" fn _start() -> ! {
             if fi.clicks > 0 {
                 clicks = clicks.wrapping_add(fi.clicks);
                 say(b":: UVUG: click n=", clicks);
-                // ===== LAYER 2 (CLICK-RUN) — ONE HUNK; DELETE THESE FOUR LINES TO REMOVE IT =========
-                // P75's other candidate grammar: a click is ALSO the stop/start control, with the
-                // toggle defined ABSOLUTELY rather than as the inversion of an invisible flag — **if
-                // the vug is not running (paused for any reason, or hidden/frozen for any reason) it
-                // RUNS; if it is running it STOPS.** One click, one visible effect, decided from what
-                // the operator can SEE.
-                //
-                // `paused = !(paused || hidden)` is that sentence: the right-hand side is the pre-click
-                // FROZEN predicate, the very expression the fold below re-computes, so the decision is
-                // made against the state on the panel and never against `paused` alone. In practice
-                // `hidden` is already false when a RESTORING click is read — the router unhides the
-                // raised owner before it queues the press — so the frozen-ness such a click cancels is
-                // the `paused` half; the `|| hidden` term is what makes the rule hold anyway, and is
-                // why this is not a blind `paused = !paused`. Parity (`& 1`) for the same reason SPACE
-                // takes it: two clicks in one frame are two toggles and cancel.
-                //
-                // Deleting these lines leaves LAYER 1 exactly: a click focuses, is acknowledged, and
-                // changes no run state. Nothing outside this block refers to it.
-                if fi.clicks & 1 != 0 {
-                    paused = !(paused || hidden);
-                    say(b":: UVUG: pause=", paused as u32);
-                }
-                // ===== end LAYER 2 =================================================================
+                // LAYER 2 (CLICK-RUN) DELETED — Peter's verdict on P76/P77 metal: click SELECTS
+                // (focus + the ack above), SPACE stops/starts. A click changes no run state.
             }
         }
 
