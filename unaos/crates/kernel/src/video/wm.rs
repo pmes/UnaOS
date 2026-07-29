@@ -4918,6 +4918,12 @@ static HT_SURF: [u32; 64] = [0x0020_C080; 64];
 ///    right; leg 7 asserts it for the focus that owns nothing on the panel, which is the case it got
 ///    wrong and which this suite reported PASS on for the whole time the bench could not click into
 ///    the shell. See [`clickshell_windowless_leg`].
+/// 8. **swallow / deliver / wake** (CLICK-SWALLOW, P73) — the HIT arm's policy, which legs 6 and 7
+///    leave entirely unasserted: a press on an UNFOCUSED window must move focus and reach the app's
+///    ring NOT AT ALL, the next press on that (now focused) window must be delivered, and neither
+///    must cost the VUGPAUSE-2r2 restore chain. Three fields rather than one because they fail in
+///    three different directions, and the middle one is the regression guard on the fix itself. See
+///    [`clickswallow_leg`].
 ///
 /// Self-cleaning on the FOCUS-VIS pattern: both windows are closed, `SHELL_Z` and `FOCUS_ASID` are
 /// restored (this calls `focus_changed` with SYNTHETIC asids, which must not be left naming an address
@@ -5002,6 +5008,115 @@ fn clickshell_windowless_leg(_asid: u64) -> Option<bool> {
     None
 }
 
+/// CLICK-SWALLOW (P73) — leg 8 of [`hittest_selftest`]: **the app never sees a click it did not own
+/// the focus for.**
+///
+/// Legs 6 and 7 assert the MISS arm's policy. This one asserts the HIT arm's, which is where the
+/// bench defect lived: CLICK-ROUTE raised the clicked window and then delivered the press to it, so
+/// the one gesture that restores a backgrounded vug also worked its click-to-pause toggle and the vug
+/// came back paused ("restarting a vug I have to click twice"). The three things this leg checks are
+/// exactly the three the fix has to get right at once, and the third is why it is not simply a
+/// `return true`:
+///  * **swallow** — a press on an UNFOCUSED window moves focus AND the owner's ring receives NOTHING.
+///    The ring is the only honest place to ask that question ([`el0_input_depth`]); the router's
+///    return value says what the ROUTER decided, not what the app got, and the two are what the whole
+///    seam sits between. Checked after the press and again after the release, because a swallowed
+///    press whose release still landed would be the fabricated half-click [`CLICK_PRESS_TARGET`]
+///    exists to prevent.
+///  * **deliver** — the very next press, now on the SAME (and now focused) window, IS delivered. The
+///    swallow must cost the operator one click on a refocus, not disable the app's mouse.
+///  * **wake** — the swallowed press still runs the VUGPAUSE-2r2 restore chain. This is the leg's
+///    real content. A fix that consumed the press EARLY — before `el0_input_set_active` and
+///    `focus_changed` — would pass the first two checks and reintroduce P72 in a worse form: the vug
+///    would not come back paused, it would not come back at all. `el0_input_wake_edges` counts the
+///    NAMED edges the seam was asked to run, so this reads 2 (focus arrival, then unhide) regardless
+///    of whether anything was parked — which matters, since on a headless gate nothing ever is.
+///
+/// Drives [`crate::arch::aarch64::syscall::el0_input_enqueue`] rather than `wc_click_route`, because
+/// the claim is about DELIVERY and the push lives on the far side of the router. The window is placed
+/// UNDER the real cursor (the router hit-tests the live pointer, so the fixture moves the window, not
+/// the pointer); `None` = not asserted, when the pointer sits somewhere this leg cannot build that
+/// fixture, when a compat row owns the panel, or when `owner` is not free to borrow.
+///
+/// Self-cleaning: the window is closed, the owner's ring is reset (via a focus arrival, the one
+/// primitive that clears it) and focus is dropped to the shell, so the slot is left exactly as found.
+#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal"))]
+fn clickswallow_leg(owner: u64, other: u64, surf: usize, len: usize) -> Option<(bool, bool, bool)> {
+    use crate::arch::aarch64::syscall as sc;
+    use crate::pal::Event::Button;
+    if compat_live() {
+        return None; // the deliver-as-before exemption owns the panel: not this leg's fixture
+    }
+    // `owner` is a REAL private-slot ASID (it must be, or it would have no ring at all), so unlike
+    // ASID_A/B it could in principle name a LIVE app. Borrow it only if nothing is using it: it holds
+    // no input focus and owns no window in the table.
+    if sc::el0_input_active() == owner {
+        return None;
+    }
+    let mut ring = [0u64; MAX_WINDOWS];
+    let n = focus_ring(&mut ring);
+    if ring[..n].contains(&owner) {
+        return None;
+    }
+
+    let (pw, ph) = {
+        let info = super::WRITER.lock().info();
+        (info.width as i32, info.height as i32)
+    };
+    let (cx, cy) = crate::pal::cursor::pos(pw, ph);
+    // Room for the chrome above/left of the content origin and for the box below/right of it.
+    if cx < 64 || cy < 64 || cx + 64 >= pw || cy + 64 >= ph {
+        return None;
+    }
+
+    let w = create(owner, surf, len, 8, 8, 32, b"ht-s");
+    if w == WIN_NONE {
+        return None;
+    }
+    // Content origin two pixels up-left of the pointer, so the pointer is inside the content area —
+    // the same relation leg 1's probe point has to `ox`/`oy`, built the other way round.
+    move_to(w, (cx - 2) as usize, (cy - 2) as usize);
+    focus_changed(owner); // raise it above the fixture rows leg 5 left buried and leg 6 re-raised
+    if hit_test(cx, cy).map(|(_, a, _)| a) != Some(owner) {
+        close(w); // the pointer does not address this window after all: no fixture, assert nothing
+        focus_changed(0);
+        return None;
+    }
+
+    // --- swallow: an UNFOCUSED hit. A focus arrival resets the ring, so `owner` starts empty; focus
+    // then moves to `other` (a synthetic ASID outside the slot range — it clears no ring and runs no
+    // wake edge of its own, so the baseline below is clean).
+    sc::el0_input_set_active(owner);
+    sc::el0_input_set_active(other);
+    let edges0 = sc::el0_input_wake_edges();
+    let queued = sc::el0_input_enqueue(Button(1));
+    let depth_press = sc::el0_input_depth(owner);
+    let refocused = sc::el0_input_active() == owner;
+    let edges1 = sc::el0_input_wake_edges();
+    let _ = sc::el0_input_enqueue(Button(0));
+    let depth_release = sc::el0_input_depth(owner);
+    let swallowed = !queued && refocused && depth_press == 0 && depth_release == 0;
+    let woke = edges1.wrapping_sub(edges0) >= 2;
+
+    // --- deliver: the SAME window, now focused (the press above left focus here). Ordinary app input.
+    let queued2 = sc::el0_input_enqueue(Button(1));
+    let delivered = queued2 && sc::el0_input_depth(owner) == 1;
+    let _ = sc::el0_input_enqueue(Button(0));
+
+    close(w);
+    sc::el0_input_set_active(owner); // the one primitive that resets a ring — leave the slot clean
+    sc::el0_input_set_active(0);
+    focus_changed(0);
+    Some((swallowed, delivered, woke))
+}
+
+/// CLICK-SWALLOW, DORMANT half: no arch router (and no EL0 input rings) in this build, so leg 8
+/// asserts nothing.
+#[cfg(all(feature = "witness", not(all(target_arch = "aarch64", feature = "baremetal"))))]
+fn clickswallow_leg(_owner: u64, _other: u64, _surf: usize, _len: usize) -> Option<(bool, bool, bool)> {
+    None
+}
+
 #[cfg(feature = "witness")]
 pub fn hittest_selftest() {
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -5029,6 +5144,11 @@ pub fn hittest_selftest() {
     /// CLICK-SHELL r2 leg 7's owner: synthetic, and deliberately never passed to `create` — the leg
     /// needs a focus that owns NOTHING.
     const ASID_C: u64 = 0xC0C;
+    /// CLICK-SWALLOW leg 8's owner, and the one ASID here that is NOT synthetic: the leg asserts what
+    /// an app's input RING received, and rings exist only for private slots (`1..=USER_SLOTS`). The
+    /// HIGHEST slot, because slots are handed out from the bottom, so it is the last one a live app
+    /// would be holding — and the leg checks that it is free before borrowing it, and resets it after.
+    const SWALLOW_ASID: u64 = 8;
     let s = &raw const HT_SURF as usize;
     let len = core::mem::size_of_val(&HT_SURF);
     // 8x8 ARGB8888, stride 32 BYTES (= 8 px) — the FOCUS-VIS surface geometry exactly. The compositor
@@ -5077,18 +5197,40 @@ pub fn hittest_selftest() {
     // is the leg that fails without the predicate fix. ASID_C owns nothing by construction.
     let bare: Option<bool> = clickshell_windowless_leg(ASID_C);
 
+    // Leg 8 — CLICK-SWALLOW (P73). The HIT arm's policy, which legs 6 and 7 do not touch: a press on
+    // an UNFOCUSED window moves focus and is CONSUMED, the next press on it (now focused) is
+    // delivered, and the swallow does not skip the VUGPAUSE-2r2 restore chain. Needs a real
+    // private-slot ASID — the assertion is about a RING, and only slot ASIDs have one — so it runs
+    // last, borrows the highest slot, and hands it back reset. `ASID_A` stands in as the app that
+    // held focus before the click.
+    let swallow: Option<(bool, bool, bool)> = clickswallow_leg(SWALLOW_ASID, ASID_A, s, len);
+
     let ok = inside_ok
         && topmost_ok
         && raise_ok
         && outside_ok
         && hidden_ok
         && shell != Some(false)
-        && bare != Some(false);
+        && bare != Some(false)
+        && swallow.map(|(a, b, c)| a && b && c) != Some(false);
+    let verdict3 = |v: Option<(bool, bool, bool)>, pick: fn((bool, bool, bool)) -> bool| match v {
+        Some(t) => {
+            if pick(t) {
+                "true"
+            } else {
+                "false"
+            }
+        }
+        None => "skip",
+    };
     serial_println!(
-        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} hidden={} shell={} bare={} -> {}",
+        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} hidden={} shell={} bare={} swallow={} deliver={} wake={} -> {}",
         ix, iy, inside_ok, topmost_ok, raise_ok, outside_ok, hidden_ok,
         match shell { Some(true) => "true", Some(false) => "false", None => "skip" },
         match bare { Some(true) => "true", Some(false) => "false", None => "skip" },
+        verdict3(swallow, |t| t.0),
+        verdict3(swallow, |t| t.1),
+        verdict3(swallow, |t| t.2),
         if ok { "PASS" } else { "FAIL" }
     );
 

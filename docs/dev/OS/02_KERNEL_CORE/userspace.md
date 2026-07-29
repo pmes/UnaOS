@@ -1974,6 +1974,8 @@
       `wc_focus_key` calls them — then let the press fall through to the enqueue, which re-reads the now
       **new** active ASID and delivers there. No second focus path was invented: this is a new **caller**
       of the WEDGE path, so a click-driven raise emits the same `<F1>`–`<F9>` breadcrumbs a TAB does.
+      *(Superseded by CLICK-SWALLOW below: the raise stands, the fall-through does not — a
+      focus-changing press is now consumed. Left standing as the record of what was tried.)*
     - **hit on the focused window** → delivered exactly as before. The common case, unchanged.
     - **no window hit** → the click is the desktop's or the console's, not the focused app's, so it is
       **consumed** rather than delivered. That single arm is P69's fix. Two deliberate limits on it:
@@ -2097,6 +2099,71 @@
   `[clickroute] hit-test at (215,135) inside=true topmost=true raise=true outside=true hidden=true shell=true bare=true -> PASS`
   and both legs' router lines (`press miss … (was 3082)`, `press miss … (was 3084)`). **Metal still
   proves the arc** — QEMU raspi4b delivers no HID, so the live arms remain unverified in QEMU by nature.
+
+- **CLICK-SWALLOW (a focus-changing click is a window-manager gesture, not app input)** — the ruling on
+  the item VUGPAUSE-2r2 flagged and deferred to this lane (see its "Not changed" note below), which
+  supersedes the CLICK-ROUTE bullet's **first** sub-point exactly as CLICK-SHELL superseded its last.
+
+  **P73, attended:** *"sometimes a click gets lost… restarting a vug I have to click twice."* CLICK-ROUTE
+  shipped the hit arm as raise-then-**fall-through**: the press that raised a window was then delivered
+  to it. For a vug, a delivered click **is** the `VUGCLICK` pause toggle, so the one gesture that
+  restores a backgrounded vug carried two meanings at once — *focus this* and *toggle this* — and the vug
+  came back **paused**. It looks dead; the operator clicks again; that second (now ordinary, focused)
+  click resumes it. That is the "click twice", and it is also the whole of the pattern the report could
+  not pin down: it bites exactly when the clicked vug was **not already focused**, and never otherwise.
+  Note this is not a lost click at all — both clicks arrive, the first one just spends itself on a
+  meaning the operator did not intend.
+
+  **The rule: an app never sees a click it did not own the focus for.** A press that *changes* focus is
+  addressed to the window system, not to the app. The hit arm now does what the miss arm has always done
+  — `CLICK_TARGET_DROP`, return `true`, and the matching release is dropped with it so no half-pair
+  reaches anyone. A press on the **already focused** window under the cursor is untouched and still
+  delivered: that is ordinary app input and it is the common case. Click-to-focus **without**
+  focus-follows-through, which is where every window manager that has thought about it converged; it
+  costs the operator exactly the one click they were already spending on a refocus, only now that click
+  does one thing instead of two.
+
+  **What the swallow does *not* touch — the restore chain.** Both VUGPAUSE-2r2 wake edges fire *before*
+  the consume decision, from inside the two calls the arm already made: the focus arrival
+  (`el0_input_set_active` → `el0_input_wake_edge(asid, "focus")`) and the unhide (`wm::focus_changed` →
+  `set_hidden(asid, false)` → `el0_input_wake_edge(asid, "unhide")`). The swallow withholds a **ring
+  push** and nothing else, so a press on a parked, hidden, unfocused vug still produces the `[vugpause2]
+  resume` pair and still re-readies the waiter — the vug wakes, observes its own restore, and is simply
+  not handed a click. A fix that consumed the press *early* would have passed every behavioural check and
+  reintroduced P72 in a worse form (the vug would not come back at all), which is why the witness asserts
+  this edge and not only the delivery.
+
+  **Both callers converge without a second decision.** The EL0-focus path (`el0_input_enqueue`) reads
+  `true` and returns "not queued". The **shell** path (`main.rs`'s `Button` arm) reads `true` and
+  `continue`s its drain — which lands it exactly where its old `break` did, because
+  `el0_input_set_active` has already drained `EVENT_QUEUE` as part of granting focus, so the loop finds
+  nothing behind the press either way. `main.rs` is unchanged; its `el0_input_active() != before` arm is
+  now unreachable and left standing as the defensive check it was.
+  UVUG's click-to-exit and the compat row are untouched: `hit_test` excludes compat rows and owner-0
+  rows, so a full-screen app still reads as *no hit* and still takes the miss arm's deliver exemption.
+
+  **Witness.** The router's line names the disposition — `[clickroute] press hit asid=<a> win=<w> (was
+  <m>) swallowed` — and `hittest_selftest` gains **leg 8**, three fields, because the fix fails in three
+  directions: `swallow=` (an unfocused hit moves focus **and** the owner's ring depth stays 0, checked
+  after the press *and* after the release), `deliver=` (the very next press, now on that focused window,
+  *is* queued and the ring depth is 1), `wake=` (the named-edge counter advanced by 2 across the
+  swallowed press — focus arrival, then unhide). Two new read-only seams carry it: `el0_input_depth(asid)`
+  (unread events in a ring — the only honest way to ask what the *app* got, as opposed to what the
+  *router* decided) and `el0_input_wake_edges()` (cumulative named wake edges *asked for*, which is the
+  question a headless gate can answer; `EL0_INPUT_WAKES` counts waiters actually released and is always
+  0 there). Leg 8 is the only leg needing a real private-slot ASID — rings exist only for slots — so it
+  borrows the **highest** slot (8, the last one a live app would hold), skips if that slot holds focus or
+  owns a window, and hands it back reset. It places its window **under** the live cursor rather than
+  moving the pointer, and drives `el0_input_enqueue` rather than `wc_click_route`, since the claim is
+  about delivery and the push lives on the far side of the router.
+
+  **Gates:** `./arroyo check` ✅ x86_64 / ✅ aarch64 (and with `UNAOS_WITNESS=1`); `./arroyo kernel8-test`
+  **✅ MBENCH PASS — 86/86, 0 forbidden**, 6177 lines, first run, with
+  `[clickroute] press hit asid=8 win=3 (was 3082) swallowed` and
+  `[clickroute] hit-test at (215,135) … shell=true bare=true swallow=true deliver=true wake=true -> PASS`.
+  `[vugmin] wm scope=fixture hides=0 unhides=0 … -> DORMANT` unchanged — leg 8 raises but never buries,
+  so it perturbs no counter. **Metal still proves the arc**: QEMU raspi4b delivers no HID, so the
+  operator-facing claim (one click restores a vug *running*) is a bench observation by nature.
 
 - **VUGPAUSE (a paused vug stops burning cores)** — an **app-only** arc: `crates/user-vug` + this doc, no
   kernel change. **VUGCLICK** made a click *pause* a vug, and that is as far as it went: pause froze the
@@ -2410,10 +2477,13 @@
     actually releases someone. The router's per-event push edge stays silent (mouse-motion rate). This is
     the line that separates the two outcomes on wire: a **stranded** vug shows `[clickroute] press hit`
     with no `resume` after it; a **restored** one shows the pair.
-  - **Not changed, and flagged instead:** the press that raises a window is also delivered to it
-    (CLICK-ROUTE's documented design), so the click that restores a vug is *also* a `VUGCLICK` pause
-    toggle — the restored vug comes back paused and needs a second click to resume rotating. That is a UX
-    question about click-to-focus semantics, not the strand, and it belongs to the CLICK-ROUTE lane.
+  - **Not changed here, flagged instead — and since FIXED by CLICK-SWALLOW (above):** the press that
+    raises a window was also delivered to it (CLICK-ROUTE's documented design), so the click that
+    restores a vug was *also* a `VUGCLICK` pause toggle — the restored vug came back paused and needed a
+    second click to resume rotating. That was a UX question about click-to-focus semantics rather than
+    the strand, so it was left to the CLICK-ROUTE lane; P73 is the bench report that carried it, and the
+    hit arm now swallows a focus-changing press. This bullet's three wake edges are unaffected: the
+    swallow sits strictly downstream of both of the ones a restore crosses.
   - **Gates:** `./arroyo check` green both arches; `./arroyo kernel8-test` **MBENCH PASS 86/86, 0
     forbidden**, `UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c` unchanged.
 

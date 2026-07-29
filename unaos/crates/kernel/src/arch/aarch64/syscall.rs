@@ -11729,6 +11729,12 @@ static EL0_INPUT_PARKED: [AtomicBool; super::boot::USER_SLOTS + 1] =
 static EL0_INPUT_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static EL0_INPUT_WAKES: AtomicU64 = AtomicU64::new(0);
 
+/// CLICK-SWALLOW: how many NAMED wake edges (`focus` / `unhide` — the VUGPAUSE-2r2 restore chain) the
+/// wake seam has been ASKED to run, whether or not a waiter was there to release. Distinct from
+/// `EL0_INPUT_WAKES`, which counts waiters actually woken: a headless gate parks nobody, so only this
+/// counter can witness that the restore chain was REACHED. Read by [`el0_input_wake_edges`].
+static EL0_INPUT_WAKE_EDGES: AtomicU64 = AtomicU64::new(0);
+
 /// VUGPAUSE-2: the synthetic futex key for ASID `asid`'s input ring.
 ///
 /// `sys_futex`'s user keys are PHYSICAL ADDRESSES of EL0 words, and on this SoC a PA is < 2^40; bit 63
@@ -11769,6 +11775,15 @@ fn el0_input_wake(asid: u64) -> usize {
 fn el0_input_wake_edge(asid: u64, edge: &str) -> usize {
     if asid == 0 || asid as usize > super::boot::USER_SLOTS {
         return 0;
+    }
+    // CLICK-SWALLOW: count the NAMED edges — the focus arrival and the unhide, i.e. exactly the two
+    // that make up the VUGPAUSE-2r2 restore chain. Counted here, ABOVE the parked fast path, because
+    // the question the swallow witness has to answer is "was this edge REACHED?", not "did it find a
+    // waiter": on a headless gate nothing is ever parked, so the woken count is always 0 and would
+    // prove nothing, while a swallow that skipped `el0_input_set_active` would show up here at once.
+    // Relaxed and off any hot path — the router's per-event push passes `""` and is not counted.
+    if !edge.is_empty() {
+        EL0_INPUT_WAKE_EDGES.fetch_add(1, Ordering::Relaxed);
     }
     if !EL0_INPUT_PARKED[asid as usize].load(Ordering::Acquire) {
         return 0; // fast path: nobody has parked on this ring
@@ -12259,12 +12274,12 @@ fn click_owner_is_fullscreen(asid: u64) -> bool {
 ///
 /// ### The rule, on a PRESS edge
 /// Hit-test the cursor ([`crate::video::wm::hit_test`] — topmost visible window containing the point):
-///  * **a DIFFERENT window than the focused one** — raise it to focus FIRST, through the one focus
+///  * **a DIFFERENT window than the focused one** — raise it to focus, through the one focus
 ///    primitive that exists (`el0_input_set_active` + `wm::focus_changed`, in that order, exactly as
-///    `wc_focus_key` calls them), then let the press fall through to the enqueue, which now reads the
-///    NEW active ASID and delivers there. Click-to-focus, with no second focus path invented for it:
-///    this is a new CALLER of the WEDGE path, so a click-driven raise emits the same `<F1>`-`<F9>`
-///    breadcrumbs a TAB does, which is desirable — the breadcrumbs cover both callers.
+///    `wc_focus_key` calls them), and CONSUME the press (CLICK-SWALLOW, below). Click-to-focus, with
+///    no second focus path invented for it: this is a new CALLER of the WEDGE path, so a click-driven
+///    raise emits the same `<F1>`-`<F9>` breadcrumbs a TAB does, which is desirable — the breadcrumbs
+///    cover both callers.
 ///  * **the FOCUSED window** — deliver exactly as before. This is the no-change case and it is the
 ///    common one.
 ///  * **no window** — the click landed on the desktop or the console. It is not the focused app's
@@ -12320,14 +12335,46 @@ fn click_owner_is_fullscreen(asid: u64) -> bool {
 /// press/release pair must not be split and the shell's `click1_dispatch` never saw the press edge.
 /// The operator's NEXT click is an ordinary shell click on the shell's own path.
 ///
+/// ### CLICK-SWALLOW — a FOCUS-CHANGING press is consumed, not delivered (P73, bench)
+/// Peter, attended: "sometimes a click gets lost... restarting a vug I have to click twice." The
+/// VUGPAUSE-2r2 report named the mechanism and this arc is the ruling on it. CLICK-ROUTE shipped the
+/// hit arm as raise-then-FALL-THROUGH: the press was delivered to the window it had just raised. For a
+/// vug, a delivered click IS the pause toggle. So the single gesture that restores a backgrounded vug
+/// carried two meanings at once — "focus this" and "toggle this" — and the vug came back PAUSED. It
+/// looks dead; the operator clicks again; the second click (now an ordinary focused click) un-pauses
+/// it. That is the "click twice", and it is also the whole of the pattern Peter could not pin down: it
+/// bites exactly when the clicked vug was NOT already focused, and never otherwise.
+///
+/// The rule is that **an app never sees a click it did not own the focus for.** A press that CHANGES
+/// focus is a window-manager gesture; it is addressed to the window system, not to the app. So the hit
+/// arm now does what the miss arm has always done — target [`CLICK_TARGET_DROP`], return `true`, and
+/// the matching release is dropped with it, so no half-pair reaches anyone. The press on an ALREADY
+/// FOCUSED window is untouched and still delivered: that is ordinary app input and it is the common
+/// case. This is click-to-focus WITHOUT focus-follows-through, the behaviour every window manager that
+/// has thought about it converged on, and it costs the operator exactly one click on a refocus — the
+/// same one they are already spending, only now it does one thing instead of two.
+///
+/// **The swallow withholds the ring push and nothing else.** Both wake edges the VUGPAUSE-2r2 restore
+/// chain needs fire BEFORE the consume decision, from inside the two calls above: the focus arrival
+/// (`el0_input_set_active`) and the unhide (`focus_changed` -> `set_hidden(asid, false)`). A press on a
+/// PARKED, hidden, unfocused vug therefore still produces the `[vugpause2] resume` pair and still
+/// re-readies the waiter — the vug wakes, observes its restore, and is simply not handed a click.
+///
+/// **Both callers converge on this without a second decision.** The EL0-focus path
+/// (`el0_input_enqueue`) reads `true` and returns "not queued", so nothing reaches the new ring. The
+/// SHELL path (`main.rs`'s Button arm) reads `true` and `continue`s its drain — which is the same
+/// place its old `break` left it, because `el0_input_set_active` has already drained `EVENT_QUEUE` as
+/// part of granting focus, so the loop finds nothing behind the press either way.
+///
 /// ### The RELEASE edge follows the press, and is never re-routed
 /// See [`CLICK_PRESS_TARGET`]. The release is delivered iff the focus is still the one the press was
 /// delivered to; otherwise it is dropped. So a TAB (or an app exit) between press and release costs
 /// the release, never a fabricated one in a second app.
 ///
-/// Returns `true` when the event was CONSUMED and the caller must not deliver or forward it; `false`
-/// means "carry on with your normal path" — including the refocus case, where the caller's normal path
-/// now leads to a different ring than it did one instruction ago.
+/// Returns `true` when the event was CONSUMED and the caller must not deliver or forward it — since
+/// CLICK-SWALLOW that includes every press that MOVED focus, in either direction (to a window or to
+/// the shell). `false` means "carry on with your normal path", and now always with the focus the
+/// caller already had.
 ///
 /// Idempotent per edge: the mask tracker is swapped on entry, so a second call with the same mask sees
 /// no edge and answers `false`. The shell caller relies on that (it calls `el0_input_enqueue`, which
@@ -12346,14 +12393,22 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                 // The ONLY line this arc adds to serial, and only on the arm that changes behaviour:
                 // a click that MOVED focus. Human-rate by construction (one line per click that lands
                 // on a window other than the focused one), so it needs no throttle of its own.
+                // CLICK-SWALLOW: the line now names the DISPOSITION as well as the address, because
+                // this arm no longer delivers — `swallowed` is the wire proof of the consumed press.
                 serial_println!(
-                    "[clickroute] press hit asid={} win={} (was {})",
+                    "[clickroute] press hit asid={} win={} (was {}) swallowed",
                     owner, win, cur
                 );
+                // The wake chain runs FIRST and in full, exactly as before: focus arrival
+                // (`el0_input_set_active` -> `el0_input_wake_edge(asid, "focus")`) then the raise and
+                // its unhide (`focus_changed` -> `set_hidden(asid, false)` ->
+                // `el0_input_wake_edge(asid, "unhide")`). The swallow below is strictly downstream of
+                // both; it withholds a RING PUSH, never a wake. A restore click on a parked vug must
+                // still produce the VUGPAUSE-2r2 `[vugpause2] resume` pair.
                 el0_input_set_active(owner);
                 crate::video::wm::focus_changed(owner);
-                CLICK_PRESS_TARGET.store(owner, Ordering::Release);
-                false
+                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                true
             }
             Some(_) => {
                 CLICK_PRESS_TARGET.store(cur, Ordering::Release);
@@ -12393,6 +12448,29 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
 /// The ASID currently designated to receive input (0 = none) — the read side of `el0_input_set_active`.
 pub fn el0_input_active() -> u64 {
     EL0_INPUT_ACTIVE.load(Ordering::Acquire)
+}
+
+/// CLICK-SWALLOW witness read: how many events are sitting UNREAD in `asid`'s input ring. 0 for the
+/// shell slot and for any ASID outside the private-slot range (they have no ring).
+///
+/// This is the observation the swallow leg is built on, and it is the only honest one available: "was
+/// the app handed this click?" is a question about the RING, not about a return value. The producer
+/// (`el0_input_push`) and the consumer (`sys_input_poll`) are the only writers, and neither runs while
+/// the selftest drives a synthetic edge, so the difference across one press is exactly the delivery.
+pub fn el0_input_depth(asid: u64) -> u32 {
+    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+        return 0;
+    }
+    let a = asid as usize;
+    let head = EL0_INPUT_HEAD[a].load(Ordering::Acquire);
+    EL0_INPUT_TAIL[a].load(Ordering::Acquire).wrapping_sub(head)
+}
+
+/// CLICK-SWALLOW witness read: the cumulative count of NAMED wake edges — see
+/// [`EL0_INPUT_WAKE_EDGES`]. The swallow leg samples it either side of a press to assert that
+/// consuming the click did not also skip the restore chain.
+pub fn el0_input_wake_edges() -> u64 {
+    EL0_INPUT_WAKE_EDGES.load(Ordering::Relaxed)
 }
 
 /// UVUG-8: the ASID currently in interactive takeover (0 = none) — the read side of the takeover latch. The
