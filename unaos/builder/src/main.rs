@@ -121,6 +121,11 @@ fn main() {
     // media, so the knob must be mapped here too (arroyo's own list only covers non-media paths —
     // that asymmetry is why s42 shipped without the dialog).
     if std::env::var("UNAOS_INSTGUI").is_ok() { feats.push("instgui"); }
+    // WEDGE-2: UNAOS_WEDGE2=1 arms the `wedge2` feature — raw-UART `<F1>`..`<F9>` last-words
+    // breadcrumbs along the focus-raise/composite chain (x86: bare 16550 at 0x3F8, no lock). Media
+    // builds come from THIS list, not arroyo's (the s42/INSTGUI lesson), so the knob is mapped here
+    // too. Default off => call sites vanish => no `<F` token in the image (strings-verifiable).
+    if std::env::var("UNAOS_WEDGE2").is_ok() { feats.push("wedge2"); }
     // IVB-iGPU: UNAOS_IVB=1 arms the Intel HD 4000 ground-truth probe (sitting #6). Kept in sync
     // with arroyo's mapping — boot-1 of sitting #6 shipped WITHOUT this line and carried no probe.
     // unaos_ivb rides the same knob: it adds the teardown-trace fields to the SHARED BootInfo
