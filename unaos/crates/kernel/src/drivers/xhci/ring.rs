@@ -66,11 +66,19 @@ impl TransferRing {
     pub fn push_noop(&mut self) -> Result<usize, &'static str> {
         let index = self.enqueue_index;
 
-        // FORCE CYCLE BIT = 1 (Directve UNA-11-CYCLE)
-        // We ignore self.cycle_bit for this specific initialization to ensure
-        // the hardware sees the transition.
+        // BOT-RESCUE M2: honour the ring's LIVE cycle bit.
+        //
+        // This used to hard-code `true` ("Directive UNA-11-CYCLE") on the theory that a freshly
+        // initialised ring needs a 0->1 transition to be visible. That is true only for the FIRST
+        // No-Op on a virgin ring — where `cycle_bit` is already `true`, so the two agree and this
+        // change is a no-op for every call the driver makes today (the command ring's bring-up
+        // probe). It is a latent trap for any later call: after one wrap `cycle_bit` is false, the
+        // hard-coded 1 would then be the STALE colour, the controller would treat the No-Op as an
+        // un-produced slot, and the ring would silently stop being consumed (xHCI 1.2 §4.9.1 —
+        // the Cycle bit is the sole producer/consumer handshake). Reading the field costs nothing
+        // and removes the trap.
         unsafe {
-            *self.trbs.add(index) = Trb::new_noop(true);
+            *self.trbs.add(index) = Trb::new_noop(self.cycle_bit);
 
             // FLUSH CACHE (Directive J11:FLUSH-01)
             let trb_ptr = self.trbs.add(index);
@@ -137,6 +145,66 @@ impl TransferRing {
         self.enqueue_index += 1;
 
         Ok(index)
+    }
+
+    /// BOT-RESCUE M2: our own live enqueue position and cycle colour, for the timeout witness.
+    /// The one pair of numbers that, read against the controller's TR Dequeue Pointer + DCS from
+    /// the endpoint context, says whether the controller is BEHIND us (it has not fetched what we
+    /// produced — a controller/endpoint fault) or level with us (it fetched everything and the
+    /// DEVICE is silent). Pure reads.
+    pub fn enqueue_index(&self) -> usize { self.enqueue_index }
+    pub fn cycle_bit(&self) -> bool { self.cycle_bit }
+    pub fn num_trbs(&self) -> usize { self.num_trbs }
+
+    /// BOT-RESCUE M2: would enqueueing ONE more TRB lap the controller's dequeue pointer?
+    ///
+    /// xHCI 1.2 §4.9.1/§4.9.2: a Transfer Ring is a producer/consumer ring whose only full/empty
+    /// discriminator is the Cycle bit, so the producer MUST NOT advance its enqueue pointer past
+    /// the consumer's dequeue pointer — doing so overwrites TRBs the controller has not yet
+    /// fetched and re-colours slots it is still walking. This ring tracked no consumer position at
+    /// all: during BOT error recovery, where the endpoint is stalled and the controller's dequeue
+    /// pointer is parked, a retry loop could push straight through it.
+    ///
+    /// `ctx_deq` is the raw Endpoint Context TR Dequeue Pointer field (low bits carry DCS), read
+    /// by the caller from the OUTPUT device context. If it does not address a TRB inside THIS ring
+    /// the answer is "no" — an unreadable consumer position must never manufacture a refusal on a
+    /// healthy device.
+    ///
+    /// Margin: refuse while fewer than two slots would remain free, so the Link TRB slot the wrap
+    /// path needs is always available. With a 16-TRB ring the refusal threshold is 14 outstanding
+    /// TRBs; a healthy BOT transaction has at most ONE outstanding TRB (each stage is awaited to
+    /// completion before the next is queued), so this predicate is false by construction on every
+    /// healthy transfer and can only fire against a controller that has stopped consuming.
+    pub fn would_lap(&self, ctx_deq: u64) -> bool {
+        let deq = match self.index_of(ctx_deq & !0xFu64) {
+            Some(i) => i,
+            None => return false,
+        };
+        let n = self.num_trbs;
+        // Outstanding = how far our enqueue pointer has run ahead of the controller's dequeue.
+        let used = (self.enqueue_index + n - deq) % n;
+        used + 2 >= n
+    }
+
+    /// BOT-RESCUE M2: return the ring to a known-clean producer state — every slot zeroed, enqueue
+    /// at index 0, cycle bit back to the xHCI initial Consumer Cycle State of 1. Used ONLY by
+    /// recovery escalation (a), which re-programs the endpoint context to point at this ring's
+    /// base with DCS=1 in the same breath; continuing from wherever the failed transaction left
+    /// the pointers would leave the driver's and the controller's ideas of the ring disagreeing
+    /// about both position and colour.
+    ///
+    /// Safety: the caller must have stopped/reset the endpoint first, so the controller is not
+    /// concurrently fetching from this ring.
+    pub fn reset(&mut self) {
+        unsafe {
+            core::ptr::write_bytes(self.trbs as *mut u8, 0, self.num_trbs * core::mem::size_of::<Trb>());
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            // XHCI-COHERENCE: the zeros must reach DRAM before the controller is pointed here, or a
+            // non-snooping master could fetch a stale (valid-looking) cycle bit. No-op on x86.
+            dma_coherency::clean(self.trbs as usize, self.num_trbs * core::mem::size_of::<Trb>());
+        }
+        self.enqueue_index = 0;
+        self.cycle_bit = true;
     }
 
     fn write_trb(&mut self, index: usize, trb: Trb) {

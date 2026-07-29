@@ -847,6 +847,12 @@ pub enum BotError {
     /// BEFORE anything is built or queued, so unlike every other variant it is not a transport
     /// fault and must not drag the pipe through Reset Recovery: it never reaches `bot_transfer`.
     BadRequest,
+    /// BOT-RESCUE M2: the stage was REFUSED before anything was queued because enqueueing it would
+    /// have lapped the controller's TR Dequeue Pointer on that bulk ring (xHCI 1.2 §4.9.1/§4.9.2 —
+    /// see `TransferRing::would_lap`). A transport fault like any other from the caller's point of
+    /// view: it feeds the same Reset Recovery ladder, which is precisely the right response, since
+    /// the only way to reach it is a controller that has stopped consuming the ring.
+    RingFull,
 }
 
 /// A successful BOT transaction result (CSW decoded).
@@ -4555,6 +4561,38 @@ impl XhciController {
         lo | (hi << 32)
     }
 
+    /// BOT-RESCUE M2: refuse a bulk stage that would lap the controller on its ring.
+    ///
+    /// Reads the controller's own TR Dequeue Pointer for `dci` out of the OUTPUT device context and
+    /// asks the ring whether one more `push` would overrun it (`TransferRing::would_lap`, which
+    /// carries the spec citation and the margin argument). Two bounded volatile reads and pure
+    /// arithmetic — no command, no wait, no MMIO.
+    ///
+    /// Healthy path: a BOT transaction awaits each stage's completion before queuing the next, so at
+    /// most one TRB is ever outstanding on a 16-TRB ring and this returns `Ok` unconditionally. The
+    /// refusal is reachable only when the controller has stopped consuming the ring — the state the
+    /// metal failure this arc addresses parks the endpoint in — and there, failing the transfer
+    /// immediately is strictly better than corrupting the ring and then waiting the full budget for a
+    /// completion that cannot come.
+    fn bot_ring_guard(&self, slot_id: u8, dci: u8, is_in: bool) -> Result<(), BotError> {
+        let deq = self.ep_ctx_deq(slot_id, dci);
+        if deq == 0 {
+            return Ok(()); // no output context / unreadable consumer position — never refuse
+        }
+        let slot = &self.slots[slot_id as usize];
+        let ring = if is_in { slot.bulk_in_ring.as_ref() } else { slot.bulk_out_ring.as_ref() };
+        let Some(r) = ring else { return Ok(()) };
+        if !r.would_lap(deq) {
+            return Ok(());
+        }
+        serial_println!(
+            ":: BOT: ring refuse slot={} dci={} dir={} enq={} cycle={} ntrb={} ctxdeq={:#x} dcs={} — enqueue would lap the controller (xHCI 1.2 §4.9.1); stage failed instead of overrunning the ring ::",
+            slot_id, dci, if is_in { "in" } else { "out" },
+            r.enqueue_index(), if r.cycle_bit() { 1 } else { 0 }, r.num_trbs(),
+            deq, deq & 1);
+        Err(BotError::RingFull)
+    }
+
     /// BOTEV: run ONE recovery-stage xHCI command and render its outcome for a witness:
     /// `(ok, completion_code, why)`. A bare `Result` cannot distinguish the three ways a stage
     /// fails, and the metal capture that motivated this arc reported only `fail`:
@@ -4735,6 +4773,9 @@ impl XhciController {
         // the pump wakes). We await the DATA stage, then the CSW — never the CBW directly.
 
         // 1) CBW on bulk OUT (Normal TRB, 31 bytes).
+        // BOT-RESCUE M2: refuse rather than lap the controller (see `bot_ring_guard`). Checked
+        // BEFORE the push so a refusal leaves the ring byte-untouched.
+        self.bot_ring_guard(slot_id, out_dci, false)?;
         self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
             .push(Trb { parameter: cbw_phys, status: 31, control: 1 << 10 }).ok();
 
@@ -4742,6 +4783,8 @@ impl XhciController {
         //    completions post an event; wait for it to retire BEFORE queuing the CSW.
         if data_len > 0 {
             let data_out = matches!(dir, Direction::Out);
+            // BOT-RESCUE M2: same lap refusal for the data stage's ring, before its push.
+            self.bot_ring_guard(slot_id, if data_out { out_dci } else { in_dci }, !data_out)?;
             let (data_dci, data_trb_phys, data_trb_idx) = {
                 let ring = if data_out {
                     self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
@@ -4838,6 +4881,8 @@ impl XhciController {
 
         // 3) CSW on bulk IN (13 bytes, IOC). The data stage (if any) has fully retired, so
         //    usb-storage is in its CSW state and services this token immediately.
+        // BOT-RESCUE M2: same lap refusal for the status stage's ring, before its push.
+        self.bot_ring_guard(slot_id, in_dci, true)?;
         let csw_trb_phys = {
             let ring = self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap();
             let base = ring.get_ptr();
