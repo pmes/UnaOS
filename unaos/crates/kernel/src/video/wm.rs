@@ -1341,7 +1341,18 @@ fn composite_inner() -> CursorTail {
 
     let mut plan: Option<super::cursor::Plan> = None;
     let mut session = false;
-    if let Some(p) = super::cursor::sprite_plan() {
+    // CURSOR-12 — the denominator. Bumped here rather than at function entry so it counts passes that
+    // actually reached the bracket decision, which is the population every term is a fraction of.
+    #[cfg(feature = "witness")]
+    CUR12_PASSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // ONE acquisition, bound once: a second `sprite_plan()` call for the counter would take `SPRITE`
+    // again and could disagree with the one the pass actually brackets on.
+    let sprite_now = super::cursor::sprite_plan();
+    #[cfg(feature = "witness")]
+    if sprite_now.is_none() {
+        CUR12_NOSPRITE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(p) = sprite_now {
         let sbox = (p.bx, p.by, p.bw, p.bh);
         let shell = shell_z();
         let mut paint: [(usize, usize, usize, usize); MAX_WINDOWS] = [(0, 0, 0, 0); MAX_WINDOWS];
@@ -1378,6 +1389,12 @@ fn composite_inner() -> CursorTail {
                 }
             }
             hit |= reserved_hit;
+        }
+        // CURSOR-12 — the sprite was up but nothing was under it. Counted before the `hit` branch so
+        // the terms stay mutually exclusive and sum to `passes`.
+        #[cfg(feature = "witness")]
+        if !hit {
+            CUR12_NOHIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
         if hit {
             // CURSOR-4 — the split is taken only when the overlay session is ours AND no WC-F
@@ -1422,6 +1439,10 @@ fn composite_inner() -> CursorTail {
                 #[cfg(feature = "witness")]
                 {
                     CUR3_DECL_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    // CURSOR-12 — attributed to the WC-F probe specifically, so `[cursor12]`'s
+                    // `reserved` can be read against `budget`, which also carries the per-window
+                    // `may_overlay` exclusions.
+                    CUR12_RESERVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     // CURSOR-11 — a pass whose arrow left the glass. Kept, not fixed: the probe paints
                     // the FRONT after this pass, outside every window box, so no staged present can
                     // carry the sprite through it.
@@ -1458,6 +1479,10 @@ fn composite_inner() -> CursorTail {
                 #[cfg(feature = "witness")]
                 {
                     CUR3_DECL_LOCK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    // CURSOR-12 — the session refusal on its own, separated from `compose_into`'s
+                    // contended `try_lock` inside the guard. `CUR3_DECL_LOCK` counts both and cannot
+                    // answer "did the offer die before it was made, or after".
+                    CUR12_NOSESSION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     super::cursor::note_masked_nosession();
                     // CURSOR-11 — also a pass whose arrow left the glass. This one COULD in principle
                     // be deferred, but it must not be: without the session there is no coverage to
@@ -1623,6 +1648,11 @@ fn composite_inner() -> CursorTail {
         #[cfg(feature = "witness")]
         if wcg_probe.is_some() {
             may_overlay = false;
+            // CURSOR-12 — attributed, and only when there was an offer to lose. A pass with no plan
+            // was never going to compose anything, so charging it here would drown the real signal.
+            if plan.is_some() {
+                CUR12_EXCL_PROBE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
         }
         #[cfg(feature = "witness")]
         {
@@ -1631,6 +1661,9 @@ fn composite_inner() -> CursorTail {
                 let bit = 1u32 << r.id;
                 if VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit == 0 {
                     may_overlay = false;
+                    if plan.is_some() {
+                        CUR12_EXCL_UNVERIFIED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -2149,6 +2182,31 @@ pub fn wci_rollup() {
     wci_rollup_scoped("fixture");
 }
 
+/// CURSOR-12 — the same block, on the LIVE scope, for a bench sitting rather than a boot fixture.
+///
+/// ### Why this entry point had to exist before any of it could be read
+/// [`wci_rollup`] has exactly one caller in the tree, `arch::aarch64::syscall`'s EL0 window-verb
+/// fixture, and it is a boot-time one-shot. Two consequences, both of which have cost sittings:
+///
+/// * **On x86 the entire cursor rollup block has never printed at all.** There is no x86 caller, so
+///   `[cursor3]`/`[cursor5]`/`[cursor6]`/`[cursor8]` are absent from every rmbp capture ever taken —
+///   which is why the s46 sitting shows one `[cursor3] present …` sample line (that one comes from
+///   `note_cursor_tail`, a different site) and no rollup whatsoever. The x86 track has been reading
+///   the cursor mechanism through a keyhole.
+/// * **On both arches it fires before the operator has touched the pointer**, so even where it does
+///   print, every cursor counter in it is structurally zero. `UNWITNESSED` there is not a finding.
+///
+/// The pointer's own motion path is the correct cadence for a pointer instrument: it runs only while
+/// there is a pointer to instrument, it stops when the operator stops, and it cannot fire on a
+/// headless gate at all. Paced by the caller — see `pal::cursor::rollup_tick`.
+///
+/// Called with no lock of `wm`'s or the sprite module's held; it takes `TABLE` internally, on the same
+/// footing every other rollup does.
+#[cfg(feature = "witness")]
+pub fn wci_rollup_live() {
+    wci_rollup_scoped("live");
+}
+
 /// WC-I — the rollup body. `scope` names WHICH evidence the line was taken on: `fixture` at the end of
 /// the window-verb witness block (the counters are wired), `desktop` after the desktop layer has
 /// presented over a live window layer enough times for the verdict to mean something.
@@ -2246,6 +2304,127 @@ static CUR3_DECL_BUDGET: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 /// it reads as an unexplained gap in the mechanism instead of as the absorbed race it is.
 #[cfg(feature = "witness")]
 static CUR3_DECL_STALE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// ---- CURSOR-12 — WHICH PREDICATE KILLS THE OFFER --------------------------------------------
+//
+// P74, both seats: `[cursor3] tail=repaint offers=0 taken=0 -> BRACKETED` for whole live sittings, on
+// aarch64 AND on x86, with every `[cursor11]` counter zero. Compose-through is not rare, it is
+// DORMANT — CURSOR-3's mechanism has never run outside its selftest, and two tracks have spent
+// sittings tuning a path the wire says never executes.
+//
+// `offers` is incremented in `note_cursor_overlay`, which is called from `stage_window` only when it
+// actually reaches `compose_into`. Every predicate between `composite_inner`'s entry and that call is
+// therefore a way to reach `offers=0`, and the existing breakdown (`straddle`/`lock`/`budget`/`stale`)
+// covers only the ones DOWNSTREAM of an offer being made or a session being opened. The whole
+// upstream chain — is the sprite on the panel at all, does any window meet it, did the session open —
+// is invisible, and `offers=0` is exactly what an upstream death looks like from the rollup.
+//
+// These five name the upstream chain, one bump per composite pass, in the order the pass tests them.
+// They are pass-scoped and mutually exclusive by construction, so `nosprite + nohit + reserved +
+// nosession + planned` is the pass count, and whichever term dominates IS the answer.
+
+/// CURSOR-12 — passes where `cursor::sprite_plan()` returned `None`: the sprite was not on the panel
+/// when the bracket was decided, so no plan could be taken and no window could be offered one.
+///
+/// **The leading hypothesis for both arches, and it is a CALL-GRAPH fact rather than a race.**
+/// `Screen::flush` ends in `wm::service_damage()` → `composite()`, and the render task brackets its
+/// own flush with `cursor::undraw()` … `cursor::repaint()` (x86: `main.rs`'s console loop; aarch64:
+/// the Pi render task, the CURSOR-1 contract). So every composite reached through the desktop's flush
+/// runs BETWEEN the undraw and the repaint — with `sp.drawn == false`, by the caller's own design.
+/// `sprite_plan()` is `None` for structural reasons on that path, every time, on both arches.
+/// Compose-through can only ever run on a composite reached from `wm::present`, and on the x86 bench
+/// the console's presents are suspended while the installer is up.
+#[cfg(feature = "witness")]
+static CUR12_NOSPRITE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// CURSOR-12 — the sprite was on the panel, but no live window above the shell met its box. The
+/// pointer is over the desktop; nothing to compose through, and WC-I's whole point.
+#[cfg(feature = "witness")]
+static CUR12_NOHIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// CURSOR-12 — a WC-F reserved box overlapped the sprite, so the pass took CURSOR-3's whole-sprite
+/// bracket deliberately. aarch64 witness+baremetal only; must be 0 on x86.
+#[cfg(feature = "witness")]
+static CUR12_RESERVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// CURSOR-12 — `overlay_open` refused because another pass already held the session (the VUGPAR
+/// steady state). Distinct from [`CUR3_DECL_LOCK`], which this pass also bumps: that counter mixes
+/// this refusal with `compose_into`'s own contended `try_lock` inside the guard, and the two are
+/// different questions.
+#[cfg(feature = "witness")]
+static CUR12_NOSESSION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// CURSOR-12 — the two halves of the per-window `may_overlay` exclusion, split apart.
+///
+/// Both are `#[cfg(feature = "witness")]`, which is the structural problem this counter pair exists to
+/// size: **every bench image either seat has ever booted is a witness build**, so if these dominate,
+/// the instrument has been disabling the mechanism under observation and every compose-through
+/// conclusion drawn from a metal boot is suspect. Reading the code says both are self-clearing — the
+/// WC-G probe is budgeted per window id and returns `None` once spent, and `VERIFIED`'s bit is set
+/// immediately after `draw_window` in the same loop body (so pass 1 excludes and pass 2 permits, and
+/// the only clear is on window CREATE) — but "reading the code says" is what produced two wasted
+/// sittings, so it is counted instead.
+#[cfg(feature = "witness")]
+static CUR12_EXCL_PROBE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static CUR12_EXCL_UNVERIFIED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// CURSOR-12 — total composite passes, the denominator every term above is read against.
+#[cfg(feature = "witness")]
+static CUR12_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// CURSOR-12 — the attribution rollup: which predicate killed the offer, and how often.
+///
+/// Printed beside `[cursor3] rollup`, because it is the line that makes `offers=0` legible. The
+/// reading is a single dominant term:
+///
+/// * **`nosprite` ≈ `passes`** — the render-bracket call graph above. The fix is not in the cursor
+///   module at all: it is that `Screen::flush` composites from inside a bracket that has just taken
+///   the sprite down. Compose-through cannot run on that path by construction.
+/// * **`nohit` ≈ `passes`** — the operator simply was not pointing at a window. Not a defect; check
+///   the sitting, not the code.
+/// * **`excl_probe` / `excl_unverified` non-trivial** — the instrument is suppressing the mechanism,
+///   and the correct scoping is per-window-per-pass (exclude the ONE window the probe is bracketing on
+///   the ONE pass it is spent on) rather than the general case. That is a witness-build-only defect
+///   with production-only correct behaviour, which is the worst shape a defect can have.
+/// * **`nosession` ≈ `passes`** — two cores compositing at once; CURSOR-5's territory.
+/// * **`planned` non-zero with `[cursor3] offers=0`** — the death is BELOW the session, i.e. in
+///   `stage_window`'s decline chain (`[wc-h] staged=no reason=…`), and `DECL_FIXTURE`/`DECL_LOCK` there
+///   are the next things to read. A window that takes the DIRECT path never calls `compose_into` at
+///   all, so it is un-composable for that pass by construction.
+#[cfg(feature = "witness")]
+fn cursor12_rollup(scope: &str) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let passes = CUR12_PASSES.load(Relaxed);
+    let nosprite = CUR12_NOSPRITE.load(Relaxed);
+    let nohit = CUR12_NOHIT.load(Relaxed);
+    let reserved = CUR12_RESERVED.load(Relaxed);
+    let nosession = CUR12_NOSESSION.load(Relaxed);
+    let planned = CUR3_PLANNED.load(Relaxed);
+    let probe = CUR12_EXCL_PROBE.load(Relaxed);
+    let unver = CUR12_EXCL_UNVERIFIED.load(Relaxed);
+    // The dominant term, named rather than left to arithmetic. Ties go to the earliest predicate in
+    // the chain, which is the one a reader has to fix first anyway.
+    let why = if passes == 0 {
+        "none"
+    } else if nosprite * 2 >= passes {
+        "nosprite"
+    } else if nohit * 2 >= passes {
+        "nohit"
+    } else if nosession * 2 >= passes {
+        "nosession"
+    } else if probe + unver > 0 && planned > 0 {
+        "witness-exclusion"
+    } else if planned > 0 {
+        "below-session"
+    } else {
+        "mixed"
+    };
+    serial_println!(
+        "[cursor12] offer scope={} passes={} nosprite={} nohit={} reserved={} nosession={} planned={} excl_probe={} excl_unverified={} -> {}",
+        scope, passes, nosprite, nohit, reserved, nosession, planned, probe, unver, why
+    );
+}
 
 /// CURSOR-3 — record one overlay offer and whether the layer took it. Called from `stage_window`,
 /// which is inside the `BlitGuard` window: relaxed atomics only, no lock, no allocation, no serial.
@@ -2382,6 +2561,10 @@ fn cursor3_rollup(scope: &str) {
     // `[cursor6] repaired=` says how often the arrow was rebuilt, and this says how often that was
     // asked for and what declined the rest. The two lines are adjacent because they share a counter.
     super::cursor::cursor8_rollup(scope);
+    // CURSOR-12 — and WHY `offers=` above reads what it reads. Every other line here describes what
+    // compose-through did; this one is the only line that can say whether it ran at all, and on both
+    // benches the answer so far is that it did not.
+    cursor12_rollup(scope);
 }
 
 /// WC-A — whether the first `[wc-a] composite` witness has been emitted (first composite only; a

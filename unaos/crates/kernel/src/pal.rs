@@ -431,6 +431,55 @@ pub mod cursor {
         if SPRITE_OWNS_PAINT {
             crate::video::cursor::repaint();
         }
+        rollup_tick();
+    }
+
+    /// CURSOR-12 — how long between two live cursor rollups, in milliseconds.
+    ///
+    /// 5 s, matching `[sched6]`'s window, so a bench capture interleaves the two at the same cadence
+    /// and an operator can read "what the pointer cost" against "what the render loop did" without
+    /// aligning timestamps by hand. Short enough that a 30-second sitting yields several samples;
+    /// long enough that the block (six lines) cannot become the load it is measuring.
+    #[cfg(feature = "witness")]
+    const ROLLUP_EVERY_MS: u64 = 5_000;
+
+    /// CURSOR-12 — wall-clock reading of the last live rollup, or 0 for "never".
+    #[cfg(feature = "witness")]
+    static ROLLUP_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// CURSOR-12 — print the cursor rollup block on the pointer's own cadence, rate-limited.
+    ///
+    /// ### Why the pointer path is the right place, stated once
+    /// The block's only other caller is a boot-time fixture in `arch::aarch64::syscall`, which fires
+    /// before any pointer report has arrived and does not exist on x86 at all
+    /// (`wm::wci_rollup_live` documents both consequences). An instrument for a pointer mechanism has
+    /// to sample while the pointer is moving, and this is the one function every x86 motion path goes
+    /// through — the console loop's drain, the demos' drain, and the EL0 router's keep-alive.
+    ///
+    /// Self-gating three times over, which is what keeps it off every gate: witness builds only, and
+    /// it is unreachable without a real HID report, so both QEMU suites (which deliver no pointer)
+    /// print nothing and their line counts are unchanged.
+    ///
+    /// **`swap`, not a read-then-write.** Two cores can drain input concurrently; a compare-and-set on
+    /// the deadline means a race produces one rollup rather than two, and the loser simply returns.
+    /// The failure mode of this limiter is a skipped sample, never a duplicated block.
+    #[inline]
+    fn rollup_tick() {
+        #[cfg(feature = "witness")]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            let now = crate::arch::ms();
+            let last = ROLLUP_LAST_MS.load(Relaxed);
+            if last != 0 && now.wrapping_sub(last) < ROLLUP_EVERY_MS {
+                return;
+            }
+            // Claim the slot before printing, so a second core arriving inside the same window sees
+            // the new deadline and declines.
+            if ROLLUP_LAST_MS.swap(now, Relaxed) != last {
+                return;
+            }
+            crate::video::wm::wci_rollup_live();
+        }
     }
 
     fn set_clamped(x: i32, y: i32, w: i32, h: i32) {

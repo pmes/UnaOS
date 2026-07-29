@@ -4145,3 +4145,111 @@ verdict is owed by an attended bench boot.**
   `saved[i]` only when the pixel is provably NOT our colour.
 * **A white arrow standing in a vug's rect** would mean the install/settle ordering above was violated.
   Nothing else in this arc can produce it.
+
+---
+
+### CURSOR-12 — compose-through was dormant, and the rollup that says so could not print on x86
+
+**P74, both seats.** The pi seat's live mouse sitting reads `[cursor3] tail=repaint offers=0 taken=0
+-> BRACKETED` on every sampled present, with every `[cursor11]` counter zero. The rmbp's s46 capture
+shows a single `[cursor3] present tail=adopt offers=2 taken=2 -> COMPOSED` for a whole sitting and no
+`[cursor…] rollup` line at all. CURSOR-3's compose-through — five arcs of design, from CURSOR-3 to
+CURSOR-11 — has essentially never executed on either bench outside its own selftest.
+
+Two separate defects produce that, and only one of them is in the cursor module.
+
+#### 1. The rollup block has no x86 caller, and fires before the pointer exists on aarch64
+
+`wm::wci_rollup()` has exactly one caller in the tree: `arch::aarch64::syscall`'s EL0 window-verb
+fixture, a boot-time one-shot. So:
+
+* **On x86 the entire block has never printed.** `[cursor3]`, `[cursor5]`, `[cursor6]` and `[cursor8]`
+  rollups are absent from every rmbp capture ever taken. The one `[cursor3] present …` line in s46
+  comes from `note_cursor_tail`, a different site with a different format. The x86 track has been
+  reading a five-arc mechanism through an eight-sample keyhole.
+* **On both arches it fires before any HID report has arrived**, so even where it prints, every cursor
+  counter in it is structurally zero and `UNWITNESSED` is not a finding.
+
+`wm::wci_rollup_live()` plus `pal::cursor::rollup_tick` fix the cadence: the block is emitted from the
+pointer's own motion choke point, rate-limited to 5 s (matching `[sched6]`, so the two interleave and
+can be read against each other). Witness builds only, and unreachable without a real pointer report,
+so both QEMU suites print nothing and their line counts are unchanged.
+
+#### 2. `offers=0` is an UPSTREAM death, and nothing counted the upstream
+
+`offers` is bumped in `note_cursor_overlay`, called from `stage_window` only once it has actually
+reached `compose_into`. The existing breakdown (`straddle`/`lock`/`budget`/`stale`) covers only what
+happens *after* an offer is made or a session is opened. The whole chain before that — is the sprite
+on the panel, does any window meet it, did the session open — was invisible, and `offers=0` is exactly
+what an upstream death looks like from the rollup.
+
+`[cursor12]` names that chain, one bump per composite pass, in the order the pass tests it:
+
+```
+[cursor12] offer scope=live passes=N nosprite=… nohit=… reserved=… nosession=… planned=… excl_probe=… excl_unverified=… -> why
+```
+
+The terms are mutually exclusive by construction, so they sum to `passes` and the dominant one is the
+answer.
+
+**The leading candidate is `nosprite`, and it is a call-graph fact rather than a race.**
+`Screen::flush` ends in `wm::service_damage()` → `composite()`, and the render task brackets its own
+flush with `cursor::undraw()` … `cursor::repaint()` — x86's console loop does it explicitly
+(`main.rs`), and the Pi render task has done it since CURSOR-1. **Every composite reached through the
+desktop's flush therefore runs between the undraw and the repaint, with `sp.drawn == false`, by the
+caller's own design.** `sprite_plan()` returns `None`, no plan is taken, no window is offered one, and
+the pass settles `Untouched`. Compose-through can only ever run on a composite reached from
+`wm::present`, and on the rmbp bench those are suspended while the installer is up.
+
+If that is what the counter says, the fix is not in `video::cursor` at all: it is that the desktop
+composites from inside a bracket that has just taken the sprite down.
+
+#### The witness-exclusion question, sized rather than argued
+
+`may_overlay` is suppressed by two `#[cfg(feature = "witness")]` exclusions — the WC-G probe, and a
+window whose `VERIFIED` bit is not yet set — and **every bench image either seat has ever booted is a
+witness build**. If those dominate, the instrument has been disabling the mechanism under observation,
+which is the worst shape a defect can have: broken only where it is watched.
+
+Reading the code says both are self-clearing. The WC-G probe is budgeted per window id and returns
+`None` once spent; `VERIFIED`'s bit is set immediately after `draw_window` in the same loop body, so
+pass 1 excludes and pass 2 permits, and the only clear is on window CREATE (an id is a recycled slot
+alias, so a fresh window deserves a fresh verdict). Neither should persist for a whole sitting.
+
+But "reading the code says" is what produced the sittings this arc exists to stop repeating, so
+`excl_probe` and `excl_unverified` count them instead, and only on passes that actually held a plan to
+lose. **If either is non-trivial, the correct scoping is per-window-per-pass** — exclude the one window
+the probe is bracketing on the one pass it is spent on, never the general case — and that fix belongs
+in `composite_inner`, not in a `cfg`.
+
+#### A second, independent source of `offers=0`
+
+`[wc-h] win=1 staged=no reason=fixture -> DIRECT` in the rmbp wire is `stage_window`'s
+`FALLBACK_FIXTURE` one-shot taking the direct path for an unverified window. `compose_into` is reached
+only from the staged path, so **a window that takes DIRECT is un-composable for that pass by
+construction** — no offer is made and none is counted as declined. `[cursor12] planned=` non-zero
+beside `[cursor3] offers=0` is the reading that isolates this case: the session opened, so the death is
+below it, in `stage_window`'s decline chain.
+
+#### Gate results (CURSOR-12)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
+* `UNAOS_WC=1 ./arroyo test` — 0 FAIL. The suite is pointer-free, so `rollup_tick` is unreachable and
+  no line count moves.
+* `./arroyo test-arm` — banner, 0 FAIL.
+
+QEMU delivers no pointer on either suite, so `[cursor12]` cannot print there and the gates prove
+wiring and no-regression only. The line carries its evidence on the bench.
+
+#### Metal watch-list (CURSOR-12)
+
+* **`nosprite` ≈ `passes`** confirms the render-bracket call graph. The desktop flush is compositing
+  with the sprite deliberately off the panel, and compose-through is unreachable on that path.
+* **`excl_probe` / `excl_unverified` non-trivial** means the witness build is suppressing the
+  mechanism. Rescope per-window-per-pass; do not "fix" it by removing the instrument.
+* **`nohit` ≈ `passes`** means the operator was pointing at the desktop. Check the sitting, not the
+  code.
+* **`planned` > 0 with `[cursor3] offers=0`** puts the death below the session — read
+  `[wc-h] staged=no reason=` next.
+* **`[cursor12]` appearing at all on an rmbp capture** is itself the first result: it means the x86
+  track can finally see the cursor mechanism it has been tuning blind.
