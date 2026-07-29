@@ -240,6 +240,18 @@ pub struct Task {
     /// pace), so a difference across cores would not be a duration. CNTPCT is system-global,
     /// fixed-frequency and always advancing — the same property the load accounting relies on.
     park_cyc: u64,
+    /// SPREAD-6 (VUG-PACE-2) — CNTPCT timestamp at which the PLACEMENT QUESTION was last asked for
+    /// this task (stamped at spawn, where placement is first decided, and by every `rewake_place`
+    /// call thereafter). Same Box-handoff synchronisation argument as `park_cyc`: written only by
+    /// whoever exclusively owns the Box.
+    ///
+    /// Why it exists: SPREAD-5 gates re-placement on a >= 100 ms park, and a frame-paced task NEVER
+    /// parks that long — so whatever core assignment contention-era wakes left it with was PERMANENT.
+    /// The s1q wire shows the cost as the residual "predestined fps": win1 pinned at 30.9/s for tens
+    /// of seconds with two runnable EL0 tasks time-sharing c2 (99% busy) while c0/c1/c3 sat idle and
+    /// `rewake=` never moved. This stamp lets a micro-park wake ask the question again on a slow
+    /// clock (see `PLACE_REFRESH_MS`) without restoring SPREAD-4's per-frame churn.
+    place_cyc: u64,
 }
 
 /// One CPU's scheduler bookkeeping (interior-mutable atomics, so the array is a plain static).
@@ -1491,6 +1503,35 @@ const REWAKE_MIN_PARK_MS: u64 = 100;
 /// is `CNTFRQ/4`), so the threshold is the same wall-clock span on the BCM2711's ~54 MHz counter and on
 /// QEMU virt's ~62.5 MHz one. `.max(1)` so a nonsense CNTFRQ can never make the threshold zero, which
 /// would silently restore SPREAD-4's re-place-on-every-wake behaviour.
+// SPREAD-6 (VUG-PACE-2) — THE PLACEMENT LATCH, AND ITS ESCAPEMENT.
+//
+// SPREAD-5's damping was right about churn and silently wrong about one population: a task that never
+// stops. A frame-paced vug parks and wakes every frame, each park tens of milliseconds, so under
+// SPREAD-5 the placement question is never asked again for as long as the vug keeps rendering — its
+// core assignment is frozen at whatever the LAST long-park wake (or the spawn) decided, under whatever
+// load existed at that instant. When the surrounding fleet then pauses or exits, the survivor keeps the
+// contention-era packing forever. The s1q wire is the measurement: win1 held 30.7-30.9/s across ten
+// straight rollups — two runnable EL0 tasks time-sharing c2 at 99% busy while three cores sat idle —
+// with [spread4] rewake frozen at 26 and short= climbing by hundreds per window. A stable rate that is
+// a pure function of stale packing is exactly Peter's "vug wants to go back to what it thinks its fps
+// is supposed to be even though it could run faster": the fps was never a target, it was a latch.
+//
+// The escapement: a micro-park wake MAY still ask the placement question, at most once per
+// `PLACE_REFRESH_MS` per task. That bounds the asking rate at ~4/s per task (a six-vug fleet is ~72
+// asks/s of lock-free arithmetic, against SPREAD-4's measured ~540 placement calls/s), and asking is
+// not moving: `rewake_place`'s margin-2 threshold and freshness gate still decide, so a balanced fleet
+// answers "stay" and the counters show it. What changes is only that a pile-up now comes apart within
+// a quarter second of the load leaving, instead of never.
+const PLACE_REFRESH_MS: u64 = 250;
+
+/// SPREAD-6 — [`PLACE_REFRESH_MS`] in CNTPCT cycles, frequency-derived exactly like
+/// [`rewake_min_park_cyc`] and for the same reason.
+#[inline]
+fn place_refresh_cyc() -> u64 {
+    let frq = load_window_cyc().saturating_mul(4); // == CNTFRQ_EL0, cached
+    (frq / 1000).saturating_mul(PLACE_REFRESH_MS).max(1)
+}
+
 #[inline]
 fn rewake_min_park_cyc() -> u64 {
     let frq = load_window_cyc().saturating_mul(4); // == CNTFRQ_EL0, cached
@@ -1562,6 +1603,12 @@ static SPREAD4_STAY: AtomicU64 = AtomicU64::new(0);
 /// and SPREAD-5 does not. On a running fleet it should dwarf `rewake` + `stay` by orders of magnitude;
 /// if it does not, the fleet is not parking per frame and this arc's premise needs re-checking.
 static SPREAD5_SHORT_STAY: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-6 — micro-park wakes that asked the placement question anyway because the last ask was more
+/// than [`PLACE_REFRESH_MS`] ago. Climbs at ~4/s per continuously-running EL0 task; the OUTCOME of each
+/// ask still lands in `rewake`/`stay`, so `refresh` large with `rewake` flat is a fleet that keeps
+/// asking and keeps being told it is already in the right place — the escapement idling, as designed.
+static SPREAD6_REFRESH: AtomicU64 = AtomicU64::new(0);
 
 /// SPREAD-4 — rate limit for the per-event `[spread4] rewake` trace, on the same terms as
 /// `[smpbal] steal`: name the first few moves, then go quiet so a steadily-rebalancing desktop cannot
@@ -1663,6 +1710,7 @@ fn spawn_inner(
         // spawned onto an explicit core is pinned there (no-migrate), so stealing never touches it.
         steal_ok: requested_cpu == CPU_AUTO,
         park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
+        place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
     });
     rq(cpu).push(task);
     // PI-SCHED-1 — placement witness. The scheduler PINS a task to the caller-chosen core and never
@@ -1780,6 +1828,7 @@ fn spawn_user_inner(
         // SMP-BAL: EL0/slot tasks carry per-core TTBR0/ASID state — always pinned, never stolen.
         steal_ok: false,
         park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
+        place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
     });
     // SKILL-1: count this task against its address-space slot BEFORE the push, so it is countable before
     // it can ever be dispatched (and thus before any ASID-scoped kill could observe a short count).
@@ -1858,6 +1907,7 @@ pub fn spawn_user_thread(
         // SMP-BAL: shared-ASID EL0 thread — per-core address-space state, always pinned.
         steal_ok: false,
         park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
+        place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
     });
     // SKILL-1: this is the path that MAKES a slot multi-threaded, so it is the one the ASID-scoped kill
     // exists for — count the sibling before it can be dispatched.
@@ -2086,15 +2136,25 @@ fn make_ready(mut task: Box<Task>) {
         // blocked. Treat that as a short stay: it declines the move, which is the pre-SPREAD-4
         // behaviour and the conservative direction (a task is never moved on a duration we did not
         // measure). `saturating_sub` covers the same case defensively; CNTPCT itself is monotonic.
-        let parked_cyc = now_cyc().saturating_sub(task.park_cyc);
+        let now = now_cyc();
+        let parked_cyc = now.saturating_sub(task.park_cyc);
         let long_park = task.park_cyc != 0 && parked_cyc >= rewake_min_park_cyc();
         task.park_cyc = 0; // consumed — the next park stamps it afresh
-        if !long_park {
+        // SPREAD-6: a micro-park may still ask, on a slow clock. Without this, a task that never stops
+        // never re-asks and its packing latches forever — the residual "predestined fps" (see
+        // PLACE_REFRESH_MS). `place_cyc == 0` (a Task literal that predates the stamp discipline —
+        // none today, but cheap to be honest about) counts as due: asking is safe, moving is gated.
+        let refresh = !long_park && now.saturating_sub(task.place_cyc) >= place_refresh_cyc();
+        if !long_park && !refresh {
             // The micro-park path: no placement call, no counters but this one, and `target` stays
             // `home`. `stay` is deliberately NOT incremented — it means "asked and declined", and
             // folding thousands of unasked frame wakes into it would bury the signal it carries.
             SPREAD5_SHORT_STAY.fetch_add(1, Ordering::Relaxed);
         } else {
+            if refresh {
+                SPREAD6_REFRESH.fetch_add(1, Ordering::Relaxed);
+            }
+            task.place_cyc = now; // the question is being asked NOW — re-arm the refresh clock
             target = rewake_place(home);
             if target != home {
                 el0_resident_leave(home);
@@ -3647,7 +3707,22 @@ pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
             let mut claimed = None;
             for b in FUTEX.iter() {
                 b.lock_raw();
-                if b.key.load(Ordering::Relaxed) == 0 {
+                // FUTEX-DUP (VUG-PACE-2) — accept a bucket ANOTHER waiter keyed to `key` between our
+                // existence scan above and this claim pass. Two waiters entering together on a key with
+                // no standing bucket (the ONLY two-concurrent-waiter key in the system is user-vug's
+                // PHASE word: both workers park on it in the same instant, once per frame) could each
+                // complete the existence scan before either had stored the key, and the old claim loop
+                // — which tested `== 0` alone — then minted TWO buckets for one key. `futex_wake`
+                // stopped at the first, and the second bucket's waiter slept forever: the s1q win1
+                // lockup (att=0, no fault, parent parked at the frame barrier behind its stranded
+                // worker). This check closes the common window; the wake-side full scan below is the
+                // correctness backstop for the sliver it cannot (a foreign bucket freeing mid-scan).
+                let k = b.key.load(Ordering::Relaxed);
+                if k == key {
+                    claimed = Some(b);
+                    break;
+                }
+                if k == 0 {
                     b.key.store(key, Ordering::Relaxed);
                     claimed = Some(b);
                     break;
@@ -3712,19 +3787,40 @@ pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
     FutexWait::Woken
 }
 
-/// FUTEX_WAKE: wake up to `n` waiters parked on `key`; returns the number actually woken. Releases the
+/// FUTEX-DUP (VUG-PACE-2) — wakes that found MORE THAN ONE bucket serving their key. Every count here
+/// is one occurrence of the double-claim race `futex_wait`'s claim loop can still lose (see the note
+/// there); before the full-scan fix each one was a permanently stranded waiter — the s1q win1 lockup.
+/// Expected to stay at 0 on almost every boot; nonzero is the race observed AND survived.
+static FUTEX_DUP: AtomicU64 = AtomicU64::new(0);
+/// FUTEX-DUP — rate limit for the per-event witness line, `[spread4] rewake`-style: the first few
+/// occurrences name themselves, the cumulative counter carries the rest.
+static FUTEX_DUP_LOG: AtomicU32 = AtomicU32::new(0);
+const FUTEX_DUP_LOG_MAX: u32 = 8;
+
+/// FUTEX_WAKE: wake up to `n` waiters parked on `key`; returns the number actually woken. Releases a
 /// bucket back to free once its last waiter leaves. Waiters are re-readied OUTSIDE the bucket lock (the
 /// run-queue lock must never nest under it — same rule as `Semaphore::post`).
+///
+/// FUTEX-DUP (VUG-PACE-2): the scan visits EVERY bucket serving `key`, not just the first. The claim
+/// race in `futex_wait` can leave two buckets keyed alike (two waiters entering together on a key with
+/// no standing bucket), and the old `break` after the first match stranded the second bucket's waiter
+/// on a key nothing would ever name again — with user-vug's PHASE futex that was a worker asleep
+/// forever, the parent parked at the frame barrier behind it, and a window that stopped presenting with
+/// no fault anywhere (the s1q win1 signature: att=0, parked=0ms, composited by neighbors only). The
+/// early exit now happens only once `n` waiters are woken; the extra cost on the common single-bucket
+/// wake is one pass over the remaining bucket keys, each a lock/load/unlock with no waiter traffic.
 pub fn futex_wake(key: u64, n: usize) -> usize {
     debug_assert!(key != 0, "futex key must be non-zero");
     let daif = irq_save_mask();
     let mut woken = 0usize;
+    let mut buckets_hit = 0u32;
     for b in FUTEX.iter() {
         b.lock_raw();
         if b.key.load(Ordering::Relaxed) != key {
             b.unlock_raw();
             continue;
         }
+        buckets_hit += 1;
         while woken < n {
             let next = unsafe { (*b.waiters.get()).pop_front() };
             match next {
@@ -3745,7 +3841,20 @@ pub fn futex_wake(key: u64, n: usize) -> usize {
             b.key.store(0, Ordering::Relaxed); // last waiter gone — release the bucket
         }
         b.unlock_raw();
-        break;
+        if woken >= n {
+            break; // the wake's budget is spent — semantics unchanged from the single-bucket scan
+        }
+    }
+    if buckets_hit > 1 {
+        // The race happened and the full scan absorbed it. Witness it: this exact shape was a silent
+        // permanent strand before the fix, so each early occurrence is worth a line on the wire.
+        FUTEX_DUP.fetch_add(1, Ordering::Relaxed);
+        if FUTEX_DUP_LOG.fetch_add(1, Ordering::Relaxed) < FUTEX_DUP_LOG_MAX {
+            serial_println!(
+                ":: [futexdup] key={:#x} buckets={} woken={} (double-claim absorbed) ::",
+                key, buckets_hit, woken
+            );
+        }
     }
     irq_restore(daif);
     woken
@@ -4948,6 +5057,10 @@ pub fn prio_witness() {
 ///   * `short` — SPREAD-5: wakes that skipped placement because the park was a frame-loop micro-park.
 ///     Expected to dominate `rewake + stay` by orders of magnitude on a windowed fleet; that ratio IS
 ///     the damping. `short` climbing while `rewake` stays flat is the arc working.
+///   * `refresh` — SPREAD-6: micro-park wakes that asked anyway because the task's last placement ask
+///     was over `PLACE_REFRESH_MS` ago (the escapement that unlatches stale packing — the residual
+///     "predestined fps"). ~4/s per continuously-running EL0 task; its OUTCOMES land in
+///     `rewake`/`stay`, so `refresh` climbing with `rewake` flat is a fleet already in place.
 ///   * `margin` / `minpark` — the two thresholds those decisions were made against (runnable-resident
 ///     gap, and minimum park duration), so a reading is interpretable without the source.
 ///
@@ -4956,7 +5069,7 @@ pub fn prio_witness() {
 /// every aarch64 build (they simply stay zero where there is no EL0).
 fn spread4_witness() {
     serial_println!(
-        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} short={} margin={} minpark={}ms",
+        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} short={} refresh={} margin={} minpark={}ms",
         el0_active(0),
         EL0_RESIDENTS[0].load(Ordering::Relaxed),
         el0_active(1),
@@ -4968,6 +5081,7 @@ fn spread4_witness() {
         SPREAD4_REWAKE.load(Ordering::Relaxed),
         SPREAD4_STAY.load(Ordering::Relaxed),
         SPREAD5_SHORT_STAY.load(Ordering::Relaxed),
+        SPREAD6_REFRESH.load(Ordering::Relaxed),
         REWAKE_MARGIN,
         REWAKE_MIN_PARK_MS,
     );
@@ -5222,6 +5336,7 @@ fn spawn_stealable_on(name: &'static str, entry: fn(usize), arg: usize, cpu: usi
         user_ttbr0: 0,
         steal_ok: true, // the point of the fixture: movable, but staged on one core
         park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
+        place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
     });
     rq(cpu).push(task);
     poke_cpu(cpu);

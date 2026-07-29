@@ -2792,6 +2792,36 @@
   **The deterministic auto path cannot reach any of this** — QEMU raspi4b delivers no HID, so
   `interactive` never arms, no click is ever seen, and the 300-frame checksum is byte-identical.
 
+- **VUG-PACE-2 (both residuals were outside the program)** — the s1q re-opens closed, with **zero
+  user-vug code change** (a comment records both verdicts at the barrier note): the fixes live in
+  `arch/aarch64/sched.rs` and are written up in `scheduler.md` (§ SPREAD-6, § FUTEX-DUP).
+  - **(a) The residual "predestined fps" was the scheduler's placement latch.** VUG-PACE removed the
+    barrier-park floor; the s1q wire then showed win1 pinned at 30.7–30.9/s for tens of seconds while
+    win6 ran 88–93/s from the same binary — two runnable EL0 tasks time-sharing c2 at 99 % while three
+    cores idled, `[spread4] rewake=` frozen. SPREAD-5 re-asked core placement only after a ≥ 100 ms
+    park, which a frame-paced vug never takes, so contention-era packing was permanent. SPREAD-6 lets a
+    micro-park wake re-ask every 250 ms (`refresh=` on the `[spread4]` rollup); moves stay margin- and
+    freshness-gated.
+  - **The eye was honest, and the tumble is the instrument that proves it.** The idle tumble is
+    FRAME-based (3 brads per rendered frame — never time-based), so rotation speed *is* the frame rate
+    made visible: a crystal that "returns to its old speed" is a true fps reversion, and the on-window
+    VUGFPS digits and the rotation can never honestly disagree. The time-based-tumble hypothesis is
+    refuted by construction; no discriminating instrument needed beyond what the window already draws.
+  - **(b) The win1 lockup was the barrier's arrival park behind a kernel futex defect** (FUTEX-DUP):
+    two waiters entering `futex_wait` together on a bucketless key could mint two buckets for one key,
+    and `futex_wake` stopped at the first — and the only two-concurrent-waiter key in the system is
+    this program's `PHASE` word (both workers, same instant, once per frame). One worker was stranded,
+    `DONE` never reached `live`, and the parent parked at the barrier making no passes — which is why
+    `BARRIER_PASS_BUDGET` (a *pass* counter) never fired and the wire showed `att=0`, no fault, no
+    stall witness, no resume edge on the restoring click and no click ack. `kill` was the only
+    recovery (`futex_wake_killed` already scanned all buckets). Fixed both-sided in the kernel (claim
+    joins an existing same-key bucket; wake scans every bucket serving the key; `[futexdup]` witnesses
+    an absorbed race). The barrier protocol here was always lost-wakeup-safe against a correct futex.
+  - **Gates:** `./arroyo check` green both arches; `./arroyo kernel8-test` MBENCH PASS 86/86,
+    `UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c` unchanged — VUG.ELF is byte-identical
+    (comment-only edit), and the scheduler changes alter only when placement is re-asked and which
+    bucket a wake visits, never any value that reaches a surface.
+
 ### x86_64 (branch `hw-rmbp`)
 
 - **U1a** — first ring-3 round-trip (the x86 mirror of aarch64 M6a). A

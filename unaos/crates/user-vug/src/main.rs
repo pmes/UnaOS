@@ -211,6 +211,27 @@
 // rest of VUGPAUSE-2's idle contract is untouched: paused, hidden and idle vugs still park in
 // `SYS_INPUT_WAIT` exactly as designed.
 //
+// VUG-PACE-2 — BOTH RESIDUALS WERE OUTSIDE THIS PROGRAM, and the record here is so no future arc
+// re-audits this file for them. (a) THE RESIDUAL "PREDESTINED FPS" WAS THE SCHEDULER'S PLACEMENT
+// LATCH, not a pacer: SPREAD-5 re-asked the core-placement question only after a >=100 ms park, and a
+// frame-paced vug never parks that long, so contention-era packing (two vug threads time-sharing one
+// core while others idled — s1q wire: win1 pinned at 30.9/s, c2 at 99%, rewake frozen) persisted
+// forever after the contention left. SPREAD-6 (sched.rs) lets a micro-park wake re-ask every 250 ms.
+// Note the discriminator the eye already carries: the idle tumble below is FRAME-based (3 brads per
+// rendered frame, never time-based), so on the auto path rotation speed IS the frame rate made
+// visible — a crystal that "returns to its old speed" is a real fps reversion, not a perceptual
+// artifact, and the on-window VUGFPS digits and the rotation can never honestly disagree.
+// (b) THE WIN1 LOCKUP (att=0, no fault, HUD frozen, no resume edge on click) was the frame barrier's
+// ARRIVAL park below with a worker STRANDED by a kernel futex defect: two waiters entering
+// futex_wait together on a key with no standing bucket could mint two buckets for one key (this
+// program's PHASE word is the only two-concurrent-waiter key in the system), and futex_wake stopped
+// at the first — wake_phase woke one worker, the other slept forever, DONE never reached `live`, and
+// the parent parked at the barrier making no passes (so BARRIER_PASS_BUDGET, which counts returned
+// passes, could never fire — the documented "parked forever" limitation, observed in anger). Fixed in
+// sched.rs (FUTEX-DUP: claim joins an existing same-key bucket; wake scans every bucket serving the
+// key; `[futexdup]` witnesses an absorbed race). This program's barrier protocol was and is
+// lost-wakeup-safe against a correct futex; nothing here changed.
+//
 // Barrier direction split (deliberate, robust under QEMU raspi4b's lack of a Group-1 timer IRQ — see
 // docs userspace.md M6e): ARRIVAL (worker -> parent) is a real FUTEX (workers atomically bump `done` +
 // SYS_FUTEX WAKE, the parent SYS_FUTEX WAITs); RELEASE (parent -> worker) is a SYS_YIELD poll on `phase`

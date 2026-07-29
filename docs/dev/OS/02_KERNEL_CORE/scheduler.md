@@ -523,6 +523,74 @@ increment `stay`, which means "asked and declined" and would otherwise be buried
 The per-event trace carries `parked=<n>ms`, so every move that does happen names
 the absence that justified it.
 
+### The placement latch and its escapement (aarch64, SPREAD-6 / VUG-PACE-2)
+
+SPREAD-5's damping was right about churn and silently wrong about one population:
+a task that never stops. A frame-paced vug parks and wakes every frame, each park
+tens of milliseconds, so under SPREAD-5 the placement question was **never asked
+again** for as long as the vug kept rendering — its core assignment stayed frozen
+at whatever the last long-park wake (or the spawn) decided, under whatever load
+existed at that instant. When the surrounding fleet paused or exited, the
+survivor kept the contention-era packing forever.
+
+The s1q metal wire is the measurement, and it is the residual half of P73's "vug
+wants to go back to what it thinks its fps is supposed to be even though it could
+run faster": `[wcn]` win1 pinned at 30.7–30.9/s across ten straight 5 s rollups
+while win6 ran 88–93/s from the same binary, `SCHED: load` showing c2 at 99 % with
+`[spread4] c2=2/4` (two runnable EL0 tasks time-sharing one core) while c0/c1/c3
+sat near idle, and `rewake=` frozen at 26 while `short=` climbed by hundreds per
+window — the question was simply never being asked. A frame rate that is a stable
+function of stale packing *looks* like a target fps; there is none (VUG-PACE
+established that), and the vug's idle tumble is frame-based (3 brads/rendered
+frame), so the eye's report that the rotation "returned to its old speed" was a
+true report of a real fps reversion, not a perceptual artifact.
+
+SPREAD-6 adds the escapement: a micro-park wake may still ask the placement
+question, at most once per `PLACE_REFRESH_MS` (250 ms) per task. `Task.place_cyc`
+(stamped at spawn and at every `rewake_place` call, under the same Box-ownership
+argument as `park_cyc`) is the clock. Asking is bounded at ~4/s per
+continuously-running EL0 task — a six-vug fleet is ~72 lock-free asks/s against
+SPREAD-4's measured ~540 placement calls/s — and asking is not moving: the
+margin-2 threshold and the WEDGE-1 freshness gate still decide, so a balanced
+fleet answers "stay". What changes is only that a pile-up now comes apart within
+a quarter second of the load leaving, instead of never. The rollup gains
+`refresh=` (asks from this path; outcomes still land in `rewake`/`stay`).
+
+### Futex duplicate-bucket lost wake (aarch64, FUTEX-DUP / VUG-PACE-2)
+
+The other half of VUG-PACE-2, and the win1 lockup's root cause. `futex_wait`
+selected its bucket in two passes — an existence scan for the key, then a claim
+scan that tested **only** `key == 0`. Two waiters entering together on a key with
+no standing bucket could each complete the existence scan before either had
+stored the key, and the claim pass then minted **two buckets for one key**.
+`futex_wake` stopped at the first matching bucket, so the second bucket's waiter
+slept on a key nothing would ever name again.
+
+The only two-concurrent-waiter key in the system is user-vug's `PHASE` word —
+both workers park on it in the same instant, once per frame, thousands of
+opportunities per minute under a fleet — which is why the victim was always a
+vug. The s1q signature: `wake_phase` woke one worker, the stranded one never
+rendered, `DONE` never reached `live`, and the parent parked at the frame
+barrier's arrival futex making **no passes** — so `BARRIER_PASS_BUDGET`, which
+counts returned passes, could never fire (UVUG-9's documented "parked forever"
+limitation, observed in anger). On the wire: `[wcn] win=1 att=0 parked=0ms`,
+composited by neighbors only, **no** fault, no `[uvug9]` stall, no `[vugpause2]
+resume` on the restoring click (the parent was not parked on the *input* futex,
+so the focus/unhide edges found the parked-hint clear), and no click ack (input
+never drained again). Nothing recovers it — the input backstop wakes only input
+keys — except `kill`, whose `futex_wake_killed` already scans every bucket.
+
+The fix is two-sided. Claim side: the claim pass now joins a bucket another
+waiter has keyed to the same key since the existence scan (closes the common
+window). Wake side, the correctness backstop: `futex_wake` visits **every**
+bucket serving the key, exiting early only once `n` waiters are woken, so a
+duplicate that still slips through (a foreign bucket freeing mid-scan) costs
+nothing. A wake that finds more than one bucket for its key increments
+`FUTEX_DUP` and prints `[futexdup] key=... buckets=... woken=...` (first 8
+occurrences) — each line is the race observed **and absorbed**; before the fix
+each was a permanent strand. user-vug's barrier protocol was and is
+lost-wakeup-safe against a correct futex; nothing in the program changed.
+
 ### BSP scheduling + work stealing (aarch64, SMP-BAL)
 
 SCHED-3 balances at **spawn**, but a task's cost is unknown then and wake bursts
