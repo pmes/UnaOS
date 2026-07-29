@@ -2343,7 +2343,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
             console.println("APPS:     vug (3D sculptor), v3d (replay the visible GPU graphics battery)");
             // BGRUN-1: background EL0 runs — the concurrent-apps line (windows coexist; TAB cycles).
-            #[cfg(feature = "baremetal")]
+            #[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
             console.println("PROC:     run <path> (foreground), bg <path> (background), jobs (list+reap), kill <pid>");
             console.println("POWER:    batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
             console.println("WITNESS:  bootlog (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
@@ -2833,7 +2833,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // foreign volume-level path from the same surface. `vfs <op> <path>`.
             vfs_cmd(console, &args);
         },
-        #[cfg(feature = "baremetal")]
+        #[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
         "run" => {
             // EXEC-1: load an ELF64 EL0 program off the VFS namespace and execute it at EL0, reporting its
             // exit status. Rides the SAME `MountTable` the `vfs` verb uses (`/fat` = FAT boot partition,
@@ -3334,7 +3334,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
              crate::hlt_loop();
              crate::hlt_loop();
         },
-        #[cfg(feature = "baremetal")]
+        #[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
         "bg" => {
             // BGRUN-1: run an EL0 program in the BACKGROUND — the shell returns to its prompt at once and
             // the program keeps running (and, if windowed, its window stays OPEN, so TAB has a ring to
@@ -3345,13 +3345,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 Some(&path) => bg_program(console, path),
             }
         },
-        #[cfg(feature = "baremetal")]
+        #[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
         "jobs" => {
             // BGRUN-1: list background programs and REAP the exited ones (this verb is the reaper — a
             // PEXITED row stays claimed until it is polled here, and the table is bounded). `jobs`.
             bg_jobs(console);
         },
-        #[cfg(feature = "baremetal")]
+        #[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
         "kill" => {
             // BGRUN-1: kill a background program by pid (SKILL-1 underneath — ASID-scoped, so ELF-2
             // sibling threads die with it; unconfirmed kills park the row PORPHANED and settle at the
@@ -3463,12 +3463,106 @@ fn parse_num(s: &str) -> Option<u64> {
 /// EXEC-1/BGRUN-1: the shared read-and-precheck front of `run` and `bg` — stat + bound + read off the
 /// VFS, then the friendly ELF64/aarch64 pre-check (the kernel loader is the real gate; a flat blob
 /// passes through to the position-independent flat path). `verb` names the caller in every message.
-#[cfg(feature = "baremetal")]
+#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
 fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc::vec::Vec<u8>> {
+    // WINX-3: fetch the bytes per-arch, then run the SHARED header pre-checks below on the result.
+    #[cfg(target_arch = "x86_64")]
+    let bytes = read_el0_image_bytes_x86(console, verb, path)?;
+    #[cfg(target_arch = "aarch64")]
+    let bytes = read_el0_image_bytes_aarch64(console, verb, path)?;
+    read_el0_image_check(console, verb, path, bytes)
+}
+
+/// WINX-3: the x86 byte fetch. It reads the FAT boot partition's ROOT DIRECTORY directly through
+/// `crate::fs::fat` rather than the VFS `MountTable` the aarch64 twin uses.
+///
+/// WHY, honestly: `fs/vfs.rs`'s `impl VfsBackend for FatBackend` (and for `NativeBackend`) is
+/// `#[cfg(target_arch = "aarch64")]`. Widening that would enable a large body of VFS code on x86 whose
+/// on-x86 behaviour this arc has not proven — x86 storage is the staged/flush model, not aarch64's
+/// synchronous in-place one — and `fs/` is outside this arc's lane besides. The FAT root read used here
+/// is the SAME API the x86 U2/U9x/U10x paths already exercise on this arch, so it rests on proven code.
+///
+/// CONSEQUENCE, and it is a real limitation: x86 `run`/`bg` accept a boot-partition root file only —
+/// `/fat/NAME` (or a bare `NAME`), 8.3 names, no subdirectories, no `/usb`, no native `/` volume.
+/// aarch64 keeps its full VFS namespace. Widening x86 to the full namespace is the follow-on that goes
+/// with making the VFS backends arch-neutral.
+#[cfg(target_arch = "x86_64")]
+fn read_el0_image_bytes_x86(
+    console: &mut Console,
+    verb: &str,
+    path: &str,
+) -> Option<alloc::vec::Vec<u8>> {
+    let cap = crate::arch::x86_64::syscall::user_window_size();
+    // Accept `/fat/NAME` (the documented operator form) or a bare `NAME`. Anything else names a volume
+    // this arch cannot reach yet — say so precisely rather than failing as "not found".
+    let name = match path.strip_prefix("/fat/") {
+        Some(n) => n,
+        None => match path.strip_prefix('/') {
+            // A rooted path into some other volume.
+            Some(_) => {
+                console.println(&alloc::format!(
+                    "{}: {}: x86 {} reads the FAT boot partition only — use /fat/<NAME>", verb, path, verb
+                ));
+                return None;
+            }
+            None => path,
+        },
+    };
+    if name.is_empty() || name.contains('/') {
+        console.println(&alloc::format!(
+            "{}: {}: x86 {} takes a boot-partition root file (no subdirectories)", verb, path, verb
+        ));
+        return None;
+    }
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => {
+            console.println(&alloc::format!("{}: {}: no FAT boot partition mounted", verb, path));
+            return None;
+        }
+    };
+    let de = match fs.find_in_root(name) {
+        Ok(d) => d,
+        Err(_) => {
+            console.println(&alloc::format!(
+                "{}: {}: no such file on the boot partition (-ENOENT)", verb, path
+            ));
+            return None;
+        }
+    };
+    if de.size == 0 {
+        console.println(&alloc::format!("{}: {}: empty file", verb, path));
+        return None;
+    }
+    if de.size as usize > cap {
+        console.println(&alloc::format!(
+            "{}: {}: {} bytes exceeds the {}-byte EL0 user window (-E2BIG)",
+            verb, path, de.size, cap
+        ));
+        return None;
+    }
+    // Reject up-front from the ON-DISK directory size (the U2 truncation lesson): `read_file` caps the
+    // copy at min(de.size, cap), so a silently-short read would otherwise look like a valid small image.
+    let mut bytes = alloc::vec![0u8; de.size as usize];
+    if fs.read_file(&de, &mut bytes, cap).is_err() {
+        console.println(&alloc::format!("{}: {}: read failed", verb, path));
+        return None;
+    }
+    Some(bytes)
+}
+
+/// WINX-3: the aarch64 byte fetch — the original `read_el0_image` body, unchanged, over the full VFS
+/// namespace (`/` native, `/fat` boot partition, `/usb` stick).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn read_el0_image_bytes_aarch64(
+    console: &mut Console,
+    verb: &str,
+    path: &str,
+) -> Option<alloc::vec::Vec<u8>> {
     use crate::fs::vfs::NodeKind;
     // Cap = the kernel user window; a file at or under it may still be rejected by the loader (a flat blob
     // is re-bounded to one code page), but this is the hard read ceiling — we never read past it.
-    const CAP: u64 = crate::arch::aarch64::boot::USER_REGION_SIZE as u64;
+    let cap: u64 = crate::arch::aarch64::boot::USER_REGION_SIZE as u64;
     let mt = vfs_mount_table();
     let st = match mt.stat(path) {
         Ok(s) => s,
@@ -3485,10 +3579,10 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
         console.println(&alloc::format!("{}: {}: empty file", verb, path));
         return None;
     }
-    if st.size > CAP {
+    if st.size > cap {
         console.println(&alloc::format!(
             "{}: {}: {} bytes exceeds the {}-byte EL0 user window (-E2BIG)",
-            verb, path, st.size, CAP
+            verb, path, st.size, cap
         ));
         return None;
     }
@@ -3499,6 +3593,19 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
             return None;
         }
     };
+    Some(bytes)
+}
+
+/// WINX-3: the SHARED ELF header pre-check both arches run on the fetched bytes. A friendly check that
+/// only sharpens the error text — the kernel loader re-validates every one of these fields from scratch
+/// and is the actual authority. aarch64's messages and values are unchanged.
+#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
+fn read_el0_image_check(
+    console: &mut Console,
+    verb: &str,
+    path: &str,
+    bytes: alloc::vec::Vec<u8>,
+) -> Option<alloc::vec::Vec<u8>> {
     if bytes.len() >= 20 && bytes[0..4] == [0x7F, b'E', b'L', b'F'] {
         if bytes[4] != 2 {
             console.println(&alloc::format!("{}: {}: not an ELF64 image (EI_CLASS != 2)", verb, path));
@@ -3508,10 +3615,15 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
             console.println(&alloc::format!("{}: {}: not little-endian (EI_DATA != 1)", verb, path));
             return None;
         }
+        // WINX-3: the expected e_machine is per-arch — 183 (EM_AARCH64) or 62 (EM_X86_64).
         let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
-        if machine != 183 {
+        #[cfg(target_arch = "aarch64")]
+        let (want, arch_name) = (183u16, "aarch64");
+        #[cfg(target_arch = "x86_64")]
+        let (want, arch_name) = (62u16, "x86_64");
+        if machine != want {
             console.println(&alloc::format!(
-                "{}: {}: not an aarch64 image (e_machine {} != 183)", verb, path, machine
+                "{}: {}: not an {} image (e_machine {} != {})", verb, path, arch_name, machine, want
             ));
             return None;
         }
@@ -3519,7 +3631,7 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
     Some(bytes)
 }
 
-#[cfg(feature = "baremetal")]
+#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
 fn run_program(console: &mut Console, path: &str) {
     let Some(bytes) = read_el0_image(console, "run", path) else {
         return;
@@ -3527,7 +3639,15 @@ fn run_program(console: &mut Console, path: &str) {
     // Hand the bytes to the kernel loader: map into a fresh EL0 slot, run co-located, wait (bounded 5 s) for
     // the program to exit or fault. The image length + entry are reported for the witness.
     let n = bytes.len();
+    // WINX-3: a 5-second bound, expressed in each arch's own unit. aarch64's `run_user_image` takes a
+    // CNTPCT span (`cntfrq()` = one second) and its expression is unchanged; the x86 twin takes
+    // milliseconds against the global 1 kHz timebase. Deliberately NOT unified into one arch-neutral
+    // unit, because that would mean changing the aarch64 loader's signature — and aarch64 must stay
+    // byte-identical through this arc.
+    #[cfg(target_arch = "aarch64")]
     let deadline = 5 * crate::arch::aarch64::timer::cntfrq();
+    #[cfg(target_arch = "x86_64")]
+    let deadline: u64 = 5_000;
     match crate::arch::syscall::run_user_image("shell-run", &bytes, deadline) {
         Ok((outcome, entry)) => {
             use crate::arch::syscall::RunOutcome;
@@ -3566,7 +3686,7 @@ fn run_program(console: &mut Console, path: &str) {
 
 /// BGRUN-1: one shell-side background job. The PATH is copied (bounded) so `jobs` can name it — the
 /// kernel row carries only the fixed task name. The pid is the durable key; asid rides for `kill`.
-#[cfg(feature = "baremetal")]
+#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 struct BgJob {
     pid: u64,
@@ -3580,12 +3700,12 @@ struct BgJob {
 /// slots — so the real ceiling is 3 bg jobs alongside one foreground `run`, and this table's
 /// full arm is reachable only if MAX_PROCS grows past it. 8 slots kept (harmless headroom).
 /// Shell access is single-task, but the Mutex keeps the invariant explicit rather than relying on it.
-#[cfg(feature = "baremetal")]
+#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
 static BG_JOBS: spin::Mutex<[Option<BgJob>; 8]> = spin::Mutex::new([None; 8]);
 
 /// BGRUN-1: `bg <path>` — read the image, spawn it detached, record the job. The shell prompt is
 /// back the moment this returns; the program (and its window, if it creates one) keeps running.
-#[cfg(feature = "baremetal")]
+#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
 fn bg_program(console: &mut Console, path: &str) {
     let Some(bytes) = read_el0_image(console, "bg", path) else {
         return;
@@ -3624,7 +3744,7 @@ fn bg_program(console: &mut Console, path: &str) {
 
 /// BGRUN-1: `jobs` — list background jobs and reap the exited ones. This is the SOLE reaper for
 /// bg rows: an exited job's kernel row stays claimed (PEXITED) until it is polled here.
-#[cfg(feature = "baremetal")]
+#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
 fn bg_jobs(console: &mut Console) {
     use crate::arch::syscall::BgPoll;
     let mut jobs = BG_JOBS.lock();
@@ -3671,7 +3791,7 @@ fn bg_jobs(console: &mut Console) {
 
 /// BGRUN-1: `kill <pid>` — kill a recorded background job (SKILL-1 underneath). The row is reaped by
 /// the next `jobs`; the table entry stays until then so the operator sees the outcome there.
-#[cfg(feature = "baremetal")]
+#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
 fn bg_kill_cmd(console: &mut Console, pid: u64) {
     let jobs = BG_JOBS.lock();
     let Some(job) = jobs.iter().flatten().find(|j| j.pid == pid).copied() else {
@@ -3708,8 +3828,9 @@ fn vfs_mount_table() -> crate::fs::vfs::MountTable {
 }
 
 /// Render a `VfsError` as an errno-style operator line, matching the shell's
-/// `-ENOENT`/`-EISDIR` house style.
-#[cfg(target_arch = "aarch64")]
+/// `-ENOENT`/`-EISDIR` house style. WINX-3: the body is arch-neutral, so the gate simply widened to
+/// cover x86's new `run`/`bg` callers; the aarch64 text is unchanged.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn vfs_err(e: crate::fs::vfs::VfsError) -> String {
     use crate::fs::vfs::VfsError::*;
     match e {
