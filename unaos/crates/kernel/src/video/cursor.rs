@@ -748,6 +748,17 @@ static C8_SUPPRESSED_RATE: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "witness")]
 static C8_UNCLOCKED: AtomicU64 = AtomicU64::new(0);
 
+/// CURSOR-10 — panel bytes this module has handed to `DC CVAC`, across every flush path it owns.
+/// Reported as KiB in `[cursor8]`'s line because that is the rollup the pointer-report cost already
+/// lives in. On the bench the number to read is its RATE against `[cursor6] present_over`: before
+/// CURSOR-10 a pointer report cost two full-scanline sweeps of the sprite's height (~553 KB at
+/// 1920x1200), after it one column-bounded sweep of the union (~9 KB), so a run whose motion profile
+/// is unchanged should show this fall by roughly the panel-width-to-sprite-width ratio. QEMU raspi4b
+/// has no HID pointer, so on the gate it counts only the compositor-driven paths and cannot witness
+/// the win.
+#[cfg(feature = "witness")]
+static C10_FLUSH_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// CURSOR-6/7 — count a window present that landed on the live sprite box, and, when nothing in that
 /// pass owes the sprite a repaint, ARM the tail repair.
 ///
@@ -879,6 +890,10 @@ pub fn take_present_dirty() -> bool {
 /// * **`suppressed_rate`** — inside the floor, DEFERRED (re-armed), not lost.
 /// * **`unclocked`** — granted without a floor because no monotonic counter was readable. Must be 0
 ///   on both bench platforms; non-zero means the limiter is not running.
+/// * **`flush_kb`** — CURSOR-10: panel KiB this module has cleaned to the PoC, over every flush path
+///   it owns. A cost, not a fault, and the only number that reads the coalesce on the bench: it
+///   should fall by roughly the panel-width-to-sprite-width ratio against an unchanged motion
+///   profile. It does not enter the verdict.
 ///
 /// `UNWITNESSED` where no request ever arrived, which on QEMU raspi4b is every boot: no HID pointer
 /// report means the sprite is never drawn, `live_box_relaxed()` is always `None`, and nothing can arm.
@@ -891,6 +906,7 @@ pub fn cursor8_rollup(scope: &str) {
     let stale = C8_SUPPRESSED_STALE.load(Ordering::Relaxed);
     let rate = C8_SUPPRESSED_RATE.load(Ordering::Relaxed);
     let unclocked = C8_UNCLOCKED.load(Ordering::Relaxed);
+    let flush_kb = C10_FLUSH_BYTES.load(Ordering::Relaxed) / 1024;
     let verdict = if unclocked > 0 {
         "UNCLOCKED"
     } else if requests == 0 {
@@ -901,8 +917,8 @@ pub fn cursor8_rollup(scope: &str) {
         "PACED"
     };
     serial_println!(
-        "[cursor8] repair rate scope={} requests={} repairs={} suppressed_stale={} suppressed_rate={} unclocked={} floor_ms={} -> {}",
-        scope, requests, repairs, stale, rate, unclocked, REPAIR_MIN_MS, verdict
+        "[cursor8] repair rate scope={} requests={} repairs={} suppressed_stale={} suppressed_rate={} unclocked={} floor_ms={} flush_kb={} -> {}",
+        scope, requests, repairs, stale, rate, unclocked, REPAIR_MIN_MS, flush_kb, verdict
     );
 }
 
@@ -1054,13 +1070,107 @@ fn for_each_sprite_pixel(
 
 /// Clean the panel rows the box spans, so the non-coherent HVS sees the change. Whole scanlines at
 /// the panel's stride — the same discipline `wm::draw_window` and `Screen::flush` use.
+///
+/// Kept as-is for the standalone entry points ([`undraw`], [`ensure_drawn`], the masked paths), whose
+/// other callers are unchanged by CURSOR-10. The [`refresh_locked`] pair goes through
+/// [`FlushUnion`]/[`flush_rect`] instead.
 fn flush_box(fb: &FrameBuffer, y: usize, h: usize) {
     let info = fb.info();
     let row_bytes = info.stride * info.bytes_per_pixel;
     let y0 = y.min(info.height);
     let y1 = (y + h).min(info.height);
     if y1 > y0 {
+        #[cfg(feature = "witness")]
+        C10_FLUSH_BYTES.fetch_add(((y1 - y0) * row_bytes) as u64, Ordering::Relaxed);
         fb.flush_range(y0 * row_bytes, (y1 - y0) * row_bytes);
+    }
+}
+
+/// CURSOR-10 — clean only the COLUMNS the box spans, row by row, instead of whole scanlines.
+///
+/// The sprite is ~36 px wide on a 1920 px panel, so a whole-scanline sweep cleans ~53x the bytes the
+/// sprite could possibly have dirtied. `flush_range` takes a byte range, not a rect, so a
+/// column-bounded clean is `h` calls rather than one — and `h` is the sprite's height (~36), not the
+/// panel's.
+///
+/// **Cache-line alignment is not a correctness condition here, and that is worth saying explicitly.**
+/// `cache::clean_range` rounds the start DOWN to the D-cache line (64 B on the A72) and iterates to
+/// the end, so a rect whose columns do not sit on a line boundary simply cleans a few neighbouring
+/// pixels as well. `DC CVAC` writes a dirty line back; it never invalidates and never discards, so
+/// cleaning a byte we did not write can only publish that byte's newest value — including another
+/// core's, which is that core's own data and which it will clean again anyway. There is no rect
+/// whose flush this can get wrong; the only cost of misalignment is a few extra bytes.
+///
+/// Falls back to the contiguous whole-span form once the columns cover most of the row: each
+/// `flush_range` ends in its own `dsb sy`, and past that point `h` barriers cost more than the bytes
+/// they save.
+fn flush_rect(fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize) {
+    let info = fb.info();
+    let row_bytes = info.stride * info.bytes_per_pixel;
+    let bpp = info.bytes_per_pixel;
+    let y0 = y.min(info.height);
+    let y1 = (y + h).min(info.height);
+    let x0 = x.min(info.width);
+    let x1 = (x + w).min(info.width);
+    if y1 <= y0 || x1 <= x0 || bpp == 0 {
+        return;
+    }
+    // Columns cover >= 3/4 of the row (the 4 and the 3 are that fraction, not a pixel size).
+    if (x1 - x0) * 4 >= info.width * 3 {
+        flush_box(fb, y0, y1 - y0);
+        return;
+    }
+    let span = (x1 - x0) * bpp;
+    #[cfg(feature = "witness")]
+    C10_FLUSH_BYTES.fetch_add(((y1 - y0) * span) as u64, Ordering::Relaxed);
+    for row in y0..y1 {
+        fb.flush_range(row * row_bytes + x0 * bpp, span);
+    }
+}
+
+/// CURSOR-10 — a deferred flush: the bounding box of every rect a pass has dirtied but not yet
+/// cleaned.
+///
+/// [`refresh_locked`] is `undraw_locked` then `draw_locked` under ONE lock, and each used to end in
+/// its own whole-scanline `flush_box`. That is two full sweeps per HID report (~553 KB on the bench
+/// panel, ~69 MB/s at 125 Hz), and — worse than the bytes — the first sweep PUBLISHES the panel with
+/// the arrow taken down and not yet put back. Handing both rects to one union flushed after both
+/// pixel phases have run removes the intermediate publication entirely and halves the sweep even
+/// before [`flush_rect`]'s column bound is applied.
+///
+/// Union rather than two rects, because the two boxes are the same sprite one report apart: at 125 Hz
+/// they overlap or nearly do, and the union's column span is the sprite's width plus the motion
+/// delta. The degenerate case is a teleporting pointer, where the union spans the panel width and
+/// [`flush_rect`] falls back to whole scanlines — i.e. one full-scanline sweep, still exactly half of
+/// what this path did before, never more.
+///
+/// The saved-under logic is untouched: nothing here reads or writes `saved`, `off`, or the epoch, and
+/// the flush is a cache maintenance operation on pixels already written. The [wc-d] argument is
+/// unaffected — it turns on WHAT is in RAM when the compositor verifies, and every byte either phase
+/// wrote is still cleaned, once, before the lock is released.
+#[derive(Clone, Copy, Default)]
+struct FlushUnion(Option<(usize, usize, usize, usize)>);
+
+impl FlushUnion {
+    /// Grow the union to include `(x, y, w, h)`.
+    fn add(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        self.0 = Some(match self.0 {
+            None => (x, y, w, h),
+            Some((ox, oy, ow, oh)) => {
+                let x0 = ox.min(x);
+                let y0 = oy.min(y);
+                let x1 = (ox + ow).max(x + w);
+                let y1 = (oy + oh).max(y + h);
+                (x0, y0, x1 - x0, y1 - y0)
+            }
+        });
+    }
+
+    /// Clean everything accumulated, once. A no-op when no phase dirtied anything.
+    fn flush(self, fb: &FrameBuffer) {
+        if let Some((x, y, w, h)) = self.0 {
+            flush_rect(fb, x, y, w, h);
+        }
     }
 }
 
@@ -1079,7 +1189,14 @@ fn flush_box(fb: &FrameBuffer, y: usize, h: usize) {
 /// The residual hole is narrow and named: a painter whose new content happens to be exactly `FILL` or
 /// `SHADOW` at one of our pixels is indistinguishable from our own sprite, and that pixel would be
 /// restored to stale content. [`repair`] closes it.
-fn undraw_locked(sp: &mut Sprite) -> Option<(usize, usize, usize, usize)> {
+///
+/// CURSOR-10 — `pend` is the caller's deferred flush. `None` means "clean my rows yourself before
+/// returning", which is what every standalone caller wants; `Some` defers the clean to the caller,
+/// which is sound ONLY because the caller still holds the sprite lock and cleans before releasing it.
+fn undraw_locked(
+    sp: &mut Sprite,
+    pend: Option<&mut FlushUnion>,
+) -> Option<(usize, usize, usize, usize)> {
     if !sp.drawn {
         return None;
     }
@@ -1116,7 +1233,10 @@ fn undraw_locked(sp: &mut Sprite) -> Option<(usize, usize, usize, usize)> {
             fb.put_pixel(x, y, saved[i]);
         }
     });
-    flush_box(&fb, by, bh);
+    match pend {
+        Some(p) => p.add(bx, by, bw, bh),
+        None => flush_box(&fb, by, bh),
+    }
     sp.drawn = false;
     sp.off.reset();
     bump_epoch(sp);
@@ -1138,7 +1258,7 @@ fn undraw_locked(sp: &mut Sprite) -> Option<(usize, usize, usize, usize)> {
 pub fn undraw() {
     let restored = {
         let mut sp = SPRITE.lock();
-        undraw_locked(&mut sp)
+        undraw_locked(&mut sp, None)
     };
     repair(restored);
 }
@@ -1292,7 +1412,7 @@ fn undraw_within_locked(
     if !fb.is_ready() {
         // The full undraw bumps the generation itself, so the caller's conditional bump would be
         // redundant — and harmless either way, since it reports zero pixels handed back.
-        return (undraw_locked(sp), 0);
+        return (undraw_locked(sp, None), 0);
     }
     // CURSOR-9 — same consumption as the full undraw, and for the same reason. Taken AFTER the
     // `is_ready` delegation above, which consumes it itself.
@@ -1354,7 +1474,7 @@ pub fn ensure_drawn() {
         if sp.drawn || sp.unsupported || !crate::pal::cursor::visible() {
             return;
         }
-        match draw_locked(&mut sp) {
+        match draw_locked(&mut sp, None) {
             Ok(pos) => armed_at = pos,
             Err(()) => unsupported_now = true,
         }
@@ -1401,13 +1521,20 @@ fn refresh_locked(
     armed_at: &mut Option<(i32, i32)>,
     unsupported_now: &mut bool,
 ) -> Option<(usize, usize, usize, usize)> {
-    let restored = undraw_locked(sp);
+    // CURSOR-10 — both phases defer their clean into one union, flushed below.
+    let mut pend = FlushUnion::default();
+    let restored = undraw_locked(sp, Some(&mut pend));
     if crate::pal::cursor::visible() && !sp.unsupported {
-        match draw_locked(sp) {
+        match draw_locked(sp, Some(&mut pend)) {
             Ok(pos) => *armed_at = pos,
             Err(()) => *unsupported_now = true,
         }
     }
+    // Unconditional, and after BOTH phases: every pixel write above is complete, and the restore owes
+    // RAM its clean even on the paths where the draw declined or failed (hidden pointer, unsupported
+    // panel, unreadable pixel). The lock is still held, so nothing has observed the union half-built.
+    let fb = *super::WRITER.lock();
+    pend.flush(&fb);
     restored
 }
 
@@ -1924,7 +2051,14 @@ fn redraw_off_locked(sp: &mut Sprite, unsupported_now: &mut bool) {
 /// Save-under and draw, with the lock held. `Ok(Some(pos))` when this was the first draw of the boot
 /// (the caller prints the witness), `Ok(None)` on any later draw, `Err(())` when the panel format has
 /// no read-back inverse and the cursor must be disabled for the boot.
-fn draw_locked(sp: &mut Sprite) -> Result<Option<(i32, i32)>, ()> {
+///
+/// CURSOR-10 — `pend` as in [`undraw_locked`]: `Some` defers this draw's clean to the caller, so the
+/// undraw's restore and the draw's arrow reach RAM in ONE sweep and the panel is never published with
+/// the arrow missing.
+fn draw_locked(
+    sp: &mut Sprite,
+    pend: Option<&mut FlushUnion>,
+) -> Result<Option<(i32, i32)>, ()> {
     let fb = *super::WRITER.lock();
     if !fb.is_ready() {
         return Ok(None);
@@ -2011,7 +2145,10 @@ fn draw_locked(sp: &mut Sprite) -> Result<Option<(i32, i32)>, ()> {
     for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, _i| {
         fb.put_pixel(x, y, color);
     });
-    flush_box(&fb, by, bh);
+    match pend {
+        Some(p) => p.add(bx, by, bw, bh),
+        None => flush_box(&fb, by, bh),
+    }
 
     // CURSOR-1 witness: once, at the first draw of the boot. Input-driven by construction (nothing
     // reaches here before a pointer report), so quiet boot is preserved and the QEMU gate — which has

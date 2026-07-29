@@ -3445,7 +3445,9 @@ to a single line ahead of the CLICK-ROUTE arc.
 
 #### What the counters mean now
 
-`[cursor8] repair rate scope=… requests=N repairs=N suppressed_stale=N suppressed_rate=N unclocked=N floor_ms=8 -> V`
+`[cursor8] repair rate scope=… requests=N repairs=N suppressed_stale=N suppressed_rate=N unclocked=N floor_ms=8 flush_kb=N -> V`
+
+(`flush_kb` is CURSOR-10's; see below. It is a cost counter and does not enter the verdict.)
 
 * **`requests`** — flag CONSUMPTIONS, not armings. The flag coalesces, so `requests <= present_over`
   by construction, and the ratio between them is how much the coalescing already absorbs.
@@ -3503,6 +3505,48 @@ never run; this run is the first to cover both arcs**, and it clears CURSOR-7's 
 * `[cursor3] repaint=` beside `[cursor8] repairs=` remains the honest ratio to watch. CURSOR-7's
   tripwire is still armed — this arc bounded the RATE, it did not remove the whole-sprite duty cycle,
   and the structural fix (a plan snapshot that sees a sprite arriving mid-pass) is still owed.
+
+### CURSOR-10 — one pointer report, one cache sweep
+
+CURSOR-9's root-cause named a second cost on the same path and left it standing: `refresh_locked` is
+`undraw_locked` + `draw_locked` under one `SPRITE` acquisition, and **each phase ended in its own
+`flush_box`, which cleans WHOLE PANEL SCANLINES over the sprite's height**. On the bench panel
+(1920x1200, 4 B/px) that is ~36 x 1920 x 4 B ≈ 276 KB per phase, ~553 KB per HID report, ~69 MB/s of
+`DC CVAC` at the 125 Hz report rate — for a sprite that can have dirtied at most ~36 x 36 px.
+
+Two separable defects, both closed here, both entirely inside `video/cursor.rs`:
+
+* **Two sweeps, and an arrow-less panel between them.** The undraw's flush PUBLISHES the restored
+  rows to the HVS before the draw has put the arrow back. Both phases now defer their clean into one
+  `FlushUnion` (the bounding box of what they dirtied), flushed once after both, with the lock still
+  held. The intermediate state is never published, and the sweep is halved before any other change.
+* **Whole scanlines for a 36 px sprite.** `flush_range` takes a byte range, so a column-bounded clean
+  is one call per row — `h` calls where `h` is the SPRITE's height, not the panel's. `flush_rect` does
+  that, falling back to the contiguous whole-span form once the columns cover ≥ 3/4 of the row, where
+  `h` `dsb sy` barriers would cost more than the bytes they save.
+
+**Cache-line alignment is not a correctness condition**, and the code says so: `cache::clean_range`
+rounds the start down to the 64 B D-cache line and iterates to the end, so a rect off a line boundary
+cleans a few neighbouring pixels too. `DC CVAC` writes a dirty line back — it never invalidates and
+never discards — so cleaning a byte we did not write publishes that byte's newest value, including
+another core's own data, which that core will clean again regardless. Misalignment costs bytes, never
+correctness.
+
+Estimated per report on the bench panel: **~553 KB → ~9 KB** (union column span ≈ sprite width plus
+the inter-report motion delta, ~40 px ≈ 160 B, plus line rounding, over ~36 rows). The bound in the
+degenerate case — a teleporting pointer whose union spans the panel — is one full-scanline sweep,
+i.e. **still exactly half** of what this path did before, never more.
+
+Untouched by construction: the saved-under logic (nothing here reads or writes `saved`, `off`, or the
+epoch), the `[wc-d]` argument (every byte either phase wrote is still cleaned, once, before the lock
+is released — including on the paths where the draw declines or fails, where the restore still owes
+RAM its clean), and the standalone `undraw` / `ensure_drawn` / masked entry points, which keep their
+own `flush_box` for their other callers.
+
+**QEMU cannot witness this.** raspi4b delivers no HID pointer report, so `refresh_locked` never runs
+from the router and the coalesced path is never taken; the gate proves no-regression and nothing more.
+`[cursor8] flush_kb=` is the bench instrument: against an unchanged motion profile it should fall by
+roughly the panel-width-to-sprite-width ratio.
 
 ### WEDGE-1 — P66's mechanism is UNKNOWN; this arc hardens and instruments
 
