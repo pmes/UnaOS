@@ -35,6 +35,15 @@ use crate::arch::percpu::{KERNEL_RSP_OFFSET, USER_RSP_OFFSET};
 // --- Syscall numbers (the tiny U1a subset; mirrors aarch64). ---
 const SYS_WRITE: u64 = 1;
 const SYS_EXIT: u64 = 2;
+// WINX-1: the PROCESS verbs x86 was missing, at their SHARED numbers (the aarch64 twins are
+// `sys_yield`/`sys_sleep_ms`/`sys_getinfo`). 3 (`SYS_REPORT`) and 6 (`SYS_GETPID`) stay unimplemented
+// here: x86 routes fixture witnesses BY TASK NAME through the `SYS_EXIT` arm (the u5x/u6x idiom), so it
+// has never needed `SYS_REPORT`, and nothing yet asks for a bare pid that `SYS_GETINFO` does not carry.
+// Their NUMBERS are reserved by the shared law regardless — an x86 caller of 3 or 6 falls to the
+// `-ENOSYS` default rather than colliding with something else.
+const SYS_YIELD: u64 = 4;
+const SYS_SLEEP_MS: u64 = 5;
+const SYS_GETINFO: u64 = 7;
 // U4x: the process-model pair (same numbers as aarch64 U4). `sys_spawn` loads the fixed on-disk
 // program (`HELLO.BIN`) into a fresh slot, runs it ring-3 as a CHILD, and returns a small HANDLE
 // index into the caller's per-process handle table; `sys_wait(handle)` blocks until that child exits
@@ -2379,6 +2388,11 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     }
     match nr {
         SYS_WRITE => sys_write(a0, a1, a2),
+        // WINX-1: the process verbs, at their cross-arch shared numbers. Unconditional (no feature
+        // gate) — they are core process surface, like WRITE/EXIT, not an optional subsystem.
+        SYS_YIELD => sys_yield(),
+        SYS_SLEEP_MS => sys_sleep_ms(a0),
+        SYS_GETINFO => sys_getinfo(a0),
         SYS_SPAWN => sys_spawn(),
         SYS_WAIT => sys_wait(a0),
         SYS_CAP => sys_cap(a0, a1, a2),
@@ -2722,6 +2736,94 @@ fn copy_to_user(user_ptr: u64, src: &[u8]) -> Result<(), i64> {
         core::ptr::copy_nonoverlapping(src.as_ptr(), user_ptr as *mut u8, src.len());
     }
     Ok(())
+}
+
+// =============================================================================================
+// WINX-1 — the PROCESS verbs: SYS_YIELD(4), SYS_SLEEP_MS(5), SYS_GETINFO(7).
+//
+// The x86 twins of aarch64's `sys_yield`/`sys_sleep_ms`/`sys_getinfo`, at the SHARED numbers, with the
+// same ring-3 contracts (yield/sleep return 0 unconditionally; getinfo returns 0 or `-EFAULT`). They
+// exist because a windowed EL0 app paces itself: `user-stat` calls `SYS_SLEEP_MS` once per frame and
+// `SYS_GETINFO` once at startup to learn the pid it paints, and neither had an x86 arm.
+//
+// ONE REAL ARCH DIVERGENCE, and it is a simplification. The aarch64 handlers must call `remask_irq()`
+// before returning, because `sched::yield_now`/`sleep_ticks` there unmask unconditionally and the
+// `__vec_svc` epilogue that follows restores per-core banked ELR/SPSR/SP_EL0 and MUST run I-masked.
+// The x86 primitives instead SNAPSHOT the caller's IF (`are_enabled()`) and restore exactly that after
+// the context switch, so a syscall handler entered IF-masked (SFMASK clears IF) is resumed IF-masked
+// and needs no re-mask. Nothing about the switch itself differs — this is the same "a blocking syscall
+// may safely `switch_context` here" property `syscall_dispatch` already documents for the storage
+// syscalls.
+//
+// The other divergence is that x86 needs no dead-timer fallback. aarch64's `sys_sleep_ms` must test
+// `timer::is_live()` and degrade to `yield_now`, because QEMU raspi4b delivers no Group-1 timer IRQ and
+// `sleep_ticks` (whose only waker is the tick) would park the caller forever. The x86 local-APIC
+// heartbeat is the scheduler's own tick and is always armed (`apic::init` arms it calibrated or at the
+// fixed fallback), so `sleep_ticks` always has a waker. The honest residual is RESOLUTION, not
+// liveness: before `apic::calibrate` runs, a tick is ~0.8 ms under QEMU, so a sleep runs proportionally
+// short — the documented degradation `arch::ms_to_ticks` already carries.
+
+/// WINX-1: `SYS_GETINFO`'s payload — the fixed `{pid, ticks}` struct copied out to ring 3. `#[repr(C)]`
+/// plain-old-data, field-for-field identical to the aarch64 `UserInfo`, so one arch-neutral ring-3
+/// program reads the same two little-endian u64s on either arch.
+#[repr(C)]
+struct UserInfo {
+    pid: u64,
+    ticks: u64,
+}
+
+/// WINX-1: `SYS_GETINFO(user_ptr)` — write `{pid, ticks}` to the caller's buffer through the validated
+/// `copy_to_user` seam. Returns 0, or `-EFAULT` if the destination fails validation (outside the ring-3
+/// window, wrapping, or aimed at the read-only code page — `UserAccess::Write` starts past page 0). An
+/// error RETURN, never a task-kill: a bad pointer is a ring-3 mistake, not a kernel-integrity event.
+///
+/// `pid` is the SCHEDULER task id (`current_task_id` on this CPU), which is what the x86 `Proc` table
+/// and the ring-3 fault-kill log already name a task by — the same identity aarch64 reports from
+/// `sched::current_id()`. `ticks` is the global 1 kHz ms-since-boot timebase (`arch::ticks()`).
+/// `None` from `current_task_id` (a syscall from an unscheduled context, which cannot normally happen —
+/// ring 3 always runs inside a scheduled task) reports pid 0 rather than failing: the aarch64 twin's
+/// `unwrap_or(0)`, kept identical so a program sees the same degenerate value on both arches.
+fn sys_getinfo(user_ptr: u64) -> i64 {
+    let info = UserInfo {
+        pid: crate::arch::sched::current_task_id(crate::arch::sched::meter_current_cpu())
+            .unwrap_or(0),
+        ticks: crate::arch::ticks(),
+    };
+    // SAFETY: view `info` as its raw bytes for the copy; `UserInfo` is `#[repr(C)]` plain-old-data with
+    // no padding (two u64s), so the byte view is exactly the two fields in declaration order.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &info as *const UserInfo as *const u8,
+            core::mem::size_of::<UserInfo>(),
+        )
+    };
+    match copy_to_user(user_ptr, bytes) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// WINX-1: `SYS_YIELD()` — cooperatively give up the CPU; thin over `sched::yield_now()`. Returns 0.
+/// Safe from the IF-masked handler: `yield_now` disables IF for its own critical section, switches, and
+/// restores the caller's IF snapshot on resume (see the block comment above) — so we return IF-masked,
+/// exactly as the `unaos_syscall_entry` epilogue expects. A no-op (still 0) outside a scheduled task,
+/// matching `yield_now`'s own contract.
+fn sys_yield() -> i64 {
+    crate::arch::sched::yield_now();
+    0
+}
+
+/// WINX-1: `SYS_SLEEP_MS(ms)` — block the calling task ~`ms` milliseconds; thin over `sched::sleep_ms`,
+/// which is `sleep_ticks(arch::ms_to_ticks(ms))` against the local-APIC heartbeat. Returns 0.
+///
+/// The ms→ticks conversion is deliberately NOT duplicated here (the aarch64 twin has to hardcode a
+/// `TICK_HZ` because its `timer::TICK_HZ` is private): `arch::ms_to_ticks` is the one place the
+/// ms<->tick relationship lives on x86, so a future retune of the tick rate cannot leave this verb
+/// behind. Like `yield_now`, `sleep_ticks` restores the caller's IF snapshot, so this returns
+/// IF-masked; and like it, it is a no-op outside a scheduled task (an immediate 0 rather than a hang).
+fn sys_sleep_ms(ms: u64) -> i64 {
+    crate::arch::sched::sleep_ms(ms);
+    0
 }
 
 // =============================================================================
