@@ -49,6 +49,30 @@ const SYS_GETINFO: u64 = 7;
 // explicitly retire a window, and a window is retired correctly at slot teardown (`win_close_slot`).
 const SYS_WIN_CREATE: u64 = 29;
 const SYS_WIN_PRESENT: u64 = 30;
+// WINX-7: the THREAD verbs, at the shared numbers the aarch64 ELF-2 arc minted. Semantics are the
+// aarch64 twins', verbatim:
+//   SYS_THREAD_SPAWN(entry, sp, arg, place) -> thread handle >= 0 / -errno. A new ring-3 task under the
+//     CALLER's own address space (same CR3), entered at `entry` on stack `sp` with `arg` in the SysV
+//     first-argument register. `place`: 0 = the caller's core, 1 = a sibling online core.
+//   SYS_THREAD_JOIN(handle) -> 0 / -ESRCH. Block until that thread finishes, then reap its handle.
+//   SYS_THREAD_EXIT() — terminate the calling thread: post its completion (waking a joiner) and drop
+//     this task's hold on the shared address space (teardown only on the LAST thread).
+const SYS_THREAD_SPAWN: u64 = 21;
+const SYS_THREAD_EXIT: u64 = 22;
+const SYS_THREAD_JOIN: u64 = 23;
+// WINX-7: SYS_FUTEX(uaddr, op, val) -> op-specific / -errno — the EL0 wait/wake a userspace mutex or
+// frame barrier is built out of. `op`: 0 = WAIT (block iff `*uaddr == val`), 1 = WAKE (wake up to
+// `val` waiters; returns the count woken). 24/25 (`SYS_FB_MAP`/`SYS_FB_PRESENT`) stay reserved and
+// unimplemented on x86 — see the window-verb note above.
+const SYS_FUTEX: u64 = 26;
+/// WINX-7: `SYS_FUTEX` sub-ops (passed in the second argument). Shared with aarch64 by law.
+const FUTEX_WAIT: u64 = 0;
+const FUTEX_WAKE: u64 = 1;
+// WINX-7: SYS_INPUT_POLL() -> a packed input event (>= 0, bit 63 always clear) / -EAGAIN when the
+// caller's ring is empty. The delivery half of "an EL0 app can be interactive": the kernel holds a
+// small per-process ring, the router fills the FOCUSED process's ring, and EL0 drains its own
+// nonblocking. 28 is unassigned on both arches.
+const SYS_INPUT_POLL: u64 = 27;
 // U4x: the process-model pair (same numbers as aarch64 U4). `sys_spawn` loads the fixed on-disk
 // program (`HELLO.BIN`) into a fresh slot, runs it ring-3 as a CHILD, and returns a small HANDLE
 // index into the caller's per-process handle table; `sys_wait(handle)` blocks until that child exits
@@ -2089,6 +2113,14 @@ core::arch::global_asm!(
     "mov rsp, gs:[{koff}]",         // switch to this task's kernel stack top
     "push r11",                     // save user RFLAGS  (SYSRET restores from r11)
     "push rcx",                     // save user RIP     (SYSRET restores from rcx); rsp now 16-aligned
+    // WINX-7: FIVE C arguments now, not four. `SYS_THREAD_SPAWN(entry, sp, arg, place)` is the first
+    // four-argument verb on this arch, and the ring-3 side passes its fourth argument in `r10` —
+    // which is what a userspace SysV caller would use for a fourth argument anyway, and is the
+    // conventional choice precisely because `SYSCALL` itself destroys `rcx`. Move it to `r8` (the 5th
+    // C argument register) BEFORE the shuffle below, so nothing in the shuffle can clobber it. `r8`
+    // was previously untouched here and is scrubbed on the way out with the other caller-saved
+    // registers, so the return half is unchanged.
+    "mov r8, r10",                  // arg3 -> 5th C arg (SYS_THREAD_SPAWN's `place`; junk otherwise)
     "mov rcx, rdx",                 // arg2 -> 4th C arg
     "mov rdx, rsi",                 // arg1 -> 3rd C arg
     "mov rsi, rdi",                 // arg0 -> 2nd C arg
@@ -2423,10 +2455,14 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
 
 /// SYSCALL dispatcher, called from `unaos_syscall_entry` on the faulting task's kernel stack with
 /// IF masked (SFMASK) and GS = this CPU's PerCpuData (so `this_cpu()` / the scheduler resolve). rax
-/// = number, rdi/rsi/rdx = args; the return value goes back in rax. A blocking/exiting syscall may
-/// safely `switch_context` here — exactly like `timer_preempt` from the timer ISR.
+/// = number, rdi/rsi/rdx/r10 = args; the return value goes back in rax. A blocking/exiting syscall
+/// may safely `switch_context` here — exactly like `timer_preempt` from the timer ISR.
+///
+/// WINX-7: `a3` (from ring-3 `r10`) is the fourth argument, used only by `SYS_THREAD_SPAWN`. Every
+/// other arm ignores it, and a program that does not load `r10` simply passes junk to a verb that
+/// does not read it.
 #[unsafe(no_mangle)]
-extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     if !SYSCALL_LOGGED.swap(true, Ordering::Relaxed) {
         serial_println!(":: SYSCALL: nr={} — ring-3 -> ring-0 path live ::", nr);
     }
@@ -2442,6 +2478,19 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         // x86 panel, and a refused `wm::create` degrades to a surface with no compositor row.
         SYS_WIN_CREATE => sys_win_create(a0, a1),
         SYS_WIN_PRESENT => sys_win_present(a0),
+        // WINX-7: threads, futex and input, at their shared cross-arch numbers. Unconditional (no
+        // feature gate), for the same reason the process and window verbs are: they are core EL0
+        // surface that a windowed application is written against, not an optional subsystem. A
+        // program that never calls them pays nothing — an unused match arm is not a cost.
+        //
+        // `SYS_THREAD_SPAWN` is the first FOUR-argument verb on this arch (entry, sp, arg, place),
+        // which is why `unaos_syscall_entry` now shuffles a fourth register — see the stub. Every
+        // other verb ignores `a3`.
+        SYS_THREAD_SPAWN => sys_thread_spawn(a0, a1, a2, a3),
+        SYS_THREAD_JOIN => sys_thread_join(a0),
+        SYS_THREAD_EXIT => sys_thread_exit(), // never returns
+        SYS_FUTEX => sys_futex(a0, a1, a2),
+        SYS_INPUT_POLL => sys_input_poll(),
         SYS_SPAWN => sys_spawn(),
         SYS_WAIT => sys_wait(a0),
         SYS_CAP => sys_cap(a0, a1, a2),
@@ -3083,6 +3132,28 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     t[id] = e;
     fb_info_write_win(slot, id, &e);
     drop(t);
+    // WINX-7: if NOBODY currently has input focus, the process that just opened a window gets it.
+    //
+    // This is the minimum viable focus POLICY, and it is deliberately the weakest one that makes an
+    // interactive EL0 app reachable at all. x86 has no focus-cycling key yet (the aarch64 WC-C TAB
+    // ring lives in that arch's router seam, which this arc does not have a twin of), so without some
+    // rule a program launched with `bg` would create a window, poll `SYS_INPUT_POLL` forever, and
+    // never receive a single event — indistinguishable from broken input.
+    //
+    // What makes "only when nobody has focus" the safe version: it can never STEAL focus. A second
+    // windowed app launched behind a focused one does not take the keyboard from it, so a background
+    // program cannot arrange to receive keystrokes aimed at the window in front of it — which is the
+    // property the producer-side focus gate exists to guarantee. Focus returns to the shell when the
+    // holder's slot is torn down (`el0_input_revoke_slot`), so the next app launched after that one
+    // exits is focusable in turn. A real focus RING — click-to-focus, a reserved cycling key — is the
+    // follow-on arc, and it will replace this rule rather than build on it.
+    if EL0_INPUT_ACTIVE
+        .compare_exchange(0, (slot as u64) + 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        clear_input_row(slot); // a fresh focus starts clean, exactly as `el0_input_set_active` does
+        serial_println!(":: wc-x86: input focus -> slot {} (first window, shell was idle) ::", slot);
+    }
     serial_println!(
         ":: wc-x86: SYS_WIN_CREATE slot={} win={} rslot={} {}x{} pages={} wm_id={} ::",
         slot, id, rslot, w32, h32, pages, e.wm_id
@@ -3204,6 +3275,483 @@ mod wc_shim {
         if id != WIN_NONE {
             wm::close(id);
         }
+    }
+}
+
+// =============================================================================================
+// WINX-7 — INPUT INTO EL0: `SYS_INPUT_POLL(27)`, the per-process input ring, the router seam, and
+// the focus registration. The x86 twin of aarch64's ELF-5.
+//
+// An interactive EL0 app needs keys and mouse. It already has a surface (`SYS_WIN_CREATE`), pacing
+// (`SYS_SLEEP_MS`) and, as of this arc, threads and a futex; this is the delivery half.
+//
+// SHAPE. The kernel holds a small per-SLOT ring of packed events. The router — the shell's own event
+// drain, which is the single place every HID event on this arch passes through — offers each drained
+// event to `el0_input_route`, which forwards it into the FOCUSED process's ring or hands it back for
+// the shell to consume. EL0 drains its own ring nonblocking through `SYS_INPUT_POLL`. One producer
+// (the single router drain) and one consumer (the owning EL0 task) per ring, so the ring is a
+// lock-free SPSC: free-running head/tail, occupancy = `tail - head`.
+//
+// FOCUS GATING IS THE WHOLE SECURITY ARGUMENT, and it is why the ACTIVE slot is consulted on the
+// PRODUCER side rather than the consumer side. Only one process can receive input at a time, and it
+// is the one the window system says has focus; an unfocused program's ring simply never fills. A
+// per-app opt-in would be no gate at all (any app could claim the keyboard by never opting out), and
+// a consumer-side check would mean events for the focused app are queued into every process's ring
+// and merely hidden — which is a disclosure, not a gate. Enqueue-into-the-focused-ring-only means a
+// background program cannot observe a single keystroke aimed at another window, including keystrokes
+// that are passwords.
+//
+// KEYED BY SLOT, NOT PID. `memory::current_slot()` is the x86 stand-in for aarch64's ASID and is what
+// every other per-process gate in this file already uses. The consequence that matters: all THREADS
+// of a process share one ring (they share a slot), which is correct — an app's worker threads and its
+// parent are one input consumer, and `user-vug` drains from the parent only. The ring is reset on
+// focus change and on slot teardown, so a recycled slot inherits nothing.
+// =============================================================================================
+
+/// WINX-7 packed-event type tags (bits [55:48] of the packed u64). Shared with aarch64 by law, so one
+/// arch-neutral EL0 program decodes the same wire form on both.
+const INPUT_EV_KEY_DOWN: u64 = 1; // a key PRESS   (payload[7:0] = ASCII / the C0 arrow codes)
+const INPUT_EV_KEY_UP: u64 = 2; // a key RELEASE (payload[7:0] = same)
+const INPUT_EV_MOUSE_REL: u64 = 3; // relative pointer motion  (payload[31:16] = dx, [15:0] = dy, i16)
+const INPUT_EV_MOUSE_ABS: u64 = 4; // absolute pointer position(payload[31:16] = x,  [15:0] = y,  i16)
+const INPUT_EV_BUTTON: u64 = 5; // a pointer button state    (payload[7:0] = button bitmask)
+
+/// Per-process input ring capacity. A power of two, because occupancy is `tail.wrapping_sub(head)`
+/// and the slot index is `& (CAP - 1)`.
+const INPUT_RING_CAP: usize = 32;
+
+/// The per-process input rings, keyed by address-space SLOT. One producer (the router) + one consumer
+/// (the owning EL0 task) per ring => lock-free SPSC.
+static EL0_INPUT_BUF: [[AtomicU64; INPUT_RING_CAP]; crate::arch::memory::USER_SLOTS] =
+    [const { [const { AtomicU64::new(0) }; INPUT_RING_CAP] }; crate::arch::memory::USER_SLOTS];
+/// Consumer index (free-running; advanced by `sys_input_poll`). Real slot = `head & (CAP - 1)`.
+static EL0_INPUT_HEAD: [AtomicU32; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
+/// Producer index (free-running; advanced by `el0_input_push`). Occupancy = `tail - head`.
+static EL0_INPUT_TAIL: [AtomicU32; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
+
+/// The slot currently designated to RECEIVE input, `+1`-BIASED: 0 means "no EL0 target — the shell
+/// owns the keyboard", and `s + 1` means slot `s` has focus.
+///
+/// The bias is not cosmetic. aarch64 can use a bare ASID because ASID 0 is its shared/boot context
+/// and so doubles as "nobody"; x86 slot 0 is a REAL address space that a real program can occupy
+/// (the WINX-1 fixture routinely does), so an unbiased 0 would silently mean "the first program to
+/// launch always has focus". This is the same reason `WinEntry` needs `WIN_OWNER_FREE` and `Proc`
+/// stores `slot + 1`.
+static EL0_INPUT_ACTIVE: AtomicU64 = AtomicU64::new(0);
+
+/// How many times a slot TEARDOWN revoked the live input focus — i.e. the dying slot *was* the
+/// focused one. Zero on a boot where no focused program ever exited; it climbs by one per focused
+/// program that ends. Read by the witness to prove its measurement window was not crossed by a
+/// revocation it did not cause.
+static EL0_FOCUS_REVOKES: AtomicU64 = AtomicU64::new(0);
+
+/// Router accounting: events actually DELIVERED into some process's ring, and events DROPPED because
+/// the target ring was full. The drop counter is the honest half — a full ring is a real event loss
+/// and must be countable, not silent.
+static EL0_INPUT_DELIVERED: AtomicU64 = AtomicU64::new(0);
+static EL0_INPUT_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// WINX-7: the slot currently receiving input, `+1`-biased (0 = the shell). The read side of
+/// [`el0_input_set_active`], for the router and the witnesses.
+pub fn el0_input_active() -> u64 {
+    EL0_INPUT_ACTIVE.load(Ordering::Acquire)
+}
+
+/// WINX-7: `(delivered, dropped, focus_revokes)` — the router's own accounting, for the witness line.
+pub fn el0_input_stats() -> (u64, u64, u64) {
+    (
+        EL0_INPUT_DELIVERED.load(Ordering::Acquire),
+        EL0_INPUT_DROPPED.load(Ordering::Acquire),
+        EL0_FOCUS_REVOKES.load(Ordering::Acquire),
+    )
+}
+
+/// Pack a `pal::Event` into the WINX-7 wire form, or `None` for an event that carries nothing an EL0
+/// app can use (`Timer`/`None`/`Unknown` are kernel-internal pacing and non-events).
+///
+/// BIT 63 IS ALWAYS CLEAR by construction — the type tag lives at [55:48] — which is what lets
+/// `sys_input_poll` hand the packed value straight back as a NON-NEGATIVE `i64` that is unambiguously
+/// distinguishable from `-EAGAIN`. EL0 tests `ev >> 63` and needs no separate out-parameter.
+fn pack_input(ev: crate::pal::Event) -> Option<u64> {
+    use crate::pal::Event;
+    let pack_xy = |x: i32, y: i32| -> u64 { ((x as i16 as u16 as u64) << 16) | (y as i16 as u16 as u64) };
+    let (ty, payload): (u64, u64) = match ev {
+        Event::Key(b) => (INPUT_EV_KEY_DOWN, b as u64),
+        Event::KeyUp(b) => (INPUT_EV_KEY_UP, b as u64),
+        Event::Mouse { x, y } => (INPUT_EV_MOUSE_REL, pack_xy(x, y)),
+        Event::MouseAbsolute { x, y } => (INPUT_EV_MOUSE_ABS, pack_xy(x, y)),
+        Event::Button(mask) => (INPUT_EV_BUTTON, mask as u64),
+        Event::Timer | Event::None | Event::Unknown => return None,
+    };
+    Some((ty << 48) | payload)
+}
+
+/// Push a pre-packed event into `slot`'s ring — the SPSC producer half. DROP-NEWEST on a full ring, so
+/// a backlog can never clobber an event the EL0 consumer has not read yet: an app that falls behind
+/// loses the events it could not have handled anyway, rather than having its next read silently
+/// replaced by a later one (which would corrupt a press/release pairing). `slot` is validated by the
+/// caller. Returns whether the event was queued.
+fn el0_input_push(slot: usize, packed: u64) -> bool {
+    let head = EL0_INPUT_HEAD[slot].load(Ordering::Acquire);
+    let tail = EL0_INPUT_TAIL[slot].load(Ordering::Relaxed); // the router is the sole producer
+    if tail.wrapping_sub(head) >= INPUT_RING_CAP as u32 {
+        EL0_INPUT_DROPPED.fetch_add(1, Ordering::Relaxed);
+        return false; // full — drop the newest
+    }
+    EL0_INPUT_BUF[slot][(tail as usize) & (INPUT_RING_CAP - 1)].store(packed, Ordering::Release);
+    // Publish the tail AFTER the slot store: the consumer's Acquire load of the tail is what makes
+    // the payload visible to it, so the two stores must not be reordered.
+    EL0_INPUT_TAIL[slot].store(tail.wrapping_add(1), Ordering::Release);
+    EL0_INPUT_DELIVERED.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// WINX-7 ROUTER SEAM (public, in-lane): offer one input event to the FOCUSED process's ring.
+///
+/// Returns `true` if the event was queued for an EL0 app (the caller must NOT also give it to the
+/// shell), `false` if there is no focused EL0 target, the event carries nothing deliverable, or the
+/// target ring was full. Single producer: exactly one drain loop may call this.
+pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
+    let active = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
+    if active == 0 {
+        return false; // the shell owns the keyboard
+    }
+    let slot = (active - 1) as usize;
+    if slot >= crate::arch::memory::USER_SLOTS {
+        return false; // impossible unless the focus word was corrupted — fail to the shell
+    }
+    let Some(packed) = pack_input(ev) else {
+        return false;
+    };
+    el0_input_push(slot, packed)
+}
+
+/// WINX-7 ROUTER FOLD POINT (public, in-lane) — the ONE line the shell's event drain needs.
+///
+/// Hands `ev` to [`el0_input_enqueue`] and reports the outcome AS AN EVENT, so a caller folds this in
+/// without restructuring its drain: the event comes back UNCHANGED when no EL0 app took it (the shell
+/// handles it exactly as before), and comes back as `Event::Unknown` when an EL0 ring consumed it.
+///
+/// `Event::Unknown` and not `Event::None` — deliberately, and it is the whole reason this wrapper
+/// exists rather than a bare boolean. Every drain loop on this arch treats `Event::None` as
+/// END-OF-QUEUE and breaks on it; returning `None` for a consumed event would end the drain at the
+/// first keystroke routed to a window and strand everything queued behind it. `Event::Unknown`
+/// already falls through every such loop's catch-all arm as a no-op, which is precisely the
+/// "swallowed, keep draining" semantics required.
+pub fn el0_input_route(ev: crate::pal::Event) -> crate::pal::Event {
+    if el0_input_enqueue(ev) {
+        crate::pal::Event::Unknown
+    } else {
+        ev
+    }
+}
+
+/// Reset a slot's input ring (head == tail == 0 => empty). Called on a focus change (a freshly
+/// focused app starts clean — no stale input aimed at whoever had focus before) and from
+/// `clear_handle_row` on slot teardown (a reused slot inherits no stale input). Safe in both cases:
+/// on teardown no producer runs for the dying slot, and on a focus change the router only ever
+/// targets the newly-active slot.
+fn clear_input_row(slot: usize) {
+    if slot >= crate::arch::memory::USER_SLOTS {
+        return;
+    }
+    EL0_INPUT_HEAD[slot].store(0, Ordering::Release);
+    EL0_INPUT_TAIL[slot].store(0, Ordering::Release);
+}
+
+/// WINX-7 FOCUS REGISTRATION (public, in-lane): designate which process receives input.
+/// `slot_plus1` is `slot + 1`, or 0 to hand the keyboard back to the shell.
+///
+/// A real focus (non-zero) RESETS the incoming ring first: the events queued while another window had
+/// focus were aimed at that window, and delivering them to the new one is both wrong and, for a
+/// button, actively harmful (a release with no matching press is a fabricated click). Clearing focus
+/// leaves every ring alone — from then on events legitimately belong to the shell.
+pub fn el0_input_set_active(slot_plus1: u64) {
+    if slot_plus1 != 0 {
+        let slot = (slot_plus1 - 1) as usize;
+        if slot >= crate::arch::memory::USER_SLOTS {
+            return; // not a real slot — refuse rather than publish a focus nobody can drain
+        }
+        clear_input_row(slot); // a fresh focus starts clean
+    }
+    EL0_INPUT_ACTIVE.store(slot_plus1, Ordering::Release);
+}
+
+/// WINX-7: revoke input focus if the dying `slot` holds it, and reset its ring. Called from
+/// `clear_handle_row`, i.e. on the slot-teardown path both `exit` and the `KillSwitch` reap funnel
+/// through.
+///
+/// The CAS is slot-exact, which is what makes this safe against a concurrent focus change: if focus
+/// has already moved to another slot we must not clear it (that would silently deafen the app that
+/// just gained focus), and if it has not, the exchange is the only writer. Without this a killed
+/// windowed app would leave focus pointing at its own dead slot forever and every later keystroke
+/// would be enqueued into a ring with no consumer — the keyboard would appear to stop working with
+/// no message anywhere.
+fn el0_input_revoke_slot(slot: usize) {
+    let biased = (slot as u64) + 1;
+    if EL0_INPUT_ACTIVE
+        .compare_exchange(biased, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        EL0_FOCUS_REVOKES.fetch_add(1, Ordering::AcqRel);
+        serial_println!(":: wc-x86: input focus revoked — slot {} torn down ::", slot);
+    }
+    clear_input_row(slot);
+}
+
+/// WINX-7: `SYS_INPUT_POLL()` — nonblocking dequeue of the next input event for the CALLING process.
+/// Returns the packed event (>= 0, bit 63 clear) or `-EAGAIN` when the ring is empty or the caller has
+/// no private slot (the shared kernel window, which is not an input target — the same refusal the
+/// window verbs give it).
+///
+/// The SPSC consumer half: this process is the sole consumer of its own ring, so `head` is read
+/// Relaxed and published Release AFTER the payload load — the mirror of the producer's ordering.
+///
+/// NOT GATED ON FOCUS, deliberately. An unfocused app may drain whatever was queued while it DID have
+/// focus, which is what makes tabbing away and back lossless rather than a silent truncation; the gate
+/// that matters is on the PRODUCER side, where an unfocused app's ring stops filling in the first
+/// place. The distinction is that a program may always read what was already addressed to it, and may
+/// never receive what was addressed to somebody else.
+fn sys_input_poll() -> i64 {
+    let Some(slot) = crate::arch::x86_64::memory::current_slot() else {
+        return EAGAIN;
+    };
+    let head = EL0_INPUT_HEAD[slot].load(Ordering::Relaxed); // sole consumer
+    let tail = EL0_INPUT_TAIL[slot].load(Ordering::Acquire);
+    if head == tail {
+        return EAGAIN; // empty
+    }
+    let packed = EL0_INPUT_BUF[slot][(head as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
+    EL0_INPUT_HEAD[slot].store(head.wrapping_add(1), Ordering::Release); // consume AFTER the load
+    packed as i64
+}
+
+// =============================================================================================
+// WINX-7 — EL0 THREADS: `SYS_THREAD_SPAWN(21)` / `SYS_THREAD_EXIT(22)` / `SYS_THREAD_JOIN(23)`.
+//
+// The syscall half; the lifetime machinery is `sched::spawn_user_thread` +
+// `sched::user_space_retain`/`user_space_release` (see the section header there for why teardown had
+// to become refcounted). What lives HERE is the part with security weight: validating that the entry
+// and stack a program hands us are inside ITS OWN window, and making a thread handle name a thread
+// that this exact tenant of this exact slot spawned.
+//
+// THE HANDLE TABLE IS GLOBAL AND FIXED, like every other table in this file. That has one consequence
+// worth stating plainly, because aarch64 learned it the hard way (its `[killbound]` note): a row is
+// released by the owner's own voluntary `SYS_THREAD_JOIN`, so a program KILLED before it joins leaks
+// every row it holds — permanently, from a table shared by the whole machine. The remedy here is the
+// same LAZY SCAVENGE, gated on the same kind of positive quiescence witness: `SLOT_GEN[slot]` is
+// bumped by `clear_handle_row` on the slot's teardown edge, so `SLOT_GEN[owner] != rec.tenant_gen` is proof
+// that the tenant which spawned the thread is entirely gone — not idle, gone — and its row is dead.
+// =============================================================================================
+
+/// How many concurrently-tracked joinable EL0 threads the kernel holds handles for. A small fixed
+/// pool (`user-vug` uses 2 per process); `-EAGAIN` when exhausted, after the scavenge below has had
+/// its chance. STOP tripwire: a deliberate cap, like `USER_SLOTS` — do not raise it for a demo.
+const NTHREAD: usize = 8;
+
+/// One live thread the kernel can be `SYS_THREAD_JOIN`ed on.
+struct ThreadRec {
+    /// The address-space slot that spawned it — only that process may join it.
+    owner: usize,
+    /// The owner slot's GENERATION at spawn time (`SLOT_GEN[owner]`). Slots are RECYCLED, so `owner`
+    /// alone does not identify a TENANT; the generation is what stops a new tenant of the same slot
+    /// from joining (and reaping) its predecessor's thread handle, and what makes the scavenge's
+    /// "this row is dead" judgement a positive proof rather than a guess.
+    tenant_gen: u64,
+    /// The completion handle, posted by the thread's `exit()` whatever ends it.
+    join: crate::arch::sched::JoinHandle,
+}
+
+/// The thread-handle table; the index IS the handle returned to EL0. A `SpinMutex` (not the per-slot
+/// atomic sidecars the handle table uses) because a `JoinHandle` is a non-`Copy` owned value that
+/// `join` must MOVE out. The lock is held only for the claim or the take — NEVER across the blocking
+/// join, which would park a task holding a spinlock every other thread verb needs.
+static THREAD_TABLE: SpinMutex<[Option<ThreadRec>; NTHREAD]> = SpinMutex::new([const { None }; NTHREAD]);
+
+/// WINX-7: `SYS_THREAD_SPAWN(entry, sp, arg, place)` -> a thread handle (>= 0), or a negative errno.
+///
+/// Validates that `entry` and `sp` are inside the CALLER's own ring-3 window before anything else
+/// happens — this is the gate. `entry` need only be in-window and readable: whether the target page is
+/// actually executable is enforced by the page permissions, and a thread aimed at a non-exec page
+/// simply takes a contained ring-3 fault and is killed by the existing net (there is no need, and no
+/// way, to answer "is this an instruction?" here). `sp` must be 16-aligned (the SysV requirement the
+/// first push depends on) and sit in the WRITABLE part of the window with headroom below it, which
+/// excludes the read-only code page — so a stack aimed at page 0 is refused rather than faulting on
+/// its first push.
+///
+/// `place`: 0 = the caller's core, 1 = a sibling core that is actually dispatching. Errno shapes:
+/// `-EFAULT` bad entry/sp, `-EINVAL` from the shared kernel window (no private address space to
+/// thread within), `-EAGAIN` the table is full.
+fn sys_thread_spawn(entry: u64, sp: u64, arg: u64, place: u64) -> i64 {
+    // entry: inside the window (the code page IS a legal target — that is where a worker lives).
+    if user_range_ok(entry, 1, UserAccess::Read).is_err() {
+        return EFAULT;
+    }
+    // sp: 16-aligned, and at least 16 WRITABLE bytes below it inside the window. `sp` is the stack
+    // TOP the thread will push from, so the bytes that must be writable are the ones BELOW it.
+    if sp & 0xF != 0 || sp < 16 || user_range_ok(sp - 16, 16, UserAccess::Write).is_err() {
+        return EFAULT;
+    }
+    let Some(slot) = crate::arch::x86_64::memory::current_slot() else {
+        return EINVAL; // the shared kernel window owns no private address space to thread within
+    };
+    let cr3 = crate::arch::x86_64::memory::slot_cr3(slot);
+    let caller_cpu = crate::arch::sched::meter_current_cpu();
+    let cpu = if place == 1 {
+        crate::arch::sched::sibling_online_cpu(caller_cpu)
+    } else {
+        caller_cpu
+    };
+    let tenant_gen = SLOT_GEN[slot].load(Ordering::Acquire);
+
+    let mut tab = THREAD_TABLE.lock();
+    let idx = match tab.iter().position(|s| s.is_none()) {
+        Some(i) => i,
+        None => {
+            // SCAVENGE — reclaim rows whose owning TENANT is provably gone. `SLOT_GEN[owner] != tenant_gen`
+            // means that slot reached `clear_handle_row`, which happens only after the last live task
+            // under it retired, so the thread this row tracks is not merely idle — it does not exist
+            // on any core. Deliberately LAZY (under pressure) rather than eager at teardown: the
+            // teardown path runs IRQ-masked, sometimes from the scheduler's own context, and taking
+            // this `SpinMutex` there would add a lock-order hazard for nothing. Here the lock is
+            // already held, in the one context that actually needs the rows.
+            let mut freed = usize::MAX;
+            for (i, row) in tab.iter_mut().enumerate() {
+                let dead = match row {
+                    Some(r) => SLOT_GEN[r.owner].load(Ordering::Acquire) != r.tenant_gen,
+                    None => false,
+                };
+                if dead {
+                    let owner = row.as_ref().map(|r| r.owner).unwrap_or(0);
+                    *row = None; // drops the JoinHandle's Arc clone with the row
+                    serial_println!(
+                        ":: winx7: thread table full — reclaimed row {} from dead slot {} (its tenant reached teardown, so every task under it has retired) ::",
+                        i, owner
+                    );
+                    if freed == usize::MAX {
+                        freed = i;
+                    }
+                }
+            }
+            if freed == usize::MAX {
+                return EAGAIN;
+            }
+            freed
+        }
+    };
+    // RETAIN BEFORE SPAWN. The extra hold on the address space must be published before the task can
+    // be dispatched, because a preemptible task can run on another core the instant it is enqueued —
+    // and if the parent exited in that window an unretained slot would be freed under a live thread.
+    crate::arch::sched::user_space_retain(cr3);
+    let join = crate::arch::sched::spawn_user_thread(
+        EL0_THREAD_NAME,
+        entry,
+        sp,
+        arg as usize,
+        cpu,
+        cr3,
+    );
+    tab[idx] = Some(ThreadRec { owner: slot, tenant_gen, join });
+    drop(tab);
+    THREADS_SPAWNED.fetch_add(1, Ordering::AcqRel);
+    idx as i64
+}
+
+/// WINX-7: `SYS_THREAD_JOIN(handle)` -> 0, or `-ESRCH`. Block until the named thread finishes, then
+/// reap its handle (single-shot — the row is taken, so a second join on the same handle is `-ESRCH`
+/// rather than a permanent park on a completion nobody will post twice).
+///
+/// The row is resolved against `(caller slot, slot generation)`, never the slot alone: slots are
+/// recycled and a killed program's rows outlive it until the scavenge reclaims them, so slot-only
+/// ownership would let a NEW tenant block on — and reap — its predecessor's thread. Fail-closed.
+///
+/// The `JoinHandle` is MOVED out UNDER the lock and the lock DROPPED BEFORE the blocking join. Joining
+/// while holding `THREAD_TABLE` would park a task holding the spinlock that every spawn and join needs,
+/// which is a system-wide wedge reachable from ring 3 by a program that simply joins a slow thread.
+fn sys_thread_join(handle: u64) -> i64 {
+    let Some(slot) = crate::arch::x86_64::memory::current_slot() else {
+        return ESRCH;
+    };
+    let idx = handle as usize;
+    if idx >= NTHREAD {
+        return ESRCH;
+    }
+    let rec = {
+        let mut tab = THREAD_TABLE.lock();
+        let tenant_gen = SLOT_GEN[slot].load(Ordering::Acquire);
+        if !tab[idx].as_ref().is_some_and(|r| r.owner == slot && r.tenant_gen == tenant_gen) {
+            return ESRCH;
+        }
+        tab[idx].take().expect("thread row vanished under its own lock")
+    };
+    rec.join.join(); // blocks until the thread posts its completion (a scheduler wake)
+    THREADS_JOINED.fetch_add(1, Ordering::AcqRel);
+    0
+}
+
+/// WINX-7: `SYS_THREAD_EXIT()` — terminate the calling EL0 thread. Never returns.
+///
+/// `sched::exit()` does both halves: it posts this task's completion (waking a joiner) and drops its
+/// hold on the shared address space, which tears the slot down only if this was the LAST thread. A
+/// process's MAIN task uses `SYS_EXIT` instead; the two differ only in the accounting the `SYS_EXIT`
+/// arm performs on the `Proc` row, which a worker thread does not own.
+fn sys_thread_exit() -> i64 {
+    THREADS_EXITED.fetch_add(1, Ordering::AcqRel);
+    crate::arch::sched::exit() // diverges
+}
+
+/// The kernel-side name every EL0 worker thread carries. Fixed (not derived from the program) for the
+/// same reason a window title is: it appears on the wire and in the fault-kill log, so it must not be
+/// anything ring 3 chose.
+const EL0_THREAD_NAME: &str = "el0-thread";
+
+/// WINX-7 thread accounting — successful spawns, completed joins, and thread exits. Global rather than
+/// per-slot: they exist to let a witness assert what happened on a boot, not to enforce anything.
+static THREADS_SPAWNED: AtomicU64 = AtomicU64::new(0);
+static THREADS_JOINED: AtomicU64 = AtomicU64::new(0);
+static THREADS_EXITED: AtomicU64 = AtomicU64::new(0);
+
+/// WINX-7: `(spawned, joined, exited)` — read by the regression witness.
+pub fn thread_stats() -> (u64, u64, u64) {
+    (
+        THREADS_SPAWNED.load(Ordering::Acquire),
+        THREADS_JOINED.load(Ordering::Acquire),
+        THREADS_EXITED.load(Ordering::Acquire),
+    )
+}
+
+/// WINX-7: `SYS_FUTEX(uaddr, op, val)` -> op-specific, or a negative errno.
+///
+/// Validates `uaddr` as a 4-aligned, WRITABLE address inside the caller's own window — a futex word is
+/// read AND written by ring 3, so the read-only code page is not a legal target and `UserAccess::Write`
+/// is the right predicate — then derives the key from `(caller slot, uaddr)` and dispatches:
+///   * `FUTEX_WAIT`: block iff `*uaddr == val`. Returns 0 when woken, `-EAGAIN` on a value mismatch
+///     (the caller must re-check and loop — this is not an error, it is the compare-and-block contract)
+///     or when the fixed bucket pool is exhausted, `-EINVAL` off a scheduled task.
+///   * `FUTEX_WAKE`: wake up to `val` waiters on the key; returns the count woken.
+///
+/// `-EAGAIN` for BOTH the mismatch and the pool-exhausted cases is the aarch64 twin's choice and is
+/// kept for wire compatibility: a correct futex user re-checks its condition and retries on `-EAGAIN`,
+/// which is the right behaviour under either cause, and merging them keeps one arch-neutral EL0 loop.
+fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
+    if uaddr & 3 != 0 || user_range_ok(uaddr, 4, UserAccess::Write).is_err() {
+        return EFAULT;
+    }
+    let Some(slot) = crate::arch::x86_64::memory::current_slot() else {
+        return EINVAL; // no private address space => no futex domain
+    };
+    let key = crate::arch::sched::futex_key(slot, uaddr);
+    match op {
+        FUTEX_WAIT => match crate::arch::sched::futex_wait(key, uaddr, val as u32) {
+            crate::arch::sched::FutexWait::Woken => 0,
+            crate::arch::sched::FutexWait::Mismatch => EAGAIN,
+            crate::arch::sched::FutexWait::TableFull => EAGAIN,
+            crate::arch::sched::FutexWait::NoTask => EINVAL,
+        },
+        FUTEX_WAKE => crate::arch::sched::futex_wake(key, val as usize) as i64,
+        _ => EINVAL,
     }
 }
 
@@ -5080,6 +5628,7 @@ const ENOENT: i64 = -2; // SYS_OPEN: no staged file by that name (the staged set
 const EIO: i64 = -5; // SYS_READ: a live descriptor over an unstaged source — a kernel bug; fail closed
 const EMFILE: i64 = -24; // SYS_OPEN: the caller's open-file table is full
 const EBADF: i64 = -9; // U11x SYS_CLOSE: no such handle (already closed / never opened / oob / stale-slot)
+const ESRCH: i64 = -3; // WINX-7 SYS_THREAD_JOIN: no such thread handle (oob / already reaped / another tenant's)
 const ENFILE: i64 = -23; // WINX-1 SYS_WIN_CREATE: the GLOBAL window table is full (vs EMFILE = this caller's)
 const EBUSY: i64 = -16; // U11x M2: O_CREAT of a name whose deferred on-disk DELETE has not drained yet
 const ENOSPC: i64 = -28; // U10: the FAT volume (or the one-page grow-staging buffer) is full
@@ -8435,6 +8984,14 @@ pub fn clear_handle_row(slot: usize) {
     // after the sweep passed its slot (RECV verifies the stamp; the sender's post-check re-reads this word).
     // This closes the U7x-documented sys_xfer TOCTOU (exit + recycle + consume inside the deposit window).
     SLOT_GEN[slot].fetch_add(1, Ordering::AcqRel);
+    // WINX-7: revoke input focus if this dying slot held it, and reset its input ring — BEFORE the
+    // rest of the teardown, and for the same reason the generation bump comes first: from this point
+    // on nothing addressed to the old tenant may reach the slot's next one. Without the revoke, focus
+    // would keep pointing at a dead slot and every later keystroke would be enqueued into a ring with
+    // no consumer, which presents to the operator as the keyboard silently ceasing to work. The
+    // generation bump above also retires this slot's thread-table rows for the lazy scavenge in
+    // `sys_thread_spawn` — a killed threaded program leaks no rows permanently.
+    el0_input_revoke_slot(slot);
     for i in 0..NHANDLE {
         // Clear the value first (Empty => `handle_resolve` bails as NoHandle before reading rights/kind),
         // then the rights and kind — so no intermediate state is ever a live handle with stale rights/kind.
@@ -14063,9 +14620,9 @@ fn cfu_efault_witness() {
     let window = USER_WINDOW_PAGES * PAGE_SIZE;
     // The three rejected shapes, each driven through the real dispatcher. None dereferences the pointer —
     // `user_range_ok` returns `Err(EFAULT)` before `copy_from_user` copies, so this is safe in any CR3.
-    let wrap = syscall_dispatch(SYS_OPEN, u64::MAX - 2, NLEN, 0); // ptr + NLEN overflows (end < ptr)
-    let below = syscall_dispatch(SYS_OPEN, USER_BASE - PAGE_SIZE, NLEN, 0); // ptr < USER_BASE
-    let above = syscall_dispatch(SYS_OPEN, USER_BASE + window - 4, NLEN, 0); // end past the window
+    let wrap = syscall_dispatch(SYS_OPEN, u64::MAX - 2, NLEN, 0, 0); // ptr + NLEN overflows (end < ptr)
+    let below = syscall_dispatch(SYS_OPEN, USER_BASE - PAGE_SIZE, NLEN, 0, 0); // ptr < USER_BASE
+    let above = syscall_dispatch(SYS_OPEN, USER_BASE + window - 4, NLEN, 0, 0); // end past the window
     // Positive controls (validate-only, no deref): a valid in-window READ range is accepted, and the READ
     // bound admits page 0 (a legal read source) while the WRITE bound rejects it (page 0 is RO/RX).
     let inwin_ok = user_range_ok(USER_BASE + PAGE_SIZE, NLEN, UserAccess::Read).is_ok();

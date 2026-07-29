@@ -593,18 +593,18 @@ extern "C" fn task_trampoline() -> ! {
 
     entry(arg);
 
-    // Signal completion to any joiner. `post()` runs with IF=1 and self-masks (Semaphore::post),
-    // and cross-CPU-wakes a parked joiner if any. The task's OWN `done_sem` Arc clone is the
-    // liveness anchor for this `post()` — it MUST remain in the Box until `run()` drops it on the
-    // Finished path, so we BORROW it here (never take/move the Arc out before `exit()`).
+    // WINX-7: the completion `post()` moved DOWN into `exit()`, which this call reaches immediately.
+    // It used to live here, which was correct while only KERNEL threads were joinable — a kernel
+    // thread's one completion edge is "entry returned". An EL0 THREAD (`spawn_user_thread`) never
+    // runs `entry` at all: it `iretq`s to ring 3 and finishes at `SYS_THREAD_EXIT`, a fault-kill, or
+    // the scheduler's `KillSwitch` reap, none of which pass through here. Putting the post at the
+    // single terminus every task funnels through means one implementation covers all four edges and
+    // a joiner can never be stranded on a thread that died some way its author did not anticipate.
     unsafe {
         debug_assert!(
             (*raw).state.load(Ordering::Acquire) == STATE_RUNNING && (*raw).cpu as usize == cpu,
             "task_trampoline: task not running on its own CPU at completion"
         );
-        if let Some(sem) = &(*raw).done_sem {
-            sem.post();
-        }
     }
     exit();
 }
@@ -718,8 +718,8 @@ extern "C" fn user_task_trampoline() -> ! {
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
     debug_assert!(!raw.is_null(), "user_task_trampoline: current is null");
-    let (entry, user_rsp, preemptible) =
-        unsafe { ((*raw).user_entry, (*raw).user_rsp, (*raw).preemptible) };
+    let (entry, user_rsp, preemptible, thread_arg) =
+        unsafe { ((*raw).user_entry, (*raw).user_rsp, (*raw).preemptible, (*raw).arg) };
     // U4x: TSS.RSP0 (used by the CPU on a ring-3 FAULT or timer preemption) and the per-CPU SYSCALL
     // kernel-rsp anchor (used by the SYSCALL stub — SYSCALL does not switch stacks itself) are BOTH
     // installed at the scheduler DISPATCH site (`run`) — NOT here — so, exactly like the CR3 install
@@ -752,6 +752,16 @@ extern "C" fn user_task_trampoline() -> ! {
     // starts from an all-zero register file. The user entry ABI takes no register arguments — the
     // U1a blob and the U2 loaded HELLO.BIN both load their own registers — so this leaks nothing the
     // program needs.
+    //
+    // WINX-7 — the ONE EXCEPTION, and it is a DELIBERATE ABI VALUE rather than kernel residue: `rdi`
+    // carries this task's `arg`, so a `SYS_THREAD_SPAWN`ed EL0 thread enters its `extern "C"` worker
+    // entry with the SysV first argument already in place (the aarch64 twin puts the same word in x0;
+    // see `spawn_user_thread`). It is bound as an explicit `in("rdi")` operand — NOT left to the
+    // register allocator — precisely so the scrub below can drop its `xor edi, edi` without opening a
+    // hole: every task that is not a thread carries `arg == 0`, so rdi is provably zero for the U1a /
+    // U2 / U3 / `run` / `bg` paths and the scrub property is preserved bit for bit. The value is one
+    // the CALLER of `SYS_THREAD_SPAWN` chose from inside its own address space, so it discloses
+    // nothing the program did not already know.
     unsafe {
         core::arch::asm!(
             "swapgs",
@@ -782,7 +792,8 @@ extern "C" fn user_task_trampoline() -> ! {
             "xor ecx, ecx",
             "xor edx, edx",
             "xor esi, esi",
-            "xor edi, edi",
+            // NO `xor edi, edi` — rdi is the thread-argument ABI register (see the note above). It is
+            // an explicit `in("rdi")` operand and is 0 for every non-thread task.
             "xor ebp, ebp",
             "xor r8d, r8d",
             "xor r9d, r9d",
@@ -798,6 +809,7 @@ extern "C" fn user_task_trampoline() -> ! {
             rflags = in(reg) user_rflags, // reserved bit set; IF clear (cooperative) or set (preemptible)
             cs = in(reg) crate::arch::gdt::USER_CODE_SEL as u64,
             entry = in(reg) entry,
+            in("rdi") thread_arg as u64, // WINX-7: SysV arg0 for a SYS_THREAD_SPAWNed worker; 0 otherwise
             options(noreturn),
         );
     }
@@ -889,6 +901,178 @@ fn spawn_user_inner(
     wedge4::leave(w4cpu);
     poke_for(target_cpu, PRIO_NORMAL);
     id
+}
+
+// ---------------------------------------------------------------------------------------------
+// WINX-7: EL0 THREADS — several ring-3 tasks sharing ONE address space.
+//
+// `spawn_user_in_space` / `spawn_user_preemptible` already put a ring-3 task in a private CR3, and
+// U4x's dispatch-site install of CR3 + TSS.RSP0 + `syscall_kernel_rsp` already made a SECOND
+// concurrent user task per core safe (each task's syscalls and faults land on its OWN kernel stack,
+// never a sibling's). What was missing for threads is not scheduling at all — it is LIFETIME. Two
+// things follow from several tasks sharing one `user_cr3`:
+//
+//   1. TEARDOWN MUST BE REFCOUNTED. The pre-WINX-7 `exit`/reap paths called
+//      `memory::free_user_space_by_cr3` unconditionally, so the first thread to finish freed the
+//      slot — retiring its siblings' compositor windows, wiping the shared handle row, and handing
+//      the backing frames to the next `alloc_user_space` while live ring-3 code was still executing
+//      out of them. `user_space_retain`/`user_space_release` below make the LAST holder the one that
+//      frees, which is the same rule aarch64 gets from `boot::slot_thread_retain` +
+//      `teardown_user_slot`'s per-thread refcount.
+//   2. A THREAD MUST BE JOINABLE. `spawn_user_thread` gives the task a `done_sem` (the same
+//      `Arc<Semaphore>` machinery `spawn_joinable` uses for kernel threads) and hands the caller a
+//      `JoinHandle`; the completion is posted at `exit()`, which is the single terminus every task
+//      reaches however it dies.
+//
+// Threads are spawned PREEMPTIBLE (RFLAGS.IF set in ring 3). That is not a convenience: a worker
+// thread's whole job is to run concurrently with its parent, and a cooperative (IF-masked) ring-3
+// task runs to completion FIFO — so a co-located cooperative worker would monopolise its core until
+// it made a syscall, and a `user-vug` worker's inner rasterisation loop makes none. The U3.5
+// preemptible path is exactly the primitive this needs and it is already proven on the wire
+// (`:: U3.5: ring-3 preemption — IRQs-at-ring3=…, co-task ran, spinner resumed -> PASS ::`).
+// ---------------------------------------------------------------------------------------------
+
+/// WINX-7: per-slot EXTRA-HOLDER counts for the user address spaces. `USER_SPACE_REFS[s]` is the
+/// number of live tasks in slot `s` BEYOND the first — i.e. the number of `SYS_THREAD_SPAWN`ed EL0
+/// threads that have not yet retired. A single-task process keeps this at 0, so its first (and only)
+/// `user_space_release` frees the slot and every pre-WINX-7 path behaves byte-identically.
+///
+/// Relaxed-free accounting is deliberately NOT used: `retain` and `release` can run on different
+/// cores (a parent spawning on core A while a worker exits on core B), and the decision the counter
+/// drives is "may I free this address space?", so both sides are `AcqRel`.
+static USER_SPACE_REFS: [AtomicU32; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
+
+/// WINX-7: the slot index whose page-table root is `cr3`, or `None` for the shared kernel window.
+/// The `memory::current_slot` shape, but keyed off a STORED cr3 rather than the live one — a task's
+/// `user_cr3` field is the authority on which address space it belongs to, and at reap time the live
+/// CR3 has already been restored to the kernel's.
+fn cr3_slot(cr3: u64) -> Option<usize> {
+    (0..crate::arch::memory::USER_SLOTS).find(|&s| crate::arch::memory::slot_cr3(s) == cr3)
+}
+
+/// WINX-7: claim one extra hold on the address space `cr3` — called by the syscall layer BEFORE it
+/// spawns a thread into that space, so the slot cannot be torn down in the window between the
+/// decision to spawn and the new task's first dispatch. Idempotent-free and unbounded in principle;
+/// bounded in practice by the syscall layer's fixed thread table.
+pub fn user_space_retain(cr3: u64) {
+    if let Some(s) = cr3_slot(cr3) {
+        USER_SPACE_REFS[s].fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// WINX-7: drop one hold on the address space `cr3`, freeing it only when the LAST holder leaves.
+/// The caller MUST already have restored the kernel CR3 (that `mov cr3` full-flush is what retires
+/// this slot's user TLB entries) — the same precondition `free_user_space_by_cr3` has always had.
+///
+/// The count is decremented with a saturating CAS loop rather than `fetch_sub`, so a stray extra
+/// release (a path that retained nothing) cannot wrap the counter to `u32::MAX` and make the slot
+/// immortal — the fail-closed direction here is "free it", not "leak it forever".
+fn user_space_release(cr3: u64) {
+    let Some(s) = cr3_slot(cr3) else {
+        // Not one of ours (a CR3 that is not a live slot root — nothing to free, nothing to count).
+        return;
+    };
+    let mut cur = USER_SPACE_REFS[s].load(Ordering::Acquire);
+    loop {
+        if cur == 0 {
+            // Last holder: free the slot for real. `free_user_space_by_cr3` retires the slot's
+            // compositor windows, drops its FB leaves, clears its handle/file rows and releases the
+            // used-flag — the clear-before-release discipline it already documents.
+            crate::arch::memory::free_user_space_by_cr3(cr3);
+            return;
+        }
+        match USER_SPACE_REFS[s].compare_exchange_weak(
+            cur,
+            cur - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return, // a sibling is still live — the slot stays
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
+/// WINX-7: create a ring-3 THREAD inside the EXISTING address space `user_cr3` — a second (third, …)
+/// task under the same page-table root as its parent, so a memory word is coherent across them and a
+/// futex on that word is a real cross-thread wait/wake.
+///
+/// `user_entry` and `user_rsp` are VAs the CALLER carved out of its OWN window; the syscall layer
+/// validates them against that window before we are called (this function performs no validation and
+/// must not be reached from anywhere else). `arg` is delivered in `rdi` — SysV arg0 — by
+/// `user_task_trampoline`, so a worker written as `extern "C" fn(usize)` receives it directly.
+///
+/// The returned `JoinHandle` is the caller's ONLY way to wait for this thread; the completion permit
+/// is posted at the thread's `exit()` (whatever ends it). The caller MUST have called
+/// `user_space_retain(user_cr3)` first — the retain has to precede the enqueue, because a preemptible
+/// task can be dispatched on another core the instant it is pushed.
+pub fn spawn_user_thread(
+    name: &'static str,
+    user_entry: u64,
+    user_rsp: u64,
+    arg: usize,
+    target_cpu: usize,
+    user_cr3: u64,
+) -> JoinHandle {
+    assert!(target_cpu < MAX_CPUS, "spawn_user_thread: target_cpu out of range");
+    assert!(user_cr3 != 0, "spawn_user_thread: a thread needs a real private address space");
+    let done = Arc::new(Semaphore::new(0));
+    done.init(); // reserve the waiter list BEFORE the thread can run + post (alloc-free park)
+
+    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
+    let ctx_rsp = build_initial_frame(&mut stack, user_task_trampoline);
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    let task = Box::new(Task {
+        id,
+        name,
+        state: AtomicU8::new(STATE_READY),
+        ctx_rsp,
+        stack,
+        entry: user_never, // never called — the trampoline iretq's to ring 3 instead
+        arg,               // -> rdi at first entry (the thread ABI; see `user_task_trampoline`)
+        cpu: target_cpu as u32,
+        priority: PRIO_NORMAL,
+        wait_ticks: 0,
+        effective_level: 0, // re-based to `priority` by push() on enqueue (just below)
+        done_sem: Some(done.clone()),
+        user_entry,
+        user_rsp,
+        user_cr3,
+        preemptible: true, // see the section header: a worker must share its core, not own it
+        kill: None,
+    });
+    // WEDGE-4 `<W1>` window: this acquisition can run with IF=1; see `wedge4`. Same idiom as every
+    // other enqueue site (`spawn_inner` / `spawn_user_inner` / `make_ready`) — no new lock ORDER is
+    // introduced here, only one more instance of the existing one.
+    #[cfg(feature = "wedge2")]
+    let w4cpu = percpu::this_cpu().cpu_index as usize;
+    #[cfg(feature = "wedge2")]
+    wedge4::enter(w4cpu);
+    RUN_QUEUES[target_cpu].lock().push(task);
+    #[cfg(feature = "wedge2")]
+    wedge4::leave(w4cpu);
+    poke_for(target_cpu, PRIO_NORMAL);
+    JoinHandle { done, id }
+}
+
+/// WINX-7: pick a core for a thread whose caller asked for a SIBLING (`place == 1`) — an online core
+/// that is not `caller`, or `caller` itself when this machine is scheduling only one core. The
+/// aarch64 twin is `sched::other_online_cpu`.
+///
+/// "Online" here means DISPATCHING, and that distinction is the WINX-2 `bg_place_cpu` lesson written
+/// down: `meter_cpu_count()` reports how many cores the meter knows about, which is not the same as
+/// how many were released into `run()`. A thread placed on a core that never dispatches is spawned,
+/// never run, and never joined — a silent hang at the parent's frame barrier. So the probe is a core
+/// that has actually PUBLISHED a scheduler context (`scheduler_rsp != 0`, written by the first
+/// `switch_context` that core's `run()` performed); a core still sitting in `wait_and_run` has not.
+pub fn sibling_online_cpu(caller: usize) -> usize {
+    for c in 0..MAX_CPUS {
+        if c != caller && SCHED[c].scheduler_rsp.load(Ordering::Acquire) != 0 {
+            return c;
+        }
+    }
+    caller
 }
 
 /// Turn scheduling on (idempotent): release the APs from their post-online wait loop into `run()`
@@ -1117,15 +1301,36 @@ pub fn exit() -> ! {
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     assert!(!raw.is_null(), "exit: no current task");
     unsafe {
+        // WINX-7: signal completion to any joiner FIRST — before the address space is torn down and
+        // before the state flip. This is the single terminus every task reaches (a kernel thread via
+        // `task_trampoline`, an EL0 process via `SYS_EXIT`, an EL0 thread via `SYS_THREAD_EXIT`, a
+        // faulting ring-3 task via `ring3_fault_kill`), which is exactly why the post belongs here
+        // and not in the trampoline. The task's OWN `done_sem` Arc clone is the liveness anchor for
+        // this `post()` — it MUST remain in the Box until `run()` drops it on the Finished path, so
+        // we BORROW it (never take/move the Arc out). `post()` may `make_ready` a joiner parked on
+        // another core; we are IF=0 and hold no lock, so that is the ordinary cross-CPU wake.
+        if let Some(sem) = &(*raw).done_sem {
+            sem.post();
+        }
         // U3: if this task owned a private address space, tear it down HERE — restore the shared
         // kernel CR3 (that `mov cr3` full-flush retires this process's user TLB entries), THEN free
         // the slot. Order matters: free-after-restore, so no core is left on the dead root. We run on
         // this task's own kernel stack + scheduler code, both Global in the kernel half (shared into
         // every process root), so restoring the kernel CR3 doesn't pull the stack out from under us.
+        //
+        // WINX-7: the free is now REFCOUNTED (`user_space_release`) because an address space can hold
+        // several tasks — a process plus its `SYS_THREAD_SPAWN`ed EL0 threads. The pre-WINX-7 code
+        // freed unconditionally, which for a threaded program meant the FIRST thread to finish pulled
+        // the slot (and its window surfaces, and its handle row) out from under its still-running
+        // siblings. `user_space_release` frees only on the LAST holder's exit; every earlier exit
+        // still restores the kernel CR3, which is both harmless (the next dispatch installs whatever
+        // the incoming task needs) and necessary (this core must not sit on a root it no longer has
+        // a task for). Single-task programs are unchanged: their refcount is 0, so the first release
+        // IS the last one.
         let user_cr3 = (*raw).user_cr3;
         if user_cr3 != 0 {
             crate::arch::memory::restore_kernel_cr3();
-            crate::arch::memory::free_user_space_by_cr3(user_cr3);
+            user_space_release(user_cr3);
         }
         (*raw).state.store(STATE_FINISHED, Ordering::Release);
         // Switch away for good. `old_rsp` is a throwaway slot on the dying stack (the scheduler
@@ -1348,6 +1553,271 @@ impl Semaphore {
             x86_64::instructions::interrupts::enable();
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// WINX-7: FUTEX — a keyed EL0 wait/wake primitive (backs SYS_FUTEX(26))
+// ---------------------------------------------------------------------------------------------
+//
+// A futex lets EL0 build a userspace mutex/condvar out of one shared u32: block on that word iff it
+// still holds an expected value, and wake N blocked waiters. It is what makes an EL0 thread pool
+// possible at all — `user-vug`'s per-frame barrier is exactly "the parent blocks until both workers
+// have bumped `done`", and without a real park that is a spin that burns a core per waiting thread.
+//
+// THE KEY IS `(slot, uaddr)`, NOT A PHYSICAL ADDRESS — the one deliberate divergence from the
+// aarch64 twin, and it is a simplification rather than a weakening. aarch64 keys on the word's PA
+// because a PA is globally unique across address spaces. On x86 the same uniqueness comes free from
+// the pair: two threads share a key iff they are in the same slot AND naming the same VA, which is
+// precisely "the same word", because threads of one process share one page-table root and distinct
+// processes share no user memory at all. Deriving a PA would mean a page-table walk from the
+// scheduler (a `memory` API this layer has no business reaching for) to re-establish a property the
+// slot index already carries. The cost is honest and stated: if x86 ever grows genuine cross-process
+// shared memory, a futex on it will need the PA key back.
+//
+// Everything else is the aarch64 shape verbatim, because the shape is the correctness argument: the
+// compare-and-block happens UNDER the bucket lock that any `futex_wake` on the same key must also
+// take, so a wake can never slip between the compare and the park being enqueued (the classic
+// race-free compare-and-block). The park itself reuses the `Semaphore` PARK_WAITQ lock-handoff
+// unchanged — the blocking task holds the bucket lock across the switch and the SCHEDULER pushes its
+// Box and releases the lock — so the lost-wakeup proof is the one already written for `Semaphore`.
+//
+// LOCK ORDER: a bucket lock is a WAIT-QUEUE lock and sits exactly where `Semaphore::locked` sits —
+// `futex_wake` pops a waiter under the bucket lock but calls `make_ready` only AFTER releasing it, so
+// the run-queue lock is never nested under a bucket lock and the existing acyclic order holds.
+
+/// Distinct futex keys the kernel can have waiters parked on at once (never grown — the same fixed
+/// discipline as `USER_SLOTS` / the process table). `user-vug` uses ONE key per process.
+const NFUTEX: usize = 16;
+
+/// One futex wait bucket: a keyed FIFO wait queue with a `Semaphore`-style raw lock handed to the
+/// scheduler at park time.
+struct FutexBucket {
+    /// Raw spinlock guarding `key` + `waiters` (Acquire on lock, Release on unlock; the PARK_WAITQ
+    /// lock-handoff releases it AFTER the scheduler has pushed the blocking Box).
+    locked: AtomicBool,
+    /// The key this bucket serves, or 0 = free. Claimed by the first waiter for a key, released back
+    /// to 0 when its last waiter leaves.
+    key: AtomicU64,
+    /// FIFO waiter list; touched only under `locked`, pre-reserved by `futex_init`.
+    waiters: UnsafeCell<VecDeque<Box<Task>>>,
+}
+
+// SAFETY: every access to `key`/`waiters` is serialised by `locked` — identical argument to
+// `Semaphore`'s, including the park-side push performed by the scheduler while the lock is still
+// held, which establishes happens-before with the next `futex_wake` that acquires it.
+unsafe impl Sync for FutexBucket {}
+
+impl FutexBucket {
+    const fn new() -> Self {
+        FutexBucket {
+            locked: AtomicBool::new(false),
+            key: AtomicU64::new(0),
+            waiters: UnsafeCell::new(VecDeque::new()),
+        }
+    }
+    #[inline]
+    fn lock_raw(&self) {
+        while self.locked.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+    #[inline]
+    fn unlock_raw(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+    #[inline]
+    fn waiters_empty(&self) -> bool {
+        unsafe { (*self.waiters.get()).is_empty() }
+    }
+}
+
+static FUTEX: [FutexBucket; NFUTEX] = [const { FutexBucket::new() }; NFUTEX];
+
+/// Reserve every futex bucket's waiter capacity on the BSP before any task can park on one, so the
+/// scheduler's park-side `push_back` never reallocates (and so never takes the heap lock) under the
+/// handed-off bucket lock. Called from [`init`].
+pub fn futex_init() {
+    for b in FUTEX.iter() {
+        b.lock_raw();
+        unsafe { (*b.waiters.get()).reserve(WAIT_CAPACITY) };
+        b.unlock_raw();
+    }
+}
+
+/// Outcome of [`futex_wait`].
+pub enum FutexWait {
+    /// Was blocked, then woken by a `futex_wake` on the same key.
+    Woken,
+    /// `*uaddr != expected` at the compare — the caller must re-check and loop (no sleep happened).
+    Mismatch,
+    /// Every bucket is busy with a DIFFERENT live key — the fixed futex pool is exhausted.
+    TableFull,
+    /// Called off a scheduled task (no `current` to park) — cannot block.
+    NoTask,
+}
+
+/// Build the futex key for `uaddr` in address-space `slot`. Non-zero by construction (the slot index
+/// is biased by 1, and the top byte of a user VA is 0 — `USER_BASE` is 1 TiB and the window is
+/// 16 KiB + the FB region, so bits [63:56] are provably clear and cannot collide with the tag).
+pub fn futex_key(slot: usize, uaddr: u64) -> u64 {
+    debug_assert!(uaddr >> 56 == 0, "futex_key: user VA overlaps the slot tag");
+    (((slot as u64) + 1) << 56) | (uaddr & 0x00FF_FFFF_FFFF_FFFF)
+}
+
+/// FUTEX_WAIT: block the current task on `key` iff the u32 at `uaddr` still equals `expected`.
+///
+/// `uaddr` must ALREADY be validated by the syscall layer as a 4-aligned, writable address inside the
+/// CALLER's own ring-3 window, and `key` must be `futex_key(caller_slot, uaddr)`; this function
+/// dereferences `uaddr` at CPL 0 under the caller's still-live CR3 (a syscall runs in the caller's
+/// address space) and performs no validation of its own.
+pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
+    debug_assert!(key != 0, "futex key must be non-zero");
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable(); // IF=0 for the whole critical section
+
+    // Select the bucket: an existing one serving this key, else claim a free one. Left LOCKED on
+    // success — the compare and the park both happen under that same hold.
+    let mut chosen: Option<&FutexBucket> = None;
+    for b in FUTEX.iter() {
+        b.lock_raw();
+        if b.key.load(Ordering::Relaxed) == key {
+            chosen = Some(b);
+            break;
+        }
+        b.unlock_raw();
+    }
+    let b = match chosen {
+        Some(b) => b,
+        None => {
+            let mut claimed = None;
+            for b in FUTEX.iter() {
+                b.lock_raw();
+                if b.key.load(Ordering::Relaxed) == 0 {
+                    b.key.store(key, Ordering::Relaxed);
+                    claimed = Some(b);
+                    break;
+                }
+                b.unlock_raw();
+            }
+            match claimed {
+                Some(b) => b,
+                None => {
+                    if was_enabled {
+                        x86_64::instructions::interrupts::enable();
+                    }
+                    return FutexWait::TableFull;
+                }
+            }
+        }
+    };
+
+    // `b` is locked and serves `key`. Compare-and-block under that lock.
+    let cur = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+    if cur != expected {
+        if b.waiters_empty() {
+            b.key.store(0, Ordering::Relaxed); // release a bucket we claimed but will not park on
+        }
+        b.unlock_raw();
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+        return FutexWait::Mismatch;
+    }
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
+    if raw.is_null() {
+        if b.waiters_empty() {
+            b.key.store(0, Ordering::Relaxed);
+        }
+        b.unlock_raw();
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+        return FutexWait::NoTask;
+    }
+    // Capacity guard: the lock is held continuously until the scheduler pushes, so the length cannot
+    // change before then — asserting here proves the park-side push will not reallocate.
+    assert!(
+        unsafe { (*b.waiters.get()).len() } < WAIT_CAPACITY,
+        "futex waiter overflow (raise WAIT_CAPACITY)"
+    );
+    unsafe {
+        debug_assert_eq!((*raw).cpu as usize, cpu, "futex_wait: task on the wrong CPU");
+        (*raw).state.store(STATE_BLOCKED, Ordering::Release);
+        // Hand the scheduler this bucket's waiter list + lock (the PARK_WAITQ lock-handoff — see
+        // `Semaphore::wait` for the full lost-wakeup argument).
+        SCHED[cpu].park_waiters.store(b.waiters.get() as u64, Ordering::Relaxed);
+        SCHED[cpu].park_lock.store(&b.locked as *const AtomicBool as u64, Ordering::Relaxed);
+        SCHED[cpu].park_kind.store(PARK_WAITQ, Ordering::Relaxed);
+        switch_context(&raw mut (*raw).ctx_rsp, SCHED[cpu].scheduler_rsp.load(Ordering::Acquire));
+    }
+    // Resumed (IF=0, carried) once a `futex_wake` moved us back to our run queue; it released the
+    // bucket lock, so we must not touch it here.
+    if was_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
+    FutexWait::Woken
+}
+
+/// FUTEX_WAKE: wake up to `n` waiters parked on `key`; returns how many were actually woken. Releases
+/// the bucket back to free once its last waiter leaves. Waiters are re-readied OUTSIDE the bucket
+/// lock (the run-queue lock must never nest under a wait-queue lock — the `Semaphore::post` rule).
+pub fn futex_wake(key: u64, n: usize) -> usize {
+    debug_assert!(key != 0, "futex key must be non-zero");
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+    let mut woken = 0usize;
+    for b in FUTEX.iter() {
+        b.lock_raw();
+        if b.key.load(Ordering::Relaxed) != key {
+            b.unlock_raw();
+            continue;
+        }
+        while woken < n {
+            let next = unsafe { (*b.waiters.get()).pop_front() };
+            match next {
+                Some(task) => {
+                    b.unlock_raw();
+                    make_ready(task);
+                    woken += 1;
+                    b.lock_raw();
+                    // A concurrent drain may have freed and reclaimed this bucket for another key
+                    // while we were outside the lock; stop rather than pop a stranger's waiter.
+                    if b.key.load(Ordering::Relaxed) != key {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        if b.key.load(Ordering::Relaxed) == key && b.waiters_empty() {
+            b.key.store(0, Ordering::Relaxed); // last waiter gone — release the bucket
+        }
+        b.unlock_raw();
+        break;
+    }
+    if was_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
+    woken
+}
+
+/// WINX-7 introspection: how many tasks are parked across every futex bucket right now. Read by the
+/// regression witness as POSITIVE proof that its fixture really reached the park (the alternative —
+/// inferring a park from the absence of progress — cannot tell a park from a stall).
+pub fn futex_parked_total() -> usize {
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+    let mut n = 0usize;
+    for b in FUTEX.iter() {
+        b.lock_raw();
+        n += unsafe { (*b.waiters.get()).len() };
+        b.unlock_raw();
+    }
+    if was_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
+    n
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2095,9 +2565,20 @@ fn run() -> ! {
                         debug_assert_eq!(park, PARK_NONE, "non-blocked task carried a park action");
                         let reap = task.kill.as_ref().is_some_and(|k| k.is_requested());
                         if reap {
+                            // WINX-7: post the completion here too. A REAPED task never runs `exit()`
+                            // — the scheduler drops it where it stands — so without this a joiner
+                            // parked on a killed thread would wait forever, which is the one way a
+                            // `kill` could leave a process MORE stuck than before it was killed.
+                            if let Some(sem) = &task.done_sem {
+                                sem.post();
+                            }
+                            // WINX-7: refcounted, for the reason `exit()` documents — a killed
+                            // THREAD must not tear the address space out from under its siblings.
+                            // (A killed PROCESS is the common case and still frees here: its
+                            // refcount is 0 unless it spawned threads.)
                             if task.user_cr3 != 0 {
                                 crate::arch::memory::restore_kernel_cr3();
-                                crate::arch::memory::free_user_space_by_cr3(task.user_cr3);
+                                user_space_release(task.user_cr3);
                             }
                             if let Some(k) = &task.kill {
                                 k.mark_reaped(); // through the Arc — the requester's clone keeps it live
@@ -2191,6 +2672,11 @@ pub fn init() {
     for q in RUN_QUEUES.iter() {
         let _ = q.lock().len();
     }
+    // WINX-7: reserve every futex bucket's waiter capacity here, on the BSP, before any AP can reach
+    // `run()` and therefore before any task can park on one. Doing it at the first `futex_wait`
+    // instead would put a `VecDeque` growth (and the heap lock) inside the handed-off bucket lock,
+    // which is exactly the allocation the park-side push is proven not to perform.
+    futex_init();
 }
 
 /// Number of tasks currently queued on a CPU (best-effort snapshot; for the `sched` shell command).
