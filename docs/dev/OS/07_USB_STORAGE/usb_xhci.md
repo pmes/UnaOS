@@ -2770,6 +2770,14 @@ this arc's lane. That is why it is a brief and not a patch. Expected effect: the
 drops from ~730 transactions to single digits, and M2 — whatever wedges one transaction on this
 controller — stops being reached hundreds of times per boot.
 
+> **BUILT, 2026-07-29 — see §13.** The lane was widened by the operator and all four steps landed,
+> with one deliberate departure: step 3's chained multi-TRB TD was **not** built. Over-aligning the
+> staging buffer to 64 KiB makes a single Normal TRB legal at every size the buffer can hold, so the
+> §12.2 data-stage shape is preserved verbatim and the "only part with real xHCI risk" is discharged
+> rather than managed. §13 also records what this section could not have known: on the QEMU fixture's
+> 512-byte-cluster geometry the dominant amplifier was `alloc_cluster`'s free search, not the
+> per-sector data loop.
+
 ### 12.7 What metal must verify next
 
 1. `mean=` on the SUMMARY/TIMEOUT lines. If `mean` is within a small factor of `peak`, every
@@ -2779,6 +2787,189 @@ controller — stops being reached hundreds of times per boot.
    second — and that the log content is still correct in both (no stale tail with `reused=true`).
 3. Whether the reservation now gets further before wedging (a higher `n=` on the TIMEOUT line),
    which is the direct read of the −35 % transaction count.
+
+---
+
+## 13. MULTIBLK — the multi-block BOT path (2026-07-29)
+
+This is §12.6's deferred brief, built. It is a fix for **M1 (transaction amplification)** and
+**explicitly not** a fix for **M2 (the lost completion event)**, which remains unexplained. What it
+does to M2 is shrink the number of times per boot the wedge can be reached, and — new — make the
+next metal capture able to *characterise* it.
+
+### 13.0 Diagnosis re-verification at tip (693e097f)
+
+Every load-bearing claim in §12 was re-checked against the current tree before anything was designed.
+All of it still held:
+
+| §12 claim | at tip |
+| --- | --- |
+| `scsi_data_buffer` is 512 B | confirmed — `Layout::from_size_align(512, 64)` in `configure_bulk_endpoints_sync` |
+| every block-layer caller passes `blocks = 1` | confirmed — all four call sites in `drivers/block.rs` |
+| `fat.rs` write paths are per-sector RMW loops | confirmed — `write_at`, `write_grow` step 3, `zero_cluster`, `set_fat_entry_inner`, every directory-slot mutator |
+| the data stage is ONE Normal TRB (IOC+ISP), not a chain | confirmed — unchanged since the §12.2 audit |
+| `sum=`/`mean=` are on the SUMMARY/TIMEOUT witnesses | confirmed — §12.5's instrumentation is intact |
+| `reserved … reused=false` witness | confirmed on every QEMU FAT run |
+
+Nothing in §12 has gone stale. One thing §12 did **not** know, because it was measuring a metal boot
+rather than a QEMU battery, is recorded in §13.4: on the QEMU fixture geometry the dominant amplifier
+is not the data loop at all.
+
+### 13.1 Design
+
+1. **`scsi_data_buffer`: 512 B → 32 KiB, aligned to 64 KiB** (`STORAGE_DATA_BYTES` /
+   `STORAGE_DATA_ALIGN`, `xhci/mod.rs`). The alignment is the whole trick. xHCI 1.2 §4.11.7.1 forbids
+   a Normal TRB's buffer from crossing a 64 KiB boundary; a 32 KiB buffer aligned to 64 KiB *cannot*.
+   So the data stage stays **exactly** the single-TRB / single-TD / single-IOC shape §12.2 audited and
+   cleared, at every transfer size up to the buffer. §12.6 step 3 proposed a chained multi-TRB TD with
+   hand-rolled boundary splitting and called it "the only part with real xHCI risk"; over-aligning the
+   buffer **discharges** that risk instead of managing it. There is no new TRB shape on the wire.
+2. **`scsi_read10` / `scsi_write10` carry a real `blocks`**, bounded by `STORAGE_MAX_BLOCKS` (= 64).
+   The CDB always encoded the count; only the buffer forbade it. An inadmissible count is the new
+   `BotError::BadRequest`, raised *before* anything is queued so it never drags the pipe through Reset
+   Recovery.
+3. **`drivers/block.rs` gains counted entry points** — `read_blocks` / `write_blocks` /
+   `read_blocks_usb` / `write_blocks_usb`, plus `MAX_BLOCKS_PER_OP`. The diff is **purely additive**:
+   `git diff drivers/block.rs` removes zero lines. `read_block` / `write_block` and both `_usb`
+   singles are byte-identical, so the installer engine's verify ladder and the shell's raw
+   `write <lba> <byte>` keep the exact path they were audited on. A request that is not a whole number
+   of blocks, or is larger than the staging buffer, is **refused** — never truncated, because a
+   short write that reported success is the one failure a filesystem cannot detect.
+4. **`fs/fat.rs` coalesces contiguous extents.** `collect_chain` materialises a chain (caching the FAT
+   sector across hops); `contiguous_sectors` measures how far a run stays consecutive on disk;
+   `write_span` / `read_span` do the transfers. A span splits into head-partial / whole-sector body /
+   tail-partial, and **the body is written with no preceding read at all** — the RMW exists only to
+   preserve bytes outside the write, so it is needed only at the two ends. `zero_cluster`,
+   `write_grow`, `write_at`, `read_file` and `read_at` all route through this. Six near-identical
+   directory walks (read / locate / free-slot × fixed-root / chain) collapse onto one
+   `walk_dir_sectors`, whose chunk size **doubles** as a scan proves itself long — so an early exit
+   costs exactly what it used to and a full scan costs a logarithmic number of transfers.
+5. **`alloc_cluster` gets a rotating start** (`ALLOC_HINT`, the in-memory equivalent of FAT32's
+   FSInfo `FSI_Nxt_Free`). See §13.4 — this turned out to be the single largest amplifier in the QEMU
+   battery. Search ORDER only: every cluster is still visited at most once per call (the scan wraps
+   once back to cluster 2), the F3-M1 compare-and-claim under `FAT_MUTATION` is untouched, and the
+   zero-fill-after-claim order — and with it the information-disclosure invariant — is unchanged.
+
+### 13.2 Measured effect
+
+All runs on this Linux box, kernel rebuilt per row, image rebuilt fresh per run per §12.5a.
+
+| gate | baseline `n=` | after `n=` | cut |
+| --- | --- | --- | --- |
+| `UNAOS_FATIMG=1 UNAOS_WC=1 ./arroyo test 90` (fixture, 512 B clusters) | 10889 | **3969** | 2.74× |
+| the same, on a **32 KiB-cluster** volume (metal-shaped, §13.3) | 2667 | **779** | 3.4× |
+| `UNAOS_WC=1 ./arroyo test 90` (no FAT volume) | 51 | 51 | — |
+| `./arroyo test-arm 22` (aarch64-virt) | 92 | 92 | — |
+
+Verdict sets are unchanged. The FAT-attached gate's 40 PASS/FAIL lines diff clean against baseline
+except for two timing-sampled lines (one `[wc-d] verify … -> PASS` sampled 5× before and 4× after,
+all `bad_cache=0 bad_ram=0`, and WINX-8's parenthetical race wording). `./arroyo test-fat sf 300`
+also runs green apart from the same two WINX teardown FAILs, with `U11m2 … -> PASS` (the ledgered
+end-to-end FAT mutation gate) and `n=3853`. `timeouts=0` everywhere.
+
+`n=` counts pump WAITS; a data-carrying transaction awaits two (data stage, then CSW), so the
+transaction counts are half these. The new `:: BOT: tx … result=SIZES ::` witness reports the census
+directly — on the 32 KiB-cluster run, `single=337 multi=52 maxlen=32768 rd_sectors=394
+wr_sectors=789`: 389 transactions moving 1183 sectors, i.e. **3.0 sectors per USB round trip**, where
+before every round trip moved exactly one.
+
+### 13.3 The 32 KiB-cluster measurement, and why it needed building
+
+The tracked fixture is `mkfs.vfat -s 1` — **512-byte clusters** — because the U10 GROW.BIN fixture
+asserts "512 bytes == exactly one cluster". That is the *worst possible* geometry for cluster-level
+coalescing: a cluster **is** a sector, so `zero_cluster` has nothing to merge and a data span rarely
+crosses into a contiguous neighbour. The sticks that actually wedge on metal are formatted with
+32 KiB clusters, which is the geometry §12.1's ~730-transaction arithmetic is priced against.
+
+So the row above was measured against a purpose-built image: same staged contents, `mkfs.vfat -s 64`,
+2600 MiB. The size is not arbitrary — FAT type is decided by **cluster count**, not by what the
+formatter writes in the BPB, and a 96 MiB volume at 32 KiB clusters is 3072 clusters, i.e. FAT12,
+which `parse_bpb` correctly refuses (`FS: no FAT filesystem (NotFat)`). 2600 MiB gives ~83200
+clusters, over the 65525 FAT32 threshold — and is also the realistic pairing, since 32 KiB clusters
+are what a formatter picks for a multi-gigabyte stick in the first place.
+
+This is a **measurement** image, not a battery fixture: the U10 512-byte-cluster fixtures do not hold
+on it. It is built by a throwaway patched copy of `make-fat-img.sh`; nothing about it is committed.
+
+### 13.4 What the measurement found that §12 could not have
+
+On the fixture geometry the per-sector data loop was **not** the dominant amplifier. Coalescing the
+data path, the read path and the directory walks together took `n=` only from 10889 to 9261. The
+remaining ~4600 transactions were `alloc_cluster`'s free search, which restarted at cluster 2 on every
+call: allocating the flight recorder's 129 clusters (66048 bytes at 512-byte clusters) re-read the
+~20 FAT sectors in front of the free region 129 times — **~2580 sector reads, more than every data
+transfer in the boot put together**. The rotating start took the same run to 3959.
+
+That is worth recording as a general lesson and not just a fix: §12.1's transaction table was built by
+reading the *write* path, and it was right about the write path, but a table derived from code review
+undercounts whatever the reviewer was not looking at. The census witness now measures it instead.
+
+### 13.5 M2 — what is now instrumented, and what remains open
+
+**No claim is made that M2 is fixed, or understood.** It was not reproduced in QEMU during this arc
+(`timeouts=0` on every run above), so there is no new evidence about its *cause*. What changed is the
+instrumentation, and the reason it is now worth having: while every transfer was the same 512-byte
+single-TRB shape, there was nothing for a wedge to correlate *with*. Transfer sizes now span two
+orders of magnitude.
+
+Two new witnesses, both on their own lines so every pre-existing line stays byte-comparable with
+captures taken before this arc:
+
+* `:: BOT: pump shape stage= dir= len= trb_idx= wrapped= … result=TIMEOUT-SHAPE ::` — printed
+  immediately after the existing TIMEOUT line, naming the transaction that did not complete.
+* `:: BOT: tx single= multi= maxlen= wrapped_tx= rd_sectors= wr_sectors= max_blocks= result=SIZES ::`
+  — the population those fields must be read against, at summary time.
+
+How to read a metal TIMEOUT-SHAPE:
+
+| observation | reading |
+| --- | --- |
+| `stage=data` with a large `len=` | the wedge prefers big TDs — a controller/stick burst boundary. Multi-block would then be trading M1 for M2 and the buffer size must come back down. |
+| `stage=data len=512` | size is not the discriminator; the amplification cut is pure profit. |
+| `stage=csw` | the data phase landed and only the 13-byte status event went missing — points at the event ring, not the transfer. This is what §12.3's `csw_sig=0x0` evidence *suggests*, and this line is what would confirm it. |
+| `wrapped=true`, against `wrapped_tx=` / total transactions | the direct ring-wrap correlation test. §12.2 could only argue from ring arithmetic (16 TRBs, 3 pushed per transaction, so ~1 in 5 wraps); this observes it. |
+| `timeouts=` split against `rd_sectors=`/`wr_sectors=` | whether M2 is direction-specific. §12's evidence is all from the write path, but that is also where all the traffic was. |
+
+**Still open**, unchanged by this arc: why a completion event is lost at all while the controller
+itself stays healthy (stop-ep/set-deq return cc=1, the dequeue pointer moves). Nothing here explains
+that, and a boot that still wedges after this arc has *not* refuted the M1 analysis — it has confirmed
+that M1 was only ever the amplifier.
+
+### 13.6 aarch64 impact — inert today, liftable in one arc
+
+`fs/fat.rs` and `drivers/block.rs` are shared with the Pi track, so this is stated precisely.
+
+* **`drivers/block.rs`** — additive. The SD backend (`drivers::emmc2`) exposes only single-block
+  CMD17/CMD24, so `read_blocks`/`write_blocks` **loop** those: byte-for-byte the same card traffic, in
+  the same order, that the per-sector callers produced before. Nothing about the microSD path changes.
+* **`fs/fat.rs`** — the coalescing is real on aarch64 too, but it lands on a block layer that
+  immediately re-splits it, so the card sees no difference. Measured: `./arroyo test-arm 22` reports
+  `n=92` before and `n=92` after, identical.
+* **The lift is one arc, and the pi seat should want it.** Implementing CMD18 (READ_MULTIPLE_BLOCK) /
+  CMD25 (WRITE_MULTIPLE_BLOCK) behind `read_blocks`/`write_blocks` puts this entire coalescing layer
+  onto the microSD **with no filesystem change at all**, because the coalescing lives above that seam,
+  not below it. The `alloc_cluster` rotating start and the directory-walk collapse are arch-neutral
+  and benefit the microSD immediately.
+
+### 13.7 Guard ladder — untouched, provably
+
+`git diff --stat` for this arc names exactly three files: `drivers/block.rs`, `drivers/xhci/mod.rs`,
+`fs/fat.rs`. `install/mod.rs` (the blank-check refusal and the verify ladder), `fs/vfs.rs`,
+`shell.rs` and `flight_recorder.rs` are **not in the diff at all**, and `drivers/block.rs`'s diff
+deletes zero lines. The destructive path therefore reaches the disk through the same single-block
+functions, with the same bounds, that it did before.
+
+### 13.8 Not done
+
+* **`set_fat_entry` is still one sector RMW per FAT copy per link** (4 transactions per cluster
+  linked). Batching a whole run of chain links into one FAT-sector write is the next available cut,
+  and it is the largest remaining item on the fixture geometry — but it moves crash-ordering
+  guarantees, so it wants its own arc rather than a corner of this one.
+* **`ALLOC_HINT` is not persisted to FSInfo.** Writing that sector would be a new on-disk mutation on
+  the destructive path; deliberately declined.
+* **WINX-2 / WINX-8 are still FAIL**, before and after, on both geometries, and for a reason outside
+  this lane: `killed=false (kill armed — the task retires at its next preemption)`. Storage is not
+  what fails them — the FAT read side is demonstrably green in the same run.
 
 ---
 

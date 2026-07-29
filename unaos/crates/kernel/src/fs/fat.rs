@@ -573,6 +573,91 @@ fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Resul
     r.map_err(|_| FatError::Io)
 }
 
+// ===================== MULTIBLK (2026-07-29) — counted sector runs =====================
+//
+// Every writer below this point used to be a per-sector read-modify-write loop, and
+// usb_xhci.md §12.1 priced exactly what that costs on real hardware: one flight-recorder
+// reservation is ~730 BOT transactions and ~1460 awaited USB completion events, because the driver
+// could move 512 bytes per round trip and this file dutifully asked it to, one sector at a time.
+// That amplification (mechanism M1) is not itself the wedge — mechanism M2, a LOST completion event,
+// is, and it remains unexplained. What M1 does is multiply M2's per-transaction hazard by a thousand
+// until it is certain to be hit. Cutting the transaction count is therefore the structural repair
+// available to us while M2's cause is still open, and it shrinks the exposure proportionally.
+//
+// Two independent wins, and it is worth keeping them separate because they compound:
+//   1. CONTIGUITY — sectors inside one cluster are always consecutive on disk, and consecutive
+//      clusters are consecutive LBAs, so a run can be handed to the block layer as ONE counted
+//      transfer instead of N.
+//   2. NO READ ON A FULL-SECTOR OVERWRITE — the old loop read every sector before writing it, even
+//      when the caller's data covered the whole sector. That read exists only to preserve the bytes
+//      OUTSIDE the written range, so it is needed only for a partial head or tail sector. Dropping
+//      it on the interior is a further 2x on every data write.
+//
+// The seam is deliberately narrow: `read_sector` / `write_sector` above are untouched and still
+// serve every partial-sector RMW, every FAT-entry mutation and every directory-slot mutation, so
+// those paths keep the exact shape they were audited in. Only whole-sector RUNS come through here.
+
+/// MULTIBLK: where the next `alloc_cluster` free search STARTS. This is the in-memory equivalent of
+/// FAT32's FSInfo `FSI_Nxt_Free` field, and it exists for the reason every real driver keeps one:
+/// restarting the scan at cluster 2 for every allocation makes allocating a run of clusters
+/// quadratic in FAT sector reads, and on a USB stick each of those reads is a full BOT transaction.
+/// It is advisory ONLY — `alloc_cluster` validates it into range, wraps back to cluster 2 when it
+/// reaches the end, and still claims under the F3-M1 compare-and-claim — so a stale value (including
+/// one left by a different volume, since this is a single global) can cost an extra wrap and can
+/// never cost correctness. Deliberately not persisted to FSInfo: writing that sector would be a new
+/// on-disk mutation on the destructive path, which this arc does not take.
+static ALLOC_HINT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
+
+/// MULTIBLK: read a run of whole sectors starting at absolute `lba` into `buf`, chunked against the
+/// block layer's published `MAX_BLOCKS_PER_OP`. `buf.len()` must be a non-zero multiple of
+/// [`SECTOR_SIZE`]; anything else is a caller bug and returns `Io` rather than a partial result.
+fn read_sectors(source: BlockSource, lba: u64, buf: &mut [u8]) -> Result<(), FatError> {
+    if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
+        return Err(FatError::Io);
+    }
+    let step = crate::drivers::block::MAX_BLOCKS_PER_OP * SECTOR_SIZE;
+    let mut off = 0usize;
+    while off < buf.len() {
+        let take = core::cmp::min(step, buf.len() - off);
+        let at = lba + (off / SECTOR_SIZE) as u64;
+        let chunk = &mut buf[off..off + take];
+        let r = match source {
+            BlockSource::Default => crate::drivers::block::read_blocks(at, chunk),
+            BlockSource::Usb => crate::drivers::block::read_blocks_usb(at, chunk),
+        };
+        match r {
+            Ok(n) if n == take => {}
+            _ => return Err(FatError::Io), // short read == error, exactly as `read_sector`
+        }
+        off += take;
+    }
+    Ok(())
+}
+
+/// MULTIBLK: write a run of whole sectors starting at absolute `lba` from `buf`, chunked against
+/// `MAX_BLOCKS_PER_OP`. The write twin of [`read_sectors`], with the same whole-sector precondition.
+/// Callers reach this ONLY for spans they have proven are fully covered by `buf`, which is what
+/// makes it sound to issue the write with no preceding read.
+fn write_sectors(source: BlockSource, lba: u64, buf: &[u8]) -> Result<(), FatError> {
+    if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
+        return Err(FatError::Io);
+    }
+    let step = crate::drivers::block::MAX_BLOCKS_PER_OP * SECTOR_SIZE;
+    let mut off = 0usize;
+    while off < buf.len() {
+        let take = core::cmp::min(step, buf.len() - off);
+        let at = lba + (off / SECTOR_SIZE) as u64;
+        let chunk = &buf[off..off + take];
+        let r = match source {
+            BlockSource::Default => crate::drivers::block::write_blocks(at, chunk),
+            BlockSource::Usb => crate::drivers::block::write_blocks_usb(at, chunk),
+        };
+        r.map_err(|_| FatError::Io)?;
+        off += take;
+    }
+    Ok(())
+}
+
 /// F2 (SMP-hardening): the FAT-table mutation lock. Serializes the read-modify-write of a FAT sector so two
 /// cores mutating entries that fall in the SAME sector cannot interleave read/write and lose an update — and
 /// so the mirrored FAT copies never diverge under concurrency. See [`with_fat_lock`] for the lock-span and the
@@ -1299,13 +1384,32 @@ impl FatFs {
     /// U10: zero-fill every sector of a data cluster. Called BEFORE a freshly allocated cluster joins a chain,
     /// so no stale bytes from a previously-freed file can leak into a grown/created region (an information-
     /// disclosure invariant).
+    ///
+    /// MULTIBLK: a cluster's sectors are consecutive on disk BY DEFINITION, and every one of them is
+    /// written in full, so this is the purest case for a counted transfer — the whole cluster goes
+    /// out as one run (chunked only by the block layer's `MAX_BLOCKS_PER_OP`). It used to be
+    /// `sec_per_clus` separate WRITE(10)s, which on the 32 KiB clusters real sticks are formatted
+    /// with is 64 USB round trips per allocated cluster; §12.1 counted ~192 of them in a single
+    /// flight-recorder reservation. The zeroing is otherwise unchanged, and so is its ORDER relative
+    /// to the claim in `alloc_cluster` — the information-disclosure invariant is untouched.
     fn zero_cluster(&self, cluster: u32) -> Result<(), FatError> {
         if !self.valid_cluster(cluster) {
             return Err(FatError::BadChain);
         }
-        let zeros = [0u8; SECTOR_SIZE];
-        for s in 0..self.sec_per_clus as u64 {
-            write_sector(self.source, self.cluster_lba(cluster) + s, &zeros)?;
+        let step = core::cmp::min(
+            self.sec_per_clus as usize,
+            crate::drivers::block::MAX_BLOCKS_PER_OP,
+        );
+        let zeros = alloc::vec![0u8; step * SECTOR_SIZE];
+        let mut done = 0u64;
+        while done < self.sec_per_clus as u64 {
+            let n = core::cmp::min(step as u64, self.sec_per_clus as u64 - done);
+            write_sectors(
+                self.source,
+                self.cluster_lba(cluster) + done,
+                &zeros[..n as usize * SECTOR_SIZE],
+            )?;
+            done += n;
         }
         Ok(())
     }
@@ -1326,13 +1430,41 @@ impl FatFs {
     /// EOC-reserved but UNLINKED during the fill, so no reader path can walk onto its stale bytes). Error path:
     /// a zero-fill failure AFTER the claim orphans `c` (EOC, unlinked — a benign lost cluster, chkdsk-
     /// reclaimable), never an aliased or stale-visible one.
+    ///
+    /// MULTIBLK (2026-07-29) — THE ROTATING START, and why it is the biggest single amplifier here.
+    /// The search used to restart at cluster 2 on EVERY call. Allocating a run of N clusters is then
+    /// quadratic in the FAT sectors it reads: the flight recorder's 66048-byte reservation on a
+    /// 512-byte-cluster volume allocates 129 clusters, and if the free region starts around cluster
+    /// 2530 each of those 129 searches re-reads the ~20 FAT sectors in front of it — ~2580 sector
+    /// reads, which measured as the LARGEST source of BOT transactions in the QEMU FAT battery,
+    /// larger than every data transfer put together. Starting the scan where the last successful
+    /// claim left off makes the same reservation cost ~2 FAT sector reads, because a FAT32 sector
+    /// holds 128 entries and consecutive allocations stay inside it.
+    ///
+    /// CORRECTNESS IS UNCHANGED, and deliberately so — this alters the ORDER of the search, nothing
+    /// else. Every cluster in `[2, count + 2)` is still visited at most once per call (the scan wraps
+    /// exactly once, back to cluster 2), so "the volume is full" still means the volume is full and
+    /// `NoSpace` cannot be returned early. The claim is still the F3-M1 compare-and-claim under
+    /// `FAT_MUTATION`, so two cores cannot alias a cluster no matter where their searches began; a
+    /// stale or nonsensical hint (e.g. carried over from a different volume) is validated back into
+    /// range and costs at most one extra wrap, never a bad allocation. The zero-fill-after-claim
+    /// order, and with it the information-disclosure invariant, is untouched.
     fn alloc_cluster(&self) -> Result<u32, FatError> {
         let entry_bytes: u64 = if self.kind == FatKind::Fat32 { 4 } else { 2 };
         let last = self.count_of_clusters + 2; // exclusive: valid data clusters are 2 ..= count+1
+        if last <= 2 {
+            return Err(FatError::NoSpace);
+        }
         let mut buf = [0u8; SECTOR_SIZE];
         let mut loaded = u64::MAX;
-        let mut c = 2u32;
-        while c < last {
+        // Where to begin. A hint outside this volume's cluster range is meaningless, not dangerous —
+        // clamp it back to the classic start and carry on.
+        let hint = ALLOC_HINT.load(core::sync::atomic::Ordering::Relaxed);
+        let mut c = if hint < 2 || hint >= last { 2 } else { hint };
+        let span = last - 2; // clusters that exist; the scan visits each at most once
+        let mut visited = 0u32;
+        while visited < span {
+            visited += 1;
             let offset = c as u64 * entry_bytes;
             let sec = offset / SECTOR_SIZE as u64;
             if sec >= self.fat_sz as u64 {
@@ -1367,6 +1499,11 @@ impl FatFs {
                     Ok(true)
                 })?;
                 if claimed {
+                    // MULTIBLK: publish the hint BEFORE the zero-fill, so a zero-fill failure (which
+                    // orphans `c`) still moves the next search past it rather than re-finding a
+                    // cluster that is now EOC-marked and will simply be skipped.
+                    let next = if c + 1 >= last { 2 } else { c + 1 };
+                    ALLOC_HINT.store(next, core::sync::atomic::Ordering::Relaxed);
                     // Zero AFTER the claim (see the doc comment): EOC-reserved but unlinked, so no reader can
                     // see stale bytes; a failure here orphans `c` (benign lost cluster) rather than aliasing.
                     self.zero_cluster(c)?;
@@ -1374,7 +1511,14 @@ impl FatFs {
                 }
                 loaded = u64::MAX; // our search buffer is stale (a concurrent writer mutated this sector)
             }
+            // MULTIBLK: advance, wrapping ONCE back to cluster 2 — `visited`/`span` is what bounds
+            // the loop now, so wrapping cannot spin. The sector cache is dropped on a wrap because
+            // the scan jumps to a different part of the FAT.
             c += 1;
+            if c >= last {
+                c = 2;
+                loaded = u64::MAX;
+            }
         }
         Err(FatError::NoSpace)
     }
@@ -1434,52 +1578,108 @@ impl FatFs {
         }
     }
 
+    /// MULTIBLK: feed a directory's sectors to `visit` in disk order, reading them in CONTIGUOUS RUNS
+    /// instead of one sector per USB round trip. `start_cluster` is `None` for the FAT16 fixed root
+    /// (one contiguous run of `root_dir_sectors`, no chain at all) and `Some(c)` for a cluster-chain
+    /// directory (the FAT32 root or any subdirectory). `visit(lba, sector)` returns true to STOP —
+    /// which is how the "0x00 end-of-directory" terminator, a name match and a free-slot hit all
+    /// terminate the walk without this function knowing what any of them mean.
+    ///
+    /// This replaces six near-identical hand-rolled walks (read/locate/free-slot × fixed-root/chain),
+    /// each of which was one `read_sector` per directory sector PLUS one `fat_entry` sector read per
+    /// cluster hop — i.e. two USB transactions per 512 bytes of directory on a 512-byte-cluster
+    /// volume. `collect_chain` caches the FAT sector, so the hops now cost ~1 read for the whole
+    /// chain, and the sectors themselves come back in runs.
+    ///
+    /// ### Why the chunk size GROWS instead of being fixed at the maximum
+    /// A directory scan very often stops in its first sector — `locate_in_dir_chain` finding a name,
+    /// `free_slot_in_dir_chain` finding the terminator. Reading `MAX_BLOCKS_PER_OP` sectors up front
+    /// would make the common case fetch 64 sectors to look at one. Starting at one sector and
+    /// doubling gives the early exit its old cost exactly, and a full scan a logarithmic number of
+    /// transfers instead of a linear one — the right shape for both, with no caller having to choose.
+    ///
+    /// Guards are `collect_chain`'s, unchanged from the walks this replaces: a bad/free/out-of-range
+    /// cluster is `BadChain`, a chain longer than the volume has clusters is `BadChain`, and an EOC
+    /// simply ends the walk (the caller then reports `NotFound` / `NoSpace` / the entries it got).
+    ///
+    /// ONE deliberate divergence, on corrupt media only: because the chain is collected before the
+    /// first sector is scanned, a directory whose 0x00 terminator sits early but whose FAT chain is
+    /// damaged LATER now reports `BadChain`, where the old lazy walk would have stopped at the
+    /// terminator and never seen the damage. That is the stricter direction — the volume really is
+    /// corrupt — and it cannot arise on a well-formed one, where a chain is walked to its EOC.
+    fn walk_dir_sectors(
+        &self,
+        start_cluster: Option<u32>,
+        mut visit: impl FnMut(u64, &[u8; SECTOR_SIZE]) -> bool,
+    ) -> Result<(), FatError> {
+        // 1. The runs, as (first LBA, sector count). Consecutive clusters are consecutive LBAs, so a
+        //    contiguously-allocated directory collapses to a single run.
+        let runs: alloc::vec::Vec<(u64, u64)> = match start_cluster {
+            None => alloc::vec![(self.root_dir_lba, self.root_dir_sectors as u64)],
+            Some(start) => {
+                let clusters = self.collect_chain(start, self.count_of_clusters as usize + 1)?;
+                let spc = self.sec_per_clus as u64;
+                let mut runs = alloc::vec::Vec::new();
+                let mut i = 0usize;
+                while i < clusters.len() {
+                    let base = self.cluster_lba(clusters[i]);
+                    let mut n = spc;
+                    while i + 1 < clusters.len() && clusters[i + 1] == clusters[i] + 1 {
+                        n += spc;
+                        i += 1;
+                    }
+                    runs.push((base, n));
+                    i += 1;
+                }
+                runs
+            }
+        };
+
+        // 2. Walk them, growing the transfer size as the scan proves it is going to be a long one.
+        //    The cap is DELIBERATELY below `MAX_BLOCKS_PER_OP`: this buffer is allocated per scan and
+        //    directory scans are frequent (every path resolution runs one), so 8 KiB is the right
+        //    trade — it already covers 256 directory slots per transfer, which is more than any
+        //    directory this filesystem creates, and it keeps the per-scan allocation small.
+        let cap = core::cmp::min(crate::drivers::block::MAX_BLOCKS_PER_OP, 16);
+        let mut chunk = 1usize;
+        let mut buf = alloc::vec![0u8; cap * SECTOR_SIZE];
+        for (base, count) in runs {
+            let mut done = 0u64;
+            while done < count {
+                let n = core::cmp::min(chunk as u64, count - done) as usize;
+                read_sectors(self.source, base + done, &mut buf[..n * SECTOR_SIZE])?;
+                for k in 0..n {
+                    let sec: &[u8; SECTOR_SIZE] = buf[k * SECTOR_SIZE..(k + 1) * SECTOR_SIZE]
+                        .try_into()
+                        .map_err(|_| FatError::Io)?;
+                    if visit(base + done + k as u64, sec) {
+                        return Ok(());
+                    }
+                }
+                done += n as u64;
+                chunk = core::cmp::min(chunk * 2, cap);
+            }
+        }
+        Ok(())
+    }
+
     /// FAT16 fixed root directory: a contiguous run of sectors, no cluster chain.
     fn read_fixed_root16(&self) -> Result<alloc::vec::Vec<DirEntry>, FatError> {
         let mut out = alloc::vec::Vec::new();
-        let mut buf = [0u8; SECTOR_SIZE];
         let mut lfn = LfnBuf::new();
-        for s in 0..self.root_dir_sectors as u64 {
-            read_sector(self.source, self.root_dir_lba + s, &mut buf)?;
-            if scan_dir_sector(&buf, &mut out, &mut lfn) {
-                break;
-            }
-        }
+        self.walk_dir_sectors(None, |_lba, sec| scan_dir_sector(sec, &mut out, &mut lfn))?;
         Ok(out)
     }
 
     /// Walk a directory stored as a cluster chain (the FAT32 root, or any subdirectory), collecting
     /// its entries. Stops at the 0x00 terminator or end-of-chain; guards against bad/free clusters
-    /// and a chain longer than the whole volume (loop protection).
+    /// and a chain longer than the whole volume (loop protection) — all now inside `walk_dir_sectors`
+    /// / `collect_chain`, so this and its five siblings cannot drift apart on them.
     fn read_dir_chain(&self, start: u32) -> Result<alloc::vec::Vec<DirEntry>, FatError> {
         let mut out = alloc::vec::Vec::new();
-        let mut cluster = start;
-        let mut hops = 0u32;
-        let mut buf = [0u8; SECTOR_SIZE];
         let mut lfn = LfnBuf::new();
-        loop {
-            if !self.valid_cluster(cluster) {
-                return Err(FatError::BadChain);
-            }
-            for s in 0..self.sec_per_clus as u64 {
-                read_sector(self.source, self.cluster_lba(cluster) + s, &mut buf)?;
-                if scan_dir_sector(&buf, &mut out, &mut lfn) {
-                    return Ok(out);
-                }
-            }
-            let next = self.fat_entry(cluster)?;
-            if self.is_eoc(next) {
-                return Ok(out);
-            }
-            if self.is_bad(next) || next < 2 {
-                return Err(FatError::BadChain);
-            }
-            cluster = next;
-            hops += 1;
-            if hops > self.count_of_clusters {
-                return Err(FatError::BadChain); // chain longer than the volume has clusters -> loop
-            }
-        }
+        self.walk_dir_sectors(Some(start), |_lba, sec| scan_dir_sector(sec, &mut out, &mut lfn))?;
+        Ok(out)
     }
 
     /// Find a top-level entry by 8.3 name (case-insensitive).
@@ -1528,35 +1728,17 @@ impl FatFs {
         if !self.valid_cluster(de.first_cluster) {
             return Err(FatError::BadChain);
         }
-        let mut cluster = de.first_cluster;
-        let mut hops = 0u32;
-        let mut buf = [0u8; SECTOR_SIZE];
-        'chain: loop {
-            if !self.valid_cluster(cluster) {
-                return Err(FatError::BadChain);
-            }
-            for s in 0..self.sec_per_clus as u64 {
-                read_sector(self.source, self.cluster_lba(cluster) + s, &mut buf)?;
-                let take = core::cmp::min(remaining, SECTOR_SIZE);
-                out.extend_from_slice(&buf[..take]);
-                remaining -= take;
-                if remaining == 0 {
-                    break 'chain;
-                }
-            }
-            let next = self.fat_entry(cluster)?;
-            if self.is_eoc(next) {
-                break; // chain ended before de.size (malformed) — return the short read
-            }
-            if self.is_bad(next) || next < 2 {
-                return Err(FatError::BadChain);
-            }
-            cluster = next;
-            hops += 1;
-            if hops > self.count_of_clusters {
-                return Err(FatError::BadChain); // chain longer than the volume has clusters -> loop
-            }
-        }
+        // MULTIBLK: collect the chain, then read it in contiguous runs. This is the path
+        // `load_program_into_slot` uses for every EL0 program on the volume, so it is exactly the
+        // path the boot-time `FS: 8472 STAT.ELF` / `FS: 12568 VUG.ELF` reads run down: 17 and 25
+        // sectors respectively, previously 17 and 25 separate READ(10)s plus one FAT sector read per
+        // cluster hop. Guards unchanged and now single-sourced in `collect_chain`: bad/free cluster
+        // and chain loop are `BadChain`, an early EOC returns the short read.
+        let clus_bytes = self.sec_per_clus as usize * SECTOR_SIZE;
+        let need = (remaining + clus_bytes - 1) / clus_bytes;
+        let clusters = self.collect_chain(de.first_cluster, need)?;
+        remaining = core::cmp::min(remaining, clusters.len().saturating_mul(clus_bytes));
+        self.read_span(&clusters, 0, remaining, out)?;
         Ok(())
     }
 
@@ -1567,10 +1749,13 @@ impl FatFs {
     /// bytes. Read-only — never writes the FAT, directory, or data. Stops at `size`, `start + max`, or
     /// end-of-chain; guards against bad/free clusters and chain loops exactly as `read_file`.
     ///
-    /// This is the offset-aware twin of `read_file`; `read_file` is deliberately left untouched (its
-    /// M6g/U4 `load_program_into_slot` caller reads whole programs from offset 0 and must stay
-    /// byte-identical). `read_at(fc, size, 0, out, max)` delivers the same bytes `read_file` would for a
-    /// non-directory entry, so the two share no code by design, not by divergence.
+    /// This is the offset-aware twin of `read_file`. ⚠ MULTIBLK (2026-07-29) SUPERSEDES the note that
+    /// stood here — it said the two "share no code by design, not by divergence", because `read_file`
+    /// was being held byte-identical for its M6g/U4 `load_program_into_slot` caller. They now share
+    /// `collect_chain` + `read_span`, which is the stronger form of the same guarantee: the twins
+    /// cannot diverge on bounds, on the short-read rule or on the FATREAD-1 replace contract, because
+    /// there is only one implementation of each. `read_at(fc, size, 0, out, max)` still delivers
+    /// exactly the bytes `read_file` would for a non-directory entry.
     ///
     /// FATREAD-1: `out` is REPLACED, never appended to — the same contract `read_file` now states,
     /// for the same reason, so the twins cannot diverge on it. Every current caller already hands in
@@ -1592,7 +1777,6 @@ impl FatFs {
         // above, so `end > start` and `want >= 1` here.
         let end = core::cmp::min(size as usize, (start as usize).saturating_add(max));
         let mut want = end - start as usize;
-        let mut skip = start as usize; // bytes still to skip before the first delivered byte
         if want == 0 {
             return Ok(()); // caller requested 0 bytes
         }
@@ -1600,46 +1784,20 @@ impl FatFs {
             return Err(FatError::BadChain);
         }
         let clus_bytes = self.sec_per_clus as usize * SECTOR_SIZE;
-        let mut cluster = first_cluster;
-        let mut hops = 0u32;
-        let mut buf = [0u8; SECTOR_SIZE];
-        'chain: loop {
-            if !self.valid_cluster(cluster) {
-                return Err(FatError::BadChain);
-            }
-            if skip >= clus_bytes {
-                // The whole cluster is before `start` — skip it without touching the disk.
-                skip -= clus_bytes;
-            } else {
-                for s in 0..self.sec_per_clus as u64 {
-                    if skip >= SECTOR_SIZE {
-                        skip -= SECTOR_SIZE; // this whole sector is still before `start`
-                        continue;
-                    }
-                    read_sector(self.source, self.cluster_lba(cluster) + s, &mut buf)?;
-                    let from = skip; // nonzero only on the first partially-skipped sector
-                    skip = 0;
-                    let take = core::cmp::min(want, SECTOR_SIZE - from);
-                    out.extend_from_slice(&buf[from..from + take]);
-                    want -= take;
-                    if want == 0 {
-                        break 'chain;
-                    }
-                }
-            }
-            let next = self.fat_entry(cluster)?;
-            if self.is_eoc(next) {
-                break; // chain ended before `end` (malformed vs `size`) — return the short read
-            }
-            if self.is_bad(next) || next < 2 {
-                return Err(FatError::BadChain);
-            }
-            cluster = next;
-            hops += 1;
-            if hops > self.count_of_clusters {
-                return Err(FatError::BadChain); // chain longer than the volume has clusters -> loop
-            }
+        // MULTIBLK: collect the chain up to the cluster the LAST wanted byte falls in, then read
+        // spans over it. `skip` is no longer a running subtraction — `read_span` addresses the file
+        // by byte offset directly, and clusters entirely before `start` are simply never visited
+        // (the old loop's "skip it without touching the disk" is now "never index it"). Every guard
+        // is preserved inside `collect_chain`: bad/free cluster and chain loop are `BadChain`, an
+        // early EOC yields a short read.
+        let need = (end + clus_bytes - 1) / clus_bytes;
+        let clusters = self.collect_chain(first_cluster, need)?;
+        let covered = clusters.len().saturating_mul(clus_bytes);
+        if covered <= start as usize {
+            return Ok(()); // the chain ends before `start` — a legal short (empty) read
         }
+        want = core::cmp::min(want, covered - start as usize);
+        self.read_span(&clusters, start as usize, want, out)?;
         Ok(())
     }
 
@@ -1658,6 +1816,207 @@ impl FatFs {
     ///     that re-`mount`s and `find_in_root`s the file sees the same size and chain head afterwards.
     /// Guards against bad/free clusters and chain loops exactly as `read_at`. A chain that ends before `size`
     /// (a malformed volume) yields a SHORT write (the returned count) rather than writing outside the chain.
+    /// MULTIBLK: walk the cluster chain from `first`, collecting up to `max_clusters` clusters in
+    /// order, and CACHE the FAT sector across hops.
+    ///
+    /// Two things it buys over the lazy `fat_entry`-per-hop walk it replaces in the span callers:
+    ///   * the chain arrives as a slice, which is what makes contiguity detectable at all — you
+    ///     cannot coalesce a run you are discovering one element at a time; and
+    ///   * a FAT32 sector holds 128 entries and a FAT16 sector 256, so a file laid down contiguously
+    ///     by any formatter costs ONE FAT read for its whole chain instead of one per cluster. On the
+    ///     QEMU fixture volumes (512-byte clusters) that alone dominates: a 12568-byte VUG.ELF is 25
+    ///     clusters, i.e. 25 FAT sector reads before this and 1 after.
+    ///
+    /// Bounds are the read walkers' bounds, unchanged: a free/bad/out-of-range cluster is
+    /// `BadChain`, a chain longer than the volume has clusters is `BadChain` (loop guard), and an
+    /// EOC before `max_clusters` simply ends the walk — the caller sees a SHORT chain and short-reads
+    /// or short-writes against it, exactly as the lazy walkers did.
+    ///
+    /// The cache is per-CALL and never outlives the walk, so it introduces no new coherence claim: a
+    /// chain walk was never atomic with respect to a concurrent FAT mutation before this either.
+    fn collect_chain(&self, first: u32, max_clusters: usize) -> Result<alloc::vec::Vec<u32>, FatError> {
+        let mut out = alloc::vec::Vec::new();
+        if max_clusters == 0 {
+            return Ok(out);
+        }
+        if !self.valid_cluster(first) {
+            return Err(FatError::BadChain);
+        }
+        let entry_bytes: u64 = if self.kind == FatKind::Fat32 { 4 } else { 2 };
+        let mut buf = [0u8; SECTOR_SIZE];
+        let mut loaded = u64::MAX; // which FAT sector `buf` currently holds (u64::MAX = none)
+        let mut cluster = first;
+        let mut hops = 0u32;
+        loop {
+            out.push(cluster);
+            if out.len() >= max_clusters {
+                return Ok(out);
+            }
+            let offset = cluster as u64 * entry_bytes;
+            let sec = offset / SECTOR_SIZE as u64;
+            if sec >= self.fat_sz as u64 {
+                return Err(FatError::BadChain); // outside the FAT region — same guard as fat_entry_copy
+            }
+            if sec != loaded {
+                read_sector(self.source, self.fat_start + sec, &mut buf)?;
+                loaded = sec;
+            }
+            let within = (offset % SECTOR_SIZE as u64) as usize;
+            let next = match self.kind {
+                FatKind::Fat16 => u16le(&buf, within) as u32,
+                FatKind::Fat32 => u32le(&buf, within) & 0x0FFF_FFFF,
+            };
+            if self.is_eoc(next) {
+                return Ok(out); // chain ended early — the caller short-reads/short-writes
+            }
+            if self.is_bad(next) || next < 2 || !self.valid_cluster(next) {
+                return Err(FatError::BadChain);
+            }
+            cluster = next;
+            hops += 1;
+            if hops > self.count_of_clusters {
+                return Err(FatError::BadChain); // longer than the volume has clusters -> a loop
+            }
+        }
+    }
+
+    /// MULTIBLK: how many sectors, starting at `clusters[ci]` sector `s0`, are CONSECUTIVE on disk.
+    ///
+    /// Within one cluster the answer is trivially "the rest of the cluster". Across clusters it holds
+    /// only while the chain is physically contiguous, i.e. `clusters[i + 1] == clusters[i] + 1` —
+    /// which for FAT is exactly the condition `cluster_lba(c + 1) == cluster_lba(c) + sec_per_clus`,
+    /// since cluster LBAs are a linear function of the cluster number. Files a formatter has just
+    /// laid down are usually one long contiguous run, so this is the common case, not the lucky one;
+    /// a fragmented file simply gets several runs and still beats one transfer per sector.
+    fn contiguous_sectors(&self, clusters: &[u32], ci: usize, s0: u64) -> u64 {
+        let spc = self.sec_per_clus as u64;
+        let mut n = spc - s0;
+        let mut i = ci;
+        while i + 1 < clusters.len() && clusters[i + 1] == clusters[i] + 1 {
+            n += spc;
+            i += 1;
+        }
+        n
+    }
+
+    /// MULTIBLK: write `data` into the byte range `[pos, pos + data.len())` of a file whose chain is
+    /// `clusters` (element `i` covering file bytes `[i * clus_bytes, (i + 1) * clus_bytes)`).
+    /// Returns the number of bytes written; a `pos` past what `clusters` covers is a short write.
+    ///
+    /// This is the shape that replaces the per-sector read-modify-write loop, and it splits the span
+    /// into at most three pieces per contiguous run:
+    ///   * a HEAD partial sector (only when `pos` is not sector-aligned) — one sector RMW, because
+    ///     the bytes before `pos` inside that sector must survive;
+    ///   * a BODY of whole sectors — issued as ONE counted `write_sectors` with NO preceding read at
+    ///     all, since `data` covers every byte of it. This is where both wins land;
+    ///   * a TAIL partial sector (only when fewer than 512 bytes remain) — one sector RMW, for the
+    ///     mirror-image reason to the head.
+    /// A partial sector still costs a read; that is not an oversight, it is the only way to preserve
+    /// the untouched bytes, and it is why the two RMWs are kept and only the interior is optimised.
+    fn write_span(&self, clusters: &[u32], start: usize, data: &[u8]) -> Result<usize, FatError> {
+        let clus_bytes = self.sec_per_clus as usize * SECTOR_SIZE;
+        let mut done = 0usize;
+        let mut pos = start;
+        let mut buf = [0u8; SECTOR_SIZE];
+        while done < data.len() {
+            let ci = pos / clus_bytes;
+            let Some(&cluster) = clusters.get(ci) else {
+                break; // the chain does not reach this far — a short write, never a write off-chain
+            };
+            if !self.valid_cluster(cluster) {
+                return Err(FatError::BadChain);
+            }
+            let in_clus = pos % clus_bytes;
+            let s0 = (in_clus / SECTOR_SIZE) as u64;
+            let in_sec = in_clus % SECTOR_SIZE;
+            let lba = self.cluster_lba(cluster) + s0;
+            let remaining = data.len() - done;
+
+            if in_sec != 0 {
+                // HEAD: partial sector — read, patch, write back. Exactly the old loop body.
+                let take = core::cmp::min(remaining, SECTOR_SIZE - in_sec);
+                read_sector(self.source, lba, &mut buf)?;
+                buf[in_sec..in_sec + take].copy_from_slice(&data[done..done + take]);
+                write_sector(self.source, lba, &buf)?;
+                done += take;
+                pos += take;
+                continue;
+            }
+
+            let full = (remaining / SECTOR_SIZE) as u64;
+            if full == 0 {
+                // TAIL: fewer than a whole sector left — read, patch, write back.
+                read_sector(self.source, lba, &mut buf)?;
+                buf[..remaining].copy_from_slice(&data[done..]);
+                write_sector(self.source, lba, &buf)?;
+                done += remaining;
+                pos += remaining;
+                continue;
+            }
+
+            // BODY: the longest run that is contiguous on disk, still covered by `data`, and still
+            // inside the chain we were given. No read — `data` supplies every byte.
+            let run = core::cmp::min(full, self.contiguous_sectors(clusters, ci, s0));
+            let bytes = run as usize * SECTOR_SIZE;
+            write_sectors(self.source, lba, &data[done..done + bytes])?;
+            done += bytes;
+            pos += bytes;
+        }
+        Ok(done)
+    }
+
+    /// MULTIBLK: the read twin of [`FatFs::write_span`] — append `len` bytes from byte offset `start`
+    /// of the file whose chain is `clusters` onto `out`. Returns the number of bytes delivered (short
+    /// if the chain ends first). Reads coalesce over the same contiguous runs; there is no
+    /// read-modify-write asymmetry here, so the only split is "partial sector" vs "whole-sector run".
+    fn read_span(
+        &self,
+        clusters: &[u32],
+        start: usize,
+        len: usize,
+        out: &mut alloc::vec::Vec<u8>,
+    ) -> Result<usize, FatError> {
+        let clus_bytes = self.sec_per_clus as usize * SECTOR_SIZE;
+        let mut done = 0usize;
+        let mut pos = start;
+        let mut buf = [0u8; SECTOR_SIZE];
+        while done < len {
+            let ci = pos / clus_bytes;
+            let Some(&cluster) = clusters.get(ci) else {
+                break; // chain ended before `len` — return the short read, as the walkers always did
+            };
+            if !self.valid_cluster(cluster) {
+                return Err(FatError::BadChain);
+            }
+            let in_clus = pos % clus_bytes;
+            let s0 = (in_clus / SECTOR_SIZE) as u64;
+            let in_sec = in_clus % SECTOR_SIZE;
+            let lba = self.cluster_lba(cluster) + s0;
+            let remaining = len - done;
+
+            if in_sec != 0 || remaining < SECTOR_SIZE {
+                // A partial sector at either end: one sector read, copy out the covered slice.
+                let take = core::cmp::min(remaining, SECTOR_SIZE - in_sec);
+                read_sector(self.source, lba, &mut buf)?;
+                out.extend_from_slice(&buf[in_sec..in_sec + take]);
+                done += take;
+                pos += take;
+                continue;
+            }
+
+            let full = (remaining / SECTOR_SIZE) as u64;
+            let run = core::cmp::min(full, self.contiguous_sectors(clusters, ci, s0));
+            let bytes = run as usize * SECTOR_SIZE;
+            // Extend `out` in place and read the whole run straight into it — one transfer.
+            let at = out.len();
+            out.resize(at + bytes, 0);
+            read_sectors(self.source, lba, &mut out[at..at + bytes])?;
+            done += bytes;
+            pos += bytes;
+        }
+        Ok(done)
+    }
+
     pub fn write_at(
         &self,
         first_cluster: u32,
@@ -1680,55 +2039,30 @@ impl FatFs {
             return Err(FatError::BadChain);
         }
         let clus_bytes = self.sec_per_clus as usize * SECTOR_SIZE;
-        let mut cluster = first_cluster;
-        let mut hops = 0u32;
-        let mut buf = [0u8; SECTOR_SIZE];
-        let mut skip = start as usize; // bytes still to skip before the first written byte
-        let mut src_off = 0usize; // bytes of `data` already written
-        'chain: loop {
-            if !self.valid_cluster(cluster) {
-                return Err(FatError::BadChain);
-            }
-            if skip >= clus_bytes {
-                // The whole cluster is before `start` — skip it without touching the disk.
-                skip -= clus_bytes;
-            } else {
-                for s in 0..self.sec_per_clus as u64 {
-                    if skip >= SECTOR_SIZE {
-                        skip -= SECTOR_SIZE; // this whole sector is still before `start`
-                        continue;
-                    }
-                    let lba = self.cluster_lba(cluster) + s;
-                    let from = skip; // nonzero only on the first partially-skipped sector
-                    skip = 0;
-                    let take = core::cmp::min(want, SECTOR_SIZE - from);
-                    // Read-modify-write: read the sector, overwrite [from..from+take], write it back. Even a
-                    // full-sector overwrite reads first (uniform RMW — the brief's "read-modify-write the
-                    // touched sectors"; a partial first/last sector's untouched bytes MUST be preserved).
-                    read_sector(self.source, lba, &mut buf)?;
-                    buf[from..from + take].copy_from_slice(&data[src_off..src_off + take]);
-                    write_sector(self.source, lba, &buf)?;
-                    src_off += take;
-                    want -= take;
-                    if want == 0 {
-                        break 'chain;
-                    }
-                }
-            }
-            let next = self.fat_entry(cluster)?;
-            if self.is_eoc(next) {
-                break; // chain ended before `end` (malformed vs `size`) — return the short write
-            }
-            if self.is_bad(next) || next < 2 {
-                return Err(FatError::BadChain);
-            }
-            cluster = next;
-            hops += 1;
-            if hops > self.count_of_clusters {
-                return Err(FatError::BadChain); // chain longer than the volume has clusters -> loop
-            }
+
+        // MULTIBLK: the lazy per-cluster `fat_entry` walk that used to live here has been replaced by
+        // "collect the chain, then write spans over it". EVERY bound this function documents is
+        // preserved, and each is now enforced in exactly one place:
+        //   * never grows        — `end` is still clamped to `size` above, and `write_span` refuses to
+        //                          step past the clusters it was handed;
+        //   * never allocates    — `collect_chain` only READS the FAT; nothing here writes it;
+        //   * never touches dirs — unchanged, there is no directory access in this function;
+        //   * bad/free cluster, chain loop -> `BadChain` — `collect_chain` carries the identical
+        //     guards (`is_bad`, `< 2`, `valid_cluster`, hop count vs `count_of_clusters`);
+        //   * a chain that ends before `size` yields a SHORT write — `collect_chain` returns the short
+        //     chain and `write_span` stops at its end, returning what it managed.
+        let need = (end + clus_bytes - 1) / clus_bytes; // clusters the write's END byte reaches into
+        let clusters = self.collect_chain(first_cluster, need)?;
+        // Clamp to what the collected chain actually covers, so a truncated chain short-writes rather
+        // than the caller being told bytes landed that never did.
+        let covered = clusters.len().saturating_mul(clus_bytes);
+        if covered <= start as usize {
+            return Ok(0);
         }
-        Ok(total - want)
+        want = core::cmp::min(want, covered - start as usize);
+        let wrote = self.write_span(&clusters, start as usize, &data[..want])?;
+        debug_assert!(wrote <= total);
+        Ok(wrote)
     }
 
     /// U10: like [`FatFs::find_in_root`] but also returns the on-disk LOCATION of the matched 8.3 entry — the
@@ -1745,63 +2079,43 @@ impl FatFs {
     /// FAT16 fixed root directory: a contiguous run of sectors, no cluster chain. Returns the matched entry
     /// with its (LBA, slot-offset). Stops at the 0x00 end marker exactly as `read_fixed_root16`.
     fn locate_in_fixed_root16(&self, name: &str) -> Result<(DirEntry, u64, usize), FatError> {
-        let mut buf = [0u8; SECTOR_SIZE];
-        for s in 0..self.root_dir_sectors as u64 {
-            let lba = self.root_dir_lba + s;
-            read_sector(self.source, lba, &mut buf)?;
-            for i in 0..(SECTOR_SIZE / 32) {
-                match classify_dir_slot(&buf[i * 32..i * 32 + 32]) {
-                    DirSlot::End => return Err(FatError::NotFound),
-                    DirSlot::Skip => continue,
-                    DirSlot::Entry(de) => {
-                        if de.eq_name(name) {
-                            return Ok((de, lba, i * 32));
-                        }
-                    }
-                }
-            }
-        }
-        Err(FatError::NotFound)
+        self.locate_in_dir_sectors(None, name)
     }
 
     /// A directory stored as a cluster chain (the FAT32 root, or any subdirectory): the located twin of
     /// `read_dir_chain`. Same bounded walk + bad/free-cluster + loop guards.
     fn locate_in_dir_chain(&self, start: u32, name: &str) -> Result<(DirEntry, u64, usize), FatError> {
-        let mut cluster = start;
-        let mut hops = 0u32;
-        let mut buf = [0u8; SECTOR_SIZE];
-        loop {
-            if !self.valid_cluster(cluster) {
-                return Err(FatError::BadChain);
-            }
-            for s in 0..self.sec_per_clus as u64 {
-                let lba = self.cluster_lba(cluster) + s;
-                read_sector(self.source, lba, &mut buf)?;
-                for i in 0..(SECTOR_SIZE / 32) {
-                    match classify_dir_slot(&buf[i * 32..i * 32 + 32]) {
-                        DirSlot::End => return Err(FatError::NotFound),
-                        DirSlot::Skip => continue,
-                        DirSlot::Entry(de) => {
-                            if de.eq_name(name) {
-                                return Ok((de, lba, i * 32));
-                            }
+        self.locate_in_dir_sectors(Some(start), name)
+    }
+
+    /// MULTIBLK: the one implementation behind [`FatFs::locate_in_fixed_root16`] and
+    /// [`FatFs::locate_in_dir_chain`] — they differed only in how they enumerated sectors, which is
+    /// now [`FatFs::walk_dir_sectors`]'s job. Semantics are preserved exactly: the first 0x00 slot
+    /// ends the directory and yields `NotFound` even if later sectors still hold data (that is what
+    /// "end of directory" means on FAT), a 0xE5/LFN slot is skipped, and the first short-name match
+    /// wins with its (LBA, slot-offset).
+    fn locate_in_dir_sectors(
+        &self,
+        start_cluster: Option<u32>,
+        name: &str,
+    ) -> Result<(DirEntry, u64, usize), FatError> {
+        let mut found: Option<(DirEntry, u64, usize)> = None;
+        self.walk_dir_sectors(start_cluster, |lba, sec| {
+            for i in 0..(SECTOR_SIZE / 32) {
+                match classify_dir_slot(&sec[i * 32..i * 32 + 32]) {
+                    DirSlot::End => return true, // end of directory — stop, `found` stays None
+                    DirSlot::Skip => continue,
+                    DirSlot::Entry(de) => {
+                        if de.eq_name(name) {
+                            found = Some((de, lba, i * 32));
+                            return true;
                         }
                     }
                 }
             }
-            let next = self.fat_entry(cluster)?;
-            if self.is_eoc(next) {
-                return Err(FatError::NotFound);
-            }
-            if self.is_bad(next) || next < 2 {
-                return Err(FatError::BadChain);
-            }
-            cluster = next;
-            hops += 1;
-            if hops > self.count_of_clusters {
-                return Err(FatError::BadChain);
-            }
-        }
+            false
+        })?;
+        found.ok_or(FatError::NotFound)
     }
 
     /// U10: publish a directory entry's `first_cluster` (bytes 20-21 hi, 26-27 lo) and `size` (bytes 28-31) at
@@ -1928,22 +2242,20 @@ impl FatFs {
         // 3. RMW the data across the chain. `start <= size <= end`, and the chain now covers [0, needed*clus),
         //    so every byte in [start, end) maps to an existing cluster. A partial sector preserves its other
         //    bytes; a freshly allocated cluster's untouched bytes stay zero (from step 2's zero-fill).
-        let mut written = 0usize;
-        let mut pos = start as usize;
-        let mut buf = [0u8; SECTOR_SIZE];
-        while written < data.len() {
-            let ci = pos / clus_bytes;
-            let cluster = *chain.get(ci).ok_or(FatError::BadChain)?;
-            let in_clus = pos % clus_bytes;
-            let sec_in_clus = (in_clus / SECTOR_SIZE) as u64;
-            let in_sec = in_clus % SECTOR_SIZE;
-            let lba = self.cluster_lba(cluster) + sec_in_clus;
-            let take = core::cmp::min(data.len() - written, SECTOR_SIZE - in_sec);
-            read_sector(self.source, lba, &mut buf)?;
-            buf[in_sec..in_sec + take].copy_from_slice(&data[written..written + take]);
-            write_sector(self.source, lba, &buf)?;
-            written += take;
-            pos += take;
+        //    MULTIBLK: this was a per-sector read-modify-write loop, and §12.1 counted it as 129
+        //    READ(10) + 129 WRITE(10) for a single 66048-byte flight-recorder reservation. `write_span`
+        //    keeps the RMW for the head and tail partial sectors — those bytes outside the write MUST
+        //    be preserved — and issues the whole-sector interior as counted, contiguous, READ-FREE
+        //    writes. Step 2 has just guaranteed the chain covers `[0, needed * clus_bytes)`, so
+        //    `write_span` can never run off its end here; it returns a short count only if handed a
+        //    short chain, which is why the total is checked below rather than assumed.
+        let written = self.write_span(&chain, start as usize, data)?;
+        if written != data.len() {
+            // The chain we just ensured covers the range did not, in fact, cover it. That is a
+            // corrupt-volume / lost-race condition, not a legal short write for a GROWING write:
+            // reporting fewer bytes while step 4 below publishes `new_size` would claim a size the
+            // data does not back. Fail instead, leaving the OLD size on disk (the safe order).
+            return Err(FatError::BadChain);
         }
 
         // 4. LAST: publish size (+ chain head if it changed) to the directory — data + FAT already
@@ -2440,51 +2752,33 @@ impl FatFs {
     }
 
     fn free_slot_in_fixed_root16(&self) -> Result<(u64, usize), FatError> {
-        let mut buf = [0u8; SECTOR_SIZE];
-        for s in 0..self.root_dir_sectors as u64 {
-            let lba = self.root_dir_lba + s;
-            read_sector(self.source, lba, &mut buf)?;
-            for i in 0..(SECTOR_SIZE / 32) {
-                let b0 = buf[i * 32];
-                if b0 == 0x00 || b0 == 0xE5 {
-                    return Ok((lba, i * 32));
-                }
-            }
-        }
-        Err(FatError::NoSpace) // fixed root full — no extension possible
+        // MULTIBLK: `NoSpace` on exhaustion, exactly as before — a fixed root cannot be extended.
+        self.free_slot_in_dir_sectors(None)
     }
 
-    fn free_slot_in_dir_chain(&self, start: u32) -> Result<(u64, usize), FatError> {
-        let mut cluster = start;
-        let mut hops = 0u32;
-        let mut buf = [0u8; SECTOR_SIZE];
-        loop {
-            if !self.valid_cluster(cluster) {
-                return Err(FatError::BadChain);
-            }
-            for s in 0..self.sec_per_clus as u64 {
-                let lba = self.cluster_lba(cluster) + s;
-                read_sector(self.source, lba, &mut buf)?;
-                for i in 0..(SECTOR_SIZE / 32) {
-                    let b0 = buf[i * 32];
-                    if b0 == 0x00 || b0 == 0xE5 {
-                        return Ok((lba, i * 32));
-                    }
+    /// MULTIBLK: the one implementation behind [`FatFs::free_slot_in_fixed_root16`] and
+    /// [`FatFs::free_slot_in_dir_chain`]. Unchanged rule: the first slot whose first byte is 0x00
+    /// (end marker) or 0xE5 (deleted) wins. Writing into the first 0x00 slot still preserves the
+    /// terminator, because every slot after it is also 0x00.
+    fn free_slot_in_dir_sectors(&self, start_cluster: Option<u32>) -> Result<(u64, usize), FatError> {
+        let mut found: Option<(u64, usize)> = None;
+        self.walk_dir_sectors(start_cluster, |lba, sec| {
+            for i in 0..(SECTOR_SIZE / 32) {
+                let b0 = sec[i * 32];
+                if b0 == 0x00 || b0 == 0xE5 {
+                    found = Some((lba, i * 32));
+                    return true;
                 }
             }
-            let next = self.fat_entry(cluster)?;
-            if self.is_eoc(next) {
-                return Err(FatError::NoSpace); // directory chain full (root or subdir); extending it is out of scope
-            }
-            if self.is_bad(next) || next < 2 {
-                return Err(FatError::BadChain);
-            }
-            cluster = next;
-            hops += 1;
-            if hops > self.count_of_clusters {
-                return Err(FatError::BadChain);
-            }
-        }
+            false
+        })?;
+        found.ok_or(FatError::NoSpace)
+    }
+
+    /// A directory stored as a cluster chain. `NoSpace` when the chain holds no free slot — extending
+    /// a directory chain remains out of scope, exactly as before MULTIBLK.
+    fn free_slot_in_dir_chain(&self, start: u32) -> Result<(u64, usize), FatError> {
+        self.free_slot_in_dir_sectors(Some(start))
     }
 
     /// U11-M2: mark a directory entry deleted (first byte -> `0xE5`) via RMW, preserving the rest of the sector.

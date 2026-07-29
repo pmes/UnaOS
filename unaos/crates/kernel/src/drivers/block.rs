@@ -8,6 +8,14 @@
 use spin::Mutex;
 use crate::drivers::xhci::{XHCI_CONTROLLER, CswStatus};
 
+/// MULTIBLK: the largest number of 512-byte blocks ONE `read_blocks`/`write_blocks` call may carry.
+/// It is the xHCI SCSI staging buffer's capacity (`xhci::STORAGE_MAX_BLOCKS`), re-exported here so
+/// filesystem code chunks against the block layer's own published limit instead of hard-coding a
+/// number that belongs to a driver two layers down. A caller that hands in more is refused, never
+/// silently truncated — a short write that reported success is the one failure mode a filesystem
+/// cannot detect.
+pub const MAX_BLOCKS_PER_OP: usize = crate::drivers::xhci::STORAGE_MAX_BLOCKS as usize;
+
 // M6g backend selector (aarch64 bare-metal only). The block layer dispatches over a registered
 // backend: the default is the xHCI USB-MSC path this file has always served; `register_sd` flips it
 // to the EMMC2/SDHCI microSD driver (`drivers::emmc2`). Everything SD-related is cfg-gated so the x86
@@ -426,6 +434,156 @@ pub fn write_block(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
             // BOTEV: this is the line that turns the flight recorder's `(Io)` into a diagnosis —
             // `/UNAOS.LOG`'s reservation writes come through here.
             io_cause_witness("write", lba, other);
+            Err(BlockError::Io)
+        }
+    }
+}
+
+// ===================== MULTIBLK — counted (multi-block) transfers =====================
+//
+// Everything above this line moves exactly one sector per USB round trip, because that is all the
+// xHCI SCSI staging buffer could hold. usb_xhci.md §12.1 priced what that costs: a single flight-
+// recorder reservation is ~730 BOT transactions and ~1460 awaited completion events, and since each
+// awaited event is an independent chance to hit the unexplained lost-completion wedge (M2), the
+// amplification (M1) is what converts a low per-transaction hazard into a boot-killing certainty.
+//
+// The entry points below carry a real block COUNT. They are additive on purpose: `read_block` /
+// `write_block` / `read_block_usb` / `write_block_usb` are left byte-identical, so every existing
+// caller — including the installer engine's verify ladder and the shell's raw `write <lba> <byte>` —
+// keeps the exact code path it was audited on. Nothing is rerouted; `fs/fat.rs` opts in where it can
+// prove the extent is contiguous.
+//
+// ### The contract, and why it refuses rather than truncates
+// `buf.len()` must be a non-zero exact multiple of the device block size, and at most
+// [`MAX_BLOCKS_PER_OP`] blocks. Every violation is an error. A block layer that quietly served a
+// prefix of the request would hand a filesystem a successful-looking short write, which is precisely
+// the failure a filesystem has no way to notice — so the refusal is the safe direction and the only
+// honest one. Callers that want more than the cap chunk against `MAX_BLOCKS_PER_OP`, which is
+// published for exactly that purpose.
+//
+// ### aarch64 impact — deliberately behaviour-inert on the microSD path
+// The SD backend (`drivers::emmc2`, Pi bare-metal) exposes only the single-block CMD17/CMD24
+// primitives, so `read_blocks`/`write_blocks` LOOP those, sector by sector: byte-for-byte the same
+// card traffic the per-sector callers produced before this arc, in the same order. The aarch64 seat
+// therefore inherits no risk and no win from this change today. The win is available to it whenever
+// it wants to spend the arc: implementing CMD18 (READ_MULTIPLE_BLOCK) / CMD25 (WRITE_MULTIPLE_BLOCK)
+// behind these two functions lifts the whole `fs/fat.rs` coalescing layer onto the microSD with no
+// filesystem change at all, because the coalescing lives above this seam, not below it.
+
+/// MULTIBLK: validate a counted request against one device's geometry, returning the block count.
+/// Shared by all four counted entry points so the bound rules cannot drift between them.
+fn span_blocks(dev: &BlockDeviceInfo, lba: u64, len: usize) -> Result<usize, BlockError> {
+    let bs = dev.block_size as usize;
+    if bs == 0 || len == 0 || len % bs != 0 {
+        return Err(BlockError::Io); // not a whole number of blocks — a caller bug, not an I/O fault
+    }
+    let count = len / bs;
+    if count > MAX_BLOCKS_PER_OP {
+        return Err(BlockError::Io); // larger than the staging buffer; chunk against MAX_BLOCKS_PER_OP
+    }
+    let end = lba.checked_add(count as u64).ok_or(BlockError::BadLba)?;
+    if end > dev.num_blocks {
+        return Err(BlockError::BadLba); // the LAST block must be in range, not just the first
+    }
+    Ok(count)
+}
+
+/// MULTIBLK: read `buf.len() / block_size` consecutive blocks starting at `lba` into `buf`, in ONE
+/// transfer where the backend supports it. Returns the number of bytes read (always `buf.len()` on
+/// success — a partial read is an error, see the contract note above).
+pub fn read_blocks(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let dev = info().ok_or(BlockError::NotReady)?;
+    let count = span_blocks(&dev, lba, buf.len())?;
+
+    // SD backend: no multi-block primitive yet — loop the proven single-block CMD17. Identical card
+    // traffic to the pre-MULTIBLK per-sector callers; see the aarch64 note above.
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    if BACKEND.load(Ordering::Acquire) == BACKEND_SD {
+        let bs = dev.block_size as usize;
+        for i in 0..count {
+            crate::drivers::emmc2::read_block_512(lba + i as u64, &mut buf[i * bs..(i + 1) * bs])?;
+        }
+        return Ok(buf.len());
+    }
+
+    let mut guard = XHCI_CONTROLLER.lock();
+    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    match xhci.storage_read10(lba as u32, count as u16) {
+        Ok(res) if res.status == CswStatus::Passed => {}
+        other => {
+            io_cause_witness("read", lba, other);
+            return Err(BlockError::Io);
+        }
+    }
+    let src = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
+    unsafe { core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), buf.len()); }
+    Ok(buf.len())
+}
+
+/// MULTIBLK: write `buf.len() / block_size` consecutive blocks starting at `lba` from `buf`, in ONE
+/// transfer where the backend supports it. `buf` covers the whole span, so — unlike the single-block
+/// path's callers — there is nothing to read first: this is the point where a full-sector overwrite
+/// stops costing a READ(10) it never used.
+pub fn write_blocks(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let dev = info().ok_or(BlockError::NotReady)?;
+    let count = span_blocks(&dev, lba, buf.len())?;
+
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    if BACKEND.load(Ordering::Acquire) == BACKEND_SD {
+        let bs = dev.block_size as usize;
+        for i in 0..count {
+            crate::drivers::emmc2::write_block_512(lba + i as u64, &buf[i * bs..(i + 1) * bs])?;
+        }
+        return Ok(());
+    }
+
+    let mut guard = XHCI_CONTROLLER.lock();
+    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    let dst = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
+    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()); }
+    match xhci.storage_write10(lba as u32, count as u16) {
+        Ok(res) if res.status == CswStatus::Passed => Ok(()),
+        other => {
+            io_cause_witness("write", lba, other);
+            Err(BlockError::Io)
+        }
+    }
+}
+
+/// MULTIBLK: the counted twin of [`read_block_usb`] — reads the USB stick DIRECTLY through the xHCI
+/// controller, bypassing the backend selector, so a `Usb`-sourced FAT mount coalesces on the Pi too
+/// (where the global block device is the microSD). Strictly read-only, as that path has always been.
+pub fn read_blocks_usb(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let dev = usb_info().ok_or(BlockError::NotReady)?;
+    let count = span_blocks(&dev, lba, buf.len())?;
+    let mut guard = XHCI_CONTROLLER.lock();
+    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    match xhci.storage_read10(lba as u32, count as u16) {
+        Ok(res) if res.status == CswStatus::Passed => {}
+        other => {
+            io_cause_witness("read-usb", lba, other);
+            return Err(BlockError::Io);
+        }
+    }
+    let src = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
+    unsafe { core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), buf.len()); }
+    Ok(buf.len())
+}
+
+/// MULTIBLK: the counted twin of [`write_block_usb`]. Same guard ladder as the single-block form —
+/// geometry re-read on every call, span bounded against `num_blocks`, a non-`Passed` CSW propagated
+/// as [`BlockError::Io`] so a write NEVER reports a false success.
+pub fn write_blocks_usb(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let dev = usb_info().ok_or(BlockError::NotReady)?;
+    let count = span_blocks(&dev, lba, buf.len())?;
+    let mut guard = XHCI_CONTROLLER.lock();
+    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    let dst = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
+    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()); }
+    match xhci.storage_write10(lba as u32, count as u16) {
+        Ok(res) if res.status == CswStatus::Passed => Ok(()),
+        other => {
+            io_cause_witness("write-usb", lba, other);
             Err(BlockError::Io)
         }
     }

@@ -422,6 +422,19 @@ pub fn log_summary_once() {
             BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed),
             x.storage_slot,
             x.slots[x.storage_slot as usize].route_string, x.slots[x.storage_slot as usize].route_depth);
+        // MULTIBLK: the transfer-size census, on its own line so the SUMMARY above stays
+        // byte-comparable with pre-arc captures. `single=` counts data stages still issued at one
+        // sector (partial-sector RMW head/tails, INQUIRY, READ CAPACITY, REQUEST SENSE); `multi=`
+        // counts the genuine multi-block transfers this arc creates. The ratio is the direct read of
+        // how much of the boot's I/O the coalescing actually caught; `maxlen=` proves the biggest TD
+        // that reached the wire, and `wrapped_tx=` is the ring-wrap population a TIMEOUT-SHAPE line's
+        // `wrapped=` must be read against.
+        serial_println!(
+            ":: BOT: tx single={} multi={} maxlen={} wrapped_tx={} rd_sectors={} wr_sectors={} max_blocks={} result=SIZES ::",
+            BOT_TX_SINGLE.load(Ordering::Relaxed), BOT_TX_MULTI.load(Ordering::Relaxed),
+            BOT_TX_MAXLEN.load(Ordering::Relaxed), BOT_TX_WRAPPED.load(Ordering::Relaxed),
+            BOT_TX_RD_SECTORS.load(Ordering::Relaxed), BOT_TX_WR_SECTORS.load(Ordering::Relaxed),
+            STORAGE_MAX_BLOCKS);
     }
 }
 
@@ -433,7 +446,7 @@ pub static mut ERST_TABLE: ErstTable = ErstTable { entries: [ErstEntry { ring_ad
 // Store Physical Address of the Event Ring for Runtime ERDP updates
 static mut EVENT_RING_PHYS_BASE: u64 = 0;
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// PIUSB-10: set true once USBSTS.CNR has been observed clear (in `init_interrupter`, immediately
 /// before the first op/runtime-register programming). `init_pointers` and `start` refuse to write
@@ -573,11 +586,81 @@ pub static BOT_RETRY_FAIL: AtomicU64 = AtomicU64::new(0);
 // CONDITION at runtime failed every subsequent command with nothing in the log saying why. The
 // exposure is real: the flight recorder writes ~64 KiB to the boot volume on every x86 boot.
 // (FRWRITE 2026-07-26 — that is NOT "a ~128-sector WRITE(10) burst", as this comment used to claim.
-// `scsi_data_buffer` is 512 bytes (see `configure_bulk_endpoints_sync`) and every block-layer caller
-// passes `blocks = 1`, so the recorder's 64 KiB is ~129 SEPARATE single-sector WRITE(10)s, each
+// `scsi_data_buffer` was 512 bytes (see `configure_bulk_endpoints_sync`) and every block-layer caller
+// passed `blocks = 1`, so the recorder's 64 KiB was ~129 SEPARATE single-sector WRITE(10)s, each
 // preceded by a single-sector READ(10) for the RMW, on top of the per-cluster zero-fills — several
-// hundred BOT transactions, not one burst. See usb_xhci.md §12.)
+// hundred BOT transactions, not one burst. See usb_xhci.md §12.
+//  MULTIBLK 2026-07-29 SUPERSEDES THE ARITHMETIC, NOT THE READING: the buffer is now 32 KiB
+//  (`STORAGE_DATA_BYTES`), `blocks` is a real count, and `fs/fat.rs` coalesces contiguous sector runs
+//  and skips the read on a full-sector overwrite. The same 64 KiB reservation is now a couple of
+//  dozen transactions rather than several hundred. The EXPOSURE ARGUMENT above is unchanged and
+//  still the reason this handler exists — fewer transactions is a smaller target, not no target.)
 // These counters stay at zero on a clean boot, so any non-zero reading is itself the finding.
+// --- MULTIBLK (2026-07-29): the storage data buffer, and why it is the size and alignment it is ---
+//
+// Until this arc the storage slot's `scsi_data_buffer` was 512 bytes, so the driver's maximum
+// transfer size was ONE sector and every block-layer caller was forced to pass `blocks = 1`. §12.1
+// of usb_xhci.md priced that: one flight-recorder reservation is ~730 separate BOT transactions and
+// ~1460 awaited Transfer Events, and since each awaited event is an independent chance to hit the
+// still-unexplained lost-completion wedge (mechanism M2), the amplification (M1) is what turns a
+// low per-transaction hazard into a certainty. Growing the buffer is the structural repair.
+//
+// SIZE — 32 KiB / 64 sectors. Two reasons, not one:
+//   * it is a whole 32 KiB FAT cluster on the sizes real sticks are formatted with, so
+//     `zero_cluster` and a cluster-aligned data write each become ONE transaction; and
+//   * the SCSI READ(10)/WRITE(10) transfer-length field is 16 bits of BLOCKS, so 64 is nowhere near
+//     a CDB limit — the limit we are choosing against is the DMA staging cost, not the protocol.
+//
+// ALIGNMENT — 64 KiB, deliberately larger than the buffer. xHCI 1.2 §4.11.7.1 requires that a
+// Normal TRB's data buffer NOT cross a 64 KiB boundary; a 32 KiB buffer aligned to 64 KiB cannot.
+// That is the whole point: it means the data stage stays EXACTLY the shape §12.2 audited and
+// cleared — ONE Normal TRB, one TD, one IOC completion event — for every transfer size up to the
+// buffer's capacity. §12.6's step 3 proposed a chained multi-TRB TD with the boundary split done by
+// hand, and called it "the only part with real xHCI risk"; over-aligning the buffer discharges that
+// risk instead of managing it. Do NOT raise STORAGE_DATA_BYTES above STORAGE_DATA_ALIGN without
+// reinstating the split, because at that point a single TRB CAN cross the boundary.
+/// Size of the per-slot SCSI data-stage staging buffer.
+pub const STORAGE_DATA_BYTES: usize = 32 * 1024;
+/// Alignment of that buffer — see above: it is the 64 KiB TRB-boundary rule, not a cache concern.
+pub const STORAGE_DATA_ALIGN: usize = 64 * 1024;
+/// The largest `blocks` count a single READ(10)/WRITE(10) may carry, i.e. what the staging buffer
+/// holds. The block layer publishes this to `fs/fat.rs` so callers chunk instead of guessing.
+pub const STORAGE_MAX_BLOCKS: u16 = (STORAGE_DATA_BYTES / 512) as u16;
+
+// --- MULTIBLK: M2 shape instrumentation ---
+//
+// M2 — the lost completion event — is still unexplained, and this arc does not claim to fix it.
+// What it CAN do is make the next metal capture able to characterise it, which was impossible while
+// every transfer was the same 512-byte single-TRB shape: with only one shape on the wire there is
+// nothing for a wedge to correlate WITH. Now that transfer sizes vary by two orders of magnitude,
+// these record the shape of the transaction the pump is waiting on, so a TIMEOUT line names it.
+/// Stage the pump is waiting on: 1 = DATA, 2 = CSW, 0 = none yet.
+static BOT_LAST_STAGE: AtomicU32 = AtomicU32::new(0);
+/// Direction of that stage: 0 = none, 1 = IN, 2 = OUT.
+static BOT_LAST_DIR: AtomicU32 = AtomicU32::new(0);
+/// Byte length of that stage's TD.
+static BOT_LAST_LEN: AtomicU32 = AtomicU32::new(0);
+/// Index within its transfer ring of the TRB the pump is waiting on.
+static BOT_LAST_TRB_IDX: AtomicU32 = AtomicU32::new(0);
+/// True if pushing that TRB wrapped the ring (i.e. a Link TRB was written and the cycle bit
+/// toggled immediately before it). `ring::TransferRing::push` returns index 0 exactly on a wrap,
+/// which is what this records — the direct test of "does the wedge correlate with a ring wrap?".
+static BOT_LAST_WRAP: AtomicBool = AtomicBool::new(false);
+/// Data stages issued at the legacy single-sector size (<= 512 B).
+pub static BOT_TX_SINGLE: AtomicU64 = AtomicU64::new(0);
+/// Data stages issued as a genuine multi-block transfer (> 512 B) — the count this arc creates.
+pub static BOT_TX_MULTI: AtomicU64 = AtomicU64::new(0);
+/// Largest data-stage byte length this boot ever put on the wire.
+pub static BOT_TX_MAXLEN: AtomicU64 = AtomicU64::new(0);
+/// Data-stage TRB pushes that landed on a ring wrap.
+pub static BOT_TX_WRAPPED: AtomicU64 = AtomicU64::new(0);
+/// Sectors moved by IN (read) data stages, and by OUT (write) data stages. `n=` counts pump WAITS
+/// (two per transaction), and `single=`/`multi=` count TRANSACTIONS; neither says how much data
+/// moved or which direction dominates. M2 is a write-path suspicion, so the read/write split is the
+/// first thing a metal capture wants to divide `timeouts=` against.
+pub static BOT_TX_RD_SECTORS: AtomicU64 = AtomicU64::new(0);
+pub static BOT_TX_WR_SECTORS: AtomicU64 = AtomicU64::new(0);
+
 /// REQUEST SENSE fetches issued from the runtime `Failed`-CSW path (one per Failed CSW handled).
 pub static BOT_SENSE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Sense-driven single retries that came back `Passed` — transactions this arc rescued.
@@ -759,6 +842,11 @@ pub enum BotError {
     TagMismatch,
     TransferError(u8),
     NoDevice,
+    /// MULTIBLK: the request itself was inadmissible — a `blocks` count of 0, or one larger than the
+    /// SCSI staging buffer can back (`STORAGE_MAX_BLOCKS`). Raised in `scsi_read10`/`scsi_write10`
+    /// BEFORE anything is built or queued, so unlike every other variant it is not a transport
+    /// fault and must not drag the pipe through Reset Recovery: it never reaches `bot_transfer`.
+    BadRequest,
 }
 
 /// A successful BOT transaction result (CSW decoded).
@@ -1029,7 +1117,7 @@ pub struct DeviceSlot {
     // descriptor_buffer / data_buffer so a CBW can't clobber descriptors or HID reports.
     pub cbw_buffer: Option<*mut u8>,       // 31-byte Command Block Wrapper
     pub csw_buffer: Option<*mut u8>,       // 13-byte Command Status Wrapper
-    pub scsi_data_buffer: Option<*mut u8>, // data-stage buffer (>= one block)
+    pub scsi_data_buffer: Option<*mut u8>, // data-stage buffer (MULTIBLK: STORAGE_DATA_BYTES, not one block)
     pub bulk_in_ep: u8,                    // bulk IN endpoint address (e.g. 0x81)
     pub bulk_out_ep: u8,                   // bulk OUT endpoint address (e.g. 0x02)
     /// bInterfaceNumber of the Mass-Storage (class 0x08, SCSI Bulk-Only) interface. This is the
@@ -4146,7 +4234,12 @@ impl XhciController {
             slot.cbw_buffer = Some(alloc::alloc::alloc_zeroed(cbw_layout));
             let csw_layout = core::alloc::Layout::from_size_align(64, 64).unwrap();
             slot.csw_buffer = Some(alloc::alloc::alloc_zeroed(csw_layout));
-            let data_layout = core::alloc::Layout::from_size_align(512, 64).unwrap();
+            // MULTIBLK: the data-stage staging buffer is STORAGE_DATA_BYTES (32 KiB), 64 KiB-ALIGNED.
+            // The alignment is not a cache-line choice — it is what keeps a single Normal TRB from
+            // ever crossing a 64 KiB boundary (xHCI 1.2 §4.11.7.1), so the audited one-TRB data stage
+            // stays valid at every size up to the buffer. See STORAGE_DATA_BYTES for the full note.
+            let data_layout =
+                core::alloc::Layout::from_size_align(STORAGE_DATA_BYTES, STORAGE_DATA_ALIGN).unwrap();
             slot.scsi_data_buffer = Some(alloc::alloc::alloc_zeroed(data_layout));
             slot.bulk_in_ep = in_addr;
             slot.bulk_out_ep = out_addr;
@@ -4649,7 +4742,7 @@ impl XhciController {
         //    completions post an event; wait for it to retire BEFORE queuing the CSW.
         if data_len > 0 {
             let data_out = matches!(dir, Direction::Out);
-            let (data_dci, data_trb_phys) = {
+            let (data_dci, data_trb_phys, data_trb_idx) = {
                 let ring = if data_out {
                     self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
                 } else {
@@ -4670,8 +4763,33 @@ impl XhciController {
                 dma_coherency::clean(data_phys as usize, data_len as usize);
                 let idx = ring.push(Trb { parameter: data_phys, status: data_len,
                     control: (1 << 10) | (1 << 5) | (1 << 2) }).unwrap_or(0);
-                (if data_out { out_dci } else { in_dci }, base + (idx as u64) * 16)
+                // MULTIBLK: `push` returns index 0 EXACTLY when it had to write the Link TRB and
+                // toggle the cycle bit, i.e. on a ring wrap. Recording that here is what lets a
+                // TIMEOUT line answer "did the lost completion sit on a wrapped ring?" — a question
+                // §12.2 could only argue about from the ring arithmetic (16 TRBs, 3 pushed per
+                // transaction, so ~every 5th transaction wraps) and never observe directly.
+                BOT_LAST_WRAP.store(idx == 0, Ordering::Relaxed);
+                if idx == 0 { BOT_TX_WRAPPED.fetch_add(1, Ordering::Relaxed); }
+                (if data_out { out_dci } else { in_dci }, base + (idx as u64) * 16, idx as u32)
             };
+            // MULTIBLK: shape of the TD the pump is about to wait on. Sizes now span 512 B .. 32 KiB,
+            // so a wedge that prefers one size or one direction becomes visible instead of invisible.
+            BOT_LAST_STAGE.store(1, Ordering::Relaxed);
+            BOT_LAST_DIR.store(if data_out { 2 } else { 1 }, Ordering::Relaxed);
+            BOT_LAST_LEN.store(data_len, Ordering::Relaxed);
+            BOT_LAST_TRB_IDX.store(data_trb_idx, Ordering::Relaxed);
+            if data_len > 512 {
+                BOT_TX_MULTI.fetch_add(1, Ordering::Relaxed);
+            } else {
+                BOT_TX_SINGLE.fetch_add(1, Ordering::Relaxed);
+            }
+            BOT_TX_MAXLEN.fetch_max(data_len as u64, Ordering::Relaxed);
+            let sectors = (data_len as u64) / 512;
+            if data_out {
+                BOT_TX_WR_SECTORS.fetch_add(sectors, Ordering::Relaxed);
+            } else {
+                BOT_TX_RD_SECTORS.fetch_add(sectors, Ordering::Relaxed);
+            }
 
             // Ring OUT to fetch+send the CBW; for an IN data stage also ring the IN ring.
             // (An OUT data stage rides the same OUT ring as the CBW, in order.)
@@ -4724,6 +4842,14 @@ impl XhciController {
             let ring = self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap();
             let base = ring.get_ptr();
             let idx = ring.push(Trb { parameter: csw_phys, status: 13, control: (1 << 10) | (1 << 5) }).unwrap_or(0);
+            // MULTIBLK: same shape record as the data stage. The CSW is ALWAYS 13 bytes IN, so a
+            // TIMEOUT reporting `stage=csw` rules transfer size OUT as the discriminator — which is
+            // itself a finding, and one a log with only one transfer shape could never make.
+            BOT_LAST_STAGE.store(2, Ordering::Relaxed);
+            BOT_LAST_DIR.store(1, Ordering::Relaxed);
+            BOT_LAST_LEN.store(13, Ordering::Relaxed);
+            BOT_LAST_TRB_IDX.store(idx as u32, Ordering::Relaxed);
+            BOT_LAST_WRAP.store(idx == 0, Ordering::Relaxed);
             base + (idx as u64) * 16
         };
         self.ring_doorbell(slot_id, in_dci as u32);
@@ -5638,6 +5764,28 @@ impl XhciController {
                     budget, elapsed, BOT_PUMP_PEAK.load(Ordering::Relaxed), sum,
                     if n != 0 { sum / n } else { 0 }, route, depth, slot,
                     n, BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed));
+                // MULTIBLK: the SHAPE of the transaction that did not complete, on its own line so
+                // the line above stays byte-comparable with every capture taken before this arc.
+                // M2 is still unexplained; this is the evidence that can bound it. Read it as:
+                //   stage=data + a large len  -> the wedge prefers big TDs (a controller/stick
+                //     boundary or burst problem, and the multi-block win would be trading M1 for M2);
+                //   stage=data + len=512      -> size is not the discriminator, and the amplification
+                //     cut is pure profit;
+                //   stage=csw                 -> the DATA phase landed and only the 13-byte status
+                //     event went missing, which points at the event ring, not the transfer;
+                //   wrapped=true on a timeout, against `wrapped=` in the SUMMARY line's population
+                //     rate, is the direct ring-wrap correlation test.
+                serial_println!(
+                    ":: BOT: pump shape stage={} dir={} len={} trb_idx={} wrapped={} single={} multi={} maxlen={} wrapped_tx={} result=TIMEOUT-SHAPE ::",
+                    match BOT_LAST_STAGE.load(Ordering::Relaxed) { 1 => "data", 2 => "csw", _ => "none" },
+                    match BOT_LAST_DIR.load(Ordering::Relaxed) { 1 => "in", 2 => "out", _ => "none" },
+                    BOT_LAST_LEN.load(Ordering::Relaxed),
+                    BOT_LAST_TRB_IDX.load(Ordering::Relaxed),
+                    BOT_LAST_WRAP.load(Ordering::Relaxed),
+                    BOT_TX_SINGLE.load(Ordering::Relaxed),
+                    BOT_TX_MULTI.load(Ordering::Relaxed),
+                    BOT_TX_MAXLEN.load(Ordering::Relaxed),
+                    BOT_TX_WRAPPED.load(Ordering::Relaxed));
                 return Err(BotError::Timeout);
             }
         }
@@ -5722,7 +5870,15 @@ impl XhciController {
     }
 
     /// SCSI READ(10) (0x28) of `blocks` blocks at `lba` into the storage data buffer.
+    ///
+    /// MULTIBLK: `blocks` is now a real count rather than a permanent 1. The CDB always encoded it;
+    /// what forbade it was the 512-byte staging buffer, which a `blocks > 1` transfer would have
+    /// overrun. The bound below is therefore a BUFFER bound, and it is checked here — at the one
+    /// place that turns `blocks` into a byte length — rather than trusted from callers.
     fn scsi_read10(&mut self, slot: u8, lba: u32, blocks: u16) -> Result<BotResult, BotError> {
+        if blocks == 0 || blocks > STORAGE_MAX_BLOCKS {
+            return Err(BotError::BadRequest);
+        }
         let data_phys = self.storage_data_phys(slot)?;
         let len = (blocks as u32) * 512;
         let cdb = [0x28, 0,
@@ -5732,7 +5888,12 @@ impl XhciController {
     }
 
     /// SCSI WRITE(10) (0x2A) of `blocks` blocks at `lba` from the storage data buffer.
+    /// MULTIBLK: same buffer bound as [`XhciController::scsi_read10`], and for the same reason —
+    /// a `blocks` the staging buffer cannot back is a refusal, never a truncated transfer.
     fn scsi_write10(&mut self, slot: u8, lba: u32, blocks: u16) -> Result<BotResult, BotError> {
+        if blocks == 0 || blocks > STORAGE_MAX_BLOCKS {
+            return Err(BotError::BadRequest);
+        }
         let data_phys = self.storage_data_phys(slot)?;
         let len = (blocks as u32) * 512;
         let cdb = [0x2A, 0,
@@ -5743,7 +5904,9 @@ impl XhciController {
 
     // ---- Public storage API used by the block layer / shell ----
 
-    /// Pointer to the storage slot's data buffer (one block).
+    /// Pointer to the storage slot's data buffer. MULTIBLK: this now addresses
+    /// [`STORAGE_DATA_BYTES`] bytes, not one block — the block layer stages up to
+    /// [`STORAGE_MAX_BLOCKS`] sectors here for a single READ(10)/WRITE(10).
     pub fn storage_data_ptr(&self) -> Option<*mut u8> {
         if self.storage_slot == 0 { return None; }
         self.slots[self.storage_slot as usize].scsi_data_buffer
