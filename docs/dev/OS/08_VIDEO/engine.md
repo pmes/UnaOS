@@ -4735,6 +4735,98 @@ this arc adds no call into `pump_and_poll`. (The compat-row exemption in the des
 belt-and-braces half of the same statement, for a *ring-3* full-screen app presenting through
 `SYS_FB_PRESENT` while the main drain does run.)
 
+## HITTEST-GEOM — the hit-test witness stops assuming an empty panel (2026-07-29)
+
+`hittest_selftest` passed on every QEMU gate and FAILED on the bench. s50, rMBP, 2880x1800:
+
+```
+[clickroute] hit-test at (962,465) inside=true topmost=true raise=true outside=false hidden=true -> FAIL
+[clickroute] route hit=true deliver=true depth=1/2 kernel=true desktop=true nofab=true -> PASS
+```
+
+Four legs held on silicon; only **outside** — "a point clear of both probe windows hits nothing" —
+failed, and only at bench geometry.
+
+### The cause is the FIXTURE, and `wm::hit_test` is exonerated
+
+The fixture derived its miss point arithmetically: probe origin `(pw/3, ph/4 + TITLE_H + BORDER)`,
+plus `8 * scale + BORDER + 4` on both axes. At 2880x1800 that is roughly `(1029, 532)` — which is
+inside the console WINDOW, 1314x750 centred at `(783, 444)` on that panel. `hit_test` answered
+correctly: that pixel belongs to the console row, so it is not a miss. The leg asserted a fact about
+the panel that stopped being true in CLICK-X86.
+
+Why it held before: `hit_test` skips owner-0 rows, and before CLICK-X86 every piece of kernel
+furniture carried owner 0. Everything but an app window read as a miss, so a point offset from the
+fixture's own origin was unowned **by construction** and no search was needed. CLICK-X86 gave the
+console and the desktop demo owners in the reserved band and made them hittable — deliberately, so
+the operator can click them — and that invariant died with the change. The sibling
+`clickroute_selftest` was written in that same arc and already FINDS its desktop point on the live
+table, reporting `skip` when the panel leaves none; the hit-test witness predates it and kept its
+constant. That is the whole of the difference between the two.
+
+Why QEMU never saw it: `wcx::activate` runs only from the Kepler display takeover, so on the QEMU x86
+gate neither the console window nor the desktop demo row exists at all. The gate panel is bare, every
+derived point is unowned, and the leg passes for a reason that has nothing to do with the leg. (The
+CLICK-X86 r2 note above says the x86 gate line was taken "with the console window live in the table";
+that was wrong — it is live on the bench, never on the gate.)
+
+`hit_test` itself needs no change. It converts a non-negative `i32` to `usize`, mirrors `outer_box`'s
+saturation on both edge sums, and has no stride, `i32` boundary or wrap-around exposure at any panel
+size — 2880x1800 is nowhere near a `usize` edge. It is arch-neutral shared code and is untouched by
+this arc, so the pi seat inherits nothing from it.
+
+### The fix
+
+The miss point is now FOUND, not computed: the historical diagonal point first (so a bare panel probes
+the pixel it always did), then the four panel corners inset 2 px, and the leg reports `outside=skip`
+with the chosen point printed as `miss=(x,y)` if the live panel leaves nothing unowned. Two properties
+keep the search from making the leg circular:
+
+* it runs **before** the probe rows are created, so the only thing it can reject is a point some REAL
+  window owns — a probe row cannot influence the choice;
+* candidates inside the probe box are rejected **arithmetically**, from `spawn_geometry`, not by
+  asking `hit_test`.
+
+What the leg then asserts — still a miss with both probe rows up and A raised — is a claim about the
+probe rows, which is what it was always meant to be. Raising A cannot lower anything, so a point
+unowned at search time stays unowned unless a probe claims it.
+
+### Proof of geometry-independence
+
+The x86 panel is drivable from the harness with no source change:
+`UNAOS_QEMU_EXTRA="-vga none -device VGA,xres=W,yres=H,vgamem_mb=N"`. A bench-shaped panel was
+simulated by opening one pinned kernel-owned window at 7/8 of the panel, centred — the console
+window's own shape — in a throwaway build.
+
+| panel | furniture | before | after |
+|---|---|---|---|
+| 1280x800 | none | `outside=true` PASS | `outside=true miss=(463,250)` PASS |
+| 1920x1200 | none | `outside=true` PASS | `outside=true miss=(677,350)` PASS |
+| 2880x1800 | none | `outside=true` PASS | `outside=true miss=(1029,532)` PASS |
+| 1280x800 | console-sized | `outside=false` **FAIL** | `outside=true miss=(2,2)` PASS |
+| 2880x1800 | console-sized | `outside=false` **FAIL** | `outside=true miss=(2,2)` PASS |
+
+The 2880x1800 occupied row reproduces the bench line exactly, probe point and all:
+`[clickroute] hit-test at (962,465) inside=true topmost=true raise=true outside=false hidden=true -> FAIL`.
+The verdict is now the same at every geometry, occupied or bare, which is what a trustworthy fixture
+owes.
+
+### Gate results (HITTEST-GEOM, 2026-07-29, QEMU)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
+* `UNAOS_WC=1 ./arroyo test 90` — **0 FAIL**, `[clickroute] hit-test ... -> PASS` and
+  `[clickroute] route ... -> PASS`; measured baseline at `693e097f` was the same set with the
+  pre-fix `hit-test` line.
+* `./arroyo test-arm 22` — banner `:: AARCH64 build: witness=on ... ::` present, **0 FAIL**; the
+  arm gate emits no `[clickroute]` line at all (the battery's aarch64 driver does not reach the
+  hit-test witness inside the gate window), so that gate is byte-inert across this change.
+
+**Shared-code note for the pi seat.** `hittest_selftest` IS driven on aarch64
+(`arch/aarch64/syscall.rs`, after `wci_rollup`), so this is a shared-fixture change, not an x86-only
+one: on a panel where the aarch64 side has kernel furniture in the table, the witness now finds its
+miss point instead of assuming one, and its wire line gains a `miss=(x,y)` field. `wm::hit_test`
+itself is untouched — there is no routing behaviour change on either arch.
+
 ### Gate results (CLICK-X86 r2, 2026-07-29, QEMU)
 
 * `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
