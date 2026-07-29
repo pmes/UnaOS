@@ -4682,6 +4682,21 @@ machinery that has been sitting there since CURSOR-3, unchanged:
   composite, so the arrow's save-under is taken against a front buffer whose desktop is already
   final. Window pixels under the arrow may still change during the composite that follows — and that
   is precisely the case the pend/adopt path exists to settle, per pixel, against the finished front.
+* **Why the close is `repaint()` and MUST NOT be "simplified" to `ensure_drawn()`** (cross-seat
+  finding, both implementations converged on this the hard way): after `flush`'s leading `undraw()`
+  the sprite is down, so on the common path the two closes look interchangeable. The case that
+  separates them is a pointer report landing on another core *between* the undraw and the close:
+  `ensure_drawn` would then find `drawn == true` and return — leaving a save-under captured
+  MID-BLIT, stale by construction, for a later undraw to restore into a live rect. `repaint`
+  re-takes the save-under unconditionally. (Corollary: the "CURSOR-9 mends sooner" note below is
+  the concurrent-redraw case specifically — on the quiet path `repaint`'s internal undraw returns
+  early and its repair damages nothing.)
+* **Why plan-before-blit (the rejected variant B) stays dead**: a plan captured before
+  `present_background` describes a panel the desktop blit then partially destroys, and adopt/settle
+  would settle against a "finished front" that no longer contains the sprite the plan promised —
+  the WC-L/P64 interleave re-entering by a new route, invisible to the epoch check because the
+  epoch is unchanged across a desktop blit. It trades a recoverable failure (blinky arrow) for an
+  unrecoverable one (`[wc-d] FAIL`) to save nothing.
 * **CURSOR-9 / `TOUCHED_SINCE_DRAW`.** Untouched, and now actually exercised on this path: a present
   landing under a live sprite arms the repair through `note_present_over_sprite`, and there is at
   last a live sprite for it to arm for. The colour-guard residual is repaired *sooner* than before,
