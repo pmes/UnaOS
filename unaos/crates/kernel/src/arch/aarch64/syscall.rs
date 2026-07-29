@@ -3908,6 +3908,11 @@ pub fn clear_handle_row(asid: u64) {
     // rest of the boot. It is deliberately NOT inside `clear_input_row`, whose other caller is a focus
     // arrival: see `clear_input_parked`.
     clear_input_parked(asid);
+    // VUGMIN-C: and the resume-print pacing counter, for the ordinary recycle reason — the next tenant of
+    // this slot must get its own first/second `[vugpause2] resume` lines printed rather than inheriting a
+    // departed program's cadence and going quiet until the count next hits a power of two. Pacing state
+    // only; the cumulative `EL0_INPUT_WAKES` the rollup reports is boot-scoped and stays.
+    clear_input_resumes(asid);
     // INROUTE: this CAS is a FOCUS REVOCATION, and it is asynchronous with respect to whoever currently
     // holds focus — it fires on the dying slot's core the instant that slot tears down. Count it. The
     // count is the evidence line for the one race this seam can lose an event to: a router pass that
@@ -11735,6 +11740,23 @@ static EL0_INPUT_WAKES: AtomicU64 = AtomicU64::new(0);
 /// counter can witness that the restore chain was REACHED. Read by [`el0_input_wake_edges`].
 static EL0_INPUT_WAKE_EDGES: AtomicU64 = AtomicU64::new(0);
 
+/// VUGMIN-C: per-slot count of NAMED-EDGE resumes (`focus` / `unhide`) this ASID has actually taken.
+///
+/// Exists only to pace `el0_input_wake_edge`'s print — the aggregate that the `[vugpause2]` rollup
+/// reports is `EL0_INPUT_WAKES` above and is unaffected by anything here. Per-ASID rather than global
+/// because the question the line answers ("did THIS vug resume, or is it stranded?") is per-ASID: a
+/// global cadence would let a busy vug's traffic silence a newly launched one's first resume.
+static EL0_INPUT_RESUMES: [AtomicU64; super::boot::USER_SLOTS + 1] =
+    [const { AtomicU64::new(0) }; super::boot::USER_SLOTS + 1];
+
+/// VUGMIN-C: drop `asid`'s resume-print pacing count. Called from slot teardown ONLY — the count paces a
+/// witness line across a whole tenancy, so nothing on the running path may reset it.
+fn clear_input_resumes(asid: u64) {
+    if asid != 0 && asid as usize <= super::boot::USER_SLOTS {
+        EL0_INPUT_RESUMES[asid as usize].store(0, Ordering::Relaxed);
+    }
+}
+
 /// VUGPAUSE-2: the synthetic futex key for ASID `asid`'s input ring.
 ///
 /// `sys_futex`'s user keys are PHYSICAL ADDRESSES of EL0 words, and on this SoC a PA is < 2^40; bit 63
@@ -11772,6 +11794,17 @@ fn el0_input_wake(asid: u64) -> usize {
 ///
 /// This is the witness that distinguishes the two P72 outcomes on wire. A stranded vug produces a
 /// `[clickroute] press hit` with no `[vugpause2] resume` after it; a resumed one produces the pair.
+///
+/// VUGMIN-C / P73 wire hygiene — **the line is thinned; the counters are not.** "Operator rate" was too
+/// generous a description: one focus change fired 6-12 of these from inside the input path, on several
+/// cores, and the P73 capture shows the UART overrun mid-line in exactly those bursts
+/// (`resu<e7>sid=1`, `[f8>fv]`, `<fu>pause2]`) — a corrupted witness that also blocks the press path for
+/// tens of milliseconds while it corrupts. So the print is now on a per-ASID POWER-OF-TWO cadence: the
+/// 1st, 2nd, 4th, 8th, … resume for a given ASID prints, the rest are silent. Every resume is still
+/// counted — `EL0_INPUT_WAKES` (the `[vugpause2] blocked=/wakes=` rollup) is untouched, and the printed
+/// line now carries `n=`, that ASID's exact cumulative resume count, so a reader can subtract across two
+/// lines and know how many were elided. The first two resumes of every ASID print, which is what the
+/// "was this vug stranded or resumed?" read actually needs; a flood is what it does not.
 fn el0_input_wake_edge(asid: u64, edge: &str) -> usize {
     if asid == 0 || asid as usize > super::boot::USER_SLOTS {
         return 0;
@@ -11792,7 +11825,13 @@ fn el0_input_wake_edge(asid: u64, edge: &str) -> usize {
     if n != 0 {
         EL0_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
         if !edge.is_empty() {
-            serial_println!("[vugpause2] resume asid={} edge={} woken={}", asid, edge, n);
+            let seen = EL0_INPUT_RESUMES[asid as usize].fetch_add(1, Ordering::Relaxed) + 1;
+            if seen.is_power_of_two() {
+                serial_println!(
+                    "[vugpause2] resume asid={} edge={} woken={} n={}",
+                    asid, edge, n, seen
+                );
+            }
         }
     }
     n

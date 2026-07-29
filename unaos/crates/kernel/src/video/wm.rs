@@ -343,11 +343,19 @@ fn vugmin_publish(asid: u64, hidden: bool) {
 
 /// VUGMIN-B — snapshot, for every live owner in the table, whether that owner is now hidden.
 ///
-/// Returns the filled prefix length of `out`. Taken under `TABLE` by [`focus_changed`] right after the
-/// z-order has moved, and applied through [`vugmin_publish`] once the guard is dropped: recomputing the
-/// predicate for EVERY owner (rather than only the ones this call touched) is what makes both arms of
-/// the focus change one code path, and what keeps the answer a function of the table's actual state
-/// instead of of the arm that got there.
+/// Returns the filled prefix length of `out`. Taken under `TABLE` by [`focus_changed`]'s **SHELL arm**
+/// right after the z-order has moved, and applied through [`vugmin_publish`] once the guard is dropped.
+///
+/// VUGMIN-C — **this is the shell arm's scan and only the shell arm's.** It used to serve both arms, on
+/// the reasoning that a predicate recomputed for every owner is a function of the table rather than of
+/// the code path that reached it. That reasoning is right about the SHELL arm (`focus_changed(0)` moves
+/// `SHELL_Z` above everything, so every owner's answer really does change in one step) and wrong about a
+/// RAISE: raising one window changes exactly one owner's z, but the scan re-published `hidden=false` for
+/// every owner still sitting above `SHELL_Z` — i.e. for every window ever raised since the last shell
+/// TAB. On the P73 bench wire one `[clickroute] press hit asid=4` produced `[vugpause2] resume` with
+/// `edge=unhide` for two OTHER address spaces, and a six-vug fleet stayed lit on all four cores forever.
+/// The raise arm now publishes the TRANSITION instead (see [`focus_changed`]); this function keeps the
+/// whole-table shape because "the shell took the top, everyone is under it" is genuinely whole-table.
 fn vugmin_scan(t: &Table, shell: u32, out: &mut [(u64, bool); MAX_WINDOWS]) -> usize {
     let mut n = 0usize;
     for r in t.rows.iter() {
@@ -361,6 +369,22 @@ fn vugmin_scan(t: &Table, shell: u32, out: &mut [(u64, bool); MAX_WINDOWS]) -> u
         n += 1;
     }
     n
+}
+
+/// VUGMIN-C — does `asid` still own a live, non-compat window?
+///
+/// The raise arm's hide of the PREVIOUS focus holder is gated on this, and the gate is not cosmetic. A
+/// vug that exited while focused has had its hidden bit cleared by `boot::teardown_user_slot` on the way
+/// out; publishing `hidden=true` for it afterwards would leave a set bit on a free slot, and the next
+/// tenant of that ASID would come up permanently idle with nothing left to unhide it. Owners that still
+/// have a window are the only ones a focus change has anything true to say about.
+///
+/// Caller holds `TABLE`. One scan of eight rows; ASID 0 (shell / compat) is never an answer.
+fn owner_live(t: &Table, asid: u64) -> bool {
+    asid != 0
+        && t.rows
+            .iter()
+            .any(|r| r.used && !r.compat && r.owner_asid == asid)
 }
 
 /// Create a window owned by `owner_asid` over the caller's ARGB8888 surface at `surf` (EL1-visible
@@ -1061,6 +1085,13 @@ pub fn hit_test(x: i32, y: i32) -> Option<(WinId, u64, u32)> {
 ///   desktop colour immediately, and the desktop is asked for a whole-panel present so the console's
 ///   text comes back over the erase. That is the "TAB to the shell, then read your command's output"
 ///   case, and it is a z-order fact rather than a special case.
+/// * **VUGMIN-C — a raise publishes a TRANSITION, not a census.** The arriving owner is unhidden (the
+///   wake edge that restarts a parked vug) and the departing one is hidden; every other owner's hidden
+///   bit is left alone. Only the shell arm speaks for the whole table. The semantic that falls out is
+///   the bench's: one vug runs — the focused one — and the rest stay frozen in place, visible and
+///   static, until they are clicked or TABbed back. Before this, a raise re-published `hidden=false` for
+///   every owner above `SHELL_Z`, so focusing any one window un-minimized the entire stack and the whole
+///   fleet rendered forever (P73).
 /// * **Both ends repaint.** The raise marks the affected windows damaged and composites, so the change
 ///   is on the panel before this returns rather than at the focused app's next present — which, for a
 ///   window whose app is idle or blocked in a read, might be never.
@@ -1085,10 +1116,12 @@ pub fn focus_changed(asid: u64) {
     // Boxes of windows this call pushed BELOW the shell — the pixels the console is about to own.
     let mut hidden = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut nhidden = 0usize;
-    // VUGMIN-B — (owner asid, is it now hidden) for every live owner, snapshotted under the table lock
-    // below and published to the syscall layer after the guard drops. See [`vugmin_scan`].
+    // VUGMIN-B/C — (owner asid, is it now hidden) pairs, built under the table lock below and published
+    // to the syscall layer after the guard drops. The SHELL arm fills this from [`vugmin_scan`] (every
+    // owner, all hidden); the RAISE arm fills in the TRANSITION only — `marks[0]` is the arriving owner,
+    // `marks[1]` (when `nmarks == 2`) the departing one. See [`vugmin_scan`].
     let mut marks = [(0u64, false); MAX_WINDOWS];
-    let nmarks;
+    let mut nmarks = 0usize;
 
     // FOCUS-HL: take the focus owner BEFORE the table lock, so the composite at the end of this call
     // already draws the new highlight. The window that is LOSING focus must be repainted too — the raise
@@ -1138,16 +1171,33 @@ pub fn focus_changed(asid: u64) {
                 raised += 1;
             }
         }
-        // VUGMIN-B — the z-order is now final for this focus change, so this is the one moment the
-        // hidden predicate has a settled answer. Snapshot only; the publication is outside the guard.
-        nmarks = vugmin_scan(&t, SHELL_Z.load(Ordering::Acquire), &mut marks);
+        // VUGMIN-B/C — the z-order is now final for this focus change, so this is the one moment the
+        // hidden state has a settled answer. Snapshot only; the publication is outside the guard.
+        if asid == 0 {
+            // SHELL arm: the shell took the top of the stack, so EVERY owner is under it and the
+            // whole-table scan is the honest answer. Unchanged from VUGMIN-B.
+            nmarks = vugmin_scan(&t, SHELL_Z.load(Ordering::Acquire), &mut marks);
+        } else {
+            // RAISE arm (VUGMIN-C): publish the TRANSITION and nothing else. The arriving owner
+            // unhides — that is the wake edge VUGPAUSE-2r2 exists to deliver, and it must still fire.
+            // The departing owner hides, joining the rest of the stack: it keeps its pixels and its z
+            // (it is not moved below `SHELL_Z`; the fleet is tiled and genuinely on-screen), it simply
+            // stops being told to render, so it freezes in place, visible and static, until it is
+            // clicked or TABbed back. Every OTHER owner's bit is left exactly as it was — an owner the
+            // shell arm hid stays hidden until it is itself raised.
+            marks[0] = (asid, false);
+            nmarks = 1;
+            if prev != asid && owner_live(&t, prev) {
+                marks[1] = (prev, true);
+                nmarks = 2;
+            }
+        }
     }
 
-    // VUGMIN-B — tell the syscall layer who is hidden now. `TABLE` is dropped: `set_hidden` takes no
+    // VUGMIN-B/C — tell the syscall layer who is hidden now. `TABLE` is dropped: `set_hidden` takes no
     // lock (atomics + one `u32` info-page store), so this is a convention rather than a necessity, but
-    // it is the file's convention. Both directions come from the same scan — the shell arm hides every
-    // owner at once, a raise unhides exactly the owner it raised, and an owner whose state did not
-    // change is republished with the value it already had.
+    // it is the file's convention. The shell arm hides every owner at once; a raise publishes at most
+    // two rows, the owner arriving and the owner leaving, and says nothing at all about the rest.
     for &(asid, hid) in marks[..nmarks].iter() {
         vugmin_publish(asid, hid);
     }
@@ -1174,6 +1224,25 @@ pub fn focus_changed(asid: u64) {
             "[wc-fv] focus raise asid={:#x} windows={} top_win={} z={} shell_z={}",
             asid, raised, first_id, newz, shell_z()
         );
+    }
+    // VUGMIN-C — and WHAT THE HIDDEN BIT DID, on the same breath as the raise it belongs to. The whole
+    // defect this replaced was invisible on the wire from `wm`'s side: the only trace was N
+    // `[vugpause2] resume ... edge=unhide` lines appearing in the syscall layer for ASIDs nobody had
+    // focused. One line per focus change, at operator rate, that names the transition and asserts the
+    // scope: exactly one unhide, at most one hide, nothing else published.
+    #[cfg(feature = "witness")]
+    if asid != 0 {
+        if nmarks == 2 {
+            serial_println!(
+                "[vugmin] focus asid={:#x} unhid=1 hid=asid={:#x} others=untouched",
+                asid, marks[1].0
+            );
+        } else {
+            serial_println!(
+                "[vugmin] focus asid={:#x} unhid=1 hid=none others=untouched",
+                asid
+            );
+        }
     }
     let _ = (raised, first_id, newz);
     // WEDGE-2 `<F6>` — the `[wc-fv]` line above is the LAST thing every recorded wedge printed, so
@@ -4237,6 +4306,16 @@ pub fn focusvis_selftest() {
         got_stack, stack_ok, got_raise, raise_ok, got_shell, shell_ok, got_reraise, reraise_ok,
         if ok { "PASS" } else { "FAIL" }
     );
+
+    // VUGMIN-C — one more raise, purely to EXERCISE the transition the four legs above cannot reach.
+    // Every focus change in this fixture so far arrives from the shell (`prev == 0`), so every
+    // `[vugmin] focus` line it prints says `hid=none`. This one goes window→window with both owners
+    // live, which is the shape the arc is about, and puts `hid=asid=<b>` on the headless wire. It
+    // asserts no pixel — the panel claim is the four legs' — and it is deliberately AFTER the verdict
+    // line so it can perturb none of them. Both windows are closed on the next two lines, so the extra
+    // raise leaves nothing behind. (`vugmin_publish` no-ops for these synthetic ASIDs: 0xF0A/0xF0B are
+    // outside the 64-wide hidden mask, so this moves no real process's bit, only the witness.)
+    focus_changed(ASID_A);
 
     close(wa);
     close(wb);

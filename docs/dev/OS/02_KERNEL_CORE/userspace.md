@@ -2348,6 +2348,8 @@
     arm therefore hides every owner because every owner *is* below the new `SHELL_Z`, and a raise unhides
     the owner it raised because that owner is now above it. The published value is a function of the
     table's actual state rather than of the code path that reached it.
+    **Superseded by VUGMIN-C for the raise arm** — the paragraph above is why it was written that way and
+    why exactly half of it was wrong; see below.
   - **The quantifier is per-owner and all-or-nothing.** `owner_hidden(asid)` is true only when EVERY
     live, non-compat window that ASID owns sits below `SHELL_Z` — an app with one window still on the
     panel is not hidden however many of its others are buried, which matters because the focus ring is
@@ -2384,6 +2386,48 @@
     nothing ever TABs to the shell, so all three counters are 0 there and the line's honest claim is
     "wired, and nothing hid by accident" — the number that carries the arc is `hides > 0` on the bench.
     The 300-frame `checksum=0xe68285b85121ac7c` is byte-identical across B, as predicted.
+
+- **VUGMIN-C (a raise publishes a transition, not a census)** — B's "one predicate, both arms" is right
+  about the shell arm and wrong about a raise, and P73 on the bench is what the difference costs. The
+  shell arm really is whole-table: `focus_changed(0)` puts `SHELL_Z` above everything, so every owner's
+  answer changes in one step. A RAISE changes exactly one owner's z — but `vugmin_scan` re-published
+  `hidden=false` for **every** owner still above `SHELL_Z`, which after any prior raise is the entire
+  stack. So a single TAB or click into one vug un-minimized all of them. On the P73 wire one
+  `[clickroute] press hit asid=4` is followed by `[vugpause2] resume … edge=unhide` for two OTHER
+  ASIDs (p73 L6523-6525), and a six-vug fleet stayed lit on all four cores for ~500 s with no operator
+  input and no decay (`c1=c2=c3=99%`, ~795k ctx/window). The defect shipped with B and was INERT until
+  VUGPAUSE-2r2 made the unhide edge able to reach a parked task.
+  - **The raise arm now publishes at most two rows.** The arriving owner unhides; the owner that just
+    lost focus hides; every other owner's bit is untouched. `vugmin_scan` is kept, unchanged, for the
+    shell arm alone.
+  - **The departing owner is NOT moved below `SHELL_Z`.** Its z and its pixels stay exactly where they
+    are — the fleet is tiled at non-overlapping positions and is genuinely on-screen, and this arc does
+    not pretend otherwise. What changes is only what the owner is TOLD: it stops rendering and parks, so
+    it freezes in place, visible and static, until it is clicked or TABbed back. That is the bench
+    semantic of record — only the focused vug runs — and it makes P69's "if a vug is minimized it should
+    shut off" apply to the raise path as well as the hide path.
+  - **The hide is gated on `owner_live`.** An ASID with no live, non-compat window is never marked
+    hidden on the way out: a vug that exited while focused has already had its bit cleared by
+    `boot::teardown_user_slot`, and re-setting it would leave a set bit on a free slot whose next tenant
+    would come up permanently idle with nothing left to unhide it.
+  - **The VUGPAUSE-2r2 wake edges are intact.** The unhide for the newly focused owner is exactly the
+    edge that restarts a parked vug, and it still fires on every raise; only the unhides for owners
+    nobody focused are gone.
+  - **Witness:** `[vugmin] focus asid=<a> unhid=1 hid=asid=<b> others=untouched` (or `hid=none` when
+    focus arrived from the shell or did not move), one line per raise beside `[wc-fv] focus raise`. The
+    old behaviour was invisible from `wm`'s side — its only trace was N `edge=unhide` resumes in the
+    syscall layer for ASIDs nobody had focused — so the scope is now asserted where it is decided.
+  - **Wire hygiene, same arc.** `[vugpause2] resume` fired 6-12 times per focus change from inside the
+    input path, on several cores, and the P73 capture shows the UART overrun mid-line in exactly those
+    bursts (`resu<e7>sid=1`, `[f8>fv]`, `<fu>pause2]`). The print is now paced per ASID on powers of two
+    (1st, 2nd, 4th, 8th, …) and carries `n=<cumulative resumes for this ASID>` so elisions are
+    countable. **Counters are unchanged** — `EL0_INPUT_WAKES`, and therefore the `[vugpause2]
+    blocked=/wakes=` rollup, still counts every resume. The pacing counter is per-ASID (a global cadence
+    would let a busy vug silence a newly launched one's first resume) and is reset only by slot teardown.
+  - **Headless gate:** unchanged. `[wc-fv] focus-vis`'s four legs are framebuffer read-backs of z-order
+    and this arc moves no window; its synthetic ASIDs (`0xF0A`/`0xF0B`) are outside the 64-wide hidden
+    mask, so `vugmin_publish` no-ops for them as it always did, and `[vugmin] wm … -> DORMANT` still
+    holds with no HID to TAB with.
 
 - **VUGPAUSE-2 (an idle vug leaves the run queues)** — VUGPAUSE and VUGMIN stopped an idle vug from
   RENDERING; they did not stop it from RUNNING. What they left is a **yield-polling floor**: the idle loop
