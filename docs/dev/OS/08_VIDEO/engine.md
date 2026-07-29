@@ -4478,6 +4478,11 @@ reading there and cannot move. The gate proves no-regression only. The verdict i
 
 * **`[cursor12] nosprite` still ≈ `passes` with the pointer live over a window** — the fix did not
   take; look for a second bracket around a flush site.
+  **Superseded by CURSOR-14 — this watch item as written cost three sittings.** Before CURSOR-14 the
+  first `[cursor12] scope=live` block of a boot fired on the operator's first pointer report and
+  reported cumulative counters, so it covered only the era *before* the sprite existed and read
+  `nosprite = passes` on any kernel whatsoever. Read this item only against a block whose
+  `passes < cum`; see the CURSOR-14 section below.
 * **`[cursor6] desktop_over` > 0** — the narrowed desktop bracket has a hole; the desktop is erasing
   the arrow at flush rate.
 * **`[cursor11] px_deferred` > 0 with `px_installed + px_redrawn` lagging it persistently** — the
@@ -4759,3 +4764,224 @@ x86 wire lines, this arc:
   `MISSION SUCCESS` present.
 * `./arroyo test-arm 22` — **`MISSION SUCCESS`**, 0 FAIL. aarch64 is byte-inert: the code diff is one
   file under `arch/x86_64/`.
+
+---
+
+## CURSOR-14 — the instrument was the defect: `nosprite` measured the era before the sprite existed
+
+### What was asked, and why the question was wrong
+
+CURSOR-13 landed on both arches. The next attended x86 boot (s50, kernel with CURSOR-13 aboard) put
+this on the wire:
+
+```
+[cursor] armed x=1433 y=900
+[cursor12] offer scope=live passes=69 nosprite=69 nohit=0 reserved=0 nosession=0 planned=0 excl_probe=0 excl_unverified=0 -> nosprite
+[cursor6] rollup scope=live present_over=0 masked=0 repaired=0 desktop_over=0 mismatch=0 uncover_lost=0/0 -> UNWITNESSED
+```
+
+Read against GR7 s48 (42/42) and s49 (47/47) this says "CURSOR-13 changed nothing measurable", and
+the arc was opened as a refutation on silicon: find the second bracket that is still starving the
+composite.
+
+**There is no second bracket on the hot path. The three readings are the same measurement artefact,
+and it is the only thing those numbers could ever have said.**
+
+### The proof, from the capture itself
+
+Two facts about the instrument, both in the tree before this arc:
+
+1. **`pal::cursor::rollup_tick` fired on the FIRST pointer report of the boot.** `ROLLUP_LAST_MS`
+   starts at 0 and the limiter read `if last != 0 && now - last < ROLLUP_EVERY_MS { return }`, so a
+   zero fell straight through to the print.
+2. **Every `[cursor12]` term was a running total since boot**, loaded and printed raw, never
+   snapshotted.
+
+Compose them. `move_rel` runs `touch()` → `set_clamped` → `repaint_on_move()`, and `repaint_on_move`
+is `cursor::repaint()` *then* `rollup_tick()`. On the first report of a boot the `repaint` draws the
+sprite for the first time — emitting `[cursor] armed` — and the very next call prints a block
+covering every composite that ran **before that draw**. During all of them `sp.drawn == false`, so
+`cursor::sprite_plan()` returns `None` by construction. `nosprite == passes` is not a finding; it is
+arithmetic.
+
+The tell is visible in the capture without reading any code: **`[cursor] armed` sits immediately
+above the block, because both lines come from the same pointer report.** 42, 47 and 69 are not a rate
+that failed to move — they are three boots' worth of pre-pointer composite totals, and they differ
+from each other exactly as much as three boots differ.
+
+The debt did not clear on the next block either. With ~40–70 boot-era passes permanently in the
+numerator and a sitting adding ~14 passes/s, `nosprite * 2 >= passes` — the verdict's own predicate —
+stays true for the first ten-odd seconds of continuous motion **whatever the mechanism is doing**.
+
+### Consequence for the cross-seat record
+
+The previous executor's call-graph analysis — *"after CURSOR-13 our x86 path has exactly one
+caller-side bracket left, `pal::TargetPal::render`, and its `undraw` … `ensure_drawn` is an
+idempotent close that cannot re-starve the composite"* — **was correct.** What was wrong was the
+inference drawn from the wire against it. The failure was not in the reasoning about the code; it was
+in treating a structurally-pinned counter as evidence.
+
+The same applies backwards. **P74's original `nosprite ≈ passes` reading on GR7 s48 was a first-block
+reading too**, so the evidence that motivated CURSOR-13 was the identical artefact. CURSOR-13's
+*argument* stands on its own — a bracket that spans a composite does starve `sprite_plan()`, and the
+call graph says so without any counter — but its *measurement* never demonstrated the effect it
+claimed. Neither seat has yet seen a valid `nosprite` sample. This arc is what makes one possible.
+
+The operator's own words on the same s50 boot are the independent corroboration:
+**"mouse makes it over the top of everything now."** The arrow is on glass above window content. The
+instrument was simply unable to say so.
+
+### The composite call-site table (x86), with the sprite's state at entry
+
+`wm::composite()` is private-by-design behind `composite_inner`; every path below reaches it.
+
+| # | Call site | Reached on x86 from | Sprite at entry | Why |
+|---|---|---|---|---|
+| 1 | `Screen::flush` → `wm::service_damage` → `composite` | `pal::TargetPal::render`, every console-loop pass | **UP** | CURSOR-13: `flush`'s `repaint()` runs before the composite. Early-returns on an undamaged table. |
+| 2 | `Screen::flush` → `wm::repaint` → `composite` | same, intrusion fallback only | **UP** | Same bracket, same close. `[wc-i] intrusions=0` says this arm is not taken. |
+| 3 | `fbcon::route_present_rows` → `wm::present_rows` → `present_banded` → `composite` | **every routed console line** (FBCON-DMG) | **UP**, and this is the volume path when the console is not suspended | The print path takes no cursor bracket of its own. Suspended entirely while an INSTGUI dialog is open. |
+| 4 | `arch::x86_64::syscall` window-present verb → `wm::present` | EL0 `SYS_WIN_PRESENT` | **UP** | Syscall context; no bracket anywhere above it. |
+| 5 | `instgui::repaint` → `wm::present` | dialog state change / keypress only | **UP** | Ordinary `wm::present`. **No special path** — see below. |
+| 6 | `wcx::activate` → `wm::present` / `create_at` | once, from PCI enumeration | DOWN, harmlessly | `wcx.rs:193` undraws before its one-shot `fill_screen`. Runs before the sprite has ever existed, so the undraw is a no-op. |
+| 7 | `wm::create_at` / `create_inner` → `composite` | window creation | **UP** | No caller-side bracket. |
+| 8 | `wm::focus_changed` → `composite` | focus raise | **UP** | No caller-side bracket. |
+| 9 | `wm::move_to` → `erase` → `composite` | window move | **was DOWN** | `erase` undraws; the composite ran inside that bracket. **Fixed this arc.** |
+| 10 | `wm::close` → `erase`/`reclaim` → `composite` | window close | **was DOWN** | Same. **Fixed this arc.** |
+| 11 | `wm::close_owner` → `erase`/`reclaim` → `composite` | ASID teardown | **was DOWN** | Same. **Fixed this arc.** |
+| 12 | `pal::TargetPal::render`'s own bracket | every present | spanned #1/#2 harmlessly, but held the sprite down across the whole desktop blit | **Removed this arc.** |
+
+Rows 9–11 are genuine starving paths of exactly CURSOR-13's shape, and they were the only ones. They
+are also *rare* — a window move or teardown, not a frame — so they cannot account for a 100% reading
+and never could have.
+
+### What changed
+
+**1. `pal::TargetPal::render` — the last caller-side bracket goes (`pal.rs`, was x86-gated).**
+
+```rust
+fn render(&mut self) {
+    self.surface.flush();          // CURSOR-13's body owns the sprite end to end
+}
+```
+
+Two reasons, and the second is the one that matters. It cost two wasted `SPRITE` acquisitions per
+present (an earlier arc flagged this and could not act on it). And from its `undraw` to `flush`'s
+`repaint` the arrow was off the panel **for the length of the entire desktop blit** — the longest
+front-buffer write in the system — so any composite reached during that window from another core, or
+from an IRQ-context printer on this one (`fbcon::route_present_rows`, row 3 above), entered with
+`sprite_plan() == None`. That window is now `present_background` alone, the smallest it can be while
+a raw desktop blit exists. `render` is arch-neutral in shape again.
+
+**2. `wm::move_to` / `close` / `close_owner` — close the erase bracket before the composite.**
+
+`super::cursor::repaint();` immediately before each `composite()`, after the last `erase`/`reclaim`
+and after the drain barrier is dropped. Same shape as `Screen::flush`: the save-under is taken
+against a front buffer whose desktop is already final, and the composite then owns the sprite. Costs
+one restore/save/draw per window move or close.
+
+**3. `pal::cursor::rollup_tick` — the first report ARMS the window, it does not print one.**
+
+**4. `[cursor12]` — every term is a delta since the previous block; `cum=` carries the boot total.**
+
+Together, the first `[cursor12] scope=live` block to reach the wire now covers one full 5 s window of
+real pointer motion with the sprite alive throughout. A block whose `passes == cum` is the whole-boot
+baseline and carries no verdict.
+
+```
+[cursor12] offer scope=live passes=N nosprite=… … cum=M -> why
+```
+
+### What proves the fix on the next boot, and what refutes it
+
+**Proves.** A `[cursor12] scope=live` block with **`passes` strictly less than `cum`** (i.e. a real
+window, not the baseline) in which, with the pointer moving **over a window**:
+
+* `nosprite` is small — ideally 0, legitimately non-zero only for passes inside CURSOR-HIDE's ~1.5 s
+  idle expiry;
+* `planned > 0`, and `[cursor3] offers > 0` with `taken > 0`;
+* `[cursor6] desktop_over` stays **0** (the retained desktop bracket, confirmed clean on s50).
+
+With the pointer over **bare desktop**, the correct reading is `nohit ≈ passes`, not `nosprite`.
+
+**Refutes.** A windowed block (`passes < cum`) that *still* reads `nosprite ≈ passes` with the
+pointer demonstrably moving over a window. That would mean a bracket this table missed, and the next
+thing to instrument is the composite's *caller*, not its predicate — tag each `nosprite` pass with
+its entry point.
+
+**Does not refute, and must not be read as refutation:** the first block of a boot, or any block
+where `passes == cum`. Also `nosprite = passes` on either QEMU gate — neither has a pointer, so the
+sprite is never drawn and the reading is *correct* there and cannot move.
+
+### The INSTGUI appearance report — a separate defect, and the discriminating question
+
+Same s50 boot, operator at the machine: **"mouse makes it over the top of everything now but it
+doesn't look right over the top of the installer window."**
+
+Row 5 of the table answers "does instgui reach the compositor by a path the others do not": **it does
+not.** `instgui::repaint` → `wm::present` is the ordinary verb. What *is* unique to instgui is on the
+other side of the seam — **`instgui::open` calls `fbcon::console_present_suspend(true)`**, so while
+the dialog is up the routed console (row 3, the highest-volume compositor path on this arch) stops
+presenting entirely. The repaint *cadence* under the arrow changes there and nowhere else.
+
+Candidates at pixel level, from the mechanism:
+
+* **(A) Trailing / smear while moving.** The save-under is captured from the front buffer at draw
+  time; if it was taken against non-final dialog pixels, the restore stamps them back. CURSOR-9's
+  `TOUCHED_SINCE_DRAW` repair mends it at the next composite — within one desktop frame — so this
+  predicts a *brief* smear at the pointer's rate, visible only in motion.
+* **(B) A hard block of stale content inside the dialog.** Same mechanism, but persisting, which
+  requires the mend not to arrive. With console presents suspended the mend comes only from
+  `Screen::flush` → `service_damage`; that still runs every console-loop pass, so the code does
+  **not** predict a persistent block.
+* **(C) Flicker at the dialog's own repaint rate.** `instgui::service` repaints only when the disk
+  list signature changes, so the dialog presents almost never. The code **positively predicts this
+  does not happen.**
+* **(D) The arrow reading wrong rather than behaving wrong.** The sprite is a white `FILL` with a
+  dark drop shadow offset by `(s, s)`. Every other surface on this panel — console, corner demo,
+  desktop — is dark; the installer dialog is the one piece of **light** chrome in the system. A white
+  arrow plus a shadow overhang on light grey is low-contrast and the shadow reads as a smudge. This
+  is not a defect in any mechanism.
+
+**The code predicts (A) or (D), and rules out (C).** One question separates them, and it is the only
+question the operator needs to be asked:
+
+> **Hold the pointer perfectly still over the installer dialog. Does it look wrong then too, or only
+> while you are moving it?**
+
+* *Only while moving* → (A): save-under / mend latency. Compose-through is the fix, and making it
+  reachable is exactly what this arc does — **expect it to improve**.
+* *Wrong when still as well* → (D) (or (B)): appearance over light chrome, or a static stale restore.
+  **Compose-through will not touch it.** (D)'s remedy is the sprite's own colours — an outline, or a
+  contrast-aware fill — which is a different arc.
+
+**Do not assume the two are the same bug.** They share a symptom surface, not a mechanism: the
+`nosprite` finding is an instrumentation artefact, and the instgui appearance is either a save-under
+latency or a palette choice. Nothing in the code makes the second a consequence of the first.
+
+### Gate results (CURSOR-14, 2026-07-29, QEMU)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
+* `UNAOS_WC=1 ./arroyo test 90` — **33 PASS lines / 0 FAIL**, 594 log lines. Baseline measured this
+  session at `693e097f`: **33 PASS / 0 FAIL, 594 lines**. No regression, and no line moved.
+* `./arroyo test-arm 22` — banner reached (`:: AARCH64 Core Hardware Init ::`,
+  `AARCH64 boot diag: EL=2 CNTFRQ=62500000 Hz MMU=on`), 341 lines, 0 FAIL / 0 PANIC.
+
+**Neither QEMU gate has a pointer**, so `rollup_tick` never fires and no `[cursor12] scope=live` block
+is emitted on either. The gates are no-regression only; the verdict is owed by the next attended
+boot.
+
+### Out of lane / flagged for the pi seat
+
+Three of the four changes are in shared files and the pi seat should lift them:
+
+* **`wm.rs` rows 9–11** (`repaint()` before `composite()` in `move_to`/`close`/`close_owner`) — three
+  one-line insertions, arch-neutral, behavioural on both arches.
+* **`wm.rs` `[cursor12]` delta reporting** — witness-only, arch-neutral, changes the wire format
+  (adds `cum=`). Any log-scraper on either bench needs the new field.
+* **`pal.rs` `rollup_tick`** — witness-only and behaviour-inert, but `rollup_tick` is *not*
+  arch-gated (only the `repaint` above it is), so **this changes aarch64's witness output too**: the
+  pi bench will lose the first `[cursor12] scope=live` block of each boot. That is the intended
+  effect — it is the block that could never be true — and the pi seat should expect it.
+
+`pal::TargetPal::render` (change 1) is x86-only in effect: the bracket it removes was
+`cfg(target_arch = "x86_64")`, so aarch64 is byte-inert there.

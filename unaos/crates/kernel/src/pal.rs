@@ -463,6 +463,27 @@ pub mod cursor {
     /// **`swap`, not a read-then-write.** Two cores can drain input concurrently; a compare-and-set on
     /// the deadline means a race produces one rollup rather than two, and the loser simply returns.
     /// The failure mode of this limiter is a skipped sample, never a duplicated block.
+    ///
+    /// ### CURSOR-14 — the FIRST report ARMS the window; it does not print one
+    ///
+    /// It used to print. `ROLLUP_LAST_MS` starts at 0, the limiter's `last != 0` guard let a zero
+    /// through, and so the very first pointer report of the boot emitted a block — from inside
+    /// `repaint_on_move`, i.e. one call after the `repaint` that draws the sprite for the first time.
+    /// Every composite that block reported therefore ran BEFORE the sprite had ever existed, so
+    /// `cursor::sprite_plan()` was `None` on all of them **by construction, on any kernel, with or
+    /// without a fix**. `[cursor12] … nosprite=N/N -> nosprite` was the only reading that block could
+    /// ever produce.
+    ///
+    /// That is not a hypothetical. It is s48 (42/42), s49 (47/47) and s50 (69/69) — three boots, three
+    /// different boot-era composite totals, all of them first blocks, read across the seats as "the
+    /// mechanism is pinned and the fix changed nothing". The tell is in the capture itself: the
+    /// `[cursor] armed x=… y=…` line (emitted once, at the first draw) sits immediately above the
+    /// block, because both come from the same pointer report.
+    ///
+    /// So the first report now stores the deadline and returns. Every block that prints covers at
+    /// least [`ROLLUP_EVERY_MS`] of real pointer activity, with the sprite alive throughout — which is
+    /// the only condition under which any term in it means what its name says. The cost is one lost
+    /// sample per boot, and what it buys is that no sample is a lie.
     #[inline]
     fn rollup_tick() {
         #[cfg(feature = "witness")]
@@ -470,7 +491,14 @@ pub mod cursor {
             use core::sync::atomic::Ordering::Relaxed;
             let now = crate::arch::ms();
             let last = ROLLUP_LAST_MS.load(Relaxed);
-            if last != 0 && now.wrapping_sub(last) < ROLLUP_EVERY_MS {
+            // `now` can legitimately be 0 for the first few ms of a boot; `swap` below would then
+            // store a 0 and re-arm on the next report, which costs one deferred sample and nothing
+            // else. Biased that way deliberately: never print an unarmed window.
+            if last == 0 {
+                let _ = ROLLUP_LAST_MS.compare_exchange(0, now, Relaxed, Relaxed);
+                return;
+            }
+            if now.wrapping_sub(last) < ROLLUP_EVERY_MS {
                 return;
             }
             // Claim the slot before printing, so a second core arriving inside the same window sees
@@ -1153,12 +1181,38 @@ impl<'a> GneissPal for TargetPal<'a> {
     /// (`repaint` would run a whole restore → save → draw cycle per present, which is the churn WC-I
     /// removed.) Both halves are no-ops before the first pointer report of the boot, which is every
     /// headless gate.
+    ///
+    /// ### CURSOR-14 — and the bracket is GONE, because `Screen::flush` took it
+    ///
+    /// The paragraphs above are the CURSOR-1 contract, and they were correct for as long as
+    /// `Screen::flush` was one opaque present. CURSOR-13 split that function into its two halves and
+    /// gave the DESKTOP half a bracket of its own — `undraw()` … `present_background()` …
+    /// `repaint()` — so everything this one used to protect is protected one frame deeper, by the
+    /// code that actually writes the pixels.
+    ///
+    /// What was left here is not merely redundant. It was the last caller-side bracket on this arch,
+    /// and it still spanned real work:
+    ///
+    /// * **Cost.** Two wasted `SPRITE` acquisitions per present: this `undraw` handed the sprite back
+    ///   only for `flush`'s own `undraw` to find it already down, and this `ensure_drawn` found it
+    ///   already up. An earlier arc flagged that; this is the arc that can act on it, because only
+    ///   now does something else own the sprite across the whole call.
+    /// * **Correctness, which is why it goes rather than merely shrinks.** From this `undraw` to
+    ///   `flush`'s `repaint` the arrow was off the panel for the length of the entire desktop blit —
+    ///   the longest front-buffer write in the system. A composite reached during that window from
+    ///   ANOTHER core, or from an IRQ-context printer on this one (the routed console:
+    ///   `fbcon::route_present_rows` → `wm::present_rows` → `composite`), entered with
+    ///   `sprite_plan() == None` and was starved of compose-through exactly as the flush path was
+    ///   before CURSOR-13. Deleting the pair narrows that window to `present_background` alone, which
+    ///   is the smallest it can be while a raw desktop blit exists at all.
+    ///
+    /// Nothing is left unbracketed. `self.surface` is a [`crate::video::screen::Screen`] for every
+    /// construction of this type on every target, so `flush` is always the CURSOR-13 body; and that
+    /// body's `repaint` runs UNCONDITIONALLY, before the composite, so a present that composites
+    /// nothing at all (`wm::service_damage` early-returns on an undamaged table) still leaves the
+    /// arrow on glass. The function is now arch-neutral in shape as well as in effect.
     fn render(&mut self) {
-        #[cfg(target_arch = "x86_64")]
-        crate::video::cursor::undraw();
         self.surface.flush();
-        #[cfg(target_arch = "x86_64")]
-        crate::video::cursor::ensure_drawn();
     }
 
     fn width(&self) -> u32 {
