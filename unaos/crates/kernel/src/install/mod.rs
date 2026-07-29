@@ -63,6 +63,13 @@ pub enum InstallError {
     NoSpace,
     /// The armed target's leading sectors are NOT blank — the engine refuses to write over it.
     NotBlank,
+    /// INSTALL-SEL: the OPERATOR-SELECTED device is no longer in the block registry at go-time (it was
+    /// unplugged, or its slot has been handed to a different device, between the choice and the go).
+    /// Distinct from [`InstallError::NotReady`] on purpose: `NotReady` means "no storage at all", this
+    /// means "storage exists, but not the disk the operator was looking at" — and the engine must
+    /// REFUSE rather than fall back to whatever disk is present, because a fallback would erase a disk
+    /// nobody consented to.
+    TargetGone,
 }
 
 /// The one abstraction the installer engine writes through. Sector granularity, explicit capacity +
@@ -83,21 +90,73 @@ pub trait InstallTarget {
     fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), InstallError>;
 }
 
-/// An `InstallTarget` over the in-tree single-device block layer (`drivers::block`). In this arc that
-/// device is the QEMU usb-storage scratch disk the builder attaches under `UNAOS_INSTALLDEMO=1`.
+/// An `InstallTarget` over the in-tree block layer (`drivers::block`). In this arc that device is the
+/// QEMU usb-storage scratch disk the builder attaches under `UNAOS_INSTALLDEMO=1`.
+///
+/// INSTALL-SEL: a bound target now remembers WHICH registry handle it was bound through, not just the
+/// geometry it found there. Two things follow. First, the sector I/O routes to that handle's own
+/// path — the global backend dispatcher for [`block::BlockHandle::Global`], the
+/// selector-bypassing USB pair for [`block::BlockHandle::Usb`] — so a target bound to the USB stick
+/// is written to the USB stick even on a machine whose global backend is something else. Second, the
+/// bound `handle` + geometry IS the identity the witness prints and the erase warning shows, so what
+/// is on glass and what the engine writes to cannot drift apart.
 pub struct BlockTarget {
     info: block::BlockDeviceInfo,
+    handle: block::BlockHandle,
 }
 
 impl BlockTarget {
-    /// Bind to the currently registered block device, or `NotReady` if storage is not up.
+    /// Bind to the currently registered GLOBAL block device, or `NotReady` if storage is not up. This
+    /// is the unattended witness path (`run_demo` / `install_probe_once`), which has no operator and
+    /// no selection: it targets the one armed scratch disk exactly as it always has.
     pub fn bind() -> Result<Self, InstallError> {
         let info = block::info().ok_or(InstallError::NotReady)?;
+        Self::from_parts(info, block::BlockHandle::Global)
+    }
+
+    /// INSTALL-SEL: bind to the device the operator SELECTED, named by identity rather than by list
+    /// position. The identity is re-resolved against the live registry here, at go-time, which is the
+    /// whole point: if the disk left (unplugged — `block::unpublish_usb_geometry` retracts its entry)
+    /// or its slot now holds a different device, this returns [`InstallError::TargetGone`] and the
+    /// engine never writes a byte. It does NOT fall back to "some other disk that is present", which
+    /// is precisely the defect this replaces: with two disks attached, binding the global device meant
+    /// selecting row 1 and erasing row 0.
+    pub fn bind_id(id: block::BlockDeviceId) -> Result<Self, InstallError> {
+        let info = block::lookup(id).ok_or(InstallError::TargetGone)?;
+        Self::from_parts(info, id.handle)
+    }
+
+    /// Shared tail of both binds: the engine is a 512-byte-sector engine (GPT layout, FAT32 geometry
+    /// and the extent verifier all assume it), so a device that reports anything else is refused here
+    /// rather than mis-addressed later.
+    fn from_parts(
+        info: block::BlockDeviceInfo,
+        handle: block::BlockHandle,
+    ) -> Result<Self, InstallError> {
         if info.block_size != SECTOR as u32 {
             return Err(InstallError::Io);
         }
-        Ok(Self { info })
+        Ok(Self { info, handle })
     }
+
+    /// INSTALL-SEL: the identity this target is bound to — the same value that resolved it, so a
+    /// caller can print or re-check it without re-deriving the row it came from.
+    pub fn identity(&self) -> block::BlockDeviceId {
+        self.info.id(self.handle)
+    }
+
+    /// INSTALL-SEL: vendor and product of the bound device, space/NUL-trimmed, for the witness line
+    /// and for the erase warning. Read from the BOUND info, never from a list row.
+    pub fn vendor_product(&self) -> (alloc::string::String, alloc::string::String) {
+        (trim_ident(&self.info.vendor), trim_ident(&self.info.product))
+    }
+}
+
+/// SCSI INQUIRY identity strings are fixed-width and space-padded; trim the padding (and any NULs a
+/// device pads with instead) so the witness and the glass show the same readable name.
+fn trim_ident(s: &[u8]) -> alloc::string::String {
+    let end = s.iter().rposition(|&b| b != b' ' && b != 0).map_or(0, |p| p + 1);
+    s[..end].iter().map(|&b| b as char).collect()
 }
 
 impl InstallTarget for BlockTarget {
@@ -106,14 +165,10 @@ impl InstallTarget for BlockTarget {
     }
 
     fn id(&self) -> alloc::string::String {
-        let trim = |s: &[u8]| -> alloc::string::String {
-            let end = s.iter().rposition(|&b| b != b' ' && b != 0).map_or(0, |p| p + 1);
-            s[..end].iter().map(|&b| b as char).collect()
-        };
         alloc::format!(
             "{} {} ({} x {}B sectors)",
-            trim(&self.info.vendor),
-            trim(&self.info.product),
+            trim_ident(&self.info.vendor),
+            trim_ident(&self.info.product),
             self.info.num_blocks,
             self.info.block_size
         )
@@ -122,7 +177,11 @@ impl InstallTarget for BlockTarget {
     fn read_sectors(&self, lba: u64, buf: &mut [u8]) -> Result<(), InstallError> {
         debug_assert!(buf.len() % SECTOR == 0);
         for (i, chunk) in buf.chunks_mut(SECTOR).enumerate() {
-            let n = block::read_block(lba + i as u64, chunk).map_err(map_blk)?;
+            let n = match self.handle {
+                block::BlockHandle::Global => block::read_block(lba + i as u64, chunk),
+                block::BlockHandle::Usb => block::read_block_usb(lba + i as u64, chunk),
+            }
+            .map_err(map_blk)?;
             if n < chunk.len() {
                 return Err(InstallError::Io);
             }
@@ -133,7 +192,11 @@ impl InstallTarget for BlockTarget {
     fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), InstallError> {
         debug_assert!(buf.len() % SECTOR == 0);
         for (i, chunk) in buf.chunks(SECTOR).enumerate() {
-            block::write_block(lba + i as u64, chunk).map_err(map_blk)?;
+            match self.handle {
+                block::BlockHandle::Global => block::write_block(lba + i as u64, chunk),
+                block::BlockHandle::Usb => block::write_block_usb(lba + i as u64, chunk),
+            }
+            .map_err(map_blk)?;
         }
         Ok(())
     }
@@ -249,19 +312,46 @@ pub fn run_demo() {
 /// One-shot boot-loop entry: run the INSTALL witness exactly once, the first time a block device is
 /// present (the armed scratch disk enumerates asynchronously over usb-storage). Mirrors the
 /// `fat::probe_once` / `u2_probe_once` idiom used by the other x86 storage witnesses.
+/// INSTALL-SEL: what the graphical installer's go-button produced. Three outcomes, not two, because
+/// "the disk you picked is gone" is a different thing to say to an operator than "the engine refused
+/// this disk" — the first is answered by re-seating the disk and choosing again, the second by the
+/// console's refusal line. Both are refusals: neither wrote anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuiOutcome {
+    /// The full ladder passed.
+    Pass,
+    /// The engine declined or failed (blank-check guard, verify, I/O) — see the console verdict.
+    Refused,
+    /// The operator-selected device was not in the registry at go-time. Nothing was bound, nothing
+    /// was written, and NO other disk was substituted.
+    TargetGone,
+}
+
 /// INSTGUI seam: the graphical installer's go-button. Same engine run as
 /// [`run_demo`] — same blank-check refusal, same verify ladder, same serial
 /// verdicts — returning the outcome so the GUI can show a verdict screen. The
 /// GUI adds an attended confirmation in FRONT of the engine; it removes nothing.
-pub fn run_gui() -> bool {
-    match run_demo_inner() {
+///
+/// INSTALL-SEL: `sel` is the identity of the device the OPERATOR chose (captured when they left the
+/// chooser) and `row` is the list position it occupied on their screen, carried only so the witness
+/// line can be read against what they saw. The identity — not the row — is what binds; see
+/// [`BlockTarget::bind_id`].
+pub fn run_gui(sel: block::BlockDeviceId, row: u8) -> GuiOutcome {
+    match run_engine(Some((sel, row))) {
         Ok(()) => {
             serial_println!(":: INSTALL: gpt+fat32+copy verify => PASS (instgui) ::");
-            true
+            GuiOutcome::Pass
+        }
+        Err(InstallError::TargetGone) => {
+            serial_println!(
+                ":: INSTALL: refusal — selected target (slot {}, {} sectors) is no longer present; refusing to install (instgui) ::",
+                sel.slot_id, sel.num_blocks
+            );
+            GuiOutcome::TargetGone
         }
         Err(e) => {
             serial_println!(":: INSTALL: engine => REFUSED/FAIL ({:?}) (instgui) ::", e);
-            false
+            GuiOutcome::Refused
         }
     }
 }
@@ -280,6 +370,21 @@ pub fn install_probe_once() {
 }
 
 fn run_demo_inner() -> Result<(), InstallError> {
+    run_engine(None)
+}
+
+/// The engine proper. `sel` selects HOW the target is bound and nothing else:
+///
+/// * `None` — the unattended witness path (`run_demo` / `install_probe_once`), which binds the global
+///   block device exactly as it always has. Byte-identical behavior to before INSTALL-SEL.
+/// * `Some((id, row))` — the graphical installer's attended path: bind the device the operator
+///   selected, by identity, and emit the go-time witness naming it.
+///
+/// Everything after the bind — the blank-check refusal, the GPT parse-back, the FAT32 format, the
+/// extent SHA verify, the negative test, the post-write guard, the multi-cluster directory proof — is
+/// the same ladder in the same order for both, driven through the same `InstallTarget` trait. The
+/// selection changes WHICH disk is written; it changes no guard.
+fn run_engine(sel: Option<(block::BlockDeviceId, u8)>) -> Result<(), InstallError> {
     // 0) Trust the primitives first. NOTE: the two opening prints are folded into ONE line on
     //    purpose — this point is a serial burst boundary (the first prints after the block device
     //    enumerates) where the console reliably drops the SECOND of two back-to-back, pre-I/O writes.
@@ -289,7 +394,28 @@ fn run_demo_inner() -> Result<(), InstallError> {
         serial_println!(":: INSTALL: hash self-test (sha256 + crc32 KATs) => FAIL ::");
         return Err(InstallError::VerifyFailed);
     }
-    let mut t = BlockTarget::bind()?;
+    let mut t = match sel {
+        // INSTALL-SEL: the go-time witness. It is emitted from HERE — after the bind resolved the
+        // operator's identity against the live registry — so the names it prints are read out of the
+        // bound target, not out of the list row that produced the identity. That is what makes it
+        // evidence: if the erase warning said one disk and this line says another, the handoff is
+        // broken and the log shows it. The burst hazard described above does not reach this line: the
+        // attended path has been printing (`[wc-x] instgui ...`) for as long as the dialog has been
+        // open, so this is not the first write after enumeration.
+        Some((id, row)) => {
+            let t = BlockTarget::bind_id(id)?;
+            let (vendor, product) = t.vendor_product();
+            serial_println!(
+                ":: INSTALL: target bound '{}' '{}' slot={} (operator row {}) ::",
+                vendor,
+                product,
+                t.info.slot_id,
+                row
+            );
+            t
+        }
+        None => BlockTarget::bind()?,
+    };
     serial_println!(
         ":: INSTALL: engine start — hash self-test (sha256 + crc32 KATs) PASS — armed target = {} ::",
         t.id()
@@ -344,6 +470,24 @@ fn run_demo_inner() -> Result<(), InstallError> {
     serial_println!(":: INSTALL: extent sha-verify (re-read every extent) => PASS ::");
 
     // 5) Interop self-check: the IN-TREE FAT reader must mount our GPT+ESP and read the file back.
+    //    INSTALL-SEL PRECONDITION: `fs::fat::mount()` reads through the GLOBAL block device — it has
+    //    no notion of the handle this target is bound to. On every target that reaches here today that
+    //    is the same physical disk (x86 publishes one stick into BOTH registry handles, and the
+    //    unattended path binds the global by definition), but "today" is not a guarantee, and a mount
+    //    of a DIFFERENT volume that happened to contain a matching PAYLOAD.BIN would be a false PASS.
+    //    So state the precondition mechanically: if the global registry does not currently name the
+    //    very device we wrote, this step cannot testify about our write, and a verification step that
+    //    cannot testify must FAIL rather than pass. This only ever adds a refusal.
+    let bound = t.identity();
+    let global_is_bound = block::info()
+        .map(|g| g.slot_id == bound.slot_id && g.num_blocks == bound.num_blocks)
+        .unwrap_or(false);
+    if !global_is_bound {
+        serial_println!(
+            ":: INSTALL: in-tree FAT read-back cannot address the bound target (global registry names a different device) => FAIL ::"
+        );
+        return Err(InstallError::VerifyFailed);
+    }
     match crate::fs::fat::mount() {
         Ok(fs) => {
             let de = fs.find_in_root("PAYLOAD.BIN").map_err(|_| InstallError::VerifyFailed)?;

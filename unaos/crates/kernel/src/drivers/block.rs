@@ -100,6 +100,69 @@ pub fn usb_info() -> Option<BlockDeviceInfo> {
     *USB_BLOCK_DEVICE.lock()
 }
 
+/// INSTALL-SEL: which of the two registry handles a device row was read from. The block layer keeps
+/// two `Option<BlockDeviceInfo>` slots — the GLOBAL [`BLOCK_DEVICE`] (whatever the active backend is:
+/// the xHCI stick on x86, the microSD once `register_sd` has run on the Pi) and the dedicated USB
+/// handle [`USB_BLOCK_DEVICE`] — and the graphical installer's chooser can show BOTH as separate rows
+/// when they name different devices. "Row 1" is therefore not a property of the device; it is a
+/// property of one frame's list. Naming the handle makes the row's identity independent of the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockHandle {
+    /// The global [`BLOCK_DEVICE`] entry — read/written through [`read_block`] / [`write_block`].
+    Global,
+    /// The dedicated [`USB_BLOCK_DEVICE`] entry — read/written through [`read_block_usb`] /
+    /// [`write_block_usb`], which bypass the backend selector.
+    Usb,
+}
+
+/// INSTALL-SEL: a durable name for ONE block device, good across frames and across a registry change.
+///
+/// The graphical installer captures this when the operator commits to a row, and the installer engine
+/// re-resolves it at go-time through [`lookup`]. The point is that a list that changes between the
+/// operator's choice and the engine's bind — which it now can, since `unpublish_usb_geometry` lets the
+/// list SHRINK on a physical disconnect — can never silently retarget the install: an identity that no
+/// longer resolves is a refusal, not a fallback to whatever disk happens to occupy the row now.
+///
+/// ### Why these three fields
+/// * `handle` — as above, it decides WHICH registry slot (and therefore which read/write path) the
+///   row named, so the Pi's microSD-in-the-global and stick-in-the-USB-handle case cannot be confused.
+/// * `slot_id` — the xHCI slot the device enumerated on. This is the same key
+///   [`unpublish_usb_geometry`] matches on for retraction, so the two agree by construction. A replug
+///   lands on a NEW slot id, so "same disk, physically re-seated" correctly reads as a different
+///   device to a dialog that was opened before the replug.
+/// * `num_blocks` — a cheap geometry witness that closes the residual slot-id-reuse window: a freed
+///   slot handed to some other, differently sized device will not match. Comparing more is possible
+///   but not more honest; a mismatch here already forces the refusal path, which is the safe direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockDeviceId {
+    pub handle: BlockHandle,
+    pub slot_id: u8,
+    pub num_blocks: u64,
+}
+
+impl BlockDeviceInfo {
+    /// INSTALL-SEL: the durable identity of this device as read from `handle`.
+    pub fn id(&self, handle: BlockHandle) -> BlockDeviceId {
+        BlockDeviceId { handle, slot_id: self.slot_id, num_blocks: self.num_blocks }
+    }
+}
+
+/// INSTALL-SEL: resolve an identity against the LIVE registry — `Some(info)` only if the named handle
+/// still holds exactly that device, `None` if it is gone or has been replaced. Purely a query: it
+/// takes one handle's lock briefly and changes nothing, so it is safe to call from a repaint as well
+/// as from the engine's bind. Both callers going through this one function is what makes the erase
+/// warning on glass and the device the engine actually binds provably the same device.
+pub fn lookup(id: BlockDeviceId) -> Option<BlockDeviceInfo> {
+    let cur = match id.handle {
+        BlockHandle::Global => info(),
+        BlockHandle::Usb => usb_info(),
+    };
+    match cur {
+        Some(d) if d.slot_id == id.slot_id && d.num_blocks == id.num_blocks => Some(d),
+        _ => None,
+    }
+}
+
 /// PIUSB-27: storage-ready edge for the USB FAT mount. `set_usb_ready` is raised by the xHCI storage
 /// bring-up (once per enumeration, so it re-arms on hot-plug); `take_usb_ready` is the main loop's
 /// consume-once read (swaps it back to false). The mount runs from the main loop rather than the
