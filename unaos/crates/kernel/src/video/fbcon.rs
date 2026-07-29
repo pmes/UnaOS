@@ -66,8 +66,13 @@ static CONSOLE_WIN: core::sync::atomic::AtomicU32 =
 
 /// CONSOLE-WINDOW re-entry guard. `wm::composite` prints on witness builds, and a print on a routed
 /// console would ask for another composite from inside the one already running. The guard makes the
-/// inner request a no-op; the glyphs it painted are carried by the NEXT line's present, because a
-/// present repaints the window's whole content rather than a sub-rectangle.
+/// inner request a no-op; the glyphs it painted are carried by the NEXT line's present.
+///
+/// FBCON-DMG — that last clause used to rest on "a present repaints the window's whole content
+/// rather than a sub-rectangle", and it does not any more. What carries the inner request's rows now
+/// is [`PEND`]: the band is merged into the pending set BEFORE this guard is tested, so a declined
+/// present owes those rows to the next one instead of dropping them. Nothing else about the guard
+/// changed, and the re-entrant print is still a no-op.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 static ROUTE_BUSY: AtomicBool = AtomicBool::new(false);
 
@@ -310,18 +315,31 @@ impl FbCon {
 
     /// Clean just the dirtied rows out to RAM (for the HVS), then reset the band. No-op when
     /// nothing was drawn or on cache-coherent targets.
-    fn flush_dirty(&mut self) {
+    ///
+    /// FBCON-DMG — returns the SURFACE-ROW band the caller owes the compositor, and `None` whenever
+    /// the console is not routed into a window (every aarch64 build, every x86 build without `wc`,
+    /// and every moment before the route exists or after a panic tore it down). Those callers keep
+    /// calling the unbanded [`route_present`], which is a no-op for them, so nothing off the routed
+    /// x86 path changes at all.
+    #[must_use = "the routed band must reach route_present_rows or the rows never present"]
+    fn flush_dirty(&mut self) -> Option<(usize, usize)> {
         // CONSOLE-WINDOW: the glyphs went into cached kernel RAM that no scan-out reads, and the
         // panel write belongs to the compositor. There is nothing to clean and nothing to blit here;
-        // the damage is declared by `route_present`, outside this lock.
+        // the damage is declared outside this lock.
+        //
+        // FBCON-DMG: the band is HANDED BACK rather than dropped. This is the older of the two places
+        // the console's per-line damage was being discarded — it was computed correctly by
+        // `mark_rows`, reset here, and the present that followed then repainted all 750 rows of the
+        // box because it had nothing narrower to go on.
         #[cfg(all(target_arch = "x86_64", feature = "wc"))]
         if self.win_store.is_some() {
+            let band = (self.dirty_y0, self.dirty_y1);
             self.dirty_y0 = 0;
             self.dirty_y1 = 0;
-            return;
+            return if band.1 > band.0 { Some(band) } else { None };
         }
         if self.dirty_y0 >= self.dirty_y1 {
-            return;
+            return None;
         }
         let info = self.fb.info();
         let row_bytes = info.stride * info.bytes_per_pixel;
@@ -343,6 +361,7 @@ impl FbCon {
         }
         self.dirty_y0 = 0;
         self.dirty_y1 = 0;
+        None
     }
 
     /// Advance to the next line — WRAP-AROUND rendering, never a scroll. At the bottom row the
@@ -560,11 +579,116 @@ pub fn console_present_suspend(on: bool) {
     }
 }
 
+/// FBCON-DMG — THE ROWS THE COMPOSITOR IS OWED BUT HAS NOT BEEN GIVEN.
+///
+/// A banded present is only sound if a band that is *not* presented is not *forgotten*. Three paths
+/// decline a present after the glyphs are already in the surface — the `ROUTE_BUSY` re-entry guard,
+/// the INSTGUI suspension, and a `wm` that reports the row gone — and before this arc all three were
+/// harmless because the next present repainted everything anyway. They are not harmless now.
+///
+/// So every band is merged in here BEFORE any decline is tested, and taken out only by the present
+/// that is actually going to run. A declined present therefore leaves its rows standing, and the next
+/// one carries them.
+///
+/// `(y0, y1)` with `y1 <= y0` is empty. The SATURATED state — "some band was lost track of, repaint
+/// the whole window" — lives beside this in [`PEND_FULL`] rather than in the struct, because it is
+/// precisely the state that has to be recordable when the ledger itself cannot be taken. Every
+/// degradation here is towards painting MORE, never less.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[derive(Clone, Copy)]
+struct Pending {
+    y0: usize,
+    y1: usize,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+impl Pending {
+    const EMPTY: Pending = Pending { y0: 0, y1: 0 };
+    fn merge(&mut self, y0: usize, y1: usize) {
+        if y1 <= y0 {
+            return;
+        }
+        if self.y1 <= self.y0 {
+            self.y0 = y0;
+            self.y1 = y1;
+        } else {
+            self.y0 = self.y0.min(y0);
+            self.y1 = self.y1.max(y1);
+        }
+    }
+}
+
+/// The ledger itself. A `Mutex` and not a pair of atomics because the merge and the take are each
+/// two-field operations that must not interleave: a take that read a new `y0` against an old `y1`
+/// could drop rows, which is the one outcome this whole mechanism exists to prevent.
+///
+/// **Always `try_lock`.** This is reached from print context with interrupts ENABLED, so an
+/// IRQ-context printer can land on the same core mid-critical-section; a blocking acquire there would
+/// deadlock the machine over a repaint. Contention is instead answered with `full` — a whole-box
+/// present, i.e. exactly the behaviour this arc replaces, for one line.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PEND: Mutex<Pending> = Mutex::new(Pending::EMPTY);
+
+/// FBCON-DMG — record `[y0, y1)` as owed. Never presents; see [`route_present_rows`].
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn pend_merge(y0: usize, y1: usize) {
+    match PEND.try_lock() {
+        Some(mut p) => p.merge(y0, y1),
+        // Contended: we cannot record WHICH rows, so we record that some are outstanding. The next
+        // take turns that into a whole-box present.
+        None => PEND_FULL.store(true, Ordering::Release),
+    }
+}
+
+/// FBCON-DMG — take everything owed. `None` means "the whole box"; `Some(band)` is a real band.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn pend_take() -> Option<(usize, usize)> {
+    let full = PEND_FULL.swap(false, Ordering::AcqRel);
+    match PEND.try_lock() {
+        Some(mut p) => {
+            let band = (p.y0, p.y1);
+            *p = Pending::EMPTY;
+            if full || band.1 <= band.0 { None } else { Some(band) }
+        }
+        // Contended: the ledger may hold rows we cannot read. Present the whole box; anything still
+        // recorded in there is then a superset of what is already on the glass, which costs one
+        // redundant band later and loses nothing.
+        None => None,
+    }
+}
+
+/// Companion to [`PEND`] for the contended case — see [`pend_merge`].
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PEND_FULL: AtomicBool = AtomicBool::new(false);
+
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn route_present() {
+    route_present_banded(None)
+}
+
+/// FBCON-DMG — present the console window over SURFACE ROWS `[band.0, band.1)` only.
+///
+/// The one call fbcon makes on the hot path. Same contract as [`route_present`] in every other
+/// respect: **call with the `FBCON` lock RELEASED and interrupts ENABLED.**
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn route_present_rows(band: (usize, usize)) {
+    route_present_banded(Some(band))
+}
+
+/// The body both routed presents share. `None` = whole box, which is what `clear`, the route's own
+/// first paint and the INSTGUI resume all want (they change the entire surface, or do not know what
+/// they changed).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn route_present_banded(band: Option<(usize, usize)>) {
     let id = CONSOLE_WIN.load(Ordering::Relaxed);
     if id == wm::WIN_NONE {
         return;
+    }
+    // OWE FIRST, DECLINE SECOND. Both returns below happen with the rows recorded, so neither can
+    // lose them. A whole-box caller saturates the ledger for the same reason.
+    match band {
+        Some((y0, y1)) => pend_merge(y0, y1),
+        None => PEND_FULL.store(true, Ordering::Release),
     }
     if CONSOLE_PRESENT_SUSPENDED.load(Ordering::Relaxed) {
         return;
@@ -576,9 +700,27 @@ fn route_present() {
     {
         return;
     }
-    let ok = wm::present(id);
+    // Everything owed, including bands from presents that declined earlier.
+    let owed = pend_take();
+    let ok = match owed {
+        Some((y0, y1)) => wm::present_rows(id, y0, y1),
+        None => wm::present(id),
+    };
+    if !ok {
+        // The row is gone (a panic tore the route down, or the window was closed underneath us).
+        // Put the rows back rather than dropping them: if a route is ever re-established they are
+        // still owed, and if it is not, nothing reads the ledger again.
+        if let Some((y0, y1)) = owed {
+            pend_merge(y0, y1);
+        } else {
+            PEND_FULL.store(true, Ordering::Release);
+        }
+    }
     if ok && !ROUTE_ANNOUNCED.swap(true, Ordering::Relaxed) {
-        serial_println!("[wc-x] console-route first-paint win={} (glyphs -> window surface)", id);
+        serial_println!(
+            "[wc-x] console-route first-paint win={} (glyphs -> window surface, damage-limited)",
+            id
+        );
     }
     ROUTE_BUSY.store(false, Ordering::Release);
 }
@@ -586,6 +728,12 @@ fn route_present() {
 #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
 #[inline]
 fn route_present() {}
+
+/// No-op off the routed x86 path: `flush_dirty` returns `None` there, so this is never reached with
+/// a real band. Defined so the shared print paths need no `cfg` of their own.
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+#[inline]
+fn route_present_rows(_band: (usize, usize)) {}
 
 /// No-op off the wc path (see the x86 definition).
 #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
@@ -596,6 +744,7 @@ pub fn console_present_suspend(_on: bool) {}
 /// line. Kept verbatim for the PANIC path and for aarch64.
 fn print_masked(args: core::fmt::Arguments) {
     let mut drew = false;
+    let mut band = None;
     crate::arch::without_interrupts(|| {
         if let Some(mut c) = FBCON.try_lock() {
             if c.ready {
@@ -603,15 +752,21 @@ fn print_masked(args: core::fmt::Arguments) {
                 // Clean just the freshly-drawn rows out to RAM (no-op off the Pi). fbcon pokes
                 // pixels directly rather than via `blit`, so this is what keeps the boot log visible
                 // on the HVS-scanned framebuffer — but only the touched rows, not the whole surface.
-                c.flush_dirty();
+                band = c.flush_dirty();
                 drew = true;
             }
         }
     });
     // CONSOLE-WINDOW: outside the mask and the lock, per `route_present`'s contract. Not reached on
     // the panic path in any meaningful sense — `panic_screen` has already cleared `CONSOLE_WIN`.
+    // FBCON-DMG: the whole LINE's band, presented once. `None` is either "not routed" (where
+    // `route_present` is a no-op) or "routed and nothing to say", and the whole-box present is the
+    // honest answer to the second: this path has no per-chunk state to have accumulated.
     if drew {
-        route_present();
+        match band {
+            Some(b) => route_present_rows(b),
+            None => route_present(),
+        }
     }
 }
 
@@ -644,6 +799,18 @@ const CHUNK: usize = 16;
 ///     preempted paint, so panic-path behaviour is byte-for-byte unchanged;
 ///   * a cached-RAM shadow being attached — drawing then goes to cached RAM (cheap; the cost this
 ///     fix targets does not exist) and presenting it needs the store, i.e. the lock, held anyway.
+///
+/// ### FBCON-DMG — ONE PRESENT PER LINE, NOT ONE PER CHUNK
+///
+/// `write_str` flushes every [`CHUNK`] (16) bytes, and each flush used to end in its own
+/// `route_present`. On the routed console that meant an 80-column line paid FIVE full-box composites
+/// and presents — the 24 ms measured in `[wc-h] win=1` multiplied by the line length, for a line
+/// whose glyphs occupy one cell row. The chunking exists to bound the stack cost of the op buffer
+/// under a nesting IRQ printer; it was never meant to be a present cadence.
+///
+/// So the paint half still runs per chunk (it is cheap — cached RAM, no lock, no mask) and the
+/// PRESENT is deferred to [`PanelSink::finish`], over the union of every chunk's band. The two
+/// savings compose: one present per line instead of ~five, and a few rows per present instead of 750.
 #[cfg(target_arch = "x86_64")]
 struct PanelSink {
     buf: [u8; CHUNK],
@@ -652,12 +819,37 @@ struct PanelSink {
     split: bool,
     /// Route decided yet?
     decided: bool,
+    /// FBCON-DMG — the union of every routed chunk's dirty band, in surface rows; empty when this
+    /// line painted nothing routed. Presented once, by `finish`.
+    band: (usize, usize),
+    /// FBCON-DMG — did any chunk of this line paint into the console WINDOW? Distinguishes "routed
+    /// and nothing changed" from "not routed at all", which owe different things at `finish`.
+    routed: bool,
 }
 
 #[cfg(target_arch = "x86_64")]
 impl PanelSink {
     fn new() -> Self {
-        PanelSink { buf: [0u8; CHUNK], n: 0, split: false, decided: false }
+        PanelSink {
+            buf: [0u8; CHUNK],
+            n: 0,
+            split: false,
+            decided: false,
+            band: (0, 0),
+            routed: false,
+        }
+    }
+
+    /// FBCON-DMG — union a chunk's dirty band into the line's.
+    fn note(&mut self, band: (usize, usize)) {
+        if band.1 <= band.0 {
+            return;
+        }
+        if self.band.1 <= self.band.0 {
+            self.band = band;
+        } else {
+            self.band = (self.band.0.min(band.0), self.band.1.max(band.1));
+        }
     }
 
     fn flush(&mut self) {
@@ -706,8 +898,15 @@ impl PanelSink {
         paint_ops(&surf, ops.as_slice(), fg, bg, scale);
         if routed {
             // No direct front-buffer write on this path: the surface is cached RAM and `wm` owns
-            // the panel. Damage is declared here, still outside the lock and the mask.
-            route_present();
+            // the panel.
+            //
+            // FBCON-DMG — the damage is RECORDED here and declared in `finish`. Presenting per chunk
+            // was costing a full composite every 16 bytes; see the type's docs. Nothing is at risk in
+            // deferring it: the glyphs are in cached RAM that only the compositor reads, `finish` runs
+            // before `_print` returns, and the band accumulated here is exactly what the compositor
+            // is then told.
+            self.routed = true;
+            self.note(band);
             return;
         }
         if band.1 > band.0 {
@@ -721,8 +920,21 @@ impl PanelSink {
     }
 
     /// Returns true when the split path owned this line (nothing more to do).
+    ///
+    /// FBCON-DMG — and this is where the line's accumulated damage reaches the compositor: once, over
+    /// the union of every chunk's band, outside the `FBCON` lock and outside the interrupt mask,
+    /// which is `route_present`'s standing contract and is unchanged.
     fn finish(&mut self) -> bool {
         self.flush();
+        if self.routed {
+            if self.band.1 > self.band.0 {
+                route_present_rows(self.band);
+            }
+            // An empty band on a routed line means the bytes were `\r`/control only — no glyph moved,
+            // so there is nothing on the surface to present and no present is owed.
+            self.band = (0, 0);
+            self.routed = false;
+        }
         self.split || !self.decided
     }
 }
@@ -761,6 +973,7 @@ pub fn milestone(ms: u64, tag: &str) {
         if crate::splash::active() {
             return;
         }
+        let mut band = None;
         crate::arch::without_interrupts(|| {
             if let Some(mut c) = FBCON.try_lock() {
                 if c.ready {
@@ -768,12 +981,16 @@ pub fn milestone(ms: u64, tag: &str) {
                         &mut Sink { con: &mut c },
                         format_args!(":: [{:>8} ms] {} ::\n", ms, tag),
                     );
-                    c.flush_dirty();
+                    band = c.flush_dirty();
                 }
             }
         });
         // CONSOLE-WINDOW: same contract as `print_masked` — present outside the lock and the mask.
-        route_present();
+        // FBCON-DMG: a milestone is one line, so it damages one cell row like any other.
+        match band {
+            Some(b) => route_present_rows(b),
+            None => route_present(),
+        }
     }
     #[cfg(not(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "witness")))))]
     let _ = (ms, tag);

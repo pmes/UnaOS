@@ -131,6 +131,17 @@ struct Window {
     scale: usize,
     z: u32,
     damaged: bool,
+    /// FBCON-DMG — the SOURCE-ROW band `[dmg_y0, dmg_y1)` of this window's surface that is known
+    /// damaged, when the damage arrived through [`present_rows`]. An EMPTY band (`dmg_y1 <= dmg_y0`,
+    /// which is what [`Window::empty`] and every [`Window::damage_all`] site leave behind) means THE
+    /// WHOLE BOX — so a window that never takes a banded present behaves exactly as it did before.
+    ///
+    /// Source rows and not panel rows, because that is the coordinate the *owner* of the surface
+    /// knows: the console tracks a dirty band in its own glyph grid and has no business re-deriving
+    /// the compositor's placement. [`draw_window`] converts once, through the same `r.y`/`r.scale`
+    /// the content blit uses, so the band can never disagree with the pixels it describes.
+    dmg_y0: usize,
+    dmg_y1: usize,
     title: [u8; MAX_TITLE],
     title_len: usize,
     /// Compat shim marker: window created implicitly by [`super::screen::present_surface`]. Such a
@@ -167,12 +178,48 @@ impl Window {
             scale: 1,
             z: 0,
             damaged: false,
+            dmg_y0: 0,
+            dmg_y1: 0,
             title: [0u8; MAX_TITLE],
             title_len: 0,
             compat: false,
             pinned: false,
             presented: false,
         }
+    }
+
+    /// FBCON-DMG — declare the WHOLE outer box damaged. This is what `r.damaged = true` meant before
+    /// the band existed, and every damage path except [`present_rows`] still means exactly it: an
+    /// empty band reads as "the whole box", so clearing the band here is what keeps a chrome repaint,
+    /// a move, a raise, a focus change and a `damage_intersecting` unconditionally whole-box even
+    /// when a banded present is already pending on the same row.
+    fn damage_all(&mut self) {
+        self.damaged = true;
+        self.dmg_y0 = 0;
+        self.dmg_y1 = 0;
+    }
+
+    /// FBCON-DMG — declare SOURCE rows `[y0, y1)` damaged, widening whatever band is already pending.
+    ///
+    /// Fail-safe in the direction that cannot lose a pixel: a band already standing for the whole box
+    /// (empty, i.e. an unserviced [`damage_all`]) STAYS the whole box, and an empty or inverted
+    /// argument is likewise promoted to the whole box rather than silently narrowing anything.
+    fn damage_rows(&mut self, y0: usize, y1: usize) {
+        if y1 <= y0 {
+            self.damage_all();
+            return;
+        }
+        if self.damaged && self.dmg_y1 <= self.dmg_y0 {
+            return; // a whole-box repaint is already owed; it covers these rows.
+        }
+        if self.damaged {
+            self.dmg_y0 = self.dmg_y0.min(y0);
+            self.dmg_y1 = self.dmg_y1.max(y1);
+        } else {
+            self.dmg_y0 = y0;
+            self.dmg_y1 = y1;
+        }
+        self.damaged = true;
     }
 }
 
@@ -418,7 +465,7 @@ pub(super) fn compat_present(
         r.scale = scale;
         r.x = x;
         r.y = y;
-        r.damaged = true;
+        r.damage_all();
         r.presented = true;
     }
     composite();
@@ -452,6 +499,27 @@ pub fn close_compat() -> bool {
 ///
 /// Returns `false` if `id` names no live window.
 pub fn present(id: WinId) -> bool {
+    present_banded(id, None)
+}
+
+/// FBCON-DMG — present `id`, declaring only SOURCE rows `[sy0, sy1)` of its surface damaged.
+///
+/// The whole of the difference from [`present`] is the extent the compositor repaints: the pass, the
+/// occlusion closure, the staged-present discipline, the cursor bracket and every witness are the
+/// same code on the same path. A caller that knows which of its rows changed can therefore stop
+/// paying for the ones that did not, without a second present path existing to keep in step.
+///
+/// Rows are the SURFACE's, not the panel's — see [`Window::dmg_y0`]. `sy1 <= sy0` (or a band the
+/// surface does not contain) degrades to the whole box rather than to nothing.
+///
+/// Returns `false` if `id` names no live window.
+pub fn present_rows(id: WinId, sy0: usize, sy1: usize) -> bool {
+    present_banded(id, Some((sy0, sy1)))
+}
+
+/// The body both present verbs share. `band` is `None` for a whole-box present, which is
+/// byte-for-byte the pre-FBCON-DMG `present`.
+fn present_banded(id: WinId, band: Option<(usize, usize)>) -> bool {
     // WC-G — the surface as the OWNER declared it finished. Taken here and nowhere else: this is the
     // one moment the owner is provably not writing (it is parked inside `SYS_WIN_PRESENT`), so it is
     // the only honest baseline for the `app` leg. The identity is captured under the table lock and
@@ -463,7 +531,13 @@ pub fn present(id: WinId) -> bool {
         let mut t = TABLE.lock();
         match row_mut(&mut t, id) {
             Some(r) => {
-                r.damaged = true;
+                match band {
+                    // A band the surface does not contain is not narrowed to the part that fits —
+                    // it means the caller and the row disagree about the geometry, and the only
+                    // answer that cannot leave a stale pixel is the whole box.
+                    Some((y0, y1)) if y1 > y0 && y1 <= r.h => r.damage_rows(y0, y1),
+                    _ => r.damage_all(),
+                }
                 r.presented = true;
                 #[cfg(feature = "witness")]
                 if !r.compat {
@@ -518,7 +592,7 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
                 r.x = x.clamp(BORDER, max_x);
                 r.y = y.clamp(TITLE_H + BORDER, max_y);
                 r.pinned = true;
-                r.damaged = true;
+                r.damage_all();
                 if outer_box(r) == before { None } else { Some(before) }
             }
             None => return false,
@@ -900,7 +974,7 @@ pub fn focus_changed(asid: u64) {
         if prev != asid && prev != 0 {
             for r in t.rows.iter_mut() {
                 if r.used && !r.compat && r.owner_asid == prev {
-                    r.damaged = true;
+                    r.damage_all();
                 }
             }
         }
@@ -917,7 +991,7 @@ pub fn focus_changed(asid: u64) {
                     nhidden += 1;
                     // Damaged so that a later raise repaints from the source surface rather than
                     // trusting whatever survived on the panel.
-                    r.damaged = true;
+                    r.damage_all();
                 }
             }
         } else {
@@ -928,7 +1002,7 @@ pub fn focus_changed(asid: u64) {
                 let z = t.next_z;
                 t.next_z = t.next_z.wrapping_add(1).max(1);
                 t.rows[i].z = z;
-                t.rows[i].damaged = true;
+                t.rows[i].damage_all();
                 if first_id == WIN_NONE {
                     first_id = t.rows[i].id;
                 }
@@ -1043,7 +1117,7 @@ pub fn repaint() {
         }
         for r in t.rows.iter_mut() {
             if repaintable(r) {
-                r.damaged = true;
+                r.damage_all();
             }
         }
     }
@@ -1164,7 +1238,7 @@ pub fn damage_intersecting(x: usize, y: usize, w: usize, h: usize) -> usize {
             continue;
         }
         if boxes_overlap(rect, outer_box(&t.rows[i])) {
-            t.rows[i].damaged = true;
+            t.rows[i].damage_all();
             n += 1;
         }
     }
@@ -1541,7 +1615,7 @@ fn composite_inner() -> CursorTail {
     // lock, so the registration is ordered against any teardown that takes the lock afterwards: a
     // `close_owner` that clears rows can then tell whether some other core snapshotted those rows
     // before the clear and is still blitting from their (about to be unmapped) surfaces.
-    let (rows, mut dirty, _blit) = {
+    let (rows, mut dirty, mut bands, _blit) = {
         let mut t = TABLE.lock();
         // F4 — the barrier, observed in the SAME critical section as the registration below. A
         // teardown raises it after clearing its rows, so seeing it up means there is nothing of that
@@ -1554,27 +1628,47 @@ fn composite_inner() -> CursorTail {
             return tail_of(disturbed, session);
         }
         let mut dirty = [false; MAX_WINDOWS];
+        // FBCON-DMG — the band travels with the dirty flag and is cleared with it, in the same
+        // critical section, so a `present_rows` that lands after this snapshot re-damages the row
+        // rather than having its rows absorbed by a pass that is no longer going to draw them.
+        let mut bands = [None; MAX_WINDOWS];
         for (i, r) in t.rows.iter_mut().enumerate() {
             dirty[i] = r.used && r.damaged;
+            if dirty[i] && r.dmg_y1 > r.dmg_y0 {
+                bands[i] = Some((r.dmg_y0, r.dmg_y1));
+            }
             r.damaged = false;
+            r.dmg_y0 = 0;
+            r.dmg_y1 = 0;
         }
-        (t.rows, dirty, BlitGuard::enter())
+        (t.rows, dirty, bands, BlitGuard::enter())
     };
 
     // Close the damage set upwards over occlusion, to a fixed point (at most MAX_WINDOWS passes).
+    //
+    // FBCON-DMG — the closure now reads the DAMAGED region of `i` (its band-clipped box) rather than
+    // its whole box, and the windows it drags in are promoted to a WHOLE-BOX repaint. Both halves are
+    // the conservative direction: a narrower `bi` can only reach fewer windows, and every window it
+    // does reach repaints at least the rows `i` is about to overwrite. A `j` that was itself banded is
+    // widened here too, which is why `bands[j].is_some()` re-enters the fixed point — without it a
+    // banded window could stay banded while a lower window repainted rows outside that band.
     for _ in 0..MAX_WINDOWS {
         let mut grew = false;
         for i in 0..MAX_WINDOWS {
             if !dirty[i] {
                 continue;
             }
-            let bi = outer_box(&rows[i]);
+            let bi = damaged_box(&rows[i], bands[i]);
             for j in 0..MAX_WINDOWS {
-                if dirty[j] || !rows[j].used || rows[j].z <= rows[i].z {
+                if !rows[j].used || rows[j].z <= rows[i].z {
+                    continue;
+                }
+                if dirty[j] && bands[j].is_none() {
                     continue;
                 }
                 if boxes_overlap(bi, outer_box(&rows[j])) {
                     dirty[j] = true;
+                    bands[j] = None;
                     grew = true;
                 }
             }
@@ -1683,6 +1777,10 @@ fn composite_inner() -> CursorTail {
             // to answer is "does this pass's TAIL owe the sprite a repaint", and both `Adopt` and
             // `Repaint` do. It is final by here (nothing below the bracket block writes it).
             disturbed,
+            // FBCON-DMG — the band this window's damage was declared over. `None` for every window
+            // dragged in by the occlusion closure and for every whole-box present, which is every
+            // caller that predates this arc.
+            bands[i],
         );
         #[cfg(feature = "witness")]
         if let Some(p) = wcg_probe {
@@ -1943,7 +2041,9 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
     // `disturbed`, and the safe direction is to assume nothing owes the sprite a repaint: a live arrow
     // under these rows then arms the tail repair. The cost of being wrong is one spurious whole-sprite
     // repaint on the one-shot verify pass per window; the cost of the other guess is an erased arrow.
-    draw_window(fb, r, focus != 0 && focus == r.owner_asid, None, false, false);
+    // FBCON-DMG: `None` — the WHOLE box. This is a REPAIR of whatever the invalidate above dropped,
+    // not a present of what a caller declared changed, so it has no band and must not borrow one.
+    draw_window(fb, r, focus != 0 && focus == r.owner_asid, None, false, false, None);
 }
 
 /// WC-D — window ids whose [`verify_window`] verdict has already been emitted (bit `id`), so the read-back
@@ -2610,6 +2710,33 @@ fn outer_box(r: &Window) -> (usize, usize, usize, usize) {
     }
 }
 
+/// FBCON-DMG — the part of `r`'s outer box a banded present will actually repaint.
+///
+/// `band` is in SOURCE rows; the conversion to panel rows is `r.y + sy * r.scale`, the same mapping
+/// [`paint_window`] blits the content through, so the rectangle returned here is exactly the one the
+/// pass writes. `None` — every window that has not taken a [`present_rows`] — returns [`outer_box`]
+/// unchanged, which is why every existing caller and every existing window is unaffected.
+///
+/// The result is intersected with the outer box, so a band cannot extend a window's damage past its
+/// own chrome however wrong the caller's rows are.
+fn damaged_box(r: &Window, band: Option<(usize, usize)>) -> (usize, usize, usize, usize) {
+    let (bx, by, bw, bh) = outer_box(r);
+    let Some((sy0, sy1)) = band else {
+        return (bx, by, bw, bh);
+    };
+    if sy1 <= sy0 {
+        return (bx, by, bw, bh);
+    }
+    // F5 discipline: saturating throughout, so a nonsense band degrades to a large box the panel
+    // clip bounds rather than to a small one that under-damages.
+    let y0 = r.y.saturating_add(sy0.saturating_mul(r.scale)).max(by);
+    let y1 = r.y.saturating_add(sy1.saturating_mul(r.scale)).min(by.saturating_add(bh));
+    if y1 <= y0 {
+        return (bx, by, bw, 0);
+    }
+    (bx, y0, bw, y1 - y0)
+}
+
 fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize)) -> bool {
     a.0 < b.0.saturating_add(b.2)
         && b.0 < a.0.saturating_add(a.2)
@@ -2944,6 +3071,19 @@ static FALLBACK_FIXTURE: core::sync::atomic::AtomicBool =
 /// are never on the panel without it. Returns whether that happened; the direct fallback path never
 /// takes the overlay (it has no back layer to save from), and reports `false` so the caller's tail
 /// falls back to WC-I's repaint.
+///
+/// ### FBCON-DMG — `band`, and what it may and may not skip
+///
+/// `band` is the SOURCE-ROW range this present was declared over (`None` = the whole window, which is
+/// every window that has not taken a [`present_rows`] and therefore every pre-FBCON-DMG caller). It
+/// narrows the STAGED path's row range and nothing else: the box geometry handed to [`paint_window`]
+/// is still the whole box, so the chrome keeps its true position across the seam exactly as a
+/// WC-M-banded present does — this reuses that machinery rather than adding a second kind of band.
+///
+/// The DIRECT fallback ignores it and paints the whole box. That is deliberate and it is the
+/// fail-safe direction: the fallback is the path taken when the back layer is unavailable, it is
+/// already the expensive regime, and a whole-box repaint there can only over-paint, never leave a
+/// stale glyph. The cache clean at the tail follows whichever extent actually ran.
 fn draw_window(
     fb: &super::FrameBuffer,
     r: &Window,
@@ -2951,6 +3091,7 @@ fn draw_window(
     cur: Option<super::cursor::Plan>,
     may_overlay: bool,
     bracketed: bool,
+    band: Option<(usize, usize)>,
 ) -> bool {
     // `stride`/`scale` are divisors below and `surf_len` bounds the reads, so all four are checked
     // here rather than trusted from the row.
@@ -2974,7 +3115,24 @@ fn draw_window(
     // allocator declining), in which case the direct path below runs exactly as it always has.
     let mut overlaid = false;
     let offer = if may_overlay { cur } else { None };
-    if !stage_window(fb, r, bx, by, bw, bh, pw, ph, focused, offer, &mut overlaid) {
+    // FBCON-DMG — the band, as BOX-RELATIVE rows. `damaged_box` does the source→panel conversion and
+    // the clip to the box; subtracting `by` puts it in the coordinate `stage_window`'s loop counts in.
+    // An empty result means this pass's damage falls entirely outside the panel-clipped box, which is
+    // nothing to draw rather than everything.
+    let (dy0, dy1) = match band {
+        None => (0, bh),
+        Some(_) => {
+            let (_, dby, _, dbh) = damaged_box(r, band);
+            let y0 = dby.max(by).saturating_sub(by);
+            let y1 = (dby.saturating_add(dbh)).min(by + bh).saturating_sub(by);
+            if y1 <= y0 {
+                return false;
+            }
+            (y0, y1)
+        }
+    };
+    let staged = stage_window(fb, r, bx, by, bw, bh, dy0, dy1, pw, ph, focused, offer, &mut overlaid);
+    if !staged {
         paint_window(fb, r, 0, 0, bx, by, bw, bh, pw, ph, focused, false);
     }
     // CURSOR-4 — this window has just painted its clipped outer box. If it did NOT compose the
@@ -3031,9 +3189,14 @@ fn draw_window(
     // Clean the touched rows (superset: whole scanlines of the outer box) for the non-coherent
     // scan-out — one `DC CVAC` sweep per window, not one per scanline. No-op on coherent targets.
     // Unchanged by WC-H: staged or direct, the same panel rows were written by the time we get here.
+    // FBCON-DMG: the span follows the extent that actually ran — the band on a staged banded present,
+    // the whole box on the direct fallback (which ignores the band) and on every unbanded present.
+    // Cleaning rows nothing wrote would be harmless; cleaning fewer than were written would not, so
+    // this is derived from `staged` rather than from `band`.
     let row_bytes = info.stride * info.bytes_per_pixel;
-    let y0 = by.min(info.height);
-    let y1 = (by + bh).min(info.height);
+    let (fy0, fy1) = if staged { (by + dy0, by + dy1) } else { (by, by + bh) };
+    let y0 = fy0.min(info.height);
+    let y1 = fy1.min(info.height);
     if y1 > y0 {
         fb.flush_range(y0 * row_bytes, (y1 - y0) * row_bytes);
     }
@@ -3286,6 +3449,16 @@ fn paint_window(
 /// bands, over the box's whole row span. On the non-coherent Pi 4 the bands therefore tend to become
 /// visible together rather than one at a time — a mitigation worth having and NOT a guarantee (a
 /// cache line may be evicted at any point), which is why the seams above are described as real.
+///
+/// ### FBCON-DMG — `dy0`/`dy1`: which of the box's rows this present owes
+///
+/// Box-relative row range, `0..bh` for every present that did not declare a band — which is every
+/// present that existed before FBCON-DMG, and the branch every QEMU-gate window takes. When it IS
+/// narrowed, the banding loop below simply starts and stops there: each band it runs is the same
+/// band, composed the same way and presented by the same bulk row copies, and `paint_window` already
+/// takes the box geometry separately from the destination origin (that is WC-M's whole contract), so
+/// the chrome and the upscale keep their true geometry with nothing new to reason about. A one-line
+/// console change therefore costs one band of a few rows instead of `bh` rows of full-box compose.
 #[allow(clippy::too_many_arguments)]
 fn stage_window(
     fb: &super::FrameBuffer,
@@ -3294,6 +3467,8 @@ fn stage_window(
     by: usize,
     bw: usize,
     bh: usize,
+    dy0: usize,
+    dy1: usize,
     pw: usize,
     ph: usize,
     focused: bool,
@@ -3341,13 +3516,19 @@ fn stage_window(
     if bw == 0 || bh == 0 || bpp == 0 {
         decline!(super::wcg::DECL_GEOM);
     }
+    // FBCON-DMG — the row range this present owes, clamped to the box. A caller that hands in a band
+    // outside the box gets the whole box: over-painting is free of consequence, under-painting is not.
+    let (dy0, dy1) = if dy1 > dy0 && dy1 <= bh { (dy0, dy1) } else { (0, bh) };
+    let span = dy1 - dy0;
     // `bw <= pw` and `bh <= ph` (both clipped by the caller), so neither product can wrap.
     let row_bytes = bw * bpp;
     // WC-M — the cap sizes a BAND, not the present. `chunk_rows` is how many whole rows of this box
     // fit under it; `bh` of them when the box fits outright, which is the pre-WC-M allocation and the
     // pre-WC-M single-pass present. Zero means one ROW does not fit — the only cap decline left, and
     // unreachable at any panel width this kernel can address.
-    let chunk_rows = if row_bytes == 0 { 0 } else { (MAX_STAGE_BYTES / row_bytes).min(bh) };
+    // FBCON-DMG: `span`, not `bh` — the buffer only ever has to hold the rows this present writes,
+    // so a banded present of a box that would have needed several WC-M bands takes ONE.
+    let chunk_rows = if row_bytes == 0 { 0 } else { (MAX_STAGE_BYTES / row_bytes).min(span) };
     if chunk_rows == 0 {
         decline!(super::wcg::DECL_CAP);
     }
@@ -3376,9 +3557,12 @@ fn stage_window(
 
     let fb_row = info.stride * bpp;
     // WC-M — one band per turn. `band` is the box-relative row the buffer currently holds.
-    let mut band = 0usize;
-    while band < bh {
-        let rows = chunk_rows.min(bh - band);
+    // FBCON-DMG — it starts at the damaged range's first row and stops at its last, instead of
+    // walking the whole box. `dy0 == 0 && dy1 == bh` is the unbanded present and is the pre-FBCON-DMG
+    // loop verbatim.
+    let mut band = dy0;
+    while band < dy1 {
+        let rows = chunk_rows.min(dy1 - band);
 
         #[cfg(feature = "witness")]
         let b0 = crate::arch::now_cycles();
@@ -3419,8 +3603,14 @@ fn stage_window(
         // no part of CURSOR-3's provenance argument covers that. A sprite straddling a seam is
         // therefore taken by nobody, `overlaid` stays false, and the caller's WC-I repaint tail puts
         // it back from the finished front — the same fallback every other decline already uses.
+        //
+        // FBCON-DMG leaves this contract exactly as it found it. The offer is still "this band holds
+        // the sprite's box outright"; the only thing that changed is which rows the band covers, and a
+        // band that does not contain the sprite declines here as it always did. `chunk_rows >= span`
+        // (not `>= bh`) is the same "single band" test restated against the rows this present owes —
+        // a banded present that runs in one turn is as much a single band as an unbanded one is.
         if let Some(plan) = cur {
-            let whole = chunk_rows >= bh
+            let whole = chunk_rows >= span
                 || (plan.by >= by + band && plan.by + plan.bh <= by + band + rows);
             if whole {
                 let c = super::cursor::compose_into(&layer, bx, by + band, plan);
@@ -3449,15 +3639,20 @@ fn stage_window(
         band += rows;
     }
 
-    // `bytes` is the WHOLE box, not the buffer: it is what reached the panel, and on a banded present
-    // it is the number that says banding happened at all (a `-> BUFFERED` line whose `bytes=` exceeds
-    // `MAX_STAGE_BYTES` could not have been staged before this arc).
+    // `bytes` is what REACHED THE PANEL, not what the buffer held — on a WC-M-banded present that is
+    // the whole box, and it is the number that says banding happened at all (a `-> BUFFERED` line
+    // whose `bytes=` exceeds `MAX_STAGE_BYTES` could not have been staged before WC-M).
+    //
+    // FBCON-DMG — `span`, not `bh`, and for exactly the same reason: the rows this present copied are
+    // the rows it owed. `[wc-h] box=WxH bytes=N` therefore keeps meaning "what this present put on
+    // the glass", so a damage-limited console line reports its true cost instead of the cost of the
+    // box it lives in. Unbanded presents have `span == bh` and their `[wc-h]` lines do not move.
     #[cfg(feature = "witness")]
     super::wcg::stage_note(
         r.id,
         bw,
-        bh,
-        row_bytes * bh,
+        span,
+        row_bytes * span,
         compose_cyc + present_cyc,
         0,
         compose_cyc,
@@ -4174,7 +4369,7 @@ fn create_inner(
     row.surf = surf;
     row.surf_len = surf_len;
     row.z = z;
-    row.damaged = true;
+    row.damage_all();
     row.compat = compat;
     row.title_len = title.len().min(MAX_TITLE);
     row.title[..row.title_len].copy_from_slice(&title[..row.title_len]);
@@ -4352,7 +4547,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         // each other is a legibility problem the operator can fix by closing one; a window over the
         // instrument panel silently breaks the one surface that is supposed to be always readable.
         r.y = cy.min(usable_h.saturating_sub(bh));
-        r.damaged = true;
+        r.damage_all();
         if outer_box(r) != before && before.2 != 0 && before.3 != 0 {
             vacated[nv] = before;
             nv += 1;
