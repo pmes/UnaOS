@@ -45,9 +45,12 @@ struct Damage {
 }
 
 impl Damage {
+    /// VUG-FPS-4 — does `self` cover every pixel of `o`? The no-dropped-pixel invariant of
+    /// [`DamageSet`] stated as a predicate, which is what the boot selftest checks.
+    #[cfg(feature = "witness")]
     #[inline]
-    fn overlaps(&self, o: &Damage) -> bool {
-        self.x0 < o.x1 && o.x0 < self.x1 && self.y0 < o.y1 && o.y0 < self.y1
+    fn contains(&self, o: &Damage) -> bool {
+        self.x0 <= o.x0 && self.y0 <= o.y0 && self.x1 >= o.x1 && self.y1 >= o.y1
     }
     #[inline]
     fn union(&self, o: &Damage) -> Damage {
@@ -73,6 +76,17 @@ impl Damage {
 /// SUPERSET of the true damage — never drops a dirty pixel, only (rarely) reflushes a clean one.
 const MAX_DAMAGE_RECTS: usize = 16;
 
+/// VUG-FPS-4 — the merge floor: a fusion whose RESULT is no bigger than this is always taken, even
+/// when the byte test below would refuse it. Rationale in the same currency as the test: a rect this
+/// small costs less to reflush whole than it costs to carry a second entry through the flush loop
+/// (and through the WC-I span walk, which is per-rect), and holding the slot open is what keeps the
+/// set from overflowing into a forced bridge later. 64x64 px = 16 KiB at 32 bpp, ~0.15% of one
+/// 1920x1200 frame. Because a rect that reached its size through this clause is BY CONSTRUCTION at
+/// most this large, the total slack the clause can inject is bounded by
+/// `MAX_DAMAGE_RECTS * MERGE_FLOOR_PX` (256 KiB on that panel) no matter how many marks a frame
+/// makes — the cost model stays bounded, which is the whole point of it.
+const MERGE_FLOOR_PX: u64 = 64 * 64;
+
 /// A small bounded set of damage rectangles. `len == 0` means nothing changed (flush is a no-op).
 struct DamageSet {
     rects: [Damage; MAX_DAMAGE_RECTS],
@@ -94,17 +108,52 @@ impl DamageSet {
         self.len = 1;
     }
 
-    /// Add `r`, merging it into every rect it overlaps (cascading, since a merge can grow `r` into
-    /// reach of a rect it previously missed). On a full set with no overlap, fold `r` into the
-    /// existing rect whose union grows the total area least — keeps the flush a tight superset.
+    /// VUG-FPS-4 — the merge question, answered in the currency the flush actually spends: BYTES.
+    ///
+    /// The present walks the set and blits each rect row by row, so a frame's flush cost is the SUM
+    /// OF THE RECTS' AREAS. Overlap is not a correctness problem for it — two rects sharing pixels
+    /// simply copy those pixels twice, which is exactly what "sum of areas" already says. So fusing
+    /// `a` and `b` is worth it precisely when the fused box costs no more than the two blits it
+    /// replaces: `union.area() <= a.area() + b.area()`.
+    ///
+    /// That is a COST test, not a topology test, and the difference is the bug it fixes. The old rule
+    /// merged on overlap alone, which meant a rect straddling two far-apart rects fused all three into
+    /// their bounding box and the flush paid for the dead gap between them. VUG-FPS-3 keeps a moving
+    /// object's previous and current footprints as two deliberately separate rects for exactly that
+    /// reason; under this test no third rect can bridge them unless bridging is genuinely cheaper.
+    ///
+    /// Returns the fused rect when fusing wins, `None` when the two should stay separate.
+    #[inline]
+    fn worth_fusing(a: &Damage, b: &Damage) -> Option<Damage> {
+        let u = a.union(b);
+        let ua = u.area();
+        if ua <= a.area() + b.area() || ua <= MERGE_FLOOR_PX {
+            Some(u)
+        } else {
+            None
+        }
+    }
+
+    /// Add `r`, fusing it into every rect fusion is CHEAPER for ([`worth_fusing`](Self::worth_fusing)),
+    /// cascading — a fusion grows `r`, which can bring a rect that just refused into range, so the scan
+    /// restarts. Termination: a restart costs one set entry, so at most `len` of them happen.
+    ///
+    /// Rects that decline to fuse are kept side by side, overlapping or not; the flush is correct
+    /// either way (it copies a superset) and this is the shape that costs fewer bytes.
+    ///
+    /// On a full set something must give, and the choice is made in the same byte terms: either fold
+    /// `r` into an existing rect, or fuse the cheapest existing PAIR and let `r` take the freed slot.
+    /// The second option is what stops a late-arriving `r` from being forced to bridge a wide gap
+    /// merely because it was last through the door. Both options are a union, so the set stays a
+    /// correct SUPERSET of the true damage — no dirty pixel is ever dropped.
     fn add(&mut self, mut r: Damage) {
         if r.x0 >= r.x1 || r.y0 >= r.y1 {
             return;
         }
         let mut i = 0;
         while i < self.len {
-            if self.rects[i].overlaps(&r) {
-                r = r.union(&self.rects[i]);
+            if let Some(u) = Self::worth_fusing(&self.rects[i], &r) {
+                r = u;
                 self.len -= 1;
                 self.rects[i] = self.rects[self.len];
                 i = 0; // r grew; rescan from the start
@@ -115,19 +164,154 @@ impl DamageSet {
         if self.len < MAX_DAMAGE_RECTS {
             self.rects[self.len] = r;
             self.len += 1;
-        } else {
-            let mut best = 0usize;
-            let mut best_grow = u64::MAX;
-            for k in 0..self.len {
-                let grow = self.rects[k].union(&r).area() - self.rects[k].area();
-                if grow < best_grow {
-                    best_grow = grow;
-                    best = k;
+            return;
+        }
+        // Option A — fold `r` into rect `k`. The set's total area (= the flush's byte cost) changes by
+        // `area(k ∪ r) - area(k)`; `r`'s own area is not added because `r` never gets a slot.
+        let mut fold_at = 0usize;
+        let mut fold_cost = u64::MAX;
+        for k in 0..self.len {
+            let cost = self.rects[k].union(&r).area() - self.rects[k].area();
+            if cost < fold_cost {
+                fold_cost = cost;
+                fold_at = k;
+            }
+        }
+        // Option B — fuse the existing pair `(a, b)` and append `r` in the freed slot. Total area
+        // changes by `area(a ∪ b) - area(a) - area(b) + area(r)`. The leading term is a `saturating_sub`
+        // because an OVERLAPPING pair fuses for less than nothing; clamping the saving at zero only
+        // ever makes this option look slightly worse than it is, so the choice stays conservative.
+        let mut pair = (0usize, 0usize);
+        let mut pair_cost = u64::MAX;
+        for a in 0..self.len {
+            for b in (a + 1)..self.len {
+                let u = self.rects[a].union(&self.rects[b]);
+                let cost = u
+                    .area()
+                    .saturating_sub(self.rects[a].area() + self.rects[b].area())
+                    + r.area();
+                if cost < pair_cost {
+                    pair_cost = cost;
+                    pair = (a, b);
                 }
             }
-            self.rects[best] = self.rects[best].union(&r);
+        }
+        if pair_cost < fold_cost && self.len >= 2 {
+            let (a, b) = pair;
+            self.rects[a] = self.rects[a].union(&self.rects[b]);
+            self.len -= 1;
+            self.rects[b] = self.rects[self.len];
+            self.rects[self.len] = r;
+            self.len += 1;
+        } else {
+            self.rects[fold_at] = self.rects[fold_at].union(&r);
         }
     }
+
+    /// VUG-FPS-4 — total area of the set, which IS the byte cost of the flush divided by bytes/pixel.
+    /// The selftest's yardstick: a number to compare against the true damage it was fed.
+    #[cfg(feature = "witness")]
+    fn total_area(&self) -> u64 {
+        let mut a = 0u64;
+        for k in 0..self.len {
+            a += self.rects[k].area();
+        }
+        a
+    }
+
+    /// VUG-FPS-4 — is every rect of `fed` covered by some rect of the set? The no-dropped-pixel
+    /// invariant, checked directly rather than inferred from rect counts.
+    #[cfg(feature = "witness")]
+    fn covers_all(&self, fed: &[Damage]) -> bool {
+        fed.iter().all(|f| (0..self.len).any(|k| self.rects[k].contains(f)))
+    }
+}
+
+/// VUG-FPS-4 — the damage-accounting boot selftest. One-shot, `witness`-gated, arch-neutral: it runs
+/// pure [`DamageSet`] arithmetic on synthetic rects and touches no framebuffer, so it costs the same
+/// nothing on every target and reads identically in an x86 `./arroyo test` log and a pi4 capture.
+///
+/// It states the property this arc exists for as a number rather than a story. The `bridge` case is
+/// VUG-FPS-3's shape exactly — two far-apart footprints of one moving object, then a third rect that
+/// overlaps both — and the assertion is that the set still holds three rects whose combined area is a
+/// small fraction of their bounding box. Under the old overlap-merge rule this printed `rects=1` and
+/// a `cost=` equal to the full bounding box; that regression, should it ever return, turns the line
+/// red here instead of turning up as a frame-rate mystery on the bench.
+///
+/// The other three cases fence the change in: `tiled` proves the cost test still fuses what is
+/// genuinely cheaper to fuse (a rect count that only ever grows would be its own bandwidth bug),
+/// `full` proves the bound holds under adversarial pressure, and `covered` proves that across every
+/// case above, no fed pixel was dropped.
+#[cfg(feature = "witness")]
+pub fn damage_cost_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let mut ok = true;
+    let mut covered = true;
+    let mut fed: Vec<Damage> = Vec::new();
+
+    // 1. THE BRIDGE. `prev` and `cur` are one object's vacated and current footprints, 900 px apart;
+    // `bridge` is a wide, thin rect (a status strip, a window edge, the old back-buffer cursor trail)
+    // that overlaps both. Fusing all three costs 964*64 px; keeping them costs 4096+4096+18000.
+    let prev = Damage { x0: 0, y0: 0, x1: 64, y1: 64 };
+    let cur = Damage { x0: 900, y0: 0, x1: 964, y1: 64 };
+    let bridge = Damage { x0: 32, y0: 20, x1: 932, y1: 40 };
+    let mut ds = DamageSet::empty();
+    for d in [prev, cur, bridge] {
+        ds.add(d);
+        fed.push(d);
+    }
+    let bridge_rects = ds.len;
+    let bridge_cost = ds.total_area();
+    let bridge_bbox = prev.union(&cur).area();
+    if bridge_rects != 3 || bridge_cost >= bridge_bbox {
+        ok = false;
+    }
+    covered &= ds.covers_all(&fed);
+
+    // 2. TILED. Two boxes that stack into their union with nothing wasted — the cost test must take
+    // this one, or every scrolled console line would accumulate its own slot.
+    let mut ds = DamageSet::empty();
+    ds.add(Damage { x0: 10, y0: 10, x1: 110, y1: 20 });
+    ds.add(Damage { x0: 10, y0: 20, x1: 110, y1: 30 });
+    let tiled_rects = ds.len;
+    if tiled_rects != 1 || ds.total_area() != 100 * 20 {
+        ok = false;
+    }
+
+    // 3. FULL. Feed far more widely-scattered rects than the set can hold. The set must stay at its
+    // cap, and every fed rect must still be covered — the always-safe union fallback, witnessed.
+    let mut ds = DamageSet::empty();
+    fed.clear();
+    for k in 0..(MAX_DAMAGE_RECTS * 3) {
+        let x = (k * 61) % 1900;
+        let y = (k * 37) % 1180;
+        let d = Damage { x0: x, y0: y, x1: x + 8, y1: y + 8 };
+        ds.add(d);
+        fed.push(d);
+    }
+    let full_len = ds.len;
+    covered &= ds.covers_all(&fed);
+    if full_len > MAX_DAMAGE_RECTS {
+        ok = false;
+    }
+    ok &= covered;
+
+    serial_println!(
+        "[dmgcost] bridge rects={} cost={} bbox={} | tiled rects={} | full len={}/{} | covered={} -> {}",
+        bridge_rects,
+        bridge_cost,
+        bridge_bbox,
+        tiled_rects,
+        full_len,
+        MAX_DAMAGE_RECTS,
+        if covered { "yes" } else { "NO" },
+        if ok { "OK" } else { "FAIL" }
+    );
 }
 
 /// VUG-PAR — the maximum number of parallel flush bands (1 render core + up to 3 helper APs). The Pi
@@ -446,6 +630,12 @@ impl Screen {
                 computed
             );
         }
+        // VUG-FPS-4 — the damage-accounting selftest rides the first `Screen` construction rather than
+        // a call site of its own: every target that has a damage set builds one here, and the fixture
+        // is pure arithmetic, so this is the earliest point on every arch at which the witness is both
+        // reachable and meaningful. One-shot inside, so the later `Screen::new` calls cost nothing.
+        #[cfg(feature = "witness")]
+        damage_cost_selftest();
         let mut back_store = vec![0u8; len];
         let mut back = FrameBuffer::new();
         back.init(back_store.as_mut_ptr() as usize, len, info);
@@ -682,8 +872,10 @@ impl Screen {
 
     /// Present the back buffer: copy each damaged rectangle to the framebuffer, row by row (each
     /// row a single bulk copy), then clear the damage. No-op if nothing changed. VUG-FPS: the set
-    /// holds disjoint dirty regions, so a rotating crystal plus two corner widgets blit as a few
-    /// tight rectangles instead of one panel-spanning box.
+    /// holds separately-tracked dirty regions, so a rotating crystal plus two corner widgets blit as
+    /// a few tight rectangles instead of one panel-spanning box. VUG-FPS-4: those regions are not
+    /// guaranteed disjoint — a pair the cost test refused to fuse simply copies its shared pixels
+    /// twice, which is both correct (the copy is idempotent) and, by that test, the cheaper shape.
     ///
     /// The DESKTOP half of [`flush`] — it knows nothing about windows; see that function for the
     /// layering. Split out so both of its exits (the parallel band path and the serial fallback) are

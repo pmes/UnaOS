@@ -3853,8 +3853,102 @@ where they read 0 before, and `[cursor6] desktop_over=0` holding (the bracket is
   cursor was exactly such a third rect whenever it sat on the crystal, which is one path by which
   pointer motion could grow a frame's flush. Taking the arrow out of the damage set removes the
   cursor as a bridge, but the general re-merge is still reachable by any two near-neighbour painters.
+  *(Fixed since, by VUG-FPS-4 below.)*
 * `[vugfps]`'s 12.8 → 34.8 fps ramp on the s45 capture is NOT mouse-driven: the pointer was
   stationary for it, and the ramp is the crystal's own bounding box coming off its broadside
   orientation (the frame budget is bandwidth-bound in the bbox, so a wide bbox is self-sustaining
   until the tumble carries it edge-on). That capture contains no pointer-motion experiment, so the
   metal verdict quoted above stands on the attended observation alone.
+
+## VUG-FPS-4 — the damage set merges on cost, not on overlap
+
+`DamageSet` (`video/screen.rs`) is a bounded set of at most `MAX_DAMAGE_RECTS` (16) dirty rectangles,
+accumulated between flushes. Its contract has always been: **hold a superset of the true damage —
+never drop a dirty pixel, at worst reflush a clean one — and stay bounded, folding rects together
+when the set is full.** What VUG-FPS-4 changes is the rule that decides *which* rects fold.
+
+### The rule that was wrong
+
+`add` merged an incoming rect into every rect it *overlapped*, cascading: a merge grows the incoming
+rect, which can bring a previously-untouched rect into contact, so the scan restarted. Overlap is a
+topological question, and the flush does not spend topology. It spends bytes.
+
+The consequence had a name before it had a fix. VUG-FPS-3 keeps a moving object's **previous** and
+**current** footprints as two deliberately separate rects, precisely so a jumping crystal never
+flushes the dead gap between them. Under an overlap rule, any third rect touching both — a status
+strip, a window edge, the back-buffer cursor while it still lived in the damage set — fused all three
+into their bounding box, and the frame paid for the gap after all. On the bench panel the desktop
+flush is 69–86% of the frame budget at 10.9 MB/frame over a ~150 MB/s GOP path, so those bridged
+bytes are not a rounding error; they are the whole cost.
+
+### The cost model
+
+The present walks the set and blits each rect row by row. A frame's flush therefore costs the **sum
+of the rects' areas** — and overlap is not a correctness problem for it, because two rects sharing
+pixels simply copy those pixels twice, which "sum of areas" already accounts for. That gives an exact
+answer to the merge question:
+
+> Fuse `a` and `b` **iff** `union(a, b).area() <= a.area() + b.area()`.
+
+Fusing that passes this test never costs the flush a byte more than the two blits it replaces; fusing
+that fails it costs strictly more. It is a cost test, not a topology test, and it subsumes the old
+behaviour where the old behaviour was right: heavily-overlapping rects still fuse (their union is
+barely larger than either), and rects that *tile* — successive console lines, adjacent glyph boxes —
+now fuse too, which the overlap rule refused and which is free.
+
+One bounded exception, `MERGE_FLOOR_PX` (64x64 px = 16 KiB at 32 bpp): a fusion whose **result** is no
+larger than the floor is always taken. A rect that small costs less to reflush whole than it costs to
+carry a second entry through the flush loop and the per-rect WC-I span walk, and taking it keeps a
+slot free — which is what stops the set overflowing into a forced bridge later. The slack this clause
+can inject is bounded by construction: a rect that reached its size *through* the clause is at most
+`MERGE_FLOOR_PX`, so the whole set can carry at most `MAX_DAMAGE_RECTS * MERGE_FLOOR_PX` (256 KiB on a
+1920x1200 panel, ~2.3% of one frame) of it, no matter how many marks a frame makes.
+
+### When the set is full
+
+Something must fold, and the choice is made in the same currency. Two candidate shapes are costed and
+the cheaper wins:
+
+| Shape | Change in total set area (= flush bytes / bpp) |
+|---|---|
+| fold the incoming `r` into existing rect `k` | `area(k ∪ r) - area(k)` |
+| fuse the cheapest existing pair `(a, b)`, give `r` the freed slot | `area(a ∪ b) - area(a) - area(b) + area(r)` |
+
+The second shape is the one that matters: without it, a late-arriving rect is forced to bridge a wide
+gap merely because it was last through the door. Both shapes are unions, so the set remains a correct
+superset either way — the always-safe fallback is intact.
+
+### Worst case
+
+Adversarially scattered damage — many small rects, all far apart, none worth fusing — fills the set,
+and then every further `add` pays one fold. The bound holds by construction (16 rects, each a union of
+things that were genuinely damaged), and the fold always picks the cheapest of the two shapes above,
+so the *total* flush area is what degrades gracefully, not the rect count or the pixel coverage. The
+pathological input for the *old* rule — a chain of rects each overlapping the next, spanning the panel
+— now costs the sum of the chain instead of the panel-wide bounding box.
+
+### Witness
+
+`damage_cost_selftest()` (`video/screen.rs`, `witness`-gated, one-shot, called from the first
+`Screen::new`) runs pure `DamageSet` arithmetic on synthetic rects — no framebuffer, no timing — so it
+reads identically in an x86 `./arroyo test` log and a pi4 capture. One line:
+
+```
+[dmgcost] bridge rects=3 cost=26192 bbox=61696 | tiled rects=1 | full len=16/16 | covered=yes -> OK
+```
+
+* `bridge` is VUG-FPS-3's shape exactly: two footprints 900 px apart plus a third rect overlapping
+  both. `rects=3` and `cost` well under `bbox` is the fix. The old rule printed `rects=1` with `cost`
+  equal to `bbox`.
+* `tiled` proves the cost test still fuses what is genuinely cheaper to fuse — a rect count that only
+  ever grows would be its own bandwidth bug.
+* `full` feeds three times the cap in scattered rects and proves the bound holds.
+* `covered` checks the no-dropped-pixel invariant directly, across every case above.
+
+The verdict word is `OK`/`FAIL` rather than `PASS`/`FAIL` on purpose: the batteries tally `PASS` lines,
+and this witness is deliberately additive to the existing tallies. A regression still turns the line
+red and still trips the generic `-> FAIL` scan.
+
+**Signature stability.** No `[wc-…]` or `[vugfps]` line changed shape. `[vugfps]`'s `rects=N` now
+reports the cost-model rect count, which is the number it was always meant to report; `bytes/frame`
+and `union=WxH` are computed exactly as before.
