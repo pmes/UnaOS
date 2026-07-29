@@ -4485,3 +4485,144 @@ reading there and cannot move. The gate proves no-regression only. The verdict i
   reachable for the first time.
 * **A spotty or trailing arrow over the desktop** — the desktop bracket, not the composite path.
   Over a *window*, it is the composite path.
+
+---
+
+## CLICK-X86 — what a pointer press does on x86 today (2026-07-29)
+
+This section exists because a lift was attempted and correctly refused. The pi seat landed
+CLICK-ROUTE, then CLICK-SWALLOW (`1ed1c725`), then CLICK-PLAIN (`475c51d3`) — three arcs of click
+routing policy on aarch64 — and the x86 track was asked to lift the last of them. It cannot be
+lifted, and the reason is not a merge conflict: **x86 has no pointer-press path for a routing policy
+to be a policy about.** The audit is recorded here in full so it is not re-run.
+
+### The five findings, each with its line
+
+1. **The x86 event drain has no `Event::Button` arm.** `main.rs`'s x86 loop matches `Key`,
+   `Mouse`, `MouseAbsolute` and then `_ => {}`. A button report is pushed onto `pal::EVENT_QUEUE` by
+   the xHCI/EHCI HID paths, popped by that drain, and discarded. Nothing hit-tests it, nothing routes
+   it, nothing consumes it. (The exception is a full-screen in-kernel demo — `vug` — which drains
+   `pal::pump_and_poll` itself and reads `Event::Button` as exit/drag. That is the only x86 code that
+   has ever seen a click.)
+2. **`wm::focus_changed` has no x86 caller.** Its only callers outside `video/wm.rs` are in
+   `arch/aarch64/syscall.rs`. Focus, as a live concept, does not exist on x86: nothing raises a
+   window, nothing publishes a focus owner, and `FOCUS_ASID` is only ever written by `wm`'s own
+   selftests.
+3. **`wm::hit_test` has no x86 caller either.** The seam is present and arch-neutral; the address
+   lookup has simply never been performed on this arch.
+4. **There is no ring-3 input delivery on x86 at all.** `arch/x86_64/syscall.rs` contains no
+   `el0_input_*` equivalent, no per-address-space input ring, and no `SYS_INPUT_POLL`. The file's own
+   syscall-numbering note says so directly: 27 (`INPUT_POLL`) is reserved for x86's "later arcs".
+   CLICK-PLAIN's central claim — that a focus-changing press is *delivered whole* into the raised
+   owner's ring — has no addressee on x86.
+5. **Every window x86 puts on the panel is owned by ASID 0.** `video/wcx.rs` creates the demo and
+   probe rows with owner 0, and `video/fbcon.rs`'s console window likewise; `hit_test` skips
+   `owner_asid == 0` by design (a compat/kernel row names nobody as a focus target). So even if the
+   press path existed and called `hit_test` today, it would resolve `None` for every persistent x86
+   window. The only x86 rows with a real owner are the transient ones `SYS_WIN_CREATE` mints for the
+   WINX-1 fixture.
+
+The earlier x86 audit's summary — "no hit-test on the button path, mirroring the pre-CLICK-ROUTE
+aarch64 state" — is true but understates it. Pre-CLICK-ROUTE aarch64 *had* a press path, a focus
+holder, and a delivery ring, and merely addressed the press to the wrong one of them. x86 has none of
+the three.
+
+### Arch-neutral vs. arch policy, for whoever lifts next
+
+CLICK-PLAIN splits cleanly, and the split is worth naming because it is the same split every one of
+these arcs has:
+
+* **Arch-neutral (`video/wm.rs`)** — the VUGMIN-C amendment (a raise publishes only the ARRIVING
+  owner's unhide; the departing owner is no longer hidden, so a focus change starts things and never
+  stops them), the deletion of `owner_live` with its only caller, and the selftest leg. These are the
+  liftable half in principle. In practice **none of it applies to this tree yet**: it is an edit to
+  VUGMIN-A/B/C machinery (`vugmin_publish`, `vugmin_scan`, the raise arm's `marks`/`nmarks` block)
+  that x86's `wm.rs` does not contain, so every hunk's context is absent and `git cherry-pick` has
+  nothing to anchor on. When the VUGMIN chain does arrive here, it must arrive **post-CLICK-PLAIN** —
+  see the reversal note below.
+* **Arch policy (`arch/<arch>/syscall.rs`)** — the router: the press-edge tracker, the hit/miss arms,
+  the ordering of `set_active` → `focus_changed` → push, and the press/release pairing that keeps a
+  click from being split across two apps. This half is reimplemented per arch by design and is never
+  lifted. x86's is unwritten because its three prerequisites are unwritten.
+
+### The CLICK-SWALLOW → CLICK-PLAIN reversal, and why the later position is right
+
+CLICK-SWALLOW's rule was: a press that *changes focus* is consumed. Its case was concrete — the one
+gesture that restores a backgrounded vug was also working that vug's click-to-pause toggle, so the
+vug came back paused and the operator had to click twice. Swallowing the refocusing press made the
+first click mean only "come here".
+
+CLICK-PLAIN reverses it: the focus-changing press is delivered again, whole, press and release both.
+The reversal is right, and not because the pause-toggle problem went away — it is right because
+CLICK-SWALLOW made *what a click does* a function of state the operator cannot see. Whether a press
+reached the app depended on which window happened to hold focus a moment earlier, which is invisible
+by construction on a panel where an unfocused window looks like a focused one that has stopped
+drawing. Two identical gestures produced two different outcomes and nothing on the glass explained
+the difference. That is the accretion P75 named ("no reason to it"), and swallowing was a
+load-bearing part of it.
+
+The right fix was to make the click's *effect* legible instead of making its *delivery* conditional:
+CLICK-PLAIN pairs the restored delivery with an ABSOLUTE run-state toggle (`paused = !(paused ||
+hidden)` — a click on anything not running makes it run) and a visible acknowledgement. Under those
+two, the original defect cannot recur — a click on a parked vug makes it run whether or not the press
+was also delivered — so the swallow was buying nothing and costing predictability. The same judgement
+retires VUGMIN-C's departing-owner hide in the same commit: a focus change that *stops* an unrelated
+window is another effect with no visible cause. **A raise is purely additive.** Both halves of
+CLICK-PLAIN are the same principle, and it is the correct one: prefer a rule that is true
+unconditionally over a rule that is true given hidden state.
+
+Nothing about that reasoning is aarch64-specific, so when x86 grows a press path it should be built
+to the CLICK-PLAIN contract directly and should never pass through the CLICK-SWALLOW shape.
+
+### What this arc landed
+
+One in-lane change, in `arch/x86_64/syscall.rs`: `wm::hittest_selftest()` now runs on x86, chained
+off `winx_launcher` after the WINX-1 verdict (after the fixture's window is confirmed retired, so the
+selftest's two rows cannot burn a one-shot per-window latch — the ordering rule aarch64 states at its
+own call site). The battery has always been arch-neutral and has only ever been driven from
+`arch/aarch64/syscall.rs`; every claim it makes about shared code was, until now, an aarch64-only
+claim. It is table-driven rather than pixel-driven, so it needs no pointer and runs headless.
+
+x86 wire line, both gate runs, 1280x800 panel:
+
+```
+[clickroute] hit-test at (428,215) inside=true topmost=true raise=true outside=true hidden=true -> PASS
+```
+
+All five legs hold on x86's real z-order with the console window live in the table: the lookup
+resolves *something*, resolves the FRONTMOST something, follows a raise, returns `None` on a genuine
+miss, and returns `None` for a row pushed below `SHELL_Z`. The address lookup is sound; only its
+callers are missing. When the press path arrives, this line is what distinguishes "resolved the wrong
+window" from "never resolved one" — which is the discrimination the operator's two standing
+complaints ("clicks eaten" vs. "out-of-focus clicks stop the focused app") have never had on x86.
+
+### The prerequisite chain, in order
+
+A future x86 click arc needs these, and needs them in this order:
+
+1. **A press dispatch site.** `main.rs`'s x86 event drain needs an `Event::Button` arm. This is the
+   blocking item and it is **outside the video lane** — one arm beside the existing `Mouse` /
+   `MouseAbsolute` arms in `kernel_main`'s inner drain loop (the `_ => {}` at the end of that `match`
+   is where the press dies today). Nothing downstream can be exercised until it exists, which is why
+   this arc landed the instrument and not a router: a router with no call site is mechanism nobody
+   can see, and that is the thing CLICK-PLAIN was written against.
+2. **Focusable windows.** `wcx.rs`/`fbcon.rs` create their rows with owner ASID 0, which `hit_test`
+   and `focus_ring` both skip. Either those rows get real owners, or x86 click routing addresses only
+   `SYS_WIN_CREATE` windows and the console keeps every other click.
+3. **`SYS_INPUT_POLL` (27) and per-address-space input rings** — the x86 twin of the aarch64 EL0
+   input seam. Only then does "the press is delivered" name anything.
+4. **The router itself**, in `arch/x86_64/syscall.rs`, written to the CLICK-PLAIN contract: press
+   hit-tests the pointer; a hit on a different window raises it through `wm::focus_changed` **and**
+   the press still delivers; wake edges run BEFORE the push; the release follows the recorded press
+   target so a press/release pair is never split and no click is fabricated in an app that did not
+   see the press.
+
+### Gate results (CLICK-X86, 2026-07-29, QEMU)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
+* `UNAOS_WC=1 ./arroyo test 90`, two consecutive runs — **39 PASS lines / 0 FAIL** each
+  (37 verdicts; two of the 39 are `[wc-d] verify` lines that carry the word incidentally). Baseline
+  at `9c2c6b94` was 38/36; the +1 is the new `[clickroute]` line and nothing else moved.
+  `MISSION SUCCESS` present.
+* `./arroyo test-arm 22` — **`MISSION SUCCESS`**, 0 FAIL. aarch64 is byte-inert: the code diff is one
+  file under `arch/x86_64/`.

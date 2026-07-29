@@ -11345,6 +11345,35 @@ fn winx_launcher(demo_cpu: usize) {
             WINX_WITNESS_ALL
         );
     }
+
+    // CLICK-ROUTE — run the arch-neutral hit-test witness on the x86 panel, for the first time.
+    //
+    // `video::wm::hittest_selftest` has been in the tree since CLICK-ROUTE and has only ever been
+    // driven from `arch::aarch64::syscall` (its sole call site, after that arch's `wci_rollup`), so
+    // every claim it makes — that `hit_test` names the FRONTMOST window, that a raise moves who owns
+    // a pixel, that a miss is a miss, that a window below `SHELL_Z` is unclickable — has been an
+    // aarch64-only claim about arch-neutral code. Nothing in the function is arch-specific: it reads
+    // the window TABLE rather than the panel (deliberately, so it is drivable with no pointer at
+    // all), mints and closes its own two rows, and restores `SHELL_Z`/`FOCUS_ASID` before returning.
+    // The x86 panel is a different geometry with a different upscale and a live console window in the
+    // table, and the selftest derives its probe and miss points from the row it actually got — so
+    // running it here asserts the same five legs against x86's real z-order.
+    //
+    // HERE, and not earlier: the selftest puts two rows of its own in the table and drives
+    // `focus_changed(0)`, which pushes every live window below the shell. The WINX-1 fixture above
+    // owns the one-shot per-window latches (`[wc-d] verify`, `[wc-g]`/`[wc-h]` rollups) and its
+    // window must be gone — the `cleared` poll above is exactly that — before rows that would burn
+    // them appear. That is the same ordering rule aarch64 states at its own call site.
+    //
+    // What this does NOT do, stated so the next reader does not infer it: it does not give x86 click
+    // ROUTING. On this arch a pointer press is still dropped by the main event drain (which has no
+    // `Event::Button` arm at all), `wm::focus_changed` has no caller outside `wm` itself, and there
+    // are no ring-3 input rings for a press to be delivered into. The hit-test is the address lookup
+    // a routing policy would be built on; this line is the standing proof that the lookup is sound on
+    // x86 geometry, so when the press path does arrive a `[clickroute]` line already distinguishes
+    // "resolved the wrong window" from "never resolved one".
+    #[cfg(feature = "witness")]
+    crate::video::wm::hittest_selftest();
 }
 
 // =============================================================================================
