@@ -1826,7 +1826,10 @@
     launch → both retry lines, then the HARNESS FLAKE message and exit **4**. (4) `kernel8-test 8` →
     TRUNCATED 64/86, exit **3**, carrying the new host-load line. Lane: the `test_kernel8()` stanza
     of `unaos/arroyo`, `unaos/scripts/specs/pi4-regression.spec`'s header, and this doc.
-- **VUGCLICK (a click stops killing the vug)** — an **app-only** arc: `crates/user-vug` + this doc, no
+- **VUGCLICK (a click stops killing the vug)** — *(the click→pause half is **superseded by CLICK-ONE**
+  below: a click is now focus/restore only and carries no run-state meaning; SPACE is the pause toggle.
+  The half that stands is the one this arc was about — a click does not exit.)* — an **app-only** arc:
+  `crates/user-vug` + this doc, no
   kernel change. P62 attended metal reported "vug is crashing". The wire showed no panic, no fault and a
   clean load — what it showed was `:: UVUG: interactive takeover at frame 24340 ::` followed immediately
   by `:: UVUG: interactive exit=click frames=36000 ::`, twice. The vugs were leaving through their own
@@ -2103,6 +2106,10 @@
 - **CLICK-SWALLOW (a focus-changing click is a window-manager gesture, not app input)** — the ruling on
   the item VUGPAUSE-2r2 flagged and deferred to this lane (see its "Not changed" note below), which
   supersedes the CLICK-ROUTE bullet's **first** sub-point exactly as CLICK-SHELL superseded its last.
+  *(The rule stands; its motivating example does not. **CLICK-ONE** below removed the second meaning a
+  delivered click carried — "for a vug, a delivered click **is** the pause toggle" is false by design
+  since that arc — so read this entry for its general form: an app never sees a click it did not own the
+  focus for.)*
 
   **P73, attended:** *"sometimes a click gets lost… restarting a vug I have to click twice."* CLICK-ROUTE
   shipped the hit arm as raise-then-**fall-through**: the press that raised a window was then delivered
@@ -2654,6 +2661,63 @@
     forbidden, 4758 lines scanned**, `UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c` unchanged —
     the barrier change alters only WHEN the parent observes an arrival, never any value that reaches the
     surface, so the deterministic 300-frame witness is untouched by construction and in fact.
+
+- **CLICK-ONE (one visible rule for stop and start)** — an **app-only** arc: `crates/user-vug` + this
+  doc, no kernel change. **P74, blocked at the bench:** *"click stop/start is all messed up cannot
+  continue test."*
+
+  **THE SINGLE STOP MODEL — read this paragraph and nothing else is needed.** *A click on a vug is
+  **focus/restore only**, always, and is never app input that changes run state. **The focused vug runs;
+  unfocused vugs freeze in place.** **SPACE** on the focused vug toggles pause/resume. A vug with an
+  empty input ring **parks** (VUGPAUSE-2) and is woken by the next event addressed to it.* Focus decides
+  running; SPACE pauses; ring-empty parks — three mechanisms, one per question, none of them reachable by
+  the same gesture. Everything below is why, and what it supersedes.
+
+  **The defect was accumulation, not a bug.** Nothing was wrong in isolation; three independently correct
+  stop states had piled up and a click could land in any of them — frozen-by-unfocus (**VUGMIN-C**),
+  paused-by-a-delivered-click (**VUGCLICK**), parked-on-an-empty-ring (**VUGPAUSE-2**). **CLICK-SWALLOW**
+  then made the first click on an unfocused vug focus-only, so the *second* click toggled pause. The
+  visible result of a click had become a function of invisible state: which window held focus, and
+  whether this was the first click or the second. That is not a model an operator can hold, and P74 is
+  the proof — the bench could not proceed, with every individual mechanism behaving as designed.
+
+  **Change (app side, `crates/user-vug/src/main.rs`).** The pause toggle leaves the pointer and moves to
+  the keyboard, where it can only reach the **focused** vug by construction:
+    - **Click/button edges carry no run-state meaning at all.** A press starts a drag, a release ends
+      one, and that is the whole of it. `CLICK_THRESH` and the drag-motion accumulator that fed it are
+      **gone** — with no click/drag discrimination left to make, a click is simply a drag of zero pixels:
+      it rotates nothing and changes nothing.
+    - **SPACE toggles pause** (`K_SPACE`, ASCII 0x20). Chosen because nothing bound it: `key_bit` maps
+      WASD/arrows, Q/E and the `+`/`-` family and nothing else, and ESC is handled ahead of it, so no
+      existing gesture changed meaning. The witness is `:: UVUG: pause=<0|1> ::`, one line per **state
+      change** (superseding `:: UVUG: click pause=<0|1> ::`), still human-rate and still doubling as
+      proof that the input reached EL0.
+    - **Typematic repeats cannot flutter it.** `pal.rs` synthesises a KeyDown every `RATE_MS` (40 ms)
+      once a key has been held `DELAY_MS` (400 ms), so a toggle driven off raw KeyDowns would flip 25
+      times a second under a resting thumb. SPACE therefore rides the existing `held` word as `H_PAUSE`
+      and toggles only on a bit that was **not already set** — a true press edge. `H_PAUSE` is
+      deliberately **outside** the new `H_MOTION` mask that `manual` tests, so a held SPACE does not read
+      as manual control and silently stop an unpaused vug's tumble.
+    - **Drag-rotate, interactive takeover, and ESC are untouched.** Takeover is keyboard-armed and
+      unaffected; a drag is motion, not a click, and was never a run-state gesture.
+
+  **The router needed no change and got none.** `wc_click_route`'s already-focused arm still **delivers**
+  the press, which stays correct — apps may legitimately want clicks, and the vug now simply ignores them
+  for run-state purposes. The CLICK-SWALLOW arm (focus-changing press consumed) and the CLICK-SHELL miss
+  arm (desktop press focuses the shell) are the *focus* half of the same one rule. Two stale readings in
+  the bullets above are superseded by this entry rather than rewritten: CLICK-ROUTE's full-screen
+  exemption is no longer motivated by "UVUG's own click-to-exit" (that exit died at VUGCLICK; the
+  exemption stands on `compat_live` per CLICK-SHELL r2), and CLICK-SWALLOW's "for a vug, a delivered
+  click **is** the pause toggle" is now false by design — which removes the *second* meaning the swallow
+  was protecting the operator from, and leaves the swallow correct for the general reason it also gave
+  ("an app never sees a click it did not own the focus for").
+
+  **Size.** Removing the click-toggle **bought** bytes rather than spending them: `.text` **8022 →
+  8012 B** against the hard `0x2000` cliff, and `VUG.ELF` links at **12568 B**, byte-for-byte the same
+  size as before.
+
+  **The deterministic auto path cannot reach any of this by construction** — QEMU raspi4b delivers no
+  HID, so `interactive` never arms, so `paused` is never written and no click or SPACE is ever seen.
 
 ### x86_64 (branch `hw-rmbp`)
 

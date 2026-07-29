@@ -29,17 +29,40 @@
 //   4. On exit (ESC, or the interactive frame cap) it signals the workers to leave, JOINs both,
 //      and prints its witness before exiting 0.
 //
-// VUGCLICK — CLICK SEMANTICS IN A WINDOWED WORLD. Until this arc a click EXITED the program. That rule
+// VUGCLICK — CLICK SEMANTICS IN A WINDOWED WORLD. Until VUGCLICK a click EXITED the program. That rule
 // was written for the full-screen takeover era, where the vug owned the panel and any click meant "done".
 // Since WC-C there is no takeover mode left to reach: every vug creates its own compositor window
 // (SYS_WIN_CREATE, unconditional, below), tiled beside other windows. In that world clicking is how an
 // operator focuses or interacts with a window, so "click exits" meant every attempt to touch a vug killed
 // it — and with WC-J erasing a dead window instantly, the death read as a spontaneous crash (P62,
 // "vug is crashing", on a wire showing no panic, no fault, and the program's own designed exit path).
-// So: a click no longer exits. It toggles a PAUSE of the rotation — a harmless, visible, reversible
-// interaction that also proves the click reached EL0. A DRAG (motion at or over CLICK_THRESH between
-// press and release) still rotates, exactly as before. ESC remains the keyboard exit, unchanged and now
-// the only operator-driven one.
+// VUGCLICK's answer was to make a click toggle PAUSE instead of exiting; CLICK-ONE, below, retires that
+// answer along with the question.
+//
+// CLICK-ONE — ONE VISIBLE RULE FOR STOP AND START. P74, blocked at the bench: "click stop/start is all
+// messed up cannot continue test." Nothing was broken in isolation; THREE independently correct stop
+// states had accumulated, and a click could land in any of them:
+//   1. FROZEN BY UNFOCUS (VUGMIN-C) — only the focused vug runs; the rest hold still.
+//   2. PAUSED BY A DELIVERED CLICK (VUGCLICK) — the demo's own historical click meaning.
+//   3. PARKED ON AN EMPTY RING (VUGPAUSE-2) — no input, nothing to draw, so nothing runs.
+// CLICK-SWALLOW then made the FIRST click on an unfocused vug focus-only, so the SECOND click toggled
+// pause. The visible result of a click had become a function of invisible state — which vug had focus,
+// and whether this was the first click or the second. No operator can hold that model, and the bench
+// report is the proof.
+//
+// Peter's ruling, and the rule this program now implements without exception: **a click on a vug is
+// FOCUS/RESTORE ONLY, always, and is NEVER app input that changes run state.** The focused vug runs;
+// unfocused vugs freeze in place; there is no separate click-pause state to be in. What the operator
+// sees is one rule with one input: the window they clicked is the window that runs.
+//
+// The pause/resume verb the demo still wants moves to the KEYBOARD, where it can only reach the focused
+// vug by construction: SPACE toggles pause (`K_SPACE`, chosen because nothing bound it). A DRAG still
+// rotates, exactly as before — a drag is motion, not a click, and it was never a run-state gesture. ESC
+// remains the keyboard exit. Interactive takeover is untouched: it is keyboard-armed and unaffected.
+//
+// The ROUTER side needs no change and got none. `wc_click_route`'s already-focused arm still DELIVERS
+// the press, which stays correct: apps may legitimately want clicks, and this vug now simply ignores
+// them for run-state purposes. The swallow arm and the miss arm are the focus half of the same rule.
 //
 // TWO PATHS — deterministic auto (QEMU) vs interactive (metal). The switch is INPUT-DRIVEN, not
 // time-boxed (UVUG-4): the parent polls SYS_INPUT_POLL EVERY frame for the program's whole life, and
@@ -57,7 +80,7 @@
 //     mode at that frame: it prints `:: UVUG: interactive takeover at frame <n> ::` (proving the input
 //     arrived on metal), cancels the auto-tumble and the 300-frame cap, and switches to held-state
 //     control — WASD/arrows rotate (TRUE held state from KeyDown/KeyUp), Q/E zoom, a mouse drag rotates
-//     (per-frame clamped delta, full-panel-drag ≈ one revolution), a click toggles pause, ESC exits. It
+//     (per-frame clamped delta, full-panel-drag ≈ one revolution), SPACE toggles pause, ESC exits. It
 //     runs until ESC and prints `:: UVUG: interactive exit=<key|frames …> frames=<n> ::`.
 //     Interactive is metal-only (no HID in QEMU).
 //
@@ -83,7 +106,8 @@
 //     prose qualifier outside it — so no future sitting re-diagnoses this as a crash.
 // The deterministic AUTO path (AUTO_FRAMES = 300, the checksum witness) is untouched in both modes.
 //
-// VUGPAUSE — A PAUSED VUG MUST NOT BURN A CORE. VUGCLICK made a click PAUSE the rotation, and that is
+// VUGPAUSE — A PAUSED VUG MUST NOT BURN A CORE. VUGCLICK made a gesture PAUSE the rotation (a click
+// then, SPACE since CLICK-ONE — the mechanism below is indifferent to which), and that is
 // where it stopped: pause froze the frame's ADVANCE (the orientation stopped changing) but the frame
 // LOOP kept running at full rate — every paused frame still drained input, released both workers,
 // rasterised 128x128 twice, futex-barriered and PRESENTED, redrawing a surface that could not differ
@@ -95,7 +119,7 @@
 // SKIPPED entirely — no worker release, no rasterise, no barrier, no present. The parent polls input
 // and calls `SYS_YIELD`, which is the whole idle loop. Consequences, each deliberate:
 //   * UNPAUSE LATENCY is one idle iteration — a poll plus a yield — because the idle loop is exactly
-//     the input half of the normal frame. The click that unpauses, ESC, and a drag are all seen on the
+//     the input half of the normal frame. The SPACE that unpauses, ESC, and a drag are all seen on the
 //     very next pass, and the first frame after ANY state change renders normally.
 //   * THE WINDOW STAYS LIVE AND KILLABLE. VUGGUARD's P60 lesson is that a vug which parks in an
 //     unbounded `futex_wait` is an unkillable empty window; this idle path never blocks on anything. It
@@ -615,13 +639,27 @@ const H_PIT_U: u32 = 1 << 2;
 const H_PIT_D: u32 = 1 << 3;
 const H_ZOOM_IN: u32 = 1 << 4;
 const H_ZOOM_OUT: u32 = 1 << 5;
+/// CLICK-ONE: SPACE rides the SAME held word as the motion keys, for one reason only — typematic
+/// repeat suppression. `pal.rs`'s engine synthesises a KeyDown every `RATE_MS` (40 ms) once a key has
+/// been down `DELAY_MS` (400 ms), and a toggle driven off raw KeyDowns would flip 25 times a second
+/// under a resting thumb. Held state tells a TRUE press edge from a repeat for free, which is what
+/// `held` already exists to do.
+const H_PAUSE: u32 = 1 << 6;
+/// The held bits that mean MOTION. `H_PAUSE` is deliberately outside it: a held SPACE must not read as
+/// manual control, or holding the pause key would silently stop the idle tumble of an unpaused vug.
+const H_MOTION: u32 = H_YAW_L | H_YAW_R | H_PIT_U | H_PIT_D | H_ZOOM_IN | H_ZOOM_OUT;
 
-// HID-KEYS arrow C0 codes (see vug.rs) and ESC.
+// HID-KEYS arrow C0 codes (see vug.rs), ESC, and CLICK-ONE's pause key.
 const K_RIGHT: u8 = 0x1C;
 const K_LEFT: u8 = 0x1D;
 const K_DOWN: u8 = 0x1E;
 const K_UP: u8 = 0x1F;
 const K_ESC: u8 = 0x1B;
+/// CLICK-ONE: SPACE toggles pause. Chosen because it is UNBOUND here — `key_bit` maps WASD/arrows,
+/// Q/E and the +/- family and nothing else, and ESC is handled ahead of it — so no existing gesture
+/// changes meaning. It is also the conventional pause key, and the xHCI table delivers it as plain
+/// ASCII 0x20 (keycode 0x2C, shifted and unshifted alike), so no modifier state is involved.
+const K_SPACE: u8 = b' ';
 
 fn key_bit(k: u8) -> u32 {
     let k = k.to_ascii_lowercase();
@@ -632,6 +670,7 @@ fn key_bit(k: u8) -> u32 {
         b's' | K_DOWN => H_PIT_D,
         b'e' | b'+' | b'=' => H_ZOOM_IN,
         b'q' | b'-' | b'_' => H_ZOOM_OUT,
+        K_SPACE => H_PAUSE,
         _ => 0,
     }
 }
@@ -663,21 +702,23 @@ const MAX_DRAIN_PER_FRAME: u32 = 64;
 struct FrameInput {
     any: bool,      // any event at all this frame (arms interactive mode)
     exit_key: bool, // ESC pressed
-    /// VUGCLICK: a click (button press+release under the motion threshold). NO LONGER AN EXIT — see
-    /// the click-semantics note above `_start`'s frame loop. It toggles the pause state.
-    clicks: u32,
+    /// CLICK-ONE: TRUE SPACE press edges this frame (repeats excluded — see `H_PAUSE`), each one a
+    /// pause toggle. Counted rather than latched so the consumer can take the PARITY: two presses
+    /// inside one frame must leave the state where it started, and a bool would turn that into a
+    /// spurious toggle. This replaces VUGCLICK's `clicks`: a click is no longer app input at all
+    /// (see the click-semantics note above `_start`'s frame loop).
+    pause_keys: u32,
     mdx: i32, // summed relative mouse dx while dragging
     mdy: i32, // summed relative mouse dy while dragging
     /// UVUG-9: the drain hit `MAX_DRAIN_PER_FRAME` with the ring still non-empty — the freeze signature.
     saturated: bool,
 }
 
-/// Drain this frame's queued input events. Updates `held`/`dragging`/`drag_motion` in place and returns the
+/// Drain this frame's queued input events. Updates `held`/`dragging` in place and returns the
 /// per-frame accumulation. BOUNDED at `MAX_DRAIN_PER_FRAME` events (see that constant for the P54b root
 /// cause): whatever is left stays in the ring for the next frame, so the render/present half of the loop is
 /// always reached.
-fn drain_input(held: &mut u32, dragging: &mut bool, drag_motion: &mut i32) -> FrameInput {
-    const CLICK_THRESH: i32 = 6;
+fn drain_input(held: &mut u32, dragging: &mut bool) -> FrameInput {
     let mut fi = FrameInput::default();
     let mut budget = MAX_DRAIN_PER_FRAME;
     loop {
@@ -699,7 +740,14 @@ fn drain_input(held: &mut u32, dragging: &mut bool, drag_motion: &mut i32) -> Fr
                 if k == K_ESC {
                     fi.exit_key = true;
                 } else {
-                    *held |= key_bit(k);
+                    let b = key_bit(k);
+                    // CLICK-ONE: SPACE toggles on the TRUE press edge — a bit that is not already set.
+                    // Every later KeyDown for a key still down is a typematic repeat and is absorbed by
+                    // the `|=` below, exactly as it always has been for the motion keys.
+                    if b & !*held & H_PAUSE != 0 {
+                        fi.pause_keys += 1;
+                    }
+                    *held |= b;
                 }
             }
             EV_KEYUP => {
@@ -711,24 +759,21 @@ fn drain_input(held: &mut u32, dragging: &mut bool, drag_motion: &mut i32) -> Fr
             }
             EV_BUTTON => {
                 let mask = lo & 0xFF;
-                if mask != 0 {
-                    // Press edge: start a drag (also clears held keys — the vug.rs hot-unplug net).
-                    *dragging = true;
-                    *drag_motion = 0;
+                // CLICK-ONE: a button edge carries NO run-state meaning any more. A press starts a
+                // drag, a release ends one, and that is the whole of it — there is no click/drag
+                // discrimination left to make, so `CLICK_THRESH` and the motion accumulator that fed
+                // it are gone. A click that never moves is simply a drag of zero pixels: it rotates
+                // nothing and changes nothing.
+                *dragging = mask != 0;
+                if *dragging {
+                    // Press edge also clears held keys — the vug.rs hot-unplug net.
                     *held = 0;
-                } else {
-                    // Release edge: little motion = a CLICK (pause toggle); otherwise it ended a drag.
-                    if *drag_motion < CLICK_THRESH {
-                        fi.clicks += 1;
-                    }
-                    *dragging = false;
                 }
             }
             EV_MOUSE_REL => {
                 let dx = ((lo >> 16) & 0xFFFF) as u16 as i16 as i32;
                 let dy = (lo & 0xFFFF) as u16 as i16 as i32;
                 if *dragging {
-                    *drag_motion += dx.abs() + dy.abs();
                     fi.mdx += dx;
                     fi.mdy += dy;
                 }
@@ -1136,11 +1181,10 @@ pub extern "C" fn _start() -> ! {
     let mut dist: Fx = 4 * ONE;
     let mut held: u32 = 0;
     let mut dragging = false;
-    let mut drag_motion: i32 = 0;
 
     let mut interactive = false; // flipped permanently by the first input event, at any frame
     let mut exit_key = false;
-    // VUGCLICK: rotation pause, toggled by a click. Purely cosmetic and interactive-only.
+    // CLICK-ONE: rotation pause, toggled by SPACE. Purely cosmetic and interactive-only.
     let mut paused = false;
     // VUGLIFE: one-shot latch for the waived-budget witness (detached/interactive only).
     let mut budget_waived = false;
@@ -1165,7 +1209,7 @@ pub extern "C" fn _start() -> ! {
     let mut frame: u32 = 0;
     loop {
         // --- input (polled EVERY frame for the program's whole life) ---
-        let fi = drain_input(&mut held, &mut dragging, &mut drag_motion);
+        let fi = drain_input(&mut held, &mut dragging);
         if fi.saturated {
             // UVUG-9: the drain spent its whole frame budget with events still queued. Pre-fix this loop had
             // no budget to spend and simply never returned — the P54b freeze. Report once and carry on.
@@ -1185,16 +1229,15 @@ pub extern "C" fn _start() -> ! {
             if fi.exit_key {
                 exit_key = true;
             }
-            // VUGCLICK: a click toggles pause; it does NOT exit. Clicks are human-rate, so one line per
-            // toggle cannot flood the serial log, and the line doubles as proof that a click reached EL0.
-            let mut c = fi.clicks;
-            while c > 0 {
+            // CLICK-ONE: SPACE toggles pause; nothing the mouse does can. Parity, not a loop: two
+            // press edges inside one frame are two toggles and cancel, so only an odd count changes
+            // state — and only a change is worth a line. Human-rate by construction (one line per
+            // press of a key a person is pressing), and the line doubles as proof that a keystroke
+            // reached EL0.
+            if fi.pause_keys & 1 != 0 {
                 paused = !paused;
-                c -= 1;
-            }
-            if fi.clicks > 0 {
                 let mut pb = Buf::new();
-                pb.put(b":: UVUG: click pause=");
+                pb.put(b":: UVUG: pause=");
                 pb.put_dec(paused as u32);
                 pb.put(b" ::\n");
                 pb.flush();
@@ -1230,9 +1273,9 @@ pub extern "C" fn _start() -> ! {
         let frozen = paused || hidden;
 
         // --- fold input into rotation/zoom ---
-        let manual = interactive && (held != 0 || (dragging && (fi.mdx != 0 || fi.mdy != 0)));
+        let manual = interactive && (held & H_MOTION != 0 || (dragging && (fi.mdx != 0 || fi.mdy != 0)));
         if frozen {
-            // VUGCLICK: clicked-to-pause — hold the current orientation. VUGPAUSE: holding it is now
+            // CLICK-ONE: paused by SPACE — hold the current orientation. VUGPAUSE: holding it is now
             // also what lets the frame below be skipped entirely; the window stays live because the
             // idle path keeps polling and yielding, not because it keeps redrawing. VUGMIN: a hidden
             // vug holds the identical way, so the orientation the operator left on screen is the
@@ -1282,7 +1325,7 @@ pub extern "C" fn _start() -> ! {
         //
         // What DOES run is the input half plus one `SYS_YIELD` — the loop is bounded and runnable by
         // construction, never a park (VUGGUARD/P60), so the window stays live and `kill`-able and the
-        // click that unpauses is acted on within one iteration.
+        // SPACE that unpauses is acted on within one iteration.
         //
         // VUGMIN widened the FIRST conjunct only, via `frozen`. `presented` still gates, so a vug hidden
         // before its first present renders that first frame normally rather than idling on an empty
@@ -1360,7 +1403,7 @@ pub extern "C" fn _start() -> ! {
             // leaves the run queues entirely.
             //
             // Responsiveness is not traded away for it: the kernel issues the wake from the router's own
-            // enqueue, so the click that unpauses and the keystroke that exits re-ready this task in the
+            // enqueue, so the SPACE that unpauses and the keystroke that exits re-ready this task in the
             // same pass the event arrives — sooner than the yield loop, which had to wait to be dispatched
             // before it could look. Focus arrival and un-hiding wake it too, since neither moves the ring.
             //
