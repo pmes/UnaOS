@@ -1257,6 +1257,159 @@ fn el0_resident_leave(cpu: usize) {
     });
 }
 
+// SPREAD-4 — A COMMITTED RESIDENT IS NOT THE SAME THING AS A RUNNABLE ONE.
+//
+// SPREAD-3's residents key fixed the burst problem (N spawns in one window no longer agree on one
+// core), but it counts HEADS, not LOAD: a vug spinning flat out and a vug parked on its input futex
+// weigh exactly the same. On a live fleet that is the dominant error, because a windowed EL0 app
+// spends most of its life PARKED — VUGPAUSE-2 made the idle vug block on `SYS_INPUT_WAIT` and its
+// workers block on the phase futex, so a four-vug desktop with one active window reads
+// `residents = 4` spread over the cores that happened to be least loaded at spawn time, and every
+// later placement steers around load that is not there. The P73 wire is the shape that produces:
+// per-core busy swinging 3-5x while the residents counts stay flat and even.
+//
+// The second half is that the count is only ever consulted at SPAWN. EL0 tasks are `steal_ok = false`
+// (they carry per-core address-space state), so `try_steal` can never correct them — and neither can
+// anything else, because `make_ready` returns a woken task to `task.cpu` unconditionally. A vug that
+// was placed on c1 when c1 was idle re-runs on c1 forever, however crowded c1 later becomes. That is
+// the "parked-then-resumed vug re-runs on its original core regardless of current load" half, and it
+// is also the sched half of the vug speed-up delay: when its peers park, the surviving vug's own
+// worker threads stay bunched on the cores they were spawned onto and the fleet-of-one never spreads.
+//
+// SPREAD-4 fixes both with one counter and one decision point:
+//
+//   1. LIVE RESIDENTS. `EL0_PARKED` tracks how many of a core's committed residents are currently
+//      BLOCKED. `el0_active` = committed - parked is the RUNNABLE resident count, and that is what
+//      `pick_cpu` keys on. A parked vug stops anchoring load to its core the moment it blocks and
+//      starts counting again the moment it wakes. Nothing else about SPREAD-3's accounting moves:
+//      `EL0_RESIDENTS` keeps its exact enter/leave sites and its exact meaning.
+//   2. RE-PLACE AT WAKE. `make_ready` is the single funnel every wake goes through (sleeper drain,
+//      `Semaphore::post`, `futex_wake`, the kill sweeps), and a task arriving there is parked — it
+//      owns no core, holds no per-core register state, and is about to be pushed onto SOME queue.
+//      That is the one instant at which an EL0 task can be moved for free, so that is where the
+//      committed-load signal gets a second look. See `rewake_place`.
+
+/// SPREAD-4 — how many of each core's committed EL0 residents are currently PARKED (blocked in a wait
+/// queue or on the sleeper list). Incremented by `park_blocked` and decremented by `make_ready`, which
+/// are the sole park/wake funnels: every blocking primitive an EL0 task can reach (`Semaphore::wait`,
+/// `futex_wait`, `sleep_ticks`) parks by setting `park_kind` and switching back, and every wake path
+/// re-readies through `make_ready`. The pair is therefore exactly balanced.
+///
+/// `retire_killed` needs no arm here: the task it reaps was just POPPED FROM A RUN QUEUE, so it was
+/// READY (already un-parked by the `make_ready` that the kill sweep performed) and only its
+/// `EL0_RESIDENTS` credit is outstanding. `exit()` likewise runs on a RUNNING task.
+static EL0_PARKED: [AtomicUsize; NUM_CPUS] = [const { AtomicUsize::new(0) }; NUM_CPUS];
+
+/// SPREAD-4 — note that a committed EL0 resident of `cpu` has gone to sleep.
+#[inline]
+fn el0_parked_enter(cpu: usize) {
+    if cpu < NUM_CPUS {
+        EL0_PARKED[cpu].fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// SPREAD-4 — note that a parked EL0 resident of `cpu` is runnable again. Saturating at zero for the
+/// same reason `el0_resident_leave` is: an accounting slip must never underflow into `usize::MAX` and
+/// make a busy core look permanently empty (the failure mode here is the DANGEROUS direction —
+/// `el0_active` would saturate to 0 and the core would attract every placement on the machine).
+#[inline]
+fn el0_parked_leave(cpu: usize) {
+    if cpu >= NUM_CPUS {
+        return;
+    }
+    let _ = EL0_PARKED[cpu].fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        if n == 0 { None } else { Some(n - 1) }
+    });
+}
+
+/// SPREAD-4 — RUNNABLE EL0 residents on `cpu`: committed minus parked. This is the committed-load
+/// signal `pick_cpu` keys on and the one `rewake_place` compares cores by. Saturating rather than
+/// wrapping: the two counters are updated by different cores at different instants, so a reader can
+/// legitimately observe `parked > residents` for a few cycles mid-wake (the parked decrement lands
+/// before the resident transfer). Saturation makes that transient read 0 — one placement decision
+/// made against a count that is one low — instead of a huge number that would exclude the core.
+#[inline]
+fn el0_active(cpu: usize) -> usize {
+    if cpu >= NUM_CPUS {
+        return 0;
+    }
+    EL0_RESIDENTS[cpu]
+        .load(Ordering::Acquire)
+        .saturating_sub(EL0_PARKED[cpu].load(Ordering::Acquire))
+}
+
+/// SPREAD-4 — how much less loaded another core must be before a waking EL0 task is moved onto it,
+/// in RUNNABLE residents. Two, not one, and the gap is the whole stability argument: with a margin of
+/// one, two cores carrying `n` and `n-1` would trade a task back and forth on every wake (each move
+/// makes the destination the loaded one), and a windowed vug wakes on every frame. A margin of two
+/// cannot oscillate — moving a task across a gap of two leaves the two cores at `n-1` and `n`, which
+/// is a gap of one, which is below the threshold — so each imbalance is corrected at most once.
+const REWAKE_MARGIN: usize = 2;
+
+/// SPREAD-4 — choose the core a waking EL0 task should run on, given the core it was parked from.
+/// Returns `home` unless some other online core is at least `REWAKE_MARGIN` runnable residents
+/// lighter, in which case it returns the lightest such core (rolling busy fraction breaking ties —
+/// PULSE-5 made that number current rather than a lagging window, which is what makes it usable on a
+/// decision path at all).
+///
+/// Called with the waking task ALREADY un-parked from `home`'s parked count, so `home`'s figure is
+/// the load the task would be joining, not including itself — the comparison is apples to apples.
+///
+/// FRESHNESS GATE (WEDGE-1's, for WEDGE-1's reason). An EL0 task is `steal_ok = false`: whichever
+/// queue it lands on is the only core that will ever run it, so handing it to a core that has stopped
+/// going round its dispatch loop parks it forever. A candidate must therefore have folded a load span
+/// within `dispatch_fresh_cyc()`. This is deliberately conservative in the safe direction — declining
+/// every candidate simply leaves the task at home, which is the pre-SPREAD-4 behaviour.
+///
+/// Lock-free by construction (atomics and one sysreg read; no run-queue lock), which is required:
+/// `make_ready` calls this INSIDE the IRQ-masked wake path and the `rq()` discipline forbids nesting
+/// a second run-queue section under the push that follows.
+fn rewake_place(home: usize) -> usize {
+    if home >= NUM_CPUS {
+        return home;
+    }
+    let home_act = el0_active(home);
+    if home_act < REWAKE_MARGIN {
+        return home; // home is not carrying enough to be worth correcting
+    }
+    let fresh = dispatch_fresh_cyc();
+    let mut best = home;
+    let mut best_act = home_act;
+    let mut best_pct = u32::MAX;
+    for cpu in 0..NUM_CPUS {
+        if cpu == home || !ONLINE_MASK[cpu].load(Ordering::Acquire) {
+            continue;
+        }
+        let act = el0_active(cpu);
+        if act + REWAKE_MARGIN > home_act {
+            continue; // not enough of a win to pay for the move
+        }
+        if ACCT[cpu].fold_age_cyc() >= fresh {
+            continue; // not provably dispatching — never hand it a task only it can run
+        }
+        let pct = ACCT[cpu].busy_pct();
+        if act < best_act || (act == best_act && pct < best_pct) {
+            best = cpu;
+            best_act = act;
+            best_pct = pct;
+        }
+    }
+    best
+}
+
+/// SPREAD-4 — wakes that moved an EL0 task to a lighter core, and wakes that left it where it was.
+/// The ratio is the arc's own honesty check: a fleet in balance should be nearly all `stay`.
+static SPREAD4_REWAKE: AtomicU64 = AtomicU64::new(0);
+static SPREAD4_STAY: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-4 — rate limit for the per-event `[spread4] rewake` trace, on the same terms as
+/// `[smpbal] steal`: name the first few moves, then go quiet so a steadily-rebalancing desktop cannot
+/// flood the serial log. The cumulative counters in `spread4_witness` carry the steady state.
+#[cfg(feature = "pi")]
+const SPREAD4_LOG_MAX: u32 = 16;
+#[cfg(feature = "pi")]
+static SPREAD4_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+
 /// Register `cpu` as an online, scheduling core — a candidate for `CPU_AUTO` load-balanced placement.
 /// Called by the BSP as it releases the APs (`start_aps`); idempotent, introspection-only bookkeeping
 /// (no effect on any existing caller-pinned spawn, so boot behavior is byte-identical without CPU_AUTO).
@@ -1269,10 +1422,12 @@ pub fn mark_online(cpu: usize) {
 /// Resolve a requested `cpu` to a concrete core. An explicit index passes through verbatim (the
 /// no-migrate pin contract). `CPU_AUTO` selects the least-loaded online core, keyed in this order:
 ///
-///   1. SPREAD-3 — fewest COMMITTED live EL0 residents (`EL0_RESIDENTS`). This is the only signal
-///      that is already true at the instant of the decision, so N spawns in a burst spread instead of
-///      all agreeing on one core. It is the primary key precisely because a running compute-bound EL0
-///      task is invisible to both keys below.
+///   1. SPREAD-3/SPREAD-4 — fewest RUNNABLE EL0 residents (`el0_active` = committed minus parked).
+///      This is the only signal that is already true at the instant of the decision, so N spawns in a
+///      burst spread instead of all agreeing on one core. It is the primary key precisely because a
+///      running compute-bound EL0 task is invisible to both keys below. SPREAD-4 subtracts the PARKED
+///      residents: a vug blocked on its input futex owes its core nothing, and counting it kept
+///      placement steering around load that was not there (see `EL0_PARKED`).
 ///   2. minimum ready-queue DEPTH — the classic "will this task wait" signal, still the right
 ///      discriminator between cores carrying equal resident counts.
 ///   3. lower rolling-window busy fraction, then
@@ -1296,7 +1451,7 @@ fn pick_cpu(requested: usize) -> usize {
         if !ONLINE_MASK[cpu].load(Ordering::Acquire) {
             continue;
         }
-        let res = EL0_RESIDENTS[cpu].load(Ordering::Acquire);
+        let res = el0_active(cpu); // SPREAD-4: runnable residents, not merely committed ones
         let depth = rq(cpu).len();
         let pct = ACCT[cpu].busy_pct();
         let better = res < best_res
@@ -1688,12 +1843,66 @@ fn poke_cpu(target: usize) {
     }
 }
 
-/// Mark a parked/just-woken task READY, push it onto its PINNED CPU's run queue, and poke that CPU.
-/// Used by the sleeper drain (same CPU) and, from M4b, `Semaphore::post` (cross-CPU wake). The task
-/// always returns to `task.cpu`, so its per-CPU (TPIDR_EL2) view stays correct on resume — tasks do
-/// not migrate. Caller runs with IRQ masked.
-fn make_ready(task: Box<Task>) {
-    let target = task.cpu as usize;
+/// Mark a parked/just-woken task READY, push it onto a run queue, and poke that CPU. Used by the
+/// sleeper drain (same CPU) and, from M4b, `Semaphore::post` (cross-CPU wake). Caller runs with IRQ
+/// masked.
+///
+/// A KERNEL task always returns to `task.cpu` exactly as before — that is the no-migrate contract the
+/// kernel blocking primitives are written against (`Condvar::wait` rebuilds its `!Send` guard on the
+/// resuming core; `spawn_inner`'s caller-pinned tasks are pinned on purpose), and nothing here
+/// touches it.
+///
+/// SPREAD-4 — AN EL0 TASK GETS ITS PLACEMENT RE-EXAMINED HERE, AND ONLY HERE. Two things have to be
+/// true at once for a move to be sound, and this is the only point in a task's life where both are:
+///
+///   * the task owns no core state. It is parked: not `current` anywhere, not in any run queue, no
+///     live register context beyond the saved frame on its own kernel stack (which is a Global
+///     identity mapping, valid under every root). `dispatch_next` installs `user_ttbr0` on whichever
+///     core dispatches it, so the address space follows the task rather than the core.
+///   * we already hold the decision. The wake is going to push onto SOME queue in the next few
+///     instructions, so choosing a different one costs one comparison and no extra machinery.
+///
+/// The residual is the old core's TTBR0, which keeps pointing at the moved task's slot root until
+/// that core next dispatches a user task. That is benign and stays benign: the slot L1 tables are a
+/// STATIC array (`boot::SLOT_L1`), never freed to the heap, and `teardown_user_slot` broadcasts
+/// `tlbi aside1is` for the ASID on the last release — so a core left holding the value has no stale
+/// translations and no dangling page. It runs EL1 code, which never touches a low VA.
+///
+/// The counters are kept consistent across the move in one order: un-park at home (so `home`'s figure
+/// excludes the waker itself), pick, then transfer the RESIDENT credit home -> target and retarget
+/// `task.cpu`. Both reap paths (`exit`, `retire_killed`) release against `task.cpu`, so the transfer
+/// is what keeps them releasing the core that is actually carrying the task.
+fn make_ready(mut task: Box<Task>) {
+    let home = task.cpu as usize;
+    let mut target = home;
+    // SPREAD-4: `user_entry != 0` is the same EL0 test SPREAD-3's enter/leave sites use, so the parked
+    // accounting covers exactly the population the resident accounting does. A kernel task falls
+    // straight through to the unchanged push below.
+    if task.user_entry != 0 {
+        el0_parked_leave(home);
+        target = rewake_place(home);
+        if target != home {
+            el0_resident_leave(home);
+            let act = el0_resident_enter(target);
+            task.cpu = target as u32;
+            SPREAD4_REWAKE.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "pi")]
+            if SPREAD4_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < SPREAD4_LOG_MAX {
+                serial_println!(
+                    ":: [spread4] rewake asid={} tid={} from=c{} to=c{} act={} ::",
+                    task.user_ttbr0 >> 48,
+                    task.id,
+                    home,
+                    target,
+                    act
+                );
+            }
+            #[cfg(not(feature = "pi"))]
+            let _ = act;
+        } else {
+            SPREAD4_STAY.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     debug_assert!(target < NUM_CPUS, "make_ready: cpu out of range");
     task.state.store(STATE_READY, Ordering::Release);
     rq(target).push(task);
@@ -2505,6 +2714,14 @@ pub fn note_core_idle(cpu: usize) {
 /// Park a task that switched back BLOCKED, per the action it set before switching. Runs in the
 /// scheduler context with IRQ masked and owns `task`.
 fn park_blocked(cpu: usize, park: u8, task: Box<Task>) {
+    // SPREAD-4: this is the SOLE park funnel — every blocking primitive an EL0 task can reach
+    // (`Semaphore::wait`, `futex_wait`, `sleep_ticks`) marks itself BLOCKED, sets `park_kind` and
+    // switches back into `dispatch_next`, which lands here. A parked resident owes its core no CPU, so
+    // it stops counting towards `el0_active` for as long as it sleeps; `make_ready` puts it back.
+    let el0_home = if task.user_entry != 0 { Some(task.cpu as usize) } else { None };
+    if let Some(home) = el0_home {
+        el0_parked_enter(home);
+    }
     match park {
         PARK_WAITQ => {
             // Lock-handoff: the blocking task acquired the wait queue's lock and held it ACROSS the
@@ -2526,6 +2743,12 @@ fn park_blocked(cpu: usize, park: u8, task: Box<Task>) {
         }
         _ => {
             // A BLOCKED task with no valid park action is a bug; don't leak it — drop it (frees the stack).
+            // SPREAD-4: it is never coming back through `make_ready`, so undo the park credit AND
+            // release its residency, or the core would carry a phantom resident for the rest of the boot.
+            if let Some(home) = el0_home {
+                el0_parked_leave(home);
+                el0_resident_leave(home);
+            }
             debug_assert!(false, "BLOCKED task with no park action");
             drop(task);
         }
@@ -4377,6 +4600,7 @@ fn load_witness_tick() {
         c(0), c(1), c(2), c(3), ctx_delta
     );
     pulse5_witness();
+    spread4_witness(); // SPREAD-4: the placement signal beside the load it is derived from
 }
 
 /// PULSE-5 — the proof line for age-on-read. It says three things and nothing else: how long each
@@ -4405,6 +4629,38 @@ fn pulse5_witness() {
         cyc_to_ms(PULSE5_SPAN_MAX_CYC.load(Ordering::Relaxed)),
         cyc_to_ms(load_window_cyc()),
         PULSE5_FOLD_WINDOWS.load(Ordering::Relaxed),
+    );
+}
+
+/// SPREAD-4 — the proof line for live residents + re-placement, in the `[pulse5]` mould and emitted
+/// from the same two sites, so the placement signal is readable beside the load numbers it is derived
+/// from. It says exactly three things:
+///
+///   * `cN=active/committed` — per core, the runnable resident count `pick_cpu` now keys on, over the
+///     SPREAD-3 committed count it used to. `2/5` is the arc in one field: three of that core's five
+///     EL0 residents are parked and were, until now, steering placement away from a core with room.
+///   * `rewake` / `stay` — how many EL0 wakes moved to a lighter core and how many did not. A fleet in
+///     balance is nearly all `stay`; a burst of `rewake` is a pile-up being taken apart.
+///   * `margin` — the threshold those decisions were made against, so a reading is interpretable
+///     without the source.
+///
+/// Reads only, lock-free, safe from any core. Not `pi`-gated, matching `pulse5_witness` beside it: it
+/// is one introspection line on a path that already prints one, and the counters it reads exist on
+/// every aarch64 build (they simply stay zero where there is no EL0).
+fn spread4_witness() {
+    serial_println!(
+        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} margin={}",
+        el0_active(0),
+        EL0_RESIDENTS[0].load(Ordering::Relaxed),
+        el0_active(1),
+        EL0_RESIDENTS[1].load(Ordering::Relaxed),
+        el0_active(2),
+        EL0_RESIDENTS[2].load(Ordering::Relaxed),
+        el0_active(3),
+        EL0_RESIDENTS[3].load(Ordering::Relaxed),
+        SPREAD4_REWAKE.load(Ordering::Relaxed),
+        SPREAD4_STAY.load(Ordering::Relaxed),
+        REWAKE_MARGIN,
     );
 }
 
@@ -4463,6 +4719,10 @@ pub fn load_accounting_witness() {
     // PULSE-5: the aged-read state behind the percents just asserted, on the one path the QEMU
     // battery actually reaches. Separate line, so the PASS/FAIL line the gate matches is untouched.
     pulse5_witness();
+    // SPREAD-4: same reasoning, same site. In the QEMU battery this runs before any EL0 task exists,
+    // so it reads all-zero — which is the honest baseline, and it proves the counters are wired and
+    // the line is emitted. The numbers that matter are the ones `load_witness_tick` prints on metal.
+    spread4_witness();
 }
 
 /// M3b/M4a/M4-capstone: turn on preemptive scheduling and put a workload on the APs, then flip

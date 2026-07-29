@@ -389,6 +389,81 @@ accounting directly: successive `bg-el0` launches should walk the cores rather
 than repeating one, and `residents` should climb evenly across them instead of
 running up on a single core.
 
+### Live residents + re-placement at wake (aarch64, SPREAD-4)
+
+SPREAD-3's residents key counts **heads, not load**, and it is only ever consulted
+at **spawn**. Both halves matter on a live vug fleet, and together they are the
+P73 shape (per-core busy swinging 3–5x while the resident counts sit flat).
+
+- **A parked resident is not load.** A windowed EL0 app spends most of its life
+  blocked — VUGPAUSE-2 parks the idle vug on `SYS_INPUT_WAIT` and its workers on
+  the phase futex — so a four-vug desktop with one active window reads
+  `residents = 4` and every later placement steers around load that is not there.
+- **Placement is never revisited.** EL0 tasks are `steal_ok: false` (they carry
+  per-core address-space state), so `try_steal` cannot correct them, and
+  `make_ready` returned a woken task to `task.cpu` unconditionally. A vug placed
+  on c1 while c1 was idle re-ran on c1 forever. This is also the scheduler half of
+  the vug speed-up delay: when its peers park, the surviving vug's own worker
+  threads stay bunched on the cores they were spawned onto.
+
+SPREAD-4 adds one counter and one decision point.
+
+- **`EL0_PARKED[cpu]`** — how many of a core's committed residents are currently
+  blocked. `park_blocked` increments it and `make_ready` decrements it; those are
+  the sole park/wake funnels (every EL0-reachable blocking primitive —
+  `Semaphore::wait`, `futex_wait`, `sleep_ticks` — marks itself BLOCKED, sets
+  `park_kind` and switches back into `dispatch_next`, which lands in
+  `park_blocked`), so the pair is exactly balanced. `retire_killed` needs no arm:
+  the task it reaps was popped from a run queue, i.e. already un-parked by the
+  kill sweep's own `make_ready`. `exit()` runs on a RUNNING task.
+- **`el0_active(cpu)` = committed − parked** is what `pick_cpu` now keys on.
+  `EL0_RESIDENTS` keeps its exact enter/leave sites and its exact meaning; only
+  the *reader* changes. The subtraction saturates, so a transient mid-wake read
+  (parked decremented before the resident credit transfers) yields 0 rather than a
+  huge number that would exclude the core.
+- **`rewake_place(home)`** — on an EL0 wake, `make_ready` re-examines placement and
+  moves the task to the lightest online core that is at least `REWAKE_MARGIN` (2)
+  runnable residents lighter, breaking ties on the (PULSE-5-aged, therefore
+  current) busy fraction. Kernel tasks are untouched and still return to
+  `task.cpu` — that is the contract `Condvar::wait` and every caller-pinned spawn
+  are written against.
+
+**Why a wake is the sound moment to move an EL0 task.** It is parked: not
+`current` anywhere, not in any run queue, holding no live register state beyond
+the saved frame on its own kernel stack (a Global identity mapping valid under
+every root). `dispatch_next` installs `user_ttbr0` on whichever core dispatches
+it, so the address space follows the task. The residual is the old core's TTBR0,
+which keeps pointing at the moved task's slot root until that core next dispatches
+a user task — benign and staying benign, because the slot L1 tables are a static
+array (`boot::SLOT_L1`, never freed to the heap) and `teardown_user_slot`
+broadcasts `tlbi aside1is` for the ASID on the last release, so the core holds no
+stale translation and no dangling page while running EL1 code that never touches a
+low VA.
+
+**Why the margin is 2.** With a margin of 1, two cores at `n` and `n−1` would
+trade a task back and forth on every wake, and a windowed vug wakes every frame.
+Moving across a gap of two leaves the cores at `n−1` and `n` — a gap of one, below
+threshold — so each imbalance is corrected at most once and cannot oscillate.
+
+**Freshness gate.** An EL0 task is non-stealable, so whichever queue it lands on is
+the only core that will ever run it. A candidate must have folded a load span
+within `dispatch_fresh_cyc()` (WEDGE-1's bound, for WEDGE-1's reason); declining
+every candidate simply leaves the task at home, which is the pre-SPREAD-4
+behaviour.
+
+**Witness.** A rate-limited per-event trace plus a rollup emitted from the two
+`pulse5_witness` sites:
+
+```
+:: [spread4] rewake asid=1 tid=109 from=c2 to=c1 act=1 ::
+[spread4] live c0=2/5 c1=1/1 c2=0/3 c3=1/1 rewake=10 stay=884 margin=2
+```
+
+`cN=active/committed` is the arc in one field: `0/3` is a core whose three EL0
+residents are all parked and which was, until now, repelling placements from a
+core with room. A fleet in balance is nearly all `stay`; a burst of `rewake` is a
+pile-up being taken apart.
+
 ### BSP scheduling + work stealing (aarch64, SMP-BAL)
 
 SCHED-3 balances at **spawn**, but a task's cost is unknown then and wake bursts
