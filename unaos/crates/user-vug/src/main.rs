@@ -50,19 +50,31 @@
 // and whether this was the first click or the second. No operator can hold that model, and the bench
 // report is the proof.
 //
-// Peter's ruling, and the rule this program now implements without exception: **a click on a vug is
-// FOCUS/RESTORE ONLY, always, and is NEVER app input that changes run state.** The focused vug runs;
-// unfocused vugs freeze in place; there is no separate click-pause state to be in. What the operator
-// sees is one rule with one input: the window they clicked is the window that runs.
+// CLICK-ONE's answer was that **a click is FOCUS/RESTORE ONLY and never app input**: the focused vug
+// runs, unfocused vugs freeze in place, and the pause verb moves to the KEYBOARD (SPACE — `K_SPACE`,
+// chosen because nothing bound it). A DRAG still rotates, ESC still exits, and interactive takeover is
+// keyboard-armed and untouched.
 //
-// The pause/resume verb the demo still wants moves to the KEYBOARD, where it can only reach the focused
-// vug by construction: SPACE toggles pause (`K_SPACE`, chosen because nothing bound it). A DRAG still
-// rotates, exactly as before — a drag is motion, not a click, and it was never a run-state gesture. ESC
-// remains the keyboard exit. Interactive takeover is untouched: it is keyboard-armed and unaffected.
+// CLICK-PLAIN — THE CLICK IS ACKNOWLEDGED WHERE THE OPERATOR CAN SEE IT. P75, on metal: "stop works
+// like absolute garbage there is no reason to it." CLICK-ONE removed the click's run-state meaning but
+// left the operator with NO feedback for a click at all, while the kernel side (CLICK-SWALLOW's swallowed
+// press, VUGMIN-C's hide of the DEPARTING focus owner) meant a click still appeared to stop a vug — one
+// click later, and a different vug than the one clicked. Both kernel halves are gone this arc: the router
+// DELIVERS the focus-changing press to the window it just raised, and a focus change never hides anything
+// any more (only focusing the SHELL idles the fleet).
 //
-// The ROUTER side needs no change and got none. `wc_click_route`'s already-focused arm still DELIVERS
-// the press, which stays correct: apps may legitimately want clicks, and this vug now simply ignores
-// them for run-state purposes. The swallow arm and the miss arm are the focus half of the same rule.
+// What this program does with the delivered click is deliberately split into two layers, so the final
+// grammar is a decision rather than an accident:
+//   * LAYER 1 (this file, unconditional) — a click is ACKNOWLEDGED and nothing else. It advances a
+//     counter drawn beside the fps readout in the top-left corner, and prints `:: UVUG: click n=<N> ::`.
+//     Zero coupling to run state; SPACE remains the only stop/start control. That makes "did my click
+//     reach the window under the cursor?" a question the panel answers by itself.
+//   * LAYER 2 (one clearly-fenced hunk in the frame loop, `LAYER 2 (CLICK-RUN)`) — a click ALSO toggles
+//     the run state, defined ABSOLUTELY rather than as an inversion of an invisible flag: not running
+//     (paused OR hidden) -> RUNS; running -> STOPS. Delete the fenced lines and Layer 1 remains exactly.
+//
+// A click is a press+release whose pointer travel stayed under `CLICK_THRESH`; anything further is a drag
+// and rotates, exactly as before.
 //
 // TWO PATHS — deterministic auto (QEMU) vs interactive (metal). The switch is INPUT-DRIVEN, not
 // time-boxed (UVUG-4): the parent polls SYS_INPUT_POLL EVERY frame for the program's whole life, and
@@ -326,6 +338,20 @@ fn exit(code: i32) -> ! {
 //     single saving in the file (8196 -> 8022).
 // Landed at 8022, so the next arc inherits ~170 bytes rather than none. Spend them knowing the ceiling is
 // a cliff, not a slope: one byte past 0x2000 costs a whole 4 KiB page and the build.
+//
+// CLICK-PLAIN spent them and then some, and had to buy the difference. Its first draft measured 8477 —
+// 285 OVER — for a click counter, a wire line and the LAYER 2 hunk. Three economies brought both layers
+// in at 8121, and the first two are new tricks worth keeping:
+//   * ONE WITNESS HELPER FOR A REPEATED LINE SHAPE. `say(label, n)` emits `<label><n> ::\n`; three sites
+//     inline a `Buf` and four `put`s before it, and a fourth (the interactive-takeover line) had the same
+//     shape and joined for free. Worth 92 + 56 bytes.
+//   * FOLD A FLAG AND ITS COMPANION COUNTER INTO ONE WORD. `dragging: &mut bool` plus VUGCLICK's
+//     `drag_motion: &mut i32` became one `drag: &mut u32` — 0 while no button is down, else 1 + travel.
+//     One argument instead of two, at every site. Worth 68 bytes.
+//   * ONE CALL FOR A PAIR OF DRAWS. `draw_hud` wraps the two `draw_num` calls so neither of the two
+//     overlay sites sets up an offset and a colour twice.
+// Landed at 8057 with LAYER 2 in, 8073 with the hunk deleted — the two-line hunk measures NEGATIVE
+// because it changes inlining around `paused`; treat both as ~8060 and ~130 bytes of headroom.
 #[inline(always)]
 fn futex_wait(word: *const AtomicU32, val: u32) {
     unsafe { sys3(SYS_FUTEX, word as u64, 0, val as u64) };
@@ -708,17 +734,26 @@ struct FrameInput {
     /// spurious toggle. This replaces VUGCLICK's `clicks`: a click is no longer app input at all
     /// (see the click-semantics note above `_start`'s frame loop).
     pause_keys: u32,
+    /// CLICK-PLAIN: CLICKS this frame — press+release pairs whose travel stayed under `CLICK_THRESH`.
+    /// A click is app input again (the router delivers the focus-changing press since CLICK-PLAIN), and
+    /// this is what the program does with it. Counted, not latched, for the same reason `pause_keys` is.
+    clicks: u32,
     mdx: i32, // summed relative mouse dx while dragging
     mdy: i32, // summed relative mouse dy while dragging
     /// UVUG-9: the drain hit `MAX_DRAIN_PER_FRAME` with the ring still non-empty — the freeze signature.
     saturated: bool,
 }
 
-/// Drain this frame's queued input events. Updates `held`/`dragging` in place and returns the
+/// Drain this frame's queued input events. Updates `held`/`drag` in place and returns the
 /// per-frame accumulation. BOUNDED at `MAX_DRAIN_PER_FRAME` events (see that constant for the P54b root
 /// cause): whatever is left stays in the ring for the next frame, so the render/present half of the loop is
 /// always reached.
-fn drain_input(held: &mut u32, dragging: &mut bool) -> FrameInput {
+fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
+    /// CLICK-PLAIN: the greatest `drag` word (= 1 + accumulated |dx|+|dy| since the press) that still
+    /// counts as a CLICK rather than a drag. VUGCLICK's original 6 px of slack, restored unchanged — a
+    /// hand that means to click a 128 px window moves a pixel or two doing it, and a hand that means to
+    /// rotate moves far more.
+    const CLICK_THRESH: u32 = 6;
     let mut fi = FrameInput::default();
     let mut budget = MAX_DRAIN_PER_FRAME;
     loop {
@@ -759,21 +794,32 @@ fn drain_input(held: &mut u32, dragging: &mut bool) -> FrameInput {
             }
             EV_BUTTON => {
                 let mask = lo & 0xFF;
-                // CLICK-ONE: a button edge carries NO run-state meaning any more. A press starts a
-                // drag, a release ends one, and that is the whole of it — there is no click/drag
-                // discrimination left to make, so `CLICK_THRESH` and the motion accumulator that fed
-                // it are gone. A click that never moves is simply a drag of zero pixels: it rotates
-                // nothing and changes nothing.
-                *dragging = mask != 0;
-                if *dragging {
+                // CLICK-PLAIN: the click/drag discrimination CLICK-ONE deleted is back, because a
+                // click is app input again. A press opens the gesture, a release closes it, and the
+                // accumulated pointer travel decides which gesture it was: under `CLICK_THRESH` it is a
+                // CLICK, at or over it it was a drag (which has already done its rotating, below).
+                //
+                // SIZE (see the SIZE note — "fold a new counter into an existing one"): the `dragging`
+                // FLAG and VUGCLICK's separate `drag_motion` accumulator are ONE word. `drag` is 0 while
+                // no button is down and `1 + travel` while one is, so "is a drag open?" is `!= 0` and
+                // "was it a click?" is `<= CLICK_THRESH` — one `u32` through one `&mut`, in place of a
+                // bool and an i32 through two.
+                if mask != 0 {
+                    *drag = 1;
                     // Press edge also clears held keys — the vug.rs hot-unplug net.
                     *held = 0;
+                } else {
+                    if *drag <= CLICK_THRESH {
+                        fi.clicks += 1;
+                    }
+                    *drag = 0;
                 }
             }
             EV_MOUSE_REL => {
                 let dx = ((lo >> 16) & 0xFFFF) as u16 as i16 as i32;
                 let dy = (lo & 0xFFFF) as u16 as i16 as i32;
-                if *dragging {
+                if *drag != 0 {
+                    *drag += (dx.abs() + dy.abs()) as u32;
                     fi.mdx += dx;
                     fi.mdy += dy;
                 }
@@ -909,10 +955,14 @@ fn getinfo_ticks() -> u64 {
     info[1]
 }
 
-/// Widest backing box the readout ever paints: 3 digits at 6 px advance + 2 px pad.
+/// Widest backing box a readout ever paints: 3 digits at 6 px advance + 2 px pad.
 const FPS_BOX_W: i32 = 3 * 6 + 3;
+/// CLICK-PLAIN: the click counter sits immediately right of the fps box, in the same 11-row band.
+const CLICK_X: i32 = FPS_BOX_W + 3;
+/// CLICK-PLAIN: click-counter digits — cool cyan, so the two numbers in the corner never read as one.
+const CLICK_C: u32 = 0xFF6C_D8E8;
 
-/// Draw the current fps (clamped to 999) in the top-left corner over whatever the frame rendered.
+/// Draw a 1-3 digit readout (clamped to 999) at `x0` in the top band, over whatever the frame rendered.
 /// Runs in the PARENT, after the frame barrier and before the present, so no worker is writing.
 ///
 /// VUGPAUSE: the backing box is the FIXED maximum width, not the current digit count's. On the
@@ -920,7 +970,11 @@ const FPS_BOX_W: i32 = 3 * 6 + 3;
 /// path there is no band clear, so a readout shrinking (e.g. 47 -> 0) would leave the old digit's
 /// pixels stranded. Clearing the same box every time makes the overlay self-erasing. Checksum-safe:
 /// this function is called only when `detached || interactive`, which the foreground auto path is not.
-unsafe fn draw_fps(surf: *mut u8, fps: u32) {
+///
+/// CLICK-PLAIN generalised this from `draw_fps` by adding `x0`/`color`, so the click counter is the same
+/// code at a different offset rather than a second copy of it — the cheapest way to add a second readout
+/// against the `.text` ceiling (see the SIZE note).
+unsafe fn draw_num(surf: *mut u8, fps: u32, x0: i32, color: u32) {
     let v = fps.min(999);
     // VUG-PACE, size only (no behaviour change): the digit count and its leading power of ten come out of
     // ONE ladder. The old form derived `div` from `n` with a `while k < n { div *= 10 }` loop, and this
@@ -935,8 +989,8 @@ unsafe fn draw_fps(surf: *mut u8, fps: u32) {
     let mut y = 0;
     while y < 11 {
         let row = surf.add((y as usize) * STRIDE) as *mut u32;
-        let mut x = 0usize;
-        while x < FPS_BOX_W as usize {
+        let mut x = x0 as usize;
+        while x < (x0 + FPS_BOX_W) as usize {
             row.add(x).write_volatile(BG);
             x += 1;
         }
@@ -944,10 +998,34 @@ unsafe fn draw_fps(surf: *mut u8, fps: u32) {
     }
     let mut i = 0i32;
     while i < n {
-        draw_digit(surf, ((v / div) % 10) as usize, 2 + i * 6, 2, FPS_C);
+        draw_digit(surf, ((v / div) % 10) as usize, x0 + 2 + i * 6, 2, color);
         div /= 10;
         i += 1;
     }
+}
+
+/// CLICK-PLAIN: one `:: UVUG: <label><n> ::` witness line.
+///
+/// Three call sites emit exactly this shape (`pause=` from SPACE, `click n=` from a delivered click,
+/// `pause=` again from the LAYER 2 hunk), and a `Buf` plus four `put`s inlined three times is the kind of
+/// duplication this program cannot afford (see the SIZE note). The trailing ` ::\n` is folded in here
+/// because every caller wants it — the label is the only thing that varies.
+fn say(label: &[u8], v: u32) {
+    let mut b = Buf::new();
+    b.put(label);
+    b.put_dec(v);
+    b.put(b" ::\n");
+    b.flush();
+}
+
+/// CLICK-PLAIN: draw BOTH corner readouts — fps at the left, the delivered-click count beside it.
+///
+/// A wrapper rather than two calls at each site, and that is a SIZE decision (see the SIZE note): the
+/// overlay is drawn from two places, and hoisting the pair behind one two-argument call removes a whole
+/// set of argument setup (offset + colour, twice) from each of them.
+unsafe fn draw_hud(surf: *mut u8, fps: u32, clicks: u32) {
+    draw_num(surf, fps, 0, FPS_C);
+    draw_num(surf, clicks, CLICK_X, CLICK_C);
 }
 
 /// Fold the kernel tick clock into the displayed fps, refreshing at most once per second. `ticks`/`mark`
@@ -1180,12 +1258,18 @@ pub extern "C" fn _start() -> ! {
     let mut ax: i32 = 0;
     let mut dist: Fx = 4 * ONE;
     let mut held: u32 = 0;
-    let mut dragging = false;
+    // CLICK-PLAIN: the drag word — 0 = no button down, else 1 + |dx|+|dy| travelled since the press.
+    let mut drag: u32 = 0;
 
     let mut interactive = false; // flipped permanently by the first input event, at any frame
     let mut exit_key = false;
     // CLICK-ONE: rotation pause, toggled by SPACE. Purely cosmetic and interactive-only.
     let mut paused = false;
+    // CLICK-PLAIN: clicks DELIVERED to this window since it started — the acknowledgement counter. It is
+    // drawn beside the fps readout and printed on the wire, and it is the whole of what a click does in
+    // this layer: unmissable proof that the router addressed the click to the window under the cursor,
+    // with zero coupling to run state.
+    let mut clicks: u32 = 0;
     // VUGLIFE: one-shot latch for the waived-budget witness (detached/interactive only).
     let mut budget_waived = false;
 
@@ -1209,7 +1293,7 @@ pub extern "C" fn _start() -> ! {
     let mut frame: u32 = 0;
     loop {
         // --- input (polled EVERY frame for the program's whole life) ---
-        let fi = drain_input(&mut held, &mut dragging);
+        let fi = drain_input(&mut held, &mut drag);
         if fi.saturated {
             // UVUG-9: the drain spent its whole frame budget with events still queued. Pre-fix this loop had
             // no budget to spend and simply never returned — the P54b freeze. Report once and carry on.
@@ -1219,28 +1303,70 @@ pub extern "C" fn _start() -> ! {
             // First input at any frame takes over: cancel the auto-tumble + the 300-frame cap and
             // switch to held-state control. The witness proves the input arrived on metal.
             interactive = true;
-            let mut tb = Buf::new();
-            tb.put(b":: UVUG: interactive takeover at frame ");
-            tb.put_dec(frame);
-            tb.put(b" ::\n");
-            tb.flush();
+            // SIZE: the takeover line has exactly `say`'s shape (label, number, ` ::` terminator), so it
+            // uses it — CLICK-PLAIN added the helper for its own two lines and this one was free.
+            say(b":: UVUG: interactive takeover at frame ", frame);
         }
+        // --- VUGMIN: is this vug currently off-screen? ---
+        // Peter's ruling, P69: "if vug is minimized it should shut off". In UnaOS the state he is naming
+        // is HIDDEN — `wm::focus_changed`'s shell arm pushes every window below `SHELL_Z` and erases its
+        // box, so the vug is gone from the panel while its frame loop runs at full rate. The kernel
+        // publishes that fact as bit 1 of the process-flags word; this is the poll.
+        //
+        // CLICK-PLAIN moved the read UP to here, ahead of the input block, from just above the `frozen`
+        // fold. One volatile load per frame either way; what it buys is that the input block can ask
+        // whether this vug is RUNNING (`paused || hidden`) at the moment a gesture arrives, which the
+        // LAYER 2 hunk below needs and nothing else in between disturbs.
+        //
+        // Since VUGMIN-B the kernel really does set the bit (`wm::focus_changed`'s shell arm), so this is
+        // no longer a dormant read. The deterministic auto path is still unaffected and the 300-frame
+        // checksum still byte-identical, because nothing in a headless QEMU run ever TABs to the shell.
+        let hidden = unsafe { flags_p.read_volatile() } & 2 != 0;
         if interactive {
             if fi.exit_key {
                 exit_key = true;
             }
-            // CLICK-ONE: SPACE toggles pause; nothing the mouse does can. Parity, not a loop: two
+            // CLICK-ONE: SPACE toggles pause — the keyboard control, and under LAYER 1 the only one
+            // that reaches run state at all. Parity, not a loop: two
             // press edges inside one frame are two toggles and cancel, so only an odd count changes
             // state — and only a change is worth a line. Human-rate by construction (one line per
             // press of a key a person is pressing), and the line doubles as proof that a keystroke
             // reached EL0.
             if fi.pause_keys & 1 != 0 {
                 paused = !paused;
-                let mut pb = Buf::new();
-                pb.put(b":: UVUG: pause=");
-                pb.put_dec(paused as u32);
-                pb.put(b" ::\n");
-                pb.flush();
+                say(b":: UVUG: pause=", paused as u32);
+            }
+            // CLICK-PLAIN: ACKNOWLEDGE the click and nothing more. The counter advances, the corner
+            // readout shows it, and the wire carries one line per click — human-rate by construction, and
+            // the proof that the press reached THIS window's ring rather than whichever window happened
+            // to hold focus. Run state is untouched here on purpose: the mouse is a routing question in
+            // this layer and the keyboard (SPACE, above) is the only control that stops or starts.
+            if fi.clicks > 0 {
+                clicks = clicks.wrapping_add(fi.clicks);
+                say(b":: UVUG: click n=", clicks);
+                // ===== LAYER 2 (CLICK-RUN) — ONE HUNK; DELETE THESE FOUR LINES TO REMOVE IT =========
+                // P75's other candidate grammar: a click is ALSO the stop/start control, with the
+                // toggle defined ABSOLUTELY rather than as the inversion of an invisible flag — **if
+                // the vug is not running (paused for any reason, or hidden/frozen for any reason) it
+                // RUNS; if it is running it STOPS.** One click, one visible effect, decided from what
+                // the operator can SEE.
+                //
+                // `paused = !(paused || hidden)` is that sentence: the right-hand side is the pre-click
+                // FROZEN predicate, the very expression the fold below re-computes, so the decision is
+                // made against the state on the panel and never against `paused` alone. In practice
+                // `hidden` is already false when a RESTORING click is read — the router unhides the
+                // raised owner before it queues the press — so the frozen-ness such a click cancels is
+                // the `paused` half; the `|| hidden` term is what makes the rule hold anyway, and is
+                // why this is not a blind `paused = !paused`. Parity (`& 1`) for the same reason SPACE
+                // takes it: two clicks in one frame are two toggles and cancel.
+                //
+                // Deleting these lines leaves LAYER 1 exactly: a click focuses, is acknowledged, and
+                // changes no run state. Nothing outside this block refers to it.
+                if fi.clicks & 1 != 0 {
+                    paused = !(paused || hidden);
+                    say(b":: UVUG: pause=", paused as u32);
+                }
+                // ===== end LAYER 2 =================================================================
             }
         }
 
@@ -1250,18 +1376,6 @@ pub extern "C" fn _start() -> ! {
         // refresh, and the record of what was presented). Four inline copies is four times the branch.
         let overlay = detached || interactive;
 
-        // --- VUGMIN: is this vug currently off-screen? ---
-        // Peter's ruling, P69: "if vug is minimized it should shut off". In UnaOS the state he is naming
-        // is HIDDEN — `wm::focus_changed`'s shell arm pushes every window below `SHELL_Z` and erases its
-        // box, so the vug is gone from the panel while its frame loop runs at full rate. The kernel
-        // publishes that fact as bit 1 of the process-flags word; this is the poll.
-        //
-        // DORMANT UNTIL VUGMIN-B. Nothing in the kernel sets the bit yet (the `wm` call sites are another
-        // session's lane this arc), so today this load always yields 0 and every branch below it is not
-        // taken. That is also exactly why the deterministic auto path is unaffected and the 300-frame
-        // checksum is byte-identical — but note that it would remain byte-identical even once the bit is
-        // live, because nothing in a headless QEMU run ever TABs to the shell.
-        let hidden = unsafe { flags_p.read_volatile() } & 2 != 0;
         // The state that must HOLD STILL for a frame to be skippable. `paused` is the operator's explicit
         // request; `hidden` is the same conclusion reached from the other direction — pixels nobody can
         // see are not worth computing. They are folded into one word here rather than at the predicate
@@ -1273,9 +1387,10 @@ pub extern "C" fn _start() -> ! {
         let frozen = paused || hidden;
 
         // --- fold input into rotation/zoom ---
-        let manual = interactive && (held & H_MOTION != 0 || (dragging && (fi.mdx != 0 || fi.mdy != 0)));
+        let manual = interactive && (held & H_MOTION != 0 || (drag != 0 && (fi.mdx != 0 || fi.mdy != 0)));
         if frozen {
-            // CLICK-ONE: paused by SPACE — hold the current orientation. VUGPAUSE: holding it is now
+            // CLICK-ONE/CLICK-PLAIN: paused (by SPACE, or by a click under LAYER 2) — hold the
+            // current orientation. VUGPAUSE: holding it is now
             // also what lets the frame below be skipped entirely; the window stays live because the
             // idle path keeps polling and yielding, not because it keeps redrawing. VUGMIN: a hidden
             // vug holds the identical way, so the orientation the operator left on screen is the
@@ -1301,7 +1416,7 @@ pub extern "C" fn _start() -> ! {
             if held & H_ZOOM_OUT != 0 {
                 dist = (dist + ONE / 16).min(8 * ONE);
             }
-            if dragging {
+            if drag != 0 {
                 // Pointer motion → rotation, scaled + per-frame clamped (see DRAG_DIV/DRAG_CLAMP).
                 yaw += (fi.mdx / DRAG_DIV).clamp(-DRAG_CLAMP, DRAG_CLAMP);
                 pit += (fi.mdy / DRAG_DIV).clamp(-DRAG_CLAMP, DRAG_CLAMP);
@@ -1385,11 +1500,17 @@ pub extern "C" fn _start() -> ! {
             // exactly the "still burning CPU while minimized" that this arc exists to end, merely at one
             // hertz instead of sixty. `fps` is left holding its last value; it is stale only while
             // nobody can read it, and the first rendered frame after restore resumes the refresh.
+            //
+            // CLICK-PLAIN: a CLICK is the second thing that can reach the panel from here, and it must
+            // be. A vug stopped on this idle path is exactly the one an operator clicks to ask "are you
+            // listening?", and under LAYER 1 the click changes no run state — so without this arm the
+            // ack would sit in the surface, unpresented, until a digit happened to change. `fi.clicks`
+            // is the frame's own count, so this fires once per click and nothing else keeps it awake.
             if !hidden && overlay {
                 let v = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame);
-                if v != fps {
+                if v != fps || fi.clicks > 0 {
                     fps = v;
-                    unsafe { draw_fps(surf, fps) };
+                    unsafe { draw_hud(surf, fps, clicks) };
                     let rc = unsafe { sys1(SYS_WIN_PRESENT, win) };
                     if rc >> 63 != 0 {
                         stall_witness(&W_PRESENT, frame, b"present rc=", (rc as i64).unsigned_abs() as u32);
@@ -1527,9 +1648,12 @@ pub extern "C" fn _start() -> ! {
         }
 
         // --- VUGFPS: measure, refresh once per second, draw (desktop/interactive only) ---
+        // CLICK-PLAIN: the click counter rides the same gate, the same band and the same self-erasing
+        // box — one more readout, drawn every frame the fps readout is, so an ack is on the panel within
+        // one frame of the click that earned it.
         if overlay {
             fps = fps_refresh(&mut fps_ticks, &mut fps_frame, fps, frame);
-            unsafe { draw_fps(surf, fps) };
+            unsafe { draw_hud(surf, fps, clicks) };
         }
 
         // --- present ---

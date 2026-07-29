@@ -2719,6 +2719,79 @@
   **The deterministic auto path cannot reach any of this by construction** — QEMU raspi4b delivers no
   HID, so `interactive` never arms, so `paused` is never written and no click or SPACE is ever seen.
 
+- **CLICK-PLAIN (a click goes to the window under the cursor, and is acknowledged there)** — router +
+  window manager + app: `arch/aarch64/syscall.rs` (`wc_click_route`), `video/wm.rs` (`focus_changed`
+  raise arm, hit-test selftest leg 8), `crates/user-vug/src/main.rs`, and this doc. **P75, on metal:**
+  *"stop works like absolute garbage there is no reason to it."*
+
+  **THE MODEL — read this paragraph and nothing else is needed.** *A press goes to the **window under
+  the cursor**; if that window was not focused, the focus moves there **first** and the press is then
+  delivered to it, whole (press and release together). **A focus change never stops anything** — it
+  starts the window it names and leaves every other window exactly as the operator last saw it. Idling
+  the whole fleet is still one deliberate gesture: focus the **shell** (click the desktop, or TAB to
+  it), whose arm hides every owner at once. What the app does with a delivered click is the app's
+  decision.*
+
+  **The defect, and why it was not in any one place.** CLICK-ONE removed the click's run-state meaning
+  in the app, which was right, but two kernel-side rules from the previous arcs survived it and combined
+  into something no operator could model:
+    - **CLICK-SWALLOW** consumed the focus-changing press instead of delivering it. Correct while a
+      delivered click *was* a pause toggle; after CLICK-ONE it only meant the first click on a window
+      produced no observable effect at all.
+    - **VUGMIN-C's departing-owner hide** stopped the vug that was *losing* focus. So clicking vug B
+      appeared to stop vug A — a different window from the one clicked, one click after the fact, with
+      no gesture on screen that explained it.
+  Together: a click did nothing visible to what you clicked and stopped something you did not click.
+  That is P75 exactly.
+
+  **Change 1 — the router delivers the focus-changing press (`wc_click_route`, hit arm).** The arm keeps
+  its order and loses its swallow: `el0_input_set_active(owner)` then `wm::focus_changed(owner)` (both
+  wake edges — focus arrival and unhide — fire *first*, so a parked, hidden vug is re-readied before
+  anything is pushed), then it records the **raised owner** in `CLICK_PRESS_TARGET` and returns `false`.
+  Both callers' normal paths now address the new focus, so the press lands in the raised window's ring
+  and the matching release follows it there. Wire: `[clickroute] press hit asid=<a> win=<w> (was <c>)
+  **delivered**` (was `swallowed`). The **miss** arm is unchanged — a desktop press still focuses the
+  shell and is still consumed (CLICK-SHELL / r2).
+
+  **Change 2 — a raise publishes an arrival only (`wm::focus_changed`, raise arm).** The departing
+  owner's `hidden=true` publication is **removed**; the arriving owner's `hidden=false` (the VUGPAUSE-2r2
+  wake edge) stays. Every other owner's bit is untouched, exactly as VUGMIN-C intended for them. The
+  shell arm is **unchanged** — `vugmin_scan` over the whole table, every owner hidden — and is now the
+  only place a hidden bit is ever *set*, which is what keeps VUGMIN-A/B's shell-focus-idles-the-fleet
+  semantic intact. `owner_live` went with the hide it guarded (its hazard — stranding a set bit on a
+  freed slot — cannot arise when the arm only ever *clears*). Wire: `[vugmin] focus asid=<a> unhid=1
+  **hid=none** others=untouched`, on every raise.
+
+  **Change 3 — the app acknowledges the click, in two layers.** `crates/user-vug` regains its click/drag
+  discrimination (a press+release whose travel stayed under `CLICK_THRESH` is a **click**; anything
+  further is a drag and rotates as before), and then:
+    - **LAYER 1 (unconditional).** A click advances a **click counter drawn in the window's top-left
+      band**, in cyan immediately right of the amber fps digits, and prints `:: UVUG: click n=<N> ::`.
+      **No run-state coupling whatsoever** — SPACE remains the only stop/start control in this layer.
+      This is the unmissable proof that routing worked: the number under the cursor is the number that
+      moves.
+    - **LAYER 2 (`LAYER 2 (CLICK-RUN)`, one fenced hunk in the frame loop).** A click **also** toggles
+      run state, defined **absolutely** rather than as the inversion of an invisible flag:
+      `paused = !(paused || hidden)` — *not running (paused OR hidden) → **runs**; running → **stops***.
+      Deleting the fenced lines leaves Layer 1 exactly; nothing outside the block refers to it.
+
+  **Witness (leg 8 of the hit-test selftest, `wm.rs`).** The leg keeps its three fields and inverts its
+  assertions with the rule: `hit=` (an unfocused hit moves focus **and** the raised owner's ring holds
+  the whole pair — depth 1 after the press, 2 after the release), `deliver=` (the next press on that now
+  focused window lands too — depth 3), `wake=` (≥ 2 named wake edges ran, which is what pins the wake
+  chain *ahead of* the push). Line: `[clickroute] hit-test … hit=<…> deliver=<…> wake=<…> -> PASS`.
+
+  **Size.** `.text` **8012 → 8057 B** with Layer 2 in (**8073 B** with the hunk deleted — the two-line
+  hunk measures *negative*, because it shifts inlining around `paused`) against the hard `0x2000`
+  cliff. The first draft measured 8477 — 285 over — and was bought back with three economies now recorded
+  in the file's SIZE note: one `say(label, n)` helper for the four `:: UVUG: … ::` lines that share a
+  shape; folding the `dragging` flag and the drag-motion accumulator into one `drag: u32` word (0 = no
+  button down, else 1 + travel); and one `draw_hud` call in place of two `draw_num` calls at each of the
+  two overlay sites.
+
+  **The deterministic auto path cannot reach any of this** — QEMU raspi4b delivers no HID, so
+  `interactive` never arms, no click is ever seen, and the 300-frame checksum is byte-identical.
+
 ### x86_64 (branch `hw-rmbp`)
 
 - **U1a** — first ring-3 round-trip (the x86 mirror of aarch64 M6a). A

@@ -354,8 +354,10 @@ fn vugmin_publish(asid: u64, hidden: bool) {
 /// every owner still sitting above `SHELL_Z` — i.e. for every window ever raised since the last shell
 /// TAB. On the P73 bench wire one `[clickroute] press hit asid=4` produced `[vugpause2] resume` with
 /// `edge=unhide` for two OTHER address spaces, and a six-vug fleet stayed lit on all four cores forever.
-/// The raise arm now publishes the TRANSITION instead (see [`focus_changed`]); this function keeps the
-/// whole-table shape because "the shell took the top, everyone is under it" is genuinely whole-table.
+/// The raise arm now publishes only the ARRIVING owner's unhide (see [`focus_changed`] — VUGMIN-C had
+/// it publish the departing owner's hide too, which CLICK-PLAIN removed); this function keeps the
+/// whole-table shape because "the shell took the top, everyone is under it" is genuinely whole-table,
+/// and it is now the ONLY place a hidden bit is ever SET.
 fn vugmin_scan(t: &Table, shell: u32, out: &mut [(u64, bool); MAX_WINDOWS]) -> usize {
     let mut n = 0usize;
     for r in t.rows.iter() {
@@ -371,21 +373,13 @@ fn vugmin_scan(t: &Table, shell: u32, out: &mut [(u64, bool); MAX_WINDOWS]) -> u
     n
 }
 
-/// VUGMIN-C — does `asid` still own a live, non-compat window?
-///
-/// The raise arm's hide of the PREVIOUS focus holder is gated on this, and the gate is not cosmetic. A
-/// vug that exited while focused has had its hidden bit cleared by `boot::teardown_user_slot` on the way
-/// out; publishing `hidden=true` for it afterwards would leave a set bit on a free slot, and the next
-/// tenant of that ASID would come up permanently idle with nothing left to unhide it. Owners that still
-/// have a window are the only ones a focus change has anything true to say about.
-///
-/// Caller holds `TABLE`. One scan of eight rows; ASID 0 (shell / compat) is never an answer.
-fn owner_live(t: &Table, asid: u64) -> bool {
-    asid != 0
-        && t.rows
-            .iter()
-            .any(|r| r.used && !r.compat && r.owner_asid == asid)
-}
+// VUGMIN-C's `owner_live` lived here. It existed for ONE caller — the raise arm's hide of the previous
+// focus holder — and guarded the one hazard that hide carried: a vug that exited while focused has had
+// its hidden bit cleared by `boot::teardown_user_slot` on the way out, so publishing `hidden=true` for it
+// afterwards would strand a set bit on a free slot and the next tenant of that ASID would come up
+// permanently idle with nothing left to unhide it. CLICK-PLAIN removed the hide (see `focus_changed`),
+// which removes the hazard with it: the raise arm now publishes only `hidden=false`, and a spurious
+// CLEAR on a free slot is the harmless direction — it is the state `teardown_user_slot` already leaves.
 
 /// Create a window owned by `owner_asid` over the caller's ARGB8888 surface at `surf` (EL1-visible
 /// address, `surf_len` bytes long, `stride` bytes per row) with source dimensions `w` x `h` and a
@@ -1085,13 +1079,17 @@ pub fn hit_test(x: i32, y: i32) -> Option<(WinId, u64, u32)> {
 ///   desktop colour immediately, and the desktop is asked for a whole-panel present so the console's
 ///   text comes back over the erase. That is the "TAB to the shell, then read your command's output"
 ///   case, and it is a z-order fact rather than a special case.
-/// * **VUGMIN-C — a raise publishes a TRANSITION, not a census.** The arriving owner is unhidden (the
-///   wake edge that restarts a parked vug) and the departing one is hidden; every other owner's hidden
-///   bit is left alone. Only the shell arm speaks for the whole table. The semantic that falls out is
-///   the bench's: one vug runs — the focused one — and the rest stay frozen in place, visible and
-///   static, until they are clicked or TABbed back. Before this, a raise re-published `hidden=false` for
-///   every owner above `SHELL_Z`, so focusing any one window un-minimized the entire stack and the whole
-///   fleet rendered forever (P73).
+/// * **VUGMIN-C — a raise publishes an ARRIVAL, not a census.** The arriving owner is unhidden (the wake
+///   edge that restarts a parked vug); every other owner's hidden bit is left alone. Only the shell arm
+///   speaks for the whole table. Before this, a raise re-published `hidden=false` for every owner above
+///   `SHELL_Z`, so focusing any one window un-minimized the entire stack and the whole fleet rendered
+///   forever (P73).
+/// * **CLICK-PLAIN — a focus change never STOPS anything (P75).** VUGMIN-C also hid the DEPARTING owner
+///   here, so that only the focused vug ran. On top of click-to-focus that made a click appear to stop a
+///   vug the operator had not clicked, one click after the fact ("stop works like absolute garbage there
+///   is no reason to it"). A raise is now purely additive: it starts the window it names and leaves
+///   every other window exactly as the operator last saw it. Idling the whole fleet is still one
+///   gesture — focus the SHELL — which is the arm that genuinely speaks for the whole table.
 /// * **Both ends repaint.** The raise marks the affected windows damaged and composites, so the change
 ///   is on the panel before this returns rather than at the focused app's next present — which, for a
 ///   window whose app is idle or blocked in a read, might be never.
@@ -1118,10 +1116,11 @@ pub fn focus_changed(asid: u64) {
     let mut nhidden = 0usize;
     // VUGMIN-B/C — (owner asid, is it now hidden) pairs, built under the table lock below and published
     // to the syscall layer after the guard drops. The SHELL arm fills this from [`vugmin_scan`] (every
-    // owner, all hidden); the RAISE arm fills in the TRANSITION only — `marks[0]` is the arriving owner,
-    // `marks[1]` (when `nmarks == 2`) the departing one. See [`vugmin_scan`].
+    // owner, all hidden); since CLICK-PLAIN the RAISE arm fills in exactly ONE row — `marks[0]`, the
+    // arriving owner, unhidden. Assigned on both arms, so it carries no initial value to be mistaken
+    // for a verdict. See [`vugmin_scan`].
     let mut marks = [(0u64, false); MAX_WINDOWS];
-    let mut nmarks = 0usize;
+    let nmarks: usize;
 
     // FOCUS-HL: take the focus owner BEFORE the table lock, so the composite at the end of this call
     // already draws the new highlight. The window that is LOSING focus must be repainted too — the raise
@@ -1178,19 +1177,22 @@ pub fn focus_changed(asid: u64) {
             // whole-table scan is the honest answer. Unchanged from VUGMIN-B.
             nmarks = vugmin_scan(&t, SHELL_Z.load(Ordering::Acquire), &mut marks);
         } else {
-            // RAISE arm (VUGMIN-C): publish the TRANSITION and nothing else. The arriving owner
-            // unhides — that is the wake edge VUGPAUSE-2r2 exists to deliver, and it must still fire.
-            // The departing owner hides, joining the rest of the stack: it keeps its pixels and its z
-            // (it is not moved below `SHELL_Z`; the fleet is tiled and genuinely on-screen), it simply
-            // stops being told to render, so it freezes in place, visible and static, until it is
-            // clicked or TABbed back. Every OTHER owner's bit is left exactly as it was — an owner the
-            // shell arm hid stays hidden until it is itself raised.
+            // RAISE arm (VUGMIN-C, as amended by CLICK-PLAIN): publish the ARRIVAL and nothing else.
+            // The arriving owner unhides — that is the wake edge VUGPAUSE-2r2 exists to deliver, and
+            // it must still fire. Every OTHER owner's bit is left exactly as it was: an owner the
+            // SHELL arm hid stays hidden until it is itself raised, and an owner that was running keeps
+            // running.
+            //
+            // VUGMIN-C also HID the departing owner here, so that exactly one vug — the focused one —
+            // ran at a time. P75 is the ruling against that: "stop works like absolute garbage there is
+            // no reason to it". Combined with the router's click-to-focus, moving focus stopped a vug
+            // the operator had not clicked, one click after they clicked somewhere else, and no visible
+            // gesture explained it. **A focus change now starts things and never stops them.** The
+            // fleet-idling semantic VUGMIN-A/B designed is untouched and still reachable, from the arm
+            // that was always the honest place for it: focusing the SHELL hides every owner at once
+            // (above), which is a whole-table statement the operator makes deliberately.
             marks[0] = (asid, false);
             nmarks = 1;
-            if prev != asid && owner_live(&t, prev) {
-                marks[1] = (prev, true);
-                nmarks = 2;
-            }
         }
     }
 
@@ -1230,19 +1232,16 @@ pub fn focus_changed(asid: u64) {
     // `[vugpause2] resume ... edge=unhide` lines appearing in the syscall layer for ASIDs nobody had
     // focused. One line per focus change, at operator rate, that names the transition and asserts the
     // scope: exactly one unhide, at most one hide, nothing else published.
+    // CLICK-PLAIN keeps the line and narrows what it can say: `hid=none` on EVERY raise, because a raise
+    // no longer hides anything. Printing the field rather than deleting it is deliberate — it is the
+    // standing assertion that this arm publishes exactly one bit, and a future arc that reintroduces a
+    // hide here has to change the line to do it.
     #[cfg(feature = "witness")]
     if asid != 0 {
-        if nmarks == 2 {
-            serial_println!(
-                "[vugmin] focus asid={:#x} unhid=1 hid=asid={:#x} others=untouched",
-                asid, marks[1].0
-            );
-        } else {
-            serial_println!(
-                "[vugmin] focus asid={:#x} unhid=1 hid=none others=untouched",
-                asid
-            );
-        }
+        serial_println!(
+            "[vugmin] focus asid={:#x} unhid={} hid=none others=untouched",
+            asid, nmarks
+        );
     }
     let _ = (raised, first_id, newz);
     // WEDGE-2 `<F6>` — the `[wc-fv]` line above is the LAST thing every recorded wedge printed, so
@@ -5218,12 +5217,12 @@ static HT_SURF: [u32; 64] = [0x0020_C080; 64];
 ///    right; leg 7 asserts it for the focus that owns nothing on the panel, which is the case it got
 ///    wrong and which this suite reported PASS on for the whole time the bench could not click into
 ///    the shell. See [`clickshell_windowless_leg`].
-/// 8. **swallow / deliver / wake** (CLICK-SWALLOW, P73) — the HIT arm's policy, which legs 6 and 7
-///    leave entirely unasserted: a press on an UNFOCUSED window must move focus and reach the app's
-///    ring NOT AT ALL, the next press on that (now focused) window must be delivered, and neither
-///    must cost the VUGPAUSE-2r2 restore chain. Three fields rather than one because they fail in
-///    three different directions, and the middle one is the regression guard on the fix itself. See
-///    [`clickswallow_leg`].
+/// 8. **hit / deliver / wake** (CLICK-PLAIN, P75) — the HIT arm's policy, which legs 6 and 7 leave
+///    entirely unasserted: a press on an UNFOCUSED window must move focus and then reach that window's
+///    ring WHOLE (press and release both), the next press on it must be delivered too, and neither may
+///    cost — or precede — the VUGPAUSE-2r2 restore chain. Three fields rather than one because they
+///    fail in three different directions, and the last one is what pins the ORDER the fix depends on.
+///    See [`clickplain_leg`].
 ///
 /// Self-cleaning on the FOCUS-VIS pattern: both windows are closed, `SHELL_Z` and `FOCUS_ASID` are
 /// restored (this calls `focus_changed` with SYNTHETIC asids, which must not be left naming an address
@@ -5308,29 +5307,29 @@ fn clickshell_windowless_leg(_asid: u64) -> Option<bool> {
     None
 }
 
-/// CLICK-SWALLOW (P73) — leg 8 of [`hittest_selftest`]: **the app never sees a click it did not own
-/// the focus for.**
+/// CLICK-PLAIN (P75) — leg 8 of [`hittest_selftest`]: **a press goes to the window under the cursor,
+/// and if that window was not focused, the focus goes there FIRST.**
 ///
-/// Legs 6 and 7 assert the MISS arm's policy. This one asserts the HIT arm's, which is where the
-/// bench defect lived: CLICK-ROUTE raised the clicked window and then delivered the press to it, so
-/// the one gesture that restores a backgrounded vug also worked its click-to-pause toggle and the vug
-/// came back paused ("restarting a vug I have to click twice"). The three things this leg checks are
-/// exactly the three the fix has to get right at once, and the third is why it is not simply a
-/// `return true`:
-///  * **swallow** — a press on an UNFOCUSED window moves focus AND the owner's ring receives NOTHING.
-///    The ring is the only honest place to ask that question ([`el0_input_depth`]); the router's
-///    return value says what the ROUTER decided, not what the app got, and the two are what the whole
-///    seam sits between. Checked after the press and again after the release, because a swallowed
-///    press whose release still landed would be the fabricated half-click [`CLICK_PRESS_TARGET`]
-///    exists to prevent.
-///  * **deliver** — the very next press, now on the SAME (and now focused) window, IS delivered. The
-///    swallow must cost the operator one click on a refocus, not disable the app's mouse.
-///  * **wake** — the swallowed press still runs the VUGPAUSE-2r2 restore chain. This is the leg's
-///    real content. A fix that consumed the press EARLY — before `el0_input_set_active` and
-///    `focus_changed` — would pass the first two checks and reintroduce P72 in a worse form: the vug
-///    would not come back paused, it would not come back at all. `el0_input_wake_edges` counts the
-///    NAMED edges the seam was asked to run, so this reads 2 (focus arrival, then unhide) regardless
-///    of whether anything was parked — which matters, since on a headless gate nothing ever is.
+/// Legs 6 and 7 assert the MISS arm's policy. This one asserts the HIT arm's. It was written for
+/// CLICK-SWALLOW, which consumed the focus-changing press so an app could never see a click it had not
+/// owned the focus for; P75 retired that rule (the withheld press made a click's visible effect a
+/// function of invisible state) and the leg's assertions invert with it. The three checks are the three
+/// the router has to get right at once, and the ORDER between the first and third is the whole content:
+///  * **hit** — a press on an UNFOCUSED window moves focus AND is delivered WHOLE to the raised owner's
+///    ring: depth 1 after the press, depth 2 after the release. The ring is the only honest place to ask
+///    that question ([`el0_input_depth`]); the router's return value says what the ROUTER decided, not
+///    what the app got, and the two are what the whole seam sits between. Checking the release as well
+///    as the press is what pins [`CLICK_PRESS_TARGET`] to the RAISED owner rather than the sentinel — a
+///    press delivered with a dropped release is the half-click that tracker exists to prevent, in the
+///    other direction.
+///  * **deliver** — the very next press, now on the SAME (and now focused) window, is delivered too:
+///    depth 3. The refocusing click must cost the operator nothing and must not consume the next one.
+///  * **wake** — the delivered press still runs the VUGPAUSE-2r2 restore chain, and runs it BEFORE the
+///    push. A router that queued the press first and moved focus after would pass the first two checks
+///    and strand a PARKED vug: the click would land in the ring of the app that was focused a moment
+///    ago. `el0_input_wake_edges` counts the NAMED edges the seam was asked to run, so this reads 2
+///    (focus arrival, then unhide) regardless of whether anything was parked — which matters, since on
+///    a headless gate nothing ever is.
 ///
 /// Drives [`crate::arch::aarch64::syscall::el0_input_enqueue`] rather than `wc_click_route`, because
 /// the claim is about DELIVERY and the push lives on the far side of the router. The window is placed
@@ -5341,7 +5340,7 @@ fn clickshell_windowless_leg(_asid: u64) -> Option<bool> {
 /// Self-cleaning: the window is closed, the owner's ring is reset (via a focus arrival, the one
 /// primitive that clears it) and focus is dropped to the shell, so the slot is left exactly as found.
 #[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal"))]
-fn clickswallow_leg(owner: u64, other: u64, surf: usize, len: usize) -> Option<(bool, bool, bool)> {
+fn clickplain_leg(owner: u64, other: u64, surf: usize, len: usize) -> Option<(bool, bool, bool)> {
     use crate::arch::aarch64::syscall as sc;
     use crate::pal::Event::Button;
     if compat_live() {
@@ -5383,9 +5382,9 @@ fn clickswallow_leg(owner: u64, other: u64, surf: usize, len: usize) -> Option<(
         return None;
     }
 
-    // --- swallow: an UNFOCUSED hit. A focus arrival resets the ring, so `owner` starts empty; focus
-    // then moves to `other` (a synthetic ASID outside the slot range — it clears no ring and runs no
-    // wake edge of its own, so the baseline below is clean).
+    // --- hit: an UNFOCUSED hit. A focus arrival resets the ring, so `owner` starts empty; focus then
+    // moves to `other` (a synthetic ASID outside the slot range — it clears no ring and runs no wake
+    // edge of its own, so the baseline below is clean).
     sc::el0_input_set_active(owner);
     sc::el0_input_set_active(other);
     let edges0 = sc::el0_input_wake_edges();
@@ -5395,25 +5394,26 @@ fn clickswallow_leg(owner: u64, other: u64, surf: usize, len: usize) -> Option<(
     let edges1 = sc::el0_input_wake_edges();
     let _ = sc::el0_input_enqueue(Button(0));
     let depth_release = sc::el0_input_depth(owner);
-    let swallowed = !queued && refocused && depth_press == 0 && depth_release == 0;
+    let hit = queued && refocused && depth_press == 1 && depth_release == 2;
     let woke = edges1.wrapping_sub(edges0) >= 2;
 
-    // --- deliver: the SAME window, now focused (the press above left focus here). Ordinary app input.
+    // --- deliver: the SAME window, now focused (the press above left focus here). Ordinary app input,
+    // and it must stack on the pair already in the ring rather than replace it.
     let queued2 = sc::el0_input_enqueue(Button(1));
-    let delivered = queued2 && sc::el0_input_depth(owner) == 1;
+    let delivered = queued2 && sc::el0_input_depth(owner) == 3;
     let _ = sc::el0_input_enqueue(Button(0));
 
     close(w);
     sc::el0_input_set_active(owner); // the one primitive that resets a ring — leave the slot clean
     sc::el0_input_set_active(0);
     focus_changed(0);
-    Some((swallowed, delivered, woke))
+    Some((hit, delivered, woke))
 }
 
-/// CLICK-SWALLOW, DORMANT half: no arch router (and no EL0 input rings) in this build, so leg 8
+/// CLICK-PLAIN, DORMANT half: no arch router (and no EL0 input rings) in this build, so leg 8
 /// asserts nothing.
 #[cfg(all(feature = "witness", not(all(target_arch = "aarch64", feature = "baremetal"))))]
-fn clickswallow_leg(_owner: u64, _other: u64, _surf: usize, _len: usize) -> Option<(bool, bool, bool)> {
+fn clickplain_leg(_owner: u64, _other: u64, _surf: usize, _len: usize) -> Option<(bool, bool, bool)> {
     None
 }
 
@@ -5444,11 +5444,11 @@ pub fn hittest_selftest() {
     /// CLICK-SHELL r2 leg 7's owner: synthetic, and deliberately never passed to `create` — the leg
     /// needs a focus that owns NOTHING.
     const ASID_C: u64 = 0xC0C;
-    /// CLICK-SWALLOW leg 8's owner, and the one ASID here that is NOT synthetic: the leg asserts what
+    /// CLICK-PLAIN leg 8's owner, and the one ASID here that is NOT synthetic: the leg asserts what
     /// an app's input RING received, and rings exist only for private slots (`1..=USER_SLOTS`). The
     /// HIGHEST slot, because slots are handed out from the bottom, so it is the last one a live app
     /// would be holding — and the leg checks that it is free before borrowing it, and resets it after.
-    const SWALLOW_ASID: u64 = 8;
+    const PLAIN_ASID: u64 = 8;
     let s = &raw const HT_SURF as usize;
     let len = core::mem::size_of_val(&HT_SURF);
     // 8x8 ARGB8888, stride 32 BYTES (= 8 px) — the FOCUS-VIS surface geometry exactly. The compositor
@@ -5497,13 +5497,13 @@ pub fn hittest_selftest() {
     // is the leg that fails without the predicate fix. ASID_C owns nothing by construction.
     let bare: Option<bool> = clickshell_windowless_leg(ASID_C);
 
-    // Leg 8 — CLICK-SWALLOW (P73). The HIT arm's policy, which legs 6 and 7 do not touch: a press on
-    // an UNFOCUSED window moves focus and is CONSUMED, the next press on it (now focused) is
-    // delivered, and the swallow does not skip the VUGPAUSE-2r2 restore chain. Needs a real
+    // Leg 8 — CLICK-PLAIN (P75). The HIT arm's policy, which legs 6 and 7 do not touch: a press on an
+    // UNFOCUSED window moves focus and is DELIVERED WHOLE to the raised owner, the next press on it is
+    // delivered too, and the wake edges run BEFORE the push. Needs a real
     // private-slot ASID — the assertion is about a RING, and only slot ASIDs have one — so it runs
     // last, borrows the highest slot, and hands it back reset. `ASID_A` stands in as the app that
     // held focus before the click.
-    let swallow: Option<(bool, bool, bool)> = clickswallow_leg(SWALLOW_ASID, ASID_A, s, len);
+    let plain: Option<(bool, bool, bool)> = clickplain_leg(PLAIN_ASID, ASID_A, s, len);
 
     let ok = inside_ok
         && topmost_ok
@@ -5512,7 +5512,7 @@ pub fn hittest_selftest() {
         && hidden_ok
         && shell != Some(false)
         && bare != Some(false)
-        && swallow.map(|(a, b, c)| a && b && c) != Some(false);
+        && plain.map(|(a, b, c)| a && b && c) != Some(false);
     let verdict3 = |v: Option<(bool, bool, bool)>, pick: fn((bool, bool, bool)) -> bool| match v {
         Some(t) => {
             if pick(t) {
@@ -5524,13 +5524,13 @@ pub fn hittest_selftest() {
         None => "skip",
     };
     serial_println!(
-        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} hidden={} shell={} bare={} swallow={} deliver={} wake={} -> {}",
+        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} hidden={} shell={} bare={} hit={} deliver={} wake={} -> {}",
         ix, iy, inside_ok, topmost_ok, raise_ok, outside_ok, hidden_ok,
         match shell { Some(true) => "true", Some(false) => "false", None => "skip" },
         match bare { Some(true) => "true", Some(false) => "false", None => "skip" },
-        verdict3(swallow, |t| t.0),
-        verdict3(swallow, |t| t.1),
-        verdict3(swallow, |t| t.2),
+        verdict3(plain, |t| t.0),
+        verdict3(plain, |t| t.1),
+        verdict3(plain, |t| t.2),
         if ok { "PASS" } else { "FAIL" }
     );
 
