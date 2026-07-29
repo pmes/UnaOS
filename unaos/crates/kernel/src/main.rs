@@ -1260,6 +1260,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     // position. The console repaints nothing per frame, so the sprite must be
                     // fully self-undoing — the old flat-color erase punched grey boxes through
                     // text and missed the drop shadow's overhang, smearing motion.
+                    //
+                    // CURSOR-X86: on this target these three verbs now drive the COMPOSITOR SPRITE
+                    // (`video::cursor`, front buffer, above the window layer) rather than a
+                    // back-buffer sprite — `pal::cursor::SPRITE_OWNS_PAINT` carries the whole
+                    // argument. The sequence is unchanged and still correct: `restore` takes the
+                    // arrow off, `move_rel` repaints it at the new position on the report itself,
+                    // and `draw_over` is the idempotent tail. What changed is that the arrow no
+                    // longer needs the `pal.render()` below to reach the glass, and no longer
+                    // disappears under a window.
                     unaos_kernel::pal::cursor::restore(&mut pal);
                     unaos_kernel::pal::cursor::move_rel(
                         x, y,

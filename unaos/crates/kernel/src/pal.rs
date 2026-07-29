@@ -180,6 +180,57 @@ pub mod cursor {
     /// console loop and the full-screen demos all move/draw the same cursor.
     static POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
+    // --- CURSOR-X86 (metal defect fix: the pointer moved at PRESENT rate) ----------------------
+    //
+    // WHO OWNS THE POINTER'S PIXELS. Everything above this line is the pointer's *state* — position,
+    // activity clock, auto-hide — and that is arch-neutral and stays where it is. What was NOT
+    // arch-neutral, and what this flag names, is where the arrow's pixels are written.
+    //
+    // The x86 path drew the arrow into the `Screen` BACK BUFFER (`draw`/`draw_over` below, through
+    // `GneissPal::draw_rect`), with a save-under stashed from the same back buffer. A back-buffer
+    // pixel is not on the panel: it reaches glass only when somebody calls `Screen::flush`. Two
+    // consequences followed, and both are on the s45 rMBP bench record:
+    //
+    //   1. **The cursor could not move faster than the desktop could PRESENT.** Inside a full-screen
+    //      app the present is the frame, and the frame on that panel is expensive — `[vugfps4]` puts
+    //      `flush` at 69–86% of the whole frame budget at 10.9 MB/frame, and the panel's measured
+    //      write bandwidth (`[wc-h] win=2 … bytes=1620080 present_us=9858`) is ~150 MB/s. So the arrow
+    //      advanced once per 25–80 ms frame while the trackpad reported every 8 ms: the pointer
+    //      travelled in visible jumps and lagged the finger by a whole frame plus its flush. That is
+    //      the "slow as molasses" verdict, and it is a structural property of painting into the back
+    //      buffer, not a cost that any amount of tuning inside the sprite could remove.
+    //   2. **The sprite was BELOW the window layer.** `Screen::present_background` subtracts the
+    //      compositor's occluder boxes from the desktop's damage (WC-I), so back-buffer pixels are
+    //      deliberately never copied where a window is. The arrow therefore vanished under every
+    //      window it crossed — correct behaviour for the desktop layer, wrong behaviour for a system
+    //      cursor, which is by definition the last painter of the panel.
+    //
+    // `video::cursor` is the fix, and it was already here: a front-buffer sprite with its own
+    // colour-guarded, painted-pixels-only save-under (~200 reads at this panel's 2x block scale), a
+    // repair hand-off to the compositor, and CURSOR-8's rate floor on that repair. The Pi's render
+    // task has driven it since CURSOR-1 (`main.rs`: `move_rel` … then `video::cursor::repaint()`,
+    // with the pass deliberately NOT marked dirty — "a pointer report costs a save + a few small
+    // fills over one cell, not a `Screen::flush` of the sprite's damage box"). On x86 it was fully
+    // lifted and completely dormant: the s45 wire reads `[cursor3] planned=0 offers=0 ensure=177`
+    // and `[wc-i] cursor_brackets=0` — the machinery was compiled, linked, and never once asked to
+    // paint.
+    //
+    // WHERE THE SWITCH IS MADE, AND WHY HERE RATHER THAN AT THE CALL SITES. Every pointer report on
+    // every x86 path — the console loop, `vug`/`pulse`'s own drain, the EL0 input router — funnels
+    // through `move_rel`/`set_abs`, and every paint request funnels through `draw`/`draw_over`/
+    // `restore`. Folding the delegation into those six functions moves the whole target onto the
+    // compositor sprite without a single call-site change, which is also what keeps the full-screen
+    // demos' loops (not this arc's lane) correct: they keep calling `cursor::draw(pal)` once a frame
+    // and simply stop putting pixels in the back buffer, while the ARROW now tracks the pointer at
+    // report rate because `move_rel` repaints it the moment the report lands.
+    //
+    // The back-buffer sprite is kept, unchanged, for every other target: aarch64's `virt`/UEFI GUI
+    // console has no compositor-sprite driver of its own, and the bare-metal Pi render task already
+    // drives `video::cursor` explicitly. Nothing on those paths changes.
+    /// Whether the SYSTEM COMPOSITOR SPRITE (`video::cursor`, front buffer, above the window layer)
+    /// owns the arrow's pixels on this target, rather than the back-buffer sprite below.
+    const SPRITE_OWNS_PAINT: bool = cfg!(target_arch = "x86_64");
+
     // CURSOR-HIDE (metal verdict, 2026-07-18): the cursor auto-hides after ~1.5 s without pointer
     // input and reappears instantly on the next report (`move_rel`/`set_abs` stamp the activity
     // clock, and every draw site runs AFTER the frame's input drain). It also starts hidden — no
@@ -260,6 +311,16 @@ pub mod cursor {
     /// flat-color `erase`). No-op when nothing is stashed. Call before moving the position and
     /// when the auto-hide expires; the restored pixels come from the stash, never from VRAM.
     pub fn restore(pal: &mut impl GneissPal) {
+        // CURSOR-X86: the compositor sprite has its own save-under, in the FRONT buffer, and this
+        // verb means exactly "take the arrow off the panel" — so it delegates rather than no-ops.
+        // Both of this function's callers want that: the console loop's per-report restore → move →
+        // draw sequence, and the auto-hide transition, which is the ONE place the sprite must come
+        // down and stay down. Nothing was ever stashed in the back buffer on this target, so there
+        // is no local state to unwind.
+        if SPRITE_OWNS_PAINT {
+            crate::video::cursor::undraw();
+            return;
+        }
         let mut s = SAVED.lock();
         if !s.valid {
             return;
@@ -282,6 +343,15 @@ pub mod cursor {
     /// `None`) the stash is skipped and this degrades to a plain draw — no such surface exists
     /// on the GUI path today (`TargetPal` is always `Screen`-backed).
     pub fn draw_over(pal: &mut impl GneissPal) {
+        // CURSOR-X86: the arrow is already on the panel — `move_rel`/`set_abs` put it there the
+        // instant the report landed, which is the whole point. `ensure_drawn` is the cheap
+        // idempotent tail (one lock acquisition and a boolean in the common case, per WC-I); it does
+        // real work only when something took the sprite down and owes it back, e.g. the `restore`
+        // above or a compositor erase.
+        if SPRITE_OWNS_PAINT {
+            crate::video::cursor::ensure_drawn();
+            return;
+        }
         if !visible() {
             return;
         }
@@ -321,6 +391,7 @@ pub mod cursor {
         touch();
         let (x, y) = pos(w, h);
         set_clamped(x + dx, y + dy, w, h);
+        repaint_on_move();
     }
 
     /// Apply an absolute report in the 0..=32767 HID coordinate space, scaled to the panel.
@@ -329,6 +400,33 @@ pub mod cursor {
         let x = ((ax as i64 * w as i64) / 32767) as i32;
         let y = ((ay as i64 * h as i64) / 32767) as i32;
         set_clamped(x, y, w, h);
+        repaint_on_move();
+    }
+
+    /// CURSOR-X86 — put the compositor sprite where the pointer now is, on the report that moved it.
+    ///
+    /// THE ONE CHOKE POINT. `move_rel` and `set_abs` are the only two functions in the kernel that
+    /// change the pointer's position, so a repaint here is a repaint on every pointer report of every
+    /// x86 path — the console loop's drain, the full-screen demos' own drain, and the EL0 input
+    /// router's keep-alive — without any of them being touched. That is what decouples the arrow's
+    /// cadence from the panel present: `video::cursor::repaint` is a restore → save → draw over one
+    /// glyph cell in the FRONT buffer (~200 read-backs at this panel's 2x block scale, then the same
+    /// number of writes), so it costs single-digit microseconds and is affordable at the trackpad's
+    /// full ~125 Hz, where a `Screen::flush` of the same box was gated behind a 25–80 ms frame.
+    ///
+    /// Self-gating, twice over: `repaint` does nothing while `visible()` is false (before the first
+    /// report of the boot, and again ~1.5 s after the last one), and nothing at all on a target where
+    /// the back-buffer sprite still owns the paint. The headless QEMU gates deliver no pointer report
+    /// at all, so this never runs there and the regression suite sees no change.
+    ///
+    /// Lock discipline: `repaint` takes `SPRITE` → `WRITER`, and its `repair` tail takes `TABLE` with
+    /// `SPRITE` already released (the module's stated `SPRITE` → `TABLE` order). Every caller of
+    /// `move_rel`/`set_abs` is an input drain holding none of the three, so no new order is created.
+    #[inline]
+    fn repaint_on_move() {
+        if SPRITE_OWNS_PAINT {
+            crate::video::cursor::repaint();
+        }
     }
 
     fn set_clamped(x: i32, y: i32, w: i32, h: i32) {
@@ -353,6 +451,15 @@ pub mod cursor {
         // sprite — any stash is stale; invalidate it so a later `restore` (back on the console)
         // can never paint old pixels over a fresh frame.
         SAVED.lock().valid = false;
+        // CURSOR-X86: a full-redraw surface (vug/pulse clear + flush every frame) has just repainted
+        // the back buffer; the front-buffer sprite is unaffected by that and only needs putting back
+        // if the frame's own present took it down. `TargetPal::render`'s bracket does exactly that,
+        // so in practice this is the idempotent no-op and the arrow's real cadence is the report
+        // rate, not the frame rate.
+        if SPRITE_OWNS_PAINT {
+            crate::video::cursor::ensure_drawn();
+            return;
+        }
         paint(pal);
     }
 
@@ -976,8 +1083,29 @@ impl<'a> GneissPal for TargetPal<'a> {
     }
 
     /// Present the frame: flush the damaged region of the back buffer to the framebuffer.
+    ///
+    /// CURSOR-X86 — and, where the compositor sprite owns the pointer's pixels, bracket that flush.
+    ///
+    /// `Screen::flush` copies back-buffer pixels over the front framebuffer's damaged rects. The
+    /// front buffer is where the sprite lives, so an unbracketed flush would both erase the arrow and
+    /// invalidate its save-under — the next restore would stamp pre-flush content back over whatever
+    /// the desktop had just presented. The Pi's render task has always taken this bracket around its
+    /// own `pal.render()` call; putting it HERE instead of at the x86 call sites is what makes it
+    /// hold for every `Screen`-backed present on the target, including the ones inside the
+    /// full-screen demos' frame loops, without editing any of them.
+    ///
+    /// `undraw` before, `ensure_drawn` after — not `repaint` after. `ensure_drawn` is WC-I's
+    /// idempotent tail: it re-establishes a sprite that is down and does nothing to one that is up,
+    /// so a present that ran while the pointer was hidden costs one lock acquisition and a boolean.
+    /// (`repaint` would run a whole restore → save → draw cycle per present, which is the churn WC-I
+    /// removed.) Both halves are no-ops before the first pointer report of the boot, which is every
+    /// headless gate.
     fn render(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        crate::video::cursor::undraw();
         self.surface.flush();
+        #[cfg(target_arch = "x86_64")]
+        crate::video::cursor::ensure_drawn();
     }
 
     fn width(&self) -> u32 {
