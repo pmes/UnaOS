@@ -1782,6 +1782,50 @@
     run completed, so a missing witness here is a GENUINE regression". Lane: `scripts/mbench.py`,
     `scripts/specs/pi4-regression.spec`, the `kernel8-test`/`battery` stanzas of `arroyo`, and this
     doc.
+- **FLAKE-1 (the gate names its own flakes)** — a **test-tooling** arc: `unaos/arroyo`'s
+  `test_kernel8()` stanza only; zero kernel source touched. MBENCH-HONEST above made the gate's
+  *verdict* honest; two bench artifacts from 2026-07-28 showed the *harness* could still fail in
+  ways that bypassed that verdict entirely.
+  - **The silent no-capture run.** A `kernel8-test 150` finished looking green while QEMU had
+    produced **no `serial-pi.log` at all**; mbench then errored `[Errno 2] No such file or
+    directory` and a downstream `&&`/pipe masked it, so the wrapper ended green. A *missing capture*
+    was being read as a pass — the exact class of lie MBENCH-HONEST was built to end.
+  - **The race, stated precisely.** The QMP port is picked by an `lsof` pre-scan and QEMU binds it
+    **seconds later**, after the image build. That is a **check-then-bind race**, and it cannot be
+    made atomic from shell: the script never holds the socket, QEMU does. This host runs several
+    worktree gates concurrently, so a colliding QEMU can win the bind and kill ours instantly —
+    before `-serial file:` has created the log. The pre-scan is kept (it narrows the window and is
+    nearly always sufficient); it is *not* the fix, and the arroyo comment now says so.
+  - **The fix — a liveness gate and a bounded retry.** Within `UNAOS_K8T_LIVE_SECS` (default 5 s,
+    polled at 10 Hz so a healthy launch costs a fraction of a second, and short-circuited the moment
+    the pid dies) the QEMU pid must be alive **and** `$logf` must exist and be non-empty. A launch
+    failing either test is killed, reaped, and relaunched on the next free port, printing a loud
+    `⚠ kernel8-test: QEMU launch flake (port <n>) — retrying on <n+1>`. Bounded at **2 retries**.
+  - **A fourth exit code.** If all three attempts fail — or if `$logf` is missing/empty where mbench
+    would run (belt and braces) — the command exits **4: HARNESS FLAKE** and says in words that the
+    run carries no verdict: not a pass, not a regression, not a truncation. **0 PASS / 1 FAIL /
+    3 TRUNCATED are unchanged**; 4 only occupies ground that was previously reported as 0 or 1 by
+    accident. mbench is never reached with a missing log.
+  - **TRUNCATED now names host load.** Second artifact: under concurrent build/QEMU load a 150 s
+    window truncated (exit 3 — honestly) where **210 s passed clean**. Not a bug, but the reader was
+    left to guess. The existing TRUNCATED explanation is kept verbatim and gains one line noting the
+    sufficient window scales with host load, citing the 150/210 precedent. This is the same
+    MACHINE-DEPENDENT margin the spec header has warned about since BGRUN-2 — observed within *one*
+    machine over time rather than between machines.
+  - **Siblings sharing the shape (NOT touched — lane discipline).** `install_pi()` and
+    `test_aarch64()` launch QEMU the same way and carry the same latent race. They are deliberately
+    out of this arc and can inherit the retry loop as a shared helper later.
+  - **Gates:** `bash -n unaos/arroyo` clean; `./arroyo check` green both arches. Four `kernel8-test`
+    runs, one per verdict. (1) Healthy: `kernel8-test 210` → **MBENCH PASS 86/86 required, 0
+    forbidden**, 22501 lines, exit **0**, no flake line — the healthy path is unchanged. (2) The
+    race, *reproduced*: two sockets **bound but not listening** on 4600/4601 are invisible to
+    `lsof -sTCP:LISTEN` (the pre-scan passes them) yet fatal to QEMU's bind — a faithful stand-in for
+    losing the race. QEMU printed `Failed to find an available port: Address already in use` twice,
+    the harness printed both retry lines, the third attempt bound 4602 and the run **recovered**:
+    PASS 86/86, exit **0**. (3) Unrecoverable: `UNAOS_QEMU_EXTRA=-flake1-forced-bad-arg` kills every
+    launch → both retry lines, then the HARNESS FLAKE message and exit **4**. (4) `kernel8-test 8` →
+    TRUNCATED 64/86, exit **3**, carrying the new host-load line. Lane: the `test_kernel8()` stanza
+    of `unaos/arroyo`, `unaos/scripts/specs/pi4-regression.spec`'s header, and this doc.
 - **VUGCLICK (a click stops killing the vug)** — an **app-only** arc: `crates/user-vug` + this doc, no
   kernel change. P62 attended metal reported "vug is crashing". The wire showed no panic, no fault and a
   clean load — what it showed was `:: UVUG: interactive takeover at frame 24340 ::` followed immediately

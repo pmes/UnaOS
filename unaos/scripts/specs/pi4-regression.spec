@@ -17,6 +17,20 @@
 #     Re-measured 2026-07-25 (MBENCH-HONEST, this host, 63 witnesses): 8 s -> 41/63 TRUNCATED;
 #     60 s -> 63/63 PASS, last required witness (`BANDY-ACL`) at line 1035 of 1682. The 8 s default
 #     this arc removed was not marginal — it stopped less than a third of the way through the chain.
+#     FLAKE-1 (2026-07-28): the exit contract GAINS a fourth code and loses none. 0 PASS / 1 FAIL /
+#     3 TRUNCATED are exactly as above; NEW `4` = HARNESS FLAKE — QEMU never produced a capture, so the
+#     run is neither a pass, a regression, nor a truncation. It exists because a `kernel8-test 150` on
+#     this bench finished GREEN with no serial-pi.log at all: mbench errored `[Errno 2] No such file or
+#     directory` and a downstream `&&` masked it. Cause is a check-then-bind race on the QMP port (the
+#     `lsof` pre-scan runs, QEMU binds seconds later after the build, and a concurrent worktree gate can
+#     win the bind and kill ours before `-serial file:` creates the log) — unclosable atomically from
+#     shell, so `test_kernel8()` now gates on LIVENESS (pid alive + log non-empty within
+#     UNAOS_K8T_LIVE_SECS, default 5) and RETRIES on the next port, twice, loudly; exhausted retries or
+#     an empty log at assert time exit 4 instead of reaching mbench with nothing to replay.
+#     Second FLAKE-1 measurement, and why TRUNCATED now mentions host load: the sufficient window is
+#     LOAD-DEPENDENT. Same host, same image, 2026-07-28 — 150 s -> TRUNCATED under concurrent
+#     build/QEMU load; 210 s -> PASS clean. This is the same MACHINE-DEPENDENT margin noted above,
+#     observed within ONE machine over time rather than between machines.
 #   Metal:      ~/pi-serial.log (pi-bench-connect.sh bridge capture)
 #
 # Metal caveat (unaos-hazards): some real-Pi boots bring up only 3 of 4 cores and

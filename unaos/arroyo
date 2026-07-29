@@ -1286,6 +1286,27 @@ run_kernel8() {
 # gating a CLEAN base and getting the identical shortfall). The measured floor is 60 s; the spec header
 # in scripts/specs/pi4-regression.spec carries the per-window measurements. `kernel8-test` is pi4-only —
 # no x86/arm caller reaches this function — so raising the default changes nothing for them.
+#
+# FLAKE-1 (2026-07-28): two flake modes were artifacted on the bench, and both produced a DISHONEST
+# verdict from a harness whose whole point is honesty. Named here so the tool reports them instead.
+#   (1) SILENT NO-CAPTURE. A `kernel8-test 150` finished looking green while QEMU had produced NO
+#       serial-pi.log at all; mbench then errored `[Errno 2] No such file or directory` and a
+#       downstream `&&`/pipe masked the failure. Root cause is a CHECK-THEN-BIND RACE on the QMP
+#       port: the `lsof` pre-scan below observes the port free, and QEMU binds it some seconds LATER
+#       (after the image build), so a concurrently-launching QEMU from another worktree gate — this
+#       host runs several at once — can win the bind and kill ours instantly, before `-serial file:`
+#       has created the log. That check-then-bind window CANNOT be closed atomically from shell: we
+#       do not hold the socket, QEMU does. The pre-scan stays (it narrows the window and is nearly
+#       always sufficient); the RETRY LOOP below is the actual mechanism. A launch that is not alive
+#       AND writing within UNAOS_K8T_LIVE_SECS (default 5) is treated as a flake, killed, and
+#       relaunched on the next port, bounded at 2 retries.
+#   (2) LOAD-SENSITIVE TRUNCATION. Under concurrent build/QEMU load a 150 s window truncated (exit 3,
+#       honestly) where 210 s passed clean. Not a bug — but the TRUNCATED explanation now says so.
+# EXIT CONTRACT (extends MBENCH-HONEST, does not alter it): 0 PASS / 1 FAIL / 3 TRUNCATED are exactly
+# as before; the NEW code 4 means HARNESS FLAKE — the run produced no usable capture, so it is neither
+# a pass, a regression, nor a truncation. Never fall through to mbench with a missing log.
+# `install_pi()` and `test_aarch64()` share this launch shape and have the same latent race; they are
+# deliberately NOT touched by this arc (lane discipline) and can inherit the retry helper later.
 test_kernel8() {
     local secs="${1:-60}"
     kernel8 # always rebuild from current source (incremental; ~seconds) so we never test a stale image
@@ -1300,16 +1321,53 @@ test_kernel8() {
     [ "$SDIMG" != "0" ] && SD_DRIVE="-drive if=sd,format=raw,file=${SDIMG}"
     # QMP port: default 4463, overridable (UNAOS_QMP_PORT) and auto-bumped past ports already in
     # use — parallel worktree sessions (hybrid mode) each run their own QEMU and MUST NOT collide.
+    # FLAKE-1: the pre-scan is a NARROWING measure, not a guarantee — see the header. It cannot be
+    # atomic (we never hold the socket; QEMU binds it later), so the liveness+retry loop below is the
+    # mechanism that actually turns a lost race into a named, bounded retry instead of a false green.
     local qmp_port="${UNAOS_QMP_PORT:-4463}"
     while lsof -iTCP:"$qmp_port" -sTCP:LISTEN >/dev/null 2>&1; do qmp_port=$((qmp_port + 1)); done
-    qemu-system-aarch64 \
-        -machine raspi4b \
-        -kernel "$KERNEL8_DIR/kernel8.img" \
-        -serial "file:${logf}" -serial null -display none \
-        ${SD_DRIVE} \
-        -qmp tcp:127.0.0.1:${qmp_port},server,nowait \
-        ${UNAOS_QEMU_EXTRA:-} &
-    local qpid=$!
+    # FLAKE-1 liveness gate: within UNAOS_K8T_LIVE_SECS (default 5) of launch, the QEMU pid must be
+    # ALIVE and $logf must exist and be GROWING PAST 0 BYTES. A QEMU that lost the QMP bind (or died
+    # on a bad arg) fails both within milliseconds. 2 retries, each on the next port up.
+    local live_secs="${UNAOS_K8T_LIVE_SECS:-5}"
+    local max_tries=3           # 1 launch + 2 retries
+    local qpid="" attempt=1 launched=0
+    while [ "$attempt" -le "$max_tries" ]; do
+        rm -f "$logf"
+        qemu-system-aarch64 \
+            -machine raspi4b \
+            -kernel "$KERNEL8_DIR/kernel8.img" \
+            -serial "file:${logf}" -serial null -display none \
+            ${SD_DRIVE} \
+            -qmp tcp:127.0.0.1:${qmp_port},server,nowait \
+            ${UNAOS_QEMU_EXTRA:-} &
+        qpid=$!
+        # Poll at 10 Hz so a healthy launch costs a fraction of a second, not the whole window.
+        local ticks=$((live_secs * 10)) t=0
+        while [ "$t" -lt "$ticks" ]; do
+            if ! kill -0 "$qpid" 2>/dev/null; then break; fi   # died => flake, no point waiting out the window
+            if [ -s "$logf" ]; then launched=1; break; fi
+            sleep 0.1
+            t=$((t + 1))
+        done
+        if [ "$launched" -eq 1 ]; then break; fi
+        kill "$qpid" 2>/dev/null || true                       # reap the remnant before retrying
+        wait "$qpid" 2>/dev/null || true
+        if [ "$attempt" -lt "$max_tries" ]; then
+            echo -e "${COLOR_YELLOW}⚠ kernel8-test: QEMU launch flake (port ${qmp_port}) — retrying on $((qmp_port + 1))${COLOR_RESET}"
+            qmp_port=$((qmp_port + 1))
+            while lsof -iTCP:"$qmp_port" -sTCP:LISTEN >/dev/null 2>&1; do qmp_port=$((qmp_port + 1)); done
+        fi
+        attempt=$((attempt + 1))
+    done
+    if [ "$launched" -ne 1 ]; then
+        echo -e "${COLOR_RED}✖ kernel8-test: HARNESS FLAKE — QEMU never came up (no serial capture at ${logf})"
+        echo -e "  after ${max_tries} launch attempts, each given ${live_secs}s to write its first byte (last port ${qmp_port})."
+        echo -e "  This run carries NO verdict: not a pass, not a regression, not a truncation. Exit 4."
+        echo -e "  Usual cause is a lost QMP-port race against a concurrent worktree gate, or a bad"
+        echo -e "  UNAOS_QEMU_EXTRA. Re-run when the host is quieter, or pin UNAOS_QMP_PORT to a free port.${COLOR_RESET}"
+        return 4
+    fi
     python3 "${WORKSPACE_DIR}/scripts/qmp_shoot.py" --port "$qmp_port" --wait "$((secs - 1))" --out "$png" 2>/dev/null || sleep "$secs"
     kill "$qpid" 2>/dev/null || true
     wait "$qpid" 2>/dev/null || true
@@ -1323,7 +1381,18 @@ test_kernel8() {
     #   was cut short — INCONCLUSIVE, neither a pass nor a regression; re-run with a longer window).
     # UNAOS_K8T_ASSERT=0 opts out, for the deliberate off-spec configurations (UNAOS_SDIMG=0 no-card
     # control, single-subsystem knob runs) where the full pi4 spec is not the contract being tested.
+    # FLAKE-1 adds exit 4 (HARNESS FLAKE), for the case where there is no capture to assert at all.
     if [ "${UNAOS_K8T_ASSERT:-1}" != "0" ]; then
+        # FLAKE-1 belt-and-braces: the liveness gate above should make this unreachable, but a QEMU
+        # that dies AFTER writing its first byte can still leave a truncated-to-zero log, and mbench
+        # given a missing path errors `[Errno 2] No such file or directory` — which is how the silent
+        # no-capture run got read as green. Name it as a flake (4) rather than a regression (1).
+        if [ ! -s "$logf" ]; then
+            echo -e "${COLOR_RED}✖ kernel8-test: HARNESS FLAKE — ${logf} is missing or empty; there is nothing to assert."
+            echo -e "  QEMU came up but produced no serial bytes. This run carries NO verdict — not a pass,"
+            echo -e "  not a regression, not a truncation. Exit 4; re-run.${COLOR_RESET}"
+            return 4
+        fi
         echo -e "${COLOR_CYAN}⚡ mbench: asserting the capture against scripts/specs/pi4-regression.spec${COLOR_RESET}"
         # `|| mrc=$?` rather than a bare call + `$?`: this script runs under `set -e`, so a FAIL (1) or
         # TRUNCATED (3) exit would otherwise abort here and swallow the explanation below.
@@ -1333,6 +1402,11 @@ test_kernel8() {
         if [ "$mrc" -eq 3 ]; then
             echo -e "${COLOR_YELLOW}⚠ kernel8-test: the boot was TRUNCATED at ${secs}s — this run proves NOTHING."
             echo -e "  Missing witnesses here are NOT a regression. Re-run with a longer window: ./arroyo kernel8-test 60${COLOR_RESET}"
+            # FLAKE-1: the window that suffices is HOST-LOAD DEPENDENT, not fixed. Artifacted on this
+            # bench 2026-07-28: 150 s truncated under concurrent build/QEMU load where 210 s passed clean.
+            echo -e "${COLOR_YELLOW}  The needed window scales with HOST LOAD: concurrent builds/QEMU gates slow the boot, so a"
+            echo -e "  window that passed on a quiet host truncates on a busy one (bench precedent 2026-07-28: 150 s"
+            echo -e "  TRUNCATED under load, 210 s clean). Try './arroyo kernel8-test 210', or re-run when quieter.${COLOR_RESET}"
         fi
         return $mrc
     fi
