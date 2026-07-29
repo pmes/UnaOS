@@ -4192,3 +4192,159 @@ six-vug storm. Positive verification is a wedge on the bench.
   region — the first direct evidence about whether this is a one-core death or a pile-up.
 * A wire that reaches `<F9>` and wedges later has exonerated the focus chain for that press, and the
   next instrument belongs downstream in the pump.
+
+### WC-N — "predetermined fps" becomes wire data
+
+Six vugs on the panel run at visibly different rates, and until this arc nothing on the wire could
+say **why**. The two numbers that existed answer adjacent questions:
+
+* `[vugfps]` (`user-vug`, commit `ff6ec88f`) is the **app's own** count of frames it *issued*, drawn
+  in its window corner. It is measured at EL0 from `SYS_GETINFO`'s tick and cannot know whether a
+  frame reached glass — a vug hidden below the shell draws a healthy `60` while presenting into a
+  pass that is suppressed before it touches a pixel.
+* `[sched6]` (`main.rs`) is the render task's passes and presented composites per second. Fleet-wide,
+  with no window in it: it says the compositor is busy, never which window the work was for.
+
+So the question Peter's phrase names — *is a given vug's effective present rate a CONSEQUENCE of load,
+or a CEILING somewhere?* — had no reading. `[wcn]` is that reading, taken on the compositor's own side
+of the seam, per window.
+
+#### What it counts
+
+Four counts per window, each a delta over the rollup window:
+
+| field  | meaning |
+| ------ | ------- |
+| `att`  | `wm::present` calls naming this row — the owner's **attempt**, after `SYS_WIN_PRESENT`'s ownership check |
+| `comp` | times the row was actually blitted by `composite_inner`'s loop — **pixels on glass** |
+| `hid`  | presents suppressed by the VUGMIN-B arm: every window this owner holds was below `SHELL_Z` |
+| `bel`  | passes in which the row was in the dirty set and then declined by `above_shell` |
+
+`comp` can legitimately **exceed** `att`: a neighbour's present grows the dirty set upwards over
+occlusion and repaints this row inside the neighbour's pass. `comp - att` is therefore a reading about
+overlap — compositor work this window's owner never asked for and cannot see — not an error.
+
+`hid` and `bel` are the same fact from the two ends. `hid` is the owner's own present being dropped in
+`present`; `bel` is somebody *else's* pass declining to repaint the row. **There is no third skip
+class, because there is no occlusion cull:** a window wholly covered by another is still blitted (the
+dirty-set closure exists to repaint what is on top, not to drop what is underneath), and this witness
+does not invent a category the compositor does not have.
+
+#### The park, and why the rate is not `att / span`
+
+VUGPAUSE-2 makes an idle vug **leave the run queues** — it blocks in the input wait and presents
+nothing at all until the operator touches it. Divided by wall-clock span that vug reads as `0.2/s`,
+which is indistinguishable from a vug being *starved of cores* at 0.2 fps. That is exactly the
+confusion this witness exists to remove, so the per-window denominator is the window's own **active**
+time:
+
+* consecutive presents closer together than `WCN_PARK_GAP_MS` (250 ms) accumulate into `active`;
+* any longer gap accumulates into `parked` instead, and is charged to neither numerator nor
+  denominator.
+
+250 ms is chosen against VUGPAUSE-2's own ~256 ms backstop period: anything past a quarter second is
+provably not a render loop pacing itself. A parked vug therefore reports the rate it ran at *while it
+was running*, with its park time stated beside it. (A window's first present after a park opens a new
+active span rather than closing one, so `att` overstates the active interval by at most one present
+per park — visible only at very low counts, and always slightly optimistic.)
+
+The **aggregate** line's denominator is wall-clock, deliberately: "what did the fleet cost the panel
+over these five seconds" is a wall-clock question, and a fleet with one vug parked and five running
+genuinely did present less per second of panel time. Conflating the two denominators on one line would
+make the aggregate un-addable from its own rows.
+
+#### `gap` is the ceiling test
+
+`gap=min..max` is the shortest and longest **active** inter-present gap in the window, in ms. This
+pair, not the rate, is what makes "predetermined fps" checkable without a second run:
+
+* a rate that is a **consequence of load** scatters — a contended vug's gaps run from a few ms to
+  tens, so `min` and `max` are far apart;
+* a rate that is a **fixed ceiling** does not — `min` and `max` collapse onto one value, because
+  something is pacing the loop regardless of what else is happening.
+
+A window that recorded no active gap at all (one present in the whole rollup) reports `0..0`, which is
+what it honestly has: no interval to measure.
+
+#### Cadence
+
+Dirty-paced, following `[pstrip]`/`[sched6]`: a fixed `WCN_ROLLUP_MS` (5000 ms) period, one claim per
+period taken by compare-exchange from the presenting core, and the tick itself driven from the tail of
+`wm::present` — including the VUGMIN-suppressed path, so a fleet that has just been hidden does not
+lose the very interval whose `hid=` count is the point.
+
+Two consequences, both deliberate:
+
+* line volume is bounded by construction — at most one block (live windows + one aggregate) per
+  period, however many cores are compositing;
+* a fleet that has **wholly parked goes silent** rather than printing a wall of zeros. The witness is
+  driven by the traffic it measures, so "no `[wcn]` lines" reads as "nobody is presenting".
+
+Because the period's final partial window is never emitted on its own account, a **forced** emit fires
+from `vugmin_rollup`, on the same scoped rollup (`fixture` / `desktop`) every other window witness
+reports on. That is what guarantees the gate a block. A slot with traffic but no live row still gets
+its line, marked `live=no`: dropping it would silently delete the last frames of every window that
+ever exits.
+
+#### Wire format
+
+```
+[wcn] win=<id> asid=<owner> live=<yes|no> above=<yes|no> att=<n> comp=<n> hid=<n> bel=<n>
+      rate=<x.y>/s comp_rate=<x.y>/s active=<n>ms parked=<n>ms gap=<min>..<max>ms
+[wcn] rollup scope=<live|fixture|desktop> wins=<n> att=<n> comp=<n> hid=<n> bel=<n> stale=<n>
+      passes=<n> aborted=<n> att_rate=<x.y>/s comp_rate=<x.y>/s span=<n>ms -> <IDLE|STARVED|LIVE>
+```
+
+(one physical line each; wrapped here). Rates are fixed-point tenths, for `[pstrip]`'s reason — an
+integer `/s` truncates every honest sub-1 Hz rate to `0`. Aggregate-only fields: `stale` (presents
+naming no live row — a window closed under its owner, with no slot to charge them to), `passes` /
+`aborted` (composite passes that reached the blit loop, and passes that returned before it under the
+F4 drain barrier or an unready framebuffer — an aborted pass cost its owner a syscall and produced no
+pixels for *any* window). The verdict is `IDLE` when nothing was attempted, `STARVED` when presents
+were attempted and none reached glass, `LIVE` otherwise.
+
+#### WC-N gate results (2026-07-29, QEMU raspi4b)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
+* `./arroyo kernel8-test` — **`✅ MBENCH PASS — 86/86 required witnesses, 0 forbidden hit(s), 5150
+  lines scanned`**. No gate entry was added; the arc's claim is the reading, not a new REQUIRE.
+
+Actual lines from `target/serial-pi.log`:
+
+```
+[wcn] win=1 asid=0x1 live=yes above=yes att=83 comp=85 hid=0 bel=0 rate=285.2/s comp_rate=292.0/s active=291ms parked=0ms gap=1..7ms
+[wcn] rollup scope=live wins=1 att=83 comp=85 hid=0 bel=0 stale=0 passes=86 aborted=0 att_rate=16.6/s comp_rate=17.0/s span=5000ms -> LIVE
+[wcn] win=1 asid=0x0 live=no above=no att=225 comp=244 hid=0 bel=1 rate=403.2/s comp_rate=437.2/s active=558ms parked=0ms gap=1..17ms
+[wcn] win=2 asid=0x0 live=no above=no att=4 comp=16 hid=0 bel=1 rate=6.6/s comp_rate=26.7/s active=0ms parked=0ms gap=0..0ms
+[wcn] rollup scope=fixture wins=0 att=229 comp=260 hid=0 bel=2 stale=0 passes=263 aborted=0 att_rate=382.9/s comp_rate=434.7/s span=598ms -> LIVE
+[wcn] win=1 asid=0x1 live=yes above=yes att=1118 comp=1126 hid=0 bel=3 rate=560.4/s comp_rate=564.4/s active=1995ms parked=0ms gap=1..7ms
+```
+
+The first block is the whole mechanism in one line: the fixture's window attempted 83 presents inside
+**291 ms of active time** out of a 5000 ms wall span — `rate=285.2/s` (what it does when it runs)
+against `att_rate=16.6/s` (what it cost the panel). Pre-WC-N only the second number was obtainable,
+and it would have been read as a 16 fps window. `gap=1..7ms` is the scatter signature: this window is
+**not** ceiling-limited in QEMU. `comp=85 > att=83` is the overlap reading — two repaints the owner
+did not ask for.
+
+#### Honest scope on the gate
+
+QEMU raspi4b has no HID, so nothing ever TABs to the shell and no owner is ever hidden: `hid=0` there
+is structural, and the `bel=` counts that do appear come from the fixture's own z manipulation rather
+than from an operator. The gate proves the counters are wired, the cadence is bounded, the park split
+does not divide by zero, and the parked/active denominators behave. The numbers that carry the arc —
+a hidden vug's `hid` climbing while its `[vugfps]` corner still reads 60, and a six-vug storm's `gap`
+spread — are bench readings.
+
+#### Metal watch-list (WC-N)
+
+* **`gapmin == gapmax` on a busy vug is the finding.** It would mean the rate is paced, not earned,
+  and the next question is by what — the present syscall, the drain barrier, or the app's own loop.
+* **`comp` far above `att` across the fleet** means the tiling has the windows overlapping enough that
+  every present costs several blits. That is a placement problem wearing a performance costume.
+* **`aborted` climbing** is the F4 drain barrier eating passes under load — presents that cost a
+  syscall and produced nothing, which is the P66 neighbourhood.
+* **`STARVED`** (`att > 0`, `comp == 0`) with `hid == 0` and `bel == 0` should be impossible; it would
+  mean presents are reaching `composite` and the blit loop is never drawing them.
+* **`parked` large while the operator says the vug looks frozen** is the good outcome — it says the
+  vug is in VUGPAUSE-2's idle and is waiting for input, not starved.

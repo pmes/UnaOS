@@ -632,7 +632,13 @@ pub fn present(id: WinId) -> bool {
                 // console path is never suppressed.
                 if r.compat { 0 } else { r.owner_asid }
             }
-            None => return false,
+            None => {
+                // WC-N — a present that named no live row: the window closed under its owner. No slot
+                // to charge it to, so it lands on the aggregate line.
+                #[cfg(feature = "witness")]
+                WCN_STALE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
         };
         skip = owner_hidden(&t, owner, SHELL_Z.load(core::sync::atomic::Ordering::Acquire));
     }
@@ -643,12 +649,25 @@ pub fn present(id: WinId) -> bool {
         // make the `app` leg disagree with itself the moment a window went behind the shell.
         super::wcg::on_present(id, surf, surf_len);
     }
+    // WC-N — the ATTEMPT is recorded here, before the suppression branch, because an attempt is what
+    // the owner did and it happened either way. `hidden` is the branch it took. Outside the table
+    // lock (dropped at the block above), per this file's standing rule.
+    #[cfg(feature = "witness")]
+    wcn_note_present(id, skip);
     if skip {
         #[cfg(feature = "witness")]
-        VUGMIN_SKIPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        {
+            VUGMIN_SKIPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // The cadence tick runs on the suppressed path too: a fleet that has just been hidden is
+            // still presenting, and a rollup that went quiet the moment VUGMIN engaged would lose the
+            // exact interval whose `hid=` count is the point.
+            wcn_tick();
+        }
         return true;
     }
     composite();
+    #[cfg(feature = "witness")]
+    wcn_tick();
     true
 }
 
@@ -741,6 +760,10 @@ pub fn close(id: WinId) -> bool {
             None => return false,
         }
     };
+    // WC-N — the slot may be handed to a new window immediately; clear the activity clock so the next
+    // tenant's first present is not measured against this one's last.
+    #[cfg(feature = "witness")]
+    wcn_forget(id);
     // F4 — same barrier as `close_owner`: this row's surface may be under an in-flight blit.
     let barrier = DrainBarrier::drain();
     #[cfg(feature = "witness")]
@@ -768,6 +791,10 @@ pub fn close_owner(owner_asid: u64) -> usize {
         for r in t.rows.iter_mut() {
             if r.used && r.owner_asid == owner_asid {
                 vacated[n] = outer_box(r);
+                // WC-N — same slot-recycle reset as `close`. Under the table lock here because the
+                // row's id is only readable before the clear; `wcn_forget` is one relaxed store.
+                #[cfg(feature = "witness")]
+                wcn_forget(r.id);
                 *r = Window::empty();
                 n += 1;
             }
@@ -1668,6 +1695,9 @@ fn composite_inner() -> CursorTail {
     crate::wedge2::mark_composite("<F7>", "<f7>");
     let fb = *super::WRITER.lock();
     if !fb.is_ready() {
+        // WC-N — a pass that produced no pixels for any window. See `WCN_ABORTED`.
+        #[cfg(feature = "witness")]
+        wcn_note_pass(false);
         return tail_of(disturbed, session);
     }
 
@@ -1685,6 +1715,11 @@ fn composite_inner() -> CursorTail {
         // panel, and the caller's tail is what puts it back. Every early exit from here on owes the
         // same answer.
         if DRAIN_PENDING.load(core::sync::atomic::Ordering::Acquire) != 0 {
+            // WC-N — aborted under the F4 barrier. The `wcn_note_pass` call is one relaxed increment
+            // and takes no lock, so it is safe inside this critical section; keeping it here rather
+            // than after the early return is what makes the abort count exact.
+            #[cfg(feature = "witness")]
+            wcn_note_pass(false);
             return tail_of(disturbed, session);
         }
         let mut dirty = [false; MAX_WINDOWS];
@@ -1755,6 +1790,10 @@ fn composite_inner() -> CursorTail {
         // flag from while it was hidden. Outermost of the per-window guards: WC-G's sampler below
         // must never bracket a window this skip declines to draw.
         if !above_shell(&rows[i], shell) {
+            // WC-N — this row was damaged and this pass declined to repaint it. The compositor's end
+            // of the same fact `present`'s `hid` counts from the owner's end.
+            #[cfg(feature = "witness")]
+            wcn_note_below(rows[i].id);
             continue;
         }
         // WC-G — bracket the blit. `begin` must be the last thing before `draw_window` and `end` the
@@ -1832,8 +1871,15 @@ fn composite_inner() -> CursorTail {
                 }
             }
         }
+        // WC-N — pixels on glass for this window id. The only writer of `comp`.
+        #[cfg(feature = "witness")]
+        wcn_note_drawn(rows[i].id);
         drawn += 1;
     }
+    // WC-N — the pass reached the blit loop (`drawn == 0` is still a pass: it means every damaged row
+    // was below the shell, which is a fact about the shell and not about the pass).
+    #[cfg(feature = "witness")]
+    wcn_note_pass(true);
 
     #[cfg(feature = "witness")]
     if drawn > 0 && !COMPOSITE_WITNESSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
@@ -2557,6 +2603,426 @@ fn vugmin_rollup(scope: &str) {
         "[vugmin] wm scope={} hides={} unhides={} presents_skipped={} hidden_now={} -> {}",
         scope, hides, unhides, skipped, live, verdict
     );
+    wcn_emit_forced(scope);
+}
+
+// ---- WC-N: the per-window present-rate rollup ---------------------------------------------------
+
+/// WC-N — **"predetermined fps" as wire data.**
+///
+/// Two numbers already existed and neither answers the question. `[vugfps]` (user-vug) is the app's
+/// own count of frames it *issued*, drawn in its corner — it cannot know whether a frame reached
+/// glass. `[sched6]` counts the render task's passes and composites — fleet-wide, with no window in
+/// it. So when Peter reads six vugs running at visibly different rates, nothing on the wire says
+/// whether a given vug's rate is a CONSEQUENCE (it is competing for cores and the compositor) or a
+/// CEILING (something is pacing it at a fixed rate regardless of load). This rollup is that fact,
+/// per window, from the compositor's own side of the seam.
+///
+/// Four counts per live window, each a delta over the rollup window:
+///  * `att` — [`present`] calls that named this row. The owner's *attempt*: `SYS_WIN_PRESENT`
+///    performed its ownership check and handed us a finished surface.
+///  * `comp` — times this row was actually blitted by [`composite_inner`]'s loop. Pixels on glass.
+///    It can legitimately EXCEED `att`: a neighbour's present grows the dirty set upwards over
+///    occlusion, and this row is repainted inside that neighbour's pass. `comp > att` is therefore a
+///    reading about overlap, not an error — it is compositor work this window's owner did not ask
+///    for and does not know about.
+///  * `hid` — presents suppressed by the VUGMIN-B arm in [`present`]: every window this owner holds
+///    was below `SHELL_Z`, so the pass would have written nowhere the operator can see.
+///  * `bel` — passes in which this row was in the dirty set and then declined by [`above_shell`].
+///    The same fact as `hid` seen from the compositor's end: `hid` is the owner's own present being
+///    dropped, `bel` is somebody ELSE's pass declining to repaint this row.
+///
+/// **There is no occlusion cull, so there is no third skip class, and this rollup does not invent
+/// one.** A window wholly covered by another is still blitted — the dirty-set closure exists to
+/// repaint what is ON TOP, not to drop what is underneath. `comp - att` is where that cost shows.
+///
+/// ### The park, and why the rate is not `att / span`
+///
+/// VUGPAUSE-2 makes an idle vug *leave the run queues*: it blocks in the input wait and presents
+/// nothing at all, for as long as the operator leaves it alone. Divided by wall-clock span, that vug
+/// reads as `0.2/s` — indistinguishable from a vug that is being starved of cores at 0.2 fps, which
+/// is the exact confusion this witness exists to remove. So the denominator is the window's own
+/// ACTIVE time: consecutive presents closer together than [`WCN_PARK_GAP_MS`] accumulate into
+/// `active`, and any longer gap accumulates into `parked` instead and is charged to neither the
+/// numerator nor the denominator. A parked vug reports the rate it ran at *while it was running*,
+/// with its park time stated beside it. (The window's first present after a park opens a new active
+/// span rather than closing one, so `att` overstates the active interval by at most one present per
+/// park — visible only at very low counts, and always in the direction of a slightly optimistic
+/// rate.)
+///
+/// ### `gap` is the ceiling test
+///
+/// `gapmin`/`gapmax` are the shortest and longest ACTIVE inter-present gaps in the window, in ms. A
+/// rate that is a consequence of load scatters — a contended vug's gaps run from a few ms to tens.
+/// A rate that is a fixed ceiling does not: `gapmin` and `gapmax` collapse onto the same value
+/// (something is pacing the loop), and the collapse is visible on one line without a second run.
+/// That pair, not the rate, is what makes "predetermined fps" checkable.
+#[cfg(feature = "witness")]
+const WCN_ROLLUP_MS: u64 = 5000;
+
+/// WC-N — an inter-present gap longer than this is a PARK, not a slow frame. VUGPAUSE-2's backstop
+/// period is ~256 ms and a parked vug's next present waits on operator input, so anything past a
+/// quarter second is provably not the render loop pacing itself. The slowest rate this can misread
+/// as active is 4/s, which is already far below anything the fleet produces while rendering.
+#[cfg(feature = "witness")]
+const WCN_PARK_GAP_MS: u64 = 250;
+
+/// WC-N — one window slot's accumulators. Plain atomics rather than a `Mutex`: this is written from
+/// [`present`] (the owner's core, at frame rate) and from [`composite_inner`]'s blit loop (any core),
+/// and a witness must not add a lock to a path whose contention it is trying to measure. Every field
+/// is `Relaxed` — no other state is published through them and the rollup reads them one at a time
+/// anyway, so a line that catches a counter mid-increment is off by one and never inconsistent.
+#[cfg(feature = "witness")]
+struct WcnRow {
+    att: core::sync::atomic::AtomicU64,
+    comp: core::sync::atomic::AtomicU64,
+    hid: core::sync::atomic::AtomicU64,
+    bel: core::sync::atomic::AtomicU64,
+    /// Summed inter-present gaps at or under [`WCN_PARK_GAP_MS`] — the window's own active time.
+    active_ms: core::sync::atomic::AtomicU64,
+    /// Summed gaps longer than that — VUGPAUSE-2 park, excluded from the rate's denominator.
+    parked_ms: core::sync::atomic::AtomicU64,
+    /// Shortest / longest ACTIVE gap this rollup window. `u64::MAX` is the "no gap yet" sentinel.
+    gap_min: core::sync::atomic::AtomicU64,
+    gap_max: core::sync::atomic::AtomicU64,
+    /// `arch::ms()` of the last present that named this row. `0` = none yet. NOT reset at rollup:
+    /// the activity span is a property of the window, not of the reporting cadence, so a rollup
+    /// boundary must not manufacture a park out of the gap it straddles.
+    last_ms: core::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "witness")]
+impl WcnRow {
+    const fn new() -> Self {
+        use core::sync::atomic::AtomicU64;
+        Self {
+            att: AtomicU64::new(0),
+            comp: AtomicU64::new(0),
+            hid: AtomicU64::new(0),
+            bel: AtomicU64::new(0),
+            active_ms: AtomicU64::new(0),
+            parked_ms: AtomicU64::new(0),
+            gap_min: AtomicU64::new(u64::MAX),
+            gap_max: AtomicU64::new(0),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+/// WC-N — one slot per window id (`id - 1`). Written out rather than repeated by a `Copy` splat
+/// because `WcnRow` holds atomics; the assertion below is what keeps it honest if [`MAX_WINDOWS`]
+/// ever moves.
+#[cfg(feature = "witness")]
+static WCN: [WcnRow; 8] = [
+    WcnRow::new(),
+    WcnRow::new(),
+    WcnRow::new(),
+    WcnRow::new(),
+    WcnRow::new(),
+    WcnRow::new(),
+    WcnRow::new(),
+    WcnRow::new(),
+];
+
+#[cfg(feature = "witness")]
+const _: () = assert!(WCN.len() == MAX_WINDOWS);
+
+/// WC-N — composite passes that reached the blit loop, and passes that returned before it (the F4
+/// drain barrier was up, or the framebuffer was not ready). An aborted pass is a present that cost
+/// its owner a syscall and produced no pixels for ANY window, so it belongs on the aggregate line
+/// rather than charged to whichever row happened to trigger it.
+#[cfg(feature = "witness")]
+static WCN_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static WCN_ABORTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WC-N — presents that named no live row at all (a window closed under its owner). Aggregate-only:
+/// there is no slot to charge them to, and that is exactly what makes them worth counting.
+#[cfg(feature = "witness")]
+static WCN_STALE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WC-N — `arch::ms()` at the last rollup. Also the CLAIM: a core that wins the compare-exchange
+/// owns the emit and every other core in the same instant falls through to its present.
+#[cfg(feature = "witness")]
+static WCN_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WC-N — the slot for `id`, or `None` for an out-of-range id.
+#[cfg(feature = "witness")]
+fn wcn_slot(id: WinId) -> Option<&'static WcnRow> {
+    if id == WIN_NONE {
+        return None;
+    }
+    WCN.get(id as usize - 1)
+}
+
+/// WC-N — record one [`present`] against `id`, and fold its inter-present gap into the active/parked
+/// split. Called from `present` with the table lock DROPPED (`arch::ms()` is a register read, but the
+/// rule in this file is that nothing is called out from under `TABLE` and this is not the exception).
+#[cfg(feature = "witness")]
+fn wcn_note_present(id: WinId, hidden: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let Some(s) = wcn_slot(id) else { return };
+    s.att.fetch_add(1, Relaxed);
+    if hidden {
+        s.hid.fetch_add(1, Relaxed);
+    }
+    // `max(1)` keeps 0 as the "never presented" sentinel even if this is the very first millisecond
+    // of the boot; the cost is one ms of misattribution, once, ever.
+    let now = crate::arch::ms().max(1);
+    let last = s.last_ms.swap(now, Relaxed);
+    if last != 0 && now > last {
+        let gap = now - last;
+        if gap <= WCN_PARK_GAP_MS {
+            s.active_ms.fetch_add(gap, Relaxed);
+            s.gap_min.fetch_min(gap, Relaxed);
+            s.gap_max.fetch_max(gap, Relaxed);
+        } else {
+            s.parked_ms.fetch_add(gap, Relaxed);
+        }
+    }
+}
+
+/// WC-N — record that `id`'s row was blitted by a composite pass. The only "reached glass" writer.
+#[cfg(feature = "witness")]
+fn wcn_note_drawn(id: WinId) {
+    if let Some(s) = wcn_slot(id) {
+        s.comp
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// WC-N — record that `id`'s row was in a pass's dirty set and declined for sitting below the shell.
+#[cfg(feature = "witness")]
+fn wcn_note_below(id: WinId) {
+    if let Some(s) = wcn_slot(id) {
+        s.bel.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// WC-N — one composite pass reached (`drew = true`) or did not reach (`drew = false`) the blit loop.
+#[cfg(feature = "witness")]
+fn wcn_note_pass(drew: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if drew {
+        WCN_PASSES.fetch_add(1, Relaxed);
+    } else {
+        WCN_ABORTED.fetch_add(1, Relaxed);
+    }
+}
+
+/// WC-N — the dirty-paced tick, called at the tail of every [`present`].
+///
+/// Cadence follows `[pstrip]`/`[sched6]`: a fixed rollup period, one claim per period, and NOTHING
+/// printed for a period in which no window attempted or completed a present. Two consequences worth
+/// stating, because both are deliberate:
+///  * the line volume is bounded by construction — at most one block (live windows + one aggregate)
+///    per [`WCN_ROLLUP_MS`], however many cores are compositing;
+///  * a fleet that has wholly parked goes SILENT rather than printing a wall of zeros. The witness is
+///    driven by the traffic it measures, so "no `[wcn]` lines" reads as "nobody is presenting", which
+///    is the same thing the absence of the lines would have meant anyway.
+///
+/// The period's final partial window is therefore never emitted on its own account. The forced
+/// [`wcn_emit_forced`] path — fired from the fixture/desktop rollup beside `[vugmin]` — is what
+/// guarantees the gate a block regardless.
+#[cfg(feature = "witness")]
+fn wcn_tick() {
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed};
+    let now = crate::arch::ms();
+    let last = WCN_LAST_MS.load(Relaxed);
+    let span = now.wrapping_sub(last);
+    if span < WCN_ROLLUP_MS {
+        return;
+    }
+    // Claim the window. A loser does not retry: the winner is emitting the same evidence.
+    if WCN_LAST_MS
+        .compare_exchange(last, now, AcqRel, Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    wcn_emit("live", span, false);
+}
+
+/// WC-N — force a block out now, whatever the cadence says. Called from [`vugmin_rollup`] so the
+/// arc's line appears on the same scoped rollup every other window witness reports on, including on
+/// a headless gate whose last rollup window is still open when the fixture ends.
+#[cfg(feature = "witness")]
+fn wcn_emit_forced(scope: &str) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let now = crate::arch::ms();
+    let last = WCN_LAST_MS.swap(now, Relaxed);
+    wcn_emit(scope, now.wrapping_sub(last), true);
+}
+
+/// WC-N — drain the accumulators and print. `span` is the wall-clock length of the window being
+/// reported; `force` prints the aggregate even when nothing happened in it.
+///
+/// Counters are drained with `swap`, not read-then-store: a present landing on another core during
+/// the emit is carried into the NEXT window rather than lost, which is what keeps the per-window
+/// totals summable across a whole boot.
+#[cfg(feature = "witness")]
+fn wcn_emit(scope: &str, span: u64, force: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    // Identity for the per-window lines, snapshotted under one acquisition so every line in a block
+    // is judged against one table state and one shell position. A slot with traffic but no live row
+    // is a window that closed inside this rollup window; it still gets its line (`live=no`), because
+    // dropping it would silently delete the last few frames of every window that ever exits.
+    let mut ident = [(0u64, false, false); MAX_WINDOWS]; // (owner asid, live, above shell)
+    {
+        let t = TABLE.lock();
+        let shell = SHELL_Z.load(core::sync::atomic::Ordering::Acquire);
+        for r in t.rows.iter() {
+            if !r.used || r.id == WIN_NONE || r.id as usize > MAX_WINDOWS {
+                continue;
+            }
+            ident[r.id as usize - 1] = (r.owner_asid, true, above_shell(r, shell));
+        }
+    }
+    let (mut t_att, mut t_comp, mut t_hid, mut t_bel) = (0u64, 0u64, 0u64, 0u64);
+    let mut wins = 0usize;
+    let mut lines: [Option<WcnLine>; MAX_WINDOWS] = [None; MAX_WINDOWS];
+    for (i, s) in WCN.iter().enumerate() {
+        let att = s.att.swap(0, Relaxed);
+        let comp = s.comp.swap(0, Relaxed);
+        let hid = s.hid.swap(0, Relaxed);
+        let bel = s.bel.swap(0, Relaxed);
+        let active = s.active_ms.swap(0, Relaxed);
+        let parked = s.parked_ms.swap(0, Relaxed);
+        let gmin = s.gap_min.swap(u64::MAX, Relaxed);
+        let gmax = s.gap_max.swap(0, Relaxed);
+        t_att += att;
+        t_comp += comp;
+        t_hid += hid;
+        t_bel += bel;
+        let (asid, live, above) = ident[i];
+        if live {
+            wins += 1;
+        }
+        if att == 0 && comp == 0 && bel == 0 {
+            continue;
+        }
+        // Tenths, for `[pstrip]`'s reason: an integer /s truncates every honest sub-1 Hz rate to 0.
+        // The rate's denominator is the window's ACTIVE time (see the module note above) and falls
+        // back to the wall span only when this window recorded no gap at all — a single present in
+        // the whole rollup, where there is no active interval to divide by and the wall answer is
+        // the honest upper bound rather than a divide by zero.
+        let den = if active > 0 { active } else { span.max(1) };
+        lines[i] = Some(WcnLine {
+            id: (i + 1) as WinId,
+            asid,
+            live,
+            above,
+            att,
+            comp,
+            hid,
+            bel,
+            arate: att.saturating_mul(10_000) / den.max(1),
+            crate_: comp.saturating_mul(10_000) / den.max(1),
+            active,
+            parked,
+            // The "no active gap at all" sentinel reports as `0..0`, which is what a single-present
+            // window honestly has: no interval to measure.
+            gap_min: if gmin == u64::MAX { 0 } else { gmin },
+            gap_max: gmax,
+        });
+    }
+    if !force && t_att == 0 && t_comp == 0 {
+        return; // dirty-paced: a period with no present traffic prints nothing at all.
+    }
+    for l in lines.iter().flatten() {
+        serial_println!(
+            "[wcn] win={} asid={:#x} live={} above={} att={} comp={} hid={} bel={} rate={}.{}/s comp_rate={}.{}/s active={}ms parked={}ms gap={}..{}ms",
+            l.id,
+            l.asid,
+            if l.live { "yes" } else { "no" },
+            if l.above { "yes" } else { "no" },
+            l.att,
+            l.comp,
+            l.hid,
+            l.bel,
+            l.arate / 10,
+            l.arate % 10,
+            l.crate_ / 10,
+            l.crate_ % 10,
+            l.active,
+            l.parked,
+            l.gap_min,
+            l.gap_max
+        );
+    }
+    let passes = WCN_PASSES.swap(0, Relaxed);
+    let aborted = WCN_ABORTED.swap(0, Relaxed);
+    let stale = WCN_STALE.swap(0, Relaxed);
+    let att_rate = t_att.saturating_mul(10_000) / span.max(1);
+    let comp_rate = t_comp.saturating_mul(10_000) / span.max(1);
+    // The aggregate's denominator IS wall-clock, and deliberately so: "what did the fleet cost the
+    // panel over these five seconds" is a wall-clock question, and a fleet in which one vug is parked
+    // and five are running genuinely did present less per second of panel time. The per-window lines
+    // above are where the park is factored out; conflating the two denominators on one line would
+    // make the aggregate un-addable from its own rows.
+    let verdict = if t_att == 0 {
+        "IDLE"
+    } else if t_comp == 0 {
+        "STARVED"
+    } else {
+        "LIVE"
+    };
+    serial_println!(
+        "[wcn] rollup scope={} wins={} att={} comp={} hid={} bel={} stale={} passes={} aborted={} att_rate={}.{}/s comp_rate={}.{}/s span={}ms -> {}",
+        scope,
+        wins,
+        t_att,
+        t_comp,
+        t_hid,
+        t_bel,
+        stale,
+        passes,
+        aborted,
+        att_rate / 10,
+        att_rate % 10,
+        comp_rate / 10,
+        comp_rate % 10,
+        span,
+        verdict
+    );
+}
+
+/// WC-N — one drained per-window line, held on the stack between the drain loop and the print loop.
+/// The two are separate passes because the DECISION to print at all is a property of the whole block
+/// (`force || any traffic`), and the drain must happen either way: a rollup that read the counters,
+/// decided to stay silent, and left them standing would fold two windows' traffic into the next line
+/// and misreport every rate in it.
+#[cfg(feature = "witness")]
+#[derive(Clone, Copy)]
+struct WcnLine {
+    id: WinId,
+    asid: u64,
+    live: bool,
+    above: bool,
+    att: u64,
+    comp: u64,
+    hid: u64,
+    bel: u64,
+    /// Attempt / completion rates in TENTHS of a present per second, over the active denominator.
+    arate: u64,
+    crate_: u64,
+    active: u64,
+    parked: u64,
+    gap_min: u64,
+    gap_max: u64,
+}
+
+/// WC-N — forget a slot's accumulators when its row is freed, so a recycled window id cannot inherit
+/// the previous tenant's gap history and report a park that never happened. The counts themselves are
+/// left to the next rollup to drain (they are real presents that really happened, and the line's
+/// `live=no` is what says the window is gone); only `last_ms` — the one field that spans rollups — is
+/// cleared, because it is the only one whose meaning depends on the row still being the same window.
+#[cfg(feature = "witness")]
+fn wcn_forget(id: WinId) {
+    if let Some(s) = wcn_slot(id) {
+        s.last_ms
+            .store(0, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// WC-A — whether the first `[wc-a] composite` witness has been emitted (first composite only; a
