@@ -3776,3 +3776,85 @@ Cross-arch key (the W probes are deliberately NOT token-for-token, unlike the F 
 probes print full witness lines and live outside the `UNAOS_WEDGE2` knob; ours are raw tokens
 behind it. aarch64's seven-site sweep found two fixture/witness acquisitions beyond the five
 production sites; the x86 analog is `run_queue_len` (shell status + sched selftest), covered.
+
+### CURSOR-X86 — the pointer stops moving at present rate
+
+**The bench verdict (s45 attended, rMBP 2012, EHCI trackpad).** Moving the pointer made the arrow
+lag badly — "slow as molasses" — and the panel's frame rate visibly fell while the pointer moved.
+Alongside it, the arrow disappeared under every window it crossed.
+
+**Where the arrow lived, and why that was the whole defect.** On x86 the cursor was the OLDER
+back-buffer sprite (`pal::cursor`, CURSOR-VIS + CURSOR-SAVE-UNDER): `draw`/`draw_over` painted it
+through `GneissPal::draw_rect` into `Screen`'s BACK buffer, and the save-under was stashed from that
+same back buffer through `Screen::read_back_pixel`. That design was deliberate and, for its time,
+right — it kept the write-combining front buffer write-only, which is what VPERF-WC bought. But a
+back-buffer pixel is not on the panel. It reaches glass only when somebody calls `Screen::flush`.
+Two consequences followed, and both are structural rather than tunable:
+
+* **The arrow's update cadence was the desktop's PRESENT cadence.** Inside a full-screen app the
+  present *is* the frame, and a frame on that panel is expensive: `[vugfps4]` puts `flush` at 69–86%
+  of the whole frame budget at ~10.9 MB/frame, and `[wc-h] win=2 … bytes=1620080 present_us=9858`
+  measures the GOP write path at roughly 150 MB/s. So the arrow advanced once per 25–80 ms frame
+  while the trackpad reported every ~8 ms. The pointer travelled in visible jumps and trailed the
+  finger by a whole frame plus its flush.
+* **The arrow was BELOW the window layer.** `Screen::present_background` subtracts the compositor's
+  occluder boxes from the desktop's damage (WC-I), so back-buffer pixels are never copied where a
+  window is. That is correct for the desktop layer and wrong for a system cursor, which is by
+  definition the panel's last painter.
+
+**The machinery was already here, and it was dormant.** `video::cursor` is a FRONT-buffer sprite
+with a colour-guarded, painted-pixels-only save-under (~200 read-backs at this panel's 2× block
+scale, not a full-box stash), a `repair` hand-off that damages the windows a restore touched, and
+CURSOR-8's rate floor on that repair. The Pi's render task has driven it since CURSOR-1, with the
+pointer pass deliberately NOT marked dirty — *"a pointer report costs a save + a few small fills over
+one cell, not a `Screen::flush` of the sprite's damage box"*. On x86 the module was compiled, linked
+and never once asked to paint: the s45 wire reads `[cursor3] planned=0 offers=0 ensure=177` and
+`[wc-i] cursor_passes=177 cursor_brackets=0`.
+
+**The switch, and why it is made inside `pal::cursor` rather than at the call sites.** Every pointer
+report on every x86 path — the console loop's drain, `vug`/`pulse`'s own frame drain, the EL0 input
+router's keep-alive — funnels through `move_rel`/`set_abs`, and every paint request funnels through
+`draw`/`draw_over`/`restore`. Folding the delegation into those verbs moves the whole target onto the
+compositor sprite with no call-site change at all, which is also what keeps the full-screen demos'
+loops correct without editing them: they keep calling `cursor::draw(pal)` once a frame, simply stop
+putting pixels in the back buffer, and the arrow nonetheless tracks the pointer at report rate
+because `move_rel` repainted it the moment the report landed.
+
+| Verb | On a target where the compositor sprite owns the paint |
+|---|---|
+| `move_rel` / `set_abs` | update the shared position, then `video::cursor::repaint()` — the one choke point every report passes |
+| `draw` / `draw_over` | `video::cursor::ensure_drawn()` (WC-I's idempotent tail); no back-buffer pixels, no damage |
+| `restore` | `video::cursor::undraw()` — the auto-hide transition is the one place the sprite must come down and stay down |
+
+`TargetPal::render` takes the bracket the Pi's render task has always taken around its own
+`pal.render()`: `undraw` → `Screen::flush` → `ensure_drawn`. Placing it in the PAL rather than at the
+x86 call sites is what makes it hold for every `Screen`-backed present on the target, including the
+ones inside the demos' frame loops. `ensure_drawn` and not `repaint` on the tail: the former
+re-establishes a sprite that is down and costs one lock acquisition and a boolean for one that is up,
+where `repaint` would run a full restore → save → draw cycle per present — the churn WC-I removed.
+
+Ownership is named by one const, `pal::cursor::SPRITE_OWNS_PAINT` (`cfg!(target_arch = "x86_64")`).
+The back-buffer sprite is unchanged for every other target: aarch64's `virt`/UEFI GUI console has no
+compositor-sprite driver of its own, and the bare-metal Pi render task already drives `video::cursor`
+explicitly.
+
+**Gate honesty.** The headless x86 battery delivers no pointer report, so `visible()` is false all
+boot, every verb above self-gates to nothing, and the suite proves NO-REGRESSION only (30 PASS /
+0 FAIL under `UNAOS_WC=1`). The latency and frame-rate verdicts are the next attended sitting's; the
+readings that would confirm the lift are `[cursor3] ensure`/`repaint` climbing with pointer motion
+where they read 0 before, and `[cursor6] desktop_over=0` holding (the bracket is not leaking).
+
+**Observed and NOT fixed here.** Two things stand, both outside this arc's lane:
+
+* `DamageSet::add` (`video/screen.rs`) merges an incoming rect into every rect it overlaps, cascading
+  and rescanning after each merge. VUG-FPS-3 keeps the crystal's previous and current footprints as
+  two DELIBERATELY separate rects so a jumping crystal never flushes the dead gap between them; any
+  third rect that overlaps both fuses them back into one box spanning that gap. The back-buffer
+  cursor was exactly such a third rect whenever it sat on the crystal, which is one path by which
+  pointer motion could grow a frame's flush. Taking the arrow out of the damage set removes the
+  cursor as a bridge, but the general re-merge is still reachable by any two near-neighbour painters.
+* `[vugfps]`'s 12.8 → 34.8 fps ramp on the s45 capture is NOT mouse-driven: the pointer was
+  stationary for it, and the ramp is the crystal's own bounding box coming off its broadside
+  orientation (the frame budget is bandwidth-bound in the bbox, so a wide bbox is self-sustaining
+  until the tumble carries it edge-on). That capture contains no pointer-motion experiment, so the
+  metal verdict quoted above stands on the attended observation alone.
