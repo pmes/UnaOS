@@ -272,6 +272,27 @@ pub mod cursor {
     /// **`swap`, not a read-then-write.** Two cores can drain input concurrently; a compare-and-set on
     /// the deadline means a race produces one rollup rather than two, and the loser simply returns.
     /// The failure mode of this limiter is a skipped sample, never a duplicated block.
+    ///
+    /// ### CURSOR-14 — the FIRST report ARMS the window; it does not print one
+    ///
+    /// It used to print. `ROLLUP_LAST_MS` starts at 0, the limiter's `last != 0` guard let a zero
+    /// through, and so the very first pointer report of the boot emitted a block — from inside
+    /// `repaint_on_move`, i.e. one call after the `repaint` that draws the sprite for the first time.
+    /// Every composite that block reported therefore ran BEFORE the sprite had ever existed, so
+    /// `cursor::sprite_plan()` was `None` on all of them **by construction, on any kernel, with or
+    /// without a fix**. `[cursor12] … nosprite=N/N -> nosprite` was the only reading that block could
+    /// ever produce.
+    ///
+    /// That is not a hypothetical. It is s48 (42/42), s49 (47/47) and s50 (69/69) — three boots, three
+    /// different boot-era composite totals, all of them first blocks, read across the seats as "the
+    /// mechanism is pinned and the fix changed nothing". The tell is in the capture itself: the
+    /// `[cursor] armed x=… y=…` line (emitted once, at the first draw) sits immediately above the
+    /// block, because both come from the same pointer report.
+    ///
+    /// So the first report now stores the deadline and returns. Every block that prints covers at
+    /// least [`ROLLUP_EVERY_MS`] of real pointer activity, with the sprite alive throughout — which is
+    /// the only condition under which any term in it means what its name says. The cost is one lost
+    /// sample per boot, and what it buys is that no sample is a lie.
     #[inline]
     fn rollup_tick() {
         #[cfg(feature = "witness")]
@@ -279,7 +300,14 @@ pub mod cursor {
             use core::sync::atomic::Ordering::Relaxed;
             let now = crate::arch::ms();
             let last = ROLLUP_LAST_MS.load(Relaxed);
-            if last != 0 && now.wrapping_sub(last) < ROLLUP_EVERY_MS {
+            // `now` can legitimately be 0 for the first few ms of a boot; `swap` below would then
+            // store a 0 and re-arm on the next report, which costs one deferred sample and nothing
+            // else. Biased that way deliberately: never print an unarmed window.
+            if last == 0 {
+                let _ = ROLLUP_LAST_MS.compare_exchange(0, now, Relaxed, Relaxed);
+                return;
+            }
+            if now.wrapping_sub(last) < ROLLUP_EVERY_MS {
                 return;
             }
             // Claim the slot before printing, so a second core arriving inside the same window sees

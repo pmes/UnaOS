@@ -759,6 +759,15 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
         super::screen::request_full_present();
         // Re-open before recompositing — a composite under a raised barrier is a no-op.
         drop(barrier);
+        // CURSOR-14 — CLOSE THE ERASE BRACKET BEFORE THE COMPOSITE, per CURSOR-13's single rule:
+        // composite owns the sprite, and a caller-side bracket may not span a composite. `erase`
+        // above took the arrow off the panel (it is a raw desktop fill and genuinely needs to), and
+        // this call used to hand the restore to `composite`'s own tail — which meant the pass ran
+        // with `sprite_plan() == None` and could not compose the arrow through the re-tile it is
+        // about to perform. Putting it back HERE costs one restore/save/draw on a window move, and
+        // the save is taken against a front buffer whose desktop is already final, exactly as
+        // `Screen::flush` takes it. The tail is unaffected: `Untouched` still ends in `ensure_drawn`.
+        super::cursor::repaint();
         composite();
     }
     true
@@ -794,6 +803,10 @@ pub fn close(id: WinId) -> bool {
     reclaim(&moved[..nv]);
     // Re-open the barrier before recompositing — a composite under a raised barrier is a no-op.
     drop(barrier);
+    // CURSOR-14 — close the erase bracket before the composite. Same rule and same argument as
+    // `move_to`'s; placed after BOTH reclaims, because each of them erases and the sprite must go
+    // back on a panel whose desktop is finished.
+    super::cursor::repaint();
     composite();
     true
 }
@@ -836,6 +849,8 @@ pub fn close_owner(owner_asid: u64) -> usize {
     reclaim(&moved[..nv]);
     // Re-open the barrier before recompositing — a composite under a raised barrier is a no-op.
     drop(barrier);
+    // CURSOR-14 — close the erase bracket before the composite; see `move_to`.
+    super::cursor::repaint();
     composite();
     n
 }
@@ -907,6 +922,12 @@ pub const DESKTOP_BG: u32 = 0x002D_2B55;
 /// unsynchronised writer of the save-under. So the overlay decision this path takes is the same one
 /// `stage_window` takes when `cur` is `None`: compose no sprite, and leave the repaint to the
 /// following composite. That is CURSOR-3's own fallback, not a new rule.
+///
+/// CURSOR-14 — the RESTORE is no longer the following composite's tail. `move_to`, `close` and
+/// `close_owner` each call `cursor::repaint()` after their last erase and BEFORE their `composite()`,
+/// so the bracket this function opens is closed by its caller rather than spanning a compositor pass.
+/// The undraw below is unchanged and still required: a raw desktop fill with no session is exactly
+/// the class CURSOR-13 kept bracketed.
 fn erase(boxes: &[(usize, usize, usize, usize)]) {
     // CURSOR-1: take the sprite off the panel before repainting desktop under it. Without this the
     // fills below would overwrite the sprite, and the save-under would later restore pre-erase
@@ -2687,6 +2708,12 @@ static CUR12_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// * **`nosprite` ≈ `passes`** — the render-bracket call graph above. The fix is not in the cursor
 ///   module at all: it is that `Screen::flush` composites from inside a bracket that has just taken
 ///   the sprite down. Compose-through cannot run on that path by construction.
+///   **CURSOR-14 — read this term ONLY on a windowed block.** Every term is now a delta since the
+///   previous rollup (`cum=` carries the boot total), and `pal::cursor::rollup_tick` no longer prints
+///   on the operator's first report. Before those two changes this term was pinned at ≈ `passes` on
+///   any kernel whatsoever, because a boot's worth of pre-pointer composites — during which the
+///   sprite has never been drawn and `sprite_plan()` cannot answer — was permanently in the
+///   numerator. A block whose `passes == cum` is that baseline and carries no verdict.
 /// * **`nohit` ≈ `passes`** — the operator simply was not pointing at a window. Not a defect; check
 ///   the sitting, not the code.
 /// * **`excl_probe` / `excl_unverified` non-trivial** — the instrument is suppressing the mechanism,
@@ -2698,17 +2725,58 @@ static CUR12_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 ///   `stage_window`'s decline chain (`[wc-h] staged=no reason=…`), and `DECL_FIXTURE`/`DECL_LOCK` there
 ///   are the next things to read. A window that takes the DIRECT path never calls `compose_into` at
 ///   all, so it is un-composable for that pass by construction.
+/// CURSOR-14 — the previous rollup's reading of every term above, so the block can report a WINDOW
+/// instead of a running total. Order is the print order; see [`cursor12_rollup`] for why.
+#[cfg(feature = "witness")]
+static CUR12_PREV: [core::sync::atomic::AtomicU64; 8] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// CURSOR-14 — `now - prev`, and record `now` for the next block. Saturating, because two rollups
+/// racing on different cores can read the counters in either order and a wrapped delta would print
+/// as an enormous term.
+#[cfg(feature = "witness")]
+fn cur12_window(slot: usize, now: u64) -> u64 {
+    use core::sync::atomic::Ordering::Relaxed;
+    now.saturating_sub(CUR12_PREV[slot].swap(now, Relaxed))
+}
+
 #[cfg(feature = "witness")]
 fn cursor12_rollup(scope: &str) {
     use core::sync::atomic::Ordering::Relaxed;
-    let passes = CUR12_PASSES.load(Relaxed);
-    let nosprite = CUR12_NOSPRITE.load(Relaxed);
-    let nohit = CUR12_NOHIT.load(Relaxed);
-    let reserved = CUR12_RESERVED.load(Relaxed);
-    let nosession = CUR12_NOSESSION.load(Relaxed);
-    let planned = CUR3_PLANNED.load(Relaxed);
-    let probe = CUR12_EXCL_PROBE.load(Relaxed);
-    let unver = CUR12_EXCL_UNVERIFIED.load(Relaxed);
+    // CURSOR-14 — EVERY TERM IS A WINDOW, NOT A RUNNING TOTAL, and the change is what makes this
+    // block readable at all.
+    //
+    // The counters are cumulative from boot and were printed raw, which put every reading in
+    // permanent debt to the pre-pointer era. Before the operator's first report the sprite has never
+    // been drawn, so `sprite_plan()` is `None` on 100% of composites — a boot's worth of `nosprite`
+    // that no later evidence can dilute. With a bench boot contributing ~40-70 such passes and a
+    // sitting adding ~14/s, `nosprite * 2 >= passes` stays true for the first ten-odd seconds of
+    // motion whatever the mechanism is actually doing, so the verdict reads `-> nosprite` on a
+    // kernel where compose-through is working perfectly. Two seats spent three sittings reading that
+    // number as a defect.
+    //
+    // A delta cannot carry that debt. `pal::cursor::rollup_tick` no longer prints on the first report
+    // either, so the first block to reach the wire covers one full 5 s window of live pointer motion
+    // with the sprite alive throughout — and `nosprite` in it finally means what its name says.
+    // `cum=` keeps the boot total on the wire for continuity, and a block where `passes == cum` is
+    // self-evidently the whole-boot baseline rather than a sample.
+    let passes = cur12_window(0, CUR12_PASSES.load(Relaxed));
+    let nosprite = cur12_window(1, CUR12_NOSPRITE.load(Relaxed));
+    let nohit = cur12_window(2, CUR12_NOHIT.load(Relaxed));
+    let reserved = cur12_window(3, CUR12_RESERVED.load(Relaxed));
+    let nosession = cur12_window(4, CUR12_NOSESSION.load(Relaxed));
+    let planned = cur12_window(5, CUR3_PLANNED.load(Relaxed));
+    let probe = cur12_window(6, CUR12_EXCL_PROBE.load(Relaxed));
+    let unver = cur12_window(7, CUR12_EXCL_UNVERIFIED.load(Relaxed));
+    let cum = CUR12_PASSES.load(Relaxed);
     // The dominant term, named rather than left to arithmetic. Ties go to the earliest predicate in
     // the chain, which is the one a reader has to fix first anyway.
     let why = if passes == 0 {
@@ -2727,8 +2795,8 @@ fn cursor12_rollup(scope: &str) {
         "mixed"
     };
     serial_println!(
-        "[cursor12] offer scope={} passes={} nosprite={} nohit={} reserved={} nosession={} planned={} excl_probe={} excl_unverified={} -> {}",
-        scope, passes, nosprite, nohit, reserved, nosession, planned, probe, unver, why
+        "[cursor12] offer scope={} passes={} nosprite={} nohit={} reserved={} nosession={} planned={} excl_probe={} excl_unverified={} cum={} -> {}",
+        scope, passes, nosprite, nohit, reserved, nosession, planned, probe, unver, cum, why
     );
 }
 

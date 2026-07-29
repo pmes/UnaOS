@@ -4741,6 +4741,11 @@ reading there and cannot move. The gate proves no-regression only. The verdict i
 
 * **`[cursor12] nosprite` still ≈ `passes` with the pointer live over a window** — the fix did not
   take; look for a second bracket around a flush site.
+  **Superseded by CURSOR-14 — this watch item as written cost three sittings.** Before CURSOR-14 the
+  first `[cursor12] scope=live` block of a boot fired on the operator's first pointer report and
+  reported cumulative counters, so it covered only the era *before* the sprite existed and read
+  `nosprite = passes` on any kernel whatsoever. Read this item only against a block whose
+  `passes < cum`; see the CURSOR-14 section below.
 * **`[cursor6] desktop_over` > 0** — the narrowed desktop bracket has a hole; the desktop is erasing
   the arrow at flush rate.
 * **`[cursor11] px_deferred` > 0 with `px_installed + px_redrawn` lagging it persistently** — the
@@ -4748,3 +4753,498 @@ reading there and cannot move. The gate proves no-regression only. The verdict i
   reachable for the first time.
 * **A spotty or trailing arrow over the desktop** — the desktop bracket, not the composite path.
   Over a *window*, it is the composite path.
+
+---
+
+## CLICK-X86 — what a pointer press does on x86 today (2026-07-29)
+
+This section exists because a lift was attempted and correctly refused. The pi seat landed
+CLICK-ROUTE, then CLICK-SWALLOW (`1ed1c725`), then CLICK-PLAIN (`475c51d3`) — three arcs of click
+routing policy on aarch64 — and the x86 track was asked to lift the last of them. It cannot be
+lifted, and the reason is not a merge conflict: **x86 has no pointer-press path for a routing policy
+to be a policy about.** The audit is recorded here in full so it is not re-run.
+
+### The five findings, each with its line
+
+1. **The x86 event drain has no `Event::Button` arm.** `main.rs`'s x86 loop matches `Key`,
+   `Mouse`, `MouseAbsolute` and then `_ => {}`. A button report is pushed onto `pal::EVENT_QUEUE` by
+   the xHCI/EHCI HID paths, popped by that drain, and discarded. Nothing hit-tests it, nothing routes
+   it, nothing consumes it. (The exception is a full-screen in-kernel demo — `vug` — which drains
+   `pal::pump_and_poll` itself and reads `Event::Button` as exit/drag. That is the only x86 code that
+   has ever seen a click.)
+2. **`wm::focus_changed` has no x86 caller.** Its only callers outside `video/wm.rs` are in
+   `arch/aarch64/syscall.rs`. Focus, as a live concept, does not exist on x86: nothing raises a
+   window, nothing publishes a focus owner, and `FOCUS_ASID` is only ever written by `wm`'s own
+   selftests.
+3. **`wm::hit_test` has no x86 caller either.** The seam is present and arch-neutral; the address
+   lookup has simply never been performed on this arch.
+4. **There is no ring-3 input delivery on x86 at all.** `arch/x86_64/syscall.rs` contains no
+   `el0_input_*` equivalent, no per-address-space input ring, and no `SYS_INPUT_POLL`. The file's own
+   syscall-numbering note says so directly: 27 (`INPUT_POLL`) is reserved for x86's "later arcs".
+   CLICK-PLAIN's central claim — that a focus-changing press is *delivered whole* into the raised
+   owner's ring — has no addressee on x86.
+5. **Every window x86 puts on the panel is owned by ASID 0.** `video/wcx.rs` creates the demo and
+   probe rows with owner 0, and `video/fbcon.rs`'s console window likewise; `hit_test` skips
+   `owner_asid == 0` by design (a compat/kernel row names nobody as a focus target). So even if the
+   press path existed and called `hit_test` today, it would resolve `None` for every persistent x86
+   window. The only x86 rows with a real owner are the transient ones `SYS_WIN_CREATE` mints for the
+   WINX-1 fixture.
+
+The earlier x86 audit's summary — "no hit-test on the button path, mirroring the pre-CLICK-ROUTE
+aarch64 state" — is true but understates it. Pre-CLICK-ROUTE aarch64 *had* a press path, a focus
+holder, and a delivery ring, and merely addressed the press to the wrong one of them. x86 has none of
+the three.
+
+### Arch-neutral vs. arch policy, for whoever lifts next
+
+CLICK-PLAIN splits cleanly, and the split is worth naming because it is the same split every one of
+these arcs has:
+
+* **Arch-neutral (`video/wm.rs`)** — the VUGMIN-C amendment (a raise publishes only the ARRIVING
+  owner's unhide; the departing owner is no longer hidden, so a focus change starts things and never
+  stops them), the deletion of `owner_live` with its only caller, and the selftest leg. These are the
+  liftable half in principle. In practice **none of it applies to this tree yet**: it is an edit to
+  VUGMIN-A/B/C machinery (`vugmin_publish`, `vugmin_scan`, the raise arm's `marks`/`nmarks` block)
+  that x86's `wm.rs` does not contain, so every hunk's context is absent and `git cherry-pick` has
+  nothing to anchor on. When the VUGMIN chain does arrive here, it must arrive **post-CLICK-PLAIN** —
+  see the reversal note below.
+* **Arch policy (`arch/<arch>/syscall.rs`)** — the router: the press-edge tracker, the hit/miss arms,
+  the ordering of `set_active` → `focus_changed` → push, and the press/release pairing that keeps a
+  click from being split across two apps. This half is reimplemented per arch by design and is never
+  lifted. x86's is unwritten because its three prerequisites are unwritten.
+
+### The CLICK-SWALLOW → CLICK-PLAIN reversal, and why the later position is right
+
+CLICK-SWALLOW's rule was: a press that *changes focus* is consumed. Its case was concrete — the one
+gesture that restores a backgrounded vug was also working that vug's click-to-pause toggle, so the
+vug came back paused and the operator had to click twice. Swallowing the refocusing press made the
+first click mean only "come here".
+
+CLICK-PLAIN reverses it: the focus-changing press is delivered again, whole, press and release both.
+The reversal is right, and not because the pause-toggle problem went away — it is right because
+CLICK-SWALLOW made *what a click does* a function of state the operator cannot see. Whether a press
+reached the app depended on which window happened to hold focus a moment earlier, which is invisible
+by construction on a panel where an unfocused window looks like a focused one that has stopped
+drawing. Two identical gestures produced two different outcomes and nothing on the glass explained
+the difference. That is the accretion P75 named ("no reason to it"), and swallowing was a
+load-bearing part of it.
+
+The right fix was to make the click's *effect* legible instead of making its *delivery* conditional:
+CLICK-PLAIN pairs the restored delivery with an ABSOLUTE run-state toggle (`paused = !(paused ||
+hidden)` — a click on anything not running makes it run) and a visible acknowledgement. Under those
+two, the original defect cannot recur — a click on a parked vug makes it run whether or not the press
+was also delivered — so the swallow was buying nothing and costing predictability. The same judgement
+retires VUGMIN-C's departing-owner hide in the same commit: a focus change that *stops* an unrelated
+window is another effect with no visible cause. **A raise is purely additive.** Both halves of
+CLICK-PLAIN are the same principle, and it is the correct one: prefer a rule that is true
+unconditionally over a rule that is true given hidden state.
+
+Nothing about that reasoning is aarch64-specific, so when x86 grows a press path it should be built
+to the CLICK-PLAIN contract directly and should never pass through the CLICK-SWALLOW shape.
+
+### What this arc landed
+
+One in-lane change, in `arch/x86_64/syscall.rs`: `wm::hittest_selftest()` now runs on x86, chained
+off `winx_launcher` after the WINX-1 verdict (after the fixture's window is confirmed retired, so the
+selftest's two rows cannot burn a one-shot per-window latch — the ordering rule aarch64 states at its
+own call site). The battery has always been arch-neutral and has only ever been driven from
+`arch/aarch64/syscall.rs`; every claim it makes about shared code was, until now, an aarch64-only
+claim. It is table-driven rather than pixel-driven, so it needs no pointer and runs headless.
+
+x86 wire line, both gate runs, 1280x800 panel:
+
+```
+[clickroute] hit-test at (428,215) inside=true topmost=true raise=true outside=true hidden=true -> PASS
+```
+
+All five legs hold on x86's real z-order with the console window live in the table: the lookup
+resolves *something*, resolves the FRONTMOST something, follows a raise, returns `None` on a genuine
+miss, and returns `None` for a row pushed below `SHELL_Z`. The address lookup is sound; only its
+callers are missing. When the press path arrives, this line is what distinguishes "resolved the wrong
+window" from "never resolved one" — which is the discrimination the operator's two standing
+complaints ("clicks eaten" vs. "out-of-focus clicks stop the focused app") have never had on x86.
+
+### The prerequisite chain — CLOSED (CLICK-X86 r2, 2026-07-29)
+
+The four items the audit above listed as unwritten are written. Recorded in the audit's own order,
+each with what actually landed:
+
+1. **A press dispatch site — done.** `main.rs`'s x86 drain has an `Event::Button` arm, and the routing
+   decision runs one step earlier still: the drain calls
+   `arch::x86_64::syscall::wc_click_route(raw)` *before* `el0_input_route`, because `el0_input_route`
+   routes by FOCUS and a click belongs to the window under the cursor. The arm is `#[cfg]`-gated to
+   x86 (the loop is shared with aarch64-UEFI, which routes clicks from its own drains).
+2. **Focusable windows — done, via a reserved kernel-owner band.** See the next subsection; this was
+   the item that needed an argument rather than an edit.
+3. **`SYS_INPUT_POLL` (27) and per-address-space input rings — already done** by WINX-7, which landed
+   while the audit was being written. "The press is delivered" now names something.
+4. **The router — done**, in `arch/x86_64/syscall.rs`, built to CLICK-PLAIN directly. x86 has never
+   passed through the CLICK-SWALLOW shape and will not.
+
+### Window ownership: `KERNEL_OWNER_*`, a band that is hittable but not focusable
+
+The audit's finding 5 stated the blocker: every persistent x86 window carries owner ASID 0, and
+`hit_test` skips owner 0, so a wired hit-test resolves `None` for the console and the desktop demo —
+the two largest objects on the panel and the ones the operator will actually click.
+
+`fbcon.rs`'s owner-0 choice was deliberate and documented, so changing it needed an argument. The
+argument is that the comment justifies owner 0 by exactly **two** consequences, and neither is the one
+being changed:
+
+* the row is outside `focus_ring` — no keyboard-focus cycle can hand the keyboard to the kernel's
+  console; and
+* the row is outside `close_owner`'s reach — no EL0 task can move, present or close it.
+
+Being **unhittable** was never argued for anywhere. It is a side effect of encoding two different
+facts — "the kernel owns this" and "nobody owns this" — in one value. So the fix splits them rather
+than overturning the decision:
+
+* `wm::KERNEL_OWNER_BASE` (`0xFFFF_FF00`) names a reserved band of owner ASIDs meaning *the kernel
+  owns this window*. `KERNEL_OWNER_CONSOLE` and `KERNEL_OWNER_DESKTOP` are distinct values in it, so a
+  click raises exactly the window under the hand rather than all of the furniture together.
+* `focus_ring` skips the band explicitly — property one, preserved.
+* `close_owner` refuses the band outright — property two, preserved, and *strengthened*: owner 0 was
+  safe only because no teardown seam happens to pass 0.
+* `hit_test` needs no change: the band is non-zero, so kernel rows became hittable by construction.
+* Owner 0 keeps its remaining meaning — *nobody owns this row* — held by the compat shim's rows and by
+  the transient witness probes, which must stay unclickable.
+
+**A second, separate ownership fix.** `SYS_WIN_CREATE` was handing the compositor an *unbiased* slot
+number while `EL0_INPUT_ACTIVE` carries `slot + 1`. Because x86 slot 0 is a real address space, the
+first program to launch got a window with `owner_asid == 0` — skipped by both `hit_test` and
+`focus_ring`, i.e. neither clickable nor tabbable, silently and only for slot 0. The owner is now
+`slot + 1`, so the value `hit_test` returns is the value the router compares against the input focus,
+with no conversion at the one seam that decides who receives a keystroke.
+
+### The router: `wc_click_route`, and the one arm that is x86-specific
+
+On a PRESS edge the point is hit-tested and lands in one of four arms:
+
+| hit | disposition | focus | press |
+| --- | --- | --- | --- |
+| a window owned by another address space | `raise+deliver` | `set_active(owner)` then `focus_changed(owner)` | **delivered** into the raised owner's ring |
+| the already-focused window | `deliver` | unchanged | delivered |
+| a KERNEL-owned row (console, demo) | `consume` | `set_active(0)` — keyboard to the shell | consumed |
+| nothing (bare desktop) | `consume` | `set_active(0)` | consumed |
+
+with the two CLICK-SHELL r2 limits on the last arm intact: with focus already at the shell nothing is
+consumed, and a full-screen app presenting through the compat row is exempt (`wm::compat_live`, added
+here) because a compat row covers the panel but carries owner 0 and can never be hit.
+
+The RELEASE edge is never re-hit-tested. `CLICK_PRESS_TARGET` records where the press went and the
+release either follows it or is dropped — a press/release pair is never split across two apps, and no
+release is ever delivered to an app that did not see the press.
+
+**The one arm that differs from aarch64, and why.** On the kernel-row and desktop arms this router
+calls `el0_input_set_active(0)` but does **not** call `wm::focus_changed(0)`. On aarch64 the shell is
+the desktop layer *beneath* the window layer, so raising `SHELL_Z` reveals the console. On x86 the
+console **is a window row** (`fbcon::panel_console_window_open`), so raising `SHELL_Z` above every
+window would push the console below the shell, stop it compositing and erase it to the desktop colour
+— it would blank the console the operator just clicked. The kernel row's own z-bump
+(`focus_changed(owner)`, which touches only that owner's rows) is the correct raise on this arch, and
+`SHELL_Z` is left where it is. The selftest asserts that `SHELL_Z` does not move.
+
+### The witness: one line per press, and it separates the two complaints
+
+`[clickroute]` gains a per-press row beside the existing hit-test verdict — the same vocabulary, not a
+second one:
+
+```
+[clickroute] press at (x,y) win=N owner=0xA was=F -> <disposition> deliver=D
+```
+
+Human-rate by construction (a hand cannot click faster than serial can print), so it carries no
+throttle. It resolves the operator's two standing complaints in one sitting:
+
+* **"the click was eaten"** — press the pad and **no `[clickroute] press` line appears at all**. The
+  press never reached the router; the defect is upstream in HID or the queue and no routing change can
+  fix it. Before this arc *every* x86 press was in this state, silently.
+* **"the click was mis-routed"** — a line appears and its `win=`/`owner=` name something other than the
+  window the hand was over, or `deliver=` names an asid other than that window's owner.
+* **"an out-of-focus click stopped my app"** — a line whose `was=` names the focused app while
+  `deliver=` is 0 or another asid is positive proof the rule held: the press went where the hand
+  pointed, not to whoever held the keyboard.
+
+`deliver=0` means the press entered no app's ring. `click_stats()` carries the `(presses, delivered)`
+rollup for a coarser read.
+
+### Coverage: `clickroute_selftest`, headless-drivable
+
+QEMU delivers no pointer, so coverage extends `hittest_selftest`'s idiom one layer up: the press
+POSITION is a parameter (`wc_click_route_at`) rather than a read of the cursor, and every claim is
+made against the window table and the input rings rather than against the panel. Where
+`hittest_selftest` asserts *which window owns a pixel*, this asserts *who receives the press*.
+
+Six legs, each a distinct failure direction: `hit` (three disjoint probe rows resolve to their own
+owners), `deliver` (a press over an unfocused window is **not** consumed and moves focus — the
+direction CLICK-SWALLOW would fail), `depth` (the press then actually lands in that ring, and its
+release follows it — 1 then 2), `kernel` (a press on kernel furniture is consumed, hands the keyboard
+to the shell, and does not move `SHELL_Z`), `desktop` (a press on an unowned point is consumed and
+hands the keyboard to the shell; reported as `skip` rather than a false verdict if the live panel
+leaves no unowned point), and `nofab` (the release after a consumed press is dropped, never
+delivered).
+
+The probe rows are deliberately three DISJOINT boxes, not `hittest_selftest`'s stacked pair: this
+witness raises windows as part of the decisions it is testing, and overlapping boxes would let a raise
+silently turn the "different window" leg into the "already focused" one.
+
+### Interaction with the full-screen `vug` demo: none
+
+`vug.rs`'s `drain_input` reads `crate::pal::pump_and_poll()` directly and treats `Event::Button(_)` as
+its exit gesture. That is a *different drain*: while the full-screen demo is presenting, `handle_key`
+has taken over and `kernel_main`'s inner drain — the only place `wc_click_route` is called from — is
+not running. The router is never interposed on the demo's events, its click-to-exit is unchanged, and
+this arc adds no call into `pump_and_poll`. (The compat-row exemption in the desktop arm is the
+belt-and-braces half of the same statement, for a *ring-3* full-screen app presenting through
+`SYS_FB_PRESENT` while the main drain does run.)
+
+### Gate results (CLICK-X86 r2, 2026-07-29, QEMU)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
+* `UNAOS_WC=1 ./arroyo test 90` — **42 PASS lines / 0 FAIL**; measured baseline at `aed91dc0` was
+  **41 / 0**. The +1 is the new `[clickroute] route ... -> PASS` verdict and nothing else moved.
+* `./arroyo test-arm 22` — boots to `gui:handoff`, banner present, **0 FAIL**, identical to the
+  measured baseline. aarch64 is behaviour-inert: the `main.rs` Button arm is `#[cfg]`-gated to x86,
+  the `wm.rs` additions are new items plus one `focus_ring` predicate and one `close_owner` guard that
+  are both unreachable on a target where no row ever carries a band owner, and `fbcon.rs`'s console
+  window is itself x86-only.
+
+x86 wire lines, this arc:
+
+```
+[clickroute] press at (482,215) win=2 owner=0x2 was=1 -> raise+deliver deliver=2
+[clickroute] press at (536,215) win=3 owner=0xffffff7f was=1 -> consume deliver=0
+[clickroute] press at (2,2) win=0 owner=0x0 was=1 -> consume deliver=0
+[clickroute] route hit=true deliver=true depth=1/2 kernel=true desktop=true nofab=true -> PASS
+```
+
+### Gate results (CLICK-X86 r1 — the audit arc, 2026-07-29, QEMU)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
+* `UNAOS_WC=1 ./arroyo test 90`, two consecutive runs — **39 PASS lines / 0 FAIL** each
+  (37 verdicts; two of the 39 are `[wc-d] verify` lines that carry the word incidentally). Baseline
+  at `9c2c6b94` was 38/36; the +1 is the new `[clickroute]` line and nothing else moved.
+  `MISSION SUCCESS` present.
+* `./arroyo test-arm 22` — **`MISSION SUCCESS`**, 0 FAIL. aarch64 is byte-inert: the code diff is one
+  file under `arch/x86_64/`.
+
+---
+
+## CURSOR-14 — the instrument was the defect: `nosprite` measured the era before the sprite existed
+
+### What was asked, and why the question was wrong
+
+CURSOR-13 landed on both arches. The next attended x86 boot (s50, kernel with CURSOR-13 aboard) put
+this on the wire:
+
+```
+[cursor] armed x=1433 y=900
+[cursor12] offer scope=live passes=69 nosprite=69 nohit=0 reserved=0 nosession=0 planned=0 excl_probe=0 excl_unverified=0 -> nosprite
+[cursor6] rollup scope=live present_over=0 masked=0 repaired=0 desktop_over=0 mismatch=0 uncover_lost=0/0 -> UNWITNESSED
+```
+
+Read against GR7 s48 (42/42) and s49 (47/47) this says "CURSOR-13 changed nothing measurable", and
+the arc was opened as a refutation on silicon: find the second bracket that is still starving the
+composite.
+
+**There is no second bracket on the hot path. The three readings are the same measurement artefact,
+and it is the only thing those numbers could ever have said.**
+
+### The proof, from the capture itself
+
+Two facts about the instrument, both in the tree before this arc:
+
+1. **`pal::cursor::rollup_tick` fired on the FIRST pointer report of the boot.** `ROLLUP_LAST_MS`
+   starts at 0 and the limiter read `if last != 0 && now - last < ROLLUP_EVERY_MS { return }`, so a
+   zero fell straight through to the print.
+2. **Every `[cursor12]` term was a running total since boot**, loaded and printed raw, never
+   snapshotted.
+
+Compose them. `move_rel` runs `touch()` → `set_clamped` → `repaint_on_move()`, and `repaint_on_move`
+is `cursor::repaint()` *then* `rollup_tick()`. On the first report of a boot the `repaint` draws the
+sprite for the first time — emitting `[cursor] armed` — and the very next call prints a block
+covering every composite that ran **before that draw**. During all of them `sp.drawn == false`, so
+`cursor::sprite_plan()` returns `None` by construction. `nosprite == passes` is not a finding; it is
+arithmetic.
+
+The tell is visible in the capture without reading any code: **`[cursor] armed` sits immediately
+above the block, because both lines come from the same pointer report.** 42, 47 and 69 are not a rate
+that failed to move — they are three boots' worth of pre-pointer composite totals, and they differ
+from each other exactly as much as three boots differ.
+
+The debt did not clear on the next block either. With ~40–70 boot-era passes permanently in the
+numerator and a sitting adding ~14 passes/s, `nosprite * 2 >= passes` — the verdict's own predicate —
+stays true for the first ten-odd seconds of continuous motion **whatever the mechanism is doing**.
+
+### Consequence for the cross-seat record
+
+The previous executor's call-graph analysis — *"after CURSOR-13 our x86 path has exactly one
+caller-side bracket left, `pal::TargetPal::render`, and its `undraw` … `ensure_drawn` is an
+idempotent close that cannot re-starve the composite"* — **was correct.** What was wrong was the
+inference drawn from the wire against it. The failure was not in the reasoning about the code; it was
+in treating a structurally-pinned counter as evidence.
+
+The same applies backwards. **P74's original `nosprite ≈ passes` reading on GR7 s48 was a first-block
+reading too**, so the evidence that motivated CURSOR-13 was the identical artefact. CURSOR-13's
+*argument* stands on its own — a bracket that spans a composite does starve `sprite_plan()`, and the
+call graph says so without any counter — but its *measurement* never demonstrated the effect it
+claimed. Neither seat has yet seen a valid `nosprite` sample. This arc is what makes one possible.
+
+The operator's own words on the same s50 boot are the independent corroboration:
+**"mouse makes it over the top of everything now."** The arrow is on glass above window content. The
+instrument was simply unable to say so.
+
+### The composite call-site table (x86), with the sprite's state at entry
+
+`wm::composite()` is private-by-design behind `composite_inner`; every path below reaches it.
+
+| # | Call site | Reached on x86 from | Sprite at entry | Why |
+|---|---|---|---|---|
+| 1 | `Screen::flush` → `wm::service_damage` → `composite` | `pal::TargetPal::render`, every console-loop pass | **UP** | CURSOR-13: `flush`'s `repaint()` runs before the composite. Early-returns on an undamaged table. |
+| 2 | `Screen::flush` → `wm::repaint` → `composite` | same, intrusion fallback only | **UP** | Same bracket, same close. `[wc-i] intrusions=0` says this arm is not taken. |
+| 3 | `fbcon::route_present_rows` → `wm::present_rows` → `present_banded` → `composite` | **every routed console line** (FBCON-DMG) | **UP**, and this is the volume path when the console is not suspended | The print path takes no cursor bracket of its own. Suspended entirely while an INSTGUI dialog is open. |
+| 4 | `arch::x86_64::syscall` window-present verb → `wm::present` | EL0 `SYS_WIN_PRESENT` | **UP** | Syscall context; no bracket anywhere above it. |
+| 5 | `instgui::repaint` → `wm::present` | dialog state change / keypress only | **UP** | Ordinary `wm::present`. **No special path** — see below. |
+| 6 | `wcx::activate` → `wm::present` / `create_at` | once, from PCI enumeration | DOWN, harmlessly | `wcx.rs:193` undraws before its one-shot `fill_screen`. Runs before the sprite has ever existed, so the undraw is a no-op. |
+| 7 | `wm::create_at` / `create_inner` → `composite` | window creation | **UP** | No caller-side bracket. |
+| 8 | `wm::focus_changed` → `composite` | focus raise | **UP** | No caller-side bracket. |
+| 9 | `wm::move_to` → `erase` → `composite` | window move | **was DOWN** | `erase` undraws; the composite ran inside that bracket. **Fixed this arc.** |
+| 10 | `wm::close` → `erase`/`reclaim` → `composite` | window close | **was DOWN** | Same. **Fixed this arc.** |
+| 11 | `wm::close_owner` → `erase`/`reclaim` → `composite` | ASID teardown | **was DOWN** | Same. **Fixed this arc.** |
+| 12 | `pal::TargetPal::render`'s own bracket | every present | spanned #1/#2 harmlessly, but held the sprite down across the whole desktop blit | **Removed this arc.** |
+
+Rows 9–11 are genuine starving paths of exactly CURSOR-13's shape, and they were the only ones. They
+are also *rare* — a window move or teardown, not a frame — so they cannot account for a 100% reading
+and never could have.
+
+### What changed
+
+**1. `pal::TargetPal::render` — the last caller-side bracket goes (`pal.rs`, was x86-gated).**
+
+```rust
+fn render(&mut self) {
+    self.surface.flush();          // CURSOR-13's body owns the sprite end to end
+}
+```
+
+Two reasons, and the second is the one that matters. It cost two wasted `SPRITE` acquisitions per
+present (an earlier arc flagged this and could not act on it). And from its `undraw` to `flush`'s
+`repaint` the arrow was off the panel **for the length of the entire desktop blit** — the longest
+front-buffer write in the system — so any composite reached during that window from another core, or
+from an IRQ-context printer on this one (`fbcon::route_present_rows`, row 3 above), entered with
+`sprite_plan() == None`. That window is now `present_background` alone, the smallest it can be while
+a raw desktop blit exists. `render` is arch-neutral in shape again.
+
+**2. `wm::move_to` / `close` / `close_owner` — close the erase bracket before the composite.**
+
+`super::cursor::repaint();` immediately before each `composite()`, after the last `erase`/`reclaim`
+and after the drain barrier is dropped. Same shape as `Screen::flush`: the save-under is taken
+against a front buffer whose desktop is already final, and the composite then owns the sprite. Costs
+one restore/save/draw per window move or close.
+
+**3. `pal::cursor::rollup_tick` — the first report ARMS the window, it does not print one.**
+
+**4. `[cursor12]` — every term is a delta since the previous block; `cum=` carries the boot total.**
+
+Together, the first `[cursor12] scope=live` block to reach the wire now covers one full 5 s window of
+real pointer motion with the sprite alive throughout. A block whose `passes == cum` is the whole-boot
+baseline and carries no verdict.
+
+```
+[cursor12] offer scope=live passes=N nosprite=… … cum=M -> why
+```
+
+### What proves the fix on the next boot, and what refutes it
+
+**Proves.** A `[cursor12] scope=live` block with **`passes` strictly less than `cum`** (i.e. a real
+window, not the baseline) in which, with the pointer moving **over a window**:
+
+* `nosprite` is small — ideally 0, legitimately non-zero only for passes inside CURSOR-HIDE's ~1.5 s
+  idle expiry;
+* `planned > 0`, and `[cursor3] offers > 0` with `taken > 0`;
+* `[cursor6] desktop_over` stays **0** (the retained desktop bracket, confirmed clean on s50).
+
+With the pointer over **bare desktop**, the correct reading is `nohit ≈ passes`, not `nosprite`.
+
+**Refutes.** A windowed block (`passes < cum`) that *still* reads `nosprite ≈ passes` with the
+pointer demonstrably moving over a window. That would mean a bracket this table missed, and the next
+thing to instrument is the composite's *caller*, not its predicate — tag each `nosprite` pass with
+its entry point.
+
+**Does not refute, and must not be read as refutation:** the first block of a boot, or any block
+where `passes == cum`. Also `nosprite = passes` on either QEMU gate — neither has a pointer, so the
+sprite is never drawn and the reading is *correct* there and cannot move.
+
+### The INSTGUI appearance report — a separate defect, and the discriminating question
+
+Same s50 boot, operator at the machine: **"mouse makes it over the top of everything now but it
+doesn't look right over the top of the installer window."**
+
+Row 5 of the table answers "does instgui reach the compositor by a path the others do not": **it does
+not.** `instgui::repaint` → `wm::present` is the ordinary verb. What *is* unique to instgui is on the
+other side of the seam — **`instgui::open` calls `fbcon::console_present_suspend(true)`**, so while
+the dialog is up the routed console (row 3, the highest-volume compositor path on this arch) stops
+presenting entirely. The repaint *cadence* under the arrow changes there and nowhere else.
+
+Candidates at pixel level, from the mechanism:
+
+* **(A) Trailing / smear while moving.** The save-under is captured from the front buffer at draw
+  time; if it was taken against non-final dialog pixels, the restore stamps them back. CURSOR-9's
+  `TOUCHED_SINCE_DRAW` repair mends it at the next composite — within one desktop frame — so this
+  predicts a *brief* smear at the pointer's rate, visible only in motion.
+* **(B) A hard block of stale content inside the dialog.** Same mechanism, but persisting, which
+  requires the mend not to arrive. With console presents suspended the mend comes only from
+  `Screen::flush` → `service_damage`; that still runs every console-loop pass, so the code does
+  **not** predict a persistent block.
+* **(C) Flicker at the dialog's own repaint rate.** `instgui::service` repaints only when the disk
+  list signature changes, so the dialog presents almost never. The code **positively predicts this
+  does not happen.**
+* **(D) The arrow reading wrong rather than behaving wrong.** The sprite is a white `FILL` with a
+  dark drop shadow offset by `(s, s)`. Every other surface on this panel — console, corner demo,
+  desktop — is dark; the installer dialog is the one piece of **light** chrome in the system. A white
+  arrow plus a shadow overhang on light grey is low-contrast and the shadow reads as a smudge. This
+  is not a defect in any mechanism.
+
+**The code predicts (A) or (D), and rules out (C).** One question separates them, and it is the only
+question the operator needs to be asked:
+
+> **Hold the pointer perfectly still over the installer dialog. Does it look wrong then too, or only
+> while you are moving it?**
+
+* *Only while moving* → (A): save-under / mend latency. Compose-through is the fix, and making it
+  reachable is exactly what this arc does — **expect it to improve**.
+* *Wrong when still as well* → (D) (or (B)): appearance over light chrome, or a static stale restore.
+  **Compose-through will not touch it.** (D)'s remedy is the sprite's own colours — an outline, or a
+  contrast-aware fill — which is a different arc.
+
+**Do not assume the two are the same bug.** They share a symptom surface, not a mechanism: the
+`nosprite` finding is an instrumentation artefact, and the instgui appearance is either a save-under
+latency or a palette choice. Nothing in the code makes the second a consequence of the first.
+
+### Gate results (CURSOR-14, 2026-07-29, QEMU)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
+* `UNAOS_WC=1 ./arroyo test 90` — **33 PASS lines / 0 FAIL**, 594 log lines. Baseline measured this
+  session at `693e097f`: **33 PASS / 0 FAIL, 594 lines**. No regression, and no line moved.
+* `./arroyo test-arm 22` — banner reached (`:: AARCH64 Core Hardware Init ::`,
+  `AARCH64 boot diag: EL=2 CNTFRQ=62500000 Hz MMU=on`), 341 lines, 0 FAIL / 0 PANIC.
+
+**Neither QEMU gate has a pointer**, so `rollup_tick` never fires and no `[cursor12] scope=live` block
+is emitted on either. The gates are no-regression only; the verdict is owed by the next attended
+boot.
+
+### Out of lane / flagged for the pi seat
+
+Three of the four changes are in shared files and the pi seat should lift them:
+
+* **`wm.rs` rows 9–11** (`repaint()` before `composite()` in `move_to`/`close`/`close_owner`) — three
+  one-line insertions, arch-neutral, behavioural on both arches.
+* **`wm.rs` `[cursor12]` delta reporting** — witness-only, arch-neutral, changes the wire format
+  (adds `cum=`). Any log-scraper on either bench needs the new field.
+* **`pal.rs` `rollup_tick`** — witness-only and behaviour-inert, but `rollup_tick` is *not*
+  arch-gated (only the `repaint` above it is), so **this changes aarch64's witness output too**: the
+  pi bench will lose the first `[cursor12] scope=live` block of each boot. That is the intended
+  effect — it is the block that could never be true — and the pi seat should expect it.
+
+`pal::TargetPal::render` (change 1) is x86-only in effect: the bracket it removes was
+`cfg(target_arch = "x86_64")`, so aarch64 is byte-inert there.
