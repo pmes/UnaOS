@@ -2475,6 +2475,29 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i
     if !SYSCALL_LOGGED.swap(true, Ordering::Relaxed) {
         serial_println!(":: SYSCALL: nr={} — ring-3 -> ring-0 path live ::", nr);
     }
+    let rc = syscall_dispatch_inner(nr, a0, a1, a2, a3);
+    // TEARDOWN-1: the SYSCALL KILL BOUNDARY. A task whose `KillSwitch` is armed retires HERE, on the way
+    // out, and this call does not return in that case — the scheduler's existing reap arm owns the
+    // teardown (see `sched::kill_check_current`).
+    //
+    // This is the boundary that makes `bg_kill` honest for a real application. Before it, the only
+    // delivery point was `run()`'s READY arm, i.e. a PREEMPTION — so a program whose every turn ends in a
+    // blocking syscall (one `SYS_SLEEP_MS` per frame is the shape every windowed app has, and is exactly
+    // what `STAT.ELF` does) went from dispatch straight back into a park without ever passing through it,
+    // and its kill stayed armed until a timer preemption happened to land inside its short compute
+    // window. The WINX-2 kill leg timed out on precisely that.
+    //
+    // Placed at the TAIL, after the handler has returned and every guard it took has been dropped: the
+    // dispatcher's own contract already states that a syscall may `switch_context` from here, and the
+    // abandoned syscall frame on the kernel stack is freed with the stack, exactly as the preemption
+    // arm's abandoned interrupt frame is.
+    crate::arch::sched::kill_check_current();
+    rc
+}
+
+/// TEARDOWN-1: the dispatch table proper, split out of [`syscall_dispatch`] so the kill boundary above
+/// runs on the way out of EVERY verb rather than being re-stated (and forgettable) at each arm.
+fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     match nr {
         SYS_WRITE => sys_write(a0, a1, a2),
         // WINX-1: the process verbs, at their cross-arch shared numbers. Unconditional (no feature
@@ -4271,6 +4294,12 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
             crate::arch::sched::FutexWait::Mismatch => EAGAIN,
             crate::arch::sched::FutexWait::TableFull => EAGAIN,
             crate::arch::sched::FutexWait::NoTask => EINVAL,
+            // TEARDOWN-1: the caller has an armed kill, so the park was refused. Report SUCCESS rather
+            // than an errno: a spurious wake is a legal futex outcome that every correct wait loop
+            // already re-checks, whereas an errno could send a program down an error path. It does not
+            // matter which the ring-3 loop does — the task retires at the kill boundary in
+            // `syscall_dispatch` before it can execute another instruction at ring 3.
+            crate::arch::sched::FutexWait::Killed => 0,
         },
         FUTEX_WAKE => crate::arch::sched::futex_wake(key, val as usize) as i64,
         _ => EINVAL,

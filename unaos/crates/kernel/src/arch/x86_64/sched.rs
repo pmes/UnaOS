@@ -134,6 +134,29 @@ const RFLAGS_IF: u64 = 1 << 9;
 /// the task's next switch-back, tears its address space down, drops it, and sets `reaped`. Shared by
 /// `Arc` (exactly like `Task::done_sem`) so it outlives the dropped `Task` — the requester keeps a
 /// clone across the request/reap window.
+///
+/// TEARDOWN-1 — "at a preemption boundary" was the whole defect. A kill was ARMED and then delivered
+/// only from `run()`'s READY arm, i.e. only to a task that switched back yielded-or-preempted. A task
+/// PARKED in a kernel wait switches back BLOCKED, never reaches that arm, and — if nothing ever wakes
+/// it — never reaches any arm at all: `bg_kill` reported "kill armed — the task retires at its next
+/// preemption" forever, and the row, the address-space slot and the compositor window it owned were
+/// immortal. That is what the WINX-2 kill leg timed out on.
+///
+/// The kill is now delivered at THREE boundaries, and arming REACHES a parked target rather than
+/// waiting for one:
+///   * [`kill_check_current`] — the syscall boundary. A killed task retires at its next syscall
+///     return, which for any program that talks to the kernel at all is the prompt case.
+///   * `run()`'s READY arm — unchanged, and still the only boundary a never-syscalling spinner has.
+///   * [`kill_wake_parked`] — called from `request` itself, so a target already parked on a futex or
+///     a sleep is EVICTED through that park kind's own wake path (`make_ready`, exactly as
+///     `futex_wake` / `drain_due_sleepers` do) and so arrives at the syscall boundary above. Nothing
+///     mutates scheduler state behind a park's back: the eviction takes precisely the lock the
+///     matching wake already takes, in the same order, and re-readies outside it.
+/// The converse race — arm, THEN park — is closed at the two park sites (`futex_wait`, and the
+/// PARK_SLEEP arm of `park_blocked`) by testing the flag under the very lock that publishes the Box
+/// into its wait structure. That is what makes the pair lossless rather than merely likely: the
+/// arming store precedes the eviction scan, and the scan takes that same lock, so a parker whose
+/// under-lock test reads `false` is guaranteed to have published before the scan can look.
 pub struct KillSwitch {
     requested: AtomicBool,
     reaped: AtomicBool,
@@ -144,9 +167,21 @@ impl KillSwitch {
     pub const fn new() -> Self {
         KillSwitch { requested: AtomicBool::new(false), reaped: AtomicBool::new(false) }
     }
-    /// Request termination at the task's next preemption (idempotent).
+    /// Request termination at the target's next kill boundary (idempotent).
+    ///
+    /// TEARDOWN-1: arming also EVICTS a target that is already parked in a kernel wait, strictly after
+    /// the publishing store above (so the eviction scan's under-lock test cannot read a stale `false`).
+    /// Arming and evicting are one operation deliberately — there is no way for a caller to arm a kill
+    /// without reaching a parked target, which is exactly the hole this closes.
     pub fn request(&self) {
         self.requested.store(true, Ordering::Release);
+        let evicted = kill_wake_parked();
+        if evicted > 0 {
+            serial_println!(
+                "[killbound-x86] kill armed — {} task(s) evicted from a kernel wait to reach a kill boundary",
+                evicted
+            );
+        }
     }
     /// True once the scheduler has reaped the task (torn its address space down + dropped it).
     pub fn is_reaped(&self) -> bool {
@@ -943,6 +978,50 @@ fn spawn_user_inner(
 static USER_SPACE_REFS: [AtomicU32; crate::arch::memory::USER_SLOTS] =
     [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
 
+/// TEARDOWN-1: per-slot ADDRESS-SPACE DOOM — "every EL0 task under this slot is owed its death".
+///
+/// WHY A KILL MUST BE ADDRESS-SPACE SCOPED, not task scoped. `SYS_THREAD_SPAWN` gives an EL0 program
+/// several tasks under one slot, and only the LAST of them to leave releases the address space (see
+/// `USER_SPACE_REFS`). A `KillSwitch` names ONE task — the leader `run`/`bg` spawned — so killing it
+/// reaped the leader and left its workers running: the refcount never reached zero, so
+/// `free_user_space_by_cr3` never ran, so the slot's compositor windows were never retired. That is
+/// exactly what the WINX-8 teardown leg read as `cleared=false` — a killed vug whose window stayed on the
+/// panel, owned by a process the operator had been told was dead, with the slot unrecyclable and the
+/// workers burning their cores against a parent that no longer exists.
+///
+/// A worker thread carries no `KillSwitch` of its own (nothing hands one out per thread, and sharing the
+/// leader's Arc would let the first thread out publish `reaped` for the whole process). So the scope lives
+/// here instead, in the one place that is genuinely shared: the slot. `reap_killed` arms it as the last
+/// act of retiring a task that owned an address space, and every sibling then matches the same armed
+/// predicate at its own next kill boundary.
+///
+/// QUIESCENCE IS PRESERVED, NOT WEAKENED. Nothing is reclaimed here. Each sibling still retires through
+/// `reap_killed` and decrements `USER_SPACE_REFS` itself; only when that reaches zero does the slot free.
+/// This makes that edge REACHABLE — it does not move it earlier.
+static SLOT_DOOMED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+
+/// TEARDOWN-1: arm the address-space doom for the slot rooted at `cr3`. Idempotent; a `cr3` that is not a
+/// live slot root is ignored (there is no address space to scope to). Disarmed on the slot's real free
+/// edge in [`user_space_release`].
+fn doom_address_space(cr3: u64) {
+    if let Some(s) = cr3_slot(cr3) {
+        SLOT_DOOMED[s].store(true, Ordering::Release);
+    }
+}
+
+/// TEARDOWN-1: is the address space rooted at `cr3` doomed?
+fn cr3_doomed(cr3: u64) -> bool {
+    cr3 != 0 && cr3_slot(cr3).is_some_and(|s| SLOT_DOOMED[s].load(Ordering::Acquire))
+}
+
+/// TEARDOWN-1: THE kill predicate — is this task owed its death? Either its own `KillSwitch` is armed
+/// (the leader a requester named) or its address space is doomed (a sibling thread of that leader).
+/// Every kill boundary and every eviction sweep tests exactly this, so the two scopes can never drift.
+fn task_kill_armed(task: &Task) -> bool {
+    task.kill.as_ref().is_some_and(|k| k.is_requested()) || cr3_doomed(task.user_cr3)
+}
+
 /// WINX-7: the slot index whose page-table root is `cr3`, or `None` for the shared kernel window.
 /// The `memory::current_slot` shape, but keyed off a STORED cr3 rather than the live one — a task's
 /// `user_cr3` field is the authority on which address space it belongs to, and at reap time the live
@@ -976,6 +1055,12 @@ fn user_space_release(cr3: u64) {
     let mut cur = USER_SPACE_REFS[s].load(Ordering::Acquire);
     loop {
         if cur == 0 {
+            // TEARDOWN-1: the slot is going away, so DISARM its doom before the root can be recycled.
+            // Cleared here — on the real 1->0 free edge, under the same "last holder" test that frees —
+            // because that is the only moment at which no task can still be looking for it. Leaving it
+            // set would hand the doom to the NEXT tenant of this slot, which would kill a brand-new
+            // program at its first syscall.
+            SLOT_DOOMED[s].store(false, Ordering::Release);
             // Last holder: free the slot for real. `free_user_space_by_cr3` retires the slot's
             // compositor windows, drops its FB leaves, clears its handle/file rows and releases the
             // used-flag — the clear-before-release discipline it already documents.
@@ -1654,6 +1739,9 @@ pub enum FutexWait {
     TableFull,
     /// Called off a scheduled task (no `current` to park) — cannot block.
     NoTask,
+    /// TEARDOWN-1: the caller has an ARMED kill and so was refused the park. No sleep happened; the
+    /// caller must not loop, because it is about to be retired at the syscall boundary on the way out.
+    Killed,
 }
 
 /// Build the futex key for `uaddr` in address-space `slot`. Non-zero by construction (the slot index
@@ -1751,6 +1839,23 @@ pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
             x86_64::instructions::interrupts::enable();
         }
         return FutexWait::NoTask;
+    }
+    // TEARDOWN-1: the "arm, THEN park" half of the futex leg. `b` has been locked continuously since it
+    // was found/claimed and stays locked until the SCHEDULER pushes our Box and releases it, so this
+    // test and the publish are inside one hold of the very lock `kill_wake_parked`'s sweep takes — the
+    // same losslessness argument the PARK_SLEEP arm of `park_blocked` states. Refuse to park: a task
+    // owed its death must not enter a wait nobody may be left to signal. The bucket we may have just
+    // claimed is released here on the same terms as the `Mismatch` path above, so a refused park never
+    // strands a bucket on a key with no waiters.
+    if unsafe { task_kill_armed(&*raw) } {
+        if b.waiters_empty() {
+            b.key.store(0, Ordering::Relaxed);
+        }
+        b.unlock_raw();
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+        return FutexWait::Killed;
     }
     // Capacity guard: the lock is held continuously until the scheduler pushes, so the length cannot
     // change before then — asserting here proves the park-side push will not reallocate.
@@ -2639,27 +2744,9 @@ fn run() -> ! {
                         // that mov-cr3 full-flush retires the slot's user TLB entries) BEFORE freeing
                         // the slot, so no core is left on a dead/reused root. We are IF=0.
                         debug_assert_eq!(park, PARK_NONE, "non-blocked task carried a park action");
-                        let reap = task.kill.as_ref().is_some_and(|k| k.is_requested());
+                        let reap = task_kill_armed(&task);
                         if reap {
-                            // WINX-7: post the completion here too. A REAPED task never runs `exit()`
-                            // — the scheduler drops it where it stands — so without this a joiner
-                            // parked on a killed thread would wait forever, which is the one way a
-                            // `kill` could leave a process MORE stuck than before it was killed.
-                            if let Some(sem) = &task.done_sem {
-                                sem.post();
-                            }
-                            // WINX-7: refcounted, for the reason `exit()` documents — a killed
-                            // THREAD must not tear the address space out from under its siblings.
-                            // (A killed PROCESS is the common case and still frees here: its
-                            // refcount is 0 unless it spawned threads.)
-                            if task.user_cr3 != 0 {
-                                crate::arch::memory::restore_kernel_cr3();
-                                user_space_release(task.user_cr3);
-                            }
-                            if let Some(k) = &task.kill {
-                                k.mark_reaped(); // through the Arc — the requester's clone keeps it live
-                            }
-                            drop(task); // frees the kstack; the interrupt frame on it is abandoned
+                            reap_killed(task);
                         } else {
                             // Rotate to the back of its (decayed) effective level: `requeue` steps the
                             // transient promotion down by one toward base rather than re-basing, so a
@@ -2687,6 +2774,175 @@ fn run() -> ! {
     }
 }
 
+/// U3.5/TEARDOWN-1: RETIRE a task whose `KillSwitch` is armed, from the scheduler's own context.
+///
+/// Owns `task` and drops it, so the task never executes again. Extracted from `run()`'s READY arm
+/// because TEARDOWN-1 gives it a second caller — the PARK_SLEEP arm of `park_blocked`, where a task
+/// that would otherwise commit itself to a sleeper list is retired instead. Both callers are the
+/// scheduler context with IF=0, holding no scheduler, wait-queue or heap lock, which is what makes the
+/// teardown below (a `mov cr3`, a slot free, a heap drop) legal here.
+///
+/// Teardown MIRRORS `exit`: restore the kernel CR3 first (this task ran under its own CR3, which is
+/// still live on this core; that `mov cr3` full-flush retires the slot's user TLB entries) BEFORE the
+/// slot is freed, so no core is left standing on a dead or reused root.
+fn reap_killed(task: Box<Task>) {
+    // WINX-7: post the completion here too. A REAPED task never runs `exit()` — the scheduler drops
+    // it where it stands — so without this a joiner parked on a killed thread would wait forever,
+    // which is the one way a `kill` could leave a process MORE stuck than before it was killed.
+    if let Some(sem) = &task.done_sem {
+        sem.post();
+    }
+    // WINX-7: refcounted, for the reason `exit()` documents — a killed THREAD must not tear the
+    // address space out from under its siblings. (A killed PROCESS is the common case and still frees
+    // here: its refcount is 0 unless it spawned threads.)
+    if task.user_cr3 != 0 {
+        // TEARDOWN-1: DOOM the address space before dropping our hold on it, so every sibling EL0 thread
+        // follows this task out at its own next kill boundary and the refcount can actually reach zero.
+        // Armed here rather than at the requester — a `bg_kill` names a pid, and the set of tasks that
+        // pid's program owns is knowable only from the slot. Idempotent, so a sibling reaping after us
+        // simply re-arms the same flag; the flag is cleared on the slot's real free edge.
+        doom_address_space(task.user_cr3);
+        crate::arch::memory::restore_kernel_cr3();
+        user_space_release(task.user_cr3);
+    }
+    if let Some(k) = &task.kill {
+        k.mark_reaped(); // through the Arc — the requester's clone keeps it live
+    }
+    drop(task); // frees the kstack; the interrupt frame on it is abandoned
+    // TEARDOWN-1: reach the siblings the doom above just named. A worker parked on the frame barrier its
+    // now-dead parent will never release is the whole point: it is woken here, through the futex's own
+    // wake path, and retires at its next syscall return. Called AFTER the drop so no Box and no lock is
+    // held; legal in this context for the same reason `park_blocked`/`drain_due_sleepers` are — the
+    // scheduler context takes the sleeper/bucket locks and re-readies outside them, in that order.
+    let _ = kill_wake_parked();
+}
+
+/// TEARDOWN-1: is the task running on THIS core carrying an ARMED kill? Two atomic loads on the fast
+/// path (the `current` pointer and the flag), and nothing at all for a task with no kill switch — cheap
+/// enough for the syscall return path, which is where [`kill_check_current`] calls it.
+fn current_kill_requested() -> bool {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    if raw.is_null() {
+        return false;
+    }
+    // SAFETY: `current` is owned by `run()` on this CPU and we are on that CPU with IF=0 (every caller
+    // is a syscall/interrupt-masked context), so the Box cannot be reclaimed under us. We only read.
+    unsafe { task_kill_armed(&*raw) }
+}
+
+/// TEARDOWN-1: the SYSCALL kill boundary. If the task running on this core has been killed, retire it
+/// here — this call does not return in that case.
+///
+/// Retirement is expressed as `yield_now()`, deliberately, rather than as a second copy of the teardown:
+/// the task switches back to the scheduler in STATE_READY, and the scheduler's existing reap arm — the
+/// one U3.5 wrote and WINX-7 fixed — sees the armed switch and runs [`reap_killed`]. So the completion
+/// post, the refcounted address-space release, the `mark_reaped` handshake and the kernel-stack free all
+/// stay in exactly ONE place, and a killed task's teardown is byte-identical whether it was delivered at
+/// a preemption or at a syscall.
+///
+/// Callers must be at a point where switching away FOR GOOD is safe: on the task's own kernel stack,
+/// holding no lock, with every guard dropped. The syscall dispatcher's tail qualifies — it already
+/// documents that a blocking/exiting syscall may `switch_context` from there.
+pub fn kill_check_current() {
+    if !current_kill_requested() {
+        return;
+    }
+    yield_now(); // -> scheduler -> reap_killed; never comes back
+}
+
+/// TEARDOWN-1: sweep the kernel waits an EL0 task can be parked in and EVICT the ones an armed kill
+/// names. Called from [`KillSwitch::request`] once the arming store is published, so the predicate
+/// below (the task's own `kill` flag) already matches. Returns how many tasks were evicted.
+///
+/// THE SET IS ENUMERABLE, and that is the whole reason this is a finite function rather than a hope.
+/// Every park on this arch routes through one of the three `PARK_*` actions, and only two of them can
+/// hold an EL0 task indefinitely:
+///   * PARK_SLEEP — the per-CPU `SLEEPERS` lists (`SYS_SLEEP_MS`). Swept here.
+///   * PARK_WAITQ on a futex bucket (`SYS_FUTEX`). Swept here. This is the one that could park
+///     FOREVER — a barrier whose other side is gone is woken by nobody — and so the one that made a
+///     kill unconfirmable rather than merely late.
+///   * PARK_WAITQ on a `Semaphore` the syscall layer owns (`SYS_THREAD_JOIN`'s join handle,
+///     `SYS_WAIT`'s `Proc::done`). NOT swept: those tables live in `syscall`, not here, and there is no
+///     registry of live semaphores to walk. The honest bound this leaves is stated at the bottom of
+///     this doc rather than papered over.
+///
+/// Each half evicts through the park kind's OWN wake path — `make_ready`, called outside the wait
+/// structure's lock, which is precisely what `drain_due_sleepers` and `futex_wake` do. So the lock order
+/// is unchanged (the run-queue lock is never nested under a sleeper or bucket lock), the woken task
+/// resumes inside its own `sleep_ticks`/`futex_wait` exactly as a legitimate wake would leave it, and
+/// nothing reaches around a park to mutate scheduler state behind its back. A futex waiter evicted this
+/// way returns `FutexWait::Woken` and its `SYS_FUTEX` returns 0 — a spurious wake, which is a legal
+/// futex outcome the ring-3 loop must already tolerate, and it does not matter here anyway: the task
+/// retires at the syscall boundary on the way out.
+///
+/// THE REMAINING BOUND, stated: a killed task already parked on a kernel `Semaphore` is not evicted. It
+/// retires at the syscall boundary when that semaphore is posted, so it is LATE, not immortal — and both
+/// EL0 semaphore parks wait on something that is itself killable (a thread, a child process), so the
+/// post is reachable. Closing it properly needs a `kill_wake_parked_semaphores` hook in `syscall` (the
+/// shape aarch64 uses); that is a separate arc, not a silent gap.
+fn kill_wake_parked() -> u32 {
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+    let mut evicted = 0u32;
+
+    // (a) PARK_SLEEP — the per-CPU sleeper lists. Same lock-then-release-then-`make_ready` shape as
+    // `drain_due_sleepers`, one victim per pass so the lock is never held across the re-ready.
+    for cpu in 0..MAX_CPUS {
+        loop {
+            let doomed = {
+                let mut sleepers = SLEEPERS[cpu].lock();
+                match sleepers
+                    .iter()
+                    .position(|s| task_kill_armed(&s.task))
+                {
+                    Some(i) => sleepers.remove(i).map(|s| s.task),
+                    None => None,
+                }
+            }; // sleeper lock dropped here
+            match doomed {
+                Some(task) => {
+                    make_ready(task);
+                    evicted += 1;
+                }
+                None => break,
+            }
+        }
+    }
+
+    // (b) PARK_WAITQ on a futex bucket. The bucket lock is the SAME lock `futex_wake` takes, held
+    // across the removal only; the key is released when the removal drains the bucket, exactly as a
+    // wake would — otherwise a bucket emptied here would stay claimed for a key with no waiters.
+    for b in FUTEX.iter() {
+        loop {
+            b.lock_raw();
+            let doomed = unsafe {
+                let w = &mut *b.waiters.get();
+                match w.iter().position(|t| task_kill_armed(t)) {
+                    Some(i) => w.remove(i),
+                    None => None,
+                }
+            };
+            if doomed.is_some() && b.waiters_empty() {
+                b.key.store(0, Ordering::Relaxed);
+            }
+            b.unlock_raw();
+            match doomed {
+                Some(task) => {
+                    make_ready(task);
+                    evicted += 1;
+                }
+                None => break,
+            }
+        }
+    }
+
+    if was_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
+    evicted
+}
+
 /// Park a task that switched back in the BLOCKED state, per the action it set before switching.
 /// Runs in the scheduler context with IF=0 (so it cannot be preempted) and owns `task`.
 fn park_blocked(cpu: usize, park: u8, task: Box<Task>) {
@@ -2707,7 +2963,20 @@ fn park_blocked(cpu: usize, park: u8, task: Box<Task>) {
         }
         PARK_SLEEP => {
             let deadline = SCHED[cpu].park_deadline.load(Ordering::Relaxed);
-            SLEEPERS[cpu].lock().push_back(Sleeper { deadline, task });
+            // TEARDOWN-1: the "arm, THEN park" half of the sleep leg, closed at the PUBLISH point and
+            // UNDER the publish lock. The test and the `push_back` share one continuous hold of
+            // `SLEEPERS[cpu]`, which is the same lock `kill_wake_parked`'s sweep takes — so either the
+            // sweep runs before this hold (and its arming store, which precedes it, is what this test
+            // reads) or after the push (and it finds the sleeper). There is no third ordering, which is
+            // why this is lossless rather than merely narrow. The lock is dropped before `reap_killed`,
+            // which frees a slot and touches the heap.
+            let mut sleepers = SLEEPERS[cpu].lock();
+            if task_kill_armed(&task) {
+                drop(sleepers);
+                reap_killed(task);
+                return;
+            }
+            sleepers.push_back(Sleeper { deadline, task });
         }
         _ => {
             // A BLOCKED task with no valid park action is a bug; don't leak it — drop it.
