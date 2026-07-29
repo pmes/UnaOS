@@ -764,6 +764,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 // CR3-at-dispatch path). A watchdog reaps the spinner via the scheduler. Runs LAST so
                 // the preemptible task can't perturb the cooperative U1a/U1b/U2/U3 ordering above.
                 unaos_kernel::arch::syscall::u3_5_run_fixture(cpu);
+
+                // SERWIT-1: the serial transport's own fixture — the one gate that is about the
+                // INSTRUMENT rather than the thing being instrumented. Every other `PASS` on this wire
+                // is only as trustworthy as the wire, and the wire used to drop lines silently under
+                // contention (`_print`'s `try_lock` failure branch discarded the line, with no counter
+                // anywhere in the tree to notice). One worker per online AP, all released together so
+                // their bursts genuinely overlap, then the BSP asserts the conservation law
+                // `submitted == emitted + dropped + in_flight` with `dropped == 0`. The `[serwit]`
+                // lines are sequence-numbered so the assertion can be falsified from the log itself
+                // (`awk '/\[serwit\]/' target/serial.log | wc -l` == cores x burst) — a counter that
+                // only ever agreed with itself would prove nothing.
+                serwit1_run(&online);
             } else {
                 serial_println!(":: U1a: no application processors online — ring-3 demo SKIPPED ::");
             }
@@ -3365,8 +3377,47 @@ fn usb_pump(_: usize) {
     }
 }
 
+// ── SERWIT-1 ────────────────────────────────────────────────────────────────────────────────────
+// Drive the serial-transport stress fixture: one kernel worker per online AP, all parked on a gate so
+// their bursts overlap instead of trickling one core at a time (a trickle would never contend, and a
+// fixture that cannot reproduce the defect it guards is decoration). The BSP is not scheduled, so it
+// waits the same bounded-on-`ticks()` way `await_verdict` does rather than joining, then prints the
+// verdict itself. Bounded on both ends: the wait gives up on the ms-clock, and the verdict prints the
+// real numbers either way — a timeout shows up as a short `sent` count and reads FAIL, never as
+// silence, which would be an ironic way for this particular fixture to fail.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+fn serwit1_run(online: &[usize]) {
+    let workers = unaos_kernel::serial_ring::serwit_worker_count(online.len());
+    let (b_sub, b_emit, b_drop) = unaos_kernel::serial_ring::serwit_snapshot();
+    for (i, &cpu) in online.iter().take(workers).enumerate() {
+        let _ = i;
+        unaos_kernel::arch::sched::spawn("serwit-burst", serwit_entry, cpu, cpu, 1);
+    }
+    unaos_kernel::serial_ring::serwit_release();
+    let deadline = unaos_kernel::arch::ticks() + 4000; // ~4 s at the calibrated 1 kHz
+    while !unaos_kernel::serial_ring::serwit_all_done(workers)
+        && unaos_kernel::arch::ticks() < deadline
+    {
+        core::hint::spin_loop();
+    }
+    unaos_kernel::serial_ring::serwit_verdict(workers, b_sub, b_emit, b_drop);
+}
+
+/// `spawn` entry thunk: the scheduler hands the task its `arg`, which here is the core index the
+/// worker stamps into every line it prints.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+fn serwit_entry(cpu: usize) {
+    unaos_kernel::serial_ring::serwit_worker(cpu);
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // SERWIT-1: switch the serial transport to its raw, lock-free, synchronous mode BEFORE the first
+    // print below. From here on `_print` does not touch the UART Mutex at all — which is what makes
+    // these two lines reach the wire even when this very core died holding it (the old shape lost the
+    // `try_lock` to itself and dropped the whole panic message: red screen, no words). It also flushes
+    // anything other cores had staged just before the fault. Takes no lock, so it cannot deadlock.
+    unaos_kernel::serial_ring::enter_panic_mode();
     // Paint a red panic backdrop on the framebuffer (visible on hardware with no serial), then
     // print the message — serial_println! mirrors it onto that backdrop via fbcon.
     unaos_kernel::video::fbcon::panic_screen();

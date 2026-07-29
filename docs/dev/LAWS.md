@@ -23,6 +23,15 @@ laws minted at the bench and at the seat. Each entry names its origin date.
   sequence theories outrank hardware-, firmware-, and environment-blame
   theories by default. Bench cross-checks are proposed neutrally as
   discriminators, without a stated lean toward the hardware branch.
+- **The wire may not lose lines** (2026-07-29). Serial output is the evidence
+  every gate is counted from, so the transport is held to a stricter standard
+  than what it reports on: a line that cannot be written is DEFERRED, and a
+  line that is genuinely lost is COUNTED and announced on the wire
+  (`[serial] dropped N lines`). Silent loss is forbidden — a missing `PASS`
+  must never be indistinguishable from a fixture that never ran, and a
+  regression's `FAIL` must never be able to evaporate. Enforced every run by
+  the SERWIT-1 fixture; see
+  [`docs/dev/OS/02_KERNEL_CORE/serial_transport.md`](OS/02_KERNEL_CORE/serial_transport.md).
 - **Default-quiet boot** (2026-07-18). Confirmed test families are not
   re-run on default boots; batteries live behind knobs (QEMU gates arm
   them). Gate, never delete.

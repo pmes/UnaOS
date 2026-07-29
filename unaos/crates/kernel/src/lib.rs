@@ -111,6 +111,11 @@ pub mod gui_watchdog;
 // call sites in `video/wm.rs` and the focus seam stay `#[cfg]`-free and arch-neutral — which is what
 // makes this diff inheritable by the x86 tree. Knob-off is byte-inert.
 pub mod wedge2;
+// SERWIT-1: the serial staging ring — the arch-neutral half of "no line leaves the wire unaccounted
+// for". Declared unconditionally (both arches' `_print` go through it and the panic escape hatch is
+// not knob-gated); costs ~16 KiB of `.bss` and introduces no lock. See the module docs for the
+// deadlock analysis that keeps the panic and WEDGE-2/WEDGE-4 breadcrumb paths unblockable.
+pub mod serial_ring;
 
 pub fn init() {
     arch::init();
