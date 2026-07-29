@@ -194,6 +194,20 @@ const SYS_ACCEPT: u64 = 48;
 pub const USER_BASE: u64 = 0x0000_0100_0000_0000;
 /// Window size in 4 KiB pages: code, data, and two stack pages.
 const USER_WINDOW_PAGES: u64 = 4;
+
+/// WINX-2: the ring-3 window base, for the ELF loader (which lives in a sibling module and must not
+/// duplicate the constant). The aarch64 twin reads the same pair from `boot::user_region()`.
+pub fn user_base() -> u64 {
+    USER_BASE
+}
+
+/// WINX-2: the ring-3 PROGRAM window size in bytes — the bound `validate_elf` fits every segment span
+/// into, and the top of which is the initial ring-3 RSP. Deliberately the PROGRAM window only: the FB
+/// region above it is mapped by `SYS_WIN_CREATE`, never by the loader, so an image can never place a
+/// segment over a window surface.
+pub fn user_window_size() -> usize {
+    (USER_WINDOW_PAGES * PAGE_SIZE) as usize
+}
 const PAGE_SIZE: u64 = 0x1000;
 
 // MSR numbers used raw (the ones the x86_64 typed API doesn't cover cleanly here).

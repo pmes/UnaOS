@@ -317,7 +317,7 @@ pub unsafe fn map_user_page(va: u64, phys: u64, writable: bool, nx: bool) {
 pub const USER_SLOTS: usize = 8;
 /// Pages in a user window: code, data, and two stack pages. MUST match `syscall::USER_WINDOW_PAGES`.
 const U3_WINDOW_PAGES: usize = 4;
-const PAGE_4K: u64 = 0x1000;
+pub const PAGE_4K: u64 = 0x1000;
 
 /// A 4 KiB-aligned page-table (512 × u64). In `.bss` (identity-mapped), so its address IS its
 /// physical address — usable directly as a CR3 / next-level pointer.
@@ -457,6 +457,56 @@ pub fn slot_cr3(s: usize) -> u64 {
 // and a re-create of region slot 0 must be able to re-install the same leaves. Writing `SLOT_PT[s]`
 // through its identity pointer is the same thing `build_slot` does, and reaches any slot from any
 // context.
+
+/// WINX-2: apply ring-3 page permissions to `[off, off + len)` of slot `s`'s PROGRAM window — the ELF
+/// loader's per-segment W^X application. Every page the range touches (partial pages included: a page is
+/// the permission granularity, so a segment that ends mid-page still owns that whole page) is rewritten
+/// to `PRESENT | USER`, plus `WRITABLE` iff `writable` and `NX` iff `!exec`.
+///
+/// The leaves already exist — `build_slot` mapped all four program pages with its default shape (page 0
+/// RX-RO, pages 1..N RW+NX) — so this is a permission CHANGE on live entries, not a fresh mapping. x86
+/// permits that directly followed by `invlpg`; there is no break-before-make requirement (the aarch64
+/// twin's `protect_user_slot_code_range` must BBM, which is the only structural difference).
+///
+/// W^X is the CALLER's invariant to preserve, and it does: `validate_elf` rejects any segment that is
+/// both writable and executable before this is ever reached, so no call can produce a W+X page. The
+/// assertion here is a second, local line of defence rather than the primary one.
+///
+/// Panics if the range escapes the program window — a segment that large is rejected by `validate_elf`
+/// (`segment overflows the slot window`), so reaching here with one is a kernel bug, not bad input.
+pub unsafe fn protect_user_slot_range(
+    s: usize,
+    off: usize,
+    len: usize,
+    writable: bool,
+    exec: bool,
+) {
+    assert!(s < USER_SLOTS, "protect_user_slot_range: slot out of range");
+    assert!(!(writable && exec), "protect_user_slot_range: W^X violation");
+    let win = U3_WINDOW_PAGES * 4096;
+    let end = off.checked_add(len).expect("protect_user_slot_range: range overflow");
+    assert!(end <= win, "protect_user_slot_range: range escapes the program window");
+    if len == 0 {
+        return;
+    }
+    let first = off / 4096;
+    let last = (end - 1) / 4096;
+    let mut flags = PTE_PRESENT | PTE_USER;
+    if writable {
+        flags |= PTE_WRITABLE;
+    }
+    if !exec {
+        flags |= PTE_NX;
+    }
+    for p in first..=last {
+        let va = super::syscall::USER_BASE + (p as u64) * PAGE_4K;
+        let frame = slot_backing_ptr(s) as u64 + (p as u64) * PAGE_4K;
+        unsafe {
+            *slot_pt_ptr(s).add(pt_index(va)) = (frame & PTE_ADDR) | flags;
+            invlpg(va);
+        }
+    }
+}
 
 /// WINX-1: kernel identity pointer to slot `s`'s RO info page.
 pub fn slot_fb_info_ptr(s: usize) -> *mut u8 {

@@ -11,6 +11,8 @@ pub mod sched;
 pub mod syscall;
 pub mod pci;
 pub mod memory;
+/// WINX-2: the x86_64 EL0 ELF64 loader (validation + `PT_LOAD` mapping with per-segment W^X).
+pub mod elf;
 
 pub fn init() {
     gdt::init();
