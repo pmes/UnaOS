@@ -1247,7 +1247,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // late). Apply every pending event to the back buffer here; `render()` coalesces them.
         let mut had_event = false;
         loop {
-            match pal.poll_event() {
+            // WINX-7 — offer each event to the focused EL0 app's input ring before the shell sees it.
+            // `el0_input_route` returns the event UNCHANGED when no app took it, and `Unknown` (never
+            // `None`) when a ring consumed it: `None` is this loop's end-of-queue sentinel, so
+            // returning it for a routed keystroke would truncate the drain at the first one.
+            //
+            // This GUI loop is shared, but the router is x86-only — aarch64 routes EL0 input from its
+            // own path in `arch/aarch64` and has no `arch::x86_64` module to name, so the call is
+            // split rather than gated inside the callee.
+            #[cfg(target_arch = "x86_64")]
+            let ev = unaos_kernel::arch::x86_64::syscall::el0_input_route(pal.poll_event());
+            #[cfg(not(target_arch = "x86_64"))]
+            let ev = pal.poll_event();
+            match ev {
                 unaos_kernel::pal::Event::None => break,
                 unaos_kernel::pal::Event::Key(c) => {
                     had_event = true;
