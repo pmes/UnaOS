@@ -55,6 +55,45 @@ pub const PRIO_NORMAL: u8 = 1;
 pub const PRIO_HIGH: u8 = 2;
 pub const PRIO_RT: u8 = 3;
 
+/// SCHED-PRIO — the INTERACTIVE SERVICE BAND: the level the panel's own latency-critical tasks run
+/// at, one step above the `PRIO_NORMAL` every EL0 program (and every ordinary kernel worker) lands
+/// at. An alias for [`PRIO_HIGH`], named for its meaning so the spawn sites read as policy rather
+/// than as a magic number, and so this band and the storage service (`irqstorage`, already
+/// `PRIO_HIGH`) can be told apart in the source even though they share a level today.
+///
+/// ### What the band is for (P73/P75)
+/// The compositor pass owner (`main.rs::render_service` — `Screen::flush` → `wm::service_damage`,
+/// plus the cursor bracket), the input router (`input_service`) and the HID report pump (`usb_pump`)
+/// were ORDINARY `PRIO_NORMAL` tasks, i.e. exact round-robin peers of six EL0 vug render fleets.
+/// Under fleet load the triage measured composites collapsing 0.99→0.43/s and WM-lock erase defers
+/// going 29%→76%: the panel's own service work was queued behind every vug that happened to be ready.
+/// The band makes those three win a contested dispatch.
+///
+/// ### Why this is not real time, and cannot starve EL0
+///   * The band is ONE level up, not the top; nothing here is `PRIO_RT`.
+///   * The anti-starvation sweep is untouched. An EL0 task that waits `AGE_TICKS` dispatch passes is
+///     RELOCATED into this very band and then shares it round-robin, so the worst case for a vug is
+///     bounded exactly as before — the band buys ordering, not exclusion. `[prio] agedin=` counts
+///     precisely those promotions, so the escape valve is visible rather than assumed.
+///   * All three tasks BLOCK for a living (`GUI_CHANNEL.recv`, `RX_READY.wait`, `sleep_ticks`). None
+///     of them can hold a core: they are off the run queue entirely whenever there is no work, which
+///     is what makes "highest ready level" cheap to grant.
+///   * The EL0 task a wake preempts loses at most the REMAINDER of its quantum, never a whole one —
+///     see `preempt_hint`, which trims to one tick rather than switching anything out by force.
+///
+/// ### Priority inversion
+/// The band's paths take three locks, and none of them can invert unboundedly:
+///   * `wm::STAGE` and `cursor::OVERLAY` are taken with `try_lock` on every path a service task
+///     reaches (`stage_window`, `stage_rows`, `compose_into`, the `DEFER` drain probe) — a service
+///     task never waits on a lock an EL0 present holds; it declines and falls back.
+///   * `wm::TABLE` is a blocking `lock()`, but every holder takes NO further scheduler-visible lock
+///     while holding it (the compositor snapshots rows and releases before any framebuffer write),
+///     so a hold is a bounded straight-line section, and an EL0 holder that is descheduled mid-hold
+///     is aged into this same band within `AGE_TICKS` and runs it out.
+///   * `RqGuard` sections are IRQ-masked and O(ready tasks) at worst, so no run-queue section is
+///     ever preemptible at all.
+pub const PRIO_SERVICE: u8 = PRIO_HIGH;
+
 /// AARCH64-PRIO — anti-starvation aging. A ready task that has WAITED in a run queue this many aging
 /// units without being dispatched is RELOCATED one effective level UP (its BASE `priority` is
 /// unchanged); repeated, a low task under continuous higher-priority load climbs to parity, runs, then
@@ -256,6 +295,43 @@ static SCHED: [SchedCpu; NUM_CPUS] = [const { SchedCpu::new() }; NUM_CPUS];
 /// any scheduling path. This is the SEAM a real per-core utilization feed would replace.
 static CPU_BUSY: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
 static CPU_IDLE: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+
+/// SCHED-PRIO — the BASE priority of the task currently dispatched on each core, or [`PRIO_NONE`]
+/// when the core is in its scheduler/idle context (or has never run the loop). Published by
+/// `dispatch_next` around the switch, and the ONLY cross-core-readable fact about a running task
+/// this module exposes: `SCHED[cpu].current` is a raw `*mut Task` whose Box the owning core may
+/// reclaim at any moment, so it may never be dereferenced from another core. One relaxed byte can.
+///
+/// Read by [`preempt_hint`]; never read on the switch path itself.
+static CUR_PRIO: [AtomicU8; NUM_CPUS] = [const { AtomicU8::new(PRIO_NONE) }; NUM_CPUS];
+
+/// SCHED-PRIO — "no task running here". `u8::MAX` outranks every real level, so an idle core is
+/// never a preemption candidate: the poke/reschedule SGI already wakes it, and there is nothing to
+/// take the CPU away from.
+const PRIO_NONE: u8 = u8::MAX;
+
+/// SCHED-PRIO — the `[prio]` witness counters. All monotonic, relaxed, per core; read only by
+/// `prio_witness`, which reports per-window DELTAS against its own last snapshot.
+///
+///   * `PRIO_SVC_DISPATCH` — dispatches whose task's BASE priority is at or above `PRIO_SERVICE`
+///     (an aged-up EL0 task counts as EL0, which is the honest reading: the band did not win that
+///     dispatch, the anti-starvation sweep did).
+///   * `PRIO_EL0_DISPATCH` — dispatches of an EL0/user task (`user_entry != 0`), the population the
+///     band is being ranked against.
+///   * `PRIO_DEFER` — service-band wakes that landed on a core running a LOWER-band task, i.e. the
+///     times the compositor/router was ready but had to wait out (a trimmed remainder of) somebody
+///     else's quantum. This is the residual latency the band does NOT remove, kept visible on
+///     purpose — a `defer` that stays small beside a large `svc` is the band working.
+///   * `PRIO_AGED_IN` — `RunQueue::age` relocations that lifted a below-band task INTO the band.
+static PRIO_SVC_DISPATCH: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+static PRIO_EL0_DISPATCH: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+static PRIO_DEFER: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+static PRIO_AGED_IN: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+/// Last-window snapshots, so `[prio]` can print per-window deltas beside the running totals.
+static PRIO_LAST_SVC: AtomicU64 = AtomicU64::new(0);
+static PRIO_LAST_EL0: AtomicU64 = AtomicU64::new(0);
+static PRIO_LAST_DEFER: AtomicU64 = AtomicU64::new(0);
+static PRIO_LAST_AGED: AtomicU64 = AtomicU64::new(0);
 
 /// SCHED-7 — the CNTPCT busy span `dispatch_next` folded into the load window on the CURRENT pass
 /// (0 when the run queue was empty). `run()` reads+clears it after every pass and folds the REST of
@@ -764,7 +840,14 @@ impl RunQueue {
     /// raw `VecDeque` move that leaves `priority` (base) untouched — NOT `push`. A `push_back` into
     /// `level + 1` may reallocate under the run-queue lock; that is benign here exactly as at `spawn`
     /// (the heap lock is always innermost — run-queue → heap is the only ordering, never inverted).
-    fn age(&mut self, elapsed: u32) {
+    ///
+    /// SCHED-PRIO — returns how many of this sweep's relocations landed a task INTO the interactive
+    /// service band (from below `PRIO_SERVICE` to at or above it). That number is the fairness escape
+    /// valve made countable: it is exactly how often a below-band task (an EL0 vug) had waited long
+    /// enough to be lifted to parity with the compositor, and `[prio] agedin=` reports it. Counting
+    /// here costs one comparison on a path that is already O(ready tasks) and off the switch.
+    fn age(&mut self, elapsed: u32) -> u32 {
+        let mut into_band = 0u32;
         for level in (0..NUM_PRIORITIES - 1).rev() {
             let n = self.levels[level].len();
             for _ in 0..n {
@@ -773,12 +856,16 @@ impl RunQueue {
                 if task.wait_ticks >= AGE_TICKS {
                     task.wait_ticks -= AGE_TICKS; // carry surplus credit, don't discard it
                     debug_assert!(level + 1 < NUM_PRIORITIES, "age: promotion above top level");
+                    if level + 1 >= PRIO_SERVICE as usize && level < PRIO_SERVICE as usize {
+                        into_band += 1;
+                    }
                     self.levels[level + 1].push_back(task); // RELOCATE up one level (base unchanged)
                 } else {
                     self.levels[level].push_back(task);
                 }
             }
         }
+        into_band
     }
 }
 
@@ -1920,6 +2007,42 @@ fn poke_cpu(target: usize) {
     }
 }
 
+/// SCHED-PRIO — shorten the running task's quantum on `target` when a HIGHER-band task has just been
+/// made ready there, so the band's ordering preference actually turns into latency.
+///
+/// ### Why a hint and not a switch
+/// Strict priority is applied at the DISPATCH BOUNDARY (`pop_highest`), which means a woken service
+/// task waits for the running task to reach one: a yield, a block, or quantum expiry. With
+/// `QUANTUM_TICKS = 3` at ~4 ms/tick, an EL0 vug that never yields (they spin) can hold the core for
+/// up to ~12 ms past the wake — per wake, on the cursor's path. Trimming the countdown to ONE tick
+/// caps that at ~4 ms without any cross-core register surgery, without an extra IPI, and without
+/// touching the switch path.
+///
+/// ### Why it is safe
+///   * It only ever LOWERS a countdown, and never below 1 — the interrupted task always gets at least
+///     one more tick, so there is no way to livelock a task out of making progress, and no way to
+///     preempt one that is mid-anything: `timer_preempt` is the sole consumer and it already runs
+///     only at a legitimate boundary (post-EOI, with the run-queue guard's `IN_RQ_SECTION` tripwire
+///     watching for a section breach).
+///   * The two atomics are a cross-core relaxed load (`CUR_PRIO`) and a cross-core relaxed store
+///     (`quantum`), both racy by construction and both benign: the worst outcome of losing the race
+///     with the owning core's own `quantum.store(QUANTUM_TICKS)` is that this wake does not get its
+///     trim and the service task waits the ordinary quantum — exactly the pre-arc behaviour.
+///   * `CUR_PRIO` is the ONLY thing read cross-core. `SCHED[target].current` is deliberately not
+///     touched: it is a raw pointer to a Box the owning core can free at any instant.
+///   * On QEMU raspi4b there is no live timer IRQ, so there is no quantum countdown and this is inert
+///     — the gate exercises the counter, and the trim itself is a metal-only effect (as with every
+///     other preemption behaviour in this module).
+fn preempt_hint(target: usize, prio: u8) {
+    if prio < PRIO_SERVICE {
+        return; // only the service band and above ask for this
+    }
+    if prio > CUR_PRIO[target].load(Ordering::Relaxed) {
+        SCHED[target].quantum.store(1, Ordering::Relaxed);
+        PRIO_DEFER[target].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Mark a parked/just-woken task READY, push it onto a run queue, and poke that CPU. Used by the
 /// sleeper drain (same CPU) and, from M4b, `Semaphore::post` (cross-CPU wake). Caller runs with IRQ
 /// masked.
@@ -1999,8 +2122,15 @@ fn make_ready(mut task: Box<Task>) {
     }
     debug_assert!(target < NUM_CPUS, "make_ready: cpu out of range");
     task.state.store(STATE_READY, Ordering::Release);
+    // SCHED-PRIO: read the base priority BEFORE the Box is moved into the queue (after the push it
+    // belongs to whichever core dispatches it next and must not be touched from here).
+    let prio = task.priority;
     rq(target).push(task);
     poke_cpu(target);
+    // SCHED-PRIO: the wake path is where interactive latency is actually decided — `GUI_CHANNEL.recv`
+    // (compositor), `RX_READY.wait` (input router) and `sleep_ticks` (HID pump) all come back through
+    // here. Called AFTER the push and the poke so the task is already queued when the target looks.
+    preempt_hint(target, prio);
 }
 
 /// Cooperatively give up the CPU: mark this task ready and switch back to the scheduler, which
@@ -2670,7 +2800,13 @@ fn dispatch_next(cpu: usize) -> bool {
         let passes = SCHED[cpu].age_passes.fetch_add(1, Ordering::Relaxed) + 1;
         let elapsed = passes - SCHED[cpu].age_last_sweep.load(Ordering::Relaxed);
         if elapsed >= AGING_INTERVAL {
-            q.age(elapsed.min(u32::MAX as u64) as u32);
+            // SCHED-PRIO: the sweep now reports how many relocations reached the interactive service
+            // band. Folded into the witness counter here (still under the run-queue lock, one relaxed
+            // add on a path that already took the lock) rather than inside `age`, which has no `cpu`.
+            let into_band = q.age(elapsed.min(u32::MAX as u64) as u32);
+            if into_band != 0 {
+                PRIO_AGED_IN[cpu].fetch_add(into_band as u64, Ordering::Relaxed);
+            }
             SCHED[cpu].age_last_sweep.store(passes, Ordering::Relaxed);
         }
         q.pop_highest() // highest-priority ready task; lock dropped here
@@ -2698,6 +2834,17 @@ fn dispatch_next(cpu: usize) -> bool {
     // (below), when the elapsed CNTPCT span is known. Single-writer (this core), relaxed; no lock added.
     ACCT[cpu].ctx_switches.fetch_add(1, Ordering::Relaxed);
     ACCT[cpu].note_last(task.id, task.name);
+    // SCHED-PRIO — the dispatch-share witness, and the running-priority publication that makes
+    // `preempt_hint` possible. BASE priority is what is counted and published: a task the aging sweep
+    // lifted is a below-band task that the ANTI-STARVATION path is running, not a band win, and it
+    // must not be able to shield itself from a real service wake by wearing the band's number.
+    if task.priority >= PRIO_SERVICE {
+        PRIO_SVC_DISPATCH[cpu].fetch_add(1, Ordering::Relaxed);
+    }
+    if task.user_entry != 0 {
+        PRIO_EL0_DISPATCH[cpu].fetch_add(1, Ordering::Relaxed);
+    }
+    CUR_PRIO[cpu].store(task.priority, Ordering::Relaxed);
     task.state.store(STATE_RUNNING, Ordering::Release);
     SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed);
     let raw = Box::into_raw(task);
@@ -2750,6 +2897,9 @@ fn dispatch_next(cpu: usize) -> bool {
     // SCHED-7: publish this pass's busy span so `run()` can subtract it from the pass's total wall
     // span and fold the remainder (scheduler overhead, then the WFI/poll-spin) in as idle.
     PASS_BUSY_CYC[cpu].store(busy_cyc, Ordering::Relaxed);
+    // SCHED-PRIO: back on the scheduler stack — nothing is running here, so nothing is preemptible.
+    // Published alongside the `current` clear it mirrors, and for the same reason.
+    CUR_PRIO[cpu].store(PRIO_NONE, Ordering::Relaxed);
     SCHED[cpu].current.store(0, Ordering::Release);
     // Consume the park action exactly once: read it and immediately reset to NONE, so a stale action
     // can never leak into the next task's switch-back. Only a task that switched back BLOCKED carries
@@ -4701,6 +4851,7 @@ fn load_witness_tick() {
     );
     pulse5_witness();
     spread4_witness(); // SPREAD-4: the placement signal beside the load it is derived from
+    prio_witness(); // SCHED-PRIO: who WON those dispatches, beside where they were placed
 }
 
 /// PULSE-5 — the proof line for age-on-read. It says three things and nothing else: how long each
@@ -4729,6 +4880,57 @@ fn pulse5_witness() {
         cyc_to_ms(PULSE5_SPAN_MAX_CYC.load(Ordering::Relaxed)),
         cyc_to_ms(load_window_cyc()),
         PULSE5_FOLD_WINDOWS.load(Ordering::Relaxed),
+    );
+}
+
+/// SCHED-PRIO — the proof line for the interactive service band, in the `[pulse5]`/`[spread4]` mould
+/// and emitted from the same two sites, so the dispatch share reads beside the load it explains.
+///
+/// It says four things, all as PER-WINDOW deltas (the running totals follow, so a single line is
+/// still interpretable if the previous one was suppressed):
+///
+///   * `svc` — dispatches won by a task whose BASE priority is in the band. On a busy panel this is
+///     the compositor + router + HID pump getting the core the moment they are ready.
+///   * `el0` — dispatches of EL0/user tasks over the same window. `svc` and `el0` are not a partition
+///     (ordinary `PRIO_NORMAL` kernel workers are in neither); they are the two populations the arc
+///     is about, and their RATIO is the reading. The band is working when `svc` is a small, steady
+///     share and `el0` stays LARGE — a collapsing `el0` would mean the fleet is being starved, which
+///     is the failure this arc must not cause.
+///   * `defer` — service-band wakes that found a lower-band task running on the target core, i.e. the
+///     residual "the compositor was ready and still had to wait" (bounded to one tick by
+///     `preempt_hint`). Large `defer` beside large `svc` is contention being resolved; large `defer`
+///     with `svc` near zero would mean the band is not being granted and something is wrong.
+///   * `agedin` — anti-starvation relocations that lifted a below-band task INTO the band. This is
+///     the fairness valve; a nonzero figure under load is the proof that EL0 cannot be excluded.
+///
+/// Reads only, lock-free, safe from any core, no `pi` gate (matching its two neighbours): the
+/// counters exist on every aarch64 build and simply stay zero where there is no EL0 and no panel.
+///
+/// THREE callers, and the third is why this is `pub`. `load_witness_tick` and
+/// `load_accounting_witness` are the two `[pulse5]`/`[spread4]` sites; the first is metal-only
+/// (`timer_preempt` never runs on raspi4b) and the second fires exactly ONCE, early, before the panel
+/// tasks are spawned at all — so between them nothing would ever print this line at the moment it is
+/// about: a live compositor contending with a live fleet. The third caller is the render task's own
+/// rate-limited `[sched6]` block (`main.rs::render_service`), which ticks on both QEMU and metal for
+/// as long as the panel is up, and which reports the composites/s figure this line explains.
+pub fn prio_witness() {
+    let mut svc = 0u64;
+    let mut el0 = 0u64;
+    let mut defer = 0u64;
+    let mut aged = 0u64;
+    for cpu in 0..NUM_CPUS {
+        svc += PRIO_SVC_DISPATCH[cpu].load(Ordering::Relaxed);
+        el0 += PRIO_EL0_DISPATCH[cpu].load(Ordering::Relaxed);
+        defer += PRIO_DEFER[cpu].load(Ordering::Relaxed);
+        aged += PRIO_AGED_IN[cpu].load(Ordering::Relaxed);
+    }
+    let d_svc = svc.saturating_sub(PRIO_LAST_SVC.swap(svc, Ordering::Relaxed));
+    let d_el0 = el0.saturating_sub(PRIO_LAST_EL0.swap(el0, Ordering::Relaxed));
+    let d_defer = defer.saturating_sub(PRIO_LAST_DEFER.swap(defer, Ordering::Relaxed));
+    let d_aged = aged.saturating_sub(PRIO_LAST_AGED.swap(aged, Ordering::Relaxed));
+    serial_println!(
+        "[prio] svc={} el0={} defer={} agedin={} /win (band>={}, totals svc={} el0={})",
+        d_svc, d_el0, d_defer, d_aged, PRIO_SERVICE, svc, el0,
     );
 }
 
@@ -4830,6 +5032,11 @@ pub fn load_accounting_witness() {
     // so it reads all-zero — which is the honest baseline, and it proves the counters are wired and
     // the line is emitted. The numbers that matter are the ones `load_witness_tick` prints on metal.
     spread4_witness();
+    // SCHED-PRIO: same reasoning again. `timer_preempt` never runs on raspi4b, so `load_witness_tick`
+    // is unreachable there and this is the ONLY site that emits `[prio]` in the QEMU battery. The
+    // dispatch counters are live on that path (the cooperative loop dispatches through the same
+    // `dispatch_next`), so the line carries real numbers, not a wired-and-zero placeholder.
+    prio_witness();
 }
 
 /// M3b/M4a/M4-capstone: turn on preemptive scheduling and put a workload on the APs, then flip

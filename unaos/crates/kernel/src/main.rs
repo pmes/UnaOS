@@ -1009,10 +1009,48 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 // PIUSB-26: the xHCI event pump on its own ~4 ms cadence (see `usb_pump`). Co-located
                 // on the input core; timer-gated like the neighbours (its `sleep_ticks` nap needs the
                 // live timer IRQ). In QEMU raspi4b (not spawned) the input task's poll-nap still pumps.
-                unaos_kernel::arch::sched::spawn("usb-pump", usb_pump, 0, input_cpu);
+                // SCHED-PRIO: the HID-report path runs in the interactive SERVICE band. Its passes are
+                // micro (see `[piusb26]` — a `poll_events` on an empty ring), it naps between them,
+                // and it is the whole latency budget of a moving mouse: a pump pass that queues behind
+                // a spinning vug is a pointer report that arrives late, which is the P73 symptom.
+                unaos_kernel::arch::sched::spawn_prio(
+                    "usb-pump",
+                    usb_pump,
+                    0,
+                    input_cpu,
+                    unaos_kernel::arch::sched::PRIO_SERVICE,
+                );
             }
-            unaos_kernel::arch::sched::spawn("input", input_service, 0, input_cpu);
-            unaos_kernel::arch::sched::spawn("render", render_service, 0, render_cpu);
+            // SCHED-PRIO — the two panel service tasks join the band (see `sched::PRIO_SERVICE` for
+            // the policy, the non-starvation argument and the lock/inversion accounting).
+            //
+            //   * `input`  — the input ROUTER: drains the UART/HID source and posts into GUI_CHANNEL.
+            //     Everything downstream of a keystroke or a pointer report is gated on this task
+            //     getting the core.
+            //   * `render` — the COMPOSITOR PASS OWNER: `Screen::flush` → `wm::service_damage`, the
+            //     cursor bracket, and the deferred-erase queue's liveness guarantee. The triage
+            //     measured its composites collapsing 0.99→0.43/s under a six-vug fleet and its
+            //     WM-lock erase defers going 29%→76%; it was a round-robin peer of every one of those
+            //     fleets, on a core they are also placed on.
+            //
+            // `rx-backstop`, `status-tick` and `orphan-reaper` deliberately STAY at PRIO_NORMAL: the
+            // first two are coarse periodic pokes with no latency requirement (a late 4 Hz strip
+            // sample is invisible), and the reaper is background block I/O. Elevating them would put
+            // the strip's `format!` + full-width band fill ahead of the fleet for no panel benefit.
+            unaos_kernel::arch::sched::spawn_prio(
+                "input",
+                input_service,
+                0,
+                input_cpu,
+                unaos_kernel::arch::sched::PRIO_SERVICE,
+            );
+            unaos_kernel::arch::sched::spawn_prio(
+                "render",
+                render_service,
+                0,
+                render_cpu,
+                unaos_kernel::arch::sched::PRIO_SERVICE,
+            );
             // U11-M2b: the deferred-free REAPER — a forever kernel service task that frees a cluster chain
             // orphaned when a program EXITS holding the last cross-process open of an unlinked file (teardown
             // is the last close, but block I/O is illegal there, so `clear_files_row` queues the chain head and
@@ -3322,6 +3360,11 @@ fn render_service(_: usize) {
                 mean_cyc,
                 unaos_kernel::ui_status::PSTRIP_PERIOD_MS
             );
+            // SCHED-PRIO: the dispatch-share line, emitted on `[sched6]`'s cadence and immediately
+            // after it, so a capture reads "composites=N/s" and "who won the dispatches that produced
+            // them" as one pair. This is the only site that fires while a fleet is actually live —
+            // the scheduler's own two emitters are metal-only and boot-once respectively.
+            unaos_kernel::arch::sched::prio_witness();
             s6_passes = 0;
             s6_composites = 0;
             s6_cyc = 0;
