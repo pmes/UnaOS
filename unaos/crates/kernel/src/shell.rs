@@ -3342,8 +3342,32 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // dies, so real windows never coexisted before this verb). `bg <path>`.
             match args.first() {
                 None => console.println("usage: bg <path>   (run an ELF64 EL0 program in the background)"),
-                Some(&path) => bg_program(console, path),
+                Some(&path) => {
+                    bg_program(console, path);
+                }
             }
+        },
+        #[cfg(feature = "baremetal")]
+        "storm" => {
+            // STORM-VERB (Peter, P77 sitting): launch a whole vug fleet in one command — `storm [n]`,
+            // default 6, so an operator can raise a load storm without typing `bg /fat/VUG.ELF` six
+            // times. Each launch is EXACTLY the bg path (same spawn, same job table, same messages);
+            // this verb is only the loop. Stops honestly at the first failure — a partial fleet is
+            // reported as such, never rounded up. The job table (8 slots) and PROCS-6's bg cap bound n.
+            let n = args
+                .first()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(6)
+                .clamp(1, 8);
+            let mut launched = 0usize;
+            for _ in 0..n {
+                if !bg_program(console, "/fat/VUG.ELF") {
+                    break;
+                }
+                launched += 1;
+            }
+            console.println(&alloc::format!("storm: launched {}/{} vugs", launched, n));
+            serial_println!(":: STORM: launched {}/{} vugs ::", launched, n);
         },
         #[cfg(feature = "baremetal")]
         "jobs" => {
@@ -3589,9 +3613,9 @@ static BG_JOBS: spin::Mutex<[Option<BgJob>; 8]> = spin::Mutex::new([None; 8]);
 /// BGRUN-1: `bg <path>` — read the image, spawn it detached, record the job. The shell prompt is
 /// back the moment this returns; the program (and its window, if it creates one) keeps running.
 #[cfg(feature = "baremetal")]
-fn bg_program(console: &mut Console, path: &str) {
+fn bg_program(console: &mut Console, path: &str) -> bool {
     let Some(bytes) = read_el0_image(console, "bg", path) else {
-        return;
+        return false;
     };
     let n = bytes.len();
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
@@ -3606,7 +3630,7 @@ fn bg_program(console: &mut Console, path: &str) {
                     "bg: {}: job table full — spawned pid {} was killed ({})",
                     path, pid, why
                 ));
-                return;
+                return false;
             };
             let mut name = [0u8; 32];
             let nlen = path.len().min(32);
@@ -3617,10 +3641,12 @@ fn bg_program(console: &mut Console, path: &str) {
                 ":: BGRUN: bg {} — loaded {} bytes, entry {:#x}, pid={} asid={} DETACHED ::",
                 path, n, entry, pid, asid
             );
+            true
         }
         Err(why) => {
             console.println(&alloc::format!("bg: {}: {}", path, why));
             serial_println!(":: BGRUN: bg {} — rejected ({}) ::", path, why);
+            false
         }
     }
 }
