@@ -519,6 +519,35 @@ pub fn keyboard_detach_gen() -> u64 {
 // mid-hold unplug is layer 2's. Layer 3 only ever covered the residue where a release report never reaches the
 // decode at all — and the backpressure guard independently prevents a stuck repeat from starving real input in
 // the meantime. The evidence gate is cleared on a keyboard detach, so a swapped device re-earns its own verdict.
+//
+// PAL-TYPEMATIC — CHAIN B CLOSED: THE LAPSE NOW RE-ARMS, AND THE VERDICT IS SCOPED TO ITS HOLD.
+//
+// KEYSTAT (audit arc, commit 3b5cd2e5) traced the surviving "key repeat times out" report to two predicates in
+// this file and specified the repair for whoever owned `pal.rs`. Both halves land here, verbatim to that spec.
+//
+//   1. THE LAPSE DID NOT RE-ARM. Every disarm above stores `KEY_P1 = 0`, and the ONLY writer that puts a key
+//      back is the PRESS-edge arm at the bottom of `typematic_note_report` (`newest_press != 0`). So a report
+//      that positively proves the key is STILL HELD — `held.contains(&k)`, the strongest evidence the tracker
+//      ever receives — could not restart the repeat: the operator had to lift and re-press. The liveness guard
+//      disarmed on SILENCE and then ignored the very evidence that refuted its own inference. Fixed: a lapse
+//      parks the key in `LAPSED_P1` instead of forgetting it, and the next report whose held set still contains
+//      it re-arms at `DELAY_MS` (a fresh initial delay, so a re-arm feels like the hold it is and cannot
+//      free-run). A report WITHOUT the key clears the parked slot — a real release ends the hold for good, and
+//      layers 1/2 keep their absolute authority: detach and release both clear `LAPSED_P1` outright, so this
+//      can never resurrect the P51 stuck-repeat wedge.
+//
+//   2. THE STREAMING VERDICT WAS BOOT-WIDE. `STREAMS_WHILE_HELD` latched on the first hold that produced
+//      `IDLE_RUN_TO_LATCH` idle re-reports and was STICKY until detach, so ONE streaming hold imposed the tight
+//      `LIVENESS_MS` window on EVERY later hold of that boot — including holds during which the device happens
+//      not to re-report at all, which then stopped after ~15 repeats, SILENTLY (the tight window's disarm is
+//      deliberately quiet, so it is indistinguishable at the bench from the ~10-repeat stop UVUG-9 exists to
+//      have removed). Fixed: the verdict is scoped to the hold that earned it. A report with an EMPTY held set
+//      is the end of the hold, and it clears the verdict and its evidence. The P51 protection is not weakened:
+//      a genuinely streaming keyboard re-earns the latch within `IDLE_RUN_TO_LATCH` report periods (tens of ms
+//      at any real polling interval), i.e. long before `DELAY_MS` has even elapsed and the first repeat is due.
+//
+// Witness (`[keystat]`): a re-arm names itself for the first few per hold, and every hold that produced repeats
+// closes with one rollup line — repeats, re-arms, and which window was in force. Bounded by human key holds.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 mod typematic {
     use core::sync::atomic::{AtomicU32, AtomicU64};
@@ -565,6 +594,28 @@ mod typematic {
     /// idle-re-reports produces them continuously for as long as the key is held. Four is comfortably above a
     /// tap (or a double-tap) and is reached within a few report periods of a genuine hold.
     pub(super) const IDLE_RUN_TO_LATCH: u32 = 4;
+
+    // --- PAL-TYPEMATIC: the re-arm slot and the hold accounting ---
+
+    /// PAL-TYPEMATIC — the key a LIVENESS/BACKSTOP lapse disarmed, +1 (0 = none parked). Not a second armed
+    /// slot: nothing repeats off it. It exists so the next report can be asked the one question the old code
+    /// never asked — "is that key STILL down?" — and re-arm if the answer is yes. Cleared by a report that
+    /// does not contain it (a real release), by a fresh press, and by a detach.
+    pub(super) static LAPSED_P1: AtomicU32 = AtomicU32::new(0);
+    /// PAL-TYPEMATIC — the key the CURRENT hold is about, +1, kept for the hold-end rollup line (the armed
+    /// slot is already 0 by the time the release report is being processed).
+    pub(super) static HOLD_KEY: AtomicU32 = AtomicU32::new(0);
+    /// PAL-TYPEMATIC — repeats emitted during the current hold (rollup, then reset at hold end).
+    pub(super) static HOLD_REPEATS: AtomicU32 = AtomicU32::new(0);
+    /// PAL-TYPEMATIC — lapse re-arms during the current hold (rollup, then reset at hold end). A non-zero
+    /// value is the bench-visible proof that chain B fired AND was recovered from, rather than ending the hold.
+    pub(super) static HOLD_REARMS: AtomicU32 = AtomicU32::new(0);
+    /// PAL-TYPEMATIC — boot totals, carried on every rollup so a single line answers "is repeat flowing at all".
+    pub(super) static BOOT_REPEATS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BOOT_REARMS: AtomicU64 = AtomicU64::new(0);
+    /// PAL-TYPEMATIC — how many re-arms name themselves per hold before the rollup takes over. A pathological
+    /// device could re-arm on every report; the serial line must not become the new backpressure.
+    pub(super) const REARM_LOG_MAX: u32 = 3;
 }
 
 /// UVUG-9 — pack a held-ascii set into one word for exact comparison against the previous report: bit 63 =
@@ -605,6 +656,21 @@ pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
         typematic::IDLE_RUN.store(0, Ordering::Relaxed);
         0
     };
+    // PAL-TYPEMATIC (2) — the HOLD ENDED. An empty held set is the unambiguous "nothing is down any more",
+    // and it is where the streaming verdict earned by THIS hold expires. Boot-wide stickiness is what let one
+    // streaming hold impose the 1 s window on every later hold of the boot; scoping it here means a keyboard
+    // that re-reports only sometimes gets the conservative backstop on the holds where it does not, instead of
+    // a silent stop after ~15 repeats. A device that really does stream re-earns the latch within
+    // `IDLE_RUN_TO_LATCH` report periods — well inside `DELAY_MS`, i.e. before the first repeat is even due —
+    // so the P51 wedge guard is armed by the time there is anything for it to guard.
+    if held.is_empty() {
+        // Rollup FIRST: its `window=` field reads `STREAMS_WHILE_HELD`, and it must report the window that was
+        // actually in force during the hold being closed, not the cleared one the next hold will start from.
+        typematic_hold_rollup();
+        typematic::STREAMS_WHILE_HELD.store(0, Ordering::Relaxed);
+        typematic::IDLE_RUN.store(0, Ordering::Relaxed);
+        typematic::LAPSED_P1.store(0, Ordering::Relaxed);
+    }
     let kp1 = typematic::KEY_P1.load(Ordering::Relaxed);
     if kp1 != 0 {
         let k = (kp1 - 1) as u8;
@@ -627,12 +693,83 @@ pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
             // unchanged-held reports — which is what `IDLE_RUN_TO_LATCH` is for.
             typematic::STREAMS_WHILE_HELD.store(1, Ordering::Relaxed);
         }
+    } else {
+        // PAL-TYPEMATIC (1) — THE RE-ARM. Nothing is armed, but a lapse may have parked a key here. This
+        // report carries the exact evidence the lapse's inference lacked: if the parked key is still in the
+        // held set, the keyboard was never wedged and the operator never let go, so the repeat resumes. If it
+        // is absent the hold is genuinely over and the slot is dropped — a release always wins, which is why
+        // this cannot reopen the P51 hole (an armed key whose release is missed is layer 1/2's problem, and
+        // both of those clear `LAPSED_P1` too).
+        let lapsed = typematic::LAPSED_P1.load(Ordering::Relaxed);
+        if lapsed != 0 {
+            let k = (lapsed - 1) as u8;
+            if held.contains(&k) {
+                typematic::KEY_P1.store(lapsed, Ordering::Relaxed);
+                // A fresh initial delay, not the repeat rate: the re-arm re-enters the hold at its start, so a
+                // device re-reporting faster than `DELAY_MS` can never turn re-arming into a free-running spew.
+                typematic::NEXT_MS.store(now.wrapping_add(typematic::DELAY_MS), Ordering::Relaxed);
+                let n = typematic::HOLD_REARMS.fetch_add(1, Ordering::Relaxed) + 1;
+                typematic::BOOT_REARMS.fetch_add(1, Ordering::Relaxed);
+                if n <= typematic::REARM_LOG_MAX {
+                    serial_println!(
+                        "[keystat] typematic re-arm — key={:#04x} still held after a liveness lapse; repeat resumed at delay={}ms (hold re-arms={} boot re-arms={})",
+                        k,
+                        typematic::DELAY_MS,
+                        n,
+                        typematic::BOOT_REARMS.load(Ordering::Relaxed)
+                    );
+                }
+            } else {
+                typematic::LAPSED_P1.store(0, Ordering::Relaxed);
+            }
+        }
     }
     // Arm the newest press (newest-wins typematic) and (re)start the initial delay.
     if newest_press != 0 {
         typematic::KEY_P1.store(newest_press as u32 + 1, Ordering::Relaxed);
         typematic::NEXT_MS.store(now.wrapping_add(typematic::DELAY_MS), Ordering::Relaxed);
+        // A press supersedes any parked lapse (newest-wins), and names the hold for the rollup.
+        typematic::LAPSED_P1.store(0, Ordering::Relaxed);
+        typematic::HOLD_KEY.store(newest_press as u32 + 1, Ordering::Relaxed);
     }
+}
+
+/// PAL-TYPEMATIC — close out a hold: if it produced anything, say so in one line, then reset the per-hold
+/// counters. Called on the report that ends the hold (empty held set) and on a detach, so a hold that ends by
+/// unplug is accounted exactly like one that ends by release. Silent for a hold that never repeated (a tap),
+/// which is the overwhelming majority of key presses.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn typematic_hold_rollup() {
+    use core::sync::atomic::Ordering;
+    let repeats = typematic::HOLD_REPEATS.swap(0, Ordering::Relaxed);
+    let rearms = typematic::HOLD_REARMS.swap(0, Ordering::Relaxed);
+    let key = typematic::HOLD_KEY.swap(0, Ordering::Relaxed);
+    if repeats == 0 && rearms == 0 {
+        return;
+    }
+    serial_println!(
+        "[keystat] typematic hold end — key={:#04x} repeats={} re-arms={} window={}ms (boot: repeats={} re-arms={})",
+        key.wrapping_sub(1) as u8,
+        repeats,
+        rearms,
+        if typematic::STREAMS_WHILE_HELD.load(Ordering::Relaxed) != 0 {
+            typematic::LIVENESS_MS
+        } else {
+            typematic::HOLD_MAX_MS
+        },
+        typematic::BOOT_REPEATS.load(Ordering::Relaxed),
+        typematic::BOOT_REARMS.load(Ordering::Relaxed)
+    );
+}
+
+/// PAL-TYPEMATIC — the ONE place a liveness/backstop lapse disarms a hold (`typematic_tick`'s layer-3 arm and
+/// the selftest's forced-lapse aid both go through it). Clears the armed slot and PARKS the key, so the next
+/// report that still contains it re-arms instead of the operator having to lift and re-press.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn typematic_lapse_disarm(k: u8) {
+    use core::sync::atomic::Ordering;
+    typematic::KEY_P1.store(0, Ordering::Relaxed);
+    typematic::LAPSED_P1.store(k as u32 + 1, Ordering::Relaxed);
 }
 
 /// UVUG-6 — if a held key's repeat is due, return its ascii and schedule the next one. Returns `None` when no
@@ -649,9 +786,13 @@ pub fn typematic_tick() -> Option<u8> {
         // may come from different hardware, which must earn its own verdict rather than inherit this one. The
         // evidence it was derived from goes with it, or a run straddling the detach could re-latch on a mix of
         // two keyboards' reports.
+        typematic_hold_rollup(); // before the verdict is cleared — see the same ordering in `note_report`
         typematic::STREAMS_WHILE_HELD.store(0, Ordering::Relaxed);
         typematic::PREV_HELD.store(0, Ordering::Relaxed);
         typematic::IDLE_RUN.store(0, Ordering::Relaxed);
+        // PAL-TYPEMATIC: a detach is layer 2 and it is ABSOLUTE — the parked lapse goes with the armed key, or
+        // the next keyboard's first report could re-arm a hold that belonged to hardware no longer present.
+        typematic::LAPSED_P1.store(0, Ordering::Relaxed);
         return None;
     }
     let kp1 = typematic::KEY_P1.load(Ordering::Relaxed);
@@ -669,14 +810,17 @@ pub fn typematic_tick() -> Option<u8> {
         typematic::HOLD_MAX_MS
     };
     if last != 0 && now.wrapping_sub(last) > window && now >= last {
-        typematic::KEY_P1.store(0, Ordering::Relaxed);
+        // PAL-TYPEMATIC: park the key rather than forget it. Either window may be wrong about a hold that is
+        // still physically in progress — that is the whole of chain B — and the cheapest possible refutation
+        // is the next report's held set. `typematic_note_report` performs it.
+        typematic_lapse_disarm((kp1 - 1) as u8);
         // UVUG-9: name the BACKSTOP when it is what fired. A repeat that simply stops is indistinguishable at
         // the bench from the bug this arc fixed, so the coarse 30 s bound must say so out loud — one line per
         // disarm, which is self-limiting at a minimum of `HOLD_MAX_MS` apart. The tight `LIVENESS_MS` disarm
         // stays silent: it is the ordinary, expected end of a hold on a streaming keyboard.
         if window == typematic::HOLD_MAX_MS {
             serial_println!(
-                "[uvug9] typematic hold-max — key held {}s without an idle re-report from this keyboard; repeat disarmed by the BACKSTOP, not by a release (re-press resumes)",
+                "[uvug9] typematic hold-max — key held {}s without an idle re-report from this keyboard; repeat disarmed by the BACKSTOP, not by a release (PAL-TYPEMATIC: the next report that still holds the key re-arms it)",
                 typematic::HOLD_MAX_MS / 1000
             );
         }
@@ -690,6 +834,13 @@ pub fn typematic_tick() -> Option<u8> {
     // `ms()` is monotonic; guard the wrap window so a rolled clock cannot spew repeats.
     if now.wrapping_sub(due) < (1u64 << 62) && now >= due {
         typematic::NEXT_MS.store(now.wrapping_add(typematic::RATE_MS), Ordering::Relaxed);
+        // PAL-TYPEMATIC witness: count every emission, per hold and for the boot. `[keystat] typematic hold
+        // end` reports both, so the bench can see repeats FLOWING rather than inferring it from the screen.
+        typematic::HOLD_REPEATS.fetch_add(1, Ordering::Relaxed);
+        typematic::BOOT_REPEATS.fetch_add(1, Ordering::Relaxed);
+        if typematic::HOLD_KEY.load(Ordering::Relaxed) == 0 {
+            typematic::HOLD_KEY.store(kp1, Ordering::Relaxed);
+        }
         return Some((kp1 - 1) as u8);
     }
     None
@@ -722,6 +873,32 @@ pub fn typematic_test_reset() {
     typematic::PREV_HELD.store(0, Ordering::Relaxed);
     typematic::IDLE_RUN.store(0, Ordering::Relaxed);
     typematic::LAST_REPORT_MS.store(0, Ordering::Relaxed);
+    // PAL-TYPEMATIC: the re-arm slot and the hold accounting are tracker state too — a leg that inherited a
+    // parked key from the previous leg would re-arm on a key it never pressed.
+    typematic::LAPSED_P1.store(0, Ordering::Relaxed);
+    typematic::HOLD_KEY.store(0, Ordering::Relaxed);
+    typematic::HOLD_REPEATS.store(0, Ordering::Relaxed);
+    typematic::HOLD_REARMS.store(0, Ordering::Relaxed);
+}
+
+/// PAL-TYPEMATIC test aid — the currently armed repeat key, if any. Lets the selftest assert the re-arm
+/// directly (state), not only through an emitted repeat (behaviour). Not used on any boot path.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn typematic_test_armed() -> Option<u8> {
+    let kp1 = typematic::KEY_P1.load(core::sync::atomic::Ordering::Relaxed);
+    (kp1 != 0).then(|| (kp1 - 1) as u8)
+}
+
+/// PAL-TYPEMATIC test aid — fire the LIVENESS LAPSE on whatever is armed, through the same
+/// `typematic_lapse_disarm` seam `typematic_tick`'s layer-3 arm uses. Driving the lapse by the CLOCK instead
+/// would mean stalling the selftest for a real `LIVENESS_MS`/`HOLD_MAX_MS`, or putting a test hook in the
+/// production window comparison — this touches neither. Not used on any boot path.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn typematic_test_force_lapse() {
+    let kp1 = typematic::KEY_P1.load(core::sync::atomic::Ordering::Relaxed);
+    if kp1 != 0 {
+        typematic_lapse_disarm((kp1 - 1) as u8);
+    }
 }
 
 /// UVUG-9 — the consecutive unchanged-held reports required to latch the streaming verdict, mirrored so the

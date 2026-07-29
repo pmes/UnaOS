@@ -2353,6 +2353,16 @@ fn input_router_selftest() {
 ///       which is what the `IDLE_RUN_TO_LATCH` run threshold buys.
 ///   (F) genuine idle re-reports — an unchanged held set repeated past the threshold. MUST latch, so the P51
 ///       wedge guard still arms on the hardware it was written for.
+/// PAL-TYPEMATIC adds the CHAIN B legs — the defect KEYSTAT traced and specified but could not fix in its lane
+/// (a liveness lapse never re-armed, and the streaming verdict was boot-wide, so a hold could stop dead with
+/// the key still down and nothing on the wire):
+///   (G) LAPSE THEN STILL-HELD — the lapse disarms, then a report whose held set still contains the key must
+///       RE-ARM it and repeat again, with no release and no re-press anywhere in the sequence.
+///   (H) LAPSE THEN RELEASED — the same lapse, but the next report's held set is empty. The release outranks
+///       the parked key absolutely: nothing re-arms and no repeat is ever produced. This is the leg that
+///       proves the re-arm did not reopen the P51 stuck-repeat hole it sits next to.
+///   (I) VERDICT SCOPED TO ITS HOLD — latch the streaming verdict legitimately, then end the hold; the verdict
+///       must be gone, so the NEXT hold is judged on its own evidence rather than inheriting this one's.
 /// Runs once on the BSP before any input/render service task, when EVENT_QUEUE is empty; drains what it pushes.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn typematic_selftest() {
@@ -2411,19 +2421,80 @@ fn typematic_selftest() {
     pal::typematic_test_reset();
     while pal::next_event().is_some() {}
 
-    if baseline && suppressed && !repeated && rollover_clean && nonascii_clean && idle_latches {
+    // --- PAL-TYPEMATIC: chain B. The lapse must RE-ARM on evidence, and the verdict must expire with its hold.
+    // (G) LAPSE THEN STILL-HELD: a liveness lapse disarms 'g', but the next report still carries 'g' in its
+    //     held set. That report is proof the lapse's inference was wrong, so the repeat must resume — WITHOUT
+    //     a release and re-press, which is exactly what KEYSTAT recorded as the missing behaviour.
+    pal::typematic_test_reset();
+    pal::typematic_note_report(b'g', &[b'g']);
+    pal::typematic_test_force_lapse();
+    let lapse_disarms = pal::typematic_test_armed().is_none();
+    pal::typematic_note_report(0, &[b'g']); // no press edge — only "still held"
+    let lapse_rearms = pal::typematic_test_armed() == Some(b'g');
+    pal::typematic_test_force_due();
+    let rearm_repeats = pal::typematic_tick() == Some(b'g');
+    while pal::next_event().is_some() {}
+
+    // (H) LAPSE THEN RELEASED: the same lapse, but the next report's held set is EMPTY. A release outranks the
+    //     parked key absolutely — nothing may re-arm, and no repeat may EVER be produced afterwards. This is
+    //     the leg that keeps the re-arm from reopening the P51 stuck-repeat hole.
+    pal::typematic_test_reset();
+    pal::typematic_note_report(b'h', &[b'h']);
+    pal::typematic_test_force_lapse();
+    pal::typematic_note_report(0, &[]); // released
+    let release_beats_lapse = pal::typematic_test_armed().is_none();
+    let mut ghost_repeat = false;
+    for _ in 0..64 {
+        pal::typematic_test_force_due();
+        if pal::typematic_tick().is_some() {
+            ghost_repeat = true;
+            break;
+        }
+    }
+    while pal::next_event().is_some() {}
+
+    // (I) VERDICT SCOPED TO ITS HOLD: latch the streaming verdict the legitimate way (leg F's shape), then end
+    //     the hold. The verdict must be GONE — boot-wide stickiness is the half of chain B that made a later
+    //     silent hold stop after ~15 repeats with nothing on the wire.
+    pal::typematic_test_reset();
+    pal::typematic_note_report(b'i', &[b'i']);
+    for _ in 0..(pal::TYPEMATIC_IDLE_RUN_TO_LATCH + 1) {
+        pal::typematic_note_report(0, &[b'i']);
+    }
+    let hold_latches = pal::typematic_test_streams_latched();
+    pal::typematic_note_report(0, &[]); // the hold ends
+    let verdict_expires = !pal::typematic_test_streams_latched();
+    pal::typematic_test_reset();
+    while pal::next_event().is_some() {}
+
+    let chain_b = lapse_disarms
+        && lapse_rearms
+        && rearm_repeats
+        && release_beats_lapse
+        && !ghost_repeat
+        && hold_latches
+        && verdict_expires;
+
+    if baseline && suppressed && !repeated && rollover_clean && nonascii_clean && idle_latches && chain_b {
         serial_println!(
-            ":: uvug6: typematic — baseline repeat OK, backpressure suppressed inject, report-level release disarmed dropped-KeyUp hold; UVUG-9 evidence gate: rollover-release + non-ascii-tap did NOT latch, genuine idle re-reports DID :: PASS ::"
+            ":: uvug6: typematic — baseline repeat OK, backpressure suppressed inject, report-level release disarmed dropped-KeyUp hold; UVUG-9 evidence gate: rollover-release + non-ascii-tap did NOT latch, genuine idle re-reports DID; PAL-TYPEMATIC chain B: a liveness lapse RE-ARMS on a still-held report and repeats again, a release outranks it with no ghost repeat, and the streaming verdict expires with its hold :: PASS ::"
         );
     } else {
         serial_println!(
-            ":: uvug6: typematic — baseline={} suppressed={} repeated={} rollover_clean={} nonascii_clean={} idle_latches={} :: FAIL ::",
+            ":: uvug6: typematic — baseline={} suppressed={} repeated={} rollover_clean={} nonascii_clean={} idle_latches={} lapse_disarms={} lapse_rearms={} rearm_repeats={} release_beats_lapse={} ghost_repeat={} hold_latches={} verdict_expires={} :: FAIL ::",
             baseline,
             suppressed,
             repeated,
             rollover_clean,
             nonascii_clean,
-            idle_latches
+            idle_latches,
+            lapse_disarms,
+            lapse_rearms,
+            rearm_repeats,
+            release_beats_lapse,
+            ghost_repeat,
+            hold_latches,
+            verdict_expires
         );
     }
 }

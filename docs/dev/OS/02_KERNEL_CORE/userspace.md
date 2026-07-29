@@ -2280,6 +2280,66 @@
   hold. One line per kill, bounded, no new state. No spec pattern matched the old text, so
   `pi4-regression.spec` needed no change.
 
+- **PAL-TYPEMATIC (this arc) — chain B closed, exactly as KEYSTAT specified it.** KEYSTAT named the
+  defect and left it for the owner of `crates/kernel/src/pal.rs`; this arc is that repair. It was
+  **verified still present at HEAD first**: `git log 3b5cd2e5..HEAD -- crates/kernel/src/pal.rs` is
+  empty, i.e. the typematic tracker had not been touched since the audit, and both predicates read
+  exactly as the audit described them. Nothing about the arc depends on the P73 TAB report — Peter has
+  since corrected that premise (TAB repeat *does* fire; the slowness he saw is per-cycle window
+  **drawing**, a different arc). Chain B is a real defect on its own evidence, and this is its fix.
+
+  **1. A lapse now re-arms on evidence.** Every disarm in `typematic_tick` stored `KEY_P1 = 0`, and the
+  only writer that put a key back was the PRESS-edge arm at the bottom of `typematic_note_report`
+  (`newest_press != 0`). A report proving the key was **still held** — `held.contains(&k)`, the
+  strongest evidence the tracker ever receives — therefore could not restart the repeat: the operator
+  had to lift and re-press. The liveness guard disarmed on *silence* and then ignored the one fact that
+  refuted its own inference. The lapse arm now goes through `typematic_lapse_disarm`, which clears the
+  armed slot and **parks** the key in `LAPSED_P1`; the next report whose held set still contains it
+  re-arms at `DELAY_MS`. `LAPSED_P1` is not a second armed slot — nothing repeats off it — and the two
+  absolute release paths outrank it unconditionally: a report **without** the key clears it (layer 1)
+  and a **detach** clears it (layer 2). The re-arm therefore cannot reopen the P51 stuck-repeat wedge.
+  The fresh `DELAY_MS` (rather than `RATE_MS`) is deliberate: a device re-reporting faster than the
+  initial delay can never turn re-arming into a free-running spew.
+
+  **2. The streaming verdict is scoped to its hold.** `STREAMS_WHILE_HELD` latched on the first hold
+  that produced `IDLE_RUN_TO_LATCH` idle re-reports and was **sticky until detach**, so one streaming
+  hold imposed the tight `LIVENESS_MS` window on *every* later hold of that boot — including holds
+  during which the device happens not to re-report, which then stopped after ~15 repeats and did so
+  **silently** (the tight window's disarm is deliberately quiet, which is what made chain B
+  indistinguishable at the bench from the ~10-repeat stop UVUG-9 exists to have removed). A report with
+  an **empty held set** is now the end of the hold and expires the verdict and its evidence. The P51
+  protection is not weakened: a genuinely streaming keyboard re-earns the latch within
+  `IDLE_RUN_TO_LATCH` report periods — tens of ms at any real polling interval, i.e. well before
+  `DELAY_MS` has elapsed and the first repeat is even due.
+
+  **Witness (`[keystat]`).** A re-arm names itself for the first `REARM_LOG_MAX = 3` per hold
+  (`[keystat] typematic re-arm — key=0x67 still held after a liveness lapse; repeat resumed at
+  delay=400ms (hold re-arms=1 boot re-arms=1)`), and every hold that produced repeats closes with one
+  rollup (`[keystat] typematic hold end — key=0x78 repeats=1 re-arms=0 window=30000ms (boot: repeats=1
+  re-arms=0)`), carrying the window that was in force **during** that hold — which is why the rollup is
+  emitted before the verdict is cleared, in both the release path and the detach path. Output is bounded
+  by human key holds. `[uvug9] typematic hold-max`'s tail text now says the next still-held report
+  re-arms, instead of "re-press resumes".
+
+  **Arch-neutrality — and a correction for the GR7 relay.** The whole tracker
+  (`mod typematic`, `typematic_note_report`, `typematic_tick`, every test aid) is gated
+  `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]`, and its sole producer is the Pi's xHCI
+  boot-keyboard decode. **x86 does not inherit this fix, because x86 has no host-side typematic engine
+  at all** — the rMBP bench gets key repeat from the hardware/driver path, not from this code. Nothing
+  in this arc touches a shared file: `pal.rs`'s edits are inside the aarch64+baremetal cfg, and
+  `main.rs`'s are inside the equally-gated `typematic_selftest`.
+
+  **Gate.** `./arroyo check`: x86_64 OK, aarch64 OK. `./arroyo kernel8-test 210`: **MBENCH PASS —
+  86/86** required witnesses, 0 forbidden hits, 25295 lines scanned. `pi4-regression.spec` is
+  **unchanged**: the new legs ride the existing `:: uvug6: typematic … :: PASS ::` verdict, whose FAIL
+  half is already covered by mbench's default `FAIL ::` forbid. That selftest gains three legs —
+  **(G)** a lapse then a still-held report must re-arm *and* repeat again, with no release and no
+  re-press anywhere in the sequence; **(H)** a lapse then a *release* must not re-arm and must produce
+  no ghost repeat across 64 forced-due ticks (the leg that proves the re-arm did not reopen P51);
+  **(I)** a legitimately latched verdict must be **gone** once the hold ends. The lapse is driven
+  through the same `typematic_lapse_disarm` seam the production path uses rather than by the clock, so
+  no test hook enters the window comparison and the selftest does not stall for a real `LIVENESS_MS`.
+
 - **VUGMIN-A (a vug nobody can see stops burning cores too)** — Peter's ruling at **P69**: *"if vug is
   minimized it should shut off."* The audit that opened the arc found there is **no minimize feature in
   UnaOS at all** — no `minimized` field on the window table, no minimize verb on `wm`, no chrome
