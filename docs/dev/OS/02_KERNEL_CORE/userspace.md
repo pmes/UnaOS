@@ -2269,6 +2269,63 @@
     "wired, and nothing hid by accident" — the number that carries the arc is `hides > 0` on the bench.
     The 300-frame `checksum=0xe68285b85121ac7c` is byte-identical across B, as predicted.
 
+- **VUGPAUSE-2 (an idle vug leaves the run queues)** — VUGPAUSE and VUGMIN stopped an idle vug from
+  RENDERING; they did not stop it from RUNNING. What they left is a **yield-polling floor**: the idle loop
+  is `drain_input` + `SYS_YIELD`, which is runnable by construction, so an idled vug is still in a run
+  queue on every dispatch pass. P69 on silicon measured the floor at **47/58/57/55 %** per core for a
+  six-vug fleet with nothing moving on the panel — down from 99/80/85/99, and still most of the machine.
+  This arc replaces both halves of that spin with real blocking waits.
+  - **`SYS_INPUT_WAIT` = 28.** The id ELF-5 reserved and deferred, now spent. `SYS_INPUT_WAIT() -> 0 /
+    -EINVAL` blocks until the caller's input ring may be non-empty. It **does not dequeue**: the caller's
+    ordinary `SYS_INPUT_POLL` drain runs next and sees every event, so the two compose with no "the wait
+    ate my event" hazard and the vug's loop needed no restructuring — one call site swaps `SYS_YIELD` for
+    it on the idle path, and the rendering path is untouched.
+  - **Built on the existing futex, not a new primitive.** `sched::futex_wait/_wake` keyed by
+    `input_futex_key(asid)` = `(1 << 63) | asid`. A `sys_futex` key is the PHYSICAL address of an EL0
+    word and a PA is < 2^40 here, so bit 63 puts every input key in a space no user word can name — an
+    EL0 program cannot forge one and reach another process's ring. The compare word is the ring's own
+    `TAIL`, read at EL1 under the bucket lock that `el0_input_push`'s wake must take, which is what makes
+    the wait race-free against the router.
+  - **Three wake edges, each load-bearing.** `el0_input_push` (the event itself — this is the
+    latency-critical one, and it makes the vug re-ready in the same pass the router runs, sooner than the
+    yield loop could act); `el0_input_set_active` (a focus ARRIVAL, which RESETS the ring rather than
+    filling it, so nothing else would move `TAIL`); and `set_hidden(asid, false)` (an UNHIDE — the hidden
+    bit lives in the info page, so becoming visible touches no ring at all).
+  - **The workers had to go too.** A vug is one parent and TWO workers, and the workers yield-polled
+    `PHASE` for the release direction — two thirds of the residue by headcount. They now **spin then
+    park**: `WORKER_SPIN_YIELDS` (4096) passes of the original poll, then `futex_wait` on `PHASE`, with
+    every parent-side `PHASE` store followed by a wake. The spin is not conservatism. The first cut made
+    this a bare park on the symmetry argument that the ARRIVAL direction has always been a real futex on
+    the same QEMU; `kernel8-test` then FAILED with `:: EXEC-UVUG: … did not exit in time ::` and all
+    three tasks parked at the kill. The M6e note's claim that the release direction is the fragile one
+    under raspi4b's missing Group-1 timer is therefore **measured, not folklore** — the rendering path
+    keeps the poll, and only a parent that has stopped releasing frames drains the spin.
+  - **`NFUTEX` 16 → 64.** A vug used to hold ONE live key (`DONE`); it now holds three while idle
+    (`DONE`, `PHASE`, its input ring) — 18 for a six-vug fleet, over the old pool. The overflow does not
+    fail loudly: `TableFull` makes every caller degrade to a spin, so the arc's whole benefit would have
+    evaporated silently on exactly the workload it was built for.
+  - **Liveness: the backstop.** A parked task issues no `SYS_INPUT_POLL`, and two bounds are fed by
+    exactly that syscall — `gui_watchdog`'s 5 s wedge timer and UVUG-8r2's 2 s takeover heartbeat. Rather
+    than teach either a new state, `sched::run` wakes parked input waiters every `INPUT_WAIT_BACKSTOP_TICKS`
+    (64 ticks ≈ 256 ms, one CAS-claimed pass machine-wide), so the vug still polls — a few times a second
+    instead of thousands. Metal-only by construction: `timer::ticks()` needs the timer IRQ QEMU raspi4b
+    never delivers, which costs nothing there because a headless run has no HID and nothing ever freezes.
+  - **Kill/reap are unchanged, and that is KILLBOUND's doing.** VUGPAUSE's note that "an unbounded
+    `futex_wait` is an unkillable empty window" was true when it was written and is not now: `futex_wait`
+    tests the armed-kill flag before parking and `futex_wake_killed` evicts already-parked targets, so a
+    vug blocked in `SYS_INPUT_WAIT` is exactly as killable as one blocked in the frame barrier.
+  - **Witness:** `[vugpause2] blocked=<n> wakes=<n> asid=<a>`, emitted on a power-of-two cadence — a
+    per-park line would flood and a one-shot line would not show the mechanism still working, while a
+    logarithmic one is bounded at ~40 lines for any boot. `wakes` beside `blocked` is the pair that
+    matters: `blocked` climbing while `wakes` stalls is a vug going to sleep and not being woken.
+  - **Size.** `VUG.ELF` links at 12568 B with `.text` at exactly **0x2000** — the hard ceiling, since one
+    byte more pushes `.bss` to the next page and the image to 16664 B, which `arroyo` rejects against
+    `USER_REGION_SIZE`. The next arc to touch `user-vug` has no headroom; the file's own size note records
+    which inlining choices measured smaller and why.
+  - **Gates:** `./arroyo check` green both arches; `./arroyo kernel8-test` **MBENCH PASS 86/86, 0
+    forbidden**, `UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c` byte-identical — the headless
+    path has no HID, so it never freezes, never parks, and proves the rendering path is untouched.
+
 ### x86_64 (branch `hw-rmbp`)
 
 - **U1a** — first ring-3 round-trip (the x86 mirror of aarch64 M6a). A

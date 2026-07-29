@@ -176,6 +176,9 @@ const SYS_THREAD_EXIT: u64 = 22;
 const SYS_THREAD_JOIN: u64 = 23;
 const SYS_FUTEX: u64 = 26;
 const SYS_INPUT_POLL: u64 = 27;
+// VUGPAUSE-2: the BLOCKING half of the input pair. Returns 0 once the ring may be non-empty; it does not
+// dequeue, so the ordinary `drain_input` at the top of the loop still sees every event.
+const SYS_INPUT_WAIT: u64 = 28;
 // WC-C: the WINDOW verbs replace the single-surface SYS_FB_MAP/SYS_FB_PRESENT compat pair.
 const SYS_WIN_CREATE: u64 = 29;
 const SYS_WIN_PRESENT: u64 = 30;
@@ -247,6 +250,18 @@ fn exit(code: i32) -> ! {
         core::hint::spin_loop();
     }
 }
+// SIZE — read this before adding code to this program. `.text` must end at or below 0x2000. One byte past
+// it and the linker puts `.bss` on the next page, the stripped image jumps a full 4 KiB to 16664 bytes,
+// and `arroyo` rejects it against `USER_REGION_SIZE` (16 KiB) as a hard build failure. VUGMIN-A hit this
+// wall from the message side; VUGPAUSE-2 hit it from the code side and landed at exactly 0x2000, so the
+// next arc has NO headroom and should expect to pay for what it adds.
+//
+// Two measurements worth keeping, both counter-intuitive and both re-measured on this program:
+//   * `futex_wait`/`futex_wake` are CHEAPER inlined. The body is three instructions and a `ret`, so a
+//     call site costs more than the stub once argument setup is counted (the `inline(never)` variant of
+//     the pair measured 0x201c against 0x1fe8).
+//   * `wake_phase`/`phase_exit` are cheaper OUT of line, because what they share is a whole stub with its
+//     arguments already fixed. Folding the two `PHASE_EXIT` sites into `phase_exit` was the last 12 bytes.
 #[inline(always)]
 fn futex_wait(word: *const AtomicU32, val: u32) {
     unsafe { sys3(SYS_FUTEX, word as u64, 0, val as u64) };
@@ -255,9 +270,28 @@ fn futex_wait(word: *const AtomicU32, val: u32) {
 fn futex_wake(word: *const AtomicU32, n: u32) {
     unsafe { sys3(SYS_FUTEX, word as u64, 1, n as u64) };
 }
+/// VUGPAUSE-2: release any worker parked on `PHASE`. Out of line — see the size note above.
+#[inline(never)]
+fn wake_phase() {
+    futex_wake(core::ptr::addr_of!(PHASE), 2);
+}
+/// VUGPAUSE-2: retire the worker pool — publish the exit sentinel and release anyone parked on it. Both
+/// callers (the barrier's retirement arm and the normal end of the run) mean exactly this, and folding
+/// them costs nothing: the store and the wake are inseparable now that a worker can be asleep on the word.
+#[inline(never)]
+fn phase_exit() {
+    PHASE.store(PHASE_EXIT, Ordering::Release);
+    wake_phase();
+}
 #[inline(always)]
 fn input_poll() -> u64 {
     unsafe { sys0(SYS_INPUT_POLL) }
+}
+/// VUGPAUSE-2: block until this process's input ring may be non-empty. Never called from the rendering
+/// path — only from the idle path, where the alternative was `sys_yield` in a runnable spin.
+#[inline(always)]
+fn input_wait() {
+    unsafe { sys0(SYS_INPUT_WAIT) };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -374,6 +408,13 @@ static mut PX: [i32; 14] = [0; 14]; // projected pixel X per vertex
 static mut PY: [i32; 14] = [0; 14]; // projected pixel Y per vertex
 
 const PHASE_EXIT: u32 = u32::MAX;
+/// VUGPAUSE-2: `SYS_YIELD` passes a worker spends polling `PHASE` before it parks on it. Sized to be
+/// unreachable on the rendering path — a worker waits one projection plus one present between frames, a
+/// handful of passes even on a loaded machine — and trivially reachable on the idle path, where the parent
+/// stops releasing frames entirely. Erring long is the safe direction: an over-long spin costs an idling
+/// vug a few milliseconds of yielding ONCE per idle interval, while too short a spin puts a park/wake pair
+/// in the middle of every rendered frame, which is the shape that failed the checksum run.
+const WORKER_SPIN_YIELDS: u32 = 4096;
 const AUTO_FRAMES: u32 = 300; // deterministic QEMU path length (used only while no input ever arrives)
 // VUGLIFE: the interactive budget. It is a real deadline ONLY in fixture mode (a foreground launch —
 // `run`, and every battery leg); a detached/desktop vug waives it once and runs unbounded.
@@ -461,13 +502,42 @@ extern "C" fn uvug_worker(arg: usize) -> ! {
     let (y_lo, y_hi) = if arg == 0 { (0, SH / 2) } else { (SH / 2, SH) };
     let mut last: u32 = 0;
     loop {
-        // Wait for the parent to release the next frame: yield-poll `phase` until it changes.
+        // Wait for the parent to release the next frame.
+        //
+        // VUGPAUSE-2 — SPIN, THEN PARK. The `SYS_YIELD` poll is the OTHER half of the idle fleet's load,
+        // and the larger half by headcount: a vug is one parent and TWO workers, and while the parent
+        // idled on `SYS_YIELD` both workers idled on this loop. Blocking the parent alone would have left
+        // two thirds of the residue running.
+        //
+        // The SPIN stays, and the arc measured why. The first cut made this a pure `futex_wait`, on the
+        // symmetry argument that the ARRIVAL direction has always been a real futex on this same QEMU. The
+        // 300-frame checksum run then FAILED — `:: EXEC-UVUG: … did not exit in time ::`, with all three
+        // tasks parked at the kill. Whatever the mechanism (the barrier note at the top of this file blames
+        // raspi4b's missing Group-1 timer for making the release direction the fragile one), the release
+        // direction empirically cannot be a bare park there. So it is not one: `WORKER_SPIN_YIELDS` passes
+        // of the original poll come first, and the rendering path never gets past them — between two frames
+        // a worker waits only for the parent's projection and present. The park is reached ONLY when the
+        // parent has stopped releasing frames altogether, which is exactly the VUGPAUSE/VUGMIN idle this
+        // arc is about, and it is reached once per idle interval rather than once per frame.
+        //
+        // Lost-wakeup-safe: `futex_wait` compares `PHASE` against the value just read, under the same
+        // bucket lock the parent's `wake_phase` takes, so a release landing between the load and the wait
+        // returns `Mismatch` instead of parking. Kill-safe: this is KILLBOUND's futex, the same one the
+        // arrival barrier already blocks on. Every parent-side `PHASE` store — frame release, worker
+        // retirement, and the exit sentinel — is followed by `wake_phase`, which is what makes both the
+        // barrier and the final `SYS_THREAD_JOIN` terminate.
+        let mut spins: u32 = WORKER_SPIN_YIELDS;
         let p = loop {
             let p = PHASE.load(Ordering::Acquire);
             if p != last {
                 break p;
             }
-            sys_yield();
+            if spins != 0 {
+                spins -= 1;
+                sys_yield();
+            } else {
+                futex_wait(core::ptr::addr_of!(PHASE), p);
+            }
         };
         last = p;
         if p == PHASE_EXIT {
@@ -1220,7 +1290,25 @@ pub extern "C" fn _start() -> ! {
                     }
                 }
             }
-            sys_yield();
+            // VUGPAUSE-2: BLOCK, do not spin. VUGPAUSE stopped this frame from rendering and left behind a
+            // runnable idle loop — drain + `SYS_YIELD` — which is still a task in a run queue on every
+            // dispatch pass. On silicon at P69 that residue held the six-vug fleet at 47-61% per core with
+            // nothing moving. `SYS_INPUT_WAIT` parks the task on its own input ring instead, so an idle vug
+            // leaves the run queues entirely.
+            //
+            // Responsiveness is not traded away for it: the kernel issues the wake from the router's own
+            // enqueue, so the click that unpauses and the keystroke that exits re-ready this task in the
+            // same pass the event arrives — sooner than the yield loop, which had to wait to be dispatched
+            // before it could look. Focus arrival and un-hiding wake it too, since neither moves the ring.
+            //
+            // The syscall does not DEQUEUE, which is what lets it sit here with no restructuring: control
+            // returns to the top of the loop and `drain_input` reads the event exactly as before.
+            //
+            // The P60 objection ("an unbounded futex_wait is an unkillable empty window") is answered
+            // rather than ignored: KILLBOUND made the futex kill-aware from both sides, and a periodic
+            // kernel backstop wakes parked waiters a few times a second so the `run` deadline and the GUI
+            // wedge watchdog — both of which measure liveness in polls — keep seeing a live app.
+            input_wait();
             continue;
         }
 
@@ -1232,6 +1320,13 @@ pub extern "C" fn _start() -> ! {
         if live > 0 {
             DONE.store(0, Ordering::Relaxed);
             PHASE.store(frame + 1, Ordering::Release); // 1-based; never PHASE_EXIT (frame < cap)
+            // VUGPAUSE-2: release any worker that outspun `WORKER_SPIN_YIELDS` and parked. UNCONDITIONAL,
+            // and that is a decision rather than an oversight. Gating it on a "someone is parked" flag
+            // would be a second lock-free protocol between three threads whose failure mode is a worker
+            // that sleeps through its release — which the barrier would then diagnose as a dead worker and
+            // RETIRE the pool over. A wake with nobody parked is a bucket scan the kernel completes in
+            // microseconds; that is a much better thing to spend than a correctness argument.
+            wake_phase();
         }
 
         // --- VUGGUARD: rasterise every band no worker owns, inline, while the workers run ---
@@ -1267,7 +1362,11 @@ pub extern "C" fn _start() -> ! {
             passes = passes.wrapping_add(1);
             if passes == BARRIER_PASS_BUDGET {
                 stall_witness(&W_BARRIER, frame, b"barrier", b"done", d);
-                PHASE.store(PHASE_EXIT, Ordering::Release); // a worker still alive will see this and leave
+                // A worker still alive will see this and leave. VUGPAUSE-2: "will see this" now requires a
+                // WAKE as well as a store — a worker that parked cannot poll its way to the sentinel — so
+                // this is `phase_exit`, not a bare store. Without the wake, retirement would leave a live
+                // thread asleep on a word nobody writes again: the precise shape of the P60 empty window.
+                phase_exit();
                 live = 0;
                 inline_top = true;
                 inline_bot = true;
@@ -1342,7 +1441,11 @@ pub extern "C" fn _start() -> ! {
     }
 
     // Signal the workers to exit, then join the ones that exist and are still expected to answer.
-    PHASE.store(PHASE_EXIT, Ordering::Release);
+    // VUGPAUSE-2: the wake is what makes the join terminate. A vug that exits FROM the idle path (ESC
+    // while paused, or the interactive budget) has both workers parked on `PHASE`, so the sentinel store
+    // alone would leave them asleep and `SYS_THREAD_JOIN` would block on threads that never finish —
+    // turning the arc's idle win into a hung exit. `phase_exit` is store-then-wake, before the joins.
+    phase_exit();
     if join_a {
         unsafe { sys1(SYS_THREAD_JOIN, rc_a) };
     }

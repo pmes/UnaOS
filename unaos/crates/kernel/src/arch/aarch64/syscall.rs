@@ -178,12 +178,21 @@ const FUTEX_WAKE: u64 = 1;
 ///     [7:0], mouse dx/x in [31:16] (i16), dy/y in [15:0] (i16). The router seam is `el0_input_enqueue`
 ///     (mirroring ELF-3's present seam); active-process registration is `el0_input_set_active`.
 const SYS_INPUT_POLL: u64 = 27;
-/// SYS_INPUT_WAIT = 28 is DEFERRED (documented at `sys_input_poll`) — a blocking variant on a per-ASID
-/// Semaphore that `el0_input_enqueue` posts; QEMU has no real input source, so POLL is the QEMU-provable
-/// rung this arc lands.
+/// VUGPAUSE-2: the reserved id 28 is now SPENT — `SYS_INPUT_WAIT`, the BLOCKING half of the pair.
+///   SYS_INPUT_WAIT() -> 0 / -EINVAL
+///     Block the calling task until its input ring is (or may be) non-empty, then return 0. It does NOT
+///     dequeue: the caller's next `SYS_INPUT_POLL` drain sees the event, so the two syscalls compose
+///     without a "wait consumed my event" hazard. Returns 0 immediately when the ring is already
+///     non-empty, and `-EINVAL` off a private slot (ASID 0) or off a schedulable task.
+///
+/// Implemented on the SAME kill-aware futex the barrier uses (`sched::futex_wait/_wake`), keyed by
+/// `input_futex_key(asid)` — a synthetic key outside the physical-address space that `sys_futex`'s user
+/// keys occupy, so an EL0 word can never alias an input key. The compare word is the ring's own TAIL,
+/// read at EL1 under the bucket lock, which is what makes the wait race-free against `el0_input_push`.
+const SYS_INPUT_WAIT: u64 = 28;
 
 /// WC-B: the WINDOW verbs — the multi-surface successor to the single-surface `SYS_FB_MAP`/`SYS_FB_PRESENT`
-/// pair. Numbers start at 29 (28 is the reserved-DEFERRED `SYS_INPUT_WAIT` id, deliberately left unused).
+/// pair. Numbers start at 29 (28 is `SYS_INPUT_WAIT`, reserved by ELF-5 and spent by VUGPAUSE-2).
 ///
 ///   SYS_WIN_CREATE(w, h) -> win id (0..WIN_MAX) / -errno
 ///     Allocate a window owned by the CALLER's ASID and map its surface into the caller's EL0 window.
@@ -6111,6 +6120,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_FB_PRESENT => sys_fb_present(),
         SYS_FUTEX => sys_futex(a0, a1, a2),
         SYS_INPUT_POLL => sys_input_poll(),
+        SYS_INPUT_WAIT => sys_input_wait(),
         SYS_WIN_CREATE => sys_win_create(a0, a1),
         SYS_WIN_PRESENT => sys_win_present(a0),
         SYS_WIN_MOVE => sys_win_move(a0, a1, a2),
@@ -10933,6 +10943,15 @@ pub fn set_hidden(asid: u64, on: bool) {
         // is inside the info page — the same pointer and index the two info-page writers use.
         unsafe { info.add(FB_INFO_FLAGS).write_volatile(fb_info_flags(slot)) };
     }
+    // VUGPAUSE-2: an UNHIDE is a wake edge, and it is the one edge the ring cannot supply. A hidden vug is
+    // by construction not the focused app, so no event is ever routed to it; if it is parked in
+    // `SYS_INPUT_WAIT` the only thing that changed when it became visible again is the word written just
+    // above — which nothing wakes on. Without this the restore would wait for the backstop (~256 ms) or,
+    // if the timer IRQ is not live, forever. Ordered AFTER the info-page publish so the woken vug's first
+    // read of the flags word already shows it visible.
+    if !on {
+        el0_input_wake(asid);
+    }
 }
 
 /// VUGMIN — clear ASID `asid`'s hidden bit. Called from `boot::teardown_user_slot`'s FINAL-release arm
@@ -11668,6 +11687,82 @@ static EL0_INPUT_HEAD: [AtomicU32; super::boot::USER_SLOTS + 1] =
 static EL0_INPUT_TAIL: [AtomicU32; super::boot::USER_SLOTS + 1] =
     [const { AtomicU32::new(0) }; super::boot::USER_SLOTS + 1];
 
+/// VUGPAUSE-2: per-slot "this ASID has a task parked in `SYS_INPUT_WAIT`" flag. Set immediately before the
+/// futex park, cleared immediately after it returns — and ALSO cleared by `clear_input_row`, because the
+/// park is a kill boundary that can `exit()` without ever returning here (see `sched::futex_wait`), so the
+/// clear on the normal path is not sufficient on its own.
+///
+/// It is a HINT, never a decision: its only consumer is the periodic backstop, which skips slots that are
+/// clear. A stale-set flag therefore costs one wasted `futex_wake` per backstop period on a key with no
+/// waiters, and a stale-clear flag is impossible (only the parker sets it, before parking).
+static EL0_INPUT_PARKED: [AtomicBool; super::boot::USER_SLOTS + 1] =
+    [const { AtomicBool::new(false) }; super::boot::USER_SLOTS + 1];
+
+/// VUGPAUSE-2: how many times a task has PARKED in `SYS_INPUT_WAIT`, and how many waiters the wake seam
+/// has released. Both are cumulative for the boot and drive the `[vugpause2]` witness.
+static EL0_INPUT_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static EL0_INPUT_WAKES: AtomicU64 = AtomicU64::new(0);
+
+/// VUGPAUSE-2: the synthetic futex key for ASID `asid`'s input ring.
+///
+/// `sys_futex`'s user keys are PHYSICAL ADDRESSES of EL0 words, and on this SoC a PA is < 2^40; bit 63
+/// is therefore free forever, and setting it puts every input key in a space no user word can name. That
+/// matters more than it looks: the buckets are shared, so an EL0 program that could forge an input key
+/// could wake (or, worse, park on) another process's ring. It cannot reach this space at all.
+#[inline]
+fn input_futex_key(asid: u64) -> u64 {
+    (1u64 << 63) | asid
+}
+
+/// VUGPAUSE-2 WAKE SEAM: release every task parked in `SYS_INPUT_WAIT` on `asid`'s ring. Returns how many
+/// were woken (0 is the overwhelmingly common case — nobody is parked).
+///
+/// Called from THREE edges, and all three are needed for a blocked vug to be as responsive as a polling
+/// one was:
+///   * `el0_input_push` — the event itself. This is the latency-critical one: the router publishes TAIL
+///     and then wakes, so the keypress that arrives while a vug is idle re-readies it in the same pass
+///     the router runs in, not a poll period later.
+///   * `el0_input_set_active` — a focus ARRIVAL. Focus does not enqueue anything (it RESETS the ring), so
+///     without this a vug parked on an empty ring would sleep through being handed the keyboard.
+///   * `set_hidden(asid, false)` — an UNHIDE. The hidden bit lives in the info page, not in the ring, so
+///     nothing about becoming visible again touches TAIL. A vug parked while hidden must be re-readied to
+///     observe its own restore; this is the edge that makes VUGMIN's idle exit-able.
+fn el0_input_wake(asid: u64) -> usize {
+    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+        return 0;
+    }
+    if !EL0_INPUT_PARKED[asid as usize].load(Ordering::Acquire) {
+        return 0; // fast path: nobody has parked on this ring
+    }
+    let n = super::sched::futex_wake(input_futex_key(asid), usize::MAX);
+    if n != 0 {
+        EL0_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    n
+}
+
+/// VUGPAUSE-2 BACKSTOP: wake every parked input waiter, unconditionally. Called on a coarse cadence from
+/// the scheduler loop (`sched::run`), and it is a LIVENESS device, not a correctness one — the three wake
+/// edges above are what make the wait responsive.
+///
+/// Why it has to exist. A parked task issues no `SYS_INPUT_POLL`, and two independent liveness bounds are
+/// fed by exactly that syscall: `gui_watchdog`'s 5 s wedge timer (which hands the keyboard back to the
+/// shell) and UVUG-8r2's 2 s takeover heartbeat (which un-suspends the `run` deadline). Both would read a
+/// legitimately idle, blocked vug as a wedged one. Rather than teach either of them a new state, the
+/// backstop keeps the old contract true: the vug still polls, just a few times a second instead of
+/// thousands. At `INPUT_WAIT_BACKSTOP_TICKS` (~256 ms) that is ~4 wake/poll/re-park cycles per second per
+/// idle vug — far inside both bounds and far below anything a load meter can see.
+pub fn el0_input_wake_backstop() {
+    for asid in 1..=super::boot::USER_SLOTS as u64 {
+        if EL0_INPUT_PARKED[asid as usize].load(Ordering::Relaxed) {
+            let n = super::sched::futex_wake(input_futex_key(asid), usize::MAX);
+            if n != 0 {
+                EL0_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// The ASID of the process currently designated to RECEIVE input (0 = none). The router enqueues only into
 /// this process's ring — the ELF-5 twin of `SCREEN_APP_ACTIVE`. Set via `el0_input_set_active`.
 static EL0_INPUT_ACTIVE: AtomicU64 = AtomicU64::new(0);
@@ -11942,6 +12037,13 @@ fn el0_input_push(asid: u64, packed: u64) -> bool {
     // UVUG-8r2: deliberately NO takeover latch here. Delivery into the ring proves only that the ROUTER acted;
     // it says nothing about whether the app is interactive (or even running). The latch is set on the CONSUMER
     // side, in `sys_input_poll`, when the app actually drains the event. See `EL0_TAKEOVER_ASID`.
+    //
+    // VUGPAUSE-2: the wake, AFTER the TAIL publish and never before it. `sched::futex_wait` performs its
+    // compare of this very word under the bucket lock that `futex_wake` must take, so the two possible
+    // interleavings are the only two, and both are correct: a waiter that read TAIL before our store fails
+    // its compare and never parks; one that parked before our store is on the bucket we are about to take.
+    // There is no third case and therefore no lost wakeup.
+    el0_input_wake(asid);
     true
 }
 
@@ -11997,6 +12099,11 @@ pub fn el0_input_set_active(asid: u64) {
     // on the line above and `takeover_suspends` requires a non-zero MATCHING latch before the heartbeat is even
     // consulted. Flagged rather than fixed: an Option-shaped sentinel would buy nothing real here.
     EL0_TAKEOVER_HB.store(0, Ordering::Release);
+    // VUGPAUSE-2: a focus ARRIVAL is a wake edge. It has to be, and the reason is the line above the
+    // `clear_input_row` call: focus RESETS the incoming ring rather than filling it, so a vug parked on
+    // an empty ring sees no TAIL movement when it is handed the keyboard. Last, after the focus is
+    // published, so the woken task re-polls against the new state rather than the old.
+    el0_input_wake(asid);
 }
 
 /// WC-TAB — the SHELL half of the focus ring, closing the one-way exit WC-C left open.
@@ -12252,6 +12359,12 @@ fn clear_input_row(asid: u64) {
     let a = asid as usize;
     EL0_INPUT_HEAD[a].store(0, Ordering::Release);
     EL0_INPUT_TAIL[a].store(0, Ordering::Release);
+    // VUGPAUSE-2: drop the park hint with the ring it describes. On the teardown path this is the clear
+    // that matters — a task killed while parked leaves `sys_input_wait` through `sched::futex_wait`'s
+    // pre-park kill boundary, which `exit()`s and never runs the clear on the normal path — so without
+    // this the recycled slot would inherit a permanent "someone is parked here" and the backstop would
+    // wake an empty key for the rest of the boot.
+    EL0_INPUT_PARKED[a].store(false, Ordering::Release);
 }
 
 /// SYS_INPUT_POLL(): nonblocking dequeue of the next input event for the CALLING process. Returns the packed
@@ -12303,6 +12416,78 @@ fn sys_input_poll() -> i64 {
         EL0_TAKEOVER_ASID.store(asid, Ordering::Release);
     }
     packed as i64
+}
+
+/// SYS_INPUT_WAIT(): block until the CALLING process's input ring is (or may be) non-empty. Returns 0 —
+/// it is a WAIT, not a read: nothing is dequeued, so the caller's ordinary `SYS_INPUT_POLL` drain runs
+/// next and sees every event. `-EINVAL` off a private slot or off a schedulable task.
+///
+/// WHY THIS EXISTS (VUGPAUSE-2). VUGPAUSE and VUGMIN stopped an idle vug from RENDERING; they did not stop
+/// it from RUNNING. The idle loop they left behind is `drain_input` + `SYS_YIELD`, which is a runnable
+/// spin: it never parks, so it is always in a run queue, and six of them held the P69 fleet at 47-61% per
+/// core with nothing moving on the panel. That residue is this syscall's whole target. The vug calls this
+/// instead of `SYS_YIELD` on the idle path only; the rendering path is untouched.
+///
+/// The three deliberate properties, in the order they were argued:
+///   * SAME-TICK WAKE. The wake is issued by `el0_input_push` itself, so the latency from "the router
+///     enqueued a keypress" to "the vug is ready to run" is one `make_ready` — strictly better than the
+///     yield loop, which could not act until it was next dispatched.
+///   * KILL-SURVIVABLE. This is KILLBOUND's futex, not a new primitive, so a parked vug inherits the
+///     pre-park kill check and `futex_wake_killed`'s eviction of already-parked targets. A vug blocked
+///     here is exactly as killable and reapable as one blocked in the frame barrier, which is the case
+///     the KILLBOUND arc was built for. That is also the answer to VUGGUARD/P60's "an unbounded
+///     `futex_wait` is an unkillable empty window": it was, before KILLBOUND, and it is not now.
+///   * BOUNDED ANYWAY. The `run` deadline and the GUI wedge watchdog both measure liveness in polls, so a
+///     genuinely idle vug that stopped polling would read as wedged. `el0_input_wake_backstop` keeps it
+///     polling a few times a second — see there for the full argument.
+fn sys_input_wait() -> i64 {
+    let asid = current_asid();
+    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+        return EINVAL;
+    }
+    // The same two liveness stamps `sys_input_poll` makes, under the same focus predicate and for the
+    // same reason: reaching this syscall IS drain progress. Stamped BEFORE the park, so the clock the
+    // watchdog reads starts at the moment the vug went to sleep rather than the moment it last drew.
+    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
+        crate::gui_watchdog::note_progress();
+        EL0_TAKEOVER_HB.store(super::timer::cntpct(), Ordering::Release);
+    }
+    let a = asid as usize;
+    let head = EL0_INPUT_HEAD[a].load(Ordering::Relaxed); // this task is the sole consumer
+    let tail = EL0_INPUT_TAIL[a].load(Ordering::Acquire);
+    if head != tail {
+        return 0; // already has work — never park on a non-empty ring
+    }
+    // Park on the ring's TAIL word. `futex_wait` re-reads it under the bucket lock and refuses to park if
+    // it has moved, which closes the window between the load above and the park below.
+    EL0_INPUT_PARKED[a].store(true, Ordering::Release);
+    let n = EL0_INPUT_BLOCKS.fetch_add(1, Ordering::Relaxed) + 1;
+    // Witness on a POWER-OF-TWO cadence (1, 2, 4, 8, …). An idle fleet parks thousands of times a minute,
+    // so a per-park line would be a flood and a one-shot line would say nothing about whether the mechanism
+    // kept working; a logarithmic cadence is bounded at ~40 lines for any conceivable boot and still shows
+    // the ratio moving. `wakes` beside `blocked` is the pair that matters — they should track each other,
+    // and a `blocked` that climbs while `wakes` stalls is a vug going to sleep and not being woken.
+    if n & (n - 1) == 0 {
+        serial_println!(
+            "[vugpause2] blocked={} wakes={} asid={}",
+            n,
+            EL0_INPUT_WAKES.load(Ordering::Relaxed),
+            asid
+        );
+    }
+    let key = input_futex_key(asid);
+    let uaddr = core::ptr::addr_of!(EL0_INPUT_TAIL[a]) as u64;
+    let r = super::sched::futex_wait(key, uaddr, tail);
+    EL0_INPUT_PARKED[a].store(false, Ordering::Release);
+    match r {
+        // Woken by a wake edge, or the ring moved under the compare (`Mismatch`) — either way the caller's
+        // next drain is the thing that decides, so both are simply "go look".
+        super::sched::FutexWait::Woken | super::sched::FutexWait::Mismatch => 0,
+        // Every bucket is busy with another key. Returning 0 degrades this syscall to a `SYS_YIELD` for
+        // that iteration — the pre-VUGPAUSE-2 behaviour, which is the right thing to fall back to.
+        super::sched::FutexWait::TableFull => 0,
+        super::sched::FutexWait::NoTask => EINVAL,
+    }
 }
 
 // ELF-5 input-test witnesses (captured kernel-side, printed by `input_launcher`). The program SYS_REPORTs

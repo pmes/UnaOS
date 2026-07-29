@@ -2552,6 +2552,65 @@ fn drain_due_sleepers(cpu: usize) {
     }
 }
 
+/// VUGPAUSE-2: timer ticks between two runs of the input-wait backstop. A tick is ~4 ms, so 64 is ~256 ms
+/// — four wake/poll/re-park cycles per second for an idle vug. That is two decimal orders inside the
+/// tightest liveness bound it has to satisfy (UVUG-8r2's 2 s takeover heartbeat) and far below what a load
+/// meter can resolve, which is the whole point: the vug keeps its old "I am still polling" contract with
+/// the watchdogs while costing effectively nothing.
+#[cfg(feature = "baremetal")]
+const INPUT_WAIT_BACKSTOP_TICKS: u64 = 64;
+
+/// VUGPAUSE-2: the tick at which the next backstop pass is due. Global rather than per-CPU, and claimed by
+/// CAS, so the cadence is ONE pass per period across the whole machine and not one per core — six cores
+/// each waking every parked vug would be six times the work for exactly the same effect.
+#[cfg(feature = "baremetal")]
+static INPUT_WAIT_BACKSTOP_DUE: AtomicU64 = AtomicU64::new(0);
+
+/// VUGPAUSE-2: run the input-wait backstop if its period has elapsed. Called from the scheduler loop top,
+/// beside `drain_due_sleepers` and for the same structural reason — it is a periodic re-ready pass, it
+/// needs `make_ready`, and this is the one place in the kernel that runs forever on every core with IRQs
+/// masked and no lock held.
+///
+/// Metal-only by construction, and deliberately so: `timer::ticks()` advances from the timer IRQ, which
+/// QEMU raspi4b never delivers, so under QEMU this is a load of an atomic that never changes. Nothing is
+/// lost there — the headless run has no HID, so no vug ever freezes, so nothing ever parks.
+///
+/// Gated on `baremetal` because the thing it wakes is: `arch::aarch64::syscall` — which owns the input
+/// rings and therefore `SYS_INPUT_WAIT` — is itself a `baremetal`-only module. Without EL0 there is no
+/// input ring, nothing can park on one, and the backstop has nothing to do.
+#[inline]
+fn input_wait_backstop() {
+    #[cfg(not(feature = "baremetal"))]
+    return;
+    #[cfg(feature = "baremetal")]
+    {
+        input_wait_backstop_inner();
+    }
+}
+
+#[cfg(feature = "baremetal")]
+#[inline]
+fn input_wait_backstop_inner() {
+    let now = super::timer::ticks();
+    let due = INPUT_WAIT_BACKSTOP_DUE.load(Ordering::Relaxed);
+    if now < due {
+        return;
+    }
+    // Claim the period. A loser simply skips; it does not spin or retry.
+    if INPUT_WAIT_BACKSTOP_DUE
+        .compare_exchange(
+            due,
+            now.wrapping_add(INPUT_WAIT_BACKSTOP_TICKS),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+    super::syscall::el0_input_wake_backstop();
+}
+
 /// Run `cpu`'s run queue to completion, cooperatively (the M3a demo driver on the BSP): dispatch
 /// tasks until the queue drains, then return. Used before preemption is enabled, so tasks only
 /// switch via `yield_now`/`exit`. It does NOT drain the sleeper list, so a task that `sleep_ticks`
@@ -2686,6 +2745,7 @@ fn run(cpu: usize) -> ! {
         // then either switches into a task or, on an empty queue, unmasks and returns false to idle.
         mask_irq();
         drain_due_sleepers(cpu);
+        input_wait_backstop();
         if !dispatch_next(cpu) {
             // SMP-BAL: local queue is empty — before parking, try to pull a steal-eligible task off the
             // MOST-loaded core (work redistribution). A successful steal enqueues onto THIS core, so we
@@ -3016,7 +3076,15 @@ impl Semaphore {
 
 /// Distinct futex keys the kernel can have waiters parked on at once (never grown — same discipline as
 /// the thread/proc tables).
-const NFUTEX: usize = 16;
+///
+/// VUGPAUSE-2 raised this from 16, and the raise is load-bearing rather than defensive. A vug used to hold
+/// ONE live key (its `DONE` barrier word), so a six-vug fleet fit in 16 with room to spare. It now holds
+/// THREE while idle — the barrier word, the `PHASE` release word both workers park on, and its input ring
+/// — which is 18 for the same fleet: over the old pool, and the overflow does not fail loudly. It returns
+/// `TableFull`, every caller degrades to a spin, and the arc's whole benefit quietly evaporates on exactly
+/// the workload it was built for. Sized to 64 so a full `USER_SLOTS` fleet cannot reach it; a bucket is a
+/// lock, a key and a `VecDeque` header, so the pool is small even at this width.
+const NFUTEX: usize = 64;
 
 /// One futex wait bucket: a keyed FIFO wait queue with a Semaphore-style raw lock handed to the scheduler.
 struct FutexBucket {
