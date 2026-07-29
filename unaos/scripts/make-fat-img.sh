@@ -132,6 +132,17 @@ else
     echo "    WARNING: ${STAT_ELF} absent — image has no STAT.ELF (run './arroyo fat-img' via arroyo)"
 fi
 
+# WINX-7: the x86 EL0 mini-vug (crates/user-vug → target/VUG-X86.ELF, built by arroyo's
+# build_user_vug_x86). Same shape, same freshness argument and same un-suffixed on-volume name as the
+# STAT.ELF hunk above — `bg /fat/VUG.ELF` reads identically on both arches.
+VUG_ELF="${WORKSPACE_DIR}/target/VUG-X86.ELF"
+if [ -f "$VUG_ELF" ]; then
+    COPYFILE_DISABLE=1 cp "$VUG_ELF" "${MNT}/VUG.ELF"
+    echo "    added VUG.ELF ($(wc -c < "$VUG_ELF" | tr -d ' ') bytes) for the run/bg loader"
+else
+    echo "    WARNING: ${VUG_ELF} absent — image has no VUG.ELF (run './arroyo fat-img' via arroyo)"
+fi
+
 # U9x M2: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0
 # code). 1 KiB of 0xEE filler, mirroring the pi4 image plant (arroyo's kernel8 SCRATCH.BIN block): the
 # U9x fixture opens it RW, seeks to 520, overwrites a 16-byte pattern, and the launcher flushes that

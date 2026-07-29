@@ -238,6 +238,75 @@ fn main() {
         println!("   WINX: target/STAT-X86.ELF absent — ESP has no STAT.ELF (run via ./arroyo esp-x86)");
     }
 
+    // WINX-7: the x86 EL0 mini-vug (crates/user-vug, built by arroyo's build_user_vug_x86 to
+    // target/VUG-X86.ELF), staged as VUG.ELF exactly like STAT.ELF above and for the same reasons —
+    // un-suffixed on the volume so `bg /fat/VUG.ELF` reads the same on both arches.
+    let vug_elf = target_dir.join("VUG-X86.ELF");
+    if vug_elf.exists() {
+        std::fs::copy(&vug_elf, esp_dir.join("VUG.ELF")).unwrap();
+        println!("   WINX: copied VUG.ELF onto the ESP (bg /fat/VUG.ELF)");
+    } else {
+        println!("   WINX: target/VUG-X86.ELF absent — ESP has no VUG.ELF (run via ./arroyo esp-x86)");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // WINX-7 PKG — the DATA tree: the EL0 artifacts staged for the volume the RUNNING KERNEL reads.
+    //
+    // THE DEFECT THIS FIXES, from an attended rMBP boot:
+    //     :: WINX-2: STAT.ELF absent from the boot volume — end-to-end witness skipped ::
+    // …with STAT.ELF verifiably present and byte-correct on the card that was booted. The FAT mount
+    // SUCCEEDED; `find_in_root` is what came back empty. The reason is that on x86 there are TWO
+    // volumes and the build only ever staged ONE of them:
+    //
+    //   * UEFI boots the ESP — whichever volume the firmware picked, on the rMBP typically the SD
+    //     card. `crates/bootloader` reads `kernel.elf` off it through firmware boot services and then
+    //     ExitBootServices, after which that volume is unreachable forever.
+    //   * The KERNEL's `fs::fat::mount()` binds the global `drivers::block::BLOCK_DEVICE`, and on x86
+    //     the ONLY writer of that global is the xHCI mass-storage bring-up — i.e. the USB stick on
+    //     `storage_slot`. There is no SD, AHCI, SATA or NVMe driver on this arch, and `BootInfo`
+    //     carries no boot-device handle, so the kernel cannot learn what it booted from, let alone
+    //     read it.
+    //
+    // So `bg /fat/STAT.ELF` searches the USB stick while the build put STAT.ELF on the ESP. When the
+    // operator boots a SINGLE stick that is both, the two coincide and everything works — which is
+    // precisely why this went unnoticed: the `esp-x86` procedure assumed one stick, and the bench has
+    // two devices. The kernel-side message even calls the mounted volume "the boot partition", which
+    // it has no way to verify and which was, here, false.
+    //
+    // THE FIX is to stage the runtime artifacts into their own tree, named for what it actually is —
+    // the DATA volume the kernel drives — so the operator has something unambiguous to write onto the
+    // USB stick. The ESP copies above are KEPT, deliberately: they are correct and sufficient for a
+    // single-stick boot, and removing them would break that (working) configuration to fix a
+    // two-device one. What changes is that the two-device configuration is now expressible at all.
+    //
+    // The tree carries ONLY what the kernel reads at run time — no EFI/, no kernel.elf, no bootloader.
+    // Those belong to the firmware's volume and would be dead weight (and a confusing second bootable
+    // -looking volume) on the data stick.
+    let data_dir = target_dir.join("x86_64_data");
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let mut staged_data: Vec<&str> = Vec::new();
+    for (src, dst) in [
+        (target_dir.join("hello.bin"), "HELLO.BIN"),
+        (target_dir.join("STAT-X86.ELF"), "STAT.ELF"),
+        (target_dir.join("VUG-X86.ELF"), "VUG.ELF"),
+    ] {
+        if src.exists() {
+            std::fs::copy(&src, data_dir.join(dst)).unwrap();
+            staged_data.push(dst);
+        }
+    }
+    // `hello.txt` rides along so the operator has a trivial `cat hello.txt` probe that proves the
+    // kernel is reading THIS volume — the one-command answer to "did I write the right stick?".
+    std::fs::write(
+        data_dir.join("hello.txt"),
+        "Hello from UnaOS on real hardware!\nThis file was read off the FAT32 DATA volume by the in-kernel FAT reader.\n",
+    ).unwrap();
+    println!(
+        "   WINX-7 PKG: data volume tree target/x86_64_data/ — {} (+ hello.txt)",
+        if staged_data.is_empty() { "no EL0 artifacts built".to_string() } else { staged_data.join(", ") }
+    );
+
     // VMIMAGE-1: package the just-built ESP tree into ONE self-contained GPT+FAT32 disk image
     // (target/vm/unaos-x86-<git7>.img) and stop — no QEMU. Reuses the SAME build products packed
     // above; the image builder never rebuilds. UNAOS_VM_GIT7 carries the short git hash (identity

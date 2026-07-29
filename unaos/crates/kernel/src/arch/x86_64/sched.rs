@@ -1802,9 +1802,14 @@ pub fn futex_wake(key: u64, n: usize) -> usize {
     woken
 }
 
-/// WINX-7 introspection: how many tasks are parked across every futex bucket right now. Read by the
-/// regression witness as POSITIVE proof that its fixture really reached the park (the alternative —
-/// inferring a park from the absence of progress — cannot tell a park from a stall).
+/// WINX-7 introspection: how many tasks are parked across every futex bucket RIGHT NOW.
+///
+/// A point-in-time sample, and that is the whole caveat: it answers "is anything parked at this
+/// instant", not "did anything park". The WINX-7 witness originally gated on this and was flaky for
+/// exactly that reason — a park that begins and ends between two samples is invisible — so the
+/// verdict now uses `syscall::futex_park_count()`, a monotonic count of `FUTEX_WAIT`s that blocked
+/// and were woken. This function survives as the DEBUGGING view (`is the system parked on a futex
+/// right now?`), which the counter cannot answer.
 pub fn futex_parked_total() -> usize {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();

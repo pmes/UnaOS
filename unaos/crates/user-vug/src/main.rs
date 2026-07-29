@@ -75,8 +75,26 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------------------------
-// Syscall ABI (Linux-aarch64): x8 = number, args x0..x5, return in x0. The kernel SVC path preserves
-// every GPR except x0.
+// Syscall ABI — the ARCH SPLIT (WINX-7), mirroring what WINX-4 did to `crates/user-stat`.
+//
+// The NUMBERS are shared across arches by law: a syscall number names the same verb everywhere, so
+// the ten constants below are declared once and are correct on both. Only the instruction and the
+// register mapping differ, which is exactly what the two `sysabi` modules encapsulate. Everything
+// below this block — the fixed-point maths, the crystal, the rasteriser, the frame loop, the whole
+// program — is arch-neutral Rust that never mentions a register.
+//
+//   aarch64: x8 = number, args x0..x5, return in x0, `svc #0`. The kernel SVC path preserves every
+//            GPR except x0.
+//   x86_64:  rax = number, args rdi/rsi/rdx/r10, return in rax, `syscall`.
+//            TWO x86-specific hazards, both handled in the stubs and neither present on aarch64:
+//            (1) `syscall` itself DESTROYS rcx (it parks the return RIP there) and r11 (the saved
+//                RFLAGS), so both are declared clobbered — omitting them would let the compiler keep
+//                a live value in a register the CPU is about to overwrite. This is also why the
+//                fourth argument travels in r10 rather than the usual SysV rcx.
+//            (2) The kernel's `sysretq` tail scrubs rdi/rsi/rdx/r8/r9/r10 on the way back to ring 3
+//                but PRESERVES the callee-saved set (rbx/rbp/r12-r15) across the C dispatcher, so a
+//                value this program needs across a syscall must live in a callee-saved register or
+//                in memory. The compiler already knows this from the clobber list.
 // ---------------------------------------------------------------------------------------------
 const SYS_WRITE: u64 = 1;
 const SYS_EXIT: u64 = 2;
@@ -90,57 +108,159 @@ const SYS_INPUT_POLL: u64 = 27;
 const SYS_WIN_CREATE: u64 = 29;
 const SYS_WIN_PRESENT: u64 = 30;
 
-#[inline(always)]
-unsafe fn sys0(n: u64) -> u64 {
-    let mut r: u64;
-    core::arch::asm!("svc #0", inout("x0") 0u64 => r, in("x8") n, options(nostack));
-    r
+#[cfg(target_arch = "aarch64")]
+mod sysabi {
+    #[inline(always)]
+    pub unsafe fn sys0(n: u64) -> u64 {
+        let mut r: u64;
+        unsafe { core::arch::asm!("svc #0", inout("x0") 0u64 => r, in("x8") n, options(nostack)) };
+        r
+    }
+    #[inline(always)]
+    pub unsafe fn sys1(n: u64, a0: u64) -> u64 {
+        let mut r: u64;
+        unsafe { core::arch::asm!("svc #0", inout("x0") a0 => r, in("x8") n, options(nostack)) };
+        r
+    }
+    #[inline(always)]
+    pub unsafe fn sys2(n: u64, a0: u64, a1: u64) -> u64 {
+        let mut r: u64;
+        unsafe {
+            core::arch::asm!(
+                "svc #0",
+                inout("x0") a0 => r,
+                in("x1") a1,
+                in("x8") n,
+                options(nostack),
+            )
+        };
+        r
+    }
+    #[inline(always)]
+    pub unsafe fn sys3(n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+        let mut r: u64;
+        unsafe {
+            core::arch::asm!(
+                "svc #0",
+                inout("x0") a0 => r,
+                in("x1") a1,
+                in("x2") a2,
+                in("x8") n,
+                options(nostack),
+            )
+        };
+        r
+    }
+    #[inline(always)]
+    pub unsafe fn sys4(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+        let mut r: u64;
+        unsafe {
+            core::arch::asm!(
+                "svc #0",
+                inout("x0") a0 => r,
+                in("x1") a1,
+                in("x2") a2,
+                in("x3") a3,
+                in("x8") n,
+                options(nostack),
+            )
+        };
+        r
+    }
 }
-#[inline(always)]
-unsafe fn sys1(n: u64, a0: u64) -> u64 {
-    let mut r: u64;
-    core::arch::asm!("svc #0", inout("x0") a0 => r, in("x8") n, options(nostack));
-    r
+
+#[cfg(target_arch = "x86_64")]
+mod sysabi {
+    #[inline(always)]
+    pub unsafe fn sys0(n: u64) -> u64 {
+        let mut r: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") n => r,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            )
+        };
+        r
+    }
+    #[inline(always)]
+    pub unsafe fn sys1(n: u64, a0: u64) -> u64 {
+        let mut r: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") n => r,
+                in("rdi") a0,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            )
+        };
+        r
+    }
+    #[inline(always)]
+    pub unsafe fn sys2(n: u64, a0: u64, a1: u64) -> u64 {
+        let mut r: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") n => r,
+                in("rdi") a0,
+                in("rsi") a1,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            )
+        };
+        r
+    }
+    #[inline(always)]
+    pub unsafe fn sys3(n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+        let mut r: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") n => r,
+                in("rdi") a0,
+                in("rsi") a1,
+                in("rdx") a2,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            )
+        };
+        r
+    }
+    /// The four-argument form — used only by `SYS_THREAD_SPAWN(entry, sp, arg, place)`.
+    ///
+    /// The fourth argument goes in **r10, not rcx**, and that is forced by the hardware rather than
+    /// chosen: `syscall` writes the return RIP into rcx as its first act, so a value placed there
+    /// would be destroyed before the kernel could read it. r10 is the register the SysV syscall
+    /// convention nominates for exactly this reason, and the kernel's entry stub shuffles it into the
+    /// fifth C argument register before dispatching.
+    #[inline(always)]
+    pub unsafe fn sys4(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+        let mut r: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") n => r,
+                in("rdi") a0,
+                in("rsi") a1,
+                in("rdx") a2,
+                in("r10") a3,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            )
+        };
+        r
+    }
 }
-#[inline(always)]
-unsafe fn sys2(n: u64, a0: u64, a1: u64) -> u64 {
-    let mut r: u64;
-    core::arch::asm!(
-        "svc #0",
-        inout("x0") a0 => r,
-        in("x1") a1,
-        in("x8") n,
-        options(nostack),
-    );
-    r
-}
-#[inline(always)]
-unsafe fn sys3(n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
-    let mut r: u64;
-    core::arch::asm!(
-        "svc #0",
-        inout("x0") a0 => r,
-        in("x1") a1,
-        in("x2") a2,
-        in("x8") n,
-        options(nostack),
-    );
-    r
-}
-#[inline(always)]
-unsafe fn sys4(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-    let mut r: u64;
-    core::arch::asm!(
-        "svc #0",
-        inout("x0") a0 => r,
-        in("x1") a1,
-        in("x2") a2,
-        in("x3") a3,
-        in("x8") n,
-        options(nostack),
-    );
-    r
-}
+
+use sysabi::{sys0, sys1, sys2, sys3, sys4};
 
 #[inline(always)]
 fn sys_yield() {

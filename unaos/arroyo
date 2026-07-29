@@ -491,6 +491,44 @@ build_user_stat_x86() {
     echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 persistence program: STAT-X86.ELF (${ssz} B)${COLOR_RESET}"
 }
 
+# WINX-7: build the x86_64 static ELF64 EL0 MINI-VUG program (crates/user-vug → target/VUG-X86.ELF).
+# The x86 twin of the aarch64 VUG.ELF build in build_user_aarch64(), and the exact shape of
+# build_user_stat_x86 above: same crate, same app logic, same linker-script SHAPE
+# (crates/user-vug/user-vug-x86.ld — two PT_LOAD segments via a PHDRS clause); only the per-arch
+# syscall stubs and the target differ.
+#
+# Unlike STAT, this program exercises the WINX-7 verbs — SYS_THREAD_SPAWN/JOIN/EXIT, SYS_FUTEX and
+# SYS_INPUT_POLL — so a build of it that links is also the first end-to-end statement that those
+# stubs and those numbers agree with the kernel's.
+#
+# The crate's .cargo/config.toml defaults to the aarch64 target, so `--target` is passed EXPLICITLY
+# here to override it; the two builds land in separate target subdirectories and never clobber each
+# other. The output keeps a distinct name (VUG-X86.ELF) because both arches' images share one
+# target/ directory and the staging steps pick the right one.
+build_user_vug_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 mini-vug static-ELF program (crates/user-vug → target/VUG-X86.ELF)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-vug"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-vug/target/x86_64-unknown-none/release/user-vug" \
+      "${WORKSPACE_DIR}/target/VUG-X86.ELF"
+    # The same four checks the x86 STAT build makes. The e_machine one is the load-bearing addition
+    # over the aarch64 build: the loader rejects a wrong-arch image, and staging an aarch64 VUG.ELF on
+    # x86 media would be a confusing bench failure rather than an obvious build failure.
+    [ -s "${WORKSPACE_DIR}/target/VUG-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: VUG-X86.ELF missing/empty — x86 VUG build failed${COLOR_RESET}"; exit 1; }
+    local vmag; vmag="$(head -c 4 "${WORKSPACE_DIR}/target/VUG-X86.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$vmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: VUG-X86.ELF does not start with the ELF magic; first 4 bytes = ${vmag}${COLOR_RESET}"; exit 1; }
+    local vmach; vmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/VUG-X86.ELF" | tr -d ' \n')"
+    [ "$vmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: VUG-X86.ELF e_machine is ${vmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    local vsz; vsz="$(wc -c < "${WORKSPACE_DIR}/target/VUG-X86.ELF" | tr -d ' ')"
+    [ "$vsz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: VUG-X86.ELF ${vsz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 mini-vug program: VUG-X86.ELF (${vsz} B)${COLOR_RESET}"
+}
+
 build_kernel_aarch64() {
     echo -e "${COLOR_YELLOW}⚡ Building aarch64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
@@ -510,6 +548,7 @@ build_kernel_aarch64() {
 launch_x86_64() {
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
+    build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_kernel_x86_64
 
     echo -e "${COLOR_CYAN}⚡ Launching x86_64 via Builder (kernel + bootloader + QEMU)...${COLOR_RESET}"
@@ -644,6 +683,7 @@ test_x86_64() {
     local secs="${1:-20}"
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
+    build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_kernel_x86_64
 
     # VPERF: UNAOS_QMP_SHOT=<png path> arms a QMP framebuffer screendump of the headless x86 run
@@ -749,12 +789,29 @@ pack_source_along() {
     echo -e "   sha256: ${sha}   (SRC.SHA beside it: sha + commit/branch/describe)"
 }
 
-# x86_64 ESP for the MacBook (UEFI). Copy the packaged directory's contents onto a FAT32 USB
-# stick (so it has /EFI/BOOT/BOOTX64.EFI and /kernel.elf), then boot the Mac holding Option.
+# x86_64 boot media for the MacBook (UEFI). Emits TWO trees, because on x86 there are two volumes:
+#
+#   target/x86_64_esp/   the volume UEFI BOOTS  — EFI/BOOT/BOOTX64.EFI + kernel.elf (+ companions).
+#                        Read once, by the bootloader, through firmware boot services. After
+#                        ExitBootServices the kernel can never read it again.
+#   target/x86_64_data/  the volume the KERNEL READS — HELLO.BIN / STAT.ELF / VUG.ELF / hello.txt.
+#                        This is what `fs::fat::mount()` binds, which on x86 is ALWAYS the USB
+#                        mass-storage device the xHCI driver enumerated, and nothing else (there is
+#                        no SD/AHCI/NVMe driver on this arch, and BootInfo carries no boot-device
+#                        handle, so the kernel cannot reach the ESP even in principle).
+#
+# WINX-7 PKG — WHY THIS SPLIT NOW. An attended rMBP boot reported
+#   `:: WINX-2: STAT.ELF absent from the boot volume — end-to-end witness skipped ::`
+# with STAT.ELF verifiably on the booted card: the firmware booted the SD-card ESP while xHCI
+# enumerated a USB stick, so the shell's `bg /fat/STAT.ELF` searched the stick for a file the build
+# had put on the card. The old one-line instruction ("copy the contents to a FAT32 USB root") was
+# correct for a ONE-STICK boot and silently wrong for a two-device one; naming the two volumes is
+# the fix. On a single stick, write BOTH trees to that one root and everything behaves as before.
 esp_x86() {
     echo -e "${COLOR_CYAN}⚡ Building x86_64 kernel + bootloader and packaging the ESP (no QEMU)...${COLOR_RESET}"
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP as HELLO.BIN
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
+    build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -764,7 +821,16 @@ esp_x86() {
     [ -f "$_kelf" ] && echo -e "   kernel.elf sha256: $(sha256_of "$_kelf")"
     [ -f "${WORKSPACE_DIR}/target/x86_64_esp/SRC.TGZ" ] && \
       echo -e "   SRC.TGZ    sha256: $(sha256_of "${WORKSPACE_DIR}/target/x86_64_esp/SRC.TGZ")"
-    echo -e "   Copy its contents to a FAT32 USB root, then boot the Mac holding ⌥ Option → 'EFI Boot'."
+    echo -e "${COLOR_GREEN}✅ x86 DATA volume: ${WORKSPACE_DIR}/target/x86_64_data/ (HELLO.BIN / STAT.ELF / VUG.ELF)${COLOR_RESET}"
+    echo -e ""
+    echo -e "   ${COLOR_CYAN}Two volumes, because the kernel cannot read the one it booted from:${COLOR_RESET}"
+    echo -e "     BOOT volume  <- target/x86_64_esp/    (UEFI reads this; boot ⌥ Option → 'EFI Boot')"
+    echo -e "     DATA volume  <- target/x86_64_data/   (the kernel's FAT mount = the USB stick on storage_slot)"
+    echo -e "   ONE stick:  write BOTH trees to that stick's FAT32 root — they do not collide."
+    echo -e "   TWO devices (e.g. SD-card ESP + USB stick): esp tree -> the bootable device,"
+    echo -e "               data tree -> the USB stick, or \`bg /fat/VUG.ELF\` reports -ENOENT."
+    echo -e "   Probe after boot: \`cat hello.txt\` must say 'DATA volume' — if it says anything else,"
+    echo -e "               the kernel is reading a stick you did not stage."
 }
 
 # VMIMAGE-1: emit ONE self-contained, distributable bootable disk image — a GPT disk with a FAT32
@@ -783,6 +849,7 @@ vm_image() {
     echo -e "${COLOR_CYAN}⚡ Building x86 boot products + packaging VM image (unaos-x86-${git7}.img)...${COLOR_RESET}"
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it into the ESP as HELLO.BIN
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
+    build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     cd "$WORKSPACE_DIR/builder"
     UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -823,6 +890,7 @@ fat_img() {
     rm -f "${WORKSPACE_DIR}/target/x86_64_esp/SRC.TGZ" "${WORKSPACE_DIR}/target/x86_64_esp/SRC.SHA" 2>/dev/null || true
     build_user_hello_x86   # U2: ensure target/hello.bin is fresh even if the ESP is reused below
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
+    build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
         esp_x86

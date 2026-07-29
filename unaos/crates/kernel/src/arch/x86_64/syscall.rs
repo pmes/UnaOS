@@ -2382,6 +2382,15 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         WINX_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // WINX-7: the threads/futex/input fixture and its worker threads all write only their own data
+    // page and their own mapped surface, so a fault-kill means a thread verb handed ring 3 something
+    // wrong — a real WINX-7 bug, on its own counter. The most likely shape it would take is the
+    // refcount defect: an address space freed under a still-running sibling, which faults the survivor
+    // rather than returning a wrong bit. Not in PROCS, so the launcher times out to FAIL.
+    if name == EL0_THREAD_NAME || name == WINX7_TASK_NAME {
+        WINX7_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     // SOCK-2: the UDP round-trip fixture is register + inline-data only (its only user store is the recv
     // buffer in its own data page) and well-behaved; a kill is a real SOCK-2 bug — its own counter, never
     // the U1b `killed_unexpected` count. Not in PROCS, so the launcher times out to FAIL on `SOCK2_DONE`.
@@ -2721,6 +2730,13 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i
                     WINX_WITNESS.store(a0 as u32, Ordering::Release);
                     WINX_DONE.fetch_add(1, Ordering::AcqRel);
                 }
+                Some(WINX7_TASK_NAME) => {
+                    // WINX-7: the threads/futex/input fixture conveys its 8-bit witness bitmask as its
+                    // exit STATUS, by name, on the same idiom. Only the PARENT reaches here — its
+                    // worker threads terminate through `SYS_THREAD_EXIT`, which never enters this arm.
+                    WINX7_WITNESS.store(a0 as u32, Ordering::Release);
+                    WINX7_DONE.fetch_add(1, Ordering::AcqRel);
+                }
                 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
                 Some("sock2-udp") => {
                     // SOCK-2: the UDP round-trip fixture conveys its 5-bit witness bitmask as its exit STATUS
@@ -3054,6 +3070,36 @@ fn fb_info_write_win(slot: usize, id: usize, e: &WinEntry) {
 /// program can validate the entry it reads on either arch.
 const FB_MAGIC: u32 = 0x4E49_5755;
 
+/// WINX-7: which address-space slots were launched DETACHED (`bg`) rather than in the foreground
+/// (`run`). Set by `spawn_user_image_bg` before the task is spawned; cleared on slot teardown.
+///
+/// This exists because a detached windowed app has no operator to press ESC and — being launched into
+/// the background — may never receive input at all, so an app whose auto path ends after a fixed frame
+/// count would simply vanish a second or two after `bg`. On the panel that reads as a crash, which is
+/// exactly what it read as on the Pi before the aarch64 VUG-BG arc published the same bit. The remedy
+/// there and here is the same: TELL the program, and let it decide (`user-vug` skips its frame cap and
+/// tumbles until it is killed).
+///
+/// It is published in the RO info page's process-flags word rather than returned from a syscall so a
+/// program can read it once, cheaply, with no new verb — and it is read-only to EL0, so a program can
+/// learn how it was launched but cannot claim to have been launched some other way.
+static SLOT_DETACHED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+
+/// WINX-7: the process-flags word's DETACHED bit, at info-page byte offset `0x20`. Bit 0, the same
+/// bit and the same offset the aarch64 info page uses, so one arch-neutral program reads it on both.
+const FB_FLAG_DETACHED: u32 = 1 << 0;
+
+/// WINX-7: publish slot `slot`'s process-flags word into its RO info page. Written through the KERNEL
+/// identity pointer — EL0's alias of this page is read-only — and called from `sys_win_create`, which
+/// is what maps the info page in the first place, so the word is present the moment a program can read
+/// it and never before.
+fn fb_info_write_flags(slot: usize) {
+    let info = crate::arch::x86_64::memory::slot_fb_info_ptr(slot) as *mut u32;
+    let flags = if SLOT_DETACHED[slot].load(Ordering::Acquire) { FB_FLAG_DETACHED } else { 0 };
+    unsafe { info.add(0x20 / 4).write_volatile(flags) };
+}
+
 /// WINX-1: `SYS_WIN_CREATE(w, h)` -> window id (0..WIN_MAX), or a negative errno.
 ///
 /// Allocates the lowest free REGION slot for this address space (so a process's first window is region
@@ -3131,6 +3177,10 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     );
     t[id] = e;
     fb_info_write_win(slot, id, &e);
+    // WINX-7: publish the process-flags word alongside the geometry. Idempotent across a process's
+    // several `SYS_WIN_CREATE`s (it re-writes the same value), and it must be here rather than at
+    // launch because `map_slot_fb_info` above is what makes the page exist.
+    fb_info_write_flags(slot);
     drop(t);
     // WINX-7: if NOBODY currently has input focus, the process that just opened a window gets it.
     //
@@ -3713,6 +3763,16 @@ static THREADS_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static THREADS_JOINED: AtomicU64 = AtomicU64::new(0);
 static THREADS_EXITED: AtomicU64 = AtomicU64::new(0);
 
+/// WINX-7: completed `FUTEX_WAIT`s that actually PARKED and were woken — the deterministic proof that
+/// the futex is a real wait/wake and not a spin. See the `Woken` arm of `sys_futex` for why only that
+/// outcome is counted.
+static FUTEX_PARKS: AtomicU64 = AtomicU64::new(0);
+
+/// WINX-7: the park counter's read side.
+pub fn futex_park_count() -> u64 {
+    FUTEX_PARKS.load(Ordering::Acquire)
+}
+
 /// WINX-7: `(spawned, joined, exited)` — read by the regression witness.
 pub fn thread_stats() -> (u64, u64, u64) {
     (
@@ -3745,7 +3805,18 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
     let key = crate::arch::sched::futex_key(slot, uaddr);
     match op {
         FUTEX_WAIT => match crate::arch::sched::futex_wait(key, uaddr, val as u32) {
-            crate::arch::sched::FutexWait::Woken => 0,
+            crate::arch::sched::FutexWait::Woken => {
+                // WINX-7: count only the WOKEN outcome. This is the counter a witness can gate on,
+                // and the distinction matters: `Mismatch` means the caller never slept (the value had
+                // already moved), so counting it would let a pure spin masquerade as a working futex.
+                // `Woken` is the one outcome that PROVES a task parked and a `FUTEX_WAKE` released it.
+                //
+                // It replaces sampling `sched::futex_parked_total()` from the launcher, which was the
+                // first cut and was inherently racy: a park that begins and ends between two samples
+                // is invisible, so a healthy run could report "no park observed" purely on timing.
+                FUTEX_PARKS.fetch_add(1, Ordering::AcqRel);
+                0
+            }
             crate::arch::sched::FutexWait::Mismatch => EAGAIN,
             crate::arch::sched::FutexWait::TableFull => EAGAIN,
             crate::arch::sched::FutexWait::NoTask => EINVAL,
@@ -8992,6 +9063,10 @@ pub fn clear_handle_row(slot: usize) {
     // generation bump above also retires this slot's thread-table rows for the lazy scavenge in
     // `sys_thread_spawn` — a killed threaded program leaks no rows permanently.
     el0_input_revoke_slot(slot);
+    // WINX-7: the detached mark is per-TENANT, not per-slot, so it must die with the tenant — a
+    // foreground `run` landing in a slot a `bg` job just vacated must not inherit "I was detached"
+    // and skip its own frame cap.
+    SLOT_DETACHED[slot].store(false, Ordering::Release);
     for i in 0..NHANDLE {
         // Clear the value first (Empty => `handle_resolve` bails as NoHandle before reading rights/kind),
         // then the rights and kind — so no intermediate state is ever a live handle with stale rights/kind.
@@ -10898,6 +10973,10 @@ pub fn run_user_image(
 /// shell that never runs `jobs` eventually gets "process table full", not silent loss.
 pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
     let (mapped, pi) = load_program_common(bytes)?;
+    // WINX-7: mark the slot DETACHED before the task can run, so its first `SYS_WIN_CREATE` publishes
+    // the flag and the program never observes a stale `false`. See `SLOT_DETACHED` for why a windowed
+    // app needs to know it was backgrounded.
+    SLOT_DETACHED[mapped.slot].store(true, Ordering::Release);
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
     // Place a bg job on a core chosen by the same round-robin the fixtures use rather than the shell's
     // own: every `bg` launch runs from the same shell context, so pinning to `this_cpu` would stack every
@@ -11305,7 +11384,16 @@ fn winx2_launcher(_demo_cpu: usize) {
         return;
     };
     let Ok(de) = fs.find_in_root("STAT.ELF") else {
-        serial_println!(":: WINX-2: STAT.ELF absent from the boot volume — end-to-end witness skipped ::");
+        // WINX-7 PKG — the message names the VOLUME, because the previous wording ("the boot volume")
+        // was not merely vague, it was WRONG in the case that actually fired. `fat::mount()` binds the
+        // global block device, which on x86 is always the USB mass-storage device xHCI enumerated;
+        // the volume UEFI booted from is a different thing and is unreachable after ExitBootServices.
+        // An attended rMBP boot hit exactly that split — STAT.ELF was on the booted SD card, the mount
+        // was the USB stick — and the old message sent the operator to check the card, which was fine.
+        // Naming the mounted volume, and the tree that stages it, is the whole remedy from this side.
+        serial_println!(
+            ":: WINX-2: STAT.ELF absent from the mounted DATA volume (the USB mass-storage device on storage_slot — NOT the UEFI boot volume, which the kernel cannot read) — stage target/x86_64_data/ onto it; end-to-end witness skipped ::"
+        );
         return;
     };
     let cap = user_window_size();
@@ -11550,6 +11638,478 @@ fn winx3_launcher(_demo_cpu: usize) {
             ":: WINX-3: ELF loader FAIL — plan={} rej_arch={} rej_wx={} status={:#x} windowed={} presents={} gone={} cleared={} (want true/true/true/{:#x}/true/>=2/true/true) ::",
             plan_ok, rejects_wrong_arch, rejects_wx, status, windowed, presents, gone, cleared,
             WINX_WITNESS_ALL
+        );
+    }
+}
+
+// =============================================================================================
+// WINX-7: the ring-3 THREADS + FUTEX + INPUT fixture and its launcher — the headless proof that the
+// four verb families this arc adds work together, from ring 3, through the real syscall path.
+//
+// It is an INLINE, position-independent blob (the WINX-1 / sock2 / u9x idiom) rather than the shipped
+// `VUG.ELF`, for the reason WINX-3's header already records: `./arroyo test` attaches no FAT volume,
+// so an on-disk artifact cannot be read in CI. The two witnesses divide the work exactly as the WINX-1
+// / WINX-2 pair does — this one proves the SYSCALL SURFACE in CI on every run, and WINX-8 below proves
+// the SHIPPED ARTIFACT at the bench.
+//
+// What it proves that no earlier fixture could:
+//   * Two ring-3 tasks really run under ONE CR3 — the workers write into the parent's data page and
+//     the parent reads what they wrote.
+//   * The thread ARGUMENT ABI works: each worker is passed a distinct index in rdi and writes its
+//     magic at an offset computed from it, so a broken `arg` delivery shows up as a missing magic
+//     rather than as a plausible-looking pass.
+//   * The FUTEX is a real park, not a spin: the parent blocks in `FUTEX_WAIT` and is released by the
+//     workers' `FUTEX_WAKE`. The launcher independently witnesses the park through
+//     `futex_park_count()` — the count of `FUTEX_WAIT`s that actually blocked and were woken. That is
+//     the difference between "the barrier completed" and "the barrier completed BECAUSE the futex
+//     worked".
+//   * `SYS_INPUT_POLL` delivers a routed event to the focused process and only to it.
+//   * `SYS_THREAD_JOIN` returns after the workers' `SYS_THREAD_EXIT`, and the refcounted teardown
+//     leaves the slot clean — a first-thread-frees bug would have torn the address space down under
+//     the still-running parent and shown up as a fault-kill, not a wrong bit.
+// =============================================================================================
+
+// WINX-7 ring-3 fixture. Register + inline-data only; runs correctly at any VA (RIP-relative).
+//
+// Window layout it assumes (the 4-page ring-3 program window):
+//   page 0 (+0x0000)  code, RX/RO          — this blob
+//   page 1 (+0x1000)  data, RW/NX          — [+0x1000] done counter, [+0x1004] magic A, [+0x1008] magic B
+//   page 2 (+0x2000)  RW/NX                — worker A's stack (grows down from +0x3000)
+//   page 3 (+0x3000)  RW/NX                — worker B's stack (from +0x3800), parent's (from +0x4000)
+// The same stack carve `user-vug` uses, so this fixture and the shipped program agree about the one
+// piece of the ABI a program chooses for itself.
+//
+// Callee-saved registers survive syscalls (the C dispatcher preserves them; the sysret tail scrubs only
+// rdi/rsi/rdx/r8/r9/r10), so the witness accumulator and the handles live in r12-r15/rbx/rbp. The poll
+// budget in particular MUST be callee-saved — r8 would be scrubbed to 0 by the first syscall's return.
+//
+// Witness bits (accumulated in r12, conveyed as the exit status):
+//   bit0 SYS_WIN_CREATE ok · bit1 thread A spawned · bit2 thread B spawned · bit3 the futex barrier
+//   completed (both workers arrived) · bit4 BOTH workers wrote their magic at the offset their `arg`
+//   selected (the thread-argument ABI) · bit5 SYS_INPUT_POLL delivered a routed event · bit6
+//   SYS_WIN_PRESENT ok · bit7 both SYS_THREAD_JOINs returned 0. ALL = 0xFF.
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_winx7_blob_start
+unaos_user_winx7_blob_start:
+    .balign 16
+    .globl unaos_user_winx7
+unaos_user_winx7:
+    xor r12, r12                              // witness = 0
+    lea r15, [rip + unaos_user_winx7_blob_start]  // r15 = this program's window base
+    mov dword ptr [r15 + 0x1000], 0           // done   = 0
+    mov dword ptr [r15 + 0x1004], 0           // magicA = 0
+    mov dword ptr [r15 + 0x1008], 0           // magicB = 0
+
+    // (0) SYS_WIN_CREATE(128, 128). Fail-closed: without a window there is nothing to present and no
+    //     info page, so a negative return goes straight to the exit with the bits so far.
+    mov rax, 29
+    mov rdi, 128
+    mov rsi, 128
+    syscall
+    test rax, rax
+    js 90f
+    mov r13, rax                              // r13 = window id
+    or r12, 1
+
+    // (1) SYS_THREAD_SPAWN(worker, sp = base+0x3000, arg = 0, place = 0 — this core).
+    lea rdi, [rip + unaos_user_winx7_worker]
+    lea rsi, [r15 + 0x3000]
+    xor rdx, rdx
+    xor r10, r10
+    mov rax, 21
+    syscall
+    test rax, rax
+    js 10f
+    mov r14, rax                              // r14 = handle A
+    or r12, 2
+10:
+    // (2) SYS_THREAD_SPAWN(worker, sp = base+0x3800, arg = 1, place = 1 — a sibling core).
+    lea rdi, [rip + unaos_user_winx7_worker]
+    lea rsi, [r15 + 0x3800]
+    mov rdx, 1
+    mov r10, 1
+    mov rax, 21
+    syscall
+    test rax, rax
+    js 20f
+    mov rbx, rax                              // rbx = handle B
+    or r12, 4
+20:
+    // (3) The FUTEX frame barrier: block until `done` reaches 2. Skipped unless BOTH spawns
+    //     succeeded — a barrier whose target cannot be reached is the wedge itself, which is the
+    //     VUGGUARD rule this fixture must not violate either.
+    mov eax, r12d
+    and eax, 6
+    cmp eax, 6
+    jne 40f
+30: mov eax, dword ptr [r15 + 0x1000]
+    cmp eax, 2
+    jge 35f
+    // SYS_FUTEX(&done, FUTEX_WAIT = 0, expected = the value we just read). The kernel re-compares
+    // under the bucket lock, so a wake landing between the load and the call cannot be lost.
+    mov edx, eax
+    lea rdi, [r15 + 0x1000]
+    xor rsi, rsi
+    mov rax, 26
+    syscall
+    jmp 30b
+35: or r12, 8                                 // bit3: both workers arrived
+    // bit4: each worker wrote its magic at base+0x1004 + arg*4 — so this is a positive test of the
+    // thread-argument register, not merely of "a worker ran".
+    cmp dword ptr [r15 + 0x1004], -1517032219 // 0xA5A5A5A5 as a sign-extended imm32
+    jne 40f
+    cmp dword ptr [r15 + 0x1008], -1517032219
+    jne 40f
+    or r12, 16
+40:
+    // (4) SYS_INPUT_POLL until the launcher's injected event arrives, or the budget is spent. The
+    //     budget lives in rbp because it must SURVIVE the syscall — the sysret tail scrubs r8-r10.
+    mov rbp, 2000000
+50: mov rax, 27
+    syscall
+    test rax, rax
+    jns 55f                                   // a non-negative return IS a packed event
+    dec rbp
+    jnz 50b
+    jmp 60f
+55: or r12, 32                                // bit5: a routed input event reached this process
+60:
+    // (5) SYS_WIN_PRESENT(win).
+    mov rax, 30
+    mov rdi, r13
+    syscall
+    test rax, rax
+    jnz 70f
+    or r12, 64                                // bit6: present ok
+70:
+    // (6) Join both workers. Only joined if they were spawned — joining a value that is a negative
+    //     errno is a bogus syscall, and joining a thread that never started would be a lie about
+    //     what was reclaimed.
+    mov eax, r12d
+    and eax, 6
+    cmp eax, 6
+    jne 90f
+    mov rax, 23
+    mov rdi, r14
+    syscall
+    mov rbp, rax                              // accumulate both join returns
+    mov rax, 23
+    mov rdi, rbx
+    syscall
+    or rbp, rax
+    test rbp, rbp
+    jnz 90f
+    or r12, 128                               // bit7: both joins returned 0
+90: mov rax, 2                                // SYS_EXIT(witness)
+    mov rdi, r12
+    syscall
+95: jmp 95b                                   // sys_exit never returns; guard
+
+    // ---- the worker thread. Entered at ring 3 with rdi = the `arg` SYS_THREAD_SPAWN was given. ----
+    .balign 16
+    .globl unaos_user_winx7_worker
+unaos_user_winx7_worker:
+    mov rbx, rdi                              // stash `arg` — rdi is about to be a syscall argument
+    lea r15, [rip + unaos_user_winx7_blob_start]
+    // magic[arg] = 0xA5A5A5A5 — the store whose ADDRESS depends on `arg`, so a wrong argument writes
+    // the wrong slot and the parent's bit4 check fails.
+    lea rcx, [r15 + 0x1004]
+    mov eax, -1517032219                      // 0xA5A5A5A5
+    mov dword ptr [rcx + rbx*4], eax
+    // Arrive: atomically bump `done`, then wake the parent. The lock-prefixed add is what makes two
+    // workers on two cores both count.
+    mov eax, 1
+    lock xadd dword ptr [r15 + 0x1000], eax
+    // SYS_FUTEX(&done, FUTEX_WAKE = 1, n = 1)
+    lea rdi, [r15 + 0x1000]
+    mov rsi, 1
+    mov rdx, 1
+    mov rax, 26
+    syscall
+    // SYS_THREAD_EXIT — posts this thread's completion (releasing the parent's join) and drops its
+    // hold on the shared address space. Never returns.
+    mov rax, 22
+    syscall
+1:  jmp 1b
+
+    .globl unaos_user_winx7_blob_end
+unaos_user_winx7_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_winx7_blob_start: u8;
+    static unaos_user_winx7_blob_end: u8;
+    static unaos_user_winx7: u8;
+}
+
+/// WINX-7: the fixture's witness bitmask (its exit status), routed by name in `SYS_EXIT`.
+static WINX7_WITNESS: AtomicU32 = AtomicU32::new(0);
+static WINX7_DONE: AtomicU32 = AtomicU32::new(0);
+static WINX7_KILLED: AtomicU32 = AtomicU32::new(0);
+/// All eight bits: window + two spawns + the futex barrier + the thread-argument ABI + a routed input
+/// event + a present + two clean joins.
+const WINX7_WITNESS_ALL: u32 = 0xFF;
+
+/// WINX-7: the ring-3 task name, so the `SYS_EXIT` arm can route the witness by name (the u5x/u6x
+/// idiom — x86 has no `SYS_REPORT`).
+const WINX7_TASK_NAME: &str = "winx7-app";
+
+/// WINX-7: build the fixture's slot — allocate a private address space, scrub the program window, and
+/// copy the blob into its RX/RO code page through the kernel identity alias. The FB region is NOT
+/// pre-mapped; mapping it is `SYS_WIN_CREATE`'s job, and that it starts unmapped is part of what the
+/// fixture proves. `None` on slot-alloc failure.
+fn winx7_build() -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_winx7_blob_start as usize;
+    let bend = &raw const unaos_user_winx7_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "WINX-7 blob does not fit in a code page");
+    let off = (&raw const unaos_user_winx7 as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        // The parent's stack top is the window top; the workers' are carved BELOW it at +0x3800 and
+        // +0x3000 by the blob, so the three never overlap.
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// WINX-7 launcher + verdict. Chained after the WINX-3 loader witness, so the arc's four verb families
+/// are proved after the machinery they build on.
+///
+/// The launcher does three things the fixture cannot do for itself:
+///   1. GRANTS IT FOCUS explicitly (`el0_input_set_active`), rather than relying on the create-time
+///      auto-grant. Both paths exist and both are correct, but a witness that depended on the implicit
+///      one would silently stop testing input the day the focus policy changed.
+///   2. INJECTS an input event through the real `el0_input_enqueue` router seam — the same function
+///      the shell's drain calls. QEMU delivers no USB HID at all, so a kernel-side injection is the
+///      only way this leg can be witnessed headlessly, and routing it through the seam rather than
+///      straight into the ring means the focus gate is on the tested path.
+///   3. WITNESSES THE PARK independently, through `futex_park_count()` — the count of `FUTEX_WAIT`s
+///      that actually blocked and were woken. Without it, a barrier that completed by luck (both
+///      workers finishing before the parent ever reached the wait) would be indistinguishable from a
+///      working futex. It is a COUNTER rather than a sample of the parked set, which the first cut
+///      used and which was flaky by construction: a park beginning and ending between two samples is
+///      invisible, so a perfectly healthy run could report "no park observed" purely on timing.
+fn winx7_launcher(_demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let presents_before = fb_present_count();
+    let (spawned_before, joined_before, exited_before) = thread_stats();
+    let parks_before = futex_park_count();
+    let Some(fix) = winx7_build() else {
+        serial_println!(":: WINX-7: no free address-space slot — threads/futex/input demo skipped ::");
+        return;
+    };
+    serial_println!(
+        ":: WINX-7: ring-3 threads + futex + input — SYS_THREAD_SPAWN(21)/_EXIT(22)/_JOIN(23), SYS_FUTEX(26), SYS_INPUT_POLL(27), two EL0 threads under one CR3 ::"
+    );
+    crate::arch::sched::spawn_user_in_space(
+        WINX7_TASK_NAME,
+        fix.entry,
+        fix.sp,
+        crate::arch::sched::meter_current_cpu(),
+        fix.cr3,
+    );
+
+    // Wait for the fixture, granting focus once its window appears and injecting input while it polls.
+    // The futex park is counted kernel-side (`futex_park_count`), not sampled here.
+    let deadline = crate::arch::ticks() + 10_000;
+    let mut focused = false;
+    let mut injected: u32 = 0;
+    while WINX7_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < deadline {
+        if !focused && winx_slot_has_window(fix.slot) {
+            el0_input_set_active((fix.slot as u64) + 1);
+            focused = true;
+        }
+        if focused && injected < 64 {
+            // A plain printable key — the simplest event that survives `pack_input` and is trivially
+            // recognisable if it ever needs to be read off the wire. Injected repeatedly because the
+            // fixture reaches its poll only after the barrier, and a single early injection would be
+            // consumed by nothing (drop-newest on a full ring makes repetition harmless).
+            if el0_input_enqueue(crate::pal::Event::Key(b'k')) {
+                injected += 1;
+            }
+        }
+        crate::arch::sched::yield_now();
+    }
+    let witness = WINX7_WITNESS.load(Ordering::Acquire);
+    let killed = WINX7_KILLED.load(Ordering::Acquire);
+    let presents = fb_present_count() - presents_before;
+    let (spawned, joined, exited) = thread_stats();
+    // The PARK count, not a sample of the parked set: a `FUTEX_WAIT` that blocked and was woken is
+    // recorded when it returns, so a park of any duration is caught and a run cannot fail on timing.
+    let parks = futex_park_count() - parks_before;
+
+    // Teardown proof: the fixture's exit freed its slot only after the LAST thread retired, which
+    // retires its window rows and drops its FB leaves. A first-thread-frees bug shows up here as a
+    // window row that went free while the parent was still presenting — or, far more likely, as a
+    // fault-kill counted in `killed`.
+    let tdeadline = crate::arch::ticks() + 2_000;
+    while winx_slot_has_window(fix.slot) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = !winx_slot_has_window(fix.slot);
+    // Focus must have returned to the shell when the slot was torn down. If it had not, every later
+    // keystroke on this boot would be enqueued into a ring with no consumer.
+    let focus_released = el0_input_active() == 0;
+
+    // SERIAL SETTLE — see the note in `winx_launcher`: the UART writer drops lines on contention and
+    // this verdict follows the compositor's close/erase burst from another core.
+    for _ in 0..64 {
+        crate::arch::sched::yield_now();
+    }
+
+    let threads_ok = spawned - spawned_before == 2
+        && joined - joined_before == 2
+        && exited - exited_before == 2;
+    if witness == WINX7_WITNESS_ALL
+        && threads_ok
+        && parks >= 1
+        && presents >= 1
+        && cleared
+        && focus_released
+        && killed == 0
+    {
+        serial_println!(
+            ":: WINX-7: ring-3 threads + futex + input — 2 threads under one CR3 spawned/arrived/joined, {} futex park(s) witnessed, thread-arg ABI verified, {} injected event(s) polled, {} present(s), focus released, teardown clean -> PASS ::",
+            parks, injected, presents
+        );
+    } else {
+        serial_println!(
+            ":: WINX-7: ring-3 threads + futex + input FAIL — witness={:#x} spawned={} joined={} exited={} parks={} presents={} injected={} cleared={} focus_released={} killed={} done={} (want {:#x}/2/2/2/>=1/>=1/>0/true/true/0/1) ::",
+            witness,
+            spawned - spawned_before,
+            joined - joined_before,
+            exited - exited_before,
+            parks,
+            presents,
+            injected,
+            cleared,
+            focus_released,
+            killed,
+            WINX7_DONE.load(Ordering::Acquire),
+            WINX7_WITNESS_ALL
+        );
+    }
+}
+
+// =============================================================================================
+// WINX-8: the VUG.ELF end-to-end witness — the shipped 3D demo off the DATA volume, through the real
+// loader, into a compositor window, then killed. The WINX-2 shape applied to the artifact this arc
+// exists to deliver.
+//
+// Like WINX-2 it needs a mounted FAT volume carrying the artifact, which the headless `./arroyo test`
+// does not attach — so in CI it skips with one honest line naming the volume it looked at, and it
+// proves itself at the bench. What it adds over WINX-2 is that VUG.ELF exercises the WINX-7 verbs, so
+// a successful run is the statement that the ring-3 stubs in `crates/user-vug` and the kernel handlers
+// in this file agree about all ten numbers — the one thing the inline fixture above cannot say,
+// because it and the kernel were written in the same file.
+// =============================================================================================
+
+/// WINX-8: how many presents VUG.ELF must land before we accept that it is really running its frame
+/// loop rather than having created a window and wedged at its first barrier. A vug presents once per
+/// frame and its frames are fast, so three is well under a second of its life — and, critically, a
+/// program whose two thread spawns were refused would still reach a present (the VUGGUARD inline
+/// raster), so this is a liveness gate rather than a threading one.
+const WINX8_MIN_PRESENTS: u64 = 3;
+
+/// WINX-8: load `VUG.ELF` off the mounted FAT volume and run the whole `bg` lifecycle on it.
+fn winx8_launcher(_demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Ok(fs) = crate::fs::fat::mount() else {
+        serial_println!(":: WINX-8: no FAT volume on the block device — VUG.ELF end-to-end witness skipped ::");
+        return;
+    };
+    let Ok(de) = fs.find_in_root("VUG.ELF") else {
+        // The same volume-naming the WINX-2 skip carries, and for the same reason: on x86 the mounted
+        // volume is the USB mass-storage device, never the UEFI boot volume, and staging into
+        // `target/x86_64_esp/` alone puts the artifact where the running kernel has no path to it.
+        serial_println!(
+            ":: WINX-8: VUG.ELF absent from the mounted DATA volume (the USB mass-storage device on storage_slot — NOT the UEFI boot volume, which the kernel cannot read) — stage target/x86_64_data/ onto it; end-to-end witness skipped ::"
+        );
+        return;
+    };
+    let cap = user_window_size();
+    if de.size == 0 || de.size as usize > cap {
+        serial_println!(
+            ":: WINX-8: VUG.ELF is {} bytes, outside the {}-byte EL0 window — witness skipped ::",
+            de.size, cap
+        );
+        return;
+    }
+    let mut bytes = alloc::vec![0u8; de.size as usize];
+    if fs.read_file(&de, &mut bytes, cap).is_err() {
+        serial_println!(":: WINX-8: VUG.ELF read failed — end-to-end witness skipped ::");
+        return;
+    }
+    serial_println!(
+        ":: WINX-8: VUG.ELF end-to-end — {} bytes off the DATA volume, through the ELF loader into a compositor window ::",
+        bytes.len()
+    );
+
+    let presents_before = fb_present_count();
+    let (spawned_before, _, _) = thread_stats();
+    let (pid, slot, entry) = match spawn_user_image_bg(&bytes) {
+        Ok(v) => v,
+        Err(why) => {
+            serial_println!(":: WINX-8: VUG.ELF end-to-end FAIL — bg spawn rejected: {} ::", why);
+            return;
+        }
+    };
+    let slot = slot as usize;
+
+    let deadline = crate::arch::ticks() + 5_000;
+    let mut windowed = false;
+    let mut presents = 0u64;
+    while crate::arch::ticks() < deadline {
+        windowed |= winx_slot_has_window(slot);
+        presents = fb_present_count() - presents_before;
+        if windowed && presents >= WINX8_MIN_PRESENTS {
+            break;
+        }
+        crate::arch::sched::yield_now();
+    }
+    let threads = thread_stats().0 - spawned_before;
+
+    // The kill IS part of the contract for a `bg` vug: it was launched DETACHED, so it skips its frame
+    // cap and tumbles until it is killed — which is the whole point of publishing that flag.
+    let verdict = bg_kill(pid, slot as u64);
+    let killed = verdict == "killed";
+    let reaped = matches!(bg_poll(pid, true), BgPoll::Faulted | BgPoll::Exited(_));
+    let gone = matches!(bg_poll(pid, false), BgPoll::Gone);
+    let tdeadline = crate::arch::ticks() + 2_000;
+    while winx_slot_has_window(slot) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = !winx_slot_has_window(slot);
+
+    for _ in 0..64 {
+        crate::arch::sched::yield_now();
+    }
+
+    if windowed && presents >= WINX8_MIN_PRESENTS && killed && reaped && gone && cleared {
+        serial_println!(
+            ":: WINX-8: VUG.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents with {} EL0 thread(s), killed + reaped, teardown clean -> PASS ::",
+            entry, presents, threads
+        );
+    } else {
+        serial_println!(
+            ":: WINX-8: VUG.ELF end-to-end FAIL — windowed={} presents={} threads={} killed={} ({}) reaped={} gone={} cleared={} (want true/>={}/-/true/true/true/true) ::",
+            windowed, presents, threads, killed, verdict, reaped, gone, cleared, WINX8_MIN_PRESENTS
         );
     }
 }
@@ -13295,6 +13855,15 @@ fn u8x_launcher(demo_cpu: usize) {
     // does not have, so this one synthesizes a real multi-segment ELF64 in memory and pushes it through
     // the same `spawn_user_image_bg`, keeping the loader proven in CI rather than only at the bench.
     winx3_launcher(demo_cpu);
+
+    // WINX-7: the threads + futex + input fixture, after the loader witness so the machinery it
+    // builds on is proved first. Unconditional and headless-complete — it needs no block device and
+    // no panel, only the scheduler.
+    winx7_launcher(demo_cpu);
+
+    // WINX-8: the VUG.ELF end-to-end witness. Gates on the mounted volume internally, so a run with no
+    // FAT volume (or no staged VUG.ELF) skips cleanly with one honest line naming the volume.
+    winx8_launcher(demo_cpu);
 
     // SOCK-2 (knob-on, x86-only): chain the ring-3 UDP round-trip demo LAST — after the whole storage
     // chain u9x drives (so its line lands after every other demo, in both storage and no-storage modes,
