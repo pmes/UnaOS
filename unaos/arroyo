@@ -1797,7 +1797,12 @@ battery() {
             awk -v p="$pattern" 'BEGIN{f=1} $0 ~ p {f=0} END{exit f}' "$vf" || ok=0
         fi
         # Any explicit FAIL verdict line in a serial-backed step is a failure.
-        awk 'BEGIN{f=0} /-> FAIL|FAIL ::/{f=1} END{exit f}' "$vf" || ok=0
+        # FATIMG-CI: `FAIL —` is in the list because the WINX end-to-end verdicts spell their failure
+        # `:: WINX-2: ... FAIL — <reason> ::`, which matched NEITHER `-> FAIL` nor `FAIL ::`. Those are
+        # exactly the verdicts that carry the shipped `bg /fat/STAT.ELF` / `bg /fat/VUG.ELF` path, so a
+        # red one used to pass straight through this scan. The em-dash keeps the pattern narrow enough
+        # not to fire on prose that merely contains the word.
+        awk 'BEGIN{f=0} /-> FAIL|FAIL ::|FAIL — /{f=1} END{exit f}' "$vf" || ok=0
         if [ "$ok" -eq 1 ]; then
             results="${results}  ✅ ${name}\n"
         else
@@ -1815,6 +1820,20 @@ battery() {
     # already caught by the generic FAIL scan; these steps require the positive `ok` witness present.
     _step "x86 usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-x86.log"    cat "$blog_dir/test-x86.log"
     _step "arm usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-arm.log"    cat "$blog_dir/test-arm-v2.log"
+    # FATIMG-CI: the SHIPPED EL0 app-launch path — `bg /fat/STAT.ELF` / `bg /fat/VUG.ELF` read off a
+    # REAL attached FAT volume, through the ELF loader, into a compositor window. Same cheap re-grep
+    # shape as the usb-write witnesses above (no extra QEMU run): the FAT-attached boot already
+    # happened in the `test-fat` step, these two just require its POSITIVE verdicts to be present.
+    #
+    # WHY THESE ARE THEIR OWN STEPS. The witnesses SKIP with one honest line when no block device is
+    # attached, and `./arroyo test` attaches none — so on a plain test run their absence is silence,
+    # not red. Before the Linux backend landed in scripts/make-fat-img.sh, no FAT volume could be
+    # built on a Linux box at all, so `test-fat` could not run there and the whole configuration was
+    # unwitnessed: a `find_in_root` result that was exactly DOUBLE the true file size sat on this path
+    # undetected until an operator hit it by hand. Asserting the positive verdict — rather than
+    # trusting the absence of a negative — is what makes that impossible to repeat.
+    _step "x86 STAT.ELF off FAT (WINX-2)" "WINX-2: STAT.ELF end-to-end .* -> PASS" "$blog_dir/winx2-fat.log" cat "$blog_dir/test-fat.log"
+    _step "x86 VUG.ELF off FAT (WINX-8)"  "WINX-8: VUG.ELF end-to-end .* -> PASS"  "$blog_dir/winx8-fat.log" cat "$blog_dir/test-fat.log"
     _step "arm virt v3 (CAPSTONE 6/6)" "CAPSTONE COMPLETE"   "$blog_dir/test-arm-v3.log"  env UNAOS_GICV3=1 "$0" test-arm 40
     # MBENCH-HONEST: this step's verdict is now the MBENCH REPLAY's exit status, which `kernel8-test`
     # propagates (see test_kernel8). It used to be a single `awk` for CAPSTONE COMPLETE against the

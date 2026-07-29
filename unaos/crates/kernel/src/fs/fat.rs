@@ -1496,12 +1496,28 @@ impl FatFs {
     /// `de.size`, `max_bytes`, or end-of-chain (whichever comes first). Guards against bad/free
     /// clusters and chain loops. Rejects a directory. A file whose chain ends before `de.size` (a
     /// malformed volume) yields a short read rather than an error — `out.len()` tells the caller.
+    ///
+    /// FATREAD-1: `out` is REPLACED, never appended to — on return `out` holds exactly the bytes
+    /// read and nothing else, so `out.len()` is the read length for ANY caller. The body copies with
+    /// `extend_from_slice`, which means a caller that hands in a NON-EMPTY buffer used to get its old
+    /// contents with the file appended after them. Every caller that pre-sized its buffer from the
+    /// directory (`vec![0u8; de.size]` — a natural reading of "read the file into this") therefore got
+    /// a result of exactly `2 * de.size`, silently, with the file's real bytes sitting behind a run of
+    /// zeros. That is the doubling that blocked `bg /fat/STAT.ELF` and `bg /fat/VUG.ELF` on x86: the
+    /// directory said 8472 / 12568 and the loader was handed 16944 / 25136 — past the 16 KiB EL0
+    /// window, so both were rejected as oversize. It read as time-dependent (early boot fine, later
+    /// broken) only because the doubling is invisible until `2 * size` crosses a caller's cap: U2's
+    /// 72-byte HELLO.BIN doubles to 144 and still fits, an 8472-byte ELF does not. Clearing here is
+    /// the fix at the definition rather than at each call site, because the contract — not the
+    /// callers — was what was ambiguous. It is a no-op for every caller that already passed an empty
+    /// `Vec` (which is all of them on aarch64), so this is byte-inert on that arch.
     pub fn read_file(
         &self,
         de: &DirEntry,
         out: &mut alloc::vec::Vec<u8>,
         max_bytes: usize,
     ) -> Result<(), FatError> {
+        out.clear(); // FATREAD-1: "into `out`" means REPLACE — see the doc note above.
         if de.is_dir {
             return Err(FatError::IsDirectory);
         }
@@ -1555,6 +1571,11 @@ impl FatFs {
     /// M6g/U4 `load_program_into_slot` caller reads whole programs from offset 0 and must stay
     /// byte-identical). `read_at(fc, size, 0, out, max)` delivers the same bytes `read_file` would for a
     /// non-directory entry, so the two share no code by design, not by divergence.
+    ///
+    /// FATREAD-1: `out` is REPLACED, never appended to — the same contract `read_file` now states,
+    /// for the same reason, so the twins cannot diverge on it. Every current caller already hands in
+    /// an empty `Vec`, so the clear is byte-inert on both arches; it exists so the next caller that
+    /// reasonably pre-sizes its buffer does not silently get a double-length result.
     pub fn read_at(
         &self,
         first_cluster: u32,
@@ -1563,6 +1584,7 @@ impl FatFs {
         out: &mut alloc::vec::Vec<u8>,
         max: usize,
     ) -> Result<(), FatError> {
+        out.clear(); // FATREAD-1: "into `out`" means REPLACE — see the doc note above.
         if start >= size {
             return Ok(()); // at or past EOF — nothing to read (a legal 0-byte result)
         }
