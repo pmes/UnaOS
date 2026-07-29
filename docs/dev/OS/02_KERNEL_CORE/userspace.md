@@ -2326,6 +2326,48 @@
     forbidden**, `UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c` byte-identical — the headless
     path has no HID, so it never freezes, never parks, and proves the rendering path is untouched.
 
+- **VUGPAUSE-2r2 (a backgrounded vug can be restarted)** — P72 on silicon: *"once a vug goes into the
+  background it is stopped and cannot be restarted. If it's already stopped it can't be restarted."*
+  Clicking the window, focusing it, un-minimising it — nothing brought it back. The wire said the router
+  was doing its job (`[clickroute] press hit asid=3 win=3 (was 2)` on the stopped vugs) and that parking
+  and most waking worked (`blocked=` and `wakes=` tracking closely), which is what made it look like a
+  routing or compositing fault rather than the one-store bug it was.
+  - **Root cause: a stale-CLEAR of the park hint, by the focus arrival itself.** `EL0_INPUT_PARKED[asid]`
+    is the "someone is parked on this ring" flag, and `el0_input_wake` returns early when it is clear — so
+    it gates **every** wake edge, not merely the backstop that VUGPAUSE-2 described as its only consumer.
+    `clear_input_row` cleared it, and `el0_input_set_active` calls `clear_input_row` on a focus **arrival**
+    — precisely the moment a parked, backgrounded vug is being handed the keyboard. The arrival therefore
+    wiped the flag microseconds before its own wake read it; the wake took the fast path and released
+    nobody, and so did `focus_changed`'s unhide and the press enqueue that followed. The backstop, gated on
+    the same flag, skipped the slot for the rest of the boot. The vug sat on a live futex key nothing in
+    the kernel would ever name again: permanently stopped, by construction, on its first trip to the
+    background.
+  - **The fix, in three parts.** (1) `clear_input_row` no longer touches the hint; the single site that
+    legitimately clears it — slot teardown, where the parker `exit()`s out of `futex_wait`'s pre-park kill
+    boundary and never reaches its own clear — calls the new `clear_input_parked` explicitly. The
+    invariant is now stated where the flag lives: **set by the parker before parking, cleared by the
+    parker on return or by teardown, and by nothing else.** (2) `el0_input_wake_backstop` no longer reads
+    the hint at all — it wakes all eight slot keys unconditionally. A backstop that can be disabled by the
+    bug it exists to survive is not a backstop; unconditional costs ~31 `futex_wake` calls a second on
+    keys that are almost always empty, and it caps this entire failure class at one ~256 ms period instead
+    of forever. (3) The two operator-rate edges name themselves on the wire.
+  - **Why both the focus and the unhide edge are needed.** `wc_click_route` calls `el0_input_set_active`
+    *then* `wm::focus_changed`, so the focus wake fires while the vug's hidden bit may still be set: the
+    woken vug re-reads its flags word, finds itself frozen, and re-parks. The unhide wake is the one that
+    fires after the flags word says visible, and the press enqueue behind it moves `TAIL`, so a vug
+    parking in that window loses the compare rather than the wakeup. Three edges, in that order, and the
+    restore is race-free across all of them.
+  - **Witness:** `[vugpause2] resume asid=<a> edge=focus|unhide woken=<n>`, emitted only when a wake
+    actually releases someone. The router's per-event push edge stays silent (mouse-motion rate). This is
+    the line that separates the two outcomes on wire: a **stranded** vug shows `[clickroute] press hit`
+    with no `resume` after it; a **restored** one shows the pair.
+  - **Not changed, and flagged instead:** the press that raises a window is also delivered to it
+    (CLICK-ROUTE's documented design), so the click that restores a vug is *also* a `VUGCLICK` pause
+    toggle — the restored vug comes back paused and needs a second click to resume rotating. That is a UX
+    question about click-to-focus semantics, not the strand, and it belongs to the CLICK-ROUTE lane.
+  - **Gates:** `./arroyo check` green both arches; `./arroyo kernel8-test` **MBENCH PASS 86/86, 0
+    forbidden**, `UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c` unchanged.
+
 ### x86_64 (branch `hw-rmbp`)
 
 - **U1a** — first ring-3 round-trip (the x86 mirror of aarch64 M6a). A

@@ -3901,6 +3901,13 @@ pub fn clear_handle_row(asid: u64) {
     // ELF-5: reset this ASID's input ring (a reused ASID inherits no stale input event), and if it was the
     // registered active input target, clear the designation so the router stops enqueueing to a dead slot.
     clear_input_row(asid);
+    // VUGPAUSE-2r2: and drop the park hint with it. THIS is the site that needs it — a task killed while
+    // parked in `SYS_INPUT_WAIT` leaves through `sched::futex_wait`'s pre-park kill boundary, which
+    // `exit()`s and never runs the clear on the syscall's normal path, so without this the recycled slot
+    // would inherit a permanent "someone is parked here" and the backstop would wake an empty key for the
+    // rest of the boot. It is deliberately NOT inside `clear_input_row`, whose other caller is a focus
+    // arrival: see `clear_input_parked`.
+    clear_input_parked(asid);
     // INROUTE: this CAS is a FOCUS REVOCATION, and it is asynchronous with respect to whoever currently
     // holds focus — it fires on the dying slot's core the instant that slot tears down. Count it. The
     // count is the evidence line for the one race this seam can lose an event to: a router pass that
@@ -10950,7 +10957,12 @@ pub fn set_hidden(asid: u64, on: bool) {
     // if the timer IRQ is not live, forever. Ordered AFTER the info-page publish so the woken vug's first
     // read of the flags word already shows it visible.
     if !on {
-        el0_input_wake(asid);
+        // VUGPAUSE-2r2: the LAST of the three edges a click-to-restore crosses, and the decisive one — it
+        // is the only one that fires after the flags word says visible, so a vug woken here cannot find
+        // itself frozen and re-park. Like the focus edge it was dead before this fix (`el0_input_set_active`
+        // ran microseconds earlier and had wiped the park hint), which is why an unhide could not restart
+        // a backgrounded vug either.
+        el0_input_wake_edge(asid, "unhide");
     }
 }
 
@@ -11688,13 +11700,27 @@ static EL0_INPUT_TAIL: [AtomicU32; super::boot::USER_SLOTS + 1] =
     [const { AtomicU32::new(0) }; super::boot::USER_SLOTS + 1];
 
 /// VUGPAUSE-2: per-slot "this ASID has a task parked in `SYS_INPUT_WAIT`" flag. Set immediately before the
-/// futex park, cleared immediately after it returns — and ALSO cleared by `clear_input_row`, because the
-/// park is a kill boundary that can `exit()` without ever returning here (see `sched::futex_wait`), so the
-/// clear on the normal path is not sufficient on its own.
+/// futex park, cleared immediately after it returns — and ALSO cleared on slot teardown by
+/// `clear_input_parked`, because the park is a kill boundary that can `exit()` without ever returning here
+/// (see `sched::futex_wait`), so the clear on the normal path is not sufficient on its own.
 ///
-/// It is a HINT, never a decision: its only consumer is the periodic backstop, which skips slots that are
-/// clear. A stale-set flag therefore costs one wasted `futex_wake` per backstop period on a key with no
-/// waiters, and a stale-clear flag is impossible (only the parker sets it, before parking).
+/// VUGPAUSE-2r2 — WHO MAY CLEAR THIS, and why the question is load-bearing. VUGPAUSE-2 described the flag
+/// as "a HINT, never a decision", on the strength of "a stale-clear flag is impossible (only the parker
+/// sets it, before parking)". Both halves were wrong, and P72 spent a bench session on the difference:
+///   * It IS a decision. `el0_input_wake` returns early on a clear flag, so every wake edge — the router's
+///     own enqueue, focus arrival, unhide — is gated on it, not just the backstop.
+///   * A stale clear WAS reachable. `clear_input_row` cleared it, and `el0_input_set_active` calls
+///     `clear_input_row` on a focus ARRIVAL: exactly the moment a parked, backgrounded vug is being handed
+///     the keyboard. The arrival cleared the flag, then its own wake read the flag it had just cleared,
+///     took the fast path, and woke nobody; `focus_changed`'s unhide and the press enqueue that followed
+///     did the same; and the backstop skipped the slot forever after. The vug was parked on a live futex
+///     key that nothing in the kernel would ever name again — Peter's "once a vug goes into the background
+///     it is stopped and cannot be restarted", exactly.
+/// The invariant now is: SET by the parker before parking; CLEARED by the parker on return, or by slot
+/// teardown, and by nothing else. A stale-set flag costs one wasted `futex_wake` per backstop period on a
+/// key with no waiters; a stale-clear flag costs a task that never runs again, so the two are traded
+/// against each other in that direction on purpose. The backstop no longer reads it at all
+/// (`el0_input_wake_backstop`), which caps the whole failure class at one backstop period.
 static EL0_INPUT_PARKED: [AtomicBool; super::boot::USER_SLOTS + 1] =
     [const { AtomicBool::new(false) }; super::boot::USER_SLOTS + 1];
 
@@ -11728,6 +11754,19 @@ fn input_futex_key(asid: u64) -> u64 {
 ///     nothing about becoming visible again touches TAIL. A vug parked while hidden must be re-readied to
 ///     observe its own restore; this is the edge that makes VUGMIN's idle exit-able.
 fn el0_input_wake(asid: u64) -> usize {
+    el0_input_wake_edge(asid, "")
+}
+
+/// VUGPAUSE-2r2: `el0_input_wake` with the EDGE named, for the wire.
+///
+/// A non-empty `edge` asks for a `[vugpause2] resume` line when this call actually releases someone. Only
+/// the two OPERATOR-RATE edges pass one — focus arrival and unhide, the pair that resumes a backgrounded
+/// vug and the pair that was silently dead before this fix. The router's per-event push passes `""` and
+/// stays silent: it fires at mouse-motion rate and a line per event would be a flood.
+///
+/// This is the witness that distinguishes the two P72 outcomes on wire. A stranded vug produces a
+/// `[clickroute] press hit` with no `[vugpause2] resume` after it; a resumed one produces the pair.
+fn el0_input_wake_edge(asid: u64, edge: &str) -> usize {
     if asid == 0 || asid as usize > super::boot::USER_SLOTS {
         return 0;
     }
@@ -11737,6 +11776,9 @@ fn el0_input_wake(asid: u64) -> usize {
     let n = super::sched::futex_wake(input_futex_key(asid), usize::MAX);
     if n != 0 {
         EL0_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
+        if !edge.is_empty() {
+            serial_println!("[vugpause2] resume asid={} edge={} woken={}", asid, edge, n);
+        }
     }
     n
 }
@@ -11752,13 +11794,22 @@ fn el0_input_wake(asid: u64) -> usize {
 /// backstop keeps the old contract true: the vug still polls, just a few times a second instead of
 /// thousands. At `INPUT_WAIT_BACKSTOP_TICKS` (~256 ms) that is ~4 wake/poll/re-park cycles per second per
 /// idle vug — far inside both bounds and far below anything a load meter can see.
+/// VUGPAUSE-2r2 — THE HINT IS NO LONGER CONSULTED HERE. It used to be, and that turned P72's stale-clear
+/// from a hiccup into a permanent strand: the one mechanism whose entire job is to be the net that catches
+/// a missed wake was itself gated on the same flag every missed wake had already gone through. A backstop
+/// that can be disabled by the bug it exists to survive is not a backstop.
+///
+/// So it wakes all `USER_SLOTS` keys unconditionally. The cost is `USER_SLOTS` (8) `futex_wake` calls per
+/// ~256 ms — each a bounded scan of the bucket array that exits on the first matching key or a miss —
+/// which is ~31 calls a second on a machine that dispatches thousands of times a second, and a wake on a
+/// key with no waiters allocates nothing and readies nobody. That is a rounding error against the arc's
+/// measured idle win, and it is the price of the failure class being bounded at one period rather than
+/// unbounded. Any future stale-clear of the hint now costs an idle vug ~256 ms of latency, once.
 pub fn el0_input_wake_backstop() {
     for asid in 1..=super::boot::USER_SLOTS as u64 {
-        if EL0_INPUT_PARKED[asid as usize].load(Ordering::Relaxed) {
-            let n = super::sched::futex_wake(input_futex_key(asid), usize::MAX);
-            if n != 0 {
-                EL0_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
-            }
+        let n = super::sched::futex_wake(input_futex_key(asid), usize::MAX);
+        if n != 0 {
+            EL0_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
         }
     }
 }
@@ -12103,7 +12154,14 @@ pub fn el0_input_set_active(asid: u64) {
     // `clear_input_row` call: focus RESETS the incoming ring rather than filling it, so a vug parked on
     // an empty ring sees no TAIL movement when it is handed the keyboard. Last, after the focus is
     // published, so the woken task re-polls against the new state rather than the old.
-    el0_input_wake(asid);
+    //
+    // VUGPAUSE-2r2: this edge was DEAD until now, and it is the first of the three the click-to-restore
+    // path crosses. `clear_input_row` above no longer clears the park hint, so the wake can see the
+    // waiter it is for. Note it fires while the vug may still be HIDDEN (`focus_changed` runs after this
+    // in `wc_click_route`): the woken vug re-reads its flags word, may find itself still hidden and
+    // re-park, and is then released again by the unhide edge below — which is why BOTH edges are needed
+    // and neither is redundant.
+    el0_input_wake_edge(asid, "focus");
 }
 
 /// WC-TAB — the SHELL half of the focus ring, closing the one-way exit WC-C left open.
@@ -12359,12 +12417,28 @@ fn clear_input_row(asid: u64) {
     let a = asid as usize;
     EL0_INPUT_HEAD[a].store(0, Ordering::Release);
     EL0_INPUT_TAIL[a].store(0, Ordering::Release);
-    // VUGPAUSE-2: drop the park hint with the ring it describes. On the teardown path this is the clear
-    // that matters — a task killed while parked leaves `sys_input_wait` through `sched::futex_wait`'s
-    // pre-park kill boundary, which `exit()`s and never runs the clear on the normal path — so without
-    // this the recycled slot would inherit a permanent "someone is parked here" and the backstop would
-    // wake an empty key for the rest of the boot.
-    EL0_INPUT_PARKED[a].store(false, Ordering::Release);
+    // VUGPAUSE-2r2: the park hint is DELIBERATELY not touched here — see `clear_input_parked`, which the
+    // teardown caller invokes and the focus caller must not. VUGPAUSE-2 cleared it on this line, and that
+    // was the P72 "a backgrounded vug can never be restarted" bug in one store: `el0_input_set_active`
+    // calls this function on a focus ARRIVAL, microseconds before its own wake edge, so the arrival wiped
+    // the very hint the wake seam consults and every subsequent edge — focus, unhide, the press itself,
+    // and the backstop — took the "nobody is parked" fast path on a task that was, in fact, parked.
+}
+
+/// VUGPAUSE-2r2: drop ASID `asid`'s "a task is parked in `SYS_INPUT_WAIT`" hint. Exactly ONE caller, and
+/// the restriction is the fix: SLOT TEARDOWN.
+///
+/// The hint's failure modes are not symmetric, which is why this is separated from the ring reset it used
+/// to ride along with. A stale-SET hint costs one wasted `futex_wake` per backstop period on a key with no
+/// waiters. A stale-CLEAR hint costs a task that is parked forever: it is the only thing standing between
+/// every wake edge and the parked waiter, and a task that never runs again never re-sets it. So the hint
+/// may be cleared only by the parker itself (on the normal return from `sys_input_wait`) or by the one
+/// event that proves the parker is gone — its slot being torn down, which is also the path where the
+/// parker `exit()`s out of `sched::futex_wait`'s pre-park kill boundary and never reaches its own clear.
+fn clear_input_parked(asid: u64) {
+    if asid != 0 && asid as usize <= super::boot::USER_SLOTS {
+        EL0_INPUT_PARKED[asid as usize].store(false, Ordering::Release);
+    }
 }
 
 /// SYS_INPUT_POLL(): nonblocking dequeue of the next input event for the CALLING process. Returns the packed
