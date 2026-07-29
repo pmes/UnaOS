@@ -185,6 +185,28 @@ struct Sprite {
     /// so the two states cannot drift: `drawn && off.get(i)` is "hole", `drawn && !off.get(i)` is
     /// "ours, and `saved[i]` says what it covers".
     off: Bits,
+    /// CURSOR-11 — painted-pixel indices the open pass DEFERRED handing back: the arrow is still on
+    /// the panel at them, and a painter in this pass may be about to overwrite them.
+    ///
+    /// This is the third pixel class, and it is what removes the blink over a PRESENTING window.
+    /// `off` says "handed back, `saved[i]` is stale, someone owes this pixel a redraw"; `pend` says
+    /// "NOT handed back — the arrow is on glass and `saved[i]` is still true of the panel — but the
+    /// pass's tail owes it a VERDICT before it may be trusted again". The two are disjoint by
+    /// construction ([`defer_within`] skips anything already `off`, and [`settle_pending_locked`]
+    /// skips anything that became `off` under it).
+    ///
+    /// The tail ([`adopt_overlay`]) resolves every bit, and only ever one of three ways:
+    ///  * the pixel rode a window's staged present (`Overlay::covered`) — `saved[i]` takes the
+    ///    LAYER's content, which is exactly what the freshly presented rows now hold beneath the
+    ///    arrow, and the bit clears with no panel write at all;
+    ///  * the panel still holds our colour — nobody painted there, `saved[i]` was never invalidated,
+    ///    and the bit clears with no panel write either;
+    ///  * the panel holds something else — a painter took the pixel, so `saved[i]` is re-taken from
+    ///    the FINISHED front and the arrow is put back over it.
+    ///
+    /// Meaningful only while `drawn`, like `off`, and reset by every full [`undraw_locked`] /
+    /// [`draw_locked`] cycle for the same reason.
+    pend: Bits,
     /// CURSOR-4 — bumped by every full undraw and every draw. An overlay plan carries the generation
     /// it was taken at, and a plan whose generation no longer matches describes a sprite that has
     /// since been taken down and put back somewhere else — so its layer-derived save-under must not
@@ -206,6 +228,7 @@ static SPRITE: Mutex<Sprite> = Mutex::new(Sprite {
     s: 0,
     saved: [0; MAX_PIX],
     off: Bits::EMPTY,
+    pend: Bits::EMPTY,
     epoch: 0,
     unsupported: false,
 });
@@ -759,6 +782,90 @@ static C8_UNCLOCKED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "witness")]
 static C10_FLUSH_BYTES: AtomicU64 = AtomicU64::new(0);
 
+// ---- CURSOR-11 witnesses ------------------------------------------------------------------------
+
+/// CURSOR-11 — composite passes that took the COMPOSE-THROUGH shape: the session was opened and the
+/// arrow was left on glass for the whole pass. One per [`defer_within`] call.
+#[cfg(feature = "witness")]
+static C11_PASSES: AtomicU64 = AtomicU64::new(0);
+
+/// CURSOR-11 — composite passes that still took a real BRACKET, i.e. the arrow left the glass. Three
+/// sources, all pre-existing and all deliberately kept: the WC-F reserved-box full undraw, the
+/// sessionless masked undraw ([`undraw_within_nosession`]), and an [`adopt_overlay`] whose session
+/// came back incoherent and fell to `refresh_locked`. The ratio against `passes` is the arc's verdict
+/// on the bench: the P73 blink is `bracketed` dominating a pointer that sits over a presenting vug.
+#[cfg(feature = "witness")]
+static C11_BRACKETED: AtomicU64 = AtomicU64::new(0);
+
+/// CURSOR-11 — sprite pixels left on glass across a present that could have overwritten them. The
+/// denominator for the two settlements below; `installed + redrawn <= deferred`, and the difference is
+/// the pixels no painter in the pass actually touched (the common case, settled by reading the front
+/// and writing nothing).
+#[cfg(feature = "witness")]
+static C11_PIX_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// CURSOR-11 — deferred pixels a staged present carried through, whose save-under the tail installed
+/// from the BACK LAYER. **The arrow never left the panel at these pixels**, which is the whole of the
+/// fix; they are the number to read on the bench.
+#[cfg(feature = "witness")]
+static C11_PIX_INSTALLED: AtomicU64 = AtomicU64::new(0);
+
+/// CURSOR-11 — deferred pixels the tail found holding someone else's colour: a painter in the pass
+/// took them without composing the sprite in, so the tail re-saved from the finished front and put the
+/// arrow back. These pixels DID blink, for the length of the pass, exactly as they did before this
+/// arc. Not a fault — it is what the direct path, the instrument exclusions and the straddle cost —
+/// but a large ratio against `installed` means the compose-through is not reaching the pixels the
+/// pointer is actually over, and the reading to take to `[cursor3] rollup`'s decline breakdown.
+#[cfg(feature = "witness")]
+static C11_PIX_REDRAWN: AtomicU64 = AtomicU64::new(0);
+
+/// CURSOR-11 — a pass that took a real bracket rather than the deferral, counted from `wm`'s two
+/// decline arms. The third source (an incoherent tail) is counted inside [`adopt_overlay`].
+#[cfg(feature = "witness")]
+pub fn note_bracketed_pass() {
+    C11_BRACKETED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// CURSOR-11 — the compose-through rollup, printed immediately after `[cursor8]`'s because it is the
+/// same question one level up: `[cursor8]` says what it cost to REBUILD the arrow, this says how often
+/// the arrow had to come down at all.
+///
+/// * **`passes` / `bracketed`** — composite passes that left the arrow on glass, against those that
+///   took it off. Before this arc every pass over a window was `bracketed` by construction.
+/// * **`px_deferred`** — sprite pixels carried through a present without a handback.
+/// * **`px_installed`** — of those, the ones a staged present delivered with the arrow already in the
+///   rows, whose save-under came from the layer. **The arrow never left the panel here.**
+/// * **`px_redrawn`** — of those, the ones a painter took anyway (direct path, instrument exclusion,
+///   straddle): re-saved from the finished front and redrawn by the tail. These blinked.
+/// * The remainder, `px_deferred - px_installed - px_redrawn`, is pixels nothing in the pass touched:
+///   settled by one front read and no write at all.
+///
+/// `UNWITNESSED` on QEMU raspi4b by construction — no HID pointer report means the sprite is never
+/// drawn, `sprite_plan()` is always `None`, no session is ever opened and every counter here is 0. The
+/// gate proves NO-REGRESSION only; the verdict that carries the fix is `px_installed` dominating
+/// `px_redrawn` on an attended bench boot with the pointer parked over a presenting vug.
+#[cfg(feature = "witness")]
+pub fn cursor11_rollup(scope: &str) {
+    let passes = C11_PASSES.load(Ordering::Relaxed);
+    let bracketed = C11_BRACKETED.load(Ordering::Relaxed);
+    let deferred = C11_PIX_DEFERRED.load(Ordering::Relaxed);
+    let installed = C11_PIX_INSTALLED.load(Ordering::Relaxed);
+    let redrawn = C11_PIX_REDRAWN.load(Ordering::Relaxed);
+    let verdict = if passes == 0 && bracketed == 0 {
+        "UNWITNESSED"
+    } else if deferred == 0 {
+        "NO-DEFERRAL"
+    } else if installed >= redrawn {
+        "THROUGH"
+    } else {
+        "BRACKETED"
+    };
+    serial_println!(
+        "[cursor11] compose-through scope={} passes={} bracketed={} px_deferred={} px_installed={} px_redrawn={} -> {}",
+        scope, passes, bracketed, deferred, installed, redrawn, verdict
+    );
+}
+
 /// CURSOR-6/7 — count a window present that landed on the live sprite box, and, when nothing in that
 /// pass owes the sprite a repaint, ARM the tail repair.
 ///
@@ -920,6 +1027,9 @@ pub fn cursor8_rollup(scope: &str) {
         "[cursor8] repair rate scope={} requests={} repairs={} suppressed_stale={} suppressed_rate={} unclocked={} floor_ms={} flush_kb={} -> {}",
         scope, requests, repairs, stale, rate, unclocked, REPAIR_MIN_MS, flush_kb, verdict
     );
+    // CURSOR-11 — and how often the arrow had to come down at all, which is the question the three
+    // lines above all presuppose an answer to. Same scope, same block, one call site.
+    cursor11_rollup(scope);
 }
 
 /// CURSOR-6 — count a desktop present that landed on the live sprite (from `Screen::present_background`).
@@ -1208,6 +1318,8 @@ fn undraw_locked(
         // saved patch is dropped because there is no surface left to restore it into.
         sp.drawn = false;
         sp.off.reset();
+        // CURSOR-11 — a deferred verdict is meaningless once the sprite is down; see `Sprite::pend`.
+        sp.pend.reset();
         bump_epoch(sp);
         retract_box();
         return None;
@@ -1239,6 +1351,10 @@ fn undraw_locked(
     }
     sp.drawn = false;
     sp.off.reset();
+    // CURSOR-11 — every pending verdict is answered by this restore: the colour guard above already
+    // asked each pixel the question `settle_pending_locked` would have, and the sprite is off the
+    // panel now, so no bit may survive into the next draw. See `Sprite::pend`.
+    sp.pend.reset();
     bump_epoch(sp);
     // CURSOR-6 — retract AFTER the restore, mirroring `draw_locked`'s publish-before-paint for the
     // same reason: the window in which the mirror disagrees with the panel must always be the one
@@ -1339,12 +1455,178 @@ pub fn sprite_plan() -> Option<Plan> {
 ///
 /// Returns the rect that was written, for [`repair`]. Conservative (the whole box) rather than the
 /// touched subset — `repair` marks windows damaged, and a narrow rect would be a narrower repair.
+///
+/// ### CURSOR-11 — this has no caller any more, and is kept deliberately
+/// The session-owning pass was its only one, and it now takes [`defer_within`] instead: the handback
+/// is what the arrow's absence from the panel COSTS, and for pixels a staged present is going to
+/// carry it is a cost with nothing bought. What survives is the ARGUMENT above, unchanged and still
+/// load-bearing — it is what [`undraw_within_nosession`] (the sessionless pass, which has no coverage
+/// to install and so cannot defer) and [`settle_pending_locked`] (the same question, asked one pass
+/// later against a finished front) both rest on. It is retained as the reference statement of that
+/// argument and as the always-correct fallback should a future pass need a handback it can pay for.
+#[allow(dead_code)]
 pub fn undraw_within(boxes: &[(usize, usize, usize, usize)]) {
     let restored = {
         let mut sp = SPRITE.lock();
         undraw_within_locked(&mut sp, boxes).0
     };
     repair(restored);
+}
+
+/// CURSOR-11 — the compose-through entry point: leave the arrow ON GLASS and record that this pass's
+/// tail owes those pixels a verdict.
+///
+/// ### The blink this removes (P73)
+/// CURSOR-9 stopped the cursor manufacturing damage for QUIET windows; over a PRESENTING one the
+/// arrow still blinked at present rate, together with the vug's own fps overlay text. The mechanism
+/// is [`undraw_within`] itself. A pass that owns the overlay session hands back every sprite pixel
+/// inside its paint set BEFORE the compose, then `compose_into` paints the arrow into the staged rows
+/// and the row blit puts it back — so between the mask and the blit sits a whole off-screen compose,
+/// and the panel publishes an arrow-less box for exactly that interval. Once per present. That is a
+/// duty cycle, not a race, and no care inside the bracket shortens it — which is precisely the
+/// argument CURSOR-3 made about WC-I's bracket, applied one level down to the mask that replaced it.
+///
+/// The undraw was never needed for the pixels the pass is going to COMPOSE. Its whole justification
+/// is "a pixel a painter is about to overwrite must be handed back before the overwrite, or
+/// `saved[i]` goes stale" — and a pixel that rides the window's staged present is not overwritten
+/// behind our back at all: the rows that land on it already contain the arrow, and
+/// [`adopt_overlay`] installs the LAYER's pixel as its save-under. Handing it back first buys
+/// nothing and costs the blink.
+///
+/// So this call writes NO framebuffer pixels, takes no `WRITER` lock, bumps no generation and asks
+/// for no [`repair`]. It marks [`Sprite::pend`]. Everything else is deferred to the tail, where the
+/// front buffer is FINAL and the answer per pixel is knowable — see [`settle_pending_locked`] for
+/// the two non-composed outcomes and [`Sprite::pend`] for all three.
+///
+/// **Only the session owner may call this.** A pass that lost `overlay_open` has no coverage to
+/// install and no `compose_into` in its future, so for it the deferral would be a promise nothing
+/// keeps: it stays on [`undraw_within_nosession`], unchanged. The WC-F reserved-hit path stays on
+/// the full [`undraw`], unchanged. Both still arm CURSOR-9's repair machinery exactly as before.
+///
+/// `boxes` is the same conservative paint set [`undraw_within`] takes, and is used for the same
+/// reason: a pixel outside all of them is a pixel no painter in this pass can reach, so it needs
+/// neither a handback nor a verdict and is left entirely alone.
+///
+/// Returns how many pixels were newly deferred, for the witness.
+pub fn defer_within(boxes: &[(usize, usize, usize, usize)]) -> usize {
+    let mut sp = SPRITE.lock();
+    if !sp.drawn {
+        return 0;
+    }
+    let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
+    let off = sp.off;
+    let mut pend = sp.pend;
+    let mut n = 0usize;
+    for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, _c, i| {
+        // A pixel an earlier masked undraw already handed back is `off`, and `off` and `pend` are
+        // disjoint: that pixel's `saved` is stale and only a redraw can settle it, which is
+        // `redraw_off_locked`'s job and not this one's.
+        if off.get(i) || pend.get(i) || !in_any(boxes, x, y) {
+            return;
+        }
+        pend.set(i);
+        n += 1;
+    });
+    sp.pend = pend;
+    #[cfg(feature = "witness")]
+    {
+        C11_PASSES.fetch_add(1, Ordering::Relaxed);
+        C11_PIX_DEFERRED.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    n
+}
+
+/// CURSOR-11 — settle every [`Sprite::pend`] bit the pass's coverage install did not already claim.
+///
+/// ### Ordering, and why it is load-bearing (the [wc-d] argument)
+/// This runs from [`adopt_overlay`], i.e. with the pass finished, the `BlitGuard` dropped and every
+/// window's rows on the panel — and it runs AFTER the coverage install, never before. Both halves of
+/// that ordering carry weight:
+///
+/// * **After the pass.** The front buffer is final here, so `read_pixel` answers the only question
+///   that matters — "did a painter in this pass take this pixel?" — with no race left in it. Asking
+///   mid-pass would read a pixel some later window is still going to overwrite, and would install a
+///   save-under describing content the panel no longer holds. That is the stale-save that stamps a
+///   white arrow into a window's rect, which is the failure mode every arc since CURSOR-3 has been
+///   arranged around.
+/// * **After the install.** [`adopt_overlay`] first writes `ov.saved[i]` — the BACK LAYER's pixel —
+///   into `sp.saved[i]` for every covered index and clears their `pend` bit. Those pixels are exactly
+///   the ones a staged present delivered with the arrow already in them, so the front now holds our
+///   `FILL` there. If this function ran first it would read that `FILL`, see `now == color`, and
+///   conclude "nobody painted here" — which is true and useless, because the pixel UNDER the arrow
+///   changed: the window presented new content beneath it. `saved[i]` would keep the pre-present
+///   pixel, and the next real undraw would restore last frame's window content into a live window.
+///   The install is what makes the save-under coherent for that class, and it must therefore retire
+///   the bit before this pass sees it. The two sets are disjoint after the install by construction.
+///
+/// The colour guard is [`undraw_locked`]'s, used in the opposite direction. `now == color` means the
+/// arrow survived the pass untouched, so `saved[i]` is still true of the panel and there is nothing
+/// to do — no read, no write, no flush, which is the common case and the whole point. `now != color`
+/// means a painter took the pixel: `saved[i]` is re-taken from the finished front (which is that
+/// painter's content, provably not our own fill — we can see it is not our colour) and the arrow is
+/// put back on top.
+///
+/// The guard's residual is the same one it has always had and is closed the same way: a painter whose
+/// content happens to equal `FILL` or `SHADOW` at one of our pixels reads as "untouched" and keeps a
+/// stale save. `note_present_over_sprite` armed `TOUCHED_SINCE_DRAW` for every present over the
+/// sprite box in this pass, so the next full undraw's [`repair`] damages the windows involved and the
+/// composite after it repaints them from source. CURSOR-9's machinery is untouched and is exactly
+/// what covers this.
+fn settle_pending_locked(sp: &mut Sprite, unsupported_now: &mut bool) {
+    let mut any = false;
+    for w in 0..MASK_WORDS {
+        if sp.pend.0[w] != 0 {
+            any = true;
+            break;
+        }
+    }
+    if !any {
+        return;
+    }
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        // Nothing can be read or written; drop the promises rather than carry them into the next
+        // pass, where the geometry they index may already be gone.
+        sp.pend.reset();
+        return;
+    }
+    let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
+    let deferred = sp.pend;
+    let off = sp.off;
+    let mut wrote = false;
+    let mut failed = false;
+    {
+        let saved = &mut sp.saved;
+        for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
+            if !deferred.get(i) || off.get(i) || i >= saved.len() || failed {
+                return;
+            }
+            match fb.read_pixel(x, y) {
+                // Untouched: the arrow is still on glass and `saved[i]` still describes what is
+                // under it. This is the pixel class the arc exists to produce.
+                Some(now) if now == color => {}
+                Some(now) => {
+                    saved[i] = now;
+                    fb.put_pixel(x, y, color);
+                    wrote = true;
+                    #[cfg(feature = "witness")]
+                    C11_PIX_REDRAWN.fetch_add(1, Ordering::Relaxed);
+                }
+                // Fail-closed, exactly as `draw_locked` and `redraw_off_locked` do: a panel with no
+                // read-back inverse gets no cursor rather than an unrestorable patch.
+                None => failed = true,
+            }
+        });
+    }
+    sp.pend.reset();
+    if failed {
+        sp.unsupported = true;
+        *unsupported_now = true;
+        return;
+    }
+    if wrote {
+        flush_box(&fb, by, bh);
+    }
 }
 
 /// CURSOR-5 — the masked undraw for a pass that does NOT own the overlay session, which is a
@@ -1934,14 +2216,28 @@ pub fn adopt_overlay() {
                 let covered = ov.covered;
                 let src = &ov.saved;
                 let mut off = sp.off;
+                // CURSOR-11 — the install RETIRES the pending verdict for every pixel it claims, and
+                // it does so here rather than leaving it to `settle_pending_locked` because these are
+                // the pixels whose save-under the layer, and only the layer, can supply. The panel
+                // holds our `FILL` at each of them now (the row copies delivered it), so a front read
+                // would answer "untouched" and keep the PRE-PRESENT pixel as the save-under — the
+                // stale save that stamps last frame's window content back into a live window. See
+                // `settle_pending_locked` for why this ordering is the whole coherence argument.
+                let mut pend = sp.pend;
                 let dst = &mut sp.saved;
                 for_each_sprite_pixel(bx, by, bw, bh, s, |_x, _y, _c, i| {
                     if covered.get(i) && i < dst.len() && i < src.len() {
                         dst[i] = src[i];
                         off.clear(i);
+                        if pend.get(i) {
+                            pend.clear(i);
+                            #[cfg(feature = "witness")]
+                            C11_PIX_INSTALLED.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 });
                 sp.off = off;
+                sp.pend = pend;
             }
             ov.session = false;
             ov.covered.reset();
@@ -1960,11 +2256,23 @@ pub fn adopt_overlay() {
         // per-pixel state describes the panel any more, so fall back to the whole-sprite refresh.
         // `undraw_locked` skips the off-panel pixels rather than stamping their stale saves, and
         // `draw_locked` then re-establishes the sprite entirely from the finished front buffer.
+        // CURSOR-11 — the fallback below answers the PENDING class too, and answers it correctly
+        // without knowing about it: `undraw_locked`'s colour guard asks each pixel exactly the
+        // question `settle_pending_locked` asks (does the panel still hold our colour?), declines the
+        // pixels a painter took, and `draw_locked` re-saves every one of them from the finished
+        // front. Both reset `pend`, so no verdict survives the pass either way. An incoherent tail is
+        // therefore a BRACKETED pass — the arrow does leave the glass for the length of one refresh —
+        // which is the cost this fallback has always had and what `[cursor11] bracketed=` measures.
         if coherent
             && want == Some((sp.bx, sp.by))
             && crate::pal::cursor::visible()
             && !sp.unsupported
         {
+            // CURSOR-11 — the deferred class, settled against the FINISHED front. Runs before
+            // `redraw_off_locked` only for tidiness (the two sets are disjoint: `pend` and `off`
+            // never overlap), and after the coverage install for a reason that is not tidiness at
+            // all — see `settle_pending_locked`.
+            settle_pending_locked(&mut sp, &mut unsupported_now);
             // The straddle remainder: pixels the masked undraw took down that no layer delivered —
             // over bare desktop, over a window that declined the overlay, or over a window this pass
             // never drew. The front buffer is finished now, so a save-and-draw here has exactly
@@ -1973,6 +2281,8 @@ pub fn adopt_overlay() {
             redraw_off_locked(&mut sp, &mut unsupported_now);
             None
         } else {
+            #[cfg(feature = "witness")]
+            C11_BRACKETED.fetch_add(1, Ordering::Relaxed);
             refresh_locked(&mut sp, &mut armed_at, &mut unsupported_now)
         }
     };
@@ -2128,6 +2438,9 @@ fn draw_locked(
     // CURSOR-4: a full draw re-establishes the whole sprite from the front, so nothing is off-panel
     // and every `saved` entry is fresh. The generation bump retires any overlay plan still in flight.
     sp.off.reset();
+    // CURSOR-11 — and nothing is pending either: every `saved` entry above was just taken from the
+    // finished front, which is the strongest form of the verdict a pending bit was waiting for.
+    sp.pend.reset();
     bump_epoch(sp);
     // CURSOR-6 — publish BEFORE the pixels go down, not after: a lock-free reader that saw "no
     // sprite" while the arrow was already on the panel would UNDERCOUNT the very overwrite the mirror

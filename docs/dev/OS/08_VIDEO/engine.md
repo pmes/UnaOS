@@ -3996,3 +3996,152 @@ red and still trips the generic `-> FAIL` scan.
 **Signature stability.** No `[wc-…]` or `[vugfps]` line changed shape. `[vugfps]`'s `rects=N` now
 reports the cost-model rect count, which is the number it was always meant to report; `bytes/frame`
 and `union=WxH` are computed exactly as before.
+
+---
+
+### CURSOR-11 — the arrow stops leaving the glass over a presenting window
+
+**P73 (Peter, bench Pi 4).** With the pointer parked over a PRESENTING vug, the cursor and the vug's
+own fps overlay text blink together, at the vug's present rate. Over a quiet window neither blinks —
+that half is CURSOR-9, and it holds.
+
+#### The mechanism, and why it is a duty cycle rather than a race
+
+`note_present_over_sprite` arms `TOUCHED_SINCE_DRAW` on every present unconditionally, so over a live
+window the compositor's repair rect is armed every pass and the window is re-blitted every pass. That
+re-blit is not itself the blink. The blink is what the pass does *around* it.
+
+A composite that owns the overlay session used to run:
+
+```
+undraw_within(paint set)   <- arrow comes off the glass, panel published arrow-less
+paint_window -> layer      <- a whole off-screen compose
+compose_into(layer)        <- arrow painted into the staged rows
+blit rows -> front         <- arrow returns to the glass
+adopt_overlay              <- bookkeeping
+```
+
+Between line 1 and line 4 sits the entire compose plus the row copies — milliseconds, once per
+present. That is exactly the shape CURSOR-3 diagnosed in WC-I's bracket, surviving one level down in
+the *mask* that replaced the bracket. No care inside the interval shortens it.
+
+#### The fix: the handback is deferred, not taken
+
+`undraw_within` is replaced on the session path by `cursor::defer_within`, which writes **no**
+framebuffer pixels, takes no `WRITER` lock, bumps no generation and requests no `repair`. It sets a
+third per-pixel class, `Sprite::pend`:
+
+| class | on the panel? | `saved[i]` | who settles it |
+|---|---|---|---|
+| `off` (CURSOR-4) | no — handed back | stale | `redraw_off_locked`, from the front |
+| `pend` (CURSOR-11) | **yes — never left** | still true, pending a verdict | `adopt_overlay` |
+| neither | yes | true | nobody; nothing can reach it |
+
+`off` and `pend` are disjoint by construction. The arrow simply stays on glass for the whole pass and
+is overwritten by rows that already contain it.
+
+#### The save-under coherence argument — the [wc-d] argument, stated as an ordering
+
+The undraw's *only* justification was: a pixel a painter is about to overwrite must be handed back
+before the overwrite, or `saved[i]` describes content the panel no longer holds and the next restore
+stamps stale pixels into a live window's rect — which is a `[wc-d] -> FAIL`, which the Pi spec FORBIDs.
+That obligation does not go away; it moves to the tail, where the front buffer is **final** and the
+question is answerable exactly instead of conservatively. `adopt_overlay` settles every `pend` bit, in
+this order, and the order is load-bearing:
+
+1. **The coverage install runs FIRST.** For every pixel a staged present carried
+   (`Overlay::covered`), `saved[i]` takes `ov.saved[i]` — the BACK LAYER's pixel, which is precisely
+   the freshly composed window content now sitting beneath the arrow on the panel — and the `pend`
+   bit is retired there.
+2. **`settle_pending_locked` runs SECOND**, over what is left. It reads the finished front and uses
+   `undraw_locked`'s colour guard in the opposite direction: `now == color` means nobody painted
+   there, so `saved[i]` was never invalidated and nothing is written; `now != color` means a painter
+   took the pixel, so `saved[i]` is re-taken from the front (provably that painter's content — we can
+   see it is not our own `FILL`) and the arrow is put back over it.
+
+**Reversing those two steps is the defect.** After a compose-through the front holds our own `FILL` at
+the covered pixels. A front read there answers "untouched" — true and useless, because the pixel
+*under* the arrow changed: the window presented new content beneath it. `saved[i]` would keep the
+pre-present pixel and the next real undraw would restore last frame's window content into a live
+window. The layer, and only the layer, can supply that save-under, which is CURSOR-3's original
+load-bearing detail applied to the new class. So the install must retire the bit before the front read
+ever sees it, and after it the two sets are disjoint.
+
+The colour guard's residual is unchanged and closed the same way: a painter whose content happens to
+equal `FILL` or `SHADOW` reads as "untouched" and keeps a stale save. Every present over the sprite box
+armed `TOUCHED_SINCE_DRAW`, so the next full undraw's `repair` damages the windows involved.
+**CURSOR-9's machinery is untouched and is exactly what covers this.**
+
+#### What still brackets, deliberately
+
+* **The WC-F reserved-box arm.** The probe paints the FRONT after the pass, outside every window box,
+  so no staged present can carry the sprite through it. Full `undraw`, as since CURSOR-3.
+* **The sessionless arm** (`overlay_open` refused — the VUGPAR steady state). This one *could* defer,
+  and must not: without a session there is no coverage to install, so nothing would settle the
+  deferred pixels. CURSOR-5's generation bump is the signal the session owner needs, and only an
+  actual handback produces it.
+* **An `adopt_overlay` whose session came back incoherent**, which falls to `refresh_locked`. That
+  path answers the pending class correctly without knowing about it — the colour guard asks each pixel
+  the same question, and `draw_locked` re-saves every one of them from the finished front. Both reset
+  `pend`.
+
+`disturbed` in `composite_inner` therefore widens from "the sprite is off the panel" to **"this pass's
+tail owes the sprite its pixels"**. Both consumers stay right under the wider reading: `tail_of` still
+needs `Adopt`, and `draw_window`'s `bracketed` argument asks exactly that question, so a deferring
+pass correctly does **not** arm `PRESENT_DIRTY`.
+
+#### Witness
+
+```
+[cursor11] compose-through scope=<s> passes= bracketed= px_deferred= px_installed= px_redrawn= -> <verdict>
+```
+
+Printed from `cursor8_rollup`, at the same two scopes and in the same block.
+
+* **`passes` / `bracketed`** — passes that left the arrow on glass, against those that took it off.
+  Before this arc every pass over a window was `bracketed` by construction.
+* **`px_installed`** — deferred pixels a staged present delivered with the arrow already in the rows.
+  **The arrow never left the panel here.** This is the number that carries the fix.
+* **`px_redrawn`** — deferred pixels a painter took anyway (direct path, instrument exclusion,
+  straddle): re-saved and redrawn by the tail. These blinked, exactly as before the arc.
+* The remainder (`px_deferred - px_installed - px_redrawn`) is pixels nothing in the pass touched:
+  one front read, no write.
+* Verdict `THROUGH` when `px_installed >= px_redrawn`, `BRACKETED` otherwise, `UNWITNESSED` when no
+  pass ever ran the mechanism.
+
+#### CURSOR-11 gate results (2026-07-29, QEMU raspi4b)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
+* `./arroyo kernel8-test` — **`✅ MBENCH PASS — 86/86 required witnesses, 0 forbidden hit(s), 6069
+  lines scanned`**, first attempt, exit 0.
+
+```
+[wc-i] rollup scope=fixture windowed_flushes=3 intrusions=0 cursor_passes=349 cursor_brackets=1 -> CLEAN
+[cursor3] rollup scope=fixture planned=0 offers=0 taken=0 adopt=0 repaint=1 ensure=348 ... -> UNWITNESSED
+[cursor6] rollup scope=fixture present_over=0 masked=0 repaired=0 desktop_over=0 mismatch=0 uncover_lost=0/0 -> UNWITNESSED
+[cursor8] repair rate scope=fixture requests=0 repairs=0 ... flush_kb=0 -> UNWITNESSED
+[cursor11] compose-through scope=fixture passes=0 bracketed=0 px_deferred=0 px_installed=0 px_redrawn=0 -> UNWITNESSED
+```
+
+#### Honest scope on the gate
+
+**QEMU raspi4b has no HID pointer.** No pointer report means the sprite is never drawn, `sprite_plan()`
+is always `None`, no overlay session is ever opened, `defer_within` is never called and every counter
+above is 0 — `UNWITNESSED` by construction, not by accident. The gate proves **no-regression only**:
+every pre-existing cursor witness is unchanged and the whole 86-witness suite passes. **The blink
+verdict is owed by an attended bench boot.**
+
+#### Metal watch-list (CURSOR-11)
+
+* **`px_installed` dominating `px_redrawn` with the pointer parked on a presenting vug** is the arc
+  working. `-> THROUGH` is the one-word form.
+* **`px_redrawn` dominating** means the compose-through is not reaching the pixels the pointer is over.
+  Take that reading to `[cursor3] rollup`'s decline breakdown — `straddle`, `budget`, `lock` and
+  `stale` name which class is losing them.
+* **`bracketed` climbing with `passes` flat** under VUGPAR is the sessionless arm being the steady
+  state, i.e. two cores compositing at once. That is CURSOR-5's territory, not this arc's.
+* **`[cursor5] selfsave` non-zero** would mean a save-under captured our own arrow. It must stay 0:
+  this arc adds one new front read (`settle_pending_locked`), and that read is guarded — it writes
+  `saved[i]` only when the pixel is provably NOT our colour.
+* **A white arrow standing in a vug's rect** would mean the install/settle ordering above was violated.
+  Nothing else in this arc can produce it.

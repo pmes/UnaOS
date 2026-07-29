@@ -1388,7 +1388,23 @@ fn composite_inner() -> CursorTail {
             if !reserved_hit && super::cursor::overlay_open(&p) {
                 session = true;
                 plan = Some(p);
-                super::cursor::undraw_within(&paint[..npaint]);
+                // CURSOR-11 — DEFER the handback instead of taking it. This is the P73 fix and it is
+                // one call: `undraw_within` handed the paint set's sprite pixels back HERE, before a
+                // single window had composed, so the panel published an arrow-less box for the whole
+                // of the off-screen compose plus the row blit — once per present, which is the blink
+                // Peter sees over a PRESENTING vug (together with that vug's own fps overlay, for the
+                // same reason and at the same rate). `defer_within` writes no pixels at all: the arrow
+                // stays on glass, `compose_into` paints it into the staged rows as it already did, and
+                // the rows that land on it already contain it. The undraw's justification — hand a
+                // pixel back before a painter takes it, or its save-under goes stale — is answered at
+                // the TAIL instead, per pixel and against the finished front, where it is answerable
+                // exactly. See `cursor::defer_within` and `cursor::settle_pending_locked`.
+                //
+                // The paths that still bracket are unchanged and deliberately so: the WC-F arm below,
+                // the sessionless arm below it, and an `adopt_overlay` whose session came back
+                // incoherent. CURSOR-9's `TOUCHED_SINCE_DRAW` repair machinery serves all three and is
+                // untouched.
+                super::cursor::defer_within(&paint[..npaint]);
                 #[cfg(feature = "witness")]
                 CUR3_PLANNED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             } else if reserved_hit {
@@ -1404,7 +1420,13 @@ fn composite_inner() -> CursorTail {
                 super::cursor::note_sprite_touched();
                 super::cursor::undraw();
                 #[cfg(feature = "witness")]
-                CUR3_DECL_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                {
+                    CUR3_DECL_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    // CURSOR-11 — a pass whose arrow left the glass. Kept, not fixed: the probe paints
+                    // the FRONT after this pass, outside every window box, so no staged present can
+                    // carry the sprite through it.
+                    super::cursor::note_bracketed_pass();
+                }
             } else {
                 // CURSOR-5 — THE LOCK CLASS STOPS COSTING THE WHOLE SPRITE.
                 //
@@ -1437,6 +1459,12 @@ fn composite_inner() -> CursorTail {
                 {
                     CUR3_DECL_LOCK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     super::cursor::note_masked_nosession();
+                    // CURSOR-11 — also a pass whose arrow left the glass. This one COULD in principle
+                    // be deferred, but it must not be: without the session there is no coverage to
+                    // install, so nothing would ever settle the deferred pixels and their save-under
+                    // would go stale silently. CURSOR-5's generation bump is exactly the signal the
+                    // session owner needs, and it is only produced by an actual handback.
+                    super::cursor::note_bracketed_pass();
                 }
             }
             disturbed = true;
@@ -1716,6 +1744,16 @@ fn composite_inner() -> CursorTail {
 ///
 /// `session` implies `disturbed` by construction — the session is only ever opened on the branch
 /// that undraws — and the assertion is cheap enough to keep as a debug one.
+///
+/// **CURSOR-11 — `disturbed` no longer means "the sprite is off the panel", and the widening is
+/// deliberate.** The session arm now DEFERS the handback rather than taking it, so on that path the
+/// arrow is still on glass when this returns. What `disturbed` has always been used for is unchanged
+/// and is what the name should be read as: *this pass's tail owes the sprite its pixels*. Both
+/// consumers stay exactly right under the wider reading — `tail_of` needs `Adopt`, and
+/// `adopt_overlay` settles every deferred pixel; and `draw_window`'s `bracketed` argument asks
+/// `note_present_over_sprite` "does this pass's tail owe the sprite a repaint", which a deferring
+/// pass answers yes to as firmly as a bracketing one. A pass that deferred must therefore NOT arm
+/// `PRESENT_DIRTY`, and with `disturbed == true` it does not.
 fn tail_of(disturbed: bool, session: bool) -> CursorTail {
     debug_assert!(!session || disturbed);
     if session && disturbed {
