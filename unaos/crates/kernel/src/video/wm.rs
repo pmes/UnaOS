@@ -5269,7 +5269,9 @@ static HT_SURF: [u32; 64] = [0x0020_C080; 64];
 ///    so it must change who owns the click; this is the leg that ties the two orders together.
 /// 4. **outside** — a point clear of both boxes hits nothing. Misses must be misses: the router's
 ///    desktop arm consumes the click on the strength of a `None`, so a false hit here would hand the
-///    console's clicks to an app.
+///    console's clicks to an app. The point is FOUND on the live window table (the panel's furniture
+///    owns most of it since CLICK-X86), and the leg reports `skip` rather than a false verdict if the
+///    panel leaves nothing unowned — see the search itself for why that is not circular.
 /// 5. **hidden** — after `focus_changed(0)` the shell is above both windows, they stop compositing,
 ///    and the same inside point hits nothing. Visibility is a POSITION in the shared z-order, and what
 ///    you can click has to be what you can see: clicking a console that covers a window must reach the
@@ -5522,11 +5524,57 @@ pub fn hittest_selftest() {
     /// HIGHEST slot, because slots are handed out from the bottom, so it is the last one a live app
     /// would be holding — and the leg checks that it is free before borrowing it, and resets it after.
     const PLAIN_ASID: u64 = 8;
+
+    // One origin for both (so exactly one can own the probe point), upper-middle, clear of WC-F's
+    // reserved boxes at the bottom edge. `move_to` pins the rows against the tiler below.
+    let ox = info.width / 3;
+    let oy = info.height / 4 + TITLE_H + BORDER;
+    // The outer box the probe rows WILL be given, from the tiler's own scale rule — asked before any
+    // row exists, so the miss-point search below can run against the panel as it stands.
+    let (scale, bw, bh) = match spawn_geometry(8, 8) {
+        Some(g) => g,
+        None => {
+            serial_println!("[clickroute] hit-test -> SKIP (geometry unavailable)");
+            return;
+        }
+    };
+    let (bx, by) = (ox.saturating_sub(BORDER), oy.saturating_sub(TITLE_H + BORDER));
+
+    // CLICK-X86 fallout — the MISS point is FOUND on the live table, never derived from a constant.
+    // Until kernel furniture had an owner, `hit_test` skipped every owner-0 row, so everything but an
+    // app window read as a miss and a point offset from this fixture's own origin was unowned BY
+    // CONSTRUCTION. CLICK-X86 gave the console and the desktop demo owners in the reserved band and
+    // made them hittable, and that invariant died with it — on the rMBP's 2880x1800 panel the console
+    // window is 1314x750 centred at (783,444) and swallows the whole upper-middle quadrant this
+    // fixture probes, which is why the s50 bench boot read `outside=false` while the QEMU gate (no
+    // Kepler takeover, so `wcx::activate` never runs and neither furniture row exists) kept reading
+    // `outside=true`. The sibling `clickroute_selftest` was written IN that arc and already finds its
+    // desktop point this way; this witness predates it, which is the whole of the difference.
+    //
+    // Panel corners after the historical diagonal point, so a bare panel still probes the same pixel
+    // it always did. Candidates inside the probe box are rejected arithmetically rather than by
+    // asking `hit_test`, and the search runs BEFORE the probe rows exist — so the only thing it can
+    // reject is a point a REAL window owns, and the leg's own claim (still a miss with both probes
+    // up) stays a claim about the probe rows rather than a restatement of the search.
+    let diag = (8 * scale + BORDER + 4) as i32;
+    let (pw, ph) = (info.width as i32, info.height as i32);
+    let in_probe_box = |x: i32, y: i32| {
+        x >= bx as i32 && y >= by as i32 && x < (bx + bw) as i32 && y < (by + bh) as i32
+    };
+    let miss_pt = [
+        (ox as i32 + diag, oy as i32 + diag),
+        (2, 2),
+        (pw - 3, 2),
+        (2, ph - 3),
+        (pw - 3, ph - 3),
+    ]
+    .into_iter()
+    .find(|&(x, y)| !in_probe_box(x, y) && hit_test(x, y).is_none());
+
     let s = &raw const HT_SURF as usize;
     let len = core::mem::size_of_val(&HT_SURF);
     // 8x8 ARGB8888, stride 32 BYTES (= 8 px) — the FOCUS-VIS surface geometry exactly. The compositor
-    // picks the upscale itself (`place_scale`), so the content extent is read back from the row below
-    // rather than assumed here.
+    // picks the upscale itself (`place_scale`), which is the scale `spawn_geometry` answered with.
     let wa = create(ASID_A, s, len, 8, 8, 32, b"ht-a");
     let wb = create(ASID_B, s, len, 8, 8, 32, b"ht-b");
     if wa == WIN_NONE || wb == WIN_NONE {
@@ -5535,28 +5583,21 @@ pub fn hittest_selftest() {
         close(wb);
         return;
     }
-
-    // One origin for both (so exactly one can own the probe point), upper-middle, clear of WC-F's
-    // reserved boxes at the bottom edge. `move_to` pins the rows against the tiler.
-    let ox = info.width / 3;
-    let oy = info.height / 4 + TITLE_H + BORDER;
     move_to(wa, ox, oy);
     move_to(wb, ox, oy);
 
-    // Inside the shared content area; and a point clear of the outer box in BOTH axes. The scale is
-    // the compositor's, read back from the row, so the miss point is derived from the geometry the
-    // window actually has rather than from a number this witness would have to keep in sync.
-    let scale = self::info(wa).map(|i| i.scale).unwrap_or(1);
+    // Inside the shared content area.
     let (ix, iy) = ((ox + 2) as i32, (oy + 2) as i32);
-    let miss = (8 * scale + BORDER + 4) as i32;
-    let (ox_miss, oy_miss) = (ox as i32 + miss, oy as i32 + miss);
 
     let inside = hit_test(ix, iy);
     let inside_ok = inside.is_some();
     let topmost_ok = inside.map(|(_, a, _)| a) == Some(ASID_B);
     focus_changed(ASID_A);
     let raise_ok = hit_test(ix, iy).map(|(_, a, _)| a) == Some(ASID_A);
-    let outside_ok = hit_test(ox_miss, oy_miss).is_none();
+    // Raising A cannot lower anything, so a point unowned before the probes existed is unowned now
+    // unless a probe row claims it — which is exactly the leg. A panel with no unowned point left
+    // reports `skip` (the sibling's discipline) rather than a verdict it has no fixture for.
+    let outside_ok: Option<bool> = miss_pt.map(|(x, y)| hit_test(x, y).is_none());
     focus_changed(0);
     let hidden_ok = hit_test(ix, iy).is_none();
 
@@ -5581,7 +5622,7 @@ pub fn hittest_selftest() {
     let ok = inside_ok
         && topmost_ok
         && raise_ok
-        && outside_ok
+        && outside_ok.unwrap_or(true)
         && hidden_ok
         && shell != Some(false)
         && bare != Some(false)
@@ -5596,9 +5637,16 @@ pub fn hittest_selftest() {
         }
         None => "skip",
     };
+    let (mx, my) = miss_pt.unwrap_or((-1, -1));
     serial_println!(
-        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} hidden={} shell={} bare={} hit={} deliver={} wake={} -> {}",
-        ix, iy, inside_ok, topmost_ok, raise_ok, outside_ok, hidden_ok,
+        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} miss=({},{}) hidden={} shell={} bare={} hit={} deliver={} wake={} -> {}",
+        ix, iy, inside_ok, topmost_ok, raise_ok,
+        match outside_ok {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "skip",
+        },
+        mx, my, hidden_ok,
         match shell { Some(true) => "true", Some(false) => "false", None => "skip" },
         match bare { Some(true) => "true", Some(false) => "false", None => "skip" },
         verdict3(plain, |t| t.0),
