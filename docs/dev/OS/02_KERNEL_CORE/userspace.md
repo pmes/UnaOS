@@ -668,6 +668,52 @@
     i.e. aarch64 Pi-4-only. Building that loader is the next arc; it will exercise exactly these verbs
     through exactly these paths, at which point `crates/user-stat` runs on x86 glass.
   - Lane: `arch/x86_64/syscall.rs` + `arch/x86_64/memory.rs` + docs. `video/wm.rs` untouched.
+- **WINX-2 (x86)** — the **EL0 ELF loader + `run`/`bg`/`jobs`/`kill` on x86**. WINX-1 gave x86 the window
+  verbs but nothing could reach them from a real program: x86 had NO ring-3 program loader at all, and
+  the shell's EL0-exec verbs were `#[cfg(feature = "baremetal")]`, i.e. aarch64 Pi-4-only.
+  - **Loader** (`arch/x86_64/elf.rs`). The twin of the aarch64 EXEC-1 loader: static `ET_EXEC` only,
+    `PT_LOAD` and nothing else, no dynamic linking / relocations / interpreter / PIE. Every rejection the
+    aarch64 validator makes, this one makes, with the same message; the substantive difference is
+    `e_machine == 62` (EM_X86_64). Validation completes BEFORE a slot is allocated, so a rejected image
+    leaks nothing. Two x86 simplifications: no I-cache maintenance (x86 I-caches are coherent with
+    stores, and the `iretq` into ring 3 is a serialising event) and no break-before-make (x86 permits a
+    live leaf permission change + `invlpg`). Copies go through the kernel identity alias, so code pages
+    are never writable through their ring-3 mapping — W^X by construction.
+  - **Lifecycle.** `run_user_image` / `spawn_user_image_bg` / `bg_poll` / `bg_kill`. Both `run` and `bg`
+    spawn **preemptible** (U3.5's `spawn_user_preemptible` + `KillSwitch`), which is forced rather than
+    chosen: `STAT.ELF` has no exit path by design, so a cooperative `run` would wedge the shell task with
+    no way back, and x86 has no aarch64-style `sched::kill` primitive. The scheduler's reap frees the
+    address space through `free_user_space_by_cr3`, which since WINX-1 also retires the job's compositor
+    windows and drops its FB leaves. `run` also KILLS on timeout rather than leaving aarch64's documented
+    orphan residue — an orphan would keep composing frames and holding window rows forever.
+  - **Shell.** The twelve `baremetal` gates become
+    `any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64")`, so aarch64 keeps
+    its exact previous condition. Three bodies are arch-dispatched: the image read, the `e_machine`
+    pre-check, and the run deadline (aarch64 keeps its CNTPCT expression; x86 uses ms — deliberately not
+    unified, since unifying would change the aarch64 loader's signature).
+  - **A real limitation, stated plainly.** x86 `run`/`bg` read the **FAT boot partition's root only** —
+    `/fat/NAME` or a bare `NAME`, 8.3 names, no subdirectories, no `/usb`, no native `/` volume. aarch64
+    keeps its full VFS namespace. The cause is that `fs/vfs.rs`'s `impl VfsBackend for FatBackend` (and
+    `NativeBackend`) is `#[cfg(target_arch = "aarch64")]`; widening it would enable a large body of VFS
+    code on x86 whose on-x86 behaviour is unproven (x86 storage is the staged/flush model). Making the
+    VFS backends arch-neutral is the follow-on that lifts this.
+  - **Packaging.** `crates/user-stat` is arch-split — shared app logic, two `cfg`-selected `sysabi`
+    modules (aarch64 `svc #0` with x8/x0..x2; x86 `syscall` with rax/rdi/rsi/rdx, declaring rcx/r11
+    clobbered), and `user-stat-x86.ld`. arroyo's `build_user_stat_x86` produces `target/STAT-X86.ELF`
+    (asserting ELF magic, `e_machine == 0x3e`, and `<= 16384` bytes); `builder/src/main.rs` and
+    `scripts/make-fat-img.sh` stage it as **`STAT.ELF`** on the boot volume. **Operator command:
+    `bg /fat/STAT.ELF`**, then `jobs` to list and `kill <pid>` to stop it. (`run /fat/STAT.ELF` works but
+    hits its 5 s deadline and is killed — `stat.elf` has no exit path, so `bg` is the intended verb.)
+  - **Witnesses.** `:: WINX-3: ELF loader — 2 PT_LOADs mapped W^X, entry <va>, ring-3 witness 0x7f
+    through the ELF path, N presents, wrong-arch + W+X images refused, reap clean -> PASS ::` — a
+    synthesized two-segment ELF64 pushed through the same `spawn_user_image_bg` the shell calls, proving
+    the validator (including that it REFUSES a forged `e_machine` and a W+X segment), the `PT_LOAD` walk,
+    per-segment W^X, the bias, and the full bg lifecycle. `:: WINX-2: STAT.ELF end-to-end ... -> PASS ::`
+    runs the ACTUAL shipped artifact off the boot volume; it skips with one honest line in this repo's
+    headless CI, which attaches no block device (and whose FAT image builder is macOS-only), and proves
+    itself at the bench.
+  - Lane: `arch/x86_64/{elf,syscall,memory,mod}.rs` + `shell.rs` + `crates/user-stat` + `arroyo` +
+    `builder/src/main.rs` + `scripts/make-fat-img.sh` + docs.
 - **WC-B (this arc)** — the **window surface/verb seam**: the syscall half of the window-compositor arc
   (unit WC-A owns the compositor core in `video/`). Four new verbs, `SYS_WIN_CREATE = 29`,
   `SYS_WIN_PRESENT = 30`, `SYS_WIN_MOVE = 31`, `SYS_WIN_CLOSE = 32` (28 stays reserved for the deferred

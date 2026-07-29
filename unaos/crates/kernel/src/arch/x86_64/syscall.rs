@@ -10360,13 +10360,22 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
     Ok((pid, mapped.slot as u64, mapped.entry))
 }
 
-/// WINX-2: choose the core a background job starts on. Round-robins over the ONLINE cores so repeated
-/// `bg` launches from the one shell context do not all pile onto the shell's core. Placement is decided
-/// once, at spawn; the task stays put afterwards (a ring-3 slot carries per-core state).
+/// WINX-2: choose the core a background job starts on — the CALLER's core.
+///
+/// This started as a round-robin over `0..meter_cpu_count()`, mirroring aarch64's BG-SPREAD intent
+/// (every `bg` runs from the same shell context, so pinning to one core piles every background program
+/// onto it). That was WRONG and the WINX-3 witness caught it: `meter_cpu_count()` reports how many cores
+/// the METER knows about, which is not the same as how many are released into `run()` and actually
+/// dispatching. A job placed on a core that is online but not scheduling sits in that core's run queue
+/// forever — spawned, never dispatched, never exiting, and invisible except as a job that never starts.
+///
+/// The caller's core is definitionally scheduling (we are running on it), so placement here is
+/// always-correct if not always-optimal. Spreading properly needs an "is this core dispatching"
+/// predicate that x86's scheduler does not expose yet (aarch64 gets this from `CPU_AUTO`, which picks by
+/// ready-queue depth among cores it knows are live). That predicate is the honest prerequisite for
+/// re-introducing spread, and it is a scheduler change, not a syscall-layer one.
 fn bg_place_cpu() -> usize {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let n = crate::arch::sched::meter_cpu_count().max(1);
-    NEXT.fetch_add(1, Ordering::Relaxed) % n
+    crate::arch::sched::meter_current_cpu()
 }
 
 /// WINX-2: poll a background pid. With `reap` set, a `PEXITED` row is consumed here — the posted `done`
@@ -10697,6 +10706,292 @@ fn winx_launcher(demo_cpu: usize) {
             cleared,
             killed,
             WINX_DONE.load(Ordering::Acquire),
+            WINX_WITNESS_ALL
+        );
+    }
+}
+
+// =============================================================================================
+// WINX-6: the END-TO-END witness — STAT.ELF off the boot volume, through the real loader, into a
+// compositor window, then killed.
+//
+// Everything the previous WINX arcs proved in pieces, proved as ONE PATH and with the ACTUAL SHIPPING
+// ARTIFACT rather than an inline fixture: the FAT read the shell's `bg` does, `spawn_user_image_bg`,
+// `elf::validate_elf` + `map_image_into_slot` (a real two-segment ELF64 with per-segment W^X, not a
+// one-page blob), ring 3, `SYS_GETINFO`/`SYS_WIN_CREATE`/`SYS_WIN_PRESENT`/`SYS_SLEEP_MS`, the
+// compositor, and finally `bg_kill` + the reap.
+//
+// It uses the SAME BYTES the bench operator will run. `crates/user-stat` is built for x86 by arroyo's
+// `build_user_stat_x86` and staged as `STAT.ELF` on the boot volume; this launcher reads that file, so a
+// packaging break (wrong arch, truncated image, missing from the volume) fails HERE rather than at the
+// bench. That is the whole point of witnessing the artifact instead of a fixture.
+//
+// STAT.ELF has NO exit path by design ("runs until it is killed"), so the kill is not cleanup bolted on
+// the end — it is the last leg of the contract under test, and the only way this launcher can terminate.
+
+/// WINX-6: the witness's own gate — how many presents the program must land before we accept that it is
+/// really running its paint loop rather than having created a window and wedged. STAT.ELF presents once
+/// per ~50 ms frame, so this is well under a second of its life.
+const WINX2_MIN_PRESENTS: u64 = 3;
+
+/// WINX-6: load `STAT.ELF` off the FAT boot volume and run the whole `bg` lifecycle on it.
+/// Chained after `winx_launcher`, so the inline-fixture verdict (which proves the verbs in isolation)
+/// lands first and this one proves the shipping path.
+fn winx2_launcher(_demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // Read the image exactly as the shell's x86 `bg` does: FAT boot partition, root directory, 8.3 name.
+    let Ok(fs) = crate::fs::fat::mount() else {
+        serial_println!(":: WINX-2: no FAT boot volume — STAT.ELF end-to-end witness skipped ::");
+        return;
+    };
+    let Ok(de) = fs.find_in_root("STAT.ELF") else {
+        serial_println!(":: WINX-2: STAT.ELF absent from the boot volume — end-to-end witness skipped ::");
+        return;
+    };
+    let cap = user_window_size();
+    if de.size == 0 || de.size as usize > cap {
+        serial_println!(
+            ":: WINX-2: STAT.ELF is {} bytes, outside the {}-byte EL0 window — witness skipped ::",
+            de.size, cap
+        );
+        return;
+    }
+    let mut bytes = alloc::vec![0u8; de.size as usize];
+    if fs.read_file(&de, &mut bytes, cap).is_err() {
+        serial_println!(":: WINX-2: STAT.ELF read failed — end-to-end witness skipped ::");
+        return;
+    }
+    serial_println!(
+        ":: WINX-2: STAT.ELF end-to-end — {} bytes off the boot volume, through the ELF loader into a compositor window ::",
+        bytes.len()
+    );
+
+    let presents_before = fb_present_count();
+    let (pid, slot, entry) = match spawn_user_image_bg(&bytes) {
+        Ok(v) => v,
+        Err(why) => {
+            serial_println!(":: WINX-2: STAT.ELF end-to-end FAIL — bg spawn rejected: {} ::", why);
+            return;
+        }
+    };
+    let slot = slot as usize;
+
+    // Wait (bounded) for the program to prove it is alive: a window of its own AND presents landing.
+    let deadline = crate::arch::ticks() + 5_000;
+    let mut windowed = false;
+    let mut presents = 0u64;
+    while crate::arch::ticks() < deadline {
+        windowed |= winx_slot_has_window(slot);
+        presents = fb_present_count() - presents_before;
+        if windowed && presents >= WINX2_MIN_PRESENTS {
+            break;
+        }
+        crate::arch::sched::yield_now();
+    }
+
+    // The kill IS part of the contract: STAT.ELF has no exit path, so this is the only way it stops.
+    let verdict = bg_kill(pid, slot as u64);
+    let killed = verdict == "killed";
+    // Reap the row through the same call `jobs` makes, then confirm the pid is gone.
+    let reaped = matches!(bg_poll(pid, true), BgPoll::Faulted | BgPoll::Exited(_));
+    let gone = matches!(bg_poll(pid, false), BgPoll::Gone);
+    // Teardown: the kill's address-space free retires the window rows and drops the FB leaves.
+    let tdeadline = crate::arch::ticks() + 2_000;
+    while winx_slot_has_window(slot) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = !winx_slot_has_window(slot);
+
+    // SERIAL SETTLE — see the note in `winx_launcher`: the UART writer drops lines on contention, and
+    // this verdict follows the compositor's close/erase burst from another core.
+    for _ in 0..64 {
+        crate::arch::sched::yield_now();
+    }
+
+    if windowed && presents >= WINX2_MIN_PRESENTS && killed && reaped && gone && cleared {
+        serial_println!(
+            ":: WINX-2: STAT.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents, killed + reaped, teardown clean -> PASS ::",
+            entry, presents
+        );
+    } else {
+        serial_println!(
+            ":: WINX-2: STAT.ELF end-to-end FAIL — windowed={} presents={} killed={} ({}) reaped={} gone={} cleared={} (want true/>={}/true/true/true/true) ::",
+            windowed, presents, killed, verdict, reaped, gone, cleared, WINX2_MIN_PRESENTS
+        );
+    }
+}
+
+// =============================================================================================
+// WINX-6b: the HEADLESS ELF-loader witness.
+//
+// WINX-2 above is the right BENCH witness — it runs the actual shipped `STAT.ELF` off the boot volume —
+// but it cannot run in this repo's headless x86 CI: `./arroyo test` attaches NO block device (which is
+// why the U9x/U10x verdicts all say "no FAT volume"), and the FAT image builder
+// (`scripts/make-fat-img.sh`) is macOS-only. So WINX-2 skips with one honest line here and proves itself
+// on the bench.
+//
+// That would leave the ELF LOADER — the whole point of this arc, and the most security-sensitive code in
+// it — unproven in CI. This witness closes that: it SYNTHESIZES a real, valid, multi-segment ELF64 in
+// memory around the existing `winx-app` ring-3 blob and pushes it through the SAME
+// `spawn_user_image_bg` the shell's `bg` calls. Nothing about the loader is stubbed or bypassed —
+// `validate_elf` parses this image field by field, `map_image_into_slot` walks its two `PT_LOAD`s,
+// biases them, zeroes the `.bss` tail, and applies per-segment W^X, exactly as it would for STAT.ELF.
+//
+// The blob is position-independent and already computes everything from its own load address, so
+// wrapping it in an ELF changes nothing about how it runs — but it now arrives through the ELF path
+// rather than a raw copy, and its exit STATUS carries its 7-bit witness bitmask back out through the
+// Proc table. A loader bug that mis-biased a segment, mis-set a permission, or mis-computed the entry
+// shows up as a fault-kill or a wrong witness, not as a silent pass.
+
+/// WINX-6b: build a valid two-segment ELF64 image around the `winx-app` blob.
+///
+/// Layout — deliberately simple, and deliberately NOT page-congruent between file offset and vaddr,
+/// because the loader does not require congruence (it copies `p_filesz` bytes from `p_offset` to
+/// `p_vaddr - min_vaddr`) and pinning that down is worth a witness:
+///   file [0x00..0x40)      Ehdr
+///   file [0x40..0xB0)      two Phdrs
+///   file [0x1000..)        the blob bytes  (text segment's `p_offset`)
+///   vaddr [0x0000..0x1000) text  PF_R|PF_X  — the blob, entry at its `unaos_user_winx` offset
+///   vaddr [0x1000..0x2000) data  PF_R|PF_W  — filesz 0, memsz one page (exercises the zero-the-tail
+///                                             path), and it is the page the blob writes its
+///                                             `SYS_GETINFO` result into
+fn winx_elf_image() -> alloc::vec::Vec<u8> {
+    let bstart = &raw const unaos_user_winx_blob_start as usize;
+    let bend = &raw const unaos_user_winx_blob_end as usize;
+    let blen = bend - bstart;
+    let entry_off = (&raw const unaos_user_winx as usize - bstart) as u64;
+    const TEXT_FILE_OFF: usize = 0x1000;
+
+    let mut img = alloc::vec![0u8; TEXT_FILE_OFF + blen];
+    // --- Ehdr ---
+    img[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+    img[4] = 2; // EI_CLASS = ELFCLASS64
+    img[5] = 1; // EI_DATA  = ELFDATA2LSB
+    img[6] = 1; // EI_VERSION
+    img[16..18].copy_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+    img[18..20].copy_from_slice(&62u16.to_le_bytes()); // e_machine = EM_X86_64
+    img[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+    img[24..32].copy_from_slice(&entry_off.to_le_bytes()); // e_entry
+    img[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    img[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    img[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    img[56..58].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
+
+    // --- Phdr 0: text (R+X) ---
+    let p = 64;
+    img[p..p + 4].copy_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+    img[p + 4..p + 8].copy_from_slice(&5u32.to_le_bytes()); // p_flags = PF_R|PF_X
+    img[p + 8..p + 16].copy_from_slice(&(TEXT_FILE_OFF as u64).to_le_bytes()); // p_offset
+    img[p + 16..p + 24].copy_from_slice(&0u64.to_le_bytes()); // p_vaddr
+    img[p + 32..p + 40].copy_from_slice(&(blen as u64).to_le_bytes()); // p_filesz
+    img[p + 40..p + 48].copy_from_slice(&0x1000u64.to_le_bytes()); // p_memsz
+    img[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+
+    // --- Phdr 1: data (R+W), filesz 0 / memsz one page — the zero-the-tail path ---
+    let p = 64 + 56;
+    img[p..p + 4].copy_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+    img[p + 4..p + 8].copy_from_slice(&6u32.to_le_bytes()); // p_flags = PF_R|PF_W
+    img[p + 8..p + 16].copy_from_slice(&0u64.to_le_bytes()); // p_offset (filesz 0, so unused)
+    img[p + 16..p + 24].copy_from_slice(&0x1000u64.to_le_bytes()); // p_vaddr
+    img[p + 32..p + 40].copy_from_slice(&0u64.to_le_bytes()); // p_filesz
+    img[p + 40..p + 48].copy_from_slice(&0x1000u64.to_le_bytes()); // p_memsz
+    img[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+
+    // --- the blob itself ---
+    unsafe {
+        core::ptr::copy_nonoverlapping(bstart as *const u8, img.as_mut_ptr().add(TEXT_FILE_OFF), blen);
+    }
+    img
+}
+
+/// WINX-6b: push the synthesized ELF through the real `bg` lifecycle and check what came out the other
+/// side. PASS requires the loader to have accepted a genuine two-segment ELF64, the program to have run
+/// correctly from its biased entry (its exit STATUS is the same 7-bit witness bitmask the inline fixture
+/// reports — so every window verb was exercised through the ELF path), and the row to reap clean.
+fn winx3_launcher(_demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let img = winx_elf_image();
+    // Prove the VALIDATOR directly too, before the mapper ever sees it: this is the field-by-field
+    // parse, and its plan is what the mapper trusts.
+    let plan_ok = match super::elf::validate_elf(&img, user_window_size()) {
+        Ok(p) => p.nsegs == 2 && p.min_vaddr == 0,
+        Err(_) => false,
+    };
+    // And prove it REJECTS what it must — the same image with e_machine forged to aarch64's 183. A
+    // validator that accepted this would map an aarch64 image into an x86 address space.
+    let mut wrong_arch = img.clone();
+    wrong_arch[18..20].copy_from_slice(&183u16.to_le_bytes());
+    let rejects_wrong_arch = super::elf::validate_elf(&wrong_arch, user_window_size()).is_err();
+    // And a W+X segment — the W^X refusal, which is the one validation failure with security weight.
+    let mut wx = img.clone();
+    wx[64 + 4..64 + 8].copy_from_slice(&7u32.to_le_bytes()); // PF_R|PF_W|PF_X
+    let rejects_wx = super::elf::validate_elf(&wx, user_window_size()).is_err();
+
+    serial_println!(
+        ":: WINX-3: ELF loader — a synthesized two-segment ELF64 ({} bytes) through spawn_user_image_bg, the same path `bg` takes ::",
+        img.len()
+    );
+
+    let presents_before = fb_present_count();
+    let (pid, slot, entry) = match spawn_user_image_bg(&img) {
+        Ok(v) => v,
+        Err(why) => {
+            serial_println!(":: WINX-3: ELF loader FAIL — bg spawn rejected: {} ::", why);
+            return;
+        }
+    };
+    let slot = slot as usize;
+
+    // The blob exits on its own (unlike STAT.ELF), so wait for the row to settle rather than killing it.
+    let deadline = crate::arch::ticks() + 10_000;
+    let mut windowed = false;
+    while crate::arch::ticks() < deadline {
+        windowed |= winx_slot_has_window(slot);
+        if matches!(bg_poll(pid, false), BgPoll::Exited(_) | BgPoll::Faulted) {
+            break;
+        }
+        crate::arch::sched::yield_now();
+    }
+    let presents = fb_present_count() - presents_before;
+    let status = match bg_poll(pid, true) {
+        BgPoll::Exited(s) => s,
+        _ => -1,
+    };
+    let gone = matches!(bg_poll(pid, false), BgPoll::Gone);
+    let tdeadline = crate::arch::ticks() + 2_000;
+    while winx_slot_has_window(slot) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = !winx_slot_has_window(slot);
+
+    // SERIAL SETTLE — see `winx_launcher`.
+    for _ in 0..64 {
+        crate::arch::sched::yield_now();
+    }
+
+    let ok = plan_ok
+        && rejects_wrong_arch
+        && rejects_wx
+        && status == WINX_WITNESS_ALL as i32
+        && windowed
+        && presents >= 2
+        && gone
+        && cleared;
+    if ok {
+        serial_println!(
+            ":: WINX-3: ELF loader — 2 PT_LOADs mapped W^X, entry {:#x}, ring-3 witness {:#x} through the ELF path, {} presents, wrong-arch + W+X images refused, reap clean -> PASS ::",
+            entry, status, presents
+        );
+    } else {
+        serial_println!(
+            ":: WINX-3: ELF loader FAIL — plan={} rej_arch={} rej_wx={} status={:#x} windowed={} presents={} gone={} cleared={} (want true/true/true/{:#x}/true/>=2/true/true) ::",
+            plan_ok, rejects_wrong_arch, rejects_wx, status, windowed, presents, gone, cleared,
             WINX_WITNESS_ALL
         );
     }
@@ -12433,6 +12728,16 @@ fn u8x_launcher(demo_cpu: usize) {
     // `smolnet` is compiled. Unconditional (no feature gate): the window verbs are core process surface,
     // and `video::wm` is arch-neutral and always compiled. aarch64 never reaches this launcher at all.
     winx_launcher(demo_cpu);
+
+    // WINX-6: chain the STAT.ELF end-to-end witness right after the inline-fixture one, so the isolated
+    // verb proof lands first and the shipping-artifact proof second. It gates on the boot volume
+    // internally, so a run with no FAT volume (or no staged STAT.ELF) skips cleanly with one honest line.
+    winx2_launcher(demo_cpu);
+
+    // WINX-6b: the headless ELF-loader witness. WINX-2 above needs a block device the headless x86 run
+    // does not have, so this one synthesizes a real multi-segment ELF64 in memory and pushes it through
+    // the same `spawn_user_image_bg`, keeping the loader proven in CI rather than only at the bench.
+    winx3_launcher(demo_cpu);
 
     // SOCK-2 (knob-on, x86-only): chain the ring-3 UDP round-trip demo LAST — after the whole storage
     // chain u9x drives (so its line lands after every other demo, in both storage and no-storage modes,
