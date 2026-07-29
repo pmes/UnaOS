@@ -2325,6 +2325,23 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         U11M2_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // WINX-2: an operator-launched `run`/`bg` program that faults. Unlike every fixture above, these run
+    // ARBITRARY untrusted images, so a fault-kill here is NOT a kernel bug — it is the fault-kill net doing
+    // its job on a bad program, and it must be reported to the operator, not counted as an unexpected kill.
+    // The generic Proc short-circuit in the SYS_EXIT arm never runs for a killed task (it never reaches
+    // SYS_EXIT), so record the kill status on its Proc row HERE and post `done`, so `run_user_image`'s wait
+    // and `bg_poll`/`jobs` see a settled row instead of waiting out the full deadline on a dead task.
+    if name == RUN_TASK_NAME || name == BG_TASK_NAME {
+        let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+        if let Some(id) = crate::arch::sched::current_task_id(cpu) {
+            if let Some(i) = proc_find_running(id) {
+                PROCS[i].status.store(EXEC_KILLED_STATUS, Ordering::Release);
+                PROCS[i].state.store(PEXITED, Ordering::Release);
+                PROCS[i].done.post();
+            }
+        }
+        return;
+    }
     // WINX-1: the window fixture writes only its own data page and its own mapped surface, so a fault-kill
     // means a window verb mapped something wrong (or failed to map it) — a real WINX-1 bug, its own
     // counter, never the U1b `killed_unexpected` count. Not in PROCS, so the launcher times out to FAIL on
@@ -10108,6 +10125,328 @@ fn u8_kernel_check() -> bool {
 }
 
 // =============================================================================================
+// WINX-2 — the EL0 PROGRAM LIFECYCLE: `run` (synchronous) and `bg` (detached) on x86.
+//
+// The x86 twins of aarch64's EXEC-1 `run_user_image` and BGRUN-1 `spawn_user_image_bg` / `bg_poll` /
+// `bg_kill`, with the same operator-visible contracts. `shell.rs` calls these through
+// `crate::arch::syscall::*`, so the shell body is arch-neutral and the two arches diverge only here.
+//
+// PREEMPTIBLE, ALWAYS — the one substantive divergence from aarch64, and it is forced.
+// aarch64 spawns a foreground `run` co-located and COOPERATIVE, and stops a runaway with its SKILL-1
+// `sched::kill` primitive (a per-ASID kill ticket the SVC path polls). x86 has no such primitive; what it
+// has is U3.5's `spawn_user_preemptible` + `KillSwitch`, where the SCHEDULER reaps the task at its next
+// preemption boundary. So both `run` and `bg` spawn preemptible here.
+//
+// That is not a downgrade, it is the only correct choice: `STAT.ELF` has NO exit path by design ("runs
+// until it is killed" — BGRUN-2's whole contract), so a cooperative x86 `run /fat/STAT.ELF` would wedge
+// the shell task forever with no way back. Preemptible ring 3 (RFLAGS.IF set) is the proven U3.5 path,
+// and the scheduler's reap tears the address space down through `free_user_space_by_cr3` — which, since
+// WINX-1, also retires the task's compositor windows and drops its FB leaves. A killed windowed app
+// therefore leaves nothing on the panel and nothing in the window table.
+//
+// EXIT ACCOUNTING rides the GENERIC Proc short-circuit already in the `SYS_EXIT` arm: we plant a Proc row
+// and store the spawned pid, and the exiting task's own `proc_find_running` lookup records its status,
+// marks `PEXITED`, and posts `done`. No dedicated exit arm is needed (and none would work — these
+// programs run under an operator-chosen image, not a fixed fixture name). The KILL path has no such
+// short-circuit, so `record_ring3_kill` gets an arm for these two task names below.
+
+/// WINX-2: the Proc `status` a killed run/bg task is marked with, so `bg_poll` / `run_user_image` can
+/// tell a fault-kill from an ordinary nonzero exit. Same sentinel value as the aarch64 twin.
+const EXEC_KILLED_STATUS: i32 = i32::MIN;
+
+/// WINX-2: how long `bg_kill` / the `run` deadline arm waits for the scheduler to confirm a reap before
+/// reporting the kill as still-armed. The reap lands at the target's next preemption boundary, which is
+/// one timer tick away; seconds of budget is generous by orders of magnitude.
+const KILL_CONFIRM_MS: u64 = 2000;
+
+/// WINX-2: the task name a foreground `run` program is spawned under.
+const RUN_TASK_NAME: &str = "shell-run";
+/// WINX-2: the task name a background `bg` program is spawned under.
+const BG_TASK_NAME: &str = "bg-el0";
+
+/// WINX-2: the outcome of [`run_user_image`] — the program exited with a status, was killed by the
+/// fault-kill net (a CONTAINED fault), or overran its deadline (still running / stuck, and then killed).
+pub enum RunOutcome {
+    Exited(i32),
+    Faulted,
+    Timeout,
+}
+
+/// WINX-2: what [`bg_poll`] found for a pid.
+pub enum BgPoll {
+    /// The task is still running.
+    Running,
+    /// Exited with this status; if `reap` was set the row has been freed.
+    Exited(i32),
+    /// Killed by the fault-kill net (contained fault); if `reap` was set the row has been freed.
+    Faulted,
+    /// No row holds this pid (already reaped, or never existed).
+    Gone,
+}
+
+/// WINX-2: one live background job's kill handle. The `Arc<KillSwitch>` clone is what keeps the switch
+/// alive across the request/reap window after the scheduler has dropped the `Task` (the switch is shared
+/// by `Arc` exactly so this is safe — see `sched::KillSwitch`).
+struct BgKill {
+    pid: u64,
+    kill: alloc::sync::Arc<crate::arch::sched::KillSwitch>,
+}
+
+/// WINX-2: the background kill registry. Bounded by `MAX_PROCS` — a bg job always owns a Proc row, so a
+/// row is the binding resource and this can never need to be larger. Guarded by a plain `SpinMutex`
+/// (never taken from an IRQ-masked path: only the shell task and the `run` deadline arm touch it).
+static BG_KILLS: SpinMutex<[Option<BgKill>; MAX_PROCS]> =
+    SpinMutex::new([const { None }; MAX_PROCS]);
+
+/// WINX-2: record a live job's kill handle. Drops the oldest completed entry if the table is full, which
+/// cannot lose a live job (the table is sized to `MAX_PROCS` and every live job holds a Proc row).
+fn bg_kill_register(pid: u64, kill: alloc::sync::Arc<crate::arch::sched::KillSwitch>) {
+    let mut t = BG_KILLS.lock();
+    if let Some(s) = t.iter_mut().find(|s| s.is_none()) {
+        *s = Some(BgKill { pid, kill });
+        return;
+    }
+    // Full: evict a reaped entry (its job is gone, so its switch is dead weight).
+    if let Some(s) = t.iter_mut().find(|s| s.as_ref().is_some_and(|b| b.kill.is_reaped())) {
+        *s = Some(BgKill { pid, kill });
+    }
+}
+
+/// WINX-2: take a job's kill handle out of the registry (the kill consumes it — a second `kill` on the
+/// same pid finds nothing and is told so, rather than re-arming a switch whose task is already gone).
+fn bg_kill_take(pid: u64) -> Option<alloc::sync::Arc<crate::arch::sched::KillSwitch>> {
+    let mut t = BG_KILLS.lock();
+    let s = t.iter_mut().find(|s| s.as_ref().is_some_and(|b| b.pid == pid))?;
+    s.take().map(|b| b.kill)
+}
+
+/// WINX-2: drop a pid's registry entry without arming it (the reap path, after an ordinary exit).
+fn bg_kill_forget(pid: u64) {
+    let mut t = BG_KILLS.lock();
+    if let Some(s) = t.iter_mut().find(|s| s.as_ref().is_some_and(|b| b.pid == pid)) {
+        *s = None;
+    }
+}
+
+/// WINX-2: the shared front half of `run` and `bg` — bound the image, claim a Proc row, map the image
+/// into a fresh slot, endow the console capability, and publish the slot. Returns the mapped image and
+/// the Proc row index. On any failure the Proc row is released and NO slot is left allocated (the mapper
+/// allocates its slot last, after all validation).
+///
+/// PUBLISH ORDER (the aarch64 EXEC1-M rule, and it matters for the same reason): the SLOT is published
+/// into the Proc row BEFORE the task is spawned, because a preemptible child can be dispatched on
+/// another core the instant it is enqueued — before the `pid` store below lands. Anything keyed off the
+/// row must therefore be valid at spawn time, not at store time.
+fn load_program_common(bytes: &[u8]) -> Result<(super::elf::Mapped, usize), &'static str> {
+    if bytes.len() > user_window_size() {
+        return Err("image larger than the 16 KiB user window");
+    }
+    let Some(pi) = proc_reserve() else {
+        return Err("process table full (run `jobs` to reap exited jobs)");
+    };
+    let mapped = match super::elf::map_image_into_slot(bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            proc_free(pi);
+            return Err(e.as_str());
+        }
+    };
+    // Endow the console write capability, exactly as the fixtures' slots are endowed: a program's first
+    // `SYS_WRITE(1, ...)` must resolve handle 1 to the Console cap or it could not say anything.
+    install_console_cap(mapped.slot);
+    PROCS[pi].slot.store(mapped.slot + 1, Ordering::Release); // +1-biased; 0 means "none"
+    Ok((mapped, pi))
+}
+
+/// WINX-2: load an already-read program IMAGE (flat or ELF64) into a fresh ring-3 slot, run it, and
+/// return its exit status — the synchronous shell `run <path>` entry. The shell reads the bytes off the
+/// VFS at ring 0 and hands them here.
+///
+/// `deadline_ms` bounds the wait in milliseconds (the arch-neutral unit the shell now passes; aarch64's
+/// twin takes a CNTPCT span and converts on its own side). On timeout the program is KILLED rather than
+/// abandoned: an orphan that kept rendering would keep composing frames onto the panel forever and would
+/// hold its address-space slot and window rows against every later launch. That is the one place this
+/// diverges in EFFECT from the aarch64 twin, which leaves a documented orphan residue behind.
+///
+/// Returns `(outcome, entry)` where `entry` is the ring-3 entry VA the image was mapped at (for the
+/// caller's witness line), or an operator string if the image could not be loaded.
+pub fn run_user_image(
+    name: &'static str,
+    bytes: &[u8],
+    deadline_ms: u64,
+) -> Result<(RunOutcome, u64), &'static str> {
+    let _ = name; // the task name is fixed (`RUN_TASK_NAME`) so the kill arm can match it
+    let (mapped, pi) = load_program_common(bytes)?;
+    let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
+    let cpu = crate::arch::sched::meter_current_cpu();
+    let pid = crate::arch::sched::spawn_user_preemptible(
+        RUN_TASK_NAME,
+        mapped.entry,
+        mapped.sp,
+        cpu,
+        mapped.cr3,
+        kill.clone(),
+    );
+    PROCS[pi].pid.store(pid, Ordering::Release);
+
+    // Deadline-bounded wait. Yielding (not sleeping) so this works before the timebase is calibrated and
+    // so the shell task stays responsive to its own core's scheduler.
+    let deadline = crate::arch::ticks() + deadline_ms;
+    while PROCS[pi].state.load(Ordering::Acquire) == PRUNNING && crate::arch::ticks() < deadline {
+        crate::arch::sched::yield_now();
+    }
+
+    if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
+        let status = PROCS[pi].status.load(Ordering::Acquire);
+        let _ = PROCS[pi].done.wait(); // already posted by the exiting task; balances the permit
+        proc_free(pi);
+        let outcome = if status == EXEC_KILLED_STATUS {
+            RunOutcome::Faulted
+        } else {
+            RunOutcome::Exited(status)
+        };
+        return Ok((outcome, mapped.entry));
+    }
+
+    // TIMEOUT: arm the kill and wait (bounded) for the scheduler to confirm the reap.
+    kill.request();
+    let kdeadline = crate::arch::ticks() + KILL_CONFIRM_MS;
+    while !kill.is_reaped() && crate::arch::ticks() < kdeadline {
+        crate::arch::sched::yield_now();
+        // A target that reached SYS_EXIT between the deadline test and the arm settles the row itself.
+        if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
+            break;
+        }
+    }
+    if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
+        // It exited on its own in the race window — reap it normally rather than reporting a timeout on
+        // a program that actually finished.
+        let status = PROCS[pi].status.load(Ordering::Acquire);
+        let _ = PROCS[pi].done.wait();
+        proc_free(pi);
+        return Ok((RunOutcome::Exited(status), mapped.entry));
+    }
+    // Reaped by the scheduler (or the kill is still armed — either way the row is ours to release, and
+    // the scheduler's reap has already torn the address space, windows and FB leaves down).
+    proc_free(pi);
+    Ok((RunOutcome::Timeout, mapped.entry))
+}
+
+/// WINX-2: load an EL0 image and spawn it WITHOUT waiting — the shell's `bg <path>` entry. Returns
+/// `(pid, slot, entry)`; the caller records the pid and reaps it later via [`bg_poll`], or stops it with
+/// [`bg_kill`]. Mirrors `run_user_image`'s front half exactly and diverges only in not waiting.
+///
+/// The Proc row stays claimed after exit (PEXITED, `done` posted) until `bg_poll(reap = true)` consumes
+/// it — the `jobs` verb is the reaper. Rows are a bounded resource (`MAX_PROCS`), which is honest: a
+/// shell that never runs `jobs` eventually gets "process table full", not silent loss.
+pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
+    let (mapped, pi) = load_program_common(bytes)?;
+    let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
+    // Place a bg job on a core chosen by the same round-robin the fixtures use rather than the shell's
+    // own: every `bg` launch runs from the same shell context, so pinning to `this_cpu` would stack every
+    // background program on one core (the aarch64 BG-SPREAD lesson). x86 has no CPU_AUTO, so this is the
+    // simple honest version — spread across the online cores by job count.
+    let cpu = bg_place_cpu();
+    let pid = crate::arch::sched::spawn_user_preemptible(
+        BG_TASK_NAME,
+        mapped.entry,
+        mapped.sp,
+        cpu,
+        mapped.cr3,
+        kill.clone(),
+    );
+    PROCS[pi].pid.store(pid, Ordering::Release);
+    bg_kill_register(pid, kill);
+    Ok((pid, mapped.slot as u64, mapped.entry))
+}
+
+/// WINX-2: choose the core a background job starts on. Round-robins over the ONLINE cores so repeated
+/// `bg` launches from the one shell context do not all pile onto the shell's core. Placement is decided
+/// once, at spawn; the task stays put afterwards (a ring-3 slot carries per-core state).
+fn bg_place_cpu() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = crate::arch::sched::meter_cpu_count().max(1);
+    NEXT.fetch_add(1, Ordering::Relaxed) % n
+}
+
+/// WINX-2: poll a background pid. With `reap` set, a `PEXITED` row is consumed here — the posted `done`
+/// permit is awaited (it is already posted, so this does not block) and the row freed, exactly the reap
+/// in `run_user_image`; the "reused entry starts at 0 permits" invariant holds. Scans by pid rather than
+/// trusting a cached index: rows recycle, and a stale index could name a row that now belongs to someone
+/// else — the pid is the key every other lookup uses.
+pub fn bg_poll(pid: u64, reap: bool) -> BgPoll {
+    for pi in 0..MAX_PROCS {
+        if PROCS[pi].state.load(Ordering::Acquire) == PFREE {
+            continue;
+        }
+        if PROCS[pi].pid.load(Ordering::Acquire) != pid {
+            continue;
+        }
+        return match PROCS[pi].state.load(Ordering::Acquire) {
+            PEXITED => {
+                let status = PROCS[pi].status.load(Ordering::Acquire);
+                if reap {
+                    let _ = PROCS[pi].done.wait();
+                    proc_free(pi);
+                    bg_kill_forget(pid);
+                }
+                if status == EXEC_KILLED_STATUS {
+                    BgPoll::Faulted
+                } else {
+                    BgPoll::Exited(status)
+                }
+            }
+            _ => BgPoll::Running,
+        };
+    }
+    BgPoll::Gone
+}
+
+/// WINX-2: kill a background pid through the U3.5 `KillSwitch` — request termination, then wait
+/// (bounded) for the scheduler to confirm the reap at the target's next preemption boundary. The reap
+/// tears the address space down via `free_user_space_by_cr3`, which since WINX-1 also retires the job's
+/// compositor windows and drops its FB leaves, so a killed windowed app leaves nothing on the panel.
+/// Returns an operator string for the shell.
+pub fn bg_kill(pid: u64, _slot: u64) -> &'static str {
+    let mut row: Option<usize> = None;
+    for pi in 0..MAX_PROCS {
+        if PROCS[pi].state.load(Ordering::Acquire) != PFREE
+            && PROCS[pi].pid.load(Ordering::Acquire) == pid
+        {
+            row = Some(pi);
+            break;
+        }
+    }
+    let Some(pi) = row else {
+        return "no such job (already reaped?)";
+    };
+    if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
+        return "already exited — run `jobs` to reap it";
+    }
+    let Some(kill) = bg_kill_take(pid) else {
+        return "already killed — the kill is still armed; the row frees itself when the task retires";
+    };
+    kill.request();
+    let deadline = crate::arch::ticks() + KILL_CONFIRM_MS;
+    while !kill.is_reaped() && crate::arch::ticks() < deadline {
+        if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
+            // It reached SYS_EXIT in the race window; the ordinary reap path owns it now.
+            return "exited before the kill landed — run `jobs` to reap it";
+        }
+        crate::arch::sched::yield_now();
+    }
+    if !kill.is_reaped() {
+        return "kill armed — the task retires at its next preemption";
+    }
+    // Confirmed reaped. The scheduler dropped the task without running the SYS_EXIT accounting, so mark
+    // the row here — `jobs` must be able to reap it exactly like an ordinary exit.
+    PROCS[pi].status.store(EXEC_KILLED_STATUS, Ordering::Release);
+    PROCS[pi].state.store(PEXITED, Ordering::Release);
+    PROCS[pi].done.post();
+    "killed"
+}
+
+// =============================================================================================
 // WINX-1: the ring-3 WINDOW fixture + its launcher. The x86 proof that an EL0 program can put a window
 // on the compositor and present into it — the first one that ever could.
 //
@@ -10327,6 +10666,22 @@ fn winx_launcher(demo_cpu: usize) {
         crate::arch::sched::yield_now();
     }
     let cleared = !winx_slot_has_window(fix.slot);
+
+    // SERIAL SETTLE — not cosmetic, and the reason this line was intermittently missing.
+    // `serial::_print` takes the UART with `try_lock` and DROPS the line on contention (by design: it
+    // must never block an IRQ-masked or panicking context). This verdict is emitted immediately after
+    // the compositor's create/present/close burst, which the render task prints from ANOTHER core — so
+    // roughly one run in three the verdict lost the race and vanished, taking the suite from 32 PASS to
+    // 31 with no FAIL to explain it. Everything this verdict reports is already latched in locals above,
+    // and the fixture and its window are gone by now, so yielding here costs nothing and lets the
+    // compositor's queued lines drain before we take the port.
+    //
+    // This is a MITIGATION, not a fix: the drop-on-contention writer makes ANY serial line racy, and the
+    // suite's PASS-count gate inherits that. Flagged for the integrator — the real fix is a buffered or
+    // blocking serial writer, which is not this arc's lane.
+    for _ in 0..64 {
+        crate::arch::sched::yield_now();
+    }
 
     if witness == WINX_WITNESS_ALL && painted && presents >= 2 && cleared && killed == 0 {
         serial_println!(
