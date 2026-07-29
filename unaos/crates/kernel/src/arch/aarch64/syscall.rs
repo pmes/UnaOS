@@ -11789,8 +11789,9 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
     // CLICK-ROUTE: the pointer's twin of the line above, and in the same place for the same reason —
     // this is the single choke point every event bound for an EL0 ring passes through, so it is where
     // "who is this click FOR?" gets asked. `true` means the click was addressed to the desktop and is
-    // consumed; `false` may mean the routing raised a NEW window to focus, in which case the load
-    // below picks up the new ASID and the press lands in the right ring on the way past.
+    // consumed — and, since CLICK-SHELL, that focus has moved to the shell with it, so the load below
+    // would read 0 anyway; `false` may mean the routing raised a NEW window to focus, in which case the
+    // load below picks up the new ASID and the press lands in the right ring on the way past.
     if wc_click_route(ev) {
         return false; // consumed, not queued — `[el0in] routed` must stay truthful
     }
@@ -12105,19 +12106,36 @@ fn click_owner_is_windowed(asid: u64) -> bool {
 ///  * **the FOCUSED window** — deliver exactly as before. This is the no-change case and it is the
 ///    common one.
 ///  * **no window** — the click landed on the desktop or the console. It is not the focused app's
-///    click, so it is CONSUMED here rather than delivered: that single arm is what P69 is asking for.
-///    Two deliberate limits on it:
+///    click, so it is CONSUMED here rather than delivered: that arm is what P69 is asking for. It also
+///    MOVES FOCUS TO THE SHELL (below). Two deliberate limits on it:
 ///      - With focus at the SHELL (`cur == 0`) nothing is consumed — the caller's normal path IS the
-///        shell path (`gui_send` -> `click1_dispatch`), which is where a desktop click belongs.
+///        shell path (`gui_send` -> `click1_dispatch`), which is where a desktop click belongs, and the
+///        focus is already where the miss would put it.
 ///      - If the focused app owns no hittable window at all ([`click_owner_is_windowed`] false), the
 ///        press is delivered as before. That is the FULL-SCREEN app: a compat row covers the panel but
 ///        carries owner ASID 0 and so can never be hit, and dropping its clicks would break UVUG's own
 ///        click-to-exit. A miss over a full-screen app is a hit on that app, not on the desktop.
 ///
-/// A miss does NOT move focus. Raising the shell on a desktop click would bury every window under the
-/// console (`focus_changed(0)` gives SHELL_Z the fresh z — the FOCUS-VIS "shell" leg), which is a far
-/// bigger claim than P69 makes and would make the desktop unusable. Routing the click and moving focus
-/// are separate decisions here, and only the hit arm does both.
+/// ### CLICK-SHELL — a miss moves focus to the SHELL
+/// CLICK-ROUTE shipped this arm as "consume, but do not move focus", on the reasoning that raising the
+/// shell buries every window under the console. P71, attended, is the ruling against that reading:
+/// clicking a window focuses it, and clicking the DESKTOP must focus the desktop — otherwise the
+/// out-of-focus vug keeps the keyboard while the operator is demonstrably interacting with the shell,
+/// and there is no pointer gesture that reaches the console at all (only `TAB`).
+///
+/// So a miss over a windowed focus does what the hit arm does, with the shell as the target: the ONE
+/// focus primitive (`el0_input_set_active(0)` then `wm::focus_changed(0)`, in that order), which is
+/// literally the shell slot of `wc_focus_key`'s ring — no second shell-focus state is invented here,
+/// and everything already hanging off that path follows unchanged (the outgoing app's ring is left
+/// alone, its takeover latch is cleared, and VUGMIN's hidden bit is published by `focus_changed`'s own
+/// scan, so the vug it just left IDLES rather than pausing or dying). The burial is the intended
+/// effect, not a side effect — it is the same z-order move `TAB`-to-shell has always made, and the
+/// same one FOCUS-VIS's "shell" leg asserts.
+///
+/// The press itself is still CONSUMED (target [`CLICK_TARGET_DROP`], so the release is dropped with
+/// it). Focus moved; the click is not re-addressed to the console after the fact, because a
+/// press/release pair must not be split and the shell's `click1_dispatch` never saw the press edge.
+/// The operator's NEXT click is an ordinary shell click on the shell's own path.
 ///
 /// ### The RELEASE edge follows the press, and is never re-routed
 /// See [`CLICK_PRESS_TARGET`]. The release is delivered iff the focus is still the one the press was
@@ -12160,6 +12178,15 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
             }
             None => {
                 if click_owner_is_windowed(cur) {
+                    // CLICK-SHELL: the desktop was clicked while a windowed app held focus. Same
+                    // human-rate reasoning as the hit arm's line — one line per click that moves
+                    // focus, so no throttle is owed.
+                    serial_println!(
+                        "[clickroute] press miss at ({},{}) -> shell focus (was {})",
+                        x, y, cur
+                    );
+                    el0_input_set_active(0);
+                    crate::video::wm::focus_changed(0);
                     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
                     true
                 } else {

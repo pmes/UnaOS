@@ -4416,11 +4416,58 @@ static HT_SURF: [u32; 64] = [0x0020_C080; 64];
 ///    and the same inside point hits nothing. Visibility is a POSITION in the shared z-order, and what
 ///    you can click has to be what you can see: clicking a console that covers a window must reach the
 ///    console. This is [`above_shell`] holding on the input side as well as the drawing side.
+/// 6. **shell** (CLICK-SHELL, P71) — the ROUTER leg, and the only one that leaves this file. With A
+///    raised and focused, a press that hit-tests to nothing must (a) be consumed and (b) hand focus to
+///    the SHELL. Legs 1-5 assert the address lookup; this one asserts the POLICY built on it, because
+///    P71's finding was not a bad hit-test — `hit_test` answered `None` correctly and the router threw
+///    the answer away. Driven through the real `wc_click_route` (a synthetic `Button` press edge, then
+///    a release edge to leave the router's mask tracker as it was found), against the REAL cursor
+///    position, so it exercises the shipped path rather than a re-implementation of it. The leg reports
+///    SKIP rather than FAIL when the cursor happens to sit over a live window (nothing has moved the
+///    pointer on a headless gate, so it is parked at panel centre — but that is a fact about the
+///    fixture set, not something this witness may assume), and DORMANT on builds where the router does
+///    not exist (x86_64 and the hosted aarch64 build).
 ///
 /// Self-cleaning on the FOCUS-VIS pattern: both windows are closed, `SHELL_Z` and `FOCUS_ASID` are
 /// restored (this calls `focus_changed` with SYNTHETIC asids, which must not be left naming an address
 /// space that does not exist), and the live set is repainted. `witness`-gated, one-shot, and ordered
 /// after every one-shot per-window latch so it cannot burn one with its own rows.
+/// CLICK-SHELL (P71) — leg 6 of [`hittest_selftest`], factored out because it is the one leg that
+/// leaves this file: it drives the ARCH router (`wc_click_route`), which exists only on the baremetal
+/// aarch64 build, through the same `#[cfg]` seam [`vugmin_publish`] already uses for `set_hidden`.
+///
+/// The fixture, in order: raise `asid` back above the shell (leg 5 buried everything) and give it
+/// focus; read the REAL cursor; bail out (`None` — asserted nothing) if the pointer happens to be over
+/// a live window, since then the press is a HIT and this leg has no fixture; otherwise drive one PRESS
+/// edge and check the three things P71 asks for — the press is CONSUMED, focus is now the SHELL
+/// (`el0_input_active() == 0`), and the previously focused window is BELOW the shell, which is what
+/// makes the shell focus the same state VUGMIN idles the fleet from.
+///
+/// One RELEASE edge follows, so the router's press/release tracker is left exactly as it was found: a
+/// witness that left a phantom press outstanding would make the operator's next real release drop.
+#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal"))]
+fn clickshell_leg(asid: u64, ix: i32, iy: i32, w: i32, h: i32) -> Option<bool> {
+    use crate::arch::aarch64::syscall as sc;
+    focus_changed(asid);
+    let (cx, cy) = crate::pal::cursor::pos(w, h);
+    if hit_test(cx, cy).is_some() {
+        return None; // pointer parked over a window: that is the HIT arm, not the desktop arm
+    }
+    sc::el0_input_set_active(asid);
+    let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
+    let refocused = sc::el0_input_active() == 0;
+    let buried = hit_test(ix, iy).is_none();
+    let _ = sc::wc_click_route(crate::pal::Event::Button(0));
+    Some(consumed && refocused && buried)
+}
+
+/// CLICK-SHELL, DORMANT half: no arch router in this build, so leg 6 asserts nothing.
+#[cfg(all(feature = "witness", not(all(target_arch = "aarch64", feature = "baremetal"))))]
+fn clickshell_leg(asid: u64, _ix: i32, _iy: i32, _w: i32, _h: i32) -> Option<bool> {
+    focus_changed(asid);
+    None
+}
+
 #[cfg(feature = "witness")]
 pub fn hittest_selftest() {
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -4482,10 +4529,16 @@ pub fn hittest_selftest() {
     let outside_ok = hit_test(ox_miss, oy_miss).is_none();
     focus_changed(0);
     let hidden_ok = hit_test(ix, iy).is_none();
-    let ok = inside_ok && topmost_ok && raise_ok && outside_ok && hidden_ok;
+
+    // Leg 6 — CLICK-SHELL. Re-raise A (leg 5 left every window under the shell) and give it focus,
+    // then drive one PRESS edge through the router with the pointer wherever it actually is. The
+    // fixture is only valid if that point hits nothing: `shell` is the verdict, `None` = not asserted.
+    let shell: Option<bool> = clickshell_leg(ASID_A, ix, iy, info.width as i32, info.height as i32);
+    let ok = inside_ok && topmost_ok && raise_ok && outside_ok && hidden_ok && shell != Some(false);
     serial_println!(
-        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} hidden={} -> {}",
+        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} hidden={} shell={} -> {}",
         ix, iy, inside_ok, topmost_ok, raise_ok, outside_ok, hidden_ok,
+        match shell { Some(true) => "true", Some(false) => "false", None => "skip" },
         if ok { "PASS" } else { "FAIL" }
     );
 
