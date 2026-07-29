@@ -222,6 +222,22 @@ fn main() {
         println!("   U2: target/hello.bin absent — ESP has no HELLO.BIN (run via ./arroyo esp-x86)");
     }
 
+    // WINX-5: the x86 EL0 persistence program (crates/user-stat, built by arroyo's build_user_stat_x86
+    // to target/STAT-X86.ELF). Copy it onto the ESP as STAT.ELF so the metal boot media carries it, the
+    // same way HELLO.BIN reaches the volume just above; the x86 shell's `run`/`bg` read the FAT boot
+    // partition's root, so `bg /fat/STAT.ELF` finds it there. The name is un-suffixed ON the volume
+    // (STAT.ELF, not STAT-X86.ELF) because the operator command should read the same on both arches —
+    // the arch suffix exists only in target/, where both arches' images share one directory.
+    // Absent when the program wasn't built (a bare `cargo run` in builder/) — then `run`/`bg` simply
+    // report -ENOENT, harmless.
+    let stat_elf = target_dir.join("STAT-X86.ELF");
+    if stat_elf.exists() {
+        std::fs::copy(&stat_elf, esp_dir.join("STAT.ELF")).unwrap();
+        println!("   WINX: copied STAT.ELF onto the ESP (bg /fat/STAT.ELF)");
+    } else {
+        println!("   WINX: target/STAT-X86.ELF absent — ESP has no STAT.ELF (run via ./arroyo esp-x86)");
+    }
+
     // VMIMAGE-1: package the just-built ESP tree into ONE self-contained GPT+FAT32 disk image
     // (target/vm/unaos-x86-<git7>.img) and stop — no QEMU. Reuses the SAME build products packed
     // above; the image builder never rebuilds. UNAOS_VM_GIT7 carries the short git hash (identity

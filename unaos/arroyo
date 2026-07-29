@@ -457,6 +457,40 @@ build_user_hello_x86() {
     echo -e "${COLOR_GREEN}✅ x86 user blob: $(wc -c < "${WORKSPACE_DIR}/target/hello.bin" | tr -d ' ') bytes${COLOR_RESET}"
 }
 
+# WINX-5: build the x86_64 static ELF64 EL0 PERSISTENCE program (crates/user-stat → target/STAT-X86.ELF).
+# The x86 twin of the aarch64 STAT.ELF build in build_user_aarch64(): same crate, same app logic, same
+# linker-script SHAPE (crates/user-stat/user-stat-x86.ld — two PT_LOAD segments via a PHDRS clause);
+# only the per-arch syscall stubs and the target differ. `-z max-page-size=0x1000` packs the segments on
+# 4 KiB boundaries so the image fits the kernel's 16 KiB slot window.
+#
+# The crate's .cargo/config.toml defaults to the aarch64 target, so `--target` is passed EXPLICITLY here
+# to override it; the two builds therefore land in separate target subdirectories and never clobber each
+# other's artifacts. The output keeps a distinct name (STAT-X86.ELF) for the same reason — both arches'
+# images live in the one shared target/ directory, and the staging steps pick the right one.
+build_user_stat_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 persistence static-ELF program (crates/user-stat → target/STAT-X86.ELF)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-stat"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-stat/target/x86_64-unknown-none/release/user-stat" \
+      "${WORKSPACE_DIR}/target/STAT-X86.ELF"
+    # The same three checks the aarch64 STAT build makes, plus the e_machine one that matters here: the
+    # loader rejects a wrong-arch image, and staging an aarch64 STAT.ELF on x86 media would be a
+    # confusing bench failure rather than an obvious build failure.
+    [ -s "${WORKSPACE_DIR}/target/STAT-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: STAT-X86.ELF missing/empty — x86 STAT build failed${COLOR_RESET}"; exit 1; }
+    local smag; smag="$(head -c 4 "${WORKSPACE_DIR}/target/STAT-X86.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$smag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: STAT-X86.ELF does not start with the ELF magic; first 4 bytes = ${smag}${COLOR_RESET}"; exit 1; }
+    local smach; smach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/STAT-X86.ELF" | tr -d ' \n')"
+    [ "$smach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: STAT-X86.ELF e_machine is ${smach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    local ssz; ssz="$(wc -c < "${WORKSPACE_DIR}/target/STAT-X86.ELF" | tr -d ' ')"
+    [ "$ssz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: STAT-X86.ELF ${ssz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 persistence program: STAT-X86.ELF (${ssz} B)${COLOR_RESET}"
+}
+
 build_kernel_aarch64() {
     echo -e "${COLOR_YELLOW}⚡ Building aarch64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
@@ -475,6 +509,7 @@ build_kernel_aarch64() {
 
 launch_x86_64() {
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP
+    build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_kernel_x86_64
 
     echo -e "${COLOR_CYAN}⚡ Launching x86_64 via Builder (kernel + bootloader + QEMU)...${COLOR_RESET}"
@@ -608,6 +643,7 @@ SERIAL_LOG="${WORKSPACE_DIR}/target/serial.log"
 test_x86_64() {
     local secs="${1:-20}"
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP
+    build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_kernel_x86_64
 
     # VPERF: UNAOS_QMP_SHOT=<png path> arms a QMP framebuffer screendump of the headless x86 run
@@ -718,6 +754,7 @@ pack_source_along() {
 esp_x86() {
     echo -e "${COLOR_CYAN}⚡ Building x86_64 kernel + bootloader and packaging the ESP (no QEMU)...${COLOR_RESET}"
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP as HELLO.BIN
+    build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -745,6 +782,7 @@ vm_image() {
     local git7; git7="$(cd "$WORKSPACE_DIR" && git rev-parse --short=7 HEAD 2>/dev/null || echo 0000000)"
     echo -e "${COLOR_CYAN}⚡ Building x86 boot products + packaging VM image (unaos-x86-${git7}.img)...${COLOR_RESET}"
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it into the ESP as HELLO.BIN
+    build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     cd "$WORKSPACE_DIR/builder"
     UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -784,6 +822,7 @@ fat_img() {
     export UNAOS_NOSRC=1
     rm -f "${WORKSPACE_DIR}/target/x86_64_esp/SRC.TGZ" "${WORKSPACE_DIR}/target/x86_64_esp/SRC.SHA" 2>/dev/null || true
     build_user_hello_x86   # U2: ensure target/hello.bin is fresh even if the ESP is reused below
+    build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
         esp_x86

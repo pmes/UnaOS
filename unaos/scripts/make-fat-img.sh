@@ -119,6 +119,19 @@ else
     echo "    WARNING: ${HELLO_BIN} absent — image has no HELLO.BIN (run './arroyo fat-img' via arroyo, not make-fat-img.sh directly)"
 fi
 
+# WINX-5: the x86 EL0 persistence program (crates/user-stat → target/STAT-X86.ELF, built by arroyo's
+# build_user_stat_x86). Copy it onto the image as STAT.ELF so the x86 shell's `run`/`bg` — which read the
+# FAT boot partition's root — can load it (`bg /fat/STAT.ELF`). Same shape and same freshness argument as
+# the HELLO.BIN hunk above. Un-suffixed on the volume so the operator command reads the same on both
+# arches; the -X86 suffix exists only in target/, where both arches' images share one directory.
+STAT_ELF="${WORKSPACE_DIR}/target/STAT-X86.ELF"
+if [ -f "$STAT_ELF" ]; then
+    COPYFILE_DISABLE=1 cp "$STAT_ELF" "${MNT}/STAT.ELF"
+    echo "    added STAT.ELF ($(wc -c < "$STAT_ELF" | tr -d ' ') bytes) for the run/bg loader"
+else
+    echo "    WARNING: ${STAT_ELF} absent — image has no STAT.ELF (run './arroyo fat-img' via arroyo)"
+fi
+
 # U9x M2: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0
 # code). 1 KiB of 0xEE filler, mirroring the pi4 image plant (arroyo's kernel8 SCRATCH.BIN block): the
 # U9x fixture opens it RW, seeks to 520, overwrites a 16-byte pattern, and the launcher flushes that
