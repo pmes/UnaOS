@@ -68,6 +68,19 @@ pub struct BootInfo {
     /// mode (current was BltOnly), 3 = headless (no linear framebuffer available).
     pub mode_action: u32,
 
+    /// INSTALL-SELF: the FAT `BS_VolID` (volume serial) of the volume this kernel was loaded FROM —
+    /// read by the bootloader off LBA 0 of its own loaded-image device handle, i.e. the very ESP that
+    /// carried `kernel.elf`. This is the only thing in `BootInfo` that names the boot *storage*, and
+    /// the installer's boot-device guard is built on it: a candidate target disk carrying a FAT volume
+    /// with this serial is the device we booted from (or a byte clone of it) and is never offered and
+    /// never erased.
+    ///
+    /// **0 is the absent sentinel** — no readable FAT volume on the boot device, a non-FAT boot path,
+    /// a formatter that left `BS_VolID` unstamped, or an aarch64 boot (its `build_boot_info` fills 0).
+    /// The guard DISARMS on 0 with a witness line rather than guessing: an installer that cannot
+    /// identify its boot device must still be usable.
+    pub boot_volume_serial: u32,
+
     #[cfg(feature = "unaos_ivb")]
     pub igpu_trace_0: [u32; 11],
     #[cfg(feature = "unaos_ivb")]

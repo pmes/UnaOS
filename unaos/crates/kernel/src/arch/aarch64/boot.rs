@@ -1106,6 +1106,10 @@ static mut BOOT_INFO: BootInfo = BootInfo {
     edid_native_height: 0,
     edid_source: 0,
     mode_action: 0,
+    // INSTALL-SELF: aarch64 does not boot through the UEFI bootloader that reads its own ESP's FAT
+    // volume serial, so the boot volume is unidentified here. 0 is the absent sentinel; the
+    // installer's boot-device guard disarms on it (with a witness line) rather than guessing.
+    boot_volume_serial: 0,
 };
 
 /// Synthesize the BootInfo the kernel expects. `dtb_addr` carries the pointer the GPU ROM passed in

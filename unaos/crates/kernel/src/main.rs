@@ -189,6 +189,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         boot_info.mode_action,
     );
 
+    // INSTALL-SELF: publish the boot volume's FAT serial into the installer's boot-device guard BEFORE
+    // memory::init consumes boot_info. This is the whole handoff — the bootloader read the serial off
+    // the ESP it loaded this kernel from, and from here on the installer can recognize (and refuse to
+    // erase) the device the system is running from. Gated exactly like `crate::install` itself, so a
+    // build without an installer is byte-identical to baseline. 0 (aarch64, or an unidentifiable boot
+    // volume) disarms the guard with a witness line; it never blocks a boot.
+    #[cfg(any(feature = "installdemo", feature = "install_target", feature = "piinstall"))]
+    unaos_kernel::install::selfguard::set_boot_volume_serial(boot_info.boot_volume_serial);
+
     // JC3 (virt/UEFI, GICv3 only): capture the firmware RAM-GiB map from boot_info BEFORE memory::init
     // consumes it (it takes the `&'static mut`), so the EL2->EL1 drop below can build the boot core's EL1
     // identity map. Runtime-gated on `is_v3()` so the GICv2 virt run computes nothing beyond the cheap GIC

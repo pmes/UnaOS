@@ -81,6 +81,117 @@ fn edid_native_resolution(handle: uefi::Handle) -> Option<(usize, usize, u32)> {
     None
 }
 
+/// INSTALL-SELF: parse a FAT `BS_VolID` (volume serial) out of a candidate boot sector.
+///
+/// Gated the same way the kernel's own `fs::fat::parse_bpb` gates a VBR — jump instruction, 0x55AA
+/// signature, 512-byte logical sectors — plus the extended-BPB signature (`BS_BootSig` == 0x29) that
+/// says the `BS_VolID` field is actually present. FAT32 keeps the serial at offset 0x43 and FAT16 at
+/// 0x27; the FAT32 discriminator here is the structural one (`BPB_FATSz16 == 0` and
+/// `BPB_RootEntCnt == 0`), not the cosmetic FS-type string. Returns 0 for "no serial readable", which
+/// is the absent sentinel the kernel's guard disarms on.
+fn parse_fat_volume_serial(sec: &[u8]) -> u32 {
+    if sec.len() < 512 {
+        return 0;
+    }
+    if !(sec[0] == 0xEB || sec[0] == 0xE9) {
+        return 0;
+    }
+    if sec[510] != 0x55 || sec[511] != 0xAA {
+        return 0;
+    }
+    let u16le = |o: usize| (sec[o] as u16) | ((sec[o + 1] as u16) << 8);
+    if u16le(11) != 512 {
+        return 0;
+    }
+    let fat32 = u16le(22) == 0 && u16le(17) == 0;
+    let off = if fat32 { 0x43 } else { 0x27 };
+    // BS_BootSig is the byte immediately BEFORE BS_VolID in both extended BPBs (0x26 → 0x27 on
+    // FAT12/16, 0x42 → 0x43 on FAT32); 0x29 means VolID + VolLab + FSType are present. Without it the
+    // bytes at `off` are not a serial and must not be read as one.
+    if sec[off - 1] != 0x29 {
+        return 0;
+    }
+    (sec[off] as u32)
+        | ((sec[off + 1] as u32) << 8)
+        | ((sec[off + 2] as u32) << 16)
+        | ((sec[off + 3] as u32) << 24)
+}
+
+/// INSTALL-SELF: the FAT volume serial of the volume this bootloader image was loaded from.
+///
+/// The bootloader is the ONLY component that knows this first-hand — the firmware handed it a
+/// loaded-image device handle, and `kernel.elf` came off that handle's filesystem (see the
+/// `get_image_file_system` call below and the comment on why it is not `get_handle_for_protocol`).
+/// So we read LBA 0 of that same handle's `BlockIO` — on a partition handle that IS the volume's boot
+/// sector — and lift `BS_VolID` out of it. The kernel receives it in `BootInfo::boot_volume_serial`
+/// and the installer refuses to erase any candidate disk carrying a FAT volume with that serial.
+///
+/// Non-fatal by construction: every failure path returns 0 (the absent sentinel). This must never be
+/// able to stop a boot — it exists to stop an *erase*.
+///
+/// The `BlockIO` open is deliberately **non-exclusive** (`GetProtocol`). The firmware's FAT driver
+/// holds `BlockIO` on this handle `BY_DRIVER`; an exclusive open would call that driver's `Stop` and
+/// tear down the very filesystem we are about to read `kernel.elf` from. We only read, and we read
+/// nothing the driver is writing.
+/// Returns `(serial, reason)`. `reason` names the branch taken, so a disarmed guard at the bench is a
+/// diagnosable fact rather than a mystery: "no LoadedImage device", "no BlockIO", "read failed" and
+/// "not a stamped FAT volume" are four different things to do about it.
+fn read_boot_volume_serial() -> (u32, &'static str) {
+    use uefi::boot::{OpenProtocolAttributes, OpenProtocolParams};
+    use uefi::proto::loaded_image::LoadedImage;
+    use uefi::proto::media::block::BlockIO;
+
+    // UEFI requires the read buffer to satisfy the media's IoAlign; 4 KiB alignment satisfies every
+    // real value and covers any block size up to 4096.
+    #[repr(align(4096))]
+    struct Buf([u8; 4096]);
+
+    let image = boot::image_handle();
+    let device = match boot::open_protocol_exclusive::<LoadedImage>(image) {
+        Ok(li) => match li.device() {
+            Some(d) => d,
+            None => return (0, "LoadedImage has no device handle"),
+        },
+        Err(_) => return (0, "LoadedImage protocol unavailable"),
+    };
+    let bio = match unsafe {
+        boot::open_protocol::<BlockIO>(
+            OpenProtocolParams { handle: device, agent: image, controller: None },
+            OpenProtocolAttributes::GetProtocol,
+        )
+    } {
+        Ok(p) => p,
+        Err(_) => return (0, "no BlockIO on the loaded-image device"),
+    };
+    let media = bio.media();
+    let bs = media.block_size() as usize;
+    if !media.is_media_present() {
+        return (0, "no media present");
+    }
+    if bs < 512 || bs > 4096 {
+        return (0, "unsupported block size");
+    }
+    let mut buf = Buf([0u8; 4096]);
+    if bio.read_blocks(media.media_id(), 0, &mut buf.0[..bs]).is_err() {
+        return (0, "LBA 0 read failed");
+    }
+    let sec = &buf.0[..bs];
+    match parse_fat_volume_serial(sec) {
+        0 => (
+            0,
+            // The three gates that fail on a real volume, distinguished by the bytes themselves.
+            if !(sec[0] == 0xEB || sec[0] == 0xE9) {
+                "LBA 0 is not a FAT VBR (no jump instruction)"
+            } else if sec[510] != 0x55 || sec[511] != 0xAA {
+                "LBA 0 has no 0x55AA signature"
+            } else {
+                "FAT VBR carries no extended BPB / BS_VolID is 0"
+            },
+        ),
+        s => (s, "extended BPB BS_VolID"),
+    }
+}
+
 /// Surface a fatal boot error on a serial-less machine. A returned error Status just bounces the
 /// firmware back to its boot picker — invisible (the "select EFI Boot -> black flash -> back to the
 /// picker" symptom). If a linear framebuffer is already up, paint it solid white (0xFF in every
@@ -717,6 +828,18 @@ fn main() -> Status {
         log::info!("ACPI RSDP at {:#x}", rsdp_addr);
     }
 
+    // INSTALL-SELF: identify the volume we booted FROM, at the only place in the system that knows it
+    // first-hand. Read while boot services are still live (this must precede exit_boot_services).
+    let (boot_volume_serial, bvs_reason) = read_boot_volume_serial();
+    if boot_volume_serial != 0 {
+        log::info!("boot volume FAT serial {:#010x} ({})", boot_volume_serial, bvs_reason);
+    } else {
+        log::info!(
+            "boot volume FAT serial unavailable: {} — installer boot-device guard will disarm",
+            bvs_reason
+        );
+    }
+
     let boot_info = alloc::boxed::Box::new(BootInfo {
         framebuffer_addr: fb_addr,
         framebuffer_size: fb_size,
@@ -731,6 +854,7 @@ fn main() -> Status {
         edid_native_height: edid_native_h,
         edid_source,
         mode_action,
+        boot_volume_serial,
         #[cfg(feature = "unaos_ivb")]
         igpu_trace_0: t0,
         #[cfg(feature = "unaos_ivb")]

@@ -29,6 +29,12 @@ pub mod fat32;
 pub mod gpt;
 pub mod hash;
 
+// INSTALL-SELF: the boot-device guard — the installer must never offer, select, or erase the device the
+// system booted from. Arch-neutral (it compares a FAT volume serial carried in `BootInfo` against the
+// serials found on each candidate), so it rides with the engine on both arches; on aarch64 the serial
+// is absent and the guard disarms with a witness line.
+pub mod selfguard;
+
 // INSTALL-PI: the Pi 4 emmc2 microSD installer flow (three-gate escalation), driving this same engine
 // onto the seated card via `drivers::emmc2`. `piinstall`-gated (⇒ baremetal); compiled out otherwise.
 #[cfg(feature = "piinstall")]
@@ -70,6 +76,12 @@ pub enum InstallError {
     /// REFUSE rather than fall back to whatever disk is present, because a fallback would erase a disk
     /// nobody consented to.
     TargetGone,
+    /// INSTALL-SELF: the bound target carries a FAT volume whose serial is the serial of the volume
+    /// this kernel booted from — it IS the boot device, or a byte clone of it. The engine refuses
+    /// before its first write. Distinct from every other refusal because it is not about the target's
+    /// contents or geometry: a blank, correctly-sized, perfectly writable disk still gets this answer
+    /// if erasing it would erase the running system.
+    BootDevice,
 }
 
 /// The one abstraction the installer engine writes through. Sector granularity, explicit capacity +
@@ -366,7 +378,15 @@ pub fn install_probe_once() {
         return; // storage not brought up yet
     }
     DONE.store(true, Ordering::Relaxed);
+    // INSTALL-SELF: the guard's QEMU leg. Runs BEFORE the engine, from the same one-shot the engine
+    // witness rides, so the log carries the guard's decision table and its live verdict for every
+    // candidate the machine enumerated — including the disk the engine is about to write.
+    selfguard::selftest();
     run_demo();
+    // INSTALL-SELF: and again AFTER the engine ran, because the engine just put a FAT32 volume on the
+    // scratch disk — the harness's only live FAT fixture. This is where the serial reader meets real
+    // media instead of synthetic bytes.
+    selfguard::live_media_leg();
 }
 
 fn run_demo_inner() -> Result<(), InstallError> {
@@ -416,6 +436,25 @@ fn run_engine(sel: Option<(block::BlockDeviceId, u8)>) -> Result<(), InstallErro
         }
         None => BlockTarget::bind()?,
     };
+
+    // 0.5) INSTALL-SELF, DEFENSE IN DEPTH. The installer UI already declines to select the boot
+    //      device, but a UI filter is not a guard: this path is also reached by the unattended witness
+    //      (no UI at all) and by any future caller. So the engine asks the question itself, about the
+    //      target it actually BOUND, before it has written a byte — and before the blank-check, because
+    //      "this is the disk you are running from" outranks "this disk is not blank" as a reason to
+    //      stop. A blank boot device is still a boot device.
+    if selfguard::refuses(t.identity()) {
+        let (vendor, product) = t.vendor_product();
+        serial_println!(
+            ":: INSTALL: refusal — target '{}' '{}' slot={} carries the BOOT volume serial 0x{:08x}; refusing to erase the device we booted from => guard OK ::",
+            vendor,
+            product,
+            t.info.slot_id,
+            selfguard::boot_volume_serial().unwrap_or(0)
+        );
+        return Err(InstallError::BootDevice);
+    }
+
     serial_println!(
         ":: INSTALL: engine start — hash self-test (sha256 + crc32 KATs) PASS — armed target = {} ::",
         t.id()

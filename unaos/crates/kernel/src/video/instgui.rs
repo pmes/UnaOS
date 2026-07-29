@@ -84,6 +84,10 @@ use core::sync::atomic::Ordering;
 struct Row {
     id: block::BlockDeviceId,
     info: block::BlockDeviceInfo,
+    /// INSTALL-SELF: this device carries the FAT volume serial the kernel booted from — it is the boot
+    /// device (or a byte clone of it). Shown, marked, and NOT selectable. See
+    /// [`crate::install::selfguard`] for why the row is kept on screen instead of hidden.
+    boot: bool,
 }
 
 /// The device rows the chooser shows. Single-controller world today: the
@@ -92,19 +96,54 @@ struct Row {
 /// INSTALL-SEL: each row now carries the registry handle it was read from, so the two rows stay
 /// distinguishable to the engine and not merely to the eye. On x86 the one stick is published into
 /// both handles and the slot-equality test below collapses them to a single row, exactly as before.
+/// INSTALL-SELF: rows now carry the boot-device verdict, resolved through the SAME
+/// [`crate::install::selfguard`] the engine consults at go-time (cached per block-registry signature,
+/// so this costs nothing on the per-frame repaint path). One resolver for glass and engine, for the
+/// same reason INSTALL-SEL gave the warning screen one: a UI that decides eligibility on its own can
+/// disagree with the thing that does the erasing.
 fn devices(out: &mut [Option<Row>; 2]) -> usize {
     let mut n = 0;
     if let Some(i) = block::info() {
-        out[0] = Some(Row { id: i.id(block::BlockHandle::Global), info: i });
+        let id = i.id(block::BlockHandle::Global);
+        out[0] = Some(Row { id, info: i, boot: is_boot(id) });
         n = 1;
     }
     if let Some(u) = block::usb_info() {
         if out[0].map(|r| r.info.slot_id) != Some(u.slot_id) {
-            out[n] = Some(Row { id: u.id(block::BlockHandle::Usb), info: u });
+            let id = u.id(block::BlockHandle::Usb);
+            out[n] = Some(Row { id, info: u, boot: is_boot(id) });
             n += 1;
         }
     }
     n
+}
+
+fn is_boot(id: block::BlockDeviceId) -> bool {
+    use crate::install::selfguard::{classify, Verdict};
+    classify(id) == Verdict::BootDevice
+}
+
+/// INSTALL-SELF: the first row the operator is allowed to choose, or `None` when every attached disk
+/// is the boot device. Selection can never land on a marked row, so the chooser cannot hand the engine
+/// a target the engine would refuse.
+fn first_selectable(devs: &[Option<Row>; 2], n: usize) -> Option<usize> {
+    (0..n).find(|&i| devs[i].is_some_and(|r| !r.boot))
+}
+
+/// The next selectable row in `dir` (+1 down / -1 up) from `cur`, or `cur` if there is none that way.
+/// Marked rows are stepped OVER rather than stopped on: an inert highlight on a row that cannot be
+/// chosen reads as a broken installer.
+fn step_selectable(devs: &[Option<Row>; 2], n: usize, cur: usize, dir: isize) -> usize {
+    let mut i = cur as isize;
+    loop {
+        i += dir;
+        if i < 0 || i >= n as isize {
+            return cur;
+        }
+        if devs[i as usize].is_some_and(|r| !r.boot) {
+            return i as usize;
+        }
+    }
 }
 
 // ---------------------------------------------------------------- painting --
@@ -220,12 +259,18 @@ fn repaint() {
                 text(px, lx, 84 + CELL + 6, b"enumeration. Attach a disk and", theme::TITLE_TEXT_INACTIVE);
                 text(px, lx, 84 + 2 * (CELL + 6), b"it appears here by itself.", theme::TITLE_TEXT_INACTIVE);
             }
+            let mut boot_rows = 0usize;
             for i in 0..n {
-                let d = devs[i].unwrap().info;
+                let row = devs[i].unwrap();
+                let d = row.info;
                 let ry = 84 + i * (CELL + 22);
-                let row_bg = if i == sel { theme::SCROLL_THUMB } else { theme::CONTENT_FILL };
+                // INSTALL-SELF: a marked row never carries the selection highlight — selection cannot
+                // land on it (see `step_selectable`), so painting one would be a lie about what Enter
+                // would do.
+                let selected = i == sel && !row.boot;
+                let row_bg = if selected { theme::SCROLL_THUMB } else { theme::CONTENT_FILL };
                 fill(px, lx, ry - 4, W - 2 * lx, CELL + 12, row_bg);
-                if i == sel {
+                if selected {
                     rect(px, lx, ry - 4, W - 2 * lx, CELL + 12, theme::ACCENT);
                 }
                 let mut line = [b' '; 40];
@@ -236,13 +281,39 @@ fn repaint() {
                 let s = fmt_size(&mut sz, d.num_blocks * d.block_size as u64);
                 let tail = 40 - s.len();
                 line[tail..].copy_from_slice(s);
-                text(px, lx + 8, ry, &line[..(W - 2 * lx - 16) / CELL], theme::CONTENT_TEXT);
+                // INSTALL-SELF: the mark. The visible width of a row is 28 cells; `slot<n>` + the
+                // 16-byte product name ends at 22, so the tag lands in the tail the size string is
+                // already clipped out of. Dimmed text carries the "not available" reading the CRISPY
+                // theme uses everywhere else for an inert control.
+                let fg = if row.boot {
+                    line[22..27].copy_from_slice(b" BOOT");
+                    theme::TITLE_TEXT_INACTIVE
+                } else {
+                    theme::CONTENT_TEXT
+                };
+                if row.boot {
+                    boot_rows += 1;
+                }
+                text(px, lx + 8, ry, &line[..(W - 2 * lx - 16) / CELL], fg);
+            }
+            let selectable = first_selectable(&devs, n).is_some();
+            // INSTALL-SELF: say WHY a listed disk cannot be chosen. A greyed row with no explanation
+            // is the kind of thing an operator works around by rebooting into something less careful.
+            if boot_rows > 0 {
+                let ry = 84 + n * (CELL + 22) + 4;
+                text(px, lx, ry, b"BOOT = the disk this system", theme::TITLE_TEXT_INACTIVE);
+                text(px, lx, ry + CELL + 4, b"booted from. Not installable.", theme::TITLE_TEXT_INACTIVE);
+            }
+            if n > 0 && !selectable {
+                let ry = 84 + n * (CELL + 22) + 2 * (CELL + 4) + 8;
+                text(px, lx, ry, b"Attach another disk to", theme::CONTENT_TEXT);
+                text(px, lx, ry + CELL + 4, b"install onto.", theme::CONTENT_TEXT);
             }
             // Exits are ALWAYS on screen: an installer that can only go forward is a trap.
             text(px, lx, H - 100, b"w/s select   Enter continue", theme::TITLE_TEXT_INACTIVE);
             text(px, lx, H - 100 + CELL + 4, b"Esc boot this live system", theme::TITLE_TEXT_INACTIVE);
             text(px, lx, H - 100 + 2 * (CELL + 4), b"q  halt the machine", theme::TITLE_TEXT_INACTIVE);
-            if n > 0 {
+            if n > 0 && selectable {
                 button(px, W - 190, H - 52, 160, b"Continue", true);
             }
         }
@@ -367,6 +438,14 @@ pub fn open() {
     // dialog, and a commitment from a previous open would be a stale name for a disk chosen under a
     // different list.)
     *PENDING.lock() = None;
+    // INSTALL-SELF: open on a row the operator is allowed to choose. `SEL` outlives the dialog, and
+    // row 0 is the boot device on exactly the machine this arc exists for (booted from the only stick
+    // attached), so defaulting to 0 would open with the highlight on an unusable row.
+    {
+        let mut devs: [Option<Row>; 2] = [None; 2];
+        let n = devices(&mut devs);
+        SEL.store(first_selectable(&devs, n).unwrap_or(0) as u8, Ordering::Relaxed);
+    }
     repaint(); // full first paint BEFORE the window names the surface
     let (_s, ow, oh) = match wm::spawn_geometry(W, H) {
         Some(g) => g,
@@ -451,10 +530,18 @@ pub fn service() {
         // What the engine receives is no longer this index but the identity frozen at Enter — see
         // `PENDING` — so a shrink can no longer retarget an install even in the window between this
         // detection and the next frame.)
+        // (INSTALL-SELF: the clamp now also has to land on a SELECTABLE row — a shrink can leave the
+        // index on a disk the boot-device guard marked, and a highlight on a row Enter refuses is the
+        // same class of lie the row clamp was added to prevent. `first_selectable` is the fallback
+        // rather than row 0 for exactly that reason.)
         let last = n.saturating_sub(1) as u8;
-        if SEL.load(Ordering::Relaxed) > last {
-            SEL.store(last, Ordering::Relaxed);
-        }
+        let cur = SEL.load(Ordering::Relaxed);
+        let cur = if cur > last { last } else { cur };
+        let fixed = match devs.get(cur as usize).copied().flatten() {
+            Some(r) if !r.boot => cur,
+            _ => first_selectable(&devs, n).unwrap_or(cur as usize) as u8,
+        };
+        SEL.store(fixed, Ordering::Relaxed);
         repaint();
     }
 }
@@ -493,16 +580,20 @@ pub fn consume_key(c: u8) -> bool {
     }
     match (st, c) {
         (State::Choose, b'\x1b') => close(),
+        // INSTALL-SELF: both directions step over rows the guard marked, so the highlight can only ever
+        // rest on a disk the engine would accept.
         (State::Choose, b'w') | (State::Choose, b'A') => {
-            let s = SEL.load(Ordering::Relaxed);
-            SEL.store(s.saturating_sub(1), Ordering::Relaxed);
+            let mut devs: [Option<Row>; 2] = [None; 2];
+            let n = devices(&mut devs);
+            let s = SEL.load(Ordering::Relaxed) as usize;
+            SEL.store(step_selectable(&devs, n, s, -1) as u8, Ordering::Relaxed);
             repaint();
         }
         (State::Choose, b's') | (State::Choose, b'B') => {
             let mut devs: [Option<Row>; 2] = [None; 2];
             let n = devices(&mut devs);
             let s = SEL.load(Ordering::Relaxed) as usize;
-            SEL.store(((s + 1).min(n.saturating_sub(1))) as u8, Ordering::Relaxed);
+            SEL.store(step_selectable(&devs, n, s, 1) as u8, Ordering::Relaxed);
             repaint();
         }
         (State::Choose, b'\r') | (State::Choose, b'\n') => {
@@ -520,6 +611,19 @@ pub fn consume_key(c: u8) -> bool {
             let Some(row) = devs.get(sel).copied().flatten().filter(|_| n > 0) else {
                 return true;
             };
+            // INSTALL-SELF: the last UI gate. Selection is supposed to be unable to rest here, so
+            // reaching this branch means the guard's verdict changed under the dialog (a volume with
+            // the boot serial appeared on the highlighted disk between frames). Refuse to advance and
+            // say so on the wire — the engine would refuse anyway, and an installer must not walk an
+            // operator up to a go it already knows is dead.
+            if row.boot {
+                serial_println!(
+                    "[wc-x] instgui Enter on the BOOT device (row {}, slot {}) — not selectable, refusing to advance",
+                    sel, row.id.slot_id
+                );
+                repaint();
+                return true;
+            }
             *PENDING.lock() = Some((row.id, sel as u8));
             serial_println!(
                 "[wc-x] instgui selected row {} -> {:?} slot {} ({} sectors)",

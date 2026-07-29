@@ -1115,29 +1115,102 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
     // 3) MBR-partitioned: 0x55AA signature + a partition table at offset 446. Scan the four
     //    primary entries; for each non-empty, non-extended entry, try to parse a BPB at its start
     //    LBA. First one that validates wins.
-    if sec[510] == 0x55 && sec[511] == 0xAA {
-        for i in 0..4 {
-            let e = 446 + i * 16;
-            let ptype = sec[e + 4];
-            let start = u32le(&sec, e + 8);
-            // Skip empty (0x00) and extended-partition containers (0x05 CHS / 0x0F LBA).
-            if ptype == 0x00 || ptype == 0x05 || ptype == 0x0F || start == 0 {
-                continue;
-            }
-            if start as u64 >= dev_blocks {
-                continue;
-            }
-            let mut pbs = [0u8; SECTOR_SIZE];
-            if read_sector(source, start as u64, &mut pbs).is_err() {
-                continue;
-            }
-            if let Ok(fs) = parse_bpb(&pbs, start as u64, dev_blocks, source) {
-                return Ok(fs);
-            }
+    for start in mbr_volume_starts(&sec, dev_blocks) {
+        let mut pbs = [0u8; SECTOR_SIZE];
+        if read_sector(source, start, &mut pbs).is_err() {
+            continue;
+        }
+        if let Ok(fs) = parse_bpb(&pbs, start, dev_blocks, source) {
+            return Ok(fs);
         }
     }
 
     Err(FatError::NotFat)
+}
+
+/// The candidate volume-start LBAs named by a classic MBR partition table in `sec` (LBA 0). Empty if
+/// `sec` carries no 0x55AA signature. Empty (0x00) and extended-partition containers (0x05 CHS /
+/// 0x0F LBA) are skipped, as are starts at 0 or past the end of the device.
+///
+/// Extracted from `mount_source` so the INSTALL-SELF serial enumerator
+/// ([`volume_serials`]) walks the exact same candidate set the mount path does — one table walk, so
+/// the guard can never see a partition the mount would not, or miss one it would.
+fn mbr_volume_starts(sec: &[u8; SECTOR_SIZE], dev_blocks: u64) -> alloc::vec::Vec<u64> {
+    let mut out = alloc::vec::Vec::new();
+    if sec[510] != 0x55 || sec[511] != 0xAA {
+        return out;
+    }
+    for i in 0..4 {
+        let e = 446 + i * 16;
+        let ptype = sec[e + 4];
+        let start = u32le(sec, e + 8);
+        if ptype == 0x00 || ptype == 0x05 || ptype == 0x0F || start == 0 {
+            continue;
+        }
+        if start as u64 >= dev_blocks {
+            continue;
+        }
+        out.push(start as u64);
+    }
+    out
+}
+
+/// INSTALL-SELF: every FAT volume serial (`BS_VolID`) discoverable on `source`, in the same
+/// superfloppy → GPT → MBR order [`mount_source`] scans, with duplicates collapsed.
+///
+/// [`mount_source`] is first-match-wins: it returns the FIRST volume that parses and stops. That is
+/// the right rule for "mount the boot media", and the WRONG rule for "is this disk the one we booted
+/// from" — a device whose second partition is the ESP we booted would go unrecognized and be offered
+/// as an erase target. So the guard enumerates ALL of them. The direction of the difference is the
+/// safe one: a superset of serials can only ever cause MORE candidates to be refused, never fewer.
+///
+/// Read-only, bounded (≤ 1 superfloppy + ≤ 128 GPT entries + ≤ 4 MBR entries), and every parse goes
+/// through the same [`parse_bpb`] gates the mount path trusts. Errors degrade to "fewer serials
+/// found", never to a panic; the caller treats an empty result as "no FAT here, cannot be the boot
+/// device".
+pub fn volume_serials(source: BlockSource) -> alloc::vec::Vec<u32> {
+    let mut out: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    let dev = match source {
+        BlockSource::Default => crate::drivers::block::info(),
+        BlockSource::Usb => crate::drivers::block::usb_info(),
+    };
+    let Some(dev) = dev else { return out };
+    if dev.block_size != SECTOR_SIZE as u32 {
+        return out;
+    }
+    let dev_blocks = dev.num_blocks;
+
+    let mut sec = [0u8; SECTOR_SIZE];
+    if read_sector(source, 0, &mut sec).is_err() {
+        return out;
+    }
+
+    // 1) Superfloppy: LBA 0 is itself the BPB.
+    if let Ok(fs) = parse_bpb(&sec, 0, dev_blocks, source) {
+        push_unique(&mut out, fs.vol_id);
+    }
+
+    // 2) + 3) Every partition start either table names.
+    let mut starts = gpt_volume_starts(dev_blocks, source);
+    starts.extend_from_slice(&mbr_volume_starts(&sec, dev_blocks));
+    for start in starts {
+        let mut pbs = [0u8; SECTOR_SIZE];
+        if read_sector(source, start, &mut pbs).is_err() {
+            continue;
+        }
+        if let Ok(fs) = parse_bpb(&pbs, start, dev_blocks, source) {
+            push_unique(&mut out, fs.vol_id);
+        }
+    }
+    out
+}
+
+/// Append `v` only if absent. The serial list is at most a handful of entries, so a linear scan is
+/// both the simplest and the fastest thing here.
+fn push_unique(out: &mut alloc::vec::Vec<u32>, v: u32) {
+    if !out.contains(&v) {
+        out.push(v);
+    }
 }
 
 /// Look for a GUID Partition Table: a header at LBA 1 with the `EFI PART` signature, then walk its
@@ -1145,19 +1218,42 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
 /// if there is no GPT or no FAT partition. Read-only; the scan is bounded (≤128 entries), and only
 /// entry sizes that divide a 512-byte sector (128 / 256) are handled so no entry straddles a read.
 fn scan_gpt(dev_blocks: u64, source: BlockSource) -> Result<FatFs, FatError> {
+    for first_lba in gpt_volume_starts(dev_blocks, source) {
+        let mut pbs = [0u8; SECTOR_SIZE];
+        if read_sector(source, first_lba, &mut pbs).is_err() {
+            continue;
+        }
+        if let Ok(fs) = parse_bpb(&pbs, first_lba, dev_blocks, source) {
+            return Ok(fs);
+        }
+    }
+    Err(FatError::NotFat)
+}
+
+/// The candidate volume-start LBAs named by a GUID Partition Table on `source`, in entry order.
+/// Empty if there is no `EFI PART` header at LBA 1 or its geometry fields are implausible.
+///
+/// Extracted from [`scan_gpt`] so the INSTALL-SELF serial enumerator ([`volume_serials`]) walks the
+/// exact same entry set the mount path does. Bounded at 128 entries regardless of a corrupt count,
+/// and only entry sizes that divide a 512-byte sector (128 / 256) are handled so no entry straddles a
+/// read. A read failure mid-array stops the walk (as it always did); an implausible entry is skipped.
+fn gpt_volume_starts(dev_blocks: u64, source: BlockSource) -> alloc::vec::Vec<u64> {
+    let mut out = alloc::vec::Vec::new();
     if dev_blocks < 3 {
-        return Err(FatError::NotFat);
+        return out;
     }
     let mut hdr = [0u8; SECTOR_SIZE];
-    read_sector(source, 1, &mut hdr)?;
+    if read_sector(source, 1, &mut hdr).is_err() {
+        return out;
+    }
     if &hdr[0..8] != b"EFI PART" {
-        return Err(FatError::NotFat);
+        return out;
     }
     let entries_lba = u64le(&hdr, 72);
     let num_entries = u32le(&hdr, 80);
     let entry_size = u32le(&hdr, 84);
     if !(entry_size == 128 || entry_size == 256) || entries_lba == 0 || entries_lba >= dev_blocks {
-        return Err(FatError::NotFat);
+        return out;
     }
     let num = num_entries.min(128); // bound the scan regardless of a corrupt count
     let per_sec = SECTOR_SIZE as u32 / entry_size; // 4 or 2 — exact, no straddle
@@ -1183,15 +1279,9 @@ fn scan_gpt(dev_blocks: u64, source: BlockSource) -> Result<FatFs, FatError> {
         if first_lba == 0 || first_lba >= dev_blocks {
             continue;
         }
-        let mut pbs = [0u8; SECTOR_SIZE];
-        if read_sector(source, first_lba, &mut pbs).is_err() {
-            continue;
-        }
-        if let Ok(fs) = parse_bpb(&pbs, first_lba, dev_blocks, source) {
-            return Ok(fs);
-        }
+        out.push(first_lba);
     }
-    Err(FatError::NotFat)
+    out
 }
 
 impl FatFs {
