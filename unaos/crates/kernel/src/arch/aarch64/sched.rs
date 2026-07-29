@@ -190,6 +190,17 @@ pub struct Task {
     /// mutated ONLY by the stealer while it exclusively owns the popped `Box` (retargeting `cpu`), so it
     /// never races the owning core's dispatch. Honors the brief's "pinned tasks stay pinned" contract.
     steal_ok: bool,
+    /// SPREAD-5 — CNTPCT timestamp at which this task was last PARKED, or 0 if it has never parked.
+    /// Written by `park_blocked` (the sole park funnel) while it exclusively owns the Box; read by
+    /// `make_ready` (the sole wake funnel) while it exclusively owns the Box. No other code touches
+    /// it, so it needs no atomic and no lock despite park and wake happening on different cores —
+    /// the Box handoff through the wait queue / sleeper list is the synchronisation.
+    ///
+    /// CNTPCT rather than the per-CPU `ticks`: park and wake are frequently on different cores, and
+    /// the per-CPU tick counters are independent (a core that idles at WFI accrues them at its own
+    /// pace), so a difference across cores would not be a duration. CNTPCT is system-global,
+    /// fixed-frequency and always advancing — the same property the load accounting relies on.
+    park_cyc: u64,
 }
 
 /// One CPU's scheduler bookkeeping (interior-mutable atomics, so the array is a plain static).
@@ -1346,6 +1357,59 @@ fn el0_active(cpu: usize) -> usize {
 /// is a gap of one, which is below the threshold — so each imbalance is corrected at most once.
 const REWAKE_MARGIN: usize = 2;
 
+// SPREAD-5 — A PER-FRAME PARK IS NOT A BACKGROUND→FOREGROUND TRANSITION.
+//
+// SPREAD-4 re-placed an EL0 task on EVERY wake. That was right about WHERE a long-parked task should
+// land and wrong about HOW OFTEN the question is worth asking, because in this fleet parking is not a
+// rare event: VUGPAUSE-2 parks the idle vug on `SYS_INPUT_WAIT` and VUG-PACE parks each worker on the
+// phase futex after 64 spin passes, so every vug task in the fleet parks and wakes ONCE PER FRAME. The
+// P75 metal wire is what that costs: `rewake=3256 and climbing` on a six-vug fleet — thousands of
+// placement decisions per minute, each one a potential migration, against a load signal that swings
+// within a frame. The measured symptoms are migration churn, not imbalance: per-window rates that
+// diverge 5x (win5 125/s, win1 23/s, win2/3 frozen), a stuttery mouse under the full fleet, and the
+// paradox that the fifth and sixth vug beat a lone vug's frame rate.
+//
+// The fix is to separate the two shapes of park that share one funnel:
+//
+//   * a MICRO-PARK — the frame-loop park. The task is coming back within a frame, onto a core whose
+//     load has not meaningfully changed, and it still owns its warm caches there. Nothing about the
+//     placement question has moved since the last time it was asked. Return it to `task.cpu`, which is
+//     exactly the pre-SPREAD-4 behaviour, and the one that was correct for this case all along.
+//   * a REAL TRANSITION — a window that was idle/background for a human interval and is now getting
+//     work again. Its core assignment IS stale, the load has genuinely moved, and the cache footprint
+//     is cold anyway, so the move is close to free. This is the case SPREAD-4 was built for, and it
+//     keeps SPREAD-4's machinery unchanged: the margin-2 threshold and the WEDGE-1 freshness guard.
+//
+// The discriminator is how long the task was parked, and nothing else — no notion of focus, no window
+// identity, no new coupling from the scheduler up into the compositor.
+
+/// SPREAD-5 — how long a task must have been parked for its wake to count as a real background→
+/// foreground transition rather than a frame-loop micro-park, in milliseconds.
+///
+/// 100 ms sits in a wide gap between the two populations, which is why the number is not delicate:
+///
+///   * a 60 fps frame is 16.7 ms and a 30 fps frame is 33 ms, so a frame-loop park is at most a few
+///     tens of milliseconds. 100 ms is THREE 30 fps frames — a task that parks and wakes on the frame
+///     clock cannot reach it even if the fleet drops to 10 fps under load.
+///   * VUGPAUSE-2's backstop wake is 256 ms, so a genuinely idle window — one parked with no input and
+///     no frame to draw — crosses 100 ms on its very first backstop period and every one after. The
+///     long-park path stays reachable for exactly the population it is meant to serve.
+///
+/// The gap is ~3x on the near side and ~2.5x on the far side, so neither population lands near the
+/// boundary. Erring low costs some churn back; erring high costs a slower correction after a focus
+/// change (one extra backstop period). 100 ms is comfortably inside both margins.
+const REWAKE_MIN_PARK_MS: u64 = 100;
+
+/// SPREAD-5 — [`REWAKE_MIN_PARK_MS`] in CNTPCT cycles. Frequency-derived like `load_window_cyc` (which
+/// is `CNTFRQ/4`), so the threshold is the same wall-clock span on the BCM2711's ~54 MHz counter and on
+/// QEMU virt's ~62.5 MHz one. `.max(1)` so a nonsense CNTFRQ can never make the threshold zero, which
+/// would silently restore SPREAD-4's re-place-on-every-wake behaviour.
+#[inline]
+fn rewake_min_park_cyc() -> u64 {
+    let frq = load_window_cyc().saturating_mul(4); // == CNTFRQ_EL0, cached
+    (frq / 1000).saturating_mul(REWAKE_MIN_PARK_MS).max(1)
+}
+
 /// SPREAD-4 — choose the core a waking EL0 task should run on, given the core it was parked from.
 /// Returns `home` unless some other online core is at least `REWAKE_MARGIN` runnable residents
 /// lighter, in which case it returns the lightest such core (rolling busy fraction breaking ties —
@@ -1399,8 +1463,18 @@ fn rewake_place(home: usize) -> usize {
 
 /// SPREAD-4 — wakes that moved an EL0 task to a lighter core, and wakes that left it where it was.
 /// The ratio is the arc's own honesty check: a fleet in balance should be nearly all `stay`.
+///
+/// SPREAD-5 narrows the population both counters describe: they now count only wakes that ASKED the
+/// placement question (parked longer than [`REWAKE_MIN_PARK_MS`]). `rewake` should therefore climb by
+/// roughly one per real focus change rather than once per frame per task.
 static SPREAD4_REWAKE: AtomicU64 = AtomicU64::new(0);
 static SPREAD4_STAY: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-5 — EL0 wakes that skipped placement entirely because the park was a frame-loop micro-park.
+/// This is the damping made visible: it is the count of `rewake_place` calls SPREAD-4 would have made
+/// and SPREAD-5 does not. On a running fleet it should dwarf `rewake` + `stay` by orders of magnitude;
+/// if it does not, the fleet is not parking per frame and this arc's premise needs re-checking.
+static SPREAD5_SHORT_STAY: AtomicU64 = AtomicU64::new(0);
 
 /// SPREAD-4 — rate limit for the per-event `[spread4] rewake` trace, on the same terms as
 /// `[smpbal] steal`: name the first few moves, then go quiet so a steadily-rebalancing desktop cannot
@@ -1501,6 +1575,7 @@ fn spawn_inner(
         // SMP-BAL: a load-balanced (CPU_AUTO) kernel task has no core affinity → steal-eligible. A task
         // spawned onto an explicit core is pinned there (no-migrate), so stealing never touches it.
         steal_ok: requested_cpu == CPU_AUTO,
+        park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
     });
     rq(cpu).push(task);
     // PI-SCHED-1 — placement witness. The scheduler PINS a task to the caller-chosen core and never
@@ -1617,6 +1692,7 @@ fn spawn_user_inner(
         user_ttbr0,
         // SMP-BAL: EL0/slot tasks carry per-core TTBR0/ASID state — always pinned, never stolen.
         steal_ok: false,
+        park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
     });
     // SKILL-1: count this task against its address-space slot BEFORE the push, so it is countable before
     // it can ever be dispatched (and thus before any ASID-scoped kill could observe a short count).
@@ -1694,6 +1770,7 @@ pub fn spawn_user_thread(
         user_ttbr0,
         // SMP-BAL: shared-ASID EL0 thread — per-core address-space state, always pinned.
         steal_ok: false,
+        park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
     });
     // SKILL-1: this is the path that MAKES a slot multi-threaded, so it is the one the ASID-scoped kill
     // exists for — count the sibling before it can be dispatched.
@@ -1880,27 +1957,44 @@ fn make_ready(mut task: Box<Task>) {
     // straight through to the unchanged push below.
     if task.user_entry != 0 {
         el0_parked_leave(home);
-        target = rewake_place(home);
-        if target != home {
-            el0_resident_leave(home);
-            let act = el0_resident_enter(target);
-            task.cpu = target as u32;
-            SPREAD4_REWAKE.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "pi")]
-            if SPREAD4_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < SPREAD4_LOG_MAX {
-                serial_println!(
-                    ":: [spread4] rewake asid={} tid={} from=c{} to=c{} act={} ::",
-                    task.user_ttbr0 >> 48,
-                    task.id,
-                    home,
-                    target,
-                    act
-                );
-            }
-            #[cfg(not(feature = "pi"))]
-            let _ = act;
+        // SPREAD-5: ask the placement question only for a wake that follows a real absence. `park_cyc`
+        // is stamped by `park_blocked`, the sole park funnel, so a zero here means this task reached
+        // `make_ready` without ever having parked — the kill sweeps can re-ready a task that was never
+        // blocked. Treat that as a short stay: it declines the move, which is the pre-SPREAD-4
+        // behaviour and the conservative direction (a task is never moved on a duration we did not
+        // measure). `saturating_sub` covers the same case defensively; CNTPCT itself is monotonic.
+        let parked_cyc = now_cyc().saturating_sub(task.park_cyc);
+        let long_park = task.park_cyc != 0 && parked_cyc >= rewake_min_park_cyc();
+        task.park_cyc = 0; // consumed — the next park stamps it afresh
+        if !long_park {
+            // The micro-park path: no placement call, no counters but this one, and `target` stays
+            // `home`. `stay` is deliberately NOT incremented — it means "asked and declined", and
+            // folding thousands of unasked frame wakes into it would bury the signal it carries.
+            SPREAD5_SHORT_STAY.fetch_add(1, Ordering::Relaxed);
         } else {
-            SPREAD4_STAY.fetch_add(1, Ordering::Relaxed);
+            target = rewake_place(home);
+            if target != home {
+                el0_resident_leave(home);
+                let act = el0_resident_enter(target);
+                task.cpu = target as u32;
+                SPREAD4_REWAKE.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "pi")]
+                if SPREAD4_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < SPREAD4_LOG_MAX {
+                    serial_println!(
+                        ":: [spread4] rewake asid={} tid={} from=c{} to=c{} act={} parked={}ms ::",
+                        task.user_ttbr0 >> 48,
+                        task.id,
+                        home,
+                        target,
+                        act,
+                        cyc_to_ms(parked_cyc)
+                    );
+                }
+                #[cfg(not(feature = "pi"))]
+                let _ = act;
+            } else {
+                SPREAD4_STAY.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     debug_assert!(target < NUM_CPUS, "make_ready: cpu out of range");
@@ -2713,7 +2807,13 @@ pub fn note_core_idle(cpu: usize) {
 
 /// Park a task that switched back BLOCKED, per the action it set before switching. Runs in the
 /// scheduler context with IRQ masked and owns `task`.
-fn park_blocked(cpu: usize, park: u8, task: Box<Task>) {
+fn park_blocked(cpu: usize, park: u8, mut task: Box<Task>) {
+    // SPREAD-5: stamp the park instant while we still exclusively own the Box and BEFORE it is handed
+    // to a wait queue or the sleeper list (after which another core may take it at any moment). This is
+    // the sole park funnel, so this is the only writer; `make_ready` is the sole reader. Stamped for
+    // every task, not just EL0 — one register write on a path that is already switching contexts, and
+    // it keeps the field's meaning unconditional rather than "valid only for some tasks".
+    task.park_cyc = now_cyc();
     // SPREAD-4: this is the SOLE park funnel — every blocking primitive an EL0 task can reach
     // (`Semaphore::wait`, `futex_wait`, `sleep_ticks`) marks itself BLOCKED, sets `park_kind` and
     // switches back into `dispatch_next`, which lands here. A parked resident owes its core no CPU, so
@@ -4639,17 +4739,22 @@ fn pulse5_witness() {
 ///   * `cN=active/committed` — per core, the runnable resident count `pick_cpu` now keys on, over the
 ///     SPREAD-3 committed count it used to. `2/5` is the arc in one field: three of that core's five
 ///     EL0 residents are parked and were, until now, steering placement away from a core with room.
-///   * `rewake` / `stay` — how many EL0 wakes moved to a lighter core and how many did not. A fleet in
-///     balance is nearly all `stay`; a burst of `rewake` is a pile-up being taken apart.
-///   * `margin` — the threshold those decisions were made against, so a reading is interpretable
-///     without the source.
+///   * `rewake` / `stay` — how many EL0 wakes moved to a lighter core and how many did not, counted
+///     over the wakes that ASKED (SPREAD-5: long parks only). A fleet in balance is nearly all `stay`;
+///     a burst of `rewake` is a pile-up being taken apart. Post-SPREAD-5 `rewake` should track real
+///     focus changes — single digits over a session, not the thousands P75 measured.
+///   * `short` — SPREAD-5: wakes that skipped placement because the park was a frame-loop micro-park.
+///     Expected to dominate `rewake + stay` by orders of magnitude on a windowed fleet; that ratio IS
+///     the damping. `short` climbing while `rewake` stays flat is the arc working.
+///   * `margin` / `minpark` — the two thresholds those decisions were made against (runnable-resident
+///     gap, and minimum park duration), so a reading is interpretable without the source.
 ///
 /// Reads only, lock-free, safe from any core. Not `pi`-gated, matching `pulse5_witness` beside it: it
 /// is one introspection line on a path that already prints one, and the counters it reads exist on
 /// every aarch64 build (they simply stay zero where there is no EL0).
 fn spread4_witness() {
     serial_println!(
-        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} margin={}",
+        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} short={} margin={} minpark={}ms",
         el0_active(0),
         EL0_RESIDENTS[0].load(Ordering::Relaxed),
         el0_active(1),
@@ -4660,7 +4765,9 @@ fn spread4_witness() {
         EL0_RESIDENTS[3].load(Ordering::Relaxed),
         SPREAD4_REWAKE.load(Ordering::Relaxed),
         SPREAD4_STAY.load(Ordering::Relaxed),
+        SPREAD5_SHORT_STAY.load(Ordering::Relaxed),
         REWAKE_MARGIN,
+        REWAKE_MIN_PARK_MS,
     );
 }
 
@@ -4907,6 +5014,7 @@ fn spawn_stealable_on(name: &'static str, entry: fn(usize), arg: usize, cpu: usi
         user_sp: 0,
         user_ttbr0: 0,
         steal_ok: true, // the point of the fixture: movable, but staged on one core
+        park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
     });
     rq(cpu).push(task);
     poke_cpu(cpu);

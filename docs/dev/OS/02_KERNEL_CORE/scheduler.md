@@ -455,14 +455,73 @@ behaviour.
 `pulse5_witness` sites:
 
 ```
-:: [spread4] rewake asid=1 tid=109 from=c2 to=c1 act=1 ::
-[spread4] live c0=2/5 c1=1/1 c2=0/3 c3=1/1 rewake=10 stay=884 margin=2
+:: [spread4] rewake asid=1 tid=109 from=c2 to=c1 act=1 parked=311ms ::
+[spread4] live c0=2/5 c1=1/1 c2=0/3 c3=1/1 rewake=10 stay=884 short=52190 margin=2 minpark=100ms
 ```
 
 `cN=active/committed` is the arc in one field: `0/3` is a core whose three EL0
 residents are all parked and which was, until now, repelling placements from a
 core with room. A fleet in balance is nearly all `stay`; a burst of `rewake` is a
 pile-up being taken apart.
+
+### Park duration gates re-placement (aarch64, SPREAD-5)
+
+SPREAD-4 asked the placement question on **every** EL0 wake. That was right about
+*where* a long-parked task belongs and wrong about *how often* the question is
+worth asking, because in this fleet parking is not a rare event: VUGPAUSE-2 parks
+the idle vug on `SYS_INPUT_WAIT` and VUG-PACE parks each worker on the phase futex
+after 64 spin passes, so **every vug task parks and wakes once per frame**. P75
+metal measured the cost: `rewake=3256 and climbing` on a six-vug fleet, with
+per-window rates diverging 5x (win5 125/s, win1 23/s, win2/3 frozen), a stuttery
+mouse, and the paradox that the fifth and sixth vug beat a lone vug's frame rate.
+That is migration churn, not imbalance.
+
+SPREAD-5 separates the two shapes of park that share one funnel:
+
+- a **micro-park** — the frame-loop park. The task returns within a frame, to a
+  core whose load has not meaningfully moved, with warm caches. Nothing about the
+  placement question has changed since it was last asked. Return it to `task.cpu`
+  — exactly the pre-SPREAD-4 behaviour, which was correct for this case all along.
+- a **real transition** — a window idle for a human interval that is getting work
+  again. Its assignment *is* stale, its caches are cold anyway, so the move is
+  close to free. SPREAD-4's machinery is unchanged for this path: the margin-2
+  threshold and the WEDGE-1 freshness gate both still apply.
+
+**The discriminator is park duration and nothing else** — no notion of focus, no
+window identity, no new coupling from the scheduler up into the compositor.
+`park_blocked` (the sole park funnel) stamps `Task.park_cyc` from CNTPCT while it
+still exclusively owns the Box; `make_ready` (the sole wake funnel) reads it while
+it exclusively owns the Box, so the field needs neither atomic nor lock — the Box
+handoff through the wait queue / sleeper list is the synchronisation. CNTPCT, not
+the per-CPU `ticks`: park and wake are routinely on different cores and the tick
+counters advance independently, so a cross-core tick difference would not be a
+duration. A `park_cyc` of 0 (a task re-readied without ever having parked, as the
+kill sweeps can do) counts as a short stay — a task is never moved on a duration
+that was not measured.
+
+**Why 100 ms** (`REWAKE_MIN_PARK_MS`, converted to cycles against the same cached
+CNTFRQ the load window uses, so it is one wall-clock span on any board). It sits
+in a wide gap between the two populations:
+
+- a 60 fps frame is 16.7 ms and a 30 fps frame is 33 ms, so 100 ms is **three**
+  30 fps frames — a frame-clock task cannot reach it even if the fleet drops to
+  10 fps under load;
+- VUGPAUSE-2's backstop wake is **256 ms**, so a genuinely idle window crosses
+  100 ms on its first backstop period and every one after — the long-park path
+  stays reachable for exactly the population it serves.
+
+~3x margin on the near side, ~2.5x on the far side; neither population lands near
+the boundary. Erring low costs churn back, erring high costs one extra backstop
+period before a focus change is corrected.
+
+**Witness.** `rewake` / `stay` keep their meaning but now describe only the wakes
+that *asked* — post-SPREAD-5 `rewake` should track real focus changes (single
+digits over a session, not thousands). The new `short` counts wakes that skipped
+placement; it should dominate `rewake + stay` by orders of magnitude on a windowed
+fleet, and that ratio *is* the damping. Micro-parks deliberately do **not**
+increment `stay`, which means "asked and declined" and would otherwise be buried.
+The per-event trace carries `parked=<n>ms`, so every move that does happen names
+the absence that justified it.
 
 ### BSP scheduling + work stealing (aarch64, SMP-BAL)
 
