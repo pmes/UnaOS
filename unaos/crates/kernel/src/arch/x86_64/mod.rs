@@ -4,6 +4,7 @@ pub mod gdt;
 pub mod interrupts;
 pub mod apic;
 pub mod acpi;
+pub mod acpi_power;
 pub mod percpu;
 pub mod smp;
 pub mod sched;

@@ -378,6 +378,22 @@ pub fn service() {
 /// real change rather than every frame.
 static LAST_SIG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// The installer's `q` = halt, as the word is meant on a machine that can be switched off.
+///
+/// Live bench evidence (rMBP 2012, attended boot): the old `loop { hlt() }` stopped the kernel but
+/// left the laptop powered — fans on, battery draining, and the only way out a power-button hold.
+/// On x86 this now asks ACPI for a real S5 soft-off; `acpi_power::poweroff` falls back to exactly
+/// that `hlt` loop, with a witness line naming the reason, whenever the firmware tables do not
+/// yield the sleep type honestly (see the refusal list in `arch::x86_64::acpi_power`). On aarch64
+/// there is no equivalent yet — the Pi has no soft-off at all and the Jetson's path is PSCI, which
+/// belongs to that track's lane — so it keeps parking the CPU.
+fn halt_machine() -> ! {
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::acpi_power::poweroff();
+    #[cfg(not(target_arch = "x86_64"))]
+    crate::hlt_loop();
+}
+
 /// Main-loop hook: returns true if the key belonged to the installer.
 pub fn consume_key(c: u8) -> bool {
     let st = *STATE.lock();
@@ -386,11 +402,9 @@ pub fn consume_key(c: u8) -> bool {
     }
     // Halt is offered from every screen: an installer must always be leaveable.
     if c == b'q' && st != State::Running {
-        serial_println!("[wc-x] instgui halt requested — parking the machine (power off is safe)");
+        serial_println!("[wc-x] instgui halt requested — powering the machine off");
         close();
-        loop {
-            crate::hlt();
-        }
+        halt_machine();
     }
     match (st, c) {
         (State::Choose, b'\x1b') => close(),
