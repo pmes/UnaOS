@@ -3770,3 +3770,9 @@ masking only, weakens nothing. Note the x86 wedge (s44) died with NO focus chain
 `<F*>` chain cannot fire on an x86 image (no TAB router yet; `focus_changed` has no production
 caller, so its tokens dead-strip) — which is exactly why the sched-side probes are the x86
 instrument of record for this hunt.
+
+Cross-arch key (the W probes are deliberately NOT token-for-token, unlike the F chain): x86 `<W1>`
+== aarch64 `[wedge4] preempt-in-section`, x86 `<W2>` == aarch64 `[wedge4] RQ STALL`. The aarch64
+probes print full witness lines and live outside the `UNAOS_WEDGE2` knob; ours are raw tokens
+behind it. aarch64's seven-site sweep found two fixture/witness acquisitions beyond the five
+production sites; the x86 analog is `run_queue_len` (shell status + sched selftest), covered.

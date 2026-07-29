@@ -2198,7 +2198,17 @@ pub fn run_queue_len(cpu: usize) -> usize {
     if cpu >= MAX_CPUS {
         return 0;
     }
-    RUN_QUEUES[cpu].lock().len()
+    // WEDGE-4 `<W1>` window: the shell's status readout and the sched selftest call this from task
+    // context (IF possibly 1) — the same unmasked-acquisition class as the spawn paths, found by the
+    // pi seat's seven-site sweep (their two extras were also fixture/witness acquisitions).
+    #[cfg(feature = "wedge2")]
+    let w4cpu = percpu::this_cpu().cpu_index as usize;
+    #[cfg(feature = "wedge2")]
+    wedge4::enter(w4cpu);
+    let n = RUN_QUEUES[cpu].lock().len();
+    #[cfg(feature = "wedge2")]
+    wedge4::leave(w4cpu);
+    n
 }
 
 /// VUG-1 M3b: number of CPUs the "CPU pulse" meter should show (online cores, capped at MAX_CPUS).
