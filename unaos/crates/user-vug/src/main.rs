@@ -94,7 +94,22 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 //            (2) The kernel's `sysretq` tail scrubs rdi/rsi/rdx/r8/r9/r10 on the way back to ring 3
 //                but PRESERVES the callee-saved set (rbx/rbp/r12-r15) across the C dispatcher, so a
 //                value this program needs across a syscall must live in a callee-saved register or
-//                in memory. The compiler already knows this from the clobber list.
+//                in memory.
+//
+//                TEARDOWN-1: the last sentence here used to read "the compiler already knows this
+//                from the clobber list", and it did NOT. The stubs declared the argument registers
+//                `in(...)` — a promise that the asm leaves them intact — so rustc was entitled to
+//                assume rdi still held a value after the `syscall`, and it did: the two
+//                `SYS_THREAD_SPAWN` calls below load `entry` into rdi ONCE, and the second spawn
+//                therefore ran with the kernel's scrubbed rdi = 0. `sys_thread_spawn` validated it
+//                (`entry` must be inside the window) and refused with -EFAULT, which is what
+//                `:: UVUG: SYS_THREAD_SPAWN denied a=0 b=14 ::` was reporting: the second worker
+//                thread never existed. The same class also cost `user-stat` its pid (a `pid=0` line
+//                from a `SYS_GETINFO` argument the compiler believed survived).
+//
+//                Every argument register is now `inlateout(...) => _` and r8/r9 — scrubbed by the
+//                kernel, named by no stub — are declared `lateout`. The clobber list now states the
+//                ABI the kernel actually implements, so the compiler reloads what it must.
 // ---------------------------------------------------------------------------------------------
 const SYS_WRITE: u64 = 1;
 const SYS_EXIT: u64 = 2;
@@ -180,6 +195,8 @@ mod sysabi {
                 inlateout("rax") n => r,
                 lateout("rcx") _,
                 lateout("r11") _,
+                lateout("r8") _,
+                lateout("r9") _,
                 options(nostack),
             )
         };
@@ -192,9 +209,11 @@ mod sysabi {
             core::arch::asm!(
                 "syscall",
                 inlateout("rax") n => r,
-                in("rdi") a0,
+                inlateout("rdi") a0 => _,
                 lateout("rcx") _,
                 lateout("r11") _,
+                lateout("r8") _,
+                lateout("r9") _,
                 options(nostack),
             )
         };
@@ -207,10 +226,12 @@ mod sysabi {
             core::arch::asm!(
                 "syscall",
                 inlateout("rax") n => r,
-                in("rdi") a0,
-                in("rsi") a1,
+                inlateout("rdi") a0 => _,
+                inlateout("rsi") a1 => _,
                 lateout("rcx") _,
                 lateout("r11") _,
+                lateout("r8") _,
+                lateout("r9") _,
                 options(nostack),
             )
         };
@@ -223,11 +244,13 @@ mod sysabi {
             core::arch::asm!(
                 "syscall",
                 inlateout("rax") n => r,
-                in("rdi") a0,
-                in("rsi") a1,
-                in("rdx") a2,
+                inlateout("rdi") a0 => _,
+                inlateout("rsi") a1 => _,
+                inlateout("rdx") a2 => _,
                 lateout("rcx") _,
                 lateout("r11") _,
+                lateout("r8") _,
+                lateout("r9") _,
                 options(nostack),
             )
         };
@@ -247,12 +270,14 @@ mod sysabi {
             core::arch::asm!(
                 "syscall",
                 inlateout("rax") n => r,
-                in("rdi") a0,
-                in("rsi") a1,
-                in("rdx") a2,
-                in("r10") a3,
+                inlateout("rdi") a0 => _,
+                inlateout("rsi") a1 => _,
+                inlateout("rdx") a2 => _,
+                inlateout("r10") a3 => _,
                 lateout("rcx") _,
                 lateout("r11") _,
+                lateout("r8") _,
+                lateout("r9") _,
                 options(nostack),
             )
         };

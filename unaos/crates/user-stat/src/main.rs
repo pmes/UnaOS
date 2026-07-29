@@ -112,6 +112,18 @@ mod sysabi {
     }
 }
 
+/// x86_64: rax = number, args rdi/rsi/rdx, return in rax, `syscall`.
+///
+/// TEARDOWN-1 — THE CLOBBER LIST MUST STATE THE ABI THE KERNEL IMPLEMENTS, not the one SysV describes.
+/// `syscall` itself destroys rcx (the return RIP) and r11 (the saved RFLAGS), and on top of that the
+/// kernel's `sysretq` tail SCRUBS rdi/rsi/rdx/r8/r9/r10 to zero on the way back to ring 3 (the U1b B1
+/// no-kernel-pointer-leak rule) while preserving the callee-saved set across the C dispatcher.
+///
+/// These stubs used to declare the argument registers `in(...)`, which promises the asm leaves them
+/// intact — so rustc was entitled to keep a value live in rdi across a `syscall` and reuse it, and it
+/// did. That is the whole reason a second `SYS_GETINFO` read here could report `pid=0`: not a kernel
+/// bug, a stub that lied about what the instruction does. Every argument register is `inlateout(...)
+/// => _` now, and r8/r9 — scrubbed by the kernel, named by no stub — are declared `lateout`.
 #[cfg(target_arch = "x86_64")]
 mod sysabi {
     #[inline(always)]
@@ -121,9 +133,11 @@ mod sysabi {
             core::arch::asm!(
                 "syscall",
                 inlateout("rax") n => r,
-                in("rdi") a0,
+                inlateout("rdi") a0 => _,
                 lateout("rcx") _,
                 lateout("r11") _,
+                lateout("r8") _,
+                lateout("r9") _,
                 options(nostack),
             )
         };
@@ -136,10 +150,12 @@ mod sysabi {
             core::arch::asm!(
                 "syscall",
                 inlateout("rax") n => r,
-                in("rdi") a0,
-                in("rsi") a1,
+                inlateout("rdi") a0 => _,
+                inlateout("rsi") a1 => _,
                 lateout("rcx") _,
                 lateout("r11") _,
+                lateout("r8") _,
+                lateout("r9") _,
                 options(nostack),
             )
         };
@@ -152,11 +168,13 @@ mod sysabi {
             core::arch::asm!(
                 "syscall",
                 inlateout("rax") n => r,
-                in("rdi") a0,
-                in("rsi") a1,
-                in("rdx") a2,
+                inlateout("rdi") a0 => _,
+                inlateout("rsi") a1 => _,
+                inlateout("rdx") a2 => _,
                 lateout("rcx") _,
                 lateout("r11") _,
+                lateout("r8") _,
+                lateout("r9") _,
                 options(nostack),
             )
         };
