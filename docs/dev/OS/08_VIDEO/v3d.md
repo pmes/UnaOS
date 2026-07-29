@@ -2855,7 +2855,7 @@ marked **UNCERTAIN** is one this tree must not treat as settled.
 |---|---|---|---|
 | 1 | firmware | `start4.elf` powers the GRAFX rail, runs the inrush/POWOK/ISPOW/MEMREP/ISFUNC ramp and leaves the V3D clock present | established (this is why our mailbox `SET_DOMAIN_STATE` domain 10 ACKs) |
 | 2 | DT | `v3d` node: `power-domains = <&pm GRAFX_V3D>`, `resets = <&pm BCM2835_RESET_V3D>`, `clocks = <&firmware_clocks 5>`, `reg` = hub + core0 | high |
-| 3 | DT | `pm` node carries **three** reg ranges: `pm` (VC `0x7e100000`), `asb` (VC `0x7e00a000`), `rpivid_asb` (VC `0x7ec11000`) | high on the count and on `rpivid_asb`; **UNCERTAIN** on the legacy `asb` base |
+| 3 | DT | `pm` node carries **three** reg ranges: `pm` (VC `0x7e100000`), `asb` (VC `0x7e00a000`), `rpivid_asb` (VC `0x7ec11000`) | **DT-VERIFIED** (V3D-70) — decoded from the shipping `bcm2711-rpi-4-b.dtb`; see §41.8 |
 | 4 | `bcm2835-power` | `bcm2835_power_power_on(PM_GRAFX)` — the POWUP → POWOK → ISPOW → MEMREP/MRDONE → ISFUNC ramp — **returns early on BCM2711** (`if (power->rpivid_asb) return 0`): the firmware owns it | high; this tree has asserted it since §PI-V3D-3 |
 | 5 | `bcm2835-power` | `bcm2835_asb_power_on(PM_GRAFX, ASB_V3D_M_CTRL, ASB_V3D_S_CTRL, PM_V3DRSTN)`: enable the domain clock, ~1 µs settle, **deassert `PM_V3DRSTN`** (bit 6, PM password), then `bcm2835_asb_enable` the **master** then the **slave** bridge | high on the sequence and on bit 6 |
 | 6 | `bcm2835-power` | `bcm2835_asb_control` **re-routes** `ASB_V3D_{S,M}_CTRL` to the `rpivid_asb` block whenever that block is present — always, on BCM2711 | high |
@@ -2880,7 +2880,7 @@ firmware does not do by default is a candidate hole.
 |---|---|---|
 | 1, 4 (firmware rail + ramp) | mailbox `SET_DOMAIN_STATE` domain 10, `SET_CLOCK_RATE` id 5 @ 500 MHz, `SET_CLOCK_STATE` | **covered**, and mainline skips the ramp on BCM2711 anyway |
 | 5 (`PM_V3DRSTN` + both bridges) | `v3d_reset_cycle` = OFF half then `enable_pm_asb` | **written, never read back as a verdict** → the V3D-69 read half |
-| 6 (which ASB block) | we drive `rpivid_asb` at `0xFEC1_1000` | **written, never falsified** → the V3D-69 routing column |
+| 6 (which ASB block) | we drive `rpivid_asb` at `0xFEC1_1000` | **DT-verified correct** (§41.8); the routing column stays as the cross-check |
 | 7 (`EMPTY`/`FULL`) | never read | **never looked at** → new columns |
 | 12 (page table shape) | identity-mapped arena only; iova ≠ 0 by construction | equivalent-in-effect; the "page 0 is special" rule is respected |
 | 13, 14, 16, 17 | mirrored byte-exact | covered (§26, §29, §35, §"V3D-62") |
@@ -2893,8 +2893,9 @@ firmware does not do by default is a candidate hole.
    reads clear. It would not by itself explain a *bin-exclusive* wall — the render path crosses the
    same MMU — so it is a thing to fix and re-measure, not a verdict on the binner.
 2. **ASB routing.** If `ASB_V3D_{S,M}_CTRL` are not actually backed at `0xFEC1_1000`, every release
-   this driver has issued since PI-V3D-3 landed on a window nobody reads. The `BRDG_VERSION` word
-   is the falsifier, and the legacy-block column is the cross-check.
+   this driver has issued since PI-V3D-3 landed on a window nobody reads. *Settled by V3D-70:* the
+   base is DT-correct, and the identity falsifier is the legacy block's `ASB_AXI_BRDG_ID` at `+0x20`
+   — the only identity register any ASB reg range in the DT actually covers (§41.8).
 3. **The PM_GRAFX isolation bits.** Mainline never writes them on BCM2711, so a divergence here is
    a firmware-configuration finding, not a driver one — and the bit map is UNCERTAIN, so the raw
    word gets primary billing and the decode is explicitly hedged.
@@ -2921,16 +2922,18 @@ read a register out of. Hence the arc: four MMIO reads settle the branch on the 
 ### 41.5 The rungs
 
 **Read half — `[v3d69] fabric` (rides `UNAOS_V3D_DEEP`, writes nothing).** Two stations, either side
-of one banked `Empty` control rung that is the `[v3d48]` kick verbatim. Each station is nine MMIO
-loads inside the Device window `boot.rs` already maps — no new mapping:
+of one banked `Empty` control rung that is the `[v3d48]` kick verbatim. Each station is seven MMIO
+loads inside the Device window `boot.rs` already maps — no new mapping (columns as corrected by
+V3D-70; the station lines carry the `[v3d70]` tag):
 
 | Column | Read | Mainline expectation |
 |---|---|---|
 | `PM_GRAFX` raw + `V3DRSTN` | `PM_BASE + 0x10c` | `V3DRSTN` **set** |
 | `PM_GRAFX` POWUP/POWOK/ISFUNC/MRDONE/MEMREP/ISPOW/ENAB | same word | *whatever `start4.elf` left* — mainline never writes them on BCM2711; map **UNCERTAIN** |
-| `rpivid_asb` `BRDG_VERSION`, `CPR_CTRL` | `0xFEC1_1000 + 0x00/0x04` | a plausible identity word — the "is this window the ASB?" falsifier |
-| `ASB_V3D_M_CTRL` / `S_CTRL` + `REQ_STOP`/`ACK`/`EMPTY`/`FULL` | `+0x0c` / `+0x08` | `REQ_STOP = 0` **and** `ACK = 0` on both |
-| legacy `asb` `BRDG_VERSION` / `M_CTRL` / `S_CTRL` | `0xFE00_A000` (**UNCERTAIN base**) | some *other* peripheral's bridges, or dead — routing falsifier only |
+| `rpivid_asb` identity | — | **none exists**: `ASB_AXI_BRDG_ID` is at `+0x20`, one word past this range's `0x20` length. No identity column is printed for this block |
+| `ASB_V3D_M_CTRL` / `S_CTRL` + `REQ_STOP`/`ACK`/`EMPTY`/`FULL` | `0xFEC1_1000 + 0x0c` / `+0x08` | `REQ_STOP = 0` **and** `ACK = 0` on both |
+| legacy `asb` `ASB_AXI_BRDG_ID` | `0xFE00_A000 + 0x20` | ASCII `'brdg'` = `0x62726467` — **the** identity check, and the only one in DT range |
+| legacy `asb` `M_CTRL` / `S_CTRL` | `+0x0c` / `+0x08` | some *other* peripheral's bridges, or dead — routing falsifier only |
 | `V3D_MMUC_CONTROL` + `ENABLE`/`FLUSH` | hub `+0x1000` | `ENABLE` **set** |
 
 **Write half — `[v3d69] reenable` (separate knob `UNAOS_V3D69_REENABLE`, off by default even on a
@@ -2942,18 +2945,18 @@ would be uninterpretable either way.
 
 ### 41.6 Expected wire, per outcome branch
 
-- **`BRDG_VERSION` not plausible** ⇒ no bridge reading may be cited at all; the release writes have
-  been going somewhere unverified since PI-V3D-3. Establish the base from the DT — do not run
-  another rung.
+- **`ASB_AXI_BRDG_ID` ≠ `'brdg'`** ⇒ no bridge reading may be cited at all. The bases are DT-verified,
+  so this branch is not an address guess going wrong — it is the ASB address space failing mainline's
+  own probe. STOP and report; do not run another rung.
 - **Either bridge reads `REQ_STOP=1` or `ACK=1`** ⇒ the campaign's model of its own block is wrong
   and the render evidence has to be re-read. This is the only branch on which the write half is
   meaningful. Read it against `[v3d58] xengine` and the legacy-routing column *before* arming.
 - **Bridges released, `MMUC_CONTROL.ENABLE` clear** ⇒ a genuine initialisation hole, and the first
   one this arc found. Fix, then re-measure; it is not a binner verdict.
-- **Fabric clean** ⇒ the bridge hypothesis is **closed on a measurement** rather than on inference,
-  and PM/ASB power sequencing joins the excluded list alongside encoding, submission, cache mode,
-  reset, MMU, clock, frame geometry and frame content. The initialisation this campaign has not
-  found is not in this layer.
+- **Fabric clean *and* identity matched** ⇒ the **bridge/routing branch CLOSES** on a measurement
+  rather than on inference, and PM/ASB power sequencing joins the excluded list alongside encoding,
+  submission, cache mode, reset, MMU, clock, frame geometry and frame content. What is left of the
+  wall is **`BXCF`, `MISCCFG.QRMAXCNT`, or deeper block init** — not this layer.
 
 The `EMPTY`/`FULL` columns are a **two-sample read either side of a ~0.5 s wait, not a sampler**:
 "EMPTY at both stations" is consistent with a bridge that was busy and drained, and is evidence of
@@ -2962,10 +2965,49 @@ nothing on its own. Only `REQ_STOP`/`ACK` carry a verdict, and the witness says 
 ### 41.7 Gating and cost
 
 One more rung on a deep boot (the `[v3d] deep=on` budget line now reads **18 rungs / ~9.5 s**) plus
-nine MMIO reads per station. Verified by building `kernel8` three ways: **no deep** carries **zero**
+seven MMIO reads per station. Verified by building `kernel8` three ways: **no deep** carries **zero**
 `v3d69` strings; **deep** carries the read half only (11, and **zero** `[v3d69] reenable`); **deep +
 `UNAOS_V3D69_REENABLE`** carries 16, including the 3 reenable lines — 1,856 bytes larger. QEMU
 raspi4b models neither V3D nor the `rpivid_asb` block, so the probe returns at its hub-identity gate
 with an explicit `SKIPPED` line; `kernel8-test` green for this arc (86/86) means the default boot is
 byte-inert and the suite did not regress, **and nothing more**. Every verdict in §41 is
 metal-attended.
+
+### 41.8 The `pm` node, decoded from the shipping DTB (V3D-70)
+
+§41 was written with no network, so its reg table was a reconstruction and its uncertain rows were
+marked as such. The shipping device tree in this tree's own firmware payload
+(`target/pi_baremetal/bcm2711-rpi-4-b.dtb`) settles them. `/soc/watchdog@7e100000`, `compatible =
+"brcm,bcm2711-pm", "brcm,bcm2835-pm-wdt"`:
+
+| `reg-names` | VC bus address | length | ARM PA (`0x7e…`→`0xFE…`) | this driver |
+|---|---|---|---|---|
+| `pm` | `0x7e100000` | `0x114` | `0xFE10_0000` | `PM_BASE` — **correct** |
+| `asb` | `0x7e00a000` | `0x024` | `0xFE00_A000` | `LEGACY_ASB_BASE` — **correct** |
+| `rpivid_asb` | `0x7ec11000` | `0x020` | `0xFEC1_1000` | `RPIVID_ASB_BASE` — **correct** |
+
+Both bases the driver has used since PI-V3D-3 are DT-correct. The **lengths** carry the finding.
+Mainline's `bcm2835-power.c` reads its identity word `ASB_AXI_BRDG_ID` at offset **`0x20`** and
+expects the ASCII tag `'brdg'` (`0x62726467`). That offset is *inside* the legacy range (`0x24`
+long) and *outside* the `rpivid_asb` range (`0x20` long). Therefore:
+
+- the legacy block has an in-range identity register, and it is the **only** ASB identity check the
+  DT covers — a match validates the `pm`-node address space both bases are derived from;
+- the `rpivid_asb` block has **no** identity register in its DT range at all.
+
+What `[v3d69]` printed as `rpivid_asb BRDG_VERSION` was offset `+0x00` of that block, which is not
+an identity register in any range. Its `0x00000000` was therefore **not evidence of a dead window**,
+and the "establish the base from the DT" branch it would have triggered was chasing a decode
+artifact, not a fault. The column is retired; the honest "no identity register in this DT range"
+note replaces it, and the legacy `+0x20` read is the identity check.
+
+With identity set aside, the P74 wire already read shows every fabric column healthy: `PM_GRAFX`
+`V3DRSTN = 1`; both `rpivid_asb` `M_CTRL`/`S_CTRL` moving `0x7 → 0x4` across our stop/release, i.e.
+a **real** bridge acknowledging (request-stop set ⇒ `ACK` set, cleared ⇒ `ACK` clear); `MMUC.ENABLE`
+latched. So the bridge hypothesis is **excluded by read**, the release writes have been correct
+since PI-V3D-3, and the **bridge/routing branch of §41 closes**. The wall's remaining candidates are
+`BXCF`, `MISCCFG.QRMAXCNT`, or deeper block init.
+
+Unchanged by the DTB: the **generic PM word bit map** (step 8) stays **UNCERTAIN**. The device tree
+gives addresses and lengths, not bit meanings, so the `[v3d70]` PM line keeps the raw word first and
+its decode explicitly hedged.

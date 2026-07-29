@@ -86,23 +86,31 @@ const ASB_ACK: u32 = 1 << 1; // bridge stopped acknowledge (clears when released
 // `ASB_EMPTY` (2), `ASB_FULL` (3) — and only ever READS/WRITES the first two. The other two describe
 // the bridge's transaction FIFO and are exactly the never-looked-at state this arc opens: a bridge that
 // is released (REQ_STOP=0, ACK=0) but whose FIFO never leaves EMPTY across a leg saw no traffic.
-// `ASB_BRDG_VERSION` (0x00) is the block's own identity word — the falsifier for "is this window even
-// the ASB?": a plausible version constant means the base is right, 0x0/0xffffffff means it is not and
-// every other reading from this block is void.
-const ASB_BRDG_VERSION: usize = 0x00;
-const ASB_CPR_CTRL: usize = 0x04;
 const ASB_EMPTY: u32 = 1 << 2; // bridge transaction FIFO empty
 const ASB_FULL: u32 = 1 << 3; // bridge transaction FIFO full
-// The `pm` node carries THREE reg ranges on BCM2711 — "pm" (VC 0x7e100000), "asb" (VC 0x7e00a000) and
-// "rpivid_asb" (VC 0x7ec11000) — and `bcm2835_asb_control` routes ASB_V3D_{S,M}_CTRL to the rpivid
-// block whenever it is present, which on BCM2711 is always. We already drive the rpivid block. Reading
-// the SAME two offsets out of the LEGACY block as well is the routing falsifier: if the V3D bridge is
-// actually backed there and not in rpivid_asb, our release wrote a register nobody reads and the
-// bridge was never released at all. ARM PA = VC bus address with the 0x7exxxxxx → 0xFExxxxxx fixup;
-// same Device-nGnRnE GiB already mapped by boot.rs L1[3], so this opens no new MMU mapping.
-// UNCERTAIN: the legacy block's base offset (0x7e00a000) is from memory of the bcm2711 DT `pm` node and
-// is NOT independently corroborated in this tree — the version word above is what decides whether the
-// legacy column may be cited at all.
+// PI-V3D-70 — the ASB identity register, settled against the SHIPPING DTB rather than reconstructed.
+// `/soc/watchdog@7e100000` (compatible "brcm,bcm2711-pm") carries THREE reg ranges with reg-names
+// "pm", "asb", "rpivid_asb":
+//     <0x7e100000 0x114>   pm
+//     <0x7e00a000 0x024>   asb          (the LEGACY block)
+//     <0x7ec11000 0x020>   rpivid_asb   (the block bcm2835_asb_control routes V3D to on BCM2711)
+// Both bases this driver already uses are therefore DT-CORRECT (VC 0x7e00a000 → ARM 0xFE00A000,
+// VC 0x7ec11000 → ARM 0xFEC11000) — the base is no longer an open question.
+//
+// The LENGTHS are the load-bearing part. Mainline's `bcm2835-power.c` reads its identity word,
+// `ASB_AXI_BRDG_ID`, at offset **0x20** and expects the ASCII tag 'brdg'. That offset is INSIDE the
+// legacy range (len 0x24) and OUTSIDE the rpivid range (len 0x20). So:
+//   * the legacy block HAS an in-range identity register and it is the only identity check available;
+//   * the rpivid block has NO identity register in its DT range at all.
+// `[v3d69]`'s "BRDG_VERSION" column read offset 0x00 of the rpivid window and called it an identity
+// word. Offset 0x00 is not an identity register in any range, so the 0x00000000 that column reported
+// was NEVER evidence of a dead window — it was a read of a non-identity offset. This arc retires that
+// column and reads the real one.
+const ASB_AXI_BRDG_ID: usize = 0x20;
+/// ASCII 'b','r','d','g' as a little-endian word — the tag `bcm2835-power`'s ASB probe expects.
+const ASB_BRDG_ID_EXPECT: u32 = 0x6272_6467;
+// ARM PA = VC bus address with the 0x7exxxxxx → 0xFExxxxxx fixup; both blocks land in the same
+// Device-nGnRnE GiB boot.rs L1[3] already maps, so neither read opens a new MMU mapping.
 const LEGACY_ASB_BASE: usize = 0xFE00_A000;
 
 // PM_GRAFX field map from `bcm2835-power.c`'s generic power-domain bits. Only `PM_V3DRSTN` (bit 6,
@@ -4472,6 +4480,11 @@ const V3D_DEEP: bool = cfg!(feature = "v3d_deep");
 /// in both candidate ASB blocks, the MMU-cache enable) and print it against what mainline's
 /// `bcm2835_asb_power_on` + `v3d_mmu_set_page_table` leave behind. Pure MMIO reads plus one banked
 /// control rung; rides `V3D_DEEP` because its differential station sits either side of that rung.
+///
+/// PI-V3D-70 corrects the identity column against the SHIPPING DTB: both ASB bases are DT-correct,
+/// the rpivid block's DT range (len 0x20) has NO identity register, and the legacy block's
+/// `ASB_AXI_BRDG_ID` at +0x20 (in range at len 0x24) is the one identity check that exists. The
+/// station lines carry the `[v3d70]` tag from that correction on.
 const V3D69_FABRIC: bool = V3D_DEEP;
 
 /// PI-V3D-69 — the WRITE half, deliberately on its own knob (`UNAOS_V3D69_REENABLE=1`, feature
@@ -8204,14 +8217,12 @@ fn v3d68_binner_wall() {
 #[derive(Clone, Copy)]
 struct V3d69Fabric {
     pm_grafx: u32,
-    ver: u32,   // rpivid_asb BRDG_VERSION — the "is this window the ASB?" falsifier
-    cpr: u32,   // rpivid_asb CPR_CTRL
-    m: u32,     // rpivid_asb ASB_V3D_M_CTRL — the master bridge, the one a PTB write would cross
-    s: u32,     // rpivid_asb ASB_V3D_S_CTRL
-    lver: u32,  // legacy asb BRDG_VERSION — the routing falsifier
-    lm: u32,    // legacy asb ASB_V3D_M_CTRL
-    ls: u32,    // legacy asb ASB_V3D_S_CTRL
-    mmuc: u32,  // V3D_MMUC_CONTROL — the MMU cache enable, written by us and never read back
+    m: u32,    // rpivid_asb ASB_V3D_M_CTRL — the master bridge, the one a PTB write would cross
+    s: u32,    // rpivid_asb ASB_V3D_S_CTRL
+    lbrdg: u32, // legacy asb +0x20 ASB_AXI_BRDG_ID — the ONE in-DT-range identity word (PI-V3D-70)
+    lm: u32,   // legacy asb ASB_V3D_M_CTRL — the routing falsifier
+    ls: u32,   // legacy asb ASB_V3D_S_CTRL
+    mmuc: u32, // V3D_MMUC_CONTROL — the MMU cache enable, written by us and never read back
 }
 
 impl V3d69Fabric {
@@ -8227,9 +8238,12 @@ impl V3d69Fabric {
     fn s_released(&self) -> bool {
         Self::released(self.s)
     }
-    /// A plausible ASB identity word: not all-zero (absent/unpowered) and not all-ones (open bus).
-    fn window_live(v: u32) -> bool {
-        v != 0x0000_0000 && v != 0xFFFF_FFFF && v != 0xDEAD_BEEF
+    /// PI-V3D-70 — the ASB identity check, on the ONE register the DT actually covers: the legacy
+    /// block's `ASB_AXI_BRDG_ID` at +0x20, which must read the ASCII tag 'brdg'. A match says the
+    /// `pm`-node reg table this driver derives BOTH ASB bases from is the live one; it is an
+    /// identity check on the ASB address space, not on any single bridge's state.
+    fn brdg_id_ok(&self) -> bool {
+        self.lbrdg == ASB_BRDG_ID_EXPECT
     }
     /// The whole fabric as mainline would leave it after `bcm2835_asb_power_on` + the MMU set.
     fn clean(&self) -> bool {
@@ -8244,17 +8258,15 @@ impl V3d69Fabric {
     }
 }
 
-/// Take one fabric station. READ ONLY — nine MMIO loads, every one of them inside the Device-nGnRnE
+/// Take one fabric station. READ ONLY — seven MMIO loads, every one of them inside the Device-nGnRnE
 /// window boot.rs already maps, and every one of them poison-tolerant (an absent block reads 0 or
 /// 0xffffffff and the emitter says so rather than decoding it).
 fn v3d69_read_fabric() -> V3d69Fabric {
     V3d69Fabric {
         pm_grafx: mmio_read(PM_BASE, PM_GRAFX),
-        ver: mmio_read(RPIVID_ASB_BASE, ASB_BRDG_VERSION),
-        cpr: mmio_read(RPIVID_ASB_BASE, ASB_CPR_CTRL),
         m: mmio_read(RPIVID_ASB_BASE, ASB_V3D_M_CTRL),
         s: mmio_read(RPIVID_ASB_BASE, ASB_V3D_S_CTRL),
-        lver: mmio_read(LEGACY_ASB_BASE, ASB_BRDG_VERSION),
+        lbrdg: mmio_read(LEGACY_ASB_BASE, ASB_AXI_BRDG_ID),
         lm: mmio_read(LEGACY_ASB_BASE, ASB_V3D_M_CTRL),
         ls: mmio_read(LEGACY_ASB_BASE, ASB_V3D_S_CTRL),
         mmuc: mmio_read(V3D_HUB_BASE, V3D_MMUC_CONTROL),
@@ -8278,12 +8290,9 @@ fn v3d69_emit_fabric(station: &str, f: &V3d69Fabric) {
         (f.pm_grafx & PM_ENAB != 0) as u32,
     );
     serial_println!(
-        ":: V3D: [v3d69] fabric ({}) rpivid_asb@{:#x} — BRDG_VERSION={:#010x} (window live={}) CPR_CTRL={:#010x} | M_CTRL={:#010x} REQ_STOP={} ACK={} EMPTY={} FULL={} released={} | S_CTRL={:#010x} REQ_STOP={} ACK={} EMPTY={} FULL={} released={} — the MASTER word is the one a PTB write would have to cross ::",
+        ":: V3D: [v3d70] fabric ({}) rpivid_asb@{:#x} (DT-VERIFIED base, `pm` node reg-names[2] VC 0x7ec11000, len 0x20) — NO IDENTITY REGISTER IN THE DT RANGE: mainline's ASB_AXI_BRDG_ID sits at +0x20, one word PAST this block's 0x20-long range, so this window has no in-range identity word and none is printed. [v3d69]'s BRDG_VERSION column read +0x00 here and called its 0x00000000 a dead window — that was a read of a NON-IDENTITY offset and is retired; see the legacy-asb line for the identity check that the DT does cover | M_CTRL={:#010x} REQ_STOP={} ACK={} EMPTY={} FULL={} released={} | S_CTRL={:#010x} REQ_STOP={} ACK={} EMPTY={} FULL={} released={} — the MASTER word is the one a PTB write would have to cross ::",
         station,
         RPIVID_ASB_BASE,
-        f.ver,
-        V3d69Fabric::window_live(f.ver) as u32,
-        f.cpr,
         f.m,
         (f.m & ASB_REQ_STOP != 0) as u32,
         (f.m & ASB_ACK != 0) as u32,
@@ -8298,11 +8307,12 @@ fn v3d69_emit_fabric(station: &str, f: &V3d69Fabric) {
         f.s_released() as u32,
     );
     serial_println!(
-        ":: V3D: [v3d69] fabric ({}) legacy asb@{:#x} (UNCERTAIN base, from the bcm2711 `pm` node's second reg range) — BRDG_VERSION={:#010x} (window live={}) M_CTRL={:#010x} S_CTRL={:#010x} — ROUTING falsifier only: bcm2835_asb_control re-routes ASB_V3D_{{S,M}}_CTRL to rpivid_asb whenever that block is present, which on BCM2711 is always, so these two words should be some OTHER peripheral's bridges or dead. If the legacy words look like released V3D bridges and the rpivid ones do not, this driver has been releasing the wrong window since PI-V3D-3 ::",
+        ":: V3D: [v3d70] fabric ({}) legacy asb@{:#x} (DT-VERIFIED base, `pm` node reg-names[1] VC 0x7e00a000, len 0x24) — ASB_AXI_BRDG_ID(+0x20)={:#010x} expect={:#010x} ('brdg') match={} — THE identity check: the 0x24-long legacy range is the only ASB range in the DT that reaches +0x20, so this one word is what decides whether the `pm`-node reg table both ASB bases come from is the live address space. A match validates the ADDRESS SPACE, not any bridge's state | M_CTRL={:#010x} S_CTRL={:#010x} — routing falsifier: bcm2835_asb_control re-routes ASB_V3D_{{S,M}}_CTRL to rpivid_asb whenever that block is present, which on BCM2711 is always, so these two words should be some OTHER peripheral's bridges or dead. If the legacy words look like released V3D bridges and the rpivid ones do not, this driver has been releasing the wrong window since PI-V3D-3 ::",
         station,
         LEGACY_ASB_BASE,
-        f.lver,
-        V3d69Fabric::window_live(f.lver) as u32,
+        f.lbrdg,
+        ASB_BRDG_ID_EXPECT,
+        f.brdg_id_ok() as u32,
         f.lm,
         f.ls,
     );
@@ -8361,19 +8371,19 @@ fn v3d69_fabric_probe() {
 
     let moved = pre.signature() != post.signature();
     let m_fifo_moved = (pre.m & (ASB_EMPTY | ASB_FULL)) != (post.m & (ASB_EMPTY | ASB_FULL));
-    let window_ok = V3d69Fabric::window_live(pre.ver);
-    let verdict = if !window_ok {
-        "the rpivid_asb BRDG_VERSION word is NOT a plausible identity (all-zero, all-ones or poison), so this arc cannot cite ANY bridge reading: the base this driver has been writing since PI-V3D-3 may not be the ASB at all. That is itself the finding — the release writes went somewhere unverified. Nothing here excludes or confirms the bridge hypothesis; the next step is to establish the block base from the DT, not to run another rung"
+    let id_ok = pre.brdg_id_ok();
+    let verdict = if !id_ok {
+        "the legacy ASB's ASB_AXI_BRDG_ID does NOT read 'brdg'. The `pm`-node reg table both ASB bases are derived from is DT-verified, so a mismatch here is not an address guess going wrong — it is the ASB address space not answering as mainline's own probe expects. Until that is explained no bridge column above may be cited: the release writes since PI-V3D-3 went to a window whose identity failed its own check. STOP and report; do not run another rung"
     } else if !pre.m_released() || !pre.s_released() {
         "A V3D ASB BRIDGE IS NOT RELEASED. The block answers every register read and latches every job while a bridge that its memory traffic must cross reads STOPPED. This contradicts the render evidence ([v3d58] xengine: a CT1 frame retired and landed CPU-verified pixels through what this campaign believed was the same single master port) — so either the two engines do NOT share a master, or one of these two readings is not what it appears. Do not act on this line alone: re-read it against the xengine verdict and the legacy-block routing column above, and only then arm UNAOS_V3D69_REENABLE"
     } else if pre.mmuc & V3D_MMUC_CONTROL_ENABLE == 0 {
         "both bridges are released and PM_GRAFX has V3DRSTN deasserted, but V3D_MMUC_CONTROL.ENABLE READS BACK CLEAR — the MMU cache this driver believed it enabled in program_mmu never latched. That is a genuine initialisation hole and the first one this arc has found: mainline's v3d_mmu_flush_all leaves ENABLE set and every V3D memory access it makes runs behind it. It does NOT by itself explain a bin-exclusive wall (the render path crosses the same MMU), so it is a defect to fix and then re-measure, not a verdict on the binner"
     } else {
-        "THE FABRIC IS CLEAN. PM_GRAFX has V3DRSTN deasserted, both V3D async AXI bridges read released (REQ_STOP=0, ACK=0) in the rpivid_asb block mainline routes them to, and the MMU cache reads ENABLEd. The bridge hypothesis — a master AXI path that passes register reads but not PTB memory writes — is now CLOSED ON A MEASUREMENT rather than on the render-path inference, and PM/ASB power sequencing joins encoding, submission, cache mode, reset, MMU, clock, frame geometry and frame content on the excluded list. The initialisation this campaign has not found is not in this layer"
+        "THE FABRIC IS CLEAN AND ITS IDENTITY IS CONFIRMED. The legacy ASB reads the 'brdg' tag at the DT-covered +0x20, so the `pm`-node reg table both bases come from is the live address space; PM_GRAFX has V3DRSTN deasserted; both V3D async AXI bridges read released (REQ_STOP=0, ACK=0) in the rpivid_asb block mainline routes them to, with real acks either side of a stop/release; and the MMU cache reads ENABLEd. Fabric identity was the last undecidable column and it is now decided, so the BRIDGE/ROUTING BRANCH CLOSES — measured, not inferred from the render path — and PM/ASB power sequencing joins encoding, submission, cache mode, reset, MMU, clock, frame geometry and frame content on the excluded list. The wall's remaining candidates are BXCF, MISCCFG.QRMAXCNT, or deeper block init; nothing below this line is in the fabric"
     };
     serial_println!(
-        ":: V3D: [v3d69] initdiff verdict — rpivid window live={} | PM_GRAFX V3DRSTN={} | M released={} S released={} | MMUC ENABLE={} | fabric changed across the bin rung={} (master FIFO EMPTY/FULL changed={}) | fabric clean vs mainline={} — {} ::",
-        window_ok as u32,
+        ":: V3D: [v3d70] initdiff verdict — ASB_AXI_BRDG_ID match={} | PM_GRAFX V3DRSTN={} | M released={} S released={} | MMUC ENABLE={} | fabric changed across the bin rung={} (master FIFO EMPTY/FULL changed={}) | fabric clean vs mainline={} — {} ::",
+        id_ok as u32,
         (pre.pm_grafx & PM_V3DRSTN != 0) as u32,
         pre.m_released() as u32,
         pre.s_released() as u32,
