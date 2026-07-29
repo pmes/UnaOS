@@ -4342,3 +4342,137 @@ each byte load is its own aperture round trip.
 QEMU delivers no pointer report, so neither change is exercised by the suites: the gates prove
 compile and no-regression only. The 4× is arithmetic on the bench panel's geometry and is carried by
 the next attended sitting.
+
+### CURSOR-13 — the flush closes its bracket at the seam, and compose-through wakes up
+
+CURSOR-12 built the instrument that names which predicate kills the compose-through offer. On the
+first attended bench sitting it answered on the first line, unanimously, on both arches:
+
+```
+[cursor12] offer scope=live passes=42 nosprite=42 nohit=0 reserved=0 nosession=0 planned=0
+           excl_probe=0 excl_unverified=0 -> nosprite
+[cursor3]  rollup scope=live planned=0 offers=0 taken=0 adopt=0 repaint=0 ensure=42 -> UNWITNESSED
+```
+
+42/42, and 47/47 on a later sample. Every composite the bench reached found `cursor::sprite_plan()`
+returning `None`. No plan was taken, no window was ever offered the sprite, `cursor::compose_into`
+was unreachable, and the whole of CURSOR-3/4/11 had never executed outside its own selftest. On glass
+the operator's report was the plain consequence: the arrow renders beneath window content.
+
+Note what CURSOR-12 also **refuted**, so it is not re-derived: `excl_probe = excl_unverified = 0`
+clears the witness-gated `may_overlay` exclusions; `nosession = 0` clears `overlay_open`; `nohit = 0`
+clears geometry. The failure is upstream of all three.
+
+#### The mechanism: two owners of one sprite, stacked
+
+`Screen::flush` has two halves with **opposite requirements of the sprite**, and until CURSOR-13 the
+bracket was owned by the caller, which cannot see the seam between them.
+
+| half | kind of writer | needs the arrow |
+|---|---|---|
+| `Screen::present_background` | RAW BLIT — copies `back_store` rows straight into the scan-out; WC-I's occluder subtraction covers the WINDOW layer, never the sprite | **OFF** the panel, or it erases the arrow and invalidates the save-under |
+| `wm::service_damage` → `wm::composite` | COMPOSE-THROUGH — its entire sprite mechanism is conditional on `sprite_plan()` returning `Some` at the top of `composite_inner` | **ON** the panel, or it is blind to the cursor and window rows land on top of it |
+
+The caller bracket (`cursor::undraw` → `pal.render` → `cursor::repaint`; x86:
+`pal::TargetPal::render`, aarch64: `render_service`) necessarily spans both, so the second half
+inherited the first half's requirement, inverted. `sp.drawn == false` at every flush-reached
+composite, by the bracket's own design, every time, on both arches. That is a **call-graph fact, not
+a race** — which is why it read 100% rather than "often".
+
+#### The fix: same bracket, closed at the seam
+
+`Screen::flush` now owns the bracket and closes it between the halves:
+
+```rust
+cursor::undraw();               // open — the desktop blit needs the arrow down
+let intruded = self.present_background();
+cursor::repaint();              // CLOSE, here, before anything composites
+if intruded { wm::repaint() } else { wm::service_damage() }
+```
+
+A flush-reached composite now takes its plan exactly like a present-reached one, and the pend/defer
+chain (`defer_within` → `compose_into` → `adopt_overlay` → `settle_pending_locked`) becomes reachable
+on the desktop's cadence for the first time.
+
+Two design points, both deliberate:
+
+* **The desktop bracket is RETAINED, not folded into the pend class.** A deferral needs an overlay
+  session, a staged layer, coverage to install and an `adopt_overlay` tail to settle against a
+  finished front. `present_background` has none of the four — it stages nothing. That is the same
+  missing precondition for which `composite_inner`'s sessionless arm is already forbidden to defer
+  and must take `undraw_within_nosession` instead. The honest residual: the arrow still leaves the
+  glass for the length of the desktop blit, once per flush. That cost is **not new** — the caller
+  bracket paid it and paid it over the composite as well — so CURSOR-13 strictly SHORTENS the
+  off-panel duty cycle on this path. Removing it needs `present_background` to stage like `wm`'s
+  `STAGE` layer, which is a larger arc.
+* **`repaint` and not `ensure_drawn` as the close.** Equivalent on the ordinary path (the `undraw`
+  above already set `drawn = false`, so `repaint`'s internal `undraw_locked` returns `None` and its
+  `repair` tail damages nothing — so the CURSOR-8/P69 loop gains no new leg). They differ only when a
+  pointer report on another core redrew the sprite mid-blit: `ensure_drawn` would leave a sprite
+  whose save-under was captured in the middle of the desktop blit, i.e. stale by construction, while
+  `repaint` restores and re-saves against the finished front. In that case its `repair` tail hands
+  real damage to the `service_damage` on the very next line, mending CURSOR-9's colour-guard residual
+  within the same flush.
+
+#### What did NOT change
+
+Lock order is untouched — `SPRITE` → `TABLE`, no new acquisition, nothing held across a call, and
+`compose_into` still never takes `SPRITE` inside the `BlitGuard` window. CURSOR-9's damage gating is
+untouched and is now actually EXERCISED, since `TOUCHED_SINCE_DRAW` finally has a live sprite to arm
+against during a flush-reached composite. Every other bracket in the tree survives verbatim:
+`wm::erase`, `drain_deferred`, `composite_inner`'s reserved-hit and sessionless arms, `composite`'s
+three tails, CURSOR-HIDE, and the `Mouse`/`MouseAbsolute` repaints. The back-buffer sprite is not
+reintroduced — the arrow's cadence remains the pointer report rate, not the desktop present rate.
+
+Pointer-moves-mid-pass is unchanged from CURSOR-11's model: the plan carries `Plan::epoch`, every
+consumer re-checks it, and a plan that outlived its sprite is discarded (`CUR3_DECL_STALE`) rather
+than applied. The coverage-install-first / front-read-second ordering in `settle_pending_locked`
+remains the arbiter.
+
+#### The caller brackets become degenerate rather than wrong
+
+Nothing outside `video/` has to change for this to be correct — the change is liftable verbatim
+across seats.
+
+* **x86.** The only caller bracket around `Screen::flush` is `pal::TargetPal::render`'s
+  `undraw` … `ensure_drawn`. It degenerates completely: the `undraw` finds the sprite already down,
+  and `ensure_drawn` is an idempotent close that finds it already up. It **cannot re-starve the
+  composite**, so the x86 fix is `Screen::flush` alone. `main.rs`'s `render_service` bracket is
+  `cfg(all(target_arch = "aarch64", feature = "baremetal"))` and is byte-inert on x86.
+* **aarch64.** `render_service`'s `undraw` … `repaint` is still CORRECT over this shape (a
+  restore → save → draw at the same position over a finished front is exactly `CursorTail::Repaint`)
+  but costs one redundant cycle per desktop frame, so deleting it is a strict cost win.
+
+Trimming either outer bracket is a follow-up for the owners of those files, not a correctness
+requirement of this one.
+
+#### Gate results (CURSOR-13)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**, no new warnings.
+* `UNAOS_WC=1 ./arroyo test 90` — **37 PASS / 0 FAIL**, matching a baseline run at the same tip with
+  the change reverted (also 37 PASS / 0 FAIL).
+* `./arroyo test-arm 22` — banner, 0 FAIL.
+
+QEMU delivers no HID pointer report on either suite, so the sprite is never drawn and `[cursor12]`
+honestly reads `nosprite = passes` there. **The gates prove no-regression only; the verdict is owed
+by the next attended bench boot, on both arches.**
+
+#### Metal watch-list (CURSOR-13)
+
+This is the acceptance instrument, agreed by both seats. With the pointer parked over a window:
+
+* **`[cursor12] nosprite` → 0 on flush passes, `planned` the dominant term.** A surviving `nosprite`
+  is now a REAL answer — the pointer was genuinely hidden (before the boot's first report, or after
+  CURSOR-HIDE's auto-hide) — rather than a structural one.
+* **`[cursor3] offers > 0` and `taken > 0`** for the first time outside the selftest.
+* **`[cursor11] px_deferred > 0`** for the first time outside ITS selftest.
+* **`[cursor6] desktop_over=` must stay 0.** This is the HOLE DETECTOR for the retained desktop
+  bracket, and it is the one counter that distinguishes "CURSOR-13 landed" from "CURSOR-13 landed
+  inside out": non-zero means the close migrated in front of the desktop blit and the desktop is
+  erasing the arrow at flush rate.
+* **`[wc-d] -> FAIL`** is the failure mode that matters. An erased arrow is recoverable; a stale
+  `FILL` stamped into a window's rect is not. Nothing in this arc weakens the colour guard or the
+  save-under ordering that stands between the two, but this is the line to read first if the sitting
+  goes wrong.
+* **`nosprite` still ≈ `passes` on an attended boot with a live pointer** refutes the change: the
+  flush path is being bracketed from somewhere else as well.

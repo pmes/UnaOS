@@ -616,10 +616,19 @@ static PRESENT_DIRTY: AtomicBool = AtomicBool::new(false);
 /// that can trample the sprite still arms it, and an armed request is serviced exactly as before.
 ///
 /// ### The painters this does NOT hear from, stated rather than implied
-/// * `Screen::present_background` — the desktop's flush is bracketed by the render task
-///   (`cursor::undraw` → `pal.render` → `cursor::repaint`), so the sprite is provably not on the panel
-///   while it runs and there is nothing for a repair to mend. A broken bracket is what
+/// * `Screen::present_background` — bracketed, so the sprite is provably not on the panel while it
+///   runs and there is nothing for a repair to mend. A broken bracket is what
 ///   `note_desktop_over_sprite` is the designated detector for, and it must be 0.
+///
+///   **CURSOR-13 — the bracket's OWNER changed and this exemption is now stronger, not weaker.** It
+///   used to rest on a caller contract (`cursor::undraw` → `pal.render` → `cursor::repaint`, restated
+///   per arch and unenforceable from here). `Screen::flush` now opens the bracket itself, one
+///   statement in front of `present_background`, so the exemption is a local property of the one
+///   function that needs it. What CURSOR-13 changed is where the bracket CLOSES: at the seam, before
+///   `wm::service_damage`, so the compositor half of the flush runs with the arrow up. That half is
+///   `draw_window`'s territory and it arms this flag through `note_present_over_sprite` exactly as a
+///   present-reached composite always has — so the compose half is covered by the ordinary painter
+///   path and needs no exemption of its own.
 /// * `wm::erase` / `drain_deferred` — both undraw FIRST and then run their own `damage_intersecting`
 ///   over the boxes they painted, so the repair they owe does not come from here.
 /// * WC-F's ground-truth probe — paints the front OUTSIDE any window box, after the pass. It arms this
@@ -1065,8 +1074,19 @@ pub(super) fn note_desktop_over_sprite() {
 ///    is what tells the two apart. `OVERWRITTEN` is kept as the verdict because the panel outcome is
 ///    the same either way for the length of that window, and a reader who sees it should look at the
 ///    next line rather than at `wm::composite`.
-///  * `desktop_over` — the same question for the desktop layer. Must be 0 (the render task brackets
-///    its flush); non-zero is a broken bracket, not load.
+///  * `desktop_over` — the same question for the desktop layer. Must be 0; non-zero is a broken
+///    bracket, not load.
+///
+///    **CURSOR-13 promoted this to the arc's HOLE DETECTOR, and its guarantee got stronger.** The
+///    bracket used to be the render task's, restated per arch and unenforceable from the code that
+///    depended on it; `Screen::flush` now opens it itself, one statement in front of
+///    `present_background`, and the desktop bracket is the half CURSOR-13 deliberately RETAINED (the
+///    desktop present is a raw blit with no session, no staged layer and no coverage, so the
+///    pend/defer class is unavailable to it for the same reason it is unavailable to
+///    `composite_inner`'s sessionless arm). What CURSOR-13 moved is where that bracket CLOSES — at
+///    the seam, before `wm::service_damage` — so a non-zero reading here after CURSOR-13 means the
+///    close migrated in front of the desktop blit and the arrow is being erased at flush rate. It is
+///    the one counter that can distinguish "CURSOR-13 landed" from "CURSOR-13 landed inside out".
 ///  * `mismatch` — [`compose_into`] declines where the open session did not describe the plan; the
 ///    last decline class that `offers - taken` could not account for.
 ///  * `uncover_lost` — dropped coverage clears, each absorbed by a whole-sprite refresh rather than
