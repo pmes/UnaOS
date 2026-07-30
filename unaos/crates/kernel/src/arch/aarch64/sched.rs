@@ -5553,6 +5553,24 @@ fn pulse5_witness() {
         PULSE5_SPAN_MAX_CYC.fetch_max(span, Ordering::Relaxed);
         live_ms[cpu] = cyc_to_ms(span);
     }
+    // SPIN-1 (2026-07-30, the P87/P92/P93 desktop lockup): a core inside ONE task for >10 s while
+    // the witness still runs is the wedge signature ([prio] el0 huge, svc=0, comp2 rate collapsed)
+    // — and until now the line never NAMED the task. Cross-CPU current read: the pointer load is
+    // atomic; deref is safe in practice because a task that has been current for 10 s is
+    // definitionally not mid-drop. Prints every witness pass while the condition holds.
+    for cpu in 0..NUM_CPUS.min(4) {
+        if cyc_to_ms(ACCT[cpu].live_span_cyc()) > 10_000 {
+            let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+            if !raw.is_null() {
+                let (id, name, st) = unsafe { ((*raw).id, (*raw).name, (*raw).state.load(Ordering::Relaxed)) };
+                serial_println!(
+                    "[spin1] cpu={} span={}ms task={}:{} state={} park={} — one task has owned this core the whole span; the [prio]/[comp2] lines beside this name the starvation",
+                    cpu, cyc_to_ms(ACCT[cpu].live_span_cyc()), id, name, st,
+                    SCHED[cpu].park_kind.load(Ordering::Relaxed)
+                );
+            }
+        }
+    }
     serial_println!(
         "[pulse5] live c0={}ms c1={}ms c2={}ms c3={}ms span_max={}ms window={}ms folds={}",
         live_ms[0], live_ms[1], live_ms[2], live_ms[3],
