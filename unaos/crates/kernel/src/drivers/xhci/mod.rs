@@ -280,6 +280,11 @@ pub fn init(base_address: u64) {
 
     // Claim the controller from the firmware (real hardware) before we touch it.
     bios_handoff(base_address);
+    // BPACE (M4): the BIOS→OS handoff. This is the first `hw_wait_budget()`-bounded wait of the
+    // USB bring-up (waiting for firmware to drop USBLEGSUP.HC_BIOS_OWNED) and it can legitimately
+    // burn the whole ~2 s budget on a machine whose SMM does not let go — on QEMU the capability
+    // does not exist and the call returns instantly. `d=` from `portsw` is that handshake alone.
+    crate::bootpace::record("xhci-handoff");
 
     let usbcmd_ptr = op_base as *mut u32;
     let usbsts_ptr = (op_base + 0x04) as *const u32;
@@ -293,6 +298,9 @@ pub fn init(base_address: u64) {
             || (core::ptr::read_volatile(usbsts_ptr) & 1) != 0,
             hw_wait_budget(), "USBSTS.HCH=1 (halt)");
         serial_println!("xHCI: Controller Halted.");
+        // BPACE (M4): USBSTS.HCH=1 — the controller stopped. Budget-bounded (~2 s x86); a firmware
+        // that left the controller running with a live schedule pays real time here.
+        crate::bootpace::record("xhci-halt");
 
         // Reset Controller
         let cmd = core::ptr::read_volatile(usbcmd_ptr);
@@ -309,12 +317,20 @@ pub fn init(base_address: u64) {
         let _ = wait_until(
             || (core::ptr::read_volatile(usbcmd_ptr) & 2) == 0,
             hw_wait_budget(), "USBCMD.HCRST=0 (reset)");
+        // BPACE (M4): USBCMD.HCRST self-cleared. `d=` from `xhci-halt` is the Intel 1 ms quirk pause
+        // plus the chip hardware reset itself, budget-bounded.
+        crate::bootpace::record("xhci-hcrst");
 
         // Wait for Controller Not Ready (CNR) to clear
         let _ = wait_until(
             || (core::ptr::read_volatile(usbsts_ptr) & (1 << 11)) == 0,
             hw_wait_budget(), "USBSTS.CNR=0");
         serial_println!("xHCI: Controller Reset Complete.");
+        // BPACE (M4): USBSTS.CNR=0 — the controller is Ready and register programming may begin.
+        // Intel clears CNR near-instantly (expect `d=`~0 on the rMBP); the Pi's VL805 holds it for
+        // up to ~100s of ms while it loads its firmware (§1a "the CNR wall"), which is exactly the
+        // number this stamp exists to make visible rather than inferred.
+        crate::bootpace::record("xhci-cnr");
     }
 
     serial_println!("[XHCI] CONTROLLER RESET.");
@@ -3760,6 +3776,9 @@ impl XhciController {
                 || (core::ptr::read_volatile(usbsts_ptr) & 1) == 0,
                 hw_wait_budget(), "USBSTS.HCH=0 (run)");
             serial_println!("xHCI: Controller Started!");
+            // BPACE (M4): RS=1 latched and USBSTS.HCH cleared — the controller is RUNNING. `d=`
+            // from `xhci-ptrs` is CONFIG.MaxSlotsEn plus the run handshake, budget-bounded.
+            crate::bootpace::record("xhci-run");
 
             // PIUSB-9 witness (aarch64-only, minimal — x86 behaviour byte-identical): dump the
             // controller-side view of the command ring + interrupter/event ring the instant RS
@@ -3826,6 +3845,13 @@ impl XhciController {
                     serial_println!("xHCI: Port {} already powered. Status: {:#x}", i, status);
                 }
             }
+            // BPACE (M4): every root port is powered — the SETTLE'S OWN START. This is the stamp
+            // the pre-M4 ledger lacked: without it `xhci-settle`'s `d=` was measured from
+            // `pci-usb`, i.e. from a tag recorded AFTER it, and silently contained the entire
+            // PCI/EHCI/handoff/reset chain instead of the settle constant. `d=` from `xhci-run` is
+            // the PP write loop (one MMIO read + at most one write per port, ~0 ms); `d=` on the
+            // NEXT line is now the settle and nothing else.
+            crate::bootpace::record("xhci-portpwr");
 
             // Settle before sampling CCS. A boot-owned USB3 device whose SuperSpeed link dropped on
             // the controller reset (HCRST) needs time to re-train (RxDetect -> Polling -> U0) after
@@ -3839,9 +3865,17 @@ impl XhciController {
             }
             serial_println!("xHCI: port settle complete before CCS scan");
             // BPACE: the fixed pre-enumeration settle (`hw_wait_budget()/4` — ~0.5 s of wall clock
-            // and nothing else). Its `d=` from `pci-usb` is the entire cost of this one constant,
-            // which is exactly what a later settle-trim arc must have measured before it may touch
-            // the number. Absent on a `skip_xhci` build, with every pre-USB tag still present.
+            // and nothing else).
+            //
+            // M4 correction: this comment used to claim `d=` here was "measured from `pci-usb`",
+            // which is impossible — `pci-usb` is recorded LATER, after `pci::init` returns. The
+            // ledger's `d=` is always the delta from the PREVIOUS stamp, and before M4 the previous
+            // stamp was `smp`: a single 7289 ms bucket that contained the scheduler, the tick-rate
+            // window, the EHCI HID bring-up, two PCI config-space walks, the BIOS→OS handoff, the
+            // halt/HCRST/CNR chain, the ring programming AND the settle. Nobody could aim a trim at
+            // it. With `xhci-portpwr` recorded immediately above, `d=` here is the settle constant
+            // alone — which is what a settle-trim arc must have measured before it may touch the
+            // number. Absent on a `skip_xhci` build, with every pre-USB tag still present.
             crate::bootpace::record("xhci-settle");
 
             // Scrub any latched PORTSC change bits before enumeration: one latched bit gates

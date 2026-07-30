@@ -42,21 +42,58 @@
 //   * DID NOT RUN (a) — no FTDI cable attached: `ftdi-up` never records, `total` reads
 //     `ftdi=none`, and no BPACE block reaches a second host at all. Absence of the block IS the
 //     reading; a ledger that "looks fine" on a wire nobody is watching proves nothing.
-//   * DID NOT RUN (b) — a `UNAOS_SKIP_XHCI=1` build: `entry/heap/acpi/calib/smp/gui` still print
-//     and `gui=` still carries a number, while `xhci-settle`, every `enum:p*`, `stor-*`,
-//     `bot-first`, `fat-mount`, `fr-flush` and `ftdi-up` are ABSENT. That asymmetry is what proves
-//     the USB tags are reporting the USB path and not the recorder's own liveness.
+//   * DID NOT RUN (b) — a `UNAOS_SKIP_XHCI=1` build: `entry/heap/acpi/calib/smp/sched/gui` still
+//     print and `gui=` still carries a number, while the ENTIRE `pci-enter … xhci-settle`
+//     subdivision, every `enum:p*`, `stor-*`, `bot-first`, `fat-mount`, `fr-flush` and `ftdi-up`
+//     are ABSENT — `pci::init` is not called at all on that build, so `sched` is followed directly
+//     by `gui`. That asymmetry is what proves the USB tags are reporting the USB path and not the
+//     recorder's own liveness.
 //
 // The three readings differ, so the instrument can falsify. Adds no env knob, by design: a knob
 // known to `arroyo` but unknown to `builder/` ships the feature disabled with every gate green, and
 // that has cost this project two arcs already.
+//
+// ── BOOTPACE M4: the subdivided PCI/USB span ────────────────────────────────────────────────────
+// The first metal ledger (2026-07-30) read `xhci-settle t=7746ms d=7289ms` — 92% of the time to
+// serial console, in ONE bucket, with no stamp anywhere between `smp` (t=456 ms) and it. A `d=` is
+// always the delta from the PREVIOUS stamp, so that number was never a settle measurement: it was
+// the scheduler, the tick-rate window, the EHCI HID bring-up, two PCI config-space walks, the
+// BIOS→OS handoff, the halt/HCRST/CNR chain, the ring/interrupter programming AND the settle,
+// summed. No trim could be aimed at it. M4 adds thirteen stamps so each of those becomes a line of
+// its own; the tags follow the code's own names (`portsw` is PORTSW-1, `xhci-cnr` is the CNR wall
+// of usb_xhci.md §1a, `ehci-hid` is the EHCI-3 driver) rather than an invented taxonomy.
+//
+// HEALTHY (x86, GUI build, xHCI present) reads, in order:
+//
+//   entry heap acpi calib smp sched pci-enter ehci-hid ehci-hid-done pci-scan portsw
+//   xhci-handoff xhci-halt xhci-hcrst xhci-cnr xhci-ptrs xhci-run xhci-portpwr xhci-settle
+//   enum:p* … pci-usb gui … stor-* bot-first fat-mount fr-flush ftdi-up
+//
+// with `xhci-settle`'s `d=` now equal to the settle constant ALONE. `pci-usb` still lands after
+// `xhci-settle` and the first `enum:p*`, because `start()` kicks enumeration before `pci::init`
+// returns — that ordering is real, not a defect, and the subdivision makes it legible instead of
+// confusing. Every phase that contains a `hw_wait_budget()`-derived wait (`ehci-hid`, the handoff,
+// halt, HCRST, CNR, the ring programming, the run handshake) is stamped on BOTH sides, so a boot
+// that dies inside one of them still names the phase it entered.
+//
+// SKIPPED (`UNAOS_SKIP_XHCI=1`) reads `… smp sched gui …`: not one of the thirteen new tags
+// appears, because none of their call sites is reached. The two readings differ in 13 lines, so
+// the subdivision itself can be falsified — a build with USB compiled out that still printed
+// `xhci-cnr` would convict the stamps of reporting the recorder rather than the controller.
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
-/// Ring capacity. Sized for the fixed boot phases (~15) plus a start/done pair for every root port
-/// a real controller exposes (the rMBP's Panther Point xHCI reports MaxPorts=4..8; QEMU's model
-/// reports more), with slack. 64 entries × 16 bytes = 1 KiB of `.bss`, paid once.
+/// Ring capacity. Sized for the fixed boot phases plus a start/done pair for every root port a real
+/// controller exposes (the rMBP's Panther Point xHCI reports MaxPorts=4..8; QEMU's model reports
+/// more), with slack. 64 entries × 16 bytes = 1 KiB of `.bss`, paid once.
+///
+/// BOOTPACE M4 headroom check (the `dropped=` field is only honest if someone did the arithmetic):
+/// the M4 subdivision takes the fixed phases from 15 to 28. The first metal ledger recorded n=18
+/// with two ports enumerated; the same boot under M4 records 31, leaving 33 free slots — room for
+/// 16 further port enumerations (2 stamps each) before `dropped=` could become non-zero. That is
+/// well beyond MaxPorts on any controller this kernel has met, so CAP stays 64 and no capacity
+/// change rides this arc.
 const CAP: usize = 64;
 
 /// One phase stamp: the free-running counter at the moment it was reached, and its static tag.
