@@ -621,6 +621,15 @@ const BOT_RESCUE_PORT_ON_MS: u64 = 300;
 /// so the extra 4 s buys no information and is paid in frozen desktop.
 const BOT_BUDGET_SCALE_FIRST: u64 = 3;
 const BOT_BUDGET_SCALE_ESCALATION: u64 = 1;
+/// BOT-RESCUE M3 witness 4: Transfer Events observed for a slot OTHER than the one a BOT stage is
+/// waiting on. Monotonic; the pump snapshots it on entry and prints the DELTA on a timeout. The
+/// discrimination it buys: a non-zero delta means the event ring, the interrupter and the
+/// controller's event delivery were all alive and working for OTHER traffic throughout the wait, so
+/// a missing completion for THIS slot is a property of this slot's endpoint or of the device — not
+/// a globally wedged interrupter. A zero delta on a boot with other live devices (the FTDI console,
+/// a HID) says the opposite and would move the investigation somewhere else entirely. The 2026-07-29
+/// capture had to argue this by eye, from the FTDI slot's unrelated log lines.
+pub static BOT_FOREIGN_EVENTS: AtomicU64 = AtomicU64::new(0);
 /// Escalation rungs attempted (a = Reset Device, b = port power-cycle) and surrenders. Zero on a
 /// clean boot, so any non-zero reading is itself the finding.
 pub static BOT_RESCUE_RESET_DEVICE: AtomicU64 = AtomicU64::new(0);
@@ -2049,6 +2058,16 @@ impl XhciController {
                         if slot_id as usize >= self.slots.len() {
                             serial_println!("xHCI: transfer event with bogus slot {}; ignoring.", slot_id);
                             return;
+                        }
+
+                        // BOT-RESCUE M3 witness 4: count Transfer Events for OTHER slots while a BOT
+                        // stage is waiting (see BOT_FOREIGN_EVENTS). One relaxed increment on a
+                        // path that is already doing MMIO and DMA reads; no dispatch decision is
+                        // taken from it, so event routing is byte-unchanged.
+                        if let Some(p) = self.bot_pending {
+                            if p.slot_id != slot_id as u8 {
+                                BOT_FOREIGN_EVENTS.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
 
                         // Synchronous EP0 control transfer (hub bring-up) claims its OWN Status-TRB
@@ -6071,6 +6090,105 @@ impl XhciController {
         ccs != 0
     }
 
+    /// BOT-RESCUE M3 witnesses 1, 2 and 5 — the three lines that make a BOT stage timeout
+    /// self-diagnosing instead of merely reported. Pure reads (endpoint contexts, ring fields, DRAM
+    /// behind an invalidate); no command, no wait, no state change.
+    ///
+    /// **Reading key.**
+    ///
+    /// * `TIMEOUT-PIPES` (witness 1) — for BOTH bulk DCIs: the endpoint's EP State, the
+    ///   controller's own TR Dequeue Pointer with its Dequeue Cycle State, and OUR enqueue index and
+    ///   cycle bit. This is THE discriminator the 2026-07-29 capture lacked. If `ctxdeq` has NOT
+    ///   reached the TRB we were waiting on (the controller is behind our enqueue), the controller
+    ///   never fetched the work — a host/endpoint fault. If `ctxdeq` HAS passed it and `dcs` agrees
+    ///   with our `cycle`, the controller fetched everything and issued it: the DEVICE is silent,
+    ///   and no amount of host-side ring surgery can help. The audit reached that second conclusion
+    ///   by hand, off `set-deq` being a provable no-op; this prints it.
+    /// * `foreign=` on the same line (witness 4) — Transfer Events for OTHER slots during this
+    ///   wait. Non-zero proves the event ring and interrupter stayed alive for other traffic, so a
+    ///   missing completion is this slot's problem, not a global wedge. Carried here rather than on
+    ///   the `pump budget=` line so that line stays byte-comparable with every pre-arc capture.
+    /// * `TIMEOUT-TRB` (witness 2) — the awaited TRB's four raw dwords as they read back FROM DRAM,
+    ///   plus its stored cycle bit against the ring's live one. A TRB whose cycle bit does not match
+    ///   the colour the controller expects is one the controller is entitled to ignore forever;
+    ///   dwords that do not match what we believe we wrote mean the write never landed (a coherency
+    ///   or aliasing fault), which is a different arc entirely.
+    /// * `TIMEOUT-CSW` (witness 5) — the CSW buffer's signature, tag, residue and status. The CSW is
+    ///   DMA-written, so on a genuine timeout it is still the pre-transfer zero fill. A VALID
+    ///   signature (0x53425355) here means the status actually landed and only the completion EVENT
+    ///   went missing — a completely different fault class, and the direct test of §12.3's lost-CSW
+    ///   hypothesis.
+    fn bot_timeout_witness(&self, p: &BotPending, foreign: u64) {
+        let slot_id = p.slot_id;
+        // Ring state for one direction: (enqueue index, cycle bit, ring size), or the 0xFF sentinel
+        // when the slot has no such ring.
+        let ring_of = |is_in: bool| -> (usize, u32, usize) {
+            let s = &self.slots[slot_id as usize];
+            let r = if is_in { s.bulk_in_ring.as_ref() } else { s.bulk_out_ring.as_ref() };
+            match r {
+                Some(r) => (r.enqueue_index(), if r.cycle_bit() { 1 } else { 0 }, r.num_trbs()),
+                None => (0, 0xFF, 0),
+            }
+        };
+        let (in_enq, in_cyc, in_n) = ring_of(true);
+        let (out_enq, out_cyc, out_n) = ring_of(false);
+        let in_deq = self.ep_ctx_deq(slot_id, p.in_dci);
+        let out_deq = self.ep_ctx_deq(slot_id, p.out_dci);
+        serial_println!(
+            ":: BOT: timeout pipes slot={} in_dci={} in_epstate={} in_ctxdeq={:#x} in_dcs={} in_enq={} in_cycle={} in_ntrb={} out_dci={} out_epstate={} out_ctxdeq={:#x} out_dcs={} out_enq={} out_cycle={} out_ntrb={} foreign={} result=TIMEOUT-PIPES ::",
+            slot_id,
+            p.in_dci, self.ep_state_of(slot_id, p.in_dci), in_deq & !0xFu64, in_deq & 1, in_enq, in_cyc, in_n,
+            p.out_dci, self.ep_state_of(slot_id, p.out_dci), out_deq & !0xFu64, out_deq & 1, out_enq, out_cyc, out_n,
+            foreign);
+
+        // Witness 2: the awaited TRB, read back from DRAM. Rings are identity-mapped, so the
+        // physical address the endpoint context and the event dispatch use is also the CPU's.
+        let (pipe, ring_cycle) = {
+            let s = &self.slots[slot_id as usize];
+            if s.bulk_in_ring.as_ref().is_some_and(|r| r.contains(p.wait_trb_phys)) {
+                ("in", in_cyc)
+            } else if s.bulk_out_ring.as_ref().is_some_and(|r| r.contains(p.wait_trb_phys)) {
+                ("out", out_cyc)
+            } else {
+                ("unknown", 0xFF)
+            }
+        };
+        if p.wait_trb_phys != 0 {
+            let (dw0, dw1, dw2, dw3) = unsafe {
+                // The controller may have written behind our cache (Event Data / partial retire);
+                // invalidate so this reads DRAM, not a stale line. No-op on x86.
+                dma_coherency::inval(p.wait_trb_phys as usize, 16);
+                let w = p.wait_trb_phys as *const u32;
+                (core::ptr::read_volatile(w), core::ptr::read_volatile(w.add(1)),
+                 core::ptr::read_volatile(w.add(2)), core::ptr::read_volatile(w.add(3)))
+            };
+            serial_println!(
+                ":: BOT: timeout trb wait={:#x} pipe={} dw0={:#010x} dw1={:#010x} dw2={:#010x} dw3={:#010x} trb_cycle={} ring_cycle={} trb_type={} result=TIMEOUT-TRB ::",
+                p.wait_trb_phys, pipe, dw0, dw1, dw2, dw3, dw3 & 1, ring_cycle, (dw3 >> 10) & 0x3F);
+        }
+
+        // Witness 5: the CSW buffer as the controller left it.
+        let (sig, tag, residue, status) = match self.slots[slot_id as usize].csw_buffer {
+            Some(b) => unsafe {
+                dma_coherency::inval(b as usize, 13);
+                let c = core::slice::from_raw_parts(b as *const u8, 13);
+                let rd = |o: usize| (c[o] as u32) | ((c[o + 1] as u32) << 8)
+                    | ((c[o + 2] as u32) << 16) | ((c[o + 3] as u32) << 24);
+                (rd(0), rd(4), rd(8), c[12])
+            },
+            None => (0, 0, 0, 0xFF),
+        };
+        let valid = sig == 0x53425355;
+        serial_println!(
+            ":: BOT: timeout csw sig={:#x} tag={:#x} residue={} status={} valid={} — {} result=TIMEOUT-CSW ::",
+            sig, tag, residue, status, if valid { "yes" } else { "no" },
+            if valid {
+                "VALID signature at a timeout: the status phase LANDED and only its completion event went missing (see usb_xhci.md 12.3)"
+            } else {
+                "no signature: the status phase never landed, so the CSW never reached DRAM — a transport wedge, not a lost event"
+            });
+    }
+
     /// BOT-RESCUE escalation (c): SURRENDER. Mark the disk FAILED, retract it from the block
     /// registry, and stop issuing transfers to the slot.
     ///
@@ -6261,6 +6379,10 @@ impl XhciController {
             }
             None => (0, 0, 0),
         };
+        // BOT-RESCUE M3 witness 4: baseline for the foreign-event delta. Snapshotted HERE, at the
+        // start of THIS wait, because a counter read against its own boot-long total is not a rate
+        // — the instrument-baseline law. The timeout prints `now - this`.
+        let foreign_at_entry = BOT_FOREIGN_EVENTS.load(Ordering::Relaxed);
         loop {
             match &self.bot_pending {
                 Some(p) if p.done => {
@@ -6329,6 +6451,14 @@ impl XhciController {
                     BOT_TX_MULTI.load(Ordering::Relaxed),
                     BOT_TX_MAXLEN.load(Ordering::Relaxed),
                     BOT_TX_WRAPPED.load(Ordering::Relaxed));
+                // BOT-RESCUE M3 witnesses 1, 2, 4 and 5 — three further lines, so the two lines
+                // above stay byte-comparable with every capture taken before this arc. See
+                // `bot_timeout_witness` for the reading key.
+                if let Some(p) = self.bot_pending {
+                    let foreign = BOT_FOREIGN_EVENTS.load(Ordering::Relaxed)
+                        .wrapping_sub(foreign_at_entry);
+                    self.bot_timeout_witness(&p, foreign);
+                }
                 return Err(BotError::Timeout);
             }
         }
@@ -6357,11 +6487,26 @@ impl XhciController {
         let reported = BOT_PUMP_REPORTED.load(Ordering::Relaxed);
         if used >= reported.saturating_mul(2).max(1) {
             BOT_PUMP_REPORTED.store(used, Ordering::Relaxed);
+            // BOT-RESCUE M3 witness 3: IMAN and USBSTS on the SUCCESS line too.
+            //
+            // The instrument-baseline law: the timeout line already prints both registers, but a
+            // reading with nothing to compare it against cannot falsify anything — "IMAN=0x3" on a
+            // wedged boot is only evidence if we know what IMAN reads on a working one, and until
+            // now no capture carried that. Printing them on the (throttled, logarithmically rare)
+            // success line means every register reading in the log has a healthy baseline taken by
+            // the same instrument on the same boot. Two volatile MMIO reads on a path that already
+            // formats a line; nothing is decided from them.
+            let (iman, usbsts) = unsafe {
+                let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
+                let op = XHCI_OP_BASE.load(Ordering::Acquire);
+                (if ir0 != 0 { core::ptr::read_volatile(ir0 as *const u32) } else { 0 },
+                 if op != 0 { core::ptr::read_volatile((op + 0x04) as *const u32) } else { 0 })
+            };
             serial_println!(
-                ":: BOT: pump budget={} used={} peak={} route={:#x} depth={} slot={} n={} nowait={} timeouts={} result=OK ::",
+                ":: BOT: pump budget={} used={} peak={} route={:#x} depth={} slot={} n={} nowait={} timeouts={} IMAN={:#x} USBSTS={:#x} result=OK ::",
                 budget, used, used, route, depth, slot,
                 BOT_PUMP_COUNT.load(Ordering::Relaxed), BOT_PUMP_NOWAIT.load(Ordering::Relaxed),
-                BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed));
+                BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed), iman, usbsts);
         }
     }
 
