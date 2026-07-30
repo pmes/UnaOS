@@ -2688,6 +2688,17 @@ out. `lba=121` (boot 1, FAT/reserved region) and `lba=9834` (boot 2, data region
 different points inside the *same* long sequence — consistent with a per-transaction hazard,
 inconsistent with a specific bad LBA.
 
+> **SUPERSEDED-UNLESS (BOT-RESCUE, 2026-07-29).** The M2 reading below — "a LOST completion event"
+> — is the *lost-CSW hypothesis*, and it was never directly tested: it was inferred from
+> `used == budget` with a far smaller `peak`, which distinguishes "the event never arrived" from
+> "the budget was tight" but **not** "the event was lost" from "the device never produced one".
+> Witness 5 (§14.3) now tests it directly: a CSW signature of `0x53425355` in the buffer at timeout
+> means the status phase landed and only the event went missing (M2 as written); `sig=0x0` means the
+> status phase never happened at all — a transport wedge, a different fault class, and the one the
+> 2026-07-29 Alcor capture points to. **Treat M2 as superseded unless a capture shows witness 5
+> reporting `valid=yes`.** Nothing below is retracted; it is awaiting the discriminating reading it
+> was always missing.
+
 **(M2) The wedge itself — a LOST completion event, not a tight budget.** The TIMEOUT line's own
 reading rule (`pump_until_bot_done`, the IVY comment) is: `used == budget` with `peak` far below
 it means the completion event never arrived. Boot 2 has exactly that — `used` = the full 6 s
@@ -2970,6 +2981,252 @@ functions, with the same bounds, that it did before.
 * **WINX-2 / WINX-8 are still FAIL**, before and after, on both geometries, and for a reason outside
   this lane: `killed=false (kill armed — the task retires at its next preemption)`. Storage is not
   what fails them — the FAT read side is demonstrably green in the same run.
+
+---
+
+## 14. BOT-RESCUE — escalation, surrender, and a timeout that names its own failure (2026-07-29)
+
+### 14.0 The failure, and the audit verdict
+
+**Metal ground truth (2026-07-29, x86).** A USB card reader (Alcor Micro `058f:6362`) went fully
+non-responsive during a `WRITE(10)`. EP0 died with it — the device stopped answering control
+transfers too, so this was not a bulk-pipe desynchronisation. The driver's BOT recovery ladder
+(class reset → clear-halt ×2 → stop-ep/set-deq ×2 → one retry) ran to completion, reported success,
+retried, failed, and was re-entered by the next block operation. Forever. `retry_ok=0` on every
+cycle; ~6 s of busy-spin per stage timeout, which starved the desktop.
+
+**Audit verdict — the ring code is EXONERATED.** The evidence is the DCS agreement: on every
+recovery cycle the Set TR Dequeue Pointer command was a provable no-op, because the endpoint
+context's `ctxdeq` *already* equalled the value the command was about to write, cycle state
+included. The controller had fetched everything the driver produced and had advanced its dequeue
+pointer past it. A driver-side ring that is already exactly where the controller is cannot be the
+reason the controller produces no completion.
+
+**The trigger is device-side, on a write.** The controller stayed healthy throughout — the FTDI
+slot kept transferring on the same controller, the event ring kept delivering, and every command
+completed `cc=1`. Nothing global was wedged; one device stopped answering.
+
+**The defect was the ladder, not the fault.** A device can die; that is not a kernel bug. Looping on
+a dead device at 6 s per attempt with no ceiling is. The ladder had no top (nothing stronger than a
+class reset to escalate to) and no floor (no way to give up), so a permanent device failure became a
+permanent system failure. §14.1 gives it a top, §14.2 a floor, §14.3 the instruments to tell which
+was needed.
+
+### 14.1 The escalation ladder
+
+Rungs fire only after **`BOT_RESCUE_N_CONSEC = 2`** consecutive failed recovery+retry cycles on the
+slot, and each fires at most once per streak. Two, not one: a single failure is exactly what the
+existing class-level Reset Recovery exists to absorb (PIUSB-38's induced stall recovers on the first
+try). Two, not more: every rung costs a full attempt budget of busy-spin, and no capture has ever
+shown a device that failed the ladder twice recovering on a third.
+
+Any transaction that **completes** — including one completing with a `Failed` CSW, because a device
+that answers is not a device that is wedged — resets the streak and the rung counter to zero.
+
+| Rung | Action | Spec | Notes |
+|---|---|---|---|
+| (existing) | Bulk-Only Mass Storage Reset + clear-halt ×2 + stop-ep/set-deq ×2 + one retry | BOT 1.0 §5.3.3/§5.3.4 | unchanged; §11a |
+| **(a)** | **Reset Device** for the slot, then Configure Endpoint onto rings reset to a known enqueue/cycle state | xHCI 1.2 §4.6.11, §4.6.6 | see the honest limit below |
+| **(b)** | **Root-port power cycle** — PORTSC PP down 100 ms, up, 300 ms settle; re-enumeration delegated | USB 2.0 §7.1.7.3 | root ports only |
+| **(c)** | **SURRENDER** — mark FAILED, retract, refuse all further transfers | §14.2 | terminal |
+
+**Back-off.** 50 ms doubling to a 400 ms cap between cycles. A device wedged mid-internal-stall — a
+flash controller in an erase/wear-levelling window is the usual suspect for a `WRITE` that kills EP0
+— is made *worse* by hammering: each new transaction restarts its command timeout.
+
+**Settles are spec-scale, not budget-derived.** `Self::cycles_per_ms()` reads the arch timebase
+(calibrated TSC via `apic::tsc_hz` on x86, `CNTFRQ_EL0` on aarch64, each with an honest fallback).
+Deriving the dwell times from `hw_wait_budget()` would silently rescale every USB timing constant
+the day the timeout policy changed; VBUS de-energise and `bPwrOn2PwrGood` are not policy.
+
+**Budgets.** The **first** attempt keeps its ~6 s (`hw_wait_budget() × 3`, unchanged) — a real device
+can legitimately stall 1–4 s on a write, and shortening this would fail slow-but-healthy sticks.
+**Escalation retries** use ~2 s (`× 1`): by then the device has burned two full ladders without
+answering, the only question left is "did the heavy reset revive it", and a revived device answers
+in milliseconds. The extra 4 s buys no information and is paid in frozen desktop. The multiplier
+lives in `bot_budget_scale`, which is the historical `3` at all times except inside an escalation
+retry.
+
+**Rung (a) — the honest limit, recorded because the witness will show it.** Reset Device returns the
+xHC's internal slot state to the post-Address condition without touching the Root Hub Port Number or
+Route String, but it leaves the Slot in the **Default** state. This rung deliberately does **not**
+re-address: the device was not port-reset, so it still holds its USB address and would not answer a
+`SET_ADDRESS` at 0 — re-addressing without a port reset would be the *unsound* move, not the
+thorough one. A controller that therefore refuses the follow-up Configure Endpoint with Context
+State Error (`cc=19`) is **expected**, is printed as such, and simply means the rung did not take;
+the ladder moves on to (b), whose port reset is what makes a re-address lawful. The rung is kept
+because it is cheap (two bounded commands), because it is the correct fix when the fault is purely
+the xHC's slot state, and because `cc=19` here is itself evidence about which half is sick.
+
+**Rung (b) — re-enumeration is delegated, not open-coded.** Removing and restoring VBUS raises
+Connect Status Change on the port; the settle drains the event ring, so the driver's own tested,
+single-threaded, one-port-at-a-time `handle_port_status` path sees the disconnect and the reconnect
+and re-enumerates onto a **fresh slot** — retracting the old slot's block-registry entry through
+`dispose_disconnected_slots` on the way. Open-coding a synchronous re-address here would race that
+path for the same port with no way to win. Every PORTSC write masks off PED (write-1-to-**disable**)
+and PR (write-1-to-**reset**) per `clear_port_change`'s discipline, and the port is left **powered**
+on every exit path. Hub-downstream devices are refused by this rung: their power is the hub's to
+switch, via a class request on the hub's own slot, and reaching for it through a pipe that may
+itself be the sick one is not a recovery.
+
+### 14.2 Surrender semantics
+
+Surrender does three things and then stops:
+
+1. **Retract**, through GR7's `block::unpublish_usb_geometry(slot_id)` — the *same* machinery a
+   physical unplug uses. That is the design point, not a shortcut: the FAT layer, the shell's `df`
+   and the installer's per-frame disk list already handle a disk that **disappears**. Every block
+   entry point re-reads the registry on each call and fails honestly with `BlockError::NotReady`;
+   the installer's captured `BlockDeviceId` refuses to resolve rather than retargeting. A disk that
+   has stopped answering is, to every consumer above the driver, indistinguishable from one that was
+   pulled. Saying so in the one vocabulary they already understand beats inventing a second failure
+   mode for them all to learn. Matching is by slot id, so a microSD published with `slot_id: 0` can
+   never be retracted here.
+2. **Print one verdict line** (`:: BOT: SURRENDER … ::`), naming the fault class, the streak, what
+   each counter spent, and whether the block layer actually had an entry to drop.
+3. **Refuse every later transfer to that slot**, at the top of `bot_transfer`. This gate is the arc's
+   actual guarantee: a sick disk can never again spin the system at ~6 s per attempt forever. Every
+   path into the driver's storage I/O passes through `bot_transfer`, so a caller that missed the
+   retraction cannot revive the stall.
+
+`storage_slot` is cleared and `storage_note` becomes `storage device FAILED (BOT rescue
+surrendered)`, which is what `diskinfo` shows on a serial-less machine.
+
+**Reversal is physical.** The surrender is cleared when the slot is **disposed** (disconnect) or
+**re-enumerated** (`bring_up_storage`), so it binds to the disk that earned it and not to a recycled
+slot number — a slot id handed to the next device must not refuse that innocent device's transfers.
+A replug is a clean slate and needs no operator action beyond the replug.
+
+### 14.3 Witness grammar, with a reading key
+
+Four new timeout lines and one extended success line. The pre-existing
+`:: BOT: pump budget=… result=TIMEOUT ::` and `… result=TIMEOUT-SHAPE ::` lines are **byte-unchanged**
+so captures stay comparable across the arc boundary.
+
+```
+:: BOT: timeout pipes slot=S in_dci=D in_epstate=E in_ctxdeq=0x… in_dcs=B in_enq=I in_cycle=C in_ntrb=N
+                      out_dci=… out_epstate=… out_ctxdeq=… out_dcs=… out_enq=… out_cycle=… out_ntrb=…
+                      foreign=F result=TIMEOUT-PIPES ::
+:: BOT: timeout trb wait=0x… pipe=in|out|unknown dw0=… dw1=… dw2=… dw3=… trb_cycle=B ring_cycle=C
+                    trb_type=T result=TIMEOUT-TRB ::
+:: BOT: timeout csw sig=0x… tag=0x… residue=R status=S valid=yes|no — <verdict> result=TIMEOUT-CSW ::
+:: BOT: pump budget=… used=… peak=… … timeouts=… IMAN=0x… USBSTS=0x… result=OK ::
+:: BOT: ring refuse slot=S dci=D dir=… enq=I cycle=C ntrb=N ctxdeq=0x… dcs=B — … ::
+```
+
+**Reading key.**
+
+* **`TIMEOUT-PIPES` (witness 1)** — *the* discriminator, and the one thing the 2026-07-29 capture
+  could not print. For **both** bulk DCIs: EP State (§6.2.3: 0 Disabled, 1 Running, 2 Halted,
+  3 Stopped, 4 Error), the controller's own TR Dequeue Pointer with its Dequeue Cycle State, and
+  **our** enqueue index and cycle bit.
+  * `ctxdeq` **behind** our enqueue → the controller never fetched the work. Host/endpoint fault;
+    ring surgery is the right family of fix.
+  * `ctxdeq` **past** the awaited TRB and `dcs` **agreeing** with our `cycle` → the controller
+    fetched and issued everything. The **device** is silent, and no host-side ring surgery can help.
+    This is the reading the audit reached by hand; it is now printed.
+* **`foreign=F` (witness 4)** — Transfer Events for **other** slots during **this** wait, measured
+  from a baseline snapshotted at pump entry (never the boot-long total: a counter read against its
+  own pre-run total is not a rate — the instrument-baseline law). `F > 0` proves the event ring,
+  interrupter and event delivery stayed alive for other traffic throughout, so a missing completion
+  is *this slot's* problem, not a global wedge. `F = 0` on a boot with other live devices (FTDI, a
+  HID) says the opposite and moves the investigation somewhere else entirely.
+* **`TIMEOUT-TRB` (witness 2)** — the awaited TRB's four raw dwords **as read back from DRAM**
+  (behind an invalidate), its stored cycle bit against the ring's live one, and its decoded type.
+  A TRB whose cycle bit does not match the colour the controller expects is one the controller is
+  entitled to ignore forever. Dwords that do not match what we believe we wrote mean the write never
+  landed — a coherency/aliasing arc, not this one.
+* **`TIMEOUT-CSW` (witness 5)** — the CSW buffer as the controller left it. The CSW is DMA-written,
+  so a genuine timeout leaves the pre-transfer zero fill. `valid=yes` (signature `0x53425355`) means
+  the status phase **landed** and only its completion event went missing — a different fault class,
+  and the direct test of §12.3's lost-CSW hypothesis (see the SUPERSEDED-UNLESS note there).
+  `valid=no` means the status phase never happened: a transport wedge.
+* **`IMAN=` / `USBSTS=` on `result=OK` (witness 3)** — the healthy **baseline**. The timeout line has
+  always printed both registers, but a reading with nothing to compare against cannot falsify
+  anything: `IMAN=0x3` on a wedged boot is evidence only if the same instrument recorded what IMAN
+  reads on a working one, on the same boot. The OK line is throttled to doubling peaks, so this stays
+  logarithmic in the budget — a handful of lines per boot. QEMU's calibration for this arc:
+  `IMAN=0x2 USBSTS=0x0`.
+* **`ring refuse`** — M2's lap guard fired (§14.4). On a healthy device this line is unreachable.
+* **`recover evidence … pipe=…`** — now carries the truth. It previously printed
+  `pipe=none wait_trb=0x0 stage_done=no stage_cc=0` on **every capture ever taken**, because
+  `run_bot_stage` took the pending record and dropped it before propagating the error, so recovery's
+  read was always `None`. That was a structural lie about the driver's own state, not a finding about
+  the device; any pre-2026-07-29 capture showing `pipe=none` should be re-read as *no data*.
+
+### 14.4 Ring hygiene (M2)
+
+Three fixes in the ring layer. The audit exonerated the ring as the **cause**, but a recovery ladder
+that hammers a stalled endpoint is exactly what would step in these traps.
+
+1. **`TransferRing` tracked no consumer position**, so `push` could lap a stalled controller — a
+   direct xHCI 1.2 §4.9.1/§4.9.2 violation, since the Cycle bit is the only producer/consumer
+   handshake and advancing past the dequeue pointer overwrites TRBs the controller has not fetched.
+   `TransferRing::would_lap` now answers from the controller's own TR Dequeue Pointer, read out of
+   the output device context by `bot_ring_guard`, consulted before each of the three bulk pushes in
+   `bot_transfer_once`. A refusal is `BotError::RingFull`, which feeds the same Reset Recovery
+   ladder. **Healthy path unaffected by construction:** each BOT stage is awaited to completion
+   before the next is queued, so at most **one** TRB is outstanding on a 16-TRB ring; the refusal
+   threshold is 14.
+2. **`push_noop` hard-coded `cycle=1`.** Today's only caller is the command ring's bring-up probe,
+   where the ring is virgin and `cycle_bit` is already true — a no-op for every call the driver
+   makes. It was a trap for any later call: after one wrap the hard-coded 1 is the *stale* colour and
+   the ring silently stops being consumed. It reads the field now.
+3. **`EventRing::clear` zeroed 256 BYTES, not 256 TRBs** (16 of 256 slots), and reset neither
+   `dequeue_index` nor `cycle_bit` — a cleared ring would be consumed from the middle with the wrong
+   expected colour, replaying 240 stale entries as fresh events. It is **currently uncalled** and
+   stays that way; fixed because a two-line helper that silently corrupts the consumer handshake is
+   what a future controller-reset path would reach for. The ERDP is deliberately not written there.
+
+`TransferRing::reset` returns a ring to a known enqueue/cycle state; rung (a) needs it, because
+continuing from wherever a failed transaction left the pointers would leave driver and controller
+disagreeing about both position and colour from the first push.
+
+### 14.5 Blast radius on a healthy device — none, by construction
+
+* The surrender gate is `bot_surrendered_slot == slot_id`; that field is set **only** by rung (c),
+  reachable only after two consecutive failed recovery+retry cycles *and* two failed rungs.
+* Every completing transaction calls `bot_rescue_clear`, so streak and stage are 0 on a healthy
+  device and no rung is reachable.
+* `bot_budget_scale` is the pre-arc `3` except inside an escalation retry, restored immediately.
+* The `Ok` / `Ok(Failed)` / `Err(NoDevice)` / retry-succeeded returns of `bot_transfer` are the
+  pre-arc returns verbatim. The only changed return is the terminal `Err(cause)` after a failed
+  recovery, which now pays a back-off first and returns the same error below `N_CONSEC`.
+* The lap guard is two volatile reads and arithmetic before the ring is touched, and returns `Ok` on
+  every healthy transfer.
+* Witnesses are pure reads — endpoint contexts, ring fields, DRAM behind an invalidate, two MMIO
+  reads. No dispatch decision is taken from the foreign-event counter, so event routing is unchanged.
+
+### 14.6 Gates, and what QEMU cannot prove
+
+* `./arroyo check` green for **both** arches — the shared file still builds for aarch64, and none of
+  the new code is x86-gated, so the pi seat inherits the same ladder and the same healthy path.
+* `./arroyo test` — **31 PASS / 0 FAIL**, baseline maintained; and again under `UNAOS_BOTFAULT=1`,
+  where the injected CSW-stage failure is rescued by the **existing** first rung
+  (`retry result=pass recoveries=1 retry_ok=1`) and **no** escalation fires — the intended reading.
+* `./arroyo test-fat sf 300` — the FAT-attached config still loads both ELFs.
+* `strings` on the artifact finds `result=TIMEOUT-PIPES`, `result=TIMEOUT-TRB`,
+  `result=TIMEOUT-CSW`, `stage=reset-device`, `stage=port-cycle`, `BOT: SURRENDER`, `ring refuse`.
+
+**QEMU cannot exercise the escalation.** Its `usb-storage` never stalls, so no streak can reach
+`N_CONSEC`, and rungs (a), (b) and (c) — along with the three timeout witness lines and the lap
+refusal — are **never reached** in emulation. This is stated plainly rather than claimed as coverage.
+Only witness 3's healthy baseline is exercised there, and it printed.
+
+### 14.7 What metal must verify
+
+1. **The ladder terminates.** A wedged reader must produce at most: two ordinary recovery cycles,
+   one `stage=reset-device`, one `stage=port-cycle`, one `SURRENDER` — and then silence on that slot.
+   Total wall-clock from first failure to surrender should be well under a minute, against the
+   previous *unbounded*.
+2. **Witness 5's verdict.** `valid=yes` at timeout would resurrect §12.3's M2 reading; `valid=no`
+   would retire it and confirm the transport-wedge class.
+3. **Witness 1's `ctxdeq` vs `enq`.** Confirms or refutes the audit's device-silent verdict directly,
+   instead of by inference from set-deq being a no-op.
+4. **`foreign=`** should be non-zero on any boot with the FTDI console attached. Zero would mean the
+   interrupter *was* globally wedged after all, contradicting the audit.
+5. **Rung (a)'s `cfgep_cc`.** A `cc=19` is expected (§14.1); anything else is new information.
+6. **The desktop stays live** through a disk failure — the whole point.
 
 ---
 
