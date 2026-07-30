@@ -926,6 +926,12 @@ const BOT_CBWIOC_KNOB_TAG: &str = "cbw=always-awaited";
 // storage chain is witnessed live on the wire instead of replayed out of the capture ring. Carried
 // on the KNOBS line so a capture can be dated: a log without this field predates the reordering.
 const BOT_ORDER_TAG: &str = "order=console-first";
+// BOOTPACE M3 (2026-07-30): likewise not a knob. All three synchronous pumps busy-poll the event
+// ring for a spec-scale window (~200 µs) BEFORE falling into `hlt()`, so an awaited stage no longer
+// costs a full 1 kHz APIC tick just because the controller was answered in microseconds. The hlt
+// fallback is unchanged and still the only thing that makes progress under QEMU TCG. Carried on the
+// KNOBS line so a capture can be dated: a log without this field has tick-quantised `mean=`.
+const BOT_PUMP_TAG: &str = "pump=spin+hlt";
 
 // **The CBW is an awaited stage. Unconditionally. This is a fix, and it is convicted on metal.**
 //
@@ -7074,6 +7080,46 @@ impl XhciController {
         }
     }
 
+    /// BOOTPACE M3 — the polled pumps' pre-`hlt()` spin window, in `now_cycles` units. ~200 µs.
+    ///
+    /// A SPEC-scale number, and deliberately NOT derived from `hw_wait_budget()`, for the same
+    /// reason `cycles_per_ms` is not: that budget is a policy ("how long may a wedged handshake burn
+    /// before we call it dead"), and rescaling this window the day the timeout policy changed would
+    /// be a silent behaviour change in the hot path. 200 µs is chosen against the hardware instead:
+    /// a healthy xHC posts a bulk or control completion in single-digit to low-tens of
+    /// microseconds, so the window covers a completion with an order of magnitude to spare while
+    /// remaining far below the 1 ms the alternative costs.
+    fn spin_window() -> u64 {
+        (Self::cycles_per_ms() / 5).max(1)
+    }
+
+    /// Busy-poll the event ring for at most `window` counter ticks, returning `true` the moment an
+    /// event is drained (so the caller re-checks its own pending record) and `false` if the window
+    /// expired with the ring still empty.
+    ///
+    /// BOOTPACE M3 — why this exists. All three synchronous pumps below waited by calling
+    /// `crate::hlt()`, which on x86/Pi/aarch64-virt sleeps until the next INTERRUPT. With xHCI
+    /// interrupts not enabled (`IRQ_COUNT=0` on every boot), the only thing that ever wakes it is
+    /// the 1 kHz APIC timer — so EVERY awaited stage cost at least one full tick regardless of how
+    /// fast the controller actually answered, and §17.4 recorded that quantisation as a permanent
+    /// cost of the polled design. It is not permanent; it is only the cost of sleeping FIRST.
+    /// Spinning for a spec-scale window before sleeping collects the completion in the microseconds
+    /// it actually takes, and the hlt path stays exactly as it was for everything slower.
+    ///
+    /// This changes no budget, no timeout, no wall-clock deadline and no interrupt state. Past the
+    /// window, behaviour is byte-identical to before: one `hlt()` per pass, the same deadline
+    /// arithmetic, the same timeout lines.
+    fn spin_for_event(&mut self, window: u64) -> bool {
+        let start = crate::arch::now_cycles();
+        while crate::arch::now_cycles().wrapping_sub(start) < window {
+            if self.drain_event_ring_once() {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        false
+    }
+
     /// Busy-settle `ms` milliseconds off the free-running counter, draining the event ring as it
     /// goes. Draining matters: a late completion for the transaction that just timed out, or a Port
     /// Status Change raised by the power cycle in escalation (b), must be consumed here rather than
@@ -7704,6 +7750,9 @@ impl XhciController {
         // Every event-ring TRB this wait consumes, of any type. Local to the wait by construction:
         // it cannot be read against its own pre-run total because it has none.
         let mut evts: u64 = 0;
+        // BOOTPACE M3: hoisted out of the loop — the rate does not change mid-wait, and this keeps
+        // the per-pass cost of the spin at zero atomic loads.
+        let spin_window = Self::spin_window();
         loop {
             match &self.bot_pending {
                 Some(p) if p.done => {
@@ -7722,10 +7771,20 @@ impl XhciController {
                 evts = evts.saturating_add(1);
                 continue; // processed an event; drain any more immediately
             }
+            // BOOTPACE M3 — SPIN, THEN HALT. Busy-poll the ring for ~200 µs before sleeping. A
+            // healthy controller answers in microseconds, so nearly every awaited stage now returns
+            // from here instead of paying a full 1 kHz APIC tick to `hlt()`. Counted into `evts`
+            // exactly like the drain above, so the timeout witness stays honest.
+            if self.spin_for_event(spin_window) {
+                evts = evts.saturating_add(1);
+                continue;
+            }
             // Yield to QEMU's main loop so it can run the xHC bottom-half / async block-I/O
             // completion and DMA the event into the ring; a pure spin never exits TCG. On the
             // timerless tegra post-drop core this falls back to a busy spin (arch::hlt), which the
-            // wall-clock deadline below still bounds.
+            // wall-clock deadline below still bounds. KEPT, and not replaced by the spin above: the
+            // spin cannot be the only wait, or TCG would never make progress — past its window this
+            // path is byte-identical to what it was.
             crate::hlt();
             let elapsed = crate::arch::now_cycles().wrapping_sub(start);
             if elapsed >= budget {
@@ -8050,8 +8109,8 @@ impl XhciController {
         // can be dated: a log whose KNOBS line lacks this field predates the reordering, and its
         // storage-chain timings were taken with the console not yet armed.
         serial_println!(
-            ":: BOT: knobs ring_trbs={} {} {} {} result=KNOBS ::",
-            BOT_RING_TRBS, BOT_RING_KNOB_TAG, BOT_CBWIOC_KNOB_TAG, BOT_ORDER_TAG);
+            ":: BOT: knobs ring_trbs={} {} {} {} {} result=KNOBS ::",
+            BOT_RING_TRBS, BOT_RING_KNOB_TAG, BOT_CBWIOC_KNOB_TAG, BOT_ORDER_TAG, BOT_PUMP_TAG);
         Ok(())
     }
 
@@ -8869,6 +8928,10 @@ impl XhciController {
     fn pump_until_ep0_done(&mut self) -> Result<(), ()> {
         let start = crate::arch::now_cycles();
         let budget = crate::arch::hw_wait_budget();
+        // BOOTPACE M3: the ~200 µs pre-hlt spin window, hoisted (see `spin_window`). EP0 matters
+        // most of the three: enumeration is dozens of control transfers per device, each of which
+        // used to cost a full APIC tick no matter how fast the device answered.
+        let spin_window = Self::spin_window();
         loop {
             match &self.ep0_pending {
                 Some(p) if p.done => return Ok(()),
@@ -8876,6 +8939,11 @@ impl XhciController {
                 _ => {}
             }
             if self.drain_event_ring_once() {
+                continue;
+            }
+            // BOOTPACE M3 — spin, then halt. Same shape as the BOT pump: busy-poll for a spec-scale
+            // window, and fall through to the unchanged hlt path if nothing arrives.
+            if self.spin_for_event(spin_window) {
                 continue;
             }
             crate::hlt(); // yield to QEMU so it can DMA the completion into the event ring
@@ -8920,6 +8988,8 @@ impl XhciController {
     fn pump_until_cmd_done(&mut self) -> Result<(), ()> {
         let start = crate::arch::now_cycles();
         let budget = crate::arch::hw_wait_budget();
+        // BOOTPACE M3: the ~200 µs pre-hlt spin window, hoisted (see `spin_window`).
+        let spin_window = Self::spin_window();
         loop {
             match &self.cmd_pending {
                 Some(p) if p.done => return Ok(()),
@@ -8927,6 +8997,11 @@ impl XhciController {
                 _ => {}
             }
             if self.drain_event_ring_once() {
+                continue;
+            }
+            // BOOTPACE M3 — spin, then halt. The command ring is the fastest of the three (no device
+            // round trip at all for ENABLE_SLOT), so this is where the tick tax was most absurd.
+            if self.spin_for_event(spin_window) {
                 continue;
             }
             crate::hlt();

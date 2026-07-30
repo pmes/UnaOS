@@ -4566,6 +4566,32 @@ column is what the alternative costs. The ceiling itself has a known remedy that
 — take the xHCI interrupt instead of polling (§16.6's `IRQ_COUNT=0` and the never-RW1C'd `IMAN=0x3`),
 which would return the cost to interrupt latency for **all three** stages at once.
 
+> **ADDENDUM (2026-07-30, BOOTPACE M3). The cost was not permanent — it was the cost of sleeping
+> FIRST.** The paragraphs above are correct about the mechanism and wrong about its inevitability.
+> `hlt()` sleeps until an interrupt; with xHCI interrupts not enabled the only wake is the 1 kHz APIC
+> tick; therefore *a stage that begins by calling `hlt()`* costs a tick no matter how fast the
+> controller answered. But nothing required the pump to begin there. All three synchronous pumps —
+> `pump_until_bot_done`, `pump_until_ep0_done`, `pump_until_cmd_done` — now busy-poll
+> `drain_event_ring_once()` under a bounded `now_cycles` sub-deadline of **~200 µs**
+> (`Xhci::spin_window`, `cycles_per_ms()/5` — a spec-scale constant chosen against controller
+> latency, deliberately **not** derived from `hw_wait_budget()`) before falling into the sleep. A
+> healthy controller posts a completion in single-digit to low-tens of microseconds, so nearly every
+> awaited stage now returns from inside the spin window and the tick quantisation is gone.
+>
+> **The hlt fallback is kept, and that is not an oversight.** A pure spin never exits under QEMU TCG
+> — the note at the top of `pump_until_bot_done` says so, and it is still true. Past the window the
+> path is byte-identical to what it was: one `hlt()` per pass, the same wall-clock deadline
+> arithmetic, the same timeout lines. Under TCG the spin merely wastes ≤200 µs per pass.
+>
+> **What did NOT change.** No budget, no settle, no timeout, no protocol timing, and — explicitly —
+> no interrupt state: no IMAN write, no MSI change. Taking the interrupt remains the future remedy,
+> now for the residue rather than for the whole tick. The KNOBS line carries `pump=spin+hlt` so a
+> capture can be dated; artifact proof is
+> `strings unaos/target/x86_64_esp/kernel.elf | grep -c 'pump=spin+hlt'` ≥ 1.
+>
+> **No new counter was added for it**, deliberately: the existing instruments already carry the
+> verdict. See §17.8 item 4.
+
 ### 17.5 Corrections this arc makes to its own earlier claims
 
 Recorded in full rather than quietly dropped: three readings that were quoted as evidence in this
@@ -4640,8 +4666,22 @@ pair, the CBW await is the only thing left that changed.
    deterministic-recurrence handle.
 3. **`stage=cbw` has never been printed.** If it ever appears on a `TIMEOUT-SHAPE` line, the device
    is refusing the command itself and this section's mechanism does not cover it.
-4. **The measured cost.** `mean` on the SUMMARY line should now sit near **three** ticks per
-   transaction rather than two. If it does not, the pump is not doing what §16.6 says it does.
+4. **The measured cost — REVISED by BOOTPACE M3 (see §17.4's addendum).** The original expectation
+   was `mean` near **three** ticks per transaction rather than two, on the reasoning that each of
+   the three awaited stages costs one 1 kHz tick. With the spin-then-halt pumps that reasoning no
+   longer applies to a healthy controller, and the expectation inverts:
+
+   - `mean` on `:: BOT: … result=SUMMARY ::` should fall to **well under one tick** per
+     transaction — the three stages now cost controller latency (microseconds), not three ticks.
+   - `BOT_WAIT_BUCKETS` bucket 0 ("under 1 ms") should hold **nearly all** stages. Before this
+     change it held almost none.
+   - The KNOBS line must read `pump=spin+hlt`. If it does not, the build predates the change and
+     the two readings above do not apply to it.
+
+   A `mean` still sitting near three ticks **with** `pump=spin+hlt` present is the falsifying
+   result: it would say completions are genuinely arriving later than 200 µs, i.e. the tick was
+   never the dominant cost and something else is. That is a finding, not a failure — but it must be
+   reported rather than explained away.
 
 ---
 
