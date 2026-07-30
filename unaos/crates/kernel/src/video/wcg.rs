@@ -706,7 +706,7 @@ fn checksum(surf: usize, surf_len: usize) -> u64 {
 /// per call (a system register read, cheap next to a 64 KiB checksum) and falls back to the Pi 4's
 /// 54 MHz if the firmware left it zero, so a bad `CNTFRQ` degrades the number rather than dividing
 /// by zero.
-fn cycles_to_us(dt: u64) -> u64 {
+pub(super) fn cycles_to_us(dt: u64) -> u64 {
     let frq: u64;
     unsafe {
         core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack, preserves_flags));

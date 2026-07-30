@@ -5703,3 +5703,91 @@ way: they read `running` in `jobs` and die by `kill <pid>`; no sweep invents an 
   (`UNAOS_FBW=1920 UNAOS_FBH=1200`).
 * `./arroyo test-arm` — MISSION SUCCESS (legs 9–10 DORMANT on the hosted build: `close=skip
   closereal=skip`).
+## COMPOSITE-2 — measure the pass, then multiply it (2026-07-29)
+
+The compositor's aggregate throughput wall — ~123 composite passes/s, ~8 ms per pass at 1920x1200,
+measured identically across P79/P80/P82 — is the fps ceiling for the whole vug fleet while V3D
+stays walled. This arc first put the pass's cost breakdown on the wire, then rebuilt the two terms
+the measurement convicted. No protocol, window-API, CURSOR-13-bracket or FLICKER-3 semantics moved;
+the WC-D/WC-G/HT oracles keep their verdicts (87/87).
+
+### The instrument: `[comp2]` (aarch64 + witness, `video/wm.rs`)
+
+One rollup line rides the `[wcn]` cadence and partitions every pass's wall time:
+
+    [comp2] rollup passes=N pass_us= max_us= sprite_us= wait_us= blit_us= cache_us=
+            bytes_pp= dmg_px_pp= rate=/s span=ms
+
+* `sprite_us` — deferred-erase drain + cursor bracket + tail (`adopt`/`repaint`/`ensure`).
+* `wait_us` — WRITER read, TABLE lock, damage close, ordering, guard registration.
+* `blit_us` — the blit loop (compose + present), minus the cache term.
+* `cache_us` — `draw_window`'s trailing clean for the non-coherent HVS.
+* `bytes_pp` / `dmg_px_pp` — panel bytes written and damage-clipped box area, per pass.
+
+### The measurement (QEMU raspi4b, `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test`)
+
+| term                          | before   | after   | change |
+|-------------------------------|----------|---------|--------|
+| `pass_us` (per-pass wall)     | 14912    | 2821    | 5.3x   |
+| `max_us`                      | 60213    | 13852   | 4.3x   |
+| `blit_us`                     | 12952    | 1720    | 7.5x   |
+| `cache_us`                    | 1007     | 267     | 3.8x   |
+| `sprite_us` / `wait_us`       | 22 / 10  | 3 / 4   | noise  |
+| `[wc-h]` 514x526 `compose_us` | 11034    | 850     | 13x    |
+| `[wc-h]` 514x526 `present_us` | 896      | 706     | ~1x    |
+
+The verdict was unambiguous: ~87% of the pass was the per-pixel compose — every destination pixel
+paid a `put_pixel` call (four bounds checks, a format match, three byte stores), and the dense
+chrome fill wrote the whole outer box only for the content loop to rewrite 97% of it. The present
+copy was already bulk (`copy_nonoverlapping` rows) and barely moved. Sprite and wait terms were
+never the wall. (The residual `pass_us - blit - cache` ≈ 0.8 ms is the WC-F ground-truth probe's
+per-pass repaint — witness+baremetal instrumentation, absent from production media.)
+
+### The rebuild (expected-value order, as the measurement justified)
+
+1. **Word blits** (`framebuffer.rs`): `encode4` un-gated from x86; new `fill_span4` (per-span
+   bounds + swizzle hoist, 64-bit paired stores — the build is `+strict-align`, so spans check
+   word alignment and fall back to `put_pixel` rather than fault); `fill_rect`/`fill_rows` take
+   the span path on aarch64 (x86 keeps its loops so `videobench`'s poke counters keep meaning).
+   The only byte that differs is the pad, written 0 where `put_pixel` skipped it — no reader
+   decodes it (scan-out ignores it, `read_pixel` reads 3 bytes, the staged layer's pads are 0).
+2. **Flattened row compose** (`wm.rs paint_window`): the staged single-line case (every `dup` row,
+   every `scale==1` row) does its clipping once per row and degenerates to "encode, store `scale`
+   words, advance" over one contiguous run. Clip bounds identical to the span writer's.
+3. **Damage honesty — write each pixel once**: the chrome fill is now the outer box MINUS the
+   content extent (title band, bottom strip, side borders). The subtracted region is only what the
+   content loop provably writes in the same call — both painters clip with the same bounds at the
+   same coordinates — so WC-H's "every pixel the present copies was written by this pass"
+   invariant holds exactly; short content (`cols==0`/`rows==0`) keeps the full dense fill.
+4. **Cache honesty** (`flush_rect` + `arch/aarch64/cache.rs::clean_rows`): the post-blit clean
+   covers the box's own columns per row with ONE trailing `DSB`, instead of full-width scanlines —
+   3.7x fewer bytes cleaned for the bench's 514-wide box. Same swap on the two staged-erase flush
+   sites. WC-D's bare-`IVAC` discipline untouched.
+
+**Not taken, and why**: cross-window occlusion coalescing (the fleet tiles; the dirty set is
+per-window and honest, so covered-pixel double-blits are not in the measured population) and
+band-parallel composite (`wait_us` ≈ 4 µs — no serialisation to spread; the surviving cost is
+byte throughput on compose+present, which more cores do not multiply and whose sched coupling the
+constraints priced as not worth a QEMU-only guess).
+
+### Projection to metal, stated honestly
+
+QEMU measures instruction count, not DRAM/write-combining bandwidth, so the 5.3x pass_us is an
+upper-bound shape, not a metal number. What transfers: the eliminated work is real (per-pixel call
+overhead ~10 instructions/px -> 2 stores per 8 bytes; ~2x panel bytes written per pass -> ~1x;
+3.7x cleaned bytes -> 1x), and on the A72 the compose (cached RAM) was CPU-bound in exactly the
+population QEMU models. If the metal pass is bandwidth-bound after the rebuild, the floor is the
+box's ~2.1 MB of traffic (compose write + present read/write + clean) against the Pi 4's ~4 GB/s
+practical DRAM bandwidth ≈ 0.5–1 ms/pass; if it stays instruction-bound the QEMU ratio applies to
+the measured 8 ms ≈ 1.5 ms/pass. Either way the honest projection is **~4–6x the pass rate — from
+~123/s aggregate to the 500–800/s band** — with the metal verdict owed to Peter's boot at the next
+attended sitting.
+
+### Gate results (COMPOSITE-2, 2026-07-29, QEMU raspi4b)
+
+* `./arroyo check` — both arches green.
+* `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test` — MBENCH PASS 87/87, 12 consecutive runs
+  (one early 86/87 run during development did not reproduce across those 12 and left no captured
+  witness identity; recorded here so a recurrence is read as a flake candidate, not a surprise).
+* `./arroyo kernel8-test` (default geometry) — MBENCH PASS 87/87.
+* `./arroyo test-arm` — MISSION SUCCESS.

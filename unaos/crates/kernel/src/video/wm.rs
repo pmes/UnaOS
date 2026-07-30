@@ -942,7 +942,6 @@ fn erase(boxes: &[(usize, usize, usize, usize)]) {
         return;
     }
     let info = fb.info();
-    let row_bytes = info.stride * info.bytes_per_pixel;
     for &(x, y, w, h) in boxes {
         if w == 0 || h == 0 || x >= info.width || y >= info.height {
             continue;
@@ -959,7 +958,8 @@ fn erase(boxes: &[(usize, usize, usize, usize)]) {
         let y0 = y.min(info.height);
         let y1 = (y + h).min(info.height);
         if y1 > y0 {
-            fb.flush_range(y0 * row_bytes, (y1 - y0) * row_bytes);
+            // COMPOSITE-2 — the fill's own columns, not full-width scanlines (see `draw_window`).
+            fb.flush_rect(x, y0, w, y1 - y0);
         }
     }
 }
@@ -1525,7 +1525,14 @@ pub fn count() -> usize {
 /// repair is a whole-sprite [`super::cursor::repaint`] here, outside the guard, on exactly the footing
 /// the `Repaint` tail has had since WC-I. See `cursor::PRESENT_DIRTY`.
 pub fn composite() {
+    // COMPOSITE-2 — the whole-pass clock. Starts before the inner pass (which self-reports its
+    // sprite/wait/loop terms) and stops after the tail, so `pass_us` bounds everything a present
+    // pays for its composite, including the tail's sprite work.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let c2_t0 = crate::arch::aarch64::now_cycles();
     let mut tail = composite_inner();
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let c2_t1 = crate::arch::aarch64::now_cycles();
     // CURSOR-7 — read BEFORE the tail runs, so a repaint the tail is already going to do is not
     // duplicated, and a pass that would otherwise have done nothing at all is upgraded.
     let dirty = super::cursor::take_present_dirty();
@@ -1557,6 +1564,18 @@ pub fn composite() {
         CursorTail::Repaint => super::cursor::repaint(),
         CursorTail::Untouched => super::cursor::ensure_drawn(),
     }
+    // COMPOSITE-2 — close the ledger: the tail interval is sprite work, the whole interval is the
+    // pass. One `now_cycles` read serves both accounts.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let end = crate::arch::aarch64::now_cycles();
+        let pass = end.saturating_sub(c2_t0);
+        C2_SPRITE_CYC.fetch_add(end.saturating_sub(c2_t1), Relaxed);
+        C2_PASSES.fetch_add(1, Relaxed);
+        C2_PASS_CYC.fetch_add(pass, Relaxed);
+        C2_PASS_MAX_CYC.fetch_max(pass, Relaxed);
+    }
 }
 
 /// What [`composite_inner`] owes the sprite when it returns.
@@ -1580,6 +1599,9 @@ enum CursorTail {
 /// The composite pass proper. Private so the cursor bracket above cannot be bypassed — every caller
 /// (including this module's own teardown paths) goes through [`composite`].
 fn composite_inner() -> CursorTail {
+    // COMPOSITE-2 — the pre-pass (drain + cursor bracket) clock opens here.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let c2_pre0 = crate::arch::aarch64::now_cycles();
     // WC-I — THE CURSOR BRACKET, decided BEFORE anything is registered as an in-flight blit.
     //
     // Before WC-I `composite` undrew the sprite unconditionally on every call — and `composite` runs
@@ -1826,6 +1848,17 @@ fn composite_inner() -> CursorTail {
             WCI_CURSOR_BRACKETS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
+    // COMPOSITE-2 — pre-pass closed, wait clock opens: everything from here to the top of the blit
+    // loop is serialisation (WRITER read, TABLE lock, damage close, ordering, guard registration).
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let c2_wait0 = {
+        let t = crate::arch::aarch64::now_cycles();
+        C2_SPRITE_CYC.fetch_add(
+            t.saturating_sub(c2_pre0),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        t
+    };
 
     // WEDGE-1 — the framebuffer handle is taken BEFORE the guard. **Hardening, not a fix for a
     // diagnosed defect: the P66 wedge's mechanism is UNKNOWN and this is not it.**
@@ -1937,6 +1970,16 @@ fn composite_inner() -> CursorTail {
     // window (`WRITER`/`TABLE`/`BlitGuard`), while `<F8>` with no `<F9>` means it is in the blit loop
     // proper — `draw_window`, the WC-G/WC-D witnesses, or the sprite overlay they drive.
     crate::wedge2::mark_composite("<F8>", "<f8>");
+    // COMPOSITE-2 — wait closed, loop clock opens.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let c2_loop0 = {
+        let t = crate::arch::aarch64::now_cycles();
+        C2_WAIT_CYC.fetch_add(
+            t.saturating_sub(c2_wait0),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        t
+    };
     let mut drawn = 0usize;
     // CURSOR-3 — did any window in this pass carry the sprite through its staged present? Back-to-
     // front order means the LAST window to take the overlay is the topmost one that fully contains
@@ -2049,6 +2092,14 @@ fn composite_inner() -> CursorTail {
         wcn_note_drawn(rows[i].id);
         drawn += 1;
     }
+    // COMPOSITE-2 — loop closed. The witness one-shots inside it (WC-G/WC-D/WC-C) are charged here
+    // when they fire; they are budgeted per window id, so the steady state they perturb is a handful
+    // of early passes and never the rollup average this line is read for.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    C2_LOOP_CYC.fetch_add(
+        crate::arch::aarch64::now_cycles().saturating_sub(c2_loop0),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     // WC-N — the pass reached the blit loop (`drawn == 0` is still a pass: it means every damaged row
     // was below the shell, which is a fact about the shell and not about the pass).
     #[cfg(feature = "witness")]
@@ -3248,6 +3299,81 @@ static WCN_STALE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 #[cfg(feature = "witness")]
 static WCN_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// ---- COMPOSITE-2 — the per-pass cost ledger -----------------------------------------------------
+//
+// The compositor's measured wall is ~123 passes/s aggregate (~8 ms per pass at 1920x1200), which is
+// the fps ceiling for the whole vug fleet while V3D stays walled. Before rebuilding the hot path the
+// wire must say where those 8 ms go, and afterwards it must prove they moved. One [comp2] rollup
+// line rides the [wcn] cadence and partitions every pass's wall time into four accounts:
+//
+//   * `sprite_us` — the pre-pass region (deferred-erase drain + cursor bracket) plus the tail
+//     (`adopt`/`repaint`/`ensure_drawn`). Everything the sprite contract costs a pass.
+//   * `wait_us`   — WRITER read, TABLE lock, damage close, ordering, guard registration: the
+//     serialisation cost between the bracket and the first blit.
+//   * `blit_us`   — the blit loop proper (compose + present copies), MINUS the cache term below.
+//   * `cache_us`  — `draw_window`'s trailing `flush_range` (`DC CVAC` sweep + `DSB`), the
+//     non-coherent scan-out's tax, measured separately because it scales with CLEANED bytes and
+//     the fix for it (clean the box, not full-width scanlines) is distinct from the blit fix.
+//
+// Plus the two denominators every claim needs: `bytes_pp` (panel bytes written per pass) and
+// `dmg_px_pp` (damage-clipped box area per pass). aarch64 + witness only, like the other wire
+// instruments; counters are relaxed increments on the hot path and are drained by the emit.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_PASS_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_PASS_MAX_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_SPRITE_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_WAIT_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_LOOP_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_CACHE_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_DMG_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// COMPOSITE-2 — drain the ledger and print the rollup line. Called from [`wcn_emit`] so the two
+/// instruments share one cadence and one `span`; all averages are per-pass, in microseconds.
+/// `blit_us` subtracts the cache term because the flush is timed INSIDE the loop (it is per-window,
+/// in `draw_window`), and reporting it twice would make the line un-addable.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+fn comp2_emit(span: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let passes = C2_PASSES.swap(0, Relaxed);
+    let pass_cyc = C2_PASS_CYC.swap(0, Relaxed);
+    let max_cyc = C2_PASS_MAX_CYC.swap(0, Relaxed);
+    let sprite_cyc = C2_SPRITE_CYC.swap(0, Relaxed);
+    let wait_cyc = C2_WAIT_CYC.swap(0, Relaxed);
+    let loop_cyc = C2_LOOP_CYC.swap(0, Relaxed);
+    let cache_cyc = C2_CACHE_CYC.swap(0, Relaxed);
+    let bytes = C2_BYTES.swap(0, Relaxed);
+    let dmg_px = C2_DMG_PX.swap(0, Relaxed);
+    if passes == 0 {
+        return;
+    }
+    let us = |cyc: u64| super::wcg::cycles_to_us(cyc / passes);
+    serial_println!(
+        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} cache_us={} bytes_pp={} dmg_px_pp={} rate={}.{}/s span={}ms",
+        passes,
+        us(pass_cyc),
+        super::wcg::cycles_to_us(max_cyc),
+        us(sprite_cyc),
+        us(wait_cyc),
+        us(loop_cyc.saturating_sub(cache_cyc)),
+        us(cache_cyc),
+        bytes / passes,
+        dmg_px / passes,
+        passes.saturating_mul(10_000) / span.max(1) / 10,
+        passes.saturating_mul(10_000) / span.max(1) % 10,
+        span
+    );
+}
+
 // ---- FLICKER-2 — the burst/drain pressure counters ----------------------------------------------
 //
 // Symptom (a) of Peter's P79 sitting is a slight cursor flicker on a ~5 s "pulse" — the cadence of
@@ -3521,6 +3647,9 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
         span,
         verdict
     );
+    // COMPOSITE-2 — the cost ledger rides the same cadence and the same span.
+    #[cfg(target_arch = "aarch64")]
+    comp2_emit(span);
     // FLICKER-2 — stored only when a block actually went on the wire, so `burst_last` names the most
     // recent REAL burst rather than the last silent early-out. On metal this is dominated by the
     // IRQ-masked UART time of the lines above (plus any staged backlog the winning core drained);
@@ -3878,7 +4007,6 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
         F2W_DRAIN_SKIPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     let info = fb.info();
-    let row_bytes = info.stride * info.bytes_per_pixel;
     let mut painted = false;
     for &(x, y, w, h) in boxes[..n].iter() {
         // Re-clip: a coalesced union is a synthesised box, and the panel geometry it was clipped
@@ -3894,7 +4022,8 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
         let y0 = y.min(info.height);
         let y1 = (y + h).min(info.height);
         if y1 > y0 {
-            fb.flush_range(y0 * row_bytes, (y1 - y0) * row_bytes);
+            // COMPOSITE-2 — the fill's own columns, not full-width scanlines (see `draw_window`).
+            fb.flush_rect(x, y0, w, y1 - y0);
         }
         damage_intersecting(x, y, w, h);
         painted = true;
@@ -4137,15 +4266,34 @@ fn draw_window(
         }
     }
 
-    // Clean the touched rows (superset: whole scanlines of the outer box) for the non-coherent
-    // scan-out — one `DC CVAC` sweep per window, not one per scanline. No-op on coherent targets.
-    // Unchanged by WC-H: staged or direct, the same panel rows were written by the time we get here.
-    let row_bytes = info.stride * info.bytes_per_pixel;
+    // Clean the touched pixels for the non-coherent scan-out — one `DC CVAC` sweep per window with
+    // one `DSB`, over the BOX's own columns. COMPOSITE-2 narrowed this from full-width scanlines
+    // (`flush_range` over `[y0, y1)`): every write this pass made — chrome, content, staged rows,
+    // `compose_into`'s sprite pixels — lands inside the clipped outer box by construction, so the
+    // box (rounded out to cache lines by the arch sweep) is still a superset of the dirty bytes,
+    // and the margins of a 514-wide box on a 1920-wide panel stop being cleaned for nothing.
+    // No-op on coherent targets. Unchanged by WC-H: staged or direct, the same panel pixels were
+    // written by the time we get here.
     let y0 = by.min(info.height);
     let y1 = (by + bh).min(info.height);
+    // COMPOSITE-2 — the cache term and the pass's two denominators. `bytes` is what reached the
+    // panel (the clipped box), `dmg_px` its area; both are the numbers `[comp2]`'s per-byte claims
+    // divide by.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let c2_f0 = {
+        use core::sync::atomic::Ordering::Relaxed;
+        C2_BYTES.fetch_add((bw * bh * info.bytes_per_pixel) as u64, Relaxed);
+        C2_DMG_PX.fetch_add((bw * bh) as u64, Relaxed);
+        crate::arch::aarch64::now_cycles()
+    };
     if y1 > y0 {
-        fb.flush_range(y0 * row_bytes, (y1 - y0) * row_bytes);
+        fb.flush_rect(bx, y0, bw, y1 - y0);
     }
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    C2_CACHE_CYC.fetch_add(
+        crate::arch::aarch64::now_cycles().saturating_sub(c2_f0),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     // CURSOR-3: the cache clean above covers the sprite's pixels for free — they are inside these
     // rows, which is the whole point of composing them into the layer rather than poking them into
     // the front afterwards. Nothing extra is written to the front buffer on this path.
@@ -4205,13 +4353,36 @@ fn paint_window(
     let lbx = bx.saturating_sub(ox);
     // WC-M — signed: a band below the first has the box's top edge above its own row 0.
     let lby = by as isize - oy as isize;
+    // COMPOSITE-2 — the content extent, hoisted above the chrome so the border fill can subtract
+    // it. Identical derivation to the block below the chrome (which keeps its own copy for the
+    // early-return path's clarity): how many source cols/rows land on the panel AND inside the
+    // mapped slot, hence exactly which destination pixels the content loop is GUARANTEED to write.
+    let (c2_cols, c2_rows) = if r.x < pw && r.y < ph {
+        (
+            (pw - r.x).div_ceil(r.scale).min(r.w).min(r.stride / 4),
+            (ph - r.y).div_ceil(r.scale).min(r.h).min(r.surf_len / r.stride),
+        )
+    } else {
+        (0, 0)
+    };
     if !r.compat {
-        // Frame: fill the whole outer box in the border colour, then lay the title strip and the
-        // content over it. The only pixels that survive are the 1-px frame itself.
+        // Frame: fill the outer box in the border colour, then lay the title strip and the content
+        // over it. The only pixels that survive are the 1-px frame itself.
         //
         // WC-H relies on this fill being DENSE over the whole clipped box: it is what guarantees the
         // back layer carries no residue from the window it staged last. Every pixel the present
         // copies was written by this pass.
+        //
+        // COMPOSITE-2 — dense, but no longer DOUBLE. The old fill painted the whole box and the
+        // content loop then rewrote ~97% of it (a 514x526 bench box is 270k px of fill under 262k px
+        // of content), so the biggest single population of the compose was pixels written twice.
+        // The fill is now the box MINUS the content extent — four rects: the title band above it,
+        // the strip below it, and the side borders beside it. The invariant is preserved exactly,
+        // because the subtracted region is only what the content loop provably writes this same
+        // call: both painters clip with the same bounds at the same coordinates (destination
+        // width/height/length), so any subtracted pixel the clip would have denied the content is a
+        // pixel it denies the fill too. A window whose content is short (`cols == 0`/`rows == 0` —
+        // nothing visible or nothing mapped) keeps the full dense fill.
         // FOCUS-HL: the ONLY difference the focused window's chrome carries is these two colours. The
         // geometry is identical either way, so focus never moves a pixel — it just repaints the frame
         // and strip that were already going to be painted, at no extra cost per present.
@@ -4220,7 +4391,27 @@ fn paint_window(
         } else {
             (CHROME_BORDER, CHROME_TITLE_BG)
         };
-        fill_rect_v(dst, lbx, lby, bw, bh, border);
+        if c2_cols > 0 && c2_rows > 0 {
+            let cx0 = r.x.saturating_sub(ox);
+            let cy0 = r.y as isize - oy as isize;
+            let cx1 = cx0 + c2_cols * r.scale;
+            let cy1 = cy0 + (c2_rows * r.scale) as isize;
+            let box_x1 = lbx + bw;
+            let box_y1 = lby + bh as isize;
+            // Above the content (border + title band) and below it (bottom border + any clip gap).
+            fill_rect_v(dst, lbx, lby, bw, (cy0 - lby).max(0) as usize, border);
+            if box_y1 > cy1 {
+                fill_rect_v(dst, lbx, cy1, bw, (box_y1 - cy1) as usize, border);
+            }
+            // Beside it, only over the content's own rows.
+            let mid_h = (cy1 - cy0).max(0) as usize;
+            fill_rect_v(dst, lbx, cy0, cx0.saturating_sub(lbx), mid_h, border);
+            if box_x1 > cx1 {
+                fill_rect_v(dst, cx1, cy0, box_x1 - cx1, mid_h, border);
+            }
+        } else {
+            fill_rect_v(dst, lbx, lby, bw, bh, border);
+        }
         fill_rect_v(
             dst,
             lbx + BORDER,
@@ -4298,6 +4489,24 @@ fn paint_window(
     // remains byte-for-byte the pre-WC-H path. On the back layer every pad byte is 0 by construction,
     // so the copy reproduces exactly what the per-pixel loop would have left.
     let dup = dup && r.scale > 1 && dbpp != 0 && dinfo.stride == dw;
+    // COMPOSITE-2 — the content upscale's WORD path. The measured wall was here: at 1920x1200 the
+    // per-pixel `put_pixel` compose was ~11 ms of a ~15 ms pass ([comp2] blit_us=12952 against
+    // present_us=896 for the same box), because every destination pixel paid a function call, four
+    // bounds checks, a format match and three byte stores. The hoist is exactly `encode4`'s: decide
+    // the swizzle ONCE per compose, encode each source pixel once, and write its `scale`-wide run
+    // as one clipped span of 4-byte words (64-bit pairs inside). `fill_span4` clips to the
+    // destination's width and mapped length — the same bounds `put_pixel` enforced per pixel — so
+    // the pixel set is identical; the only byte that differs is the pad, written 0 where
+    // `put_pixel` skipped it, which no reader decodes (scan-out ignores it, `read_pixel` reads 3
+    // bytes, and the staged layer's pads are already 0 by construction).
+    let fast = dst.word4()
+        && matches!(
+            dinfo.pixel_format,
+            unaos_boot_info::PixelFormat::Rgb | unaos_boot_info::PixelFormat::Bgr
+        );
+    // In LE memory Bgr stores `b, g, r` — the 0x00RRGGBB word unchanged — while Rgb stores
+    // `r, g, b`, the same word with R and B exchanged. Mirrors `FrameBuffer::encode4` exactly.
+    let swap = matches!(dinfo.pixel_format, unaos_boot_info::PixelFormat::Rgb);
     let surf = r.surf as *const u8;
     for row in 0..rows {
         // WC-M — where this source row's `scale` destination lines start, in the DESTINATION's own
@@ -4322,12 +4531,81 @@ fn paint_window(
         // `dup` composes exactly one line per source row and replicates it; without it every line is
         // written per-pixel. Either way the run starts at the first line this destination can hold.
         let sy_end = if dup { sy_first + 1 } else { r.scale };
+        // COMPOSITE-2 — the SINGLE-LINE row compose, flattened. When the row composes exactly one
+        // destination line (every staged `dup` row, and any `scale == 1` row) the whole line is one
+        // contiguous, clipped, word-aligned run — so the bounds work is done ONCE here and the
+        // column loop degenerates to "encode, store `scale` words, advance". This is where the
+        // remaining compose milliseconds lived after the span writer landed: at 128 source columns
+        // per row, even `fill_span4`'s once-per-span checks were ~half the per-column work. The
+        // span clamps are exactly the writer's: the destination's visible width and its mapped
+        // length, so the pixel set is identical to the general path below.
+        let fastline = if fast && sy_end == sy_first + 1 {
+            let dy = (dy0 + sy_first as isize) as usize;
+            let row_off = (dy * dinfo.stride + cx) * 4;
+            if dy < dh && cx < dw && row_off + 4 <= dst.len() {
+                let span = (cols * r.scale).min(dw - cx).min((dst.len() - row_off) / 4);
+                if span > 0 {
+                    Some((dst.base_addr() + row_off, span))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((line0, span)) = fastline {
+            // SAFETY: `line0 + span * 4 <= dst.base + dst.len()` by the clamp above; `line0` is
+            // 4-aligned (`word4` demands a word-aligned base and every term of `row_off` is a
+            // multiple of 4); the source reads carry `paint_window`'s own bound (`row < surf_len /
+            // stride`, `col < stride / 4`).
+            let mut p = line0 as *mut u32;
+            let mut rem = span;
+            let mut col = 0usize;
+            while rem > 0 && col < cols {
+                let px =
+                    unsafe { core::ptr::read_unaligned(surf.add(row_base + col * 4) as *const u32) }
+                        & 0x00FF_FFFF;
+                let raw = if swap {
+                    ((px & 0xFF) << 16) | (px & 0xFF00) | (px >> 16)
+                } else {
+                    px
+                };
+                let n = r.scale.min(rem);
+                for _ in 0..n {
+                    unsafe {
+                        p.write(raw);
+                        p = p.add(1);
+                    }
+                }
+                rem -= n;
+                col += 1;
+            }
+        } else if fast && sy_end == sy_first + 1 {
+            // The line is wholly clipped (off the destination's height/width/length): the general
+            // path below would have written nothing for it either. Skip straight to replication,
+            // whose own clips decide what, if anything, lands.
+        } else {
         for col in 0..cols {
             // Unaligned-safe read of the ARGB8888 pixel; low 24 bits are RRGGBB (alpha ignored —
             // this arc composites opaquely). In bounds by construction: `row < surf_len / stride`
             // and `col < stride / 4`, so `row_base + col * 4 + 4 <= surf_len`.
             let px = unsafe { core::ptr::read_unaligned(surf.add(row_base + col * 4) as *const u32) }
                 & 0x00FF_FFFF;
+            if fast {
+                let raw = if swap {
+                    ((px & 0xFF) << 16) | (px & 0xFF00) | (px >> 16)
+                } else {
+                    px
+                };
+                for sy in sy_first..sy_end {
+                    // `sy >= sy_first` makes `dy0 + sy` non-negative by construction.
+                    let dy = (dy0 + sy as isize) as usize;
+                    dst.fill_span4(cx + col * r.scale, dy, r.scale, raw);
+                }
+                continue;
+            }
             for sy in sy_first..sy_end {
                 // `sy >= sy_first` makes `dy0 + sy` non-negative by construction.
                 let dy = (dy0 + sy as isize) as usize;
@@ -4335,6 +4613,7 @@ fn paint_window(
                     dst.put_pixel(cx + col * r.scale + sx, dy, px);
                 }
             }
+        }
         }
         if !dup {
             continue;
