@@ -3546,6 +3546,14 @@ const CHROME_TITLE_FG: u32 = 0x00C8_C8D8;
 const CHROME_BORDER_FOCUS: u32 = 0x008C_8CB4;
 const CHROME_TITLE_BG_FOCUS: u32 = 0x003A_3A5A;
 
+/// CLOSE-BOX (P79) — the close box's chrome colours. Red-tinted deliberately: the box is the ONE
+/// piece of chrome a click ACTS on (see [`close_box`]), and it must read as such from across the
+/// bench, so it does not share the title strip's blue family. The focused window's box brightens
+/// with the rest of its chrome so the two never disagree about who has focus; the glyph reuses
+/// [`CHROME_TITLE_FG`] so the X is exactly as legible as the title beside it.
+const CHROME_CLOSE_BG: u32 = 0x0046_262C;
+const CHROME_CLOSE_BG_FOCUS: u32 = 0x00A0_3C46;
+
 /// The outer box `(x, y, w, h)` a window occupies on the panel, chrome included. A compat window
 /// (the `present_surface` shim) has no chrome, so its outer box is exactly its content.
 /// F5 — every product and sum here saturates. The kernel builds with overflow checks off, so a
@@ -3563,6 +3571,52 @@ fn outer_box(r: &Window) -> (usize, usize, usize, usize) {
             cw.saturating_add(2 * BORDER),
             ch.saturating_add(TITLE_H + 2 * BORDER),
         )
+    }
+}
+
+/// CLOSE-BOX (P79, bench: "put a close button in the upper right of the windows to exit") — the
+/// close box's panel rect as `(x, y, side)`, or `None` for a row that has no close box.
+///
+/// ### Geometry — one function, two consumers
+/// A [`TITLE_H`]-sided square at the RIGHT end of the title strip, flush against the inner edge of
+/// the border: `x = bx + bw - BORDER - side`, `y = by + BORDER`. Derived from the outer box so the
+/// drawn box and the hit-tested box are the same rect BY CONSTRUCTION — [`paint_window`] draws this
+/// rect and [`close_box_hit`] tests it, and there is deliberately no second copy of the arithmetic
+/// for the two to disagree over.
+///
+/// ### Who gets one
+/// * **Compat rows: no.** The `present_surface` shim has no chrome at all — there is no strip to
+///   put a box in, and the full-screen app's own click-to-exit already owns its clicks.
+/// * **Owner-0 rows: no.** Kernel furniture (the CLICK-SHELL distinction: shell/desktop rows carry
+///   `owner_asid == 0`, which is also why [`hit_test`] never names them) is not an app the operator
+///   can exit; a close box on the console would be an invitation to kill the shell.
+/// * **A strip too narrow to hold the box plus one title glyph: no.** Degenerate geometry declines
+///   the control rather than drawing an unhittable sliver.
+fn close_box(r: &Window) -> Option<(usize, usize, usize)> {
+    if r.compat || r.owner_asid == 0 {
+        return None;
+    }
+    let (bx, by, bw, _bh) = outer_box(r);
+    let side = TITLE_H;
+    if bw < 2 * BORDER + 2 * side {
+        return None;
+    }
+    Some((bx + bw - BORDER - side, by + BORDER, side))
+}
+
+/// CLOSE-BOX — does panel point `(x, y)` land in window `id`'s close box? The router's second
+/// question, asked only AFTER [`hit_test`] has named `id` as the owner of the point — so this is a
+/// rect test against one row, not a scan, and the z-order question is already settled by the time
+/// it runs. `false` for a dead id and for every row [`close_box`] declines.
+pub fn close_box_hit(id: WinId, x: i32, y: i32) -> bool {
+    if x < 0 || y < 0 {
+        return false;
+    }
+    let (px, py) = (x as usize, y as usize);
+    let t = TABLE.lock();
+    match row(&t, id).and_then(close_box) {
+        Some((cx, cy, s)) => px >= cx && px < cx + s && py >= cy && py < cy + s,
+        None => false,
     }
 }
 
@@ -4108,12 +4162,41 @@ fn paint_window(
             TITLE_H,
             title_bg,
         );
+        // CLOSE-BOX — the close control, over the strip's right end. The rect comes from
+        // `close_box` (the SAME function the router hit-tests, so what is drawn is what is
+        // clickable), converted to this destination's origin exactly as the strip above was; the
+        // title's width budget below excludes it so a long title truncates BESIDE the box rather
+        // than running under it. Signed-`y` discipline matches `fill_rect_v`/`draw_title`: a
+        // chunked stage's later bands see the box above their row 0 and skip those lines.
+        let close_w = match close_box(r) {
+            Some((cbx, cby, s)) => {
+                let clx = cbx.saturating_sub(ox);
+                let cly = cby as isize - oy as isize;
+                let close_bg = if focused { CHROME_CLOSE_BG_FOCUS } else { CHROME_CLOSE_BG };
+                fill_rect_v(dst, clx, cly, s, s, close_bg);
+                // The X glyph: two 2-px diagonals, inset so the strokes never touch the box edge.
+                let g = 3;
+                let n = s.saturating_sub(2 * g);
+                for i in 0..n {
+                    let dy = cly + (g + i) as isize;
+                    if dy < 0 {
+                        continue;
+                    }
+                    dst.put_pixel(clx + g + i, dy as usize, CHROME_TITLE_FG);
+                    dst.put_pixel(clx + g + i + 1, dy as usize, CHROME_TITLE_FG);
+                    dst.put_pixel(clx + g + (n - 1 - i), dy as usize, CHROME_TITLE_FG);
+                    dst.put_pixel(clx + g + (n - 1 - i) + 1, dy as usize, CHROME_TITLE_FG);
+                }
+                s + 2
+            }
+            None => 0,
+        };
         draw_title(
             dst,
             r,
             lbx + BORDER + 2,
             lby + BORDER as isize + 2,
-            bw.saturating_sub(2 * BORDER + 4),
+            bw.saturating_sub(2 * BORDER + 4 + close_w),
         );
     }
 
@@ -5466,6 +5549,8 @@ static HT_SURF: [u32; 64] = [0x0020_C080; 64];
 ///    cost — or precede — the VUGPAUSE-2r2 restore chain. Three fields rather than one because they
 ///    fail in three different directions, and the last one is what pins the ORDER the fix depends on.
 ///    See [`clickplain_leg`].
+/// 9. **close** (CLOSE-BOX, P79) — the one ACTION click in the grammar: a press in a window's close
+///    box is consumed by the router and the row goes away. See [`closebox_leg`].
 ///
 /// Self-cleaning on the FOCUS-VIS pattern: both windows are closed, `SHELL_Z` and `FOCUS_ASID` are
 /// restored (this calls `focus_changed` with SYNTHETIC asids, which must not be left naming an address
@@ -5660,6 +5745,91 @@ fn clickplain_leg(_owner: u64, _other: u64, _surf: usize, _len: usize) -> Option
     None
 }
 
+/// CLOSE-BOX (P79) — leg 9 of [`hittest_selftest`]: **a press in a window's close box routes to
+/// CLOSE, and the row goes away.**
+///
+/// Legs 6-8 assert where an ordinary press GOES. This one asserts the single exception to
+/// CLICK-SELECT's "a click only selects" grammar: the close box is window FURNITURE, and a press
+/// that lands in it is an action — the router consumes it, closes the owner's windows, and kills
+/// the owner. The leg drives the shipped router (`wc_click_route`, real cursor position — the
+/// CLICK-PLAIN fixture discipline: move the window under the pointer, never the pointer), with the
+/// window placed so its CLOSE BOX contains the cursor rather than its content area.
+///
+/// `owner` is synthetic and outside the private-slot range, deliberately: the router's kill arm
+/// skips an ASID with no process behind it, so the leg asserts the two things the WINDOW layer owes
+/// — the press is CONSUMED (it neither selects nor reaches any ring) and the row is GONE
+/// (`info(w)` empty) — without arming a real kill on the gate. The kill half of the arm is the
+/// SKILL-1 primitive `bg`/`run` already gate elsewhere; re-proving it here would add a process
+/// launch to a window-layer witness.
+///
+/// `None` = not asserted: a compat row owns the panel, the pointer parks where the fixture cannot
+/// straddle it with a close box (too near an edge for the chrome), the table is full, or the
+/// placement lands under some other window. A release edge follows the press either way, leaving
+/// the router's mask tracker as it was found (the release follows a DROPPED press, so it is
+/// consumed too — asserting nothing, restoring everything).
+#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal"))]
+fn closebox_leg(owner: u64, surf: usize, len: usize) -> Option<bool> {
+    use crate::arch::aarch64::syscall as sc;
+    if compat_live() {
+        return None; // the deliver-as-before exemption owns the panel: not this leg's fixture
+    }
+    let (pw, ph) = {
+        let info = super::WRITER.lock().info();
+        (info.width as i32, info.height as i32)
+    };
+    let (cx, cy) = crate::pal::cursor::pos(pw, ph);
+    // Room for a whole window left/below the pointer and its chrome above it.
+    if cx < 96 || cy < 96 || cx + 96 >= pw || cy + 96 >= ph {
+        return None;
+    }
+    let w = create(owner, surf, len, 8, 8, 32, b"ht-x");
+    if w == WIN_NONE {
+        return None;
+    }
+    // Place the CONTENT origin so the close box contains the pointer. From `close_box`'s own
+    // arithmetic (BORDER=1 cancels): the box spans x in [r.x + w*scale - side, r.x + w*scale) and
+    // y in [r.y - TITLE_H, r.y - TITLE_H + side); aim the pointer at the box's centre. The scale
+    // is read back from the row `create` actually minted, not re-derived.
+    let side = TITLE_H as i32;
+    let ws = match info(w) {
+        Some(wi) => (wi.w * wi.scale) as i32,
+        None => 0,
+    };
+    let (x, y) = (cx + side / 2 - ws, cy + TITLE_H as i32 - side / 2);
+    if ws == 0 || x < 0 || y < (TITLE_H + BORDER) as i32 {
+        close(w);
+        return None;
+    }
+    move_to(w, x as usize, y as usize);
+    focus_changed(owner); // raise it above the fixture rows the earlier legs left behind
+    sc::el0_input_set_active(owner); // the closed owner also holds focus: the arm must hand it back
+    // Fixture validity: the pointer must address THIS window, in its CLOSE BOX.
+    if hit_test(cx, cy).map(|(i, a, _)| (i, a)) != Some((w, owner)) || !close_box_hit(w, cx, cy) {
+        close(w);
+        sc::el0_input_set_active(0);
+        focus_changed(0);
+        return None;
+    }
+    let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
+    let gone = info(w).is_none();
+    let refocused = sc::el0_input_active() == 0;
+    let _ = sc::wc_click_route(crate::pal::Event::Button(0));
+    // The router's close arm already dropped focus to the shell (asserted above); nothing to clean
+    // beyond making sure a FAILED close does not leak the row.
+    if !gone {
+        close(w);
+        sc::el0_input_set_active(0);
+        focus_changed(0);
+    }
+    Some(consumed && gone && refocused)
+}
+
+/// CLOSE-BOX, DORMANT half: no arch router in this build, so leg 9 asserts nothing.
+#[cfg(all(feature = "witness", not(all(target_arch = "aarch64", feature = "baremetal"))))]
+fn closebox_leg(_owner: u64, _surf: usize, _len: usize) -> Option<bool> {
+    None
+}
+
 #[cfg(feature = "witness")]
 pub fn hittest_selftest() {
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -5692,6 +5862,9 @@ pub fn hittest_selftest() {
     /// HIGHEST slot, because slots are handed out from the bottom, so it is the last one a live app
     /// would be holding — and the leg checks that it is free before borrowing it, and resets it after.
     const PLAIN_ASID: u64 = 8;
+    /// CLOSE-BOX leg 9's owner: synthetic (outside the slot range) so the router's close arm has a
+    /// window row to remove and provably no process to kill — see [`closebox_leg`].
+    const ASID_X: u64 = 0xC0D;
 
     // One origin for both (so exactly one can own the probe point), upper-middle, clear of WC-F's
     // reserved boxes at the bottom edge. `move_to` pins the rows against the tiler below.
@@ -5787,6 +5960,13 @@ pub fn hittest_selftest() {
     // held focus before the click.
     let plain: Option<(bool, bool, bool)> = clickplain_leg(PLAIN_ASID, ASID_A, s, len);
 
+    // Leg 9 — CLOSE-BOX (P79). The one action click in the grammar: a press in a window's close
+    // box is CONSUMED by the router, and the row is closed. Runs last — it is the only leg that
+    // REMOVES a row through the router — and self-cleans through the close itself (the row is the
+    // thing being asserted gone). ASID_X owns nothing but the leg's own window, so the router's
+    // kill arm is a witnessed no-op.
+    let closebox: Option<bool> = closebox_leg(ASID_X, s, len);
+
     let ok = inside_ok
         && topmost_ok
         && raise_ok
@@ -5794,7 +5974,8 @@ pub fn hittest_selftest() {
         && hidden_ok
         && shell != Some(false)
         && bare != Some(false)
-        && plain.map(|(a, b, c)| a && b && c) != Some(false);
+        && plain.map(|(a, b, c)| a && b && c) != Some(false)
+        && closebox != Some(false);
     let verdict3 = |v: Option<(bool, bool, bool)>, pick: fn((bool, bool, bool)) -> bool| match v {
         Some(t) => {
             if pick(t) {
@@ -5807,7 +5988,7 @@ pub fn hittest_selftest() {
     };
     let (mx, my) = miss_pt.unwrap_or((-1, -1));
     serial_println!(
-        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} miss=({},{}) hidden={} shell={} bare={} hit={} deliver={} wake={} -> {}",
+        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} miss=({},{}) hidden={} shell={} bare={} hit={} deliver={} wake={} close={} -> {}",
         ix, iy, inside_ok, topmost_ok, raise_ok,
         match outside_ok {
             Some(true) => "true",
@@ -5820,6 +6001,7 @@ pub fn hittest_selftest() {
         verdict3(plain, |t| t.0),
         verdict3(plain, |t| t.1),
         verdict3(plain, |t| t.2),
+        match closebox { Some(true) => "true", Some(false) => "false", None => "skip" },
         if ok { "PASS" } else { "FAIL" }
     );
 

@@ -12279,6 +12279,137 @@ const CLICK_TARGET_DROP: u64 = u64::MAX;
 /// is dropped.
 static CLICK_PRESS_TARGET: AtomicU64 = AtomicU64::new(CLICK_TARGET_DROP);
 
+/// CLOSE-BOX — rate limit for the `[clickroute] close=` event line, `[spread4] rewake`-style: name
+/// the first few closes in full, then go quiet. A close is human-rate by construction (one line per
+/// operator click on a close box), so the cap exists for the pathological case only — a stuck
+/// button over a spawner that keeps re-opening windows must not be able to flood the wire.
+const CLOSE_LOG_MAX: u32 = 16;
+static CLOSE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// CLOSE-BOX (P79) — **the close click's whole effect: the windows go, then the process goes.**
+/// Called from [`wc_click_route`]'s close arm only, with the press already consumed.
+///
+/// ### The order
+/// 1. **Windows first** — `wm::close_owner` removes EVERY row the owner holds (the vug parent's
+///    window and any workers' windows are one owner), erases and re-tiles, so the operator's click
+///    is answered on the panel immediately rather than after a kill settles. Idempotent against the
+///    teardown's own `close_owner` (which will find zero rows).
+/// 2. **Focus next** — if the closed owner held focus (either half), it is handed to the SHELL
+///    through the one focus primitive, in the canonical order (`el0_input_set_active(0)` then
+///    `wm::focus_changed(0)`) — the same state a TAB-to-shell or a desktop-miss click leaves.
+///    Without this the keyboard would keep addressing a process that is about to be dead.
+/// 3. **Kill last** — the SKILL-1 primitive, ASID-SCOPED (`sched::kill(pid, owner)`), so the vug
+///    parent and every worker thread under the slot die together; `kill` itself evicts targets
+///    parked in kernel waits (`futex_wake_killed` scans all buckets, `kill_wake_parked_semaphores`
+///    the semaphores), which is what reaches a fleet idled in `SYS_INPUT_WAIT`.
+///
+/// ### The Proc row is SETTLED, never reaped, and that is the safety argument
+/// This runs from the input-pump/shell task, racing whichever launcher owns the row (`bg`'s poll,
+/// or a FOREGROUND `run_user_image` blocked in its wait loop). Reaping here (the `bg_kill` shape)
+/// would free a row a foreground launcher still watches — the exact double-reap hazard `bg_kill`'s
+/// LENS MUST-FIX note documents. So on a CONFIRMED kill the row is settled the way a FAULT-kill
+/// settles it (`record_el0_kill`'s live-child arm): status `EXEC_KILLED_STATUS`, then a CAS
+/// `PRUNNING -> PEXITED`, then ONE `done` post — the CAS makes the post single-shot against a
+/// concurrent fault-kill of the same task. Both launchers already converge on that state: the
+/// foreground wait wakes promptly and reaps through its normal exit path; a `bg` row reads
+/// `killed` in `jobs` and is reaped there. An UNCONFIRMED kill detaches and touches the row not at
+/// all — the request stays armed, the target dies at its next boundary, and the row's owner keeps
+/// every invariant it had (no orphaning here for the same double-owner reason).
+///
+/// Owners outside the private-slot range (kernel witness fixtures) and ASIDs with no live Proc row
+/// skip the kill: there is no process to kill, and the window close is the whole of the effect.
+fn wc_close_click(owner: u64) {
+    let closed = crate::video::wm::close_owner(owner);
+    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == owner {
+        el0_input_set_active(0);
+    }
+    if crate::video::wm::focus_asid() == owner {
+        crate::video::wm::focus_changed(0);
+    }
+    if owner == 0 || owner as usize > super::boot::USER_SLOTS {
+        return; // synthetic owner: no process behind it, the row close was the whole effect
+    }
+    // The live Proc row for this ASID, if any. `pid == 0` (mid-publish) is skipped — a kill needs
+    // a tid to name, and the publish window is microseconds wide; the operator's next click lands
+    // after it.
+    let mut target: Option<(usize, u64)> = None;
+    for pi in 0..MAX_PROCS {
+        if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING
+            && PROCS[pi].asid.load(Ordering::Acquire) == owner
+        {
+            let pid = PROCS[pi].pid.load(Ordering::Acquire);
+            if pid != 0 {
+                target = Some((pi, pid));
+            }
+            break;
+        }
+    }
+    let Some((pi, pid)) = target else {
+        serial_println!(
+            "[skill] close-box asid={} closed={} window(s), no live process — nothing to kill",
+            owner, closed
+        );
+        return;
+    };
+    let Some(ticket) = super::sched::kill(pid, owner) else {
+        if !KILL_EXHAUSTED.swap(true, Ordering::AcqRel) {
+            serial_println!(
+                "[skill] slot table EXHAUSTED — close-box kill for asid={} not armed",
+                owner
+            );
+        }
+        return;
+    };
+    // Bounded cooperative confirm wait — the SKILL-1 shape. Short in practice: the arm's own
+    // `kill_wake_parked` has already evicted a parked fleet, so the boundary is one dispatch away.
+    let t0 = super::timer::cntpct();
+    let budget = super::timer::cntfrq().saturating_mul(KILL_CONFIRM_SECS);
+    let mut ok = false;
+    let mut already_dead = false;
+    loop {
+        if super::sched::kill_confirmed(&ticket) {
+            ok = true;
+            break;
+        }
+        if PROCS[pi].state.load(Ordering::Acquire) == PEXITED
+            && super::sched::asid_live_threads(owner) == 0
+        {
+            already_dead = true;
+            break;
+        }
+        if super::timer::cntpct().wrapping_sub(t0) >= budget {
+            break;
+        }
+        super::sched::yield_now();
+    }
+    if ok {
+        super::sched::kill_release(ticket);
+        // Settle (never reap) the row — see the doc block. Status BEFORE the state flip, so a
+        // watcher that wakes on PEXITED always reads the kill sentinel, exactly as
+        // `record_el0_kill` orders its stores.
+        PROCS[pi].status.store(EXEC_KILLED_STATUS, Ordering::Release);
+        if PROCS[pi]
+            .state
+            .compare_exchange(PRUNNING, PEXITED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            PROCS[pi].done.post();
+        }
+        serial_println!(
+            "[skill] close-box killed pid={} asid={} confirmed=1 ({} window(s) closed)",
+            pid, owner, closed
+        );
+    } else if already_dead {
+        super::sched::kill_retract(ticket);
+    } else {
+        super::sched::kill_detach(ticket);
+        serial_println!(
+            "[skill] close-box kill pid={} asid={} confirmed=0 — request stays armed, target dies at its next boundary",
+            pid, owner
+        );
+    }
+}
+
 /// CLICK-ROUTE: the current pointer position in PANEL pixels — the point a click is addressed to.
 /// Reads the shared cursor state every other pointer consumer reads (`pal::cursor`, the same state
 /// `click1_dispatch` hit-tests and the compositor draws), clamped by the live panel geometry.
@@ -12432,6 +12563,24 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
         // PRESS edge.
         let (x, y) = click_pointer_pos();
         match crate::video::wm::hit_test(x, y) {
+            // CLOSE-BOX (P79) — checked FIRST, so the close box beats select. This is the ONE
+            // point in the click grammar where a click ACTS: the box is explicit window FURNITURE
+            // (kernel chrome, drawn from the same `close_box` rect this tests), so clicking it is
+            // an instruction to the WINDOW SYSTEM, not input to the app — which is exactly why it
+            // does not go through the app's ring and does not disturb CLICK-SELECT for any other
+            // target. The press is CONSUMED (target DROP, so the release is dropped with it): the
+            // owner it would have been delivered to is being torn down.
+            Some((win, owner, _z)) if crate::video::wm::close_box_hit(win, x, y) => {
+                if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX {
+                    serial_println!(
+                        "[clickroute] close=win{} asid={} at ({},{})",
+                        win, owner, x, y
+                    );
+                }
+                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                wc_close_click(owner);
+                true
+            }
             Some((win, owner, _z)) if owner != cur => {
                 // The ONLY line this arc adds to serial, and only on the arm that changes behaviour:
                 // a click that MOVED focus. Human-rate by construction (one line per click that lands

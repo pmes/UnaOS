@@ -5387,3 +5387,92 @@ Three of the four changes are in shared files and the pi seat should lift them:
 
 `pal::TargetPal::render` (change 1) is x86-only in effect: the bracket it removes was
 `cfg(target_arch = "x86_64")`, so aarch64 is byte-inert there.
+
+## CLOSE-BOX — the close button, and the single action-click exception (2026-07-29)
+
+P79, bench sitting, Peter's direct request: *"put a close button in the upper right of the windows
+to exit."* Landed on the pi track as `video/wm: CLOSE-BOX`.
+
+### Geometry
+
+Every decorated (non-compat) app window's title strip now ends in a **close box**: a
+`TITLE_H`-sided square (12 px at 1x) flush against the inner edge of the border at the strip's
+RIGHT end — `x = bx + bw - BORDER - side`, `y = by + BORDER` in outer-box coordinates. The box is
+filled in a red-tinted chrome colour (`CHROME_CLOSE_BG`, brightening to `CHROME_CLOSE_BG_FOCUS`
+with the rest of the focused window's chrome) with a 2-px X glyph in the title foreground colour.
+The title's width budget excludes the box, so a long title truncates beside it rather than running
+under it.
+
+One function, `wm::close_box(r)`, is the single source of the rect: `paint_window` draws it and
+`wm::close_box_hit(id, x, y)` (the router's test) checks it, so the drawn box and the clickable box
+are the same rect by construction. Rows that decline the box: **compat** (no chrome at all — the
+full-screen shim's own click-to-exit owns its clicks), **owner-0** (kernel furniture, the same
+CLICK-SHELL distinction that keeps `hit_test` from ever naming the console/desktop — a close box on
+shell furniture would be an invitation to kill the shell), and a strip too narrow to hold the box
+plus one title glyph.
+
+### Routing precedence — close beats select
+
+In `wc_click_route`'s PRESS arm the close-box guard is tested FIRST, on the window `hit_test` has
+already named for the point: a press in that window's close box takes the CLOSE arm, and only a
+press elsewhere in the window falls through to the ordinary select/deliver arms. The press is
+CONSUMED (`CLICK_TARGET_DROP`, so the release is dropped with it) — it is not delivered to the app,
+because the app it would address is being torn down.
+
+### Why this is the ONE action click, and why it does not breach CLICK-SELECT
+
+CLICK-SELECT (P77) is Peter's grammar and it is FINAL: a click on a window only SELECTS (focus +
+the cyan `clicks=N` ack); SPACE stops/starts; focus never stops or starts anything. The close box
+does not amend that rule, because the box is not the app's surface — it is **window furniture**,
+kernel chrome drawn and hit-tested by the window system itself. A click there is an instruction TO
+THE WINDOW SYSTEM ("this window goes away"), not input to the app, which is why it takes effect at
+the router and never enters the app's ring. Every other pixel of the window, title strip included,
+keeps the select-only grammar unchanged.
+
+### Close semantics
+
+The CLOSE arm (`wc_close_click`), in order:
+
+1. **Windows first** — `wm::close_owner(owner)` removes every row the owner holds (a vug parent
+   and its workers are one owner), so the click is answered on the panel immediately.
+2. **Focus** — if the closed owner held either half of focus, it is handed to the SHELL through the
+   one focus primitive (`el0_input_set_active(0)` then `focus_changed(0)`), the same state a
+   TAB-to-shell leaves.
+3. **Kill** — the SKILL-1 primitive, ASID-scoped (`sched::kill(pid, owner)`), so every sibling
+   thread dies with the parent; `kill` evicts targets parked in kernel waits (`futex_wake_killed`
+   scans all buckets), which is what reaches a fleet idled in `SYS_INPUT_WAIT`. On a CONFIRMED kill
+   the Proc row is **settled, never reaped** — status `EXEC_KILLED_STATUS`, a CAS
+   `PRUNNING -> PEXITED`, one `done` post, exactly the fault-kill shape — because this path races
+   whichever launcher owns the row (`bg`'s poll or a foreground `run_user_image` blocked in its
+   wait loop), and reaping here would re-open the double-reap hazard `bg_kill`'s LENS note
+   documents. Both launchers converge on the settled row through their existing exit paths. An
+   UNCONFIRMED kill detaches (stays armed; the target dies at its next boundary) and leaves the row
+   alone. Owners outside the slot range (witness fixtures) skip the kill — the row close is the
+   whole effect.
+
+### Witness
+
+* `[clickroute] close=win<id> asid=<owner> at (x,y)` — one line per close click, rate-limited
+  `[spread4] rewake`-style (first 16 named, then quiet) so a stuck button over a re-spawning owner
+  cannot flood the wire.
+* `[skill] close-box ...` — the kill's disposition (confirmed / stays-armed / nothing-to-kill).
+* **Leg 9** of `hittest_selftest` (`close=` field in the `[clickroute] hit-test` line): a probe
+  window is placed so its CLOSE BOX contains the real cursor (the CLICK-PLAIN fixture discipline —
+  move the window, never the pointer), one press is driven through the shipped router, and the leg
+  asserts the press was CONSUMED, the row is GONE (`info(w)` empty), and focus fell to the shell.
+  The owner is synthetic and outside the slot range, deliberately: the kill arm provably no-ops, so
+  the leg is a window-layer witness and the kill half stays gated where SKILL-1 already gates it.
+  Pinned in `scripts/specs/pi4-regression.spec` (`REQUIRE ... close=true -> PASS`), which also pins
+  legs 1–8 via the line's tail verdict.
+
+### Gate results (CLOSE-BOX, 2026-07-29, QEMU raspi4b)
+
+* `./arroyo check` — both arches green.
+* `./arroyo kernel8-test` — MBENCH PASS 87/87 (was 86; the new directive is the leg-9 pin), with
+  `[clickroute] close=win3 asid=3085 at (320,240)` and
+  `[clickroute] hit-test ... close=true -> PASS` on the wire.
+* `./arroyo test-arm` — MISSION SUCCESS (leg 9 DORMANT there: no arch router on the hosted build,
+  `close=skip`).
+
+Hardware verification (the bench click on a storm vug's close box: window gone, `[skill]
+close-box killed ... confirmed=1`, fleet count down by one) is owed at the next attended sitting.

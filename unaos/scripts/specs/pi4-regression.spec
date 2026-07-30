@@ -857,3 +857,12 @@ FORBID BGSPREAD: .*-> FAIL
 # There is deliberately no `cores 1` tripwire: `nh == 0` exits to the serial path before any rollup,
 # so nbands is always >= 2 and such a line cannot print.
 FORBID \[spread2\] .* ratio ([5-9][0-9]{2}|[0-9]{4,})
+
+# CLOSE-BOX — the close button (P79: "put a close button in the upper right of the windows to
+# exit"), and the ONE action click in the CLICK-SELECT grammar: a press in a window's close box is
+# consumed by the router, closes the owner's windows, and kills the owner. Leg 9 of the hit-test
+# witness drives the shipped router with a probe window's close box placed under the real cursor;
+# `close=true` is the row provably going away through a routed press. The line is the whole
+# CLICK-ROUTE suite's verdict, so pinning it here also pins legs 1-8 (`-> PASS` at the tail).
+# See docs/dev/OS/08_VIDEO/engine.md CLOSE-BOX.
+REQUIRE \[clickroute\] hit-test at .*close=true -> PASS
