@@ -755,6 +755,11 @@ static BOT_FAULT_CC_FIRED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "botfaultinject")]
 static BOT_FAULT_CC_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// GUARD-STATE: one-shot latch for `bot_deqprobe`, the per-boot experiment that records whether THIS
+/// platform's Output Endpoint Context TR Dequeue Pointer is live under a Running endpoint or frozen
+/// at its birth value. Set before the probe runs, so a failure inside it cannot make it run twice.
+static BOT_DEQPROBE_DONE: AtomicBool = AtomicBool::new(false);
+
 /// PIUSB-39 witness counters. `MOUSE_REARM_COUNT` = every `queue_mouse_read` the transfer
 /// dispatch issued; `MOUSE_DISCARD_REARM_COUNT` = completions the dup-Success guard threw away
 /// but which STILL re-armed the interrupt-IN read (the pipeline-preserving exit the P54b metal
@@ -4506,7 +4511,17 @@ impl XhciController {
                 self.bot_rescue_clear(slot_id);
                 return self.bot_check_condition(slot_id, cdb, data_phys, data_len, dir, r);
             }
-            Ok(r) => { self.bot_rescue_clear(slot_id); return Ok(r); }
+            Ok(r) => {
+                self.bot_rescue_clear(slot_id);
+                // GUARD-STATE: the once-per-boot deqprobe. Here and nowhere else — a transaction
+                // that just succeeded on its FIRST attempt, so both rings are idle, nothing is in
+                // flight, and this is not a recovery or sense path. Self-latching and a no-op after
+                // the first call.
+                if !BOT_SENSE_ACTIVE.load(Ordering::Relaxed) {
+                    self.bot_deqprobe(slot_id);
+                }
+                return Ok(r);
+            }
             Err(BotError::NoDevice) => return Err(BotError::NoDevice),
             Err(e) => e,
         };
@@ -4741,6 +4756,90 @@ impl XhciController {
             r.enqueue_index(), if r.cycle_bit() { 1 } else { 0 }, r.num_trbs(),
             deq, deq & 1);
         Err(BotError::RingFull)
+    }
+
+    /// GUARD-STATE witness: the once-per-boot **deqprobe** — the experiment that turns "the TR
+    /// Dequeue Pointer field is stale under a Running endpoint" from an inference about one metal
+    /// capture into a fact every capture records, on whatever silicon it ran.
+    ///
+    /// Implementation choice: this is the ACTIVE form of the probe (rather than piggy-backing on the
+    /// recovery ladder's own Stop Endpoint), because the piggy-back only ever prints during a real
+    /// recovery — which never happens in QEMU and, after the guard fix, should never happen on a
+    /// healthy metal boot either. The whole point is that the line appears on EVERY boot, so the
+    /// platform difference is a recorded fact and not a thing to be re-derived.
+    ///
+    /// What it does, on the bulk IN endpoint, exactly once, and only from a healthy idle state:
+    ///   1. read EP State and the context TR Dequeue Pointer while the endpoint is RUNNING;
+    ///   2. **Stop Endpoint** (xHCI 1.2 §4.6.9) — the transition that obliges the controller to write
+    ///      its real dequeue position back into the context (§4.8.3);
+    ///   3. read both fields again, now from Stopped;
+    ///   4. **Set TR Dequeue Pointer** back to the exact value just read (a semantic no-op: it puts
+    ///      the controller where it already is, reserved bits 3:1 cleared, Dequeue Cycle State kept)
+    ///      and ring the doorbell to return the endpoint to Running.
+    ///
+    /// Safety: it is called only from the plain-success return of `bot_transfer`, i.e. after a whole
+    /// CBW -> data -> CSW transaction retired, with both rings idle, no TD in flight, no sense
+    /// handler active and no escalation streak open. It never runs during recovery, and the latch is
+    /// taken BEFORE any command so a fault inside it cannot repeat. If Stop Endpoint fails the
+    /// endpoint is untouched and the probe stops there — it never leaves an endpoint parked.
+    ///
+    /// Reading the line: `running_ctxdeq == stopped_ctxdeq` while `enq` has moved is the frozen
+    /// birth value (Intel Panther Point). `running_ctxdeq` tracking `enq` is a live field (QEMU).
+    fn bot_deqprobe(&mut self, slot_id: u8) {
+        if slot_id == 0 || BOT_DEQPROBE_DONE.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let (in_addr, enq) = {
+            let s = &self.slots[slot_id as usize];
+            match (s.bulk_in_ep, s.bulk_in_ring.as_ref()) {
+                (0, _) | (_, None) => return,
+                (a, Some(r)) => (a, r.enqueue_index()),
+            }
+        };
+        let dci = ((in_addr & 0x0F) * 2) + 1;
+        let running_state = self.ep_state_of(slot_id, dci);
+        if running_state != 1 {
+            // Not Running: there is no "before" half of the experiment to take. Leave the latch set —
+            // the probe is a one-shot by design, and a slot that is not Running right after a
+            // successful transaction is itself outside what this witness can speak to.
+            serial_println!(
+                ":: BOT: deqprobe slot={} dci={} skipped epstate={} why=not-running ::",
+                slot_id, dci, running_state);
+            return;
+        }
+        let running_deq = self.ep_ctx_deq(slot_id, dci);
+
+        let ctx = ((dci as u32) << 16) | ((slot_id as u32) << 24);
+        // Stop Endpoint (TRB type 15).
+        let (stop_ok, stop_cc, stop_why) =
+            self.recover_cmd(Trb { parameter: 0, status: 0, control: (15 << 10) | ctx });
+        let stopped_state = self.ep_state_of(slot_id, dci);
+        let stopped_deq = self.ep_ctx_deq(slot_id, dci);
+
+        let mut restore_ok = false;
+        if stop_ok {
+            // Set TR Dequeue Pointer (TRB type 16) back to exactly where the controller says it is.
+            let want = stopped_deq & !0xEu64; // keep the address and the Dequeue Cycle State, drop RsvdZ
+            let (ok, _, _) =
+                self.recover_cmd(Trb { parameter: want, status: 0, control: (16 << 10) | ctx });
+            restore_ok = ok;
+            // Doorbell the endpoint: Stopped -> Running. Rung whether or not set-deq succeeded, so a
+            // refused no-op cannot be what leaves the endpoint parked.
+            self.ring_doorbell(slot_id, dci as u32);
+        }
+        let after_state = self.ep_state_of(slot_id, dci);
+        serial_println!(
+            ":: BOT: deqprobe slot={} dci={} enq={} running_epstate={} running_ctxdeq={:#x} -> stopped_epstate={} stopped_ctxdeq={:#x} stop_ok={} stop_cc={} stop_why={} restore_ok={} epstate_after={} verdict={} ::",
+            slot_id, dci, enq, running_state, running_deq, stopped_state, stopped_deq,
+            if stop_ok { "yes" } else { "no" }, stop_cc, stop_why,
+            if restore_ok { "yes" } else { "no" }, after_state,
+            if !stop_ok {
+                "inconclusive (stop-ep failed)"
+            } else if running_deq == stopped_deq {
+                "ctxdeq-live (field unchanged across the stop; either already current or not written back)"
+            } else {
+                "ctxdeq-stale-under-running (the running read was a birth value; only the stopped read is a position)"
+            });
     }
 
     /// BOTEV: run ONE recovery-stage xHCI command and render its outcome for a witness:
@@ -6121,12 +6220,20 @@ impl XhciController {
     ///
     /// * `TIMEOUT-PIPES` (witness 1) — for BOTH bulk DCIs: the endpoint's EP State, the
     ///   controller's own TR Dequeue Pointer with its Dequeue Cycle State, and OUR enqueue index and
-    ///   cycle bit. This is THE discriminator the 2026-07-29 capture lacked. If `ctxdeq` has NOT
-    ///   reached the TRB we were waiting on (the controller is behind our enqueue), the controller
-    ///   never fetched the work — a host/endpoint fault. If `ctxdeq` HAS passed it and `dcs` agrees
-    ///   with our `cycle`, the controller fetched everything and issued it: the DEVICE is silent,
-    ///   and no amount of host-side ring surgery can help. The audit reached that second conclusion
-    ///   by hand, off `set-deq` being a provable no-op; this prints it.
+    ///   cycle bit. This is THE discriminator the 2026-07-29 capture lacked.
+    ///
+    ///   GUARD-STATE — read `epstate` BEFORE `ctxdeq`, always. The TR Dequeue Pointer field is only
+    ///   written back by the controller on a Running -> Stopped/Halted transition (xHCI 1.0 §4.8.3,
+    ///   §6.2.3). Under `epstate=1` (Running) it is the BIRTH value from Configure Endpoint or the
+    ///   last Set TR Dequeue and carries no information about progress — the line tags it
+    ///   `(stale: EP running)` for exactly that reason, and no verdict may be drawn from it. Only a
+    ///   Stopped(3)/Halted(2) read is a live position, and only then does the following apply: if
+    ///   `ctxdeq` has NOT reached the TRB we were waiting on, the controller never fetched the work —
+    ///   a host/endpoint fault; if `ctxdeq` HAS passed it and `dcs` agrees with our `cycle`, the
+    ///   controller fetched everything and issued it, the DEVICE is silent, and no amount of
+    ///   host-side ring surgery can help. The audit reached that second conclusion by hand, off
+    ///   `set-deq` being a provable no-op; this prints it. See `bot_deqprobe` for the per-boot proof
+    ///   of the stale-field behaviour on the running platform.
     /// * `foreign=` on the same line (witness 4) — Transfer Events for OTHER slots during this
     ///   wait. Non-zero proves the event ring and interrupter stayed alive for other traffic, so a
     ///   missing completion is this slot's problem, not a global wedge. Carried here rather than on
@@ -6157,11 +6264,18 @@ impl XhciController {
         let (out_enq, out_cyc, out_n) = ring_of(false);
         let in_deq = self.ep_ctx_deq(slot_id, p.in_dci);
         let out_deq = self.ep_ctx_deq(slot_id, p.out_dci);
+        let in_state = self.ep_state_of(slot_id, p.in_dci);
+        let out_state = self.ep_state_of(slot_id, p.out_dci);
+        // GUARD-STATE: the TR Dequeue Pointer field is only written back on Running -> Stopped/Halted
+        // (xHCI 1.0 §4.8.3, §6.2.3). Under a Running endpoint it is the birth value from Configure
+        // Endpoint / the last Set TR Dequeue, not a position — tag it so this line can never again be
+        // read as "the controller is behind our enqueue" when it says nothing of the kind.
+        let stale = |st: u8| if st == 1 { " (stale: EP running)" } else { "" };
         serial_println!(
-            ":: BOT: timeout pipes slot={} in_dci={} in_epstate={} in_ctxdeq={:#x} in_dcs={} in_enq={} in_cycle={} in_ntrb={} out_dci={} out_epstate={} out_ctxdeq={:#x} out_dcs={} out_enq={} out_cycle={} out_ntrb={} foreign={} result=TIMEOUT-PIPES ::",
+            ":: BOT: timeout pipes slot={} in_dci={} in_epstate={} in_ctxdeq={:#x}{} in_dcs={} in_enq={} in_cycle={} in_ntrb={} out_dci={} out_epstate={} out_ctxdeq={:#x}{} out_dcs={} out_enq={} out_cycle={} out_ntrb={} foreign={} result=TIMEOUT-PIPES ::",
             slot_id,
-            p.in_dci, self.ep_state_of(slot_id, p.in_dci), in_deq & !0xFu64, in_deq & 1, in_enq, in_cyc, in_n,
-            p.out_dci, self.ep_state_of(slot_id, p.out_dci), out_deq & !0xFu64, out_deq & 1, out_enq, out_cyc, out_n,
+            p.in_dci, in_state, in_deq & !0xFu64, stale(in_state), in_deq & 1, in_enq, in_cyc, in_n,
+            p.out_dci, out_state, out_deq & !0xFu64, stale(out_state), out_deq & 1, out_enq, out_cyc, out_n,
             foreign);
 
         // Witness 2: the awaited TRB, read back from DRAM. Rings are identity-mapped, so the
