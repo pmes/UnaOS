@@ -3100,9 +3100,18 @@ fn input_service(_: usize) {
 /// redundantly pokes an empty FIFO (cheap). Never returns.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn rx_backstop(_: usize) {
+    // SPIN-4: phase markers — every prior theory about WHERE this task stalls (semaphore lock,
+    // run-queue lock, LL/SC false sharing) died with clean witnesses while the stall persisted.
+    // The task now states its own position: [spin1] prints phase+loops, so the stalled call names
+    // itself. 1 = about to sleep, 2 = returned from sleep / entering post.
+    use unaos_kernel::arch::sched::{RX_BS_LOOPS, RX_BS_PHASE};
+    use core::sync::atomic::Ordering;
     loop {
+        RX_BS_PHASE.store(1, Ordering::Relaxed);
         unaos_kernel::arch::sched::sleep_ticks(50); // ~200 ms at the 250 Hz per-core tick
+        RX_BS_PHASE.store(2, Ordering::Relaxed);
         unaos_kernel::arch::serial::RX_READY.post();
+        RX_BS_LOOPS.fetch_add(1, Ordering::Relaxed);
     }
 }
 

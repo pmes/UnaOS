@@ -3985,6 +3985,11 @@ unsafe impl Sync for Semaphore {}
 /// not nest under a stalled acquisition).
 static SEM_STALL_EPISODES: AtomicU64 = AtomicU64::new(0);
 static SEM_SPIN_MAX: AtomicU64 = AtomicU64::new(0);
+/// SPIN-4 — rx-backstop's self-reported position (1 = about to sleep, 2 = in post) + loop count.
+/// Written by the task itself (main.rs), read by [spin1]. A frozen loops counter beside phase=1 says
+/// "stuck in sleep_ticks / never rewoken-but-shown-running"; phase=2 says "stuck inside post".
+pub static RX_BS_PHASE: AtomicU8 = AtomicU8::new(0);
+pub static RX_BS_LOOPS: AtomicU64 = AtomicU64::new(0);
 const SEM_STALL_SPINS: u64 = 50_000_000; // ~seconds at spin_loop speed — far past any honest hold
 
 impl Semaphore {
@@ -5639,12 +5644,14 @@ fn pulse5_witness() {
                     { (false, 0i64, 0usize) }
                 };
                 serial_println!(
-                    "[spin1] cpu={} span={}ms task={}:{} state={} park={} | rx_ready locked={} count={} waiters={} | sem_stalls={} sem_spin_max={} — one task has owned this core the whole span; the [prio]/[comp2] lines beside this name the starvation",
+                    "[spin1] cpu={} span={}ms task={}:{} state={} park={} | rx_ready locked={} count={} waiters={} | sem_stalls={} sem_spin_max={} | bs_phase={} bs_loops={} — one task has owned this core the whole span; the [prio]/[comp2] lines beside this name the starvation",
                     cpu, cyc_to_ms(ACCT[cpu].live_span_cyc()), id, name, st,
                     SCHED[cpu].park_kind.load(Ordering::Relaxed),
                     rxl as u32, rxc, rxw,
                     SEM_STALL_EPISODES.load(Ordering::Relaxed),
-                    SEM_SPIN_MAX.load(Ordering::Relaxed)
+                    SEM_SPIN_MAX.load(Ordering::Relaxed),
+                    RX_BS_PHASE.load(Ordering::Relaxed),
+                    RX_BS_LOOPS.load(Ordering::Relaxed)
                 );
             }
         }
