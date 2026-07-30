@@ -2970,9 +2970,26 @@ fn cursor12_rollup(scope: &str) {
     } else {
         "mixed"
     };
+    // CURSOR-16 (GR9 lift, 2026-07-30): the block states its own ADMISSIBILITY instead of leaving
+    // it to a doc. GR9's x86 `passes=0` read as a compose-through defect for two rounds when it was
+    // a SCENE fact: their presenter owns the panel with zero compositor windows, so `composite()`
+    // is never entered and no offer site exists. `adm=` names which scene this block measured:
+    //   empty    — composite() has never run this boot (no window layer; offers CANNOT exist)
+    //   idle     — composite() has run before but not in this window (no damage; zeros are idle)
+    //   baseline — first block, whole-boot totals (passes==cum)
+    //   window   — live window-scene sample (the only adm under which `-> none/nosprite` indicts)
+    let adm = if cum == 0 {
+        "empty"
+    } else if passes == 0 {
+        "idle"
+    } else if passes == cum {
+        "baseline"
+    } else {
+        "window"
+    };
     serial_println!(
-        "[cursor12] offer scope={} passes={} nosprite={} nohit={} reserved={} nosession={} planned={} excl_probe={} excl_unverified={} cum={} -> {}",
-        scope, passes, nosprite, nohit, reserved, nosession, planned, probe, unver, cum, why
+        "[cursor12] offer scope={} adm={} passes={} nosprite={} nohit={} reserved={} nosession={} planned={} excl_probe={} excl_unverified={} cum={} -> {}",
+        scope, adm, passes, nosprite, nohit, reserved, nosession, planned, probe, unver, cum, why
     );
 }
 
