@@ -2303,7 +2303,14 @@ pub fn read_blocks_512(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, 
 
         match read_blocks_pio_on(card, at, this, dst) {
             Ok(_) => {
-                if card.adma != Adma2State::Ready {
+                // Only the FALLBACK case earns a line. `Faulted` means ADMA2 ran and broke on this
+                // boot, so every PIO chunk after it is the visible consequence of a failure that is
+                // already on the wire — that pairing is the point of the loud-fallback policy.
+                // `Unavailable` is not a fallback: the engine never existed, its one-time reason
+                // was named at bring-up, and a per-chunk line there would put ~32 lines per MiB into
+                // the FTDI ring (64 KiB, drop-oldest) on any controller without ADMA2 — evicting the
+                // bring-up evidence to announce, repeatedly, that nothing went wrong.
+                if matches!(card.adma, Adma2State::Faulted(_)) {
                     serial_println!("[sdhc-mb] pio lba={} blocks={} ok ({})", at, this, card.adma.reason());
                 }
                 done += this as usize;
