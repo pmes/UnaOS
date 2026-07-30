@@ -3332,11 +3332,68 @@ pub fn ipi_preempt() {
     }
 }
 
+// --- SPIN-8 — the wedged core's position inside the scheduler loop itself. ---
+//
+// PA1 killed the last hypothesis that had a name. SPIN-7's per-core IRQ accounting read
+// `total=5448 last=30 unhandled=0` FROZEN across the whole 38 s stall: c3 is not being EATEN by
+// interrupts, it is taking NONE — not even its own timer. Beside SPIN-6 (saved SP valid), SPIN-5
+// (dispatch heartbeat frozen, so the core's scheduler genuinely never runs again) and clean
+// witnesses on every lock that has one, exactly one region survives: the core is spinning inside
+// `run()`'s IRQ-MASKED span. That span is short and enumerable, and a FROZEN phase beside a FROZEN
+// pass counter names which statement of it — with no FIQ, no GIC reconfiguration, and no cost past
+// one relaxed store to a private cache line per step.
+//
+// The unmasked phases (8/9/10) are excluded A PRIORI by the frozen IRQ total — a core parked there
+// would still take its timer tick. Reading one of them on the wedged core would therefore be a
+// finding in its own right: the mask discipline is not what this comment believes.
+const SPIN8_LOOP_TOP: u64 = 1; // loop top, IRQ still as the previous pass left it
+const SPIN8_DRAIN: u64 = 2; // drain_due_sleepers        (masked)
+const SPIN8_BACKSTOP: u64 = 3; // input_wait_backstop -> futex_wake (masked)
+const SPIN8_DISPATCH: u64 = 4; // dispatch_next entered     (masked)
+const SPIN8_RQ: u64 = 5; // dispatch_next: aging + pop under the run-queue lock (masked)
+const SPIN8_TASK: u64 = 6; // switched INTO a task — the normal reading for a busy core
+const SPIN8_EMPTY: u64 = 7; // dispatch_next: empty queue, unmasked, returning false
+const SPIN8_STEAL: u64 = 8; // try_steal                 (UNMASKED)
+const SPIN8_IDLE: u64 = 9; // hlt / WFI                 (UNMASKED)
+const SPIN8_ACCT: u64 = 10; // pass accounting           (UNMASKED)
+
+#[repr(align(64))]
+struct PaddedU64(AtomicU64);
+
+/// SPIN-8 — where each core is in its scheduler loop right now. Own cache line per core (SPIN-3's
+/// lesson: an A72 LL/SC reservation broken by a neighbour's store to the same line retries forever).
+static SCHED_PHASE: [PaddedU64; NUM_CPUS] = [const { PaddedU64(AtomicU64::new(0)) }; NUM_CPUS];
+
+/// SPIN-8 — completed passes of `run()`'s loop on each core. The discriminator: a phase alone could
+/// be a snapshot of a healthy core moving fast, but a phase that does not change WHILE THIS DOES NOT
+/// EITHER, across consecutive `[spin1]` prints seconds apart, is a core standing still.
+static SCHED_PASSES: [PaddedU64; NUM_CPUS] = [const { PaddedU64(AtomicU64::new(0)) }; NUM_CPUS];
+
+#[inline]
+fn spin8(cpu: usize, phase: u64) {
+    if cpu < NUM_CPUS {
+        SCHED_PHASE[cpu].0.store(phase, Ordering::Relaxed);
+    }
+}
+
+/// SPIN-8 — `(phase, passes)` for the `[spin1]` witness. Read from another core; both are relaxed
+/// single-writer words, so a torn pair is impossible and a stale pair is harmless.
+fn spin8_state(cpu: usize) -> (u64, u64) {
+    if cpu >= NUM_CPUS {
+        return (0, 0);
+    }
+    (
+        SCHED_PHASE[cpu].0.load(Ordering::Relaxed),
+        SCHED_PASSES[cpu].0.load(Ordering::Relaxed),
+    )
+}
+
 /// Dispatch the front task of `cpu`'s queue: switch into it, and when it switches back (yield /
 /// preempt / exit) requeue it (READY) or free it (FINISHED). Returns whether a task ran. The caller
 /// runs on this CPU's scheduler stack. IRQ is masked across pop+switch (nothing may re-enter the
 /// scheduler on its own stack); on an empty queue IRQ is left UNMASKED for the caller to idle.
 fn dispatch_next(cpu: usize) -> bool {
+    spin8(cpu, SPIN8_DISPATCH);
     mask_irq();
     // SCHED-7: start each pass with no busy span recorded; the busy branch below overwrites this with
     // the task's measured execution span. An empty pass leaves it 0, so `run()` folds the whole pass
@@ -3347,6 +3404,7 @@ fn dispatch_next(cpu: usize) -> bool {
     // pop so a long-waiting task cannot be dispatched before it is aged in the same pass. The sweep
     // and pop share the lock; `age` carries surplus credit past `AGE_TICKS`, so a coarse cadence loses
     // nothing. Owning-CPU-only counters (Relaxed). See `AGE_TICKS` for why the clock is passes, not ticks.
+    spin8(cpu, SPIN8_RQ);
     let next = {
         let mut q = rq(cpu);
         let passes = SCHED[cpu].age_passes.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3368,6 +3426,7 @@ fn dispatch_next(cpu: usize) -> bool {
         // SCHED-5: idle TIME is measured at the WFI in `run()` (the span the core actually sleeps), not
         // here — this empty pass itself takes negligible time and returns straight to the idle loop.
         unmask_irq();
+        spin8(cpu, SPIN8_EMPTY);
         return false;
     };
     // SKILL-1 OFF-CPU kill boundary. A killed task is retired HERE — after the pop (so it is off every
@@ -3482,9 +3541,15 @@ fn dispatch_next(cpu: usize) -> bool {
     // cleared by the fold below (`account`). This single store is the whole cost of the fix on the
     // context-switch path.
     ACCT[cpu].run_t0.store(busy_t0, Ordering::Relaxed);
+    // SPIN-8: the last store before the core leaves the scheduler. It stands for the whole span the
+    // dispatched task runs, so a healthy busy core reads phase=6 — and a wedged core reading 6 with a
+    // frozen pass counter would say the stall is inside the TASK, not the loop (the opposite verdict
+    // from every other phase, and the one SPIN-5's frozen heartbeat already argues against).
+    spin8(cpu, SPIN8_TASK);
     unsafe {
         switch_context(SCHED[cpu].scheduler_sp.as_ptr(), entry_sp);
     }
+    spin8(cpu, SPIN8_DISPATCH);
     let busy_cyc = now_cyc().wrapping_sub(busy_t0);
     // The switch-back always lands IRQ-masked (yield_now/exit mask first; timer_preempt runs in the
     // auto-masked IRQ handler), so the Box reclaim below can't race a re-entrant preempt on this
@@ -3841,8 +3906,17 @@ fn run(cpu: usize) -> ! {
         // idle WFI and re-enters this loop — so an idle core with only a pending sleeper still makes
         // progress; worst-case wake latency is one tick. `dispatch_next` re-masks (redundant here),
         // then either switches into a task or, on an empty queue, unmasks and returns false to idle.
+        // SPIN-8: one pass tick + a phase marker per step of the masked span. See the phase table
+        // above `dispatch_next`. This counter is the "is this core alive at all" word — frozen here
+        // while `[spin1]` keeps printing from a sibling core is the wedge, stated positively.
+        if cpu < NUM_CPUS {
+            SCHED_PASSES[cpu].0.fetch_add(1, Ordering::Relaxed);
+        }
+        spin8(cpu, SPIN8_LOOP_TOP);
         mask_irq();
+        spin8(cpu, SPIN8_DRAIN);
         drain_due_sleepers(cpu);
+        spin8(cpu, SPIN8_BACKSTOP);
         input_wait_backstop();
         if !dispatch_next(cpu) {
             // SMP-BAL: local queue is empty — before parking, try to pull a steal-eligible task off the
@@ -3850,13 +3924,16 @@ fn run(cpu: usize) -> ! {
             // loop straight back and `dispatch_next` runs it; nothing is parked. This is what lets an
             // idle core (incl. the BSP once it runs `run_bsp`) drain a saturated core's backlog. Only an
             // idle core ever steals, so it never competes with useful local work.
+            spin8(cpu, SPIN8_STEAL);
             if !try_steal(cpu) {
                 // Nothing to steal either: park until the next tick/IPI — WFI on metal, a light poll-spin
                 // in QEMU (no Group-1 timer). This span is idle; it is folded in below along with the
                 // rest of the pass, so it does not matter whether WFI actually sleeps or returns at once.
+                spin8(cpu, SPIN8_IDLE);
                 crate::arch::hlt();
             }
         }
+        spin8(cpu, SPIN8_ACCT);
         // SCHED-7: fold EVERY cycle this pass did NOT spend executing a task in as IDLE — the whole
         // pass span (`t_prev`→now) minus the busy span `dispatch_next` already accounted. This closes
         // the phantom-100% hole: the old code bracketed ONLY the explicit WFI, so on a core whose WFI
@@ -4231,6 +4308,40 @@ struct FutexBucket {
 // SAFETY: every access to `key`/`waiters` is serialised by `locked`; identical argument to `Semaphore`.
 unsafe impl Sync for FutexBucket {}
 
+/// WEDGE-6 — try-attempts before a futex bucket acquisition is declared stalled. Same order as
+/// WEDGE-4's `RQ_STALL_SPINS` and WEDGE-5's `SEM_STALL_SPINS`: far past any legitimate hold, so
+/// reaching it means the holder is off-CPU and not coming back.
+const FUTEX_STALL_SPINS: u64 = 1 << 26;
+
+/// WEDGE-6 — the last unwitnessed unbounded spin inside the scheduler's IRQ-masked span, given the
+/// same voice as the run-queue lock's W4-B.
+///
+/// `input_wait_backstop` runs on EVERY core on EVERY scheduler pass with IRQ masked (VUGPAUSE-2), and
+/// it calls `futex_wake`, which scans EVERY bucket and takes each one's raw lock. Meanwhile
+/// `futex_wait`'s PARK_WAITQ hand-off holds a bucket's lock ACROSS a context switch — released by the
+/// scheduler in `park_blocked`, not by the waiter. So a waiter that parks and whose core never
+/// reaches `park_blocked` leaves that bucket locked, and every other core's scheduler loop then spins
+/// on it forever, IRQ-masked, dispatching nothing and printing nothing. That is the PA1 signature
+/// exactly, and until now this lock was the one member of the masked span that could produce it in
+/// silence. Lock-free UART seam (`w4_str`), one line per stalled acquisition, then keep spinning —
+/// behaviour unchanged, the wedge merely legible.
+#[inline(never)]
+fn futex_stall_witness(b: &FutexBucket) {
+    let idx = (b as *const FutexBucket as usize).wrapping_sub(FUTEX.as_ptr() as usize)
+        / core::mem::size_of::<FutexBucket>();
+    w4_str("\r\n[wedge6] FUTEX STALL core=");
+    w4_dec(percpu::this_cpu().cpu_index as u64);
+    w4_str(" bucket=");
+    w4_dec(idx as u64);
+    w4_str(" key=");
+    w4_dec(b.key.load(Ordering::Relaxed));
+    w4_str(" — this bucket's raw lock has been held past every legitimate hold; the holder parked across the switch and its core never reached park_blocked\r\n");
+}
+
+/// WEDGE-6 — stalled futex acquisitions seen since boot, for the `[spin1]` line (the print above is
+/// once per episode and lock-free; this is the count a witness pass can read from another core).
+static FUTEX_STALLS: AtomicU64 = AtomicU64::new(0);
+
 impl FutexBucket {
     const fn new() -> Self {
         FutexBucket {
@@ -4241,7 +4352,15 @@ impl FutexBucket {
     }
     #[inline]
     fn lock_raw(&self) {
+        // WEDGE-6: bounded-witness spin, exactly WEDGE-4's W4-B shape. The counter is bumped before
+        // the print so a core that stalls with the UART itself unavailable still leaves a number.
+        let mut spins: u64 = 0;
         while self.locked.swap(true, Ordering::Acquire) {
+            spins = spins.wrapping_add(1);
+            if spins == FUTEX_STALL_SPINS {
+                FUTEX_STALLS.fetch_add(1, Ordering::Relaxed);
+                futex_stall_witness(self);
+            }
             core::hint::spin_loop();
         }
     }
@@ -5667,8 +5786,9 @@ fn pulse5_witness() {
                     #[cfg(not(feature = "baremetal"))]
                     { (false, 0i64, 0usize) }
                 };
+                let (sched_phase, sched_passes) = spin8_state(cpu);
                 serial_println!(
-                    "[spin1] cpu={} span={}ms task={}:{} state={} park={} | rx_ready locked={} count={} waiters={} | sem_stalls={} sem_spin_max={} | bs_phase={} bs_loops={} | disp busy={} idle={} | irq total={} last={} unhandled={} unhandled_last={} — one task has owned this core the whole span; the [prio]/[comp2] lines beside this name the starvation",
+                    "[spin1] cpu={} span={}ms task={}:{} state={} park={} | rx_ready locked={} count={} waiters={} | sem_stalls={} sem_spin_max={} | bs_phase={} bs_loops={} | disp busy={} idle={} | irq total={} last={} unhandled={} unhandled_last={} | sched phase={} passes={} futex_stalls={} — one task has owned this core the whole span; the [prio]/[comp2] lines beside this name the starvation",
                     cpu, cyc_to_ms(ACCT[cpu].live_span_cyc()), id, name, st,
                     SCHED[cpu].park_kind.load(Ordering::Relaxed),
                     rxl as u32, rxc, rxw,
@@ -5686,7 +5806,15 @@ fn pulse5_witness() {
                     crate::arch::gic::IRQ_TOTAL[cpu & 7].load(Ordering::Relaxed),
                     crate::arch::gic::IRQ_LAST_INTID[cpu & 7].load(Ordering::Relaxed),
                     crate::arch::gic::IRQ_UNHANDLED[cpu & 7].load(Ordering::Relaxed),
-                    crate::arch::gic::IRQ_UNHANDLED_LAST[cpu & 7].load(Ordering::Relaxed)
+                    crate::arch::gic::IRQ_UNHANDLED_LAST[cpu & 7].load(Ordering::Relaxed),
+                    // SPIN-8: WHERE in its own scheduler loop the stalled core stands, and whether
+                    // it is standing still. `passes` frozen across consecutive prints is the wedge;
+                    // `phase` names the statement. See the SPIN8_* table above `dispatch_next`.
+                    sched_phase,
+                    sched_passes,
+                    // WEDGE-6: futex-bucket acquisitions that outran every legitimate hold. Non-zero
+                    // beside phase=3 is the whole verdict — the backstop's `futex_wake` is the wedge.
+                    FUTEX_STALLS.load(Ordering::Relaxed)
                 );
             }
         }
