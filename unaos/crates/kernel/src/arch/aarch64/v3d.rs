@@ -972,11 +972,11 @@ pub fn bringup(fb: Option<FbTarget>) {
     // only trustworthy if it says what is missing from it.
     if V3D_DEEP {
         serial_println!(
-            ":: V3D: [v3d] deep=on — slow banked-verdict probes ARMED: [v3d48] bisection ladder (6 rungs x ~0.5 s FLDONE backstop) + [v3d63] ptb-unit matrix (4 more rungs, same backstop) + [v3d64] muxcal (1 more rung + a 4 ms idle window + 1 extra CT1 job) + [v3d66] ptbsweep (2 passes x [1 rung + a 4 ms idle window + 1 extra CT1 job]) + [v3d68] binwall (4 more rungs, same backstop, plus a poison fill/scan of a 24 KiB tile-state region and the 32 KiB pool per rung) + [v3d69] initdiff (1 more rung, same backstop, between two READ-ONLY PM/ASB/MMUC fabric stations) + [v3d71] mainline-geom (1 more rung, same backstop, the bin window remapped to the piOS dump's iova geometry with an in-flight ASB fabric sampler across its wait) = 19 rungs, [v3d59] frameclose (64 x 1 ms), [v3d58] rerender (extra CT1 job). Expect ~10 s of extra boot — a stall of that length here is the BUDGET, not a hang ::"
+            ":: V3D: [v3d] deep=on — slow banked-verdict probes ARMED: [v3d48] bisection ladder (6 rungs x ~0.5 s FLDONE backstop) + [v3d63] ptb-unit matrix (4 more rungs, same backstop) + [v3d64] muxcal (1 more rung + a 4 ms idle window + 1 extra CT1 job) + [v3d66] ptbsweep (2 passes x [1 rung + a 4 ms idle window + 1 extra CT1 job]) + [v3d68] binwall (4 more rungs, same backstop, plus a poison fill/scan of a 24 KiB tile-state region and the 32 KiB pool per rung) + [v3d69] initdiff (1 more rung, same backstop, between two READ-ONLY PM/ASB/MMUC fabric stations) + [v3d71] mainline-geom (1 more rung, same backstop, the bin window remapped to the piOS dump's iova geometry with in-flight ASB fabric + [v3d73] CLE-progress samplers across its wait) + [v3d73s] mainline-exact-submit (1 more rung, same backstop, the byte-exact v3d_bin_job_run write sequence with nothing interleaved) = 20 rungs, [v3d59] frameclose (64 x 1 ms), [v3d58] rerender (extra CT1 job). Expect ~10 s of extra boot — a stall of that length here is the BUDGET, not a hang ::"
         );
     } else {
         serial_println!(
-            ":: V3D: [v3d] deep=off (banked verdicts skipped) — NOT run this boot: [v3d48] empty-frame bisection ladder (all 6 rungs banked non-retire), [v3d59] frameclose (banked DEAD-OPEN, zero bit changes), [v3d58] rerender (banked clean), [v3d71] mainline-geometry rung + fabric sampler. Fast probes only; re-arm with UNAOS_V3D_DEEP=1 ::"
+            ":: V3D: [v3d] deep=off (banked verdicts skipped) — NOT run this boot: [v3d48] empty-frame bisection ladder (all 6 rungs banked non-retire), [v3d59] frameclose (banked DEAD-OPEN, zero bit changes), [v3d58] rerender (banked clean), [v3d71] mainline-geometry rung + fabric/[v3d73] CLE-progress samplers, [v3d73s] mainline-exact-submit rung. Fast probes only; re-arm with UNAOS_V3D_DEEP=1 ::"
         );
     }
 
@@ -2917,6 +2917,9 @@ fn wait_fldone(what: &str, trace_ba: u32, trace_ea: u32) -> (u32, u64, bool) {
             // PI-V3D-71 leg 2: fold one ASB fabric sample at the same cadence — a no-op (one static
             // bool read, zero MMIO) on every wait except the one the [v3d71] rung arms it across.
             v3d71_sampler_take();
+            // PI-V3D-73: fold one CLE-progress sample at the same cadence — same contract (one
+            // static bool read, zero MMIO, on every wait except the ones a rung arms it across).
+            v3d73_sampler_take();
             samples = samples.saturating_add(1);
             next_sample = now + sample_tick;
         }
@@ -6754,6 +6757,11 @@ fn empty_frame_bisection() {
     // translation those verdicts were banked under; its in-flight ASB sampler must also not overlap
     // any wait another witness times.
     v3d71_mainline_geometry();
+    // PI-V3D-73 leg 3: the mainline-exact submit rides LAST — after [v3d71] has unmapped its
+    // window (this rung's identity addresses must run on the translation every banked verdict was
+    // taken under) and after every other reading has been taken on the instrumented-submit
+    // arrangement those verdicts were banked under.
+    v3d73_mainline_submit();
 }
 
 /// PI-V3D-63 — one banked rung's readback: the RANK 2 placement witness (the CT0/PCS words) plus the
@@ -8856,6 +8864,207 @@ fn v3d71_sampler_emit() {
     }
 }
 
+// ─── PI-V3D-73 — does the CLE ever FETCH? The in-flight CLE-progress sampler + the submit diff ───
+//
+// P83 established (do not re-litigate): the core is CLOCKED AND COMPLETELY IDLE across the wedged
+// wait ([v3d72] clkliv-x: Δsrc32=703,077,589 while src14/src16/src24 all read 0), the PTB never
+// issues one beat into the fabric ([v3d71f]), BMACTIVE=1 with no fault and the poison intact. The
+// wall is a unit-level enable/trigger — "clocked but never TRIGGERED" — and the open question is
+// WHERE on the CLE→PTB path the trigger dies: does control-list thread 0 ever START (fetch its
+// first word), or does the list execute and the FLUSH terminator fail to close the frame?
+//
+// The latent evidence, made explicit here: the P83 [v3d54] trace under the v3d71 mainline-geom
+// rung printed `CT0CA off 0xfd2c2000` against BA=0x03089000 — i.e. raw CT0CA=0x0034b000, the
+// PREVIOUS (identity-iova) kick's list address. Under the one kick whose QBA was unique in the
+// whole campaign, CT0CA never held the new QBA at all. Every earlier rung reused the same CL
+// address, so their `CT0CA == BA` readings could never distinguish "loaded QBA, never advanced"
+// from "stale value that happens to equal QBA". The [v3d54] trace also reports CA as an OFFSET
+// from BA, which turned that stale raw word into a misleading "(mid) stalled mid-list" verdict.
+// This sampler reports the RAW word, tracks whether CA is ever INSIDE [QBA,QEA], and names the
+// stale address when it is not.
+//
+// Design (the [v3d71f] idiom exactly): a static accumulator armed only around the rung(s) that
+// want it; `wait_fldone` folds one sample per ~1 ms tick when armed (one static bool read, zero
+// MMIO, on every other wait). Sampled registers: CT0CA (raw, min/max/distinct + in-span
+// tracking vs the armed QBA/QEA), CT0CS (raw distinct words; only CTRUN(bit5) is decoded — the
+// corroborated bit, per the §32/§40 CTnCS hedge), CT0LC, CT0PC, BFC. All five are seeded at arm
+// time (pre-GO), so `first` is the before-kick word and a stale-hold reads as changes=0.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// One sampled register's fold: first(=pre-GO seed)/last/min/max, change count, distinct words
+/// (capped at 4, overflow reported — the [v3d71f] rule: capped, never silently dropped).
+#[derive(Clone, Copy)]
+struct V3d73Reg {
+    first: u32,
+    last: u32,
+    min: u32,
+    max: u32,
+    changes: u32,
+    vals: [u32; 4],
+    n: u32,
+    more: bool,
+}
+
+impl V3d73Reg {
+    const fn zeroed() -> Self {
+        Self { first: 0, last: 0, min: 0, max: 0, changes: 0, vals: [0; 4], n: 0, more: false }
+    }
+    fn seed(&mut self, v: u32) {
+        *self = Self { first: v, last: v, min: v, max: v, changes: 0, vals: [v, 0, 0, 0], n: 1, more: false };
+    }
+    fn fold(&mut self, v: u32) {
+        if v != self.last {
+            self.changes += 1;
+            self.last = v;
+        }
+        self.min = self.min.min(v);
+        self.max = self.max.max(v);
+        let mut vals = self.vals;
+        let mut n = self.n;
+        if v3d71_fold_distinct(&mut vals, &mut n, v) {
+            self.more = true;
+        }
+        self.vals = vals;
+        self.n = n;
+    }
+}
+
+struct V3d73Sampler {
+    armed: bool,
+    samples: u32,
+    qba: u32, // the armed job's queue-begin — the address CA must hold if thread 0 ever loads it
+    qea: u32, // the armed job's queue-end
+    ca_in_span: u32,      // samples with QBA <= CT0CA <= QEA (the CLE provably holding OUR list)
+    ca_eq_qba: u32,       // samples with CT0CA == QBA exactly (loaded, zero advance)
+    ca_max_in_span: u32,  // highest in-span CT0CA seen — how far the fetch ever got vs QEA
+    ca: V3d73Reg,
+    cs: V3d73Reg,
+    lc: V3d73Reg,
+    pc: V3d73Reg,
+    bfc: V3d73Reg,
+}
+
+static mut V3D73_SAMPLER: V3d73Sampler = V3d73Sampler {
+    armed: false,
+    samples: 0,
+    qba: 0,
+    qea: 0,
+    ca_in_span: 0,
+    ca_eq_qba: 0,
+    ca_max_in_span: 0,
+    ca: V3d73Reg::zeroed(),
+    cs: V3d73Reg::zeroed(),
+    lc: V3d73Reg::zeroed(),
+    pc: V3d73Reg::zeroed(),
+    bfc: V3d73Reg::zeroed(),
+};
+
+/// Arm the CLE-progress sampler for the job about to be kicked at [qba, qea). Seeds every tracked
+/// register with its PRE-GO word, so a CLE that never touches the queue reads changes=0 with the
+/// stale pre-kick address printed as first==last.
+fn v3d73_sampler_arm(qba: u32, qea: u32) {
+    let s = &raw mut V3D73_SAMPLER;
+    unsafe {
+        (*s).armed = true;
+        (*s).samples = 0;
+        (*s).qba = qba;
+        (*s).qea = qea;
+        (*s).ca_in_span = 0;
+        (*s).ca_eq_qba = 0;
+        (*s).ca_max_in_span = 0;
+        (*s).ca.seed(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA));
+        (*s).cs.seed(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS));
+        (*s).lc.seed(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0LC));
+        (*s).pc.seed(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0PC));
+        (*s).bfc.seed(mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC));
+    }
+}
+
+/// One in-flight sample of the five CLE-progress registers. No-op unless armed.
+fn v3d73_sampler_take() {
+    let s = &raw mut V3D73_SAMPLER;
+    unsafe {
+        if !(*s).armed {
+            return;
+        }
+        let ca = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
+        (*s).samples = (*s).samples.saturating_add(1);
+        if ca >= (*s).qba && ca <= (*s).qea {
+            (*s).ca_in_span = (*s).ca_in_span.saturating_add(1);
+            (*s).ca_max_in_span = (*s).ca_max_in_span.max(ca);
+        }
+        if ca == (*s).qba {
+            (*s).ca_eq_qba = (*s).ca_eq_qba.saturating_add(1);
+        }
+        (*s).ca.fold(ca);
+        (*s).cs.fold(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS));
+        (*s).lc.fold(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0LC));
+        (*s).pc.fold(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0PC));
+        (*s).bfc.fold(mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC));
+    }
+}
+
+/// Disarm and emit the `[v3d73]` witness with the fetch verdict in-line. The reading key (v3d.md
+/// §44): CA never inside [QBA,QEA] = the CLE NEVER LOADED this job's queue — thread 0 never
+/// started, the trigger is upstream of list execution entirely; CA pinned at QBA = loaded but the
+/// first word was never fetched/advanced past; CA reached QEA with the PTB silent ([v3d71f]) =
+/// the list EXECUTES and the FLUSH terminator fails to trigger the PTB frame-close.
+fn v3d73_sampler_emit(what: &str) {
+    let s = &raw mut V3D73_SAMPLER;
+    unsafe {
+        (*s).armed = false;
+        let smp = &*s;
+        let bfc_delta = smp.bfc.last.wrapping_sub(smp.bfc.first);
+        let verdict: &str = if smp.samples == 0 {
+            "ZERO samples landed — the wait exited before the first ~1 ms tick; INCONCLUSIVE, nothing here is a measurement"
+        } else if bfc_delta != 0 {
+            "BFC ADVANCED across the wait — a bin frame CLOSED under the sampler; read this leg's retire witness, the wedge did not reproduce here"
+        } else if smp.ca_in_span == 0 {
+            "CT0CA NEVER HELD AN ADDRESS INSIDE [QBA,QEA] at any sample — THE CLE NEVER FETCHES ITS FIRST WORD: the queue latched exactly ([v3d54] submit) yet control-list thread 0 never consumed it, and CA still holds the stale pre-kick word printed above. The trigger is UPSTREAM of list execution entirely — a thread-start condition, not list content, not addresses, not the terminator"
+        } else if smp.ca_max_in_span == smp.qba {
+            "CT0CA held QBA and NEVER ADVANCED — the CLE loaded this job's queue but never fetched (or never retired) its first word. The trigger dies at thread start / first fetch, upstream of every packet in the list; terminator/frame-close semantics were never reached"
+        } else if smp.ca_max_in_span >= smp.qea {
+            "CT0CA ADVANCED TO QEA — the list EXECUTES. With the PTB provably silent across the same class of wait ([v3d71f]) and no FLDONE, the FLUSH terminator fails to trigger the PTB frame-close: the wall moves INTO the terminator/frame-close semantics"
+        } else {
+            "CT0CA advanced into the list then STALLED before QEA at the max-in-span offset above — the CLE fetches but chokes mid-list at that byte"
+        };
+        serial_println!(
+            ":: V3D: [v3d73] cle-progress ({}) — samples={} QBA={:#010x} QEA={:#010x}(len={}) | CT0CA pre-GO={:#010x} last={:#010x} min={:#010x} max={:#010x} distinct={}{} vals=[{:#010x} {:#010x} {:#010x} {:#010x}] changes={} in-span={} eq-QBA={} max-in-span={:#010x}(off {:#x} of {:#x}) | CT0CS {:#010x}->{:#010x} (CTRUN {}->{}) distinct={} | CT0LC {:#x}->{:#x} | CT0PC {:#x}->{:#x} | BFC {:#010x}->{:#010x} (Δ{}) — {} ::",
+            what,
+            smp.samples,
+            smp.qba,
+            smp.qea,
+            smp.qea.wrapping_sub(smp.qba),
+            smp.ca.first,
+            smp.ca.last,
+            smp.ca.min,
+            smp.ca.max,
+            smp.ca.n,
+            if smp.ca.more { "(+MORE, capped)" } else { "" },
+            smp.ca.vals[0], smp.ca.vals[1], smp.ca.vals[2], smp.ca.vals[3],
+            smp.ca.changes,
+            smp.ca_in_span,
+            smp.ca_eq_qba,
+            smp.ca_max_in_span,
+            smp.ca_max_in_span.wrapping_sub(smp.qba),
+            smp.qea.wrapping_sub(smp.qba),
+            smp.cs.first,
+            smp.cs.last,
+            (smp.cs.first & V3D_CLE_CTNCS_CTRUN != 0) as u32,
+            (smp.cs.last & V3D_CLE_CTNCS_CTRUN != 0) as u32,
+            smp.cs.n,
+            smp.lc.first,
+            smp.lc.last,
+            smp.pc.first,
+            smp.pc.last,
+            smp.bfc.first,
+            smp.bfc.last,
+            bfc_delta,
+            verdict,
+        );
+    }
+}
+
 /// PI-V3D-71 leg 1 (+ leg 2 riding its wait) — the mainline-geometry shape-match rung.
 ///
 /// One `[v3d48]`-style Empty-frame kick (same 64x64 frame — shape and content are excluded prior, so
@@ -8940,12 +9149,16 @@ fn v3d71_mainline_geometry() {
     // the fabric-sampler emit below, before any post-rung readback perturbs the block.
     v3d72_pctr_arm("v3d71 mainline-geom");
     v3d71_sampler_arm(); // leg 2: the fabric sampler spans exactly this frame's wait
+    // PI-V3D-73: the CLE-progress sampler spans the same wait — the one kick in the whole campaign
+    // whose QBA is unique in iova space, so a stale CT0CA cannot masquerade as a loaded one.
+    v3d73_sampler_arm(cl_iova, cl_ea);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, cl_ea); // GO
     dsb();
     let submit_sound = v3d54_submit_audit("v3d71", cl_iova, cl_ea, bin_len);
     let idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CT1CS_CTRUN, "CT0 v3d71 mainline-geom");
     let (sts, us, retired) = wait_fldone("v3d71 mainline-geom", cl_iova, cl_ea);
     v3d71_sampler_emit(); // [v3d71f]
+    v3d73_sampler_emit("v3d71 mainline-geom"); // [v3d73] — the fetch verdict, in-flight
     v3d72_pctr_read_emit("v3d71 mainline-geom"); // [v3d72] — read + stop the bank at wait-exit
 
     let bpca = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA);
@@ -9013,6 +9226,159 @@ fn v3d71_mainline_geometry() {
         ":: V3D: [v3d71] window unmapped={} — the page table is back to the arena-identity-only map; scope: this rung wrote PTEs in OUR table, the per-job CT0Q* latches and mainline's own MMU-flush sequence, and NOTHING else — no BXCF, no MISCCFG, no CTRSTA, no GMP, no new MMIO window ::",
         unmapped as u32,
     );
+}
+
+// ─── PI-V3D-73 leg 3 — the mainline-EXACT submit sequence, with nothing interleaved ──────────────
+//
+// The submit-sequence diff (v3d.md §44.2, compiled from the mainline facts this file already
+// records — the v3d_bin_job_run order at the CT0Q* facts block, the [v3d59] mainline ledger
+// T1–T4, v3d_invalidate_caches at bin_prejob_invalidate_kernel_exact) finds NO register that
+// mainline writes on the bin submit path and we do not: BPOS=0 → invalidate → (perfmon switch,
+// a no-op when no perfmon is attached — the common mainline case) → CT0QMA → CT0QMS →
+// CT0QTS|ENABLE → CT0QBA → CT0QEA (the QEA write IS the GO; queue-register auto-start, no CTnCS
+// write anywhere on the path). What the diff DOES find is that no kick in this campaign has ever
+// been that sequence and nothing else. Every rung interleaves instrument MMIO inside it:
+//
+//   (a) an INT_CLR W1C write BETWEEN CT0QBA and CT0QEA (mainline writes nothing between the
+//       queue pair — its ISR does the W1C; ours sits inside the QBA→QEA span on every kick);
+//   (b) echo READS of CT0QTS/QMS/QMA between the tile-memory latch and CT0QBA ([v3d49]);
+//   (c) FLM=FLUSH instead of mainline's CLEAR on every rung but [v3d53] — and the [v3d53]
+//       control rung that fixed (c) still carried (a) and (b).
+//
+// Each divergence is individually benign-looking and (c) was individually controlled, but the
+// conjunction "byte-exact v3d_bin_job_run transcription, zero interleaved MMIO" has never run —
+// and with the config space exhausted measured (P83) and the trigger provably upstream of list
+// execution, an un-run mainline-documented SEQUENCE is exactly where an unfound trigger could
+// still hide. This leg runs it once: identity addresses (the canonical [v3d48] Empty frame, the
+// v3d71 window already unmapped), poison detectors intact, the [v3d73] sampler across its wait.
+// Within license: every write below is one mainline makes on this path, in mainline's order —
+// this is the REMOVAL of off-mainline instrument traffic, not an experiment.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+fn v3d73_mainline_submit() {
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down => {
+            serial_println!(
+                ":: V3D: [v3d73s] SKIPPED — hub IDENT0 reads 0x00000000 (block absent/unpowered; the QEMU raspi4b signature). No rung was kicked and NO verdict is implied ::"
+            );
+            return;
+        }
+        V3dPresence::Poison(w) => {
+            serial_println!(
+                ":: V3D: [v3d73s] SKIPPED — hub IDENT0 reads poison {:#010x} (open-bus / firmware fill, not a live register). No rung was kicked and NO verdict is implied ::",
+                w
+            );
+            return;
+        }
+    }
+    serial_println!(
+        ":: V3D: [v3d73s] mainline-exact submit — the submit-sequence diff's one un-run leg: BPOS=0 -> v3d_invalidate_caches (SLC-first, window re-established, FLM=CLEAR) -> CT0QMA -> CT0QMS -> CT0QTS|ENABLE -> CT0QBA -> CT0QEA as SEVEN UNINTERRUPTED WRITES — no INT_CLR inside the QBA->QEA pair, no echo reads inside the latch block, exactly v3d_bin_job_run. Every prior kick interleaved instrument MMIO into this sequence; this one removes it ::"
+    );
+
+    // The canonical Empty CL at identity addresses (the v3d71 window is unmapped; this is the
+    // translation every banked verdict was taken under).
+    let bin_len = build_bin_cl_content_geom(OFF_PROBE_BIN_CL, OFF_SHADREC, 1, BinContent::Empty, TARGET_W, TARGET_H);
+    v3d56_poison_region(OFF_V3D68_TSDA, V3D68_TSDA_BYTES);
+    v3d56_poison_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+    for i in (0..PROBE_BIN_OVERFLOW_BYTES).step_by(4) {
+        arena_write_u32(OFF_PROBE_BIN_OVERFLOW + i, 0);
+    }
+    cache::clean_range(arena_phys() + OFF_PROBE_BIN_OVERFLOW, PROBE_BIN_OVERFLOW_BYTES);
+    cache::clean_range(arena_phys() + OFF_PROBE_BIN_CL, bin_len);
+
+    let ba = (arena_phys() + OFF_PROBE_BIN_CL) as u32;
+    let ea = ba + bin_len as u32;
+    let tile_alloc = (arena_phys() + OFF_BIN_TILEALLOC) as u32;
+    let ts_phys = arena_phys() + OFF_V3D68_TSDA;
+    let qts_val = ts_phys as u32 | V3D_CLE_CT0QTS_ENABLE;
+
+    // Every instrument access happens BEFORE the sequence: stale-latch W1C (mainline's ISR keeps
+    // STS clean between jobs; ours must clear it here or a stale bit would fake a retire), the
+    // fault-latch clear, the BFC baseline, and the [v3d73] sampler's pre-GO seeds.
+    clear_mmu_fault_latch("v3d73s pre-kick");
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
+    let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    v3d73_sampler_arm(ba, ea);
+
+    // ── The transcription. v3d_bin_job_run, write for write, in order, nothing between. ──
+    // (1) BPOS=0 — the first write of every mainline bin job (facts block at V3D_CLE_CT0QTS).
+    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOS, 0);
+    dsb();
+    // (2) v3d_invalidate_caches — the kernel-exact FLM=CLEAR idiom ([v3d53]'s helper: SLCACTL
+    //     first, L2T window re-established, L2TCACTL=L2TFLS|FLM_CLEAR; the poll is our standard
+    //     finite backstop, a safe superset of the kernel's fire-and-forget).
+    let (l2t_before, l2t_after) = bin_prejob_invalidate_kernel_exact("L2T CLEAR (v3d73s pre-kick)");
+    // (3) v3d_switch_perfmon — a NO-OP when no perfmon is attached to the job, which is the
+    //     mainline common case; deliberately not armed here so the [v3d72] two-window law holds
+    //     and this leg stays a pure sequence transcription.
+    // (4..8) the five CLE latches, back to back. The QEA write is the GO (queue auto-start).
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, qts_val);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, ba);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, ea); // GO
+    dsb();
+    // ── End of the transcription; instruments resume (all post-GO). ──
+
+    serial_println!(
+        ":: V3D: [v3d73s] sequence — L2TCACTL {:#010x}->{:#010x} (FLM=CLEAR, SLC-first, window re-established) | QMA..QEA issued as five consecutive nGnRnE writes, one dsb after QEA; deltas vs every prior kick: no INT_CLR between QBA and QEA, no CT0Q* echo reads before QBA, mainline invalidate mode ::",
+        l2t_before, l2t_after,
+    );
+    let submit_sound = v3d54_submit_audit("v3d73s", ba, ea, bin_len);
+    let idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CT1CS_CTRUN, "CT0 v3d73s mainline-submit");
+    let (sts, us, retired) = wait_fldone("v3d73s mainline-submit", ba, ea);
+    v3d73_sampler_emit("v3d73s mainline-submit"); // [v3d73] — the fetch verdict on THIS sequence
+
+    let bfc_after = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    let pcs = mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS);
+    let mmu_ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let fault =
+        mmu_ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+
+    // The [v3d68] evidence-integrity rule: drain the L2T, then scan the poison detectors.
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_FLUSH);
+    let flush_done = wait_bit_clear(
+        V3D_CORE0_BASE,
+        V3D_CTL_L2TCACTL,
+        V3D_L2TCACTL_L2TFLS,
+        "L2T write-back (v3d73s scan)",
+    );
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_SLCACTL, V3D_SLCACTL_INVALIDATE_ALL);
+    dsb();
+    cache::invalidate_range(ts_phys, V3D68_TSDA_BYTES);
+    cache::invalidate_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+    dsb();
+    let ts_scan = v3d56_scan(ts_phys as u32, V3D68_TSDA_BYTES);
+    let pool_scan = v3d56_scan(tile_alloc, BIN_TILEALLOC_BYTES);
+    v3d56_emit_scan("v3d73s", "tile-state (24 KiB, identity)", ts_phys as u32, &ts_scan, flush_done);
+    v3d56_emit_scan("v3d73s", "tile-alloc pool (32 KiB, identity)", tile_alloc, &pool_scan, flush_done);
+    let touched = ts_scan.zeroed + ts_scan.overwritten + pool_scan.zeroed + pool_scan.overwritten;
+
+    let verdict = if fault != 0 {
+        "AN MMU FAULT LATCHED — instrument fault, not a sequence verdict; fix before citing this rung"
+    } else if retired || touched != 0 {
+        "the SUBMIT SEQUENCE is CONVICTED — the same Empty frame that wedges under the instrumented submit retired (or produced PTB traffic) the moment the sequence was v3d_bin_job_run verbatim with nothing interleaved. The trigger was being broken by our own instrument MMIO inside the submit; adopt this uninterrupted sequence as the ONLY submit path and re-run the full ladder"
+    } else if !flush_done {
+        "no retire and no fault, but the L2T drain did not complete — the poison column is INCONCLUSIVE; re-run before banking the exclusion"
+    } else {
+        "STILL DEAD under the mainline-exact sequence — no retire, no fault, poison intact through a completed drain, with zero interleaved MMIO between BPOS and the GO. The SUBMIT SEQUENCE is now exhausted alongside the config space: no write mainline makes that we lack, no order it keeps that we broke. Read [v3d73] above for where the fetch dies; the trigger hunt moves fully upstream of the submit interface"
+    };
+    serial_println!(
+        ":: V3D: [v3d73s] verdict — retired={} BFC {:#010x}->{:#010x} (Δ{}) PCS={:#010x}(BMACTIVE={} BMBUSY={} BMOOM={}) idled={} INT_STS={:#010x} waited={}us submit_sound={} | poison touched: tile-state={} of {} words, pool={} of {} words (L2T drain completed={}) | MMU_CTL={:#010x} fault latched={} — {} ::",
+        retired as u32, bfc_pre, bfc_after, bfc_after.wrapping_sub(bfc_pre),
+        pcs,
+        (pcs & V3D_PCS_BMACTIVE != 0) as u32,
+        (pcs & V3D_PCS_BMBUSY != 0) as u32,
+        (pcs & V3D_PCS_BMOOM != 0) as u32,
+        idled as u32, sts, us, submit_sound as u32,
+        ts_scan.zeroed + ts_scan.overwritten, ts_scan.words,
+        pool_scan.zeroed + pool_scan.overwritten, pool_scan.words,
+        flush_done as u32,
+        mmu_ctl, (fault != 0) as u32,
+        verdict,
+    );
+    clear_mmu_fault_latch("v3d73s post-kick");
 }
 
 /// Read a little-endian u32 out of the arena at `off` (probe scratch readback).

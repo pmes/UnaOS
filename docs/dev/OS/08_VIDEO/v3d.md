@@ -3129,3 +3129,86 @@ bank is stopped (EN=0) at read, so every rung outside the two windows prints exa
 QEMU raspi4b models no V3D: both windows sit behind the hub-identity gate and the `UNAOS_V3D_DEEP`
 feature, so `kernel8-test` green means **no regression and nothing more** — the Δ verdict is
 metal-attended, read at the next bench boot with `UNAOS_V3D_DEEP=1`.
+
+## 44. Does the CLE ever fetch? — the in-flight progress sampler and the submit-sequence diff (V3D-73)
+
+The P83 wire established, and does not re-litigate: the core is **clocked and completely idle**
+across the wedged wait (`[v3d72]` clkliv-x — CYCLE_COUNT advanced 703,077,589 cycles while src14 =
+src16 = src24 = 0), the PTB never issues one beat into the fabric (`[v3d71f]` pinned 0x4), BMACTIVE=1
+with no fault and the poison fully intact. The clock branch is dead; the wall is a **unit-level
+enable/trigger** — "clocked but never TRIGGERED" — and the CLE→PTB frame-close path is the named
+next place to look. V3D-73 asks the one question that splits that path in two: **does control-list
+thread 0 ever fetch and advance through our bin list, or does it never start?** V3D-54 proved the
+LATCH (CT0QBA/QEA hold exactly our list); it never proved a fetch.
+
+The latent evidence that motivates the instrument: under the `[v3d71]` mainline-geom rung — the one
+kick in the whole campaign whose QBA was **unique in iova space** — the `[v3d54]` trace printed
+`CT0CA off 0xfd2c2000` against BA=0x03089000, i.e. raw CT0CA = 0x0034B000: the **previous**
+identity-iova kick's list address. CT0CA never held the new QBA at all. Every earlier rung reused
+the same CL address, so their `CT0CA == BA` readings could never distinguish "loaded QBA, never
+advanced" from "stale word that happens to equal QBA" — and the `[v3d54]` offset arithmetic turned
+the stale raw word into a misleading `(mid) stalled mid-list` verdict. The wedged `CT0PC=3` /
+`CT0LC=0x30000` readings are the same class of stale hold.
+
+### 44.1 Leg 1 — `[v3d73]` cle-progress, the in-flight fetch sampler
+
+The `[v3d71f]` idiom exactly: a static accumulator armed only around the rungs that want it;
+`wait_fldone` folds one sample per ~1 ms tick when armed (one static bool read, zero MMIO, on every
+other wait). Sampled: **CT0CA** (raw word — min/max/distinct capped at 4 with overflow reported,
+plus three derived counters: samples with CA inside [QBA,QEA], samples with CA == QBA, and the
+highest in-span CA seen vs QEA), **CT0CS** (raw distinct words; only CTRUN(bit5) decoded, per the
+§32/§40 CTnCS hedge), **CT0LC**, **CT0PC**, **BFC**. All five are seeded at arm time (pre-GO), so
+`first` is the before-kick word and a stale hold reads as `changes=0` with the stale address
+printed. Armed across two waits: the `[v3d71]` mainline-geom rung (unique-QBA, the unambiguous
+read) and the `[v3d73s]` leg-3 rung below.
+
+### 44.2 Leg 2 — the submit-sequence diff vs mainline
+
+Compiled from the mainline facts this tree already records (the `v3d_bin_job_run` order at the
+CT0Q* facts block in `v3d.rs`, the `[v3d59]` mainline ledger T1–T4, `v3d_invalidate_caches` at
+`bin_prejob_invalidate_kernel_exact`, `v3d_irq_enable`/`v3d_mmu_set_page_table` sourcing) and
+against the attended piOS dumps — no external source fetched.
+
+| # | Mainline `v3d_bin_job_run` write (order) | Ours | Divergence |
+|---|---|---|---|
+| 1 | `V3D_PTB_BPOS = 0` — FIRST write of every bin job (BPOA untouched) | `bin_prejob_bpos_clear`, same position since V3D-57 | none |
+| 2 | `v3d_invalidate_caches`: L3/L2C (no-ops on 4.2) → `SLCACTL` all → `L2TFLSTA=0`/`L2TFLEND=~0` → `L2TCACTL = L2TFLS\|FLM=CLEAR` | all rungs but `[v3d53]` run `FLM=FLUSH`, L2T-first | **(c) mode/order** — individually controlled by the v3d51-vs-v3d53 differential (both wedge) |
+| 3 | `v3d_switch_perfmon` — no-op when no perfmon attached (the common case) | `[v3d63]/[v3d72]` PCTR arming occupies the same slot on armed rungs | none (same idiom) |
+| 4 | `CT0QMA` then `CT0QMS` (guarded by `job->qma`; always set for bin jobs) | same order, always written | none |
+| 5 | `CT0QTS = ENABLE(bit1) \| qts` (guarded by `job->qts`) | same value, same position | none |
+| — | *(nothing)* | **echo READS of CT0QTS/QMS/QMA** (`[v3d49]`/`[v3d71]` frame-enables witness) | **(b) interleaved reads** inside the latch block |
+| 6 | `CT0QBA` | same | none |
+| — | *(nothing — the ISR does all W1C)* | **`INT_CLR` W1C write between CT0QBA and CT0QEA** on every kick | **(a) interleaved write inside the queue pair** |
+| 7 | `CT0QEA` — **the QEA write IS the GO** (queue-register auto-start; no CTnCS write anywhere on the mainline submit path) | same | none |
+
+**Verdict of the diff: no register mainline writes on the bin submit path that we do not.** The
+config space was exhausted measured at P83; rows (a)/(b)/(c) show the **sequence** was not — no kick
+in this campaign has ever been `v3d_bin_job_run` verbatim with nothing interleaved. Each divergence
+is individually benign-looking, and (c) was individually controlled, but the conjunction never ran.
+
+### 44.3 Leg 3 — `[v3d73s]`, the mainline-exact submit (rides `UNAOS_V3D_DEEP`, no new knob)
+
+One more Empty rung at identity addresses (after `[v3d71]` unmaps its window), whose submit is the
+byte-exact transcription: stale-latch W1C and all instrument reads BEFORE the sequence, then
+`BPOS=0` → kernel-exact `FLM=CLEAR` invalidate → `CT0QMA → CT0QMS → CT0QTS|ENABLE → CT0QBA →
+CT0QEA` as five consecutive uninterrupted writes, one `dsb` after the GO. Same poison detectors
+(24 KiB tile-state + 32 KiB pool), same FLDONE backstop, the `[v3d73]` sampler across its wait.
+Within license: every write is one mainline makes on this path, in mainline's order — this leg
+**removes** off-mainline instrument traffic rather than adding an experiment.
+
+### 44.4 Reading key
+
+| Wire line | Reading | Convicts / excludes |
+|---|---|---|
+| `[v3d73] … in-span=0` (CA never inside [QBA,QEA]; stale pre-kick word printed) | **the CLE never fetches its first word** — the queue latched but thread 0 never consumed it | the trigger is **upstream of list execution entirely** (a thread-start condition); list content, addresses and terminator semantics are all unreachable and therefore exonerated for this wedge |
+| `[v3d73] … CA pinned at QBA` (in-span>0, max-in-span==QBA) | the queue loaded but the first word never fetched/advanced | same verdict, one station later: the trigger dies at thread start / first fetch |
+| `[v3d73] … max-in-span==QEA` | the list **executes** — with the PTB silent (`[v3d71f]`) and no FLDONE | the FLUSH terminator fails to trigger the PTB frame-close: the wall moves **into the terminator/frame-close semantics** |
+| `[v3d73] … advanced then stalled mid-span` | the CLE fetches but chokes at the printed offset | localise the packet at that byte |
+| `[v3d73] … BFC Δ>0` | a frame closed under the sampler | read the leg's retire witness — the wedge did not reproduce |
+| `[v3d73s] verdict — retired=1` or poison touched | the uninterrupted sequence retired what the instrumented one wedged | **the submit sequence is convicted** — our own interleaved MMIO was breaking the trigger; adopt the uninterrupted sequence as the only submit path |
+| `[v3d73s] … STILL DEAD` | no retire, no fault, poison intact through a completed drain | the **submit sequence is exhausted alongside the config space**: no write mainline makes that we lack, no order it keeps that we broke — the trigger hunt moves fully upstream of the submit interface |
+| `[v3d73] … samples=0` | the wait exited before the first tick | INCONCLUSIVE — no verdict |
+
+QEMU raspi4b models no V3D: both legs sit behind the hub-identity gate and `UNAOS_V3D_DEEP`, so
+`kernel8-test` green means **no regression and nothing more** — every verdict here is
+metal-attended, read at the next bench boot with `UNAOS_V3D_DEEP=1`.
