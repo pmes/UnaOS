@@ -4701,7 +4701,30 @@ impl XhciController {
     /// metal failure this arc addresses parks the endpoint in — and there, failing the transfer
     /// immediately is strictly better than corrupting the ring and then waiting the full budget for a
     /// completion that cannot come.
+    ///
+    /// GUARD-STATE: **the comparison is only meaningful when the endpoint is NOT Running.** The
+    /// Output Endpoint Context's TR Dequeue Pointer field is not a live position register. xHCI 1.0
+    /// §4.8.3 and §6.2.3 define it as written back by the controller when the endpoint transitions
+    /// Running -> Stopped/Halted (and otherwise set by Configure Endpoint / Set TR Dequeue Pointer);
+    /// while the endpoint is Running the field is architecturally undefined, and real Intel silicon
+    /// (Panther Point, xHCI 1.0) leaves it frozen at the birth value from the last of those writes.
+    /// QEMU refreshes it live, which is why no gate could surface this. Comparing our live enqueue
+    /// against a frozen birth value manufactures a false `RingFull` on a perfectly healthy
+    /// mid-traffic device and self-inflicts the whole rescue ladder on it — observed on metal. So:
+    /// read the EP State FIRST and refuse only from Halted(2), Stopped(3) or Error(4), the states in
+    /// which the field is defined to hold the controller's real consumer position.
+    ///
+    /// This restores the pre-M2 behaviour for Running endpoints, which is correct: a healthy BOT
+    /// transaction serialises its stages and so holds at most 3 of 16 TRBs, and the lap hazard the
+    /// guard exists for only materialises across recovery retries — which run against Stopped
+    /// endpoints, exactly where the guard still applies unchanged.
     fn bot_ring_guard(&self, slot_id: u8, dci: u8, is_in: bool) -> Result<(), BotError> {
+        // GUARD-STATE: never refuse against a Running(1) endpoint — nor a Disabled(0) or absent
+        // (0xFF) one, where there is no consumer position to compare against either.
+        match self.ep_state_of(slot_id, dci) {
+            2 | 3 | 4 => {}
+            _ => return Ok(()),
+        }
         let deq = self.ep_ctx_deq(slot_id, dci);
         if deq == 0 {
             return Ok(()); // no output context / unreadable consumer position — never refuse
