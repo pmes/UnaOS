@@ -710,6 +710,77 @@ gate exercises `ipi_preempt` end to end and the counters/line shape), but the
 timer-driven service cadences are absent — the latency collapse is metal
 evidence, as with every preemption behaviour here.
 
+### Worker co-placement — a vug's triple lives together (aarch64, SPREAD-10)
+
+FLUID-3 (see `08_VIDEO/engine.md`) closed the present-path hypothesis for the
+"predetermined fps": presents run inline (~2.5 ms) on the caller's core, there
+is no queue and no single consumer, and the aggregate rate is conserved
+(~258/s) while per-vug shares sit wildly unequal and stable (19..80/s, same
+binary). The remaining pace-setter is the **futex park at the frame barrier**:
+the parent parks on `DONE` behind its two workers (workers on `PHASE`), and
+when the three tasks of one vug are scattered across saturated cores, every
+frame pays a cross-core rendezvous — wake SGI, run-queue wait behind foreign
+residents, the parent's own re-dispatch. That park duration, not any fps
+target, is the settled rate, and it is the genuine idle the load meter shows.
+SPREAD-10 is the scheduler-side fix FLUID-3 named as in reach: **bias the
+members of one address-space slot toward the same core**, so the rendezvous
+resolves against local wakes (the spin-then-park windows catch them; the
+cross-core IPI + foreign-queue wait drops out of the frame loop). No
+present-path or barrier-contract change.
+
+**Identification.** Free: a triple is exactly the tasks sharing one
+address-space slot — `user_ttbr0 >> 48`, the ASID `spawn_user_thread`
+propagates from the parent and the key the `PHASE` futex hashes under. No new
+task metadata. What placement lacked was a per-core view: `SLOT_CORE_RES`
+(per core, per slot, committed residents), maintained at exactly the
+SPREAD-3 `EL0_RESIDENTS` enter/leave sites — both EL0 spawn paths, the
+`make_ready` move (transfer home → target, same order as the resident
+transfer), every reap path. Committed, not runnable-adjusted, deliberately: a
+parked parent still names the core its workers should rendezvous on.
+
+**The bonus and its weight.** One cross-core rendezvous costs ~1–3 ms/frame
+(`[fluid3]` millisecond park buckets under storm); one run-queue position
+costs ~4–6 ms saturated (`[spread7]` wd_mean). The co-residency bonus must
+therefore be worth **less than one runnable resident** (or triples pile onto
+saturated cores and regress SPREAD-4's margin discipline) and **more than the
+depth/pct tie-breaks** (or nothing converges). It is **half a runnable
+resident** (~2–3 ms-equivalent — the price of the rendezvous it buys back),
+applied in doubled-load units (`2*act + 1 − bonus`):
+
+* **Spawn** (`pick_cpu_slot`): a core hosting a same-slot sibling wins every
+  runnable-resident tie, ahead of depth/pct; it can never beat a core with
+  one fewer runnable resident. Pure preference, no pile-up.
+* **Rewake** (`rewake_place`): a second qualifying lane beside SPREAD-4's
+  margin-2 lane — a candidate hosting **strictly more** same-slot siblings
+  than home qualifies at margin 0 (equal load allowed, heavier never). This
+  is what lets a scattered triple converge on a *balanced* fleet, where the
+  margin lane holds every member in place. Sequential sibling-lane moves
+  strictly increase the slot's co-residency, so convergence terminates (no
+  oscillation by the same argument REWAKE_MARGIN makes); ties in the
+  selection fall to more-siblings-first, so all members of a slot rank the
+  same target core.
+* **Retention**: home hosting a sibling is half a resident harder to leave
+  via the margin lane (on the integer lattice this bites as one extra
+  resident: pure load breaks up a triple only for a ≥ margin+1 win). Both
+  lanes compare runnable load, so a saturating core still sheds — the
+  co-residency term is a preference, never an anchor, and the SPREAD-6
+  refresh escapement (~4 asks/s/task) re-asks with the new term, so triples
+  converge within ~250 ms of a load shift and un-converge when a core
+  saturates. Slotless tasks (kernel spawns, the shared window, `slot` 0)
+  reduce byte-identically to the SCHED-3/SPREAD-9 key chains.
+
+**The wire signature.** `[spread10] slots 1c=N 2c=N 3c+=N co_moves=N` beside
+`[spread4]` (same emit sites): the cores-per-slot histogram over live slots,
+plus cumulative placements the bonus *decided* (sibling-lane rewakes + spawns
+whose winner differs from the bonus-free key's). Expected metal: slots
+collapsing into `1c`/`2c` under storm; `co_moves` stepping at convergence
+edges and flat between (steady climb beside a static histogram would be
+thrash, which the strictly-increasing rule excludes); on the same wire,
+`[fluid3]` park p90 dropping out of the millisecond buckets, per-vug `[wcn]`
+rates converging upward, and the reserve core's idle shrinking into
+schedulable slack. QEMU battery baseline: all zeros before EL0 exists, which
+proves the wiring — the verdict is the next bench boot's `[fluid3]` read.
+
 ### Futex duplicate-bucket lost wake (aarch64, FUTEX-DUP / VUG-PACE-2)
 
 The other half of VUG-PACE-2, and the win1 lockup's root cause. `futex_wait`

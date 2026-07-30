@@ -1532,6 +1532,110 @@ fn el0_active(cpu: usize) -> usize {
         .saturating_sub(EL0_PARKED[cpu].load(Ordering::Acquire))
 }
 
+// SPREAD-10 — A VUG'S TRIPLE LIVES TOGETHER; THE RENDEZVOUS COMES HOME.
+//
+// FLUID-3 closed the present-path hypothesis: presents run inline (~2.5 ms) on the caller's core,
+// there is no queue and no consumer, and the aggregate rate is conserved. The remaining pace-setter
+// for a vug's settled fps is the FUTEX PARK at its frame barrier — the parent parks on `DONE` behind
+// its two workers (workers on `PHASE`), and when the three tasks of one vug sit scattered across
+// saturated cores, every frame pays a cross-core rendezvous: wake SGI, queue wait behind foreign
+// residents, then the parent's own re-dispatch. The [fluid3] millisecond park buckets ARE that price,
+// per frame, and the wildly-unequal per-vug rates (19..80/s on the same binary) are a pure function
+// of WHERE each triple landed. The fix is placement, not pacing: bias the members of one
+// address-space slot toward the same core, so the rendezvous resolves against LOCAL wakes — the
+// worker's `PHASE` wake and the parent's `DONE` wake land on a queue the target core is already
+// dispatching, the spin-then-park windows catch them, and the cross-core IPI + foreign-queue wait
+// drops out of the frame loop.
+//
+// The identification costs nothing new: a triple is exactly the tasks sharing one address-space slot
+// (`user_ttbr0 >> 48` — the ASID `spawn_user_thread` propagates from the parent, the same key the
+// PHASE futex hashes under). What placement lacked was a per-core view of it; `SLOT_CORE_RES` below
+// is that view, maintained at the exact sites the SPREAD-3 committed-residents counter already
+// occupies.
+//
+// The weight (the whole tuning argument, in one place): one cross-core rendezvous costs ~1-3 ms per
+// frame ([fluid3] p50..p90 millisecond buckets under storm; [spread7] wd_mean prices one run-queue
+// position at ~4-6 ms saturated). The co-residency bonus must therefore be worth LESS than one
+// runnable resident (or triples would pile onto saturated cores and regress SPREAD-4's margin
+// discipline) and MORE than the depth/pct tie-breaks (or nothing would ever converge). Half a
+// runnable resident — ~2-3 ms-equivalent, squarely the price of the rendezvous it buys back — is the
+// bonus, applied in doubled-load units wherever placement compares cores. Concretely:
+//
+//   * at SPAWN (`pick_cpu`): a core hosting a same-slot sibling wins every tie on runnable residents
+//     but can never beat a core with one FEWER resident. Pure preference, zero pile-up risk.
+//   * at REWAKE (`rewake_place`): a second qualifying lane beside the margin lane — a candidate
+//     hosting MORE same-slot siblings than home qualifies at margin 0 (equal load allowed, heavier
+//     never), so triples actually converge on a balanced fleet where the margin-2 lane would hold
+//     every member exactly where it is. Sequential such moves strictly increase the slot's
+//     co-residency (each move is toward strictly-more siblings), so convergence terminates; the
+//     SPREAD-6 refresh clock (~4 asks/s per task, per-task and unsynchronized) is what carries a
+//     shifted fleet to the new answer within ~250 ms.
+//   * RETENTION: home hosting a sibling is half a resident harder to leave via the margin lane (on
+//     the integer lattice that bites as one extra resident: a triple is broken up by pure load only
+//     for a >= margin+1 win). A core that saturates still sheds: both lanes compare RUNNABLE load,
+//     and a big enough delta clears the retention — co-residency is a preference, never an anchor.
+//
+// Siblings are counted COMMITTED (not runnable-adjusted): a parked parent still names the core its
+// workers should rendezvous on — that is precisely the anchor this arc exists to create.
+
+/// SPREAD-10 — committed EL0 residents per (core, address-space slot). Slot index is the ASID
+/// (1..=`boot::USER_SLOTS`; index 0 — kernel tasks and the shared window — is never counted and never
+/// biases). Enter/leave sites mirror `EL0_RESIDENTS` exactly: both EL0 spawn paths, the `make_ready`
+/// move (transfer home -> target), and every reap path. Lock-free; same saturating-leave discipline.
+static SLOT_CORE_RES: [[AtomicU32; KILL_ASID_SLOTS]; NUM_CPUS] =
+    [const { [const { AtomicU32::new(0) }; KILL_ASID_SLOTS] }; NUM_CPUS];
+
+/// SPREAD-10 — placements the co-residency bonus DECIDED: rewake moves that qualified only through
+/// the sibling lane, plus spawns whose winner differs from what the bonus-free key would have picked.
+/// The `[spread10]` witness prints it; climbing without bound beside a flat `cores_per_slot`
+/// histogram would be the thrash signature (the convergence argument above says sequential moves
+/// terminate, so it should settle to the fleet's churn rate).
+static SPREAD10_CO_MOVES: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-10 — the address-space slot of a task, or 0 for "no slot, no bias" (kernel tasks, the
+/// shared window, and any out-of-range ASID). The same `>> 48` extraction every ASID consumer uses.
+#[inline]
+fn slot_of(user_ttbr0: u64) -> usize {
+    let asid = (user_ttbr0 >> 48) as usize;
+    if asid != 0 && asid < KILL_ASID_SLOTS { asid } else { 0 }
+}
+
+/// SPREAD-10 — commit one slot resident to `cpu`. Called beside every `el0_resident_enter`.
+///
+/// `allow(dead_code)`: `el0_resident_enter`'s reason verbatim — the only callers are the two EL0
+/// spawn paths, which are `baremetal`-gated; the release side stays ungated because `exit()` is
+/// shared by both worlds.
+#[allow(dead_code)]
+#[inline]
+fn slot_res_enter(cpu: usize, user_ttbr0: u64) {
+    let slot = slot_of(user_ttbr0);
+    if slot != 0 && cpu < NUM_CPUS {
+        SLOT_CORE_RES[cpu][slot].fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// SPREAD-10 — release one slot resident from `cpu`. Called beside every `el0_resident_leave`.
+/// Saturating for `el0_resident_leave`'s reason: an accounting slip must never underflow and turn a
+/// core into a permanent phantom sibling magnet.
+#[inline]
+fn slot_res_leave(cpu: usize, user_ttbr0: u64) {
+    let slot = slot_of(user_ttbr0);
+    if slot != 0 && cpu < NUM_CPUS {
+        let _ = SLOT_CORE_RES[cpu][slot].fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            if n == 0 { None } else { Some(n - 1) }
+        });
+    }
+}
+
+/// SPREAD-10 — committed same-slot residents on `cpu` (0 for the no-slot sentinel).
+#[inline]
+fn slot_res(cpu: usize, slot: usize) -> u32 {
+    if slot == 0 || cpu >= NUM_CPUS {
+        return 0;
+    }
+    SLOT_CORE_RES[cpu][slot].load(Ordering::Acquire)
+}
+
 /// SPREAD-4 — how much less loaded another core must be before a waking EL0 task is moved onto it,
 /// in RUNNABLE residents. Two, not one, and the gap is the whole stability argument: with a margin of
 /// one, two cores carrying `n` and `n-1` would trade a task back and forth on every wake (each move
@@ -1640,24 +1744,50 @@ fn rewake_min_park_cyc() -> u64 {
 /// Lock-free by construction (atomics and one sysreg read; no run-queue lock), which is required:
 /// `make_ready` calls this INSIDE the IRQ-masked wake path and the `rq()` discipline forbids nesting
 /// a second run-queue section under the push that follows.
-fn rewake_place(home: usize) -> usize {
+///
+/// SPREAD-10 — `slot` (0 = no bias) adds the co-residency term. Loads are compared in DOUBLED units
+/// (`2*act + 1`, the +1 a uniform shift so the half-resident bonus never underflows at act 0): a core
+/// hosting more same-slot siblings than home is half a resident lighter than it reads, home hosting a
+/// sibling is half a resident harder to leave, and a SECOND qualifying lane admits a sibling-bound
+/// move at margin 0 (candidate hosts strictly MORE siblings AND is no more loaded than home) — the
+/// lane that lets a scattered triple converge on a balanced fleet, where the margin lane would never
+/// move anyone. Rationale + weight tuning: the SPREAD-10 block above `SLOT_CORE_RES`.
+fn rewake_place(home: usize, slot: usize) -> usize {
     if home >= NUM_CPUS {
         return home;
     }
     let home_act = el0_active(home);
-    if home_act < REWAKE_MARGIN {
+    // SPREAD-10 — home's committed same-slot siblings, EXCLUDING the waking task itself (it is still
+    // committed at home; the transfer happens after the decision).
+    let home_sibs = slot_res(home, slot).saturating_sub(1);
+    // SPREAD-4's cheap early-out, kept — unless the task is slot-scattered (home hosts none of its
+    // siblings), in which case the sibling lane must still get its scan: at low load a sibling-bound
+    // move is exactly the cheap, convergence-carrying case.
+    if home_act < REWAKE_MARGIN && (slot == 0 || home_sibs > 0) {
         return home; // home is not carrying enough to be worth correcting
     }
+    // Doubled-unit effective load of home: the half-resident retention bonus when staying preserves
+    // an existing co-residency.
+    let home_eff = 2 * home_act + 1 - usize::from(home_sibs > 0);
     let fresh = dispatch_fresh_cyc();
     let mut best = home;
-    let mut best_act = home_act;
+    let mut best_eff = home_eff;
+    let mut best_sibs = home_sibs;
     let mut best_pct = u32::MAX;
+    let mut best_sib_lane_only = false; // did the winner qualify ONLY via the sibling lane?
     for cpu in 0..NUM_CPUS {
         if cpu == home || !ONLINE_MASK[cpu].load(Ordering::Acquire) {
             continue;
         }
         let act = el0_active(cpu);
-        if act + REWAKE_MARGIN > home_act {
+        let sibs = if slot != 0 { slot_res(cpu, slot) } else { 0 };
+        let toward = sibs > home_sibs; // moving here strictly increases the triple's co-residency
+        let eff = 2 * act + 1 - usize::from(toward);
+        // Lane 1 (SPREAD-4, unchanged for slotless tasks): enough of a load win to pay for the move.
+        let margin_lane = eff + 2 * REWAKE_MARGIN <= home_eff;
+        // Lane 2 (SPREAD-10): sibling-bound, margin 0 — equal load allowed, heavier never.
+        let sib_lane = toward && act <= home_act;
+        if !margin_lane && !sib_lane {
             continue; // not enough of a win to pay for the move
         }
         if ACCT[cpu].fold_age_cyc() >= fresh {
@@ -1667,11 +1797,21 @@ fn rewake_place(home: usize) -> usize {
         // waking task must not decline the core the service band lives on for load that would
         // preempt-and-vanish rather than compete (the rewake half of the dissolved reserve).
         let pct = ACCT[cpu].el0_busy_pct(CUR_PRIO[cpu].load(Ordering::Relaxed) >= PRIO_SERVICE);
-        if act < best_act || (act == best_act && pct < best_pct) {
+        // Choose by effective load; ties fall to MORE siblings (all members of a slot then rank the
+        // same target core, which is what keeps concurrent asks pointing one way), then lower pct.
+        if eff < best_eff
+            || (eff == best_eff && (sibs > best_sibs || (sibs == best_sibs && pct < best_pct)))
+        {
             best = cpu;
-            best_act = act;
+            best_eff = eff;
+            best_sibs = sibs;
             best_pct = pct;
+            best_sib_lane_only = sib_lane && !margin_lane;
         }
+    }
+    // SPREAD-10 — a move only the sibling lane admitted is a placement the bonus decided.
+    if best != home && best_sib_lane_only {
+        SPREAD10_CO_MOVES.fetch_add(1, Ordering::Relaxed);
     }
     best
 }
@@ -1787,20 +1927,39 @@ pub fn mark_online(cpu: usize) {
 /// at the top of `start_aps`) every core reads 0 residents, key 1 is a universal tie, and placement
 /// is byte-identical to SCHED-3. Falls back to core 0 only if no core is online yet (early BSP staging).
 fn pick_cpu(requested: usize) -> usize {
+    pick_cpu_slot(requested, 0)
+}
+
+/// SPREAD-10 — `pick_cpu` with the co-residency term. `slot` 0 (every kernel spawn, the shared
+/// window) reduces EXACTLY to the SCHED-3/SPREAD-9 key chain: the primary key is compared in doubled
+/// units (`2*res + 1`), which is order-isomorphic to `res` when no bonus applies. A nonzero slot
+/// discounts a core already holding same-slot siblings by half a resident — enough to win every
+/// runnable-resident tie (ahead of the depth/pct tie-breaks), never enough to beat a core with one
+/// fewer runnable resident. Weight rationale: the SPREAD-10 block above `SLOT_CORE_RES`.
+fn pick_cpu_slot(requested: usize, slot: usize) -> usize {
     if requested != CPU_AUTO {
         return requested;
     }
     let rot = AUTO_ROTATE.fetch_add(1, Ordering::Relaxed);
     let mut best: Option<usize> = None;
-    let mut best_res = usize::MAX;
+    let mut best_eff = usize::MAX;
     let mut best_depth = usize::MAX;
     let mut best_pct = u32::MAX;
+    // SPREAD-10 — the bonus-free winner, tracked in parallel so `co_moves` can count exactly the
+    // spawns the bonus DECIDED (winner differs from what the plain key chain would have picked).
+    let mut plain: Option<usize> = None;
+    let mut plain_res = usize::MAX;
+    let mut plain_depth = usize::MAX;
+    let mut plain_pct = u32::MAX;
     for i in 0..NUM_CPUS {
         let cpu = (rot + i) % NUM_CPUS; // rotating start => fully-tied cores fill round-robin
         if !ONLINE_MASK[cpu].load(Ordering::Acquire) {
             continue;
         }
         let res = el0_active(cpu); // SPREAD-4: runnable residents, not merely committed ones
+        // SPREAD-10: half-resident discount for a core already hosting this task's siblings; the +1
+        // shift keeps the subtraction above zero at res 0.
+        let eff = 2 * res + 1 - usize::from(slot_res(cpu, slot) > 0);
         // SPREAD-9 — the dissolved service-core reserve: keys 2 and 3 now weigh only work that
         // actually COMPETES with a new arrival. A queued/running service-band task preempts at IPI
         // receipt, runs a micro pass and blocks — it is latency-invisible to a co-resident — but the
@@ -1811,15 +1970,28 @@ fn pick_cpu(requested: usize) -> usize {
         // tasks themselves keep their pins and their placement freedom untouched.
         let depth = rq(cpu).len_below_band();
         let pct = ACCT[cpu].el0_busy_pct(CUR_PRIO[cpu].load(Ordering::Relaxed) >= PRIO_SERVICE);
-        let better = res < best_res
-            || (res == best_res
+        let better = eff < best_eff
+            || (eff == best_eff
                 && (depth < best_depth || (depth == best_depth && pct < best_pct)));
         if better {
             best = Some(cpu);
-            best_res = res;
+            best_eff = eff;
             best_depth = depth;
             best_pct = pct;
         }
+        let plain_better = res < plain_res
+            || (res == plain_res
+                && (depth < plain_depth || (depth == plain_depth && pct < plain_pct)));
+        if plain_better {
+            plain = Some(cpu);
+            plain_res = res;
+            plain_depth = depth;
+            plain_pct = pct;
+        }
+    }
+    // SPREAD-10 — a spawn steered off the plain winner is a placement the bonus decided.
+    if slot != 0 && best.is_some() && best != plain {
+        SPREAD10_CO_MOVES.fetch_add(1, Ordering::Relaxed);
     }
     best.unwrap_or(0)
 }
@@ -1953,7 +2125,9 @@ fn spawn_user_inner(
     user_ttbr0: u64,
     requested_cpu: usize,
 ) -> u64 {
-    let cpu = pick_cpu(requested_cpu);
+    // SPREAD-10: bias toward the core(s) already holding this address space's tasks. For a fresh
+    // slot the count is zero everywhere and this is byte-identical to the plain key chain.
+    let cpu = pick_cpu_slot(requested_cpu, slot_of(user_ttbr0));
     assert!(cpu < NUM_CPUS, "spawn_user: cpu out of range");
     // BG-SPREAD witness aid — record the decision so the caller can read back where its task landed.
     LAST_USER_PLACEMENT.store(cpu, Ordering::Release);
@@ -1989,6 +2163,7 @@ fn spawn_user_inner(
     // untouched), but the residents it parks on that core are real committed load and a later
     // `CPU_AUTO` placement must see them.
     let residents = el0_resident_enter(cpu);
+    slot_res_enter(cpu, user_ttbr0); // SPREAD-10: same instant, same core — the sibling map stays true
     rq(cpu).push(task);
     // PI-SCHED-1 — placement witness for EL0 tasks (the vug/midden GUI-app loads land here — the
     // "all vug load on core 2" sighting). Same `pi`-gating + rationale as `spawn_inner`. SPREAD-3 folds
@@ -2033,7 +2208,9 @@ pub fn spawn_user_thread(
     user_ttbr0: u64,
     requested_cpu: usize,
 ) -> JoinHandle {
-    let cpu = pick_cpu(requested_cpu);
+    // SPREAD-10: THE co-placement site — a worker spawns under its parent's slot root, so the bias
+    // lands it beside the parent (or its earlier-spawned sibling) whenever the load terms tie.
+    let cpu = pick_cpu_slot(requested_cpu, slot_of(user_ttbr0));
     assert!(cpu < NUM_CPUS, "spawn_user_thread: cpu out of range");
     let done = Arc::new(Semaphore::new(0));
     done.init(); // reserve the waiter list BEFORE the thread can run + post (alloc-free park)
@@ -2067,6 +2244,7 @@ pub fn spawn_user_thread(
     // SPREAD-3: a shared-ASID EL0 thread burns a core exactly like a slot task does — count it as a
     // committed resident on the same terms (before the enqueue; released on its `exit()`).
     let residents = el0_resident_enter(cpu);
+    slot_res_enter(cpu, user_ttbr0); // SPREAD-10: same instant, same core — the sibling map stays true
     rq(cpu).push(task);
     #[cfg(feature = "pi")]
     serial_println!(
@@ -2369,10 +2547,16 @@ fn make_ready(mut task: Box<Task>) {
                 SPREAD6_REFRESH.fetch_add(1, Ordering::Relaxed);
             }
             task.place_cyc = now; // the question is being asked NOW — re-arm the refresh clock
-            target = rewake_place(home);
+            // SPREAD-10: the slot names the task's futex-coupled siblings; `rewake_place` biases
+            // toward the core(s) already holding them (0 = unslotted, no bias).
+            target = rewake_place(home, slot_of(task.user_ttbr0));
             if target != home {
                 el0_resident_leave(home);
                 let act = el0_resident_enter(target);
+                // SPREAD-10: the slot-residency credit moves with the resident credit, same order,
+                // so a concurrent sibling's placement ask never sees this task counted twice.
+                slot_res_leave(home, task.user_ttbr0);
+                slot_res_enter(target, task.user_ttbr0);
                 task.cpu = target as u32;
                 SPREAD4_REWAKE.fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "pi")]
@@ -2888,6 +3072,8 @@ fn retire_killed(idx: usize, task: Box<Task>) {
     // released would permanently bias placement away from a core that is in fact idle.
     if task.user_entry != 0 {
         el0_resident_leave(task.cpu as usize);
+        // SPREAD-10: and its slot-residency credit — a dead sibling must stop attracting its triple.
+        slot_res_leave(task.cpu as usize, task.user_ttbr0);
     }
     // M6d: the same slot retirement `exit()` performs, executed on the scheduler stack. Legal here for
     // the same reason it is legal there — the kernel half of every root is Global and identical, so
@@ -2954,6 +3140,9 @@ pub fn exit() -> ! {
         // and a kernel entry's return all land here — so one decrement here covers them all.
         if (*raw).user_entry != 0 {
             el0_resident_leave((*raw).cpu as usize);
+            // SPREAD-10: release the slot-residency credit on the same funnel, or a retired triple
+            // member would keep pulling its siblings toward a core it no longer runs on.
+            slot_res_leave((*raw).cpu as usize, (*raw).user_ttbr0);
         }
         // Settle any kill request naming this task (by tid, or by ASID for a whole-process kill). Placed
         // HERE — after the slot teardown and the joiner post, with only the state store and the final
@@ -3367,6 +3556,7 @@ fn park_blocked(cpu: usize, park: u8, mut task: Box<Task>) {
             if let Some(home) = el0_home {
                 el0_parked_leave(home);
                 el0_resident_leave(home);
+                slot_res_leave(home, task.user_ttbr0); // SPREAD-10: same phantom-credit reasoning
             }
             debug_assert!(false, "BLOCKED task with no park action");
             drop(task);
@@ -5466,6 +5656,45 @@ fn spread4_witness() {
         REWAKE_MIN_PARK_MS,
     );
     spread7_witness();
+    spread10_witness();
+}
+
+/// SPREAD-10 — the co-placement proof line, beside `[spread4]` (same emit sites, so the sibling map
+/// is readable next to the per-core load it biases). `slots 1c/2c/3c+` is the cores-per-slot
+/// histogram over live slots (slots whose committed count is zero everywhere are not counted): the
+/// arc's expected metal signature is the population collapsing into `1c`/`2c` under storm, with the
+/// `[fluid3]` park percentiles on the same wire dropping out of the millisecond buckets and the
+/// per-vug `[wcn]` rates converging upward. `co_moves` is cumulative placements the co-residency
+/// bonus DECIDED (sibling-lane rewakes + bonus-steered spawns): it should step at convergence edges
+/// (spawn bursts, load shifts) and go flat between them — climbing steadily beside a static
+/// histogram would be thrash, which the strictly-increasing-co-residency move rule is built to
+/// exclude. Reads only, lock-free, safe from any core; all-zero (no live slot) on the QEMU battery
+/// before EL0 exists, which proves the wiring exactly as `[spread4]`'s zero baseline does.
+fn spread10_witness() {
+    let mut on1 = 0u32;
+    let mut on2 = 0u32;
+    let mut on3 = 0u32;
+    for slot in 1..KILL_ASID_SLOTS {
+        let mut cores = 0u32;
+        for cpu in 0..NUM_CPUS {
+            if SLOT_CORE_RES[cpu][slot].load(Ordering::Relaxed) > 0 {
+                cores += 1;
+            }
+        }
+        match cores {
+            0 => {}
+            1 => on1 += 1,
+            2 => on2 += 1,
+            _ => on3 += 1,
+        }
+    }
+    serial_println!(
+        "[spread10] slots 1c={} 2c={} 3c+={} co_moves={}",
+        on1,
+        on2,
+        on3,
+        SPREAD10_CO_MOVES.load(Ordering::Relaxed),
+    );
 }
 
 /// SPREAD-7 — the wake-quantization proof line, emitted beside `[spread4]` from the same sites.
