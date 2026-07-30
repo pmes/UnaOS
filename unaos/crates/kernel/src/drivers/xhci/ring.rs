@@ -247,6 +247,54 @@ impl TransferRing {
         Some(idx)
     }
 
+    /// BOT-PHASE: how many TRBs lie between the controller's dequeue pointer and our enqueue
+    /// pointer, and how many of those the controller would still consider VALID (produced).
+    ///
+    /// `ctx_deq` is the raw Endpoint Context TR Dequeue Pointer field, low bits carrying the
+    /// Dequeue Cycle State — the same reading `would_lap` takes, and subject to the same caveat
+    /// GUARD-STATE established: **it only means anything while the endpoint is NOT Running.** The
+    /// caller is responsible for that; this is pure arithmetic over device memory.
+    ///
+    /// Returns `(gap, live)`:
+    ///   * `gap` — slots from the controller's dequeue index up to (not including) ours;
+    ///   * `live` — of those, the ones whose stored Cycle bit equals the cycle the CONSUMER expects
+    ///     at that position. Per xHCI 1.2 §4.9.1 the Cycle bit is the entire producer/consumer
+    ///     handshake, so `live` is precisely "TRBs the controller will execute if its doorbell
+    ///     rings again". The walk starts from the DCS carried in `ctx_deq` and toggles the expected
+    ///     cycle whenever it steps over a Link TRB with Toggle Cycle set, exactly as the controller
+    ///     does.
+    ///
+    /// `live > 0` at an error exit is a STRANDED TRANSFER DESCRIPTOR: a CBW, data stage or CSW the
+    /// transaction never retired, which the next doorbell would replay into a device whose BOT phase
+    /// machine has moved on. That is the phase-desync mechanism this arc closes; `live == 0` after
+    /// the recovery's Set TR Dequeue Pointer is the proof it closed.
+    ///
+    /// `None` if `ctx_deq` does not address a TRB inside this ring (an unreadable consumer position
+    /// must never be reported as a strand).
+    pub fn strand_scan(&self, ctx_deq: u64) -> Option<(usize, usize)> {
+        let deq = self.index_of(ctx_deq & !0xFu64)?;
+        let n = self.num_trbs;
+        let gap = (self.enqueue_index + n - deq) % n;
+        let mut expect = (ctx_deq & 1) as u32;
+        let mut live = 0usize;
+        let mut i = deq;
+        for _ in 0..gap {
+            let trb = unsafe { core::ptr::read_volatile(self.trbs.add(i)) };
+            if (trb.control & 1) == expect {
+                live += 1;
+            }
+            // Link TRB (type 6) with Toggle Cycle (bit 1) flips the consumer's expected colour.
+            if ((trb.control >> 10) & 0x3F) == 6 && (trb.control & (1 << 1)) != 0 {
+                expect ^= 1;
+            }
+            i += 1;
+            if i >= n {
+                i = 0;
+            }
+        }
+        Some((gap, live))
+    }
+
     /// BOTEV: does `phys` address a TRB inside THIS ring? Pure predicate over `index_of`, no reads
     /// of device memory. Used by the BOT recovery witness to name which pipe (bulk IN vs bulk OUT)
     /// the timed-out transfer was waiting on, from nothing but the stranded TRB address.
