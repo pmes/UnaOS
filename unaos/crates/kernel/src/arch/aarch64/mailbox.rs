@@ -217,14 +217,22 @@ fn cntfrq() -> u64 {
 /// mirroring the x86 xHCI wall-clock-deadline discipline. (QEMU always replies, so this never
 /// fires there.)
 fn mbox_call(len: usize) -> bool {
+    // ~500 ms budget — generous vs the microseconds a real reply takes.
+    mbox_call_budget(len, 500)
+}
+
+/// PI-V3D-80: same call, caller-chosen reply budget. NOTIFY_DISPLAY_DONE makes the firmware STOP
+/// its display driver before replying — measured >500 ms on the bench (P92: the only property
+/// call to time out at the default budget). The kernel's mailbox wait is unbounded; ours stays
+/// bounded, just wider where the work is real.
+fn mbox_call_budget(len: usize, budget_ms: u64) -> bool {
     let buf_phys = mbox_phys() as u32;
 
     // Clean our request out to RAM so the GPU (which doesn't snoop our cache) sees it.
     cache::clean_range(mbox_phys(), len * 4);
 
-    // ~500 ms budget — generous vs the microseconds a real reply takes. CNTPCT is monotonic and
-    // won't wrap within any boot window, so a plain `>=` compare is sound.
-    let deadline = super::timer::cntpct() + cntfrq() / 2;
+    // CNTPCT is monotonic and won't wrap within any boot window, so a plain `>=` compare is sound.
+    let deadline = super::timer::cntpct() + cntfrq() / 1000 * budget_ms;
     let timed_out = || super::timer::cntpct() >= deadline;
 
     // Post: VC bus address of the buffer in the high 28 bits, channel in the low 4. Match Circle's
@@ -349,7 +357,9 @@ pub fn notify_display_done() -> Option<()> {
     request(3, 0); // value buffer size (zero-length, like vc4's NULL/0 call)
     request(4, 0); // request code
     request(5, TAG_END);
-    if !mbox_call(6) {
+    // 5 s budget: the firmware stops its whole display driver before replying (P92 measured the
+    // default 500 ms as insufficient — the one property call on the bench that ever needed more).
+    if !mbox_call_budget(6, 5000) {
         return None;
     }
     Some(())
