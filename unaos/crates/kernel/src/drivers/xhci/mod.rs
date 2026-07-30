@@ -5257,15 +5257,19 @@ impl XhciController {
     /// refuse only from Halted(2), Stopped(3) or Error(4), the states in which the field is
     /// defined to hold the controller's real consumer position.
     ///
-    /// Healthy path: a BOT transaction awaits each stage's completion before queuing the next, so
-    /// at most one TRB is ever outstanding on a 16-TRB ring; a Running endpoint returns `Ok` here
-    /// unconditionally, so on a healthy device this is behaviourally invisible. The refusal is
+    /// Healthy path: a BOT transaction awaits each DATA/CSW stage's completion before queuing the
+    /// next — but the CBW is pushed with no IOC and never separately awaited, so an OUT data stage
+    /// briefly has TWO TRBs outstanding under one doorbell (GR9 ONSET read, 2026-07-30; the old
+    /// "at most one TRB outstanding" claim was false). Still far from lapping a 16-TRB ring; a
+    /// Running endpoint returns `Ok` here unconditionally, so on a healthy device this is
+    /// behaviourally invisible. The refusal is
     /// reachable only when the controller has stopped consuming — where failing the transfer
     /// immediately is strictly better than overwriting TRBs it has not fetched.
     fn bot_ring_guard(&self, slot_id: u8, dci: u8, is_in: bool) -> Result<(), BotError> {
         // GUARD-STATE: never refuse against a Running(1) endpoint — nor a Disabled(0) or absent
         // (0xFF) one, where there is no consumer position to compare against either.
-        match self.ep_state_of(slot_id, dci) {
+        let epstate = self.ep_state_of(slot_id, dci);
+        match epstate {
             2 | 3 | 4 => {}
             _ => return Ok(()),
         }
@@ -5280,8 +5284,8 @@ impl XhciController {
             return Ok(());
         }
         serial_println!(
-            ":: BOT: ring refuse slot={} dci={} dir={} enq={} cycle={} ntrb={} ctxdeq={:#x} dcs={} — enqueue would lap the controller (xHCI 1.2 §4.9.1); stage failed instead of overrunning the ring ::",
-            slot_id, dci, if is_in { "in" } else { "out" },
+            ":: BOT: ring refuse slot={} dci={} dir={} epstate={} ctxdeq_valid=1 enq={} cycle={} ntrb={} ctxdeq={:#x} dcs={} — enqueue would lap the controller (xHCI 1.2 §4.9.1); stage failed instead of overrunning the ring ::",
+            slot_id, dci, if is_in { "in" } else { "out" }, epstate,
             r.enqueue_index(), if r.cycle_bit() { 1 } else { 0 }, r.num_trbs(),
             deq, deq & 1);
         Err(BotError::RingFull)
