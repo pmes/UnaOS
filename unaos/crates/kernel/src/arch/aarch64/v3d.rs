@@ -6766,6 +6766,10 @@ fn empty_frame_bisection() {
     // with an RCL-class queue, so every bin-class reading above must already be banked; and its
     // verdict is read AGAINST [v3d73]'s loaded-but-never-fetches fact from this same boot.
     v3d74_thread_swap();
+    // PI-V3D-75: the fabric-condition experiments ride LAST — [v3d74a]'s thread-0-never-starts
+    // verdict must already be banked on THIS boot's untouched fabric before either experiment
+    // (firmware ENABLE_QPU, then the M_CTRL=0x4040 write) mutates it.
+    v3d75_fabric_condition();
 }
 
 /// PI-V3D-63 — one banked rung's readback: the RANK 2 placement witness (the CT0/PCS words) plus the
@@ -9590,6 +9594,131 @@ fn v3d74_thread_swap() {
     serial_println!(
         ":: V3D: [v3d74b] bcl-on-ct1 — DOCUMENTED NO-OP, deliberately NOT kicked. The mirror would submit the Empty bin list on CT1's queue with the bin-side memory latches armed as v3d71 does — but the v3d_regs.h map this file transcribed says those latches are THREAD-0-ONLY: CT0QTS(0x15c)/CT0QMA(0x170)/CT0QMS(0x174) have NO CT1 counterparts (0x158 is CT1SYNC, 0x178 is CT1QCFG). Thread 1 has no PTB tile-memory plumbing to arm, so the mirror cannot be expressed — and a bin list reaching START_TILE_BINNING on a thread with no PTB access risks wedging CT1, the ONLY thread this campaign has ever seen retire ([v3d58] xengine) and the working reference every cross-engine verdict rests on. The discriminator is one-sided by hardware design; [v3d74a] carries the verdict alone ::"
     );
+}
+
+/// PI-V3D-75 — the fabric-condition experiments, from the S1S mid-bin piOS dump
+/// (`v3d-dump-mid-bin.txt`, 2026-07-30, in-span=True, settle-proven: CT0CS 0x20→0x00 with BFC
+/// 0xE4→0xE5 across 1 ms). The dump's three divergences from every wedged UnaOS reading:
+///
+///   1. `RPIVID_ASB_V3D_M_CTRL`: piOS mid-bin `0x4040` vs ours `0x4` after release. Mainline never
+///      writes any ASB register on BCM2711 (`bcm2835_power_power_on` returns early when rpivid_asb
+///      is present), so `0x4040` is the FIRMWARE's value — and our boot's entry read is `0x7`
+///      (parked), so the firmware only establishes bits 6/14 on the KMS-overlay boot. Both our
+///      stop/release are RMW: we never cleared those bits; we never received them.
+///   2. `LEGACY_ASB_V3D_{S,M}_CTRL`: piOS `0x5` (REQ_STOP held — legacy bridges deliberately
+///      parked). Read-only station here; recorded, not driven.
+///   3. `CT0CS` while genuinely fetching reads `0x20` (CTRUN alone); every wedged read is `0x70`
+///      (bits 4 and 6 on top). Not driven here either — but every [v3d75] kick prints CS so the
+///      signature rides the same line.
+///
+/// Two experiments, ordered least- to most-invasive, each followed by the [v3d74a] discriminator
+/// kick (the proven M3 RCL on CT0, bare QBA→QEA, sampler armed):
+///   A. mailbox `SET_ENABLE_QPU(1)` — ask the firmware to run ITS V3D init, then re-read M_CTRL.
+///      If the firmware's own path sets the missing bits, the fix is a mailbox call, not a poke.
+///   B. direct `M_CTRL = pw|0x4040` — transplant the working value verbatim, readback-audited.
+/// A kick that retires (store-verify / FRDONE / RFC Δ / CA in-span) after A or B convicts the
+/// fabric condition; both-still-dead banks the M_CTRL bits as exonerated alongside the submit.
+fn v3d75_fabric_condition() {
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down | V3dPresence::Poison(_) => {
+            serial_println!(
+                ":: V3D: [v3d75] SKIPPED — hub absent/poison (QEMU raspi4b or block-down). No experiment ran and NO verdict is implied ::"
+            );
+            return;
+        }
+    }
+    let m0 = mmio_read(RPIVID_ASB_BASE, ASB_V3D_M_CTRL);
+    let s0 = mmio_read(RPIVID_ASB_BASE, ASB_V3D_S_CTRL);
+    let lm = mmio_read(LEGACY_ASB_BASE, ASB_V3D_M_CTRL);
+    let ls = mmio_read(LEGACY_ASB_BASE, ASB_V3D_S_CTRL);
+    serial_println!(
+        ":: V3D: [v3d75] fabric-condition — station: RPIVID M_CTRL={:#010x} S_CTRL={:#010x} | LEGACY M={:#010x} S={:#010x} | piOS mid-bin reference M=0x00004040 S=0x00000004 LEGACY=0x00000005/0x00000005 — experiments A (firmware ENABLE_QPU) then B (M_CTRL=0x4040 transplant), each followed by the [v3d74a] discriminator kick ::",
+        m0, s0, lm, ls
+    );
+
+    // ── Experiment A: the firmware's own V3D init path. ──
+    match mailbox::set_enable_qpu(1) {
+        Some(r) => serial_println!(":: V3D: [v3d75a] SET_ENABLE_QPU(1) — mailbox OK reply={:#010x} ::", r),
+        None => serial_println!(":: V3D: [v3d75a] SET_ENABLE_QPU(1) — MAILBOX FAILED (tag unhandled or call error) ::"),
+    }
+    let m_a = mmio_read(RPIVID_ASB_BASE, ASB_V3D_M_CTRL);
+    serial_println!(
+        ":: V3D: [v3d75a] M_CTRL after ENABLE_QPU: {:#010x} (was {:#010x}, piOS ref 0x00004040) — {} ::",
+        m_a, m0,
+        if m_a != m0 { "THE FIRMWARE PATH TOUCHED THE BRIDGE — the missing init is mailbox-reachable" }
+        else { "unchanged — ENABLE_QPU alone does not program this bridge on this firmware" }
+    );
+    let a = v3d75_kick_probe("v3d75a post-enable-qpu");
+
+    // ── Experiment B: transplant the working value verbatim (skipped if A already retires). ──
+    if !a {
+        mmio_write(RPIVID_ASB_BASE, ASB_V3D_M_CTRL, PM_PASSWORD | 0x4040);
+        dsb();
+        let m_b = mmio_read(RPIVID_ASB_BASE, ASB_V3D_M_CTRL);
+        serial_println!(
+            ":: V3D: [v3d75b] M_CTRL transplant — wrote pw|0x4040, readback {:#010x} ({}) ::",
+            m_b,
+            if m_b == 0x4040 { "held" } else { "did NOT hold — bits read-only or firmware-owned" }
+        );
+        let b = v3d75_kick_probe("v3d75b post-transplant");
+        serial_println!(
+            ":: V3D: [v3d75] verdict — A(enable-qpu)={} B(m-ctrl-0x4040)={} — {} ::",
+            a as u32, b as u32,
+            if b { "THE WALL WAS THE FABRIC CONDITION — the transplanted M_CTRL value lets thread 0 start; productionize the init" }
+            else { "both experiments dead — the M_CTRL divergence is a passenger, not the condition; the firmware-init diff hunt continues (next stations: the KMS overlay's other VPU-side writes — full piOS/UnaOS boot-state diff)" }
+        );
+    } else {
+        serial_println!(
+            ":: V3D: [v3d75] verdict — A(enable-qpu)=1 — THE WALL WAS FIRMWARE-SIDE V3D INIT, and it is MAILBOX-REACHABLE: SET_ENABLE_QPU(1) lets thread 0 start; productionize the call in bringup ::"
+        );
+    }
+}
+
+/// PI-V3D-75's discriminator kick: the [v3d74a] leg, compacted — the proven M3 RCL on CT0's queue,
+/// bare QBA→QEA, [v3d73] sampler armed, store-verify + retire signals read. Returns true if the
+/// kick shows execution (store-verified / FRDONE / FLDONE / RFC Δ / CA reached QEA). Poison scans
+/// are not re-run here — [v3d74a] establishes evidence-integrity for this boot's arrangement.
+fn v3d75_kick_probe(label: &str) -> bool {
+    fill_target(0xDEAD_BEEF);
+    let (rcl_len, sublist_len) = build_rcl();
+    cache::clean_range(arena_phys() + OFF_TARGET, TARGET_BYTES);
+    cache::clean_range(arena_phys() + OFF_RCL, rcl_len);
+    cache::clean_range(arena_phys() + OFF_SUBLIST, sublist_len);
+    let ba = arena_phys() + OFF_RCL;
+    let ea = ba + rcl_len;
+    if !arena_contains(ba, rcl_len) {
+        serial_println!(":: V3D: [{}] RCL range escapes the arena — refusing kick (fail-closed) ::", label);
+        return false;
+    }
+    clear_mmu_fault_latch(label);
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
+    let rfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC);
+    v3d73_sampler_arm(ba as u32, ea as u32);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, ba as u32);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, ea as u32); // GO — queue auto-start
+    dsb();
+    let (sts, us, fldone) = wait_fldone(label, ba as u32, ea as u32);
+    let (smp_n, smp_in_span, smp_max) = v3d73_sampler_read_span();
+    let cs_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+    let ca_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
+    let rfc_delta = mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC).wrapping_sub(rfc_pre);
+    let frdone = sts & V3D_INT_FRDONE != 0;
+    cache::clean_invalidate_range(arena_phys() + OFF_TARGET, TARGET_BYTES);
+    let verified = verify_target(CLEAR_RGBA);
+    let executed = verified || frdone || fldone || rfc_delta != 0 || smp_max >= ea as u32;
+    serial_println!(
+        ":: V3D: [{}] kick — store-verified={} FRDONE={} FLDONE={} RFCΔ={} | CT0CS={:#010x} CT0CA={:#010x} | sampler samples={} in-span={} max-in-span={:#010x} vs QBA={:#010x} QEA={:#010x} | INT_STS={:#010x} waited={}us -> {} ::",
+        label, verified as u32, frdone as u32, fldone as u32, rfc_delta,
+        cs_done, ca_done, smp_n, smp_in_span, smp_max, ba as u32, ea as u32, sts, us,
+        if executed { "EXECUTED" } else if smp_in_span > 0 { "fetched-not-retired" } else { "DEAD" }
+    );
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
+    clear_mmu_fault_latch(label);
+    executed
 }
 
 /// Read a little-endian u32 out of the arena at `off` (probe scratch readback).

@@ -74,6 +74,7 @@ const TAG_GET_CLOCK_RATE: u32 = 0x0003_0002; // M6g: query a clock's current rat
 // byte-identical to baseline (these are additive, not called on any default path).
 #[cfg(any(feature = "v3d", feature = "piusb"))]
 const TAG_SET_DOMAIN_STATE: u32 = 0x0003_8030; // set a power-domain's on/off state (value {domain, state})
+const TAG_SET_ENABLE_QPU: u32 = 0x0003_0012; // firmware-side QPU/V3D enable (value {enable}) — the VPU init path the KMS overlay boot runs and a bare-metal boot never receives (PI-V3D-75)
 #[cfg(any(feature = "v3d", feature = "piusb"))]
 const TAG_SET_CLOCK_STATE: u32 = 0x0003_8001; // enable/disable a clock's GATE (value {clock_id, state})
 #[cfg(feature = "v3d")]
@@ -311,6 +312,26 @@ pub fn get_clock_rate(clock_id: u32) -> Option<u32> {
     }
     let rate = reply(6);
     if rate == 0 { None } else { Some(rate) }
+}
+
+/// PI-V3D-75: ask the FIRMWARE to enable the QPU/V3D (`SET_ENABLE_QPU`, `0x00030012`). This is the
+/// VPU-side V3D init path: on a KMS-overlay piOS boot the firmware runs its own V3D bring-up (the
+/// mid-bin dump's `RPIVID_ASB_V3D_M_CTRL=0x4040` is its signature), while a bare-metal boot gets the
+/// parked state (`0x7`, bridges stopped, bits 6/14 never set). Returns the firmware's reply word
+/// (observed 0 on success per the historic mailbox interface), or `None` on a mailbox failure.
+#[cfg(feature = "v3d")]
+pub fn set_enable_qpu(enable: u32) -> Option<u32> {
+    request(0, 7 * 4); // total size (7 words used)
+    request(1, 0); // request
+    request(2, TAG_SET_ENABLE_QPU);
+    request(3, 4); // value buffer size (1 word: enable)
+    request(4, 0); // request code
+    request(5, enable);
+    request(6, TAG_END);
+    if !mbox_call(7) {
+        return None;
+    }
+    Some(reply(5))
 }
 
 /// PI-V3D-1: turn a firmware power domain on (`state = 1`) or off (`0`). Returns the state the
