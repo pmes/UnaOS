@@ -6770,6 +6770,43 @@ fn empty_frame_bisection() {
     // verdict must already be banked on THIS boot's untouched fabric before either experiment
     // (firmware ENABLE_QPU, then the M_CTRL=0x4040 write) mutates it.
     v3d75_fabric_condition();
+    // PI-V3D-76: the full-window sweep rides dead-last — the wedged-state register file, in the
+    // bench dump's exact line format, for a whole-file diff against the piOS --sweep capture.
+    v3d76_sweep();
+}
+
+/// PI-V3D-76 — the full-window register sweep, wedged state. [v3d75] exonerated the curated
+/// divergences (M_CTRL is VPU-owned and its transplant bounced; ENABLE_QPU is unhandled), so the
+/// firmware-init diff moves from curated registers to the WHOLE defined file: hub control
+/// 0x0000-0x0100, MMUC 0x1000-0x1040, MMU 0x1200-0x1240, core0 0x4000-0x4A00 — defined windows
+/// only, no undefined-offset reads. Nonzero words only, in the bench script's exact
+/// `SWEEP phys=0x… val=0x…` format, so `diff` against a piOS `--sweep` capture is the instrument.
+/// Runs dead-last in the battery: this is the settled WEDGED state, every rung's residue included
+/// (which is the point — the piOS side is a settled RENDERING state).
+fn v3d76_sweep() {
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down | V3dPresence::Poison(_) => {
+            serial_println!(":: V3D: [v3d76] SKIPPED — hub absent/poison. No sweep ::");
+            return;
+        }
+    }
+    serial_println!(
+        ":: V3D: [v3d76] sweep — nonzero words in hub[0x0,0x100) mmuc[0x1000,0x1040) mmu[0x1200,0x1240) core0[0x4000,0x4A00), wedged state, bench-dump line format ::"
+    );
+    const WINDOWS: [(usize, usize); 4] =
+        [(0x0000, 0x100), (0x1000, 0x40), (0x1200, 0x40), (0x4000, 0xA00)];
+    for (start, span) in WINDOWS {
+        let mut off = 0;
+        while off < span {
+            let v = mmio_read(V3D_HUB_BASE, start + off);
+            if v != 0 {
+                serial_println!("SWEEP phys={:#010x} val={:#010x}", V3D_HUB_BASE + start + off, v);
+            }
+            off += 4;
+        }
+    }
+    serial_println!(":: V3D: [v3d76] sweep end ::");
 }
 
 /// PI-V3D-63 — one banked rung's readback: the RANK 2 placement witness (the CT0/PCS words) plus the
