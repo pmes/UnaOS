@@ -265,6 +265,15 @@ const SYS_INPUT_WAIT: u64 = 28;
 const SYS_WIN_CREATE: u64 = 29;
 const SYS_WIN_PRESENT: u64 = 30;
 
+// WITSWEEP — REGISTER-SURVIVAL INVARIANT (sys0..sys4): these stubs use `in("x1")`/`in("x2")`/
+// `in("x3")`/`in("x8")`, which PROMISES the compiler those registers hold their values across the
+// `svc`. That is sound today only because the kernel's SVC return path restores the full x0-x30 + FP
+// register file (`__vec_svc` → SAVE_GPRS/RESTORE_GPRS in arch/aarch64/exceptions.rs) — nothing about
+// the AArch64 call convention guarantees it. The x86 tree already hardens its sysret with a GPR
+// scrub; if that hardening ever lifts to aarch64, any SVC-return scrub arc MUST flip these
+// constraints to `inout("x1") a1 => _` (etc.) IN THE SAME COMMIT, or every stub here becomes
+// undefined behavior the moment the kernel stops restoring the clobbered registers. The identical
+// stub set in user-stat/src/main.rs carries the same invariant.
 #[inline(always)]
 unsafe fn sys0(n: u64) -> u64 {
     let mut r: u64;

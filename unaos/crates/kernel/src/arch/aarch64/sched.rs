@@ -3846,6 +3846,17 @@ pub fn futex_wake(key: u64, n: usize) -> usize {
         }
     }
     if buckets_hit > 1 {
+        // WITSWEEP — the witness's own blind spot, stated: `[futexdup]` CANNOT fire for an n==1 wake.
+        // The scan `break`s the moment the budget is met (`woken >= n` above), so a single-waiter wake
+        // that finds its waiter in the FIRST matching bucket never visits a second one — a duplicate
+        // pair keyed alike is then both UNWITNESSED (buckets_hit stays 1) and left UNDRAINED (the
+        // second bucket keeps its key and its waiter until some later wake on that key scans past the
+        // first). This arc's target case (user-vug's PHASE futex) wakes n==2, so the scan runs past
+        // the first bucket and the duplicate is both drained and counted; the blind spot is real only
+        // for keys woken strictly one-at-a-time, where the strand it could hide is also the one the
+        // full-scan fix exists to absorb. A zero FUTEX_DUP therefore means "no duplicate SEEN", not
+        // "no duplicate happened".
+        //
         // The race happened and the full scan absorbed it. Witness it: this exact shape was a silent
         // permanent strand before the fix, so each early occurrence is worth a line on the wire.
         FUTEX_DUP.fetch_add(1, Ordering::Relaxed);

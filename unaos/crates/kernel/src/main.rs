@@ -1174,6 +1174,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Gated on storage internally; re-flushes on growth, throttled; never blocks boot.
         #[cfg(target_arch = "x86_64")]
         unaos_kernel::flight_recorder::service();
+        // WITSWEEP (SERWIT-2 reachability): on x86 the mirror-tap announcement + one-shot verdict ride
+        // `flight_recorder::service()` (its first statement). That function is x86-only, so on aarch64
+        // the whole `[mirror]`/`:: SERWIT-2 ::` block never reached the wire and the TSTE tap-drop
+        // counters were write-only. Mirror the x86 placement here: this loop iteration is an IRQs-
+        // unmasked, no-locks-held, non-print context, exactly the contract `mirror_service` states.
+        // Always-on — SERWIT is law, not a knob. (The aarch64 BAREMETAL builds never reach this loop —
+        // the scheduler path owns them; their call rides `pump_usb_into_gui`, see there.)
+        #[cfg(target_arch = "aarch64")]
+        unaos_kernel::serial_ring::mirror_service();
         // U2 (x86): once a block device is present, load HELLO.BIN off the FAT volume and run it in
         // ring 3 (one-shot, gated like probe_once). Must live HERE, in the main loop — not with the
         // pre-xHCI U1a/U1b demo — because `fat::mount()` needs the usb-storage block device that
@@ -2567,6 +2576,14 @@ fn typematic_selftest() {
 /// `GUI_CHANNEL.send` never blocks while holding the controller. Same global handle `enumerate` seeded.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn pump_usb_into_gui() {
+    // WITSWEEP (SERWIT-2 reachability, baremetal leg): the aarch64 baremetal builds never reach the
+    // shared BSP loop below (the scheduler path owns them), so the mirror-tap announcement + one-shot
+    // verdict ride this pass instead — it runs from `usb_pump` (~4 ms cadence, metal) and from the
+    // `input_service` poll-nap branch (every cooperative pass, QEMU raspi4b), i.e. on every baremetal
+    // variant. Placed BEFORE the XHCI_CONTROLLER lock: `mirror_service` prints, and its contract is
+    // IRQs unmasked, no locks held, non-print context — all true at the top of a scheduled-task pass.
+    // A few relaxed atomic loads when quiet; prints only on un-announced loss + the one-shot verdict.
+    unaos_kernel::serial_ring::mirror_service();
     if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
         x.poll_events();
         x.service_storage();

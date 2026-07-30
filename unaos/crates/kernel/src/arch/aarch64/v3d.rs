@@ -2931,27 +2931,30 @@ fn wait_fldone(what: &str, trace_ba: u32, trace_ea: u32) -> (u32, u64, bool) {
             // the deadline check and can be up to one poll-iteration stale. On the exit whose whole
             // claim is "FLDONE never latched across the entire wait", a stale final sample could miss a
             // bit that set in the last microseconds and turn a near-miss into a false negative. The
-            // mask is read at the same instant so the pair is coherent.
+            // mask is read at the same instant so the pair is coherent. WITSWEEP: the [v3d44] line
+            // below (and the timeout return value) now print/carry this fresh `sts_final` sample —
+            // previously the fresh read fed only the [v3d56] triple and was then discarded, so the
+            // timeout line and every downstream inheritor reported the provably-stale loop `sts`.
             let sts_final = mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS);
             v3d56_emit_int_triple(what, sts_entry, msk_entry, sts_final, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_MSK_STS));
-            let qpu_vec = (sts & V3D_INT_QPU_MASK) >> V3D_INT_QPU_SHIFT; // which QPU(s) raised a host int
+            let qpu_vec = (sts_final & V3D_INT_QPU_MASK) >> V3D_INT_QPU_SHIFT; // which QPU(s) raised a host int
             serial_println!(
                 ":: V3D: [v3d44] FLDONE timeout ({}) — INT_STS={:#010x} (FRDONE={} FLDONE={} OUTOMEM={} SPILLUSE={} TRFB={} GMPV={} QPU_vec={:#06x}) — {} ::",
-                what, sts,
-                (sts & V3D_INT_FRDONE != 0) as u32,
-                (sts & V3D_INT_FLDONE != 0) as u32,
-                (sts & V3D_INT_OUTOMEM != 0) as u32,
-                (sts & V3D_INT_SPILLUSE != 0) as u32,
-                (sts & V3D_INT_TRFB != 0) as u32,
-                (sts & V3D_INT_GMPV != 0) as u32,
+                what, sts_final,
+                (sts_final & V3D_INT_FRDONE != 0) as u32,
+                (sts_final & V3D_INT_FLDONE != 0) as u32,
+                (sts_final & V3D_INT_OUTOMEM != 0) as u32,
+                (sts_final & V3D_INT_SPILLUSE != 0) as u32,
+                (sts_final & V3D_INT_TRFB != 0) as u32,
+                (sts_final & V3D_INT_GMPV != 0) as u32,
                 qpu_vec,
-                if sts & V3D_INT_OUTOMEM != 0 {
+                if sts_final & V3D_INT_OUTOMEM != 0 {
                     "OUTOMEM fired: the binner stalled waiting for overflow tile-alloc memory — the pre-armed BPOA/BPOS block was too small or not honoured"
-                } else if sts & V3D_INT_GMPV != 0 {
+                } else if sts_final & V3D_INT_GMPV != 0 {
                     "GMPV fired: a GMP memory-protection violation blocked the flush"
-                } else if sts & V3D_INT_QPU_MASK != 0 {
+                } else if sts_final & V3D_INT_QPU_MASK != 0 {
                     "QPU host-interrupt latched but NO FLDONE: the coord shader ran to a program-end-interrupt yet the PTB never flushed — the QPU signalled completion while the bin pipeline stayed open (see [v3d45] CLE/PTB dump for the wedge)"
-                } else if sts == 0 {
+                } else if sts_final == 0 {
                     "no interrupt latched at all: the flush never even began to retire (chase START_TILE_BINNING / PTB bring-up)"
                 } else {
                     "an interrupt other than FLDONE latched — see the raw bits above"
@@ -3031,7 +3034,10 @@ fn wait_fldone(what: &str, trace_ba: u32, trace_ea: u32) -> (u32, u64, bool) {
             // PI-V3D-55 (RANK 3a): the timeout path is where the clock verdict matters most — 0.5 s of
             // wall clock elapsed with no flush; did the core clock advance at all across it?
             emit_v3d55_clock_liveness(what, pctr_en, &t_cyc, waited_us, samples);
-            return (sts, waited_us, false);
+            // WITSWEEP: return the fresh timeout-instant sample, not the loop's stale `sts` — the
+            // callers that print this value ([v3d44] FLDONE wait, the bisect ladder, [v3d54]
+            // resubmit) inherit evidence, and stale evidence poisons every one of them.
+            return (sts_final, waited_us, false);
         }
         core::hint::spin_loop();
     }
@@ -6519,6 +6525,7 @@ fn submit_bisect_rung_geom(
             bin_ba,
             bin_len: bin_len as u32,
             retired,
+            int_sts: sts, // WITSWEEP: pre-W1C sample from wait_fldone — see V3d63Rung
             ct0lc: mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0LC),
             ct0pc: mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0PC),
             ct0ca: mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA),
@@ -6540,6 +6547,7 @@ fn submit_bisect_rung_geom(
             bin_ba,
             bin_len: bin_len as u32,
             retired,
+            int_sts: sts, // WITSWEEP: pre-W1C sample from wait_fldone — no extra MMIO issued
             ct0lc: 0,
             ct0pc: 0,
             ct0ca: 0,
@@ -6734,6 +6742,10 @@ struct V3d63Rung {
     bin_ba: u32,    // the CL's PHYSICAL base as latched into CT0QBA
     bin_len: u32,   // built list length in bytes
     retired: bool,
+    // WITSWEEP: the INT_STS sample `wait_fldone` took BEFORE its retire-path W1C — the only sample
+    // that can still show FLDONE (and companions) for a retired rung. Callers must use this, never
+    // a post-wait MMIO re-read, which is 0 by construction after the W1C.
+    int_sts: u32,
     ct0lc: u32,
     ct0pc: u32,
     ct0ca: u32,
@@ -7966,7 +7978,11 @@ fn v3d68_run_rung(name: &str, g: &V3d68Geom, content: BinContent) -> V3d68Read {
     let bpcs = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCS);
     let bpos = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPOS);
     let bxcf = mmio_read(V3D_CORE0_BASE, V3D_PTB_BXCF);
-    let int_sts = mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS);
+    // WITSWEEP: INT_STS comes from the rung's pre-W1C sample (`r.int_sts`), NOT a re-read here.
+    // `wait_fldone` W1C-clears the latched status on its retire path, so a post-wait MMIO re-read
+    // printed 0 for every RETIRED rung by construction — and that pinned zero fed shape_signature(),
+    // making retired and non-retired rungs contribute asymmetric evidence to the geometry comparison.
+    let int_sts = r.int_sts;
     let bfc = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
     // The [v3d56] evidence-integrity rule: an "untouched" readback is only evidence if the L2T
     // write-back actually finished, so keep the completion bit and print it with the verdict.

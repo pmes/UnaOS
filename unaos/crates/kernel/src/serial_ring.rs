@@ -645,8 +645,11 @@ pub fn serwit_snapshot() -> (u64, u64, u64) {
 //   * **Sinks that are a VIEW** (`fbcon`) stay legitimately lossy. Painting a deferred backlog means
 //     glyph work inside the masked, locked critical section that PANEL-DEFER exists to keep short, and
 //     the line is on the wire regardless — the panel is the one sink whose loss costs no evidence. So
-//     the obligation there is the weaker half of the law: every miss is COUNTED, and announced both on
-//     the panel (a `[fbcon] N line(s) missed` marker) and on the wire (see [`mirror_service`]).
+//     the obligation there is the weaker half of the law: every miss COUNTED and announced both on the
+//     panel (a `[fbcon] N line(s) missed` marker) and on the wire. That half is OWED, not delivered:
+//     the fbcon counted-loss hunk was deliberately excluded at SERWIT-2 (1e733367) and lands at fbcon
+//     convergence. Until then [`TAP_FBCON`] has no writer, and [`mirror_verdict_once`] reports the tap
+//     as UNWIRED rather than folding its all-zero ledger into the conservation claim.
 //
 // ### Why none of this can deadlock, stall or contend a breadcrumb
 //
@@ -911,7 +914,10 @@ impl TapCounters {
     }
 }
 
-/// The on-screen console mirror (legitimately lossy — counted, never staged).
+/// The on-screen console mirror (legitimately lossy — counted, never staged). UNWIRED as of
+/// SERWIT-2: the fbcon counted-loss instrumentation was deliberately excluded there (1e733367)
+/// and lands at fbcon convergence, so nothing writes this ledger yet and the verdict reports the
+/// tap as unwired instead of claiming a vacuous balance.
 pub static TAP_FBCON: TapCounters = TapCounters::new();
 /// The FTDI console capture — the bench's own capture path. Staged; must not lose lines.
 pub static TAP_FTDI: TapCounters = TapCounters::new();
@@ -985,10 +991,11 @@ const MIRROR_WINDOW: u64 = 64;
 /// main loop, after the boot fixtures (SERWIT-1's own multi-core burst included) have run through all
 /// four taps under real contention.
 ///
-/// PASS demands, for every tap, that the conservation law balances — no line is unaccounted for — AND
-/// that the three EVIDENCE taps lost nothing. `fbcon`'s misses are reported but are not fatal: the
-/// panel is a view, the line is on the wire regardless, and the property being proven for it is that a
-/// miss is visible rather than that it never happens.
+/// PASS demands, for every WIRED tap, that the conservation law balances — no line is unaccounted
+/// for — AND that the three EVIDENCE taps lost nothing. `fbcon` is reported as UNWIRED and excluded
+/// from the claim entirely: its counted-loss instrumentation was deliberately excluded at SERWIT-2
+/// (1e733367) and lands at fbcon convergence, so an all-zero fbcon ledger is absence of a witness,
+/// not a balanced one, and folding it into "every line accounted for" would be an over-claim.
 fn mirror_verdict_once() {
     if MIRROR_VERDICT_DONE.swap(true, Ordering::Relaxed) {
         return;
@@ -999,6 +1006,12 @@ fn mirror_verdict_once() {
     let mut snap: [(&'static str, (u64, u64, u64, u64, u64, u64), u64, u64); 4] =
         [("", (0, 0, 0, 0, 0, 0), 0, 0); 4];
     for (i, (name, t)) in taps().into_iter().enumerate() {
+        // WITSWEEP: `fbcon` is UNWIRED (no submit() call anywhere until fbcon convergence) — skip
+        // it here so its vacuously-zero ledger neither passes nor fails the conservation claim.
+        if name == "fbcon" {
+            snap[i] = (name, (0, 0, 0, 0, 0, 0), 0, 0);
+            continue;
+        }
         let tally = t.tally();
         let inflight = tap_inflight(name);
         let (submitted, absorbed, _staged, dropped, suppressed, _torn) = tally;
@@ -1010,11 +1023,16 @@ fn mirror_verdict_once() {
             balanced = false;
         }
         snap[i] = (name, tally, inflight, gap);
-        if name != "fbcon" {
-            evidence_lost += dropped;
-        }
+        evidence_lost += dropped;
     }
     for (name, (submitted, absorbed, staged, dropped, suppressed, torn), inflight, gap) in snap {
+        if name == "fbcon" {
+            serial_println!(
+                ":: SERWIT-2 tap fbcon: submitted=unwired (counted-loss instrumentation owed at \
+                 fbcon convergence, excluded at SERWIT-2 / 1e733367) ::"
+            );
+            continue;
+        }
         serial_println!(
             ":: SERWIT-2 tap {}: submitted={} absorbed={} staged={} dropped={} suppressed={} torn={} inflight={} in_progress={} ::",
             name, submitted, absorbed, staged, dropped, suppressed, torn, inflight, gap
@@ -1022,8 +1040,9 @@ fn mirror_verdict_once() {
     }
     if balanced && evidence_lost == 0 {
         serial_println!(
-            ":: SERWIT-2: mirror taps — every line accounted for on all 4 taps, 0 lost on the 3 \
-             evidence taps (ftdi/tste/flightrec) -> PASS ::"
+            ":: SERWIT-2: mirror taps — every line accounted for on the 3 wired taps, 0 lost on \
+             the 3 evidence taps (ftdi/tste/flightrec); fbcon tap unwired until fbcon convergence \
+             -> PASS ::"
         );
     } else {
         serial_println!(
