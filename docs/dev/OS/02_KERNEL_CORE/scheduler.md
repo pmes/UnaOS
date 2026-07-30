@@ -970,7 +970,13 @@ found by source audit. `PSTATE.F` is masked kernel-wide: boot enters Rust with
 `SPSR_EL2 = 0x3c5` (D/A/I/F all set) and `enable_irq` clears only I and A, so
 the *scheduler* context — which is where the wedged core is — has FIQ masked
 too. And `__vec_fiq` is a halting fault dead-end, not a resumable handler, so an
-FIQ that did land would kill the core it was sent to diagnose. There is also an
+FIQ that did land would kill the core it was sent to diagnose.
+
+Both are confirmed on silicon by a line the boot prints for another reason
+entirely: `:: AARCH64 boot diag: EL=1 CNTFRQ=54000000 Hz MMU=on DAIF(DAIF)=0b1111 ::`.
+All four DAIF bits masked, and **`EL=1`** — the kernel has already dropped out of
+EL2 by then, so a sampler must read `ELR_EL1`/`SPSR_EL1`. Any plan written
+against `ELR_EL2` is a wasted build. There is also an
 open GIC-side question: `GICD_IGROUPRn` and `GICC_CTLR.FIQEn` are Secure-only in
 the GICv2 Non-secure view, so a Group-0/FIQ-routed SGI may not be reachable from
 where this kernel runs at all, and the BCM2711 ARM-local per-core mailbox FIQ
