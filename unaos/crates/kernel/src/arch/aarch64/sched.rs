@@ -1619,11 +1619,23 @@ static SPREAD6_REFRESH: AtomicU64 = AtomicU64::new(0);
 /// SPREAD-7 — EL0 wakes that landed in the TICK-QUANTIZED arm of the wake path: the woken task is an
 /// equal-or-higher-band peer (below the service band) of the task running on its target core, so
 /// nothing preempts for it — it waits in the run queue for the incumbent's next dispatch boundary,
-/// up to a full quantum (~12 ms). See `preempt_hint`'s SPREAD-7 section for why this arm is counted
-/// rather than trimmed. On a frame-barrier fleet this climbs at roughly the fleet's park rate;
+/// up to a full quantum (~12 ms) before SPREAD-8's same-band trim (see `preempt_hint`'s SPREAD-7 and
+/// SPREAD-8 sections). On a frame-barrier fleet this climbs at roughly the fleet's park rate;
 /// `quant` flat while the fleet stutters means wakes are landing on idle cores or being absorbed by
 /// the spin windows, and the ceiling is elsewhere.
 static SPREAD7_QUANT: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-8 — equal-band EL0 wakes that TRIMMED the incumbent's quantum (the policy SPREAD-7's
+/// diagnosis proposed, now implemented in `preempt_hint`'s same-band arm). Counted only when the
+/// `swap(1)` actually LOWERED the countdown (previous value > 1) — a wake landing when the incumbent
+/// was already on its final tick changed nothing and is not counted, so `trim <= quant` by
+/// construction and the gap is the already-about-to-yield population. On a storm this climbs at
+/// roughly the fleet's park rate, and `wd_mean` on the same line drops from half-quantum scale
+/// (~6000 us) to at most one tick (~4000 us worst, less typically). The counter moves under QEMU
+/// too (`dispatch_next` stores `QUANTUM_TICKS` on every dispatch, so the swap reads > 1), but with
+/// no live timer IRQ the shortened countdown is never consumed — the latency effect is metal-only,
+/// as with every preemption behaviour in this module.
+static SPREAD8_TRIM: AtomicU64 = AtomicU64::new(0);
 
 /// SPREAD-7 — wake-to-dispatch latency for EL0 wakes: CNTPCT cycles from `make_ready`'s stamp to the
 /// `dispatch_next` that first runs the woken task, summed / counted / max'd. This prices the
@@ -2124,18 +2136,31 @@ fn poke_cpu(target: usize) {
 /// rendezvous and nothing parked. The ceiling was never a target or a cap (VUG-PACE) — it is wake
 /// latency quantized by the co-resident's quantum.
 ///
-/// CROSS-ARCH CONVERGENCE, AND WHY THIS ARM COUNTS INSTEAD OF TRIMMING. x86's `make_ready` has the
-/// same three-arm shape: idle target -> IPI-paced (our `poke_cpu` SGI, already present and
-/// metal-validated); higher-band wake -> preempt (our service trim above); equal-or-lower-band wake
-/// onto a busy core -> WAITS FOR THE TICK, on both arches, as designed. Changing that last arm —
-/// e.g. extending the quantum trim to same-band EL0 wakes (`prio >= cur`, one `quantum.store(1)`,
-/// bounded by the tick rate so it cannot re-run SPREAD-4's churn) — is a scheduling-POLICY decision
-/// that belongs to review, not to this seat. What lands here is the instrument that decision needs:
-/// `SPREAD7_QUANT` counts exactly the wakes that arm quantizes (a woken EL0 task, below the service
-/// band, equal-or-higher than the target core's running band — an idle core reads `CUR_PRIO ==
-/// PRIO_NONE` (`u8::MAX`) and never matches), and the wake-to-dispatch stamps in `dispatch_next`
-/// price what each one cost. `quant` climbing at the fleet's park rate with `wd_mean` in the
-/// half-quantum range IS the ceiling, live on the wire.
+/// CROSS-ARCH CONVERGENCE. x86's `make_ready` has the same three-arm shape: idle target ->
+/// IPI-paced (our `poke_cpu` SGI, already present and metal-validated); higher-band wake -> preempt
+/// (our service trim above); equal-or-lower-band wake onto a busy core -> waits for the tick, on
+/// both arches, as SCHED-PRIO designed it. SPREAD-7 landed the instrument for that last arm:
+/// `SPREAD7_QUANT` counts exactly the wakes it quantizes (a woken EL0 task, below the service band,
+/// equal-or-higher than the target core's running band — an idle core reads `CUR_PRIO == PRIO_NONE`
+/// (`u8::MAX`) and never matches), and the wake-to-dispatch stamps in `dispatch_next` price what
+/// each one cost. `quant` climbing at the fleet's park rate with `wd_mean` in the half-quantum
+/// range IS the ceiling, live on the wire.
+///
+/// ### SPREAD-8 — the same-band trim (the policy, implemented)
+/// POLICY: an equal-band wake is worth at most ONE tick of the incumbent's time, not a full
+/// quantum. SPREAD-7's wire pricing (pi4-r23s1r) is the motivation: every uncaught rendezvous paid
+/// a mean ~6 ms / worst ~12 ms of pure run-queue wait behind an incumbent of the SAME band, and
+/// that wait — not rendering, not compositing — was the whole fps ceiling. So the same-band arm now
+/// gets the SCHED-PRIO trim: `prio >= cur` => the incumbent's countdown drops to 1. The TICK BOUND
+/// is the churn guard: the incumbent still finishes its current tick (nothing is switched out by
+/// force, exactly as the service trim above), so the worst case is one extra dispatch boundary per
+/// tick per core — structurally incapable of re-running SPREAD-4's ~540-moves/s disease, whose
+/// engine was per-frame MIGRATION, not dispatch. Same safety argument as the service trim: the swap
+/// only ever lowers the countdown toward 1 (a raced `quantum.store(QUANTUM_TICKS)` from the owning
+/// core loses at most this wake's trim — the pre-SPREAD-8 behaviour), `timer_preempt` remains the
+/// sole consumer, and `CUR_PRIO` is still the only cross-core read. `SPREAD8_TRIM` counts the wakes
+/// whose swap actually lowered a countdown, so the wire can prove the policy fires (`trim=` beside
+/// `quant=` on the `[spread7]` line, climbing together at the park rate).
 fn preempt_hint(target: usize, prio: u8, el0: bool) {
     let cur = CUR_PRIO[target].load(Ordering::Relaxed);
     if prio >= PRIO_SERVICE {
@@ -2145,11 +2170,16 @@ fn preempt_hint(target: usize, prio: u8, el0: bool) {
         }
         return;
     }
-    // SPREAD-7: count the tick-quantized population. `prio >= cur` with `prio < PRIO_SERVICE`
-    // implies `cur` is a real below-service level, so PRIO_NONE (idle) and any service-band runner
-    // are excluded for free. Counting only — the trim for this arm is a policy proposal (above).
+    // SPREAD-7 count + SPREAD-8 trim: `prio >= cur` with `prio < PRIO_SERVICE` implies `cur` is a
+    // real below-service level, so PRIO_NONE (idle) and any service-band runner are excluded for
+    // free. An equal-band wake is worth at most ONE tick of the incumbent's time, not a full
+    // quantum (see SPREAD-8 above): trim the countdown, tick-bounded, and count both the quantized
+    // population (quant=) and the trims that actually shortened a countdown (trim=).
     if el0 && prio >= cur {
         SPREAD7_QUANT.fetch_add(1, Ordering::Relaxed);
+        if SCHED[target].quantum.swap(1, Ordering::Relaxed) > 1 {
+            SPREAD8_TRIM.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -5179,19 +5209,23 @@ fn spread4_witness() {
 
 /// SPREAD-7 — the wake-quantization proof line, emitted beside `[spread4]` from the same sites.
 /// `quant` is how many EL0 wakes landed in the tick-quantized arm (equal-or-higher band than the
-/// target's running task, below the service band — nothing preempts for them; see `preempt_hint`);
-/// `wake2disp` prices ALL EL0 wakes: mean and max CNTPCT-derived microseconds from `make_ready` to
-/// first dispatch, over `n` wakes. The P79 ceiling reads as `quant` climbing at the fleet park rate
-/// with `wd_mean` in the thousands of microseconds (half-quantum scale); a healthy fleet reads
-/// `wd_mean` in the tens (SGI + dispatch pass). Cumulative counters, reads only, safe from any core.
+/// target's running task, below the service band; see `preempt_hint`); `trim` (SPREAD-8) is how
+/// many of those wakes actually shortened the incumbent's countdown — the same-band trim policy
+/// firing; `wake2disp` prices ALL EL0 wakes: mean and max CNTPCT-derived microseconds from
+/// `make_ready` to first dispatch, over `n` wakes. The P79 ceiling read as `quant` climbing at the
+/// fleet park rate with `wd_mean` in the thousands of microseconds (half-quantum scale); with
+/// SPREAD-8 in force the expected signature is `trim` climbing beside `quant` and `wd_mean`
+/// bounded by one tick (~4000 us worst). A healthy fleet reads `wd_mean` in the tens (SGI +
+/// dispatch pass). Cumulative counters, reads only, safe from any core.
 fn spread7_witness() {
     let n = SPREAD7_WD_N.load(Ordering::Relaxed);
     let sum = SPREAD7_WD_SUM.load(Ordering::Relaxed);
     let frq = load_window_cyc().saturating_mul(4).max(1); // == CNTFRQ_EL0, cached
     let cyc_per_us = (frq / 1_000_000).max(1);
     serial_println!(
-        "[spread7] quant={} wake2disp n={} mean={}us max={}us",
+        "[spread7] quant={} trim={} wake2disp n={} mean={}us max={}us",
         SPREAD7_QUANT.load(Ordering::Relaxed),
+        SPREAD8_TRIM.load(Ordering::Relaxed),
         n,
         sum.checked_div(n).unwrap_or(0) / cyc_per_us,
         SPREAD7_WD_MAX.load(Ordering::Relaxed) / cyc_per_us,

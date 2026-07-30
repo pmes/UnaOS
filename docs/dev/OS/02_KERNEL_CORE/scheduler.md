@@ -616,6 +616,40 @@ is a scheduling-policy decision reserved for review, not landed unilaterally.
   counters only, as with every preemption behaviour — the numbers are metal
   evidence.
 
+#### SPREAD-8 — the same-band wake quantum trim (pre-staged; lands on approval)
+
+SPREAD-8 implements the candidate fix SPREAD-7 reserved for review. **This
+change lands only on Peter's approval** — it is built and gated on the track
+branch so the fold is immediate once the policy is signed off, but it is not
+part of the trunk until then.
+
+**The policy.** An equal-band wake is worth at most **one tick** of the
+incumbent's time, not a full quantum. `preempt_hint`'s same-band arm — the one
+SPREAD-7 counted (`el0 && prio >= cur`, below the service band; an idle core
+reads `PRIO_NONE` and never matches) — now applies the SCHED-PRIO trim:
+`quantum.swap(1)`, dropping the incumbent's countdown to its final tick.
+
+**The bound.** The trim is tick-bounded: the incumbent always finishes its
+current tick (nothing is switched out by force — `timer_preempt` remains the
+sole consumer of the countdown, exactly as with the service-band trim), so the
+worst case is one extra dispatch boundary per tick per core. That is
+structurally incapable of re-running SPREAD-4's ~540-moves/s churn, whose
+engine was per-frame *migration*; this trims a countdown in place and moves
+nothing. The cross-core race with the owning core's own
+`quantum.store(QUANTUM_TICKS)` is benign as before: losing it costs one wake
+its trim — the pre-SPREAD-8 behaviour.
+
+**The wire signature.** The `[spread7]` line gains `trim=` — wakes whose swap
+actually *lowered* a countdown (previous value > 1), so `trim ≤ quant` and the
+gap is wakes that met an incumbent already on its final tick. Expected on a
+storm run: `trim` climbing at roughly the fleet's park rate beside `quant`;
+`wake2disp mean` dropping from half-quantum scale (~6000 µs) to at most one
+tick (~4000 µs worst, less typically); the floor windows' fps roughly
+tripling as their 26–48 ms frames lose the quantum-scale queue waits. QEMU
+moves the counters (every dispatch stores `QUANTUM_TICKS`, so the swap reads
+> 1) but has no live timer IRQ to consume the shortened countdown — the
+latency effect, like every preemption behaviour, is metal evidence.
+
 ### Futex duplicate-bucket lost wake (aarch64, FUTEX-DUP / VUG-PACE-2)
 
 The other half of VUG-PACE-2, and the win1 lockup's root cause. `futex_wait`
