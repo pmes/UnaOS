@@ -3964,6 +3964,15 @@ pub struct Semaphore {
 // the type doc for the full happens-before argument.
 unsafe impl Sync for Semaphore {}
 
+/// WEDGE-5 (2026-07-30, the P94/P95 rx-backstop starvation): the semaphore raw lock was the ONLY
+/// unwitnessed masked spin on the starved task's path (the run-queue lock has WEDGE-4 and never
+/// fired). Episodes crossing the stall threshold count here; the max spin ever seen rides beside
+/// it. Printed by [spin1] from the witness core — never from inside the spin (the serial lock must
+/// not nest under a stalled acquisition).
+static SEM_STALL_EPISODES: AtomicU64 = AtomicU64::new(0);
+static SEM_SPIN_MAX: AtomicU64 = AtomicU64::new(0);
+const SEM_STALL_SPINS: u64 = 50_000_000; // ~seconds at spin_loop speed — far past any honest hold
+
 impl Semaphore {
     /// Construct a semaphore with `initial` permits. `const` so it can initialise a `static`.
     pub const fn new(initial: i64) -> Self {
@@ -3984,9 +3993,27 @@ impl Semaphore {
 
     #[inline]
     fn lock_raw(&self) {
+        // WEDGE-5: witnessed like the run-queue lock — count the stall, never print in here (the
+        // serial lock must not nest under a stalled acquisition).
+        let mut spins: u64 = 0;
         while self.locked.swap(true, Ordering::Acquire) {
+            spins = spins.wrapping_add(1);
+            if spins == SEM_STALL_SPINS {
+                SEM_STALL_EPISODES.fetch_add(1, Ordering::Relaxed);
+            }
             core::hint::spin_loop();
         }
+        SEM_SPIN_MAX.fetch_max(spins, Ordering::Relaxed);
+    }
+
+    /// WEDGE-5 introspection for the [spin1] witness: (locked, count, waiters_len). The waiters
+    /// length is read UNLOCKED — witness-only; a torn read is acceptable and never dereferenced.
+    pub fn debug_state(&self) -> (bool, i64, usize) {
+        (
+            self.locked.load(Ordering::Relaxed),
+            self.count.load(Ordering::Relaxed),
+            unsafe { (*self.waiters.get()).len() },
+        )
     }
 
     #[inline]
@@ -5591,10 +5618,19 @@ fn pulse5_witness() {
             let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
             if !raw.is_null() {
                 let (id, name, st) = unsafe { ((*raw).id, (*raw).name, (*raw).state.load(Ordering::Relaxed)) };
+                let (rxl, rxc, rxw) = {
+                    #[cfg(feature = "baremetal")]
+                    { crate::arch::serial::RX_READY.debug_state() }
+                    #[cfg(not(feature = "baremetal"))]
+                    { (false, 0i64, 0usize) }
+                };
                 serial_println!(
-                    "[spin1] cpu={} span={}ms task={}:{} state={} park={} — one task has owned this core the whole span; the [prio]/[comp2] lines beside this name the starvation",
+                    "[spin1] cpu={} span={}ms task={}:{} state={} park={} | rx_ready locked={} count={} waiters={} | sem_stalls={} sem_spin_max={} — one task has owned this core the whole span; the [prio]/[comp2] lines beside this name the starvation",
                     cpu, cyc_to_ms(ACCT[cpu].live_span_cyc()), id, name, st,
-                    SCHED[cpu].park_kind.load(Ordering::Relaxed)
+                    SCHED[cpu].park_kind.load(Ordering::Relaxed),
+                    rxl as u32, rxc, rxw,
+                    SEM_STALL_EPISODES.load(Ordering::Relaxed),
+                    SEM_SPIN_MAX.load(Ordering::Relaxed)
                 );
             }
         }
