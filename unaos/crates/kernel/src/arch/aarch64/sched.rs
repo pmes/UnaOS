@@ -4298,11 +4298,21 @@ struct FutexBucket {
     /// Raw spinlock guarding `key` + `waiters` (Acquire on lock, Release on unlock; the PARK_WAITQ
     /// lock-handoff releases it AFTER the scheduler pushes the blocking Box).
     locked: AtomicBool,
-    /// WEDGE-6 — who holds `locked` right now: `((cpu + 1) << 32) | (tid as u32)`, `0` = free. Written
-    /// immediately after the acquisition and cleared immediately before the release, so a stalled
-    /// spinner can name the CULPRIT and not just itself. This is the field W4-B gets for free from
-    /// `IN_RQ_SECTION`; the futex bucket had no equivalent, and a witness that names only the victim
-    /// costs a whole boot to follow up. Diagnostic only — never read on a control path.
+    /// WEDGE-6 — who holds `locked`: `((cpu + 1) << 32) | (tid as u32)`. This is the field W4-B gets
+    /// for free from `IN_RQ_SECTION`; the futex bucket had no equivalent, and a witness that names
+    /// only the victim costs a whole boot to follow up. Diagnostic only — never read on a control path.
+    ///
+    /// **The invariant is "valid while `locked` is true", NOT "0 means free".** `unlock_raw` clears it,
+    /// but the PARK_WAITQ lock-handoff does not: the scheduler releases the handed-off lock in
+    /// `park_blocked` with a bare `(*lock).store(false)` through a `*const AtomicBool`, which cannot
+    /// reach a bucket-specific field (the same handoff serves `Semaphore` and `Condvar`). So after a
+    /// handoff release this word is stale until the next acquirer overwrites it.
+    ///
+    /// That costs the witness nothing, because the stall loop only spins — and so only ever reads this
+    /// — while `locked` is true, and the one case the witness exists for is precisely a waiter that
+    /// parked across the switch and is STILL holding the lock. There, the stale-after-release window
+    /// does not exist and this word names exactly the right task. Do not grow a second reader that
+    /// treats `0` as "free".
     holder: AtomicU64,
     /// The physical-address key this bucket serves, or 0 = free. Claimed on the first waiter for a key,
     /// released back to 0 when its last waiter leaves.
@@ -4342,9 +4352,10 @@ fn futex_stall_witness(b: &FutexBucket) {
     w4_str(" key=");
     w4_dec(b.key.load(Ordering::Relaxed));
     // WEDGE-6: name the CULPRIT, not just the victim — W4-B's owner_core/owner_tid, which the futex
-    // bucket now carries in its own word. `holder=0` here is itself a reading: the lock is held by a
-    // core that acquired it before this field existed on that path, or it was released between the
-    // spin bound and this print (in which case the stall is contention, not a stuck holder).
+    // bucket now carries in its own word. Read while `locked` is true (we are inside the stall loop),
+    // which is exactly the state the field's invariant covers — see `FutexBucket::holder`. A zero here
+    // means the acquirer had not yet published itself when we sampled: a few instructions wide, so
+    // reaching a 2^26 spin bound inside it means the lock is free and something else is wrong.
     let h = b.holder.load(Ordering::Acquire);
     if h != 0 {
         w4_str(" holder_core=");
@@ -4352,7 +4363,7 @@ fn futex_stall_witness(b: &FutexBucket) {
         w4_str(" holder_tid=");
         w4_dec(h & 0xffff_ffff);
     } else {
-        w4_str(" holder=NONE(released-under-us)");
+        w4_str(" holder=UNPUBLISHED");
     }
     w4_str(" — this bucket's raw lock has been held past every legitimate hold; the prime suspect is a waiter that parked across the switch on a core that never reached park_blocked\r\n");
 }
