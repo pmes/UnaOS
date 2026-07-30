@@ -490,6 +490,18 @@ struct CoreAccount {
     win_idle_cyc: AtomicU64,
     /// Busy percent (0..=100) of the last COMPLETED window, or `LOAD_PCT_NONE` before the first.
     recent_pct: AtomicU32,
+    /// SPREAD-9 — the SERVICE-BAND share of `win_busy_cyc`: CNTPCT cycles of the current window
+    /// spent executing tasks whose BASE priority is `>= PRIO_SERVICE`. Always `<= win_busy_cyc`
+    /// (folded by the same call, same single writer, same window roll). Exists so EL0 placement can
+    /// subtract the time that no longer competes with EL0: with services preempting at IPI receipt
+    /// (`ipi_preempt`), service execution costs an EL0 co-resident latency measured in
+    /// microseconds, and letting it inflate the placement percent kept a hole in the fleet's
+    /// spread wherever the service band currently lived.
+    win_svc_cyc: AtomicU64,
+    /// SPREAD-9 — service-band busy percent (0..=100) of the last COMPLETED window (0 before the
+    /// first — with no history the honest default is "no service load", which reduces to the
+    /// pre-arc reading). Companion of `recent_pct`, filled by the same window roll.
+    recent_svc_pct: AtomicU32,
     /// PULSE-5 — CNTPCT timestamp at which the CURRENTLY-EXECUTING task's span began on this core,
     /// or 0 when this core is not inside a task (scheduler overhead, idle, or it left `run()`).
     /// Published by the owning core immediately before `switch_context` and cleared by the fold in
@@ -531,6 +543,8 @@ impl CoreAccount {
             win_busy_cyc: AtomicU64::new(0),
             win_idle_cyc: AtomicU64::new(0),
             recent_pct: AtomicU32::new(LOAD_PCT_NONE),
+            win_svc_cyc: AtomicU64::new(0),
+            recent_svc_pct: AtomicU32::new(0),
             run_t0: AtomicU64::new(0),
             last_acct_cyc: AtomicU64::new(0),
             last_seq: AtomicU64::new(0),
@@ -541,12 +555,17 @@ impl CoreAccount {
     }
 
     /// SCHED-5 — fold a measured span into the rolling window (single-writer, owning core). Exactly one
-    /// of `busy_cyc` / `idle_cyc` is non-zero per call: `account(delta, 0)` after a task's execution
-    /// span (around `switch_context`), `account(0, delta)` after an idle WFI. On window completion
+    /// of `busy_cyc` / `idle_cyc` is non-zero per call: `account(delta, 0, ..)` after a task's execution
+    /// span (around `switch_context`), `account(0, delta, 0)` after an idle WFI. On window completion
     /// (busy+idle cycles reaching the ~250 ms budget) it snapshots the busy TIME fraction and resets.
     /// Relaxed loads/stores are sound because only this core's scheduler loop ever writes its slot.
+    ///
+    /// SPREAD-9 — `svc_cyc` is the service-band portion of `busy_cyc`: equal to it when the span just
+    /// measured belonged to a task of BASE priority `>= PRIO_SERVICE`, else 0 (and always 0 on the
+    /// idle call). It rides the same fold so `win_svc_cyc`/`recent_svc_pct` can never skew against
+    /// the totals they are subtracted from.
     #[inline]
-    fn account(&self, busy_cyc: u64, idle_cyc: u64) {
+    fn account(&self, busy_cyc: u64, idle_cyc: u64, svc_cyc: u64) {
         // SCHED-8: mark the slot fresh — every dispatch pass in `run()` folds a span, so a core still
         // inside the scheduler keeps this current; a core that left `run()` stops touching it (goes STALE).
         self.last_acct_cyc.store(now_cyc(), Ordering::Relaxed);
@@ -557,13 +576,17 @@ impl CoreAccount {
         self.run_t0.store(0, Ordering::Relaxed);
         let busy = self.win_busy_cyc.load(Ordering::Relaxed) + busy_cyc;
         let idle = self.win_idle_cyc.load(Ordering::Relaxed) + idle_cyc;
+        let svc = self.win_svc_cyc.load(Ordering::Relaxed) + svc_cyc;
         let total = busy + idle;
         if total >= load_window_cyc() {
             self.recent_pct.store((busy * 100 / total) as u32, Ordering::Relaxed); // total>=budget>0
+            self.recent_svc_pct.store((svc * 100 / total) as u32, Ordering::Relaxed); // SPREAD-9
+            self.win_svc_cyc.store(0, Ordering::Relaxed);
             self.win_idle_cyc.store(0, Ordering::Relaxed);
             self.win_busy_cyc.store(0, Ordering::Release); // PULSE-5: publishes the `run_t0` clear
             PULSE5_FOLD_WINDOWS.fetch_add(1, Ordering::Relaxed);
         } else {
+            self.win_svc_cyc.store(svc, Ordering::Relaxed);
             self.win_idle_cyc.store(idle, Ordering::Relaxed);
             self.win_busy_cyc.store(busy, Ordering::Release); // PULSE-5: publishes the `run_t0` clear
         }
@@ -641,6 +664,51 @@ impl CoreAccount {
             // rate. `busy` < 2*budget and `recent` <= 100, so both products stay far inside u64.
             let rem = budget - elapsed;
             (((busy * 100 + recent as u64 * rem) / budget) as u32).min(100)
+        }
+    }
+
+    /// SPREAD-9 — busy percent EXCLUDING the service band: the load figure EL0 placement weighs now
+    /// that services preempt at IPI receipt. Same three-case shape and read ordering as `busy_pct`
+    /// (which see), with the service share removed from each term:
+    ///
+    ///   * the windowed part subtracts `win_svc_cyc` from `win_busy_cyc` (same fold, so never skewed
+    ///     the wrong way; `saturating_sub` covers the one-call read race between the two loads);
+    ///   * the in-flight span counts only if the task executing RIGHT NOW is below the band —
+    ///     `live_is_svc` is the caller's `CUR_PRIO` read for this core, the same published word
+    ///     `preempt_hint` keys on;
+    ///   * the historical fill uses `recent_pct - recent_svc_pct` (snapshotted by the same roll).
+    ///
+    /// ELAPSED time keeps the FULL busy (service included): the answer is "what fraction of this
+    /// core's time went to work an EL0 arrival would actually wait behind", not a renormalization
+    /// that would inflate the EL0 share on a service-heavy core.
+    fn el0_busy_pct(&self, live_is_svc: bool) -> u32 {
+        let budget = load_window_cyc();
+        // Acquire pairs with `account`'s Release store; it must be read BEFORE `run_t0` (see `run_t0`).
+        let win_busy = self.win_busy_cyc.load(Ordering::Acquire);
+        let win_svc = self.win_svc_cyc.load(Ordering::Relaxed);
+        let win_idle = self.win_idle_cyc.load(Ordering::Relaxed);
+        let live = self.live_span_cyc();
+        let live_el0 = if live_is_svc { 0 } else { live };
+        if live_el0 >= budget {
+            return 100; // case 1 — the whole window is one uninterrupted below-band execution span
+        }
+        let el0_busy = win_busy.saturating_sub(win_svc) + live_el0;
+        let elapsed = win_busy + live + win_idle;
+        let recent = self.recent_pct.load(Ordering::Relaxed);
+        if elapsed >= budget || recent == LOAD_PCT_NONE {
+            // case 2 (and the pre-first-window fallback): measured time only.
+            if elapsed == 0 {
+                0
+            } else {
+                ((el0_busy * 100 / elapsed) as u32).min(100)
+            }
+        } else {
+            // case 3 — measured part at full weight, the unmeasured remainder at the last window's
+            // below-band rate.
+            let recent_el0 =
+                recent.saturating_sub(self.recent_svc_pct.load(Ordering::Relaxed)) as u64;
+            let rem = budget - elapsed;
+            (((el0_busy * 100 + recent_el0 * rem) / budget) as u32).min(100)
         }
     }
 
@@ -821,6 +889,16 @@ impl RunQueue {
     /// to pick the least-loaded core (introspection under the run-queue lock, never on the switch path).
     fn len(&self) -> usize {
         self.levels.iter().map(VecDeque::len).sum()
+    }
+    /// SPREAD-9 — ready tasks BELOW the service band: the depth EL0 placement weighs. A queued
+    /// service-band task is not competition an EL0 task will ever wait a quantum behind — it
+    /// preempts at IPI receipt, runs a micro pass and blocks — so counting it made the core hosting
+    /// the services read deeper than the load an EL0 arrival would actually contend with (the
+    /// placement half of the dissolved service-core reserve). Effective level is the right key here:
+    /// an aged-up EL0 task sitting IN the band is transiently excluded, which errs toward the old
+    /// (conservative) reading for exactly the population the anti-starvation valve is about to run.
+    fn len_below_band(&self) -> usize {
+        self.levels[..PRIO_SERVICE as usize].iter().map(VecDeque::len).sum()
     }
     /// Dequeue the front of the HIGHEST non-empty level (strict priority over the effective level,
     /// round-robin within).
@@ -1585,7 +1663,10 @@ fn rewake_place(home: usize) -> usize {
         if ACCT[cpu].fold_age_cyc() >= fresh {
             continue; // not provably dispatching — never hand it a task only it can run
         }
-        let pct = ACCT[cpu].busy_pct();
+        // SPREAD-9: the tie-break percent excludes service-band time, exactly as in `pick_cpu` — a
+        // waking task must not decline the core the service band lives on for load that would
+        // preempt-and-vanish rather than compete (the rewake half of the dissolved reserve).
+        let pct = ACCT[cpu].el0_busy_pct(CUR_PRIO[cpu].load(Ordering::Relaxed) >= PRIO_SERVICE);
         if act < best_act || (act == best_act && pct < best_pct) {
             best = cpu;
             best_act = act;
@@ -1646,6 +1727,30 @@ static SPREAD7_WD_SUM: AtomicU64 = AtomicU64::new(0);
 static SPREAD7_WD_N: AtomicU64 = AtomicU64::new(0);
 static SPREAD7_WD_MAX: AtomicU64 = AtomicU64::new(0);
 
+/// SPREAD-9 — the pending IPI-receipt preemption, per CPU: the highest service BAND whose wake is
+/// queued on this core and found a LOWER-band incumbent running (0 = none pending; every real band
+/// is `>= 1`, and only service bands `>= PRIO_SERVICE` are ever stored). Set by `preempt_hint`'s
+/// service arm BEFORE `make_ready` sends the wake SGI (so the flag is visible by the time the SGI
+/// lands), consumed exactly once (`swap(0)`) by `ipi_preempt` on the target core — one preemption
+/// per IPI, by construction. `fetch_max` rather than `store` so two concurrent wakes of different
+/// service bands leave the higher one pending.
+static KICK_BAND: [AtomicU8; NUM_CPUS] = [const { AtomicU8::new(0) }; NUM_CPUS];
+
+/// SPREAD-9 — IPI-receipt preemptions performed: `ipi_preempt` found a pending kick band above the
+/// running task's and dispatched from the IRQ-exit path instead of returning to the incumbent. On
+/// metal under fleet load this climbs with the service wake rate; the wakes it serves are the ones
+/// whose `svc_lat` collapses from tick scale to IPI scale.
+static SPREAD9_KICK: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-9 — service-band wake-to-dispatch latency (CNTPCT cycles): `make_ready` stamp to first
+/// dispatch, for wakes of BASE priority `>= PRIO_SERVICE` (the population `preempt_hint`'s service
+/// arm and `ipi_preempt` serve). Split from the SPREAD-7 aggregates so the EL0 `wake2disp` pricing
+/// keeps its exact population and the service band's number is readable on its own: this is the
+/// figure that should sit at IPI scale (mean < 100 us) once services preempt at IPI receipt.
+static SPREAD9_SVC_SUM: AtomicU64 = AtomicU64::new(0);
+static SPREAD9_SVC_N: AtomicU64 = AtomicU64::new(0);
+static SPREAD9_SVC_MAX: AtomicU64 = AtomicU64::new(0);
+
 /// SPREAD-4 — rate limit for the per-event `[spread4] rewake` trace, on the same terms as
 /// `[smpbal] steal`: name the first few moves, then go quiet so a steadily-rebalancing desktop cannot
 /// flood the serial log. The cumulative counters in `spread4_witness` carry the steady state.
@@ -1696,8 +1801,16 @@ fn pick_cpu(requested: usize) -> usize {
             continue;
         }
         let res = el0_active(cpu); // SPREAD-4: runnable residents, not merely committed ones
-        let depth = rq(cpu).len();
-        let pct = ACCT[cpu].busy_pct();
+        // SPREAD-9 — the dissolved service-core reserve: keys 2 and 3 now weigh only work that
+        // actually COMPETES with a new arrival. A queued/running service-band task preempts at IPI
+        // receipt, runs a micro pass and blocks — it is latency-invisible to a co-resident — but the
+        // full depth and the service-inclusive busy percent made whichever core currently hosted the
+        // band read loaded, so placement steered the fleet around a hole that followed the services
+        // (the ~40%-busy core beside three 99% ones under an 18-task storm). Below-band depth and
+        // the service-subtracted percent are the same signals minus exactly that time; the service
+        // tasks themselves keep their pins and their placement freedom untouched.
+        let depth = rq(cpu).len_below_band();
+        let pct = ACCT[cpu].el0_busy_pct(CUR_PRIO[cpu].load(Ordering::Relaxed) >= PRIO_SERVICE);
         let better = res < best_res
             || (res == best_res
                 && (depth < best_depth || (depth == best_depth && pct < best_pct)));
@@ -2167,6 +2280,17 @@ fn preempt_hint(target: usize, prio: u8, el0: bool) {
         if prio > cur {
             SCHED[target].quantum.store(1, Ordering::Relaxed);
             PRIO_DEFER[target].fetch_add(1, Ordering::Relaxed);
+            // SPREAD-9 — arm the IPI-receipt preemption: a HIGHER-band service wake no longer waits
+            // for the next timer tick. `make_ready` calls this hint BEFORE it sends the wake SGI, so
+            // by the time `gic::handle_irq` acks that SGI on the target the band is pending there and
+            // `ipi_preempt` (IRQ-exit, post-EOI — the same boundary `timer_preempt` uses) dispatches
+            // instead of returning to the incumbent. The quantum trim above is kept as the fallback
+            // for the races (kick consumed by an earlier in-flight SGI, IRQ landing inside a masked
+            // section): the wake then costs at most one tick, the SCHED-PRIO behaviour. Equal-band
+            // wakes (`prio == cur`) deliberately take neither arm here and keep SPREAD-8's one-tick
+            // policy — immediate preemption is the service band's alone, so the fleet cannot churn
+            // itself with it.
+            KICK_BAND[target].fetch_max(prio, Ordering::Relaxed);
         }
         return;
     }
@@ -2276,18 +2400,22 @@ fn make_ready(mut task: Box<Task>) {
     // belongs to whichever core dispatches it next and must not be touched from here).
     let prio = task.priority;
     let el0 = task.user_entry != 0;
-    if el0 {
-        // SPREAD-7: stamp the wake so the dispatching core can price the run-queue wait. EL0 only —
-        // that is the population whose frame rendezvous the [spread7] witness is instrumenting, and
-        // it keeps the kernel-worker wake traffic (sleeper drain, semaphores) out of the mean.
+    if el0 || prio >= PRIO_SERVICE {
+        // SPREAD-7: stamp the wake so the dispatching core can price the run-queue wait. EL0 (the
+        // population whose frame rendezvous the [spread7] witness is instrumenting) — and, SPREAD-9,
+        // the service band, whose wait lands in the separate `svc_lat` aggregates. Ordinary
+        // kernel-worker wake traffic (sleeper drain, semaphores) stays out of both means.
         task.wake_cyc = now_cyc();
     }
     rq(target).push(task);
-    poke_cpu(target);
     // SCHED-PRIO: the wake path is where interactive latency is actually decided — `GUI_CHANNEL.recv`
     // (compositor), `RX_READY.wait` (input router) and `sleep_ticks` (HID pump) all come back through
-    // here. Called AFTER the push and the poke so the task is already queued when the target looks.
+    // here. Called AFTER the push (the task must already be queued when the target looks) and —
+    // SPREAD-9 — BEFORE the poke: the hint's service arm arms `KICK_BAND`, and the flag has to be
+    // set before the SGI it answers is sent, or the target's `ipi_preempt` could ack the SGI, find
+    // no pending band, and return to the incumbent it was meant to preempt.
     preempt_hint(target, prio, el0);
+    poke_cpu(target);
 }
 
 /// Cooperatively give up the CPU: mark this task ready and switch back to the scheduler, which
@@ -2937,6 +3065,66 @@ pub fn timer_preempt() {
     }
 }
 
+/// SPREAD-9 — preempt at IPI RECEIPT: the wake SGI's answer to `preempt_hint`'s service arm. Called
+/// from `gic::handle_irq` AFTER EOI when the acked INTID was an SGI, on the core the SGI targeted —
+/// the exact position `timer_preempt` occupies for the timer PPI, and deliberately so: it reuses
+/// `timer_preempt`'s context-switch machinery verbatim (mark the incumbent READY, `switch_context`
+/// to the scheduler from the IRQ frame; the task resumes here IRQ-masked when re-dispatched and
+/// unwinds back through `__vec_irq`'s epilogue, which restores its banked ELR/SPSR/SP_EL0). No new
+/// switch path exists.
+///
+/// The policy, and the bound: ONE preemption per IPI, service band only. The pending band is
+/// consumed with a single `swap(0)`, so an SGI can trigger at most one dispatch; the band is only
+/// ever armed by a service-band wake that found a LOWER-band incumbent, so the fleet (PRIO_NORMAL)
+/// can never preempt itself and no wake-storm churn regression is possible — an EL0 wake takes
+/// exactly the SPREAD-7/8 path it took before this arc. Equal-band service wakes never arm the kick
+/// (`prio > cur` in the hint), keeping SPREAD-8's approved one-tick policy for that arm.
+///
+/// Why dispatching here is sound, point by point:
+///   * RqGuard/WEDGE-4: every run-queue section runs IRQ-masked (`rq`), so this IRQ cannot have
+///     landed inside one; the `IN_RQ_SECTION` check below is the same tripwire `timer_preempt`
+///     carries, made load-bearing — on a breach we DECLINE the switch (the armed quantum trim
+///     still bounds the wake at one tick) rather than dispatch over a torn queue.
+///   * Nesting: the IRQ vector runs with IRQ masked end to end and `switch_context` banks DAIF, so
+///     there is no nested-IRQ context to dispatch from — exactly the `timer_preempt` situation.
+///   * The re-check against `CUR_PRIO` is this core's OWN word (published by `dispatch_next`), so
+///     a stale hint — the incumbent already switched to a service task by the time the SGI lands —
+///     declines instead of preempting the band with itself.
+///
+/// On QEMU raspi4b the SGIs are live (unlike the timer PPI), so the gate exercises this path end to
+/// end; the LATENCY effect it exists for is metal-only, as with every preemption behaviour here.
+pub fn ipi_preempt() {
+    if !SCHED_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let band = KICK_BAND[cpu].swap(0, Ordering::Relaxed);
+    if band == 0 {
+        return; // ordinary wake ping — breaking the WFI was the whole job
+    }
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
+    if raw.is_null() {
+        return; // scheduler/idle context — the interrupted dispatch loop picks the wake up itself
+    }
+    if CUR_PRIO[cpu].load(Ordering::Relaxed) >= band {
+        return; // incumbent is already at/above the woken band — nothing to reclaim
+    }
+    if IN_RQ_SECTION[cpu].load(Ordering::Acquire) != 0 {
+        return; // discipline breach (never expected): decline; the quantum trim still bounds the wake
+    }
+    // SKILL-1 on-CPU kill boundary, exactly as at the top of `timer_preempt`'s switch arm: this is a
+    // legitimate involuntary boundary, so a killed incumbent dies here rather than running on.
+    kill_check_current();
+    SPREAD9_KICK.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        (*raw).state.store(STATE_READY, Ordering::Release);
+        switch_context(
+            &raw mut (*raw).ctx_sp,
+            SCHED[cpu].scheduler_sp.load(Ordering::Acquire),
+        );
+    }
+}
+
 /// Dispatch the front task of `cpu`'s queue: switch into it, and when it switches back (yield /
 /// preempt / exit) requeue it (READY) or free it (FINISHED). Returns whether a task ran. The caller
 /// runs on this CPU's scheduler stack. IRQ is masked across pop+switch (nothing may re-enter the
@@ -2995,7 +3183,8 @@ fn dispatch_next(cpu: usize) -> bool {
     // `preempt_hint` possible. BASE priority is what is counted and published: a task the aging sweep
     // lifted is a below-band task that the ANTI-STARVATION path is running, not a band win, and it
     // must not be able to shield itself from a real service wake by wearing the band's number.
-    if task.priority >= PRIO_SERVICE {
+    let svc_band = task.priority >= PRIO_SERVICE;
+    if svc_band {
         PRIO_SVC_DISPATCH[cpu].fetch_add(1, Ordering::Relaxed);
     }
     if task.user_entry != 0 {
@@ -3009,9 +3198,19 @@ fn dispatch_next(cpu: usize) -> bool {
     if task.wake_cyc != 0 {
         let wait = now_cyc().saturating_sub(task.wake_cyc);
         task.wake_cyc = 0;
-        SPREAD7_WD_SUM.fetch_add(wait, Ordering::Relaxed);
-        SPREAD7_WD_N.fetch_add(1, Ordering::Relaxed);
-        SPREAD7_WD_MAX.fetch_max(wait, Ordering::Relaxed);
+        if task.priority >= PRIO_SERVICE {
+            // SPREAD-9: a service-band wake — price it in the svc_lat aggregates, NOT the SPREAD-7
+            // ones, so the EL0 wake2disp population is exactly what it was before this arc. BASE
+            // priority decides, mirroring the stamp site (`make_ready`) — an aged-up EL0 task was
+            // stamped as EL0 and is priced as EL0.
+            SPREAD9_SVC_SUM.fetch_add(wait, Ordering::Relaxed);
+            SPREAD9_SVC_N.fetch_add(1, Ordering::Relaxed);
+            SPREAD9_SVC_MAX.fetch_max(wait, Ordering::Relaxed);
+        } else {
+            SPREAD7_WD_SUM.fetch_add(wait, Ordering::Relaxed);
+            SPREAD7_WD_N.fetch_add(1, Ordering::Relaxed);
+            SPREAD7_WD_MAX.fetch_max(wait, Ordering::Relaxed);
+        }
     }
     task.state.store(STATE_RUNNING, Ordering::Release);
     SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed);
@@ -3061,7 +3260,9 @@ fn dispatch_next(cpu: usize) -> bool {
     // core. Re-assert the mask explicitly so that safety doesn't rest on an inherited DAIF that a
     // future switch-in path could leave enabled.
     mask_irq();
-    ACCT[cpu].account(busy_cyc, 0); // fold this task's execution span into the rolling load window
+    // Fold this task's execution span into the rolling load window; SPREAD-9 — tag the span with its
+    // band so `el0_busy_pct` can subtract service time from what EL0 placement weighs.
+    ACCT[cpu].account(busy_cyc, 0, if svc_band { busy_cyc } else { 0 });
     // SCHED-7: publish this pass's busy span so `run()` can subtract it from the pass's total wall
     // span and fold the remainder (scheduler overhead, then the WFI/poll-spin) in as idle.
     PASS_BUSY_CYC[cpu].store(busy_cyc, Ordering::Relaxed);
@@ -3410,7 +3611,7 @@ fn run(cpu: usize) -> ! {
         // (task-execution / wall-time): ~0 for a provably-idle workload, ~100 for a CPU-bound one.
         let t_now = now_cyc();
         let busy = PASS_BUSY_CYC[cpu].swap(0, Ordering::Relaxed);
-        ACCT[cpu].account(0, t_now.wrapping_sub(t_prev).saturating_sub(busy));
+        ACCT[cpu].account(0, t_now.wrapping_sub(t_prev).saturating_sub(busy), 0);
         t_prev = t_now;
     }
 }
@@ -5229,6 +5430,21 @@ fn spread7_witness() {
         n,
         sum.checked_div(n).unwrap_or(0) / cyc_per_us,
         SPREAD7_WD_MAX.load(Ordering::Relaxed) / cyc_per_us,
+    );
+    // SPREAD-9 — the immediate-preemption proof line, beside [spread7] so the before/after is one
+    // wire read. `kick` = IPI-receipt preemptions performed (`ipi_preempt` dispatched instead of
+    // returning to the incumbent); `svc_lat` = service-band wake-to-dispatch, the number the kicks
+    // exist to collapse. Metal expectation under fleet load: `kick` climbing with the service wake
+    // rate and `svc_lat` mean < 100 us (IPI + dispatch pass — down from tick scale). In QEMU the
+    // SGIs are live but timer-driven service wakes are not, so the gate proves the counters and the
+    // switch path, not the latency.
+    let sn = SPREAD9_SVC_N.load(Ordering::Relaxed);
+    serial_println!(
+        "[spread9] kick={} svc_lat n={} mean={}us max={}us",
+        SPREAD9_KICK.load(Ordering::Relaxed),
+        sn,
+        SPREAD9_SVC_SUM.load(Ordering::Relaxed).checked_div(sn).unwrap_or(0) / cyc_per_us,
+        SPREAD9_SVC_MAX.load(Ordering::Relaxed) / cyc_per_us,
     );
 }
 

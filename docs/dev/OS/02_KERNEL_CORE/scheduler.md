@@ -650,6 +650,66 @@ moves the counters (every dispatch stores `QUANTUM_TICKS`, so the swap reads
 > 1) but has no live timer IRQ to consume the shortened countdown — the
 latency effect, like every preemption behaviour, is metal evidence.
 
+### Service-band IPI-receipt preemption + the dissolved reserve (aarch64, SPREAD-9)
+
+Two coupled changes, from the bench observation that the service band's home
+core sat at ~40% busy while three others ran 99% under an 18-task fleet storm:
+the services must preempt *now*, and once they can, nothing needs to hold a
+core open for them.
+
+**The policy.**
+
+* A **higher-band service wake preempts at IPI receipt**, not at the next
+  timer tick. `preempt_hint`'s service arm (`prio >= PRIO_SERVICE`,
+  `prio > cur`) keeps its SCHED-PRIO quantum trim (now the fallback) and
+  additionally arms a per-CPU pending band, `KICK_BAND[target]`
+  (`fetch_max`, so concurrent wakes leave the higher band pending).
+  `make_ready` orders push → hint → `poke_cpu`, so the flag is set before the
+  wake SGI is sent. On the target, `gic::handle_irq`'s SGI arm runs
+  `sched::ipi_preempt` **after EOI** — the exact position and rationale of the
+  `timer_preempt` call beside it — which consumes the band (`swap(0)`),
+  re-checks it against this core's own `CUR_PRIO`, and dispatches via the
+  existing `switch_context`-from-the-IRQ-frame machinery. No new switch path;
+  the preempted task resumes through `__vec_irq`'s epilogue as with a timer
+  preemption.
+* **Equal-band wakes keep SPREAD-8's one-tick trim** (the approved policy).
+  Immediate preemption is the service band's alone.
+* **The service-core reserve is dissolved.** EL0 placement previously weighed
+  two figures that included service load — total ready-queue depth and the
+  service-inclusive rolling busy percent — so whichever core currently hosted
+  the band (it migrates; the hole followed it) read loaded and repelled the
+  fleet. `pick_cpu` now keys on `len_below_band()` (ready tasks below
+  `PRIO_SERVICE`) and `el0_busy_pct()` (busy percent minus the service-band
+  share, tracked by a parallel `win_svc_cyc`/`recent_svc_pct` fold in
+  `CoreAccount::account`; the in-flight span is excluded when `CUR_PRIO` says
+  the running task is in the band). `rewake_place`'s tie-break percent gets
+  the same substitution. The service tasks themselves keep their band, their
+  pins and their placement freedom — only the *fleet's* view of them changes.
+
+**The bound.** One preemption per IPI (the single `swap(0)`), service band
+only. The fleet (PRIO_NORMAL) can never arm the kick, so it cannot preempt
+itself and no wake-storm churn regression is possible: an EL0 wake takes
+exactly the SPREAD-7/8 path it took before. `ipi_preempt` declines when the
+core is idle/in the scheduler, when the incumbent is already at/above the
+woken band, and on an `IN_RQ_SECTION` breach (WEDGE-4's law — run-queue
+sections are IRQ-masked, so the IRQ cannot have landed inside one; the check
+is the same tripwire `timer_preempt` carries, made load-bearing). Every
+decline leaves the armed quantum trim, so the wake still costs at most one
+tick.
+
+**The wire signature.** A `[spread9]` line beside `[spread7]` (same emit
+sites, so before/after is one read):
+`[spread9] kick=N svc_lat n=N mean=Xus max=Yus` — `kick` is IPI-receipt
+preemptions performed; `svc_lat` prices service-band wake-to-dispatch
+(stamped in `make_ready`, consumed at first dispatch, split from the EL0
+`wake2disp` aggregates so that population is unchanged). Metal expectation
+under storm: `kick` climbing with the service wake rate, `svc_lat` mean
+< 100 µs (IPI + dispatch pass, down from tick scale), all four cores reaching
+99% under fleet load with the mouse fluid. QEMU raspi4b delivers SGIs (so the
+gate exercises `ipi_preempt` end to end and the counters/line shape), but the
+timer-driven service cadences are absent — the latency collapse is metal
+evidence, as with every preemption behaviour here.
+
 ### Futex duplicate-bucket lost wake (aarch64, FUTEX-DUP / VUG-PACE-2)
 
 The other half of VUG-PACE-2, and the win1 lockup's root cause. `futex_wait`

@@ -765,9 +765,10 @@ pub fn handle_irq() {
 
     if intid < 16 {
         // SGI (inter-processor interrupt). INTID = the IPI channel, bits[12:10] = source core.
-        // For now the only IPI is a wake/reschedule ping, which just needs to have interrupted the
-        // idle WFE — count it (per-core) as proof of cross-core delivery. M3 hangs the scheduler
-        // reschedule off this.
+        // The wake/reschedule ping: count it (per-core) as proof of cross-core delivery; breaking
+        // an idle core's WFI needs nothing more. SPREAD-9: on a BUSY core the ping may also carry a
+        // pending service-band preemption — that runs after EOI (`sched::ipi_preempt`, below), never
+        // here (a context switch before EOI would leave the SGI active across the switch).
         crate::arch::percpu::count_ipi();
     } else if intid == crate::arch::timer::TIMER_INTID {
         // The handler re-arms the timer (clearing its level-sensitive line) before we EOI.
@@ -793,6 +794,15 @@ pub fn handle_irq() {
     #[cfg(feature = "baremetal")]
     if intid == crate::arch::timer::TIMER_INTID {
         crate::arch::sched::timer_preempt();
+    }
+    // SPREAD-9: the wake SGI is now a PREEMPTION boundary, not just a WFI break. Same post-EOI
+    // position and same rationale as timer_preempt above (ipi_preempt may context-switch away and
+    // must not do so with the SGI still active on this CPU interface). It consumes the per-CPU kick
+    // the waker armed (sched::KICK_BAND, via preempt_hint) and dispatches only for a service-band
+    // wake that outranks the running task — see sched::ipi_preempt for the policy and the bound.
+    #[cfg(feature = "baremetal")]
+    if intid < 16 {
+        crate::arch::sched::ipi_preempt();
     }
 }
 
