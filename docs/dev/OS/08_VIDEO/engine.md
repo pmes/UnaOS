@@ -5655,3 +5655,51 @@ session owner: at the tail, per pixel, against the finished front. The sessionle
 Hardware verification is owed at the next attended sitting: pointer parked over the presenting
 fleet, read `[flick2]` for `sess_undraws`/`mask_sess` collapsing and `down_slow` flat while
 `compose_through` climbs at present cadence, and the stutter gone from the chair.
+### CLOSE-FIX — the wire discriminator, the real-path close leg, and the teardown guard (2026-07-29)
+
+P82, bench: `[clickroute] close=win3 asid=3085 at (961,599) settle=noproc` on a live boot —
+asid 3085 is `0xC0D`, the hit-test battery's leg-9 synthetic owner. The line was read as a REAL
+operator close carrying the selftest's fake ASID (kill finds no process, the vug survives its
+window, `jobs` accumulates undead rows). Reproducing the gate at bench geometry
+(`UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test`) shows the deeper defect: **leg 9's own
+wire line is byte-for-byte the shape of that failure** — `close=win3 asid=3085 at (960,600)
+settle=noproc`, at the boot cursor's panel centre — so the wire could not distinguish the
+battery's benign no-op from a click that killed nobody, and the REQUIRE passed either way. That
+is a gate-honesty defect, and the class it slept through is real: any synthetic row that
+outlives the battery sits in the table with a high z, hit-tests FIRST over a real window's close
+box, and starves the real owner's kill for the whole boot. Three fixes, one arc:
+
+1. **The discriminator.** `wc_close_click`'s out-of-slot-range arm now settles
+   `noproc-selftest`, a distinct tag; plain `noproc` is reserved for a REAL slot ASID with no
+   live process — P82's exact kill-finds-nobody shape. The spec REQUIREs the selftest tag and
+   FORBIDs plain `noproc` on the headless gate outright (no operator clicks there, so nothing
+   may legitimately print it).
+2. **Leg 10 (`closereal=`).** The close arm re-proven against a row the battery created through
+   the ordinary path (`wa`), through the shipped router, asserting: the NAMED row is the reaped
+   row, the settle read-back (`wc_close_last_settle`, a witness-only code the wire line cannot
+   provide to a leg) is `noproc-selftest` and nothing else, press consumed, focus to the shell.
+   A router that threads a constant, resolves the wrong row, or regresses the discriminator
+   fails this leg; leg 9 alone cannot catch any of the three.
+3. **The teardown witness guard + close fall-through.** `hittest_selftest`'s tail now sweeps the
+   table for rows still owned by any battery ASID and reaps them, printing
+   `[clickroute] hit-test teardown LEAK — N synthetic row(s) reaped -> FAIL` (spec-FORBIDden;
+   also caught by the default `-> FAIL` scan) — a fixture leak can no longer be silent or
+   permanent. And the router's close arm no longer stops at witness furniture: a resolution that
+   settles `noproc-selftest` re-runs the hit-test at the same point and closes the next row
+   whose close box contains it (bounded by the table size, one rate-limited wire line per hop),
+   so even a leaked fixture cannot starve the kill of the real owner the operator was aiming at.
+   Real settles (`closed`, `noproc`, `dead`, `armed`, `exhausted`) never retry.
+
+Undead rows (window gone, process alive) accumulated by the defect remain reachable the honest
+way: they read `running` in `jobs` and die by `kill <pid>`; no sweep invents an exit for them.
+
+### Gate results (CLOSE-FIX, 2026-07-29, QEMU raspi4b)
+
+* `./arroyo check` — both arches green.
+* `./arroyo kernel8-test` — MBENCH PASS 88/88 (was 87; the new REQUIRE is the
+  `settle=noproc-selftest` pin, the leg-10 pin folds into the existing hit-test REQUIRE), with
+  `close=true closereal=true -> PASS` and two `settle=noproc-selftest` lines on the wire, no
+  LEAK line, no plain `noproc`. Green at both default and bench geometry
+  (`UNAOS_FBW=1920 UNAOS_FBH=1200`).
+* `./arroyo test-arm` — MISSION SUCCESS (legs 9–10 DORMANT on the hosted build: `close=skip
+  closereal=skip`).

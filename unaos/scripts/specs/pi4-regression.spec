@@ -862,7 +862,23 @@ FORBID \[spread2\] .* ratio ([5-9][0-9]{2}|[0-9]{4,})
 # exit"), and the ONE action click in the CLICK-SELECT grammar: a press in a window's close box is
 # consumed by the router, closes the owner's windows, and kills the owner. Leg 9 of the hit-test
 # witness drives the shipped router with a probe window's close box placed under the real cursor;
-# `close=true` is the row provably going away through a routed press. The line is the whole
-# CLICK-ROUTE suite's verdict, so pinning it here also pins legs 1-8 (`-> PASS` at the tail).
+# `close=true` is the row provably going away through a routed press. CLOSE-FIX (P82) adds leg 10:
+# `closereal=true` is the SAME arm reaping a row the battery created through the ordinary path,
+# with the settle read-back asserted `noproc-selftest` — the leg that fails if a close resolves to
+# the wrong row or the discriminator regresses. The line is the whole CLICK-ROUTE suite's verdict,
+# so pinning it here also pins legs 1-9 (`-> PASS` at the tail).
 # See docs/dev/OS/08_VIDEO/engine.md CLOSE-BOX.
-REQUIRE \[clickroute\] hit-test at .*close=true -> PASS
+REQUIRE \[clickroute\] hit-test at .*close=true closereal=true -> PASS
+
+# CLOSE-FIX (P82) — the wire DISCRIMINATOR. The bench read `close=win3 asid=3085 settle=noproc`
+# and could not tell the selftest's synthetic no-op from a real click whose ASID-scoped kill found
+# nobody (the leg's own line was byte-identical to the failure it slept through). The battery's
+# close legs must now settle `noproc-selftest` — REQUIREd here — and a plain `settle=noproc` on
+# this gate is FORBIDden outright: no operator clicks on a headless gate, so the only thing that
+# can print it is a close resolving a real slot ASID with no process behind it — P82's exact
+# kill-finds-nobody shape. The teardown guard's LEAK line is the third tripwire: a synthetic row
+# that outlives the battery polluted a whole bench boot's hit-tests, so a reap at teardown is a
+# FAIL, never housekeeping.
+REQUIRE \[clickroute\] close=win[0-9]+ asid=[0-9]+ at .* settle=noproc-selftest
+FORBID \[clickroute\] close=.* settle=noproc$
+FORBID \[clickroute\] hit-test teardown LEAK

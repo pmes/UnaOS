@@ -12312,6 +12312,47 @@ static CLICK_PRESS_TARGET: AtomicU64 = AtomicU64::new(CLICK_TARGET_DROP);
 const CLOSE_LOG_MAX: u32 = 16;
 static CLOSE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// CLOSE-FIX — the settle tag of the MOST RECENT close-box resolution, as a small code the window
+/// layer's witness legs can assert against ([`wc_close_last_settle`]). The wire line alone cannot be
+/// asserted by a leg (a leg has no view of serial), and the router's `bool` return says only
+/// "consumed" — this is the read-back that lets the real-path close leg require `settle != noproc`,
+/// which is exactly the assertion that would have caught P82's kill-finds-nobody shape.
+#[cfg(feature = "witness")]
+static CLOSE_LAST_SETTLE: AtomicU32 = AtomicU32::new(0);
+/// No close has resolved yet (the `CLOSE_LAST_SETTLE` reset/initial state).
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_NONE: u32 = 0;
+/// `settle=closed` — kill confirmed, Proc row settled clean.
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_CLOSED: u32 = 1;
+/// `settle=noproc` — a REAL slot ASID with no live process behind it.
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_NOPROC: u32 = 2;
+/// `settle=noproc-selftest` — witness furniture (owner outside the slot range).
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_NOPROC_SELFTEST: u32 = 3;
+/// Any other tag (`dead`, `armed`, `exhausted`) — resolved, but not a shape the legs assert on.
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_OTHER: u32 = 4;
+
+#[cfg(feature = "witness")]
+fn close_settle_code(tag: &str) -> u32 {
+    match tag {
+        "closed" => CLOSE_SETTLE_CLOSED,
+        "noproc" => CLOSE_SETTLE_NOPROC,
+        "noproc-selftest" => CLOSE_SETTLE_NOPROC_SELFTEST,
+        _ => CLOSE_SETTLE_OTHER,
+    }
+}
+
+/// CLOSE-FIX — the code of the most recent close-box settle (see [`CLOSE_SETTLE_NONE`] and
+/// siblings). Witness read for the hit-test battery's real-path close leg; racy only against a
+/// concurrent operator click, which no witness leg runs under.
+#[cfg(feature = "witness")]
+pub fn wc_close_last_settle() -> u32 {
+    CLOSE_LAST_SETTLE.load(Ordering::Acquire)
+}
+
 /// CLOSE-BOX (P79) — **the close click's whole effect: the windows go, then the process goes.**
 /// Called from [`wc_click_route`]'s close arm only, with the press already consumed.
 ///
@@ -12348,8 +12389,18 @@ static CLOSE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Owners outside the private-slot range (kernel witness fixtures) and ASIDs with no live Proc row
 /// skip the kill: there is no process to kill, and the window close is the whole of the effect.
 /// Returns the settle tag for the `[clickroute] close=` witness line: `closed` (kill confirmed,
-/// row settled clean), `noproc` (window furniture only — no live process), `dead` (target already
-/// exited on its own), `armed` (unconfirmed — the request stays armed), `exhausted` (no kill slot).
+/// row settled clean), `noproc` (a REAL slot ASID with no live process behind it), `dead` (target
+/// already exited on its own), `armed` (unconfirmed — the request stays armed), `exhausted` (no
+/// kill slot), `noproc-selftest` (an owner OUTSIDE the slot range — witness furniture, which only
+/// the selftest battery can mint).
+///
+/// CLOSE-FIX (P82) — `noproc-selftest` is deliberately a DISTINCT tag rather than a reuse of
+/// `noproc`. The bench read `[clickroute] close=win3 asid=3085 ... settle=noproc` off the wire and
+/// could not tell whether a REAL click had resolved to the hit-test selftest's synthetic ASID
+/// (0xC0D — a routing defect) or the selftest's own no-op arm had merely logged itself (benign):
+/// the two lines were byte-for-byte the same shape. They must never be again — a spec can now
+/// FORBID plain `noproc` where only fixtures close, and an operator reading the log can tell a
+/// witness no-op from a click that killed nobody.
 fn wc_close_click(owner: u64) -> &'static str {
     let closed = crate::video::wm::close_owner(owner);
     if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == owner {
@@ -12359,7 +12410,9 @@ fn wc_close_click(owner: u64) -> &'static str {
         crate::video::wm::focus_changed(0);
     }
     if owner == 0 || owner as usize > super::boot::USER_SLOTS {
-        return "noproc"; // synthetic owner: no process behind it, the row close was the whole effect
+        // CLOSE-FIX: synthetic owner — no process CAN be behind it, the row close was the whole
+        // effect, and the tag says so distinguishably (see the doc block's discriminator note).
+        return "noproc-selftest";
     }
     // The live Proc row for this ASID, if any. `pid == 0` (mid-publish) is skipped — a kill needs
     // a tid to name, and the publish window is microseconds wide; the operator's next click lands
@@ -12608,15 +12661,46 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
             // owner it would have been delivered to is being torn down.
             Some((win, owner, _z)) if crate::video::wm::close_box_hit(win, x, y) => {
                 CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
-                // CLOSE-CLEAN: the witness line is emitted AFTER the settle so it can name the
-                // outcome — `settle=closed` is the wire proof a close-box exit landed as a clean
-                // close (not a fault-kill). Same rate limit, same line, one new field.
-                let settle = wc_close_click(owner);
-                if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX {
-                    serial_println!(
-                        "[clickroute] close=win{} asid={} at ({},{}) settle={}",
-                        win, owner, x, y, settle
-                    );
+                // CLOSE-FIX (P82) — the close acts on what the operator SAW, all the way down.
+                // The bench shape: a leaked witness row (synthetic owner, hit-test-first by z) sat
+                // over a real vug's close box, so the click resolved to the fixture, the
+                // ASID-scoped kill found no process, and the REAL owner survived with the operator
+                // none the wiser. The fixture row is gone after its own `close_owner`, so when a
+                // resolution settles `noproc-selftest` — the ONE tag that proves the click acted on
+                // witness furniture rather than on any app — re-ask the hit-test at the SAME point
+                // and, if another window's close box also contains it, close that one too: the
+                // operator's click falls through the furniture to the row it visually addressed.
+                // Real settles (`closed`, `noproc`, `dead`, `armed`, `exhausted`) never retry —
+                // the click already acted on a real app's row. Bounded by the table: every hop
+                // removes at least the hit row, so MAX_WINDOWS caps it structurally; each hop emits
+                // its own witness line under the shared rate limit, so the wire names every row the
+                // one click consumed.
+                let (mut win, mut owner) = (win, owner);
+                let mut hops = 0usize;
+                loop {
+                    // CLOSE-CLEAN: the witness line is emitted AFTER the settle so it can name the
+                    // outcome — `settle=closed` is the wire proof a close-box exit landed as a
+                    // clean close (not a fault-kill). Same rate limit, same line, one new field.
+                    let settle = wc_close_click(owner);
+                    #[cfg(feature = "witness")]
+                    CLOSE_LAST_SETTLE.store(close_settle_code(settle), Ordering::Release);
+                    if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX {
+                        serial_println!(
+                            "[clickroute] close=win{} asid={} at ({},{}) settle={}",
+                            win, owner, x, y, settle
+                        );
+                    }
+                    hops += 1;
+                    if settle != "noproc-selftest" || hops >= crate::video::wm::MAX_WINDOWS {
+                        break;
+                    }
+                    match crate::video::wm::hit_test(x, y) {
+                        Some((w2, o2, _)) if o2 != owner && crate::video::wm::close_box_hit(w2, x, y) => {
+                            win = w2;
+                            owner = o2;
+                        }
+                        _ => break,
+                    }
                 }
                 true
             }

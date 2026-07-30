@@ -5618,11 +5618,17 @@ static HT_SURF: [u32; 64] = [0x0020_C080; 64];
 ///    See [`clickplain_leg`].
 /// 9. **close** (CLOSE-BOX, P79) — the one ACTION click in the grammar: a press in a window's close
 ///    box is consumed by the router and the row goes away. See [`closebox_leg`].
+/// 10. **closereal** (CLOSE-FIX, P82) — the same close arm against a row the battery created through
+///    the ordinary path (`wa`), asserting the named row is the reaped row and the settle read-back
+///    is the `noproc-selftest` discriminator. See [`closebox_real_leg`].
 ///
 /// Self-cleaning on the FOCUS-VIS pattern: both windows are closed, `SHELL_Z` and `FOCUS_ASID` are
 /// restored (this calls `focus_changed` with SYNTHETIC asids, which must not be left naming an address
-/// space that does not exist), and the live set is repainted. `witness`-gated, one-shot, and ordered
-/// after every one-shot per-window latch so it cannot burn one with its own rows.
+/// space that does not exist), and the live set is repainted — and, since CLOSE-FIX, a teardown
+/// witness guard sweeps the table for any row still owned by a battery ASID and reports a reap as a
+/// FAIL-shaped line (a silent fixture leak polluted a whole bench boot's hit-tests in P82).
+/// `witness`-gated, one-shot, and ordered after every one-shot per-window latch so it cannot burn
+/// one with its own rows.
 /// CLICK-SHELL (P71) — leg 6 of [`hittest_selftest`], factored out because it is the one leg that
 /// leaves this file: it drives the ARCH router (`wc_click_route`), which exists only on the baremetal
 /// aarch64 build, through the same `#[cfg]` seam [`vugmin_publish`] already uses for `set_hidden`.
@@ -5897,6 +5903,79 @@ fn closebox_leg(_owner: u64, _surf: usize, _len: usize) -> Option<bool> {
     None
 }
 
+/// CLOSE-FIX (P82) — leg 10 of [`hittest_selftest`]: **a routed close click on a row the battery
+/// created through the ordinary path reaps THAT row, and the settle tag is the selftest tag.**
+///
+/// Leg 9 proves the close arm's mechanics on a probe row it builds for the purpose. What it cannot
+/// prove — and what P82 fell through — is that a close click resolves to the row the operator is
+/// actually looking at and that the wire's settle tag is honest about who (if anyone) was killed:
+/// the leg EXPECTED `noproc`, so a boot in which every real close also settled `noproc` read as
+/// green. This leg closes `wa` — a window the battery minted at the top of the run exactly as an
+/// app would — through the shipped router, and asserts three things leg 9 does not:
+///  * the ROW THE LEG NAMED is the one reaped (`info(wa)` empty afterwards — a router that
+///    threaded a constant, or resolved some other row first, fails here);
+///  * the settle READ-BACK ([`crate::arch::aarch64::syscall::wc_close_last_settle`]) is
+///    `noproc-selftest` and nothing else — `wa`'s owner is synthetic, so any OTHER tag means the
+///    close acted on a process it had no business finding, and plain `noproc` means the
+///    discriminator regressed;
+///  * the press was consumed and focus fell to the shell, as in leg 9.
+///
+/// Fixture discipline is leg 9's exactly (move the window's close box under the real pointer, never
+/// the pointer; validate with the same `hit_test` + `close_box_hit` pair the router uses; `None`
+/// when the fixture cannot be built). On the success path the row is gone through the router — the
+/// battery's own `close(wa)` tail then no-ops harmlessly; on every bail-out `wa` is left exactly
+/// where the battery can still close it.
+#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal"))]
+fn closebox_real_leg(w: WinId, owner: u64) -> Option<bool> {
+    use crate::arch::aarch64::syscall as sc;
+    if compat_live() {
+        return None; // the deliver-as-before exemption owns the panel: not this leg's fixture
+    }
+    let (pw, ph) = {
+        let info = super::WRITER.lock().info();
+        (info.width as i32, info.height as i32)
+    };
+    let (cx, cy) = crate::pal::cursor::pos(pw, ph);
+    if cx < 96 || cy < 96 || cx + 96 >= pw || cy + 96 >= ph {
+        return None;
+    }
+    let side = TITLE_H as i32;
+    let ws = match info(w) {
+        Some(wi) => (wi.w * wi.scale) as i32,
+        None => 0, // `wa` already gone (leg 9's retry fell through onto it): no fixture
+    };
+    let (x, y) = (cx + side / 2 - ws, cy + TITLE_H as i32 - side / 2);
+    if ws == 0 || x < 0 || y < (TITLE_H + BORDER) as i32 {
+        return None; // no row was minted here: `wa` stays for the battery's own close
+    }
+    move_to(w, x as usize, y as usize);
+    focus_changed(owner);
+    sc::el0_input_set_active(owner);
+    if hit_test(cx, cy).map(|(i, a, _)| (i, a)) != Some((w, owner)) || !close_box_hit(w, cx, cy) {
+        sc::el0_input_set_active(0);
+        focus_changed(0);
+        return None; // fixture invalid; the battery's `close(wa)` still owns the row
+    }
+    let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
+    let gone = info(w).is_none();
+    let settle_ok = sc::wc_close_last_settle() == sc::CLOSE_SETTLE_NOPROC_SELFTEST;
+    let refocused = sc::el0_input_active() == 0;
+    let _ = sc::wc_click_route(crate::pal::Event::Button(0));
+    if !gone {
+        // A FAILED close must not change who owns the cleanup: hand focus back and leave the row
+        // to the battery's tail.
+        sc::el0_input_set_active(0);
+        focus_changed(0);
+    }
+    Some(consumed && gone && settle_ok && refocused)
+}
+
+/// CLOSE-FIX, DORMANT half: no arch router in this build, so leg 10 asserts nothing.
+#[cfg(all(feature = "witness", not(all(target_arch = "aarch64", feature = "baremetal"))))]
+fn closebox_real_leg(_w: WinId, _owner: u64) -> Option<bool> {
+    None
+}
+
 #[cfg(feature = "witness")]
 pub fn hittest_selftest() {
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -6034,6 +6113,13 @@ pub fn hittest_selftest() {
     // kill arm is a witnessed no-op.
     let closebox: Option<bool> = closebox_leg(ASID_X, s, len);
 
+    // Leg 10 — CLOSE-FIX (P82). The same close arm, driven against a row the battery created
+    // through the ordinary path (`wa`), asserting the ROW NAMED is the row reaped and the settle
+    // read-back is the SELFTEST tag — the discriminator that keeps this battery's wire lines
+    // distinguishable from a real operator close. Runs after leg 9 (so the probe row is gone) and
+    // consumes `wa` through the router on success; the tail's `close(wa)` then no-ops.
+    let closereal: Option<bool> = closebox_real_leg(wa, ASID_A);
+
     let ok = inside_ok
         && topmost_ok
         && raise_ok
@@ -6042,7 +6128,8 @@ pub fn hittest_selftest() {
         && shell != Some(false)
         && bare != Some(false)
         && plain.map(|(a, b, c)| a && b && c) != Some(false)
-        && closebox != Some(false);
+        && closebox != Some(false)
+        && closereal != Some(false);
     let verdict3 = |v: Option<(bool, bool, bool)>, pick: fn((bool, bool, bool)) -> bool| match v {
         Some(t) => {
             if pick(t) {
@@ -6055,7 +6142,7 @@ pub fn hittest_selftest() {
     };
     let (mx, my) = miss_pt.unwrap_or((-1, -1));
     serial_println!(
-        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} miss=({},{}) hidden={} shell={} bare={} hit={} deliver={} wake={} close={} -> {}",
+        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} miss=({},{}) hidden={} shell={} bare={} hit={} deliver={} wake={} close={} closereal={} -> {}",
         ix, iy, inside_ok, topmost_ok, raise_ok,
         match outside_ok {
             Some(true) => "true",
@@ -6069,11 +6156,29 @@ pub fn hittest_selftest() {
         verdict3(plain, |t| t.1),
         verdict3(plain, |t| t.2),
         match closebox { Some(true) => "true", Some(false) => "false", None => "skip" },
+        match closereal { Some(true) => "true", Some(false) => "false", None => "skip" },
         if ok { "PASS" } else { "FAIL" }
     );
 
     close(wa);
     close(wb);
+    // CLOSE-FIX (P82) — the teardown WITNESS GUARD: no synthetic row may outlive the battery,
+    // and a leak may not be silent. The bench cost of one leaked probe row is a whole boot of
+    // polluted hit-tests — a real click resolving to a fixture ASID, an ASID-scoped kill finding
+    // nobody, undead `jobs` rows — so the guard is a sweep, not an assertion: every row still owned
+    // by one of the battery's synthetic ASIDs is reaped HERE, and the reap prints a FAIL-shaped
+    // line the regression spec forbids. Zero rows swept is free (`close_owner` returns before any
+    // panel work); the guard's cost exists only in the state it exists to kill.
+    let mut leaked = 0usize;
+    for a in [ASID_A, ASID_B, ASID_C, ASID_X] {
+        leaked += close_owner(a);
+    }
+    if leaked > 0 {
+        serial_println!(
+            "[clickroute] hit-test teardown LEAK — {} synthetic row(s) reaped -> FAIL",
+            leaked
+        );
+    }
     // Same restore FOCUS-VIS owes and for the same reasons: drop the shell back to the bottom of the
     // z-order, un-name the synthetic focus owner, and repaint the live set (this selftest's
     // `focus_changed(0)` leg pushed EVERY live window below the shell and consumed its damage flag).
