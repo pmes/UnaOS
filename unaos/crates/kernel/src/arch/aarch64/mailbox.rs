@@ -75,6 +75,7 @@ const TAG_GET_CLOCK_RATE: u32 = 0x0003_0002; // M6g: query a clock's current rat
 #[cfg(any(feature = "v3d", feature = "piusb"))]
 const TAG_SET_DOMAIN_STATE: u32 = 0x0003_8030; // set a power-domain's on/off state (value {domain, state})
 const TAG_SET_ENABLE_QPU: u32 = 0x0003_0012; // firmware-side QPU/V3D enable (value {enable}) — the VPU init path the KMS overlay boot runs and a bare-metal boot never receives (PI-V3D-75)
+const TAG_NOTIFY_DISPLAY_DONE: u32 = 0x0003_0066; // vc4's probe-time handover: "firmware display driver, stop — the ARM owns the complex now" (PI-V3D-80)
 #[cfg(any(feature = "v3d", feature = "piusb"))]
 const TAG_SET_CLOCK_STATE: u32 = 0x0003_8001; // enable/disable a clock's GATE (value {clock_id, state})
 #[cfg(feature = "v3d")]
@@ -332,6 +333,26 @@ pub fn set_enable_qpu(enable: u32) -> Option<u32> {
         return None;
     }
     Some(reply(5))
+}
+
+/// PI-V3D-80: `NOTIFY_DISPLAY_DONE` — the ONE mailbox act vc4's probe performs that no UnaOS boot
+/// ever has: a zero-length property telling the firmware display driver to stop, ceding the
+/// display/GPU complex to the ARM. The V3D-80 hypothesis: the VPU holds V3D thread-start to
+/// itself until the ARM claims ownership this way. ⚠ Side effect on a firmware-fb system: the
+/// firmware display driver stops — scanout of the mailbox-allocated framebuffer may die (black
+/// panel; serial unaffected). Returns Some(()) on a successful call, None on mailbox failure.
+#[cfg(feature = "v3d")]
+pub fn notify_display_done() -> Option<()> {
+    request(0, 6 * 4); // total size (6 words used)
+    request(1, 0); // request
+    request(2, TAG_NOTIFY_DISPLAY_DONE);
+    request(3, 0); // value buffer size (zero-length, like vc4's NULL/0 call)
+    request(4, 0); // request code
+    request(5, TAG_END);
+    if !mbox_call(6) {
+        return None;
+    }
+    Some(())
 }
 
 /// PI-V3D-1: turn a firmware power domain on (`state = 1`) or off (`0`). Returns the state the

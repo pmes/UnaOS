@@ -6794,6 +6794,52 @@ fn empty_frame_bisection() {
     // PI-V3D-77: the unnamed-word transplants ride after the sweep (so the sweep records the
     // pre-transplant file) — the diff's two config-shaped divergences, poked and kicked.
     v3d77_unnamed_words();
+    // PI-V3D-80: the display handover rides ABSOLUTELY LAST — NOTIFY_DISPLAY_DONE stops the
+    // firmware display driver, so scanout of the firmware framebuffer may die the moment it runs.
+    // Every screen-dependent reading this boot owns must already be banked.
+    v3d80_display_done();
+}
+
+/// PI-V3D-80 — the display handover. P90/P91 closed the ARM-side space: identical firmware
+/// binaries (hash), identical config lines, genpd-faithful bring-up — still thread-0-never-starts.
+/// The one remaining mailbox act the working system performs that we never have is vc4's
+/// probe-time `NOTIFY_DISPLAY_DONE` (0x00030066, zero-length): the firmware display driver stops
+/// and the ARM owns the display/GPU complex. Hypothesis: the VPU withholds V3D thread-start until
+/// that claim. The rung sends it, re-reads the [v3d77] status words (a change there = the VPU
+/// reacted), and runs the [v3d75] kick probe. ⚠ Panel may go black from this rung on — by design.
+fn v3d80_display_done() {
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down | V3dPresence::Poison(_) => {
+            serial_println!(":: V3D: [v3d80] SKIPPED — hub absent/poison. No handover sent ::");
+            return;
+        }
+    }
+    let c0 = mmio_read(V3D_HUB_BASE, 0x4068);
+    serial_println!(
+        ":: V3D: [v3d80] display-done handover — sending NOTIFY_DISPLAY_DONE (0x00030066, vc4's probe act; the firmware display driver stops — the panel may go BLACK from here, serial carries the verdict). core+0x68 pre={:#010x} ::",
+        c0
+    );
+    match mailbox::notify_display_done() {
+        Some(()) => serial_println!(":: V3D: [v3d80] NOTIFY_DISPLAY_DONE — mailbox OK ::"),
+        None => {
+            serial_println!(":: V3D: [v3d80] NOTIFY_DISPLAY_DONE — MAILBOX FAILED — no handover happened; the kick below is a null control ::");
+        }
+    }
+    settle_ms(5);
+    let c1 = mmio_read(V3D_HUB_BASE, 0x4068);
+    serial_println!(
+        ":: V3D: [v3d80] core+0x68 after handover: {:#010x} (pre {:#010x}, working-part ref 0x00000003) — {} ::",
+        c1, c0,
+        if c1 != c0 { "THE VPU REACTED — the status word moved on the handover" } else { "unchanged" }
+    );
+    let ok = v3d75_kick_probe("v3d80 post-handover");
+    serial_println!(
+        ":: V3D: [v3d80] verdict — kick={} — {} ::",
+        ok as u32,
+        if ok { "THE WALL WAS THE HANDOVER: thread 0 starts once the ARM claims the display/GPU complex (NOTIFY_DISPLAY_DONE). Productionize: send it in bringup before first submit, and take over scanout ourselves" }
+        else { "handover did not free thread 0 — the last documented mailbox act is exonerated; the ARM-testable universe is CLOSED (v3d.md §46.5) and what remains is VPU-internal state requiring firmware-side instrumentation" }
+    );
 }
 
 /// PI-V3D-77 — the sweep diff's verdict, acted on. diff(P87 [v3d76] wedged sweep, piOS mid-bin2
