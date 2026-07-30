@@ -562,3 +562,110 @@ form is the one every card and controller in the field is exercised on, and keep
 the rule identical in both paths is what makes §7.3's A/B comparison meaningful: an
 A/B test whose two arms issue different commands for the same window measures more
 than the variable under test.
+
+### 7.3 The A/B witness and the fallback policy
+
+**The witness.** `verify_adma_ab` reads three windows — head (LBA 0), middle
+(`num_blocks / 2`), tail (`num_blocks - 8`) — each of 8 blocks, each **twice**: once
+as eight separate CMD17s through the untouched `read_block_512`, once through the
+ADMA2 engine. Then it compares them byte for byte.
+
+```text
+[sdhc-ab] window lba=0 blocks=8 match=1 wrote=1 first-diff=none
+[sdhc-ab] window lba=NNNNNNN blocks=8 match=1 wrote=1 first-diff=none
+[sdhc-ab] window lba=NNNNNNN blocks=8 match=1 wrote=1 first-diff=none
+[sdhc-ab] verdict windows=3 match=3/3 — adma2 agrees with the pio control byte-for-byte
+```
+
+Three windows and not one, because "wrong only for some addresses" is a real failure
+mode: a descriptor built from a truncated or mis-shifted address reads the right bytes
+near the start of the card and the wrong ones further in. One window at LBA 0 cannot
+see that.
+
+On a mismatch the line prints the **first differing block index and byte offset**,
+absolute LBA, and both bytes — the evidence, not a summary. `off0` of a block means a
+lost block boundary; an offset ≡ 0 mod 4 means a lost word; anything else, a byte.
+
+If ADMA2 is unavailable the witness prints
+`[sdhc-ab] SKIPPED — adma2 unavailable (reason)` rather than vanishing. A witness that
+disappears when the thing it measures is absent is indistinguishable from a witness
+that was never called.
+
+**The fallback policy.** `read_blocks_512` is the module's public counted read: it
+chunks at `MB_MAX_BLOCKS`, uses ADMA2 while the engine is `Ready`, and PIO otherwise.
+When a live ADMA2 transfer fails, **three lines are printed before this function can
+return success**:
+
+1. the transfer's own failure line — raw Interrupt Status, ADMA error state, faulting
+   descriptor;
+2. `[sdhc-adma] engine DISABLED — falling back to PIO (reason) …`, once, as the engine
+   is latched `Faulted` for the rest of the boot;
+3. the PIO retry's own result line.
+
+A driver that quietly retried on PIO and returned `Ok` would report a healthy card
+while its DMA engine was dead. **Success is never reported without the failure that
+preceded it on the wire.** The `Faulted` latch is what keeps this from becoming noise:
+the engine is disabled for the boot, not re-failed and re-printed on every read.
+
+### 7.4 The witness a metal boot prints, in order
+
+Extending §6.7. Everything through `verify mbr … all-fit=1` is milestone 2's, byte for
+byte and in the same order; milestone 3 appends:
+
+```text
+[sdhc-mb] window lba=0 blocks=8 match=1 first-diff=none ctl-fnv=0x................ mb-fnv=0x................
+[sdhc-adma] host-control1 0xHH -> 0xHH readback=0xHH dma-select=0b10
+[sdhc-adma] bus-master grant bdf B:S.F cmd 0xCCCC -> 0xCCCC bus-master 0 -> 1
+[sdhc-adma] engine ready bm=1 table=0xPHYS buf=0xPHYS descs-max=512 mode=adma2-32
+[sdhc-adma] read lba=0 blocks=8 ok wrote=1 bytes=4096
+[sdhc-ab] window lba=0 blocks=8 match=1 wrote=1 first-diff=none
+[sdhc-ab] window lba=NNNNNNN blocks=8 match=1 wrote=1 first-diff=none
+[sdhc-ab] window lba=NNNNNNN blocks=8 match=1 wrote=1 first-diff=none
+[sdhc-ab] verdict windows=3 match=3/3 — adma2 agrees with the pio control byte-for-byte
+```
+
+Note the ordering: the `[sdhc-adma]` engine lines are printed *after* milestone 2's
+verification and after `[sdhc-mb]`, because engine init runs after identification and
+the witnesses run in rung order. The `claim` line still reports `bus-master=0` — the
+grant happens later, in `adma2_init`, which is what keeps that line comparable with a
+milestone-1 or milestone-2 log.
+
+**How to read the result without the author present.** Milestone 3 succeeded iff the
+log reaches `[sdhc-ab] verdict windows=3 match=3/3` **and** `[sdhc-mb] … match=1`
+appears above it. Rows extending §6.7's table:
+
+| Last line seen / line present | What it means |
+| --- | --- |
+| `[sdhc-mb] cmd18 … FAILED int=… (name)` and no `[sdhc-mb] window … match=` | Multi-block command semantics failed. Everything below is moot; ADMA2 was never the suspect. |
+| `[sdhc-mb] window … match=0 first-diff=…` | CMD18 and CMD17 disagree on PIO, with no DMA involved at all. A driver bug in the drain or the block count, not a DMA bug. |
+| `[sdhc-adma] UNAVAILABLE (controller advertises no ADMA2)` | `CAP_ADMA2` read 0 this boot. PIO serves every read; compare against the `caps=` survey line above. **Not** a failure. |
+| `[sdhc-adma] UNAVAILABLE (dma window above 4GiB)` | The heap landed above the 32-bit ceiling. Check for the `HEAP: WARNING … above 4 GiB` line much earlier in the boot — the identity/<4 GiB premise this driver relies on is broken. |
+| `[sdhc-adma] UNAVAILABLE (bus-master did not latch)` | PCI COMMAND bit 2 did not stick. Compare the `cmd 0x… -> 0x…` readback on the grant line. |
+| `[sdhc-adma] UNAVAILABLE (dma-select did not latch)` | Host Control 1 bits [4:3] did not take 10b; the controller may not implement ADMA2 despite the capability bit. |
+| `[sdhc-adma] read … ok wrote=0` | The transfer completed but the engine never wrote the sentinel-filled buffer. The controller reported success for a DMA that did not happen — the loudest thing this milestone can find. |
+| `[sdhc-adma] … FAILED int=… adma-err=0xEE (ST_FDS…) adma-addr=0x… desc=N` | The engine faulted. `desc=N` names the descriptor; `ST_FDS` means it could not even fetch it (suspect the table address), `ST_TFR` means the data transfer of that descriptor failed. |
+| `[sdhc-adma] engine DISABLED — falling back to PIO (…)` | A live transfer failed and the boot continues on PIO. The reads that follow are correct but not DMA; the failure above it is the real event. |
+| `[sdhc-ab] SKIPPED — adma2 unavailable (reason)` | No A/B verdict this boot, and the reason is named. |
+| `[sdhc-ab] verdict … match=0/3` or `match=1/3` | ADMA2 and PIO disagree about the card's contents. The per-window `first-diff` offsets above are the evidence. This is a real defect, not a bad card. |
+| `[sdhc-ab] verdict … NO window could be compared` | Both arms failed or the control failed; this boot carries no verdict either way. |
+
+### 7.5 Knobs — none added
+
+**None**, mirroring §6.8. Milestone 3 is default-on with no new environment knob and
+no new cargo feature, so there is no way for it to ship disabled with a green gate.
+ADMA2 is gated on `CAP_ADMA2` alone — a runtime fact this boot's controller reports —
+and never on a build-time switch, so nobody has to remember to turn it on and nobody
+can turn it off to make a log look better.
+
+Every hardware wait is bounded in the same rdtsc units milestone 2 established:
+`DATA_TIMEOUT_MS` (200 ms) per PIO block, `DATA_TIMEOUT_MS + 2 ms × count` for an
+ADMA2 completion (≤ 328 ms at the 64-block chunk bound), and `CMD_TIMEOUT_MS` /
+`RESET_TIMEOUT_MS` inside CMD12 and `reset_cmd_dat`. No unbounded spin is added
+anywhere.
+
+**Still out of scope, deliberately: block-layer registration.** `drivers::block`'s x86
+path still has no backend selector, so a card published into the global
+`BLOCK_DEVICE` would silently contend with the USB stick for that slot. Milestone 3
+stops at `read_blocks_512` as a module-public API, exactly as milestone 2 stopped at
+`read_block_512`. A faster read path is not a reason to claim a global another driver
+is already using; that is its own arc.

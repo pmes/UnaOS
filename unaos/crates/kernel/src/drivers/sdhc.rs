@@ -62,8 +62,10 @@
 //!   `publish_usb_geometry` claims the global `BLOCK_DEVICE` unconditionally — so registering a
 //!   card here would silently fight the USB stick for that slot (the exact PI-FS-2 clobber the
 //!   aarch64 side already documents). Geometry is published through this module's own
-//!   [`card_num_blocks`] / [`read_block_512`] instead, and wiring it into the block layer waits for
-//!   the arc that gives x86 a real backend selector.
+//!   [`card_num_blocks`] / [`read_block_512`] / [`read_blocks_512`] instead, and wiring it into the
+//!   block layer waits for the arc that gives x86 a real backend selector. Milestone 3 holds this
+//!   line exactly where milestone 2 drew it: a faster read path is not a reason to claim a global
+//!   another driver is already using.
 
 #![allow(dead_code)]
 
@@ -2130,6 +2132,192 @@ fn verify_multiblock(num_blocks: u64) {
 }
 
 // ===================================================================================
+// Step 7 — the A/B verdict and the fallback policy (SDHC-3c)
+// ===================================================================================
+
+/// Read one window twice — once through the untouched single-block PIO control, once through the
+/// ADMA2 engine — and compare the two byte for byte. Returns (matched, the engine wrote), or `None`
+/// if the comparison could not be made at all.
+fn ab_window(lba: u64) -> Option<(bool, bool)> {
+    let blocks = VERIFY_WINDOW_BLOCKS;
+    let n = blocks * 512;
+    let mut ctl = MB_CTL_BUF.lock();
+    let mut mb = MB_BUF.lock();
+
+    for b in 0..blocks {
+        let off = b * 512;
+        if let Err(e) = read_block_512(lba + b as u64, &mut ctl[off..off + 512]) {
+            serial_println!(
+                "[sdhc-ab] window lba={} control cmd17 lba={} FAILED ({:?}) — no control, so no \
+                 comparison; this is NOT an adma2 verdict",
+                lba, lba + b as u64, e
+            );
+            return None;
+        }
+    }
+
+    let (_, wrote) = match read_blocks_512_adma(lba, blocks as u16, &mut mb[..n]) {
+        Ok(v) => v,
+        Err(e) => {
+            serial_println!(
+                "[sdhc-ab] window lba={} blocks={} adma2 read FAILED ({:?}) — reason named above",
+                lba, blocks, e
+            );
+            return None;
+        }
+    };
+
+    match first_difference(&ctl[..n], &mb[..n]) {
+        None => {
+            serial_println!(
+                "[sdhc-ab] window lba={} blocks={} match=1 wrote={} first-diff=none",
+                lba, blocks, wrote as u8
+            );
+            Some((true, wrote))
+        }
+        Some((blk, off)) => {
+            // The evidence, not a summary of it. `off0` of a block means a lost block boundary; an
+            // offset that is 0 mod 4 means a lost word; anything else, a lost byte.
+            serial_println!(
+                "[sdhc-ab] window lba={} blocks={} match=0 wrote={} first-diff=blk{},off{} \
+                 (absolute lba={} byte={}) ctl={:#04x} adma={:#04x}",
+                lba, blocks, wrote as u8, blk, off, lba + blk as u64, off,
+                ctl[blk * 512 + off], mb[blk * 512 + off]
+            );
+            Some((false, wrote))
+        }
+    }
+}
+
+/// The A/B verdict: three windows across the card, each read by both paths and compared.
+///
+/// Three windows and not one, because a DMA engine that is wrong only for some addresses is a real
+/// failure mode — a descriptor built from a truncated or mis-shifted address reads the right bytes
+/// near the start of the card and the wrong ones further in. Head, middle and tail sample that.
+///
+/// If ADMA2 is unavailable this prints `SKIPPED` with the reason. It does not vanish: a witness that
+/// disappears when the thing it measures is absent is indistinguishable from a witness that was
+/// never called.
+fn verify_adma_ab(num_blocks: u64) {
+    let Some(state) = adma_state() else {
+        return;
+    };
+    if state != Adma2State::Ready {
+        serial_println!("[sdhc-ab] SKIPPED — adma2 unavailable ({})", state.reason());
+        return;
+    }
+    let blocks = VERIFY_WINDOW_BLOCKS as u64;
+    if num_blocks < blocks * 2 {
+        serial_println!(
+            "[sdhc-ab] SKIPPED — card holds {} blocks, too few for three distinct {}-block windows",
+            num_blocks, blocks
+        );
+        return;
+    }
+
+    // Head, middle, tail. `num_blocks >= 2*blocks` makes the middle window fit by construction.
+    let windows = [0u64, num_blocks / 2, num_blocks - blocks];
+    let mut matched = 0usize;
+    let mut compared = 0usize;
+    for &w in windows.iter() {
+        match ab_window(w) {
+            Some((true, _)) => {
+                compared += 1;
+                matched += 1;
+            }
+            Some((false, _)) => compared += 1,
+            None => {}
+        }
+    }
+
+    serial_println!(
+        "[sdhc-ab] verdict windows={} match={}/{} — {}",
+        windows.len(), matched, windows.len(),
+        if matched == windows.len() {
+            "adma2 agrees with the pio control byte-for-byte"
+        } else if compared == 0 {
+            "NO window could be compared; this boot carries no adma2 verdict either way"
+        } else {
+            "adma2 DISAGREES with the pio control — the offsets above are the evidence"
+        }
+    );
+}
+
+/// Read `count` contiguous 512-byte blocks starting at `lba` into `buf`. The module's public
+/// counted read: ADMA2 when the engine is Ready, PIO otherwise, chunked at [`MB_MAX_BLOCKS`].
+///
+/// **The fallback is loud, and that is the point.** When a live ADMA2 transfer fails, three things
+/// are printed before this function can return success: the transfer's own failure line (raw status,
+/// ADMA error state, faulting descriptor), the one-time `engine DISABLED` line naming the reason,
+/// and the PIO retry's own result. A driver that quietly retried on PIO and returned `Ok` would
+/// report a healthy card while its DMA engine was dead — the instrument lie this project has paid
+/// for more than once. Success is never reported without the failure that preceded it on the wire.
+///
+/// The engine is latched `Faulted` on the first failure, so it is disabled for the rest of the boot
+/// rather than re-failing (and re-printing) on every subsequent read.
+///
+/// Deliberately NOT published into `drivers::block::BLOCK_DEVICE` — see [`card_num_blocks`].
+pub fn read_blocks_512(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, BlockError> {
+    if count == 0 {
+        return Ok(0);
+    }
+    let need = count.checked_mul(512).ok_or(BlockError::BadLba)?;
+    if buf.len() < need {
+        serial_println!(
+            "[sdhc] read_blocks_512 lba={} count={}: caller buffer is {} bytes, {} needed",
+            lba, count, buf.len(), need
+        );
+        return Err(BlockError::Io);
+    }
+
+    let mut guard = CARD.lock();
+    let card = guard.as_mut().ok_or(BlockError::NotReady)?;
+    if lba.checked_add(count as u64).is_none_or(|end| end > card.num_blocks) {
+        return Err(BlockError::BadLba);
+    }
+
+    let mut done = 0usize;
+    while done < count {
+        let this = (count - done).min(MB_MAX_BLOCKS as usize) as u16;
+        let at = lba + done as u64;
+        let dst = &mut buf[done * 512..(done + this as usize) * 512];
+
+        if card.adma == Adma2State::Ready {
+            match read_blocks_adma_on(card, at, this, dst) {
+                Ok(_) => {
+                    done += this as usize;
+                    continue;
+                }
+                Err(e) => {
+                    // `read_blocks_adma_on` has already printed the raw evidence. Latch, announce,
+                    // and fall through to the PIO retry below — never silently.
+                    card.adma = Adma2State::Faulted("a live adma2 transfer failed");
+                    serial_println!(
+                        "[sdhc-adma] engine DISABLED — falling back to PIO ({}) after {:?} at \
+                         lba={} blocks={}; every later read on this boot is PIO",
+                        card.adma.reason(), e, at, this
+                    );
+                }
+            }
+        }
+
+        match read_blocks_pio_on(card, at, this, dst) {
+            Ok(_) => {
+                if card.adma != Adma2State::Ready {
+                    serial_println!("[sdhc-mb] pio lba={} blocks={} ok ({})", at, this, card.adma.reason());
+                }
+                done += this as usize;
+            }
+            Err(e) => {
+                serial_println!("[sdhc-mb] pio lba={} blocks={} FAILED ({:?})", at, this, e);
+                return Err(e);
+            }
+        }
+    }
+    Ok(need)
+}
+
+// ===================================================================================
 // Bring-up
 // ===================================================================================
 
@@ -2188,8 +2376,10 @@ fn bring_up(base: u64, bus: u8, slot: u8, func: u8) -> bool {
 
     // SDHC-3a: multi-block command semantics, measured against that same public single-block path.
     verify_multiblock(num_blocks);
-    // SDHC-3b: one DMA transfer, so the log says whether the engine ever ran.
+    // SDHC-3b: one DMA transfer, so the log says whether the engine ever ran at all...
     adma2_smoke(num_blocks);
+    // ...and SDHC-3c: whether what it moved is what the card holds, at three places on the card.
+    verify_adma_ab(num_blocks);
     true
 }
 
