@@ -3075,3 +3075,57 @@ compared against mainline's `0x550` — the dump-diff table's one UNKNOWN-ours r
 QEMU raspi4b models no V3D: the whole battery returns at the hub-identity gate with an explicit
 `SKIPPED` line, so `kernel8-test` green means **no regression and nothing more** — every verdict in
 this section is metal-attended, read at the next bench boot with `UNAOS_V3D_DEEP=1`.
+
+## 43. Is the clock even ticking? — PCTR armed across the wedged bin (V3D-72)
+
+The P82 wire established, and does not re-litigate: the PTB never issues one beat into the fabric
+(`[v3d71f]`, 500 BMACTIVE=1 samples, M/S_CTRL pinned quiescent — the wall is **core-internal**,
+upstream of the master bridge), and the frame stays dead under mainline address geometry with the
+poison fully intact through a completed L2T drain (`[v3d71]`). Every fabric, routing and input
+theory is closed. But the same wire named its own gap: **both** `[v3d55]` clkliv lines — on the
+final `[v3d48]` Empty rung and on the `[v3d71]` mainline-geom rung — printed *"counter 2 was NOT
+enabled across this wait — no clock verdict here"*. The CYCLE_COUNT battery had only ever been
+armed around the PROBE bin, so the campaign has **never measured whether the core's clock domain is
+advancing while BMACTIVE=1 on the wedged bin itself**. With everything else excluded, a gated
+internal clock sub-domain (invisible in every config register, unlocked by some init mainline
+performs and we lack) is the leading remaining theory — and the PCTR counter file is the one
+instrument inside the core.
+
+### 43.1 What V3D-72 arms (rides `UNAOS_V3D_DEEP`, no new knob)
+
+A four-slot PCTR bank (`[v3d72] clkarm` / `[v3d72] clkliv-x`), armed with the exact
+`v3d_perfmon_start` idiom this file already uses (EN=0 → SRC → read-back → CLR while stopped →
+OVERFLOW clear → EN last; PCTR writes are counter-file config that mainline writes on every perfmon
+start — no off-mainline register experimentation), across exactly two windows:
+
+- the canonical `[v3d48]` **empty-frame** rung (arm → kick → read/stop after the FLDONE wait);
+- the `[v3d71]` **mainline-geom** rung (armed last before the GO, read after the `[v3d71f]` emit).
+
+Slots, every source id one this tree has already anchored (the PI-V3D-33 sourcing rule admits ids
+only against the verified 16/32 anchors; no PTB-family id survives it — the same verdict V3D-63
+recorded — and src35 was explored by v3d67 and is not revisited):
+
+| Slot | Source | Discriminates |
+|---|---|---|
+| 0 | src14 `QPU_ACTIVE_CYCLES_VERTEX_COORD_USER` | any vertex/coord shader execution during the wait |
+| 1 | src16 `QPU_CYCLES_VALID_INSTR` | any QPU instruction issue at all |
+| 2 | src32 `CYCLE_COUNT` | the core clock itself — the reserved `[v3d55]` slot (file law), so the pre-existing clkliv witness now prints `armed=1` with a real Δ on these two waits, with `wait_fldone` unchanged |
+| 3 | src24 `TMU_TCACHE_ACCESS` | intra-core memory-side (TMU cache) traffic |
+
+Counters are cleared while stopped at arm, so each read **is** its Δ across the window; overflow
+bits count as movement (a counter that wrapped exactly to zero must not read "never moved"). The
+bank is stopped (EN=0) at read, so every rung outside the two windows prints exactly as before.
+
+### 43.2 Reading key
+
+| `[v3d72] clkliv-x` pattern | Reading | Convicts / excludes |
+|---|---|---|
+| Δsrc32 `CYCLE_COUNT` = 0 (and no overflow) | the core's own cycle counter is **frozen** while the wedged bin holds BMACTIVE=1 | **THE WALL FOUND** — a gated clock sub-domain; mainline's missing init is a clock/power **unlock**, not a unit enable. Must agree with the same window's `[v3d55]` clkliv (same slot 2, ~1 ms cadence) |
+| Δsrc32 > 0, all unit slots (src14/16/24) = 0 | core clocked and idle: no QPU issue, no TMU-cache traffic, binner silent on an open frame | clock branch **EXONERATED** on the wedged bin itself, for every domain this counter file observes — the wall is a **unit-level enable/state** inside an always-clocked core |
+| Δsrc32 > 0, any unit slot > 0 | the core is not merely clocked but **active** during a wait that never retired | unexpected — re-open the branch of whichever unit moved (QPU issue vs TMU cache) before any clock theory |
+| `PCTR_EN(at read)` lost the 0x0F mask | something reprogrammed the counter file inside the window | every Δ INCONCLUSIVE, not zero — find the reprogrammer first |
+| `[v3d55]` clkliv `armed=0` on either window | the arming did not span the wait | instrument regression — the whole point of this arc is that these two lines now read `armed=1` |
+
+QEMU raspi4b models no V3D: both windows sit behind the hub-identity gate and the `UNAOS_V3D_DEEP`
+feature, so `kernel8-test` green means **no regression and nothing more** — the Δ verdict is
+metal-attended, read at the next bench boot with `UNAOS_V3D_DEEP=1`.

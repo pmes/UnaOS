@@ -6715,7 +6715,13 @@ fn empty_frame_bisection() {
     // wedged, the pre-job invalidate was the wall; if both wedge, the wedge is confirmed below all
     // mirror-able L2TCACTL state and the retained [v3d44/45/46] dump names the next layer.
     submit_bisect_rung_tagged("v3d53", "empty-after-clear-invalidate", BinContent::Empty, OFF_SHADREC);
+    // PI-V3D-72: arm the clock-liveness bank across THE canonical [v3d48] Empty rung — the exact wait
+    // whose P82 clkliv line read "counter 2 was NOT enabled". Arm → kick (no PCTR MMIO on the unbanked
+    // rung path, so the bank spans the whole CTRUN + FLDONE wait) → read/stop/emit. Every other ladder
+    // rung is untouched and prints exactly as before.
+    v3d72_pctr_arm("v3d48 empty-frame");
     submit_bisect_rung("empty-frame", BinContent::Empty, OFF_SHADREC);
+    v3d72_pctr_read_emit("v3d48 empty-frame");
     submit_bisect_rung("state-no-prims", BinContent::StateNoPrims, OFF_SHADREC);
     submit_bisect_rung("prims-null-shader", BinContent::PrimsNullShader, OFF_BISECT_NULL_SHADREC);
     // PI-V3D-63: the two PTB-unit discriminators ride the tail of the ladder — same boot, same block
@@ -6850,6 +6856,102 @@ fn v3d63_pctr_read() -> V3d63Ctr {
     mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0); // stop counting
     dsb();
     out
+}
+
+// ─── PI-V3D-72 — is the clock even ticking? The PCTR bank armed ACROSS the wedged bin's wait. ────────
+//
+// The P82 wire named the gap itself: both `[v3d55]` clkliv lines on the final v3d48 rung and the v3d71
+// mainline-geom rung printed "counter 2 was NOT enabled across this wait — no clock verdict here". The
+// CYCLE_COUNT battery had only ever been armed around the PROBE bin, so the campaign has NEVER measured
+// whether the core's clock domain is even ADVANCING while BMACTIVE=1 on our wedged bin — and with every
+// fabric/routing/input theory dead ([v3d71f]: the PTB never issues one beat; [v3d71]: still dead under
+// mainline geometry with poison intact), a gated internal clock sub-domain is the leading remaining
+// theory. PCTR is the one instrument inside the core, so this arc arms it across the arming window and
+// nowhere else.
+//
+// Four slots, every source id one this file has ALREADY anchored (the PI-V3D-33 sourcing rule: ids are
+// admitted only against the verified 16/32 anchors; no PTB-family id survives that rule — same verdict
+// V3D-63 recorded when it dropped its three named sources — and src35 was explored by v3d67 and is not
+// re-litigated here):
+//   slot 0 = src14 QPU_ACTIVE_CYCLES_VERTEX_COORD_USER — QPU executing vertex/coord USER shaders
+//   slot 1 = src16 QPU_CYCLES_VALID_INSTR              — QPU issuing any valid instruction
+//   slot 2 = src32 CYCLE_COUNT                          — the RESERVED [v3d55] slot (file law, see
+//            V3D63_CTRL_SLOT): arming it here is what turns the existing clkliv witness from
+//            "armed=0, no verdict" into a real Δ across the wedged wait, with zero wait_fldone changes
+//   slot 3 = src24 TMU_TCACHE_ACCESS                    — TMU cache traffic (intra-core memory side)
+// Together they discriminate "core clocked but binner unit dead" (Δsrc32>0, unit slots 0) from "whole
+// core frozen" (Δsrc32=0) from "core unexpectedly ACTIVE" (any unit slot >0) — the reading key is in
+// the witness text below and in v3d.md §43.
+//
+// Scope: PCTR writes are counter-file config — the same registers `pctr_setup_cs_witness` and
+// `v3d63_pctr_arm` already write and that mainline's v3d_perfmon.c writes on every perfmon start; no
+// CLE/PTB/fabric state is touched, no off-mainline register experimentation. The bank is stopped
+// (EN=0, the perfmon-stop idiom) at read, so every rung outside the two arming windows prints exactly
+// what it printed before this arc.
+const V3D72_PCTR_MASK: u32 = 0x0F; // slots 0..3
+
+/// PI-V3D-72 — arm the four-slot bank. Exact `v3d_perfmon_start` idiom (EN=0 → SRC → read-back to
+/// retire the posted selects (PI-V3D-39) → CLR while stopped → OVERFLOW clear → EN last), byte-for-byte
+/// the `v3d63_pctr_arm` sequence with this arc's source packing. Called LAST before the GO so the
+/// counters span exactly the arming window; the `[v3d72] clkarm` line is the wire proof of the window.
+fn v3d72_pctr_arm(what: &str) {
+    let src_0_3 = (PCTR_SRC_QPU_ACTIVE_CYCLES_VERTEX_COORD_USER & 0x7f)
+        | ((PCTR_SRC_QPU_CYCLES_VALID_INSTR & 0x7f) << 8)
+        | ((PCTR_SRC_CYCLE_COUNT & 0x7f) << 16)
+        | ((PCTR_SRC_TMU_TCACHE_ACCESS & 0x7f) << 24);
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0); // stop any prior arming before reprogramming
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3, src_0_3);
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_4_7, 0);
+    dsb();
+    // PI-V3D-39: read the selects back so the posted stores RETIRE and the mux is provably latched.
+    let _srclat = mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3)
+        | mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_4_7);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_CLR, V3D72_PCTR_MASK); // zero WHILE stopped
+    mmio_write(V3D_CORE0_BASE, V3D_PCTR_0_OVERFLOW, V3D72_PCTR_MASK); // clear latched overflow
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, V3D72_PCTR_MASK); // enable LAST, from a clean zero
+    dsb();
+    serial_println!(
+        ":: V3D: [v3d72] clkarm ({}) — PCTR bank armed ACROSS this rung's waits (perfmon-start idiom, EN={:#04x}): slot0=src14 QPU_ACTIVE_CYCLES_VERTEX_COORD_USER slot1=src16 QPU_CYCLES_VALID_INSTR slot2=src32 CYCLE_COUNT (the reserved [v3d55] clkliv slot — that witness now carries a REAL verdict on this wait) slot3=src24 TMU_TCACHE_ACCESS — all four cleared to zero while stopped, so each read below IS its Δ across the window; read the verdict on the [v3d72] clkliv-x line after the wait ::",
+        what, V3D72_PCTR_MASK,
+    );
+}
+
+/// PI-V3D-72 — read the four counters at wait-exit, stop the bank (perfmon-stop: EN=0), and emit the
+/// Δ line in the `[v3d55]` clkliv idiom: every source printed with id + name + delta, verdict inline.
+/// The reading key (also v3d.md §43): Δsrc32=0 ⇒ THE WALL FOUND — the core's own cycle counter is
+/// frozen during our bin = gated clock domain; Δsrc32>0 with unit slots 0 ⇒ clock exonerated, the wall
+/// is a unit-level enable/state; any unit slot >0 ⇒ the core is ACTIVE, re-read that unit's branch.
+fn v3d72_pctr_read_emit(what: &str) {
+    dsb();
+    let en = mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN);
+    let d_qpu_user = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0);
+    let d_qpu_instr = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 4);
+    let d_cyc = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 8);
+    let d_tmu = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 12);
+    let ovf = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_OVERFLOW);
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0); // perfmon-stop: leave the file as every other rung sees it
+    dsb();
+    // Overflow counts as movement — a counter that wrapped exactly to zero must not read "never moved"
+    // (the same silent-instrument failure class V3d63Ctr::moved guards against).
+    let cyc_moved = d_cyc != 0 || ovf & (1 << 2) != 0;
+    let qpu_moved = d_qpu_user != 0 || d_qpu_instr != 0 || ovf & 0b0011 != 0;
+    let tmu_moved = d_tmu != 0 || ovf & (1 << 3) != 0;
+    let verdict = if en & V3D72_PCTR_MASK != V3D72_PCTR_MASK {
+        "the bank was NOT fully armed at read (EN lost the mask inside the window) — every Δ on this line is INCONCLUSIVE, not zero; find what reprogrammed the counter file inside the arming window before citing this line"
+    } else if !cyc_moved {
+        "Δ=0 on src32 CYCLE_COUNT across a wait the wall held open — THE WALL FOUND: the core's own cycle counter is FROZEN while the wedged bin sits with BMACTIVE=1. That is a GATED CLOCK sub-domain, invisible in every config register this campaign has read, and mainline's missing init is a clock/power UNLOCK, not a unit enable. Cross-check this window's [v3d55] clkliv line (same slot 2 at ~1 ms cadence) — the two instruments must agree"
+    } else if !qpu_moved && !tmu_moved {
+        "src32 CYCLE_COUNT ADVANCED while every unit-side source read zero — the clock branch is EXONERATED on the wedged bin itself: the core is clocked and idle (no QPU issue, no TMU-cache traffic) while the binner never emits. The wall is a UNIT-LEVEL enable/state inside an always-clocked core; the gated-clock theory is dead for every domain this counter file can observe"
+    } else {
+        "src32 CYCLE_COUNT advanced AND a unit-side source registered events during a wait that never retired — the core is not merely clocked but ACTIVE somewhere; read which Δ moved above (QPU issue vs TMU-cache) and re-open that unit's branch before any clock theory"
+    };
+    serial_println!(
+        ":: V3D: [v3d72] clkliv-x ({}) — PCTR_EN(at read)={:#010x} OVERFLOW={:#010x} | Δ src32 CYCLE_COUNT={} | Δ src14 QPU_ACTIVE_CYCLES_VERTEX_COORD_USER={} | Δ src16 QPU_CYCLES_VALID_INSTR={} | Δ src24 TMU_TCACHE_ACCESS={} (counters cleared at arm: each value IS its Δ across the arming window) — {} ::",
+        what, en, ovf, d_cyc, d_qpu_user, d_qpu_instr, d_tmu, verdict,
+    );
 }
 
 /// PI-V3D-63 — print one banked rung: the RANK 2 placement words and the RANK 1 raw counter bank.
@@ -8832,6 +8934,11 @@ fn v3d71_mainline_geometry() {
     mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
     dsb();
     let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    // PI-V3D-72: arm the clock-liveness bank across THIS rung's waits — the second P82 wait whose
+    // clkliv line carried no verdict, and the one taken with every input mainline-shaped. Armed last
+    // before the GO (the v3d63 idiom) so the four Δs span exactly this frame; read + stopped after
+    // the fabric-sampler emit below, before any post-rung readback perturbs the block.
+    v3d72_pctr_arm("v3d71 mainline-geom");
     v3d71_sampler_arm(); // leg 2: the fabric sampler spans exactly this frame's wait
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, cl_ea); // GO
     dsb();
@@ -8839,6 +8946,7 @@ fn v3d71_mainline_geometry() {
     let idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CT1CS_CTRUN, "CT0 v3d71 mainline-geom");
     let (sts, us, retired) = wait_fldone("v3d71 mainline-geom", cl_iova, cl_ea);
     v3d71_sampler_emit(); // [v3d71f]
+    v3d72_pctr_read_emit("v3d71 mainline-geom"); // [v3d72] — read + stop the bank at wait-exit
 
     let bpca = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA);
     let bpcs = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCS);
