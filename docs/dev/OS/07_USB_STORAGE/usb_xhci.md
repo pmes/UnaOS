@@ -307,6 +307,75 @@ Saving: ~350 ms of the time to first console, on a boot whose dominant cost is
 elsewhere (see `docs/dev/OS/01_BOOT_HAL/bootpace.md` §6a) — the point of doing it
 now is that it is spec-justified on its own terms, not that it is the big win.
 
+#### The CCSMARGIN witness — how much headroom the settle actually has
+
+Until CCSMARGIN, **the settle constant was covering a phenomenon that had never
+been measured on either arch**: nothing anywhere recorded *when* CCS asserts, so
+every capture on x86 and on the Pi showed only that CCS *had* asserted by the end
+of the wait, and the sole failure signal was the pass/fail tell-tale above, after
+the fact, with no number attached. Nobody could say whether 150 ms sits on
+comfortable margin or one slow device away from missing a port — and the two
+seats do not even ask the same question of it. x86 asks "has a USB3 link finished
+Polling"; the Pi asks "has the VL805's firmware booted far enough to present its
+root ports", a bring-up observed in the hundreds of milliseconds. One constant
+covers both.
+
+The settle now samples `PORTSC` once per millisecond while it waits and records,
+per port, the elapsed millisecond at which `CCS` first reads 1. One line follows
+the `xhci-settle` stamp:
+
+```
+xHCI: ccs-margin settle_ms=150 ports=4 first_assert_ms=[p1:0 p2:none p3:none p4:87] latest=87 margin_ms=63 result=CCSMARGIN
+```
+
+- every root port `1..=MaxPorts` is listed, so the absent ones are stated rather
+  than implied;
+- **`none` ≠ `0`.** `none` is "no `CCS=1` observed by the deadline". `0` is a real
+  measurement — the port already read `CCS=1` when the settle began, i.e. the
+  device was attached before the machine was powered and never needed the wait.
+  `p1:0` is common and benign, **not** an error;
+- `margin_ms` = `SETTLE_MS − latest`, signed and raw. This is the whole point: it
+  turns "did it work" into "by how much".
+
+**Three readings that must differ** (instrument-baseline law):
+
+| situation | line reads |
+|---|---|
+| healthy boot | every connected port a small `first_assert_ms`, `latest` well under 150, `margin_ms` comfortably positive |
+| mechanism did not run — nothing plugged into any root port | every port `none`, `latest=none`, `margin_ms=none` |
+| the failure the settle exists to prevent | `margin_ms` **0 or negative** — the final at-deadline sweep was the first sample to see `CCS=1`, so the port reached the initial scan with no headroom |
+
+`margin_ms=none` is deliberate. Printing `150` when zero ports were measured would
+report maximum apparent headroom from no measurements at all — the instrument
+lying about its own baseline.
+
+A port asserting *later* than the deadline cannot be timed by an instrument that
+stops at the deadline: it reads `none`, indistinguishable here from an empty port,
+and is disambiguated by the tell-tale above (that device arrives through the
+CSC / warm-reset path). The in-loop samples can only ever report
+`elapsed < SETTLE_MS`, i.e. a strictly positive margin, which is why one final
+sweep runs *at* the deadline — an instrument that cannot print its own failure is
+not an instrument.
+
+Two things the witness deliberately does **not** do:
+
+- **It does not touch the settle.** The `while` condition, its timebase, its exit
+  and everything after it are byte-identical to M4's; the sampling reuses the same
+  `cycles_per_ms()` and only spends, inside the busy-wait, time that used to go to
+  `spin_loop()`. The diff that introduced it deletes no line of the settle. An
+  all-ones `PORTSC` (`0xFFFF_FFFF`, the PCIe no-response pattern, not a legal
+  register value) is discarded rather than read as `CCS=1` — the false positive a
+  VL805-behind-PCIe seat is exposed to.
+- **It adds no BPACE stamp.** The ring stores `(cycle, tag)` and a stamp's value
+  *is* the instant `record()` was called; the latest assert is only identifiable
+  after every port has been swept, so it cannot be stamped when it happened, and a
+  stamp placed at the end of the settle would read ~`SETTLE_MS` on every boot
+  forever — the recorder, not the phenomenon. M4's ring arithmetic (n=31 of
+  CAP=64) is untouched and `dropped=` stays 0.
+
+Arch-neutral by construction — no `cfg(target_arch)`, no second timebase — so the
+Pi 4 track gets the same measurement of its own VL805 for free at merge.
+
 ---
 
 ## 3. Interrupt model (MSI → local APIC)

@@ -3895,8 +3895,98 @@ impl XhciController {
             let per_ms = Self::cycles_per_ms();
             let settle_start = crate::arch::now_cycles();
             let settle = SETTLE_MS * per_ms;
+
+            // CCSMARGIN — measure the phenomenon the constant above covers.
+            //
+            // Until this arc, NOTHING anywhere recorded WHEN CCS actually asserts. Every capture on
+            // either arch showed only that CCS *had* asserted by the end of the settle; the sole
+            // failure signal was the boot device arriving late through the CSC/warm-reset path — a
+            // pass/fail tell-tale, after the fact, with no headroom number. So neither seat could say
+            // whether 150 ms has comfortable margin or is one slow device away from missing a port,
+            // and the two seats' risks are not even the same question: x86 asks "has a USB3 link
+            // finished Polling", the Pi asks "has the VL805's firmware booted far enough to present
+            // its root ports" (observed bring-up costs in the hundreds of ms). One constant covers
+            // both, and neither had been measured.
+            //
+            // So: sample PORTSC once per millisecond inside the wait and remember, per port, the
+            // elapsed millisecond at which CCS first reads 1. Bounded by construction — at most one
+            // read per NOT-YET-asserted port per sample, at most SETTLE_MS samples, and a port drops
+            // out of the sweep the moment it asserts.
+            //
+            // This changes NOTHING about the settle. The `while` condition, its timebase and its
+            // exit are byte-identical to M4's; only the busy-wait's body does work it used to spend
+            // in `spin_loop()`. There is no second timebase: `per_ms` is the same
+            // `cycles_per_ms()` the settle itself is built from.
+            //
+            // Readings (the instrument-baseline law — these three must differ, or the witness proves
+            // nothing):
+            //   * healthy — every physically connected port carries a small `first_assert_ms` and
+            //     `margin_ms` is comfortably positive. `p1:0` is COMMON AND BENIGN: it means the port
+            //     already read CCS=1 at settle entry, i.e. the device was attached before we powered
+            //     the port and never needed the wait at all. That is why `none` and `0` are separate
+            //     states here — 0 is a real measurement, and this project has twice been bitten by an
+            //     instrument that conflated "measured zero" with "never measured".
+            //   * mechanism did not run (no device on any root port) — every port prints `none`,
+            //     `latest=none`, and `margin_ms=none`. Printing 150 there would be the instrument
+            //     lie: maximum apparent headroom from zero measurements.
+            //   * the failure the settle exists to prevent — a port that only just made it, or did
+            //     not. `margin_ms` at or below zero means the final at-deadline sweep below was the
+            //     first sample to see CCS=1: no headroom at all. A port that asserts LATER than the
+            //     deadline cannot be timed by an instrument that stops at the deadline, so it reads
+            //     `none` — indistinguishable here from a port with nothing plugged into it, and
+            //     disambiguated by the existing tell-tale (§2d): that device shows up through the
+            //     CSC / warm-reset path instead of the initial scan.
+            //
+            // An all-ones PORTSC is discarded rather than believed: 0xFFFF_FFFF is the PCIe
+            // "no response / unsupported request" pattern, not a legal PORTSC (bits 27:25 are RsvdZ),
+            // and taking it at face value would report CCS=1 on a controller that has not answered —
+            // the exact false positive the Pi's VL805-behind-PCIe seat is exposed to.
+            const CCS_NEVER: u16 = u16::MAX;
+            /// One sweep of every port that has not asserted yet. Reads PORTSC exactly as the CCS
+            /// scan below does (a plain volatile load; PORTSC's RW1C bits are NOT disturbed by a
+            /// read), stamps `elapsed_ms` on a first CCS=1, and drops the port from the sweep.
+            fn ccs_sample(op_base: usize, max_ports: u8, elapsed_ms: u64,
+                          first: &mut [u16; 256], pending: &mut u32) {
+                for i in 1..=max_ports {
+                    let idx = i as usize;
+                    if first[idx] != CCS_NEVER {
+                        continue;
+                    }
+                    let portsc = unsafe {
+                        core::ptr::read_volatile((op_base + 0x400 + (idx - 1) * 0x10) as *const u32)
+                    };
+                    if portsc == u32::MAX || (portsc & 1) == 0 {
+                        continue;
+                    }
+                    first[idx] = elapsed_ms.min(CCS_NEVER as u64 - 1) as u16;
+                    *pending = pending.saturating_sub(1);
+                }
+            }
+            let mut ccs_first = [CCS_NEVER; 256];
+            let mut ccs_pending = max_ports as u32;
+            let sample_iv = per_ms.max(1);
+            let mut next_sample: u64 = 0;
+
             while crate::arch::now_cycles().wrapping_sub(settle_start) < settle {
+                let elapsed = crate::arch::now_cycles().wrapping_sub(settle_start);
+                if ccs_pending > 0 && elapsed >= next_sample {
+                    ccs_sample(self.op_base, max_ports, elapsed / sample_iv,
+                               &mut ccs_first, &mut ccs_pending);
+                    next_sample = elapsed.wrapping_add(sample_iv);
+                }
                 core::hint::spin_loop();
+            }
+            // One final sweep AT the deadline, so "asserted too late" is representable at all: an
+            // in-loop sample can only ever report elapsed < SETTLE_MS, i.e. a strictly positive
+            // margin, and an instrument that cannot print its own failure is not an instrument. This
+            // costs one MMIO read per still-unasserted port (microseconds) and cannot shift the
+            // millisecond-resolution `d=` of `xhci-settle` below.
+            {
+                let elapsed = crate::arch::now_cycles().wrapping_sub(settle_start);
+                if ccs_pending > 0 {
+                    ccs_sample(self.op_base, max_ports, elapsed / sample_iv,
+                               &mut ccs_first, &mut ccs_pending);
+                }
             }
             serial_println!("xHCI: port settle complete before CCS scan (settle_ms={})", SETTLE_MS);
             // BPACE: the fixed pre-enumeration settle (`hw_wait_budget()/4` — ~0.5 s of wall clock
@@ -3912,6 +4002,54 @@ impl XhciController {
             // alone — which is what a settle-trim arc must have measured before it may touch the
             // number. Absent on a `skip_xhci` build, with every pre-USB tag still present.
             crate::bootpace::record("xhci-settle");
+
+            // CCSMARGIN witness. Emitted AFTER `xhci-settle` on purpose: this line is ~100 characters
+            // of UART, and the ledger's `d=` for `xhci-settle` is M4's measurement of the settle
+            // constant ALONE. Printing before the stamp would fold this instrument's own serial cost
+            // into the number it exists to justify — the recorder reporting itself.
+            //
+            // `margin_ms` = SETTLE_MS − latest, signed, raw. That is the whole point of the arc: it
+            // turns "did it work" into "by how much", and a zero or negative value is the finding.
+            // No BPACE tag rides along. The ring stores (cycle, tag) and a stamp's value IS the
+            // instant `record()` was called, so the latest assert — which is only identifiable after
+            // every port has been swept — cannot be stamped at the moment it happened. A stamp
+            // placed here instead would read ~SETTLE_MS on every boot forever: the recorder, not the
+            // phenomenon. The number lives in this line, and M4's ring arithmetic (n=31 of CAP=64)
+            // is left exactly as it was — `dropped=` stays 0.
+            {
+                use core::fmt::Write as _;
+                let mut latest: Option<u16> = None;
+                let mut line = alloc::string::String::new();
+                let _ = write!(line, "xHCI: ccs-margin settle_ms={} ports={} first_assert_ms=[",
+                               SETTLE_MS, max_ports);
+                for i in 1..=max_ports {
+                    if i > 1 {
+                        let _ = write!(line, " ");
+                    }
+                    match ccs_first[i as usize] {
+                        CCS_NEVER => {
+                            let _ = write!(line, "p{}:none", i);
+                        }
+                        v => {
+                            let _ = write!(line, "p{}:{}", i, v);
+                            if latest.is_none_or(|l| v > l) {
+                                latest = Some(v);
+                            }
+                        }
+                    }
+                }
+                match latest {
+                    Some(l) => {
+                        let _ = write!(line, "] latest={} margin_ms={} result=CCSMARGIN",
+                                       l, SETTLE_MS as i64 - l as i64);
+                    }
+                    // No port ever asserted: nothing was measured, so there is no margin to report.
+                    None => {
+                        let _ = write!(line, "] latest=none margin_ms=none result=CCSMARGIN");
+                    }
+                }
+                serial_println!("{}", line);
+            }
 
             // Scrub any latched PORTSC change bits before enumeration: one latched bit gates
             // PSCEG (4.19.2) and blocks ALL Port Status Change events for that port, so a
