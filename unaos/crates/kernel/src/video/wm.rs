@@ -1545,6 +1545,15 @@ pub fn composite() {
                 super::cursor::repaint();
             }
         }
+        CursorTail::Settle => {
+            // CURSOR-15 — the sessionless compose-through tail: the arrow never left the glass, and
+            // the settle is per-pixel against the finished front. Like `Adopt`, a repair request is
+            // appended rather than substituted — the settle answers only the pass's own deferrals.
+            super::cursor::settle_nosession();
+            if dirty {
+                super::cursor::repaint();
+            }
+        }
         CursorTail::Repaint => super::cursor::repaint(),
         CursorTail::Untouched => super::cursor::ensure_drawn(),
     }
@@ -1557,10 +1566,14 @@ pub fn composite() {
 /// the panel is already correct and only the module's bookkeeping is outstanding. Every early exit
 /// from the pass owes `Repaint` once the bracket has been taken — `Adopt` is reachable only from the
 /// one path that actually composed the sprite into a back layer.
+/// `Settle` is CURSOR-15's: the pass DEFERRED sessionlessly (`cursor::defer_nosession`), so the
+/// arrow is still on glass and the tail owes each deferred pixel a verdict against the finished
+/// front — never a bracket.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CursorTail {
     Untouched,
     Repaint,
+    Settle,
     Adopt,
 }
 
@@ -1607,6 +1620,9 @@ fn composite_inner() -> CursorTail {
     // outer box meets the sprite — so it can only be too large, never too small, and a pixel outside
     // it is a pixel this pass provably cannot reach.
     let mut disturbed = false;
+    // CURSOR-15 — the pass composed through the sprite WITHOUT a session (`defer_nosession`): the
+    // arrow is on glass and the tail owes the deferred pixels a `Settle`, never a bracket.
+    let mut deferred = false;
 
     // WC-L — DRAIN THE DEFERRED ERASES.
     //
@@ -1752,56 +1768,61 @@ fn composite_inner() -> CursorTail {
                     super::cursor::note_bracketed_pass();
                 }
             } else {
-                // CURSOR-5 — THE LOCK CLASS STOPS COSTING THE WHOLE SPRITE.
+                // CURSOR-15 — THE SESSIONLESS PASS COMPOSES THROUGH TOO. This arm is the P82 hover
+                // stutter: another pass owns the overlay session — under a presenting vug fleet the
+                // steady state, several cores compositing against one session — and until this arc
+                // the loser took `undraw_within_nosession` (a masked handback) plus a `Repaint` tail
+                // (a whole-sprite `refresh_locked`). One erase-and-rebuild of the arrow per
+                // overlapping present, ~123/s on P82, against a pointer redrawn at event cadence:
+                // `[flick2] sess_undraws` climbing at present rate was those tail refreshes landing
+                // inside other passes' open sessions, and `down_slow` was the intervals they cost.
                 //
-                // Another pass owns the overlay session, so this one cannot split the sprite across
-                // staged presents. CURSOR-3 and CURSOR-4 answered that by taking the ENTIRE sprite
-                // off the panel for the length of the pass — which is the duty cycle WC-I and
-                // CURSOR-4 spent two arcs removing, reinstated in full every time two cores composite
-                // at once. Under VUGPAR (vugband pinned at 99% on three cores, the P64 reality) that
-                // is not the rare case, it is the steady state, and it is the surviving half of
-                // "spotty over the vug".
+                // The handback's justification — hand a pixel back before a painter in THIS pass
+                // overwrites it, or its save-under goes stale — is answered the same way CURSOR-11
+                // answered it for the session owner: at the tail, per pixel, against the finished
+                // front, where it is answerable exactly (`cursor::settle_nosession` re-saves each
+                // taken pixel from the freshly-composited content BEFORE painting the arrow back —
+                // the FLICKER-2/3 session-fresh discipline extended to compose-through). The arrow
+                // stays on glass; nothing is handed back, so CURSOR-5's stale-stamp interleave has
+                // no first move; and the one duty the old generation bump performed for a concurrent
+                // owner — retiring its coverage where our blit overwrites a pixel its layer composed
+                // — is carried by `cursor::overlay_uncover_any` from `draw_window`, per painted box,
+                // exactly as CURSOR-4 retires the identical intra-pass hazard.
                 //
-                // The undraw's reason has never been the session. A pixel must be handed back before
-                // a painter in THIS pass overwrites it, or the save-under goes stale — and `paint` is
-                // already the conservative union of exactly those extents. That argument is
-                // independent of who owns the overlay, so the mask applies here too: pixels this pass
-                // can reach come down, pixels it provably cannot stay on the panel. WC-L's shape,
-                // exactly — DEFER the sprite operation, never DROP the sprite.
-                //
-                // The tail is `Repaint`, not `Adopt`: no session means no coverage to install, and
-                // `refresh_locked` settles both classes correctly in one acquisition — `undraw_locked`
-                // skips the pixels the mask handed back (their `saved` is stale by construction) and
-                // restores the rest, then `draw_locked` re-establishes the whole sprite from the
-                // finished front, where every pixel now holds whichever painter's content is final.
-                // CURSOR-5 lens MUST-FIX 1 — the SESSIONLESS entry point, not `undraw_within`. A
-                // pixel handed back here has changed owner behind the session-holder's back, and
-                // only a generation bump tells it so; see `cursor::undraw_within_nosession` for the
-                // interleave that proves the distinction is not cosmetic.
-                super::cursor::undraw_within_nosession(&paint[..npaint]);
+                // The tail is `Settle`, not `Repaint`: no session means no coverage to install, and
+                // no bracket means nothing to refresh — only the deferred verdicts are owed.
+                super::cursor::defer_nosession(&paint[..npaint]);
+                deferred = true;
                 #[cfg(feature = "witness")]
                 {
                     CUR3_DECL_LOCK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     // CURSOR-12 — the session refusal on its own, separated from `compose_into`'s
                     // contended `try_lock` inside the guard. `CUR3_DECL_LOCK` counts both and cannot
-                    // answer "did the offer die before it was made, or after".
+                    // answer "did the offer die before it was made, or after". Still counted: the
+                    // refusal still happens; CURSOR-15 changed the RESPONSE, not the predicate.
                     CUR12_NOSESSION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    super::cursor::note_masked_nosession();
-                    // CURSOR-11 — also a pass whose arrow left the glass. This one COULD in principle
-                    // be deferred, but it must not be: without the session there is no coverage to
-                    // install, so nothing would ever settle the deferred pixels and their save-under
-                    // would go stale silently. CURSOR-5's generation bump is exactly the signal the
-                    // session owner needs, and it is only produced by an actual handback.
-                    super::cursor::note_bracketed_pass();
+                    // CURSOR-15 — no `note_masked_nosession` (no masked undraw is taken — that
+                    // counter now measures a mechanism this arm no longer runs, and must read 0) and
+                    // no `note_bracketed_pass` (the arrow does not leave the glass here any more;
+                    // `[cursor11] passes=` picks this pass up via `defer_nosession` instead).
                 }
             }
-            disturbed = true;
+            // CURSOR-15 — `disturbed` only on the arms that actually took pixels down (`reserved`,
+            // and the session arm keeps it for `tail_of`'s `Adopt`, per CURSOR-11's widened
+            // reading). The deferring sessionless arm sets `deferred` instead: a `disturbed` there
+            // would turn its tail into the `Repaint` bracket this arc exists to remove.
+            if session || reserved_hit {
+                disturbed = true;
+            }
         }
     }
     #[cfg(feature = "witness")]
     {
         WCI_CURSOR_PASSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if disturbed {
+        // CURSOR-15 — `deferred` counts here too: this counter has meant "the pass's tail owes the
+        // sprite its pixels" since CURSOR-11 widened `disturbed`, and a deferring pass owes exactly
+        // that. Keeping it out would make the WC-I ratio read as a bracket collapse it is not.
+        if disturbed || deferred {
             WCI_CURSOR_BRACKETS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -1840,7 +1861,7 @@ fn composite_inner() -> CursorTail {
         // WC-N — a pass that produced no pixels for any window. See `WCN_ABORTED`.
         #[cfg(feature = "witness")]
         wcn_note_pass(false);
-        return tail_of(disturbed, session);
+        return tail_of(disturbed, session, deferred);
     }
 
     // F4 — the drain barrier. Register this composite as in-flight WHILE STILL HOLDING the table
@@ -1862,7 +1883,7 @@ fn composite_inner() -> CursorTail {
             // than after the early return is what makes the abort count exact.
             #[cfg(feature = "witness")]
             wcn_note_pass(false);
-            return tail_of(disturbed, session);
+            return tail_of(disturbed, session, deferred);
         }
         let mut dirty = [false; MAX_WINDOWS];
         for (i, r) in t.rows.iter_mut().enumerate() {
@@ -1997,7 +2018,9 @@ fn composite_inner() -> CursorTail {
             // CURSOR-7 — `disturbed`, not `plan.is_some()`: the question the present-overlap test has
             // to answer is "does this pass's TAIL owe the sprite a repaint", and both `Adopt` and
             // `Repaint` do. It is final by here (nothing below the bracket block writes it).
-            disturbed,
+            // CURSOR-15 — `deferred` answers the same question yes: the `Settle` tail owes every
+            // deferred pixel its verdict, so a deferring pass must not arm `PRESENT_DIRTY` either.
+            disturbed || deferred,
         );
         #[cfg(all(target_arch = "aarch64", feature = "witness"))]
         if let Some(p) = wcg_probe {
@@ -2086,7 +2109,7 @@ fn composite_inner() -> CursorTail {
     }
     let _ = drawn;
     let _ = overlaid;
-    tail_of(disturbed, session)
+    tail_of(disturbed, session, deferred)
 }
 
 /// CURSOR-3 — what the pass owes the sprite, from the two facts the pass records.
@@ -2109,12 +2132,20 @@ fn composite_inner() -> CursorTail {
 /// `note_present_over_sprite` "does this pass's tail owe the sprite a repaint", which a deferring
 /// pass answers yes to as firmly as a bracketing one. A pass that deferred must therefore NOT arm
 /// `PRESENT_DIRTY`, and with `disturbed == true` it does not.
-fn tail_of(disturbed: bool, session: bool) -> CursorTail {
+///
+/// **CURSOR-15 — `deferred` is the sessionless deferral, and `disturbed` outranks it.** A pass that
+/// BOTH deferred and disturbed (the drain took a masked handback in the same pass that later
+/// deferred) has `off` pixels only a whole-sprite refresh can put back; `Repaint`'s
+/// `refresh_locked` resets `pend` as it goes, so the deferral is settled by the bracket rather than
+/// dropped. `Settle` is taken only when the deferral is the pass's sole debt.
+fn tail_of(disturbed: bool, session: bool, deferred: bool) -> CursorTail {
     debug_assert!(!session || disturbed);
     if session && disturbed {
         CursorTail::Adopt
     } else if disturbed {
         CursorTail::Repaint
+    } else if deferred {
+        CursorTail::Settle
     } else {
         CursorTail::Untouched
     }
@@ -2650,13 +2681,18 @@ static CUR3_TAKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 
 /// CURSOR-3 — how each pass's tail was settled: `adopt` (the panel already carried the sprite, the
 /// module only had to agree), `repaint` (WC-I's bracket ran to completion), `ensure` (the pass never
-/// touched the sprite — WC-I's cheap tail, and the desktop case).
+/// touched the sprite — WC-I's cheap tail, and the desktop case). CURSOR-15 adds `settle` (the
+/// sessionless compose-through: the arrow never left the glass, the tail answered the deferred
+/// pixels against the finished front). On a hovered fleet `settle` should absorb what `repaint` used
+/// to count, at present cadence — that migration IS the fix, read straight off `[cursor3] rollup`.
 #[cfg(feature = "witness")]
 static CUR3_ADOPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "witness")]
 static CUR3_REPAINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "witness")]
 static CUR3_ENSURE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static CUR15_SETTLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// CURSOR-4 — the DECLINE BREAKDOWN. CURSOR-3's rollup reported `offers - taken` as one number, and
 /// the P62 wire (`offers=4181 taken=2427`) could say only that 42% of offers fell back — not which
@@ -2939,6 +2975,10 @@ fn note_cursor_tail(tail: CursorTail) {
             CUR3_REPAINT.fetch_add(1, Relaxed);
             "repaint"
         }
+        CursorTail::Settle => {
+            CUR15_SETTLE.fetch_add(1, Relaxed);
+            "settle"
+        }
         CursorTail::Untouched => {
             CUR3_ENSURE.fetch_add(1, Relaxed);
             return;
@@ -2950,7 +2990,13 @@ fn note_cursor_tail(tail: CursorTail) {
             name,
             CUR3_OFFERS.load(Relaxed),
             CUR3_TAKEN.load(Relaxed),
-            if tail == CursorTail::Adopt { "COMPOSED" } else { "BRACKETED" }
+            match tail {
+                CursorTail::Adopt => "COMPOSED",
+                // CURSOR-15 — the sessionless compose-through: not COMPOSED (nothing rode a
+                // layer) and emphatically not BRACKETED (the arrow never left the glass).
+                CursorTail::Settle => "THROUGH",
+                _ => "BRACKETED",
+            }
         );
     }
 }
@@ -2974,6 +3020,7 @@ fn cursor3_rollup(scope: &str) {
     let taken = CUR3_TAKEN.load(Relaxed);
     let adopt = CUR3_ADOPT.load(Relaxed);
     let repaint = CUR3_REPAINT.load(Relaxed);
+    let settle = CUR15_SETTLE.load(Relaxed);
     let ensure = CUR3_ENSURE.load(Relaxed);
     let straddle = CUR3_DECL_STRADDLE.load(Relaxed);
     let lock = CUR3_DECL_LOCK.load(Relaxed);
@@ -2998,9 +3045,9 @@ fn cursor3_rollup(scope: &str) {
     let disjoint = CUR6_DECL_DISJOINT.load(Relaxed);
     let partial = CUR6_DECL_PARTIAL.load(Relaxed);
     serial_println!(
-        "[cursor3] rollup scope={} planned={} offers={} taken={} adopt={} repaint={} ensure={} straddle={} disjoint={} partial={} lock={} budget={} stale={} -> {}",
-        scope, planned, offers, taken, adopt, repaint, ensure, straddle, disjoint, partial, lock,
-        budget, stale, verdict
+        "[cursor3] rollup scope={} planned={} offers={} taken={} adopt={} repaint={} settle={} ensure={} straddle={} disjoint={} partial={} lock={} budget={} stale={} -> {}",
+        scope, planned, offers, taken, adopt, repaint, settle, ensure, straddle, disjoint, partial,
+        lock, budget, stale, verdict
     );
     // CURSOR-5 — the coherence residual, immediately after the decline breakdown so a bench capture
     // shows "how often the mechanism ran" and "what it cost when it raced" as one block.
@@ -4032,6 +4079,26 @@ fn draw_window(
         // `cursor::UNCOVER_LOST` for the interleave and for both symptoms it produces.
         if !super::cursor::overlay_uncover(&p, bx, by, bw, bh) {
             super::cursor::note_uncover_lost();
+        }
+    } else if cur.is_none() {
+        // CURSOR-15 — the SESSIONLESS pass owes a concurrent session owner the same duty, cross-
+        // pass. This pass composes through the sprite (`defer_nosession`) and hands nothing back,
+        // so the generation bump that used to retire the owner's session when we disturbed one of
+        // its pixels is gone; if this blit just overwrote a pixel the owner's layer COVERED, its
+        // tail would install a layer save the panel no longer holds and claim a pixel that is now
+        // ours. Clearing the coverage inside our painted box makes its tail settle those pixels
+        // against the finished front instead — CURSOR-4's back-to-front verdict rule, applied
+        // across passes. Gated on the sprite's advisory box: two relaxed atomics, and a one-report-
+        // stale answer degrades to a needless clear (bits the owner would have settled anyway) or
+        // to no clear over a box no live sprite met — never to a missed hazard, since a sprite that
+        // ARRIVED after the publish did so via a draw whose generation bump retires the session on
+        // its own. A contended clear invalidates the session wholesale, exactly as above.
+        if let Some(sb) = super::cursor::live_box_relaxed() {
+            if boxes_overlap(sb, (bx, by, bw, bh))
+                && !super::cursor::overlay_uncover_any(bx, by, bw, bh)
+            {
+                super::cursor::note_uncover_lost();
+            }
         }
     }
     // CURSOR-6 — THE DIRECT MEASUREMENT, and CURSOR-7 — THE REPAIR IT ARMS. This window's pixels are

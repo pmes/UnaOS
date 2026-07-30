@@ -333,7 +333,12 @@ static C5_MASKED_NOSESSION: AtomicU64 = AtomicU64::new(0);
 static C5_DRAIN_INSESSION: AtomicU64 = AtomicU64::new(0);
 
 /// CURSOR-5 — count a masked undraw taken without owning the session (called from `wm`).
+///
+/// CURSOR-15 — callerless by design, kept for the wire: the sessionless composite arm now composes
+/// through ([`defer_nosession`]) instead of mask-undrawing, so `[cursor5] masked_nosession=` must
+/// read 0 from this arc on. A non-zero reading means someone reintroduced the sessionless handback.
 #[cfg(feature = "witness")]
+#[allow(dead_code)]
 pub fn note_masked_nosession() {
     C5_MASKED_NOSESSION.fetch_add(1, Ordering::Relaxed);
 }
@@ -923,6 +928,23 @@ static F2_FLUSH_UNDRAWS: AtomicU64 = AtomicU64::new(0);
 /// should dominate `flush_undraw`: the strip's per-second bars band is the dominant desktop damage.
 #[cfg(feature = "witness")]
 static F2_FLUSH_SKIPS: AtomicU64 = AtomicU64::new(0);
+/// CURSOR-15 — SESSIONLESS composite passes that COMPOSED THROUGH the sprite (deferred instead of
+/// mask-undrawing; see [`defer_nosession`]). This is the P82 mechanism inverted: before this arc
+/// every one of these passes took a masked undraw plus a `Repaint` tail — one full restore→save→draw
+/// per overlapping present, ~123/s under a hovered fleet, which is exactly the cadence `[flick2]`'s
+/// `sess_undraws` was climbing at. On the bench this should track the present rate while
+/// `sess_undraws`/`mask_sess` collapse toward the pointer-move rate.
+#[cfg(feature = "witness")]
+static F2_CT_PASSES: AtomicU64 = AtomicU64::new(0);
+/// CURSOR-15 — [`settle_nosession`] tails that found an overlay session OPEN (or `OVERLAY`
+/// contended) and left their pending bits standing for that session's own tail to settle. Not a
+/// loss: `settle_pending_locked` is bit-driven, not owner-driven, so the owner's `adopt_overlay`
+/// answers every standing bit against ITS finished front — or its fallback `refresh_locked` resets
+/// them, which is settlement by bracket. Counted because each one is a settle deferred by up to one
+/// pass, and a large ratio against `compose_through` would mean the fleet keeps a session open
+/// nearly always and the settle latency is worth another look.
+#[cfg(feature = "witness")]
+static F2_CT_TO_OWNER: AtomicU64 = AtomicU64::new(0);
 
 /// FLICKER-3 — record `Screen::flush`'s bracket decision for a LIVE, VISIBLE sprite. The legacy
 /// always-bracket classes (no sprite on glass, visibility lapsed, `is_ready` fallbacks) are not
@@ -964,6 +986,8 @@ pub fn flick2_rollup(
     let mask_sess = F2_MASK_SESS.load(Ordering::Relaxed);
     let flush_undraw = F2_FLUSH_UNDRAWS.load(Ordering::Relaxed);
     let flush_skip = F2_FLUSH_SKIPS.load(Ordering::Relaxed);
+    let ct = F2_CT_PASSES.load(Ordering::Relaxed);
+    let ct_owner = F2_CT_TO_OWNER.load(Ordering::Relaxed);
     let verdict = if !armed() {
         "UNWITNESSED"
     } else if down_max >= F2_DOWN_SLOW_MS {
@@ -971,10 +995,16 @@ pub fn flick2_rollup(
     } else {
         "OK"
     };
+    // CURSOR-15 — `compose_through=`/`ct_owner=` beside the counters they should be draining:
+    // the P82 reading was `sess_undraws=290+` climbing at present cadence with `down_slow`
+    // accumulating; the expected post-fix wire is `compose_through` tracking the present rate while
+    // `sess_undraws` and `mask_sess` collapse toward pointer-move-only counts and `down_slow` -> 0
+    // under hover.
     serial_println!(
-        "[flick2] scope={} down_max={}ms down_slow={} down_last_at={}ms sess_undraws={} sess_px={} sess_lockmiss={} mask_sess={} flush_undraw={} flush_skip={} drains={} drain_skip={} drain_masked={} burst_last={}ms burst_max={}ms -> {}",
-        scope, down_max, slow, last_at, sess, sess_px, lockmiss, mask_sess, flush_undraw,
-        flush_skip, drains, drain_skips, drain_masked, burst_last_ms, burst_max_ms, verdict
+        "[flick2] scope={} down_max={}ms down_slow={} down_last_at={}ms sess_undraws={} sess_px={} sess_lockmiss={} mask_sess={} compose_through={} ct_owner={} flush_undraw={} flush_skip={} drains={} drain_skip={} drain_masked={} burst_last={}ms burst_max={}ms -> {}",
+        scope, down_max, slow, last_at, sess, sess_px, lockmiss, mask_sess, ct, ct_owner,
+        flush_undraw, flush_skip, drains, drain_skips, drain_masked, burst_last_ms, burst_max_ms,
+        verdict
     );
 }
 
@@ -1676,6 +1706,54 @@ pub fn undraw_within(boxes: &[(usize, usize, usize, usize)]) {
 ///
 /// Returns how many pixels were newly deferred, for the witness.
 pub fn defer_within(boxes: &[(usize, usize, usize, usize)]) -> usize {
+    defer_common(boxes, false)
+}
+
+/// CURSOR-15 — the compose-through entry point for a pass that does NOT own the overlay session.
+///
+/// ### The P82 mechanism, and why the sessionless arm was the last undraw at present cadence
+/// CURSOR-11 removed the handback for the session-owning pass; the passes that LOSE `overlay_open` —
+/// which under a presenting vug fleet is most of them, several cores compositing at once and one
+/// session — still took [`undraw_within_nosession`] plus a `Repaint` tail. That is one masked
+/// handback AND one whole-sprite `refresh_locked` (a full restore→save→draw) per overlapping
+/// present, ~123/s on P82, while the pointer's own repaint runs at event cadence: the sprite spends
+/// its life mid-restore, which is the hover stutter, and every one of those tail refreshes lands
+/// inside some other pass's open session — the `[flick2] sess_undraws=290+` climbing on the wire.
+///
+/// ### Why the deferral is sound here after all, and what replaced CURSOR-11's objection
+/// CURSOR-11 kept this arm on the undraw with a stated reason: "without the session there is no
+/// coverage to install, so nothing would ever settle the deferred pixels". The install was never the
+/// settling mechanism for UNCOVERED pixels, though — [`settle_pending_locked`] is, and it needs no
+/// session of ours: it asks the finished front, per pixel, whether a painter took it. What the
+/// sessionless pass actually lacked was (a) a tail that runs the settle and (b) CURSOR-5's
+/// generation bump, whose real job was to retire a concurrent owner's session when we hand one of
+/// its composed pixels back. CURSOR-15 supplies both without the undraw:
+///
+/// * (a) the pass's tail is now `Settle` → [`settle_nosession`], which runs the same settle the
+///   adopt tail does, gated on no session being open (see there for why the gate is load-bearing);
+/// * (b) we hand nothing back — so the interleave [`undraw_within_nosession`] documents (stamping
+///   OUR stale save into the owner's freshly-presented rows) cannot happen at all, and the one
+///   residual (our blit overwriting a pixel the owner's session has COVERED, whose install would
+///   then claim a panel pixel we own) is closed by [`overlay_uncover_any`] from `wm::draw_window`,
+///   exactly the way CURSOR-4 closes the identical intra-pass hazard.
+///
+/// The pixel work is [`defer_within`]'s verbatim: mark [`Sprite::pend`] inside the paint set, write
+/// no framebuffer pixel, bump no generation. The arrow stays on glass; the pass's blits composite
+/// over it where they reach it; the tail then re-saves each taken pixel from the freshly-composited
+/// front BEFORE painting the arrow back over it — the FLICKER-2/3 session-fresh discipline, extended
+/// to the sessionless present. The paths that still bracket are the pointer's own [`repaint`]
+/// (sprite RELOCATION keeps its undraw/redraw), `wm::erase`, the deferred-erase drain (its fills
+/// paint the front directly, so its masked handback and generation bump both stand), the WC-F
+/// reserved arm, and an incoherent adopt tail.
+pub fn defer_nosession(boxes: &[(usize, usize, usize, usize)]) -> usize {
+    defer_common(boxes, true)
+}
+
+/// CURSOR-15 — the shared deferral body of [`defer_within`] / [`defer_nosession`]. One
+/// implementation on purpose: the two entry points differ only in who owes the settle (the adopt
+/// tail vs [`settle_nosession`]), never in which pixels are deferred or how.
+fn defer_common(boxes: &[(usize, usize, usize, usize)], nosession: bool) -> usize {
+    let _ = nosession;
     let mut sp = SPRITE.lock();
     if !sp.drawn {
         return 0;
@@ -1699,16 +1777,70 @@ pub fn defer_within(boxes: &[(usize, usize, usize, usize)]) -> usize {
     {
         C11_PASSES.fetch_add(1, Ordering::Relaxed);
         C11_PIX_DEFERRED.fetch_add(n as u64, Ordering::Relaxed);
+        if nosession {
+            F2_CT_PASSES.fetch_add(1, Ordering::Relaxed);
+        }
     }
     n
+}
+
+/// CURSOR-15 — the sessionless pass's tail: settle every pending verdict against the finished
+/// front, or leave the bits for an open session's own tail.
+///
+/// ### The gate, and why it is load-bearing rather than polite
+/// [`settle_pending_locked`]'s soundness rests on the front being FINAL for the pixels it reads: a
+/// save-under taken from a pixel some in-flight window is still going to overwrite is the stale save
+/// that stamps last frame's content into a live window. Our own pass's blits are behind us here —
+/// but a session OWNER's pass may still be mid-flight on another core, and its windows' rows land
+/// after ours. So the settle runs only when no overlay session is open (`OVERLAY` probed under the
+/// sprite lock, `SPRITE` → `OVERLAY`, the documented order; `try_lock`, never a wait). An open or
+/// contended session leaves the bits standing, counted in `ct_owner`, and they are settled by
+/// whichever tail closes the pass: the owner's [`adopt_overlay`] runs the same bit-driven settle
+/// against ITS finished front, and its incoherent fallback (`refresh_locked`) resets `pend`
+/// entirely, which is settlement by bracket.
+///
+/// **"No session open" really does mean the previous owner's tail has fully retired.**
+/// [`adopt_overlay`] closes the session and settles under ONE `SPRITE` acquisition, and this
+/// function holds `SPRITE` across its probe and settle — so it can never observe the closed-but-not-
+/// yet-settled middle of an adopt. A third sessionless pass still blitting concurrently can take a
+/// pixel after our read; that is the same cross-pass residual every settle has, absorbed the same
+/// way (`note_present_over_sprite` arms `TOUCHED_SINCE_DRAW`, the next full undraw's [`repair`]
+/// damages the window, and that pass's own tail re-settles the pixel — the settle is idempotent and
+/// the last tail wins).
+///
+/// A sprite that left the glass since the deferral (`!sp.drawn`) has nothing to settle: every full
+/// undraw and every draw resets `pend`, which is the same "settlement by bracket" the incoherent
+/// adopt relies on.
+pub fn settle_nosession() {
+    let mut unsupported_now = false;
+    {
+        let mut sp = SPRITE.lock();
+        if sp.drawn {
+            let free = match OVERLAY.try_lock() {
+                Some(g) => !g.session,
+                None => false,
+            };
+            if free {
+                settle_pending_locked(&mut sp, &mut unsupported_now);
+            } else {
+                #[cfg(feature = "witness")]
+                F2_CT_TO_OWNER.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    if unsupported_now && !UNSUPPORTED_REPORTED.swap(true, Ordering::Relaxed) {
+        serial_println!("[cursor] disabled: panel format has no read-back inverse");
+    }
 }
 
 /// CURSOR-11 — settle every [`Sprite::pend`] bit the pass's coverage install did not already claim.
 ///
 /// ### Ordering, and why it is load-bearing (the [wc-d] argument)
-/// This runs from [`adopt_overlay`], i.e. with the pass finished, the `BlitGuard` dropped and every
-/// window's rows on the panel — and it runs AFTER the coverage install, never before. Both halves of
-/// that ordering carry weight:
+/// This runs from [`adopt_overlay`] — and, since CURSOR-15, from [`settle_nosession`], whose gate
+/// (no open session) makes "after the install" vacuously true for that caller: there is no install
+/// outstanding anywhere when it runs. In both cases the pass is finished, the `BlitGuard` dropped
+/// and every window's rows on the panel — and on the adopt path it runs AFTER the coverage install,
+/// never before. Both halves of that ordering carry weight:
 ///
 /// * **After the pass.** The front buffer is final here, so `read_pixel` answers the only question
 ///   that matters — "did a painter in this pass take this pixel?" — with no race left in it. Asking
@@ -1836,6 +1968,14 @@ fn settle_pending_locked(sp: &mut Sprite, unsupported_now: &mut bool) {
 /// extents — was rejected as strictly weaker: it repairs the bookkeeping (the hole) but leaves the
 /// stale pixel B already wrote inside A's window rect, since A would then repaint `P` from the front
 /// where B's stale value is sitting. Only invalidating the generation reaches both.
+///
+/// ### CURSOR-15 — the sessionless COMPOSITE arm no longer calls this
+/// That arm defers instead ([`defer_nosession`]): it writes nothing, so there is no "stale pixel B
+/// already wrote" and the coverage-clear alternative rejected above becomes exactly right for it
+/// ([`overlay_uncover_any`]). This function's one surviving caller is the WC-L deferred-erase drain,
+/// whose fills paint the front directly and therefore still owe the handback and the generation bump
+/// this function provides. The interleave analysis above is unchanged and still load-bearing for
+/// that caller.
 pub fn undraw_within_nosession(boxes: &[(usize, usize, usize, usize)]) {
     let restored = {
         let mut sp = SPRITE.lock();
@@ -1873,8 +2013,8 @@ fn undraw_within_locked(
     // `undraw_locked`'s exactly, one entry point over: pass A owns the session, `compose_into` has
     // delivered the arrow inside A's freshly presented rows (`ov.saved` holds the window's NEW frame
     // under each covered pixel), and `adopt_overlay`'s install has not yet moved that into
-    // `sp.saved`. A masked undraw arriving in that window — the sessionless composite arm or the
-    // WC-L drain, i.e. exactly `undraw_within_nosession`'s two callers — finds the panel holding our
+    // `sp.saved`. A masked undraw arriving in that window — since CURSOR-15 that is the WC-L drain,
+    // `undraw_within_nosession`'s one surviving caller — finds the panel holding our
     // colour (A put it there), passes the colour guard, and before this arc restored `sp.saved`:
     // LAST frame's window content, stamped into a live window under the pointer. That is the P80
     // residual (b) — occasional because it needs a concurrent pass inside A's compose-to-install
@@ -2215,6 +2355,48 @@ pub fn overlay_uncover(plan: &Plan, bx: usize, by: usize, bw: usize, bh: usize) 
     let boxes = [(bx, by, bw, bh)];
     let mut covered = ov.covered;
     for_each_sprite_pixel(plan.bx, plan.by, plan.bw, plan.bh, plan.s, |x, y, _c, i| {
+        if in_any(&boxes, x, y) {
+            covered.clear(i);
+        }
+    });
+    ov.covered = covered;
+    true
+}
+
+/// CURSOR-15 — [`overlay_uncover`] for a pass that holds NO plan: clear whatever open session's
+/// coverage bits fall inside the box this window has just painted.
+///
+/// ### The hazard this closes, and where the old code closed it
+/// A sessionless pass now composes through the sprite ([`defer_nosession`]) instead of handing
+/// pixels back, so [`undraw_within_nosession`]'s generation bump — whose documented job was to
+/// retire a concurrent owner's session when this pass disturbed one of its pixels — no longer runs
+/// on that arm. The residual it guarded: the owner's `compose_into` COVERED pixel `P` (arrow rode
+/// its present, layer save in `ov.saved[P]`), then OUR blit overwrote `P` with window content. The
+/// owner's [`adopt_overlay`] would install `ov.saved[P]` as the sprite's save-under and clear `P`'s
+/// bookkeeping — the module then believes the arrow is on the panel at `P`, where our content is.
+/// That is CURSOR-4's intra-pass higher-window hazard, cross-pass; the fix is CURSOR-4's too:
+/// clearing the coverage makes the owner's tail treat `P` as unclaimed and settle it against the
+/// finished front, where our content is visible and the colour guard answers correctly.
+///
+/// The walk uses the SESSION's own geometry — the plan-less caller has none to offer, and the bits
+/// being cleared are indexed against the session's sprite, not against anything of ours. No open
+/// session is a `true` (nothing to clear); a contended lock is a `false`, and the caller notes
+/// [`note_uncover_lost`] so the owner's tail declines the install wholesale — the same bounded,
+/// already-priced fallback `overlay_uncover` uses. `try_lock` only: this runs inside the
+/// `BlitGuard` window.
+#[must_use]
+pub fn overlay_uncover_any(bx: usize, by: usize, bw: usize, bh: usize) -> bool {
+    let mut ov = match OVERLAY.try_lock() {
+        Some(g) => g,
+        None => return false,
+    };
+    if !ov.session {
+        return true;
+    }
+    let boxes = [(bx, by, bw, bh)];
+    let (obx, oby, obw, obh, os) = (ov.bx, ov.by, ov.bw, ov.bh, ov.s);
+    let mut covered = ov.covered;
+    for_each_sprite_pixel(obx, oby, obw, obh, os, |x, y, _c, i| {
         if in_any(&boxes, x, y) {
             covered.clear(i);
         }

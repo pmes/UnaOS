@@ -5550,3 +5550,108 @@ the `PRUNNING -> PEXITED` flip has already published its own status, honestly.
 
 Hardware verification (the bench click on a storm vug's close box: window gone, `[skill]
 close-box killed ... confirmed=1`, fleet count down by one) is owed at the next attended sitting.
+
+## CURSOR-15 — the sessionless present composes through: the hover stutter dies (2026-07-29)
+
+### The P82 mechanism
+
+P82 (bench, attended, CURSOR-14 aboard): with the pointer parked over the presenting vug fleet the
+arrow stutters, and the wire names the shape — `[flick2] sess_undraws=290+` and climbing at present
+cadence (~123/s), `down_slow` accumulating. The same mechanism was measured independently on x86 the
+same night. The compose-through machinery itself is healthy (`[cursor12] planned`/`offers`/`taken`
+all fire), so the erase is not the session path: it is the passes that LOSE the session.
+
+Under a presenting fleet several cores composite at once and exactly one owns the overlay session
+per pass. Every loser took `undraw_within_nosession` — a masked handback of the sprite pixels inside
+its paint set — followed by a `Repaint` tail, i.e. a whole-sprite `refresh_locked`
+(restore→save→draw). One erase-and-rebuild of the arrow per overlapping present, at PRESENT cadence,
+while the pointer's own repaint runs at EVENT cadence. `sess_undraws` is those tail refreshes
+landing while some other pass's session is open (the full undraw finds a coherent session and
+restores from the layer save — FLICKER-2's fixed path, running healthily but far too often), and
+`down_slow` is the intervals they cost. The sprite spends its life mid-restore: the stutter.
+
+### The fix: COMPOSE-THROUGH for the sessionless arm
+
+The handback's one justification — a pixel a painter in this pass is about to overwrite must be
+handed back first, or its save-under goes stale — is answered the way CURSOR-11 answered it for the
+session owner: at the tail, per pixel, against the finished front. The sessionless arm now:
+
+* **defers instead of undrawing** (`cursor::defer_nosession`, the shared `defer_common` body with
+  `defer_within`): `pend` bits are marked inside the paint set, no framebuffer pixel is written, no
+  generation is bumped. The arrow stays on glass; the pass's blits composite over it where they
+  reach it.
+* **settles at a new tail** (`CursorTail::Settle` → `cursor::settle_nosession`): for each pending
+  pixel the colour guard asks the finished front whether a painter took it. Untouched → no read, no
+  write (the common case). Taken → `saved[i]` is re-taken from the freshly-composited content
+  BEFORE the arrow pixel is painted back over it — the FLICKER-2/3 session-fresh save-under
+  discipline, extended to compose-through. This is `settle_pending_locked`, unchanged; only the
+  second caller is new.
+* **gates the settle on session quiescence**: `settle_nosession` probes `OVERLAY` under the sprite
+  lock (`SPRITE` → `OVERLAY`, the documented order, `try_lock` never a wait). An open or contended
+  session leaves the bits standing (`ct_owner`) for the owner's own tail — `settle_pending_locked`
+  is bit-driven, not owner-driven, so `adopt_overlay` answers them against ITS finished front, and
+  its incoherent fallback resets `pend`, which is settlement by bracket. The gate is load-bearing:
+  a settle that read the front while the owner's rows were still in flight would install a stale
+  save. Because `adopt_overlay` closes the session and settles under one `SPRITE` acquisition, and
+  `settle_nosession` holds `SPRITE` across probe and settle, "no session open" really does mean the
+  previous owner's tail fully retired.
+
+### Coherence consequences, stated
+
+* **CURSOR-5's generation bump is not needed on this arm any more — its stale-stamp interleave has
+  no first move.** The bump existed because a sessionless handback WROTE `sp.saved` (pre-pass
+  content) into the owner's freshly-presented rows; the deferral writes nothing.
+* **The bump's second duty moves to a coverage clear.** If the sessionless pass's blit overwrites a
+  pixel the owner's layer COVERED, the owner's install would claim a panel pixel that is now the
+  loser's, with a layer save the panel no longer holds. `cursor::overlay_uncover_any` — called from
+  `draw_window` for plan-less windows whose box meets the advisory sprite box — clears the open
+  session's coverage inside the painted box, so the owner's tail settles those pixels against the
+  finished front instead. This is CURSOR-4's back-to-front verdict rule applied across passes; the
+  lens's rejected alternative on `undraw_within_nosession` is exactly right HERE because nothing
+  stale was written. A contended clear invalidates the session wholesale via the existing
+  `note_uncover_lost` → refuse-install → `refresh_locked` fallback, already priced.
+* **What still brackets, deliberately:** the pointer-move `repaint` (sprite RELOCATION keeps its
+  undraw/redraw — compose-through is for OTHER passes crossing a stationary sprite), `wm::erase`,
+  the WC-L deferred-erase drain (its fills paint the front directly, so `undraw_within_nosession`
+  survives with it as sole caller, generation bump and all), the WC-F reserved arm, an incoherent
+  adopt tail, and `Screen::flush`'s CURSOR-13 desktop bracket (unchanged — so `[cursor6]
+  desktop_over`'s meaning of "over" is untouched and its =0 verdict still catches a sprite-region
+  desync on the desktop path).
+* **Cross-pass settle residual, named:** a third concurrent pass can take a pixel between one
+  settle's front read and its arrow write. Same class as every settle, absorbed the same way:
+  `note_present_over_sprite` arms `TOUCHED_SINCE_DRAW`, the next full undraw's `repair` damages the
+  window, and the taker's own tail re-settles — the settle is idempotent and the last tail wins.
+* **`tail_of` precedence:** `disturbed` outranks `deferred` — a pass that both drained (masked
+  handback, `off` pixels) and deferred takes `Repaint`, whose `refresh_locked` resets `pend` as it
+  goes; the deferral is settled by the bracket rather than dropped.
+
+### Witness (reading key)
+
+* `[flick2] ... compose_through= ct_owner=` — sessionless compose-through passes, and settles left
+  to an open session's tail. Expected on metal: `compose_through` tracks the present rate while
+  `sess_undraws` and `mask_sess` COLLAPSE toward pointer-move-only counts and `down_slow` → 0 under
+  hover. That collapse is the arc's verdict.
+* `[cursor3] rollup ... settle=` (and sampled `tail=settle -> THROUGH`) — the new tail. On a hovered
+  fleet `settle` should absorb what `repaint` used to count.
+* `[cursor5] masked_nosession=` — must read 0 from this arc on: the mechanism it counts no longer
+  runs. Non-zero means someone reintroduced the sessionless handback.
+* `[cursor11] passes=` now includes sessionless deferrals (`defer_nosession` feeds the same
+  counters), so `passes`/`bracketed` remains the honest through-vs-bracket ratio.
+* `[cursor6]` is unchanged in meaning: a deferring pass reports `bracketed=true` to
+  `note_present_over_sprite` (its `Settle` tail owes the pixels a verdict), so its presents count as
+  `masked` — the denominator — exactly as CURSOR-11's session deferrals do, and `desktop_over` must
+  still be 0.
+* All of it `UNWITNESSED` on QEMU by construction (no HID pointer, sprite never drawn); the gate
+  proves no-regression only.
+
+### Gate results (CURSOR-15, 2026-07-29, QEMU raspi4b)
+
+* `./arroyo check` — both arches green, no new warnings in the arc files.
+* `./arroyo kernel8-test` — MBENCH PASS 87/87 required witnesses, 0 forbidden. New line shapes on
+  the wire: `[cursor3] rollup ... settle=0 ...`, `[flick2] ... compose_through=0 ct_owner=0 ...`,
+  `[cursor5] ... masked_nosession=0` — all UNWITNESSED/0, as the gate must read them.
+* `./arroyo test-arm` — MISSION SUCCESS.
+
+Hardware verification is owed at the next attended sitting: pointer parked over the presenting
+fleet, read `[flick2]` for `sess_undraws`/`mask_sess` collapsing and `down_slow` flat while
+`compose_through` climbs at present cadence, and the stutter gone from the chair.
