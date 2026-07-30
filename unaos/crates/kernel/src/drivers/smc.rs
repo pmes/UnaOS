@@ -621,6 +621,27 @@ pub mod battery {
     static ROLLED_TOTAL: Mutex<u32> = Mutex::new(0);
     static ROLLED_MS: Mutex<u64> = Mutex::new(0);
 
+    // PWR ROLLUP bookkeeping
+    struct PwrRollupState {
+        samples: u32,
+        unknown: u32,
+        sum: i64,
+        min: i64,
+        max: i64,
+        state: AcDerived,
+        start_ms: u64,
+    }
+    static PWR_ROLLUP: Mutex<PwrRollupState> = Mutex::new(PwrRollupState {
+        samples: 0,
+        unknown: 0,
+        sum: 0,
+        min: 0,
+        max: 0,
+        state: AcDerived::Unknown,
+        start_ms: 0,
+    });
+    const PWR_ROLLUP_MS: u64 = 10_000;
+
     const REFRESH_MS: u64 = 1000;
     /// QUIET-HOLD threshold. On the 2012 rMBP's flaky SMC a ONE-SWEEP drop-out is the normal case,
     /// not an event: the `holding` / `hold released` pair fired every second on s39 metal. After the
@@ -939,6 +960,66 @@ pub mod battery {
                     window,
                     rtotal
                 );
+            }
+        }
+
+        // PWR ROLLUP (M1 power instrument)
+        if s.present {
+            let mut pwr = PWR_ROLLUP.lock();
+            let mut flush = false;
+            let mut reason = "";
+
+            if pwr.start_ms == 0 {
+                pwr.start_ms = now;
+                pwr.state = s.ac_derived;
+            }
+
+            // If the AC state changes mid-window, flush the old state before accumulating
+            if s.ac_derived != pwr.state && pwr.start_ms != 0 && (pwr.samples > 0 || pwr.unknown > 0) {
+                flush = true;
+                reason = "state change";
+            } else if now.wrapping_sub(pwr.start_ms) >= PWR_ROLLUP_MS && (pwr.samples > 0 || pwr.unknown > 0) {
+                flush = true;
+                reason = "rollup";
+            }
+
+            if flush {
+                let state_str = match pwr.state {
+                    AcDerived::Charging => "plugged (charging)",
+                    AcDerived::Discharging => "unplugged (discharging)",
+                    AcDerived::Idle => "idle",
+                    AcDerived::Unknown => "unknown",
+                };
+                serial_println!(
+                    ":: PWR: state={} samples={} unknown={} sum={} min={} max={} (sign convention: inherited assumption) == {} ::",
+                    state_str, pwr.samples, pwr.unknown, pwr.sum, pwr.min, pwr.max, reason
+                );
+                // Reset accumulator for the new window
+                pwr.samples = 0;
+                pwr.unknown = 0;
+                pwr.sum = 0;
+                pwr.min = 0;
+                pwr.max = 0;
+                pwr.start_ms = now;
+                pwr.state = s.ac_derived;
+            }
+
+            // Accumulate current sample
+            if let (Some(volt), Some(amp)) = (s.volt_mv, s.amp_ma) {
+                if matches!(s.ac_derived, AcDerived::Unknown) {
+                    pwr.unknown += 1;
+                } else {
+                    let mw = (volt as i64 * amp as i64) / 1000;
+                    if pwr.samples == 0 {
+                        pwr.min = mw;
+                        pwr.max = mw;
+                    } else {
+                        if mw < pwr.min { pwr.min = mw; }
+                        if mw > pwr.max { pwr.max = mw; }
+                    }
+                    pwr.sum += mw;
+                    pwr.samples += 1;
+                }
             }
         }
     }

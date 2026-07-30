@@ -70,6 +70,12 @@ pub enum FatError {
     /// U10: no free space — the free-cluster search found no free cluster (volume full), or a directory has
     /// no free slot for a new entry (root-directory-chain extension is out of scope). Surfaces as `-ENOSPC`.
     NoSpace,
+    /// PARTITION (GR9): a derived LBA fell outside THIS volume's own extent (`part_lba .. part_lba +
+    /// vol_sectors`). Distinct from [`FatError::Io`] on purpose: `Io` means the medium refused a legal
+    /// access, this means the filesystem asked for a sector that is not its to touch — a bug or a corrupt
+    /// on-disk field, caught before it reached the medium. Never returned on a healthy volume, because
+    /// [`parse_bpb`] rejects at mount time any BPB whose total-sector claim exceeds its partition.
+    OutOfVolume,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -512,6 +518,24 @@ pub struct FatFs {
     /// globally-registered device (SD on the Pi); `Usb` for a read-only mount of the USB stick read
     /// straight through the xHCI controller.
     source: BlockSource,
+    /// PARTITION (GR9): this volume's extent in sectors, measured from `part_lba`. It is the BPB's
+    /// own `tot_sec`, and at mount time it was proven `<=` the containing partition's declared length
+    /// (see [`parse_bpb`]), so `part_lba .. part_lba + vol_sectors` is a sub-range of the partition.
+    /// Every sector access this file makes is checked against it by [`FatFs::in_extent`] — that check,
+    /// not the arithmetic, is what makes a FAT on partition 1 incapable of reaching partition 2.
+    vol_sectors: u64,
+    /// PARTITION (GR9): the MBR primary slot this volume was mounted from (1..=4), or 0 for a volume
+    /// that did not come from an MBR entry (a superfloppy at LBA 0, or a GPT partition). Carried for
+    /// the mount witness and `describe()` only; nothing keys behaviour off it.
+    part_slot: u8,
+    /// PARTITION (GR9): the containing partition as the block layer describes it, when this volume
+    /// was found through a partition entry (`None` for a superfloppy — there is no container). It is
+    /// consulted by [`FatFs::in_extent`] as a SECOND, independent bound: `vol_sectors` is what the
+    /// volume's own BPB claims, this is what the partition table claims, and the two are written by
+    /// different tools at different times. Agreeing at mount time (`parse_bpb` refuses a BPB larger
+    /// than its partition) does not make one redundant at access time — a derived address is checked
+    /// against both, so a wrong `vol_sectors` cannot by itself let an access leave the partition.
+    range: Option<crate::drivers::block::PartitionRange>,
 }
 
 // ---- little-endian field readers ------------------------------------------------------------
@@ -931,10 +955,18 @@ fn f2_witness_step() {
 /// also what distinguishes a superfloppy BPB from an MBR boot sector — an MBR's bootstrap bytes
 /// won't pass the jump-instruction, sector-size, and geometry-consistency gates. FAT12 and
 /// non-512-byte sectors are rejected as `Unsupported`.
+///
+/// PARTITION (GR9): `range` is the containing partition as the block layer describes it, when this
+/// volume was found through a partition entry (`None` for a superfloppy, where the device is the
+/// volume). Its declared length is a hard gate — see the `tot_sec` check below — and it is retained
+/// in the mount so every later access is bound-checked against it. `part_slot` is carried only so
+/// the mount witness can name which MBR slot the volume came from.
 fn parse_bpb(
     sec: &[u8; SECTOR_SIZE],
     part_lba: u64,
     dev_blocks: u64,
+    range: Option<crate::drivers::block::PartitionRange>,
+    part_slot: u8,
     source: BlockSource,
 ) -> Result<FatFs, FatError> {
     // BS_JmpBoot (offset 0): a FAT VBR starts with EB xx 90 or E9 xx xx. Strong VBR discriminator.
@@ -1031,6 +1063,21 @@ fn parse_bpb(
         return Err(FatError::NotFat);
     }
 
+    // PARTITION (GR9): consistency vs the CONTAINING PARTITION. The gate above only proves the
+    // volume fits the DISK — which is exactly what a FAT volume that overruns its partition and
+    // runs on into the next one also satisfies. Nothing on the medium guarantees `tot_sec` agrees
+    // with the partition entry that pointed here: they are two independent claims written by
+    // (possibly) two different tools, and a mismatch is either a formatting bug or a deliberate
+    // attempt to have partition 1's filesystem address partition 2's sectors. Refuse the mount
+    // rather than clamp `tot_sec` down to the partition length: a volume whose own header disagrees
+    // with its container is not a volume we understand, and silently shrinking it would leave a
+    // filesystem whose FAT and cluster count describe sectors we then refuse to serve.
+    if let Some(r) = range {
+        if r.start_lba != part_lba || tot_sec as u64 > r.sector_count {
+            return Err(FatError::NotFat);
+        }
+    }
+
     let root_cluster = if kind == FatKind::Fat32 {
         u32le(sec, 44) & 0x0FFF_FFFF
     } else {
@@ -1072,6 +1119,11 @@ fn parse_bpb(
         vol_id,
         vol_label,
         source,
+        // PARTITION (GR9): the volume's own extent. `tot_sec` — proven above to fit the disk, to fit
+        // the 32-bit LBA space, and (when this came from a partition entry) to fit the partition.
+        vol_sectors: tot_sec as u64,
+        part_slot,
+        range,
     })
 }
 
@@ -1100,8 +1152,21 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
     let mut sec = [0u8; SECTOR_SIZE];
     read_sector(source, 0, &mut sec)?;
 
+    // PARTITION (GR9): the raw census, before any of the three interpretations below. It prints at
+    // most once per handle per boot and returns the decoded table either way, so this call is both
+    // the witness and the table the MBR branch uses — one decode, one printed opinion, no chance of
+    // the log describing a table the mount did not use.
+    let table = crate::drivers::block::mbr_census(handle_of(source), &sec, dev_blocks);
+
     // 1) Superfloppy: LBA 0 is itself the BPB.
-    if let Ok(fs) = parse_bpb(&sec, 0, dev_blocks, source) {
+    //
+    //    Tried FIRST, and that ordering is load-bearing: a FAT superfloppy also carries 0x55AA at
+    //    offset 510, and the bootstrap code occupying bytes 446..510 can decode as plausible-looking
+    //    partition entries. Only the BPB gates (jump instruction, sector size, geometry consistency)
+    //    tell the two apart, so they run before any partition-table reading is trusted. `None` for
+    //    the partition length: there is no container — the device IS the volume, and the
+    //    `part_lba + tot_sec <= dev_blocks` gate inside `parse_bpb` is its bound.
+    if let Ok(fs) = parse_bpb(&sec, 0, dev_blocks, None, 0, source) {
         return Ok(fs);
     }
 
@@ -1112,20 +1177,62 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
         return Ok(fs);
     }
 
-    // 3) MBR-partitioned: 0x55AA signature + a partition table at offset 446. Scan the four
-    //    primary entries; for each non-empty, non-extended entry, try to parse a BPB at its start
-    //    LBA. First one that validates wins.
-    for start in mbr_volume_starts(&sec, dev_blocks) {
-        let mut pbs = [0u8; SECTOR_SIZE];
-        if read_sector(source, start, &mut pbs).is_err() {
-            continue;
-        }
-        if let Ok(fs) = parse_bpb(&pbs, start, dev_blocks, source) {
-            return Ok(fs);
+    // 3) MBR-partitioned — the UnaOS layout of record: partition 1 = ESP (FAT), partition 2 = UnaFS.
+    //    Walk the ACCEPTED entries in slot order, so partition 1 is what a FAT mount binds when it is
+    //    a FAT volume, and each candidate is parsed under ITS OWN partition length. That length is
+    //    the difference between this and mounting off the raw device: a BPB claiming more sectors
+    //    than its partition holds is refused here rather than becoming a volume that can address its
+    //    neighbour. `decode_mbr` has already dropped empty, extended, zero-length, out-of-range,
+    //    overlapping and GPT-protective slots, so anything reaching this loop is a disjoint,
+    //    in-bounds extent on this medium.
+    if let Some(t) = table {
+        for p in t.iter() {
+            let mut pbs = [0u8; SECTOR_SIZE];
+            if read_sector(source, p.start_lba, &mut pbs).is_err() {
+                continue;
+            }
+            let range = crate::drivers::block::PartitionRange::new(handle_of(source), &p);
+            if let Ok(fs) = parse_bpb(&pbs, p.start_lba, dev_blocks, Some(range), p.slot, source) {
+                mount_witness(&fs);
+                return Ok(fs);
+            }
         }
     }
 
     Err(FatError::NotFat)
+}
+
+/// PARTITION (GR9): which block-layer registry handle a FAT [`BlockSource`] reads through. The two
+/// enums are deliberately separate types (one names a FAT read path, the other a registry slot);
+/// this is the single place they are related, so the census can never be attributed to the wrong
+/// device.
+fn handle_of(source: BlockSource) -> crate::drivers::block::BlockHandle {
+    match source {
+        BlockSource::Default => crate::drivers::block::BlockHandle::Global,
+        BlockSource::Usb => crate::drivers::block::BlockHandle::Usb,
+    }
+}
+
+/// PARTITION (GR9): announce a FAT volume mounted from an MBR slot, once per slot per boot.
+///
+/// INSTRUMENT NOTE (healthy-but-idle): the latch below reads 0 before the first partition-hosted FAT
+/// mount and then holds whichever slot bits have been announced. It gates printing only — the mount
+/// itself is unconditional — so a missing line means "already announced this boot", never "did not
+/// mount". On the layout of record exactly one line appears, naming slot 1.
+fn mount_witness(fs: &FatFs) {
+    static ANNOUNCED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    if fs.part_slot == 0 || fs.part_slot > 4 {
+        return;
+    }
+    let bit = 1u8 << (fs.part_slot - 1);
+    if ANNOUNCED.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+        return;
+    }
+    let (start, end) = fs.extent();
+    serial_println!(
+        ":: PART: fat mounted from MBR slot {} — extent LBA {}..{} ({} sectors), {} ::",
+        fs.part_slot, start, end, fs.vol_sectors, fs.describe()
+    );
 }
 
 /// The candidate volume-start LBAs named by a classic MBR partition table in `sec` (LBA 0). Empty if
@@ -1135,6 +1242,16 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
 /// Extracted from `mount_source` so the INSTALL-SELF serial enumerator
 /// ([`volume_serials`]) walks the exact same candidate set the mount path does — one table walk, so
 /// the guard can never see a partition the mount would not, or miss one it would.
+///
+/// PARTITION (GR9): this walk stays DELIBERATELY BROADER than
+/// [`crate::drivers::block::decode_mbr`], which the mount path now uses. `decode_mbr` additionally
+/// drops entries whose extent overruns the device or overlaps an accepted neighbour; those drops are
+/// right for "which volume do I mount" and WRONG for "which volumes might this disk be", because the
+/// only failure mode that matters to the boot-device guard is missing a serial — that would offer
+/// the boot disk as an erase target. Enumerating a SUPERSET of the mount's candidates keeps the
+/// error in the safe direction (more refusals, never fewer), which is the property `volume_serials`'
+/// doc comment above states. It is therefore not a drift between two parsers: it is the same rule
+/// set minus the two rules that only make sense when choosing a volume to trust.
 fn mbr_volume_starts(sec: &[u8; SECTOR_SIZE], dev_blocks: u64) -> alloc::vec::Vec<u64> {
     let mut out = alloc::vec::Vec::new();
     if sec[510] != 0x55 || sec[511] != 0xAA {
@@ -1186,19 +1303,27 @@ pub fn volume_serials(source: BlockSource) -> alloc::vec::Vec<u32> {
     }
 
     // 1) Superfloppy: LBA 0 is itself the BPB.
-    if let Ok(fs) = parse_bpb(&sec, 0, dev_blocks, source) {
+    //
+    // PARTITION (GR9): every parse here passes `None` for the containing-partition length ON PURPOSE.
+    // This function does not mount anything — it only reads `BS_VolID` — and applying the partition
+    // gate would drop a volume whose BPB overruns its entry, i.e. would make the boot-device guard
+    // recognize FEWER disks as "the disk we booted from". The gate's job is to keep an untrustworthy
+    // volume from being MOUNTED; the guard's job is to recognize as many volumes as possible so it
+    // can refuse them as install targets. Same reasoning as the broader MBR walk below.
+    if let Ok(fs) = parse_bpb(&sec, 0, dev_blocks, None, 0, source) {
         push_unique(&mut out, fs.vol_id);
     }
 
     // 2) + 3) Every partition start either table names.
-    let mut starts = gpt_volume_starts(dev_blocks, source);
+    let mut starts: alloc::vec::Vec<u64> =
+        gpt_volume_spans(dev_blocks, source).into_iter().map(|(s, _)| s).collect();
     starts.extend_from_slice(&mbr_volume_starts(&sec, dev_blocks));
     for start in starts {
         let mut pbs = [0u8; SECTOR_SIZE];
         if read_sector(source, start, &mut pbs).is_err() {
             continue;
         }
-        if let Ok(fs) = parse_bpb(&pbs, start, dev_blocks, source) {
+        if let Ok(fs) = parse_bpb(&pbs, start, dev_blocks, None, 0, source) {
             push_unique(&mut out, fs.vol_id);
         }
     }
@@ -1218,26 +1343,41 @@ fn push_unique(out: &mut alloc::vec::Vec<u32>, v: u32) {
 /// if there is no GPT or no FAT partition. Read-only; the scan is bounded (≤128 entries), and only
 /// entry sizes that divide a 512-byte sector (128 / 256) are handled so no entry straddles a read.
 fn scan_gpt(dev_blocks: u64, source: BlockSource) -> Result<FatFs, FatError> {
-    for first_lba in gpt_volume_starts(dev_blocks, source) {
+    for (first_lba, sectors) in gpt_volume_spans(dev_blocks, source) {
         let mut pbs = [0u8; SECTOR_SIZE];
         if read_sector(source, first_lba, &mut pbs).is_err() {
             continue;
         }
-        if let Ok(fs) = parse_bpb(&pbs, first_lba, dev_blocks, source) {
+        // PARTITION (GR9): bounded by the GPT entry's own extent, exactly as the MBR branch is
+        // bounded by the primary entry's — a GPT partition is no more entitled to overrun into its
+        // neighbour than an MBR one. `part_slot` stays 0: GPT entries are not MBR primary slots and
+        // conflating the two numbers in a witness line would be a lie.
+        let range = crate::drivers::block::PartitionRange {
+            handle: handle_of(source),
+            start_lba: first_lba,
+            sector_count: sectors,
+        };
+        if let Ok(fs) = parse_bpb(&pbs, first_lba, dev_blocks, Some(range), 0, source) {
             return Ok(fs);
         }
     }
     Err(FatError::NotFat)
 }
 
-/// The candidate volume-start LBAs named by a GUID Partition Table on `source`, in entry order.
-/// Empty if there is no `EFI PART` header at LBA 1 or its geometry fields are implausible.
+/// The candidate volume spans `(first_lba, sector_count)` named by a GUID Partition Table on
+/// `source`, in entry order. Empty if there is no `EFI PART` header at LBA 1 or its geometry fields
+/// are implausible.
 ///
 /// Extracted from [`scan_gpt`] so the INSTALL-SELF serial enumerator ([`volume_serials`]) walks the
 /// exact same entry set the mount path does. Bounded at 128 entries regardless of a corrupt count,
 /// and only entry sizes that divide a 512-byte sector (128 / 256) are handled so no entry straddles a
 /// read. A read failure mid-array stops the walk (as it always did); an implausible entry is skipped.
-fn gpt_volume_starts(dev_blocks: u64, source: BlockSource) -> alloc::vec::Vec<u64> {
+///
+/// PARTITION (GR9): the entry's `last_lba` is now read alongside `first_lba` so the mount path can
+/// bound the volume by its partition. Both are on-disk claims: an entry whose `last < first`, or
+/// whose extent runs past the device, is SKIPPED rather than clamped — the same rule the MBR decoder
+/// applies, for the same reason.
+fn gpt_volume_spans(dev_blocks: u64, source: BlockSource) -> alloc::vec::Vec<(u64, u64)> {
     let mut out = alloc::vec::Vec::new();
     if dev_blocks < 3 {
         return out;
@@ -1279,7 +1419,20 @@ fn gpt_volume_starts(dev_blocks: u64, source: BlockSource) -> alloc::vec::Vec<u6
         if first_lba == 0 || first_lba >= dev_blocks {
             continue;
         }
-        out.push(first_lba);
+        // PARTITION (GR9): `last_lba` is INCLUSIVE in the UEFI entry format, so the length is
+        // `last - first + 1`. Every step is checked: a reversed pair, an overflowing sum, or an
+        // extent past the medium drops the entry.
+        let last_lba = u64le(&buf, off + 40);
+        if last_lba < first_lba {
+            continue;
+        }
+        let Some(sectors) = last_lba.checked_sub(first_lba).and_then(|d| d.checked_add(1)) else {
+            continue;
+        };
+        match first_lba.checked_add(sectors) {
+            Some(end) if end <= dev_blocks => out.push((first_lba, sectors)),
+            _ => continue,
+        }
     }
     out
 }
@@ -1292,12 +1445,13 @@ impl FatFs {
     /// One-line human summary of the parsed geometry (for `fatinfo` / boot log).
     pub fn describe(&self) -> String {
         let head = alloc::format!(
-            "FAT{} vol@LBA{} bps={} spc={} nfat={} fatsz={}sec reserved={} fat@LBA{} data@LBA{} clusters={}",
+            "FAT{} vol@LBA{} volsec={} bps={} spc={} nfat={} fatsz={}sec reserved={} fat@LBA{} data@LBA{} clusters={}",
             match self.kind {
                 FatKind::Fat16 => 16,
                 FatKind::Fat32 => 32,
             },
             self.part_lba,
+            self.vol_sectors,
             self.bytes_per_sec,
             self.sec_per_clus,
             self.num_fats,
@@ -1313,6 +1467,82 @@ impl FatFs {
                 alloc::format!("{head} rootdir@LBA{} ({}sec)", self.root_dir_lba, self.root_dir_sectors)
             }
         }
+    }
+
+    // --- PARTITION (GR9): the volume-extent gate every sector access passes through ---
+
+    /// One past the last sector of this volume, absolute. Cannot overflow: `parse_bpb` already
+    /// proved `part_lba + tot_sec <= u32::MAX + 1`.
+    fn vol_end(&self) -> u64 {
+        self.part_lba.saturating_add(self.vol_sectors)
+    }
+
+    /// Refuse an absolute span that is not entirely inside this volume.
+    ///
+    /// The FAT geometry checks in [`parse_bpb`] already make every DERIVED address (FAT sector,
+    /// root-dir sector, cluster sector) fall inside `tot_sec` by construction. This gate is the
+    /// second, independent layer: it does not reason about geometry at all, it just compares the
+    /// address that is actually about to be handed to the block layer against the volume's own
+    /// bounds. That is the layer that still holds if a future geometry derivation is wrong, if an
+    /// on-disk field is corrupt, or if a caller hands in an LBA it computed itself — which is
+    /// exactly the class of bug that writes into the neighbouring partition. Cheap: two compares per
+    /// sector op, against a path that costs a USB round trip.
+    fn in_extent(&self, lba: u64, sectors: u64) -> Result<(), FatError> {
+        let end = lba.checked_add(sectors).ok_or(FatError::OutOfVolume)?;
+        if sectors == 0 || lba < self.part_lba || end > self.vol_end() {
+            return Err(FatError::OutOfVolume);
+        }
+        // The partition's own bound, as the block layer states it — a separate claim from a separate
+        // on-disk structure. `contains_absolute` re-derives nothing from this file's fields.
+        if let Some(r) = self.range {
+            if !r.contains_absolute(lba, sectors) {
+                return Err(FatError::OutOfVolume);
+            }
+        }
+        Ok(())
+    }
+
+    /// Extent-checked [`read_sector`].
+    fn rd_sector(&self, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), FatError> {
+        self.in_extent(lba, 1)?;
+        read_sector(self.source, lba, buf)
+    }
+
+    /// Extent-checked [`write_sector`]. The write side matters most: a read that escapes the volume
+    /// returns wrong bytes, a write that escapes it destroys a neighbour.
+    fn wr_sector(&self, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), FatError> {
+        self.in_extent(lba, 1)?;
+        write_sector(self.source, lba, buf)
+    }
+
+    /// Extent-checked [`read_sectors`] — the whole run is checked, not just its first sector.
+    fn rd_sectors(&self, lba: u64, buf: &mut [u8]) -> Result<(), FatError> {
+        if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
+            return Err(FatError::Io);
+        }
+        self.in_extent(lba, (buf.len() / SECTOR_SIZE) as u64)?;
+        read_sectors(self.source, lba, buf)
+    }
+
+    /// Extent-checked [`write_sectors`].
+    fn wr_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), FatError> {
+        if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
+            return Err(FatError::Io);
+        }
+        self.in_extent(lba, (buf.len() / SECTOR_SIZE) as u64)?;
+        write_sectors(self.source, lba, buf)
+    }
+
+    /// PARTITION (GR9): this volume's extent as absolute LBAs `[start, end)` — for witnesses and
+    /// for a caller that wants to assert two mounted volumes do not overlap.
+    pub fn extent(&self) -> (u64, u64) {
+        (self.part_lba, self.vol_end())
+    }
+
+    /// PARTITION (GR9): the MBR primary slot this volume came from (1..=4), or 0 if it did not come
+    /// from an MBR entry.
+    pub fn partition_slot(&self) -> u8 {
+        self.part_slot
     }
 
     // --- cluster / FAT-chain helpers ---
@@ -1367,7 +1597,7 @@ impl FatFs {
         }
         let within = (offset % SECTOR_SIZE as u64) as usize;
         let mut buf = [0u8; SECTOR_SIZE];
-        read_sector(self.source, self.fat_start + fat as u64 * self.fat_sz as u64 + sec, &mut buf)?;
+        self.rd_sector(self.fat_start + fat as u64 * self.fat_sz as u64 + sec, &mut buf)?;
         Ok(match self.kind {
             FatKind::Fat16 => u16le(&buf, within) as u32,
             FatKind::Fat32 => u32le(&buf, within) & 0x0FFF_FFFF,
@@ -1454,7 +1684,7 @@ impl FatFs {
         let mut buf = [0u8; SECTOR_SIZE];
         for f in 0..self.num_fats as u64 {
             let lba = self.fat_start + f * self.fat_sz as u64 + sec;
-            read_sector(self.source, lba, &mut buf)?;
+            self.rd_sector(lba, &mut buf)?;
             match self.kind {
                 FatKind::Fat16 => {
                     let v = (next & 0xFFFF) as u16;
@@ -1466,7 +1696,7 @@ impl FatFs {
                     buf[within..within + 4].copy_from_slice(&v.to_le_bytes());
                 }
             }
-            write_sector(self.source, lba, &buf)?;
+            self.wr_sector(lba, &buf)?;
         }
         Ok(())
     }
@@ -1494,8 +1724,7 @@ impl FatFs {
         let mut done = 0u64;
         while done < self.sec_per_clus as u64 {
             let n = core::cmp::min(step as u64, self.sec_per_clus as u64 - done);
-            write_sectors(
-                self.source,
+            self.wr_sectors(
                 self.cluster_lba(cluster) + done,
                 &zeros[..n as usize * SECTOR_SIZE],
             )?;
@@ -1561,7 +1790,7 @@ impl FatFs {
                 break; // past the FAT region (defensive — parse_bpb already gates this)
             }
             if sec != loaded {
-                read_sector(self.source, self.fat_start + sec, &mut buf)?;
+                self.rd_sector(self.fat_start + sec, &mut buf)?;
                 loaded = sec;
             }
             let within = (offset % SECTOR_SIZE as u64) as usize;
@@ -1577,7 +1806,7 @@ impl FatFs {
                 // actually holds the x86 side together (it is NOT "one writer by construction").
                 let claimed = with_fat_lock(|| -> Result<bool, FatError> {
                     let mut cbuf = [0u8; SECTOR_SIZE];
-                    read_sector(self.source, self.fat_start + sec, &mut cbuf)?;
+                    self.rd_sector(self.fat_start + sec, &mut cbuf)?;
                     let cur = match self.kind {
                         FatKind::Fat16 => u16le(&cbuf, within) as u32,
                         FatKind::Fat32 => u32le(&cbuf, within) & 0x0FFF_FFFF,
@@ -1737,7 +1966,7 @@ impl FatFs {
             let mut done = 0u64;
             while done < count {
                 let n = core::cmp::min(chunk as u64, count - done) as usize;
-                read_sectors(self.source, base + done, &mut buf[..n * SECTOR_SIZE])?;
+                self.rd_sectors(base + done, &mut buf[..n * SECTOR_SIZE])?;
                 for k in 0..n {
                     let sec: &[u8; SECTOR_SIZE] = buf[k * SECTOR_SIZE..(k + 1) * SECTOR_SIZE]
                         .try_into()
@@ -1948,7 +2177,7 @@ impl FatFs {
                 return Err(FatError::BadChain); // outside the FAT region — same guard as fat_entry_copy
             }
             if sec != loaded {
-                read_sector(self.source, self.fat_start + sec, &mut buf)?;
+                self.rd_sector(self.fat_start + sec, &mut buf)?;
                 loaded = sec;
             }
             let within = (offset % SECTOR_SIZE as u64) as usize;
@@ -2025,9 +2254,9 @@ impl FatFs {
             if in_sec != 0 {
                 // HEAD: partial sector — read, patch, write back. Exactly the old loop body.
                 let take = core::cmp::min(remaining, SECTOR_SIZE - in_sec);
-                read_sector(self.source, lba, &mut buf)?;
+                self.rd_sector(lba, &mut buf)?;
                 buf[in_sec..in_sec + take].copy_from_slice(&data[done..done + take]);
-                write_sector(self.source, lba, &buf)?;
+                self.wr_sector(lba, &buf)?;
                 done += take;
                 pos += take;
                 continue;
@@ -2036,9 +2265,9 @@ impl FatFs {
             let full = (remaining / SECTOR_SIZE) as u64;
             if full == 0 {
                 // TAIL: fewer than a whole sector left — read, patch, write back.
-                read_sector(self.source, lba, &mut buf)?;
+                self.rd_sector(lba, &mut buf)?;
                 buf[..remaining].copy_from_slice(&data[done..]);
-                write_sector(self.source, lba, &buf)?;
+                self.wr_sector(lba, &buf)?;
                 done += remaining;
                 pos += remaining;
                 continue;
@@ -2048,7 +2277,7 @@ impl FatFs {
             // inside the chain we were given. No read — `data` supplies every byte.
             let run = core::cmp::min(full, self.contiguous_sectors(clusters, ci, s0));
             let bytes = run as usize * SECTOR_SIZE;
-            write_sectors(self.source, lba, &data[done..done + bytes])?;
+            self.wr_sectors(lba, &data[done..done + bytes])?;
             done += bytes;
             pos += bytes;
         }
@@ -2087,7 +2316,7 @@ impl FatFs {
             if in_sec != 0 || remaining < SECTOR_SIZE {
                 // A partial sector at either end: one sector read, copy out the covered slice.
                 let take = core::cmp::min(remaining, SECTOR_SIZE - in_sec);
-                read_sector(self.source, lba, &mut buf)?;
+                self.rd_sector(lba, &mut buf)?;
                 out.extend_from_slice(&buf[in_sec..in_sec + take]);
                 done += take;
                 pos += take;
@@ -2100,7 +2329,7 @@ impl FatFs {
             // Extend `out` in place and read the whole run straight into it — one transfer.
             let at = out.len();
             out.resize(at + bytes, 0);
-            read_sectors(self.source, lba, &mut out[at..at + bytes])?;
+            self.rd_sectors(lba, &mut out[at..at + bytes])?;
             done += bytes;
             pos += bytes;
         }
@@ -2227,13 +2456,13 @@ impl FatFs {
         // same sector can no longer read-before-our-write and clobber this publish (or vice versa).
         with_dir_lock(|| {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(self.source, lba, &mut buf)?;
+            self.rd_sector(lba, &mut buf)?;
             let hi = (first_cluster >> 16) as u16;
             let lo = (first_cluster & 0xFFFF) as u16;
             buf[off + 20..off + 22].copy_from_slice(&hi.to_le_bytes());
             buf[off + 26..off + 28].copy_from_slice(&lo.to_le_bytes());
             buf[off + 28..off + 32].copy_from_slice(&size.to_le_bytes());
-            write_sector(self.source, lba, &buf)?;
+            self.wr_sector(lba, &buf)?;
             Ok(())
         })
     }
@@ -2258,7 +2487,7 @@ impl FatFs {
         }
         with_dir_lock(|| {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(self.source, lba, &mut buf)?;
+            self.rd_sector(lba, &mut buf)?;
             let hi = (first_cluster >> 16) as u16;
             let lo = (first_cluster & 0xFFFF) as u16;
             buf[off + 20..off + 22].copy_from_slice(&hi.to_le_bytes());
@@ -2269,7 +2498,7 @@ impl FatFs {
                 buf[off + 22..off + 24].copy_from_slice(&mt.to_le_bytes());
                 buf[off + 24..off + 26].copy_from_slice(&md.to_le_bytes());
             }
-            write_sector(self.source, lba, &buf)?;
+            self.wr_sector(lba, &buf)?;
             Ok(())
         })
     }
@@ -2370,7 +2599,7 @@ impl FatFs {
         // JD6: this with_dir_lock slot-write body is TWINNED VERBATIM in `create_in_dir` — keep the two in sync.
         with_dir_lock(|| {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(self.source, lba, &mut buf)?;
+            self.rd_sector(lba, &mut buf)?;
             // Write a fresh 32-byte entry: 11-byte name, attr, everything else zero (NTRes/times = 0,
             // first_cluster hi@20 lo@26 = 0, size@28 = 0). Never set the volume-label bit — a file/dir entry.
             for b in buf[off..off + 32].iter_mut() {
@@ -2383,7 +2612,7 @@ impl FatFs {
             let (mt, md) = crate::clock::fat_stamp();
             buf[off + 22..off + 24].copy_from_slice(&mt.to_le_bytes());
             buf[off + 24..off + 26].copy_from_slice(&md.to_le_bytes());
-            write_sector(self.source, lba, &buf)?;
+            self.wr_sector(lba, &buf)?;
             // Re-parse the slot we just wrote so the returned DirEntry is byte-for-byte what a reader sees.
             match classify_dir_slot(&buf[off..off + 32]) {
                 DirSlot::Entry(de) => Ok((de, lba, off)),
@@ -2445,7 +2674,7 @@ impl FatFs {
         // ⚠ VERBATIM TWIN of `create_in_root`'s with_dir_lock block — keep in sync (seat review diffs these).
         with_dir_lock(|| {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(self.source, lba, &mut buf)?;
+            self.rd_sector(lba, &mut buf)?;
             // Write a fresh 32-byte entry: 11-byte name, attr, everything else zero (NTRes/times = 0,
             // first_cluster hi@20 lo@26 = 0, size@28 = 0). Never set the volume-label bit — a file/dir entry.
             for b in buf[off..off + 32].iter_mut() {
@@ -2458,7 +2687,7 @@ impl FatFs {
             let (mt, md) = crate::clock::fat_stamp();
             buf[off + 22..off + 24].copy_from_slice(&mt.to_le_bytes());
             buf[off + 24..off + 26].copy_from_slice(&md.to_le_bytes());
-            write_sector(self.source, lba, &buf)?;
+            self.wr_sector(lba, &buf)?;
             // Re-parse the slot we just wrote so the returned DirEntry is byte-for-byte what a reader sees.
             match classify_dir_slot(&buf[off..off + 32]) {
                 DirSlot::Entry(de) => Ok((de, lba, off)),
@@ -2528,7 +2757,7 @@ impl FatFs {
         buf[56..58].copy_from_slice(&md.to_le_bytes()); //  ".." date @0x18 (entry base 32 + 24)
         // size@28..32 and @60..64 stay 0 (directories report size 0); the rest of the cluster is already
         // zero (alloc_cluster), so this one sector fully initializes the directory.
-        write_sector(self.source, self.cluster_lba(self_cluster), &buf)
+        self.wr_sector(self.cluster_lba(self_cluster), &buf)
     }
 
     /// FATDIRS: create a subdirectory `name` in the directory at `parent_first_cluster` (`0` ⇒ the volume
@@ -2700,9 +2929,9 @@ impl FatFs {
         }
         with_dir_lock(|| {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(self.source, lba, &mut buf)?;
+            self.rd_sector(lba, &mut buf)?;
             buf[off..off + 11].copy_from_slice(raw);
-            write_sector(self.source, lba, &buf)?;
+            self.wr_sector(lba, &buf)?;
             Ok(())
         })
     }
@@ -2810,7 +3039,7 @@ impl FatFs {
         // move. A plain read of the source slot; the mutations below take their own DIR_MUTATION locks.
         let attr = {
             let mut sbuf = [0u8; SECTOR_SIZE];
-            read_sector(self.source, src_lba, &mut sbuf)?;
+            self.rd_sector(src_lba, &mut sbuf)?;
             sbuf[src_off + 11]
         };
         // 1. Publish the DESTINATION entry FIRST (crash order). `create_in_dir` writes a fresh
@@ -2885,9 +3114,9 @@ impl FatFs {
         // sector can no longer resurrect the `0xE5` (lost-delete), nor this delete clobber its publish.
         with_dir_lock(|| {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(self.source, dir_lba, &mut buf)?;
+            self.rd_sector(dir_lba, &mut buf)?;
             buf[dir_off] = 0xE5;
-            write_sector(self.source, dir_lba, &buf)?;
+            self.wr_sector(dir_lba, &buf)?;
             Ok(())
         })
     }
@@ -2947,7 +3176,7 @@ impl FatFs {
                 break;
             }
             if sec != loaded {
-                read_sector(self.source, self.fat_start + sec, &mut buf)?;
+                self.rd_sector(self.fat_start + sec, &mut buf)?;
                 loaded = sec;
             }
             let within = (offset % SECTOR_SIZE as u64) as usize;

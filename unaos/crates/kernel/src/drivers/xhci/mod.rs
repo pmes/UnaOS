@@ -416,7 +416,7 @@ pub fn log_summary_once() {
         let n = BOT_PUMP_COUNT.load(Ordering::Relaxed);
         let sum = BOT_PUMP_CYCLES.load(Ordering::Relaxed);
         serial_println!(
-            ":: BOT: pump budget={} peak={} sum={} mean={} n={} nowait={} timeouts={} storage_slot={} route={:#x} depth={} tag_mismatch={} bad_sig={} abandoned_in={} abandoned_out={} undrained={} short_in={} short_out={} ev_late={} ev_unaddressed={} db_in={} db_out={} ev_stopped={} ev_stopped_li={} ev_any={} w={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{} result=SUMMARY ::",
+            ":: BOT: pump budget={} peak={} sum={} mean={} n={} nowait={} timeouts={} storage_slot={} route={:#x} depth={} tag_mismatch={} bad_sig={} abandoned_in={} abandoned_out={} undrained={} short_in={} short_out={} ev_late={} ev_unaddressed={} db_in={} db_out={} ev_stopped={} ev_stopped_li={} ev_any={} wrap_push={} wrap_db={} w={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{} result=SUMMARY ::",
             budget, peak, sum, if n != 0 { sum / n } else { 0 },
             n, BOT_PUMP_NOWAIT.load(Ordering::Relaxed),
             BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed),
@@ -439,6 +439,12 @@ pub fn log_summary_once() {
             BOT_DB_IN.load(Ordering::Relaxed), BOT_DB_OUT.load(Ordering::Relaxed),
             BOT_EV_STOPPED.load(Ordering::Relaxed), BOT_EV_STOPPED_LI.load(Ordering::Relaxed),
             BOT_EV_ANY.load(Ordering::Relaxed),
+            // ONSET-3: the ring-wrap population. `wrap_push=` counts every Link crossing on every
+            // ring; `wrap_db=` counts the BOT doorbells that announced a TD sitting immediately
+            // behind an armed Link — the exact population every gr9 onset was drawn from. Both are
+            // denominators: see their statics for the healthy-but-idle readings (both LARGE and
+            // non-zero on any boot that moves real I/O) and for what they can and cannot falsify.
+            BOT_RING_WRAPS.load(Ordering::Relaxed), BOT_WRAP_DB.load(Ordering::Relaxed),
             BOT_WAIT_BUCKETS[0].load(Ordering::Relaxed), BOT_WAIT_BUCKETS[1].load(Ordering::Relaxed),
             BOT_WAIT_BUCKETS[2].load(Ordering::Relaxed), BOT_WAIT_BUCKETS[3].load(Ordering::Relaxed),
             BOT_WAIT_BUCKETS[4].load(Ordering::Relaxed), BOT_WAIT_BUCKETS[5].load(Ordering::Relaxed),
@@ -756,8 +762,77 @@ static BOT_DB_OUT_IDX: AtomicU32 = AtomicU32::new(0);
 /// reading is **also 0**. This counter discriminates ONLY across a Stop Endpoint issued while a TD
 /// is known to be outstanding, which is precisely the recovery window `resync_bulk_ep` prints the
 /// delta over. Read anywhere else it says nothing.
+///
+/// ONSET-3 — THE TWO CODES ARE NOT INTERCHANGEABLE, and the arc learned that the expensive way.
+/// gr9 boot 4's recovery posted cc=27 on the IN pipe while that pipe's own strand scan read
+/// `gap=0 live=0` and the CSW had not been pushed at all: an idle endpoint. cc=27 means only "the
+/// TRB Transfer Length field is invalid" (§6.4.5), which a controller also reports when it is
+/// stopped at a position with no computable residual. **cc=26 is the in-progress discriminator;
+/// cc=27 is not.** Never read the sum, and never read either without the post-stop TR Dequeue
+/// Pointer beside it — that pointer is what names the TD, and it is only defined once the endpoint
+/// has left Running (GUARD-STATE).
 pub static BOT_EV_STOPPED: AtomicU64 = AtomicU64::new(0);
 pub static BOT_EV_STOPPED_LI: AtomicU64 = AtomicU64::new(0);
+
+// --- ONSET-3 (2026-07-30): the cc=26 Stopped event's PAYLOAD, not just its arrival ---
+//
+// THE MISSING BYTE. A Stopped (26) Transfer Event carries two fields the driver was throwing away:
+// the TRB Pointer of the TD it interrupted, and the TRB Transfer Length — which for a Stopped event
+// is the **RESIDUE**, the bytes of that TD that had NOT moved when the endpoint was stopped (xHCI 1.2
+// §6.4.2.1, and §6.4.5: cc=26 is defined as the code whose length field IS valid, which is precisely
+// why 26 and not 27 is worth latching). `handle_event_trb` counted the completion code and dropped
+// both. It could not have kept them the ordinary way either: the residue normally rides
+// `BotPending::residue`/`residue_seen`, and by the time a recovery's Stop Endpoint posts its event
+// `bot_pending` is already `None` — so the latch below is deliberately independent of it.
+//
+// WHY IT DECIDES SOMETHING. At the gr9 onset the awaited TD was a 512-byte OUT data stage, and the
+// question the arc could not answer was whether the device ever entered the data phase at all:
+//   * residue == the TD's full length (512) -> the device accepted **ZERO** bytes. It never entered
+//     the data phase. That points at the CBW->DATA handoff — and therefore at the two-TDs-
+//     outstanding-under-one-doorbell straddle, where the CBW and the data TD sit on the same ring,
+//     separated by a Link crossing, with a single doorbell covering both.
+//   * residue < 512 -> the device DID enter the data phase and stalled part-way. That points at the
+//     device or at the transfer itself, and retires the straddle as the explanation.
+// Those are different bugs with different fixes, and one dword tells them apart.
+//
+/// Number of cc=26 payloads ever latched. **This is the validity flag, and it exists because the
+/// three fields below cannot express "no event" any other way** — a residue of 0 is a REAL and
+/// meaningful reading ("the device took every byte"), so a zero-initialised residue field would be
+/// indistinguishable from it. Read the payload only when this is non-zero, and read it as belonging
+/// to THIS recovery only when its delta across the Stop Endpoint window is non-zero (the
+/// `resync stopev` line prints `stopev_fresh=` for exactly that).
+///
+/// HEALTHY-BUT-IDLE READING: **0**, with `stopev_dci=255 stopev_trb=0x0 stopev_res=none` printed
+/// beside it — the sentinels below make "never latched" say so in words rather than in a number that
+/// could be mistaken for data. A healthy boot never issues a Stop Endpoint against a busy endpoint,
+/// so 0 here is the expected reading and is NOT evidence of anything.
+pub static BOT_STOPEV_N: AtomicU64 = AtomicU64::new(0);
+/// DCI of the endpoint whose TD the last cc=26 interrupted. Sentinel 255 = never latched (a real DCI
+/// is 1..=31), so the field is self-describing without consulting `BOT_STOPEV_N`.
+static BOT_STOPEV_DCI: AtomicU32 = AtomicU32::new(255);
+/// TRB Pointer from the last cc=26 event — the physical address of the interrupted TD's TRB. Read it
+/// against the `strand`/`TIMEOUT-TRB` lines' `wait=`/`ctxdeq=`: equal means the controller was
+/// stopped on the very TRB the pump was waiting for. Sentinel 0 = never latched.
+static BOT_STOPEV_TRB: AtomicU64 = AtomicU64::new(0);
+/// TRB Transfer Length (residue, in bytes) from the last cc=26 event. **No sentinel is possible
+/// here** — every value 0..=len is a legitimate reading — which is the whole reason `BOT_STOPEV_N`
+/// and the `stopev_res=none` spelling exist. Never print this number bare.
+static BOT_STOPEV_RES: AtomicU32 = AtomicU32::new(0);
+
+/// ONSET-3: prints a residue byte count, or the spelled sentinel `none` when nothing has ever been
+/// latched. A NUMERIC sentinel is unusable for this field: every value `0..=len` is a legitimate
+/// residue, and 0 in particular is a real and important reading ("the device took every byte"), so
+/// any in-band magic number would be exactly the instrument lie this project has caught seven times.
+/// Allocation-free — the recovery path must not depend on the heap.
+struct ResidueField(Option<u32>);
+impl core::fmt::Display for ResidueField {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(v) => write!(f, "{}", v),
+            None => f.write_str("none"),
+        }
+    }
+}
 /// Every Transfer Event dispatched, of any completion code and any slot. The denominator for the two
 /// above, and the thing that makes a zero reading of them mean something.
 /// HEALTHY-BUT-IDLE: advances with all USB traffic; only its DELTA over a named window is a reading.
@@ -796,24 +871,37 @@ static BOT_WAIT_BUCKETS: [AtomicU64; 12] = [
 
 // --- ONSET-2 (M3): the H1 experiment, behind two knobs that both default to today's behaviour ---
 //
-// The ranked hypothesis is that **the doorbell which must restart the controller across a Link TRB
+// The ranked hypothesis WAS that **the doorbell which must restart the controller across a Link TRB
 // does not take**. All three genuine onsets in `rmbp-gr8` are the same shape — an OUT data stage,
 // 512 bytes, at ring index 0, i.e. immediately behind a freshly written Link TRB — and boots B and G
 // reproduce it deterministically at the same stage index and the same LBA on two different builds.
 // Neither knob is a fix; each is a ONE-VARIABLE discriminator, and with both off the image is
 // byte-identical to the pre-arc one.
 //
+// ONSET-3 RETIRES THAT HYPOTHESIS. gr9 boot 4's recovery posts `ev_stopped=1` (cc=26, whose TRB
+// Transfer Length is defined VALID) on the OUT pipe, with the post-stop TR Dequeue Pointer sitting
+// ON the awaited data TRB, and `db_out_d=0` across the whole ~6 s wait. Per xHCI 1.2 §4.6.9 that
+// pair says the controller HAD crossed the Link, HAD fetched the data TD and was executing it, and
+// was owed no further doorbell. A missed doorbell is not the mechanism, and no redundant doorbell
+// was shipped. What is still open is why the DEVICE did not move the data — which is what the
+// `stopev_res=` residue witness (see `BOT_STOPEV_N`) and knob 2 below are now aimed at.
+//
 /// **Knob 1 (`botring64`, `UNAOS_BOTRING64=1`): the bulk transfer rings' length in TRBs.**
 ///
-/// This is the single cleanest experiment available: changing the ring length changes the wrap
-/// FREQUENCY and every wrap POSITION and nothing else. No protection is touched, no command
-/// sequence changes, no TD shape changes, and `TransferRing::would_lap`'s two-slot margin scales
-/// with the ring by construction (`used + 2 >= n`). Read the result as:
-///   * the deterministic failure at LBA 17303 MOVES or VANISHES -> the wrap/Link TRB is causal;
-///   * it STAYS at the same stage index and the same LBA -> the 3-of-3 wrap correlation was
-///     coincidence, and the hypothesis dies.
-/// Applies to the storage slot's two BULK rings only. EP0, the command ring, the hub interrupt ring
-/// and the HID rings are untouched, so the variable stays single.
+/// Changing the ring length changes the wrap FREQUENCY and every wrap POSITION and nothing else. No
+/// protection is touched, no command sequence changes, no TD shape changes, and
+/// `TransferRing::would_lap`'s two-slot margin scales with the ring by construction
+/// (`used + 2 >= n`). Applies to the storage slot's two BULK rings only. EP0, the command ring, the
+/// hub interrupt ring and the HID rings are untouched, so the variable stays single.
+///
+/// ONSET-3 — HOW ITS RESULT MUST BE READ, because gr9's was read too strongly. This knob does NOT
+/// remove Link crossings; it makes them ~4x rarer. gr9 boot 1 ran it and reported `wrapped_tx=0`,
+/// which was taken as "that boot never wrapped" — it did, an estimated 2-4 times, and `wrapped_tx=`
+/// simply counts DATA-stage pushes landing at index 0, none of which happened to be the crossing
+/// push. So a clean `botring64` boot is NOT evidence that wraps are harmless; it is evidence that
+/// the specific shape (an awaited TD at index 0 behind a Link) occurred less often. From this arc on
+/// the result is read against `wrap_push=` on the SUMMARY line, which counts the crossings
+/// themselves — without it the experiment has no denominator and cannot conclude anything.
 #[cfg(not(feature = "botring64"))]
 pub const BOT_RING_TRBS: usize = 16;
 #[cfg(feature = "botring64")]
@@ -909,9 +997,16 @@ static BOT_LAST_DIR: AtomicU32 = AtomicU32::new(0);
 static BOT_LAST_LEN: AtomicU32 = AtomicU32::new(0);
 /// Index within its transfer ring of the TRB the pump is waiting on.
 static BOT_LAST_TRB_IDX: AtomicU32 = AtomicU32::new(0);
-/// True if pushing that TRB wrapped the ring (i.e. a Link TRB was written and the cycle bit
-/// toggled immediately before it). `ring::TransferRing::push` returns index 0 exactly on a wrap,
-/// which is what this records — the direct test of "does the wedge correlate with a ring wrap?".
+/// True if pushing that TRB wrapped the ring — i.e. the push crossed the Link TRB, so the TD sits at
+/// index 0 of a fresh lap under the toggled cycle colour. The direct test of "does the wedge
+/// correlate with a ring wrap?".
+///
+/// ONSET-3: this used to be recorded as `idx == 0`, which is ALSO what a virgin ring's very first
+/// push returns — no Link crossed, no colour toggled. It now reads
+/// `ring::TransferRing::wrapped_on_last_push()`, which is the real predicate. The correction is
+/// worth ~one false `wrapped=true` per ring per boot; it does not touch the gr9 readings, where the
+/// failing pushes were the 6th wrap on a long-running ring, but a witness that answers a different
+/// question at the boundary than in the body cannot be trusted at the boundary.
 static BOT_LAST_WRAP: AtomicBool = AtomicBool::new(false);
 /// Data stages issued at the legacy single-sector size (<= 512 B).
 pub static BOT_TX_SINGLE: AtomicU64 = AtomicU64::new(0);
@@ -921,6 +1016,64 @@ pub static BOT_TX_MULTI: AtomicU64 = AtomicU64::new(0);
 pub static BOT_TX_MAXLEN: AtomicU64 = AtomicU64::new(0);
 /// Data-stage TRB pushes that landed on a ring wrap.
 pub static BOT_TX_WRAPPED: AtomicU64 = AtomicU64::new(0);
+
+// --- ONSET-3 (2026-07-30): the ring-wrap population, on both sides of the doorbell ---
+//
+// THE WRAP CORRELATION IS WEAKER THAN IT WAS REPORTED, and the correction belongs in the source
+// because the overstated version was carried to the bench. The gr9 table read: clean boots at
+// `wrapped_tx=0` (n=140) and `wrapped_tx=1` (n=62, twice), wedged boot at `wrapped_tx=6` (n=112) —
+// presented as "no wraps -> clean". It does not say that. `wrapped_tx=` counts DATA-stage pushes
+// that landed at index 0, on one ring. It does NOT count Link crossings, and **no boot in the gr9
+// set was free of them**:
+//   * boot 1 (`botring64=ON`, 64 TRBs, `wrapped_tx=0`) ran ~71 transactions and ~211 ring pushes
+//     across its two bulk rings; at 63 usable slots per ring that is still ~2-4 Link crossings. It
+//     crossed the Link and stayed clean. `wrapped_tx=0` meant only that none of its 69 data pushes
+//     happened to be the push that crossed.
+//   * boot 4 (16 TRBs, `wrapped_tx=6`, wedged) reconstructs from `db_out=58 db_in=95` to ~58
+//     transactions and ~171 pushes, i.e. ~11 Link crossings, of which 6 were data pushes.
+//   * boot 1 also moved MORE I/O than boot 4 (n=140 vs 112, wr_sectors 444 vs 333), so raw I/O
+//     volume does not order the outcomes either.
+// What survives is narrow and worth stating exactly: **the wedge has only ever been observed on an
+// awaited TD sitting at index 0 immediately after a Link crossing.** Whether Link crossings as such
+// carry any hazard is untested, because the count of them has never been in a capture. That is what
+// `wrap_push=` fixes; `wrapped_tx=` alone could never have answered it.
+//
+/// **Every Link crossing, on every ring.** Incremented inside `ring::TransferRing::push` whenever a
+/// push steps over the Link TRB and starts a new lap — command ring, EP0 rings, HID/hub rings and
+/// both bulk rings alike. Counted in the producer, so it cannot disagree with what the hardware was
+/// shown.
+///
+/// HEALTHY-BUT-IDLE READING: rises monotonically at roughly (pushes / (num_trbs - 1)) on each ring,
+/// so on a healthy boot it is a LARGE number and always non-zero — it is a denominator, not an
+/// alarm, and no single value of it is a fault. In particular a `botring64` boot will read NON-ZERO
+/// here while reading `wrapped_tx=0`, and that pair is the whole point: it is the direct proof that
+/// the 64-TRB experiment reduced the wrap RATE and never eliminated Link crossings, which is what
+/// the gr9 table was read as showing and did not show.
+///
+/// What it can falsify: a boot that wedges with `wrap_db=0` while `wrap_push` is large says the
+/// wedge happened on a doorbell that did NOT follow a wrap, which retires the wrap correlation
+/// outright. Conversely a boot that stays clean through a large `wrap_db` weakens it by the same
+/// arithmetic. Neither reading was available before this counter existed.
+pub static BOT_RING_WRAPS: AtomicU64 = AtomicU64::new(0);
+/// **BOT doorbells rung for a ring whose most recent push crossed the Link.** This is the exact
+/// population every gr9 onset was drawn from: the doorbell that announces a TD sitting at index 0
+/// of a fresh lap, immediately behind an armed Link. Counted in `bot_doorbell`, on the ring the
+/// doorbell targets, so it is one relaxed add on a path already doing an MMIO write.
+///
+/// HEALTHY-BUT-IDLE READING: **non-zero and growing** on any boot that moves more than a ring's
+/// worth of I/O — a bulk ring of 16 TRBs wraps every ~15 pushes, roughly every 5 transactions. It is
+/// stated as non-zero deliberately: a counter pinned at 0 on a healthy boot would be indistinguish-
+/// able from a counter that is simply never reached, which is the instrument lie this project has
+/// now caught six times. Its READING is the ratio `timeouts= / wrap_db=` against `timeouts= /
+/// (db_in= + db_out= - wrap_db=)`: if the wrap correlation is real those two hazard rates differ,
+/// and if it is coincidence they converge. One boot cannot settle that; the counter is what makes
+/// the question answerable at all.
+///
+/// NOTE — this does NOT count an extra doorbell. ONSET-3's first draft was to ring a redundant
+/// doorbell after every wrapped push; the capture retired that idea (`db_out_d=0` across the whole
+/// failing wait — no doorbell was owed), and a fix whose rationale has been refuted is not shipped
+/// here. `wrap_db` counts the doorbells the driver already rings.
+pub static BOT_WRAP_DB: AtomicU64 = AtomicU64::new(0);
 /// Sectors moved by IN (read) data stages, and by OUT (write) data stages. `n=` counts pump WAITS
 /// (two per transaction), and `single=`/`multi=` count TRANSACTIONS; neither says how much data
 /// moved or which direction dominates. M2 is a write-path suspicion, so the read/write split is the
@@ -2380,12 +2533,22 @@ impl XhciController {
                         //
                         // xHCI 1.2 §4.6.9: a Stop Endpoint issued against an endpoint with a TD IN
                         // PROGRESS must post a Transfer Event for the interrupted TD with completion
-                        // code 26 (Stopped) or 27 (Stopped — Length Invalid). An endpoint that never
-                        // fetched the TD has nothing to interrupt and posts nothing. That is the
+                        // code 26 (Stopped) or 27 (Stopped — Length Invalid). That is the
                         // architectural discriminator between "the controller never fetched the
                         // work" and "the controller fetched it and the device is NAKing" — the last
                         // ambiguity in the onset reading, which the driver could never speak to
                         // because it never printed stopped-events by name.
+                        //
+                        // ONSET-3 SHARPENS THE READING, and it is a narrowing, not a widening. The
+                        // gr9 capture (boot 4) posts cc=27 on the IN pipe of a recovery whose own
+                        // strand scan reads `gap=0 live=0` with the CSW not yet pushed — an endpoint
+                        // that was Running but IDLE. So **27 alone does not prove a TD was in
+                        // progress**: §6.4.5 defines it as "the TRB Transfer Length field is
+                        // invalid", which is exactly what a controller reports when it is stopped at
+                        // a position with no computable residual — including an un-produced slot.
+                        // Only **cc=26, whose length IS valid**, carries "a TD was interrupted", and
+                        // only when read together with the post-stop TR Dequeue Pointer that names
+                        // WHICH TRB. Count them separately (as below) and never sum them.
                         //
                         // Boot totals; the reading that means anything is the DELTA `resync_bulk_ep`
                         // prints across its own Stop/Reset Endpoint. Three relaxed adds on a path
@@ -2393,7 +2556,25 @@ impl XhciController {
                         // from any of them, so event routing is byte-unchanged.
                         BOT_EV_ANY.fetch_add(1, Ordering::Relaxed);
                         match completion_code {
-                            26 => { BOT_EV_STOPPED.fetch_add(1, Ordering::Relaxed); }
+                            26 => {
+                                BOT_EV_STOPPED.fetch_add(1, Ordering::Relaxed);
+                                // ONSET-3: LATCH THE PAYLOAD, not just the arrival. cc=26 is the one
+                                // completion code whose TRB Transfer Length is defined valid, and for
+                                // a Stopped event that length is the RESIDUE of the interrupted TD —
+                                // the bytes that had not moved. See `BOT_STOPEV_N` for why this
+                                // cannot ride `BotPending::residue` (it is `None` by the time a
+                                // recovery's Stop Endpoint posts) and for the reading key.
+                                //
+                                // Last-writer-wins is correct here: a recovery drains the event ring
+                                // and then prints, so the value read on the `resync stopev` line is
+                                // the most recent event of that window. `BOT_STOPEV_N` is
+                                // incremented LAST so any reader that sees a fresh count also sees
+                                // the three fields that go with it.
+                                BOT_STOPEV_DCI.store(endpoint_id as u32, Ordering::Relaxed);
+                                BOT_STOPEV_TRB.store(param, Ordering::Relaxed);
+                                BOT_STOPEV_RES.store(transfer_len, Ordering::Relaxed);
+                                BOT_STOPEV_N.fetch_add(1, Ordering::Relaxed);
+                            }
                             27 => { BOT_EV_STOPPED_LI.fetch_add(1, Ordering::Relaxed); }
                             _ => {}
                         }
@@ -5288,12 +5469,24 @@ impl XhciController {
     /// path wrote", not "doorbells anything wrote", or the delta the timeout line prints stops being
     /// about this transfer. One relaxed add and one relaxed store on a path that is already doing an
     /// MMIO write; nothing is decided from either, and the doorbell itself is byte-unchanged.
+    ///
+    /// ONSET-3 adds one more relaxed add on the same reads: `wrap_db`, the count of BOT doorbells
+    /// whose target ring's MOST RECENT push crossed the Link TRB. That is the exact population every
+    /// gr9 onset belongs to (see `BOT_WRAP_DB`), and it is read here rather than at the push sites
+    /// because a wrapped push that never reaches its doorbell is a stranded TD, not a wrapped
+    /// doorbell — keeping the two counts at different points is what lets them disagree.
     fn bot_doorbell(&mut self, slot_id: u8, dci: u8, is_in: bool) {
-        let idx = {
+        let (idx, wrapped) = {
             let s = &self.slots[slot_id as usize];
             let r = if is_in { s.bulk_in_ring.as_ref() } else { s.bulk_out_ring.as_ref() };
-            match r { Some(r) => r.enqueue_index() as u32, None => u32::MAX }
+            match r {
+                Some(r) => (r.enqueue_index() as u32, r.wrapped_on_last_push()),
+                None => (u32::MAX, false),
+            }
         };
+        if wrapped {
+            BOT_WRAP_DB.fetch_add(1, Ordering::Relaxed);
+        }
         if is_in {
             BOT_DB_IN.fetch_add(1, Ordering::Relaxed);
             BOT_DB_IN_IDX.store(idx, Ordering::Relaxed);
@@ -5492,6 +5685,10 @@ impl XhciController {
             BOT_EV_STOPPED.load(Ordering::Relaxed),
             BOT_EV_STOPPED_LI.load(Ordering::Relaxed),
             BOT_EV_ANY.load(Ordering::Relaxed));
+        // ONSET-3: same baseline discipline for the Stopped-event PAYLOAD latch. Its delta is what
+        // says the (dci, trb, residue) triple printed below belongs to THIS Stop Endpoint rather
+        // than to some earlier recovery — the fields are last-writer-wins and persist for the boot.
+        let stopev_n0 = BOT_STOPEV_N.load(Ordering::Relaxed);
         match ep_state {
             2 | 4 => {
                 // Reset Endpoint (TRB type 14). TSP left 0: the device-side toggle was already
@@ -5576,12 +5773,50 @@ impl XhciController {
         // Zero is ALSO what a healthy idle endpoint reads, because there is nothing to interrupt. So
         // this field discriminates only in the presence of a known-outstanding TD; anywhere else it
         // is silent, not reassuring. `ev_any` is its denominator over the same window.
+        //
+        // ONSET-3 CORRECTION TO THE KEY ABOVE — `ev_stopped_li` (cc=27) does NOT belong in the
+        // "non-zero -> the controller HAD fetched the TD" reading. gr9 boot 4 posts cc=27 on the IN
+        // pipe of a recovery whose own `strand` line two lines up reads `gap=0 live=0`, with the CSW
+        // not yet pushed at all: an endpoint that was Running but IDLE. §6.4.5 defines 27 as "the
+        // TRB Transfer Length field is invalid", which is exactly what a controller reports when it
+        // has no computable residual — including at an un-produced slot. Only **cc=26** carries the
+        // in-progress reading. Read `ev_stopped=` alone for that; never the sum.
+        //
+        // ONSET-3 ADDS THE PAYLOAD, which is the field that actually decides the open question:
+        //   * `stopev_res=` is the RESIDUE of the interrupted TD — bytes that had NOT moved. For the
+        //     gr9 shape (a 512-byte OUT data stage) `stopev_res=512` says the device accepted ZERO
+        //     bytes and never entered the data phase, which points at the CBW->DATA handoff and the
+        //     two-TDs-under-one-doorbell straddle; `stopev_res=` anything less says it entered the
+        //     data phase and stalled part-way, which points at the device or the transfer and
+        //     retires the straddle.
+        //   * `stopev_trb=` is the interrupted TD's TRB address. Compare it with `wait=` on the
+        //     TIMEOUT-TRB line: equal means the controller was stopped on the very TRB the pump had
+        //     given up on, which is what makes the residue answer the pump's question and not some
+        //     other TD's.
+        //   * `stopev_fresh=` is the only thing that licenses reading the other three at all. The
+        //     latch is boot-lived and last-writer-wins, so `no` means these values belong to an
+        //     EARLIER recovery and say nothing about this one.
+        // HEALTHY-BUT-IDLE: `stopev_n=0 stopev_fresh=no stopev_dci=255 stopev_trb=0x0
+        // stopev_res=none`. The sentinels are spelled, not numeric, because a residue of 0 is a real
+        // and meaningful reading — "the device took every byte" — and must never be confusable with
+        // "no event was ever latched".
+        let (stopev_n, stopev_fresh) = {
+            let n = BOT_STOPEV_N.load(Ordering::Relaxed);
+            (n, n != stopev_n0)
+        };
         serial_println!(
-            ":: BOT: resync stopev dci={} dir={} epstate_read={} ev_stopped={} ev_stopped_li={} ev_any={} — Transfer Events posted by THIS pipe's Stop/Reset Endpoint (xHCI 1.2 §4.6.9) ::",
+            ":: BOT: resync stopev dci={} dir={} epstate_read={} ev_stopped={} ev_stopped_li={} ev_any={} stopev_n={} stopev_fresh={} stopev_dci={} stopev_trb={:#x} stopev_res={} — Transfer Events posted by THIS pipe's Stop/Reset Endpoint (xHCI 1.2 §4.6.9) ::",
             dci, dir, ep_state,
             BOT_EV_STOPPED.load(Ordering::Relaxed).wrapping_sub(ev26_0),
             BOT_EV_STOPPED_LI.load(Ordering::Relaxed).wrapping_sub(ev27_0),
-            BOT_EV_ANY.load(Ordering::Relaxed).wrapping_sub(evany_0));
+            BOT_EV_ANY.load(Ordering::Relaxed).wrapping_sub(evany_0),
+            stopev_n,
+            if stopev_fresh { "yes" } else { "no" },
+            BOT_STOPEV_DCI.load(Ordering::Relaxed),
+            BOT_STOPEV_TRB.load(Ordering::Relaxed),
+            // Spelled sentinel: `none` when nothing has ever been latched, so a genuine residue of 0
+            // reads as `stopev_res=0` and cannot be mistaken for an unarmed instrument.
+            ResidueField(if stopev_n == 0 { None } else { Some(BOT_STOPEV_RES.load(Ordering::Relaxed)) }));
 
         let deq = {
             let slot = &self.slots[slot_id as usize];
@@ -5699,13 +5934,13 @@ impl XhciController {
         // and for an OUT data stage the CBW and the data TD ride the same ring under one doorbell.
         // KNOB ON, the CBW carries IOC and is pumped to completion before anything else is built,
         // which is what §14.4 has always claimed the code does.
-        let (cbw_trb_phys, cbw_idx) = {
+        let (cbw_trb_phys, cbw_idx, cbw_wrapped) = {
             let ring = self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap();
             let base = ring.get_ptr();
             let control: u32 = if cfg!(feature = "botcbwioc") { (1 << 10) | (1 << 5) } else { 1 << 10 };
             let idx = ring.push(Trb { parameter: cbw_phys, status: 31, control })
                 .map_err(|_| BotError::RingFull)?;
-            (base + (idx as u64) * 16, idx)
+            (base + (idx as u64) * 16, idx, ring.wrapped_on_last_push())
         };
         #[cfg(feature = "botcbwioc")]
         {
@@ -5716,7 +5951,7 @@ impl XhciController {
             BOT_LAST_DIR.store(2, Ordering::Relaxed);
             BOT_LAST_LEN.store(31, Ordering::Relaxed);
             BOT_LAST_TRB_IDX.store(cbw_idx as u32, Ordering::Relaxed);
-            BOT_LAST_WRAP.store(cbw_idx == 0, Ordering::Relaxed);
+            BOT_LAST_WRAP.store(cbw_wrapped, Ordering::Relaxed);
             self.bot_doorbell(slot_id, out_dci, false);
             let (cbw_code, _) = self.run_bot_stage(slot_id, in_dci, out_dci, cbw_trb_phys)?;
             if cbw_code != 1 && cbw_code != 13 {
@@ -5727,7 +5962,7 @@ impl XhciController {
         // Knob off: the CBW's address and index are recorded but nothing waits on them, exactly as
         // before this arc.
         #[cfg(not(feature = "botcbwioc"))]
-        let _ = (cbw_trb_phys, cbw_idx);
+        let _ = (cbw_trb_phys, cbw_idx, cbw_wrapped);
 
         // 2) Data stage (IN or OUT), if any. IOC + ISP (1<<2) so both full and short-packet
         //    completions post an event; wait for it to retire BEFORE queuing the CSW.
@@ -5755,13 +5990,18 @@ impl XhciController {
                 // `ring_base + 0` — a real, recurring TRB address — after a failed push. Propagate.
                 let idx = ring.push(Trb { parameter: data_phys, status: data_len,
                     control: (1 << 10) | (1 << 5) | (1 << 2) }).map_err(|_| BotError::RingFull)?;
-                // MULTIBLK: `push` returns index 0 EXACTLY when it had to write the Link TRB and
-                // toggle the cycle bit, i.e. on a ring wrap. Recording that here is what lets a
-                // TIMEOUT line answer "did the lost completion sit on a wrapped ring?" — a question
-                // §12.2 could only argue about from the ring arithmetic (16 TRBs, 3 pushed per
-                // transaction, so ~every 5th transaction wraps) and never observe directly.
-                BOT_LAST_WRAP.store(idx == 0, Ordering::Relaxed);
-                if idx == 0 { BOT_TX_WRAPPED.fetch_add(1, Ordering::Relaxed); }
+                // MULTIBLK: recording the wrap here is what lets a TIMEOUT line answer "did the lost
+                // completion sit on a wrapped ring?" — a question §12.2 could only argue about from
+                // the ring arithmetic (16 TRBs, 3 pushed per transaction, so ~every 5th transaction
+                // wraps) and never observe directly. It is the arc's surviving hard correlation.
+                //
+                // ONSET-3: the test was `idx == 0`, on the reasoning that `push` returns index 0
+                // exactly when it crossed the Link. That is true of every push but the FIRST on a
+                // virgin ring, which also lands at index 0 having crossed nothing and toggled
+                // nothing. Ask the ring directly.
+                let wrapped = ring.wrapped_on_last_push();
+                BOT_LAST_WRAP.store(wrapped, Ordering::Relaxed);
+                if wrapped { BOT_TX_WRAPPED.fetch_add(1, Ordering::Relaxed); }
                 (if data_out { out_dci } else { in_dci }, base + (idx as u64) * 16, idx as u32)
             };
             // MULTIBLK: shape of the TD the pump is about to wait on. Sizes now span 512 B .. 32 KiB,
@@ -5889,7 +6129,8 @@ impl XhciController {
             BOT_LAST_DIR.store(1, Ordering::Relaxed);
             BOT_LAST_LEN.store(13, Ordering::Relaxed);
             BOT_LAST_TRB_IDX.store(idx as u32, Ordering::Relaxed);
-            BOT_LAST_WRAP.store(idx == 0, Ordering::Relaxed);
+            // ONSET-3: real Link-crossing predicate, not `idx == 0` — see the data stage above.
+            BOT_LAST_WRAP.store(ring.wrapped_on_last_push(), Ordering::Relaxed);
             base + (idx as u64) * 16
         };
         self.bot_doorbell(slot_id, in_dci, true);

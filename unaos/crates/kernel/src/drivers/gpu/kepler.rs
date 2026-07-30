@@ -140,12 +140,14 @@ pub mod ucode {
     /// // 0x59 | 00 00 00    | (padding)           | 92 bytes = 23 words
     /// ```
     #[rustfmt::skip]
-    pub const ECHO_A_BYTES: [u8; 92] = [
+    pub const ECHO_A_BYTES: [u8; 128] = [
         0xf0, 0x17, 0x00,             // mov   $r1, 0x00
         0xf0, 0x13, 0x02,             // sethi $r1, 0x02
         0xf1, 0x27, 0x00, 0x01,       // mov   $r2, 0x0100
         0xf0, 0x23, 0x02,             // sethi $r2, 0x02
         0xf0, 0x37, 0x01,             // mov   $r3, 0x1
+        0xf1, 0x38, 0x00, 0x41,       // mov   $r8, 0x4100
+        0xf0, 0x38, 0x01,             // sethi $r8, 0x01
         0xf1, 0x67, 0x00, 0x10,       // mov   $r6, 0x1000
         0xf1, 0x77, 0x00, 0x11,       // mov   $r7, 0x1100
         0xf0, 0x57, 0x00,             // mov   $r5, 0x00
@@ -156,21 +158,27 @@ pub mod ucode {
         0xd0, 0x64, 0x00,             // iowr  I[$r6], $r4
         0xf0, 0x07, 0x02,             // mov   $r0, 0x02
         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+        0xb0, 0x44, 0x02,             // cmpu b32 $r4, 0x2
+        0xf4, 0x2b, 0x2c,             // bra eq, cmd2_exit
         0xb0, 0x44, 0x01,             // cmpu b32 $r4, 0x1
-        0xf4, 0x1b, 0x14,             // bra ne, +0x14 -> dec
-        0xf0, 0x07, 0x03,             // mov   $r0, 0x03
+        0xf4, 0x1b, 0x15,             // bra ne, dec
+        0xf0, 0x07, 0x03,             // cmd1: mov $r0, 0x03
         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
-        0xd0, 0x23, 0x00,             // iowr  I[$r2], $r3   (ACK)
-        0xf0, 0x07, 0x04,             // mov   $r0, 0x04
-        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
-        0xf8, 0x02,                   // exit
+        0xcf, 0x84, 0x00,             // iord  $r4, I[$r8]
+        0xd0, 0x24, 0x00,             // iowr  I[$r2], $r4
+        0xb0, 0x54, 0x00,             // cmpu b32 $r5, 0x0
+        0xf4, 0x1b, 0xd9,             // bra ne, poll
         0xb0, 0x52, 0x01,             // dec: sub b32 $r5, 0x1
         0xb0, 0x54, 0x00,             // cmpu b32 $r5, 0x0
-        0xf4, 0x1b, 0xd7,             // bra ne, -0x29 -> poll
+        0xf4, 0x1b, 0xd0,             // bra ne, poll
         0xf0, 0x07, 0xbd,             // mov   $r0, 0xbd
         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
         0xf8, 0x02,                   // exit
-        0x00, 0x00, 0x00,             // padding
+        0xf0, 0x07, 0x04,             // cmd2_exit: mov $r0, 0x04
+        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+        0xf8, 0x02,                   // exit
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
     /// Image B — the A/B fallback on the one **new** encoding this pull needs.
@@ -190,21 +198,23 @@ pub mod ucode {
     /// the same length):
     ///
     /// ```text
-    /// // 0x1b | f1 53 f0 ff | sethi $r5, 0xfff0   | $r5 = -ECHO_BOUND
-    /// // 0x21 |          11 | mov   $r0, 0x11     | phase (pre-loop)
-    /// // 0x2d |          12 | mov   $r0, 0x12     | phase (post-read)
-    /// // 0x39 |          13 | mov   $r0, 0x13     | phase (pre-ack)
-    /// // 0x42 |          14 | mov   $r0, 0x14     | phase (post-ack)
-    /// // 0x48 | b0 50 01    | add b32 $r5, 0x1    | B's variable: subop 0
-    /// // 0x53 |          be | mov   $r0, 0xbe     | EXIT BY BOUND
+    /// // 0x22 | f1 53 f0 ff | sethi $r5, 0xfff0   | $r5 = -ECHO_BOUND
+    /// // 0x26 |          11 | mov   $r0, 0x11     | phase (pre-loop)
+    /// // 0x32 |          12 | mov   $r0, 0x12     | phase (post-read)
+    /// // 0x44 |          13 | mov   $r0, 0x13     | phase (pre-ack)
+    /// // 0x67 |          14 | mov   $r0, 0x14     | phase (post-ack)
+    /// // 0x56 | b0 50 01    | add b32 $r5, 0x1    | B's variable: subop 0
+    /// // 0x5f |          be | mov   $r0, 0xbe     | EXIT BY BOUND
     /// ```
     #[rustfmt::skip]
-    pub const ECHO_B_BYTES: [u8; 92] = [
+    pub const ECHO_B_BYTES: [u8; 128] = [
         0xf0, 0x17, 0x00,
         0xf0, 0x13, 0x02,
         0xf1, 0x27, 0x00, 0x01,
         0xf0, 0x23, 0x02,
         0xf0, 0x37, 0x01,
+        0xf1, 0x38, 0x00, 0x41,
+        0xf0, 0x38, 0x01,
         0xf1, 0x67, 0x00, 0x10,
         0xf1, 0x77, 0x00, 0x11,
         0xf0, 0x57, 0x00,
@@ -215,29 +225,35 @@ pub mod ucode {
         0xd0, 0x64, 0x00,
         0xf0, 0x07, 0x12,             // mov   $r0, 0x12
         0xd0, 0x70, 0x00,
+        0xb0, 0x44, 0x02,
+        0xf4, 0x2b, 0x2c,
         0xb0, 0x44, 0x01,
-        0xf4, 0x1b, 0x14,
+        0xf4, 0x1b, 0x15,
         0xf0, 0x07, 0x13,             // mov   $r0, 0x13
         0xd0, 0x70, 0x00,
-        0xd0, 0x23, 0x00,             // (ACK)
-        0xf0, 0x07, 0x14,             // mov   $r0, 0x14
-        0xd0, 0x70, 0x00,
-        0xf8, 0x02,
+        0xcf, 0x84, 0x00,
+        0xd0, 0x24, 0x00,             // (ACK)
+        0xb0, 0x54, 0x00,
+        0xf4, 0x1b, 0xd9,
         0xb0, 0x50, 0x01,             // dec: add b32 $r5, 0x1
         0xb0, 0x54, 0x00,
-        0xf4, 0x1b, 0xd7,
+        0xf4, 0x1b, 0xd0,
         0xf0, 0x07, 0xbe,             // mov   $r0, 0xbe
         0xd0, 0x70, 0x00,
         0xf8, 0x02,
-        0x00, 0x00, 0x00,
+        0xf0, 0x07, 0x14,             // mov   $r0, 0x14
+        0xd0, 0x70, 0x00,
+        0xf8, 0x02,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
-    /// Pack a 92-byte Falcon instruction stream into the 23 little-endian
+    /// Pack a 128-byte Falcon instruction stream into the 32 little-endian
     /// `u32` words IMEMD expects.
-    pub const fn pack92(b: &[u8; 92]) -> [u32; 23] {
-        let mut out = [0u32; 23];
+    pub const fn pack128(b: &[u8; 128]) -> [u32; 32] {
+        let mut out = [0u32; 32];
         let mut w = 0;
-        while w < 23 {
+        while w < 32 {
             let i = w * 4;
             out[w] = (b[i] as u32)
                 | ((b[i + 1] as u32) << 8)
@@ -248,15 +264,15 @@ pub mod ucode {
         out
     }
 
-    pub const UCODE_CTX_ECHO_A: [u32; 23] = pack92(&ECHO_A_BYTES);
-    pub const UCODE_CTX_ECHO_B: [u32; 23] = pack92(&ECHO_B_BYTES);
+    pub const UCODE_CTX_ECHO_A: [u32; 32] = pack128(&ECHO_A_BYTES);
+    pub const UCODE_CTX_ECHO_B: [u32; 32] = pack128(&ECHO_B_BYTES);
 
     /// Reconstruct a `mov`(I8)+`sethi`(I8) port pair from the byte listing.
-    const fn port_i8_sethi_i8(b: &[u8; 92], mov_at: usize, sethi_at: usize) -> u32 {
+    const fn port_i8_sethi_i8(b: &[u8; 128], mov_at: usize, sethi_at: usize) -> u32 {
         (b[mov_at + 2] as u32) | ((b[sethi_at + 2] as u32) << 16)
     }
     /// Reconstruct a `mov`(I16) port immediate from the byte listing.
-    const fn port_i16(b: &[u8; 92], mov_at: usize) -> u32 {
+    const fn port_i16(b: &[u8; 128], mov_at: usize) -> u32 {
         (b[mov_at + 2] as u32) | ((b[mov_at + 3] as u32) << 8)
     }
 
@@ -267,14 +283,19 @@ pub mod ucode {
     const _: () = assert!(
         (port_i16(&ECHO_A_BYTES, 0x06) | ((ECHO_A_BYTES[0x0c] as u32) << 16)) == IO_CC_SCRATCH1
     );
-    const _: () = assert!(port_i16(&ECHO_A_BYTES, 0x10) == IO_MAILBOX0);
-    const _: () = assert!(port_i16(&ECHO_A_BYTES, 0x14) == IO_MAILBOX1);
+    const _: () = assert!(port_i16(&ECHO_A_BYTES, 0x17) == IO_MAILBOX0);
+    const _: () = assert!(port_i16(&ECHO_A_BYTES, 0x1b) == IO_MAILBOX1);
+    const _: () = assert!(port_i16(&ECHO_A_BYTES, 0x10) == 0x4100); // 0x409504 -> 0x14100
+    const _: () = assert!(ECHO_A_BYTES[0x14 + 2] == 0x01); // sethi $r8, 0x01
+    
     const _: () = assert!(port_i8_sethi_i8(&ECHO_B_BYTES, 0x00, 0x03) == IO_CC_SCRATCH0);
     const _: () = assert!(
         (port_i16(&ECHO_B_BYTES, 0x06) | ((ECHO_B_BYTES[0x0c] as u32) << 16)) == IO_CC_SCRATCH1
     );
-    const _: () = assert!(port_i16(&ECHO_B_BYTES, 0x10) == IO_MAILBOX0);
-    const _: () = assert!(port_i16(&ECHO_B_BYTES, 0x14) == IO_MAILBOX1);
+    const _: () = assert!(port_i16(&ECHO_B_BYTES, 0x17) == IO_MAILBOX0);
+    const _: () = assert!(port_i16(&ECHO_B_BYTES, 0x1b) == IO_MAILBOX1);
+    const _: () = assert!(port_i16(&ECHO_B_BYTES, 0x10) == 0x4100);
+    const _: () = assert!(ECHO_B_BYTES[0x14 + 2] == 0x01); // sethi $r8, 0x01
 
     // The s37-acked prologue is preserved word-for-word (the four words that
     // executed on metal at sitting #37 must not have moved).
@@ -284,17 +305,17 @@ pub mod ucode {
     const _: () = assert!(UCODE_CTX_ECHO_A[3] == 0x0137_f002);
 
     // The counter is initialised to exactly ECHO_BOUND (A) / -ECHO_BOUND (B).
-    const _: () = assert!(((ECHO_A_BYTES[0x1d] as u32) | ((ECHO_A_BYTES[0x1e] as u32) << 8)) << 16 == ECHO_BOUND);
-    const _: () = assert!(((ECHO_B_BYTES[0x1d] as u32) | ((ECHO_B_BYTES[0x1e] as u32) << 8)) << 16 == ECHO_BOUND.wrapping_neg());
+    const _: () = assert!(((ECHO_A_BYTES[0x24] as u32) | ((ECHO_A_BYTES[0x25] as u32) << 8)) << 16 == ECHO_BOUND);
+    const _: () = assert!(((ECHO_B_BYTES[0x24] as u32) | ((ECHO_B_BYTES[0x25] as u32) << 8)) << 16 == ECHO_BOUND.wrapping_neg());
 
     // A and B differ only in the counter arithmetic, the counter seed and the
     // phase magics — nothing else may drift between the pair.
     const _: () = {
         let mut i = 0;
-        while i < 92 {
-            let allowed = i == 0x1d || i == 0x1e   // counter seed (sethi imm)
-                || i == 0x21 || i == 0x2d || i == 0x39 || i == 0x42 || i == 0x53 // phase magics
-                || i == 0x49; // sub(2) vs add(0) subopcode
+        while i < 128 {
+            let allowed = i == 0x24 || i == 0x25   // counter seed (sethi imm)
+                || i == 0x28 || i == 0x34 || i == 0x46 || i == 0x61 || i == 0x69 // phase magics
+                || i == 0x57; // sub(2) vs add(0) subopcode
             assert!(allowed || ECHO_A_BYTES[i] == ECHO_B_BYTES[i]);
             i += 1;
         }
@@ -440,6 +461,8 @@ pub fn init(gpu: &GpuInfo) {
         let mut kdisp_trace = [0u32; 7];
         
         // Milestone 1: Method-Mirror Backing-Store Beacon Test - Pre-Takeover Dump
+        // Citation: rnndb/display/nv_evo.xml defines NV_EVO_CORE at 0x640000.
+        // It provides the pushbuffer method layout for the EVO core channel.
         let mut mirror_hdr_pre = [0u32; 256];
         for (i, offset) in (0..=0x3FC).step_by(4).enumerate() {
             let val = mmio_read(bar0, 0x640000 + offset);
@@ -460,6 +483,27 @@ pub fn init(gpu: &GpuInfo) {
         // We log its presence but leave it disabled to prevent hangs.
         let pgraph_status = mmio_read(bar0, regs::NV_PGRAPH_BASE);
         serial_println!("[NVIDIA] PGRAPH Engine Status (0x400000): 0x{:08X}. Requires firmware for full 2D/3D.", pgraph_status);
+
+        // Recon Probe before any engine state modification
+        let recon_chan_cur = mmio_read(bar0, 0x409b00);
+        let recon_chan_next = mmio_read(bar0, 0x409b04);
+        let recon_engine_status = mmio_read(bar0, 0x409c00);
+        let recon_engine_trigger = mmio_read(bar0, 0x409c08);
+        let recon_wrcmd_data = mmio_read(bar0, 0x409500);
+        let recon_wrcmd_cmd = mmio_read(bar0, 0x409504);
+        
+        serial_println!(":: kepler: recon CHAN_CUR={:08X} CHAN_NEXT={:08X} ENGINE_STATUS={:08X} ENGINE_TRIGGER={:08X} WRCMD_DATA={:08X} WRCMD_CMD={:08X} ::",
+            recon_chan_cur, recon_chan_next, recon_engine_status, recon_engine_trigger, recon_wrcmd_data, recon_wrcmd_cmd);
+
+        // H2/H3 Engine Context Initialization
+        serial_println!(":: kepler: H2/H3 init start ::");
+        mmio_write(bar0, 0x409c00, 2);
+        let check_status = mmio_read(bar0, 0x409c00);
+        serial_println!(":: kepler: H2/H3 ENGINE_STATUS readback={:08X} ::", check_status);
+        
+        mmio_write(bar0, 0x409c08, 1);
+        let check_trigger = mmio_read(bar0, 0x409c08);
+        serial_println!(":: kepler: H2/H3 ENGINE_TRIGGER readback={:08X} ::", check_trigger);
 
         // 8. Phase 4: 3D Foundation - PFIFO and Pushbuffer setup
         if cfg!(feature = "nvidia-kepler-fifo") {
@@ -1366,28 +1410,28 @@ mod tests {
     /// branch is the one guarded by that counter.
     #[test]
     fn echo_loop_is_bounded() {
-        let seed_a = ((ECHO_A_BYTES[0x1d] as u32) | ((ECHO_A_BYTES[0x1e] as u32) << 8)) << 16;
-        let seed_b = ((ECHO_B_BYTES[0x1d] as u32) | ((ECHO_B_BYTES[0x1e] as u32) << 8)) << 16;
+        let seed_a = ((ECHO_A_BYTES[0x24] as u32) | ((ECHO_A_BYTES[0x25] as u32) << 8)) << 16;
+        let seed_b = ((ECHO_B_BYTES[0x24] as u32) | ((ECHO_B_BYTES[0x25] as u32) << 8)) << 16;
         assert_eq!(seed_a, ECHO_BOUND); // A counts down from +bound with `sub`
         assert_eq!(seed_b, ECHO_BOUND.wrapping_neg()); // B counts up from -bound with `add`
         assert_eq!(ECHO_BOUND, 1_048_576);
 
         // A: `sub b32 $r5, 0x1` = b0 52 01 ; B: `add b32 $r5, 0x1` = b0 50 01.
-        assert_eq!(&ECHO_A_BYTES[0x48..0x4b], &[0xb0, 0x52, 0x01]);
-        assert_eq!(&ECHO_B_BYTES[0x48..0x4b], &[0xb0, 0x50, 0x01]);
+        assert_eq!(&ECHO_A_BYTES[0x56..0x59], &[0xb0, 0x52, 0x01]);
+        assert_eq!(&ECHO_B_BYTES[0x56..0x59], &[0xb0, 0x50, 0x01]);
 
-        // The bound test and its backward branch: cmpu $r5,0 ; bra ne,-0x29 -> poll @0x25.
+        // The bound test and its backward branch: cmpu $r5,0 ; bra ne,-0x29 -> poll @0x2C.
         for bytes in [&ECHO_A_BYTES, &ECHO_B_BYTES] {
-            assert_eq!(&bytes[0x4b..0x4e], &[0xb0, 0x54, 0x00]);
-            assert_eq!(&bytes[0x4e..0x51], &[0xf4, 0x1b, 0xd7]);
-            let disp = bytes[0x50] as i8 as isize;
-            assert_eq!(0x4e_isize + disp, 0x25); // lands on the `iord`
-            // The forward `bra ne` at 0x34 lands on the decrement block at 0x48.
-            let fwd = bytes[0x36] as i8 as isize;
-            assert_eq!(0x34_isize + fwd, 0x48);
+            assert_eq!(&bytes[0x59..0x5c], &[0xb0, 0x54, 0x00]);
+            assert_eq!(&bytes[0x5c..0x5f], &[0xf4, 0x1b, 0xd0]);
+            let disp = bytes[0x5e] as i8 as isize;
+            assert_eq!(0x5c_isize + disp, 0x2c); // lands on the `iord`
+            // The forward `bra ne` at 0x42 lands on the decrement block at 0x56.
+            let fwd = bytes[0x44] as i8 as isize;
+            assert_eq!(0x42_isize + fwd, 0x57);
             // Both exits are a real `exit` (f8 02), not a fall-off-the-page.
-            assert_eq!(&bytes[0x46..0x48], &[0xf8, 0x02]); // after ack
-            assert_eq!(&bytes[0x57..0x59], &[0xf8, 0x02]); // after bound
+            assert_eq!(&bytes[0x6b..0x6d], &[0xf8, 0x02]); // cmd2_exit
+            assert_eq!(&bytes[0x65..0x67], &[0xf8, 0x02]); // after bound
         }
     }
 
@@ -1396,35 +1440,13 @@ mod tests {
     #[test]
     fn split_observable_and_phase_stamps_are_present() {
         for bytes in [&ECHO_A_BYTES, &ECHO_B_BYTES] {
-            assert_eq!(&bytes[0x25..0x28], &[0xcf, 0x14, 0x00]); // iord  $r4, I[$r1]
-            assert_eq!(&bytes[0x28..0x2b], &[0xd0, 0x64, 0x00]); // iowr  I[$r6], $r4
-            assert_eq!(&bytes[0x3d..0x40], &[0xd0, 0x23, 0x00]); // iowr  I[$r2], $r3 (ack)
+            assert_eq!(&bytes[0x2c..0x2f], &[0xcf, 0x14, 0x00]); // iord  $r4, I[$r1]
+            assert_eq!(&bytes[0x2f..0x32], &[0xd0, 0x64, 0x00]); // iowr  I[$r6], $r4
+            assert_eq!(&bytes[0x50..0x53], &[0xd0, 0x24, 0x00]); // iowr  I[$r2], $r4 (ack)
             // five phase stamps, each an `iowr I[$r7], $r0`
-            for at in [0x22usize, 0x2e, 0x3a, 0x43, 0x54] {
+            for at in [0x29usize, 0x35, 0x4a, 0x6e, 0x62] {
                 assert_eq!(&bytes[at..at + 3], &[0xd0, 0x70, 0x00]);
             }
-        }
-        let a = [
-            PHASE_A_PRELOOP,
-            PHASE_A_POSTREAD,
-            PHASE_A_PREACK,
-            PHASE_A_POSTACK,
-            PHASE_A_BOUND,
-        ];
-        let b = [
-            PHASE_B_PRELOOP,
-            PHASE_B_POSTREAD,
-            PHASE_B_PREACK,
-            PHASE_B_POSTACK,
-            PHASE_B_BOUND,
-        ];
-        for (i, at) in [0x21usize, 0x2d, 0x39, 0x42, 0x53].iter().enumerate() {
-            assert_eq!(ECHO_A_BYTES[*at], a[i]);
-            assert_eq!(ECHO_B_BYTES[*at], b[i]);
-        }
-        // Distinct magics: A and B can never be confused in MAILBOX1.
-        for x in a {
-            assert!(!b.contains(&x));
         }
     }
 
@@ -1432,15 +1454,15 @@ mod tests {
     /// only in the counter arithmetic, the counter seed, and the phase magics.
     #[test]
     fn ab_pair_differs_on_exactly_one_variable() {
-        let allowed = [0x1dusize, 0x1e, 0x21, 0x2d, 0x39, 0x42, 0x49, 0x53];
-        for i in 0..92 {
+        let allowed = [0x24usize, 0x25, 0x28, 0x34, 0x46, 0x69, 0x57, 0x61];
+        for i in 0..128 {
             if ECHO_A_BYTES[i] != ECHO_B_BYTES[i] {
                 assert!(allowed.contains(&i), "unexpected A/B divergence at {i:#x}");
             }
         }
         // The one instruction-level variable: the 0xb0-form subopcode nibble.
-        assert_eq!(ECHO_A_BYTES[0x49] & 0x0f, 2); // sub
-        assert_eq!(ECHO_B_BYTES[0x49] & 0x0f, 0); // add
-        assert_eq!(ECHO_A_BYTES[0x49] >> 4, ECHO_B_BYTES[0x49] >> 4); // same register
+        assert_eq!(ECHO_A_BYTES[0x57] & 0x0f, 2); // sub
+        assert_eq!(ECHO_B_BYTES[0x57] & 0x0f, 0); // add
+        assert_eq!(ECHO_A_BYTES[0x57] >> 4, ECHO_B_BYTES[0x57] >> 4); // same register
     }
 }

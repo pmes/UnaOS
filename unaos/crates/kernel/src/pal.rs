@@ -229,7 +229,43 @@ pub mod cursor {
     // drives `video::cursor` explicitly. Nothing on those paths changes.
     /// Whether the SYSTEM COMPOSITOR SPRITE (`video::cursor`, front buffer, above the window layer)
     /// owns the arrow's pixels on this target, rather than the back-buffer sprite below.
-    const SPRITE_OWNS_PAINT: bool = cfg!(target_arch = "x86_64");
+    ///
+    /// FLICKER-4 — `pub(crate)` because the full-screen demo loops need to read it. The paragraph
+    /// above promises they "simply stop putting pixels in the back buffer"; that is true of the
+    /// PAINT, which `draw`/`draw_over` delegate away, and it was NOT true of the per-frame ERASE
+    /// those loops run to clear the sprite's own trail. See [`BACKBUF_SPRITE_NEEDS_ERASE`].
+    pub(crate) const SPRITE_OWNS_PAINT: bool = cfg!(target_arch = "x86_64");
+
+    /// FLICKER-4 — **must a full-redraw loop erase the arrow's previous footprint from the BACK
+    /// BUFFER every frame?**
+    ///
+    /// This is the question a dirty-rect presenter actually has to ask, asked in the direction that
+    /// makes the safe answer the default one. It is named for the PAINT MODEL, not for an arch:
+    ///
+    /// * **`true` — the BACK-BUFFER sprite model.** [`paint`] writes the arrow's merged runs into
+    ///   the caller's back buffer, so those pixels are part of the frame, the loop owns the trail,
+    ///   and erase → redraw is the correct software-cursor cycle. Not erasing strands the previous
+    ///   footprint on screen for as long as the pointer keeps moving. **This is the aarch64 /
+    ///   Pi in-kernel path, and it is also what any tree that has not adopted the front-buffer
+    ///   sprite must get.**
+    /// * **`false` — the FRONT-BUFFER sprite model.** `video::cursor` owns the arrow above the
+    ///   window layer; [`draw`]/[`draw_over`] delegate to `video::cursor::ensure_drawn` and put no
+    ///   pixels in the back buffer at all, and the trail is cleaned by the sprite module's own
+    ///   save-under the instant the pointer report lands. A back-buffer erase then restores nothing
+    ///   and does active harm: `draw_rect` marks damage, so the frame hands `Screen::flush` a
+    ///   damage rect covering the sprite's own panel box and the present blits background forward
+    ///   over a live arrow, every frame.
+    ///
+    /// **Polarity is load-bearing, and the default is ERASE.** A caller writes
+    /// `if BACKBUF_SPRITE_NEEDS_ERASE { … }` — the erase is the guarded-IN branch, not the
+    /// guarded-out one. A tree that does not have the front-buffer sprite model does not have
+    /// [`SPRITE_OWNS_PAINT`] either, and therefore does not have this constant: the call site fails
+    /// to COMPILE rather than silently resolving to "skip the erase". That is deliberate. There is
+    /// no `unwrap_or`, no `cfg!(feature = …)` that reads `false` when the feature is absent, and no
+    /// arch test at the call site — the three shapes that would turn a missing symbol into a
+    /// stranded pointer footprint at convergence. **If you are merging this into a tree without
+    /// `SPRITE_OWNS_PAINT`, the correct value of this constant there is `true`.**
+    pub(crate) const BACKBUF_SPRITE_NEEDS_ERASE: bool = !SPRITE_OWNS_PAINT;
 
     // CURSOR-HIDE (metal verdict, 2026-07-18): the cursor auto-hides after ~1.5 s without pointer
     // input and reappears instantly on the next report (`move_rel`/`set_abs` stamp the activity
@@ -1208,9 +1244,15 @@ impl<'a> GneissPal for TargetPal<'a> {
     ///
     /// Nothing is left unbracketed. `self.surface` is a [`crate::video::screen::Screen`] for every
     /// construction of this type on every target, so `flush` is always the CURSOR-13 body; and that
-    /// body's `repaint` runs UNCONDITIONALLY, before the composite, so a present that composites
-    /// nothing at all (`wm::service_damage` early-returns on an undamaged table) still leaves the
-    /// arrow on glass. The function is now arch-neutral in shape as well as in effect.
+    /// body closes UNCONDITIONALLY with a cursor draw, before the composite, so a present that
+    /// composites nothing at all (`wm::service_damage` early-returns on an undamaged table) still
+    /// leaves the arrow on glass. The function is now arch-neutral in shape as well as in effect.
+    ///
+    /// FLICKER-3 — the closing verb is `repaint()` when the bracket was taken and `ensure_drawn()`
+    /// when it was skipped, because the bracket itself is now gated on the present's damage
+    /// actually meeting the sprite. The guarantee this paragraph asserts is unchanged — both verbs
+    /// leave the arrow on glass — and `ensure_drawn` is the cheaper of the two precisely on the
+    /// path where nothing disturbed the sprite. See `Screen::flush`.
     fn render(&mut self) {
         self.surface.flush();
     }

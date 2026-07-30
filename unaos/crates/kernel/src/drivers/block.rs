@@ -588,3 +588,447 @@ pub fn write_blocks_usb(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
         }
     }
 }
+
+// ===================== PARTITION — MBR decode + bounded partition ranges =====================
+//
+// PARTITION (GR9): everything above this line addresses a WHOLE device. A real card carries a
+// partition table, and the UnaOS layout of record is MBR partition 1 = ESP (FAT) + partition 2 =
+// UnaFS (the layout `make-pi-img.sh` already stamps and `locate_unafs` already finds by superblock
+// magic). This section is the missing middle: ONE decoder for the classic MBR, and ONE bounded
+// window type ([`PartitionRange`]) that the layers above address a partition through.
+//
+// ### Every field here comes off the medium — nothing guarantees it
+// LBA 0 of an arbitrary disk is attacker-shaped input: an unformatted stick, a foreign OS's table,
+// or a deliberately crafted sector. NOTHING about a partition entry is guaranteed by the medium —
+// not the type byte, not the start LBA, not the length, not that two entries are disjoint. The only
+// thing the hardware guarantees is that we read 512 bytes from LBA 0 (and the block layer's own
+// `num_blocks` guard guarantees that read was in range). So the decoder treats every field as a
+// claim to be checked, and a claim that fails is REJECTED — never clamped, never repaired, never
+// trusted "because it is probably fine". [`decode_mbr`] documents each rule at its check.
+//
+// ### Reading, not writing
+// This arc reads and bounds. It writes NO partition table: laying an MBR down is a medium-destroying
+// operation and belongs to its own arc behind its own approval. The installer's existing GPT writer
+// (`install::gpt`) is untouched.
+
+/// Bytes in one logical sector on every device this layer supports (the block layer already refuses
+/// a device whose `block_size` is anything else at mount time).
+pub const SECTOR_BYTES: usize = 512;
+
+/// Byte offset of the 0x55AA boot signature inside LBA 0.
+const MBR_SIG_OFF: usize = 510;
+/// Byte offset of the first of the four 16-byte primary partition entries inside LBA 0.
+const MBR_TABLE_OFF: usize = 446;
+/// Size of one MBR primary partition entry.
+const MBR_ENTRY_LEN: usize = 16;
+
+/// MBR type byte reserved by UEFI for the protective partition of a GPT disk.
+pub const MBR_TYPE_GPT_PROTECTIVE: u8 = 0xEE;
+/// MBR type bytes for extended-partition containers (CHS / LBA forms). We do not walk EBR chains.
+pub const MBR_TYPE_EXTENDED_CHS: u8 = 0x05;
+/// See [`MBR_TYPE_EXTENDED_CHS`].
+pub const MBR_TYPE_EXTENDED_LBA: u8 = 0x0F;
+/// The MBR type byte the UnaOS card layout stamps on its UnaFS data partition (partition 2).
+/// Advisory ONLY: [`crate::fs::unafs`] locates the volume by its `UNAFS` superblock magic, never by
+/// this byte, so a card carved by a foreign tool still works. It exists so a census line reads
+/// meaningfully to a human.
+pub const MBR_TYPE_UNAFS: u8 = 0x7F;
+
+/// Why [`decode_mbr`] refused one primary entry. Every variant is a claim the entry made that the
+/// medium does not back; the entry is dropped, never clamped into range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionReject {
+    /// Type byte 0x00 — an unused slot. The only "reject" that is not a defect.
+    Empty,
+    /// Length field is 0: the entry addresses nothing, so it can only ever mislead.
+    ZeroLength,
+    /// Start LBA 0: the entry claims the partition table's own sector. A partition that contains
+    /// LBA 0 could rewrite the table that describes it, and it aliases the superfloppy case.
+    StartsAtZero,
+    /// `start + count` overflows u64 — a crafted extent that would wrap back into low LBAs.
+    ExtentOverflow,
+    /// The extent's LAST sector is past the end of the device. Accepting it would let a filesystem
+    /// address sectors the medium does not have (and, on a wrapping controller, sectors it does).
+    PastDevice,
+    /// The extent intersects an earlier ACCEPTED entry. Two filesystems sharing sectors is a
+    /// corruption generator: each would consider the overlap its own to write.
+    Overlap,
+    /// An extended-partition container (0x05 / 0x0F). We do not walk EBR chains, so the container
+    /// itself is not an addressable volume.
+    Extended,
+    /// A GPT protective entry (0xEE) was present, so this disk's real table is the GPT at LBA 1 and
+    /// the MBR describes nothing. See [`MbrTable::protective`].
+    Protective,
+}
+
+/// One accepted MBR primary partition, normalized to LBAs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionEntry {
+    /// 1..=4 — the slot number as a human names it ("partition 1 = ESP"). Slot order is table order.
+    pub slot: u8,
+    /// The 0x80 boot-indicator byte, verbatim. Advisory; nothing in UnaOS keys off it.
+    pub boot_flag: u8,
+    /// The partition type byte, verbatim. Advisory (see [`MBR_TYPE_UNAFS`]).
+    pub type_byte: u8,
+    /// First sector of the partition, absolute on the device.
+    pub start_lba: u64,
+    /// Length of the partition in sectors. `start_lba + sector_count` is checked `<= num_blocks`.
+    pub sector_count: u64,
+}
+
+impl PartitionEntry {
+    /// One past the last sector of this partition (always computable: `decode_mbr` already proved
+    /// the sum does not overflow and does not exceed the device).
+    pub fn end_lba(&self) -> u64 {
+        self.start_lba + self.sector_count
+    }
+}
+
+/// A decoded classic MBR partition table. Produced only from a sector that carried 0x55AA.
+#[derive(Debug, Clone, Copy)]
+pub struct MbrTable {
+    /// True when a 0xEE protective entry was present. The disk's real table is then the GPT at
+    /// LBA 1 and this table exposes NO partitions: a hybrid MBR (real entries alongside 0xEE) is
+    /// exactly the ambiguity an attacker wants, and resolving it in favour of "some entries are
+    /// real" would let a crafted MBR entry shadow a GPT partition. GPT disks go through the GPT path.
+    pub protective: bool,
+    /// Slot 1..=4 in table order; `None` where the entry was rejected.
+    entries: [Option<PartitionEntry>; 4],
+    /// Why each slot was rejected (`None` for an accepted slot).
+    rejects: [Option<PartitionReject>; 4],
+}
+
+impl MbrTable {
+    /// The entry in `slot` (1..=4), if it was accepted.
+    pub fn entry(&self, slot: u8) -> Option<PartitionEntry> {
+        if slot == 0 || slot > 4 {
+            return None;
+        }
+        self.entries[(slot - 1) as usize]
+    }
+
+    /// Why `slot` (1..=4) was rejected, if it was.
+    pub fn reject(&self, slot: u8) -> Option<PartitionReject> {
+        if slot == 0 || slot > 4 {
+            return None;
+        }
+        self.rejects[(slot - 1) as usize]
+    }
+
+    /// Every accepted entry, in slot order.
+    pub fn iter(&self) -> impl Iterator<Item = PartitionEntry> + '_ {
+        self.entries.iter().filter_map(|e| *e)
+    }
+
+    /// How many slots were accepted.
+    ///
+    /// INSTRUMENT NOTE (healthy-but-idle): on the UnaOS layout of record — MBR p1 ESP + p2 UnaFS —
+    /// this reads **2** on every boot, from the very first read, and never changes: the table is a
+    /// property of the medium, not of any activity. A value that is not 2 on a UnaOS card is a real
+    /// finding about the medium, not a sampling artifact. On a GPT disk it reads 0 (`protective`).
+    pub fn accepted(&self) -> u8 {
+        self.entries.iter().filter(|e| e.is_some()).count() as u8
+    }
+
+    /// How many slots were rejected for a reason OTHER than being an empty slot.
+    ///
+    /// INSTRUMENT NOTE (healthy-but-idle): on the UnaOS layout this reads **0** on every boot —
+    /// slots 3 and 4 are empty (`PartitionReject::Empty`, which this deliberately does not count),
+    /// and slots 1 and 2 are accepted. A non-zero value means the table itself carried an entry we
+    /// refused; the per-slot census line names which rule it broke. There is no idle path that can
+    /// make this drift, because nothing but a re-read of LBA 0 can change it.
+    pub fn rejected(&self) -> u8 {
+        self.rejects
+            .iter()
+            .filter(|r| matches!(r, Some(x) if *x != PartitionReject::Empty))
+            .count() as u8
+    }
+}
+
+#[inline]
+fn le_u32(b: &[u8], off: usize) -> u32 {
+    (b[off] as u32) | ((b[off + 1] as u32) << 8) | ((b[off + 2] as u32) << 16) | ((b[off + 3] as u32) << 24)
+}
+
+/// Decode a classic MBR partition table out of `sec` (which must be LBA 0 of a device holding
+/// `dev_blocks` sectors). Pure: it reads no device and prints nothing, so it is the one place the
+/// validation rules live and the one thing a witness or a test can exercise directly.
+///
+/// Returns `None` when `sec` carries no 0x55AA signature — that is "this is not an MBR", not an
+/// error: LBA 0 may legitimately be a FAT superfloppy BPB or blank media, and the caller falls
+/// through to its other candidates.
+///
+/// ### What a malformed table does
+/// Nothing is repaired and nothing is clamped. Each slot is judged on its own and a slot that fails
+/// any rule is dropped with a [`PartitionReject`] naming the rule. A table where every slot fails
+/// decodes successfully to a table with **zero** partitions, which every caller treats as "no
+/// partition here" — the safe direction, because a caller can only ever mount FEWER volumes, never
+/// a volume in a place the table did not honestly describe. The rules, in order of application:
+///
+/// 1. type byte 0x00 → `Empty` (an unused slot; not counted as a defect);
+/// 2. type byte 0xEE anywhere in the table → the WHOLE table is `protective` and exposes nothing;
+/// 3. type byte 0x05 / 0x0F → `Extended` (we do not walk EBR chains);
+/// 4. `sector_count == 0` → `ZeroLength`;
+/// 5. `start_lba == 0` → `StartsAtZero` (it would contain the table describing it);
+/// 6. `start + count` overflowing → `ExtentOverflow`;
+/// 7. `start + count > dev_blocks` → `PastDevice`;
+/// 8. intersecting an already-ACCEPTED slot → `Overlap`.
+///
+/// Rule 8 is what makes the accepted set pairwise disjoint, which is in turn what makes a
+/// [`PartitionRange`]'s bound check a real isolation guarantee rather than a formality: two
+/// overlapping partitions would each pass their own bound check while writing the same sectors.
+/// Table order decides the winner so the outcome is deterministic for a given medium.
+pub fn decode_mbr(sec: &[u8], dev_blocks: u64) -> Option<MbrTable> {
+    if sec.len() < SECTOR_BYTES {
+        return None;
+    }
+    if sec[MBR_SIG_OFF] != 0x55 || sec[MBR_SIG_OFF + 1] != 0xAA {
+        return None;
+    }
+
+    // Rule 2 first: one 0xEE anywhere makes the entire MBR a protective shell for a GPT.
+    let protective = (0..4).any(|i| sec[MBR_TABLE_OFF + i * MBR_ENTRY_LEN + 4] == MBR_TYPE_GPT_PROTECTIVE);
+
+    let mut entries: [Option<PartitionEntry>; 4] = [None; 4];
+    let mut rejects: [Option<PartitionReject>; 4] = [None; 4];
+
+    for i in 0..4 {
+        let off = MBR_TABLE_OFF + i * MBR_ENTRY_LEN;
+        let boot_flag = sec[off];
+        let type_byte = sec[off + 4];
+        let start_lba = le_u32(sec, off + 8) as u64;
+        let sector_count = le_u32(sec, off + 12) as u64;
+
+        let reject = if type_byte == 0x00 {
+            Some(PartitionReject::Empty)
+        } else if protective {
+            Some(PartitionReject::Protective)
+        } else if type_byte == MBR_TYPE_EXTENDED_CHS || type_byte == MBR_TYPE_EXTENDED_LBA {
+            Some(PartitionReject::Extended)
+        } else if sector_count == 0 {
+            Some(PartitionReject::ZeroLength)
+        } else if start_lba == 0 {
+            Some(PartitionReject::StartsAtZero)
+        } else {
+            match start_lba.checked_add(sector_count) {
+                None => Some(PartitionReject::ExtentOverflow),
+                Some(end) if end > dev_blocks => Some(PartitionReject::PastDevice),
+                Some(end) => {
+                    // Rule 8: disjointness against everything already accepted.
+                    let clash = entries.iter().flatten().any(|p| {
+                        start_lba < p.end_lba() && p.start_lba < end
+                    });
+                    if clash { Some(PartitionReject::Overlap) } else { None }
+                }
+            }
+        };
+
+        match reject {
+            Some(r) => rejects[i] = Some(r),
+            None => {
+                entries[i] = Some(PartitionEntry {
+                    slot: (i + 1) as u8,
+                    boot_flag,
+                    type_byte,
+                    start_lba,
+                    sector_count,
+                })
+            }
+        }
+    }
+
+    Some(MbrTable { protective, entries, rejects })
+}
+
+/// PARTITION: one-shot latch per handle for [`mbr_census`] — bit 0 = `Global`, bit 1 = `Usb`.
+///
+/// INSTRUMENT NOTE (healthy-but-idle): reads 0 before any FAT mount is attempted and stops changing
+/// once each present handle has been censused (1, 2, or 3). It gates PRINTING only; the decode it
+/// guards is pure and is re-run on every mount, so a latched census can never make a later mount
+/// see a different table than the one it printed.
+static MBR_CENSUS_LATCH: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// PARTITION: print the RAW LBA-0 partition area first, then the decoded verdict — at most once per
+/// handle per boot. Returns the decoded table (or `None` if `sec` is not an MBR) whether or not it
+/// printed, so the caller's control flow does not depend on the latch.
+///
+/// The raw line comes BEFORE any interpretation on purpose. Every decoded line below it is this
+/// code's opinion; the raw line is the medium's bytes, and it is what lets a bench sitting decide,
+/// from the serial log alone, whether a surprising verdict came from a surprising disk or from a
+/// decoder bug. It is the same discipline the block layer's `io-cause` witness follows: name the
+/// evidence before naming the conclusion.
+pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<MbrTable> {
+    let table = decode_mbr(sec, dev_blocks);
+
+    let bit: u8 = match handle {
+        BlockHandle::Global => 1,
+        BlockHandle::Usb => 2,
+    };
+    let prev = MBR_CENSUS_LATCH.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
+    if prev & bit != 0 || sec.len() < SECTOR_BYTES {
+        return table;
+    }
+    let name = match handle {
+        BlockHandle::Global => "global",
+        BlockHandle::Usb => "usb",
+    };
+
+    // --- RAW, before decoding anything: the signature word and the four 16-byte entries verbatim.
+    serial_println!(
+        ":: PART: mbr-raw handle={} dev_blocks={} sig={:02x}{:02x} ::",
+        name, dev_blocks, sec[MBR_SIG_OFF], sec[MBR_SIG_OFF + 1]
+    );
+    for i in 0..4 {
+        let o = MBR_TABLE_OFF + i * MBR_ENTRY_LEN;
+        let e = &sec[o..o + MBR_ENTRY_LEN];
+        serial_println!(
+            ":: PART: mbr-raw handle={} e{} = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+            name, i + 1,
+            e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7],
+            e[8], e[9], e[10], e[11], e[12], e[13], e[14], e[15]
+        );
+    }
+
+    // --- Decoded verdict, per slot, then the summary.
+    let Some(t) = table else {
+        serial_println!(":: PART: mbr census handle={} sig=absent — not an MBR ::", name);
+        return table;
+    };
+    for slot in 1..=4u8 {
+        match (t.entry(slot), t.reject(slot)) {
+            (Some(p), _) => serial_println!(
+                ":: PART: mbr handle={} slot={} type=0x{:02x} boot=0x{:02x} start={} count={} end={} ACCEPT ::",
+                name, slot, p.type_byte, p.boot_flag, p.start_lba, p.sector_count, p.end_lba()
+            ),
+            (None, Some(r)) => serial_println!(
+                ":: PART: mbr handle={} slot={} REJECT {:?} ::", name, slot, r
+            ),
+            (None, None) => {}
+        }
+    }
+    serial_println!(
+        ":: PART: mbr census handle={} protective={} accepted={} rejected={} ::",
+        name, t.protective as u8, t.accepted(), t.rejected()
+    );
+    table
+}
+
+/// PARTITION: a bounded, addressable window onto ONE partition.
+///
+/// This is the type the layers above address a partition through. Its whole reason to exist is the
+/// bound: every entry point takes a **partition-relative** LBA and refuses anything whose span does
+/// not lie entirely inside `[0, sector_count)` BEFORE translating it to an absolute LBA. A caller
+/// therefore cannot express an access outside its own partition — not by arithmetic error, not by a
+/// corrupt on-disk field, not by a hostile one. That is the property a filesystem mounted on
+/// partition 1 needs in order to be incapable of writing into partition 2.
+///
+/// ### Two independent bounds, deliberately
+/// 1. HERE, against the partition's own extent — the isolation guarantee.
+/// 2. Below, in [`read_block`] / [`write_block`] (and the counted forms), against the device's
+///    `num_blocks` — the medium guarantee, re-read from the live registry on every call.
+///
+/// Neither is redundant: (1) cannot see a disk that shrank or was unplugged, and (2) cannot see a
+/// partition boundary. A range is a plain value copied from a decoded entry, so it does not keep a
+/// device alive; if the disk goes away, (2) fails the next access with `NotReady`, exactly as every
+/// other block caller does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionRange {
+    /// Which registry handle (and therefore which read/write path) this partition lives behind.
+    pub handle: BlockHandle,
+    /// Absolute LBA of partition-relative sector 0.
+    pub start_lba: u64,
+    /// Length of the partition in sectors — the bound every access is checked against.
+    pub sector_count: u64,
+}
+
+impl PartitionRange {
+    /// Build a range for `entry` as read from `handle`.
+    pub fn new(handle: BlockHandle, entry: &PartitionEntry) -> Self {
+        Self { handle, start_lba: entry.start_lba, sector_count: entry.sector_count }
+    }
+
+    /// Translate a partition-relative span to an absolute LBA, or refuse.
+    ///
+    /// `sectors` is the WHOLE span, so the check covers the last sector, not merely the first — the
+    /// same rule `span_blocks` applies at the device level, and for the same reason: a span whose
+    /// head is in range and whose tail is not is precisely the shape of a cross-partition write.
+    fn map(&self, rel_lba: u64, sectors: u64) -> Result<u64, BlockError> {
+        if sectors == 0 {
+            return Err(BlockError::Io); // a caller bug, not an I/O fault
+        }
+        let end = rel_lba.checked_add(sectors).ok_or(BlockError::BadLba)?;
+        if end > self.sector_count {
+            return Err(BlockError::BadLba);
+        }
+        self.start_lba.checked_add(rel_lba).ok_or(BlockError::BadLba)
+    }
+
+    /// Absolute LBA of partition-relative `rel_lba`, bound-checked. Exposed so a filesystem that
+    /// must speak absolute LBAs (the in-tree FAT reader does) can still get every address through
+    /// this one gate instead of computing `start + rel` for itself.
+    pub fn absolute(&self, rel_lba: u64, sectors: u64) -> Result<u64, BlockError> {
+        self.map(rel_lba, sectors)
+    }
+
+    /// Does the ABSOLUTE span `[lba, lba+sectors)` lie entirely inside this partition? The check a
+    /// caller holding absolute addresses uses before handing them to the device layer.
+    pub fn contains_absolute(&self, lba: u64, sectors: u64) -> bool {
+        let Some(end) = lba.checked_add(sectors) else { return false };
+        let Some(part_end) = self.start_lba.checked_add(self.sector_count) else { return false };
+        sectors != 0 && lba >= self.start_lba && end <= part_end
+    }
+
+    /// Read one partition-relative sector.
+    pub fn read_block(&self, rel_lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+        let abs = self.map(rel_lba, 1)?;
+        match self.handle {
+            BlockHandle::Global => read_block(abs, buf),
+            BlockHandle::Usb => read_block_usb(abs, buf),
+        }
+    }
+
+    /// Write one partition-relative sector.
+    pub fn write_block(&self, rel_lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+        let abs = self.map(rel_lba, 1)?;
+        match self.handle {
+            BlockHandle::Global => write_block(abs, buf),
+            BlockHandle::Usb => write_block_usb(abs, buf),
+        }
+    }
+
+    /// Read a counted run of partition-relative sectors (`buf.len()` must be a whole multiple of the
+    /// device block size; the device layer re-checks that and the `MAX_BLOCKS_PER_OP` cap).
+    pub fn read_blocks(&self, rel_lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+        let abs = self.map(rel_lba, self.span_sectors(buf.len())?)?;
+        match self.handle {
+            BlockHandle::Global => read_blocks(abs, buf),
+            BlockHandle::Usb => read_blocks_usb(abs, buf),
+        }
+    }
+
+    /// Write a counted run of partition-relative sectors.
+    pub fn write_blocks(&self, rel_lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+        let abs = self.map(rel_lba, self.span_sectors(buf.len())?)?;
+        match self.handle {
+            BlockHandle::Global => write_blocks(abs, buf),
+            BlockHandle::Usb => write_blocks_usb(abs, buf),
+        }
+    }
+
+    /// Sectors covered by a `len`-byte buffer, using the LIVE device block size for the handle so
+    /// the bound above is computed in the same units the device layer will use. A `len` that is not
+    /// a whole number of sectors is refused here rather than rounded — rounding down would let the
+    /// tail sector escape the bound check that the device layer then happily performs.
+    fn span_sectors(&self, len: usize) -> Result<u64, BlockError> {
+        let dev = match self.handle {
+            BlockHandle::Global => info(),
+            BlockHandle::Usb => usb_info(),
+        }
+        .ok_or(BlockError::NotReady)?;
+        let bs = dev.block_size as usize;
+        if bs == 0 || len == 0 || len % bs != 0 {
+            return Err(BlockError::Io);
+        }
+        Ok((len / bs) as u64)
+    }
+}

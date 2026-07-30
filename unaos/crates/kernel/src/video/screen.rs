@@ -948,13 +948,71 @@ impl Screen {
     /// CURSOR-9's colour-guard residual is therefore mended sooner than before, not later.
     /// `TOUCHED_SINCE_DRAW` is untouched: a present landing under a live sprite still arms the
     /// repair through `note_present_over_sprite`, and it now has a live sprite to arm it for.
+    ///
+    /// ### FLICKER-3 — the bracket is DAMAGE-GATED, not paid at present cadence
+    ///
+    /// CURSOR-13 narrowed the bracket's SPAN to the desktop blit. It left its RATE alone: the pair
+    /// still ran on every flush, unconditionally, whether or not this present had a single damaged
+    /// pixel anywhere near the arrow. On a fast presenter that is 75 restore→save→draw cycles a
+    /// second over the sprite's box in the FRONT buffer, and each one is an interval in which the
+    /// arrow is genuinely not on the panel — the heavy-flicker mechanism the Pi seat diagnosed and
+    /// fixed as FLICKER-3, present in the same shape here.
+    ///
+    /// The gate is the bracket's own justification read as a predicate. `undraw` exists so that a
+    /// pixel this present is about to overwrite is handed back BEFORE the overwrite, or the
+    /// save-under describes pixels that are no longer there. A present whose damage does not meet
+    /// the sprite's box cannot overwrite one sprite pixel, so it owes the sprite nothing.
+    ///
+    /// Three properties make the skip safe rather than merely cheap:
+    ///
+    /// * **Conservative by construction.** [`damage_meets`] tests the RAW damage set — before
+    ///   WC-I's window subtraction narrows it — against the sprite's box, and treats a pending
+    ///   `FULL_PRESENT` as an unconditional meet (that flag is consumed inside
+    ///   [`present_background`], and it turns the damage into the whole panel). Every span the
+    ///   present actually copies is therefore inside a rect this test saw, so "no overlap" here
+    ///   implies "no copied span touched the arrow" there. There is no false skip.
+    /// * **Exact, not advisory.** The box comes from `cursor::sprite_box()`, which takes `SPRITE`,
+    ///   rather than from `live_box_relaxed()`, which is publish-order advisory and reads `None`
+    ///   for the instant a concurrent draw is republishing its box. One lock acquisition replaces
+    ///   two that did hundreds of pixel reads and writes between them, so the gate is cheaper than
+    ///   the thing it gates even when it decides to bracket.
+    /// * **The arrow still ends on glass.** The skip path takes `ensure_drawn()`, WC-I's idempotent
+    ///   tail — one lock acquisition and a boolean when the sprite is already up, a real draw when
+    ///   something else (`wm::erase`, an auto-hide expiry that has since ended) took it down. The
+    ///   invariant `pal::TargetPal::render` rests on — "a present that composites nothing at all
+    ///   still leaves the arrow on glass" — is unchanged; only the verb is, and `repaint`'s
+    ///   restore→save→draw on an undisturbed sprite is exactly the churn WC-I removed elsewhere.
+    ///
+    /// **The falsifier is `[cursor6] desktop_over=`, unchanged and still expected 0.** It is
+    /// computed from the surviving spans and the live box INSIDE `present_background`, i.e. from
+    /// the other side of this decision, so a skip that should not have been taken shows up there as
+    /// `UNBRACKETED` rather than as a silent hole. `flush_skip=N/M` on the same line reports how
+    /// often the gate fired against how often it ran; see [`super::cursor::note_flush_gate`] for
+    /// why the denominator is not optional.
     pub fn flush(&mut self) {
+        // FLICKER-3 — decide the bracket BEFORE the damage set is consumed. `present_background`
+        // clears `self.damage` on entry, so this is the only point at which the question is
+        // answerable at all.
+        let bracket = match super::cursor::sprite_box() {
+            // Nothing is on the panel to hand back. `ensure_drawn` below still owes it a draw if
+            // the pointer is visible, which is what the old unconditional `repaint` was doing here.
+            None => false,
+            Some(b) => self.damage_meets(b),
+        };
         // CURSOR-13 — the DESKTOP bracket. Opens here, closes before the window layer is touched.
-        super::cursor::undraw();
+        if bracket {
+            super::cursor::undraw();
+        }
         let intruded = self.present_background();
         // CURSOR-13 — bracket CLOSED. Everything below composites with the arrow on the panel, which
-        // is the whole point of this arc: `sprite_plan()` must be able to answer.
-        super::cursor::repaint();
+        // is the whole point of that arc: `sprite_plan()` must be able to answer.
+        if bracket {
+            super::cursor::repaint();
+        } else {
+            super::cursor::ensure_drawn();
+        }
+        #[cfg(feature = "witness")]
+        super::cursor::note_flush_gate(!bracket);
         // Only when background pixels actually landed ON a window — which, with the subtraction in
         // place, is the fallback path only. `repaint` self-guards on there being a window layer to
         // restore (one table-lock acquisition, then out).
@@ -963,6 +1021,31 @@ impl Screen {
         } else {
             super::wm::service_damage();
         }
+    }
+
+    /// FLICKER-3 — could the present this flush is about to run write a pixel inside `b`?
+    ///
+    /// Answered against the damage set as it stands NOW, which is a superset of what
+    /// [`present_background`] will actually copy: that function subtracts the window layer from
+    /// every rect (WC-I) and can only ever narrow. A `false` here therefore proves no copied span
+    /// meets `b`; a `true` may be a rect the subtraction would have emptied, which costs one
+    /// unnecessary bracket and never a missed one.
+    ///
+    /// `FULL_PRESENT` is read, not consumed — [`present_background`] owns the `swap`, and taking it
+    /// here would drop a whole-panel repaint on the floor. Pending means the damage is about to
+    /// become the entire panel, so the answer is unconditionally yes.
+    fn damage_meets(&self, b: (usize, usize, usize, usize)) -> bool {
+        if FULL_PRESENT.load(core::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        let (sx, sy, sw, sh) = b;
+        if sw == 0 || sh == 0 {
+            return false;
+        }
+        let (sx1, sy1) = (sx + sw, sy + sh);
+        self.damage.rects[..self.damage.len]
+            .iter()
+            .any(|d| d.x0 < sx1 && sx < d.x1 && d.y0 < sy1 && sy < d.y1)
     }
 
     /// Present the back buffer: copy each damaged rectangle to the framebuffer, row by row (each
@@ -1088,6 +1171,14 @@ impl Screen {
         // erasing the arrow at flush rate — the spotty symptom, from the other layer. Diagnostic
         // only: nothing below is conditional on it, so a stale answer costs precision and never a
         // pixel.
+        //
+        // FLICKER-3 — and the invariant STILL does not change, which is the point of stating it
+        // here. The bracket is now conditional, but its condition (`Screen::damage_meets`) is
+        // evaluated against a SUPERSET of the spans this loop copies: the raw damage rects, before
+        // the window subtraction below narrows them. So on a flush that skipped the bracket, every
+        // span reaching the panel is provably outside the sprite's box and this latch stays clear.
+        // A live sprite seen here is a broken gate or a broken bracket, and either way it is the
+        // same defect it always was.
         #[cfg(feature = "witness")]
         let sprite_box = super::cursor::live_box_relaxed();
         #[cfg(feature = "witness")]

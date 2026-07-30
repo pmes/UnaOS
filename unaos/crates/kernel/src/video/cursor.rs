@@ -480,11 +480,46 @@ static C6_PRESENT_OVER: AtomicU64 = AtomicU64::new(0);
 static C6_PRESENT_MASKED: AtomicU64 = AtomicU64::new(0);
 
 /// CURSOR-6 — desktop presents (`Screen::present_background`) whose surviving damage spans met the
-/// live sprite box. The render task brackets its own flush with [`undraw`]/[`repaint`], so this must
+/// live sprite box. `Screen::flush` brackets that call with [`undraw`]/[`repaint`], so this must
 /// be 0; a non-zero count means the desktop reached the panel through a path that skipped the
 /// bracket, and the desktop is erasing the arrow ~20 times a second.
+///
+/// **FLICKER-3 gave this counter a second job and did not change its expected reading.** The
+/// bracket is now taken only when the present's damage meets the sprite's box, so this is also the
+/// designated detector for a WRONG SKIP: `Screen::damage_meets` tests a superset of the spans this
+/// function copies, so a skip can never let one of them reach the arrow, and the first thing that
+/// would refute that argument is this counter going non-zero.
 #[cfg(feature = "witness")]
 static C6_DESKTOP_OVER: AtomicU64 = AtomicU64::new(0);
+
+/// FLICKER-3 — desktop presents that reached the flush gate at all, and the subset that SKIPPED the
+/// bracket because this present's damage provably could not touch the live sprite.
+///
+/// ### Why there are two counters and not one
+/// A bare `flush_skip=` cannot falsify anything, and this counter pair exists because `[cursor12]`
+/// already taught the project that lesson at the cost of three sittings. `flush_skip=0` is what a
+/// HEALTHY gate reads when it has simply not run yet (no flush since boot), and it is also what a
+/// gate reads that is wired up but structurally never able to skip — the two are indistinguishable
+/// from the skip count alone. `flush_gate=` is the denominator that separates them:
+///
+/// * `flush_gate=0` — no desktop present has happened in this window. **No verdict**; the
+///   instrument is unarmed, exactly as `[cursor12] passes=0` is unarmed.
+/// * `flush_gate>0, flush_skip=0` — the gate ran and never once found a present whose damage
+///   missed the arrow. That is a real reading, and on x86 it is the expected one under the
+///   full-screen `vug` presenter, which erases the pointer's previous footprint into the BACK
+///   buffer every frame (`vug.rs`, the VUG-FPS dirty-rect phase) and so damages the sprite's own
+///   box at frame rate by construction.
+/// * `flush_skip` climbing with `flush_gate` — the bracket is being paid only when it buys
+///   something, which is the whole of this fix.
+///
+/// The falsifier is already on the same line and needs no new term: a skip that should NOT have been
+/// taken means the desktop blitted over a live arrow, and that is precisely what
+/// [`note_desktop_over_sprite`] counts. `flush_skip>0` with `desktop_over=0` is the gate working;
+/// `desktop_over>0` is the gate wrong, and the `UNBRACKETED` verdict already says so.
+#[cfg(feature = "witness")]
+static C6_FLUSH_GATE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static C6_FLUSH_SKIP: AtomicU64 = AtomicU64::new(0);
 
 /// CURSOR-6 — a [`compose_into`] that declined because the session no longer described THIS plan.
 /// CURSOR-4 left this exit silent, so it was the one decline class absent from `offers - taken`.
@@ -1038,6 +1073,18 @@ pub(super) fn note_desktop_over_sprite() {
     C6_DESKTOP_OVER.fetch_add(1, Ordering::Relaxed);
 }
 
+/// FLICKER-3 — record one pass through `Screen::flush`'s bracket gate, and whether it skipped.
+///
+/// Called once per flush, AFTER the present, from `Screen::flush` and nowhere else — outside every
+/// lock this module owns, so it is a pair of relaxed adds on a path that has just done a blit.
+#[cfg(feature = "witness")]
+pub(super) fn note_flush_gate(skipped: bool) {
+    C6_FLUSH_GATE.fetch_add(1, Ordering::Relaxed);
+    if skipped {
+        C6_FLUSH_SKIP.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// CURSOR-6 — the arc's rollup, printed by `wm` immediately after `[cursor5]`'s.
 ///
 /// Each line item answers a question `[cursor5]`'s `COHERENT` could not, which is the whole point of
@@ -1087,6 +1134,10 @@ pub fn cursor6_rollup(scope: &str, planned: u64) {
     let mismatch = C6_MISMATCH.load(Ordering::Relaxed);
     let lost = C6_UNCOVER_LOST.load(Ordering::Relaxed);
     let repaired = C7_REPAIRED.load(Ordering::Relaxed);
+    // FLICKER-3 — the gate's own reading, appended to this line rather than given one of its own:
+    // `desktop_over` is its falsifier and the two have to be read together or not at all.
+    let fskip = C6_FLUSH_SKIP.load(Ordering::Relaxed);
+    let fgate = C6_FLUSH_GATE.load(Ordering::Relaxed);
     // `desktop_over` first: of the three it is the one that would mean a BROKEN bracket rather than
     // a missing one, so a reader who sees it should look there before anything else. It is a
     // VERDICT term and no longer a gate FORBID — see the spec comment: this counter is
@@ -1115,8 +1166,8 @@ pub fn cursor6_rollup(scope: &str, planned: u64) {
         "INTACT"
     };
     serial_println!(
-        "[cursor6] rollup scope={} present_over={} masked={} repaired={} desktop_over={} mismatch={} uncover_lost={}/{} -> {}",
-        scope, over, masked, repaired, desktop, mismatch, lost, planned, verdict
+        "[cursor6] rollup scope={} present_over={} masked={} repaired={} desktop_over={} mismatch={} uncover_lost={}/{} flush_skip={}/{} -> {}",
+        scope, over, masked, repaired, desktop, mismatch, lost, planned, fskip, fgate, verdict
     );
 }
 

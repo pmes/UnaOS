@@ -5176,3 +5176,269 @@ Three of the four changes are in shared files and the pi seat should lift them:
 
 `pal::TargetPal::render` (change 1) is x86-only in effect: the bracket it removes was
 `cfg(target_arch = "x86_64")`, so aarch64 is byte-inert there.
+
+---
+
+## FLICKER-3 (x86 lift) — the flush bracket is damage-gated, and what `[cursor12] passes=0` means
+
+GR9, x86 seat. Two questions, one path. The Pi seat (FLICKER-3) found the flush bracket being paid
+at present cadence unconditionally and fixed it with damage-overlap gating; this is that lift, plus
+the run-down of why x86's admissible `[cursor12]` blocks read `passes=0` where the Pi's read
+`planned`/`offers`/`taken` > 0.
+
+### 1. Does our path match the Pi's?
+
+**In shape, yes; in the gating predicate, no — and the difference is forced by our code, not chosen.**
+
+`Screen::flush` is arch-neutral (`pal::TargetPal::render` is `self.surface.flush()` on both targets
+since CURSOR-14), and before this arc its body was:
+
+```rust
+cursor::undraw();                 // bracket OPEN — unconditional
+let intruded = self.present_background();
+cursor::repaint();                // bracket CLOSED — unconditional
+if intruded { wm::repaint() } else { wm::service_damage() }
+```
+
+CURSOR-13 narrowed that bracket's **span** to the desktop blit. It never touched its **rate**. Every
+flush paid a full `restore → save → draw` over the sprite's box in the FRONT buffer, whether or not
+the present had a damaged pixel anywhere near the arrow — at 75 fps that is 75 intervals a second in
+which the arrow is genuinely off the panel. Same mechanism the Pi seat diagnosed.
+
+The relayed predicate — *"only erase where the new damage overlaps the previously flushed region"* —
+does not have a referent in our tree: `Screen` keeps no record of the region a previous flush
+covered, and the thing the bracket protects is not the previous flush's region but **the sprite's
+current panel box**. So the gate is stated against that instead:
+
+> Take the bracket only when this present's damage set meets `cursor::sprite_box()`.
+
+That is the bracket's own justification read as a predicate. `undraw` exists so a pixel this present
+is about to overwrite is handed back before the overwrite; a present whose damage misses the sprite
+cannot overwrite one sprite pixel and owes the sprite nothing.
+
+### 2. Why the skip is safe
+
+* **The test is a superset of what is copied.** `Screen::damage_meets` runs against the RAW damage
+  rects, before WC-I's window subtraction narrows them, and treats a pending `FULL_PRESENT` as an
+  unconditional meet (that flag is `swap`-consumed inside `present_background` and turns the damage
+  into the whole panel; the gate `load`s it and does not consume it). "No overlap" here therefore
+  implies "no copied span touched the arrow" there. There is no false skip; there are only
+  occasional false brackets, which cost exactly what today costs.
+* **The box is exact, not advisory.** `cursor::sprite_box()` takes `SPRITE`; `live_box_relaxed()`
+  reads `None` for the instant a concurrent draw is republishing, which would be a false *skip*.
+  One lock acquisition replaces two that did hundreds of pixel reads and writes between them, so
+  the gate is cheaper than the bracket even on the frames where it decides to bracket.
+* **The arrow still ends on glass.** The skip path takes WC-I's idempotent `ensure_drawn()` — one
+  lock and a boolean when the sprite is up, a real draw when something else (`wm::erase`, an
+  auto-hide that has since ended) took it down. The invariant `pal::TargetPal::render`'s doc rests
+  on is unchanged; only the verb is. (That doc still says "repaint" — a one-word nit in `pal.rs`,
+  outside this arc's lane, flagged rather than edited.)
+* **The falsifier already existed.** `[cursor6] desktop_over=` is computed from the *surviving*
+  spans and the live box inside `present_background`, i.e. from the other side of the decision. A
+  skip that should not have been taken shows up there as `UNBRACKETED`. Expected 0, as before.
+
+### 3. The witness, and why it has a denominator
+
+```
+[cursor6] rollup scope=… present_over=… masked=… repaired=… desktop_over=… mismatch=… uncover_lost=…/… flush_skip=N/M -> …
+```
+
+`flush_skip=` is appended; no existing field is re-spelled, so captures stay comparable.
+
+**`M` (`flush_gate`) is not decoration.** A bare skip count cannot falsify anything, for the reason
+`[cursor12]` already cost this project three sittings: `flush_skip=0` is what a HEALTHY gate reads
+when it has simply not run yet, and it is also what a gate reads that is wired up but structurally
+unable to skip. Stated as the law requires:
+
+| reading | meaning |
+| --- | --- |
+| `flush_skip=0/0` | **no verdict.** No desktop present has happened. Instrument unarmed. |
+| `flush_skip=0/M`, `M>0` | The gate ran `M` times and never found a present that missed the arrow. A real reading — see §5. |
+| `flush_skip=N/M`, `N>0`, `desktop_over=0` | The gate is working: `N` brackets not paid, and nothing reached the arrow. |
+| `flush_skip=N/M`, `desktop_over>0` | The gate is WRONG. `UNBRACKETED` already says so. |
+
+### 4. `[cursor12] passes=0` — the offer sites are not bypassed; they are not reached
+
+Every offer choke point in the tree lives inside `wm::composite_inner`: the `CUR12_PASSES` bump, the
+`sprite_plan()` acquisition, `overlay_open`/`defer_within` (`CUR3_PLANNED`), and
+`stage_window → compose_into → note_cursor_overlay` (`CUR3_OFFERS`/`TAKEN`). There is no offer site
+outside it. So `passes=0` is not "the offers were declined" and not "the wiring is missing" — it is
+**`wm::composite()` did not run at all in that window**.
+
+`composite()` has exactly nine call sites, and they are all window-layer events: `create_inner`,
+`create_at`, `present_banded` (both present verbs), `move_to`, `close`, `close_owner`,
+`focus_changed`, `repaint`, and `service_damage`. The last is the only one the desktop's flush can
+reach, and it is guarded:
+
+```rust
+pub fn service_damage() {
+    if DEFER_N.load(Relaxed) == 0 {
+        let t = TABLE.lock();
+        if !t.rows.iter().any(|r| r.used && r.damaged) { return; }   // <- the exit
+    }
+    composite();
+}
+```
+
+**On x86 the 75 fps presenter is the in-kernel full-screen `vug` loop** (`vug.rs`, `pal.render()`
+once per frame → `Screen::flush`), and it owns the panel with **no compositor window on it at all**.
+No row is used, so no row is damaged, `DEFER_N` is 0, `service_damage` takes the exit, and
+`composite()` never runs. `passes=0`, every window, at any frame rate.
+
+That is **correct by design, not a bypass.** Compose-through paints the arrow into a *staged
+window's back layer*; a raw desktop blit is not a staged surface and has no session, no coverage to
+install and nothing for `adopt_overlay` to settle against — CURSOR-13 says exactly this where it
+argues why `present_background` keeps its bracket. With no window layer the mechanism has no
+subject. **`passes=0` therefore reads: "the offer mechanism had nothing to be offered to."** It is
+not evidence about the mechanism's health in either direction.
+
+The Pi's blocks read `planned`/`offers`/`taken` > 0 because the Pi bench sitting is EL0 vug windows
+presenting through `SYS_WIN_PRESENT → wm::present → composite()` — a windowed workload. The two
+seats are measuring two different scenes, not two different kernels.
+
+**This closes a cross-seat divergence both seats have carried as a mystery for two rounds, so state
+it in the form that survives being quoted:**
+
+| `passes=0` licenses you to conclude | `passes=0` does NOT license you to conclude |
+| --- | --- |
+| No composite pass ran in this window. | Anything about compose-through's health, in either direction. |
+| The scene had no window layer (or no window damage) for the whole window. | That offers were made and declined — no offer site was reached. |
+| Every other term in the block is trivially 0 and carries no information. | That the CURSOR-13/14 wiring is missing, bypassed, or regressed. |
+| The x86 and Pi captures are of DIFFERENT SCENES. | That the two seats are running different kernels, or that one seat's fix "did not land". |
+
+The only reading that is evidence about the mechanism is a `adm=window` block **with a window layer
+on the panel** — i.e. `passes > 0`. Anything else is a measurement of the scene.
+
+**The admissibility predicate is now stated on the line itself** rather than only in this document:
+`[cursor12]` gains an `adm=` field — `empty` (`passes == 0`, no pass ran, no verdict), `baseline`
+(`passes >= cum`, the whole-boot rollup, no verdict), `window` (`passes < cum`, a real sample). A
+reader no longer has to do the subtraction to know whether the block can carry a verdict.
+
+### 5. The consequence for the x86 flicker, and the one thing outside this lane
+
+With `vug` full-screen there is no compose-through to engage, so **FLICKER-3's gate is the whole of
+the available fix on this path** — and on this path it is currently expected to read
+`flush_skip=0/M`. `vug`'s VUG-FPS dirty-rect phase erases the pointer's *previous footprint* into
+the back buffer every frame:
+
+```rust
+// vug.rs, the per-frame erase
+if let Some((qx, qy, qw, qh)) = prev_cursor { pal.draw_rect(qx, qy, qw, qh, BG); }
+```
+
+so the damage set contains the sprite's own box at frame rate, by construction, and the gate
+correctly refuses to skip: the back buffer really does hold `BG` under the arrow and that `BG`
+really is about to be blitted forward.
+
+That erase is a pre-`SPRITE_OWNS_PAINT` leftover. On x86 the sprite lives in the FRONT buffer and
+`pal::cursor::draw` delegates to `cursor::ensure_drawn()`, so painting `BG` over the cursor
+footprint in the BACK buffer restores nothing and accomplishes only one thing: it forces the desktop
+present to blit background over the arrow's panel box every frame, which is the unconditional erase
+this arc is trying to remove, reintroduced by the presenter itself.
+
+This was flagged out of lane and then authorized; it is FLICKER-4 below.
+
+### Gate results (FLICKER-3 x86 lift, 2026-07-30)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
+* `UNAOS_WITNESS=1 ./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
+* `strings target/x86_64-unaos/release/unaos-kernel` on a `--features witness` build — ` flush_skip=`
+  and `adm=` both present in the artifact, so the new witness text is not an `arroyo`-only knob.
+* No QEMU target run: forbidden this round on cost grounds. Metal is the verdict.
+
+---
+
+## FLICKER-4 — the presenter was manufacturing the overlap that forced the bracket
+
+FLICKER-3 gated the flush bracket and then predicted it would read `flush_skip=0/M` on the vug path
+anyway, because `vug`'s VUG-FPS dirty-rect phase erases the pointer's previous footprint into the
+BACK buffer every frame. This is that erase, gated.
+
+### The premise, checked before the change
+
+**On the front-buffer sprite path the erase is dead restoration.** `pal::cursor::draw` under
+`SPRITE_OWNS_PAINT` invalidates the (unused) back-buffer stash and delegates to
+`video::cursor::ensure_drawn()`; it never calls `paint()`, so **no cursor pixel is ever written into
+vug's back buffer on x86**. `pal.rs`'s own CURSOR-X86 note says as much in advance — the full-screen
+loops "simply stop putting pixels in the back buffer" — which was made true of the PAINT and never
+made true of the ERASE.
+
+Nothing else consumes it. `prev_cursor` has exactly two uses in the file: this erase and its own
+assignment. The trail it exists to clean is cleaned elsewhere on this path: when the pointer moves,
+`video::cursor::repaint` restores the vacated FRONT-buffer pixels from the sprite's save-under, and
+`pal::cursor::restore`'s `SPRITE_OWNS_PAINT` arm delegates to `video::cursor::undraw` for the same
+reason. Removing the back-buffer fill therefore cannot strand a footprint here.
+
+And the fill is not free. `draw_rect` marks damage, so every frame handed `Screen::flush` a damage
+rect covering the sprite's own panel box; the present blitted background forward over a live arrow,
+and FLICKER-3's gate *correctly* refused to skip, because the damage genuinely did meet the sprite.
+**The presenter was manufacturing the very overlap that forces the bracket, 75 times a second.**
+
+### The polarity, which is the part that matters
+
+`vug.rs` is shared with the Pi seat and **their cursor model is genuinely different**: their
+`pal::cursor::draw` paints the sprite into the BACK buffer as merged runs every frame, so
+erase → redraw is the correct software-cursor cycle there and skipping it strands the previous
+footprint on screen. The erase is dead on one path and load-bearing on the other.
+
+So the gate is written as a property, in erase-positive polarity, with the safe direction as the
+default — `pal::cursor::BACKBUF_SPRITE_NEEDS_ERASE`:
+
+```rust
+if crate::pal::cursor::BACKBUF_SPRITE_NEEDS_ERASE {
+    if let Some((qx, qy, qw, qh)) = prev_cursor { pal.draw_rect(qx, qy, qw, qh, BG); }
+}
+```
+
+* Named for the **paint model** (is the arrow in the back buffer?), not for an arch.
+* The erase is the branch guarded **IN**, never out.
+* `true` = erase = the back-buffer sprite model = the default.
+* **In a tree that has no `SPRITE_OWNS_PAINT` symbol, this constant does not exist and the call site
+  FAILS TO COMPILE.** That is deliberate and is the answer to the convergence question: there is no
+  `unwrap_or`, no `cfg!(feature = …)` that reads `false` when the feature is absent, and no arch
+  test at the call site — the three shapes that would turn a missing symbol into a stranded pointer
+  footprint. **A tree without the front-buffer sprite wants `BACKBUF_SPRITE_NEEDS_ERASE = true`.**
+
+### Proof the two paths went where they were supposed to
+
+Measured by building each target twice — once with the gate, once with the line textually reverted
+to its pre-FLICKER-4 form — and comparing the `.text` section, which is codegen only (whole-ELF
+hashes differ either way because a source edit moves the line tables):
+
+| target | `.text` sha256, gated | `.text` sha256, unguarded | size |
+| --- | --- | --- | --- |
+| aarch64 | `3f4f21d7a9cc…` | `3f4f21d7a9cc…` | **identical** |
+| x86_64 (witness) | `d71bae8ed490…` | `e261e8735ca4…` | 712 687 vs 713 103 B |
+
+**aarch64 is byte-identical**, so the Pi path is provably untouched. x86 differs and is 416 bytes
+smaller: the erase folded out, so the gate is live rather than trivially true.
+
+### What `flush_skip=` should read now — stated so the bench can read it without us
+
+`[cursor6]`'s terms are cumulative from boot, so read the CHANGE between two successive blocks, not
+the absolute ratio (a boot's worth of console flushes sits in `M` before vug ever starts).
+
+Before FLICKER-4 the prediction was `flush_skip` flat at 0 while `M` climbed at ~75/s. After it, on
+the vug path, the damage set per frame is the crystal's previous and current boxes plus the HUD and
+corner-meter blocks — and **none of those is a function of where the pointer is**. So:
+
+* **Pointer parked over empty backdrop** — no rect meets the sprite. `flush_skip` should climb at
+  **very nearly the full flush rate**: between two blocks, ΔN ≈ ΔM. This is the reading that proves
+  FLICKER-4 landed, and it is the one to take first because it is the least ambiguous.
+* **Pointer held over the tumbling crystal, the HUD, or a corner meter** — the damage genuinely does
+  meet the sprite, the bracket is genuinely required, and ΔN falls toward 0. **That is the gate
+  working, not failing**, and an operator who only ever parks the pointer on the crystal will see
+  `flush_skip` near 0 for a correct reason. Read the two placements against each other.
+* **`desktop_over` must stay 0 throughout, in both placements.** A skip taken wrongly shows up
+  there, and the `UNBRACKETED` verdict already says so.
+
+ΔN ≈ 0 with the pointer on bare backdrop is the refutation, and it would mean something else in the
+frame is still damaging the sprite's box — the next thing to instrument would be which rect.
+
+### Gate results (FLICKER-4, 2026-07-30)
+
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**; `UNAOS_WITNESS=1 ./arroyo check` — same.
+  No new warnings (`vug.rs`'s `own_load` warning is pre-existing and in the other loop).
+* `.text` comparison above: aarch64 identical, x86 changed.
+* `strings` of the `--features witness` x86 kernel still carries ` flush_skip=` and ` adm=`.
+* No QEMU target run: forbidden this round on cost grounds. Metal is the verdict.

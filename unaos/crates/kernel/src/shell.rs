@@ -158,6 +158,12 @@ fn fat_errno(e: FatError) -> &'static str {
         FatError::Unsupported => "-EINVAL", // not a representable 8.3 name
         FatError::NoDisk | FatError::NotFat => "-ENODEV",
         FatError::Io | FatError::BadChain => "-EIO",
+        // PARTITION (GR9): an access that fell outside the mounted volume's own partition extent.
+        // Reported as `-EFAULT` rather than folded into `-EIO`, because it is categorically not a
+        // medium fault: the disk was never asked. It means the filesystem computed an address that
+        // is not its to touch, and the extent gate refused it before it reached the block layer. On
+        // a healthy volume this string never appears.
+        FatError::OutOfVolume => "-EFAULT",
     }
 }
 

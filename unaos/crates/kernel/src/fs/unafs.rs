@@ -198,9 +198,93 @@ pub fn locate() -> Result<PartitionSpan, MountError> {
 pub fn mount() -> Result<KernelUnaFS, MountError> {
     install_warn_hook();
     let span = locate()?;
+    partition_witness(&span);
     let dev = SdSectorDevice::open()?;
     let adapter = BlockAdapter::for_partition(dev, &span);
     UnaFS::mount(adapter).map_err(MountError::Fs)
+}
+
+/// PARTITION (GR9): cross-check the located UnaFS span against the kernel block layer's own MBR
+/// decode, once per boot.
+///
+/// There are TWO independent partition-table readers in this tree: the unafs crate's
+/// `parse_partitions` (which `locate_unafs` uses to find this volume by superblock magic) and the
+/// kernel block layer's [`block::decode_mbr`] (which the FAT mount uses to bind the ESP). They were
+/// written at different times against the same spec, so "they agree on this medium" is a real,
+/// falsifiable claim about the disk in the machine — and the one that matters, because if they
+/// disagreed the ESP and the native volume could be bound to overlapping extents. This is the check
+/// that makes the layout of record (p1 ESP, p2 UnaFS) an observed fact rather than an assumption.
+///
+/// Strictly read-only and strictly advisory: every outcome is a printed line, never an error. It
+/// cannot change what gets mounted, so a wrong witness can mislead a reader but can never corrupt a
+/// volume. The magic re-read goes through a [`block::PartitionRange`], i.e. through the bounded,
+/// partition-RELATIVE addressing path — so a PASS also proves that path maps sector 0 of the
+/// partition to the same bytes the crate's adapter reached by its own arithmetic.
+///
+/// INSTRUMENT NOTE (healthy-but-idle): the latch reads false until the first UnaFS mount of the boot
+/// and true forever after; it gates printing only. On the layout of record the line reads
+/// `slot=2 ... magic=ok fits=yes`, from the very first mount, and nothing about an idle system can
+/// change any field on it — every value is a property of the medium, read at a moment when the
+/// volume has just been located and is therefore defined.
+fn partition_witness(span: &PartitionSpan) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Some(dev) = block::info() else {
+        serial_println!(":: PART: unafs span check — no block device ::");
+        return;
+    };
+    let mut sec = [0u8; 512];
+    if block::read_block(0, &mut sec).is_err() {
+        serial_println!(":: PART: unafs span check — LBA 0 unreadable ::");
+        return;
+    }
+    // The census may already have printed for this handle (the FAT mount runs first on most boots);
+    // calling it again is harmless and guarantees the raw bytes are in the log even on a boot where
+    // no FAT volume was ever mounted.
+    let Some(table) = block::mbr_census(block::BlockHandle::Global, &sec, dev.num_blocks) else {
+        serial_println!(
+            ":: PART: unafs span check — no MBR at LBA 0; unafs span base={} blocks={} ::",
+            span.base_lba, span.block_count
+        );
+        return;
+    };
+
+    // Which accepted primary contains the located span's base sector?
+    let Some(p) = table.iter().find(|p| p.start_lba == span.base_lba) else {
+        serial_println!(
+            ":: PART: unafs span check — base LBA {} is NOT the start of any accepted MBR partition (blocks={}) ::",
+            span.base_lba, span.block_count
+        );
+        return;
+    };
+
+    // Does the mounted volume fit inside that partition? `block_count` is 4096 B blocks; the
+    // partition is counted in 512 B sectors, so eight sectors per block. Checked, not assumed.
+    let fits = span
+        .block_count
+        .checked_mul(8)
+        .map(|s| s <= p.sector_count)
+        .unwrap_or(false);
+
+    // Re-read the superblock magic through the BOUNDED, partition-relative path.
+    let range = block::PartitionRange::new(block::BlockHandle::Global, &p);
+    let mut b0 = [0u8; 512];
+    let magic_ok = range.read_block(0, &mut b0).is_ok()
+        && b0[..::unafs::superblock::MAGIC.len()] == ::unafs::superblock::MAGIC;
+
+    serial_println!(
+        ":: PART: unafs span check — slot={} type=0x{:02x} part=[{}..{}) span_base={} span_blocks={} fits={} magic={} ::",
+        p.slot,
+        p.type_byte,
+        p.start_lba,
+        p.end_lba(),
+        span.base_lba,
+        span.block_count,
+        if fits { "yes" } else { "NO" },
+        if magic_ok { "ok" } else { "MISSING" }
+    );
 }
 
 /// The single, process-wide UnaFS mount — the K4 coherence keystone.

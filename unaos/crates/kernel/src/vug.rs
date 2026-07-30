@@ -839,8 +839,43 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
             }
             // Erase the cursor's previous footprint BEFORE redraw (so the crystal/HUD painted below
             // can cover it) — the dirty-rect path no longer wipes the whole panel each frame.
-            if let Some((qx, qy, qw, qh)) = prev_cursor {
-                pal.draw_rect(qx, qy, qw, qh, BG);
+            //
+            // FLICKER-4 — ONLY UNDER THE BACK-BUFFER SPRITE MODEL, AND THAT IS THE DEFAULT.
+            //
+            // **This file is shared between the x86 and Pi seats and their cursor models genuinely
+            // differ, so the polarity here is load-bearing. Read `BACKBUF_SPRITE_NEEDS_ERASE`
+            // before touching this.**
+            //
+            // Under the BACK-BUFFER model (aarch64, the Pi's in-kernel loop) `pal::cursor::draw`
+            // calls `paint`, which writes the arrow's merged runs into this back buffer. Those
+            // pixels are part of the frame, this loop owns the trail, and erase → redraw is the
+            // correct software-cursor cycle. Skipping it strands the previous footprint on screen
+            // for as long as the pointer keeps moving. **That path is unchanged: the constant is
+            // `true` there, the branch is taken unconditionally, and the codegen is identical to
+            // what was here before.**
+            //
+            // Under the FRONT-BUFFER model (x86) the arrow belongs to `video::cursor`:
+            // `pal::cursor::draw` below delegates to `ensure_drawn` and puts no pixels here at all,
+            // and the trail is cleaned by the sprite module's own save-under the instant the
+            // pointer report lands. CURSOR-X86's note on `SPRITE_OWNS_PAINT` says these loops
+            // "simply stop putting pixels in the back buffer" — true of the PAINT, and never made
+            // true of this ERASE. So the fill restores pixels that were never written.
+            //
+            // It is not merely wasted there, it is the x86 flicker. `draw_rect` marks damage, so
+            // every frame handed `Screen::flush` a damage rect covering the sprite's own panel box;
+            // the present then blitted background forward over a live arrow, and FLICKER-3's
+            // bracket gate correctly refused to skip because the damage genuinely did meet the
+            // sprite. The presenter was manufacturing the very overlap that forces the bracket, 75
+            // times a second. Removing it is what lets `[cursor6] flush_skip=` rise off 0 here.
+            //
+            // The condition guards the erase IN, never out, and the constant does not exist in a
+            // tree without the front-buffer sprite — such a tree fails to compile on this line
+            // rather than silently skipping the erase. `prev_cursor` is still recorded under both
+            // models so the two can never drift.
+            if crate::pal::cursor::BACKBUF_SPRITE_NEEDS_ERASE {
+                if let Some((qx, qy, qw, qh)) = prev_cursor {
+                    pal.draw_rect(qx, qy, qw, qh, BG);
+                }
             }
             // Background behind the crystal's current position (the triangles paint over it).
             if cur_crystal.2 > 0 && cur_crystal.3 > 0 {

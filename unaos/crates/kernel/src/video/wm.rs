@@ -2640,6 +2640,24 @@ static CUR12_EXCL_PROBE: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 static CUR12_EXCL_UNVERIFIED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// CURSOR-12 — total composite passes, the denominator every term above is read against.
+///
+/// ### FLICKER-3 — `passes == 0` is a statement about the SCENE, not about the mechanism
+///
+/// Every offer choke point in the kernel is inside [`composite_inner`]: this counter, the
+/// `sprite_plan()` acquisition, `overlay_open`/`defer_within` (`CUR3_PLANNED`) and
+/// `stage_window` → `compose_into` → [`note_cursor_overlay`] (`CUR3_OFFERS`/`CUR3_TAKEN`). There is
+/// no offer site outside it, so a window with `passes == 0` is a window in which [`composite`] was
+/// never called — not one in which offers were declined.
+///
+/// All nine callers of [`composite`] are window-layer events (`create_inner`, `create_at`,
+/// `present_banded`, `move_to`, `close`, `close_owner`, `focus_changed`, [`repaint`],
+/// [`service_damage`]). The desktop's flush can only reach the last, and that one returns without
+/// compositing when no row is damaged and no erase is deferred. So a full-screen presenter that owns
+/// the panel with NO compositor window on it — x86's in-kernel `vug` loop, `pal.render()` per frame
+/// at 75 fps — produces `passes == 0` at any frame rate, on a perfectly healthy kernel. Compose-through
+/// paints into a staged window's back layer; with no window layer it has no subject. `adm=empty` on
+/// the rollup line names that state so a capture cannot be read as a defect, which is the reading
+/// this counter's cumulative predecessor drew three times across two seats.
 #[cfg(feature = "witness")]
 static CUR12_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -2737,9 +2755,35 @@ fn cursor12_rollup(scope: &str) {
     } else {
         "mixed"
     };
+    // FLICKER-3 — THE ADMISSIBILITY PREDICATE, ON THE LINE ITSELF.
+    //
+    // CURSOR-14 made every term a delta and put `cum=` beside it, and then left the rule that makes
+    // the pair legible — "a block whose `passes == cum` is the whole-boot baseline and carries no
+    // verdict" — in `engine.md`, where a bench capture cannot reach it. That is the same shape of
+    // mistake as the one CURSOR-14 was fixing: the number is correct and the reader has no way to
+    // know which numbers are allowed to mean anything. So the block states its own admissibility:
+    //
+    // * `empty`    — `passes == 0`. NO COMPOSITE PASS RAN in this window, so every other term is
+    //   trivially 0 and none of them is evidence. On x86 this is the ordinary reading under the
+    //   full-screen `vug` presenter, which owns the panel with no compositor window on it:
+    //   `Screen::flush` reaches `wm::service_damage`, that function finds no damaged row and
+    //   returns, and `composite()` — which is where EVERY offer choke point lives — is never
+    //   entered. It says the offer mechanism had nothing to be offered to; it says nothing at all
+    //   about whether the mechanism works.
+    // * `baseline` — `passes >= cum`, i.e. this is the first block of the boot and its window is the
+    //   whole boot. The pre-pointer era is inside it by construction. No verdict.
+    // * `window`   — `passes < cum`. A real sample, and the only value under which `-> why` below
+    //   may be cited as evidence for or against anything.
+    let adm = if passes == 0 {
+        "empty"
+    } else if passes >= cum {
+        "baseline"
+    } else {
+        "window"
+    };
     serial_println!(
-        "[cursor12] offer scope={} passes={} nosprite={} nohit={} reserved={} nosession={} planned={} excl_probe={} excl_unverified={} cum={} -> {}",
-        scope, passes, nosprite, nohit, reserved, nosession, planned, probe, unver, cum, why
+        "[cursor12] offer scope={} passes={} nosprite={} nohit={} reserved={} nosession={} planned={} excl_probe={} excl_unverified={} cum={} adm={} -> {}",
+        scope, passes, nosprite, nohit, reserved, nosession, planned, probe, unver, cum, adm, why
     );
 }
 

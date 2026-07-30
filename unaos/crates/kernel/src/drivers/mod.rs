@@ -14,9 +14,11 @@ pub mod ehci;
 pub mod smc;
 pub mod block;
 pub mod e1000;
-// SDHC-1 (milestone 1): read-only SD Host Controller discovery on x86 — the 2012 rMBP's built-in
-// card reader. Version/capability/present-state reads only; issues no MMIO write at all, so it is
-// unconditional on this arch (there is no state it can perturb).
+// SDHC (milestone 2): the SD Host Controller driver on x86 — the 2012 rMBP's built-in PCIe card
+// reader, which reaches a card WITHOUT xHCI and without USB Bulk-Only Transport. Milestone 1's
+// read-only discovery witness still runs first and unchanged; milestone 2 then claims the function,
+// resets the controller, programs bus power and the SD clock, and identifies the card. PIO only —
+// no DMA, so the function's Bus Master bit is left as the firmware set it.
 #[cfg(target_arch = "x86_64")]
 pub mod sdhc;
 // M6g: the BCM2711 EMMC2/SDHCI microSD driver backing the block layer on the bare-metal Pi 4.
