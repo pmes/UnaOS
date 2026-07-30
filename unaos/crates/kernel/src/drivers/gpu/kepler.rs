@@ -94,11 +94,7 @@ pub mod ucode {
     pub const PHASE_A_PREACK: u8 = 0x03;
     pub const PHASE_A_POSTACK: u8 = 0x04;
     pub const PHASE_A_BOUND: u8 = 0xBD;
-    pub const PHASE_B_PRELOOP: u8 = 0x11;
-    pub const PHASE_B_POSTREAD: u8 = 0x12;
-    pub const PHASE_B_PREACK: u8 = 0x13;
-    pub const PHASE_B_POSTACK: u8 = 0x14;
-    pub const PHASE_B_BOUND: u8 = 0xBE;
+    
 
     /// Image A — indexed IO ports (s37-proven prologue), **down-counting**
     /// bound via `sub b32 $r5, 0x1`.
@@ -181,72 +177,7 @@ pub mod ucode {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
-    /// Image B — the A/B fallback on the one **new** encoding this pull needs.
-    ///
-    /// A and B are byte-identical except for the counter arithmetic: the
-    /// `sub`/`add` subopcode in the `0xb0` (b32, register + I8 immediate) form
-    /// is the only instruction here that metal has not already run. `cmpu` is
-    /// metal-proven at subop 4 (s37, `b0 44 01`), which fixes the subop table
-    /// as `0=add, 1=adc, 2=sub, 3=sbb, 4=cmpu`. A takes `sub` (subop 2) and
-    /// counts DOWN from `+ECHO_BOUND`; B takes `add` (subop 0, the least
-    /// disputable entry of any ALU table) and counts UP from `-ECHO_BOUND`
-    /// (`0xFFF0_0000`). Both exit the loop when `$r5 == 0`, both bound at
-    /// exactly `ECHO_BOUND` iterations. B also carries the 0x1x phase stamps so
-    /// MAILBOX1 names the winner without reference to the ack.
-    ///
-    /// Deltas from image A (same addresses — every substituted instruction is
-    /// the same length):
-    ///
-    /// ```text
-    /// // 0x22 | f1 53 f0 ff | sethi $r5, 0xfff0   | $r5 = -ECHO_BOUND
-    /// // 0x26 |          11 | mov   $r0, 0x11     | phase (pre-loop)
-    /// // 0x32 |          12 | mov   $r0, 0x12     | phase (post-read)
-    /// // 0x44 |          13 | mov   $r0, 0x13     | phase (pre-ack)
-    /// // 0x67 |          14 | mov   $r0, 0x14     | phase (post-ack)
-    /// // 0x56 | b0 50 01    | add b32 $r5, 0x1    | B's variable: subop 0
-    /// // 0x5f |          be | mov   $r0, 0xbe     | EXIT BY BOUND
-    /// ```
-    #[rustfmt::skip]
-    pub const ECHO_B_BYTES: [u8; 128] = [
-        0xf0, 0x17, 0x00,
-        0xf0, 0x13, 0x02,
-        0xf1, 0x27, 0x00, 0x01,
-        0xf0, 0x23, 0x02,
-        0xf0, 0x37, 0x01,
-        0xf1, 0x38, 0x00, 0x41,
-        0xf0, 0x38, 0x01,
-        0xf1, 0x67, 0x00, 0x10,
-        0xf1, 0x77, 0x00, 0x11,
-        0xf0, 0x57, 0x00,
-        0xf1, 0x53, 0xf0, 0xff,       // sethi $r5, 0xfff0  (= -ECHO_BOUND)
-        0xf0, 0x07, 0x11,             // mov   $r0, 0x11
-        0xd0, 0x70, 0x00,
-        0xcf, 0x14, 0x00,             // poll:
-        0xd0, 0x64, 0x00,
-        0xf0, 0x07, 0x12,             // mov   $r0, 0x12
-        0xd0, 0x70, 0x00,
-        0xb0, 0x44, 0x02,
-        0xf4, 0x2b, 0x2c,
-        0xb0, 0x44, 0x01,
-        0xf4, 0x1b, 0x15,
-        0xf0, 0x07, 0x13,             // mov   $r0, 0x13
-        0xd0, 0x70, 0x00,
-        0xcf, 0x84, 0x00,
-        0xd0, 0x24, 0x00,             // (ACK)
-        0xb0, 0x54, 0x00,
-        0xf4, 0x1b, 0xd9,
-        0xb0, 0x50, 0x01,             // dec: add b32 $r5, 0x1
-        0xb0, 0x54, 0x00,
-        0xf4, 0x1b, 0xd0,
-        0xf0, 0x07, 0xbe,             // mov   $r0, 0xbe
-        0xd0, 0x70, 0x00,
-        0xf8, 0x02,
-        0xf0, 0x07, 0x14,             // mov   $r0, 0x14
-        0xd0, 0x70, 0x00,
-        0xf8, 0x02,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ];
+    
 
     /// Pack a 128-byte Falcon instruction stream into the 32 little-endian
     /// `u32` words IMEMD expects.
@@ -265,7 +196,7 @@ pub mod ucode {
     }
 
     pub const UCODE_CTX_ECHO_A: [u32; 32] = pack128(&ECHO_A_BYTES);
-    pub const UCODE_CTX_ECHO_B: [u32; 32] = pack128(&ECHO_B_BYTES);
+    
 
     /// Reconstruct a `mov`(I8)+`sethi`(I8) port pair from the byte listing.
     const fn port_i8_sethi_i8(b: &[u8; 128], mov_at: usize, sethi_at: usize) -> u32 {
@@ -288,14 +219,7 @@ pub mod ucode {
     const _: () = assert!(port_i16(&ECHO_A_BYTES, 0x10) == 0x4100); // 0x409504 -> 0x14100
     const _: () = assert!(ECHO_A_BYTES[0x14 + 2] == 0x01); // sethi $r8, 0x01
     
-    const _: () = assert!(port_i8_sethi_i8(&ECHO_B_BYTES, 0x00, 0x03) == IO_CC_SCRATCH0);
-    const _: () = assert!(
-        (port_i16(&ECHO_B_BYTES, 0x06) | ((ECHO_B_BYTES[0x0c] as u32) << 16)) == IO_CC_SCRATCH1
-    );
-    const _: () = assert!(port_i16(&ECHO_B_BYTES, 0x17) == IO_MAILBOX0);
-    const _: () = assert!(port_i16(&ECHO_B_BYTES, 0x1b) == IO_MAILBOX1);
-    const _: () = assert!(port_i16(&ECHO_B_BYTES, 0x10) == 0x4100);
-    const _: () = assert!(ECHO_B_BYTES[0x14 + 2] == 0x01); // sethi $r8, 0x01
+    
 
     // The s37-acked prologue is preserved word-for-word (the four words that
     // executed on metal at sitting #37 must not have moved).
@@ -306,20 +230,9 @@ pub mod ucode {
 
     // The counter is initialised to exactly ECHO_BOUND (A) / -ECHO_BOUND (B).
     const _: () = assert!(((ECHO_A_BYTES[0x24] as u32) | ((ECHO_A_BYTES[0x25] as u32) << 8)) << 16 == ECHO_BOUND);
-    const _: () = assert!(((ECHO_B_BYTES[0x24] as u32) | ((ECHO_B_BYTES[0x25] as u32) << 8)) << 16 == ECHO_BOUND.wrapping_neg());
+    
 
-    // A and B differ only in the counter arithmetic, the counter seed and the
-    // phase magics — nothing else may drift between the pair.
-    const _: () = {
-        let mut i = 0;
-        while i < 128 {
-            let allowed = i == 0x24 || i == 0x25   // counter seed (sethi imm)
-                || i == 0x28 || i == 0x34 || i == 0x46 || i == 0x61 || i == 0x69 // phase magics
-                || i == 0x57; // sub(2) vs add(0) subopcode
-            assert!(allowed || ECHO_A_BYTES[i] == ECHO_B_BYTES[i]);
-            i += 1;
-        }
-    };
+    
 }
 
 /// s26/s28 FTDI-ring budget: the 0x640000 window is PARKED (triple-refuted),
@@ -485,27 +398,14 @@ pub fn init(gpu: &GpuInfo) {
         serial_println!("[NVIDIA] PGRAPH Engine Status (0x400000): 0x{:08X}. Requires firmware for full 2D/3D.", pgraph_status);
 
         // Recon Probe before any engine state modification
-        let recon_chan_cur = mmio_read(bar0, 0x409b00);
-        let recon_chan_next = mmio_read(bar0, 0x409b04);
-        let recon_engine_status = mmio_read(bar0, 0x409c00);
-        let recon_engine_trigger = mmio_read(bar0, 0x409c08);
-        let recon_wrcmd_data = mmio_read(bar0, 0x409500);
-        let recon_wrcmd_cmd = mmio_read(bar0, 0x409504);
-        
-        serial_println!(":: kepler: recon CHAN_CUR={:08X} CHAN_NEXT={:08X} ENGINE_STATUS={:08X} ENGINE_TRIGGER={:08X} WRCMD_DATA={:08X} WRCMD_CMD={:08X} ::",
-            recon_chan_cur, recon_chan_next, recon_engine_status, recon_engine_trigger, recon_wrcmd_data, recon_wrcmd_cmd);
-
-        // H2/H3 Engine Context Initialization
-        serial_println!(":: kepler: H2/H3 init start ::");
-        mmio_write(bar0, 0x409c00, 2);
-        let check_status = mmio_read(bar0, 0x409c00);
-        serial_println!(":: kepler: H2/H3 ENGINE_STATUS readback={:08X} ::", check_status);
-        
-        mmio_write(bar0, 0x409c08, 1);
-        let check_trigger = mmio_read(bar0, 0x409c08);
-        serial_println!(":: kepler: H2/H3 ENGINE_TRIGGER readback={:08X} ::", check_trigger);
-
-        // 8. Phase 4: 3D Foundation - PFIFO and Pushbuffer setup
+        let recon_chan_cur = fecs_read(bar0, 0x409b00);
+        let recon_chan_next = fecs_read(bar0, 0x409b04);
+        let recon_engine_status = fecs_read(bar0, 0x409c00);
+        let recon_engine_trigger = fecs_read(bar0, 0x409c08);
+        let recon_wrcmd_data = fecs_read(bar0, 0x409500);
+        serial_println!(":: kepler: recon CHAN_CUR={:08X} CHAN_NEXT={:08X} ENGINE_STATUS={:08X} ENGINE_TRIGGER={:08X} WRCMD_DATA={:08X} ::",
+            recon_chan_cur, recon_chan_next, recon_engine_status, recon_engine_trigger, recon_wrcmd_data);
+// 8. Phase 4: 3D Foundation - PFIFO and Pushbuffer setup
         if cfg!(feature = "nvidia-kepler-fifo") {
             serial_println!("[NVIDIA] Starting PFIFO initialization...");
             
@@ -522,7 +422,7 @@ pub fn init(gpu: &GpuInfo) {
             // Bind PBDMA 0 to Engine 0 (PGRAPH) by writing mask `1` to SUBFIFO_ENG_MASK[0]
             // According to gf100_pfifo.xml, SUBFIFO_ENG_MASK is at offset 0x390 relative to PFIFO (0x2000).
             let pfifo_base = 0x2000;
-            mmio_write(bar0, pfifo_base + 0x390, 1 << 0);
+            fecs_write(bar0, pfifo_base + 0x390, 1 << 0);
             serial_println!(":: kepler: pbdma-eng-mask set ::");
 
             let check = mmio_read(bar0, regs::NV_PMC_ENABLE);
@@ -679,9 +579,9 @@ pub fn init(gpu: &GpuInfo) {
                                     // M2: Disp-Era USERD Reconnaissance (Read-Only)
                                     let disp_base = 0x610000;
                                     let pdisplay_0 = mmio_read(bar0, disp_base);
-                                    let pdisplay_1 = mmio_read(bar0, disp_base + 0x40);
-                                    let evo_core = mmio_read(bar0, disp_base + 0x490);
-                                    let evo_userd_ptr = mmio_read(bar0, disp_base + 0x494);
+                                    let pdisplay_1 = fecs_read(bar0, disp_base + 0x40);
+                                    let evo_core = fecs_read(bar0, disp_base + 0x490);
+                                    let evo_userd_ptr = fecs_read(bar0, disp_base + 0x494);
                                     serial_println!(":: kepler: disp-userd-recon pdisplay_0={:08X} +40={:08X} evo_0x490={:08X} evo_0x494={:08X} ::", pdisplay_0, pdisplay_1, evo_core, evo_userd_ptr);
 
                                     // Milestone 2: PGRAPH Falcon Reconnaissance (Pull 18 + Pull 19)
@@ -715,47 +615,47 @@ pub fn init(gpu: &GpuInfo) {
                                                 let tag = if pass == 0 { "fal-base" } else { "fal-base2" };
 
                                                 for offset in (0..=0x1FC).step_by(4) {
-                                                    let val = mmio_read(bar0, base + offset);
+                                                    let val = fecs_read(bar0, base + offset);
                                                     let abs = if val == 0xFFFFFFFF || val == 0xBAD0BA20 || val == 0xBADF1000 { " ABSENT?" } else { "" };
                                                     serial_println!(":: kepler: {} b={:06X} off={:03X} val={:08X}{} ::", tag, base, offset, val, abs);
                                                 }
                                             } }
-                                            let cpuctl = mmio_read(bar0, base + 0x100);
-                                            let imemc = mmio_read(bar0, base + 0x180);
-                                            let dmemc = mmio_read(bar0, base + 0x1C0);
+                                            let cpuctl = fecs_read(bar0, base + 0x100);
+                                            let imemc = fecs_read(bar0, base + 0x180);
+                                            let dmemc = fecs_read(bar0, base + 0x1C0);
                                             serial_println!(":: kepler: fal-base b={:06X} verdict cpuctl={:08X} imemc={:08X} dmemc={:08X} ::", base, cpuctl, imemc, dmemc);
 
                                             // K-GPU-4 Pull 24: Falcon Sentinel Port Probe
-                                            mmio_write(bar0, base + 0x180, 1 << 24); // IMEMC offset=0, AINCW
-                                            let imemc_rb = mmio_read(bar0, base + 0x180);
+                                            fecs_write(bar0, base + 0x180, 1 << 24); // IMEMC offset=0, AINCW
+                                            let imemc_rb = fecs_read(bar0, base + 0x180);
                                             serial_println!(":: kepler: fal-port b={:06X} imemc wr=01000000 rb={:08X} ::", base, imemc_rb);
                                             
-                                            mmio_write(bar0, base + 0x184, 0xDEADBEEF);
-                                            mmio_write(bar0, base + 0x184, 0xCAFEF00D);
-                                            mmio_write(bar0, base + 0x184, 0x12345678);
-                                            mmio_write(bar0, base + 0x184, 0xA5A55A5A);
+                                            fecs_write(bar0, base + 0x184, 0xDEADBEEF);
+                                            fecs_write(bar0, base + 0x184, 0xCAFEF00D);
+                                            fecs_write(bar0, base + 0x184, 0x12345678);
+                                            fecs_write(bar0, base + 0x184, 0xA5A55A5A);
                                             
-                                            mmio_write(bar0, base + 0x180, 1 << 25); // reset offset, AINCR
-                                            let imem_w0 = mmio_read(bar0, base + 0x184);
-                                            let imem_w1 = mmio_read(bar0, base + 0x184);
-                                            let imem_w2 = mmio_read(bar0, base + 0x184);
-                                            let imem_w3 = mmio_read(bar0, base + 0x184);
+                                            fecs_write(bar0, base + 0x180, 1 << 25); // reset offset, AINCR
+                                            let imem_w0 = fecs_read(bar0, base + 0x184);
+                                            let imem_w1 = fecs_read(bar0, base + 0x184);
+                                            let imem_w2 = fecs_read(bar0, base + 0x184);
+                                            let imem_w3 = fecs_read(bar0, base + 0x184);
                                             serial_println!(":: kepler: fal-port b={:06X} imem rb w0={:08X} w1={:08X} w2={:08X} w3={:08X} ::", base, imem_w0, imem_w1, imem_w2, imem_w3);
                                             
-                                            mmio_write(bar0, base + 0x1C0, 1 << 24); // DMEMC offset=0, AINCW
-                                            let dmemc_rb = mmio_read(bar0, base + 0x1C0);
+                                            fecs_write(bar0, base + 0x1C0, 1 << 24); // DMEMC offset=0, AINCW
+                                            let dmemc_rb = fecs_read(bar0, base + 0x1C0);
                                             serial_println!(":: kepler: fal-port b={:06X} dmemc wr=01000000 rb={:08X} ::", base, dmemc_rb);
                                             
-                                            mmio_write(bar0, base + 0x1C4, 0xDEADBEEF);
-                                            mmio_write(bar0, base + 0x1C4, 0xCAFEF00D);
-                                            mmio_write(bar0, base + 0x1C4, 0x12345678);
-                                            mmio_write(bar0, base + 0x1C4, 0xA5A55A5A);
+                                            fecs_write(bar0, base + 0x1C4, 0xDEADBEEF);
+                                            fecs_write(bar0, base + 0x1C4, 0xCAFEF00D);
+                                            fecs_write(bar0, base + 0x1C4, 0x12345678);
+                                            fecs_write(bar0, base + 0x1C4, 0xA5A55A5A);
                                             
-                                            mmio_write(bar0, base + 0x1C0, 1 << 25); // reset offset, AINCR
-                                            let dmem_w0 = mmio_read(bar0, base + 0x1C4);
-                                            let dmem_w1 = mmio_read(bar0, base + 0x1C4);
-                                            let dmem_w2 = mmio_read(bar0, base + 0x1C4);
-                                            let dmem_w3 = mmio_read(bar0, base + 0x1C4);
+                                            fecs_write(bar0, base + 0x1C0, 1 << 25); // reset offset, AINCR
+                                            let dmem_w0 = fecs_read(bar0, base + 0x1C4);
+                                            let dmem_w1 = fecs_read(bar0, base + 0x1C4);
+                                            let dmem_w2 = fecs_read(bar0, base + 0x1C4);
+                                            let dmem_w3 = fecs_read(bar0, base + 0x1C4);
                                             serial_println!(":: kepler: fal-port b={:06X} dmem rb w0={:08X} w1={:08X} w2={:08X} w3={:08X} ::", base, dmem_w0, dmem_w1, dmem_w2, dmem_w3);
                                         }
 
@@ -792,32 +692,32 @@ pub fn init(gpu: &GpuInfo) {
                                             serial_println!(":: kepler: ucode img={} ioport={:04X} want={:08X} ::", img_label, port, want);
                                         
                                             // Seed the mailbox so "unchanged" has exactly one meaning.
-                                            mmio_write(bar0, base + 0x040, MB_SEED);
-                                            let pre_mb0 = mmio_read(bar0, base + 0x040);
-                                            let pre_cpuctl = mmio_read(bar0, base + 0x100);
+                                            fecs_write(bar0, base + 0x040, MB_SEED);
+                                            let pre_mb0 = fecs_read(bar0, base + 0x040);
+                                            let pre_cpuctl = fecs_read(bar0, base + 0x100);
                                             serial_println!(":: kepler: ucode pre mailbox0={:08X} cpuctl={:08X} ::", pre_mb0, pre_cpuctl);
                                         
                                             // Upload, padding the full IMEM page so the code TLB marks it usable.
-                                            mmio_write(bar0, base + 0x180, 1 << 24); // IMEMC offset=0, AINCW
-                                            mmio_write(bar0, base + 0x188, 0);       // IMEMT tag=0 (matches BOOTVEC=0)
+                                            fecs_write(bar0, base + 0x180, 1 << 24); // IMEMC offset=0, AINCW
+                                            fecs_write(bar0, base + 0x188, 0);       // IMEMT tag=0 (matches BOOTVEC=0)
                                             for &word in img.iter() {
-                                                mmio_write(bar0, base + 0x184, word);
+                                                fecs_write(bar0, base + 0x184, word);
                                             }
                                             for _ in img.len()..IMEM_PAGE_WORDS {
-                                                mmio_write(bar0, base + 0x184, 0);
+                                                fecs_write(bar0, base + 0x184, 0);
                                             }
                                             serial_println!(":: kepler: ucode uploaded words={} padded={} ::", img.len(), IMEM_PAGE_WORDS);
                                         
                                             // Page-usable attestation: TLB_CMD PTLB query on virtual page 0.
-                                            mmio_write(bar0, base + 0x140, 0x0200_0000);
-                                            let tlb_rd = mmio_read(bar0, base + 0x144);
+                                            fecs_write(bar0, base + 0x140, 0x0200_0000);
+                                            let tlb_rd = fecs_read(bar0, base + 0x144);
                                             serial_println!(":: kepler: ucode tlb page0={:08X} ::", tlb_rd);
                                         
-                                            mmio_write(bar0, base + 0x180, 1 << 25); // IMEMC offset=0, AINCR
+                                            fecs_write(bar0, base + 0x180, 1 << 25); // IMEMC offset=0, AINCR
                                             let mut verify_ok = true;
                                             let mut rb = [0u32; 5];
                                             for k in 0..img.len() {
-                                                rb[k] = mmio_read(bar0, base + 0x184);
+                                                rb[k] = fecs_read(bar0, base + 0x184);
                                                 if rb[k] != img[k] { verify_ok = false; }
                                             }
                                             serial_println!(":: kepler: ucode verify ok={} w0={:08X} w1={:08X} w2={:08X} w3={:08X} w4={:08X} ::",
@@ -828,19 +728,18 @@ pub fn init(gpu: &GpuInfo) {
                                                 break;
                                             }
                                         
-                                            let dmactl_pre = mmio_read(bar0, base + 0x10C);
+                                            let dmactl_pre = fecs_read(bar0, base + 0x10C);
                                             serial_println!(":: kepler: dmactl pre={:08X} ::", dmactl_pre);
-                                            mmio_write(bar0, base + 0x10C, dmactl_pre & !1);
-                                            let dmactl_post = mmio_read(bar0, base + 0x10C);
+                                            fecs_write(bar0, base + 0x10C, dmactl_pre & !1);
+                                            let dmactl_post = fecs_read(bar0, base + 0x10C);
                                             serial_println!(":: kepler: dmactl post={:08X} ::", dmactl_post);
 
                                             if (dmactl_post & 1) != 0 {
                                                 serial_println!(":: kepler: dmactl REFUSED ::");
                                                 continue;
                                             }
-
-                                            mmio_write(bar0, base + 0x104, 0); // BOOTVEC=0
-                                            mmio_write(bar0, base + 0x100, 2); // CPUCTL START_TRIGGER
+                                            fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
+                                            fecs_write(bar0, base + 0x100, 2); // CPUCTL START_TRIGGER
                                             serial_println!(":: kepler: ucode start cpuctl<=00000002 ::");
                                         
                                             // Bounded poll for STOPPED (bit 4). halt-iters is the discriminator:
@@ -848,15 +747,15 @@ pub fn init(gpu: &GpuInfo) {
                                             // state; max = started and stalled.
                                             let mut halt_iters = 0u32;
                                             for i in 0..100_000u32 {
-                                                let c = mmio_read(bar0, base + 0x100);
+                                                let c = fecs_read(bar0, base + 0x100);
                                                 halt_iters = i;
                                                 if (c & 0x10) != 0 { break; }
                                                 core::hint::spin_loop();
                                             }
                                         
-                                            let post_cpuctl = mmio_read(bar0, base + 0x100);
-                                            let post_mb0 = mmio_read(bar0, base + 0x040);
-                                            serial_println!(":: kepler: ucode end img={} cpuctl={:08X} mailbox0={:08X} halt-iters={} ::",
+                                            let post_cpuctl = fecs_read(bar0, base + 0x100);
+                                            let post_mb0 = fecs_read(bar0, base + 0x040);
+                                            serial_println!(":: kepler: ucode end h2h3={} cpuctl={:08X} mailbox0={:08X} halt-iters={} ::",
                                                 img_label, post_cpuctl, post_mb0, halt_iters);
                                         
                                             if post_mb0 != MB_SEED {
@@ -869,53 +768,52 @@ pub fn init(gpu: &GpuInfo) {
                                         // --- Pull 33: FECS Command Echo Skeleton (A/B Fallback) ---
                                         // Pull 34 R3-AMEND: split observable (MAILBOX0 = the value the
                                         // ucode READ) + phase counter (MAILBOX1) + bounded poll loop.
-                                        for &(img_label, img, phase_bound) in &[
-                                            ("A", &UCODE_CTX_ECHO_A[..], ucode::PHASE_A_BOUND),
-                                            ("B", &UCODE_CTX_ECHO_B[..], ucode::PHASE_B_BOUND),
+                                        for &(h2h3_label, img, phase_bound) in &[
+                                            ("on", &UCODE_CTX_ECHO_A[..], ucode::PHASE_A_BOUND),
+                                            ("off", &UCODE_CTX_ECHO_A[..], ucode::PHASE_A_BOUND),
                                         ] {
-                                            serial_println!(":: kepler: ucode-echo img={} bound={} ::", img_label, ucode::ECHO_BOUND);
+                                            serial_println!(":: kepler: ucode-echo h2h3={} bound={} ::", h2h3_label, ucode::ECHO_BOUND);
 
                                             // Halt engine if running (from previous loop or previous attempt)
-                                            let dmactl_pre = mmio_read(bar0, base + 0x10C);
-                                            mmio_write(bar0, base + 0x10C, dmactl_pre & !1);
+                                            let dmactl_pre = fecs_read(bar0, base + 0x10C);
+                                            fecs_write(bar0, base + 0x10C, dmactl_pre & !1);
 
-                                            mmio_write(bar0, base + 0x800, 0); // CC_SCRATCH[0]
-                                            mmio_write(bar0, base + 0x804, 0); // CC_SCRATCH[1]
+                                            fecs_write(bar0, base + 0x800, 0); // CC_SCRATCH[0]
+                                            fecs_write(bar0, base + 0x804, 0); // CC_SCRATCH[1]
                                             // Seed both mailboxes so "unchanged" has exactly one meaning
                                             // (s29 discipline) for the two new observables as well.
-                                            mmio_write(bar0, base + 0x040, MB_SEED); // MAILBOX0 <- value read
-                                            mmio_write(bar0, base + 0x044, MB_SEED); // MAILBOX1 <- phase
+                                            fecs_write(bar0, base + 0x040, MB_SEED); // MAILBOX0 <- value read
+                                            fecs_write(bar0, base + 0x044, MB_SEED); // MAILBOX1 <- phase
 
                                             serial_println!(":: kepler: ucode-echo pre CC_SCRATCH[0]={:08X} CC_SCRATCH[1]={:08X} mb0={:08X} mb1={:08X} ::",
-                                                mmio_read(bar0, base + 0x800), mmio_read(bar0, base + 0x804),
-                                                mmio_read(bar0, base + 0x040), mmio_read(bar0, base + 0x044));
+                                                fecs_read(bar0, base + 0x800), fecs_read(bar0, base + 0x804),
+                                                fecs_read(bar0, base + 0x040), fecs_read(bar0, base + 0x044));
 
-                                            mmio_write(bar0, base + 0x180, 1 << 24); // IMEMC AINCW
-                                            mmio_write(bar0, base + 0x188, 0); // IMEMT tag=0
-                                            for &word in img.iter() { mmio_write(bar0, base + 0x184, word); }
-                                            for _ in img.len()..IMEM_PAGE_WORDS { mmio_write(bar0, base + 0x184, 0); }
+                                            fecs_write(bar0, base + 0x180, 1 << 24); // IMEMC AINCW
+                                            fecs_write(bar0, base + 0x188, 0); // IMEMT tag=0
+                                            for &word in img.iter() { fecs_write(bar0, base + 0x184, word); }
+                                            for _ in img.len()..IMEM_PAGE_WORDS { fecs_write(bar0, base + 0x184, 0); }
                                             
-                                            mmio_write(bar0, base + 0x180, 1 << 25); // IMEMC AINCR
+                                            fecs_write(bar0, base + 0x180, 1 << 25); // IMEMC AINCR
                                             let mut verify_echo = true;
                                             for k in 0..img.len() {
-                                                if mmio_read(bar0, base + 0x184) != img[k] { verify_echo = false; }
+                                                if fecs_read(bar0, base + 0x184) != img[k] { verify_echo = false; }
                                             }
                                             if !verify_echo {
-                                                serial_println!(":: kepler: ucode-echo ABORT verify-mismatch img={} ::", img_label);
+                                                serial_println!(":: kepler: ucode-echo ABORT verify-mismatch h2h3={} ::", h2h3_label);
                                                 continue;
                                             }
+                                            fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
+                                            fecs_write(bar0, base + 0x100, 2); // CPUCTL START_TRIGGER
+                                            serial_println!(":: kepler: ucode-echo start h2h3={} ::", h2h3_label);
                                             
-                                            mmio_write(bar0, base + 0x104, 0); // BOOTVEC=0
-                                            mmio_write(bar0, base + 0x100, 2); // CPUCTL START_TRIGGER
-                                            serial_println!(":: kepler: ucode-echo start img={} ::", img_label);
-                                            
-                                            mmio_write(bar0, base + 0x800, 1); // host-cmd
-                                            serial_println!(":: kepler: ucode-echo host-cmd CC_SCRATCH[0]={:08X} ::", mmio_read(bar0, base + 0x800));
+                                            fecs_write(bar0, base + 0x800, 1); // host-cmd
+                                            serial_println!(":: kepler: ucode-echo host-cmd CC_SCRATCH[0]={:08X} ::", fecs_read(bar0, base + 0x800));
                                             
                                             let mut ack = 0;
                                             let mut ack_iters = 0;
                                             for i in 0..100_000u32 {
-                                                ack = mmio_read(bar0, base + 0x804);
+                                                ack = fecs_read(bar0, base + 0x804);
                                                 ack_iters = i;
                                                 if ack == 1 { break; }
                                                 core::hint::spin_loop();
@@ -927,26 +825,26 @@ pub fn init(gpu: &GpuInfo) {
                                             // of CC_SCRATCH[0]; mb1 = the phase it last reached. An ack with
                                             // mb0 != 1 would mean CC_SCRATCH[1] moved for some reason other
                                             // than our echo; no ack with a live phase localises the fault.
-                                            let mb0 = mmio_read(bar0, base + 0x040);
-                                            let phase = mmio_read(bar0, base + 0x044);
-                                            serial_println!(":: kepler: ctx-echo img={} ack={:08X} mb0={:08X} phase={:08X} ::",
-                                                img_label, ack, mb0, phase);
+                                            let mb0 = fecs_read(bar0, base + 0x040);
+                                            let phase = fecs_read(bar0, base + 0x044);
+                                            serial_println!(":: kepler: ctx-echo h2h3={} ack={:08X} mb0={:08X} phase={:08X} ::",
+                                                h2h3_label, ack, mb0, phase);
                                             if phase == phase_bound as u32 {
-                                                serial_println!(":: kepler: ctx-echo EXIT-BY-BOUND img={} iters={} — command never observed ::",
-                                                    img_label, ucode::ECHO_BOUND);
+                                                serial_println!(":: kepler: ctx-echo EXIT-BY-BOUND h2h3={} iters={} — command never observed ::",
+                                                    h2h3_label, ucode::ECHO_BOUND);
                                             }
                                             if ack == 1 {
-                                                serial_println!(":: kepler: ucode-echo SUCCESS img={} ::", img_label);
+                                                serial_println!(":: kepler: ucode-echo SUCCESS h2h3={} ::", h2h3_label);
                                                 break;
                                             } else {
-                                                serial_println!(":: kepler: ucode-echo FAILURE img={} ::", img_label);
+                                                serial_println!(":: kepler: ucode-echo FAILURE h2h3={} ::", h2h3_label);
                                             }
                                         }
 
                                         // Read-only sweep of the unit window: locates either sentinel wherever it
                                         // actually landed (MAILBOX1 on an off-by-one, INTR on a wrong-port write).
                                         for off in (0..=0x1FC).step_by(4) {
-                                            let val = mmio_read(bar0, base + off);
+                                            let val = fecs_read(bar0, base + off);
                                             let tag = if val == 0xF00DFACE || val == 0xF00DBEEF { " SENTINEL" } else { "" };
                                             serial_println!(":: kepler: ucode-post off={:03X} val={:08X}{} ::", off, val, tag);
                                         }
@@ -987,8 +885,8 @@ pub fn init(gpu: &GpuInfo) {
                                         } }
                                     }
 
-                                    let pre_wit_mb1 = mmio_read(bar0, 0x409000 + 0x044);
-                                    let pre_wit_cpu = mmio_read(bar0, 0x409000 + 0x100);
+                                    let pre_wit_mb1 = fecs_read(bar0, 0x409000 + 0x044);
+                                    let pre_wit_cpu = fecs_read(bar0, 0x409000 + 0x100);
                                     serial_println!(":: kepler: hb pre-witness mb1={:08X} cpuctl={:08X} ::", pre_wit_mb1, pre_wit_cpu);
 
                                     // --- Witness Rematch ---
@@ -1045,13 +943,13 @@ pub fn init(gpu: &GpuInfo) {
                                     serial_println!(":: kepler: poll-control valid-only chan={:08X} err={:08X} stat={:08X} ::",
                                         poll_rb, poll_err, poll_stat);
 
-                                    let post_wit_scratch = mmio_read(bar0, 0x409000 + 0x804);
-                                    let post_wit_cpu = mmio_read(bar0, 0x409000 + 0x100);
+                                    let post_wit_scratch = fecs_read(bar0, 0x409000 + 0x804);
+                                    let post_wit_cpu = fecs_read(bar0, 0x409000 + 0x100);
                                     serial_println!(":: kepler: ucode-echo post-witness CC_SCRATCH[1]={:08X} cpuctl={:08X} ::", post_wit_scratch, post_wit_cpu);
                                     
                                     for _ in 0..1_000_000 { core::hint::spin_loop(); }
-                                    let final_scratch = mmio_read(bar0, 0x409000 + 0x804);
-                                    let final_cpu = mmio_read(bar0, 0x409000 + 0x100);
+                                    let final_scratch = fecs_read(bar0, 0x409000 + 0x804);
+                                    let final_cpu = fecs_read(bar0, 0x409000 + 0x100);
                                     serial_println!(":: kepler: ucode-echo final CC_SCRATCH[1]={:08X} cpuctl={:08X} ::", final_scratch, final_cpu);
 
                                     // --- Pull 28 recon, relocated (GR5, s31 fold): the first access to an
@@ -1060,30 +958,30 @@ pub fn init(gpu: &GpuInfo) {
                                     // post-0x409504 reads poisoned, s30 markers included). Run the recon LAST,
                                     // after every proven read, and bracket it with cpuctl control reads so
                                     // poisoning is observed in-boot rather than inferred.
-                                    serial_println!(":: kepler: recon-pre cpuctl={:08X} ::", mmio_read(bar0, 0x409000 + 0x100));
+                                    serial_println!(":: kepler: recon-pre cpuctl={:08X} ::", fecs_read(bar0, 0x409000 + 0x100));
                                     
                                     // Pull 31: Context-Bind Experiment
                                     let ch_id = (inst_off as u32) >> 12;
                                     serial_println!(":: kepler: bind-pre CHAN_CUR={:08X} CHAN_NEXT={:08X} ENGINE_STATUS={:08X} ::",
-                                        mmio_read(bar0, 0x409B00), mmio_read(bar0, 0x409B04), mmio_read(bar0, 0x409C00));
+                                        fecs_read(bar0, 0x409B00), fecs_read(bar0, 0x409B04), fecs_read(bar0, 0x409C00));
                                     
                                     // Write CHAN_CUR and verify
-                                    mmio_write(bar0, 0x409B00, ch_id);
-                                    let c_cur = mmio_read(bar0, 0x409B00);
+                                    fecs_write(bar0, 0x409B00, ch_id);
+                                    let c_cur = fecs_read(bar0, 0x409B00);
                                     if (c_cur >> 16) == 0xBADF {
                                         serial_println!(":: kepler: bind CHAN_CUR FAULT={:08X} (skip rest) ::", c_cur);
                                     } else {
                                         serial_println!(":: kepler: bind CHAN_CUR={:08X} ::", c_cur);
                                         
                                         // Write CHAN_NEXT and verify
-                                        mmio_write(bar0, 0x409B04, ch_id);
-                                        let c_next = mmio_read(bar0, 0x409B04);
+                                        fecs_write(bar0, 0x409B04, ch_id);
+                                        let c_next = fecs_read(bar0, 0x409B04);
                                         if (c_next >> 16) == 0xBADF {
                                             serial_println!(":: kepler: bind CHAN_NEXT FAULT={:08X} (skip rest) ::", c_next);
                                         } else {
                                             serial_println!(":: kepler: bind CHAN_NEXT={:08X} ::", c_next);
                                             
-                                            serial_println!(":: kepler: bind-post ENGINE_STATUS={:08X} ::", mmio_read(bar0, 0x409C00));
+                                            serial_println!(":: kepler: bind-post ENGINE_STATUS={:08X} ::", fecs_read(bar0, 0x409C00));
                                             
                                             // Explicit post-bind witness leg (PFIFO_CHAN[1] Register)
                                             let pre_rw = mmio_read(bar0, 0x800000 + (1 * 8));
@@ -1097,7 +995,7 @@ pub fn init(gpu: &GpuInfo) {
                                         }
                                     }
                                     
-                                    serial_println!(":: kepler: recon-post cpuctl={:08X} ::", mmio_read(bar0, 0x409000 + 0x100));
+                                    serial_println!(":: kepler: recon-post cpuctl={:08X} ::", fecs_read(bar0, 0x409000 + 0x100));
 
 
                                     // 3. Submit Runlist
@@ -1251,8 +1149,22 @@ pub fn init(gpu: &GpuInfo) {
                                     // BEFORE the write, so the capture proves the ordering: the line
                                     // appears, then the write happens, and whether the boot survives
                                     // past it is itself the observation. Nothing more is claimed.
-                                    serial_println!(":: kepler: terminal-poke 0x409504 wr=0 (post: no further FECS reads this boot) ::");
-                                    mmio_write(bar0, 0x409504, 0);
+                                    
+                                    {
+                                        let count = FECS_ACCESS_COUNT.load(Ordering::SeqCst);
+                                        let first = FECS_FIRST_OFFSET.load(Ordering::SeqCst);
+                                        let mut r_idx_str = alloc::string::String::from("none");
+                                        let r_idx = FECS_504_READ_INDEX.load(Ordering::SeqCst);
+                                        if r_idx != 0xFFFFFFFF { r_idx_str = alloc::format!("{}", r_idx); }
+                                        let mut w_idx_str = alloc::string::String::from("none");
+                                        let w_idx = FECS_504_WRITE_INDEX.load(Ordering::SeqCst);
+                                        if w_idx != 0xFFFFFFFF { w_idx_str = alloc::format!("{}", w_idx); }
+                                        serial_println!(":: kepler: fecs-ledger accesses={} first_offset={:08X} 504_read_touched={} 504_read_idx={} 504_write_touched={} 504_write_idx={} ::",
+                                            count, first, FECS_504_READ_TOUCHED.load(Ordering::SeqCst), r_idx_str,
+                                            FECS_504_WRITE_TOUCHED.load(Ordering::SeqCst), w_idx_str);
+                                    }
+serial_println!(":: kepler: terminal-poke 0x409504 wr=0 (post: no further FECS reads this boot) ::");
+                                    fecs_write(bar0, 0x409504, 0);
                                     // ============ NOTHING BELOW THIS LINE MAY TOUCH FECS ============
                                 }
                             }
@@ -1263,6 +1175,19 @@ pub fn init(gpu: &GpuInfo) {
         }
     }
 
+                                    {
+                                        let count = FECS_ACCESS_COUNT.load(Ordering::SeqCst);
+                                        let first = FECS_FIRST_OFFSET.load(Ordering::SeqCst);
+                                        let mut r_idx_str = alloc::string::String::from("none");
+                                        let r_idx = FECS_504_READ_INDEX.load(Ordering::SeqCst);
+                                        if r_idx != 0xFFFFFFFF { r_idx_str = alloc::format!("{}", r_idx); }
+                                        let mut w_idx_str = alloc::string::String::from("none");
+                                        let w_idx = FECS_504_WRITE_INDEX.load(Ordering::SeqCst);
+                                        if w_idx != 0xFFFFFFFF { w_idx_str = alloc::format!("{}", w_idx); }
+                                        serial_println!(":: kepler: fecs-ledger accesses={} first_offset={:08X} 504_read_touched={} 504_read_idx={} 504_write_touched={} 504_write_idx={} ::",
+                                            count, first, FECS_504_READ_TOUCHED.load(Ordering::SeqCst), r_idx_str,
+                                            FECS_504_WRITE_TOUCHED.load(Ordering::SeqCst), w_idx_str);
+                                    }
     serial_println!("[NVIDIA] Initialization complete (Phases 1-4)");
 }
 
@@ -1335,6 +1260,43 @@ impl PushBuffer {
         self.push(header);
         self.push(class_id);
     }
+}
+
+use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+
+pub static FECS_ACCESS_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static FECS_FIRST_OFFSET: AtomicU32 = AtomicU32::new(0xFFFFFFFF);
+pub static FECS_504_READ_TOUCHED: AtomicBool = AtomicBool::new(false);
+pub static FECS_504_READ_INDEX: AtomicU32 = AtomicU32::new(0xFFFFFFFF);
+pub static FECS_504_WRITE_TOUCHED: AtomicBool = AtomicBool::new(false);
+pub static FECS_504_WRITE_INDEX: AtomicU32 = AtomicU32::new(0xFFFFFFFF);
+
+pub fn fecs_read(bar0: usize, offset: usize) -> u32 {
+    let count = FECS_ACCESS_COUNT.fetch_add(1, Ordering::SeqCst);
+    let _ = FECS_FIRST_OFFSET.compare_exchange(
+        0xFFFFFFFF, offset as u32, Ordering::SeqCst, Ordering::SeqCst
+    );
+    if offset == 0x409504 {
+        FECS_504_READ_TOUCHED.store(true, Ordering::SeqCst);
+        let _ = FECS_504_READ_INDEX.compare_exchange(
+            0xFFFFFFFF, count, Ordering::SeqCst, Ordering::SeqCst
+        );
+    }
+    unsafe { core::ptr::read_volatile((bar0 + offset) as *const u32) }
+}
+
+pub fn fecs_write(bar0: usize, offset: usize, val: u32) {
+    let count = FECS_ACCESS_COUNT.fetch_add(1, Ordering::SeqCst);
+    let _ = FECS_FIRST_OFFSET.compare_exchange(
+        0xFFFFFFFF, offset as u32, Ordering::SeqCst, Ordering::SeqCst
+    );
+    if offset == 0x409504 {
+        FECS_504_WRITE_TOUCHED.store(true, Ordering::SeqCst);
+        let _ = FECS_504_WRITE_INDEX.compare_exchange(
+            0xFFFFFFFF, count, Ordering::SeqCst, Ordering::SeqCst
+        );
+    }
+    unsafe { core::ptr::write_volatile((bar0 + offset) as *mut u32, val) }
 }
 
 pub unsafe fn mmio_read(base: usize, offset: usize) -> u32 {
