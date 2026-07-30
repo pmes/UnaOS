@@ -4298,6 +4298,12 @@ struct FutexBucket {
     /// Raw spinlock guarding `key` + `waiters` (Acquire on lock, Release on unlock; the PARK_WAITQ
     /// lock-handoff releases it AFTER the scheduler pushes the blocking Box).
     locked: AtomicBool,
+    /// WEDGE-6 — who holds `locked` right now: `((cpu + 1) << 32) | (tid as u32)`, `0` = free. Written
+    /// immediately after the acquisition and cleared immediately before the release, so a stalled
+    /// spinner can name the CULPRIT and not just itself. This is the field W4-B gets for free from
+    /// `IN_RQ_SECTION`; the futex bucket had no equivalent, and a witness that names only the victim
+    /// costs a whole boot to follow up. Diagnostic only — never read on a control path.
+    holder: AtomicU64,
     /// The physical-address key this bucket serves, or 0 = free. Claimed on the first waiter for a key,
     /// released back to 0 when its last waiter leaves.
     key: AtomicU64,
@@ -4335,7 +4341,20 @@ fn futex_stall_witness(b: &FutexBucket) {
     w4_dec(idx as u64);
     w4_str(" key=");
     w4_dec(b.key.load(Ordering::Relaxed));
-    w4_str(" — this bucket's raw lock has been held past every legitimate hold; the holder parked across the switch and its core never reached park_blocked\r\n");
+    // WEDGE-6: name the CULPRIT, not just the victim — W4-B's owner_core/owner_tid, which the futex
+    // bucket now carries in its own word. `holder=0` here is itself a reading: the lock is held by a
+    // core that acquired it before this field existed on that path, or it was released between the
+    // spin bound and this print (in which case the stall is contention, not a stuck holder).
+    let h = b.holder.load(Ordering::Acquire);
+    if h != 0 {
+        w4_str(" holder_core=");
+        w4_dec((h >> 32) - 1);
+        w4_str(" holder_tid=");
+        w4_dec(h & 0xffff_ffff);
+    } else {
+        w4_str(" holder=NONE(released-under-us)");
+    }
+    w4_str(" — this bucket's raw lock has been held past every legitimate hold; the prime suspect is a waiter that parked across the switch on a core that never reached park_blocked\r\n");
 }
 
 /// WEDGE-6 — stalled futex acquisitions seen since boot, for the `[spin1]` line (the print above is
@@ -4346,6 +4365,7 @@ impl FutexBucket {
     const fn new() -> Self {
         FutexBucket {
             locked: AtomicBool::new(false),
+            holder: AtomicU64::new(0),
             key: AtomicU64::new(0),
             waiters: UnsafeCell::new(VecDeque::new()),
         }
@@ -4363,9 +4383,19 @@ impl FutexBucket {
             }
             core::hint::spin_loop();
         }
+        // WEDGE-6: publish the holder AFTER the acquisition, so the word is only ever written by the
+        // core that owns the lock.
+        let core = percpu::this_cpu().cpu_index as usize;
+        self.holder.store(
+            ((core as u64 + 1) << 32) | (current_tid_relaxed(core) & 0xffff_ffff),
+            Ordering::Release,
+        );
     }
     #[inline]
     fn unlock_raw(&self) {
+        // WEDGE-6: clear the holder BEFORE the release, so the word is never stale-attributed to a
+        // core that has already let go (and never written by a core that no longer owns the lock).
+        self.holder.store(0, Ordering::Relaxed);
         self.locked.store(false, Ordering::Release);
     }
     #[inline]
