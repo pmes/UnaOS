@@ -3826,6 +3826,11 @@ impl XhciController {
                 core::hint::spin_loop();
             }
             serial_println!("xHCI: port settle complete before CCS scan");
+            // BPACE: the fixed pre-enumeration settle (`hw_wait_budget()/4` — ~0.5 s of wall clock
+            // and nothing else). Its `d=` from `pci-usb` is the entire cost of this one constant,
+            // which is exactly what a later settle-trim arc must have measured before it may touch
+            // the number. Absent on a `skip_xhci` build, with every pre-USB tag still present.
+            crate::bootpace::record("xhci-settle");
 
             // Scrub any latched PORTSC change bits before enumeration: one latched bit gates
             // PSCEG (4.19.2) and blocks ALL Port Status Change events for that port, so a
@@ -4100,6 +4105,16 @@ impl XhciController {
     /// Begin enumerating the next queued connected port. Called at boot and again each
     /// time a device finishes its setup, so at most one port is mid-enumeration.
     fn start_next_port(&mut self) {
+        // BPACE: close the ledger entry for the port the FSM is LEAVING. `start_next_port` is the
+        // single funnel through which the root enumeration FSM releases a port — reached from every
+        // configure-complete branch (storage, FTDI, HID) and from `recover_enumeration`'s give-up
+        // path — so one stamp here covers all of them, where stamping the individual
+        // Configure-Endpoint branches would have missed HID (whose enumeration continues through
+        // SET_CONFIGURATION) and every failure. `-done` therefore means "the FSM left this port",
+        // success or surrender; the outcome is on the neighbouring xHCI lines, the TIME is here.
+        if self.enumerating_port != 0 {
+            crate::bootpace::record_port(self.enumerating_port, true);
+        }
         // M1 (XENUM-1): fold in any port that asked to be re-enumerated once the in-flight
         // enumeration settled (a genuine re-plug that arrived mid-enumeration). Draining here —
         // the single point where the FSM goes idle — keeps the one-port-at-a-time invariant.
@@ -4148,6 +4163,10 @@ impl XhciController {
             self.enum_saw_disconnect = false; // M1: fresh disconnect tracking per enumeration
             self.enum_resets = 1;
             serial_println!("xHCI: === Enumerating Port {} (PORTSC={:#x}) ===", port, portsc);
+            // BPACE: this port's enumeration begins. Paired with the `-done` stamp at the top of
+            // this function, `d=` across the pair is the per-port enumeration cost — the number that
+            // says whether the boot's USB time is one slow device or the debounce paid N times.
+            crate::bootpace::record_port(port, false);
             // Debounce BEFORE the first reset (USB 2.0 TATTDB: 100 ms of stable connection
             // after attach). The metal rMBP bench captured a hot-plugged High-Speed SD reader
             // that, reset immediately on the connect event, trained at Full-Speed (failed HS
@@ -7620,6 +7639,15 @@ impl XhciController {
         }
         pump?;
         let p = pending.ok_or(BotError::Timeout)?;
+        // BPACE: the first BOT stage this boot ever completed. One-shot — this function runs
+        // thousands of times per boot, and the ledger wants the EDGE ("the mass-storage protocol
+        // started moving"), not a per-transaction trace. Placed after `pump?` so a timed-out first
+        // stage does not latch it: `bot-first` present means the wire actually carried a completion.
+        {
+            static BOT_FIRST: core::sync::atomic::AtomicUsize =
+                core::sync::atomic::AtomicUsize::new(0);
+            crate::bootpace::record_once(&BOT_FIRST, "bot-first");
+        }
         Ok((p.completion_code, p.residue))
     }
 
@@ -8117,10 +8145,17 @@ impl XhciController {
         if self.storage_slot == 0 { return; }
 
         serial_println!("xHCI: === STORAGE BRING-UP (TUR/INQUIRY/READ CAPACITY) ===");
+        // BPACE: the SCSI bring-up chain begins. `d=` between this and `stor-ready` is the whole
+        // TUR/INQUIRY/READ-CAPACITY negotiation — every one of whose stages is an awaited BOT
+        // transaction, i.e. the phase the pump quantisation of §17.4 taxes hardest.
+        crate::bootpace::record("stor-bringup");
         match self.bring_up_storage() {
             Ok(()) => serial_println!("xHCI: storage ready."),
             Err(e) => { serial_println!("xHCI: storage bring-up failed: {:?}", e); return; }
         }
+        // BPACE: reached only on SUCCESS — a failed bring-up returns above, so a ledger carrying
+        // `stor-bringup` without `stor-ready` says the storage chain died rather than ran slowly.
+        crate::bootpace::record("stor-ready");
 
         // PIUSB-35: decisive DMA-address witness. P45 refuted the cache theory (the LBA0 read still
         // returns all-zero with a Passed/residue=0 CSW even with PIUSB-34's clean-before-doorbell +
@@ -8557,6 +8592,10 @@ impl XhciController {
             // sees no bytes, the silence is post-arm TX, not a bring-up failure. That split is the
             // bench ask this ring exists to answer.
             crate::bootlog::record("ftdi:console-up");
+            // BPACE: the moment a second host can see anything at all. Everything stamped BEFORE
+            // this reached the wire only via the capture ring's replay; everything after rides live.
+            // `ftdi=` on the total line is therefore also the ledger's own observability boundary.
+            crate::bootpace::record("ftdi-up");
             ftdi::set_live(true);
         }
         self.drain_ftdi();

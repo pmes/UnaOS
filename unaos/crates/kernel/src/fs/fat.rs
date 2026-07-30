@@ -3210,6 +3210,10 @@ pub fn probe_once() {
     match mount() {
         Ok(fs) => {
             serial_println!("FS: FAT mounted: {}", fs.describe());
+            // BPACE: the boot volume is readable. `d=` from `stor-ready` is the BPB + FAT read cost
+            // — the first real filesystem I/O of the boot, and the gate every fixture waits on.
+            // Inside `probe_once`'s one-shot, so it can only ever record once.
+            crate::bootpace::record("fat-mount");
             match fs.read_root() {
                 Ok(entries) => {
                     serial_println!("FS: root directory ({} entries):", entries.len());

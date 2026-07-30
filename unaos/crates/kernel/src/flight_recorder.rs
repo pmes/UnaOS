@@ -429,6 +429,15 @@ pub fn service() {
     match write_log(&data) {
         Ok(written) => {
             LAST_FLUSHED.store(len, Ordering::Relaxed);
+            // BPACE: the first SUCCESSFUL flush — the boot's first sustained WRITE workload, and
+            // (with `PAD_NEXT` on a reused file) by far its largest. `d=` from `fat-mount` is what
+            // the write path costs; the flushes that follow are throttled and re-flush on growth,
+            // so only this first one belongs in a boot ledger.
+            {
+                static FR_FIRST: core::sync::atomic::AtomicUsize =
+                    core::sync::atomic::AtomicUsize::new(0);
+                crate::bootpace::record_once(&FR_FIRST, "fr-flush");
+            }
             if !ANNOUNCED.swap(true, Ordering::Relaxed) {
                 serial_println!(
                     ":: FLIGHTREC: boot log -> {} ({} captured bytes into a {}-byte in-place write) -> PASS ::",
