@@ -1108,6 +1108,32 @@ that with the cap described under Layout above** (`wm::legibility_cap`), not wit
 and, at forced bench geometry (`UNAOS_FBW=1920 UNAOS_FBH=1200`), `[wc-d] verify win=1 surf=128x128 scale=4x
 at (9,21) panel=1920x1200 checked=262144 bad_cache=0 bad_ram=0 -> PASS`.
 
+#### WCD-LIVE — the reference has to hold still (2026-07-29)
+
+WC-D derives every expected pixel from the owner's surface, which makes that EL0-writable surface the
+instrument's reference. That is sound only while the owner is quiescent, and it stopped being true when
+VUG.ELF began running two worker threads: siblings kept painting while `verify_window` read, so the witness
+compared scan-out against source bytes that were never blitted, and a correct compositor drew a `-> FAIL`
+(`bad_cache=312 bad_ram=556`, reshuffling every run — 500/568, 228/424). The tell was the two passes
+disagreeing with *each other*, which no blit defect can produce, since the blit is over before either pass
+starts. Nor was the exposure closed by the app's own frame barrier: `verify_window` runs from any pass that
+repaints those rows — a neighbour's present, a desktop flush, a cursor repaint — and the one-shot latch goes
+to whichever arrives first. Two corrections, doing two different jobs. **One source read:** the verdict used
+to take three independent reads of a mutable surface (pass 1, post-`IVAC` pass 2, and the `cksum=` in the
+print), so the two counts could differ with no cache story at all; the source rect is now snapshotted once
+and both passes compare against that single `want`-stream, which restores `bad_cache` vs `bad_ram` as a real
+claim about the destination's cache state (the fixture now reports 508/508, 420/420 — equal every run).
+**A liveness bracket:** the snapshot makes the passes self-consistent but cannot make a mid-flight snapshot
+equal to what was blitted a moment earlier, so the surface checksum is read before the snapshot and again
+after the passes, and an unequal bracket emits a third, distinct verdict — `[wc-d] … cksum=… cksum_pre=…
+-> LIVE (unverifiable)`. It replaces PASS *and* FAIL, because a moving reference earns neither, and it is
+never counted red: a live surface is a fact about a multi-threaded app, not a compositor defect. Quiescent
+windows bracket equal and snapshot exactly the bytes they would have re-read, so every single-threaded
+verdict is byte-identical to before — the five clean `[wc-d]` lines in `test-fat` kept their `cksum=` values
+across the change. Gate: `test 90` 31 PASS / 0 FAIL unchanged; `test-fat part 90` 41 PASS / **1 FAIL → 0
+FAIL**, plus the one new LIVE line. The compositor was never modified; this is a witness-only correction,
+and the same defect was independently audited on the aarch64 seat.
+
 ### WC-E — the garble was never in the pixels: two writers, one scan-out, no ordering
 
 WC-D left the defect cornered and unexplained. The composited pixels were byte-correct in the RAM the HVS
