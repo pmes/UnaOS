@@ -391,6 +391,15 @@ v3d_deep = ["v3d"]
 # kernel8`. See docs/dev/OS/08_VIDEO/v3d.md §41.
 v3d69_reenable = ["v3d_deep"]
 
+# PI-V3D-79: the genpd-faithful MINIMAL bringup — the S1S source audit's discriminator. On piOS,
+# v3d_reset() is the HANG path only; boot-time bring-up is genpd's bcm2835_asb_power_on alone:
+# deassert PM_V3DRSTN + release the two rpivid ASB bridges, from the firmware-parked state, with
+# no mailbox power/rate/gate calls and NO reset assert (pd->clk resolves NULL on 2711, so the
+# clock choreography no-ops). This knob makes bringup() do exactly that and nothing else — the
+# three mailbox SET calls and the [v3d50] OFF half are skipped — so one boot discriminates
+# whether one of OUR extra acts is what wedges thread 0. See docs/dev/OS/08_VIDEO/v3d.md §46.
+v3d79_minimal = ["v3d"]
+
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
 # the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding

@@ -848,9 +848,22 @@ const TRI_RGBA: u32 = 0x00FF_B000;
 pub fn bringup(fb: Option<FbTarget>) {
     serial_println!(":: V3D: PI-V3D-1 bring-up starting (VideoCore VI / V3D 4.2) ::");
 
+    // PI-V3D-79: the genpd-faithful MINIMAL bringup — the S1S source audit's discriminator.
+    // On piOS, v3d_reset() is the HANG path only. Boot-time bring-up is genpd's
+    // bcm2835_asb_power_on ALONE: deassert PM_V3DRSTN, release the two rpivid bridges, from the
+    // firmware-parked state — no mailbox power/rate/gate, no reset assert (pd->clk resolves NULL
+    // on 2711, so mainline's clock choreography no-ops). Everything else our bringup adds is a
+    // suspect this knob removes in one boot: retire under MINIMAL convicts one of our extra acts.
+    const V3D79_MINIMAL: bool = cfg!(feature = "v3d79_minimal");
+    if V3D79_MINIMAL {
+        serial_println!(
+            ":: V3D: [v3d79] MINIMAL bringup — genpd-faithful: NO mailbox set_power_domain/set_clock_rate/set_clock_state, NO [v3d50] OFF half. Deassert V3DRSTN + release rpivid M,S — exactly bcm2835_asb_power_on on BCM2711, nothing else. Firmware clock state is whatever handoff left ([v3d55] clkdom reads it, read-only) ::"
+        );
+    }
+
     // ── M1: power, clock, probe. ───────────────────────────────────────────────────────────────
     // Power THEN clock, in that order (a powered-but-unclocked block reads garbage registers).
-    match mailbox::set_power_domain(mailbox::POWER_DOMAIN_V3D, 1) {
+    if !V3D79_MINIMAL { match mailbox::set_power_domain(mailbox::POWER_DOMAIN_V3D, 1) {
         Some(1) => serial_println!(":: V3D: power domain {} ON ::", mailbox::POWER_DOMAIN_V3D),
         other => {
             serial_println!(
@@ -881,7 +894,7 @@ pub fn bringup(fb: Option<FbTarget>) {
             );
             return;
         }
-    }
+    } }
 
     // PI-V3D-50: the kernel-faithful V3D core RESET CYCLE (was PI-V3D-3's ON-half-only `enable_pm_asb`).
     // The kernel `v3d_reset_v3d` power-CYCLES the GRAFX_V3D domain (OFF then ON) to return the core to a
@@ -897,7 +910,12 @@ pub fn bringup(fb: Option<FbTarget>) {
     // register. This is the warm-handoff discriminator; see the PI-V3D-60 block.
     v3d60_residue_pre();
 
-    v3d_reset_cycle();
+    if V3D79_MINIMAL {
+        // [v3d79]: the genpd ON half alone — deassert V3DRSTN, release M then S. No OFF half.
+        enable_pm_asb();
+    } else {
+        v3d_reset_cycle();
+    }
 
     // Let the freshly powered + clocked + bridged block settle before its first register read (a
     // bounded wall-clock delay off CNTPCT — finite by construction, never an unbounded spin).

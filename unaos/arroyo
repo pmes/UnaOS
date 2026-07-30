@@ -1069,6 +1069,14 @@ kernel8() {
         K8_FEATS="${K8_FEATS},v3d69_reenable,v3d_deep,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D69_REENABLE: re-run the mainline PM/ASB enable sequence and re-kick the [v3d69] control rung (declines when the fabric already reads clean)${COLOR_RESET}"
     fi
+    # PI-V3D-79: UNAOS_V3D79_MINIMAL=1 adds the `v3d79_minimal` (+`v3d`) feature — the genpd-faithful
+    # minimal bringup: skip the three mailbox SET calls (power domain / clock rate / clock gate) and the
+    # [v3d50] OFF half; do only what piOS's boot-time path does (deassert V3DRSTN, release the two rpivid
+    # bridges). One boot discriminates whether one of our extra acts wedges thread 0. See v3d.md §46.
+    if [ -n "${UNAOS_V3D79_MINIMAL:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d79_minimal,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D79_MINIMAL: genpd-faithful minimal V3D bringup (no mailbox SETs, no reset assert)${COLOR_RESET}"
+    fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::
     # spawn_joinable + JoinHandle join barrier), falling back to the single-core serial flush when no
