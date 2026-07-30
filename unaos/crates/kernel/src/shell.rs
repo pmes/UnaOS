@@ -3572,6 +3572,14 @@ fn run_program(console: &mut Console, path: &str) {
                         path, n, entry
                     );
                 }
+                RunOutcome::Closed => {
+                    // CLOSE-CLEAN: the operator closed the window; the program's exit is clean.
+                    console.println(&alloc::format!("run: {}: closed (window close box)", path));
+                    serial_println!(
+                        ":: EXEC: run {} — loaded {} bytes, entry {:#x}, exit=CLOSED ::",
+                        path, n, entry
+                    );
+                }
                 RunOutcome::Timeout => {
                     console.println(&alloc::format!("run: {}: did not exit within the deadline", path));
                     serial_println!(
@@ -3683,6 +3691,15 @@ fn bg_jobs(console: &mut Console) {
                     "  pid {:>3}  FAULTED (contained; reaped)  {}", job.pid, name
                 ));
                 serial_println!(":: BGRUN: jobs — pid={} exit=FAULT reaped ::", job.pid);
+                *slot = None;
+            }
+            BgPoll::Closed => {
+                // CLOSE-CLEAN: the operator clicked the window's close box — a clean, asked-for
+                // exit. Reads like a normal completed job, never like a fault.
+                console.println(&alloc::format!(
+                    "  pid {:>3}  closed (reaped)  {}", job.pid, name
+                ));
+                serial_println!(":: BGRUN: jobs — pid={} exit=CLOSED reaped ::", job.pid);
                 *slot = None;
             }
             BgPoll::Gone => {

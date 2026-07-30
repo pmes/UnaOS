@@ -5441,20 +5441,48 @@ The CLOSE arm (`wc_close_click`), in order:
 3. **Kill** — the SKILL-1 primitive, ASID-scoped (`sched::kill(pid, owner)`), so every sibling
    thread dies with the parent; `kill` evicts targets parked in kernel waits (`futex_wake_killed`
    scans all buckets), which is what reaches a fleet idled in `SYS_INPUT_WAIT`. On a CONFIRMED kill
-   the Proc row is **settled, never reaped** — status `EXEC_KILLED_STATUS`, a CAS
+   the Proc row is **settled, never reaped** — a status store, a CAS
    `PRUNNING -> PEXITED`, one `done` post, exactly the fault-kill shape — because this path races
    whichever launcher owns the row (`bg`'s poll or a foreground `run_user_image` blocked in its
    wait loop), and reaping here would re-open the double-reap hazard `bg_kill`'s LENS note
-   documents. Both launchers converge on the settled row through their existing exit paths. An
+   documents. **CLOSE-CLEAN (P80) amends the settle status**: the row settles with the fault-kill
+   SHAPE but the status is `EXEC_CLOSED_STATUS`, not `EXEC_KILLED_STATUS` — see below.
+   Both launchers converge on the settled row through their existing exit paths. An
    UNCONFIRMED kill detaches (stays armed; the target dies at its next boundary) and leaves the row
    alone. Owners outside the slot range (witness fixtures) skip the kill — the row close is the
    whole effect.
 
+### CLOSE-CLEAN — a close-box exit reads *closed*, not *faulted* (2026-07-29)
+
+P80, bench sitting, Peter's verdict: *"i closed all the vugs with the x but jobs says faulted and
+reaped."* Root cause: the CLOSE-BOX settle reused the fault-kill sentinel (`EXEC_KILLED_STATUS`,
+`i32::MIN`) as the Proc row's exit status, and every classifier downstream — `bg_poll` for the
+`jobs` verb, the `run_user_image` wait for a foreground `run` — maps that sentinel to *Faulted*.
+An operator-requested close therefore printed as `FAULTED (contained; reaped)`, indistinguishable
+from a genuine contained fault.
+
+The fix is a second, distinct sentinel: `EXEC_CLOSED_STATUS` (`i32::MIN + 1`, equally
+non-colliding with real exit codes). `wc_close_click`'s confirmed-kill settle stores it instead of
+the kill sentinel; the classifiers grew a matching clean variant end to end:
+
+* `bg_poll` → `BgPoll::Closed`; the `jobs` verb prints `pid N  closed (reaped)  <name>` (serial:
+  `:: BGRUN: jobs — pid=N exit=CLOSED reaped ::`) — the shape of a normal completed job.
+* `run_user_image` → `RunOutcome::Closed`; a foreground `run` whose window is closed prints
+  `run: <path>: closed (window close box)` (serial: `exit=CLOSED`).
+
+Genuine fault-kills are untouched — the fault-kill net still stores `EXEC_KILLED_STATUS` and still
+reads `FAULTED`; the two classifications never blur. The one race (a fault-kill and the close
+settle hitting the same task) is decided by the existing single-shot CAS: whichever settle wins
+the `PRUNNING -> PEXITED` flip has already published its own status, honestly.
+
 ### Witness
 
-* `[clickroute] close=win<id> asid=<owner> at (x,y)` — one line per close click, rate-limited
-  `[spread4] rewake`-style (first 16 named, then quiet) so a stuck button over a re-spawning owner
-  cannot flood the wire.
+* `[clickroute] close=win<id> asid=<owner> at (x,y) settle=<tag>` — one line per close click,
+  rate-limited `[spread4] rewake`-style (first 16 named, then quiet) so a stuck button over a
+  re-spawning owner cannot flood the wire. CLOSE-CLEAN moved the emit to after the settle and
+  added the `settle=` field: `closed` (kill confirmed, row settled clean), `noproc` (window
+  furniture only), `dead` (target already exited), `armed` (unconfirmed; request stays armed),
+  `exhausted` (no kill slot).
 * `[skill] close-box ...` — the kill's disposition (confirmed / stays-armed / nothing-to-kill).
 * **Leg 9** of `hittest_selftest` (`close=` field in the `[clickroute] hit-test` line): a probe
   window is placed so its CLOSE BOX contains the real cursor (the CLICK-PLAIN fixture discipline —

@@ -6943,16 +6943,27 @@ fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
 }
 
 /// EXEC-1: the outcome of `run_user_image` — the program exited with a status, was killed by the fault-kill
-/// net (a CONTAINED fault), or overran its deadline (still running / stuck).
+/// net (a CONTAINED fault), was closed by the operator (CLOSE-CLEAN: the window's close box), or overran
+/// its deadline (still running / stuck).
 pub enum RunOutcome {
     Exited(i32),
     Faulted,
+    /// CLOSE-CLEAN: the operator clicked the window's close box. A clean, asked-for exit — rendered as
+    /// `closed`, never as a fault.
+    Closed,
     Timeout,
 }
 
 /// run_user_image: the Proc `status` a killed run-image task is marked with (see the fault-kill path), so
 /// the wait renders it as `Faulted` rather than `Exited`. `i32::MIN` never collides with a real exit code.
 const EXEC_KILLED_STATUS: i32 = i32::MIN;
+
+/// CLOSE-CLEAN: the Proc `status` a close-box settle marks a confirmed kill with (`wc_close_click`).
+/// Deliberately DISTINCT from [`EXEC_KILLED_STATUS`]: the operator ASKED for this exit by clicking the
+/// window's close box, so `jobs` and `run` render it as a clean `closed` — not `FAULTED`. Genuine
+/// fault-kills keep the kill sentinel; the two classifications never blur. `i32::MIN + 1` never collides
+/// with a real exit code for the same reason the kill sentinel does not.
+const EXEC_CLOSED_STATUS: i32 = i32::MIN + 1;
 
 /// EXEC-1: load an already-read program IMAGE (flat or ELF64) into a fresh EL0 slot, run it to completion
 /// on THIS core, and return its exit status. The synchronous shell `run <path>` entry: the EL1/ASID-0 panel
@@ -7185,6 +7196,7 @@ pub fn run_user_image(
     let outcome = if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
         match PROCS[pi].status.load(Ordering::Acquire) {
             EXEC_KILLED_STATUS => RunOutcome::Faulted,
+            EXEC_CLOSED_STATUS => RunOutcome::Closed,
             s => RunOutcome::Exited(s),
         }
     } else {
@@ -7308,6 +7320,7 @@ pub fn run_user_image(
                 proc_free(pi);
                 match status {
                     EXEC_KILLED_STATUS => RunOutcome::Faulted,
+                    EXEC_CLOSED_STATUS => RunOutcome::Closed,
                     s => RunOutcome::Exited(s),
                 }
             } else {
@@ -7323,6 +7336,7 @@ pub fn run_user_image(
             let out = match proc_orphan(pi) {
                 None => RunOutcome::Timeout,
                 Some(EXEC_KILLED_STATUS) => RunOutcome::Faulted,
+                Some(EXEC_CLOSED_STATUS) => RunOutcome::Closed,
                 Some(s) => RunOutcome::Exited(s),
             };
             serial_println!(
@@ -7339,6 +7353,7 @@ pub fn run_user_image(
             let out = match proc_orphan(pi) {
                 None => RunOutcome::Timeout,
                 Some(EXEC_KILLED_STATUS) => RunOutcome::Faulted,
+                Some(EXEC_CLOSED_STATUS) => RunOutcome::Closed,
                 Some(s) => RunOutcome::Exited(s),
             };
             serial_println!("[skill] killed pid={} asid={} confirmed=0 row=orphaned", pid, asid);
@@ -7390,6 +7405,9 @@ pub enum BgPoll {
     Exited(i32),
     /// Killed by the fault-kill net (contained fault); if `reap` was set the row has been freed.
     Faulted,
+    /// CLOSE-CLEAN: closed by the operator via the window's close box — a clean, asked-for exit,
+    /// never a fault; if `reap` was set the row has been freed.
+    Closed,
     /// No row holds this pid (already reaped, or never existed).
     Gone,
 }
@@ -7482,6 +7500,8 @@ pub fn bg_poll(pid: u64, reap: bool) -> BgPoll {
                 }
                 if status == EXEC_KILLED_STATUS {
                     BgPoll::Faulted
+                } else if status == EXEC_CLOSED_STATUS {
+                    BgPoll::Closed
                 } else {
                     BgPoll::Exited(status)
                 }
@@ -9540,6 +9560,9 @@ fn exec1_witness(_demo_cpu: usize) {
         Ok((RunOutcome::Faulted, _)) => {
             serial_println!(":: EXEC1: run {} — EL0 program FAULTED -> FAIL ::", path)
         }
+        Ok((RunOutcome::Closed, _)) => {
+            serial_println!(":: EXEC1: run {} — EL0 program CLOSED mid-run (unexpected) -> FAIL ::", path)
+        }
         Ok((RunOutcome::Timeout, _)) => {
             serial_println!(":: EXEC1: run {} — EL0 program did not exit in time -> FAIL ::", path)
         }
@@ -9605,7 +9628,7 @@ fn bgrun_witness(_demo_cpu: usize) {
             let exited = loop {
                 match bg_poll(pid, false) {
                     BgPoll::Exited(0) => break true,
-                    BgPoll::Exited(_) | BgPoll::Faulted | BgPoll::Gone => break false,
+                    BgPoll::Exited(_) | BgPoll::Faulted | BgPoll::Closed | BgPoll::Gone => break false,
                     BgPoll::Running => {}
                 }
                 if super::timer::cntpct().wrapping_sub(t0) >= budget {
@@ -9709,7 +9732,7 @@ fn bgrun_witness(_demo_cpu: usize) {
             let settled = loop {
                 match bg_poll(pid, true) {
                     BgPoll::Gone => break true,
-                    BgPoll::Exited(_) | BgPoll::Faulted => {} // reaped this pass; next poll reads Gone
+                    BgPoll::Exited(_) | BgPoll::Faulted | BgPoll::Closed => {} // reaped this pass; next poll reads Gone
                     BgPoll::Running => {}                     // PORPHANED fallback settles at a boundary
                 }
                 if super::timer::cntpct().wrapping_sub(t0) >= budget {
@@ -9759,7 +9782,7 @@ fn bgrun_witness(_demo_cpu: usize) {
             let settled = loop {
                 match bg_poll(pid, true) {
                     BgPoll::Gone => break true,
-                    BgPoll::Exited(_) | BgPoll::Faulted => {} // reaped this pass; next poll reads Gone
+                    BgPoll::Exited(_) | BgPoll::Faulted | BgPoll::Closed => {} // reaped this pass; next poll reads Gone
                     BgPoll::Running => {}                     // PORPHANED fallback settles at a boundary
                 }
                 if super::timer::cntpct().wrapping_sub(t1) >= budget {
@@ -9928,6 +9951,9 @@ fn uvug_witness(_demo_cpu: usize) {
         ),
         Ok((RunOutcome::Faulted, _)) => {
             serial_println!(":: EXEC-UVUG: run {} — EL0 program FAULTED -> FAIL ::", path)
+        }
+        Ok((RunOutcome::Closed, _)) => {
+            serial_println!(":: EXEC-UVUG: run {} — EL0 program CLOSED mid-run (unexpected) -> FAIL ::", path)
         }
         Ok((RunOutcome::Timeout, _)) => {
             serial_println!(":: EXEC-UVUG: run {} — EL0 program did not exit in time -> FAIL ::", path)
@@ -12307,18 +12333,24 @@ static CLOSE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 /// This runs from the input-pump/shell task, racing whichever launcher owns the row (`bg`'s poll,
 /// or a FOREGROUND `run_user_image` blocked in its wait loop). Reaping here (the `bg_kill` shape)
 /// would free a row a foreground launcher still watches — the exact double-reap hazard `bg_kill`'s
-/// LENS MUST-FIX note documents. So on a CONFIRMED kill the row is settled the way a FAULT-kill
-/// settles it (`record_el0_kill`'s live-child arm): status `EXEC_KILLED_STATUS`, then a CAS
-/// `PRUNNING -> PEXITED`, then ONE `done` post — the CAS makes the post single-shot against a
-/// concurrent fault-kill of the same task. Both launchers already converge on that state: the
-/// foreground wait wakes promptly and reaps through its normal exit path; a `bg` row reads
-/// `killed` in `jobs` and is reaped there. An UNCONFIRMED kill detaches and touches the row not at
+/// LENS MUST-FIX note documents. So on a CONFIRMED kill the row is settled with the SHAPE of a
+/// FAULT-kill settle (`record_el0_kill`'s live-child arm) but a CLEAN status (CLOSE-CLEAN, P80):
+/// status `EXEC_CLOSED_STATUS` — the operator asked for this exit, so it must never read as a
+/// fault — then a CAS `PRUNNING -> PEXITED`, then ONE `done` post; the CAS makes the post
+/// single-shot against a concurrent fault-kill of the same task (a fault-kill that wins the CAS
+/// keeps its own `EXEC_KILLED_STATUS`, honestly). Both launchers already converge on that state:
+/// the foreground wait wakes promptly and reaps through its normal exit path; a `bg` row reads
+/// `closed` in `jobs` and is reaped there — not `FAULTED`, which is reserved for the fault-kill
+/// net. An UNCONFIRMED kill detaches and touches the row not at
 /// all — the request stays armed, the target dies at its next boundary, and the row's owner keeps
 /// every invariant it had (no orphaning here for the same double-owner reason).
 ///
 /// Owners outside the private-slot range (kernel witness fixtures) and ASIDs with no live Proc row
 /// skip the kill: there is no process to kill, and the window close is the whole of the effect.
-fn wc_close_click(owner: u64) {
+/// Returns the settle tag for the `[clickroute] close=` witness line: `closed` (kill confirmed,
+/// row settled clean), `noproc` (window furniture only — no live process), `dead` (target already
+/// exited on its own), `armed` (unconfirmed — the request stays armed), `exhausted` (no kill slot).
+fn wc_close_click(owner: u64) -> &'static str {
     let closed = crate::video::wm::close_owner(owner);
     if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == owner {
         el0_input_set_active(0);
@@ -12327,7 +12359,7 @@ fn wc_close_click(owner: u64) {
         crate::video::wm::focus_changed(0);
     }
     if owner == 0 || owner as usize > super::boot::USER_SLOTS {
-        return; // synthetic owner: no process behind it, the row close was the whole effect
+        return "noproc"; // synthetic owner: no process behind it, the row close was the whole effect
     }
     // The live Proc row for this ASID, if any. `pid == 0` (mid-publish) is skipped — a kill needs
     // a tid to name, and the publish window is microseconds wide; the operator's next click lands
@@ -12349,7 +12381,7 @@ fn wc_close_click(owner: u64) {
             "[skill] close-box asid={} closed={} window(s), no live process — nothing to kill",
             owner, closed
         );
-        return;
+        return "noproc";
     };
     let Some(ticket) = super::sched::kill(pid, owner) else {
         if !KILL_EXHAUSTED.swap(true, Ordering::AcqRel) {
@@ -12358,7 +12390,7 @@ fn wc_close_click(owner: u64) {
                 owner
             );
         }
-        return;
+        return "exhausted";
     };
     // Bounded cooperative confirm wait — the SKILL-1 shape. Short in practice: the arm's own
     // `kill_wake_parked` has already evicted a parked fleet, so the boundary is one dispatch away.
@@ -12385,9 +12417,10 @@ fn wc_close_click(owner: u64) {
     if ok {
         super::sched::kill_release(ticket);
         // Settle (never reap) the row — see the doc block. Status BEFORE the state flip, so a
-        // watcher that wakes on PEXITED always reads the kill sentinel, exactly as
-        // `record_el0_kill` orders its stores.
-        PROCS[pi].status.store(EXEC_KILLED_STATUS, Ordering::Release);
+        // watcher that wakes on PEXITED always reads the CLOSE-CLEAN sentinel, exactly as
+        // `record_el0_kill` orders its stores. EXEC_CLOSED_STATUS, not EXEC_KILLED_STATUS: the
+        // operator clicked the close box, so `jobs`/`run` report `closed`, never `FAULTED`.
+        PROCS[pi].status.store(EXEC_CLOSED_STATUS, Ordering::Release);
         if PROCS[pi]
             .state
             .compare_exchange(PRUNNING, PEXITED, Ordering::AcqRel, Ordering::Acquire)
@@ -12399,14 +12432,17 @@ fn wc_close_click(owner: u64) {
             "[skill] close-box killed pid={} asid={} confirmed=1 ({} window(s) closed)",
             pid, owner, closed
         );
+        "closed"
     } else if already_dead {
         super::sched::kill_retract(ticket);
+        "dead"
     } else {
         super::sched::kill_detach(ticket);
         serial_println!(
             "[skill] close-box kill pid={} asid={} confirmed=0 — request stays armed, target dies at its next boundary",
             pid, owner
         );
+        "armed"
     }
 }
 
@@ -12571,14 +12607,17 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
             // target. The press is CONSUMED (target DROP, so the release is dropped with it): the
             // owner it would have been delivered to is being torn down.
             Some((win, owner, _z)) if crate::video::wm::close_box_hit(win, x, y) => {
+                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                // CLOSE-CLEAN: the witness line is emitted AFTER the settle so it can name the
+                // outcome — `settle=closed` is the wire proof a close-box exit landed as a clean
+                // close (not a fault-kill). Same rate limit, same line, one new field.
+                let settle = wc_close_click(owner);
                 if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX {
                     serial_println!(
-                        "[clickroute] close=win{} asid={} at ({},{})",
-                        win, owner, x, y
+                        "[clickroute] close=win{} asid={} at ({},{}) settle={}",
+                        win, owner, x, y, settle
                     );
                 }
-                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
-                wc_close_click(owner);
                 true
             }
             Some((win, owner, _z)) if owner != cur => {
