@@ -41,6 +41,33 @@ pub mod regs {
     pub const PP_CONTROL: usize = 0x61204;
     pub const DPLL_A_CTRL: usize = 0x06014;
 
+    // Additional DP/DDI Ports
+    pub const DP_B: usize = 0x64100;
+    pub const DP_C: usize = 0x64200;
+    pub const DP_D: usize = 0x64300;
+
+    // FDI links (CPU-to-PCH)
+    pub const FDI_RXA_CTL: usize = 0xF000C;
+    pub const FDI_TXA_CTL: usize = 0x60100;
+
+    // DPLL divisors
+    pub const FPA0: usize = 0x06040;
+    pub const FPA1: usize = 0x06044;
+
+    // PCH-based Panel Power Sequencer (South Display Engine)
+    pub const PCH_PP_STATUS: usize = 0xC7200;
+    pub const PCH_PP_CONTROL: usize = 0xC7204;
+    pub const PCH_PP_ON_DELAYS: usize = 0xC7208;
+    pub const PCH_PP_OFF_DELAYS: usize = 0xC720C;
+    pub const PCH_PP_DIVISOR: usize = 0xC7210;
+
+    // PCH-based GMBUS (South Display Engine)
+    pub const PCH_GMBUS0: usize = 0xC5100;
+    pub const PCH_GMBUS1: usize = 0xC5104;
+    pub const PCH_GMBUS2: usize = 0xC5108;
+    pub const PCH_GMBUS3: usize = 0xC510C;
+    pub const PCH_GMBUS4: usize = 0xC5110;
+
     // GTT Window (starts at 2MB offset in BAR0)
     pub const GTT_BASE: usize = 0x200000;
 }
@@ -138,6 +165,57 @@ pub fn init(gpu: &GpuInfo) {
         return;
     }
     serial_println!("[Intel iGPU] Initializing Ivy Bridge GT2 at BDF {}:{}:{}", gpu.bus, gpu.slot, gpu.func);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Reachability check via PCI config space
+        let vid_did = unsafe { crate::arch::pci::read_config_32(gpu.bus, gpu.slot, gpu.func, 0x00) };
+        let cmd = unsafe { crate::arch::pci::read_config_16(gpu.bus, gpu.slot, gpu.func, 0x04) };
+        
+        let cap_ptr = unsafe { crate::arch::pci::read_config_32(gpu.bus, gpu.slot, gpu.func, 0x34) } & 0xFF;
+        let mut d_state = "Unknown";
+        if cap_ptr != 0 && cap_ptr != 0xFF {
+            let mut ptr = cap_ptr as u8;
+            let mut cap_iters = 0;
+            while ptr != 0 {
+                if cap_iters >= 48 {
+                    serial_println!(":: igpu: CAPABILITY LIST BOUND HIT (48 iterations, aborting walk)");
+                    break;
+                }
+                cap_iters += 1;
+                let cap = unsafe { crate::arch::pci::read_config_32(gpu.bus, gpu.slot, gpu.func, ptr) };
+                if (cap & 0xFF) == 0x01 { // Power Management
+                    let pmcsr = unsafe { crate::arch::pci::read_config_16(gpu.bus, gpu.slot, gpu.func, ptr + 4) };
+                    d_state = match pmcsr & 0x3 {
+                        0 => "D0",
+                        1 => "D1",
+                        2 => "D2",
+                        3 => "D3hot",
+                        _ => "??",
+                    };
+                    break;
+                }
+                ptr = ((cap >> 8) & 0xFF) as u8;
+            }
+        }
+        
+        serial_println!(":: igpu: REACHABILITY CENSUS (PCI Config Space) ::");
+        serial_println!(":: igpu: RAW: VID:DID=0x{:08X}, CMD=0x{:04X}, D-State={} ::", vid_did, cmd, d_state);
+        
+        if vid_did == 0xFFFFFFFF {
+            serial_println!(":: igpu: VERDICT: Device not present (Vendor/Device ID read 0xFFFFFFFF)");
+        } else {
+            if (cmd & 0x02) == 0 {
+                serial_println!(":: igpu: VERDICT: Present but BAR not decoding (Memory Space Enable = 0)");
+            }
+            if d_state == "D3hot" {
+                serial_println!(":: igpu: VERDICT: Present, decoding, but in D3hot (PM state = D3hot)");
+            }
+            if (cmd & 0x02) != 0 && d_state != "D3hot" {
+                serial_println!(":: igpu: VERDICT: Device reachable and powered (D-State: {})", d_state);
+            }
+        }
+    }
 
     let bar0 = gpu.bar0_phys as usize;
     let bar0_size = gpu.bar0_size as usize;
@@ -246,6 +324,34 @@ pub fn init(gpu: &GpuInfo) {
                 serial_println!("[Intel iGPU] GGTT PTE[{}] (offset 0x{:X}): 0x{:08X}", page_number + i, pte_offset, pte);
             }
         }
+        
+        serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers] On Ivy Bridge (Gen7 / Panther Point 7-Series PCH), the Display Engine is split.");
+        serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers, Section 1.1.2] eDP on Port A (DP_A) is CPU-attached (North Display Engine).");
+        serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, South Display Engine Registers] GMBUS and Panel Power Sequencer (PPS) are PCH-attached (South Display Engine).");
+        serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, South Display Engine Registers] Therefore, GMBUS is at PCH base 0xC5100 and PPS is at PCH base 0xC7200.");
+        serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers] Because eDP is CPU-attached, the FDI link (CPU-to-PCH) is bypassed for the internal panel.");
+
+        serial_println!(":: igpu: --- ADDITIONAL CENSUS GAPS --- ::");
+        serial_println!(":: igpu: PP_STATUS_CPU:  0x{:08X} | PP_STATUS_PCH:  0x{:08X}", mmio_read(bar0, regs::PP_STATUS), mmio_read(bar0, regs::PCH_PP_STATUS));
+        serial_println!(":: igpu: PP_CONTROL_CPU: 0x{:08X} | PP_CONTROL_PCH: 0x{:08X}", mmio_read(bar0, regs::PP_CONTROL), mmio_read(bar0, regs::PCH_PP_CONTROL));
+        serial_println!(":: igpu: DP_B: 0x{:08X}", mmio_read(bar0, regs::DP_B));
+        serial_println!(":: igpu: DP_C: 0x{:08X}", mmio_read(bar0, regs::DP_C));
+        serial_println!(":: igpu: DP_D: 0x{:08X}", mmio_read(bar0, regs::DP_D));
+        serial_println!(":: igpu: FDI_RXA_CTL: 0x{:08X}", mmio_read(bar0, regs::FDI_RXA_CTL));
+        serial_println!(":: igpu: FDI_TXA_CTL: 0x{:08X}", mmio_read(bar0, regs::FDI_TXA_CTL));
+        serial_println!(":: igpu: FPA0: 0x{:08X}", mmio_read(bar0, regs::FPA0));
+        serial_println!(":: igpu: FPA1: 0x{:08X}", mmio_read(bar0, regs::FPA1));
+        
+        serial_println!(":: igpu: PCH_PP_ON_DELAYS: 0x{:08X}", mmio_read(bar0, regs::PCH_PP_ON_DELAYS));
+        serial_println!(":: igpu: PCH_PP_OFF_DELAYS: 0x{:08X}", mmio_read(bar0, regs::PCH_PP_OFF_DELAYS));
+        serial_println!(":: igpu: PCH_PP_DIVISOR: 0x{:08X}", mmio_read(bar0, regs::PCH_PP_DIVISOR));
+
+        serial_println!(":: igpu: PCH_GMBUS0: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS0));
+        serial_println!(":: igpu: PCH_GMBUS1: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS1));
+        serial_println!(":: igpu: PCH_GMBUS2: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS2));
+        serial_println!(":: igpu: PCH_GMBUS3: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS3));
+        serial_println!(":: igpu: PCH_GMBUS4: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS4));
+        serial_println!(":: igpu: --- END CENSUS --- ::");
     }
     
     serial_println!(":: igpu: probe-complete ::");

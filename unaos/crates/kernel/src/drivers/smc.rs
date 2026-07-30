@@ -630,6 +630,9 @@ pub mod battery {
         max: i64,
         state: AcDerived,
         start_ms: u64,
+        total_samples: u32,
+        total_sum: i64,
+        total_ms: u64,
     }
     static PWR_ROLLUP: Mutex<PwrRollupState> = Mutex::new(PwrRollupState {
         samples: 0,
@@ -639,6 +642,9 @@ pub mod battery {
         max: 0,
         state: AcDerived::Unknown,
         start_ms: 0,
+        total_samples: 0,
+        total_sum: 0,
+        total_ms: 0,
     });
     const PWR_ROLLUP_MS: u64 = 10_000;
 
@@ -984,16 +990,31 @@ pub mod battery {
             }
 
             if flush {
+                let window_ms = now.wrapping_sub(pwr.start_ms);
+
                 let state_str = match pwr.state {
                     AcDerived::Charging => "plugged (charging)",
                     AcDerived::Discharging => "unplugged (discharging)",
                     AcDerived::Idle => "idle",
                     AcDerived::Unknown => "unknown",
                 };
-                serial_println!(
-                    ":: PWR: state={} samples={} unknown={} sum={} min={} max={} (sign convention: inherited assumption) == {} ::",
-                    state_str, pwr.samples, pwr.unknown, pwr.sum, pwr.min, pwr.max, reason
-                );
+
+                if pwr.min < 0 && pwr.max > 0 {
+                    serial_println!(
+                        ":: PWR: INADMISSIBLE (straddles zero, excluded from cumulative) window_ms={} state={} samples={} unknown={} sum={} min={} max={} == {} ::",
+                        window_ms, state_str, pwr.samples, pwr.unknown, pwr.sum, pwr.min, pwr.max, reason
+                    );
+                } else {
+                    pwr.total_ms += window_ms;
+                    pwr.total_sum += pwr.sum;
+                    pwr.total_samples += pwr.samples;
+
+                    serial_println!(
+                        ":: PWR: window_ms={} state={} samples={} unknown={} sum={} min={} max={} (total: time={} sum={} samples={}) (ac_derived: inferred, no hardware key) == {} ::",
+                        window_ms, state_str, pwr.samples, pwr.unknown, pwr.sum, pwr.min, pwr.max, pwr.total_ms, pwr.total_sum, pwr.total_samples, reason
+                    );
+                }
+
                 // Reset accumulator for the new window
                 pwr.samples = 0;
                 pwr.unknown = 0;
