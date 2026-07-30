@@ -3351,3 +3351,21 @@ config. The next discriminator is P91-ENVSWAP: OUR kernel + the piOS card's exac
 files and config lines (minus kernel=/os selection). Retire there → bisect the environment
 (firmware build first, then config lines). Still-dead there closes the ARM-testable universe;
 what remains is VPU-internal state requiring firmware-side instrumentation.
+
+### 46.5 V3D-80 — the display handover, and the reply-less-notify discovery (P92/P93)
+
+vc4's probe performs ONE mailbox act no UnaOS boot ever has: `NOTIFY_DISPLAY_DONE` (0x00030066,
+zero-length) — the firmware display driver stops and the ARM owns the display/GPU complex.
+P92 sent it with the default 500 ms reply budget: timeout. P93 with 5 s: timeout again — and the
+same capture shows `NOTIFY_XHCI_RESET` (0x00030058) followed by mailbox timeouts too, *while the
+VL805 firmware load it requests demonstrably works*. Reading: **on this firmware
+(hash 3484b5dd…, = piOS's own), NOTIFY-class tags are acted on without a FIFO reply** — a
+mailbox-protocol instrument lie (ledger +1): "MAILBOX FAILED" on a notify tag means only
+"no reply", not "no effect". It also reopens [v3d75a]'s ENABLE_QPU verdict from "tag unhandled"
+to "possibly acted, reply-less".
+
+Discriminator for whether P93's handover took effect: the PANEL. The [v3d80] rung runs ~15 s
+into the battery; a display that goes black there = the firmware display driver stopped = the
+handover HAPPENED and the kick's DEAD read refutes the hypothesis for real. A display that
+survives = the tag was ignored and the hypothesis stands untested. (Attended read — recorded
+at the bench.)
