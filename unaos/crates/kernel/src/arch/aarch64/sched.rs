@@ -1419,7 +1419,20 @@ static AUTO_ROTATE: AtomicUsize = AtomicUsize::new(0);
 /// (`exit`, `retire_killed`). This is the COMMITTED-load signal `pick_cpu` reads first: unlike
 /// ready-queue depth it counts a task that is currently RUNNING, and unlike the rolling busy window
 /// it updates synchronously with the placement rather than ~250 ms later.
-static EL0_RESIDENTS: [AtomicUsize; NUM_CPUS] = [const { AtomicUsize::new(0) }; NUM_CPUS];
+/// SPIN-3 (2026-07-30, the P96 exoneration cascade): the BCM2711's A72 cores have NO LSE atomics —
+/// every RMW is an LL/SC retry loop, and an exclusive reservation broken by another core's store to
+/// the SAME CACHE LINE retries forever under sustained contention. The per-cpu accounting atomics
+/// were adjacent (4-8 to a 64-byte line): the yield storm hammering its own counters at MHz rates
+/// starved rx-backstop's `make_ready` fetch_add on a NEIGHBORING counter for 20-200 s, IRQ-masked —
+/// with every lock witness reading clean, because the locks live on other lines. One padded slot per
+/// core ends the false sharing; the reservation granule is the line.
+#[repr(align(64))]
+struct PaddedUsize(AtomicUsize);
+#[repr(align(64))]
+struct PaddedSlotRow([AtomicU32; KILL_ASID_SLOTS]);
+
+static EL0_RESIDENTS: [PaddedUsize; NUM_CPUS] =
+    [const { PaddedUsize(AtomicUsize::new(0)) }; NUM_CPUS];
 
 /// SPREAD-3 — commit one EL0 resident to `cpu`. Called BEFORE the run-queue push so a concurrent
 /// `pick_cpu` on another core can never place a second resident against a stale count. Returns the
@@ -1434,7 +1447,7 @@ fn el0_resident_enter(cpu: usize) -> usize {
     if cpu >= NUM_CPUS {
         return 0;
     }
-    EL0_RESIDENTS[cpu].fetch_add(1, Ordering::AcqRel) + 1
+    EL0_RESIDENTS[cpu].0.fetch_add(1, Ordering::AcqRel) + 1
 }
 
 /// SPREAD-3 — release one EL0 resident from `cpu` (task reaped). Saturating at zero: an accounting
@@ -1446,7 +1459,7 @@ fn el0_resident_leave(cpu: usize) {
     if cpu >= NUM_CPUS {
         return;
     }
-    let _ = EL0_RESIDENTS[cpu].fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+    let _ = EL0_RESIDENTS[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
         if n == 0 { None } else { Some(n - 1) }
     });
 }
@@ -1492,13 +1505,14 @@ fn el0_resident_leave(cpu: usize) {
 /// `retire_killed` needs no arm here: the task it reaps was just POPPED FROM A RUN QUEUE, so it was
 /// READY (already un-parked by the `make_ready` that the kill sweep performed) and only its
 /// `EL0_RESIDENTS` credit is outstanding. `exit()` likewise runs on a RUNNING task.
-static EL0_PARKED: [AtomicUsize; NUM_CPUS] = [const { AtomicUsize::new(0) }; NUM_CPUS];
+static EL0_PARKED: [PaddedUsize; NUM_CPUS] =
+    [const { PaddedUsize(AtomicUsize::new(0)) }; NUM_CPUS];
 
 /// SPREAD-4 — note that a committed EL0 resident of `cpu` has gone to sleep.
 #[inline]
 fn el0_parked_enter(cpu: usize) {
     if cpu < NUM_CPUS {
-        EL0_PARKED[cpu].fetch_add(1, Ordering::AcqRel);
+        EL0_PARKED[cpu].0.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -1511,7 +1525,7 @@ fn el0_parked_leave(cpu: usize) {
     if cpu >= NUM_CPUS {
         return;
     }
-    let _ = EL0_PARKED[cpu].fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+    let _ = EL0_PARKED[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
         if n == 0 { None } else { Some(n - 1) }
     });
 }
@@ -1527,9 +1541,9 @@ fn el0_active(cpu: usize) -> usize {
     if cpu >= NUM_CPUS {
         return 0;
     }
-    EL0_RESIDENTS[cpu]
+    EL0_RESIDENTS[cpu].0
         .load(Ordering::Acquire)
-        .saturating_sub(EL0_PARKED[cpu].load(Ordering::Acquire))
+        .saturating_sub(EL0_PARKED[cpu].0.load(Ordering::Acquire))
 }
 
 // SPREAD-10 — A VUG'S TRIPLE LIVES TOGETHER; THE RENDEZVOUS COMES HOME.
@@ -1582,8 +1596,8 @@ fn el0_active(cpu: usize) -> usize {
 /// (1..=`boot::USER_SLOTS`; index 0 — kernel tasks and the shared window — is never counted and never
 /// biases). Enter/leave sites mirror `EL0_RESIDENTS` exactly: both EL0 spawn paths, the `make_ready`
 /// move (transfer home -> target), and every reap path. Lock-free; same saturating-leave discipline.
-static SLOT_CORE_RES: [[AtomicU32; KILL_ASID_SLOTS]; NUM_CPUS] =
-    [const { [const { AtomicU32::new(0) }; KILL_ASID_SLOTS] }; NUM_CPUS];
+static SLOT_CORE_RES: [PaddedSlotRow; NUM_CPUS] =
+    [const { PaddedSlotRow([const { AtomicU32::new(0) }; KILL_ASID_SLOTS]) }; NUM_CPUS];
 
 /// SPREAD-10 — placements the co-residency bonus DECIDED: rewake moves that qualified only through
 /// the sibling lane, plus spawns whose winner differs from what the bonus-free key would have picked.
@@ -1610,7 +1624,7 @@ fn slot_of(user_ttbr0: u64) -> usize {
 fn slot_res_enter(cpu: usize, user_ttbr0: u64) {
     let slot = slot_of(user_ttbr0);
     if slot != 0 && cpu < NUM_CPUS {
-        SLOT_CORE_RES[cpu][slot].fetch_add(1, Ordering::AcqRel);
+        SLOT_CORE_RES[cpu].0[slot].fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -1621,7 +1635,7 @@ fn slot_res_enter(cpu: usize, user_ttbr0: u64) {
 fn slot_res_leave(cpu: usize, user_ttbr0: u64) {
     let slot = slot_of(user_ttbr0);
     if slot != 0 && cpu < NUM_CPUS {
-        let _ = SLOT_CORE_RES[cpu][slot].fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        let _ = SLOT_CORE_RES[cpu].0[slot].fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             if n == 0 { None } else { Some(n - 1) }
         });
     }
@@ -1633,7 +1647,7 @@ fn slot_res(cpu: usize, slot: usize) -> u32 {
     if slot == 0 || cpu >= NUM_CPUS {
         return 0;
     }
-    SLOT_CORE_RES[cpu][slot].load(Ordering::Acquire)
+    SLOT_CORE_RES[cpu].0[slot].load(Ordering::Acquire)
 }
 
 /// SPREAD-4 — how much less loaded another core must be before a waking EL0 task is moved onto it,
@@ -5723,13 +5737,13 @@ fn spread4_witness() {
     serial_println!(
         "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} short={} refresh={} margin={} minpark={}ms",
         el0_active(0),
-        EL0_RESIDENTS[0].load(Ordering::Relaxed),
+        EL0_RESIDENTS[0].0.load(Ordering::Relaxed),
         el0_active(1),
-        EL0_RESIDENTS[1].load(Ordering::Relaxed),
+        EL0_RESIDENTS[1].0.load(Ordering::Relaxed),
         el0_active(2),
-        EL0_RESIDENTS[2].load(Ordering::Relaxed),
+        EL0_RESIDENTS[2].0.load(Ordering::Relaxed),
         el0_active(3),
-        EL0_RESIDENTS[3].load(Ordering::Relaxed),
+        EL0_RESIDENTS[3].0.load(Ordering::Relaxed),
         SPREAD4_REWAKE.load(Ordering::Relaxed),
         SPREAD4_STAY.load(Ordering::Relaxed),
         SPREAD5_SHORT_STAY.load(Ordering::Relaxed),
@@ -5759,7 +5773,7 @@ fn spread10_witness() {
     for slot in 1..KILL_ASID_SLOTS {
         let mut cores = 0u32;
         for cpu in 0..NUM_CPUS {
-            if SLOT_CORE_RES[cpu][slot].load(Ordering::Relaxed) > 0 {
+            if SLOT_CORE_RES[cpu].0[slot].load(Ordering::Relaxed) > 0 {
                 cores += 1;
             }
         }
