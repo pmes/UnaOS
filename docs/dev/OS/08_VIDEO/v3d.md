@@ -3286,3 +3286,45 @@ firmware/VPU establishes and we do not. This is the standing bench ask for the S
 QEMU raspi4b models no V3D: `[v3d74]` sits behind the hub-identity gate and `UNAOS_V3D_DEEP`, so
 `kernel8-test` green means **no regression and nothing more** — the verdict is metal-attended,
 read at the next bench boot with `UNAOS_V3D_DEEP=1`.
+
+## 46. The S1S firmware-init campaign — every register divergence explained (V3D-75…78)
+
+The §45.4 bench ask was answered the same sitting (2026-07-30): the dump rig grew a
+`--trigger ct0run` mode (in-process mmap spin on `CT0CS.CTRUN`, instant snapshot + 1 ms settle)
+and caught a genuine mid-bin capture (in-span=True; settle proves it: `CT0CS 0x20→0x00`,
+`BFC 0xE4→0xE5` across the millisecond). Four rungs and one condition boot then closed the
+entire register-visible search space.
+
+### 46.1 The mid-bin diff and its three divergences
+
+Against every wedged UnaOS reading: `RPIVID_ASB_V3D_M_CTRL` 0x4040 vs our 0x4; the legacy ASB
+bridges parked (0x5) on both sides; wedged `CT0CS` 0x70 (bits 4+6 above CTRUN) vs 0x20 while
+genuinely fetching. A full-window sweep was added on both sides (`[v3d76]` in the DEEP battery;
+`--sweep` in the dump script — same `SWEEP phys= val=` line format, `diff` is the instrument).
+The sweep reduced the structural divergences to exactly two UNNAMED words, absent from mainline
+`v3d_regs.h`: core0+0x68 (piOS 0x3, ours 0x10001) and hub+0x68 (piOS 0x2, ours 0).
+
+### 46.2 The verdicts, in order (each read on metal)
+
+| Rung / boot | Experiment | Verdict |
+|---|---|---|
+| `[v3d75a]` P86 | mailbox `SET_ENABLE_QPU(1)` (0x00030012) | MAILBOX FAILED — tag unhandled by this firmware; route closed |
+| `[v3d75b]` P86 | `M_CTRL = pw\|0x4040` transplant | did NOT hold — VPU-owned bits (mid-bin2 later showed them cycling 0x4050→0x4060 live) |
+| `[v3d77a]` P88 | core0+0x68 ← 0x3 | readback unchanged — READ-ONLY status word |
+| `[v3d77b]` P88 | hub+0x68 ← 0x2 | readback unchanged — READ-ONLY |
+| P89-KMSCOND | byte-identical kernel + `dtoverlay=vc4-kms-v3d` + dtbos in the FAT | NOTHING changes at handoff: entry bridges still 0x7, core+0x68 still 0x10001, `[v3d74a]` still never-starts — start4.elf does not establish the condition, overlay or not |
+| idle-dump recheck | V3D-71-era `v3d-dump-idle.txt` | **idle piOS `M_CTRL=0x4` — OUR value.** The high bits are bridge ACTIVITY STATUS (an effect of AXI traffic), not an enabling condition |
+
+### 46.3 Where that leaves the wall
+
+Every ARM-visible register divergence between the wedged and the working system is now
+explained as job-state, free-running counters, VPU-owned live status, or read-only status.
+core0+0x68 bit16 (0x10001 wedged vs 0x3 fetching) remains valuable as the wedge's visible
+SIGNATURE — a diagnosis window, not a knob. The instrument-lie ledger gains n+1: a fabric
+status word read mid-render, mistaken for init state.
+
+The remaining truth channels are outside the register file: the VPU firmware's own V3D state
+(not ARM-visible), and whatever the Linux driver chain requests THROUGH the firmware at probe
+time that our bringup does not (clock/reset/power sequencing differences — a source-audit of
+raspberrypi-power/raspberrypi-clk/v3d-probe on BCM2711 is the next instrument, before any
+further boot is spent).
