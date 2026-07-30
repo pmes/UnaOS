@@ -408,6 +408,16 @@ pub fn log_summary_once() {
             serial_println!("xHCI: {}", line);
         }
     }
+    // BOT-PHASE (lift 0825ed08): the phase-desync census, printed once per boot alongside the
+    // topology summary. `tag_mismatch=`/`bad_sig=` were one-off prints with no denominator;
+    // `undrained=` is the single-chokepoint fix's own regression witness and MUST read 0.
+    serial_println!(
+        ":: BOT: phase tag_mismatch={} bad_sig={} abandoned_in={} abandoned_out={} undrained={} short_in={} short_out={} ev_late={} ev_unaddressed={} result=SUMMARY ::",
+        BOT_TAG_MISMATCH.load(Ordering::Relaxed), BOT_BAD_SIG.load(Ordering::Relaxed),
+        BOT_TD_ABANDONED_IN.load(Ordering::Relaxed), BOT_TD_ABANDONED_OUT.load(Ordering::Relaxed),
+        BOT_TD_UNDRAINED.load(Ordering::Relaxed),
+        BOT_SHORT_DATA_IN.load(Ordering::Relaxed), BOT_SHORT_DATA_OUT.load(Ordering::Relaxed),
+        BOT_EV_LATE_CLAIM.load(Ordering::Relaxed), BOT_EV_UNADDRESSED.load(Ordering::Relaxed));
 }
 
 pub static COMMAND_RING: Mutex<Option<TransferRing>> = Mutex::new(None);
@@ -418,7 +428,7 @@ pub static mut ERST_TABLE: ErstTable = ErstTable { entries: [ErstEntry { ring_ad
 // Store Physical Address of the Event Ring for Runtime ERDP updates
 static mut EVENT_RING_PHYS_BASE: u64 = 0;
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// PIUSB-10: set true once USBSTS.CNR has been observed clear (in `init_interrupter`, immediately
 /// before the first op/runtime-register programming). `init_pointers` and `start` refuse to write
@@ -626,6 +636,10 @@ pub enum BotError {
     TagMismatch,
     TransferError(u8),
     NoDevice,
+    /// BOT-PHASE (lift 0825ed08): a bulk stage was refused because its push would lap the
+    /// controller's dequeue pointer (xHCI 1.2 §4.9.1), or a `push` itself failed. Raised by the
+    /// up-front ring guard BEFORE anything is pushed, so a refusal leaves both rings byte-untouched.
+    RingFull,
 }
 
 /// A successful BOT transaction result (CSW decoded).
@@ -634,6 +648,61 @@ pub struct BotResult {
     pub status: CswStatus,
     pub residue: u32,
 }
+
+// --- BOT-PHASE (2026-07-29, lift 0825ed08): the phase-desync witnesses ---
+//
+// The gemini seat's audit reconstructed, from a corrupted medium, a directory sector holding CBW
+// bytes — i.e. the driver had put a Command Block Wrapper where FAT data belonged. Our own aarch64
+// audit found the same hole family on the VL805 path (error exits with no resync, no ring capacity
+// check, discarded push results, blanket cc=13 acceptance). The mechanism is a DIRTY RING: an error
+// exit from `bot_transfer` used to return with TRBs still pushed on the bulk rings and the
+// controller's dequeue pointer parked on them. The next transaction's doorbell then replayed that
+// stale payload+CBW into a device whose own BOT phase machine was still mid-transfer, and the two
+// state machines slid one phase apart: what the host called "data" the device answered as
+// "command", and vice versa. Everything below exists to make that condition COUNTABLE rather than
+// reconstructible only from a wrecked filesystem.
+//
+/// Error exits from `bot_transfer` that left at least one pushed-but-unretired TRB on a bulk ring,
+/// split by pipe. These are the transactions that COULD have stranded a CBW; a non-zero reading is
+/// expected on any boot that saw a real transport fault and says nothing by itself.
+pub static BOT_TD_ABANDONED_IN: AtomicU64 = AtomicU64::new(0);
+pub static BOT_TD_ABANDONED_OUT: AtomicU64 = AtomicU64::new(0);
+/// The subset of the above for which the ring was NOT successfully resynchronised afterwards — a
+/// stranded TRB the controller can still be pointed at when the next doorbell rings. **This is the
+/// primary fix's own regression witness: with the single chokepoint in place it must read 0 on
+/// every boot.** Counted from the POST-resync scan, which is read out of an endpoint context whose
+/// TR Dequeue Pointer field is architecturally defined (the endpoint is Stopped by then) — unlike
+/// the pre-resync scan, which under a Running endpoint may read a frozen birth value (GUARD-STATE:
+/// proven on Intel Panther Point; assume the VL805 no kinder). That is why the undrained counter,
+/// not the abandoned counter, is the one with an asserted value.
+pub static BOT_TD_UNDRAINED: AtomicU64 = AtomicU64::new(0);
+/// Boot totals for the two CSW-validation rejections. Both were one-off `serial_println!`s with no
+/// rate attached, so a log could show one and never answer "out of how many?" — the question that
+/// separates a single torn read from a systematic overlay. Folded into the BOT SUMMARY line.
+pub static BOT_TAG_MISMATCH: AtomicU64 = AtomicU64::new(0);
+pub static BOT_BAD_SIG: AtomicU64 = AtomicU64::new(0);
+/// Data stages whose Transfer Event residue said FEWER bytes moved than `dCBWDataTransferLength`
+/// asked for. On an OUT stage this is a phase slip in the making: the device stopped accepting
+/// bytes, so it is NOT in its status phase, and queueing the CSW there is what desynchronises the
+/// two machines. Counted for both directions; only OUT is treated as a fault (see `bot_transfer_body`).
+pub static BOT_SHORT_DATA_IN: AtomicU64 = AtomicU64::new(0);
+pub static BOT_SHORT_DATA_OUT: AtomicU64 = AtomicU64::new(0);
+/// Monotonic stage generation. Stamped into every `BotPending` at arm time and printed by the BOT
+/// strand witness, so a completion, a strand line and a timeout can be tied to the SAME stage in a
+/// log where TRB ADDRESSES RECUR — a 16-TRB ring at three pushes per transaction repeats an address
+/// every ~5 transactions, which is the aliasing the de-aliased matching defends against.
+static BOT_STAGE_GEN: AtomicU32 = AtomicU32::new(0);
+/// Transfer Events that arrived for a `BotPending` which had ALREADY been completed (`done`), and
+/// were therefore refused rather than allowed to overwrite the recorded completion code. Non-zero
+/// means real event aliasing is happening on this platform and the first-write latch is earning its
+/// keep; zero means the rings are draining cleanly. Either way it is a fact, not an inference.
+pub static BOT_EV_LATE_CLAIM: AtomicU64 = AtomicU64::new(0);
+/// Error completions claimed by the BOT pump WITHOUT a TRB-address match — the narrow residue of
+/// the blanket `is_error` claim this lift removed. Only reachable for an error whose TRB pointer
+/// addresses nothing in either of this slot's bulk rings (the codes that post no TRB pointer at
+/// all: Ring Underrun / Ring Overrun / VF Event Ring Full). A non-zero reading names exactly how
+/// often the driver has to fall back on "it can only be ours".
+pub static BOT_EV_UNADDRESSED: AtomicU64 = AtomicU64::new(0);
 
 /// In-flight BOT stage state. BOT phases (CBW -> [DATA] -> CSW) are pumped one at a time;
 /// the event handler records the completion (or an error) here while the synchronous pump
@@ -647,6 +716,26 @@ struct BotPending {
     wait_trb_phys: u64,
     done: bool,
     completion_code: u8,
+    /// BOT-PHASE fix 4: monotonic stage generation, from `BOT_STAGE_GEN`, stamped when the stage is
+    /// armed. TRB physical addresses RECUR — a 16-TRB ring at three pushes per BOT transaction
+    /// repeats an address roughly every five transactions — so `wait_trb_phys` alone cannot tell a
+    /// live stage's completion from a stale event for a long-dead one at the same slot. The
+    /// generation cannot travel on the wire (a Transfer Event carries only the TRB pointer), so it
+    /// is not a wire tag; it is (a) the log key that ties a completion, a strand line and a timeout
+    /// to ONE stage, and (b) the identity the first-write latch below is defined against.
+    generation: u32,
+    /// BOT-PHASE fix 3: TRB Transfer Length RESIDUE (untransferred bytes) taken from this stage's
+    /// Transfer Event (xHCI 1.2 §6.4.2.1 — for an IN or OUT Normal TRB the event reports what did
+    /// NOT move). `run_bot_stage` used to return the completion code alone, so a data stage that
+    /// moved fewer bytes than `dCBWDataTransferLength` asked for was indistinguishable from one that
+    /// moved all of them — `cc=13 SHORT PACKET` was simply accepted and the CSW queued behind it.
+    /// First-write latched via `residue_seen` for the same reason `Ep0Pending::data_seen` is: a
+    /// duplicate Success after a Short Packet for the same TD (Panther Point's
+    /// XHCI_SPURIOUS_SUCCESS quirk) would otherwise overwrite a real shortfall with 0.
+    residue: u32,
+    /// True once a Transfer Event has been recorded for this stage, so `residue == 0` is trusted as
+    /// "everything moved" rather than "nothing observed yet". Doubles as the first-write latch.
+    residue_seen: bool,
 }
 
 /// In-flight FTDI console bulk-OUT transfer (U2.5). The FTDI TX is a single bulk-OUT stage — no
@@ -1759,11 +1848,31 @@ impl XhciController {
 
                         // Bulk-Only Transport routing: if a BOT transaction is in flight on this
                         // slot's bulk endpoints, hand the completion to the synchronous pump.
-                        // The CSW is matched by its TRB address so it is never confused with a
-                        // data-stage event; any ERROR completion also finishes the transaction —
-                        // which is why this claim must sit BEFORE the success-only gate below
-                        // (it used to live inside it, so a bulk STALL was never delivered to the
-                        // pump and every stalled SCSI command burned the full pump timeout).
+                        // This claim must sit BEFORE the success-only gate below (it used to live
+                        // inside it, so a bulk STALL was never delivered to the pump and every
+                        // stalled SCSI command burned the full pump timeout).
+                        //
+                        // BOT-PHASE fix 4 (lift 0825ed08) — DE-ALIASING. This claim used to be:
+                        // match the awaited TRB address, OR claim ANY error completion on either
+                        // bulk DCI. The second half is a blanket claim over a slot's whole bulk
+                        // traffic, and TRB addresses recur (16-TRB rings, three pushes per
+                        // transaction — an address repeats every ~5 transactions), so between them
+                        // a STALE event for a long-retired TD could retire the LIVE stage with
+                        // someone else's completion code. Two narrowings, both minimal and both
+                        // provable from the event's own fields:
+                        //   1. The blanket error claim is gone. An error that names a TRB is now
+                        //      matched by address like any other event — a bulk STALL carries its
+                        //      TRB pointer, so the property the blanket claim was added for (a
+                        //      stalled command must not burn the full pump timeout) is preserved.
+                        //      The fallback survives ONLY for an error whose pointer addresses
+                        //      nothing in either of this slot's bulk rings — Ring Underrun (21),
+                        //      Ring Overrun (22) and VF Event Ring Full (either post no TRB pointer
+                        //      or a meaningless one), where "it can only be ours" is the sole
+                        //      available attribution. That fallback is COUNTED (`BOT_EV_UNADDRESSED`)
+                        //      rather than silent.
+                        //   2. First-write latch on `done`. A second event for an already-completed
+                        //      stage is refused, not allowed to overwrite the recorded completion
+                        //      code, and is counted (`BOT_EV_LATE_CLAIM`).
                         if endpoint_id > 1 && slot_id > 0 {
                             if let Some(p) = self.bot_pending {
                                 if p.slot_id == slot_id as u8
@@ -1771,9 +1880,32 @@ impl XhciController {
                                 {
                                     let is_match = param == p.wait_trb_phys;
                                     let is_error = completion_code != 1 && completion_code != 13;
-                                    if is_match || is_error {
+                                    // Does this event name a TRB in either of this slot's bulk
+                                    // rings? If it names one and it is not ours, it belongs to a
+                                    // retired TD and must not touch the live stage.
+                                    let addressed = {
+                                        let s = &self.slots[slot_id as usize];
+                                        s.bulk_in_ring.as_ref().is_some_and(|r| r.contains(param))
+                                            || s.bulk_out_ring.as_ref().is_some_and(|r| r.contains(param))
+                                    };
+                                    let unaddressed_error = is_error && !addressed;
+                                    if is_match || unaddressed_error {
+                                        if p.done {
+                                            // Fix 4 (2): the stage already has its completion.
+                                            BOT_EV_LATE_CLAIM.fetch_add(1, Ordering::Relaxed);
+                                            return; // refused, not overwritten
+                                        }
+                                        if unaddressed_error {
+                                            BOT_EV_UNADDRESSED.fetch_add(1, Ordering::Relaxed);
+                                        }
                                         if let Some(bp) = self.bot_pending.as_mut() {
                                             bp.completion_code = completion_code as u8;
+                                            // Fix 3: carry the residue out of the event instead of
+                                            // discarding it. Latched on first write.
+                                            if !bp.residue_seen {
+                                                bp.residue = transfer_len;
+                                                bp.residue_seen = true;
+                                            }
                                             bp.done = true;
                                         }
                                         return; // consumed by the BOT pump
@@ -4084,7 +4216,31 @@ impl XhciController {
     /// Execute a synchronous Bulk-Only Transport transaction: CBW -> (optional data) -> CSW.
     /// MUST be called from a non-event context (controller lock held, event ring free) such
     /// as the main loop or a shell command — never from inside handle_event_trb.
+    ///
+    /// BOT-PHASE fix 1 (lift 0825ed08) — **THE SINGLE CHOKEPOINT.** This function is a thin
+    /// wrapper whose only job is that *no error exit from a BOT transaction returns with a dirty
+    /// ring*. See `bot_clean_rings` for the mechanism and `bot_transfer_body` for the transaction
+    /// itself. Wrapping the whole body (rather than patching known exits) covers every error path
+    /// the audit named — the data-stage `TransferError` return, the status-stage `Err`
+    /// propagation, the CSW-validation rejections — and whatever exit a later arc adds.
     pub fn bot_transfer(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32, dir: Direction)
+        -> Result<BotResult, BotError>
+    {
+        let out = self.bot_transfer_body(slot_id, cdb, data_phys, data_len, dir);
+        if let Err(cause) = out {
+            // `NoDevice` is raised before anything is built or queued (no buffers or no bulk
+            // endpoints on the slot), so there is no ring to clean. Every OTHER error, from every
+            // path in the body, lands here exactly once. (`RingFull` is refused before anything is
+            // pushed, so its clean is a provable no-op — cheap, and keeping it inside the
+            // chokepoint means the invariant needs no per-variant argument.)
+            if !matches!(cause, BotError::NoDevice) {
+                self.bot_clean_rings(slot_id, cause);
+            }
+        }
+        out
+    }
+
+    fn bot_transfer_body(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32, dir: Direction)
         -> Result<BotResult, BotError>
     {
         let (cbw_phys, csw_phys, in_addr, out_addr) = {
@@ -4101,6 +4257,9 @@ impl XhciController {
         // into Reset Recovery: on a data-phase stall we still collect the CSW (resync), and if the
         // CSW itself fails we escalate to a full Bulk-Only Mass Storage Reset.
         let mut data_stalled = false;
+        // BOT-PHASE fix 3: bytes the data stage actually moved, from its Transfer Event residue.
+        // Cross-checked against the device's own `dCSWDataResidue` claim at CSW validation.
+        let mut data_moved: u32 = 0;
         let tag = self.build_cbw(cbw_phys as *mut u8, data_len, dir, cdb);
         unsafe { core::ptr::write_bytes(csw_phys as *mut u8, 0, 13); }
         // XHCI-COHERENCE: the CBW is CPU-written and DMA-read by the controller (bulk OUT) — clean it
@@ -4118,14 +4277,42 @@ impl XhciController {
         // stages each carry IOC (1<<5) so their completion posts a Transfer Event (-> MSI ->
         // the pump wakes). We await the DATA stage, then the CSW — never the CBW directly.
 
+        // BOT-PHASE fix 2 (lift 0825ed08) — THE RING GUARD RUNS BEFORE ANYTHING IS PUSHED.
+        //
+        // This tree had NO capacity guard at all (the audit's "no ring capacity check"): every
+        // stage's push went straight onto the ring, and during error recovery — where the
+        // controller's dequeue pointer is parked — a retry loop could push straight through it.
+        // The lift source's own lesson is folded in too: a guard checked per-stage, after the CBW
+        // push, manufactures the very stranded-TRB condition it exists to prevent (a RingFull from
+        // the data/status guard would leave the CBW un-rung on the OUT ring). So every ring this
+        // transaction will touch is checked here, up front; a refusal leaves BOTH rings
+        // byte-untouched.
+        //
+        // Healthy path: `bot_ring_guard` returns `Ok` immediately for a Running endpoint
+        // (GUARD-STATE: the context's dequeue field is undefined under Running — do not trust the
+        // read), so on a healthy device these are three no-op calls.
+        let data_out = matches!(dir, Direction::Out);
+        self.bot_ring_guard(slot_id, out_dci as u8, false)?;                // CBW (and an OUT data stage)
+        if data_len > 0 && !data_out {
+            self.bot_ring_guard(slot_id, in_dci as u8, true)?;              // IN data stage
+        }
+        self.bot_ring_guard(slot_id, in_dci as u8, true)?;                  // CSW
+
         // 1) CBW on bulk OUT (Normal TRB, 31 bytes).
+        // BOT-PHASE: the push result is no longer discarded. `TransferRing::push` returns a
+        // `Result`, and `.ok()` threw it away — a failed push would then have left the transaction
+        // waiting on whatever address the DEFAULT produced, which for the stages below was
+        // `ring_base + 0`: an address that is a real TRB slot and recurs, i.e. another aliasing
+        // vector for the matching in `handle_event_trb`. `push` cannot fail today (it always
+        // returns `Ok`), so this is byte-identical in behaviour; it is here so that if it ever can,
+        // the transaction fails honestly instead of waiting on a fabricated address.
         self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
-            .push(Trb { parameter: cbw_phys, status: 31, control: 1 << 10 }).ok();
+            .push(Trb { parameter: cbw_phys, status: 31, control: 1 << 10 })
+            .map_err(|_| BotError::RingFull)?;
 
         // 2) Data stage (IN or OUT), if any. IOC + ISP (1<<2) so both full and short-packet
         //    completions post an event; wait for it to retire BEFORE queuing the CSW.
         if data_len > 0 {
-            let data_out = matches!(dir, Direction::Out);
             let (data_dci, data_trb_phys) = {
                 let ring = if data_out {
                     self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
@@ -4145,8 +4332,10 @@ impl XhciController {
                 // below then drops the clean lines and the CPU parses fresh DRAM. This mirrors every
                 // other IN-arming site (interrupt-IN reports, control-IN, descriptor reads). No-op x86.
                 dma_coherency::clean(data_phys as usize, data_len as usize);
+                // BOT-PHASE: `.unwrap_or(0)` here would have silently made the pump wait on
+                // `ring_base + 0` — a real, recurring TRB address — after a failed push. Propagate.
                 let idx = ring.push(Trb { parameter: data_phys, status: data_len,
-                    control: (1 << 10) | (1 << 5) | (1 << 2) }).unwrap_or(0);
+                    control: (1 << 10) | (1 << 5) | (1 << 2) }).map_err(|_| BotError::RingFull)?;
                 (if data_out { out_dci } else { in_dci }, base + (idx as u64) * 16)
             };
 
@@ -4155,7 +4344,50 @@ impl XhciController {
             self.ring_doorbell(slot_id, out_dci as u32);
             if data_dci != out_dci { self.ring_doorbell(slot_id, data_dci as u32); }
 
-            let code = self.run_bot_stage(slot_id, in_dci, out_dci, data_trb_phys)?;
+            let (code, residue) = self.run_bot_stage(slot_id, in_dci, out_dci, data_trb_phys)?;
+            // BOT-PHASE fix 3 — SHORT-TRANSFER HONESTY.
+            //
+            // The Transfer Event's TRB Transfer Length field is the RESIDUE: the bytes of this TD
+            // that did NOT move (xHCI 1.2 §6.4.2.1). Until this lift `run_bot_stage` returned only
+            // the completion code, so `cc=13 SHORT PACKET` — which is exactly the code that says
+            // "fewer bytes than the TD asked for" — was accepted as success and the CSW was queued
+            // straight behind it. `moved` is what actually crossed the wire.
+            let moved = data_len.saturating_sub(residue);
+            data_moved = moved;
+            if moved != data_len {
+                if data_out {
+                    BOT_SHORT_DATA_OUT.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    BOT_SHORT_DATA_IN.fetch_add(1, Ordering::Relaxed);
+                }
+                // Prints on every shortfall in either direction, so the OUT case (a fault, below)
+                // and the IN case (legitimate SCSI, see the reasoning on the fault gate) are both
+                // on the record with the same grammar.
+                serial_println!(
+                    ":: BOT: dtl_vs_moved slot={} dir={} dtl={} moved={} residue={} cc={} verdict={} ::",
+                    slot_id, if data_out { "out" } else { "in" }, data_len, moved, residue, code,
+                    if data_out { "phase-fault" } else { "short-in-allowed" });
+            }
+            // OUT: the device stopped ACCEPTING bytes. USB MSC BOT 1.0 §6.7.3 case 9 (Ho > Do) —
+            // the device wants less than the host is sending, and the host must run Reset Recovery.
+            // It is NOT in its status phase, so queueing the CSW behind this is precisely the step
+            // that slides the two phase machines apart, and the next transaction's CBW then lands
+            // where a CSW was expected. Fail the transaction; the chokepoint cleans the rings.
+            //
+            // IN is deliberately NOT a fault, and the asymmetry is the spec's, not a softening:
+            // §6.7.2 case 4 (Hi > Di) has the device legitimately returning fewer bytes than the
+            // allocation length asked for — REQUEST SENSE (18), INQUIRY (36) and READ CAPACITY (8)
+            // are all commands whose CDB names a MAXIMUM — and the device is in its status phase
+            // afterwards, with `dCSWDataResidue` carrying the shortfall. Failing those would break
+            // bring-up on conforming devices. The IN shortfall is instead CROSS-CHECKED against the
+            // device's own residue claim at CSW validation below, which is the check that has
+            // teeth: host and device disagreeing about how much moved IS a phase fault.
+            if data_out && moved != data_len {
+                serial_println!(
+                    "xHCI: BOT OUT data stage moved {} of {} bytes — phase fault (BOT 1.0 §6.7.3 case 9)",
+                    moved, data_len);
+                return Err(BotError::TransferError(if code == 1 { 13 } else { code }));
+            }
             if code != 1 && code != 13 {
                 serial_println!("xHCI: BOT data stage error, completion code {}", code);
                 if code == 4 || code == 6 {
@@ -4188,10 +4420,13 @@ impl XhciController {
 
         // 3) CSW on bulk IN (13 bytes, IOC). The data stage (if any) has fully retired, so
         //    usb-storage is in its CSW state and services this token immediately.
+        // BOT-PHASE fix 2: this ring's headroom was checked up front, with the others, BEFORE the
+        // CBW was pushed — a refusal here would have stranded it.
         let csw_trb_phys = {
             let ring = self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap();
             let base = ring.get_ptr();
-            let idx = ring.push(Trb { parameter: csw_phys, status: 13, control: (1 << 10) | (1 << 5) }).unwrap_or(0);
+            let idx = ring.push(Trb { parameter: csw_phys, status: 13, control: (1 << 10) | (1 << 5) })
+                .map_err(|_| BotError::RingFull)?;
             base + (idx as u64) * 16
         };
         self.ring_doorbell(slot_id, in_dci as u32);
@@ -4200,7 +4435,7 @@ impl XhciController {
         // the pipe is wedged — escalate to full Bulk-Only Reset Recovery before surfacing the error
         // so the next command is not born onto a dead pipe.
         let code = match self.run_bot_stage(slot_id, in_dci, out_dci, csw_trb_phys) {
-            Ok(c) => c,
+            Ok((c, _csw_stage_residue)) => c,
             Err(e) => {
                 if data_stalled { self.recover_bot_full(slot_id); }
                 return Err(e);
@@ -4231,17 +4466,63 @@ impl XhciController {
             let residue = (csw[8] as u32) | ((csw[9] as u32) << 8) | ((csw[10] as u32) << 16) | ((csw[11] as u32) << 24);
             let bstatus = csw[12];
 
+            // BOT-PHASE witness (lift 0825ed08): the raw 13 CSW bytes, printed on EVERY rejection
+            // below. The lift source's capture recorded a single garbage tag with nothing to read
+            // it against, and the two candidate explanations — a TORN READ of a partially
+            // DMA-written CSW, versus an OVERLAY of some other payload onto the CSW buffer — are
+            // distinguished by the bytes AROUND the tag, which were never printed. A valid `USBS`
+            // signature with a wrong tag is a stale-but-well-formed CSW (phase slip); high-entropy
+            // bytes across all 13 are an overlay; a mixture of expected and zero bytes is a torn
+            // read.
+            let hexdump = |what: &str| {
+                serial_println!(
+                    ":: BOT: csw_bytes slot={} why={} tag_want={:#010x} b={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                    slot_id, what, tag,
+                    csw[0], csw[1], csw[2], csw[3], csw[4], csw[5], csw[6],
+                    csw[7], csw[8], csw[9], csw[10], csw[11], csw[12]);
+            };
+
             if sig != 0x53425355 {
-                serial_println!("xHCI: BOT bad CSW signature {:#x}", sig);
+                BOT_BAD_SIG.fetch_add(1, Ordering::Relaxed);
+                serial_println!("xHCI: BOT bad CSW signature {:#x} (boot total {})",
+                    sig, BOT_BAD_SIG.load(Ordering::Relaxed));
+                hexdump("bad-sig");
                 // PIUSB-38: a garbage CSW after a data-phase stall means the resync attempt did not
                 // land a valid status — the pipe is out of phase, so do full Reset Recovery.
                 if data_stalled { self.recover_bot_full(slot_id); }
                 return Err(BotError::BadCswSignature);
             }
             if csw_tag != tag {
-                serial_println!("xHCI: BOT CSW tag mismatch (got {:#x}, want {:#x})", csw_tag, tag);
+                BOT_TAG_MISMATCH.fetch_add(1, Ordering::Relaxed);
+                serial_println!("xHCI: BOT CSW tag mismatch (got {:#x}, want {:#x}; boot total {})",
+                    csw_tag, tag, BOT_TAG_MISMATCH.load(Ordering::Relaxed));
+                hexdump("tag-mismatch");
                 if data_stalled { self.recover_bot_full(slot_id); }
                 return Err(BotError::TagMismatch);
+            }
+            // BOT-PHASE fix 3: VALIDATE `dCSWDataResidue`. It was decoded and handed to the caller
+            // but never checked against anything, so a transaction that moved ZERO bytes and came
+            // back `bStatus=0` with a full residue was reported to the FAT layer as a clean
+            // success — a silent short write, or a read whose buffer keeps whatever was in it. The
+            // device's residue is its own claim about how many bytes did not move; the Transfer
+            // Event residue is the CONTROLLER's. Two independent witnesses of one quantity: if
+            // they disagree, one of the two state machines is a phase out, and that is exactly the
+            // condition this lift refuses to call success. Skipped after a data-phase stall: the
+            // stalled stage's residue is not a measurement of a completed transfer, and the CSW
+            // carries the real (Failed) verdict.
+            if data_len > 0 && !data_stalled {
+                let device_moved = data_len.saturating_sub(residue.min(data_len));
+                if residue > data_len || device_moved != data_moved {
+                    serial_println!(
+                        ":: BOT: residue_disagree slot={} dir={} dtl={} host_moved={} dev_residue={} dev_moved={} bstatus={} ::",
+                        slot_id, if data_out { "out" } else { "in" }, data_len,
+                        data_moved, residue, device_moved, bstatus);
+                    serial_println!(
+                        "xHCI: BOT CSW residue disagrees with the transfer event (dtl {}, host moved {}, device says {} moved) — phase fault",
+                        data_len, data_moved, device_moved);
+                    hexdump("residue-disagree");
+                    return Err(BotError::TransferError(13));
+                }
             }
             let status = match bstatus {
                 0 => CswStatus::Passed, 1 => CswStatus::Failed,
@@ -4259,8 +4540,28 @@ impl XhciController {
     /// coherency, same serialized CBW -> DATA -> CSW). A TD-SHAPE variant: if a single-TRB 512 B
     /// TD reads zeros but a two-TRB TD reads data (or vice-versa), the discriminator is TD shape,
     /// not transfer length. Read-only, aarch64-only.
+    ///
+    /// PIUSB36-PHASE: this probe is the aarch64-only twin of `bot_transfer` and carried the same
+    /// phase-desync holes the BOT-PHASE lift closes there — error exits with no resync, discarded
+    /// push results, and stall arms that returned WITHOUT collecting the CSW (the pre-PIUSB-38
+    /// wedge shape: the device sits in its status phase while the host abandons the transaction,
+    /// so the two BOT machines part company and every later command on the slot inherits it). It
+    /// now goes through the same single chokepoint, and its data-stall arm collects the CSW after
+    /// recovery, exactly like `bot_transfer_body`. The two-TRB TD shape — the probe's whole point —
+    /// is untouched.
     #[cfg(target_arch = "aarch64")]
     fn piusb36_read10_two_trb(&mut self, slot_id: u8, data_phys: u64) -> Result<BotResult, BotError> {
+        let out = self.piusb36_read10_two_trb_body(slot_id, data_phys);
+        if let Err(cause) = out {
+            if !matches!(cause, BotError::NoDevice) {
+                self.bot_clean_rings(slot_id, cause);
+            }
+        }
+        out
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn piusb36_read10_two_trb_body(&mut self, slot_id: u8, data_phys: u64) -> Result<BotResult, BotError> {
         let (cbw_phys, csw_phys, in_addr, out_addr) = {
             let slot = &self.slots[slot_id as usize];
             let cbw = match slot.cbw_buffer { Some(p) => p as u64, None => return Err(BotError::NoDevice) };
@@ -4271,15 +4572,24 @@ impl XhciController {
         let in_dci = ((in_addr & 0x0F) * 2) + 1;
         let out_dci = (out_addr & 0x0F) * 2;
 
+        // PIUSB36-PHASE: same PIUSB-38 stall latch as `bot_transfer_body` — a data-phase stall
+        // steers the status stage into Reset Recovery instead of returning with the CSW uncollected.
+        let mut data_stalled = false;
         let cdb = [0x28u8, 0, 0, 0, 0, 0, 0, 0, 1, 0]; // READ(10) LBA0, 1 block
         let tag = self.build_cbw(cbw_phys as *mut u8, 512, Direction::In, &cdb);
         unsafe { core::ptr::write_bytes(csw_phys as *mut u8, 0, 13); }
         dma_coherency::clean(cbw_phys as usize, 31);
         dma_coherency::clean_inval(csw_phys as usize, 13);
 
-        // 1) CBW on bulk OUT.
+        // PIUSB36-PHASE (BOT-PHASE fix 2): all headroom checked up front, before anything is
+        // pushed — this transaction puts one TRB on the OUT ring and three on the IN ring.
+        self.bot_ring_guard(slot_id, out_dci, false)?;
+        self.bot_ring_guard(slot_id, in_dci, true)?;
+
+        // 1) CBW on bulk OUT. Push result propagated (BOT-PHASE fix 2), not discarded.
         self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
-            .push(Trb { parameter: cbw_phys, status: 31, control: 1 << 10 }).ok();
+            .push(Trb { parameter: cbw_phys, status: 31, control: 1 << 10 })
+            .map_err(|_| BotError::RingFull)?;
 
         // 2) Two chained IN data TRBs (256 B + 256 B). Clean the whole 512 B buffer to DRAM first,
         //    exactly like the single-TRB IN path. The completion event (IOC) rides the SECOND TRB;
@@ -4289,41 +4599,117 @@ impl XhciController {
             let ring = self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap();
             let base = ring.get_ptr();
             // TRB 1: 256 B, CHAIN, no IOC.
-            ring.push(Trb { parameter: data_phys, status: 256, control: (1 << 10) | (1 << 4) }).ok();
+            ring.push(Trb { parameter: data_phys, status: 256, control: (1 << 10) | (1 << 4) })
+                .map_err(|_| BotError::RingFull)?;
             // TRB 2: 256 B, IOC (1<<5) + ISP (1<<2).
             let idx = ring.push(Trb { parameter: data_phys + 256, status: 256,
-                control: (1 << 10) | (1 << 5) | (1 << 2) }).unwrap_or(0);
+                control: (1 << 10) | (1 << 5) | (1 << 2) }).map_err(|_| BotError::RingFull)?;
             base + (idx as u64) * 16
         };
         self.ring_doorbell(slot_id, out_dci as u32);
         self.ring_doorbell(slot_id, in_dci as u32);
-        let code = self.run_bot_stage(slot_id, in_dci, out_dci, data_trb_phys)?;
-        if code != 1 && code != 13 {
-            if code == 4 || code == 6 { self.recover_bulk_stall(slot_id, true); return Err(BotError::Stall); }
-            return Err(BotError::TransferError(code));
+        let (code, residue) = self.run_bot_stage(slot_id, in_dci, out_dci, data_trb_phys)?;
+        // PIUSB36-PHASE (BOT-PHASE fix 3): judge the stage against its own transfer length. This
+        // is an IN stage, so a shortfall is legal (BOT 1.0 §6.7.2 case 4) and is policed by the
+        // residue cross-check at the CSW instead — the same deliberate asymmetry as
+        // `bot_transfer_body`, not softened and not "fixed".
+        let data_moved = 512u32.saturating_sub(residue);
+        if data_moved != 512 {
+            BOT_SHORT_DATA_IN.fetch_add(1, Ordering::Relaxed);
+            serial_println!(
+                ":: BOT: dtl_vs_moved slot={} dir=in dtl=512 moved={} residue={} cc={} verdict=short-in-allowed ::",
+                slot_id, data_moved, residue, code);
         }
-        dma_coherency::inval(data_phys as usize, 512);
+        if code != 1 && code != 13 {
+            if code == 4 || code == 6 {
+                // PIUSB36-PHASE: the data endpoint halted. This used to `return Err(Stall)`
+                // IMMEDIATELY — the pre-PIUSB-38 wedge shape: the device stalls the DATA phase,
+                // not the command, so it is sitting in its status phase with a Failed CSW ready,
+                // and abandoning the transaction here leaves the two BOT machines one phase
+                // apart. Clear the halt, then STILL collect the CSW below (resync); if the status
+                // stage also fails, escalate to full Reset Recovery.
+                self.recover_bulk_stall(slot_id, true);
+                data_stalled = true;
+            } else {
+                return Err(BotError::TransferError(code));
+            }
+        }
+        // Skip the invalidate after a stall: the buffer holds no valid transfer, and the CSW below
+        // carries the real (Failed) verdict.
+        if !data_stalled {
+            dma_coherency::inval(data_phys as usize, 512);
+        }
 
-        // 3) CSW on bulk IN.
+        // 3) CSW on bulk IN. Headroom was checked up front; push result propagated.
         let csw_trb_phys = {
             let ring = self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap();
             let base = ring.get_ptr();
-            let idx = ring.push(Trb { parameter: csw_phys, status: 13, control: (1 << 10) | (1 << 5) }).unwrap_or(0);
+            let idx = ring.push(Trb { parameter: csw_phys, status: 13, control: (1 << 10) | (1 << 5) })
+                .map_err(|_| BotError::RingFull)?;
             base + (idx as u64) * 16
         };
         self.ring_doorbell(slot_id, in_dci as u32);
-        let code = self.run_bot_stage(slot_id, in_dci, out_dci, csw_trb_phys)?;
+        // PIUSB36-PHASE: if the status stage cannot complete after a data-phase stall, the pipe is
+        // wedged — full Reset Recovery before surfacing the error (mirrors `bot_transfer_body`).
+        let code = match self.run_bot_stage(slot_id, in_dci, out_dci, csw_trb_phys) {
+            Ok((c, _csw_residue)) => c,
+            Err(e) => {
+                if data_stalled { self.recover_bot_full(slot_id); }
+                return Err(e);
+            }
+        };
         if code != 1 && code != 13 {
-            if code == 4 || code == 6 { self.recover_bulk_stall(slot_id, true); return Err(BotError::Stall); }
+            if code == 4 || code == 6 {
+                // Status-phase stall: the CSW pipe itself is dead — clear the halt and do FULL
+                // Reset Recovery so no later command inherits the wedge (BOT 1.0 §6.7.2/§5.3.4).
+                self.recover_bulk_stall(slot_id, true);
+                self.recover_bot_full(slot_id);
+                return Err(BotError::Stall);
+            }
             return Err(BotError::TransferError(code));
         }
         unsafe {
             dma_coherency::inval(csw_phys as usize, 13);
             let csw = core::slice::from_raw_parts(csw_phys as *const u8, 13);
+            let sig = (csw[0] as u32) | ((csw[1] as u32) << 8) | ((csw[2] as u32) << 16) | ((csw[3] as u32) << 24);
             let csw_tag = (csw[4] as u32) | ((csw[5] as u32) << 8) | ((csw[6] as u32) << 16) | ((csw[7] as u32) << 24);
             let residue = (csw[8] as u32) | ((csw[9] as u32) << 8) | ((csw[10] as u32) << 16) | ((csw[11] as u32) << 24);
-            let status = match csw[12] { 0 => CswStatus::Passed, 1 => CswStatus::Failed, 2 => CswStatus::PhaseError, _ => CswStatus::Unknown };
-            if csw_tag != tag { return Err(BotError::TagMismatch); }
+            let bstatus = csw[12];
+            let hexdump = |what: &str| {
+                serial_println!(
+                    ":: BOT: csw_bytes slot={} why={} tag_want={:#010x} b={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                    slot_id, what, tag,
+                    csw[0], csw[1], csw[2], csw[3], csw[4], csw[5], csw[6],
+                    csw[7], csw[8], csw[9], csw[10], csw[11], csw[12]);
+            };
+            // PIUSB36-PHASE: validate the signature too (it was skipped here), with the same
+            // counters + csw_bytes grammar as `bot_transfer_body`, so the SUMMARY ledger counts
+            // this path's rejections as well.
+            if sig != 0x53425355 {
+                BOT_BAD_SIG.fetch_add(1, Ordering::Relaxed);
+                hexdump("bad-sig");
+                if data_stalled { self.recover_bot_full(slot_id); }
+                return Err(BotError::BadCswSignature);
+            }
+            if csw_tag != tag {
+                BOT_TAG_MISMATCH.fetch_add(1, Ordering::Relaxed);
+                hexdump("tag-mismatch");
+                if data_stalled { self.recover_bot_full(slot_id); }
+                return Err(BotError::TagMismatch);
+            }
+            // PIUSB36-PHASE (BOT-PHASE fix 3): the IN-short cross-check with teeth — device and
+            // controller must agree on how many bytes moved, else it is a phase fault.
+            if !data_stalled {
+                let device_moved = 512u32.saturating_sub(residue.min(512));
+                if residue > 512 || device_moved != data_moved {
+                    serial_println!(
+                        ":: BOT: residue_disagree slot={} dir=in dtl=512 host_moved={} dev_residue={} dev_moved={} bstatus={} ::",
+                        slot_id, data_moved, residue, device_moved, bstatus);
+                    hexdump("residue-disagree");
+                    return Err(BotError::TransferError(13));
+                }
+            }
+            let status = match bstatus { 0 => CswStatus::Passed, 1 => CswStatus::Failed, 2 => CswStatus::PhaseError, _ => CswStatus::Unknown };
             Ok(BotResult { status, residue })
         }
     }
@@ -4797,6 +5183,317 @@ impl XhciController {
         serial_println!(":: PIUSB: [piusb38] === stall-recovery + low-LBA bisect complete === ::");
     }
 
+    /// BOT-PHASE (lift 0825ed08): read one endpoint's EP State field from the OUTPUT device
+    /// context (xHCI 1.2 §6.2.3, Endpoint Context dword 0 bits 2:0; 0=Disabled 1=Running 2=Halted
+    /// 3=Stopped 4=Error). Returns `0xFF` when the slot has no output context (nothing to read).
+    /// One bounded volatile read, no command, no wait.
+    fn ep_state_of(&self, slot_id: u8, dci: u8) -> u8 {
+        let oc = self.slots[slot_id as usize].output_context;
+        if oc.is_null() {
+            return 0xFF;
+        }
+        (unsafe { core::ptr::read_volatile((oc as *const u32).add(dci as usize * CTX_WORDS)) } & 0x7) as u8
+    }
+
+    /// BOT-PHASE (lift 0825ed08): the controller's own TR Dequeue Pointer for one endpoint, out of
+    /// the OUTPUT device context (xHCI 1.2 §6.2.3, Endpoint Context dwords 2:3 — bit 0 is the
+    /// Dequeue Cycle State, kept because a witness wants the raw field). `0` when the slot has no
+    /// output context. GUARD-STATE discipline (lift): the field is only architecturally DEFINED
+    /// while the endpoint is NOT Running (xHCI 1.2 §4.8.3) — Intel Panther Point demonstrably
+    /// freezes it at a birth value under Running, and the VL805 is a different xHC whose behaviour
+    /// here is UNVERIFIED, so every consumer must qualify a Running-state reading as advisory
+    /// rather than trusting it.
+    fn ep_ctx_deq(&self, slot_id: u8, dci: u8) -> u64 {
+        let oc = self.slots[slot_id as usize].output_context;
+        if oc.is_null() {
+            return 0;
+        }
+        let base = unsafe { (oc as *const u32).add(dci as usize * CTX_WORDS) };
+        let lo = unsafe { core::ptr::read_volatile(base.add(2)) } as u64;
+        let hi = unsafe { core::ptr::read_volatile(base.add(3)) } as u64;
+        lo | (hi << 32)
+    }
+
+    /// BOT-PHASE (lift 0825ed08): run ONE recovery-stage xHCI command and render its outcome for a
+    /// witness: `(ok, completion_code, why)`. A bare `Result` cannot distinguish the three ways a
+    /// stage fails:
+    ///   * `why="ok"` — completion code 1 (Success).
+    ///   * `why="cc-error"` — the command completed, but with an error code (`cc` carries it; 19 =
+    ///     Context State Error, i.e. the command was illegal from the endpoint's actual state).
+    ///   * `why="nocompletion"` — no Command Completion Event arrived inside the wall-clock budget
+    ///     (`cc` is meaningless, reported 0): the command ring is not being consumed.
+    ///   * `why="cmdring-stopped"` — the command ring is parked by an abort in progress, so
+    ///     `run_command_sync` refuses before pushing anything.
+    /// No retry, no extra wait: exactly the one bounded `run_command_sync` the caller already made.
+    fn recover_cmd(&mut self, trb: Trb) -> (bool, u8, &'static str) {
+        if self.cmd_ring_stopped {
+            return (false, 0, "cmdring-stopped");
+        }
+        match self.run_command_sync(trb) {
+            Ok((1, _)) => (true, 1, "ok"),
+            Ok((cc, _)) => (false, cc, "cc-error"),
+            Err(_) => (false, 0, "nocompletion"),
+        }
+    }
+
+    /// BOT-PHASE fix 2 (lift 0825ed08): refuse a bulk stage that would lap the controller on its
+    /// ring — the capacity check the audit found missing entirely (`TransferRing::push` cannot see
+    /// the consumer, so the check lives here, where the consumer position is readable).
+    ///
+    /// Reads the controller's own TR Dequeue Pointer for `dci` out of the OUTPUT device context and
+    /// asks the ring whether one more `push` would overrun it (`TransferRing::would_lap`, which
+    /// carries the spec citation and the margin argument). Two bounded volatile reads and pure
+    /// arithmetic — no command, no wait, no MMIO.
+    ///
+    /// GUARD-STATE (lift): **the comparison is only meaningful when the endpoint is NOT Running.**
+    /// The Output Endpoint Context's TR Dequeue Pointer field is not a live position register:
+    /// xHCI 1.2 §4.8.3/§6.2.3 define it as written back on Running -> Stopped/Halted (and set by
+    /// Configure Endpoint / Set TR Dequeue Pointer); while Running it is architecturally
+    /// undefined, and Intel Panther Point demonstrably leaves it frozen at a birth value. QEMU
+    /// refreshes it live, so no gate can surface the difference; the VL805's behaviour is
+    /// unverified — which is precisely why the guard must NOT trust a Running-state reading:
+    /// comparing our live enqueue against a frozen birth value would manufacture a false
+    /// `RingFull` on a perfectly healthy mid-traffic device. So: read the EP State FIRST and
+    /// refuse only from Halted(2), Stopped(3) or Error(4), the states in which the field is
+    /// defined to hold the controller's real consumer position.
+    ///
+    /// Healthy path: a BOT transaction awaits each stage's completion before queuing the next, so
+    /// at most one TRB is ever outstanding on a 16-TRB ring; a Running endpoint returns `Ok` here
+    /// unconditionally, so on a healthy device this is behaviourally invisible. The refusal is
+    /// reachable only when the controller has stopped consuming — where failing the transfer
+    /// immediately is strictly better than overwriting TRBs it has not fetched.
+    fn bot_ring_guard(&self, slot_id: u8, dci: u8, is_in: bool) -> Result<(), BotError> {
+        // GUARD-STATE: never refuse against a Running(1) endpoint — nor a Disabled(0) or absent
+        // (0xFF) one, where there is no consumer position to compare against either.
+        match self.ep_state_of(slot_id, dci) {
+            2 | 3 | 4 => {}
+            _ => return Ok(()),
+        }
+        let deq = self.ep_ctx_deq(slot_id, dci);
+        if deq == 0 {
+            return Ok(()); // no output context / unreadable consumer position — never refuse
+        }
+        let slot = &self.slots[slot_id as usize];
+        let ring = if is_in { slot.bulk_in_ring.as_ref() } else { slot.bulk_out_ring.as_ref() };
+        let Some(r) = ring else { return Ok(()) };
+        if !r.would_lap(deq) {
+            return Ok(());
+        }
+        serial_println!(
+            ":: BOT: ring refuse slot={} dci={} dir={} enq={} cycle={} ntrb={} ctxdeq={:#x} dcs={} — enqueue would lap the controller (xHCI 1.2 §4.9.1); stage failed instead of overrunning the ring ::",
+            slot_id, dci, if is_in { "in" } else { "out" },
+            r.enqueue_index(), if r.cycle_bit() { 1 } else { 0 }, r.num_trbs(),
+            deq, deq & 1);
+        Err(BotError::RingFull)
+    }
+
+    /// BOT-PHASE (lift 0825ed08): bring ONE bulk endpoint back to a usable, resynchronised state
+    /// after a failed BOT stage.
+    ///
+    /// Reads the endpoint's current EP State from the OUTPUT device context, because both commands
+    /// below are legal only from particular states and issuing them blind returns Context State
+    /// Error (completion code 19):
+    ///   * Halted (or Error) -> **Reset Endpoint** (§4.6.8) transitions it to Stopped.
+    ///   * Running -> **Stop Endpoint** (§4.6.9) transitions it to Stopped. A plain timeout leaves
+    ///     the endpoint Running with a TD still in flight, so this arm — not the Reset arm — is
+    ///     the one a timeout takes.
+    ///   * Already Stopped -> neither command is needed.
+    /// Then **Set TR Dequeue Pointer** (§4.6.10, legal from Stopped/Error) moves the controller's
+    /// dequeue pointer to the driver's enqueue pointer, discarding the stranded TRBs of the failed
+    /// transaction and restoring the invariant that controller-dequeue == driver-enqueue on an
+    /// idle ring. Every step is a single bounded `run_command_sync`; there is no loop.
+    ///
+    /// Every stage is witnessed with its completion code AND the EP State before/after, so a
+    /// capture distinguishes "command ring dead" (`why=nocompletion`) from "command refused"
+    /// (`why=cc-error cc=19`) from "the state-aware arm chose wrong" (the `epstate` transition did
+    /// not happen).
+    fn resync_bulk_ep(&mut self, slot_id: u8, dci: u8, is_in: bool) -> bool {
+        if self.slots[slot_id as usize].output_context.is_null() {
+            serial_println!(
+                ":: BOT: resync stage=read-state dci={} dir={} ok=no why=no-output-context ::",
+                dci, if is_in { "in" } else { "out" });
+            return false;
+        }
+        let dir = if is_in { "in" } else { "out" };
+        let ep_state = self.ep_state_of(slot_id, dci) as u32;
+        let ctx = ((dci as u32) << 16) | ((slot_id as u32) << 24);
+        match ep_state {
+            2 | 4 => {
+                // Reset Endpoint (TRB type 14). TSP left 0: the controller resets its own toggle.
+                let (ok, cc, why) = self.recover_cmd(Trb { parameter: 0, status: 0, control: (14 << 10) | ctx });
+                let after = self.ep_state_of(slot_id, dci);
+                serial_println!(
+                    ":: BOT: resync stage=reset-ep dci={} dir={} ok={} cc={} why={} epstate={}->{} ::",
+                    dci, dir, if ok { "yes" } else { "no" }, cc, why, ep_state, after);
+                if !ok {
+                    serial_println!("xHCI: BOT recover: Reset Endpoint failed (slot {} dci {})", slot_id, dci);
+                    return false;
+                }
+            }
+            1 => {
+                // Stop Endpoint (TRB type 15).
+                let (ok, cc, why) = self.recover_cmd(Trb { parameter: 0, status: 0, control: (15 << 10) | ctx });
+                let after = self.ep_state_of(slot_id, dci);
+                serial_println!(
+                    ":: BOT: resync stage=stop-ep dci={} dir={} ok={} cc={} why={} epstate={}->{} ::",
+                    dci, dir, if ok { "yes" } else { "no" }, cc, why, ep_state, after);
+                if !ok {
+                    serial_println!("xHCI: BOT recover: Stop Endpoint failed (slot {} dci {})", slot_id, dci);
+                    return false;
+                }
+            }
+            3 => {
+                serial_println!(
+                    ":: BOT: resync stage=skip dci={} dir={} ok=yes cc=0 why=already-stopped epstate={}->{} ::",
+                    dci, dir, ep_state, ep_state);
+            }
+            _ => {
+                serial_println!(
+                    ":: BOT: resync stage=read-state dci={} dir={} ok=no why=ep-unusable epstate={}->{} ::",
+                    dci, dir, ep_state, ep_state);
+                return false;
+            }
+        }
+        // Drain any Transfer Events the stop/reset produced (a stopped TD posts one) so they cannot
+        // be mistaken for the next transaction's completion.
+        while self.drain_event_ring_once() {}
+
+        let deq = {
+            let slot = &self.slots[slot_id as usize];
+            let ring = if is_in { slot.bulk_in_ring.as_ref() } else { slot.bulk_out_ring.as_ref() };
+            match ring {
+                Some(r) => { let (phys, dcs) = r.dequeue_reset_target(); phys | (dcs as u64) }
+                None => {
+                    serial_println!(
+                        ":: BOT: resync stage=set-deq dci={} dir={} ok=no why=no-ring ::", dci, dir);
+                    return false;
+                }
+            }
+        };
+        let before_state = self.ep_state_of(slot_id, dci);
+        let before_deq = self.ep_ctx_deq(slot_id, dci);
+        // Set TR Dequeue Pointer (TRB type 16); Stream ID 0 for a non-streaming bulk endpoint.
+        let (ok, cc, why) = self.recover_cmd(Trb { parameter: deq, status: 0, control: (16 << 10) | ctx });
+        let after_state = self.ep_state_of(slot_id, dci);
+        let after_deq = self.ep_ctx_deq(slot_id, dci);
+        serial_println!(
+            ":: BOT: resync stage=set-deq dci={} dir={} ok={} cc={} why={} epstate={}->{} want={:#x} ctxdeq={:#x}->{:#x} ::",
+            dci, dir, if ok { "yes" } else { "no" }, cc, why,
+            before_state, after_state, deq, before_deq, after_deq);
+        if !ok {
+            serial_println!("xHCI: BOT recover: Set TR Dequeue failed (slot {} dci {} deq {:#x})", slot_id, dci, deq);
+            return false;
+        }
+        true
+    }
+
+    /// BOT-PHASE fix 1 (lift 0825ed08): leave BOTH bulk rings, and the event ring, in a state the
+    /// next transaction can be born onto — and prove it on the wire.
+    ///
+    /// **The mechanism this closes.** A BOT transaction pushes up to three TRBs (CBW, data, CSW).
+    /// Every error exit from the body used to return with whatever it had already pushed still on
+    /// the rings and the controller's TR Dequeue Pointer parked on them. Nothing retired them and
+    /// nothing repointed the controller, so the *next* transaction's doorbell re-executed them:
+    /// a stale CBW and, on the write path, a stale payload, delivered into a device whose own BOT
+    /// phase machine was still mid-transfer. The two machines then run one phase apart — the
+    /// host's data is read as a command and its command as data — which is how a Command Block
+    /// Wrapper ends up written into a FAT directory sector, the medium forensics that opened the
+    /// lift-source arc. Our own audit found the same exits unresynced on the VL805 path.
+    ///
+    /// **The shared-ring aggravator.** The CBW and an OUT data stage ride the SAME bulk-OUT ring.
+    /// An abandoned WRITE therefore strands *both* — a 31-byte command wrapper AND the file
+    /// payload, in that order, ahead of the next doorbell. That is why this cleans both rings
+    /// unconditionally rather than only the pipe the failed stage was waiting on.
+    ///
+    /// **The tool.** `resync_bulk_ep` — Stop/Reset Endpoint (whichever the EP State admits), drain
+    /// the event ring, then Set TR Dequeue Pointer at the ring's live enqueue slot, discarding
+    /// exactly the stranded TRBs and nothing else.
+    fn bot_clean_rings(&mut self, slot_id: u8, cause: BotError) {
+        let (in_ep, out_ep) = {
+            let s = &self.slots[slot_id as usize];
+            (s.bulk_in_ep, s.bulk_out_ep)
+        };
+        if slot_id == 0 || in_ep == 0 || out_ep == 0 {
+            return; // no bulk pipes on this slot — nothing was ever pushed
+        }
+        // Nothing to clean, and nothing that could consume a stale TRB, when the slot has no
+        // output context: the device is gone and the slot retired, so there is no endpoint to
+        // stop, no controller position to move, and no ring the hardware can still reach. This
+        // must SKIP rather than fail, or `undrained=` would count it and stop being an assertion.
+        if self.slots[slot_id as usize].output_context.is_null() {
+            serial_println!(
+                ":: BOT: clean slot={} cause={:?} skipped=no-output-context — no reachable ring; no further transfer to this slot ::",
+                slot_id, cause);
+            return;
+        }
+        let in_dci = ((in_ep & 0x0F) * 2) + 1;
+        let out_dci = (out_ep & 0x0F) * 2;
+
+        // Any half-armed pending stage must not be matched against an event raised by the
+        // stop/reset commands below.
+        self.bot_pending = None;
+
+        let (in_live, out_live) = self.bot_strand_witness(slot_id, in_dci, out_dci, cause, "pre");
+        if in_live > 0 { BOT_TD_ABANDONED_IN.fetch_add(1, Ordering::Relaxed); }
+        if out_live > 0 { BOT_TD_ABANDONED_OUT.fetch_add(1, Ordering::Relaxed); }
+
+        let in_ok = self.resync_bulk_ep(slot_id, in_dci, true);
+        let out_ok = self.resync_bulk_ep(slot_id, out_dci, false);
+        // Drain anything the resync itself produced, so a stopped TD's event cannot be mistaken
+        // for the NEXT transaction's completion. `resync_bulk_ep` drains once between its stop and
+        // its set-deq; this is the drain after the set-deq.
+        while self.drain_event_ring_once() {}
+
+        // POST scan. By here both endpoints are Stopped, so the Output Endpoint Context's TR
+        // Dequeue Pointer field is architecturally DEFINED (xHCI 1.2 §4.8.3) — unlike the
+        // pre-scan, which under a Running endpoint may read a frozen birth value (GUARD-STATE;
+        // unverified on the VL805, so distrusted the same way). That is why the assertion lives on
+        // this reading: `live=0` on both pipes here is the fix's own regression witness, and it is
+        // read from a field that means what it says.
+        let (in_live2, out_live2) = self.bot_strand_witness(slot_id, in_dci, out_dci, cause, "post");
+        if in_live2 > 0 || !in_ok { BOT_TD_UNDRAINED.fetch_add(1, Ordering::Relaxed); }
+        if out_live2 > 0 || !out_ok { BOT_TD_UNDRAINED.fetch_add(1, Ordering::Relaxed); }
+        serial_println!(
+            ":: BOT: clean slot={} cause={:?} in_resync={} out_resync={} in_live={} out_live={} undrained={} ::",
+            slot_id, cause, if in_ok { "ok" } else { "fail" }, if out_ok { "ok" } else { "fail" },
+            in_live2, out_live2, BOT_TD_UNDRAINED.load(Ordering::Relaxed));
+    }
+
+    /// BOT-PHASE (lift 0825ed08): the `:: BOT: strand ::` line — per-ring enqueue index, cycle
+    /// colour, the controller's context dequeue pointer, and the count of valid-cycle TRBs between
+    /// the two. Returns `(in_live, out_live)` so the caller can count and assert on them.
+    ///
+    /// `epstate` is on the line because it is the line's own reading key: the `ctxdeq` field is
+    /// only architecturally defined for a NON-Running endpoint (GUARD-STATE / xHCI 1.2 §4.8.3), so
+    /// a `live=` count taken from `epstate=1` is advisory and one taken from `epstate=2/3/4` is
+    /// authoritative. `ctxdeq_valid=` states which, rather than leaving a reader to know it.
+    fn bot_strand_witness(&self, slot_id: u8, in_dci: u8, out_dci: u8, cause: BotError, when: &str)
+        -> (usize, usize)
+    {
+        let mut live = [0usize; 2];
+        for (i, (dci, is_in)) in [(in_dci, true), (out_dci, false)].into_iter().enumerate() {
+            let state = self.ep_state_of(slot_id, dci);
+            let deq = self.ep_ctx_deq(slot_id, dci);
+            let slot = &self.slots[slot_id as usize];
+            let ring = if is_in { slot.bulk_in_ring.as_ref() } else { slot.bulk_out_ring.as_ref() };
+            let (enq, cyc, ntrb, scan) = match ring {
+                Some(r) => (r.enqueue_index(), if r.cycle_bit() { 1 } else { 0 }, r.num_trbs(),
+                            r.strand_scan(deq)),
+                None => (0, 0, 0, None),
+            };
+            let (gap, l) = scan.unwrap_or((0, 0));
+            let trusted = matches!(state, 2 | 3 | 4);
+            if trusted { live[i] = l; }
+            serial_println!(
+                ":: BOT: strand when={} slot={} cause={:?} pipe={} dci={} epstate={} enq={} cycle={} ntrb={} ctxdeq={:#x} dcs={} ctxdeq_valid={} gap={} live={} gen={} ::",
+                when, slot_id, cause, if is_in { "in" } else { "out" }, dci, state,
+                enq, cyc, ntrb, deq, deq & 1,
+                if trusted { "yes" } else { "no-ep-running" },
+                gap, l, BOT_STAGE_GEN.load(Ordering::Relaxed));
+        }
+        (live[0], live[1])
+    }
+
     /// USB-WRITE-2: recover a halted bulk endpoint after a STALL (completion code 4) or Babble
     /// (6) so one faulted transfer cannot dead-line every later BOT command on the slot. This is
     /// the standard USB BOT clear-stall sequence, host + device side:
@@ -4914,18 +5611,33 @@ impl XhciController {
     /// Arm the BOT pending state for one stage (waiting on `wait_trb_phys`'s completion
     /// event), pump the event ring until it arrives, and return its completion code. The
     /// caller queues the stage's TRB(s) and rings the doorbell(s) before calling this.
+    /// BOT-PHASE (lift 0825ed08): returns `(completion_code, residue)` — the TRB Transfer Length
+    /// the event reported as NOT transferred. The residue was always in the event and always
+    /// discarded; fix 3 carries it out so a data stage can be checked against its own
+    /// `dCBWDataTransferLength`.
     fn run_bot_stage(&mut self, slot_id: u8, in_dci: u8, out_dci: u8, wait_trb_phys: u64)
-        -> Result<u8, BotError>
+        -> Result<(u8, u32), BotError>
     {
+        let generation = BOT_STAGE_GEN.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         self.bot_pending = Some(BotPending {
             slot_id, in_dci, out_dci, wait_trb_phys,
             done: false, completion_code: 0,
+            generation, residue: 0, residue_seen: false,
         });
         let pump = self.pump_until_bot_done();
         let pending = self.bot_pending.take();
+        if let Err(BotError::Timeout) = pump {
+            // BOT-PHASE fix 4: the generation is the log key that ties this timeout to the strand
+            // lines the chokepoint prints next, in a log where TRB addresses recur.
+            if let Some(p) = &pending {
+                serial_println!(
+                    ":: BOT: stage timeout slot={} wait_trb={:#x} gen={} ::",
+                    p.slot_id, p.wait_trb_phys, p.generation);
+            }
+        }
         pump?;
         let p = pending.ok_or(BotError::Timeout)?;
-        Ok(p.completion_code)
+        Ok((p.completion_code, p.residue))
     }
 
     /// Pump the event ring until the in-flight BOT transaction reports done, or a WALL-CLOCK
@@ -7082,47 +7794,6 @@ impl XhciController {
             }
         }
         found_hid_ep
-    }
-
-    pub fn send_scsi_read(&mut self, slot_id: u8) {
-        unsafe {
-            serial_println!("xHCI: UNA-21 Initiating SCSI Read (Sector 0)...");
-
-            let (desc_phys, data_phys, cbw_ptr) = {
-                let slot = &self.slots[slot_id as usize];
-                let Some(data_buf) = slot.data_buffer else {
-                    serial_println!("xHCI: send_scsi_read: slot {} has no data_buffer (endpoints not configured); aborting read", slot_id);
-                    return;
-                };
-                (slot.descriptor_buffer as u64, data_buf as u64, slot.descriptor_buffer)
-            };
-
-            core::ptr::write_bytes(cbw_ptr, 0, 64);
-
-            *cbw_ptr.add(0) = 0x55; *cbw_ptr.add(1) = 0x53; *cbw_ptr.add(2) = 0x42; *cbw_ptr.add(3) = 0x43;
-            *cbw_ptr.add(4) = 0xEF; *cbw_ptr.add(5) = 0xBE; *cbw_ptr.add(6) = 0xAD; *cbw_ptr.add(7) = 0xDE;
-            *cbw_ptr.add(8) = 0x00; *cbw_ptr.add(9) = 0x02; *cbw_ptr.add(10) = 0x00; *cbw_ptr.add(11) = 0x00;
-            *cbw_ptr.add(12) = 0x80; *cbw_ptr.add(13) = 0x00; *cbw_ptr.add(14) = 10;
-            *cbw_ptr.add(15) = 0x28; *cbw_ptr.add(23) = 1;
-
-            let out_trb = Trb {
-                parameter: desc_phys,
-                status: 31,
-                control: (1 << 10) | (1 << 5),
-            };
-            self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap().push(out_trb).unwrap();
-            self.ring_doorbell(slot_id, 4);
-
-            let in_trb = Trb {
-                parameter: data_phys,
-                status: 512,
-                control: (1 << 10) | (1 << 5) | (1 << 2),
-            };
-            self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap().push(in_trb).unwrap();
-            self.ring_doorbell(slot_id, 3);
-
-            serial_println!("xHCI: SCSI Command Dispatched.");
-        }
     }
 
     pub unsafe fn scan_ports(&mut self) {

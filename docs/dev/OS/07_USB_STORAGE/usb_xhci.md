@@ -2001,6 +2001,207 @@ witness is metal-only (see above — its absence is non-regression, not evidence
 
 ---
 
+## 12. BOT-PHASE — the phase-desync holes, closed on the VL805 path (lift 0825ed08, 2026-07-29)
+
+### 12.0 The finding, and why it is lifted
+
+On the gemini (x86, Panther Point) track, a read-only audit of a corrupted USB stick recovered a
+FAT directory entry whose bytes were **not a directory entry**: they were a **Command Block
+Wrapper** — the driver's own 31-byte BOT command header, written into a sector that belonged to the
+filesystem, with a `dCBWTag` matching the first-failing transaction of a captured storm boot
+(code → capture → medium, joined by one transaction number). The full forensics live in that
+tree's usb_xhci.md §15 (commits `ae052e95`/`0470f498`, branch tip `0825ed08`).
+
+Our own independent audit of this tree's aarch64/VL805 BOT path found **the same hole family**, at
+these (pre-lift, `cb837f69`) sites:
+
+* error exits with no ring resync — `bot_transfer`'s data-stage `TransferError` return, the
+  status-stage `Err` propagation, the stall return, and both CSW-validation rejections;
+* no ring capacity check at all (`TransferRing::push` tracked no consumer position);
+* discarded push results (`.ok()` on the CBW push, `.unwrap_or(0)` on the data and CSW pushes —
+  a failed push would have waited on `ring_base + 0`, a real, recurring TRB address);
+* `cc=13 SHORT PACKET` accepted as blanket success on both the data and status stages;
+* `BotPending` carrying no residual (the Transfer Event residue was discarded);
+* event matching that claimed **any** error completion on either bulk DCI, unqualified by
+  generation or position.
+
+Two independent audits, two controllers (Intel Panther Point, Broadcom VL805), one mechanism. The
+mechanism is in the shared BOT state machine, not in a vendor quirk — which is the argument for
+lifting the fix set at this layer rather than re-deriving it behind a platform flag. This tree is
+the VL805 confirmation of the lift source's §15.3.
+
+### 12.1 The mechanism: a dirty ring is a phase slip
+
+A BOT transaction is three serialized phases on two bulk rings. The device runs a phase machine of
+its own, and the two machines stay in step **only** because each side retires one phase before
+starting the next. Every error exit from `bot_transfer` used to return with whatever it had already
+pushed **still on the rings**, and the controller's TR Dequeue Pointer parked on those TRBs. The
+*next* transaction's doorbell then did not start a new transaction — it **resumed the abandoned
+one**, replaying a stale CBW (and on the write path a stale payload) into a device whose phase
+machine had moved on. From there the two machines run one phase apart: the host's data is read as a
+command, its command consumed as data and written to the medium.
+
+Aggravators (all apply here as on x86): the CBW and an OUT data stage share the bulk-OUT ring, so
+an abandoned WRITE strands a command wrapper AND payload together; TRB addresses recur every ~5
+transactions on a 16-TRB ring, so address-only matching aliases; and the condition is
+self-perpetuating once entered.
+
+### 12.2 The fix set, as landed here
+
+Six fixes in the lift source; five land here, one is not applicable. Where the lift consults
+`ep_state` or controller-written context fields, the GUARD-STATE discipline is carried verbatim:
+the Output Endpoint Context's TR Dequeue Pointer is only architecturally defined while the endpoint
+is **not Running** (xHCI 1.2 §4.8.3), Intel silicon demonstrably freezes it at a birth value under
+Running, and the VL805 — a different xHC whose behaviour here is **unverified** — is trusted no
+further. Every consumer of the field either refuses to act on a Running-state reading
+(`bot_ring_guard`) or labels it advisory (`ctxdeq_valid=no-ep-running` on the strand witness).
+
+**1. The single chokepoint.** `bot_transfer` is now a thin wrapper around `bot_transfer_body`;
+every `Err` other than `NoDevice` (raised before anything is built or queued) passes through
+`bot_clean_rings`: Stop/Reset Endpoint (whichever the EP State admits), Set TR Dequeue Pointer on
+**both** bulk rings at each ring's live enqueue slot, and an event-ring drain. The supporting tools
+(`ep_state_of`, `ep_ctx_deq`, `recover_cmd`, `resync_bulk_ep`, `TransferRing::strand_scan`/
+`would_lap`/`contains`) did not exist in this tree and are lifted with the fix. Wrapping the whole
+body covers every audited exit and whatever exit a later arc adds.
+
+**2. Ring capacity honesty, up front.** This tree had **no** capacity guard at all. The lifted
+`bot_ring_guard` (backed by `TransferRing::would_lap`, xHCI 1.2 §4.9.1) now runs for every ring the
+transaction will touch **before anything is pushed** — the lift source's own lesson, folded in: a
+per-stage guard that runs after the CBW push manufactures the stranded-TRB condition it exists to
+prevent. Per GUARD-STATE it refuses only from Halted/Stopped/Error, where the consumer position is
+defined; a Running endpoint is never refused. The same pass propagates all push results
+(`.map_err(RingFull)`) instead of discarding them — inert today (`push` always returns `Ok`), but a
+failed push now fails honestly instead of waiting on a fabricated address.
+
+**3. Short-transfer honesty.** `run_bot_stage` returns `(completion_code, residue)`; `BotPending`
+carries the Transfer Event residue, first-write-latched (`residue_seen`) against duplicate-Success
+quirks, exactly like `Ep0Pending::data_seen`. The data stage is judged against its own
+`dCBWDataTransferLength`, and the treatment is deliberately **asymmetric — the asymmetry is the
+spec's, and it is honored here, not "fixed"**:
+
+* **OUT short is a phase fault** (BOT 1.0 §6.7.3 case 9, Ho > Do): the device stopped accepting
+  bytes, so it is *not* in its status phase; queueing the CSW there is the step that slides the two
+  machines apart. It fails the transaction (the chokepoint then cleans the rings).
+* **IN short is legal** (BOT 1.0 §6.7.2 case 4, Hi > Di): `REQUEST SENSE` (18), `INQUIRY` (36) and
+  `READ CAPACITY` (8) all name a *maximum* allocation length, and a conforming device may
+  under-return and then sit in its status phase with the shortfall in `dCSWDataResidue`. Failing
+  those would break bring-up on conforming devices.
+
+The IN case is policed by the check with teeth instead: **`dCSWDataResidue` is now validated**
+against the Transfer Event residue. The device's residue is *its* claim about bytes moved; the
+event residue is the *controller's*. Two independent witnesses of one quantity — disagreement is a
+phase fault (`residue_disagree`, `Err(TransferError(13))`), and a transfer that moved zero bytes
+with `bStatus=0` is no longer reported to FAT as a clean success.
+
+**4. De-aliased event matching.** The blanket "claim any error completion on either bulk DCI" is
+gone from `handle_event_trb`. Errors that name a TRB are matched by address like anything else (a
+bulk STALL carries its TRB pointer, so stall delivery to the pump — the property the blanket claim
+existed for — is preserved). The fallback survives only for an error whose pointer addresses
+nothing in either bulk ring (Ring Underrun / Ring Overrun / VF Event Ring Full), and it is
+**counted** (`ev_unaddressed=`) rather than silent. A first-write latch on `done` refuses late
+events for an already-completed stage (`ev_late=`). `BotPending` gains a monotonic `generation` — a
+log key, not a wire tag (a Transfer Event carries only a TRB pointer), tying a timeout to the
+strand lines that follow it.
+
+**5. `send_scsi_read` deleted.** This tree carried the same uncalled fire-and-forget legacy as the
+lift source: a hand-built CBW with a hardcoded `0xDEADBEEF` tag, pushed to both rings with
+`.unwrap()`, doorbells rung, nothing awaited. A permanent supply of untracked TRBs and a tag no CSW
+validation could match. Removed rather than documented.
+
+**6. The `cfgep_cc=19` repoint — not applicable here.** The lift source's fix 6 patches
+`rescue_reset_device`, a BOT-RESCUE escalation rung that `reset()`s both rings and can then fail
+Configure Endpoint. This tree has no BOT-RESCUE ladder and no code path that resets a bulk ring's
+producer state and re-programs the context in two steps, so the disagreement that fix closes cannot
+arise here. If the ladder is ever lifted, its fix 6 comes with it.
+
+### 12.3 PIUSB36-PHASE — the aarch64-only twin, closed
+
+The lift source's §15.9 flagged `piusb36_read10_two_trb` (the PIUSB-36 step-5 two-TRB TD-shape
+probe, aarch64-only) as carrying the same holes, out of its lane. Closed here, in our lane:
+
+* it now runs through the **same chokepoint** (a wrapper calls `bot_clean_rings` on every `Err` but
+  `NoDevice`);
+* its ring headroom is checked **up front** and all four push results are propagated;
+* its data-stage stall arm no longer returns immediately — that was the **pre-PIUSB-38 wedge
+  shape** (the device stalls the DATA phase, not the command, so it sits in its status phase with a
+  Failed CSW ready; abandoning the transaction leaves the two BOT machines one phase apart, and
+  every later command on the slot inherits the wedge). It now clears the halt and **collects the
+  CSW** (resync), escalating to full Reset Recovery only if the status stage also fails — exactly
+  `bot_transfer_body`'s shape;
+* its data stage gets fix 3: IN-short is allowed (same honored asymmetry) and cross-checked against
+  `dCSWDataResidue`; the CSW signature is now validated (it was skipped) with the same counters and
+  `csw_bytes` grammar.
+
+The probe's two-TRB TD shape (256 B + 256 B, chain on the first, IOC on the second) — its entire
+diagnostic point — is untouched.
+
+### 12.4 Witness grammar
+
+| line / field | where | says |
+|---|---|---|
+| `:: BOT: strand when=pre\|post … epstate= enq= cycle= ntrb= ctxdeq= dcs= ctxdeq_valid= gap= live= gen= ::` | every error exit, per pipe | the ring as the error found it, and as the cleanup left it |
+| `:: BOT: clean slot= cause= in_resync= out_resync= in_live= out_live= undrained= ::` | every error exit | whether the cleanup succeeded on both pipes |
+| `:: BOT: resync stage=stop-ep\|reset-ep\|skip\|set-deq … epstate=A->B ::` | inside the cleanup | each recovery command's outcome, with EP state before/after |
+| `:: BOT: ring refuse slot= dci= … ::` | up-front guard | a stage refused instead of lapping the controller |
+| `:: BOT: dtl_vs_moved slot= dir= dtl= moved= residue= cc= verdict= ::` | any short data stage | host-side shortfall, and how it was judged (`phase-fault` vs `short-in-allowed`) |
+| `:: BOT: residue_disagree slot= dir= dtl= host_moved= dev_residue= dev_moved= bstatus= ::` | CSW validation | device and controller disagree about bytes moved |
+| `:: BOT: csw_bytes slot= why= tag_want= b=… ::` | every CSW rejection | all 13 raw CSW bytes (torn read vs overlay vs stale-but-well-formed, decidable) |
+| `:: BOT: stage timeout slot= wait_trb= gen= ::` | pump timeout | the generation that ties the timeout to its strand lines |
+| `:: BOT: phase tag_mismatch= bad_sig= abandoned_in= abandoned_out= undrained= short_in= short_out= ev_late= ev_unaddressed= result=SUMMARY ::` | once per boot (topology summary) | boot totals for all of the above |
+
+Reading keys (lifted, and they matter): `ctxdeq_valid=` states whether the `live=` count came from
+a defined field (`epstate=2/3/4`) or an advisory Running-state read. **`undrained=` is fix 1's own
+regression witness and must read 0 on every boot** — it counts pipes still holding valid-cycle TRBs
+after the cleanup (from the *post* scan, the defined reading), or whose resync failed. Slots with
+no reachable ring (no output context) are skipped explicitly, so the number stays an assertion.
+
+### 12.5 Blast radius
+
+The healthy path is byte-identical: fix 1 runs only on `Err`; fix 2's guards return `Ok`
+immediately for a Running endpoint and nothing is pushed between them; fix 3 is arithmetic on a
+value the event already carried (`moved == data_len` on a full transfer takes no branch); fix 4
+only narrows what may claim a stage; fix 5 removes dead code. Nothing weakens a protection —
+fixes 2/3/4 each *add* a check, and fix 3 converts a previously accepted condition (silent short
+transfer) into a rejected one.
+
+### 12.6 Gates, and what QEMU cannot prove — honest coverage
+
+* `./arroyo check` — green, both arches.
+* `./arroyo kernel8-test` — MBENCH PASS, 87/87 required witnesses, 0 forbidden.
+* `./arroyo test-arm` — MISSION SUCCESS (the BOT proof through the shared xhci path), and the
+  SUMMARY ledger reads `tag_mismatch=0 bad_sig=0 abandoned_in=0 abandoned_out=0 undrained=0
+  short_in=0 short_out=0 ev_late=0 ev_unaddressed=0`.
+* `strings` on `target/pi_baremetal/kernel8.img` proves every witness above (the SUMMARY ledger,
+  `strand`, `clean`, `resync`, `ring refuse`, `dtl_vs_moved`, `residue_disagree`, `csw_bytes`,
+  `stage timeout`) is present in the kernel8 builder artifact.
+
+**Stated plainly: the error-exit and strand witnesses never execute in QEMU.** The chokepoint's
+cleanup fires only when `bot_transfer` *returns* an error, and QEMU's `usb-storage` produces none
+on these boots (injected faults are rescued earlier, and it does not stall, short-change or wedge).
+`bot_clean_rings`, `bot_strand_witness`, `resync_bulk_ep`, `TransferRing::strand_scan`, the
+OUT-short branch, the `residue_disagree` rejection, the `ev_unaddressed` fallback, every `ring
+refuse`, and the piusb36 stall-collect arm are therefore **not executed** in emulation — `strings`
+proves the text is in the artifact, and that is all emulation establishes. The `undrained=0`
+readings above are real but **weak evidence**: they are taken on boots where the cleanup path never
+ran. Their correctness rests on inspection (no new `unwrap` on these paths, every `Option` handled,
+the strand scan bounded by the ring length) and on the first metal boot, which is the proof.
+
+### 12.7 What metal must verify
+
+1. **`undrained=0` on every boot**, including boots that see real transport faults — the central
+   assertion.
+2. A `:: BOT: strand ::` pair at every error exit, `when=post` showing `live=0` on both pipes; a
+   `when=pre` line with `live>0` and `ctxdeq_valid=yes` is the first direct observation of a
+   stranded TRB on the VL805.
+3. Whether the VL805 refreshes `ctxdeq` under Running (compare pre-scan `live` against post-scan) —
+   the GUARD-STATE question this tree has never answered on its own silicon.
+4. `short_out=0`; any non-zero is a phase fault caught before it reached the medium.
+5. `ev_late=` / `ev_unaddressed=` — the first real measurement of event aliasing on the VL805.
+6. The piusb36 stall arms, if a stall ever occurs during the matrix: the probe should now come back
+   with a Failed CSW instead of wedging the slot.
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).

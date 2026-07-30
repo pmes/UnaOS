@@ -173,6 +173,104 @@ impl TransferRing {
         (phys, if self.cycle_bit { 1 } else { 0 })
     }
 
+    /// BOT-PHASE (lift 0825ed08): our own live enqueue position and cycle colour, for the strand
+    /// witness. Read against the controller's TR Dequeue Pointer + DCS from the endpoint context,
+    /// these say whether the controller is BEHIND us (it has not fetched what we produced) or level
+    /// with us (it fetched everything). Pure reads.
+    pub fn enqueue_index(&self) -> usize { self.enqueue_index }
+    pub fn cycle_bit(&self) -> bool { self.cycle_bit }
+    pub fn num_trbs(&self) -> usize { self.num_trbs }
+
+    /// BOT-PHASE (lift 0825ed08, orig. BOT-RESCUE M2): would enqueueing ONE more TRB lap the
+    /// controller's dequeue pointer?
+    ///
+    /// xHCI 1.2 §4.9.1/§4.9.2: a Transfer Ring is a producer/consumer ring whose only full/empty
+    /// discriminator is the Cycle bit, so the producer MUST NOT advance its enqueue pointer past
+    /// the consumer's dequeue pointer — doing so overwrites TRBs the controller has not yet
+    /// fetched and re-colours slots it is still walking. This ring tracked no consumer position at
+    /// all (the audit's "no ring capacity check"): during BOT error recovery, where the endpoint
+    /// is stalled and the controller's dequeue pointer is parked, a retry loop could push straight
+    /// through it.
+    ///
+    /// `ctx_deq` is the raw Endpoint Context TR Dequeue Pointer field (low bits carry DCS), read
+    /// by the caller from the OUTPUT device context. If it does not address a TRB inside THIS ring
+    /// the answer is "no" — an unreadable consumer position must never manufacture a refusal on a
+    /// healthy device. GUARD-STATE discipline applies: the caller must only consult this when the
+    /// endpoint is NOT Running (the field is architecturally undefined under Running, and stale on
+    /// real silicon — assume the VL805 no kinder than Panther Point).
+    ///
+    /// Margin: refuse while fewer than two slots would remain free, so the Link TRB slot the wrap
+    /// path needs is always available. With a 16-TRB ring the refusal threshold is 14 outstanding
+    /// TRBs; a healthy BOT transaction has at most ONE outstanding TRB (each stage is awaited to
+    /// completion before the next is queued), so this predicate is false by construction on every
+    /// healthy transfer and can only fire against a controller that has stopped consuming.
+    pub fn would_lap(&self, ctx_deq: u64) -> bool {
+        let deq = match self.index_of(ctx_deq & !0xFu64) {
+            Some(i) => i,
+            None => return false,
+        };
+        let n = self.num_trbs;
+        // Outstanding = how far our enqueue pointer has run ahead of the controller's dequeue.
+        let used = (self.enqueue_index + n - deq) % n;
+        used + 2 >= n
+    }
+
+    /// BOT-PHASE (lift 0825ed08): how many TRBs lie between the controller's dequeue pointer and
+    /// our enqueue pointer, and how many of those the controller would still consider VALID
+    /// (produced).
+    ///
+    /// `ctx_deq` is the raw Endpoint Context TR Dequeue Pointer field, low bits carrying the
+    /// Dequeue Cycle State — the same reading `would_lap` takes, and subject to the same caveat:
+    /// **it only means anything while the endpoint is NOT Running.** The caller is responsible for
+    /// that; this is pure arithmetic over device memory.
+    ///
+    /// Returns `(gap, live)`:
+    ///   * `gap` — slots from the controller's dequeue index up to (not including) ours;
+    ///   * `live` — of those, the ones whose stored Cycle bit equals the cycle the CONSUMER expects
+    ///     at that position. Per xHCI 1.2 §4.9.1 the Cycle bit is the entire producer/consumer
+    ///     handshake, so `live` is precisely "TRBs the controller will execute if its doorbell
+    ///     rings again". The walk starts from the DCS carried in `ctx_deq` and toggles the expected
+    ///     cycle whenever it steps over a Link TRB with Toggle Cycle set, exactly as the controller
+    ///     does.
+    ///
+    /// `live > 0` at an error exit is a STRANDED TRANSFER DESCRIPTOR: a CBW, data stage or CSW the
+    /// transaction never retired, which the next doorbell would replay into a device whose BOT phase
+    /// machine has moved on. That is the phase-desync mechanism this arc closes; `live == 0` after
+    /// the recovery's Set TR Dequeue Pointer is the proof it closed.
+    ///
+    /// `None` if `ctx_deq` does not address a TRB inside this ring (an unreadable consumer position
+    /// must never be reported as a strand).
+    pub fn strand_scan(&self, ctx_deq: u64) -> Option<(usize, usize)> {
+        let deq = self.index_of(ctx_deq & !0xFu64)?;
+        let n = self.num_trbs;
+        let gap = (self.enqueue_index + n - deq) % n;
+        let mut expect = (ctx_deq & 1) as u32;
+        let mut live = 0usize;
+        let mut i = deq;
+        for _ in 0..gap {
+            let trb = unsafe { core::ptr::read_volatile(self.trbs.add(i)) };
+            if (trb.control & 1) == expect {
+                live += 1;
+            }
+            // Link TRB (type 6) with Toggle Cycle (bit 1) flips the consumer's expected colour.
+            if ((trb.control >> 10) & 0x3F) == 6 && (trb.control & (1 << 1)) != 0 {
+                expect ^= 1;
+            }
+            i += 1;
+            if i >= n {
+                i = 0;
+            }
+        }
+        Some((gap, live))
+    }
+
+    /// BOT-PHASE (lift 0825ed08): does `phys` address a TRB inside THIS ring? Pure predicate over
+    /// `index_of`, no reads of device memory. Used by the de-aliased BOT event matching to decide
+    /// whether an error completion's TRB pointer names a TRB in either bulk ring.
+    pub fn contains(&self, phys: u64) -> bool {
+        self.index_of(phys).is_some()
+    }
+
     /// Ring index of the TRB at physical address `phys`, if it lies inside this ring.
     fn index_of(&self, phys: u64) -> Option<usize> {
         let base = self.trbs as u64;
