@@ -578,6 +578,55 @@ pub static BOT_RETRY_OK: AtomicU64 = AtomicU64::new(0);
 /// Post-recovery retries that failed anyway (the caller still sees the terminal `Err`).
 pub static BOT_RETRY_FAIL: AtomicU64 = AtomicU64::new(0);
 
+// --- BOT-RESCUE (2026-07-29): escalation, back-off and surrender ---
+//
+// The 2026-07-29 metal capture: an Alcor 058f:6362 card reader went fully non-responsive on a
+// WRITE(10) — EP0 died with it — while the controller, the event ring and the command ring stayed
+// demonstrably healthy (the FTDI slot kept transferring; every command completed cc=1). The
+// existing ladder (class reset -> clear-halt x2 -> stop-ep/set-deq x2 -> one retry) therefore ran
+// to completion, reported success, retried, failed, and was re-entered by the next block op —
+// forever, at ~6 s of busy-spin per stage timeout. The permanence was never the ring and never the
+// controller: it was that the ladder had no top and no floor. This is the top (two more rungs) and
+// the floor (surrender).
+//
+/// Consecutive failed recovery+retry cycles on one slot before the ladder escalates past its
+/// existing top rung. Two, not one: a single failure is exactly what the existing class-level
+/// Reset Recovery exists to absorb (PIUSB-38's induced stall recovers on the first try, and a
+/// marginal device on a long cable can lose one transaction and be fine), so escalating on the
+/// first would fire the heavy rungs against devices the light one already fixed. Two, not three or
+/// more: every extra rung costs a full first-attempt budget (~6 s) of desktop-starving busy-spin,
+/// and the failure this arc addresses is PERMANENT — a device that fails the ladder twice in a row
+/// has never, in any capture, recovered on the third.
+const BOT_RESCUE_N_CONSEC: u32 = 2;
+/// Base back-off between recovery attempts, doubling per consecutive failure up to
+/// `BOT_RESCUE_BACKOFF_MAX_MS`. A device wedged mid-internal-stall (a flash controller in an
+/// erase/wear-levelling window is the usual suspect for a WRITE that kills EP0) is made WORSE by
+/// being hammered: each new transaction restarts its command timeout. Spec-scale, not
+/// budget-derived — see `settle_ms`.
+const BOT_RESCUE_BACKOFF_MS: u64 = 50;
+const BOT_RESCUE_BACKOFF_MAX_MS: u64 = 400;
+/// Port power-off dwell for escalation (b). USB 2.0 §7.1.7.3 gives a device 100 ms to see VBUS
+/// removed and fully de-energise; less risks the device holding internal state across the "cycle"
+/// and the whole rung being a no-op.
+const BOT_RESCUE_PORT_OFF_MS: u64 = 100;
+/// Port power-on settle for escalation (b): hub bPwrOn2PwrGood is at most 255 * 2 ms, and USB 2.0
+/// §7.1.7.3 adds 100 ms of attach debounce before a reset may be driven. 300 ms covers the common
+/// case without turning a doomed rung into a second multi-second stall.
+const BOT_RESCUE_PORT_ON_MS: u64 = 300;
+/// Multiplier on `hw_wait_budget()` for a BOT stage's wall-clock wait. THREE on the first attempt
+/// (~6 s): a real device can legitimately stall 1–4 s on a write, and shortening this would turn a
+/// slow-but-healthy stick into a false failure. ONE (~2 s) for an escalation retry: by then the
+/// device has already burned two full ladders' worth of budget without answering, the question the
+/// retry asks is "did the heavy reset revive it", and a revived device answers in milliseconds —
+/// so the extra 4 s buys no information and is paid in frozen desktop.
+const BOT_BUDGET_SCALE_FIRST: u64 = 3;
+const BOT_BUDGET_SCALE_ESCALATION: u64 = 1;
+/// Escalation rungs attempted (a = Reset Device, b = port power-cycle) and surrenders. Zero on a
+/// clean boot, so any non-zero reading is itself the finding.
+pub static BOT_RESCUE_RESET_DEVICE: AtomicU64 = AtomicU64::new(0);
+pub static BOT_RESCUE_PORT_CYCLE: AtomicU64 = AtomicU64::new(0);
+pub static BOT_RESCUE_SURRENDER: AtomicU64 = AtomicU64::new(0);
+
 // --- PH-2: runtime CHECK CONDITION handling (SCSI SPC-4 §4.5, USB MSC BOT 1.0 §6.5) ---
 //
 // A `Failed` CSW is NOT a transport error: the transaction completed, the device rejected the
@@ -1359,6 +1408,32 @@ pub struct XhciController {
     /// In-flight BOT transaction, populated by the event handler.
     bot_pending: Option<BotPending>,
 
+    // --- BOT-RESCUE: escalation state for the storage pipe ---
+    /// M3 witness 6: the pending record of the stage that most recently FAILED, taken out of
+    /// `bot_pending` by `run_bot_stage` on its way to reporting the error. Before this the record
+    /// was taken and DROPPED before the error propagated, so `recover_bot_full` always read
+    /// `bot_pending == None` and its `recover evidence` line printed `pipe=none wait_trb=0x0
+    /// stage_done=no stage_cc=0` on every metal capture — a structural lie, not a finding.
+    /// Consumed (taken) by `bot_transfer` and handed to recovery as a parameter.
+    bot_failed: Option<BotPending>,
+    /// Consecutive failed recovery+retry cycles on `storage_slot`. Reset to 0 by ANY transaction
+    /// that completes (including one that completes with a `Failed` CSW — a device that answers is
+    /// not a device that is wedged). Compared against `BOT_RESCUE_N_CONSEC`.
+    bot_fail_streak: u32,
+    /// Which escalation rungs have already been spent on the current streak: 0 = none, 1 = (a)
+    /// Reset Device tried, 2 = (b) port power-cycle tried. Each rung fires at most once per streak,
+    /// so a device that keeps failing walks a -> b -> surrender and never loops.
+    bot_rescue_stage: u8,
+    /// Slot the ladder has SURRENDERED on (0 = none). While set, `bot_transfer` refuses every
+    /// transfer to that slot up front — the guarantee that a sick disk can never again spin the
+    /// system at ~6 s per attempt forever. Cleared when the slot is disposed (disconnect) or
+    /// re-enumerated, so a replug is a clean slate.
+    bot_surrendered_slot: u8,
+    /// Live multiplier on `hw_wait_budget()` for `pump_until_bot_done` — `BOT_BUDGET_SCALE_FIRST`
+    /// at all times except inside an escalation retry, where it is briefly
+    /// `BOT_BUDGET_SCALE_ESCALATION` and restored immediately after.
+    bot_budget_scale: u64,
+
     /// In-flight synchronous EP0 control transfer (hub bring-up). See `Ep0Pending`.
     ep0_pending: Option<Ep0Pending>,
     /// XENUM-3 M1: bytes actually transferred by the most recent `sync_control` IN read (requested
@@ -1517,6 +1592,11 @@ impl XhciController {
             storage_note: "no mass-storage device enumerated",
             bot_tag: 1,
             bot_pending: None,
+            bot_failed: None,
+            bot_fail_streak: 0,
+            bot_rescue_stage: 0,
+            bot_surrendered_slot: 0,
+            bot_budget_scale: BOT_BUDGET_SCALE_FIRST,
             ep0_pending: None,
             last_control_len: 0,
             cmd_pending: None,
@@ -3403,6 +3483,11 @@ impl XhciController {
             // zeroed `storage_slot`. A replug enumerates as a NEW slot and republishes through the
             // normal attach path, so the entry is fresh rather than duplicated.
             crate::drivers::block::unpublish_usb_geometry(i as u8);
+            // BOT-RESCUE: a slot that leaves takes its escalation state with it. Without this a
+            // surrendered slot id, once recycled by the controller for the NEXT device, would
+            // refuse that innocent device's transfers up front — the surrender must bind to the
+            // disk that earned it, not to a number.
+            self.bot_rescue_clear(i as u8);
             if self.ftdi_configuring_slot == i as u8 {
                 self.ftdi_configuring_slot = 0;
             }
@@ -4383,21 +4468,38 @@ impl XhciController {
     pub fn bot_transfer(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32, dir: Direction)
         -> Result<BotResult, BotError>
     {
+        // BOT-RESCUE (c): a surrendered slot never sees another transfer. This is the one gate that
+        // makes the guarantee absolute — every path into the driver's storage I/O comes through
+        // here, so a disk the ladder gave up on cannot be revived into another ~6 s stall by a
+        // caller that missed the retraction. Cleared on disposal / re-enumeration.
+        if slot_id != 0 && self.bot_surrendered_slot == slot_id {
+            return Err(BotError::NoDevice);
+        }
         let first = self.bot_transfer_once(slot_id, cdb, data_phys, data_len, dir);
         let cause = match first {
             // PH-2: a `Failed` CSW is a completed transaction the DEVICE rejected — CHECK
             // CONDITION, not a transport fault. Reset Recovery is the wrong tool (nothing is
             // desynchronised); the right one is REQUEST SENSE, which is also what CLEARS the
             // condition. Handled before, and independently of, `recover_bot_full`.
-            Ok(r) if r.status == CswStatus::Failed =>
-                return self.bot_check_condition(slot_id, cdb, data_phys, data_len, dir, r),
-            Ok(r) => return Ok(r),
+            // BOT-RESCUE: a device that answers at all is not a device that is wedged, so this and
+            // the plain-Ok arm below both END any escalation streak.
+            Ok(r) if r.status == CswStatus::Failed => {
+                self.bot_rescue_clear(slot_id);
+                return self.bot_check_condition(slot_id, cdb, data_phys, data_len, dir, r);
+            }
+            Ok(r) => { self.bot_rescue_clear(slot_id); return Ok(r); }
             Err(BotError::NoDevice) => return Err(BotError::NoDevice),
             Err(e) => e,
         };
-        if !self.recover_bot_full(slot_id, cause) {
-            // Recovery failed: the pre-existing terminal Err path, semantics unchanged.
-            return Err(cause);
+        // BOT-RESCUE M3 witness 6: the failed stage's own pending record, taken out of
+        // `run_bot_stage` instead of dropped, handed to recovery so its evidence line can carry the
+        // truth about which pipe the stranded TRB sat on.
+        let failed = self.bot_failed.take();
+        if !self.recover_bot_full(slot_id, cause, failed) {
+            // Recovery itself did not complete. Pre-arc this was the terminal Err; it now counts as
+            // one failed cycle and enters the escalation ladder (which, below `BOT_RESCUE_N_CONSEC`,
+            // returns exactly the same `Err(cause)` after a back-off).
+            return self.bot_rescue_escalate(slot_id, cdb, data_phys, data_len, dir, cause);
         }
         let again = self.bot_transfer_once(slot_id, cdb, data_phys, data_len, dir);
         match &again {
@@ -4416,7 +4518,13 @@ impl XhciController {
                     BOT_RETRY_OK.load(Ordering::Relaxed), BOT_RETRY_FAIL.load(Ordering::Relaxed));
             }
         }
-        again
+        // BOT-RESCUE: the retry settled it (whatever the CSW says) — end the streak and return the
+        // result verbatim, exactly as the pre-arc code did. Otherwise escalate.
+        if again.is_ok() {
+            self.bot_rescue_clear(slot_id);
+            return again;
+        }
+        self.bot_rescue_escalate(slot_id, cdb, data_phys, data_len, dir, cause)
     }
 
     /// PH-2: handle a runtime `Failed` CSW (SCSI CHECK CONDITION) with ONE sense fetch and, when
@@ -5443,7 +5551,9 @@ impl XhciController {
 
         // --- Phase 2: exercise the full Bulk-Only Reset Recovery path explicitly, then re-prove. ---
         // `Stall` is the honest cause here: Phase 1 induced one, and it is what the witness records.
-        let full_ok = self.recover_bot_full(slot, BotError::Stall);
+        // BOT-RESCUE M3 witness 6: no failed stage to hand over — this call is a deliberate
+        // exercise of the recovery path, not the aftermath of one. `None` is the honest record.
+        let full_ok = self.recover_bot_full(slot, BotError::Stall, None);
         serial_println!(":: PIUSB: [piusb38] explicit recover_bot_full -> {} ::",
             if full_ok { "ok" } else { "incomplete" });
         let tur2 = self.scsi_test_unit_ready(slot);
@@ -5582,7 +5692,16 @@ impl XhciController {
     /// Every step is one bounded `sync_control` / `run_command_sync`; there is no loop, and this
     /// never calls `bot_transfer`, so recursion is impossible. Runs in the same safe synchronous
     /// polled context as the BOT pump itself.
-    fn recover_bot_full(&mut self, slot_id: u8, cause: BotError) -> bool {
+    ///
+    /// BOT-RESCUE M3 witness 6: `failed` is the pending record of the stage that actually failed,
+    /// handed in by the caller. It used to be read out of `self.bot_pending` here — but
+    /// `run_bot_stage` had already TAKEN that record on its way to reporting the error, so the read
+    /// was always `None` and the `recover evidence` line printed `pipe=none wait_trb=0x0
+    /// stage_done=no stage_cc=0` on every capture ever taken. That was a structural lie about the
+    /// driver's own state, not a finding about the device. Callers with no record to hand (the
+    /// PIUSB-38 aarch64 matrix, which calls recovery directly rather than after a failed stage)
+    /// pass `None` and get the honest `pipe=none`.
+    fn recover_bot_full(&mut self, slot_id: u8, cause: BotError, failed: Option<BotPending>) -> bool {
         let (in_ep, out_ep, intf) = {
             let s = &self.slots[slot_id as usize];
             (s.bulk_in_ep, s.bulk_out_ep, s.storage_intf)
@@ -5598,10 +5717,6 @@ impl XhciController {
             ":: BOT: recover begin cause={:?} slot={} ep={:#x}/{:#x} iface={} n={} ::",
             cause, slot_id, in_ep, out_ep, intf, BOT_RECOVER_COUNT.load(Ordering::Relaxed));
 
-        // BOTEV: snapshot the failed transaction's stage state BEFORE it is dropped — the pending
-        // record is the only in-kernel trace of which TRB the timed-out stage was waiting on. Read
-        // only; the clear below is unchanged.
-        let failed = self.bot_pending;
         // Any half-armed pending stage from the failed transaction must not be matched against an
         // event raised during recovery's own control transfers.
         self.bot_pending = None;
@@ -5716,6 +5831,376 @@ impl XhciController {
         ok
     }
 
+    // ==================== BOT-RESCUE: escalation, back-off, surrender ====================
+
+    /// Rate of `crate::arch::now_cycles()` in ticks per millisecond.
+    ///
+    /// Deliberately NOT derived from `hw_wait_budget()`. That budget is a policy number ("how long
+    /// may a wedged handshake burn before we call it dead"), and the settles below are SPEC numbers
+    /// (VBUS de-energise, bPwrOn2PwrGood, attach debounce, a flash controller's internal stall
+    /// window). Tying one to the other would silently rescale every USB timing constant the day the
+    /// timeout policy changed. Each arch answers from its own timebase, with an honest fallback:
+    ///   * x86_64 — the calibrated invariant TSC (`apic::tsc_hz`), or a 2 GHz guess before
+    ///     calibration has run. A wrong guess makes a settle longer or shorter, never unsound.
+    ///   * aarch64 — CNTFRQ_EL0, the generic timer's declared rate (~54 MHz Pi 4, ~62.5 MHz virt),
+    ///     or 54 MHz if the register reads zero.
+    fn cycles_per_ms() -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let hz = crate::arch::apic::tsc_hz();
+            if hz != 0 { (hz / 1000).max(1) } else { 2_000_000 }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let freq: u64;
+            unsafe {
+                core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq,
+                    options(nomem, nostack, preserves_flags));
+            }
+            if freq != 0 { (freq / 1000).max(1) } else { 54_000 }
+        }
+    }
+
+    /// Busy-settle `ms` milliseconds off the free-running counter, draining the event ring as it
+    /// goes. Draining matters: a late completion for the transaction that just timed out, or a Port
+    /// Status Change raised by the power cycle in escalation (b), must be consumed here rather than
+    /// left to be mistaken for the next stage's completion. `bot_pending` is already `None` on every
+    /// path that reaches here (`run_bot_stage` took it), so nothing in flight can be claimed by a
+    /// stale record. Bounded by construction; no allocation, no lock.
+    fn settle_ms(&mut self, ms: u64) {
+        let budget = Self::cycles_per_ms().saturating_mul(ms);
+        let start = crate::arch::now_cycles();
+        while crate::arch::now_cycles().wrapping_sub(start) < budget {
+            if self.drain_event_ring_once() {
+                continue;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// BOT-RESCUE escalation (a): **Reset Device** for the slot, then re-programme its bulk endpoint
+    /// contexts onto freshly reset rings.
+    ///
+    /// xHCI 1.2 §4.6.11: Reset Device returns the xHC's internal state for a Device Slot — its
+    /// endpoint contexts, data toggles and dequeue pointers — to the post-Address condition, without
+    /// touching the Root Hub Port Number or Route String. It is the strongest slot-scoped tool the
+    /// controller offers short of tearing the device down, and it is the right next rung after the
+    /// class-level Bulk-Only Reset (which resets the DEVICE's state machine) has failed twice: those
+    /// two reset the two halves of a desynchronised pair, and this arc's metal failure had already
+    /// proven the device half insufficient.
+    ///
+    /// HONEST LIMIT, recorded because the witness will show it: the command leaves the Slot in the
+    /// Default state, and this rung does NOT re-address the device (the device was not port-reset,
+    /// so it still holds its address and would not answer a SET_ADDRESS at 0 — re-addressing without
+    /// a port reset would be the unsound move, not the thorough one). A controller that therefore
+    /// refuses the follow-up Configure Endpoint with Context State Error (cc 19) is EXPECTED, is
+    /// printed as such, and simply means this rung did not take: the ladder moves on to (b), whose
+    /// port reset is what makes a re-address lawful. The rung is kept because it is cheap (two
+    /// bounded commands), because it is the correct fix when the fault is purely the xHC's slot
+    /// state, and because a `cc=19` reading here is itself evidence about which half is sick.
+    ///
+    /// Returns true only if BOTH commands succeeded — a half-reset slot is never driven further.
+    fn rescue_reset_device(&mut self, slot_id: u8) -> bool {
+        BOT_RESCUE_RESET_DEVICE.fetch_add(1, Ordering::Relaxed);
+        let (in_ep, out_ep) = {
+            let s = &self.slots[slot_id as usize];
+            (s.bulk_in_ep, s.bulk_out_ep)
+        };
+        if in_ep == 0 || out_ep == 0 || self.slots[slot_id as usize].output_context.is_null() {
+            serial_println!(
+                ":: BOT: rescue stage=reset-device slot={} ok=no why=no-bulk-context ::", slot_id);
+            return false;
+        }
+        let in_dci = ((in_ep & 0x0F) * 2) + 1;
+        let out_dci = (out_ep & 0x0F) * 2;
+        // Max Packet Size lives in Endpoint Context DW1 bits 31:16 (xHCI 1.2 §6.2.3). Read it back
+        // from the OUTPUT context BEFORE the reset clears the endpoint contexts, so the rebuilt
+        // input context carries the device's real MPS rather than a guess.
+        let mps_of = |oc: *mut DeviceContext, dci: u8| -> u16 {
+            let w = unsafe {
+                core::ptr::read_volatile((oc as *const u32).add(dci as usize * CTX_WORDS + 1))
+            };
+            ((w >> 16) & 0xFFFF) as u16
+        };
+        let oc = self.slots[slot_id as usize].output_context;
+        let (in_mps, out_mps) = (mps_of(oc, in_dci), mps_of(oc, out_dci));
+        let (in_s0, out_s0) = (self.ep_state_of(slot_id, in_dci), self.ep_state_of(slot_id, out_dci));
+
+        // M2: hand the re-programmed endpoint contexts a ring in a KNOWN state. The Configure
+        // Endpoint below points the controller at each ring's base with DCS=1; continuing from
+        // wherever the failed transaction left the enqueue index and cycle bit would leave driver
+        // and controller disagreeing about both position and colour from the first push.
+        {
+            let s = &mut self.slots[slot_id as usize];
+            if let Some(r) = s.bulk_in_ring.as_mut() { r.reset(); }
+            if let Some(r) = s.bulk_out_ring.as_mut() { r.reset(); }
+        }
+
+        // Reset Device (TRB type 17).
+        let (rd_ok, rd_cc, rd_why) =
+            self.recover_cmd(Trb { parameter: 0, status: 0, control: (17 << 10) | ((slot_id as u32) << 24) });
+        // A Reset Device retires any TDs the endpoints still held; drain their events so they cannot
+        // be mistaken for the retry's completion.
+        while self.drain_event_ring_once() {}
+
+        // Re-programme both bulk endpoint contexts onto the reset rings (Configure Endpoint, type
+        // 12). `rebuild_bulk_input_ctx` reuses the EXISTING rings and DMA buffers — unlike the
+        // enumeration-time builder, which allocates fresh ones and would leak a ring pair per rung.
+        let input_phys = self.rebuild_bulk_input_ctx(slot_id, in_dci, in_mps, out_dci, out_mps);
+        let (cfg_ok, cfg_cc, cfg_why) = match input_phys {
+            Some(p) => self.recover_cmd(Trb { parameter: p, status: 0, control: (12 << 10) | ((slot_id as u32) << 24) }),
+            None => (false, 0, "no-input-context"),
+        };
+        let ok = rd_ok && cfg_ok;
+        serial_println!(
+            ":: BOT: rescue stage=reset-device slot={} ok={} resetdev_cc={} resetdev_why={} cfgep_cc={} cfgep_why={} indci={} outdci={} inmps={} outmps={} epin={}->{} epout={}->{} n={} ::",
+            slot_id, if ok { "yes" } else { "no" }, rd_cc, rd_why, cfg_cc, cfg_why,
+            in_dci, out_dci, in_mps, out_mps,
+            in_s0, self.ep_state_of(slot_id, in_dci),
+            out_s0, self.ep_state_of(slot_id, out_dci),
+            BOT_RESCUE_RESET_DEVICE.load(Ordering::Relaxed));
+        ok
+    }
+
+    /// BOT-RESCUE: build a bulk Configure-Endpoint input context that REUSES this slot's existing
+    /// transfer rings and DMA buffers. The enumeration-time `build_bulk_input_ctx` allocates a fresh
+    /// ring pair, CBW/CSW buffers and a 32 KiB data buffer on every call — correct there (the slot
+    /// has none yet), a leak per escalation rung here, and wrong besides: the retry must land on the
+    /// ring whose address the caller already reset. Returns the input context's physical address, or
+    /// `None` if the slot has no context or no rings (nothing to re-programme).
+    fn rebuild_bulk_input_ctx(&mut self, slot_id: u8, in_dci: u8, in_mps: u16, out_dci: u8, out_mps: u16)
+        -> Option<u64>
+    {
+        let slot = &self.slots[slot_id as usize];
+        if slot.input_context.is_null() || slot.output_context.is_null() {
+            return None;
+        }
+        let in_phys = slot.bulk_in_ring.as_ref()?.get_ptr();
+        let out_phys = slot.bulk_out_ring.as_ref()?.get_ptr();
+        let input_ctx_virt = slot.input_context;
+        let output_ctx_virt = slot.output_context;
+        unsafe {
+            // XHCI-COHERENCE: consumer boundary — the slot context copied out below was DMA-written
+            // by the controller; invalidate so the copy reads fresh. No-op x86.
+            dma_coherency::inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
+            let base_ptr = input_ctx_virt as *mut u32;
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
+            // Input Control Context: A0 (slot) + both bulk DCIs.
+            base_ptr.add(1).write_volatile(1u32 | (1 << in_dci) | (1 << out_dci));
+            // Slot context, copied from the output context, with Context Entries set to the top DCI.
+            let slot_ctx_ptr = base_ptr.add(CTX_WORDS);
+            for i in 0..8 {
+                let val = core::ptr::read_volatile((output_ctx_virt as *const u32).add(i));
+                slot_ctx_ptr.add(i).write_volatile(val);
+            }
+            let max_dci = in_dci.max(out_dci) as u32;
+            let old_dw0 = slot_ctx_ptr.add(0).read_volatile();
+            slot_ctx_ptr.add(0).write_volatile((old_dw0 & !(0x1F << 27)) | (max_dci << 27));
+            // Bulk IN (EP Type 6) and OUT (EP Type 2) contexts, CErr 3, DCS=1 at each ring's base —
+            // which is exactly where `TransferRing::reset` put the enqueue pointer and colour.
+            let ep_in_ptr = base_ptr.add((1 + in_dci as usize) * CTX_WORDS);
+            ep_in_ptr.add(1).write_volatile((6 << 3) | (3 << 1) | ((in_mps as u32) << 16));
+            ep_in_ptr.add(2).write_volatile((in_phys as u32) | 1);
+            ep_in_ptr.add(3).write_volatile((in_phys >> 32) as u32);
+            ep_in_ptr.add(4).write_volatile(in_mps as u32);
+            let ep_out_ptr = base_ptr.add((1 + out_dci as usize) * CTX_WORDS);
+            ep_out_ptr.add(1).write_volatile((2 << 3) | (3 << 1) | ((out_mps as u32) << 16));
+            ep_out_ptr.add(2).write_volatile((out_phys as u32) | 1);
+            ep_out_ptr.add(3).write_volatile((out_phys >> 32) as u32);
+            ep_out_ptr.add(4).write_volatile(out_mps as u32);
+        }
+        Some(input_ctx_virt as u64)
+    }
+
+    /// BOT-RESCUE escalation (b): power-cycle the device's ROOT PORT (PORTSC Port Power, bit 9) and
+    /// let the enumeration machinery re-attach whatever comes back.
+    ///
+    /// This is the only rung that can revive a device whose own logic — not just its BOT state
+    /// machine — has hung: removing VBUS is the one action a host can take that a wedged device
+    /// firmware cannot ignore. Dwell times are USB spec-scale (`BOT_RESCUE_PORT_OFF_MS`,
+    /// `BOT_RESCUE_PORT_ON_MS`), not timeout-derived.
+    ///
+    /// Re-enumeration is DELEGATED, not open-coded: removing and restoring power raises Connect
+    /// Status Change on the port, and the settle below drains the event ring, so the driver's own
+    /// (tested, single-threaded, one-port-at-a-time) `handle_port_status` path sees the disconnect
+    /// and the reconnect and re-enumerates onto a FRESH slot — retracting this slot's block-registry
+    /// entry through `dispose_disconnected_slots` on the way. Open-coding a synchronous re-address
+    /// here would race that path for the same port with no way to win.
+    ///
+    /// PORTSC hygiene: every write goes through a read-modify-write that masks off PED (bit 1,
+    /// write-1-to-DISABLE), PR (bit 4, write-1-to-RESET) and all RW1C change bits — the same
+    /// discipline `clear_port_change` documents. Nothing here weakens a protection: PP is the
+    /// port's own power switch, and the port is returned to powered before the function exits on
+    /// every path.
+    ///
+    /// Returns true if the port reports a device connected (CCS, bit 0) after the cycle.
+    fn rescue_port_cycle(&mut self, slot_id: u8) -> bool {
+        BOT_RESCUE_PORT_CYCLE.fetch_add(1, Ordering::Relaxed);
+        let port = self.slots[slot_id as usize].port_id;
+        let downstream = self.slots[slot_id as usize].is_downstream;
+        if port == 0 || port > self.max_ports || downstream {
+            // A hub-downstream device's power is the HUB's to switch, via a class request on the
+            // hub's slot — a different pipe, and one this rung has no business reaching for while
+            // the device it would have to ask through may itself be the sick one.
+            serial_println!(
+                ":: BOT: rescue stage=port-cycle slot={} port={} ok=no why={} ::",
+                slot_id, port, if downstream { "downstream-port-not-root" } else { "no-root-port" });
+            return false;
+        }
+        // Preserve everything except the write-1-to-act bits; then drop PP.
+        let keep = |v: u32| v & !(PORT_CHANGE_BITS | (1 << 1) | (1 << 4));
+        let before = self.read_portsc(port);
+        self.write_portsc(port, keep(before) & !(1 << 9));
+        self.settle_ms(BOT_RESCUE_PORT_OFF_MS);
+        let off = self.read_portsc(port);
+        // Restore power.
+        let cur = self.read_portsc(port);
+        self.write_portsc(port, keep(cur) | (1 << 9));
+        self.settle_ms(BOT_RESCUE_PORT_ON_MS);
+        let after = self.read_portsc(port);
+        // The connect/disconnect edges the cycle raised have been dispatched by the settles' drain;
+        // acknowledge any change bits still latched so the port is left clean.
+        self.clear_port_change(port, PORT_CHANGE_BITS);
+        let ccs = after & 1;
+        serial_println!(
+            ":: BOT: rescue stage=port-cycle slot={} port={} ok={} off_ms={} on_ms={} portsc={:#x}->{:#x}->{:#x} pp_off={} ccs={} ped={} pls={} n={} ::",
+            slot_id, port, if ccs != 0 { "yes" } else { "no" },
+            BOT_RESCUE_PORT_OFF_MS, BOT_RESCUE_PORT_ON_MS,
+            before, off, after, (off >> 9) & 1, ccs, (after >> 1) & 1, (after >> 5) & 0xF,
+            BOT_RESCUE_PORT_CYCLE.load(Ordering::Relaxed));
+        ccs != 0
+    }
+
+    /// BOT-RESCUE escalation (c): SURRENDER. Mark the disk FAILED, retract it from the block
+    /// registry, and stop issuing transfers to the slot.
+    ///
+    /// Retraction reuses the GR7 unplug machinery verbatim (`block::unpublish_usb_geometry`), which
+    /// is the point: the FAT layer, the shell's `df` and the installer's per-frame disk list already
+    /// handle a disk that DISAPPEARS — every block entry point re-reads the registry on each call
+    /// and fails honestly with `NotReady`, and the installer's captured `BlockDeviceId` refuses to
+    /// resolve rather than retargeting. A disk that has stopped answering is, to every consumer
+    /// above the driver, indistinguishable from one that was pulled; saying so in the one vocabulary
+    /// they already understand is better than inventing a second failure mode for them to learn.
+    /// It matches by slot id, so a microSD published with `slot_id: 0` can never be retracted here.
+    ///
+    /// `bot_surrendered_slot` then refuses every later transfer to this slot up front. That is the
+    /// arc's actual guarantee: a sick disk can never again spin the system at ~6 s per attempt
+    /// forever. It is cleared when the slot is disposed or re-enumerated, so a physical replug is a
+    /// clean slate and needs no operator action beyond the replug.
+    fn bot_surrender(&mut self, slot_id: u8, cause: BotError) {
+        if self.bot_surrendered_slot == slot_id {
+            return; // already surrendered; one verdict line per disk, not one per caller
+        }
+        BOT_RESCUE_SURRENDER.fetch_add(1, Ordering::Relaxed);
+        self.bot_surrendered_slot = slot_id;
+        let retracted = crate::drivers::block::unpublish_usb_geometry(slot_id);
+        if self.storage_slot == slot_id {
+            self.storage_slot = 0;
+            self.storage_pending_bringup = false;
+            self.storage_note = "storage device FAILED (BOT rescue surrendered)";
+        }
+        // THE verdict line. One per surrendered disk, naming the fault class, what the ladder spent,
+        // and whether the block layer heard about it.
+        serial_println!(
+            ":: BOT: SURRENDER slot={} cause={:?} streak={} recoveries={} recover_ok={} retry_ok={} retry_fail={} resetdev={} portcycle={} retracted={} — disk marked FAILED and retracted; NO further transfers to this slot until it is replugged ::",
+            slot_id, cause, self.bot_fail_streak,
+            BOT_RECOVER_COUNT.load(Ordering::Relaxed), BOT_RECOVER_OK.load(Ordering::Relaxed),
+            BOT_RETRY_OK.load(Ordering::Relaxed), BOT_RETRY_FAIL.load(Ordering::Relaxed),
+            BOT_RESCUE_RESET_DEVICE.load(Ordering::Relaxed),
+            BOT_RESCUE_PORT_CYCLE.load(Ordering::Relaxed),
+            if retracted { "yes" } else { "no-registry-entry" });
+    }
+
+    /// BOT-RESCUE: clear a slot's escalation state — called when a transaction COMPLETES (the
+    /// device is answering, so whatever streak it was on is over) and when a slot is disposed or
+    /// re-enumerated (a fresh device inherits nothing).
+    fn bot_rescue_clear(&mut self, slot_id: u8) {
+        self.bot_fail_streak = 0;
+        self.bot_rescue_stage = 0;
+        if self.bot_surrendered_slot == slot_id {
+            self.bot_surrendered_slot = 0;
+        }
+    }
+
+    /// BOT-RESCUE: ONE retry after an escalation rung, on the SHORTER budget
+    /// (`BOT_BUDGET_SCALE_ESCALATION` — see the constant for why the first attempt keeps ~6 s and
+    /// this does not). `Some(_)` = the rung settled the question (the transfer completed, whatever
+    /// its CSW says); `None` = keep escalating.
+    fn bot_rescue_retry(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32,
+        dir: Direction, rung: &'static str) -> Option<Result<BotResult, BotError>>
+    {
+        self.bot_budget_scale = BOT_BUDGET_SCALE_ESCALATION;
+        let r = self.bot_transfer_once(slot_id, cdb, data_phys, data_len, dir);
+        self.bot_budget_scale = BOT_BUDGET_SCALE_FIRST;
+        self.bot_failed = None;
+        match r {
+            Ok(res) => {
+                serial_println!(
+                    ":: BOT: rescue retry rung={} result=pass status={:?} residue={} budget_scale={} ::",
+                    rung, res.status, res.residue, BOT_BUDGET_SCALE_ESCALATION);
+                self.bot_rescue_clear(slot_id);
+                Some(Ok(res))
+            }
+            Err(e) => {
+                serial_println!(
+                    ":: BOT: rescue retry rung={} result=fail err={:?} budget_scale={} ::",
+                    rung, e, BOT_BUDGET_SCALE_ESCALATION);
+                None
+            }
+        }
+    }
+
+    /// BOT-RESCUE: the ladder above the ladder. Entered when the existing class-level Reset Recovery
+    /// plus its single retry did NOT rescue the transaction.
+    ///
+    /// Counts the consecutive failure, pays an exponential back-off, and — once
+    /// `BOT_RESCUE_N_CONSEC` consecutive cycles have failed — walks the rungs in order, each at most
+    /// once per streak: (a) Reset Device + endpoint re-setup, (b) root-port power cycle, then
+    /// (c) surrender. Terminates by construction: `bot_rescue_stage` only ever increases within a
+    /// streak, and its top is surrender, which refuses every later transfer to the slot.
+    fn bot_rescue_escalate(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32,
+        dir: Direction, cause: BotError) -> Result<BotResult, BotError>
+    {
+        self.bot_fail_streak = self.bot_fail_streak.saturating_add(1);
+        let streak = self.bot_fail_streak;
+        // Exponential back-off: a device wedged mid-internal-stall is made worse by being hammered.
+        let backoff = (BOT_RESCUE_BACKOFF_MS << (streak - 1).min(3)).min(BOT_RESCUE_BACKOFF_MAX_MS);
+        serial_println!(
+            ":: BOT: rescue slot={} cause={:?} streak={} n_consec={} stage={} backoff_ms={} ::",
+            slot_id, cause, streak, BOT_RESCUE_N_CONSEC, self.bot_rescue_stage, backoff);
+        self.settle_ms(backoff);
+        if streak < BOT_RESCUE_N_CONSEC {
+            // Not yet enough evidence that the fault is permanent: report the failure as the
+            // pre-arc code did, and let the caller decide whether to come back.
+            return Err(cause);
+        }
+
+        // (a) Reset Device + endpoint re-setup.
+        if self.bot_rescue_stage == 0 {
+            self.bot_rescue_stage = 1;
+            if self.rescue_reset_device(slot_id) {
+                if let Some(r) = self.bot_rescue_retry(slot_id, cdb, data_phys, data_len, dir, "reset-device") {
+                    return r;
+                }
+            }
+            self.settle_ms(backoff);
+        }
+
+        // (b) Port power-cycle + (delegated) re-enumeration.
+        if self.bot_rescue_stage == 1 {
+            self.bot_rescue_stage = 2;
+            if self.rescue_port_cycle(slot_id) {
+                if let Some(r) = self.bot_rescue_retry(slot_id, cdb, data_phys, data_len, dir, "port-cycle") {
+                    return r;
+                }
+            }
+        }
+
+        // (c) Surrender.
+        self.bot_surrender(slot_id, cause);
+        Err(cause)
+    }
+
     /// Arm the BOT pending state for one stage (waiting on `wait_trb_phys`'s completion
     /// event), pump the event ring until it arrives, and return its completion code. The
     /// caller queues the stage's TRB(s) and rings the doorbell(s) before calling this.
@@ -5728,6 +6213,14 @@ impl XhciController {
         });
         let pump = self.pump_until_bot_done();
         let pending = self.bot_pending.take();
+        // BOT-RESCUE M3 witness 6: park the taken record where the caller can hand it to recovery.
+        // The `pump?` below propagates the error and — before this arc — dropped `pending` on the
+        // floor with it, which is why `recover evidence` could only ever print `pipe=none`. Stored
+        // on the FAILURE path only, and taken (not cloned) by `bot_transfer`, so a stale record can
+        // never be attributed to a later transaction.
+        if pump.is_err() {
+            self.bot_failed = pending;
+        }
         pump?;
         let p = pending.ok_or(BotError::Timeout)?;
         Ok(p.completion_code)
@@ -5751,7 +6244,12 @@ impl XhciController {
         // A BOT data stage can outlast a bare register handshake, so allow a generous multiple of
         // the base handshake budget; only a FAILING transfer (dead DMA / wedged endpoint) ever pays
         // the full wait — the happy path returns the instant the completion event drains.
-        let budget = crate::arch::hw_wait_budget().saturating_mul(3);
+        // BOT-RESCUE: the multiple is `bot_budget_scale`, which is `BOT_BUDGET_SCALE_FIRST` (3 —
+        // the pre-arc constant, so the first attempt's ~6 s is unchanged) at all times except
+        // inside an escalation retry, where the caller briefly drops it to
+        // `BOT_BUDGET_SCALE_ESCALATION` and restores it immediately after. A healthy device never
+        // reaches an escalation retry, so it never sees anything but the historical budget.
+        let budget = crate::arch::hw_wait_budget().saturating_mul(self.bot_budget_scale);
         BOT_PUMP_BUDGET.store(budget, Ordering::Relaxed);
         // IVY: snapshot the waiting slot's topology up front, so the witness (and any timeout line)
         // says whether this transfer rode a root port or a hub route — the one fact the 2026-07-17
@@ -5976,6 +6474,9 @@ impl XhciController {
     fn bring_up_storage(&mut self) -> Result<(), BotError> {
         let slot = self.storage_slot;
         if slot == 0 { return Err(BotError::NoDevice); }
+        // BOT-RESCUE: a freshly enumerated disk inherits no escalation state, even if the
+        // controller handed it a slot id a surrendered disk once held.
+        self.bot_rescue_clear(slot);
 
         // Put the device in the USB CONFIGURED state before touching its bulk endpoints. Real USB
         // Mass-Storage requires a SET_CONFIGURATION before its bulk IN/OUT endpoints become active;
