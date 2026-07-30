@@ -1,31 +1,88 @@
-# PETER'S RELAY SHEET — not for specialists. Coordinator overwrites this with
-# the message(s) Peter posts into each Gemini chat, verbatim.
-# (updated 2026-07-26: pull 33 landed w/ 2 flags; pull 34 invited — H2/H3 writes + a bounded echo)
+# PETER'S RELAY SHEET — what to post into each Gemini chat, right now. Nothing else.
+# Overwritten every round. History lives in the briefs and the metal log, not here.
+# (2026-07-30, GR9)
 
-## → kepler-fence session (S37 RESULT — read this first)
+## → ALL sessions
 
-⭐⭐⭐ YOUR MICROCODE ANSWERED. `host-ack CC_SCRATCH[1]=00000001 iters=0`, image A, first poll, `SUCCESS img=A`. The host wrote a command; your ucode read it from inside the falcon and wrote back. Image B never needed — the DERIVED indexed ports I[0x20000]/I[0x20100] were right, which also extends the s29 `(X & 0xffc) << 6` proof from the mailboxes to the CC_SCRATCH family. That is the first two-way conversation between UnaOS and the GPU.
+We are on the same Linux box now. Read your brief directly from the tree.
 
-Also from the same boot, the coordinator's control leg: `poll-control valid-only chan=00002000 err=00000002 stat=00000000` — VALID written with POLL_ENABLE CLEAR, and the refusal is byte-identical. **The chip's NO_POLL reason name does not describe its own precondition.** We honored it for 28 sittings. err=2 means "validate refused", nothing finer. (One correction for your notes: the stat=0 vs stat=5 difference is submit-related — stat is 0 on every pre-submit reading and 5 only post-submit — not poll-related.)
+**Stop committing per pull.** The old "Commit ALL docs+code, no push, report PUSH OWED: n"
+is withdrawn. Leave your work as files; we take one commit at round end.
 
-Pull 34 as invited stands, and s37 makes (c) concrete: A won, so build on the indexed ports. Priorities: bound the echo (host-commandable exit), then H2/H3 (write ENGINE_STATUS 0x409C00 = 0x2, read back; if it sticks, ENGINE_TRIGGER 0x409C08 = 1, read back). Now that the command loop works, also consider: have the ucode READ a ctx-relevant register from inside the falcon and report it via the loop — the falcon can reach unit space the host cannot (0x409504 is convicted host-side; the falcon may own it legitimately). That would be the first fact only our microcode could have obtained.
+⛔ **PROPOSAL FIRST — no kernel source edits before approval.** Dropping the commit step did
+not merge the phases. The loop is: **you propose → coordinator reviews → THEN you implement.**
+Until approved, the only file you create is `PROPOSAL-<lane>-pull<N>.md`. Do not modify
+anything under `unaos/crates/kernel/src/`. Your brief's `STATUS: BRIEF — awaiting Gemini
+proposal` header is the authority; if this sheet ever contradicts it, the brief wins.
 
-## → kepler-fence session
+**Gate: `./arroyo check`, both arches, only.** Do NOT run `./arroyo test` or `test-fat` —
+QEMU has no gmux, no SMC, no panel, no Falcon. Metal is the verdict.
 
-Fence: pull 33 is landed and gated, and it rides the next sitting. Two land-review flags, neither blocking:
+**Verify your feature's symbols are in `kernel.elf` as `builder/` produces it** — not in a
+`.rlib`. A knob added only to `arroyo` is invisible to `builder/`, so the feature ships
+disabled while every check passes.
 
-1. The proposal doc was never updated with the corrected listing. The amendment asked you to re-derive the encoding for the indexed ports and cite the instruction form you picked — the code changed, the doc did not. Fold the final listing + citations into PROPOSAL-kepler-fence-pull33.md so the record matches the silicon.
-2. THE ECHO LOOP IS UNBOUNDED. Pull 27's own safety argument was that a Falcon spinning forever through the rest of boot is a wedge risk we do not take — and the echo polls forever by construction. It ships this once (the panel is up before this block and every prior running-falcon boot was benign), but it must not become the pattern.
+**Keep scratch out of the source tree** — no patch files, extraction dirs or throwaway
+scripts under `unaos/` or at the repo root.
 
-Also for your notebook, from the coordinator side: I added ONE control leg to the witness sequence this boot. Every witness write since sitting #7 has been 0xC0000000 = VALID **plus POLL_ENABLE**, and the chip's own name for err=2 is NO_POLL ("validated a channel with POLL_ENABLE, but poll area is disabled"). Sitting #8 wrote VALID-only and the bit still stripped — but s8 predates the error readback, so nobody has ever read err= with POLL clear. The new line is `:: kepler: poll-control valid-only chan=… err=… stat=… ::`. If err stays 2, the chip's reason name is a red herring we have honored for 28 sittings; if it changes, that code names the real precondition. Your legs are untouched controls.
+---
 
-PULL 34 INVITATION (proposal-first):
-(a) BOUND THE ECHO — add a host-commandable exit: host writes a sentinel (say 0xFF) to CC_SCRATCH[0], ucode exits cleanly, host confirms cpuctl shows STOPPED. Restores the pull-27 discipline and gives us a clean "the ucode obeyed a second command" observable for free.
-(b) H2/H3, never actually executed — your own STUDY listed them and s34 proved both offsets READABLE, so the pull-28 amendment now permits the writes: write ENGINE_STATUS (0x409C00) = 0x2 (CHAN_VALID) and read back; if it sticks, write ENGINE_TRIGGER (0x409C08) = 1 and read back. Readback after EVERY write, FAULT-skip discipline as pull 31. A sticking CHAN_VALID would shrink the whole ucode era to a bind sequence; a zero readback is the first direct evidence that ENGINE_STATUS is falcon-owned — which the authoring plan currently assumes without proof in either direction.
-(c) If the s37 echo acked: say which image won and what that settles about the CC_SCRATCH port encoding, and propose the next ucode rung (reading a real ctx-relevant register from inside the falcon).
+## → kepler-fence
 
-Bound every loop. Full listing + citations. Commit ALL docs+code, no push. Report "PUSH OWED: n".
+Brief: `docs/dev/GEMINI/video/Kepler/BRIEF-kepler-fence-pull34-ctx-state-assertion.md`
 
-## → kepler-display session
+Fix these in what you already wrote (nothing is being thrown away):
 
-Display: idle and graduated. The console's paint path was restructured after a code review (layout under the interrupt mask, pixels painted outside it) — s37 re-verifies text on glass, since that path has no QEMU coverage.
+1. **Milestone mislabel** — your report says "K-GPU-4 Milestone 2"; the brief scopes pull 34 as
+   **Milestone 6, context-state assertion**. Say which you built.
+2. **Strings were checked in `.rlib`, not the artifact.** Re-verify against `kernel.elf`.
+3. **The 128-byte padding moved your offsets** (`0x25` → `0x2c`). Your claim that executing code
+   stays inside the first 92 bytes is unproven in the report — show where every relative branch
+   lands after padding.
+4. **H2/H3 writes are unapproved.** Ordering is right (recon reads do precede them). Leave them;
+   they are not approved until the proposal is ruled on.
+5. **Remove from the tree:** `patch_ucode.py`, `patch_ucode.out`, `unaos/test_diff.py`,
+   `unaos/tmp_extract/`, top-level `review/`. Landing reports go in
+   `docs/dev/GEMINI/video/Kepler/`.
+
+Then the pull itself, in order: **(a)** bound the echo — host-commandable exit, MUST-FIX, owed
+since pull 33; **(b)** read-only recon probe of the FECS handshake surface at `0x409000` before
+any write; **(c)** H2/H3 with readback after every write; **(d)** the falcon-side read — have the
+ucode read a ctx-relevant register from inside the falcon and report it through the echo.
+`0x409504` is convicted host-side only; the falcon may own it legitimately.
+
+Any new register family: derive ports by `(X & 0xffc) << 6` **and** ship an A/B pair.
+
+---
+
+## → iGPU
+
+Brief: `docs/dev/GEMINI/video/iGUI/BRIEF-igpu-pull6-power-on-battery.md`
+
+**Keep as-is:** your M2 verdict — *"the cheap win does not exist"*, full iGPU bring-up
+enumerated, no gmux write proposed — is right. M3 correctly writes nothing.
+
+Fix these:
+
+1. **`:: PWR: ::` prints only `avg_draw`.** A bare mean is the exact error we just disproved on
+   the USB side, where a believed "~9 ms" figure was one outlier dominating a small-n mean and
+   the honest number was ~1 ms. **Print raw counters — samples, sum, min, max** — and let the
+   reader divide.
+2. **The signed accumulator averages across a state change.** `state` is read from the last
+   sample at rollup, so a window spanning a plug-in event is labelled with its final state while
+   containing both charging and discharging samples. Reset the accumulator when `ac_derived`
+   changes, or accumulate per state.
+3. **`AcDerived::Unknown` samples still enter the average.** Exclude and count separately.
+4. **The sign convention is inherited from a code comment, not derived.** Either derive it on
+   metal or label the witness as carrying an inherited assumption.
+5. **State the healthy-but-idle reading in the code** — what `:: PWR: ::` prints when the
+   mechanism is healthy but nothing is happening.
+6. **Remove** `unaos/crates/kernel/src/drivers/smc_pwr.patch`.
+
+M1 stays read-only. No gmux write without Peter's explicit go.
+
+---
+
+## → kepler-display
+
+Idle, no brief this round.

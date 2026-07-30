@@ -153,6 +153,27 @@ irqstorage = []
 # ATTENDED/TEST ONLY: never enable on boot media. Default OFF => byte-identical (fully cfg-compiled
 # out). Enable via `UNAOS_BOTFAULT=1`.
 botfaultinject = []
+# ONSET-2 (M3 knob 1): grow the STORAGE slot's two BULK transfer rings from 16 TRBs to 64. The
+# one-variable discriminator for the arc's ranked hypothesis (the doorbell that must restart the
+# controller across a Link TRB does not take): changing the ring length changes the wrap FREQUENCY
+# and every wrap POSITION and nothing else — no command sequence, no TD shape, no protection, and
+# the lap guard's two-slot margin scales with the ring by construction. All three genuine onsets in
+# the rmbp-gr8 capture are an OUT data stage at ring index 0, immediately behind a freshly written
+# Link TRB, and boots B and G reproduce the failure deterministically at the same LBA. If the
+# failure MOVES or VANISHES the wrap is causal; if it stays put the correlation was coincidence and
+# the hypothesis dies. EP0, the command ring, the hub interrupt ring and the HID rings are untouched.
+# METAL EXPERIMENT ONLY. Default OFF => BOT_RING_TRBS is 16 and the artifact is byte-identical.
+# Enable via `UNAOS_BOTRING64=1`.
+botring64 = []
+# ONSET-2 (M3 knob 2): give the CBW an IOC bit and await it as its own pumped stage — i.e. make the
+# code do what usb_xhci.md §14.4 already claims it does. Today `bot_transfer_once` pushes the CBW
+# with no IOC and no ISP (so it posts no completion at all) and then pushes the data TRB with NO
+# pump between them; on an OUT data stage both TDs ride the same bulk ring under a SINGLE doorbell
+# and nothing ever witnesses that the CBW was consumed. Costs roughly one 1 kHz tick per
+# transaction. If the onset survives with the CBW confirmed consumed, hypothesis 2 is out and
+# hypothesis 1 narrows to the data TD. METAL EXPERIMENT ONLY. Default OFF => the CBW push is
+# byte-identical to the pre-arc one. Enable via `UNAOS_BOTCBWIOC=1`.
+botcbwioc = []
 # VPERF video-path bench instrumentation (x86_64 only — the module is additionally target-gated,
 # so aarch64 artifacts are byte-identical with this on or off): scroll/VRAM-read/put_pixel
 # counters + serial-only cadence lines, the effective framebuffer memory-type readout (MTRR +

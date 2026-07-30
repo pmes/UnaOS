@@ -416,7 +416,7 @@ pub fn log_summary_once() {
         let n = BOT_PUMP_COUNT.load(Ordering::Relaxed);
         let sum = BOT_PUMP_CYCLES.load(Ordering::Relaxed);
         serial_println!(
-            ":: BOT: pump budget={} peak={} sum={} mean={} n={} nowait={} timeouts={} storage_slot={} route={:#x} depth={} tag_mismatch={} bad_sig={} abandoned_in={} abandoned_out={} undrained={} short_in={} short_out={} ev_late={} ev_unaddressed={} result=SUMMARY ::",
+            ":: BOT: pump budget={} peak={} sum={} mean={} n={} nowait={} timeouts={} storage_slot={} route={:#x} depth={} tag_mismatch={} bad_sig={} abandoned_in={} abandoned_out={} undrained={} short_in={} short_out={} ev_late={} ev_unaddressed={} db_in={} db_out={} ev_stopped={} ev_stopped_li={} ev_any={} w={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{} result=SUMMARY ::",
             budget, peak, sum, if n != 0 { sum / n } else { 0 },
             n, BOT_PUMP_NOWAIT.load(Ordering::Relaxed),
             BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed),
@@ -428,7 +428,23 @@ pub fn log_summary_once() {
             BOT_TD_ABANDONED_IN.load(Ordering::Relaxed), BOT_TD_ABANDONED_OUT.load(Ordering::Relaxed),
             BOT_TD_UNDRAINED.load(Ordering::Relaxed),
             BOT_SHORT_DATA_IN.load(Ordering::Relaxed), BOT_SHORT_DATA_OUT.load(Ordering::Relaxed),
-            BOT_EV_LATE_CLAIM.load(Ordering::Relaxed), BOT_EV_UNADDRESSED.load(Ordering::Relaxed));
+            BOT_EV_LATE_CLAIM.load(Ordering::Relaxed), BOT_EV_UNADDRESSED.load(Ordering::Relaxed),
+            // ONSET-2 (M2): boot totals for the doorbell and stopped-event witnesses, plus the
+            // log2-millisecond wait histogram `w=b0/b1/…/b11`. Bucket 0 is "under 1 ms", bucket k is
+            // 2^(k-1)..2^k - 1 ms, bucket 11 saturates. If the polled-pump reading of the pace is
+            // right the mass sits in buckets 0-2 with a handful of high outliers from the device's
+            // own media-init latency; a spread across the middle buckets refutes it. `ev_stopped=` /
+            // `ev_stopped_li=` are boot totals whose only meaningful reading is the per-recovery
+            // delta on the `resync stopev` lines — see there for why 0 is not by itself reassuring.
+            BOT_DB_IN.load(Ordering::Relaxed), BOT_DB_OUT.load(Ordering::Relaxed),
+            BOT_EV_STOPPED.load(Ordering::Relaxed), BOT_EV_STOPPED_LI.load(Ordering::Relaxed),
+            BOT_EV_ANY.load(Ordering::Relaxed),
+            BOT_WAIT_BUCKETS[0].load(Ordering::Relaxed), BOT_WAIT_BUCKETS[1].load(Ordering::Relaxed),
+            BOT_WAIT_BUCKETS[2].load(Ordering::Relaxed), BOT_WAIT_BUCKETS[3].load(Ordering::Relaxed),
+            BOT_WAIT_BUCKETS[4].load(Ordering::Relaxed), BOT_WAIT_BUCKETS[5].load(Ordering::Relaxed),
+            BOT_WAIT_BUCKETS[6].load(Ordering::Relaxed), BOT_WAIT_BUCKETS[7].load(Ordering::Relaxed),
+            BOT_WAIT_BUCKETS[8].load(Ordering::Relaxed), BOT_WAIT_BUCKETS[9].load(Ordering::Relaxed),
+            BOT_WAIT_BUCKETS[10].load(Ordering::Relaxed), BOT_WAIT_BUCKETS[11].load(Ordering::Relaxed));
         // MULTIBLK: the transfer-size census, on its own line so the SUMMARY above stays
         // byte-comparable with pre-arc captures. `single=` counts data stages still issued at one
         // sector (partial-sector RMW head/tails, INQUIRY, READ CAPACITY, REQUEST SENSE); `multi=`
@@ -695,6 +711,139 @@ pub static BOT_EV_LATE_CLAIM: AtomicU64 = AtomicU64::new(0);
 /// all: Ring Underrun / Ring Overrun / VF Event Ring Full). A non-zero reading names exactly how
 /// often the driver has to fall back on "it can only be ours".
 pub static BOT_EV_UNADDRESSED: AtomicU64 = AtomicU64::new(0);
+
+// --- ONSET-2 (M2, 2026-07-30): the witnesses the cold read of `rmbp-gr8` found missing ---
+//
+// Every counter below states its HEALTHY-BUT-IDLE reading in its own doc comment, because six
+// instrument lies have now been caught in this subsystem by applying one rule: a counter whose
+// healthy reading is indistinguishable from its interesting reading cannot falsify anything.
+// `foreign=` is the current example — it is pinned at 0 by construction on this platform (the pump
+// is a synchronous spin that submits no other traffic, so no other slot can have a TRB outstanding
+// to complete) and therefore supports no verdict at all. It is KEPT, unchanged, for capture
+// comparability; `BOT_EVENTS_SEEN` below is its replacement.
+//
+/// **Doorbell witness.** Per-pipe count of doorbells the BOT path has written, and the ring enqueue
+/// index at the moment of the last one. Until this arc there was no line anywhere in any capture
+/// saying a doorbell had been written, so "the doorbell was written and did not take" and "the
+/// doorbell was never written" were indistinguishable in every capture ever taken — and that is
+/// exactly the discriminator the ranked hypothesis (a doorbell that fails to restart the controller
+/// across a Link TRB) turns on.
+///
+/// HEALTHY-BUT-IDLE READING: both counters advance monotonically, roughly once per transaction each
+/// (the CBW and an OUT data stage share the OUT doorbell; the CSW always rings IN). A raw total is
+/// therefore uninformative on its own — which is why the pump snapshots both at entry and the
+/// timeout line prints the **delta over this wait** (`db_in_d=` / `db_out_d=`). A healthy stage has
+/// a delta of at least 1 on the pipe it is waiting on. A timeout with a delta of **0** on the
+/// awaited pipe means no doorbell was written for this stage at all; a non-zero delta means one was
+/// written and the controller did not act on it. Those are different bugs and this is what tells
+/// them apart.
+pub static BOT_DB_IN: AtomicU64 = AtomicU64::new(0);
+pub static BOT_DB_OUT: AtomicU64 = AtomicU64::new(0);
+/// Ring enqueue index at the last doorbell on each pipe, so a timeout can say WHERE the producer
+/// was when it last told the controller to look. HEALTHY-BUT-IDLE: cycles through 0..ntrb-1 with the
+/// traffic; it is a position, not an alarm, and is read against `trb_idx=` on the TIMEOUT-SHAPE line.
+static BOT_DB_IN_IDX: AtomicU32 = AtomicU32::new(0);
+static BOT_DB_OUT_IDX: AtomicU32 = AtomicU32::new(0);
+/// **Stopped-event census.** Transfer Events carrying completion code 26 (Stopped) and 27 (Stopped —
+/// Length Invalid), boot totals. xHCI 1.2 §4.6.9: a Stop Endpoint issued against an endpoint with a
+/// TD **in progress** must post a Transfer Event with one of those two codes for the interrupted TD;
+/// an endpoint that never fetched the TD has nothing to interrupt and posts nothing. That is the
+/// architectural discriminator between "the controller never fetched the work" and "the controller
+/// fetched it and the device is NAKing" — the last ambiguity in the onset reading, which the cold
+/// read could only call *suggestive*.
+///
+/// HEALTHY-BUT-IDLE READING: **0**, and — stated because the rule demands it — the "never fetched"
+/// reading is **also 0**. This counter discriminates ONLY across a Stop Endpoint issued while a TD
+/// is known to be outstanding, which is precisely the recovery window `resync_bulk_ep` prints the
+/// delta over. Read anywhere else it says nothing.
+pub static BOT_EV_STOPPED: AtomicU64 = AtomicU64::new(0);
+pub static BOT_EV_STOPPED_LI: AtomicU64 = AtomicU64::new(0);
+/// Every Transfer Event dispatched, of any completion code and any slot. The denominator for the two
+/// above, and the thing that makes a zero reading of them mean something.
+/// HEALTHY-BUT-IDLE: advances with all USB traffic; only its DELTA over a named window is a reading.
+pub static BOT_EV_ANY: AtomicU64 = AtomicU64::new(0);
+/// **Event-ring liveness during a wait.** Every event-ring TRB consumed by `pump_until_bot_done`
+/// during ONE wait, of any type — command completion, port status change, transfer for any slot.
+/// This is `foreign=`'s replacement: unlike `foreign`, it CAN be non-zero on this platform, which is
+/// the whole reason a zero reading from it means anything.
+/// HEALTHY-BUT-IDLE READING: at least 1 per completed stage (the completion itself, which is what
+/// ends the wait). At a timeout, `evts=0` says nothing at all came off the event ring across the
+/// whole ~6 s; `evts>0` says the ring was being consumed throughout and only OUR completion never
+/// arrived. Both readings are reachable, and they point at different halves of the machine.
+/// Counted per-wait in the pump, not stored in a static.
+///
+/// **Transaction identity on the timeout line.** `dCBWTag`, CDB opcode and LBA of the transaction
+/// the pump is waiting on. §15.2's code -> capture -> medium join was reconstructed by hand from a
+/// wrecked filesystem; it should be readable straight off the log.
+/// HEALTHY-BUT-IDLE: these are identity, not health — they always hold the last transaction's
+/// values and are only ever printed on a timeout.
+static BOT_LAST_TAG: AtomicU32 = AtomicU32::new(0);
+static BOT_LAST_CDB0: AtomicU32 = AtomicU32::new(0);
+static BOT_LAST_LBA: AtomicU32 = AtomicU32::new(0);
+/// **Per-stage wait histogram**, log2 buckets in MILLISECONDS: bucket 0 = under 1 ms, bucket k>0 =
+/// waits of 2^(k-1) .. 2^k - 1 ms, top bucket saturating. The capture carries only `sum`, `peak` and
+/// `n`, which cannot answer whether the pace is uniform, bimodal or bursty — and cannot test the
+/// reading that the ~1 ms mean is just the 1 kHz APIC tick the polled pump sleeps on (`IRQ_COUNT=0`
+/// on every boot, so `hlt()` is woken by the timer and nothing else).
+/// HEALTHY-BUT-IDLE READING: if the polled-pump reading is right, essentially every sample lands in
+/// buckets 0-2 (under 4 ms) with a handful of high outliers from device-side media-init latency. A
+/// spread across the middle buckets would refute it.
+static BOT_WAIT_BUCKETS: [AtomicU64; 12] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+
+// --- ONSET-2 (M3): the H1 experiment, behind two knobs that both default to today's behaviour ---
+//
+// The ranked hypothesis is that **the doorbell which must restart the controller across a Link TRB
+// does not take**. All three genuine onsets in `rmbp-gr8` are the same shape — an OUT data stage,
+// 512 bytes, at ring index 0, i.e. immediately behind a freshly written Link TRB — and boots B and G
+// reproduce it deterministically at the same stage index and the same LBA on two different builds.
+// Neither knob is a fix; each is a ONE-VARIABLE discriminator, and with both off the image is
+// byte-identical to the pre-arc one.
+//
+/// **Knob 1 (`botring64`, `UNAOS_BOTRING64=1`): the bulk transfer rings' length in TRBs.**
+///
+/// This is the single cleanest experiment available: changing the ring length changes the wrap
+/// FREQUENCY and every wrap POSITION and nothing else. No protection is touched, no command
+/// sequence changes, no TD shape changes, and `TransferRing::would_lap`'s two-slot margin scales
+/// with the ring by construction (`used + 2 >= n`). Read the result as:
+///   * the deterministic failure at LBA 17303 MOVES or VANISHES -> the wrap/Link TRB is causal;
+///   * it STAYS at the same stage index and the same LBA -> the 3-of-3 wrap correlation was
+///     coincidence, and the hypothesis dies.
+/// Applies to the storage slot's two BULK rings only. EP0, the command ring, the hub interrupt ring
+/// and the HID rings are untouched, so the variable stays single.
+#[cfg(not(feature = "botring64"))]
+pub const BOT_RING_TRBS: usize = 16;
+#[cfg(feature = "botring64")]
+pub const BOT_RING_TRBS: usize = 64;
+
+// The two knob TAGS below exist so `strings` on the metal artifact can settle which experiment the
+// media carries. A compiled-in INTEGER (16 vs 64) leaves no text behind, and this project has twice
+// shipped a knob that was wired into `arroyo` but not into `builder/` — green everywhere, disabled
+// on the media, and invisible until the boot came back identical. One of each pair, and only one, is
+// in any given image.
+#[cfg(not(feature = "botring64"))]
+const BOT_RING_KNOB_TAG: &str = "botring64=off-16trb";
+#[cfg(feature = "botring64")]
+const BOT_RING_KNOB_TAG: &str = "botring64=ON-64trb";
+#[cfg(not(feature = "botcbwioc"))]
+const BOT_CBWIOC_KNOB_TAG: &str = "botcbwioc=off-cbw-unawaited";
+#[cfg(feature = "botcbwioc")]
+const BOT_CBWIOC_KNOB_TAG: &str = "botcbwioc=ON-cbw-awaited";
+
+// **Knob 2 (`botcbwioc`, `UNAOS_BOTCBWIOC=1`): give the CBW IOC and await it as its own stage.**
+//
+// §14.4 asserts that "each BOT stage is awaited to completion before the next is queued, so at most
+// ONE TRB is outstanding". The source does not do that. `bot_transfer_once` pushes the CBW with
+// `control: 1 << 10` — Normal type, no IOC, no ISP, so it posts no completion at all — and then
+// pushes the data TRB with NO pump between them. For an OUT data stage both TDs ride the same bulk
+// OUT ring under a SINGLE doorbell, and the driver has no witness that the CBW was ever consumed.
+// With this knob the CBW carries IOC and is pumped to completion before the data stage is built, so
+// the code does what the doc already claims. Costs roughly one 1 kHz tick per transaction. Read it
+// as: if the onset survives with the CBW CONFIRMED consumed, hypothesis 2 is out and hypothesis 1
+// narrows to the data TD alone.
 
 // --- PH-2: runtime CHECK CONDITION handling (SCSI SPC-4 §4.5, USB MSC BOT 1.0 §6.5) ---
 //
@@ -1840,6 +1989,78 @@ impl XhciController {
         }
     }
 
+    /// ONSET-2 (M2 witness 1): the **port register census** — PORTSC with its Port Link State
+    /// decoded, PORTPMSC and PORTLI, for every port that reports a device connected.
+    ///
+    /// **Why this is the highest-value line in the arc.** No capture has ever recorded any port
+    /// state at a BOT timeout, which leaves two whole hypothesis families untestable: USB 2.0 link
+    /// power management left armed by firmware (the failing device is on a **USB 2.0** root port, so
+    /// the relevant LPM is **L1 / PORTPMSC**, not USB 3's U1/U2), and PCH port-mux routing residue
+    /// from the XUSB2PR/USB3_PSSEN writes the driver makes at bring-up. Both can be killed or
+    /// confirmed by a handful of volatile reads. This function writes nothing: PORTSC has write-1-to
+    /// -disable (PED) and write-1-to-reset (PR) semantics and every RW1C change bit besides, so a
+    /// witness that only ever reads cannot perturb what it is measuring.
+    ///
+    /// Printed once at bring-up as the **baseline** the instrument-baseline law requires, and again
+    /// on every `TIMEOUT-PIPES`. A register reading with nothing to compare it against cannot
+    /// falsify anything — that is how `IMAN=0x3` sat in captures for weeks looking like evidence
+    /// until the healthy line was printed beside it and read identically.
+    ///
+    /// HEALTHY-BUT-IDLE READING, stated per field because that is the rule:
+    ///   * `pls=0(U0)` — the link is up and active. **This is the reading that kills the LPM
+    ///     hypothesis** if it holds across a timeout. `pls=2(U2)` or `pls=3(U3)` at a timeout on a
+    ///     USB 2.0 port would mean the link went to sleep under a driver that programs no LPM state
+    ///     and would never bring it back.
+    ///   * `ccs=1 ped=1 pp=1 pr=0 oca=0 cas=0` — connected, enabled, powered, not resetting, no
+    ///     overcurrent, no Cold Attach Status.
+    ///   * `pmsc=0x0` with `l1s=0(invalid)` and `hle=0` — no L1 transaction has ever been attempted
+    ///     and hardware LPM is not enabled. Anything else on a port this driver never programmed
+    ///     means **firmware** armed it, which is the whole hypothesis.
+    ///   * `li=0x0` — PORTLI is the USB 3 Link Error Count and is **reserved on a USB 2.0 port**, so
+    ///     0 there is definitional, not a signal. It is printed to prove the register decode and to
+    ///     be non-empty on a USB 3 port, and no verdict may ever be taken from it on a USB 2 port.
+    ///   * change bits (`csc/pec/prc/plc/cec`) all 0 — nothing has happened to the port since it was
+    ///     last acknowledged. A `plc=1` at a timeout would be a Port Link State Change nobody
+    ///     consumed, which is the single most interesting thing this line could say.
+    fn port_link_witness(&self, why: &str) {
+        for port in 1..=self.max_ports {
+            let base = self.op_base + 0x400 + (port as usize - 1) * 0x10;
+            let (portsc, pmsc, li) = unsafe {
+                (core::ptr::read_volatile(base as *const u32),
+                 core::ptr::read_volatile((base + 0x04) as *const u32),
+                 core::ptr::read_volatile((base + 0x08) as *const u32))
+            };
+            if portsc & 1 == 0 {
+                continue; // CCS clear: nothing attached, nothing to say
+            }
+            let pls = (portsc >> 5) & 0xF;
+            // xHCI 1.2 §5.4.8 Table 5-27.
+            let pls_name = match pls {
+                0 => "U0", 1 => "U1", 2 => "U2", 3 => "U3-suspend", 4 => "Disabled",
+                5 => "RxDetect", 6 => "Inactive", 7 => "Polling", 8 => "Recovery",
+                9 => "HotReset", 10 => "Compliance", 11 => "TestMode", 15 => "Resume",
+                _ => "reserved",
+            };
+            // PORTPMSC in its USB 2.0 layout (§5.4.9.1): L1S 2:0, RWE 3, BESL/HIRD 7:4,
+            // L1 Device Slot 15:8, HLE 16. On a USB 3 port the same offset is a different register
+            // (U1/U2 timeouts), which is why the major version is on the line.
+            let l1s = pmsc & 0x7;
+            let l1s_name = match l1s {
+                0 => "invalid", 1 => "success", 2 => "not-yet", 3 => "not-supported",
+                4 => "timeout-error", _ => "reserved",
+            };
+            serial_println!(
+                ":: BOT: portreg why={} port={} usb{} portsc={:#010x} ccs={} ped={} oca={} pr={} pls={}({}) pp={} speed={} cas={} csc={} pec={} prc={} plc={} cec={} pmsc={:#010x} l1s={}({}) rwe={} hird={} l1slot={} hle={} li={:#010x} result=PORTREG ::",
+                why, port, self.port_major(port), portsc,
+                portsc & 1, (portsc >> 1) & 1, (portsc >> 3) & 1, (portsc >> 4) & 1,
+                pls, pls_name, (portsc >> 9) & 1, (portsc >> 10) & 0xF, (portsc >> 24) & 1,
+                (portsc >> 17) & 1, (portsc >> 18) & 1, (portsc >> 21) & 1,
+                (portsc >> 22) & 1, (portsc >> 23) & 1,
+                pmsc, l1s, l1s_name, (pmsc >> 3) & 1, (pmsc >> 4) & 0xF,
+                (pmsc >> 8) & 0xFF, (pmsc >> 16) & 1, li);
+        }
+    }
+
     /// Safely clear one or more PORTSC change bits (all RW1C). PORTSC has dangerous
     /// write-1 semantics: bit 1 (PED) is write-1-to-DISABLE and bit 4 (PR) is
     /// write-1-to-RESET. A naive `read | change_bit` write-back can therefore disable
@@ -2153,6 +2374,28 @@ impl XhciController {
                             if p.slot_id != slot_id as u8 {
                                 BOT_FOREIGN_EVENTS.fetch_add(1, Ordering::Relaxed);
                             }
+                        }
+
+                        // ONSET-2 (M2 witness 3): census by completion code, naming 26 and 27.
+                        //
+                        // xHCI 1.2 §4.6.9: a Stop Endpoint issued against an endpoint with a TD IN
+                        // PROGRESS must post a Transfer Event for the interrupted TD with completion
+                        // code 26 (Stopped) or 27 (Stopped — Length Invalid). An endpoint that never
+                        // fetched the TD has nothing to interrupt and posts nothing. That is the
+                        // architectural discriminator between "the controller never fetched the
+                        // work" and "the controller fetched it and the device is NAKing" — the last
+                        // ambiguity in the onset reading, which the driver could never speak to
+                        // because it never printed stopped-events by name.
+                        //
+                        // Boot totals; the reading that means anything is the DELTA `resync_bulk_ep`
+                        // prints across its own Stop/Reset Endpoint. Three relaxed adds on a path
+                        // that is already doing MMIO and DMA reads; no dispatch decision is taken
+                        // from any of them, so event routing is byte-unchanged.
+                        BOT_EV_ANY.fetch_add(1, Ordering::Relaxed);
+                        match completion_code {
+                            26 => { BOT_EV_STOPPED.fetch_add(1, Ordering::Relaxed); }
+                            27 => { BOT_EV_STOPPED_LI.fetch_add(1, Ordering::Relaxed); }
+                            _ => {}
                         }
 
                         // Synchronous EP0 control transfer (hub bring-up) claims its OWN Status-TRB
@@ -4456,11 +4699,13 @@ impl XhciController {
             // fresh, not a stale cached line. No-op x86.
             dma_coherency::inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
 
-            let bulk_in_ring = ring::TransferRing::new(16);
+            // ONSET-2 (M3 knob 1): `BOT_RING_TRBS` is 16 unless `botring64` is compiled in, in which
+            // case it is 64. The ONLY two rings the knob touches.
+            let bulk_in_ring = ring::TransferRing::new(BOT_RING_TRBS);
             let bulk_in_phys = bulk_in_ring.get_ptr();
             slot.bulk_in_ring = Some(bulk_in_ring);
 
-            let bulk_out_ring = ring::TransferRing::new(16);
+            let bulk_out_ring = ring::TransferRing::new(BOT_RING_TRBS);
             let bulk_out_phys = bulk_out_ring.get_ptr();
             slot.bulk_out_ring = Some(bulk_out_ring);
 
@@ -4690,12 +4935,16 @@ impl XhciController {
         // stop/reset commands below.
         self.bot_pending = None;
 
-        let (in_live, out_live) = self.bot_strand_witness(slot_id, in_dci, out_dci, cause, "pre");
-        if in_live > 0 { BOT_TD_ABANDONED_IN.fetch_add(1, Ordering::Relaxed); }
-        if out_live > 0 { BOT_TD_ABANDONED_OUT.fetch_add(1, Ordering::Relaxed); }
-
-        let in_ok = self.resync_bulk_ep(slot_id, in_dci, true);
-        let out_ok = self.resync_bulk_ep(slot_id, out_dci, false);
+        // ONSET-2 (M1b): the `when=pre` scan is no longer taken here. It is taken inside
+        // `resync_bulk_ep` below, between each pipe's Stop/Reset Endpoint and its Set TR Dequeue
+        // Pointer — the only window in which the endpoint context's TR Dequeue Pointer is BOTH
+        // architecturally defined (the endpoint is out of Running) and still parked on the strand.
+        // Taken here it ran after `recover_bot_full` had already repointed both pipes, so `gap=0
+        // live=0` was true by construction and §15.8 item 2 could never fire. `abandoned_in=` /
+        // `abandoned_out=` are incremented from that scan, so they still get exactly one count per
+        // pipe per failure — from the authoritative reading instead of a post-repoint one.
+        let in_ok = self.resync_bulk_ep(slot_id, in_dci, true, cause);
+        let out_ok = self.resync_bulk_ep(slot_id, out_dci, false, cause);
         // Drain anything the resync itself produced, so a stopped TD's event cannot be mistaken for
         // the NEXT transaction's completion. `resync_bulk_ep` drains once between its stop and its
         // set-deq; this is the drain after the set-deq.
@@ -4726,28 +4975,66 @@ impl XhciController {
     fn bot_strand_witness(&self, slot_id: u8, in_dci: u8, out_dci: u8, cause: BotError, when: &str)
         -> (usize, usize)
     {
-        let mut live = [0usize; 2];
-        for (i, (dci, is_in)) in [(in_dci, true), (out_dci, false)].into_iter().enumerate() {
-            let state = self.ep_state_of(slot_id, dci);
-            let deq = self.ep_ctx_deq(slot_id, dci);
-            let slot = &self.slots[slot_id as usize];
-            let ring = if is_in { slot.bulk_in_ring.as_ref() } else { slot.bulk_out_ring.as_ref() };
-            let (enq, cyc, ntrb, scan) = match ring {
-                Some(r) => (r.enqueue_index(), if r.cycle_bit() { 1 } else { 0 }, r.num_trbs(),
-                            r.strand_scan(deq)),
-                None => (0, 0, 0, None),
-            };
-            let (gap, l) = scan.unwrap_or((0, 0));
-            let trusted = matches!(state, 2 | 3 | 4);
-            if trusted { live[i] = l; }
-            serial_println!(
-                ":: BOT: strand when={} slot={} cause={:?} pipe={} dci={} epstate={} enq={} cycle={} ntrb={} ctxdeq={:#x} dcs={} ctxdeq_valid={} gap={} live={} gen={} ::",
-                when, slot_id, cause, if is_in { "in" } else { "out" }, dci, state,
-                enq, cyc, ntrb, deq, deq & 1,
-                if trusted { "yes" } else { "no-ep-running" },
-                gap, l, BOT_STAGE_GEN.load(Ordering::Relaxed));
+        let in_live = self.bot_strand_pipe(slot_id, in_dci, true, cause, when);
+        let out_live = self.bot_strand_pipe(slot_id, out_dci, false, cause, when);
+        (in_live, out_live)
+    }
+
+    /// One pipe's `:: BOT: strand ::` line. Returns the count of live (valid-cycle) TRBs between the
+    /// controller's dequeue pointer and our enqueue pointer — **0 unless the reading is trusted**,
+    /// i.e. unless the endpoint is Halted(2)/Stopped(3)/Error(4), where the Output Endpoint Context's
+    /// TR Dequeue Pointer field is architecturally defined (xHCI 1.2 §4.8.3). The raw scan is still
+    /// printed under a Running endpoint, tagged `ctxdeq_valid=no-ep-running`, because a tagged
+    /// reading is evidence about the instrument even when it is not evidence about the ring.
+    ///
+    /// **ONSET-2 (M1b): where the `pre` scan is taken from, and why it moved.** Until this arc the
+    /// only `when=pre` scan ran inside `bot_clean_rings`, i.e. at the chokepoint on the way OUT of
+    /// `bot_transfer` — after `recover_bot_full` had already run `resync_bulk_ep` on both pipes and
+    /// issued their Set TR Dequeue Pointers. The controller had therefore been repointed onto our
+    /// enqueue before the "pre" scan ever looked, so `gap=0 live=0` was true BY CONSTRUCTION and
+    /// §15.8 item 2 ("a `when=pre` line with `live>0` and `ctxdeq_valid=yes`") could never fire from
+    /// there. Two metal boots in `rmbp-gr8` show the ordering directly (F: set-deq at 3752/3754, the
+    /// pre scan at 3758/3759; G: 4192/4194 then 4198/4199).
+    ///
+    /// The scan is now taken inside `resync_bulk_ep`, in the window between that pipe's Stop/Reset
+    /// Endpoint and its Set TR Dequeue Pointer. That window is the ONLY place in the driver where
+    /// both halves of the reading are true at once: the endpoint has been forced out of Running so
+    /// the controller has written its real dequeue position back into the context (the reading is
+    /// authoritative), and nothing has yet moved that position (the strand, if any, is still
+    /// between the two pointers). `bot_clean_rings` keeps its `when=post` scan unchanged — that is
+    /// `undrained=`'s reading and this arc does not touch it.
+    ///
+    /// The `abandoned_in=`/`abandoned_out=` counters are incremented from here, on the `pre` scan
+    /// only, so they now count from the authoritative reading rather than from a post-repoint one.
+    fn bot_strand_pipe(&self, slot_id: u8, dci: u8, is_in: bool, cause: BotError, when: &str) -> usize {
+        let state = self.ep_state_of(slot_id, dci);
+        let deq = self.ep_ctx_deq(slot_id, dci);
+        let slot = &self.slots[slot_id as usize];
+        let ring = if is_in { slot.bulk_in_ring.as_ref() } else { slot.bulk_out_ring.as_ref() };
+        let (enq, cyc, ntrb, scan) = match ring {
+            Some(r) => (r.enqueue_index(), if r.cycle_bit() { 1 } else { 0 }, r.num_trbs(),
+                        r.strand_scan(deq)),
+            None => (0, 0, 0, None),
+        };
+        let (gap, l) = scan.unwrap_or((0, 0));
+        let trusted = matches!(state, 2 | 3 | 4);
+        serial_println!(
+            ":: BOT: strand when={} slot={} cause={:?} pipe={} dci={} epstate={} enq={} cycle={} ntrb={} ctxdeq={:#x} dcs={} ctxdeq_valid={} gap={} live={} gen={} ::",
+            when, slot_id, cause, if is_in { "in" } else { "out" }, dci, state,
+            enq, cyc, ntrb, deq, deq & 1,
+            if trusted { "yes" } else { "no-ep-running" },
+            gap, l, BOT_STAGE_GEN.load(Ordering::Relaxed));
+        if !trusted {
+            return 0;
         }
-        (live[0], live[1])
+        if when == "pre" && l > 0 {
+            if is_in {
+                BOT_TD_ABANDONED_IN.fetch_add(1, Ordering::Relaxed);
+            } else {
+                BOT_TD_ABANDONED_OUT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        l
     }
 
     fn bot_transfer_body(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32, dir: Direction)
@@ -4994,10 +5281,34 @@ impl XhciController {
     /// transaction serialises its stages and so holds at most 3 of 16 TRBs, and the lap hazard the
     /// guard exists for only materialises across recovery retries — which run against Stopped
     /// endpoints, exactly where the guard still applies unchanged.
+    /// ONSET-2 (M2 witness 2): ring a bulk doorbell for the BOT path, and RECORD that we did.
+    ///
+    /// The counting lives here rather than in `ring_doorbell` because that function is shared with
+    /// enumeration, HID and the FTDI console: these counters must mean "doorbells the BOT transfer
+    /// path wrote", not "doorbells anything wrote", or the delta the timeout line prints stops being
+    /// about this transfer. One relaxed add and one relaxed store on a path that is already doing an
+    /// MMIO write; nothing is decided from either, and the doorbell itself is byte-unchanged.
+    fn bot_doorbell(&mut self, slot_id: u8, dci: u8, is_in: bool) {
+        let idx = {
+            let s = &self.slots[slot_id as usize];
+            let r = if is_in { s.bulk_in_ring.as_ref() } else { s.bulk_out_ring.as_ref() };
+            match r { Some(r) => r.enqueue_index() as u32, None => u32::MAX }
+        };
+        if is_in {
+            BOT_DB_IN.fetch_add(1, Ordering::Relaxed);
+            BOT_DB_IN_IDX.store(idx, Ordering::Relaxed);
+        } else {
+            BOT_DB_OUT.fetch_add(1, Ordering::Relaxed);
+            BOT_DB_OUT_IDX.store(idx, Ordering::Relaxed);
+        }
+        self.ring_doorbell(slot_id, dci as u32);
+    }
+
     fn bot_ring_guard(&self, slot_id: u8, dci: u8, is_in: bool) -> Result<(), BotError> {
         // GUARD-STATE: never refuse against a Running(1) endpoint — nor a Disabled(0) or absent
         // (0xFF) one, where there is no consumer position to compare against either.
-        match self.ep_state_of(slot_id, dci) {
+        let epstate = self.ep_state_of(slot_id, dci);
+        match epstate {
             2 | 3 | 4 => {}
             _ => return Ok(()),
         }
@@ -5011,9 +5322,23 @@ impl XhciController {
         if !r.would_lap(deq) {
             return Ok(());
         }
+        // ONSET-2 (M2 witness 5): `epstate=` and `ctxdeq_valid=` are now ON the line. §14.7 item 8's
+        // sub-claim — "any `ring refuse` now carries epstate 2, 3 or 4 BY CONSTRUCTION, so it is a
+        // real finding rather than an artefact" — was unverifiable on every capture ever taken,
+        // because the line printed slot/dci/dir/enq/cycle/ntrb/ctxdeq/dcs and nothing else. The
+        // construction argument is sound in the source (the match above returns `Ok` for every other
+        // state before `ctxdeq` is even read), but a claim whose witness is absent from the log is an
+        // inference, not a finding. Both values are already in hand here; printing them costs a
+        // format argument each and makes the sub-claim checkable for the first time.
+        //
+        // HEALTHY-BUT-IDLE READING: the line does not appear at all. When it does appear, `epstate`
+        // must read 2, 3 or 4 and `ctxdeq_valid` must read `yes`; anything else on this line would
+        // mean the guard fired from a state in which the field it read is architecturally undefined,
+        // which is the GUARD-STATE defect returning.
         serial_println!(
-            ":: BOT: ring refuse slot={} dci={} dir={} enq={} cycle={} ntrb={} ctxdeq={:#x} dcs={} — enqueue would lap the controller (xHCI 1.2 §4.9.1); stage failed instead of overrunning the ring ::",
+            ":: BOT: ring refuse slot={} dci={} dir={} epstate={} ctxdeq_valid={} enq={} cycle={} ntrb={} ctxdeq={:#x} dcs={} — enqueue would lap the controller (xHCI 1.2 §4.9.1); stage failed instead of overrunning the ring ::",
             slot_id, dci, if is_in { "in" } else { "out" },
+            epstate, if matches!(epstate, 2 | 3 | 4) { "yes" } else { "no-ep-running" },
             r.enqueue_index(), if r.cycle_bit() { 1 } else { 0 }, r.num_trbs(),
             deq, deq & 1);
         Err(BotError::RingFull)
@@ -5145,7 +5470,12 @@ impl XhciController {
     /// capture distinguishes "command ring dead" (`why=nocompletion`) from "command refused"
     /// (`why=cc-error cc=19`) from "the state-aware arm chose wrong" (the `epstate` transition did
     /// not happen). The command SEQUENCE is untouched by this instrumentation.
-    fn resync_bulk_ep(&mut self, slot_id: u8, dci: u8, is_in: bool) -> bool {
+    ///
+    /// ONSET-2 (M1b): this function now also emits the `:: BOT: strand when=pre ::` line for its
+    /// pipe, in the window between the Stop/Reset Endpoint above and the Set TR Dequeue Pointer
+    /// below. See `bot_strand_pipe` for why that is the only window where the reading is worth
+    /// taking. Read-only; the command sequence is unchanged.
+    fn resync_bulk_ep(&mut self, slot_id: u8, dci: u8, is_in: bool, cause: BotError) -> bool {
         if self.slots[slot_id as usize].output_context.is_null() {
             serial_println!(
                 ":: BOT: resync stage=read-state dci={} dir={} ok=no why=no-output-context ::",
@@ -5155,6 +5485,13 @@ impl XhciController {
         let dir = if is_in { "in" } else { "out" };
         let ep_state = self.ep_state_of(slot_id, dci) as u32;
         let ctx = ((dci as u32) << 16) | ((slot_id as u32) << 24);
+        // ONSET-2 (M2 witness 3): baselines for the stopped-event delta, taken HERE — before the
+        // Stop/Reset Endpoint below — because a counter read against its own boot-long total is not
+        // a rate (the instrument-baseline law). The delta is printed after the drain.
+        let (ev26_0, ev27_0, evany_0) = (
+            BOT_EV_STOPPED.load(Ordering::Relaxed),
+            BOT_EV_STOPPED_LI.load(Ordering::Relaxed),
+            BOT_EV_ANY.load(Ordering::Relaxed));
         match ep_state {
             2 | 4 => {
                 // Reset Endpoint (TRB type 14). TSP left 0: the device-side toggle was already
@@ -5217,6 +5554,35 @@ impl XhciController {
         // be mistaken for the retry's completion.
         while self.drain_event_ring_once() {}
 
+        // ONSET-2 (M1b): THE authoritative pre-cleanup reading, and the only place it can be taken.
+        // The endpoint is out of Running by here (the arms above stopped or reset it, or found it
+        // already Stopped), so the controller has written its real TR Dequeue Pointer back into the
+        // output context — and the Set TR Dequeue Pointer that would move it is still below. A
+        // `live>0` here with `ctxdeq_valid=yes` is §15.8 item 2's first direct observation of a
+        // stranded TRB.
+        self.bot_strand_pipe(slot_id, dci, is_in, cause, "pre");
+
+        // ONSET-2 (M2 witness 3): what the Stop/Reset Endpoint above actually posted.
+        //
+        // READING KEY — and the honest limit, stated because a witness read wrong is worse than
+        // none. `ev_stopped`/`ev_stopped_li` counts the Transfer Events xHCI 1.2 §4.6.9 obliges the
+        // controller to post for a TD it was IN THE MIDDLE OF when the endpoint was stopped:
+        //   * non-zero -> the controller HAD fetched the TD. A timeout on that TD is then the DEVICE
+        //     failing to move the data (NAKing, or wedged mid-transfer), not the controller failing
+        //     to fetch it — and no host-side ring surgery can help.
+        //   * zero, WITH a TD known outstanding (which is exactly the case at a BOT timeout: the
+        //     pump was waiting on a specific TRB when it gave up) -> the controller never fetched
+        //     the work. Host/endpoint fault; ring surgery is the right family of fix.
+        // Zero is ALSO what a healthy idle endpoint reads, because there is nothing to interrupt. So
+        // this field discriminates only in the presence of a known-outstanding TD; anywhere else it
+        // is silent, not reassuring. `ev_any` is its denominator over the same window.
+        serial_println!(
+            ":: BOT: resync stopev dci={} dir={} epstate_read={} ev_stopped={} ev_stopped_li={} ev_any={} — Transfer Events posted by THIS pipe's Stop/Reset Endpoint (xHCI 1.2 §4.6.9) ::",
+            dci, dir, ep_state,
+            BOT_EV_STOPPED.load(Ordering::Relaxed).wrapping_sub(ev26_0),
+            BOT_EV_STOPPED_LI.load(Ordering::Relaxed).wrapping_sub(ev27_0),
+            BOT_EV_ANY.load(Ordering::Relaxed).wrapping_sub(evany_0));
+
         let deq = {
             let slot = &self.slots[slot_id as usize];
             let ring = if is_in { slot.bulk_in_ring.as_ref() } else { slot.bulk_out_ring.as_ref() };
@@ -5269,6 +5635,19 @@ impl XhciController {
         // Cross-checked against the device's own `dCSWDataResidue` claim at CSW validation.
         let mut data_moved: u32 = 0;
         let tag = self.build_cbw(cbw_phys as *mut u8, data_len, dir, cdb);
+        // ONSET-2 (M2 witness 7): name the transaction, so a TIMEOUT line identifies its own victim.
+        // §15.2's code -> capture -> medium join had to be reconstructed from a wrecked filesystem
+        // because `dCBWTag`, the CDB opcode and the LBA were printed only by `csw_bytes` on a CSW
+        // rejection and by `BLK: io-cause` after the fact. Three relaxed stores.
+        BOT_LAST_TAG.store(tag, Ordering::Relaxed);
+        BOT_LAST_CDB0.store(*cdb.first().unwrap_or(&0) as u32, Ordering::Relaxed);
+        // READ(10) / WRITE(10) carry a big-endian 32-bit LBA at CDB bytes 2..5 (SBC-3 §5.10/§5.32).
+        // Any other opcode has no LBA in that position, so record 0 rather than a decoded lie.
+        BOT_LAST_LBA.store(
+            if cdb.len() >= 6 && matches!(cdb[0], 0x28 | 0x2A) {
+                ((cdb[2] as u32) << 24) | ((cdb[3] as u32) << 16) | ((cdb[4] as u32) << 8) | cdb[5] as u32
+            } else { 0 },
+            Ordering::Relaxed);
         unsafe { core::ptr::write_bytes(csw_phys as *mut u8, 0, 13); }
         // XHCI-COHERENCE: the CBW is CPU-written and DMA-read by the controller (bulk OUT) — clean it
         // to DRAM before its doorbell. The CSW was just zeroed and the controller will DMA-write it —
@@ -5314,9 +5693,41 @@ impl XhciController {
         // vector for the matching in `handle_event_trb`. `push` cannot fail today (it always
         // returns `Ok`), so this is byte-identical in behaviour; it is here so that if it ever can,
         // the transaction fails honestly instead of waiting on a fabricated address.
-        self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
-            .push(Trb { parameter: cbw_phys, status: 31, control: 1 << 10 })
-            .map_err(|_| BotError::RingFull)?;
+        //
+        // ONSET-2 (M3 knob 2, `botcbwioc`) — KNOB OFF (the default) this is byte-identical to the
+        // pre-arc push: `control = 1 << 10`, Normal type, no IOC, no ISP, no completion, no wait,
+        // and for an OUT data stage the CBW and the data TD ride the same ring under one doorbell.
+        // KNOB ON, the CBW carries IOC and is pumped to completion before anything else is built,
+        // which is what §14.4 has always claimed the code does.
+        let (cbw_trb_phys, cbw_idx) = {
+            let ring = self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap();
+            let base = ring.get_ptr();
+            let control: u32 = if cfg!(feature = "botcbwioc") { (1 << 10) | (1 << 5) } else { 1 << 10 };
+            let idx = ring.push(Trb { parameter: cbw_phys, status: 31, control })
+                .map_err(|_| BotError::RingFull)?;
+            (base + (idx as u64) * 16, idx)
+        };
+        #[cfg(feature = "botcbwioc")]
+        {
+            // The CBW becomes a first-class awaited stage: shape record, its own doorbell, its own
+            // pump. `stage=cbw` on a TIMEOUT-SHAPE line is then a reading no capture has ever been
+            // able to produce — "the device never even took the command".
+            BOT_LAST_STAGE.store(3, Ordering::Relaxed);
+            BOT_LAST_DIR.store(2, Ordering::Relaxed);
+            BOT_LAST_LEN.store(31, Ordering::Relaxed);
+            BOT_LAST_TRB_IDX.store(cbw_idx as u32, Ordering::Relaxed);
+            BOT_LAST_WRAP.store(cbw_idx == 0, Ordering::Relaxed);
+            self.bot_doorbell(slot_id, out_dci, false);
+            let (cbw_code, _) = self.run_bot_stage(slot_id, in_dci, out_dci, cbw_trb_phys)?;
+            if cbw_code != 1 && cbw_code != 13 {
+                serial_println!("xHCI: BOT CBW stage error, completion code {}", cbw_code);
+                return Err(BotError::TransferError(cbw_code));
+            }
+        }
+        // Knob off: the CBW's address and index are recorded but nothing waits on them, exactly as
+        // before this arc.
+        #[cfg(not(feature = "botcbwioc"))]
+        let _ = (cbw_trb_phys, cbw_idx);
 
         // 2) Data stage (IN or OUT), if any. IOC + ISP (1<<2) so both full and short-packet
         //    completions post an event; wait for it to retire BEFORE queuing the CSW.
@@ -5374,8 +5785,8 @@ impl XhciController {
 
             // Ring OUT to fetch+send the CBW; for an IN data stage also ring the IN ring.
             // (An OUT data stage rides the same OUT ring as the CBW, in order.)
-            self.ring_doorbell(slot_id, out_dci as u32);
-            if data_dci != out_dci { self.ring_doorbell(slot_id, data_dci as u32); }
+            self.bot_doorbell(slot_id, out_dci, false);
+            if data_dci != out_dci { self.bot_doorbell(slot_id, data_dci, true); }
 
             let (code, residue) = self.run_bot_stage(slot_id, in_dci, out_dci, data_trb_phys)?;
             // BOT-PHASE fix 3 — SHORT-TRANSFER HONESTY.
@@ -5446,9 +5857,11 @@ impl XhciController {
             if !data_out && !data_stalled {
                 dma_coherency::inval(data_phys as usize, data_len as usize);
             }
-        } else {
+        } else if !cfg!(feature = "botcbwioc") {
             // No data stage: fetch+send the CBW now; the CSW is queued next.
-            self.ring_doorbell(slot_id, out_dci as u32);
+            // ONSET-2 (M3 knob 2): with `botcbwioc` on, the CBW already had its own doorbell and has
+            // already retired, so this one would ring an empty ring.
+            self.bot_doorbell(slot_id, out_dci, false);
         }
 
         // Test-only: deterministic synthetic failure at exactly this point (see BOT_FAULT_FIRED).
@@ -5479,7 +5892,7 @@ impl XhciController {
             BOT_LAST_WRAP.store(idx == 0, Ordering::Relaxed);
             base + (idx as u64) * 16
         };
-        self.ring_doorbell(slot_id, in_dci as u32);
+        self.bot_doorbell(slot_id, in_dci, true);
 
         // PIUSB-38: if the status stage cannot even complete (times out) after a data-phase stall,
         // the pipe is wedged. Surfacing the error is now enough to get it un-wedged: EVERY `Err` this
@@ -6167,7 +6580,7 @@ impl XhciController {
         //      `resync_bulk_ep` is the single host-side implementation, shared with the class-level
         //      `recover_bot_full`; it reads the EP State first, so the Halted endpoint a STALL
         //      leaves behind takes the Reset-Endpoint arm exactly as this path always did.
-        self.resync_bulk_ep(slot_id, dci as u8, ep_in);
+        self.resync_bulk_ep(slot_id, dci as u8, ep_in, BotError::Stall);
 
         // 3) Device-side CLEAR_FEATURE(ENDPOINT_HALT) on EP0. wIndex carries the full endpoint
         //    address (with the direction bit for an IN endpoint).
@@ -6297,8 +6710,8 @@ impl XhciController {
         }
 
         // 3) xHCI-side endpoint + ring resynchronisation (state-aware: Reset vs Stop Endpoint).
-        let in_ring = self.resync_bulk_ep(slot_id, in_dci, true);
-        let out_ring = self.resync_bulk_ep(slot_id, out_dci, false);
+        let in_ring = self.resync_bulk_ep(slot_id, in_dci, true, cause);
+        let out_ring = self.resync_bulk_ep(slot_id, out_dci, false, cause);
         let ring_ok = in_ring && out_ring;
 
         serial_println!(
@@ -6399,29 +6812,90 @@ impl XhciController {
         }
     }
 
-    /// BOT-RESCUE escalation (a): **Reset Device** for the slot, then re-programme its bulk endpoint
-    /// contexts onto freshly reset rings.
+    /// BOT-RESCUE escalation (a), **rewritten by ONSET-2 (M1a)**: rebase both bulk rings onto a
+    /// known-zero producer state and repoint the controller at their bases — using only commands
+    /// that are legal from the state the slot is actually in.
     ///
-    /// xHCI 1.2 §4.6.11: Reset Device returns the xHC's internal state for a Device Slot — its
-    /// endpoint contexts, data toggles and dequeue pointers — to the post-Address condition, without
-    /// touching the Root Hub Port Number or Route String. It is the strongest slot-scoped tool the
-    /// controller offers short of tearing the device down, and it is the right next rung after the
-    /// class-level Bulk-Only Reset (which resets the DEVICE's state machine) has failed twice: those
-    /// two reset the two halves of a desynchronised pair, and this arc's metal failure had already
-    /// proven the device half insufficient.
+    /// ## Why the old rung (Reset Device -> Configure Endpoint) was retired
     ///
-    /// HONEST LIMIT, recorded because the witness will show it: the command leaves the Slot in the
-    /// Default state, and this rung does NOT re-address the device (the device was not port-reset,
-    /// so it still holds its address and would not answer a SET_ADDRESS at 0 — re-addressing without
-    /// a port reset would be the unsound move, not the thorough one). A controller that therefore
-    /// refuses the follow-up Configure Endpoint with Context State Error (cc 19) is EXPECTED, is
-    /// printed as such, and simply means this rung did not take: the ladder moves on to (b), whose
-    /// port reset is what makes a re-address lawful. The rung is kept because it is cheap (two
-    /// bounded commands), because it is the correct fix when the fault is purely the xHC's slot
-    /// state, and because a `cc=19` reading here is itself evidence about which half is sick.
+    /// It could not succeed, and it left the slot strictly WORSE than it found it. Metal capture
+    /// `rmbp-gr8/ttyUSB1.log` line 3806 is the whole story on one line:
+    /// `resetdev_cc=1 resetdev_why=ok cfgep_cc=19 cfgep_why=cc-error … epin=1->0 epout=1->0`.
     ///
-    /// Returns true only if BOTH commands succeeded — a half-reset slot is never driven further.
-    fn rescue_reset_device(&mut self, slot_id: u8) -> bool {
+    ///   * **Reset Device succeeded** (`cc=1`) and, per xHCI 1.2 §4.6.11, transitioned the Slot to
+    ///     the **Default** state, disabled every endpoint except the Default Control Endpoint, and
+    ///     set the Output Slot Context's USB Device Address field to 0. The driver's own
+    ///     before/after field records the endpoint half of that on the same line:
+    ///     `epin=1->0 epout=1->0`. Two **Running** endpoints became **Disabled** ones.
+    ///   * **Configure Endpoint is legal only against a Slot in Addressed or Configured**
+    ///     (xHCI 1.2 §4.6.6); against Default it is required to return **Context State Error**. So
+    ///     `cfgep_cc=19` was never a finding about the device — it is the architecturally guaranteed
+    ///     answer to an illegal command. All seven `cfgep_cc=19` readings in the capture, across two
+    ///     builds, are preceded by exactly this pair.
+    ///   * Nothing inside the rung could then recover: Set TR Dequeue Pointer is legal from Stopped
+    ///     or Error (§4.6.10) and the endpoints were **Disabled**, so BOT-PHASE fix 6's
+    ///     `stage=repoint` returned `cc=19` on both pipes with `epstate=0` (capture lines
+    ///     3804/3805), and the escalation retry that followed died on `completion code 12` —
+    ///     Endpoint Not Enabled. The rung's only exit was the port cycle it was trying to avoid.
+    ///
+    /// ## Why no re-address can be inserted, and §14.1 is right
+    ///
+    /// The obvious patch — an Address Device between Reset Device and Configure Endpoint — does not
+    /// exist in a form that works from here:
+    ///
+    ///   * **Address Device with BSR=1** (Block Set Address Request) issues no `SET_ADDRESS` on the
+    ///     wire, but per xHCI 1.2 §4.6.5 it leaves the Slot in the **Default** state with USB Device
+    ///     Address 0. That is precisely where Reset Device already left it, so §4.6.6's precondition
+    ///     is still unmet and Configure Endpoint still returns `cc=19`. BSR=1 exists for the
+    ///     enumeration sequence — set up the contexts, read the device descriptor at address 0,
+    ///     Evaluate Context for MPS0, then Address Device with BSR=0 — every step of which presumes
+    ///     a device that HAS just been port-reset.
+    ///   * **Address Device with BSR=0** does reach Addressed, but only by issuing `SET_ADDRESS` on
+    ///     the wire to device address **0**. A USB device answers address 0 only while it is in the
+    ///     Default state, which it enters on a port reset and nowhere else (USB 2.0 §9.1.1, §9.4.6).
+    ///     This rung deliberately does not port-reset, so the device still holds the address it was
+    ///     given at enumeration and cannot answer; the command would burn a full control timeout and
+    ///     fail. §14.1's argument against re-addressing here is therefore **correct**, and the
+    ///     proposal to insert an Address Device is not.
+    ///
+    /// Both halves are one fact from two directions: **the xHC's slot state cannot be returned to
+    /// Addressed without a port reset**, and the port reset is rung (b)'s, where re-enumeration
+    /// rebuilds both sides from scratch. A rung that can only ever fail, and that disables two
+    /// working endpoints on its way to failing, is worse than no rung. So Reset Device and its
+    /// Configure Endpoint are gone from the ladder.
+    ///
+    /// ## What the rung does instead
+    ///
+    /// The disorder rung (a) actually exists to repair is **ring** disorder — driver and controller
+    /// disagreeing about position or cycle colour — not slot-state disorder. That is repairable with
+    /// commands legal from where the endpoints already are:
+    ///
+    ///   1. **Stop Endpoint** on each bulk DCI from Running, or **Reset Endpoint** from Halted/Error
+    ///      (§4.6.9 / §4.6.8) — `resync_bulk_ep`'s state-aware arm, reused verbatim so its strand
+    ///      witness (M1b) and its event drain come with it.
+    ///   2. **`TransferRing::reset`** on each ring: every slot zeroed, enqueue index 0, cycle bit
+    ///      back to the initial Consumer Cycle State of 1. The endpoints are Stopped by then, so
+    ///      `reset`'s documented safety precondition ("the caller must have stopped the endpoint
+    ///      first") is finally honoured — the old rung zeroed the rings while they could still be
+    ///      Running.
+    ///   3. **Set TR Dequeue Pointer** at each ring's base with DCS=1 (§4.6.10, legal from Stopped
+    ///      and from Error) — BOT-PHASE fix 6's repoint, intent intact, moved to the only placement
+    ///      where it is reachable. It programs exactly what the failed Configure Endpoint would have.
+    ///
+    /// That is strictly stronger than the ordinary recovery rung, which repoints at the ring's LIVE
+    /// enqueue slot with its live colour on a ring still carrying its history. After this rung both
+    /// sides are at index 0 with cycle 1 and no stale TRB remains anywhere on either ring —
+    /// including no stale Link TRB, which is the one piece of ring state the ordinary resync cannot
+    /// clear.
+    ///
+    /// **The required property holds by construction: this rung cannot leave the slot worse than it
+    /// found it.** It issues no command that can disable an endpoint, change the Slot State or clear
+    /// the USB Device Address. Every command it issues is legal from the state it just read, and if
+    /// any fails the endpoint is left Stopped (or untouched) and the ladder proceeds to the port
+    /// cycle exactly as before.
+    ///
+    /// Returns true only if BOTH pipes came through — a half-rebased slot is never driven further.
+    fn rescue_ring_rebase(&mut self, slot_id: u8) -> bool {
         BOT_RESCUE_RESET_DEVICE.fetch_add(1, Ordering::Relaxed);
         let (in_ep, out_ep) = {
             let s = &self.slots[slot_id as usize];
@@ -6429,147 +6903,73 @@ impl XhciController {
         };
         if in_ep == 0 || out_ep == 0 || self.slots[slot_id as usize].output_context.is_null() {
             serial_println!(
-                ":: BOT: rescue stage=reset-device slot={} ok=no why=no-bulk-context ::", slot_id);
+                ":: BOT: rescue stage=ring-rebase slot={} ok=no why=no-bulk-context ::", slot_id);
             return false;
         }
         let in_dci = ((in_ep & 0x0F) * 2) + 1;
         let out_dci = (out_ep & 0x0F) * 2;
-        // Max Packet Size lives in Endpoint Context DW1 bits 31:16 (xHCI 1.2 §6.2.3). Read it back
-        // from the OUTPUT context BEFORE the reset clears the endpoint contexts, so the rebuilt
-        // input context carries the device's real MPS rather than a guess.
-        let mps_of = |oc: *mut DeviceContext, dci: u8| -> u16 {
-            let w = unsafe {
-                core::ptr::read_volatile((oc as *const u32).add(dci as usize * CTX_WORDS + 1))
-            };
-            ((w >> 16) & 0xFFFF) as u16
-        };
-        let oc = self.slots[slot_id as usize].output_context;
-        let (in_mps, out_mps) = (mps_of(oc, in_dci), mps_of(oc, out_dci));
         let (in_s0, out_s0) = (self.ep_state_of(slot_id, in_dci), self.ep_state_of(slot_id, out_dci));
 
-        // M2: hand the re-programmed endpoint contexts a ring in a KNOWN state. The Configure
-        // Endpoint below points the controller at each ring's base with DCS=1; continuing from
-        // wherever the failed transaction left the enqueue index and cycle bit would leave driver
-        // and controller disagreeing about both position and colour from the first push.
+        // 1) Both endpoints out of Running and into Stopped, state-aware, with the authoritative
+        //    `when=pre` strand reading taken between each stop and its set-deq (M1b). Whatever this
+        //    leaves the dequeue pointing at is overridden by step 3; the call is here for the stop,
+        //    the drain and the witness.
+        let in_stop = self.resync_bulk_ep(slot_id, in_dci, true, BotError::Timeout);
+        let out_stop = self.resync_bulk_ep(slot_id, out_dci, false, BotError::Timeout);
+
+        // 2) Rings back to their birth state — but ONLY for a pipe whose endpoint is provably
+        //    stopped. Zeroing a ring the controller may still be walking is the disagreement this
+        //    rung exists to end, not a way to end it.
         {
             let s = &mut self.slots[slot_id as usize];
-            if let Some(r) = s.bulk_in_ring.as_mut() { r.reset(); }
-            if let Some(r) = s.bulk_out_ring.as_mut() { r.reset(); }
+            if in_stop { if let Some(r) = s.bulk_in_ring.as_mut() { r.reset(); } }
+            if out_stop { if let Some(r) = s.bulk_out_ring.as_mut() { r.reset(); } }
         }
 
-        // Reset Device (TRB type 17).
-        let (rd_ok, rd_cc, rd_why) =
-            self.recover_cmd(Trb { parameter: 0, status: 0, control: (17 << 10) | ((slot_id as u32) << 24) });
-        // A Reset Device retires any TDs the endpoints still held; drain their events so they cannot
-        // be mistaken for the retry's completion.
+        // 3) Repoint the controller at each reset ring's base with DCS=1.
+        let mut repoint_ok = [false; 2];
+        let mut repoint_cc = [0u8; 2];
+        for (i, (dci, is_in, stopped)) in
+            [(in_dci, true, in_stop), (out_dci, false, out_stop)].into_iter().enumerate()
+        {
+            if !stopped {
+                continue;
+            }
+            let base_dcs = {
+                let s = &self.slots[slot_id as usize];
+                let r = if is_in { s.bulk_in_ring.as_ref() } else { s.bulk_out_ring.as_ref() };
+                match r { Some(r) => r.get_ptr() | 1, None => 0 }
+            };
+            if base_dcs == 0 {
+                continue;
+            }
+            let ctx = ((dci as u32) << 16) | ((slot_id as u32) << 24);
+            let (sd_ok, sd_cc, sd_why) =
+                self.recover_cmd(Trb { parameter: base_dcs, status: 0, control: (16 << 10) | ctx });
+            repoint_ok[i] = sd_ok;
+            repoint_cc[i] = sd_cc;
+            serial_println!(
+                ":: BOT: rescue stage=repoint slot={} dci={} dir={} ok={} cc={} why={} want={:#x} ctxdeq={:#x} epstate={} — ring rebased to base|DCS=1 (Set TR Dequeue Pointer, xHCI 1.2 §4.6.10, legal from Stopped/Error) ::",
+                slot_id, dci, if is_in { "in" } else { "out" },
+                if sd_ok { "yes" } else { "no" }, sd_cc, sd_why, base_dcs,
+                self.ep_ctx_deq(slot_id, dci), self.ep_state_of(slot_id, dci));
+        }
         while self.drain_event_ring_once() {}
 
-        // Re-programme both bulk endpoint contexts onto the reset rings (Configure Endpoint, type
-        // 12). `rebuild_bulk_input_ctx` reuses the EXISTING rings and DMA buffers — unlike the
-        // enumeration-time builder, which allocates fresh ones and would leak a ring pair per rung.
-        let input_phys = self.rebuild_bulk_input_ctx(slot_id, in_dci, in_mps, out_dci, out_mps);
-        let (cfg_ok, cfg_cc, cfg_why) = match input_phys {
-            Some(p) => self.recover_cmd(Trb { parameter: p, status: 0, control: (12 << 10) | ((slot_id as u32) << 24) }),
-            None => (false, 0, "no-input-context"),
-        };
-        // BOT-PHASE fix 6 — NEVER LEAVE DRIVER AND CONTROLLER DISAGREEING ABOUT THE RING.
-        //
-        // The rings were `reset()` above: driver-side enqueue is 0 and cycle is 1, because the
-        // Configure Endpoint below was going to point the controller at each ring's base with DCS=1
-        // in the same breath. When that command FAILS — and on metal it fails with `cc=19` Context
-        // State Error, which §14.7 item 5 already expects — the controller was never repointed. It
-        // is still parked wherever the wedged transaction left it, on a ring whose contents the
-        // reset just zeroed, while the driver believes it is at the base with the initial cycle
-        // colour. The next push then writes a TRB the controller will never fetch, or one it
-        // fetches at the wrong colour: a silent stop, or a replay. Either way the two disagree,
-        // which is the same class of defect as the stranded TRB fix 1 closes.
-        //
-        // The repair is the direct one: repoint the controller with an explicit Set TR Dequeue
-        // Pointer at each ring's base with DCS=1 — exactly what the failed Configure Endpoint would
-        // have programmed. Set TR Dequeue Pointer is legal from Stopped and from Error (xHCI 1.2
-        // §4.6.10), which is where a Reset Device leaves these endpoints. If it too fails there is
-        // nothing further this rung can do; the function still returns false, the ladder proceeds to
-        // the port power-cycle, and re-enumeration rebuilds both sides from scratch. What must not
-        // happen — and no longer can — is a quiet return with the two sides out of step.
-        if rd_ok && !cfg_ok {
-            for (dci, is_in) in [(in_dci, true), (out_dci, false)] {
-                let base_dcs = {
-                    let s = &self.slots[slot_id as usize];
-                    let r = if is_in { s.bulk_in_ring.as_ref() } else { s.bulk_out_ring.as_ref() };
-                    match r { Some(r) => r.get_ptr() | 1, None => 0 }
-                };
-                if base_dcs == 0 { continue; }
-                let ctx = ((dci as u32) << 16) | ((slot_id as u32) << 24);
-                let (sd_ok, sd_cc, sd_why) =
-                    self.recover_cmd(Trb { parameter: base_dcs, status: 0, control: (16 << 10) | ctx });
-                serial_println!(
-                    ":: BOT: rescue stage=repoint slot={} dci={} dir={} ok={} cc={} why={} want={:#x} ctxdeq={:#x} epstate={} — Configure Endpoint failed; repointing the controller at the reset ring ::",
-                    slot_id, dci, if is_in { "in" } else { "out" },
-                    if sd_ok { "yes" } else { "no" }, sd_cc, sd_why, base_dcs,
-                    self.ep_ctx_deq(slot_id, dci), self.ep_state_of(slot_id, dci));
-            }
-            while self.drain_event_ring_once() {}
-        }
-
-        let ok = rd_ok && cfg_ok;
+        let ok = in_stop && out_stop && repoint_ok[0] && repoint_ok[1];
+        // The rung's one summary line. `retired=` names what ONSET-2 removed and why, so a reader
+        // comparing this capture against any pre-ONSET-2 one — where the same rung printed
+        // `stage=reset-device … resetdev_cc=1 cfgep_cc=19` — can see at a glance which build it is
+        // and that the `cc=19` question is closed rather than merely unrecorded.
         serial_println!(
-            ":: BOT: rescue stage=reset-device slot={} ok={} resetdev_cc={} resetdev_why={} cfgep_cc={} cfgep_why={} indci={} outdci={} inmps={} outmps={} epin={}->{} epout={}->{} n={} ::",
-            slot_id, if ok { "yes" } else { "no" }, rd_cc, rd_why, cfg_cc, cfg_why,
-            in_dci, out_dci, in_mps, out_mps,
+            ":: BOT: rescue stage=ring-rebase slot={} ok={} retired=reset-device+configure-endpoint why_retired=xhci-1.2-4.6.11-leaves-slot-Default-and-4.6.6-then-guarantees-cc19 stop_in={} stop_out={} repoint_in_cc={} repoint_out_cc={} indci={} outdci={} epin={}->{} epout={}->{} n={} ::",
+            slot_id, if ok { "yes" } else { "no" },
+            if in_stop { "ok" } else { "fail" }, if out_stop { "ok" } else { "fail" },
+            repoint_cc[0], repoint_cc[1], in_dci, out_dci,
             in_s0, self.ep_state_of(slot_id, in_dci),
             out_s0, self.ep_state_of(slot_id, out_dci),
             BOT_RESCUE_RESET_DEVICE.load(Ordering::Relaxed));
         ok
-    }
-
-    /// BOT-RESCUE: build a bulk Configure-Endpoint input context that REUSES this slot's existing
-    /// transfer rings and DMA buffers. The enumeration-time `build_bulk_input_ctx` allocates a fresh
-    /// ring pair, CBW/CSW buffers and a 32 KiB data buffer on every call — correct there (the slot
-    /// has none yet), a leak per escalation rung here, and wrong besides: the retry must land on the
-    /// ring whose address the caller already reset. Returns the input context's physical address, or
-    /// `None` if the slot has no context or no rings (nothing to re-programme).
-    fn rebuild_bulk_input_ctx(&mut self, slot_id: u8, in_dci: u8, in_mps: u16, out_dci: u8, out_mps: u16)
-        -> Option<u64>
-    {
-        let slot = &self.slots[slot_id as usize];
-        if slot.input_context.is_null() || slot.output_context.is_null() {
-            return None;
-        }
-        let in_phys = slot.bulk_in_ring.as_ref()?.get_ptr();
-        let out_phys = slot.bulk_out_ring.as_ref()?.get_ptr();
-        let input_ctx_virt = slot.input_context;
-        let output_ctx_virt = slot.output_context;
-        unsafe {
-            // XHCI-COHERENCE: consumer boundary — the slot context copied out below was DMA-written
-            // by the controller; invalidate so the copy reads fresh. No-op x86.
-            dma_coherency::inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
-            let base_ptr = input_ctx_virt as *mut u32;
-            core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
-            // Input Control Context: A0 (slot) + both bulk DCIs.
-            base_ptr.add(1).write_volatile(1u32 | (1 << in_dci) | (1 << out_dci));
-            // Slot context, copied from the output context, with Context Entries set to the top DCI.
-            let slot_ctx_ptr = base_ptr.add(CTX_WORDS);
-            for i in 0..8 {
-                let val = core::ptr::read_volatile((output_ctx_virt as *const u32).add(i));
-                slot_ctx_ptr.add(i).write_volatile(val);
-            }
-            let max_dci = in_dci.max(out_dci) as u32;
-            let old_dw0 = slot_ctx_ptr.add(0).read_volatile();
-            slot_ctx_ptr.add(0).write_volatile((old_dw0 & !(0x1F << 27)) | (max_dci << 27));
-            // Bulk IN (EP Type 6) and OUT (EP Type 2) contexts, CErr 3, DCS=1 at each ring's base —
-            // which is exactly where `TransferRing::reset` put the enqueue pointer and colour.
-            let ep_in_ptr = base_ptr.add((1 + in_dci as usize) * CTX_WORDS);
-            ep_in_ptr.add(1).write_volatile((6 << 3) | (3 << 1) | ((in_mps as u32) << 16));
-            ep_in_ptr.add(2).write_volatile((in_phys as u32) | 1);
-            ep_in_ptr.add(3).write_volatile((in_phys >> 32) as u32);
-            ep_in_ptr.add(4).write_volatile(in_mps as u32);
-            let ep_out_ptr = base_ptr.add((1 + out_dci as usize) * CTX_WORDS);
-            ep_out_ptr.add(1).write_volatile((2 << 3) | (3 << 1) | ((out_mps as u32) << 16));
-            ep_out_ptr.add(2).write_volatile((out_phys as u32) | 1);
-            ep_out_ptr.add(3).write_volatile((out_phys >> 32) as u32);
-            ep_out_ptr.add(4).write_volatile(out_mps as u32);
-        }
-        Some(input_ctx_virt as u64)
     }
 
     /// BOT-RESCUE escalation (b): power-cycle the device's ROOT PORT (PORTSC Port Power, bit 9) and
@@ -6667,7 +7067,7 @@ impl XhciController {
     ///   signature (0x53425355) here means the status actually landed and only the completion EVENT
     ///   went missing — a completely different fault class, and the direct test of §12.3's lost-CSW
     ///   hypothesis.
-    fn bot_timeout_witness(&self, p: &BotPending, foreign: u64) {
+    fn bot_timeout_witness(&self, p: &BotPending, foreign: u64, evts: u64, db_in_d: u64, db_out_d: u64) {
         let slot_id = p.slot_id;
         // Ring state for one direction: (enqueue index, cycle bit, ring size), or the 0xFF sentinel
         // when the slot has no such ring.
@@ -6690,12 +7090,33 @@ impl XhciController {
         // Endpoint / the last Set TR Dequeue, not a position — tag it so this line can never again be
         // read as "the controller is behind our enqueue" when it says nothing of the kind.
         let stale = |st: u8| if st == 1 { " (stale: EP running)" } else { "" };
+        // ONSET-2 (M2 witnesses 2 and 6) append four fields to this line; `foreign=` is KEPT,
+        // unchanged and in place, so every capture ever taken stays diffable against this one.
+        //
+        //   `evts=`   — every event-ring TRB consumed during THIS wait, of any type. `foreign=` is
+        //               structurally pinned at 0 on this platform (the pump is a synchronous spin
+        //               that submits no other traffic, so no other slot can have a TRB outstanding
+        //               to complete) and therefore supports no verdict whatever it reads. `evts`
+        //               can be non-zero, which is what makes a zero reading of it mean something:
+        //               `evts=0` says nothing at all came off the event ring across the whole
+        //               budget; `evts>0` says the ring was being consumed throughout and only OUR
+        //               completion never arrived.
+        //   `db_in_d=` / `db_out_d=` — doorbells the BOT path wrote on each pipe DURING this wait,
+        //               against a baseline snapshotted at pump entry. Before this arc there was no
+        //               line in any capture saying a doorbell had been written at all, so "written
+        //               and did not take" and "never written" were indistinguishable — and that is
+        //               the ranked hypothesis's own discriminator. A delta of 0 on the pipe the
+        //               stage is waiting on means no doorbell was written for it.
+        //   `db_in_idx=` / `db_out_idx=` — the ring enqueue index at the last doorbell on each pipe,
+        //               to be read against `trb_idx=` on the TIMEOUT-SHAPE line.
         serial_println!(
-            ":: BOT: timeout pipes slot={} in_dci={} in_epstate={} in_ctxdeq={:#x}{} in_dcs={} in_enq={} in_cycle={} in_ntrb={} out_dci={} out_epstate={} out_ctxdeq={:#x}{} out_dcs={} out_enq={} out_cycle={} out_ntrb={} foreign={} result=TIMEOUT-PIPES ::",
+            ":: BOT: timeout pipes slot={} in_dci={} in_epstate={} in_ctxdeq={:#x}{} in_dcs={} in_enq={} in_cycle={} in_ntrb={} out_dci={} out_epstate={} out_ctxdeq={:#x}{} out_dcs={} out_enq={} out_cycle={} out_ntrb={} foreign={} evts={} db_in_d={} db_out_d={} db_in={} db_out={} db_in_idx={} db_out_idx={} result=TIMEOUT-PIPES ::",
             slot_id,
             p.in_dci, in_state, in_deq & !0xFu64, stale(in_state), in_deq & 1, in_enq, in_cyc, in_n,
             p.out_dci, out_state, out_deq & !0xFu64, stale(out_state), out_deq & 1, out_enq, out_cyc, out_n,
-            foreign);
+            foreign, evts, db_in_d, db_out_d,
+            BOT_DB_IN.load(Ordering::Relaxed), BOT_DB_OUT.load(Ordering::Relaxed),
+            BOT_DB_IN_IDX.load(Ordering::Relaxed), BOT_DB_OUT_IDX.load(Ordering::Relaxed));
 
         // Witness 2: the awaited TRB, read back from DRAM. Rings are identity-mapped, so the
         // physical address the endpoint context and the event dispatch use is also the CPU's.
@@ -6723,6 +7144,42 @@ impl XhciController {
                 p.wait_trb_phys, pipe, dw0, dw1, dw2, dw3, dw3 & 1, ring_cycle, (dw3 >> 10) & 0x3F);
         }
 
+        // ONSET-2 (M2 witness 4): LINK TRB FORENSICS, on a wrapped stage only.
+        //
+        // All three genuine onsets in `rmbp-gr8` are `stage=data dir=out len=512 trb_idx=0
+        // wrapped=true` — an OUT data stage landing at ring index 0, i.e. immediately behind a
+        // freshly written Link TRB. `TransferRing::push` writes that Link TRB LAZILY, when the
+        // enqueue index reaches `ntrb-1`, so for the whole of each lap the last slot holds a stale
+        // TRB whose cycle is the colour the controller is no longer expecting. Whether the
+        // controller stops there, and what colour and target it actually found, has only ever been
+        // argued from the source. These two lines put the bytes on the record: the Link slot
+        // (`ntrb-1`) and the TRB immediately ahead of it (`ntrb-2`).
+        //
+        // HEALTHY-BUT-IDLE READING: not printed at all — the block is gated on the timing-out stage
+        // having wrapped. When printed, `type=6` with `tc=1` and `target=` equal to the ring base is
+        // a correctly formed Link TRB; a `cycle` disagreeing with `ring_cycle` on the line above is
+        // the stale-colour condition the hypothesis names.
+        if BOT_LAST_WRAP.load(Ordering::Relaxed) {
+            let s = &self.slots[slot_id as usize];
+            let ring = match pipe {
+                "in" => s.bulk_in_ring.as_ref(),
+                "out" => s.bulk_out_ring.as_ref(),
+                _ => None,
+            };
+            if let Some(r) = ring {
+                let n = r.num_trbs();
+                for (what, idx) in [("link", n.wrapping_sub(1)), ("prev", n.wrapping_sub(2))] {
+                    if let Some((dw0, dw1, dw2, dw3)) = r.trb_raw(idx) {
+                        serial_println!(
+                            ":: BOT: timeout link pipe={} slot={} what={} idx={} ntrb={} dw0={:#010x} dw1={:#010x} dw2={:#010x} dw3={:#010x} cycle={} tc={} type={} target={:#x} result=TIMEOUT-LINK ::",
+                            pipe, slot_id, what, idx, n, dw0, dw1, dw2, dw3,
+                            dw3 & 1, (dw3 >> 1) & 1, (dw3 >> 10) & 0x3F,
+                            ((dw1 as u64) << 32) | (dw0 as u64));
+                    }
+                }
+            }
+        }
+
         // Witness 5: the CSW buffer as the controller left it.
         let (sig, tag, residue, status) = match self.slots[slot_id as usize].csw_buffer {
             Some(b) => unsafe {
@@ -6743,6 +7200,12 @@ impl XhciController {
             } else {
                 "no signature: the status phase never landed, so the CSW never reached DRAM — a transport wedge, not a lost event"
             });
+
+        // ONSET-2 (M2 witness 1): the port register census, for the failing device's port AND every
+        // other connected port, read against the `why=bringup` baseline taken on this same boot.
+        // Last, because it is the widest reading and the one a reader wants after the pipe and TRB
+        // verdicts have narrowed the question.
+        self.port_link_witness("timeout");
     }
 
     /// BOT-RESCUE escalation (c): SURRENDER. Mark the disk FAILED, retract it from the block
@@ -6849,11 +7312,12 @@ impl XhciController {
             return Err(cause);
         }
 
-        // (a) Reset Device + endpoint re-setup.
+        // (a) Ring rebase — ONSET-2 (M1a) replaced Reset Device + Configure Endpoint here; see
+        //     `rescue_ring_rebase` for the spec argument and the capture that convicted the old rung.
         if self.bot_rescue_stage == 0 {
             self.bot_rescue_stage = 1;
-            if self.rescue_reset_device(slot_id) {
-                if let Some(r) = self.bot_rescue_retry(slot_id, cdb, data_phys, data_len, dir, "reset-device") {
+            if self.rescue_ring_rebase(slot_id) {
+                if let Some(r) = self.bot_rescue_retry(slot_id, cdb, data_phys, data_len, dir, "ring-rebase") {
                     return r;
                 }
             }
@@ -6944,6 +7408,14 @@ impl XhciController {
         // start of THIS wait, because a counter read against its own boot-long total is not a rate
         // — the instrument-baseline law. The timeout prints `now - this`.
         let foreign_at_entry = BOT_FOREIGN_EVENTS.load(Ordering::Relaxed);
+        // ONSET-2 (M2 witnesses 2 and 6): the two baselines the instrument-baseline law requires for
+        // the doorbell and event-ring witnesses. Same discipline as `foreign_at_entry` above — the
+        // timeout prints `now - this`, never the boot-long total on its own.
+        let (db_in_at_entry, db_out_at_entry) =
+            (BOT_DB_IN.load(Ordering::Relaxed), BOT_DB_OUT.load(Ordering::Relaxed));
+        // Every event-ring TRB this wait consumes, of any type. Local to the wait by construction:
+        // it cannot be read against its own pre-run total because it has none.
+        let mut evts: u64 = 0;
         loop {
             match &self.bot_pending {
                 Some(p) if p.done => {
@@ -6959,6 +7431,7 @@ impl XhciController {
                 _ => {}
             }
             if self.drain_event_ring_once() {
+                evts = evts.saturating_add(1);
                 continue; // processed an event; drain any more immediately
             }
             // Yield to QEMU's main loop so it can run the xHC bottom-half / async block-I/O
@@ -7001,9 +7474,15 @@ impl XhciController {
                 //     event went missing, which points at the event ring, not the transfer;
                 //   wrapped=true on a timeout, against `wrapped=` in the SUMMARY line's population
                 //     rate, is the direct ring-wrap correlation test.
+                // ONSET-2 (M2 witness 7): `tag=`, `cdb0=` and `lba=` APPENDED (every pre-existing
+                // field keeps its name and position, so this line stays diffable against every
+                // capture taken before this arc). The timing-out transaction now names itself:
+                // §15.2's code -> capture -> medium join should be readable off the log rather than
+                // reconstructed from a wrecked filesystem. `lba=0` on a non-READ(10)/WRITE(10)
+                // opcode means "this CDB has no LBA there", not "LBA zero".
                 serial_println!(
-                    ":: BOT: pump shape stage={} dir={} len={} trb_idx={} wrapped={} single={} multi={} maxlen={} wrapped_tx={} result=TIMEOUT-SHAPE ::",
-                    match BOT_LAST_STAGE.load(Ordering::Relaxed) { 1 => "data", 2 => "csw", _ => "none" },
+                    ":: BOT: pump shape stage={} dir={} len={} trb_idx={} wrapped={} single={} multi={} maxlen={} wrapped_tx={} tag={:#010x} cdb0={:#04x} lba={} result=TIMEOUT-SHAPE ::",
+                    match BOT_LAST_STAGE.load(Ordering::Relaxed) { 1 => "data", 2 => "csw", 3 => "cbw", _ => "none" },
                     match BOT_LAST_DIR.load(Ordering::Relaxed) { 1 => "in", 2 => "out", _ => "none" },
                     BOT_LAST_LEN.load(Ordering::Relaxed),
                     BOT_LAST_TRB_IDX.load(Ordering::Relaxed),
@@ -7011,14 +7490,19 @@ impl XhciController {
                     BOT_TX_SINGLE.load(Ordering::Relaxed),
                     BOT_TX_MULTI.load(Ordering::Relaxed),
                     BOT_TX_MAXLEN.load(Ordering::Relaxed),
-                    BOT_TX_WRAPPED.load(Ordering::Relaxed));
+                    BOT_TX_WRAPPED.load(Ordering::Relaxed),
+                    BOT_LAST_TAG.load(Ordering::Relaxed),
+                    BOT_LAST_CDB0.load(Ordering::Relaxed),
+                    BOT_LAST_LBA.load(Ordering::Relaxed));
                 // BOT-RESCUE M3 witnesses 1, 2, 4 and 5 — three further lines, so the two lines
                 // above stay byte-comparable with every capture taken before this arc. See
                 // `bot_timeout_witness` for the reading key.
                 if let Some(p) = self.bot_pending {
                     let foreign = BOT_FOREIGN_EVENTS.load(Ordering::Relaxed)
                         .wrapping_sub(foreign_at_entry);
-                    self.bot_timeout_witness(&p, foreign);
+                    let db_in_d = BOT_DB_IN.load(Ordering::Relaxed).wrapping_sub(db_in_at_entry);
+                    let db_out_d = BOT_DB_OUT.load(Ordering::Relaxed).wrapping_sub(db_out_at_entry);
+                    self.bot_timeout_witness(&p, foreign, evts, db_in_d, db_out_d);
                 }
                 return Err(BotError::Timeout);
             }
@@ -7035,6 +7519,21 @@ impl XhciController {
     fn note_bot_pump(start: u64, budget: u64, route: u32, depth: u8, slot: u8) {
         let used = crate::arch::now_cycles().wrapping_sub(start);
         BOT_PUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+        // ONSET-2 (M2 witness 7): fold this wait into the log2-millisecond histogram.
+        //
+        // The capture carries only `sum`, `peak` and `n`, so it CANNOT answer whether the pace is
+        // uniform, bimodal or bursty — and cannot test the reading that the ~1 ms mean is simply the
+        // 1 kHz APIC tick the polled pump sleeps on (`IRQ_COUNT=0` on every boot means `hlt()` is
+        // woken by the timer and by nothing else, so per-stage latency is quantised to the tick).
+        // Bucket 0 is "under 1 ms"; bucket k>0 holds waits of 2^(k-1)..2^k - 1 ms; the top bucket
+        // saturates. Cheap: one integer divide and one relaxed add per awaited stage.
+        {
+            let ms = used / Self::cycles_per_ms().max(1);
+            let b = if ms == 0 { 0usize } else {
+                (64 - ms.leading_zeros() as usize).min(BOT_WAIT_BUCKETS.len() - 1)
+            };
+            BOT_WAIT_BUCKETS[b].fetch_add(1, Ordering::Relaxed);
+        }
         // FRWRITE: accumulate EVERY wait, not just the record-setters — `sum/n` is the mean, and the
         // mean is what separates "one slow outlier" from "the whole write path runs at 0.5 s/sector".
         BOT_PUMP_CYCLES.fetch_add(used, Ordering::Relaxed);
@@ -7242,6 +7741,20 @@ impl XhciController {
         // up?" milestones a silent boot otherwise can't answer on-panel.
         crate::bootlog::record("block:up");
         self.storage_note = "ready";
+        // ONSET-2 (M2 witness 1): THE BASELINE. Taken here, at the one moment the whole chain is
+        // provably healthy and idle — the device has enumerated, answered TEST UNIT READY, INQUIRY
+        // and READ CAPACITY, and no BOT transaction is in flight. Every `portreg why=timeout` line
+        // later in the boot is read against this one, on the same boot, by the same instrument.
+        // Without it a `pls=0(U0)` at a timeout proves nothing, because nobody would know what this
+        // controller reads when everything is fine.
+        self.port_link_witness("bringup");
+        // ONSET-2 (M3): the knob witness. `strings` proves the TEXT is in the artifact; this proves
+        // the compiled-in VALUE at runtime, which is the thing that has bitten this project twice —
+        // a knob wired into `arroyo` but not into `builder/` ships disabled while every gate stays
+        // green. A boot log that does not say `ring_trbs=64` did not run the experiment.
+        serial_println!(
+            ":: BOT: knobs ring_trbs={} {} {} result=KNOBS ::",
+            BOT_RING_TRBS, BOT_RING_KNOB_TAG, BOT_CBWIOC_KNOB_TAG);
         Ok(())
     }
 

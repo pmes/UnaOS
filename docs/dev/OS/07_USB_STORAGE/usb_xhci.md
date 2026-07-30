@@ -3026,7 +3026,7 @@ that answers is not a device that is wedged — resets the streak and the rung c
 | Rung | Action | Spec | Notes |
 |---|---|---|---|
 | (existing) | Bulk-Only Mass Storage Reset + clear-halt ×2 + stop-ep/set-deq ×2 + one retry | BOT 1.0 §5.3.3/§5.3.4 | unchanged; §11a |
-| **(a)** | **Reset Device** for the slot, then Configure Endpoint onto rings reset to a known enqueue/cycle state | xHCI 1.2 §4.6.11, §4.6.6 | see the honest limit below |
+| **(a)** | ~~**Reset Device** for the slot, then Configure Endpoint onto rings reset to a known enqueue/cycle state~~ **RETIRED (M1a, 2026-07-30)** — replaced by a **ring rebase**: Stop/Reset Endpoint → `TransferRing::reset` → Set TR Dequeue Pointer at each ring base with DCS=1 | ~~xHCI 1.2 §4.6.11, §4.6.6~~ → xHCI 1.2 §4.6.9, §4.6.8, §4.6.10 | the honest limit below turned out to be fatal, not merely honest; see §16.12 |
 | **(b)** | **Root-port power cycle** — PORTSC PP down 100 ms, up, 300 ms settle; re-enumeration delegated | USB 2.0 §7.1.7.3 | root ports only |
 | **(c)** | **SURRENDER** — mark FAILED, retract, refuse all further transfers | §14.2 | terminal |
 
@@ -3057,6 +3057,19 @@ State Error (`cc=19`) is **expected**, is printed as such, and simply means the 
 the ladder moves on to (b), whose port reset is what makes a re-address lawful. The rung is kept
 because it is cheap (two bounded commands), because it is the correct fix when the fault is purely
 the xHC's slot state, and because `cc=19` here is itself evidence about which half is sick.
+
+> **Amended (2026-07-30, ONSET + M1a) — the reasoning above is vindicated; the conclusion is not.**
+> The paragraph's central claim is **correct and was worth writing**: re-addressing without a port
+> reset is unsound, and metal confirmed the `cc=19` it predicted, seven times across two builds
+> (§16.7). What it got wrong is the cost. The rung is **not** cheap and it is **not** merely a no-op
+> when it fails: Reset Device *succeeds*, leaving the Slot in **Default** and every bulk endpoint
+> **Disabled** (`epin=1->0 epout=1->0` on every instance), which is strictly worse than where the
+> ladder started, and from which nothing short of rung (b)'s port cycle recovers. Nor is Configure
+> Endpoint reachable by any legal continuation: **neither BSR setting of Address Device reaches
+> Addressed on a device that was not port-reset**, so there is no repair to insert. The rung has
+> therefore been **retired**, not completed — [§16.12](#1612-m1a--what-the-code-lane-landed-and-the-correction-it-forces-on-167)
+> has the replacement and the spec citations. `cc=19` remains evidence, but the price of collecting
+> it was the slot.
 
 **Rung (b) — re-enumeration is delegated, not open-coded.** Removing and restoring VBUS raises
 Connect Status Change on the port; the settle drains the event ring, so the driver's own tested,
@@ -3156,12 +3169,36 @@ so captures stay comparable across the arc boundary.
   * `running_ctxdeq == stopped_ctxdeq` → `verdict=ctxdeq-live`. QEMU's reading; its calibration for
     this arc is `enq=3 running_epstate=1 running_ctxdeq=stopped_ctxdeq stop_cc=1 restore_ok=yes
     epstate_after=1`.
-* **`foreign=F` (witness 4)** — Transfer Events for **other** slots during **this** wait, measured
-  from a baseline snapshotted at pump entry (never the boot-long total: a counter read against its
-  own pre-run total is not a rate — the instrument-baseline law). `F > 0` proves the event ring,
-  interrupter and event delivery stayed alive for other traffic throughout, so a missing completion
-  is *this slot's* problem, not a global wedge. `F = 0` on a boot with other live devices (FTDI, a
-  HID) says the opposite and moves the investigation somewhere else entirely.
+
+  **ONSET correction (2026-07-30) — the `epstate_after` calibration above is backwards.** Metal
+  reads **`epstate_after=3`**, twice, on two slots and two rings (`rmbp-gr8/ttyUSB1.log` lines 3710,
+  4144). That is the *correct* reading and `epstate_after=1` is the QEMU artefact: the probe rings
+  the doorbell on an **empty** ring and samples immediately, and real silicon does not leave Stopped
+  until there is a TRB to fetch, while QEMU transitions eagerly. The endpoint is not parked — 218
+  and 94 further awaited stages retired after the two probes respectively — so the claim above it
+  ("it never leaves an endpoint parked") stands; only the expected value of the field is corrected.
+  See [§16.1](#161-the-platform-grading-is-on-the-record--and-this-keys-calibration-line-was-backwards).
+* **`foreign=F` (witness 4) — RETIRED. Do not read a verdict off this field.**
+
+  > **Retraction (2026-07-30, ONSET).** This bullet previously read: *"`F > 0` proves the event ring,
+  > interrupter and event delivery stayed alive for other traffic throughout, so a missing completion
+  > is this slot's problem, not a global wedge. `F = 0` on a boot with other live devices (FTDI, a
+  > HID) says the opposite and moves the investigation somewhere else entirely."* The second sentence
+  > is wrong, and the instrument cannot support the first either. `pump_until_bot_done` is a
+  > **synchronous spin** (`mod.rs:6947–6970` at `0825ed08`): while it waits, the driver submits no
+  > FTDI transfer, so no FTDI TRB is outstanding, so no foreign Transfer Event can arrive. `F` is
+  > pinned at 0 **by construction**, on a healthy boot exactly as on a wedged one — which is why all
+  > 14 `TIMEOUT-PIPES` lines of `rmbp-gr8/ttyUSB1.log` read `foreign=0` across two driver builds. The
+  > baseline discipline the bullet cites was applied correctly and did not save it: the field's
+  > healthy-but-idle reading is indistinguishable from total failure, so it can falsify nothing. This
+  > is the **fifth** entry in the instrument-lie ledger ([§16.9](#169-the-instrument-lie-ledger)).
+  >
+  > The liveness `foreign` was built to prove is proven *positively* on the same lines instead: the
+  > recovery ladder's own `resync … cc=1` command completions arrive **during** the silence (boot F,
+  > lines 3751–3754), so the command ring executed, the xHC posted events, the interrupter delivered
+  > them and `drain_event_ring_once` consumed them. The replacement witness proposed for the code
+  > lane is **`evts=`** — all event-ring TRBs consumed during this wait, of any type — which, unlike
+  > `foreign`, can be non-zero, and that is what would make a zero reading mean something.
 * **`TIMEOUT-TRB` (witness 2)** — the awaited TRB's four raw dwords **as read back from DRAM**
   (behind an invalidate), its stored cycle bit against the ring's live one, and its decoded type.
   A TRB whose cycle bit does not match the colour the controller expects is one the controller is
@@ -3199,6 +3236,19 @@ that hammers a stalled endpoint is exactly what would step in these traps.
    ladder. **Healthy path unaffected by construction:** each BOT stage is awaited to completion
    before the next is queued, so at most **one** TRB is outstanding on a 16-TRB ring; the refusal
    threshold is 14.
+
+   **ONSET correction (2026-07-30) — the premise in bold above is false in our own source.**
+   `bot_transfer_once` pushes the CBW (`mod.rs:5317`) and then the data TRB (`mod.rs:5345`) with
+   **no pump between them**, and the CBW is built `control: 1 << 10` — Normal type, **no IOC, no
+   ISP** — so it posts no completion at all and the driver has no witness that it was ever consumed.
+   For an OUT data stage `data_dci == out_dci`, so the two TDs ride the **same** ring under a
+   **single** doorbell (`mod.rs:5377–5378`). At least **two** TRBs are therefore outstanding on the
+   OUT ring at every write, not one. (Line numbers as of `0825ed08`, before M1a's changes to this
+   file.) This is the *same* premise the already-retracted §14.5 rested on: the
+   "at most one TRB outstanding" claim was never established, it was assumed, and it is now known to
+   be wrong in two independent ways. The refusal threshold of 14 is not endangered by two — the
+   correction is to the argument, not to the number — but no later reasoning may cite the premise.
+   See [§16.3](#163-the-by-construction-premise-in-144-item-1-is-false-in-the-source).
 
    **GUARD-STATE correction (2026-07-29).** That "by construction" argument was wrong on real
    silicon, and §14.5 below retracts the claim it supported. `bot_ring_guard` compared our live
@@ -3303,15 +3353,39 @@ platform difference itself becoming a recorded fact rather than a surprise.
    would retire it and confirm the transport-wedge class.
 3. **Witness 1's `ctxdeq` vs `enq`.** Confirms or refutes the audit's device-silent verdict directly,
    instead of by inference from set-deq being a no-op.
-4. **`foreign=`** should be non-zero on any boot with the FTDI console attached. Zero would mean the
-   interrupter *was* globally wedged after all, contradicting the audit.
+4. ~~**`foreign=`** should be non-zero on any boot with the FTDI console attached. Zero would mean
+   the interrupter *was* globally wedged after all, contradicting the audit.~~
+   **RETIRED (2026-07-30, ONSET).** The expectation was structurally wrong: the pump is a synchronous
+   spin, so no foreign transfer is ever outstanding while it waits and `foreign=0` is guaranteed on
+   healthy and wedged boots alike. Metal duly printed `foreign=0` on all 14 timeouts, and it means
+   nothing. Retraction and the replacement witness are in §14.3's `foreign=F` bullet.
 5. **Rung (a)'s `cfgep_cc`.** A `cc=19` is expected (§14.1); anything else is new information.
+   **Answered and closed (2026-07-30, ONSET).** Metal printed `cc=19` seven times across two builds,
+   and §16.7 explains it: Reset Device succeeds, leaves the Slot in Default, and Configure Endpoint
+   is then architecturally required to fail. **The rung has since been retired** (M1a), so this
+   expectation no longer has a rung to attach to — see §14.1's amendment and
+   [§16.12](#1612-m1a--what-the-code-lane-landed-and-the-correction-it-forces-on-167).
 6. **The desktop stays live** through a disk failure — the whole point.
 7. **`deqprobe`'s verdict** (GUARD-STATE). `ctxdeq-stale-under-running` on Panther Point confirms the
    premise of the guard fix. `ctxdeq-live` there would mean the s53 capture is explained by something
    else and the fix, while harmless, is not the whole story.
 8. **No `ring refuse` line on a healthy boot.** This is the fix's actual assertion. Any `ring refuse`
    now carries `epstate` 2, 3 or 4 by construction, so it is a real finding rather than an artefact.
+
+   **ONSET verdict (2026-07-30).** The **primary assertion HOLDS on metal.** All 9 `ring refuse`
+   lines in `rmbp-gr8/ttyUSB1.log` (1852, 1882, 2026, 2343, 2582, 2786, 2839, 3188, 3241) are in
+   **pre-GUARD-STATE** boots; the two tip boots carry **zero** across 218 + 94 awaited stages.
+   Three of the nine read `ctxdeq=0x2020b181`, which the tip build's own `deqprobe` (line 4144)
+   labels `running_ctxdeq` and identifies as slot 1's bulk-IN ring **base | DCS=1** — the pre-fix bug
+   and the post-fix instrument that names it, on the same silicon in the same file.
+
+   **The sub-claim is unverifiable on any capture ever taken.** The `ring refuse` format string
+   (`mod.rs:5014–5018` at `0825ed08`) emits `slot dci dir enq cycle ntrb ctxdeq dcs` and **no
+   `epstate`**. The construction argument is sound *in source* — `bot_ring_guard` matches
+   `ep_state_of` against `2 | 3 | 4` and returns `Ok` for everything else **before** reading `ctxdeq`
+   (`mod.rs:5000–5004`) — but a claim whose witness is absent from the log is an **inference, not a
+   finding**, and no capture can ever promote it. The field is [§16.10](#1610-what-the-next-metal-boot-must-be-able-to-print)'s
+   first instrumentation ask.
 
 ### 14.8 Still open — each owed its own arc
 
@@ -3323,9 +3397,16 @@ platform difference itself becoming a recorded fact rather than a surprise.
 > controller's dequeue on them, replayed by the next doorbell into a device whose phase machine had
 > moved on. §15 closes it with six fixes. What survives from item 1 is narrower than it is written
 > here: the **loss of the FIRST completion** — the event that starts a storm — is still unexplained,
-> and `foreign=0` across the silence is still the part most wanting one. Item 2 is untouched by that
-> work and remains fully open. `cfgep_cc=19` (§14.7 item 5) is made *safe* by §15's fix 6 but is
+> and ~~`foreign=0` across the silence is still the part most wanting one~~. Item 2 is untouched by
+> that work and remains fully open. `cfgep_cc=19` (§14.7 item 5) is made *safe* by §15's fix 6 but is
 > still not *explained*, and is now tracked in §15.9.
+>
+> **Amended (2026-07-30, ONSET — see [§16](#16-onset--the-gr8-cold-read-what-the-capture-establishes-and-what-it-falsifies-2026-07-30)).**
+> The `foreign=0` clause is struck: the field is 0 by construction on this platform and wants no
+> explanation (§14.3's `foreign=F` retraction). The first-completion loss remains open, now with a
+> reproduced, index-locked shape (§16.8). Item 2's figure did not survive the arithmetic and is
+> restated below. `cfgep_cc=19` is **closed** as a sequencing defect of ours (§16.7), which also
+> answers §15.8 item 7 in the negative.
 
 Two facts about the metal reader survive GUARD-STATE untouched. Neither is explained by the stale-field
 defect, and neither should be quietly absorbed into the story of it.
@@ -3334,13 +3415,41 @@ defect, and neither should be quietly absorbed into the story of it.
    deterministically at **n = 68**, with **~6.4 s of total event silence**, `foreign=0`, and recovery
    on the ladder's ordinary retry. This predates the lap guard entirely — it is the failure BOT-RESCUE
    was built to survive, not one BOT-RESCUE caused. Deterministic recurrence at a fixed transaction
-   index is the strongest handle available and has not been pulled; `foreign=0` across the silence is
-   the part that most wants an explanation, since it says the interrupter went quiet globally.
-2. **~9 ms mean per 512-byte transfer.** Two to three orders of magnitude slower than the transfer
+   index is the strongest handle available and has not been pulled; ~~`foreign=0` across the silence
+   is the part that most wants an explanation, since it says the interrupter went quiet globally.~~
+
+   **ONSET update (2026-07-30). The handle has now been pulled, and the `foreign=0` clause is
+   struck.** Boots B and G of `rmbp-gr8/ttyUSB1.log` are the same failure twice — same awaited-stage
+   index (`n=94`), same `single=44 multi=3 wrapped_tx=2`, same `io-cause op=write lba=17303`, `peak`
+   agreeing to 6 ppm — across two *different* driver builds. The recurrence is reproduced and
+   index-locked, and it survives the GUARD-STATE and BOT-PHASE fixes exactly as §15.9 item 1
+   predicted. `foreign=0` says nothing about the interrupter (§14.3's retracted bullet); the
+   interrupter is demonstrably alive across the silence. The shape, the authoritative dequeue read
+   and the ranked lead are in [§16.8](#168-still-open-the-first-completion-loss-now-has-a-shape-and-a-lead).
+2. **~9 ms mean per 512-byte transfer.** ~~Two to three orders of magnitude slower than the transfer
    itself can account for. The shape is SMI-like (long, opaque, host-side stalls), and the xHCI SMI
    enable bits have been **confirmed clear** — so the obvious suspect is already eliminated and the
-   real source is unidentified. This is a throughput ceiling on all USB storage on this platform, not
-   a correctness bug, which is why it keeps being deferred; it should stop being deferred.
+   real source is unidentified.~~
+
+   **ONSET correction (2026-07-30) — the figure does not survive the arithmetic, and the SMI-shaped
+   reading has nothing behind it.** The "~9 ms" was a small-`n` mean dominated by **one** sample: a
+   single reproducible **~625 ms** wait, the *first* BOT stage after `SET_CONFIGURATION`, whose value
+   is spread under 1% across five of the seven boots — the signature of a device-side media-init
+   timer, not an opaque host stall. Excluding it, the per-awaited-stage mean is **0.94–1.9 ms**, and
+   boot D — which has no such outlier — reports a **raw** mean of **0.94 ms** with nothing removed.
+   That residue is one to two ticks of our own **1000 Hz** APIC heartbeat: `IRQ_COUNT=0` on every
+   boot, so the xHCI interrupt is never taken and the polled pump's `hlt()` can only be woken by the
+   1 ms tick. The item is **restated, not deleted**: there is still a real cost here — roughly
+   1.9–3.4 ms per transaction, ~3–8× a fully serialised BOT transaction's floor — but it is a
+   **polled-driver quantisation artefact of ours**, not a two-to-three-orders-of-magnitude platform
+   stall, and no further effort should go into hunting a host stall on this evidence. Derivation in
+   [§16.6](#166-the-pace-anomaly-is-our-own-1-khz-polled-pump). This remains a throughput ceiling on
+   USB storage on this platform rather than a correctness bug.
+
+   **The SMI half of the old claim has no witness at all.** "The xHCI SMI enable bits have been
+   confirmed clear" is not supported by any capture: xHCI prints only `BIOS->OS handoff complete.`
+   and never prints USBLEGSUP/USBLEGCTLSTS, while EHCI prints both for both controllers every boot.
+   See [§16.11](#1611-checklist-items-this-capture-closes--and-one-it-does-not).
 
 ---
 
@@ -3570,6 +3679,16 @@ programmed, and legal from Stopped/Error (xHCI 1.2 §4.6.10). If that fails too,
 returns false and the ladder proceeds to the port cycle, where re-enumeration rebuilds both sides.
 What can no longer happen is a quiet return with the two sides out of step.
 
+> **Amended (2026-07-30, ONSET + M1a).** The repoint's *intent* is right and is retained, but at the
+> call site described above it could never land: by the time it ran, Reset Device had already left
+> both endpoints **Disabled**, and Set TR Dequeue Pointer is legal only from Stopped or Error — so
+> metal printed `ok=no cc=19 … epstate=0` on both pipes and the following retry failed with
+> `completion code 12` (Endpoint Not Enabled). That is §15.8 item 7 answered **NO** (§16.7). M1a
+> **retired the surrounding Reset Device + Configure Endpoint rung** and rebuilt it as a ring rebase
+> from Stop/Reset Endpoint onward, which is the only state where this repoint is reachable at all.
+> The fix is unchanged; what changed is that it is now placed where it can execute.
+> [§16.12](#1612-m1a--what-the-code-lane-landed-and-the-correction-it-forces-on-167).
+
 ### 15.5 Witness grammar
 
 | line / field | where | says |
@@ -3659,8 +3778,20 @@ does not stall, short-change or wedge.
 1. **`undrained=0` on every boot**, including boots that see real transport faults. This is the
    arc's central assertion.
 2. **A `:: BOT: strand ::` pair at every error exit**, with `when=post` showing `live=0` on both
-   pipes. A `when=pre` line with `live>0` and `ctxdeq_valid=yes` is the first direct observation of
-   the stranded TRB this arc is about.
+   pipes. ~~A `when=pre` line with `live>0` and `ctxdeq_valid=yes` is the first direct observation of
+   the stranded TRB this arc is about.~~
+
+   **ONSET correction (2026-07-30) — the `when=pre` half of this item cannot fire from the current
+   call site, so its `gap=0 live=0` readings are not findings.** On both tip boots the `pre` scan
+   runs *after* `bot_recover`'s own `resync stage=set-deq` has already repointed the controller onto
+   our enqueue (boot F: 3752/3754 → 3758/3759; boot G: 4192/4194 → 4198/4199). `gap=0 live=0` is
+   therefore true **by construction** — the observation the item asks for is destroyed by the
+   cleanup that precedes it. This is the **sixth** entry in the instrument-lie ledger
+   ([§16.9](#169-the-instrument-lie-ledger)). **Fixed by M1a (landed, gated, awaiting metal):** the
+   pre-scan now runs inside `resync_bulk_ep`, between each pipe's stop and its own `set-deq`, which
+   is the only window where `ctxdeq` is defined *and* still on the strand — so **this item can now
+   fire**. `undrained=` (post) is unaffected: it is taken after the endpoints are
+   Stopped, it is the arc's asserted counter, and its `0` readings on boots F and G stand.
 3. **No further CBW-shaped corruption** across a sustained write workload on the affected reader.
 4. **`csw_bytes` on the next tag mismatch** — torn read or overlay, finally decidable.
 5. **`short_out=`** should be 0; any non-zero is a phase fault caught before it reached the medium,
@@ -3669,6 +3800,20 @@ does not stall, short-change or wedge.
    hardware.
 7. **Rung (a)'s `cfgep_cc=19` followed by `stage=repoint`** — whether the repoint lands, which
    determines if §14.8's second open item is now explained.
+
+   **ONSET answer (2026-07-30): NO — the repoint does not land, and at its current call site it
+   cannot.** Set TR Dequeue Pointer is legal only against a Stopped or Error endpoint (xHCI 1.2
+   §4.6.10), and at that moment both bulk endpoints are **Disabled**: boot F lines 3804/3805 print
+   `ok=no cc=19 why=cc-error … epstate=0` on the IN and the OUT pipe, and the retry that follows
+   fails with `completion code 12` = **Endpoint Not Enabled** (line 3810). Fix 6 is a no-op wherever
+   the endpoints have been disabled, which is every time this rung runs. Why they are disabled — and
+   whose fault that is — is [§16.7](#167-cfgep_cc19-closed--a-sequencing-defect-of-ours).
+
+   **Consequence (M1a, landed).** The answer stands for the code as it was, and it is what retired
+   the rung: the Reset Device + Configure Endpoint step is gone, replaced by a ring rebase, and fix
+   6's repoint now sits in the only state from which it is reachable. Whether it *lands* is a metal
+   question again — the item is re-armed, not closed.
+   [§16.12](#1612-m1a--what-the-code-lane-landed-and-the-correction-it-forces-on-167).
 
 ### 15.9 Still open
 
@@ -3679,13 +3824,589 @@ does not stall, short-change or wedge.
    remains open from that item is narrower and should not be absorbed into the fix: the **FIRST
    completion loss** — the event that goes missing to *start* a storm — is still unexplained. This
    arc stops a lost completion from corrupting the medium; it does not explain why one is lost.
-   `foreign=0` across the silence remains the part most wanting an explanation.
-2. **`cfgep_cc=19`** — fix 6 makes the failure *safe* but does not explain *why* Configure Endpoint
+   ~~`foreign=0` across the silence remains the part most wanting an explanation.~~
+
+   **ONSET update (2026-07-30).** The first-completion loss is **still open** — but the `foreign=0`
+   clause is **retired**, not answered: the field is structurally incapable of reading anything else
+   on this platform (§14.3's `foreign=F` retraction). What the GR8 capture *did* add is a shape: 3 of
+   3 genuine onsets are byte-identically an OUT data stage of 512 B at ring index 0 on a wrap, and
+   two of them are the same failure at the same stage index and the same LBA on different builds.
+   [§16.8](#168-still-open-the-first-completion-loss-now-has-a-shape-and-a-lead).
+2. ~~**`cfgep_cc=19`** — fix 6 makes the failure *safe* but does not explain *why* Configure Endpoint
    is illegal at that moment. `stage=repoint`'s own `cc` on the next metal capture is the next rung
-   of that question. Still open.
-3. **~9 ms mean per 512-byte transfer** — unchanged from §14.8, still deferred, still should not be.
+   of that question. Still open.~~
+
+   **CLOSED (2026-07-30, ONSET) — as a sequencing defect of ours.** Reset Device **succeeds**
+   (`resetdev_cc=1 resetdev_why=ok`) and leaves the Slot in **Default** (xHCI 1.2 §4.6.11), disabling
+   every endpoint but the Default Control Endpoint — which the driver's own before/after field
+   records on the same line as `epin=1->0 epout=1->0`. Configure Endpoint is legal only against an
+   Addressed or Configured Slot, so Context State Error is **architecturally required** there, not
+   merely "expected" as §14.1 words it. ~~Our ladder omits **Address Device** between the two
+   rungs.~~ All seven `cc=19` instances in the capture fit, across both builds (lines 2022, 2380,
+   2630, 2835, 3237, 3806, 4321), each preceded by `resetdev_cc=1` and an `epX=…->0` transition. The
+   endpoints were not "already gone" — **we disable them.**
+
+   **Corrected (2026-07-30, M1a): the struck sentence named the wrong remedy.** There is no lawful
+   re-address without a port reset — Address Device with BSR=1 leaves the Slot in Default, and with
+   BSR=0 it must `SET_ADDRESS` to 0, which this device will not answer — so §14.1's argument holds
+   and inserting Address Device would only have added a second command that must fail. **Rung (a) has
+   been retired** in the code lane and replaced with a ring rebase built from commands that are legal
+   where the endpoints actually are.
+   [§16.7](#167-cfgep_cc19-closed--a-sequencing-defect-of-ours) has the diagnosis;
+   [§16.12](#1612-m1a--what-the-code-lane-landed-and-the-correction-it-forces-on-167) has the verdict
+   and what landed.
+3. **~9 ms mean per 512-byte transfer** — ~~unchanged from §14.8, still deferred, still should not
+   be.~~ **Restated (2026-07-30, ONSET):** the figure was a one-outlier artefact and the SMI-shaped
+   reading has no evidence behind it; the honest number is ~0.94–1.9 ms per awaited stage, which is
+   one to two ticks of our own 1 kHz polled pump. See the corrected §14.8 item 2 and
+   [§16.6](#166-the-pace-anomaly-is-our-own-1-khz-polled-pump). Still a throughput ceiling; no longer
+   a mystery, and no longer a reason to hunt a host stall.
 4. **The aarch64 `piusb36_read10_two_trb` twin** carries the same short-transfer hole fix 3 closes in
    `bot_transfer_once`, and is out of this arc's lane. It is flagged for the Pi seat's lift.
+
+---
+
+## 16. ONSET — the GR8 cold read: what the capture establishes, and what it falsifies (2026-07-30)
+
+A read-only pass over the GR8 metal capture, `~/unaos-bench/capture/rmbp-gr8/ttyUSB1.log` (4347
+lines), read against the driver source at `0825ed08`. Nothing in this section is itself a fix. The
+code lane's response — **M1a**, which landed one of the implied fixes, **refuted another**, and
+turned two more into default-off metal experiments — is recorded in
+[§16.12](#1612-m1a--what-the-code-lane-landed-and-the-correction-it-forces-on-167), and the
+subsections it corrects say so where they stand.
+
+Every claim below is tagged with how it was obtained, because §14.5's lesson was that the difference
+matters more than the conclusion:
+
+* **Observed** — a line in the capture.
+* **Derived** — arithmetic on observed values.
+* **Inferred from source** — read in the code at `0825ed08`, not witnessed on a wire.
+* **Hypothesis** — with its falsifier named.
+
+### 16.0 Provenance — read this before quoting any number from this capture
+
+**Observed. The file is not one boot. It is seven.** `xHCI: Controller Started!` appears at lines
+257, 1246, 1751, 2251, 3068, 3540, 4052 — call them **A–G**. (A's start is missing; line 1 of the
+file is a truncated mid-line, so the watcher attached during A.) **Two driver builds are present**,
+and the log says which:
+
+| build marker | boots |
+|---|---|
+| `result=SUMMARY` **without** `tag_mismatch=/undrained=/ev_late=` | A, B, C, D, E |
+| `result=SUMMARY` **with** those fields; `:: BOT: strand ::`, `:: BOT: clean ::`, `:: BOT: deqprobe ::`, the `(stale: EP running)` tag on `timeout pipes` | **F, G only** |
+
+Those extra fields are GUARD-STATE + BOT-PHASE, i.e. tip `0825ed08`. **Only boots F and G carry the
+GUARD-STATE/BOT-PHASE witnesses; A–E are older builds.** Any census that attributes this file's
+14 `TIMEOUT-PIPES`, 9 `ring refuse`, 7 `cfgep_cc=19` or 7 `SURRENDER` lines to "the s55 boot" is
+mixing pre- and post-fix evidence. Per-boot attribution is used throughout below.
+
+**Inferred from source, confirmed by arithmetic: `n=` in the pump lines counts awaited STAGES, not
+transactions.** `BOT_PUMP_COUNT` is incremented once per completed pump wait (`mod.rs:7037`, from
+`note_bot_pump`) and `BOT_STAGE_GEN` once per `run_bot_stage` (`mod.rs:6887`); `bot_transfer_once`
+calls `run_bot_stage` **twice** per transaction — the data stage (`mod.rs:5380`) and the CSW stage
+(`mod.rs:5490`). The CBW is pushed but never separately awaited (§16.3). Boot F's first timeout reads
+`n=218 gen=219` with `single=99 multi=10`; 99 + 10 = **109 data stages**, and 109 × 2 = **218**.
+
+**Consequence, and it propagates to every rate quoted from a pump line: boot F's "~219 clean
+transactions" is ~109 transactions / 218 awaited stages.** Halve any transaction count derived from
+`n=`, and read `mean=` as per-stage, not per-transaction.
+
+**Line-number citations into `mod.rs`/`ring.rs` are as of `0825ed08`** and have already drifted:
+M1a landed against the same files after this read (§16.12). Cite them as of that commit, not as of
+tip.
+
+### 16.1 The platform grading is on the record — and this key's calibration line was backwards
+
+**Observed.** Two `deqprobe` lines, both metal, both the same verdict, on two different slots and two
+different rings:
+
+```
+3710: :: BOT: deqprobe slot=2 dci=5 enq=6 running_epstate=1 running_ctxdeq=0x2020bd41
+      -> stopped_epstate=3 stopped_ctxdeq=0x2020bda1 stop_ok=yes stop_cc=1 stop_why=ok
+      restore_ok=yes epstate_after=3 verdict=ctxdeq-stale-under-running ::
+4144: :: BOT: deqprobe slot=1 dci=5 enq=6 running_epstate=1 running_ctxdeq=0x2020b181
+      -> stopped_epstate=3 stopped_ctxdeq=0x2020b1e1 stop_ok=yes stop_cc=1 stop_why=ok
+      restore_ok=yes epstate_after=3 verdict=ctxdeq-stale-under-running ::
+```
+
+**§14.7 item 7 is confirmed on metal, twice, independently.** The Output Endpoint Context TR Dequeue
+Pointer read under a Running endpoint on this silicon is the **birth value**, not a position.
+
+**Derived, and load-bearing for §16.4.** Boot G's `running_ctxdeq=0x2020b181` against
+`stopped_ctxdeq=0x2020b1e1` with `enq=6` pins slot 1's bulk-IN ring base at **`0x2020b180`**
+(`0x1E0 − 0x180 = 0xE0` = index 6 = `enq`). So `0x2020b181` is literally *ring base | DCS=1* — the
+value Configure Endpoint wrote at birth.
+
+**The one correction: `epstate_after`.** §14.3's calibration line gave QEMU's `epstate_after=1` as
+the expected reading. Metal reads **3**, both times. Reading the source, the probe rings the doorbell
+on an **empty** ring and samples `epstate` immediately; real silicon does not leave Stopped until
+there is a TRB to fetch, while QEMU transitions eagerly. **Metal is right; `epstate_after=1` is the
+QEMU artefact.** The endpoint is not left parked — 218 and 94 further awaited stages retired after
+the respective probes. §14.3 carries the correction inline.
+
+### 16.2 `foreign=` is a dead instrument on this platform
+
+**Observed.** All 14 `TIMEOUT-PIPES` lines in the file read `foreign=0`, across both builds.
+
+**Inferred from source.** `pump_until_bot_done` is a synchronous spin (`mod.rs:6947–6970`). While it
+spins, nothing submits an FTDI transfer; no FTDI TRB is outstanding; no FTDI Transfer Event can
+arrive. `foreign` is pinned at 0 **by construction** — on a healthy boot exactly as on a wedged one.
+The capture arriving over that same FTDI proves only that the driver drained its serial queue
+*before* and *after* the wait, not during it.
+
+**Observed, and it answers the question `foreign` was built to answer — positively.** During the
+6-second silence the driver issues Stop Endpoint and Set TR Dequeue Pointer and gets Command
+Completion Events back (boot F, lines 3751–3754: `resync stage=stop-ep … cc=1`, `resync
+stage=set-deq … cc=1`, twice). A `cc=1` on a command means the command ring executed, the xHC posted
+an event, the interrupter delivered it and `drain_event_ring_once` consumed it. **The event ring,
+interrupter and event delivery are demonstrably alive throughout the silence** — which refutes the
+"global interrupter wedge" reading `foreign=0` seemed to license, 15 lines after the line that
+seemed to license it.
+
+**Also observed, and it is witness 3 doing its job:** `IMAN=0x3 USBSTS=0x18` at the timeout, and
+`IMAN=0x3 USBSTS=0x18` on the healthy `result=OK` baseline of the same boot (line 3709). Identical.
+Those registers discriminate nothing here, and the only reason anyone can say so is that §14.3's
+healthy baseline was recorded alongside.
+
+§14.3's `foreign=F` bullet carries the retraction and names `evts=` as the replacement the code lane
+should carry. §14.7 item 4 and §15.9 item 1's closing sentence are retired.
+
+### 16.3 The "by construction" premise in §14.4 item 1 is false in the source
+
+**Inferred from source, and it is our own code, not the device's behaviour.** §14.4 item 1 argued
+that the lap guard cannot affect a healthy device because "each BOT stage is awaited to completion
+before the next is queued, so at most **one** TRB is outstanding". `bot_transfer_once` does not do
+that:
+
+* the CBW is pushed at `mod.rs:5317` with `control: 1 << 10` — **Normal type, no IOC, no ISP**, so it
+  posts **no completion at all**;
+* the data TRB is pushed at `mod.rs:5345` with **no pump between the two pushes**;
+* for an OUT data stage `data_dci == out_dci`, so the doorbell at `mod.rs:5377` is a **single**
+  doorbell covering **both** TDs (the second doorbell at `mod.rs:5378` is conditional and does not
+  fire).
+
+So **at least two TRBs are outstanding on the OUT ring at every write**, and the driver holds **no
+witness that the CBW was ever consumed**. Only the data and CSW stages are awaited, which is also why
+`n=` counts two per transaction (§16.0).
+
+This matters beyond the arithmetic: **it is the same premise the already-retracted §14.5 rested on.**
+The retraction there was written as a story about one stale field; the premise underneath it was
+never true either, and had never been established anywhere in the code or the doc. §14.4 carries the
+correction inline. The 14-TRB refusal threshold is not endangered by two outstanding TRBs — what is
+retired is the argument, not the number.
+
+**M1a's response is an experiment, not a fix.** `UNAOS_BOTCBWIOC` (default-off) gives the CBW TRB IOC
+and awaits it as its own stage — making the code do what §14.4 item 1 already claimed it did — at a
+cost of one extra ~1 ms tick per transaction (§16.6). Its value is evidentiary: with it on, "the CBW
+was consumed" stops being an assumption, which is what would let §16.8's rank-1 hypothesis be
+narrowed to the data TD alone.
+
+### 16.4 `ring refuse` — the assertion holds, the sub-claim is unfalsifiable
+
+**Observed.** All 9 `ring refuse` lines (1852, 1882, 2026, 2343, 2582, 2786, 2839, 3188, 3241) are in
+**pre-GUARD-STATE** boots C, D and E. **Boots F and G — the tip build — carry zero**, across 218 + 94
+awaited stages. §14.7 item 8's primary assertion is what the fix actually claims, and the capture
+supports it.
+
+**Observed + derived, and it is as clean a confirmation of the GUARD-STATE diagnosis as this evidence
+class allows.** Three of the nine (1852, 2343, 3188) read `slot=1 dci=5 enq=14 ctxdeq=0x2020b181
+dcs=1`. From §16.1 that value is slot 1's bulk-IN ring **base | DCS=1** — the exact value boot G's
+`deqprobe` labels `running_ctxdeq` and calls a birth value. `would_lap` therefore computed
+`used = (14 + 16 − 0) % 16 = 14`, `14 + 2 ≥ 16` → refuse: **from a frozen birth value, against a
+device that was working.** The pre-fix bug and the post-fix instrument that names it are in the same
+file, on the same silicon. (The other six split into two shapes — `enq=14` against dequeue index 0,
+and `enq=0` against dequeue index 1 — our enqueue a full lap ahead of a pointer that never moved.
+Same mechanism.)
+
+**The sub-claim cannot be checked on this or any capture.** §14.7 item 8 also asserted that any
+`ring refuse` "now carries `epstate` 2, 3 or 4 by construction, so it is a real finding rather than
+an artefact". The format string (`mod.rs:5014–5018`) emits `slot dci dir enq cycle ntrb ctxdeq dcs`
+and **no `epstate`**. The construction argument is sound *in source* (`bot_ring_guard` matches
+`ep_state_of` against `2 | 3 | 4` and returns `Ok` for everything else **before** reading `ctxdeq`,
+`mod.rs:5000–5004`) — but a claim whose witness is absent from the log is an **inference, not a
+finding**. No `ring refuse` in this file carries `epstate=1` or `0`, because none carries `epstate`
+at all: the live defect is *not observed* and *not excluded*.
+
+### 16.5 `strand when=pre` cannot observe what it was built to observe
+
+**Observed.** In both tip boots the `when=pre` scan runs **after** `bot_recover`'s own
+`resync stage=set-deq` has already repointed the controller onto our enqueue:
+
+| boot | resync `set-deq` | `strand when=pre` |
+|---|---|---|
+| F | 3752, 3754 | 3758, 3759 |
+| G | 4192, 4194 | 4198, 4199 |
+
+So `gap=0 live=0` on those lines is true **by construction**, not a finding: the cleanup that the
+scan was meant to precede has already run. §15.8 item 2's `when=pre` half can never fire from this
+call site, and the readings it produced must not be cited as evidence that the rings were clean at
+the error exit.
+
+**Fixed in the code lane by M1a (landed, `./arroyo check` green both arches, awaiting metal).** The
+pre-scan moved out of `bot_clean_rings` and into `resync_bulk_ep`, between each pipe's stop and its
+own `set-deq` — the only window where `ctxdeq` is both architecturally defined (endpoint Stopped) and
+still parked on the strand. **§15.8 item 2 can now fire**; whether it does is a metal question, not a
+gate question ([§16.12](#1612-m1a--what-the-code-lane-landed-and-the-correction-it-forces-on-167)).
+
+**`undrained=` (post) is unaffected.** It is taken after both endpoints are Stopped, where the field
+it derives from is architecturally defined (§15.5), it is the arc's asserted counter, and its `0`
+readings on boots F and G stand.
+
+### 16.6 The pace anomaly is our own 1 kHz polled pump
+
+**Derived, calibration first.** `hw_wait_budget() = tsc_hz × HW_WAIT_SECONDS` with
+`HW_WAIT_SECONDS = 2` (`arch/x86_64/mod.rs:102, 115–118`). The capture's observed `hw_wait_budget` is
+**5 387 700 130** cycles (boot F, line 3742), so **TSC = 2.6939 GHz** and **1 ms = 2 693 850 cycles**.
+The BOT budget is 3× that = 16.16 × 10⁹ cycles ≈ 6 s, which matches every `pump budget=` line. The
+APIC heartbeat is **1000 Hz** — one tick per millisecond (`arch/x86_64/apic.rs:158–162`,
+`TICK_HZ = 1000`).
+
+**Derived, per awaited stage, with and without the single bring-up outlier:**
+
+| boot | build | n | peak (ms) | raw mean (ms) | mean ex-peak (ms) |
+|---|---|---|---|---|---|
+| A | pre | 148 | 622.9 | 5.32 | **1.12** |
+| B | pre | 94 | 626.9 | 7.88 | **1.23** |
+| C | pre | 28 | 624.9 | 23.5 | **1.24** |
+| D | pre | 18 | 0.99 | **0.94** | **0.93** |
+| E | pre | 19 | 623.9 | 34.6 | **1.88** |
+| F | tip | 218 | 475.9 | 3.87 | **1.69** |
+| G | tip | 94 | 626.9 | 7.89 | **1.24** |
+
+Two readings follow, and together they retire the SMI-shaped account in §14.8 item 2.
+
+1. **The "~9 ms mean per 512-byte transfer" was a one-outlier artefact.** Five of the seven boots
+   carry a single ~625 ms wait — the **first** BOT stage after `SET_CONFIGURATION` (printed at `n=1`,
+   e.g. line 3709) — and with `n` between 18 and 218 that one sample owns the mean. Its cycle counts
+   are 1 678 052 412 / 1 688 825 376 / 1 683 430 866 / 1 680 738 993 / 1 688 819 643 — a spread under
+   **1%** across five independent boots, which is the signature of a **device-side firmware timer**
+   (the SD reader's media-init latency on the first TUR / READ CAPACITY), not an opaque host stall.
+   Boot F's peak is a different constant (475.9 ms); boot D has no such outlier at all and reports a
+   **raw** mean of **0.94 ms**, with nothing removed. That is the honest number.
+2. **The residual 0.94–1.9 ms per awaited stage is one to two 1 kHz ticks, and it is our code.**
+   `pump_until_bot_done` drains the event ring and then calls `crate::hlt()` (`mod.rs:6961–6968`),
+   which sleeps until an interrupt. **`IRQ_COUNT=0` on every boot** — the xHCI interrupt is never
+   taken — so the only thing that can wake the pump is the 1 ms periodic APIC tick, and per-stage
+   latency is quantised to it. Corroborating: `IMAN=0x3` reads identically on the healthy and the
+   timeout lines, i.e. IP is set and never RW1C'd, so an MSI cannot re-arm — consistent with
+   `IRQ_COUNT=0` and with a purely polled driver.
+
+**What the capture cannot say.** It carries only `sum`, `peak` and `n`, so it cannot produce a
+distribution and cannot answer whether the waits are uniform, bimodal or bursty. That needs the
+histogram in [§16.10](#1610-what-the-next-metal-boot-must-be-able-to-print) item 3.
+
+**Nothing here supports the SMI-shaped reading.** Per transaction the cost is ~1.9–3.4 ms (two awaited
+stages), roughly 3–8× a fully serialised BOT transaction's floor — not the two-to-three orders of
+magnitude §14.8 item 2 claimed. It remains a throughput ceiling worth removing; it is no longer a
+reason to hunt a host stall.
+
+### 16.7 `cfgep_cc=19` closed — a sequencing defect of ours
+
+**Observed** (boot F, line 3806, and the same shape on all seven instances):
+
+```
+:: BOT: rescue stage=reset-device slot=2 ok=no resetdev_cc=1 resetdev_why=ok
+        cfgep_cc=19 cfgep_why=cc-error indci=5 outdci=2 inmps=512 outmps=512
+        epin=1->0 epout=1->0 n=1 ::
+```
+
+Reset Device **succeeds**. xHCI 1.2 §4.6.11: it transitions the Slot to **Default** and disables every
+endpoint except the Default Control Endpoint — and the driver records that transition itself, on its
+own line, as `epin=1->0 epout=1->0`. Configure Endpoint is legal only against an **Addressed** or
+**Configured** Slot, so against Default a Context State Error is **architecturally required**, not
+merely "expected" as §14.1 words it. That is a driver gap, in our lane, and it accounts for **every**
+`cc=19` in the file — all seven, across both builds (lines 2022, 2380, 2630, 2835, 3237, 3806, 4321),
+each preceded by `resetdev_cc=1` and an `epX=…->0` transition.
+
+> **Correction (2026-07-30, M1a) — the remedy this section first inferred was wrong.** The sentence
+> that stood here read *"Our escalation ladder omits **Address Device** between the two rungs."* It
+> is **struck**: Address Device with BSR=1 leaves the Slot in Default and does not satisfy §4.6.6
+> either, and with BSR=0 it must `SET_ADDRESS` to address 0, which only a just-port-reset device
+> answers. There is **no lawful re-address without a port reset**, so §14.1's argument is correct and
+> the insertion would have added a second command that must fail in front of one that already did.
+> **The diagnosis above is unchanged; only the inferred fix was wrong.** What landed instead — the
+> retirement of the rung — is [§16.12](#1612-m1a--what-the-code-lane-landed-and-the-correction-it-forces-on-167).
+
+**The `epstate=0` discriminator is answered.** The endpoints were **not** already gone when the rung
+ran — **we disable them**, at a precisely located step, and the driver's own before/after field says
+so.
+
+**Consequence 1 — §15.8 item 7 is answered NO.** Fix 6's `stage=repoint` cannot land from the call
+site it had. Set TR Dequeue Pointer requires Stopped or Error (xHCI 1.2 §4.6.10) and the endpoint is
+**Disabled**: lines 3804 and 3805 print `ok=no cc=19 why=cc-error … epstate=0` on both pipes, and the
+retry that follows fails with `completion code 12` = **Endpoint Not Enabled** (line 3810). This
+verdict stands as the correct reading of the code as it was, and it is what motivated M1a's
+retirement of the rung ([§16.12](#1612-m1a--what-the-code-lane-landed-and-the-correction-it-forces-on-167)).
+
+**Consequence 2 — the design question is SETTLED, against the remedy this section first inferred.**
+§14.1 argued that re-addressing without a port reset would be the *unsound* move, because the device
+still holds its USB address and would not answer `SET_ADDRESS` at 0. **§14.1 is right.** Neither BSR
+setting of Address Device reaches Addressed here, so the rung had no lawful continuation at all — the
+fix was to **retire** it, not to complete it. Full verdict and what landed in
+[§16.12](#1612-m1a--what-the-code-lane-landed-and-the-correction-it-forces-on-167).
+
+**One thing the capture does not say.** Whether a device-side condition made Reset Device necessary
+in a way that also explains the onset. Reset Device ran ~12 s *after* the onset, on the third
+consecutive failure. It is a consequence, and it cannot be the cause.
+
+### 16.8 Still open: the first-completion loss now has a shape and a lead
+
+The loss of the **first** completion — the event that starts a storm — is **still unexplained**. What
+the GR8 capture adds is a shape, a reproduction, and one ranked hypothesis.
+
+**Observed — the onset shape, 3 for 3.** Boots C, D and E do not belong to this question: their first
+BOT failure is a `ring refuse` (1852, 2343, 3188), i.e. the pre-GUARD-STATE false `RingFull`, since
+fixed. The three genuine onsets are:
+
+```
+1367 (B): stage=data dir=out len=512 trb_idx=0 wrapped=true  single=44 multi=3  wrapped_tx=2
+3735 (F): stage=data dir=out len=512 trb_idx=0 wrapped=true  single=99 multi=10 wrapped_tx=7
+4175 (G): stage=data dir=out len=512 trb_idx=0 wrapped=true  single=44 multi=3  wrapped_tx=2
+```
+
+**Byte-identical: an OUT data stage, 512 bytes, landing at ring index 0 — i.e. on a wrap.** From
+source, `BOT_LAST_WRAP` is set exactly when the data push returned index 0 (`mod.rs:5352`), and
+`TransferRing::push` writes the Link TRB **lazily**, at push time, only once
+`enqueue_index == num_trbs − 1` (`ring.rs:106–124`) — so for the whole of each lap index 15 holds a
+**stale-cycle** TRB, and the data TD at index 0 sits immediately behind a Link TRB written moments
+earlier. A data stage lands at index 0 roughly one time in 8–16, so 3/3 is not a coincidence anyone
+should spend long defending.
+
+**Observed — and the victim is named:**
+
+```
+1386 (B): :: BLK: io-cause op=write lba=17303 bot_err=Timeout (first, once) ::
+3767 (F): :: BLK: io-cause op=write lba=2080  bot_err=Timeout (first, once) ::
+4207 (G): :: BLK: io-cause op=write lba=17303 bot_err=Timeout (first, once) ::
+```
+
+All three are the flight recorder's write path (each followed by `:: FR: UNAOS.LOG reservation failed
+(Io) ::`); boot F's LBA 2080 is the FAT itself.
+
+**Observed — boots B and G are the same failure twice.** Same `n=94`, same
+`single=44 multi=3 wrapped_tx=2`, same `trb_idx=0 wrapped=true`, same `lba=17303`, `peak` agreeing to
+**6 ppm** (1 688 825 376 vs 1 688 819 643) and `sum` to 0.13% — on **two different driver builds**
+(B is pre-GUARD-STATE, G is tip). **This is §14.8 item 1's deterministic-recurrence handle,
+reproduced**, and it survives the GUARD-STATE and BOT-PHASE fixes exactly as §15.9 item 1 predicted.
+A deterministic, index-locked failure is a function of ring position and workload — it is neither a
+stochastic device fault nor an SMI.
+
+**Observed — the authoritative read at the onset, and the caveat §14.3's key omits.** Boot F, in
+order:
+
+```
+3736: timeout pipes … out_epstate=1 out_ctxdeq=0x2020be40 (stale: EP running) out_enq=1 … foreign=0
+3737: timeout trb wait=0x2020be40 pipe=out dw0=0x21e60000 dw1=0x0 dw2=0x00000200 dw3=0x00000425
+                  trb_cycle=1 ring_cycle=1 trb_type=1
+3738: timeout csw sig=0x0 … valid=no
+3753: resync stage=stop-ep dci=2 dir=out ok=yes cc=1 epstate=1->3
+3754: resync stage=set-deq dci=2 dir=out ok=yes cc=1 want=0x2020be51 ctxdeq=0x2020be41->0x2020be51
+```
+
+Line 3736's `ctxdeq` is tagged stale and supports nothing — correct behaviour by the driver, correct
+reading by us. Line 3737 is authoritative: `dw3=0x425` decodes as TRB Type 1 (Normal), C=1, IOC
+(bit 5), ISP (bit 2), and `dw2=0x200` = 512 bytes. **The TRB is well-formed and its cycle matches the
+ring's; nothing is wrong with what we wrote.** Line 3754 is the authoritative *dequeue* read, because
+3753 forced the Running→Stopped transition with `cc=1`: the pre-write value `0x2020be41` is address
+`0x2020be40` with DCS=1 — **the awaited TRB itself**, at ring index 0. The identical structure holds
+in boots B and G (G: `wait=0x2020b280` at 4177 against `ctxdeq=0x2020b281->0x2020b291` at 4194).
+
+Read against §14.3's key with a Stopped read in hand, `ctxdeq` *at* the awaited TRB rather than past
+it is **"the controller never fetched the work"**, not "the device is silent", and `TIMEOUT-CSW
+valid=no` is consistent. **The honest caveat, stated because the key does not state it:** a TD the
+xHC *has* fetched and is retrying (device NAKing) leaves the dequeue in the same place. The
+architectural discriminator is a Stop Endpoint Transfer Event with completion code **26 (Stopped)**
+or **27 (Stopped — Length Invalid)**, which the driver never prints. Boot G's SUMMARY reads
+`ev_late=0 ev_unaddressed=0`, which leans the same way. **Suggestive, not decisive** — see
+[§16.10](#1610-what-the-next-metal-boot-must-be-able-to-print) item 4.
+
+**Hypothesis (rank 1) — the doorbell that must restart the controller across a Link TRB does not
+take.** At a wrap, `bot_transfer_once` leaves the CBW at index 14 (cycle C), the Link at index 15
+(cycle C, TC=1) and the data TD at index 0 (cycle !C), under **one** doorbell (§16.3) that arrives
+*after* the Link was written into a slot the controller may already have inspected and rejected as
+stale. That fits the onset shape (index 0, on a wrap), the index-locked determinism, the dequeue
+parked at index 0 with DCS toggled, and `valid=no`. **Falsifier:** any onset with `wrapped=false` on
+the tip build, or the deterministic failure surviving unchanged when the wrap position moves.
+**Neutral discriminating experiments, one variable each:** change only the transfer-ring length
+16 → 64 and see whether the failure moves or disappears; ring the doorbell a second time after a
+wrapped OUT push (redundant doorbells are architecturally legal and weaken nothing); and, if either
+implicates the Link, pre-place the Link TRB at ring construction so index 15 is never a stale data
+slot. **The first of these is now armed as a default-off knob, `UNAOS_BOTRING64`** — an experiment
+awaiting a boot, not a fix
+([§16.12](#1612-m1a--what-the-code-lane-landed-and-the-correction-it-forces-on-167)).
+
+**Lower-ranked, kept only with their falsifiers named.** USB 2.0 link power management — the failing
+device is on a **USB 2.0** root port (`port 1 [usb2] … sp=3(HS)`), so the LPM at issue is **L1 /
+PORTPMSC**, not USB 3 U1/U2, and we program no LPM state at all; falsified by PORTSC PLS reading U0
+continuously across the silence. PCH port-mux residue — we write XUSB2PR and USB3_PSSEN ourselves
+every boot (`:: PORTSW-1: … routed 0x0->0xf …`) and have never tested that `0xf` is right for this
+board; the controlled comparison is a boot that leaves the mux at the firmware default. **Device or
+card fault is not admissible** and is recorded only to say why: UEFI reads this card through this
+reader on this port flawlessly every boot, nothing in this capture is a controlled experiment against
+the device, and until the hypotheses above are excluded *and* a firmware-baseline experiment
+reproduces the failure, it is not a hypothesis but a place to stop looking.
+
+### 16.9 The instrument-lie ledger
+
+The class, stated generally: **a field read at a moment the hardware or the runtime defines it as
+meaningless is not weak evidence — it is an instrument that cannot falsify anything, and it will be
+believed because it printed.** The sibling rule is the instrument-baseline law (a counter read
+against its own pre-run total is not a rate). This read found the fifth and sixth entries.
+
+| # | instrument | why it could not mean what it printed | recorded in |
+|---|---|---|---|
+| 1 | `[cursor12]` rollup (compositor, cross-seat) | printed cumulative totals covering passes that ran before the sprite existed — the healthy-but-idle reading was indistinguishable from total failure | compositor docs; instrument-baseline law |
+| 2 | `recover evidence … pipe=none` | `run_bot_stage` took the pending record and dropped it before propagating the error, so recovery's read was always `None` — a structural lie about the driver's own state, on **every capture ever taken** | §14.3 |
+| 3 | `ctxdeq` under a Running endpoint | architecturally undefined while Running; frozen at the birth value on Panther Point, refreshed live by QEMU — read as a position, it built the lap guard wrong | §14.3, §14.4, §14.5 |
+| 4 | wc-d live reference (compositor, cross-seat) | same class, other subsystem | compositor docs |
+| **5** | **`foreign=`** | the pump is a synchronous spin, so no foreign transfer is ever outstanding while it waits; **0 by construction**, healthy or wedged | §14.3, [§16.2](#162-foreign-is-a-dead-instrument-on-this-platform) |
+| **6** | **`strand when=pre`** | runs *after* `bot_recover`'s `set-deq` has already repointed the controller, so `gap=0 live=0` is true by construction and the observation it was built for is destroyed before it is taken | §15.8 item 2, [§16.5](#165-strand-whenpre-cannot-observe-what-it-was-built-to-observe) |
+
+Entries 2, 3, 5 and 6 are all in this driver, and all four printed green readings that were quoted as
+evidence. The standing consequence: **a new witness is not done until someone has stated what it
+reads in the healthy case and in the "mechanism has not run yet" case, and shown those differ.**
+
+### 16.10 What the next metal boot must be able to print
+
+Each item names the decision it unblocks. These are asks on the code lane, not changes made here.
+
+1. **`epstate=` and `ctxdeq_valid=` on the `ring refuse` line** (`mod.rs:5014`). Unblocks §14.7 item
+   8's sub-claim, which is otherwise unfalsifiable on every capture ever taken (§16.4). Two fields;
+   both values are already in hand at that point in the function.
+2. **Port state at the timeout: PORTSC with PLS decoded, plus PORTPMSC and PORTLI**, for the failing
+   port and every other connected port, on or immediately after `TIMEOUT-PIPES`, and once at
+   bring-up as the baseline. Unblocks the LPM and port-mux hypotheses entirely, for the cost of a few
+   volatile reads. Note the current state precisely: a periodic topology summary *does* print PORTSC
+   with PLS decoded (e.g. lines 885–892), but **never on a timeout line**, and **PORTPMSC and PORTLI
+   are never printed at all**. One summary happens to land inside boot G's storm before any recovery
+   touched the port (line 4271: `port 1 … CCS=1 PED=1 PLS=0(U0) sp=3(HS)`), which leans against a
+   link-down reading — but it is not a read at the timeout and is not part of the witness set.
+3. **A log₂ bucket histogram of per-stage wait cycles on the SUMMARY line** (8–10 counters). Unblocks
+   the uniform/bimodal/bursty question and any test of §16.6's tick-quantisation reading. If the
+   buckets pile at 1 and 2 ticks, the pace question closes as a polled-driver artefact.
+4. **Transfer Events counted by completion code during recovery, naming 26 and 27 explicitly.**
+   Unblocks the last ambiguity in §16.8: "the controller never fetched the TD" versus "it fetched it
+   and the device is NAKing".
+5. **A per-endpoint doorbell counter on `TIMEOUT-PIPES` (`db_in=`, `db_out=`), with the ring index at
+   the time of the last one.** Unblocks the rank-1 hypothesis directly. There is no line anywhere in
+   the capture saying a doorbell was written, so a doorbell that was written and did not take, and a
+   doorbell that was never written, are currently indistinguishable.
+6. **Link TRB forensics: when `wrapped=true`, dump the TRBs at index `ntrb−1` and `ntrb−2` as raw
+   dwords** alongside the awaited TRB. Puts the Link's cycle bit, TC bit and target address on the
+   record instead of being reasoned about from source.
+7. ~~**Move the `strand when=pre` scan above `bot_recover`**~~ — **DONE (M1a).** The scan now runs
+   inside `resync_bulk_ep`, between each pipe's stop and its own `set-deq`. Unblocks §15.8 item 2
+   (§16.5, [§16.12](#1612-m1a--what-the-code-lane-landed-and-the-correction-it-forces-on-167)).
+   Landed and gated; the reading itself is still owed by metal.
+8. **xHCI USBLEGSUP/USBLEGCTLSTS pre/post, in the EHCI grammar.** Unblocks the standing claim that
+   the xHCI SMI enable bits are clear, which currently has **no witness in any capture** (§16.11).
+9. **`evts=` — all event-ring TRBs consumed during this wait, of any type** — replacing or augmenting
+   `foreign=`. `drain_event_ring_once` already returns per-event. Unlike `foreign`, it can be
+   non-zero, which is what would make a zero reading mean something (§16.2).
+10. **`tag=`, `cdb0=` and `lba=` on the `TIMEOUT-SHAPE` line.** The timing-out transaction is
+    currently identified only by `csw_bytes` on a CSW rejection and by `BLK: io-cause` after the
+    fact; §15.2's code→capture→medium join had to be reconstructed from a wrecked filesystem and
+    should be readable from the log directly.
+11. **`t_ms=` on the pump lines.** No BOT line carries a wall clock, which blocks correlating the
+    onset with the 1 kHz tick, with any periodic external event, and with the concurrent port-2
+    enumeration that was mid-`reset-settle` at both the B and G onsets (lines 1362–1364, 4170–4172).
+    Boot F's onset had no port activity, which is what keeps port-reset concurrency out of §16.8's
+    ranked list — but the coincidence deserves a timestamp before it is dismissed.
+
+### 16.11 Checklist items this capture closes — and one it does not
+
+**Closed.** Two entries on the real-silicon-gap checklist print on **every** boot in this file and
+need no further investigation:
+
+* **Scratchpad buffers** — `xHCI: scratchpad: 16 buffer(s) x 4096 bytes; DCBAA[0]=…` (lines 254,
+  1243, 1748, 2248, 3065, 3537, 4049).
+* **BIOS→OS handoff** — `xHCI: BIOS->OS handoff complete.` (lines 241, 1230, 1735, 2235, 3052, 3524,
+  4036).
+
+**Not closed — and the claim that said otherwise has no witness.** The standing statement that "the
+xHCI SMI enable bits are confirmed clear" (§14.8 item 2) is supported by **nothing in any capture**.
+xHCI prints only the one handoff line above and **never** prints USBLEGSUP or USBLEGCTLSTS. EHCI
+prints both, for both controllers, every boot — e.g. `:: EHCI-CONFIG: [0] USBLEGCTLSTS@0x6c:
+pre=0xc00c0000 post-own=0xe00c0000 cleared->0x000c0000 …` and `:: EHCI-CONFIG: [0] USBLEGSUP@0x68:
+OS-own set, BIOS-owned cleared …`. xHCI should print them in the same grammar
+([§16.10](#1610-what-the-next-metal-boot-must-be-able-to-print) item 8). Until it does, the SMI half
+of the handoff is an **assumption**, not a finding.
+
+### 16.12 M1a — what the code lane landed, and the correction it forces on §16.7
+
+The code lane's M1a arc answered §16.7's open design question, and **it refuted the fix this section
+originally implied**. Recorded here in full, because the wrong fix was the more obvious one and would
+otherwise stay plausible.
+
+> **RETRACTION (2026-07-30, M1a).** §16.7 and §15.9 item 2 originally named the defect as *"our
+> escalation ladder omits **Address Device** between Reset Device and Configure Endpoint"*, and left
+> §14.1's competing soundness argument standing as an open question. **That proposed insertion was
+> wrong, and §14.1's argument is correct: there is no lawful re-address without a port reset.**
+>
+> * **Address Device with BSR=1** (xHCI 1.2 §4.6.5) issues no `SET_ADDRESS`, but leaves the Slot in
+>   **Default** with address 0. It does **not** reach Addressed, so §4.6.6's precondition is still
+>   unmet and Configure Endpoint still answers `cc=19`. BSR=1 exists for the enumeration sequence,
+>   every step of which presumes a just-port-reset device.
+> * **Address Device with BSR=0** must send `SET_ADDRESS` to address **0** (USB 2.0 §9.1.1, §9.4.6),
+>   which only a device in Default state — entered on a port reset and nowhere else — answers. The
+>   wedged reader still holds its assigned address.
+>
+> So inserting Address Device between the rungs would have added a second command that must fail, in
+> front of one that already did. The failure mode this section diagnosed is real and its explanation
+> (§16.7's first two paragraphs) is unchanged: Reset Device succeeds, leaves the Slot in Default,
+> disables the endpoints, and Configure Endpoint is then architecturally required to return `cc=19`.
+> What was wrong was the inferred remedy. **This is the difference between a correct diagnosis and a
+> correct fix, and the record should show that we got one and not the other.**
+
+**What landed instead** (code lane; gated `./arroyo check` green on **both** arches; **awaiting
+metal**):
+
+1. **Rung (a)'s Reset Device + Configure Endpoint is RETIRED.** The rung could never succeed — Reset
+   Device succeeds, but the Configure Endpoint behind it is architecturally required to fail, and no
+   lawful step closes that gap (the retraction above) — and failing was not free: it turned Running
+   endpoints into **Disabled** ones (`epin=1->0 epout=1->0`, observed on all seven instances) with no
+   path back except the port cycle the rung existed to avoid. A rung whose success is architecturally
+   impossible and whose failure costs the slot is worse than no rung.
+2. **It is replaced by a ring rebase**, built only from commands legal where the endpoints actually
+   are: **Stop Endpoint / Reset Endpoint** (xHCI 1.2 §4.6.9 / §4.6.8) → `TransferRing::reset` →
+   **Set TR Dequeue Pointer** at each ring base with DCS=1 (§4.6.10). `rebuild_bulk_input_ctx` and
+   its Configure Endpoint are deleted.
+3. **A real sub-finding, recorded because it was found on the way.** The retired rung called
+   `TransferRing::reset` **before** the endpoints were stopped, violating that function's own stated
+   safety precondition — *"the caller must have stopped/reset the endpoint first, so the controller
+   is not concurrently fetching from this ring"* (`ring.rs`). The driver was zeroing a ring the
+   controller could still be walking. The rebase honours it: stop first, then reset, then repoint.
+   This is independent of the `cc=19` story and would have been worth fixing on its own.
+4. **Fix 6's `stage=repoint` (§15.8 item 7) keeps its intent** and now sits in the only state where
+   it is reachable. This is a consequence of the retirement, not a change to fix 6. **§16.7's
+   "answered NO" verdict stands as the correct reading of the code as it was**, and is what motivated
+   the retirement.
+5. **The `strand when=pre` scan (§15.8 item 2, §16.5) moved** out of `bot_clean_rings` and into
+   `resync_bulk_ep`, between each pipe's stop and its own `set-deq` — the only window where `ctxdeq`
+   is both architecturally defined (endpoint Stopped) and still parked on the strand. **It can now
+   fire.** `undrained=` is untouched.
+
+**Two metal knobs, default-off — experiments awaiting a boot, not fixes.** Neither is a claimed
+correction and neither should be quoted as one:
+
+* **`UNAOS_BOTRING64`** — transfer ring 16 → 64 TRBs. This is [§16.8](#168-still-open-the-first-completion-loss-now-has-a-shape-and-a-lead)'s
+  rank-1 discriminator with one variable changed: wrap frequency and wrap positions both move,
+  nothing else does. **If the deterministic failure at LBA 17303 moves or vanishes, the Link/wrap
+  mechanism is causal; if it stays put, the rank-1 hypothesis dies.**
+* **`UNAOS_BOTCBWIOC`** — the CBW TRB is given IOC and awaited as its own stage, i.e. the code is
+  made to do what §14.4 item 1 already claimed it did (§16.3). Cost is one extra ~1 ms tick per
+  transaction (§16.6). If the onset survives with the CBW *confirmed consumed*, the two-TDs-one-
+  doorbell reading is out and the rank-1 hypothesis narrows to the data TD alone.
+
+### 16.13 The standing frame
+
+Every conviction in this section is against our own driver, our own boot chain, or a gap in our own
+instrumentation: the guard that read a meaningless field, the rung that could only ever fail and took
+the endpoints down with it, the pump that never awaits its own CBW, the scan that runs after the
+cleanup it was meant to precede, the mean that was one sample — and, in §16.12, our own first
+proposed remedy. Hardware blame remains inadmissible on this evidence — UEFI reads this card, through
+this reader, on this port, flawlessly, every boot, and no controlled experiment against the device
+has been run. The null hypothesis is our code until something falsifiable says otherwise.
 
 ---
 

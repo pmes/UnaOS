@@ -110,6 +110,15 @@ _feats=""
 # path: REQUEST SENSE (sense rewritten to UNIT ATTENTION) + the single sense-driven retry.
 # Both fire exactly once. Test-only; never on boot media.
 [ -n "${UNAOS_BOTFAULT:-}" ] && _feats="${_feats}botfaultinject,"
+# ONSET-2 (M3): the two H1 metal experiments, both default-off so a normal boot is byte-identical.
+# UNAOS_BOTRING64=1 grows the storage slot's two BULK transfer rings 16 -> 64 TRBs (wrap frequency
+# and wrap positions change; nothing else does). UNAOS_BOTCBWIOC=1 gives the CBW an IOC bit and
+# awaits it as its own stage, so "the CBW was consumed" stops being an assumption. Metal only —
+# QEMU's usb-storage never stalls, wedges or short-changes, so neither knob can be exercised there.
+# Kept in sync with builder/src/main.rs; the boot log's `:: BOT: knobs … result=KNOBS ::` line
+# reports the value that actually compiled in.
+[ -n "${UNAOS_BOTRING64:-}" ] && _feats="${_feats}botring64,"
+[ -n "${UNAOS_BOTCBWIOC:-}" ] && _feats="${_feats}botcbwioc,"
 # VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem memory-type
 # readout, display-BAR probe, scripted scroll scenario). x86_64-only module — aarch64 media are
 # byte-identical with this on or off.

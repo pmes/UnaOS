@@ -295,6 +295,33 @@ impl TransferRing {
         Some((gap, live))
     }
 
+    /// ONSET-2 (M2 witness 4): the four raw dwords of the TRB at ring index `index`, as they read
+    /// back from DRAM. `None` if the index is out of range.
+    ///
+    /// **What it exists for.** `TIMEOUT-TRB` prints only the AWAITED TRB, so the Link TRB's cycle
+    /// bit, its Toggle Cycle bit and its target address have only ever been reasoned about from
+    /// `push`'s source — never observed. `push` writes the Link TRB **lazily**, at the moment the
+    /// enqueue index reaches `num_trbs - 1`, so for the whole of every lap the last slot holds a
+    /// stale TRB carrying the colour the controller is no longer expecting. Whether that is what
+    /// stops the controller at a wrap is the arc's ranked hypothesis, and it cannot be settled
+    /// without the bytes.
+    ///
+    /// The caller is expected to dump index `num_trbs - 1` (the Link slot) and `num_trbs - 2` (the
+    /// TRB immediately ahead of it) when a timeout reports `wrapped=true`.
+    ///
+    /// HEALTHY-BUT-IDLE READING: both slots always hold *something* — the Link slot holds a Type 6
+    /// TRB with TC set once the ring has wrapped at least once, and index `n-2` holds whatever data
+    /// TRB last occupied it. This is forensic detail, not an alarm: nothing about the presence or
+    /// absence of these dwords is itself a fault, and the line is only ever printed at a timeout.
+    /// Invalidate is the caller's business (rings are identity-mapped and coherent on x86).
+    pub fn trb_raw(&self, index: usize) -> Option<(u32, u32, u32, u32)> {
+        if index >= self.num_trbs {
+            return None;
+        }
+        let t = unsafe { core::ptr::read_volatile(self.trbs.add(index)) };
+        Some(((t.parameter & 0xFFFF_FFFF) as u32, (t.parameter >> 32) as u32, t.status, t.control))
+    }
+
     /// BOTEV: does `phys` address a TRB inside THIS ring? Pure predicate over `index_of`, no reads
     /// of device memory. Used by the BOT recovery witness to name which pipe (bulk IN vs bulk OUT)
     /// the timed-out transfer was waiting on, from nothing but the stranded TRB address.
