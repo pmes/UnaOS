@@ -972,11 +972,11 @@ pub fn bringup(fb: Option<FbTarget>) {
     // only trustworthy if it says what is missing from it.
     if V3D_DEEP {
         serial_println!(
-            ":: V3D: [v3d] deep=on — slow banked-verdict probes ARMED: [v3d48] bisection ladder (6 rungs x ~0.5 s FLDONE backstop) + [v3d63] ptb-unit matrix (4 more rungs, same backstop) + [v3d64] muxcal (1 more rung + a 4 ms idle window + 1 extra CT1 job) + [v3d66] ptbsweep (2 passes x [1 rung + a 4 ms idle window + 1 extra CT1 job]) + [v3d68] binwall (4 more rungs, same backstop, plus a poison fill/scan of a 24 KiB tile-state region and the 32 KiB pool per rung) + [v3d69] initdiff (1 more rung, same backstop, between two READ-ONLY PM/ASB/MMUC fabric stations) + [v3d71] mainline-geom (1 more rung, same backstop, the bin window remapped to the piOS dump's iova geometry with in-flight ASB fabric + [v3d73] CLE-progress samplers across its wait) + [v3d73s] mainline-exact-submit (1 more rung, same backstop, the byte-exact v3d_bin_job_run write sequence with nothing interleaved) = 20 rungs, [v3d59] frameclose (64 x 1 ms), [v3d58] rerender (extra CT1 job). Expect ~10 s of extra boot — a stall of that length here is the BUDGET, not a hang ::"
+            ":: V3D: [v3d] deep=on — slow banked-verdict probes ARMED: [v3d48] bisection ladder (6 rungs x ~0.5 s FLDONE backstop) + [v3d63] ptb-unit matrix (4 more rungs, same backstop) + [v3d64] muxcal (1 more rung + a 4 ms idle window + 1 extra CT1 job) + [v3d66] ptbsweep (2 passes x [1 rung + a 4 ms idle window + 1 extra CT1 job]) + [v3d68] binwall (4 more rungs, same backstop, plus a poison fill/scan of a 24 KiB tile-state region and the 32 KiB pool per rung) + [v3d69] initdiff (1 more rung, same backstop, between two READ-ONLY PM/ASB/MMUC fabric stations) + [v3d71] mainline-geom (1 more rung, same backstop, the bin window remapped to the piOS dump's iova geometry with in-flight ASB fabric + [v3d73] CLE-progress samplers across its wait) + [v3d73s] mainline-exact-submit (1 more rung, same backstop, the byte-exact v3d_bin_job_run write sequence with nothing interleaved) + [v3d74] thread-swap (1 more rung, same backstop + poison scans: the retiring M3 RCL submitted on CT0's queue with the [v3d73] sampler armed; leg B BCL-on-CT1 is a documented no-op) = 21 rungs, [v3d59] frameclose (64 x 1 ms), [v3d58] rerender (extra CT1 job). Expect ~10 s of extra boot — a stall of that length here is the BUDGET, not a hang ::"
         );
     } else {
         serial_println!(
-            ":: V3D: [v3d] deep=off (banked verdicts skipped) — NOT run this boot: [v3d48] empty-frame bisection ladder (all 6 rungs banked non-retire), [v3d59] frameclose (banked DEAD-OPEN, zero bit changes), [v3d58] rerender (banked clean), [v3d71] mainline-geometry rung + fabric/[v3d73] CLE-progress samplers, [v3d73s] mainline-exact-submit rung. Fast probes only; re-arm with UNAOS_V3D_DEEP=1 ::"
+            ":: V3D: [v3d] deep=off (banked verdicts skipped) — NOT run this boot: [v3d48] empty-frame bisection ladder (all 6 rungs banked non-retire), [v3d59] frameclose (banked DEAD-OPEN, zero bit changes), [v3d58] rerender (banked clean), [v3d71] mainline-geometry rung + fabric/[v3d73] CLE-progress samplers, [v3d73s] mainline-exact-submit rung, [v3d74] thread-swap rung. Fast probes only; re-arm with UNAOS_V3D_DEEP=1 ::"
         );
     }
 
@@ -6762,6 +6762,10 @@ fn empty_frame_bisection() {
     // taken under) and after every other reading has been taken on the instrumented-submit
     // arrangement those verdicts were banked under.
     v3d73_mainline_submit();
+    // PI-V3D-74: the thread-swap discriminator rides after [v3d73s] — its leg A latches CT0Q*
+    // with an RCL-class queue, so every bin-class reading above must already be banked; and its
+    // verdict is read AGAINST [v3d73]'s loaded-but-never-fetches fact from this same boot.
+    v3d74_thread_swap();
 }
 
 /// PI-V3D-63 — one banked rung's readback: the RANK 2 placement witness (the CT0/PCS words) plus the
@@ -9065,6 +9069,14 @@ fn v3d73_sampler_emit(what: &str) {
     }
 }
 
+/// PI-V3D-74: read back the span evidence of the LAST armed+emitted sampler window, so a leg-level
+/// verdict can fold the fetch facts into its own reading without re-deriving them from the wire.
+/// Returns (samples, ca_in_span, ca_max_in_span) — the disarmed accumulator is left untouched.
+fn v3d73_sampler_read_span() -> (u32, u32, u32) {
+    let s = &raw const V3D73_SAMPLER;
+    unsafe { ((*s).samples, (*s).ca_in_span, (*s).ca_max_in_span) }
+}
+
 /// PI-V3D-71 leg 1 (+ leg 2 riding its wait) — the mainline-geometry shape-match rung.
 ///
 /// One `[v3d48]`-style Empty-frame kick (same 64x64 frame — shape and content are excluded prior, so
@@ -9379,6 +9391,205 @@ fn v3d73_mainline_submit() {
         verdict,
     );
     clear_mmu_fault_latch("v3d73s post-kick");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// PI-V3D-74 — the THREAD-SWAP discriminator: is THREAD 0 dead as a thread, or are BIN-class
+// lists dead as a class?
+//
+// The P84 wire established, and this rung does not re-litigate: [v3d73s] = the byte-exact
+// mainline submit sequence changes NOTHING (the submit interface is exhausted alongside the
+// config space). [v3d73] cle-progress = CT0's queue LOADS (CA=our list, CTRUN=1) but the CLE
+// NEVER FETCHES THE FIRST WORD — 500 samples, zero movement, the core clocked (703M cycles) and
+// idle. Meanwhile THREAD 1 WORKS on the same CLE hardware: CT1/RCL jobs fetch, execute, retire
+// and land byte-verified pixels ([v3d58] xengine). Thread 1 alive; thread 0 loaded-but-never-
+// fetches. Two hypotheses fit, and they diverge completely on where the hunt goes next:
+//
+//   (i)  BIN-class lists are dead as a CLASS — something about a bin submission upstream of the
+//        first fetch (the QMA/QMS/QTS tile-memory arming state, or bin-mode selection) kills the
+//        fetch before it starts. Then thread 0 CAN fetch, and the next instrument targets what
+//        distinguishes a bin submission before its first word.
+//   (ii) THREAD 0 is dead as a THREAD — it never starts regardless of list class: a per-thread
+//        enable/power state no register this campaign knows controls. Then the hunt leaves the
+//        core's programming interface entirely (firmware/VPU-side per-thread init becomes the
+//        leading space) and the next discriminator is a piOS dump taken MID-BIN (the S1S bench
+//        ask — v3d.md §45).
+//
+// Leg A (`[v3d74a]` rcl-on-ct0) splits them: take the minimal render list that thread 1 provably
+// executes — the M3 clear-job RCL, the smallest retiring rung in this file, byte-verified on
+// metal since M3 — and submit it on CT0's queue, otherwise byte-identical to the retiring CT1
+// submit (QBA then QEA, nothing else — deliberately NO QMA/QMS/QTS arming: that is the bin-class
+// state under suspicion), with the [v3d73] sampler armed across the wait. A bonus of the swap:
+// QBA here is the RCL's address, which NO prior CT0 kick ever latched — so a CA==QBA reading is
+// unambiguous (the [v3d73] stale-word trap cannot reproduce on this leg).
+//
+// Leg B (`[v3d74b]` bcl-on-ct1, the mirror) is a DOCUMENTED NO-OP — see its witness line: the
+// v3d_regs.h map this file transcribed says the bin tile-memory latches are thread-0-only
+// (CT0QTS 0x15c / CT0QMA 0x170 / CT0QMS 0x174 have no CT1 counterparts — 0x158 is CT1SYNC,
+// 0x178 is CT1QCFG), so "the bin-side arming, as v3d71 does" cannot be expressed for thread 1,
+// and a bin list reaching START_TILE_BINNING on a thread with no PTB plumbing risks wedging CT1
+// — the only thread this campaign has ever seen retire, and the working reference every
+// cross-engine verdict rests on. The discriminator is one-sided by hardware design; leg A
+// carries the verdict alone.
+//
+// Rides UNAOS_V3D_DEEP, LAST — after [v3d73s], so every banked reading above is taken on the
+// arrangement its verdict was banked under. Same poison detectors, same FLDONE-wait window
+// (the wait is the sampler's tick source; an RCL retires with FRDONE not FLDONE, so the wait
+// always runs its full backstop and the INT decode on its timeout line is part of the reading).
+// Reading key: the witness text below + v3d.md §45.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+fn v3d74_thread_swap() {
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down => {
+            serial_println!(
+                ":: V3D: [v3d74] SKIPPED — hub IDENT0 reads 0x00000000 (block absent/unpowered; the QEMU raspi4b signature). No rung was kicked and NO verdict is implied ::"
+            );
+            return;
+        }
+        V3dPresence::Poison(w) => {
+            serial_println!(
+                ":: V3D: [v3d74] SKIPPED — hub IDENT0 reads poison {:#010x} (open-bus / firmware fill, not a live register). No rung was kicked and NO verdict is implied ::",
+                w
+            );
+            return;
+        }
+    }
+    serial_println!(
+        ":: V3D: [v3d74] thread-swap — thread 0 dead, or bin-class lists dead? [v3d73] proved CT0 loads but never fetches while CT1 retires RCLs on the same CLE. Leg A submits the PROVEN M3 RCL on CT0's queue, byte-identical to the retiring CT1 submit (QBA->QEA only, NO QMA/QMS/QTS — the bin-class arming is the suspect being removed), [v3d73] sampler armed. CA advances/retires = THREAD 0 CAN FETCH, the death is BIN-JOB-CONFIG-specific upstream of fetch; CA pinned = THREAD 0 NEVER STARTS regardless of class, the hunt leaves the core's programming interface (next: a piOS dump MID-BIN — the S1S bench ask) ::"
+    );
+
+    // ── Leg A: the M3 RCL — the smallest list thread 1 provably executes — on CT0's queue. ──
+    // Prep is clear_job's, verbatim: sentinel-seeded target, both lists built + published.
+    fill_target(0xDEAD_BEEF);
+    let (rcl_len, sublist_len) = build_rcl();
+    cache::clean_range(arena_phys() + OFF_TARGET, TARGET_BYTES);
+    cache::clean_range(arena_phys() + OFF_RCL, rcl_len);
+    cache::clean_range(arena_phys() + OFF_SUBLIST, sublist_len);
+    let ba = arena_phys() + OFF_RCL;
+    let ea = ba + rcl_len;
+    if !arena_contains(ba, rcl_len) {
+        serial_println!(":: V3D: [v3d74a] RCL range escapes the arena — refusing kick (fail-closed) ::");
+        return;
+    }
+    // The [v3d68] evidence-integrity detectors: if anything on this leg makes PTB-class writes,
+    // the poison says so (an executing RCL writes the TARGET, never these regions).
+    v3d56_poison_region(OFF_V3D68_TSDA, V3D68_TSDA_BYTES);
+    v3d56_poison_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+
+    // All instrument accesses BEFORE the kick (the [v3d73s] discipline): stale-latch W1C, fault
+    // latch clear, RFC/BFC baselines, sampler pre-GO seeds.
+    clear_mmu_fault_latch("v3d74a pre-kick");
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
+    let rfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC);
+    let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    v3d73_sampler_arm(ba as u32, ea as u32);
+
+    // ── The swap itself: the retiring CT1 submit (clear_job's two writes), on CT0's slots. ──
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, ba as u32);
+    dsb(); // BA latched before the EA write triggers the fetch (clear_job's ordering, verbatim)
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, ea as u32); // GO — queue auto-start
+    dsb();
+    let cs_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+    let ca_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
+
+    let submit_sound = v3d54_submit_audit("v3d74a", ba as u32, ea as u32, rcl_len);
+    // The FLDONE wait is the sampler's tick window. An RCL that executes retires with FRDONE
+    // (bit0), which this wait does NOT return early on — so a fetching thread 0 still runs the
+    // full ~0.5 s backstop and the [v3d44] timeout line prints FRDONE=1: that print is a POSITIVE
+    // reading on this leg, not a failure.
+    let (sts, us, fldone) = wait_fldone("v3d74a rcl-on-ct0", ba as u32, ea as u32);
+    v3d73_sampler_emit("v3d74a rcl-on-ct0"); // [v3d73] — the fetch verdict on the swapped class
+    let (smp_n, smp_in_span, smp_max) = v3d73_sampler_read_span();
+
+    let cs_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+    let ca_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
+    let rfc_after = mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC);
+    let bfc_after = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    let frdone = sts & V3D_INT_FRDONE != 0;
+    let mmu_ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let fault =
+        mmu_ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+
+    // Evidence-integrity: drain the L2T, then scan the poison detectors ([v3d68] rule).
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_FLUSH);
+    let flush_done = wait_bit_clear(
+        V3D_CORE0_BASE,
+        V3D_CTL_L2TCACTL,
+        V3D_L2TCACTL_L2TFLS,
+        "L2T write-back (v3d74a scan)",
+    );
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_SLCACTL, V3D_SLCACTL_INVALIDATE_ALL);
+    dsb();
+    let ts_phys = arena_phys() + OFF_V3D68_TSDA;
+    cache::invalidate_range(ts_phys, V3D68_TSDA_BYTES);
+    cache::invalidate_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+    dsb();
+    let ts_scan = v3d56_scan(ts_phys as u32, V3D68_TSDA_BYTES);
+    let pool_scan = v3d56_scan((arena_phys() + OFF_BIN_TILEALLOC) as u32, BIN_TILEALLOC_BYTES);
+    v3d56_emit_scan("v3d74a", "tile-state (24 KiB, identity)", ts_phys as u32, &ts_scan, flush_done);
+    v3d56_emit_scan(
+        "v3d74a",
+        "tile-alloc pool (32 KiB, identity)",
+        (arena_phys() + OFF_BIN_TILEALLOC) as u32,
+        &pool_scan,
+        flush_done,
+    );
+
+    // The store verify — the same DRAM-truth readback clear_job banks its PASS on. Meaningful as
+    // a positive only; a false here with CA pinned is just the sentinel surviving an unrun list.
+    cache::clean_invalidate_range(arena_phys() + OFF_TARGET, TARGET_BYTES);
+    let verified = verify_target(CLEAR_RGBA);
+
+    let idled = cs_done & V3D_CLE_CTNCS_CTRUN == 0 && cs_kicked & V3D_CLE_CTNCS_CTRUN != 0;
+    let rfc_delta = rfc_after.wrapping_sub(rfc_pre);
+    // Execution evidence, strongest first: byte-verified store / a render-frame retire signal /
+    // CA walked to QEA. Fetch evidence: CA ever advanced past QBA into the span.
+    let executed = verified || frdone || fldone || rfc_delta != 0 || smp_max >= ea as u32;
+    let fetched = smp_in_span > 0 && smp_max > ba as u32;
+    let loaded = smp_in_span > 0;
+    let verdict = if fault != 0 {
+        "AN MMU FAULT LATCHED — instrument fault, not a discriminator verdict; fix before citing this rung"
+    } else if smp_n == 0 {
+        "ZERO samples landed — the wait exited before the first tick; INCONCLUSIVE, nothing here is a measurement"
+    } else if executed {
+        "THREAD 0 CAN FETCH AND EXECUTE — the render-class list that thread 1 retires ran on CT0's queue the moment the bin-class arming was absent. Thread 0 is ALIVE as a thread; the death is specific to BIN-JOB CONFIGURATION upstream of the first fetch — whatever distinguishes a bin submission before its first word (the QMA/QMS/QTS tile-memory arming state and its interactions with thread start). Instrument THAT next: the arming-state permutation ladder"
+    } else if fetched {
+        "THREAD 0 FETCHES an RCL-class list but stalled mid-span at the max-in-span offset above — thread start is LIST-CLASS-DEPENDENT: the bin-class death remains upstream of fetch, and the mid-list choke on this leg is a separate localisable fact (an RCL run without render-side plumbing may legitimately choke past the fetch). The class discrimination stands: thread 0 STARTS when the submission is not bin-armed"
+    } else if loaded {
+        "CT0CA LOADED the RCL's queue address — unambiguous on this leg, no prior CT0 kick ever latched this address — but NEVER FETCHED past it: the same loaded-but-never-fetches signature as the bin class. THREAD 0 ITSELF NEVER STARTS regardless of list class — a per-thread enable/power state no register this campaign knows controls. The hunt leaves the core's programming interface: firmware/VPU-side per-thread init is the leading space, and the next discriminator is a piOS register dump taken MID-BIN (the S1S bench ask, v3d.md §45)"
+    } else {
+        "CT0CA NEVER HELD the RCL's queue address at any sample — thread 0 did not even load the swapped queue. THREAD 0 ITSELF NEVER STARTS regardless of list class — a per-thread enable/power state no register this campaign knows controls. The hunt leaves the core's programming interface: firmware/VPU-side per-thread init is the leading space, and the next discriminator is a piOS register dump taken MID-BIN (the S1S bench ask, v3d.md §45)"
+    };
+    serial_println!(
+        ":: V3D: [v3d74a] verdict — store-verified={} FRDONE={} FLDONE={} RFC {:#010x}->{:#010x} (Δ{}) BFC {:#010x}->{:#010x} (Δ{}) | CT0CS kicked={:#010x} done={:#010x} (CTRUN {}->{}) idled={} CT0CA kicked={:#010x} done={:#010x} | sampler: samples={} in-span={} max-in-span={:#010x} vs QBA={:#010x} QEA={:#010x} | INT_STS={:#010x} waited={}us submit_sound={} | poison touched: tile-state={} of {}, pool={} of {} (drain completed={}) | MMU_CTL={:#010x} fault={} — {} ::",
+        verified as u32, frdone as u32, fldone as u32,
+        rfc_pre, rfc_after, rfc_delta,
+        bfc_pre, bfc_after, bfc_after.wrapping_sub(bfc_pre),
+        cs_kicked, cs_done,
+        (cs_kicked & V3D_CLE_CTNCS_CTRUN != 0) as u32,
+        (cs_done & V3D_CLE_CTNCS_CTRUN != 0) as u32,
+        idled as u32,
+        ca_kicked, ca_done,
+        smp_n, smp_in_span, smp_max, ba as u32, ea as u32,
+        sts, us, submit_sound as u32,
+        ts_scan.zeroed + ts_scan.overwritten, ts_scan.words,
+        pool_scan.zeroed + pool_scan.overwritten, pool_scan.words,
+        flush_done as u32,
+        mmu_ctl, (fault != 0) as u32,
+        verdict,
+    );
+    // Leave the field clean: W1C whatever this leg latched (FRDONE on a positive) so no later
+    // reader inherits it, and clear any fault latch the same way every rung does.
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
+    clear_mmu_fault_latch("v3d74a post-kick");
+
+    // ── Leg B: the mirror (BCL-on-CT1) — a DOCUMENTED NO-OP, on the tree's own register map. ──
+    serial_println!(
+        ":: V3D: [v3d74b] bcl-on-ct1 — DOCUMENTED NO-OP, deliberately NOT kicked. The mirror would submit the Empty bin list on CT1's queue with the bin-side memory latches armed as v3d71 does — but the v3d_regs.h map this file transcribed says those latches are THREAD-0-ONLY: CT0QTS(0x15c)/CT0QMA(0x170)/CT0QMS(0x174) have NO CT1 counterparts (0x158 is CT1SYNC, 0x178 is CT1QCFG). Thread 1 has no PTB tile-memory plumbing to arm, so the mirror cannot be expressed — and a bin list reaching START_TILE_BINNING on a thread with no PTB access risks wedging CT1, the ONLY thread this campaign has ever seen retire ([v3d58] xengine) and the working reference every cross-engine verdict rests on. The discriminator is one-sided by hardware design; [v3d74a] carries the verdict alone ::"
+    );
 }
 
 /// Read a little-endian u32 out of the arena at `off` (probe scratch readback).

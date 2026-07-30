@@ -3212,3 +3212,77 @@ Within license: every write is one mainline makes on this path, in mainline's or
 QEMU raspi4b models no V3D: both legs sit behind the hub-identity gate and `UNAOS_V3D_DEEP`, so
 `kernel8-test` green means **no regression and nothing more** — every verdict here is
 metal-attended, read at the next bench boot with `UNAOS_V3D_DEEP=1`.
+
+## 45. Thread 0 or bin class? — the thread-swap discriminator (V3D-74)
+
+The P84 wire established, and this arc does not re-litigate: `[v3d73s]` = the byte-exact mainline
+submit sequence changes **nothing** — the submit interface is exhausted alongside the config space.
+`[v3d73]` cle-progress = CT0's queue **loads** (CA holds our list, CTRUN=1) but the CLE **never
+fetches the first word** — 500 samples, zero movement, the core clocked (703M cycles over the wait)
+and idle. Meanwhile **thread 1 works** on the same CLE hardware: CT1/RCL jobs fetch, execute,
+retire and land byte-verified pixels (`[v3d58]` xengine, banked since M3). Same silicon, two
+threads: one alive, one loaded-but-never-fetches.
+
+Two hypotheses fit, and they send the hunt in opposite directions:
+
+1. **Bin-class lists are dead as a class** — something about a bin submission upstream of the
+   first fetch (the CT0QMA/QMS/QTS tile-memory arming state, or bin-mode selection) kills the
+   fetch before it starts. Then thread 0 *can* fetch, and the next instrument targets whatever
+   distinguishes a bin submission before its first word.
+2. **Thread 0 is dead as a thread** — it never starts regardless of list class: a per-thread
+   enable/power state no register this campaign knows controls. Then the hunt leaves the core's
+   programming interface entirely; firmware/VPU-side per-thread init becomes the leading space.
+
+### 45.1 Leg A — `[v3d74a]` rcl-on-ct0, the swap
+
+Take the minimal render list thread 1 provably executes — the M3 clear-job RCL, the smallest
+retiring rung in the file, byte-verified on metal since M3 — and submit it on **CT0's** queue
+(CT0QBA/CT0QEA), otherwise byte-identical to the retiring CT1 submit: QBA, `dsb`, QEA, `dsb`,
+and **nothing else**. Deliberately no QMA/QMS/QTS arming — that is exactly the bin-class state
+under suspicion, being removed. The `[v3d73]` sampler is armed across the wait; the FLDONE wait
+supplies the ~1 ms tick window (an executing RCL retires with **FRDONE**, not FLDONE, so the wait
+always runs its full ~0.5 s backstop and `FRDONE=1` on the `[v3d44]` timeout line is a *positive*
+reading on this leg). Same `[v3d68]` poison detectors (24 KiB tile-state + 32 KiB pool, drained
+and scanned), plus the clear-job store verify (sentinel-seeded target vs `CLEAR_RGBA`) as the
+strongest possible positive. A bonus of the swap: the RCL's address was never latched into CT0Q*
+by any prior kick, so a `CA==QBA` reading on this leg is unambiguous — the `[v3d73]` stale-word
+trap cannot reproduce here.
+
+Placement: last in the deep ladder, after `[v3d73s]` — leg A latches an RCL-class queue into
+CT0Q*, so every bin-class reading must already be banked before it runs.
+
+### 45.2 Leg B — `[v3d74b]` bcl-on-ct1: a documented no-op, on the tree's own register map
+
+The mirror leg — the Empty bin list on CT1's queue with the bin-side memory latches armed as
+`[v3d71]` does — **cannot be expressed**: the `v3d_regs.h` map this driver transcribed shows the
+bin tile-memory latches are thread-0-only. CT0QTS (0x15c), CT0QMA (0x170) and CT0QMS (0x174)
+have **no CT1 counterparts** — the adjacent slots are CT1SYNC (0x158) and CT1QCFG (0x178).
+Thread 1 has no PTB tile-memory plumbing to arm, so "the bin-side arming, mirrored" is not a
+register sequence that exists; and a bin list reaching `START_TILE_BINNING` on a thread with no
+PTB access risks wedging CT1 — the only thread this campaign has ever seen retire, and the
+working reference every cross-engine verdict (`[v3d58]` xengine, `[v3d64]`/`[v3d66]` render legs,
+`[v3d58]` rerender) rests on. The discriminator is therefore one-sided by hardware design:
+`[v3d74b]` emits the rationale on the wire and kicks nothing; leg A carries the verdict alone.
+
+### 45.3 Reading key
+
+| Wire line | Reading | Consequence |
+|---|---|---|
+| `[v3d74a] … store-verified=1` (or `FRDONE=1` / `RFC Δ>0` / sampler `max-in-span==QEA`) | **thread 0 can fetch and execute** — the render-class list ran on CT0 the moment the bin-class arming was absent | the death is **bin-job-configuration-specific**, upstream of the first fetch; next instrument: the QMA/QMS/QTS arming-state permutation ladder |
+| `[v3d74a] … advanced then stalled mid-span` | thread 0 **fetches** an RCL-class list, then chokes mid-list (an RCL without render-side plumbing may legitimately choke past the fetch) | the class discrimination stands — thread 0 starts when the submission is not bin-armed; the choke offset is a separate localisable fact |
+| `[v3d74a] … CA loaded QBA, never advanced` (unambiguous here — fresh address) | the same loaded-but-never-fetches signature as the bin class, now on a render-class list | **thread 0 itself never starts regardless of list class** — a per-thread enable/power state outside the known register space; the hunt leaves the core's programming interface (firmware/VPU-side per-thread init) |
+| `[v3d74a] … CA never held QBA` | thread 0 did not even load the swapped queue | same verdict, one station earlier |
+| `[v3d74a] … samples=0` or MMU fault latched | instrument failure | INCONCLUSIVE — no verdict; fix before citing |
+
+### 45.4 The S1S bench ask — the piOS dump taken MID-BIN
+
+If leg A reads *thread 0 never starts*, the next discriminator is not a register this driver can
+reach: it is a **piOS register dump captured mid-bin** — the same dump rig as V3D-71's, but
+triggered while a mainline bin job is in flight (between `v3d_bin_job_run`'s QEA write and its
+FLDONE), so the capture shows the CLE/PTB/hub state of a thread 0 that *is* fetching. Diffing
+that against our wedged mid-bin state is the first look at whatever per-thread condition the
+firmware/VPU establishes and we do not. This is the standing bench ask for the S1S sitting.
+
+QEMU raspi4b models no V3D: `[v3d74]` sits behind the hub-identity gate and `UNAOS_V3D_DEEP`, so
+`kernel8-test` green means **no regression and nothing more** — the verdict is metal-attended,
+read at the next bench boot with `UNAOS_V3D_DEEP=1`.
