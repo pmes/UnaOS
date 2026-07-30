@@ -16,11 +16,16 @@
 //! * **Milestone 1 (SDHC-1, shipped)** — discovery only, and STRICTLY read-only: a storage-class
 //!   PCI census (`PciScanner::storage_inventory`) plus a version/capability/present-state read out
 //!   of BAR0. It programmed nothing, so the serial log was evidence about *the machine*.
-//! * **Milestone 2 (SDHC-2, this file)** — bring-up. This driver now WRITES to the controller:
+//! * **Milestone 2 (SDHC-2, shipped)** — bring-up. This driver now WRITES to the controller:
 //!   it claims the function's memory decode, resets the host controller, programs bus power and
 //!   the SD clock, runs the card identification ladder, and reads one block. Milestone 1's witness
 //!   lines are all still emitted, in the same order, before anything is programmed — so a boot log
 //!   from this build is still directly comparable with a milestone-1 log up to the `claim` line.
+//! * **Milestone 3 (SDHC-3, this file)** — multi-block and ADMA2, layered so a failure can be
+//!   attributed. 3a adds CMD18 READ_MULTIPLE_BLOCK still on PIO, so new COMMAND semantics are
+//!   proved against milestone 2's single-block path with no new risk surface at all; only then do
+//!   3b/3c grant Bus Master and put a DMA engine underneath the same command. Milestone 2's
+//!   witness lines are unchanged and still emitted first.
 //!
 //! ## Witness discipline (the rule this project pays for six times over)
 //!
@@ -143,6 +148,10 @@ const INT_ERR_CMD_INDEX: u32 = 1 << 19;
 const INT_ERR_DATA_TIMEOUT: u32 = 1 << 20;
 const INT_ERR_DATA_CRC: u32 = 1 << 21;
 const INT_ERR_DATA_END_BIT: u32 = 1 << 22;
+/// Auto CMD Error (error-half bit 8): the STOP the controller issued on the driver's behalf at the
+/// end of a multi-block transfer failed. Already inside [`INT_ERR_ANY`]'s `0xFFFF_0000` half — it is
+/// named here only so a failure line says *which* error, instead of "other-error".
+const INT_ERR_AUTO_CMD: u32 = 1 << 24;
 /// Any error at all: the summary bit, or any bit of the error half.
 const INT_ERR_ANY: u32 = INT_ERROR_SUMMARY | 0xFFFF_0000;
 
@@ -643,6 +652,10 @@ const fn cmd_word(index: u8, flags: u16) -> u16 {
 
 // --- Transfer Mode (0x0C, 16-bit) fields ------------------------------------------
 const TM_BLOCK_COUNT_EN: u16 = 1 << 1;
+/// Auto CMD12 Enable: the controller issues STOP_TRANSMISSION itself at the end of the transfer.
+/// Only meaningful together with Block Count Enable — the block counter is what tells the
+/// controller *when* the transfer ended.
+const TM_AUTO_CMD12: u16 = 1 << 2;
 const TM_DIR_READ: u16 = 1 << 4; // 1 = card -> host
 const TM_MULTI_BLOCK: u16 = 1 << 5;
 
@@ -750,6 +763,8 @@ fn int_error_name(int: u32) -> &'static str {
         "data-crc"
     } else if int & INT_ERR_DATA_END_BIT != 0 {
         "data-end-bit"
+    } else if int & INT_ERR_AUTO_CMD != 0 {
+        "auto-cmd12"
     } else if int & INT_ERR_ANY != 0 {
         "other-error"
     } else {
@@ -1146,6 +1161,198 @@ pub fn read_block_512(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 }
 
 // ===================================================================================
+// Step 5 — a multi-block read (CMD18), still PIO
+//
+// Milestone 3's first rung, and it deliberately adds NO new risk surface: no DMA, no Bus Master,
+// the same FIFO drain `read_block_512` already proved on metal. What is new is only the COMMAND
+// SEMANTICS — CMD18 with Block Count Enable and Auto CMD12 — so that when ADMA2 is layered on top
+// in the next rung and something breaks, the failure indicts the DMA engine rather than leaving
+// "multi-block" and "DMA" jointly suspect. That is §6.6's own layering argument, applied.
+// ===================================================================================
+
+/// The most 512-byte blocks one CMD18 transfer moves: 64 blocks = 32 KiB. Bounds one transfer's
+/// drain and one ADMA2 descriptor run, and matches the chunk the aarch64 Tegra driver already runs
+/// on metal (`arch::aarch64::sdmmc_tegra`'s `MULTIBLOCK_CHUNK_BLOCKS`).
+const MB_MAX_BLOCKS: u16 = 64;
+
+/// Translate an LBA into the Argument-register value this card expects.
+///
+/// The Argument register is 32 bits, so BOTH addressing modes have a reachability limit and both
+/// are checked rather than truncated: a silently wrapped address reads a real but wrong block. This
+/// mirrors the check inside [`read_block_512`] rather than refactoring it — that function is the
+/// control instrument every comparison below is measured against, and it stays byte-for-byte as
+/// metal verified it.
+fn lba_arg(card: &SdCard, lba: u64) -> Result<u32, BlockError> {
+    if card.block_addressing {
+        u32::try_from(lba).map_err(|_| BlockError::BadLba)
+    } else {
+        let byte_off = lba.checked_mul(512).ok_or(BlockError::BadLba)?;
+        u32::try_from(byte_off).map_err(|_| BlockError::BadLba)
+    }
+}
+
+/// Close a multi-block read that ended badly: CMD12 STOP_TRANSMISSION, then reset the CMD and DAT
+/// circuits, then clear the status word.
+///
+/// The CMD12 is the part that is easy to skip and expensive to have skipped. An aborted CMD18
+/// leaves the CARD in data state, streaming or waiting to stream; the controller-side reset clears
+/// only the HOST's circuits. The next command issued to a card still in data state is rejected for
+/// a reason that has nothing to do with that command — one failure becomes a cascade that indicts
+/// the wrong step, which is exactly the class of misdiagnosis this driver exists to avoid.
+///
+/// CMD12 is R1b (the card asserts busy on DAT0 while it finishes), and `send_command`'s own
+/// Command-Inhibit(DAT) wait on the *next* command absorbs that busy. Every leg is bounded:
+/// `send_command` twice at `CMD_TIMEOUT_MS`, `reset_cmd_dat` at `RESET_TIMEOUT_MS`.
+fn abort_data_transfer(base: u64) {
+    let _ = send_command(base, cmd_word(12, RSP_48_BUSY | CMD_CRC_CHECK | CMD_INDEX_CHECK), 0, false);
+    reset_cmd_dat(base);
+    w32(base, REG_INT_STATUS, 0xFFFF_FFFF);
+}
+
+/// Read `count` contiguous 512-byte blocks starting at `lba` into `buf` via one polled CMD18
+/// READ_MULTIPLE_BLOCK, draining the FIFO block by block. Returns the number of bytes written.
+///
+/// Auto CMD12 is enabled, so the controller issues the closing STOP itself the moment the block
+/// counter reaches zero — which is why Block Count Enable is not optional here: the counter is what
+/// tells the controller when the transfer ended. An Auto-CMD12 failure sets error-half bit 8, which
+/// [`INT_ERR_ANY`] already covers and [`int_error_name`] now names.
+///
+/// Every failure path prints the RAW Interrupt Status word that convicted it and then closes the
+/// card's side with [`abort_data_transfer`], so a failure here cannot poison the next command.
+fn read_blocks_512_pio(lba: u64, count: u16, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let guard = CARD.lock();
+    let card = guard.as_ref().ok_or(BlockError::NotReady)?;
+    read_blocks_pio_on(card, lba, count, buf)
+}
+
+/// [`read_blocks_512_pio`]'s body, against an already-borrowed card. Split out so the dispatcher in
+/// milestone 3c can fall back from ADMA2 to PIO without dropping and retaking `CARD`.
+fn read_blocks_pio_on(
+    card: &SdCard,
+    lba: u64,
+    count: u16,
+    buf: &mut [u8],
+) -> Result<usize, BlockError> {
+    if count == 0 || count > MB_MAX_BLOCKS {
+        serial_println!(
+            "[sdhc-mb] refusing count={} (bound is 1..={}) — a transfer this driver cannot bound \
+             is not issued",
+            count, MB_MAX_BLOCKS
+        );
+        return Err(BlockError::Io);
+    }
+    let n = count as usize * 512;
+    if buf.len() < n {
+        serial_println!(
+            "[sdhc-mb] refusing lba={} blocks={}: caller buffer is {} bytes, {} needed — a short \
+             drain desynchronises the FIFO for every later transfer",
+            lba, count, buf.len(), n
+        );
+        return Err(BlockError::Io);
+    }
+    if lba.checked_add(count as u64).is_none_or(|end| end > card.num_blocks) {
+        return Err(BlockError::BadLba);
+    }
+
+    let base = card.base;
+    let arg = lba_arg(card, lba)?;
+
+    w32(base, REG_INT_STATUS, 0xFFFF_FFFF); // W1C stale status
+    w16(base, REG_BLOCK_SIZE, 512); // bits 11:0 = block length; SDMA boundary bits stay 0 (PIO)
+    w16(base, REG_BLOCK_COUNT, count);
+    // Multi-block, card -> host, block count enabled, auto-CMD12, DMA still disabled. Written
+    // BEFORE the Command register, which is what issues the transfer.
+    w16(
+        base,
+        REG_TRANSFER_MODE,
+        TM_BLOCK_COUNT_EN | TM_DIR_READ | TM_MULTI_BLOCK | TM_AUTO_CMD12,
+    );
+
+    if let Err(int) = send_command(
+        base,
+        cmd_word(18, RSP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA_PRESENT),
+        arg,
+        true,
+    ) {
+        serial_println!(
+            "[sdhc-mb] cmd18 lba={} blocks={} FAILED int={:#010x} ({})",
+            lba, count, int, int_error_name(int)
+        );
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+    // The card answered on the wire; now its own verdict, BEFORE touching the FIFO. A card that
+    // rejected CMD18 never fills the buffer, and draining it anyway would return stale bytes with
+    // an Ok beside them.
+    if let Err(r1) = r1_check(base, "cmd18 read-multiple") {
+        serial_println!("[sdhc-mb] cmd18 lba={} blocks={} rejected by the CARD r1={:#010x}", lba, count, r1);
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+
+    for blk in 0..count as usize {
+        // Buffer Read Ready is re-armed by the controller once per block. It reads 0 both for a
+        // healthy controller mid-block and for one that will never deliver, so only the bounded
+        // wait separates them — and the error half is tested in the same predicate, because a
+        // failing transfer sets an error bit instead of, not before, Buffer Read Ready.
+        if !wait_ms(DATA_TIMEOUT_MS, || {
+            r32(base, REG_INT_STATUS) & (INT_BUF_READ_READY | INT_ERR_ANY) != 0
+        }) {
+            let int = r32(base, REG_INT_STATUS);
+            serial_println!(
+                "[sdhc-mb] cmd18 lba={} blocks={} block {} buffer-read-ready TIMEOUT after {}ms \
+                 int={:#010x} ({})",
+                lba, count, blk, DATA_TIMEOUT_MS, int, int_error_name(int)
+            );
+            abort_data_transfer(base);
+            return Err(BlockError::Io);
+        }
+        let int = r32(base, REG_INT_STATUS);
+        if int & INT_ERR_ANY != 0 {
+            serial_println!(
+                "[sdhc-mb] cmd18 lba={} blocks={} block {} ERROR int={:#010x} ({})",
+                lba, count, blk, int, int_error_name(int)
+            );
+            w32(base, REG_INT_STATUS, int);
+            abort_data_transfer(base);
+            return Err(BlockError::Io);
+        }
+        w32(base, REG_INT_STATUS, INT_BUF_READ_READY); // W1C, re-arm for the next block
+
+        let bo = blk * 512;
+        for i in 0..128usize {
+            let word = r32(base, REG_BUFFER_DATA);
+            let off = bo + i * 4;
+            buf[off..off + 4].copy_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    // Transfer Complete: the controller's Auto CMD12 has closed the card's read.
+    if !wait_ms(DATA_TIMEOUT_MS, || {
+        r32(base, REG_INT_STATUS) & (INT_XFER_COMPLETE | INT_ERR_ANY) != 0
+    }) {
+        let int = r32(base, REG_INT_STATUS);
+        serial_println!(
+            "[sdhc-mb] cmd18 lba={} blocks={} transfer-complete TIMEOUT after {}ms int={:#010x} ({})",
+            lba, count, DATA_TIMEOUT_MS, int, int_error_name(int)
+        );
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+    let int = r32(base, REG_INT_STATUS);
+    w32(base, REG_INT_STATUS, int); // W1C everything we saw
+    if int & INT_ERR_ANY != 0 {
+        serial_println!(
+            "[sdhc-mb] cmd18 lba={} blocks={} transfer ERROR int={:#010x} ({})",
+            lba, count, int, int_error_name(int)
+        );
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+    Ok(n)
+}
+
+// ===================================================================================
 // Step 4b — proving the block is really the card's
 // ===================================================================================
 
@@ -1288,6 +1495,100 @@ fn verify_read(bus: u8, slot: u8, func: u8, num_blocks: u64) {
 }
 
 // ===================================================================================
+// Step 5b — the multi-block witness
+// ===================================================================================
+
+/// Blocks per comparison window. 8 × 512 = 4 KiB: enough that a per-block desynchronisation shows
+/// up, small enough that a failing window prints one line rather than a wall.
+const VERIFY_WINDOW_BLOCKS: usize = 8;
+
+/// The control buffer for a comparison window — filled block by block through the UNMODIFIED
+/// single-block [`read_block_512`], which is what makes it a control.
+static MB_CTL_BUF: Mutex<[u8; VERIFY_WINDOW_BLOCKS * 512]> =
+    Mutex::new([0u8; VERIFY_WINDOW_BLOCKS * 512]);
+
+/// The buffer a multi-block transfer lands in. Sized for a full [`MB_MAX_BLOCKS`] chunk so the
+/// witness never has to be the reason a transfer is short. Static rather than stack, so 32 KiB can
+/// never be a factor in an early-boot stack budget.
+static MB_BUF: Mutex<[u8; MB_MAX_BLOCKS as usize * 512]> =
+    Mutex::new([0u8; MB_MAX_BLOCKS as usize * 512]);
+
+/// First differing (block index, byte offset within that block) between two equal-length windows,
+/// or `None` if they are identical. The EVIDENCE, not a summary of it: a fingerprint mismatch says
+/// only "different", while an offset says whether the transfer lost a block boundary (offset 0 of
+/// some block), a word (offset ≡ 0 mod 4), or a byte.
+fn first_difference(a: &[u8], b: &[u8]) -> Option<(usize, usize)> {
+    for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+        if x != y {
+            return Some((i / 512, i % 512));
+        }
+    }
+    None
+}
+
+/// Read one window twice — once as `VERIFY_WINDOW_BLOCKS` separate CMD17s, once as a single CMD18 —
+/// and compare the two byte for byte.
+///
+/// The single-block path is the control, and it is the control precisely because nothing in
+/// milestone 3 touches it: [`read_block_512`] is byte-for-byte the function metal verified in
+/// milestone 2. So a `match=1` here is not "two runs of the same code agreed" — it is "a transfer
+/// whose command semantics are new agreed with a transfer whose semantics are already trusted".
+///
+/// Reading the log: a healthy card prints `match=1`. If CMD18 never ran at all, the ladder stops at
+/// a named `[sdhc-mb] cmd18 … FAILED` line and **no `match=` line exists** — the two outcomes are
+/// distinguishable in the log, which is the whole point of printing a verdict rather than a status.
+fn verify_multiblock(num_blocks: u64) {
+    let blocks = VERIFY_WINDOW_BLOCKS;
+    if num_blocks < blocks as u64 {
+        serial_println!(
+            "[sdhc-mb] SKIPPED — card holds {} blocks, fewer than the {}-block window",
+            num_blocks, blocks
+        );
+        return;
+    }
+    let n = blocks * 512;
+    let mut ctl = MB_CTL_BUF.lock();
+    let mut mb = MB_BUF.lock();
+
+    for b in 0..blocks {
+        let off = b * 512;
+        if let Err(e) = read_block_512(b as u64, &mut ctl[off..off + 512]) {
+            serial_println!(
+                "[sdhc-mb] control cmd17 lba={} FAILED ({:?}) — the control is unavailable, so no \
+                 comparison is possible; NOT a multi-block verdict",
+                b, e
+            );
+            return;
+        }
+    }
+    let ctl_fnv = fnv1a(&ctl[..n]);
+
+    // Sentinel-fill so "the transfer wrote nothing" cannot masquerade as "the transfer matched" —
+    // a zeroed buffer compared against a zeroed control would.
+    mb[..n].fill(0xA5);
+    if let Err(e) = read_blocks_512_pio(0, blocks as u16, &mut mb[..n]) {
+        serial_println!(
+            "[sdhc-mb] window lba=0 blocks={} cmd18 FAILED ({:?}) — reason named on the line above",
+            blocks, e
+        );
+        return;
+    }
+    let mb_fnv = fnv1a(&mb[..n]);
+
+    match first_difference(&ctl[..n], &mb[..n]) {
+        None => serial_println!(
+            "[sdhc-mb] window lba=0 blocks={} match=1 first-diff=none ctl-fnv={:#018x} mb-fnv={:#018x}",
+            blocks, ctl_fnv, mb_fnv
+        ),
+        Some((blk, off)) => serial_println!(
+            "[sdhc-mb] window lba=0 blocks={} match=0 first-diff=blk{},off{} ctl={:#04x} mb={:#04x} \
+             ctl-fnv={:#018x} mb-fnv={:#018x}",
+            blocks, blk, off, ctl[blk * 512 + off], mb[blk * 512 + off], ctl_fnv, mb_fnv
+        ),
+    }
+}
+
+// ===================================================================================
 // Bring-up
 // ===================================================================================
 
@@ -1338,6 +1639,9 @@ fn bring_up(base: u64, bus: u8, slot: u8, func: u8) -> bool {
     // Verification goes through the PUBLIC read path, after the card is published, so what the
     // witness exercises is exactly what a later caller would get — not a private shortcut.
     verify_read(bus, slot, func, num_blocks);
+
+    // SDHC-3a: multi-block command semantics, measured against that same public single-block path.
+    verify_multiblock(num_blocks);
     true
 }
 

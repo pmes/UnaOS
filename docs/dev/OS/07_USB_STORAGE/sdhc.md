@@ -375,3 +375,76 @@ long before `pci::init`, so a dead or absent controller costs bounded millisecon
 and one named line rather than freezing a serial-less laptop.
 
 `UNAOS_NOSDHCI=1` (§4) is unchanged and remains a QEMU-argument knob only.
+
+## 7. Milestone 3 (SDHC-3) — ADMA2 + multi-block
+
+Milestone 2 stopped at a verified single-block PIO read and said why (§6.6): a DMA
+engine stacked on an unverified PIO path puts two unproven layers into one log, and a
+failure does not say which layer it indicts. Milestone 3 takes that argument
+seriously and applies it to itself. It lands in three rungs, each of which is a
+complete, shippable driver:
+
+| Rung | What is new | What is still trusted from below |
+| --- | --- | --- |
+| **3a** | CMD18 command semantics (multi-block + Auto CMD12) | the FIFO drain, the command layer, PIO |
+| **3b** | Bus Master, a descriptor table, ADMA2 | the CMD18 semantics 3a proved |
+| **3c** | the A/B verdict and the fallback policy | both of the above |
+
+So if 3b's engine misbehaves on metal, 3a's `match=1` line — printed in the *same
+boot*, above it — has already excluded "multi-block is wrong" as the explanation.
+
+### 7.1 Multi-block PIO (the control extended)
+
+`read_blocks_512_pio` issues one CMD18 READ_MULTIPLE_BLOCK for up to
+`MB_MAX_BLOCKS` = 64 blocks (32 KiB), with Block Count Enable, Auto CMD12, and the
+same block-by-block FIFO drain milestone 2 verified. **No DMA, no Bus Master, no new
+grant to the device** — the risk surface added by this rung is exactly the command
+encoding and nothing else.
+
+Three things about it are not cosmetic:
+
+* **Block Count Enable is required, not optional.** Auto CMD12 makes the controller
+  issue the closing STOP_TRANSMISSION itself; the block counter is what tells it when
+  the transfer ended. Enabling the one without the other leaves the card streaming.
+* **Auto CMD12 has its own error bit.** Error-half bit 8 (`INT_ERR_AUTO_CMD`, bit 24
+  of the combined status word) was already inside `INT_ERR_ANY`'s `0xFFFF_0000` mask,
+  so it already convicted; milestone 3 adds it to `int_error_name` so the failure line
+  says `auto-cmd12` instead of `other-error`.
+* **Every failure path closes the CARD, not just the host.** `abort_data_transfer`
+  issues CMD12 and *then* resets the CMD/DAT circuits. The controller-side reset clears
+  only the host's circuits; an aborted CMD18 leaves the card in data state, and the
+  next command issued to it is rejected for a reason that has nothing to do with that
+  command. One failure would become a cascade indicting the wrong step — the exact
+  class of misdiagnosis this driver exists to prevent.
+
+The witness, `verify_multiblock`, runs from `bring_up` right after §6.5's
+verification. It reads LBA 0–7 as **eight separate CMD17s through the unmodified
+public `read_block_512`**, then reads the same eight blocks as **one CMD18**, then
+compares them byte for byte:
+
+```text
+[sdhc-mb] window lba=0 blocks=8 match=1 first-diff=none ctl-fnv=0x................ mb-fnv=0x................
+```
+
+`read_block_512` is byte-for-byte the function milestone 2 verified on metal, and
+milestone 3 does not touch it in any rung. That is what makes this a control rather
+than two runs of the same code agreeing with each other.
+
+Reading the result:
+
+| Log | Meaning |
+| --- | --- |
+| `window … match=1 first-diff=none` | CMD18 delivered the same bytes as eight CMD17s. |
+| `window … match=0 first-diff=blkN,offM` | They ran and disagreed. The offset is the evidence: `off0` of some block means a lost block boundary, `off ≡ 0 (mod 4)` a lost word. |
+| `cmd18 … FAILED int=0x........ (name)` and **no `match=` line at all** | CMD18 never completed. The named reason is on that line; the absence of a verdict line is itself the signal. |
+| `control cmd17 lba=N FAILED` | The control is unavailable, so there is no comparison — reported as such, never as a multi-block verdict. |
+| `SKIPPED — card holds N blocks` | The card is smaller than the 8-block window. |
+
+The destination buffer is pre-filled with a `0xA5` sentinel before the transfer, so
+"the transfer wrote nothing" cannot masquerade as "the transfer matched" — which a
+zeroed buffer compared against a zeroed control would.
+
+All waits are bounded in the same rdtsc units as milestone 2: `DATA_TIMEOUT_MS`
+(200 ms) per block for Buffer Read Ready, `DATA_TIMEOUT_MS` for Transfer Complete,
+and `abort_data_transfer`'s CMD12 and reset are bounded by `CMD_TIMEOUT_MS` and
+`RESET_TIMEOUT_MS` respectively. No unbounded spin is added anywhere.
