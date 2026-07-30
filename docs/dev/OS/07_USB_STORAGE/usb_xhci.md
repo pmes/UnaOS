@@ -3112,6 +3112,9 @@ so captures stay comparable across the arc boundary.
 :: BOT: timeout csw sig=0x… tag=0x… residue=R status=S valid=yes|no — <verdict> result=TIMEOUT-CSW ::
 :: BOT: pump budget=… used=… peak=… … timeouts=… IMAN=0x… USBSTS=0x… result=OK ::
 :: BOT: ring refuse slot=S dci=D dir=… enq=I cycle=C ntrb=N ctxdeq=0x… dcs=B — … ::
+:: BOT: deqprobe slot=S dci=D enq=I running_epstate=E running_ctxdeq=0x… -> stopped_epstate=E
+                 stopped_ctxdeq=0x… stop_ok=yes|no stop_cc=C stop_why=… restore_ok=yes|no
+                 epstate_after=E verdict=… ::
 ```
 
 **Reading key.**
@@ -3120,11 +3123,39 @@ so captures stay comparable across the arc boundary.
   could not print. For **both** bulk DCIs: EP State (§6.2.3: 0 Disabled, 1 Running, 2 Halted,
   3 Stopped, 4 Error), the controller's own TR Dequeue Pointer with its Dequeue Cycle State, and
   **our** enqueue index and cycle bit.
+
+  **`ctxdeq` is only a position when `epstate` is not Running.** (Corrected 2026-07-29 by
+  GUARD-STATE; the original key below was written as if the field were live and is what let the
+  guard be built wrong.) The Output Endpoint Context TR Dequeue Pointer field is written back by
+  the controller on a Running → Stopped/Halted transition, and otherwise set by Configure Endpoint
+  and Set TR Dequeue Pointer (xHCI 1.0 §4.8.3, §6.2.3). While the endpoint is **Running** the
+  field is architecturally undefined; real Intel silicon (Panther Point, xHCI 1.0) leaves it frozen
+  at the last written **birth** value, while QEMU refreshes it live. The line therefore prints
+  `in_ctxdeq=0x… (stale: EP running)` whenever `in_epstate=1`, and the same for `out_`. A tagged
+  reading supports **no verdict at all** — not "the controller is behind us", not "the controller
+  stopped fetching". Get a Stopped-state read first (the recovery ladder's own `stage=stop-ep`
+  line brackets one) and read that.
+
+  With a Stopped(3)/Halted(2) read in hand:
   * `ctxdeq` **behind** our enqueue → the controller never fetched the work. Host/endpoint fault;
     ring surgery is the right family of fix.
   * `ctxdeq` **past** the awaited TRB and `dcs` **agreeing** with our `cycle` → the controller
     fetched and issued everything. The **device** is silent, and no host-side ring surgery can help.
     This is the reading the audit reached by hand; it is now printed.
+* **`deqprobe` (GUARD-STATE)** — the once-per-boot experiment that makes the above a recorded fact
+  on whatever silicon the capture came from, instead of an inference. Fired exactly once, from the
+  plain-success return of `bot_transfer` (a transaction that passed on its first attempt: both rings
+  idle, nothing in flight, no sense handler, no escalation streak), on the bulk IN endpoint. It
+  reads `epstate`/`ctxdeq` while Running, issues **Stop Endpoint**, reads both again from Stopped,
+  then puts the controller back exactly where it said it was (**Set TR Dequeue Pointer** to the
+  value just read, reserved bits 3:1 cleared, DCS kept) and rings the doorbell to return the
+  endpoint to Running. If Stop Endpoint fails it stops there and reports `verdict=inconclusive`;
+  it never leaves an endpoint parked.
+  * `running_ctxdeq != stopped_ctxdeq` → `verdict=ctxdeq-stale-under-running`. The Running read was
+    a birth value. Expected on Panther Point.
+  * `running_ctxdeq == stopped_ctxdeq` → `verdict=ctxdeq-live`. QEMU's reading; its calibration for
+    this arc is `enq=3 running_epstate=1 running_ctxdeq=stopped_ctxdeq stop_cc=1 restore_ok=yes
+    epstate_after=1`.
 * **`foreign=F` (witness 4)** — Transfer Events for **other** slots during **this** wait, measured
   from a baseline snapshotted at pump entry (never the boot-long total: a counter read against its
   own pre-run total is not a rate — the instrument-baseline law). `F > 0` proves the event ring,
@@ -3168,6 +3199,18 @@ that hammers a stalled endpoint is exactly what would step in these traps.
    ladder. **Healthy path unaffected by construction:** each BOT stage is awaited to completion
    before the next is queued, so at most **one** TRB is outstanding on a 16-TRB ring; the refusal
    threshold is 14.
+
+   **GUARD-STATE correction (2026-07-29).** That "by construction" argument was wrong on real
+   silicon, and §14.5 below retracts the claim it supported. `bot_ring_guard` compared our live
+   enqueue against a field that is only meaningful when the endpoint is **not** Running (§14.3's
+   corrected key). On Panther Point the Running read is the frozen birth value, so as soon as our
+   enqueue ran 14 TRBs past the ring base — which a healthy device does in the ordinary course of
+   traffic — `would_lap` returned true and the guard manufactured a `RingFull` on a device that was
+   working perfectly, dragging it into recovery, reset-device, port-cycle and SURRENDER. The guard
+   now reads `ep_state_of` **first** and refuses only from Halted(2), Stopped(3) or Error(4); for a
+   Running endpoint it returns `Ok` unconditionally, which is the pre-M2 behaviour. That is correct
+   and not a retreat: the lap hazard the guard exists for only materialises across recovery retries,
+   and those run against Stopped endpoints — exactly where the guard still applies unchanged.
 2. **`push_noop` hard-coded `cycle=1`.** Today's only caller is the command ring's bring-up probe,
    where the ring is virgin and `cycle_bit` is already true — a no-op for every call the driver
    makes. It was a trap for any later call: after one wrap the hard-coded 1 is the *stale* colour and
@@ -3182,7 +3225,25 @@ that hammers a stalled endpoint is exactly what would step in these traps.
 continuing from wherever a failed transaction left the pointers would leave driver and controller
 disagreeing about both position and colour from the first push.
 
-### 14.5 Blast radius on a healthy device — none, by construction
+### 14.5 Blast radius on a healthy device — RETRACTED, and the honest account
+
+> **Retraction (2026-07-29, GUARD-STATE).** This section previously asserted that BOT-RESCUE could
+> not touch a healthy device "by construction". That was false on metal. The lap guard (§14.4 item 1)
+> was itself the blast radius: it read the Output Endpoint Context TR Dequeue Pointer under a
+> **Running** endpoint, where on Intel Panther Point the field is frozen at its birth value, compared
+> that frozen value against our advancing enqueue, and refused a stage on a perfectly healthy
+> mid-traffic device. The refusal is a `BotError::RingFull`, which is a transport fault, which enters
+> Reset Recovery — and because the guard fires again on the retry for the same reason, the streak ran
+> the full ladder: reset-device, port-cycle, SURRENDER. BOT-RESCUE stormed working disks. Every gate
+> was green throughout, because QEMU refreshes the field live and the guard therefore never misfires
+> in emulation. The bullets below were true of the escalation ladder and false of the guard; the last
+> one is now correct only because GUARD-STATE made it so.
+>
+> The general lesson, recorded because it outlasts this bug: an argument of the form "this can never
+> fire on a healthy device" is a claim about the *reading* the predicate takes, not just about the
+> predicate. It is only as good as the guarantee that the field being read means what the argument
+> assumes — and here nothing in the code or the doc had ever established that. `deqprobe` exists so
+> that assumption is measured on every boot rather than asserted.
 
 * The surrender gate is `bot_surrendered_slot == slot_id`; that field is set **only** by rung (c),
   reachable only after two consecutive failed recovery+retry cycles *and* two failed rungs.
@@ -3192,10 +3253,17 @@ disagreeing about both position and colour from the first push.
 * The `Ok` / `Ok(Failed)` / `Err(NoDevice)` / retry-succeeded returns of `bot_transfer` are the
   pre-arc returns verbatim. The only changed return is the terminal `Err(cause)` after a failed
   recovery, which now pays a back-off first and returns the same error below `N_CONSEC`.
-* The lap guard is two volatile reads and arithmetic before the ring is touched, and returns `Ok` on
-  every healthy transfer.
+* The lap guard is three volatile reads and arithmetic before the ring is touched, and — **since
+  GUARD-STATE, and only since** — returns `Ok` on every healthy transfer, because it now bypasses
+  entirely for a Running endpoint. Before that it was the one thing in this arc that *did* have a
+  blast radius on a healthy device.
 * Witnesses are pure reads — endpoint contexts, ring fields, DRAM behind an invalidate, two MMIO
   reads. No dispatch decision is taken from the foreign-event counter, so event routing is unchanged.
+  The one exception, added by GUARD-STATE and named as such: **`deqprobe` issues commands** (one Stop
+  Endpoint, one Set TR Dequeue Pointer, one doorbell), exactly once per boot, on an idle endpoint
+  immediately after a first-attempt success, and restores the controller to the position it reported.
+  It is a deliberate, bounded, once-only disturbance, and it is the price of not having to infer this
+  class of fact from a rare capture ever again.
 
 ### 14.6 Gates, and what QEMU cannot prove
 
@@ -3207,11 +3275,23 @@ disagreeing about both position and colour from the first push.
 * `./arroyo test-fat sf 300` — the FAT-attached config still loads both ELFs.
 * `strings` on the artifact finds `result=TIMEOUT-PIPES`, `result=TIMEOUT-TRB`,
   `result=TIMEOUT-CSW`, `stage=reset-device`, `stage=port-cycle`, `BOT: SURRENDER`, `ring refuse`.
+* GUARD-STATE re-ran the same set: `./arroyo check` green both arches; `./arroyo test 90` **31 PASS /
+  0 FAIL**; `./arroyo test-fat part 90` **41 PASS / 0 FAIL + 1 LIVE**; `strings` on `kernel.elf`
+  finds `BOT: deqprobe`, `(stale: EP running)` and `ctxdeq-stale-under-running`. The FAT gate ran
+  4005 pump waits with `timeouts=0` and **no `ring refuse` line**.
 
 **QEMU cannot exercise the escalation.** Its `usb-storage` never stalls, so no streak can reach
 `N_CONSEC`, and rungs (a), (b) and (c) — along with the three timeout witness lines and the lap
 refusal — are **never reached** in emulation. This is stated plainly rather than claimed as coverage.
 Only witness 3's healthy baseline is exercised there, and it printed.
+
+**QEMU also cannot prove the GUARD-STATE fix.** Its context TR Dequeue Pointer refreshes live, so the
+guard never misfired there in the first place — every gate was green before the fix and is green
+after it, and that agreement is worth exactly nothing as evidence. The proof is the `deqprobe` line
+on the next metal boot: `verdict=ctxdeq-stale-under-running` establishes the premise on the affected
+silicon, and the absence of a `ring refuse` line across a full FAT workload establishes the
+consequence. QEMU's contribution is the control: it printed `verdict=ctxdeq-live`, which is the
+platform difference itself becoming a recorded fact rather than a surprise.
 
 ### 14.7 What metal must verify
 
@@ -3227,6 +3307,28 @@ Only witness 3's healthy baseline is exercised there, and it printed.
    interrupter *was* globally wedged after all, contradicting the audit.
 5. **Rung (a)'s `cfgep_cc`.** A `cc=19` is expected (§14.1); anything else is new information.
 6. **The desktop stays live** through a disk failure — the whole point.
+7. **`deqprobe`'s verdict** (GUARD-STATE). `ctxdeq-stale-under-running` on Panther Point confirms the
+   premise of the guard fix. `ctxdeq-live` there would mean the s53 capture is explained by something
+   else and the fix, while harmless, is not the whole story.
+8. **No `ring refuse` line on a healthy boot.** This is the fix's actual assertion. Any `ring refuse`
+   now carries `epstate` 2, 3 or 4 by construction, so it is a real finding rather than an artefact.
+
+### 14.8 Still open — each owed its own arc
+
+Two facts about the metal reader survive GUARD-STATE untouched. Neither is explained by the stale-field
+defect, and neither should be quietly absorbed into the story of it.
+
+1. **The pre-guard genuine transient (GR7 era).** On a fixed workload, the reader times out
+   deterministically at **n = 68**, with **~6.4 s of total event silence**, `foreign=0`, and recovery
+   on the ladder's ordinary retry. This predates the lap guard entirely — it is the failure BOT-RESCUE
+   was built to survive, not one BOT-RESCUE caused. Deterministic recurrence at a fixed transaction
+   index is the strongest handle available and has not been pulled; `foreign=0` across the silence is
+   the part that most wants an explanation, since it says the interrupter went quiet globally.
+2. **~9 ms mean per 512-byte transfer.** Two to three orders of magnitude slower than the transfer
+   itself can account for. The shape is SMI-like (long, opaque, host-side stalls), and the xHCI SMI
+   enable bits have been **confirmed clear** — so the obvious suspect is already eliminated and the
+   real source is unidentified. This is a throughput ceiling on all USB storage on this platform, not
+   a correctness bug, which is why it keeps being deferred; it should stop being deferred.
 
 ---
 
