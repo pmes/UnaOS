@@ -4001,6 +4001,12 @@ cost of one extra ~1 ms tick per transaction (§16.6). Its value is evidentiary:
 was consumed" stops being an assumption, which is what would let §16.8's rank-1 hypothesis be
 narrowed to the data TD alone.
 
+**SUPERSEDED (2026-07-30, BOT-CBW).** The experiment ran, on metal, one variable, and came back
+one-sided. It is now the **unconditional** behaviour and the knob is deleted — see
+[§17](#17-bot-cbw--the-straddle-convicted-and-the-cbw-becomes-a-stage-2026-07-30). This paragraph is
+kept as written because the sequence matters: the defect was found by auditing our own claim against
+our own source, and only then tested.
+
 ### 16.4 `ring refuse` — the assertion holds, the sub-claim is unfalsifiable
 
 **Observed.** All 9 `ring refuse` lines (1852, 1882, 2026, 2343, 2582, 2786, 2839, 3188, 3241) are in
@@ -4397,6 +4403,12 @@ correction and neither should be quoted as one:
   made to do what §14.4 item 1 already claimed it did (§16.3). Cost is one extra ~1 ms tick per
   transaction (§16.6). If the onset survives with the CBW *confirmed consumed*, the two-TDs-one-
   doorbell reading is out and the rank-1 hypothesis narrows to the data TD alone.
+  **RESOLVED (2026-07-30) — and the falsifier fired the other way.** The onset did **not** survive:
+  with the CBW confirmed consumed the failure vanished (`n=1108 timeouts=0` against
+  `n=737 timeouts=3`, one variable). The two-TDs-one-doorbell reading is **in**, not out, and this
+  knob is now unconditional behaviour with the feature deleted from the build —
+  [§17](#17-bot-cbw--the-straddle-convicted-and-the-cbw-becomes-a-stage-2026-07-30). `UNAOS_BOTRING64`
+  above remains a default-off diagnostic; ring length was never convicted.
 
 ### 16.13 The standing frame
 
@@ -4407,6 +4419,167 @@ cleanup it was meant to precede, the mean that was one sample — and, in §16.1
 proposed remedy. Hardware blame remains inadmissible on this evidence — UEFI reads this card, through
 this reader, on this port, flawlessly, every boot, and no controlled experiment against the device
 has been run. The null hypothesis is our code until something falsifiable says otherwise.
+
+---
+
+## 17. BOT-CBW — the straddle convicted, and the CBW becomes a stage (2026-07-30)
+
+The onset that §16.8 could only rank has an **experiment against it, and the experiment came back
+one-sided.** `UNAOS_BOTCBWIOC` stops being a knob in this arc: the CBW carries IOC and is awaited as
+its own stage in every build, and the feature is deleted from `Cargo.toml`, `arroyo` and
+`builder/src/main.rs` so that no build can turn it off. This section records what convicted it, what
+it cost, and which of this document's own earlier claims it retires.
+
+### 17.1 The A/B, and why it is a clean one
+
+**Observed.** Two metal boots on the **same tree** (`46f8f37e`), **one variable** — whether the CBW
+is awaited. Both forced the flight recorder's **RESERVATION** path (if `UNAOS.LOG` already exists,
+later boots take write-in-place and never reach the failing code, so this had to be forced or the
+comparison would have been between a run of the mechanism and a run of nothing). Both at ring
+length **16**. Both carried the ONSET-3 ring hardening.
+
+| | CBW awaited | CBW unawaited |
+|---|---|---|
+| awaited stages (`n=`) | **1108** | 737 |
+| `timeouts=` | **0** | **3** |
+| Link crossings (`wrap_push=`) | 81 | 83 |
+| `:: BLK: io-cause …` | none | `op=write lba=33742` |
+
+**Derived, and it is the reason the numbers are worth quoting.** `wrap_push=` is within 2.5% across
+the pair, so the failing boot was not simply the one that crossed more Links; and the passing boot
+moved **50% more** awaited stages while taking **zero** timeouts. A hazard that fires three times in
+737 stages and zero times in 1108 is not a difference in exposure. The denominator problem that made
+every earlier wrap experiment unreadable (§16.8, and the `wrapped_tx=` correction below) is closed
+here by `wrap_push=` being on both lines.
+
+### 17.2 `stopev_res=512` — the device took zero bytes
+
+**Observed.** The onset witness on the failing boot:
+
+```
+resync stopev dci=2 dir=out ev_stopped=1 stopev_n=1 stopev_fresh=yes
+              stopev_dci=2 stopev_trb=0x20212ec0 stopev_res=512
+```
+
+**Derived, from xHCI 1.2 §4.6.9 and §6.4.2.1.** Completion code 26 (Stopped) is posted only for a TD
+the controller had **fetched and was executing**, and the Transfer Event's TRB Transfer Length field
+is the **residue** — the bytes of that TD that did *not* move. A residue of **512 on a 512-byte OUT
+data stage** is the whole TD: the controller had the work, presented it, and the **device accepted
+zero bytes and never entered the data phase.** That is not a lost doorbell, not a lost completion and
+not a bad TRB; it is the **CBW→DATA handoff**.
+
+**Do not conflate this with the CSW-shaped stops.** The same failing boot also carries
+`stopev_res=13` on several **IN**-pipe events. The CSW is 13 bytes, so those are status-stage stops —
+a different phase, and not the onset. **Only the `dci=2 dir=out res=512` line is the onset witness.**
+
+### 17.3 The mechanism
+
+**Inferred from source, and now supported by the A/B.** Before this arc `bot_transfer_once` pushed
+the CBW with `control: 1 << 10` — Normal type, **no IOC, no ISP**, so it posted no completion at all
+— and then pushed the data TRB with **no pump between the two pushes** (§16.3). For an OUT data
+stage `data_dci == out_dci`, so a **single** doorbell covered **both** TDs. At a wrap the two sit on
+opposite sides of a **Link traversal**: CBW near the end of one lap, data TD at index 0 of the next.
+
+So the host had **two TDs outstanding on one endpoint under one doorbell, across a Link**, and held
+**no witness that the CBW was ever consumed**. The device's BOT state machine and ours were free to
+disagree about which phase was current, and §17.2 is what that disagreement looks like from the host
+side: the controller executing a data TD at a device that is still waiting for a command.
+
+**The fix is to remove the straddle, not to reason about it.** The CBW now carries IOC, gets its own
+doorbell, and is pumped to completion before the data stage is *built*. At most one TD is outstanding
+on any endpoint at any time — which is what [§14.4](#144-ring-hygiene-m2) item 1 has claimed since it
+was written and what §16.3 showed was false in the source. `stage=cbw` on a `TIMEOUT-SHAPE` line is
+now a reachable reading, and it means "the device never even took the command".
+
+### 17.4 The cost, stated because it is now permanent
+
+**Derived, from §16.6's calibration.** The pump is polled: `pump_until_bot_done` drains the event
+ring and calls `hlt()`, `IRQ_COUNT=0` on every boot, and the only thing that wakes it is the **1 kHz**
+APIC tick. Every awaited stage therefore costs **at least one ~1 ms tick**. Adding the CBW takes a
+transaction from `T + D` to `2T + D` — one extra tick each, on **every BOT transaction, forever**.
+
+This is not written off as noise and it is not hidden in a knob. It is a real throughput ceiling and
+it is the price of a transport that stays phase-synchronised with a real device; §17.1's right-hand
+column is what the alternative costs. The ceiling itself has a known remedy that is **not** this arc's
+— take the xHCI interrupt instead of polling (§16.6's `IRQ_COUNT=0` and the never-RW1C'd `IMAN=0x3`),
+which would return the cost to interrupt latency for **all three** stages at once.
+
+### 17.5 Corrections this arc makes to its own earlier claims
+
+Recorded in full rather than quietly dropped: three readings that were quoted as evidence in this
+document did not survive the boots that convicted the straddle.
+
+> **RETRACTION (2026-07-30, BOT-CBW). §16.8's rank-1 hypothesis — "the doorbell that must restart
+> the controller across a Link TRB does not take" — is RETIRED.** ONSET-3's recovery posts
+> `ev_stopped=1` (cc=26), which xHCI 1.2 §4.6.9 defines as posted only for a TD **in progress**. The
+> controller had crossed the Link, had **fetched** the data TD, and was owed no further doorbell. A
+> missed or non-taking doorbell is not the mechanism. The onset *shape* §16.8 recorded (OUT, 512 B,
+> `trb_idx=0`, `wrapped=true`, 3 for 3) was real and pointed at the right place; the mechanism
+> inferred from it was wrong. **The Link crossing is where the straddle becomes lethal, not what
+> fails.**
+
+> **CORRECTION (2026-07-30, BOT-CBW). `wrapped_tx=0` never meant "this boot had no Link crossings".**
+> It counts **data-stage pushes landing at index 0** — nothing else. A boot can cross the Link many
+> times and report `wrapped_tx=0` simply because no *data* push happened to be the crossing one. The
+> 64-TRB boot that was read as "the wrap is not causal" had crossings throughout, and moved **more**
+> I/O than the boot that wedged. Link crossings were never eliminated in **any** boot. This is why
+> `wrap_push=` exists and why §17.1 quotes it on both sides: without a count of the crossings
+> themselves the experiment has no denominator and can conclude nothing.
+
+> **CORRECTION (2026-07-30, BOT-CBW). `cc=27` alone proves nothing.** Stopped — Length Invalid was
+> read as a signal in its own right; on the IN pipe it arrived with `gap=0 live=0` and `deq == enq`,
+> i.e. **no TD at all**. The completion code has to be read together with the pipe, the residue and
+> the ring state, which is exactly what `stopev_res=` was added to make possible. `cc=26` with a
+> **full-length residue on a pipe that had a TD** is a finding; a bare code is not.
+
+The standing rule these three share is [§16.9](#169-the-instrument-lie-ledger)'s: a witness is not
+done until someone has stated what it reads in the healthy case, what it reads when the mechanism has
+not run, and shown those differ.
+
+### 17.6 The ring hardening is NOT claimed to explain any capture
+
+**Stated as a boundary on the evidence.** The same ONSET-3 commit shipped two ring changes: the
+**Link TRB is pre-placed at ring construction** (so the last slot is never a stale data slot holding a
+wrong-cycle TRB for most of a lap), and the **payload is written at index 0 before the Link is
+armed** (so the consumer can never be handed a live Link pointing at a slot whose contents are not
+yet there). Both are correctness hardening, both are right on their own terms, and **neither is
+offered as the cure.**
+
+The reason is in §17.1: **the failing boot had them.** The knob-off run carried the pre-placed Link
+and the payload-before-arm ordering and still took three timeouts and still produced
+`op=write lba=33742`. That is what exonerates the ring work as the explanation — and it is the same
+observation that convicts the straddle, because with the ring hardening held constant across the
+pair, the CBW await is the only thing left that changed.
+
+### 17.7 What is a knob, and what is not
+
+* **`UNAOS_BOTRING64` — still a knob, still default-off, unchanged.** The metal evidence never
+  convicted ring length. It grows the storage slot's two bulk rings 16 → 64 TRBs, changing wrap
+  frequency and every wrap position and nothing else. It is a **diagnostic**, and it stays one; the
+  64-TRB boot moved more I/O than the boot that wedged, which is a data point and not a fix.
+* **`UNAOS_BOTCBWIOC` — deleted.** Not defaulted-on: **deleted**, from `Cargo.toml`, `arroyo` and
+  `builder/src/main.rs`. Setting the variable does nothing. A fix that a build flag can switch off is
+  a fix that will eventually ship switched off, and this project has twice shipped media with a knob
+  wired into `arroyo` but not into `builder/` — green everywhere, disabled on the metal, invisible
+  until the boot came back identical.
+* **The KNOBS line keeps a tag for it, because captures are compared across boots.** The third field
+  of `:: BOT: knobs … result=KNOBS ::` now reads **`cbw=always-awaited`** in every build. A log
+  carrying `botcbwioc=off-cbw-unawaited` or `botcbwioc=ON-cbw-awaited` is from **before** this arc,
+  and that is how any future reader dates a capture against this section.
+
+### 17.8 What metal must verify next
+
+1. **The A/B holds at ring 64.** Same forced-reservation workload, CBW awaited, `UNAOS_BOTRING64=1`.
+   Expected: `timeouts=0` with `wrap_push=` roughly a quarter of the ring-16 figure. A timeout here
+   would say the straddle was not the whole mechanism.
+2. **A long run.** §17.1's passing boot is `n=1108`. The failure was ~1 in 250 stages on the failing
+   side, so a clean `n=1108` is roughly a 4× margin — good, not conclusive. A multi-thousand-stage
+   run with `timeouts=0` is what closes [§14.8](#148-still-open--each-owed-its-own-arc) item 1's
+   deterministic-recurrence handle.
+3. **`stage=cbw` has never been printed.** If it ever appears on a `TIMEOUT-SHAPE` line, the device
+   is refusing the command itself and this section's mechanism does not cover it.
+4. **The measured cost.** `mean` on the SUMMARY line should now sit near **three** ticks per
+   transaction rather than two. If it does not, the pump is not doing what §16.6 says it does.
 
 ---
 

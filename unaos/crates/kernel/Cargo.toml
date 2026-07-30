@@ -165,15 +165,10 @@ botfaultinject = []
 # METAL EXPERIMENT ONLY. Default OFF => BOT_RING_TRBS is 16 and the artifact is byte-identical.
 # Enable via `UNAOS_BOTRING64=1`.
 botring64 = []
-# ONSET-2 (M3 knob 2): give the CBW an IOC bit and await it as its own pumped stage — i.e. make the
-# code do what usb_xhci.md §14.4 already claims it does. Today `bot_transfer_once` pushes the CBW
-# with no IOC and no ISP (so it posts no completion at all) and then pushes the data TRB with NO
-# pump between them; on an OUT data stage both TDs ride the same bulk ring under a SINGLE doorbell
-# and nothing ever witnesses that the CBW was consumed. Costs roughly one 1 kHz tick per
-# transaction. If the onset survives with the CBW confirmed consumed, hypothesis 2 is out and
-# hypothesis 1 narrows to the data TD. METAL EXPERIMENT ONLY. Default OFF => the CBW push is
-# byte-identical to the pre-arc one. Enable via `UNAOS_BOTCBWIOC=1`.
-botcbwioc = []
+# (`botcbwioc` lived here. DELETED 2026-07-30: awaiting the CBW as its own stage is now
+# unconditional — see usb_xhci.md §17 and the BOT-CBW block in drivers/xhci/mod.rs. It graduated
+# from experiment to fix on a two-boot metal A/B and there is deliberately no feature left that
+# could turn it back off.)
 # VPERF video-path bench instrumentation (x86_64 only — the module is additionally target-gated,
 # so aarch64 artifacts are byte-identical with this on or off): scroll/VRAM-read/put_pixel
 # counters + serial-only cadence lines, the effective framebuffer memory-type readout (MTRR +

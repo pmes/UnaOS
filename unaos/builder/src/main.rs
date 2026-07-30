@@ -65,14 +65,15 @@ fn main() {
     // UNAOS_BOTFAULT=1 injects ONE synthetic BOT failure (first WRITE(10), CSW stage) so the headless
     // suite exercises the xHCI BOT Reset Recovery path. Test-only; never on boot media.
     if std::env::var("UNAOS_BOTFAULT").is_ok() { feats.push("botfaultinject"); }
-    // ONSET-2 (M3): the two H1 metal experiments. UNAOS_BOTRING64=1 grows the storage slot's two
-    // BULK transfer rings 16 -> 64 TRBs (the one-variable wrap/Link discriminator); UNAOS_BOTCBWIOC=1
-    // gives the CBW an IOC bit and awaits it as its own stage. Both default OFF => byte-identical
-    // media. MAPPED HERE AS WELL AS IN `arroyo` ON PURPOSE: a knob wired into arroyo alone never
-    // reaches the ESP media the metal boot actually runs, which has bitten this project twice — the
-    // boot log's `:: BOT: knobs … result=KNOBS ::` line reports what really compiled in.
+    // ONSET-2 (M3): UNAOS_BOTRING64=1 grows the storage slot's two BULK transfer rings 16 -> 64 TRBs
+    // (the one-variable wrap/Link discriminator). Default OFF => byte-identical media. It remains a
+    // knob because it is a diagnostic, not a fix. MAPPED HERE AS WELL AS IN `arroyo` ON PURPOSE: a
+    // knob wired into arroyo alone never reaches the ESP media the metal boot actually runs, which
+    // has bitten this project twice — the boot log's `:: BOT: knobs … result=KNOBS ::` line reports
+    // what really compiled in.
+    // UNAOS_BOTCBWIOC is DELETED (2026-07-30): the CBW is awaited as its own stage in every build,
+    // unconditionally, and no media can be produced with it off (usb_xhci.md §17).
     if std::env::var("UNAOS_BOTRING64").is_ok() { feats.push("botring64"); }
-    if std::env::var("UNAOS_BOTCBWIOC").is_ok() { feats.push("botcbwioc"); }
     // VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem readout,
     // display-BAR probe, scripted scroll scenario). x86_64-only module; default OFF.
     if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }

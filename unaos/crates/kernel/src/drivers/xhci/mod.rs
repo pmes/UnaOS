@@ -916,22 +916,39 @@ pub const BOT_RING_TRBS: usize = 64;
 const BOT_RING_KNOB_TAG: &str = "botring64=off-16trb";
 #[cfg(feature = "botring64")]
 const BOT_RING_KNOB_TAG: &str = "botring64=ON-64trb";
-#[cfg(not(feature = "botcbwioc"))]
-const BOT_CBWIOC_KNOB_TAG: &str = "botcbwioc=off-cbw-unawaited";
-#[cfg(feature = "botcbwioc")]
-const BOT_CBWIOC_KNOB_TAG: &str = "botcbwioc=ON-cbw-awaited";
+// BOT-CBW (2026-07-30): no longer a knob — a statement of what the driver ALWAYS does. The tag is
+// kept on the KNOBS line because captures are compared across boots and a reader must be able to
+// tell a post-fix artifact from a pre-fix one without diffing the source.
+const BOT_CBWIOC_KNOB_TAG: &str = "cbw=always-awaited";
 
-// **Knob 2 (`botcbwioc`, `UNAOS_BOTCBWIOC=1`): give the CBW IOC and await it as its own stage.**
+// **The CBW is an awaited stage. Unconditionally. This is a fix, and it is convicted on metal.**
 //
-// §14.4 asserts that "each BOT stage is awaited to completion before the next is queued, so at most
-// ONE TRB is outstanding". The source does not do that. `bot_transfer_once` pushes the CBW with
-// `control: 1 << 10` — Normal type, no IOC, no ISP, so it posts no completion at all — and then
-// pushes the data TRB with NO pump between them. For an OUT data stage both TDs ride the same bulk
-// OUT ring under a SINGLE doorbell, and the driver has no witness that the CBW was ever consumed.
-// With this knob the CBW carries IOC and is pumped to completion before the data stage is built, so
-// the code does what the doc already claims. Costs roughly one 1 kHz tick per transaction. Read it
-// as: if the onset survives with the CBW CONFIRMED consumed, hypothesis 2 is out and hypothesis 1
-// narrows to the data TD alone.
+// What it replaces: `bot_transfer_once` used to push the CBW with `control: 1 << 10` — Normal type,
+// no IOC, no ISP, so it posted no completion at all — and then push the data TRB with NO pump
+// between them. For an OUT data stage both TDs then rode the same bulk OUT ring under a SINGLE
+// doorbell, and the driver held no witness that the CBW was ever consumed. §14.4's claim that "each
+// BOT stage is awaited to completion before the next is queued, so at most ONE TRB is outstanding"
+// was false in the source (§16.3). It is true now.
+//
+// THE METAL EVIDENCE (§17). Two boots, same tree, ONE variable (this behaviour), both forcing the
+// flight-recorder RESERVATION path, both at ring=16, both carrying the ONSET-3 ring hardening:
+//
+//     awaited   n=1108 stages, timeouts=0, wrap_push=81, no io-cause
+//     unawaited n=737  stages, timeouts=3, wrap_push=83, io-cause op=write lba=33742
+//
+// and the onset witness on the failing boot, `resync stopev dci=2 dir=out ev_stopped=1
+// stopev_res=512` on a 512-byte OUT data stage: cc=26 is posted only for a TD the controller had
+// FETCHED and was executing (xHCI 1.2 §4.6.9), and a residue equal to the full length says the
+// DEVICE accepted zero bytes and never entered the data phase. That is the CBW->DATA handoff
+// failing, i.e. the straddle: two TDs outstanding on one endpoint under one doorbell, with a Link
+// traversal between them at a wrap. Awaiting the CBW removes the straddle and the failure with it.
+//
+// THE COST, STATED PLAINLY BECAUSE IT IS NOW PERMANENT. The pump is polled and `IRQ_COUNT=0`, so
+// `hlt()` wakes on the 1 kHz APIC tick (§16.6): every awaited stage costs at least one tick. Adding
+// the CBW takes a transaction from `T + D` to `2T + D` — roughly one extra millisecond each. Storage
+// throughput pays for this on every single transaction, forever. It is worth paying: the alternative
+// is a transport that silently desynchronises its phase machine against a real device, and the A/B
+// above is what that costs instead.
 
 // --- PH-2: runtime CHECK CONDITION handling (SCSI SPC-4 §4.5, USB MSC BOT 1.0 §6.5) ---
 //
@@ -5894,10 +5911,12 @@ impl XhciController {
         // the next is queued — mirroring the Linux usb-storage bulk transport. We must NOT
         // pipeline the CSW TRB behind an async data stage: QEMU's usb-storage is a single-
         // packet device, so a CSW IN token arriving while the DATA transfer is still async
-        // is never serviced and the transfer hangs with no completion event. The CBW is
-        // fire-and-forget (the device consumes it before it can respond); the DATA and CSW
-        // stages each carry IOC (1<<5) so their completion posts a Transfer Event (-> MSI ->
-        // the pump wakes). We await the DATA stage, then the CSW — never the CBW directly.
+        // is never serviced and the transfer hangs with no completion event.
+        //
+        // BOT-CBW 2026-07-30: "the CBW is fire-and-forget (the device consumes it before it can
+        // respond)" — which is what this comment used to say — was an assumption the driver never
+        // tested, and metal convicted it (§17). ALL THREE stages now carry IOC (1<<5) and all three
+        // are awaited in order. Nothing is ever queued behind an un-retired TD on the same endpoint.
 
         // BOT-PHASE fix 2 — THE RING GUARD RUNS BEFORE ANYTHING IS PUSHED.
         //
@@ -5929,24 +5948,20 @@ impl XhciController {
         // returns `Ok`), so this is byte-identical in behaviour; it is here so that if it ever can,
         // the transaction fails honestly instead of waiting on a fabricated address.
         //
-        // ONSET-2 (M3 knob 2, `botcbwioc`) — KNOB OFF (the default) this is byte-identical to the
-        // pre-arc push: `control = 1 << 10`, Normal type, no IOC, no ISP, no completion, no wait,
-        // and for an OUT data stage the CBW and the data TD ride the same ring under one doorbell.
-        // KNOB ON, the CBW carries IOC and is pumped to completion before anything else is built,
-        // which is what §14.4 has always claimed the code does.
+        // BOT-CBW: the CBW carries IOC (1<<5) and is pumped to completion before anything else is
+        // built, which is what §14.4 has always claimed the code does and what §17's A/B proved it
+        // must. There is no build that can turn this off.
         let (cbw_trb_phys, cbw_idx, cbw_wrapped) = {
             let ring = self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap();
             let base = ring.get_ptr();
-            let control: u32 = if cfg!(feature = "botcbwioc") { (1 << 10) | (1 << 5) } else { 1 << 10 };
-            let idx = ring.push(Trb { parameter: cbw_phys, status: 31, control })
+            let idx = ring.push(Trb { parameter: cbw_phys, status: 31, control: (1 << 10) | (1 << 5) })
                 .map_err(|_| BotError::RingFull)?;
             (base + (idx as u64) * 16, idx, ring.wrapped_on_last_push())
         };
-        #[cfg(feature = "botcbwioc")]
         {
-            // The CBW becomes a first-class awaited stage: shape record, its own doorbell, its own
-            // pump. `stage=cbw` on a TIMEOUT-SHAPE line is then a reading no capture has ever been
-            // able to produce — "the device never even took the command".
+            // The CBW is a first-class awaited stage: shape record, its own doorbell, its own pump.
+            // `stage=cbw` on a TIMEOUT-SHAPE line is a reading no pre-2026-07-30 capture was able to
+            // produce — "the device never even took the command".
             BOT_LAST_STAGE.store(3, Ordering::Relaxed);
             BOT_LAST_DIR.store(2, Ordering::Relaxed);
             BOT_LAST_LEN.store(31, Ordering::Relaxed);
@@ -5959,10 +5974,6 @@ impl XhciController {
                 return Err(BotError::TransferError(cbw_code));
             }
         }
-        // Knob off: the CBW's address and index are recorded but nothing waits on them, exactly as
-        // before this arc.
-        #[cfg(not(feature = "botcbwioc"))]
-        let _ = (cbw_trb_phys, cbw_idx, cbw_wrapped);
 
         // 2) Data stage (IN or OUT), if any. IOC + ISP (1<<2) so both full and short-packet
         //    completions post an event; wait for it to retire BEFORE queuing the CSW.
@@ -6023,8 +6034,12 @@ impl XhciController {
                 BOT_TX_RD_SECTORS.fetch_add(sectors, Ordering::Relaxed);
             }
 
-            // Ring OUT to fetch+send the CBW; for an IN data stage also ring the IN ring.
-            // (An OUT data stage rides the same OUT ring as the CBW, in order.)
+            // BOT-CBW: the CBW has already rung its own doorbell and RETIRED, so this one announces
+            // the data TD alone — an OUT data stage is the only TD outstanding on the OUT ring, and
+            // that is precisely the straddle §17 convicted. For an IN data stage this OUT doorbell
+            // now has nothing to fetch; it is kept because ringing a drained ring is architecturally
+            // legal and a no-op, and because the knob-ON boot that produced §17's n=1108/timeouts=0
+            // rang it. Changing it would make this build something metal has not run.
             self.bot_doorbell(slot_id, out_dci, false);
             if data_dci != out_dci { self.bot_doorbell(slot_id, data_dci, true); }
 
@@ -6097,12 +6112,10 @@ impl XhciController {
             if !data_out && !data_stalled {
                 dma_coherency::inval(data_phys as usize, data_len as usize);
             }
-        } else if !cfg!(feature = "botcbwioc") {
-            // No data stage: fetch+send the CBW now; the CSW is queued next.
-            // ONSET-2 (M3 knob 2): with `botcbwioc` on, the CBW already had its own doorbell and has
-            // already retired, so this one would ring an empty ring.
-            self.bot_doorbell(slot_id, out_dci, false);
         }
+        // BOT-CBW: there is no `else` arm any more. The no-data-stage path used to ring the OUT
+        // doorbell here to fetch+send the CBW; the CBW now has its own doorbell and has already
+        // retired by this point, so this ring would have been empty.
 
         // Test-only: deterministic synthetic failure at exactly this point (see BOT_FAULT_FIRED).
         // The data stage above really landed, so returning here leaves the device parked in its CSW
@@ -7993,6 +8006,10 @@ impl XhciController {
         // the compiled-in VALUE at runtime, which is the thing that has bitten this project twice —
         // a knob wired into `arroyo` but not into `builder/` ships disabled while every gate stays
         // green. A boot log that does not say `ring_trbs=64` did not run the experiment.
+        // BOT-CBW: `botring64` is still a knob (still default-off, still a diagnostic — the metal
+        // evidence never convicted ring length). The third field is no longer a knob at all: it
+        // reads `cbw=always-awaited` in every build, and its presence is how a capture is dated
+        // against §17. A log still carrying `botcbwioc=` is from before the fix.
         serial_println!(
             ":: BOT: knobs ring_trbs={} {} {} result=KNOBS ::",
             BOT_RING_TRBS, BOT_RING_KNOB_TAG, BOT_CBWIOC_KNOB_TAG);
