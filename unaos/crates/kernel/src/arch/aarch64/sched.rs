@@ -4082,6 +4082,11 @@ pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
         unsafe { (*b.waiters.get()).len() } < WAIT_CAPACITY,
         "futex waiter overflow (raise WAIT_CAPACITY)"
     );
+    // FLUID-3 — the park clock. Opens here (the last instruction before the switch out) and closes
+    // on the first instruction after resume, so it prices the WHOLE invisible interval: blocked in
+    // the bucket, plus `make_ready`-to-dispatch. This is the vug-side wait the P83 idle reserve is
+    // made of; see the ledger above `fluid3_note_park`.
+    let fl3_t0 = super::now_cycles();
     unsafe {
         debug_assert_eq!((*raw).cpu as usize, cpu, "futex_wait: task on the wrong CPU");
         (*raw).state.store(STATE_BLOCKED, Ordering::Release);
@@ -4092,6 +4097,7 @@ pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
         switch_context(&raw mut (*raw).ctx_sp, SCHED[cpu].scheduler_sp.load(Ordering::Acquire));
     }
     // Resumed once `futex_wake` moved us back to our run queue (it released the lock).
+    fluid3_note_park(super::now_cycles().saturating_sub(fl3_t0));
     irq_restore(daif);
     FutexWait::Woken
 }
@@ -4235,6 +4241,60 @@ pub fn futex_parked_total() -> usize {
     }
     irq_restore(daif);
     n
+}
+
+// ---- FLUID-3 — price the futex park (the vug-side wait the load meter proves is real idle) -------
+//
+// P83 bench observation (Peter, live): pointer motion INCREASES a fleet core's idle, and each vug
+// SETTLES to a characteristic fps below available capacity. The SCHED load meter counts service time
+// as busy (`CoreAccount::busy_pct`), so the growing reserve is genuine idle: fleet tasks stop being
+// runnable. The only place a live (non-paused) vug leaves the run queues is `futex_wait` — the frame
+// barrier (`DONE`), the worker release (`PHASE`) and the idle input ring are all futex parks — so the
+// park duration distribution IS the invisible wait this arc exists to price. Measured from just
+// before the context switch out to the first instruction after resume, so it includes wake-to-
+// dispatch latency: exactly the interval the parked core may sit idle while the meter shows reserve.
+//
+// Drained on the `[wcn]`/`[comp2]` cadence by `video::wm`'s `[fluid3]` emit, which pairs it with the
+// present-side concurrency figures. The histogram is log2 in microseconds (bucket b holds parks in
+// [2^(b-1), 2^b) us, top bucket open-ended) — enough to read the modes: a barrier park behind a
+// healthy worker is tens-to-hundreds of us; a park behind a starved worker on a saturated core is
+// milliseconds; an idle vug's input-ring park is seconds and lands in the top bucket.
+const FL3_BUCKETS: usize = 16;
+static FL3_PARK_N: AtomicU64 = AtomicU64::new(0);
+static FL3_PARK_CYC: AtomicU64 = AtomicU64::new(0);
+static FL3_PARK_MAX_CYC: AtomicU64 = AtomicU64::new(0);
+static FL3_HIST: [AtomicU32; FL3_BUCKETS] = [const { AtomicU32::new(0) }; FL3_BUCKETS];
+
+/// FLUID-3 — fold one completed futex park into the window's ledger. Called on the resumed task's
+/// own path with IRQs still masked; three relaxed RMWs and one shift, no locks.
+#[inline]
+fn fluid3_note_park(cyc: u64) {
+    FL3_PARK_N.fetch_add(1, Ordering::Relaxed);
+    FL3_PARK_CYC.fetch_add(cyc, Ordering::Relaxed);
+    FL3_PARK_MAX_CYC.fetch_max(cyc, Ordering::Relaxed);
+    let cyc_per_us = (load_window_cyc().saturating_mul(4) / 1_000_000).max(1);
+    let us = (cyc / cyc_per_us).max(1);
+    let b = ((64 - us.leading_zeros()) as usize).min(FL3_BUCKETS - 1);
+    FL3_HIST[b].fetch_add(1, Ordering::Relaxed);
+}
+
+/// FLUID-3 — drain the park ledger: `(parks, mean_us, max_us, hist)`. The histogram is log2-us as
+/// documented on the statics; the caller (`video::wm::fluid3_emit`) derives percentiles from it.
+pub fn fluid3_drain() -> (u64, u64, u64, [u32; FL3_BUCKETS]) {
+    let n = FL3_PARK_N.swap(0, Ordering::Relaxed);
+    let cyc = FL3_PARK_CYC.swap(0, Ordering::Relaxed);
+    let max = FL3_PARK_MAX_CYC.swap(0, Ordering::Relaxed);
+    let mut hist = [0u32; FL3_BUCKETS];
+    for (i, h) in FL3_HIST.iter().enumerate() {
+        hist[i] = h.swap(0, Ordering::Relaxed);
+    }
+    let cyc_per_us = (load_window_cyc().saturating_mul(4) / 1_000_000).max(1);
+    (
+        n,
+        cyc.checked_div(n).unwrap_or(0) / cyc_per_us,
+        max / cyc_per_us,
+        hist,
+    )
 }
 
 /// KILLBOUND — sweep every wait an EL0 task can be parked in and evict the ones an armed kill names.

@@ -1923,7 +1923,18 @@ fn composite_inner() -> CursorTail {
             dirty[i] = r.used && r.damaged;
             r.damaged = false;
         }
-        (t.rows, dirty, BlitGuard::enter())
+        let guard = BlitGuard::enter();
+        // FLUID-3 — sample the in-flight depth AT registration (self included), under the same
+        // table lock the guard is ordered by. Two relaxed RMWs; see the ledger above `fluid3_emit`.
+        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        {
+            let d = BLIT_ACTIVE.load(core::sync::atomic::Ordering::Relaxed);
+            FL3_DEPTH_MAX.fetch_max(d, core::sync::atomic::Ordering::Relaxed);
+            if d > 1 {
+                FL3_OVERLAP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        (t.rows, dirty, guard)
     };
 
     // Close the damage set upwards over occlusion, to a fixed point (at most MAX_WINDOWS passes).
@@ -3374,6 +3385,68 @@ fn comp2_emit(span: u64) {
     );
 }
 
+// ---- FLUID-3 — the vug-side wait ledger ----------------------------------------------------------
+//
+// P83 (Peter, live): pointer motion grows a fleet core's idle reserve, and each vug settles to a
+// characteristic fps below capacity. The load meter counts service time as busy, so the reserve is
+// REAL idle — fleet tasks leaving the run queues. The present path cannot queue (a present IS its
+// composite, run inline on the caller's core; there is no ack rendezvous to wait on), so the only
+// parks a live vug takes are its futex parks: the frame barrier behind its workers, and the workers
+// behind the next release. This line prices them, beside the present-side concurrency:
+//
+//   * `parks` / `park_us mean/max` / `p50/p90/p99` — completed futex parks this window and their
+//     duration distribution (log2 buckets, computed in `sched::fluid3_drain`). The percentiles are
+//     bucket UPPER bounds. Barrier parks behind healthy workers read tens-to-hundreds of us;
+//     milliseconds here is a parent parked behind a starved worker — the invisible idle the SCHED
+//     load line shows as reserve; the top bucket (>32 ms) is idle vugs on their input rings.
+//   * `depth_max` — high-water of concurrently in-flight composites (`BLIT_ACTIVE` sampled at guard
+//     registration). >1 proves presents do NOT serialize behind one consumer; 1 under a saturated
+//     fleet would mean they do.
+//   * `overlap` — passes that entered with another composite already in flight.
+//
+// aarch64 + witness, drained on the [wcn]/[comp2] cadence. The sched half lives in
+// `arch::aarch64::sched` (`fluid3_note_park` / `fluid3_drain`).
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static FL3_DEPTH_MAX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static FL3_OVERLAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// FLUID-3 — drain both halves of the ledger and print the rollup. Percentile figures are the upper
+/// bound of the log2 bucket in which the cumulative count crossed the mark, in microseconds.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+fn fluid3_emit(span: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let (parks, mean_us, max_us, hist) = crate::arch::aarch64::sched::fluid3_drain();
+    let depth = FL3_DEPTH_MAX.swap(0, Relaxed);
+    let overlap = FL3_OVERLAP.swap(0, Relaxed);
+    if parks == 0 && depth == 0 {
+        return;
+    }
+    let pct = |mark: u64| -> u64 {
+        // Smallest bucket upper bound covering `mark` parks cumulatively; `mark` is 1-based.
+        let mut cum = 0u64;
+        for (b, &h) in hist.iter().enumerate() {
+            cum += h as u64;
+            if cum >= mark {
+                return 1u64 << b;
+            }
+        }
+        1u64 << (hist.len() - 1)
+    };
+    serial_println!(
+        "[fluid3] parks={} park_us mean={} max={} p50<={} p90<={} p99<={} depth_max={} overlap={} span={}ms",
+        parks,
+        mean_us,
+        max_us,
+        pct(parks.div_ceil(2)),
+        pct((parks.saturating_mul(9)).div_ceil(10)),
+        pct((parks.saturating_mul(99)).div_ceil(100)),
+        depth,
+        overlap,
+        span
+    );
+}
+
 // ---- FLICKER-2 — the burst/drain pressure counters ----------------------------------------------
 //
 // Symptom (a) of Peter's P79 sitting is a slight cursor flicker on a ~5 s "pulse" — the cadence of
@@ -3650,6 +3723,9 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     // COMPOSITE-2 — the cost ledger rides the same cadence and the same span.
     #[cfg(target_arch = "aarch64")]
     comp2_emit(span);
+    // FLUID-3 — the wait ledger rides the same cadence and the same span.
+    #[cfg(target_arch = "aarch64")]
+    fluid3_emit(span);
     // FLICKER-2 — stored only when a block actually went on the wire, so `burst_last` names the most
     // recent REAL burst rather than the last silent early-out. On metal this is dominated by the
     // IRQ-masked UART time of the lines above (plus any staged backlog the winning core drained);

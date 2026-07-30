@@ -5791,3 +5791,87 @@ attended sitting.
   witness identity; recorded here so a recurrence is read as a flake candidate, not a surprise).
 * `./arroyo kernel8-test` (default geometry) — MBENCH PASS 87/87.
 * `./arroyo test-arm` — MISSION SUCCESS.
+
+## FLUID-3 — price the wait that motion buys (2026-07-29)
+
+Two live P83 bench observations (Peter, at the panel): **pointer motion increases a fleet core's
+idle** ("when I move the mouse it makes more reserve" — one core sits ~47% busy under a six-vug
+storm while the other three run 99%, and heavy motion windows deepen the reserve), and **each vug
+settles to a characteristic fps below available capacity** ("vug still wants to fall to its
+predetermined fps even though it could run faster"). The SCHED load meter counts service time as
+busy (`CoreAccount::busy_pct`; only placement uses the EL0-only figure), so the reserve is genuine
+idle — fleet tasks leaving the run queues with headroom measurably present.
+
+### What the P83 wire says (`pi4-r23s1r`, six-vug storm stretch)
+
+Correlating `[prio] el0=` per-window (motion proxy: EL0 dispatches spike under pointer events)
+against `SCHED: load`, `[wcn]` rates, `[comp2]` and `[spread9]` over the same windows:
+
+* The aggregate present rate is **conserved at ~258 passes/s** across the storm — quiet windows
+  (`el0` ≈ 0) and heavy-motion windows (`el0` ≈ 1.1 M) alike, `att_rate` 248–262/s, `aborted=0`.
+  One live window alone gets the whole figure (win5 solo: 255/s); six share it.
+* The shares are wildly unequal and stable over minutes: win1/2/4 ≈ 19–21/s, win3 ≈ 50/s,
+  win5/6 ≈ 71–80/s. Same binary, same class — the settled "predetermined fps" Peter feels.
+* One core holds a ~44–48% busy reserve in every storm window; under sustained motion the busy
+  cores sag from 99% to ~84% and the reserve core dips as low as 23% busy (motion window
+  `el0=589k`: c2=23%) — motion buys REAL idle while `att_rate` holds. Quiet mean total busy
+  336/400, motion mean 327/400 across the stretch, with the deep sags exclusively in motion
+  windows.
+* `[spread9] kick` deltas: ~4/window quiet vs ~13/window motion, both trivial against ~1290
+  passes/window — **H2 (preemption storm) refuted**.
+* `[comp2] sprite_us=1` per pass throughout motion windows — **H3 (compose-through cost)
+  refuted**.
+
+### What the code says (H1, corrected)
+
+`SYS_WIN_PRESENT` → `wm::present` → `composite()` runs the full pass **inline on the presenting
+task's own core** and returns when it finishes. There is no present queue, no single consumer, and
+no ack rendezvous: the "ack" IS the synchronous return, so (a) a vug's next frame is gated on its
+own composite completing — ~2.5 ms of service time per frame at fleet damage sizes — and nothing
+else. (b) The `[sched6]` "dirty-paced strip@250ms" cadence belongs to the shell's `render_service`
+strip repaint only; nothing batches or quantizes per-window presents. (c) The symmetry break
+between a 19 fps and an 80 fps window is therefore NOT in the present path (which is symmetric and
+first-come-first-served): the remaining pace-setter is where a live vug is allowed to leave the run
+queue at all — its futex parks (frame barrier `DONE` behind its two workers, workers on `PHASE`),
+crossed with placement packing. A parent whose workers sit deep in a saturated core's run queue
+parks for milliseconds per frame; that park is the reserve the load meter shows, and its duration —
+not any fps target (the vug has none) — is the settled rate.
+
+### The instrument: `[fluid3]` (aarch64 + witness; `video/wm.rs` + `arch/aarch64/sched.rs`)
+
+One line per `[wcn]`/`[comp2]` window:
+
+    [fluid3] parks=N park_us mean= max= p50<= p90<= p99<= depth_max= overlap= span=..ms
+
+* `parks` / `park_us` / percentiles — completed futex parks and their duration distribution
+  (log2-µs buckets, park-to-first-dispatch, stamped around `switch_context` in `futex_wait`).
+  Percentile figures are bucket upper bounds. Expected modes: tens-to-hundreds of µs = barrier
+  behind healthy workers; **milliseconds = a parent starved behind a packed worker — the P83
+  mechanism if confirmed**; >32 ms (top bucket) = idle vugs parked on input rings.
+* `depth_max` / `overlap` — high-water of concurrently in-flight composites (`BLIT_ACTIVE` at
+  guard registration) and passes that entered with another in flight. `depth_max>1` under storm
+  proves presents overlap rather than serialize behind one consumer.
+
+### The two fix directions (priced, not chosen — the frame-pacing contract is Peter's)
+
+* **Async present** — enqueue damage and return; a dedicated service performs passes. Decouples the
+  vug's frame loop from the pass cost entirely (each vug pays raster only; the ~2.5 ms moves to a
+  service core). Cost: breaks the WC-G/tearing invariant that the owner is parked inside
+  `SYS_WIN_PRESENT` while its surface is read — the one moment the surface is provably quiescent —
+  so it needs double-buffered surfaces or a copy, and it changes the barrier semantics VUG-PACE
+  deliberately preserved.
+* **Per-window fair compositor service** — keep the synchronous shape but make pass inclusion fair
+  across windows (e.g. round-robin damage service) so no window's share collapses to 19/s while a
+  sibling holds 80/s. Cost: adds a scheduler-like policy to the compositor; does not return the
+  parked milliseconds (the barrier park remains), only redistributes them.
+
+If `[fluid3]` shows the millisecond mode riding motion windows on the parents of the slow windows,
+the shares are a placement/park story and the second option is the wrong lever entirely — the fix
+is worker co-placement (keep a vug's workers adjacent to its parent), which is scheduler-side and
+in reach without touching the present contract.
+
+### Gate results (FLUID-3, 2026-07-29, QEMU raspi4b)
+
+* `./arroyo check` — both arches green.
+* `./arroyo kernel8-test` — MBENCH PASS 88/88.
+* `./arroyo test-arm` — MISSION SUCCESS.
