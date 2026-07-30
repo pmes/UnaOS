@@ -2162,6 +2162,40 @@ fn tail_of(disturbed: bool, session: bool) -> CursorTail {
 ///
 /// A guarded-out window still EMITS — a `-> SKIP` line naming the reason — so the one-shot latch is never
 /// burned silently. A gate whose REQUIRE fails then has a line saying why, instead of nothing at all.
+///
+/// ### WCD-LIVE — the reference must hold still (lift of x86 76c724d6)
+/// Both passes derive the expected pixel from the SOURCE surface, which makes that surface the instrument's
+/// reference — and that surface is EL0-writable. A single-threaded app is quiescent inside `present`, so the
+/// reference is a constant and the comparison is sound. A multi-threaded one is not: sibling threads keep
+/// painting while verify reads, and the witness compares scan-out against source bytes that were never
+/// blitted. The tell is `bad_cache != bad_ram` — the two passes disagreeing with each OTHER, which no blit
+/// defect can produce, since the blit is over before either pass starts — with counts that reshuffle every
+/// run. The exposure is not closed by the app's own frame barrier either: verify runs from ANY pass that
+/// repaints these rows (a neighbour's present growing the dirty set, a desktop flush, a cursor repaint),
+/// and the one-shot latch is claimed by whichever reaches it first.
+///
+/// Two corrections, doing two different jobs:
+/// 1. **One source read.** The verdict used to take three independent reads of a mutable surface (pass 1,
+///    post-`IVAC` pass 2, and the checksum inside the print), so the two counts could differ with no cache
+///    story at all. The source rect is now snapshotted ONCE and both passes compare against that single
+///    `want`-stream. The two-pass design is a claim about the DESTINATION's cache state and never wanted the
+///    source re-read; with the snapshot, a surviving `bad_cache != bad_ram` is again a real one.
+/// 2. **A liveness bracket.** The snapshot makes the passes self-consistent but cannot make a mid-flight
+///    snapshot equal to what was blitted a moment earlier, so it does not make the verdict *earned*. The
+///    surface checksum is therefore read before the snapshot and again after the passes; unequal means EL0
+///    repainted during the verdict, and the verdict is emitted as a third, distinct label:
+///    `-> LIVE (unverifiable)`. That is reported instead of PASS *and* instead of FAIL, because a moving
+///    reference earns neither. It is never counted red: a live surface is a fact about the app, not a
+///    defect in the compositor. The counts stay printed so the disagreement stays inspectable.
+///
+/// LIVE counts as neither PASS nor FAIL; a REQUIRE asserting the LIVE line for a threaded app would be a
+/// deliberate spec change neither seat has made.
+///
+/// The owner's-own-present gate was deliberately NOT taken: owner presents are not quiescent either with
+/// free-running workers, and re-gating the one-shot VERIFIED latch would move clean verdicts.
+///
+/// A quiescent surface brackets equal and snapshots to exactly the bytes it would have re-read, so
+/// single-threaded verdicts are byte-identical to before.
 #[cfg(feature = "witness")]
 fn verify_window(fb: &super::FrameBuffer, r: &Window) {
     let info = fb.info();
@@ -2177,20 +2211,51 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
         return;
     }
 
-    let pass = |fb: &super::FrameBuffer| {
+    // WCD-LIVE, opening bracket. The snapshot below makes the two passes AGREE with each other, but it
+    // cannot make a mid-flight snapshot equal to what `draw_window` actually blitted — so it removes the
+    // instrument's self-contradiction without making the verdict earned. This checksum, read here and again
+    // after the passes, is what decides whether it WAS earned: unequal means EL0 repainted the surface
+    // during the verdict, so the reference moved and neither PASS nor FAIL is a statement about the blit.
+    let cksum_pre = surface_checksum(r);
+
+    // WCD-LIVE — read the SOURCE exactly ONCE, into a snapshot both passes share. Before this, a verdict
+    // took three independent reads of an EL0-mutable surface (pass 1, post-IVAC pass 2, and the checksum in
+    // the print), so `bad_cache` and `bad_ram` could differ purely because they had read different bytes —
+    // no cache story required. The two-pass design is a claim about the DESTINATION's cache state; nothing
+    // in it wants the SOURCE re-read. One `want`-stream restores that: any surviving `bad_cache != bad_ram`
+    // is now a real statement about scan-out memory. `cols * rows * 4` bytes — 64 KiB at the 128x128
+    // fixture — paid once per window id under `witness`.
+    let mut want_buf: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    if want_buf.try_reserve_exact(rows * cols).is_err() {
+        serial_println!(
+            "[wc-d] verify win={} -> SKIP (no memory for {}x{} source snapshot)",
+            r.id, cols, rows
+        );
+        return;
+    }
+    {
         let surf = r.surf as *const u8;
-        let mut checked = 0usize;
-        let mut bad = 0usize;
-        let mut nonzero = 0usize;
-        let mut first = (0usize, 0usize, 0u32, 0u32);
         for row in 0..rows {
             let row_base = row * r.stride;
             for col in 0..cols {
                 // SAFETY: identical bound to `draw_window`'s read — `row < surf_len / stride` and
                 // `col < stride / 4`, so `row_base + col * 4 + 4 <= surf_len`.
-                let want =
+                want_buf.push(
                     unsafe { core::ptr::read_unaligned(surf.add(row_base + col * 4) as *const u32) }
-                        & 0x00FF_FFFF;
+                        & 0x00FF_FFFF,
+                );
+            }
+        }
+    }
+
+    let pass = |fb: &super::FrameBuffer| {
+        let mut checked = 0usize;
+        let mut bad = 0usize;
+        let mut nonzero = 0usize;
+        let mut first = (0usize, 0usize, 0u32, 0u32);
+        for row in 0..rows {
+            for col in 0..cols {
+                let want = want_buf[row * cols + col];
                 for sy in 0..r.scale {
                     let dy = r.y + row * r.scale + sy;
                     for sx in 0..r.scale {
@@ -2234,22 +2299,35 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
     }
 
     let (_, bad_ram, _, first_ram) = pass(fb);
-    let ok = bad_cache == 0 && bad_ram == 0;
-    let first = if bad_cache > 0 { first_cache } else { first_ram };
     // `cksum` is the `[wc-c]` FNV over the SOURCE slot, carried here so a verdict is content-aware: without
     // it a blank surface blitted faithfully onto a blank rect is a PASS indistinguishable from a verified
-    // crystal. `nonzero` is the same question asked of the DESTINATION.
-    if ok {
+    // crystal. `nonzero` is the same question asked of the DESTINATION. WCD-LIVE also makes it the closing
+    // bracket of the liveness check — the same number, read twice.
+    let cksum = surface_checksum(r);
+    let live = cksum != cksum_pre;
+    let ok = bad_cache == 0 && bad_ram == 0;
+    let first = if bad_cache > 0 { first_cache } else { first_ram };
+    if live {
+        // WCD-LIVE — the reference moved, so NEITHER verdict was earned: a `FAIL` here would accuse the
+        // compositor of a mismatch the witness manufactured, and a `PASS` would be luck. Report the fact
+        // instead, with the counts kept visible so the disagreement stays readable. Distinct label, never
+        // red: a live surface is a property of a multi-threaded app, not a defect.
+        serial_println!(
+            "[wc-d] verify win={} surf={}x{} scale={}x at ({},{}) panel={}x{} checked={} bad_cache={} bad_ram={} nonzero={} cksum={:#018x} cksum_pre={:#018x} -> LIVE (unverifiable)",
+            r.id, r.w, r.h, r.scale, r.x, r.y, info.width, info.height,
+            checked, bad_cache, bad_ram, nonzero, cksum, cksum_pre
+        );
+    } else if ok {
         serial_println!(
             "[wc-d] verify win={} surf={}x{} scale={}x at ({},{}) panel={}x{} checked={} bad_cache=0 bad_ram=0 nonzero={} cksum={:#018x} first=none -> PASS",
             r.id, r.w, r.h, r.scale, r.x, r.y, info.width, info.height,
-            checked, nonzero, surface_checksum(r)
+            checked, nonzero, cksum
         );
     } else {
         serial_println!(
             "[wc-d] verify win={} surf={}x{} scale={}x at ({},{}) panel={}x{} checked={} bad_cache={} bad_ram={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
             r.id, r.w, r.h, r.scale, r.x, r.y, info.width, info.height,
-            checked, bad_cache, bad_ram, nonzero, surface_checksum(r),
+            checked, bad_cache, bad_ram, nonzero, cksum,
             first.0, first.1, first.2, first.3
         );
     }
