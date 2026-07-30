@@ -906,8 +906,39 @@ static F2_SESS_UNDRAWS: AtomicU64 = AtomicU64::new(0);
 static F2_SESS_PX: AtomicU64 = AtomicU64::new(0);
 /// FLICKER-2 — full undraws that could not read `OVERLAY` (`try_lock` contended) and fell back to
 /// `sp.saved` for one undraw. Bounded staleness, counted rather than waited out.
+/// FLICKER-3 — the masked path (`undraw_within_locked`) now feeds this too, for the same fallback.
 #[cfg(feature = "witness")]
 static F2_SESS_LOCKMISS: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-3 — masked undraws (`undraw_within_locked`) that found a coherent open overlay session
+/// and restored covered pixels from the LAYER save. Before this arc every one of these restored
+/// `sp.saved` — the pre-present frame — into a live window: the P80 residual (b) mechanism.
+#[cfg(feature = "witness")]
+static F2_MASK_SESS: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-3 — desktop presents (`Screen::flush`) that met a live, visible sprite (or a pending
+/// whole-panel present) and took the CURSOR-13 bracket: one whole-sprite restore→redraw each.
+#[cfg(feature = "witness")]
+static F2_FLUSH_UNDRAWS: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-3 — desktop presents whose damage set was provably disjoint from the live sprite and
+/// left it on glass. On an attended boot with the pointer parked away from the status strip this
+/// should dominate `flush_undraw`: the strip's per-second bars band is the dominant desktop damage.
+#[cfg(feature = "witness")]
+static F2_FLUSH_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+/// FLICKER-3 — record `Screen::flush`'s bracket decision for a LIVE, VISIBLE sprite. The legacy
+/// always-bracket classes (no sprite on glass, visibility lapsed, `is_ready` fallbacks) are not
+/// counted: they cannot blink an arrow the operator can see, and counting them would drown the one
+/// ratio this discriminator exists to put on the wire — how often a desktop present (the core-load
+/// bars, chiefly) takes the sprite down versus leaves it alone.
+pub fn note_flush_bracket(taken: bool) {
+    #[cfg(feature = "witness")]
+    if taken {
+        F2_FLUSH_UNDRAWS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        F2_FLUSH_SKIPS.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "witness"))]
+    let _ = taken;
+}
 
 /// FLICKER-2 — the arc's rollup, one line beside the other cursor rollups. The `wm`-side figures
 /// (drain shape and `[wcn]` burst wall time) arrive as arguments; everything else is this module's.
@@ -930,6 +961,9 @@ pub fn flick2_rollup(
     let sess = F2_SESS_UNDRAWS.load(Ordering::Relaxed);
     let sess_px = F2_SESS_PX.load(Ordering::Relaxed);
     let lockmiss = F2_SESS_LOCKMISS.load(Ordering::Relaxed);
+    let mask_sess = F2_MASK_SESS.load(Ordering::Relaxed);
+    let flush_undraw = F2_FLUSH_UNDRAWS.load(Ordering::Relaxed);
+    let flush_skip = F2_FLUSH_SKIPS.load(Ordering::Relaxed);
     let verdict = if !armed() {
         "UNWITNESSED"
     } else if down_max >= F2_DOWN_SLOW_MS {
@@ -938,9 +972,9 @@ pub fn flick2_rollup(
         "OK"
     };
     serial_println!(
-        "[flick2] scope={} down_max={}ms down_slow={} down_last_at={}ms sess_undraws={} sess_px={} sess_lockmiss={} drains={} drain_skip={} drain_masked={} burst_last={}ms burst_max={}ms -> {}",
-        scope, down_max, slow, last_at, sess, sess_px, lockmiss, drains, drain_skips, drain_masked,
-        burst_last_ms, burst_max_ms, verdict
+        "[flick2] scope={} down_max={}ms down_slow={} down_last_at={}ms sess_undraws={} sess_px={} sess_lockmiss={} mask_sess={} flush_undraw={} flush_skip={} drains={} drain_skip={} drain_masked={} burst_last={}ms burst_max={}ms -> {}",
+        scope, down_max, slow, last_at, sess, sess_px, lockmiss, mask_sess, flush_undraw,
+        flush_skip, drains, drain_skips, drain_masked, burst_last_ms, burst_max_ms, verdict
     );
 }
 
@@ -1835,6 +1869,35 @@ fn undraw_within_locked(
     let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
     let mut off = sp.off;
     let mut handed_back = 0usize;
+    // FLICKER-3 — FLICKER-2's session-fresh restore, lifted to the masked path. The interleave is
+    // `undraw_locked`'s exactly, one entry point over: pass A owns the session, `compose_into` has
+    // delivered the arrow inside A's freshly presented rows (`ov.saved` holds the window's NEW frame
+    // under each covered pixel), and `adopt_overlay`'s install has not yet moved that into
+    // `sp.saved`. A masked undraw arriving in that window — the sessionless composite arm or the
+    // WC-L drain, i.e. exactly `undraw_within_nosession`'s two callers — finds the panel holding our
+    // colour (A put it there), passes the colour guard, and before this arc restored `sp.saved`:
+    // LAST frame's window content, stamped into a live window under the pointer. That is the P80
+    // residual (b) — occasional because it needs a concurrent pass inside A's compose-to-install
+    // window, and the P80 wire's `sess_lockmiss=0` had already exonerated the other suspect (the
+    // `try_lock` fallback never fired). Same fix, same lock order (`SPRITE` → `OVERLAY`), same
+    // `try_lock`-never-block discipline; a contended read falls back to the old behaviour for one
+    // undraw and is counted in the shared `sess_lockmiss`. The caller's conditional generation bump
+    // is untouched — a handback still retires A's session, which then refreshes whole-sprite.
+    let ov = OVERLAY.try_lock();
+    let sess = ov.as_ref().filter(|g| {
+        g.session
+            && g.epoch == sp.epoch
+            && (g.bx, g.by, g.bw, g.bh, g.s) == (bx, by, bw, bh, s)
+    });
+    #[cfg(feature = "witness")]
+    {
+        if ov.is_none() {
+            F2_SESS_LOCKMISS.fetch_add(1, Ordering::Relaxed);
+        }
+        if sess.is_some() {
+            F2_MASK_SESS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     {
         let saved = &sp.saved;
         for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
@@ -1846,11 +1909,22 @@ fn undraw_within_locked(
             // has already taken is theirs, and putting our saved value back would be the stale
             // restore. The bit is set either way — guarded or not, this pixel is no longer ours.
             if i < saved.len() && fb.read_pixel(x, y) == Some(color) {
-                fb.put_pixel(x, y, saved[i]);
+                let under = match sess {
+                    // FLICKER-3 — the layer's save is this pixel's CURRENT under-content (the
+                    // window's just-presented frame); `sp.saved[i]` describes the frame before it.
+                    Some(g) if g.covered.get(i) && i < g.saved.len() => {
+                        #[cfg(feature = "witness")]
+                        F2_SESS_PX.fetch_add(1, Ordering::Relaxed);
+                        g.saved[i]
+                    }
+                    _ => saved[i],
+                };
+                fb.put_pixel(x, y, under);
             }
             off.set(i);
         });
     }
+    drop(ov);
     sp.off = off;
     flush_box(&fb, by, bh);
     (if touched { Some((bx, by, bw, bh)) } else { None }, handed_back)

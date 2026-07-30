@@ -680,6 +680,8 @@ impl Screen {
     ///   path — the desktop is not a staged surface — so a bracket here costs exactly one
     ///   restore/save/draw per present and buys coherence. `cursor::note_desktop_over_sprite`
     ///   (CURSOR-6) remains what it always was: a hole detector for THIS bracket, expected 0.
+    ///   FLICKER-3 — the bracket is now taken only when the present can reach the sprite; see
+    ///   [`Self::bracket_needed`] for the decision and for the classes that keep it unconditionally.
     /// * **The composite below runs with the sprite ON GLASS.** `sprite_plan()` returns a real plan,
     ///   so the pass takes the machinery that already exists: a staged window composes the arrow into
     ///   its own rows (`compose_into`/`adopt_overlay`), CURSOR-11's pend class defers the handback
@@ -696,12 +698,31 @@ impl Screen {
     /// `TOUCHED_SINCE_DRAW` is untouched: a present landing under a live sprite still arms the
     /// repair through `note_present_over_sprite`, and it now has a live sprite to arm it for.
     pub fn flush(&mut self) {
-        // CURSOR-13 — the DESKTOP bracket. Opens here, closes before the window layer is touched.
-        super::cursor::undraw();
+        // FLICKER-3 — the CURSOR-13 bracket is owed only when this present can actually REACH the
+        // sprite. It used to be unconditional: every desktop present — chiefly the status strip's
+        // per-core load bars, a one-line band at the panel bottom repainting about once a second —
+        // took the whole sprite down and redrew it, wherever the pointer stood. That is P80's
+        // "the core idle bars cause mouse to flicker when they move", and it is the same shape
+        // FLICKER-2 removed from `drain_deferred`: a whole-sprite bracket paid for paint that can
+        // never touch a sprite pixel. The undraw's one justification — hand a pixel back before a
+        // painter in THIS operation overwrites it — applies only when some damage rect meets the
+        // sprite's box, so `bracket_needed` tests exactly that and a disjoint present leaves the
+        // arrow on glass entirely. The decision's snapshot can be one pointer report stale, with the
+        // same degradation `drain_deferred` argues: a sprite that moved INTO the damage mid-present
+        // is re-established by the mover's own `repaint`, and `present_background`'s CURSOR-6 probe
+        // (`note_desktop_over_sprite`) now doubles as the detector for that race — a blit that lands
+        // on a live sprite is counted there, on either path.
+        let bracket = self.bracket_needed();
+        if bracket {
+            // CURSOR-13 — the DESKTOP bracket. Opens here, closes before the window layer is touched.
+            super::cursor::undraw();
+        }
         let intruded = self.present_background();
         // CURSOR-13 — bracket CLOSED. Everything below composites with the arrow on the panel, which
-        // is the whole point of this arc: `sprite_plan()` must be able to answer.
-        super::cursor::repaint();
+        // is the whole point of that arc: `sprite_plan()` must be able to answer.
+        if bracket {
+            super::cursor::repaint();
+        }
         // Only when background pixels actually landed ON a window — which, with the subtraction in
         // place, is the fallback path only. `repaint` self-guards on there being a window layer to
         // restore (one table-lock acquisition, then out).
@@ -710,6 +731,49 @@ impl Screen {
         } else {
             super::wm::service_damage();
         }
+    }
+
+    /// FLICKER-3 — does this present owe the sprite the CURSOR-13 bracket?
+    ///
+    /// The skip is deliberately narrow: it is taken ONLY for a sprite that is on glass, currently
+    /// visible, with no whole-panel present pending and every damage rect disjoint from its box —
+    /// i.e. exactly the class where the bracket restores and redraws an arrow nothing in this
+    /// present can touch. Every other class keeps the bracket it has always had:
+    ///
+    /// * **No sprite on glass** — the undraw is a no-op, but the repaint may owe a DRAW (this is
+    ///   the desktop-cadence recovery path for a sprite something took down without a tail), so it
+    ///   stays.
+    /// * **Visibility lapsed (CURSOR-HIDE)** — this bracket's repaint at desktop cadence is what
+    ///   takes a timed-out sprite off the panel; skipping here would leave a parked arrow standing
+    ///   past its 1.5 s.
+    /// * **`FULL_PRESENT` pending** — the present's paint set is the whole panel; every sprite
+    ///   pixel is in it. Read with `load`, not `swap`: consuming the flag is `present_background`'s
+    ///   job and it must still see it.
+    ///
+    /// Only the live-sprite decision is counted (`[flick2] flush_undraw=`/`flush_skip=`): the
+    /// legacy classes cannot blink an arrow the operator can see, and counting them would bury the
+    /// discriminator this exists to put on the wire.
+    fn bracket_needed(&self) -> bool {
+        let Some((sx, sy, sw, sh)) = super::cursor::sprite_box() else {
+            return true;
+        };
+        if !crate::pal::cursor::visible() {
+            return true;
+        }
+        let taken = FULL_PRESENT.load(core::sync::atomic::Ordering::Acquire)
+            || (0..self.damage.len).any(|i| {
+                let d = self.damage.rects[i];
+                let x1 = d.x1.min(self.info.width);
+                let y1 = d.y1.min(self.info.height);
+                d.x0 < x1
+                    && d.y0 < y1
+                    && d.x0 < sx + sw
+                    && sx < x1
+                    && d.y0 < sy + sh
+                    && sy < y1
+            });
+        super::cursor::note_flush_bracket(taken);
+        taken
     }
 
     /// Present the back buffer: copy each damaged rectangle to the framebuffer, row by row (each
@@ -828,11 +892,13 @@ impl Screen {
         // CURSOR-6 — the sprite's box, once for the whole present, read WITHOUT the sprite lock. This
         // function is bracketed by `flush` (`cursor::undraw` → here → `cursor::repaint`; CURSOR-13
         // narrowed that bracket from the whole flush to this call, and the bracket's OWNER moved from
-        // the render task to `flush` itself — the invariant this witness tests did not change). So a
-        // live sprite must never be seen here; if one is, the bracket has a hole and the desktop is
-        // erasing the arrow at flush rate — the spotty symptom, from the other layer. Diagnostic
-        // only: nothing below is conditional on it, so a stale answer costs precision and never a
-        // pixel.
+        // the render task to `flush` itself). FLICKER-3 narrowed it once more: a present whose damage
+        // is provably disjoint from a live sprite skips the bracket and runs with the arrow on glass —
+        // so "a live sprite must never be seen here" became "a live sprite must never be seen UNDER A
+        // DAMAGE RECT here". The per-rect overlap test below asks exactly that, on both arms, so the
+        // counter keeps its meaning: a hit is a desktop blit landing on a live arrow, whether from a
+        // bracket hole or from a skip decision the sprite outran. Diagnostic only: nothing below is
+        // conditional on it, so a stale answer costs precision and never a pixel.
         #[cfg(feature = "witness")]
         let sprite_box = super::cursor::live_box_relaxed();
         #[cfg(feature = "witness")]

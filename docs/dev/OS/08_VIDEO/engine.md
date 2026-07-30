@@ -1618,6 +1618,52 @@ Gate scope, stated plainly: `[flick2]` reads `UNWITNESSED` on QEMU by constructi
 never drawn), so the QEMU gates prove no-regression only; both verdicts above are argued from the
 interleave analysis and await the next attended bench boot for pixel-level confirmation.
 
+#### FLICKER-3 — the P80 residuals: the flush bracket and the masked stale restore
+
+P80 (bench, attended, FLICKER-2 aboard and improved) reported two residuals: (a) "the core idle
+bars cause mouse to flicker when they move", and (b) "vug can still get disturbed by the mouse",
+occasionally.
+
+**Symptom (a) — the CURSOR-13 desktop bracket was unconditional.** The status strip's per-core load
+bars are desktop furniture: `ui_status` paints them into the `Screen` back buffer and marks their
+one-line band as damage, and the render task's `pal.render()` → `Screen::flush()` presents it.
+`flush` opened the CURSOR-13 bracket — a FULL `cursor::undraw()` before `present_background`, a
+full `cursor::repaint()` after — on every present, wherever the damage was; so every bars repaint
+(~1/s idle, faster when loads move) took the whole sprite off the glass and redrew it, and the
+operator saw the arrow blink in time with the bars. Same shape FLICKER-2 removed from
+`drain_deferred`, one layer up. `Screen::flush` now asks `bracket_needed()` first: a present whose
+damage rects are all provably disjoint from a live, visible sprite skips the bracket entirely and
+runs with the arrow on glass. The skip is deliberately narrow — no sprite on glass (the repaint may
+owe a recovery draw), a lapsed CURSOR-HIDE visibility (this bracket's repaint is what takes a
+timed-out arrow down), and a pending `FULL_PRESENT` all keep the unconditional bracket.
+`present_background`'s CURSOR-6 probe (`desktop_over=`) now tests per-damage-rect overlap on both
+arms and doubles as the detector for a skip decision the sprite outran (moved into the damage
+mid-present — re-established by the mover's own `repaint`, exactly the `drain_deferred` argument).
+`[flick2] flush_undraw=`/`flush_skip=` count the live-sprite decision; with the pointer parked away
+from the strip, `flush_skip` should dominate.
+
+**Symptom (b) — the masked undraw restored a stale save.** The P80 wire ruled the FLICKER-2
+`try_lock` fallback out (`sess_lockmiss=0` across the whole attended phase) while `[cursor5]`
+climbed steadily (`stale_compose=1468`, `adopt_incoh=1386`, `masked_nosession=68`): concurrent
+passes were routinely active inside a session owner's compose-to-install window. FLICKER-2 gave the
+session-fresh restore to `undraw_locked` (full undraws) only; `undraw_within_locked` — the masked
+path behind `undraw_within_nosession`, i.e. the sessionless composite arm and the WC-L drain —
+still restored `sp.saved` unconditionally. Inside that window a covered pixel's `sp.saved` is last
+frame's window content, the colour guard passes (the session owner's present put our colour there),
+and the masked undraw stamped the stale pixel into the live vug under the pointer — occasional
+because it needs the cross-core interleave, which is P80's (b) exactly. The masked path now takes
+the same `SPRITE → OVERLAY` `try_lock` and restores covered pixels from the session's layer save;
+a contended read falls back for one undraw and feeds the shared `sess_lockmiss`. The caller's
+conditional generation bump is unchanged — a handback still retires the owner's session.
+`[flick2] mask_sess=` counts the lifted path running; `sess_px=` now aggregates layer-restored
+pixels from both entry points.
+
+Gate scope: unchanged from FLICKER-2 — `UNWITNESSED` on QEMU by construction; both fixes are argued
+from the wire correlation plus interleave analysis and await the next attended bench boot. One
+reading note for that boot: `down_max=`/`down_slow=` include CURSOR-HIDE spans (a full undraw with
+no draw until the next pointer report — the P80 capture's 150 s `down_max` is a parked pointer, not
+a blink), so judge (a) by `flush_skip` dominating and by the chair, not by `down_max` alone.
+
 ### FOCUS-VIS — focus you can SEE, and a shell you can read
 
 P59 (bench, 2026-07-25) put two backgrounded windows on the panel — the UVUG crystal and `STAT.ELF` —
