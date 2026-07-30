@@ -1823,6 +1823,10 @@ fn rewake_place(home: usize, slot: usize) -> usize {
 /// placement question (parked longer than [`REWAKE_MIN_PARK_MS`]). `rewake` should therefore climb by
 /// roughly one per real focus change rather than once per frame per task.
 static SPREAD4_REWAKE: AtomicU64 = AtomicU64::new(0);
+/// SPREAD-11 — yield-path slot re-placements (the P94 idle-desktop livelock fix). Counts moves made
+/// at the READY re-enqueue (yield/preempt) refresh, the path that never passes `make_ready` and so
+/// never saw SPREAD-10's co-placement at all.
+static SPREAD11_YIELD_MOVES: AtomicU64 = AtomicU64::new(0);
 static SPREAD4_STAY: AtomicU64 = AtomicU64::new(0);
 
 /// SPREAD-5 — EL0 wakes that skipped placement entirely because the park was a frame-loop micro-park.
@@ -3463,7 +3467,7 @@ fn dispatch_next(cpu: usize) -> bool {
     // can never leak into the next task's switch-back. Only a task that switched back BLOCKED carries
     // a meaningful action.
     let park = SCHED[cpu].park_kind.swap(PARK_NONE, Ordering::Relaxed);
-    let task = unsafe { Box::from_raw(raw) };
+    let mut task = unsafe { Box::from_raw(raw) };
     match task.state.load(Ordering::Acquire) {
         STATE_FINISHED => drop(task), // free the stack
         STATE_BLOCKED => park_blocked(cpu, park, task), // sleeper list / (M4b) a wait queue
@@ -3472,7 +3476,31 @@ fn dispatch_next(cpu: usize) -> bool {
             // which also re-zeroes its aging clock — a task only ages while it sits WAITING.
             debug_assert_eq!(park, PARK_NONE, "non-blocked task carried a park action");
             task.state.store(STATE_READY, Ordering::Release);
-            rq(cpu).push(task);
+            // SPREAD-11 (2026-07-30, the P87/P92/P93/P94 idle-desktop livelock): a task that YIELDS
+            // instead of parking never passes `make_ready`, so SPREAD-10's co-placement never sees
+            // it — a spread vug triple that yield-spins its rendezvous ([spread10] 3c+=1 co_moves=0)
+            // storms the run-queue locks at wake-speed (P94 measured ctx +1.3M/win, svc=0, and
+            // rx-backstop starved 199 s inside make_ready). Give the READY re-enqueue the SAME
+            // refresh clock the park path has: at most once per PLACE_REFRESH_MS, ask rewake_place
+            // and move toward the slot's residents. Credits move exactly as SPREAD-10's rewake does.
+            let mut dest = cpu;
+            if task.user_entry != 0 {
+                let now = now_cyc();
+                if task.place_cyc != 0 && now.saturating_sub(task.place_cyc) >= place_refresh_cyc() {
+                    task.place_cyc = now;
+                    let target = rewake_place(cpu, slot_of(task.user_ttbr0));
+                    if target != cpu {
+                        el0_resident_leave(cpu);
+                        let _ = el0_resident_enter(target);
+                        slot_res_leave(cpu, task.user_ttbr0);
+                        slot_res_enter(target, task.user_ttbr0);
+                        task.cpu = target as u32;
+                        SPREAD11_YIELD_MOVES.fetch_add(1, Ordering::Relaxed);
+                        dest = target;
+                    }
+                }
+            }
+            rq(dest).push(task);
         }
     }
     true
@@ -5707,11 +5735,12 @@ fn spread10_witness() {
         }
     }
     serial_println!(
-        "[spread10] slots 1c={} 2c={} 3c+={} co_moves={}",
+        "[spread10] slots 1c={} 2c={} 3c+={} co_moves={} ymoves={}",
         on1,
         on2,
         on3,
         SPREAD10_CO_MOVES.load(Ordering::Relaxed),
+        SPREAD11_YIELD_MOVES.load(Ordering::Relaxed),
     );
 }
 
