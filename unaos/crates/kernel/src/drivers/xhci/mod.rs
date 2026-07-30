@@ -1941,6 +1941,14 @@ pub struct XhciController {
     /// connect that arrived while a port was mid-enumeration (could not be reset immediately).
     /// Drained into `ports_to_enumerate` at the top of `start_next_port`.
     requeue_after_settle: Vec<u8>,
+    /// BOOTPACE M4: the ports queued by the INITIAL boot CCS scan in `start()`, as opposed to by a
+    /// hot-plug CSC / unsolicited-reset event. These skip the 100 ms connect debounce: their
+    /// connection predates port power and has additionally been held across the pre-scan settle, so
+    /// TATTDB's "100 ms of stable attach before the reset" is already satisfied. An entry is
+    /// consumed the moment `start_next_port` pops the port — so if that same port is later
+    /// re-queued by a genuine (re)attach it is treated as a hot-plug and pays the full debounce,
+    /// which is the metal-proven behaviour (the SD-reader FS-chirp failure) and must not be lost.
+    boot_scan_ports: Vec<u8>,
     /// The most recent enumeration stall (for `usbinfo`): where a port's enumeration died.
     last_stall: Option<EnumStall>,
     /// Total enumeration stalls since boot.
@@ -2049,6 +2057,7 @@ impl XhciController {
             enumerating_port: 0,
             enum_saw_disconnect: false,
             requeue_after_settle: Vec::new(),
+            boot_scan_ports: Vec::new(),
             port_protocols,
             enum_stage: "idle",
             enum_stage_set_at: 0,
@@ -3857,13 +3866,39 @@ impl XhciController {
             // the controller reset (HCRST) needs time to re-train (RxDetect -> Polling -> U0) after
             // its port is powered; the old code read CCS immediately, so a still-training SS link was
             // missed and the device never queued/enumerated. USB2 keyboard/mouse re-detect fast
-            // enough to be caught without this — a real USB3 stick was not. Wall-clock, ~0.5 s.
+            // enough to be caught without this — a real USB3 stick was not.
+            //
+            // BOOTPACE M4: 500 ms -> SETTLE_MS (150 ms), and the constant stops being derived from
+            // `hw_wait_budget()`. Two separate changes, both required:
+            //
+            //   * TIMEBASE. `hw_wait_budget()/4` tied a SPEC number to a POLICY number — exactly
+            //     what `cycles_per_ms`'s own doc-comment forbids ("the settles below are SPEC
+            //     numbers ... tying one to the other would silently rescale every USB timing
+            //     constant the day the timeout policy changed"). It also made the settle's true
+            //     wall clock arch-dependent and unprintable: ~500 ms on a calibrated x86, ~694 ms
+            //     on the Pi's fixed 150 M-tick guess. Derived from `cycles_per_ms()` it is the same
+            //     honest 150 ms everywhere, and `settle_ms=` below can state it without lying.
+            //   * LENGTH. USB3 link training reaches U0 in tens of ms typically; the spec's outer
+            //     bound is tPollingLFPSTimeout = 360 ms, and that bound is enforced BELOW by
+            //     POLLING_DECIDE_MS rather than by padding this settle. So the fast, common case
+            //     (link already trained, or a USB2-only machine) pays 150 ms instead of 500 ms,
+            //     while a link genuinely still in Polling is given the full spec window before
+            //     anything is concluded about it.
+            //
+            // If the link is still not up when the CCS scan runs, the device is not lost: the CAS /
+            // warm-reset rungs immediately below, and the hot-plug CSC path (a late 0->1 CCS edge
+            // latches CSC after this scrub and queues the port through `handle_port_status`), both
+            // catch it. It enumerates LATER, not never — and "the boot device arrived via the
+            // CSC/warm-reset path instead of the initial scan" is the metal tell-tale of a
+            // regression here (see usb_xhci.md §2d).
+            const SETTLE_MS: u64 = 150;
+            let per_ms = Self::cycles_per_ms();
             let settle_start = crate::arch::now_cycles();
-            let settle = hw_wait_budget() / 4;
+            let settle = SETTLE_MS * per_ms;
             while crate::arch::now_cycles().wrapping_sub(settle_start) < settle {
                 core::hint::spin_loop();
             }
-            serial_println!("xHCI: port settle complete before CCS scan");
+            serial_println!("xHCI: port settle complete before CCS scan (settle_ms={})", SETTLE_MS);
             // BPACE: the fixed pre-enumeration settle (`hw_wait_budget()/4` — ~0.5 s of wall clock
             // and nothing else).
             //
@@ -3916,8 +3951,20 @@ impl XhciController {
                 }
             }
             if !polling_candidates.is_empty() {
+                // BOOTPACE M4: this debounce now carries the spec floor the settle used to pad.
+                // tPollingLFPSTimeout (USB 3.2 §6.9) is 360 ms: a HEALTHY link may legitimately sit
+                // in Polling that long, so no port may be DECLARED stuck in Polling — and warm-reset
+                // out of a legal state — before 360 ms have passed since its power was applied. The
+                // old pairing satisfied that only by accident (500 ms settle + 100 ms = 600 ms).
+                // Here it is explicit: the debounce is whatever is left of the 360 ms window after
+                // the settle, so shortening the settle cannot shorten the Polling verdict.
+                //
+                // The device also gets a second chance from it: a link that finishes training
+                // during this window reads CCS=1 at the re-check, is NOT warm-reset, and is picked
+                // up by the CCS scan below in the ordinary way.
+                const POLLING_DECIDE_MS: u64 = 360;
                 let dbc_start = crate::arch::now_cycles();
-                let dbc = hw_wait_budget() / 20; // ~100 ms
+                let dbc = POLLING_DECIDE_MS.saturating_sub(SETTLE_MS) * per_ms;
                 while crate::arch::now_cycles().wrapping_sub(dbc_start) < dbc {
                     core::hint::spin_loop();
                 }
@@ -3933,6 +3980,7 @@ impl XhciController {
             // Collect every connected port and enumerate them ONE AT A TIME. Push in
             // reverse so the queue pops in ascending port order.
             self.ports_to_enumerate.clear();
+            self.boot_scan_ports.clear();
             for i in (1..=max_ports).rev() {
                 let port_offset = 0x400 + (i as usize - 1) * 0x10;
                 let portsc_ptr = (self.op_base + port_offset) as *const u32;
@@ -3942,6 +3990,13 @@ impl XhciController {
                 if (status & 1) != 0 {
                     serial_println!("xHCI: Port {} connected (Status: {:#x}); queued for enumeration.", i, status);
                     self.ports_to_enumerate.push(i);
+                    // BOOTPACE M4: mark this as an INITIAL-SCAN entry. Its connection has been
+                    // electrically stable since before we powered the port — the boot device was
+                    // attached before the machine was — and it has additionally been powered and
+                    // sampled across the settle above. TATTDB's intent is already met, so
+                    // `start_next_port` skips the 100 ms connect debounce for it. Hot-plug entries
+                    // never land in this list and keep the full debounce.
+                    self.boot_scan_ports.push(i);
                 }
             }
         }
@@ -4186,6 +4241,17 @@ impl XhciController {
             }
         }
         while let Some(port) = self.ports_to_enumerate.pop() {
+            // BOOTPACE M4: consume this port's initial-boot-scan mark, if it has one. Consumed on
+            // POP rather than on use, so the `continue` below (port no longer connected) also
+            // clears it: a port that has to come back through CSC is a genuine attach and must pay
+            // the full debounce.
+            let boot_scan = match self.boot_scan_ports.iter().position(|&p| p == port) {
+                Some(i) => {
+                    self.boot_scan_ports.remove(i);
+                    true
+                }
+                None => false,
+            };
             let portsc = self.read_portsc(port);
             if (portsc & 1) == 0 {
                 // Not connected — but a USB3 link stuck in an error state reads CCS=0 too
@@ -4218,8 +4284,8 @@ impl XhciController {
             // that, reset immediately on the connect event, trained at Full-Speed (failed HS
             // chirp) and then failed every ADDRESS_DEVICE with USB Transaction Error (code 4)
             // — resetting a device whose attach hasn't electrically settled is the classic
-            // cause. service_enum issues the reset once the gate expires; boot-scan devices
-            // (long since stable) just pay the same 100 ms, which is harmless.
+            // cause. service_enum issues the reset once the gate expires. (BOOTPACE M4: ports
+            // queued by the INITIAL boot CCS scan are exempt — see the `boot_scan` branch below.)
             //
             // The reset itself is always issued whether or not PED is already set. A device
             // the firmware enumerated (our USB stick / SD reader IS the UEFI boot device) —
@@ -4228,8 +4294,29 @@ impl XhciController {
             // device). ADDRESS_DEVICE issues SET_ADDRESS to the Default address, so the
             // device must be in Default state, which a USB reset restores. The Port Reset
             // Change event then drives the rest.
+            //
+            // BOOTPACE M4: the comment above used to end "boot-scan devices (long since stable)
+            // just pay the same 100 ms, which is harmless". It is not free — it is 100 ms per
+            // boot-scan port on the critical path to the first console and the first block read —
+            // and it is not needed for them either. TATTDB (USB 2.0 §7.1.7.3) asks for 100 ms of
+            // STABLE ATTACH before the reset; a port queued by the initial CCS scan was attached
+            // before the machine was powered, was seen connected after `start()` powered it, and
+            // was held across the pre-scan settle. Its debounce has already been served by
+            // wall-clock that is not ours to charge twice, so it goes straight to the reset.
+            //
+            // HOT-PLUG PORTS KEEP THE FULL 100 ms. That path is metal-proven, not theoretical: a
+            // hot-plugged High-Speed SD reader reset immediately on the connect event trained at
+            // Full-Speed (failed HS chirp) and then failed every ADDRESS_DEVICE with code 4. The
+            // 50 ms TRSTRCY reset-settle is untouched on both paths.
             self.enum_cmd_phys = 0;
-            self.set_enum_stage("debounce");
+            if boot_scan {
+                serial_println!(
+                    "xHCI: [enum port {}] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.",
+                    port);
+                self.issue_enum_reset(port);
+            } else {
+                self.set_enum_stage("debounce");
+            }
             return;
         }
         self.enum_active = false;
@@ -4482,6 +4569,10 @@ impl XhciController {
             "debounce" => {
                 // Connect debounce (USB 2.0 TATTDB, 100 ms) before the first reset — see
                 // start_next_port. Always advances, so no separate watchdog is needed.
+                // BOOTPACE M4: only HOT-PLUG ports reach this stage now; initial-boot-scan ports go
+                // straight to `issue_enum_reset` because their attach was already stable across the
+                // pre-scan settle. This 100 ms is the metal-proven SD-reader FS-chirp fix and stays
+                // exactly as it was for every port that genuinely just arrived.
                 if age >= 100 * per_ms {
                     self.issue_enum_reset(port);
                 }
