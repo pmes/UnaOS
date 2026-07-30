@@ -749,6 +749,19 @@ pub fn ppi_pending(intid: u32) -> bool {
 /// Acknowledge, dispatch, and end one interrupt at the CPU interface. Called from the IRQ vector
 /// stub with IRQs masked. Reading IAR acknowledges (and returns the INTID); writing EOIR the same
 /// value completes it. Spurious reads (INTID >= 1020) take no EOI.
+/// SPIN-7 (2026-07-30, the PA0 storm hypothesis): per-core IRQ accounting for the [spin1] witness.
+/// A level-sensitive SPI with no handler is EOI'd still-asserted and re-pends instantly — an
+/// interrupt storm that freezes a task one instruction after `unmask_irq` with every lock clean
+/// and the scheduler never re-entered (the exact PA0 signature). These counters name it.
+pub static IRQ_TOTAL: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+pub static IRQ_LAST_INTID: [core::sync::atomic::AtomicU32; 8] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 8];
+pub static IRQ_UNHANDLED: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+pub static IRQ_UNHANDLED_LAST: [core::sync::atomic::AtomicU32; 8] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 8];
+
 pub fn handle_irq() {
     // v3: acknowledge/EOI go through the ICC_*_EL1 system registers, not the memory-mapped GICC.
     // Compiled out on the pi build (which is always v2).
@@ -761,6 +774,15 @@ pub fn handle_irq() {
     let intid = iar & 0x3FF;
     if intid >= SPURIOUS_FLOOR {
         return; // spurious / special — no EOI
+    }
+
+    // SPIN-7: count every acked IRQ per core; a storm shows as TOTAL racing while the core's task
+    // makes no progress, and LAST_INTID names the screamer.
+    {
+        use core::sync::atomic::Ordering;
+        let c = crate::arch::percpu::this_cpu().cpu_index as usize & 7;
+        IRQ_TOTAL[c].fetch_add(1, Ordering::Relaxed);
+        IRQ_LAST_INTID[c].store(intid, Ordering::Relaxed);
     }
 
     if intid < 16 {
@@ -781,6 +803,20 @@ pub fn handle_irq() {
         #[cfg(feature = "baremetal")]
         if intid == crate::arch::serial::PL011_RX_INTID {
             crate::arch::serial::on_rx_interrupt();
+        } else {
+            // SPIN-7: an SPI nobody handles — after the EOI below its level re-pends instantly if
+            // still asserted. Count + name it; the [spin1] line beside a racing count is the storm.
+            use core::sync::atomic::Ordering;
+            let c = crate::arch::percpu::this_cpu().cpu_index as usize & 7;
+            IRQ_UNHANDLED[c].fetch_add(1, Ordering::Relaxed);
+            IRQ_UNHANDLED_LAST[c].store(intid, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "baremetal"))]
+        {
+            use core::sync::atomic::Ordering;
+            let c = crate::arch::percpu::this_cpu().cpu_index as usize & 7;
+            IRQ_UNHANDLED[c].fetch_add(1, Ordering::Relaxed);
+            IRQ_UNHANDLED_LAST[c].store(intid, Ordering::Relaxed);
         }
     }
 

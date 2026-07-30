@@ -5668,7 +5668,7 @@ fn pulse5_witness() {
                     { (false, 0i64, 0usize) }
                 };
                 serial_println!(
-                    "[spin1] cpu={} span={}ms task={}:{} state={} park={} | rx_ready locked={} count={} waiters={} | sem_stalls={} sem_spin_max={} | bs_phase={} bs_loops={} | disp busy={} idle={} — one task has owned this core the whole span; the [prio]/[comp2] lines beside this name the starvation",
+                    "[spin1] cpu={} span={}ms task={}:{} state={} park={} | rx_ready locked={} count={} waiters={} | sem_stalls={} sem_spin_max={} | bs_phase={} bs_loops={} | disp busy={} idle={} | irq total={} last={} unhandled={} unhandled_last={} — one task has owned this core the whole span; the [prio]/[comp2] lines beside this name the starvation",
                     cpu, cyc_to_ms(ACCT[cpu].live_span_cyc()), id, name, st,
                     SCHED[cpu].park_kind.load(Ordering::Relaxed),
                     rxl as u32, rxc, rxw,
@@ -5680,7 +5680,13 @@ fn pulse5_witness() {
                     // [spin1] prints = the CORE's scheduler is wedged (the current pointer is real
                     // and the stall is in the dispatch/resume path); advancing = current is a lie.
                     meter_cpu_ticks(cpu).0,
-                    meter_cpu_ticks(cpu).1
+                    meter_cpu_ticks(cpu).1,
+                    // SPIN-7: the IRQ story on the stalled core — a racing total beside a frozen
+                    // task = interrupt storm; unhandled_last names the screaming line.
+                    crate::arch::gic::IRQ_TOTAL[cpu & 7].load(Ordering::Relaxed),
+                    crate::arch::gic::IRQ_LAST_INTID[cpu & 7].load(Ordering::Relaxed),
+                    crate::arch::gic::IRQ_UNHANDLED[cpu & 7].load(Ordering::Relaxed),
+                    crate::arch::gic::IRQ_UNHANDLED_LAST[cpu & 7].load(Ordering::Relaxed)
                 );
             }
         }
