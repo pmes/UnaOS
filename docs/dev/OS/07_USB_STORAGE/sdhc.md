@@ -448,3 +448,117 @@ All waits are bounded in the same rdtsc units as milestone 2: `DATA_TIMEOUT_MS`
 (200 ms) per block for Buffer Read Ready, `DATA_TIMEOUT_MS` for Transfer Complete,
 and `abort_data_transfer`'s CMD12 and reset are bounded by `CMD_TIMEOUT_MS` and
 `RESET_TIMEOUT_MS` respectively. No unbounded spin is added anywhere.
+
+### 7.2 The ADMA2 engine and the DMA contract
+
+This is the first DMA in the driver and the first time the SDHCI function is ever
+granted Bus Master. The engine is built to a contract that is stated here in full,
+because every clause of it is load-bearing.
+
+**Descriptor table.** One 4 KiB page, `alloc_zeroed(4096, 4096)`, allocated once at
+engine init and never freed. A 4 KiB-aligned 4 KiB region cannot cross a 64 KiB
+boundary, so the table satisfies ADMA2's boundary rule *by construction* rather than
+by a check that could be wrong. 512 slots; no transfer here uses more than three.
+
+**Data buffer.** A driver-owned 32 KiB bounce (64 × 512 = one `MB_MAX_BLOCKS` chunk),
+allocated once, never freed. **DMA lands only here**, and is then copied to the
+caller. That buys two things: every caller-alignment and caller-lifetime constraint
+disappears, and a DMA write that straggles in *after* a transfer was declared timed
+out lands inside memory this driver owns forever — never in a caller's buffer that
+has since been freed or reused.
+
+**Physical addresses.** On x86_64 the kernel heap is identity-mapped physical RAM
+handed to devices as physical == bus addresses — `arch::x86_64::memory` states this
+and prints a `HEAP: WARNING` on serial if the heap window itself ends above 4 GiB —
+so `ptr as u64` *is* the bus address, the same seam `drivers::xhci::ring` uses. Two
+refusals run before the engine is ever called `Ready`:
+
+* **reachability** — address + length must be below 4 GiB, because the ADMA2-32
+  descriptor address field and `REG_ADMA_ADDR` are 32 bits. Above it, the address is
+  unreachable, and is refused **by name** rather than truncated into a valid-looking
+  address that points at the wrong RAM;
+* **alignment** — 4-byte, because the field's low bits are address bits, not flags, so
+  a misaligned buffer is a *wrong* address rather than a slow one. The 4096-byte
+  layout guarantees it; it is asserted anyway, since a guarantee that is never checked
+  is an assumption.
+
+Either refusal yields `Unavailable("dma window above 4GiB")` (or `…misaligned`),
+**named on serial** — never a silent drop to PIO.
+
+**Descriptor format.** 32-bit ADMA2 (spec 3.00 §1.13): 8 bytes = `attr:u16 |
+length:u16 | address:u32`, attributes Valid(0), End(1), Int(2), Act[5:4] = 10b
+(Tran). The builder splits the span at every 64 KiB physical boundary **and** caps
+each descriptor at 32 KiB — the first satisfies the boundary constraint, the second
+keeps every length inside the 16-bit field without ever relying on the
+version-dependent "length 0 means 65536" encoding. Only the last descriptor carries
+End; no descriptor carries Int, because the driver is polled and a descriptor
+interrupt would raise a status bit nothing consumes. Before the transfer is issued the
+lengths are summed and checked against `count × 512`; a mismatch refuses, prints, and
+returns `Err(Io)`. A chain describing fewer bytes than the block count demands is
+precisely what raises ADMA Length Mismatch on real silicon, and catching it here names
+the bug instead of reading it back off the wire.
+
+**Cache and ordering — zero fence instructions, and why.** The buffers are Write-Back
+kernel heap and the platform is I/O-coherent: CPU caches and the PCIe DMA path snoop
+each other. That is the same contract `drivers::xhci::dma_coherency` documents and
+ships on for every xHCI ring and data buffer in this kernel — on x86_64 its clean and
+invalidate functions are empty bodies that compile to nothing. Ordering falls out of
+x86-TSO plus the UC BAR mapping: descriptor stores go to WB memory, the MMIO writes
+that follow (ADMA System Address, then the Command register that issues the transfer)
+go to the UC window, and a UC store may not pass earlier stores — so the descriptors
+are globally visible before the write that makes the controller fetch them. This is
+byte-for-byte the seam the xHCI doorbell already relies on. In the other direction the
+UC read of Interrupt Status is the ordering point: PCIe producer/consumer ordering
+requires a read returning from the device to push the DMA writes it posted ahead of
+itself, so once that read reports Transfer Complete, every byte the engine wrote is in
+memory. The compiler is a separate matter from the hardware: the bounce buffer is
+filled and read through **volatile** accesses, because the compiler sees a region the
+driver wrote a sentinel into and no subsequent writer, and would otherwise be free to
+fold a plain read back to the sentinel.
+
+**Bus Master.** Enabled at engine init, read-modify-write on PCI COMMAND bit 2 through
+the same accessors `claim` uses, with a before/after readback printed. It is
+deliberately **not** enabled in `claim`: that keeps every log line up to and including
+the claim line comparable across all three milestones, and it means the grant is made
+only after the controller has advertised ADMA2 *and* every address check has passed —
+if any of them refuse, the function keeps exactly the capabilities milestone 2 gave
+it. If the bit does not read back set: `Unavailable("bus-master did not latch")`.
+
+**Failure path.** On `INT_ERR_ADMA`, any other error, or a timeout during a DMA
+transfer, one line carries the raw Interrupt Status, the raw ADMA Error Status (`0x54`,
+with bits [1:0] decoded to ST_STOP / ST_FDS / ST_TFR), the ADMA System Address read
+back from `0x58` — it advances as the engine walks the table, so it names the faulting
+descriptor — and the Auto CMD Error word (`0x3C`). Then a bounded CMD12
+STOP_TRANSMISSION, `reset_cmd_dat`, and W1C. The CMD12 is not optional: an aborted
+transfer leaves the *card* in data state, and the next command would be indicted for
+it.
+
+**ADMA2 is gated on `CAP_ADMA2`, read fresh every boot.** The `14e4:16bc` "SDHCI 3.00
+with ADMA2 + 64-bit" note that motivated this milestone is a bench observation with no
+committed log, so nothing is hard-coded from it: the capability register decides, and
+the mode is 32-bit ADMA2 unconditionally so the unverified 64-bit half of that claim
+is never load-bearing.
+
+**The in-boot smoke transfer** reads 8 blocks at LBA 0 and prints:
+
+```text
+[sdhc-adma] engine ready bm=1 table=0xPHYS buf=0xPHYS descs-max=512 mode=adma2-32
+[sdhc-adma] read lba=0 blocks=8 ok wrote=1 bytes=4096
+```
+
+Three readings are distinguishable, which is why a verdict is printed rather than a
+status:
+
+| Log | Meaning |
+| --- | --- |
+| `engine ready …` then `read … ok wrote=1` | The engine ran and DMA-wrote the buffer. |
+| `UNAVAILABLE (reason)` and no `read` line | The engine never ran, and the line says why. |
+| `read … ok wrote=0` | The transfer completed but the engine wrote nothing into the sentinel-filled buffer — the failure a bare `Ok` would have concealed. |
+
+**One structural change reaches back into 7.1.** A read of exactly one block issues
+CMD17 with Multi/Single Block Select clear, not CMD18 with a block count of one — in
+*both* the PIO and the ADMA2 path. Both forms are spec-legal, but the single-block
+form is the one every card and controller in the field is exercised on, and keeping
+the rule identical in both paths is what makes §7.3's A/B comparison meaningful: an
+A/B test whose two arms issue different commands for the same window measures more
+than the variable under test.

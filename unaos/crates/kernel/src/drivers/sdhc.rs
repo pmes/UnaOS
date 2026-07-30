@@ -43,9 +43,19 @@
 //!
 //! ## Scope limits held on purpose
 //!
-//! * **PIO only.** The function's Bus Master bit is deliberately left as the firmware set it — this
-//!   milestone issues no DMA, so it needs no bus mastering, and enabling it would grant the device
-//!   a capability nothing here uses. ADMA2 is milestone 3's problem.
+//! * **Bus Master is granted late, narrowly, and only when it will be used.** Milestones 1 and 2
+//!   left the bit exactly as the firmware set it, because they issued no DMA. Milestone 3 enables
+//!   it in [`adma2_init`] — never in [`claim`] — and only after the controller has advertised
+//!   ADMA2 and every address the engine could reach has passed a refusal check. If any of those
+//!   refuse, the function keeps exactly the capabilities milestone 2 gave it. Keeping the grant out
+//!   of `claim` also keeps every log line up to the claim line comparable across all three
+//!   milestones.
+//! * **DMA lands only in driver-owned memory.** ADMA2 writes a bounce buffer this driver allocated
+//!   and never frees, which is then copied to the caller. A DMA write that straggles in after a
+//!   transfer was declared timed out therefore lands somewhere harmless, forever.
+//! * **32-bit ADMA2 unconditionally.** Never the 64-bit mode: the kernel heap is below 4 GiB by
+//!   construction on this platform, so 64-bit addressing would buy nothing while making an
+//!   unverified capability claim load-bearing.
 //! * **1-bit bus, no high-speed.** Identification-clock then 25 MHz default speed, DAT0 only. A
 //!   4-bit bus needs ACMD6 and a Host Control 1 change; not this milestone.
 //! * **No block-layer registration.** `drivers::block`'s x86 path has no backend selector — its
@@ -90,9 +100,12 @@ const REG_SOFTWARE_RESET: u64 = 0x2F; // 8
 const REG_INT_STATUS: u64 = 0x30; // 16 normal + 16 error at 0x32; read/written as one 32-bit word
 const REG_INT_STATUS_EN: u64 = 0x34; // 16 normal + 16 error at 0x36
 const REG_INT_SIGNAL_EN: u64 = 0x38; // 16 normal + 16 error at 0x3A
+const REG_AUTO_CMD_ERR: u64 = 0x3C; // 16 — why the controller's own Auto CMD12 failed
 const REG_HOST_CONTROL2: u64 = 0x3E; // 16
 const REG_CAPABILITIES: u64 = 0x40; // 32
 const REG_CAPABILITIES_2: u64 = 0x44; // 32
+const REG_ADMA_ERROR: u64 = 0x54; // 8 — ADMA Error Status: which state the engine faulted in
+const REG_ADMA_ADDR: u64 = 0x58; // 32 (low half; the high half at 0x5C exists only in 64-bit mode)
 const REG_HOST_CTRL_VERSION: u64 = 0xFE; // 16
 
 /// The SDHCI register block is 256 bytes; map one page of it Uncacheable.
@@ -117,6 +130,15 @@ const PWR_ON: u8 = 1 << 0;
 const PWR_V33: u8 = 0b111 << 1;
 const PWR_V30: u8 = 0b110 << 1;
 const PWR_V18: u8 = 0b101 << 1;
+
+// --- Host Control 1 (0x28, 8-bit) -------------------------------------------------
+/// DMA Select, bits [4:3]: 00 = SDMA, 01 = 32-bit ADMA1, 10 = 32-bit ADMA2, 11 = 64-bit ADMA2.
+const HC1_DMA_SELECT_MASK: u8 = 0b11 << 3;
+/// 32-bit ADMA2. Chosen **unconditionally**, never 64-bit: the only evidence that this controller
+/// supports 64-bit addressing is an uncommitted bench observation, and the kernel heap this driver
+/// allocates from is below 4 GiB by construction (`arch::x86_64::memory`), so the 64-bit mode would
+/// buy nothing while making an unverified claim load-bearing.
+const HC1_DMA_ADMA2_32: u8 = 0b10 << 3;
 
 // --- Clock Control (0x2C, 16-bit) -------------------------------------------------
 const CLK_INTERNAL_EN: u16 = 1 << 0;
@@ -152,6 +174,10 @@ const INT_ERR_DATA_END_BIT: u32 = 1 << 22;
 /// end of a multi-block transfer failed. Already inside [`INT_ERR_ANY`]'s `0xFFFF_0000` half — it is
 /// named here only so a failure line says *which* error, instead of "other-error".
 const INT_ERR_AUTO_CMD: u32 = 1 << 24;
+/// ADMA Error (error-half bit 9): the descriptor engine faulted — a bad descriptor, a length
+/// mismatch, or a system-address error. Also already inside [`INT_ERR_ANY`], so no existing error
+/// path is weakened by naming it; `REG_ADMA_ERROR` says *which* of the three it was.
+const INT_ERR_ADMA: u32 = 1 << 25;
 /// Any error at all: the summary bit, or any bit of the error half.
 const INT_ERR_ANY: u32 = INT_ERROR_SUMMARY | 0xFFFF_0000;
 
@@ -651,6 +677,10 @@ const fn cmd_word(index: u8, flags: u16) -> u16 {
 }
 
 // --- Transfer Mode (0x0C, 16-bit) fields ------------------------------------------
+/// DMA Enable: the data phase is moved by whichever engine Host Control 1's DMA Select names,
+/// instead of through the PIO FIFO. Left 0 by every milestone-2 path and by the PIO path in
+/// milestone 3, so those transfers are unchanged.
+const TM_DMA_EN: u16 = 1 << 0;
 const TM_BLOCK_COUNT_EN: u16 = 1 << 1;
 /// Auto CMD12 Enable: the controller issues STOP_TRANSMISSION itself at the end of the transfer.
 /// Only meaningful together with Block Count Enable — the block counter is what tells the
@@ -765,6 +795,8 @@ fn int_error_name(int: u32) -> &'static str {
         "data-end-bit"
     } else if int & INT_ERR_AUTO_CMD != 0 {
         "auto-cmd12"
+    } else if int & INT_ERR_ADMA != 0 {
+        "adma"
     } else if int & INT_ERR_ANY != 0 {
         "other-error"
     } else {
@@ -797,6 +829,29 @@ fn r2_bits(resp: &[u32; 4], hi: u32, lo: u32) -> u64 {
 // The identified card
 // ===================================================================================
 
+/// Whether this card's controller has a usable ADMA2 engine, and — when it has not — the reason,
+/// which is carried so it can be NAMED on serial instead of degrading into a silent PIO fallback.
+///
+/// `Unavailable` is decided once at engine init and never changes. `Faulted` is latched the first
+/// time a live transfer fails, so one bad transfer disables the engine for the rest of the boot
+/// rather than re-failing on every read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Adma2State {
+    Ready,
+    Unavailable(&'static str),
+    Faulted(&'static str),
+}
+
+impl Adma2State {
+    /// The reason string, for the lines that must name why DMA is not being used.
+    fn reason(&self) -> &'static str {
+        match self {
+            Adma2State::Ready => "ready",
+            Adma2State::Unavailable(r) | Adma2State::Faulted(r) => r,
+        }
+    }
+}
+
 /// One identified SD card behind one SDHCI function.
 pub struct SdCard {
     base: u64,
@@ -808,6 +863,15 @@ pub struct SdCard {
     /// CMD3's relative card address, already shifted into bits 31:16 for use as a command argument.
     rca_arg: u32,
     csd_structure: u8,
+    /// ADMA2 engine state — `Unavailable` until [`adma2_init`] has run.
+    adma: Adma2State,
+    /// Physical address of the one-page ADMA2 descriptor table, or 0. Held as an address rather
+    /// than a pointer so `SdCard` stays `Send` and can live in the `CARD` static; on x86_64 the
+    /// kernel heap is identity-mapped, so this value is simultaneously the CPU address and the bus
+    /// address (see `arch::x86_64::memory`).
+    adma_table: u64,
+    /// Physical address of the driver-owned DMA bounce buffer, or 0.
+    adma_bounce: u64,
 }
 
 static CARD: Mutex<Option<SdCard>> = Mutex::new(None);
@@ -1064,7 +1128,19 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
     let actual = set_clock(base, caps, CLK_TRANSFER_HZ)?;
     serial_println!("[sdhc] transfer clock {}Hz engaged", actual);
 
-    Some(SdCard { base, bdf, block_addressing: ccs, num_blocks, rca_arg, csd_structure })
+    Some(SdCard {
+        base,
+        bdf,
+        block_addressing: ccs,
+        num_blocks,
+        rca_arg,
+        csd_structure,
+        // The engine starts refused and is only granted by `adma2_init`. A default of "ready"
+        // would make a forgotten init call read as a working DMA path.
+        adma: Adma2State::Unavailable("engine init has not run"),
+        adma_table: 0,
+        adma_bounce: 0,
+    })
 }
 
 // ===================================================================================
@@ -1191,6 +1267,32 @@ fn lba_arg(card: &SdCard, lba: u64) -> Result<u32, BlockError> {
     }
 }
 
+/// The (command word, transfer-mode bits, log name) for a counted read of `count` blocks.
+///
+/// `count == 1` issues **CMD17 READ_SINGLE_BLOCK with Multi/Single Block Select clear**, not CMD18
+/// with a block count of one. Both are spec-legal, but the single-block form is the one every card
+/// and controller in the field is exercised on — and it is what keeps the two arms of §7.3's A/B
+/// comparison issuing the *same* command for the same window. An A/B test whose arms differ in more
+/// than the variable under test measures nothing.
+///
+/// Auto CMD12 appears only on the multi-block leg, and only alongside Block Count Enable: the block
+/// counter is what tells the controller when to issue the closing STOP.
+fn counted_read_cmd(count: u16) -> (u16, u16, &'static str) {
+    if count == 1 {
+        (
+            cmd_word(17, RSP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA_PRESENT),
+            TM_BLOCK_COUNT_EN | TM_DIR_READ,
+            "cmd17",
+        )
+    } else {
+        (
+            cmd_word(18, RSP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA_PRESENT),
+            TM_BLOCK_COUNT_EN | TM_DIR_READ | TM_MULTI_BLOCK | TM_AUTO_CMD12,
+            "cmd18",
+        )
+    }
+}
+
 /// Close a multi-block read that ended badly: CMD12 STOP_TRANSMISSION, then reset the CMD and DAT
 /// circuits, then clear the status word.
 ///
@@ -1256,36 +1358,28 @@ fn read_blocks_pio_on(
 
     let base = card.base;
     let arg = lba_arg(card, lba)?;
+    let (command, tm, name) = counted_read_cmd(count);
 
     w32(base, REG_INT_STATUS, 0xFFFF_FFFF); // W1C stale status
     w16(base, REG_BLOCK_SIZE, 512); // bits 11:0 = block length; SDMA boundary bits stay 0 (PIO)
     w16(base, REG_BLOCK_COUNT, count);
-    // Multi-block, card -> host, block count enabled, auto-CMD12, DMA still disabled. Written
-    // BEFORE the Command register, which is what issues the transfer.
-    w16(
-        base,
-        REG_TRANSFER_MODE,
-        TM_BLOCK_COUNT_EN | TM_DIR_READ | TM_MULTI_BLOCK | TM_AUTO_CMD12,
-    );
+    // Card -> host, block count enabled, DMA still DISABLED. Written BEFORE the Command register,
+    // which is what issues the transfer.
+    w16(base, REG_TRANSFER_MODE, tm);
 
-    if let Err(int) = send_command(
-        base,
-        cmd_word(18, RSP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA_PRESENT),
-        arg,
-        true,
-    ) {
+    if let Err(int) = send_command(base, command, arg, true) {
         serial_println!(
-            "[sdhc-mb] cmd18 lba={} blocks={} FAILED int={:#010x} ({})",
-            lba, count, int, int_error_name(int)
+            "[sdhc-mb] {} lba={} blocks={} FAILED int={:#010x} ({})",
+            name, lba, count, int, int_error_name(int)
         );
         abort_data_transfer(base);
         return Err(BlockError::Io);
     }
     // The card answered on the wire; now its own verdict, BEFORE touching the FIFO. A card that
-    // rejected CMD18 never fills the buffer, and draining it anyway would return stale bytes with
+    // rejected the read never fills the buffer, and draining it anyway would return stale bytes with
     // an Ok beside them.
-    if let Err(r1) = r1_check(base, "cmd18 read-multiple") {
-        serial_println!("[sdhc-mb] cmd18 lba={} blocks={} rejected by the CARD r1={:#010x}", lba, count, r1);
+    if let Err(r1) = r1_check(base, "multi-block read") {
+        serial_println!("[sdhc-mb] {} lba={} blocks={} rejected by the CARD r1={:#010x}", name, lba, count, r1);
         abort_data_transfer(base);
         return Err(BlockError::Io);
     }
@@ -1300,9 +1394,9 @@ fn read_blocks_pio_on(
         }) {
             let int = r32(base, REG_INT_STATUS);
             serial_println!(
-                "[sdhc-mb] cmd18 lba={} blocks={} block {} buffer-read-ready TIMEOUT after {}ms \
+                "[sdhc-mb] {} lba={} blocks={} block {} buffer-read-ready TIMEOUT after {}ms \
                  int={:#010x} ({})",
-                lba, count, blk, DATA_TIMEOUT_MS, int, int_error_name(int)
+                name, lba, count, blk, DATA_TIMEOUT_MS, int, int_error_name(int)
             );
             abort_data_transfer(base);
             return Err(BlockError::Io);
@@ -1310,8 +1404,8 @@ fn read_blocks_pio_on(
         let int = r32(base, REG_INT_STATUS);
         if int & INT_ERR_ANY != 0 {
             serial_println!(
-                "[sdhc-mb] cmd18 lba={} blocks={} block {} ERROR int={:#010x} ({})",
-                lba, count, blk, int, int_error_name(int)
+                "[sdhc-mb] {} lba={} blocks={} block {} ERROR int={:#010x} ({})",
+                name, lba, count, blk, int, int_error_name(int)
             );
             w32(base, REG_INT_STATUS, int);
             abort_data_transfer(base);
@@ -1333,8 +1427,8 @@ fn read_blocks_pio_on(
     }) {
         let int = r32(base, REG_INT_STATUS);
         serial_println!(
-            "[sdhc-mb] cmd18 lba={} blocks={} transfer-complete TIMEOUT after {}ms int={:#010x} ({})",
-            lba, count, DATA_TIMEOUT_MS, int, int_error_name(int)
+            "[sdhc-mb] {} lba={} blocks={} transfer-complete TIMEOUT after {}ms int={:#010x} ({})",
+            name, lba, count, DATA_TIMEOUT_MS, int, int_error_name(int)
         );
         abort_data_transfer(base);
         return Err(BlockError::Io);
@@ -1343,13 +1437,460 @@ fn read_blocks_pio_on(
     w32(base, REG_INT_STATUS, int); // W1C everything we saw
     if int & INT_ERR_ANY != 0 {
         serial_println!(
-            "[sdhc-mb] cmd18 lba={} blocks={} transfer ERROR int={:#010x} ({})",
-            lba, count, int, int_error_name(int)
+            "[sdhc-mb] {} lba={} blocks={} transfer ERROR int={:#010x} ({})",
+            name, lba, count, int, int_error_name(int)
         );
         abort_data_transfer(base);
         return Err(BlockError::Io);
     }
     Ok(n)
+}
+
+// ===================================================================================
+// Step 6 — the ADMA2 engine (SDHC-3b)
+//
+// The first DMA in this driver, and the first time this function is ever granted Bus Master. Every
+// address the engine can reach is checked before that grant is made, and every buffer it can write
+// is allocated and owned by this driver.
+// ===================================================================================
+
+/// One 4 KiB page of descriptors: 512 slots of 8 bytes. Three is the most any transfer below uses.
+///
+/// A 4 KiB-aligned 4 KiB region cannot cross a 64 KiB boundary, so the table satisfies ADMA2's
+/// boundary rule **by construction** rather than by a check that could be got wrong.
+const ADMA2_TABLE_BYTES: usize = 4096;
+const ADMA2_DESC_BYTES: usize = 8;
+const ADMA2_MAX_DESCS: usize = ADMA2_TABLE_BYTES / ADMA2_DESC_BYTES;
+
+/// The driver-owned DMA landing zone: 64 × 512 = 32 KiB, one full [`MB_MAX_BLOCKS`] chunk.
+///
+/// DMA lands **only** here and is then copied to the caller. Two things follow, and together they
+/// are why it exists rather than DMA-ing into the caller's buffer directly:
+/// * every caller-alignment and caller-lifetime constraint disappears; and
+/// * a straggling DMA write that arrives *after* a transfer was declared timed out lands inside
+///   memory this driver owns forever — never in a caller's buffer that has since been freed or
+///   reused. The table and the bounce are allocated once at engine init and never freed.
+const ADMA2_BOUNCE_BYTES: usize = MB_MAX_BLOCKS as usize * 512;
+
+/// Largest byte count in one descriptor. The length field is 16 bits, and spec 3.00 encodes 65536
+/// as a length of 0 — a version-dependent special case this driver simply never relies on. 32 KiB
+/// leaves margin on both sides and still covers a whole chunk in one descriptor when the buffer is
+/// contiguous and boundary-free.
+const ADMA2_MAX_DESC_LEN: usize = 32768;
+
+/// ADMA2 descriptor attributes (spec 3.00 §1.13).
+const ADMA2_ATTR_VALID: u16 = 1 << 0;
+const ADMA2_ATTR_END: u16 = 1 << 1;
+/// Act = 10b: Tran — transfer `length` bytes to/from `address`. No Int attribute is ever set: this
+/// driver is polled, and a descriptor interrupt would raise a status bit nothing consumes.
+const ADMA2_ATTR_ACT_TRAN: u16 = 0b10 << 4;
+
+/// The 32-bit address ceiling. The ADMA2-32 descriptor address field and `REG_ADMA_ADDR` are both
+/// 32 bits wide, so anything at or above this is simply unreachable by the engine — a fact this
+/// driver refuses on rather than truncates into a wrong-but-plausible address.
+const DMA_CEILING: u64 = 0x1_0000_0000;
+
+/// The byte a DMA landing zone is pre-filled with, so "the engine wrote nothing" is distinguishable
+/// from "the engine wrote what was already there".
+const DMA_SENTINEL: u8 = 0xA5;
+
+/// Decode ADMA Error Status bits [1:0] — the state the engine was in when it faulted, which is what
+/// separates "the descriptor table itself is unreadable" from "a descriptor's data transfer failed".
+fn adma_error_state_name(err: u8) -> &'static str {
+    match err & 0b11 {
+        0b00 => "ST_STOP (stopped between descriptors)",
+        0b01 => "ST_FDS (faulted fetching a descriptor)",
+        0b10 => "reserved",
+        _ => "ST_TFR (faulted transferring a descriptor's data)",
+    }
+}
+
+// --- DMA-visible memory access ----------------------------------------------------
+//
+// The bounce buffer and the descriptor table are ordinary Write-Back kernel heap. Everything the
+// CPU writes there must actually reach memory, and everything the DEVICE writes there must actually
+// be re-read — and the compiler knows about neither party. It sees a region this driver filled with
+// a sentinel and no subsequent writer, so a plain read of it is free to be folded back to the
+// sentinel. The two helpers below therefore use volatile accesses, which may be neither elided nor
+// forwarded across.
+//
+// CACHE MAINTENANCE: none, and none is needed. x86_64 is I/O-coherent — the CPU caches and the PCIe
+// DMA path snoop each other — which is the same contract `drivers::xhci::dma_coherency` documents
+// and ships on for every xHCI ring and data buffer in this kernel (on x86_64 its clean/invalidate
+// functions are empty bodies that compile to nothing).
+//
+// ORDERING: zero fence instructions, and this is the reason. Descriptor stores go to WB memory; the
+// MMIO writes that follow them (the ADMA System Address, then the Command register that issues the
+// transfer) go to the UC BAR window. x86-TSO does not reorder stores with stores, and a UC store
+// may not pass earlier stores — so the descriptors are globally visible before the write that makes
+// the controller fetch them. That is byte-for-byte the seam the xHCI doorbell already relies on. In
+// the other direction the UC read of Interrupt Status is the ordering point: PCIe producer/consumer
+// ordering requires a read returning from the device to push the DMA writes it posted ahead of
+// itself, so once that read reports Transfer Complete, every byte the engine wrote is in memory.
+
+/// Fill `len` bytes at DMA-visible physical address `phys` with `byte`, volatile.
+fn dma_fill(phys: u64, len: usize, byte: u8) {
+    let pattern = u64::from_ne_bytes([byte; 8]);
+    let words = len / 8;
+    for i in 0..words {
+        unsafe { core::ptr::write_volatile((phys as *mut u64).add(i), pattern) };
+    }
+    for i in words * 8..len {
+        unsafe { core::ptr::write_volatile((phys as *mut u8).add(i), byte) };
+    }
+}
+
+/// Copy `dst.len()` bytes out of the DMA-visible region at `phys`, volatile.
+fn dma_copy_out(phys: u64, dst: &mut [u8]) {
+    let words = dst.len() / 8;
+    for i in 0..words {
+        let w = unsafe { core::ptr::read_volatile((phys as *const u64).add(i)) };
+        dst[i * 8..i * 8 + 8].copy_from_slice(&w.to_ne_bytes());
+    }
+    for (i, d) in dst.iter_mut().enumerate().skip(words * 8) {
+        *d = unsafe { core::ptr::read_volatile((phys as *const u8).add(i)) };
+    }
+}
+
+/// Write one 8-byte ADMA2-32 descriptor: attr:u16 | length:u16 | address:u32.
+fn adma2_write_desc(table: u64, index: usize, attr: u16, len: u16, addr: u32) {
+    let p = table + (index * ADMA2_DESC_BYTES) as u64;
+    unsafe {
+        core::ptr::write_volatile(p as *mut u16, attr);
+        core::ptr::write_volatile((p + 2) as *mut u16, len);
+        core::ptr::write_volatile((p + 4) as *mut u32, addr);
+    }
+}
+
+/// Build the descriptor chain covering `total` bytes starting at physical `phys`. Returns the
+/// number of descriptors written, or `None` — having printed why — if the span cannot be described.
+///
+/// The span is split at every 64 KiB physical boundary **and** capped at [`ADMA2_MAX_DESC_LEN`].
+/// The first satisfies ADMA2's boundary constraint; the second keeps every length inside the 16-bit
+/// field without ever touching the version-dependent "length 0 means 65536" encoding.
+///
+/// The lengths are summed and checked against `total` before returning. A chain describing fewer
+/// bytes than the block count demands is exactly what raises ADMA Length Mismatch on real silicon,
+/// and catching it here names the bug instead of reading it back off the wire.
+fn adma2_build(table: u64, phys: u64, total: usize) -> Option<usize> {
+    if total == 0 {
+        return None;
+    }
+    let mut at = phys;
+    let mut left = total;
+    let mut n = 0usize;
+    let mut sum = 0usize;
+
+    while left > 0 {
+        if n >= ADMA2_MAX_DESCS {
+            serial_println!(
+                "[sdhc-adma] descriptor table would overflow ({} slots) describing {} bytes at \
+                 {:#x} — refusing",
+                ADMA2_MAX_DESCS, total, phys
+            );
+            return None;
+        }
+        // Bytes from `at` up to the next 64 KiB boundary.
+        let to_boundary = (0x1_0000 - (at & 0xFFFF)) as usize;
+        let this = left.min(to_boundary).min(ADMA2_MAX_DESC_LEN);
+        if at + this as u64 > DMA_CEILING {
+            serial_println!(
+                "[sdhc-adma] descriptor {} would reach {:#x}, past the 32-bit ceiling — refusing",
+                n, at + this as u64
+            );
+            return None;
+        }
+        let last = this == left;
+        let attr = ADMA2_ATTR_VALID | ADMA2_ATTR_ACT_TRAN | if last { ADMA2_ATTR_END } else { 0 };
+        adma2_write_desc(table, n, attr, this as u16, at as u32);
+        sum += this;
+        at += this as u64;
+        left -= this;
+        n += 1;
+    }
+
+    if sum != total {
+        serial_println!(
+            "[sdhc-adma] descriptor lengths sum to {} but {} were required — refusing",
+            sum, total
+        );
+        return None;
+    }
+    Some(n)
+}
+
+/// Bring the ADMA2 engine up for one identified card, or refuse with a named, printed reason.
+///
+/// Ordering is deliberate: capability, then memory, then the address refusals, then the DMA-select
+/// latch, and **only then** Bus Master. The grant comes last because it is the one step that hands
+/// the device a new capability — if anything earlier refuses, the function is left exactly as
+/// milestone 2 left it, with no bus-mastering it does not use.
+fn adma2_init(card: &mut SdCard, caps: &HostCaps) {
+    let (bus, slot, func) = card.bdf;
+    let base = card.base;
+
+    fn refuse(card: &mut SdCard, why: &'static str) {
+        card.adma = Adma2State::Unavailable(why);
+        serial_println!(
+            "[sdhc-adma] UNAVAILABLE ({}) — every read is served by the PIO path; a named \
+             limitation, never a silent one",
+            why
+        );
+    }
+
+    // --- Capability, read FRESH from this boot's controller. Nothing about ADMA2 is carried over
+    // from a previous observation of this machine: the only evidence for the bench part's ADMA2
+    // support is an uncommitted bench note, so the register decides, every boot.
+    if caps.caps & CAP_ADMA2 == 0 {
+        serial_println!("[sdhc-adma] caps={:#010x} adma2-bit=0", caps.caps);
+        refuse(card, "controller advertises no ADMA2");
+        return;
+    }
+
+    // --- Memory. Allocated once, never freed, for the lifetime of the kernel.
+    let Ok(table_layout) = core::alloc::Layout::from_size_align(ADMA2_TABLE_BYTES, 4096) else {
+        refuse(card, "descriptor-table layout invalid");
+        return;
+    };
+    let Ok(bounce_layout) = core::alloc::Layout::from_size_align(ADMA2_BOUNCE_BYTES, 4096) else {
+        refuse(card, "bounce-buffer layout invalid");
+        return;
+    };
+    let table = unsafe { alloc::alloc::alloc_zeroed(table_layout) } as u64;
+    let bounce = unsafe { alloc::alloc::alloc_zeroed(bounce_layout) } as u64;
+    if table == 0 || bounce == 0 {
+        refuse(card, "dma allocation failed");
+        return;
+    }
+
+    // --- The two address refusals, before the engine can ever be called Ready.
+    //
+    // (a) Reachability. On x86_64 the kernel heap is identity-mapped physical RAM handed to devices
+    //     as physical==bus addresses (`arch::x86_64::memory`, which also prints a HEAP WARNING on
+    //     serial if the heap window itself ends above 4 GiB), so `ptr as u64` IS the bus address —
+    //     the same seam the xHCI rings use. In ADMA2-32 that address field is 32 bits, so anything
+    //     at or past the ceiling is unreachable, and is refused BY NAME rather than truncated into
+    //     a valid-looking address pointing at the wrong RAM.
+    // (b) Alignment. The descriptor address field's low bits are address bits, not flags, so a
+    //     misaligned buffer is a WRONG address, not a slow one. The 4096-byte layouts guarantee it;
+    //     it is asserted anyway, because a guarantee that is never checked is an assumption.
+    if table + ADMA2_TABLE_BYTES as u64 > DMA_CEILING
+        || bounce + ADMA2_BOUNCE_BYTES as u64 > DMA_CEILING
+    {
+        serial_println!("[sdhc-adma] table={:#x} buf={:#x} ceiling={:#x}", table, bounce, DMA_CEILING);
+        refuse(card, "dma window above 4GiB");
+        return;
+    }
+    if table & 0x3 != 0 || bounce & 0x3 != 0 {
+        serial_println!("[sdhc-adma] table={:#x} buf={:#x} not 4-byte aligned", table, bounce);
+        refuse(card, "dma window misaligned");
+        return;
+    }
+
+    // --- Host Control 1 DMA Select -> 32-bit ADMA2, read-modify-write so the bus-width, high-speed
+    // and LED bits the earlier steps left there are preserved.
+    let hc1 = r8(base, REG_HOST_CONTROL1);
+    let hc1_want = (hc1 & !HC1_DMA_SELECT_MASK) | HC1_DMA_ADMA2_32;
+    w8(base, REG_HOST_CONTROL1, hc1_want);
+    let hc1_back = r8(base, REG_HOST_CONTROL1);
+    serial_println!(
+        "[sdhc-adma] host-control1 {:#04x} -> {:#04x} readback={:#04x} dma-select={:#03b}",
+        hc1, hc1_want, hc1_back, (hc1_back & HC1_DMA_SELECT_MASK) >> 3
+    );
+    if hc1_back & HC1_DMA_SELECT_MASK != HC1_DMA_ADMA2_32 {
+        refuse(card, "dma-select did not latch");
+        return;
+    }
+
+    // --- Bus Master. The first grant this kernel has ever made to this function: milestones 1 and
+    // 2 left the bit exactly as the firmware set it because they issued no DMA. It is enabled HERE,
+    // at engine init, and deliberately NOT in `claim` — so every log line up to and including the
+    // claim line stays directly comparable with a milestone-1 or milestone-2 boot log.
+    let cmd_before = unsafe { crate::arch::pci::read_config_16(bus, slot, func, 0x04) };
+    unsafe { crate::arch::pci::write_config_16(bus, slot, func, 0x04, cmd_before | 0x0004) };
+    let cmd_after = unsafe { crate::arch::pci::read_config_16(bus, slot, func, 0x04) };
+    serial_println!(
+        "[sdhc-adma] bus-master grant bdf {}:{}.{} cmd {:#06x} -> {:#06x} bus-master {} -> {}",
+        bus, slot, func, cmd_before, cmd_after,
+        (cmd_before >> 2) & 1, (cmd_after >> 2) & 1
+    );
+    if cmd_after & 0x0004 == 0 {
+        refuse(card, "bus-master did not latch");
+        return;
+    }
+
+    card.adma_table = table;
+    card.adma_bounce = bounce;
+    card.adma = Adma2State::Ready;
+    serial_println!(
+        "[sdhc-adma] engine ready bm=1 table={:#x} buf={:#x} descs-max={} mode=adma2-32",
+        table, bounce, ADMA2_MAX_DESCS
+    );
+}
+
+/// Print everything the controller knows about a failed DMA transfer, on one line.
+///
+/// Raw Interrupt Status, raw ADMA Error Status, the ADMA System Address read BACK from the
+/// controller — it advances as the engine walks the table, so it names the descriptor the engine
+/// faulted on — and the Auto CMD Error word. Raw first, decoded second, as everywhere else here.
+fn adma2_report_failure(base: u64, table: u64, what: &str, lba: u64, count: u16, int: u32) {
+    let adma_err = r8(base, REG_ADMA_ERROR);
+    let adma_at = r32(base, REG_ADMA_ADDR);
+    let acmd_err = r16(base, REG_AUTO_CMD_ERR);
+    let desc = if adma_at as u64 >= table {
+        ((adma_at as u64 - table) / ADMA2_DESC_BYTES as u64) as i64
+    } else {
+        -1
+    };
+    serial_println!(
+        "[sdhc-adma] {} lba={} blocks={} FAILED int={:#010x} ({}) adma-err={:#04x} ({}) \
+         adma-addr={:#010x} table={:#x} desc={} auto-cmd-err={:#06x}",
+        what, lba, count, int, int_error_name(int),
+        adma_err, adma_error_state_name(adma_err),
+        adma_at, table, desc, acmd_err
+    );
+}
+
+/// Read `count` blocks at `lba` through the ADMA2 engine into `buf`. Returns (bytes copied, whether
+/// the engine actually wrote the bounce buffer).
+///
+/// The caller must have established that `card.adma` is [`Adma2State::Ready`]. This function never
+/// falls back to PIO on its own: a fallback that hides the failure it fell back from is exactly the
+/// instrument lie §7.3 forbids, so the decision belongs to the dispatcher that can also print it.
+fn read_blocks_adma_on(
+    card: &SdCard,
+    lba: u64,
+    count: u16,
+    buf: &mut [u8],
+) -> Result<(usize, bool), BlockError> {
+    if count == 0 || count > MB_MAX_BLOCKS {
+        serial_println!("[sdhc-adma] refusing count={} (bound is 1..={})", count, MB_MAX_BLOCKS);
+        return Err(BlockError::Io);
+    }
+    let n = count as usize * 512;
+    if buf.len() < n {
+        serial_println!(
+            "[sdhc-adma] refusing lba={} blocks={}: caller buffer is {} bytes, {} needed",
+            lba, count, buf.len(), n
+        );
+        return Err(BlockError::Io);
+    }
+    if lba.checked_add(count as u64).is_none_or(|end| end > card.num_blocks) {
+        return Err(BlockError::BadLba);
+    }
+    if card.adma_table == 0 || card.adma_bounce == 0 {
+        return Err(BlockError::NotReady);
+    }
+
+    let base = card.base;
+    let table = card.adma_table;
+    let bounce = card.adma_bounce;
+    let arg = lba_arg(card, lba)?;
+    let (command, tm, name) = counted_read_cmd(count);
+
+    // Sentinel FIRST. Without it, a transfer where the engine wrote nothing at all would hand back
+    // the previous transfer's bytes — or zeros that happen to match a zeroed control — with an `Ok`
+    // beside them. With it, "the DMA engine did not write" is a reportable outcome (`wrote=0`)
+    // instead of an invisible one.
+    dma_fill(bounce, n, DMA_SENTINEL);
+
+    let descs = adma2_build(table, bounce, n).ok_or(BlockError::Io)?;
+
+    w32(base, REG_INT_STATUS, 0xFFFF_FFFF); // W1C stale status
+    w32(base, REG_ADMA_ADDR, table as u32); // low half only: ADMA2-32 has no high half
+    w16(base, REG_BLOCK_SIZE, 512);
+    w16(base, REG_BLOCK_COUNT, count);
+    w16(base, REG_TRANSFER_MODE, tm | TM_DMA_EN);
+
+    if let Err(int) = send_command(base, command, arg, true) {
+        adma2_report_failure(base, table, name, lba, count, int);
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+    if let Err(r1) = r1_check(base, "adma2 read") {
+        serial_println!(
+            "[sdhc-adma] {} lba={} blocks={} rejected by the CARD r1={:#010x}",
+            name, lba, count, r1
+        );
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+
+    // ONE wait for the whole transfer — with DMA there is no per-block CPU rendezvous, which is the
+    // entire point of the engine. Budget: the single-block data ceiling plus 2 ms per block (≤328 ms
+    // at 64 blocks), in the same rdtsc units as every other wait in this driver.
+    let budget = DATA_TIMEOUT_MS + 2 * count as u64;
+    if !wait_ms(budget, || {
+        r32(base, REG_INT_STATUS) & (INT_XFER_COMPLETE | INT_ERR_ANY) != 0
+    }) {
+        let int = r32(base, REG_INT_STATUS);
+        serial_println!("[sdhc-adma] transfer TIMEOUT after {}ms with {} descriptor(s)", budget, descs);
+        adma2_report_failure(base, table, name, lba, count, int);
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+    // This UC read is also the ordering point in the device->CPU direction: PCIe requires it to push
+    // the engine's posted writes ahead of itself, so once it reports Transfer Complete the bounce
+    // buffer has settled and no fence is needed before reading it.
+    let int = r32(base, REG_INT_STATUS);
+    w32(base, REG_INT_STATUS, int); // W1C everything we saw
+    if int & INT_ERR_ANY != 0 {
+        adma2_report_failure(base, table, name, lba, count, int);
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+
+    dma_copy_out(bounce, &mut buf[..n]);
+    // Whether the engine wrote anything at all. A card sector legitimately full of the sentinel byte
+    // would read as `wrote=0`; that is a stated limit of this indicator, not a hidden one.
+    let wrote = buf[..n].iter().any(|&b| b != DMA_SENTINEL);
+    Ok((n, wrote))
+}
+
+/// [`read_blocks_adma_on`] against the published card.
+fn read_blocks_512_adma(lba: u64, count: u16, buf: &mut [u8]) -> Result<(usize, bool), BlockError> {
+    let guard = CARD.lock();
+    let card = guard.as_ref().ok_or(BlockError::NotReady)?;
+    if card.adma != Adma2State::Ready {
+        return Err(BlockError::NotReady);
+    }
+    read_blocks_adma_on(card, lba, count, buf)
+}
+
+/// The engine's state, copied out from under the lock.
+fn adma_state() -> Option<Adma2State> {
+    CARD.lock().as_ref().map(|c| c.adma)
+}
+
+/// One in-boot DMA transfer, so a metal log says whether the engine ever ran at all.
+///
+/// Three readings are distinguishable in the log, which is why this prints a verdict and not a
+/// status: `engine ready` + `read … ok wrote=1` (healthy); `UNAVAILABLE (reason)` with no `read`
+/// line (the engine never ran, and why); `read … ok wrote=0` (the transfer completed but the engine
+/// wrote nothing — the failure a bare `Ok` would have concealed).
+fn adma2_smoke(num_blocks: u64) {
+    if adma_state() != Some(Adma2State::Ready) {
+        // The refusal has already printed its own named line at init; a second, weaker restatement
+        // of it here would only compete with the real one.
+        return;
+    }
+    let blocks = VERIFY_WINDOW_BLOCKS;
+    if num_blocks < blocks as u64 {
+        serial_println!("[sdhc-adma] smoke SKIPPED — card holds {} blocks", num_blocks);
+        return;
+    }
+    let n = blocks * 512;
+    let mut mb = MB_BUF.lock();
+    match read_blocks_512_adma(0, blocks as u16, &mut mb[..n]) {
+        Ok((bytes, wrote)) => serial_println!(
+            "[sdhc-adma] read lba=0 blocks={} ok wrote={} bytes={}",
+            blocks, wrote as u8, bytes
+        ),
+        Err(e) => serial_println!(
+            "[sdhc-adma] read lba=0 blocks={} FAILED ({:?}) — reason named on the line above",
+            blocks, e
+        ),
+    }
 }
 
 // ===================================================================================
@@ -1624,7 +2165,7 @@ fn bring_up(base: u64, bus: u8, slot: u8, func: u8) -> bool {
         bus, slot, func, CLK_IDENT_HZ
     );
 
-    let Some(card) = identify(base, &caps, (bus, slot, func)) else {
+    let Some(mut card) = identify(base, &caps, (bus, slot, func)) else {
         return false;
     };
     serial_println!(
@@ -1634,6 +2175,11 @@ fn bring_up(base: u64, bus: u8, slot: u8, func: u8) -> bool {
         if card.csd_structure == 1 { 2 } else { 1 }
     );
     let num_blocks = card.num_blocks;
+
+    // SDHC-3b: the DMA engine, AFTER identification (it needs a card in transfer state to be worth
+    // anything) and BEFORE publication (so the card is never visible with a half-built engine).
+    // Refusal is not failure: an unavailable engine names itself and the PIO path serves every read.
+    adma2_init(&mut card, &caps);
     *CARD.lock() = Some(card);
 
     // Verification goes through the PUBLIC read path, after the card is published, so what the
@@ -1642,6 +2188,8 @@ fn bring_up(base: u64, bus: u8, slot: u8, func: u8) -> bool {
 
     // SDHC-3a: multi-block command semantics, measured against that same public single-block path.
     verify_multiblock(num_blocks);
+    // SDHC-3b: one DMA transfer, so the log says whether the engine ever ran.
+    adma2_smoke(num_blocks);
     true
 }
 
