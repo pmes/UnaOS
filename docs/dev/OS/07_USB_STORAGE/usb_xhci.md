@@ -276,6 +276,68 @@ if let Some(xhci) = &mut *XHCI_CONTROLLER.lock() {
 this safe, non-interrupt context (the actual SCSI READ(10)/WRITE(10) + Command
 Status Wrapper exchange), rather than inside the MSI handler.
 
+### 4a. Console-first ordering (BOOTPACE M2)
+
+The order of the hooks in that ladder is not incidental, and as of this arc it is
+fixed by two rules. Both x86-reachable ladders in `main.rs` (the `usbdebug` loop
+and the GUI loop) now run:
+
+```rust
+xhci.poll_events();
+xhci.service_ftdi();      // <- ahead of storage
+xhci.service_storage();
+xhci.service_hubs();
+xhci.service_hid_setproto();
+xhci.service_slot_disposal();
+xhci.service_enum();
+```
+
+and `service_storage()` holds its deferred bring-up while enumeration is still in
+flight:
+
+```rust
+if !self.storage_pending_bringup { return; }
+if self.enum_active || !self.ports_to_enumerate.is_empty() { return; }  // latch stays SET
+```
+
+**Why.** On metal the FTDI console is the only instrument that exists, and it arms
+at the *end* of its own port's enumeration. Previously, the storage device's
+Configure-Endpoint completion armed `storage_pending_bringup` and the very next
+`service_storage()` ran the multi-second TUR / INQUIRY / READ CAPACITY chain —
+plus the FAT mount and the first flight-recorder flush behind it — while the
+remaining ports, *including the FTDI's*, were still queued. Every one of those
+seconds elapsed with no console attached, so those lines reached a second host
+only as a replay out of the 64 KiB capture ring (`ftdi.rs`), which discards the
+**oldest** on overflow. Deferring means all ports enumerate back-to-back, the
+console arms, and only then does the storage chain start — live on the wire.
+
+**Cost.** Storage becomes ready later by the tail of enumeration only: hundreds of
+milliseconds, worst case one wedged port's bounded watchdog. Every `service_enum`
+stage has such a watchdog (`recover_enumeration` on expiry), so `enum_active`
+cannot stay true indefinitely and the deferral cannot become a hang. The latch is
+left set — this is a postponement, never a skip.
+
+**No protocol change.** This is ordering only: no budget, no settle, no timing
+constant, no interrupt-model change. Nothing downstream needed adjusting either —
+`fat::probe_once`, `flight_recorder::service` and the storage fixtures all gate on
+`block::info()` internally, so they simply follow the block device's later arrival.
+
+**Dating a capture.** The `:: BOT: knobs … result=KNOBS ::` line carries
+`order=console-first`, on the same terms as `cbw=always-awaited`: not a knob, a
+statement of what the build always does. A log whose KNOBS line lacks the field
+predates this reordering, and its storage-chain timings were taken with the
+console not yet armed. Artifact proof:
+`strings unaos/target/x86_64_esp/kernel.elf | grep -c 'order=console-first'` ≥ 1.
+
+**What is measurable.** BPACE (`docs/dev/OS/01_BOOT_HAL/bootpace.md`) reads the
+reordering directly: `ftdi-up` now precedes `stor-bringup` on the ledger, where
+before this arc it landed after `fr-flush`. That inversion — and only it — is the
+proof the reordering took effect; `gui=` is unaffected, because the GUI handoff
+happens before the service loop that runs any of these hooks even starts.
+
+The Pi's `pump_usb_into_gui` ladder (`main.rs`, `all(aarch64, baremetal)`) is
+deliberately **unchanged**: `service_ftdi` is a no-op there.
+
 ---
 
 ## 5. Block storage interface
@@ -4504,6 +4566,32 @@ column is what the alternative costs. The ceiling itself has a known remedy that
 — take the xHCI interrupt instead of polling (§16.6's `IRQ_COUNT=0` and the never-RW1C'd `IMAN=0x3`),
 which would return the cost to interrupt latency for **all three** stages at once.
 
+> **ADDENDUM (2026-07-30, BOOTPACE M3). The cost was not permanent — it was the cost of sleeping
+> FIRST.** The paragraphs above are correct about the mechanism and wrong about its inevitability.
+> `hlt()` sleeps until an interrupt; with xHCI interrupts not enabled the only wake is the 1 kHz APIC
+> tick; therefore *a stage that begins by calling `hlt()`* costs a tick no matter how fast the
+> controller answered. But nothing required the pump to begin there. All three synchronous pumps —
+> `pump_until_bot_done`, `pump_until_ep0_done`, `pump_until_cmd_done` — now busy-poll
+> `drain_event_ring_once()` under a bounded `now_cycles` sub-deadline of **~200 µs**
+> (`Xhci::spin_window`, `cycles_per_ms()/5` — a spec-scale constant chosen against controller
+> latency, deliberately **not** derived from `hw_wait_budget()`) before falling into the sleep. A
+> healthy controller posts a completion in single-digit to low-tens of microseconds, so nearly every
+> awaited stage now returns from inside the spin window and the tick quantisation is gone.
+>
+> **The hlt fallback is kept, and that is not an oversight.** A pure spin never exits under QEMU TCG
+> — the note at the top of `pump_until_bot_done` says so, and it is still true. Past the window the
+> path is byte-identical to what it was: one `hlt()` per pass, the same wall-clock deadline
+> arithmetic, the same timeout lines. Under TCG the spin merely wastes ≤200 µs per pass.
+>
+> **What did NOT change.** No budget, no settle, no timeout, no protocol timing, and — explicitly —
+> no interrupt state: no IMAN write, no MSI change. Taking the interrupt remains the future remedy,
+> now for the residue rather than for the whole tick. The KNOBS line carries `pump=spin+hlt` so a
+> capture can be dated; artifact proof is
+> `strings unaos/target/x86_64_esp/kernel.elf | grep -c 'pump=spin+hlt'` ≥ 1.
+>
+> **No new counter was added for it**, deliberately: the existing instruments already carry the
+> verdict. See §17.8 item 4.
+
 ### 17.5 Corrections this arc makes to its own earlier claims
 
 Recorded in full rather than quietly dropped: three readings that were quoted as evidence in this
@@ -4578,8 +4666,22 @@ pair, the CBW await is the only thing left that changed.
    deterministic-recurrence handle.
 3. **`stage=cbw` has never been printed.** If it ever appears on a `TIMEOUT-SHAPE` line, the device
    is refusing the command itself and this section's mechanism does not cover it.
-4. **The measured cost.** `mean` on the SUMMARY line should now sit near **three** ticks per
-   transaction rather than two. If it does not, the pump is not doing what §16.6 says it does.
+4. **The measured cost — REVISED by BOOTPACE M3 (see §17.4's addendum).** The original expectation
+   was `mean` near **three** ticks per transaction rather than two, on the reasoning that each of
+   the three awaited stages costs one 1 kHz tick. With the spin-then-halt pumps that reasoning no
+   longer applies to a healthy controller, and the expectation inverts:
+
+   - `mean` on `:: BOT: … result=SUMMARY ::` should fall to **well under one tick** per
+     transaction — the three stages now cost controller latency (microseconds), not three ticks.
+   - `BOT_WAIT_BUCKETS` bucket 0 ("under 1 ms") should hold **nearly all** stages. Before this
+     change it held almost none.
+   - The KNOBS line must read `pump=spin+hlt`. If it does not, the build predates the change and
+     the two readings above do not apply to it.
+
+   A `mean` still sitting near three ticks **with** `pump=spin+hlt` present is the falsifying
+   result: it would say completions are genuinely arriving later than 200 µs, i.e. the tick was
+   never the dominant cost and something else is. That is a finding, not a failure — but it must be
+   reported rather than explained away.
 
 ---
 

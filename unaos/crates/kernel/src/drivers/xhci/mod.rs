@@ -920,6 +920,18 @@ const BOT_RING_KNOB_TAG: &str = "botring64=ON-64trb";
 // kept on the KNOBS line because captures are compared across boots and a reader must be able to
 // tell a post-fix artifact from a pre-fix one without diffing the source.
 const BOT_CBWIOC_KNOB_TAG: &str = "cbw=always-awaited";
+// BOOTPACE M2 (2026-07-30): likewise not a knob. The main loop brings the FTDI console up BEFORE it
+// runs any storage I/O — `service_storage` holds the deferred SCSI bring-up until the enumeration
+// queue has drained, and `service_ftdi` precedes it in both x86 service ladders — so the whole
+// storage chain is witnessed live on the wire instead of replayed out of the capture ring. Carried
+// on the KNOBS line so a capture can be dated: a log without this field predates the reordering.
+const BOT_ORDER_TAG: &str = "order=console-first";
+// BOOTPACE M3 (2026-07-30): likewise not a knob. All three synchronous pumps busy-poll the event
+// ring for a spec-scale window (~200 µs) BEFORE falling into `hlt()`, so an awaited stage no longer
+// costs a full 1 kHz APIC tick just because the controller was answered in microseconds. The hlt
+// fallback is unchanged and still the only thing that makes progress under QEMU TCG. Carried on the
+// KNOBS line so a capture can be dated: a log without this field has tick-quantised `mean=`.
+const BOT_PUMP_TAG: &str = "pump=spin+hlt";
 
 // **The CBW is an awaited stage. Unconditionally. This is a fix, and it is convicted on metal.**
 //
@@ -3826,6 +3838,11 @@ impl XhciController {
                 core::hint::spin_loop();
             }
             serial_println!("xHCI: port settle complete before CCS scan");
+            // BPACE: the fixed pre-enumeration settle (`hw_wait_budget()/4` — ~0.5 s of wall clock
+            // and nothing else). Its `d=` from `pci-usb` is the entire cost of this one constant,
+            // which is exactly what a later settle-trim arc must have measured before it may touch
+            // the number. Absent on a `skip_xhci` build, with every pre-USB tag still present.
+            crate::bootpace::record("xhci-settle");
 
             // Scrub any latched PORTSC change bits before enumeration: one latched bit gates
             // PSCEG (4.19.2) and blocks ALL Port Status Change events for that port, so a
@@ -4100,6 +4117,16 @@ impl XhciController {
     /// Begin enumerating the next queued connected port. Called at boot and again each
     /// time a device finishes its setup, so at most one port is mid-enumeration.
     fn start_next_port(&mut self) {
+        // BPACE: close the ledger entry for the port the FSM is LEAVING. `start_next_port` is the
+        // single funnel through which the root enumeration FSM releases a port — reached from every
+        // configure-complete branch (storage, FTDI, HID) and from `recover_enumeration`'s give-up
+        // path — so one stamp here covers all of them, where stamping the individual
+        // Configure-Endpoint branches would have missed HID (whose enumeration continues through
+        // SET_CONFIGURATION) and every failure. `-done` therefore means "the FSM left this port",
+        // success or surrender; the outcome is on the neighbouring xHCI lines, the TIME is here.
+        if self.enumerating_port != 0 {
+            crate::bootpace::record_port(self.enumerating_port, true);
+        }
         // M1 (XENUM-1): fold in any port that asked to be re-enumerated once the in-flight
         // enumeration settled (a genuine re-plug that arrived mid-enumeration). Draining here —
         // the single point where the FSM goes idle — keeps the one-port-at-a-time invariant.
@@ -4148,6 +4175,10 @@ impl XhciController {
             self.enum_saw_disconnect = false; // M1: fresh disconnect tracking per enumeration
             self.enum_resets = 1;
             serial_println!("xHCI: === Enumerating Port {} (PORTSC={:#x}) ===", port, portsc);
+            // BPACE: this port's enumeration begins. Paired with the `-done` stamp at the top of
+            // this function, `d=` across the pair is the per-port enumeration cost — the number that
+            // says whether the boot's USB time is one slow device or the debounce paid N times.
+            crate::bootpace::record_port(port, false);
             // Debounce BEFORE the first reset (USB 2.0 TATTDB: 100 ms of stable connection
             // after attach). The metal rMBP bench captured a hot-plugged High-Speed SD reader
             // that, reset immediately on the connect event, trained at Full-Speed (failed HS
@@ -7049,6 +7080,46 @@ impl XhciController {
         }
     }
 
+    /// BOOTPACE M3 — the polled pumps' pre-`hlt()` spin window, in `now_cycles` units. ~200 µs.
+    ///
+    /// A SPEC-scale number, and deliberately NOT derived from `hw_wait_budget()`, for the same
+    /// reason `cycles_per_ms` is not: that budget is a policy ("how long may a wedged handshake burn
+    /// before we call it dead"), and rescaling this window the day the timeout policy changed would
+    /// be a silent behaviour change in the hot path. 200 µs is chosen against the hardware instead:
+    /// a healthy xHC posts a bulk or control completion in single-digit to low-tens of
+    /// microseconds, so the window covers a completion with an order of magnitude to spare while
+    /// remaining far below the 1 ms the alternative costs.
+    fn spin_window() -> u64 {
+        (Self::cycles_per_ms() / 5).max(1)
+    }
+
+    /// Busy-poll the event ring for at most `window` counter ticks, returning `true` the moment an
+    /// event is drained (so the caller re-checks its own pending record) and `false` if the window
+    /// expired with the ring still empty.
+    ///
+    /// BOOTPACE M3 — why this exists. All three synchronous pumps below waited by calling
+    /// `crate::hlt()`, which on x86/Pi/aarch64-virt sleeps until the next INTERRUPT. With xHCI
+    /// interrupts not enabled (`IRQ_COUNT=0` on every boot), the only thing that ever wakes it is
+    /// the 1 kHz APIC timer — so EVERY awaited stage cost at least one full tick regardless of how
+    /// fast the controller actually answered, and §17.4 recorded that quantisation as a permanent
+    /// cost of the polled design. It is not permanent; it is only the cost of sleeping FIRST.
+    /// Spinning for a spec-scale window before sleeping collects the completion in the microseconds
+    /// it actually takes, and the hlt path stays exactly as it was for everything slower.
+    ///
+    /// This changes no budget, no timeout, no wall-clock deadline and no interrupt state. Past the
+    /// window, behaviour is byte-identical to before: one `hlt()` per pass, the same deadline
+    /// arithmetic, the same timeout lines.
+    fn spin_for_event(&mut self, window: u64) -> bool {
+        let start = crate::arch::now_cycles();
+        while crate::arch::now_cycles().wrapping_sub(start) < window {
+            if self.drain_event_ring_once() {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        false
+    }
+
     /// Busy-settle `ms` milliseconds off the free-running counter, draining the event ring as it
     /// goes. Draining matters: a late completion for the transaction that just timed out, or a Port
     /// Status Change raised by the power cycle in escalation (b), must be consumed here rather than
@@ -7620,6 +7691,15 @@ impl XhciController {
         }
         pump?;
         let p = pending.ok_or(BotError::Timeout)?;
+        // BPACE: the first BOT stage this boot ever completed. One-shot — this function runs
+        // thousands of times per boot, and the ledger wants the EDGE ("the mass-storage protocol
+        // started moving"), not a per-transaction trace. Placed after `pump?` so a timed-out first
+        // stage does not latch it: `bot-first` present means the wire actually carried a completion.
+        {
+            static BOT_FIRST: core::sync::atomic::AtomicUsize =
+                core::sync::atomic::AtomicUsize::new(0);
+            crate::bootpace::record_once(&BOT_FIRST, "bot-first");
+        }
         Ok((p.completion_code, p.residue))
     }
 
@@ -7670,6 +7750,9 @@ impl XhciController {
         // Every event-ring TRB this wait consumes, of any type. Local to the wait by construction:
         // it cannot be read against its own pre-run total because it has none.
         let mut evts: u64 = 0;
+        // BOOTPACE M3: hoisted out of the loop — the rate does not change mid-wait, and this keeps
+        // the per-pass cost of the spin at zero atomic loads.
+        let spin_window = Self::spin_window();
         loop {
             match &self.bot_pending {
                 Some(p) if p.done => {
@@ -7688,10 +7771,20 @@ impl XhciController {
                 evts = evts.saturating_add(1);
                 continue; // processed an event; drain any more immediately
             }
+            // BOOTPACE M3 — SPIN, THEN HALT. Busy-poll the ring for ~200 µs before sleeping. A
+            // healthy controller answers in microseconds, so nearly every awaited stage now returns
+            // from here instead of paying a full 1 kHz APIC tick to `hlt()`. Counted into `evts`
+            // exactly like the drain above, so the timeout witness stays honest.
+            if self.spin_for_event(spin_window) {
+                evts = evts.saturating_add(1);
+                continue;
+            }
             // Yield to QEMU's main loop so it can run the xHC bottom-half / async block-I/O
             // completion and DMA the event into the ring; a pure spin never exits TCG. On the
             // timerless tegra post-drop core this falls back to a busy spin (arch::hlt), which the
-            // wall-clock deadline below still bounds.
+            // wall-clock deadline below still bounds. KEPT, and not replaced by the spin above: the
+            // spin cannot be the only wait, or TCG would never make progress — past its window this
+            // path is byte-identical to what it was.
             crate::hlt();
             let elapsed = crate::arch::now_cycles().wrapping_sub(start);
             if elapsed >= budget {
@@ -8010,9 +8103,14 @@ impl XhciController {
         // evidence never convicted ring length). The third field is no longer a knob at all: it
         // reads `cbw=always-awaited` in every build, and its presence is how a capture is dated
         // against §17. A log still carrying `botcbwioc=` is from before the fix.
+        // BOOTPACE M2: `order=console-first` joins it on the same terms — not a knob, a statement of
+        // what the build always does (the SCSI bring-up waits for the enumeration queue to drain,
+        // and `service_ftdi` precedes `service_storage` in both x86 ladders). It exists so a capture
+        // can be dated: a log whose KNOBS line lacks this field predates the reordering, and its
+        // storage-chain timings were taken with the console not yet armed.
         serial_println!(
-            ":: BOT: knobs ring_trbs={} {} {} result=KNOBS ::",
-            BOT_RING_TRBS, BOT_RING_KNOB_TAG, BOT_CBWIOC_KNOB_TAG);
+            ":: BOT: knobs ring_trbs={} {} {} {} {} result=KNOBS ::",
+            BOT_RING_TRBS, BOT_RING_KNOB_TAG, BOT_CBWIOC_KNOB_TAG, BOT_ORDER_TAG, BOT_PUMP_TAG);
         Ok(())
     }
 
@@ -8113,14 +8211,41 @@ impl XhciController {
 
     pub fn service_storage(&mut self) {
         if !self.storage_pending_bringup { return; }
+        // BOOTPACE M2 — CONSOLE-FIRST. Defer the whole SCSI bring-up until the enumeration queue
+        // has drained. The latch is left SET (this is a `return`, not a consume), so the bring-up is
+        // not skipped, only postponed to the first main-loop pass on which no port is mid-enumeration.
+        //
+        // Why: the FTDI console is the only instrument that exists on a metal boot, and it arms at
+        // the END of its own port's enumeration. Before this, the storage Configure-Endpoint
+        // completion armed `storage_pending_bringup` and the very next `service_storage` ran the
+        // multi-second TUR/INQUIRY/READ-CAPACITY chain — plus the FAT mount and the first
+        // flight-recorder flush behind it — while the remaining ports, INCLUDING the FTDI's, were
+        // still queued. Every one of those seconds happened with no console attached, so the log
+        // reached a second host only as a replay out of the 64 KiB capture ring, which drops the
+        // oldest lines on overflow. Enumerating all ports back-to-back first costs the tail of
+        // enumeration (hundreds of ms; worst case one wedged port's bounded watchdog — every
+        // `service_enum` stage has one, so `enum_active` cannot stay true forever) and buys a live
+        // wire for the entire storage chain.
+        //
+        // Nothing downstream needed changing: `fat::probe_once`, `flight_recorder::service` and the
+        // fixtures all gate on `block::info()` internally, so they follow the block device's arrival.
+        // This changes ORDER only — no protocol timing, no budget, no settle.
+        if self.enum_active || !self.ports_to_enumerate.is_empty() { return; }
         self.storage_pending_bringup = false;
         if self.storage_slot == 0 { return; }
 
         serial_println!("xHCI: === STORAGE BRING-UP (TUR/INQUIRY/READ CAPACITY) ===");
+        // BPACE: the SCSI bring-up chain begins. `d=` between this and `stor-ready` is the whole
+        // TUR/INQUIRY/READ-CAPACITY negotiation — every one of whose stages is an awaited BOT
+        // transaction, i.e. the phase the pump quantisation of §17.4 taxes hardest.
+        crate::bootpace::record("stor-bringup");
         match self.bring_up_storage() {
             Ok(()) => serial_println!("xHCI: storage ready."),
             Err(e) => { serial_println!("xHCI: storage bring-up failed: {:?}", e); return; }
         }
+        // BPACE: reached only on SUCCESS — a failed bring-up returns above, so a ledger carrying
+        // `stor-bringup` without `stor-ready` says the storage chain died rather than ran slowly.
+        crate::bootpace::record("stor-ready");
 
         // PIUSB-35: decisive DMA-address witness. P45 refuted the cache theory (the LBA0 read still
         // returns all-zero with a Passed/residue=0 CSW even with PIUSB-34's clean-before-doorbell +
@@ -8557,6 +8682,10 @@ impl XhciController {
             // sees no bytes, the silence is post-arm TX, not a bring-up failure. That split is the
             // bench ask this ring exists to answer.
             crate::bootlog::record("ftdi:console-up");
+            // BPACE: the moment a second host can see anything at all. Everything stamped BEFORE
+            // this reached the wire only via the capture ring's replay; everything after rides live.
+            // `ftdi=` on the total line is therefore also the ledger's own observability boundary.
+            crate::bootpace::record("ftdi-up");
             ftdi::set_live(true);
         }
         self.drain_ftdi();
@@ -8799,6 +8928,10 @@ impl XhciController {
     fn pump_until_ep0_done(&mut self) -> Result<(), ()> {
         let start = crate::arch::now_cycles();
         let budget = crate::arch::hw_wait_budget();
+        // BOOTPACE M3: the ~200 µs pre-hlt spin window, hoisted (see `spin_window`). EP0 matters
+        // most of the three: enumeration is dozens of control transfers per device, each of which
+        // used to cost a full APIC tick no matter how fast the device answered.
+        let spin_window = Self::spin_window();
         loop {
             match &self.ep0_pending {
                 Some(p) if p.done => return Ok(()),
@@ -8806,6 +8939,11 @@ impl XhciController {
                 _ => {}
             }
             if self.drain_event_ring_once() {
+                continue;
+            }
+            // BOOTPACE M3 — spin, then halt. Same shape as the BOT pump: busy-poll for a spec-scale
+            // window, and fall through to the unchanged hlt path if nothing arrives.
+            if self.spin_for_event(spin_window) {
                 continue;
             }
             crate::hlt(); // yield to QEMU so it can DMA the completion into the event ring
@@ -8850,6 +8988,8 @@ impl XhciController {
     fn pump_until_cmd_done(&mut self) -> Result<(), ()> {
         let start = crate::arch::now_cycles();
         let budget = crate::arch::hw_wait_budget();
+        // BOOTPACE M3: the ~200 µs pre-hlt spin window, hoisted (see `spin_window`).
+        let spin_window = Self::spin_window();
         loop {
             match &self.cmd_pending {
                 Some(p) if p.done => return Ok(()),
@@ -8857,6 +8997,11 @@ impl XhciController {
                 _ => {}
             }
             if self.drain_event_ring_once() {
+                continue;
+            }
+            // BOOTPACE M3 — spin, then halt. The command ring is the fastest of the three (no device
+            // round trip at all for ENABLE_SLOT), so this is where the tick tax was most absurd.
+            if self.spin_for_event(spin_window) {
                 continue;
             }
             crate::hlt();

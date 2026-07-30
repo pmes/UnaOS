@@ -78,6 +78,15 @@ pub extern "C" fn __rust_boot(dtb: u64) -> ! {
 // below unreachable in those builds.
 #[cfg_attr(any(feature = "bootlog", feature = "usbdebug", feature = "baremetal", feature = "tegra"), allow(unreachable_code))]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    // BPACE origin. The FIRST instruction of the kernel proper, before any subsystem exists, so the
+    // ledger's `t=0` is as close to "the kernel got control" as this function can get. On x86 the
+    // rdtsc value read here is the counter since RESET, so it is also — approximately — the cost of
+    // firmware + bootloader, the one boot phase this kernel can never instrument from the inside.
+    // Approximately: the TSC's zero is the last processor reset, which on a warm boot need not be
+    // the moment power was applied. Read the number as an upper bound on pre-kernel time, not as a
+    // measurement of firmware. Heap-free and lock-light, so it is safe this early.
+    unaos_kernel::bootpace::record("entry");
+
     // 0. Framebuffer log sink FIRST — mirror every serial_println! (and panics) to the screen,
     //    so boot diagnostics are visible on real hardware that has no serial port. No-op if the
     //    firmware gave us no framebuffer. The GUI repaints over it later on a successful boot.
@@ -212,6 +221,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 4. Global Heap Allocation (Phase 3 Memory Translation)
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
+    unaos_kernel::bootpace::record("heap");
 
     // VPERF M3 EARLY-ATTACH (bench QoL, Peter's word 2026-07-16): usbdebug builds attach the
     // fbcon cached-RAM shadow the moment the heap exists, so the ENTIRE boot log scrolls in
@@ -647,6 +657,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     unaos_kernel::arch::acpi::pm_timer_report(rsdp_addr);
 
+    // BPACE: the whole ACPI phase — MADT topology discovery, the DMAR/IOMMU report and the PM-timer
+    // liveness probe. Stamped HERE rather than immediately after `acpi::init` so the next stamp's
+    // `d=` is the calibration alone and nothing else. x86-only, like the three calls it closes.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::bootpace::record("acpi");
+
     // 4b'''. Calibrate the TSC and the local-APIC timer against the PM timer, so tick-based timing
     // (scheduler sleeps, net RTO) and cycle-based busy-wait budgets become real wall-clock on this
     // machine's unknown Ivy Bridge crystal. Must precede SMP/scheduler bring-up so the APs inherit
@@ -656,12 +672,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         unaos_kernel::arch::apic::calibrate(&pm);
     }
 
+    // BPACE: calibration done — and, more importantly, the moment `counter_hz()` stops returning 0.
+    // Every stamp BEFORE this one was still taken in raw counter ticks; they only become
+    // milliseconds because the conversion happens at print time, downstream of this call.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::bootpace::record("calib");
+
     // 4c. SMP: start the application processors (INIT-SIPI-SIPI). Each AP brings up its own
     // per-CPU GDT/TSS + local APIC, then waits to enter its scheduler loop; the BSP continues to
     // drive everything below. `start_aps` also runs the post-bring-up SMP smoke test while the
     // APs are still idle.
     #[cfg(target_arch = "x86_64")]
     unaos_kernel::arch::smp::start_aps();
+
+    // BPACE: application processors up (INIT-SIPI-SIPI + the post-bring-up smoke test).
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::bootpace::record("smp");
 
     // 4d. Scheduler: now that SMP verification has run against idle APs, initialise the per-CPU
     // run queues, turn scheduling on, and spawn a small demo workload across the APs to exercise
@@ -818,6 +844,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     //    otherwise stall boot in the bounded timeout loops before the first GUI frame paints.
     #[cfg(not(feature = "skip_xhci"))]
     unaos_kernel::arch::pci::init(dtb_addr, dtb_size);
+    // BPACE: PCI scan + xHCI controller bring-up returned. This is the SYNCHRONOUS half of USB; the
+    // per-port enumeration that follows is asynchronous and stamps itself from the main loop. On a
+    // `skip_xhci` build this tag is absent — the asymmetry the doc's "did not run (b)" reading uses.
+    #[cfg(not(feature = "skip_xhci"))]
+    unaos_kernel::bootpace::record("pci-usb");
     #[cfg(feature = "skip_xhci")]
     {
         let _ = (dtb_addr, dtb_size);
@@ -911,10 +942,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         loop {
             if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
                 xhci.poll_events();
+                // BOOTPACE M2 — CONSOLE-FIRST: `service_ftdi` runs AHEAD of `service_storage`, so on
+                // the pass that finally releases the deferred SCSI bring-up the console has already
+                // armed and every line of that multi-second chain rides the live wire instead of the
+                // FTDI capture ring's drop-oldest replay. Ordering only; both hooks are idempotent
+                // no-ops when their work is not pending.
+                xhci.service_ftdi();
                 xhci.service_storage();
                 xhci.service_hubs();
                 xhci.service_hid_setproto();
-                xhci.service_ftdi();
                 xhci.service_slot_disposal();
                 xhci.service_enum();
             }
@@ -945,6 +981,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // run surfaces the exact recorder ring via serial (M3 proof path), including the FTDI/block
             // milestones recorded from inside this loop. Serial-only + bounded.
             unaos_kernel::bootlog::service_serial_dump();
+            // BPACE: re-emit the boot-phase timing ledger whenever it grows. Ungated, deliberately —
+            // see `bootpace::service_dump`. Cheap when idle (one snapshot + one length compare).
+            unaos_kernel::bootpace::service_dump();
             // FLIGHT-RECORDER (x86): flush the captured serial boot log to UNAOS.LOG (usbdebug metal
             // boot benefits from an on-disk log too). Gated on storage; throttled; never blocks boot.
             #[cfg(target_arch = "x86_64")]
@@ -1132,6 +1171,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // paints on the pre-GUI panel, detach flips GUI_ACTIVE, and NOTHING may paint behind the GUI
     // after this point (a panic still re-attaches).
     unaos_kernel::bootlog::record("gui:handoff");
+    // BPACE: the desktop-up number — the one the operator's stopwatch has been approximating. Every
+    // trim this arc's successor considers is measured against `gui=` on the total line.
+    unaos_kernel::bootpace::record("gui");
 
     // The GUI now owns the screen — stop fbcon mirroring serial output onto the framebuffer
     // (a panic re-enables it). Boot diagnostics up to this point stay on screen until the first
@@ -1152,10 +1194,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // transactions run here, in a safe non-event context).
         if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
             xhci.poll_events();
+            // BOOTPACE M2 — CONSOLE-FIRST: `service_ftdi` ahead of `service_storage`, so the console
+            // is armed before the deferred SCSI bring-up (which `service_storage` now holds until the
+            // enumeration queue drains) puts its multi-second chain on the wire. Ordering only.
+            xhci.service_ftdi();
             xhci.service_storage();
             xhci.service_hubs();
             xhci.service_hid_setproto();
-            xhci.service_ftdi();
             xhci.service_slot_disposal();
             xhci.service_enum();
         }
@@ -1186,6 +1231,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // the same ring on-panel. Serial-only + bounded (one print per new milestone).
         #[cfg(feature = "witness")]
         unaos_kernel::bootlog::service_serial_dump();
+        // BPACE: re-emit the boot-phase timing ledger whenever it grows. NOT under the `witness`
+        // gate above, and that difference is the point: the media `./arroyo esp-x86` writes carries
+        // neither `witness` nor `usbdebug`, so a gated ledger would be absent from the only build
+        // that ever reaches the bench. The GUI loop is where the late tags (`stor-*`, `fat-mount`,
+        // `fr-flush`, `ftdi-up`) land, and where the last full block is emitted onto the live wire.
+        unaos_kernel::bootpace::service_dump();
         // FLIGHT-RECORDER (x86): flush the captured serial boot log to UNAOS.LOG on the FAT volume so
         // a consumer who booted the vm-image (no serial capture) can copy the log off afterward.
         // Gated on storage internally; re-flushes on growth, throttled; never blocks boot.

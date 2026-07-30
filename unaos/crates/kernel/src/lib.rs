@@ -94,6 +94,12 @@ pub mod rast_demo;
 // its record() calls are additive at each site.
 pub mod bootlog;
 
+// BPACE: the boot-phase TIMING ledger — bootlog's sibling, stamped with the free-running counter
+// (rdtsc / CNTVCT) instead of the APIC tick, so it can measure the whole boot including everything
+// that happens before `apic::calibrate`. Always linked, never gated: the ledger has to exist in the
+// build that actually boots on metal.
+pub mod bootpace;
+
 pub mod pal;
 pub mod ui;
 pub mod ui_status;
