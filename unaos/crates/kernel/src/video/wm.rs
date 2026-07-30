@@ -2939,6 +2939,21 @@ fn cursor3_rollup(scope: &str) {
     // compose-through did; this one is the only line that can say whether it ran at all, and on both
     // benches the answer so far is that it did not.
     cursor12_rollup(scope);
+    // FLICKER-2 — bracket latency and restore provenance beside the burst/drain pressure that can
+    // cause both, one line, so the P79 flicker cadence question ("does it ride the 5 s rollup
+    // burst?") is answerable from a single capture. The wm-side counters are passed in because the
+    // cursor module must not reach back into this one.
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        super::cursor::flick2_rollup(
+            scope,
+            F2W_DRAINS.load(Relaxed),
+            F2W_DRAIN_SKIPS.load(Relaxed),
+            F2W_DRAIN_MASKED.load(Relaxed),
+            WCN_BURST_LAST_MS.load(Relaxed),
+            WCN_BURST_MAX_MS.load(Relaxed),
+        );
+    }
     // VUGMIN-B — and who the window layer told to go to sleep, on the same line block for the same
     // reason: it is a fact about this compositor's passes, and the number it reports (`presents
     // skipped`) is a subtraction from `cursor_passes` above.
@@ -3108,6 +3123,36 @@ static WCN_STALE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 #[cfg(feature = "witness")]
 static WCN_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// ---- FLICKER-2 — the burst/drain pressure counters ----------------------------------------------
+//
+// Symptom (a) of Peter's P79 sitting is a slight cursor flicker on a ~5 s "pulse" — the cadence of
+// the [wcn] rollup burst above. The emission itself holds NO compositor lock (the `TABLE` snapshot
+// in `wcn_emit` is dropped before the first print) and runs at the tail of `present`, OUTSIDE the
+// composite pass and its cursor bracket — but on metal every line the winning core puts on the wire
+// is ~13 ms of IRQ-masked 115200-baud polling, and the UART holder also drains up to `serial_ring::
+// SLOTS` lines other cores staged. A timer-IRQ witness site ([pulse5]/[spread4]/[prio]) that fires
+// on a core which is MID-composite therefore stretches that pass — and any cursor bracket it holds —
+// by the whole burst. QEMU cannot reproduce any of this (no drawn sprite, instant UART), so the
+// burst is MEASURED instead: `wcn_emit` records its own wall time here, and `[flick2]` reports it
+// beside the sprite's observed down-intervals (see `cursor::flick2_rollup`) so the next bench boot
+// can read whether the flicker Peter sees rides the burst.
+#[cfg(feature = "witness")]
+static WCN_BURST_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static WCN_BURST_MAX_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// FLICKER-2 — drains that found queued boxes (the population the two counters below partition).
+#[cfg(feature = "witness")]
+static F2W_DRAINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// FLICKER-2 — drains whose boxes never met the sprite: the sprite was left on the panel untouched.
+/// Before this arc every one of these was a whole-sprite restore→repaint over the window under the
+/// pointer.
+#[cfg(feature = "witness")]
+static F2W_DRAIN_SKIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// FLICKER-2 — drains that met the sprite and took the MASKED handback instead of the full undraw.
+#[cfg(feature = "witness")]
+static F2W_DRAIN_MASKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// WC-N — the slot for `id`, or `None` for an out-of-range id.
 #[cfg(feature = "witness")]
 fn wcn_slot(id: WinId) -> Option<&'static WcnRow> {
@@ -3225,6 +3270,10 @@ fn wcn_emit_forced(scope: &str) {
 #[cfg(feature = "witness")]
 fn wcn_emit(scope: &str, span: u64, force: bool) {
     use core::sync::atomic::Ordering::Relaxed;
+    // FLICKER-2 — the burst's own wall clock, from the identity snapshot to the last rollup byte.
+    // The reading means "how long the emitting core was occupied by this block"; it is stored only
+    // at the end of the function, so silent early-outs never overwrite a real burst's figure.
+    let t_burst = crate::arch::ms();
     // Identity for the per-window lines, snapshotted under one acquisition so every line in a block
     // is judged against one table state and one shell position. A slot with traffic but no live row
     // is a window that closed inside this rollup window; it still gets its line (`live=no`), because
@@ -3347,6 +3396,15 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
         span,
         verdict
     );
+    // FLICKER-2 — stored only when a block actually went on the wire, so `burst_last` names the most
+    // recent REAL burst rather than the last silent early-out. On metal this is dominated by the
+    // IRQ-masked UART time of the lines above (plus any staged backlog the winning core drained);
+    // in QEMU it reads ~0, which is itself the point — the stall being measured does not exist there.
+    let dt = crate::arch::ms().wrapping_sub(t_burst);
+    WCN_BURST_LAST_MS.store(dt, Relaxed);
+    if dt > WCN_BURST_MAX_MS.load(Relaxed) {
+        WCN_BURST_MAX_MS.store(dt, Relaxed);
+    }
 }
 
 /// WC-N — one drained per-window line, held on the stack between the drain loop and the print loop.
@@ -3600,17 +3658,46 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
     if n == 0 {
         return false;
     }
-    // The sprite comes off the panel before the first fill byte lands, exactly as `erase` does it,
-    // and the caller's tail puts it back. From here on EVERY return path must report `true`: the
-    // sprite is off the panel whether or not a single box went on to stage successfully.
+    // FLICKER-2 — the sprite bracket is owed only where a fill can actually REACH the sprite.
     //
-    // CURSOR-5 — and this undraw must never land inside an open overlay session (see the placement
-    // note in `composite_inner`: that interleave is the P64 flash). The ordering makes it structurally
-    // impossible for this pass; the probe below catches a future reorder that puts it back, and its
-    // counter is the one line item in `[cursor5]` that reads as a defect rather than as load.
+    // The previous shape took the FULL sprite down before the first fill byte landed, whatever the
+    // queue held — so a deferred erase anywhere on the panel cost a whole-sprite restore→repaint over
+    // whatever window the pointer was resting on, once per drain. Every such restore is also an
+    // opportunity for the colour guard's documented residual (a stale `saved` restored over a live
+    // window's fresh frame), which is exactly the "window under the cursor flickers occasionally"
+    // symptom: the fills were typically nowhere near the pointer, and the sprite paid anyway.
+    //
+    // The undraw's one justification — hand a pixel back before a painter in THIS operation
+    // overwrites it — applies only to sprite pixels inside the boxes about to be filled. So the test
+    // is the same one `composite_inner`'s bracket makes: if no queued box meets the sprite's box, the
+    // sprite is left entirely alone (and `false` is returned — the tail owes it nothing); if one
+    // does, the handback is MASKED to the queued boxes via `undraw_within_nosession`, whose
+    // generation bump is precisely what protects a concurrent core's open overlay session (see
+    // CURSOR-5's interleave analysis on that function). `sprite_box` is a snapshot and can be one
+    // pointer report stale; that degrades to an unnecessary masked handback or to the pre-FLICKER-2
+    // behaviour for one pass, never to a missed one — a sprite that moved INTO a fill box mid-drain
+    // is re-established by the mover's own `repaint`, exactly as it always was under the full undraw
+    // (which had the identical window: the snapshot was simply taken inside `undraw` itself).
+    //
+    // CURSOR-5 — the undraw must still never land inside an open overlay session on THIS core (the
+    // P64 flash). The ordering keeps that structurally impossible; the probe below still catches a
+    // future reorder, on the arm that actually disturbs the sprite.
     #[cfg(feature = "witness")]
-    super::cursor::note_drain_undraw();
-    super::cursor::undraw();
+    F2W_DRAINS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let sprite_hit = super::cursor::sprite_box()
+        .map(|sb| boxes[..n].iter().any(|&b| b.2 != 0 && b.3 != 0 && boxes_overlap(sb, b)))
+        .unwrap_or(false);
+    if sprite_hit {
+        #[cfg(feature = "witness")]
+        {
+            super::cursor::note_drain_undraw();
+            F2W_DRAIN_MASKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        super::cursor::undraw_within_nosession(&boxes[..n]);
+    } else {
+        #[cfg(feature = "witness")]
+        F2W_DRAIN_SKIPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     let info = fb.info();
     let row_bytes = info.stride * info.bytes_per_pixel;
     let mut painted = false;
@@ -3638,9 +3725,12 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
         // back under a departed window; the erase above can only paint `DESKTOP_BG`.
         super::screen::request_full_present();
     }
-    // NOT `painted`. The sprite was undrawn above, so the caller owes it a repaint even if every box
-    // re-deferred and nothing reached the panel.
-    true
+    // FLICKER-2 — the caller owes the sprite a repaint exactly when this drain disturbed it, which
+    // is the `sprite_hit` arm and NOT `painted`: a masked handback whose boxes all re-deferred has
+    // still taken pixels down (MUST-FIX 1's argument, unchanged), while a drain whose fills never met
+    // the sprite has provably touched none of its pixels and must not cost a restore→repaint cycle
+    // over the window under the pointer.
+    sprite_hit
 }
 
 // ---- WC-H: the window back-layer ---------------------------------------------------------------

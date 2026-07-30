@@ -1571,6 +1571,53 @@ and the compat `mapped=32x32 … checksum=0x8d99530ca96d4b25` are unchanged. Not
 What QEMU therefore cannot exercise is the sprite itself: the first draw, the save-under restore and the
 `[cursor] armed` line are **unverified until the next bench boot**, exactly as WC-D's `bad_ram` column is.
 
+#### FLICKER-2 — the two P79 flickers: one fixed, both instrumented
+
+P79 (bench, storm 6, mouse otherwise good) reported two residual flickers: (a) a slight cursor
+flicker on a ~5 s "pulse", and (b) an occasional flicker of the vug window *under* the pointer.
+
+**Symptom (b) — root cause found and fixed: restore-before-install.** A session-owning pass updates
+`sp.saved` (the sprite's save-under) only at its tail (`adopt_overlay`'s coverage install). Between
+`compose_into` delivering the arrow inside a window's freshly presented rows and that install, the
+covered pixels' true under-content — the window's *new* frame — exists only in the session's layer
+save (`ov.saved`); `sp.saved` still holds the previous frame. Any full undraw arriving in that window
+(a pointer move's `repaint` on another core, `wm::erase`, or the WC-L drain) found the panel holding
+the arrow's colour there, passed the colour guard, and restored `sp.saved` — stamping last frame's
+window content into a live window for one frame. The interleave fires at the `[cursor5] adopt_incoh`
+rate (~1/s on the P79 capture, mouse motion being the usual trigger); the visible subset is the
+occasional flicker. `undraw_locked` now consults the open session under `SPRITE → OVERLAY` order
+(`try_lock`, never blocking a `compose_into` inside the blit guard): if the session coherently
+describes the live sprite (epoch + geometry, the `adopt_overlay` predicate), covered pixels restore
+from the layer save. `[flick2] sess_undraws=`/`sess_px=` count the fixed path running; `sess_lockmiss=`
+counts the bounded `try_lock` fallback.
+
+**Symptom (b), second mechanism, also removed: the drain's whole-sprite bracket.** `drain_deferred`
+took the FULL sprite down before painting any deferred erase box, wherever those boxes were — so a
+deferred erase anywhere on the panel cost a whole-sprite restore→repaint over the window under the
+pointer, each restore an extra roll of the colour-guard residual. The drain now tests its queued
+boxes against `sprite_box()` first: disjoint boxes leave the sprite entirely alone
+(`[flick2] drain_skip=`), intersecting ones take the masked `undraw_within_nosession` handback
+(`drain_masked=`), whose generation bump already protects a concurrent core's open session.
+
+**Symptom (a) — instrumented, not provable off-metal.** The `[wcn]` rollup burst (measured 5003–5005 ms
+cadence on the P79 capture, matching the reported pulse) emits *between* passes, holds no compositor
+lock (`wcn_emit`'s `TABLE` snapshot drops before its first print), and SERWIT-1's staging ring means a
+contended core stages and returns rather than blocking. What remains is wall time on the *winning*
+core: each line is ~13 ms of IRQ-masked 115200-baud polling, the holder also drains up to 64 staged
+lines, and the timer-IRQ witness sites (`[pulse5]`/`[spread4]`/`[prio]`) can fire on a core that is
+mid-composite with the arrow off the glass — stretching that bracket by the whole burst. QEMU cannot
+show any of this (no drawn sprite, instant UART), so the next bench boot reads it directly from the
+`[flick2]` line: `down_max=` (longest full-undraw→draw interval per rollup window), `down_slow=`
+(intervals ≥ 20 ms — a visible blink), `down_last_at=` (monotonic ms of the last one, to place against
+the nearest burst), and `burst_last=`/`burst_max=` (the `[wcn]` block's own measured wall time). If the
+flicker rides the pulse, `down_slow` events cluster at burst positions with `down_max` ≈ `burst_last`;
+if both read low while Peter still sees the pulse flicker, the cause is outside the bracket path and
+the next suspect is the vug present cadence itself.
+
+Gate scope, stated plainly: `[flick2]` reads `UNWITNESSED` on QEMU by construction (the sprite is
+never drawn), so the QEMU gates prove no-regression only; both verdicts above are argued from the
+interleave analysis and await the next attended bench boot for pixel-level confirmation.
+
 ### FOCUS-VIS — focus you can SEE, and a shell you can read
 
 P59 (bench, 2026-07-25) put two backgrounded windows on the panel — the UVUG crystal and `STAT.ELF` —

@@ -866,6 +866,84 @@ pub fn cursor11_rollup(scope: &str) {
     );
 }
 
+// ---- FLICKER-2 witnesses -------------------------------------------------------------------------
+//
+// Two P79 symptoms, both metal-only (QEMU never draws the sprite and its UART is instant), each with
+// one number that would decide it:
+//
+//   (a) "the pulse gives the mouse a slight flicker" — hypothesis: a serial witness burst (the 5 s
+//       `[wcn]` block, or a timer-IRQ `[prio]`/`[spread4]` site) lands IRQ-masked on a core that is
+//       mid-composite with the arrow off the glass, stretching the bracket from ~1 ms to the length
+//       of the burst. Decider: the DOWN-INTERVAL — wall time from a full undraw to the next draw —
+//       whose max and slow-count are tracked here, with the last slow event's timestamp so a capture
+//       reader can place it against the nearest burst (whose own duration `wm` measures).
+//   (b) "the vug under the mouse flickers occasionally" — one mechanism is FIXED this arc
+//       (restore-before-install: see `undraw_locked`); the counters here say how often the fixed
+//       path actually runs, which is the difference between "fixed" and "adjective".
+#[cfg(feature = "witness")]
+static F2_DOWN_AT_MS: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-2 — longest full-undraw→draw interval in the current rollup window (swapped to 0 by the
+/// rollup, so each line reports its own window).
+#[cfg(feature = "witness")]
+static F2_DOWN_MAX_MS: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-2 — down-intervals at or past [`F2_DOWN_SLOW_MS`], cumulative. Each one is an arrow
+/// absence long enough to read as a blink from the bench chair.
+#[cfg(feature = "witness")]
+static F2_DOWN_SLOW: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-2 — `arch::ms()` at the close of the most recent slow interval, for cadence correlation.
+#[cfg(feature = "witness")]
+static F2_DOWN_LAST_AT: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-2 — a down-interval a bench operator can plausibly see. ~1 vug frame at the P79 rates.
+#[cfg(feature = "witness")]
+const F2_DOWN_SLOW_MS: u64 = 20;
+/// FLICKER-2 — full undraws that found a coherent open overlay session and restored its covered
+/// pixels from the LAYER save. Every one of these would previously have stamped last frame's window
+/// content into a live window (the (b) mechanism, fixed).
+#[cfg(feature = "witness")]
+static F2_SESS_UNDRAWS: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-2 — pixels restored from a session's layer save rather than from `sp.saved`.
+#[cfg(feature = "witness")]
+static F2_SESS_PX: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-2 — full undraws that could not read `OVERLAY` (`try_lock` contended) and fell back to
+/// `sp.saved` for one undraw. Bounded staleness, counted rather than waited out.
+#[cfg(feature = "witness")]
+static F2_SESS_LOCKMISS: AtomicU64 = AtomicU64::new(0);
+
+/// FLICKER-2 — the arc's rollup, one line beside the other cursor rollups. The `wm`-side figures
+/// (drain shape and `[wcn]` burst wall time) arrive as arguments; everything else is this module's.
+///
+/// `down_max` is per-window (swapped); the rest are boot-cumulative. `down_last_at` is a raw
+/// monotonic-ms timestamp — subtract it from a burst's position to answer the cadence question.
+/// `UNWITNESSED` whenever the sprite has never been drawn (the QEMU gate, by construction).
+#[cfg(feature = "witness")]
+pub fn flick2_rollup(
+    scope: &str,
+    drains: u64,
+    drain_skips: u64,
+    drain_masked: u64,
+    burst_last_ms: u64,
+    burst_max_ms: u64,
+) {
+    let down_max = F2_DOWN_MAX_MS.swap(0, Ordering::Relaxed);
+    let slow = F2_DOWN_SLOW.load(Ordering::Relaxed);
+    let last_at = F2_DOWN_LAST_AT.load(Ordering::Relaxed);
+    let sess = F2_SESS_UNDRAWS.load(Ordering::Relaxed);
+    let sess_px = F2_SESS_PX.load(Ordering::Relaxed);
+    let lockmiss = F2_SESS_LOCKMISS.load(Ordering::Relaxed);
+    let verdict = if !armed() {
+        "UNWITNESSED"
+    } else if down_max >= F2_DOWN_SLOW_MS {
+        "SLOW"
+    } else {
+        "OK"
+    };
+    serial_println!(
+        "[flick2] scope={} down_max={}ms down_slow={} down_last_at={}ms sess_undraws={} sess_px={} sess_lockmiss={} drains={} drain_skip={} drain_masked={} burst_last={}ms burst_max={}ms -> {}",
+        scope, down_max, slow, last_at, sess, sess_px, lockmiss, drains, drain_skips, drain_masked,
+        burst_last_ms, burst_max_ms, verdict
+    );
+}
+
 /// CURSOR-6/7 — count a window present that landed on the live sprite box, and, when nothing in that
 /// pass owes the sprite a repaint, ARM the tail repair.
 ///
@@ -1331,6 +1409,40 @@ fn undraw_locked(
     let touched = TOUCHED_SINCE_DRAW.swap(false, Ordering::AcqRel);
     let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
     let off = sp.off;
+    // FLICKER-2 — RESTORE-BEFORE-INSTALL, the undraw half of `settle_pending_locked`'s ordering
+    // argument. A pass that owns the overlay session updates `sp.saved` only at its TAIL
+    // (`adopt_overlay`'s install); between `compose_into` and that install, every covered pixel's
+    // fresh under-content — the window's just-presented frame — exists only in `ov.saved`, while
+    // `sp.saved` still holds the PREVIOUS frame. A full undraw arriving in that window (a pointer
+    // move's `repaint` on another core, `wm::erase`, the WC-L drain) finds the panel holding our
+    // colour at those pixels (the arrow rode the staged rows), so the colour guard passes and the
+    // old code restored `sp.saved` — last frame's window content, stamped into a live window. That
+    // is symptom (b) of P79: an OCCASIONAL one-frame regression of the vug under the pointer, at
+    // exactly the rate `[cursor5] adopt_incoh` fires (~1/s on the P79 capture), visible only when
+    // the interleave lands after the rows do.
+    //
+    // The fix is to ask the session for the fresh value: if an open session coherently describes
+    // THIS sprite (same epoch, same geometry — the `adopt_overlay` predicate verbatim), a covered
+    // pixel's under-content is taken from `ov.saved` instead. Lock order `SPRITE` → `OVERLAY` is the
+    // documented one, and `try_lock` keeps the undraw from ever blocking on a `compose_into` holding
+    // `OVERLAY` inside the blit guard: a contended read falls back to the old behaviour for one
+    // undraw and is counted, never waited for. The epoch bump below then retires the session
+    // (`adopt_overlay` finds it incoherent and refreshes), exactly as before.
+    let ov = OVERLAY.try_lock();
+    let sess = ov.as_ref().filter(|g| {
+        g.session
+            && g.epoch == sp.epoch
+            && (g.bx, g.by, g.bw, g.bh, g.s) == (bx, by, bw, bh, s)
+    });
+    #[cfg(feature = "witness")]
+    {
+        if ov.is_none() {
+            F2_SESS_LOCKMISS.fetch_add(1, Ordering::Relaxed);
+        }
+        if sess.is_some() {
+            F2_SESS_UNDRAWS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     let saved = &sp.saved;
     for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
         // CURSOR-4: a pixel already handed back by a masked undraw is not ours and `saved[i]` is
@@ -1342,9 +1454,21 @@ fn undraw_locked(
             return;
         }
         if i < saved.len() && fb.read_pixel(x, y) == Some(color) {
-            fb.put_pixel(x, y, saved[i]);
+            let under = match sess {
+                // FLICKER-2 — the layer's save is this pixel's CURRENT under-content: the window's
+                // freshly composed frame, captured by `compose_into` before the arrow was painted
+                // over it. `sp.saved[i]` describes the frame before that.
+                Some(g) if g.covered.get(i) && i < g.saved.len() => {
+                    #[cfg(feature = "witness")]
+                    F2_SESS_PX.fetch_add(1, Ordering::Relaxed);
+                    g.saved[i]
+                }
+                _ => saved[i],
+            };
+            fb.put_pixel(x, y, under);
         }
     });
+    drop(ov);
     match pend {
         Some(p) => p.add(bx, by, bw, bh),
         None => flush_box(&fb, by, bh),
@@ -1360,6 +1484,10 @@ fn undraw_locked(
     // same reason: the window in which the mirror disagrees with the panel must always be the one
     // where it claims a sprite that is not there, never the one where it denies a sprite that is.
     retract_box();
+    // FLICKER-2 — the arrow just left the glass entirely; `draw_locked` closes the interval. `max(1)`
+    // keeps 0 as the "not down" sentinel on a clock that can legitimately read 0 early in boot.
+    #[cfg(feature = "witness")]
+    F2_DOWN_AT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
     // CURSOR-9 — the rect is the REPAIR REQUEST, and it is owed only where a painter could have taken
     // one of our pixels. `None` here means "restored, provably exactly, nothing to mend"; the pixels
     // went back either way.
@@ -2459,6 +2587,26 @@ fn draw_locked(
     // a stale pixel inside a window's rect.
     TOUCHED_SINCE_DRAW.store(false, Ordering::Release);
     publish_box(sp);
+    // FLICKER-2 — close the down-interval opened by the last full undraw. The interesting reading is
+    // the MAX per rollup window and the count of visibly long intervals: a bracket stretched by a
+    // serial burst landing IRQ-masked on the compositing core (symptom (a)'s hypothesis) shows up
+    // here as a >=20 ms interval, and its wall-clock timestamp lets a capture reader place it against
+    // the nearest `[wcn]`/`[prio]` block. QEMU never draws the sprite, so this stays 0 on the gate.
+    #[cfg(feature = "witness")]
+    {
+        let down = F2_DOWN_AT_MS.swap(0, Ordering::Relaxed);
+        if down != 0 {
+            let now = crate::arch::ms();
+            let dt = now.saturating_sub(down);
+            if dt > F2_DOWN_MAX_MS.load(Ordering::Relaxed) {
+                F2_DOWN_MAX_MS.store(dt, Ordering::Relaxed);
+            }
+            if dt >= F2_DOWN_SLOW_MS {
+                F2_DOWN_SLOW.fetch_add(1, Ordering::Relaxed);
+                F2_DOWN_LAST_AT.store(now, Ordering::Relaxed);
+            }
+        }
+    }
 
     for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, _i| {
         fb.put_pixel(x, y, color);
