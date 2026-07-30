@@ -884,6 +884,100 @@ the spawn-placement decision witness (already present from SCHED-3).
 
 **SCHED-4 sleep_ticks regression** (U11-reap FAIL, timer never ticks in QEMU) bisected and fixed by SCHED-4b (`d7631117`): semaphore wake on orphan enqueue — ~0% idle duty metal-confirmed (c2=0% P31b), U11-reap PASS restored.
 
+### The idle-desktop core wedge (aarch64, SPIN-1…8 / WEDGE-4…6)
+
+A reproducible single-core lockup on the Pi 4: open one window on an otherwise
+idle desktop, use it, and roughly seven seconds after the scene settles core 3
+goes to 100% and never dispatches again. It survived six instrumented
+hypotheses, and the record of how each died is more useful than the list itself
+— every one of them was killed by an instrument built specifically to convict
+it, which is the only reason the search space ever closed.
+
+**The signature.** `c3` at 100%, `svc=0`, the composite rate collapsing, and
+serial dying at end-stage — so the witness must be caught early. The stalled
+task reads `69:rx-backstop`, `state=1`, `bs_phase=1` (inside `sleep_ticks`),
+with `bs_loops` frozen. Reproduction is deterministic to within one loop
+iteration (`bs_loops` lands on 35 or 36).
+
+**The ledger.** Each row is an instrument, not an argument.
+
+| Hypothesis | Instrument | Verdict |
+| --- | --- | --- |
+| Run-queue lock deadlock | WEDGE-4 W4-B — bounded-spin stall witness inside the acquisition, printed through the lock-free UART seam | Refuted. Silent, and *reachably* silent (see below). |
+| Semaphore raw lock | WEDGE-5 — the same witness on `Semaphore::lock_raw` | Refuted. `locked=0 stalls=0`. |
+| A72 LL/SC false sharing | SPIN-3 — cache-line padding on the per-cpu accounting atomics | Refuted. Padding kept as hygiene: the A72 has no LSE, so every RMW is an LL/SC retry loop and neighbouring counters on one line really can starve each other. |
+| Bad placement | SPREAD-11 — yield-path slot re-placement | Real but insufficient. Helped once (`ymoves=1`); the storm re-forms on two cores because `rewake_place` declines equal-load moves. |
+| Corrupt parked frame | SPIN-6 — validate the saved SP against the task's own stack bounds at switch-in | Refuted. SP valid; no refusal ever printed. |
+| Stale `current` pointer (core fine, witness lying) | SPIN-5 — a per-core dispatch heartbeat | Refuted, and inverted: the heartbeat is **frozen**, so the core's scheduler genuinely never runs again. |
+| Interrupt storm (unhandled level SPI, EOI'd still asserted) | SPIN-7 — per-core IRQ accounting, incremented at the `GICC_IAR` read | Refuted. `total=5448 last=30 unhandled=0`, frozen across the whole span. |
+
+**What the last row actually proves, and it is the load-bearing one.** A
+*racing* total means a storm; a *frozen* total means the core is taking no
+interrupts at all — not even its own timer. Those are opposite verdicts from
+the same counter, which is why `unhandled` alone could never have settled it.
+`last=30` is the timer PPI (`TIMER_INTID`), and the counter increments at
+acknowledge, so the core's last act was taking a tick. Combined with a valid SP
+and a frozen dispatch heartbeat, the core is executing with `PSTATE.I` masked
+and is unreachable by IRQ and by IPI — measured at 38 s and counting.
+
+**Reachability is a property of an instrument, not of the code it watches.**
+WEDGE-4 ships two probes that print the same tag. W4-A (`preempt-in-section`)
+reports from `timer_preempt`, so it needs a timer interrupt and **cannot fire on
+a core that has masked interrupts**: its silence there is structural, and
+carries no evidence. W4-B (`RQ STALL`) reports from inside the bounded-spin
+acquisition through the lock-free UART seam, so it fires exactly in the state it
+is meant to report on: its silence *is* evidence. Same subsystem, same log tag,
+opposite evidential weight. Any probe added to a masked span must be checked
+against this question before its silence is banked as a refutation.
+
+**Where that leaves the search.** `run()`'s IRQ-masked span, which is short and
+enumerable: `mask_irq` → `drain_due_sleepers` → `input_wait_backstop` →
+`dispatch_next` up to its unmask or its switch-in. Every *unmasked* phase —
+`try_steal`, the idle WFI, the pass accounting — is excluded a priori, because a
+core parked there would still take its tick. Inside the masked span, the sleeper
+list is per-core and only ever touched IRQ-masked by its own core, and the heap
+lock is always taken inside `without_interrupts`, so neither can host a
+cross-core stall.
+
+**SPIN-8 — the core states its own position.** A per-core phase word (its own
+cache line, per SPIN-3) is stored at each step of that span, and a per-core pass
+counter ticks the loop top; `[spin1]` prints both, read from a healthy sibling.
+A phase that does not move *while the pass counter also does not move*, across
+prints seconds apart, is the wedge stated positively and names the statement —
+with no FIQ, no GIC reconfiguration, and one relaxed store per step. Reading an
+unmasked phase there would itself be a finding, since the frozen IRQ total says
+it is impossible.
+
+**WEDGE-6 — the last silent spin in that span.** `input_wait_backstop` runs on
+every core on every scheduler pass with IRQ masked (VUGPAUSE-2) and calls
+`futex_wake`, which scans every bucket and takes each one's raw lock — while
+`futex_wait`'s `PARK_WAITQ` hand-off holds a bucket's lock **across a context
+switch**, released by the scheduler in `park_blocked` rather than by the waiter.
+A waiter whose core never reaches `park_blocked` leaves that bucket locked, and
+every other core's scheduler loop then spins on it forever, IRQ-masked,
+dispatching nothing and printing nothing. WEDGE-4 gave the run-queue lock a
+voice and WEDGE-5 gave the semaphore one; `FutexBucket::lock_raw` was the last
+unbounded spin in the masked span without one. It now uses W4-B's exact shape:
+bounded spins, one lock-free line naming core/bucket/key, a counter on the
+`[spin1]` line, then keep spinning — behaviour unchanged, the wedge merely
+legible. `Condvar::lock_raw` remains unwitnessed by design: it is not reachable
+from the masked span, so it cannot produce this signature.
+
+**On the FIQ PC sampler.** The obvious next instrument — interrupt the core with
+an FIQ, since `PSTATE.F` is a separate mask bit from `PSTATE.I`, and sample
+`ELR`/`SPSR` — is a multi-commit arc rather than a one-liner, for two reasons
+found by source audit. `PSTATE.F` is masked kernel-wide: boot enters Rust with
+`SPSR_EL2 = 0x3c5` (D/A/I/F all set) and `enable_irq` clears only I and A, so
+the *scheduler* context — which is where the wedged core is — has FIQ masked
+too. And `__vec_fiq` is a halting fault dead-end, not a resumable handler, so an
+FIQ that did land would kill the core it was sent to diagnose. There is also an
+open GIC-side question: `GICD_IGROUPRn` and `GICC_CTLR.FIQEn` are Secure-only in
+the GICv2 Non-secure view, so a Group-0/FIQ-routed SGI may not be reachable from
+where this kernel runs at all, and the BCM2711 ARM-local per-core mailbox FIQ
+path (which this tree does not map today) would be the alternative. If a PC
+sample is ever taken, it must be printed beside whatever names the masking
+window — a PC alone dates a symptom without naming a cause.
+
 ---
 
 ## 3. Blocking and synchronization primitives
@@ -923,8 +1017,11 @@ Combined-boot evidence (one kernel running SMP + USB + net + video):
 
 ## 5. Status and limitations
 
-- **x86_64 only.** aarch64 runs a single polled core; it has no GIC-driven
-  preemption or scheduler yet.
+- ~~**x86_64 only.** aarch64 runs a single polled core; it has no GIC-driven
+  preemption or scheduler yet.~~ **Stale — retired.** aarch64 runs the full
+  preemptive SMP scheduler on all four Pi 4 cores, GIC-driven off the per-core
+  generic timer PPI (`TIMER_INTID = 30`), with work stealing, priority aging and
+  EL0 tasks. Most of the sections above this one are aarch64 work.
 - **No priority inheritance** on `Mutex` (assessed as large/thorny under CPU
   pinning; deliberately deferred).
 - **APIC timer is uncalibrated** (~1 ms/tick on QEMU); a CPUID 0x15 / TSC-
