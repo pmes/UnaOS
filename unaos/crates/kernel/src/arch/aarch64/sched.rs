@@ -252,6 +252,12 @@ pub struct Task {
     /// `rewake=` never moved. This stamp lets a micro-park wake ask the question again on a slow
     /// clock (see `PLACE_REFRESH_MS`) without restoring SPREAD-4's per-frame churn.
     place_cyc: u64,
+    /// SPREAD-7 — CNTPCT timestamp at which this task was last made READY by `make_ready` (EL0 tasks
+    /// only; 0 = not currently priced). Consumed (read + zeroed) by the `dispatch_next` that first
+    /// runs the task, yielding the wake-to-dispatch latency the `[spread7]` witness aggregates. Same
+    /// Box-handoff synchronisation argument as `park_cyc`: written only by whoever exclusively owns
+    /// the Box (the wake funnel on write, the dispatching core on consume).
+    wake_cyc: u64,
 }
 
 /// One CPU's scheduler bookkeeping (interior-mutable atomics, so the array is a plain static).
@@ -1610,6 +1616,24 @@ static SPREAD5_SHORT_STAY: AtomicU64 = AtomicU64::new(0);
 /// asking and keeps being told it is already in the right place — the escapement idling, as designed.
 static SPREAD6_REFRESH: AtomicU64 = AtomicU64::new(0);
 
+/// SPREAD-7 — EL0 wakes that landed in the TICK-QUANTIZED arm of the wake path: the woken task is an
+/// equal-or-higher-band peer (below the service band) of the task running on its target core, so
+/// nothing preempts for it — it waits in the run queue for the incumbent's next dispatch boundary,
+/// up to a full quantum (~12 ms). See `preempt_hint`'s SPREAD-7 section for why this arm is counted
+/// rather than trimmed. On a frame-barrier fleet this climbs at roughly the fleet's park rate;
+/// `quant` flat while the fleet stutters means wakes are landing on idle cores or being absorbed by
+/// the spin windows, and the ceiling is elsewhere.
+static SPREAD7_QUANT: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-7 — wake-to-dispatch latency for EL0 wakes: CNTPCT cycles from `make_ready`'s stamp to the
+/// `dispatch_next` that first runs the woken task, summed / counted / max'd. This prices the
+/// quantization `SPREAD7_QUANT` counts: on an idle fleet `wd_mean` is IPI-scale (microseconds); on a
+/// saturated one it converges on the half-quantum (~6 ms) plus queue depth. Cumulative, lock-free,
+/// owner-core writes only for SUM/N (dispatch), MAX via `fetch_max`.
+static SPREAD7_WD_SUM: AtomicU64 = AtomicU64::new(0);
+static SPREAD7_WD_N: AtomicU64 = AtomicU64::new(0);
+static SPREAD7_WD_MAX: AtomicU64 = AtomicU64::new(0);
+
 /// SPREAD-4 — rate limit for the per-event `[spread4] rewake` trace, on the same terms as
 /// `[smpbal] steal`: name the first few moves, then go quiet so a steadily-rebalancing desktop cannot
 /// flood the serial log. The cumulative counters in `spread4_witness` carry the steady state.
@@ -1711,6 +1735,7 @@ fn spawn_inner(
         steal_ok: requested_cpu == CPU_AUTO,
         park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
         place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
+        wake_cyc: 0, // SPREAD-7: never woken yet; `make_ready` stamps it
     });
     rq(cpu).push(task);
     // PI-SCHED-1 — placement witness. The scheduler PINS a task to the caller-chosen core and never
@@ -1829,6 +1854,7 @@ fn spawn_user_inner(
         steal_ok: false,
         park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
         place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
+        wake_cyc: 0, // SPREAD-7: never woken yet; `make_ready` stamps it
     });
     // SKILL-1: count this task against its address-space slot BEFORE the push, so it is countable before
     // it can ever be dispatched (and thus before any ASID-scoped kill could observe a short count).
@@ -1908,6 +1934,7 @@ pub fn spawn_user_thread(
         steal_ok: false,
         park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
         place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
+        wake_cyc: 0, // SPREAD-7: never woken yet; `make_ready` stamps it
     });
     // SKILL-1: this is the path that MAKES a slot multi-threaded, so it is the one the ASID-scoped kill
     // exists for — count the sibling before it can be dispatched.
@@ -2083,13 +2110,46 @@ fn poke_cpu(target: usize) {
 ///   * On QEMU raspi4b there is no live timer IRQ, so there is no quantum countdown and this is inert
 ///     — the gate exercises the counter, and the trim itself is a metal-only effect (as with every
 ///     other preemption behaviour in this module).
-fn preempt_hint(target: usize, prio: u8) {
-    if prio < PRIO_SERVICE {
-        return; // only the service band and above ask for this
+/// ### SPREAD-7 — the same-band quantization made countable (the ~35 fps ceiling)
+/// SCHED-PRIO built the trim for the service band only, and P79's storm-6 wire (pi4-r23s1r) showed
+/// what that leaves on the table for everyone below it. A vug frame is a THREE-TASK RENDEZVOUS
+/// (parent + two workers on the PHASE futex), and every rendezvous the spin window does not catch
+/// becomes a park followed by a wake. The wake's SGI only breaks WFI — `gic::handle_irq` counts SGIs
+/// and returns — so a woken PRIO_NORMAL task landing on a BUSY core sits in the run queue until the
+/// running task reaches a dispatch boundary: yield, block, or quantum expiry, up to a full quantum
+/// (~12 ms, mean ~6 ms) per park. A frame with two or three uncaught rendezvous is 15-35 ms of pure
+/// queue wait, which is the metal reading exactly: per-window rates pinned at 21-39/s (26-48 ms
+/// frames, in quantum-sized steps), `gap` minima of 15 ms on the lucky windows and 32-71 ms on the
+/// crowded ones, and the rare ~50/s escape being a stretch where the spin windows caught every
+/// rendezvous and nothing parked. The ceiling was never a target or a cap (VUG-PACE) — it is wake
+/// latency quantized by the co-resident's quantum.
+///
+/// CROSS-ARCH CONVERGENCE, AND WHY THIS ARM COUNTS INSTEAD OF TRIMMING. x86's `make_ready` has the
+/// same three-arm shape: idle target -> IPI-paced (our `poke_cpu` SGI, already present and
+/// metal-validated); higher-band wake -> preempt (our service trim above); equal-or-lower-band wake
+/// onto a busy core -> WAITS FOR THE TICK, on both arches, as designed. Changing that last arm —
+/// e.g. extending the quantum trim to same-band EL0 wakes (`prio >= cur`, one `quantum.store(1)`,
+/// bounded by the tick rate so it cannot re-run SPREAD-4's churn) — is a scheduling-POLICY decision
+/// that belongs to review, not to this seat. What lands here is the instrument that decision needs:
+/// `SPREAD7_QUANT` counts exactly the wakes that arm quantizes (a woken EL0 task, below the service
+/// band, equal-or-higher than the target core's running band — an idle core reads `CUR_PRIO ==
+/// PRIO_NONE` (`u8::MAX`) and never matches), and the wake-to-dispatch stamps in `dispatch_next`
+/// price what each one cost. `quant` climbing at the fleet's park rate with `wd_mean` in the
+/// half-quantum range IS the ceiling, live on the wire.
+fn preempt_hint(target: usize, prio: u8, el0: bool) {
+    let cur = CUR_PRIO[target].load(Ordering::Relaxed);
+    if prio >= PRIO_SERVICE {
+        if prio > cur {
+            SCHED[target].quantum.store(1, Ordering::Relaxed);
+            PRIO_DEFER[target].fetch_add(1, Ordering::Relaxed);
+        }
+        return;
     }
-    if prio > CUR_PRIO[target].load(Ordering::Relaxed) {
-        SCHED[target].quantum.store(1, Ordering::Relaxed);
-        PRIO_DEFER[target].fetch_add(1, Ordering::Relaxed);
+    // SPREAD-7: count the tick-quantized population. `prio >= cur` with `prio < PRIO_SERVICE`
+    // implies `cur` is a real below-service level, so PRIO_NONE (idle) and any service-band runner
+    // are excluded for free. Counting only — the trim for this arm is a policy proposal (above).
+    if el0 && prio >= cur {
+        SPREAD7_QUANT.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -2185,12 +2245,19 @@ fn make_ready(mut task: Box<Task>) {
     // SCHED-PRIO: read the base priority BEFORE the Box is moved into the queue (after the push it
     // belongs to whichever core dispatches it next and must not be touched from here).
     let prio = task.priority;
+    let el0 = task.user_entry != 0;
+    if el0 {
+        // SPREAD-7: stamp the wake so the dispatching core can price the run-queue wait. EL0 only —
+        // that is the population whose frame rendezvous the [spread7] witness is instrumenting, and
+        // it keeps the kernel-worker wake traffic (sleeper drain, semaphores) out of the mean.
+        task.wake_cyc = now_cyc();
+    }
     rq(target).push(task);
     poke_cpu(target);
     // SCHED-PRIO: the wake path is where interactive latency is actually decided — `GUI_CHANNEL.recv`
     // (compositor), `RX_READY.wait` (input router) and `sleep_ticks` (HID pump) all come back through
     // here. Called AFTER the push and the poke so the task is already queued when the target looks.
-    preempt_hint(target, prio);
+    preempt_hint(target, prio, el0);
 }
 
 /// Cooperatively give up the CPU: mark this task ready and switch back to the scheduler, which
@@ -2871,7 +2938,7 @@ fn dispatch_next(cpu: usize) -> bool {
         }
         q.pop_highest() // highest-priority ready task; lock dropped here
     };
-    let Some(task) = next else {
+    let Some(mut task) = next else {
         CPU_IDLE[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
         // SCHED-5: idle TIME is measured at the WFI in `run()` (the span the core actually sleeps), not
         // here — this empty pass itself takes negligible time and returns straight to the idle loop.
@@ -2905,6 +2972,17 @@ fn dispatch_next(cpu: usize) -> bool {
         PRIO_EL0_DISPATCH[cpu].fetch_add(1, Ordering::Relaxed);
     }
     CUR_PRIO[cpu].store(task.priority, Ordering::Relaxed);
+    // SPREAD-7: consume the wake stamp — this dispatch is the woken task first RUNNING, so the span
+    // since `make_ready` is exactly the run-queue wait the wake paid (the quantity the quantized arm
+    // of `preempt_hint` leaves unbounded below one quantum). Zeroed so a later preempt/requeue cycle
+    // of the same task is not double-priced: this measures wake latency, not scheduling in general.
+    if task.wake_cyc != 0 {
+        let wait = now_cyc().saturating_sub(task.wake_cyc);
+        task.wake_cyc = 0;
+        SPREAD7_WD_SUM.fetch_add(wait, Ordering::Relaxed);
+        SPREAD7_WD_N.fetch_add(1, Ordering::Relaxed);
+        SPREAD7_WD_MAX.fetch_max(wait, Ordering::Relaxed);
+    }
     task.state.store(STATE_RUNNING, Ordering::Release);
     SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed);
     let raw = Box::into_raw(task);
@@ -5096,6 +5174,28 @@ fn spread4_witness() {
         REWAKE_MARGIN,
         REWAKE_MIN_PARK_MS,
     );
+    spread7_witness();
+}
+
+/// SPREAD-7 — the wake-quantization proof line, emitted beside `[spread4]` from the same sites.
+/// `quant` is how many EL0 wakes landed in the tick-quantized arm (equal-or-higher band than the
+/// target's running task, below the service band — nothing preempts for them; see `preempt_hint`);
+/// `wake2disp` prices ALL EL0 wakes: mean and max CNTPCT-derived microseconds from `make_ready` to
+/// first dispatch, over `n` wakes. The P79 ceiling reads as `quant` climbing at the fleet park rate
+/// with `wd_mean` in the thousands of microseconds (half-quantum scale); a healthy fleet reads
+/// `wd_mean` in the tens (SGI + dispatch pass). Cumulative counters, reads only, safe from any core.
+fn spread7_witness() {
+    let n = SPREAD7_WD_N.load(Ordering::Relaxed);
+    let sum = SPREAD7_WD_SUM.load(Ordering::Relaxed);
+    let frq = load_window_cyc().saturating_mul(4).max(1); // == CNTFRQ_EL0, cached
+    let cyc_per_us = (frq / 1_000_000).max(1);
+    serial_println!(
+        "[spread7] quant={} wake2disp n={} mean={}us max={}us",
+        SPREAD7_QUANT.load(Ordering::Relaxed),
+        n,
+        sum.checked_div(n).unwrap_or(0) / cyc_per_us,
+        SPREAD7_WD_MAX.load(Ordering::Relaxed) / cyc_per_us,
+    );
 }
 
 /// SCHED-2 on-demand per-core load table (the `top` shell verb's body, and a serial witness). Prints
@@ -5348,6 +5448,7 @@ fn spawn_stealable_on(name: &'static str, entry: fn(usize), arg: usize, cpu: usi
         steal_ok: true, // the point of the fixture: movable, but staged on one core
         park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
         place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
+        wake_cyc: 0, // SPREAD-7: never woken yet; `make_ready` stamps it
     });
     rq(cpu).push(task);
     poke_cpu(cpu);

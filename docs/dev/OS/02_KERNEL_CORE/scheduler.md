@@ -556,6 +556,66 @@ fleet answers "stay". What changes is only that a pile-up now comes apart within
 a quarter second of the load leaving, instead of never. The rollup gains
 `refresh=` (asks from this path; outcomes still land in `rewake`/`stay`).
 
+### Wake-latency quantization made countable (aarch64, SPREAD-7 / SMP-FLUID)
+
+P79's storm-6 bench verdict ("it doesn't work fluidly") reduced to one structural
+number: a ~35/s per-window ceiling that only rarely broke to ~50/s, with the
+fleet-wide attach rate pinned at 123.8/s across dozens of rollups (pi4-r23s1r).
+There is no fps target or cap anywhere in the code (VUG-PACE established that,
+and the same run shows a lone fixture vug at 194.6/s). The ceiling is **wake
+latency quantized by the co-resident's quantum**:
+
+* A vug frame is a three-task rendezvous (parent + two workers on the `PHASE`
+  futex). Every rendezvous the VUG-PACE spin window does not catch becomes a
+  park followed by a wake through `make_ready`.
+* The wake's SGI (`poke_cpu` → `IPI_RESCHED`) only breaks WFI — `gic::handle_irq`
+  counts SGIs and returns. On an **idle** target core that is a prompt dispatch;
+  on a **busy** one the woken task waits in the run queue until the running task
+  reaches a dispatch boundary (yield, block, or quantum expiry — up to
+  `QUANTUM_TICKS` × tick = ~12 ms, mean ~6 ms), and `preempt_hint` trims the
+  incumbent's quantum only for a *service-band* wake (SCHED-PRIO).
+* Under storm 6 three cores sit at 99 % busy, so nearly every uncaught
+  rendezvous pays a quantum-scale wait, and a frame with 1–3 of them lands at
+  20–48 ms. The wire agrees in quantum-sized steps: per-window rates 21–39/s,
+  `[wcn] gap` minima of 15 ms on windows whose tasks own most of a core and
+  32–71 ms on the crowded ones, and the rare ~50/s escape being a stretch where
+  the spin windows caught every rendezvous and nothing parked at all
+  (`parked=0ms` on exactly the fast windows).
+
+The per-window *spread* (win4 at 39/s beside win2 at 9/s from the same binary)
+is the same mechanism distributed unevenly: whichever vug's tasks share busy
+cores pays more quantized wakes per frame. The SPREAD-4/5/6 machinery does not
+take the packing apart because the tasks that would need to ask the placement
+question either never park at all (spin-caught rendezvous produce no
+`make_ready`, so SPREAD-6's escapement — which only fires *on a wake* — never
+runs for them: the fast windows show `[wcn] parked=0ms` for whole rollups, and
+`refresh` climbed at ~20–25/s fleet-wide against a designed ~4/s for *each* of
+the ~14 committed EL0 tasks), or ask from a 3-runnable core against a
+2-runnable one, which margin-2 correctly answers "stay".
+
+**Cross-arch convergence.** x86's `make_ready` has the same three-arm shape:
+idle target → IPI-paced; higher-band wake → preempt; equal-or-lower-band wake
+onto a busy core → **waits for the tick, by design, on both arches**. aarch64 is
+not missing the wake IPI. Changing the equal-band arm — the candidate fix is a
+one-line extension of the existing SCHED-PRIO trim to same-band EL0 wakes
+(`prio >= cur` ⇒ `quantum.store(1)`, capping the wait at ~one tick ≈ 4 ms;
+bounded by the tick rate, so it cannot re-run SPREAD-4's ~540-moves/s churn) —
+is a scheduling-policy decision reserved for review, not landed unilaterally.
+
+**What SPREAD-7 lands** is the instrument that decision needs:
+
+* `SPREAD7_QUANT` — EL0 wakes that hit the tick-quantized arm (woken task
+  below the service band, equal-or-higher than the target core's running band;
+  an idle core reads `PRIO_NONE` and never matches).
+* `Task.wake_cyc` — stamped by `make_ready` (EL0 only), consumed by the first
+  `dispatch_next` that runs the task: the exact run-queue wait each wake paid.
+* `[spread7] quant=N wake2disp n=N mean=Xus max=Yus` — emitted beside
+  `[spread4]` from the same sites. The ceiling reads as `quant` climbing at the
+  fleet's park rate with `mean` at half-quantum scale (thousands of µs); a
+  healthy fleet reads tens of µs. QEMU (no live timer IRQ) exercises the
+  counters only, as with every preemption behaviour — the numbers are metal
+  evidence.
+
 ### Futex duplicate-bucket lost wake (aarch64, FUTEX-DUP / VUG-PACE-2)
 
 The other half of VUG-PACE-2, and the win1 lockup's root cause. `futex_wait`
