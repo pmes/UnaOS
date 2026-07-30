@@ -942,10 +942,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         loop {
             if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
                 xhci.poll_events();
+                // BOOTPACE M2 — CONSOLE-FIRST: `service_ftdi` runs AHEAD of `service_storage`, so on
+                // the pass that finally releases the deferred SCSI bring-up the console has already
+                // armed and every line of that multi-second chain rides the live wire instead of the
+                // FTDI capture ring's drop-oldest replay. Ordering only; both hooks are idempotent
+                // no-ops when their work is not pending.
+                xhci.service_ftdi();
                 xhci.service_storage();
                 xhci.service_hubs();
                 xhci.service_hid_setproto();
-                xhci.service_ftdi();
                 xhci.service_slot_disposal();
                 xhci.service_enum();
             }
@@ -1189,10 +1194,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // transactions run here, in a safe non-event context).
         if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
             xhci.poll_events();
+            // BOOTPACE M2 — CONSOLE-FIRST: `service_ftdi` ahead of `service_storage`, so the console
+            // is armed before the deferred SCSI bring-up (which `service_storage` now holds until the
+            // enumeration queue drains) puts its multi-second chain on the wire. Ordering only.
+            xhci.service_ftdi();
             xhci.service_storage();
             xhci.service_hubs();
             xhci.service_hid_setproto();
-            xhci.service_ftdi();
             xhci.service_slot_disposal();
             xhci.service_enum();
         }

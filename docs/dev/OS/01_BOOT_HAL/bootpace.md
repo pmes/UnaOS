@@ -131,9 +131,12 @@ two differ.* For BPACE:
 
 **Healthy.** The full ledger prints. Every tag from `entry` through `ftdi-up` is
 present; `t=` is strictly nondecreasing; `gui=` is in the tens of seconds; and
-`ftdi=` is strictly **greater** than `gui=` on a pre-BOOTPACE-M2 ordering (the
-console arms after the desktop). `dropped=0`, `hz=` a plausible TSC rate
-(~2.3e9 on the Ivy Bridge rMBP).
+`ftdi=` is strictly **greater** than `gui=`. That last inequality is structural,
+not incidental: on a GUI build the handoff happens *before* the service loop that
+runs enumeration, storage and the FTDI hooks starts at all, so every main-loop tag
+necessarily lands after `gui`. On a `usbdebug` build the GUI is never reached and
+the same ledger reads `gui=none` with `ftdi=` present. `dropped=0`, and `hz=` a
+plausible TSC rate (~2.3e9 on the Ivy Bridge rMBP).
 
 **Did not run (a) — no FTDI cable.** `ftdi-up` never records, `total` reads
 `ftdi=none`, **and no BPACE block reaches a second host at all**. The absence of

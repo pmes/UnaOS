@@ -276,6 +276,68 @@ if let Some(xhci) = &mut *XHCI_CONTROLLER.lock() {
 this safe, non-interrupt context (the actual SCSI READ(10)/WRITE(10) + Command
 Status Wrapper exchange), rather than inside the MSI handler.
 
+### 4a. Console-first ordering (BOOTPACE M2)
+
+The order of the hooks in that ladder is not incidental, and as of this arc it is
+fixed by two rules. Both x86-reachable ladders in `main.rs` (the `usbdebug` loop
+and the GUI loop) now run:
+
+```rust
+xhci.poll_events();
+xhci.service_ftdi();      // <- ahead of storage
+xhci.service_storage();
+xhci.service_hubs();
+xhci.service_hid_setproto();
+xhci.service_slot_disposal();
+xhci.service_enum();
+```
+
+and `service_storage()` holds its deferred bring-up while enumeration is still in
+flight:
+
+```rust
+if !self.storage_pending_bringup { return; }
+if self.enum_active || !self.ports_to_enumerate.is_empty() { return; }  // latch stays SET
+```
+
+**Why.** On metal the FTDI console is the only instrument that exists, and it arms
+at the *end* of its own port's enumeration. Previously, the storage device's
+Configure-Endpoint completion armed `storage_pending_bringup` and the very next
+`service_storage()` ran the multi-second TUR / INQUIRY / READ CAPACITY chain —
+plus the FAT mount and the first flight-recorder flush behind it — while the
+remaining ports, *including the FTDI's*, were still queued. Every one of those
+seconds elapsed with no console attached, so those lines reached a second host
+only as a replay out of the 64 KiB capture ring (`ftdi.rs`), which discards the
+**oldest** on overflow. Deferring means all ports enumerate back-to-back, the
+console arms, and only then does the storage chain start — live on the wire.
+
+**Cost.** Storage becomes ready later by the tail of enumeration only: hundreds of
+milliseconds, worst case one wedged port's bounded watchdog. Every `service_enum`
+stage has such a watchdog (`recover_enumeration` on expiry), so `enum_active`
+cannot stay true indefinitely and the deferral cannot become a hang. The latch is
+left set — this is a postponement, never a skip.
+
+**No protocol change.** This is ordering only: no budget, no settle, no timing
+constant, no interrupt-model change. Nothing downstream needed adjusting either —
+`fat::probe_once`, `flight_recorder::service` and the storage fixtures all gate on
+`block::info()` internally, so they simply follow the block device's later arrival.
+
+**Dating a capture.** The `:: BOT: knobs … result=KNOBS ::` line carries
+`order=console-first`, on the same terms as `cbw=always-awaited`: not a knob, a
+statement of what the build always does. A log whose KNOBS line lacks the field
+predates this reordering, and its storage-chain timings were taken with the
+console not yet armed. Artifact proof:
+`strings unaos/target/x86_64_esp/kernel.elf | grep -c 'order=console-first'` ≥ 1.
+
+**What is measurable.** BPACE (`docs/dev/OS/01_BOOT_HAL/bootpace.md`) reads the
+reordering directly: `ftdi-up` now precedes `stor-bringup` on the ledger, where
+before this arc it landed after `fr-flush`. That inversion — and only it — is the
+proof the reordering took effect; `gui=` is unaffected, because the GUI handoff
+happens before the service loop that runs any of these hooks even starts.
+
+The Pi's `pump_usb_into_gui` ladder (`main.rs`, `all(aarch64, baremetal)`) is
+deliberately **unchanged**: `service_ftdi` is a no-op there.
+
 ---
 
 ## 5. Block storage interface

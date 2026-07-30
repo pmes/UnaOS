@@ -35,7 +35,10 @@
 //
 //   * HEALTHY — the full ledger prints: every tag from `entry` through `ftdi-up` present, `t=`
 //     strictly nondecreasing, `gui=` in the tens of seconds, and `ftdi=` strictly greater than
-//     `gui=` (the console arms after the desktop on a pre-BOOTPACE-M2 ordering).
+//     `gui=`. That last inequality is structural, not incidental: on a GUI build the handoff
+//     happens BEFORE the service loop that runs enumeration/storage/FTDI starts at all, so every
+//     main-loop tag necessarily lands after `gui`. On a `usbdebug` build the GUI is never reached
+//     and the same ledger reads `gui=none` with `ftdi=` present.
 //   * DID NOT RUN (a) — no FTDI cable attached: `ftdi-up` never records, `total` reads
 //     `ftdi=none`, and no BPACE block reaches a second host at all. Absence of the block IS the
 //     reading; a ledger that "looks fine" on a wire nobody is watching proves nothing.

@@ -920,6 +920,12 @@ const BOT_RING_KNOB_TAG: &str = "botring64=ON-64trb";
 // kept on the KNOBS line because captures are compared across boots and a reader must be able to
 // tell a post-fix artifact from a pre-fix one without diffing the source.
 const BOT_CBWIOC_KNOB_TAG: &str = "cbw=always-awaited";
+// BOOTPACE M2 (2026-07-30): likewise not a knob. The main loop brings the FTDI console up BEFORE it
+// runs any storage I/O — `service_storage` holds the deferred SCSI bring-up until the enumeration
+// queue has drained, and `service_ftdi` precedes it in both x86 service ladders — so the whole
+// storage chain is witnessed live on the wire instead of replayed out of the capture ring. Carried
+// on the KNOBS line so a capture can be dated: a log without this field predates the reordering.
+const BOT_ORDER_TAG: &str = "order=console-first";
 
 // **The CBW is an awaited stage. Unconditionally. This is a fix, and it is convicted on metal.**
 //
@@ -8038,9 +8044,14 @@ impl XhciController {
         // evidence never convicted ring length). The third field is no longer a knob at all: it
         // reads `cbw=always-awaited` in every build, and its presence is how a capture is dated
         // against §17. A log still carrying `botcbwioc=` is from before the fix.
+        // BOOTPACE M2: `order=console-first` joins it on the same terms — not a knob, a statement of
+        // what the build always does (the SCSI bring-up waits for the enumeration queue to drain,
+        // and `service_ftdi` precedes `service_storage` in both x86 ladders). It exists so a capture
+        // can be dated: a log whose KNOBS line lacks this field predates the reordering, and its
+        // storage-chain timings were taken with the console not yet armed.
         serial_println!(
-            ":: BOT: knobs ring_trbs={} {} {} result=KNOBS ::",
-            BOT_RING_TRBS, BOT_RING_KNOB_TAG, BOT_CBWIOC_KNOB_TAG);
+            ":: BOT: knobs ring_trbs={} {} {} {} result=KNOBS ::",
+            BOT_RING_TRBS, BOT_RING_KNOB_TAG, BOT_CBWIOC_KNOB_TAG, BOT_ORDER_TAG);
         Ok(())
     }
 
@@ -8141,6 +8152,26 @@ impl XhciController {
 
     pub fn service_storage(&mut self) {
         if !self.storage_pending_bringup { return; }
+        // BOOTPACE M2 — CONSOLE-FIRST. Defer the whole SCSI bring-up until the enumeration queue
+        // has drained. The latch is left SET (this is a `return`, not a consume), so the bring-up is
+        // not skipped, only postponed to the first main-loop pass on which no port is mid-enumeration.
+        //
+        // Why: the FTDI console is the only instrument that exists on a metal boot, and it arms at
+        // the END of its own port's enumeration. Before this, the storage Configure-Endpoint
+        // completion armed `storage_pending_bringup` and the very next `service_storage` ran the
+        // multi-second TUR/INQUIRY/READ-CAPACITY chain — plus the FAT mount and the first
+        // flight-recorder flush behind it — while the remaining ports, INCLUDING the FTDI's, were
+        // still queued. Every one of those seconds happened with no console attached, so the log
+        // reached a second host only as a replay out of the 64 KiB capture ring, which drops the
+        // oldest lines on overflow. Enumerating all ports back-to-back first costs the tail of
+        // enumeration (hundreds of ms; worst case one wedged port's bounded watchdog — every
+        // `service_enum` stage has one, so `enum_active` cannot stay true forever) and buys a live
+        // wire for the entire storage chain.
+        //
+        // Nothing downstream needed changing: `fat::probe_once`, `flight_recorder::service` and the
+        // fixtures all gate on `block::info()` internally, so they follow the block device's arrival.
+        // This changes ORDER only — no protocol timing, no budget, no settle.
+        if self.enum_active || !self.ports_to_enumerate.is_empty() { return; }
         self.storage_pending_bringup = false;
         if self.storage_slot == 0 { return; }
 
