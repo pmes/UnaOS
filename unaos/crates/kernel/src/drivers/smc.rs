@@ -713,19 +713,8 @@ pub mod battery {
     pub fn snapshot() -> BatterySnapshot {
         let mut s = BatterySnapshot::default();
         RETRIES_SWEEP.store(0, Ordering::Relaxed); // per-sweep retry counter (IVY-RETRY)
-        let first = read_u16k(b"BRSC");
-        if matches!(first, KeyRead::Stuck) {
-            use core::sync::atomic::{AtomicBool, Ordering};
-            static NOTED: AtomicBool = AtomicBool::new(false);
-            if !NOTED.swap(true, Ordering::Relaxed) {
-                serial_println!(
-                    ":: SMC-BATT: sweep aborted — first key BRSC stuck (SMC unresponsive); remaining keys skipped (noted once) ::"
-                );
-            }
-            latch_retries();
-            return s; // all-None, present=false: the honest unresponsive snapshot
-        }
-        s.soc_pct = opt(first);
+        
+        s.soc_pct = opt(read_u16k(b"BRSC"));
         s.volt_mv = opt(read_u16k(b"B0AV"));
         s.amp_ma = opt(read_u16k(b"B0AC")).map(|u| u as i16);
         s.full_mah = opt(read_u16k(b"B0FC"));
@@ -758,7 +747,13 @@ pub mod battery {
         // IVY-AC: infer charge state from the B0AC sign. Computed always (it is cheap and costs no
         // port I/O); it is only *reported in place of* ac_present when AC-W could not answer.
         s.ac_derived = derive_ac(s.amp_ma);
-        s.present = s.soc_pct.is_some() || s.volt_mv.is_some() || s.rem_mah.is_some();
+        
+        let b0pr = read_u16k(b"B0Pr");
+        s.present = match b0pr {
+            KeyRead::Val(v) => v != 0,
+            KeyRead::Stuck => CACHE.lock().present,
+            KeyRead::Absent => s.soc_pct.is_some() || s.volt_mv.is_some() || s.rem_mah.is_some(),
+        };
         latch_retries();
         s
     }
@@ -970,17 +965,17 @@ pub mod battery {
         }
 
         // PWR ROLLUP (M1 power instrument)
-        if s.present {
-            let mut pwr = PWR_ROLLUP.lock();
-            let mut flush = false;
-            let mut reason = "";
+        let mut pwr = PWR_ROLLUP.lock();
+        let mut flush = false;
+        let mut reason = "";
+        let dropped_accumulator = !s.present && pwr.start_ms != 0 && (pwr.samples > 0 || pwr.unknown > 0);
 
+        if s.present {
             if pwr.start_ms == 0 {
                 pwr.start_ms = now;
                 pwr.state = s.ac_derived;
             }
 
-            // If the AC state changes mid-window, flush the old state before accumulating
             if s.ac_derived != pwr.state && pwr.start_ms != 0 && (pwr.samples > 0 || pwr.unknown > 0) {
                 flush = true;
                 reason = "state change";
@@ -988,43 +983,63 @@ pub mod battery {
                 flush = true;
                 reason = "rollup";
             }
+        } else if dropped_accumulator {
+            flush = true;
+            reason = "presence dropped";
+        }
 
-            if flush {
-                let window_ms = now.wrapping_sub(pwr.start_ms);
+        if flush {
+            let window_ms = now.wrapping_sub(pwr.start_ms);
 
-                let state_str = match pwr.state {
-                    AcDerived::Charging => "plugged (charging)",
-                    AcDerived::Discharging => "unplugged (discharging)",
-                    AcDerived::Idle => "idle",
-                    AcDerived::Unknown => "unknown",
-                };
+            let state_str = match pwr.state {
+                AcDerived::Charging => "plugged (charging)",
+                AcDerived::Discharging => "unplugged (discharging)",
+                AcDerived::Idle => "idle",
+                AcDerived::Unknown => "unknown",
+            };
 
-                if pwr.min < 0 && pwr.max > 0 {
-                    serial_println!(
-                        ":: PWR: INADMISSIBLE (straddles zero, excluded from cumulative) window_ms={} state={} samples={} unknown={} sum={} min={} max={} == {} ::",
-                        window_ms, state_str, pwr.samples, pwr.unknown, pwr.sum, pwr.min, pwr.max, reason
-                    );
-                } else {
-                    pwr.total_ms += window_ms;
-                    pwr.total_sum += pwr.sum;
-                    pwr.total_samples += pwr.samples;
+            if pwr.samples == 0 && pwr.unknown > 0 {
+                serial_println!(
+                    ":: PWR: NO-WINDOW (unknown dominated) window_ms={} state={} samples={} unknown={} == {} ::",
+                    window_ms, state_str, pwr.samples, pwr.unknown, reason
+                );
+            } else if dropped_accumulator && pwr.samples == 0 {
+                serial_println!(
+                    ":: PWR: NO-WINDOW (dropped) window_ms={} state={} samples={} unknown={} == {} ::",
+                    window_ms, state_str, pwr.samples, pwr.unknown, reason
+                );
+            } else if pwr.min < 0 && pwr.max > 0 {
+                serial_println!(
+                    ":: PWR: INADMISSIBLE (straddles zero, excluded from cumulative) window_ms={} state={} samples={} unknown={} sum={} min={} max={} == {} ::",
+                    window_ms, state_str, pwr.samples, pwr.unknown, pwr.sum, pwr.min, pwr.max, reason
+                );
+            } else {
+                pwr.total_ms += window_ms;
+                pwr.total_sum += pwr.sum;
+                pwr.total_samples += pwr.samples;
 
-                    serial_println!(
-                        ":: PWR: window_ms={} state={} samples={} unknown={} sum={} min={} max={} (total: time={} sum={} samples={}) (ac_derived: inferred, no hardware key) == {} ::",
-                        window_ms, state_str, pwr.samples, pwr.unknown, pwr.sum, pwr.min, pwr.max, pwr.total_ms, pwr.total_sum, pwr.total_samples, reason
-                    );
-                }
-
-                // Reset accumulator for the new window
-                pwr.samples = 0;
-                pwr.unknown = 0;
-                pwr.sum = 0;
-                pwr.min = 0;
-                pwr.max = 0;
-                pwr.start_ms = now;
-                pwr.state = s.ac_derived;
+                serial_println!(
+                    ":: PWR: window_ms={} state={} samples={} unknown={} sum={} min={} max={} (total: time={} sum={} samples={}) (ac_derived: inferred, no hardware key) == {} ::",
+                    window_ms, state_str, pwr.samples, pwr.unknown, pwr.sum, pwr.min, pwr.max, pwr.total_ms, pwr.total_sum, pwr.total_samples, reason
+                );
             }
 
+            // Reset accumulator for the new window
+            pwr.samples = 0;
+            pwr.unknown = 0;
+            pwr.sum = 0;
+            pwr.min = 0;
+            pwr.max = 0;
+            if s.present {
+                pwr.start_ms = now;
+                pwr.state = s.ac_derived;
+            } else {
+                pwr.start_ms = 0;
+                pwr.state = AcDerived::Unknown;
+            }
+        }
+
+        if s.present {
             // Accumulate current sample
             if let (Some(volt), Some(amp)) = (s.volt_mv, s.amp_ma) {
                 if matches!(s.ac_derived, AcDerived::Unknown) {
@@ -1041,6 +1056,9 @@ pub mod battery {
                     pwr.sum += mw;
                     pwr.samples += 1;
                 }
+            } else {
+                // If either volt or amp is missing, it's a partial sweep and is unknown.
+                pwr.unknown += 1;
             }
         }
     }

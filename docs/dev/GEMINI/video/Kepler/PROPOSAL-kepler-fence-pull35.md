@@ -34,5 +34,12 @@ This ensures the ledger survives a wedged boot.
 - **Healthy Boot**: `504_read_touched=false`, `504_read_idx=none`. `504_write_touched=true`, `504_write_idx=N` (where N is the very last index, representing the terminal poke).
 - **Poisoned Boot**: `504_read_touched=true`, `504_read_idx=M` (where M < N, indicating an illegal read occurred earlier in the boot), explaining any subsequent `BADF1000` faults.
 
+### Falcon-Side Read Outcome Table
+By seeding `CC_SCRATCH[1]` with a non-zero sentinel (`0xA5A50000`), the `host-ack` reading (`ack=...`) distinguishes four distinct states:
+1. **Sentinel intact (`ack=A5A50000`)**: The Falcon never wrote to the register. (Host reports `phase=04`).
+2. **Read Zero (`ack=00000000`)**: The Falcon executed the read and actively wrote zero back. (Host reports `phase=04`).
+3. **Read Poison (`ack=BADFxxxx`)**: The offset is poisoned from the Falcon's perspective, returning the standard bus error/fault signature. (Host reports `phase=04`).
+4. **Falcon Wedged (`phase=03`, `ack=A5A50000`)**: The `iord` against the poisoned offset halts or crashes the Falcon core before reaching phase 4, leaving the sentinel intact and the phase stuck at 03.
+
 ## 4. Falcon-Side Read (Carried Forward)
 The falcon-side read of `0x409504` inside the microcode via `iord` port `(0x14100)` remains intact and will execute natively.

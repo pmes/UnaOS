@@ -155,18 +155,19 @@ pub mod ucode {
         0xf0, 0x07, 0x02,             // mov   $r0, 0x02
         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
         0xb0, 0x44, 0x02,             // cmpu b32 $r4, 0x2
-        0xf4, 0x2b, 0x2c,             // bra eq, cmd2_exit
+        0xf4, 0x2b, 0x2e,             // bra eq, cmd2_exit
         0xb0, 0x44, 0x01,             // cmpu b32 $r4, 0x1
-        0xf4, 0x1b, 0x15,             // bra ne, dec
+        0xf4, 0x1b, 0x17,             // bra ne, dec
         0xf0, 0x07, 0x03,             // cmd1: mov $r0, 0x03
         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
         0xcf, 0x84, 0x00,             // iord  $r4, I[$r8]
         0xd0, 0x24, 0x00,             // iowr  I[$r2], $r4
-        0xb0, 0x54, 0x00,             // cmpu b32 $r5, 0x0
-        0xf4, 0x1b, 0xd9,             // bra ne, poll
+        0xf0, 0x07, 0x04,             // mov   $r0, 0x04
+        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+        0xf8, 0x02,                   // exit
         0xb0, 0x52, 0x01,             // dec: sub b32 $r5, 0x1
         0xb0, 0x54, 0x00,             // cmpu b32 $r5, 0x0
-        0xf4, 0x1b, 0xd0,             // bra ne, poll
+        0xf4, 0x1b, 0xce,             // bra ne, poll
         0xf0, 0x07, 0xbd,             // mov   $r0, 0xbd
         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
         0xf8, 0x02,                   // exit
@@ -174,7 +175,7 @@ pub mod ucode {
         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
         0xf8, 0x02,                   // exit
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
     
@@ -398,13 +399,7 @@ pub fn init(gpu: &GpuInfo) {
         serial_println!("[NVIDIA] PGRAPH Engine Status (0x400000): 0x{:08X}. Requires firmware for full 2D/3D.", pgraph_status);
 
         // Recon Probe before any engine state modification
-        let recon_chan_cur = fecs_read(bar0, 0x409b00);
-        let recon_chan_next = fecs_read(bar0, 0x409b04);
-        let recon_engine_status = fecs_read(bar0, 0x409c00);
-        let recon_engine_trigger = fecs_read(bar0, 0x409c08);
-        let recon_wrcmd_data = fecs_read(bar0, 0x409500);
-        serial_println!(":: kepler: recon CHAN_CUR={:08X} CHAN_NEXT={:08X} ENGINE_STATUS={:08X} ENGINE_TRIGGER={:08X} WRCMD_DATA={:08X} ::",
-            recon_chan_cur, recon_chan_next, recon_engine_status, recon_engine_trigger, recon_wrcmd_data);
+
 // 8. Phase 4: 3D Foundation - PFIFO and Pushbuffer setup
         if cfg!(feature = "nvidia-kepler-fifo") {
             serial_println!("[NVIDIA] Starting PFIFO initialization...");
@@ -596,6 +591,14 @@ pub fn init(gpu: &GpuInfo) {
                                     
                                     mmio_write(bar0, regs::NV_PMC_ENABLE, pmc_en_pre | (1 << 12));
                                     let pmc_en_on = mmio_read(bar0, regs::NV_PMC_ENABLE);
+                                    let recon_chan_cur = fecs_read(bar0, 0x409b00);
+                                    let recon_chan_next = fecs_read(bar0, 0x409b04);
+                                    let recon_engine_status = fecs_read(bar0, 0x409c00);
+                                    let recon_engine_trigger = fecs_read(bar0, 0x409c08);
+                                    let recon_wrcmd_data = fecs_read(bar0, 0x409500);
+                                    serial_println!(":: kepler: recon (healthy: BADF1000/0s, unpowered: BADF1200) CHAN_CUR={:08X} CHAN_NEXT={:08X} ENGINE_STATUS={:08X} ENGINE_TRIGGER={:08X} WRCMD_DATA={:08X} ::",
+                                        recon_chan_cur, recon_chan_next, recon_engine_status, recon_engine_trigger, recon_wrcmd_data);
+
                                     serial_println!(":: kepler: pgraph-pulse on rb={:08X} ::", pmc_en_on);
 
                                     if (pmc_en_on & (1 << 12)) == 0 {
@@ -738,7 +741,7 @@ pub fn init(gpu: &GpuInfo) {
                                                 serial_println!(":: kepler: dmactl REFUSED ::");
                                                 continue;
                                             }
-                                            fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
+fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                             fecs_write(bar0, base + 0x100, 2); // CPUCTL START_TRIGGER
                                             serial_println!(":: kepler: ucode start cpuctl<=00000002 ::");
                                         
@@ -779,7 +782,7 @@ pub fn init(gpu: &GpuInfo) {
                                             fecs_write(bar0, base + 0x10C, dmactl_pre & !1);
 
                                             fecs_write(bar0, base + 0x800, 0); // CC_SCRATCH[0]
-                                            fecs_write(bar0, base + 0x804, 0); // CC_SCRATCH[1]
+                                            fecs_write(bar0, base + 0x804, MB_SEED); // CC_SCRATCH[1] (sentinel)
                                             // Seed both mailboxes so "unchanged" has exactly one meaning
                                             // (s29 discipline) for the two new observables as well.
                                             fecs_write(bar0, base + 0x040, MB_SEED); // MAILBOX0 <- value read
@@ -803,6 +806,15 @@ pub fn init(gpu: &GpuInfo) {
                                                 serial_println!(":: kepler: ucode-echo ABORT verify-mismatch h2h3={} ::", h2h3_label);
                                                 continue;
                                             }
+                                                                                        if h2h3_label == "on" {
+                                                fecs_write(bar0, base + 0xC00, 2);
+                                                let check_status = fecs_read(bar0, base + 0xC00);
+                                                serial_println!(":: kepler: H2/H3 ENGINE_STATUS readback={:08X} ::", check_status);
+                                                
+                                                fecs_write(bar0, base + 0xC08, 1);
+                                                let check_trigger = fecs_read(bar0, base + 0xC08);
+                                                serial_println!(":: kepler: H2/H3 ENGINE_TRIGGER readback={:08X} ::", check_trigger);
+                                            }
                                             fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                             fecs_write(bar0, base + 0x100, 2); // CPUCTL START_TRIGGER
                                             serial_println!(":: kepler: ucode-echo start h2h3={} ::", h2h3_label);
@@ -815,7 +827,7 @@ pub fn init(gpu: &GpuInfo) {
                                             for i in 0..100_000u32 {
                                                 ack = fecs_read(bar0, base + 0x804);
                                                 ack_iters = i;
-                                                if ack == 1 { break; }
+                                                if ack != MB_SEED { break; }
                                                 core::hint::spin_loop();
                                             }
                                             
@@ -1377,20 +1389,20 @@ mod tests {
         assert_eq!(ECHO_BOUND, 1_048_576);
 
         // A: `sub b32 $r5, 0x1` = b0 52 01 ; B: `add b32 $r5, 0x1` = b0 50 01.
-        assert_eq!(&ECHO_A_BYTES[0x56..0x59], &[0xb0, 0x52, 0x01]);
+        assert_eq!(&ECHO_A_BYTES[0x58..0x5b], &[0xb0, 0x52, 0x01]);
 
         // The bound test and its backward branch: cmpu $r5,0 ; bra ne,-0x29 -> poll @0x2C.
         for bytes in [&ECHO_A_BYTES] {
-            assert_eq!(&bytes[0x59..0x5c], &[0xb0, 0x54, 0x00]);
-            assert_eq!(&bytes[0x5c..0x5f], &[0xf4, 0x1b, 0xd0]);
-            let disp = bytes[0x5e] as i8 as isize;
-            assert_eq!(0x5c_isize + disp, 0x2c); // lands on the `iord`
+            assert_eq!(&bytes[0x5b..0x5e], &[0xb0, 0x54, 0x00]);
+            assert_eq!(&bytes[0x5e..0x61], &[0xf4, 0x1b, 0xce]);
+            let disp = bytes[0x60] as i8 as isize;
+            assert_eq!(0x5e_isize + disp, 0x2c); // lands on the `iord`
             // The forward `bra ne` at 0x42 lands on the decrement block at 0x56.
-            let fwd = bytes[0x44] as i8 as isize;
-            assert_eq!(0x42_isize + fwd, 0x57);
+            let fwd = bytes[0x43] as i8 as isize;
+            assert_eq!(0x41_isize + fwd, 0x58);
             // Both exits are a real `exit` (f8 02), not a fall-off-the-page.
-            assert_eq!(&bytes[0x6b..0x6d], &[0xf8, 0x02]); // cmd2_exit
-            assert_eq!(&bytes[0x65..0x67], &[0xf8, 0x02]); // after bound
+            assert_eq!(&bytes[0x6d..0x6f], &[0xf8, 0x02]); // cmd2_exit
+            assert_eq!(&bytes[0x67..0x69], &[0xf8, 0x02]); // after bound
         }
     }
 
@@ -1403,7 +1415,7 @@ mod tests {
             assert_eq!(&bytes[0x2f..0x32], &[0xd0, 0x64, 0x00]); // iowr  I[$r6], $r4
             assert_eq!(&bytes[0x50..0x53], &[0xd0, 0x24, 0x00]); // iowr  I[$r2], $r4 (ack)
             // five phase stamps, each an `iowr I[$r7], $r0`
-            for at in [0x29usize, 0x35, 0x4a, 0x6e, 0x62] {
+            for at in [0x29usize, 0x35, 0x47, 0x53, 0x64, 0x6c] {
                 assert_eq!(&bytes[at..at + 3], &[0xd0, 0x70, 0x00]);
             }
         }

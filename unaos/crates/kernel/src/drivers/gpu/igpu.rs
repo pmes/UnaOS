@@ -41,10 +41,15 @@ pub mod regs {
     pub const PP_CONTROL: usize = 0x61204;
     pub const DPLL_A_CTRL: usize = 0x06014;
 
-    // Additional DP/DDI Ports
+    // Additional DP/DDI Ports (CPU block)
     pub const DP_B: usize = 0x64100;
     pub const DP_C: usize = 0x64200;
     pub const DP_D: usize = 0x64300;
+
+    // Additional DP/DDI Ports (PCH block)
+    pub const PCH_DP_B: usize = 0xE4100;
+    pub const PCH_DP_C: usize = 0xE4200;
+    pub const PCH_DP_D: usize = 0xE4300;
 
     // FDI links (CPU-to-PCH)
     pub const FDI_RXA_CTL: usize = 0xF000C;
@@ -334,9 +339,9 @@ pub fn init(gpu: &GpuInfo) {
         serial_println!(":: igpu: --- ADDITIONAL CENSUS GAPS --- ::");
         serial_println!(":: igpu: PP_STATUS_CPU:  0x{:08X} | PP_STATUS_PCH:  0x{:08X}", mmio_read(bar0, regs::PP_STATUS), mmio_read(bar0, regs::PCH_PP_STATUS));
         serial_println!(":: igpu: PP_CONTROL_CPU: 0x{:08X} | PP_CONTROL_PCH: 0x{:08X}", mmio_read(bar0, regs::PP_CONTROL), mmio_read(bar0, regs::PCH_PP_CONTROL));
-        serial_println!(":: igpu: DP_B: 0x{:08X}", mmio_read(bar0, regs::DP_B));
-        serial_println!(":: igpu: DP_C: 0x{:08X}", mmio_read(bar0, regs::DP_C));
-        serial_println!(":: igpu: DP_D: 0x{:08X}", mmio_read(bar0, regs::DP_D));
+        serial_println!(":: igpu: DP_B_CPU: 0x{:08X} | DP_B_PCH: 0x{:08X}", mmio_read(bar0, regs::DP_B), mmio_read(bar0, regs::PCH_DP_B));
+        serial_println!(":: igpu: DP_C_CPU: 0x{:08X} | DP_C_PCH: 0x{:08X}", mmio_read(bar0, regs::DP_C), mmio_read(bar0, regs::PCH_DP_C));
+        serial_println!(":: igpu: DP_D_CPU: 0x{:08X} | DP_D_PCH: 0x{:08X}", mmio_read(bar0, regs::DP_D), mmio_read(bar0, regs::PCH_DP_D));
         serial_println!(":: igpu: FDI_RXA_CTL: 0x{:08X}", mmio_read(bar0, regs::FDI_RXA_CTL));
         serial_println!(":: igpu: FDI_TXA_CTL: 0x{:08X}", mmio_read(bar0, regs::FDI_TXA_CTL));
         serial_println!(":: igpu: FPA0: 0x{:08X}", mmio_read(bar0, regs::FPA0));
