@@ -1955,7 +1955,13 @@ pub fn futex_wake(key: u64, n: usize) -> usize {
         }
         b.unlock_raw();
         if woken >= n {
-            break; // the wake's budget is spent; semantics are unchanged from the first-match scan
+            // The wake's budget is spent; semantics are unchanged from the first-match scan. KNOWN
+            // BLIND SPOT (cross-seat, 2026-07-29): exiting here means an n==1 wake that finds its
+            // waiter in the FIRST bucket serving the key never scans further — a duplicate bucket
+            // beyond it is neither counted by [futexdup] nor drained. Only n>=2 wakes can witness a
+            // duplicate. The trigger pattern in the tree (vug's PHASE barrier) wakes 2, so it is
+            // covered; a future n==1 caller inherits detection-by-luck, not by construction.
+            break;
         }
     }
     if buckets_served > 1 {
