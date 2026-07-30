@@ -3328,3 +3328,26 @@ The remaining truth channels are outside the register file: the VPU firmware's o
 time that our bringup does not (clock/reset/power sequencing differences — a source-audit of
 raspberrypi-power/raspberrypi-clk/v3d-probe on BCM2711 is the next instrument, before any
 further boot is spent).
+
+### 46.4 V3D-79 — the genpd-faithful minimal bringup (P90, read on metal)
+
+The source audit (rpi-6.6.y: `v3d_drv.c`, `v3d_gem.c`, `bcm2835-power.c`, `clk-bcm2835.c`,
+`bcm2711.dtsi`) established that piOS never resets V3D at boot — `v3d_reset()` is the hang path;
+boot-time bring-up is genpd `bcm2835_asb_power_on` alone (deassert `PM_V3DRSTN`, release the two
+rpivid bridges; `pd->clk` resolves NULL on 2711 so the clock choreography no-ops; the v3d node
+has no clock of its own). `UNAOS_V3D79_MINIMAL` reproduces exactly that and nothing else.
+
+**P90 verdict: STILL DEAD.** BLOCK-UP without any mailbox call (the block decodes on bridge
+release alone), and `[v3d74a]` reads the identical never-starts signature. Every ARM-side act,
+order and register the working system touches is now matched or removed — **the ARM-side
+divergence space is EMPTY.** Two riders: (a) on the MINIMAL boot the firmware *reports* the V3D
+clock gated at 250 MHz while CYCLE_COUNT free-runs at ~499 MHz — the firmware clock-state report
+is not trustworthy (instrument-lie ledger +1); (b) our mailbox power/rate/gate calls are
+therefore neither harmful nor sufficient — cosmetic to the wedge.
+
+**Remaining space, now exclusive: the environment the FIRMWARE boots under.** piOS's start4.elf
+/fixup4.dat (its own build) + its config.txt lines vs our pinned 1.20260521 set with a bare
+config. The next discriminator is P91-ENVSWAP: OUR kernel + the piOS card's exact firmware
+files and config lines (minus kernel=/os selection). Retire there → bisect the environment
+(firmware build first, then config lines). Still-dead there closes the ARM-testable universe;
+what remains is VPU-internal state requiring firmware-side instrumentation.
