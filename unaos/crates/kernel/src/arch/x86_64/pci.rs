@@ -190,6 +190,12 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
 }
 
 pub fn init(_dtb_addr: u64, _dtb_size: usize) {
+    // BPACE (M4): entry to the whole PCI/USB bring-up. Placed FIRST so that `d=` from `sched` is
+    // step 4e (`apic::report_tick_rate` — a 50 ms PM-timer window) and nothing else, and so a boot
+    // that dies anywhere below still shows that it got this far. Everything from here to
+    // `pci-usb` used to be one undivided delta; see `docs/dev/OS/01_BOOT_HAL/bootpace.md` §6a.
+    crate::bootpace::record("pci-enter");
+
     // VPERF (bench builds only): read-only display diagnostics — the effective framebuffer memory
     // type (MTRR + live PTE + PAT) and which class-0x03 device's BAR owns the fb address. Rides
     // the PCI-init point so the lines land once, early, in every knob-ON boot log.
@@ -223,8 +229,16 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     // poll. Runs BEFORE the PORTSW flip + xhci::init below: the internal HID sit on NON-switchable
     // EHCI-only ports (PORTSW-1 §7f), so the port sets are disjoint by hardware and the two stacks
     // coexist permanently. Never touches an xHCI register. Opt-out => this call + the module unlink.
+    //
+    // BPACE (M4): stamped on BOTH sides. `ehci::init` is default-ON on the metal build, walks all
+    // 256 PCI buses of config space, then runs a wake + port-reset + synchronous EP0 enumeration per
+    // EHCI function — every one of those waits is `wait_bounded`, so the phase can legitimately cost
+    // hundreds of ms and a boot that dies inside it must still show that it ENTERED it. A single
+    // trailing stamp could not tell "EHCI was slow" from "EHCI never ran".
+    crate::bootpace::record("ehci-hid");
     #[cfg(feature = "ehcihid")]
     crate::drivers::ehci::init();
+    crate::bootpace::record("ehci-hid-done");
 
     // BATMON-1 (UNAOS_SMC=1): fire the Apple SMC key-inventory scout once, here at the early x86
     // bring-up point (like the EHCI scout above) so its `:: SMC-SCOUT: ... ::` lines land once in
@@ -239,7 +253,13 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         crate::drivers::smc::battery::refresh_if_due();
     }
 
-    if let Some((xhci_phys_addr, bus, dev, func)) = crate::drivers::pci::PciScanner::scan() {
+    // BPACE (M4): the xHCI bus scan. Split from the `if let` so the stamp lands whether or not a
+    // controller was found — on a machine with no xHCI the tag is still present and `pci-usb`
+    // follows it directly, which is how the ledger distinguishes "no controller" from "the scan
+    // hung". Config-space reads only, no waits: a single trailing stamp is sufficient here.
+    let xhci_found = crate::drivers::pci::PciScanner::scan();
+    crate::bootpace::record("pci-scan");
+    if let Some((xhci_phys_addr, bus, dev, func)) = xhci_found {
         serial_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
 
         // DIAGNOSTIC (read-only): dump interrupt line/pin + capability list to plan
@@ -258,6 +278,13 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         // config-space write is issued (the no-routing EHCI-internal/xHCI-external topology).
         #[cfg(not(feature = "noportsw"))]
         enable_intel_xhci_ports(bus, dev, func);
+
+        // BPACE (M4): the PCI-side preamble to the controller — `probe_irq_caps`,
+        // `enable_bus_master`, and the PORTSW-1 routing flip. All config-space I/O with no
+        // handshake wait, so `d=` here should be ~0; on a `noportsw` build the tag still records
+        // (the flip is what is absent, not the stamp) and `d=` is the two capability accesses
+        // alone. Immediately precedes `xhci::init`, so it doubles as that call's entry marker.
+        crate::bootpace::record("portsw");
 
         // Initialize xHCI
         crate::drivers::xhci::init(xhci_phys_addr); // Reset and command ring
@@ -293,6 +320,14 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
             );
 
             xhci.init_pointers(command_ring_phys);
+
+            // BPACE (M4): the ring/interrupter programming is done and RS has NOT been set yet.
+            // `d=` from `xhci-cnr` covers the heap allocation of the command + event rings,
+            // `init_interrupter` (which re-runs `wait_for_cnr_clear`, a `hw_wait_budget()`-bounded
+            // wait), the MSI-X programming and `init_pointers`. Stamped before `start()` so a boot
+            // that wedges inside `start()` still shows the controller was fully programmed.
+            crate::bootpace::record("xhci-ptrs");
+
             xhci.start();
 
             // Store globally

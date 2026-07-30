@@ -828,6 +828,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // BPACE (M4): scheduler bring-up returned — per-CPU run queues, `sched::enable()`, the
+    // CLOCK-X1 witness, and (on a `witness` build only) the whole ring-3 fixture flow. On the quiet
+    // build that reaches metal this is init+enable+clock witness and nothing else, so `d=` here is
+    // expected to be small; it exists so that "small" is a MEASUREMENT rather than an assumption.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::bootpace::record("sched");
+
     // 4e. Prove the global ms-clock is real: with every core now online and ticking at 1 kHz, the
     // shared `ticks()` clock must still advance at ~1000 Hz (only the BSP drives it). This is the
     // wall-clock assertion the calibration hinges on — a reading of ~N×1000 would betray an SMP

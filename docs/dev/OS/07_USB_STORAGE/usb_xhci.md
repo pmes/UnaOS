@@ -243,6 +243,70 @@ advances log `[xhciint] ERDP advanced to <phys>` under the xdbg gate. QEMU raspi
 models no PCIe RC/VL805, so the Pi witness is metal-only; the aarch64 `virt` MISSION
 gate exercises the path and carries the witness.
 
+### 2d. The pre-CCS-scan settle — 500 ms → 150 ms (BOOTPACE M4)
+
+`start()` powers every root port, waits, and only then samples CCS to build the
+initial enumeration queue. The wait exists because a boot-owned USB3 device whose
+SuperSpeed link dropped on our `HCRST` needs time to re-train
+(RxDetect → Polling → U0); the pre-settle code read CCS immediately and a real
+USB3 stick was missed at scan time. USB2 keyboards and mice re-detect fast enough
+to be caught without it — the USB3 stick was not.
+
+M4 changes two things about that wait.
+
+**Timebase.** It was `hw_wait_budget() / 4`. `hw_wait_budget()` is a *policy*
+number — "how long may a wedged handshake burn before we call it dead" — and
+`cycles_per_ms`'s own doc-comment already forbids tying spec settles to it,
+because the day the timeout policy changes, every USB timing constant silently
+rescales. It also made the settle's real wall clock arch-dependent and
+unprintable: ~500 ms on a calibrated x86, ~694 ms on the Pi's fixed 150 M-tick
+budget. It is now `SETTLE_MS * cycles_per_ms()` — the same honest number on both
+arches, and `settle_ms=` can state it without lying.
+
+**Length: 150 ms.** USB3 link training reaches U0 in tens of ms typically; the
+spec's outer bound is `tPollingLFPSTimeout` = 360 ms (USB 3.2 §6.9). That outer
+bound is now enforced where it belongs — see below — instead of by padding the
+settle, so the common case (link already trained, or a machine with no USB3
+device attached) pays 150 ms rather than 500 ms.
+
+**The 360 ms floor moved into the Polling debounce.** The scrub loop that runs
+straight after the settle collects USB3 ports sitting at `CCS=0, PLS=Polling`,
+waits, re-reads, and warm-resets the ones still there (the Panther Point
+stuck-in-Polling erratum). A healthy link may *legitimately* be in Polling for up
+to 360 ms, so declaring one stuck before then would warm-reset a link out of a
+legal state. The old pairing satisfied that only by accident (500 ms settle +
+100 ms debounce = 600 ms). It is now explicit: the debounce is
+`POLLING_DECIDE_MS (360) − SETTLE_MS`, i.e. whatever is left of the spec window,
+so shortening the settle cannot shorten the Polling verdict. A link that finishes
+training during that window reads `CCS=1` at the re-check, is *not* warm-reset,
+and is picked up by the CCS scan in the ordinary way.
+
+**Why a short settle cannot lose the device.** Two backstops, both pre-existing:
+
+- the CAS / warm-reset rungs immediately after the settle (`CAS=1`, or
+  `PLS ∈ {Inactive, Compliance}`) kick a link a hot reset cannot recover, and the
+  resulting `CSC`/`PRC` flows through `handle_port_status`;
+- a late `0 → 1` CCS edge latches `CSC` *after* the scrub has cleared every change
+  bit (so `PSCEG` is armed), the controller posts a Port Status Change Event, the
+  polled main loop drains it, and `handle_port_status` queues the port.
+
+A slow device therefore enumerates **later**, not never.
+
+**Metal tell-tale of a regression here.** The boot device arriving via the
+CSC / warm-reset path instead of the initial scan. On a healthy boot the capture
+reads `xHCI: Port N connected (Status: …); queued for enumeration.` immediately
+after `xHCI: port settle complete before CCS scan (settle_ms=150)`. If instead the
+boot device's port shows up through
+`xHCI: [Port N] unsolicited reset complete; queuing for enumeration.` or a plain
+hot-plug `CSC` line — or if `xHCI: USB3 port N stuck in Polling (debounced);
+warm-resetting.` names the boot port — the settle is too short for this machine
+and `SETTLE_MS` must go back up. `settle_ms=` is printed live precisely so a
+capture can be dated against the constant that produced it.
+
+Saving: ~350 ms of the time to first console, on a boot whose dominant cost is
+elsewhere (see `docs/dev/OS/01_BOOT_HAL/bootpace.md` §6a) — the point of doing it
+now is that it is spec-justified on its own terms, not that it is the big win.
+
 ---
 
 ## 3. Interrupt model (MSI → local APIC)
@@ -847,10 +911,44 @@ Error (code 4):
 
 - **Connect debounce** — 100 ms (USB 2.0 TATTDB) between the connect event and
   the first port reset, so the reset never lands on an electrically unsettled
-  attach.
+  attach. **Hot-plug ports only** since BOOTPACE M4 — see below.
 - **Escalating retry pacing** — recovery re-resets are spaced 200/400/600 ms
   (attempt-scaled), and a code-4-with-FS-speed failure logs an explicit
   failed-HS-chirp hint in the serial capture.
+
+### 6a. Initial-boot-scan ports skip the connect debounce (BOOTPACE M4)
+
+TATTDB asks for 100 ms of **stable attach** before the port reset. A port queued
+by the initial CCS scan in `start()` has already served it, several times over and
+in wall clock that is not ours to charge twice:
+
+- the device was physically attached before the machine was powered — the boot
+  stick *is* the UEFI boot device;
+- `start()` powered the port and then held the pre-scan settle (§2d) before
+  sampling CCS at all;
+- it was observed `CCS=1` at the end of that settle, which is the stability
+  evidence the debounce exists to gather.
+
+So `start()` records those ports in `boot_scan_ports` alongside
+`ports_to_enumerate`, and `start_next_port` sends a marked port straight to
+`issue_enum_reset` instead of parking it in the `debounce` stage. Witness:
+`xHCI: [enum port N] initial boot scan — attach already stable through the settle;
+skipping the 100 ms connect debounce.`
+
+**Hot-plug ports keep the full 100 ms, unchanged.** That path is metal-proven, not
+theoretical: the 2012 rMBP bench (2026-07-08) hot-plugged a High-Speed SD reader
+which, reset immediately on the connect event, trained at Full-Speed (failed HS
+chirp) and then failed every `ADDRESS_DEVICE` with USB Transaction Error (code 4).
+Nothing about that case is improved by removing its debounce.
+
+The mark is **consumed when the port is popped**, not when it is used. A port that
+is popped, found `CCS=0`, skipped, and later returns through `CSC` is a genuine
+(re)attach and pays the full debounce — as does any port re-queued by
+`requeue_after_settle` or by the hot-plug path. The 50 ms `TRSTRCY` reset-settle
+is untouched on both paths.
+
+Saving: 100 ms per boot-scan port on the critical path to the first console and
+the first block read (two ports on the rMBP bench = ~200 ms).
 
 **Mass storage behind a hub** is detected at the *interface* level (MSC devices
 report class 0 at the device level), gets a synchronous bulk Configure-Endpoint
