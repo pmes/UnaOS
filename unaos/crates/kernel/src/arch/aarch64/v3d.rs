@@ -702,9 +702,16 @@ static mut V3D_ARENA: Arena = Arena { bytes: [0; ARENA_BYTES] };
 
 // The V3D MMU page table: one u32 PTE per 4 KiB of iova, indexed by (iova >> 12). We identity-map the
 // arena (iova == phys) and leave every other entry invalid, so the arena's top phys page bounds the
-// table size. PT_CAP covers up to 32 MiB of low RAM — the kernel image + BSS (hence the arena) sits
-// far below that on the Pi 4; `program_mmu` asserts the arena fits before filling, never overflowing.
-const PT_CAP: usize = 8192; // 8192 PTEs × 4 B = 32 KiB, covers iova [0, 32 MiB)
+// table size. The kernel image + BSS (hence the arena) sits far below the cap on the Pi 4;
+// `program_mmu` asserts the arena fits before filling, never overflowing.
+//
+// PI-V3D-71: grown from 8192 (32 MiB of iova) to 16384 (64 MiB) so the `[v3d71]` mainline-geometry
+// window (bin buffers at the piOS dump's ~0x03000000+ iovas) has real, PUBLISHED-zero PTEs to sit in.
+// Confinement is unchanged — every entry outside the arena identity map (and, for the one deep-battery
+// rung, outside the v3d71 window while it is mapped) is zero — and the growth is itself a hardening:
+// an iova in [32 MiB, 64 MiB) previously indexed PAST the table's end into whatever DRAM followed it,
+// where a stray VALID-looking word could have translated; now it hits a published zero and faults.
+const PT_CAP: usize = 16384; // 16384 PTEs × 4 B = 64 KiB, covers iova [0, 64 MiB)
 #[repr(C, align(4096))]
 struct PageTable {
     ptes: [u32; PT_CAP],
@@ -965,11 +972,11 @@ pub fn bringup(fb: Option<FbTarget>) {
     // only trustworthy if it says what is missing from it.
     if V3D_DEEP {
         serial_println!(
-            ":: V3D: [v3d] deep=on — slow banked-verdict probes ARMED: [v3d48] bisection ladder (6 rungs x ~0.5 s FLDONE backstop) + [v3d63] ptb-unit matrix (4 more rungs, same backstop) + [v3d64] muxcal (1 more rung + a 4 ms idle window + 1 extra CT1 job) + [v3d66] ptbsweep (2 passes x [1 rung + a 4 ms idle window + 1 extra CT1 job]) + [v3d68] binwall (4 more rungs, same backstop, plus a poison fill/scan of a 24 KiB tile-state region and the 32 KiB pool per rung) + [v3d69] initdiff (1 more rung, same backstop, between two READ-ONLY PM/ASB/MMUC fabric stations) = 18 rungs, [v3d59] frameclose (64 x 1 ms), [v3d58] rerender (extra CT1 job). Expect ~9.5 s of extra boot — a stall of that length here is the BUDGET, not a hang ::"
+            ":: V3D: [v3d] deep=on — slow banked-verdict probes ARMED: [v3d48] bisection ladder (6 rungs x ~0.5 s FLDONE backstop) + [v3d63] ptb-unit matrix (4 more rungs, same backstop) + [v3d64] muxcal (1 more rung + a 4 ms idle window + 1 extra CT1 job) + [v3d66] ptbsweep (2 passes x [1 rung + a 4 ms idle window + 1 extra CT1 job]) + [v3d68] binwall (4 more rungs, same backstop, plus a poison fill/scan of a 24 KiB tile-state region and the 32 KiB pool per rung) + [v3d69] initdiff (1 more rung, same backstop, between two READ-ONLY PM/ASB/MMUC fabric stations) + [v3d71] mainline-geom (1 more rung, same backstop, the bin window remapped to the piOS dump's iova geometry with an in-flight ASB fabric sampler across its wait) = 19 rungs, [v3d59] frameclose (64 x 1 ms), [v3d58] rerender (extra CT1 job). Expect ~10 s of extra boot — a stall of that length here is the BUDGET, not a hang ::"
         );
     } else {
         serial_println!(
-            ":: V3D: [v3d] deep=off (banked verdicts skipped) — NOT run this boot: [v3d48] empty-frame bisection ladder (all 6 rungs banked non-retire), [v3d59] frameclose (banked DEAD-OPEN, zero bit changes), [v3d58] rerender (banked clean). Fast probes only; re-arm with UNAOS_V3D_DEEP=1 ::"
+            ":: V3D: [v3d] deep=off (banked verdicts skipped) — NOT run this boot: [v3d48] empty-frame bisection ladder (all 6 rungs banked non-retire), [v3d59] frameclose (banked DEAD-OPEN, zero bit changes), [v3d58] rerender (banked clean), [v3d71] mainline-geometry rung + fabric sampler. Fast probes only; re-arm with UNAOS_V3D_DEEP=1 ::"
         );
     }
 
@@ -2907,6 +2914,9 @@ fn wait_fldone(what: &str, trace_ba: u32, trace_ea: u32) -> (u32, u64, bool) {
             t_pc.update(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0PC), us32);
             t_bpca.update(mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA), us32);
             t_cyc.update(mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 8), us32); // [v3d55] RANK 3a
+            // PI-V3D-71 leg 2: fold one ASB fabric sample at the same cadence — a no-op (one static
+            // bool read, zero MMIO) on every wait except the one the [v3d71] rung arms it across.
+            v3d71_sampler_take();
             samples = samples.saturating_add(1);
             next_sample = now + sample_tick;
         }
@@ -6732,6 +6742,12 @@ fn empty_frame_bisection() {
     // rung already behind it; and its own control rung must not sit in front of a reading another
     // verdict is banked on.
     v3d69_fabric_probe();
+    // PI-V3D-71: the dump-diff discriminator rides the very tail, after [v3d69]'s stations — it is the
+    // ONLY battery that touches the V3D page table (window map/unmap around its one rung) and the only
+    // one that latches non-identity iovas into CT0Q*, so every reading above is taken on the exact
+    // translation those verdicts were banked under; its in-flight ASB sampler must also not overlap
+    // any wait another witness times.
+    v3d71_mainline_geometry();
 }
 
 /// PI-V3D-63 — one banked rung's readback: the RANK 2 placement witness (the CT0/PCS words) plus the
@@ -8239,6 +8255,11 @@ struct V3d69Fabric {
     lm: u32,   // legacy asb ASB_V3D_M_CTRL — the routing falsifier
     ls: u32,   // legacy asb ASB_V3D_S_CTRL
     mmuc: u32, // V3D_MMUC_CONTROL — the MMU cache enable, written by us and never read back
+    // PI-V3D-71 leg 3 — MMU_DEBUG_INFO (hub +0x1238), the hub-MMU capability word. Both piOS dumps
+    // (idle AND mid-render) read 0x00000550; the dump-diff table carried our side as UNKNOWN because
+    // the only prior read of it (`program_mmu`'s readback, `vio_decode`'s width fetch) never printed
+    // under a station tag the diff could line up against. One read closes that row.
+    dbg: u32,
 }
 
 impl V3d69Fabric {
@@ -8274,7 +8295,7 @@ impl V3d69Fabric {
     }
 }
 
-/// Take one fabric station. READ ONLY — seven MMIO loads, every one of them inside the Device-nGnRnE
+/// Take one fabric station. READ ONLY — eight MMIO loads, every one of them inside the Device-nGnRnE
 /// window boot.rs already maps, and every one of them poison-tolerant (an absent block reads 0 or
 /// 0xffffffff and the emitter says so rather than decoding it).
 fn v3d69_read_fabric() -> V3d69Fabric {
@@ -8286,6 +8307,7 @@ fn v3d69_read_fabric() -> V3d69Fabric {
         lm: mmio_read(LEGACY_ASB_BASE, ASB_V3D_M_CTRL),
         ls: mmio_read(LEGACY_ASB_BASE, ASB_V3D_S_CTRL),
         mmuc: mmio_read(V3D_HUB_BASE, V3D_MMUC_CONTROL),
+        dbg: mmio_read(V3D_HUB_BASE, V3D_MMU_DEBUG_INFO), // PI-V3D-71 leg 3
     }
 }
 
@@ -8338,6 +8360,28 @@ fn v3d69_emit_fabric(station: &str, f: &V3d69Fabric) {
         f.mmuc,
         (f.mmuc & V3D_MMUC_CONTROL_ENABLE != 0) as u32,
         (f.mmuc & V3D_MMUC_CONTROL_FLUSH != 0) as u32,
+    );
+    // PI-V3D-71 leg 3 — the one UNKNOWN-ours row of the piOS dump-diff table, closed with one read.
+    // Decode per mainline v3d_drv.c: va_width = 30 + DEBUG_INFO[7:4], pa_width = 30 + DEBUG_INFO[11:8]
+    // (the same fields `vio_decode` has used since boot-P6, where 0x550 → va_width 35 was the ground
+    // truth that decoded the CLE fault VA). This is a hardware capability word, not programmed state:
+    // a mismatch against mainline's 0x550 would say the hub MMUs themselves differ; a match removes it.
+    let va_f = (f.dbg >> 4) & 0xF;
+    let pa_f = (f.dbg >> 8) & 0xF;
+    let dbg_match = f.dbg == 0x0000_0550;
+    serial_println!(
+        ":: V3D: [v3d71] fabric ({}) MMU_DEBUG_INFO(hub +0x1238)={:#010x} — VA_WIDTH field {} (va {} bits) PA_WIDTH field {} (pa {} bits) VERSION nibble {} (v3d_drv.c decode) | mainline piOS dumps read 0x00000550 in BOTH the idle and mid-render captures; match={} — {} ::",
+        station,
+        f.dbg,
+        va_f, 30 + va_f,
+        pa_f, 30 + pa_f,
+        f.dbg & 0xF,
+        dbg_match as u32,
+        if dbg_match {
+            "the hub-MMU capability word is bit-identical to working mainline; the dump-diff table's one UNKNOWN-ours row closes as EXCLUDED MEASURED"
+        } else {
+            "the word DIFFERS from mainline's 0x550 — a hub-MMU capability divergence between the two systems; report it, and re-read every VIO_ADDR decode in this campaign against the va_width printed here"
+        },
     );
 }
 
@@ -8462,6 +8506,404 @@ fn v3d69_reenable_rung(pre: &V3d69Fabric) {
         } else {
             "the enable sequence did NOT move the fabric into the mainline state — the bridge words did not take the release even with the PM password. That is a hardware-or-address finding, not a driver one: either the block base is wrong (see the legacy-asb routing column) or the bridge is held by something outside this driver's reach. STOP and report; do not iterate on writes to a window that does not answer"
         },
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// PI-V3D-71 — the piOS dump-diff discriminator: mainline-geometry iovas + the in-flight fabric read.
+//
+// The two attended piOS dumps (v3d-dump-{idle,mid-render}, bench capture 2026-07-29) were taken on
+// working mainline on THIS Pi 4, with v3d+vc4 loaded — the first ground-truth register images of a
+// binner that demonstrably closes frames. Diffed against our side, the dumps EXCLUDE the two named
+// suspects [v3d68] left standing: PTB `BXCF` reads 0x00000000 on working mainline (bit-identical to
+// ours — MEASURED, not inferred from "no write path") and `MISCCFG` reads 0x00000006 (ditto). Do not
+// re-litigate either. Frame shape, frame content and fabric identity were all excluded prior.
+//
+// What the diff leaves as PTB-visible differences between the two systems is the ADDRESS GEOMETRY of
+// the bin frame: mainline's buffers live behind its MMU at iovas in the tens of MiB — tile-alloc pool
+// CT0QMA=0x0129A000/0x09BDF000 with CT0QMS=0x0008B000/0x00088000 (~544 KiB), bin CL CT0QBA at
+// 0x03033000/0x0338A000, tile-state CT0QTS at 0x0132_5002/0x0437F002 — while every rung this campaign
+// ever kicked handed the PTB identity-mapped arena addresses under 0x400000 and a 32 KiB pool. Leg 1
+// rebuilds OUR page table so the SAME physical arena appears at mainline-LIKE iovas (pool ~0x03000000+
+// sized at the dump's 0x88000; CL and tile-state above it) and kicks the banked Empty rung once.
+// Leg 2 answers the question no exit-state read can: DOES A SINGLE BEAT ENTER THE FABRIC while the
+// frame is open? The mid-render dump shows rpivid_asb `M_CTRL`=0x00008000 under live master writes
+// (0x00000004 = FIFO-EMPTY quiescent, the idle dump's word and our own [v3d70] reading); sampling it
+// DURING the FLDONE wait converts "no bytes landed" into either "no beat ever issued" (core-internal
+// wall) or "beats issue and die downstream" (fabric re-opens, measured in-flight). Leg 3 closes the
+// dump-diff table's one UNKNOWN-ours row (MMU_DEBUG_INFO) inside the [v3d69] fabric stations.
+//
+// Constraint honoured throughout: NO off-mainline config-register writes. Leg 1 is a page-table +
+// job-address change in OUR allocator (the CT0Q* writes are the same per-job latches every rung
+// makes; the MMU flush is mainline's own v3d_mmu_flush_all idiom program_mmu already mirrors);
+// legs 2 and 3 are pure reads.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The v3d71 iova window (all page-aligned). Pool at the dump's neighbourhood and SIZE; CL and
+/// tile-state ABOVE it, with an unmapped guard page between pool and CL so a pool overrun faults
+/// rather than corrupting the list.
+const V3D71_POOL_IOVA: usize = 0x0300_0000; // mainline-like bin tile-alloc pool base
+const V3D71_POOL_BYTES: usize = 0x88000; // 544 KiB — the mid-render dump's CT0QMS, verbatim
+const V3D71_CL_IOVA: usize = 0x0308_9000; // bin CL, above the pool (mainline places its CL above too)
+const V3D71_TS_IOVA: usize = 0x0308_a000; // tile-state array, 24 KiB (the [v3d68] poisoned detector)
+const V3D71_WINDOW_END: usize = V3D71_TS_IOVA + V3D68_TSDA_BYTES;
+const _: () = assert!(V3D71_POOL_IOVA % PAGE == 0 && V3D71_POOL_BYTES % PAGE == 0);
+const _: () = assert!(V3D71_POOL_IOVA + V3D71_POOL_BYTES + PAGE <= V3D71_CL_IOVA); // guard page
+const _: () = assert!(V3D71_CL_IOVA + PAGE <= V3D71_TS_IOVA);
+const _: () = assert!(V3D71_WINDOW_END / PAGE <= PT_CAP); // the grown table covers the whole window
+const _: () = assert!(V3D71_TS_IOVA % 32 == 0); // CT0QTS carries the base in its upper bits
+const _: () = assert!(BIN_TILEALLOC_BYTES % PAGE == 0); // the alias cycle below needs whole pages
+
+/// PI-V3D-71 — map the window: pool iovas CYCLICALLY ALIASED onto the arena's 32 KiB physical pool
+/// (same physical arena — the 544 KiB is iova-side only, and any PTB write through ANY alias lands in
+/// the poisoned physical pool where the scan reads), CL page onto the probe-CL page, tile-state 1:1
+/// onto the dedicated [v3d68] TSDA pages. Publishes the PTEs and runs mainline's flush (MMUC
+/// FLUSH|ENABLE + MMU_CTL TLB_CLEAR, the program_mmu tail verbatim). Fail-closed on a flush timeout.
+fn v3d71_map_window(map: bool) -> bool {
+    let pt = &raw mut V3D_PT;
+    let pool_first_pfn = (arena_phys() + OFF_BIN_TILEALLOC) >> V3D_MMU_PAGE_SHIFT;
+    let pool_pages = BIN_TILEALLOC_BYTES / PAGE;
+    let cl_pfn = (arena_phys() + OFF_PROBE_BIN_CL) >> V3D_MMU_PAGE_SHIFT;
+    let ts_first_pfn = (arena_phys() + OFF_V3D68_TSDA) >> V3D_MMU_PAGE_SHIFT;
+    unsafe {
+        for p in 0..(V3D71_POOL_BYTES / PAGE) {
+            (*pt).ptes[V3D71_POOL_IOVA / PAGE + p] = if map {
+                V3D_PTE_VALID | V3D_PTE_WRITEABLE | (pool_first_pfn + (p % pool_pages)) as u32
+            } else {
+                0
+            };
+        }
+        (*pt).ptes[V3D71_CL_IOVA / PAGE] =
+            if map { V3D_PTE_VALID | V3D_PTE_WRITEABLE | cl_pfn as u32 } else { 0 };
+        for p in 0..(V3D68_TSDA_BYTES / PAGE) {
+            (*pt).ptes[V3D71_TS_IOVA / PAGE + p] = if map {
+                V3D_PTE_VALID | V3D_PTE_WRITEABLE | (ts_first_pfn + p) as u32
+            } else {
+                0
+            };
+        }
+    }
+    // Publish the whole touched index span (pool..window-end covers the guard + CL + TS slots too —
+    // the guard entry was never written and stays a published zero, which is exactly its job).
+    cache::clean_range(
+        pt_phys() + (V3D71_POOL_IOVA / PAGE) * 4,
+        ((V3D71_WINDOW_END - V3D71_POOL_IOVA) / PAGE) * 4,
+    );
+    // Mainline's v3d_mmu_flush_all idiom, exactly as program_mmu's tail runs it.
+    mmio_write(V3D_HUB_BASE, V3D_MMUC_CONTROL, V3D_MMUC_CONTROL_FLUSH | V3D_MMUC_CONTROL_ENABLE);
+    mmio_write(V3D_HUB_BASE, V3D_MMU_CTL, mmio_read(V3D_HUB_BASE, V3D_MMU_CTL) | V3D_MMU_CTL_TLB_CLEAR);
+    let ok = wait_bit_clear(
+        V3D_HUB_BASE,
+        V3D_MMU_CTL,
+        V3D_MMU_CTL_TLB_CLEARING,
+        if map { "v3d71 window map TLB clear" } else { "v3d71 window unmap TLB clear" },
+    );
+    dsb();
+    ok
+}
+
+/// PI-V3D-71 leg 2 — the in-flight fabric sampler's accumulator. Armed only across the `[v3d71]`
+/// rung's FLDONE wait; `wait_fldone` folds one sample per ~1 ms tick when armed and never issues an
+/// MMIO for it otherwise. Distinct-value tracking is capped at 4 words per register (mainline shows
+/// exactly two: 0x4 quiescent, 0x8000 under live master writes); overflow is reported, never dropped.
+struct V3d71Sampler {
+    armed: bool,
+    samples: u32,
+    bm_active: u32, // samples taken while PCS.BMACTIVE read 1 (the frame provably open)
+    m_min: u32,
+    m_max: u32,
+    s_min: u32,
+    s_max: u32,
+    m_vals: [u32; 4],
+    m_n: u32,
+    m_more: bool, // >4 distinct M_CTRL words seen (reported, not silently capped)
+    s_vals: [u32; 4],
+    s_n: u32,
+    s_more: bool,
+}
+
+static mut V3D71_SAMPLER: V3d71Sampler = V3d71Sampler {
+    armed: false,
+    samples: 0,
+    bm_active: 0,
+    m_min: u32::MAX,
+    m_max: 0,
+    s_min: u32::MAX,
+    s_max: 0,
+    m_vals: [0; 4],
+    m_n: 0,
+    m_more: false,
+    s_vals: [0; 4],
+    s_n: 0,
+    s_more: false,
+};
+
+/// Fold `v` into a capped distinct-value set. Returns overflow (a fifth distinct word arrived).
+fn v3d71_fold_distinct(vals: &mut [u32; 4], n: &mut u32, v: u32) -> bool {
+    let mut i = 0usize;
+    while i < *n as usize {
+        if vals[i] == v {
+            return false;
+        }
+        i += 1;
+    }
+    if (*n as usize) < vals.len() {
+        vals[*n as usize] = v;
+        *n += 1;
+        false
+    } else {
+        true
+    }
+}
+
+/// Arm the sampler (reset the accumulator). Called immediately before the `[v3d71]` GO.
+fn v3d71_sampler_arm() {
+    let s = &raw mut V3D71_SAMPLER;
+    unsafe {
+        (*s) = V3d71Sampler {
+            armed: true,
+            samples: 0,
+            bm_active: 0,
+            m_min: u32::MAX,
+            m_max: 0,
+            s_min: u32::MAX,
+            s_max: 0,
+            m_vals: [0; 4],
+            m_n: 0,
+            m_more: false,
+            s_vals: [0; 4],
+            s_n: 0,
+            s_more: false,
+        };
+    }
+}
+
+/// One in-flight sample: rpivid_asb M_CTRL + S_CTRL (pure reads of the DT-verified window [v3d70]
+/// confirmed live) and PCS for the BMACTIVE qualifier. No-op unless armed.
+fn v3d71_sampler_take() {
+    let s = &raw mut V3D71_SAMPLER;
+    unsafe {
+        if !(*s).armed {
+            return;
+        }
+        let m = mmio_read(RPIVID_ASB_BASE, ASB_V3D_M_CTRL);
+        let sc = mmio_read(RPIVID_ASB_BASE, ASB_V3D_S_CTRL);
+        let pcs = mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS);
+        (*s).samples = (*s).samples.saturating_add(1);
+        if pcs & V3D_PCS_BMACTIVE != 0 {
+            (*s).bm_active = (*s).bm_active.saturating_add(1);
+        }
+        (*s).m_min = (*s).m_min.min(m);
+        (*s).m_max = (*s).m_max.max(m);
+        (*s).s_min = (*s).s_min.min(sc);
+        (*s).s_max = (*s).s_max.max(sc);
+        let mut mv = (*s).m_vals;
+        let mut mn = (*s).m_n;
+        if v3d71_fold_distinct(&mut mv, &mut mn, m) {
+            (*s).m_more = true;
+        }
+        (*s).m_vals = mv;
+        (*s).m_n = mn;
+        let mut sv = (*s).s_vals;
+        let mut sn = (*s).s_n;
+        if v3d71_fold_distinct(&mut sv, &mut sn, sc) {
+            (*s).s_more = true;
+        }
+        (*s).s_vals = sv;
+        (*s).s_n = sn;
+    }
+}
+
+/// Disarm and emit the `[v3d71f]` witness. The reading key: mainline's M_CTRL reads 0x00000004
+/// (FIFO-EMPTY quiescent) at idle and 0x00008000 under live master writes (bench dumps, this Pi 4).
+/// Ours moving off the quiescent word during an OPEN bin frame = writes ISSUE into the fabric and die
+/// downstream (fabric/routing re-opens, measured in-flight); ours pinned at the quiescent word across
+/// the whole wait with BMACTIVE=1 = the PTB never issued a single beat (core-internal verdict).
+fn v3d71_sampler_emit() {
+    let s = &raw mut V3D71_SAMPLER;
+    unsafe {
+        (*s).armed = false;
+        let smp = &*s;
+        let m_moved = smp.m_n > 1 || smp.m_more;
+        let s_moved = smp.s_n > 1 || smp.s_more;
+        let verdict = if smp.samples == 0 {
+            "ZERO samples landed — the wait exited before the first ~1 ms tick; INCONCLUSIVE, nothing here is a measurement"
+        } else if m_moved || s_moved {
+            "AN ASB WORD MOVED while the bin frame was in flight — the fabric saw state change during the wait. Mainline's live-master signature is M_CTRL=0x8000; if that word appears in the distinct list, PTB writes ISSUE into the fabric and die DOWNSTREAM of the bridge — the fabric/routing branch re-opens, this time on an in-flight measurement, not an exit-state read"
+        } else if smp.bm_active > 0 {
+            "M_CTRL and S_CTRL NEVER left their quiescent words across the whole wait while BMACTIVE=1 — on working mainline the master word reads 0x8000 under live writes, so a PTB that were emitting would have shown here. The PTB provably never issues a single beat into the fabric: the wall is CORE-INTERNAL, upstream of the master bridge, and no fabric/routing theory survives"
+        } else {
+            "BMACTIVE was never observed set across the sampled window — the sampler did not overlap an open bin frame and the pinned-quiescent reading carries NO verdict"
+        };
+        serial_println!(
+            ":: V3D: [v3d71f] fabric-sampler — {} samples (~1 ms cadence across the FLDONE wait), BMACTIVE-set samples={} | M_CTRL min={:#010x} max={:#010x} distinct={}{} vals=[{:#010x} {:#010x} {:#010x} {:#010x}] | S_CTRL min={:#010x} max={:#010x} distinct={}{} vals=[{:#010x} {:#010x} {:#010x} {:#010x}] (unused slots print 0) | mainline key: 0x4=quiescent FIFO-EMPTY, 0x8000=live master writes (bench dumps) — {} ::",
+            smp.samples,
+            smp.bm_active,
+            smp.m_min,
+            smp.m_max,
+            smp.m_n,
+            if smp.m_more { "(+MORE, capped)" } else { "" },
+            smp.m_vals[0], smp.m_vals[1], smp.m_vals[2], smp.m_vals[3],
+            smp.s_min,
+            smp.s_max,
+            smp.s_n,
+            if smp.s_more { "(+MORE, capped)" } else { "" },
+            smp.s_vals[0], smp.s_vals[1], smp.s_vals[2], smp.s_vals[3],
+            verdict,
+        );
+    }
+}
+
+/// PI-V3D-71 leg 1 (+ leg 2 riding its wait) — the mainline-geometry shape-match rung.
+///
+/// One `[v3d48]`-style Empty-frame kick (same 64x64 frame — shape and content are excluded prior, so
+/// the ONE variable here is where the buffers sit in iova space and how big the pool claims to be),
+/// against the v3d71 window: pool at the dump's ~0x03000000 sized at its 0x88000, CL and tile-state
+/// above it. Same kernel-exact submit order, same FLDONE backstop, the [v3d68] 24 KiB poisoned
+/// tile-state detector plus the poisoned physical pool every iova alias funnels into. Hub-gated,
+/// poison-honest, and the window is UNMAPPED afterwards so every later job (the real M4 draw included)
+/// runs on the exact page table its verdicts were always banked under.
+fn v3d71_mainline_geometry() {
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down => {
+            serial_println!(
+                ":: V3D: [v3d71] SKIPPED — hub IDENT0 reads 0x00000000 (block absent/unpowered; the QEMU raspi4b signature). No window was mapped, no rung was kicked and NO verdict is implied ::"
+            );
+            return;
+        }
+        V3dPresence::Poison(w) => {
+            serial_println!(
+                ":: V3D: [v3d71] SKIPPED — hub IDENT0 reads poison {:#010x} (open-bus / firmware fill, not a live register). No window was mapped, no rung was kicked and NO verdict is implied ::",
+                w
+            );
+            return;
+        }
+    }
+    let pool_phys = arena_phys() + OFF_BIN_TILEALLOC;
+    let cl_phys = arena_phys() + OFF_PROBE_BIN_CL;
+    let ts_phys = arena_phys() + OFF_V3D68_TSDA;
+    serial_println!(
+        ":: V3D: [v3d71] mainline-geom — the piOS dump-diff discriminator. BXCF and MISCCFG are EXCLUDED MEASURED (bit-identical on working mainline: 0x00000000 / 0x00000006); frame shape/content/fabric-identity excluded prior. The last PTB-visible difference is ADDRESS GEOMETRY: mainline bins into iovas in the tens of MiB with a ~544 KiB pool, we bin into sub-4 MiB identity iovas with 32 KiB. This rung re-plumbs OUR page table: pool iova={:#010x} size={:#x} (the dump's CT0QMS, iova-ALIASED cyclically onto the 32 KiB physical pool at {:#010x} — same physical arena, any write through any alias lands in poison), CL iova={:#010x} (phys {:#010x}), tile-state iova={:#010x} (24 KiB, 1:1 onto phys {:#010x}), guard page unmapped at {:#010x} ::",
+        V3D71_POOL_IOVA, V3D71_POOL_BYTES, pool_phys, V3D71_CL_IOVA, cl_phys, V3D71_TS_IOVA, ts_phys,
+        V3D71_POOL_IOVA + V3D71_POOL_BYTES,
+    );
+    if !v3d71_map_window(true) {
+        serial_println!(
+            ":: V3D: [v3d71] mainline-geom NOT RUN (fail-closed) — the window-map TLB clear never settled; kicking a rung against an unflushed translation would measure the TLB, not the geometry. No verdict ::"
+        );
+        return;
+    }
+
+    // The banked Empty CL, byte-identical to the [v3d48] control rung (same offset, same 64x64 frame),
+    // already decoded + Mesa-diffed under [v3d48] this same boot — only its ADDRESS differs here.
+    let bin_len = build_bin_cl_content_geom(OFF_PROBE_BIN_CL, OFF_SHADREC, 1, BinContent::Empty, TARGET_W, TARGET_H);
+    v3d56_poison_region(OFF_V3D68_TSDA, V3D68_TSDA_BYTES);
+    v3d56_poison_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+    for i in (0..PROBE_BIN_OVERFLOW_BYTES).step_by(4) {
+        arena_write_u32(OFF_PROBE_BIN_OVERFLOW + i, 0);
+    }
+    cache::clean_range(arena_phys() + OFF_PROBE_BIN_OVERFLOW, PROBE_BIN_OVERFLOW_BYTES);
+    cache::clean_range(cl_phys, bin_len);
+
+    let cl_iova = V3D71_CL_IOVA as u32;
+    let cl_ea = cl_iova + bin_len as u32;
+
+    // Kernel-exact submit order, mirrored from submit_bisect_rung_geom — the only deltas are the
+    // ADDRESSES latched (window iovas instead of arena identity) and the pool SIZE (the dump's).
+    clear_mmu_fault_latch("v3d71 pre-kick");
+    bin_prejob_bpos_clear("v3d71 mainline-geom");
+    invalidate_gpu_caches("L2T flush (v3d71 pre-kick)");
+    let qts_val = V3D71_TS_IOVA as u32 | V3D_CLE_CT0QTS_ENABLE;
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, V3D71_POOL_IOVA as u32);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, V3D71_POOL_BYTES as u32);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, qts_val);
+    dsb();
+    let qts_echo = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QTS);
+    let qms_echo = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMS);
+    let qma_echo = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMA);
+    serial_println!(
+        ":: V3D: [v3d71] frame enables — CT0QMA wrote={:#010x} echo={:#010x} | CT0QMS wrote={:#x} echo={:#x} | CT0QTS wrote={:#010x} echo={:#010x} (ENABLE(bit1)={}) — the mainline-shaped triple, latched ::",
+        V3D71_POOL_IOVA, qma_echo, V3D71_POOL_BYTES, qms_echo, qts_val, qts_echo,
+        (qts_echo & V3D_CLE_CT0QTS_ENABLE != 0) as u32,
+    );
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, cl_iova);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
+    let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    v3d71_sampler_arm(); // leg 2: the fabric sampler spans exactly this frame's wait
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, cl_ea); // GO
+    dsb();
+    let submit_sound = v3d54_submit_audit("v3d71", cl_iova, cl_ea, bin_len);
+    let idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CT1CS_CTRUN, "CT0 v3d71 mainline-geom");
+    let (sts, us, retired) = wait_fldone("v3d71 mainline-geom", cl_iova, cl_ea);
+    v3d71_sampler_emit(); // [v3d71f]
+
+    let bpca = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA);
+    let bpcs = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCS);
+    let bfc_after = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    let pcs = mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS);
+    // The MMU fault surface is load-bearing HERE as nowhere else: a mis-built window would fault the
+    // CLE's very first fetch and a "still dead" read would be an instrument artifact. Read before W1C.
+    let mmu_ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let fault =
+        mmu_ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+
+    // The [v3d68] evidence-integrity rule: drain the L2T, then scan the poison through the PHYSICAL
+    // addresses (the CPU reads DRAM; every iova alias funnels into these same pages).
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_FLUSH);
+    let flush_done = wait_bit_clear(
+        V3D_CORE0_BASE,
+        V3D_CTL_L2TCACTL,
+        V3D_L2TCACTL_L2TFLS,
+        "L2T write-back (v3d71 scan)",
+    );
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_SLCACTL, V3D_SLCACTL_INVALIDATE_ALL);
+    dsb();
+    cache::invalidate_range(ts_phys, V3D68_TSDA_BYTES);
+    cache::invalidate_range(pool_phys, BIN_TILEALLOC_BYTES);
+    dsb();
+    let ts_scan = v3d56_scan(ts_phys as u32, V3D68_TSDA_BYTES);
+    let pool_scan = v3d56_scan(pool_phys as u32, BIN_TILEALLOC_BYTES);
+    v3d56_emit_scan("v3d71", "tile-state (24 KiB, phys of iova 0x0308a000)", ts_phys as u32, &ts_scan, flush_done);
+    v3d56_emit_scan("v3d71", "tile-alloc pool (32 KiB phys behind all 544 KiB of pool iova)", pool_phys as u32, &pool_scan, flush_done);
+
+    let touched = ts_scan.zeroed + ts_scan.overwritten + pool_scan.zeroed + pool_scan.overwritten;
+    let verdict = if fault != 0 {
+        "AN MMU FAULT LATCHED ACROSS THE RUNG — the window translation itself refused an access, so nothing downstream of it was measured. This is an INSTRUMENT fault, not a geometry verdict: fix the map (see the fault-latch line below for client + VA) before citing this rung for anything"
+    } else if retired || touched != 0 {
+        "the address-geometry/pool-size branch is CONVICTED — the SAME Empty frame that has wedged at identity iovas for the whole campaign produced a retire or PTB memory traffic the moment its buffers sat at mainline-LIKE iovas with a mainline-size pool. The wall was never the engine: it is where this driver PLACES the bin frame. Next arc: adopt mainline's allocation geometry outright and re-run the full ladder"
+    } else if !flush_done {
+        "no retire and no fault, but the L2T drain did not complete so the poison column cannot be read — the register half says still-dead, the memory half is INCONCLUSIVE; re-run before banking the exclusion"
+    } else {
+        "STILL DEAD under mainline geometry — no retire, no fault, poison fully intact through a completed drain, with the pool at the dump's own size and every buffer at mainline-like iovas. The LAST PTB-visible difference between the two systems is now EXCLUDED MEASURED: no register the PTB can see distinguishes our bin frame from mainline's, and the wall moves conclusively off the frame's inputs — read [v3d71f] above for which side of the master bridge it lives on"
+    };
+    serial_println!(
+        ":: V3D: [v3d71] mainline-geom verdict — retired={} BFC {:#010x}->{:#010x} (Δ{}) PCS={:#010x}(BMACTIVE={} BMBUSY={} BMOOM={}) idled={} INT_STS={:#010x} waited={}us submit_sound={} | BPCA={:#010x} (advance off pool iova = {:#x}) BPCS={:#x} | poison touched: tile-state={} of {} words, pool={} of {} words (L2T drain completed={}) | MMU_CTL={:#010x} fault latched={} (PT_INVALID={} WRITE_VIOLATION={} CAP_EXCEEDED={}) — {} ::",
+        retired as u32, bfc_pre, bfc_after, bfc_after.wrapping_sub(bfc_pre),
+        pcs,
+        (pcs & V3D_PCS_BMACTIVE != 0) as u32,
+        (pcs & V3D_PCS_BMBUSY != 0) as u32,
+        (pcs & V3D_PCS_BMOOM != 0) as u32,
+        idled as u32, sts, us, submit_sound as u32,
+        bpca, bpca.wrapping_sub(V3D71_POOL_IOVA as u32), bpcs,
+        ts_scan.zeroed + ts_scan.overwritten, ts_scan.words,
+        pool_scan.zeroed + pool_scan.overwritten, pool_scan.words,
+        flush_done as u32,
+        mmu_ctl, (fault != 0) as u32,
+        (fault & V3D_MMU_CTL_PT_INVALID != 0) as u32,
+        (fault & V3D_MMU_CTL_WRITE_VIOLATION != 0) as u32,
+        (fault & V3D_MMU_CTL_CAP_EXCEEDED != 0) as u32,
+        verdict,
+    );
+    clear_mmu_fault_latch("v3d71 post-kick");
+    // Restore the exact pre-v3d71 translation: zero the window PTEs and flush again, so the real M4
+    // draw (and every later job) runs on the page table its verdicts were always banked under.
+    let unmapped = v3d71_map_window(false);
+    serial_println!(
+        ":: V3D: [v3d71] window unmapped={} — the page table is back to the arena-identity-only map; scope: this rung wrote PTEs in OUR table, the per-job CT0Q* latches and mainline's own MMU-flush sequence, and NOTHING else — no BXCF, no MISCCFG, no CTRSTA, no GMP, no new MMIO window ::",
+        unmapped as u32,
     );
 }
 

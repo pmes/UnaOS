@@ -3011,3 +3011,67 @@ since PI-V3D-3, and the **bridge/routing branch of §41 closes**. The wall's rem
 Unchanged by the DTB: the **generic PM word bit map** (step 8) stays **UNCERTAIN**. The device tree
 gives addresses and lengths, not bit meanings, so the `[v3d70]` PM line keeps the raw word first and
 its decode explicitly hedged.
+
+## 42. The piOS dump-diff — both named suspects excluded measured; the geometry rung and the in-flight fabric read (V3D-71)
+
+V3D-68 ended with two named suspects (`BXCF`, `MISCCFG.QRMAXCNT`) plus "an initialisation this
+campaign has not found"; V3D-69/70 closed the fabric branch by read. V3D-71 starts from the first
+**ground-truth register images of a binner that works**: two attended `devmem` dumps taken on this
+same Pi 4 under working mainline (v3d+vc4 loaded) — `v3d-dump-idle` and `v3d-dump-mid-render`
+(bench capture, 2026-07-29, `glxgears -fullscreen` for the mid-render image).
+
+### 42.1 The dump-diff table's conclusion
+
+Diffing the dumps against our side settles the V3D-68 suspects **by measurement, not argument**:
+
+| Suspect | Working mainline reads | Ours reads | Verdict |
+|---|---|---|---|
+| `PTB BXCF` | `0x00000000` (idle **and** mid-render) | `0x00000000` | **EXCLUDED MEASURED** — a binner that closes frames runs with the identical word; do not re-litigate |
+| `MISCCFG` (`QRMAXCNT`) | `0x00000006` (both dumps) | `0x00000006` | **EXCLUDED MEASURED** — ditto |
+| `MMU_DEBUG_INFO` (hub `+0x1238`) | `0x00000550` (both dumps) | *was the table's one UNKNOWN-ours row* | closed by leg 3 below |
+
+Frame shape, frame content (V3D-68) and fabric identity/state (V3D-69/70) were excluded prior. What
+the diff then leaves as **PTB-visible** differences between the two systems is the **address
+geometry of the bin frame**: mainline bins with its buffers at MMU iovas in the tens of MiB — pool
+`CT0QMA=0x0129A000`/`0x09BDF000` with `CT0QMS≈0x88000` (~544 KiB), CL `CT0QBA=0x03033000`/
+`0x0338A000`, tile-state `CT0QTS=0x01325002`/`0x0437F002` — while every rung this campaign ever
+kicked handed it identity-mapped arena addresses below 4 MiB and a 32 KiB pool.
+
+### 42.2 The three legs (one boot, all riding `UNAOS_V3D_DEEP`, no new knob)
+
+**Leg 1 — `[v3d71] mainline-geom`, the shape-match rung.** Same physical arena, mainline-LIKE iovas:
+the driver's own page table (grown to `PT_CAP=16384`, 64 MiB of iova — entries beyond the arena stay
+published zeros, so the growth also removes the old past-table-end read) gains a window mapped only
+for this rung: pool iova `0x03000000` sized at the dump's `0x88000` — **iova-aliased cyclically onto
+the 32 KiB physical pool**, so any PTB write through any alias lands in poison — CL at `0x03089000`
+(an unmapped guard page below it), the 24 KiB [v3d68] poisoned tile-state detector at `0x0308A000`.
+One `[v3d48]`-style Empty kick (same 64x64 frame — the ONE variable is the addresses), kernel-exact
+submit order, same FLDONE backstop; afterwards the window is unmapped so every later job runs on the
+translation its verdicts were banked under. No off-mainline config write anywhere: the deltas are
+PTEs in our table, the per-job `CT0Q*` latches, and mainline's own `v3d_mmu_flush_all` idiom.
+
+**Leg 2 — `[v3d71f]`, the in-flight fabric sampler.** During that rung's ~0.5 s FLDONE wait,
+`wait_fldone` folds one sample of `rpivid_asb` `M_CTRL` + `S_CTRL` (plus `PCS.BMACTIVE` as the
+qualifier) at its ~1 ms cadence — armed only for this rung, zero MMIO on every other wait. The
+witness prints min/max/distinct-values/count for both words.
+
+**Leg 3 — `[v3d71] fabric MMU_DEBUG_INFO`.** One read of hub `+0x1238` folded into the `[v3d69]`
+fabric stations, decoded per `v3d_drv.c` (`va_width = 30 + [7:4]`, `pa_width = 30 + [11:8]`) and
+compared against mainline's `0x550` — the dump-diff table's one UNKNOWN-ours row.
+
+### 42.3 Reading key
+
+| Wire line | Reading | Convicts / excludes |
+|---|---|---|
+| `[v3d71] mainline-geom verdict — retired=1` or any poison touched | the same Empty frame that wedges at identity iovas produced a retire or PTB traffic at mainline-like iovas | **address-geometry/pool-size branch CONVICTED** — next arc adopts mainline's allocation geometry outright |
+| `[v3d71] … fault latched=1` | the window translation refused an access (client + VA on the fault-latch line) | instrument fault — fix the map; **no** geometry verdict |
+| `[v3d71] … retired=0, no fault, poison intact, drain completed` | still dead with every PTB-visible input mainline-shaped | the **last PTB-visible difference is EXCLUDED MEASURED**; the wall is not in the frame's inputs at all |
+| `[v3d71f] … M_CTRL left 0x4` (any distinct word beyond quiescent, esp. `0x8000`) | beats ENTER the fabric while the frame is open | writes **ISSUE and die downstream** — fabric/routing re-opens, this time measured in-flight |
+| `[v3d71f] … pinned at 0x4 across the wait with BMACTIVE=1` | mainline shows `0x8000` under live master writes; ours never leaves quiescent | the PTB **never issues a single beat** — core-internal verdict, upstream of the master bridge |
+| `[v3d71f] … BMACTIVE never set / 0 samples` | sampler did not overlap an open frame | INCONCLUSIVE — no verdict |
+| `[v3d71] fabric … MMU_DEBUG_INFO match=1` | capability word bit-identical to mainline | the UNKNOWN-ours row closes as excluded |
+| `[v3d71] fabric … match=0` | hub-MMU capability divergence | report; re-read every `VIO_ADDR` decode against the printed `va_width` |
+
+QEMU raspi4b models no V3D: the whole battery returns at the hub-identity gate with an explicit
+`SKIPPED` line, so `kernel8-test` green means **no regression and nothing more** — every verdict in
+this section is metal-attended, read at the next bench boot with `UNAOS_V3D_DEEP=1`.
