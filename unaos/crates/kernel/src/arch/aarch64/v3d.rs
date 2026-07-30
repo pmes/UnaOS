@@ -6773,6 +6773,68 @@ fn empty_frame_bisection() {
     // PI-V3D-76: the full-window sweep rides dead-last — the wedged-state register file, in the
     // bench dump's exact line format, for a whole-file diff against the piOS --sweep capture.
     v3d76_sweep();
+    // PI-V3D-77: the unnamed-word transplants ride after the sweep (so the sweep records the
+    // pre-transplant file) — the diff's two config-shaped divergences, poked and kicked.
+    v3d77_unnamed_words();
+}
+
+/// PI-V3D-77 — the sweep diff's verdict, acted on. diff(P87 [v3d76] wedged sweep, piOS mid-bin2
+/// --sweep) filtered to structural (non-address, non-counter) divergences leaves exactly TWO
+/// words, both UNNAMED — absent from mainline v3d_regs.h (which ends the interrupt bank at
+/// 0x64/INT_MSK_CLR) and from every map this campaign transcribed:
+///
+///   core0+0x068: piOS 0x00000003, ours 0x00010001   hub+0x068: piOS 0x00000002, ours 0x00000000
+///
+/// No driver writes them, so the piOS values are the FIRMWARE/hardware state of a V3D whose
+/// thread 0 fetches, and ours is the state of one whose thread 0 never starts. Ours carrying
+/// bit16 (0x10001) where the working part shows 0x3 is exactly the shape of a latched per-thread
+/// condition — the space [v3d74a] said the hunt must move to. Two transplants, readback-audited
+/// (a W1C or RO word shows itself in the readback), each followed by the [v3d75] kick probe:
+/// retire = THE WALL WAS THE UNNAMED WORD; no-hold/no-retire = recorded and exonerated in turn.
+fn v3d77_unnamed_words() {
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down | V3dPresence::Poison(_) => {
+            serial_println!(":: V3D: [v3d77] SKIPPED — hub absent/poison. No experiment ran ::");
+            return;
+        }
+    }
+    let c0 = mmio_read(V3D_HUB_BASE, 0x4068);
+    let h0 = mmio_read(V3D_HUB_BASE, 0x0068);
+    serial_println!(
+        ":: V3D: [v3d77] unnamed-words — station: core0+0x68={:#010x} (piOS ref 0x00000003) hub+0x68={:#010x} (piOS ref 0x00000002) — both absent from v3d_regs.h; transplant each, readback-audited, kick after each ::",
+        c0, h0
+    );
+    // A: core0+0x68 ← 0x3 (the working part's value; if W1C this clears whatever ours latched).
+    mmio_write(V3D_HUB_BASE, 0x4068, 0x0000_0003);
+    dsb();
+    let c1 = mmio_read(V3D_HUB_BASE, 0x4068);
+    serial_println!(
+        ":: V3D: [v3d77a] core0+0x68 wrote 0x3, readback {:#010x} ({}) ::",
+        c1,
+        if c1 == c0 { "unchanged — RO or self-restoring" } else if c1 == 3 { "held" } else { "changed to a third value — W1C-like" }
+    );
+    let a = v3d75_kick_probe("v3d77a core-unnamed");
+    if a {
+        serial_println!(":: V3D: [v3d77] verdict — A=1 — THE WALL WAS core0+0x68: thread 0 starts once the unnamed word reads the working value; name it, productionize the write ::");
+        return;
+    }
+    // B: hub+0x68 ← 0x2.
+    mmio_write(V3D_HUB_BASE, 0x0068, 0x0000_0002);
+    dsb();
+    let h1 = mmio_read(V3D_HUB_BASE, 0x0068);
+    serial_println!(
+        ":: V3D: [v3d77b] hub+0x68 wrote 0x2, readback {:#010x} ({}) ::",
+        h1,
+        if h1 == h0 { "unchanged — RO or self-restoring" } else if h1 == 2 { "held" } else { "changed to a third value" }
+    );
+    let b = v3d75_kick_probe("v3d77b hub-unnamed");
+    serial_println!(
+        ":: V3D: [v3d77] verdict — A(core+0x68)=0 B(hub+0x68)={} — {} ::",
+        b as u32,
+        if b { "THE WALL WAS hub+0x68 — thread 0 starts with the hub word transplanted; name it, productionize" }
+        else { "both unnamed words dead — recorded and exonerated; the remaining diff surface is the hub 0x84-0xA8 counter block (static on ours = no AXI traffic, symptom) and the firmware-side init outside the register file entirely (VPU code path; next space is a start4.elf/config.txt condition diff — dtoverlay=vc4-kms-v3d on/off with OUR kernel)" }
+    );
 }
 
 /// PI-V3D-76 — the full-window register sweep, wedged state. [v3d75] exonerated the curated
