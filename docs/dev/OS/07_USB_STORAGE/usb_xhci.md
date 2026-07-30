@@ -3315,6 +3315,18 @@ platform difference itself becoming a recorded fact rather than a surprise.
 
 ### 14.8 Still open — each owed its own arc
 
+> **Superseded in part (2026-07-29, BOT-PHASE — see [§15](#15-bot-phase--the-phase-desync-holes-and-the-cbw-found-in-a-directory-sector-2026-07-29)).**
+> Item 1 below has since been given its mechanism. A read-only audit recovered a **Command Block
+> Wrapper written into a FAT directory sector**, and its `dCBWTag = 28` matches the first-failing
+> transaction of captured storm boot GR8-B3 — joining code, capture and medium at one transaction
+> number. The cause is a **dirty ring at every error exit**: abandoned TRBs left live with the
+> controller's dequeue on them, replayed by the next doorbell into a device whose phase machine had
+> moved on. §15 closes it with six fixes. What survives from item 1 is narrower than it is written
+> here: the **loss of the FIRST completion** — the event that starts a storm — is still unexplained,
+> and `foreign=0` across the silence is still the part most wanting one. Item 2 is untouched by that
+> work and remains fully open. `cfgep_cc=19` (§14.7 item 5) is made *safe* by §15's fix 6 but is
+> still not *explained*, and is now tracked in §15.9.
+
 Two facts about the metal reader survive GUARD-STATE untouched. Neither is explained by the stale-field
 defect, and neither should be quietly absorbed into the story of it.
 
@@ -3329,6 +3341,351 @@ defect, and neither should be quietly absorbed into the story of it.
    enable bits have been **confirmed clear** — so the obvious suspect is already eliminated and the
    real source is unidentified. This is a throughput ceiling on all USB storage on this platform, not
    a correctness bug, which is why it keeps being deferred; it should stop being deferred.
+
+---
+
+## 15. BOT-PHASE — the phase-desync holes, and the CBW found in a directory sector (2026-07-29)
+
+### 15.0 The finding
+
+A read-only audit of a corrupted USB stick recovered a FAT directory entry whose bytes were **not a
+directory entry**. They were a **Command Block Wrapper** — the driver's own 31-byte BOT command
+header, written into a sector that belonged to the filesystem.
+
+That is the whole arc in one sentence: the driver put a command where data belonged. Everything
+below is the mechanism that allows it, the six holes that make up that mechanism, and the witnesses
+that make each one countable instead of reconstructible only from a wrecked medium.
+
+This is a different class of defect from §14. BOT-RESCUE was about a device that stopped answering
+and a ladder with no top — a **liveness** failure, loud and self-announcing. This is a **safety**
+failure: silent, and it damages the medium. Every gate in this tree was green throughout the period
+the corruption was created.
+
+### 15.1 The mechanism: a dirty ring is a phase slip
+
+A BOT transaction is three serialized phases on two bulk rings:
+
+```
+   bulk OUT ring:   [ CBW ] ---> [ DATA(out) ] ................
+   bulk IN  ring:   ............ [ DATA(in) ] ---> [ CSW ]
+```
+
+The device runs a phase state machine of its own, and the two machines stay in step **only** because
+each side retires one phase before starting the next.
+
+Every error exit from `bot_transfer` used to return with whatever it had already pushed **still on
+the rings**, and with the controller's TR Dequeue Pointer still parked on those TRBs. Nothing retired
+them and nothing repointed the controller. So the *next* transaction's doorbell did not start a new
+transaction — it **resumed the abandoned one**, replaying a stale CBW, and on the write path a stale
+payload, into a device whose phase machine had moved on.
+
+From there the two machines run exactly one phase apart. What the host sends as *data* the device
+reads as a *command*; what the host sends as a *command* the device consumes as *data* and writes to
+the medium. A 31-byte CBW landing in a data phase is written to whatever LBA the device last
+latched. That is how a Command Block Wrapper ends up in a directory sector.
+
+Three properties make this worse than it first looks:
+
+* **The shared-ring aggravator.** The CBW and an OUT data stage ride the **same** bulk-OUT ring. An
+  abandoned WRITE therefore strands *both* — a command wrapper **and** up to 32 KiB of file payload,
+  in that order, ahead of the next doorbell. On the write path the compounding case is the common
+  one.
+* **Addresses recur.** The rings are 16 TRBs and a transaction pushes up to three, so a given TRB
+  address comes round again roughly every five transactions. A completion matched by address alone
+  cannot tell a live stage from a long-retired one.
+* **It is self-perpetuating.** Once out of phase, the next transaction fails too — and failed the
+  same dirty way, re-arming the same trap.
+
+### 15.2 Medium forensics — code → capture → medium
+
+The corrupted card was re-inserted and read back. Raw device access was refused, so the readings
+below are the **kernel-decoded views** through a mounted vfat; where the decode depends on the vfat
+driver's own field mapping that is stated rather than glossed.
+
+A 31-byte CBW overlaid on a 32-byte FAT 8.3 directory entry aligns like this — and this table is
+what turns the wreckage into a readable record of the transaction that caused it:
+
+| dirent field | offset | CBW field at that offset |
+|---|---|---|
+| `name[0..3]` | 0–3 | `dCBWSignature` = `55 53 42 43` (`"USBC"`) |
+| `name[4..7]` | 4–7 | `dCBWTag` (LE) |
+| `name[8..10]` | 8–10 | `dCBWDataTransferLength` bytes 0–2 |
+| `attr` | 11 | `dCBWDataTransferLength` byte 3 |
+| `NTRes` | 12 | `bmCBWFlags` |
+| `crtTimeTenth` | 13 | `bCBWLUN` |
+| `crtTime` | 14–15 | `bCBWCBLength`, `CDB[0]` (opcode) |
+| `crtDate` | 16–17 | `CDB[1..2]` |
+| `lstAccDate` | 18–19 | `CDB[3..4]` |
+| `fstClusHI` | 20–21 | `CDB[5..6]` |
+| `wrtTime` | 22–23 | `CDB[7..8]` |
+| `wrtDate` | 24–25 | `CDB[9..10]` |
+| `fstClusLO` | 26–27 | `CDB[11..12]` |
+| `fileSize` | 28–31 | `CDB[13..15]` + one byte past the CBW |
+
+**What the medium says.**
+
+1. **The name is the signature.** Raw name bytes `55 53 42 43 1c` — `"USBC"` followed by `0x1C`, the
+   name terminating at the first invalid byte. This is not an inference from a pattern; it is the
+   BOT signature constant, in a directory entry.
+
+2. **The tag names the transaction.** `name[4..7]` is `dCBWTag` little-endian, and the observed
+   bytes give **`dCBWTag = 28`**. The audit's first-timeout table for the GR8 boots reads
+   `n = 142, 94, 28, 16, 17`, and **28 is the first-failing transaction of GR8-B3**. The CBW on the
+   medium is the first-failure transaction of a captured storm boot. That is the closing link of the
+   chain — **code → capture → medium, joined by one transaction number**. No step of it is
+   circumstantial.
+
+3. **The size confirms the overlay.** `fileSize = 973,078,528 = 0x3A000000`, i.e. bytes 28–31 read
+   `00 00 00 3A`. `CDB[13..15]` are zero (a 10-byte CDB zero-padded to 16), and `0x3A` is the byte
+   *past* the 31-byte CBW. The file size is not a size at all; it is CDB padding plus one byte of
+   whatever followed the wrapper in the staging buffer.
+
+4. **The timestamp recovers the transfer length.** `wrtTime = CDB[7..8]`, and for a `WRITE(10)` CDB
+   those are the transfer length in **blocks, big-endian**. `st_mtime` decodes to raw `315533280` =
+   the FAT epoch (1980-01-01 UTC, `315532800`) **+ 480 s = 8 minutes exactly**. Reading that
+   backwards: FAT time packs minutes in bits 10:5, so 8 minutes is the field value `0x0100`, so
+   `CDB[7] = 0x00, CDB[8] = 0x01` — **a transfer length of one block**. A single-sector `WRITE(10)`,
+   which is exactly the shape of the flight recorder's dirent-update write. The exact epoch offset
+   also shows no timezone skew was applied to this field, so the derivation stands on its own.
+
+   **`st_ctime` is not evidence.** It reports the same 8-minute value, but `crtTime` is
+   `bCBWCBLength, CDB[0]` = `0x0A, 0x2A` = `0x2A0A`, which decodes to 05:16:20, not 00:08:00. The
+   agreement is therefore a Linux vfat artefact (ctime mirroring mtime), not a second independent
+   reading. It is recorded here so nobody later cites it as corroboration.
+
+5. **`lstAccDate` is a partial LBA, with a caveat.** `lstAccDate = CDB[3..4]`, which for `WRITE(10)`
+   are LBA bits 23:16 and 15:8. The decoded date, 2026-07-29, would give `LBA[23:16] = 0xFD` and
+   `LBA[15:8] = 0x5C`. **Do not rely on this**: 2026-07-29 is also the date the card was re-read, and
+   a read-write mount updates `lstAccDate`. Confirming the target LBA needs the raw sector.
+
+6. **The head is a phantom.** The file's first 64 bytes read as zeros — `fstClusLO`/`fstClusHI` are
+   CDB bytes, so they address a cluster chain that was never allocated to anything.
+
+7. **The entry is a ghost.** `readdir` shows it; `stat` on the path fails with *No such file*. The
+   invalid byte in the name means the entry can be listed but not opened or deleted by normal means.
+   Recorded here so that this dead end is not re-investigated as a separate filesystem bug — it is a
+   consequence of the corrupt name, nothing more.
+
+8. Linux additionally warned at mount: *"Volume was not properly unmounted. Some data may be
+   corrupt."*
+
+### 15.3 Cross-platform: the same hole family on VL805
+
+The Pi seat's independent audit of the aarch64 BOT path found **the same hole family** on Broadcom
+VL805 silicon — three of the six exposed, plus a push with no capacity check at all. The mechanism
+is therefore not an artefact of one controller, one vendor's quirks, or one arch's code path: it is
+in the shared BOT state machine, and it is portable. That is the strongest available argument that
+the fixes belong at this layer rather than behind a platform quirk.
+
+### 15.4 The fix set
+
+Six fixes, in audit priority order. Fixes 1, 2 and 6 close ways the driver can leave hardware and
+software disagreeing; fixes 3 and 4 close ways it can *believe a false report* about what happened.
+
+**1. The single chokepoint — no error exit returns with a dirty ring.** `bot_transfer` is now a thin
+wrapper around `bot_transfer_body`; every `Err` other than `NoDevice`/`BadRequest` (raised before
+anything is built or queued) passes through `bot_clean_rings`, which stop/reset-endpoints, Set TR
+Dequeue Pointer on **both** bulk rings, and drains the event ring. `resync_bulk_ep` is the tool — it
+already existed and was already correct; the defect was never the tool, only that the error paths did
+not call it.
+
+Wrapping the whole body, rather than patching the known exits, is the point. It covers the
+below-`N_CONSEC` early return and the terminal escalate return the audit named; it covers the
+`RingFull` refusals, the stalled status stage, and — stated explicitly because two boots in the
+capture ran it — **the pre-BOT-RESCUE shape, a bare `return Err` with no cleanup of any kind**. It
+also covers whatever exit the next arc adds, which an enumeration of exits would not.
+
+It cleans **both** rings unconditionally, not just the pipe the failed stage awaited, because of the
+shared-ring aggravator in §15.1: naming one pipe would leave the other loaded with a CBW and a
+payload.
+
+**2. The ring guard runs before the CBW push.** The lap guard used to be checked per stage,
+immediately before that stage's own push — one stage too late. The CBW went on the OUT ring first,
+so an `Err(RingFull)` from the *data* or *status* guard returned with the CBW stranded, un-rung and
+unretired: the guard meant to prevent a dirty ring was manufacturing one. All rings the transaction
+will touch are now checked up front, so a refusal leaves both rings byte-untouched.
+
+The same pass removed three discarded `push` results (`.ok()`, `.unwrap_or(0)`) on the CBW/DATA/CSW
+paths. `push` cannot fail today, so this is behaviourally inert — but `.unwrap_or(0)` would have made
+a failed push wait on `ring_base + 0`, a real and recurring TRB address, which is another aliasing
+vector into fix 4. A fabricated wait address is never better than an honest failure.
+
+**3. Short-transfer honesty.** `run_bot_stage` returned only the completion code, so the Transfer
+Event's residue — the bytes that did **not** move — was discarded, and `cc=13 SHORT PACKET` was
+accepted as success with the CSW queued behind it. `BotPending` now carries `residue`
+(first-write-latched against duplicate-Success quirks, like `Ep0Pending::data_seen`), and the data
+stage is checked against its own `dCBWDataTransferLength`.
+
+The treatment is deliberately **asymmetric**, and the asymmetry is the spec's:
+
+* **OUT short is a fault.** BOT 1.0 §6.7.3 case 9 (Ho > Do): the device stopped accepting bytes, so
+  it is *not* in its status phase. Queueing the CSW there is precisely the step that slides the two
+  machines apart. It now feeds the recovery path.
+* **IN short is not.** §6.7.2 case 4 (Hi > Di): `REQUEST SENSE` (18), `INQUIRY` (36) and
+  `READ CAPACITY` (8) all name a *maximum* allocation length, and a conforming device may return
+  less and then sit in its status phase with the shortfall in `dCSWDataResidue`. Failing those would
+  break bring-up on correct hardware.
+
+The IN case is instead given a check with real teeth: **`dCSWDataResidue` is now validated.** It was
+decoded and handed to the caller but never compared with anything — so a transfer that moved zero
+bytes and returned `bStatus = 0` with a full residue was reported to the FAT layer as a clean
+success. The device's residue is *its* claim about how many bytes moved; the Transfer Event residue
+is the *controller's*. Two independent witnesses of one quantity: if they disagree, one of the two
+state machines is a phase out, and that is not success.
+
+**4. De-aliased event matching.** `handle_event_trb` matched a BOT stage by TRB address and
+*additionally claimed any error completion on either bulk DCI*. That blanket claim spans a slot's
+whole bulk traffic, and addresses recur every ~5 transactions, so between them a stale event could
+retire a live stage with someone else's completion code. Two narrowings, both minimal:
+
+* The blanket error claim is gone. Errors that name a TRB are matched by address like anything else
+  — a bulk STALL carries its TRB pointer, so the property the blanket claim was added for (a stalled
+  command must not burn the full pump timeout) is preserved. The fallback survives only for an error
+  whose pointer addresses nothing in either bulk ring (Ring Underrun, Ring Overrun, VF Event Ring
+  Full), where "it can only be ours" is the only attribution available — and it is **counted**
+  (`ev_unaddressed=`) rather than silent.
+* A first-write latch on `done`: a second event for an already-completed stage is refused rather
+  than allowed to overwrite the recorded completion code, and counted (`ev_late=`).
+
+`BotPending` also carries a monotonic `generation`. It is **not** a wire tag and does not pretend to
+be — a Transfer Event carries only a TRB pointer, so nothing can round-trip an identity. It is the
+log key that ties a completion, a strand line and a timeout to one stage in a log where addresses
+repeat.
+
+**5. `send_scsi_read` deleted.** An uncalled fire-and-forget legacy path that pushed a hand-built CBW
+with a **hardcoded tag** (`0xDEADBEEF`) and a data TRB onto both bulk rings, rang both doorbells, and
+awaited nothing. It could not have been reached by any live call path, and it would have been a
+loaded gun aimed at this state machine — a permanent supply of untracked TRBs and a tag no CSW
+validation could ever match. Removed rather than documented.
+
+**6. The `cfgep_cc=19` disagreement.** `rescue_reset_device` `reset()`s both rings — driver-side
+enqueue 0, cycle 1 — because the Configure Endpoint that follows was going to point the controller at
+each ring's base with DCS=1 in the same breath. When that command fails, and on metal it fails with
+`cc=19` Context State Error (§14.7 item 5 already expects it), the controller was **never repointed**:
+it is parked wherever the wedged transaction left it, on a ring whose contents the reset just zeroed,
+while the driver believes it is at the base. The next push then writes a TRB the controller never
+fetches, or one it fetches at the wrong colour. The rung now issues an explicit Set TR Dequeue
+Pointer at each ring's base with DCS=1 — exactly what the failed Configure Endpoint would have
+programmed, and legal from Stopped/Error (xHCI 1.2 §4.6.10). If that fails too, the rung still
+returns false and the ladder proceeds to the port cycle, where re-enumeration rebuilds both sides.
+What can no longer happen is a quiet return with the two sides out of step.
+
+### 15.5 Witness grammar
+
+| line / field | where | says |
+|---|---|---|
+| `:: BOT: strand when=pre\|post … epstate= enq= cycle= ntrb= ctxdeq= dcs= ctxdeq_valid= gap= live= gen= ::` | every error exit, per pipe | the ring as the error found it, and as the cleanup left it |
+| `:: BOT: clean slot= cause= in_resync= out_resync= in_live= out_live= undrained= ::` | every error exit | whether the cleanup succeeded on both pipes |
+| `:: BOT: dtl_vs_moved slot= dir= dtl= moved= residue= cc= verdict= ::` | any short data stage | host-side shortfall, and how it was judged |
+| `:: BOT: residue_disagree slot= dir= dtl= host_moved= dev_residue= dev_moved= bstatus= ::` | CSW validation | the device and the controller disagree about bytes moved |
+| `:: BOT: csw_bytes slot= why= tag_want= b=… ::` | every CSW rejection | **all 13 raw CSW bytes** |
+| `:: BOT: rescue stage=repoint …` | fix 6 | the controller being repointed after a failed Configure Endpoint |
+| `tag_mismatch= bad_sig= abandoned_in= abandoned_out= undrained= short_in= short_out= ev_late= ev_unaddressed=` | the `result=SUMMARY` line | boot totals for all of the above |
+
+Two of these deserve their reading key stated, because a witness read wrong is worse than none:
+
+**`ctxdeq_valid=`.** The `live=` count is derived from the Output Endpoint Context's TR Dequeue
+Pointer, and GUARD-STATE established that this field is only architecturally defined while the
+endpoint is **not Running** (xHCI 1.2 §4.8.3); on Intel Panther Point it is otherwise frozen at its
+birth value. So the **pre** scan is advisory — under a Running endpoint it reads a stale field and
+will under-count — and the **post** scan, taken after the endpoints are Stopped, is authoritative.
+This is why the asserted counter is `undrained=` (post) and not `abandoned_*` (pre): the assertion is
+placed on the reading that means what it says. `ctxdeq_valid=` states which kind each line is rather
+than leaving a reader to know it.
+
+**`undrained=` is fix 1's own regression witness.** It counts pipes that still held valid-cycle TRBs
+after the cleanup, or whose resync failed. **It must read 0 on every boot.** A non-zero reading is
+the primary hole reopened, and it says so without anyone having to reconstruct it from a corrupted
+filesystem afterwards. Slots with no reachable ring (device gone, or surrendered — where
+`bot_transfer` refuses every later transfer at its first line) are skipped explicitly and *not*
+counted, so the number stays an assertion rather than drifting into noise.
+
+**`csw_bytes` resolves a specific open question.** The 2026-07-29 capture recorded one tag of
+`0xACABAAA9` with nothing to read it against, and the two candidate explanations — a **torn read** of
+a partially DMA-written CSW versus an **overlay** of another payload onto the CSW buffer — are
+distinguished by the bytes *around* the tag, which were never printed. A valid `USBS` signature with
+a wrong tag is a stale-but-well-formed CSW (a phase slip); high entropy across all 13 is an overlay;
+expected bytes mixed with zeros is a torn read. The boot totals now give it a denominator, which is
+the difference between "this happened once" and a rate.
+
+### 15.6 Blast radius
+
+**The healthy path is byte-identical**, and each claim is checkable:
+
+* Fix 1 adds nothing to any success path — the wrapper inspects the result and calls the cleanup only
+  on `Err`.
+* Fix 2 reorders three `bot_ring_guard` calls that, since GUARD-STATE, return `Ok` immediately for a
+  Running endpoint. Nothing is pushed and no doorbell rings between them, so the reordering is not
+  observable; only the `RingFull` refusal moves earlier. The `push` result changes are inert (`push`
+  always returns `Ok` today).
+* Fix 3 adds arithmetic on a value the event already carried. On a transfer where everything moved,
+  `moved == data_len` and no branch is taken. The gates below ran 2002 data stages with
+  `short_in=0 short_out=0` and no `residue_disagree`.
+* Fix 4 only ever *narrows* what may claim a stage; it cannot cause a claim that did not happen
+  before. The stall-delivery property is preserved because a STALL carries its TRB pointer.
+* Fix 5 removes dead code with no callers.
+* Fix 6 is reachable only from escalation rung (a), after a failed Configure Endpoint — unreachable
+  on a healthy device.
+
+Nothing here weakens a protection. No page permission, checksum, SMEP/NXE/WXN or validation gate is
+touched; fixes 2, 3 and 4 each *add* a check, and fix 3 converts a previously accepted condition into
+a rejected one.
+
+### 15.7 Gates
+
+* `./arroyo check` — green, **both** arches.
+* `./arroyo test 90` — **31 PASS / 0 FAIL** (baseline maintained).
+* `./arroyo test-fat part 90` — **41 PASS / 0 FAIL + 1 LIVE**, 4005 pump waits, `timeouts=0`.
+* `UNAOS_BOTFAULT=1 ./arroyo test 90` — **31 PASS / 0 FAIL**. The injected CSW-stage failure is
+  rescued by the existing first rung (`recoveries=1 retry_ok=1`), and the new witnesses read
+  `abandoned_in=0 abandoned_out=0 undrained=0` afterwards — the rings are clean after recovery.
+* Every new counter reads **0** on all three boots.
+
+**What QEMU cannot prove — stated plainly, as §14.6 does.** The chokepoint's cleanup fires only when
+`bot_transfer` *returns* an error, and QEMU never produces one: the single injected fault is always
+rescued by the first rung, so the transaction returns `Ok`. `bot_clean_rings`, `bot_strand_witness`
+and `TransferRing::strand_scan` are therefore **not executed** in emulation — `strings` proves the
+text is in the artifact, and that is all emulation establishes. Their correctness rests on inspection
+(no new `unwrap`, every `Option` handled, the scan bounded by the ring length) and on the metal boot
+that will first exercise them. The `undrained=0` readings above are real but weak: they are taken on
+boots where the cleanup path never ran.
+
+Equally: fix 3's OUT-short branch, fix 4's `ev_unaddressed` fallback, fix 6's repoint, and every
+`ring refuse` remain unreached in emulation, for the same reason §14.6 gives — QEMU's `usb-storage`
+does not stall, short-change or wedge.
+
+### 15.8 What metal must verify
+
+1. **`undrained=0` on every boot**, including boots that see real transport faults. This is the
+   arc's central assertion.
+2. **A `:: BOT: strand ::` pair at every error exit**, with `when=post` showing `live=0` on both
+   pipes. A `when=pre` line with `live>0` and `ctxdeq_valid=yes` is the first direct observation of
+   the stranded TRB this arc is about.
+3. **No further CBW-shaped corruption** across a sustained write workload on the affected reader.
+4. **`csw_bytes` on the next tag mismatch** — torn read or overlay, finally decidable.
+5. **`short_out=`** should be 0; any non-zero is a phase fault caught before it reached the medium,
+   and each one is a transaction that would previously have been reported to FAT as success.
+6. **`ev_late=` / `ev_unaddressed=`** — the first real measurement of event aliasing on this
+   hardware.
+7. **Rung (a)'s `cfgep_cc=19` followed by `stage=repoint`** — whether the repoint lands, which
+   determines if §14.8's second open item is now explained.
+
+### 15.9 Still open
+
+§14.8's list, updated:
+
+1. **The genuine wedge now has its mechanism.** The deterministic first-timeout, the storm boots and
+   the medium corruption are one story, closed by §15.1–15.2 and joined at `dCBWTag = 28`. What
+   remains open from that item is narrower and should not be absorbed into the fix: the **FIRST
+   completion loss** — the event that goes missing to *start* a storm — is still unexplained. This
+   arc stops a lost completion from corrupting the medium; it does not explain why one is lost.
+   `foreign=0` across the silence remains the part most wanting an explanation.
+2. **`cfgep_cc=19`** — fix 6 makes the failure *safe* but does not explain *why* Configure Endpoint
+   is illegal at that moment. `stage=repoint`'s own `cc` on the next metal capture is the next rung
+   of that question. Still open.
+3. **~9 ms mean per 512-byte transfer** — unchanged from §14.8, still deferred, still should not be.
+4. **The aarch64 `piusb36_read10_two_trb` twin** carries the same short-transfer hole fix 3 closes in
+   `bot_transfer_once`, and is out of this arc's lane. It is flagged for the Pi seat's lift.
 
 ---
 
