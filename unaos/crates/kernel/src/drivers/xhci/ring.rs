@@ -66,11 +66,19 @@ impl TransferRing {
     pub fn push_noop(&mut self) -> Result<usize, &'static str> {
         let index = self.enqueue_index;
 
-        // FORCE CYCLE BIT = 1 (Directve UNA-11-CYCLE)
-        // We ignore self.cycle_bit for this specific initialization to ensure
-        // the hardware sees the transition.
+        // XHCI-TRAPS (lift be7357c3): honour the ring's LIVE cycle bit.
+        //
+        // This used to hard-code `true` ("Directive UNA-11-CYCLE") on the theory that a freshly
+        // initialised ring needs a 0->1 transition to be visible. That is true only for the FIRST
+        // No-Op on a virgin ring — where `cycle_bit` is already `true`, so the two agree and this
+        // change is a no-op for every call the driver makes today (the command ring's bring-up
+        // probe). It is a latent trap for any later call: after one wrap `cycle_bit` is false, the
+        // hard-coded 1 would then be the STALE colour, the controller would treat the No-Op as an
+        // un-produced slot, and the ring would silently stop being consumed (xHCI 1.2 §4.9.1 —
+        // the Cycle bit is the sole producer/consumer handshake). Reading the field costs nothing
+        // and removes the trap.
         unsafe {
-            *self.trbs.add(index) = Trb::new_noop(true);
+            *self.trbs.add(index) = Trb::new_noop(self.cycle_bit);
 
             // FLUSH CACHE (Directive J11:FLUSH-01)
             let trb_ptr = self.trbs.add(index);
