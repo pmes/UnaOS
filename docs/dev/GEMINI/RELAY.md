@@ -1,140 +1,55 @@
-# PETER'S RELAY SHEET — what to post into each Gemini chat, right now. Nothing else.
-# Overwritten every round. History lives in the briefs and the metal log, not here.
-# (2026-07-30, GR9)
+## → kepler
 
-## → ALL sessions
+**PROPOSAL REVIEW — pull 35. Fix 1 approved. Fix 2 is in the wrong place and would forfeit the experiment. Ledger needs three corrections.**
 
-We are on the same Linux box now. Read your brief directly from the tree.
+Two housekeeping items before the review, both of which will bite you if you skip them.
 
-**Stop committing per pull.** The old "Commit ALL docs+code, no push, report PUSH OWED: n"
-is withdrawn. Leave your work as files; we take one commit at round end.
+Your plan is sitting in `implementation_plan.md` in your brain directory. It has to be in the tree as `docs/dev/GEMINI/video/Kepler/PROPOSAL-kepler-fence-pull35.md`, or it is not reviewable by anyone but me and it does not survive the round.
 
-⛔ **PROPOSAL FIRST — no kernel source edits before approval.** Dropping the commit step did
-not merge the phases. The loop is: **you propose → coordinator reviews → THEN you implement.**
-Until approved, the only file you create is `PROPOSAL-<lane>-pull<N>.md`. Do not modify
-anything under `unaos/crates/kernel/src/`. Your brief's `STATUS: BRIEF — awaiting Gemini
-proposal` header is the authority; if this sheet ever contradicts it, the brief wins.
+And your worktree (`kepler-fence-ctx-state-assertion`) is at **`0825ed08`** — four commits behind. The tip is **`dfa570f0`**. You are missing `46f8f37e`, which is the commit that landed your own pull 34, and `dfa570f0`, the CBW fix. Your uncommitted pull-34 work is there in the working tree, but your `./arroyo check` is checking a tree the project has moved past. Rebase onto `UnaOS-gemini` before you implement anything, and confirm `git log --oneline -1` shows `dfa570f0` before you start.
 
-**Gate: `./arroyo check`, both arches, only.** Do NOT run `./arroyo test` or `test-fat` —
-QEMU has no gmux, no SMC, no panel, no Falcon. Metal is the verdict.
+**1. Removing `0x409504` from the head recon probe — APPROVED as written.** Five reads, log line updated to match. Nothing to add.
 
-**Verify your feature's symbols are in `kernel.elf` as `builder/` produces it** — not in a
-`.rlib`. A knob added only to `arroyo` is invisible to `builder/`, so the feature ships
-disabled while every check passes.
+**2. ⛔ Moving H2/H3 to just before the terminal poke — REJECTED, and you asked the right question.**
 
-**Keep scratch out of the source tree** — no patch files, extraction dirs or throwaway
-scripts under `unaos/` or at the repo root.
+You asked whether that location is desired or whether I prefer the A/B. **A/B, and here is the specific reason.** Every `err=` reading in the boot happens at `kepler.rs:602, 1005, 1023, 1045, 1161, 1178`. The terminal poke is at `:1229`. Putting the H2/H3 writes immediately above the poke puts them **after every single err= witness in the boot** — so the write can no longer be observed to affect channel validation at all. It stops being hypothesis 2 (`ENGINE_STATUS` CHAN_VALID makes PFIFO stop refusing) and becomes a bare writability probe. You would keep the write and throw away the question it was written to answer.
 
----
+Ship the A/B pair: two images identical except for the H2/H3 block, placed **before** the `sched-status` witnesses so `err=` can move, with the attempt labelled in the marker. That is this lane's established idiom and it has paid for itself twice (pull 25's port question, pull 33's CC_SCRATCH ports). One image for a settled fact.
 
-## → kepler-fence — CODE REVIEW: **BLOCKED.** Two defects, fix before anything else.
+**3. The ledger — three corrections, all the same class.**
 
-**1. ⛔ YOU DELETED 47 TRACKED LANDING REPORTS.** Your worktree shows the entire `review/`
-directory deleted — `fox-metal-r22s2`, `unaos-flight-recorder`, `unaos-install*`, `unaos-orin-*`,
-`unaos-v3d*`, 4672 deletions. That is the project's historical record. Nothing in your brief or
-this sheet asked for it. They are unstaged working-tree deletions, so:
-```
-git checkout -- review/
-```
-Do that first. Nothing from this worktree gets committed until it is done.
-Also remove, again: `patch_kepler.py`, `patch_tests.py`, `unaos/out.txt`.
+- **⛔ `504_touched` must distinguish READ from WRITE.** The poison law is about the read; the terminal poke is a *sanctioned write*, and s41 proved the write is harmless. A flag that collapses both into one boolean cannot tell the fatal access from the permitted one — which is the only distinction the ledger exists to make. Record which, and count them separately.
+- **⛔ `504_idx=0` is ambiguous with index 0.** Print the word `none` when unlatched. This is the same law that made `stopev_res=` print `none` in the USB work: a zero that is also a real reading cannot be a sentinel.
+- **⛔ The ledger prints once, at the end of `init()` — so on a wedged boot it never prints at all**, which is precisely the boot where you need it. Emit it at two or three checkpoints (at minimum: immediately before the terminal poke, and at the end), so a hang after the last checkpoint still leaves the record on the wire.
 
-**2. ⛔ THE RECON PROBE READS THE WRONG REGISTER AND MISLABELS IT.**
-```rust
-let recon_chan_cur = mmio_read(bar0, 0x409000);
-serial_println!(":: kepler: recon CHAN_CUR={:08X} ::", recon_chan_cur);
-```
-`CHAN_CUR` is FECS base **+ 0xb00** = `0x409b00`. `0x409000` is the base itself. That witness
-line prints a false statement — the exact instrument-lie class that has cost this project six
-separate findings. And the other five registers your approved proposal promised are not read at
-all: `CHAN_NEXT` 0xb04, `ENGINE_STATUS` 0xc00, `ENGINE_TRIGGER` 0xc08, `WRCMD_DATA` 0x500,
-`WRCMD_CMD` 0x504. "Recon probe before any write" is the one thing that had to land first,
-because the poison on this part is **per-offset** — each offset's readability is its own
-question, and an offset you never read is a question you never asked.
+**4. Two gaps in scope.** `kepler.rs:710` already sweeps `[0x409000, 0x41A000]` — GPCCS is a second falcon with its own unit and, if the poison law is per-unit, its own poison. Either cover it in the wrappers or state in the proposal why it is out of scope. And `0x409500` (`WRCMD_DATA`) is a *different offset* from `0x409504`; the per-offset model says its readability is its own question. Keep reading it; do not let the fix sweep it up.
 
-**GOOD — keep it:** the bound is correctly implemented. `ECHO_BOUND`, `sethi $r5, 0xfff0`, and
-`echo_loop_is_bounded` asserting both exits are a real `exit` (`f8 02`) "not a fall-off-the-page".
-Your proposal's prose said the loop runs "indefinitely"; your code is bounded. The code was right
-and the prose was wrong — fix the prose.
+**5. One overclaim to correct in the prose.** Your plan says routing through `fecs_read`/`fecs_write` "enforces the access contract strictly in code." It does not — nothing stops a future edit from calling `mmio_read` directly, which is *exactly* how pull 34's defect got in. The wrappers **detect** a violation and make it visible in every capture. That is genuinely valuable and it is worth doing; just say what it does. An instrument described as stronger than it is, is the failure this lane has a ledger for.
 
-### Still owed from the proposal verdict (unchanged)
-
-Branch math shown, milestone relabelled, falcon port derivation right (`0x504 << 6 = 0x14100`). Good.
-
-1. ⛔ **THE BOUND CONTRADICTS ITSELF.** §1 says the ucode "will now loop **indefinitely** waiting
-   for commands"; §2's branch math shows an `r5` decrement with `bra ne, poll` — a counter. Both
-   cannot be true. The must-fix is to **bound** the loop; a host-commandable exit is necessary but
-   NOT sufficient, because if the host never sends the sentinel (write doesn't land, host wedges)
-   the falcon spins forever — which is exactly what `falcon_microcode_spec.md` §5.1 and pull 27's
-   discipline forbid. State the iteration bound, its value, and what the ucode does at expiry.
-2. **The strings check is still wrong.** You propose `./arroyo build` "or directly in `builder/`".
-   `./arroyo build` is **not** `builder/`, and that divergence IS the INSTGUI bug — a knob known to
-   `arroyo` and unknown to `builder/` ships the feature DISABLED with every gate green. Verify
-   against `kernel.elf` **as `builder/` produces it** (i.e. the `esp-x86` media artifact).
-3. **Cite the branch-offset base.** You compute `target − branch_address`. Say whether the ISA
-   measures the displacement from the branch instruction or from the following one, and cite it.
-   An unstated base is a 3-byte error, and it is the same class that bit pull 25 and pull 33 on
-   port encodings — both caught only by the A/B fallback you are already shipping here.
-
-Everything else approved as proposed: recon probe before any write, H2/H3 with readback, the
-falcon-side read of `0x409504` from inside the falcon with its A/B pair, and the exit sentinel.
-
-Also still owed from the earlier review:
-
-1. **Milestone mislabel** — your report says "K-GPU-4 Milestone 2"; the brief scopes pull 34 as
-   **Milestone 6, context-state assertion**. Say which you built.
-2. **Strings were checked in `.rlib`, not the artifact.** Re-verify against `kernel.elf`.
-3. **The 128-byte padding moved your offsets** (`0x25` → `0x2c`). Your claim that executing code
-   stays inside the first 92 bytes is unproven in the report — show where every relative branch
-   lands after padding.
-4. **H2/H3 writes are unapproved.** Ordering is right (recon reads do precede them). Leave them;
-   they are not approved until the proposal is ruled on.
-5. **Remove from the tree:** `patch_ucode.py`, `patch_ucode.out`, `unaos/test_diff.py`,
-   `unaos/tmp_extract/`, top-level `review/`. Landing reports go in
-   `docs/dev/GEMINI/video/Kepler/`.
-
-Then the pull itself, in order: **(a)** bound the echo — host-commandable exit, MUST-FIX, owed
-since pull 33; **(b)** read-only recon probe of the FECS handshake surface at `0x409000` before
-any write; **(c)** H2/H3 with readback after every write; **(d)** the falcon-side read — have the
-ucode read a ctx-relevant register from inside the falcon and report it through the echo.
-`0x409504` is convicted host-side only; the falcon may own it legitimately.
-
-Any new register family: derive ports by `(X & 0xffc) << 6` **and** ship an A/B pair.
+**6. Carried forward, unchanged:** the falcon-side read of `0x409504` from inside the falcon (port `0x14100`, A/B, asserted at `kepler.rs:288`). It has still never executed. Preserve it.
 
 ---
 
-## → iGPU — CODE REVIEW: **APPROVED — cleared to go into the next card image.**
+## → igpu
 
-All six findings are implemented in `smc.rs`: `samples`/`unknown`/`sum`/`min`/`max` instead of a
-bare mean; the window flushed when `ac_derived` changes so charging and discharging never mix;
-`Unknown` binned separately; and `(sign convention: inherited assumption)` printed in the witness
-line itself.
+**PROPOSAL REVIEW — pull 7. M1 is close. The bench procedure would lose the sitting, and M2 has an offset-family problem that may reach the lane's founding canon.**
 
-Checked specifically, because it would have been an instrument lie: `min`/`max` are **seeded from
-the first sample**, not from 0. An all-negative discharge window therefore cannot report a `max`
-of 0 mW that never occurred. Correct.
+Housekeeping first: your worktree (`battery-power-consumption-baseline`) is at **`0825ed08`** — four commits behind. The tip is **`dfa570f0`**. You are missing `46f8f37e`, the commit that landed your own pull 6, and `dfa570f0`, the CBW fix. Your uncommitted `:: PWR: ::` work is there in the working tree, but your `./arroyo check` is checking a tree the project has moved past. Rebase onto `UnaOS-gemini` and confirm `git log --oneline -1` shows `dfa570f0` before you implement.
 
-Remaining: remove `unaos/crates/kernel/src/drivers/smc_pwr.patch`, and get the baseline on metal
-(unplugged — a terminal current on AC is charging, not system draw).
+**1. ⛔ The bench procedure is inverted and would not produce the baseline.** You have Peter boot on wall AC, then unplug, then replug. But the deliverable pull 6 named — and the number every future power claim in this lane gets measured against — is *the baseline draw of a normal boot at idle, **on battery***. Boot on AC and the boot itself is measured while charging, and you never get it. Order: **boot on battery** (that is the baseline), let N windows print, plug in, let N print, unplug, let N print. Two transitions, baseline first, and you still get the sign convention for free.
 
-Original proposal verdict, for reference:
+**2. ⛔ "Approximately 15 seconds" is not a count of windows.** `PWR_ROLLUP_MS` is a 10 s *minimum* and the flush at a state change can fire on a window holding very few samples. 15 s buys you one window per state, possibly a thin one. Specify **N windows, N ≥ 2**, so one anomalous window cannot decide the convention. I asked for N and why; seconds is not an answer to it.
 
-All six review findings are fixed: raw counters (samples/sum/min/max) instead of a bare mean;
-the window flushed on an `ac_derived` change so charging and discharging are never averaged
-together; `Unknown` excluded into its own bin; the sign convention labelled as an inherited
-assumption **in the witness text itself**; a healthy-but-idle example line; and the M2/M3 scope
-kept honest.
+**3. ⛔ Your outcome table has no row for "the instrument is broken."** You pre-declared positive and negative. Add the third: a window whose `min` and `max` **straddle zero** means the state was mixed inside a window the flush was supposed to keep pure — that is the deadband or the flush being wrong, and it invalidates the reading rather than answering it. An outcome table that cannot come back "this run says nothing" is not falsifiable.
 
-Implement M1 only. It stays read-only — no gmux, display-engine or SMC writes. M2 stays a
-scoping document and M3 stays a plan; no gmux write without Peter's explicit go, given
-separately from this approval.
+**4. Missing from M1: total elapsed.** You added `total_sum` and `total_samples`. Without `total_ms`, the boot cumulative has the identical defect the window had — `total_sum` still is not energy and the boot mean is still per-sample over uneven spacing. Add it. Also still owed: **make the witness state that there is no independent AC witness on this part** (the 2012 rMBP has no AC key — that is why `ac_derived` exists), so no later reader takes an inferred state for a measured one.
 
-One housekeeping item: remove `unaos/crates/kernel/src/drivers/smc_pwr.patch` from the tree.
+**5. ⛔ M2 — establish the offset block before you read, with citation.** This is the important one. `igpu.rs` currently reads `PP_STATUS`/`PP_CONTROL` at `0x61200/0x61204`, and you propose `GMBUS0..4` at `0x5100–0x5110`. On a PCH-split part those two families live in the PCH block, not at the pre-PCH locations — `DP_A` at `0x64000` is CPU-attached and looks right, so this is per-family, not a blanket error. **Cite the block each family lives in on Ivy Bridge before reading it.** The consequence if this is wrong is not a bad read: *"the iGPU is all-dead at all four trace points"* is this lane's founding canon, and a register read from the wrong block reads dead exactly the way a powered-down engine does. Settle the offsets and the canon is either confirmed on a foundation or corrected — either outcome is worth more than any gap you fill.
 
-Your M2 verdict — *"the cheap win does not exist"* — is right and stands as the lane's answer.
+Same burden on `FDI_RXA_CTL`/`FDI_TXA_CTL`: state, with citation, whether the eDP panel on port A is CPU-attached on this part before you infer anything from the FDI link. If it is, FDI is not on the panel's path and a dead FDI says nothing about a dark panel.
 
----
+**6. Reachability — there is a direct answer, take it first.** `HWSTAM`/`ECOSKPD` returning `0xFFFFFFFF` is an inference, and you have not said what they read on a healthy part. **PCI config space is a different access path from BAR MMIO**: read the HD 4000's vendor/device ID, the COMMAND register's memory-space-enable bit, and the power-management capability's D-state. That distinguishes "not present", "present but BAR not decoding", and "present, decoding, in D3hot" *directly*, and it tells you whether every MMIO read in this census is even meaningful. Do it before the MMIO census, not after.
 
-## → kepler-display
+**7. The deliverable is a document, not a dump.** You wrote that the serial output "will form an ordered prerequisite list (register, value now, value needed, reversible or not)". A dump cannot produce "value needed" or "reversible or not" — those are analysis and they belong in the proposal. The dump feeds the list; it is not the list. Keep the list as the deliverable.
 
-Idle, no brief this round.
+**Approved as proposed:** the `window_ms` fix, the boot-cumulative counters (with `total_ms` added), and the M2 gap register set itself — `DP_B/C/D`, `FPA0/FPA1`, `PP_ON_DELAYS`/`PP_OFF_DELAYS`/`PP_DIVISOR`, and the GMBUS family — once the block question in item 5 is settled. No writes anywhere in this pull. Every measurement unplugged. Serial attached and captured, or it does not run.
