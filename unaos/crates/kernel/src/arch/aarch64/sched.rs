@@ -3419,6 +3419,30 @@ fn dispatch_next(cpu: usize) -> bool {
             SPREAD7_WD_MAX.fetch_max(wait, Ordering::Relaxed);
         }
     }
+    // SPIN-6 (2026-07-30, the P99 conviction): the c3 wedge is a switch-in to a CORRUPTED saved
+    // frame — disp counters freeze, state reads RUNNING, the task's own phase marker never
+    // advances (bs_phase=1 bs_loops=36, deterministic). Validate the saved SP against the task's
+    // OWN stack bounds before restoring it: a frame outside its stack means the parked context was
+    // overwritten (leading suspect: a neighboring kernel-stack overflow). Refuse the switch loudly
+    // — a named refusal beats an anonymous dead core — and drop the task as unrecoverable.
+    {
+        let base = task.stack.as_ptr() as u64;
+        let top = base + task.stack.len() as u64;
+        let sp = task.ctx_sp;
+        if sp < base || sp > top {
+            serial_println!(
+                "[spin6] cpu={} REFUSING corrupt switch-in: task={}:{} ctx_sp={:#x} outside its stack [{:#x},{:#x}) — the parked frame was OVERWRITTEN (neighboring stack overflow?). Task dropped; core keeps dispatching",
+                cpu, task.id, task.name, sp, base, top
+            );
+            if task.user_entry != 0 {
+                // Same phantom-credit reasoning as park_blocked's dead-arm: it is never coming back.
+                el0_resident_leave(cpu);
+                slot_res_leave(cpu, task.user_ttbr0);
+            }
+            drop(task);
+            return true;
+        }
+    }
     task.state.store(STATE_RUNNING, Ordering::Release);
     SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed);
     let raw = Box::into_raw(task);
