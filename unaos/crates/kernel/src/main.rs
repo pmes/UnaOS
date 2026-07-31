@@ -3707,6 +3707,21 @@ fn x86_usb_pump(cpu: usize) {
         // keyboard/trackpad). Same polled-service spot as the xHCI hooks above.
         #[cfg(feature = "ehcihid")]
         unaos_kernel::drivers::ehci::service_ehci_hid();
+        // BATMON-1 — the SMC accumulator, restored to a path a normal GUI boot actually reaches.
+        //
+        // This call existed at main.rs:972, but that site sits inside `#[cfg(feature = "usbdebug")]`
+        // whose loop is TERMINAL (`hlt()`, no break), so on a stock GUI boot it never ran. The only
+        // other site is `pci::init` — one shot at boot, never repeated. The in-kernel vug demo had
+        // the third, and ee6bfd97 deleted it. Net effect on metal: an idle desktop produced ZERO
+        // `:: PWR: ::` lines for its entire uptime, while a boot with a render loop running produced
+        // one every ~10 s. The rollup needs `samples > 0` and nothing was accruing them.
+        //
+        // `refresh_if_due` throttles itself to ~1 s of real SMC port I/O, so calling it from the
+        // device-service pass costs a timestamp compare on the other passes. When the igpu lane's
+        // `ui_tick_service()` lands this moves there; the call belongs on a per-pass service body
+        // either way, and this task is that body.
+        #[cfg(all(target_arch = "x86_64", feature = "smc"))]
+        unaos_kernel::drivers::smc::battery::refresh_if_due();
         // STOR-1 (irqstorage knob): bring up the interrupt-driven storage service task once a block
         // device is present, then run the `bx-blockreq` self-test once. Both one-shot + gated.
         #[cfg(feature = "irqstorage")]

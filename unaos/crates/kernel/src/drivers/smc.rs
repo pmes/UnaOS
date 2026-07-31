@@ -998,14 +998,29 @@ pub mod battery {
                 AcDerived::Unknown => "unknown",
             };
 
-            if pwr.samples == 0 && pwr.unknown > 0 {
-                serial_println!(
-                    ":: PWR: NO-WINDOW (unknown dominated) window_ms={} state={} samples={} unknown={} == {} ::",
-                    window_ms, state_str, pwr.samples, pwr.unknown, reason
-                );
-            } else if dropped_accumulator && pwr.samples == 0 {
+            // ORDERING IS LOAD-BEARING — `(dropped)` MUST be tested first.
+            //
+            // These two arms partition the `samples == 0` space, and they partition it by WHY the
+            // window ended, not by what was in it. Reaching this block at all requires
+            // `samples > 0 || unknown > 0` (every one of the three `flush` conditions above demands
+            // it), so `samples == 0` here implies `unknown > 0` — which means the `(unknown
+            // dominated)` test is true for EVERY sample-less window, including the dropped ones.
+            //
+            // With the tests in the other order, `(dropped)` was unreachable: it required
+            // `samples == 0` AND falling through `samples == 0 && unknown > 0`, i.e. `unknown == 0`,
+            // while `dropped_accumulator` itself demands `samples > 0 || unknown > 0`. Mutually
+            // exclusive. The branch could never print, so a presence drop was reported as ordinary
+            // unknown-domination and the SMC dying mid-window looked like a quiet sensor.
+            //
+            // Nothing is lost by preferring `(dropped)`: `unknown=` is on both lines either way.
+            if dropped_accumulator && pwr.samples == 0 {
                 serial_println!(
                     ":: PWR: NO-WINDOW (dropped) window_ms={} state={} samples={} unknown={} == {} ::",
+                    window_ms, state_str, pwr.samples, pwr.unknown, reason
+                );
+            } else if pwr.samples == 0 && pwr.unknown > 0 {
+                serial_println!(
+                    ":: PWR: NO-WINDOW (unknown dominated) window_ms={} state={} samples={} unknown={} == {} ::",
                     window_ms, state_str, pwr.samples, pwr.unknown, reason
                 );
             } else if pwr.min < 0 && pwr.max > 0 {
