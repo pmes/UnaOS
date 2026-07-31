@@ -3369,3 +3369,87 @@ into the battery; a display that goes black there = the firmware display driver 
 handover HAPPENED and the kick's DEAD read refutes the hypothesis for real. A display that
 survives = the tag was ignored and the hypothesis stands untested. (Attended read — recorded
 at the bench.)
+
+## 47. The reply-less NOTIFY, read by effect (V3D-81)
+
+§46.5 closed the ARM-testable space and left exactly one thread live, and it is a thread about
+METHOD rather than about hardware. On this firmware a NOTIFY-class tag is acted on without a FIFO
+doorbell. `mbox_call` returns only when a doorbell arrives. Every verdict this campaign read
+through it for such a tag was therefore a statement about the doorbell and not about the tag —
+including the two that closed routes: `NOTIFY_DISPLAY_DONE` (P92 at 500 ms, P93 at 5 s, both
+"MAILBOX FAILED") and `SET_ENABLE_QPU` (P86, recorded as "tag unhandled by this firmware"). Neither
+was refuted. Both were mis-read.
+
+V3D-81 sends them properly: post the tag, wait for no reply, settle a stated interval, then read
+the EFFECT.
+
+### 47.1 Why panel survival was never enough
+
+P93's only discriminator was the bench panel: black = the display driver stopped = the handover
+happened = a dead kick refutes the hypothesis; alive = the tag was ignored = the hypothesis stands
+untested. That reading is correct and nearly useless. It is a null result, it needs an attended
+human at the exact moment, and it cannot separate "nothing happened" from "something happened
+somewhere nobody was looking". The instrument must decide **acted vs ignored** by itself, on the
+wire, or a boot spent on it is a boot spent on a coin flip.
+
+Three channels do that, and all three are independent of the doorbell:
+
+1. **The reply buffer.** The VPU writes its response into the request buffer by DMA; the doorbell
+   is a separate mechanism. `overall = 0x8000_0000`, or the tag's own request word carrying bit 31,
+   means the message was parsed and the tag HANDLED — acted, whatever the effect. P92/P93 posted
+   that buffer and abandoned it when the wait timed out; nobody has ever read those words for
+   either tag. (PIUSB-12 named this word as the discriminating one for the doorbell-bearing case;
+   V3D-81 is that reading carried across to the doorbell-less one.)
+2. **The register station**, pre and post, bracketing only the send: core0+0x68 (the wedge
+   signature, §46.3), hub+0x68, both RPIVID ASB bridge words, CT0CS. Any movement = the VPU reacted.
+3. **The firmware's own state**, asked before and after: `GET_CLOCK_RATE`/`GET_CLOCK_STATE` for V3D
+   and `GET_PHYS_WH` for the display. The last is the panel observation made in software — a
+   firmware that stopped its display driver should stop answering (or answer differently) about
+   DISPLAY geometry while still answering about CLOCKS. That asymmetry is the handover, machine-read.
+
+And the control that makes a null reading mean anything: `GET_CLOCK_RATE` after the send, on a tag
+unrelated to either hypothesis. If it answers, the transport and the cache invalidate were both
+alive when the buffer was read, so an untouched buffer is the firmware's silence rather than our
+blindness. If it does not answer, the leg reports INCONCLUSIVE instead of inventing a verdict.
+
+`query_display_size_raw` and `get_clock_rate_raw` exist for the same reason: the ordinary wrappers
+fold "the firmware reports no display mode" and "0 Hz" into `None` alongside a transport failure,
+and those are precisely the answers a stopped driver would give.
+
+### 47.2 Reading key
+
+| Wire reading | Verdict |
+|---|---|
+| `send … doorbells=N>0` | the tag is **not reply-less** at this settle — §46.5's protocol reading does not cover it, `mbox_call` can carry it, and P92/P93's timeouts want re-explaining |
+| `send … REPLY-LESS AND ACTED` (`overall`/`tag_code` stamped) | the message was parsed and the tag HANDLED with no doorbell — the fact P92/P93 could not see |
+| `verdict … kick=1` | **the wall was this tag**: thread 0 starts once it is sent reply-less. Productionize the send in bringup before first submit |
+| `verdict … kick=0 acted-on-buffer=1` or `station-moved=1` | **ACTED, EFFECT ELSEWHERE** — the firmware demonstrably processed it and thread 0 still never starts. A real refutation; the tag comes off the open list |
+| `verdict … kick=0`, everything else 0, `control-alive=1` | **IGNORED** — the reader was alive and the firmware left no trace: the tag does nothing an ARM can see and the hypothesis stays UNTESTED (P93's position, now stated from evidence) |
+| `verdict … control-alive=0` | INCONCLUSIVE — no verdict. On the display leg only, a control that dies is itself candidate evidence the display driver stopped |
+| `display-liveness … display query moved while the clock query still answers` | the firmware DISPLAY driver specifically stopped — the handover happened, no panel needed |
+
+### 47.3 Arming, and the one-send rule
+
+`UNAOS_V3D81_QPU` and `UNAOS_V3D81_DISPLAY` arm the legs separately, because they are independent
+hypotheses and a boot that sends both can attribute a change to neither. Each implies
+`UNAOS_V3D_DEEP` (the legs ride the tail of the deep battery, where every reading they are compared
+against is taken). `UNAOS_V3D81_SETTLE_MS` sets the settle (default 250 ms, capped at 10 s).
+
+Arming a leg **stands down the doorbell-waiting send of the same tag above** — `[v3d75a]` for
+ENABLE_QPU, `[v3d80]` for the handover — and says so on the wire. A tag sent twice makes the
+reply-less rung's pre-station a lie, and it also turns the stood-down rung into something better:
+`[v3d75a]`'s station and kick become the same-boot PRE-SEND control for `[v3d81q]`.
+
+Every `[v3d81]` line states the armed legs, the settle, the tag ids and both stations, so a capture
+is self-describing and datable without the reader knowing how the image was built.
+
+Standing caveats for whoever reads the next boot. The legs run after `[v3d75b]`'s M_CTRL transplant
+and `[v3d77]`'s two pokes, so the fabric they act on carries that residue — both were readback-proven
+not to hold (§46.2), and the pre-station prints the values, but the residue is real and named. And
+if a tag replies LATER than the settle, its doorbell would be consumed by the next ordinary property
+call as if it were that call's own reply: the FIFO is drained and counted before every post and
+before every station query, and a non-zero `stale-pre` on a later leg is the visible tell that it
+happened.
+
+QEMU raspi4b models no V3D, so `[v3d81]` sits behind the hub-identity gate: `kernel8-test` green
+means no regression and nothing more. The verdict is metal-attended.

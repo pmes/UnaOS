@@ -400,6 +400,25 @@ v3d69_reenable = ["v3d_deep"]
 # whether one of OUR extra acts is what wedges thread 0. See docs/dev/OS/08_VIDEO/v3d.md §46.
 v3d79_minimal = ["v3d"]
 
+# PI-V3D-81: the reply-less NOTIFY legs. §46.5 established that this firmware acts on NOTIFY-class
+# tags WITHOUT sending a FIFO reply, which means every "MAILBOX FAILED" the campaign printed for one
+# was a statement about the doorbell and not about the tag: NOTIFY_DISPLAY_DONE (P92/P93) and
+# SET_ENABLE_QPU (P86) were mis-read, not refuted. These legs post the tag, wait for no reply, settle
+# a stated interval, and then read the EFFECT — the reply BUFFER (which the VPU writes by DMA whether
+# or not it rings), the register station, and the firmware's own clock/display state — with
+# GET_CLOCK_RATE as a positive control so that "nothing moved" is a fact about the firmware and not
+# about our reader. `v3d81` is the shared machinery and is never armed on its own; the two legs are
+# separately armable because they are independent hypotheses and a boot that sends both can attribute
+# a change to neither. Arming a leg STANDS DOWN the doorbell-waiting send of the same tag above
+# ([v3d75a] / [v3d80]) so the tag is sent exactly once per boot. Implies `v3d_deep` — the legs ride
+# the tail of the deep battery, where every banked reading they are compared against is taken.
+# Settle interval: `UNAOS_V3D81_SETTLE_MS` (option_env, default 250 ms, capped at 10 s). Enable via
+# `UNAOS_V3D=1 UNAOS_V3D81_QPU=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ the display leg may take the panel
+# to black permanently — that is the hypothesis. See docs/dev/OS/08_VIDEO/v3d.md §47.
+v3d81 = ["v3d_deep"]
+v3d81_qpu = ["v3d81"]
+v3d81_display = ["v3d81"]
+
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
 # the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding

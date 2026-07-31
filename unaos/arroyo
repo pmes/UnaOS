@@ -62,6 +62,12 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # path at all. `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test` reproduces bench geometry, and is the
 # configuration the WC-D `[wc-d] verify` verdict was cleared in. NOTE these change compiled-in behaviour:
 # a build made with them is NOT the flashable default image.
+#
+# PI-V3D-81: UNAOS_V3D81_SETTLE_MS is the same kind of knob — read with `option_env!` by
+# arch/aarch64/v3d.rs, not a cargo feature. It sets how long a reply-less NOTIFY post settles before
+# the effect is read (default 250 ms, capped at 10 s, ignored unless a UNAOS_V3D81_* leg is armed).
+# The value rides on the `[v3d81]` wire lines, so a capture states its own settle rather than
+# requiring the reader to remember the build.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
@@ -1076,6 +1082,27 @@ kernel8() {
     if [ -n "${UNAOS_V3D79_MINIMAL:-}" ]; then
         K8_FEATS="${K8_FEATS},v3d79_minimal,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D79_MINIMAL: genpd-faithful minimal V3D bringup (no mailbox SETs, no reset assert)${COLOR_RESET}"
+    fi
+    # PI-V3D-81: the REPLY-LESS NOTIFY legs. v3d.md §46.5 established that this firmware acts on
+    # NOTIFY-class tags without sending a FIFO reply, so a `mbox_call` timeout on one says nothing
+    # about whether the tag was honoured — NOTIFY_DISPLAY_DONE (P92/P93) and SET_ENABLE_QPU (P86) were
+    # MIS-READ, not refuted. Each leg posts its tag, waits for no reply, settles UNAOS_V3D81_SETTLE_MS,
+    # then reads the EFFECT: the reply buffer the VPU writes by DMA (the channel P92/P93 never read),
+    # the register station either side of the send, and the firmware's own clock/display state, with
+    # GET_CLOCK_RATE as the positive control that makes a null reading interpretable. Separately
+    # armable BECAUSE they are independent hypotheses: a boot that sends both can attribute a change to
+    # neither. Arming a leg stands down the doorbell-waiting send of the same tag ([v3d75a] / [v3d80]),
+    # so the tag is sent exactly once per boot and the pre-station is honest. Each implies
+    # UNAOS_V3D_DEEP (the legs ride the tail of the deep battery, where their comparison readings are
+    # taken). ⚠ UNAOS_V3D81_DISPLAY may take the bench panel to black permanently — by design; serial
+    # carries the whole verdict. See docs/dev/OS/08_VIDEO/v3d.md §47.
+    if [ -n "${UNAOS_V3D81_QPU:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d81_qpu,v3d81,v3d_deep,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D81_QPU: send SET_ENABLE_QPU reply-less and read the effect ([v3d75a]'s send stands down)${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_V3D81_DISPLAY:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d81_display,v3d81,v3d_deep,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D81_DISPLAY: send NOTIFY_DISPLAY_DONE reply-less and read the effect ([v3d80] stands down) — ⚠ the panel may go black and stay black${COLOR_RESET}"
     fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::

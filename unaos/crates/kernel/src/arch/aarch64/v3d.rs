@@ -6797,7 +6797,21 @@ fn empty_frame_bisection() {
     // PI-V3D-80: the display handover rides ABSOLUTELY LAST — NOTIFY_DISPLAY_DONE stops the
     // firmware display driver, so scanout of the firmware framebuffer may die the moment it runs.
     // Every screen-dependent reading this boot owns must already be banked.
+    // PI-V3D-81: unless the reply-less display leg is armed, in which case this rung STANDS DOWN and
+    // [v3d81d] below owns the one send. Sending the tag here first would mean [v3d81d]'s pre-station
+    // reads a firmware that has already been told to hand over, and nothing after it could be
+    // attributed to the reply-less send. Stood down loudly, never silently: the wire says so.
+    #[cfg(not(feature = "v3d81_display"))]
     v3d80_display_done();
+    #[cfg(feature = "v3d81_display")]
+    serial_println!(
+        ":: V3D: [v3d80] STOOD DOWN — UNAOS_V3D81_DISPLAY is armed, so NOTIFY_DISPLAY_DONE is sent EXACTLY ONCE this boot, reply-less, in [v3d81d]. Nothing was sent here and no [v3d80] verdict is implied ::"
+    );
+    // PI-V3D-81: the reply-less legs ride after [v3d80] — dead last in the file. Their display leg
+    // can stop the firmware display driver, and their whole point is to be read against the
+    // doorbell-waiting sends above, so every one of those must already have printed.
+    #[cfg(feature = "v3d81")]
+    v3d81_replyless_notify();
 }
 
 /// PI-V3D-80 — the display handover. P90/P91 closed the ARM-side space: identical firmware
@@ -6807,6 +6821,11 @@ fn empty_frame_bisection() {
 /// and the ARM owns the display/GPU complex. Hypothesis: the VPU withholds V3D thread-start until
 /// that claim. The rung sends it, re-reads the [v3d77] status words (a change there = the VPU
 /// reacted), and runs the [v3d75] kick probe. ⚠ Panel may go black from this rung on — by design.
+///
+/// PI-V3D-81: not compiled when the reply-less display leg is armed. The tag must be sent at most
+/// once per boot or no reading can be attributed to a send, and when [v3d81d] is present it owns
+/// the send. Cfg'd out rather than skipped at runtime so the two can never both fire.
+#[cfg(not(feature = "v3d81_display"))]
 fn v3d80_display_done() {
     match probe_hub_ident0() {
         V3dPresence::Up(_) => {}
@@ -6839,6 +6858,277 @@ fn v3d80_display_done() {
         ok as u32,
         if ok { "THE WALL WAS THE HANDOVER: thread 0 starts once the ARM claims the display/GPU complex (NOTIFY_DISPLAY_DONE). Productionize: send it in bringup before first submit, and take over scanout ourselves" }
         else { "handover did not free thread 0 — the last documented mailbox act is exonerated; the ARM-testable universe is CLOSED (v3d.md §46.5) and what remains is VPU-internal state requiring firmware-side instrumentation" }
+    );
+}
+
+/// PI-V3D-81 — the settle interval a reply-less post waits before it reads the effect, in ms.
+/// `UNAOS_V3D81_SETTLE_MS`, decimal; absent/zero/garbage => 250 ms, capped at 10 s so a typo cannot
+/// turn the anti-hang rule off. It is a knob because the right value is unknown: it must be long
+/// enough for a firmware that stops its whole display driver to finish doing so, and short enough
+/// that a boot is still a boot. Whatever it is, the wire states it — an instrument that needs the
+/// reader to remember the build is not an instrument.
+#[cfg(feature = "v3d81")]
+const V3D81_SETTLE_MS: u64 = v3d81_settle_ms();
+
+#[cfg(feature = "v3d81")]
+const fn v3d81_settle_ms() -> u64 {
+    let b = match option_env!("UNAOS_V3D81_SETTLE_MS") {
+        Some(s) => s.as_bytes(),
+        None => return 250,
+    };
+    let mut v: u64 = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] < b'0' || b[i] > b'9' {
+            return 250;
+        }
+        v = v * 10 + (b[i] - b'0') as u64;
+        i += 1;
+    }
+    if v == 0 {
+        250
+    } else if v > 10_000 {
+        10_000
+    } else {
+        v
+    }
+}
+
+/// PI-V3D-81 — one reading of everything a reply-less send could plausibly move, taken as a unit so
+/// a before/after pair is comparable field by field. Registers first and firmware second, because
+/// the register reads are free and must not be taken on the far side of a property call that might
+/// itself perturb something.
+#[cfg(feature = "v3d81")]
+#[derive(Clone, Copy)]
+struct V3d81Station {
+    /// core0+0x68 — the wedge's visible SIGNATURE (§46.3): 0x10001 on every wedged boot, 0x3 on a
+    /// piOS part whose thread 0 fetches. Read-only (P88), which is exactly why it is a good witness.
+    c68: u32,
+    /// hub+0x68 — its unnamed companion, same provenance, same read-only verdict.
+    h68: u32,
+    m_ctrl: u32,
+    s_ctrl: u32,
+    /// CT0CS — 0x70 wedged vs 0x20 while genuinely fetching. Between a pre- and a post-station only
+    /// the send happens, so movement here is signal and not job residue.
+    ct0cs: u32,
+    /// `GET_CLOCK_RATE(V3D)`, raw. Doubles as the POSITIVE CONTROL: an answer here proves the
+    /// mailbox transport and our cache invalidate are both alive at this instant, which is what
+    /// makes an untouched reply buffer a fact about the firmware instead of a fact about us.
+    fw_rate: Option<u32>,
+    /// `GET_CLOCK_STATE(V3D)` — bit0 active, bit1 not-present. An ENABLE_QPU that actually ran the
+    /// firmware's V3D init has a plausible reason to move this even if no register does.
+    fw_gate: Option<u32>,
+    /// `GET_PHYS_WH`, raw (0x0 preserved, not folded into a failure). The display-driver liveness
+    /// read: the machine-readable stand-in for P93's attended panel.
+    fw_wh: Option<(u32, u32)>,
+}
+
+#[cfg(feature = "v3d81")]
+fn v3d81_station() -> V3d81Station {
+    let c68 = mmio_read(V3D_HUB_BASE, 0x4068);
+    let h68 = mmio_read(V3D_HUB_BASE, 0x0068);
+    let m_ctrl = mmio_read(RPIVID_ASB_BASE, ASB_V3D_M_CTRL);
+    let s_ctrl = mmio_read(RPIVID_ASB_BASE, ASB_V3D_S_CTRL);
+    let ct0cs = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+    // A late doorbell from the reply-less post would be consumed by the first query below as if it
+    // were that query's own reply — over a buffer the query has already overwritten. Drain first.
+    mailbox::drain_property_fifo();
+    let fw_rate = mailbox::get_clock_rate_raw(mailbox::CLOCK_ID_V3D);
+    let fw_gate = mailbox::get_clock_state(mailbox::CLOCK_ID_V3D);
+    let fw_wh = mailbox::query_display_size_raw();
+    V3d81Station { c68, h68, m_ctrl, s_ctrl, ct0cs, fw_rate, fw_gate, fw_wh }
+}
+
+#[cfg(feature = "v3d81")]
+fn v3d81_print_station(tag: &str, when: &str, st: &V3d81Station) {
+    serial_println!(
+        ":: V3D: [{}] station {} — core+0x68={:#010x} (wedged ref 0x00010001, fetching ref 0x00000003) hub+0x68={:#010x} RPIVID M_CTRL={:#010x} S_CTRL={:#010x} CT0CS={:#010x} | firmware: V3D rate={:?} gate={:?} display_wh={:?} ::",
+        tag, when, st.c68, st.h68, st.m_ctrl, st.s_ctrl, st.ct0cs, st.fw_rate, st.fw_gate, st.fw_wh
+    );
+}
+
+/// Did anything the ARM can see move across the send? Every field participates: the point is not
+/// which one moved but whether the VPU reacted AT ALL, because a single moved field converts a dead
+/// kick from "no information" into "acted, and the effect is elsewhere".
+#[cfg(feature = "v3d81")]
+fn v3d81_moved(pre: &V3d81Station, post: &V3d81Station) -> bool {
+    pre.c68 != post.c68
+        || pre.h68 != post.h68
+        || pre.m_ctrl != post.m_ctrl
+        || pre.s_ctrl != post.s_ctrl
+        || pre.ct0cs != post.ct0cs
+        || pre.fw_rate != post.fw_rate
+        || pre.fw_gate != post.fw_gate
+        || pre.fw_wh != post.fw_wh
+}
+
+/// PI-V3D-81 — one reply-less leg: station, send, settle, station, kick, verdict. `display_leg`
+/// adds the display-driver liveness reading, which only means something for the handover tag.
+#[cfg(feature = "v3d81")]
+fn v3d81_leg(
+    tag: &str,
+    tag_id: u32,
+    name: &str,
+    kick_label: &str,
+    display_leg: bool,
+    send: fn(u64) -> mailbox::NoReplySend,
+) {
+    let pre = v3d81_station();
+    v3d81_print_station(tag, "PRE-send", &pre);
+    serial_println!(
+        ":: V3D: [{}] sending {} ({:#010x}) REPLY-LESS — post the tag, wait for NO doorbell, settle {} ms, then read the EFFECT. Reply-lessness is itself the claim under test (v3d.md §46.5): a doorbell arriving inside the settle refutes it for this tag ::",
+        tag, name, tag_id, V3D81_SETTLE_MS
+    );
+    let r = send(V3D81_SETTLE_MS);
+    serial_println!(
+        ":: V3D: [{}] send — posted={} settle={}us (asked {}ms) | doorbells={} first={}us other-ch={} stale-pre={} | buffer@{:#x}: overall={:#010x} tag_code={:#010x} word5={:#010x} -> {} ::",
+        tag, r.posted as u32, r.settle_us, V3D81_SETTLE_MS, r.doorbells, r.first_doorbell_us,
+        r.other_ch, r.stale_pre, r.buf_pa, r.overall, r.tag_code, r.word5,
+        if !r.posted {
+            "NOT SENT — the write FIFO never accepted the message. Nothing below carries any reading"
+        } else if r.doorbells > 0 {
+            "A REPLY CAME — this tag is NOT reply-less at this settle. §46.5's protocol reading does not cover it, the ordinary mbox_call path can carry it, and P92/P93's timeouts want re-explaining"
+        } else if r.buffer_written() {
+            "REPLY-LESS AND ACTED — no doorbell, yet the VPU stamped its response into our buffer: the message was parsed and THE TAG WAS HANDLED. This is the fact P92/P93 could not see"
+        } else {
+            "no doorbell and an untouched buffer — the tag left no trace in the protocol itself; the station diff and the control below are what decide ignored-vs-acted-elsewhere"
+        }
+    );
+    let post = v3d81_station();
+    v3d81_print_station(tag, "POST-send", &post);
+    let moved = v3d81_moved(&pre, &post);
+    // The control. `fw_rate` answering AFTER the send proves the transport and the invalidate were
+    // both working when we read the buffer — without it, "the buffer was untouched" is a statement
+    // about our reader, not about the firmware, and the whole leg is uninterpretable.
+    let control = post.fw_rate.is_some();
+    if display_leg {
+        serial_println!(
+            ":: V3D: [{}] display-liveness — GET_PHYS_WH pre={:?} post={:?} | GET_CLOCK_RATE(V3D) pre={:?} post={:?} — {} ::",
+            tag, pre.fw_wh, post.fw_wh, pre.fw_rate, post.fw_rate,
+            if post.fw_wh != pre.fw_wh && control {
+                "THE FIRMWARE DISPLAY DRIVER STOPPED — the display query moved while an unrelated clock query still answers, so this is the display side specifically. The handover HAPPENED, read on the wire, with no panel and no attended observer"
+            } else if control {
+                "the firmware still reports the same display mode with the mailbox alive — its display driver did NOT stop. Combined with an untouched buffer this is the IGNORED reading P93 could only infer from panel survival"
+            } else {
+                "both queries degraded — a stopped display driver and a stopped mailbox are not separable from here. The register channel above still stands; the panel (attended) breaks this particular tie"
+            }
+        );
+    }
+    let kick = v3d75_kick_probe(kick_label);
+    serial_println!(
+        ":: V3D: [{}] verdict — kick={} acted-on-buffer={} doorbell={} station-moved={} control-alive={} — {} ::",
+        tag, kick as u32, r.buffer_written() as u32, (r.doorbells > 0) as u32, moved as u32,
+        control as u32,
+        if !r.posted {
+            "NO SEND — instrument failure, no verdict. Fix before citing"
+        } else if kick {
+            "THE WALL WAS THIS TAG — thread 0 starts once it is sent reply-less. Productionize the send in bringup before first submit (and take over whatever the firmware just stopped owning)"
+        } else if r.buffer_written() || moved {
+            "ACTED, EFFECT ELSEWHERE — the firmware demonstrably processed the tag and thread 0 STILL never starts. This is a REFUTATION of the hypothesis, not a null: bank it and take the tag off the open list"
+        } else if control {
+            "IGNORED — the control answers, so the reader was alive and the firmware left no trace in any channel: on this firmware the tag does nothing an ARM can see, and the hypothesis stays UNTESTED rather than refuted (exactly P93's position, now stated from evidence instead of from panel survival)"
+        } else {
+            "INCONCLUSIVE — the control did not answer, so an untouched buffer cannot be attributed to the firmware. Re-run. If the control fails ONLY on the display leg, that failure is itself evidence the display driver stopped"
+        }
+    );
+}
+
+/// PI-V3D-81 — the reply-less NOTIFY battery: the one open thread in a closed campaign.
+///
+/// §46.5's discovery is a protocol fact with a methodological consequence. On this firmware a
+/// NOTIFY-class tag is acted on WITHOUT a FIFO doorbell, so `mbox_call` — which returns only when a
+/// doorbell arrives — reports failure for a tag the VPU may have honoured perfectly. Two hypotheses
+/// were therefore never tested, only mis-read: [v3d80]'s `NOTIFY_DISPLAY_DONE` (P92 at 500 ms, P93
+/// at 5 s, both "MAILBOX FAILED") and [v3d75a]'s `SET_ENABLE_QPU` (P86, recorded as "tag unhandled
+/// by this firmware"). Each is sent here without waiting for a reply, and read by its EFFECT.
+///
+/// ### The discrimination this rung exists to make
+/// P93's lesson is that the panel SURVIVING proved only that the tag was ignored — a null result,
+/// requiring an attended human, and unable to tell "nothing happened" from "something happened
+/// somewhere I am not looking". Three channels replace it, all machine-readable on the wire:
+///
+///   1. **The reply buffer.** The VPU writes its response into our request buffer by DMA; the
+///      doorbell is a separate mechanism. `overall = 0x8000_0000`, or `tag_code` bit 31 set, means
+///      the message was parsed and THE TAG WAS HANDLED — acted, independent of any effect. Nobody
+///      read those words in P92/P93: the buffer was posted and abandoned when the wait timed out.
+///   2. **The registers.** core+0x68 (the wedge signature), hub+0x68, both RPIVID ASB bridge words,
+///      CT0CS — pre and post, bracketing only the send. Any movement = the VPU reacted.
+///   3. **The firmware's own state.** V3D clock rate and gate, and the display mode, asked before
+///      and after. For the handover tag the last of these is the point: a firmware that stopped its
+///      display driver should stop answering (or answer differently) about DISPLAY geometry while
+///      still answering about CLOCKS. That asymmetry is the panel observation, made in software.
+///
+/// And the control that makes a null reading mean anything: `GET_CLOCK_RATE` after the send, on a
+/// tag with nothing to do with either hypothesis. If it answers, the transport and our cache
+/// invalidate were both alive when we read the buffer, so an untouched buffer is the FIRMWARE's
+/// silence. If it does not, the leg is INCONCLUSIVE and says so rather than inventing a verdict.
+///
+/// ### Ignored vs acted-with-the-effect-elsewhere, stated plainly
+/// IGNORED = no doorbell AND an untouched buffer AND no station movement, WITH the control
+/// answering. ACTED = any one of those channels moves. The kick decides only the hypothesis itself;
+/// the other three decide whether a dead kick is a REFUTATION (acted, thread 0 still dead — the tag
+/// comes off the list) or merely another NULL (ignored — the tag remains untested and the next
+/// instrument must reach the firmware some other way). That distinction is the whole arc.
+///
+/// Each leg is separately armable (`UNAOS_V3D81_QPU`, `UNAOS_V3D81_DISPLAY`) because the two are
+/// independent hypotheses, and a boot that sends both cannot attribute a change to either. The
+/// armed set, the settle, and the tag ids all ride on the wire, so a capture is datable and
+/// self-describing without the reader knowing how it was built. When a leg is armed, the
+/// doorbell-waiting send of the same tag above ([v3d75a], [v3d80]) stands down — one send per tag
+/// per boot, or the pre-station is a lie.
+///
+/// ⚠ The display leg may take the panel to black permanently. That is the hypothesis, not a fault.
+#[cfg(feature = "v3d81")]
+fn v3d81_replyless_notify() {
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down | V3dPresence::Poison(_) => {
+            serial_println!(
+                ":: V3D: [v3d81] SKIPPED — hub absent/poison (QEMU raspi4b or block-down). Nothing was sent and NO verdict is implied ::"
+            );
+            return;
+        }
+    }
+    serial_println!(
+        ":: V3D: [v3d81] reply-less NOTIFY battery — ARMED LEGS qpu={} display={} | settle={}ms | tags SET_ENABLE_QPU=0x00030012 NOTIFY_DISPLAY_DONE=0x00030066 | each armed leg is the ONLY send of its tag on this boot (the doorbell-waiting rung above stands down); each leg reads the reply BUFFER, the register station and the firmware's own state, with GET_CLOCK_RATE as the positive control ::",
+        cfg!(feature = "v3d81_qpu") as u32,
+        cfg!(feature = "v3d81_display") as u32,
+        V3D81_SETTLE_MS
+    );
+
+    // Leg Q first: it cannot take the panel away, so its readings are taken while the display is
+    // still whatever the firmware made it. Leg D can end the boot's video and therefore rides last.
+    #[cfg(feature = "v3d81_qpu")]
+    v3d81_leg(
+        "v3d81q",
+        0x0003_0012,
+        "SET_ENABLE_QPU(1)",
+        "v3d81q post-enable-qpu",
+        false,
+        |ms| mailbox::enable_qpu_noreply(1, ms),
+    );
+    #[cfg(not(feature = "v3d81_qpu"))]
+    serial_println!(
+        ":: V3D: [v3d81q] NOT ARMED — no reply-less SET_ENABLE_QPU on this boot. [v3d75a] above sent it the doorbell-waiting way and its reading (whatever it says) stands unchanged ::"
+    );
+
+    #[cfg(feature = "v3d81_display")]
+    {
+        serial_println!(
+            ":: V3D: [v3d81d] ⚠ the next send may stop the firmware display driver — the panel may go BLACK from here and not come back. Serial is unaffected and carries the whole verdict; every screen-dependent reading this boot owns is already banked above ::"
+        );
+        v3d81_leg(
+            "v3d81d",
+            0x0003_0066,
+            "NOTIFY_DISPLAY_DONE",
+            "v3d81d post-handover",
+            true,
+            mailbox::notify_display_done_noreply,
+        );
+    }
+    #[cfg(not(feature = "v3d81_display"))]
+    serial_println!(
+        ":: V3D: [v3d81d] NOT ARMED — no reply-less NOTIFY_DISPLAY_DONE on this boot. [v3d80] above sent it the doorbell-waiting way, which is the send P92/P93 proved cannot see its own effect ::"
     );
 }
 
@@ -9801,18 +10091,37 @@ fn v3d75_fabric_condition() {
     );
 
     // ── Experiment A: the firmware's own V3D init path. ──
+    // PI-V3D-81: when the reply-less QPU leg is armed this send stands down and [v3d81q] owns the
+    // one send of the tag — otherwise [v3d81q]'s pre-station would be reading a firmware that had
+    // already been asked once, and its post-send diff would attribute this rung's effect to itself.
+    // The rest of the rung still runs, which turns it into something it could not be before: the
+    // same-boot PRE-SEND control for [v3d81q], taken at this exact position in the battery.
+    #[cfg(not(feature = "v3d81_qpu"))]
     match mailbox::set_enable_qpu(1) {
         Some(r) => serial_println!(":: V3D: [v3d75a] SET_ENABLE_QPU(1) — mailbox OK reply={:#010x} ::", r),
         None => serial_println!(":: V3D: [v3d75a] SET_ENABLE_QPU(1) — MAILBOX FAILED (tag unhandled or call error) ::"),
     }
+    #[cfg(feature = "v3d81_qpu")]
+    serial_println!(
+        ":: V3D: [v3d75a] SEND STOOD DOWN — UNAOS_V3D81_QPU is armed, so SET_ENABLE_QPU is sent EXACTLY ONCE this boot, reply-less, in [v3d81q]. The station and kick below are this boot's PRE-SEND control ::"
+    );
     let m_a = mmio_read(RPIVID_ASB_BASE, ASB_V3D_M_CTRL);
+    #[cfg(not(feature = "v3d81_qpu"))]
     serial_println!(
         ":: V3D: [v3d75a] M_CTRL after ENABLE_QPU: {:#010x} (was {:#010x}, piOS ref 0x00004040) — {} ::",
         m_a, m0,
         if m_a != m0 { "THE FIRMWARE PATH TOUCHED THE BRIDGE — the missing init is mailbox-reachable" }
         else { "unchanged — ENABLE_QPU alone does not program this bridge on this firmware" }
     );
+    #[cfg(feature = "v3d81_qpu")]
+    serial_println!(
+        ":: V3D: [v3d75a] M_CTRL pre-send control: {:#010x} (station {:#010x}, piOS ref 0x00004040) — no tag was sent, so equality here is the expected null and the value [v3d81q]'s post-send read is compared against ::",
+        m_a, m0
+    );
+    #[cfg(not(feature = "v3d81_qpu"))]
     let a = v3d75_kick_probe("v3d75a post-enable-qpu");
+    #[cfg(feature = "v3d81_qpu")]
+    let a = v3d75_kick_probe("v3d75a pre-send-control");
 
     // ── Experiment B: transplant the working value verbatim (skipped if A already retires). ──
     if !a {
