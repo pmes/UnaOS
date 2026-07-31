@@ -337,6 +337,18 @@ FORBID \[wc-d\] verify .*-> FAIL
 REQUIRE \[wc-fv\] focus-vis .*-> PASS
 FORBID \[wc-fv\] focus-vis .*-> FAIL
 
+# --- 4c. WEDGE-1r2: the drain barrier's DWELL ledger must reach the wire. WEDGE-1's `DRAIN STALLED`
+# ---    tripwire measures only past ~10^8 spins and speaks through a blocking serial lock, so its
+# ---    silence carried no information — and §WEDGE-2 banked it as "the drain barrier is exonerated"
+# ---    across three silicon lockups. `[wedge1] dwell` is the reading below that threshold. It is
+# ---    REQUIREd for the reason the arc exists: an instrument that can vanish without the gate
+# ---    noticing is an instrument whose next silence gets misread the same way.
+# ---    `-> QUIET` specifically (drains ran, none of them dwelt) is the healthy gate answer; `NONE`
+# ---    would mean no teardown ran at all and the line measured nothing. DWELL/INFLIGHT are NOT
+# ---    forbidden: under a loaded CI host a slow QEMU blit is a plausible honest reading, and a flaky
+# ---    FORBID is worth less than an honest number on the wire.
+REQUIRE \[wedge1\] dwell drains=.*-> QUIET
+
 # --- BGRUN-1: background EL0 runs (bg/jobs/kill). Headless-observable core of the contract,
 # ---   REQUIREd per the round-1 lens: leg 1 proves spawn->exit->reap (the sole-reaper contract);
 # ---   leg 2 proves a killed bg row settles (confirmed-kill reaps in place; no leaked PRUNNING row

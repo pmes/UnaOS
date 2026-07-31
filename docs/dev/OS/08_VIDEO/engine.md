@@ -1773,13 +1773,40 @@ cannot collide with WC-F's reserved probe boxes at the bottom edge, and run from
 
 ```
 [wc-fv] focus raise asid=0xf0a windows=1 top_win=1 z=7 shell_z=0
-[wc-fv] focus shell z=8 hidden=2
+[wc-fv] focus shell z=8 hidden=2 exempt=0
 [wc-fv] focus raise asid=0xf0b windows=1 top_win=2 z=9 shell_z=8
 [wc-fv] focus-vis at (641,314) a=0xff2020 b=0x20ff20 stack=0x20ff20/true raise=0xff2020/true shell=0x2d2b55/true reraise=0x20ff20/true -> PASS
 ```
 
 The `shell` leg reads `0x2d2b55` — `DESKTOP_BG` exactly — which is the erase landing, i.e. the window
 layer genuinely stopped owning those pixels rather than merely being reordered among itself.
+
+##### FV-EXEMPT — `hidden=` has been counting rows that were never hidden
+
+The shell arm collects its erase set with `r.z < z`. That is **not** the hiding predicate:
+`above_shell` is what decides whether a row stops compositing, and it **exempts compat rows** on
+purpose — a compat row is the full-screen present path, carries owner ASID 0, is not a focus target,
+and could never be raised back over a shell that overtook it, so hiding it would strand a full-screen
+app's output for the rest of the boot. Its `z` still falls below the shell, so it is collected,
+erased to `DESKTOP_BG`, and then repainted by the `composite` at the end of the same call — having
+never been hidden at all.
+
+Reachable, and on the desktop path: a **background** full-screen app (`bg` — the BGRUN-1 case) is on
+the panel while the operator TABs to the shell. The visible cost is a whole-box desktop fill followed
+by an immediate repaint of the same pixels; the durable one is that `erase` may **defer** that fill
+under `STAGE` contention (WC-L), in which case the drain paints `DESKTOP_BG` over the live app one
+pass *after* the repaint has already put it back.
+
+`exempt=` is that contradiction on the wire — the part of `hidden=` that was erased-and-repainted
+rather than hidden. It is derived from `above_shell` rather than from `r.compat`, so a future
+exemption added there is carried automatically. `hidden=N exempt=0` is the reading the field always
+implied.
+
+**Counted, not changed.** Narrowing the erase set to `!above_shell(r, z)` is a one-token edit and is
+deliberately not taken: what a bg full-screen app's pixels should do across a shell TAB is a panel
+question, the headless gate has no HID to TAB with, and it interacts with BGRUN-1's two-writer
+shimmer. The gate reads `exempt=0` (no compat row is live when the fixtures TAB), which is the honest
+headless outcome and not evidence either way — the bench sitting is where this reads non-zero.
 
 #### FOCUS-VIS gate results (2026-07-25, QEMU raspi4b @ `UNAOS_FBW=1920 UNAOS_FBH=1200`)
 
@@ -4171,6 +4198,110 @@ and an intact serial fallback. It does not exercise either change.
   survives an IRQ-masked spin (the tripwire only fires from inside one specific loop) before it
   theorises further.
 
+> **Superseded by §WEDGE-1r2.** The third bullet's "no tripwire line ⇒ this instrument is not at the
+> site" is not a sound inference, and §WEDGE-2 below turned it into a settled premise. Read
+> §WEDGE-1r2 before drawing anything from a quiet `[wedge1]`.
+
+### WEDGE-1r2 — the drain tripwire's silence was not evidence
+
+**This is a finding about an INSTRUMENT, not about a mechanism. No behaviour changes, no fix, no new
+lock; the spin is byte-for-byte what WEDGE-1 left.**
+
+§WEDGE-2 opens by treating one inference as settled: *"The drain barrier is exonerated. WEDGE-1's
+`[wedge1] DRAIN STALLED` tripwire fires from inside the drain-barrier spin, and it stayed silent all
+three times."* Reading a silence as a refutation is only sound where the instrument could have spoken
+in the states it is being cleared of. This one could not, in two of them:
+
+1. **It speaks through `serial_println!`, which takes a blocking lock.** WEDGE-1's own note concedes
+   this ("if the wedge is IN the serial path the tripwire blocks") and answers it with "strictly no
+   worse" — a claim about the *machine*, true, that was then used as a claim about the *evidence*,
+   where it is false. s44's capture stopped **mid-word**, i.e. a core died holding the UART. On that
+   shape the tripwire's silence is structurally guaranteed and carries no information at all. A
+   blocked print does not merely fail to report the stall; it erases the fact that the threshold was
+   ever crossed.
+2. **It exists only INSIDE the spin.** Every teardown reaches the barrier through its own `TABLE`
+   critical section — `close`/`close_owner` clear rows under the lock, `move_to` rewrites geometry
+   under it — and a core that dies waiting on `TABLE` there never reaches `drain()`. The teardown
+   path can therefore *be* the wedge site with the tripwire silent by construction, because the
+   instrument sits one lock downstream of the death. `close_owner` is the sharp case: it is reached
+   from `sched::exit` → `clear_handle_row`, which has already masked interrupts.
+
+Neither is answered by moving the threshold. Both are answered by a voice that acquires nothing, and
+the tree already has one — WEDGE-2's `wedge2_raw_byte`.
+
+#### The teardown tokens (knob-gated with the rest of WEDGE-2)
+
+| Token | Emitted at | Read as |
+| --- | --- | --- |
+| `<D1>` / `<d1>` | teardown entry, **before** the `TABLE`/`WRITER` section (`close`, `close_owner`, `move_to`) | uppercase = the core owning the open focus chain, lowercase = a teardown on some OTHER core while that chain is open. `<D1>` with no `<D2>` puts the death upstream of the barrier — blindness 2 |
+| `<D2>` | that section is behind us; the barrier is going up and this core is about to spin | `<D2>` with no `<D3>` puts the death in the spin |
+| `<D3>` | the spin returned; the barrier is held | pairs with `<D2>` |
+| `<D!>` | the stall tripwire fired, **before** its `serial_println!` | `<D!>` with no `DRAIN STALLED` line after it is blindness 1 caught in the act |
+
+`<D1>` is chain-gated (`wedge2::mark_composite`) and the budget is measured, not preferred: the first
+cut emitted it unconditionally and the wedge2 gate run priced it at **96 tokens against the focus
+chain's 17**, because `close_owner` runs on every EL0 task exit and 65 of those 96 found no window
+and raised no barrier. One interleaved into another core's line mid-word
+(`:<D1: B>GRUN-ST: slot reclaim PASS`) and took a required witness off the wire — 87/88. The gate is
+also the right aim: all four recorded lockups happened during TAB cycling with a focus change in
+flight, which is exactly `CHAIN_CORE != 0`.
+
+#### `[wedge1] dwell` — the range the tripwire deliberately declined to measure
+
+`DRAIN_STALL_SPINS` sits past ~10⁸ spin hints on purpose (a threshold a merely slow drain could reach
+would put a serial write on a hot IRQ-masked path). The consequence was left standing: the wire had
+exactly two readings, *nothing* and *wedged*, with the whole interesting range between them
+unmeasured. A counter costs no print, so it can measure it.
+
+```
+[wedge1] dwell drains=N spun=M spin_max=K note=65536 in_spin=J tripwire=silent|fired span=Tms -> VERDICT
+```
+
+* `NONE` — no drain ran in this window. **Nothing was measured; nothing may be concluded.**
+* `QUIET` — drains ran and none spun past `note`. The only verdict here that is a statement about the
+  barrier rather than about the scene.
+* `DWELL` — a drain spun far enough to be a stalled core, four orders of magnitude under the
+  tripwire. IRQ-masked time on a teardown's core.
+* `INFLIGHT` — a drain was inside the spin when *another* core took the line. One sample at operator
+  teardown rates against a 5 s window is a coincidence; the same reading twice is a core that is not
+  coming out.
+
+`spin_max` is published **from inside the spin**, not after it. A ledger written after the loop
+reports only drains that finished, so the one that never does contributes nothing and the rollup
+reads clean over a held core — WEDGE-4's W4-A defect, refused here for the same reason. `in_spin` is
+a gauge (loaded, never drained) and stays raised for as long as that core is in there. The line is
+emitted **ahead of** `wcn_emit`'s dirty-paced guard, because a wedged teardown is not presenting and
+gating it on present traffic would silence it under exactly the condition it reports on.
+
+#### WEDGE-1r2 gate results (2026-07-30, QEMU raspi4b)
+
+`./arroyo check` green both arches, feature-off and with `witness,wedge2` armed; `kernel8` builds;
+`kernel8-test 150` **MBENCH PASS 88/88, 0 forbidden**, and again **88/88 with `UNAOS_WEDGE2=1`**.
+Wire: `[wedge1] dwell drains=21 spun=0 spin_max=0 ... -> QUIET` — the barrier ran 21 times in a
+3-second window and never once had to wait for anybody, which was previously unmeasured in both
+directions.
+
+**What QEMU did not prove.** `<D1>`/`<d1>` do not appear at all, and that zero is a SCENE fact rather
+than a wiring one: the chain is open only for the body of `focus_changed`, and nothing in the fixture
+battery tears a window down from inside it (`clickplain_leg` closes before its `focus_changed(0)`;
+`closebox_leg`'s router close runs after `chain_exit`). The scene the token is aimed at — one core in
+a TAB while a vug exits on another — is the bench's, and is P66's. **`<D1>` absent on QEMU must not be
+read as the mechanism being quiet.** What the gate does prove is the `<D2>`/`<D3>` pairing (31 pairs)
+and the dwell line's wiring. One `<D2>` reads as `<activD2>` on the wire — another core's line
+interleaved with the token's bytes, WEDGE-2's stated and accepted cost for taking no lock.
+
+#### Metal watch-list (WEDGE-1r2)
+
+* `-> DWELL` or a repeated `-> INFLIGHT` locates a real stall well below the tripwire, and is the
+  first reading this instrument has ever been able to produce.
+* `<D!>` with no `[wedge1] DRAIN STALLED` line after it: the stall is real **and** the serial path is
+  where the core went to die. That combination is the one WEDGE-1 could not distinguish from health.
+* `<D1>`/`<d1>` as the LAST thing on a torn wire: the death is in the teardown's own `TABLE`/`WRITER`
+  section, upstream of the barrier — the region WEDGE-1 never covered, and the reason its silence
+  could not exonerate the teardown path.
+* A quiet `[wedge1]` still means **nothing about the barrier** unless `drains > 0`. That is the whole
+  point of the verdict naming the scene.
+
 ### WEDGE-2 — breadcrumbs, so the next wedge names its dying step
 
 WEDGE-1 ended with a request written into its own watch-list: *get a per-core heartbeat that survives
@@ -4191,9 +4322,16 @@ Four lockups, three of them silicon, all under a six-vug storm during TAB cyclin
 
 Two facts fall straight out of that table and are treated as settled here rather than re-litigated:
 
-* **The drain barrier is exonerated.** WEDGE-1's `[wedge1] DRAIN STALLED` tripwire fires from inside
+* ~~**The drain barrier is exonerated.** WEDGE-1's `[wedge1] DRAIN STALLED` tripwire fires from inside
   the drain-barrier spin, and it stayed silent all three times. Whatever stops the machine, it is not
-  that loop.
+  that loop.~~ **RETRACTED by §WEDGE-1r2.** The tripwire speaks through a blocking serial lock — and
+  s44 stopped mid-word, i.e. a core died holding the UART, the one shape on which its silence is
+  structurally guaranteed — and it exists only *inside* the spin, so a teardown that dies on the
+  `TABLE` acquisition upstream of `drain()` never reaches it. Its silence was therefore compatible
+  with the drain path being the site, and this bullet should never have been settled from it.
+  WEDGE-2's own reasoning below is unaffected (the breadcrumbs are worth having on their own terms),
+  but the drain barrier is **not** ruled out and the `<D1>`/`<D2>`/`<D3>`/`<D!>` tokens exist to
+  settle it properly on the next bench wedge.
 * **The mechanism is ARCH-NEUTRAL.** s44 reproduces the identical death shape on x86, so it lives in
   the shared wm/compositor/input-routing/sched interplay, not in anything BCM2711-specific.
 

@@ -700,6 +700,13 @@ pub fn present(id: WinId) -> bool {
 /// Returns `false` if `id` names no live window, or if the framebuffer is not ready (nothing sane to
 /// clamp against).
 pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
+    // WEDGE-1r2 `<D1>`/`<d1>` — a barrier-raising path begins, BEFORE the `WRITER`/`TABLE`
+    // acquisitions that stand between here and `DrainBarrier::drain`. See the ledger block above
+    // `DrainBarrier`: this is the region WEDGE-1's in-spin tripwire cannot report on, because a core
+    // that dies waiting on `TABLE` here never reaches the spin the tripwire lives in. Chain-gated
+    // (`mark_composite`) so it costs nothing outside a focus change — the shape every recorded wedge
+    // has — and so its rate cannot bury the chain it is joining.
+    crate::wedge2::mark_composite("<D1>", "<d1>");
     let fb = *super::WRITER.lock();
     // Guard intentionally dropped before the table lock: `place`/`composite` never hold the table
     // lock while touching `WRITER`, so keeping WRITER-then-TABLE strictly non-overlapping here is
@@ -776,6 +783,9 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
 /// Close `id`, freeing its table row. The surface itself belongs to the owner's address space and is
 /// not touched here — WC-B unmaps it. Returns `false` if `id` names no live window.
 pub fn close(id: WinId) -> bool {
+    // WEDGE-1r2 `<D1>`/`<d1>` — see `move_to`. `close` reaches its barrier through a `TABLE` critical
+    // section, so the token has to precede the lock to cover the death that happens ON it.
+    crate::wedge2::mark_composite("<D1>", "<d1>");
     let vacated = {
         let mut t = TABLE.lock();
         match row_mut(&mut t, id) {
@@ -815,6 +825,13 @@ pub fn close(id: WinId) -> bool {
 /// (`clear_handle_row`) calls this so a dead ASID can never leave a window compositing from a
 /// surface whose address space is gone.
 pub fn close_owner(owner_asid: u64) -> usize {
+    // WEDGE-1r2 `<D1>`/`<d1>` — see `move_to`, and note that THIS is the path that matters most: it
+    // is reached from `sched::exit` → `clear_handle_row`, which has already masked interrupts, so a
+    // core that blocks on the `TABLE` acquisition below is unpreemptible and silent — and is upstream
+    // of the only place WEDGE-1 instrumented. It is also the hottest of the three (one call per EL0
+    // task exit, most of them owning no window), which is why the chain gate is what makes the token
+    // affordable here at all.
+    crate::wedge2::mark_composite("<D1>", "<d1>");
     let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut n = 0;
     {
@@ -1135,6 +1152,9 @@ pub fn focus_changed(asid: u64) {
     // Boxes of windows this call pushed BELOW the shell — the pixels the console is about to own.
     let mut hidden = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut nhidden = 0usize;
+    // FV-EXEMPT — of those boxes, how many belong to a row that [`above_shell`] says is STILL VISIBLE.
+    // That number ought to be zero by the definition of the set, and it is not: see the shell arm.
+    let mut exempt = 0usize;
     // VUGMIN-B/C — (owner asid, is it now hidden) pairs, built under the table lock below and published
     // to the syscall layer after the guard drops. The SHELL arm fills this from [`vugmin_scan`] (every
     // owner, all hidden); since CLICK-PLAIN the RAISE arm fills in exactly ONE row — `marks[0]`, the
@@ -1168,6 +1188,33 @@ pub fn focus_changed(asid: u64) {
             newz = z;
             for r in t.rows.iter_mut() {
                 if r.used && r.z < z {
+                    // FV-EXEMPT — **`r.z < z` IS NOT THE HIDING PREDICATE, AND THIS SET IS THEREFORE
+                    // NOT WHAT `hidden=` HAS BEEN CALLING IT.** [`above_shell`] is what decides
+                    // whether a row stops compositing, and it EXEMPTS compat rows on purpose: a
+                    // compat row is the full-screen present path, it carries owner ASID 0, it is not
+                    // a focus target, and it could never be raised back over a shell that overtook
+                    // it — so hiding it would strand a full-screen app's output for the rest of the
+                    // boot. Its z still falls below the shell here, so it is collected, erased to
+                    // `DESKTOP_BG`, and then repainted by the `composite` at the end of this call,
+                    // having never been hidden at all.
+                    //
+                    // Reachable, and on the desktop path: a BACKGROUND full-screen app (`bg` — the
+                    // case BGRUN-1 exists for) is on the panel while the operator TABs to the shell.
+                    // The visible cost is a whole-box desktop fill and an immediate repaint of the
+                    // same pixels; the durable one is that `erase` may DEFER that fill under `STAGE`
+                    // contention (WC-L), in which case the drain paints `DESKTOP_BG` over the app a
+                    // pass AFTER the repaint has already put it back.
+                    //
+                    // COUNTED, NOT CHANGED. Narrowing the set to `!above_shell(r, z)` is a one-token
+                    // edit and it is deliberately not taken here: what a bg full-screen app's pixels
+                    // should do across a shell TAB is a panel question, the gate has no HID to TAB
+                    // with, and this seat may not settle it from a headless run. `exempt=` puts the
+                    // contradiction on the wire so the next bench sitting can read it instead of
+                    // inferring it, and it is derived from `above_shell` rather than from `r.compat`
+                    // so a future exemption added there is carried automatically.
+                    if above_shell(r, z) {
+                        exempt += 1;
+                    }
                     hidden[nhidden] = outer_box(r);
                     nhidden += 1;
                     // Damaged so that a later raise repaints from the source surface rather than
@@ -1241,7 +1288,13 @@ pub fn focus_changed(asid: u64) {
     }
     #[cfg(feature = "witness")]
     if asid == 0 {
-        serial_println!("[wc-fv] focus shell z={} hidden={}", newz, nhidden);
+        // FV-EXEMPT — `exempt` is the part of `hidden` that was erased and immediately repainted
+        // rather than hidden (see the shell arm). `hidden=N exempt=0` is the line reading it always
+        // implied; any other reading is the contradiction, named.
+        serial_println!(
+            "[wc-fv] focus shell z={} hidden={} exempt={}",
+            newz, nhidden, exempt
+        );
     } else {
         serial_println!(
             "[wc-fv] focus raise asid={:#x} windows={} top_win={} z={} shell_z={}",
@@ -1264,7 +1317,7 @@ pub fn focus_changed(asid: u64) {
             asid, nmarks
         );
     }
-    let _ = (raised, first_id, newz);
+    let _ = (raised, first_id, newz, exempt);
     // WEDGE-2 `<F6>` — the `[wc-fv]` line above is the LAST thing every recorded wedge printed, so
     // this token is the one that matters most: it is emitted after that line and before the composite
     // pass. `<F6>` present with nothing after it says the chain survived the print and died inside
@@ -2512,6 +2565,136 @@ const DRAIN_STALL_SPINS: u64 = 1 << 27;
 static DRAIN_STALL_REPORTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+// ---- WEDGE-1r2 — the drain barrier's silence, made readable --------------------------------------
+//
+// **What this arc found, and it is a finding about an INSTRUMENT rather than about a mechanism.**
+// `docs/dev/OS/08_VIDEO/engine.md` §WEDGE-2 opens by treating one inference as settled: *"The drain
+// barrier is exonerated. WEDGE-1's `[wedge1] DRAIN STALLED` tripwire fires from inside the
+// drain-barrier spin, and it stayed silent all three times."* That inference reads a silence as a
+// refutation, and it is only sound if the tripwire could have SPOKEN in the states it is being
+// cleared of. It could not, in two of them:
+//
+//  1. **It speaks through `serial_println!`, which takes a blocking lock.** The tripwire's own note
+//     admits this ("if the wedge is IN the serial path the tripwire blocks") and then argues it is
+//     "strictly no worse" than spinning — which is true about the MACHINE and false about the
+//     EVIDENCE. s44's capture stopped mid-word, i.e. a core died holding the UART; on that shape the
+//     tripwire's silence is structurally guaranteed and carries no information at all.
+//  2. **It exists only INSIDE the spin.** Every teardown reaches the barrier through its own
+//     `TABLE` critical section — `close`/`close_owner` clear their rows under the lock, `move_to`
+//     rewrites its geometry under it — and a core that dies waiting on `TABLE` there never reaches
+//     `drain()`. The teardown path can therefore BE the wedge site with the tripwire silent by
+//     construction, because the instrument is one lock downstream of the death.
+//
+// Neither is fixed by moving the threshold. What both need is a voice that acquires nothing, and
+// the tree already has one: WEDGE-2's `wedge2_raw_byte` — a lock-free bounded poll of the UART
+// TX-ready flag and one volatile store, taking no `SERIAL_PORT`, no `FBCON`, no `WRITER`, no
+// `TABLE`, no `SPRITE` and no allocator. So the teardown path gets tokens on the same terms the
+// focus chain has had since WEDGE-2:
+//
+//   `<D1>`/`<d1>` — a teardown began, BEFORE the `TABLE`/`WRITER` critical section that precedes the
+//                   barrier (`close`, `close_owner`, `move_to`). Uppercase on the core that owns the
+//                   open focus chain, lowercase on any other.
+//   `<D2>`        — that section is behind us; the barrier is going up and this core is about to spin.
+//   `<D3>`        — the spin returned. The barrier is held and the erase/reclaim half is next.
+//   `<D!>`        — the stall tripwire FIRED, emitted before its `serial_println!` so a blocked print
+//                   no longer erases the fact that the threshold was crossed.
+//
+// Read exactly as WEDGE-2's are read — by what is MISSING after the last one on a torn wire:
+// `<D1>` with no `<D2>` puts the death upstream of the barrier, in the teardown's own critical
+// section (blindness 2); `<D2>` with no `<D3>` puts it in the spin; `<D!>` with no `[wedge1] DRAIN
+// STALLED` line after it is blindness 1 caught in the act — the tripwire fired and the serial lock
+// ate it. A `<D1>` that is NOT the last thing on the wire is an ordinary teardown that took an early
+// return (no such row, an unmoved `move_to`); a `<D1>` that IS the last thing is the finding.
+//
+// **`<D1>` speaks only while a focus chain is open, and that budget is a measured constraint rather
+// than a preference.** The first cut emitted it unconditionally at each teardown entry, and the
+// wedge2 regression run priced it: 96 tokens against the whole focus chain's 17, because
+// `close_owner` runs on EVERY EL0 task exit (`sched::exit` → `clear_handle_row`) and 65 of those 96
+// found no window and never raised a barrier at all. One of them interleaved into another core's
+// line mid-word (`:<D1: B>GRUN-ST: slot reclaim PASS`) and took a required witness off the wire —
+// the accepted cost of a lock-free token, spent on teardowns with nothing to say. So `<D1>` takes
+// `mark_composite`'s existing discipline, for the reason `mark_composite` states: the steady-state
+// rate would otherwise bury the chain in tokens. It is also the right AIM — all four recorded
+// lockups (P66/P67v2/P68/s44) happened during TAB cycling with a focus change in flight, which is
+// exactly `CHAIN_CORE != 0` — and the case split it comes with is itself evidence: `<D1>` says the
+// teardown is on the core running the focus change, `<d1>` says a vug exited on some OTHER core
+// while that chain was open, which is the P66 scene in one byte.
+//
+// `<D2>`/`<D3>`/`<D!>` stay unconditional: they fire only when a barrier is genuinely raised (31 in
+// that same run), a wedge in the drain is worth naming whether or not a TAB is in flight, and the
+// tripwire least of all may be gated on somebody else's state.
+//
+// **WHAT THE HEADLESS GATE CAN AND CANNOT WITNESS — stated here, because this whole block exists
+// because a silence got banked as a refutation.** `UNAOS_WEDGE2=1 kernel8-test` emits `<D2>`/`<D3>`
+// in pairs and NO `<D1>`/`<d1>` at all, and that zero is a SCENE fact rather than a wiring one: the
+// chain is open only for the body of `focus_changed`, and nothing in the fixture battery tears a
+// window down from inside that window (`clickplain_leg` closes before its `focus_changed(0)`;
+// `closebox_leg`'s router close runs after `focus_changed` has already called `chain_exit`). The
+// scene the token is aimed at — one core in a TAB while a vug exits on another — is the bench's,
+// which is precisely P66's. So `<D1>` absent on QEMU proves nothing either way and MUST NOT be read
+// as the mechanism being quiet; the pairing of `<D2>`/`<D3>` is what the gate does prove.
+//
+// One `<D2>` in that run reads as `<activD2>` on the wire — another core's line interleaved with the
+// token's own bytes. That is WEDGE-2's stated and accepted cost for taking no lock, unchanged here.
+//
+// Knob-gated with the rest of WEDGE-2 (`UNAOS_WEDGE2=1`): with the feature off `mark` is an empty
+// inline function and no token exists in the image, so no shipped media pay for this.
+
+/// WEDGE-1r2 — how often [`DrainBarrier::drain`] ran, and how long it actually SPUN.
+///
+/// ### Why the tripwire alone cannot answer this
+/// [`DRAIN_STALL_SPINS`] sits past ~10^8 spin hints on purpose, and its own note says why: a
+/// threshold a merely slow drain could reach would put a serial write on a hot IRQ-masked path. The
+/// consequence was left standing — the wire has exactly two readings, "nothing" and "wedged", with
+/// the whole interesting range between them unmeasured. A teardown that spins for milliseconds is
+/// not a wedge, but it IS a core held with interrupts masked (`sched::exit` masks before it reaches
+/// `clear_handle_row`), and today it is indistinguishable from a drain that returned at once.
+///
+/// A counter costs no print, so it can measure the range the tripwire deliberately declined to.
+///
+/// ### Why the high-water mark is published FROM INSIDE the loop
+/// A ledger written after the spin can only report drains that FINISHED — so the one drain that
+/// matters most, the one still going, contributes nothing and the rollup reads clean. That is
+/// WEDGE-4's W4-A defect exactly, and it is inadmissible here for the same reason: an instrument's
+/// silence is evidence only if the instrument can execute in the state it reports on. [`F4W_SPIN_MAX`]
+/// is therefore updated from within the spin, so a core that never leaves the loop has still
+/// published how far it got, and [`F4W_IN_SPIN`] stays raised for as long as that core is in there —
+/// which is what lets some OTHER core's rollup report a drain that is not coming back.
+///
+/// The stride is what keeps it off the hot path: one masked compare per iteration, one relaxed RMW
+/// per [`DRAIN_DWELL_STEP`]. The A72 LL/SC starvation SPIN-3 padded for is a function of how many
+/// cores hammer a line, and these have one writer per concurrently-draining teardown.
+#[cfg(feature = "witness")]
+static F4W_DRAINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WEDGE-1r2 — drains that found `BLIT_ACTIVE` non-zero and actually entered the spin. The
+/// denominator `spin_max` is meaningful against: `drains` with `spun=0` is a barrier that never had
+/// to wait for anybody, which is the healthy desktop's normal answer.
+#[cfg(feature = "witness")]
+static F4W_SPUN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WEDGE-1r2 — the longest spin any drain reached in this rollup window, published from inside the
+/// loop. See [`F4W_DRAINS`] for why that placement is a correctness property of the instrument.
+#[cfg(feature = "witness")]
+static F4W_SPIN_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WEDGE-1r2 — drains currently inside the spin. A GAUGE, not an accumulator: it is read rather than
+/// drained, and a non-zero reading taken by a core that is still running is the closest thing this
+/// module has to "somebody else is stuck right now".
+#[cfg(feature = "witness")]
+static F4W_IN_SPIN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// WEDGE-1r2 — how often the spin publishes its progress. A power of two so the test is a mask.
+#[cfg(feature = "witness")]
+const DRAIN_DWELL_STEP: u64 = 1 << 12;
+
+/// WEDGE-1r2 — spins past which a drain is worth calling a DWELL rather than a wait. Four orders of
+/// magnitude under [`DRAIN_STALL_SPINS`], and far past the handful of panel-clipped `memcpy`s the
+/// barrier is bounded against, so it names an interval no healthy teardown produces without
+/// competing with the tripwire for the wedge itself.
+#[cfg(feature = "witness")]
+const DRAIN_DWELL_NOTE: u64 = 1 << 16;
+
 /// F4 — a teardown's phase barrier, RAII so the barrier always re-opens. Raised by
 /// [`close`]/[`close_owner`] and dropped once the drain has completed.
 struct DrainBarrier;
@@ -2532,6 +2715,15 @@ impl DrainBarrier {
     /// is fixed at entry, finite, and every member is running a bounded panel-clipped blit.
     fn drain() -> Self {
         use core::sync::atomic::Ordering;
+        // WEDGE-1r2 `<D2>` — the caller's `TABLE` critical section is behind us, the barrier is going
+        // up, and this core is about to spin IRQ-masked. Raw and lock-free, for the reason the block
+        // above the ledger states: the `serial_println!` tripwire further down cannot speak while the
+        // serial lock is what the wedge is holding, so the token that says "we got this far" must not
+        // depend on it either. A `<D1>` never followed by this one puts the death upstream, in the
+        // caller's own critical section — the region WEDGE-1's tripwire is blind to by construction.
+        crate::wedge2::mark("<D2>");
+        #[cfg(feature = "witness")]
+        F4W_DRAINS.fetch_add(1, Ordering::Relaxed);
         DRAIN_PENDING.fetch_add(1, Ordering::AcqRel);
         // Ordered against the composite registration by the table lock: a composite either took the
         // lock BEFORE the clearing critical section (so it registered, and is counted here) or AFTER
@@ -2566,11 +2758,51 @@ impl DrainBarrier {
         // lock. If the wedge is IN the serial path the tripwire blocks — but the alternative on that
         // path was spinning here forever anyway, so it is strictly no worse, and on every other
         // shape of wedge it converts a silent hang into a named one.
+        //
+        // WEDGE-1r2 CORRECTS THE SECOND HALF OF THAT SENTENCE. "Strictly no worse" is a claim about
+        // the MACHINE, and it is true. It was then used as a claim about the EVIDENCE, and there it is
+        // false: engine.md §WEDGE-2 banked this tripwire's silence across P66/P67v2/P68 as *"the drain
+        // barrier is exonerated"*, while on the one wedge shape the wire actually points at — s44's
+        // capture stopped mid-word, i.e. a core died holding the UART — the silence was structurally
+        // guaranteed and said nothing whatever. A blocked print does not merely fail to report the
+        // stall; it erases the fact that the threshold was crossed, which is the difference between an
+        // instrument that is quiet and an instrument that cannot speak. The `<D!>` token below takes
+        // no lock and is emitted BEFORE the print, so from here on this tripwire's silence means the
+        // threshold was not reached rather than the report was eaten.
         let mut spins: u64 = 0;
+        // WEDGE-1r2 — has this drain been charged to `spun`/`in_spin` yet? Set on the FIRST iteration
+        // rather than before the loop, so a barrier that found `BLIT_ACTIVE == 0` and never waited is
+        // not counted as a wait. `drains` above already counts those.
+        #[cfg(feature = "witness")]
+        let mut entered = false;
         while BLIT_ACTIVE.load(Ordering::Acquire) != 0 {
+            #[cfg(feature = "witness")]
+            if !entered {
+                entered = true;
+                F4W_SPUN.fetch_add(1, Ordering::Relaxed);
+                // Raised HERE and lowered only after the loop, so a core that never comes out leaves
+                // it raised — that standing count is the whole point (see `F4W_IN_SPIN`).
+                F4W_IN_SPIN.fetch_add(1, Ordering::Relaxed);
+            }
             core::hint::spin_loop();
             spins = spins.wrapping_add(1);
+            // WEDGE-1r2 — publish progress FROM INSIDE the loop. A high-water mark written after the
+            // spin describes only drains that finished, so the one that never does would contribute
+            // nothing and the rollup would read clean over a held core — W4-A's defect, refused here.
+            // The stride keeps the RMW off the hot path; the masked compare is what runs per spin.
+            #[cfg(feature = "witness")]
+            if spins % DRAIN_DWELL_STEP == 0 {
+                F4W_SPIN_MAX.fetch_max(spins, Ordering::Relaxed);
+            }
             if spins == DRAIN_STALL_SPINS && !DRAIN_STALL_REPORTED.swap(true, Ordering::Relaxed) {
+                // WEDGE-1r2 `<D!>` — THE TRIPWIRE FIRED, said without taking a lock, and said BEFORE
+                // the line below. The tripwire's own note concedes that a wedge in the serial path
+                // blocks this print; what it did not follow through is that the blocked print then
+                // destroys the evidence that the threshold was ever crossed, which is precisely how a
+                // silence that could not have been broken came to be read as a refutation. This token
+                // survives that: `<D!>` with no `[wedge1] DRAIN STALLED` line after it says the stall
+                // is real AND that the serial path is where the core went to die.
+                crate::wedge2::mark("<D!>");
                 serial_println!(
                     ":: [wedge1] DRAIN STALLED core={} blit_active={} pending={} spins={} == tripwire ::",
                     crate::arch::sched::meter_current_cpu(),
@@ -2580,6 +2812,17 @@ impl DrainBarrier {
                 );
             }
         }
+        #[cfg(feature = "witness")]
+        if entered {
+            // The exact figure, now that it is known; the in-loop publication above is the floor that
+            // stands in for it while the drain is still running.
+            F4W_SPIN_MAX.fetch_max(spins, Ordering::Relaxed);
+            F4W_IN_SPIN.fetch_sub(1, Ordering::Relaxed);
+        }
+        // WEDGE-1r2 `<D3>` — the spin returned. `<D2>` with no `<D3>` puts the death in the spin
+        // itself, which is the one region WEDGE-1's tripwire CAN see — and pairs with `<D!>` to say
+        // whether it got far enough to try.
+        crate::wedge2::mark("<D3>");
         DrainBarrier
     }
 }
@@ -3494,6 +3737,69 @@ static F2W_DRAIN_SKIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 #[cfg(feature = "witness")]
 static F2W_DRAIN_MASKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// WEDGE-1r2 — what the drain barrier actually cost this window, below the tripwire's threshold.
+///
+/// ### The admissibility clause, because this line's SILENCE is the thing that was misread
+/// `drains=0` says NO TEARDOWN RAN in this window. It does not say the drain barrier is healthy, and
+/// it is not evidence about any wedge: a boot with no window close and no task exit never reaches
+/// that code at all. The inference WEDGE-1's watch-list drew from a quiet tripwire — "the drain
+/// barrier is exonerated" — is exactly the reading this line exists to make impossible to repeat, so
+/// the verdict names the SCENE and never the outcome:
+///
+/// * `NONE`     — no drain at all in this window. Nothing was measured; nothing may be concluded.
+/// * `QUIET`    — drains ran, and none spun past [`DRAIN_DWELL_NOTE`]. The healthy steady state, and
+///                the only verdict here that is a statement about the barrier rather than about the
+///                scene.
+/// * `DWELL`    — a drain spun far enough to be a stalled core, four orders of magnitude under the
+///                tripwire. That is IRQ-masked time on a teardown's core, and it is the reading the
+///                tripwire's own threshold note deliberately declined to produce.
+/// * `INFLIGHT` — a drain was inside the spin at the instant ANOTHER core took this line. At operator
+///                teardown rates against a 5 s window, one sample is a coincidence worth noting and
+///                the same reading twice running is a core that is not coming out.
+///
+/// `tripwire=` carries [`DRAIN_STALL_REPORTED`] so the two instruments are read together: `fired`
+/// beside a `DWELL` is one stall growing, and `silent` beside an `INFLIGHT` is a drain that is stuck
+/// but has not yet reached [`DRAIN_STALL_SPINS`] — the state that used to produce nothing at all.
+///
+/// Emitted AHEAD of [`wcn_emit`]'s dirty-paced guard: a wedged teardown holds a core with interrupts
+/// masked, and if the only thing keeping this block off the wire were "no window presented in the
+/// last five seconds", the reading that names the wedge would be suppressed by the very condition it
+/// describes. Self-silencing when there is genuinely nothing to say, so an idle desktop still prints
+/// no wall of zeros.
+#[cfg(feature = "witness")]
+fn wedge1_dwell_emit(span: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let drains = F4W_DRAINS.swap(0, Relaxed);
+    let spun = F4W_SPUN.swap(0, Relaxed);
+    let spin_max = F4W_SPIN_MAX.swap(0, Relaxed);
+    // A GAUGE — loaded, never drained. Draining it would report a stuck core once and then forget it,
+    // which is the opposite of what a standing count is for.
+    let in_spin = F4W_IN_SPIN.load(Relaxed);
+    if drains == 0 && in_spin == 0 {
+        return;
+    }
+    let verdict = if in_spin > 0 {
+        "INFLIGHT"
+    } else if spin_max >= DRAIN_DWELL_NOTE {
+        "DWELL"
+    } else if drains == 0 {
+        "NONE"
+    } else {
+        "QUIET"
+    };
+    serial_println!(
+        "[wedge1] dwell drains={} spun={} spin_max={} note={} in_spin={} tripwire={} span={}ms -> {}",
+        drains,
+        spun,
+        spin_max,
+        DRAIN_DWELL_NOTE,
+        in_spin,
+        if DRAIN_STALL_REPORTED.load(Relaxed) { "fired" } else { "silent" },
+        span,
+        verdict
+    );
+}
+
 /// WC-N — the slot for `id`, or `None` for an out-of-range id.
 #[cfg(feature = "witness")]
 fn wcn_slot(id: WinId) -> Option<&'static WcnRow> {
@@ -3678,6 +3984,11 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
             gap_max: gmax,
         });
     }
+    // WEDGE-1r2 — the drain barrier's dwell, taken BEFORE the dirty-paced guard below. A teardown
+    // that has consumed a core is a teardown that is not presenting, so gating this reading on
+    // present traffic would silence it under exactly the condition it reports on. It has its own
+    // self-silencing test (no drains, nobody spinning), so an idle desktop stays as quiet as before.
+    wedge1_dwell_emit(span);
     if !force && t_att == 0 && t_comp == 0 {
         return; // dirty-paced: a period with no present traffic prints nothing at all.
     }
