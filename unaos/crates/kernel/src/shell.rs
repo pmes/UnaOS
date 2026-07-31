@@ -18,7 +18,6 @@ use alloc::vec::Vec;
 use alloc::string::String;
 use crate::console::Console;
 use crate::fs::fat::{DirEntry, FatError, FatFs};
-use crate::vug;
 use crate::pal::TargetPal;
 
 /// JD4: the shell's current working directory as a NORMALIZED, CANONICAL absolute path
@@ -2295,21 +2294,22 @@ impl History {
 }
 
 /// Run one command. Returns `true` if the command took over the whole screen with its own
-/// graphics (e.g. `vug`), so the caller should NOT repaint the console over it.
+/// graphics (e.g. `v3d`), so the caller should NOT repaint the console over it.
 pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetPal) -> bool {
     // Split command and args (simple whitespace split)
     let mut parts = cmd_line.trim().split_whitespace();
     let command = parts.next().unwrap_or("");
     let args: Vec<&str> = parts.collect();
 
-    // The `vug` and `pulse` commands paint full-screen views; everything else leaves the
-    // console visible. PI-APP-1: `v3d` blits the visible battery onto the live scanout, so it too
-    // keeps the console off (a repaint would overwrite the replayed tiles). Aarch64+v3d only; the
-    // knob-off build never registers the command, so this OR-clause is constant-folded away there.
+    // PI-APP-1: `v3d` blits the visible battery onto the live scanout, so it keeps the console off
+    // (a repaint would overwrite the replayed tiles). It is now the ONLY screen-taking command —
+    // the `vug` crystal and the full-screen `pulse` monitor are gone (the pulse lives in the
+    // always-on bottom strip, `ui_status`). Aarch64+v3d only; with the knob off the command is
+    // never registered and nothing takes the screen.
     #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
-    let took_screen = command == "vug" || command == "pulse" || command == "v3d";
+    let took_screen = command == "v3d";
     #[cfg(not(all(target_arch = "aarch64", feature = "v3d")))]
-    let took_screen = command == "vug" || command == "pulse";
+    let took_screen = false;
 
     match command {
         "ver" | "version" => {
@@ -2342,12 +2342,12 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("          usnapls <gen> [path], usnapcat <gen> <path>  (read a snapshot; current-ACL enforced)");
             console.println("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
             console.println("          time  (shared civil clock: ISO-8601 UTC + source; unsynced until SNTP/setdate)");
-            console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
+            console.println("SMP:      sched (per-CPU run queues)  [per-core load: the always-on pulse strip]");
             #[cfg(target_arch = "aarch64")]
             console.println("          top  (per-core load: recent busy%, ctx-switches, last task)");
             // PI-APP-1: v3d-gated so the knob-off build's help text stays byte-identical to baseline.
             #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
-            console.println("APPS:     vug (3D sculptor), v3d (replay the visible GPU graphics battery)");
+            console.println("APPS:     v3d (replay the visible GPU graphics battery)");
             // BGRUN-1: background EL0 runs — the concurrent-apps line (windows coexist; TAB cycles).
             #[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
             console.println("PROC:     run <path> (foreground), bg <path> (background), jobs (list+reap), kill <pid>");
@@ -3206,27 +3206,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 None => console.println("usage: get <a.b.c.d> [port] [path]"),
             }
         },
-        "vug" => {
-             match args.first().copied() {
-                 Some("bebox") => {
-                     console.println("Vug: BeBox tribute (press any key)...");
-                     vug::run_bebox_mode(pal);
-                     // Tribute screen stays up; `took_screen` keeps the console off it.
-                 }
-                 Some("wire") => {
-                     console.println("Vug: sculpting the quartz (wireframe)...");
-                     vug::run_crystal(pal, vug::Mode::Wire);
-                     console.draw(pal); // clean exit: restore the shell over the demo
-                 }
-                 _ => {
-                     console.println("Vug: sculpting the quartz (solid)...");
-                     vug::run_crystal(pal, vug::Mode::Solid);
-                     console.draw(pal); // clean exit: restore the shell over the demo
-                 }
-             }
-        },
-        // PI-APP-1: the V3D visible-battery app. Registered in the same launcher path as `vug` (a
-        // shell-command match arm — the kernel's convention for a launchable UI program). It replays
+        // PI-APP-1: the V3D visible-battery app. Registered as a shell-command match arm — the
+        // kernel's convention for a launchable UI program. It replays
         // the four visible V3D stages (gradient / animate / multi-primitive / blit) onto the live
         // framebuffer so the graphics are watchable while the system is up — the boot-time battery
         // flashes past before the monitor wakes. Reuses the state boot established (no GPU re-init);
@@ -3243,13 +3224,6 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 console.draw(pal);
             }
             // On a real replay `took_screen` keeps the console off the freshly-blitted tiles.
-        },
-        "pulse" => {
-            // UI1-M3: the full-screen system monitor (BeOS Pulse homage). Any key exits; the
-            // console repaints over it on the way out (same contract as the vug crystal).
-            console.println("Pulse: system monitor (press any key)...");
-            vug::run_pulse(pal);
-            console.draw(pal); // clean exit: restore the shell over the monitor
         },
         "tste" | "selftest" => {
             // The in-OS self-test suite (TSTE-1). Prints a three-section PASS/FAIL/SKIP table in the

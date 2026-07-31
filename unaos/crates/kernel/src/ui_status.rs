@@ -69,15 +69,16 @@
 //!   full, the one LED the boundary lands inside is lit in proportion to its coverage, and every LED
 //!   carries its own vertical lens gradient. A rising load brightens the next lamp continuously
 //!   instead of clicking it on. The stored load went to per-mille for the same reason (a 1% quantum is
-//!   a 14 px jump on a 1400 px bar) — see `vug::classify_load_scaled`, which states the VUG-HONESTY
+//!   a 14 px jump on a 1400 px bar) — see [`classify_load_scaled`], which states the VUG-HONESTY
 //!   rule once for both scales.
 //! * The scale runs green → amber → red across the bar (colour by POSITION, so a given lamp's colour
 //!   is stable and only the length moves). Test instrument, not chrome.
 //!
 //! The status band itself goes back to what it was before PULSE-STRIP: **text only**, host / ip /
 //! clock. The miniature bars are superseded. What PULSE-STRIP got right is kept verbatim and is the
-//! substrate here: the same `sched::meter_cpu_*` relaxed reads, the same [`crate::vug`] widget and
-//! palette, the same dirty pacing, the same zero-new-threads plumbing.
+//! substrate here: the same `sched::meter_cpu_*` relaxed reads, the same meter palette and
+//! VUG-HONESTY load rule (both now owned by this module — see [`classify_load_scaled`]), the same
+//! dirty pacing, the same zero-new-threads plumbing.
 //!
 //! ### Reserving the band honestly
 //!
@@ -109,7 +110,6 @@
 //! busy-loop FORBID. The `[pstrip]` rollup reports samples and redraws so the pacing stays checkable.
 
 use crate::pal::GneissPal;
-use crate::vug::{METER_BREATH, METER_DIM, METER_PARKED, PARKED};
 use alloc::format;
 use alloc::string::String;
 use spin::Mutex;
@@ -129,6 +129,84 @@ const STRIP_FG: u32 = 0x7BD0E0;
 const PANEL_BG: u32 = 0x0E0D22;
 /// PULSE-2 label / percent text.
 const PANEL_FG: u32 = 0x9FB4C8;
+
+// ---------------------------------------------------------------------------------------------
+// The meter palette and the VUG-HONESTY display rule.
+//
+// These are the pulse's own primitives. They were carried by the in-kernel `vug` demo module while
+// that module existed and the strip borrowed them; the demo is gone and the strip is the only
+// consumer, so they live here now. The rationale comments below are the originals, verbatim.
+// ---------------------------------------------------------------------------------------------
+
+// Meter palette.
+const METER_DIM: u32 = 0x00_2A2432;
+/// PULSE-ALIVE breath colour — clearly brighter than `METER_DIM`, dimmer than a load fill: the one
+/// sweeping segment an idle-but-scheduled core lights so "alive and idle" reads at a glance.
+const METER_BREATH: u32 = 0x00_5F4E86;
+/// Parked dash colour — cooler/dimmer than `METER_DIM` so a broken track reads as "not participating".
+const METER_PARKED: u32 = 0x00_3A3550;
+
+/// VUG-HONESTY parked-core marker (a load-array sentinel, disjoint from the 0..=100 percent range). A
+/// core whose pulse counters are frozen this window AND that is NOT the demo core is parked /
+/// never-scheduled: the display must not fabricate load for it. `load[c] == PARKED` selects a distinct
+/// DASHED bar (see [`draw_led_bar`]) — visually separable from an idle 0% bar (a solid dim track) so
+/// "idle" and "never woken" never read alike, and the percent column prints `park` instead of a number.
+const PARKED: u32 = u32::MAX;
+
+/// VUG-HONESTY — the pure per-core display decision. Given one core's per-window busy/idle tick deltas
+/// (`db`/`di`), whether it is the *demo core* (the core executing this render loop), and that loop's own
+/// measured render busy% (`own_load`), return the load to display (0..=100) or [`PARKED`]:
+///   * `db + di > 0`  → the scheduler accounted this core this window: honest busy fraction.
+///   * frozen + demo  → the demo core runs OUTSIDE the scheduler, so its own counters freeze; credit its
+///                      measured render load — the honest number for the core doing the drawing.
+///   * frozen + other → a core with no scheduling activity this window that is NOT drawing: parked /
+///                      never-woken. NEVER fabricate load. (The pre-fix code credited `own_load` to
+///                      EVERY frozen core, so a parked AP mirrored the busy demo core and read PINNED —
+///                      the display-honesty defect this arc closes. The merged idle/busy-heartbeats made
+///                      the *counters* honest and passed the one-shot boot witness, but the LIVE meter
+///                      samples per-window deltas: a parked EL2 secondary gets no periodic wake, so its
+///                      counters are frozen between windows and this fallback still fabricated.) Report
+///                      PARKED instead.
+fn classify_load(db: u64, di: u64, is_demo: bool, own_load: u32) -> u32 {
+    classify_load_scaled(db, di, is_demo, own_load, 100)
+}
+
+/// PULSE-2 — [`classify_load`] at an arbitrary full-scale, so a display with more resolution than
+/// "one bar in ten" can have more resolution than one percent.
+///
+/// The honesty rule is stated ONCE, here; `classify_load` is this function at `full = 100` and the
+/// VUG-HONESTY witness therefore still covers every branch of it. The instrument panel calls it at
+/// `full = 1000` (per-mille): its LED bar is ~1400 px wide on the bench panel, so a 1% quantum would
+/// be a 14 px jump — the display would step where the machine is smooth, which is exactly the
+/// "sensitivity" Peter asked the full width to buy. `own_load` is a percent by contract and is scaled
+/// to match. [`PARKED`] is `u32::MAX` and stays disjoint from `0..=full` at any sane scale.
+fn classify_load_scaled(db: u64, di: u64, is_demo: bool, own_load: u32, full: u32) -> u32 {
+    if db + di > 0 {
+        ((db * full as u64) / (db + di)) as u32
+    } else if is_demo {
+        (own_load as u64 * full as u64 / 100) as u32
+    } else {
+        PARKED
+    }
+}
+
+/// VUG-HONESTY witness — deterministic, arch-neutral, framebuffer-free. Exercises [`classify_load`]
+/// over the cases the honesty rule must separate and emits one PASS/FAIL serial line. Wired into the
+/// `virt` CAPSTONE boot (`arch::sched::run_capstone_boot_core`), so `test-arm` and the GICv3 suite
+/// witness a parked core reading PARKED rather than a fabricated pinned bar. Returns true on PASS.
+pub fn parked_display_witness() -> bool {
+    let busy = classify_load(8, 0, false, 99) == 100; // scheduled + fully busy
+    let idle = classify_load(0, 2, false, 99) == 0; // scheduled + idle → honest 0%, NOT own_load
+    let half = classify_load(1, 1, false, 0) == 50; // scheduled + half busy
+    let demo = classify_load(0, 0, true, 42) == 42; // frozen demo core → its own render load
+    let park = classify_load(0, 0, false, 99) == PARKED; // frozen non-demo core → PARKED, not fabricated
+    let pass = busy && idle && half && demo && park;
+    serial_println!(
+        ":: VUG-HONESTY: parked-core display witness {} — a frozen non-demo core reads PARKED (never the demo core's load); scheduled cores read their busy fraction, the demo core its render load ::",
+        if pass { "PASS" } else { "FAIL" }
+    );
+    pass
+}
 
 /// The settled interface IPv4 (leased or static-fallback), or `None` before any bring-up completed.
 /// Wrapped so the strip compiles on a net-less kernel (the `net_phy` module is gated on the net
@@ -203,8 +281,8 @@ pub fn draw<P: GneissPal>(pal: &mut P) {
 
 /// Upper bound on the rows the instrument will draw. The band is a fixed fraction of the panel and
 /// splits into one row per core, so past this the rows stop being tall enough to read: a wider machine
-/// simply shows its first `PSTRIP_MAX_CPUS` cores. (Kept below vug's `MAX_METER_CPUS` for that reason,
-/// not for want of counters.)
+/// simply shows its first `PSTRIP_MAX_CPUS` cores. (Capped for that reason, not for want of counters —
+/// `sched::meter_cpu_count()` may well report more.)
 pub const PSTRIP_MAX_CPUS: usize = 8;
 
 /// The pulse sample period. One sample per second is the strip's own refresh cadence; sampling
@@ -261,7 +339,7 @@ fn hash(s: &str) -> u64 {
 
 /// Full scale of the stored per-core load. Per-mille, not percent: the bar is ~1400 px wide on the
 /// bench panel, so a 1% quantum would move the fill 14 px at a time and the "super smooth" scaling the
-/// gradient LEDs exist for would be stepping under the gradient. See `vug::classify_load_scaled`.
+/// gradient LEDs exist for would be stepping under the gradient. See [`classify_load_scaled`].
 pub const PERMILLE_FULL: u32 = 1000;
 
 // ---------------------------------------------------------------------------------------------
@@ -672,7 +750,7 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
                 // `own_load` is 0: the strip is drawn by a SCHEDULED task, so its core's counters
                 // tick like every other core's and the demo-core fallback never fires here. Passing a
                 // fabricated render load would be exactly the dishonesty VUG-HONESTY closed.
-                let new = crate::vug::classify_load_scaled(db, di, c == demo, 0, PERMILLE_FULL);
+                let new = classify_load_scaled(db, di, c == demo, 0, PERMILLE_FULL);
                 changed |= match &geo {
                     Some(g) => lit_px(g, new) != lit_px(g, st.load[c]),
                     // No seatable geometry: fall back to the number itself, so a panel too small to

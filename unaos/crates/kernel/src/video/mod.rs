@@ -83,7 +83,32 @@ pub use framebuffer::FrameBuffer;
 pub use screen::Screen;
 
 use spin::Mutex;
+use unaos_boot_info::FrameBufferInfo;
 
 /// The primary display surface. The GUI renderer (`pal::TargetPal` → `console`) draws here.
 /// Initialised once in `kernel_main` from `BootInfo` (UEFI GOP, or the Pi mailbox framebuffer).
 pub static WRITER: Mutex<FrameBuffer> = Mutex::new(FrameBuffer::new());
+
+/// The panel background the GUI paints over — Can-Am dark grey, `#1E1E1E`.
+pub const PANEL_BG: u32 = 0x001E_1E1E;
+
+/// Paint the panel background once at boot, and witness the framebuffer geometry the bootloader
+/// handed us.
+///
+/// Called from `kernel_main` immediately after [`WRITER`] is attached, on both arches. The serial
+/// lines are the FB-geometry witness a metal capture reads before any GUI exists — they are the
+/// first independent statement of what the firmware actually gave us (size, stride, pixel format),
+/// so a wrong-geometry boot is nameable from the log alone. The paint goes through a plain
+/// [`FrameBuffer`] handle rather than `WRITER` so format and bounds are handled in exactly one
+/// place and no lock is held across the fill.
+pub fn init_panel(base: usize, len: usize, info: FrameBufferInfo) {
+    serial_println!(":: FB Init ::");
+    serial_println!(":: FB Size: {}x{} (stride {}) ::", info.width, info.height, info.stride);
+    serial_println!(":: FB Format: {:?} ::", info.pixel_format);
+
+    let mut surface = FrameBuffer::new();
+    surface.init(base, len, info);
+    surface.fill_screen(PANEL_BG);
+
+    serial_println!(":: Framebuffer painted #1E1E1E ::");
+}

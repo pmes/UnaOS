@@ -1055,7 +1055,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .lock()
             .init(framebuffer_addr as usize, framebuffer_size, info);
 
-        unaos_kernel::vug::init(framebuffer_addr as usize, framebuffer_size, info);
+        unaos_kernel::video::init_panel(framebuffer_addr as usize, framebuffer_size, info);
 
         // UVUG-2: wire the SYS_FB_PRESENT seam to the real scan-out now that WRITER is initialized.
         // One registration call site; the hook centers an EL0 program's presented off-screen surface

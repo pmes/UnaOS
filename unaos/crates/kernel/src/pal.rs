@@ -216,13 +216,13 @@ pub mod cursor {
     // paint.
     //
     // WHERE THE SWITCH IS MADE, AND WHY HERE RATHER THAN AT THE CALL SITES. Every pointer report on
-    // every x86 path — the console loop, `vug`/`pulse`'s own drain, the EL0 input router — funnels
-    // through `move_rel`/`set_abs`, and every paint request funnels through `draw`/`draw_over`/
-    // `restore`. Folding the delegation into those six functions moves the whole target onto the
-    // compositor sprite without a single call-site change, which is also what keeps the full-screen
-    // demos' loops (not this arc's lane) correct: they keep calling `cursor::draw(pal)` once a frame
-    // and simply stop putting pixels in the back buffer, while the ARROW now tracks the pointer at
-    // report rate because `move_rel` repaints it the moment the report lands.
+    // every x86 path — the console loop, the EL0 input router, any full-redraw loop's own drain —
+    // funnels through `move_rel`/`set_abs`, and every paint request funnels through `draw`/
+    // `draw_over`/`restore`. Folding the delegation into those six functions moves the whole target
+    // onto the compositor sprite without a single call-site change: a caller keeps calling
+    // `cursor::draw(pal)` once a frame and simply stops putting pixels in the back buffer, while the
+    // ARROW now tracks the pointer at report rate because `move_rel` repaints it the moment the
+    // report lands.
     //
     // The back-buffer sprite is kept, unchanged, for every other target: aarch64's `virt`/UEFI GUI
     // console has no compositor-sprite driver of its own, and the bare-metal Pi render task already
@@ -230,42 +230,21 @@ pub mod cursor {
     /// Whether the SYSTEM COMPOSITOR SPRITE (`video::cursor`, front buffer, above the window layer)
     /// owns the arrow's pixels on this target, rather than the back-buffer sprite below.
     ///
-    /// FLICKER-4 — `pub(crate)` because the full-screen demo loops need to read it. The paragraph
-    /// above promises they "simply stop putting pixels in the back buffer"; that is true of the
-    /// PAINT, which `draw`/`draw_over` delegate away, and it was NOT true of the per-frame ERASE
-    /// those loops run to clear the sprite's own trail. See [`BACKBUF_SPRITE_NEEDS_ERASE`].
+    /// FLICKER-4 — `pub(crate)` because [`draw`]/[`draw_over`]/[`restore`] and `move_rel`/`set_abs`
+    /// read it to pick the model. The paragraph above promises a full-redraw loop can "simply stop
+    /// putting pixels in the back buffer"; that is true of the PAINT, which `draw`/`draw_over`
+    /// delegate away.
+    ///
+    /// It was NOT true of the per-frame back-buffer ERASE the full-screen demo loops ran to clear
+    /// the sprite's own trail — under the front-buffer model that erase restored pixels nobody had
+    /// written and marked damage over a live arrow, which was the x86 flicker. Those loops (the
+    /// in-kernel `vug` crystal and `pulse` monitor) no longer exist, so the companion
+    /// `BACKBUF_SPRITE_NEEDS_ERASE` predicate they were the sole readers of is gone with them. **If
+    /// a full-redraw loop is ever reintroduced, it must erase the arrow's previous footprint only
+    /// when this constant is `false` (the back-buffer sprite model — aarch64 / the Pi in-kernel
+    /// path); under the front-buffer model (x86) `video::cursor`'s own save-under owns the trail
+    /// and a back-buffer erase does active harm.**
     pub(crate) const SPRITE_OWNS_PAINT: bool = cfg!(target_arch = "x86_64");
-
-    /// FLICKER-4 — **must a full-redraw loop erase the arrow's previous footprint from the BACK
-    /// BUFFER every frame?**
-    ///
-    /// This is the question a dirty-rect presenter actually has to ask, asked in the direction that
-    /// makes the safe answer the default one. It is named for the PAINT MODEL, not for an arch:
-    ///
-    /// * **`true` — the BACK-BUFFER sprite model.** [`paint`] writes the arrow's merged runs into
-    ///   the caller's back buffer, so those pixels are part of the frame, the loop owns the trail,
-    ///   and erase → redraw is the correct software-cursor cycle. Not erasing strands the previous
-    ///   footprint on screen for as long as the pointer keeps moving. **This is the aarch64 /
-    ///   Pi in-kernel path, and it is also what any tree that has not adopted the front-buffer
-    ///   sprite must get.**
-    /// * **`false` — the FRONT-BUFFER sprite model.** `video::cursor` owns the arrow above the
-    ///   window layer; [`draw`]/[`draw_over`] delegate to `video::cursor::ensure_drawn` and put no
-    ///   pixels in the back buffer at all, and the trail is cleaned by the sprite module's own
-    ///   save-under the instant the pointer report lands. A back-buffer erase then restores nothing
-    ///   and does active harm: `draw_rect` marks damage, so the frame hands `Screen::flush` a
-    ///   damage rect covering the sprite's own panel box and the present blits background forward
-    ///   over a live arrow, every frame.
-    ///
-    /// **Polarity is load-bearing, and the default is ERASE.** A caller writes
-    /// `if BACKBUF_SPRITE_NEEDS_ERASE { … }` — the erase is the guarded-IN branch, not the
-    /// guarded-out one. A tree that does not have the front-buffer sprite model does not have
-    /// [`SPRITE_OWNS_PAINT`] either, and therefore does not have this constant: the call site fails
-    /// to COMPILE rather than silently resolving to "skip the erase". That is deliberate. There is
-    /// no `unwrap_or`, no `cfg!(feature = …)` that reads `false` when the feature is absent, and no
-    /// arch test at the call site — the three shapes that would turn a missing symbol into a
-    /// stranded pointer footprint at convergence. **If you are merging this into a tree without
-    /// `SPRITE_OWNS_PAINT`, the correct value of this constant there is `true`.**
-    pub(crate) const BACKBUF_SPRITE_NEEDS_ERASE: bool = !SPRITE_OWNS_PAINT;
 
     // CURSOR-HIDE (metal verdict, 2026-07-18): the cursor auto-hides after ~1.5 s without pointer
     // input and reappears instantly on the next report (`move_rel`/`set_abs` stamp the activity
