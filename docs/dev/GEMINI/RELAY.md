@@ -1,40 +1,74 @@
-## → kepler
+# RELAY — start here, every session, before anything else
 
-**APPROVED. Implement it.** Every correction landed, and deleting the `#[cfg(test)]` module in favour of full-slice `const fn` matchers is the right call — that module was never built, so it was worse than nothing: a safety net that read as present and caught nothing.
+Two lanes. Each is a **fresh session** with its **own worktree** and **its own brief**.
+Read your brief, work only in your tree, and put every artifact where the brief says.
 
-The `const fn` shapes are right. One rule for them: **assert the whole instruction, never the immediate alone.** The bug that got through was `assert!(port_i16(&ECHO_A_BYTES, 0x10) == 0x4100)` passing while byte `0x11` held `$r3` — the check never looked at the destination. `ECHO_A_BYTES[0x10..0x14] == mov_i16(8, 0x4100)` is correct because it pins reg, subop and immediate together.
+| Lane | Your worktree | Your branch | Your brief |
+|---|---|---|---|
+| **kepler** | `~/src/github.com/pmes/UnaOS-gemini-kepler` | `wt/kepler-poke-x86` | [`video/Kepler/BRIEF-kepler-poke-terminal.md`](video/Kepler/BRIEF-kepler-poke-terminal.md) |
+| **igpu** | `~/src/github.com/pmes/UnaOS-gemini-igpu` | `wt/gmux-igd-x86` | [`video/iGUI/BRIEF-igpu-gmux-igd.md`](video/iGUI/BRIEF-igpu-gmux-igd.md) |
 
-Your target address checks out, so the read should now be real: `falcon_io(0x504)` = `0x504 << 6` = `0x14100`, and `0x409000 + 0x504` = `0x409504`. Use `falcon_io(0x504)` in the assertion rather than the literal `0x4100` — your module's own spec-§3 rule says so, and a literal is what let the last one hide.
+Both trees are already created and already sit on trunk tip `ce5c6f49`. **Do not create
+worktrees, do not rebase onto anything else, and do not touch the other lane's tree.**
 
-**Two cautions on the runlist, then go.**
+---
 
-`RUNLIST_LEN` used at both the config write and the poll is exactly right. But do not read a fast exit as success: the runlist you are polling about is the one filled with `0xBEAC0001..0xBEAC0008`. Matching `len == 3` will now exit the loop promptly and save ~200k uncached BAR0 reads — that is a real boot-time win and worth having — but it says nothing about whether the runlist bound correctly, because its contents are known-bad. Your log line should make that impossible to misread later. Say `matched` or `bound` explicitly, not `ok`.
+## The five rules. These are why the last round was thrown away.
 
-Thank you for raising the beacon overwrite rather than patching it. It stays out of this round.
+**1. COMMIT YOUR WORK.** The previous kepler session left its entire arc uncommitted in a
+working tree while its HEAD still carried the defect the arc existed to remove. Had that
+lane been merged on the strength of "the work is done", the dangerous version is what would
+have landed. **Uncommitted work does not exist.** Commit every milestone; never report
+complete against a dirty tree.
 
-**What the next boot decides:** with `$r8` actually loaded, `CC_SCRATCH[1]` is a real Falcon-side read of `0x409504` for the first time. If it comes back `00000000` again, that is now a finding rather than an artifact — the previous zero was `I[0]`/INTR_SET and carried no information about that register.
+**2. YOUR ARTIFACTS LIVE IN THE REPO, NOT IN YOUR HEAD-SPACE.** Write your plan, your
+walkthrough and your findings as files in your tree under `docs/dev/GEMINI/`, and **commit
+them**. Exact paths are in your brief. Anything that lives only in a session-private
+scratch directory is invisible to review and will be treated as not having happened.
 
-## → igpu
+**3. THE GATE MUST CARRY THE KNOBS THAT COMPILE YOUR CODE.** A green gate that did not
+compile your change is not evidence — it is the single most expensive mistake in this
+project's history and it has now happened three separate ways. Your brief names your exact
+gate command. Run that one. Check the `⚡ kernel features:` banner actually lists your
+feature before you believe any result.
 
-**APPROVED WITH ONE MUST-FIX. The `ui_tick_service()` seam is accepted, the handshake/order/read-back/auto-revert corrections are all right, and you were right to route the revert off the GUI loop.**
+**4. VERIFY WITH A TOOL, NOT WITH YOUR COMMENTS.** Four malformed falcon instructions
+survived three review rounds because the assertions checked immediates and the comments
+said the right thing. `envydis`, built from the in-repo `envytools`, is what caught them.
+Where your brief names a verification tool, that tool's output is the evidence — not your
+description of what the code does.
 
-**⛔ MUST-FIX — a 20 ms spin inside `timer_interrupt_handler` is self-defeating, and it stalls the clock it depends on.**
+**5. STATE WHAT YOU DID NOT DO.** A commit message that claims a fix it does not contain
+costs more than no commit at all. The last igpu commit was titled "Deferred GMUX IGD
+Switch" and deferred nothing. If you ran out of road, say so in the commit body.
 
-That handler runs at **1 kHz — one tick every 1 ms** (`TICK_HZ = 1000`), on an **interrupt gate with IF=0**. Your hook at `interrupts.rs:372` lands in the `cpu_index == 0` branch, which is:
+---
 
-- **before `apic::eoi()`** (`:385`) — so a 20 ms spin holds the in-service bit and blocks this CPU's own subsequent timer ticks for the whole duration;
-- **before `sched::timer_preempt()`** (`:388`) — so it stalls the preemption point;
-- **on the one core that advances the global millisecond clock** (`:375-376`, BSP only, by design, because summing all cores would run `ms()` 8× fast).
+## Standing facts — do not re-derive these, they cost real boots
 
-That last one is the circular part: **the revert deadline is measured with `ms()`, and the revert would stall the clock that produces `ms()`.** A 20 ms blocking handshake in a 1 ms handler cannot work.
+- **`./arroyo check` with no knobs compiles neither GPU driver nor the SMC.** Bare green is
+  green about a build without your work in it.
+- **A knob must be declared in THREE places** or it silently does nothing:
+  `unaos/crates/kernel/Cargo.toml`, `unaos/arroyo`, and `unaos/builder/src/main.rs`. The
+  builder rebuilds the kernel, so a knob missing there ships the feature disabled while
+  every log line claims it is on.
+- **Read serial captures with `awk`, never `grep`** — control bytes in the logs break grep.
+- **The rig is Linux.** Everything runs on the Fedora host via
+  `flatpak-spawn --host bash -c 'export PATH=$HOME/.cargo/bin:$PATH; …'`.
+- **Metal is the verdict.** QEMU cannot reach these paths. Never run a QEMU suite.
+- **Ask before you touch a file outside your lane.** `main.rs`, `shell.rs`, `arroyo`,
+  `builder/` and `interrupts.rs` belong to the integrator. If your change needs one, say so
+  and stop — a two-line seam is cheap to hand over and expensive to collide on.
 
-**The fix is better than the plan, not more restrictive: make the revert a tick-driven state machine.** One step per tick, never spin. Advance on the busy bit; if it is still busy, return and try next tick. At 1 kHz, twenty ticks *is* twenty milliseconds — you get the reference `udelay(100) × 200` budget exactly, for free, with zero time spent in interrupt context. Each tick does at most one `outb`/`inb` and returns. Give it a hard step cap so a wedged mux ends the sequence instead of retrying forever, and print the outcome.
+## What the last round did get right — keep doing this
 
-Keep everything else as written: read the real pre-switch values and revert to those, `SW_DDC` → `SW_DISPLAY` → `SW_EXTERNAL` in both directions, read back and print after both, abort rather than pushing into a busy mux.
-
-**Two smaller things:**
-
-- **The read-back is your success criterion, not the panel.** Your own census says every pipe, plane and PLL is zero, so the panel will stay black — that is not the experiment failing. What this boot can actually establish is whether the mux write *lands*, which is what a future round needs before it configures pipes. State that in the plan so the result is not read as a defeat.
-- `ui_tick_service()` in `lib.rs` is fine, and adding it with a comment rather than splicing it into `main.rs` is the correct handling of the seam. **I will wire the call sites** — the inline loop today, `input_service` after the scheduler arc lands. Do not touch `main.rs`.
-
-Answering your two questions directly: yes to `ui_tick_service()`. No to the timer handler as written — right path, wrong shape; make it a state machine and it becomes the right answer.
+- Building `envydis` from the in-repo `envytools` and disassembling the extracted byte
+  arrays. Zero unknown instructions, every branch displacement resolved by arithmetic.
+  That method is now standing law for any microcode change.
+- Whole-slice `const _: () = assert!` matchers that pin the destination register, not just
+  the immediate.
+- Deriving port immediates from `falcon_io()` rather than hand-writing them.
+- The `RevertState` pack/unpack helper — one encode/decode point instead of open-coded
+  shifts at fourteen sites.
+- Diagnosing the `usbdebug` enclosure correctly, against the integrator's contradiction.
+  That one was right and it is now fixed in trunk (`6e7b64d6`), credited.
