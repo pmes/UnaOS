@@ -1091,14 +1091,16 @@ kernel8() {
     # the register station either side of the send, and the firmware's own clock/display state, with
     # GET_CLOCK_RATE as the positive control that makes a null reading interpretable. Separately
     # armable BECAUSE they are independent hypotheses: a boot that sends both can attribute a change to
-    # neither. Arming a leg stands down the doorbell-waiting send of the same tag ([v3d75a] / [v3d80]),
-    # so the tag is sent exactly once per boot and the pre-station is honest. Each implies
+    # neither. Arming a leg stands down [v3d75a]'s doorbell-waiting send of the same tag, and stands
+    # [v3d80] down outright whichever leg is armed — it sits immediately before the battery and its
+    # NOTIFY may be honoured reply-lessly, so leaving it in would hand [v3d81q] a baseline taken on a
+    # firmware already told to release the display. Sent once per boot or not at all. Each implies
     # UNAOS_V3D_DEEP (the legs ride the tail of the deep battery, where their comparison readings are
     # taken). ⚠ UNAOS_V3D81_DISPLAY may take the bench panel to black permanently — by design; serial
     # carries the whole verdict. See docs/dev/OS/08_VIDEO/v3d.md §47.
     if [ -n "${UNAOS_V3D81_QPU:-}" ]; then
         K8_FEATS="${K8_FEATS},v3d81_qpu,v3d81,v3d_deep,v3d"
-        echo -e "${COLOR_YELLOW}  • UNAOS_V3D81_QPU: send SET_ENABLE_QPU reply-less and read the effect ([v3d75a]'s send stands down)${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D81_QPU: send SET_ENABLE_QPU reply-less and read the effect ([v3d75a] and [v3d80] both stand down)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_V3D81_DISPLAY:-}" ]; then
         K8_FEATS="${K8_FEATS},v3d81_display,v3d81,v3d_deep,v3d"

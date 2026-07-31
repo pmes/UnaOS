@@ -38,6 +38,11 @@ const MBOX_WRITE: usize = MBOX_BASE + 0x20;
 const MBOX_FULL: u32 = 0x8000_0000; // STATUS: write FIFO full  -> can't post
 const MBOX_EMPTY: u32 = 0x4000_0000; // STATUS: read FIFO empty -> nothing to read
 const MBOX_RESPONSE: u32 = 0x8000_0000; // request-code reply: success
+/// Request-code reply: "error parsing request buffer" — the VPU read the message and found it
+/// MALFORMED. It wrote, but it never looked at any tag inside, so this code must never be read as
+/// evidence that a tag was acted on (PI-V3D-81, `NoReplySend::buffer_rejected`).
+#[cfg(feature = "v3d81")]
+const MBOX_ERROR: u32 = 0x8000_0001;
 
 const CH_PROP: u32 = 8; // ARM -> VC property tags
 
@@ -221,10 +226,18 @@ fn mbox_call(len: usize) -> bool {
     mbox_call_budget(len, 500)
 }
 
-/// PI-V3D-80: same call, caller-chosen reply budget. NOTIFY_DISPLAY_DONE makes the firmware STOP
-/// its display driver before replying — measured >500 ms on the bench (P92: the only property
-/// call to time out at the default budget). The kernel's mailbox wait is unbounded; ours stays
+/// PI-V3D-80: same call, caller-chosen reply budget, for a caller that has reason to think its tag
+/// takes longer than the default 500 ms. The kernel's mailbox wait is unbounded; ours stays
 /// bounded, just wider where the work is real.
+///
+/// ⚠ PI-V3D-81 correction (v3d.md §46.5). This entry point was added on the reading that
+/// `NOTIFY_DISPLAY_DONE` merely replies SLOWLY — that the firmware stops its whole display driver
+/// before answering. That reading is wrong, and no budget can repair it: P92 timed out at 500 ms,
+/// P93 timed out at 5 s, and the same P93 capture shows `NOTIFY_XHCI_RESET` timing out *while the
+/// VL805 firmware load it requests demonstrably works*. On this firmware a NOTIFY-class tag is
+/// acted on WITHOUT ever ringing the read FIFO, so a timeout here is a statement about the
+/// DOORBELL and not about the tag. Widening the budget only makes that statement more slowly. To
+/// read such a tag, post it with [`post_noreply`] and read its EFFECT.
 fn mbox_call_budget(len: usize, budget_ms: u64) -> bool {
     let buf_phys = mbox_phys() as u32;
 
@@ -348,7 +361,12 @@ pub fn set_enable_qpu(enable: u32) -> Option<u32> {
 /// display/GPU complex to the ARM. The V3D-80 hypothesis: the VPU holds V3D thread-start to
 /// itself until the ARM claims ownership this way. ⚠ Side effect on a firmware-fb system: the
 /// firmware display driver stops — scanout of the mailbox-allocated framebuffer may die (black
-/// panel; serial unaffected). Returns Some(()) on a successful call, None on mailbox failure.
+/// panel; serial unaffected).
+///
+/// ⚠ PI-V3D-81 (§46.5): this function cannot report whether the handover HAPPENED. It returns
+/// `Some(())` only when a DOORBELL arrives, and this firmware honours NOTIFY-class tags without
+/// ringing — so `None` means "no doorbell", never "no handover". Kept so the historic P92/P93 sends
+/// stay reproducible; [`notify_display_done_noreply`] is the reading path.
 #[cfg(feature = "v3d")]
 pub fn notify_display_done() -> Option<()> {
     request(0, 6 * 4); // total size (6 words used)
@@ -357,8 +375,10 @@ pub fn notify_display_done() -> Option<()> {
     request(3, 0); // value buffer size (zero-length, like vc4's NULL/0 call)
     request(4, 0); // request code
     request(5, TAG_END);
-    // 5 s budget: the firmware stops its whole display driver before replying (P92 measured the
-    // default 500 ms as insufficient — the one property call on the bench that ever needed more).
+    // 5 s budget, kept only for reproducibility of P93. It was chosen on the belief that the
+    // firmware stops its whole display driver before replying; §46.5 refuted that — P93 timed out
+    // at 5 s exactly as P92 did at 500 ms, because there is no reply to wait for. A false return
+    // below is therefore "no doorbell", not "no handover".
     if !mbox_call_budget(6, 5000) {
         return None;
     }
@@ -398,8 +418,10 @@ pub fn notify_display_done() -> Option<()> {
 // settle leaves a doorbell in the FIFO that the next ordinary `mbox_call` would consume as its own
 // reply, reading a buffer that the newer request has already overwritten. `post_noreply` therefore
 // drains and COUNTS the FIFO before posting (`stale_pre`) and again across the settle, and
-// [`drain_property_fifo`] lets a caller re-drain before each follow-up query. A non-zero
-// `stale_pre` on a later leg is the visible tell that this happened.
+// [`drain_property_fifo`] lets a caller re-drain before each follow-up query — RETURNING the count,
+// because a drain that swallows a late doorbell silently destroys the only evidence that one ever
+// arrived. Every caller of it must print what it discarded: whichever drain runs first is where the
+// late reply shows up, and `stale_pre` will read 0 on a leg whose caller already swept the FIFO.
 
 /// PI-V3D-81 — everything a reply-less post left behind. Read the fields in this order: `posted`
 /// (did the message even reach the write FIFO — nothing below means anything if not), `doorbells`
@@ -440,17 +462,37 @@ pub struct NoReplySend {
 
 #[cfg(feature = "v3d81")]
 impl NoReplySend {
-    /// Did the VPU write a response into our buffer? True = the message was parsed and the tag
+    /// The VPU parsed our message and REJECTED it (`overall = 0x8000_0001`, "error parsing request
+    /// buffer"). It wrote — so the transport and our invalidate were both alive — but it never
+    /// reached the tag, so this state must never read as "acted". Low-probability (these messages
+    /// are byte-for-byte the working doorbell-waiting senders' messages) and split out anyway,
+    /// because it is precisely the state in which the buffer channel says the opposite of what it
+    /// means: the one write that proves the tag was NOT looked at.
+    pub fn buffer_rejected(&self) -> bool {
+        self.overall == MBOX_ERROR
+    }
+
+    /// Did the VPU write a RESPONSE into our buffer? True = the message was parsed and the tag
     /// acted on, doorbell or no doorbell. This is the "acted" half of the acted-vs-ignored
-    /// discrimination, and it costs no panel and no attended observer.
+    /// discrimination, and it costs no panel and no attended observer. A rejected buffer is
+    /// excluded — see [`Self::buffer_rejected`].
+    ///
+    /// Only the TRUE reading is control-free. A stamped `0x8000_0000` cannot come from our own
+    /// posted words, so it stands on its own; FALSE can equally mean our invalidate went blind,
+    /// which is what the caller's positive control is there to rule out.
     pub fn buffer_written(&self) -> bool {
-        self.overall != 0 || self.tag_code & 0x8000_0000 != 0
+        !self.buffer_rejected() && (self.overall != 0 || self.tag_code & 0x8000_0000 != 0)
     }
 }
 
 /// PI-V3D-81 — empty the read FIFO without waiting for anything, returning how many words were
 /// discarded. Bounded by construction: a FIFO that will not empty is a fault, not a queue, and
 /// spinning on one here would hang the boot the instrument is meant to describe.
+///
+/// The count is not optional bookkeeping. A doorbell that arrives after a leg's settle is the only
+/// trace a late-replying tag leaves, and this function is what destroys it — so a caller that drops
+/// the return has silently deleted the evidence for the one hazard the reply-less path admits to.
+/// Print it.
 #[cfg(feature = "v3d81")]
 pub fn drain_property_fifo() -> u32 {
     let mut n = 0;
@@ -496,9 +538,12 @@ fn post_noreply(len: usize, settle_ms: u64) -> NoReplySend {
     }
 
     // The settle. Not a wait for a reply — a stated interval during which the firmware may act, and
-    // during which we notice a doorbell if one comes without needing it to.
+    // during which we notice a doorbell if one comes without needing it to. Skipped outright when
+    // the post never landed: there is nothing for the firmware to act ON, so the whole interval (up
+    // to 10 s) would buy a leg that already carries no reading nothing but a slower boot. The
+    // measured `settle_us` then reads ~0, which is the honest record of what was actually waited.
     let t_post = super::timer::cntpct();
-    let settle_end = t_post + frq / 1000 * settle_ms;
+    let settle_end = if posted { t_post + frq / 1000 * settle_ms } else { t_post };
     let (mut doorbells, mut other_ch, mut first_doorbell_us) = (0u32, 0u32, 0u64);
     while super::timer::cntpct() < settle_end {
         if mmio_read(MBOX_STATUS) & MBOX_EMPTY == 0 {
