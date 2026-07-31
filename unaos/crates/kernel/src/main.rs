@@ -1147,6 +1147,89 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // SCHED-X86 (x86_64): the same handoff, on this arch, for the same reason. The BSP hands the
+    // panel to scheduled kernel services and then JOINS THE SCHEDULER instead of falling into the
+    // inline GUI loop below — the loop that made `bg`/`run` place ring-3 tasks on a core which never
+    // popped its run queue (metal: 2 BGRUN spawns, zero `SYS_WIN_CREATE`, zero `:: SYSCALL:`, both
+    // kills burning the full KILL_CONFIRM_MS, `c0:0/0` beside `0/263` everywhere else).
+    //
+    // It must diverge HERE, before `let mut console` / `Screen::new` below: `x86_render_service`
+    // builds its own ~28 MiB cached-RAM back buffer, and a second one on the BSP would OOM the 48 MiB
+    // metal heap. Same placement, and the same reason, as the Pi's block above.
+    //
+    // Gated off under `rast`: the RAST-1 demo below drives the BSP's local `screen`, which does not
+    // exist on this path. That knob keeps the inline loop.
+    #[cfg(all(target_arch = "x86_64", not(feature = "rast")))]
+    if framebuffer_addr != 0 {
+        let online = unaos_kernel::arch::smp::online_aps();
+        // Two DISTINCT cores or nothing. `XHCI_CONTROLLER` is a raw `spin::Mutex` and both the
+        // service task and the render/shell task take it (the latter through `fat` block reads,
+        // `pal::pump_and_poll` inside a full-screen app, and `usbinfo`). Kernel tasks are preempted
+        // like any other, so two preemptible takers of a raw spinlock on ONE core deadlock it: the
+        // spinner cannot yield, so the holder it displaced can never be redispatched. Cross-core the
+        // same contention is bounded spin and progresses. Declining the handoff is the honest
+        // fallback — the inline loop below still works, it is only unscheduled.
+        let split = match (online.first(), online.last()) {
+            (Some(&render_cpu), Some(&svc_cpu)) if render_cpu != svc_cpu => {
+                Some((render_cpu, svc_cpu))
+            }
+            _ => None,
+        };
+        if let Some((render_cpu, svc_cpu)) = split {
+            // Reserve the channel's waiter capacity on the BSP, before any task can block on it —
+            // otherwise the first park would grow a `VecDeque` (and take the heap lock) inside the
+            // path that is proven not to allocate. Must precede the spawns.
+            GUI_CHANNEL_X86.init();
+
+            // The handoff milestones, replicated from below in their existing order and fired BEFORE
+            // any task can paint. HANDOFF-CLEAN: record + detach strictly before the first console
+            // frame, so the milestone's on-panel leg draws on the PRE-GUI panel and nothing paints
+            // behind the GUI afterwards.
+            unaos_kernel::bootlog::record("gui:handoff");
+            // BPACE: the desktop-up number — the one every boot-pace trim is measured against. It
+            // must keep landing on this path or the ledger silently loses its terminal stamp.
+            unaos_kernel::bootpace::record("gui");
+            // The GUI now owns the screen — stop fbcon mirroring serial onto the framebuffer, so
+            // exactly one core writes the panel (a panic re-attaches).
+            unaos_kernel::video::fbcon::detach();
+
+            // The Pi's order: device service, then input, then render. `arg` carries the core index
+            // so each task's own dispatch witness names the core it actually woke up on rather than
+            // the one we intended.
+            unaos_kernel::arch::sched::spawn(
+                "usb-pump",
+                x86_usb_pump,
+                svc_cpu,
+                svc_cpu,
+                unaos_kernel::arch::sched::PRIO_NORMAL,
+            );
+            unaos_kernel::arch::sched::spawn(
+                "input",
+                x86_input_service,
+                svc_cpu,
+                svc_cpu,
+                unaos_kernel::arch::sched::PRIO_NORMAL,
+            );
+            unaos_kernel::arch::sched::spawn(
+                "render",
+                x86_render_service,
+                render_cpu,
+                render_cpu,
+                unaos_kernel::arch::sched::PRIO_NORMAL,
+            );
+            serial_println!(
+                ":: SCHED-X86: RENDER on core {} + INPUT/usb-pump on core {} ({} AP(s) dispatching) — OS on its own scheduler ::",
+                render_cpu, svc_cpu, online.len()
+            );
+            // The BSP joins the scheduler. Diverges — nothing below this line runs on this path.
+            unaos_kernel::arch::sched::run_bsp(0);
+        }
+        serial_println!(
+            ":: SCHED-X86: {} AP(s) dispatching — the render/service split needs 2 distinct cores; GUI stays inline on the BSP ::",
+            online.len()
+        );
+    }
+
     let mut console = unaos_kernel::console::Console::new();
 
     // Build the double-buffered screen over the framebuffer. FrameBuffer is Copy, so we take a
@@ -2204,6 +2287,47 @@ fn jd2_console_pump(_arg: usize) {
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static GUI_CHANNEL: unaos_kernel::arch::sched::Channel<unaos_kernel::pal::Event> =
     unaos_kernel::arch::sched::Channel::new(64);
+
+/// SCHED-X86: the x86 twin of `GUI_CHANNEL` — the input service `send`s, the render service `recv`s,
+/// across two different application processors. Same capacity (64) and the same backpressure
+/// contract: a full channel blocks the producer rather than dropping a keystroke. Separate from the
+/// aarch64 static (rather than one ungated channel) because the two arches' handoffs are gated on
+/// different feature sets and neither build should carry the other's 64-slot `VecDeque`.
+#[cfg(target_arch = "x86_64")]
+static GUI_CHANNEL_X86: unaos_kernel::arch::sched::Channel<unaos_kernel::pal::Event> =
+    unaos_kernel::arch::sched::Channel::new(64);
+
+/// SCHED-X86 (depth witness): events forwarded INTO / taken OUT OF `GUI_CHANNEL_X86`. `sent - recv`
+/// is the live queue depth, which is the one number that distinguishes "the render task is keeping
+/// up" from "the render task is wedged and the input task is about to block in `send`". Both sites
+/// live in this file, so the pair cannot drift.
+#[cfg(target_arch = "x86_64")]
+static GUI_SENT_X86: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(target_arch = "x86_64")]
+static GUI_RECV_X86: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// SCHED-X86: ms() of the last `[schedx86] depth` line, rate-limiting it to once every ~5 s. The
+/// render task passes at least four times a second (the pulse), so this is a real clock gate and not
+/// a pass counter standing in for one.
+#[cfg(target_arch = "x86_64")]
+static GUI_DEPTH_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// SCHED-X86: cadence of the render task's periodic wake, posted as an `Event::Timer` by the input
+/// service. The render loop BLOCKS on `recv`, so without a pulse two things that are not driven by
+/// input would never happen: the CURSOR-HIDE auto-hide erase (which fires ~1.5 s after the last
+/// pointer report) and the `instgui` disk rescan. The Pi solves this with a dedicated `status-tick`
+/// task; here it rides the input service's existing nap — a wall-clock compare per pass, no extra
+/// task, no extra timer. 250 ms keeps the auto-hide crisp at four channel sends per second.
+#[cfg(target_arch = "x86_64")]
+const X86_GUI_PULSE_MS: u64 = 250;
+
+/// SCHED-X86: forward one event into `GUI_CHANNEL_X86` and bump the sent counter — the single choke
+/// point, so `GUI_SENT_X86` can never disagree with the real send count.
+#[cfg(target_arch = "x86_64")]
+fn gui_send_x86(ev: unaos_kernel::pal::Event) {
+    GUI_SENT_X86.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    GUI_CHANNEL_X86.send(ev);
+}
 
 /// One-shot guard: log "RX interrupt live" exactly once, from the input task (never the ISR).
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
@@ -3523,14 +3647,310 @@ fn usb_pump(_: usize) {
     }
 }
 
+// ── SCHED-X86 ───────────────────────────────────────────────────────────────────────────────────
+// The x86 GUI handoff, mirroring the Pi's M5/M5b/PIUSB-26 split (`usb_pump` / `input_service` /
+// `render_service` above). Until this arc the x86 BSP fell into an inline GUI loop at the end of
+// `kernel_main` and NEVER entered the scheduler, which had two consequences the metal capture named:
+// every `bg`/`run` placed its ring-3 task on the calling core (core 0, `bg_place_cpu` =
+// `meter_current_cpu`), where nothing ever popped the run queue — 2 BGRUN spawns, zero
+// `wc-x86: SYS_WIN_CREATE`, zero `:: SYSCALL:` witnesses, both kills burning the full
+// `KILL_CONFIRM_MS` — and the pulse meter read `c0:0/0` while every other core read `0/263`.
+//
+// The three tasks below dismantle that loop into scheduled kernel services and the BSP joins the
+// scheduler via `sched::run_bsp(0)`. Two placement rules are LOAD-BEARING and are asserted at the
+// spawn site rather than left to comments:
+//
+//  1. `x86_usb_pump` and `x86_render_service` MUST be on DIFFERENT cores. `XHCI_CONTROLLER` is a raw
+//     `spin::Mutex`, not the scheduler's sleeping `Mutex`, and both tasks take it (the pump directly;
+//     the render side transitively, through `fat` block reads, `pal::pump_and_poll` inside a
+//     full-screen app, and the `usbinfo` verb). Kernel tasks ARE preempted (`timer_preempt` acts on
+//     any `current`, not just ring 3), so co-locating two preemptible takers of a raw spinlock on one
+//     core is a hard deadlock: preempt the holder and the spinner — which cannot yield — owns the
+//     core forever. Cross-core it is bounded spin, which progresses. No future task that touches xHCI
+//     may be added to the render core.
+//  2. `x86_input_service` PAINTS NOTHING. On x86 `pal::cursor::SPRITE_OWNS_PAINT` is true, so the
+//     cursor verbs drive the compositor sprite straight into the FRONT buffer; running them on the
+//     input core would put two cores on the panel. The routers (`wc_click_route`, `el0_input_route`)
+//     move with the pixels for the same reason — `wc_click_route` mutates window-manager focus and
+//     repaints through `wm::focus_changed`, so it belongs on the render side. The input task is a
+//     pure forwarder, exactly like the Pi's.
+
+/// SCHED-X86: the DEVICE-SERVICE task — every per-pass call the dismantled BSP GUI loop made that
+/// touches hardware and no pixel. Owns the xHCI service family, the FAT/flight-recorder/boot-ledger
+/// pumps, the one-shot witness probes and the NIC drain. Pinned to the service core; never returns.
+///
+/// Cadence: `sleep_ticks(1)` ≈ 1 ms at the calibrated 1 kHz local-APIC tick. That is deliberately the
+/// SAME floor the old loop had — it ended each pass in `hlt()`, which the periodic timer broke once
+/// per tick — so this is a faithful translation of the service rate and not a boot-pace regression.
+#[cfg(target_arch = "x86_64")]
+fn x86_usb_pump(cpu: usize) {
+    serial_println!(":: SCHED-X86: usb-pump task dispatched on core {} ::", cpu);
+    loop {
+        // Nap first: `spawn` puts us on the run queue immediately, and the framebuffer handoff on the
+        // BSP is still finishing. One tick costs nothing and keeps the first pass off that seam.
+        unaos_kernel::arch::sched::sleep_ticks(1);
+        // Poll xHCI, then run any deferred storage work (synchronous BOT transactions run here, in a
+        // safe non-event context). The lock is released at the end of this block — everything below
+        // re-locks briefly, so there is no nested-lock hazard.
+        if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
+            xhci.poll_events();
+            // BOOTPACE M2 — CONSOLE-FIRST: `service_ftdi` ahead of `service_storage`, so the console
+            // is armed before the deferred SCSI bring-up puts its multi-second chain on the wire.
+            xhci.service_ftdi();
+            xhci.service_storage();
+            xhci.service_hubs();
+            xhci.service_hid_setproto();
+            xhci.service_slot_disposal();
+            xhci.service_enum();
+        }
+        // EHCI-3 (ehcihid knob): poll the EHCI HID interrupt endpoints (internal rMBP
+        // keyboard/trackpad). Same polled-service spot as the xHCI hooks above.
+        #[cfg(feature = "ehcihid")]
+        unaos_kernel::drivers::ehci::service_ehci_hid();
+        // STOR-1 (irqstorage knob): bring up the interrupt-driven storage service task once a block
+        // device is present, then run the `bx-blockreq` self-test once. Both one-shot + gated.
+        #[cfg(feature = "irqstorage")]
+        {
+            unaos_kernel::drivers::xhci::irqstorage::start_service_once();
+            unaos_kernel::drivers::xhci::irqstorage::selftest_once();
+        }
+        // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI lock
+        // released; `read_block` re-locks it briefly.
+        unaos_kernel::fs::fat::probe_once();
+        // GUI-WITNESS M3 (witness knob): re-dump the boot-milestone ring to serial on growth.
+        #[cfg(feature = "witness")]
+        unaos_kernel::bootlog::service_serial_dump();
+        // BPACE: re-emit the boot-phase timing ledger whenever it grows. Deliberately NOT under the
+        // witness gate — the media `./arroyo esp-x86` writes carries neither `witness` nor
+        // `usbdebug`, and this is the only build that reaches the bench.
+        unaos_kernel::bootpace::service_dump();
+        // FLIGHT-RECORDER: flush the captured serial boot log to UNAOS.LOG on the FAT volume.
+        unaos_kernel::flight_recorder::service();
+        // U2/U4x/U5x/U6x/U6bx (witness knob): the ring-3 fixture ladder, each one-shot and gated on
+        // storage. These used to run on the BSP; they now run inside a kernel task, which is strictly
+        // better for them — `spawn_user`'s target-core choice and the bounded `ticks()` waits are
+        // unchanged, and core 0's ms-clock keeps advancing underneath.
+        #[cfg(feature = "witness")]
+        {
+            unaos_kernel::arch::syscall::u2_probe_once();
+            unaos_kernel::arch::syscall::u4x_probe_once();
+            unaos_kernel::arch::syscall::u5x_probe_once();
+            unaos_kernel::arch::syscall::u6x_probe_once();
+            unaos_kernel::arch::syscall::u6bx_probe_once();
+        }
+        // INSTALL-CORE (installdemo knob): run the installer engine end-to-end once a blank scratch
+        // disk is present. INSTGUI supersedes it — there the attended Enter is the only trigger.
+        #[cfg(all(feature = "installdemo", not(feature = "instgui")))]
+        unaos_kernel::install::install_probe_once();
+        // One-shot USB topology dump to serial (enumeration diagnosis; `usbinfo` shows it live).
+        unaos_kernel::drivers::xhci::log_summary_once();
+        // Drain any frames the NIC has received into the network stack (no-op with no NIC).
+        unaos_kernel::drivers::e1000::service_net();
+    }
+}
+
+/// SCHED-X86: the INPUT service — drain `pal::EVENT_QUEUE` (filled by the HID decode inside
+/// `x86_usb_pump`'s `poll_events`) and forward every event over `GUI_CHANNEL_X86` to the render task.
+/// Paints nothing and routes nothing; never returns.
+///
+/// Two behaviours it carries that are not "forward an event":
+///
+///  * **The `SCREEN_APP_ACTIVE` gate**, taken straight from the Pi's `pump_usb_into_gui`. While a
+///    full-screen command owns the panel the render task is blocked inside `dispatch_command` and
+///    cannot drain the channel, so forwarding would (a) starve the app, which reads `EVENT_QUEUE`
+///    itself through `pal::pump_and_poll`, and (b) fill the 64 slots and block this task in `send`.
+///    While the flag is set we leave the queue alone — that IS the delivery path for those apps.
+///  * **The `X86_GUI_PULSE_MS` heartbeat.** The render loop blocks on `recv`, so a periodic
+///    `Event::Timer` is what lets it run the CURSOR-HIDE auto-hide erase and the `instgui` rescan
+///    with no input arriving. `Event::Timer` is inert everywhere else on the path: `wc_click_route`
+///    ignores non-`Button` events, and `pack_input` returns `None` for it so `el0_input_route` hands
+///    it straight back rather than pushing it into a focused app's ring.
+#[cfg(target_arch = "x86_64")]
+fn x86_input_service(cpu: usize) {
+    use core::sync::atomic::Ordering;
+    serial_println!(":: SCHED-X86: input task dispatched on core {} ::", cpu);
+    let mut pulse_ms = unaos_kernel::arch::ms();
+    loop {
+        if SCREEN_APP_ACTIVE.load(Ordering::Relaxed) {
+            // A full-screen app owns the panel and the queue. Re-base the pulse clock so the first
+            // pass after it exits does not fire a stale backlog of one Timer.
+            pulse_ms = unaos_kernel::arch::ms();
+        } else {
+            while let Some(ev) = unaos_kernel::pal::next_event() {
+                gui_send_x86(ev);
+            }
+            let now = unaos_kernel::arch::ms();
+            if now.wrapping_sub(pulse_ms) >= X86_GUI_PULSE_MS {
+                pulse_ms = now;
+                gui_send_x86(unaos_kernel::pal::Event::Timer);
+            }
+        }
+        unaos_kernel::arch::sched::sleep_ticks(1); // ~1 ms at the calibrated 1 kHz tick
+    }
+}
+
+/// SCHED-X86: the RENDER service — the interactive OS as a scheduled kernel task, and the sole owner
+/// of every pixel. Builds its own `Screen`/`TargetPal`/`Console` over the framebuffer the BSP left in
+/// `WRITER` (and detached fbcon from), paints the first frame, then blocks on `GUI_CHANNEL_X86` and
+/// dispatches each event through the same routing and the same shared `handle_key` the dismantled BSP
+/// loop used. Never returns.
+///
+/// It owns the ~28 MiB cached-RAM back buffer, which is why the handoff block in `kernel_main` must
+/// diverge into `run_bsp` BEFORE the BSP builds one of its own: a second shadow OOMs the 48 MiB metal
+/// heap (the same budget `fbcon::attach_shadow` is kept off the GUI path for).
+///
+/// Presentation is one `pal.render()` per received event. That is strictly FEWER presents than the
+/// loop it replaces, which rendered on every pass — i.e. ~1 kHz, since it ended each idle pass in
+/// `hlt()` and the periodic timer broke it every tick. Blocking on `recv` means an idle render core
+/// is off the run queue entirely and `hlt`s.
+#[cfg(target_arch = "x86_64")]
+fn x86_render_service(cpu: usize) {
+    use core::sync::atomic::Ordering;
+    use unaos_kernel::pal::GneissPal; // for pal.width()/height()/render()
+
+    // FrameBuffer is Copy: take a handle and release the WRITER lock immediately. All GUI drawing
+    // goes to a cached-RAM back buffer; render() flushes only the damaged region.
+    let front_fb = *unaos_kernel::video::WRITER.lock();
+    let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
+    let mut console = unaos_kernel::console::Console::new();
+
+    console.draw(&mut pal);
+    pal.render();
+    // The falsifiable pair to the spawn-site line: this one is printed by the task ITSELF, after it
+    // has built the panel surface and presented a frame. Spawned is not dispatched (the WINX-2/WINX-3
+    // lesson); a spawn line with no dispatch line means the task is sitting in a run queue nobody
+    // pops, which is the exact failure this whole arc exists to remove.
+    serial_println!(
+        ":: SCHED-X86: render task dispatched on core {} — panel owned by the scheduler ::",
+        cpu
+    );
+
+    // CURSOR-HIDE: whether the last pass drew the cursor, so the auto-hide transition erases the
+    // sprite exactly once. Driven by the input service's `Event::Timer` pulse when nothing is typed.
+    let mut cursor_was_visible = false;
+
+    loop {
+        // Block until an event arrives — an idle render core burns nothing.
+        let mut raw = GUI_CHANNEL_X86.recv();
+        GUI_RECV_X86.fetch_add(1, Ordering::Relaxed);
+
+        // SCHED-X86 DRAIN: dispatch EVERY queued event, then present ONCE below — the dismantled
+        // BSP loop's semantic, kept deliberately. Presenting per event is the regression this file
+        // already documents (see the CURSOR-10 note on the old loop): a native-resolution flush is
+        // slow, so one present per event made "the cursor never catch up; typed text appeared
+        // seconds late". A keystroke burst or one trackpad sweep queues dozens of events into the
+        // 64-slot channel, and each would otherwise cost its own full present.
+        loop {
+            // WINX-7 / CLICK-X86 — the router pair, in the dismantled loop's exact order. A pointer
+            // BUTTON is ADDRESSED before it is DELIVERED: `el0_input_route` routes by FOCUS, which is
+            // right for a keystroke and wrong for a click (that belongs to the window under the cursor),
+            // so `wc_click_route` hit-tests the press first and answers `true` only when it CONSUMED the
+            // event. Both return `Event::Unknown` (never `Event::None`) for a consumed event.
+            let ev = if unaos_kernel::arch::x86_64::syscall::wc_click_route(raw) {
+                unaos_kernel::pal::Event::Unknown
+            } else {
+                unaos_kernel::arch::x86_64::syscall::el0_input_route(raw)
+            };
+
+            match ev {
+                unaos_kernel::pal::Event::Key(c) => {
+                    // INSTGUI — while the installer dialog is open it owns the keyboard; the console
+                    // resumes the moment it closes.
+                    #[cfg(all(feature = "wc", feature = "instgui"))]
+                    let consumed = unaos_kernel::video::instgui::consume_key(c);
+                    #[cfg(not(all(feature = "wc", feature = "instgui")))]
+                    let consumed = false;
+                    if !consumed {
+                        // `handle_key` answers `true` when the command took the whole screen. The BSP
+                        // loop used that to stop DRAINING, and so do we — a command that owns the panel
+                        // must not have the rest of the burst painted over it before it is presented.
+                        if handle_key(c, &mut console, &mut pal) {
+                            break;
+                        }
+                    }
+                }
+                unaos_kernel::pal::Event::Mouse { x, y } => {
+                    // CURSOR-X86/CURSOR-WCR: on this target these verbs drive the COMPOSITOR SPRITE in
+                    // the front buffer, so `move_rel` repaints the arrow on the report itself and
+                    // `draw_over` is the idempotent tail; the leading `restore` the back-buffer targets
+                    // need is deliberately absent (it was a duplicated undraw with a wasted publish).
+                    unaos_kernel::pal::cursor::move_rel(x, y, pal.width() as i32, pal.height() as i32);
+                    unaos_kernel::pal::cursor::draw_over(&mut pal);
+                }
+                unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+                    unaos_kernel::pal::cursor::set_abs(x, y, pal.width() as i32, pal.height() as i32);
+                    unaos_kernel::pal::cursor::draw_over(&mut pal);
+                }
+                // CLICK-X86 — the PRESS arm. Reaching it means the press was NOT consumed by the click
+                // router and NOT taken by an EL0 ring, i.e. it is the SHELL's click, and the x86 shell has
+                // no click model yet. Deliberately empty of policy (the disposition is already on the wire
+                // from the router's `[clickroute]` line); this is where one attaches when it grows one.
+                unaos_kernel::pal::Event::Button(_mask) => {}
+                // Timer (the pulse) / KeyUp / Unknown: nothing to dispatch — the tail below still runs.
+                _ => {}
+            }
+
+            // Take the next queued event if one is already waiting; otherwise the burst is drained
+            // and we fall through to the single present. Never parks, so an empty channel costs one
+            // failed semaphore try rather than a deschedule.
+            match GUI_CHANNEL_X86.try_recv() {
+                Some(next) => {
+                    GUI_RECV_X86.fetch_add(1, Ordering::Relaxed);
+                    raw = next;
+                }
+                None => break,
+            }
+        }
+
+        // CURSOR-HIDE: restore the pixels under the sprite once when the auto-hide delay expires
+        // (reappearance is instant — the pointer arms above stamp the activity clock before drawing).
+        let cursor_vis = unaos_kernel::pal::cursor::visible();
+        if cursor_was_visible && !cursor_vis {
+            unaos_kernel::pal::cursor::restore(&mut pal);
+        }
+        cursor_was_visible = cursor_vis;
+
+        // INSTGUI: pick up disks that enumerate after the dialog opened (repaints only on change).
+        // Rides the pulse, which is why the pulse exists.
+        #[cfg(all(feature = "wc", feature = "instgui"))]
+        unaos_kernel::video::instgui::service();
+
+        // Present: flush the damaged region of the back buffer to the framebuffer. A no-op when
+        // nothing was drawn, so a pure cursor pass (front-buffer sprite) costs almost nothing.
+        pal.render();
+
+        // SCHED-X86 depth witness. `sent - recv` is the LIVE occupancy of the 64-slot channel, and it
+        // is the number that separates "the render task is keeping up" from "the render task is
+        // wedged and the input task is one burst away from blocking in `send`". Both counters are
+        // read HERE, from the consumer side, after the present — so the line is a measurement of the
+        // steady state, not of this task's own start-up. Rate-limited to ~5 s.
+        let now_ms = unaos_kernel::arch::ms();
+        let last = GUI_DEPTH_LAST_MS.load(Ordering::Relaxed);
+        if now_ms.wrapping_sub(last) >= 5000 || last == 0 {
+            GUI_DEPTH_LAST_MS.store(now_ms.max(1), Ordering::Relaxed);
+            let sent = GUI_SENT_X86.load(Ordering::Relaxed);
+            let recv = GUI_RECV_X86.load(Ordering::Relaxed);
+            serial_println!(
+                "[schedx86] depth sent={} recv={} inflight={} (render core {})",
+                sent,
+                recv,
+                sent.wrapping_sub(recv),
+                cpu
+            );
+        }
+    }
+}
+
 // ── SERWIT-1 ────────────────────────────────────────────────────────────────────────────────────
 // Drive the serial-transport stress fixture: one kernel worker per online AP, all parked on a gate so
 // their bursts overlap instead of trickling one core at a time (a trickle would never contend, and a
-// fixture that cannot reproduce the defect it guards is decoration). The BSP is not scheduled, so it
-// waits the same bounded-on-`ticks()` way `await_verdict` does rather than joining, then prints the
-// verdict itself. Bounded on both ends: the wait gives up on the ms-clock, and the verdict prints the
-// real numbers either way — a timeout shows up as a short `sent` count and reads FAIL, never as
-// silence, which would be an ironic way for this particular fixture to fail.
+// fixture that cannot reproduce the defect it guards is decoration). This runs on the boot path,
+// before the BSP joins the scheduler, so it waits the same bounded-on-`ticks()` way `await_verdict`
+// does rather than joining, then prints the verdict itself. Bounded on both ends: the wait gives up on
+// the ms-clock, and the verdict prints the real numbers either way — a timeout shows up as a short
+// `sent` count and reads FAIL, never as silence, which would be an ironic way for this particular
+// fixture to fail.
 #[cfg(all(target_arch = "x86_64", feature = "witness"))]
 fn serwit1_run(online: &[usize]) {
     let workers = unaos_kernel::serial_ring::serwit_worker_count(online.len());

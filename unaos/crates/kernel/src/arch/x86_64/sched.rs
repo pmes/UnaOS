@@ -852,10 +852,15 @@ extern "C" fn user_task_trampoline() -> ! {
 
 /// Create a ready ring-3 (user-mode) task on `target_cpu`'s run queue (U1a): when dispatched it
 /// drops to ring 3 at `user_entry` with rsp = `user_rsp` (both from `syscall::setup`) and calls
-/// back into the kernel via `syscall`. MUST be spawned on a SCHEDULED core (an AP), never the
-/// unscheduled BSP — `user_task_trampoline` reads `SCHED[cpu].current`, which is null on a core
-/// that never runs the scheduler loop. Fire-and-forget: `sys_exit` marks it FINISHED and the
-/// scheduler reclaims it. Returns the task id.
+/// back into the kernel via `syscall`. MUST be spawned on a core that is RUNNING THE SCHEDULER LOOP
+/// — `user_task_trampoline` reads `SCHED[cpu].current`, which is null on a core that never dispatches.
+/// Since SCHED-X86 that includes core 0 (the BSP calls `run_bsp` at the GUI handoff), so the
+/// constraint is "a dispatching core", not "an AP"; a core still parked in `wait_and_run` is still
+/// illegal. One placement rule survives and is SHARPER than the old one: this entry point builds a
+/// COOPERATIVE ring-3 task (`INITIAL_RFLAGS` has IF=0), and core 0 is the sole advancer of the global
+/// ms-clock, so a cooperative user task on core 0 would freeze `arch::ms()` for its lifetime — never
+/// place one there. `spawn_user_preemptible` (IF=1) has no such restriction.
+/// Fire-and-forget: `sys_exit` marks it FINISHED and the scheduler reclaims it. Returns the task id.
 pub fn spawn_user(name: &'static str, user_entry: u64, user_rsp: u64, target_cpu: usize) -> u64 {
     spawn_user_in_space(name, user_entry, user_rsp, target_cpu, 0)
 }
@@ -1216,8 +1221,9 @@ impl JoinHandle {
     }
 
     /// Block the current task until the joined task finishes. MUST be called from a scheduled task
-    /// (it blocks); the `assert` rejects a call off the scheduler — e.g. the unscheduled BSP — loudly
-    /// rather than silently returning as if the task had finished.
+    /// (it blocks); the `assert` rejects a call off the scheduler — e.g. a boot-path caller that is
+    /// not itself a task, or a core still parked in `wait_and_run` — loudly rather than silently
+    /// returning as if the task had finished.
     ///
     /// No timeout: a joined task that PANICS or never returns leaves the joiner blocked forever (the
     /// completion permit is posted only on a normal `entry` return; this no-`std` kernel has no
@@ -1247,8 +1253,9 @@ impl JoinHandle {
     /// completion) is one `JOIN_POLL_TICKS` window.
     ///
     /// MUST be called from a scheduled task, like `join`: it relies on `sleep_ticks` actually
-    /// blocking to advance the deadline. The assert rejects a call off the scheduler (e.g. the
-    /// unscheduled BSP) loudly — there `sleep_ticks` is a no-op, which would busy-spin the poll.
+    /// blocking to advance the deadline. The assert rejects a call off the scheduler (a boot-path
+    /// caller that is not a task) loudly — there `sleep_ticks` is a no-op, which would busy-spin the
+    /// poll.
     ///
     /// `self` stays bound for the whole body: its `Arc` clone is what keeps the completion semaphore
     /// alive while we poll it, exactly as `join` keeps it alive across the park. On `TimedOut` the
@@ -1430,7 +1437,7 @@ pub fn exit() -> ! {
 /// Timer-driven (no waker), so it cannot lose a wakeup: the scheduler drains due sleepers at its
 /// loop top, and the free-running periodic timer re-enters that loop every tick (granularity and
 /// worst-case wake latency are one tick). `ticks == 0` wakes on the next loop pass (~0–1 tick).
-/// No-op outside a scheduled task (e.g. the unscheduled BSP), like `yield_now`.
+/// No-op outside a scheduled task (a boot-path caller that is not itself a task), like `yield_now`.
 pub fn sleep_ticks(ticks: u64) {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
@@ -1533,8 +1540,9 @@ impl Semaphore {
     }
 
     /// Acquire a permit, blocking the current task until one is available. Returns `true` once a
-    /// permit is held. Returns `false` WITHOUT acquiring if called off a scheduled task (the
-    /// unscheduled BSP / idle context) — there is no `current` to block, so it cannot wait. A
+    /// permit is held. Returns `false` WITHOUT acquiring if called off a scheduled task (a boot-path
+    /// caller / the scheduler's own idle context) — there is no `current` to block, so it cannot
+    /// wait. A
     /// caller that issues a resource on success (e.g. `Mutex::lock`) MUST check the return value:
     /// a `false` means NO permit was taken, so no resource may be handed out.
     #[must_use]
@@ -2051,8 +2059,8 @@ impl<T> Mutex<T> {
     /// MUST be called from a scheduled task. A guard may be issued ONLY when a real permit was
     /// taken — otherwise two callers could hold guards at once (aliased `&mut T` = UB). Off a
     /// scheduled task `wait()` cannot block and so does not acquire, so we panic rather than hand
-    /// out an unbacked guard. (A sleeping mutex is meaningless off a scheduler context anyway —
-    /// the unscheduled BSP must not block.)
+    /// out an unbacked guard. (A sleeping mutex is meaningless off a scheduler context anyway — a
+    /// boot-path caller that is not a task must not block.)
     pub fn lock(&self) -> MutexGuard<'_, T> {
         assert!(
             self.sem.wait(),
@@ -2261,8 +2269,9 @@ impl Condvar {
     }
 
     /// Wake one waiter if any; a no-op if none are waiting (the notification is NOT stored — the
-    /// defining difference from `Semaphore::post`). May be called from any context (a task or the
-    /// unscheduled BSP). `make_ready` is called only AFTER releasing the condvar lock, so the lock
+    /// defining difference from `Semaphore::post`). May be called from any context (a task, an
+    /// interrupt handler, or the boot path). `make_ready` is called only AFTER releasing the condvar
+    /// lock, so the lock
     /// is never nested over a run-queue lock.
     pub fn notify_one(&self) {
         let was_enabled = x86_64::instructions::interrupts::are_enabled();
@@ -2336,8 +2345,10 @@ impl<T> Channel<T> {
         }
     }
 
-    /// Reserve the underlying primitives' waiter capacity. Call once on the BSP before use. (Does
-    /// not lock the buffer — `Mutex::lock` requires a scheduler context, which the BSP is not.)
+    /// Reserve the underlying primitives' waiter capacity. Call once on the BSP, from the boot path,
+    /// BEFORE any task can block on the channel — which since SCHED-X86 means before the BSP itself
+    /// enters `run_bsp`. (Does not lock the buffer: `Mutex::lock` requires a scheduler context, and
+    /// the boot path is not one.)
     pub fn init(&self) {
         self.slots.init();
         self.items.init();
@@ -2359,6 +2370,30 @@ impl<T> Channel<T> {
         let value = self.buffer.lock().pop_front().expect("channel buffer empty after items.wait");
         self.slots.post();
         value
+    }
+
+    /// Non-blocking `recv`: take a buffered value if one is already there, else `None`.
+    ///
+    /// SCHED-X86 DRAIN: this exists so a consumer can empty a burst before doing expensive
+    /// per-batch work. The x86 render task presents ONE frame per drained burst, which is the
+    /// semantic the dismantled BSP loop had — it drained every queued event and then presented
+    /// once. Presenting per event instead is the exact regression main.rs documents as having
+    /// bitten before ("at native resolution that flush is slow, so processing a single event per
+    /// loop made input lag badly — the cursor never caught up; typed text appeared seconds late").
+    /// A 2880x1800 present is ~50 ms; a fast typist or one trackpad sweep queues dozens of events.
+    ///
+    /// Unlike `recv` this never parks, so it is safe to call where blocking would be wrong — but it
+    /// still takes the buffer mutex, so it must run on a scheduled task like the rest of the type.
+    /// `try_wait` takes a permit only when it succeeds, so the `items`/`slots` accounting is
+    /// identical to `recv`'s on the `Some` path and untouched on the `None` path.
+    pub fn try_recv(&self) -> Option<T> {
+        if !self.items.try_wait() {
+            return None;
+        }
+        // Same invariant as `recv`: an `items` permit means a value was pushed before its `post`.
+        let value = self.buffer.lock().pop_front().expect("channel buffer empty after items.try_wait");
+        self.slots.post();
+        Some(value)
     }
 }
 
@@ -2579,8 +2614,9 @@ impl<T> Drop for RwLockWriteGuard<'_, T> {
 /// task is marked ready and control switches to this CPU's scheduler. Runs in interrupt context
 /// with IF=0; the task's own `iretq` (much later, when it is rescheduled) restores its IF=1.
 ///
-/// No-op unless scheduling is active AND a task is actually running on this CPU — so it does
-/// nothing on the BSP (never scheduled) and nothing during the pre-scheduler smoke test.
+/// No-op unless scheduling is active AND a task is actually running on this CPU — so it does nothing
+/// during the pre-scheduler smoke test, nothing on a core still parked in `wait_and_run`, and nothing
+/// on the BSP before it reaches `run_bsp` (after which core 0 is preempted like any other core).
 pub fn timer_preempt() {
     if !SCHED_ACTIVE.load(Ordering::Acquire) {
         return;
@@ -2588,7 +2624,7 @@ pub fn timer_preempt() {
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     if raw.is_null() {
-        return; // scheduler/idle context, or an unscheduled CPU (BSP)
+        return; // scheduler/idle context, or a CPU that is not dispatching yet
     }
 
     // Tick down the quantum; arm the reschedule signal when it runs out.
@@ -2627,6 +2663,79 @@ pub fn wait_and_run() -> ! {
     while !SCHED_GO.load(Ordering::Acquire) {
         x86_64::instructions::hlt();
     }
+    run()
+}
+
+/// SCHED-X86 — the BSP's entry into the scheduler, after it finishes its one-time boot duties
+/// (framebuffer bring-up, PCI/xHCI publish, service-task spawn). Mirrors the APs'
+/// `wait_and_run`→`run`, minus the `SCHED_GO` wait: the BSP is the core that SET `SCHED_GO` in
+/// `enable()`, so scheduling is already live by the time it calls this. Never returns; it replaces
+/// the inline GUI/shell loop the x86 BSP used to fall into at the end of `kernel_main`.
+///
+/// `cpu` is the caller's own logical index, taken as a parameter for signature parity with the
+/// aarch64 twin and CHECKED against the per-CPU block rather than used — x86's `run()` derives the
+/// index itself from `percpu::this_cpu()`, so a mismatch would mean the caller's model of which core
+/// it is on is wrong, which is worth failing loudly on.
+///
+/// Why this is safe — the "the BSP is never scheduled" invariants, re-audited against the x86
+/// evidence rather than inherited from the aarch64 doc:
+///
+///   * **GDT / TSS / IST / IDT / percpu / SYSCALL MSRs.** The BSP goes through the SAME `init_cpu`
+///     an AP does: `arch::init()` calls `gdt::init()` (which is exactly `init_cpu(0)` — a full
+///     per-CPU TSS with its four IST stacks), `interrupts::init_idt()`, `percpu::init_cpu(0, ..)`
+///     and `syscall::init()`, all long before `kernel_main` reaches its GUI handoff. So the two
+///     things `run()` writes per dispatch — `gdt::set_privilege_stack0(cpu, ktop)` and
+///     `percpu::set_syscall_kernel_rsp(ktop)` — address a real TSS and a real per-CPU block on core
+///     0, not the null state an unbrought-up core would have.
+///
+///   * **APIC routing.** There is nothing to re-route. x86 has no interrupt distributor to
+///     reconfigure and no routed input line: keyboard/pointer arrive as USB HID through the xHCI
+///     MSI-X path, not a per-core SPI. All local-APIC setup is per-core and already done (`apic::init`
+///     on the BSP, and on each AP in `ap_entry`); the only globally-scoped acts are `apic::calibrate`
+///     and `report_tick_rate`, both BSP-only and both complete before this call. The BSP running
+///     scheduled tasks adds no interrupt-controller state at all.
+///
+///   * **The global ms-clock keeps advancing.** This is the one that would bite silently, so it was
+///     checked by reading the handler rather than by analogy. `interrupts::timer_interrupt_handler`
+///     runs, in this order: `percpu::note_tick()` (the per-core tick), then the `cpu_index == 0`
+///     arm that does `APIC_TICKS.fetch_add(1, ..)` — core 0 is the SOLE advancer of the counter
+///     behind `arch::ticks()` / `arch::ms()` — then `apic::eoi()`, and only THEN
+///     `sched::timer_preempt()`. Both clocks are banked and the EOI is issued BEFORE any preemption
+///     can switch core 0 away, so the system's wall clock advances whether or not a task is running
+///     here. The residual hazard is NOT this function's: a COOPERATIVE ring-3 task (`spawn_user`,
+///     whose `INITIAL_RFLAGS` carries IF=0) placed on core 0 would mask the timer for its lifetime
+///     and freeze the global clock. Kernel tasks are safe (`task_trampoline` enables interrupts on
+///     entry) and the live shell paths are safe (`run_user_image` / `spawn_user_image_bg` both use
+///     `spawn_user_preemptible`, IF=1). The rule, written down: never place a COOPERATIVE ring-3
+///     task on core 0.
+///
+///   * **Placement can never surprise us, because x86 tasks do not migrate.** aarch64 needs a
+///     `mark_online` here so that `CPU_AUTO` placement and work-stealing may start using core 0;
+///     x86 has neither — there is no `CPU_AUTO`, no `spawn_auto`, and no steal predicate anywhere
+///     (`run()`'s empty-queue arm goes straight to `enable_and_hlt`, where the aarch64 twin calls
+///     `try_steal`). `make_ready` enqueues on `task.cpu` unconditionally, so every task stays on the
+///     core its spawner named, forever. The consequence is the honest one and it cuts both ways:
+///     nothing can wander onto core 0 uninvited, and core 0 will run ONLY what is explicitly pinned
+///     to it — it cannot heal load imbalance, and with nothing pinned there it simply idles.
+///
+///   * **The `c0:0/0` meter reading heals, and that is a display change, not load moving.**
+///     `CPU_BUSY[0]`/`CPU_IDLE[0]` are frozen at (0,0) today because core 0 never enters this loop;
+///     from here it folds a busy or idle span every pass, so `meter_cpu_ticks(0)` starts reporting.
+///     Do not read the meter coming alive as evidence that work was rebalanced onto core 0.
+///
+///   * **`sibling_online_cpu` changes behaviour, by design.** It probes `SCHED[c].scheduler_rsp != 0`
+///     as "is this core dispatching". Core 0 publishes that word on its first `switch_context` from
+///     this loop, so WINX-7 `SYS_THREAD_SPAWN` sibling placement may now answer 0. That is correct —
+///     core 0 really is dispatching now — and it is the whole point: the same predicate is what
+///     `bg_place_cpu` relies on being true of the caller.
+pub fn run_bsp(cpu: usize) -> ! {
+    let this = percpu::this_cpu().cpu_index as usize;
+    assert_eq!(cpu, this, "run_bsp: caller named cpu {} but is running on cpu {}", cpu, this);
+    // SCHED-X86 witness — the falsifiable moment. On the metal capture this line is what separates
+    // "the BSP reached the handoff" from "the BSP is dispatching": everything after it is scheduler
+    // work, and its absence with the spawn line present means the handoff block ran but `run()` was
+    // never entered.
+    serial_println!(":: SCHED-X86: BSP entered run loop cpu={} ::", cpu);
     run()
 }
 
@@ -3085,7 +3194,7 @@ pub fn current_name() -> Option<&'static str> {
 }
 
 /// The CURRENT task's user CR3 (`0` for a kernel task), or `None` if no task is current on this CPU
-/// (the scheduler-reaper context — `current` is `0` there — or the unscheduled BSP). STOR-1 S4c uses
+/// (the scheduler-reaper context — `current` is `0` there — or a core not yet dispatching). STOR-1 S4c uses
 /// this in the teardown path to tell a SELF-teardown (`exit`/reap of the current ring-3 task, which
 /// runs IF=0 mid-death and MUST NOT block on the storage service task) from a launcher tearing down
 /// ANOTHER slot (a live scheduled task that MAY block): a launcher is a kernel task, so its

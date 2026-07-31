@@ -56,7 +56,8 @@ Boot evidence: `APIC: x2APIC software-enabled (id=0…3)`, `SMP: AP 1/2/3 online
   additionally returns a handle (see §3).
 - **Cooperative + preemptive.** `yield_now()` cooperatively reschedules;
   `exit()` terminates the current task; the APIC timer calls `timer_preempt()`
-  to preempt on a tick. `wait_and_run()` is the AP idle/dispatch loop.
+  to preempt on a tick. `wait_and_run()` is the AP idle/dispatch loop, and
+  `run_bsp(cpu)` is the BSP's (see SCHED-X86 below).
 - **Sleeping.** `sleep_ticks(n)` blocks the current task on a timer-driven,
   per-CPU sleeper list.
 - **Priority aging (anti-starvation).** Ready tasks accrue wait-credit; a
@@ -247,6 +248,92 @@ steal path (not just placement). Both are `all(feature = "pi", feature =
 and the jetson/virt builds. The `SCHED: task ... -> core N (policy: ...)` line is
 the spawn-placement decision witness (already present from SCHED-3).
 
+### The BSP joins the scheduler + the GUI handoff (x86_64, SCHED-X86)
+
+x86 had the whole toolkit — run queues, preemption, `Channel`, `spawn` — and used
+none of it for the interactive OS. `kernel_main` ended in an inline GUI/shell loop
+on the BSP, so core 0 **never popped a run queue**. Two consequences, both on the
+metal capture:
+
+- `bg`/`run` place a ring-3 task on the CALLER's core (`bg_place_cpu()` =
+  `meter_current_cpu()`), and the caller was the BSP. Result: 2 BGRUN spawns,
+  **zero** `wc-x86: SYS_WIN_CREATE`, **zero** `:: SYSCALL:` witnesses, and both
+  kills burning the full `KILL_CONFIRM_MS` — programs spawned, never dispatched,
+  never reaped.
+- The pulse meter read `c0:0/0` while every other core read `0/263`.
+
+SCHED-X86 mirrors the Pi's structure exactly: the loop becomes three scheduled
+kernel services and the BSP calls `sched::run_bsp(0)`.
+
+| Task | Core | Owns |
+| --- | --- | --- |
+| `x86_usb_pump` | `online_aps().last()` | The xHCI service family, `fat::probe_once`, the boot-ledger / flight-recorder pumps, the witness probe ladder, `e1000::service_net`. Touches no pixel. `sleep_ticks(1)` ≈ 1 ms — the same floor the old `hlt()`-paced loop had. |
+| `x86_input_service` | `online_aps().last()` | Drains `pal::EVENT_QUEUE` and forwards every event over `GUI_CHANNEL_X86`. Paints nothing, routes nothing. Also emits the 250 ms `Event::Timer` pulse. |
+| `x86_render_service` | `online_aps().first()` | Every pixel: builds its own `Screen`/`TargetPal`/`Console`, runs `wc_click_route` → `el0_input_route` → `handle_key`, the cursor sprite, CURSOR-HIDE, `pal.render()`. The shell runs here. |
+
+**`run_bsp(cpu)`** takes the caller's index for parity with the aarch64 twin and
+asserts it against `percpu::this_cpu()`; the body is `run()` (x86's `run` derives
+the index itself). It has no `mark_online` because x86 has **no work-stealing and
+no `CPU_AUTO`** — `make_ready` enqueues on `task.cpu` unconditionally, so nothing
+can migrate onto core 0 and core 0 runs only what is pinned there. The invariant
+audit, with the x86 evidence, is in the function's doc block; the load-bearing one
+is the ms-clock: `timer_interrupt_handler` banks `percpu::note_tick()` and the
+cpu-0-only `APIC_TICKS.fetch_add`, and issues the EOI, **before** calling
+`timer_preempt()`, so the global clock advances whether or not core 0 is preempted.
+
+**Two placement rules are load-bearing.**
+
+1. **The pump and the render task must be on different cores.** `XHCI_CONTROLLER`
+   is a raw `spin::Mutex`, not the sleeping one, and both take it (the render side
+   through `fat` block reads, `pal::pump_and_poll` inside a full-screen app, and
+   `usbinfo`). Kernel tasks are preempted like any other, so two preemptible takers
+   of a raw spinlock on one core hard-deadlock it: the spinner cannot yield, so the
+   holder it displaced is never redispatched. The handoff therefore **requires two
+   distinct dispatching APs** and declines (staying on the inline loop, with a
+   witness) otherwise. No future task that touches xHCI may join the render core.
+2. **Never place a COOPERATIVE ring-3 task on core 0.** `spawn_user`'s
+   `INITIAL_RFLAGS` carries IF=0, and core 0 is the sole advancer of the global
+   ms-clock, so such a task would freeze `arch::ms()` for its lifetime.
+   `spawn_user_preemptible` (IF=1 — what `run`/`bg` use) is unrestricted.
+
+**PAT / write-combining — the one x86-specific step the Pi gets for free.** The
+framebuffer is WC via PAT slot 4, and `ensure_pat_wc` is per-core MSR state that
+only the BSP used to program. Pinning render to an AP would have made that AP's fb
+PTE select PA4=WB, which under the firmware's UC var-range MTRR is **effective-UC**
+— every blit uncombined, on a panel whose flush is already most of a frame.
+`smp::ap_entry` now calls `arch::memory::ensure_pat_wc()` immediately after
+`apic::init()` and before the `AP_ONLINE` handshake, on **every** AP — so the
+placement decision is not load-bearing and a later re-pin cannot regress the panel.
+The leaf retype is not per-core (APs run on the BSP's CR3), and PAT=WC wins over
+any MTRR type, so the MSR was the only missing piece.
+
+**Witnesses** (this is how metal proves it, `awk '/SCHED-X86/'`):
+
+```
+:: SCHED-X86: RENDER on core 1 + INPUT/usb-pump on core 7 (7 AP(s) dispatching) — OS on its own scheduler ::
+:: SCHED-X86: BSP entered run loop cpu=0 ::
+:: SCHED-X86: usb-pump task dispatched on core 7 ::
+:: SCHED-X86: input task dispatched on core 7 ::
+:: SCHED-X86: render task dispatched on core 1 — panel owned by the scheduler ::
+[schedx86] depth sent=… recv=… inflight=… (render core 1)
+```
+
+The spawn line and the three *dispatched* lines are deliberately separate: spawned
+is not dispatched (the WINX-2/WINX-3 lesson), and a spawn line with no dispatch
+line names a run queue nobody pops. `inflight` is the live `GUI_CHANNEL_X86`
+occupancy — the number that separates "render is keeping up" from "render is wedged
+and the input task is one burst from blocking in `send`".
+
+**Expected at the bench, not fixed here:** the shell now runs inside
+`x86_render_service`, so `bg_place_cpu()`'s premise ("the caller's core is
+definitionally scheduling") finally holds and programs start — but they start on
+the **render** core, so a foreground `run` degrades the panel for its duration.
+That is a syscall-layer placement question. `sibling_online_cpu` also changes
+answer, by design: core 0 publishes `scheduler_rsp` from this loop, so WINX-7
+sibling placement may now pick it.
+
+The `rast` knob keeps the inline loop (its demo drives the BSP's local `screen`).
+
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 
 **SCHED-4 sleep_ticks regression** (U11-reap FAIL, timer never ticks in QEMU) bisected and fixed by SCHED-4b (`d7631117`): semaphore wake on orphan enqueue — ~0% idle duty metal-confirmed (c2=0% P31b), U11-reap PASS restored.
@@ -304,4 +391,8 @@ Combined-boot evidence (one kernel running SMP + USB + net + video):
 
 ## See also
 - `unaos/crates/kernel/src/arch/x86_64/{sched,smp,percpu,acpi}.rs` — the implementation.
+- `unaos/crates/kernel/src/main.rs` — `x86_usb_pump` / `x86_input_service` /
+  `x86_render_service` and the SCHED-X86 handoff block in `kernel_main`.
+- `unaos/crates/kernel/src/arch/x86_64/memory.rs` — `ensure_pat_wc`, and why every
+  core that can blit must program PA4=WC.
 - [`network_stack.md`](../06_NETWORK_STACK/network_stack.md) and the USB/video docs — the other subsystems the BSP services while the scheduler runs the APs.

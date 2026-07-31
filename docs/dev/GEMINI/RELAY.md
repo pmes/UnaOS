@@ -1,60 +1,40 @@
 ## → kepler
 
-**PLAN APPROVED — implement it, with one must-fix. And you root-caused the echo regression, which was the hard part.**
+**APPROVED. Implement it.** Every correction landed, and deleting the `#[cfg(test)]` module in favour of full-slice `const fn` matchers is the right call — that module was never built, so it was worse than nothing: a safety net that read as present and caught nothing.
 
-Rebase first: you are on `dfa570f0`, trunk is `4c43d512`, and **`4c43d512` is your pull 35** — already landed. Your worktree holds it as uncommitted edits on a stale base, so re-apply only what is new below.
+The `const fn` shapes are right. One rule for them: **assert the whole instruction, never the immediate alone.** The bug that got through was `assert!(port_i16(&ECHO_A_BYTES, 0x10) == 0x4100)` passing while byte `0x11` held `$r3` — the check never looked at the destination. `ECHO_A_BYTES[0x10..0x14] == mov_i16(8, 0x4100)` is correct because it pins reg, subop and immediate together.
 
-```
-git fetch && git merge --ff-only UnaOS-gemini
-git log --oneline -1        # must show 4c43d512 or later
-```
+Your target address checks out, so the read should now be real: `falcon_io(0x504)` = `0x504 << 6` = `0x14100`, and `0x409000 + 0x504` = `0x409504`. Use `falcon_io(0x504)` in the assertion rather than the literal `0x4100` — your module's own spec-§3 rule says so, and a literal is what let the last one hide.
 
-**Approved as proposed:**
+**Two cautions on the runlist, then go.**
 
-1. **Recon relocation** to after the `NV_PMC_ENABLE` bit-12 sequence, with `(healthy: BADF1000/0s, unpowered: BADF1200)` in the log string. Putting both readings in the witness text is the right move — it makes the next reader unable to repeat our mistake.
-2. **H2/H3 re-insert** ahead of `BOOTVEC`/`CPUCTL` in loop 2.
-3. **⭐ The echo root cause.** *"The modified `ECHO_A_BYTES` array, which injected the `iord` for `0x14100`, accidentally omitted the Phase 4 stamp and `exit`, instead looping infinitely back to `poll`."* That is precisely consistent with the capture — `phase=00000003`, `ack=0`, `iters=99999`, both arms identical, ucode demonstrably alive. You found it from the bytes, not by guessing, and it explains every field. Good work.
+`RUNLIST_LEN` used at both the config write and the poll is exactly right. But do not read a fast exit as success: the runlist you are polling about is the one filled with `0xBEAC0001..0xBEAC0008`. Matching `len == 3` will now exit the loop promptly and save ~200k uncached BAR0 reads — that is a real boot-time win and worth having — but it says nothing about whether the runlist bound correctly, because its contents are known-bad. Your log line should make that impossible to misread later. Say `matched` or `bound` explicitly, not `ok`.
 
-**⛔ MUST-FIX — your own outcome table cannot distinguish its first case from a silent no-write.**
+Thank you for raising the beacon overwrite rather than patching it. It stays out of this round.
 
-Outcome 1 is *"reads `0x00000000`… host reports `phase=04`, `ack=00000000`"*. But `CC_SCRATCH[1]` is **zeroed by the host before the run** (`mmio_write(bar0, base + 0x804, 0)`). So `ack=00000000` at `phase=04` means either:
-
-- the falcon executed the `iord`, got `0`, and wrote `0`; or
-- the `iord` or the `iowr` did not execute, and you are reading the host's own pre-zero.
-
-Same value, opposite conclusions — and this is the *one fact in the entire pull* that only our microcode can obtain. Do not ship it able to lie.
-
-Fix: **seed `CC_SCRATCH[1]` with a non-zero sentinel** instead of `0` before starting the ucode. You already use `A5A5…` for exactly this on the mailbox path (`mb0=A5A50000` appears in the capture), so follow that. Then the table becomes decisive: sentinel intact = the falcon never wrote; `0` = the falcon actively wrote zero; `BADFxxxx` = poison from the falcon side; and `phase=03` with the sentinel intact = it never got there. Four states, four readings. Restate the table that way in the proposal before you build it.
-
-Everything else: implement, gate with the knobs, tell me.
-
-```
-UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1 UNAOS_KEPLER_FIFO=1 UNAOS_IVB=1 UNAOS_SMC=1 ./arroyo check
-```
-
----
+**What the next boot decides:** with `$r8` actually loaded, `CC_SCRATCH[1]` is a real Falcon-side read of `0x409504` for the first time. If it comes back `00000000` again, that is now a finding rather than an artifact — the previous zero was `I[0]`/INTR_SET and carried no information about that register.
 
 ## → igpu
 
-**AUDIT ACCEPTED AND ALL THREE QUESTIONS ANSWERED — YES, YES, and one addition to each.**
+**APPROVED WITH ONE MUST-FIX. The `ui_tick_service()` seam is accepted, the handshake/order/read-back/auto-revert corrections are all right, and you were right to route the revert off the GUI loop.**
 
-Rebase first: you are on `dfa570f0`, trunk is `4c43d512`, and **`c1eaae1f` — your pull 7 — is in it.** Re-apply only what is new.
+**⛔ MUST-FIX — a 20 ms spin inside `timer_interrupt_handler` is self-defeating, and it stalls the clock it depends on.**
 
-```
-git fetch && git merge --ff-only UnaOS-gemini
-git log --oneline -1        # must show 4c43d512 or later
-```
+That handler runs at **1 kHz — one tick every 1 ms** (`TICK_HZ = 1000`), on an **interrupt gate with IF=0**. Your hook at `interrupts.rs:372` lands in the `cpu_index == 0` branch, which is:
 
-**Q1 — correct `DP_B/C/D` to the `0xE4100` base? YES.** The audit table is the right artifact and finding a second family caught by the same CPU-block assumption is exactly what it was for.
+- **before `apic::eoi()`** (`:385`) — so a 20 ms spin holds the in-service bit and blocks this CPU's own subsequent timer ticks for the whole duration;
+- **before `sched::timer_preempt()`** (`:388`) — so it stalls the preemption point;
+- **on the one core that advances the global millisecond clock** (`:375-376`, BSP only, by design, because summing all cores would run `ms()` 8× fast).
 
-**One addition, and it is not optional: print both, as you did for `PP_*`.** `PP_CONTROL_CPU: 0x00000000 | PP_CONTROL_PCH: 0xABCD0008` is the reason that finding is *demonstrable* rather than asserted — one line, self-evidently conclusive, no argument required. Do the same for `DP_B/C/D`. You wrote that their dead readings are "vacated"; a side-by-side pair is what turns that from a claim into a capture. It costs three extra reads.
+That last one is the circular part: **the revert deadline is measured with `ms()`, and the revert would stall the clock that produces `ms()`.** A 20 ms blocking handshake in a 1 ms handler cannot work.
 
-**Q2 — the SMC partial-sample logic? YES, exactly as stated.** `present` reflects the physical presence key, not bus health; a stuck key does not invalidate keys that answered; a sweep missing either factor of `V × A` is a failed sample that increments `unknown` rather than being faked or thrown away. Your reasoning for refusing to substitute a default voltage is right and is the same instinct that made `min`/`max` seed from the first sample.
+**The fix is better than the plan, not more restrictive: make the revert a tick-driven state machine.** One step per tick, never spin. Advance on the busy bit; if it is still busy, return and try next tick. At 1 kHz, twenty ticks *is* twenty milliseconds — you get the reference `udelay(100) × 200` budget exactly, for free, with zero time spent in interrupt context. Each tick does at most one `outb`/`inb` and returns. Give it a hard step cap so a wedged mux ends the sequence instead of retrying forever, and print the outcome.
 
-**Addition: `NO-WINDOW` must also fire when `unknown` dominates.** Look at what metal actually did — `volt` dropped out while `amp` kept reading, one sweep before the abort. Under your new rules that sweep becomes `unknown`, which is correct. But if degradation always takes `volt` first, a window can now reach its 10 s flush with `samples=0 unknown=N` and print as a *successful* window measuring nothing. A window with no admissible samples is not a measurement; make it take the `NO-WINDOW` path with the reason, so an empty window and a real one cannot be confused.
+Keep everything else as written: read the real pre-switch values and revert to those, `SW_DDC` → `SW_DISPLAY` → `SW_EXTERNAL` in both directions, read back and print after both, abort rather than pushing into a busy mux.
 
-**Q3 — the canon restatement? YES.** "Each remaining claim of a dead engine is only as good as the verified offset of the register being probed" is the correct scope: narrower than "the iGPU was alive", which the evidence does not support (`PP_STATUS_PCH` is genuinely `0`, and the panel really is off because the Kepler owns it). Put it in the lane doc where the sitting-10 line lives, and mark that line superseded rather than deleting it — the wrong canon and its correction are both part of the record.
+**Two smaller things:**
 
-**One gap in the table:** `PP_ON_DELAYS` / `PP_OFF_DELAYS` / `PP_DIVISOR` are in your code at the PCH base but absent from the audit. The table is the artifact that says "everything was checked", so anything it omits reads as unchecked. Add the rows.
+- **The read-back is your success criterion, not the panel.** Your own census says every pipe, plane and PLL is zero, so the panel will stay black — that is not the experiment failing. What this boot can actually establish is whether the mux write *lands*, which is what a future round needs before it configures pipes. State that in the plan so the result is not read as a defeat.
+- `ui_tick_service()` in `lib.rs` is fine, and adding it with a comment rather than splicing it into `main.rs` is the correct handling of the seam. **I will wire the call sites** — the inline loop today, `input_service` after the scheduler arc lands. Do not touch `main.rs`.
 
-Then implement all three, gate with `UNAOS_IVB=1 UNAOS_SMC=1 ./arroyo check` both arches, and tell me. **Do not ask for a sitting until the SMC changes are in** — three boots have produced zero windows and the last one spent an attended plug/unplug on a sensor that had already stopped answering.
+Answering your two questions directly: yes to `ui_tick_service()`. No to the timer handler as written — right path, wrong shape; make it a state machine and it becomes the right answer.

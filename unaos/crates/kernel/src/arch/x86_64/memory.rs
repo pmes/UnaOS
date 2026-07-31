@@ -821,14 +821,20 @@ const PAT_TYPE_WC: u64 = 0x01;
 
 /// Program THIS CPU's IA32_PAT so slot `PAT_WC_INDEX` == WC, preserving every other slot. Idempotent
 /// and harmless on any CPU: no live mapping selects that slot until a PTE opts in via the PAT bit.
-/// The BSP is programmed by `set_framebuffer_wc` (it drives the console/scenario — the measured
-/// path). For a uniform effective type on APs that also blit, an AP would call this at bring-up
-/// (a one-line `arch::memory::ensure_pat_wc()` in `smp::ap_entry`); left as a follow-up so this arc
-/// stays in-lane. Not wiring it is CORRECT, not merely tolerated: an AP's fb PTE then selects PA4=WB
-/// (its unmodified default) which, under the UC var-range MTRR, is effective-UC — so an AP blit is
-/// plain UC (no speedup) while the BSP blit is WC. WC and UC are both uncacheable (no cache line
-/// holds fb data), so the mix is not the SDM 11.12.4 WB-aliasing hazard — it is exactly the
-/// write-only-framebuffer access pattern, just un-accelerated on the AP.
+/// The BSP is programmed by `set_framebuffer_wc` (it drives the early console/scenario — the
+/// originally measured path). EVERY AP is programmed by `smp::ap_entry`, which calls this one line
+/// right after `apic::init()` and before the `AP_ONLINE` handshake — so every core that can ever
+/// reach the scheduler loop has PA4=WC before it is released.
+///
+/// SCHED-X86 made that wiring load-bearing rather than cosmetic. The render service is now a
+/// scheduled kernel task pinned to an AP, so an AP is THE blitting core. Were its PAT left at the
+/// power-on default, its fb PTE would select PA4=WB which, under the firmware's UC var-range MTRR,
+/// is EFFECTIVE-UC: the sequential blit stores would stop being write-combined. (That state was
+/// never a correctness bug — WC and UC are both uncacheable, so it is not the SDM 11.12.4
+/// WB-aliasing hazard, just the same write-only access pattern un-accelerated — but on a panel whose
+/// flush is already most of a frame it is the difference between a working desktop and a hang.)
+/// Programming every core, not only the one currently chosen, is deliberate: it makes the placement
+/// decision non-load-bearing, so re-pinning render later cannot silently regress the panel.
 pub fn ensure_pat_wc() {
     use x86_64::registers::model_specific::Msr;
     // PAT support: CPUID.01H:EDX[16]. A part without PAT never gets the WRMSR.

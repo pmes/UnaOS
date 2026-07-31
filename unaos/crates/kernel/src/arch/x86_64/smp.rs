@@ -168,6 +168,22 @@ pub extern "C" fn ap_entry(cpu_index: u64) -> ! {
     gdt::init_cpu(idx);
     interrupts::init_idt();
     apic::init();
+    // SCHED-X86 / PAT-WC: program THIS core's IA32_PAT so slot 4 == Write-Combining, exactly as
+    // `arch::memory` prescribes for an AP that blits (see the `ensure_pat_wc` doc block). The PAT is
+    // PER-CORE MSR state; the framebuffer's LEAF retype is not (APs run on the BSP's CR3, so the
+    // `set_framebuffer_wc` retype is already visible here). Without this line an AP's fb PTE selects
+    // PA4 = its unmodified WB default, which under the firmware's UC var-range MTRR is EFFECTIVE-UC:
+    // every blit on that core would be an uncombined UC store train. The render service is now a
+    // scheduled task pinned to an AP, so that core IS a blitting core — but we program EVERY core
+    // rather than the chosen one, so the placement decision is not load-bearing and a later re-pin
+    // cannot silently regress the panel. PAT=WC wins over any MTRR type (SDM Table 11-7; the tree's
+    // own decode is `video::vperf`'s `1 => 1, // PAT WC: WC regardless of MTRR`), so this is correct
+    // whatever firmware left in the APs' MTRRs.
+    //
+    // Legal HERE, this early: `ensure_pat_wc` is CPUID + RDMSR/WRMSR only — no GDT, no per-CPU GS, no
+    // heap, no interrupts. Placed BEFORE the `AP_ONLINE` handshake and before `sti`, so no AP is ever
+    // advertised online — or takes an interrupt — without PA4=WC programmed.
+    crate::arch::memory::ensure_pat_wc();
 
     let apic_id = apic::apic_id_u32();
     // Per-CPU data + GS base before enabling interrupts, so this AP's timer/IPI handlers can

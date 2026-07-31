@@ -5645,8 +5645,9 @@ pub fn setup() -> UserDemo {
 /// lines (printed from its AP) reach the console UNCONTENDED and the whole demo lands contiguously
 /// in the boot log — decisive on the serial-less metal target, where the log is photographed off
 /// the framebuffer and the best-effort fbcon lock silently drops lines under cross-core contention.
-/// `ticks()` advances on the BSP (its timer ISR drives the global ms-clock), so the bound is real
-/// even though the BSP is not scheduled; a timeout FAIL (`0/0`) means the round-trip never returned.
+/// `ticks()` advances on the BSP (its timer ISR drives the global ms-clock, and does so BEFORE
+/// `timer_preempt` — so it keeps advancing now that SCHED-X86 lets core 0 dispatch tasks too), so the
+/// bound is real; a timeout FAIL (`0/0`) means the round-trip never returned.
 pub fn await_verdict() {
     let start = crate::arch::ticks();
     let deadline = start + 2000; // ~2 s at the calibrated 1 kHz; the round-trip is sub-millisecond
@@ -5869,7 +5870,9 @@ pub fn u2_probe_once() {
         return;
     }
     // Gate: storage enumerated (same as fat::probe_once) AND a scheduled AP to run ring 3 on
-    // (spawn_user needs a core running the scheduler loop; the BSP is never scheduled).
+    // (spawn_user needs a core running the scheduler loop). An AP is chosen deliberately even though
+    // SCHED-X86 makes core 0 dispatch too: this path uses the COOPERATIVE `spawn_user` (IF=0), and a
+    // cooperative ring-3 task on core 0 would mask the sole advancer of the global ms-clock.
     if crate::drivers::block::info().is_none() {
         return;
     }
@@ -11580,6 +11583,15 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
 /// predicate that x86's scheduler does not expose yet (aarch64 gets this from `CPU_AUTO`, which picks by
 /// ready-queue depth among cores it knows are live). That predicate is the honest prerequisite for
 /// re-introducing spread, and it is a scheduler change, not a syscall-layer one.
+///
+/// SCHED-X86 — and "definitionally scheduling" was, until that arc, FALSE for the only caller that
+/// matters. The shell ran in the BSP's inline GUI loop, on a core that never popped its run queue, so
+/// every `bg`/`run` landed on core 0 and sat there: the metal capture showed 2 BGRUN spawns, zero
+/// `SYS_WIN_CREATE`, zero `:: SYSCALL:` witnesses, and both kills burning the full `KILL_CONFIRM_MS`.
+/// The shell is now the `x86_render_service` task, so this function's own premise finally holds and
+/// programs start. The consequence to expect at the bench: they start ON THE RENDER CORE, so a
+/// foreground `run` (whose `yield_now` wait loop interleaves with rendering) degrades the panel for
+/// its duration. That is a syscall-layer placement question, deliberately not fixed here.
 fn bg_place_cpu() -> usize {
     crate::arch::sched::meter_current_cpu()
 }
