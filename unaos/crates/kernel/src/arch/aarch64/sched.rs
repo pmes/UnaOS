@@ -744,11 +744,20 @@ impl CoreAccount {
     /// WEDGE-1 — cycles since the last fold, or `u64::MAX` if this core has never folded a span.
     /// The raw quantity `tracked()` thresholds; see `CoreLoad::fold_age_cyc`.
     fn fold_age_cyc(&self) -> u64 {
+        self.fold_age_from(now_cyc())
+    }
+
+    /// SPREAD-13 — [`fold_age_cyc`](Self::fold_age_cyc) against a caller-supplied `now`, so a scan
+    /// that asks the freshness question of EVERY core pays one CNTPCT read instead of one per core.
+    /// Identical quantity and identical never-folded sentinel; the only difference is who reads the
+    /// counter. Using a single `now` across the scan is also the more honest reading — the four ages
+    /// are then comparable to each other rather than each measured from its own instant.
+    fn fold_age_from(&self, now: u64) -> u64 {
         let last = self.last_acct_cyc.load(Ordering::Relaxed);
         if last == 0 {
             return u64::MAX;
         }
-        now_cyc().wrapping_sub(last)
+        now.wrapping_sub(last)
     }
 
     /// Read the last-task triple with a bounded seqlock retry. `&'static str` reconstruction is sound:
@@ -1546,6 +1555,19 @@ fn el0_active(cpu: usize) -> usize {
         .saturating_sub(EL0_PARKED[cpu].0.load(Ordering::Acquire))
 }
 
+/// SPREAD-13 — COMMITTED EL0 residents on `cpu`: `EL0_RESIDENTS` without SPREAD-4's parked
+/// subtraction. This is OWNERSHIP rather than contention — "does any EL0 task call this core home" —
+/// and it is the reading the co-placement predicate needs, because it changes only at spawn, at reap,
+/// and at a placement move. It cannot flicker on a park/wake edge, which `el0_active` does once per
+/// frame per task. See the SPREAD-13 block above `spare_cores`.
+#[inline]
+fn el0_committed(cpu: usize) -> usize {
+    if cpu >= NUM_CPUS {
+        return 0;
+    }
+    EL0_RESIDENTS[cpu].0.load(Ordering::Acquire)
+}
+
 // SPREAD-10 — A VUG'S TRIPLE LIVES TOGETHER; THE RENDEZVOUS COMES HOME.
 //
 // FLUID-3 closed the present-path hypothesis: presents run inline (~2.5 ms) on the caller's core,
@@ -1591,6 +1613,28 @@ fn el0_active(cpu: usize) -> usize {
 //
 // Siblings are counted COMMITTED (not runnable-adjusted): a parked parent still names the core its
 // workers should rendezvous on — that is precisely the anchor this arc exists to create.
+//
+// SPREAD-13 CORRECTS THIS BLOCK IN TWO PLACES, and both corrections are consequences of the sentence
+// immediately above rather than objections to it. The asymmetry it declares — siblings weighed
+// COMMITTED, load weighed RUNNABLE — is right when cores are contended and is the mechanism that pins
+// a barrier-synchronised triple to one core when they are not:
+//
+//   * "zero pile-up risk" (the SPAWN bullet) holds against a core with one fewer RUNNABLE resident,
+//     which is what it says. It does not hold against a core with one fewer COMMITTED one: a core
+//     whose same-slot tasks are all momentarily parked reads `res == 0` and scores `2*0 + 1 - 1 = 0`,
+//     strictly below a core that owns nothing at all. That is a pile-up onto a core that is 99% busy,
+//     decided against a core that is 0% busy.
+//   * "a preference, never an anchor" (the RETENTION bullet) holds for the margin lane, which is the
+//     lane it is about. It does not hold for `rewake_place`'s early-out, which returns home WITHOUT
+//     SCANNING when `home_act < 2 && home_sibs > 0` — and a co-resident triple taking turns presents
+//     exactly that reading however saturated its core is. There the retention is an anchor, and the
+//     PA3 desktop (one window, `c1=99%` beside three cores at 0%) is what it anchored.
+//
+// Neither correction changes the weight or the lanes. SPREAD-13 leaves every line of this block in
+// force whenever the machine has no spare core, and suspends the whole of it — bonus, discount,
+// sibling lane, retention and early-out together — whenever it does. See the SPREAD-13 block above
+// `spare_cores` for why suspension rather than re-tuning, and for the pattern this is the third
+// instance of on this track.
 
 /// SPREAD-10 — committed EL0 residents per (core, address-space slot). Slot index is the ASID
 /// (1..=`boot::USER_SLOTS`; index 0 — kernel tasks and the shared window — is never counted and never
@@ -1766,6 +1810,209 @@ const REWAKE_MARGIN: usize = 2;
 /// UP, which is the opposite of the one the early-out's coupling note below warns about.
 const RECRUIT_MIN_HOME: usize = 2;
 
+// SPREAD-13 — CO-PLACEMENT IS A CONTENTION POLICY, AND AN EMPTY MACHINE HAS NO CONTENTION.
+//
+// The PA3 measurement, with SPREAD-12 already in force: ONE window rendering steadily ([comp2]
+// rate=231/s), `:: SCHED: load c0=0% c1=99% c2=0% c3=0% ::`, [spread10] recruit=81 (the idle lane IS
+// firing), [fluid3] parks=0 across 60 s (the barrier no longer parks at all). The run-queue storm is
+// gone, recruitment works, nothing parks — and a single vug still cannot use more than one core.
+//
+// The thing still holding the triple together is SPREAD-10, and the arithmetic is worth writing out
+// because it names the defect exactly. Co-placement counts siblings COMMITTED and load RUNNABLE, and
+// says why in its own block: "Siblings are counted COMMITTED (not runnable-adjusted): a parked parent
+// still names the core its workers should rendezvous on." That asymmetry is what pins a
+// barrier-synchronised triple:
+//
+//   * ATTRACTION uses committed weight. A core hosting two same-slot tasks that are momentarily
+//     parked reads `act == 0` AND `sibs == 2`, so `eff = 2*0 + 1 - 1 = 0` — the LOWEST value the
+//     doubled-load lattice can produce, strictly below a genuinely empty core's `2*0 + 1 = 1`. A
+//     scattered member therefore prefers the core its parked siblings live on over a core that owns
+//     nothing at all, and the sibling lane (margin 0) admits the move.
+//   * REPULSION uses runnable weight. Once the triple is co-resident, whichever member is asking is
+//     usually the only RUNNABLE one on that core, so `home_act == 1`. The early-out
+//     (`home_act < 2 && home_sibs > 0`) then returns home without scanning at all, and even when it
+//     does scan, SPREAD-12's idle lane needs `home_act >= RECRUIT_MIN_HOME` (2) and the margin lane
+//     needs a gap of two. A core sitting at 99% busy with three committed EL0 residents reads
+//     `home_act = 1` and is, to every lane in this function, an uncontended core.
+//
+// So the triple gathers under committed weight and cannot come apart under runnable weight. That is
+// not a threshold that needs re-tuning; it is a policy whose PREMISE has failed. SPREAD-10's cost
+// model is explicit that the thing co-placement buys back is "queue wait behind FOREIGN residents" on
+// SATURATED cores — 1-3 ms per frame, priced from [spread7] wd_mean under storm. On a core that owns
+// nothing there is no foreign resident and no queue: the wake lands on a core sitting in WFI and the
+// same wd_mean reads in the TENS of microseconds. Co-placement is buying back a cost that is not
+// being charged, and paying for it with three quarters of the machine.
+//
+// THIS IS THE THIRD ARC ON THIS TRACK WITH THE SAME SHAPE, and the pattern is now worth naming rather
+// than re-discovering: SPREAD-11's placement predicate declined equal-load moves (right under
+// contention, wrong when empty); the vug frame barrier's spin budget was denominated in YIELDS, so its
+// wall-clock coverage collapsed as the machine emptied and yields got cheaper (right under contention,
+// wrong when empty); and now co-placement. Each was tuned against a saturated four-core board, each
+// was correct there, and each misbehaves on an idle one. The common error is not the tuning — it is
+// that none of the three asked whether its own premise still held.
+//
+// THE FIX is to make co-placement conditional rather than to delete it. Under the six-window desktop
+// the bonus is a measured win and deleting it regresses the case the desktop actually ships. So:
+// co-placement applies EXACTLY as it does today whenever the machine has no spare core, and is
+// suspended — every term of it, at spawn and at rewake alike — whenever it does.
+//
+// "SPARE" IS COMMITTED-EMPTY AND DISPATCH-FRESH, and both halves are load-bearing:
+//
+//   * COMMITTED, not runnable. `el0_active == 0` is the reading SPREAD-12's idle lane uses, and its
+//     own block explains why that set is not monotone: a core whose residents are all parked reads
+//     zero and rejoins the set once per frame. A predicate built on it would flip at frame rate and
+//     the triple would split and re-pack every few frames — precisely the flapping this arc has to
+//     bound. `EL0_RESIDENTS` moves only at spawn, at reap, and at a placement move, so `spare` is a
+//     slow variable by construction. SPREAD-12 wrote this remedy down in advance ("qualify the lane
+//     on COMMITTED residents rather than runnable ones, which is a different reading of 'empty'");
+//     this is that reading, applied to the policy rather than to the lane.
+//   * DISPATCH-FRESH (WEDGE-1's gate). A WEDGED core reads zero committed residents forever. Without
+//     the freshness half, one wedged core would hold co-placement suspended across the whole fleet
+//     permanently — a silent, machine-wide regression of the policy in exactly the failure this track
+//     is hunting. A core that has left the dispatch loop is not spare; it is broken.
+//
+// WHAT BOUNDS THIS IS A CLOCK, NOT A STRUCTURE, and the distinction is the whole of this paragraph:
+// the first draft of this block claimed the suspension could not flap at all, and that claim is false
+// at the whiteboard. What IS true, and is what keeps the lane's firing count finite per unit of new
+// spare capacity:
+//
+//   * every split moves a task ONTO a core with zero committed residents; the credit moves before the
+//     enqueue, so that core leaves the spare set immediately and `spare` strictly decreases. Home
+//     never becomes spare from its own split — `spread_lane` requires `home_sibs > 0`, so home keeps
+//     a committed resident besides the mover.
+//   * no split ever increases `spare` directly.
+//
+// What is FALSE is the step the first draft built on top of that: that a RETURN move therefore needs
+// some OTHER task to have taken ownership of the destination, i.e. a real change in the committed
+// population. It does not. The split's own destination is what drives `spare` to zero; that re-arms
+// the sibling lane on the next ask; the sibling lane's move vacates the destination again, which
+// restores `spare`. The committed population is identical at both ends of the cycle. It is written
+// out here rather than left for a future reader to rediscover on the wire:
+//
+//   4 cores; window A owns `a1,a2,a3` (slot sA), window B owns `b1,b2,b3` (slot sB).
+//   S1  c0={a1,b3} c1={} c2={a2,a3} c3={b1,b2} ⇒ `spare == 1` (c1) ⇒ co-placement suspended.
+//       `a2` asks from c2: `home_act == 1`, `home_sibs == 1`, `home_eff == 3`. c1 is admitted by the
+//       spread lane ALONE (`eff == 1`) and wins ⇒ SPREAD13_SPLIT++, `a2` → c1.
+//   S2  c0={a1,b3} c1={a2} c2={a3} c3={b1,b2} ⇒ `spare == 0` ⇒ co-placement re-armed.
+//       `a2` asks from c1: `home_sibs == 0`, so the early-out declines to swallow the ask and the
+//       scan runs. c2 hosts `a3` ⇒ `toward`, and `act(c2) <= home_act` ⇒ the sibling lane admits ⇒
+//       SPREAD10_CO_MOVES++ and SPREAD13_REPACK++, `a2` → c2. That is S1 again.
+//
+// The precondition is not exotic — any core whose committed population is exactly one, beside a
+// sibling-hosting core reading `act <= home_act` — and the six-window desktop reaches it whenever a
+// window closes and leaves a core singly owned.
+//
+// SO THE HONEST BOUND IS THE PLACEMENT CLOCK: the SAME class of bound SPREAD-12 fell back on, not a
+// stronger one. The cycle's period is one placement ASK per participating task, and asking is exactly
+// what SPREAD-6's escapement rate-limits — at most once per `PLACE_REFRESH_MS` (250 ms) on the
+// refresh path, or once per `REWAKE_MIN_PARK_MS` (100 ms) on the wake path when the barrier park runs
+// long. Worst case that is 4-10 migrations per second per participating task: bounded below frame
+// rate and orders of magnitude below dispatch rate, which is why it ships as a known cost rather than
+// as a defect. SPREAD-6's latch-and-escapement is therefore NOT superseded here; it is the mechanism
+// doing the bounding.
+//
+// WHICH MAKES `split` AND `repack` CLIMBING TOGETHER AN EXPECTED READING, not a falsification — see
+// `SPREAD13_REPACK` for the full reading rule. What WOULD falsify the bound is either counter
+// climbing at DISPATCH rate, which means an escapement is not holding. If the metal read says the
+// churn is not paying for itself, the remedy is real hysteresis rather than a threshold: refuse the
+// sibling lane for a task whose last placement was a spread-lane split within N ms — SPREAD-6's
+// escapement applied to the LANE rather than to the ask. Deliberately not done here, because it adds
+// a second clock to tune ahead of any measurement saying the first is insufficient, and `split` /
+// `repack` on the wire exist precisely to produce that measurement.
+//
+// THE COST, stated plainly rather than hidden. A window that is IDLE (VUGPAUSE-2 parks its triple on
+// SYS_INPUT_WAIT for seconds) is indistinguishable here from one that is barrier-synchronised, so its
+// triple will also be spread, and its next wake pays a cross-core rendezvous it would not have paid.
+// That is bounded by the placement clock above rather than by a move count — the 2-cycle applies to
+// an idle window's triple exactly as it does to a busy one — and the split fleet is ALREADY spread
+// when the window becomes active, which is the good case; the population it costs is a window nobody
+// is measuring the frame rate of. Accepted knowingly.
+//
+// Explicit pins are untouched by all of this: `pick_cpu_slot` returns a non-`CPU_AUTO` request
+// verbatim before any of this arithmetic runs, and `rewake_place` is only ever reached from the EL0
+// wake and yield paths. Render and input stay single-core.
+
+/// SPREAD-13 — online cores that own NO committed EL0 resident and are provably still dispatching:
+/// the machine's spare capacity, in cores. Zero means every core is somebody's home and co-placement's
+/// contention premise holds; nonzero means a vug's triple has somewhere to go that costs nobody
+/// anything, and the co-residency bonus is suspended for as long as that is true.
+///
+/// One CNTPCT read for the whole scan (`fold_age_from`), then two relaxed-to-acquire loads per core.
+/// No lock, no run-queue access — which is required at both call sites: `rewake_place` runs inside
+/// `make_ready`'s IRQ-masked section under WEDGE-4's rq() discipline, and `pick_cpu_slot` runs before
+/// the spawn's own enqueue.
+fn spare_cores() -> usize {
+    let now = now_cyc();
+    let fresh = dispatch_fresh_cyc();
+    let mut n = 0usize;
+    for cpu in 0..NUM_CPUS {
+        if ONLINE_MASK[cpu].load(Ordering::Acquire)
+            && el0_committed(cpu) == 0
+            && ACCT[cpu].fold_age_from(now) < fresh
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// SPREAD-13 — triples the suspension actually BROKE UP: rewake/yield moves that ONLY the spread lane
+/// admitted (the margin, sibling and idle lanes all declined the same candidate). It is counted at the
+/// one place it is decidable, and it names the arc's CORE case — see "what it does not count" below
+/// for the part of the delta this attribution cannot reach.
+///
+/// It can execute in every state it reports on, which is the property this track requires of a
+/// counter rather than assumes: a slot task can leave a core hosting its committed siblings by exactly
+/// two routes, `make_ready`'s wake path and SPREAD-11's yield path, and BOTH funnel through
+/// `rewake_place`. There is no third route for the event to happen down while the instrument is
+/// elsewhere. And an admitted spare core always WINS its comparison: its `eff` (1) is strictly below
+/// home's (`2*home_act + 1 >= 3`, since `home_act` always includes the asking task), and the only
+/// `continue` between the lane test and the comparison is the freshness gate, which `rstale` counts.
+///
+/// WHAT IT DOES NOT COUNT, because a lane-ONLY counter's zero is evidence only against a population
+/// the reader can name. Under suspension a spread-lane candidate has zero COMMITTED residents, hence
+/// zero runnable ones (`el0_active = residents - parked`), hence `eff == 1`; and `bias_sibs == 0`
+/// gives `home_eff == 2*home_act + 1`. So `margin_lane` (`1 + 2*REWAKE_MARGIN <= home_eff`) and
+/// `idle_lane` (`act == 0 && home_act >= RECRUIT_MIN_HOME`) reduce to the SAME condition,
+/// `home_act >= 2`, and both co-admit there. `split` therefore counts the `home_act == 1` splits
+/// ONLY — which is the state this arc exists for, the co-resident triple taking turns, and the reason
+/// the field is worth having. A split at `home_act >= 2` is a real move that this arc's suspension
+/// enabled, and no lane-only counter records it (the same co-admission zeroes `SPREAD12_RECRUIT`; see
+/// its block); it lands in `[spread4] rewake` with every other move.
+///
+/// So the reading rule is narrower than "the lane never fired": `split == 0` with `spare > 0` means no
+/// `home_act == 1` split was made — either the lane was never offered that state, or the freshness
+/// gate refused the candidate (`rstale`, same line). It does NOT mean the suspension moved nothing.
+static SPREAD13_SPLIT: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-13 — the FLAP METER, and the reason it is a separate counter from `split` rather than a
+/// ratio the operator is asked to infer. A repack is the inverse event: a rewake/yield move that lands
+/// a slot task ON a core already hosting its committed siblings, FROM a core hosting none. It is
+/// counted on the raw sibling map with NO lane attribution, so it catches the sibling lane (the usual
+/// route, `spare == 0`) and the margin lane alike — under suspension a loaded home (`home_act == 3`)
+/// can carry a slot task onto a lightly loaded sibling-hosting core on load alone, with `spare > 0`.
+/// Both are repacks and neither is exempt; a repack is NOT evidence of `spare == 0` on its own.
+///
+/// Read it against `split` on the same line, and read both against the PLACEMENT CLOCK:
+///
+///   * `split` stepping a few times and `repack` flat — the triple came apart and stayed apart. The
+///     good read.
+///   * both climbing together at the rate of placement asks (single digits/s per participating task)
+///     — the reachable 2-cycle written out above `spare_cores`. EXPECTED and clock-bounded, not a
+///     falsification: the split's own destination drives `spare` to zero, the sibling lane returns the
+///     task, `spare` is restored, and nothing about the committed population changed. Judge it against
+///     the `:: SCHED: load ::` line — work still spread across cores means the churn is buying the
+///     spread it was meant to buy; back to one core at 98% beside three at 0% means it is not, and the
+///     next arc is the split hysteresis named above `spare_cores`.
+///   * either counter climbing at DISPATCH rate rather than at ask rate — SPREAD-6's escapement is not
+///     holding. That is the real falsification, and it falsifies the bound rather than the lane.
+///   * `repack` climbing with `split` flat — not this arc at all: SPREAD-10 gathering triples on a
+///     genuinely full machine, which is what it is for.
+///
+/// Same execution argument as `split`: a repack is a move, every move is decided here, and both call
+/// paths funnel through this function.
+static SPREAD13_REPACK: AtomicU64 = AtomicU64::new(0);
+
 // SPREAD-5 — A PER-FRAME PARK IS NOT A BACKGROUND→FOREGROUND TRANSITION.
 //
 // SPREAD-4 re-placed an EL0 task on EVERY wake. That was right about WHERE a long-parked task should
@@ -1863,9 +2110,11 @@ fn rewake_min_park_cyc() -> u64 {
 /// within `dispatch_fresh_cyc()`. This is deliberately conservative in the safe direction — declining
 /// every candidate simply leaves the task at home, which is the pre-SPREAD-4 behaviour.
 ///
-/// Lock-free by construction (atomics and one sysreg read; no run-queue lock), which is required:
-/// `make_ready` calls this INSIDE the IRQ-masked wake path and the `rq()` discipline forbids nesting
-/// a second run-queue section under the push that follows.
+/// Lock-free by construction (atomics and a handful of CNTPCT reads; no run-queue lock), which is
+/// required: `make_ready` calls this INSIDE the IRQ-masked wake path and the `rq()` discipline forbids
+/// nesting a second run-queue section under the push that follows. SPREAD-13's predicate is held to
+/// the same contract — `spare_cores` is two atomic loads per core over one CNTPCT read, and touches no
+/// queue.
 ///
 /// SPREAD-10 — `slot` (0 = no bias) adds the co-residency term. Loads are compared in DOUBLED units
 /// (`2*act + 1`, the +1 a uniform shift so the half-resident bonus never underflows at act 0): a core
@@ -1884,6 +2133,19 @@ fn rewake_min_park_cyc() -> u64 {
 /// freshness gate, which is what keeps it from mistaking a wedged core for an idle one. Full
 /// argument, including what actually bounds the firing rate (`act == 0` is "nobody runnable here",
 /// not "empty core"): the SPREAD-12 block above `RECRUIT_MIN_HOME`.
+///
+/// SPREAD-13 makes SPREAD-10's whole contribution CONDITIONAL, and adds a FOURTH lane for the state
+/// that condition opens up. While the machine has a spare core (`spare_cores() > 0` — committed-empty
+/// and dispatch-fresh) the co-residency terms are suspended entirely: `sibs` reads 0 everywhere, so
+/// the home retention bonus, the `toward` discount and the sibling lane all vanish and a slot task is
+/// weighed exactly as a slotless one. In their place, a candidate that owns NO committed EL0 resident
+/// qualifies whenever home hosts a committed sibling of ours — the state SPREAD-12's idle lane cannot
+/// reach, because a barrier-synchronised triple reads `home_act == 1` no matter how saturated its core
+/// is. When `spare_cores()` is zero every line below behaves exactly as it did before this arc. Why
+/// suspension rather than deletion, why "spare" is committed rather than runnable, and what bounds the
+/// flapping (a clock, not a structure — with the reachable 2-cycle written out): the SPREAD-13 block
+/// above `spare_cores`. Note also that suspension makes `best_idle_lane_only` unreachable, so
+/// `SPREAD12_RECRUIT` reads zero for as long as it lasts; that is documented at the counter.
 fn rewake_place(home: usize, slot: usize) -> usize {
     if home >= NUM_CPUS {
         return home;
@@ -1892,34 +2154,63 @@ fn rewake_place(home: usize, slot: usize) -> usize {
     // SPREAD-10 — home's committed same-slot siblings, EXCLUDING the waking task itself (it is still
     // committed at home; the transfer happens after the decision).
     let home_sibs = slot_res(home, slot).saturating_sub(1);
+    // SPREAD-13 — does co-placement's contention premise still hold? Asked once per placement, and
+    // only for a task that HAS a slot: a slotless task carries no co-residency term to suspend, so the
+    // kernel-thread and `virt`/JC3 paths keep their exact former cost (not one extra atomic load) and
+    // their exact former behaviour.
+    let coplace = slot == 0 || spare_cores() == 0;
     // SPREAD-4's cheap early-out, kept — unless the task is slot-scattered (home hosts none of its
     // siblings), in which case the sibling lane must still get its scan: at low load a sibling-bound
     // move is exactly the cheap, convergence-carrying case.
     // SPREAD-12: the early-out must not outrank the recruitment lane, so it keys on the LOWER of the
     // two thresholds. They are equal today; writing the coupling down keeps a later re-tuning of
     // REWAKE_MARGIN from silently DELETING the idle lane rather than merely re-tuning the margin.
-    if home_act < REWAKE_MARGIN.min(RECRUIT_MIN_HOME) && (slot == 0 || home_sibs > 0) {
+    // SPREAD-13: nor may it outrank the spread lane, and here that matters MORE, because the state
+    // the spread lane exists for is precisely a `home_act == 1` reading on a saturated core — the
+    // co-resident triple taking turns. Under suspension a slot-CONCENTRATED task must therefore get
+    // its scan, which is the one case this clause used to swallow. Note the scattered case
+    // (`home_sibs == 0`) already scanned before this arc and still does, so no new scan is introduced
+    // anywhere except the one the lane needs.
+    if home_act < REWAKE_MARGIN.min(RECRUIT_MIN_HOME) && (slot == 0 || home_sibs > 0) && coplace {
         return home; // home is not carrying enough to be worth correcting
     }
+    // SPREAD-13 — the co-residency weight home and every candidate are scored with. Under suspension
+    // it is zero on both sides, so a slot task is weighed EXACTLY as a slotless one and no term of
+    // SPREAD-10 survives to bias the comparison. The RAW `home_sibs` is kept alive beside it because
+    // the spread lane and the two witness counters ask a different question — "is this a co-placed
+    // triple at all" — which is true whether or not the bonus is currently being applied.
+    let bias_sibs = if coplace { home_sibs } else { 0 };
     // Doubled-unit effective load of home: the half-resident retention bonus when staying preserves
     // an existing co-residency.
-    let home_eff = 2 * home_act + 1 - usize::from(home_sibs > 0);
+    let home_eff = 2 * home_act + 1 - usize::from(bias_sibs > 0);
     let fresh = dispatch_fresh_cyc();
     let mut best = home;
     let mut best_eff = home_eff;
-    let mut best_sibs = home_sibs;
+    let mut best_sibs = bias_sibs;
     let mut best_pct = u32::MAX;
     let mut best_sib_lane_only = false; // did the winner qualify ONLY via the sibling lane?
-    // SPREAD-12 — did the winner qualify ONLY via the idle lane? That is the arc's whole behavioural
+    // SPREAD-12 — did the winner qualify ONLY via the idle lane? That is that arc's whole behavioural
     // delta, and `recruit` on the wire is exactly this flag counted.
+    // SPREAD-13 — and it CANNOT BE SET while `coplace` is false: with `bias_sibs` zeroed, `idle_lane`
+    // and `margin_lane` both reduce to `home_act >= 2` for any candidate reading `act == 0`, so the
+    // exclusivity this flag demands never holds. `recruit` is a structural zero for the duration of a
+    // suspension; the derivation and the reading rule live at `SPREAD12_RECRUIT`. Left as-is rather
+    // than made subsumption-aware, because redefining `recruit` to mean "narrowest qualifying lane"
+    // would silently rewrite SPREAD-12's counter for the `spare == 0` regime too.
     let mut best_idle_lane_only = false;
+    // SPREAD-13 — did the winner qualify ONLY via the spread lane? Same discipline, same reason:
+    // lane-only attribution is the only count that names THIS arc's delta rather than the fleet's
+    // churn.
+    let mut best_spread_lane_only = false;
     for cpu in 0..NUM_CPUS {
         if cpu == home || !ONLINE_MASK[cpu].load(Ordering::Acquire) {
             continue;
         }
         let act = el0_active(cpu);
-        let sibs = if slot != 0 { slot_res(cpu, slot) } else { 0 };
-        let toward = sibs > home_sibs; // moving here strictly increases the triple's co-residency
+        // SPREAD-13: `coplace` false zeroes this, which is what collapses `toward`, the discount and
+        // the sibling lane together — one suspension, not three.
+        let sibs = if coplace && slot != 0 { slot_res(cpu, slot) } else { 0 };
+        let toward = sibs > bias_sibs; // moving here strictly increases the triple's co-residency
         let eff = 2 * act + 1 - usize::from(toward);
         // Lane 1 (SPREAD-4, unchanged for slotless tasks): enough of a load win to pay for the move.
         let margin_lane = eff + 2 * REWAKE_MARGIN <= home_eff;
@@ -1930,14 +2221,28 @@ fn rewake_place(home: usize, slot: usize) -> usize {
         // the termination argument and for why this enforces SPREAD-10's weight rather than
         // overruling it.
         let idle_lane = act == 0 && home_act >= RECRUIT_MIN_HOME;
-        if !margin_lane && !sib_lane && !idle_lane {
+        // Lane 4 (SPREAD-13): co-placement is suspended, home hosts a committed sibling of ours, and
+        // this candidate owns NOTHING. Both qualifiers are needed. Requiring a committed sibling at
+        // home is what keeps this a co-placement fix rather than a second, looser spreading policy —
+        // a task with no sibling at home is not being held by SPREAD-10 and is already lanes 1 and 3's
+        // business. Requiring the candidate to be committed-EMPTY (not merely idle-reading) is what
+        // makes the firing count monotone, since the move itself takes the core out of the spare set;
+        // `el0_active == 0` would flicker back once per frame and this lane would oscillate with it.
+        let spread_lane = !coplace && home_sibs > 0 && el0_committed(cpu) == 0;
+        if !margin_lane && !sib_lane && !idle_lane && !spread_lane {
             continue; // not enough of a win to pay for the move
         }
         if ACCT[cpu].fold_age_cyc() >= fresh {
             // SPREAD-12: a core that reads EMPTY but is not provably dispatching is the wedge
             // signature, not an idle core. Counted apart from the ordinary declines because this is
             // the one rejection here that means something is wrong rather than something is fine.
-            if idle_lane {
+            // SPREAD-13 folds its own empty-core lane into the SAME counter, deliberately: the two
+            // lanes read "empty" differently (runnable vs committed) but a stale rejection means the
+            // identical thing under both, and splitting the field would make each half look quiet.
+            // It is also what keeps `split == 0` interpretable — without it, a spread lane firing
+            // into a wedged core would leave NO trace at all, which is the structural silence this
+            // track sends arcs back for.
+            if idle_lane || spread_lane {
                 SPREAD12_STALE.fetch_add(1, Ordering::Relaxed);
             }
             continue; // not provably dispatching — never hand it a task only it can run
@@ -1957,16 +2262,34 @@ fn rewake_place(home: usize, slot: usize) -> usize {
             best_pct = pct;
             best_sib_lane_only = sib_lane && !margin_lane;
             best_idle_lane_only = idle_lane && !margin_lane && !sib_lane;
+            best_spread_lane_only = spread_lane && !margin_lane && !sib_lane && !idle_lane;
         }
     }
     // SPREAD-10 — a move only the sibling lane admitted is a placement the bonus decided.
     if best != home && best_sib_lane_only {
         SPREAD10_CO_MOVES.fetch_add(1, Ordering::Relaxed);
     }
-    // SPREAD-12 — a move only the idle lane admitted is a core this arc recruited that nothing else
-    // would have. This is the arc's whole delta, counted at the one place it is decidable.
+    // SPREAD-12 — a move only the idle lane admitted is a core that arc recruited that nothing else
+    // would have. Counted at the one place it is decidable. SPREAD-13: silent whenever `coplace` is
+    // false, per the flag's declaration above — this line does not execute in that regime, so its zero
+    // reports nothing about it.
     if best != home && best_idle_lane_only {
         SPREAD12_RECRUIT.fetch_add(1, Ordering::Relaxed);
+    }
+    // SPREAD-13 — a move only the spread lane admitted is a triple this arc took apart that nothing
+    // else could have: the margin lane could not (home reads `home_act == 1` while its core saturates),
+    // the sibling lane is suspended, and the idle lane wants `home_act >= RECRUIT_MIN_HOME`. That
+    // conjunction pins the counted population to `home_act == 1`; at `home_act >= 2` the margin and
+    // idle lanes co-admit and the move is not counted here (nor anywhere lane-attributed).
+    if best != home && best_spread_lane_only {
+        SPREAD13_SPLIT.fetch_add(1, Ordering::Relaxed);
+    }
+    // SPREAD-13 — the flap side, counted on the raw sibling map rather than the suspended one, and
+    // WITHOUT any lane attribution: the question is not which rule re-gathered the triple but whether
+    // it got re-gathered at all. `slot_res(best, ..)` is read before the caller moves the credits, so
+    // it is the destination's siblings excluding this task — the same exclusion `home_sibs` makes.
+    if best != home && slot != 0 && home_sibs == 0 && slot_res(best, slot) > 0 {
+        SPREAD13_REPACK.fetch_add(1, Ordering::Relaxed);
     }
     best
 }
@@ -1995,6 +2318,25 @@ static SPREAD11_YIELD_MOVES: AtomicU64 = AtomicU64::new(0);
 /// for itself, back to a 0%-beside-98% split = churn that is not, and the answer is to qualify the
 /// lane on committed residents. A climb at dispatch rate would mean the clocks are not holding, and
 /// that is a bug in this arc.
+///
+/// SPREAD-13 — READ THIS FIELD ONLY AGAINST `spare == 0`. While `spare > 0` it is a STRUCTURAL ZERO
+/// and its silence is not evidence of anything. The arithmetic, written out because this track does
+/// not let a counter's zero go unexplained: suspension forces `bias_sibs = 0`, so
+/// `home_eff = 2*home_act + 1`, and a candidate reading `act == 0` computes `eff = 1`. Then
+/// `margin_lane` (`1 + 2*REWAKE_MARGIN <= home_eff`) and `idle_lane`
+/// (`act == 0 && home_act >= RECRUIT_MIN_HOME`) are the same condition, `home_act >= 2`; so
+/// `idle_lane` IMPLIES `margin_lane`, and `best_idle_lane_only` — which demands exclusivity — is
+/// identically false. The lane itself is unchanged and still admits; it is the ATTRIBUTION that does
+/// not survive, and the move lands unattributed in `[spread4] rewake`. (It was always the retention
+/// bonus that made this field reachable at all: even before SPREAD-13 the same collapse held whenever
+/// `home_sibs == 0`, so `recruit` only ever fired with `home_sibs > 0` and `home_act` exactly
+/// `RECRUIT_MIN_HOME`. Zeroing `bias_sibs` removes the one reachable case.)
+///
+/// This matters concretely rather than pedantically: PA3 printed `recruit=81` from a machine whose
+/// state reads `spare > 0` under this arc, so the SAME bench boot now prints `recruit=0`. That zero
+/// means "the attribution is unavailable in this regime" — NOT "recruitment stopped being needed" and
+/// NOT "the idle lane stopped firing". Whether the machine is spreading while suspended is read from
+/// `split` and the `:: SCHED: load ::` line, not from this field.
 static SPREAD12_RECRUIT: AtomicU64 = AtomicU64::new(0);
 
 // SPREAD-12 — THERE IS DELIBERATELY NO "OFFERED AND DECLINED" COUNTER HERE, and the reason is worth
@@ -2019,6 +2361,14 @@ static SPREAD12_RECRUIT: AtomicU64 = AtomicU64::new(0);
 /// counter is the placement path sighting it from the outside. Per the block above, it is also the
 /// ONLY way a contended task can be offered an empty core and still stay, so it carries that reading
 /// too — there is no second counter for it.
+///
+/// SPREAD-13 widened the population without changing the meaning: this now also counts SPREAD-13's
+/// spread-lane rejections, where "empty" is read as zero COMMITTED residents rather than zero runnable
+/// ones. Two lanes, two readings of empty, one verdict — the core was not dispatching and was not
+/// given work only it could run. Keeping them in one field is what preserves the reading for BOTH
+/// arcs: `recruit == 0` and `split == 0` are each interpretable only against a `rstale` that would
+/// have caught the refusals, and two half-populated fields would have made each lane look quiet for
+/// the other's reason.
 static SPREAD12_STALE: AtomicU64 = AtomicU64::new(0);
 
 static SPREAD4_STAY: AtomicU64 = AtomicU64::new(0);
@@ -2134,10 +2484,23 @@ fn pick_cpu(requested: usize) -> usize {
 /// discounts a core already holding same-slot siblings by half a resident — enough to win every
 /// runnable-resident tie (ahead of the depth/pct tie-breaks), never enough to beat a core with one
 /// fewer runnable resident. Weight rationale: the SPREAD-10 block above `SLOT_CORE_RES`.
+///
+/// SPREAD-13 — the bonus is suspended here on the same terms as in `rewake_place`, and for a reason
+/// specific to this site. The half-resident weight was calibrated so it "can never beat a core with one
+/// FEWER runnable resident", and against a core with one fewer RUNNABLE resident it indeed cannot. But
+/// the sibling core's own count is runnable too, so a core hosting a slot's PARKED tasks reads
+/// `res == 0` and scores `2*0 + 1 - 1 = 0` — below a genuinely spare core's 1. The one state in which
+/// the spawn bonus outranks an empty core is therefore exactly the state in which it must not: a worker
+/// being spawned onto the core where its parked siblings live, while a core owning nothing sits idle.
+/// Suspending it costs nothing anywhere else, because whenever the sibling core has even one runnable
+/// resident the plain key chain already sends the spawn to the emptier core.
 fn pick_cpu_slot(requested: usize, slot: usize) -> usize {
     if requested != CPU_AUTO {
-        return requested;
+        return requested; // the no-migrate pin contract: render/input stay exactly where they are put
     }
+    // SPREAD-13 — asked only for a slotted spawn, so the kernel-thread path (`pick_cpu`) and the
+    // `virt`/JC3 builds pay nothing and behave identically to before this arc.
+    let coplace = slot == 0 || spare_cores() == 0;
     let rot = AUTO_ROTATE.fetch_add(1, Ordering::Relaxed);
     let mut best: Option<usize> = None;
     let mut best_eff = usize::MAX;
@@ -2156,8 +2519,8 @@ fn pick_cpu_slot(requested: usize, slot: usize) -> usize {
         }
         let res = el0_active(cpu); // SPREAD-4: runnable residents, not merely committed ones
         // SPREAD-10: half-resident discount for a core already hosting this task's siblings; the +1
-        // shift keeps the subtraction above zero at res 0.
-        let eff = 2 * res + 1 - usize::from(slot_res(cpu, slot) > 0);
+        // shift keeps the subtraction above zero at res 0. SPREAD-13: not while a core owns nothing.
+        let eff = 2 * res + 1 - usize::from(coplace && slot_res(cpu, slot) > 0);
         // SPREAD-9 — the dissolved service-core reserve: keys 2 and 3 now weigh only work that
         // actually COMPETES with a new arrival. A queued/running service-band task preempts at IPI
         // receipt, runs a micro pass and blocks — it is latency-invisible to a co-resident — but the
@@ -2187,7 +2550,10 @@ fn pick_cpu_slot(requested: usize, slot: usize) -> usize {
             plain_pct = pct;
         }
     }
-    // SPREAD-10 — a spawn steered off the plain winner is a placement the bonus decided.
+    // SPREAD-10 — a spawn steered off the plain winner is a placement the bonus decided. SPREAD-13
+    // needs no arm of its own here: with the bonus suspended `eff` and `res` order the cores
+    // identically, so `best == plain` by construction and this simply stops counting — which is the
+    // honest reading, since under suspension there are no bonus-decided spawns to count.
     if slot != 0 && best.is_some() && best != plain {
         SPREAD10_CO_MOVES.fetch_add(1, Ordering::Relaxed);
     }
@@ -6166,6 +6532,52 @@ fn spread4_witness() {
 /// beside `SPREAD12_RECRUIT` for why a separate "declined" field would have been a structural zero).
 /// The healthy one-window signature is `recruit` stepping a few times and settling, `rstale` at
 /// zero, and the `:: SCHED: load ::` line no longer showing a 0% core beside a 98% one.
+///
+/// SPREAD-13 NARROWED `recruit` TO `spare == 0`, and this is a change in an EXISTING field's meaning
+/// rather than a new one, so it is stated here where the field is printed. While `spare > 0` the
+/// suspension zeroes the retention bonus, which makes the margin lane co-admit every candidate the
+/// idle lane admits, which makes `recruit`'s lane-only attribution identically false. `recruit=0`
+/// beside `spare>0` therefore says NOTHING about recruitment — not that it stopped, not that it is no
+/// longer needed, not that the idle lane went quiet. It is uninterpretable in that regime, by
+/// construction. Read it only on lines where `spare=0`; the derivation is above `SPREAD12_RECRUIT`.
+/// Anyone holding a prior from PA3's `recruit=81` should expect `recruit=0` on the same machine now.
+///
+/// SPREAD-13 adds the conditionality triple, and the three fields are only interpretable together:
+///
+///   * `spare` — cores owning no committed EL0 resident and provably dispatching, sampled NOW. It is
+///     the predicate itself: `spare=0` means co-placement is live and every other field on this line
+///     carries its pre-SPREAD-13 meaning; `spare>0` means it is suspended. This is a gauge rather
+///     than a counter and is trustworthy as one precisely because it is built on COMMITTED residents
+///     — it moves at spawn/reap/move, not at frame rate, so a single sample is representative of the
+///     window rather than of the microsecond. The same field read against `1c`/`2c`/`3c+` is the
+///     whole one-window story in one line: three tasks on three cores with a fourth spare reads
+///     `3c+=1 spare=1`, and the load line beside it should show three cores carrying work.
+///   * `split` — triples this arc took apart, counted as spread-lane-ONLY moves, which means the
+///     `home_act == 1` case only: at `home_act >= 2` the margin and idle lanes co-admit the same
+///     candidate and the move goes unattributed. See `SPREAD13_SPLIT` for that population.
+///   * `repack` — the flap side: moves that put a slot task back onto a core hosting its siblings
+///     from a core hosting none, counted with no lane attribution (so a margin-lane repack under
+///     suspension counts too). `split` stepping with `repack` flat is the arc holding. Both climbing
+///     at the rate of placement asks is the reachable 2-cycle documented above `spare_cores` —
+///     EXPECTED, clock-bounded at `PLACE_REFRESH_MS`/`REWAKE_MIN_PARK_MS`, and judged against the
+///     load line rather than treated as a defect. Only a climb at DISPATCH rate falsifies the bound.
+///
+/// Reading `split=0`: check `spare` first. `spare=0` means the lane is correctly dormant on a
+/// contended machine and says nothing about the arc. `spare>0` with `rstale` climbing means the lane
+/// fired and the freshness gate refused it, which is a wedge sighting rather than a placement result.
+/// `spare>0` with `rstale=0` and `3c+` still populated needs the load line before it is called a
+/// falsification: it is one if the load is still piled on a single core, and it is the
+/// `home_act >= 2` attribution gap above if the load line shows the work already spread.
+///
+/// THE QEMU BATTERY PRINTS `spare=0`, and that is a true reading rather than a broken one — worth
+/// writing down because it is the shape this track sends arcs back for. The battery's single emit
+/// comes from `load_accounting_witness`, which runs once early, before EL0 exists and before the APs
+/// have folded a span recently enough to clear `dispatch_fresh_cyc` (the same instant `[pulse5]`
+/// reports `folds=0` on that wire). A core that has never provably dispatched is NOT spare, by the
+/// definition above, so the field reports the state correctly and the battery proves wiring only —
+/// exactly as `[spread4]`'s all-zero baseline does beside it. On metal the emit comes from
+/// `load_witness_tick` inside `timer_preempt`, where every core is going round `run()` and folding a
+/// span every pass, so the freshness half never suppresses a genuinely spare core there.
 fn spread10_witness() {
     let mut on1 = 0u32;
     let mut on2 = 0u32;
@@ -6185,7 +6597,7 @@ fn spread10_witness() {
         }
     }
     serial_println!(
-        "[spread10] slots 1c={} 2c={} 3c+={} co_moves={} ymoves={} recruit={} rstale={}",
+        "[spread10] slots 1c={} 2c={} 3c+={} co_moves={} ymoves={} recruit={} rstale={} spare={} split={} repack={}",
         on1,
         on2,
         on3,
@@ -6193,6 +6605,9 @@ fn spread10_witness() {
         SPREAD11_YIELD_MOVES.load(Ordering::Relaxed),
         SPREAD12_RECRUIT.load(Ordering::Relaxed),
         SPREAD12_STALE.load(Ordering::Relaxed),
+        spare_cores(), // SPREAD-13: the predicate itself, so `split`'s reading is decidable
+        SPREAD13_SPLIT.load(Ordering::Relaxed),
+        SPREAD13_REPACK.load(Ordering::Relaxed),
     );
 }
 
