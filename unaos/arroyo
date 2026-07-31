@@ -198,6 +198,13 @@ _feats=""
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
 # arms the bootloader side; this feature list only reaches the kernel).
 [ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"
+# GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the INTEGRATED GPU plus its timed
+# auto-revert (drivers/gpu/igpu.rs). ⛔ SINGLE-USE TEST MEDIA — the knob is baked into the image and
+# nothing guards it across boots, so every boot from that stick switches the mux again. Re-flash
+# after the sitting. Without this line the feature exists in Cargo.toml but no gate can reach it:
+# `./arroyo check` type-checked only the DISARMED build, so "gate green" said nothing about the
+# armed code. That is why this mapping is not optional.
+[ -n "${UNAOS_GMUX_IGD:-}" ] && _feats="${_feats}gmux_igd,"
 
 [ -n "${UNAOS_TEGRA:-}" ] && _feats="${_feats}tegra,"
 # ORIN-SMP-2: UNAOS_SMPPROBE=<n> arms the JM5 CPU_ON firmware-wall investigation probe (tegra-only;
