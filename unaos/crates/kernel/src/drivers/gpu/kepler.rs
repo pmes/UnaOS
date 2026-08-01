@@ -243,6 +243,25 @@ pub mod ucode {
 /// silenced. Flip to re-enable the raw dumps.
 const MIRROR_HDR_DENSE: bool = false;
 
+/// Rate of [`crate::arch::now_cycles`] in Hz, or `None` when it is not known on this
+/// platform — the boot-calibrated invariant TSC on x86 (`apic::calibrate`, which runs
+/// long before `pci::init` and therefore before this driver), `None` everywhere else.
+///
+/// `None` is not "zero elapsed": callers that time a bounded poll with this must print
+/// raw cycles and say the clock was a guess, never a fabricated millisecond.
+#[cfg(target_arch = "x86_64")]
+fn poll_hz() -> Option<u64> {
+    match crate::arch::apic::tsc_hz() {
+        0 => None, // calibration never ran or was rejected
+        hz => Some(hz),
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn poll_hz() -> Option<u64> {
+    None
+}
+
 pub fn init(gpu: &GpuInfo) {
     serial_println!("[NVIDIA] Initializing Kepler GPU at BDF {}:{}:{}", gpu.bus, gpu.slot, gpu.func);
 
@@ -473,22 +492,38 @@ pub fn init(gpu: &GpuInfo) {
                                     let ib_4c = unsafe { core::ptr::read_volatile((bar1 + inst_off + 0x4C) as *const u32) };
                                     serial_println!(":: kepler: inst-raw 08={:08X} 0C={:08X} 48={:08X} 4C={:08X} ::", ib_08, ib_0c, ib_48, ib_4c);
 
-                                    let chid_0 = 1;
-                                    let chid_1 = 2;
-                                    let chid_2 = 3;
+                                    let chid_0 = 1u32;
+                                    let chid_1 = 2u32;
+                                    let chid_2 = 3u32;
                                     let entry_0 = chid_0;
                                     let entry_1 = chid_1 | (1 << 31);
                                     let entry_2 = (chid_2 << 1) | 1;
 
+                                    // The three runlist entries, six words, in the order the scheduler
+                                    // reads them out of the runlist page.
+                                    let runlist_words: [u32; 6] = [entry_0, 0, entry_1, 0, entry_2, 0];
+
+                                    // ENTRIES (not words) handed to RUNLIST_SUBMIT (0x2274). The submit
+                                    // and the acceptance poll both derive from THIS — never from a
+                                    // literal. They drifted apart once already: the submit was raised
+                                    // 1 → 3 while the poll kept demanding `(len & 0xFFF) == 1`, a
+                                    // predicate that then could not be satisfied on any boot.
+                                    const RUNLIST_LEN: u32 = 3;
+                                    const _: () = assert!(RUNLIST_LEN as usize * 2 == 6); // words per entry
+
+                                    // Write the six entry words into the runlist page. Called twice —
+                                    // here, and again immediately before the submit. The mirror-window
+                                    // beacon probe below deliberately plants 0xBEAC0001..8 over
+                                    // `runlist_off + 0..31` and must stay planted through its pass-2
+                                    // re-read, so the page has to be rebuilt after the probe is done.
+                                    let write_runlist = || unsafe {
+                                        for (i, w) in runlist_words.iter().enumerate() {
+                                            core::ptr::write_volatile((bar1 + runlist_off + i * 4) as *mut u32, *w);
+                                        }
+                                    };
+
                                     // 1. Write Runlist VRAM FIRST
-                                    unsafe {
-                                        core::ptr::write_volatile((bar1 + runlist_off) as *mut u32, entry_0);
-                                        core::ptr::write_volatile((bar1 + runlist_off + 4) as *mut u32, 0);
-                                        core::ptr::write_volatile((bar1 + runlist_off + 8) as *mut u32, entry_1);
-                                        core::ptr::write_volatile((bar1 + runlist_off + 12) as *mut u32, 0);
-                                        core::ptr::write_volatile((bar1 + runlist_off + 16) as *mut u32, entry_2);
-                                        core::ptr::write_volatile((bar1 + runlist_off + 20) as *mut u32, 0);
-                                    }
+                                    write_runlist();
 
                                     let _read_sched_status = |label: &str| {
                                         let err = mmio_read(bar0, 0x252c);
@@ -535,7 +570,11 @@ pub fn init(gpu: &GpuInfo) {
                                         }
                                         serial_println!(":: kepler: beacon planted at=pb off={:08X} ::", pb_off);
                                         
-                                        // runlist
+                                        // runlist — DESTRUCTIVE: 8 words over `runlist_off + 0..31`
+                                        // covers all six words of all three entries written above.
+                                        // The pass-1/pass-2 scans below are this plant's consumer;
+                                        // `write_runlist()` rebuilds the page after pass 2, before
+                                        // the submit. Do not move the submit above pass 2.
                                         for (i, val) in pattern.iter().enumerate() {
                                             core::ptr::write_volatile((bar1 + runlist_off + i * 4) as *mut u32, *val);
                                         }
@@ -1011,21 +1050,114 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
 
 
                                     // 3. Submit Runlist
-                                    mmio_write(bar0, 0x2270, (runlist_off as u32) >> 12); // target=0 (VRAM), addr
-                                    mmio_write(bar0, 0x2274, 3); // LEN=3, ENG=0
-                                    serial_println!("[NVIDIA] Configured Runlist and bound channel.");
+                                    //
+                                    // Rebuild the entry words first. The mirror-window beacon probe
+                                    // planted 0xBEAC0001..8 over `runlist_off + 0..31` — all six
+                                    // words of all three entries — and its consumers (the pass-1
+                                    // scan and the pass-2 volatility re-read) are long done by here.
+                                    // Without this the chip is handed a three-entry playlist whose
+                                    // entries are beacon words, which is what every capture from the
+                                    // pull-16 beacon landing onward actually submitted.
+                                    write_runlist();
 
-                                    // Wait for PLAYLIST_RD to accept the runlist
-                                    let mut pl_rd = 0;
-                                    let mut pl_rd_len = 0;
-                                    for _ in 0..100_000 {
-                                        pl_rd = mmio_read(bar0, 0x2280);
-                                        pl_rd_len = mmio_read(bar0, 0x2284);
-                                        if pl_rd == ((runlist_off as u32) >> 12) && (pl_rd_len & 0xFFF) == 1 {
-                                            break;
+                                    // Read the page back and count how many words are still beacons.
+                                    // `resid=0` is the only healthy value; any nonzero means something
+                                    // between the rebuild and the submit is still clobbering the page,
+                                    // and the submit below is again meaningless. Without this counter a
+                                    // silently-failed rebuild would look exactly like a good one.
+                                    let mut rl_beacon_resid = 0u32;
+                                    let mut rl_mismatch = 0u32;
+                                    for (i, want) in runlist_words.iter().enumerate() {
+                                        let got = unsafe {
+                                            core::ptr::read_volatile((bar1 + runlist_off + i * 4) as *const u32)
+                                        };
+                                        if (0xBEAC0001..=0xBEAC0008).contains(&got) {
+                                            rl_beacon_resid += 1;
+                                        }
+                                        if got != *want {
+                                            rl_mismatch += 1;
                                         }
                                     }
-                                    serial_println!(":: kepler: post-bind playlist_rd={:08X} playlist_rd_len={:08X} ::", pl_rd, pl_rd_len);
+                                    serial_println!(
+                                        ":: kepler: runlist-rebuild off={:08X} w0={:08X} w1={:08X} w2={:08X} w3={:08X} w4={:08X} w5={:08X} beacon_resid={} mismatch={} {} ::",
+                                        runlist_off,
+                                        runlist_words[0], runlist_words[1], runlist_words[2],
+                                        runlist_words[3], runlist_words[4], runlist_words[5],
+                                        rl_beacon_resid, rl_mismatch,
+                                        if rl_beacon_resid == 0 && rl_mismatch == 0 { "CLEAN" } else { "CORRUPT" }
+                                    );
+
+                                    let want_base = (runlist_off as u32) >> 12;
+                                    mmio_write(bar0, 0x2270, want_base); // target=0 (VRAM), addr
+                                    mmio_write(bar0, 0x2274, RUNLIST_LEN); // ENG=0 | LEN
+                                    serial_println!("[NVIDIA] Configured Runlist and bound channel.");
+
+                                    // Wait for PLAYLIST_RD/_RD_LEN to echo the submit.
+                                    //
+                                    // What this tests, and on whose authority — `docs/dev/OS/08_VIDEO/gpu_spec.md`
+                                    // §2.4.1, from eight metal captures across four code revisions:
+                                    //   * finding 2 — PLAYLIST_RD (0x2280) holds our runlist page,
+                                    //     `runlist_off >> 12`;
+                                    //   * finding 1 — PLAYLIST_RD_LEN bits [11:0] are a faithful echo of
+                                    //     the length we wrote (LEN=1 → …001, LEN=3 → …003, no exceptions).
+                                    // So the predicate is: base echoes, and the entry count echoes
+                                    // `RUNLIST_LEN`. It reads the count from the same constant the submit
+                                    // used, so the two cannot drift apart again.
+                                    //
+                                    // Bit 20 is deliberately NOT in the predicate. §2.4.1 leaves H-ID(weak),
+                                    // H-BUSY and H-STICKY all standing and §2.4.2's sibling sweep has not
+                                    // yet separated them; under H-BUSY the correct wait would be for bit 20
+                                    // to CLEAR, the exact opposite of waiting for it to appear. Polling on
+                                    // an unresolved bit would be asserting a semantics we have not proven.
+                                    //
+                                    // Bounded by wall clock, not by iteration count. Every capture on record
+                                    // shows the echo already present on the first read, so 10 ms is generous
+                                    // by orders of magnitude; the old 100_000-iteration bound with an
+                                    // unsatisfiable predicate burned 200_000 BAR0 reads across PCIe on every
+                                    // boot and could not distinguish "accepted" from "never accepted".
+                                    const PL_POLL_MS: u64 = 10;
+                                    let pl_hz = poll_hz();
+                                    // Calibrated → an honest wall-clock budget. Uncalibrated → scale the
+                                    // fixed pre-calibration guess (`HW_WAIT_BUDGET` is defined as ~2 s),
+                                    // and say so rather than print a fabricated millisecond.
+                                    let pl_budget = match pl_hz {
+                                        Some(hz) => hz.saturating_mul(PL_POLL_MS) / 1000,
+                                        None => crate::arch::HW_WAIT_BUDGET.saturating_mul(PL_POLL_MS) / 2000,
+                                    };
+                                    let pl_t0 = crate::arch::now_cycles();
+                                    let mut pl_rd;
+                                    let mut pl_rd_len;
+                                    let mut pl_iters = 0u32;
+                                    let pl_hit = loop {
+                                        pl_rd = mmio_read(bar0, 0x2280);
+                                        pl_rd_len = mmio_read(bar0, 0x2284);
+                                        pl_iters += 1;
+                                        if pl_rd == want_base && (pl_rd_len & 0xFFF) == RUNLIST_LEN {
+                                            break true;
+                                        }
+                                        if crate::arch::now_cycles().wrapping_sub(pl_t0) >= pl_budget {
+                                            break false;
+                                        }
+                                        core::hint::spin_loop();
+                                    };
+                                    let pl_cy = crate::arch::now_cycles().wrapping_sub(pl_t0);
+                                    // `iters` counts register-pair READS, so its minimum is 1 and `iters=0`
+                                    // is an impossible state — a broken instrument, not a quiet zero.
+                                    // `iters=1 exit=hit` is the echo already present on the first read;
+                                    // `exit=deadline` never means "not looked at". `clk=guess` marks a
+                                    // waited/budget figure derived from the uncalibrated fallback, printed in
+                                    // raw cycles so it can never be mistaken for a measured millisecond.
+                                    let (pl_waited, pl_unit, pl_clk) = match pl_hz {
+                                        Some(hz) => (pl_cy.saturating_mul(1000) / hz, "ms", "tsc"),
+                                        None => (pl_cy, "cy", "guess"),
+                                    };
+                                    serial_println!(
+                                        ":: kepler: post-bind playlist_rd={:08X} playlist_rd_len={:08X} exit={} iters={} waited={}{} budget={}ms clk={} want_base={:08X} want_len={} got_len={} ::",
+                                        pl_rd, pl_rd_len,
+                                        if pl_hit { "hit" } else { "deadline" },
+                                        pl_iters, pl_waited, pl_unit, PL_POLL_MS, pl_clk,
+                                        want_base, RUNLIST_LEN, pl_rd_len & 0xFFF
+                                    );
 
                                     // --- GR6 runlist-sibling sweep (READ-ONLY; docs/dev/OS/08_VIDEO/gpu_spec.md §2.4.2) ---
                                     // Under the gk104 array shape the host runlist controls are
