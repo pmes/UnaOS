@@ -605,6 +605,40 @@ static FTDI_PUMP_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 /// The peak last PRINTED as a `:: FTDI: … result=OK ::` witness — the doubling throttle's reference.
 static FTDI_PUMP_REPORTED: AtomicU64 = AtomicU64::new(0);
 
+// --- CCSTRIM (2026-08-01): the settle's LATE-ASSERT detector ---
+//
+// CCSMARGIN (see `SETTLE_MS`) can only time ports that assert CCS *before* the settle deadline.
+// A port that asserts one millisecond after it reads `none` — identical to an empty port. That
+// blind spot is tolerable when the settle is generously padded and fatal to a TRIM: every
+// millisecond taken off the settle moves more of the real population into the un-timeable region,
+// and the instrument would go on printing a comfortable `margin_ms` computed from the ports that
+// still fit. A trim justified by a witness that cannot see the trim's own failure mode is not
+// justified at all.
+//
+// So the deadline stops being the end of the measurement. Ports that read `none` are latched here,
+// and the FIRST connect edge each one delivers afterwards — through the ordinary CSC / hot-plug
+// path in `handle_port_status`, which is the path that recovers such a device — prints how long
+// after the settle's start it actually arrived. That number is the falsifier: it is exactly the
+// `SETTLE_MS` the machine would have needed, measured on the machine, with no upper bound.
+//
+// Armed once, at the end of the settle. Not reset per boot because there is only one boot.
+static CCS_LATE_ARMED: AtomicBool = AtomicBool::new(false);
+/// `now_cycles()` at the instant the settle began (i.e. immediately after the port-power loop).
+static CCS_SETTLE_START: AtomicU64 = AtomicU64::new(0);
+/// The live `SETTLE_MS`, so the late line can restate the budget it beat without importing it.
+static CCS_SETTLE_MS_LIVE: AtomicU64 = AtomicU64::new(0);
+/// Per root port: "the settle ended without ever seeing CCS=1 here". Cleared on the first connect
+/// edge, so each port reports at most once and a later re-plug of the same port stays quiet.
+static CCS_UNSEEN: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+/// How long after the settle's start a connect edge still counts as "the settle was too short"
+/// rather than "a human plugged something in". Two seconds: the slowest bring-up either seat has
+/// ever observed for a device that was physically present at power-on is the Pi's VL805 presenting
+/// its root ports, in the high hundreds of milliseconds, and no boot-attached device can plausibly
+/// take twice that. Past the window the port is simply disarmed and the ordinary hot-plug lines
+/// carry it — an unbounded detector would fire on every hot-plug for the rest of uptime and make
+/// the token useless as a wake pattern.
+const CCS_LATE_WINDOW_MS: u64 = 2000;
+
 // --- BOT error recovery (USB Mass Storage Bulk-Only Transport 1.0 §5.3.3/§5.3.4, "Reset
 // Recovery") ---
 //
@@ -3841,6 +3875,10 @@ impl XhciController {
             let max_ports = self.max_ports;
             serial_println!("xHCI: Max Ports = {}", max_ports);
 
+            // CCSTRIM: remember, per port, whether WE applied VBUS here (PP was 0) or found it
+            // already on. This is the discriminator the CCSMARGIN line was missing, and it decides
+            // what the settle's clock even means for that port — see `SETTLE_MS` below.
+            let mut pp_applied = [false; 256];
             for i in 1..=max_ports {
                 let port_offset = 0x400 + (i as usize - 1) * 0x10;
                 let portsc_ptr = (self.op_base + port_offset) as *mut u32;
@@ -3850,6 +3888,7 @@ impl XhciController {
                 if (status & (1 << 9)) == 0 {
                     serial_println!("xHCI: Powering on Port {}", i);
                     core::ptr::write_volatile(portsc_ptr, status | (1 << 9));
+                    pp_applied[i as usize] = true;
                 } else {
                     serial_println!("xHCI: Port {} already powered. Status: {:#x}", i, status);
                 }
@@ -3891,7 +3930,48 @@ impl XhciController {
             // catch it. It enumerates LATER, not never — and "the boot device arrived via the
             // CSC/warm-reset path instead of the initial scan" is the metal tell-tale of a
             // regression here (see usb_xhci.md §2d).
-            const SETTLE_MS: u64 = 150;
+            //
+            // CCSTRIM (2026-08-01): 150 ms -> 100 ms, and the number stops being a USB3 guess and
+            // becomes the USB 2.0 attach allowance, which is the only external standard that binds
+            // this wait at all.
+            //
+            //   * WHAT THE WAIT ACTUALLY COVERS. Two independent phenomena were folded into one
+            //     constant. (a) USB 2.0: VBUS reaching operating level on a port we just powered,
+            //     then the device pulling up its speed resistor — TSIGATT, "signalling attach",
+            //     which USB 2.0 Table 7-14 caps at 100 ms from VBUS_min. (b) USB 3 link training,
+            //     RxDetect -> Polling -> U0, whose outer bound is tPollingLFPSTimeout = 360 ms
+            //     (USB 3.2 §6.9). M4 already moved (b) out of here: POLLING_DECIDE_MS below is
+            //     defined as 360 − SETTLE_MS, so the USB3 verdict window is 360 ms from port power
+            //     NO MATTER what this constant is, and shortening the settle cannot shorten it.
+            //     (b) therefore places NO floor here. Only (a) does.
+            //
+            //   * THE FLOOR IS 100, AND IT IS TSIGATT. A spec-conformant USB 2.0 device may take
+            //     its full 100 ms to signal attach after VBUS is valid. Setting this below 100
+            //     would be DESIGNING the initial scan to miss a conformant device — a decision no
+            //     measurement of one machine's device population can license. 150 carried 50 ms
+            //     above that floor as an unstated VBUS-ramp allowance; the ramp only exists for
+            //     ports we actually power, and the witness below now prints which ports those were,
+            //     so the allowance is no longer paid blind on every boot by every machine.
+            //
+            //   * WHY NOT LOWER, GIVEN THE MEASUREMENT. GR11's metal reading (rMBP, the
+            //     instrument's first ever) was `latest=21 margin_ms=129` against 150 — the last
+            //     port to connect did so 21 ms in, 7x inside budget. That invites a much deeper
+            //     cut, and the cost model forbids it. A port timed at `t`: if t <= SETTLE_MS it is
+            //     caught by the initial scan and, being a boot-scan entry, SKIPS the 100 ms
+            //     connect debounce, so enumeration starts at SETTLE_MS. If t > SETTLE_MS it falls
+            //     to the CSC/hot-plug path, which is NOT a boot-scan entry and therefore pays the
+            //     full TATTDB debounce, so enumeration starts at t + 100. Undershooting by one
+            //     millisecond costs a hundred. The trim is worth at most (150 − SETTLE_MS) and
+            //     risks +100 whenever the real population's tail exceeds the new value, so the
+            //     asymmetry alone rules out chasing the 21.
+            //
+            //   * n=1, AND THE READING DOES NOT DISCRIMINATE. One boot, one machine, one set of
+            //     attached devices. Worse, `latest=21` alone cannot say whether the settle's clock
+            //     started at a VBUS transition at all: if firmware had already powered that port,
+            //     TSIGATT expired long before we arrived and 21 ms is measuring something else
+            //     entirely. That is why `pp=` and the late-assert detector are added in the same
+            //     change as the trim — the next capture answers it, this one could not.
+            const SETTLE_MS: u64 = 100;
             let per_ms = Self::cycles_per_ms();
             let settle_start = crate::arch::now_cycles();
             let settle = SETTLE_MS * per_ms;
@@ -3988,6 +4068,18 @@ impl XhciController {
                                &mut ccs_first, &mut ccs_pending);
                 }
             }
+            // CCSTRIM: the deadline is no longer the end of the measurement. Every port the settle
+            // did NOT see is armed here; its first connect edge afterwards is timed and reported by
+            // `handle_port_status`, which is the number that says how long the settle should have
+            // been on THIS machine. Stored before the scan below so an edge landing during the
+            // Polling debounce (up to 360 − SETTLE_MS ms of it) is already covered.
+            CCS_SETTLE_START.store(settle_start, Ordering::Relaxed);
+            CCS_SETTLE_MS_LIVE.store(SETTLE_MS, Ordering::Relaxed);
+            for i in 1..=max_ports {
+                CCS_UNSEEN[i as usize]
+                    .store(ccs_first[i as usize] == CCS_NEVER, Ordering::Relaxed);
+            }
+            CCS_LATE_ARMED.store(true, Ordering::Release);
             serial_println!("xHCI: port settle complete before CCS scan (settle_ms={})", SETTLE_MS);
             // BPACE: the fixed pre-enumeration settle (`hw_wait_budget()/4` — ~0.5 s of wall clock
             // and nothing else).
@@ -4016,9 +4108,28 @@ impl XhciController {
             // placed here instead would read ~SETTLE_MS on every boot forever: the recorder, not the
             // phenomenon. The number lives in this line, and M4's ring arithmetic (n=31 of CAP=64)
             // is left exactly as it was — `dropped=` stays 0.
+            //
+            // CCSTRIM adds two things to it, both because the line is now the justification for a
+            // TRIMMED constant rather than a description of a padded one:
+            //
+            //   * `/on` vs `/pre` per port — did WE apply VBUS to this port (PP was 0, so the
+            //     settle's clock starts at a real power transition and USB 2.0's 100 ms TSIGATT
+            //     allowance is genuinely running), or was it already powered by firmware (VBUS has
+            //     been valid for a long time, TSIGATT expired before we existed, and a nonzero
+            //     `first_assert_ms` is measuring something other than attach signalling)? Without
+            //     it, `latest=21` is uninterpretable: on a `/pre` port it says the settle covers a
+            //     phenomenon nobody has named, and on an `/on` port it says a conformant device
+            //     used a fifth of its allowance. GR11's reading could not distinguish them, which
+            //     is precisely why this arc does not cut below the spec floor.
+            //   * a DISTINCT RESULT TOKEN when the margin is gone. A shrinking `margin_ms` is one
+            //     integer in a hundred-character line and a capture-grep for it must already know
+            //     what "too small" is. `result=CCSMARGIN-TIGHT` / `result=CCSMARGIN-BLOWN` are
+            //     states, not numbers — and together with `result=CCSMARGIN-LATE` from the
+            //     detector armed above, `result=CCSMARGIN-` matches every failure of this trim and
+            //     nothing on a healthy boot.
             {
                 use core::fmt::Write as _;
-                let mut latest: Option<u16> = None;
+                let mut latest: Option<(u16, u8)> = None;
                 let mut line = alloc::string::String::new();
                 let _ = write!(line, "xHCI: ccs-margin settle_ms={} ports={} first_assert_ms=[",
                                SETTLE_MS, max_ports);
@@ -4026,29 +4137,49 @@ impl XhciController {
                     if i > 1 {
                         let _ = write!(line, " ");
                     }
+                    let pp = if pp_applied[i as usize] { "on" } else { "pre" };
                     match ccs_first[i as usize] {
                         CCS_NEVER => {
-                            let _ = write!(line, "p{}:none", i);
+                            let _ = write!(line, "p{}:none/{}", i, pp);
                         }
                         v => {
-                            let _ = write!(line, "p{}:{}", i, v);
-                            if latest.is_none_or(|l| v > l) {
-                                latest = Some(v);
+                            let _ = write!(line, "p{}:{}/{}", i, v, pp);
+                            if latest.is_none_or(|(l, _)| v > l) {
+                                latest = Some((v, i));
                             }
                         }
                     }
                 }
                 match latest {
-                    Some(l) => {
-                        let _ = write!(line, "] latest={} margin_ms={} result=CCSMARGIN",
-                                       l, SETTLE_MS as i64 - l as i64);
+                    Some((l, port)) => {
+                        let margin = SETTLE_MS as i64 - l as i64;
+                        let _ = write!(line, "] latest={} margin_ms={} result=CCSMARGIN", l, margin);
+                        serial_println!("{}", line);
+                        // The negative case, stated as a state and not left as a small integer.
+                        // BLOWN: the at-deadline sweep was the first sample to see CCS=1 — this
+                        // port reached the initial scan with no headroom at all, and one slower
+                        // boot puts it past the deadline entirely. TIGHT: still positive, but
+                        // inside a fifth of the budget, which on a constant this arc just cut to
+                        // the USB 2.0 floor means the floor is where the population actually
+                        // lives. Both are findings; only BLOWN is a failure.
+                        if margin <= 0 {
+                            serial_println!(
+                                "xHCI: !! ccs-margin BLOWN port={} latest={} settle_ms={} margin_ms={} \
+                                 (deadline sweep was the first CCS=1; no headroom) result=CCSMARGIN-BLOWN",
+                                port, l, SETTLE_MS, margin);
+                        } else if margin <= (SETTLE_MS / 5) as i64 {
+                            serial_println!(
+                                "xHCI: !! ccs-margin TIGHT port={} latest={} settle_ms={} margin_ms={} \
+                                 (under a fifth of budget left) result=CCSMARGIN-TIGHT",
+                                port, l, SETTLE_MS, margin);
+                        }
                     }
                     // No port ever asserted: nothing was measured, so there is no margin to report.
                     None => {
                         let _ = write!(line, "] latest=none margin_ms=none result=CCSMARGIN");
+                        serial_println!("{}", line);
                     }
                 }
-                serial_println!("{}", line);
             }
 
             // Scrub any latched PORTSC change bits before enumeration: one latched bit gates
@@ -4127,6 +4258,13 @@ impl XhciController {
                 // Bit 0: CCS (Current Connect Status)
                 if (status & 1) != 0 {
                     serial_println!("xHCI: Port {} connected (Status: {:#x}); queued for enumeration.", i, status);
+                    // CCSTRIM: the initial scan HAS this port, so it never fell to the recovery
+                    // path and owes no late report — disarm it. (A USB3 link that finished
+                    // training during the Polling debounce lands here: the settle was short for
+                    // it, but it cost nothing, and `CCSMARGIN-LATE` must mean "the scan missed a
+                    // port", not "a timer was tight". Its own CSC arrives later and is swallowed
+                    // by the active-device case in `handle_port_status`.)
+                    CCS_UNSEEN[i as usize].store(false, Ordering::Relaxed);
                     self.ports_to_enumerate.push(i);
                     // BOOTPACE M4: mark this as an INITIAL-SCAN entry. Its connection has been
                     // electrically stable since before we powered the port — the boot device was
@@ -4219,6 +4357,29 @@ impl XhciController {
         // completion drains the queue), so the one-at-a-time invariant holds.
         if changes & (1 << 17) != 0 {
             if (portsc & 1) != 0 {
+                // CCSTRIM: before any policy runs on this edge — is this the connect the pre-scan
+                // settle was too short to wait for? `CCS_UNSEEN` was armed at the settle's end for
+                // every port it never saw and cleared for every port the initial scan did find, so
+                // a surviving flag means exactly one thing: this port missed the scan and is being
+                // recovered by the path §2d promises will recover it. The elapsed time is the only
+                // direct measurement of how long `SETTLE_MS` should have been on this machine, and
+                // it is taken here because an instrument that stops at the deadline can never
+                // produce it. Reported once per port; disarmed either way, so a hot-plug hours into
+                // uptime cannot resurrect the token.
+                if CCS_LATE_ARMED.load(Ordering::Acquire)
+                    && CCS_UNSEEN[port_id as usize].swap(false, Ordering::Relaxed)
+                {
+                    let t_ms = crate::arch::now_cycles()
+                        .wrapping_sub(CCS_SETTLE_START.load(Ordering::Relaxed))
+                        / Self::cycles_per_ms();
+                    let settle_ms = CCS_SETTLE_MS_LIVE.load(Ordering::Relaxed);
+                    if t_ms <= CCS_LATE_WINDOW_MS {
+                        serial_println!(
+                            "xHCI: !! ccs-margin LATE port={} t_ms={} settle_ms={} short_by_ms={} \
+                             (missed the initial CCS scan; recovered via CSC) result=CCSMARGIN-LATE",
+                            port_id, t_ms, settle_ms, t_ms.saturating_sub(settle_ms));
+                    }
+                }
                 // CONNECT edge (CCS=1). Three cases to tell apart (M1 / XENUM-1):
                 //   (a) the reset artifact — the USB reset WE issue for `enumerating_port` asserts
                 //       CSC while CCS stays 1 throughout. Never disturbed the connection, so no
