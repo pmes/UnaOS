@@ -2022,12 +2022,16 @@ impl Controller {
 const KBDWIT_QUIET_MS: u64 = 4000;
 
 /// KBDWIT — USBSTS bit 15, Async Schedule Status (EHCI 1.0 §2.3.2): the controller is traversing
-/// the asynchronous list. Genuinely absent from the module's shared register set — the two other
-/// readers of this bit (`quiesce_if_firmware_stale`) spell it as a bare `1 << 15` — so unlike
-/// Periodic Schedule Status (bit 14), which this probe takes from the module's `STS_PSS`, it needs
-/// a name. Left KBDWIT-local rather than promoted to a shared `STS_ASS` beside `STS_PSS`: that
-/// block is the one region of this file trunk is concurrently editing, and this arc was verified
-/// collision-free against it. Promoting it (and folding in those two bare literals) is the right
+/// the asynchronous list. Genuinely absent from the module's shared register set — its only other
+/// readers, both in `overlay_txn` (mod.rs:812 and mod.rs:820), spell it as a bare `1 << 15` — so it
+/// needs a name here. Periodic Schedule Status is the neighbouring bit 14, which this probe takes
+/// from the module's own `STS_PSS`: that constant is `1 << 14` and correct per EHCI 1.0 §2.3.2,
+/// and trunk `8b112c64` is the prose fix for its doc comment, so there is nothing for this
+/// instrument to work around and no reason to duplicate it.
+///
+/// Left KBDWIT-local rather than promoted to a shared `STS_ASS` beside `STS_PSS`: that const block
+/// is the one region of this file trunk is concurrently editing, and this arc was verified
+/// collision-free against it. Promoting it — and folding in those two bare literals — is the right
 /// follow-up, on a branch that is not racing that hunk.
 #[cfg(feature = "kbdwit")]
 const KBDWIT_STS_ASS: u32 = 1 << 15;
@@ -2100,9 +2104,16 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     // a TT, so a wedged split shows up HERE and nowhere else.
     //
     // THEY ARE NOT EQUALLY TRUSTWORTHY, and the difference matters on the metal path:
-    //   * `ovl4` IS cleared on every (re-)arm — `init_schedules`, `arm_interrupt_ep` and the
-    //     service-loop re-arm all write `overlay[4] = 0` — so a non-zero value is progress the
-    //     controller made on THIS transfer. Read it as evidence.
+    //   * `ovl4` IS cleared before every (re-)arm, by a DIFFERENT mechanism per path. On
+    //     overlay-direct, `arm_interrupt_ep` (1587) and the service-loop re-arm (1877) each write
+    //     `overlay[4] = 0` directly; both sites are inside the `overlay_mode` branch, so on
+    //     qtd-chain the driver never writes this QH's `overlay[4]` at all — there the controller
+    //     LOADS the overlay from the qTD, and `write_qtd` (qh.rs:185) sets
+    //     `buf = [buf_phys, 0, 0, 0, 0]`. Either way the word is zero going into the transfer, so
+    //     a non-zero value is progress the controller made on THIS transfer. Read it as evidence.
+    //     (Note for anyone re-deriving this: the driver's third `overlay[4] = 0`, at mod.rs:799,
+    //     is in `overlay_txn` and lands on the CONTROL QH — it has nothing to do with `e.qh`. And
+    //     `init_schedules` writes only `overlay[0]/[1]/[2]`; it never touches `overlay[4]`.)
     //   * `ovl5` IS NEVER WRITTEN BY THIS DRIVER, anywhere. On the qtd-chain path `write_qtd`
     //     zeroes `buf[1..5]` and the controller copies them into the overlay when it fetches the
     //     qTD, so it happens to be clean there. On OVERLAY-DIRECT — the mode this metal settles
@@ -2138,6 +2149,12 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     // is a fault. `class=never-completed` is the shared picture of an idle keyboard and of the s58
     // recurrence — see WHAT IT CAN AND CANNOT CONVICT in the section comment. Do not read this
     // line alone as a recurrence; the evidence is on lines 2..7.
+    //
+    // `class=` keys off the same `kbdwit_last_ms == 0` sentinel `since` does above, and inherits
+    // its one ambiguity: a completion stamped at `arch::ms() == 0` would be indistinguishable from
+    // "never completed". Unreachable here — enumeration alone is ~1.8 s in before an endpoint can
+    // complete anything — but `class=` PRINTS the sentinel as a verdict where `since` only branches
+    // on it, so it is written down rather than left implicit.
     serial_println!(
         ":: KBDWIT: [{}] ep=IN{} addr={} kind={} NO-COMPLETIONS class={} quiet={}ms armed_ms={} last_ms={} now_ms={} reports={} toggle={} dead={} == witness ::",
         idx, epn, addr, kind,
@@ -2207,16 +2224,25 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     //     adv=0x0000  the frame counter has not moved in seconds — the schedule is FROZEN.
     //     adv!=0      it moved. The MAGNITUDE IS NOT A RATE: FRINDEX is 14 bits and wraps every
     //                 2.048 s while this window spans several wraps, so `adv` is `(fire - arm)`
-    //                 modulo 0x4000 and nothing more. (The one false-clean case is an advance that
-    //                 lands on an exact multiple of 16384 microframes — 1 in 16384, and it would
-    //                 have to coincide with a fault that leaves every other field healthy.)
+    //                 modulo 0x4000 and nothing more.
+    //
+    // WHICH WAY THIS FIELD CAN LIE — and it is the opposite of the usual worry. A stopped counter
+    // gives `arm == fire`, hence `adv = 0` unconditionally, so `adv != 0` is unfalsifiable proof of
+    // movement: there is NO false-clean mode. The only error is a false FROZEN — a healthy counter
+    // whose advance across the window happens to land on an exact multiple of 16384 microframes
+    // reads `adv=0x0000`. That is a FALSE ALARM (1 in 16384), never a missed fault. So `adv=0x0000`
+    // is worth a second boot before it is worth a conviction; `adv!=0` needs no corroboration.
     //
     // `post` is a second sample taken after lines 1..6 have been emitted. It is NOT the tell and
     // must not be read as one: on this rig printing costs tens of microseconds against FRINDEX's
     // 125 us tick, so `post == fire` and `post_ms=0` are the NORMAL healthy result. It is retained
     // only because it costs nothing and does resolve on a platform whose console is genuinely slow.
-    // All three readings print raw; `ok=0` means at least one of the reads failed and the hex —
-    // `adv` included — is a placeholder, not a measurement.
+    //
+    // The two flags are SPLIT along exactly that line, so the non-load-bearing sample can never
+    // discredit the load-bearing one: `ok=` covers `arm` and `fire` — i.e. it guards `adv`, and
+    // `ok=0` means `adv` is a placeholder, not a measurement — while `post_ok=` covers `post`
+    // alone. A single `ok=` over all three would let a failed `post` read stamp "placeholder" on a
+    // perfectly valid `adv`, discarding the tell on account of the field just declared not to be it.
     let fr_post = mmio_read32(op + KBDWIT_OP_FRINDEX);
     let t_b = crate::arch::ms();
     let adv = match (e.kbdwit_armed_frindex, fr_a) {
@@ -2224,12 +2250,13 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
         _ => 0,
     };
     serial_println!(
-        ":: KBDWIT: [{}] ep=IN{} frindex arm={:#06x} fire={:#06x} post={:#06x} ok={} adv={:#06x} post_ms={} == witness ::",
+        ":: KBDWIT: [{}] ep=IN{} frindex arm={:#06x} fire={:#06x} post={:#06x} ok={} post_ok={} adv={:#06x} post_ms={} == witness ::",
         idx, epn,
         e.kbdwit_armed_frindex.unwrap_or(0) & 0x3FFF,
         fr_a.unwrap_or(0) & 0x3FFF,
         fr_post.unwrap_or(0) & 0x3FFF,
-        (e.kbdwit_armed_frindex.is_some() && fr_a.is_some() && fr_post.is_some()) as u8,
+        (e.kbdwit_armed_frindex.is_some() && fr_a.is_some()) as u8,
+        fr_post.is_some() as u8,
         adv,
         t_b.wrapping_sub(t_a),
     );
