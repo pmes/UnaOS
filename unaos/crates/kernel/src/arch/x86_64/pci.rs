@@ -295,12 +295,15 @@ impl Gpace {
 /// still unknown. Never fabricates a millisecond out of a guessed frequency (the `[vugfps]` lesson).
 ///
 /// The expression is `cy / (hz / 1000)` — deliberately `bootpace::Dur`'s formula and NOT EPACE's
-/// `cy * 1000 / hz`. The two differ by up to 1 ms, which would be irrelevant anywhere else but is
-/// not irrelevant here: the whole deliverable is `span` versus the ledger's own rendered
-/// `pci-usb d=`, and two renderers make that comparison disagree by one before either instrument
-/// has said anything. Sharing `Dur`'s divisor makes "the same clock" true of the printed digits and
-/// not merely of the counter. The `hz >= 1000` guard is `Dur`'s too, so a sub-kHz rate falls to raw
-/// ticks in both places rather than dividing by zero in one of them.
+/// `cy * 1000 / hz`. The two can differ by one millisecond, but only just barely: at this machine's
+/// `hz=2693848854` the relative gap is ≈3.2e-7 (~0.0006 ms over a 1845 ms reading), so it changes a
+/// printed digit only when it straddles a floor boundary, on the order of 1e-6 per reading. This is
+/// not a bug being fixed. It is that the whole deliverable is `span` versus the ledger's own
+/// rendered `pci-usb d=`, and identical-by-construction is worth having over almost-always-equal
+/// when it costs one expression: it makes "the same clock" true of the printed digits and not
+/// merely of the counter. The `hz >= 1000` guard is `Dur`'s too, so a sub-kHz rate falls to raw
+/// ticks in both places rather than dividing by zero in one of them; it also retires the
+/// `saturating_mul` ceiling the old form carried.
 fn gpace_fmt(cy: u64) -> (u64, &'static str) {
     let hz = crate::bootpace::origin_hz();
     if hz >= 1000 { (cy / (hz / 1000), "ms") } else { (cy, "cy") }
@@ -703,7 +706,13 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         }
         let (sv, su) = gpace_fmt(span);
         // Printed-domain closure: `resid` is what the printed span has left after the printed
-        // classes. The row sums to `span` exactly, for any `hz`, including the `cy` case.
+        // classes. In a sound build — equivalently, whenever the tripwire above stayed silent —
+        // the row sums to `span` exactly, for any `hz`, including the `cy` case (which floors
+        // nothing, so `rv = span - Σ` outright). The OVERLAP case is the deliberate exception: the
+        // row does NOT close there and `resid=0ms` still prints, which is precisely why that
+        // condition gets a line of its own rather than being left to this subtraction. The
+        // `saturating_sub` is therefore never silent — `named > sv` implies `Σcy > span`, which is
+        // exactly the tripwire's condition.
         let mut named = 0u64;
         let mut j = 0;
         while j < N_GPACE {

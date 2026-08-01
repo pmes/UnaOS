@@ -421,15 +421,26 @@ actually anchored is printed as `anchor=`, so a reader sees immediately when the
 topology changes. Conversion goes through `bootpace::origin_hz()`, the same rate
 the ledger divides its own `d=` by — and `gpace_fmt` uses `Dur`'s own expression,
 `cy / (hz / 1000)`, rather than EPACE's `cy * 1000 / hz`, so the two instruments
-share a renderer and not merely a counter. (Those two expressions differ by up to
-1 ms. Anywhere else that is irrelevant; here the entire deliverable is one
-rendered number against another, so the divisor was made identical instead of the
-claim softened.)
+share a renderer and not merely a counter. The practical gap between those two
+expressions is tiny — at this machine's `hz=2693848854` the relative difference
+is ≈3.2e-7, about 0.0006 ms over a 1845 ms reading, and it can only change a
+printed digit when it happens to straddle a floor boundary (~1e-6 per reading).
+The change was still right, because identical-by-construction beats
+almost-always-equal and it cost nothing; but it removed a remote possibility, not
+a standing error.
 
 The remaining slack is these two lines' own print cost, which lands inside
 `pci-usb` and outside `span`. **Measured: 1 ms** — `span=26ms` against
-`pci-usb d=27ms`, and `since-entry=1845ms` against `pci-usb t=1846ms`, twice
-independently.
+`pci-usb d=27ms`, and `since-entry=1845ms` against `pci-usb t=1846ms`. Those are
+**the same interval seen from two origins, one observation and not two**:
+`d − span` and `t − since-entry` both reduce to *(the `pci-usb` stamp instant) −
+(the GPACE report instant)*, so if the print cost is 1 ms both gaps are 1 ms by
+construction. They corroborate the arithmetic, not each other.
+
+Provenance: that capture predates the `gpace_fmt` change above, so it was taken
+with the `cy * 1000 / hz` renderer. The 1 ms cannot be an artefact of that — the
+two expressions differ by ~0.0006 ms at this `hz`, four orders of magnitude too
+small — so the number stands for the current build.
 
 `resid = span − Σ(named classes)` **over the printed millisecond values**, and
 the classes are disjoint sequential spans inside `span`. The printed domain is
@@ -439,10 +450,17 @@ cycles and then floored a ninth time leaves the printed row short of the printed
 noise; against the ~100 ms default-build baseline of §9a — the reading this
 document calls load-bearing — it is up to 8%, sitting in exactly the field whose
 job is to prove nothing went unattributed. A reader adds up the line, so the line
-must add up. `Σfloor(x_k) ≤ floor(Σx_k) ≤ floor(span)` makes the subtraction
-non-negative by construction. A class that under-measures therefore **inflates
-`resid`** — the arithmetic still closes, so the lie surfaces as unattributed time
-instead of as a tidy-looking total.
+must add up. `Σfloor(x_k/d) ≤ floor(Σx_k/d) ≤ floor(span/d)` for any integer
+`d ≥ 1` makes the subtraction non-negative by construction whenever
+`Σx_k ≤ span`; on the `cy` path there is no flooring at all and `resid` is
+`span − Σ` outright. A class that under-measures therefore **inflates `resid`** —
+the arithmetic still closes, so the lie surfaces as unattributed time instead of
+as a tidy-looking total.
+
+That closure holds **in a sound build** — equivalently, whenever the tripwire
+below stays silent. The overlap case is the deliberate exception: there the row
+does *not* close and `resid=0ms` still prints, which is exactly why that
+condition gets a line of its own rather than being left to the subtraction.
 
 **The tripwire.** The cycle-domain comparison survives, but as a conviction
 rather than as the printed residual. `Σ > span` in cycles is what overlapping
@@ -451,6 +469,11 @@ produce — and a `saturating_sub` renders all three as `resid=0ms`, which is al
 the *healthy* reading. Clamping a broken instrument into the shape of a working
 one is the defect class this whole ledger exists to avoid, so the overlap case
 gets its own line instead. One branch, never taken in a sound build.
+
+The clamp on `resid` is acceptable precisely because it can never be silent:
+`named > sv` implies `Σx_k > span`, which implies `sum_cy > span`, which is the
+tripwire's own condition. Any reading the clamp would have hidden is announced by
+the line above it.
 
 Every class prints `<value><unit>(n=<count>)`. `0ms(n=0)` means *this code was
 not compiled in or never reached*; `0ms(n=1)` means *it ran and cost nothing*.
