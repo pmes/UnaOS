@@ -3588,3 +3588,16 @@ regardless of list class, a per-thread condition outside the ARM-visible registe
 
 Instrument-lie ledger +1 (the campaign's n+2 of this shape): a wrapping offset over a frozen
 register, printed under a verdict string that presumed the register valid.
+
+**NOTE — V3D-83 (same day): the audit generalized the fix.** A sweep of the aarch64 witness
+surface for the same class — a derived value computed from a raw register word whose freeze
+would go undetected — found the identical unguarded idiom over BPCA, CT0CA's PTB sibling, at
+five sites, and the PI-V3D-82 idiom was transplanted to each: `[v3d41]` `ptb_frame_witness`
+now seeds a `bpca_pre` beside `bfc_pre`/`rfc_pre` and requires an observed pre→post transition
+landing in the pool span before any "the PTB emitted bytes" claim; the `[v3d55]` pool phantom
+arm and the `[v3d56]` bpca-vs-bytes mismatch arm gate on the raw word sitting inside the pool
+span, routing out-of-span words to an explicit no-verdict stale arm; `[v3d58]` station S4 and
+the `[v3d71]` mainline-geom line (both display-only consumers) carry an out-of-pool `(stale?)`
+tell. In every case the raw word is printed beside the derived figure and the deciding
+instrument (the poison scans) is named. No banked verdict is reinterpreted — the fix constrains
+what future lines can claim, not the meaning of past captures.

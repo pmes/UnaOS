@@ -2455,6 +2455,11 @@ fn v3d55_tilestate_readback(tag: &str, cl_iova: u32, ts_iova: u32, pool_iova: u3
         }
     }
     let bfc = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    // PI-V3D-83 (the PI-V3D-82 idiom over BPCA): before reading any wrapping offset as an advance,
+    // require the raw word to sit inside the pool span — an out-of-span word is a stale pre-kick/
+    // residue address, not a write pointer into THIS pool (the frozen-register class, v3d.md §48).
+    let bpca_in_pool =
+        bpca >= pool_iova && bpca <= pool_iova.wrapping_add(BIN_TILEALLOC_BYTES as u32);
 
     serial_println!(
         ":: V3D: [v3d55] tilestate ({}) — TSDA iova={:#010x} bytes={} words={} nonzero_words={} first_nz=[{}] | L2T write-back completed={} (L2TCACTL after={:#010x}) | head w0..w7 = {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} — {} ::",
@@ -2472,11 +2477,13 @@ fn v3d55_tilestate_readback(tag: &str, cl_iova: u32, ts_iova: u32, pool_iova: u3
         }
     );
     serial_println!(
-        ":: V3D: [v3d55] pool ({}) — pool iova={:#010x} bytes={} words={} nonzero_words={} first_nz=[{}] (FULL-pool scan) | L2T write-back completed={} | head w0..w7 = {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} | BPCA={:#010x} (adv {:#x} off pool base) BPCS={:#010x} BFC={:#010x} — {} ::",
+        ":: V3D: [v3d55] pool ({}) — pool iova={:#010x} bytes={} words={} nonzero_words={} first_nz=[{}] (FULL-pool scan) | L2T write-back completed={} | head w0..w7 = {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} | BPCA={:#010x} (adv {:#x} off pool base{}) BPCS={:#010x} BFC={:#010x} — {} ::",
         tag, pool_iova, BIN_TILEALLOC_BYTES, pool_words, pool_nonzero, pool_first_nz,
         flush_done as u32,
         p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
-        bpca, bpca.wrapping_sub(pool_iova), bpcs, bfc,
+        bpca, bpca.wrapping_sub(pool_iova),
+        if bpca != 0 && !bpca_in_pool { ", out-of-span=stale" } else { "" },
+        bpcs, bfc,
         if pool_nonzero != 0 {
             "the pool carries binner bytes — primitive-list output exists in DRAM; frame-close is the only missing step"
         } else if !flush_done {
@@ -2484,8 +2491,10 @@ fn v3d55_tilestate_readback(tag: &str, cl_iova: u32, ts_iova: u32, pool_iova: u3
         } else if bpca == 0 {
             // A block whose registers read 0x0 is not a PTB parked at the pool base — do not conflate.
             "BPCA reads 0x0, which is NOT the pool base — the register is either genuinely reset or the block is not returning live values; this says nothing about where a PTB write pointer stands (check the other CLE/PTB registers in the [v3d45] dump for a block-wide zero/poison pattern)"
+        } else if bpca != pool_iova && !bpca_in_pool {
+            "BPCA holds a word OUTSIDE the pool span — a stale pre-kick/residue address, not a write pointer into THIS pool: no phantom/address verdict from this line (the frozen-register rule, v3d.md §48); the poison scans are the deciding instrument"
         } else if bpca != pool_iova {
-            "BPCA ADVANCED off the pool base yet the FULL pool reads all-zero after a COMPLETED L2T write-back — on this evidence BPCA is a PHANTOM/aliased write pointer and the address question reopens (see [v3d55] mmucfg + the pte lines)"
+            "BPCA ADVANCED off the pool base (in-span) yet the FULL pool reads all-zero after a COMPLETED L2T write-back — on this evidence BPCA is a PHANTOM/aliased write pointer and the address question reopens (see [v3d55] mmucfg + the pte lines)"
         } else {
             "pool all-zero with BPCA exactly at the pool base after a completed write-back — the PTB emitted nothing and never moved its write pointer this kick"
         }
@@ -4648,6 +4657,11 @@ fn v3d58_emit_stations(what: &str, s: &[V3d58Station; 5], pool_base: u32, pool_s
     }
     let resv_full = resv_at >= 0 && s[resv_at as usize].bpcs == 0;
     let adv4 = s[4].bpca.wrapping_sub(pool_base);
+    // PI-V3D-83: mirror the S0-BPCS stale discipline for BPCA. The "advance" label presumes an
+    // in-pool word; an S4 BPCA outside [pool_base, pool_base+pool_size] is indistinguishable from a
+    // stale pre-existing value and gets the tell (frozen-register class, v3d.md §48). Display-only —
+    // the verdict chain never consumes adv4.
+    let adv4_stale = s[4].bpca < pool_base || s[4].bpca > pool_base.wrapping_add(pool_size);
     let verdict = if bm0 {
         "BMACTIVE was ALREADY SET at S0 — before this driver wrote a single CT0 register. A bin frame was left OPEN by the reset path or by the preceding CT1 job, and every START_TILE_BINNING since has been stacking onto a frame that was never closed. This is a bring-up defect UPSTREAM of everything V3D-40..57 audited, and it would produce exactly the observed signature (list walks, pool reserves, FLUSH never closes a frame it did not open). Next arc: a corroborated CT0 frame/thread abort before the kick — NOT the fabricated CTRSTA bit (see the V3D-58 facts block)"
     } else if !bm4 {
@@ -4662,7 +4676,7 @@ fn v3d58_emit_stations(what: &str, s: &[V3d58Station; 5], pool_base: u32, pool_s
         "mixed reading — BMACTIVE opened after the GO but the pool reservation station is ambiguous; read BPCS across the five stations by hand before drawing a verdict"
     };
     serial_println!(
-        ":: V3D: [v3d58] station ({}) — pool base={:#010x} size={:#x} (as latched into CT0QMA/CT0QMS) | BMACTIVE S0..S4 = {}{}{}{}{} | BPCS S0={:#x} (PRE-LATCH: reset/stale, below-size={} carries NO verdict) S1={:#x} -> S4={:#x} | first-drop-station={} (S1..S4 only{}) | BPCA advance at S4 = {:#x} | BFC {:#010x}->{:#010x} (Δ{}) — {} ::",
+        ":: V3D: [v3d58] station ({}) — pool base={:#010x} size={:#x} (as latched into CT0QMA/CT0QMS) | BMACTIVE S0..S4 = {}{}{}{}{} | BPCS S0={:#x} (PRE-LATCH: reset/stale, below-size={} carries NO verdict) S1={:#x} -> S4={:#x} | first-drop-station={} (S1..S4 only{}) | BPCA advance at S4 = {:#x}{} | BFC {:#010x}->{:#010x} (Δ{}) — {} ::",
         what, pool_base, pool_size,
         (s[0].pcs & V3D_PCS_BMACTIVE != 0) as u32,
         (s[1].pcs & V3D_PCS_BMACTIVE != 0) as u32,
@@ -4673,6 +4687,7 @@ fn v3d58_emit_stations(what: &str, s: &[V3d58Station; 5], pool_base: u32, pool_s
         if resv_at < 0 { -1 } else { resv_at },
         if resv_full { ", dropped to ZERO = FULL pool consumption" } else { "" },
         adv4,
+        if adv4_stale { " (out-of-pool: stale?)" } else { "" },
         s[0].bfc, s[4].bfc, s[4].bfc.wrapping_sub(s[0].bfc),
         verdict
     );
@@ -6072,6 +6087,10 @@ fn probe_job() {
     // (ptb_frame_witness below) is the started-vs-never-started discriminator for the V3D-40 wall.
     let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
     let rfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC);
+    // PI-V3D-83: seed the PTB write pointer beside the frame counters. The [v3d41] "emitted" claim
+    // downstream requires an OBSERVED pre->post transition, not a single-shot word — a frozen BPCA
+    // would otherwise manufacture an advance (the frozen-register class, v3d.md §48).
+    let bpca_pre = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA);
     // PI-V3D-56: digest EVERY arena page immediately before the GO. The arena is the entire address
     // space the V3D MMU grants this job, so the post-job diff answers "where did the bytes land?" over
     // the whole reachable space, not just the two regions we happen to read back.
@@ -6204,18 +6223,26 @@ fn probe_job() {
         // BPCA-semantics finding this line has to be read against.
         let bpca = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA);
         let adv = bpca.wrapping_sub(tile_alloc);
+        // PI-V3D-83 (the PI-V3D-82 idiom over BPCA): `wrapping_sub` turns EVERY stale 32-bit word
+        // into a plausible-looking advance — require the raw word inside the pool span before any
+        // reservation/geometry reading (the frozen-register class, v3d.md §48).
+        let bpca_in_pool =
+            bpca >= tile_alloc && bpca <= tile_alloc.wrapping_add(BIN_TILEALLOC_BYTES as u32);
         let touched_bytes = if pool_scan.last < 0 { 0 } else { (pool_scan.last as u32 + 1) * 4 };
         serial_println!(
-            ":: V3D: [v3d56] bpca-vs-bytes (v3d40 PROBE post-bin) — BPCA={:#010x} pool_base={:#010x} advance={:#x} ({} B) | Mesa v3d_tile_alloc_sizes predicts {:#x} for an EMPTY bin on this 1x1-tile frame (align(1*1*1*128,4096)+8192) — match={} | poison says touched through byte {:#x} ({} B) | delta={} — {} ::",
+            ":: V3D: [v3d56] bpca-vs-bytes (v3d40 PROBE post-bin) — BPCA={:#010x} pool_base={:#010x} advance={:#x} ({} B{}) | Mesa v3d_tile_alloc_sizes predicts {:#x} for an EMPTY bin on this 1x1-tile frame (align(1*1*1*128,4096)+8192) — match={} | poison says touched through byte {:#x} ({} B) | delta={} — {} ::",
             bpca, tile_alloc, adv, adv,
+            if !bpca_in_pool { ", out-of-span=stale" } else { "" },
             V3D56_EXPECTED_EMPTY_BPCA_ADVANCE,
             (adv == V3D56_EXPECTED_EMPTY_BPCA_ADVANCE) as u32,
             touched_bytes, touched_bytes,
             adv as i64 - touched_bytes as i64,
             if pool_scan.zeroed + pool_scan.overwritten == 0 && adv == V3D56_EXPECTED_EMPTY_BPCA_ADVANCE {
                 "PHANTOM VERDICT RETRACTED. BPCA advanced by EXACTLY the reservation the Mesa formula predicts for an empty bin, over a pool the poison proves the PTB never touched. BPCA is the pool ALLOCATION pointer (VC4/v42 ARG: 'Current Address Of Binning Memory Pool'), not a bytes-written counter — reservation moves it and writes nothing. There are no phantom bytes because there were never any bytes; the address question does NOT reopen and the MMU evidence stands. The defect is FLDONE generation on an empty frame — see [v3d56] int"
+            } else if !bpca_in_pool {
+                "BPCA holds a raw word OUTSIDE the pool span — the printed advance is wrapping arithmetic over a stale pre-kick/residue address, not a reservation in THIS pool: no reservation/geometry verdict from this line (the frozen-register rule, v3d.md §48); the poison columns are the deciding instrument"
             } else if pool_scan.zeroed + pool_scan.overwritten == 0 && adv != 0 {
-                "BPCA advanced over a pool the PTB provably never touched (poison fully intact), but NOT by the predicted reservation size. Reservation-without-write is still the leading reading — BPCA is an allocation pointer, so an advance is not evidence of a write — yet the size mismatch means our tile geometry or the programmed initial block size differs from what the formula assumed; re-derive tiles_x/tiles_y and the TILE_BINNING_MODE_CFG block size before drawing a conclusion"
+                "BPCA advanced (in-span) over a pool the PTB provably never touched (poison fully intact), but NOT by the predicted reservation size. Reservation-without-write is still the leading reading — BPCA is an allocation pointer, so an advance is not evidence of a write — yet the size mismatch means our tile geometry or the programmed initial block size differs from what the formula assumed; re-derive tiles_x/tiles_y and the TILE_BINNING_MODE_CFG block size before drawing a conclusion"
             } else if adv >= touched_bytes && touched_bytes != 0 {
                 "the PTB both advanced AND wrote, with the advance at or ahead of the last touched byte — consistent, unremarkable pointer behaviour. BPCA is NOT a phantom; the bytes were findable all along and the missing step is frame-close"
             } else if touched_bytes != 0 {
@@ -6247,7 +6274,7 @@ fn probe_job() {
     // shader proven to have RUN (v3d35), did START_TILE_BINNING actually complete a PTB bin FRAME? BFC's
     // pre→post delta answers "started vs never-started"; BPCA (the PTB write pointer vs the pool base)
     // corroborates whether any primitive-list bytes were emitted at all.
-    ptb_frame_witness("v3d41 PROBE post-bin", bfc_pre, rfc_pre, tile_alloc);
+    ptb_frame_witness("v3d41 PROBE post-bin", bfc_pre, rfc_pre, bpca_pre, tile_alloc);
     let mmu_ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
     let fault = mmu_ctl
         & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
@@ -9753,6 +9780,11 @@ fn v3d71_mainline_geometry() {
     v3d56_emit_scan("v3d71", "tile-alloc pool (32 KiB phys behind all 544 KiB of pool iova)", pool_phys as u32, &pool_scan, flush_done);
 
     let touched = ts_scan.zeroed + ts_scan.overwritten + pool_scan.zeroed + pool_scan.overwritten;
+    // PI-V3D-83: this rung remaps the pool into tens-of-MiB iovas, so a stale sub-4 MiB BPCA from
+    // any earlier identity-mapped kick wraps to an enormous plausible "advance". Display-only tell —
+    // the verdict below is driven by fault/retired/poison, never by this figure (v3d.md §48).
+    let bpca_stale = bpca < V3D71_POOL_IOVA as u32
+        || bpca > (V3D71_POOL_IOVA + V3D71_POOL_BYTES) as u32;
     let verdict = if fault != 0 {
         "AN MMU FAULT LATCHED ACROSS THE RUNG — the window translation itself refused an access, so nothing downstream of it was measured. This is an INSTRUMENT fault, not a geometry verdict: fix the map (see the fault-latch line below for client + VA) before citing this rung for anything"
     } else if retired || touched != 0 {
@@ -9763,14 +9795,16 @@ fn v3d71_mainline_geometry() {
         "STILL DEAD under mainline geometry — no retire, no fault, poison fully intact through a completed drain, with the pool at the dump's own size and every buffer at mainline-like iovas. The LAST PTB-visible difference between the two systems is now EXCLUDED MEASURED: no register the PTB can see distinguishes our bin frame from mainline's, and the wall moves conclusively off the frame's inputs — read [v3d71f] above for which side of the master bridge it lives on"
     };
     serial_println!(
-        ":: V3D: [v3d71] mainline-geom verdict — retired={} BFC {:#010x}->{:#010x} (Δ{}) PCS={:#010x}(BMACTIVE={} BMBUSY={} BMOOM={}) idled={} INT_STS={:#010x} waited={}us submit_sound={} | BPCA={:#010x} (advance off pool iova = {:#x}) BPCS={:#x} | poison touched: tile-state={} of {} words, pool={} of {} words (L2T drain completed={}) | MMU_CTL={:#010x} fault latched={} (PT_INVALID={} WRITE_VIOLATION={} CAP_EXCEEDED={}) — {} ::",
+        ":: V3D: [v3d71] mainline-geom verdict — retired={} BFC {:#010x}->{:#010x} (Δ{}) PCS={:#010x}(BMACTIVE={} BMBUSY={} BMOOM={}) idled={} INT_STS={:#010x} waited={}us submit_sound={} | BPCA={:#010x} (advance off pool iova = {:#x}{}) BPCS={:#x} | poison touched: tile-state={} of {} words, pool={} of {} words (L2T drain completed={}) | MMU_CTL={:#010x} fault latched={} (PT_INVALID={} WRITE_VIOLATION={} CAP_EXCEEDED={}) — {} ::",
         retired as u32, bfc_pre, bfc_after, bfc_after.wrapping_sub(bfc_pre),
         pcs,
         (pcs & V3D_PCS_BMACTIVE != 0) as u32,
         (pcs & V3D_PCS_BMBUSY != 0) as u32,
         (pcs & V3D_PCS_BMOOM != 0) as u32,
         idled as u32, sts, us, submit_sound as u32,
-        bpca, bpca.wrapping_sub(V3D71_POOL_IOVA as u32), bpcs,
+        bpca, bpca.wrapping_sub(V3D71_POOL_IOVA as u32),
+        if bpca_stale { " (out-of-window: stale?)" } else { "" },
+        bpcs,
         ts_scan.zeroed + ts_scan.overwritten, ts_scan.words,
         pool_scan.zeroed + pool_scan.overwritten, pool_scan.words,
         flush_done as u32,
@@ -10951,12 +10985,16 @@ fn bin_pool_witness(tag: &str) -> bool {
 /// captured by the caller immediately before the CT0QEA GO; this fn reads the post-idle counters and
 /// diffs. BFC advanced by ≥1 ⇒ branch (B) (a frame completed — chase the on-chip clipper/VCM/PTB write
 /// path); BFC unchanged ⇒ branch (A) (no frame — chase START_TILE_BINNING / PTB bring-up / the CT0
-/// primitive feed). BPCA (the PTB write pointer) corroborates: advanced off `pool_base` ⇒ the PTB
-/// emitted bytes (the CPU read path is then suspect, not the binner); still at `pool_base`/0 ⇒ it did
-/// not. BPOA nonzero ⇒ overflow requested (a distinct pool-exhaustion failure, not this one). All reads
+/// primitive feed). BPCA (the PTB write pointer) corroborates — but only via an OBSERVED transition:
+/// a `bpca_pre` is captured beside `bfc_pre`/`rfc_pre`, and "the PTB emitted bytes" requires the
+/// pre→post word to have CHANGED and to land inside the pool span (PI-V3D-83, the frozen-register
+/// class of v3d.md §48 — a stale word ≠0 and ≠pool_base would otherwise manufacture the advance AND
+/// misdirect toward the CPU read path). Unchanged-off-base or out-of-span words carry a `(stale)`
+/// tell and NO verdict. BPOA nonzero ⇒ overflow requested (a distinct pool-exhaustion failure, not
+/// this one). All reads
 /// are of GPU status/counter registers — no shader-visible state is touched. PCS is reported RAW: its
 /// bit layout past CTRUN is uncorroborated for V3D 4.x, so no bit names are fabricated (§5 law).
-fn ptb_frame_witness(tag: &str, bfc_pre: u32, rfc_pre: u32, pool_base: u32) {
+fn ptb_frame_witness(tag: &str, bfc_pre: u32, rfc_pre: u32, bpca_pre: u32, pool_base: u32) {
     let bfc = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
     let rfc = mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC);
     let pcs = mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS);
@@ -10968,7 +11006,19 @@ fn ptb_frame_witness(tag: &str, bfc_pre: u32, rfc_pre: u32, pool_base: u32) {
     let bpos = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPOS);
     let bfc_delta = bfc.wrapping_sub(bfc_pre);
     let rfc_delta = rfc.wrapping_sub(rfc_pre);
-    let bpca_advanced = bpca != 0 && bpca != pool_base;
+    // PI-V3D-83 (the PI-V3D-82 idiom over BPCA): an "emitted" claim needs an OBSERVED transition —
+    // the word must have CHANGED across this kick AND landed inside the pool span. A single-shot
+    // `!=0 && !=pool_base` test reads any stale pre-kick/residue word as an advance (v3d.md §48).
+    let bpca_moved = bpca != bpca_pre;
+    let bpca_in_span = bpca >= pool_base && bpca <= pool_base.wrapping_add(BIN_TILEALLOC_BYTES as u32);
+    let bpca_advanced = bpca_moved && bpca_in_span && bpca != pool_base;
+    let bpca_tell = if !bpca_moved && bpca != 0 && bpca != pool_base {
+        " (stale)"
+    } else if bpca_moved && !bpca_in_span {
+        " (out-of-span)"
+    } else {
+        ""
+    };
     serial_println!(
         ":: V3D: [v3d41] {} frame counters — BFC {:#010x}->{:#010x} (Δ{}) RFC {:#010x}->{:#010x} (Δ{}) — {} ::",
         tag, bfc_pre, bfc, bfc_delta, rfc_pre, rfc, rfc_delta,
@@ -10979,10 +11029,14 @@ fn ptb_frame_witness(tag: &str, bfc_pre: u32, rfc_pre: u32, pool_base: u32) {
         }
     );
     serial_println!(
-        ":: V3D: [v3d41] {} CLE feed + PTB pointer — CT0LC={:#010x} CT0PC={:#010x} PCS={:#010x} (raw) | BPCA={:#010x} (pool base {:#010x}) BPCS={:#010x} BPOA={:#010x} BPOS={:#010x} — PTB write pointer {} ::",
-        tag, ct0lc, ct0pc, pcs, bpca, pool_base, bpcs, bpoa, bpos,
+        ":: V3D: [v3d41] {} CLE feed + PTB pointer — CT0LC={:#010x} CT0PC={:#010x} PCS={:#010x} (raw) | BPCA {:#010x}->{:#010x}{} (pool base {:#010x}) BPCS={:#010x} BPOA={:#010x} BPOS={:#010x} — PTB write pointer {} ::",
+        tag, ct0lc, ct0pc, pcs, bpca_pre, bpca, bpca_tell, pool_base, bpcs, bpoa, bpos,
         if bpca_advanced {
-            "ADVANCED off the pool base: the PTB emitted primitive-list bytes (if the pool head still reads zero the CPU READ path is suspect, not the binner)"
+            "ADVANCED off the pool base across THIS kick (observed pre->post transition, landing in the pool span): the PTB emitted primitive-list bytes (if the pool head still reads zero the CPU READ path is suspect, not the binner)"
+        } else if !bpca_moved && bpca != 0 && bpca != pool_base {
+            "UNCHANGED across the kick while off the pool base — a stale pre-kick/residue word, NOT an advance: no PTB verdict from this pointer (the frozen-register rule, v3d.md §48; the poison scans are the deciding instrument)"
+        } else if bpca_moved && !bpca_in_span {
+            "MOVED but landed OUTSIDE the pool span — not a position in this pool: no PTB verdict from this pointer (raw words above; the poison scans are the deciding instrument)"
         } else if bpoa != 0 {
             "at/near pool base but BPOA nonzero: the binner requested an OVERFLOW block (pool-exhaustion — a distinct failure)"
         } else {
