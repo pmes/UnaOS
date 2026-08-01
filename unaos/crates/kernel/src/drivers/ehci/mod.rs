@@ -682,9 +682,22 @@ impl Controller {
         for i in 0..1024 {
             core::ptr::write_volatile(self.frame_list.add(i), old_head);
         }
+        // EPACE-TRIM M3 — the s59 sub-split named the guilty wait: `sched-en=0ms done-wait=0ms
+        // sched-dis=2000ms`. The HSE latches instantly and the completion wait exits on it; the
+        // full budget was burned waiting for USBSTS.PSS to clear on an engine the HSE has wedged
+        // — a handshake that cannot complete, ahead of a caller that responds to Err("hse") with
+        // a full HCRESET (which clears PSE/PSS at defaults anyway). On the HSE path: write PSE
+        // off (tidy, harmless) and skip the PSS wait. The healthy path (QEMU, and any silicon
+        // that chain-fetches) keeps the full EHCI 4.8 handshake unchanged.
+        let hse_latched = mmio_read32(self.op + OP_USBSTS).unwrap_or(0) & STS_HSE != 0;
         let dis_t0 = crate::arch::now_cycles();
         if !self.periodic_on {
-            let _ = self.set_periodic_schedule(false);
+            if hse_latched {
+                let cmd = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
+                let _ = mmio_write32(self.op + OP_USBCMD, cmd & !CMD_PSE);
+            } else {
+                let _ = self.set_periodic_schedule(false);
+            }
         }
         let dis_cy = crate::arch::now_cycles().wrapping_sub(dis_t0);
         (*qh).horiz = PTR_TERMINATE;

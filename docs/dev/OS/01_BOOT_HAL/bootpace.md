@@ -332,3 +332,14 @@ across three bounded waits (PSS enable, completion, PSS disable) — undecomposa
 outside, and a constant that has not been decomposed must not be trimmed. `chain HSE
 sub-split: sched-en= done-wait= sched-dis=` prints on the failure exits only; the next
 metal boot names the wait, and the trim that follows is arithmetic.
+
+### 8b. s59 metal verdicts (2026-08-01, same sitting)
+
+`ehci-hid-done d=4010ms` (from 6324): M1 verified — the CARRIED witness printed, `[1]
+hseprobe=0ms(n=0)`, controller 1's hcrst/rootrst halved (no re-init). Desktop 12.4 → 10.0 s.
+The M2 sub-split named the guilty wait exactly: `sched-en=0ms done-wait=0ms sched-dis=2000ms`
+— the HSE latches instantly, the completion wait exits on it, and the whole budget burned
+waiting for PSS to clear on the wedged engine, ahead of a caller that HCRESETs regardless.
+EPACE-TRIM M3 (landed after this boot) skips the PSS wait on the HSE path only; the healthy
+path keeps the full EHCI 4.8 handshake. Expected next ledger: `ehci-hid-done d=` ≈ 2.0 s,
+`sched-dis=0ms` on the sub-split, boot to desktop ≈ 8.0 s with all four GPU/SMC lanes in.
