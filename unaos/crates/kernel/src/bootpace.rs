@@ -80,6 +80,14 @@
 // appears, because none of their call sites is reached. The two readings differ in 13 lines, so
 // the subdivision itself can be falsified — a build with USB compiled out that still printed
 // `xhci-cnr` would convict the stamps of reporting the recorder rather than the controller.
+//
+// ── Read-only accessors (GPACE) ─────────────────────────────────────────────────────────────────
+// `cycles_of` / `last_stamp` / `origin_hz` let an accumulator OUTSIDE this module open a span at
+// the exact instant of a stamp already in the ring, and convert it with the same rate the ledger
+// uses. They are the reason a subdivision such as GPACE (`arch/x86_64/pci.rs`) can claim its total
+// equals the enclosing `pci-usb d=` by CONSTRUCTION rather than by eyeball. None of them records,
+// grows the ring, or perturbs `dropped=`: the ledger stays exactly as long as the stamps made it,
+// which matters because drop-NEWEST would spend any growth on the late boot tags.
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
@@ -186,6 +194,50 @@ pub fn record_once(latch: &AtomicUsize, tag: &'static str) {
     if latch.swap(1, Ordering::Relaxed) == 0 {
         record(tag);
     }
+}
+
+/// The counter value of the most recent stamp whose tag equals `tag`, or `None` when that tag has
+/// not been recorded on this boot.
+///
+/// READ-ONLY by construction: it takes the ring's leaf mutex, copies one `u64` out and releases it.
+/// No stamp is added, `len` does not move, and the `dropped=` arithmetic is untouched. That
+/// restraint is not politeness — the metal ledger sits at `n=31` of `CAP=64` with a drop-NEWEST
+/// policy, so an accessor that grew the ring would silently destroy the LATE boot tags (`stor-*`,
+/// `fat-mount`, `fr-flush`, `ftdi-up`) this ledger exists to carry.
+///
+/// It exists so a phase accumulator in another module can open a span at the EXACT instant of a
+/// stamp already in this ledger, rather than "shortly after" it. That exactness is what makes a
+/// self-check against a BPACE `d=` mean something: with an approximate origin, a disagreement
+/// between the two instruments is a shrug instead of a conviction.
+pub fn cycles_of(tag: &str) -> Option<u64> {
+    let r = RING.lock();
+    let n = r.len;
+    r.slots[..n].iter().rev().find(|(_, t)| *t == tag).map(|(c, _)| *c)
+}
+
+/// The most recent stamp of ANY tag — its counter value and its tag — or `None` before the first
+/// `record`.
+///
+/// The companion `cycles_of` needs to make a self-check exact rather than merely close. BPACE
+/// computes every `d=` against the IMMEDIATELY PRECEDING stamp, whichever tag that turns out to be;
+/// so an accumulator whose total must equal the next `d=` *by construction* has to anchor on the
+/// last stamp as it actually is, not on the tag it expected to find there. Anchoring on a guessed
+/// tag makes the equality a coincidence of topology — true on one machine, quietly false on the
+/// next, with no reading that would reveal the difference.
+pub fn last_stamp() -> Option<(u64, &'static str)> {
+    let r = RING.lock();
+    if r.len == 0 { None } else { Some(r.slots[r.len - 1]) }
+}
+
+/// The rate of `arch::now_cycles()` in Hz, or 0 when it is not (yet) known — the very value this
+/// ledger converts its own `t=`/`d=` with.
+///
+/// Exposed so an out-of-module accumulator converts against the LEDGER's clock instead of reaching
+/// into an arch-specific `tsc_hz()`/`cntfrq()` of its own. A self-check between two instruments is
+/// only meaningful when both divided by the same number; two rates make a disagreement
+/// uninterpretable, and 0 here means both must print raw ticks rather than fabricate a millisecond.
+pub fn origin_hz() -> u64 {
+    counter_hz()
 }
 
 /// Copy the buffered stamps (oldest→newest) into `out`, returning how many were written. Snapshots

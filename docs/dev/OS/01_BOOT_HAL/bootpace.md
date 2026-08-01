@@ -112,7 +112,7 @@ strings unaos/target/x86_64_esp/kernel.elf | grep -c 'BPACE'      # must be >= 1
 | `xhci-run` | after the `USBSTS.HCH=0` wait in `start()` | `CONFIG.MaxSlotsEn` + the RS=1 run handshake |
 | `xhci-portpwr` | after the port-power loop in `start()` | one PORTSC read and at most one PP write per root port |
 | `xhci-settle` | after the pre-CCS-scan settle | **that one constant alone** — `hw_wait_budget()/4`; see §6a |
-| `pci-usb` | after `pci::init` returns | GPU dispatch + the SDHC probe + the NIC block (NOT the xHCI bring-up — see §6a) |
+| `pci-usb` | after `pci::init` returns | the `start_next_port` tail + the BENCH-RIDE probes + the GPU dispatch + the SDHC probe + the NIC block (NOT the xHCI bring-up — see §6a) — subdivided by the GPACE lines (§9) |
 | `enum:p<N>` | `start_next_port`, at the `=== Enumerating Port N ===` line | — |
 | `enum:p<N>-done` | top of `start_next_port`, for the port being left | with the pair above: this port's enumeration cost |
 | `stor-bringup` | entry to the SCSI bring-up in `service_storage` | — |
@@ -343,3 +343,108 @@ waiting for PSS to clear on the wedged engine, ahead of a caller that HCRESETs r
 EPACE-TRIM M3 (landed after this boot) skips the PSS wait on the HSE path only; the healthy
 path keeps the full EHCI 4.8 handshake. Expected next ledger: `ehci-hid-done d=` ≈ 2.0 s,
 `sched-dis=0ms` on the sub-split, boot to desktop ≈ 8.0 s with all four GPU/SMC lanes in.
+
+## 9. GPACE — the inside of `pci-usb` (GR13)
+
+Once EPACE took `ehci-hid-done` down, the s60 capture's largest remaining block
+was `pci-usb d=4620ms`. Same shape as §8, same remedy: per §7 the instrument for
+the inside of a dominating phase is the phase's own witness, so the split lives
+in `arch/x86_64/pci.rs` as GPACE, not as more ring stamps.
+
+Two things about that delta are easy to misread, and GPACE exists to make both
+mistakes unavailable.
+
+**`pci-usb` is not a USB block.** The tag is stamped after `pci::init`
+*returns*, and `d=` is the delta from the previous stamp — which, because
+`xhci.start()` kicks port-1 enumeration before returning, is `enum:p1`. The
+window is therefore the `start_next_port` tail, the BENCH-RIDE probes,
+`gpu::detect::detect_gpus`, `igpu::init`, `kepler::init`, `sdhc::probe` and the
+NIC block. The xHCI bring-up is *upstream* of it and already subdivided by the M4
+tags (§6a).
+
+**Most of the 4620 ms is not in a default build.** The s60 stick was armed with
+`UNAOS_KEPLER` / `UNAOS_KEPLER_TAKEOVER` / `UNAOS_IVB` / `UNAOS_WC`. The
+2026-07-30 metal baseline in §6, with none of them, reads `pci-usb … 113 ms` for
+the same tag. A split that did not say **which build it measured** would let a
+reader charge a default boot for 4.5 s it never pays, so the second GPACE line
+carries a `build=` field naming the compiled knob set, and a knobless build
+prints `build=default(no-gpu-knobs)`.
+
+It is also a *deterministic* burn, not a device- or contention-dependent one:
+across the four boots in the s60 capture `pci-usb` reads 4576 / 4576 / 4575 /
+4620 ms while `gui=` moves 12429 → 8048. A block that stable across a 4.4 s swing
+is fixed iteration counts and a fixed volume of MMIO.
+
+### The two lines
+
+```
+:: GPACE: xtail=<v>ms(n=1) bench=<v>ms(n=0) detect=<v>ms(n=1) igpu=<v>ms(n=1) kepler=<v>ms(n=1) sdhc=<v>ms(n=1) nic=<v>ms(n=1) resid=<v>ms == witness ::
+:: GPACE: span=<v>ms anchor=enum:p1 since-entry=<v>ms hz=<v> build=kepler+takeover+fifo+ivb+smc+ == the pci-usb d= split ::
+```
+
+* `xtail` the `start_next_port` tail — from the `enum:p1` stamp to the end of the
+  xHCI block, plus publishing the controller into `XHCI_CONTROLLER` · `bench` the
+  knob-gated BENCH-RIDE probes (therm / pcilink / vrom), `n=` counting how many of
+  the three were compiled in · `detect` the class-0x03 census · `igpu` / `kepler`
+  one span per device found · `sdhc` the read-only SDHC census · `nic` the
+  class-0x02 lookup and whatever followed it.
+* Spans are wall-clock around the call sites, so each class contains everything
+  its callee did — MMIO, settles **and** the serial printing of its own witness
+  lines.
+* **The GPU calls are measured from the outside.** `igpu::init` and `kepler::init`
+  are bracketed where `pci.rs` calls them; `gpu/detect.rs`, `gpu/igpu.rs` and
+  `gpu/kepler.rs` are not touched at all. Those files belong to other lanes, and
+  the split does not need them.
+
+### How the self-check is enforced
+
+`span` is measured from `bootpace::last_stamp()` — the stamp BPACE will itself
+subtract when it computes `pci-usb d=`, read out of the ring at the instant the
+xHCI block ends — to the report. Anchoring on the *last* stamp rather than on the
+literal tag `enum:p1` is what makes `span == pci-usb d=` a property of the
+construction instead of a coincidence of this machine's topology; the tag that
+actually anchored is printed as `anchor=`, so a reader sees immediately when the
+topology changes. Conversion goes through `bootpace::origin_hz()`, the same rate
+the ledger divides its own `d=` by, so the two instruments cannot disagree merely
+by arithmetic. The only slack between them is these two lines' own print cost,
+which lands inside `pci-usb` and outside `span`.
+
+`resid = span − Σ(named classes)`, and the classes are disjoint sequential spans
+inside `span`. A class that under-measures therefore **inflates `resid`** — the
+arithmetic still closes, so the lie surfaces as unattributed time instead of as a
+tidy-looking total.
+
+Every class prints `<value><unit>(n=<count>)`. `0ms(n=0)` means *this code was
+not compiled in or never reached*; `0ms(n=1)` means *it ran and cost nothing*.
+The two are structurally distinguishable, which this project has twice paid for
+learning.
+
+New read-only accessors on the ledger make this possible: `cycles_of(tag)`,
+`last_stamp()` and `origin_hz()`. None records, grows the ring or perturbs
+`dropped=` — the ring sits at `n=31` of `CAP=64` under drop-NEWEST, so any growth
+would be spent on the late boot tags.
+
+### The prerequisite trap this arc removed
+
+The network block ended in a bare `return` on the non-Intel-NIC branch, and this
+machine's Broadcom `0x14e4` takes it on **every** boot
+(`:: x86_64 PCI: non-Intel NIC (0x14e4) — no e1000 driver, skipping ::`). Any
+report placed after it would never have executed on the machine it exists to
+measure — an instrument that cannot run in the state it reports on. That block is
+now `init_network()`; the early exit returns from the helper, `pci::init` has
+exactly one exit, and the report sits on it.
+
+### 9a. Baseline law — the three readings
+
+| build | reading |
+|---|---|
+| bench media, GPU knobs armed | both lines print; `span` ≈ 4600 ms with `kepler=` dominant; `build=kepler+takeover+…` |
+| default `./arroyo esp-x86` | both lines still print, with `detect=0ms(n=0) igpu=0ms(n=0) kepler=0ms(n=0)`, `build=default(no-gpu-knobs)`, `span` ≈ 100 ms |
+| `UNAOS_SKIP_XHCI=1` | the lines are **absent entirely** — `pci::init` is never called |
+
+The middle reading is the load-bearing one: it is what proves the numbers report
+the GPU path rather than the reporter's own liveness. A build with the GPU code
+compiled out that still printed a large `kepler=` would convict the instrument.
+The third matches BPACE's own "did not run (b)" asymmetry (§5).
+
+Read the lines with `awk '/GPACE/'` — **not** `grep`.

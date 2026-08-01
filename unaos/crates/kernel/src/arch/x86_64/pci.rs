@@ -189,7 +189,197 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
     }
 }
 
+// ── GPACE — the inside of the BPACE `pci-usb` delta ─────────────────────────────────────────────
+// The s60 metal ledger read `pci-usb d=4620ms` — the largest single block in that boot, and an
+// undivided delta nothing had ever split. Two things about it are easy to get wrong, and this
+// instrument exists to make both of them impossible to get wrong again:
+//
+//   1. **`pci-usb` is not a USB block.** BPACE stamps it after `pci::init` RETURNS, and `d=` is
+//      always the delta from the previous stamp — which, because `xhci.start()` kicks port-1
+//      enumeration before returning, is `enum:p1`. So the window covers the `start_next_port`
+//      tail, the BENCH-RIDE probes, `gpu::detect`, `igpu::init`, `kepler::init`, `sdhc::probe`
+//      and the NIC block. The xHCI bring-up itself is upstream of it, already subdivided by the
+//      BOOTPACE M4 tags.
+//   2. **Most of that 4620 ms is not in a default build.** The s60 stick was armed with
+//      `UNAOS_KEPLER` / `UNAOS_KEPLER_TAKEOVER` / `UNAOS_IVB` / `UNAOS_WC`; the 2026-07-30 metal
+//      baseline, with none of them, reads `pci-usb … 113 ms`. A split that did not say WHICH BUILD
+//      it measured would let a reader charge a default boot for 4.5 s it never pays, so the report
+//      names the compiled knob set on its own line (`build=`), and a knobless build prints
+//      `build=default(no-gpu-knobs)`.
+//
+// Design follows the EPACE precedent (`drivers/ehci/mod.rs`): cycle accumulators per phase CLASS,
+// converted to ms only at PRINT time, printed as two lines at the one unconditional exit of
+// `pci::init`. Deliberately NOT more `bootpace::record` stamps — the ring is at n=31 of CAP=64 with
+// drop-NEWEST, and seven more stamps would spend headroom the late boot tags need.
+//
+// Instrument honesty (the can-this-lie-while-looking-right check):
+//   * **The self-check is structural, not aspirational.** `span` is measured from
+//     `bootpace::last_stamp()` — the very stamp BPACE will compute `pci-usb d=` against, captured
+//     at the instant the xHCI block ends — to the report. Anchoring on the LAST stamp rather than
+//     on the literal tag `enum:p1` is what makes `span == pci-usb d=` a property of the
+//     construction instead of a coincidence of this machine's topology; the tag that actually
+//     anchored is printed as `anchor=` so a reader can see when the topology changes.
+//   * **A short-counting class cannot hide.** The named classes are disjoint, sequential spans
+//     inside `span`, and `resid = span - Σ(classes)`. A class that under-measures therefore
+//     INFLATES `resid` — the arithmetic still closes, so the lie surfaces as unattributed time
+//     rather than as a clean-looking total.
+//   * **Zero and never-ran are structurally distinct.** Every class prints `<v><unit>(n=<count>)`.
+//     `0ms(n=0)` is "this code was not compiled in / never reached"; `0ms(n=1)` is "it ran and cost
+//     nothing". This project has twice been bitten by conflating the two.
+//   * **It can execute in every state it reports on.** The NIC block used to `return` early on a
+//     non-Intel part — which this machine's Broadcom 0x14e4 takes on EVERY boot — so a report
+//     placed after it would never have run on the machine it exists to measure. That block is now
+//     `init_network()`, and its early exit returns from the helper; `pci::init` has exactly one
+//     exit, and the report sits on it.
+//   * **Same clock as BPACE.** Conversion goes through `bootpace::origin_hz()`, the rate the ledger
+//     divides its own `d=` by, so the two instruments cannot disagree merely by arithmetic. `hz=0`
+//     prints raw counter ticks with a `cy` suffix, never a fabricated millisecond.
+//
+// Three readings that differ (the baseline law):
+//   * bench media, GPU knobs armed — `span` ≈ 4600 ms with `kepler=` dominant;
+//   * default `./arroyo esp-x86` — the line STILL prints, with `igpu=0ms(n=0) kepler=0ms(n=0)`,
+//     `detect=0ms(n=0)`, `build=default(no-gpu-knobs)` and `span` ≈ 100 ms. That is what proves the
+//     numbers report the GPU path rather than the reporter's own liveness;
+//   * `UNAOS_SKIP_XHCI=1` — the line is ABSENT entirely, because `pci::init` is never called.
+const G_XTAIL: usize = 0; // enum:p1 → end of the xHCI block: the `start_next_port` tail
+const G_BENCH: usize = 1; // the knob-gated BENCH-RIDE probes (therm / pcilink / vrom)
+const G_DETECT: usize = 2; // gpu::detect::detect_gpus() — the class-0x03 census
+const G_IGPU: usize = 3; // gpu::igpu::init, per Ivy Bridge IGD found
+const G_KEPLER: usize = 4; // gpu::kepler::init, per GK107 found
+const G_SDHC: usize = 5; // drivers::sdhc::probe() — the read-only SDHC census
+const G_NIC: usize = 6; // init_network(): the class-0x02 lookup + e1000 bring-up or the skip
+const N_GPACE: usize = 7;
+const GPACE_TAGS: [&str; N_GPACE] =
+    ["xtail", "bench", "detect", "igpu", "kepler", "sdhc", "nic"];
+
+#[derive(Clone, Copy)]
+struct Gpace {
+    cy: [u64; N_GPACE],
+    n: [u32; N_GPACE],
+}
+
+impl Gpace {
+    const fn new() -> Self {
+        Gpace { cy: [0; N_GPACE], n: [0; N_GPACE] }
+    }
+    /// Close a span opened at `t0` (a `now_cycles()` reading) into class `class`, and count it.
+    /// `n` is incremented on the CLOSE, so a class only ever reports a count for work that actually
+    /// ran to completion here.
+    fn add(&mut self, class: usize, t0: u64) {
+        self.cy[class] =
+            self.cy[class].wrapping_add(crate::arch::now_cycles().wrapping_sub(t0));
+        self.n[class] = self.n[class].saturating_add(1);
+    }
+    /// Σ of every named class — the subtrahend of `resid`.
+    fn sum(&self) -> u64 {
+        let mut s = 0u64;
+        let mut k = 0;
+        while k < N_GPACE {
+            s = s.wrapping_add(self.cy[k]);
+            k += 1;
+        }
+        s
+    }
+}
+
+/// Cycles → whole ms at print time via the BPACE ledger's own rate, or raw ticks when that rate is
+/// still unknown. Never fabricates a millisecond out of a guessed frequency (the `[vugfps]` lesson).
+fn gpace_fmt(cy: u64) -> (u64, &'static str) {
+    let hz = crate::bootpace::origin_hz();
+    if hz == 0 { (cy, "cy") } else { (cy.saturating_mul(1000) / hz, "ms") }
+}
+
+// The compiled knob set, as `&'static str` fragments a `no_std` format can concatenate without an
+// allocator. This is the field that stops a bench-media 4600 ms from being read as something a
+// default boot pays.
+#[cfg(feature = "nvidia-kepler")]
+const GB_KEPLER: &str = "kepler+";
+#[cfg(not(feature = "nvidia-kepler"))]
+const GB_KEPLER: &str = "";
+#[cfg(feature = "nvidia-kepler-takeover")]
+const GB_TAKEOVER: &str = "takeover+";
+#[cfg(not(feature = "nvidia-kepler-takeover"))]
+const GB_TAKEOVER: &str = "";
+#[cfg(feature = "nvidia-kepler-fifo")]
+const GB_FIFO: &str = "fifo+";
+#[cfg(not(feature = "nvidia-kepler-fifo"))]
+const GB_FIFO: &str = "";
+#[cfg(feature = "intel-ivb")]
+const GB_IVB: &str = "ivb+";
+#[cfg(not(feature = "intel-ivb"))]
+const GB_IVB: &str = "";
+#[cfg(feature = "wc")]
+const GB_WC: &str = "wc+";
+#[cfg(not(feature = "wc"))]
+const GB_WC: &str = "";
+#[cfg(feature = "smc")]
+const GB_SMC: &str = "smc+";
+#[cfg(not(feature = "smc"))]
+const GB_SMC: &str = "";
+#[cfg(any(feature = "thermprobe", feature = "pcilink", feature = "vromprobe"))]
+const GB_BENCH: &str = "benchride+";
+#[cfg(not(any(feature = "thermprobe", feature = "pcilink", feature = "vromprobe")))]
+const GB_BENCH: &str = "";
+/// Prints in place of the fragments when NONE of them is compiled in, so "default build" is a
+/// positive statement in the log rather than an empty field a reader has to interpret.
+const GB_NONE: &str = if cfg!(any(
+    feature = "nvidia-kepler",
+    feature = "nvidia-kepler-takeover",
+    feature = "nvidia-kepler-fifo",
+    feature = "intel-ivb",
+    feature = "wc",
+    feature = "smc",
+    feature = "thermprobe",
+    feature = "pcilink",
+    feature = "vromprobe",
+)) {
+    ""
+} else {
+    "default(no-gpu-knobs)"
+};
+
+/// The class-0x02 network block, lifted out of `init` verbatim.
+///
+/// It is a separate function for one reason: it contains an early `return` on a non-Intel NIC, and
+/// this machine's Broadcom 0x14e4 takes that branch on EVERY boot. While the block was inline, any
+/// report placed after it was unreachable on the very machine it existed to measure — an instrument
+/// that cannot run in the state it reports on. The `return` now leaves the HELPER; `pci::init` has
+/// exactly one exit, and the GPACE report sits on it.
+fn init_network() {
+    // Network controller (PCI class 0x02 = Network, subclass 0x00 = Ethernet).
+    // QEMU's e1000 (82540EM) lands here; bring it up for polled RX.
+    if let Some((bus, slot, func)) = crate::drivers::pci::PciScanner::find_device(0x02, 0x00) {
+        let vendor = unsafe { read_config_16(bus, slot, func, 0x00) };
+        serial_println!(
+            ":: x86_64 PCI: Found network controller (class 0x02) vendor {:#06x} at {}:{}.{} ::",
+            vendor, bus, slot, func
+        );
+        // Only the Intel e1000/e1000e family is supported. On a real 2012 MacBook Pro the NIC is a
+        // Broadcom Wi-Fi part (vendor 0x14e4) that also reports class 0x02 — poking it with e1000
+        // register writes is wrong and its RX/TX bring-up (+ DHCP) just stalls. Gate to Intel.
+        if vendor != 0x8086 {
+            serial_println!(":: x86_64 PCI: non-Intel NIC ({:#06x}) — no e1000 driver, skipping ::", vendor);
+            return;
+        }
+        crate::drivers::e1000::init(bus, slot, func);
+        // Route the NIC's RX interrupt to the BSP local APIC via MSI (IDT vector 0x41),
+        // the same local-APIC delivery the xHCI uses. The e1000e keeps its MSI-X table in
+        // BAR3 (not mappable by enable_msix), so plain MSI is used.
+        let msg_addr = 0xFEE0_0000u32 | ((crate::arch::apic::apic_id() as u32) << 12);
+        crate::drivers::e1000::enable_interrupts(
+            bus, slot, func, msg_addr,
+            crate::arch::interrupts::NIC_MSI_VECTOR as u32,
+        );
+    } else {
+        serial_println!(":: x86_64 PCI: No network controller (class 0x02) found ::");
+    }
+}
+
 pub fn init(_dtb_addr: u64, _dtb_size: usize) {
+    // GPACE: the phase accumulators for everything BPACE lumps into `pci-usb d=`. Plain memory,
+    // no lock, no allocation — see the module block above `G_XTAIL`.
+    let mut pace = Gpace::new();
+
     // BPACE (M4): entry to the whole PCI/USB bring-up. Placed FIRST so that `d=` from `sched` is
     // step 4e (`apic::report_tick_rate` — a 50 ms PM-timer window) and nothing else, and so a boot
     // that dies anywhere below still shows that it got this far. Everything from here to
@@ -335,32 +525,71 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         }
     }
 
+    // ── GPACE anchor ────────────────────────────────────────────────────────────────────────────
+    // Everything measured from here on is what BPACE will charge to `pci-usb d=`. The anchor is the
+    // ledger's LAST stamp at this instant — the one BPACE itself will subtract — read out of the
+    // ring without adding to it. On this machine that is `enum:p1`, because `xhci.start()` kicks
+    // port-1 enumeration before returning; with no xHCI present it is `pci-scan`, and the arithmetic
+    // is unchanged. `anchor=` is printed so the reader never has to assume which it was.
+    //
+    // `xtail` therefore holds the `start_next_port` tail: whatever `xhci.start()` did after its last
+    // stamp, plus publishing the controller into `XHCI_CONTROLLER`.
+    let (anchor_cy, anchor_tag) = crate::bootpace::last_stamp()
+        .unwrap_or((crate::arch::now_cycles(), "none"));
+    pace.add(G_XTAIL, anchor_cy);
+
     // BENCH-RIDE probes run here — serial is live (post-xHCI) and the GPU dispatch hasn't run,
     // so their evidence survives a GPU-init wedge. All read-only, knob-gated, one-shot.
+    // GPACE: each probe closes into `bench`, so `n=` counts how many of the three were compiled in
+    // — `0ms(n=0)` on the media that carries none of them, which is the default.
     #[cfg(all(target_arch = "x86_64", feature = "thermprobe"))]
-    crate::drivers::bench_ride::therm_snapshot();
+    {
+        let t = crate::arch::now_cycles();
+        crate::drivers::bench_ride::therm_snapshot();
+        pace.add(G_BENCH, t);
+    }
     #[cfg(all(target_arch = "x86_64", feature = "pcilink"))]
-    crate::drivers::bench_ride::pcilink_snapshot();
+    {
+        let t = crate::arch::now_cycles();
+        crate::drivers::bench_ride::pcilink_snapshot();
+        pace.add(G_BENCH, t);
+    }
     #[cfg(all(target_arch = "x86_64", feature = "vromprobe"))]
-    crate::drivers::bench_ride::vrom_sniff();
+    {
+        let t = crate::arch::now_cycles();
+        crate::drivers::bench_ride::vrom_sniff();
+        pace.add(G_BENCH, t);
+    }
 
     // GPU init runs AFTER the xHCI block: bench serial on the rMBP is the usbdebug FTDI behind
     // xHCI, so any GPU-init wedge before this point is invisible (zero serial from power-on —
     // sitting #7 boot 2 hard-hang signature). After xHCI is up, a wedge leaves breadcrumbs.
+    // GPACE: the GPU dispatch is measured entirely from OUT HERE, at its call sites. `detect`,
+    // `igpu` and `kepler` are wall-clock spans around calls this file already makes; not one line
+    // is added to `gpu/detect.rs`, `gpu/igpu.rs` or `gpu/kepler.rs`, which belong to other lanes.
+    // Each span therefore contains everything its callee did — MMIO, settles, AND the serial
+    // printing of its own witness lines. When the whole block is compiled out (a default build) all
+    // three classes read `0ms(n=0)`: never measured, not measured-as-zero.
     #[cfg(all(target_arch = "x86_64", any(feature = "nvidia-kepler", feature = "intel-ivb")))]
     {
+        let t_detect = crate::arch::now_cycles();
         let gpus = crate::drivers::gpu::detect::detect_gpus();
+        pace.add(G_DETECT, t_detect);
         let mut kepler_found = false;
         for gpu in &gpus {
             match gpu.gpu_type {
                 #[cfg(feature = "nvidia-kepler")]
                 crate::drivers::gpu::detect::GpuType::NvidiaKepler => {
                     kepler_found = true;
+                    let t = crate::arch::now_cycles();
                     crate::drivers::gpu::kepler::init(gpu);
+                    pace.add(G_KEPLER, t);
                 }
                 #[cfg(feature = "intel-ivb")]
                 crate::drivers::gpu::detect::GpuType::IntelIvyBridge => {
+                    let t = crate::arch::now_cycles();
                     crate::drivers::gpu::igpu::init(gpu);
+                    pace.add(G_IGPU, t);
                 }
                 _ => {}
             }
@@ -373,36 +602,71 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
 
     // SDHC-1 (milestone 1): storage-class PCI census + the read-only SD Host Controller
     // version/capability probe. Runs HERE — after the GPU dispatch (paging + the frame allocator
-    // the MMIO mapping needs are long up) and BEFORE the network block, which `return`s early on a
-    // non-Intel NIC and would otherwise swallow the witness on the 2012 rMBP (Broadcom Wi-Fi).
+    // the MMIO mapping needs are long up) and BEFORE the network block, whose non-Intel early exit
+    // would otherwise have swallowed the witness on the 2012 rMBP (Broadcom Wi-Fi). GPACE moved
+    // that exit into `init_network()`, so the ordering is no longer load-bearing for THIS witness —
+    // but it stays, because the sequence is what the metal baselines were taken against.
     // Read-only end to end: no reset, no clock/power programming, no command, no config write.
-    crate::drivers::sdhc::probe();
+    {
+        let t = crate::arch::now_cycles();
+        crate::drivers::sdhc::probe();
+        pace.add(G_SDHC, t);
+    }
 
-    // Network controller (PCI class 0x02 = Network, subclass 0x00 = Ethernet).
-    // QEMU's e1000 (82540EM) lands here; bring it up for polled RX.
-    if let Some((bus, slot, func)) = crate::drivers::pci::PciScanner::find_device(0x02, 0x00) {
-        let vendor = unsafe { read_config_16(bus, slot, func, 0x00) };
-        serial_println!(
-            ":: x86_64 PCI: Found network controller (class 0x02) vendor {:#06x} at {}:{}.{} ::",
-            vendor, bus, slot, func
-        );
-        // Only the Intel e1000/e1000e family is supported. On a real 2012 MacBook Pro the NIC is a
-        // Broadcom Wi-Fi part (vendor 0x14e4) that also reports class 0x02 — poking it with e1000
-        // register writes is wrong and its RX/TX bring-up (+ DHCP) just stalls. Gate to Intel.
-        if vendor != 0x8086 {
-            serial_println!(":: x86_64 PCI: non-Intel NIC ({:#06x}) — no e1000 driver, skipping ::", vendor);
-            return;
+    // GPACE: the network block is `init_network()` precisely so its non-Intel early exit cannot
+    // swallow the report below — see the helper's doc comment. `n=1` always; a Broadcom skip is a
+    // measured, cheap `nic=`, not an absence.
+    {
+        let t = crate::arch::now_cycles();
+        init_network();
+        pace.add(G_NIC, t);
+    }
+
+    // ── GPACE report — the one unconditional exit of `pci::init` ────────────────────────────────
+    // Two lines. The first is the split; the second is the self-check plus the build identity.
+    //
+    // `resid = span - Σ(classes)` by construction, so the parts always close on the whole: a class
+    // that under-counts shows up as unattributed time instead of as a tidy-looking total. `span`
+    // must equal the independent BPACE `pci-usb d=` to the millisecond — they are anchored on the
+    // same stamp and divided by the same `hz`, so the only slack is these two lines' own print
+    // cost, which lands inside `pci-usb` and outside `span`.
+    {
+        let now = crate::arch::now_cycles();
+        let span = now.wrapping_sub(anchor_cy);
+        let resid = span.saturating_sub(pace.sum());
+        let mut v = [0u64; N_GPACE];
+        let mut unit = "ms";
+        let mut k = 0;
+        while k < N_GPACE {
+            let (val, u) = gpace_fmt(pace.cy[k]);
+            v[k] = val;
+            unit = u;
+            k += 1;
         }
-        crate::drivers::e1000::init(bus, slot, func);
-        // Route the NIC's RX interrupt to the BSP local APIC via MSI (IDT vector 0x41),
-        // the same local-APIC delivery the xHCI uses. The e1000e keeps its MSI-X table in
-        // BAR3 (not mappable by enable_msix), so plain MSI is used.
-        let msg_addr = 0xFEE0_0000u32 | ((crate::arch::apic::apic_id() as u32) << 12);
-        crate::drivers::e1000::enable_interrupts(
-            bus, slot, func, msg_addr,
-            crate::arch::interrupts::NIC_MSI_VECTOR as u32,
+        let (sv, su) = gpace_fmt(span);
+        let (rv, _) = gpace_fmt(resid);
+        serial_println!(
+            ":: GPACE: {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) resid={}{} == witness ::",
+            GPACE_TAGS[G_XTAIL], v[G_XTAIL], unit, pace.n[G_XTAIL],
+            GPACE_TAGS[G_BENCH], v[G_BENCH], unit, pace.n[G_BENCH],
+            GPACE_TAGS[G_DETECT], v[G_DETECT], unit, pace.n[G_DETECT],
+            GPACE_TAGS[G_IGPU], v[G_IGPU], unit, pace.n[G_IGPU],
+            GPACE_TAGS[G_KEPLER], v[G_KEPLER], unit, pace.n[G_KEPLER],
+            GPACE_TAGS[G_SDHC], v[G_SDHC], unit, pace.n[G_SDHC],
+            GPACE_TAGS[G_NIC], v[G_NIC], unit, pace.n[G_NIC],
+            rv, unit
         );
-    } else {
-        serial_println!(":: x86_64 PCI: No network controller (class 0x02) found ::");
+        // `since-entry=` correlates this line with the ledger's `t=` column. `entry` is the boot's
+        // first stamp and cannot legitimately be missing here; if it ever is, the unit prints `?`
+        // rather than a zero that would read as a real measurement.
+        let (tv, tu) = match crate::bootpace::cycles_of("entry") {
+            Some(e) => gpace_fmt(now.wrapping_sub(e)),
+            None => (0, "?"),
+        };
+        serial_println!(
+            ":: GPACE: span={}{} anchor={} since-entry={}{} hz={} build={}{}{}{}{}{}{}{} == the pci-usb d= split ::",
+            sv, su, anchor_tag, tv, tu, crate::bootpace::origin_hz(),
+            GB_NONE, GB_KEPLER, GB_TAKEOVER, GB_FIFO, GB_IVB, GB_WC, GB_SMC, GB_BENCH
+        );
     }
 }
