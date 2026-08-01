@@ -101,7 +101,7 @@ strings unaos/target/x86_64_esp/kernel.elf | grep -c 'BPACE'      # must be >= 1
 | `sched` | after the step-4d scheduler block (x86) | `sched::init` + `enable` + the CLOCK-X1 witness (+ the `witness` ring-3 fixtures, when built) |
 | `pci-enter` | first statement of `arch::pci::init` (x86) | step 4e — `apic::report_tick_rate`, a 50 ms PM-timer window |
 | `ehci-hid` | before `drivers::ehci::init` | the knob-gated VPERF / EHCI-scout / SMC probes (all absent by default ⇒ ~0) |
-| `ehci-hid-done` | after `drivers::ehci::init` | the whole EHCI-3 HID bring-up: 256-bus config walk, wake, port reset, EP0 enumeration |
+| `ehci-hid-done` | after `drivers::ehci::init` | the whole EHCI-3 HID bring-up: 256-bus config walk, wake, port reset, EP0 enumeration — subdivided by the EPACE lines (below), not by more ring stamps |
 | `pci-scan` | after `PciScanner::scan()` | the xHCI bus scan (config-space reads only) |
 | `portsw` | after the PORTSW-1 flip | `probe_irq_caps` + `enable_bus_master` + the XUSB2PR/USB3_PSSEN routing writes |
 | `xhci-handoff` | after `bios_handoff` | the BIOS→OS USBLEGSUP handshake (budget-bounded; a no-op on QEMU) |
@@ -271,3 +271,42 @@ array writes each. It cannot attribute time *within* a phase; when a phase is
 found to dominate, the instrument for the inside of that phase is the phase's own
 witness line (`:: BOT: … result=SUMMARY ::` for the storage chain,
 `BOT_WAIT_BUCKETS` for per-stage latency), not this ledger.
+
+## 8. EPACE — the inside of `ehci-hid-done` (GR12)
+
+The first metal ledger with the M4 split read `ehci-hid-done d=6324ms` — 93% of
+the boot's remaining block, in one bucket. Per §7, the instrument for the inside
+of a dominating phase is the phase's own witness, so the split lives in
+`drivers/ehci/mod.rs` as EPACE, not as more ring stamps: the hub walk is
+per-port × per-tier, and overflowing the 64-slot ring would trigger drop-NEWEST
+and silently destroy every later boot tag.
+
+EPACE keeps cycle accumulators per phase class on each `Controller` and prints
+one summary line per controller before `:: EHCI-HID: end ::`:
+
+```
+:: EPACE: [i] wake= hcrst= smoke= rootrst= hseprobe= enum= [hubpwr= hubrst= hidcfg= resid=] == witness ::
+:: EPACE: selftest= evid= init= hz= == the ehci-hid d= split ::
+```
+
+* `wake` PMCSR-D0/legsup/RS/CONFIGFLAG (+ its 150 ms settle) · `hcrst` the
+  firmware-stale quiesce + RS restart, including the probe-14 full re-init ·
+  `smoke` the 5 periodic DMA passes · `rootrst` connect debounce + paced root
+  resets · `hseprobe` the probe-14 transport probe · `enum` the whole top-level
+  `enumerate_at_zero` span.
+* The bracketed classes accumulate **inside** `enum` across hub recursion:
+  `hubpwr` (PORT_POWER + pwr2good settle), `hubrst` (downstream reset + poll +
+  acks), `hidcfg` (`configure_hid`). `resid=` is `enum` minus those three —
+  control-transfer descriptor time plus recursion overhead. A large `resid` is a
+  finding, not noise.
+* Spans are wall-clock around the call sites, so each class contains its own
+  serial printing. `evid=` (the DMAR/PCI/RCBA dump) is almost pure serial output
+  and therefore doubles as the measured print cost of ~70 witness lines — the
+  calibration for how much of every other phase is serial time.
+
+Instrument-baseline: the clock is the same `now_cycles()`/`tsc_hz()` pair the
+settles themselves use — a miscalibration moves the report and the settles
+together, keeping ratios truthful; `hz=0` prints raw `cy`, never a fabricated
+ms. The self-check is `init=` against the independent BPACE `ehci-hid-done d=`:
+they must agree to within the EPACE lines' own print cost, or one of the two
+instruments is lying.

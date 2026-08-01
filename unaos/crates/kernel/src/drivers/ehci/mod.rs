@@ -254,6 +254,75 @@ struct ReportLayout {
     vendor_mt: bool,
 }
 
+// ── EPACE — the ehci-hid phase accumulator ──────────────────────────────────────────────────────
+// The metal BPACE ledger (2026-07-30) read `ehci-hid-done d=6324ms`: 93% of the old 7.3 s boot
+// block in ONE bucket, entered and left with nothing stamped in between. This instrument splits
+// that bucket. It deliberately does NOT add per-phase `bootpace::record` stamps: the hub walk is
+// per-port × per-tier and could overflow the 64-slot ring, whose drop-NEWEST policy would then
+// silently destroy every later boot tag — a worse ledger in exchange for a better one.
+//
+// Design: cycle-count accumulators per phase CLASS, kept on the Controller, printed as one
+// summary line per controller right before `:: EHCI-HID: end`. Spans are measured around the
+// phase call sites, so a class contains everything its phase did — settles, MMIO polls, control
+// transfers AND the serial printing of its own witness lines. Nested classes (hubpwr/hubrst/
+// hidcfg) accumulate inside the top-level `enum` span; `resid=` prints `enum` minus its named
+// parts, so unattributed time is a visible number, never a silent absence.
+//
+// Instrument honesty (the can-this-lie-while-looking-right check):
+//   * Same clock as the code under measurement — `now_cycles()`/rdtsc, converted at PRINT time
+//     via `apic::tsc_hz()`, the exact rate `settle_ms` itself uses. If calibration is wrong the
+//     settles and this report are wrong TOGETHER, which keeps the ratios truthful; `hz=0`
+//     (pre-calibration) prints raw cycles with a `cy` suffix rather than a fabricated ms.
+//   * Self-check against the enclosing instrument: the final line prints `init=` (this module's
+//     own entry→exit span), which must match the independent BPACE `ehci-hid-done d=` to within
+//     the print cost of the EPACE lines themselves. Disagreement means one of the two is lying.
+//   * This instrument can execute in every state it reports on: the accumulators are plain
+//     memory writes, and the print site sits on the one unconditional path out of `init`.
+const EP_WAKE: usize = 0; // wake_run: PMCSR D0 + legsup + RS + CONFIGFLAG (+ its 150 ms settle)
+const EP_HCRST: usize = 1; // quiesce_if_firmware_stale + RS restart (+ the probe-14 full re-init)
+const EP_SMOKE: usize = 2; // the 5 periodic DMA smoke passes
+const EP_ROOTRST: usize = 3; // reset_root_port: 100 ms debounce + paced reset attempts
+const EP_HSEPROBE: usize = 4; // the probe-14 bare GET_DESCRIPTOR(8) transport probe
+const EP_ENUM: usize = 5; // top-level enumerate_at_zero span (contains the three below)
+const EP_HUBPWR: usize = 6; // …hub PORT_POWER writes + the pwr2good settle
+const EP_HUBRST: usize = 7; // …hub downstream-port reset + completion poll + change acks
+const EP_HIDCFG: usize = 8; // …configure_hid: config/report descriptors + boot-proto + arming
+const N_EPACE: usize = 9;
+const EPACE_TAGS: [&str; N_EPACE] =
+    ["wake", "hcrst", "smoke", "rootrst", "hseprobe", "enum", "hubpwr", "hubrst", "hidcfg"];
+
+#[derive(Clone, Copy)]
+struct Epace {
+    cy: [u64; N_EPACE],
+    n: [u32; N_EPACE],
+}
+
+impl Epace {
+    const fn new() -> Self {
+        Epace { cy: [0; N_EPACE], n: [0; N_EPACE] }
+    }
+    /// Close a span opened at `t0` (a `now_cycles()` reading) into class `class`.
+    fn add(&mut self, class: usize, t0: u64) {
+        self.cy[class] = self.cy[class]
+            .wrapping_add(crate::arch::now_cycles().wrapping_sub(t0));
+        self.n[class] = self.n[class].saturating_add(1);
+    }
+}
+
+/// Cycles → whole ms at print time, `None` when the TSC rate is still unknown (pre-calibration) —
+/// the caller then prints raw cycles rather than a fabricated millisecond (the `[vugfps]` lesson).
+fn epace_ms(cy: u64) -> Option<u64> {
+    let hz = crate::arch::x86_64::apic::tsc_hz();
+    if hz == 0 { None } else { Some(cy.saturating_mul(1000) / hz) }
+}
+
+fn epace_fmt(cy: u64) -> (u64, &'static str) {
+    match epace_ms(cy) {
+        Some(ms) => (ms, "ms"),
+        None => (cy, "cy"),
+    }
+}
+
 /// One woken, schedule-bearing EHCI function. All DMA structures live in the static
 /// `qh::DMA_POOLS` (kernel image, low physical); every `*_phys` field is the page-table-
 /// resolved physical address the controller is actually programmed with (probe-5 discipline —
@@ -297,6 +366,8 @@ pub struct Controller {
     /// hot-plug rescan in this arc, exhaustion is unreachable in practice and traced if hit.
     next_addr: u8,
     int_eps: Vec<IntEp>,
+    /// EPACE phase accumulators (see the module comment above the struct).
+    pace: Epace,
     /// MT-INVESTIGATION (IVY, `mtraw` knob only): the trackpad target the raw-mode probe armed,
     /// remembered so the service loop can restore the known-good pointer mode over EP0 once the
     /// capture window closes. `None` until the probe runs, and again after the restore.
@@ -870,7 +941,9 @@ impl Controller {
             }
             self.bring_up_hub(&t, depth);
         } else {
+            let hidcfg_t0 = crate::arch::now_cycles();
             self.configure_hid(&t);
+            self.pace.add(EP_HIDCFG, hidcfg_t0);
         }
     }
 
@@ -898,10 +971,12 @@ impl Controller {
         );
 
         // Power every port first (SET_PORT_FEATURE PORT_POWER=8; harmless where always-on).
+        let hubpwr_t0 = crate::arch::now_cycles();
         for port in 1..=nbr_ports as u16 {
             let _ = self.control(hub, 0x23, 3, 8, port, 0, false);
         }
         settle_ms(pwr2good_ms + 100);
+        self.pace.add(EP_HUBPWR, hubpwr_t0);
 
         for port in 1..=nbr_ports as u16 {
             // GET_PORT_STATUS: wPortStatus (lo16) + wPortChange (hi16).
@@ -914,7 +989,9 @@ impl Controller {
                 continue; // no connection
             }
             // Reset the downstream port (SET_PORT_FEATURE PORT_RESET=4), bounded completion.
+            let hubrst_t0 = crate::arch::now_cycles();
             if self.control(hub, 0x23, 3, 4, port, 0, false).is_err() {
+                self.pace.add(EP_HUBRST, hubrst_t0);
                 continue;
             }
             settle_ms(50);
@@ -938,6 +1015,7 @@ impl Controller {
             // Ack the change bits we may have latched (C_PORT_CONNECTION=16, C_PORT_RESET=20).
             let _ = self.control(hub, 0x23, 1, 16, port, 0, false);
             let _ = self.control(hub, 0x23, 1, 20, port, 0, false);
+            self.pace.add(EP_HUBRST, hubrst_t0);
             if !ok || status & (1 << 1) == 0 {
                 serial_println!(
                     ":: EHCI-HID: [{}] hub {} port {} did not enable after reset (status {:#010x}) — skipped ::",
@@ -2667,9 +2745,12 @@ unsafe fn pci_evidence(bus: u8, dev: u8, func: u8, idx: usize) {
 /// stacks' port sets are disjoint by hardware — PORTSW-1 §7f).
 pub fn init() {
     serial_println!(":: EHCI-HID: begin (EHCI-3 driver, polling model, knob-gated) ::");
+    // EPACE: the module's own entry→exit span — the self-check target for the per-phase split.
+    let init_t0 = crate::arch::now_cycles();
     // Hardening self-test up front (default-ON driver parses ANY device's descriptor): proves the
     // report-parser is bounded against a hostile Report Count before we enumerate anything.
     unsafe { parser_selftest() };
+    let selftest_cy = crate::arch::now_cycles().wrapping_sub(init_t0);
     let mut ctrls: Vec<Controller> = Vec::new();
     // Probe-13 (b), Peter-approved 2026-07-17: the RCBA CG (clock gating) base + a one-shot
     // flag — the clear fires only if the live-port smoke actually HSEs.
@@ -2699,10 +2780,12 @@ pub fn init() {
                 unsafe {
                     ensure_bus_master(bus, dev, func, idx);
                     // The one shared wake path (idempotent when EHCI-2 mode already ran it).
+                    let wake_t0 = crate::arch::now_cycles();
                     let Some(h): Option<EhciFnHandle> = ehci_scout::wake_run(bus, dev, func, idx)
                     else {
                         continue;
                     };
+                    let wake_cy = crate::arch::now_cycles().wrapping_sub(wake_t0);
                     if h.addr64 != 0 {
                         serial_println!(
                             ":: EHCI-HID: [{}] note: controller advertises 64-bit addressing; CTRLDSSEGMENT pinned to 0 (all DMA < 4 GiB) ::",
@@ -2770,6 +2853,12 @@ pub fn init() {
                         overlay_mode: false,
                         next_addr: 1,
                         int_eps: Vec::new(),
+                        pace: {
+                            let mut p = Epace::new();
+                            p.cy[EP_WAKE] = wake_cy;
+                            p.n[EP_WAKE] = 1;
+                            p
+                        },
                         #[cfg(feature = "mtraw")]
                         mt_probe: None,
                         #[cfg(feature = "mtraw")]
@@ -2781,6 +2870,7 @@ pub fn init() {
                     // pre-approved HCRESET the controller is at defaults (halted, CF=0) — the
                     // bases are then programmed in the halted state (textbook), RS re-started,
                     // and CF re-routed via the shared wake_route.
+                    let hcrst_t0 = crate::arch::now_cycles();
                     let did_reset = c.quiesce_if_firmware_stale();
                     c.init_schedules();
                     if did_reset {
@@ -2804,6 +2894,8 @@ pub fn init() {
                             let _ = mmio_write32(h.op + OP_USBSTS, sts & STS_RW1C);
                         }
                     }
+                    c.pace.add(EP_HCRST, hcrst_t0);
+                    let smoke_t0 = crate::arch::now_cycles();
                     // Probe-6/10 discriminators, two 5 ms periodic smoke passes:
                     //  (1) all-Terminate frame list — one 4-byte frame-list read per frame,
                     //      the simplest upstream read (probe-6: PASSED on metal).
@@ -2891,12 +2983,16 @@ pub fn init() {
                             });
                         }
                     }
+                    c.pace.add(EP_SMOKE, smoke_t0);
                     for port in 0..h.n_ports {
                         let portsc = mmio_read32(h.op + OP_PORTSC0 + 4 * port as u64).unwrap_or(0);
                         if portsc & PORT_CCS == 0 || portsc & PORT_OWNER != 0 {
                             continue;
                         }
-                        if c.reset_root_port(port) {
+                        let rootrst_t0 = crate::arch::now_cycles();
+                        let root_ok = c.reset_root_port(port);
+                        c.pace.add(EP_ROOTRST, rootrst_t0);
+                        if root_ok {
                             // Transport probe (probe-14): one bare chain-mode GET_DESCRIPTOR(8)
                             // to addr 0. An HSE means this silicon aborts the qTD-fetch burst
                             // write — flip to OVERLAY-DIRECT and FULLY re-init (an HSE'd
@@ -2905,12 +3001,16 @@ pub fn init() {
                                 let probe_t = Target {
                                     addr: 0, mps0: 64, eps: QH_EPS_HIGH, hub_addr: 0, hub_port: 0,
                                 };
-                                if let Err("hse") = c.control(&probe_t, 0x80, 6, 0x0100, 0, 8, true) {
+                                let hseprobe_t0 = crate::arch::now_cycles();
+                                let probe_res = c.control(&probe_t, 0x80, 6, 0x0100, 0, 8, true);
+                                c.pace.add(EP_HSEPROBE, hseprobe_t0);
+                                if let Err("hse") = probe_res {
                                     c.overlay_mode = true;
                                     serial_println!(
                                         ":: EHCI-HID: [{}] qTD-fetch HSE — OVERLAY-DIRECT mode + full HCRESET re-init (probe-14 silicon finding) ::",
                                         idx
                                     );
+                                    let hcrst2_t0 = crate::arch::now_cycles();
                                     let _ = c.quiesce_if_firmware_stale(); // HSE latched -> resets
                                     c.init_schedules();
                                     let cmd = mmio_read32(h.op + OP_USBCMD).unwrap_or(0);
@@ -2925,13 +3025,19 @@ pub fn init() {
                                             let _ = mmio_write32(h.op + OP_USBSTS, sts & STS_RW1C);
                                         }
                                     }
-                                    if !c.reset_root_port(port) {
+                                    c.pace.add(EP_HCRST, hcrst2_t0);
+                                    let rootrst2_t0 = crate::arch::now_cycles();
+                                    let root2_ok = c.reset_root_port(port);
+                                    c.pace.add(EP_ROOTRST, rootrst2_t0);
+                                    if !root2_ok {
                                         continue;
                                     }
                                 }
                             }
                             let _ = (&cg_cleared, rcba); // probe-13 levers retired (smokes all passed)
+                            let enum_t0 = crate::arch::now_cycles();
                             c.enumerate_at_zero(QH_EPS_HIGH, 0, 0, 0);
+                            c.pace.add(EP_ENUM, enum_t0);
                         }
                     }
                     ctrls.push(c);
@@ -2942,6 +3048,10 @@ pub fn init() {
 
     // Probe-4 evidence dump: VT-d state AFTER the enumeration attempts, so any DMA fault our
     // transfers raised is latched in the fault-recording registers (read-only).
+    // EPACE: the whole evidence block (DMAR + PCI STATUS/CFG + RCBA) is one span. It is almost
+    // pure serial output, so its number doubles as the measured print cost of ~70 witness lines
+    // at this baud — the calibration for how much of every OTHER phase is serial time.
+    let evid_t0 = crate::arch::now_cycles();
     unsafe { dmar_report() };
 
     // Probe-5 evidence: PCI STATUS decode (received/signaled abort bits name the failure class
@@ -2981,6 +3091,52 @@ pub fn init() {
                 }
             }
         }
+    }
+
+    let evid_cy = crate::arch::now_cycles().wrapping_sub(evid_t0);
+
+    // ── EPACE report ────────────────────────────────────────────────────────────────────────────
+    // One line per controller + one closing line. `resid=` is `enum` minus its named parts —
+    // control-transfer time for the descriptor reads plus recursion overhead; a big resid is a
+    // finding, not a rounding error. The closing line's `init=` must match the independent BPACE
+    // `ehci-hid-done d=` (minus these prints' own cost) or one of the two instruments is lying.
+    for c in ctrls.iter() {
+        let named_enum_parts =
+            c.pace.cy[EP_HUBPWR] + c.pace.cy[EP_HUBRST] + c.pace.cy[EP_HIDCFG];
+        let resid = c.pace.cy[EP_ENUM].saturating_sub(named_enum_parts);
+        let (rv, ru) = epace_fmt(resid);
+        let mut parts_ms: [u64; N_EPACE] = [0; N_EPACE];
+        let mut unit = "ms";
+        for k in 0..N_EPACE {
+            let (v, u) = epace_fmt(c.pace.cy[k]);
+            parts_ms[k] = v;
+            unit = u;
+        }
+        serial_println!(
+            ":: EPACE: [{}] {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) [{}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) resid={}{}] == witness ::",
+            c.idx,
+            EPACE_TAGS[EP_WAKE], parts_ms[EP_WAKE], unit, c.pace.n[EP_WAKE],
+            EPACE_TAGS[EP_HCRST], parts_ms[EP_HCRST], unit, c.pace.n[EP_HCRST],
+            EPACE_TAGS[EP_SMOKE], parts_ms[EP_SMOKE], unit, c.pace.n[EP_SMOKE],
+            EPACE_TAGS[EP_ROOTRST], parts_ms[EP_ROOTRST], unit, c.pace.n[EP_ROOTRST],
+            EPACE_TAGS[EP_HSEPROBE], parts_ms[EP_HSEPROBE], unit, c.pace.n[EP_HSEPROBE],
+            EPACE_TAGS[EP_ENUM], parts_ms[EP_ENUM], unit, c.pace.n[EP_ENUM],
+            EPACE_TAGS[EP_HUBPWR], parts_ms[EP_HUBPWR], unit, c.pace.n[EP_HUBPWR],
+            EPACE_TAGS[EP_HUBRST], parts_ms[EP_HUBRST], unit, c.pace.n[EP_HUBRST],
+            EPACE_TAGS[EP_HIDCFG], parts_ms[EP_HIDCFG], unit, c.pace.n[EP_HIDCFG],
+            rv, ru
+        );
+    }
+    {
+        let init_cy = crate::arch::now_cycles().wrapping_sub(init_t0);
+        let (st, su) = epace_fmt(selftest_cy);
+        let (ev, eu) = epace_fmt(evid_cy);
+        let (iv, iu) = epace_fmt(init_cy);
+        serial_println!(
+            ":: EPACE: selftest={}{} evid={}{} init={}{} hz={} == the ehci-hid d= split ::",
+            st, su, ev, eu, iv, iu,
+            crate::arch::x86_64::apic::tsc_hz()
+        );
     }
 
     let n = ctrls.len();
