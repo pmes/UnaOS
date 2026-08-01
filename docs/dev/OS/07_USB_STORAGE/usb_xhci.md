@@ -260,8 +260,11 @@ number — "how long may a wedged handshake burn before we call it dead" — and
 because the day the timeout policy changes, every USB timing constant silently
 rescales. It also made the settle's real wall clock arch-dependent and
 unprintable: ~500 ms on a calibrated x86, ~694 ms on the Pi's fixed 150 M-tick
-budget. It is now `SETTLE_MS * cycles_per_ms()` — the same honest number on both
-arches, and `settle_ms=` can state it without lying.
+budget. It is now `settle_ms * cycles_per_ms()` — the same nominal number on both
+arches, and `settle_ms=` can state the value that actually ran. (M4 spelled that
+local `SETTLE_MS`, a single constant; CCSTRIM made it a local chosen between
+`SETTLE_PP_APPLIED_MS` and `SETTLE_PRE_POWERED_MS`, so the old name no longer
+exists anywhere in the driver.)
 
 **Length: 150 ms** (M4; now conditional — see CCSTRIM below). USB3 link training
 reaches U0 in tens of ms typically; the spec's outer bound is
@@ -277,7 +280,7 @@ stuck-in-Polling erratum). A healthy link may *legitimately* be in Polling for u
 to 360 ms, so declaring one stuck before then would warm-reset a link out of a
 legal state. The old pairing satisfied that only by accident (500 ms settle +
 100 ms debounce = 600 ms). It is now explicit: the debounce is
-`POLLING_DECIDE_MS (360) − SETTLE_MS`, i.e. whatever is left of the spec window,
+`POLLING_DECIDE_MS (360) − settle_ms`, i.e. whatever is left of the spec window,
 so shortening the settle cannot shorten the Polling verdict. A link that finishes
 training during that window reads `CCS=1` at the re-check, is *not* warm-reset,
 and is picked up by the CCS scan in the ordinary way.
@@ -301,7 +304,9 @@ boot device's port shows up through
 `xHCI: [Port N] unsolicited reset complete; queuing for enumeration.` or a plain
 hot-plug `CSC` line — or if `xHCI: USB3 port N stuck in Polling (debounced);
 warm-resetting.` names the boot port — the settle is too short for this machine
-and `SETTLE_MS` must go back up. `settle_ms=` is printed live precisely so a
+and the settle must go back up — which since CCSTRIM means the branch named by
+the capture's own `/on`|`/pre` markers, `SETTLE_PP_APPLIED_MS` or
+`SETTLE_PRE_POWERED_MS`, not one shared number. `settle_ms=` is printed live precisely so a
 capture can be dated against the constant that produced it. Since CCSTRIM that
 tell-tale is no longer something to spot by eye: see `CCSMARGIN-LATE` below.
 
@@ -351,14 +356,14 @@ xHCI: ccs-margin settle_ms=150 ppc=1 ports=4 first_assert_ms=[p1:0/pre p2:none/o
   allowance expired long before the kernel existed, and the same number is
   measuring something else entirely. Without this marker `latest=` is not
   interpretable, and GR11's reading was not;
-- `margin_ms` = `SETTLE_MS − latest`, signed and raw. This is the whole point: it
+- `margin_ms` = `settle_ms − latest`, signed and raw. This is the whole point: it
   turns "did it work" into "by how much".
 
 **Three readings that must differ** (instrument-baseline law):
 
 | situation | line reads |
 |---|---|
-| healthy boot | every connected port a small `first_assert_ms`, `latest` well under `SETTLE_MS`, `margin_ms` comfortably positive |
+| healthy boot | every connected port a small `first_assert_ms`, `latest` well under `settle_ms`, `margin_ms` comfortably positive |
 | mechanism did not run — nothing plugged into any root port | every port `none`, `latest=none`, `margin_ms=none` |
 | the failure the settle exists to prevent | `margin_ms` **0 or negative** — the final at-deadline sweep was the first sample to see `CCS=1`, so the port reached the initial scan with no headroom |
 
@@ -370,7 +375,7 @@ A port asserting *later* than the deadline cannot be timed by an instrument that
 stops at the deadline: it reads `none`, indistinguishable here from an empty port,
 and is disambiguated by the tell-tale above (that device arrives through the
 CSC / warm-reset path). The in-loop samples can only ever report
-`elapsed < SETTLE_MS`, i.e. a strictly positive margin, which is why one final
+`elapsed < settle_ms`, i.e. a strictly positive margin, which is why one final
 sweep runs *at* the deadline — an instrument that cannot print its own failure is
 not an instrument.
 
@@ -386,7 +391,7 @@ Two things the witness deliberately does **not** do:
 - **It adds no BPACE stamp.** The ring stores `(cycle, tag)` and a stamp's value
   *is* the instant `record()` was called; the latest assert is only identifiable
   after every port has been swept, so it cannot be stamped when it happened, and a
-  stamp placed at the end of the settle would read ~`SETTLE_MS` on every boot
+  stamp placed at the end of the settle would read ~`settle_ms` on every boot
   forever — the recorder, not the phenomenon. M4's ring arithmetic (n=31 of
   CAP=64) is untouched and `dropped=` stays 0.
 
@@ -461,15 +466,25 @@ Undershooting by one millisecond costs a hundred. The whole prize is
 `150 − settle_ms`; the penalty whenever the real population's tail exceeds the
 new value is `+100`.
 
-**It survives the uncalibrated timebase.** `cycles_per_ms()` falls back to a
-2 GHz guess when `apic::tsc_hz()` reads 0 (no ACPI PM timer, or `calibrate`
-returning ABORTED/REJECTED). Against this bench's real 2.693 GHz that makes every
-nominal figure ~26 % short in wall clock. The `/on` branch's 150 degrades to
-~111 ms — still above `TSIGATT`. A flat 100 would have degraded to ~74 ms, i.e.
-*below* the floor on the exact path where the floor applies. That is a second,
-independent reason the constant is not flat, and `cycles_per_ms`'s doc comment —
-which used to claim a wrong guess is "never unsound" — has been corrected to say
-so.
+**It survives the uncalibrated timebase — up to a stated limit.**
+`cycles_per_ms()` falls back to a flat 2,000,000 cycles/ms (an assumed 2 GHz) when
+`apic::tsc_hz()` reads 0 (no ACPI PM timer, or `calibrate` returning
+ABORTED/REJECTED). A nominal `N` ms then spins `N × 2e6` cycles, which on a part
+whose real invariant TSC is `f` GHz is `N × 2 / f` ms of real time. **The
+direction of the error is a property of the machine, not of the helper**: above
+2 GHz waits run short, below 2 GHz (low-power mobile parts, QEMU TCG) they run
+long. Only the short direction can be unsound, and only for a constant chosen at
+an external floor.
+
+For the `/on` branch, 150 nominal is `300 / f` ms real, so it stays at or above
+the 100 ms `TSIGATT` floor **for any invariant TSC up to 3.0 GHz** — this bench's
+2.693 GHz gives ~111 ms, where a flat 100 would already have given ~74 ms. Above
+3.0 GHz even the 150 branch falls under the floor on the fallback path (~86 ms at
+3.5 GHz); the fallback is a stopgap for an uncalibrated timebase, not a guarantee,
+and a seat expecting to run there must calibrate rather than lean on these
+numbers. Within that bound it is a second, independent reason the constant is not
+flat — and `cycles_per_ms`'s doc comment, which used to claim a wrong guess is
+"never unsound", now states the formula and the limit instead of a new absolute.
 
 **The three failure tokens.** A trim justified by a witness that cannot see its
 own failure mode is not justified.

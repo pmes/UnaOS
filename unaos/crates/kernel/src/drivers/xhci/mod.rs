@@ -7566,16 +7566,26 @@ impl XhciController {
     ///     ABORTED/REJECTED).
     ///
     /// **The fallback is not benign, and this comment used to claim it was** ("a wrong guess makes
-    /// a settle longer or shorter, never unsound"). It is only ever a guess LOW: the rMBP's real
-    /// invariant TSC is 2.693 GHz, so on the fallback path every nominal figure built from this
-    /// helper runs ~26% SHORT in wall clock — a nominal 100 ms is ~74 ms of real time. For a
-    /// back-off or a pacing delay that is harmless. For a settle that sits ON an external floor it
-    /// is not: it can put the real wait below the floor while the capture still prints the nominal
-    /// number, which is precisely the kind of silent lie CCSMARGIN exists to catch. Any constant
-    /// here that is chosen AT a spec bound must therefore carry its own headroom for this path
-    /// rather than assume the helper is exact. The pre-CCS-scan settle in `start()` is the worked
-    /// example: its `/on` branch keeps 150 (>= ~111 ms even under the guess, still above TSIGATT)
-    /// instead of the flat 100 the spec floor alone would suggest.
+    /// a settle longer or shorter, never unsound"). State it as arithmetic, not as an absolute —
+    /// the first correction of this paragraph replaced one unbounded claim with another ("only ever
+    /// a guess LOW"), which is equally false on a slow part.
+    ///
+    /// The fallback is a flat 2_000_000 cycles/ms, i.e. an ASSUMED 2 GHz. A nominal `N` ms
+    /// therefore spins `N * 2e6` cycles, which against a real invariant TSC of `f` GHz is
+    /// `N * 2 / f` ms of wall clock. **The direction of the error is a property of the machine,
+    /// not of this helper:** above 2 GHz every wait runs SHORT (this bench's 2.693 GHz turns a
+    /// nominal 100 ms into ~74 ms), below 2 GHz — low-power mobile parts, QEMU TCG — it runs LONG.
+    ///
+    /// Only the short direction can be unsound, and only for a constant chosen AT an external
+    /// floor: it puts the real wait under the floor while the capture still prints the nominal
+    /// number, exactly the silent lie CCSMARGIN exists to catch. Such constants must carry their
+    /// own headroom for this path rather than assume the helper is exact. The pre-CCS-scan settle
+    /// in `start()` is the worked example: its `/on` branch keeps 150 nominal, i.e. `300 / f` ms
+    /// real, which holds at or above the 100 ms TSIGATT floor **for any invariant TSC up to
+    /// 3.0 GHz** (2.693 GHz -> ~111 ms), where a flat 100 would already be ~74 ms. Above 3.0 GHz
+    /// even the 150 branch falls under the floor on this path (~86 ms at 3.5 GHz): the fallback is
+    /// a stopgap for an uncalibrated timebase, not a guarantee, and a seat that expects to run
+    /// there must calibrate rather than lean on these numbers.
     ///   * aarch64 — CNTFRQ_EL0, the generic timer's declared rate (~54 MHz Pi 4, ~62.5 MHz virt),
     ///     or 54 MHz if the register reads zero.
     fn cycles_per_ms() -> u64 {
