@@ -1856,7 +1856,8 @@ const RECRUIT_MIN_HOME: usize = 2;
 // co-placement applies EXACTLY as it does today whenever the machine has no spare core, and is
 // suspended — every term of it, at spawn and at rewake alike — whenever it does.
 //
-// "SPARE" IS COMMITTED-EMPTY AND DISPATCH-FRESH, and both halves are load-bearing:
+// "SPARE" IS COMMITTED-EMPTY, DISPATCH-FRESH AND KERNEL-COLD (the third half is SPREAD-14's), and
+// all three are load-bearing:
 //
 //   * COMMITTED, not runnable. `el0_active == 0` is the reading SPREAD-12's idle lane uses, and its
 //     own block explains why that set is not monotone: a core whose residents are all parked reads
@@ -1870,6 +1871,20 @@ const RECRUIT_MIN_HOME: usize = 2;
 //     the freshness half, one wedged core would hold co-placement suspended across the whole fleet
 //     permanently — a silent, machine-wide regression of the policy in exactly the failure this track
 //     is hunting. A core that has left the dispatch loop is not spare; it is broken.
+//   * KERNEL-COLD (SPREAD-14). Both halves above are EL0-shaped instruments, and a core saturated by
+//     PINNED KERNEL work is invisible to both: it owns no EL0 resident ever (`EL0_RESIDENTS` moves
+//     only on the EL0 spawn/reap/move paths), and it is dispatch-fresh BECAUSE of the very load in
+//     question — it goes round `run()` dispatching that work. With `UNAOS_VUGPAR=1` on the bench
+//     build line this is not hypothetical: `flush_parallel` spawns per-frame `vugband` tasks —
+//     kernel, `PRIO_NORMAL`, `steal_ok = false` — onto up to three helper cores on every full-screen
+//     present, and P65v2 measured the result (`c0=99 c1=68 c2=99 c3=63`, the 99s pure band load). Such
+//     a core read spare, suspending co-placement fleet-wide, and scored the floor `eff == 1` in the
+//     scan below, making a 99%-busy core the PREFERRED split target over staying home. The third
+//     half closes it with a signal that already exists and already means exactly the right thing:
+//     `el0_busy_pct` is documented as "what fraction of this core's time went to work an EL0 arrival
+//     would actually wait behind", and on a committed-EMPTY core every point of it is kernel-task
+//     burn (there is no EL0 resident to produce EL0 time). See `SPARE_KBUSY_PCT_MAX` for the bound
+//     and its derivation, and `kernel_busy_hot` for the instrument argument.
 //
 // WHAT BOUNDS THIS IS A CLOCK, NOT A STRUCTURE, and the distinction is the whole of this paragraph:
 // the first draft of this block claimed the suspension could not flap at all, and that claim is false
@@ -1932,28 +1947,89 @@ const RECRUIT_MIN_HOME: usize = 2;
 // verbatim before any of this arithmetic runs, and `rewake_place` is only ever reached from the EL0
 // wake and yield paths. Render and input stay single-core.
 
-/// SPREAD-13 — online cores that own NO committed EL0 resident and are provably still dispatching:
-/// the machine's spare capacity, in cores. Zero means every core is somebody's home and co-placement's
-/// contention premise holds; nonzero means a vug's triple has somewhere to go that costs nobody
-/// anything, and the co-residency bonus is suspended for as long as that is true.
+/// SPREAD-14 — how much below-service-band busy a committed-empty core may carry and still count
+/// SPARE, in percent. At or above this it is "kernel-hot": something an EL0 arrival would wait
+/// behind is already burning the core, and on a committed-empty core that something can only be
+/// kernel work (pinned bands being the measured case).
 ///
-/// One CNTPCT read for the whole scan (`fold_age_from`), then two relaxed-to-acquire loads per core.
-/// No lock, no run-queue access — which is required at both call sites: `rewake_place` runs inside
+/// 25 is derived from the lattice this predicate feeds, not tuned: the spread lane fires at margin 0
+/// on the claim that the destination is FREE, so "free" must mean the hidden load is below the
+/// smallest quantum the doubled-load lattice distinguishes — HALF a runnable resident, the
+/// co-residency bonus's own unit. One time-slicing `PRIO_NORMAL` peer takes half the core (50% of
+/// below-band time); half a resident is therefore 25%. A committed-empty core burning >= 25% on
+/// kernel work is carrying at least the half-resident that separates a genuinely spare core's
+/// `eff == 1` from a contended one, and the margin-0 claim would be dishonest for it.
+///
+/// The failure direction is asymmetric on purpose: a false "kernel-hot" merely keeps co-placement
+/// LIVE, which is the pre-SPREAD-13 behaviour and correct on a machine with no free core; a false
+/// "spare" is the P65v2 state — an EL0 task handed to a 99%-busy core that placement priced at zero.
+const SPARE_KBUSY_PCT_MAX: u32 = 25;
+
+/// SPREAD-14 — is this committed-empty core saturated by kernel work an EL0 arrival would wait
+/// behind? `el0_busy_pct` is the existing SPREAD-9 signal read for exactly its documented meaning;
+/// with `el0_committed(cpu) == 0` (the callers' contract) every point of it is attributable to
+/// kernel tasks below the service band — per-frame pinned `vugband` workers under `UNAOS_VUGPAR=1`
+/// being the population that motivated the check. The one imprecision is a reap mid-window: EL0 time
+/// from a just-reaped resident lingers in the ~250 ms window while committed already reads 0, which
+/// errs toward "not spare" for at most one window — the safe direction.
+///
+/// It can execute in the state it reports on, which is what lets its answer stand as evidence: the
+/// percent is folded by the reported core's own dispatch loop, and both callers test freshness
+/// FIRST, so a core that stopped folding is disqualified as stale before this stale percent could be
+/// read as either hot or cold. And it is a ~250 ms low-passed window, not an instantaneous flag —
+/// per-frame band tasks are transient (spawned, run, reaped inside one flush), so any "is a band
+/// here NOW" reading would flicker at frame rate, precisely the flapping `spare` is built to
+/// exclude; the windowed percent moves on the same timescale as the placement clock instead.
+///
+/// Lock-free (a handful of atomic loads + one division), per the `spare_cores` contract.
+#[inline]
+fn kernel_busy_hot(cpu: usize) -> bool {
+    ACCT[cpu].el0_busy_pct(CUR_PRIO[cpu].load(Ordering::Relaxed) >= PRIO_SERVICE)
+        >= SPARE_KBUSY_PCT_MAX
+}
+
+/// SPREAD-13 — online cores that own NO committed EL0 resident, are provably still dispatching, and
+/// (SPREAD-14) are not kernel-hot: the machine's spare capacity, in cores. Zero means every core is
+/// somebody's home — or is burning a resident's worth of kernel work — and co-placement's contention
+/// premise holds; nonzero means a vug's triple has somewhere to go that costs nobody anything, and
+/// the co-residency bonus is suspended for as long as that is true.
+///
+/// Returns `(spare, khot)`: `khot` counts the cores refused spare status ONLY by the kernel-heat
+/// test — committed-empty, dispatch-fresh cores that would have read spare before SPREAD-14. It is a
+/// gauge for the `[spread10]` wire (`spare_cores` discards it), computed by the same scan so the
+/// instrument cannot be elsewhere when the state it reports on occurs. On a build without `vugpar`
+/// it should read 0; nonzero there means some OTHER pinned kernel work is saturating an unowned
+/// core, which is worth seeing either way.
+///
+/// One CNTPCT read for the whole scan (`fold_age_from`), then a few relaxed-to-acquire loads per
+/// core (the heat test's loads are paid only by cores that pass the first two halves). No lock, no
+/// run-queue access — which is required at both call sites: `rewake_place` runs inside
 /// `make_ready`'s IRQ-masked section under WEDGE-4's rq() discipline, and `pick_cpu_slot` runs before
 /// the spawn's own enqueue.
-fn spare_cores() -> usize {
+fn spare_scan() -> (usize, usize) {
     let now = now_cyc();
     let fresh = dispatch_fresh_cyc();
-    let mut n = 0usize;
+    let mut spare = 0usize;
+    let mut khot = 0usize;
     for cpu in 0..NUM_CPUS {
         if ONLINE_MASK[cpu].load(Ordering::Acquire)
             && el0_committed(cpu) == 0
             && ACCT[cpu].fold_age_from(now) < fresh
         {
-            n += 1;
+            if kernel_busy_hot(cpu) {
+                khot += 1;
+            } else {
+                spare += 1;
+            }
         }
     }
-    n
+    (spare, khot)
+}
+
+/// SPREAD-13 — the predicate itself; see [`spare_scan`] for the full contract.
+#[inline]
+fn spare_cores() -> usize {
+    spare_scan().0
 }
 
 /// SPREAD-13 — triples the suspension actually BROKE UP: rewake/yield moves that ONLY the spread lane
@@ -2135,8 +2211,8 @@ fn rewake_min_park_cyc() -> u64 {
 /// not "empty core"): the SPREAD-12 block above `RECRUIT_MIN_HOME`.
 ///
 /// SPREAD-13 makes SPREAD-10's whole contribution CONDITIONAL, and adds a FOURTH lane for the state
-/// that condition opens up. While the machine has a spare core (`spare_cores() > 0` — committed-empty
-/// and dispatch-fresh) the co-residency terms are suspended entirely: `sibs` reads 0 everywhere, so
+/// that condition opens up. While the machine has a spare core (`spare_cores() > 0` — committed-empty,
+/// dispatch-fresh and, per SPREAD-14, kernel-cold) the co-residency terms are suspended entirely: `sibs` reads 0 everywhere, so
 /// the home retention bonus, the `toward` discount and the sibling lane all vanish and a slot task is
 /// weighed exactly as a slotless one. In their place, a candidate that owns NO committed EL0 resident
 /// qualifies whenever home hosts a committed sibling of ours — the state SPREAD-12's idle lane cannot
@@ -2228,6 +2304,8 @@ fn rewake_place(home: usize, slot: usize) -> usize {
         // business. Requiring the candidate to be committed-EMPTY (not merely idle-reading) is what
         // makes the firing count monotone, since the move itself takes the core out of the spare set;
         // `el0_active == 0` would flicker back once per frame and this lane would oscillate with it.
+        // SPREAD-14 adds a KERNEL-COLD refusal for this lane, placed AFTER the freshness gate below
+        // rather than in this conjunction — see the comment there for why the order is load-bearing.
         let spread_lane = !coplace && home_sibs > 0 && el0_committed(cpu) == 0;
         if !margin_lane && !sib_lane && !idle_lane && !spread_lane {
             continue; // not enough of a win to pay for the move
@@ -2246,6 +2324,28 @@ fn rewake_place(home: usize, slot: usize) -> usize {
                 SPREAD12_STALE.fetch_add(1, Ordering::Relaxed);
             }
             continue; // not provably dispatching — never hand it a task only it can run
+        }
+        // SPREAD-14 — the spread lane's candidate must also be KERNEL-COLD, the same third half
+        // `spare_cores` grew: a committed-empty core saturated by pinned kernel bands (`vugband`,
+        // per-frame under `UNAOS_VUGPAR=1`) reads `act == 0`, hence the floor `eff == 1`, and would
+        // WIN this scan outright (`1 < home_eff`) — handing a triple member to a 99%-busy core the
+        // lattice priced at zero. Refused HERE, after the freshness gate, and only when no other
+        // lane admits, and both restrictions are load-bearing:
+        //
+        //   * AFTER freshness, so the percent `kernel_busy_hot` reads is provably being folded by a
+        //     live dispatch loop — and so a WEDGED empty core still lands in `rstale` first, exactly
+        //     as before this arc. Tested in the lane conjunction instead, a core wedged mid-task
+        //     (whose live span pins `el0_busy_pct` at 100) would be refused as "hot" and leave no
+        //     trace at all — the structural silence this track sends arcs back for.
+        //   * SPREAD-LANE-ONLY, so this refusal is exactly this arc's delta and no other lane's
+        //     admission changes: margin- and idle-lane candidacies (which predate SPREAD-13 and do
+        //     not consult committed emptiness) keep their pre-SPREAD-14 behaviour verbatim.
+        //
+        // Among the candidates that remain, the existing `pct` tie-break below already orders
+        // equal-`eff` spares by the same signal, so a mildly-warm core (below the bound) still ranks
+        // behind a cold one.
+        if spread_lane && !margin_lane && !sib_lane && !idle_lane && kernel_busy_hot(cpu) {
+            continue; // committed-empty but burning a resident's worth of kernel work — not spare
         }
         // SPREAD-9: the tie-break percent excludes service-band time, exactly as in `pick_cpu` — a
         // waking task must not decline the core the service band lives on for load that would
@@ -6556,6 +6656,14 @@ fn spread4_witness() {
 ///     window rather than of the microsecond. The same field read against `1c`/`2c`/`3c+` is the
 ///     whole one-window story in one line: three tasks on three cores with a fourth spare reads
 ///     `3c+=1 spare=1`, and the load line beside it should show three cores carrying work.
+///   * `khot` (SPREAD-14) — the same gauge's refusals-for-kernel-heat: committed-empty,
+///     dispatch-fresh cores that `spare` would have counted before the kernel-cold half existed.
+///     Under `UNAOS_VUGPAR=1` with a full-screen present running, the expected reading is `khot`
+///     equal to the band helper count while `spare` reads 0 — co-placement correctly LIVE on a
+///     machine whose "free" cores are blitting; the pre-SPREAD-14 build read `spare=3` there. On a
+///     no-`vugpar` build `khot` must read 0, and a nonzero is a sighting of some other pinned kernel
+///     load saturating an unowned core, not noise. Computed by the same scan as `spare` (one
+///     instrument, both fields), so its zero is evidence on any line where `spare` is legible.
 ///   * `split` — triples this arc took apart, counted as spread-lane-ONLY moves, which means the
 ///     `home_act == 1` case only: at `home_act >= 2` the margin and idle lanes co-admit the same
 ///     candidate and the move goes unattributed. See `SPREAD13_SPLIT` for that population.
@@ -6600,8 +6708,11 @@ fn spread10_witness() {
             _ => on3 += 1,
         }
     }
+    // SPREAD-13/14: one scan feeds both fields — the predicate itself (so `split`'s reading is
+    // decidable) and the cores the kernel-heat half refused it.
+    let (spare, khot) = spare_scan();
     serial_println!(
-        "[spread10] slots 1c={} 2c={} 3c+={} co_moves={} ymoves={} recruit={} rstale={} spare={} split={} repack={}",
+        "[spread10] slots 1c={} 2c={} 3c+={} co_moves={} ymoves={} recruit={} rstale={} spare={} khot={} split={} repack={}",
         on1,
         on2,
         on3,
@@ -6609,7 +6720,8 @@ fn spread10_witness() {
         SPREAD11_YIELD_MOVES.load(Ordering::Relaxed),
         SPREAD12_RECRUIT.load(Ordering::Relaxed),
         SPREAD12_STALE.load(Ordering::Relaxed),
-        spare_cores(), // SPREAD-13: the predicate itself, so `split`'s reading is decidable
+        spare,
+        khot,
         SPREAD13_SPLIT.load(Ordering::Relaxed),
         SPREAD13_REPACK.load(Ordering::Relaxed),
     );

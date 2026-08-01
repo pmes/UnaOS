@@ -1012,7 +1012,9 @@ retention and early-out together, at spawn (`pick_cpu_slot`) and at rewake
 weighed precisely as a slotless one.
 
 **"Spare" is committed-empty *and* dispatch-fresh** (`spare_cores()`), and both
-halves are load-bearing.
+halves are load-bearing. (SPREAD-14, below, added a third half — kernel-cold —
+after the bench build line turned `UNAOS_VUGPAR=1` on and made a core saturated
+by pinned kernel bands satisfy both of these.)
 
 * **Committed, not runnable.** `el0_active == 0` is SPREAD-12's reading, and that
   section explains why the set it defines is not monotone: a core whose residents
@@ -1095,14 +1097,18 @@ is a window whose frame rate nobody is measuring. Accepted knowingly.
 verbatim before any of this arithmetic runs, so render and input stay
 single-core); the `vugpar` band-parallel flush, which picks its own helper cores
 from `core_load().tracked` and never consults EL0 placement at all — it was not
-being denied cores by placement, and it is off unless `UNAOS_VUGPAR=1`; slotless
+being denied cores by placement, and it is off unless `UNAOS_VUGPAR=1` (the
+*converse* blindness — EL0 placement never consulting band load — turned out not
+to be ignorable once the bench build line shipped that knob on, and is SPREAD-14
+below); slotless
 tasks, which never compute the predicate and so keep their exact former cost and
 behaviour, `virt`/JC3 included. No new lock and no run-queue access: `spare_cores`
 is two atomic loads per core over one CNTPCT read, which is required — the wake
 path calls it IRQ-masked under WEDGE-4's `rq()` discipline.
 
 **The wire signature.** Three fields appended to `[spread10]`:
-`spare=N split=N repack=N`.
+`spare=N split=N repack=N` (SPREAD-14 later added `khot=N` between `spare` and
+`split`; see its section below).
 
 * `spare` — the predicate itself, sampled now. `spare=0` means co-placement is
   live and every other field on the line carries its pre-SPREAD-13 meaning;
@@ -1184,6 +1190,96 @@ cores instead of one. `repack` flat is the *clean* outcome; `repack` tracking
 line shows the work spread — it is the *load line*, not `repack`, that decides
 whether this arc worked. `recruit=0` is expected on that wire and is not a
 finding.
+
+### A core saturated by pinned kernel bands is not spare (aarch64, SPREAD-14)
+
+**The flag (SPREAD-13's reviewer), and why it grew teeth.** Both halves of
+SPREAD-13's spare predicate are EL0-shaped instruments, and a core saturated by
+*pinned kernel* work is invisible to both. `vugband` tasks — the `vugpar`
+band-parallel flush's per-frame workers — are kernel tasks (`user_ttbr0 = 0`),
+`PRIO_NORMAL`, `steal_ok = false`, spawned onto up to three helper cores on
+every full-screen present. A core fed that stream owns no committed EL0 resident
+ever (`EL0_RESIDENTS` moves only on EL0 spawn/reap/move paths), and it is
+dispatch-fresh *because of* the very load in question — it goes round `run()`
+dispatching a band every frame, and WEDGE-1's own doc says a live core can never
+trip the bound. When SPREAD-13 landed this was a latent shape behind a
+default-off feature; the bench build line now ships `UNAOS_VUGPAR=1`, so it is
+live on the bench.
+
+**The mechanism, concretely.** With a full-screen present banding (the windowless
+`occ.is_empty()` path, i.e. exactly the crystal the vugpar bench renders), each
+helper core reads:
+
+* `el0_committed == 0` → `spare_cores()` counts it → co-placement **suspended
+  fleet-wide**, on the claim that a triple "has somewhere to go that costs nobody
+  anything" — while the somewhere is a core P65v2 measured at **99% busy**
+  (`c0=99 c1=68 c2=99 c3=63`, the 99s pure band load);
+* `el0_active == 0` → the floor `eff = 1` in `rewake_place`'s scan, admitted by
+  the spread lane (`el0_committed == 0`) and strictly below any
+  `home_eff ≥ 3` — so the 99%-busy band core *wins* the comparison and a triple
+  member is moved onto it, where at `PRIO_NORMAL` it time-slices against the
+  band stream (and, symmetrically, stretches the flusher's untimed `join`, i.e.
+  the frame).
+
+The `pct` tie-break (`el0_busy_pct`) does see band time — bands run below the
+service band — but a tie-break only orders equal-`eff` candidates; it never
+stops a strict `eff` win.
+
+**The fix — a third half, not a new instrument.** "Spare" gains *kernel-cold*,
+read from a signal that already exists and already means exactly the right
+thing: `el0_busy_pct` is documented (SPREAD-9) as "what fraction of this core's
+time went to work an EL0 arrival would actually wait behind", and on a
+committed-**empty** core every point of it is attributable to kernel tasks below
+the service band — there is no EL0 resident to produce EL0 time. (The one
+imprecision: EL0 time from a resident reaped mid-window lingers ~250 ms while
+committed already reads 0 — erring toward "not spare", the safe direction.) A
+committed-empty, dispatch-fresh core whose below-band busy is at or above
+`SPARE_KBUSY_PCT_MAX` is *kernel-hot*: it is refused by `spare_cores()` and by
+the spread lane's candidate test, the two places SPREAD-13's own arithmetic
+decides. Nothing else moves: the margin/sibling/idle lanes, the `eff` lattice
+and every `spare == 0` behaviour are untouched.
+
+**The bound is derived from the lattice, not tuned.** The spread lane fires at
+margin 0 on the claim that the destination is *free*, so "free" must mean the
+hidden load is below the smallest quantum the doubled-load lattice
+distinguishes — half a runnable resident, the co-residency bonus's own unit. One
+time-slicing `PRIO_NORMAL` peer takes half the core, i.e. 50% of below-band
+time; half a resident is therefore **25%**. At or above that, the core is
+carrying at least the half-resident that separates a genuinely spare core's
+`eff = 1` from a contended one, and the margin-0 claim would be dishonest. The
+failure direction is asymmetric on purpose: a false "kernel-hot" merely keeps
+co-placement live (the pre-SPREAD-13 behaviour, correct on a machine with no
+free core); a false "spare" is the P65v2 state.
+
+**Why a windowed percent and not a band counter.** Per-frame band tasks are
+transient — spawned, run and reaped inside one flush — so any instantaneous "is
+a band here now" flag (a committed-pinned-kernel-task count, say) would flicker
+at frame rate: precisely the flapping SPREAD-13 rejected `el0_active` for. The
+~250 ms low-passed percent moves on the same timescale as the placement clock.
+And the instrument can execute in the state it reports on: the percent is folded
+by the reported core's own dispatch loop, and both callers test freshness
+*first*, so a wedged core's frozen percent is disqualified as stale before it
+could be read as either hot or cold.
+
+**PA3 is not regressed.** The SPREAD-13 measurement had `c0=0% c2=0% c3=0%`
+beside the vug's `c1=99%` — presents run inline on the caller's core (FLUID-3),
+so the idle cores read genuinely cold, `0 < 25`, and stay spare. Splits proceed
+exactly as before on any machine whose free cores are actually free.
+
+**The wire.** One field appended to `[spread10]`, from the same scan that
+computes `spare` (one instrument, both fields): `khot=N` — committed-empty,
+dispatch-fresh cores refused spare status *only* by the kernel-heat test, i.e.
+cores the pre-SPREAD-14 build would have counted spare. Readings:
+
+| reading | meaning |
+|---|---|
+| `vugpar` build, full-screen present running | `khot` ≈ the band helper count with `spare=0` — co-placement correctly live while the "free" cores blit; the pre-SPREAD-14 build read `spare=3` here |
+| no-`vugpar` build | `khot=0` required; nonzero is a sighting of some *other* pinned kernel load saturating an unowned core — worth chasing, not noise |
+| `khot>0` beside `spare>0` | mixed state: some cores blit, at least one is genuinely free — suspension and splits proceed, and the `pct` tie-break orders the spare set so the cold core is preferred |
+
+The QEMU battery's `[spread10]` line gains the field reading `khot=0` (no core
+is dispatch-fresh at that emit, so neither gauge counts anything), which proves
+the wiring exactly as the battery's other zeros do.
 
 ### Fleet headroom at the launch boundary (aarch64, STORM-HEADROOM)
 
