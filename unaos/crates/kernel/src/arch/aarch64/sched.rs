@@ -2026,6 +2026,53 @@ fn spare_scan() -> (usize, usize) {
     (spare, khot)
 }
 
+/// SPREAD-15 — the witness-only detail scan. `spare_scan` above stays byte-for-byte the hot-path
+/// version: it runs inside `make_ready`'s IRQ-masked section and before a spawn's enqueue, and its
+/// contract (no lock, no rq access, one CNTPCT read) is why co-placement can consult it at all.
+/// This variant is called from `spread10_witness` ONLY — the emit path, never a placement decision —
+/// so it can afford to carry the raw inputs out.
+///
+/// It exists because `spare=`/`khot=` are counts with no raw word beside them: from the line you
+/// could not tell WHICH core was refused (so it could not be crossed against `:: SCHED: load ::`),
+/// by how much it missed the bound (26% and 99% printed identically), or how many cores were
+/// excluded by FRESHNESS rather than heat — the scan computes `fold_age_from` and throws the result
+/// away, so a low `spare` was indistinguishable from "the cores were stale". That last one is the
+/// staleness tell this track requires beside a derived value.
+///
+/// Returns `(spare, khot, spare_mask, khot_mask, spare_max_pct, kstale)`.
+fn spare_scan_detail() -> (usize, usize, u32, u32, u32, usize) {
+    let now = now_cyc();
+    let fresh = dispatch_fresh_cyc();
+    let (mut spare, mut khot, mut kstale) = (0usize, 0usize, 0usize);
+    let (mut spare_mask, mut khot_mask, mut spare_max_pct) = (0u32, 0u32, 0u32);
+    for cpu in 0..NUM_CPUS {
+        if !ONLINE_MASK[cpu].load(Ordering::Acquire) || el0_committed(cpu) != 0 {
+            continue;
+        }
+        // Committed-empty but not provably dispatching: excluded BEFORE the heat test runs, so it
+        // is neither spare nor khot and must not be silently folded into either.
+        if ACCT[cpu].fold_age_from(now) >= fresh {
+            kstale += 1;
+            continue;
+        }
+        let pct = ACCT[cpu].el0_busy_pct(CUR_PRIO[cpu].load(Ordering::Relaxed) >= PRIO_SERVICE);
+        if pct >= SPARE_KBUSY_PCT_MAX {
+            khot += 1;
+            khot_mask |= 1 << cpu;
+        } else {
+            spare += 1;
+            spare_mask |= 1 << cpu;
+            // The decisive number for the "does the bound need hysteresis" question: how close the
+            // spare set actually sits to it. Dwell near the bound argues for a band; a bimodal
+            // distribution with nothing near it argues the dither is coming from somewhere else.
+            if pct > spare_max_pct {
+                spare_max_pct = pct;
+            }
+        }
+    }
+    (spare, khot, spare_mask, khot_mask, spare_max_pct, kstale)
+}
+
 /// SPREAD-13 — the predicate itself; see [`spare_scan`] for the full contract.
 #[inline]
 fn spare_cores() -> usize {
@@ -2345,6 +2392,13 @@ fn rewake_place(home: usize, slot: usize) -> usize {
         // equal-`eff` spares by the same signal, so a mildly-warm core (below the bound) still ranks
         // behind a cold one.
         if spread_lane && !margin_lane && !sib_lane && !idle_lane && kernel_busy_hot(cpu) {
+            // SPREAD-15: count it. The stale decline 23 lines above takes a counter for the stated
+            // reason that a decline leaving NO trace is "the structural silence this track sends
+            // arcs back for" — and this refusal, added later, left exactly that silence. `split == 0`
+            // does not cover it: `split` counts spread-lane ADMISSIONS, and a refusal is by
+            // definition not one, so whether this arc's delta has ever fired on metal was
+            // unanswerable from any capture. Same relaxed fetch_add, same rationale.
+            SPREAD14_HOTREF.fetch_add(1, Ordering::Relaxed);
             continue; // committed-empty but burning a resident's worth of kernel work — not spare
         }
         // SPREAD-9: the tie-break percent excludes service-band time, exactly as in `pick_cpu` — a
@@ -2470,6 +2524,12 @@ static SPREAD12_RECRUIT: AtomicU64 = AtomicU64::new(0);
 /// have caught the refusals, and two half-populated fields would have made each lane look quiet for
 /// the other's reason.
 static SPREAD12_STALE: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-15 — times the SPREAD-14 kernel-heat half REFUSED a spread-lane candidate. This arc's
+/// delta had no counter, so `hotref == 0` vs "never reached the conjunction" were indistinguishable
+/// on the wire; the refusal's own precondition was reachable in 9 of 46 PA6 windows and 11 of 112
+/// PA5c windows, and whether it ever fired in any of them could not be read.
+static SPREAD14_HOTREF: AtomicU64 = AtomicU64::new(0);
 
 static SPREAD4_STAY: AtomicU64 = AtomicU64::new(0);
 
@@ -6710,9 +6770,9 @@ fn spread10_witness() {
     }
     // SPREAD-13/14: one scan feeds both fields — the predicate itself (so `split`'s reading is
     // decidable) and the cores the kernel-heat half refused it.
-    let (spare, khot) = spare_scan();
+    let (spare, khot, sparem, khotm, sparepct, kstale) = spare_scan_detail();
     serial_println!(
-        "[spread10] slots 1c={} 2c={} 3c+={} co_moves={} ymoves={} recruit={} rstale={} spare={} khot={} split={} repack={}",
+        "[spread10] slots 1c={} 2c={} 3c+={} co_moves={} ymoves={} recruit={} rstale={} spare={} khot={} hotref={} khotm={:#06x} sparem={:#06x} sparepct={} kstale={} split={} repack={}",
         on1,
         on2,
         on3,
@@ -6722,6 +6782,11 @@ fn spread10_witness() {
         SPREAD12_STALE.load(Ordering::Relaxed),
         spare,
         khot,
+        SPREAD14_HOTREF.load(Ordering::Relaxed),
+        khotm,
+        sparem,
+        sparepct,
+        kstale,
         SPREAD13_SPLIT.load(Ordering::Relaxed),
         SPREAD13_REPACK.load(Ordering::Relaxed),
     );
