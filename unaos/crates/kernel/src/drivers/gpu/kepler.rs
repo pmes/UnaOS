@@ -556,20 +556,151 @@ pub fn init(gpu: &GpuInfo) {
                                         0xBEAC0001, 0xBEAC0002, 0xBEAC0003, 0xBEAC0004,
                                         0xBEAC0005, 0xBEAC0006, 0xBEAC0007, 0xBEAC0008,
                                     ];
-                                    
+
+                                    // The plant below is DESTRUCTIVE over `off + 0..31` in THREE
+                                    // regions. The runlist's eight words have an author in this
+                                    // function (`runlist_words`), so it is rebuilt from the author.
+                                    // USERD and the pushbuffer do not:
+                                    //
+                                    //   * USERD is written exactly once before this point — by the
+                                    //     page-zeroing loop above — so its eight words should be zero,
+                                    //     and the instance block at `inst_off + 0x08/0x0C` was pointed
+                                    //     at it in that state. "Should be" is not "is", which is why
+                                    //     the words are read rather than assumed.
+                                    //     What the hardware expects of these eight words specifically:
+                                    //     envytools `docs/hw/fifo/dma-pusher.rst`, "Channel control
+                                    //     area", enumerates every usable address in the area — DMA_PUT
+                                    //     0x40, DMA_GET 0x44, REF 0x48, DMA_PUT_HIGH 0x4C, 0x50
+                                    //     (GF100+), DMA_CGET 0x54, DMA_MGET 0x58/0x5C, DMA_GET_HIGH
+                                    //     0x60, IB_GET 0x88, IB_PUT 0x8C — and none of them lies below
+                                    //     0x40. The plant's eight words are 0x00..0x1C, so they overlap
+                                    //     no documented field, and this driver's own historic GP_GET/
+                                    //     GP_PUT witness (added 1c9e2570, removed 51b98bab at pull 15,
+                                    //     which is BEFORE the beacons landed at 200be275 / pull 16)
+                                    //     read 0x8C/0x90 — also outside the plant.
+                                    //     That narrows the damage; it does not license leaving it. The
+                                    //     doc lists what a DRIVER may use, not what the CHIP keeps
+                                    //     there, and the same section records that on GF100 the area
+                                    //     moved out of BAR0 into VRAM reached through BAR1 — memory the
+                                    //     chip DMAs its own channel state into. Zero is the state this
+                                    //     driver established for the whole page and zero is what the
+                                    //     capture should read back; nothing here invents a value.
+                                    //   * The pushbuffer is never initialised by this driver at all:
+                                    //     the zeroing loop covers inst/gpfifo/userd/runlist/fence and
+                                    //     omits `pb_off`, and no other write to it exists. Its words
+                                    //     are untouched VRAM handed out by the bump allocator. There
+                                    //     is no correct constant to put back — writing zeros would be
+                                    //     a behaviour change smuggled in under the word "restore".
+                                    //
+                                    // So both are CAPTURED, not authored: read the exact eight words
+                                    // the plant is about to destroy, put those same words back once the
+                                    // probe's consumers are done. The captured array is the single
+                                    // source of truth for the restore, so the plant and the restore
+                                    // cannot drift apart the way the runlist's submit and poll did.
+                                    let save_beacon_window = |off: usize| -> [u32; 8] {
+                                        let mut w = [0u32; 8];
+                                        for (i, s) in w.iter_mut().enumerate() {
+                                            *s = unsafe {
+                                                core::ptr::read_volatile((bar1 + off + i * 4) as *const u32)
+                                            };
+                                        }
+                                        w
+                                    };
+
+                                    // THE one write-point for each restored region. Writes the saved
+                                    // words back and immediately reads them again: `beacon_resid`
+                                    // counts words still holding a beacon value, `mismatch` counts
+                                    // words that are not what was saved. Both zero is the only healthy
+                                    // state; without the read-back a silently-failed restore would look
+                                    // exactly like a good one.
+                                    //
+                                    // ALL EIGHT WORDS, and `words=8` is printed so the claim is
+                                    // checkable. The plant is eight words wide; a restore or a scan
+                                    // narrower than the plant reports CLEAN over residue it never
+                                    // looked at. That is not hypothetical — the runlist restore in
+                                    // a470ba16 rebuilds and scans only its six authored words, so
+                                    // 0xBEAC0007/0xBEAC0008 survive at `runlist_off + 24/28` under a
+                                    // `CLEAN` verdict. Not this lane's to fix; not this lane's to
+                                    // repeat either.
+                                    //
+                                    // `restored=CLEAN` asserts exactly one thing: the eight words the
+                                    // plant destroyed are back to the eight words it destroyed. It says
+                                    // NOTHING about whether those contents are the right contents for
+                                    // the chip — that is a separate question this leg does not answer
+                                    // and must not be read as answering.
+                                    //
+                                    // The read-back is honest about the CPU side: BAR1 is mapped
+                                    // PCD|PWT with the PTE PAT bit clear (`arch::memory::map_mmio_window`),
+                                    // which selects PAT entry 3 — left at the power-on UC; only PA4 is
+                                    // retyped, to WC, and only PTEs that set the PAT bit reach it. UC
+                                    // reads are strongly ordered and are never served from a cache line
+                                    // or a write-combining buffer, so this really does observe a failed
+                                    // write. What it does NOT prove is that the GPU's own fetch path
+                                    // (through its VM, not through BAR1) sees the same bytes — that
+                                    // question is the whole reason the mirror-window probe exists, and
+                                    // this line does not settle it.
+                                    let restore_beacon_window = |label: &str, off: usize, w: &[u32; 8]| {
+                                        unsafe {
+                                            for (i, v) in w.iter().enumerate() {
+                                                core::ptr::write_volatile((bar1 + off + i * 4) as *mut u32, *v);
+                                            }
+                                        }
+                                        let mut resid = 0u32;
+                                        let mut mismatch = 0u32;
+                                        for (i, want) in w.iter().enumerate() {
+                                            let got = unsafe {
+                                                core::ptr::read_volatile((bar1 + off + i * 4) as *const u32)
+                                            };
+                                            if (0xBEAC0001..=0xBEAC0008).contains(&got) {
+                                                resid += 1;
+                                            }
+                                            if got != *want {
+                                                mismatch += 1;
+                                            }
+                                        }
+                                        serial_println!(
+                                            ":: kepler: beacon-restore at={} off={:08X} w=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] words={} beacon_resid={} mismatch={} restored={} ::",
+                                            label, off,
+                                            w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+                                            w.len(), resid, mismatch,
+                                            if resid == 0 && mismatch == 0 { "CLEAN" } else { "CORRUPT" }
+                                        );
+                                    };
+
+                                    let userd_saved = save_beacon_window(userd_off);
+                                    let pb_saved = save_beacon_window(pb_off);
+                                    // Printed before the plant lines below, so the serial order alone
+                                    // proves the capture preceded the destruction. It also witnesses
+                                    // the zeroing loop: `at=userd w=[00000000 x8]` is the expected
+                                    // reading, and anything else is news about BAR1, not about here.
+                                    serial_println!(
+                                        ":: kepler: beacon-save at=userd off={:08X} w=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] ::",
+                                        userd_off, userd_saved[0], userd_saved[1], userd_saved[2], userd_saved[3],
+                                        userd_saved[4], userd_saved[5], userd_saved[6], userd_saved[7]
+                                    );
+                                    serial_println!(
+                                        ":: kepler: beacon-save at=pb off={:08X} w=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] ::",
+                                        pb_off, pb_saved[0], pb_saved[1], pb_saved[2], pb_saved[3],
+                                        pb_saved[4], pb_saved[5], pb_saved[6], pb_saved[7]
+                                    );
+
                                     unsafe {
-                                        // userd
+                                        // userd — DESTRUCTIVE: 8 words over `userd_off + 0..31`, the
+                                        // head of the channel control area the chip owns the moment
+                                        // PFIFO_CHAN[1] goes VALID. Saved above, put back by
+                                        // `restore_beacon_window` immediately before that write.
                                         for (i, val) in pattern.iter().enumerate() {
                                             core::ptr::write_volatile((bar1 + userd_off + i * 4) as *mut u32, *val);
                                         }
                                         serial_println!(":: kepler: beacon planted at=userd off={:08X} ::", userd_off);
-                                        
-                                        // pushbuffer
+
+                                        // pushbuffer — DESTRUCTIVE: 8 words over `pb_off + 0..31`.
+                                        // Saved above, put back at the same site as USERD.
                                         for (i, val) in pattern.iter().enumerate() {
                                             core::ptr::write_volatile((bar1 + pb_off + i * 4) as *mut u32, *val);
                                         }
                                         serial_println!(":: kepler: beacon planted at=pb off={:08X} ::", pb_off);
-                                        
+
                                         // runlist — DESTRUCTIVE: 8 words over `runlist_off + 0..31`
                                         // covers all six words of all three entries written above.
                                         // The pass-1/pass-2 scans below are this plant's consumer;
@@ -939,6 +1070,39 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     let pre_wit_mb1 = fecs_read(bar0, 0x409000 + 0x044);
                                     let pre_wit_cpu = fecs_read(bar0, 0x409000 + 0x100);
                                     serial_println!(":: kepler: hb pre-witness mb1={:08X} cpuctl={:08X} ::", pre_wit_mb1, pre_wit_cpu);
+
+                                    // --- Restore USERD and the pushbuffer, before the channel goes live ---
+                                    //
+                                    // The mirror-window beacon probe planted 0xBEAC0001..8 over
+                                    // `userd_off + 0..31` and `pb_off + 0..31`. Its consumers are the
+                                    // pass-1 window scan and the pass-2 volatility re-read, both of
+                                    // which read BAR0 0x640000 and both of which are long finished:
+                                    // there is no read of 0x640000, and no reference to the beacon
+                                    // range at all, anywhere between the end of pass 2 and this point.
+                                    // So the probe's intent is fully served and the beacons are now
+                                    // only damage — restore, never delete, exactly as a470ba16 argued
+                                    // for the runlist.
+                                    //
+                                    // FIRST REAL USE, and why the restore lands HERE:
+                                    //   * USERD — the next three writes hand PFIFO the instance block,
+                                    //     whose 0x08/0x0C words point at `userd_off`. From the moment
+                                    //     PFIFO_CHAN[1] is written VALID|POLL_ENABLE the chip owns that
+                                    //     page and may write its own state into it. That write is
+                                    //     USERD's first real use; this is the last instruction before it.
+                                    //   * PUSHBUFFER — nothing in this driver reads, writes, or points
+                                    //     at `pb_off` after the plant: the GPFIFO page is zeroed and no
+                                    //     entry is ever written into it, so no fetch of the pushbuffer
+                                    //     can be issued. Its first *possible* use is still gated on the
+                                    //     same channel-validate below, so the same site is the correct
+                                    //     one and no later site is safer.
+                                    //
+                                    // Latest legal point rather than earliest, for the reason a470ba16
+                                    // rebuilt the runlist immediately before the submit: everything
+                                    // between pass 2 and here pulses PGRAPH through a PMC reset and
+                                    // pokes both falcons' IMEM/DMEM ports. A restore placed before that
+                                    // would be witnessed against a state the chip never receives.
+                                    restore_beacon_window("userd", userd_off, &userd_saved);
+                                    restore_beacon_window("pb", pb_off, &pb_saved);
 
                                     // --- Witness Rematch ---
                                     serial_println!(":: kepler: witness-rematch begin (pgraph on) ::");
