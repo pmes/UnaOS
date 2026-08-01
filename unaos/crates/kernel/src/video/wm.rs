@@ -59,7 +59,8 @@
 //! without overflow checks, so wrapping arithmetic is a real failure mode here, not a theoretical
 //! one.
 
-use spin::Mutex;
+use spin::relax::Spin as SpinRelax;
+use spin::{Mutex, MutexGuard};
 
 /// WC-A — the window table is fixed-size and statically allocated: the compositor runs from syscall
 /// context on a non-coherent scan-out path where a heap allocation (or a growable table) would be
@@ -189,6 +190,92 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
     rows: [Window::empty(); MAX_WINDOWS],
     next_z: 1,
 });
+
+/// WEDGE-7 / F1 — **the sole acquisition path for [`TABLE`].** Masks IRQs for exactly the lifetime
+/// of the guard.
+///
+/// ## The defect this closes
+/// `TABLE` was acquired unmasked at 23 sites while `WINDOWS` (`arch::syscall`) is acquired MASKED at
+/// all 8 of its sites, and a masked span reaches `TABLE` through `wm::present`. That asymmetry is a
+/// deadlock on ONE core, with no ABBA cycle anywhere — the documented order `WINDOWS ⊃ TABLE ⊃
+/// WRITER` is honoured throughout, which is why no lock-ordering discipline addresses it:
+///
+/// 1. `render` (pinned, `PRIO_SERVICE`) takes `TABLE` unmasked inside `service_damage`/`composite`.
+/// 2. The timer PPI preempts it mid-hold — `timer_preempt` stores `STATE_READY` and switches out.
+///    `render` is now descheduled **still holding TABLE**, and it is pinned, so no other core can
+///    steal and finish it.
+/// 3. An aged-in EL0 vug on the SAME core wins the next pop and issues `SYS_WIN_PRESENT`, which
+///    masks IRQs, takes `WINDOWS`, and blocks on `TABLE`.
+/// 4. That core can no longer take a timer IRQ, so it never re-enters its scheduler, so `render` is
+///    never re-dispatched, so `TABLE` is never released. Permanent, silent, no panic.
+///
+/// It propagates: the spinner holds `WINDOWS` throughout, so every other vug on every other core
+/// that issues any window verb masks and blocks on `WINDOWS` too — a fleet-wide GUI freeze from one
+/// vug on one core. The foreground case is not even a coincidence: `run` places an EL0 program on
+/// the launching core, which is the shell's core, which is `render`'s core.
+///
+/// ## Why masking is the fix, and why the alternatives were rejected
+/// Masking establishes: *no core is ever preempted while holding `TABLE`*. Every critical section
+/// then runs to completion once entered, so every waiter — masked or not — waits at most one
+/// critical section. This is the WEDGE-4 discipline that fixed `RUN_QUEUES`, transposed to `wm`.
+/// It is affordable because all 23 sections are bounded `MAX_WINDOWS`-row scans with no print, no
+/// allocation, no I/O and no nested blocking lock; the two longest are the composite snapshot
+/// (8 rows + damage clear, with the blit itself OUTSIDE the guard) and the focus-raise scan.
+///
+/// A try-lock with backoff cannot work here: the holder is on the SAME core and cannot run while we
+/// back off, so a masked backoff is the same deadlock with extra steps. Moving the composite off the
+/// masked span is worse than useless — `arch::syscall` documents that the `WINDOWS` hold must span
+/// the composite precisely because a `CLOSE`+`CREATE` pair on other cores can recycle the id in the
+/// gap and land the caller's pixels under a different process's window identity. That is a
+/// protection, so dropping it to fix a deadlock is not on the table.
+///
+/// This ADDS masking; it removes no check, permission, checksum or page attribute. The cost is
+/// worst-case IRQ latency bounded by an 8-row scan — far below the `IrqGuard` spans already present
+/// in every window verb.
+///
+/// ## The invariant, and how to check it without booting
+/// *`wm::TABLE` is never held across a preemption point.* Checkable by grep, because this is the
+/// only acquisition path:
+/// ```text
+/// grep -n "TABLE\s*\.\s*lock" video/wm.rs   -> exactly ONE hit, inside `fn table()`
+/// grep -rn "\bTABLE\b" --include=*.rs src | grep -v video/wm.rs   -> no acquisitions (TABLE is private)
+/// ```
+/// Standing rule for future arcs: **no `TABLE` critical section may call anything that can block,
+/// print, or allocate.** True today; this guard makes it load-bearing.
+struct TableGuard {
+    // DECLARATION ORDER IS THE FIX. Rust drops struct fields in declaration order, so the lock
+    // guard is released FIRST and the IRQ mask is restored SECOND. The reverse would unmask while
+    // still holding TABLE, re-opening a preemption window in the hold's tail — which is precisely
+    // the bug, in miniature, at every unlock.
+    // `spin 0.12`'s guard is `<'a, T, R>` — the 2-generic form this tree requires.
+    inner: MutexGuard<'static, Table, SpinRelax>,
+    _irq: crate::arch::IrqMask,
+}
+
+impl core::ops::Deref for TableGuard {
+    type Target = Table;
+    #[inline]
+    fn deref(&self) -> &Table {
+        &self.inner
+    }
+}
+
+impl core::ops::DerefMut for TableGuard {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Table {
+        &mut self.inner
+    }
+}
+
+/// Acquire [`TABLE`] with IRQs masked. See [`TableGuard`].
+#[inline]
+fn table() -> TableGuard {
+    // Mask BEFORE the acquisition, not after: masking after would leave the spin itself
+    // preemptible, and a holder preempted between our acquire and our mask is the same wedge.
+    let _irq = crate::arch::IrqMask::new();
+    let inner = TABLE.lock();
+    TableGuard { inner, _irq }
+}
 
 /// FOCUS-VIS — **the SHELL's position in the z-order.** The desktop/console is a member of the stack the
 /// TAB ring already cycles through, not a backdrop the stack is painted onto.
@@ -545,7 +632,7 @@ pub(super) fn compat_present(
         id
     };
     {
-        let mut t = TABLE.lock();
+        let mut t = table();
         let r = match row_mut(&mut t, id) {
             // F2 — re-check under the lock: the row could have been closed and recycled between the
             // guard above and here.
@@ -572,7 +659,7 @@ pub(super) fn compat_present(
 
 /// Whether `id` names a live row that is the compat window (F2's identity test).
 fn is_compat_row(id: WinId) -> bool {
-    let t = TABLE.lock();
+    let t = table();
     row(&t, id).map(|r| r.compat).unwrap_or(false)
 }
 
@@ -637,7 +724,7 @@ pub fn present(id: WinId) -> bool {
     // answer and the mark are taken against one table state.
     let skip;
     {
-        let mut t = TABLE.lock();
+        let mut t = table();
         let owner = match row_mut(&mut t, id) {
             Some(r) => {
                 r.damaged = true;
@@ -717,7 +804,7 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
     let info = fb.info();
 
     let vacated = {
-        let mut t = TABLE.lock();
+        let mut t = table();
         match row_mut(&mut t, id) {
             Some(r) => {
                 let before = outer_box(r);
@@ -787,7 +874,7 @@ pub fn close(id: WinId) -> bool {
     // section, so the token has to precede the lock to cover the death that happens ON it.
     crate::wedge2::mark_composite("<D1>", "<d1>");
     let vacated = {
-        let mut t = TABLE.lock();
+        let mut t = table();
         match row_mut(&mut t, id) {
             Some(r) => {
                 let b = outer_box(r);
@@ -835,7 +922,7 @@ pub fn close_owner(owner_asid: u64) -> usize {
     let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut n = 0;
     {
-        let mut t = TABLE.lock();
+        let mut t = table();
         for r in t.rows.iter_mut() {
             if r.used && r.owner_asid == owner_asid {
                 vacated[n] = outer_box(r);
@@ -984,13 +1071,13 @@ fn erase(boxes: &[(usize, usize, usize, usize)]) {
 /// The ASID owning `id`, or `None` if `id` names no live window. The ownership gate WC-B's verbs use:
 /// a task may only present/move/close a window whose owner matches its own ASID.
 pub fn owner_of(id: WinId) -> Option<u64> {
-    let t = TABLE.lock();
+    let t = table();
     row(&t, id).map(|r| r.owner_asid)
 }
 
 /// A snapshot of `id`'s table row, or `None` if it names no live window.
 pub fn info(id: WinId) -> Option<WindowInfo> {
-    let t = TABLE.lock();
+    let t = table();
     row(&t, id).map(|r| WindowInfo {
         id: r.id,
         owner_asid: r.owner_asid,
@@ -1015,7 +1102,7 @@ pub fn info(id: WinId) -> Option<WindowInfo> {
 /// A snapshot, never a handle — the caller re-validates before acting on it. Used by the syscall layer's
 /// tab-cycle to pick the next `EL0_INPUT_ACTIVE`; nothing in this module reads input state.
 pub fn focus_ring(out: &mut [u64; MAX_WINDOWS]) -> usize {
-    let t = TABLE.lock();
+    let t = table();
     let mut n = 0usize;
     let mut ids = [(0u32, 0u64); MAX_WINDOWS];
     let mut m = 0usize;
@@ -1074,7 +1161,7 @@ pub fn hit_test(x: i32, y: i32) -> Option<(WinId, u64, u32)> {
     }
     let (px, py) = (x as usize, y as usize);
     let shell = shell_z();
-    let t = TABLE.lock();
+    let t = table();
     let mut best: Option<(WinId, u64, u32)> = None;
     for r in t.rows.iter() {
         if !r.used || r.compat || r.owner_asid == 0 || !above_shell(r, shell) {
@@ -1171,7 +1258,7 @@ pub fn focus_changed(asid: u64) {
     let prev = FOCUS_ASID.swap(asid, Ordering::Release);
 
     {
-        let mut t = TABLE.lock();
+        let mut t = table();
         if prev != asid && prev != 0 {
             for r in t.rows.iter_mut() {
                 if r.used && !r.compat && r.owner_asid == prev {
@@ -1392,7 +1479,7 @@ pub fn repaint() {
     #[cfg(not(feature = "baremetal"))]
     let focused: u64 = 0;
     {
-        let mut t = TABLE.lock();
+        let mut t = table();
         let repaintable = |r: &Window| r.used && (!r.compat || focused == 0);
         if !t.rows.iter().any(|r| repaintable(r)) {
             return;
@@ -1441,7 +1528,7 @@ pub fn repaint() {
 /// that moves or closes immediately afterwards is repainted by the mover/closer's own composite.
 pub fn occluders(out: &mut [(usize, usize, usize, usize); MAX_WINDOWS]) -> usize {
     let shell = shell_z();
-    let t = TABLE.lock();
+    let t = table();
     let mut n = 0usize;
     for r in t.rows.iter() {
         if !r.used || r.compat || !above_shell(r, shell) {
@@ -1484,7 +1571,7 @@ pub fn occluders(out: &mut [(usize, usize, usize, usize); MAX_WINDOWS]) -> usize
 /// idle path is one atomic read ahead of a lock acquisition that was already happening.
 pub fn service_damage() {
     if DEFER_N.load(core::sync::atomic::Ordering::Relaxed) == 0 {
-        let t = TABLE.lock();
+        let t = table();
         if !t.rows.iter().any(|r| r.used && r.damaged) {
             return;
         }
@@ -1513,7 +1600,7 @@ pub fn damage_intersecting(x: usize, y: usize, w: usize, h: usize) -> usize {
         return 0;
     }
     let rect = (x, y, w, h);
-    let mut t = TABLE.lock();
+    let mut t = table();
     let mut n = 0usize;
     for i in 0..MAX_WINDOWS {
         if !t.rows[i].used || t.rows[i].damaged {
@@ -1529,7 +1616,7 @@ pub fn damage_intersecting(x: usize, y: usize, w: usize, h: usize) -> usize {
 
 /// Number of live windows.
 pub fn count() -> usize {
-    let t = TABLE.lock();
+    let t = table();
     t.rows.iter().filter(|r| r.used).count()
 }
 
@@ -1753,7 +1840,7 @@ fn composite_inner() -> CursorTail {
         let mut npaint = 0usize;
         #[allow(unused_mut)]
         let mut hit = {
-            let t = TABLE.lock();
+            let t = table();
             for r in t.rows.iter() {
                 if r.used && above_shell(r, shell) && boxes_overlap(sbox, outer_box(r)) {
                     paint[npaint] = outer_box(r);
@@ -1955,7 +2042,7 @@ fn composite_inner() -> CursorTail {
     // `close_owner` that clears rows can then tell whether some other core snapshotted those rows
     // before the clear and is still blitting from their (about to be unmapped) surfaces.
     let (rows, mut dirty, _blit) = {
-        let mut t = TABLE.lock();
+        let mut t = table();
         // F4 — the barrier, observed in the SAME critical section as the registration below. A
         // teardown raises it after clearing its rows, so seeing it up means there is nothing of that
         // ASID's left to draw and the teardown will recomposite when it finishes: skipping is both
@@ -3949,7 +4036,7 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     // dropping it would silently delete the last few frames of every window that ever exits.
     let mut ident = [(0u64, false, false); MAX_WINDOWS]; // (owner asid, live, above shell)
     {
-        let t = TABLE.lock();
+        let t = table();
         let shell = SHELL_Z.load(core::sync::atomic::Ordering::Acquire);
         for r in t.rows.iter() {
             if !r.used || r.id == WIN_NONE || r.id as usize > MAX_WINDOWS {
@@ -4215,7 +4302,7 @@ pub fn close_box_hit(id: WinId, x: i32, y: i32) -> bool {
         return false;
     }
     let (px, py) = (x as usize, y as usize);
-    let t = TABLE.lock();
+    let t = table();
     match row(&t, id).and_then(close_box) {
         Some((cx, cy, s)) => px >= cx && px < cx + s && py >= cy && py < cy + s,
         None => false,
@@ -5949,7 +6036,7 @@ fn retile_selftest() {
 /// The outer (chrome-inclusive) panel box of `id`, or `None` if `id` names no live window.
 #[cfg(feature = "witness")]
 fn info_box(id: WinId) -> Option<(usize, usize, usize, usize)> {
-    let t = TABLE.lock();
+    let t = table();
     row(&t, id).map(outer_box)
 }
 
@@ -6009,7 +6096,7 @@ fn create_inner(
             scale,
         ))
     });
-    let mut t = TABLE.lock();
+    let mut t = table();
     let slot = match t.rows.iter().position(|r| !r.used) {
         Some(s) => s,
         None => return WIN_NONE,
@@ -6169,7 +6256,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         .saturating_sub(crate::ui_status::chrome_h(ph))
         .max(1);
 
-    let mut t = TABLE.lock();
+    let mut t = table();
     let mut cx = GAP;
     let mut cy = GAP + TITLE_H + BORDER;
     let mut row_h = 0usize;

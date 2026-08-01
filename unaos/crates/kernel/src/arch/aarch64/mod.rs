@@ -310,6 +310,44 @@ pub fn hw_wait_budget() -> u64 {
     HW_WAIT_BUDGET
 }
 
+/// WEDGE-7 — the RAII form of [`without_interrupts`], for spans that cannot be expressed as a
+/// closure. `without_interrupts` is fine when the masked region is a block; it is not usable when
+/// the mask must live exactly as long as a lock guard whose scope the caller controls (see
+/// `video::wm::table`). Same save/restore semantics, same nesting correctness: an inner guard
+/// restores to "still masked" rather than unconditionally unmasking.
+///
+/// Public and arch-neutral by re-export (`crate::arch::IrqMask`), because the code that needs it
+/// (`video/wm.rs`) compiles on both arches. The x86_64 twin lives in that arch's `mod.rs`.
+pub struct IrqMask(u64);
+
+impl IrqMask {
+    #[inline]
+    pub fn new() -> Self {
+        let daif: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack, preserves_flags));
+            core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
+        }
+        IrqMask(daif)
+    }
+}
+
+impl Default for IrqMask {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for IrqMask {
+    #[inline]
+    fn drop(&mut self) {
+        unsafe {
+            core::arch::asm!("msr daif, {}", in(reg) self.0, options(nomem, nostack, preserves_flags))
+        };
+    }
+}
+
 pub fn without_interrupts<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,

@@ -118,6 +118,38 @@ pub fn hw_wait_budget() -> u64 {
     }
 }
 
+/// WEDGE-7 — the RAII form of [`without_interrupts`], for spans that cannot be expressed as a
+/// closure. Twin of the aarch64 `IrqMask`; same save/restore semantics, so an inner guard restores
+/// to "still masked" rather than unconditionally re-enabling. Needed because `video/wm.rs` compiles
+/// on both arches and must hold the mask exactly as long as a lock guard whose scope the caller
+/// owns (see `video::wm::table`).
+pub struct IrqMask(bool);
+
+impl IrqMask {
+    #[inline]
+    pub fn new() -> Self {
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable();
+        IrqMask(was_enabled)
+    }
+}
+
+impl Default for IrqMask {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for IrqMask {
+    #[inline]
+    fn drop(&mut self) {
+        if self.0 {
+            x86_64::instructions::interrupts::enable();
+        }
+    }
+}
+
 pub fn without_interrupts<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
