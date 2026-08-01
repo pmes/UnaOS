@@ -3223,7 +3223,8 @@ metal-attended, read at the next bench boot with `UNAOS_V3D_DEEP=1`.
 > wrapping arithmetic by hand, and the P83-class artifact ("stalled at offset 0x2d000" on a
 > 106-byte list) can no longer print as a verdict. In the same change, the shared `v3d75_kick_probe`
 > — the kick every deep leg after V3D-74 rides (`[v3d75a]`/`[v3d75b]`, `[v3d77a]`/`[v3d77b]`,
-> `[v3d80 post-handover]`, `[v3d81q]` — six callers) — now **emits** the `[v3d73]` witness it was already arming (wait → emit →
+> `[v3d80 post-handover]`, `[v3d81q]`, and `[v3d81d post-handover]` when that leg is armed — every
+> caller of the shared probe) — now **emits** the `[v3d73]` witness it was already arming (wait → emit →
 > read-span, the `[v3d74a]` idiom), so the sampler rides every CT0-kicking deep leg and the fetch
 > verdict on those legs is measured, not extrapolated from the three originally-armed rungs.
 

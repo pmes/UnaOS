@@ -4259,9 +4259,17 @@ unmeasured. A counter costs no print, so it can measure it.
 
 * `STRADDLE` — spin evidence with zero completed drains in this window: the drain that produced it
   was counted in a neighbouring window's `drains` (it straddled the rollup boundary). Read beside
-  those neighbours. (A window with no evidence at all does not print — there is no `NONE` verdict;
-  silence here is the *absence of teardown activity*, and per the reachability rule it is evidence
-  only because the emit path is timer-driven and lock-free, not present-gated.)
+  those neighbours. A straddle whose `spin_max` clears `note` prints `DWELL` — severity wins the
+  precedence. (A window with no evidence at all does not print — there is no `NONE` verdict.)
+
+  **What this line's silence is worth — the honest boundary (s1u lens must-fix).** The dwell emit
+  rides `wcn_emit`, whose drivers are `present()` and the fixture/pointer forced rollups, and
+  `wcn_emit` holds the `TABLE` lock before the emit — the WEDGE-1r2 change bypassed only the
+  dirty-paced guard, not the cadence or the lock. So in a scene where nothing presents, or where a
+  core dies holding `TABLE`, this line CANNOT print, and per the reachability rule its silence there
+  is evidence of nothing. The instruments for those regimes are the `<D…>` tokens (raw-UART,
+  chain-gated, emitted before the locks) and the tripwire itself. Bank dwell-line silence as
+  "no teardown activity" only on a wire that shows presents continuing (`[wc-c]`/`[pstrip]` alive).
 * `QUIET` — drains ran and none spun past `note`. The only verdict here that is a statement about the
   barrier rather than about the scene.
 * `DWELL` — a drain spun far enough to be a stalled core, four orders of magnitude under the

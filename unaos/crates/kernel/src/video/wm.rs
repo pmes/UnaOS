@@ -3746,7 +3746,11 @@ static F2W_DRAIN_MASKED: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 /// barrier is exonerated" — is exactly the reading this line exists to make impossible to repeat, so
 /// the verdict names the SCENE and never the outcome:
 ///
-/// * `NONE`     — no drain at all in this window. Nothing was measured; nothing may be concluded.
+/// * `STRADDLE` — spin evidence with zero completed drains in this window: the drain that produced
+///                it was counted in a neighbouring window's `drains` (it straddled the rollup
+///                boundary). Read beside those neighbours. (A straddle whose `spin_max` clears the
+///                note prints `DWELL`, not `STRADDLE` — the precedence is severity-first.) A window
+///                with no evidence at all does not print; there is no `NONE` verdict.
 /// * `QUIET`    — drains ran, and none spun past [`DRAIN_DWELL_NOTE`]. The healthy steady state, and
 ///                the only verdict here that is a statement about the barrier rather than about the
 ///                scene.

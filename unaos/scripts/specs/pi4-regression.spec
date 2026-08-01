@@ -350,6 +350,11 @@ FORBID \[wc-fv\] focus-vis .*-> FAIL
 # ---    instrument still exist and publish", and that is what the pattern below asserts.
 REQUIRE \[wedge1\] dwell drains=.*spin_max=.*->
 
+# --- STORM-HEADROOM (s1u lens nit): the boot-baseline census is the proof the storm instrument
+# ---    still exists and publishes — the same existence-pin rationale as the dwell REQUIRE above.
+# ---    Without it, the load_accounting_witness call could vanish with the gate green.
+REQUIRE \[storm\] boot-baseline \| busy
+
 # --- BGRUN-1: background EL0 runs (bg/jobs/kill). Headless-observable core of the contract,
 # ---   REQUIREd per the round-1 lens: leg 1 proves spawn->exit->reap (the sole-reaper contract);
 # ---   leg 2 proves a killed bg row settles (confirmed-kill reaps in place; no leaked PRUNNING row
