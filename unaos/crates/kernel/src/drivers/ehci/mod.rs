@@ -74,7 +74,12 @@ const PORT_RW1C: u32 = (1 << 1) | (1 << 3) | (1 << 5);
 /// USBSTS RW1C status bits acked during polling (USBINT/ERR/port-change/rollover/host-error/
 /// async-advance). Ack-only — USBINTR is never written (polling model).
 const STS_RW1C: u32 = 0x3F;
-/// USBSTS Async Schedule Status (read-only; tracks USBCMD.ASE with a lag).
+/// USBSTS **Periodic** Schedule Status, EHCI 1.0 §2.3.2 bit 14 (read-only; tracks USBCMD.PSE
+/// with a lag). The name is right and always was; this comment used to read "Async Schedule
+/// Status", which is bit 15. Worth correcting rather than tolerating: the M3 trim in c90599f1
+/// turns on reasoning about precisely this bit — it skips the PSS-disable wait on the HSE path —
+/// and a reader checking that argument against a comment naming the wrong schedule would
+/// conclude the trim was unsound.
 const STS_PSS: u32 = 1 << 14;
 const STS_HCHALTED: u32 = 1 << 12;
 const STS_HSE: u32 = 1 << 4; // Host System Error (DMA master/target abort) — halts the HC
