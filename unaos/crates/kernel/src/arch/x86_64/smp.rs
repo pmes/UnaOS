@@ -15,7 +15,7 @@
 // each AP loads its own per-CPU GDT/TSS (gdt::init_cpu), the shared IDT, and its own local APIC,
 // then idles — the BSP keeps driving xHCI/console/storage.
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -79,26 +79,43 @@ pub fn online_aps() -> Vec<usize> {
 //
 // BEFORE the handoff publishes a split — and on every build that never takes it (`rast`, `usbdebug`,
 // a single-AP box, the pre-GUI `witness` fixture block) — both helpers degrade to indexing
-// `online_aps()` directly, i.e. byte-identical behaviour to the pre-WITCORE call sites.
+// `online_aps()` directly. That reproduces the pre-WITCORE placement at twelve of the thirteen
+// converted sites. It is NOT true at the thirteenth: `irqstorage::selftest_once` deliberately lost
+// its `.get(1).or_else(|| .first())` fallback, because the two takers that fallback co-located are
+// both preemptible holders of `XHCI_CONTROLLER`. On a 1-AP `usbdebug`/`rast`/no-split build
+// `bx-blockreq` therefore no longer runs; it prints a SKIP line and `selftest_verdict()` reads 0.
+// That is a real behaviour change, chosen over a real deadlock, and it is called out here rather
+// than hidden behind "byte-identical".
 
 /// Sentinel: no SCHED-X86 split has been published yet.
-const NO_CPU: usize = usize::MAX;
+const NO_SPLIT: u64 = u64::MAX;
 
-/// The core `x86_render_service` is pinned to, published by the SCHED-X86 handoff.
-static RENDER_CPU: AtomicUsize = AtomicUsize::new(NO_CPU);
-/// The core `x86_usb_pump` + `x86_input_service` are pinned to, published by the SCHED-X86 handoff.
-static SERVICE_CPU: AtomicUsize = AtomicUsize::new(NO_CPU);
+/// The published SCHED-X86 split, as ONE word: `(render << 32) | service`.
+///
+/// One word deliberately. Two `AtomicUsize`s written with two `Release` stores are read with two
+/// `Acquire` loads, and a reader landing between them sees `(Some(render), None)` — which
+/// `worker_pool` classifies as `Unpublished`, which hands out `online_aps()[0]`, which IS the render
+/// core. That is the exact defect this module removes, resurrected on some boots only. Today the
+/// publisher runs before any reader can exist, so the window is unreachable — but that is a property
+/// of statement order in `kernel_main`, not of the data, and the next arc to move a spawn earlier
+/// would not be told. A single word makes the pair unobservably-partial by type.
+static SPLIT: AtomicU64 = AtomicU64::new(NO_SPLIT);
+
+/// The published split as a pair, or `None` before `publish_sched_split`. ONE load — every caller
+/// that needs both halves goes through this rather than two independent reads.
+fn split() -> Option<(usize, usize)> {
+    let v = SPLIT.load(Ordering::Acquire);
+    (v != NO_SPLIT).then(|| ((v >> 32) as usize, (v & 0xffff_ffff) as usize))
+}
 
 /// The render service's core, once the SCHED-X86 handoff has published it.
 pub fn render_cpu() -> Option<usize> {
-    let v = RENDER_CPU.load(Ordering::Acquire);
-    (v != NO_CPU).then_some(v)
+    split().map(|(r, _)| r)
 }
 
 /// The device-service core (`x86_usb_pump` / `x86_input_service`), once published.
 pub fn service_cpu() -> Option<usize> {
-    let v = SERVICE_CPU.load(Ordering::Acquire);
-    (v != NO_CPU).then_some(v)
+    split().map(|(_, s)| s)
 }
 
 /// How much room the worker pool actually had — reported in the placement witness so the log says
@@ -186,27 +203,23 @@ impl core::fmt::Display for CpuOpt {
 /// Called ONCE by the handoff in `kernel_main`, BEFORE the three service tasks are spawned, so every
 /// later `worker_cpu` / `xhci_worker_cpu` question is answered against the real map.
 ///
-/// The witness is the point. A placement invariant with no boot line is not verifiable on metal, and
-/// metal is the only verdict for this arc. The line prints the map AND the two verdicts, so the
-/// falsifying case is readable directly rather than reconstructed by cross-referencing each task's
-/// own dispatch line:
+/// This line carries the MAP and nothing else. It deliberately carries no PASS/FAIL.
 ///
-///   `render-clear` — no core this module will hand out equals the render core. Holds BY
-///                    CONSTRUCTION; it is printed so that a future edit that breaks the construction
-///                    is caught by reading one line instead of by a hung panel.
-///   `xhci-clear`   — the xHCI-taking pool is disjoint from BOTH render and service. `DECLINED` is a
-///                    legitimate (not failing) outcome on a 2-AP box: the storage service does not
-///                    start, rather than starting into a deadlock.
+/// The first version of it printed `render-clear` and `xhci-clear`, and both were tautologies:
+/// `render-clear` re-applied the very filter that had just built the pool (and `render != service`
+/// is guaranteed by the match guard in `kernel_main` that is the only path here), and `xhci-clear`'s
+/// FAIL arm was unreachable code. They printed PASS on every boot that printed the line at all —
+/// including captures where `bx-blockreq` had been handed no core. A verdict that cannot fail is
+/// worse than no verdict: it reads as evidence and is not. The real verdict is
+/// [`confirm_render_core`], which fires later, from the render task itself, against what the
+/// SCHEDULER reports rather than against the arguments this function was handed.
 ///
 /// Reading the line: `worker[0..2]` are the cores the ring-3 fixture ladder will take (U2/U4x/U5x/
 /// U6x/U6bx/U7x/U6gx and their launchers/verdict tasks); `xhci[0]` is `irqstorage`'s `storage-svc`
-/// and `xhci[1]` is its `bx-blockreq` self-test. Cross-check against each task's own dispatch line
-/// (`:: SCHED-X86: render task dispatched on core N ::`, `:: STOR-1: storage service task live on
-/// cpu N ::`, `:: U1a: ring-3 demo — user task on core N ::`) — the map predicts them, so a
-/// disagreement falsifies this module rather than being absorbed by it.
+/// and `xhci[1]` is its `bx-blockreq` self-test. A `-` means that consumer got NO core and will skip
+/// — the short-pool signal, printed rather than rounded up to PASS.
 pub fn publish_sched_split(render: usize, service: usize) {
-    RENDER_CPU.store(render, Ordering::Release);
-    SERVICE_CPU.store(service, Ordering::Release);
+    SPLIT.store(((render as u64) << 32) | (service as u64 & 0xffff_ffff), Ordering::Release);
 
     let (pool, tier) = worker_pool();
     let w = [
@@ -216,19 +229,8 @@ pub fn publish_sched_split(render: usize, service: usize) {
     ];
     let x = [CpuOpt(xhci_worker_cpu(0)), CpuOpt(xhci_worker_cpu(1))];
 
-    // render-clear: recomputed from the pool rather than asserted from the tier, so the check is
-    // independent of the classification that produced it.
-    let render_clear = render != service && !pool.iter().any(|&c| c == render);
-    let xhci_clear = match (xhci_worker_cpu(0), xhci_worker_cpu(1)) {
-        (None, _) => "DECLINED",
-        (Some(a), b) if a != render && a != service && b != Some(render) && b != Some(service) => {
-            "PASS"
-        }
-        _ => "FAIL",
-    };
-
     serial_println!(
-        ":: SCHED-X86 PLACE: aps={} render=c{} svc=c{} worker=[{},{},{}] xhci=[{},{}] tier={} render-clear={} xhci-clear={} ::",
+        ":: SCHED-X86 PLACE: aps={} render=c{} svc=c{} worker=[{},{},{}] xhci=[{},{}] tier={} pool={} ::",
         online_aps().len(),
         render,
         service,
@@ -238,8 +240,58 @@ pub fn publish_sched_split(render: usize, service: usize) {
         x[0],
         x[1],
         tier.name(),
-        if render_clear { "PASS" } else { "FAIL" },
-        xhci_clear,
+        pool.len(),
+    );
+}
+
+/// The placement VERDICT — called by `x86_render_service` itself, on the core the scheduler actually
+/// dispatched it to, right after its own dispatch witness.
+///
+/// This is the check [`publish_sched_split`] could not honestly make. It compares THREE values with
+/// three independent producers, none of which is the argument the publisher was handed:
+///
+///   1. `actual` — `percpu::this_cpu().cpu_index`, i.e. the core the hardware says this code is
+///      executing on, read here rather than accepted from a caller. Produced by GS/per-CPU setup.
+///   2. `arg` — the core the SPAWN SITE asked for, carried through the task's argument. Produced by
+///      `kernel_main`.
+///   3. the split read BACK out of `SPLIT`, and the pool `worker_cpu`/`xhci_worker_cpu` will hand
+///      out, re-derived now. Produced by this module.
+///
+/// It can therefore fail for real: a `spawn` that ignored its pin, a steal that moved a task marked
+/// pinned, a second publisher, a torn `SPLIT`, or a pool that contains the core the renderer
+/// actually landed on would each show up. Verdicts:
+///
+///   `PASS`    — all three agree, and no core this module hands out equals the running renderer's.
+///   `PARTIAL` — the above holds, but some consumer class got no core (`xhci=[-,…]` on the PLACE
+///               line): the rule is intact, coverage is not. Its own word, because rounding this up
+///               to PASS is exactly what made the first version of this witness useless.
+///   `FAIL`    — a placement collides with the running renderer, or the core it is running on is not
+///               the one that was published/requested.
+pub fn confirm_render_core(arg: usize) {
+    let actual = percpu::this_cpu().cpu_index as usize;
+    let published = split().map(|(r, _)| r);
+    let (pool, tier) = worker_pool();
+    let collide = pool.iter().filter(|&&c| c == actual).count();
+    let agree = published == Some(actual) && arg == actual;
+    let short = xhci_worker_cpu(0).is_none() || xhci_worker_cpu(1).is_none();
+
+    let verdict = if !agree || collide > 0 {
+        "FAIL"
+    } else if short {
+        "PARTIAL"
+    } else {
+        "PASS"
+    };
+
+    serial_println!(
+        ":: SCHED-X86 PLACE-CHECK: actual=c{} arg=c{} published={} pool={} collide={} tier={} verdict={} ::",
+        actual,
+        arg,
+        CpuOpt(published),
+        pool.len(),
+        collide,
+        tier.name(),
+        verdict,
     );
 }
 

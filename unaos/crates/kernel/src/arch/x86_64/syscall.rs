@@ -11098,7 +11098,12 @@ fn u7x_run(demo_cpu: usize) {
     // short — because these three cores must be genuinely distinct; a fallback to a shared core
     // would deadlock the GO/SIG sequencing, which is worse than the clean skip below.
     let Some(parent_cpu) = crate::arch::smp::worker_cpu(2) else {
-        serial_println!(":: U7x: fewer than 3 application processors — transfer demo skipped ::");
+        // WITCORE: name the REAL condition. "fewer than 3 APs" was true before SCHED-X86 reserved
+        // one AP for the renderer; printing it three lines under `SCHED-X86 PLACE: aps=3` is a lie.
+        serial_println!(
+            ":: U7x: fewer than 3 cores free of the render core (aps={}) — transfer demo skipped ::",
+            crate::arch::smp::online_aps().len()
+        );
         return;
     };
 
@@ -13674,7 +13679,11 @@ fn sock4_launcher(demo_cpu: usize) {
     // (cooperative ring 3 hogs its core while polling, so sharing either would deadlock the sequencing).
     // WITCORE: the THIRD non-render core (see `u7x_run`) — strict, so a short pool skips cleanly.
     let Some(grantor_cpu) = crate::arch::smp::worker_cpu(2) else {
-        serial_println!(":: SOCK-4: fewer than 3 application processors — transferable-socket demo skipped ::");
+        // WITCORE: the real condition — the pool excludes the render core (see `u7x_run`).
+        serial_println!(
+            ":: SOCK-4: fewer than 3 cores free of the render core (aps={}) — transferable-socket demo skipped ::",
+            crate::arch::smp::online_aps().len()
+        );
         return;
     };
     // Plant the grantee's Proc entry FIRST (nothing else claimed if the table is full).
@@ -16585,7 +16594,11 @@ fn u6gx_launcher(_demo_cpu: usize) {
     // WITCORE: both from the non-render pool (see `u7x_run`) — strict, so a short pool skips cleanly.
     let (Some(cpu_a), Some(cpu_b)) = (crate::arch::smp::worker_cpu(0), crate::arch::smp::worker_cpu(2))
     else {
-        serial_println!(":: U6gx: fewer than 3 application processors — owner/grants demo skipped ::");
+        // WITCORE: the real condition — the pool excludes the render core (see `u7x_run`).
+        serial_println!(
+            ":: U6gx: fewer than 3 cores free of the render core (aps={}) — owner/grants demo skipped ::",
+            crate::arch::smp::online_aps().len()
+        );
         return;
     };
     // B's Proc entry FIRST (A's Child handle -> B resolves pid->slot in SYS_FGRANT); nothing else claimed on fail.

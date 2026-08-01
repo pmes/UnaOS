@@ -3863,6 +3863,13 @@ fn x86_render_service(cpu: usize) {
         ":: SCHED-X86: render task dispatched on core {} — panel owned by the scheduler ::",
         cpu
     );
+    // WITCORE: the placement VERDICT, and the reason it lives here rather than at the publish site.
+    // `cpu` above is what the spawn site ASKED for; this call additionally reads the core the
+    // hardware says it is running on and the split read back out of `smp::SPLIT`, and cross-checks
+    // both against the pool `worker_cpu`/`xhci_worker_cpu` will hand out. Three producers, so the
+    // PASS/FAIL can actually fail — unlike a check made at publish time against the publisher's own
+    // arguments, which is a tautology dressed as evidence.
+    unaos_kernel::arch::smp::confirm_render_core(cpu);
 
     // CURSOR-HIDE: whether the last pass drew the cursor, so the auto-hide transition erases the
     // sprite exactly once. Driven by the input service's `Event::Timer` pulse when nothing is typed.

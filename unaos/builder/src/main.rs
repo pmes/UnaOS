@@ -607,7 +607,14 @@ fn main() {
     // processors to discover (ACPI MADT) and boot (INIT-SIPI-SIPI). Override the core
     // count with UNAOS_SMP (e.g. `UNAOS_SMP=1` to force uniprocessor). The BSP still
     // drives xHCI/console/storage; APs idle until the scheduler work lands.
-    let smp = std::env::var("UNAOS_SMP").unwrap_or_else(|_| "4".into());
+    // WITCORE: 6, not 4. SCHED-X86 spends two APs (render takes the pool's head, the device service
+    // its tail), so with `-smp 4` = 3 APs the non-render pool is exactly ONE core and every fixture
+    // that needs three distinct non-render cores stops running: u7x, u6gx, sock4, and irqstorage's
+    // bx-blockreq. u6gx is the only automated exercise of the STOR-1 S5 mitigation (owner A
+    // busy-spinning on the storage-service core) — i.e. precisely the interaction the placement rule
+    // exists to protect. 6 restores index-2 consumers to a 3-core pool. Metal is this track's
+    // verdict; this line is here so the change does not silently delete fixture coverage.
+    let smp = std::env::var("UNAOS_SMP").unwrap_or_else(|_| "6".into());
     cmd.arg("-smp").arg(smp);
 
     // Network: Intel e1000 (82540EM). slirp (default) brings the link up but the host
