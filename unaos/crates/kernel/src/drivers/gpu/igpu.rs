@@ -197,6 +197,381 @@ unsafe fn read_gmux_trace() -> [u32; 7] {
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn read_gmux_trace() -> [u32; 7] { [0; 7] }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// GMUX-IGD — point the display mux at the integrated GPU, prove the write landed, get back.
+//
+// EVERYTHING BELOW THIS LINE IS COMPILED ONLY WHEN `gmux_igd` IS ON.
+//
+// That split is deliberate. `read_gmux_trace()` above is left exactly as baseline has it —
+// inline closures, a hard iteration cap, no `arch::ms()` anywhere — so the knob-off build is
+// behaviourally identical to trunk. An earlier attempt replaced those closures with
+// `arch::ms()`-deadline helpers gated on `target_arch` only, so EVERY `unaos_ivb` build (armed
+// or not) picked up a wait whose bound depends on the BSP timer ISR still running. The old
+// bound could not hang; that one could. The armed helpers here carry BOTH an unconditional
+// iteration cap AND an `ms()` deadline, so even on the armed build a stopped clock cannot hang
+// them — whichever bound trips first ends the wait.
+//
+// The panel WILL go black between the switch and the revert. That is the EXPECTED result, not
+// the experiment failing: the census in this same function reads every pipe, every plane and
+// `DPLL_A` as zero, so nothing on the integrated side is driving the panel. The deliverable is
+// the READ-BACK proving the mux write landed.
+//
+// See docs/dev/GEMINI/video/iGUI/PROPOSAL-igpu-gmux-igd.md and RUNBOOK-gmux-igd.md.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+// Port map and register/value encodings, from Linux `drivers/platform/x86/apple-gmux.c` (the
+// classic port-I/O backend, which is the one this 2012 Retina MacBookPro uses):
+//   GMUX_PORT_VALUE 0x7C2 · GMUX_PORT_READ 0x7D0 · GMUX_PORT_WRITE 0x7D4
+//   GMUX_PORT_SWITCH_DISPLAY 0x10 · GMUX_PORT_SWITCH_DDC 0x28 · GMUX_PORT_SWITCH_EXTERNAL 0x40
+//   GMUX_SWITCH_DDC_IGD 0x1 / _DIS 0x2 · GMUX_SWITCH_DISPLAY_IGD 0x2 / _DIS 0x3
+//   (EXTERNAL shares the DISPLAY encoding).
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_PORT_VALUE: u16 = 0x7C2;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_PORT_READ: u16 = 0x7D0;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_PORT_WRITE: u16 = 0x7D4;
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_SWITCH_DISPLAY: u8 = 0x10;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_SWITCH_DDC: u8 = 0x28;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_SWITCH_EXTERNAL: u8 = 0x40;
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_DDC_IGD: u8 = 0x01;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_DISPLAY_IGD: u8 = 0x02;
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_EXTERNAL_IGD: u8 = 0x02;
+
+/// Baseline's iteration bound, kept UNCONDITIONALLY alongside the ms deadline.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_WAIT_ITERS: u32 = 200;
+/// Wall-clock bound on one handshake wait. Only meaningful while the BSP timer ISR runs.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_WAIT_MS: u64 = 20;
+/// How long the mux stays on IGD before the revert fires.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_DWELL_MS: u64 = 10_000;
+/// Backstop bound on the dwell for the case where `arch::ms()` has stopped advancing. Its
+/// wall-clock length is NOT known a priori — that is exactly why the dwell reports `iters=`
+/// and which bound ended it, so one metal boot makes the relationship measurable instead of
+/// assumed.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const GMUX_DWELL_ITER_CAP: u64 = 2_000_000;
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+unsafe fn gmux_outb(port: u16, val: u8) {
+    unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags)); }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+unsafe fn gmux_inb(port: u16) -> u8 {
+    let mut val: u8;
+    unsafe { core::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack, preserves_flags)); }
+    val
+}
+
+/// Wait for the gmux to be ready to accept an index byte. Bounded twice over: an iteration
+/// count that cannot depend on any clock, and an `ms()` deadline. Returns false on timeout —
+/// and no caller here swallows a timeout silently.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+unsafe fn gmux_wait_ready() -> bool {
+    let start = crate::arch::ms();
+    let mut iters = GMUX_WAIT_ITERS;
+    loop {
+        if (unsafe { gmux_inb(GMUX_PORT_WRITE) } & 0x01) == 0 {
+            return true;
+        }
+        // apple-gmux.c drains the stale reply byte here before retrying.
+        let _ = unsafe { gmux_inb(GMUX_PORT_READ) };
+        if iters == 0 || crate::arch::ms().wrapping_sub(start) > GMUX_WAIT_MS {
+            return false;
+        }
+        iters -= 1;
+        for _ in 0..1000 { core::hint::spin_loop(); }
+    }
+}
+
+/// Wait for the gmux to signal that the transaction completed, then consume the reply byte.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+unsafe fn gmux_wait_complete() -> bool {
+    let start = crate::arch::ms();
+    let mut iters = GMUX_WAIT_ITERS;
+    loop {
+        if (unsafe { gmux_inb(GMUX_PORT_WRITE) } & 0x01) != 0 {
+            let _ = unsafe { gmux_inb(GMUX_PORT_READ) };
+            return true;
+        }
+        if iters == 0 || crate::arch::ms().wrapping_sub(start) > GMUX_WAIT_MS {
+            return false;
+        }
+        iters -= 1;
+        for _ in 0..1000 { core::hint::spin_loop(); }
+    }
+}
+
+/// Read one gmux register. Returns `0xFFFFFFFF` on timeout — a value no 8-bit register can
+/// produce, which is what makes the refuse-to-arm sentinel unambiguous.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+unsafe fn gmux_index_read(reg: u8) -> u32 {
+    if !unsafe { gmux_wait_ready() } { return 0xFFFFFFFF; }
+    unsafe { gmux_outb(GMUX_PORT_READ, reg) };
+    if !unsafe { gmux_wait_complete() } { return 0xFFFFFFFF; }
+    (unsafe { gmux_inb(GMUX_PORT_VALUE) }) as u32
+}
+
+/// Write one gmux register. Upstream order, reproduced exactly: **value byte first, then
+/// `gmux_index_wait_ready()`, then the index byte**, then wait for completion.
+///
+/// The wait BETWEEN the value write and the index write is upstream's — see
+/// `gmux_index_write8()` in `drivers/platform/x86/apple-gmux.c`. Two separate reviews asked
+/// for it to be removed on the theory that it belongs only before the value byte; both were
+/// wrong and the instruction is retracted. Cited here so it is not raised a third time.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+unsafe fn gmux_index_write(reg: u8, val: u8) -> bool {
+    unsafe { gmux_outb(GMUX_PORT_VALUE, val) };
+    if !unsafe { gmux_wait_ready() } { return false; }
+    unsafe { gmux_outb(GMUX_PORT_WRITE, reg) };
+    unsafe { gmux_wait_complete() }
+}
+
+/// The pre-switch mux state, plus whether a revert is owed and when.
+///
+/// ONE encode point and ONE decode point. Every mutation of the saved bytes routes through
+/// `pack`/`unpack`; this is what stopped a saved byte being lost to a mask in an earlier
+/// round, and it is why `gmux_dwell()` reads `deadline_ms` back out of the packed word rather
+/// than keeping a second local copy of it.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+#[derive(Clone, Copy)]
+struct RevertState {
+    armed: bool,
+    due: bool,
+    ddc: u8,
+    disp: u8,
+    ext: u8,
+    /// Absolute `arch::ms()` value at which the revert comes due. Saturated into 32 bits
+    /// (~49 days of uptime); the switch is a boot-time one-shot, so that is not reachable.
+    deadline_ms: u32,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+impl RevertState {
+    fn pack(&self) -> u64 {
+        let mut v = 0u64;
+        if self.armed { v |= 1 << 0; }
+        if self.due { v |= 1 << 1; }
+        v |= (self.ddc as u64) << 8;
+        v |= (self.disp as u64) << 16;
+        v |= (self.ext as u64) << 24;
+        v |= (self.deadline_ms as u64) << 32;
+        v
+    }
+
+    fn unpack(v: u64) -> Self {
+        Self {
+            armed: (v & (1 << 0)) != 0,
+            due: (v & (1 << 1)) != 0,
+            ddc: ((v >> 8) & 0xFF) as u8,
+            disp: ((v >> 16) & 0xFF) as u8,
+            ext: ((v >> 24) & 0xFF) as u8,
+            deadline_ms: ((v >> 32) & 0xFFFF_FFFF) as u32,
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+static GMUX_REVERT_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Atomically transform the packed revert state.
+///
+/// `SeqCst` on an independent load and an independent store does NOT make the pair atomic —
+/// two contexts can both observe `armed` and both run the port sequence. This compare-exchange
+/// loop makes the read-modify-write indivisible. `f` returns `None` to abandon the update; on
+/// success the PRE-IMAGE is returned, which is how `gmux_revert_now()` obtains the saved bytes
+/// and the exclusive right to use them in one indivisible step.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+fn gmux_state_update<F>(mut f: F) -> Option<RevertState>
+where
+    F: FnMut(RevertState) -> Option<RevertState>,
+{
+    let mut cur = GMUX_REVERT_STATE.load(Ordering::SeqCst);
+    loop {
+        let old = RevertState::unpack(cur);
+        let new = f(old)?;
+        match GMUX_REVERT_STATE.compare_exchange_weak(
+            cur,
+            new.pack(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return Some(old),
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// Write the DDC/DISPLAY/EXTERNAL triple, read all three back, and compare the read-back
+/// against what was intended.
+///
+/// The verdict is decided by the READ-BACK, never by the write helpers returning `true`. A
+/// timed-out DDC write with a landed DISPLAY write leaves the panel on IGD with DDC on
+/// discrete; an earlier version logged that and printed `Revert Complete` anyway, so a black
+/// screen could not be distinguished from a write that never happened. The `w_*` flags are
+/// still printed — they say WHERE it broke — but they do not decide anything.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+unsafe fn gmux_apply(phase: &str, ddc: u8, disp: u8, ext: u8) -> bool {
+    let w_ddc = unsafe { gmux_index_write(GMUX_SWITCH_DDC, ddc) };
+    let w_disp = unsafe { gmux_index_write(GMUX_SWITCH_DISPLAY, disp) };
+    let w_ext = unsafe { gmux_index_write(GMUX_SWITCH_EXTERNAL, ext) };
+    let ok = |b: bool| if b { "ok" } else { "TIMEOUT" };
+    serial_println!(
+        ":: igpu: [GMUX] {} write: ddc={} disp={} ext={} (intent DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X}) ::",
+        phase, ok(w_ddc), ok(w_disp), ok(w_ext), ddc, disp, ext);
+
+    let r_ddc = unsafe { gmux_index_read(GMUX_SWITCH_DDC) };
+    let r_disp = unsafe { gmux_index_read(GMUX_SWITCH_DISPLAY) };
+    let r_ext = unsafe { gmux_index_read(GMUX_SWITCH_EXTERNAL) };
+    serial_println!(
+        ":: igpu: [GMUX] {} read-back: DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::",
+        phase, r_ddc, r_disp, r_ext);
+
+    let m_ddc = r_ddc == ddc as u32;
+    let m_disp = r_disp == disp as u32;
+    let m_ext = r_ext == ext as u32;
+    if m_ddc && m_disp && m_ext {
+        serial_println!(":: igpu: [GMUX] {} verdict: MATCH (all three registers read back as written) ::", phase);
+        true
+    } else {
+        if !m_ddc { serial_println!(":: igpu: [GMUX] {} MISMATCH SW_DDC: wrote 0x{:02X}, read 0x{:02X} ::", phase, ddc, r_ddc); }
+        if !m_disp { serial_println!(":: igpu: [GMUX] {} MISMATCH SW_DISPLAY: wrote 0x{:02X}, read 0x{:02X} ::", phase, disp, r_disp); }
+        if !m_ext { serial_println!(":: igpu: [GMUX] {} MISMATCH SW_EXTERNAL: wrote 0x{:02X}, read 0x{:02X} ::", phase, ext, r_ext); }
+        serial_println!(":: igpu: [GMUX] {} verdict: MISMATCH ::", phase);
+        false
+    }
+}
+
+/// Perform the whole revert, here and now, and report truthfully whether it landed.
+///
+/// This function does the port writes ITSELF. An earlier version set `due = true` and
+/// returned, with every port write living in a task tick — so on exactly the paths where the
+/// automatic revert was already dead, the operator would see a success message and nothing
+/// would move. A recovery path that reports success while doing nothing is the worst failure
+/// mode available here: it gets typed blind at a black panel by someone who then believes it
+/// worked.
+///
+/// The armed state is CLAIMED with a compare-exchange, so this is idempotent and safe from any
+/// number of contexts: exactly one caller wins and issues the sequence.
+///
+/// `pub` because a one-line seam in `shell.rs` would make a working `gmux-revert` verb out of
+/// it. THAT SEAM IS NOT PRESENT IN THIS BUILD — `shell.rs` is outside this lane. No claim is
+/// made anywhere here that such a verb exists.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+pub fn gmux_revert_now() -> bool {
+    let claimed = gmux_state_update(|s| {
+        if s.armed {
+            Some(RevertState { armed: false, due: false, ..s })
+        } else {
+            None
+        }
+    });
+    let Some(s) = claimed else {
+        serial_println!(":: igpu: [GMUX] revert requested but NOT ARMED — no write issued ::");
+        return false;
+    };
+    serial_println!(":: igpu: [GMUX] reverting to pre-switch state DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", s.ddc, s.disp, s.ext);
+    unsafe { gmux_apply("revert", s.ddc, s.disp, s.ext) }
+}
+
+/// Hold the mux on IGD for the armed deadline, then return.
+///
+/// Bounded twice: the `ms()` deadline out of the packed state, and an iteration cap that
+/// depends on no clock. `arch::ms()` only advances while the BSP timer ISR runs, so a dwell
+/// bounded by it alone could become a permanent stall with the panel dark. Which bound ended
+/// the dwell is printed, along with the iteration count — an instrument's silence is evidence
+/// ONLY if the instrument can execute in the state it reports on, so this one reports the
+/// state it ran in rather than assuming the clock was alive.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+fn gmux_dwell() {
+    let deadline = RevertState::unpack(GMUX_REVERT_STATE.load(Ordering::SeqCst)).deadline_ms as u64;
+    let start = crate::arch::ms();
+    let mut iters: u64 = 0;
+    let ended_by;
+    loop {
+        if crate::arch::ms() >= deadline {
+            ended_by = "deadline";
+            break;
+        }
+        if iters >= GMUX_DWELL_ITER_CAP {
+            ended_by = "itercap";
+            break;
+        }
+        iters += 1;
+        for _ in 0..1000 { core::hint::spin_loop(); }
+    }
+    serial_println!(
+        ":: igpu: [GMUX] dwell ended by={} elapsed_ms={} iters={} (cap={}) ::",
+        ended_by, crate::arch::ms().wrapping_sub(start), iters, GMUX_DWELL_ITER_CAP);
+}
+
+/// Arm, switch to IGD, verify, dwell, revert, verify — all on ONE call stack.
+///
+/// The arming context and the revert executor are the same instruction stream. There is no
+/// deferred executor that can fail to spawn, no task gated on *(not `rast`)* and *(non-zero
+/// framebuffer)* and *(two APs online)*, and no window in which a wedge elsewhere in boot can
+/// strand the mux — the only code that runs between the switch and the revert is the bounded
+/// spin in `gmux_dwell()`, which calls nothing out.
+///
+/// The cost is stated rather than hidden: boot stalls for `GMUX_DWELL_MS` inside `pci::init`,
+/// before xHCI enumeration. That is accepted for a one-shot experiment behind a knob.
+///
+/// Called ONLY from inside the `PROTOCOL PROVEN` branch.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+unsafe fn gmux_arm_switch_and_revert() {
+    // Read the pre-switch state through the ARMED helpers rather than reusing the trace
+    // values: the trace's closures cannot report a timeout at all, and a value that cannot be
+    // distinguished from a timeout is not a state we may promise to return to.
+    let ddc = unsafe { gmux_index_read(GMUX_SWITCH_DDC) };
+    let disp = unsafe { gmux_index_read(GMUX_SWITCH_DISPLAY) };
+    let ext = unsafe { gmux_index_read(GMUX_SWITCH_EXTERNAL) };
+    serial_println!(":: igpu: [GMUX] pre-switch state: DDC=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} ::", ddc, disp, ext);
+
+    if ddc == 0xFFFFFFFF || disp == 0xFFFFFFFF || ext == 0xFFFFFFFF {
+        // The refuse-to-arm sentinel. A pre-switch read that timed out means there is no known
+        // state to return to, so there is nothing safe to switch away from.
+        serial_println!(":: igpu: [GMUX] REFUSED: pre-switch read timed out (0xFFFFFFFF) — no known state to return to, no write issued ::");
+        return;
+    }
+
+    let deadline = crate::arch::ms().saturating_add(GMUX_DWELL_MS).min(u32::MAX as u64) as u32;
+    gmux_state_update(|_| Some(RevertState {
+        armed: true,
+        due: false,
+        ddc: ddc as u8,
+        disp: disp as u8,
+        ext: ext as u8,
+        deadline_ms: deadline,
+    }));
+    serial_println!(":: igpu: [GMUX] ARMED synchronous revert: dwell={}ms deadline_ms={} ::", GMUX_DWELL_MS, deadline);
+    serial_println!(":: igpu: [GMUX] the panel is EXPECTED to go black now — nothing on the integrated side is driving it (every pipe/plane/PLL reads zero). The read-back below is the result. ::");
+
+    let switched = unsafe { gmux_apply("switch", GMUX_DDC_IGD, GMUX_DISPLAY_IGD, GMUX_EXTERNAL_IGD) };
+
+    // Dwell and revert UNCONDITIONALLY, including after a MISMATCH: a partially-landed switch
+    // is precisely the state that most needs putting back.
+    gmux_dwell();
+    let reverted = gmux_revert_now();
+
+    serial_println!(
+        ":: igpu: [GMUX] SUMMARY: switch={} revert={} — the mux is {} ::",
+        if switched { "MATCH" } else { "MISMATCH" },
+        if reverted { "MATCH" } else { "FAILED" },
+        if reverted { "back on the pre-switch (discrete) state" } else { "NOT PROVEN back — power cycle, see RUNBOOK-gmux-igd.md" });
+    serial_println!(":: igpu: [GMUX] NOTE: nothing guards this knob across boots. EVERY boot from this stick switches the mux again. Re-flash it after the sitting. ::");
+}
+
 pub fn init(gpu: &GpuInfo) {
     if PROBED.swap(true, Ordering::SeqCst) {
         return;
@@ -330,8 +705,17 @@ pub fn init(gpu: &GpuInfo) {
                     GMUX_0[3], decode_disp(GMUX_0[3]), gmux3[3], decode_disp(gmux3[3]));
                 serial_println!(":: igpu: SW_DDC                | 0x{:02X} ({:<3})          |                   |                   | 0x{:02X} ({:<3}) ::", 
                     GMUX_0[4], decode_ddc(GMUX_0[4]), gmux3[4], decode_ddc(gmux3[4]));
-                serial_println!(":: igpu: DISC_POWER            | 0x{:02X} ({:<3})          |                   |                   | 0x{:02X} ({:<3}) ::", 
+                serial_println!(":: igpu: DISC_POWER            | 0x{:02X} ({:<3})          |                   |                   | 0x{:02X} ({:<3}) ::",
                     GMUX_0[5], decode_pwr(GMUX_0[5]), gmux3[5], decode_pwr(gmux3[5]));
+
+                // GMUX-IGD: the arm block lives INSIDE the `PROTOCOL PROVEN` arm, not after the
+                // if/else. An earlier version computed `boot_ver_ok`/`kern_ver_ok`, closed the
+                // if/else, and then opened the arm block outside both branches — so a gmux that
+                // answered the handshake but reported an implausible version tuple passed the
+                // 0xFFFFFFFF sentinel and got its display mux written anyway. The version check
+                // is only a gate if something is actually gated on it.
+                #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+                gmux_arm_switch_and_revert();
             }
             serial_println!(":: igpu: TRACE END ::");
         }
