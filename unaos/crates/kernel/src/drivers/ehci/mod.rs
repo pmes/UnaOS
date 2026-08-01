@@ -137,6 +137,16 @@ struct IntEp {
     /// KBDWIT — the one-shot latch. Set by the first (and only) dump this endpoint will ever emit.
     #[cfg(feature = "kbdwit")]
     kbdwit_fired: bool,
+    /// KBDWIT — FRINDEX sampled at ARM time, the baseline the dump's `adv=` is measured against.
+    /// This is the instrument's only real answer to "is the periodic schedule advancing?": the
+    /// arm→fire window is >= `KBDWIT_QUIET_MS`, so a frame counter that has not moved across it is
+    /// unambiguously frozen, whereas two reads taken microseconds apart inside the dump cannot
+    /// distinguish a frozen counter from one that simply has not ticked yet (FRINDEX advances every
+    /// 125 us). `None` = the baseline MMIO read failed, and `adv` is not computed at all rather than
+    /// computed from a fabricated zero. Costs exactly one MMIO read per endpoint (<= 4 per
+    /// controller) on the arming path, of a register in the BAR that path is already driving.
+    #[cfg(feature = "kbdwit")]
+    kbdwit_armed_frindex: Option<u32>,
     /// MT-INVESTIGATION (IVY, `mtraw` only): bytes ONE armed transfer may accept — `mps` for every
     /// endpoint except the vendor-multitouch one, which is armed for the whole (grown) receive
     /// buffer so the controller accumulates a >MPS raw frame into it. See `arm_interrupt_ep`.
@@ -1611,6 +1621,12 @@ impl Controller {
             self.periodic_on = true;
         }
 
+        // KBDWIT: the FRINDEX baseline, read here — after the QH is linked and PSE is on, so the
+        // window `adv=` measures is genuinely "armed and expected to complete". Hoisted out of the
+        // struct literal below so it cannot be entangled with the `int_eps` borrow. One MMIO read
+        // per endpoint on the arming path; `None` is carried honestly rather than defaulted to 0.
+        #[cfg(feature = "kbdwit")]
+        let kbdwit_fr0 = mmio_read32(self.op + KBDWIT_OP_FRINDEX);
         self.int_eps.push(IntEp {
             qh,
             qtd,
@@ -1635,6 +1651,8 @@ impl Controller {
             kbdwit_last_ms: 0,
             #[cfg(feature = "kbdwit")]
             kbdwit_fired: false,
+            #[cfg(feature = "kbdwit")]
+            kbdwit_armed_frindex: kbdwit_fr0,
             #[cfg(feature = "mtraw")]
             rx_total,
             #[cfg(feature = "mtraw_inject")]
@@ -1918,10 +1936,31 @@ impl Controller {
 //
 // IT THEREFORE PRINTS ON HEALTHY BOOTS TOO, and that is deliberate. An idle boot keyboard
 // genuinely completes nothing — no SET_IDLE is sent on this path and no key is pressed — so its
-// dump is the ACQUITTAL BASELINE: qTD Active, CERR=3, split state clean, FRINDEX advancing. The
-// convicting boot is then read by DIFFERENCE against the baseline the same instrument printed on
-// every other boot. A witness that only spoke once it had already decided what was wrong could
+// dump is the ACQUITTAL BASELINE: qTD Active, CERR=3, CERR unburned, PSE/PSS on, FRINDEX advanced.
+// The convicting boot is then read by DIFFERENCE against the baseline the same instrument printed
+// on every other boot. A witness that only spoke once it had already decided what was wrong could
 // not do that, and could not be checked for its own health.
+//
+// FOR THAT REASON THE HEADER CARRIES NO VERDICT WORD. It reads `NO-COMPLETIONS`, a statement of
+// fact, with `class=never-completed` or `class=went-quiet` — never "SILENT", which an `awk
+// /KBDWIT/` over a perfectly healthy capture would read as a recurrence that did not happen.
+//
+// WHAT IT CAN AND CANNOT CONVICT — the limit of a deadline this early. The probe fires at
+// armed + `KBDWIT_QUIET_MS`, i.e. seconds into boot and BEFORE the operator has touched anything,
+// and the one-shot latch is spent there. So:
+//   * IT CAN CONVICT, from this dump alone: a QH orphaned from the frame list (line 5 `fl0` plus
+//     line 4 `horiz`/`qh`), a QH programmed with the wrong device address or endpoint number
+//     (line 5, decoded from the controller's own words), a periodic schedule that is off or not
+//     running (line 6 `pse`/`pss`), a halted or host-errored controller (line 6 `hch`/`hse`), a
+//     frozen frame counter (line 7 `adv=0x0000`), and a wedged split transaction with the error
+//     counter burned down (line 3 `cerr`, line 4 `ovl4`).
+//   * IT CANNOT SEPARATE, at this deadline, an idle keyboard from the s58 recurrence. Both show
+//     `class=never-completed` with the qTD Active, CERR=3 and a healthy controller, because a
+//     boot keyboard nobody has typed on completes nothing either. Every hypothesis that only
+//     manifests at an UNANSWERED KEYPRESS — device-side silence, a data-toggle desync that leaves
+//     the qTD Active forever — produces a picture identical to the healthy baseline here.
+//     A clean dump is therefore NOT an acquittal of that class; it is silence about it. Convicting
+//     those would need a second, keypress-triggered sample, which this arc does not build.
 //
 // WHY PER-ENDPOINT, NOT PER-CONTROLLER. During the failure the trackpad is streaming on the SAME
 // controller, so any controller-level "is anything completing?" test reads HEALTHY on the exact
@@ -1948,10 +1987,25 @@ impl Controller {
 //     (the standalone qTD), with `path=` naming which of the two the driver actually drives.
 //     `seen` differing from the live word means the token is CHANGING — a frozen source printed
 //     as a live value is the failure mode this seat has been bitten by repeatedly.
-//   * FRINDEX is sampled TWICE, before and after the dump's own serial output (which costs real
-//     milliseconds at 115200 baud — so the spacing is bought without adding a single wait), and
-//     BOTH raw readings print with the measured `dt=` between them. Never a bare delta: if
-//     `dt=0ms` the reader can see the pair proves nothing, rather than being told "frozen".
+//   * `qtd_driven=` guards `qtd_tok=`. On the overlay-direct path (this metal) the standalone qTD
+//     is NEVER handed to the controller and `write_qtd` is never called for an interrupt slot, so
+//     `qtd_tok` is untouched zeroed pool memory that decodes to `active=0 halted=0` — "completed
+//     cleanly", flatly contradicting the header three lines above it. A value meaning NOT DRIVEN
+//     must never sit unmarked in the position of a measurement, so `qtd_driven=0` says so.
+//   * FRINDEX advancement is measured from a BASELINE STAMPED AT ARM TIME (`kbdwit_armed_frindex`)
+//     to the dump — a real multi-second window — not from a pair of reads taken microseconds
+//     apart. The earlier design bracketed the dump's own serial output on the theory that it cost
+//     milliseconds at 115200 baud; on this rig there is no 16550, the fbcon mirror is detached
+//     before the first probe-reaching call, and the remaining sinks are try_lock ring memcpys, so
+//     seven lines cost TENS OF MICROSECONDS. FRINDEX ticks every 125 us, so that pair returned the
+//     same microframe on a perfectly healthy controller and the one line meant to answer "is the
+//     periodic schedule advancing?" printed a bare zero on every metal boot — dead exactly where
+//     it was needed, alive only under QEMU where a real UART exists. The `post=` sample is kept
+//     (it costs nothing and does resolve where printing is genuinely slow) but it is no longer the
+//     tell: `adv=` is. Its magnitude is WRAP-AMBIGUOUS by construction — FRINDEX is 14 bits and
+//     wraps every 2.048 s, while the window is >= `KBDWIT_QUIET_MS` — so `adv` answers "did the
+//     frame counter move at all?", not "by how much". Stated here rather than inferred, because a
+//     reader who took `adv` for a rate would be wrong by whole wraps.
 //   * Every MMIO read carries an `ok=` flag, because `mmio_read32` returns an Option and a
 //     failed read rendered as `0x00000000` would read as "halted clear, host error clear, all
 //     well" — the most dangerous possible lie this dump could tell.
@@ -1967,14 +2021,14 @@ impl Controller {
 #[cfg(feature = "kbdwit")]
 const KBDWIT_QUIET_MS: u64 = 4000;
 
-/// KBDWIT — USBSTS bit 14, Periodic Schedule Status (EHCI 1.0 §2.3.2): the controller is
-/// traversing the periodic list. Defined here rather than reusing this module's `STS_PSS`, whose
-/// doc comment misnames it "Async Schedule Status" (that is bit 15). The VALUE in `STS_PSS` is
-/// right and its only use — an `init()` handshake — is unaffected, but an instrument must not
-/// inherit a name whose comment disagrees with the spec.
-#[cfg(feature = "kbdwit")]
-const KBDWIT_STS_PSS: u32 = 1 << 14;
-/// KBDWIT — USBSTS bit 15, Async Schedule Status (EHCI 1.0 §2.3.2).
+/// KBDWIT — USBSTS bit 15, Async Schedule Status (EHCI 1.0 §2.3.2): the controller is traversing
+/// the asynchronous list. Genuinely absent from the module's shared register set — the two other
+/// readers of this bit (`quiesce_if_firmware_stale`) spell it as a bare `1 << 15` — so unlike
+/// Periodic Schedule Status (bit 14), which this probe takes from the module's `STS_PSS`, it needs
+/// a name. Left KBDWIT-local rather than promoted to a shared `STS_ASS` beside `STS_PSS`: that
+/// block is the one region of this file trunk is concurrently editing, and this arc was verified
+/// collision-free against it. Promoting it (and folding in those two bare literals) is the right
+/// follow-up, on a branch that is not racing that hunk.
 #[cfg(feature = "kbdwit")]
 const KBDWIT_STS_ASS: u32 = 1 << 15;
 /// KBDWIT — operational-register offset of FRINDEX (EHCI 1.0 §2.3.4), the frame index the
@@ -2043,8 +2097,23 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     // overlay[4]/overlay[5] are qTD buffer pointers 1 and 2, which for a SPLIT transaction carry
     // the controller's split progress state — C-prog-mask (buf1 bits 7:0) and FrameTag/S-bytes
     // (buf2 bits 4:0 / 11:5), EHCI 1.0 §3.5.4. The rMBP keyboard is a low/full-speed device behind
-    // a TT, so a wedged split shows up HERE and nowhere else. Both are zeroed at every (re-)arm,
-    // so a non-zero value is progress the controller made on this transfer.
+    // a TT, so a wedged split shows up HERE and nowhere else.
+    //
+    // THEY ARE NOT EQUALLY TRUSTWORTHY, and the difference matters on the metal path:
+    //   * `ovl4` IS cleared on every (re-)arm — `init_schedules`, `arm_interrupt_ep` and the
+    //     service-loop re-arm all write `overlay[4] = 0` — so a non-zero value is progress the
+    //     controller made on THIS transfer. Read it as evidence.
+    //   * `ovl5` IS NEVER WRITTEN BY THIS DRIVER, anywhere. On the qtd-chain path `write_qtd`
+    //     zeroes `buf[1..5]` and the controller copies them into the overlay when it fetches the
+    //     qTD, so it happens to be clean there. On OVERLAY-DIRECT — the mode this metal settles
+    //     into — no qTD is ever fetched, the driver writes the overlay in place, and nothing
+    //     clears `overlay[5]`. It can therefore hold FrameTag/S-bytes the controller wrote during
+    //     an EARLIER, SUCCESSFULLY COMPLETED transfer on this same QH. A reader who took a
+    //     non-zero `ovl5` for split progress on the STALLED transfer would be chasing a phantom.
+    //     Printed because the raw word is still worth having; read as residue, not as evidence,
+    //     whenever `path=overlay-direct`.
+    // Deliberately NOT fixed by zeroing `overlay[5]` at re-arm: that is a WRITE on the transfer
+    // path, and this witness is read-only by construction. Flagged for a separate arc.
     let ovl4 = core::ptr::read_volatile(&(*e.qh).overlay[4]);
     let ovl5 = core::ptr::read_volatile(&(*e.qh).overlay[5]);
     let qtok = core::ptr::read_volatile(&(*e.qtd).token);
@@ -2064,32 +2133,43 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
         None => "unknown",
     };
 
-    // 1/7 — the verdict header: what went quiet, for how long, measured from what.
+    // 1/7 — the header. NO VERDICT WORD: `NO-COMPLETIONS` is a fact, and `class=` distinguishes
+    // "never completed anything" from "completed, then stopped" WITHOUT asserting which of those
+    // is a fault. `class=never-completed` is the shared picture of an idle keyboard and of the s58
+    // recurrence — see WHAT IT CAN AND CANNOT CONVICT in the section comment. Do not read this
+    // line alone as a recurrence; the evidence is on lines 2..7.
     serial_println!(
-        ":: KBDWIT: [{}] ep=IN{} addr={} kind={} SILENT quiet={}ms armed_ms={} last_ms={} now_ms={} reports={} toggle={} dead={} == witness ::",
+        ":: KBDWIT: [{}] ep=IN{} addr={} kind={} NO-COMPLETIONS class={} quiet={}ms armed_ms={} last_ms={} now_ms={} reports={} toggle={} dead={} == witness ::",
         idx, epn, addr, kind,
+        if e.kbdwit_last_ms == 0 { "never-completed" } else { "went-quiet" },
         now.wrapping_sub(since),
         e.kbdwit_armed_ms, e.kbdwit_last_ms, now,
         e.reports, e.toggle as u8, e.dead as u8,
     );
     // 2/7 — the token, raw, from all three vantage points (see the honesty note on `seen=`).
+    // `qtd_driven=0` marks `qtd_tok` as NOT DRIVEN: on the overlay-direct path the controller is
+    // never given that qTD, so the word is untouched zeroed pool memory and must not be decoded —
+    // it would read `active=0 halted=0`, i.e. "completed cleanly", contradicting line 1.
     serial_println!(
-        ":: KBDWIT: [{}] ep=IN{} path={} seen={:#010x} ovl_tok={:#010x} qtd_tok={:#010x} live={:#010x} == witness ::",
+        ":: KBDWIT: [{}] ep=IN{} path={} seen={:#010x} ovl_tok={:#010x} qtd_tok={:#010x} qtd_driven={} live={:#010x} == witness ::",
         idx, epn,
         if om { "overlay-direct" } else { "qtd-chain" },
-        seen, ovl2, qtok, live,
+        seen, ovl2, qtok, (!om) as u8, live,
     );
     // 3/7 — the live token decoded. `rem` is Total Bytes To Transfer still outstanding: equal to
-    // the armed total means not one byte moved.
+    // the armed total means not one byte moved. `tog` is the qTD Data Toggle (token bit 31) — so
+    // named, not `dt`, because line 7 already reports an elapsed-milliseconds field and one
+    // `awk '/dt=/'` must not match two unrelated quantities in the same dump.
     serial_println!(
-        ":: KBDWIT: [{}] ep=IN{} tok active={} halted={} dbuf={} babble={} xact={} missed={} split={} ping={} pid={} cerr={} ioc={} dt={} rem={} == witness ::",
+        ":: KBDWIT: [{}] ep=IN{} tok active={} halted={} dbuf={} babble={} xact={} missed={} split={} ping={} pid={} cerr={} ioc={} tog={} rem={} == witness ::",
         idx, epn,
         (live >> 7) & 1, (live >> 6) & 1, (live >> 5) & 1, (live >> 4) & 1,
         (live >> 3) & 1, (live >> 2) & 1, (live >> 1) & 1, live & 1,
         kbdwit_pid(live), (live >> 10) & 3, (live >> 15) & 1, (live >> 31) & 1,
         (live >> 16) & 0x7FFF,
     );
-    // 4/7 — the queue head verbatim. `ovl4`/`ovl5` are the split progress words (see above).
+    // 4/7 — the queue head verbatim. `ovl4` is split progress on THIS transfer; `ovl5` is residue
+    // the driver never clears on the overlay-direct path — read the block above before using it.
     serial_println!(
         ":: KBDWIT: [{}] ep=IN{} qh={:#010x} chars={:#010x} caps={:#010x} horiz={:#010x} cur={:#010x} ovl0={:#010x} ovl1={:#010x} ovl3={:#010x} ovl4={:#010x} ovl5={:#010x} == witness ::",
         idx, epn, qh_phys, chars, caps, horiz, cur, ovl0, ovl1, ovl3, ovl4, ovl5,
@@ -2115,22 +2195,42 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
         (sts.is_some() && cmd.is_some()) as u8,
         (sts.unwrap_or(0) & STS_HCHALTED != 0) as u8,
         (sts.unwrap_or(0) & STS_HSE != 0) as u8,
-        (sts.unwrap_or(0) & KBDWIT_STS_PSS != 0) as u8,
+        (sts.unwrap_or(0) & STS_PSS != 0) as u8,
         (sts.unwrap_or(0) & KBDWIT_STS_ASS != 0) as u8,
         (cmd.unwrap_or(0) & CMD_RS != 0) as u8,
         (cmd.unwrap_or(0) & CMD_PSE != 0) as u8,
         (cmd.unwrap_or(0) & CMD_ASE != 0) as u8,
     );
-    // 7/7 — the staleness tell. `b` is read AFTER the six lines above have gone out on the wire,
-    // so the spacing is paid for by serial output already owed, not by a wait. Both raws print
-    // with the measured gap: at `dt=0ms` the pair is uninformative and says so.
-    let fr_b = mmio_read32(op + KBDWIT_OP_FRINDEX);
+    // 7/7 — is the periodic schedule advancing? THE TELL IS `adv`, measured from the arm-time
+    // baseline across the whole >= KBDWIT_QUIET_MS silence window:
+    //
+    //     adv=0x0000  the frame counter has not moved in seconds — the schedule is FROZEN.
+    //     adv!=0      it moved. The MAGNITUDE IS NOT A RATE: FRINDEX is 14 bits and wraps every
+    //                 2.048 s while this window spans several wraps, so `adv` is `(fire - arm)`
+    //                 modulo 0x4000 and nothing more. (The one false-clean case is an advance that
+    //                 lands on an exact multiple of 16384 microframes — 1 in 16384, and it would
+    //                 have to coincide with a fault that leaves every other field healthy.)
+    //
+    // `post` is a second sample taken after lines 1..6 have been emitted. It is NOT the tell and
+    // must not be read as one: on this rig printing costs tens of microseconds against FRINDEX's
+    // 125 us tick, so `post == fire` and `post_ms=0` are the NORMAL healthy result. It is retained
+    // only because it costs nothing and does resolve on a platform whose console is genuinely slow.
+    // All three readings print raw; `ok=0` means at least one of the reads failed and the hex —
+    // `adv` included — is a placeholder, not a measurement.
+    let fr_post = mmio_read32(op + KBDWIT_OP_FRINDEX);
     let t_b = crate::arch::ms();
+    let adv = match (e.kbdwit_armed_frindex, fr_a) {
+        (Some(arm), Some(fire)) => fire.wrapping_sub(arm) & 0x3FFF,
+        _ => 0,
+    };
     serial_println!(
-        ":: KBDWIT: [{}] ep=IN{} frindex a={:#06x} b={:#06x} ok={} dt={}ms == witness ::",
+        ":: KBDWIT: [{}] ep=IN{} frindex arm={:#06x} fire={:#06x} post={:#06x} ok={} adv={:#06x} post_ms={} == witness ::",
         idx, epn,
-        fr_a.unwrap_or(0) & 0x3FFF, fr_b.unwrap_or(0) & 0x3FFF,
-        (fr_a.is_some() && fr_b.is_some()) as u8,
+        e.kbdwit_armed_frindex.unwrap_or(0) & 0x3FFF,
+        fr_a.unwrap_or(0) & 0x3FFF,
+        fr_post.unwrap_or(0) & 0x3FFF,
+        (e.kbdwit_armed_frindex.is_some() && fr_a.is_some() && fr_post.is_some()) as u8,
+        adv,
         t_b.wrapping_sub(t_a),
     );
 }
