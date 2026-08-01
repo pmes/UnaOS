@@ -412,12 +412,19 @@ pub fn log_summary_once() {
     // topology summary. `tag_mismatch=`/`bad_sig=` were one-off prints with no denominator;
     // `undrained=` is the single-chokepoint fix's own regression witness and MUST read 0.
     serial_println!(
-        ":: BOT: phase tag_mismatch={} bad_sig={} abandoned_in={} abandoned_out={} undrained={} short_in={} short_out={} ev_late={} ev_unaddressed={} result=SUMMARY ::",
+        ":: BOT: phase tag_mismatch={} bad_sig={} abandoned_in={} abandoned_out={} undrained={} short_in={} short_out={} ev_late={} ev_unaddressed={} cbw_fault={} result=SUMMARY ::",
         BOT_TAG_MISMATCH.load(Ordering::Relaxed), BOT_BAD_SIG.load(Ordering::Relaxed),
         BOT_TD_ABANDONED_IN.load(Ordering::Relaxed), BOT_TD_ABANDONED_OUT.load(Ordering::Relaxed),
         BOT_TD_UNDRAINED.load(Ordering::Relaxed),
         BOT_SHORT_DATA_IN.load(Ordering::Relaxed), BOT_SHORT_DATA_OUT.load(Ordering::Relaxed),
-        BOT_EV_LATE_CLAIM.load(Ordering::Relaxed), BOT_EV_UNADDRESSED.load(Ordering::Relaxed));
+        BOT_EV_LATE_CLAIM.load(Ordering::Relaxed), BOT_EV_UNADDRESSED.load(Ordering::Relaxed),
+        // CBW-FAULT: command-block failures the controller reported and the router now claims.
+        // Read it WITH the stage-timeout count: a boot with both at 0 says nothing about which
+        // mechanism is carrying CBW failures, because there were none. `cbw_fault>0` with no new
+        // stage timeouts is the fix earning its keep — a failure that used to cost the whole pump
+        // budget now costs one event. `cbw_fault=0` alongside timeouts leaves the question open,
+        // since a CBW can fail without the controller posting anything.
+        BOT_CBW_FAULT.load(Ordering::Relaxed));
 }
 
 pub static COMMAND_RING: Mutex<Option<TransferRing>> = Mutex::new(None);
@@ -704,6 +711,34 @@ pub static BOT_EV_LATE_CLAIM: AtomicU64 = AtomicU64::new(0);
 /// often the driver has to fall back on "it can only be ours".
 pub static BOT_EV_UNADDRESSED: AtomicU64 = AtomicU64::new(0);
 
+// --- CBW-FAULT (2026-08-01): the command block's own failure, claimed by address ---
+//
+// The CBW is the one stage of a BOT transaction that nothing waits on: phases are serialized, so
+// the DATA or CSW event proves the CBW retired, and the CBW TRB therefore carries no IOC. That is
+// correct for the SUCCESS path and stays that way. It is NOT the whole story for the FAILURE path,
+// because an error terminates a TD and posts a Transfer Event *regardless* of IOC (xHCI 1.2
+// §4.10.2) — so a CBW that STALLs or takes a transaction error DOES name itself on the event ring.
+//
+// BOT-PHASE fix 4's de-aliasing predicate (`is_match || (is_error && !addressed)`) dropped that
+// event on the floor: the CBW TRB lies inside the bulk OUT ring, so it is `addressed`, and it is
+// never `wait_trb_phys`, so it never matches. Neither arm fired. The cost was not just latency
+// (the pump burned its whole wall-clock budget on a command that had already failed) but a
+// MIS-ATTRIBUTION: the `:: BOT: stage timeout ::` witness keys off `wait_trb_phys`, so the log
+// reported a DATA or CSW timeout for a transaction whose command block never left the host.
+//
+/// Transfer Events that named THIS transaction's CBW TRB with an error completion code — the
+/// command block the device refused. Non-zero says the transport failed at the command phase, and
+/// the transaction was failed there (into the chokepoint's ring clean, per USB MSC BOT 1.0
+/// §6.6.1) instead of waiting out the budget for a data stage that could never run.
+///
+/// **What zero does NOT prove.** This counter is incremented from `handle_event_trb`, which the BOT
+/// pump itself drives — so it can execute in exactly the state it reports on (a stage waiting, an
+/// error event arriving). But it can only count events that were POSTED. A CBW that fails without
+/// the controller posting anything — a doorbell that never reached the xHC, a wedged event ring, a
+/// dead PCIe link — is still a real CBW failure, and it still reads zero here and surfaces as a
+/// pump timeout. Zero means "no CBW error was reported", never "no CBW failed".
+pub static BOT_CBW_FAULT: AtomicU64 = AtomicU64::new(0);
+
 /// In-flight BOT stage state. BOT phases (CBW -> [DATA] -> CSW) are pumped one at a time;
 /// the event handler records the completion (or an error) here while the synchronous pump
 /// waits. The stage's TRB is matched by its physical address so it is never confused with
@@ -736,6 +771,20 @@ struct BotPending {
     /// True once a Transfer Event has been recorded for this stage, so `residue == 0` is trusted as
     /// "everything moved" rather than "nothing observed yet". Doubles as the first-write latch.
     residue_seen: bool,
+    /// CBW-FAULT: physical address of the CBW TRB this transaction pushed on the bulk OUT ring, or 0
+    /// if none is in flight. It is the SECOND address that belongs to a live stage, and the reason
+    /// it has to be carried explicitly is that nothing ever waits on it: the CBW is never
+    /// `wait_trb_phys`, so without this field an error naming it satisfies neither arm of the
+    /// de-aliasing predicate and is dropped. Held for the whole transaction (both stages), which is
+    /// safe because within one transaction no other TD occupies that ring slot.
+    cbw_trb_phys: u64,
+    /// CBW-FAULT: completion code of an error the controller reported AGAINST the CBW TRB, 0 if
+    /// none. Deliberately a separate field from `completion_code`: that one describes the stage the
+    /// pump asked about, and everything downstream of `run_bot_stage` — the short-transfer check,
+    /// the stall-then-still-collect-the-CSW recovery — is written about that stage. Feeding a CBW's
+    /// code through it would, for a READ, clear the halt on the IN pipe while the OUT pipe is the
+    /// halted one, and then queue a CSW to a device that was never given a command.
+    cbw_error: u8,
 }
 
 /// In-flight FTDI console bulk-OUT transfer (U2.5). The FTDI TX is a single bulk-OUT stage — no
@@ -1217,6 +1266,12 @@ pub struct XhciController {
     pub bot_tag: u32,
     /// In-flight BOT transaction, populated by the event handler.
     bot_pending: Option<BotPending>,
+    /// CBW-FAULT: physical address of the CBW TRB of the transaction currently in flight, 0 between
+    /// transactions. Set immediately after the CBW is pushed and cleared before the next one is
+    /// built, so every stage `run_bot_stage` arms inherits the right address without threading it
+    /// through the signature — the CBW belongs to the whole transaction, not to one stage, and the
+    /// stages are pumped one at a time from a single call site.
+    bot_cbw_trb: u64,
 
     /// In-flight synchronous EP0 control transfer (hub bring-up). See `Ep0Pending`.
     ep0_pending: Option<Ep0Pending>,
@@ -1368,6 +1423,7 @@ impl XhciController {
             storage_note: "no mass-storage device enumerated",
             bot_tag: 1,
             bot_pending: None,
+            bot_cbw_trb: 0,
             ep0_pending: None,
             last_control_len: 0,
             cmd_pending: None,
@@ -1863,7 +1919,16 @@ impl XhciController {
                         //   1. The blanket error claim is gone. An error that names a TRB is now
                         //      matched by address like any other event — a bulk STALL carries its
                         //      TRB pointer, so the property the blanket claim was added for (a
-                        //      stalled command must not burn the full pump timeout) is preserved.
+                        //      stalled command must not burn the full pump timeout) is preserved
+                        //      **for every stage the pump waits on**. CBW-FAULT: that qualifier was
+                        //      missing and it mattered. The CBW is the one stage nothing waits on,
+                        //      so its address is never `wait_trb_phys`; and it lives in the bulk OUT
+                        //      ring, so it is `addressed` and the fallback below excludes it too. A
+                        //      STALLed *command block* therefore satisfied neither arm and was
+                        //      dropped — burning the full pump budget and, worse, leaving the
+                        //      stage-timeout witness to name the DATA or CSW stage, because that is
+                        //      what `wait_trb_phys` points at. The third arm below closes exactly
+                        //      that hole, by naming the one further address this transaction owns.
                         //      The fallback survives ONLY for an error whose pointer addresses
                         //      nothing in either of this slot's bulk rings — Ring Underrun (21),
                         //      Ring Overrun (22) and VF Event Ring Full (either post no TRB pointer
@@ -1889,6 +1954,33 @@ impl XhciController {
                                             || s.bulk_out_ring.as_ref().is_some_and(|r| r.contains(param))
                                     };
                                     let unaddressed_error = is_error && !addressed;
+                                    // CBW-FAULT: an ERROR naming THIS transaction's command block.
+                                    // Deliberately narrower than the claim fix 4 removed — it is one
+                                    // exact address, pushed by this transaction, on an error code
+                                    // only. A success at that address cannot reach here (the CBW
+                                    // carries no IOC, so the controller posts nothing on success),
+                                    // and if some controller posted one anyway it is not claimed.
+                                    if is_error && !is_match
+                                        && p.cbw_trb_phys != 0 && param == p.cbw_trb_phys
+                                    {
+                                        if p.done {
+                                            BOT_EV_LATE_CLAIM.fetch_add(1, Ordering::Relaxed);
+                                            return;
+                                        }
+                                        BOT_CBW_FAULT.fetch_add(1, Ordering::Relaxed);
+                                        serial_println!(
+                                            ":: BOT: cbw fault slot={} dci={} trb={:#x} cc={} gen={} — the command block itself failed; failing the transaction here rather than waiting out the budget for a stage the device was never asked to run (USB MSC BOT 1.0 §6.6.1) ::",
+                                            slot_id, endpoint_id, param, completion_code, p.generation);
+                                        if let Some(bp) = self.bot_pending.as_mut() {
+                                            // The code goes in its OWN field; `completion_code` and
+                                            // `residue` describe the awaited stage and stay untouched
+                                            // so nothing downstream can read a CBW's verdict as a
+                                            // data or status verdict. `done` stops the pump.
+                                            bp.cbw_error = completion_code as u8;
+                                            bp.done = true;
+                                        }
+                                        return;
+                                    }
                                     if is_match || unaddressed_error {
                                         if p.done {
                                             // Fix 4 (2): the stage already has its completion.
@@ -4272,10 +4364,23 @@ impl XhciController {
         // the next is queued — mirroring the Linux usb-storage bulk transport. We must NOT
         // pipeline the CSW TRB behind an async data stage: QEMU's usb-storage is a single-
         // packet device, so a CSW IN token arriving while the DATA transfer is still async
-        // is never serviced and the transfer hangs with no completion event. The CBW is
-        // fire-and-forget (the device consumes it before it can respond); the DATA and CSW
+        // is never serviced and the transfer hangs with no completion event. The DATA and CSW
         // stages each carry IOC (1<<5) so their completion posts a Transfer Event (-> MSI ->
         // the pump wakes). We await the DATA stage, then the CSW — never the CBW directly.
+        //
+        // CBW-FAULT: the CBW deliberately carries NO IOC, and this is why. Because the phases are
+        // serialized on one ring in order, the DATA (or, with no data stage, the CSW) event is
+        // itself proof the CBW retired — a completion interrupt for it would be an extra event and
+        // an extra MSI per BOT transaction with nothing on the other end to consume them. This is
+        // not the Linux shape only because the URB model there obliges every submission to have a
+        // completion callback; nothing here waits on the CBW, so nothing here needs one.
+        //
+        // What the missing IOC does NOT buy the device is silence on FAILURE. An error terminates a
+        // TD and posts a Transfer Event irrespective of IOC (xHCI 1.2 §4.10.2), so a STALLed or
+        // errored command block names its own TRB on the event ring whether we asked for an
+        // interrupt or not. Claiming that event is the router's job (`BOT_CBW_FAULT`), not this
+        // TRB's — setting IOC here would add a per-transaction cost and still not change a single
+        // failure path.
 
         // BOT-PHASE fix 2 (lift 0825ed08) — THE RING GUARD RUNS BEFORE ANYTHING IS PUSHED.
         //
@@ -4306,9 +4411,20 @@ impl XhciController {
         // vector for the matching in `handle_event_trb`. `push` cannot fail today (it always
         // returns `Ok`), so this is byte-identical in behaviour; it is here so that if it ever can,
         // the transaction fails honestly instead of waiting on a fabricated address.
-        self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
-            .push(Trb { parameter: cbw_phys, status: 31, control: 1 << 10 })
-            .map_err(|_| BotError::RingFull)?;
+        //
+        // CBW-FAULT: and the index it returns is no longer discarded either. Nothing waits on this
+        // TRB — that is the design, and it is why it carries no IOC — but the controller will still
+        // name it if it FAILS, and the event router needs the address to recognise that. Cleared
+        // first so a refused push cannot leave the previous transaction's CBW address armed.
+        self.bot_cbw_trb = 0;
+        let cbw_trb_phys = {
+            let ring = self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap();
+            let base = ring.get_ptr();
+            let idx = ring.push(Trb { parameter: cbw_phys, status: 31, control: 1 << 10 })
+                .map_err(|_| BotError::RingFull)?;
+            base + (idx as u64) * 16
+        };
+        self.bot_cbw_trb = cbw_trb_phys;
 
         // 2) Data stage (IN or OUT), if any. IOC + ISP (1<<2) so both full and short-packet
         //    completions post an event; wait for it to retire BEFORE queuing the CSW.
@@ -4587,9 +4703,19 @@ impl XhciController {
         self.bot_ring_guard(slot_id, in_dci, true)?;
 
         // 1) CBW on bulk OUT. Push result propagated (BOT-PHASE fix 2), not discarded.
-        self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
-            .push(Trb { parameter: cbw_phys, status: 31, control: 1 << 10 })
-            .map_err(|_| BotError::RingFull)?;
+        // CBW-FAULT: record this experiment's own CBW address, exactly as the production path does.
+        // Not optional bookkeeping: `bot_cbw_trb` persists between transactions, so leaving it alone
+        // here would arm the router with the LAST REAL transaction's CBW address while this
+        // experiment's stages are pending — a stale alias in the one place BOT-PHASE exists to keep
+        // free of them.
+        self.bot_cbw_trb = 0;
+        self.bot_cbw_trb = {
+            let ring = self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap();
+            let base = ring.get_ptr();
+            let idx = ring.push(Trb { parameter: cbw_phys, status: 31, control: 1 << 10 })
+                .map_err(|_| BotError::RingFull)?;
+            base + (idx as u64) * 16
+        };
 
         // 2) Two chained IN data TRBs (256 B + 256 B). Clean the whole 512 B buffer to DRAM first,
         //    exactly like the single-TRB IN path. The completion event (IOC) rides the SECOND TRB;
@@ -5434,8 +5560,11 @@ impl XhciController {
         let out_dci = (out_ep & 0x0F) * 2;
 
         // Any half-armed pending stage must not be matched against an event raised by the
-        // stop/reset commands below.
+        // stop/reset commands below. CBW-FAULT: the transaction's CBW address is disarmed for the
+        // same reason — the resync's Stop Endpoint can post an event for a TRB this ring still
+        // holds, and after this point there is no transaction for it to belong to.
         self.bot_pending = None;
+        self.bot_cbw_trb = 0;
 
         let (in_live, out_live) = self.bot_strand_witness(slot_id, in_dci, out_dci, cause, "pre");
         if in_live > 0 { BOT_TD_ABANDONED_IN.fetch_add(1, Ordering::Relaxed); }
@@ -5627,6 +5756,8 @@ impl XhciController {
             slot_id, in_dci, out_dci, wait_trb_phys,
             done: false, completion_code: 0,
             generation, residue: 0, residue_seen: false,
+            // CBW-FAULT: inherited from the transaction, not from the stage — see `bot_cbw_trb`.
+            cbw_trb_phys: self.bot_cbw_trb, cbw_error: 0,
         });
         let pump = self.pump_until_bot_done();
         let pending = self.bot_pending.take();
@@ -5641,6 +5772,16 @@ impl XhciController {
         }
         pump?;
         let p = pending.ok_or(BotError::Timeout)?;
+        // CBW-FAULT: the device refused the command block. There is no stage verdict to report —
+        // the awaited TRB was never executed — so this cannot return through the `Ok` path, whose
+        // whole downstream is written about the awaited stage. `TransferError` puts it on the one
+        // path that is right for it: the caller propagates it to `bot_transfer`'s chokepoint, which
+        // stops both endpoints and resyncs both rings (`bot_clean_rings`) — the recovery USB MSC
+        // BOT 1.0 §5.3.3 / §6.6.1 prescribe a stalled command phase, instead of a data-stage
+        // stall-recovery written for a command the device never accepted.
+        if p.cbw_error != 0 {
+            return Err(BotError::TransferError(p.cbw_error));
+        }
         Ok((p.completion_code, p.residue))
     }
 
