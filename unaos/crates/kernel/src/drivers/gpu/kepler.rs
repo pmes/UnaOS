@@ -50,13 +50,37 @@ pub mod regs {
 ///
 /// Falcon instructions are variable-length byte sequences; IMEM is written a
 /// `u32` at a time. The **byte listing is authoritative** here — the packed
-/// `[u32]` images are produced from it by [`pack92`] at compile time, so the
+/// `[u32]` images are produced from it by [`pack128`] at compile time, so the
 /// listing in `docs/dev/OS/08_VIDEO/falcon_microcode_spec.md` and the words the
-/// host uploads cannot drift apart. Every IO port immediate in the listing is
-/// checked against [`regs::falcon_io`] by const assertion below (§3 of the
-/// spec: derive the port, never hand-write it).
+/// host uploads cannot drift apart. Every instruction in both images — all 128
+/// bytes of each, padding included — is pinned by a `const _` assertion below,
+/// built out of the instruction constructors (`mov_i8`, `iowr`, `bra`, …) and
+/// out of [`regs::falcon_io`] for the port immediates. Coverage is contiguous
+/// by construction: there are no unpinned holes for a hand-typed byte to hide
+/// in. This is the check that would have caught pull 33's raw-host-offset
+/// listing, and the four malformed instructions (`f1 38`, `f0 38`, `f4 2b`,
+/// `b0 52`) that survived three review rounds because the old assertions
+/// checked only immediates while the comments read correctly.
 ///
-/// Pull 34 (R3-AMEND) retrofit of the s37-acked pull-33 echo skeleton:
+/// ## Two images, and why they are two
+///
+/// [`ECHO_A_BYTES`] is the **falcon-execution test**: command in, ACK out,
+/// phase stamps. It runs mid-sequence. It must therefore contain **no `$r8`
+/// setup, no `iord I[$r8]`, and no `0x409504` in any form** — the first access
+/// to `0x409504` (WRCMD_CMD) faults and wedges every subsequent read in the
+/// FECS unit for the rest of the boot (spec §5.4, s31/s32/s34), so an echo test
+/// that reads it poisons the unit it is testing and invalidates every FECS
+/// observation printed after it. That absence is asserted mechanically, not
+/// promised in a comment.
+///
+/// [`POKE_A_BYTES`] is the same skeleton **plus** the `$r8 = falcon_io(0x504)`
+/// setup and the `iord`. Reading the poison offset from the falcon side, where
+/// the host side faults, is a legitimate experiment — it just has to be the
+/// last thing the kepler leg does, so it executes exactly once, at the terminal
+/// phase, immediately before the host's terminal `fecs_write(bar0, 0x409504, 0)`
+/// (spec §10).
+///
+/// Retained from pull 34 (R3-AMEND):
 ///   * the ucode reports the **value it read** into MAILBOX0 (`I[0x1000]`), so
 ///     the ack is no longer a single undifferentiated observable — a stuck
 ///     `CC_SCRATCH[1]` and a genuine echo now look different;
@@ -68,36 +92,60 @@ pub mod ucode {
     use super::regs::falcon_io;
 
     /// Falcon IO indices, derived — never hand-written (spec §3).
+    ///
+    /// These go through [`regs::falcon_io`] deliberately: it carries the
+    /// `& 0xffc` mask, and it is the single point where the host-offset →
+    /// IO-index derivation lives. Do **not** add a second `falcon_io` in this
+    /// module — a local one shadows the real one and silently drops the mask.
     pub const IO_MAILBOX0: u32 = falcon_io(0x040);
     pub const IO_MAILBOX1: u32 = falcon_io(0x044);
     pub const IO_CC_SCRATCH0: u32 = falcon_io(0x800);
     pub const IO_CC_SCRATCH1: u32 = falcon_io(0x804);
+    /// WRCMD_CMD — the poison offset, falcon-side. Host reads of `0x409504`
+    /// fault and wedge the unit (spec §5.4); [`POKE_A_BYTES`] reads it with an
+    /// `iord` from inside the falcon instead. Referenced by POKE only.
+    pub const IO_WRCMD_CMD: u32 = falcon_io(0x504);
 
-    /// Iteration bound on the echo poll loop.
+    /// Iteration bound on the echo/poke poll loop, **in Falcon instructions**.
     ///
     /// Chosen as `0x0010_0000` = 1_048_576 iterations. Sizing argument: the
     /// loop body is 8 instructions, so the bound is ~8.4M Falcon instructions —
     /// milliseconds of Falcon time. The host writes the command word one
-    /// `mmio_write` plus one `serial_println!` after `CPUCTL <= 2`, and at s37
+    /// `fecs_write` plus one `serial_println!` after `CPUCTL <= 2`, and at s37
     /// the ucode had already consumed it by the host's *first* poll
     /// (`iters=0`). The bound is therefore ~3 orders of magnitude larger than
     /// the window it must cover: it exists to guarantee termination (spec
     /// §5.1), not to be reached. If `phase` ever comes back as
-    /// [`PHASE_A_BOUND`]/[`PHASE_B_BOUND`], the command never arrived — that is
-    /// a real finding, not a tuning problem.
+    /// [`PHASE_A_BOUND`], the command never arrived — that is a real finding,
+    /// not a tuning problem.
+    ///
+    /// ⚠ This is a **Falcon** budget. It is not a host MMIO read count and must
+    /// never be used as one: at ~1 µs per BAR0 read it would be ~1 s of boot
+    /// spent spinning. The host side uses [`HOST_ACK_ITERS`].
     pub const ECHO_BOUND: u32 = 0x0010_0000;
 
-    // Phase stamps. Image A uses 0x01..0x04, image B 0x11..0x14, so MAILBOX1
-    // alone names which image ran (pull 25 distinct-magic discipline).
+    /// Host-side poll bound, in **host MMIO reads**, matching the bound the
+    /// `ucode-echo` leg has used since pull 33.
+    pub const HOST_ACK_ITERS: u32 = 100_000;
+
+    // Phase stamps, written to MAILBOX1 (`I[0x1100]`).
     pub const PHASE_A_PRELOOP: u8 = 0x01;
     pub const PHASE_A_POSTREAD: u8 = 0x02;
     pub const PHASE_A_PREACK: u8 = 0x03;
     pub const PHASE_A_POSTACK: u8 = 0x04;
-    pub const PHASE_A_BOUND: u8 = 0xBD;
-    
 
-    /// Image A — indexed IO ports (s37-proven prologue), **down-counting**
-    /// bound via `sub b32 $r5, 0x1`.
+    /// Exit-by-bound stamp, **as the host reads it back**.
+    ///
+    /// The ucode reaches it with `mov $r0, 0xbd` — a *signed* I8 immediate, so
+    /// the register (and therefore MAILBOX1) holds `0xFFFF_FFBD`, not `0xBD`.
+    /// envydis prints that instruction as `mov $r0 -0x43`. Declaring this `u8 =
+    /// 0xBD` is what made the exit-by-bound branch of the host verdict
+    /// unreachable: it compared a sign-extended read against a truncated
+    /// constant and never matched. The byte in the image is still `0xbd`; the
+    /// assertion below takes `PHASE_A_BOUND as u8` to check it.
+    pub const PHASE_A_BOUND: u32 = 0xFFFF_FFBD;
+
+    /// Image A — the ECHO test. **No `$r8`, no `0x409504`.**
     ///
     /// ```text
     /// // Addr | Bytes       | Instruction         | Note
@@ -106,7 +154,7 @@ pub mod ucode {
     /// // 0x03 | f0 13 02    | sethi $r1, 0x02     | $r1 = 0x20000                (s37)
     /// // 0x06 | f1 27 00 01 | mov   $r2, 0x0100   | low half of I[CC_SCRATCH[1]]
     /// // 0x0a | f0 23 02    | sethi $r2, 0x02     | $r2 = 0x20100                (s37)
-    /// // 0x0d | f0 37 01    | mov   $r3, 0x1      | the ack value
+    /// // 0x0d | f0 37 01    | mov   $r3, 0x01     | the ack value
     /// // 0x10 | f1 67 00 10 | mov   $r6, 0x1000   | $r6 = I[MAILBOX0]            (s29)
     /// // 0x14 | f1 77 00 11 | mov   $r7, 0x1100   | $r7 = I[MAILBOX1]            (s30)
     /// // 0x18 | f0 57 00    | mov   $r5, 0x00     | loop counter, low half
@@ -114,26 +162,32 @@ pub mod ucode {
     /// // 0x1f | f0 07 01    | mov   $r0, 0x01     | phase 0x01
     /// // 0x22 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase (pre-loop)
     /// // poll:
-    /// // 0x25 | cf 14 00    | iord  $r4, I[$r1]   | RISKY: read the command word
+    /// // 0x25 | cf 14 00    | iord  $r4, I[$r1]   | read the command word
     /// // 0x28 | d0 64 00    | iowr  I[$r6], $r4   | MAILBOX0 = VALUE READ  <-- split obs.
     /// // 0x2b | f0 07 02    | mov   $r0, 0x02     |
     /// // 0x2e | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase (post-read)
-    /// // 0x31 | b0 44 01    | cmpu b32 $r4, 0x1   | is it the test command?
-    /// // 0x34 | f4 1b 14    | bra ne, +0x14       | -> 0x48 (dec), keep polling
-    /// // 0x37 | f0 07 03    | mov   $r0, 0x03     |
-    /// // 0x3a | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase (pre-ack)
-    /// // 0x3d | d0 23 00    | iowr  I[$r2], $r3   | RISKY: CC_SCRATCH[1] = 1 (ACK)
-    /// // 0x40 | f0 07 04    | mov   $r0, 0x04     |
-    /// // 0x43 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase (post-ack)
-    /// // 0x46 | f8 02       | exit                | terminal state: phase=04
+    /// // 0x31 | b0 44 02    | cmpu b32 $r4, 0x02  | host said "quit"?
+    /// // 0x34 | f4 0b 2b    | bra eq, +0x2b       | -> 0x5f cmd2_exit
+    /// // 0x37 | b0 44 01    | cmpu b32 $r4, 0x01  | host said "ack"?
+    /// // 0x3a | f4 1b 14    | bra ne, +0x14       | -> 0x4e dec, keep polling
+    /// // 0x3d | f0 07 03    | mov   $r0, 0x03     |
+    /// // 0x40 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase (pre-ack)
+    /// // 0x43 | d0 23 00    | iowr  I[$r2], $r3   | CC_SCRATCH[1] = 1 (ACK)
+    /// // 0x46 | f0 07 04    | mov   $r0, 0x04     |
+    /// // 0x49 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase (post-ack)
+    /// // 0x4c | f8 02       | exit                | terminal state: phase=04
     /// // dec:
-    /// // 0x48 | b0 52 01    | sub  b32 $r5, 0x1   | A's variable: subop 2
-    /// // 0x4b | b0 54 00    | cmpu b32 $r5, 0x0   |
-    /// // 0x4e | f4 1b d7    | bra ne, -0x29       | -> 0x25 (poll)
-    /// // 0x51 | f0 07 bd    | mov   $r0, 0xbd     | EXIT BY BOUND
-    /// // 0x54 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = 0xBD
-    /// // 0x57 | f8 02       | exit                |
-    /// // 0x59 | 00 00 00    | (padding)           | 92 bytes = 23 words
+    /// // 0x4e | b6 52 01    | sub b32 $r5, 0x01   | subop 2 on the b6 form
+    /// // 0x51 | b0 54 00    | cmpu b32 $r5, 0x00  |
+    /// // 0x54 | f4 1b d1    | bra ne, -0x2f       | -> 0x25 poll
+    /// // 0x57 | f0 07 bd    | mov   $r0, 0xbd     | EXIT BY BOUND ($r0 = FFFFFFBD)
+    /// // 0x5a | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = FFFFFFBD
+    /// // 0x5d | f8 02       | exit                |
+    /// // cmd2_exit:
+    /// // 0x5f | f0 07 04    | mov   $r0, 0x04     |
+    /// // 0x62 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase (post-ack)
+    /// // 0x65 | f8 02       | exit                |
+    /// // 0x67 | 00 …        | (padding)           | 25 bytes -> 128 bytes = 32 words
     /// ```
     #[rustfmt::skip]
     pub const ECHO_A_BYTES: [u8; 128] = [
@@ -142,8 +196,6 @@ pub mod ucode {
         0xf1, 0x27, 0x00, 0x01,       // mov   $r2, 0x0100
         0xf0, 0x23, 0x02,             // sethi $r2, 0x02
         0xf0, 0x37, 0x01,             // mov   $r3, 0x1
-        0xf1, 0x38, 0x00, 0x41,       // mov   $r8, 0x4100
-        0xf0, 0x38, 0x01,             // sethi $r8, 0x01
         0xf1, 0x67, 0x00, 0x10,       // mov   $r6, 0x1000
         0xf1, 0x77, 0x00, 0x11,       // mov   $r7, 0x1100
         0xf0, 0x57, 0x00,             // mov   $r5, 0x00
@@ -155,30 +207,126 @@ pub mod ucode {
         0xf0, 0x07, 0x02,             // mov   $r0, 0x02
         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
         0xb0, 0x44, 0x02,             // cmpu b32 $r4, 0x2
-        0xf4, 0x2b, 0x2e,             // bra eq, cmd2_exit
+        0xf4, 0x0b, 0x2b,             // bra eq, +0x2b -> 0x5f cmd2_exit
         0xb0, 0x44, 0x01,             // cmpu b32 $r4, 0x1
-        0xf4, 0x1b, 0x17,             // bra ne, dec
-        0xf0, 0x07, 0x03,             // cmd1: mov $r0, 0x03
+        0xf4, 0x1b, 0x14,             // bra ne, +0x14 -> 0x4e dec
+        0xf0, 0x07, 0x03,             // mov   $r0, 0x03
         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
-        0xcf, 0x84, 0x00,             // iord  $r4, I[$r8]
-        0xd0, 0x24, 0x00,             // iowr  I[$r2], $r4
+        0xd0, 0x23, 0x00,             // iowr  I[$r2], $r3   (ACK)
         0xf0, 0x07, 0x04,             // mov   $r0, 0x04
         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
         0xf8, 0x02,                   // exit
-        0xb0, 0x52, 0x01,             // dec: sub b32 $r5, 0x1
+        0xb6, 0x52, 0x01,             // dec: sub b32 $r5, 0x1
         0xb0, 0x54, 0x00,             // cmpu b32 $r5, 0x0
-        0xf4, 0x1b, 0xce,             // bra ne, poll
+        0xf4, 0x1b, 0xd1,             // bra ne, -0x2f -> 0x25 poll
         0xf0, 0x07, 0xbd,             // mov   $r0, 0xbd
         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
         0xf8, 0x02,                   // exit
         0xf0, 0x07, 0x04,             // cmd2_exit: mov $r0, 0x04
         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
         0xf8, 0x02,                   // exit
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00
     ];
 
-    
+    /// Image B — the terminal POKE. Identical skeleton to [`ECHO_A_BYTES`],
+    /// with the `$r8 = falcon_io(0x504)` setup restored at `0x10`/`0x14` and the
+    /// constant ACK replaced by `iord $r4, I[$r8]` → `iowr I[$r2], $r4`, so
+    /// `CC_SCRATCH[1]` carries the **value the falcon read out of `0x409504`**.
+    ///
+    /// Everything after `0x14` is the ECHO listing shifted by +7 bytes (the
+    /// width of the two `$r8` instructions), which is why all three branch
+    /// displacements differ from ECHO's by exactly the same amount.
+    ///
+    /// ```text
+    /// // Addr | Bytes       | Instruction         | Note
+    /// // -----|-------------|---------------------|-------------------------------------
+    /// // 0x00 | f0 17 00    | mov   $r1, 0x00     | low half of I[CC_SCRATCH[0]]
+    /// // 0x03 | f0 13 02    | sethi $r1, 0x02     | $r1 = 0x20000
+    /// // 0x06 | f1 27 00 01 | mov   $r2, 0x0100   | low half of I[CC_SCRATCH[1]]
+    /// // 0x0a | f0 23 02    | sethi $r2, 0x02     | $r2 = 0x20100
+    /// // 0x0d | f0 37 01    | mov   $r3, 0x01     | (unused in B; kept for prologue parity)
+    /// // 0x10 | f1 87 00 41 | mov   $r8, 0x4100   | low half of I[WRCMD_CMD]
+    /// // 0x14 | f0 83 01    | sethi $r8, 0x01     | $r8 = 0x14100 = falcon_io(0x504)
+    /// // 0x17 | f1 67 00 10 | mov   $r6, 0x1000   | $r6 = I[MAILBOX0]
+    /// // 0x1b | f1 77 00 11 | mov   $r7, 0x1100   | $r7 = I[MAILBOX1]
+    /// // 0x1f | f0 57 00    | mov   $r5, 0x00     | loop counter, low half
+    /// // 0x22 | f1 53 10 00 | sethi $r5, 0x0010   | $r5 = ECHO_BOUND
+    /// // 0x26 | f0 07 01    | mov   $r0, 0x01     |
+    /// // 0x29 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase (pre-loop)
+    /// // poll:
+    /// // 0x2c | cf 14 00    | iord  $r4, I[$r1]   | read the command word
+    /// // 0x2f | d0 64 00    | iowr  I[$r6], $r4   | MAILBOX0 = VALUE READ
+    /// // 0x32 | f0 07 02    | mov   $r0, 0x02     |
+    /// // 0x35 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase (post-read)
+    /// // 0x38 | b0 44 02    | cmpu b32 $r4, 0x02  |
+    /// // 0x3b | f4 0b 2e    | bra eq, +0x2e       | -> 0x69 cmd2_exit
+    /// // 0x3e | b0 44 01    | cmpu b32 $r4, 0x01  |
+    /// // 0x41 | f4 1b 17    | bra ne, +0x17       | -> 0x58 dec
+    /// // 0x44 | f0 07 03    | mov   $r0, 0x03     |
+    /// // 0x47 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase (pre-poke)
+    /// // 0x4a | cf 84 00    | iord  $r4, I[$r8]   | ⛔ THE POKE: read 0x409504
+    /// // 0x4d | d0 24 00    | iowr  I[$r2], $r4   | CC_SCRATCH[1] = the word read
+    /// // 0x50 | f0 07 04    | mov   $r0, 0x04     |
+    /// // 0x53 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase (post-poke)
+    /// // 0x56 | f8 02       | exit                |
+    /// // dec:
+    /// // 0x58 | b6 52 01    | sub b32 $r5, 0x01   |
+    /// // 0x5b | b0 54 00    | cmpu b32 $r5, 0x00  |
+    /// // 0x5e | f4 1b ce    | bra ne, -0x32       | -> 0x2c poll
+    /// // 0x61 | f0 07 bd    | mov   $r0, 0xbd     | EXIT BY BOUND ($r0 = FFFFFFBD)
+    /// // 0x64 | d0 70 00    | iowr  I[$r7], $r0   |
+    /// // 0x67 | f8 02       | exit                |
+    /// // cmd2_exit:
+    /// // 0x69 | f0 07 04    | mov   $r0, 0x04     |
+    /// // 0x6c | d0 70 00    | iowr  I[$r7], $r0   |
+    /// // 0x6f | f8 02       | exit                |
+    /// // 0x71 | 00 …        | (padding)           | 15 bytes -> 128 bytes = 32 words
+    /// ```
+    #[rustfmt::skip]
+    pub const POKE_A_BYTES: [u8; 128] = [
+        0xf0, 0x17, 0x00,             // mov   $r1, 0x00
+        0xf0, 0x13, 0x02,             // sethi $r1, 0x02
+        0xf1, 0x27, 0x00, 0x01,       // mov   $r2, 0x0100
+        0xf0, 0x23, 0x02,             // sethi $r2, 0x02
+        0xf0, 0x37, 0x01,             // mov   $r3, 0x1
+        0xf1, 0x87, 0x00, 0x41,       // mov   $r8, 0x4100
+        0xf0, 0x83, 0x01,             // sethi $r8, 0x01 ($r8 = 0x14100)
+        0xf1, 0x67, 0x00, 0x10,       // mov   $r6, 0x1000
+        0xf1, 0x77, 0x00, 0x11,       // mov   $r7, 0x1100
+        0xf0, 0x57, 0x00,             // mov   $r5, 0x00
+        0xf1, 0x53, 0x10, 0x00,       // sethi $r5, 0x0010
+        0xf0, 0x07, 0x01,             // mov   $r0, 0x01
+        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+        0xcf, 0x14, 0x00,             // poll: iord $r4, I[$r1]
+        0xd0, 0x64, 0x00,             // iowr  I[$r6], $r4
+        0xf0, 0x07, 0x02,             // mov   $r0, 0x02
+        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+        0xb0, 0x44, 0x02,             // cmpu b32 $r4, 0x2
+        0xf4, 0x0b, 0x2e,             // bra eq, +0x2e -> 0x69 cmd2_exit
+        0xb0, 0x44, 0x01,             // cmpu b32 $r4, 0x1
+        0xf4, 0x1b, 0x17,             // bra ne, +0x17 -> 0x58 dec
+        0xf0, 0x07, 0x03,             // mov   $r0, 0x03
+        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+        0xcf, 0x84, 0x00,             // iord  $r4, I[$r8]   THE POKE
+        0xd0, 0x24, 0x00,             // iowr  I[$r2], $r4
+        0xf0, 0x07, 0x04,             // mov   $r0, 0x04
+        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+        0xf8, 0x02,                   // exit
+        0xb6, 0x52, 0x01,             // dec: sub b32 $r5, 0x1
+        0xb0, 0x54, 0x00,             // cmpu b32 $r5, 0x0
+        0xf4, 0x1b, 0xce,             // bra ne, -0x32 -> 0x2c poll
+        0xf0, 0x07, 0xbd,             // mov   $r0, 0xbd
+        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+        0xf8, 0x02,                   // exit
+        0xf0, 0x07, 0x04,             // cmd2_exit: mov $r0, 0x04
+        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+        0xf8, 0x02,                   // exit
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    ];
 
     /// Pack a 128-byte Falcon instruction stream into the 32 little-endian
     /// `u32` words IMEMD expects.
@@ -197,43 +345,250 @@ pub mod ucode {
     }
 
     pub const UCODE_CTX_ECHO_A: [u32; 32] = pack128(&ECHO_A_BYTES);
-    
+    pub const UCODE_CTX_POKE_A: [u32; 32] = pack128(&POKE_A_BYTES);
 
-    /// Reconstruct a `mov`(I8)+`sethi`(I8) port pair from the byte listing.
-    const fn port_i8_sethi_i8(b: &[u8; 128], mov_at: usize, sethi_at: usize) -> u32 {
-        (b[mov_at + 2] as u32) | ((b[sethi_at + 2] as u32) << 16)
+    // ---------------------------------------------------------------------
+    // Instruction constructors (envytools Falcon ISA v4; docs/hw/falcon/*.rst).
+    //
+    // Every assertion below is written against these, never against a byte
+    // literal with the intent in a trailing comment. A literal `0xf4, 0x2b`
+    // "bra eq" reads fine and is not `bra eq`; `bra(BRA_EQ, …)` cannot be
+    // wrong in that way.
+    // ---------------------------------------------------------------------
+
+    /// `bra e` — predicate byte of the `f4` form.
+    const BRA_EQ: u8 = 0x0b;
+    /// `bra ne`.
+    const BRA_NE: u8 = 0x1b;
+
+    const fn mov_i8(reg: u8, imm: u8) -> [u8; 3] {
+        [0xf0, (reg << 4) | 0x07, imm]
     }
-    /// Reconstruct a `mov`(I16) port immediate from the byte listing.
-    const fn port_i16(b: &[u8; 128], mov_at: usize) -> u32 {
-        (b[mov_at + 2] as u32) | ((b[mov_at + 3] as u32) << 8)
+    const fn mov_i16(reg: u8, imm: u16) -> [u8; 4] {
+        [0xf1, (reg << 4) | 0x07, (imm & 0xFF) as u8, (imm >> 8) as u8]
+    }
+    const fn sethi_i8(reg: u8, imm: u8) -> [u8; 3] {
+        [0xf0, (reg << 4) | 0x03, imm]
+    }
+    const fn sethi_i16(reg: u8, imm: u16) -> [u8; 4] {
+        [0xf1, (reg << 4) | 0x03, (imm & 0xFF) as u8, (imm >> 8) as u8]
+    }
+    const fn cmpu_b32_i8(reg: u8, imm: u8) -> [u8; 3] {
+        [0xb0, (reg << 4) | 0x04, imm]
+    }
+    const fn sub_b32_i8(reg: u8, imm: u8) -> [u8; 3] {
+        [0xb6, (reg << 4) | 0x02, imm]
+    }
+    const fn bra(cc: u8, disp: u8) -> [u8; 3] {
+        [0xf4, cc, disp]
+    }
+    /// `iord $r<dst>, I[$r<ptr>]`
+    const fn iord(dst: u8, ptr: u8) -> [u8; 3] {
+        [0xcf, (ptr << 4) | dst, 0x00]
+    }
+    /// `iowr I[$r<ptr>], $r<src>`
+    const fn iowr(ptr: u8, src: u8) -> [u8; 3] {
+        [0xd0, (ptr << 4) | src, 0x00]
+    }
+    const fn exit_inst() -> [u8; 2] {
+        [0xf8, 0x02]
     }
 
-    // ⭐ Spec §3: every port immediate in both images is the derived value.
-    // These are the assertions that would have caught pull 33's raw-host-offset
-    // listing at compile time instead of at proposal review.
-    const _: () = assert!(port_i8_sethi_i8(&ECHO_A_BYTES, 0x00, 0x03) == IO_CC_SCRATCH0);
-    const _: () = assert!(
-        (port_i16(&ECHO_A_BYTES, 0x06) | ((ECHO_A_BYTES[0x0c] as u32) << 16)) == IO_CC_SCRATCH1
-    );
-    const _: () = assert!(port_i16(&ECHO_A_BYTES, 0x17) == IO_MAILBOX0);
-    const _: () = assert!(port_i16(&ECHO_A_BYTES, 0x1b) == IO_MAILBOX1);
-    const _: () = assert!(port_i16(&ECHO_A_BYTES, 0x10) == 0x4100); // 0x409504 -> 0x14100
-    const _: () = assert!(ECHO_A_BYTES[0x14 + 2] == 0x01); // sethi $r8, 0x01
-    
-    
+    const fn slice2(b: &[u8; 128], at: usize) -> [u8; 2] {
+        [b[at], b[at + 1]]
+    }
+    const fn slice3(b: &[u8; 128], at: usize) -> [u8; 3] {
+        [b[at], b[at + 1], b[at + 2]]
+    }
+    const fn slice4(b: &[u8; 128], at: usize) -> [u8; 4] {
+        [b[at], b[at + 1], b[at + 2], b[at + 3]]
+    }
+    const fn eq2(a: &[u8; 2], b: &[u8; 2]) -> bool {
+        a[0] == b[0] && a[1] == b[1]
+    }
+    const fn eq3(a: &[u8; 3], b: &[u8; 3]) -> bool {
+        a[0] == b[0] && a[1] == b[1] && a[2] == b[2]
+    }
+    const fn eq4(a: &[u8; 4], b: &[u8; 4]) -> bool {
+        a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]
+    }
+    /// Resolve a branch at `at` by arithmetic: `at + sign_extend(disp)`.
+    const fn bra_target(b: &[u8; 128], at: usize) -> isize {
+        at as isize + b[at + 2] as i8 as isize
+    }
+    /// True if the 3-byte instruction `needle` occurs anywhere in `b`.
+    const fn contains3(b: &[u8; 128], needle: &[u8; 3]) -> bool {
+        let mut i = 0;
+        while i + 3 <= 128 {
+            if eq3(&slice3(b, i), needle) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+    /// True if the 4-byte instruction `needle` occurs anywhere in `b`.
+    const fn contains4(b: &[u8; 128], needle: &[u8; 4]) -> bool {
+        let mut i = 0;
+        while i + 4 <= 128 {
+            if eq4(&slice4(b, i), needle) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+    /// True if every byte from `from` to the end of the image is zero.
+    const fn zero_tail(b: &[u8; 128], from: usize) -> bool {
+        let mut i = from;
+        while i < 128 {
+            if b[i] != 0 {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    // ---------------------------------------------------------------------
+    // ECHO — full coverage. The `at` values below are contiguous: each
+    // assertion's offset is the previous one's offset plus that instruction's
+    // width, from 0x00 through 0x67, and `zero_tail` closes 0x67..128. There
+    // is no byte in this array that no assertion looks at.
+    // ---------------------------------------------------------------------
+    const _: () = {
+        let b = &ECHO_A_BYTES;
+        // prologue — ports derived, never hand-written (spec §3)
+        assert!(eq3(&slice3(b, 0x00), &mov_i8(1, (IO_CC_SCRATCH0 & 0xFF) as u8)));
+        assert!(eq3(&slice3(b, 0x03), &sethi_i8(1, (IO_CC_SCRATCH0 >> 16) as u8)));
+        assert!(eq4(&slice4(b, 0x06), &mov_i16(2, (IO_CC_SCRATCH1 & 0xFFFF) as u16)));
+        assert!(eq3(&slice3(b, 0x0a), &sethi_i8(2, (IO_CC_SCRATCH1 >> 16) as u8)));
+        assert!(eq3(&slice3(b, 0x0d), &mov_i8(3, 1))); // the ack value
+        assert!(eq4(&slice4(b, 0x10), &mov_i16(6, IO_MAILBOX0 as u16)));
+        assert!(eq4(&slice4(b, 0x14), &mov_i16(7, IO_MAILBOX1 as u16)));
+        assert!(eq3(&slice3(b, 0x18), &mov_i8(5, 0x00)));
+        assert!(eq4(&slice4(b, 0x1b), &sethi_i16(5, (ECHO_BOUND >> 16) as u16)));
+        assert!(eq3(&slice3(b, 0x1f), &mov_i8(0, PHASE_A_PRELOOP)));
+        assert!(eq3(&slice3(b, 0x22), &iowr(7, 0)));
+        // poll: @0x25
+        assert!(eq3(&slice3(b, 0x25), &iord(4, 1)));
+        assert!(eq3(&slice3(b, 0x28), &iowr(6, 4)));
+        assert!(eq3(&slice3(b, 0x2b), &mov_i8(0, PHASE_A_POSTREAD)));
+        assert!(eq3(&slice3(b, 0x2e), &iowr(7, 0)));
+        assert!(eq3(&slice3(b, 0x31), &cmpu_b32_i8(4, 2)));
+        assert!(eq3(&slice3(b, 0x34), &bra(BRA_EQ, b[0x36])));
+        assert!(bra_target(b, 0x34) == 0x5f); // cmd2_exit
+        assert!(eq3(&slice3(b, 0x37), &cmpu_b32_i8(4, 1)));
+        assert!(eq3(&slice3(b, 0x3a), &bra(BRA_NE, b[0x3c])));
+        assert!(bra_target(b, 0x3a) == 0x4e); // dec
+        assert!(eq3(&slice3(b, 0x3d), &mov_i8(0, PHASE_A_PREACK)));
+        assert!(eq3(&slice3(b, 0x40), &iowr(7, 0)));
+        assert!(eq3(&slice3(b, 0x43), &iowr(2, 3))); // CC_SCRATCH[1] = $r3 = 1
+        assert!(eq3(&slice3(b, 0x46), &mov_i8(0, PHASE_A_POSTACK)));
+        assert!(eq3(&slice3(b, 0x49), &iowr(7, 0)));
+        assert!(eq2(&slice2(b, 0x4c), &exit_inst()));
+        // dec: @0x4e
+        assert!(eq3(&slice3(b, 0x4e), &sub_b32_i8(5, 1)));
+        assert!(eq3(&slice3(b, 0x51), &cmpu_b32_i8(5, 0)));
+        assert!(eq3(&slice3(b, 0x54), &bra(BRA_NE, b[0x56])));
+        assert!(bra_target(b, 0x54) == 0x25); // poll
+        assert!(eq3(&slice3(b, 0x57), &mov_i8(0, PHASE_A_BOUND as u8)));
+        assert!(eq3(&slice3(b, 0x5a), &iowr(7, 0)));
+        assert!(eq2(&slice2(b, 0x5d), &exit_inst()));
+        // cmd2_exit: @0x5f
+        assert!(eq3(&slice3(b, 0x5f), &mov_i8(0, PHASE_A_POSTACK)));
+        assert!(eq3(&slice3(b, 0x62), &iowr(7, 0)));
+        assert!(eq2(&slice2(b, 0x65), &exit_inst()));
+        assert!(zero_tail(b, 0x67));
+
+        // ⛔ THE POINT OF THE ARC, asserted rather than promised: the ECHO
+        // image contains no path to 0x409504. Neither the port setup nor the
+        // read appears anywhere in the 128 bytes.
+        assert!(!contains4(b, &mov_i16(8, (IO_WRCMD_CMD & 0xFFFF) as u16)));
+        assert!(!contains3(b, &sethi_i8(8, (IO_WRCMD_CMD >> 16) as u8)));
+        assert!(!contains3(b, &iord(4, 8)));
+    };
 
     // The s37-acked prologue is preserved word-for-word (the four words that
-    // executed on metal at sitting #37 must not have moved).
+    // executed on metal at sitting #37 must not have moved), in both images.
     const _: () = assert!(UCODE_CTX_ECHO_A[0] == 0xf000_17f0);
     const _: () = assert!(UCODE_CTX_ECHO_A[1] == 0x27f1_0213);
     const _: () = assert!(UCODE_CTX_ECHO_A[2] == 0x23f0_0100);
     const _: () = assert!(UCODE_CTX_ECHO_A[3] == 0x0137_f002);
+    const _: () = assert!(UCODE_CTX_POKE_A[0] == 0xf000_17f0);
+    const _: () = assert!(UCODE_CTX_POKE_A[1] == 0x27f1_0213);
+    const _: () = assert!(UCODE_CTX_POKE_A[2] == 0x23f0_0100);
+    const _: () = assert!(UCODE_CTX_POKE_A[3] == 0x0137_f002);
 
-    // The counter is initialised to exactly ECHO_BOUND (A) / -ECHO_BOUND (B).
-    const _: () = assert!(((ECHO_A_BYTES[0x24] as u32) | ((ECHO_A_BYTES[0x25] as u32) << 8)) << 16 == ECHO_BOUND);
-    
+    // The counter is initialised to exactly ECHO_BOUND in each image — read
+    // back out of the `sethi` immediate where it actually sits.
+    const _: () =
+        assert!(((ECHO_A_BYTES[0x1d] as u32) | ((ECHO_A_BYTES[0x1e] as u32) << 8)) << 16 == ECHO_BOUND);
+    const _: () =
+        assert!(((POKE_A_BYTES[0x24] as u32) | ((POKE_A_BYTES[0x25] as u32) << 8)) << 16 == ECHO_BOUND);
 
-    
+    // ---------------------------------------------------------------------
+    // POKE — full coverage, same contiguity property, 0x00 through 0x71.
+    // ---------------------------------------------------------------------
+    const _: () = {
+        let b = &POKE_A_BYTES;
+        assert!(eq3(&slice3(b, 0x00), &mov_i8(1, (IO_CC_SCRATCH0 & 0xFF) as u8)));
+        assert!(eq3(&slice3(b, 0x03), &sethi_i8(1, (IO_CC_SCRATCH0 >> 16) as u8)));
+        assert!(eq4(&slice4(b, 0x06), &mov_i16(2, (IO_CC_SCRATCH1 & 0xFFFF) as u16)));
+        assert!(eq3(&slice3(b, 0x0a), &sethi_i8(2, (IO_CC_SCRATCH1 >> 16) as u8)));
+        assert!(eq3(&slice3(b, 0x0d), &mov_i8(3, 1)));
+        // ⛔ the poison port, derived — this is the one place 0x504 may appear
+        assert!(eq4(&slice4(b, 0x10), &mov_i16(8, (IO_WRCMD_CMD & 0xFFFF) as u16)));
+        assert!(eq3(&slice3(b, 0x14), &sethi_i8(8, (IO_WRCMD_CMD >> 16) as u8)));
+        assert!(eq4(&slice4(b, 0x17), &mov_i16(6, IO_MAILBOX0 as u16)));
+        assert!(eq4(&slice4(b, 0x1b), &mov_i16(7, IO_MAILBOX1 as u16)));
+        assert!(eq3(&slice3(b, 0x1f), &mov_i8(5, 0x00)));
+        assert!(eq4(&slice4(b, 0x22), &sethi_i16(5, (ECHO_BOUND >> 16) as u16)));
+        assert!(eq3(&slice3(b, 0x26), &mov_i8(0, PHASE_A_PRELOOP)));
+        assert!(eq3(&slice3(b, 0x29), &iowr(7, 0)));
+        // poll: @0x2c
+        assert!(eq3(&slice3(b, 0x2c), &iord(4, 1)));
+        assert!(eq3(&slice3(b, 0x2f), &iowr(6, 4)));
+        assert!(eq3(&slice3(b, 0x32), &mov_i8(0, PHASE_A_POSTREAD)));
+        assert!(eq3(&slice3(b, 0x35), &iowr(7, 0)));
+        assert!(eq3(&slice3(b, 0x38), &cmpu_b32_i8(4, 2)));
+        assert!(eq3(&slice3(b, 0x3b), &bra(BRA_EQ, b[0x3d])));
+        assert!(bra_target(b, 0x3b) == 0x69); // cmd2_exit
+        assert!(eq3(&slice3(b, 0x3e), &cmpu_b32_i8(4, 1)));
+        assert!(eq3(&slice3(b, 0x41), &bra(BRA_NE, b[0x43])));
+        assert!(bra_target(b, 0x41) == 0x58); // dec
+        assert!(eq3(&slice3(b, 0x44), &mov_i8(0, PHASE_A_PREACK)));
+        assert!(eq3(&slice3(b, 0x47), &iowr(7, 0)));
+        assert!(eq3(&slice3(b, 0x4a), &iord(4, 8))); // ⛔ the poke
+        assert!(eq3(&slice3(b, 0x4d), &iowr(2, 4))); // CC_SCRATCH[1] = value read
+        assert!(eq3(&slice3(b, 0x50), &mov_i8(0, PHASE_A_POSTACK)));
+        assert!(eq3(&slice3(b, 0x53), &iowr(7, 0)));
+        assert!(eq2(&slice2(b, 0x56), &exit_inst()));
+        // dec: @0x58
+        assert!(eq3(&slice3(b, 0x58), &sub_b32_i8(5, 1)));
+        assert!(eq3(&slice3(b, 0x5b), &cmpu_b32_i8(5, 0)));
+        assert!(eq3(&slice3(b, 0x5e), &bra(BRA_NE, b[0x60])));
+        assert!(bra_target(b, 0x5e) == 0x2c); // poll
+        assert!(eq3(&slice3(b, 0x61), &mov_i8(0, PHASE_A_BOUND as u8)));
+        assert!(eq3(&slice3(b, 0x64), &iowr(7, 0)));
+        assert!(eq2(&slice2(b, 0x67), &exit_inst()));
+        // cmd2_exit: @0x69
+        assert!(eq3(&slice3(b, 0x69), &mov_i8(0, PHASE_A_POSTACK)));
+        assert!(eq3(&slice3(b, 0x6c), &iowr(7, 0)));
+        assert!(eq2(&slice2(b, 0x6f), &exit_inst()));
+        assert!(zero_tail(b, 0x71));
+
+        // The poke happens exactly once: one `iord I[$r8]` in the image.
+        let mut n = 0;
+        let mut i = 0;
+        while i + 3 <= 128 {
+            if eq3(&slice3(b, i), &iord(4, 8)) {
+                n += 1;
+            }
+            i += 1;
+        }
+        assert!(n == 1);
+    };
 }
 
 /// s26/s28 FTDI-ring budget: the 0x640000 window is PARKED (triple-refuted),
@@ -1043,18 +1398,22 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                             // than our echo; no ack with a live phase localises the fault.
                                             let mb0 = fecs_read(bar0, base + 0x040);
                                             let phase = fecs_read(bar0, base + 0x044);
-                                            serial_println!(":: kepler: ctx-echo h2h3={} ack={:08X} mb0={:08X} phase={:08X} ::",
-                                                h2h3_label, ack, mb0, phase);
-                                            if phase == phase_bound as u32 {
+                                            serial_println!(":: kepler: ctx-echo h2h3={} ack={:08X} mb0={:08X} phase={:08X} class={} ::",
+                                                h2h3_label, ack, mb0, phase, classify_fecs_word(ack));
+                                            if phase == phase_bound {
                                                 serial_println!(":: kepler: ctx-echo EXIT-BY-BOUND h2h3={} iters={} — command never observed ::",
                                                     h2h3_label, ucode::ECHO_BOUND);
                                                 serial_println!(":: kepler: H3/H4 arm=Instrument-did-not-run (ECHO_BOUND) ::");
                                             }
+                                            // The ECHO ucode acks with the literal `$r3 = 1`. Anything
+                                            // else is not an ack: `class` names which not-an-ack it is
+                                            // so a wedged unit and a silent falcon do not read alike.
                                             if ack == 1 {
-                                                serial_println!(":: kepler: ucode-echo SUCCESS h2h3={} ::", h2h3_label);
+                                                serial_println!(":: kepler: ucode-echo SUCCESS h2h3={} mb0={:08X} ::", h2h3_label, mb0);
                                                 break;
                                             } else {
-                                                serial_println!(":: kepler: ucode-echo NO-ACK h2h3={} ::", h2h3_label);
+                                                serial_println!(":: kepler: ucode-echo NO-ACK h2h3={} ack={:08X} class={} ::",
+                                                    h2h3_label, ack, classify_fecs_word(ack));
                                             }
                                         }
 
@@ -1512,6 +1871,106 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                         kdisp_trace[0], kdisp_trace[1], kdisp_trace[2], kdisp_trace[3],
                                         kdisp_trace[4], kdisp_trace[5], kdisp_trace[6]);
 
+                                    // ============ TERMINAL FALCON POKE — 0x409504, from inside ============
+                                    // The falcon-side counterpart of the host poke below, and the last
+                                    // thing in the kepler leg that runs the FECS core. It reads
+                                    // 0x409504 with `iord I[$r8]` — the access the HOST side cannot
+                                    // survive (spec §5.4) — and reports the word it got in
+                                    // CC_SCRATCH[1]. If the unit wedges, everything it could have
+                                    // wedged has already been printed.
+                                    //
+                                    // This is why the ECHO image no longer carries the read: ECHO runs
+                                    // mid-sequence, so a poisoning read inside it invalidated every
+                                    // FECS observation from the sweep onwards.
+                                    {
+                                        let pbase = 0x409000usize;
+                                        let img = &ucode::UCODE_CTX_POKE_A[..];
+                                        const IMEM_PAGE_WORDS: usize = 0x40;
+                                        const MB_SEED: u32 = 0xA5A5_0000;
+
+                                        // Halt the core if the echo leg left it running.
+                                        let dmactl_pre = fecs_read(bar0, pbase + 0x10C);
+                                        fecs_write(bar0, pbase + 0x10C, dmactl_pre & !1);
+
+                                        fecs_write(bar0, pbase + 0x800, 0);        // CC_SCRATCH[0] cmd
+                                        fecs_write(bar0, pbase + 0x804, MB_SEED);  // CC_SCRATCH[1] ack
+                                        fecs_write(bar0, pbase + 0x040, MB_SEED);  // MAILBOX0 <- value read
+                                        fecs_write(bar0, pbase + 0x044, MB_SEED);  // MAILBOX1 <- phase
+                                        serial_println!(":: kepler: ucode-poke pre CC_SCRATCH[0]={:08X} CC_SCRATCH[1]={:08X} mb0={:08X} mb1={:08X} ::",
+                                            fecs_read(bar0, pbase + 0x800), fecs_read(bar0, pbase + 0x804),
+                                            fecs_read(bar0, pbase + 0x040), fecs_read(bar0, pbase + 0x044));
+
+                                        // Upload. IMEMT tag 0 matches BOOTVEC=0, and the page is padded
+                                        // to IMEM_PAGE_WORDS because the code TLB marks a page usable
+                                        // only when the LAST word of the 0x40-word page is written.
+                                        fecs_write(bar0, pbase + 0x180, 1 << 24);  // IMEMC offset=0, AINCW
+                                        fecs_write(bar0, pbase + 0x188, 0);        // IMEMT tag=0
+                                        for &word in img.iter() { fecs_write(bar0, pbase + 0x184, word); }
+                                        for _ in img.len()..IMEM_PAGE_WORDS { fecs_write(bar0, pbase + 0x184, 0); }
+                                        serial_println!(":: kepler: ucode-poke uploaded words={} padded={} ::", img.len(), IMEM_PAGE_WORDS);
+
+                                        fecs_write(bar0, pbase + 0x180, 1 << 25);  // IMEMC offset=0, AINCR
+                                        let mut verify_poke = true;
+                                        for k in 0..img.len() {
+                                            let rb = fecs_read(bar0, pbase + 0x184);
+                                            if rb != img[k] {
+                                                serial_println!(":: kepler: ucode-poke verify-mismatch word={} wr={:08X} rb={:08X} ::", k, img[k], rb);
+                                                verify_poke = false;
+                                            }
+                                        }
+
+                                        if !verify_poke {
+                                            serial_println!(":: kepler: ucode-poke ABORT verify-mismatch — BOOTVEC/CPUCTL NOT written ::");
+                                        } else {
+                                            // ⚠ LEDGER. FECS_504_READ_TOUCHED is set from `fecs_read`,
+                                            // which sees only HOST accesses; a falcon `iord` is invisible
+                                            // to it. Set it here, BEFORE arming the core, or the ledger
+                                            // reports 504_read_touched=false on exactly the boot where
+                                            // the falcon touched 0x409504 first. An instrument's silence
+                                            // is evidence only if the instrument can execute in the
+                                            // state it reports on.
+                                            FECS_504_READ_TOUCHED.store(true, Ordering::SeqCst);
+
+                                            fecs_write(bar0, pbase + 0x104, 0); // BOOTVEC = 0
+                                            fecs_write(bar0, pbase + 0x100, 2); // CPUCTL START_TRIGGER
+                                            serial_println!(":: kepler: ucode-poke start img=POKE ::");
+
+                                            fecs_write(bar0, pbase + 0x800, 1); // host-cmd: do the poke
+
+                                            // Host-side bound, in HOST MMIO reads. ECHO_BOUND is a
+                                            // falcon instruction budget (1,048,576); spending it here
+                                            // would be ~1 s of boot in BAR0 reads.
+                                            let mut ack = MB_SEED;
+                                            let mut ack_iters = 0u32;
+                                            for i in 0..ucode::HOST_ACK_ITERS {
+                                                ack = fecs_read(bar0, pbase + 0x804);
+                                                ack_iters = i;
+                                                if ack != MB_SEED { break; }
+                                                core::hint::spin_loop();
+                                            }
+
+                                            let mb0 = fecs_read(bar0, pbase + 0x040);
+                                            let phase = fecs_read(bar0, pbase + 0x044);
+                                            let class = classify_fecs_word(ack);
+                                            serial_println!(":: kepler: ctx-poke img=POKE ack={:08X} mb0={:08X} phase={:08X} iters={} class={} ::",
+                                                ack, mb0, phase, ack_iters, class);
+
+                                            if phase == ucode::PHASE_A_BOUND {
+                                                serial_println!(":: kepler: ucode-poke EXIT-BY-BOUND img=POKE bound={} — command never observed, 0x409504 NOT read ::",
+                                                    ucode::ECHO_BOUND);
+                                            } else if ack == MB_SEED {
+                                                serial_println!(":: kepler: ucode-poke FAILURE img=POKE iters={} phase={:08X} — no ack ::",
+                                                    ack_iters, phase);
+                                            } else if class == "VALUE" {
+                                                // The falcon read 0x409504 and got a word that is not a
+                                                // fault response, not a float and not zero.
+                                                serial_println!(":: kepler: ucode-poke SUCCESS img=POKE wrcmd_cmd={:08X} ::", ack);
+                                            } else {
+                                                serial_println!(":: kepler: ucode-poke {} img=POKE wrcmd_cmd={:08X} ::", class, ack);
+                                            }
+                                        }
+                                    }
+
                                     // ================= TERMINAL POKE — MUST BE LAST =================
                                     // ⛔ ORDERING CONTRACT. This is the LAST kepler statement of the
                                     // boot. Nothing below it, and nothing later in `init()`, may touch
@@ -1665,6 +2124,32 @@ pub static FECS_504_READ_INDEX: AtomicU32 = AtomicU32::new(0xFFFFFFFF);
 pub static FECS_504_WRITE_TOUCHED: AtomicBool = AtomicBool::new(false);
 pub static FECS_504_WRITE_INDEX: AtomicU32 = AtomicU32::new(0xFFFFFFFF);
 
+/// Classify a 32-bit word read back out of the FECS unit.
+///
+/// This file has always known that not every non-sentinel word is a result;
+/// what it did not have was one place that says so. The three non-results:
+///
+///   * `BADF….` / `BAD0….` — the chip's own fault response. `BADF1000` is what
+///     a healthy-but-idle unit returns and `BADF1200` an unpowered one (s31);
+///     `BAD0BA20` is the generic form. A poison read must be reported as
+///     POISON, never as a value.
+///   * `FFFFFFFF` — nothing claimed the cycle; the bus floated high.
+///   * `00000000` — carries no information. Every "absent?" test in this file
+///     already lumps `0` in with the two above.
+///
+/// A verdict that carves out only `BADF….` prints SUCCESS for the other three.
+pub fn classify_fecs_word(x: u32) -> &'static str {
+    if (x >> 16) == 0xBADF || (x >> 16) == 0xBAD0 {
+        "POISON"
+    } else if x == 0xFFFFFFFF {
+        "ABSENT"
+    } else if x == 0 {
+        "ZERO"
+    } else {
+        "VALUE"
+    }
+}
+
 pub fn fecs_read(bar0: usize, offset: usize) -> u32 {
     let count = FECS_ACCESS_COUNT.fetch_add(1, Ordering::SeqCst);
     let _ = FECS_FIRST_OFFSET.compare_exchange(
@@ -1701,105 +2186,16 @@ pub unsafe fn mmio_write(base: usize, offset: usize, val: u32) {
     core::ptr::write_volatile((base + offset) as *mut u32, val)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::regs::falcon_io;
-    use super::ucode::*;
-
-    /// The IO derivation itself (spec §3), both metal-proven register families.
-    #[test]
-    fn falcon_io_matches_the_proven_mappings() {
-        assert_eq!(falcon_io(0x040), 0x1000); // MAILBOX0, s29
-        assert_eq!(falcon_io(0x044), 0x1100); // MAILBOX1, s30
-        assert_eq!(falcon_io(0x800), 0x20000); // CC_SCRATCH[0], s37
-        assert_eq!(falcon_io(0x804), 0x20100); // CC_SCRATCH[1], s37
-    }
-
-    /// Round-trip: the documented byte listing packs to the words we upload,
-    /// and unpacking those words reproduces the listing byte for byte.
-    #[test]
-    fn echo_images_round_trip_bytes_to_words() {
-        for (bytes, words) in [
-            (&ECHO_A_BYTES, &UCODE_CTX_ECHO_A),
-            
-        ] {
-            assert_eq!(pack92(bytes), *words);
-            let mut back = [0u8; 92];
-            for (w, word) in words.iter().enumerate() {
-                back[w * 4..w * 4 + 4].copy_from_slice(&word.to_le_bytes());
-            }
-            assert_eq!(&back, bytes);
-        }
-    }
-
-    /// The four words that executed on metal at sitting #37 must not have moved.
-    #[test]
-    fn s37_acked_prologue_is_preserved() {
-        assert_eq!(
-            &UCODE_CTX_ECHO_A[..4],
-            &[0xf000_17f0u32, 0x27f1_0213, 0x23f0_0100, 0x0137_f002]
-        );
-    }
-
-    /// Every port immediate in both images is the value `falcon_io` derives —
-    /// this is the check that would have caught pull 33's raw-host-offset
-    /// listing (`0x800`/`0x804`) at build time.
-    #[test]
-    fn every_port_immediate_is_derived_not_hand_written() {
-        for bytes in [&ECHO_A_BYTES] {
-            // $r1: mov(I8) @0x00 + sethi(I8) @0x03
-            let r1 = bytes[0x02] as u32 | ((bytes[0x05] as u32) << 16);
-            // $r2: mov(I16) @0x06 + sethi(I8) @0x0a
-            let r2 = bytes[0x08] as u32 | ((bytes[0x09] as u32) << 8) | ((bytes[0x0c] as u32) << 16);
-            // $r6/$r7: mov(I16) @0x10 / @0x14
-            let r6 = bytes[0x12] as u32 | ((bytes[0x13] as u32) << 8);
-            let r7 = bytes[0x16] as u32 | ((bytes[0x17] as u32) << 8);
-            assert_eq!(r1, falcon_io(0x800));
-            assert_eq!(r2, falcon_io(0x804));
-            assert_eq!(r6, falcon_io(0x040));
-            assert_eq!(r7, falcon_io(0x044));
-        }
-    }
-
-    /// Bounded-loop law (spec §5.1): the counter is seeded to exactly
-    /// `ECHO_BOUND` iterations in both images, and the loop's only backward
-    /// branch is the one guarded by that counter.
-    #[test]
-    fn echo_loop_is_bounded() {
-        let seed_a = ((ECHO_A_BYTES[0x24] as u32) | ((ECHO_A_BYTES[0x25] as u32) << 8)) << 16;
-        assert_eq!(seed_a, ECHO_BOUND); // A counts down from +bound with `sub`
-        assert_eq!(ECHO_BOUND, 1_048_576);
-
-        // A: `sub b32 $r5, 0x1` = b0 52 01 ; B: `add b32 $r5, 0x1` = b0 50 01.
-        assert_eq!(&ECHO_A_BYTES[0x58..0x5b], &[0xb0, 0x52, 0x01]);
-
-        // The bound test and its backward branch: cmpu $r5,0 ; bra ne,-0x29 -> poll @0x2C.
-        for bytes in [&ECHO_A_BYTES] {
-            assert_eq!(&bytes[0x5b..0x5e], &[0xb0, 0x54, 0x00]);
-            assert_eq!(&bytes[0x5e..0x61], &[0xf4, 0x1b, 0xce]);
-            let disp = bytes[0x60] as i8 as isize;
-            assert_eq!(0x5e_isize + disp, 0x2c); // lands on the `iord`
-            // The forward `bra ne` at 0x42 lands on the decrement block at 0x56.
-            let fwd = bytes[0x43] as i8 as isize;
-            assert_eq!(0x41_isize + fwd, 0x58);
-            // Both exits are a real `exit` (f8 02), not a fall-off-the-page.
-            assert_eq!(&bytes[0x6d..0x6f], &[0xf8, 0x02]); // cmd2_exit
-            assert_eq!(&bytes[0x67..0x69], &[0xf8, 0x02]); // after bound
-        }
-    }
-
-    /// The split observable: MAILBOX0 is written with the value that was read,
-    /// and MAILBOX1 is stamped before and after each risky IO step.
-    #[test]
-    fn split_observable_and_phase_stamps_are_present() {
-        for bytes in [&ECHO_A_BYTES] {
-            assert_eq!(&bytes[0x2c..0x2f], &[0xcf, 0x14, 0x00]); // iord  $r4, I[$r1]
-            assert_eq!(&bytes[0x2f..0x32], &[0xd0, 0x64, 0x00]); // iowr  I[$r6], $r4
-            assert_eq!(&bytes[0x50..0x53], &[0xd0, 0x24, 0x00]); // iowr  I[$r2], $r4 (ack)
-            // five phase stamps, each an `iowr I[$r7], $r0`
-            for at in [0x29usize, 0x35, 0x47, 0x53, 0x64, 0x6c] {
-                assert_eq!(&bytes[at..at + 3], &[0xd0, 0x70, 0x00]);
-            }
-        }
-    }
-}
+// NOTE — there is no `#[cfg(test)] mod tests` here any more, deliberately.
+//
+// The module that used to sit at the bottom of this file did not compile: it
+// called `pack92` (only `pack128` exists), asserted against a 92-byte buffer,
+// and pinned instruction offsets that had moved. It survived in that state
+// because nothing runs `cargo test` on this `no_std` kernel crate — `./arroyo
+// check` is the gate, and `#[cfg(test)]` code is invisible to it.
+//
+// The coverage did not move to nowhere: the `const _: () = { … }` blocks in
+// `mod ucode` pin all 128 bytes of BOTH images, contiguously, padding
+// included — strictly more than the old tests sampled — and const evaluation
+// IS performed by the gate. A test that cannot run is a comment that lies
+// about being a test, so it is gone rather than repaired.
