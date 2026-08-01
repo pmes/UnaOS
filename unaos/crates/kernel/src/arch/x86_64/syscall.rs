@@ -11098,11 +11098,15 @@ fn u7x_run(demo_cpu: usize) {
     // short — because these three cores must be genuinely distinct; a fallback to a shared core
     // would deadlock the GO/SIG sequencing, which is worse than the clean skip below.
     let Some(parent_cpu) = crate::arch::smp::worker_cpu(2) else {
-        // WITCORE: name the REAL condition. "fewer than 3 APs" was true before SCHED-X86 reserved
-        // one AP for the renderer; printing it three lines under `SCHED-X86 PLACE: aps=3` is a lie.
+        // WITCORE: print the MEASURED quantity, not a description of it. "fewer than 3 APs" was true
+        // before SCHED-X86 reserved an AP for the renderer; "fewer than 3 cores free of the render
+        // core (aps=4)" is worse — self-contradicting to anyone who subtracts, because in the
+        // `Exclusive` tier (which every >=3-AP box lands in) the pool excludes the SERVICE core too.
+        // The guard is `worker_cpu(2).is_none()`, i.e. `pool < 3`, so print `pool`.
         serial_println!(
-            ":: U7x: fewer than 3 cores free of the render core (aps={}) — transfer demo skipped ::",
-            crate::arch::smp::online_aps().len()
+            ":: U7x: placement pool too small (aps={} pool={}, need 3) — transfer demo skipped ::",
+            crate::arch::smp::online_aps().len(),
+            crate::arch::smp::worker_pool_len()
         );
         return;
     };
@@ -13679,10 +13683,11 @@ fn sock4_launcher(demo_cpu: usize) {
     // (cooperative ring 3 hogs its core while polling, so sharing either would deadlock the sequencing).
     // WITCORE: the THIRD non-render core (see `u7x_run`) — strict, so a short pool skips cleanly.
     let Some(grantor_cpu) = crate::arch::smp::worker_cpu(2) else {
-        // WITCORE: the real condition — the pool excludes the render core (see `u7x_run`).
+        // WITCORE: the measured quantity — the pool excludes render AND service (see `u7x_run`).
         serial_println!(
-            ":: SOCK-4: fewer than 3 cores free of the render core (aps={}) — transferable-socket demo skipped ::",
-            crate::arch::smp::online_aps().len()
+            ":: SOCK-4: placement pool too small (aps={} pool={}, need 3) — transferable-socket demo skipped ::",
+            crate::arch::smp::online_aps().len(),
+            crate::arch::smp::worker_pool_len()
         );
         return;
     };
@@ -16594,10 +16599,11 @@ fn u6gx_launcher(_demo_cpu: usize) {
     // WITCORE: both from the non-render pool (see `u7x_run`) — strict, so a short pool skips cleanly.
     let (Some(cpu_a), Some(cpu_b)) = (crate::arch::smp::worker_cpu(0), crate::arch::smp::worker_cpu(2))
     else {
-        // WITCORE: the real condition — the pool excludes the render core (see `u7x_run`).
+        // WITCORE: the measured quantity — the pool excludes render AND service (see `u7x_run`).
         serial_println!(
-            ":: U6gx: fewer than 3 cores free of the render core (aps={}) — owner/grants demo skipped ::",
-            crate::arch::smp::online_aps().len()
+            ":: U6gx: placement pool too small (aps={} pool={}, need 3) — owner/grants demo skipped ::",
+            crate::arch::smp::online_aps().len(),
+            crate::arch::smp::worker_pool_len()
         );
         return;
     };

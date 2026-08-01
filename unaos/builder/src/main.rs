@@ -614,6 +614,12 @@ fn main() {
     // busy-spinning on the storage-service core) — i.e. precisely the interaction the placement rule
     // exists to protect. 6 restores index-2 consumers to a 3-core pool. Metal is this track's
     // verdict; this line is here so the change does not silently delete fixture coverage.
+    //
+    // 6 meets the requirement with ZERO SLACK: 5 APs - render - service = exactly 3. One AP failing
+    // INIT-SIPI-SIPI (`smp.rs` logs `did not come online (timeout)`) drops the pool to 2 and those
+    // fixtures skip again. `:: SCHED-X86 PLACE-CHECK: ... verdict=PARTIAL ::` is the line that says
+    // so — not a FAIL, because the placement rule still holds; it is a COVERAGE loss. Raise this
+    // number rather than reading PARTIAL as noise.
     let smp = std::env::var("UNAOS_SMP").unwrap_or_else(|_| "6".into());
     cmd.arg("-smp").arg(smp);
 

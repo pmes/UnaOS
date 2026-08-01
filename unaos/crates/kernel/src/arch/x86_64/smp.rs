@@ -79,8 +79,10 @@ pub fn online_aps() -> Vec<usize> {
 //
 // BEFORE the handoff publishes a split — and on every build that never takes it (`rast`, `usbdebug`,
 // a single-AP box, the pre-GUI `witness` fixture block) — both helpers degrade to indexing
-// `online_aps()` directly. That reproduces the pre-WITCORE placement at twelve of the thirteen
-// converted sites. It is NOT true at the thirteenth: `irqstorage::selftest_once` deliberately lost
+// `online_aps()` directly. That reproduces the pre-WITCORE placement at eleven of the TWELVE
+// converted sites (twelve, not thirteen — the thirteenth placement site in the tree,
+// `syscall::bg_place_cpu`, is deliberately NOT converted and is named in the `kernel_main` handoff
+// comment). It is NOT true at the twelfth: `irqstorage::selftest_once` deliberately lost
 // its `.get(1).or_else(|| .first())` fallback, because the two takers that fallback co-located are
 // both preemptible holders of `XHCI_CONTROLLER`. On a 1-AP `usbdebug`/`rast`/no-split build
 // `bx-blockreq` therefore no longer runs; it prints a SKIP line and `selftest_verdict()` reads 0.
@@ -148,7 +150,11 @@ impl PlaceTier {
 /// The eligible cores for non-render work, in placement order, plus the tier that produced them.
 fn worker_pool() -> (Vec<usize>, PlaceTier) {
     let online = online_aps();
-    let (Some(r), Some(s)) = (render_cpu(), service_cpu()) else {
+    // ONE load, through `split()`. This was `(render_cpu(), service_cpu())` — two loads — which is
+    // safe today only because a single store exists in the whole program. Written that way here it
+    // undercut the entire reason the two words were collapsed into one. This is the only caller that
+    // needs both halves, so it is the one that has to demonstrate the discipline.
+    let Some((r, s)) = split() else {
         return (online, PlaceTier::Unpublished);
     };
     let excl: Vec<usize> = online.iter().copied().filter(|&c| c != r && c != s).collect();
@@ -160,6 +166,17 @@ fn worker_pool() -> (Vec<usize>, PlaceTier) {
         return (no_render, PlaceTier::SvcShared);
     }
     (online, PlaceTier::RenderShared)
+}
+
+/// How many cores the placement pool currently holds — i.e. the largest `n + 1` for which
+/// `worker_cpu(n)` returns `Some`.
+///
+/// Exists so a caller that DECLINES can print the measured quantity instead of re-describing the
+/// condition in prose. "fewer than 3 cores free of the render core (aps=4)" is self-contradicting on
+/// a 4-AP box in the `Exclusive` tier — three cores genuinely are free of the render core; what is
+/// short is the pool, which also excludes the SERVICE core. Print `pool=`, not an adjective.
+pub fn worker_pool_len() -> usize {
+    worker_pool().0.len()
 }
 
 /// The `n`th core (0-based) for work that MUST NOT share a core with `x86_render_service`.
@@ -257,23 +274,39 @@ pub fn publish_sched_split(render: usize, service: usize) {
 ///   3. the split read BACK out of `SPLIT`, and the pool `worker_cpu`/`xhci_worker_cpu` will hand
 ///      out, re-derived now. Produced by this module.
 ///
-/// It can therefore fail for real: a `spawn` that ignored its pin, a steal that moved a task marked
-/// pinned, a second publisher, a torn `SPLIT`, or a pool that contains the core the renderer
-/// actually landed on would each show up. Verdicts:
+/// It can therefore fail for real, and the `!agree` arm is where that lives — it crosses three
+/// subsystem boundaries, so a mis-set GS base on an AP, a `spawn_inner` enqueueing on the wrong
+/// index, a run loop popping another core's queue, a future work-stealing `make_ready`, a second
+/// publisher, or a torn `SPLIT` each surface as `FAIL`. FOUR failure modes, not five: `collide > 0`
+/// is belt-and-braces, NOT an independent falsifier. Given `agree`, `actual` IS the published render
+/// core, and `worker_pool` filters that core out in both `Exclusive` and `SvcShared`;
+/// `RenderShared` needs a single AP, which the match guard in `kernel_main` that is the only path to
+/// `publish_sched_split` already excludes; and `Unpublished` cannot hold when `published` is `Some`.
+/// So `collide` is printed as a diagnostic and can never change the outcome on its own. It stays
+/// because a future edit to `worker_pool` could make it independent, and a counter that is already
+/// on the wire will say so.
 ///
-///   `PASS`    — all three agree, and no core this module hands out equals the running renderer's.
-///   `PARTIAL` — the above holds, but some consumer class got no core (`xhci=[-,…]` on the PLACE
-///               line): the rule is intact, coverage is not. Its own word, because rounding this up
-///               to PASS is exactly what made the first version of this witness useless.
-///   `FAIL`    — a placement collides with the running renderer, or the core it is running on is not
-///               the one that was published/requested.
+/// Verdicts:
+///
+///   `PASS`    — all three agree, AND every consumer class got the cores it needs.
+///   `PARTIAL` — the rule is intact but coverage is not: some consumer class got no core. That means
+///               the xHCI class (`xhci=[-,…]`) OR the worker class — `pool < 3`, which is what U7x,
+///               SOCK-4 and U6gx each need, U6gx being the only automated exercise of the STOR-1 S5
+///               mitigation. The worker term was missing from the first version of this function, so
+///               `PASS` printed on exactly the boot the `-smp 6` default exists to prevent: the same
+///               "rounding up to PASS" defect this witness was written to remove, one level up.
+///   `FAIL`    — the core it is running on is not the one that was published/requested (or, see
+///               above, a pool that somehow contains it).
 pub fn confirm_render_core(arg: usize) {
     let actual = percpu::this_cpu().cpu_index as usize;
     let published = split().map(|(r, _)| r);
     let (pool, tier) = worker_pool();
     let collide = pool.iter().filter(|&&c| c == actual).count();
     let agree = published == Some(actual) && arg == actual;
-    let short = xhci_worker_cpu(0).is_none() || xhci_worker_cpu(1).is_none();
+    // BOTH terms. `pool.len() < 3` covers the worker class (U7x/SOCK-4/U6gx need `worker_cpu(2)`);
+    // the `xhci_worker_cpu` checks cover the xHCI class, which returns `None` in `SvcShared`
+    // regardless of how deep the pool is. Neither implies the other.
+    let short = pool.len() < 3 || xhci_worker_cpu(0).is_none() || xhci_worker_cpu(1).is_none();
 
     let verdict = if !agree || collide > 0 {
         "FAIL"

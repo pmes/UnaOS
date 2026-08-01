@@ -311,10 +311,12 @@ any MTRR type, so the MSR was the only missing piece.
 
 ```
 :: SCHED-X86: RENDER on core 1 + INPUT/usb-pump on core 7 (7 AP(s) dispatching) — OS on its own scheduler ::
+:: SCHED-X86 PLACE: aps=7 render=c1 svc=c7 worker=[c2,c3,c4] xhci=[c2,c3] tier=exclusive pool=5 ::
 :: SCHED-X86: BSP entered run loop cpu=0 ::
 :: SCHED-X86: usb-pump task dispatched on core 7 ::
 :: SCHED-X86: input task dispatched on core 7 ::
 :: SCHED-X86: render task dispatched on core 1 — panel owned by the scheduler ::
+:: SCHED-X86 PLACE-CHECK: actual=c1 arg=c1 published=c1 pool=5 collide=0 tier=exclusive verdict=PASS ::
 [schedx86] depth sent=… recv=… inflight=… (render core 1)
 ```
 
@@ -323,6 +325,44 @@ is not dispatched (the WINX-2/WINX-3 lesson), and a spawn line with no dispatch
 line names a run queue nobody pops. `inflight` is the live `GUI_CHANNEL_X86`
 occupancy — the number that separates "render is keeping up" from "render is wedged
 and the input task is one burst from blocking in `send`".
+
+### Core placement (WITCORE) — the two extra lines
+
+SCHED-X86 reserved two APs by name but left every *other* placement site in the tree
+saying `online_aps().first()`, which since that arc has meant **the render core**.
+`arch::x86_64::smp` now owns placement — `worker_cpu(n)` (never render) and
+`xhci_worker_cpu(n)` (never render or service, because both hold the raw
+`XHCI_CONTROLLER` spinlock and two preemptible holders on one core deadlock it) —
+and the two lines above are how a bench operator checks it.
+
+`PLACE` is the **map**, printed at the handoff before any task is spawned. It
+carries no verdict on purpose: a check made at publish time against the publisher's
+own arguments is a tautology. `worker=[…]` are the cores the ring-3 fixture ladder
+will take; `xhci[0]` is `storage-svc` and `xhci[1]` is `bx-blockreq`. A `-` means
+that consumer got **no core and will skip**.
+
+`PLACE-CHECK` is the **verdict**, printed by the render task itself once it is
+running, comparing the core the hardware reports (`percpu::this_cpu().cpu_index`),
+the core the spawn site asked for, and the split read back out of `smp::SPLIT`:
+
+| verdict | meaning | operator action |
+| --- | --- | --- |
+| `PASS` | all three agree and every consumer class got its cores | none |
+| `PARTIAL` | rule intact, **coverage lost** — `pool < 3` (U7x/SOCK-4/U6gx skip, and U6gx is the only automated exercise of the STOR-1 S5 mitigation) or an `xhci=` slot is `-` (storage service and/or `bx-blockreq` skip) | raise core count; on QEMU `UNAOS_SMP=8` |
+| `FAIL` | the renderer is not on the core that was published/requested — a mis-set GS base, a spawn enqueued on the wrong index, a run loop popping another core's queue, or a torn publish | stop; this is the defect the arc exists to prevent |
+
+`awk '/SCHED-X86 PLACE/'` gets both lines; `awk '/verdict=FAIL/'` is the alarm.
+Note the QEMU default `-smp 6` (5 APs) meets the 3-core pool requirement with **zero
+slack** — one AP failing INIT-SIPI-SIPI yields `PARTIAL`, not `FAIL`.
+
+Sites that DECLINE print the measured pool rather than a description of it, e.g.
+`:: U6gx: placement pool too small (aps=4 pool=2, need 3) — owner/grants demo skipped ::`.
+
+One placement site is deliberately **not** under this owner: `syscall::bg_place_cpu`,
+which starts `bg`/`run` programs on the caller's core — since SCHED-X86, the render
+core. That is not a rule-1 deadlock (the storage syscall handler is IF-masked and
+cannot be preempted holding `XHCI_CONTROLLER`); it is an operator-facing placement
+question — a foreground `run` degrades the panel for its duration — and it is open.
 
 **Expected at the bench, not fixed here:** the shell now runs inside
 `x86_render_service`, so `bg_place_cpu()`'s premise ("the caller's core is
