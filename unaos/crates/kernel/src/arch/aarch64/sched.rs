@@ -6346,10 +6346,12 @@ fn load_witness_tick() {
 /// A `span_max` well past `window` beside a `SCHED: load` line that still reads honestly busy is the
 /// whole arc in one line.
 ///
-/// Two callers, deliberately: `load_witness_tick` (metal, the attended-boot proof, inheriting that
-/// line's change-only suppression so it adds no steady-state chatter) and `load_accounting_witness`
+/// THREE callers, deliberately: `load_witness_tick` (metal, the attended-boot proof, inheriting that
+/// line's change-only suppression so it adds no steady-state chatter), `load_accounting_witness`
 /// (once, in the QEMU battery — otherwise nothing in the gate exercises the aged read at all, since
-/// `timer_preempt` never runs on raspi4b). Reads only; safe from any core.
+/// `timer_preempt` never runs on raspi4b), and `storm_census` (STORM-HEADROOM: re-emitted at the
+/// storm verb's launch boundaries, from task context, so a fleet capture reads this line at the
+/// instant the fleet changes size rather than at the timer's). Reads only; safe from any core.
 fn pulse5_witness() {
     let mut live_ms = [0u64; 4];
     for cpu in 0..NUM_CPUS.min(4) {
@@ -6467,8 +6469,10 @@ pub fn prio_witness() {
 }
 
 /// SPREAD-4 — the proof line for live residents + re-placement, in the `[pulse5]` mould and emitted
-/// from the same two sites, so the placement signal is readable beside the load numbers it is derived
-/// from. It says exactly three things:
+/// from the same three sites (`load_witness_tick`, `load_accounting_witness`, and — since
+/// STORM-HEADROOM — `storm_census`, which re-emits it at the storm verb's launch boundaries), so the
+/// placement signal is readable beside the load numbers it is derived from. It says exactly three
+/// things:
 ///
 ///   * `cN=active/committed` — per core, the runnable resident count `pick_cpu` now keys on, over the
 ///     SPREAD-3 committed count it used to. `2/5` is the arc in one field: three of that core's five
@@ -6651,6 +6655,142 @@ fn spread7_witness() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// STORM-HEADROOM — the census the `storm` shell verb takes at its launch boundaries.
+// ---------------------------------------------------------------------------------------------
+//
+// The question is "what breaks FIRST as the fleet grows", and until now a storm run could not
+// answer it. Every quantity that would name a ceiling already exists, but each rides a clock of its
+// own: `:: SCHED: load ::` and its `[pulse5]`/`[spread4]`/`[spread7]`/`[spread9]`/`[spread10]`/
+// `[prio]` train ride `timer_preempt`'s ~1 s window (metal-only), `[fluid3]`/`[comp2]` ride the
+// compositor's. Reading a storm against them meant correlating by eye across two unsynchronised
+// cadences — and the interval that matters, the seconds in which the fleet is actually being built,
+// is SHORTER THAN ONE WINDOW. The launch boundary is a third clock, and the only one that samples
+// the fleet at the instant it changes size.
+//
+// This block mints no counter. Every number below already existed and is read through the accessor
+// that already owns it; what is new is WHEN they are sampled and that they are sampled TOGETHER.
+//
+// WHY DEPTH AND SATURATION ARE PRINTED AS A PAIR, always. The note above `pick_cpu` says why one
+// alone is uninterpretable: a core spinning flat-out inside one compute-bound vug holds that task in
+// `current`, NOT in its run queue, so it reads depth 0 exactly like a genuinely idle core. The pair
+// separates three different ceilings that the load line alone conflates:
+//   * `busy=99% rq=0/0` — saturated with nothing waiting; the ceiling is that core's throughput.
+//   * `busy=99% rq=6/6` — saturated with a queue behind it; the ceiling is PLACEMENT, and
+//     `[spread10] rstale`/`recruit` on the same block say whether placement was offered a way out.
+//   * `busy=-- ` — the core is not dispatching at all; nothing about it is a load measurement.
+//
+// WHAT THIS INSTRUMENT'S SILENCE MEANS — because a measurement whose absence is misread is worse
+// than no measurement. Apart from one `boot-baseline` line taken by `load_accounting_witness` (which
+// exists only so the gate EXECUTES this code), every `[storm]` line is emitted from the SHELL task
+// inside the `storm` verb. So it can run for exactly as long as the shell is dispatched. That is the
+// state a headroom probe is about, and its readings are honest there — but a fleet that starves the
+// shell also silences the probe, and starving the shell is one of the outcomes it is hunting. Its
+// silence is therefore NEVER a refutation of anything.
+//
+// Two properties make that silence READABLE rather than mute: the `pre` census is emitted BEFORE the
+// first launch, and one line is emitted after EACH successful launch — so the last `[storm] k=` on
+// the wire names the launch after which the shell stopped reporting, and a truncated tail is itself
+// the measurement. The instruments that survive a starved shell are the timer-driven ones —
+// `load_witness_tick` and the `[spin1]` block inside `pulse5_witness` — which run from the timer IRQ
+// on every core and depend on no task being schedulable. Read those BESIDE this block, never
+// instead of it, and never read a missing `post` as a clean run.
+//
+// WHAT IS DELIBERATELY ABSENT, and why each absence is a correctness property rather than a gap:
+//   * `[prio]`'s per-window DELTAS. `prio_witness` swaps its `PRIO_LAST_*` snapshots as it prints,
+//     so calling it here would silently shorten the next periodic `[prio]` line's window — a probe
+//     that alters what it measures. At a boundary sample the cumulative totals carry the same
+//     information and cost the periodic line nothing, so `storm_census` prints those instead.
+//   * `[fluid3]`'s park-duration percentiles. `fluid3_drain` CONSUMES the buckets it reports; they
+//     belong to the compositor, which drains them on the `[comp2]` cadence. Sampling them here would
+//     take the very samples the `[fluid3]` line is computed from — the same defect, larger. Read
+//     `[fluid3]` from its own cadence beside a storm run; park PRESSURE is still represented here,
+//     through `[spread4] short/rewake` and `[spread7] wake2disp`, which are cumulative and safe to
+//     re-read.
+//
+// COST, priced rather than waved away. `storm_probe` takes each core's run-queue lock once through
+// the `rq()` guard — IRQ-masked for the hold, WEDGE-4's law, the only admissible acquisition — for
+// an O(NUM_PRIORITIES) length read. That is byte-for-byte the hold `pick_cpu` already takes on every
+// EL0 spawn, and it happens once per launch rather than once per frame. Not zero, and saying so is
+// the point: an instrument that stands on the measured path has to state its own weight.
+
+/// STORM-HEADROOM — one boundary sample: per-core saturation, run-queue depth and EL0 residency,
+/// under the caller's `phase` label so a capture reads back in launch order. See the block above for
+/// what the pairs mean, what the line's absence does not prove, and what this hold costs.
+///
+/// TWO callers, and the second one exists for the reason stated at its site: the `storm` verb (the
+/// measurement this is for) and `load_accounting_witness` (one `boot-baseline` line, so the QEMU
+/// battery actually EXECUTES this function rather than merely compiling it).
+pub fn storm_probe(phase: &str) {
+    let mut ready = [0usize; 4];
+    let mut below = [0usize; 4];
+    let mut ctx = 0u64;
+    for cpu in 0..NUM_CPUS.min(4) {
+        // Both depths under ONE hold, so the total and the below-band figure describe the same queue
+        // state rather than two instants a lock release apart.
+        {
+            let q = rq(cpu);
+            ready[cpu] = q.len();
+            below[cpu] = q.len_below_band();
+        }
+        ctx += core_load(cpu).ctx_switches;
+    }
+    // SCHED-8's `--`-for-untracked rendering, from the same accessor the `:: SCHED: load ::` line
+    // uses: a core that has left the dispatch loop carries a FROZEN percent, and printing it as a
+    // number here would put a stale saturation reading in the middle of a headroom argument.
+    let b = |i: usize| {
+        let ld = core_load(i);
+        if ld.tracked {
+            alloc::format!("{}%", ld.busy_pct_recent)
+        } else {
+            alloc::string::String::from("--")
+        }
+    };
+    serial_println!(
+        "[storm] {} | busy c0={} c1={} c2={} c3={} | rq(ready/below-band) c0={}/{} c1={}/{} c2={}/{} c3={}/{} | el0(runnable/committed) c0={}/{} c1={}/{} c2={}/{} c3={}/{} | ctx={}",
+        phase,
+        b(0), b(1), b(2), b(3),
+        ready[0], below[0], ready[1], below[1], ready[2], below[2], ready[3], below[3],
+        el0_active(0), EL0_RESIDENTS[0].0.load(Ordering::Relaxed),
+        el0_active(1), EL0_RESIDENTS[1].0.load(Ordering::Relaxed),
+        el0_active(2), EL0_RESIDENTS[2].0.load(Ordering::Relaxed),
+        el0_active(3), EL0_RESIDENTS[3].0.load(Ordering::Relaxed),
+        ctx,
+    );
+}
+
+/// STORM-HEADROOM — the FULL boundary block, emitted at the two ends of a storm (the per-launch
+/// lines in between are [`storm_probe`] alone, which is the cheap half).
+///
+/// It is [`storm_probe`] followed by the standing witness train re-emitted at THIS instant instead
+/// of the timer's — `[pulse5]` (live spans + the `[spin1]` starvation block), then `[spread4]`,
+/// which already chains `[spread7]`/`[spread9]`/`[spread10]`: placement declines (`rstale`),
+/// recruitment, co-placement, wake-to-dispatch latency and the park/wake ratios, all in their
+/// existing wording so a storm capture and a steady-state capture are read with one vocabulary.
+///
+/// It closes with `[prio]`'s CUMULATIVE totals, read directly rather than through `prio_witness`,
+/// for the reason given in the block above: that function consumes the deltas the periodic line is
+/// made of, and a probe must not spend the instrument it is standing next to.
+pub fn storm_census(phase: &str) {
+    storm_probe(phase);
+    pulse5_witness();
+    spread4_witness(); // chains [spread7] -> [spread9], and [spread10]
+    let mut svc = 0u64;
+    let mut el0 = 0u64;
+    let mut defer = 0u64;
+    let mut aged = 0u64;
+    for cpu in 0..NUM_CPUS {
+        svc += PRIO_SVC_DISPATCH[cpu].load(Ordering::Relaxed);
+        el0 += PRIO_EL0_DISPATCH[cpu].load(Ordering::Relaxed);
+        defer += PRIO_DEFER[cpu].load(Ordering::Relaxed);
+        aged += PRIO_AGED_IN[cpu].load(Ordering::Relaxed);
+    }
+    serial_println!(
+        "[storm] {} prio totals svc={} el0={} defer={} agedin={} (cumulative — the per-window deltas stay with [prio])",
+        phase, svc, el0, defer, aged,
+    );
+}
+
 /// SCHED-2 on-demand per-core load table (the `top` shell verb's body, and a serial witness). Prints
 /// one row per core: recent busy percent (rolling window), cumulative context switches, and the last
 /// task (id + name). Reads `core_load` per core — introspection only, safe from any core.
@@ -6715,6 +6855,16 @@ pub fn load_accounting_witness() {
     // dispatch counters are live on that path (the cooperative loop dispatches through the same
     // `dispatch_next`), so the line carries real numbers, not a wired-and-zero placeholder.
     prio_witness();
+    // STORM-HEADROOM: the probe's own machinery, exercised by the gate. Every other line here is
+    // emitted by SOME path the battery reaches; `storm_probe` is reached only by an operator typing
+    // `storm`, so without this call its first execution ever would be on an attended bench, and a
+    // formatting or lock-ordering defect in it would surface exactly where it costs the most. This is
+    // the `[spread4]`-baseline argument one step further: that line proves its counters are wired,
+    // and this one proves the run-queue reads and the pair rendering RUN. Only the cheap half — the
+    // full `storm_census` would re-emit the three lines directly above it. Deliberately taken AFTER
+    // them so the PASS/FAIL line the gate matches, and the witness order it has always printed in,
+    // are untouched.
+    storm_probe("boot-baseline");
 }
 
 /// M3b/M4a/M4-capstone: turn on preemptive scheduling and put a workload on the APs, then flip

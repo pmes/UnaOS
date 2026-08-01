@@ -2345,6 +2345,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // BGRUN-1: background EL0 runs — the concurrent-apps line (windows coexist; TAB cycles).
             #[cfg(feature = "baremetal")]
             console.println("PROC:     run <path> (foreground), bg <path> (background), jobs (list+reap), kill <pid>");
+            // STORM-HEADROOM: the verb existed since P77 but was never listed, so the one command an
+            // attended bench uses to load the scheduler was discoverable only from the source. The
+            // cap is stated here because it is the first thing a `storm 8` reading needs.
+            #[cfg(feature = "baremetal")]
+            console.println("          storm [n]  (launch n vugs; n>6 is refused by the process table — serial carries the [storm] census)");
             console.println("POWER:    batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
             console.println("WITNESS:  bootlog (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
@@ -3352,22 +3357,103 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // STORM-VERB (Peter, P77 sitting): launch a whole vug fleet in one command — `storm [n]`,
             // default 6, so an operator can raise a load storm without typing `bg /fat/VUG.ELF` six
             // times. Each launch is EXACTLY the bg path (same spawn, same job table, same messages);
-            // this verb is only the loop. Stops honestly at the first failure — a partial fleet is
-            // reported as such, never rounded up. The job table (8 slots) and PROCS-6's bg cap bound n.
+            // this verb adds the loop and, since STORM-HEADROOM, the MEASUREMENT around the loop. It
+            // still decides nothing about how a vug is spawned or where it is placed. Stops honestly
+            // at the first failure — a partial fleet is reported as such, never rounded up.
+            //
+            // STORM-HEADROOM — WHAT ACTUALLY BOUNDS `n`. The sentence this replaces ("the job table
+            // (8 slots) and PROCS-6's bg cap bound n") was true and useless: it named both bounds
+            // without saying which one BITES. The clamp below admits 8; `syscall::proc_table_rows()`
+            // is 6. So `storm 7` and `storm 8` cannot succeed as asked on ANY boot, empty or not —
+            // the seventh launch is refused by the process table, the loop stops, and the fleet that
+            // remains is the same fleet `storm 6` builds. The clamp stays at 8 deliberately: an
+            // operator who asks for more than the machine has must get a REFUSAL that names the
+            // resource, not a silently-lowered request that reads as if it were granted. The cap is
+            // not a knob — see the `MAX_PROCS` block in `arch::syscall` for why 6 is where the EL0
+            // slot reserve puts it, and treat moving it as an arc, not a tuning step.
+            //
+            // WHY THE CENSUS SITS HERE. Every scheduler quantity that could name a ceiling already
+            // exists, but on other clocks: the `:: SCHED: load ::` train is timer-driven (~1 s
+            // windows, metal-only) and `[fluid3]`/`[comp2]` ride the compositor. The seconds in which
+            // a fleet is being BUILT are shorter than one of those windows, so the launch boundary is
+            // the only clock that samples the machine at the instant its size changes. `pre` is taken
+            // before the first launch, one `[storm] k=` line after each successful one, `post` after
+            // the burst. That layout is what makes a WEDGE readable as well as a refusal: if the
+            // fleet starves the shell, this verb stops printing, and the last `k=` on the wire names
+            // the launch it stopped after. Its silence proves nothing on its own — the timer-driven
+            // `:: SCHED: load ::` / `[pulse5]` / `[spin1]` lines are the instruments that survive a
+            // starved shell, and they are what a silent tail must be read against.
             let n = args
                 .first()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(6)
                 .clamp(1, 8);
+            // Pre-flight resource census. The refusal string already names what ran out AT a refusal;
+            // this names the headroom when there is NO refusal, which is the reading "storm 6 launched
+            // 6/6" silently withholds. Taken before the burst so a partial fleet can be attributed to
+            // rows that were already spoken for (live work, corpses awaiting `jobs`, or the PORPHANED
+            // rows `jobs` can never reap) rather than to the cap.
+            let rows = crate::arch::syscall::proc_table_rows();
+            let (rows_free, rows_running, rows_exited, rows_orphaned) =
+                crate::arch::syscall::proc_table_headroom();
+            let (jobs_free, jobs_rows) = {
+                let j = BG_JOBS.lock();
+                (j.iter().filter(|s| s.is_none()).count(), j.len())
+            };
+            let slots_free = crate::arch::boot::user_slots_free();
+            console.println(&alloc::format!(
+                "storm: n={} — {}/{} process rows free, {}/{} job rows, {}/{} EL0 slots",
+                n, rows_free, rows, jobs_free, jobs_rows,
+                slots_free, crate::arch::boot::USER_SLOTS
+            ));
+            serial_println!(
+                ":: STORM: begin n={} | proc rows free={} running={} exited={} porphaned={} of {} | job rows free={}/{} | EL0 slots free={}/{} ::",
+                n, rows_free, rows_running, rows_exited, rows_orphaned, rows,
+                jobs_free, jobs_rows, slots_free, crate::arch::boot::USER_SLOTS
+            );
+            crate::arch::sched::storm_census("pre");
             let mut launched = 0usize;
             for _ in 0..n {
                 if !bg_program(console, "/fat/VUG.ELF") {
+                    // `bg_program` has already said WHY, but not uniformly on this wire: a SPAWN
+                    // refusal also prints `:: BGRUN: bg … rejected (…)` to serial, while an
+                    // IMAGE-READ failure (missing, empty or oversized /fat/VUG.ELF) is console-only.
+                    // A serial-only capture would therefore be unable to tell the fleet ceiling from
+                    // a bad card, which is exactly the confusion this arc exists to remove — so this
+                    // line re-reads the census rather than pointing at a neighbour that may not be
+                    // there. `free > 0` here means the table was NOT the limit.
+                    let (f, r, e, o) = crate::arch::syscall::proc_table_headroom();
+                    serial_println!(
+                        ":: STORM: REFUSED at launch {} of {} — fleet stands at {} | proc rows free={} running={} exited={} porphaned={} | EL0 slots free={} ::",
+                        launched + 1, n, launched, f, r, e, o,
+                        crate::arch::boot::user_slots_free()
+                    );
                     break;
                 }
                 launched += 1;
+                crate::arch::sched::storm_probe(&alloc::format!("k={}/{}", launched, n));
             }
             console.println(&alloc::format!("storm: launched {}/{} vugs", launched, n));
             serial_println!(":: STORM: launched {}/{} vugs ::", launched, n);
+            // Review must-fix (R23S1T): re-read the resource census UNCONDITIONALLY after the burst,
+            // not only on refusal. `user_slots_free`'s whole reason to exist is "did the 2-slot
+            // reserve survive a FULL fleet" — and the success path (storm 6, six launches, no
+            // refusal) is exactly the state that question is about. Nor is it derivable:
+            // `rows_free_before - launched` breaks the moment a vug faults mid-burst and leaves a
+            // PEXITED row, and `[spread10]`'s slot histogram counts residency, not SLOT_USED.
+            {
+                let (f, r, e, o) = crate::arch::syscall::proc_table_headroom();
+                serial_println!(
+                    ":: STORM: end | proc rows free={} running={} exited={} porphaned={} of {} | EL0 slots free={}/{} ::",
+                    f, r, e, o, crate::arch::syscall::proc_table_rows(),
+                    crate::arch::boot::user_slots_free(), crate::arch::boot::USER_SLOTS
+                );
+            }
+            // `post` is taken immediately, so its busy percents still carry the pre-burst window —
+            // that is intended: it is the ZERO MARK for the cumulative counters, against which the
+            // next few timer-driven windows are read. The settled fleet is described by those lines,
+            // not by this one.
+            crate::arch::sched::storm_census("post");
         },
         #[cfg(feature = "baremetal")]
         "jobs" => {

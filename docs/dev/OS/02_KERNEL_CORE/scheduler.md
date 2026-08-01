@@ -1185,6 +1185,110 @@ line shows the work spread — it is the *load line*, not `repack`, that decides
 whether this arc worked. `recruit=0` is expected on that wire and is not a
 finding.
 
+### Fleet headroom at the launch boundary (aarch64, STORM-HEADROOM)
+
+`storm [n]` is the shell verb that raises a load fleet — *n* background
+`/fat/VUG.ELF` launches through the ordinary `bg` path, nothing else. The track
+baton carried "storm 8 headroom probe" as the next reading to take, beyond the
+`storm 6` fleet SPREAD-10 was measured against.
+
+**That reading is not available, and the reason is a hard cap rather than a
+tuning value.** The verb clamps *n* to 8; `syscall::MAX_PROCS` is **6**. The
+seventh launch is refused by the process table, the loop stops, and the fleet
+that remains is byte-for-byte the fleet `storm 6` builds — so `storm 7` and
+`storm 8` cannot succeed as asked on any boot, empty or not. Six is not
+arbitrary: each live row costs one of the eight `USER_SLOTS` EL0
+address spaces, and the cap is set two below the pool precisely so a foreground
+`run` and the launcher fixtures can still get an address space with a full
+background fleet. Raising it makes the `Proc` table and the slot pool exhaust
+together, which turns every slot-pressure failure into a table-full one. **Vug
+count is therefore not the axis with headroom left on it.** Task count still is
+— a vug is a triple (parent plus two ELF-2 workers), so a full fleet is ~18
+tasks against four cores, and that is the load the placement arcs are actually
+measured against.
+
+The clamp is deliberately left at 8 rather than lowered to 6: an operator asking
+for more than the machine has must get a *refusal that names the resource*, not
+a silently-lowered request that reads as if it were granted.
+
+**The instrument.** What a storm run could not previously answer is "what breaks
+first as *n* grows", because every quantity that would name a ceiling rides a
+different clock — the `:: SCHED: load ::` train is timer-driven (~1 s windows,
+metal-only) and `[fluid3]`/`[comp2]` ride the compositor, while the interval
+that matters (the seconds in which the fleet is being built) is shorter than one
+of those windows. The launch boundary is the only clock that samples the machine
+at the instant its size changes, so the verb now takes a census there. It mints
+**no new counter**: every number is read through the accessor that already owns
+it. What is new is *when* they are sampled and that they are sampled together.
+
+A run emits, on serial: a `:: STORM: begin ::` resource line (free/running/
+exited/porphaned `Proc` rows, free job rows, free EL0 slots), a `pre` census, one
+`[storm] k=` line after each successful launch, a `:: STORM: REFUSED at launch
+k ::` line if one is refused, and a `post` census. The refusal line **re-reads
+the census** rather than referring to the message beside it, because those
+messages are not uniform on this wire: a spawn refusal also prints
+`:: BGRUN: bg … rejected (…)` to serial, while an image-read failure (missing or
+oversized `/fat/VUG.ELF`) is console-only. A serial-only capture must be able to
+tell the fleet ceiling from a bad card — `free > 0` at the refusal means the
+process table was *not* the limit. The resource line is re-read **unconditionally
+after the burst** as `:: STORM: end ::` (not only on refusal): the reserve
+question — did two EL0 slots survive a full fleet? — is asked by the *success*
+path, and the answer is not derivable from the `begin` line (a vug that faults
+mid-burst leaves a `PEXITED` row and breaks the arithmetic; `[spread10]`'s slot
+histogram counts residency, not `SLOT_USED`). The census is `[storm]` plus
+the standing witness train (`[pulse5]`, `[spread4]` → `[spread7]`/`[spread9]`/
+`[spread10]`) re-emitted at that instant, in their existing wording — so a storm
+capture and a steady-state capture are read with one vocabulary.
+
+**Depth and saturation are printed as a pair, always**, because neither is
+interpretable alone. A core spinning flat-out inside one compute-bound vug holds
+that task in `current`, not in its run queue, so it reads depth 0 exactly like a
+genuinely idle core. The pair separates three ceilings the load line conflates:
+
+* `busy=99% rq=0/0` — saturated with nothing waiting; the ceiling is that core's
+  throughput.
+* `busy=99% rq=6/6` — saturated with a queue behind it; the ceiling is
+  **placement**, and `[spread10] recruit`/`rstale` on the same block say whether
+  placement was offered a way out and refused it.
+* `busy=--` — the core is not dispatching at all; nothing about it is a load
+  measurement (SCHED-8's untracked rendering).
+
+**Two things are deliberately absent, and each absence is a correctness
+property.** `[prio]`'s per-window *deltas* are not taken: `prio_witness` swaps
+its snapshots as it prints, so calling it here would silently shorten the next
+periodic `[prio]` window — a probe that alters what it measures. The cumulative
+totals carry the same information at a boundary sample and cost the periodic
+line nothing. `[fluid3]`'s park percentiles are not taken for the larger version
+of the same reason: `fluid3_drain` *consumes* the buckets it reports, and they
+belong to the compositor's `[comp2]` cadence. Park pressure is still represented,
+through the cumulative `[spread4] short/rewake` and `[spread7] wake2disp`.
+
+**What the silence means.** Apart from one `boot-baseline` line, every `[storm]`
+line is emitted from the shell task, so the probe runs for exactly as long as the
+shell is dispatched. That is the state a headroom probe is about — but a fleet
+that starves the shell also silences the probe, and starving the shell is one of
+the outcomes it is hunting. **A missing `post` is not a clean run.** Two
+properties make the silence readable rather than mute: `pre` is emitted before
+the first launch, and one line after *each* successful launch, so the last
+`[storm] k=` on the wire names the launch after which the shell stopped
+reporting, and a truncated tail is itself the measurement. The instruments that
+survive a starved shell are the timer-driven ones — `load_witness_tick` and the
+`[spin1]` block inside `pulse5_witness`, which run from the timer IRQ on every
+core and depend on no task being schedulable. Read those beside a storm capture,
+never instead of it.
+
+The probe costs one `rq()` acquisition per core per sample — IRQ-masked for the
+hold, WEDGE-4's law, byte-for-byte the hold `pick_cpu` already takes on every EL0
+spawn, and once per launch rather than once per frame.
+
+`load_accounting_witness` takes one `[storm] boot-baseline` line so the QEMU
+battery *executes* the probe rather than merely compiling it; without it, code
+reached only by an operator typing `storm` would run for the first time on an
+attended bench. The gate reads
+`busy c0=100% c1=-- c2=-- c3=-- | rq …=0/0 | el0 …=0/0` — the BSP inside the
+cooperative demo, the APs not yet in `run()`, no EL0 anywhere — which is the
+honest boot baseline and proves the run-queue reads and the pair rendering work.
+
 ### Futex duplicate-bucket lost wake (aarch64, FUTEX-DUP / VUG-PACE-2)
 
 The other half of VUG-PACE-2, and the win1 lockup's root cause. `futex_wait`

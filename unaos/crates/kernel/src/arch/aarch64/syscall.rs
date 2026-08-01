@@ -3355,17 +3355,46 @@ fn proc_table_full_reason() -> &'static str {
 }
 
 /// KILLBOUND: how many `Proc` rows are in each lifecycle state — `(porphaned, exited_unreaped)`.
+/// The full breakdown lives in [`proc_table_headroom`]; this is the two fields
+/// `proc_table_full_reason` needs to name WHICH exhaustion an operator is looking at.
 fn proc_table_census() -> (usize, usize) {
-    let mut porphaned = 0usize;
+    let (_, _, exited, porphaned) = proc_table_headroom();
+    (porphaned, exited)
+}
+
+/// STORM-HEADROOM: the `Proc` table's occupancy right now, as
+/// `(free, running, exited_unreaped, porphaned)`. Reads only; safe from any task.
+///
+/// The refusal string (`proc_table_full_reason`) already tells an operator what ran out AT THE MOMENT
+/// A LAUNCH IS REFUSED — but a burst that does NOT refuse prints nothing, and "storm 6 launched 6/6"
+/// leaves the remaining headroom unstated. That is precisely the reading a headroom probe exists to
+/// take, so the `storm` verb samples this BEFORE its burst: `free` is how many launches can possibly
+/// succeed, and the other three say whether a shortfall would be live work, corpses awaiting `jobs`,
+/// or the PORPHANED rows `jobs` can never reap (the P60 lesson, made readable one step earlier).
+///
+/// [`proc_table_rows`] is the denominator, exported beside it so a caller can print `free of N`
+/// without naming `MAX_PROCS` — the cap is this module's to state, and a second literal elsewhere
+/// would be a fact that could drift.
+pub fn proc_table_headroom() -> (usize, usize, usize, usize) {
+    let mut free = 0usize;
+    let mut running = 0usize;
     let mut exited = 0usize;
+    let mut porphaned = 0usize;
     for i in 0..MAX_PROCS {
         match PROCS[i].state.load(Ordering::Acquire) {
-            PORPHANED => porphaned += 1,
+            PFREE => free += 1,
             PEXITED => exited += 1,
-            _ => {}
+            PORPHANED => porphaned += 1,
+            _ => running += 1,
         }
     }
-    (porphaned, exited)
+    (free, running, exited, porphaned)
+}
+
+/// STORM-HEADROOM: the process-table cap — the denominator for [`proc_table_headroom`]. See the
+/// `MAX_PROCS` block for why it is 6 and why raising it is not a tuning knob.
+pub const fn proc_table_rows() -> usize {
+    MAX_PROCS
 }
 
 /// Find the RUNNING Proc entry whose pid matches — the child-exit / child-kill lookup. Called with a live

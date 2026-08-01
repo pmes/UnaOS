@@ -416,6 +416,20 @@ static SLOT_USED: [AtomicBool; USER_SLOTS] = [const { AtomicBool::new(false) }; 
 /// teardown.
 static SLOT_REFCOUNT: [AtomicU32; USER_SLOTS] = [const { AtomicU32::new(0) }; USER_SLOTS];
 
+/// STORM-HEADROOM — how many of the `USER_SLOTS` address-space slots are unclaimed right now. Reads
+/// only (one relaxed-ordered flag per slot), safe from any core; never consulted on an allocation
+/// path — `alloc_user_slot`'s CAS is the only thing that may decide a slot's fate, and a count taken
+/// here is stale the instant it is returned.
+///
+/// It exists because the slot pool is the resource the `MAX_PROCS` block stakes its whole argument
+/// on: 6 background rows are meant to leave 2 EL0 slots free for a foreground `run` and the launcher
+/// fixtures. That reserve is a claim about a live system, and nothing on the wire ever stated it. The
+/// `storm` verb samples it at its launch boundaries so a bench capture says whether the reserve
+/// actually survived a full fleet, rather than whether it was intended to.
+pub fn user_slots_free() -> usize {
+    (0..USER_SLOTS).filter(|&s| !SLOT_USED[s].load(Ordering::Acquire)).count()
+}
+
 /// ELF-2 — register one more live EL0 thread against the slot owning `asid` (the shared address space a
 /// `SYS_THREAD_SPAWN` adds a task to). Balanced by that thread's eventual `teardown_user_slot` call at exit.
 /// MUST be called on a live slot (refcount already >= 1 from the initial owner) BEFORE the new thread can be
