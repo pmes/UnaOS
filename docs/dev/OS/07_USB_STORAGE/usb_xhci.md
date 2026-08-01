@@ -777,11 +777,51 @@ it directly: the bracket stays, so `entry-link-discriminator took=` collapsing t
 ### 5i. PIUSB-43 — the enum-portsc witness (PA6: which connect branch died)
 
 **The gap.** PA5c metal (boot via GR12) ran the FULL 30 s `enum-pump` budget with **zero**
-port-connect events — clean through "M3: 5 root port(s) powered (PORTSC.PP set)" and
-"enumerate: xHCI self-coherent", then thousands of idle `[piusb26]` pump passes and no slot, no HID,
-no BOT. The wire could not distinguish four different deaths: no device electrically present (CCS
-never set) · CCS set but no Port Status Change Event generated · events written but never consumed
-off our ring · PP/link state regressed after the M3 line.
+port-connect events, then thousands of idle `[piusb26]` pump passes and no slot, no HID, no BOT. The
+wire could not distinguish four different deaths: no device electrically present (CCS never set) ·
+CCS set but no Port Status Change Event generated · events written but never consumed off our ring ·
+PP/link state regressed after the M3 line.
+
+> **⚠ CORRECTED 2026-08-01 (s1v), from the PA5c capture itself — read this before the verdict key.**
+> The framing above ("clean through ports-powered, then the connect died") does **not** hold, and the
+> instrument was designed against it. The same capture says, verbatim:
+>
+> ```
+> xHCI: TIMEOUT (~150000000 cyc) waiting for USBCMD.HCRST=0 (reset)
+> xHCI: TIMEOUT (~150000000 cyc) waiting for USBSTS.CNR=0
+> xHCI: FATAL — USBSTS.CNR still 1 after 801 polls; aborting xHCI register programming
+>        (spec 5.4.1: op/runtime writes while CNR=1 are dropped)
+> xHCI: init_pointers SKIPPED — controller never left Not-Ready (CNR=1)
+> xHCI: start SKIPPED — controller never left Not-Ready (CNR=1); RS=1 not issued
+> ```
+>
+> So on PA5c: **RS=1 was never issued and no ring was ever programmed.** Three consequences bind every
+> reading below.
+> 1. `M3: 5 root port(s) powered (PORTSC.PP set)` and `enumerate: xHCI self-coherent` are
+>    stage-intent lines, not state observations — by our own FATAL line, the PP write was dropped.
+>    `PP=1` read back is the controller's reset default, not our write landing.
+> 2. `popped=0` / `pend=0` are **forced by construction**, not observed: ERSTBA/ERDP/CRCR/DCBAAP were
+>    never written. `EVENTS-UNCONSUMED` cannot fire, and `CCS-NO-EVENT` degenerates into a
+>    restatement of "no event path was ever built".
+> 3. A device **was** electrically present the whole time — port 1 read `0x400202e1`
+>    (CCS=1, CSC=1, PP=1, PLS=7 Polling) and `[enum] port 1 connect (device attached)` fired. The
+>    "no device ever existed to the kernel" reading was wrong.
+>
+> **Admissibility rule:** whenever `init_pointers SKIPPED` / `start SKIPPED` appear in a capture, a
+> `[piusb43]` verdict must be quoted **beside them, never alone** — under CNR=1 the PORTSC and IMAN
+> reads inherit the same doubt the FATAL line raises about that register window. The sentence below
+> ("it can execute in the state it reports on") holds for the pump's own MMIO, not for a controller
+> that never left Not-Ready.
+>
+> **Upstream cause (s1v, settled from captures, zero boots).** The mailbox transport dies mid-boot:
+> alive at `[v3d55] GET_CLOCK_RATE … (mailbox OK)`, dead from `[v3d75a] SET_ENABLE_QPU(1) — MAILBOX
+> FAILED` onward, for every caller. All three `NOTIFY_XHCI_RESET` attempts then fail, so the VL805
+> firmware is never reloaded after our PERST/RC reset and the controller cannot leave CNR. The
+> healthy 2026-07-29 boot (`capture/pi4-r23s1q`) has **zero** mailbox timeouts, `NOTIFY … tag
+> HONOURED` ×3, `CNR cleared after 1 polls`, `RS=1`, `Max Ports = 5`, and an enumerated HID mouse.
+> `set_enable_qpu` is reached only via `v3d75_fabric_condition()`, whose sole caller
+> `empty_frame_bisection()` early-returns on `!V3D_DEEP` — so the send rides **`UNAOS_V3D_DEEP=1`
+> alone**, and dropping that one knob removes it with no code change.
 
 **The instrument.** A read-only sampler inside the enum pump: at pump START, every ~2 s of pump
 time (capped at 13 interior samples), and once at pump END, one line carries every root port's RAW
@@ -809,7 +849,17 @@ pump (`XHCI_READY` gate), so its log stays byte-identical. Budget: ≤16 lines p
 | `REGRESSED` | PP=0 at pump start (regression between M3 and the pump), PP 1→0 during the pump, or PLS moved with CCS never set — before/after raw words quoted |
 | `CCS-NO-EVENT` | CCS/CSC seen on some port (mask printed) yet `popped=0` and nothing pending — device seen electrically, no PSC event reached the ring; event path suspect |
 | `NO-CCS-EVER` | every port sampled CCS=0 CSC=0 at every sample, PP held, PLS stable — no device electrically visible to the VL805 |
+| `UNRESOLVED` (poison) | a PORTSC word read back as poison (`0xffffffff`/`0xdeadbeef`/`0xdeaddead`) — the register window stopped decoding, so every PORTSC-derived branch is disqualified. Checked AFTER the ring branch, which is derived from the event ring in DRAM and stays sound while the BAR is dark; the raw ring words ride the line so nothing observed is lost |
 | `UNRESOLVED` | a state the samples cannot separate — the line names the deciding read (e.g. CCS seen *and* `popped>0`: a TRB-type census of the consumed events would decide) |
+
+**Poison discipline (s1v).** A non-decoding BAR reads `0xffffffff`, which *decodes* as
+`CCS=1 CSC=1 PED=1 PP=1` — indistinguishable from a live connect on the decode alone. Before this
+was guarded, that word set `saw_ccs` and drove a confident `CCS-NO-EVENT` ("a device was seen
+electrically") off a dead bus. `sample()` now runs every per-port word through the file's existing
+`is_poison()`, prints it as `p<N>=0x…(POISON — not decoded)`, accumulates nothing from it, and
+latches the port so `verdict()` takes the poison branch. `HCSPARAMS1` gets the same treatment: poison
+there would yield `MaxPorts=0xff`, which the clamp would silently turn into 8 — three ports past the
+VL805's five, sampled as if they existed; on poison the witness falls back to the known 5 and says so.
 
 Support: `EventRing.popped` (drivers/xhci/event.rs), a monotonic consumed-TRB counter incremented in
 `pop()` — `dequeue_index` alone is mod-256 and cannot distinguish "no events" from "exactly one lap".

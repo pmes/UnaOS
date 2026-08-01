@@ -2212,6 +2212,10 @@ struct PortscWitness {
     end_pend: bool,  // has_event() at the most recent sample (the END sample decides)
     end_popped: u64, // total event TRBs consumed as of the most recent sample
     periodic: u32,
+    /// First poison PORTSC read: (port, raw). A non-decoding BAR reads 0xffffffff, which DECODES as
+    /// CCS=1 CSC=1 PED=1 PP=1 — indistinguishable from a live connect on the decode alone. Latched
+    /// here so the sample series is disqualified rather than believed (PI-V3D-1 false-PASS rule).
+    poison: Option<(usize, u32)>,
 }
 
 impl PortscWitness {
@@ -2229,6 +2233,7 @@ impl PortscWitness {
             end_pend: false,
             end_popped: 0,
             periodic: 0,
+            poison: None,
         }
     }
 
@@ -2242,6 +2247,16 @@ impl PortscWitness {
         let _ = write!(line, "{} [piusb43] portsc {} t={}ms", P, tag, t_ms);
         for i in 0..self.ports {
             let raw = r(self.op_base + 0x400 + (i as u64) * 0x10);
+            // A poison word is NOT live data. Print it with an explicit tell and accumulate NOTHING
+            // from it: 0xffffffff would otherwise set saw_ccs/saw_csc and drive verdict() into
+            // CCS-NO-EVENT ("a device was seen electrically") off a BAR that stopped decoding.
+            if is_poison(raw) {
+                let _ = write!(line, " p{}={:#010x}(POISON — not decoded)", i + 1, raw);
+                if self.poison.is_none() {
+                    self.poison = Some((i + 1, raw));
+                }
+                continue;
+            }
             let ccs = raw & 1;
             let csc = (raw >> 17) & 1;
             let ped = (raw >> 1) & 1;
@@ -2321,6 +2336,18 @@ impl PortscWitness {
             serial_println!(
                 "{} [piusb43] verdict=EVENTS-UNCONSUMED — the event ring holds a fresh TRB at pump exit (pend=1) and popped=0 events were consumed all pump: events reached the ring, the consumer never took one ::",
                 P
+            );
+            return;
+        }
+        // A poison PORTSC read disqualifies every PORTSC-DERIVED branch below (REGRESSED,
+        // CCS-NO-EVENT, NO-CCS-EVER all rest on those words). It is checked AFTER the ring branch
+        // above because that one is derived from the event ring in DRAM, not from this MMIO window,
+        // and stays sound while the BAR is dark. The raw ring words ride this line so nothing the
+        // series did observe is lost.
+        if let Some((port, raw)) = self.poison {
+            serial_println!(
+                "{} [piusb43] verdict=UNRESOLVED — port {} PORTSC read back {:#010x} (poison): the xHC register window stopped decoding, so the PORTSC-derived branches cannot be judged (that word decodes as CCS=1 CSC=1 PED=1 PP=1 and would otherwise be read as a device). Ring state at exit: popped={} pend={}. Deciding read: re-probe the VL805's PCIe config vendor:device and BAR decode enable — a live 1106:3483 means the window is back and the pump should be re-run; poison there means the RC link or the BAR window dropped ::",
+                P, port, raw, self.end_popped, self.end_pend as u32
             );
             return;
         }
@@ -2491,11 +2518,24 @@ pub fn enumerate() {
     );
     // PIUSB-43: arm the enum-portsc witness — start sample now, ~2 s cadence inside the loop,
     // end sample + verdict after it. All reads, no pump-logic change (see the witness block doc).
+    // HCSPARAMS1 is read the same way and gets the same poison discipline: a poison word yields
+    // MaxPorts=0xff, which the clamp would silently turn into 8 — three ports past the VL805's five,
+    // sampled as if they existed. Poison here means the window is dark, so fall back to the known
+    // VL805 port count and let the per-port poison tell in `sample()` name the state on the wire.
     let hcs1 = r(base + 0x04);
+    let ports = if is_poison(hcs1) {
+        serial_println!(
+            "{} [piusb43] HCSPARAMS1 read back {:#010x} (poison) — MaxPorts unreadable; sampling the VL805's 5 root ports and expecting the per-port poison tell below ::",
+            P, hcs1
+        );
+        5
+    } else {
+        (((hcs1 >> 24) & 0xff) as usize).clamp(1, PIUSB43_MAX_PORTS)
+    };
     let mut pw = PortscWitness::new(
         base + cap_length,
         xhci::XHCI_IR0_BASE.load(Ordering::Acquire) as u64,
-        (((hcs1 >> 24) & 0xff) as usize).clamp(1, PIUSB43_MAX_PORTS),
+        ports,
     );
     pw.sample("start");
     let mut pw_last = super::timer::cntpct();
