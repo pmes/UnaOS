@@ -3523,3 +3523,67 @@ that swallowed the count silently would have destroyed the only evidence it ever
 
 QEMU raspi4b models no V3D, so `[v3d81]` sits behind the hub-identity gate: `kernel8-test` green
 means no regression and nothing more. The verdict is metal-attended.
+
+## 48. The CLE stall decoded — there is no packet at the stall offset (V3D-82 verdict, 2026-08-01)
+
+The S1U opening arc: the PA4 `[v3d54]` line read `CT0CA off 0x2d000 (mid)` against the 106-byte
+`[v3d74a]` RCL (`BA=0x0031e000 EA=0x0031e06a`) — "stalled mid-list, choked on the packet at that
+offset". The arc's task was to decode the list byte-for-byte and name that packet. Both halves
+are now closed, off the banked capture alone, with no boot spent.
+
+### 48.1 The stall offset names no packet — it names the previous list's base address
+
+Hand-verified arithmetic across every "STALLED mid-list" reading in the PA4 capture: all three
+reported offsets decode to the SAME absolute CT0CA word.
+
+| leg | BA | reported off | raw CT0CA |
+|---|---|---|---|
+| v3d63 (14 B @ 0x0034f000) | 0x0034f000 | 0xffffc000 | **0x0034b000** |
+| v3d71 mainline-geom | 0x03089000 | 0xfd2c2000 | **0x0034b000** |
+| v3d74a…v3d81q (106 B) | 0x0031e000 | 0x2d000 | **0x0034b000** |
+
+0x2d000 would be byte 184,320 of a 106-byte list — impossible as progress, exact as one frozen
+register. 0x0034b000 is the BA of every pre-wedge probe list; CT0CA moved genuinely in the
+pre-wedge era (offsets 0x4c, 0xe walked with CTRUN=0), latched 0x0034b000 at the wedge onset
+(the v3d53 rung, where CTRUN stuck 1), and has never changed since. The `(mid)` verdict was
+`emit_v3d54_trace`'s fallthrough arm — `!(==BA) && !(==EA)` over a wrapping subtract, no span
+check (the §44 P83 trap, reproduced verbatim on PA4).
+
+Adversarial review closed the loopholes: a fetch-and-park between 1 ms samples is triply
+incoherent (CA parks at EA on completion; CTRUN would clear, it is frozen 1 at CS=0x70
+changes=0; BFC Δ0 and BPCA adv=0), and the sampler's own MMIO reads demonstrably execute in
+the wedged state, so its zero is admissible.
+
+**Direct measurement existed for every leg all along.** `v3d75_kick_probe` armed the `[v3d73]`
+sampler on all five funneled legs (v3d75a/b, v3d77a/b, v3d81q) and folded its span facts into
+each kick line — `sampler samples=500 in-span=0 max-in-span=0x00000000` — while the `[v3d73]`
+verdict line itself never printed (the emit call was missing; fixed by V3D-82). No leg in the
+PA4 capture ever held a CT0CA inside its submitted span. The v3d81q reading is measurement,
+not inference.
+
+### 48.2 The list itself is well-formed — content exonerated by decode, not by inference
+
+First byte-level RCL audit of the campaign (§31/V3D-57 audited only the bin CL). The 106-byte
+M3 clear-job RCL decodes as 20 packets, exactly 106 bytes, every boundary opcode-aligned,
+against the V3D 4.2 encoding (`v3d_packet_v42.xml` naming): the TILE_RENDERING_MODE_CFG
+bracket in correct order (COMMON → CLEAR_COLORS_PART1 → COLOR → ZS_CLEAR_VALUES),
+TILE_LIST_INITIAL_BLOCK_SIZE, MULTICORE_TILE_LIST_SET_BASE/SUPERTILE_CFG, the GFXH-1742
+double dummy-store block, FLUSH_VCD_CACHE, START_ADDRESS_OF_GENERIC_TILE_LIST (whose 26-byte
+sub-list, with the real RT0 store, decodes clean), SUPERTILE_COORDINATES, END_OF_RENDERING
+(code 13 — the PI-V3D-10 fix present). No unknown opcode, no length mismatch, no field out of
+range; packet shape matches Mesa's minimal clear-job emitters with only benign micro-ordering
+divergence. Full offset→packet table: the S1U landing report and its decode script.
+
+### 48.3 Where that leaves the wall
+
+The arc premise dissolves and the §45 verdict stands STRENGTHENED: **the CLE never fetched a
+byte of any list since the wedge onset; there is no choking packet because there is no fetch.**
+List content — previously exonerated only by unreachability — is now exonerated by direct
+decode as well. The wall remains exactly where `[v3d74a]` left it: thread 0 never starts,
+regardless of list class, a per-thread condition outside the ARM-visible register space
+(§46.3–46.4). The instrument that manufactured the "mid-list stall" reading is fixed (V3D-82,
+§44 NOTE): `[v3d54]` now prints raw CA and classifies out-of-span words as `(stale)`, and the
+`[v3d73]` verdict line rides every CT0-kicking deep leg.
+
+Instrument-lie ledger +1 (the campaign's n+2 of this shape): a wrapping offset over a frozen
+register, printed under a verdict string that presumed the register valid.
