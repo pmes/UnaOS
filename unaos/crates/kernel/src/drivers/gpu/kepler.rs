@@ -511,14 +511,34 @@ pub fn init(gpu: &GpuInfo) {
                                     const RUNLIST_LEN: u32 = 3;
                                     const _: () = assert!(RUNLIST_LEN as usize * 2 == 6); // words per entry
 
-                                    // Write the six entry words into the runlist page. Called twice —
-                                    // here, and again immediately before the submit. The mirror-window
-                                    // beacon probe below deliberately plants 0xBEAC0001..8 over
-                                    // `runlist_off + 0..31` and must stay planted through its pass-2
-                                    // re-read, so the page has to be rebuilt after the probe is done.
+                                    // Width of the mirror-window beacon plant below: EIGHT words over
+                                    // `off + 0..31`, in each of three regions. Everything that undoes
+                                    // the plant must be this wide. A restore or a scan narrower than
+                                    // the plant reports CLEAN over residue it never looked at — which
+                                    // is exactly what the first version of this rebuild did, leaving
+                                    // 0xBEAC0007/0xBEAC0008 alive at `runlist_off + 24/28` under a
+                                    // `CLEAN` verdict.
+                                    const BEACON_PLANT_WORDS: usize = 8;
+                                    const _: () = assert!(BEACON_PLANT_WORDS >= 6); // the six authored words fit
+
+                                    // Put the runlist page back the way this driver left it. Called
+                                    // twice — here, and again immediately before the submit, because
+                                    // the beacon plant below is destructive over the same bytes and
+                                    // must stay planted through its pass-2 re-read.
+                                    //
+                                    // Words 0..5 are the three authored entries. Words 6..7 lie past
+                                    // the last entry but are still inside the plant, and are still our
+                                    // page: the zeroing loop above clears all 0x1000 bytes of it, so
+                                    // zero — not "whatever the plant left" — is the state this driver
+                                    // established and the state the page returns to. With LEN=3 the
+                                    // scheduler should not read past `+23`, but "should" is not a thing
+                                    // to leave beacon words behind on.
                                     let write_runlist = || unsafe {
                                         for (i, w) in runlist_words.iter().enumerate() {
                                             core::ptr::write_volatile((bar1 + runlist_off + i * 4) as *mut u32, *w);
+                                        }
+                                        for i in runlist_words.len()..BEACON_PLANT_WORDS {
+                                            core::ptr::write_volatile((bar1 + runlist_off + i * 4) as *mut u32, 0);
                                         }
                                     };
 
@@ -617,11 +637,13 @@ pub fn init(gpu: &GpuInfo) {
                                     // ALL EIGHT WORDS, and `words=8` is printed so the claim is
                                     // checkable. The plant is eight words wide; a restore or a scan
                                     // narrower than the plant reports CLEAN over residue it never
-                                    // looked at. That is not hypothetical — the runlist restore in
-                                    // a470ba16 rebuilds and scans only its six authored words, so
-                                    // 0xBEAC0007/0xBEAC0008 survive at `runlist_off + 24/28` under a
-                                    // `CLEAN` verdict. Not this lane's to fix; not this lane's to
-                                    // repeat either.
+                                    // looked at. That is not hypothetical — the runlist restore as
+                                    // a470ba16 first landed it rebuilt and scanned only its six
+                                    // authored words, so 0xBEAC0007/0xBEAC0008 survived at
+                                    // `runlist_off + 24/28` under a `CLEAN` verdict. That is now
+                                    // fixed at its own site (`write_runlist` / the `runlist-rebuild`
+                                    // scan, both `BEACON_PLANT_WORDS` wide); the lesson stays because
+                                    // the next region added here will be tempted the same way.
                                     //
                                     // `restored=CLEAN` asserts exactly one thing: the eight words the
                                     // plant destroyed are back to the eight words it destroyed. It says
@@ -702,10 +724,11 @@ pub fn init(gpu: &GpuInfo) {
                                         serial_println!(":: kepler: beacon planted at=pb off={:08X} ::", pb_off);
 
                                         // runlist — DESTRUCTIVE: 8 words over `runlist_off + 0..31`
-                                        // covers all six words of all three entries written above.
-                                        // The pass-1/pass-2 scans below are this plant's consumer;
-                                        // `write_runlist()` rebuilds the page after pass 2, before
-                                        // the submit. Do not move the submit above pass 2.
+                                        // covers all six words of all three entries written above,
+                                        // plus two words past them that the page-zeroing loop had
+                                        // cleared. The pass-1/pass-2 scans below are this plant's
+                                        // consumer; `write_runlist()` rebuilds all eight after pass 2,
+                                        // before the submit. Do not move the submit above pass 2.
                                         for (i, val) in pattern.iter().enumerate() {
                                             core::ptr::write_volatile((bar1 + runlist_off + i * 4) as *mut u32, *val);
                                         }
@@ -1215,38 +1238,58 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
 
                                     // 3. Submit Runlist
                                     //
-                                    // Rebuild the entry words first. The mirror-window beacon probe
-                                    // planted 0xBEAC0001..8 over `runlist_off + 0..31` — all six
-                                    // words of all three entries — and its consumers (the pass-1
-                                    // scan and the pass-2 volatility re-read) are long done by here.
-                                    // Without this the chip is handed a three-entry playlist whose
-                                    // entries are beacon words, which is what every capture from the
-                                    // pull-16 beacon landing onward actually submitted.
+                                    // Rebuild the page first. The mirror-window beacon probe planted
+                                    // 0xBEAC0001..8 over `runlist_off + 0..31` — all six words of all
+                                    // three entries, plus two words past them — and its consumers (the
+                                    // pass-1 scan and the pass-2 volatility re-read) are long done by
+                                    // here. Without this the chip is handed a three-entry playlist
+                                    // whose entries are beacon words, which is what every capture from
+                                    // the pull-16 beacon landing onward actually submitted.
                                     write_runlist();
 
-                                    // Read the page back and count how many words are still beacons.
-                                    // `resid=0` is the only healthy value; any nonzero means something
-                                    // between the rebuild and the submit is still clobbering the page,
-                                    // and the submit below is again meaningless. Without this counter a
-                                    // silently-failed rebuild would look exactly like a good one.
+                                    // Read the page back over the FULL plant width and count what is
+                                    // wrong. Scanning only the six authored words would report CLEAN
+                                    // over the two beacon words the scan never looked at — the same
+                                    // narrower-than-the-plant mistake the restore itself made.
+                                    // `words=` is printed so the coverage claim is checkable in the
+                                    // capture rather than trusted from the source, and `w=[…]` prints
+                                    // what was READ BACK, not what was intended — so a `mismatch`
+                                    // names the offending word instead of merely counting it.
+                                    //
+                                    // `restored=CLEAN` asserts exactly one thing: the eight words the
+                                    // plant destroyed are back to what this driver put there. It says
+                                    // NOTHING about whether those contents are the right contents for
+                                    // the chip — the three entries still use three mutually
+                                    // inconsistent encodings, a separate question this leg does not
+                                    // answer and must not be read as answering.
+                                    //
+                                    // The read-back is honest about the CPU side: BAR1 is mapped
+                                    // PCD|PWT with the PTE PAT bit clear (`arch::memory::map_mmio_window`),
+                                    // selecting PAT entry 3, left at the power-on UC. UC reads are
+                                    // never served from a cache line or a write-combining buffer, so a
+                                    // failed write really is observed. It does NOT prove the GPU's own
+                                    // fetch path sees the same bytes.
                                     let mut rl_beacon_resid = 0u32;
                                     let mut rl_mismatch = 0u32;
-                                    for (i, want) in runlist_words.iter().enumerate() {
-                                        let got = unsafe {
+                                    let mut rl_read = [0u32; BEACON_PLANT_WORDS];
+                                    for (i, got) in rl_read.iter_mut().enumerate() {
+                                        let want = runlist_words.get(i).copied().unwrap_or(0);
+                                        *got = unsafe {
                                             core::ptr::read_volatile((bar1 + runlist_off + i * 4) as *const u32)
                                         };
-                                        if (0xBEAC0001..=0xBEAC0008).contains(&got) {
+                                        if (0xBEAC0001..=0xBEAC0008).contains(got) {
                                             rl_beacon_resid += 1;
                                         }
-                                        if got != *want {
+                                        if *got != want {
                                             rl_mismatch += 1;
                                         }
                                     }
                                     serial_println!(
-                                        ":: kepler: runlist-rebuild off={:08X} w0={:08X} w1={:08X} w2={:08X} w3={:08X} w4={:08X} w5={:08X} beacon_resid={} mismatch={} {} ::",
+                                        ":: kepler: runlist-rebuild off={:08X} w=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] words={} entries={} beacon_resid={} mismatch={} restored={} ::",
                                         runlist_off,
-                                        runlist_words[0], runlist_words[1], runlist_words[2],
-                                        runlist_words[3], runlist_words[4], runlist_words[5],
+                                        rl_read[0], rl_read[1], rl_read[2], rl_read[3],
+                                        rl_read[4], rl_read[5], rl_read[6], rl_read[7],
+                                        rl_read.len(), RUNLIST_LEN,
                                         rl_beacon_resid, rl_mismatch,
                                         if rl_beacon_resid == 0 && rl_mismatch == 0 { "CLEAN" } else { "CORRUPT" }
                                     );
@@ -1280,13 +1323,18 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     // unsatisfiable predicate burned 200_000 BAR0 reads across PCIe on every
                                     // boot and could not distinguish "accepted" from "never accepted".
                                     const PL_POLL_MS: u64 = 10;
+                                    // Fallback divisor for the uncalibrated path. `HW_WAIT_BUDGET` is a
+                                    // fixed CYCLE count with no defined wall time — its own definition
+                                    // (`arch/x86_64/mod.rs`) puts it at 2.5e9 cycles ≈ [0.5 s, 2.5 s]
+                                    // across 1–5 GHz parts, ~1.1 s at this board's 2.3 GHz Ivy Bridge
+                                    // base — so NO millisecond can be derived from it. Take a fixed
+                                    // 1/200 of it (12.5e6 cycles ≈ 2.5–12 ms over that same range) and
+                                    // report the budget in cycles, never in a unit the number lacks.
+                                    const PL_POLL_FALLBACK_DIV: u64 = 200;
                                     let pl_hz = poll_hz();
-                                    // Calibrated → an honest wall-clock budget. Uncalibrated → scale the
-                                    // fixed pre-calibration guess (`HW_WAIT_BUDGET` is defined as ~2 s),
-                                    // and say so rather than print a fabricated millisecond.
                                     let pl_budget = match pl_hz {
                                         Some(hz) => hz.saturating_mul(PL_POLL_MS) / 1000,
-                                        None => crate::arch::HW_WAIT_BUDGET.saturating_mul(PL_POLL_MS) / 2000,
+                                        None => crate::arch::HW_WAIT_BUDGET / PL_POLL_FALLBACK_DIV,
                                     };
                                     let pl_t0 = crate::arch::now_cycles();
                                     let mut pl_rd;
@@ -1308,18 +1356,24 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     // `iters` counts register-pair READS, so its minimum is 1 and `iters=0`
                                     // is an impossible state — a broken instrument, not a quiet zero.
                                     // `iters=1 exit=hit` is the echo already present on the first read;
-                                    // `exit=deadline` never means "not looked at". `clk=guess` marks a
-                                    // waited/budget figure derived from the uncalibrated fallback, printed in
-                                    // raw cycles so it can never be mistaken for a measured millisecond.
-                                    let (pl_waited, pl_unit, pl_clk) = match pl_hz {
-                                        Some(hz) => (pl_cy.saturating_mul(1000) / hz, "ms", "tsc"),
-                                        None => (pl_cy, "cy", "guess"),
+                                    // `exit=deadline` never means "not looked at".
+                                    //
+                                    // `waited` and `budget` are selected TOGETHER with the unit and the
+                                    // clock label, and printed with the SAME unit, so the two figures are
+                                    // always comparable and neither can carry a unit the clock cannot
+                                    // support. `clk=guess` means the counter rate is unknown: both are
+                                    // then raw cycles, because on that path no millisecond exists to
+                                    // print — the earlier form printed `budget=10ms` next to a cycle
+                                    // count, a wall-clock claim the fallback had not earned.
+                                    let (pl_waited, pl_budget_shown, pl_unit, pl_clk) = match pl_hz {
+                                        Some(hz) => (pl_cy.saturating_mul(1000) / hz, PL_POLL_MS, "ms", "tsc"),
+                                        None => (pl_cy, pl_budget, "cy", "guess"),
                                     };
                                     serial_println!(
-                                        ":: kepler: post-bind playlist_rd={:08X} playlist_rd_len={:08X} exit={} iters={} waited={}{} budget={}ms clk={} want_base={:08X} want_len={} got_len={} ::",
+                                        ":: kepler: post-bind playlist_rd={:08X} playlist_rd_len={:08X} exit={} iters={} waited={}{} budget={}{} clk={} want_base={:08X} want_len={} got_len={} ::",
                                         pl_rd, pl_rd_len,
                                         if pl_hit { "hit" } else { "deadline" },
-                                        pl_iters, pl_waited, pl_unit, PL_POLL_MS, pl_clk,
+                                        pl_iters, pl_waited, pl_unit, pl_budget_shown, pl_unit, pl_clk,
                                         want_base, RUNLIST_LEN, pl_rd_len & 0xFFF
                                     );
 
