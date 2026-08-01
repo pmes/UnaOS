@@ -4257,7 +4257,11 @@ unmeasured. A counter costs no print, so it can measure it.
 [wedge1] dwell drains=N spun=M spin_max=K note=65536 in_spin=J tripwire=silent|fired span=Tms -> VERDICT
 ```
 
-* `NONE` — no drain ran in this window. **Nothing was measured; nothing may be concluded.**
+* `STRADDLE` — spin evidence with zero completed drains in this window: the drain that produced it
+  was counted in a neighbouring window's `drains` (it straddled the rollup boundary). Read beside
+  those neighbours. (A window with no evidence at all does not print — there is no `NONE` verdict;
+  silence here is the *absence of teardown activity*, and per the reachability rule it is evidence
+  only because the emit path is timer-driven and lock-free, not present-gated.)
 * `QUIET` — drains ran and none spun past `note`. The only verdict here that is a statement about the
   barrier rather than about the scene.
 * `DWELL` — a drain spun far enough to be a stalled core, four orders of magnitude under the
@@ -4276,7 +4280,8 @@ gating it on present traffic would silence it under exactly the condition it rep
 #### WEDGE-1r2 gate results (2026-07-30, QEMU raspi4b)
 
 `./arroyo check` green both arches, feature-off and with `witness,wedge2` armed; `kernel8` builds;
-`kernel8-test 150` **MBENCH PASS 88/88, 0 forbidden**, and again **88/88 with `UNAOS_WEDGE2=1`**.
+`kernel8-test 150` **MBENCH PASS 89/89, 0 forbidden**, and again **89/89 with `UNAOS_WEDGE2=1`**
+(originally mis-recorded here as 88/88; the landing commit and an s1u tip re-run both read 89/89).
 Wire: `[wedge1] dwell drains=21 spun=0 spin_max=0 ... -> QUIET` — the barrier ran 21 times in a
 3-second window and never once had to wait for anybody, which was previously unmeasured in both
 directions.

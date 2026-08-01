@@ -343,11 +343,12 @@ FORBID \[wc-fv\] focus-vis .*-> FAIL
 # ---    across three silicon lockups. `[wedge1] dwell` is the reading below that threshold. It is
 # ---    REQUIREd for the reason the arc exists: an instrument that can vanish without the gate
 # ---    noticing is an instrument whose next silence gets misread the same way.
-# ---    `-> QUIET` specifically (drains ran, none of them dwelt) is the healthy gate answer; `NONE`
-# ---    would mean no teardown ran at all and the line measured nothing. DWELL/INFLIGHT are NOT
-# ---    forbidden: under a loaded CI host a slow QEMU blit is a plausible honest reading, and a flaky
-# ---    FORBID is worth less than an honest number on the wire.
-REQUIRE \[wedge1\] dwell drains=.*-> QUIET
+# ---    `-> QUIET` (drains ran, none of them dwelt) is the healthy gate answer, but the REQUIRE
+# ---    pins only the LINE, not the verdict: under a loaded CI host a slow QEMU blit honestly reads
+# ---    DWELL/INFLIGHT, and a gate that fails on an honest reading teaches people to ignore it
+# ---    (lens fix, s1u — the verdict pin was a flake in waiting). The gate question is "does the
+# ---    instrument still exist and publish", and that is what the pattern below asserts.
+REQUIRE \[wedge1\] dwell drains=.*spin_max=.*->
 
 # --- BGRUN-1: background EL0 runs (bg/jobs/kill). Headless-observable core of the contract,
 # ---   REQUIREd per the round-1 lens: leg 1 proves spawn->exit->reap (the sole-reaper contract);

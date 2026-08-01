@@ -3775,7 +3775,11 @@ fn wedge1_dwell_emit(span: u64) {
     // A GAUGE — loaded, never drained. Draining it would report a stuck core once and then forget it,
     // which is the opposite of what a standing count is for.
     let in_spin = F4W_IN_SPIN.load(Relaxed);
-    if drains == 0 && in_spin == 0 {
+    // Lens fix (s1u): the quiet-window early-out must also test the spin evidence. The swaps above
+    // have already drained `spun`/`spin_max`, so a drain that straddled the previous rollup boundary
+    // (counted there as `drains`, its spin published here) would have its DWELL evidence silently
+    // dropped by a `drains==0` return — banking QUIET for a window that measured a stall.
+    if drains == 0 && in_spin == 0 && spun == 0 && spin_max == 0 {
         return;
     }
     let verdict = if in_spin > 0 {
@@ -3783,7 +3787,9 @@ fn wedge1_dwell_emit(span: u64) {
     } else if spin_max >= DRAIN_DWELL_NOTE {
         "DWELL"
     } else if drains == 0 {
-        "NONE"
+        // Reachable only via the straddle case above: spin evidence with zero completed drains in
+        // THIS window — the drain that produced it was counted in a neighbouring window's `drains`.
+        "STRADDLE"
     } else {
         "QUIET"
     };
