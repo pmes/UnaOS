@@ -104,6 +104,20 @@ fn main() {
     // Also moves the QEMU usb-kbd onto the harness ehci bus below by default so the driver has a
     // direct-path (Topology B) HID target. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_NOEHCIHID").is_err() { feats.push("ehcihid"); }
+    // KBDWIT: the one-shot per-endpoint EHCI interrupt-silence witness (drivers/ehci/mod.rs §KBDWIT),
+    // for the s58 metal defect where the rMBP USB keyboard completed NOTHING all boot while the
+    // trackpad on the same TT streamed. DEFAULT-ON for this round — a new witness family rides the
+    // default boot only while it is earning its verdict — and suppressed by UNAOS_NOKBDWIT=1, which
+    // unlinks the probe, its `IntEp` fields and its call site => the EHCI service path is
+    // byte-identical to the pre-arc default. Gated on the SAME condition as `ehcihid`: `kbdwit`
+    // deliberately does not IMPLY `ehcihid` (that would resurrect the driver for an operator who
+    // opted out), so pushing it without the driver would be a feature with no module to compile
+    // into. THIS list is what reaches the kernel binary for MEDIA builds — a knob mapped in arroyo
+    // but missing here ships the feature DISABLED while the banner claims it is on (the s42/INSTGUI
+    // and GMUX-IGD lesson, and the reason this line is not optional). Kept in sync with arroyo.
+    if std::env::var("UNAOS_NOEHCIHID").is_err() && std::env::var("UNAOS_NOKBDWIT").is_err() {
+        feats.push("kbdwit");
+    }
     // BATMON-1: the Apple SMC battery monitor (x86_64). UNAOS_SMC=1 arms the polled SMC key/value
     // driver; the QEMU isa-applesmc device is attached below under the same knob so the protocol
     // machinery is gated by a known-key read. Kept in sync with arroyo's mapping.

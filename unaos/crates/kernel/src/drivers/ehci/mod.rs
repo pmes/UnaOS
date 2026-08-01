@@ -122,6 +122,21 @@ struct IntEp {
     /// button, or idle keep-alive). The re-press recovery below reads the SILENCE between reports,
     /// so it must be stamped by every report, not only by button ones. 0 = no report yet.
     last_report_ms: u64,
+    /// KBDWIT — `arch::ms()` when this endpoint was ARMED. The silence clock's origin for an
+    /// endpoint that has never completed anything (the s58 keyboard's exact state). Deliberately
+    /// separate from `last_report_ms`, which only the POINTER paths stamp (`note_buttons`) and so
+    /// stays 0 forever on a keyboard — reusing it would have made every keyboard look silent from
+    /// boot regardless of how many reports it delivered.
+    #[cfg(feature = "kbdwit")]
+    kbdwit_armed_ms: u64,
+    /// KBDWIT — `arch::ms()` at the last COMPLETION on this endpoint (any retired qTD, report
+    /// bytes or not), stamped by the service loop itself rather than by any decoder, so no report
+    /// layout can affect whether the endpoint counts as alive. 0 = nothing has ever completed.
+    #[cfg(feature = "kbdwit")]
+    kbdwit_last_ms: u64,
+    /// KBDWIT — the one-shot latch. Set by the first (and only) dump this endpoint will ever emit.
+    #[cfg(feature = "kbdwit")]
+    kbdwit_fired: bool,
     /// MT-INVESTIGATION (IVY, `mtraw` only): bytes ONE armed transfer may accept — `mps` for every
     /// endpoint except the vendor-multitouch one, which is armed for the whole (grown) receive
     /// buffer so the controller accumulates a >MPS raw frame into it. See `arm_interrupt_ep`.
@@ -1611,6 +1626,15 @@ impl Controller {
             dead: false,
             prev_buttons: 0,
             last_report_ms: 0,
+            // KBDWIT: stamp the silence clock's origin at the moment the endpoint becomes armed —
+            // i.e. after the QH is linked and PSE is on, so the interval this witness measures is
+            // genuinely "armed and expected to complete", never "still being set up".
+            #[cfg(feature = "kbdwit")]
+            kbdwit_armed_ms: crate::arch::ms(),
+            #[cfg(feature = "kbdwit")]
+            kbdwit_last_ms: 0,
+            #[cfg(feature = "kbdwit")]
+            kbdwit_fired: false,
             #[cfg(feature = "mtraw")]
             rx_total,
             #[cfg(feature = "mtraw_inject")]
@@ -1634,6 +1658,11 @@ impl Controller {
         }
         let idx = self.idx;
         let om = self.overlay_mode;
+        // KBDWIT: hoisted for the same reason `idx`/`om` are — the endpoint loop below holds an
+        // exclusive borrow of `self.int_eps`, so the probe cannot reach through `self` for the
+        // operational-register base or the frame-list head and must be handed them as scalars.
+        #[cfg(feature = "kbdwit")]
+        let (kw_op, kw_fl) = (self.op, self.frame_list as *const u32);
         // MT-INVESTIGATION (IVY): local mirror of the capture-window counter, so the endpoint
         // iteration below keeps its exclusive borrow of `int_eps` (the EP0 restore runs after).
         #[cfg(feature = "mtraw")]
@@ -1648,7 +1677,19 @@ impl Controller {
                 core::ptr::read_volatile(&(*e.qtd).token)
             };
             if tok & QTD_ACTIVE != 0 {
+                // KBDWIT: still armed, nothing came back this pass — the only state from which the
+                // s58 silence is observable. The probe self-bounds (one dump per endpoint per boot)
+                // and returns after a single bool test once it has fired or before its deadline.
+                #[cfg(feature = "kbdwit")]
+                kbdwit_probe(e, idx, om, kw_op, kw_fl, tok);
                 continue;
+            }
+            // KBDWIT: the qTD retired — a COMPLETION, whether or not it carried report bytes.
+            // Stamped here, above every decoder, so no report layout, length gate or `dead` path
+            // can influence whether this endpoint counts as alive.
+            #[cfg(feature = "kbdwit")]
+            {
+                e.kbdwit_last_ms = crate::arch::ms();
             }
             if tok & QTD_ERR_MASK != 0 {
                 serial_println!(
@@ -1857,6 +1898,241 @@ impl Controller {
             }
         }
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// KBDWIT — the one-shot, per-endpoint EHCI interrupt-silence witness.
+//
+// THE OBSERVATION (metal, 2012 rMBP, build s58, 2026-08-01). On two consecutive boots the USB
+// KEYBOARD produced ZERO interrupt completions for the entire boot, while the TRACKPAD — same
+// physical device chain, same hub, same TT, same EHCI function — streamed normally. The kernel
+// recorded `ehci:kbd-armed`, so the interrupt endpoint WAS armed; nothing ever came back on it.
+// No halt STOP-NOTE was emitted, so the qTD was not retired in error either. It did not recur on
+// s59 or s60 on the same hardware. Cause unknown. This instrument exists to convict or acquit on
+// the next recurrence; it is NOT a fix and NOT a recovery.
+//
+// WHAT IT IS: a SNAPSHOT taken at a deadline, not an alarm. Once per boot, per endpoint, when an
+// armed interrupt endpoint has gone `KBDWIT_QUIET_MS` without a single completion (or that long
+// since its last one), every register and descriptor word that separates the candidate failure
+// modes is dumped raw, and the endpoint latches silent forever.
+//
+// IT THEREFORE PRINTS ON HEALTHY BOOTS TOO, and that is deliberate. An idle boot keyboard
+// genuinely completes nothing — no SET_IDLE is sent on this path and no key is pressed — so its
+// dump is the ACQUITTAL BASELINE: qTD Active, CERR=3, split state clean, FRINDEX advancing. The
+// convicting boot is then read by DIFFERENCE against the baseline the same instrument printed on
+// every other boot. A witness that only spoke once it had already decided what was wrong could
+// not do that, and could not be checked for its own health.
+//
+// WHY PER-ENDPOINT, NOT PER-CONTROLLER. During the failure the trackpad is streaming on the SAME
+// controller, so any controller-level "is anything completing?" test reads HEALTHY on the exact
+// boot that motivated this instrument. The silence clock lives on `IntEp` and is stamped only by
+// that endpoint's own completions.
+//
+// BOUNDS. `kbdwit_fired` latches on the first dump: at most one dump per endpoint per boot, at
+// most `MAX_INT_EPS` (4) per controller for a whole boot. No loop, no retry, no wait, no
+// allocation, no register write — every access below is a read. Cost on the service path is one
+// bool test plus one `ms()` read before the deadline, and one bool test after it fires. Note the
+// path this rides is `service()`, the POST-boot main-loop poll — NOT the `init()` bring-up block
+// the EPACE ledger measures and this seat just trimmed 6324 ms -> 2010 ms — so the deadline
+// cannot land inside that budget at all.
+//
+// INSTRUMENT HONESTY — asked of every field, "can this be wrong in a way that still looks right?"
+//   * Every controller-visible word is printed RAW as well as decoded, so a decode bug here can
+//     never destroy the evidence: a reader with the EHCI spec re-derives each flag from the hex.
+//   * IDENTITY (device address, endpoint number, MPS, speed, TT hub/port) is decoded from the
+//     QH's OWN `ep_chars`/`ep_caps` — the words the controller is executing — not from the
+//     driver's software copy. `kind=` is the software belief, printed alongside. If the driver
+//     and the controller disagree about which endpoint this is, the capture shows it.
+//   * The TOKEN is printed three ways: `seen=` (what the service loop tested this pass) plus both
+//     live words, `ovl_tok=` (the controller's working copy in the QH overlay) and `qtd_tok=`
+//     (the standalone qTD), with `path=` naming which of the two the driver actually drives.
+//     `seen` differing from the live word means the token is CHANGING — a frozen source printed
+//     as a live value is the failure mode this seat has been bitten by repeatedly.
+//   * FRINDEX is sampled TWICE, before and after the dump's own serial output (which costs real
+//     milliseconds at 115200 baud — so the spacing is bought without adding a single wait), and
+//     BOTH raw readings print with the measured `dt=` between them. Never a bare delta: if
+//     `dt=0ms` the reader can see the pair proves nothing, rather than being told "frozen".
+//   * Every MMIO read carries an `ok=` flag, because `mmio_read32` returns an Option and a
+//     failed read rendered as `0x00000000` would read as "halted clear, host error clear, all
+//     well" — the most dangerous possible lie this dump could tell.
+//   * `ms()` is the calibrated APIC tick; before calibration it degrades to ~1 ms/tick. The
+//     deadline and the elapsed prints both use it, so they degrade TOGETHER and the ratios stay
+//     truthful.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// KBDWIT — silence (ms) after arming, or after the endpoint's last completion, at which the
+/// snapshot is taken. Sits well past every bring-up settle on this path (the whole EHCI HID
+/// `init()` block now costs ~2.0 s end to end) so a dump can never catch a schedule that is merely
+/// still starting, and well inside any boot capture so it always lands in the log.
+#[cfg(feature = "kbdwit")]
+const KBDWIT_QUIET_MS: u64 = 4000;
+
+/// KBDWIT — USBSTS bit 14, Periodic Schedule Status (EHCI 1.0 §2.3.2): the controller is
+/// traversing the periodic list. Defined here rather than reusing this module's `STS_PSS`, whose
+/// doc comment misnames it "Async Schedule Status" (that is bit 15). The VALUE in `STS_PSS` is
+/// right and its only use — an `init()` handshake — is unaffected, but an instrument must not
+/// inherit a name whose comment disagrees with the spec.
+#[cfg(feature = "kbdwit")]
+const KBDWIT_STS_PSS: u32 = 1 << 14;
+/// KBDWIT — USBSTS bit 15, Async Schedule Status (EHCI 1.0 §2.3.2).
+#[cfg(feature = "kbdwit")]
+const KBDWIT_STS_ASS: u32 = 1 << 15;
+/// KBDWIT — operational-register offset of FRINDEX (EHCI 1.0 §2.3.4), the frame index the
+/// periodic traversal is driven from. This witness is the driver's first consumer of a "is the
+/// schedule actually advancing?" reading, so the offset appears here rather than in the module's
+/// shared register set.
+#[cfg(feature = "kbdwit")]
+const KBDWIT_OP_FRINDEX: u64 = 0x0C;
+
+/// KBDWIT — decode a qTD token's PID field (bits 9:8, EHCI 1.0 §3.5.3).
+#[cfg(feature = "kbdwit")]
+fn kbdwit_pid(tok: u32) -> &'static str {
+    match (tok >> 8) & 0x3 {
+        0 => "OUT",
+        1 => "IN",
+        2 => "SETUP",
+        _ => "rsvd",
+    }
+}
+
+/// KBDWIT — decode a QH's endpoint-speed field (`ep_chars` bits 13:12, EHCI 1.0 §3.6.2).
+#[cfg(feature = "kbdwit")]
+fn kbdwit_eps(chars: u32) -> &'static str {
+    match (chars >> 12) & 0x3 {
+        0 => "full",
+        1 => "low",
+        2 => "high",
+        _ => "rsvd",
+    }
+}
+
+/// KBDWIT — the probe. Called from the service loop for an endpoint whose qTD is STILL ACTIVE
+/// (nothing completed this pass); dumps once and latches. See the section comment above for the
+/// observation this exists for, its bounds, and the honesty argument for each field.
+#[cfg(feature = "kbdwit")]
+unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const u32, seen: u32) {
+    // One-shot, cheapest test first: after the single dump this endpoint will ever emit, the whole
+    // probe is one predictable branch on the service path.
+    if e.kbdwit_fired {
+        return;
+    }
+    let now = crate::arch::ms();
+    // Reference = this endpoint's last completion, or its arming instant if it has never completed
+    // anything (the s58 keyboard's exact state). A 0 reference means the stamp was never taken —
+    // unreachable, since `arm_interrupt_ep` stamps `kbdwit_armed_ms` — but treating it as "no
+    // reference" rather than as time zero keeps an unbounded `now` from reading as a silence.
+    let since = if e.kbdwit_last_ms != 0 { e.kbdwit_last_ms } else { e.kbdwit_armed_ms };
+    if since == 0 || now.wrapping_sub(since) < KBDWIT_QUIET_MS {
+        return;
+    }
+    e.kbdwit_fired = true;
+
+    // ── sample everything BEFORE printing, so the whole dump describes one instant ──────────────
+    let fr_a = mmio_read32(op + KBDWIT_OP_FRINDEX);
+    let t_a = crate::arch::ms();
+    let sts = mmio_read32(op + OP_USBSTS);
+    let cmd = mmio_read32(op + OP_USBCMD);
+    let chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
+    let caps = core::ptr::read_volatile(&(*e.qh).ep_caps);
+    let horiz = core::ptr::read_volatile(&(*e.qh).horiz);
+    let cur = core::ptr::read_volatile(&(*e.qh).current_qtd);
+    let ovl0 = core::ptr::read_volatile(&(*e.qh).overlay[0]);
+    let ovl1 = core::ptr::read_volatile(&(*e.qh).overlay[1]);
+    let ovl2 = core::ptr::read_volatile(&(*e.qh).overlay[2]);
+    let ovl3 = core::ptr::read_volatile(&(*e.qh).overlay[3]);
+    // overlay[4]/overlay[5] are qTD buffer pointers 1 and 2, which for a SPLIT transaction carry
+    // the controller's split progress state — C-prog-mask (buf1 bits 7:0) and FrameTag/S-bytes
+    // (buf2 bits 4:0 / 11:5), EHCI 1.0 §3.5.4. The rMBP keyboard is a low/full-speed device behind
+    // a TT, so a wedged split shows up HERE and nowhere else. Both are zeroed at every (re-)arm,
+    // so a non-zero value is progress the controller made on this transfer.
+    let ovl4 = core::ptr::read_volatile(&(*e.qh).overlay[4]);
+    let ovl5 = core::ptr::read_volatile(&(*e.qh).overlay[5]);
+    let qtok = core::ptr::read_volatile(&(*e.qtd).token);
+    let fl0 = core::ptr::read_volatile(fl);
+    let qh_phys = phys_of(e.qh as *const Qh, 32).unwrap_or(0);
+
+    // The token the CONTROLLER is executing, per the mode this controller settled into.
+    let live = if om { ovl2 } else { qtok };
+    let addr = chars & 0x7F;
+    let epn = (chars >> 8) & 0xF;
+    let kind = match e.layout {
+        Some(l) if l.vendor_mt => "vendor-mt",
+        Some(l) if l.relative => "rptr-rel",
+        Some(_) => "rptr-abs",
+        None if e.is_kbd => "kbd",
+        None if e.is_rel_mouse => "boot-mouse",
+        None => "unknown",
+    };
+
+    // 1/7 — the verdict header: what went quiet, for how long, measured from what.
+    serial_println!(
+        ":: KBDWIT: [{}] ep=IN{} addr={} kind={} SILENT quiet={}ms armed_ms={} last_ms={} now_ms={} reports={} toggle={} dead={} == witness ::",
+        idx, epn, addr, kind,
+        now.wrapping_sub(since),
+        e.kbdwit_armed_ms, e.kbdwit_last_ms, now,
+        e.reports, e.toggle as u8, e.dead as u8,
+    );
+    // 2/7 — the token, raw, from all three vantage points (see the honesty note on `seen=`).
+    serial_println!(
+        ":: KBDWIT: [{}] ep=IN{} path={} seen={:#010x} ovl_tok={:#010x} qtd_tok={:#010x} live={:#010x} == witness ::",
+        idx, epn,
+        if om { "overlay-direct" } else { "qtd-chain" },
+        seen, ovl2, qtok, live,
+    );
+    // 3/7 — the live token decoded. `rem` is Total Bytes To Transfer still outstanding: equal to
+    // the armed total means not one byte moved.
+    serial_println!(
+        ":: KBDWIT: [{}] ep=IN{} tok active={} halted={} dbuf={} babble={} xact={} missed={} split={} ping={} pid={} cerr={} ioc={} dt={} rem={} == witness ::",
+        idx, epn,
+        (live >> 7) & 1, (live >> 6) & 1, (live >> 5) & 1, (live >> 4) & 1,
+        (live >> 3) & 1, (live >> 2) & 1, (live >> 1) & 1, live & 1,
+        kbdwit_pid(live), (live >> 10) & 3, (live >> 15) & 1, (live >> 31) & 1,
+        (live >> 16) & 0x7FFF,
+    );
+    // 4/7 — the queue head verbatim. `ovl4`/`ovl5` are the split progress words (see above).
+    serial_println!(
+        ":: KBDWIT: [{}] ep=IN{} qh={:#010x} chars={:#010x} caps={:#010x} horiz={:#010x} cur={:#010x} ovl0={:#010x} ovl1={:#010x} ovl3={:#010x} ovl4={:#010x} ovl5={:#010x} == witness ::",
+        idx, epn, qh_phys, chars, caps, horiz, cur, ovl0, ovl1, ovl3, ovl4, ovl5,
+    );
+    // 5/7 — identity + addressing decoded from the controller's OWN words, plus the linkage check:
+    // `fl0` is frame-list entry 0, the head of the periodic chain the controller walks. If neither
+    // it nor any `horiz` in that chain reaches `qh`, this endpoint is orphaned from the schedule
+    // and no amount of healthy controller state could ever have completed it.
+    serial_println!(
+        ":: KBDWIT: [{}] ep=IN{} mps={} eps={} dtc={} smask={:#04x} cmask={:#04x} tt=hub{}:port{} mult={} buf_phys={:#010x} qtd_phys={:#010x} fl0={:#010x} == witness ::",
+        idx, epn,
+        (chars >> 16) & 0x7FF, kbdwit_eps(chars), (chars >> 14) & 1,
+        caps & 0xFF, (caps >> 8) & 0xFF, (caps >> 16) & 0x7F, (caps >> 23) & 0x7F,
+        (caps >> 30) & 3,
+        e.buf_phys, e.qtd_phys, fl0,
+    );
+    // 6/7 — controller state. `ok=0` means the MMIO read itself failed and the hex is a
+    // placeholder, NOT a set of clear status bits.
+    serial_println!(
+        ":: KBDWIT: [{}] ep=IN{} usbsts={:#010x} usbcmd={:#010x} ok={} hch={} hse={} pss={} ass={} rs={} pse={} ase={} == witness ::",
+        idx, epn,
+        sts.unwrap_or(0), cmd.unwrap_or(0),
+        (sts.is_some() && cmd.is_some()) as u8,
+        (sts.unwrap_or(0) & STS_HCHALTED != 0) as u8,
+        (sts.unwrap_or(0) & STS_HSE != 0) as u8,
+        (sts.unwrap_or(0) & KBDWIT_STS_PSS != 0) as u8,
+        (sts.unwrap_or(0) & KBDWIT_STS_ASS != 0) as u8,
+        (cmd.unwrap_or(0) & CMD_RS != 0) as u8,
+        (cmd.unwrap_or(0) & CMD_PSE != 0) as u8,
+        (cmd.unwrap_or(0) & CMD_ASE != 0) as u8,
+    );
+    // 7/7 — the staleness tell. `b` is read AFTER the six lines above have gone out on the wire,
+    // so the spacing is paid for by serial output already owed, not by a wait. Both raws print
+    // with the measured gap: at `dt=0ms` the pair is uninformative and says so.
+    let fr_b = mmio_read32(op + KBDWIT_OP_FRINDEX);
+    let t_b = crate::arch::ms();
+    serial_println!(
+        ":: KBDWIT: [{}] ep=IN{} frindex a={:#06x} b={:#06x} ok={} dt={}ms == witness ::",
+        idx, epn,
+        fr_a.unwrap_or(0) & 0x3FFF, fr_b.unwrap_or(0) & 0x3FFF,
+        (fr_a.is_some() && fr_b.is_some()) as u8,
+        t_b.wrapping_sub(t_a),
+    );
 }
 
 /// Boot-keyboard report decode — the same layout, scancode table, and Event delivery as the

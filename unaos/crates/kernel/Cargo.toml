@@ -230,6 +230,24 @@ ehciconfig = ["ehciscout"]
 # suppresses it under UNAOS_NOEHCIHID=1 (the PORTSW-1 negative-knob policy). Opt-out => this feature
 # is not enabled => module + every call site unlinked => byte-identical to the pre-fold no-EHCI media.
 ehcihid = ["ehciconfig"]
+# KBDWIT: the one-shot per-endpoint EHCI interrupt-silence witness (drivers/ehci/mod.rs
+# §KBDWIT). Motivated by metal build s58 (2026-08-01): on two consecutive boots the rMBP USB
+# keyboard produced ZERO interrupt completions for the whole boot while the trackpad — same hub,
+# same TT, same EHCI function — streamed normally, with `ehci:kbd-armed` recorded so the endpoint
+# WAS armed. Cause unknown; it did not recur on s59/s60. When an armed interrupt endpoint has gone
+# `KBDWIT_QUIET_MS` with no completion, this dumps the qTD token, the QH overlay (incl. the split
+# progress words), USBSTS/USBCMD and a FRINDEX pair — once, per endpoint, per boot — then latches.
+# Read-only telemetry: no register is written, no transfer is retried, nothing is "recovered".
+#
+# DEFAULT-QUIET LAW, and the deliberate exception: this is a NEW witness family, so it rides the
+# default boot ONLY while it is earning its verdict. arroyo/builder therefore push `kbdwit` BY
+# DEFAULT (alongside `ehcihid`, and only when `ehcihid` itself is on), and `UNAOS_NOKBDWIT=1` OPTS
+# OUT => feature not enabled => the probe, its `IntEp` fields and its call site all vanish and the
+# EHCI service path is byte-identical to the pre-arc default. Retire the default-on half once the
+# recurrence is convicted or the family is declared spent. Mirrors the PORTSW-1/SMOLNET/EHCI-4
+# default-ON/negative-knob policy. x86_64-only (the `ehci` module is x86-gated), and `arroyo`'s
+# `arm_features` strips it from aarch64 compiles so aarch64 media stay byte-identical either way.
+kbdwit = []
 # SMOLNET-DEFAULT (2026-07-17): the mature smoltcp TCP/IP stack (ROADMAP §1b) is the DEFAULT x86 net
 # path — the shell's ping/arp/netinfo, the socket syscall family (SOCK-2..7), the DNS sinkhole
 # (zeolite), and the boot witnesses. Pulls in the x86-only smoltcp optional dependency and compiles

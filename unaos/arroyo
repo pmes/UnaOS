@@ -149,6 +149,16 @@ _feats=""
 # feature not pushed => module + all call sites unlinked => byte-identical to the pre-fold no-EHCI
 # default. Mirrors the PORTSW-1 default-ON/negative-knob policy. x86_64 only; aarch64 identical.
 [ -z "${UNAOS_NOEHCIHID:-}" ] && _feats="${_feats}ehcihid,"
+# KBDWIT: the one-shot per-endpoint EHCI interrupt-silence witness (drivers/ehci/mod.rs §KBDWIT) —
+# for the s58 metal defect where the rMBP USB keyboard completed NOTHING all boot while the trackpad
+# on the same TT streamed. DEFAULT-ON for this round (a new witness family rides the default boot
+# only while it is earning its verdict): pushed whenever the driver it instruments is pushed, and
+# suppressed by UNAOS_NOKBDWIT=1 => probe + IntEp fields + call site unlinked => the EHCI service
+# path is byte-identical to the pre-arc default. Gated on the SAME condition as `ehcihid` on purpose:
+# `kbdwit` deliberately does NOT imply `ehcihid` (implying it would resurrect the driver for an
+# operator who opted out), so pushing it alone would be a feature with no module to compile into.
+# Read-only: no register written, no transfer retried. Kept in sync with builder/src/main.rs.
+[ -z "${UNAOS_NOEHCIHID:-}" ] && [ -z "${UNAOS_NOKBDWIT:-}" ] && _feats="${_feats}kbdwit,"
 # BATMON-1: the Apple SMC battery monitor (x86_64). UNAOS_SMC=1 arms the polled SMC key/value driver
 # (boot key-inventory scout + battery snapshot for the on-screen meter). Port I/O confined to
 # 0x300/0x304; no value-mutating writes. The builder attaches QEMU's isa-applesmc under this knob so
@@ -367,6 +377,12 @@ arm_features() {
     esac
     local f=",${KERNEL_FEATURES#--features },"
     f="${f//,smolnet,/,}"
+    # KBDWIT rides the same strip, for the same reason: the `ehci` module it instruments is
+    # `target_arch = "x86_64"`-gated, so `kbdwit` emits not one byte of aarch64 CODE — but an
+    # enabled feature is hashed into cargo's `-Cmetadata` fingerprint, so leaving it in would shift
+    # every aarch64 media hash between a default build and a `UNAOS_NOKBDWIT=1` one for zero
+    # observable change. Stripped => aarch64 media are byte-identical either way.
+    f="${f//,kbdwit,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
