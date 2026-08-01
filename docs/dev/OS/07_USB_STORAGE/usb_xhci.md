@@ -777,7 +777,7 @@ it directly: the bracket stays, so `entry-link-discriminator took=` collapsing t
 ### 5i. PIUSB-43 — the enum-portsc witness (PA6: which connect branch died)
 
 **The gap.** PA5c metal (boot via GR12) ran the FULL 30 s `enum-pump` budget with **zero**
-port-connect events, then thousands of idle `[piusb26]` pump passes and no slot, no HID, no BOT. The
+port-status-change events off the ring, then thousands of idle `[piusb26]` pump passes and no slot, no HID, no BOT. The
 wire could not distinguish four different deaths: no device electrically present (CCS never set) ·
 CCS set but no Port Status Change Event generated · events written but never consumed off our ring ·
 PP/link state regressed after the M3 line.
@@ -789,7 +789,7 @@ PP/link state regressed after the M3 line.
 > ```
 > xHCI: TIMEOUT (~150000000 cyc) waiting for USBCMD.HCRST=0 (reset)
 > xHCI: TIMEOUT (~150000000 cyc) waiting for USBSTS.CNR=0
-> xHCI: FATAL — USBSTS.CNR still 1 after 801 polls; aborting xHCI register programming
+> xHCI: FATAL — USBSTS.CNR still 1 after 801 polls (~150000000 cyc); aborting xHCI register programming
 >        (spec 5.4.1: op/runtime writes while CNR=1 are dropped)
 > xHCI: init_pointers SKIPPED — controller never left Not-Ready (CNR=1)
 > xHCI: start SKIPPED — controller never left Not-Ready (CNR=1); RS=1 not issued
@@ -799,17 +799,20 @@ PP/link state regressed after the M3 line.
 > reading below.
 > 1. `M3: 5 root port(s) powered (PORTSC.PP set)` and `enumerate: xHCI self-coherent` are
 >    stage-intent lines, not state observations — by our own FATAL line, the PP write was dropped.
->    `PP=1` read back is the controller's reset default, not our write landing.
+>    `PP=1` read back is therefore not our write landing (a firmware-set value is equally consistent).
 > 2. `popped=0` / `pend=0` are **forced by construction**, not observed: ERSTBA/ERDP/CRCR/DCBAAP were
 >    never written. `EVENTS-UNCONSUMED` cannot fire, and `CCS-NO-EVENT` degenerates into a
 >    restatement of "no event path was ever built".
-> 3. A device **was** electrically present the whole time — port 1 read `0x400202e1`
+> 3. A device **was** electrically present at both sample points (pump entry and after pump exit;
+>    the capture samples endpoints, not continuously) — port 1 read `0x400202e1`
 >    (CCS=1, CSC=1, PP=1, PLS=7 Polling) and `[enum] port 1 connect (device attached)` fired. The
 >    "no device ever existed to the kernel" reading was wrong.
 >
 > **Admissibility rule:** whenever `init_pointers SKIPPED` / `start SKIPPED` appear in a capture, a
 > `[piusb43]` verdict must be quoted **beside them, never alone** — under CNR=1 the PORTSC and IMAN
-> reads inherit the same doubt the FATAL line raises about that register window. The sentence below
+> reads inherit the same doubt the FATAL line raises about that register window. (Note this is an
+> EXTENSION of the spec cite, which covers dropped op/runtime *writes* under CNR=1, not read doubt —
+> conservative, and stated as an extension rather than as the spec's own claim.) The sentence below
 > ("it can execute in the state it reports on") holds for the pump's own MMIO, not for a controller
 > that never left Not-Ready.
 >
@@ -817,11 +820,25 @@ PP/link state regressed after the M3 line.
 > alive at `[v3d55] GET_CLOCK_RATE … (mailbox OK)`, dead from `[v3d75a] SET_ENABLE_QPU(1) — MAILBOX
 > FAILED` onward, for every caller. All three `NOTIFY_XHCI_RESET` attempts then fail, so the VL805
 > firmware is never reloaded after our PERST/RC reset and the controller cannot leave CNR. The
-> healthy 2026-07-29 boot (`capture/pi4-r23s1q`) has **zero** mailbox timeouts, `NOTIFY … tag
-> HONOURED` ×3, `CNR cleared after 1 polls`, `RS=1`, `Max Ports = 5`, and an enumerated HID mouse.
 > `set_enable_qpu` is reached only via `v3d75_fabric_condition()`, whose sole caller
-> `empty_frame_bisection()` early-returns on `!V3D_DEEP` — so the send rides **`UNAOS_V3D_DEEP=1`
-> alone**, and dropping that one knob removes it with no code change.
+> `empty_frame_bisection()` early-returns on `!V3D_DEEP`. The second send site reaches the same tag
+> reply-lessly under `v3d81_qpu` (`v3d.rs:7204-7211` from `v3d81_replyless_notify()`), which is the
+> last statement of the same function — so it rides `V3D_DEEP` too. The send is behind
+> **`UNAOS_V3D_DEEP=1` alone**, and dropping that one knob removes it with no code change.
+>
+> **Two controls, and they prove different things — do not conflate them.**
+> - `capture/pi4-r23s1q` (2026-07-29) ran **`deep=on`** on a build that *predates* the `[v3d75a]`
+>   rung — zero `SET_ENABLE_QPU` sends anywhere in it — with zero mailbox timeouts, `NOTIFY … tag
+>   HONOURED` ×3, `CNR cleared after 1 polls`, `RS=1`, `Max Ports = 5`, an enumerated HID mouse. It
+>   isolates **the send**, not the knob, and positively rules out `deep=on` by itself as the cause.
+> - **PA6** (`67d2b094`, 2026-08-01) is the knob counterfactual: same tip code as the failing image,
+>   `UNAOS_V3D_DEEP` dropped. Metal result — **0** mailbox timeouts, `tag HONOURED` ×3, `CNR cleared
+>   after 1 polls`, `enum-xhci-handoff took=1ms` (vs 5566 ms), `enum-pump took=7694ms` (early exit,
+>   vs the full 30000 ms budget), port 1 walking `0x400002e1` → `0x40000e03` (PED=1, PLS=0, High-
+>   Speed), hub walked, `SLOT 1 ENABLED & ADDRESSED`, `keyboard ARMED … -> PASS`, boot-mouse
+>   configured. Mass storage did not enumerate on that boot
+>   (`note='no mass-storage device enumerated'`) — unattributed; no storage device is known to have
+>   been attached, so it is not evidence about the BOT path either way.
 
 **The instrument.** A read-only sampler inside the enum pump: at pump START, every ~2 s of pump
 time (capped at 13 interior samples), and once at pump END, one line carries every root port's RAW
@@ -831,7 +848,8 @@ event-ring consumer state (`dequeue_index`/cycle, `popped` = total TRBs ever con
 and the witness never writes), IMAN is read not acknowledged, and no pump logic, budget, or write
 is touched. Default-ON: the instrument exists for the failing path, and it can execute in the state
 it reports on (samples ride the same MMIO the pump already trusts); QEMU raspi4b never reaches the
-pump (`XHCI_READY` gate), so its log stays byte-identical. Budget: ≤16 lines per boot.
+pump (`XHCI_READY` gate), so its log stays byte-identical. Budget: ≤17 lines per boot
+(1 HCSPARAMS1 + 1 start + ≤13 periodic + 1 end + 1 verdict).
 
 **Witness grammar.**
 

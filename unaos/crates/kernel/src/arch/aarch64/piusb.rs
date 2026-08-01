@@ -2188,7 +2188,7 @@ impl EnumWitness {
 //    reaches the pump (`XHCI_READY` gate — no PCIe RC/VL805 modeled), so the witness is
 //    hardware-gated quiet there and the QEMU log stays byte-identical.
 //
-//    Line budget: 1 start + <=13 periodic + 1 end + 1 verdict = <=16 lines per boot; an
+//    Line budget: 1 HCSPARAMS1 + 1 start + <=13 periodic + 1 end + 1 verdict = <=17 lines per boot; an
 //    early-exiting healthy pump emits as few as 3.
 const PIUSB43_MAX_PORTS: usize = 8; // VL805 exposes 5 root ports; clamp for the fixed arrays
 const PIUSB43_PERIODIC_CAP: u32 = 13; // 30 s / 2 s = 15 interior ticks; cap keeps the budget honest
@@ -2320,7 +2320,18 @@ impl PortscWitness {
     /// Branch priority: an unconsumed ring first (it invalidates any silence claim downstream of
     /// it), then powered-state regressions, then the device-evidence branches. A state the samples
     /// cannot distinguish prints UNRESOLVED naming the read that would decide it.
-    fn verdict(&self) {
+    fn verdict(&self, advanced: Option<&str>) {
+        // The pump reached a terminal SUCCESS state. Every branch below names a way the connect
+        // path died; none of them may speak here. PA6 metal printed a confident
+        // "yet enumeration did not advance" while the hub was walked, slots addressed and the
+        // keyboard armed — the verdict was asserting a state it had never checked.
+        if let Some(how) = advanced {
+            serial_println!(
+                "{} [piusb43] verdict=ADVANCED — the pump exited on a terminal success ({}); the connect path did NOT die and no death branch is claimed. Ring at exit: popped={} pend={} ::",
+                P, how, self.end_popped, self.end_pend as u32
+            );
+            return;
+        }
         if !self.have_baseline {
             serial_println!(
                 "{} [piusb43] verdict=UNRESOLVED — no sample was ever taken (pump exited before the start sample); this instrument did not execute in the state it reports on, so its silence is not evidence ::",
@@ -2333,10 +2344,19 @@ impl PortscWitness {
         // was draining and one more event arrived after the last poll; the end sample line shows
         // it either way.)
         if self.end_pend && self.end_popped == 0 {
-            serial_println!(
-                "{} [piusb43] verdict=EVENTS-UNCONSUMED — the event ring holds a fresh TRB at pump exit (pend=1) and popped=0 events were consumed all pump: events reached the ring, the consumer never took one ::",
-                P
-            );
+            // The ring finding is DRAM-derived and survives a dark BAR — but if PORTSC read poison
+            // this line must carry that tell too, or it is the same confident-verdict-from-a-dark-
+            // window defect the poison branch below exists to prevent, just pointing the other way.
+            match self.poison {
+                Some((port, raw)) => serial_println!(
+                    "{} [piusb43] verdict=EVENTS-UNCONSUMED — the event ring holds a fresh TRB at pump exit (pend=1) and popped=0 events were consumed all pump: events reached the ring, the consumer never took one. CAVEAT: port {} PORTSC read back {:#010x} (poison), so this ring finding stands but NO PORTSC-derived reading does ::",
+                    P, port, raw
+                ),
+                None => serial_println!(
+                    "{} [piusb43] verdict=EVENTS-UNCONSUMED — the event ring holds a fresh TRB at pump exit (pend=1) and popped=0 events were consumed all pump: events reached the ring, the consumer never took one ::",
+                    P
+                ),
+            }
             return;
         }
         // A poison PORTSC read disqualifies every PORTSC-DERIVED branch below (REGRESSED,
@@ -2522,15 +2542,24 @@ pub fn enumerate() {
     // MaxPorts=0xff, which the clamp would silently turn into 8 — three ports past the VL805's five,
     // sampled as if they existed. Poison here means the window is dark, so fall back to the known
     // VL805 port count and let the per-port poison tell in `sample()` name the state on the wire.
+    // The port count is a DERIVED value, so its raw word rides the wire UNCONDITIONALLY — otherwise
+    // NO-CCS-EVER quotes "all N root ports" with nothing letting a reader check where N came from.
+    // `0` is poison here too (this file's own idiom at the CAP[0] probe): a zero read would clamp to
+    // 1 and the witness would report NO-CCS-EVER across "all 1 root ports".
     let hcs1 = r(base + 0x04);
-    let ports = if is_poison(hcs1) {
+    let ports = if is_poison(hcs1) || hcs1 == 0 {
         serial_println!(
-            "{} [piusb43] HCSPARAMS1 read back {:#010x} (poison) — MaxPorts unreadable; sampling the VL805's 5 root ports and expecting the per-port poison tell below ::",
+            "{} [piusb43] HCSPARAMS1={:#010x} (poison/zero) — MaxPorts unreadable; sampling the VL805's 5 root ports and expecting the per-port poison tell below ::",
             P, hcs1
         );
         5
     } else {
-        (((hcs1 >> 24) & 0xff) as usize).clamp(1, PIUSB43_MAX_PORTS)
+        let n = (((hcs1 >> 24) & 0xff) as usize).clamp(1, PIUSB43_MAX_PORTS);
+        serial_println!(
+            "{} [piusb43] HCSPARAMS1={:#010x} MaxPorts={} — sampling {} root port(s) ::",
+            P, hcs1, (hcs1 >> 24) & 0xff, n
+        );
+        n
     };
     let mut pw = PortscWitness::new(
         base + cap_length,
@@ -2539,6 +2568,11 @@ pub fn enumerate() {
     );
     pw.sample("start");
     let mut pw_last = super::timer::cntpct();
+    // PIUSB-43r3: what the pump ACHIEVED, for the verdict. PA6 metal printed
+    // "verdict=UNRESOLVED — … yet enumeration did not advance" on a boot that enumerated a hub,
+    // addressed slots and armed a keyboard: the verdict had no success branch and asserted a
+    // failure it never checked. The witness must know how the pump exited before it names a death.
+    let mut enum_advanced: Option<&'static str> = None;
     loop {
         // XHCI-COHERENCE: no external cache maintenance here anymore. The driver's `poll_events`
         // invalidates the event ring at each dequeue (`EventRing::has_event`) and cleans every command
@@ -2586,10 +2620,12 @@ pub fn enumerate() {
         // keyboard-first carryover that left a disk-only Pi boot spinning to the 30 s deadline).
         if storage_ready {
             serial_println!("{} enumerate: mass storage ready (slot {}) ::", P, storage_slot);
+            enum_advanced = Some("mass storage ready");
             break;
         }
         if armed.is_some() {
             if super::timer::cntpct().wrapping_sub(armed_at) >= storage_settle {
+                enum_advanced = Some("keyboard armed, no mass storage within the settle window");
                 break; // keyboard up, no disk within the settle window — stop
             }
         }
@@ -2603,7 +2639,7 @@ pub fn enumerate() {
 
     // PIUSB-43: end sample + the one verdict line, before the stage bracket closes.
     pw.sample("end");
-    pw.verdict();
+    pw.verdict(enum_advanced);
 
     stage_end("enum-pump", pump_start);
     stage_end("enum-total", t_enum_total);
