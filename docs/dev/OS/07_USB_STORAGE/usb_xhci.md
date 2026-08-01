@@ -243,7 +243,7 @@ advances log `[xhciint] ERDP advanced to <phys>` under the xdbg gate. QEMU raspi
 models no PCIe RC/VL805, so the Pi witness is metal-only; the aarch64 `virt` MISSION
 gate exercises the path and carries the witness.
 
-### 2d. The pre-CCS-scan settle — 500 ms → 150 ms (BOOTPACE M4) → 100 ms (CCSTRIM)
+### 2d. The pre-CCS-scan settle — 500 ms → 150 ms (M4) → conditional 150/100 ms (CCSTRIM)
 
 `start()` powers every root port, waits, and only then samples CCS to build the
 initial enumeration queue. The wait exists because a boot-owned USB3 device whose
@@ -263,7 +263,7 @@ unprintable: ~500 ms on a calibrated x86, ~694 ms on the Pi's fixed 150 M-tick
 budget. It is now `SETTLE_MS * cycles_per_ms()` — the same honest number on both
 arches, and `settle_ms=` can state it without lying.
 
-**Length: 150 ms** (M4; now 100 ms — see CCSTRIM below). USB3 link training
+**Length: 150 ms** (M4; now conditional — see CCSTRIM below). USB3 link training
 reaches U0 in tens of ms typically; the spec's outer bound is
 `tPollingLFPSTimeout` = 360 ms (USB 3.2 §6.9). That outer bound is now enforced
 where it belongs — see below — instead of by padding the settle, so the common
@@ -296,7 +296,7 @@ A slow device therefore enumerates **later**, not never.
 **Metal tell-tale of a regression here.** The boot device arriving via the
 CSC / warm-reset path instead of the initial scan. On a healthy boot the capture
 reads `xHCI: Port N connected (Status: …); queued for enumeration.` immediately
-after `xHCI: port settle complete before CCS scan (settle_ms=150)`. If instead the
+after `xHCI: port settle complete before CCS scan (settle_ms=<N>)`. If instead the
 boot device's port shows up through
 `xHCI: [Port N] unsolicited reset complete; queuing for enumeration.` or a plain
 hot-plug `CSC` line — or if `xHCI: USB3 port N stuck in Polling (debounced);
@@ -315,7 +315,8 @@ Until CCSMARGIN, **the settle constant was covering a phenomenon that had never
 been measured on either arch**: nothing anywhere recorded *when* CCS asserts, so
 every capture on x86 and on the Pi showed only that CCS *had* asserted by the end
 of the wait, and the sole failure signal was the pass/fail tell-tale above, after
-the fact, with no number attached. Nobody could say whether 150 ms sits on
+the fact, with no number attached. Nobody could say whether the then-current
+150 ms sat on
 comfortable margin or one slow device away from missing a port — and the two
 seats do not even ask the same question of it. x86 asks "has a USB3 link finished
 Polling"; the Pi asks "has the VL805's firmware booted far enough to present its
@@ -327,7 +328,7 @@ per port, the elapsed millisecond at which `CCS` first reads 1. One line follows
 the `xhci-settle` stamp:
 
 ```
-xHCI: ccs-margin settle_ms=100 ports=4 first_assert_ms=[p1:0/pre p2:none/on p3:none/on p4:87/on] latest=87 margin_ms=13 result=CCSMARGIN
+xHCI: ccs-margin settle_ms=150 ppc=1 ports=4 first_assert_ms=[p1:0/pre p2:none/on p3:none/on p4:87/on] latest=87 margin_ms=63 result=CCSMARGIN
 ```
 
 - every root port `1..=MaxPorts` is listed, so the absent ones are stated rather
@@ -336,9 +337,15 @@ xHCI: ccs-margin settle_ms=100 ports=4 first_assert_ms=[p1:0/pre p2:none/on p3:n
   measurement — the port already read `CCS=1` when the settle began, i.e. the
   device was attached before the machine was powered and never needed the wait.
   `p1:0` is common and benign, **not** an error;
+- **`ppc=`** (CCSTRIM) — `HCCPARAMS1` bit 3, Port Power Control (xHCI 5.3.6).
+  `ppc=0` means the controller implements no port power switching at all: `PP`
+  reads 1 permanently and VBUS is never removed, so every `/pre` below is an
+  *observation*. `ppc=1` with `/pre` is the weaker claim — `PP` survived our
+  `HCRST`, which strongly implies VBUS did too, but no register says so;
 - **`/on` vs `/pre`** (CCSTRIM) — did *we* apply `PP` to this port, or did we find
   it already powered by firmware? This decides what the settle's clock means for
-  that port. On an `/on` port VBUS really did transition, so USB 2.0's `TSIGATT`
+  that port **and which settle value the boot runs**. On an `/on` port VBUS really
+  did transition, so USB 2.0's `TSIGATT`
   attach allowance is genuinely running and a nonzero `first_assert_ms` is
   attach signalling. On a `/pre` port VBUS has been valid since firmware, the
   allowance expired long before the kernel existed, and the same number is
@@ -355,7 +362,7 @@ xHCI: ccs-margin settle_ms=100 ports=4 first_assert_ms=[p1:0/pre p2:none/on p3:n
 | mechanism did not run — nothing plugged into any root port | every port `none`, `latest=none`, `margin_ms=none` |
 | the failure the settle exists to prevent | `margin_ms` **0 or negative** — the final at-deadline sweep was the first sample to see `CCS=1`, so the port reached the initial scan with no headroom |
 
-`margin_ms=none` is deliberate. Printing `150` when zero ports were measured would
+`margin_ms=none` is deliberate. Printing the whole budget when zero ports were measured would
 report maximum apparent headroom from no measurements at all — the instrument
 lying about its own baseline.
 
@@ -388,48 +395,84 @@ Pi 4 track gets the same measurement of its own VL805 for free at merge.
 
 #### CCSTRIM — spending the margin, and making the spend falsifiable
 
-CCSMARGIN's first metal reading (rMBP, GR11) was
+**Seven metal boots**, not one: `rmbp-gr11/ttyUSB1.log` ×3 and
+`rmbp-gr12/ttyUSB0.log` ×4 all carry the CCSMARGIN line, all byte-identical —
 
 ```
 xHCI: ccs-margin settle_ms=150 … latest=21 margin_ms=129 result=CCSMARGIN
 ```
 
-129 ms of a 150 ms budget unused, and the note "safe with 7× headroom, could go
-lower". Going lower on that reading alone is the trap, for two reasons.
+— with `Max Ports = 8`, all eight ports already powered (`status 0x2a0`), and
+zero variance across the seven. `polling_candidates` is empty on every one, so
+the Polling debounce never runs and any trim is fully realised as boot time on
+this machine. 129 ms of a 150 ms budget unused, and GR11's note "safe with 7×
+headroom, could go lower". Going lower on that reading is still a trap, for
+reasons the reading itself cannot show.
 
 **What the wait is actually made of.** Two phenomena were folded into one
 constant:
 
 | | phenomenon | outer bound | where it is enforced |
 |---|---|---|---|
-| (a) | port power → USB 2.0 device signals attach | `TSIGATT` = **100 ms** from `VBUS_min` (USB 2.0 Table 7-14) | here, and only here |
-| (b) | USB3 link training `RxDetect → Polling → U0` | `tPollingLFPSTimeout` = 360 ms (USB 3.2 §6.9) | `POLLING_DECIDE_MS − SETTLE_MS`, *not* here |
+| (a) | port power → USB 2.0 device signals attach | `TSIGATT` = **100 ms from `VBUS_min`** (USB 2.0 Table 7-14) | here, and only here |
+| (b) | USB3 link training `RxDetect → Polling → U0` | `tPollingLFPSTimeout` = 360 ms (USB 3.2 §6.9) | `POLLING_DECIDE_MS − settle_ms`, *not* here |
 
-M4 already moved (b) out: the Polling debounce is defined as `360 − SETTLE_MS`,
+M4 already moved (b) out: the Polling debounce is defined as `360 − settle_ms`,
 so the USB3 verdict window is 360 ms from port power **whatever this constant
-is**. (b) therefore places no floor on the settle. **Only (a) does, and it is
-100 ms.** Below that, a spec-conformant USB 2.0 device that uses its full attach
-allowance is *designed* to be missed by the initial scan — a decision no
-measurement of one machine's device population can license. So `SETTLE_MS` is
-now exactly `TSIGATT`: **150 → 100 ms**, dropping the 50 ms of unstated
-VBUS-ramp allowance that 150 carried on top of the floor.
+is**. (b) places no floor on the settle. Only (a) does — and (a) exists only on a
+port this boot actually energised.
+
+**Why the constant is conditional and not flat.** `settle_start` is taken *after*
+the `PP`-write loop, so the port power-on-to-power-good ramp sits **inside** the
+budget while `TSIGATT`'s clock only starts at the far end of it. A flat 100 would
+therefore hand a conformant device on a freshly energised port strictly *less*
+than the 100 ms it is allowed — the floor violated by the constant named after
+it. But the ramp only exists for `/on` ports, and the driver knows which those
+are. So:
+
+| condition | `settle_ms` | why |
+|---|---|---|
+| any port energised by us this boot (`/on`) | **150** | 100 ms `TSIGATT` + 50 ms ramp allowance. The metal-proven incumbent; nothing in evidence justifies trimming a path nobody has measured |
+| every port already powered (`/pre`) | **100** | no ramp to allow for, and no `TSIGATT` clock running at all |
+
+On the seven rMBP captures every port is `/pre`, so that bench takes the 100 ms
+branch and the full ~50 ms saving.
+
+**What the `/pre` branch is really waiting for.** Not attach signalling. VBUS
+never transitioned, so `TSIGATT` expired long before the kernel existed; the
+21 ms is post-`HCRST` root-port connect re-detection, for which **no external
+standard sets any bound at all**. 100 is therefore not a spec floor on this
+machine — it is the measured phenomenon with an order of magnitude of headroom,
+retained at the `TSIGATT` figure because it is the least arbitrary number
+available and because the other tracks inherit this constant. The `TSIGATT` floor
+is doing its work for `hw-pi4` and `hw-jetson`, not for the rMBP.
 
 **Why not far lower, given `latest=21`.** Because the cost of undershooting is
 not symmetric with the saving. A port that asserts at `t`:
 
-- `t ≤ SETTLE_MS` — caught by the initial scan; being a boot-scan entry it
+- `t ≤ settle_ms` — caught by the initial scan; being a boot-scan entry it
   *skips* the 100 ms `TATTDB` connect debounce, so enumeration starts at
-  `SETTLE_MS`;
-- `t > SETTLE_MS` — falls to the CSC / hot-plug path, which is **not** a
-  boot-scan entry and pays the full debounce, so enumeration starts at `t + 100`.
+  `settle_ms`;
+- `t > settle_ms` — falls to the CSC / hot-plug path, which is **not** a
+  boot-scan entry and pays the debounce in full, so enumeration starts at
+  `t + 100`.
 
 Undershooting by one millisecond costs a hundred. The whole prize is
-`150 − SETTLE_MS`; the penalty whenever the real population's tail exceeds the
-new value is `+100`. Chasing the 21 is a bad trade even before `n=1` is
-considered.
+`150 − settle_ms`; the penalty whenever the real population's tail exceeds the
+new value is `+100`.
 
-**The two instruments that make the trim falsifiable.** A trim justified by a
-witness that cannot see its own failure mode is not justified.
+**It survives the uncalibrated timebase.** `cycles_per_ms()` falls back to a
+2 GHz guess when `apic::tsc_hz()` reads 0 (no ACPI PM timer, or `calibrate`
+returning ABORTED/REJECTED). Against this bench's real 2.693 GHz that makes every
+nominal figure ~26 % short in wall clock. The `/on` branch's 150 degrades to
+~111 ms — still above `TSIGATT`. A flat 100 would have degraded to ~74 ms, i.e.
+*below* the floor on the exact path where the floor applies. That is a second,
+independent reason the constant is not flat, and `cycles_per_ms`'s doc comment —
+which used to claim a wrong guess is "never unsound" — has been corrected to say
+so.
+
+**The three failure tokens.** A trim justified by a witness that cannot see its
+own failure mode is not justified.
 
 | token | meaning |
 |---|---|
@@ -437,36 +480,54 @@ witness that cannot see its own failure mode is not justified.
 | `result=CCSMARGIN-BLOWN` | `margin_ms ≤ 0` — the at-deadline sweep was the first `CCS=1`; no headroom at all |
 | `result=CCSMARGIN-LATE` | a port the settle never saw delivered its connect edge *afterwards*, through the recovery path |
 
-`CCSMARGIN-LATE` is the one that matters, because it is the only measurement that
+`CCSMARGIN-LATE` is the one that matters, because it is the only signal that
 escapes the deadline. Ports that end the settle unseen are latched; ports the
 initial scan finds are cleared; the first connect edge on a still-latched port
 prints
 
 ```
-xHCI: !! ccs-margin LATE port=N t_ms=<t> settle_ms=<s> short_by_ms=<t−s> (missed the initial CCS scan; recovered via CSC) result=CCSMARGIN-LATE
+xHCI: !! ccs-margin LATE port=N t_seen_ms=<t> settle_ms=<s> short_by_ms<=<t−s> (missed the initial CCS scan; recovered via CSC; t_seen is drain time, an upper bound) result=CCSMARGIN-LATE
 ```
 
-`t_ms` is, directly, the `SETTLE_MS` this machine needed. Reported once per port,
-and only within 2 s of the settle's start — past that a connect edge is a human
-with a cable, not a short settle, and an unbounded detector would fire on every
-hot-plug for the rest of uptime and be worthless as a wake pattern.
+**`t_seen_ms` is discovery time, not assert time.** This kernel runs the xHC with
+interrupts off at boot, so the Port Status Change TRB waits in the event ring
+until the main loop's first `poll_events()` drain — and between the settle and
+that drain sits `pci::init`, ~4.5 s of iGPU/Kepler bring-up on this media, with
+the first drain measured at **≈4997 ms** after `settle_start`. So the true assert
+lies in `(settle_ms, t_seen_ms]` and the true shortfall in `(0, short_by_ms]`.
+Do **not** read `short_by_ms` as "add this to the settle". What the line proves is
+the categorical thing — the initial scan missed a port it was supposed to catch.
+
+That measurement is also why the window is **not** wall-clock. The first version
+of this detector closed at a fixed 2 s, roughly 3 s before the first drain could
+ever run: it could not fire on this machine at all, and a falsifier that is dead
+on arrival is worse than none because its silence reads as a pass. The window is
+a boot-phase boundary instead — armed until the end of the first `poll_events()`
+pass that *completes* at or after `CCS_LATE_FLOOR_MS` (2 s). Everything latched
+during boot is still in the ring when that pass drains it, so it is reported;
+anything arriving afterwards is a human with a cable and stays silent. The floor
+only stops a pathologically early empty pass from closing the window before a
+slow port has had time to assert.
 
 **`result=CCSMARGIN-` (with the trailing dash) matches every failure of this trim
-and nothing on a healthy boot** — that is the pattern to arm a bench waker on.
-The healthy line still ends `result=CCSMARGIN`, so pre-CCSTRIM capture greps keep
-working unchanged.
+and nothing on a healthy boot** — that is the pattern to arm a bench waker on,
+and with the window fixed it can now actually fire. The healthy line still ends
+`result=CCSMARGIN`, so pre-CCSTRIM capture greps keep working.
 
-**Saving: ~50 ms**, and only on boots where the Polling debounce does not run —
-when a USB3 port sits at `CCS=0, PLS=Polling` after the settle, the debounce
-absorbs the trim exactly (`360 − SETTLE_MS`) and the boot pays 360 ms either way.
-That is deliberate: the trim must not be able to shorten a spec window.
+**Saving: ~50 ms** on the rMBP, where all seven captures are `/pre` and
+`polling_candidates` is empty on every one. Zero on an `/on` boot (the constant
+stays 150 there by construction), and zero on any boot where the Polling debounce
+does run — the debounce absorbs the trim exactly (`360 − settle_ms`) and the boot
+pays 360 ms either way. That last part is deliberate: the trim must not be able
+to shorten a spec window.
 
-**`n = 1`.** 100 ms is derived from an external standard, not from the metal
-reading; the reading is what showed the 150 was not load-bearing. What would
-invalidate it: a boot printing `CCSMARGIN-LATE`, or a `first_assert_ms` on an
-`/on` port above ~80, on any machine either track cares about. Either says this
-population's attach tail is at the floor and the settle must go back up — and
-neither could have been seen at all before this change.
+**What would invalidate this.** Not sample size — the `/pre` branch rests on seven
+identical boots, and 150 on the `/on` branch is unchanged from the value the
+project has always shipped. It falls to: any boot printing `CCSMARGIN-LATE`; a
+`first_assert_ms` above ~80 on an `/on` port; or an rMBP capture showing `/on`
+ports at all, which would mean the pre-powered premise the 100 ms branch rests on
+does not hold on that machine after all. None of the three was observable before
+this change.
 
 ---
 
