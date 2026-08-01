@@ -310,3 +310,25 @@ together, keeping ratios truthful; `hz=0` prints raw `cy`, never a fabricated
 ms. The self-check is `init=` against the independent BPACE `ehci-hid-done d=`:
 they must agree to within the EPACE lines' own print cost, or one of the two
 instruments is lying.
+
+### 8a. The first EPACE metal reading, and the trim it aimed (s58, 2026-08-01)
+
+One boot: `init=6324ms` against BPACE `ehci-hid-done d=6324ms` — the self-check held
+exactly. The split: `hseprobe=2000ms` on BOTH controllers (63% of the block — the probe-14
+transport probe burning one full `hw_wait_budget()` per controller on silicon whose answer
+was already known), plus the doubled HCRESET/root-reset the HSE re-init forces (~1.25 s
+across both), against ~1 s of real enumeration.
+
+EPACE-TRIM M1 (same arc): the chain-HSE verdict is a property of the PCH DMA path, not of
+one EHCI function — `CHAIN_HSE_SEEN` carries it, so later controllers are born
+overlay-direct: no probe, no re-init, no doubled resets (~2.6 s). The first controller
+still measures it (the probe IS the platform check; QEMU requires chain mode). A carried
+verdict is witnessed as `chain-HSE verdict CARRIED … (inference, not a measurement)`, and
+a wrong inheritance cannot fail silently — the enumeration error witnesses are
+unconditional.
+
+EPACE-TRIM M2 (same arc): the remaining 2000 ms on the first controller is one budget burn
+across three bounded waits (PSS enable, completion, PSS disable) — undecomposable from
+outside, and a constant that has not been decomposed must not be trimmed. `chain HSE
+sub-split: sched-en= done-wait= sched-dis=` prints on the failure exits only; the next
+metal boot names the wait, and the trim that follows is arithmetic.

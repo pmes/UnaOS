@@ -383,6 +383,30 @@ unsafe impl Send for Controller {}
 
 pub static EHCI_HID: Mutex<Option<Vec<Controller>>> = Mutex::new(None);
 
+/// EPACE-TRIM M1 — the chain-HSE verdict, carried across controllers.
+///
+/// The first EPACE metal split (s58, 2026-08-01) read `hseprobe=2000ms(n=1)` on BOTH
+/// controllers: 4.0 s of the 6.32 s `ehci-hid-done` block was the probe-14 transport probe
+/// burning one full `hw_wait_budget()` per controller — on silicon whose answer we already
+/// knew, because the qTD-fetch HSE is a property of the 7-series PCH DMA path, not of one
+/// EHCI function. Both functions sit on the same die; thirteen metal probes produced no case
+/// where one function chain-fetched and the other did not.
+///
+/// So: the FIRST controller still runs the probe (the probe IS the platform check — QEMU's
+/// hcd-ehci requires chain mode and never HSEs, so a hardcoded overlay default would break
+/// the only other platform this driver runs on). When it HSEs, this latch is set, and every
+/// LATER controller is born in overlay-direct mode: no probe, no wedged-controller HCRESET
+/// re-init, no doubled root-port reset. Witnessed with a "verdict carried" line so a capture
+/// always distinguishes measured-on-this-controller from inherited.
+///
+/// Instrument honesty: carrying a verdict is an inference, and the line says so. The
+/// falsifying case — a machine whose functions genuinely differ — would show as a controller
+/// that fails overlay transfers after inheriting the verdict; its enumeration witnesses
+/// (`enumeration aborted`, `EP0 … error`) are already unconditional, so the wrong inheritance
+/// cannot fail silently.
+static CHAIN_HSE_SEEN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// PCI COMMAND register: Memory Space (bit 1) + Bus Master (bit 2). Read-checked, set only if
 /// clear (Peter-approved write-surface extension): without BME the controller can never fetch a
 /// single QH, so this is a hard precondition traced honestly rather than assumed.
@@ -634,7 +658,17 @@ impl Controller {
         for i in 0..1024 {
             core::ptr::write_volatile(self.frame_list.add(i), (self.qh_phys as u32) | PTR_TYPE_QH);
         }
+        // EPACE-TRIM M2 — the sub-split of the probe's budget burn. The s58 metal split read
+        // `hseprobe=2000ms(n=1)`: exactly one full `hw_wait_budget()` consumed somewhere in
+        // this function, but WHICH of the three bounded waits burned it — the PSS enable
+        // handshake, the completion wait, or the PSS disable on an already-wedged engine — is
+        // not decomposable from the outside. Per the ledger's own law, a constant that has
+        // not been decomposed must not be trimmed: these three timers aim the trim. Printed
+        // only on the failure exits (HSE / timeout), so QEMU's healthy chain path stays quiet.
+        let en_t0 = crate::arch::now_cycles();
         let _ = self.set_periodic_schedule(true);
+        let en_cy = crate::arch::now_cycles().wrapping_sub(en_t0);
+        let wait_t0 = crate::arch::now_cycles();
         let done = wait_bounded(|| {
             let st = core::ptr::read_volatile(&(*status).token);
             if st & QTD_ACTIVE == 0 {
@@ -644,22 +678,39 @@ impl Controller {
             hse || (core::ptr::read_volatile(&(*setup).token) & QTD_HALTED != 0)
                 || (w_length > 0 && core::ptr::read_volatile(&(*data).token) & QTD_HALTED != 0)
         });
+        let wait_cy = crate::arch::now_cycles().wrapping_sub(wait_t0);
         for i in 0..1024 {
             core::ptr::write_volatile(self.frame_list.add(i), old_head);
         }
+        let dis_t0 = crate::arch::now_cycles();
         if !self.periodic_on {
             let _ = self.set_periodic_schedule(false);
         }
+        let dis_cy = crate::arch::now_cycles().wrapping_sub(dis_t0);
         (*qh).horiz = PTR_TERMINATE;
         core::ptr::write_volatile(&mut (*qh).overlay[0], PTR_TERMINATE);
 
         let sts = mmio_read32(self.op + OP_USBSTS).unwrap_or(0);
         if sts & STS_HSE != 0 {
+            let (ev, eu) = epace_fmt(en_cy);
+            let (wv, wu) = epace_fmt(wait_cy);
+            let (dv, du) = epace_fmt(dis_cy);
+            serial_println!(
+                ":: EHCI-HID: [{}] chain HSE sub-split: sched-en={}{} done-wait={}{} sched-dis={}{} == witness ::",
+                self.idx, ev, eu, wv, wu, dv, du
+            );
             // Leave the HSE LATCHED: the caller's quiesce path keys its full HCRESET off it
             // (probe-14b: acking here left the controller wedged and the re-reset PR stuck).
             return Err("hse");
         }
         if !done {
+            let (ev, eu) = epace_fmt(en_cy);
+            let (wv, wu) = epace_fmt(wait_cy);
+            let (dv, du) = epace_fmt(dis_cy);
+            serial_println!(
+                ":: EHCI-HID: [{}] chain timeout sub-split: sched-en={}{} done-wait={}{} sched-dis={}{} == witness ::",
+                self.idx, ev, eu, wv, wu, dv, du
+            );
             serial_println!(
                 ":: EHCI-HID: [{}] STOP-NOTE EP0 chain timeout addr={} req={:#04x}/{:#04x} setup-token={:#010x} — not forced ::",
                 self.idx, t.addr, bm_req, b_req,
@@ -2786,6 +2837,16 @@ pub fn init() {
                         continue;
                     };
                     let wake_cy = crate::arch::now_cycles().wrapping_sub(wake_t0);
+                    // EPACE-TRIM M1: latch the birth mode BEFORE construction, so a same-
+                    // controller HSE flip can never be mistaken for an inherited verdict.
+                    let born_overlay =
+                        CHAIN_HSE_SEEN.load(core::sync::atomic::Ordering::Relaxed);
+                    if born_overlay {
+                        serial_println!(
+                            ":: EHCI-HID: [{}] chain-HSE verdict CARRIED from an earlier controller — OVERLAY-DIRECT from birth (probe + re-init skipped; inference, not a measurement on this function) ::",
+                            idx
+                        );
+                    }
                     if h.addr64 != 0 {
                         serial_println!(
                             ":: EHCI-HID: [{}] note: controller advertises 64-bit addressing; CTRLDSSEGMENT pinned to 0 (all DMA < 4 GiB) ::",
@@ -2850,7 +2911,9 @@ pub fn init() {
                         frame_list_phys: fl_phys,
                         int_next: 0,
                         periodic_on: false,
-                        overlay_mode: false,
+                        // EPACE-TRIM M1: born overlay-direct when an earlier controller
+                        // already proved the chain-HSE on this die (see CHAIN_HSE_SEEN).
+                        overlay_mode: born_overlay,
                         next_addr: 1,
                         int_eps: Vec::new(),
                         pace: {
@@ -2997,6 +3060,10 @@ pub fn init() {
                             // to addr 0. An HSE means this silicon aborts the qTD-fetch burst
                             // write — flip to OVERLAY-DIRECT and FULLY re-init (an HSE'd
                             // controller is wedged; HCRESET, bases, RS, CF, port — all redone).
+                            // EPACE-TRIM M1: a controller born overlay-direct (verdict carried
+                            // from an earlier function on this die — witnessed at construction)
+                            // skips the probe AND the wedged-controller re-init; the s58 split
+                            // priced that pair at ~2.6 s.
                             if !c.overlay_mode {
                                 let probe_t = Target {
                                     addr: 0, mps0: 64, eps: QH_EPS_HIGH, hub_addr: 0, hub_port: 0,
@@ -3006,6 +3073,8 @@ pub fn init() {
                                 c.pace.add(EP_HSEPROBE, hseprobe_t0);
                                 if let Err("hse") = probe_res {
                                     c.overlay_mode = true;
+                                    CHAIN_HSE_SEEN
+                                        .store(true, core::sync::atomic::Ordering::Relaxed);
                                     serial_println!(
                                         ":: EHCI-HID: [{}] qTD-fetch HSE — OVERLAY-DIRECT mode + full HCRESET re-init (probe-14 silicon finding) ::",
                                         idx
