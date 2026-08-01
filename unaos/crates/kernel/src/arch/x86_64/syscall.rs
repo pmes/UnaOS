@@ -5873,11 +5873,14 @@ pub fn u2_probe_once() {
     // (spawn_user needs a core running the scheduler loop). An AP is chosen deliberately even though
     // SCHED-X86 makes core 0 dispatch too: this path uses the COOPERATIVE `spawn_user` (IF=0), and a
     // cooperative ring-3 task on core 0 would mask the sole advancer of the global ms-clock.
+    //
+    // WITCORE: `.first()` was that AP until SCHED-X86 pinned `x86_render_service` to exactly
+    // `online_aps().first()` — after which this cooperative IF=0 task aimed at the RENDER core by
+    // coincidence. `smp::worker_cpu` is the one place that rule now lives.
     if crate::drivers::block::info().is_none() {
         return;
     }
-    let online = crate::arch::smp::online_aps();
-    let Some(&cpu) = online.first() else {
+    let Some(cpu) = crate::arch::smp::worker_cpu(0) else {
         DONE.store(true, Ordering::Relaxed);
         serial_println!(":: U2: no application processor online — loader skipped ::");
         return;
@@ -5952,7 +5955,7 @@ pub fn u2_probe_once() {
     crate::arch::sched::spawn_user("u2-hello", USER_BASE, sp, cpu);
     // Async verdict on a sibling core if available (else the same AP, FIFO after u2-hello): reports
     // the loaded program's clean exit without blocking the interactive main loop.
-    let vcpu = online.get(1).copied().unwrap_or(cpu);
+    let vcpu = crate::arch::smp::worker_cpu(1).unwrap_or(cpu);
     crate::arch::sched::spawn("u2-verdict", u2_verdict, 0, vcpu, crate::arch::sched::PRIO_NORMAL);
 }
 
@@ -10424,8 +10427,8 @@ pub fn u4x_probe_once() {
     if crate::drivers::block::info().is_none() {
         return; // retry next loop iteration until storage enumerates
     }
-    let online = crate::arch::smp::online_aps();
-    let Some(&cpu) = online.first() else {
+    // WITCORE: `smp::worker_cpu` — never the render core (see `u2_probe_once`).
+    let Some(cpu) = crate::arch::smp::worker_cpu(0) else {
         DONE.store(true, Ordering::Relaxed);
         serial_println!(":: U4x: no application processor online — process-model demo skipped ::");
         return;
@@ -10443,7 +10446,7 @@ pub fn u4x_probe_once() {
 
     // The launcher runs on a sibling core (or the demo core if only one AP), spawning the parent +
     // orphan on `cpu` — the `u2_probe_once` split.
-    let vcpu = online.get(1).copied().unwrap_or(cpu);
+    let vcpu = crate::arch::smp::worker_cpu(1).unwrap_or(cpu);
     crate::arch::sched::spawn("u4x-launch", u4x_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
 }
 
@@ -10741,15 +10744,15 @@ pub fn u5x_probe_once() {
     // targets the serial console, never disk). It runs REGARDLESS of storage so the capability chain is VISIBLE
     // on the no-storage / metal path (replayed over the FTDI console), not only when a block device enumerates.
     // The storage-GATED arcs (U2/U4x/U6x/U6bx/U9x/U11x) keep their gates. (Scoped relaxation — U5x/U7x/U8x only.)
-    let online = crate::arch::smp::online_aps();
-    let Some(&cpu) = online.first() else {
+    // WITCORE: `smp::worker_cpu` — never the render core (see `u2_probe_once`).
+    let Some(cpu) = crate::arch::smp::worker_cpu(0) else {
         DONE.store(true, Ordering::Relaxed);
         serial_println!(":: U5x: no application processor online — capability demo skipped ::");
         return;
     };
     DONE.store(true, Ordering::Relaxed); // one-shot from here regardless of outcome
 
-    let vcpu = online.get(1).copied().unwrap_or(cpu);
+    let vcpu = crate::arch::smp::worker_cpu(1).unwrap_or(cpu);
     crate::arch::sched::spawn("u5x-launch", u5x_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
 }
 
@@ -10767,8 +10770,8 @@ pub fn u6x_probe_once() {
     if crate::drivers::block::info().is_none() {
         return; // retry next loop iteration until storage enumerates (mirrors u4x/u5x_probe_once)
     }
-    let online = crate::arch::smp::online_aps();
-    let Some(&cpu) = online.first() else {
+    // WITCORE: `smp::worker_cpu` — never the render core (see `u2_probe_once`).
+    let Some(cpu) = crate::arch::smp::worker_cpu(0) else {
         DONE.store(true, Ordering::Relaxed);
         serial_println!(":: U6x: no application processor online — object-table demo skipped ::");
         return;
@@ -10782,7 +10785,7 @@ pub fn u6x_probe_once() {
         return;
     }
 
-    let vcpu = online.get(1).copied().unwrap_or(cpu);
+    let vcpu = crate::arch::smp::worker_cpu(1).unwrap_or(cpu);
     crate::arch::sched::spawn("u6x-launch", u6x_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
 }
 
@@ -10966,8 +10969,8 @@ pub fn u6bx_probe_once() {
     if crate::drivers::block::info().is_none() {
         return; // retry next loop iteration until storage enumerates (mirrors u4x/u5x/u6x_probe_once)
     }
-    let online = crate::arch::smp::online_aps();
-    let Some(&cpu) = online.first() else {
+    // WITCORE: `smp::worker_cpu` — never the render core (see `u2_probe_once`).
+    let Some(cpu) = crate::arch::smp::worker_cpu(0) else {
         DONE.store(true, Ordering::Relaxed);
         serial_println!(":: U6bx: no application processor online — File-handle demo skipped ::");
         return;
@@ -10979,7 +10982,7 @@ pub fn u6bx_probe_once() {
         return;
     }
 
-    let vcpu = online.get(1).copied().unwrap_or(cpu);
+    let vcpu = crate::arch::smp::worker_cpu(1).unwrap_or(cpu);
     crate::arch::sched::spawn("u6bx-launch", u6bx_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
 }
 
@@ -11091,8 +11094,10 @@ fn u7x_run(demo_cpu: usize) {
     // The parent's dedicated core: a third AP, distinct from the child's (`demo_cpu`) and this
     // launcher's. Cooperative ring 3 hogs its core while polling, so sharing either would deadlock the
     // sequencing (the launcher could never run to release a GO word).
-    let online = crate::arch::smp::online_aps();
-    let Some(&parent_cpu) = online.get(2) else {
+    // WITCORE: the THIRD non-render core. `worker_cpu` indexes strictly — `None` when the pool is
+    // short — because these three cores must be genuinely distinct; a fallback to a shared core
+    // would deadlock the GO/SIG sequencing, which is worse than the clean skip below.
+    let Some(parent_cpu) = crate::arch::smp::worker_cpu(2) else {
         serial_println!(":: U7x: fewer than 3 application processors — transfer demo skipped ::");
         return;
     };
@@ -13667,8 +13672,8 @@ fn sock4_launcher(demo_cpu: usize) {
     }
     // The grantor's dedicated core: a third AP, distinct from the grantee's (`demo_cpu`) and this launcher's
     // (cooperative ring 3 hogs its core while polling, so sharing either would deadlock the sequencing).
-    let online = crate::arch::smp::online_aps();
-    let Some(&grantor_cpu) = online.get(2) else {
+    // WITCORE: the THIRD non-render core (see `u7x_run`) — strict, so a short pool skips cleanly.
+    let Some(grantor_cpu) = crate::arch::smp::worker_cpu(2) else {
         serial_println!(":: SOCK-4: fewer than 3 application processors — transferable-socket demo skipped ::");
         return;
     };
@@ -16577,8 +16582,9 @@ fn u6gx_launcher(_demo_cpu: usize) {
     };
     // A dedicated core each for A and B (distinct from `demo_cpu` and this launcher): a polling ring-3 fixture
     // hogs its core, so co-locating would deadlock the GO/SIG sequencing (the u7x structural divergence).
-    let online = crate::arch::smp::online_aps();
-    let (Some(&cpu_a), Some(&cpu_b)) = (online.first(), online.get(2)) else {
+    // WITCORE: both from the non-render pool (see `u7x_run`) — strict, so a short pool skips cleanly.
+    let (Some(cpu_a), Some(cpu_b)) = (crate::arch::smp::worker_cpu(0), crate::arch::smp::worker_cpu(2))
+    else {
         serial_println!(":: U6gx: fewer than 3 application processors — owner/grants demo skipped ::");
         return;
     };
@@ -16733,14 +16739,14 @@ pub fn u7x_probe_once() {
     // U7x is an INLINE demo — both fixtures are inline blobs transferring a console cap, no disk. It runs
     // REGARDLESS of storage so the cross-process-transfer rung shows on the no-storage / metal path (it needs 3
     // online APs; fewer skips cleanly in u7x_run). (Scoped relaxation — U5x/U7x/U8x only.)
-    let online = crate::arch::smp::online_aps();
-    let Some(&cpu) = online.first() else {
+    // WITCORE: `smp::worker_cpu` — never the render core (see `u2_probe_once`).
+    let Some(cpu) = crate::arch::smp::worker_cpu(0) else {
         DONE.store(true, Ordering::Relaxed);
         serial_println!(":: U7x: no application processor online — transfer demo skipped ::");
         return;
     };
     DONE.store(true, Ordering::Relaxed); // one-shot from here regardless of outcome
 
-    let vcpu = online.get(1).copied().unwrap_or(cpu);
+    let vcpu = crate::arch::smp::worker_cpu(1).unwrap_or(cpu);
     crate::arch::sched::spawn("u7x-launch", u7x_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
 }

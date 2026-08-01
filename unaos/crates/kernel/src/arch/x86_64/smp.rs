@@ -15,7 +15,7 @@
 // each AP loads its own per-CPU GDT/TSS (gdt::init_cpu), the shared IDT, and its own local APIC,
 // then idles — the BSP keeps driving xHCI/console/storage.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -50,6 +50,197 @@ static ONLINE_APS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Snapshot of the online application-processor logical indices (excludes the BSP).
 pub fn online_aps() -> Vec<usize> {
     ONLINE_APS.lock().clone()
+}
+
+// ── WITCORE: SCHED-X86 core placement ───────────────────────────────────────────────────────────
+//
+// Until this arc, "which core does this work go on?" was answered independently at a dozen call
+// sites, and every one of them answered `online_aps().first()` / `.get(1)` / `.get(2)`. That was
+// correct while the APs were an undifferentiated pool. SCHED-X86 (`a571254f`) ended that: it pinned
+// `x86_render_service` to `online_aps().first()` and `x86_usb_pump` + `x86_input_service` to
+// `online_aps().last()`. Every unrelated site that still said `.first()` therefore started aiming at
+// the RENDER core by coincidence, including:
+//
+//   * the ring-3 fixture ladder (`u2/u4x/u5x/u6x/u6bx/u7x/u6gx_probe_once`), which places
+//     COOPERATIVE (IF=0) ring-3 tasks — a task that owns its core until it makes a syscall. On the
+//     render core that is a stalled panel at best;
+//   * `irqstorage::start_service_once`, which places the PREEMPTIBLE `storage-svc` task — and
+//     `service_one` -> `block::read_block` takes the raw `XHCI_CONTROLLER` spin lock, which the
+//     render/shell task also takes (FAT reads, `pal::pump_and_poll`, `usbinfo`). Two preemptible
+//     takers of a raw spinlock on ONE core is the hard deadlock SCHED-X86's own rule 1 forbids.
+//
+// So placement is stated HERE, once, and asked for by name. Two rules, two functions:
+//
+//   `worker_cpu(n)`      — work that must not share the render core (cooperative ring 3, launchers).
+//   `xhci_worker_cpu(n)` — additionally must not share the SERVICE core, because it is a preemptible
+//                          taker of `XHCI_CONTROLLER` and so is `x86_usb_pump`. Returns `None`
+//                          rather than degrade: co-locating is a deadlock, and declining is the
+//                          honest fallback (the same choice the handoff itself makes).
+//
+// BEFORE the handoff publishes a split — and on every build that never takes it (`rast`, `usbdebug`,
+// a single-AP box, the pre-GUI `witness` fixture block) — both helpers degrade to indexing
+// `online_aps()` directly, i.e. byte-identical behaviour to the pre-WITCORE call sites.
+
+/// Sentinel: no SCHED-X86 split has been published yet.
+const NO_CPU: usize = usize::MAX;
+
+/// The core `x86_render_service` is pinned to, published by the SCHED-X86 handoff.
+static RENDER_CPU: AtomicUsize = AtomicUsize::new(NO_CPU);
+/// The core `x86_usb_pump` + `x86_input_service` are pinned to, published by the SCHED-X86 handoff.
+static SERVICE_CPU: AtomicUsize = AtomicUsize::new(NO_CPU);
+
+/// The render service's core, once the SCHED-X86 handoff has published it.
+pub fn render_cpu() -> Option<usize> {
+    let v = RENDER_CPU.load(Ordering::Acquire);
+    (v != NO_CPU).then_some(v)
+}
+
+/// The device-service core (`x86_usb_pump` / `x86_input_service`), once published.
+pub fn service_cpu() -> Option<usize> {
+    let v = SERVICE_CPU.load(Ordering::Acquire);
+    (v != NO_CPU).then_some(v)
+}
+
+/// How much room the worker pool actually had — reported in the placement witness so the log says
+/// which rule was satisfiable rather than leaving it to be inferred.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PlaceTier {
+    /// No split published: the helpers index `online_aps()` directly (pre-handoff / inline-GUI builds).
+    Unpublished,
+    /// Cores exist that are neither the render core nor the service core. The only tier in which
+    /// `xhci_worker_cpu` will hand anything out.
+    Exclusive,
+    /// Only the service core is left after excluding render. Workers share with the pump; xHCI
+    /// takers are declined.
+    SvcShared,
+    /// Nothing to exclude (single AP). Unreachable post-publish — the split needs 2 distinct cores.
+    RenderShared,
+}
+
+impl PlaceTier {
+    pub fn name(self) -> &'static str {
+        match self {
+            PlaceTier::Unpublished => "unpublished",
+            PlaceTier::Exclusive => "exclusive",
+            PlaceTier::SvcShared => "svc-shared",
+            PlaceTier::RenderShared => "render-shared",
+        }
+    }
+}
+
+/// The eligible cores for non-render work, in placement order, plus the tier that produced them.
+fn worker_pool() -> (Vec<usize>, PlaceTier) {
+    let online = online_aps();
+    let (Some(r), Some(s)) = (render_cpu(), service_cpu()) else {
+        return (online, PlaceTier::Unpublished);
+    };
+    let excl: Vec<usize> = online.iter().copied().filter(|&c| c != r && c != s).collect();
+    if !excl.is_empty() {
+        return (excl, PlaceTier::Exclusive);
+    }
+    let no_render: Vec<usize> = online.iter().copied().filter(|&c| c != r).collect();
+    if !no_render.is_empty() {
+        return (no_render, PlaceTier::SvcShared);
+    }
+    (online, PlaceTier::RenderShared)
+}
+
+/// The `n`th core (0-based) for work that MUST NOT share a core with `x86_render_service`.
+///
+/// STRICT indexing: `None` when the pool is shorter than `n + 1`. Callers that need k mutually
+/// distinct cores (the cooperative ring-3 choreographies — U7x, SOCK-4, U6gx — where a polling
+/// fixture hogs its core) depend on that: a silent fallback to a shared core would deadlock the
+/// GO/SIG sequencing, which is strictly worse than the clean skip they already print.
+pub fn worker_cpu(nth: usize) -> Option<usize> {
+    worker_pool().0.get(nth).copied()
+}
+
+/// The `n`th core for a PREEMPTIBLE task that takes `XHCI_CONTROLLER` (a raw `spin::Mutex`).
+///
+/// Excludes BOTH the render core and the service core: `x86_usb_pump` holds that lock on the service
+/// core and the render/shell task holds it on the render core, and two preemptible takers of a raw
+/// spinlock on one core deadlock it (preempt the holder; the spinner cannot yield). `None` when no
+/// such core exists — the caller must DECLINE, never co-locate.
+pub fn xhci_worker_cpu(nth: usize) -> Option<usize> {
+    let (pool, tier) = worker_pool();
+    match tier {
+        PlaceTier::Exclusive | PlaceTier::Unpublished => pool.get(nth).copied(),
+        PlaceTier::SvcShared | PlaceTier::RenderShared => None,
+    }
+}
+
+/// Formats an optional core index as `c3` / `-` for the placement witness.
+struct CpuOpt(Option<usize>);
+
+impl core::fmt::Display for CpuOpt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(c) => write!(f, "c{}", c),
+            None => write!(f, "-"),
+        }
+    }
+}
+
+/// Publish the SCHED-X86 split and emit the placement witness.
+///
+/// Called ONCE by the handoff in `kernel_main`, BEFORE the three service tasks are spawned, so every
+/// later `worker_cpu` / `xhci_worker_cpu` question is answered against the real map.
+///
+/// The witness is the point. A placement invariant with no boot line is not verifiable on metal, and
+/// metal is the only verdict for this arc. The line prints the map AND the two verdicts, so the
+/// falsifying case is readable directly rather than reconstructed by cross-referencing each task's
+/// own dispatch line:
+///
+///   `render-clear` — no core this module will hand out equals the render core. Holds BY
+///                    CONSTRUCTION; it is printed so that a future edit that breaks the construction
+///                    is caught by reading one line instead of by a hung panel.
+///   `xhci-clear`   — the xHCI-taking pool is disjoint from BOTH render and service. `DECLINED` is a
+///                    legitimate (not failing) outcome on a 2-AP box: the storage service does not
+///                    start, rather than starting into a deadlock.
+///
+/// Reading the line: `worker[0..2]` are the cores the ring-3 fixture ladder will take (U2/U4x/U5x/
+/// U6x/U6bx/U7x/U6gx and their launchers/verdict tasks); `xhci[0]` is `irqstorage`'s `storage-svc`
+/// and `xhci[1]` is its `bx-blockreq` self-test. Cross-check against each task's own dispatch line
+/// (`:: SCHED-X86: render task dispatched on core N ::`, `:: STOR-1: storage service task live on
+/// cpu N ::`, `:: U1a: ring-3 demo — user task on core N ::`) — the map predicts them, so a
+/// disagreement falsifies this module rather than being absorbed by it.
+pub fn publish_sched_split(render: usize, service: usize) {
+    RENDER_CPU.store(render, Ordering::Release);
+    SERVICE_CPU.store(service, Ordering::Release);
+
+    let (pool, tier) = worker_pool();
+    let w = [
+        CpuOpt(pool.first().copied()),
+        CpuOpt(pool.get(1).copied()),
+        CpuOpt(pool.get(2).copied()),
+    ];
+    let x = [CpuOpt(xhci_worker_cpu(0)), CpuOpt(xhci_worker_cpu(1))];
+
+    // render-clear: recomputed from the pool rather than asserted from the tier, so the check is
+    // independent of the classification that produced it.
+    let render_clear = render != service && !pool.iter().any(|&c| c == render);
+    let xhci_clear = match (xhci_worker_cpu(0), xhci_worker_cpu(1)) {
+        (None, _) => "DECLINED",
+        (Some(a), b) if a != render && a != service && b != Some(render) && b != Some(service) => {
+            "PASS"
+        }
+        _ => "FAIL",
+    };
+
+    serial_println!(
+        ":: SCHED-X86 PLACE: aps={} render=c{} svc=c{} worker=[{},{},{}] xhci=[{},{}] tier={} render-clear={} xhci-clear={} ::",
+        online_aps().len(),
+        render,
+        service,
+        w[0],
+        w[1],
+        w[2],
+        x[0],
+        x[1],
+        tier.name(),
+        if render_clear { "PASS" } else { "FAIL" },
+        xhci_clear,
+    );
 }
 
 // The real-mode -> long-mode trampoline. AT&T syntax; see the module comment for the design.

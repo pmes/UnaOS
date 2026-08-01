@@ -753,7 +753,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(feature = "witness")]
         {
             let online = unaos_kernel::arch::smp::online_aps();
-            if let Some(&cpu) = online.first() {
+            // WITCORE: ask the placement module, not `.first()`. This block runs BEFORE the SCHED-X86
+            // handoff publishes a split, so `worker_cpu(0)` resolves to `online_aps()[0]` — identical
+            // to the old `.first()` — but the rule is now stated in exactly one place, and a later
+            // reordering that moved this block after the handoff would stop aiming at the render core
+            // instead of silently landing on it.
+            if let Some(cpu) = unaos_kernel::arch::smp::worker_cpu(0) {
                 unaos_kernel::arch::sched::enable();
                 let demo = unaos_kernel::arch::syscall::setup();
                 serial_println!(":: U1a: ring-3 demo — user task on core {} ::", cpu);
@@ -1176,6 +1181,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             _ => None,
         };
         if let Some((render_cpu, svc_cpu)) = split {
+            // WITCORE: publish the split BEFORE anything is spawned, and emit the placement witness.
+            // Every other site that needs a core (`smp::worker_cpu` for the cooperative ring-3 fixture
+            // ladder, `smp::xhci_worker_cpu` for preemptible `XHCI_CONTROLLER` takers) asks that module
+            // rather than re-deriving `online_aps().first()` — which, since SCHED-X86, silently named
+            // the RENDER core. This call is what makes those answers correct: it must precede the
+            // spawns, and it precedes `fbcon::detach()` so the `:: SCHED-X86 PLACE: ... ::` line also
+            // lands on the panel of the serial-less metal boot.
+            unaos_kernel::arch::smp::publish_sched_split(render_cpu, svc_cpu);
+
             // Reserve the channel's waiter capacity on the BSP, before any task can block on it —
             // otherwise the first park would grow a `VecDeque` (and take the heap lock) inside the
             // path that is proven not to allocate. Must precede the spawns.
@@ -3668,6 +3682,15 @@ fn usb_pump(_: usize) {
 //     core is a hard deadlock: preempt the holder and the spinner — which cannot yield — owns the
 //     core forever. Cross-core it is bounded spin, which progresses. No future task that touches xHCI
 //     may be added to the render core.
+//
+//     WITCORE: "asserted at the spawn site" held for these three tasks and NOWHERE ELSE, which is how
+//     the rule was already being broken by tasks spawned later: `irqstorage`'s `storage-svc` (a
+//     preemptible `XHCI_CONTROLLER` taker) placed itself on `online_aps().first()` — i.e. the render
+//     core — and the whole cooperative ring-3 fixture ladder did the same. The rule now lives in
+//     `arch::smp` (`worker_cpu` / `xhci_worker_cpu`), the split is published to it by
+//     `smp::publish_sched_split` below, and the resulting map is printed once as
+//     `:: SCHED-X86 PLACE: ... ::`. Ask that module for a core; do not re-derive one from
+//     `online_aps()`.
 //  2. `x86_input_service` PAINTS NOTHING. On x86 `pal::cursor::SPRITE_OWNS_PAINT` is true, so the
 //     cursor verbs drive the compositor sprite straight into the FRONT buffer; running them on the
 //     input core would put two cores on the panel. The routers (`wc_click_route`, `el0_input_route`)
