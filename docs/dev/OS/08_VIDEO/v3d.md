@@ -3213,6 +3213,20 @@ QEMU raspi4b models no V3D: both legs sit behind the hub-identity gate and `UNAO
 `kernel8-test` green means **no regression and nothing more** — every verdict here is
 metal-attended, read at the next bench boot with `UNAOS_V3D_DEEP=1`.
 
+> **NOTE (2026-08-01, V3D-82).** The `[v3d54]` trace itself now applies this section's lesson
+> instead of merely being corrected by it. Its CT0CA line prints the **raw** first/last words
+> alongside the offsets (`CT0CA raw 0x…->0x… off 0x…->0x…`), and its interpretation arm checks the
+> raw word against the raw `[BA, EA]` span before naming a stall: a raw CA **outside** the span is
+> classified `(stale)` — a stale pre-kick address, the CLE never demonstrably entered this list,
+> with `[v3d73]` named as the deciding instrument — while only a raw CA genuinely inside the span
+> keeps the `(mid)` "advanced then stalled mid-list" reading. No future reader has to undo the
+> wrapping arithmetic by hand, and the P83-class artifact ("stalled at offset 0x2d000" on a
+> 106-byte list) can no longer print as a verdict. In the same change, the shared `v3d75_kick_probe`
+> — the kick every deep leg after V3D-74 rides (`[v3d75a]`/`[v3d75b]`, `[v3d77a]`/`[v3d77b]`,
+> `[v3d81q]`) — now **emits** the `[v3d73]` witness it was already arming (wait → emit →
+> read-span, the `[v3d74a]` idiom), so the sampler rides every CT0-kicking deep leg and the fetch
+> verdict on those legs is measured, not extrapolated from the three originally-armed rungs.
+
 ## 45. Thread 0 or bin class? — the thread-swap discriminator (V3D-74)
 
 The P84 wire established, and this arc does not re-litigate: `[v3d73s]` = the byte-exact mainline

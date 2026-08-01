@@ -2101,6 +2101,14 @@ fn emit_v3d54_trace(
     let ca_last_off = ca_off(ca.last);
     let reached_ea = ca.last == ea;
     let never_left_ba = ca.changes == 0 && ca.last == ba;
+    // PI-V3D-82: compare the RAW CT0CA word against the RAW [BA, EA] span before interpreting any
+    // offset. `wrapping_sub` turns EVERY stale 32-bit word into a plausible-looking offset, and the
+    // old fallthrough arm read any not-BA-not-EA word as a mid-list stall — [v3d73] (v3d.md §44)
+    // caught exactly that: raw CT0CA=0x0034b000, frozen since the previous kick, printed as
+    // "stalled mid-list at offset 0x2d000" against a 106-byte list. An out-of-span raw CA is not a
+    // position in this list at all; it is a stale pre-kick address, and the instrument's-silence
+    // rule applies: the CLE never demonstrably entered this list.
+    let ca_in_span = ca.last >= ba && ca.last <= ea;
     let bpca_adv = bpca.last.wrapping_sub(bpca.first);
     let interp: &str = if never_left_ba {
         "CT0CA NEVER left BA across the whole wait — the CLE never fetched the list; the GO was a no-op or the list is mis-submitted (the [v3d54] submit audit decides BA/EA/length)"
@@ -2110,14 +2118,17 @@ fn emit_v3d54_trace(
         } else {
             "CT0CA walked BA->EA (whole list consumed) but BPCA never advanced — the CLE stepped every packet yet the PTB wrote no primitive-list bytes; the wall is the PTB write / frame-close, not the CLE walk"
         }
-    } else {
+    } else if ca_in_span {
         "CT0CA advanced off BA then STALLED mid-list at the offset above — the CLE choked on the packet at that byte offset (fetches-but-stalls)"
+    } else {
+        "CT0CA holds a RAW word OUTSIDE the submitted [BA,EA] span (raw last above) — a STALE pre-kick address, not a mid-list position: the printed offset is wrapping arithmetic over a word that never pointed into this list, and the CLE never demonstrably entered it. The [v3d73] sampler on this leg is the deciding instrument (v3d.md §44)"
     };
     serial_println!(
-        ":: V3D: [v3d54] trace ({}) samples={} span={}us BA={:#010x} EA={:#010x}(len={}) | CT0CA off {:#x}->{:#x}{} moves={} first_move={}us stall@{}us | CT0CS first={:#010x} last={:#010x}(CTRUN {}->{}) changes={} | CT0LC {:#x}->{:#x} | CT0PC {:#x}->{:#x} | BPCA {:#010x}->{:#010x} adv={:#x} moves={} — {} ::",
+        ":: V3D: [v3d54] trace ({}) samples={} span={}us BA={:#010x} EA={:#010x}(len={}) | CT0CA raw {:#010x}->{:#010x} off {:#x}->{:#x}{} moves={} first_move={}us stall@{}us | CT0CS first={:#010x} last={:#010x}(CTRUN {}->{}) changes={} | CT0LC {:#x}->{:#x} | CT0PC {:#x}->{:#x} | BPCA {:#010x}->{:#010x} adv={:#x} moves={} — {} ::",
         what, samples, span_us, ba, ea, ea.wrapping_sub(ba),
+        ca.first, ca.last,
         ca_first_off, ca_last_off,
-        if reached_ea { "(=EA)" } else if never_left_ba { "(=BA)" } else { "(mid)" },
+        if reached_ea { "(=EA)" } else if never_left_ba { "(=BA)" } else if ca_in_span { "(mid)" } else { "(stale)" },
         ca.changes, ca.first_move_us, ca.last_change_us,
         cs.first, cs.last,
         (cs.first & V3D_CLE_CTNCS_CTRUN != 0) as u32,
@@ -10255,6 +10266,12 @@ fn v3d75_kick_probe(label: &str) -> bool {
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, ea as u32); // GO — queue auto-start
     dsb();
     let (sts, us, fldone) = wait_fldone(label, ba as u32, ea as u32);
+    // PI-V3D-82: emit (and thereby disarm) the [v3d73] witness on EVERY leg riding this probe —
+    // the v3d74a idiom exactly (wait -> emit -> read_span). Before this, the probe armed the
+    // sampler and folded its span facts into the kick line below, but the [v3d73] verdict line
+    // itself never printed and the sampler was left armed; the v3d75a/b, v3d77a/b and v3d81q
+    // legs were extrapolating the fetch verdict instead of measuring it.
+    v3d73_sampler_emit(label); // [v3d73] — the fetch verdict on this leg's own kick
     let (smp_n, smp_in_span, smp_max) = v3d73_sampler_read_span();
     let cs_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
     let ca_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
