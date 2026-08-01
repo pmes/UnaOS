@@ -42,6 +42,10 @@ pub struct EventRing {
     pub trbs: [Trb; EVENT_RING_SIZE],
     pub dequeue_index: usize,
     pub cycle_bit: bool, // What we expect the hardware to write
+    /// PIUSB-43: total TRBs ever consumed from this ring (monotonic, wrap-proof — `dequeue_index`
+    /// alone is mod-256 and cannot distinguish "no events" from "exactly 256k events"). Read-only
+    /// telemetry for the enum-portsc witness; costs one integer increment per pop.
+    pub popped: u64,
 }
 
 unsafe impl Send for EventRing {}
@@ -53,6 +57,7 @@ impl EventRing {
             trbs: [Trb::new(); EVENT_RING_SIZE],
             dequeue_index: 0,
             cycle_bit: true, // xHCI starts writing 1s
+            popped: 0,
         }
     }
 
@@ -97,6 +102,7 @@ impl EventRing {
         let trb = unsafe { core::ptr::read_volatile(&self.trbs[self.dequeue_index]) };
 
         // Advance
+        self.popped = self.popped.wrapping_add(1); // PIUSB-43 consumed-count witness
         self.dequeue_index += 1;
         if self.dequeue_index >= EVENT_RING_SIZE {
             self.dequeue_index = 0;
@@ -147,5 +153,6 @@ impl EventRing {
         }
         self.dequeue_index = 0;
         self.cycle_bit = true;
+        self.popped = 0;
     }
 }

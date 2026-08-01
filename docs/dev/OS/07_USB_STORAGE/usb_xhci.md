@@ -774,6 +774,50 @@ it directly: the bracket stays, so `entry-link-discriminator took=` collapsing t
 
 ---
 
+### 5i. PIUSB-43 — the enum-portsc witness (PA6: which connect branch died)
+
+**The gap.** PA5c metal (boot via GR12) ran the FULL 30 s `enum-pump` budget with **zero**
+port-connect events — clean through "M3: 5 root port(s) powered (PORTSC.PP set)" and
+"enumerate: xHCI self-coherent", then thousands of idle `[piusb26]` pump passes and no slot, no HID,
+no BOT. The wire could not distinguish four different deaths: no device electrically present (CCS
+never set) · CCS set but no Port Status Change Event generated · events written but never consumed
+off our ring · PP/link state regressed after the M3 line.
+
+**The instrument.** A read-only sampler inside the enum pump: at pump START, every ~2 s of pump
+time (capped at 13 interior samples), and once at pump END, one line carries every root port's RAW
+PORTSC word beside its decode (frozen-register discipline — no derived-only claims) plus the
+event-ring consumer state (`dequeue_index`/cycle, `popped` = total TRBs ever consumed, a
+`has_event` freshness peek, raw IMAN with IP/IE). PORTSC reads latch nothing (change bits are RW1C
+and the witness never writes), IMAN is read not acknowledged, and no pump logic, budget, or write
+is touched. Default-ON: the instrument exists for the failing path, and it can execute in the state
+it reports on (samples ride the same MMIO the pump already trusts); QEMU raspi4b never reaches the
+pump (`XHCI_READY` gate), so its log stays byte-identical. Budget: ≤16 lines per boot.
+
+**Witness grammar.**
+
+```
+:: PIUSB: [piusb43] portsc <start|pump|end> t=<ms>ms p1=0x…(CCS=_ CSC=_ PED=_ PP=_ PLS=_ spd=_) … p5=…
+    | evt deq=<idx> cyc=<b> popped=<n> pend=<0|1> IMAN=0x…(IP=_ IE=_) ::
+:: PIUSB: [piusb43] verdict=<branch> — <evidence> ::
+```
+
+**Reading key — the verdict names only what the samples show, in this priority:**
+
+| Verdict | Meaning / evidence |
+| --- | --- |
+| `EVENTS-UNCONSUMED` | ring holds a fresh TRB at exit (`pend=1`) AND `popped=0` all pump — events reached the ring, the consumer never took one |
+| `REGRESSED` | PP=0 at pump start (regression between M3 and the pump), PP 1→0 during the pump, or PLS moved with CCS never set — before/after raw words quoted |
+| `CCS-NO-EVENT` | CCS/CSC seen on some port (mask printed) yet `popped=0` and nothing pending — device seen electrically, no PSC event reached the ring; event path suspect |
+| `NO-CCS-EVER` | every port sampled CCS=0 CSC=0 at every sample, PP held, PLS stable — no device electrically visible to the VL805 |
+| `UNRESOLVED` | a state the samples cannot separate — the line names the deciding read (e.g. CCS seen *and* `popped>0`: a TRB-type census of the consumed events would decide) |
+
+Support: `EventRing.popped` (drivers/xhci/event.rs), a monotonic consumed-TRB counter incremented in
+`pop()` — `dequeue_index` alone is mod-256 and cannot distinguish "no events" from "exactly one lap".
+Ledger note: the numbers PIUSB-41/42 were already spent on the P60 default-quiet dump (5h above), so
+this instrument is PIUSB-43 with serial tag `[piusb43]`.
+
+---
+
 ## 6. Enumeration robustness (metal-informed)
 
 Root-port enumeration is a staged FSM (`debounce → await-reset → reset-settle →
