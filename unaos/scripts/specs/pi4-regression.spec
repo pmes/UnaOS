@@ -343,7 +343,9 @@ FORBID \[wc-fv\] focus-vis .*-> FAIL
 # ---    across three silicon lockups. `[wedge1] dwell` is the reading below that threshold. It is
 # ---    REQUIREd for the reason the arc exists: an instrument that can vanish without the gate
 # ---    noticing is an instrument whose next silence gets misread the same way.
-# ---    `-> QUIET` (drains ran, none of them dwelt) is the healthy gate answer, but the REQUIRE
+# ---    `-> QUIET` (drains ran, none of them spun) is the healthy gate answer — as is `-> SPUN`
+# ---    (WEDGE-1r3: a short spin was measured and stayed under `note`; PA6 metal printed exactly
+# ---    this and the old ladder banked it as QUIET). But the REQUIRE
 # ---    pins only the LINE, not the verdict: under a loaded CI host a slow QEMU blit honestly reads
 # ---    DWELL/INFLIGHT, and a gate that fails on an honest reading teaches people to ignore it
 # ---    (lens fix, s1u — the verdict pin was a flake in waiting). The gate question is "does the

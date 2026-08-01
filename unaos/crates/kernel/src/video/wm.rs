@@ -3794,6 +3794,18 @@ fn wedge1_dwell_emit(span: u64) {
         // Reachable only via the straddle case above: spin evidence with zero completed drains in
         // THIS window — the drain that produced it was counted in a neighbouring window's `drains`.
         "STRADDLE"
+    } else if spin_max > 0 {
+        // WEDGE-1r3 (PA6 metal, 2026-08-01). A window that MEASURED a spin may not be called
+        // QUIET, whose contract is "the healthy steady state". PA6 printed
+        //   drains=20 spun=1 spin_max=6890 ... -> QUIET
+        // — the first non-zero spin this track has ever recorded, banked as healthy, because the
+        // only gate above was `spin_max >= DRAIN_DWELL_NOTE`. `DRAIN_DWELL_NOTE` is 1<<16 and is
+        // NOT calibrated against any measurement: its stated justification is relative only ("four
+        // orders under DRAIN_STALL_SPINS"), so a real dwell can sit at 65535 forever and every
+        // window still reads QUIET. Lowering the constant would only move an arbitrary line; the
+        // honest fix is to stop claiming health for a window that has evidence, and let the number
+        // speak. SPUN is not a fault — it is "contention was observed and stayed under the note".
+        "SPUN"
     } else {
         "QUIET"
     };

@@ -4261,6 +4261,32 @@ unmeasured. A counter costs no print, so it can measure it.
   was counted in a neighbouring window's `drains` (it straddled the rollup boundary). Read beside
   those neighbours. A straddle whose `spin_max` clears `note` prints `DWELL` — severity wins the
   precedence. (A window with no evidence at all does not print — there is no `NONE` verdict.)
+* `SPUN` — drains completed and at least one of them spun, but `spin_max` stayed under `note`.
+  Contention was observed and was short. **Not a fault**; it is the reading that used to be lost.
+
+  **Why it exists (WEDGE-1r3, PA6 metal 2026-08-01).** The ladder's only gate above `QUIET` was
+  `spin_max >= DRAIN_DWELL_NOTE`, so any spin below the note was banked as `QUIET` — whose contract
+  is "the healthy steady state". PA6 printed `drains=20 spun=1 spin_max=6890 ... -> QUIET`, the
+  first non-zero spin this track has ever recorded, filed as healthy. Note that `DRAIN_DWELL_NOTE`
+  (`1<<16`) is **not calibrated against any measurement** — its stated justification is purely
+  relative ("four orders under `DRAIN_STALL_SPINS`"), and `DRAIN_STALL_SPINS` is itself only
+  "comfortably past a second of real time". So a genuine dwell can sit at 65535 indefinitely and
+  every window still reads `QUIET`. Lowering the constant would move an arbitrary line rather than
+  fix the lens; the fix is that a window which measured a spin no longer claims health, and the
+  raw `spin_max` is left to speak. The gate REQUIREs the line, never the verdict, so `SPUN` is
+  gate-neutral by construction.
+
+  **What `spun`/`spin_max` actually measure — do not read them as lock contention.** They count the
+  `DrainBarrier`'s wait on `BLIT_ACTIVE`, an `AtomicUsize` refcount of in-flight composites — a
+  *phase barrier*, not a lock. A non-zero `spin_max` means a teardown on one core waited for a
+  composite in flight on another. `wm::TABLE` spin time is **entirely uninstrumented**: `spin::Mutex`
+  has no counter anywhere in the tree. PA6's `spun=1` is therefore evidence of cross-core concurrency
+  inside `wm` — the population every masked-spinner interleaving requires — and evidence of nothing
+  about `TABLE` itself.
+
+  **`in_spin=0` beside `spun>0` is not a contradiction.** `in_spin` is a gauge sampled at rollup
+  time by a presenting core; a short spin completes long before the sample. It exists to catch a
+  drain that never returns, not to sample contention.
 
   **What this line's silence is worth — the honest boundary (s1u lens must-fix).** The dwell emit
   rides `wcn_emit`, whose drivers are `present()` and the fixture/pointer forced rollups, and
