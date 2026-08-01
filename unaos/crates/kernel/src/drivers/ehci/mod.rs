@@ -788,7 +788,12 @@ impl Controller {
         (*qh).horiz = (self.head_phys as u32) | PTR_TYPE_QH;
         let cmd = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
         let _ = mmio_write32(self.op + OP_USBCMD, cmd | CMD_ASE);
-        let pss_on = wait_bounded(|| {
+        // USBSTS bit 15 is Async Schedule Status (EHCI 1.0 §2.3.2) — the correct bit to
+        // handshake an ASE toggle. It was previously read into a local named `pss_*` and
+        // printed as `PSS on=/off=`, i.e. a field labelled PERIODIC reporting the ASYNC
+        // schedule, in the one path a reader only ever reaches while something is already
+        // wrong. Bit 14 is PSS; see `STS_PSS`.
+        let ass_on = wait_bounded(|| {
             mmio_read32(self.op + OP_USBSTS).unwrap_or(0) & (1 << 15) != 0
         });
         let done = wait_bounded(|| {
@@ -796,18 +801,18 @@ impl Controller {
         });
         let cmd2 = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
         let _ = mmio_write32(self.op + OP_USBCMD, cmd2 & !CMD_ASE);
-        let pss_off = wait_bounded(|| {
+        let ass_off = wait_bounded(|| {
             mmio_read32(self.op + OP_USBSTS).unwrap_or(0) & (1 << 15) == 0
         });
         let tok = core::ptr::read_volatile(&(*qh).overlay[2]);
 
         if !done {
             serial_println!(
-                ":: EHCI-HID: [{}] STOP-NOTE EP0 {} timeout addr={} req={:#04x}/{:#04x} token={:#010x} USBCMD={:#010x} USBSTS={:#010x} PSS on={} off={} — not forced ::",
+                ":: EHCI-HID: [{}] STOP-NOTE EP0 {} timeout addr={} req={:#04x}/{:#04x} token={:#010x} USBCMD={:#010x} USBSTS={:#010x} ASS on={} off={} — not forced ::",
                 self.idx, stage, addr, bm_req, b_req, tok,
                 mmio_read32(self.op + OP_USBCMD).unwrap_or(0),
                 mmio_read32(self.op + OP_USBSTS).unwrap_or(0),
-                pss_on, pss_off
+                ass_on, ass_off
             );
             return Err("timeout");
         }
