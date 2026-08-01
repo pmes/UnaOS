@@ -25,6 +25,14 @@ wc = []
 instgui = ["wc", "installdemo"]
 intel-ivb = []
 unaos_ivb = ["unaos-boot-info/unaos_ivb"]
+# GMUX-IGD: the display-mux switch to the INTEGRATED GPU (`UNAOS_GMUX_IGD=1`). `arroyo` and
+# `builder/src/main.rs` have pushed this feature since ce5c6f49 while this — the third leg both
+# assumed existed — was missing, so the armed gate died on `does not contain this feature`
+# rather than compiling anything. Declared here so the knob resolves; NOTHING on trunk is gated
+# on it yet, so armed and disarmed trunk builds are byte-identical. The behaviour (the port
+# helpers, `RevertState`, and the arm block in `igpu::init()`) arrives with the igpu lane, which
+# replaces this comment with its own.
+gmux_igd = []
 # DEFAULT-QUIET (witness): gate the battery of EL0/kernel fixtures that RE-PROVE long-metal-confirmed
 # facts on every boot (x86: nmi-self-fire + canonical-guard + U1a/U1b/U2-0a/U3/U3.5 + the
 # U2/U4x/U5x/U6x/U6bx storage chain that cascades U7x..U6gx; aarch64 baremetal: the M6b/M6e/M6d/M6f/M6g
