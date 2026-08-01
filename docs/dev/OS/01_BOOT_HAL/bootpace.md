@@ -379,15 +379,29 @@ is fixed iteration counts and a fixed volume of MMIO.
 
 ```
 :: GPACE: xtail=<v>ms(n=1) bench=<v>ms(n=0) detect=<v>ms(n=1) igpu=<v>ms(n=1) kepler=<v>ms(n=1) sdhc=<v>ms(n=1) nic=<v>ms(n=1) resid=<v>ms == witness ::
-:: GPACE: span=<v>ms anchor=enum:p1 since-entry=<v>ms hz=<v> build=kepler+takeover+fifo+ivb+smc+ == the pci-usb d= split ::
+:: GPACE: span=<v>ms anchor=enum:p1 since-entry=<v>ms hz=<v> build=kepler+takeover+fifo+ivb+wc+smc+ == the pci-usb d= split ::
+```
+
+(The `build=` string above is the observed s60 knob set, `UNAOS_WC` included.)
+
+A third line appears **only** when the tiling is broken — see "the tripwire"
+below:
+
+```
+:: GPACE: OVERLAP sum>span by <v>cy — classes are not disjoint ::
 ```
 
 * `xtail` the `start_next_port` tail — from the `enum:p1` stamp to the end of the
   xHCI block, plus publishing the controller into `XHCI_CONTROLLER` · `bench` the
-  knob-gated BENCH-RIDE probes (therm / pcilink / vrom), `n=` counting how many of
-  the three were compiled in · `detect` the class-0x03 census · `igpu` / `kepler`
-  one span per device found · `sdhc` the read-only SDHC census · `nic` the
-  class-0x02 lookup and whatever followed it.
+  knob-gated BENCH-RIDE probes, `n=` counting how many of the three ran · `detect`
+  the class-0x03 census · `igpu` / `kepler` one span per device found · `sdhc` the
+  read-only SDHC census · `nic` the class-0x02 lookup and whatever followed it.
+* `bench` is the only class with more than one call site, so the three probes are
+  named **individually** in `build=` (`therm+` / `pcilink+` / `vrom+`) rather than
+  rolled into one fragment. Without that, `bench=..ms(n=2)` said two of three ran
+  and no reading said which two — the single place the none-vs-zero rule broke.
+  (It was also double-counted: `thermprobe` pulls in `smc`, so it already appeared
+  in `build=` under a second name.)
 * Spans are wall-clock around the call sites, so each class contains everything
   its callee did — MMIO, settles **and** the serial printing of its own witness
   lines.
@@ -405,14 +419,38 @@ literal tag `enum:p1` is what makes `span == pci-usb d=` a property of the
 construction instead of a coincidence of this machine's topology; the tag that
 actually anchored is printed as `anchor=`, so a reader sees immediately when the
 topology changes. Conversion goes through `bootpace::origin_hz()`, the same rate
-the ledger divides its own `d=` by, so the two instruments cannot disagree merely
-by arithmetic. The only slack between them is these two lines' own print cost,
-which lands inside `pci-usb` and outside `span`.
+the ledger divides its own `d=` by — and `gpace_fmt` uses `Dur`'s own expression,
+`cy / (hz / 1000)`, rather than EPACE's `cy * 1000 / hz`, so the two instruments
+share a renderer and not merely a counter. (Those two expressions differ by up to
+1 ms. Anywhere else that is irrelevant; here the entire deliverable is one
+rendered number against another, so the divisor was made identical instead of the
+claim softened.)
 
-`resid = span − Σ(named classes)`, and the classes are disjoint sequential spans
-inside `span`. A class that under-measures therefore **inflates `resid`** — the
-arithmetic still closes, so the lie surfaces as unattributed time instead of as a
-tidy-looking total.
+The remaining slack is these two lines' own print cost, which lands inside
+`pci-usb` and outside `span`. **Measured: 1 ms** — `span=26ms` against
+`pci-usb d=27ms`, and `since-entry=1845ms` against `pci-usb t=1846ms`, twice
+independently.
+
+`resid = span − Σ(named classes)` **over the printed millisecond values**, and
+the classes are disjoint sequential spans inside `span`. The printed domain is
+deliberate: each class floors to ms independently, so a residual computed in
+cycles and then floored a ninth time leaves the printed row short of the printed
+`span` by up to `N_GPACE + 1 = 8` ms. Against the 4620 ms armed block that is
+noise; against the ~100 ms default-build baseline of §9a — the reading this
+document calls load-bearing — it is up to 8%, sitting in exactly the field whose
+job is to prove nothing went unattributed. A reader adds up the line, so the line
+must add up. `Σfloor(x_k) ≤ floor(Σx_k) ≤ floor(span)` makes the subtraction
+non-negative by construction. A class that under-measures therefore **inflates
+`resid`** — the arithmetic still closes, so the lie surfaces as unattributed time
+instead of as a tidy-looking total.
+
+**The tripwire.** The cycle-domain comparison survives, but as a conviction
+rather than as the printed residual. `Σ > span` in cycles is what overlapping
+spans, a wrong anchor, or a non-monotonic `now_cycles()` across cores would
+produce — and a `saturating_sub` renders all three as `resid=0ms`, which is also
+the *healthy* reading. Clamping a broken instrument into the shape of a working
+one is the defect class this whole ledger exists to avoid, so the overlap case
+gets its own line instead. One branch, never taken in a sound build.
 
 Every class prints `<value><unit>(n=<count>)`. `0ms(n=0)` means *this code was
 not compiled in or never reached*; `0ms(n=1)` means *it ran and cost nothing*.
@@ -423,6 +461,14 @@ New read-only accessors on the ledger make this possible: `cycles_of(tag)`,
 `last_stamp()` and `origin_hz()`. None records, grows the ring or perturbs
 `dropped=` — the ring sits at `n=31` of `CAP=64` under drop-NEWEST, so any growth
 would be spent on the late boot tags.
+
+**What GPACE cannot do: attribute a wedge.** Both lines print at the single exit
+of `pci::init`, so a hang anywhere inside the window kills the entire report — no
+partial split, no "it got as far as `kepler`". GPACE's *silence* is therefore not
+evidence about where the boot stopped; the callees' own witness lines are the
+only fallback for that. The limitation is inherent to a single-exit accumulator
+and is shared with EPACE (§8). BPACE's own both-sides stamping rule (§6a) exists
+precisely because ring stamps do not have this property.
 
 ### The prerequisite trap this arc removed
 

@@ -220,9 +220,18 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
 //     construction instead of a coincidence of this machine's topology; the tag that actually
 //     anchored is printed as `anchor=` so a reader can see when the topology changes.
 //   * **A short-counting class cannot hide.** The named classes are disjoint, sequential spans
-//     inside `span`, and `resid = span - Σ(classes)`. A class that under-measures therefore
-//     INFLATES `resid` — the arithmetic still closes, so the lie surfaces as unattributed time
-//     rather than as a clean-looking total.
+//     inside `span`, and `resid = span - Σ(classes)` over the PRINTED millisecond values, so the
+//     row a reader adds up closes on `span` exactly rather than to within a per-class flooring
+//     error. A class that under-measures therefore INFLATES `resid` — the arithmetic still closes,
+//     so the lie surfaces as unattributed time rather than as a clean-looking total.
+//   * **The one reading that would convict the tiling is not clamped into looking healthy.**
+//     `Σ > span` in the CYCLE domain means the classes overlap, the anchor is wrong, or
+//     `now_cycles()` went backwards across cores. A `saturating_sub` would render all three as
+//     `resid=0ms` — indistinguishable from health. The cycle comparison is kept as an explicit
+//     tripwire that prints `:: GPACE: OVERLAP … ::` ahead of the report instead.
+//   * **`bench`'s count is resolvable.** It is the only class with more than one call site, so the
+//     three BENCH-RIDE probes are named individually in `build=` (`therm+`/`pcilink+`/`vrom+`);
+//     `bench=..ms(n=2)` would otherwise not say WHICH two ran.
 //   * **Zero and never-ran are structurally distinct.** Every class prints `<v><unit>(n=<count>)`.
 //     `0ms(n=0)` is "this code was not compiled in / never reached"; `0ms(n=1)` is "it ran and cost
 //     nothing". This project has twice been bitten by conflating the two.
@@ -284,9 +293,17 @@ impl Gpace {
 
 /// Cycles → whole ms at print time via the BPACE ledger's own rate, or raw ticks when that rate is
 /// still unknown. Never fabricates a millisecond out of a guessed frequency (the `[vugfps]` lesson).
+///
+/// The expression is `cy / (hz / 1000)` — deliberately `bootpace::Dur`'s formula and NOT EPACE's
+/// `cy * 1000 / hz`. The two differ by up to 1 ms, which would be irrelevant anywhere else but is
+/// not irrelevant here: the whole deliverable is `span` versus the ledger's own rendered
+/// `pci-usb d=`, and two renderers make that comparison disagree by one before either instrument
+/// has said anything. Sharing `Dur`'s divisor makes "the same clock" true of the printed digits and
+/// not merely of the counter. The `hz >= 1000` guard is `Dur`'s too, so a sub-kHz rate falls to raw
+/// ticks in both places rather than dividing by zero in one of them.
 fn gpace_fmt(cy: u64) -> (u64, &'static str) {
     let hz = crate::bootpace::origin_hz();
-    if hz == 0 { (cy, "cy") } else { (cy.saturating_mul(1000) / hz, "ms") }
+    if hz >= 1000 { (cy / (hz / 1000), "ms") } else { (cy, "cy") }
 }
 
 // The compiled knob set, as `&'static str` fragments a `no_std` format can concatenate without an
@@ -316,10 +333,25 @@ const GB_WC: &str = "";
 const GB_SMC: &str = "smc+";
 #[cfg(not(feature = "smc"))]
 const GB_SMC: &str = "";
-#[cfg(any(feature = "thermprobe", feature = "pcilink", feature = "vromprobe"))]
-const GB_BENCH: &str = "benchride+";
-#[cfg(not(any(feature = "thermprobe", feature = "pcilink", feature = "vromprobe")))]
-const GB_BENCH: &str = "";
+// The three BENCH-RIDE probes are named INDIVIDUALLY rather than rolled into one `benchride+`.
+// `bench` is the only class whose `n=` counts more than one call site, so a single fragment left
+// `bench=..ms(n=2)` unresolvable — two of three ran, and no reading said which two. Every other
+// class is disambiguated by its own fragment (`kepler=0ms(n=0)` against `kepler+`), and this was
+// the one place the none-vs-zero rule broke. Worse, `thermprobe` pulls in `smc`, so it was already
+// showing up twice in `build=` under two different names. With three fragments, `bench`'s `n=` is
+// fully determined by `build=`.
+#[cfg(feature = "thermprobe")]
+const GB_THERM: &str = "therm+";
+#[cfg(not(feature = "thermprobe"))]
+const GB_THERM: &str = "";
+#[cfg(feature = "pcilink")]
+const GB_PCILINK: &str = "pcilink+";
+#[cfg(not(feature = "pcilink"))]
+const GB_PCILINK: &str = "";
+#[cfg(feature = "vromprobe")]
+const GB_VROM: &str = "vrom+";
+#[cfg(not(feature = "vromprobe"))]
+const GB_VROM: &str = "";
 /// Prints in place of the fragments when NONE of them is compiled in, so "default build" is a
 /// positive statement in the log rather than an empty field a reader has to interpret.
 const GB_NONE: &str = if cfg!(any(
@@ -623,17 +655,43 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     }
 
     // ── GPACE report — the one unconditional exit of `pci::init` ────────────────────────────────
-    // Two lines. The first is the split; the second is the self-check plus the build identity.
+    // Two lines (three when the tripwire fires). The first is the split; the second is the
+    // self-check plus the build identity.
     //
-    // `resid = span - Σ(classes)` by construction, so the parts always close on the whole: a class
-    // that under-counts shows up as unattributed time instead of as a tidy-looking total. `span`
-    // must equal the independent BPACE `pci-usb d=` to the millisecond — they are anchored on the
-    // same stamp and divided by the same `hz`, so the only slack is these two lines' own print
-    // cost, which lands inside `pci-usb` and outside `span`.
+    // `resid = span - Σ(classes)` closes over the PRINTED MILLISECOND VALUES, not over the cycle
+    // counts. That distinction is the whole point of the field. Each class is floored to ms
+    // independently, so a cycle-domain residual then floored a ninth time leaves the printed row
+    // short of the printed `span` by up to `N_GPACE + 1` ms — noise against the 4620 ms armed
+    // block, but up to 8% of the ~100 ms default-build baseline that §9a calls load-bearing, and
+    // sitting in exactly the field whose job is to prove nothing went unattributed. A reader adds
+    // up the line; the line must add up. `Σfloor(x_k) ≤ floor(Σx_k) ≤ floor(span)` makes the
+    // printed-domain subtraction non-negative by construction, so the flooring loss lands in
+    // `resid` — which already means "unattributed" — and the row closes exactly.
+    //
+    // A class that under-counts therefore still shows up as unattributed time rather than as a
+    // tidy-looking total. `span` must equal the independent BPACE `pci-usb d=` to the millisecond:
+    // same anchor stamp, same `hz`, and since `gpace_fmt` now shares `Dur`'s divisor, the same
+    // rendering. The only slack is these two lines' own print cost, which lands inside `pci-usb`
+    // and outside `span` — measured at 1 ms (§9).
     {
         let now = crate::arch::now_cycles();
         let span = now.wrapping_sub(anchor_cy);
-        let resid = span.saturating_sub(pace.sum());
+
+        // TRIPWIRE. The cycle comparison survives here — not as the printed residual, but as the
+        // one reading that can convict the tiling. `Σ > span` is what overlapping spans, a wrong
+        // anchor, or a non-monotonic `now_cycles()` across cores would produce; the previous
+        // `saturating_sub` rendered every one of those as `resid=0ms`, which is ALSO the healthy
+        // reading. Clamping a broken instrument into the shape of a working one is this seat's
+        // recurring defect, and it had no business living inside the instrument built to avoid it.
+        // One branch, never taken in a sound build, turns that mask into a conviction.
+        let sum_cy = pace.sum();
+        if sum_cy > span {
+            serial_println!(
+                ":: GPACE: OVERLAP sum>span by {}cy — classes are not disjoint ::",
+                sum_cy - span
+            );
+        }
+
         let mut v = [0u64; N_GPACE];
         let mut unit = "ms";
         let mut k = 0;
@@ -644,7 +702,15 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
             k += 1;
         }
         let (sv, su) = gpace_fmt(span);
-        let (rv, _) = gpace_fmt(resid);
+        // Printed-domain closure: `resid` is what the printed span has left after the printed
+        // classes. The row sums to `span` exactly, for any `hz`, including the `cy` case.
+        let mut named = 0u64;
+        let mut j = 0;
+        while j < N_GPACE {
+            named = named.saturating_add(v[j]);
+            j += 1;
+        }
+        let rv = sv.saturating_sub(named);
         serial_println!(
             ":: GPACE: {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) resid={}{} == witness ::",
             GPACE_TAGS[G_XTAIL], v[G_XTAIL], unit, pace.n[G_XTAIL],
@@ -664,9 +730,10 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
             None => (0, "?"),
         };
         serial_println!(
-            ":: GPACE: span={}{} anchor={} since-entry={}{} hz={} build={}{}{}{}{}{}{}{} == the pci-usb d= split ::",
+            ":: GPACE: span={}{} anchor={} since-entry={}{} hz={} build={}{}{}{}{}{}{}{}{}{} == the pci-usb d= split ::",
             sv, su, anchor_tag, tv, tu, crate::bootpace::origin_hz(),
-            GB_NONE, GB_KEPLER, GB_TAKEOVER, GB_FIFO, GB_IVB, GB_WC, GB_SMC, GB_BENCH
+            GB_NONE, GB_KEPLER, GB_TAKEOVER, GB_FIFO, GB_IVB, GB_WC, GB_SMC,
+            GB_THERM, GB_PCILINK, GB_VROM
         );
     }
 }
