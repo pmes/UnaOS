@@ -1,56 +1,85 @@
-# WHITE BOARD — GR13, 2026-08-01 (refreshed)
+# WHITE BOARD — GR13 close, 2026-08-02
 
 **This is a whiteboard, not a record.** Wiped and rewritten every time it changes. It carries
-one thing: **what I need from Peter, right now.** Status lives in
+one thing: **what I need from Peter, right now.** Durable facts live in the baton
+(`~/.claude/plans/unaos/active/unaos-gemini-coord-baton.md`); per-boot status lives in
 `~/unaos-bench/PLAYBOOK-x86.md`.
 
 ---
 
 # OPEN — one item
 
-## 1. `git cherry-pick` is blocked by the permission classifier
+## 1. Two branch tips are not on origin
 
-This is the only thing standing between here and staged media. Denied both chained and
-single-commit; I have not tried to route around it.
+Trunk is safe: `UnaOS-gemini @ d5d4684f` is pushed and metal-proven — I verified local ==
+origin by fetch, not by assumption. **These two are not, and they are the only x86 work that
+exists on a single disk:**
 
-```
-git cherry-pick <sha>
-```
+git push origin wt/bgplace-x86 wt/postfold-doc-x86
 
-**Either:** add a Bash permission rule for it and I fold the fourteen commits singly, verifying
-the result against the merge matrix's tree hash — **or** I hand you the ordered list and you run
-them, and I verify after.
+- `wt/bgplace-x86 @ a4610035` — `bg_place_cpu` RESERVE, **two commits**
+- `wt/postfold-doc-x86 @ 922e18b8` — doc-freshness sweep, **two commits**
 
-Everything downstream is mechanical and needs nothing from you until the card goes in:
-fold → verify tree → `./arroyo esp-x86` **last** → stage with sha + MANIFEST → re-arm the card
-watch → send you the playbook.
+If you would rather they stay local until they fold, say so and I will stop raising it — but
+then it is a known, accepted risk rather than an oversight.
 
 ---
 
-# ANSWERED — recorded so they are not re-asked
+# → GR14 — THE PICKUP
 
-| | was | outcome |
-|---|---|---|
-| **Kepler runlist ownership** | leave to lane, or grant me the file? | **Granted, scoped**, then **extended** to userd + pushbuffer. Delivered: `wt/runlist-x86` @ `e47aa1bb`, reviewed, all conditions met. |
-| **`bg_place_cpu` policy** | reserve / spread / leave | **RESERVE.** Held deliberately until the fold — it needs `worker_cpu(0)`, which exists only on the unmerged placement branch. |
-| **Durability** | nine commits on one disk | **You pushed.** Verified by my own fetch. Trunk backed; branch tips still local. |
-| **Boot timing** | when do you want it? | **Whenever the jobs are rolled in** — they now are, bar the fold. |
-| **`serial-analyzer.py` lane** | is fixing it mine? | **Granted.** Delivered and validated on both an rMBP and a Pi capture. |
+## What is true right now
+
+- **Trunk `d5d4684f`, pushed, and PROVEN ON METAL.** s61 boot1, 2026-08-01T21:40:01Z. Five
+  arcs, fifteen commits, none of which had ever run on hardware — all five proved out on the
+  **first** boot. All three cross-checks passed. `kepler=4393ms` named the 4.6 s GPU block.
+- **The bench is cold for x86 and that is correct, not broken.** The `rmbp-gr13` session was
+  closed cleanly (`MARK session-end` / `WATCH down`, 2026-08-02T15:02:14Z). No card staged,
+  no watcher armed.
+- **The Pi seat holds the serial line.** `/dev/ttyUSB0` is FTDI `ABAFUJCO` — the rMBP console
+  adapter — and session `pi4-r23s1x` (opened 17:38Z today) has it open. **x86 cannot capture
+  until Fox releases it.** Do not take it; ask.
+- `~/unaos-bench/tools/waker.conf` is an explicitly **disarmed template**. Its patterns are
+  correct and worth keeping; its `B_LOG` is a placeholder on purpose.
+
+## Where the next arc starts
+
+The two unfolded branches above. Then the GR13 menu that never got picked up — see the baton.
+
+## How Peter wants to be worked with
+
+- **He pushes. The seat never pushes, ever** — no inference from "the last session did" or
+  "durable means origin" overrides it. Raise it on the whiteboard and stop.
+- **Metal is the verdict**, `strings` is the artifact. `./arroyo check` with the *full knob
+  set* stays; the QEMU suites do not — emulation cannot reach these paths.
+- **The whiteboard is his sheet.** Text in the file, one file, sections in it. Do not invent a
+  new layout for the relay.
+- Scratch media is scratch: compile, write, playbook. Ceremony over a scratch card is stolen
+  money.
 
 ---
 
 # CORRECTIONS I OWE, ALREADY MADE
 
+- **I reported the bench "armed with a sound alarm." It was not armed at all.** The write that
+  claimed it had been truncated by a shell-quoting failure and never reached the file; a `;`
+  after the heredoc meant the success echo printed regardless. Then the config it *would* have
+  written pointed at a closed capture. Both fixed — and the lesson is the one already on the
+  wall in another form: **a success message that cannot fail is not evidence.**
+- **KBDWIT has a false-CLEAN mode after all.** I previously wrote that its `adv` field has only
+  a false-*alarm* direction. Wrong by half: the emitter falls through to zero on a failed
+  FRINDEX read, so `ok=0` forces `adv=0x0000` (false alarm) **and** forces `hch=0 hse=0`
+  (false clean). One fallthrough, both directions. Qualify every KBDWIT rule on `ok=1`.
+  s61's two KBDWIT lines are both `ok=1`, so the s61 reading itself stands.
+- **The playbook named two commits that were each the tip of a two-commit stack.** Corrected
+  in place. Cherry-picking the named sha alone would have silently shipped half of each.
 - **`pci-usb d=4620ms` is not 57% of a real boot.** Bench-media only; 113 ms on a default build.
 - **CCSMARGIN was never n=1.** Seven captured boots, byte-identical.
 - **The `gp_get=0` corruption claim was wider than the evidence.** No in-repo `gp_get=` capture
-  and the beacon era ever overlapped — the witness was removed at `51b98bab` (pull 15) and the
+  and the beacon era ever overlapped — the witness was removed at `51b98bab` (pull 15), the
   beacons landed at `200be275` (pull 16). Retracted to Fox in writing.
-- **KBDWIT's `adv` has no false-clean mode.** I relayed the failure direction backwards. A
-  frozen counter gives `adv=0` unconditionally; the rare case is a false *alarm*.
 - **The 150 ms settle leg is not blocked on PA6.** The Pi cannot produce that measurement *by
   construction* — firmware always wins the race to PP, so that rig is permanently the `/pre`
-  case. It is unmeasurable there, not merely unmeasured.
+  case. Unmeasurable there, not merely unmeasured.
 
 ---
 
@@ -64,3 +93,7 @@ watch → send you the playbook.
   two more count-bounded polls, six untimed `2_000_000`-iteration spins, and the fact that all
   three beacon regions get the **same** eight values — so `beacon SEEN` could never identify
   which structure the mirror window reflects, contrary to pull-16's stated discriminator.
+- `envytools/` (53 MB upstream clone) sits untracked in the worktree root and is now
+  gitignored, not deleted. If it was mine to fetch it should go; **the README bans nouveau
+  register *semantics* on the Kepler lanes**, so its presence is a policy question, not a
+  cleanup one. Your call.

@@ -17,6 +17,14 @@ Thumbs.db
 *.swp
 *~
 
+# Agent harness state (session data + agent worktrees; multi-GB, never committed)
+.claude/
+
+# Upstream clones fetched for reference, not vendored
+# NOTE: nouveau/rnndb register SEMANTICS are banned on the Kepler lanes
+# (docs/dev/GEMINI/README.md §5); addresses with citation are fine.
+envytools/
+
 # Secrets (Just in case)
 secret.txt
 evidence.txt
