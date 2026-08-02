@@ -125,6 +125,13 @@ pub fn hw_wait_budget() -> u64 {
 /// owns (see `video::wm::table`).
 pub struct IrqMask(bool);
 
+/// WEDGE-8 (F3): true when interrupts are masked on this core (`RFLAGS.IF` clear). Twin of the
+/// aarch64 `irqs_masked`; the block layer uses it to refuse a masked wait on the xHCI loan.
+#[inline]
+pub fn irqs_masked() -> bool {
+    !x86_64::instructions::interrupts::are_enabled()
+}
+
 impl IrqMask {
     #[inline]
     pub fn new() -> Self {

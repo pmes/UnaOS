@@ -2501,7 +2501,7 @@ pub fn enumerate() {
         x.init_interrupter(event_ring_phys, erst_table_phys);
         x.init_pointers(command_ring_phys);
         x.start();
-        *xhci::XHCI_CONTROLLER.lock() = Some(x);
+        xhci::install(x);
     }
     stage_end("enum-rings-rs1", t_rings);
 
@@ -2579,8 +2579,20 @@ pub fn enumerate() {
         // TRB it pushes (`ring::write_trb`), so the enable-slot handshake is coherent by construction
         // on aarch64 without this loop touching the caches.
         let (armed_now, storage_slot, storage_ready) = {
-            let mut guard = xhci::XHCI_CONTROLLER.lock();
-            let x = guard.as_mut().unwrap();
+            // WEDGE-8 (F3): the boot pump claims the LOAN per pass — the storage bring-up inside
+            // `service_storage` reaches `pump_until_bot_done` and must never run under a held lock.
+            // At this boot stage the scheduled pump task is not yet the loan's owner, but the claim
+            // is still fallible by contract; a Busy pass just spins the loop once more.
+            let Ok(mut x) = xhci::claim() else {
+                // Still honour the pump deadline (wrap-safe, same test as the loop bottom) so a
+                // claim that never succeeds cannot turn this bounded pump into a spin forever.
+                if super::timer::cntpct().wrapping_sub(deadline) < (1u64 << 63) {
+                    break;
+                }
+                core::hint::spin_loop();
+                continue;
+            };
+            let x = &mut *x;
             x.poll_events();
             x.service_hubs();
             x.service_hid_setproto();
@@ -2648,7 +2660,7 @@ pub fn enumerate() {
     //     line each, so the boot's serial names the topology it reached (honest even on a no-device or
     //     deadline exit).
     serial_println!("{} enumerate: device topology after the polled walk: ::", P);
-    if let Some(x) = xhci::XHCI_CONTROLLER.lock().as_ref() {
+    if let Ok(x) = xhci::claim() {
         for line in x.port_slot_summary() {
             serial_println!("{}   {} ::", P, line);
         }

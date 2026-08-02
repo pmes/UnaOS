@@ -158,6 +158,9 @@ fn fat_errno(e: FatError) -> &'static str {
         FatError::Unsupported => "-EINVAL", // not a representable 8.3 name
         FatError::NoDisk | FatError::NotFat => "-ENODEV",
         FatError::Io | FatError::BadChain => "-EIO",
+        // WEDGE-8 (F3): the storage driver's controller loan was busy past the bounded retry —
+        // the operation never started; running the command again is the honest remedy.
+        FatError::Busy => "-EAGAIN",
     }
 }
 

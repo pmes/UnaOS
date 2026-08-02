@@ -854,7 +854,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial_println!(":: Enumerating USB. Plug in a stick / keyboard / mouse, then type or move the mouse. ::");
         serial_println!(":: Watch for: 'MISSION SUCCESS' (storage), 'POINTER ... ABSOLUTE/RELATIVE', 'KEY', and the USB-DEBUG lines below. ::");
         loop {
-            if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
+            // WEDGE-8 (F3): a claimed LOAN — the synchronous BOT work below runs with no lock
+            // held, so nothing that spins on the controller can ever wait out a preempted holder.
+            // Busy (another context has the loan) skips this pass; the next one is milliseconds out.
+            if let Ok(mut xhci) = unaos_kernel::drivers::xhci::claim() {
                 xhci.poll_events();
                 xhci.service_storage();
                 xhci.service_hubs();
@@ -1133,7 +1136,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     loop {
         // Poll xHCI Controller, then run any deferred storage work (synchronous BOT
         // transactions run here, in a safe non-event context).
-        if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
+        // WEDGE-8 (F3): a claimed LOAN — the BOT work runs with no lock held; a Busy claim
+        // (another context has the loan) skips this pass and the next frame retries.
+        if let Ok(mut xhci) = unaos_kernel::drivers::xhci::claim() {
             xhci.poll_events();
             xhci.service_storage();
             xhci.service_hubs();
@@ -1966,7 +1971,7 @@ fn jd2_console_pump(_arg: usize) {
     };
     let phase1_start = cntpct();
     let first_key: Option<u8> = loop {
-        if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
+        if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
             x.poll_events();
         }
         match unaos_kernel::pal::next_event() {
@@ -2010,7 +2015,7 @@ fn jd2_console_pump(_arg: usize) {
     }
 
     loop {
-        if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
+        if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
             x.poll_events();
         }
         let mut keyed = false;
@@ -2572,7 +2577,7 @@ fn typematic_selftest() {
 ///   (3) queued keys are forwarded into `GUI_CHANNEL` in the SAME `Event::Key` shape UART bytes take
 ///       (see `input_service`), so a USB keystroke reaches the shell/panel exactly like a serial byte.
 ///
-/// The XHCI_CONTROLLER lock is released before the drain (its guard scope ends) so a backpressured
+/// The xHCI loan (WEDGE-8) is returned before the drain (its scope ends) so a backpressured
 /// `GUI_CHANNEL.send` never blocks while holding the controller. Same global handle `enumerate` seeded.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn pump_usb_into_gui() {
@@ -2584,7 +2589,12 @@ fn pump_usb_into_gui() {
     // IRQs unmasked, no locks held, non-print context — all true at the top of a scheduled-task pass.
     // A few relaxed atomic loads when quiet; prints only on un-announced loss + the one-shot verdict.
     unaos_kernel::serial_ring::mirror_service();
-    if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
+    // WEDGE-8 (F3): THE F3 HOLDER SITE. This claim is a LOAN, not a lock hold — the services below
+    // (service_storage's bring-up matrices reach `pump_until_bot_done`, budget hw_wait_budget()*3
+    // ≈ 8.3 s on a failing transfer) run with NO lock held, so a mid-service preemption of this
+    // task parks the CONTROLLER, not a lock every masked FS writer spins on. A Busy claim means a
+    // block-layer transaction is in flight; skip the pass — the next one is ~4 ms out.
+    if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
         x.poll_events();
         x.service_storage();
         x.service_hubs();
@@ -2820,10 +2830,10 @@ fn pump_usb_into_gui() {
     // This pump path runs on metal (the `usb_pump` ~4 ms task) and in QEMU raspi4b (the input
     // service's poll-nap fallback), so the storage-ready edge is finally polled where it matters.
     //
-    // DEADLOCK: the mount re-locks XHCI_CONTROLLER via `read_block_usb`, so it MUST run outside any
-    // scope holding that lock. The controller guard above is dropped at the end of its `if let`
-    // scope (before the event-drain loop), so we are lock-free here — same discipline as the main
-    // loop, where this call sits after `probe_once` with the guard released. The edge is one-shot
+    // LOAN DISCIPLINE (was DEADLOCK): the mount re-claims the xHCI loan via `read_block_usb`, so it
+    // MUST run outside any scope holding the loan — a claim while we still held it would return
+    // Busy and the mount would fail for the pass. The loan above is returned at the end of its
+    // `if let` scope (before the event-drain loop), so we are loan-free here. The edge is one-shot
     // per raise (`take_usb_ready`), so calling it every ~4 ms pass is a cheap no-op until a stick's
     // bring-up raises it, then it mounts + witnesses once (and again on every hot-plug re-enum).
     if !PIUSB28_ARMED.swap(true, core::sync::atomic::Ordering::Relaxed) {

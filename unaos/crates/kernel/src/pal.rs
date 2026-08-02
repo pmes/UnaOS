@@ -1051,7 +1051,9 @@ pub fn next_event() -> Option<Event> {
 /// returns one event. The bare-metal Pi routes keys through a separate scheduled input service /
 /// channel rather than this queue, so that path is unaffected here.
 pub fn pump_and_poll() -> Option<Event> {
-    if let Some(x) = crate::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
+    // WEDGE-8 (F3): claim, don't lock — a Busy claim (a BOT transaction in flight elsewhere)
+    // skips this poll rather than spinning on a preemptible holder; the caller polls again.
+    if let Ok(mut x) = crate::drivers::xhci::claim() {
         x.poll_events();
     }
     // RMBP-FIX M3 (x86 EHCI): the internal rMBP keyboard/trackpad ride the EHCI HID path, not xHCI.

@@ -372,23 +372,131 @@ fn hub_port_change_feature_selector(bit: u16, is_ss: bool) -> Option<u16> {
     }
 }
 
-pub static XHCI_CONTROLLER: spin::Mutex<Option<XhciController>> = spin::Mutex::new(None);
+/// WEDGE-8 (F3) — the controller now lives behind a CLAIM/LOAN model, and this mutex is PRIVATE.
+///
+/// The defect this closes is F1's, transposed: `XHCI_CONTROLLER` used to be held straight across
+/// `pump_until_bot_done`, whose wall-clock budget is `hw_wait_budget()*3` ≈ 8.3 s on the Pi against
+/// a 12 ms scheduler quantum — so a preemptible holder (`pump_usb_into_gui`, the block layer) was
+/// CERTAIN to be preempted mid-hold on a busy core. Tasks never migrate and pinned tasks are never
+/// stolen, so the holder never ran again once a masked acquirer (EL0 `SYS_WRITE` → `fat.rs`
+/// `without_interrupts` → `block.rs`) started spinning on this lock on the same core: that core
+/// could take no timer IRQ, the holder was never re-dispatched, and the core died silently — no
+/// panic, and (at 8.3 s) just under `[spin1]`'s 10 s witness threshold. There is no ABBA cycle in
+/// this family; lock ordering fixes none of it.
+///
+/// F1's fix (WEDGE-7, `video/wm::table`) masked across the critical section — affordable there
+/// because every TABLE section is a bounded row scan. An 8.3 s BOT pump can NEVER be masked (the
+/// pump's `hlt`/WFI needs the timer, and masking a core for seconds is the bug in another coat), so
+/// the same discipline is applied to the LOCK, not the WORK:
+///
+///   * the mutex is held only inside [`claim`]/[`XhciLoan::drop`]/[`install`], each a masked O(1)
+///     take/put (the WEDGE-7 IrqMask discipline: mask taken BEFORE the acquire, lock released
+///     BEFORE the unmask). No masked spinner can ever wait more than a few dozen cycles on it, and
+///     no holder of it can ever be preempted mid-hold.
+///   * the CONTROLLER ITSELF is loaned out by value (a `Box` move) to exactly one user at a time,
+///     which runs the long BOT work with NO lock held. Contenders are told [`XhciClaimError::Busy`]
+///     immediately and handle it honestly (a pump pass skips; the block layer surfaces `Busy`,
+///     which the FAT layer retries OUTSIDE its masked span and EL0 sees as `-EAGAIN`).
+///
+/// The invariant, checkable by grep (the F1 idiom): `XHCI_CONTROLLER.lock()` appears ONLY in
+/// `claim`/`Drop`/`install` in this file — the static is private, so the compiler enforces it.
+static XHCI_CONTROLLER: spin::Mutex<Option<alloc::boxed::Box<XhciController>>> =
+    spin::Mutex::new(None);
+
+/// True while the controller is loaned out via [`claim`]. Written only inside the masked mutex
+/// hold, so a `None` in the mutex disambiguates cleanly: loaned (`Busy`) vs never installed
+/// (`NotReady`).
+static XHCI_LOANED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Why [`claim`] returned no controller.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum XhciClaimError {
+    /// The controller was never installed (USB bring-up skipped or failed).
+    NotReady,
+    /// Another context holds the loan right now — a BOT transaction or service pass is in flight.
+    /// The claim did NOT wait: waiting is the caller's decision (and a masked caller must not).
+    Busy,
+}
+
+/// An exclusive loan of the xHCI controller, returned by [`claim`]. Derefs to [`XhciController`];
+/// dropping it returns the controller to the shared slot (masked O(1) put, panic-safe by RAII).
+pub struct XhciLoan(Option<alloc::boxed::Box<XhciController>>);
+
+impl core::ops::Deref for XhciLoan {
+    type Target = XhciController;
+    #[inline]
+    fn deref(&self) -> &XhciController {
+        self.0.as_deref().expect("XhciLoan invariant: Some until drop")
+    }
+}
+
+impl core::ops::DerefMut for XhciLoan {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut XhciController {
+        self.0.as_deref_mut().expect("XhciLoan invariant: Some until drop")
+    }
+}
+
+impl Drop for XhciLoan {
+    fn drop(&mut self) {
+        if let Some(x) = self.0.take() {
+            // WEDGE-8: masked micro-hold; field order of the locals is the fix in miniature — the
+            // guard (lock) drops before `_mask` restores, so we never run unmasked while holding.
+            let _mask = crate::arch::IrqMask::new();
+            let mut guard = XHCI_CONTROLLER.lock();
+            *guard = Some(x);
+            XHCI_LOANED.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Claim exclusive use of the xHCI controller. O(1), never waits: the internal mutex hold is a
+/// masked take (a preempted holder is impossible, so a spin on it is bounded by construction), and
+/// a controller already loaned out returns [`XhciClaimError::Busy`] instead of blocking. Callers
+/// that can afford to wait do so OUTSIDE this call, unmasked, with their own bounded policy.
+pub fn claim() -> Result<XhciLoan, XhciClaimError> {
+    let _mask = crate::arch::IrqMask::new();
+    let mut guard = XHCI_CONTROLLER.lock();
+    match guard.take() {
+        Some(x) => {
+            XHCI_LOANED.store(true, Ordering::Release);
+            Ok(XhciLoan(Some(x)))
+        }
+        None => Err(if XHCI_LOANED.load(Ordering::Acquire) {
+            XhciClaimError::Busy
+        } else {
+            XhciClaimError::NotReady
+        }),
+    }
+}
+
+/// Install the freshly initialised controller into the shared slot (boot bring-up, both arches).
+/// Masked micro-hold, same discipline as [`claim`].
+pub fn install(x: XhciController) {
+    let boxed = alloc::boxed::Box::new(x);
+    let _mask = crate::arch::IrqMask::new();
+    let mut guard = XHCI_CONTROLLER.lock();
+    *guard = Some(boxed);
+    XHCI_LOANED.store(false, Ordering::Release);
+}
 
 /// Human-readable mass-storage enumeration/bring-up state, for the shell `diskinfo` command when no
 /// block device is published. Lets a metal storage failure be diagnosed from the interactive shell
 /// (the boot enumeration log is wiped once the GUI takes over on the serial-less rMBP).
 pub fn storage_diag() -> alloc::string::String {
-    match &*XHCI_CONTROLLER.lock() {
-        Some(x) => alloc::format!("storage: slot {} — {}", x.storage_slot, x.storage_note),
-        None => alloc::string::String::from("storage: xHCI not initialised (USB bring-up skipped?)"),
+    match claim() {
+        Ok(x) => alloc::format!("storage: slot {} — {}", x.storage_slot, x.storage_note),
+        Err(XhciClaimError::Busy) => alloc::string::String::from("storage: xHCI busy (transaction in flight) — retry"),
+        Err(XhciClaimError::NotReady) => alloc::string::String::from("storage: xHCI not initialised (USB bring-up skipped?)"),
     }
 }
 
 /// Live port + slot summary for the shell `usbinfo` command (metal enumeration diagnosis).
 pub fn usb_summary() -> alloc::vec::Vec<alloc::string::String> {
-    match &*XHCI_CONTROLLER.lock() {
-        Some(x) => x.port_slot_summary(),
-        None => alloc::vec::Vec::from([alloc::string::String::from("xHCI not initialised")]),
+    match claim() {
+        Ok(x) => x.port_slot_summary(),
+        Err(XhciClaimError::Busy) => alloc::vec::Vec::from([alloc::string::String::from("xHCI busy (transaction in flight) — retry")]),
+        Err(XhciClaimError::NotReady) => alloc::vec::Vec::from([alloc::string::String::from("xHCI not initialised")]),
     }
 }
 
@@ -402,11 +510,17 @@ pub fn log_summary_once() {
     if N.fetch_add(1, Ordering::Relaxed) != 2000 {
         return;
     }
-    if let Some(x) = XHCI_CONTROLLER.lock().as_ref() {
-        serial_println!("xHCI: === USB topology summary ===");
-        for line in x.port_slot_summary() {
-            serial_println!("xHCI: {}", line);
+    match claim() {
+        Ok(x) => {
+            serial_println!("xHCI: === USB topology summary ===");
+            for line in x.port_slot_summary() {
+                serial_println!("xHCI: {}", line);
+            }
         }
+        // One-shot (the N counter has already advanced): say WHY the summary is absent rather
+        // than silently dropping it for the boot.
+        Err(XhciClaimError::Busy) => serial_println!("xHCI: topology summary skipped — controller busy at the sample point"),
+        Err(XhciClaimError::NotReady) => {}
     }
     // BOT-PHASE (lift 0825ed08): the phase-desync census, printed once per boot alongside the
     // topology summary. `tag_mismatch=`/`bad_sig=` were one-off prints with no denominator;

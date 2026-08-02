@@ -320,6 +320,19 @@ pub fn hw_wait_budget() -> u64 {
 /// (`video/wm.rs`) compiles on both arches. The x86_64 twin lives in that arch's `mod.rs`.
 pub struct IrqMask(u64);
 
+/// WEDGE-8 (F3): true when IRQs are masked on this core (`PSTATE.I` set). The block layer uses it
+/// to pick between "wait politely for the xHCI loan" (unmasked, schedulable) and "refuse instantly
+/// with `Busy`" (masked — a masked wait on a preemptible holder is the F3 deadlock). Arch-neutral
+/// by re-export; the x86_64 twin reads `RFLAGS.IF`.
+#[inline]
+pub fn irqs_masked() -> bool {
+    let daif: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack, preserves_flags));
+    }
+    daif & (1 << 7) != 0
+}
+
 impl IrqMask {
     #[inline]
     pub fn new() -> Self {

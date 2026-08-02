@@ -6590,11 +6590,15 @@ fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
         let fs = match crate::fs::fat::mount() {
             Ok(fs) => fs,
             Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+            Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable
             Err(_) => return EIO,
         };
         let cluster = FILE_CLUSTER[asid as usize][idx].load(Ordering::Acquire);
         let wrote = match fs.write_at(cluster, size, offset, &data) {
             Ok(n) => n,
+            // WEDGE-8 (F3): the storage driver was busy past the bounded retry — retryable, no
+            // bytes written. Distinct from EIO so a shell/app retry loop is honest, not superstition.
+            Err(crate::fs::fat::FatError::Busy) => return EAGAIN,
             Err(_) => return EIO,
         };
         if wrote == 0 {
@@ -6622,6 +6626,7 @@ fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     let cluster = FILE_CLUSTER[asid as usize][idx].load(Ordering::Acquire);
@@ -6630,6 +6635,7 @@ fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
     let (wrote, new_size, new_first) = match fs.write_grow(cluster, size, dir_lba, dir_off, offset, &data) {
         Ok(t) => t,
         Err(crate::fs::fat::FatError::NoSpace) => return ENOSPC,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable
         Err(_) => return EIO, // a bad chain / block error — nothing advanced (the dir bump is write_grow's last step)
     };
     if wrote == 0 {
@@ -8092,6 +8098,7 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     // F3-M3: the NAMESPACE hold — from the name lookup through the descriptor claim. It makes the
@@ -8122,9 +8129,11 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
                 }
                 Err(crate::fs::fat::FatError::Unsupported) => return EINVAL, // name not representable as 8.3
                 Err(crate::fs::fat::FatError::NoSpace) => return ENOSPC,     // root directory full
+                Err(crate::fs::fat::FatError::Busy) => return EAGAIN,        // WEDGE-8: retryable, nothing created
                 Err(_) => return EIO,
             }
         }
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: retryable, nothing claimed
         Err(_) => return EIO,
     };
     if de.is_dir {
@@ -8248,12 +8257,16 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     let cluster = FILE_CLUSTER[asid as usize][idx].load(Ordering::Acquire);
     let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    if fs.read_at(cluster, size, offset, &mut bytes, want).is_err() {
-        return EIO;
+    match fs.read_at(cluster, size, offset, &mut bytes, want) {
+        Ok(_) => {}
+        // WEDGE-8 (F3): the storage driver was busy past the bounded wait — retryable, no data lost.
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN,
+        Err(_) => return EIO,
     }
     let got = bytes.len();
     if got == 0 {
@@ -8353,6 +8366,7 @@ fn sys_unlink(handle: u64) -> i64 {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     // K1 M2.3: snapshot the owner's persistent principal BEFORE owned_clear drops the row, so we know whether a
@@ -20457,6 +20471,7 @@ fn bus_ls(text: &mut alloc::vec::Vec<u8>) -> i64 {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     let entries = match fs.read_root() {
@@ -20505,6 +20520,7 @@ fn bus_cat(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str, text: &mut a
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     let ns = ns_lock();
@@ -20547,6 +20563,7 @@ fn bus_cp(asid: u64, agen: u64, ppid: PrincipalRecord, src: &str, dst: &str) -> 
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     let ns = ns_lock();
@@ -20643,6 +20660,7 @@ fn bus_write(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str, content: &
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     // Existence check (advisory — re-verified under the ns hold below before any mutation).
@@ -20766,6 +20784,7 @@ fn bus_rm(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str) -> i64 {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     // Locate + authorize under the ns hold (coherent), then DROP it for the durable clear (which
@@ -20832,6 +20851,7 @@ fn bus_mv(asid: u64, agen: u64, ppid: PrincipalRecord, src: &str, dst: &str) -> 
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     let ns = ns_lock();

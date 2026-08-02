@@ -6,7 +6,7 @@
 // here after SCSI bring-up, and read/write are serviced by locking the xHCI controller.
 
 use spin::Mutex;
-use crate::drivers::xhci::{XHCI_CONTROLLER, CswStatus};
+use crate::drivers::xhci::{self, CswStatus, XhciClaimError, XhciLoan};
 
 // M6g backend selector (aarch64 bare-metal only). The block layer dispatches over a registered
 // backend: the default is the xHCI USB-MSC path this file has always served; `register_sd` flips it
@@ -29,6 +29,49 @@ pub enum BlockError {
     NotReady,
     Io,
     BadLba,
+    /// WEDGE-8 (F3): the xHCI controller is loaned out to another context (a BOT transaction or a
+    /// service pass is in flight) and this call refused to wait for it. Callers that CAN wait —
+    /// unmasked, schedulable contexts — never see this from a healthy device: `claim_xhci_for_io`
+    /// retries with a bounded `hlt` wait first. A caller running with IRQs MASKED gets it
+    /// immediately, because a masked wait on a driver lock is exactly the F3 deadlock; the FAT
+    /// layer retries OUTSIDE its masked span and surfaces `-EAGAIN` on exhaustion.
+    Busy,
+}
+
+/// WEDGE-8 (F3): claim the xHCI controller for one block transaction.
+///
+/// Masked callers (the FAT/dir RMW spans under `without_interrupts`) get an INSTANT
+/// `BlockError::Busy` when the controller is loaned out — the whole point of F3 is that a masked
+/// context must never wait on a driver lock, because the loan holder is preemptible and, once
+/// preempted on this core, can only run again if this core takes timer IRQs.
+///
+/// Unmasked callers keep the old effectively-blocking semantics, honestly bounded: retry the claim
+/// with a `hlt` between attempts (each wakes on the next IRQ, letting the scheduler run the loan
+/// holder) up to `hw_wait_budget()` wall-clock — long enough for any healthy service pass or BOT
+/// transaction, short enough that a wedged 25 s failing-transfer hold surfaces as `Busy` instead of
+/// hanging the caller forever.
+fn claim_xhci_for_io() -> Result<XhciLoan, BlockError> {
+    match xhci::claim() {
+        Ok(l) => return Ok(l),
+        Err(XhciClaimError::NotReady) => return Err(BlockError::NotReady),
+        Err(XhciClaimError::Busy) => {}
+    }
+    if crate::arch::irqs_masked() {
+        return Err(BlockError::Busy);
+    }
+    let start = crate::arch::now_cycles();
+    let budget = crate::arch::hw_wait_budget();
+    loop {
+        crate::hlt();
+        match xhci::claim() {
+            Ok(l) => return Ok(l),
+            Err(XhciClaimError::NotReady) => return Err(BlockError::NotReady),
+            Err(XhciClaimError::Busy) => {}
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+            return Err(BlockError::Busy);
+        }
+    }
 }
 
 /// Geometry + identity of the enumerated mass-storage device.
@@ -95,8 +138,8 @@ pub fn read_block_usb(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
     if lba >= dev.num_blocks {
         return Err(BlockError::BadLba);
     }
-    let mut guard = XHCI_CONTROLLER.lock();
-    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    // WEDGE-8 (F3): a claimed LOAN, not a held lock — the BOT pump below runs with no lock held.
+    let mut xhci = claim_xhci_for_io()?;
     match xhci.storage_read10(lba as u32, 1) {
         Ok(res) if res.status == CswStatus::Passed => {}
         _ => return Err(BlockError::Io),
@@ -123,8 +166,8 @@ pub fn write_block_usb(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     if lba >= dev.num_blocks {
         return Err(BlockError::BadLba);
     }
-    let mut guard = XHCI_CONTROLLER.lock();
-    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    // WEDGE-8 (F3): a claimed LOAN, not a held lock — the BOT pump below runs with no lock held.
+    let mut xhci = claim_xhci_for_io()?;
     let dst = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
     let n = (dev.block_size as usize).min(buf.len());
     unsafe {
@@ -246,8 +289,8 @@ pub fn read_block(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
         return crate::drivers::emmc2::read_block_512(lba, buf);
     }
 
-    let mut guard = XHCI_CONTROLLER.lock();
-    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    // WEDGE-8 (F3): a claimed LOAN, not a held lock — the BOT pump below runs with no lock held.
+    let mut xhci = claim_xhci_for_io()?;
 
     match xhci.storage_read10(lba as u32, 1) {
         Ok(res) if res.status == CswStatus::Passed => {}
@@ -279,8 +322,8 @@ pub fn write_block(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
         return crate::drivers::emmc2::write_block_512(lba, buf);
     }
 
-    let mut guard = XHCI_CONTROLLER.lock();
-    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    // WEDGE-8 (F3): a claimed LOAN, not a held lock — the BOT pump below runs with no lock held.
+    let mut xhci = claim_xhci_for_io()?;
 
     // Stage the data into the controller's DMA buffer, then issue WRITE(10).
     let dst = xhci.storage_data_ptr().ok_or(BlockError::Io)?;

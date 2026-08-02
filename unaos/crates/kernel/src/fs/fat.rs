@@ -69,6 +69,12 @@ pub enum FatError {
     /// U10: no free space — the free-cluster search found no free cluster (volume full), or a directory has
     /// no free slot for a new entry (root-directory-chain extension is out of scope). Surfaces as `-ENOSPC`.
     NoSpace,
+    /// WEDGE-8 (F3): the storage driver is busy (the xHCI controller loan is held by another
+    /// context) and this call refused to wait for it — a masked span must NEVER block on a driver
+    /// lock (that wait is the F3 deadlock), and an unmasked one already waited its bounded budget.
+    /// The RMW wrappers ([`with_fat_lock_src`]/[`with_dir_lock_src`]) retry it OUTSIDE the masked
+    /// span; exhaustion surfaces as `-EAGAIN` — the caller may retry, nothing was mutated.
+    Busy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -560,6 +566,10 @@ fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Re
     };
     match r {
         Ok(n) if n >= SECTOR_SIZE => Ok(()),
+        // WEDGE-8 (F3): Busy is not an I/O failure — the controller is loaned out and this context
+        // refused (masked) or exhausted (unmasked) its wait. Kept distinct so the RMW wrappers can
+        // retry outside the masked span and EL0 sees `-EAGAIN`, never a false `-EIO`.
+        Err(crate::drivers::block::BlockError::Busy) => Err(FatError::Busy),
         _ => Err(FatError::Io),
     }
 }
@@ -575,7 +585,11 @@ fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Resul
         BlockSource::Default => crate::drivers::block::write_block(lba, buf),
         BlockSource::Usb => crate::drivers::block::write_block_usb(lba, buf),
     };
-    r.map_err(|_| FatError::Io)
+    r.map_err(|e| match e {
+        // WEDGE-8 (F3): see `read_sector` — Busy stays Busy so it can be retried, not mourned.
+        crate::drivers::block::BlockError::Busy => FatError::Busy,
+        _ => FatError::Io,
+    })
 }
 
 /// F2 (SMP-hardening): the FAT-table mutation lock. Serializes the read-modify-write of a FAT sector so two
@@ -707,22 +721,70 @@ fn note_masked_usb_hold(source: BlockSource, site: &str) {
 #[inline(always)]
 fn note_masked_usb_hold(_source: BlockSource, _site: &str) {}
 
+/// WEDGE-8 (F3): retry bounds for a `Busy` FAT/dir RMW — the masked closure found the storage
+/// driver's controller loaned out and returned instantly (a masked context must never wait on a
+/// driver lock; that wait IS the F3 deadlock). Each retry re-runs the WHOLE closure from outside
+/// the `without_interrupts` span, with a `hlt()` between attempts so the scheduler can run the loan
+/// holder to completion. Both bounds are needed: the attempt cap keeps the aarch64 masked path
+/// (instant-`Busy` attempts, one timer tick apart) from spinning unbounded, and the wall-clock cap
+/// keeps the x86 path (whose block layer already waits its own bounded budget per attempt) from
+/// multiplying that budget by the attempt count. Exhaustion surfaces `FatError::Busy` → `-EAGAIN`:
+/// the RMW never started, nothing was mutated, the caller may retry.
+const RMW_BUSY_ATTEMPTS: u32 = 64;
+
 /// USBFALL F2: [`with_fat_lock`], with the [`BlockSource`] the guarded RMW will run through made EXPLICIT.
 /// Every `FatFs` call site uses this form so the span's per-source cost (see [`with_fat_lock`]'s LOCK SPAN
 /// paragraph) is visible at the point the lock is taken, and so a newly added source cannot inherit the
-/// "polled, therefore cheap" premise by accident. Behaviourally identical to `with_fat_lock`; the only added
-/// work is the one-shot `witness`-gated note, which compiles away in a default-quiet build.
+/// "polled, therefore cheap" premise by accident.
+///
+/// WEDGE-8 (F3): the closure is now `Result`-typed and a `FatError::Busy` from inside it is RETRIED
+/// here, OUTSIDE the masked span (see [`RMW_BUSY_ATTEMPTS`]). The invariant this establishes for
+/// every span in `fs/`: no `without_interrupts` closure ever blocks on a driver lock — it fails
+/// fast with `Busy` and the wait (a `hlt`, schedulable, unmasked) happens out here.
 #[inline]
-fn with_fat_lock_src<R>(source: BlockSource, site: &str, f: impl FnOnce() -> R) -> R {
+fn with_fat_lock_src<R>(
+    source: BlockSource,
+    site: &str,
+    mut f: impl FnMut() -> Result<R, FatError>,
+) -> Result<R, FatError> {
     note_masked_usb_hold(source, site);
-    with_fat_lock(f)
+    let start = crate::arch::now_cycles();
+    let budget = crate::arch::hw_wait_budget();
+    for _ in 0..RMW_BUSY_ATTEMPTS {
+        match with_fat_lock(&mut f) {
+            Err(FatError::Busy) => {}
+            other => return other,
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+            break;
+        }
+        crate::hlt(); // unmasked here — the mask ended with the closure; let the holder run
+    }
+    Err(FatError::Busy)
 }
 
-/// USBFALL F2: the [`with_dir_lock`] twin of [`with_fat_lock_src`] — same reasoning, directory sectors.
+/// USBFALL F2: the [`with_dir_lock`] twin of [`with_fat_lock_src`] — same reasoning, directory
+/// sectors; WEDGE-8 (F3): same `Busy` retry-outside-the-mask discipline.
 #[inline]
-fn with_dir_lock_src<R>(source: BlockSource, site: &str, f: impl FnOnce() -> R) -> R {
+fn with_dir_lock_src<R>(
+    source: BlockSource,
+    site: &str,
+    mut f: impl FnMut() -> Result<R, FatError>,
+) -> Result<R, FatError> {
     note_masked_usb_hold(source, site);
-    with_dir_lock(f)
+    let start = crate::arch::now_cycles();
+    let budget = crate::arch::hw_wait_budget();
+    for _ in 0..RMW_BUSY_ATTEMPTS {
+        match with_dir_lock(&mut f) {
+            Err(FatError::Busy) => {}
+            other => return other,
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+            break;
+        }
+        crate::hlt();
+    }
+    Err(FatError::Busy)
 }
 
 // ---------------------------------------------------------------------------------------------------------

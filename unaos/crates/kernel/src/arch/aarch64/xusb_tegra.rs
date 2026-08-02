@@ -1273,7 +1273,7 @@ pub fn jb2b_attach(
         x.init_interrupter(event_ring_phys, erst_table_phys);
         x.init_pointers(command_ring_phys);
         x.start();
-        *xhci::XHCI_CONTROLLER.lock() = Some(x);
+        xhci::install(x);
     }
 
     // JETSON-XCARVE-CRCR M1: quiesce + re-seat the command ring BEFORE the first command doorbell.
@@ -1292,8 +1292,10 @@ pub fn jb2b_attach(
     // completion code 17 (Parameter Error). DISABLE_SLOT 1..8 is the spec-clean reclaim — a
     // not-enabled slot just completes with code 11 (Slot Not Enabled), harmless.
     if JB9G_NO_HCRST {
-        let mut guard = xhci::XHCI_CONTROLLER.lock();
-        if let Some(x) = guard.as_mut() {
+        // WEDGE-8 (F3): a claimed loan, not a held lock (single-threaded boot stage; a failed
+        // claim just skips the eviction, same as the old `None` case).
+        if let Ok(mut x) = xhci::claim() {
+            let x = &mut *x;
             for slot in 1u8..=8 {
                 let trb = xhci::trb::Trb {
                     parameter: 0,
@@ -1353,8 +1355,14 @@ pub fn jb2b_attach(
             }
         }
         let (armed_now, storage_slot, storage_ready) = {
-            let mut guard = xhci::XHCI_CONTROLLER.lock();
-            let x = guard.as_mut().unwrap();
+            // WEDGE-8 (F3): claim the loan per pass — service_storage's BOT waits must never run
+            // under a held lock. Busy cannot occur in this single-threaded pre-drop window, but
+            // the claim is fallible by contract; skip the pass if it ever is.
+            let Ok(mut x) = xhci::claim() else {
+                core::hint::spin_loop();
+                continue;
+            };
+            let x = &mut *x;
             x.poll_events();
             x.service_hubs();
             x.service_hid_setproto();
@@ -1428,7 +1436,7 @@ pub fn jb2b_attach(
 pub fn kbd_pump_body(_arg: usize) {
     serial_println!(":: tegra: JB2b — EL1 keyboard pump live (xHCI polled at EL1) ::");
     loop {
-        if let Some(x) = xhci::XHCI_CONTROLLER.lock().as_mut() {
+        if let Ok(mut x) = xhci::claim() {
             x.poll_events();
         }
         // Drain the pal queue the HID decoder feeds — the same sink the x86 GUI drains — and
