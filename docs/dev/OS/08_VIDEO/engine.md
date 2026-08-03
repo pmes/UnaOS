@@ -4235,8 +4235,20 @@ the tree already has one — WEDGE-2's `wedge2_raw_byte`.
 | --- | --- | --- |
 | `<D1>` / `<d1>` | teardown entry, **before** the `TABLE`/`WRITER` section (`close`, `close_owner`, `move_to`) | uppercase = the core owning the open focus chain, lowercase = a teardown on some OTHER core while that chain is open. `<D1>` with no `<D2>` puts the death upstream of the barrier — blindness 2 |
 | `<D2>` | that section is behind us; the barrier is going up and this core is about to spin | `<D2>` with no `<D3>` puts the death in the spin |
-| `<D3>` | the spin returned; the barrier is held | pairs with `<D2>` |
+| `<D3>` | the spin returned; the barrier is held | pairs with `<D2>`; `<D3>` with no `<D4>` puts the death in the erase/reclaim run |
+| `<D4>` | the erase/reclaim half is behind us and the barrier is down; the cursor bracket (`cursor::repaint`, and with it `SPRITE`) is next. `close_owner` only | `<D4>` as the LAST token on a torn wire puts the death on `SPRITE` — the **F4** site, not F1's `TABLE` |
 | `<D!>` | the stall tripwire fired, **before** its `serial_println!` | `<D!>` with no `DRAIN STALLED` line after it is blindness 1 caught in the act |
+
+**`<D4>` exists because the F4 death was otherwise misattributed to F1.** Before it, a `close_owner`
+that died in `cursor::repaint` left `<D3>` as the last token on the wire — and `<D3>` is emitted from
+inside `DrainBarrier::drain`, which *every* teardown reaches, so a `SPRITE` wedge and a reclaim wedge
+produced the same trace and the audited F1 site (`TABLE`, closed by WEDGE-7's `fn table()`) was the
+natural place to pin it. `SPRITE` is reached on **every** EL0 exit through this path, and a core that
+blocks on it there is IRQ-masked by `sched::exit`, so the outcome is a silent total freeze of panel,
+cursor and input. The token does not fix that — it makes the capture name the lock. It is
+unconditional (`wedge2::mark`), on `<D2>`/`<D3>`'s terms rather than `<D1>`'s: it sits past the
+`n == 0` early return, so its population is teardowns that genuinely freed a row and raised a
+barrier, and a wedge that eats the panel is worth naming whether or not a TAB is in flight.
 
 `<D1>` is chain-gated (`wedge2::mark_composite`) and the budget is measured, not preferred: the first
 cut emitted it unconditionally and the wedge2 gate run priced it at **96 tokens against the focus
@@ -4329,6 +4341,18 @@ read as the mechanism being quiet.** What the gate does prove is the `<D2>`/`<D3
 and the dwell line's wiring. One `<D2>` reads as `<activD2>` on the wire — another core's line
 interleaved with the token's bytes, WEDGE-2's stated and accepted cost for taking no lock.
 
+**`<D4>` gate reading (210 s full-knob window, MBENCH PASS 90/90, 26398 lines).** `<D2>`=31,
+`<D3>`=32, `<D4>`=3, `<D1>`=0, `<D!>`=0. The `<D2>`/`<D3>` gap is one more interleave of the same
+kind and not a missing token — the split `<D2>` is legible on the wire as
+`run /fat/<DVUG.ELF2> <D3>— loaded 12568 bytes`, its two halves wrapped around another core's
+`EXEC-UVUG` line, so the true pairing is 32/32. `<D4>`=3 against `<D3>`=32 is the expected ratio and
+is itself the token's design: `<D4>` sits past `close_owner`'s `n == 0` early return, so it counts
+only the teardowns that actually freed a row, while `<D3>` counts every barrier `close`, `move_to`
+and `close_owner` raise between them. All three `<D4>`s are followed by further output (two by the
+focus chain's own `<F4><F5>`), i.e. no wedge — which is what this gate can show and the limit of it:
+`timer_preempt` never runs on raspi4b, so F4 cannot occur there and a clean QEMU run is a wiring
+proof, never a refutation of the mechanism.
+
 #### Metal watch-list (WEDGE-1r2)
 
 * `-> DWELL` or a repeated `-> INFLIGHT` locates a real stall well below the tripwire, and is the
@@ -4338,6 +4362,17 @@ interleaved with the token's bytes, WEDGE-2's stated and accepted cost for takin
 * `<D1>`/`<d1>` as the LAST thing on a torn wire: the death is in the teardown's own `TABLE`/`WRITER`
   section, upstream of the barrier — the region WEDGE-1 never covered, and the reason its silence
   could not exonerate the teardown path.
+* `<D4>` as the LAST thing on a torn wire: the death is in `close_owner`'s cursor bracket —
+  F4, downstream of everything F1 and the barrier cover. Expect it to come with a dead panel rather
+  than a merely stalled teardown: the sprite gates the cursor bracket every compositor path takes, so
+  panel, cursor and input stop together. Until this token existed that death read as
+  `<D3>`-then-silence and was attributed to the reclaim run or to F1's `TABLE`.
+
+  **Updated by §WEDGE-9 (2026-08-02).** `SPRITE` is no longer a lock that can be waited on: it is a
+  claim/loan, and a masked `close_owner` that cannot claim it takes an immediate `Busy` and defers the
+  repaint. So `<D4>`-then-silence no longer means *a masked spin on the sprite lock*. It still names
+  the phase, and the phase is still worth naming — but read it now as the framebuffer work inside
+  `refresh_locked` (or `WRITER`), not as the family wedge.
 * A quiet `[wedge1]` still means **nothing about the barrier** unless `drains > 0`. That is the whole
   point of the verdict naming the scene.
 
@@ -6052,3 +6087,140 @@ in reach without touching the present contract.
 * `./arroyo check` — both arches green.
 * `./arroyo kernel8-test` — MBENCH PASS 88/88.
 * `./arroyo test-arm` — MISSION SUCCESS.
+
+## WEDGE-9 — `cursor::SPRITE` becomes a claim/loan; F4 is closed (2026-08-02)
+
+The last unfixed member of the F1–F4 family, and the worst user-visible one. §WEDGE-2 built the
+`<D4>` token to stop this death being misattributed to F1's `TABLE`, audited the nine `SPRITE`
+acquisitions, and stated plainly that WEDGE-7's masked micro-guard could not be applied here. This is
+the fix that audit called for: WEDGE-8's claim/loan (`drivers/xhci::claim`), by way of MBOX-1's
+transposition of it in `arch/aarch64/mailbox.rs`.
+
+### The family shape, and why F4 is the expensive one
+
+A masked span blocks on a lock a **preemptible** holder holds; the holder is preempted; the masked
+spinner's core can take no timer interrupt, so the holder never runs again and the core spins
+forever. No ABBA cycle is involved and none is needed.
+
+`SPRITE` was that lock. Every one of its nine acquisitions held it across the whole operation, and
+seven of those were unbounded — two ≤`MAX_PIX` framebuffer read/write passes against non-coherent
+scan-out, a `flush_box` that cleans **whole panel scanlines** (~276 KB, ~4300 cache lines on the
+bench's 1920×1200), and in `adopt_overlay` a nested blocking `OVERLAY.lock()`.
+
+### The acquirer side, which §WEDGE-2's audit did not enumerate
+
+This is what makes F4 the family's worst case rather than merely another instance. Three chains reach
+`video/cursor.rs` with interrupts already masked:
+
+| Chain | Where the mask comes from | Reaches |
+| --- | --- | --- |
+| EL0 task exit | `sched::exit` → `mask_irq()` → `boot::teardown_user_slot` → `syscall::clear_handle_row` → `wm::close_owner` | `undraw` (via `erase`), `repaint` (the `<D4>` site), then a whole `composite()` pass — i.e. every entry point in the module |
+| `SYS_WIN_PRESENT` | `syscall::sys_win_present` → `IrqGuard::mask_save()` + `WINDOWS` → `present_surface_common` → `wm::present` → `composite()` | the same whole-pass set — **one masked pass per window present, several windows, several cores** |
+| `SYS_FB_PRESENT` | `syscall::sys_fb_present`, same guard, → `wm::compat_present` → `composite()` | the same |
+
+The scheduler's off-CPU reap arm (`retire_killed` → `teardown_user_slot`) is a fourth entrance to the
+first chain. Unmasked acquirers — the render task's `Screen::flush` bracket, the HID router's motion
+repaint, `wm::move_to`/`wm::close` (both deliberately outside their verb's `IrqGuard`), and
+`wc_close_click` from the input pump — are preemptible and were never the hazard.
+
+So the symptom of an F4 death is not a stalled teardown. The sprite gates the cursor bracket every
+compositor path takes, so panel, cursor and input stop together, with nothing on the wire.
+
+### The shape: the discipline goes on the LOCK, not the WORK
+
+* `SPRITE_STATE` is a private `static mut`, reachable only through `SpriteLoan`'s `Deref`/`DerefMut`.
+* `SPRITE_FREE: Mutex<bool>` is the only lock, held for a masked O(1) take/put and nothing else. Mask
+  before the acquisition, guard released before the mask is restored (WEDGE-7's field order, as local
+  drop order).
+* The long work runs on the **loan**, with no lock held. A contender's `claim()` takes `SPRITE_FREE`
+  for a few dozen cycles, reads `false`, and answers `Busy` — it never waits on a preemptible holder.
+* Grep-checkable, the F1/WEDGE-8 idiom: `SPRITE_FREE.lock()` appears only in `claim` and
+  `SpriteLoan::drop`; `SPRITE_STATE` is named only by the two loan accessors.
+
+### Per-caller Busy policy
+
+`Busy` is never a shrug. Eight of the ten sites route a refusal into `owe_repaint()`, which arms a
+whole-sprite repaint for the next composite tail and arms CURSOR-9's `TOUCHED_SINCE_DRAW` alongside.
+
+| Site | Policy | Why |
+| --- | --- | --- |
+| `repaint` (**the F4 site**) | bounded unmasked retry (`CLAIM_RETRY_MS` = 2 ms), else owe | The pointer's own motion path; a lost one is a stale cursor position. Masked callers skip the retry entirely (`arch::irqs_masked`, the WEDGE-8 rule) — that refusal *is* the fix |
+| `undraw`, `undraw_within`, `undraw_within_nosession` | owe | The caller is about to paint over pixels it could not hand back. The owed refresh re-establishes arrow and save-under from the finished front |
+| `defer_within` / `defer_nosession` | return 0, owe | An unrecorded deferral leaves the tail's settle nothing to verdict and `saved` stale. The 0 return is safe: neither caller reads it, and the session arm still reports `Adopt`, so no session leaks |
+| `settle_nosession` | owe | The `pend` bits stand; the owed refresh is settlement-by-bracket in its strongest form |
+| `ensure_drawn` | owe | Its whole job is "is the arrow up?"; a refusal means it could not check |
+| `adopt_overlay` | **close the session anyway**, then owe | It is the ONLY closer of the overlay session; a leaked session locks the mechanism out for the boot. Closed with no loan held — not an order inversion but its degenerate case |
+| `sprite_plan` | `None` + `TOUCHED_SINCE_DRAW`, **no owe** | The composite bracket decision, once per pass on every core. `None` is the arm the pass already takes when the sprite is down, and every window blit's `note_present_over_sprite` (lock-free) arms the repair anyway. Owing here would rebuild the P69 loop |
+| `sprite_box` | answer from `live_box_relaxed()` | Split from `sprite_plan` for this: "could this operation reach the sprite?" is answerable from the CURSOR-6 mirror with no lock, and answering `None` would be the one degradation its contract rules out — a MISSED bracket. `wm::drain_deferred` is the caller that makes it matter |
+
+### The handoff, and its bound
+
+`owe_repaint()` sets `REPAINT_OWED`; `take_present_dirty()` — already called by `wm::composite` before
+the tail is chosen — is the consumer, and all four tails end in a `repaint` when it answers `true`.
+The owed request is **exempt from CURSOR-8's `stale` test** (a context that could not take the sprite
+never observed an epoch worth comparing, and the generation has almost certainly moved *because* the
+holder was mid-cycle) but **subject to its `REPAIR_MIN_MS` rate floor**, re-armed rather than dropped.
+That is deliberate in both directions: without the exemption the repaints this arc exists to preserve
+would be suppressed; without the floor, refusals arriving from tails that run on every pass would
+reinstate CURSOR-7's ungated storm.
+
+Latency is one composite pass plus at most one 8 ms floor. On the path that matters most it is
+microseconds — `wm::close_owner` calls `composite()` on the line after its refused `repaint()`.
+
+**The honest bound.** `wm::repaint`/`wm::service_damage` both early-return when nothing is damaged, so
+on a panel with no windows and no damage the owed repaint waits for the next pointer report's own
+`repaint`. That is not silence: on such a panel nothing is painting over the arrow either.
+
+### `adopt_overlay`'s nested `OVERLAY.lock()`
+
+The audit's first disqualifier, and it is answered by construction rather than by restructuring.
+Holding the **loan** across a blocking `OVERLAY.lock()` is sound precisely because the loan is not a
+spinnable lock: `SPRITE_FREE` was released the instant `claim` returned, so nothing can be waiting on
+this context. The documented `SPRITE` → `OVERLAY` order survives in the only sense that still applies
+— this is the one place that holds the sprite while taking the overlay, and nothing takes them the
+other way round.
+
+`OVERLAY` itself is unchanged and is *not* claimed to be safe by this arc. Its blocking acquirers are
+`overlay_open` (O(1) field writes) and `adopt_overlay` (a bounded ≤`MAX_PIX` index walk, no I/O, no
+lock taken inside the hold); every other site `try_lock`s. Both holds satisfy WEDGE-7's precondition,
+and WEDGE-9 strictly improves the picture by removing the spinnable lock the nested one used to sit
+inside. **Flagged, not done: giving `OVERLAY` the masked micro-guard is a separate arc.**
+
+### Witness
+
+```
+[wedge9] sprite-claim scope=… refused=N masked=N retried=N owed=0|1 serviced=N -> QUIET|ABSORBED|DEFERRED|LOST
+```
+
+Chained off `[cursor11]`'s rollup. `masked` is the F4 population: each of those was, before this arc,
+an unpreemptible spin on a preemptible holder. **A non-zero `masked` is the mechanism being caught,
+not a fault.** `serviced` is expected far below `refused` — the flag coalesces and the floor defers;
+`LOST` (refusals with nothing ever cashed and nothing pending) is the only reading that is a defect.
+
+### Gate results (WEDGE-9, 2026-08-02, QEMU raspi4b)
+
+* `./arroyo check` — both arches green.
+* Full-knob `kernel8` (`witness,wedge2,vugpar,smp8,usbdebug,sched_demo,bootlog`) — builds.
+* `./arroyo kernel8-test 210` — **MBENCH PASS 90/90 required witnesses, 0 forbidden, 28824 lines.**
+  Cursor fixtures unchanged and green: `[wc-i] rollup … cursor_passes=350 cursor_brackets=0 -> CLEAN`,
+  `[wc-i] reopen … -> PASS`, `[wc-g] rollup win=1/2/3 … -> CLEAN`, `[cursor6] … -> UNWITNESSED`.
+  `[wedge9] sprite-claim scope=fixture refused=0 masked=0 retried=0 owed=0 serviced=0 -> QUIET`.
+* `UNAOS_WEDGE2=1 ./arroyo kernel8-test 210` — **MBENCH PASS 90/90, 0 forbidden, 31356 lines.**
+  `<D4>`=2 against exactly two `[wc-a] close_owner … closed=1` lines, i.e. the token still fires on
+  every teardown that frees a row; `<D2>`=32, `<D3>`=32 (three of them split by another core's line,
+  WEDGE-2's stated cost), `<D1>`=0, `<D!>`=0. Both `<D4>`s are followed by further output — no wedge.
+
+**What the gate cannot prove, for the same reason WEDGE-7's could not.** `timer_preempt` never runs on
+raspi4b, so no holder can be preempted and F4 cannot occur there. A clean QEMU run proves the wiring
+and the absence of regression; it is not a refutation of the mechanism, and `[wedge9] -> QUIET` on the
+gate means the population was never sampled rather than that contention is absent on metal.
+
+### Metal watch-list (WEDGE-9)
+
+* `[wedge9] masked=` climbing on a bench boot: the F4 interleave is real and is now being absorbed.
+  Read it beside `[cursor8] suppressed_rate` — if both climb together the floor is doing its job.
+* `[wedge9] -> LOST`: refusals with no grant and none pending. Means composite tails have stopped
+  running, which is a different fault; check `[wc-i] windowed_flushes` and `[comp2] passes`.
+* `<D4>` as the LAST token on a torn wire no longer implicates the sprite lock's *wait*. It still
+  names `close_owner`'s cursor bracket as the phase, but a death there is now downstream of the claim
+  — look at `refresh_locked`'s framebuffer work and at `WRITER`, not at a masked spin on `SPRITE`.

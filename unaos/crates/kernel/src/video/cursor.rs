@@ -61,8 +61,11 @@
 //! its source surface. Neither alone is sufficient; together the restore cannot leave a window's rect
 //! wrong for longer than one frame. See [`undraw_locked`] and [`repair`].
 //!
-//! Atomicity is the other half: every entry point holds the sprite lock across its whole
+//! Atomicity is the other half: every entry point holds the sprite EXCLUSIVELY across its whole
 //! restore → save → draw sequence, so two cores cannot interleave into "save captured the arrow".
+//! Since WEDGE-9 that exclusivity is a CLAIM/LOAN rather than a mutex hold — same span, but a
+//! contender is refused in O(1) instead of made to wait. See [`claim`] for the F4 death that forced
+//! the change and for each entry point's refusal policy.
 //!
 //! ### Checksum safety (CURSOR-1's hard requirement)
 //! The sprite must not perturb `[wc-c]`'s per-window checksum, `[wc-d]`'s scan-out verdict, the
@@ -156,12 +159,20 @@ fn in_any(boxes: &[(usize, usize, usize, usize)], x: usize, y: usize) -> bool {
 
 /// Sprite state. `drawn` is the only thing that decides whether `saved` means anything.
 ///
-/// **One lock, held across a whole operation.** Every public entry point takes this mutex ONCE and
+/// **One claim, held across a whole operation.** Every public entry point takes the loan ONCE and
 /// holds it for the entire restore → save → draw sequence. An earlier cut had `repaint` call
 /// `undraw` (which took and released the lock) and then re-acquire it for the save; in that gap
 /// another core could draw the sprite, the save would capture THE ARROW as "what was underneath",
 /// and the next undraw would stamp a white arrow permanently into the desktop or a window. The
-/// private `*_locked` helpers exist so the outer call can keep the guard.
+/// private `*_locked` helpers exist so the outer call can keep the loan.
+///
+/// WEDGE-9 changed WHAT is held, not FOR HOW LONG. This used to live inside `static SPRITE:
+/// Mutex<Sprite>` and the exclusivity was the mutex guard; it now lives behind [`claim`]'s loan, and
+/// the exclusivity is the loan. The atomicity argument above is untouched — the loan is exclusive for
+/// exactly the same span — but a contender is now REFUSED in O(1) instead of made to wait, which is
+/// what stops an IRQ-masked contender from waiting forever on a preempted holder. The `*_locked`
+/// suffix is kept: it still means "the caller holds exclusive access", which is the property those
+/// helpers actually require.
 struct Sprite {
     /// Whether the sprite is currently ON the panel (and `saved` holds what it covered).
     drawn: bool,
@@ -219,7 +230,12 @@ struct Sprite {
     unsupported: bool,
 }
 
-static SPRITE: Mutex<Sprite> = Mutex::new(Sprite {
+/// WEDGE-9 — the sprite state, reachable ONLY through a [`SpriteLoan`].
+///
+/// This was `static SPRITE: Mutex<Sprite>` until WEDGE-9, and every one of the nine acquisitions in
+/// this module held that mutex across its WHOLE operation — two of them bounded, seven of them not.
+/// See [`claim`] for the audit, for the death that shape admits, and for what replaced it.
+static mut SPRITE_STATE: Sprite = Sprite {
     drawn: false,
     bx: 0,
     by: 0,
@@ -231,7 +247,296 @@ static SPRITE: Mutex<Sprite> = Mutex::new(Sprite {
     pend: Bits::EMPTY,
     epoch: 0,
     unsupported: false,
-});
+};
+
+/// WEDGE-9 — the sprite's availability flag, and the ONLY lock over [`SPRITE_STATE`]. `true` = the
+/// sprite is on the shelf; `false` = it is loaned to exactly one context. Held for a masked O(1)
+/// take/put and nothing else (WEDGE-8 discipline, `drivers/xhci::claim`; MBOX-1's transposition of it
+/// in `arch/aarch64/mailbox.rs` is the closer template): the LONG work — two ≤`MAX_PIX` pixel passes
+/// against non-coherent scan-out plus a `flush_box` that cleans WHOLE PANEL SCANLINES — runs with this
+/// mutex NOT held, so no masked spinner can ever wait on it for more than a few dozen cycles and no
+/// holder of it can be preempted mid-hold.
+///
+/// The invariant is grep-checkable, the F1/WEDGE-8 idiom: `SPRITE_FREE.lock()` appears ONLY in
+/// [`claim`] and `SpriteLoan::drop`, and `SPRITE_STATE` is named ONLY by the two [`SpriteLoan`]
+/// accessors — both statics are private, so the compiler enforces the rest.
+static SPRITE_FREE: Mutex<bool> = Mutex::new(true);
+
+/// Why [`claim`] handed back no sprite. One variant only: unlike the xHCI controller the sprite is
+/// never "not yet installed" — it is a static that is live from the first instruction and whose
+/// `drawn: false` initial state is a legitimate answer, not an absence — so `Busy` is the whole
+/// failure space.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SpriteClaimError {
+    /// Another context holds the sprite right now. The claim did NOT wait: waiting is the caller's
+    /// decision, and a masked caller must not.
+    Busy,
+}
+
+/// WEDGE-9 — an exclusive loan of the sprite state.
+///
+/// Dropping it returns the sprite to the shelf — a masked O(1) put, panic-safe by RAII. `Deref`/
+/// `DerefMut` are the only two places [`SPRITE_STATE`] is named, so "no sprite access without the
+/// loan" is a compile-time property of this module rather than a comment asking readers to be careful.
+///
+/// **The loan is not a lock.** Holding it blocks nobody: a contender's [`claim`] takes `SPRITE_FREE`
+/// for a few dozen cycles, observes `false`, and returns [`SpriteClaimError::Busy`] immediately. That
+/// is what makes it safe to hold across the long pixel work, across a `flush_box`, and — see
+/// [`adopt_overlay`] — across a blocking `OVERLAY.lock()`.
+struct SpriteLoan(());
+
+impl Drop for SpriteLoan {
+    fn drop(&mut self) {
+        // WEDGE-9: masked micro-hold. Local drop order is WEDGE-7's guard field order in miniature —
+        // locals drop in REVERSE declaration order, so `guard` is released FIRST and `_mask` restores
+        // SECOND. The reverse would unmask while still holding the lock, re-opening a preemption
+        // window in the hold's tail, which is the family bug at every unlock.
+        let _mask = crate::arch::IrqMask::new();
+        let mut guard = SPRITE_FREE.lock();
+        *guard = true;
+    }
+}
+
+impl core::ops::Deref for SpriteLoan {
+    type Target = Sprite;
+    #[inline]
+    fn deref(&self) -> &Sprite {
+        // SAFETY: the loan is handed out by `claim` only while `SPRITE_FREE` held `true`, and `claim`
+        // flips it to `false` under the lock before returning — so at most one `SpriteLoan` exists at
+        // a time and this is the unique live reference to the static.
+        unsafe { &*(&raw const SPRITE_STATE) }
+    }
+}
+
+impl core::ops::DerefMut for SpriteLoan {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Sprite {
+        // SAFETY: as `deref` — the loan is the module's exclusivity token.
+        unsafe { &mut *(&raw mut SPRITE_STATE) }
+    }
+}
+
+/// WEDGE-9 — claim exclusive use of the sprite. O(1), never waits.
+///
+/// ### The death this replaces (F4, the last of the F1–F4 family)
+/// The family shape is: a masked span blocks on a lock a PREEMPTIBLE holder holds; the holder is
+/// preempted and, because the masked spinner's core cannot take a timer interrupt, never runs again;
+/// the masked core spins forever. No ABBA cycle is involved and none is needed.
+///
+/// `SPRITE` was that lock, and the audit (WEDGE-2, `be4ea433`) found nine acquisitions, all in this
+/// module, seven of them unbounded:
+///
+/// ```text
+///   bounded    sprite_plan            field copy under the lock
+///   bounded    defer_common           bitmask only; no WRITER, no flush
+///   UNBOUNDED  undraw                 undraw_locked
+///   UNBOUNDED  undraw_within          undraw_within_locked
+///   UNBOUNDED  settle_nosession       settle_pending_locked
+///   UNBOUNDED  undraw_within_nosessn  undraw_within_locked + epoch bump
+///   UNBOUNDED  ensure_drawn           draw_locked
+///   UNBOUNDED  repaint                refresh_locked — THE F4 SITE
+///   UNBOUNDED  adopt_overlay          nested BLOCKING OVERLAY.lock
+/// ```
+///
+/// The ACQUIRER side — which the WEDGE-2 audit did not enumerate — is what makes it the worst member
+/// of the family. Three chains reach this module with interrupts already masked:
+///
+/// * **EL0 task exit.** `sched::exit` masks, then `boot::teardown_user_slot` →
+///   `syscall::clear_handle_row` → `wm::close_owner`, which runs `cursor::undraw` (through `erase`),
+///   then `cursor::repaint` (the `<D4>` token's site), then a whole `composite()` pass. Every entry
+///   point in this module is reachable from it, masked.
+/// * **`SYS_WIN_PRESENT`.** `syscall::sys_win_present` takes `IrqGuard::mask_save()` and the `WINDOWS`
+///   lock, and calls `wm::present` → `composite()` inside that mask. This is the HOT one: one masked
+///   pass per window present, several windows, several cores.
+/// * **`SYS_FB_PRESENT`.** The compat twin of the above, same guard, same reach.
+///
+/// So the symptom of an F4 death is not a stalled teardown but a dead machine — the sprite gates the
+/// cursor bracket every compositor path takes, so panel, cursor and input stop together, with nothing
+/// on the wire.
+///
+/// ### Why claim/loan and not WEDGE-7's masked micro-guard
+/// WEDGE-7 (`video::wm::table`) masks ACROSS the critical section, which is affordable there because
+/// every `TABLE` hold is a bounded row scan. These are not, and the audit named three independent
+/// disqualifiers, any one sufficient: a nested BLOCKING `OVERLAY.lock()` in [`adopt_overlay`]; cache
+/// maintenance to a non-coherent device (`flush_box` cleans whole PANEL scanlines — a 36-row box on a
+/// 1920x1200 panel is ~276 KB, ~4300 lines, each `flush_rect` alternative issuing up to `h` separate
+/// `dsb sy`s); and up to `MAX_PIX` framebuffer `read_pixel`/`put_pixel` per pass against scan-out,
+/// with [`repaint`] running TWO such passes plus the union flush under ONE acquisition. Masking a core
+/// for that is the bug in another coat.
+///
+/// So the discipline goes on the LOCK, not the WORK: `SPRITE_FREE` is held for a masked O(1)
+/// take/put, the sprite is loaned out for the long work with nothing held, and contenders get an
+/// immediate honest [`SpriteClaimError::Busy`] instead of a wait. Per-caller Busy policy is stated at
+/// each entry point; the one thing none of them may do is lose a repaint silently — see
+/// [`owe_repaint`].
+fn claim() -> Result<SpriteLoan, SpriteClaimError> {
+    let _mask = crate::arch::IrqMask::new();
+    let mut guard = SPRITE_FREE.lock();
+    if *guard {
+        *guard = false;
+        Ok(SpriteLoan(()))
+    } else {
+        Err(SpriteClaimError::Busy)
+    }
+}
+
+/// WEDGE-9 — the budget [`claim_bounded`] spends, in milliseconds.
+///
+/// Derived, not chosen. The longest possible hold is one [`refresh_locked`]: two ≤`MAX_PIX` pixel
+/// passes and one `flush_box` over the union — well under a millisecond even on the bench's
+/// 1920x1200 panel. 2 ms is roughly twice that worst hold, so a retry that succeeds does so quickly
+/// and a retry that fails has genuinely met something pathological; and it is a QUARTER of
+/// [`REPAIR_MIN_MS`], the 125 Hz HID report period this module already treats as the motion bound, so
+/// a bounded retry can never stack two pointer reports on top of each other.
+const CLAIM_RETRY_MS: u64 = 2;
+
+/// WEDGE-9 — the ONE caller policy that waits at all: retry the claim, UNMASKED and bounded, for up to
+/// `budget_ms`. Used only by [`repaint`], whose refusal costs more than a log line — it is the
+/// pointer's own motion path, and a lost one is a cursor left at the previous position.
+///
+/// **Refuses to wait when IRQs are masked** (`arch::irqs_masked`, the WEDGE-8 rule), which is not a
+/// nicety here but the whole of the F4 fix: all three masked acquirer chains named in [`claim`] reach
+/// [`repaint`], and a masked waiter can neither be preempted nor take a timer interrupt, so spinning
+/// there is exactly the deadlock this model exists to prevent. A masked caller takes the immediate
+/// refusal and the [`owe_repaint`] handoff instead.
+fn claim_bounded(budget_ms: u64) -> Result<SpriteLoan, SpriteClaimError> {
+    let first = claim();
+    if first.is_ok() || crate::arch::irqs_masked() {
+        return first;
+    }
+    // No trustworthy monotonic counter on this machine: take one more O(1) attempt and accept the
+    // answer. A spin with no measurable deadline is exactly the unbounded wait this function exists
+    // to avoid, so it is never entered.
+    let Some((t0, hz)) = mono_now_hz() else {
+        return claim();
+    };
+    let budget = hz.saturating_mul(budget_ms) / 1000;
+    loop {
+        if let Ok(l) = claim() {
+            #[cfg(feature = "witness")]
+            W9_RETRIED_OK.fetch_add(1, Ordering::Relaxed);
+            return Ok(l);
+        }
+        let Some((now, _)) = mono_now_hz() else {
+            return Err(SpriteClaimError::Busy);
+        };
+        if now.wrapping_sub(t0) >= budget {
+            return Err(SpriteClaimError::Busy);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// WEDGE-9 — a whole-sprite repaint the panel is owed because a claim was refused.
+///
+/// ### Deferred damage, never silence
+/// This is the answer to the one thing a `Busy` may not do. Every refusal in this module leaves the
+/// panel in a state the module's bookkeeping no longer describes: an undraw that could not hand its
+/// pixels back is about to be painted over; a deferral that was not recorded will not be settled by
+/// its pass's tail; a repaint that did not run left the arrow at the previous position or off the
+/// glass entirely. In every one of those cases the always-correct repair is the same and has been
+/// since CURSOR-3 — a whole-sprite [`refresh_locked`] against the FINISHED front buffer, which
+/// re-establishes both the arrow and its save-under from what the panel actually holds.
+///
+/// So a refusal does not spin and does not shrug: it arms this flag, and a composite pass cashes it.
+/// [`take_present_dirty`] is the consumer — it is called by `wm::composite` before the tail is
+/// chosen, and every one of the four tails ends in a [`repaint`] when it answers `true`. The latency
+/// is one composite pass plus at most one [`REPAIR_MIN_MS`] floor (the request is RE-ARMED inside the
+/// floor, never dropped — see there for why the floor applies to this producer at all), and on the
+/// path that matters most it is microseconds: `wm::close_owner` calls `composite()` on the line after
+/// its refused `repaint()`.
+///
+/// [`TOUCHED_SINCE_DRAW`] is armed alongside, because the refusal's own premise is CURSOR-9's
+/// predicate verbatim: some painter is about to write, or has written, inside the sprite box without
+/// the module hearing about it. That is what makes the eventual [`repair`] damage the windows the
+/// colour guard's residual could have left stale.
+///
+/// **The bound, stated rather than implied.** The flag is serviced by a composite pass, and
+/// `wm::repaint`/`wm::service_damage` can both early-return when nothing is damaged — so on a panel
+/// with no windows and no damage at all the owed repaint waits for the next pointer report's own
+/// [`repaint`]. That is not silence: on such a panel nothing is painting over the arrow either, which
+/// is the same condition that makes the wait harmless. It cannot accumulate (an `AtomicBool`, not a
+/// count) and it cannot be lost (only [`take_present_dirty`] clears it, and only by granting it).
+#[cold]
+fn owe_repaint() {
+    // CURSOR-9's predicate: a painter may have taken one of our pixels without a handback. Armed
+    // first, so a consumer that observes the owed flag observes this too.
+    TOUCHED_SINCE_DRAW.store(true, Ordering::Release);
+    REPAINT_OWED.store(true, Ordering::Release);
+    #[cfg(feature = "witness")]
+    {
+        W9_REFUSED.fetch_add(1, Ordering::Relaxed);
+        if crate::arch::irqs_masked() {
+            W9_REFUSED_MASKED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// WEDGE-9 — see [`owe_repaint`]. Consumed by [`take_present_dirty`], i.e. by `wm::composite`.
+static REPAINT_OWED: AtomicBool = AtomicBool::new(false);
+
+/// WEDGE-9 — claims refused for [`SpriteClaimError::Busy`], over every entry point.
+#[cfg(feature = "witness")]
+static W9_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// WEDGE-9 — of [`W9_REFUSED`], those taken with interrupts MASKED. This is the F4 population: every
+/// one of these is a core that would have spun unpreemptibly, and silently, before this arc.
+#[cfg(feature = "witness")]
+static W9_REFUSED_MASKED: AtomicU64 = AtomicU64::new(0);
+
+/// WEDGE-9 — [`claim_bounded`] retries that succeeded inside the budget. Contention absorbed without
+/// costing a repaint; only [`repaint`] can produce these, and only when unmasked.
+#[cfg(feature = "witness")]
+static W9_RETRIED_OK: AtomicU64 = AtomicU64::new(0);
+
+/// WEDGE-9 — owed repaints actually cashed at a composite tail. Deferred, then paid.
+#[cfg(feature = "witness")]
+static W9_OWED_SERVICED: AtomicU64 = AtomicU64::new(0);
+
+/// WEDGE-9 — the claim/loan rollup, chained off `[cursor11]`'s because it is the same pass's story one
+/// layer down: `[cursor11]` says how often the arrow had to come down, this says how often a context
+/// could not even ask.
+///
+/// * **`refused`** — claims that found the sprite loaned out. Contention, not damage.
+/// * **`masked`** — of those, the ones taken with interrupts masked. Before this arc each was an
+///   unpreemptible spin on a preemptible holder, i.e. the F4 wedge itself. **This number being
+///   non-zero is the mechanism being caught, not a fault.**
+/// * **`retried`** — [`repaint`]'s bounded unmasked retries that succeeded within
+///   [`CLAIM_RETRY_MS`], costing no repaint at all.
+/// * **`owed` / `serviced`** — whether a repaint is in flight right now, and how many composite tails
+///   have paid one. `serviced` is deliberately far below `refused`: the flag coalesces, and
+///   [`take_present_dirty`]'s [`REPAIR_MIN_MS`] floor defers rather than multiplies. `owed=1` at
+///   rollup time is the flag caught in flight, not a leak.
+///
+/// `QUIET` where nothing was ever refused, which on QEMU raspi4b is the expected reading: no HID
+/// pointer report means the sprite is never drawn and most entry points return at their `!drawn`
+/// test, so the loan is rarely held long enough to be met. The gate proves the WIRING; the mechanism
+/// is metal-only for the same reason WEDGE-7 and WEDGE-2 are — `timer_preempt` never runs on
+/// raspi4b, so no holder can be preempted and F4 cannot occur there.
+#[cfg(feature = "witness")]
+pub fn wedge9_rollup(scope: &str) {
+    let refused = W9_REFUSED.load(Ordering::Relaxed);
+    let masked = W9_REFUSED_MASKED.load(Ordering::Relaxed);
+    let retried = W9_RETRIED_OK.load(Ordering::Relaxed);
+    let serviced = W9_OWED_SERVICED.load(Ordering::Relaxed);
+    let owed = REPAINT_OWED.load(Ordering::Relaxed);
+    // `serviced` is deliberately NOT expected to equal `refused`: the flag coalesces, so any number
+    // of refusals between two composite tails is one grant. The only reading that would be a fault is
+    // refusals with nothing ever cashed and nothing pending — a handoff that goes nowhere.
+    let verdict = if refused == 0 && retried == 0 {
+        "QUIET"
+    } else if refused == 0 {
+        "ABSORBED"
+    } else if serviced > 0 || owed {
+        "DEFERRED"
+    } else {
+        "LOST"
+    };
+    serial_println!(
+        "[wedge9] sprite-claim scope={} refused={} masked={} retried={} owed={} serviced={} -> {}",
+        scope, refused, masked, retried, u8::from(owed), serviced, verdict
+    );
+}
 
 /// CURSOR-5 — [`Sprite::epoch`], mirrored where a lock-free reader can see it.
 ///
@@ -869,6 +1174,10 @@ pub fn cursor11_rollup(scope: &str) {
         "[cursor11] compose-through scope={} passes={} bracketed={} px_deferred={} px_installed={} px_redrawn={} -> {}",
         scope, passes, bracketed, deferred, installed, redrawn, verdict
     );
+    // WEDGE-9 — chained here rather than given its own call site, on `[cursor8]` → `[cursor11]`'s
+    // own precedent: it is this pass's story one layer down, and one seam is easier to keep in step
+    // than two.
+    wedge9_rollup(scope);
 }
 
 // ---- FLICKER-2 witnesses -------------------------------------------------------------------------
@@ -1076,15 +1385,40 @@ pub fn note_present_over_sprite(bracketed: bool) {
 /// only be asking for the same thing, and the epoch it stored is at worst one arming stale — which
 /// [`PRESENT_DIRTY_EPOCH`] documents as the conservative direction. Nothing here spins, and nothing
 /// here can fail to make progress: every path is a bounded number of atomic operations.
+/// ### WEDGE-9 — and it is also where an OWED repaint is cashed
+/// [`REPAINT_OWED`] joins [`PRESENT_DIRTY`] as a second producer of the same grant, and the two are
+/// judged by ONE of the tests below rather than by both:
+///
+/// * **Exempt from `stale`.** That test asks "has a full sprite cycle run since the arming, so that
+///   the present this request names has already been repaired?" — a question an owed repaint cannot
+///   ask. It exists because a context could not TAKE the sprite at all, so it never observed an epoch
+///   worth comparing, and the generation it would be judged against has almost certainly moved *for
+///   the very reason the claim was refused* (the holder was mid-cycle). Suppressing on that would
+///   discard exactly the repaints this arc exists to preserve.
+/// * **Subject to `rate`, and deliberately so.** The floor is the difference between a deferral and
+///   the P69 storm. `owe_repaint` is armed from tails that run on EVERY composite pass — `defer_*`,
+///   `settle_nosession`, `ensure_drawn` — so granting each refusal outright would reinstate CURSOR-7's
+///   ungated behaviour under contention: a whole-sprite repaint per pass, whose `repair` damages the
+///   windows under the pointer, whose next composite refuses again. [`REPAIR_MIN_MS`] bounds that at
+///   the HID motion rate, and — the load-bearing half — the request is **RE-ARMED, not dropped**, so
+///   the first pass past the floor takes it. Bounded latency, never an absence.
+///
+/// The two producers are also mutually exclusive per call: an owed repaint short-circuits before
+/// `PRESENT_DIRTY` is touched, so a `PRESENT_DIRTY` arming can never be consumed by a grant it did not
+/// cause.
 pub fn take_present_dirty() -> bool {
-    if !PRESENT_DIRTY.swap(false, Ordering::AcqRel) {
+    // WEDGE-9 — the owed grant takes precedence; `PRESENT_DIRTY` is left entirely alone on that path
+    // (`&&` short-circuits), so nothing it armed is swallowed by someone else's grant.
+    let owed = REPAINT_OWED.swap(false, Ordering::AcqRel);
+    if !owed && !PRESENT_DIRTY.swap(false, Ordering::AcqRel) {
         return false;
     }
     #[cfg(feature = "witness")]
     C8_REQUESTS.fetch_add(1, Ordering::Relaxed);
 
-    // Read AFTER the flag — see `note_present_over_sprite` for the pairing.
-    if live_epoch() != PRESENT_DIRTY_EPOCH.load(Ordering::Relaxed) {
+    // Read AFTER the flag — see `note_present_over_sprite` for the pairing. WEDGE-9: skipped entirely
+    // for an owed repaint, which has no arming epoch of its own — see the doc block above.
+    if !owed && live_epoch() != PRESENT_DIRTY_EPOCH.load(Ordering::Relaxed) {
         #[cfg(feature = "witness")]
         C8_SUPPRESSED_STALE.fetch_add(1, Ordering::Relaxed);
         return false;
@@ -1100,6 +1434,9 @@ pub fn take_present_dirty() -> bool {
             {
                 C8_UNCLOCKED.fetch_add(1, Ordering::Relaxed);
                 C7_REPAIRED.fetch_add(1, Ordering::Relaxed);
+                if owed {
+                    W9_OWED_SERVICED.fetch_add(1, Ordering::Relaxed);
+                }
             }
             return true;
         }
@@ -1113,12 +1450,25 @@ pub fn take_present_dirty() -> bool {
     if last != 0 && now.wrapping_sub(last) < floor {
         #[cfg(feature = "witness")]
         C8_SUPPRESSED_RATE.fetch_add(1, Ordering::Relaxed);
-        PRESENT_DIRTY.store(true, Ordering::Release);
+        // Re-arm the producer that actually asked, never the other one.
+        if owed {
+            REPAINT_OWED.store(true, Ordering::Release);
+        } else {
+            PRESENT_DIRTY.store(true, Ordering::Release);
+        }
         return false;
     }
     LAST_REPAIR_TICKS.store(now, Ordering::Relaxed);
     #[cfg(feature = "witness")]
-    C7_REPAIRED.fetch_add(1, Ordering::Relaxed);
+    {
+        // Counted here on BOTH paths: `[cursor6] repaired=` answers "how often did the panel actually
+        // get a fresh arrow", and an owed grant produces one exactly as a present-storm repair does.
+        // `[wedge9] serviced=` is what attributes the WEDGE-9 share of it.
+        C7_REPAIRED.fetch_add(1, Ordering::Relaxed);
+        if owed {
+            W9_OWED_SERVICED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     true
 }
 
@@ -1568,10 +1918,19 @@ fn undraw_locked(
 /// which put the flush's window composite inside the bracket too and left [`sprite_plan`] answering
 /// `None` on every one of those passes. The bracket now belongs to `Screen::flush` and covers only
 /// `present_background`; the composite that follows it runs with the sprite on the panel.
+/// WEDGE-9 — **Busy policy: fail soft, hand the repaint off, never wait.** Two of this function's
+/// three callers run with interrupts masked (`wm::erase` on the EL0-exit teardown chain, and
+/// `composite_inner`'s WC-F reserved arm inside a masked present), so a wait here is the F4 death
+/// outright. A refused undraw means the caller is about to paint over sprite pixels it could not hand
+/// back — which is precisely the condition [`owe_repaint`] exists for, and the whole-sprite refresh it
+/// schedules re-establishes both the arrow and its save-under from the finished front.
 pub fn undraw() {
-    let restored = {
-        let mut sp = SPRITE.lock();
-        undraw_locked(&mut sp, None)
+    let restored = match claim() {
+        Ok(mut sp) => undraw_locked(&mut sp, None),
+        Err(_) => {
+            owe_repaint();
+            return;
+        }
     };
     repair(restored);
 }
@@ -1620,8 +1979,35 @@ pub struct Plan {
 }
 
 /// CURSOR-3 — the sprite's current geometry, or `None` when it is not on the panel.
+///
+/// WEDGE-9 — **Busy policy: fail soft to `None`, arm CURSOR-9's repair predicate, and do NOT owe a
+/// repaint.** This is the composite pass's bracket decision, taken once per pass on every core, and
+/// it runs masked on both present chains, so it may not wait. `None` routes the pass to the arm it
+/// already takes when the sprite is down: no bracket, no session, no deferral. That degradation is
+/// already covered, and covered by machinery that does not need this lock — every window blit calls
+/// `note_present_over_sprite`, which reads the lock-free [`live_box_relaxed`] mirror and arms
+/// [`PRESENT_DIRTY`], so `wm::composite`'s tail repaints the sprite anyway.
+///
+/// It deliberately does NOT call [`owe_repaint`]. A refusal here is a pass that raced a context which
+/// is *already* rebuilding the sprite, and owing a whole-sprite repaint per contended pass — several
+/// cores, once per present — would rebuild the P69 feedback loop [`REPAIR_MIN_MS`] exists to break.
+/// What it does arm is [`TOUCHED_SINCE_DRAW`], which costs nothing until the next full undraw and is
+/// exactly true: a painter in this pass may take one of our pixels with no handback recorded.
 pub fn sprite_plan() -> Option<Plan> {
-    let sp = SPRITE.lock();
+    let sp = match claim() {
+        Ok(l) => l,
+        Err(_) => {
+            TOUCHED_SINCE_DRAW.store(true, Ordering::Release);
+            #[cfg(feature = "witness")]
+            {
+                W9_REFUSED.fetch_add(1, Ordering::Relaxed);
+                if crate::arch::irqs_masked() {
+                    W9_REFUSED_MASKED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return None;
+        }
+    };
     if sp.drawn {
         Some(Plan { bx: sp.bx, by: sp.by, bw: sp.bw, bh: sp.bh, s: sp.s, epoch: sp.epoch })
     } else {
@@ -1661,11 +2047,18 @@ pub fn sprite_plan() -> Option<Plan> {
 /// to install and so cannot defer) and [`settle_pending_locked`] (the same question, asked one pass
 /// later against a finished front) both rest on. It is retained as the reference statement of that
 /// argument and as the always-correct fallback should a future pass need a handback it can pay for.
+///
+/// WEDGE-9 — **Busy policy: [`undraw`]'s, verbatim.** It has no live caller, so the policy is chosen
+/// for consistency rather than for a behaviour: were it revived it would be revived on a compositor
+/// path, which is masked on both present chains, and a masked wait is the F4 death.
 #[allow(dead_code)]
 pub fn undraw_within(boxes: &[(usize, usize, usize, usize)]) {
-    let restored = {
-        let mut sp = SPRITE.lock();
-        undraw_within_locked(&mut sp, boxes).0
+    let restored = match claim() {
+        Ok(mut sp) => undraw_within_locked(&mut sp, boxes).0,
+        Err(_) => {
+            owe_repaint();
+            return;
+        }
     };
     repair(restored);
 }
@@ -1752,9 +2145,24 @@ pub fn defer_nosession(boxes: &[(usize, usize, usize, usize)]) -> usize {
 /// CURSOR-15 — the shared deferral body of [`defer_within`] / [`defer_nosession`]. One
 /// implementation on purpose: the two entry points differ only in who owes the settle (the adopt
 /// tail vs [`settle_nosession`]), never in which pixels are deferred or how.
+///
+/// WEDGE-9 — **Busy policy: return 0 and hand the repaint off.** Both callers are inside a composite
+/// pass, i.e. masked on both present chains, so no wait is admissible. A refused deferral is worse
+/// than a missing optimisation: the pass will composite over sprite pixels with NO `pend` bit
+/// recorded, so its tail's settle has nothing to verdict and `saved` goes stale for whatever the pass
+/// takes. The whole-sprite refresh [`owe_repaint`] schedules answers both — it re-saves every pixel
+/// from the finished front. The 0 return is safe for the callers: neither reads it for control flow,
+/// and in particular the session arm still reports `Adopt`, so [`adopt_overlay`] still runs and the
+/// overlay session cannot leak.
 fn defer_common(boxes: &[(usize, usize, usize, usize)], nosession: bool) -> usize {
     let _ = nosession;
-    let mut sp = SPRITE.lock();
+    let mut sp = match claim() {
+        Ok(l) => l,
+        Err(_) => {
+            owe_repaint();
+            return 0;
+        }
+    };
     if !sp.drawn {
         return 0;
     }
@@ -1800,9 +2208,10 @@ fn defer_common(boxes: &[(usize, usize, usize, usize)], nosession: bool) -> usiz
 /// entirely, which is settlement by bracket.
 ///
 /// **"No session open" really does mean the previous owner's tail has fully retired.**
-/// [`adopt_overlay`] closes the session and settles under ONE `SPRITE` acquisition, and this
-/// function holds `SPRITE` across its probe and settle — so it can never observe the closed-but-not-
-/// yet-settled middle of an adopt. A third sessionless pass still blitting concurrently can take a
+/// [`adopt_overlay`] closes the session and settles under ONE sprite claim, and this function holds
+/// the loan across its probe and settle — so it can never observe the closed-but-not-yet-settled
+/// middle of an adopt. WEDGE-9 does not weaken that: the loan is exclusive for exactly as long as the
+/// old mutex guard was, and a contender is refused rather than admitted. A third sessionless pass still blitting concurrently can take a
 /// pixel after our read; that is the same cross-pass residual every settle has, absorbed the same
 /// way (`note_present_over_sprite` arms `TOUCHED_SINCE_DRAW`, the next full undraw's [`repair`]
 /// damages the window, and that pass's own tail re-settles the pixel — the settle is idempotent and
@@ -1811,10 +2220,23 @@ fn defer_common(boxes: &[(usize, usize, usize, usize)], nosession: bool) -> usiz
 /// A sprite that left the glass since the deferral (`!sp.drawn`) has nothing to settle: every full
 /// undraw and every draw resets `pend`, which is the same "settlement by bracket" the incoherent
 /// adopt relies on.
+///
+/// WEDGE-9 — **Busy policy: hand the repaint off.** This is a composite tail and runs masked on both
+/// present chains. A refused settle leaves this pass's `pend` bits standing, which is not a loss on
+/// its own — the bits are answered by whichever tail closes the pass, and every full undraw and every
+/// draw resets them, "settlement by bracket". What the refusal DOES leave outstanding is the reason
+/// the bits existed: pixels a painter may have taken with a stale `saved`. The owed whole-sprite
+/// refresh is that settlement in its strongest form, so nothing is lost and nothing waits.
 pub fn settle_nosession() {
     let mut unsupported_now = false;
     {
-        let mut sp = SPRITE.lock();
+        let mut sp = match claim() {
+            Ok(l) => l,
+            Err(_) => {
+                owe_repaint();
+                return;
+            }
+        };
         if sp.drawn {
             let free = match OVERLAY.try_lock() {
                 Some(g) => !g.session,
@@ -1976,14 +2398,26 @@ fn settle_pending_locked(sp: &mut Sprite, unsupported_now: &mut bool) {
 /// whose fills paint the front directly and therefore still owe the handback and the generation bump
 /// this function provides. The interleave analysis above is unchanged and still load-bearing for
 /// that caller.
+///
+/// WEDGE-9 — **Busy policy: hand the repaint off.** Its one caller is the WC-L deferred-erase drain,
+/// which runs at the head of `composite_inner` — masked on both present chains — and whose fills
+/// paint desktop colour DIRECTLY over whatever the boxes hold. A refusal therefore means the arrow is
+/// about to be erased with no handback and no generation bump, which is the one case in this module
+/// where the panel would otherwise simply lose the cursor with nothing to notice. [`owe_repaint`] is
+/// the whole answer: the same pass's tail cashes it, so the arrow is back within one composite.
 pub fn undraw_within_nosession(boxes: &[(usize, usize, usize, usize)]) {
-    let restored = {
-        let mut sp = SPRITE.lock();
-        let (restored, handed_back) = undraw_within_locked(&mut sp, boxes);
-        if handed_back > 0 {
-            bump_epoch(&mut sp);
+    let restored = match claim() {
+        Ok(mut sp) => {
+            let (restored, handed_back) = undraw_within_locked(&mut sp, boxes);
+            if handed_back > 0 {
+                bump_epoch(&mut sp);
+            }
+            restored
         }
-        restored
+        Err(_) => {
+            owe_repaint();
+            return;
+        }
     };
     repair(restored);
 }
@@ -2084,8 +2518,39 @@ fn undraw_within_locked(
 /// uses it only to answer "could this pass touch the sprite?", and a stale answer degrades to an
 /// unnecessary bracket (the pre-WC-I behaviour), never to a missed one — a sprite that MOVED between
 /// this read and the draw was moved by `repaint`, which redraws it on top afterwards.
+///
+/// WEDGE-9 — **Busy policy: answer from the lock-free mirror, which is CONSERVATIVE and is exactly
+/// what this function's contract already promises.** This no longer delegates to [`sprite_plan`], and
+/// the split is the point: `sprite_plan` must answer `None` on a refusal because a `Plan` carries a
+/// generation and a block scale the mirror does not have, but *this* question — "could this operation
+/// reach the sprite?" — is answerable from [`live_box_relaxed`] with no lock at all, and answering it
+/// `None` would be the one degradation the doc above rules out (a MISSED bracket).
+///
+/// The caller that makes this matter is `wm::drain_deferred`: a `None` there means the deferred-erase
+/// fills paint desktop colour straight over a live arrow with no handback and nothing to hear about
+/// it — the arrow simply disappears until the next pointer report, and a parked pointer sends none.
+/// The mirror says "yes, there is a sprite here", the drain takes `undraw_within_nosession`, and that
+/// function's own Busy policy ([`owe_repaint`]) closes the case.
 pub fn sprite_box() -> Option<(usize, usize, usize, usize)> {
-    sprite_plan().map(|p| (p.bx, p.by, p.bw, p.bh))
+    match claim() {
+        Ok(sp) => {
+            if sp.drawn {
+                Some((sp.bx, sp.by, sp.bw, sp.bh))
+            } else {
+                None
+            }
+        }
+        Err(_) => {
+            #[cfg(feature = "witness")]
+            {
+                W9_REFUSED.fetch_add(1, Ordering::Relaxed);
+                if crate::arch::irqs_masked() {
+                    W9_REFUSED_MASKED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            live_box_relaxed()
+        }
+    }
 }
 
 /// WC-I — put the sprite on the panel if it is not already there, and do nothing at all if it is.
@@ -2095,11 +2560,22 @@ pub fn sprite_box() -> Option<(usize, usize, usize, usize)> {
 /// whereas this is one lock acquisition and a boolean test in the common case. The case where it does
 /// work is the one that needs it: `wm::erase` takes the sprite down and leaves it to the composite
 /// that follows to put it back.
+///
+/// WEDGE-9 — **Busy policy: hand the repaint off.** This is the `Untouched` composite tail, masked on
+/// both present chains. Its whole job is "make sure the arrow is on the panel", and a refusal means it
+/// could not check — so the panel may be carrying `wm::erase`'s desktop fill where the cursor should
+/// be. The owed repaint is a strictly stronger form of the same duty, taken one pass later.
 pub fn ensure_drawn() {
     let mut armed_at: Option<(i32, i32)> = None;
     let mut unsupported_now = false;
     {
-        let mut sp = SPRITE.lock();
+        let mut sp = match claim() {
+            Ok(l) => l,
+            Err(_) => {
+                owe_repaint();
+                return;
+            }
+        };
         if sp.drawn || sp.unsupported || !crate::pal::cursor::visible() {
             return;
         }
@@ -2122,12 +2598,39 @@ pub fn ensure_drawn() {
 /// sequence is atomic against another core doing the same thing. Silently does nothing while the
 /// pointer is hidden ([`crate::pal::cursor::visible`]): before the first pointer report of the boot,
 /// and again ~1.5 s after the last one.
+///
+/// ## WEDGE-9 — THE F4 SITE, and the one entry point whose Busy policy is split by caller
+///
+/// This is where the family's worst death lived. `wm::close_owner` calls it on EVERY EL0 task exit,
+/// from a chain `sched::exit` has already IRQ-masked, and the `<D4>` token in `wm.rs` sits immediately
+/// before it precisely so a wire that ends there names this lock rather than `TABLE`. The other two
+/// masked chains — `SYS_WIN_PRESENT` and `SYS_FB_PRESENT`, both holding `IrqGuard` and `WINDOWS` —
+/// reach it through all four `composite` tails.
+///
+/// **Masked callers never wait.** [`claim_bounded`] refuses to spin when `arch::irqs_masked()`, which
+/// is the entire F4 fix: a masked core that cannot be preempted and cannot take a timer interrupt
+/// must not block on a lock a preemptible holder may be holding.
+///
+/// **Unmasked callers retry, briefly and boundedly.** The render task's `Screen::flush` bracket, the
+/// HID router's motion repaint, `wm::move_to`/`wm::close`, and the composite tails reached from those
+/// are all preemptible, so a short spin there is free of the family hazard — the holder can run. The
+/// budget is [`CLAIM_RETRY_MS`], derived there against the worst single hold and against the HID
+/// report period.
+///
+/// **And neither ever loses the repaint.** A refusal that survives the retry (or is taken masked,
+/// where no retry is attempted at all) calls [`owe_repaint`], which hands a whole-sprite refresh to
+/// the next composite tail. On the path that matters most that tail is immediate: `close_owner` runs
+/// `composite()` on the line after this call. The cursor may be one pass late; it is never silently
+/// gone.
 pub fn repaint() {
     let mut armed_at: Option<(i32, i32)> = None;
     let mut unsupported_now = false;
-    let restored = {
-        let mut sp = SPRITE.lock();
-        refresh_locked(&mut sp, &mut armed_at, &mut unsupported_now)
+    let restored = match claim_bounded(CLAIM_RETRY_MS) {
+        Ok(mut sp) => refresh_locked(&mut sp, &mut armed_at, &mut unsupported_now),
+        Err(_) => {
+            owe_repaint();
+            return;
+        }
     };
     // Serial output happens with the sprite lock RELEASED: on a build where fbcon is still attached
     // `serial_println!` paints the framebuffer mirror, which is another writer to the panel — one
@@ -2270,7 +2773,7 @@ pub struct Composed {
     pub mismatch: bool,
 }
 
-/// CURSOR-3 — the published plan. Separate from [`SPRITE`] on purpose: [`compose_into`] runs from
+/// CURSOR-3 — the published plan. Separate from [`SPRITE_STATE`] on purpose: [`compose_into`] runs from
 /// inside `wm`'s `BlitGuard` window, and F4's drain barrier spins IRQ-masked until every registered
 /// blit retires. A `lock()` there would put a second blocking wait into that termination argument.
 /// This one is only ever `try_lock`ed from that side — the same discipline, and for the same reason,
@@ -2570,8 +3073,51 @@ pub fn adopt_overlay() {
     // retire it. Reading it without clearing would make one dropped clear poison every later pass;
     // clearing it without reading would lose the only evidence the pass produced.
     let uncover_lost = UNCOVER_LOST.swap(false, Ordering::Relaxed);
+    let mut sp = match claim() {
+        Ok(l) => l,
+        Err(_) => {
+            // WEDGE-9 — **Busy policy: CLOSE THE SESSION ANYWAY, then hand the repaint off.** The
+            // refusal may not be a plain return, and that is the one thing about this site that is
+            // not shared with the others: this function is the ONLY closer of the overlay session,
+            // and a session that outlived its pass would lock the whole overlay mechanism out for the
+            // rest of the boot (see `overlay_open`). So the session is closed here, with no loan held
+            // at all — which is not an inversion of the `SPRITE` → `OVERLAY` order but its
+            // degenerate case, since nothing of ours is held.
+            //
+            // Discarding the coverage install costs one frame and is the fallback this arc already
+            // trusts everywhere: the covered pixels' `saved` stays pre-present, so the owed refresh's
+            // undraw may put one stale frame back before its draw re-saves from the finished front,
+            // and [`repair`] damages the windows it reached. That is CURSOR-9's documented residual,
+            // absorbed by CURSOR-9's machinery.
+            {
+                let mut ov = OVERLAY.lock();
+                ov.session = false;
+                ov.covered.reset();
+            }
+            owe_repaint();
+            return;
+        }
+    };
     let restored = {
-        let mut sp = SPRITE.lock();
+        // WEDGE-9 — the `OVERLAY.lock()` below is a BLOCKING acquisition taken while this function
+        // holds the sprite LOAN, and that is admissible where it was not admissible before. The
+        // WEDGE-2 audit named this nesting as the first of three disqualifiers for WEDGE-7's masked
+        // micro-guard: masking `SPRITE` across the section would have put a masked spinner on
+        // `OVERLAY`, reproducing the family shape one level down. Under claim/loan there is no such
+        // spinner, because **the loan is not a spinnable lock** — `SPRITE_FREE` was released the
+        // instant [`claim`] returned, and a contender's claim takes it, reads `false` and answers
+        // `Busy` in a few dozen cycles. Nothing can be waiting on us here. The documented order
+        // `SPRITE` → `OVERLAY` is preserved in the only sense that survives the change: this is the
+        // only place that holds the sprite while taking the overlay, and nothing takes them the other
+        // way round.
+        //
+        // What the loan does NOT excuse is the acquisition itself. `OVERLAY`'s blocking acquirers are
+        // `overlay_open` (O(1) field writes) and this one (a bounded ≤`MAX_PIX` index walk over two
+        // arrays, no I/O, and no lock taken inside the hold); every other site `try_lock`s. Both
+        // holds are bounded and neither can block on anything while held — the WEDGE-7 precondition —
+        // and WEDGE-9 strictly improves the picture by removing the spinnable lock this one used to
+        // be nested inside. Giving `OVERLAY` the masked micro-guard as well is a separate arc's work
+        // and is flagged rather than done here.
         // CURSOR-4 — the session closes here, unconditionally, whatever the pass managed. `composite`
         // routes every exit through its tail, so this is the one place that can release it, and a
         // session that outlived its pass would lock the mechanism out for the rest of the boot.
@@ -2675,6 +3221,12 @@ pub fn adopt_overlay() {
             refresh_locked(&mut sp, &mut armed_at, &mut unsupported_now)
         }
     };
+    // WEDGE-9 — the loan is returned EXPLICITLY here, where the enclosing block used to end the
+    // mutex's scope, and for the reason `repaint` states: on a build with fbcon still attached
+    // `serial_println!` paints the framebuffer mirror, so the lines below are another writer to the
+    // panel and must not run with the sprite loaned. `repair` needs it released too — it takes
+    // `TABLE`, and `SPRITE` → `TABLE` is the documented order.
+    drop(sp);
     if unsupported_now && !UNSUPPORTED_REPORTED.swap(true, Ordering::Relaxed) {
         serial_println!("[cursor] disabled: panel format has no read-back inverse");
     }

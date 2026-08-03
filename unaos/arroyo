@@ -1386,6 +1386,34 @@ kernel8() {
         K8_FEATS="${K8_FEATS},v3d_deep,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_DEEP: the slow banked-verdict V3D probes (v3d48 ladder / v3d59 frameclose / v3d58 rerender) — adds ~3.5 s to an armed boot${COLOR_RESET}"
     fi
+    # V3D75A-GATE: UNAOS_V3D_QPU=1 adds the `v3d_qpu` feature — the arming switch for the
+    # `SET_ENABLE_QPU` (0x00030012) mailbox sends. That tag permanently WEDGES the VideoCore mailbox on
+    # Pi 4 metal: every later NOTIFY_XHCI_RESET fails and USB is dead for the rest of the boot. Its
+    # verdict is banked negative twice (P86 doorbell-waiting, and the [v3d81q] reply-less re-read), so
+    # the send has nothing left to teach. OFF (default) both send sites — [v3d75a]'s doorbell-waiting
+    # one and [v3d81q]'s reply-less one — print one `SET_ENABLE_QPU SKIPPED — qpu-gate off …` line and
+    # send nothing, which is what makes UNAOS_V3D_DEEP=1 non-destructive. Implies NOTHING on purpose:
+    # both sites ride the deep battery, so this knob only has an effect alongside UNAOS_V3D_DEEP and
+    # arming it on its own changes no behaviour. ⚠ an armed boot loses USB from the send onward.
+    if [ -n "${UNAOS_V3D_QPU:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_qpu"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_QPU: ARM the SET_ENABLE_QPU sends ([v3d75a] + [v3d81q]) — ⚠ wedges the VC mailbox and kills USB for the boot; inert without UNAOS_V3D_DEEP${COLOR_RESET}"
+    fi
+    # V3D80-GATE: UNAOS_V3D_DISPDONE=1 adds the `v3d_dispdone` feature — the arming switch for the
+    # `NOTIFY_DISPLAY_DONE` (0x00030066) mailbox sends. That tag is vc4's probe-time handover and it does
+    # what it says: the firmware display driver STOPS and the panel goes BLACK for the rest of the boot,
+    # by design. Its verdict is now BANKED (boot pi4-r23s1x/boot3: core+0x68 0x00010001 unchanged across
+    # the handover, pre == post, working-part ref 0x3), so the handover does not move the wedge signature
+    # and has nothing left to teach. OFF (default) both send sites — [v3d80]'s doorbell-waiting one and
+    # [v3d81d]'s reply-less one — print one `NOTIFY_DISPLAY_DONE SKIPPED — dispdone-gate off …` line and
+    # send nothing, which is what lets a deep boot keep its panel. Implies NOTHING on purpose: both sites
+    # ride the deep battery, so this knob only has an effect alongside UNAOS_V3D_DEEP and arming it on
+    # its own changes no behaviour. ⚠ an armed boot loses the panel from the send onward; serial is
+    # unaffected and carries the whole verdict.
+    if [ -n "${UNAOS_V3D_DISPDONE:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_dispdone"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_DISPDONE: ARM the NOTIFY_DISPLAY_DONE sends ([v3d80] + [v3d81d]) — ⚠ stops the firmware display driver and blacks the panel for the boot; inert without UNAOS_V3D_DEEP${COLOR_RESET}"
+    fi
     # PI-V3D-69: UNAOS_V3D69_REENABLE=1 adds the `v3d69_reenable` (+`v3d_deep`,+`v3d`) features — the
     # WRITE half of the initialisation-diff arc. The READ half (the `[v3d69] fabric` stations: PM_GRAFX,
     # both V3D async-AXI-bridge control words in both candidate ASB blocks, V3D_MMUC_CONTROL) rides
