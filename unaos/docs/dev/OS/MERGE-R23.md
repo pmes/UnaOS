@@ -33,8 +33,15 @@ extended by that seat.
 - x86 sysret scrub: ring-3 stubs under-declare clobbers (`r10` declared once tree-wide) — live
   UB, x86 seat's. aarch64 twin audit queued (no eret GPR scrub exists there; hardening review).
 - `[v3d55]` tilestate poison-vs-nonzero instrument bug (rung 0 of the V3D R-ladder, v3d.md §49).
-- CBW/IOC history questions (did CBW-FAULT fire on metal; was no-IOC measured or inherited;
-  does masked-span depend on the CBW not being awaited) — answered from capture archive, owed.
+- CBW/IOC history questions — **ANSWERED and folded** (x86 seat, 2026-08-03,
+  `07_USB_STORAGE/usb_xhci.md` §17.9). CBW-FAULT has never fired on any rig; no-IOC was inherited
+  from the original stack and re-asserted twice on spec reasoning, never measured, and §17.1's A/B
+  (the only one in the history) convicted it; masked-span does **not** depend on the CBW being
+  unawaited (family-doc invariants are lock-shaped, the three WEDGE diffs touch no cbw/ioc lines,
+  and `block.rs:61` already sizes its bounded retry against the awaited-CBW 25 s hold).
+  **Residual open, pi seat's:** the awaited-CBW architecture is unverified on Pi silicon — every pi
+  `cbw_fault=0` in the archive reads `n=0 storage_slot=0` and is vacuous. Discriminator: a pi metal
+  boot with `storage_slot != 0` and BOT traffic to `n > 0`, SUMMARY captured.
 - kernel8 cross-commit byte-identity is NOT currently a valid instrument (1410-byte diff on an
   x86-confined source change; clean-dirs reproducibility discriminator queued).
 - **Trunk 47f955a3 does not compile x86 under `witness`** (x86 seat, post-landing): two more

@@ -392,11 +392,39 @@ unsafe fn put_px(surf: *mut u8, x: i32, y: i32, color: u32) {
     (surf.add(off) as *mut u32).write_volatile(color);
 }
 
+/// Fill a rectangle, CLAMPED TO THE SURFACE BEFORE THE LOOP RUNS.
+///
+/// The clamp is the loop bound — that is the whole point, not a tidiness pass. With `while y < y0 + h`
+/// the row bound was an unclamped runtime value, and LLVM compiled the row loop to a rotated
+/// `do {} while (y != y0 + h)` over a 64-bit induction variable with no zero-trip guard, while the
+/// `put_px` bounds check inlined beside it stayed 32-bit (`leal`/`orl`/`testl $0xffffff80`). Those two
+/// widths disagree: every row congruent to 0 mod 2^32 passes a 32-bit guard, so an unreachable bound
+/// meant ~2^64 iterations stepping the row pointer 512 B at a time, every store suppressed until the
+/// counter wrapped and exactly one landed at `surf + 2^41`.
+///
+/// Clamping first is what bounds it. `ye` can never exceed `SH`, so the bound is always reachable and
+/// the trip count is bounded by the surface. What the compiler actually emits (verified by disassembly,
+/// not assumed): the exit test is STILL `cmpq`/`jne`, but it is now preceded by a signed zero-trip
+/// guard — `cmpl %ye, %ys; jge <past the loop>` — because `ys > ye` is possible (a negative `h`, a rect
+/// entirely below the surface) and the loop is therefore not provably non-empty. With `0 <= ys < ye <=
+/// SH` established before entry, both bounds are zero-extended to 64-bit from values proven in range,
+/// so the counter cannot outrun the bound and the 32-bit guard beside it can no longer disagree with
+/// the 64-bit pointer.
+///
+/// NOTE the residue: `put_px`'s guard is still a 32-bit test. This clamp bounds the trip count; it does
+/// not widen that guard. Anything that corrupts the counter MID-loop is outside what this can catch.
+///
+/// `put_px` keeps its own guard. It is now redundant for every call arriving through here, which is
+/// the intent: belt and braces, and it still guards the callers that plot points directly.
 unsafe fn fill_rect(surf: *mut u8, x0: i32, y0: i32, w: i32, h: i32, color: u32) {
-    let mut y = y0;
-    while y < y0 + h {
-        let mut x = x0;
-        while x < x0 + w {
+    let xs = x0.max(0);
+    let ys = y0.max(0);
+    let xe = x0.saturating_add(w).min(SW);
+    let ye = y0.saturating_add(h).min(SH);
+    let mut y = ys;
+    while y < ye {
+        let mut x = xs;
+        while x < xe {
             put_px(surf, x, y, color);
             x += 1;
         }

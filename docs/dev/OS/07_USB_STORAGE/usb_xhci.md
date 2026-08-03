@@ -3149,6 +3149,30 @@ Worked cost of one reservation on a 32 KiB-cluster volume (3 clusters for 66048 
 | *(pre-FRWRITE)* first flush pad to `RESERVE_BYTES` | 129 READ(10) + 129 WRITE(10) |
 | **total** | **≈730** |
 
+> **SUPERSEDED (2026-08-03, BOT-CBW).** The paragraph below rests on the CBW carrying no IOC. That
+> premise was **convicted on metal** — see
+> [§17](#17-bot-cbw--the-straddle-convicted-and-the-cbw-becomes-a-stage-2026-07-30) for the A/B that
+> did it, §16.3 for the source audit that preceded it, and
+> [§17.9](#179-provenance-of-the-no-ioc-position-and-what-is-still-owed) for where the premise came
+> from. `bot_transfer_once` now pushes the CBW with `control: (1 << 10) | (1 << 5)` — Normal **plus
+> IOC** — rings its own doorbell for it and pumps it to completion before the data stage is *built*,
+> so the CBW is a first-class awaited stage.
+>
+> **The count is three, not two**, on any transaction that carries data: CBW, data, CSW. (A
+> zero-length transaction — `data_len == 0`, e.g. TEST UNIT READY — awaits two, CBW and CSW; the
+> data stage is guarded on `data_len > 0`.) Every row of this section's ≈730-transaction table is a
+> single-sector READ(10) or WRITE(10) and therefore carries a data stage, so against **this
+> section's own numbers** the reservation is **≈2190 pump waits**, not ≈1460. Only the multiplier
+> moves: the ≈730 transaction count, the 512-byte-per-transaction ceiling and M1's shape are all
+> untouched, and the paragraph's closing point — that the roadmap's mental model of 1 is off by
+> three orders of magnitude — holds a fortiori.
+>
+> **Two limits on quoting ≈2190.** It is arithmetic, not a measurement: no capture counts the pump
+> waits of a whole reservation. And it re-prices the *pre-MULTIBLK* model this section froze —
+> §12.5 item 3 removed ~258 of the ~730, and §13 replaced the single-sector geometry outright
+> (§12.6: "drops from ~730 transactions to single digits"). ≈2190 is what §12's model implies once
+> the CBW is awaited; it is not today's cost.
+
 Each transaction awaits **two** Transfer Events (data stage, then CSW — the CBW TRB carries no
 IOC and is fire-and-forget), so the reservation is **≈1460 pump waits**. The roadmap's mental
 model was 1. The real number is three orders of magnitude larger.
@@ -3186,6 +3210,10 @@ not 470 chained waits.
 ### 12.3 The mechanism, named
 
 Two separate things, and they must not be conflated:
+
+> **FIGURE SUPERSEDED (2026-08-03, BOT-CBW).** `~1460` below is §12.1's figure and inherits its
+> correction: with the CBW awaited the same ≈730 transactions cost **≈2190** awaited completion
+> events. The amplification argument is unaffected — it is strengthened.
 
 **(M1) Transaction amplification — why it is always the FR write that dies.** The write path
 issues ~1460 awaited completion events to lay down 64 KiB. On QEMU each costs microseconds and
@@ -3758,6 +3786,17 @@ that hammers a stalled endpoint is exactly what would step in these traps.
    be wrong in two independent ways. The refusal threshold of 14 is not endangered by two — the
    correction is to the argument, not to the number — but no later reasoning may cite the premise.
    See [§16.3](#163-the-by-construction-premise-in-144-item-1-is-false-in-the-source).
+
+   > **SUPERSEDED (2026-08-03, BOT-CBW) — the correction above is itself now historical, and the
+   > bolded premise it corrected is TRUE AGAIN.** The ONSET correction describes the source as it
+   > stood at `0825ed08`. Since BOT-CBW the CBW is pushed with `control: (1 << 10) | (1 << 5)`
+   > (Normal | IOC), rings its own doorbell and is pumped to completion before the data stage is
+   > built, so **at most one TRB is outstanding** — by construction in the source, not merely in the
+   > argument. See [§17.3](#173-the-mechanism). Read the correction as: the premise was false when
+   > §14.4 was written, and asserting it without checking is what the audit caught. Its standing
+   > instruction ("no later reasoning may cite the premise") is **lifted for the current source**
+   > and **retained for any capture predating 2026-07-30** — those boots really did run two TDs
+   > under one doorbell, and §16.0's provenance rule applies to them.
 
    **GUARD-STATE correction (2026-07-29).** That "by construction" argument was wrong on real
    silicon, and §14.5 below retracts the claim it supported. `bot_ring_guard` compared our live
@@ -4420,6 +4459,17 @@ calls `run_bot_stage` **twice** per transaction — the data stage (`mod.rs:5380
 transactions" is ~109 transactions / 218 awaited stages.** Halve any transaction count derived from
 `n=`, and read `mean=` as per-stage, not per-transaction.
 
+> **SUPERSEDED FOR POST-2026-07-30 CAPTURES (BOT-CBW).** The two paragraphs above are correct for
+> **this file's boots A–G and every capture predating BOT-CBW**, and they stay as the reading key
+> for them. They are wrong for anything newer. Since
+> [§17](#17-bot-cbw--the-straddle-convicted-and-the-cbw-becomes-a-stage-2026-07-30),
+> `bot_transfer_once` calls `run_bot_stage` **three** times on a data-carrying transaction — CBW,
+> data, CSW — so the divisor is **3, not 2** (a `data_len == 0` transaction still awaits two). The
+> rule generalises to: **divide `n=` by the stage count of the build that produced the log, and date
+> the build from the KNOBS line** — `cbw=always-awaited` means three, `botcbwioc=off-cbw-unawaited`
+> means two (§17.7). `mean=` remains per-stage in every build. The `single=`/`multi=` cross-check
+> this section used (99 + 10 = 109 data stages, × 2 = 218) still works, with ×3 in place of ×2.
+
 **Line-number citations into `mod.rs`/`ring.rs` are as of `0825ed08`** and have already drifted:
 M1a landed against the same files after this read (§16.12). Cite them as of that commit, not as of
 tip.
@@ -4614,6 +4664,15 @@ histogram in [§16.10](#1610-what-the-next-metal-boot-must-be-able-to-print) ite
 stages), roughly 3–8× a fully serialised BOT transaction's floor — not the two-to-three orders of
 magnitude §14.8 item 2 claimed. It remains a throughput ceiling worth removing; it is no longer a
 reason to hunt a host stall.
+
+> **SUPERSEDED (2026-08-03, BOT-CBW + BOOTPACE M3).** The parenthetical "(two awaited stages)"
+> is the no-IOC premise, and it holds only for the pre-BOT-CBW boots this section reads. Under
+> [§17](#17-bot-cbw--the-straddle-convicted-and-the-cbw-becomes-a-stage-2026-07-30) a data-carrying
+> transaction awaits **three** stages. The per-stage measurement above (0.94–1.9 ms, one to two
+> 1 kHz ticks) is what this capture supports and is unchanged; only the multiplier that turns it
+> into a per-transaction figure moves. §17.4's original per-transaction projection was then itself
+> revised by BOOTPACE M3's spin-then-halt pumps — see §17.4's addendum and §17.8 item 4. Do not
+> quote ~1.9–3.4 ms as a current per-transaction cost on either count.
 
 ### 16.7 `cfgep_cc=19` closed — a sequencing defect of ours
 
@@ -5129,6 +5188,72 @@ pair, the CBW await is the only thing left that changed.
    result: it would say completions are genuinely arriving later than 200 µs, i.e. the tick was
    never the dominant cost and something else is. That is a finding, not a failure — but it must be
    reported rather than explained away.
+
+### 17.9 Provenance of the no-IOC position, and what is still owed
+
+Added 2026-08-03, after an archive sweep run from the pi4 seat answered three standing questions
+about where the fire-and-forget premise came from. It is recorded here because the premise outlived
+its own evidence by a wide margin, and because §12.1 derived a headline number from it for a week
+after §17 convicted it.
+
+**The position was inherited, and it was never measured.** *(read-from-git)* The no-IOC CBW push
+(`Trb { parameter: cbw_phys, status: 31, control: 1 << 10 }`) traces back through
+`git log -S'control: 1 << 10 }'` to `8c25f448` ("USB stack work") and `fa82b728` ("Phase 1: Local
+APIC + xHCI MSI-X"). Neither commit carries a measurement. The justification the source carried was
+the bare assertion the current comment quotes back at itself — "the CBW is fire-and-forget (the
+device consumes it before it can respond)".
+
+**It was then re-asserted twice, on spec reasoning alone.** *(read-from-git)* `52382e22` (CBW-FAULT,
+2026-07-30) and its re-derivation `c3947e22` (BOT-PHASE, 2026-08-01, which reached trunk) both argue
+the missing IOC is deliberate, from xHCI 1.2 §4.10.2 (an error terminates a TD and posts a Transfer
+Event irrespective of IOC) plus a cost argument (one wasted event and MSI per transaction). Both
+arguments are a priori. `52382e22`'s gate is QEMU only, with `kernel8-test` — the pi target —
+blocked on the host; `c3947e22`'s gate is `./arroyo check` green on both arches and nothing else. So
+the position reached the shared trunk on a type-check, carrying zero runtime evidence.
+
+**The only A/B in the project's history is §17.1's, and it convicted the position.** *(read-from-git)*
+`efa52ebe` / `dfa570f0` are the sole controlled comparison anywhere in the log: same tree
+(`46f8f37e`), one variable, both boots forced onto the flight recorder's RESERVATION path, both at
+ring 16, both carrying the ONSET-3 hardening — `n=1108 timeouts=0` awaited against `n=737
+timeouts=3` unawaited, with `wrap_push=` within 2.5% across the pair so the failing boot was not the
+more exposed one.
+
+**The two seats re-derived the question independently and blind.** *(read-from-git)*
+`git merge-base --is-ancestor efa52ebe 52382e22` reports not-an-ancestor; the merge base is
+`0825ed08` (2026-07-29), and `git branch --contains` places the two commits on two different
+worktree branches. They are ~8 hours apart on the same day. The pi seat re-asserted no-IOC while the
+disproving A/B already existed on a branch it could not see. This is a provenance fact about the
+argument, not a criticism of either seat: it is why the premise survived a re-derivation that looked
+like independent confirmation and was not one.
+
+**The narrow spec claim was never refuted, and is still true.** *(read-from-git)* An error does post
+a Transfer Event irrespective of IOC. What the a-priori argument missed is the *straddle* (§17.3) —
+two TDs outstanding on one endpoint under one doorbell, across a Link — which is about phase
+synchronisation, not about error visibility. `mod.rs`'s comment at the CBW-FAULT claim arm records
+this reconciliation, and the counter's own doc-comment states that `cbw_fault=0` does not mean no
+CBW failed.
+
+**x86 metal evidence for the awaited architecture.** *(booted-capture)* Beyond §17.1's A/B, the
+trunk-unification boot `rmbp-s66-cand444` ran the awaited-CBW path clean on the 2012 rMBP:
+`n=100 timeouts=0 undrained=0 cbw_fault=0` with `storage_slot=1` — a real denominator, i.e. BOT
+transactions actually ran.
+
+**What is still owed: the same reading on Pi hardware.** *(booted-capture)* The archive sweep found
+`cbw_fault=` on a real SUMMARY line in exactly three capture files; the only pi one
+(`capture/pi4-r23s1x/ttyACM0.log`, two occurrences) reads
+`n=0 storage_slot=0 db_in=0 db_out=0 cbw_fault=0`. **Those readings are vacuous, not passing** — no
+BOT transaction ran on that boot, so the zero is the absence of a measurement, not a clean one. No
+pi capture in the archive carries a BOT pump SUMMARY with `n>0`, and the firing line
+`:: BOT: cbw fault … ::` has never appeared on any rig. The awaited-CBW architecture is therefore
+compiled and QEMU-green on aarch64 but **unverified on Pi silicon**.
+
+> **Discriminator, queued for the pi seat.** A Pi 4 metal boot with USB storage enumerated
+> (`storage_slot != 0`) driving BOT traffic to `n > 0` — the flight-recorder reservation path or FAT
+> traffic on the `Usb` source — with the `:: BOT: pump … result=SUMMARY ::` line captured. Until
+> such a boot exists, "the awaited CBW is correct on pi" and "CBW-FAULT is clean on pi" are both
+> unsupported in either direction. A second, independent gap: `cbw_fault` has no non-zero reading on
+> any rig, so the safety net itself is untested code — that one needs a deliberate CBW-error
+> injection or a STALLing device, on either rig.
 
 ---
 
