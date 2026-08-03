@@ -60,3 +60,10 @@ extended by that seat.
   gating needs the kepler knob set (`UNAOS_IVB/KEPLER/KEPLER_TAKEOVER/KEPLER_FIFO/SMC`), not
   `UNAOS_WC` alone. pi activation is default-path (metal-proven).
 - No QEMU suite on an unchanged tree — `mbench.py --replay` the existing capture.
+- **Vacuous-zero law**: a zero from a counter whose subject never ran is vacuous, not passing —
+  every zero-anomaly verdict must be qualified on evidence the subject ran at all (e.g. a
+  `cbw_fault=0` claim requires `n>0 storage_slot!=0` beside it, and the capture should carry the
+  self-describing knob line, e.g. `cbw=always-awaited`). Round examples of the class: the pi
+  WEDGE boots' cbw_fault=0 with n=0; a waker conf written but never started; a strings probe
+  reading 0 because the binary wasn't on the probed path. Positive controls or run-evidence,
+  always.
