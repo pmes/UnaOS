@@ -7621,3 +7621,60 @@ Both host branches of `make-pi-img.sh` carry the pair: Darwin `cp`s it into the 
 in a scratch dir and copied in explicitly — `make-pi-img.sh` never mutates the staging directory it is
 handed. `UNAOS_SRC_ROOT` overrides the source tree, which otherwise resolves to the repo root two levels
 above the script.
+
+## PI-NOBM — the `pi`-without-`baremetal` feature combo is unsupported (verdict: **unreachable**)
+
+An open question carried over from the x86 seat: `UNAOS_PI=1 ./arroyo check` fails the aarch64 leg with
+18 errors, all variations of "cannot find `sched` in `arch`". This section records the investigation and
+the decision **not** to change the gate.
+
+### What the gate actually says
+
+`crates/kernel/src/arch/aarch64/mod.rs` compiles the kernel-thread scheduler under:
+
+```rust
+#[cfg(any(
+    feature = "baremetal",
+    all(target_arch = "aarch64", not(feature = "pi"), not(feature = "tegra")),
+    all(target_arch = "aarch64", feature = "tegra")
+))]
+pub mod sched;
+```
+
+Three aarch64 configurations get `sched`: anything `baremetal` (the Pi 4 metal path), the QEMU `virt`
+path (neither `pi` nor `tegra`), and the Orin `tegra` path. The fourth — `pi` **without** `baremetal` —
+is the one combination the `not(feature = "pi")` arm deliberately excludes. Its unconditional consumers
+(`selftest.rs`, `shell.rs`, and the aarch64 `mod.rs` re-export) then fail to resolve, which is the whole
+of the 18-error cascade. Nothing is subtly broken: `sched` is simply not compiled, and `rustc` says so
+with an explicit "found an item that was configured out" note pointing at the gate.
+
+### Is the combo reachable?
+
+**No.** `arroyo` composes the two features from disjoint places:
+
+- The general `_feats` accumulator adds `pi` from `UNAOS_PI=1`, and **never** adds `baremetal`.
+- `baremetal` is set only inside `kernel8()`, whose `K8_FEATS` is **curated** — it starts at
+  `baremetal,skip_xhci` and takes no input from `_feats`, so it never carries `pi` either.
+
+So the two features are produced by mutually exclusive code paths, and on the `kernel8`/`kernel8-test`
+path `UNAOS_PI=1` contributes no cargo feature at all (`baremetal` already implies the Pi target). Every
+documented `UNAOS_PI=1` invocation in `docs/env-knobs.md` pairs it with `kernel8` or `kernel8-test`; a
+sweep of `docs/`, `scripts/`, `CLAUDE.md` and `HARDWARE-BRINGUP.md` found **no** documented or scripted
+invocation that puts `pi` in front of a non-`kernel8` target. The failing combo is reachable only by
+typing `UNAOS_PI=1` at `check`/`arm`/`test-arm`/`esp-arm` by hand, and no such build has a Pi boot path
+to run — `pi` alone selects the aarch64 UART policy, not a platform.
+
+### Provenance
+
+Not a merge regression. The identical 18-error failure reproduces at `e860181a` (the pre-merge `hw-pi4`
+tip) with the same error sites and the same gate text; the gate has read this way since `1ffaf6cf`
+(SMP M3a), widened only by `c82ddf9b` (JC3, `virt`) and `1e010597` (JM6, `tegra`). `UNAOS_WITNESS=1` is
+incidental: `pi` alone already fails with 16 of the 18, and the `witness` feature only adds the last two.
+
+### Decision
+
+**The gate stands and the code is unchanged.** Adding `feature = "pi"` to the `any(...)` list would
+compile a scheduler into a configuration that has no boot path to run it, trading a loud, accurate
+compile error for a silently-buildable artifact nobody flashes. `pi` without `baremetal` is an
+**unsupported combination**; the honest compile failure is the intended behaviour. Treat
+`./arroyo kernel8` / `kernel8-test` as the only supported carriers of `UNAOS_PI=1`.
