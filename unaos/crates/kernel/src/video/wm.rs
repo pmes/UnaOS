@@ -4386,7 +4386,7 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
 const MAX_DEFER: usize = MAX_WINDOWS;
 
 /// Why a fill could not stage. These mirror `wcg`'s `DECL_*`, and the mirror is not duplication for
-/// its own sake: `wcg` is compiled only for `aarch64 + witness`, while WC-L's decision about what to
+/// its own sake: `wcg` is compiled only under `witness`, while WC-L's decision about what to
 /// do with a fill that cannot stage — defer it or drop it — is a CORRECTNESS decision that every
 /// build makes, witness or not. The reason therefore has to exist outside the witness. The `const`
 /// assertions below tie the two vocabularies together at compile time on the builds that have both,
@@ -7035,6 +7035,24 @@ pub fn hittest_selftest() {
     // Same restore FOCUS-VIS owes and for the same reasons: drop the shell back to the bottom of the
     // z-order, un-name the synthetic focus owner, and repaint the live set (this selftest's
     // `focus_changed(0)` leg pushed EVERY live window below the shell and consumed its damage flag).
+    SHELL_Z.store(0, Ordering::Release);
+    FOCUS_ASID.store(0, Ordering::Release);
+    repaint();
+}
+
+/// CLICK-X86 — the restore every selftest that drives [`focus_changed`] with SYNTHETIC owners owes:
+/// drop the shell back to the bottom of the z-order, un-name the focus owner (it must not be left
+/// naming an address space that does not exist), and repaint the live set (a `focus_changed(0)` leg
+/// pushes every live window below the shell and consumes its damage flag).
+///
+/// Deliberately the LAST item in this file. It is `witness`-only, so with the knob off it does not
+/// compile — but a definition inserted higher up would still renumber every `core::panic::Location`
+/// below it, and those records live in the loadable image, not only in DWARF. Appending keeps the
+/// knob-off artifact byte-identical on both targets, which is the property `wcg`'s module note
+/// claims for the whole witness.
+#[cfg(feature = "witness")]
+pub fn focus_reset() {
+    use core::sync::atomic::Ordering;
     SHELL_Z.store(0, Ordering::Release);
     FOCUS_ASID.store(0, Ordering::Release);
     repaint();
