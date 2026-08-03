@@ -3391,6 +3391,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(6)
                 .clamp(1, 8);
+            // STORM-FATW: `fat` anywhere in the args arms the USB-traffic writer (below). A bare
+            // `storm fat` keeps the default fleet of 6 (the non-numeric arg falls through the parse).
+            let fatw = args.iter().any(|a| *a == "fat");
             // Pre-flight resource census. The refusal string already names what ran out AT a refusal;
             // this names the headroom when there is NO refusal, which is the reading "storm 6 launched
             // 6/6" silently withholds. Taken before the burst so a partial fleet can be attributed to
@@ -3457,6 +3460,15 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // next few timer-driven windows are read. The settled fleet is described by those lines,
             // not by this one.
             crate::arch::sched::storm_census("post");
+            // STORM-FATW (Peter, R23 boot1 sitting): `storm [n] fat` also arms a kernel writer task
+            // that drives bounded USB storage traffic UNDER the fleet — the missing half of the
+            // WEDGE-8/F3 metal provocation (the fleet supplies preemption pressure; this supplies
+            // the driver-claim traffic). See `storm_fat_writer` for the two legs and their honesty
+            // rules. Armed AFTER the burst so the census lines above describe the fleet alone.
+            if fatw {
+                crate::arch::sched::spawn_auto("stormfatw", storm_fat_writer, 0);
+                console.println("storm: fat writer armed — watch :: STORM: fatw lines on serial");
+            }
         },
         #[cfg(feature = "baremetal")]
         "jobs" => {
@@ -3706,6 +3718,151 @@ struct BgJob {
 /// Shell access is single-task, but the Mutex keeps the invariant explicit rather than relying on it.
 #[cfg(feature = "baremetal")]
 static BG_JOBS: spin::Mutex<[Option<BgJob>; 8]> = spin::Mutex::new([None; 8]);
+
+/// STORM-FATW: the bounded USB-traffic writer `storm [n] fat` arms — the driver-claim half of the
+/// WEDGE-8/F3 metal provocation (the vug fleet is the preemption half). Two legs, decided once at
+/// start by whether the stick carries a mountable FAT volume:
+///
+/// * **usb-fat leg** (a FAT16/32 stick is in): the FULL F3 chain — `create_in_root` /
+///   `write_grow` appends / periodic `delete_located`, all on `BlockSource::Usb`, so every round
+///   runs the masked FAT/dir RMW spans against the xHCI loan exactly as EL0 `SYS_WRITE` does.
+/// * **raw-scratch leg** (no FAT volume — the honest fallback, and it SAYS so): bounded
+///   read/write/verify rounds on the last-but-one LBA via `read_block_usb`/`write_block_usb`,
+///   original sector restored at the end (the `mission_write_selftest` RMW-restore discipline).
+///   This still contends for the claim under the fleet, but the masked-RMW leg is NOT exercised —
+///   the begin line names that, so a green run cannot be over-read.
+///
+/// Honesty rules: `Busy`/`-EAGAIN` outcomes are counted and reported as `busy=` — under WEDGE-8
+/// they are the fix WORKING (pre-fix, that contention was the silent dead core). Ten consecutive
+/// hard I/O errors abort the run rather than burn the remaining rounds on a dead device. Bounded
+/// (300 rounds, one `hlt` breather each) so an armed writer always ends and reports. Re-arming
+/// while one runs just adds a second contender — noisy but bounded, and contention is the point.
+#[cfg(feature = "baremetal")]
+fn storm_fat_writer(_: usize) {
+    use crate::fs::fat::BlockSource;
+    const ROUNDS: u32 = 300;
+    const REDELETE_EVERY: u32 = 64; // exercise the dir-RMW delete/create cycle, and cap file growth
+    let mut ok = 0u32;
+    let mut busy = 0u32;
+    let mut io = 0u32;
+    let mut io_run = 0u32; // consecutive hard errors — the abort counter
+    let fat_leg = crate::fs::fat::mount_source(BlockSource::Usb);
+    serial_println!(
+        ":: STORM: fatw begin rounds={} leg={} ::",
+        ROUNDS,
+        if fat_leg.is_ok() { "usb-fat (full F3 chain: masked RMW vs xHCI loan)" }
+        else { "raw-scratch (no FAT volume on the stick — masked-RMW leg NOT exercised)" }
+    );
+    let mut pattern = [0u8; 512];
+    match fat_leg {
+        Ok(fs) => {
+            const NAME: &str = "STORMW.TMP";
+            // (de-fields we carry between rounds: dir slot + chain head + size)
+            let mut cur: Option<(u64, usize, u32, u32)> = None; // (dir_lba, dir_off, first_cluster, size)
+            for r in 0..ROUNDS {
+                for (i, b) in pattern.iter_mut().enumerate() {
+                    *b = (r as u8) ^ (i as u8);
+                }
+                let step: Result<(), crate::fs::fat::FatError> = (|| {
+                    if cur.is_none() {
+                        let (de, lba, off) = match fs.find_located(NAME) {
+                            Ok(t) => t,
+                            Err(crate::fs::fat::FatError::NotFound) => fs.create_in_root(NAME, 0x20)?,
+                            Err(e) => return Err(e),
+                        };
+                        cur = Some((lba, off, de.first_cluster(), de.size));
+                    }
+                    let (lba, off, first, size) = cur.unwrap();
+                    if r % REDELETE_EVERY == REDELETE_EVERY - 1 {
+                        fs.delete_located(lba, off, first)?;
+                        cur = None;
+                        return Ok(());
+                    }
+                    let (_w, new_size, new_first) = fs.write_grow(first, size, lba, off, size, &pattern)?;
+                    cur = Some((lba, off, new_first, new_size));
+                    Ok(())
+                })();
+                match step {
+                    Ok(()) => { ok += 1; io_run = 0; }
+                    Err(crate::fs::fat::FatError::Busy) => { busy += 1; io_run = 0; }
+                    Err(_) => {
+                        io += 1;
+                        io_run += 1;
+                        cur = None; // re-resolve the slot next round — the volume may have moved under us
+                        if io_run >= 10 {
+                            serial_println!(":: STORM: fatw ABORT at r={} — 10 consecutive I/O errors ::", r);
+                            break;
+                        }
+                    }
+                }
+                if r % 50 == 49 {
+                    serial_println!(":: STORM: fatw r={}/{} ok={} busy={} io={} ::", r + 1, ROUNDS, ok, busy, io);
+                }
+                crate::hlt();
+            }
+            // Leave the volume clean: best-effort delete of the scratch file.
+            if let Some((lba, off, first, _)) = cur {
+                let _ = fs.delete_located(lba, off, first);
+            }
+            serial_println!(
+                ":: STORM: fatw done leg=usb-fat ok={} busy={} io={} (busy>0 with no freeze = WEDGE-8 witnessed live) ::",
+                ok, busy, io
+            );
+        }
+        Err(_) => {
+            let Some(dev) = crate::drivers::block::usb_info() else {
+                serial_println!(":: STORM: fatw done leg=none — no USB block device enumerated; nothing exercised ::");
+                return;
+            };
+            if dev.num_blocks < 4 {
+                serial_println!(":: STORM: fatw done leg=none — device too small for a scratch sector ::");
+                return;
+            }
+            let scratch = dev.num_blocks - 2;
+            let mut orig = [0u8; 512];
+            if crate::drivers::block::read_block_usb(scratch, &mut orig).is_err() {
+                serial_println!(":: STORM: fatw done leg=none — scratch LBA {} unreadable; nothing exercised ::", scratch);
+                return;
+            }
+            let mut verify = [0u8; 512];
+            for r in 0..ROUNDS {
+                for (i, b) in pattern.iter_mut().enumerate() {
+                    *b = (r as u8) ^ (i as u8);
+                }
+                let step: Result<(), crate::drivers::block::BlockError> = (|| {
+                    crate::drivers::block::write_block_usb(scratch, &pattern)?;
+                    let n = crate::drivers::block::read_block_usb(scratch, &mut verify)?;
+                    if n < verify.len() || verify != pattern {
+                        return Err(crate::drivers::block::BlockError::Io);
+                    }
+                    Ok(())
+                })();
+                match step {
+                    Ok(()) => { ok += 1; io_run = 0; }
+                    Err(crate::drivers::block::BlockError::Busy) => { busy += 1; io_run = 0; }
+                    Err(_) => {
+                        io += 1;
+                        io_run += 1;
+                        if io_run >= 10 {
+                            serial_println!(":: STORM: fatw ABORT at r={} — 10 consecutive I/O errors ::", r);
+                            break;
+                        }
+                    }
+                }
+                if r % 50 == 49 {
+                    serial_println!(":: STORM: fatw r={}/{} ok={} busy={} io={} ::", r + 1, ROUNDS, ok, busy, io);
+                }
+                crate::hlt();
+            }
+            // RMW-restore: put the original sector back, and say whether that succeeded.
+            let restored = crate::drivers::block::write_block_usb(scratch, &orig).is_ok();
+            serial_println!(
+                ":: STORM: fatw done leg=raw-scratch lba={} ok={} busy={} io={} restored={} (masked-RMW leg NOT exercised — no FAT volume) ::",
+                scratch, ok, busy, io, restored
+            );
+        }
+    }
+}
 
 /// BGRUN-1: `bg <path>` — read the image, spawn it detached, record the job. The shell prompt is
 /// back the moment this returns; the program (and its window, if it creates one) keeps running.
