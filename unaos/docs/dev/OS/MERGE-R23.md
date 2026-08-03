@@ -83,6 +83,17 @@ extended by that seat.
   gating needs the kepler knob set (`UNAOS_IVB/KEPLER/KEPLER_TAKEOVER/KEPLER_FIFO/SMC`), not
   `UNAOS_WC` alone. pi activation is default-path (metal-proven).
 - No QEMU suite on an unchanged tree — `mbench.py --replay` the existing capture.
+- **Fixture-provisioning asymmetry** (the part a future seat will trip on): the two platforms
+  had DIFFERENT fixture models — pi plants at image build (arroyo:1652–1673) + the aarch64
+  U-family runtime-creates its files; x86 planted only in the QEMU FAT script, so x86 METAL
+  boots silently degraded U9x/U10 witnesses to a passing in-memory mode. Fixed 2026-08-03
+  (builder plants, contents cross-checked against witness constants). When adding a witness
+  with an on-disk fixture, verify the fixture reaches EVERY medium the witness runs from.
+- **Commit-message-overclaim** (x86 seat, self-reported; belongs beside the vacuous zero): a
+  commit titled "name all six sysret-scrubbed registers in every stub" did not do what it said
+  (read "argument registers" as per-stub, not the scrubbed six) and the gap crashed VUG.ELF on
+  metal (`rsi` zeroed under a live `&mut` — err=0x5 cr2=0x0). A commit message is a claim;
+  gate the claim, not the diff's existence. Fixed and disassembly-proven same day.
 - **Vacuous-zero law**: a zero from a counter whose subject never ran is vacuous, not passing —
   every zero-anomaly verdict must be qualified on evidence the subject ran at all (e.g. a
   `cbw_fault=0` claim requires `n>0 storage_slot!=0` beside it, and the capture should carry the
