@@ -11,7 +11,10 @@ several sessions can work in parallel without stepping on each other.
   `test` / `test-arm` (headless QEMU, serial → `target/serial*.log`),
   `x86` / `arm` (QEMU GUI), `esp-x86` / `esp-arm` (metal boot media),
   `kernel8` / `kernel8-run` / `kernel8-test` (Pi 4 bare-metal image / QEMU raspi4b).
-  Env knobs: `UNAOS_PI`, `UNAOS_BAREMETAL`, `UNAOS_SKIP_XHCI`, `UNAOS_BOOTLOG`,
+  Env knobs: `UNAOS_WC` (**arms the x86 window compositor — any gate touching
+  the video stack MUST carry `UNAOS_WC=1`, and the run MUST show `wc` in the
+  `⚡ kernel features:` banner; without it the video stack is not compiled and
+  the gate is vacuous**), `UNAOS_PI`, `UNAOS_BAREMETAL`, `UNAOS_SKIP_XHCI`, `UNAOS_BOOTLOG`,
   `UNAOS_SCHED_DEMO`, `UNAOS_USBDEBUG`, `UNAOS_FBW`/`UNAOS_FBH` (panel-geometry
   override — QEMU raspi4b is 640x480 while the bench Pi is 1920x1200, and the
   window compositor's upscale is a function of the panel, so
@@ -34,6 +37,16 @@ several sessions can work in parallel without stepping on each other.
   `hw-jetson` (`../UnaOS-jetson`, Jetson Orin Nano).
 - Track sessions commit **only to their own track branch**. Never merge or
   push to `main` — the integrator session does that after review.
+- **The seat never runs `git push`. Peter does.** No inference overrides this.
+- **Name every push Peter will need in your FIRST turn, batched** — including
+  pushes for commits you have not written yet (if your arc will end on a
+  branch, name that branch's push at the start). Discovering them one at a
+  time costs him a full round-trip each, and the information to batch them
+  is always available at minute one. Before announcing any sha to a peer,
+  verify it with `git ls-remote --heads origin` **and**
+  `git log --oneline -1 <sha>` — a sha the peer cannot fetch is not a
+  deliverable. And re-run `git fetch` before ever reporting a push as still
+  outstanding.
 - **Tracks run independently, at their own pace.** No track waits for another.
   When a track's arc lands and passes review, the integrator merges *that* arc
   to `main` and rebases *that* track for its next arc; the other tracks keep
