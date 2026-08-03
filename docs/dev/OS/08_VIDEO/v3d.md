@@ -2008,7 +2008,8 @@ every boot buys no new information:
 | Knob | Feature | Effect |
 | --- | --- | --- |
 | `UNAOS_V3D=1` | `v3d` | The V3D bring-up + the **fast** probe battery: the `[v3d40]` probe kick and its single FLDONE wait, and all the pure-read decodes (`[v3d54]` submit/trace, `[v3d55]` clkliv/tilestate, `[v3d56]` poison/landing/int, `[v3d57]` Mesa diff, `[v3d58]` stations/xengine, `[v3d59]` mainline/ctstate). |
-| `UNAOS_V3D_DEEP=1` | `v3d_deep` (implies `v3d`) | **Adds** the three banked-verdict probes above — ~3.5 s of extra boot. Arm it only when the bench is deliberately re-opening one of those questions. |
+| `UNAOS_V3D_DEEP=1` | `v3d_deep` (implies `v3d`) | **Adds** the three banked-verdict probes above — ~3.5 s of extra boot. Arm it only when the bench is deliberately re-opening one of those questions. Since V3D75A-GATE this knob is **no longer destructive**: the `SET_ENABLE_QPU` sends it used to reach are separately gated (below) and a deep boot leaves the mailbox — and therefore USB — alive. |
+| `UNAOS_V3D_QPU=1` | `v3d_qpu` (bare — an arming switch, inert without `v3d_deep`) | **Re-arms the two `SET_ENABLE_QPU` (tag 0x00030012) send sites** (`[v3d75a]`'s doorbell-waiting send and `[v3d81q]`'s reply-less one). This send **permanently wedges the VideoCore mailbox** on Pi 4 metal — every later `NOTIFY_XHCI_RESET` fails and USB is dead for the boot — and its diagnostic verdict is banked negative twice, so it is gated OFF by default rather than deleted. With deep armed and this off, each site prints an honest `SET_ENABLE_QPU SKIPPED` line and explicitly disclaims the verdicts the send would have fed. Arm only for a boot that deliberately sacrifices USB to re-open the QPU-enable question. |
 
 Off (the default for an armed boot), the bring-up prints one line right after the `M1 probe PASS` gate:
 
