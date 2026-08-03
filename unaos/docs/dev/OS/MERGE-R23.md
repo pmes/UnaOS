@@ -37,6 +37,20 @@ extended by that seat.
   does masked-span depend on the CBW not being awaited) — answered from capture archive, owed.
 - kernel8 cross-commit byte-identity is NOT currently a valid instrument (1410-byte diff on an
   x86-confined source change; clean-dirs reproducibility discriminator queued).
+- **Trunk 47f955a3 does not compile x86 under `witness`** (x86 seat, post-landing): two more
+  orphaned x86 call sites, gated on `witness` not `wc` (`wcg.rs:130` imports
+  `crate::arch::aarch64` unconditionally; `wm::focus_reset` missing at x86 syscall.rs:4142).
+  Structural blind spot: arroyo auto-arms `witness` only for test targets, so `esp-x86` media —
+  including the Condition-A boot — never contained the broken code (boot valid, tree not fully
+  checked). Repair = milestone 1 of the x86 re-land arc (theirs). aarch64 CLEARED: both the
+  check invocation and the kernel8-test feature path type-check green (x86 seat, replicated
+  invocations). Open question, pi seat's: `pi` WITHOUT `baremetal` (+witness) fails 18×
+  "cannot find sched in arch" — unestablished whether that path is ever run or predates the merge.
+- x86 sysret scrub: FIXED on trunk post-landing (all six scrubbed registers declared in every
+  x86 ring-3 stub; previously `r10` was declared exactly once tree-wide).
+- Terminology: the `EL0-equiv FAULT` witness string is **x86-only** (`vec=14`/`cr2`/`err` are
+  x86 page-fault artefacts; `arch/aarch64` never emits it). It reads like an ARM exception and
+  has already cost a round-trip — any doc naming that fault says "x86 ring 3" explicitly.
 
 ## Gate rules earned by this merge (binding; also in CLAUDE.md / LAWS)
 - Video-stack checks carry `UNAOS_WC=1`; banner must list `wc`.
