@@ -394,6 +394,21 @@ v3d_deep = ["v3d"]
 # ⚠ an armed boot loses USB from the send onward — that is the known cost, not a fault.
 v3d_qpu = []
 
+# V3D80-GATE: the arming switch for the `NOTIFY_DISPLAY_DONE` (0x00030066) sends. That tag is vc4's
+# probe-time handover and it does exactly what it says: the firmware display driver STOPS, so the
+# panel goes BLACK for the rest of the boot — by design, not a fault. Its diagnostic verdict is now
+# BANKED (boot pi4-r23s1x/boot3, 2026-08-03): core+0x68 read 0x00010001 unchanged across the handover
+# (pre == post, working-part ref 0x00000003), so the handover does not move the wedge signature and
+# the send has nothing left to teach a deep boot. Both send sites — `[v3d80]`'s doorbell-waiting one
+# in `v3d80_display_done` and `[v3d81d]`'s reply-less one — are gated on `all(v3d_deep,
+# v3d_dispdone)`; with this feature OFF each one prints a single `NOTIFY_DISPLAY_DONE SKIPPED —
+# dispdone-gate off …` line and sends nothing, which is what lets a deep boot keep its panel.
+# Deliberately a BARE feature that implies nothing: it only has an effect alongside `v3d_deep` (both
+# sites ride the deep battery), so arming it alone changes no behaviour. Enable via `UNAOS_V3D=1
+# UNAOS_V3D_DEEP=1 UNAOS_V3D_DISPDONE=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot loses the panel
+# from the send onward — that is the known cost; serial carries the whole verdict.
+v3d_dispdone = []
+
 # PI-V3D-69: the WRITE half of the initialisation-diff arc. The READ half (`[v3d69] fabric` stations —
 # PM_GRAFX, both V3D async-AXI-bridge control words in both candidate ASB blocks, V3D_MMUC_CONTROL)
 # rides `v3d_deep` and is read-only. THIS feature adds the one rung that WRITES: it re-runs mainline's

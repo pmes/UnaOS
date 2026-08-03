@@ -6835,6 +6835,10 @@ fn empty_frame_bisection() {
     // PI-V3D-80: the display handover rides ABSOLUTELY LAST — NOTIFY_DISPLAY_DONE stops the
     // firmware display driver, so scanout of the firmware framebuffer may die the moment it runs.
     // Every screen-dependent reading this boot owns must already be banked.
+    // V3D80-GATE: and it only runs at all when the `v3d_dispdone` arming switch is on (default off,
+    // UNAOS_V3D_DISPDONE=1). Its verdict is banked — core+0x68 unchanged across the handover — so a
+    // deep boot keeps its panel unless the bench deliberately re-opens the question. The position is
+    // unchanged either way: whether the rung sends or skips, it is still the last thing in the file.
     // PI-V3D-81: unless ANY v3d81 leg is armed, in which case this rung STANDS DOWN entirely.
     // Two reasons, and the second is why the stand-down is not merely per-tag. (1) If [v3d81d] is
     // armed it owns the one send of this tag, and sending it here first would make [v3d81d]'s
@@ -6849,7 +6853,7 @@ fn empty_frame_bisection() {
     v3d80_display_done();
     #[cfg(feature = "v3d81")]
     serial_println!(
-        ":: V3D: [v3d80] STOOD DOWN — a UNAOS_V3D81_* leg is armed, so NOTIFY_DISPLAY_DONE is NOT sent the doorbell-waiting way on this boot. If [v3d81d] is armed it owns the one send of the tag; if only [v3d81q] is armed the tag is not sent at all, so the QPU leg's stations are taken on a firmware that was never told to hand over. Nothing was sent here and no [v3d80] verdict is implied ::"
+        ":: V3D: [v3d80] STOOD DOWN — a UNAOS_V3D81_* leg is armed, so NOTIFY_DISPLAY_DONE is NOT sent the doorbell-waiting way on this boot. If [v3d81d] is armed AND the dispdone-gate is armed with it, that leg owns the one send of the tag; if only [v3d81q] is armed, or the dispdone-gate is off, the tag is not sent at all, so every station below is taken on a firmware that was never told to hand over. Nothing was sent here and no [v3d80] verdict is implied ::"
     );
     // PI-V3D-81: the reply-less legs ride after [v3d80] — dead last in the file. Their display leg
     // can stop the firmware display driver, and their whole point is to be read against the
@@ -6872,8 +6876,36 @@ fn empty_frame_bisection() {
 /// tag may (§46.5) be honoured reply-lessly, so leaving it in would contaminate [v3d81q]'s baseline
 /// with a handover it did not ask for. Cfg'd out rather than skipped at runtime so no build can
 /// have both.
+///
+/// V3D80-GATE: the send now needs its own arming switch (`v3d_dispdone`, `UNAOS_V3D_DISPDONE=1`) on
+/// top of `v3d_deep`, and is OFF by default. The rung did what it was built to do and its verdict is
+/// BANKED (boot pi4-r23s1x/boot3, 2026-08-03): core+0x68 read `0x00010001` unchanged across the
+/// handover — pre == post against the working part's `0x00000003` — so the handover does not move the
+/// wedge signature. What it does still do is stop the firmware display driver, which costs the panel
+/// for the rest of the boot. A deep boot should keep its panel by default; the send re-arms only when
+/// the bench deliberately re-opens the handover question. Gate off, the rung sends nothing and takes
+/// NO station either side of the send it did not make — a post-handover readback on a boot with no
+/// handover is not a null result, it is a false one — so it prints one skip line and nothing else.
+/// The armed body lives in its own function so that not one of its lines is even compiled on a boot
+/// that does not send.
 #[cfg(not(feature = "v3d81"))]
 fn v3d80_display_done() {
+    // The gate is a build-time fact and it is the whole reason nothing happens, so it is stated
+    // BEFORE the hardware one: with the send compiled out there is no reading to take, and whether
+    // the hub answers changes nothing about what this rung did (nothing).
+    #[cfg(any(not(feature = "v3d_deep"), not(feature = "v3d_dispdone")))]
+    serial_println!(
+        ":: V3D: [v3d80] NOTIFY_DISPLAY_DONE SKIPPED — dispdone-gate off (arm with UNAOS_V3D_DISPDONE=1; this send stops the firmware display driver and blacks the panel for the rest of the boot). Nothing was sent, no station either side of it was taken, and the banked handover verdict (core+0x68 0x00010001 unchanged across the handover, pre == post, working-part ref 0x00000003 — banked 2026-08-03) is NOT re-read here ::"
+    );
+    #[cfg(all(feature = "v3d_deep", feature = "v3d_dispdone"))]
+    v3d80_display_done_armed();
+}
+
+/// PI-V3D-80, the armed body — the doorbell-waiting handover send and the two stations that bracket
+/// it. Split out so that every line in it is compiled only on a boot that actually sends the tag:
+/// each one asserts a handover happened, and none of them is true otherwise.
+#[cfg(all(not(feature = "v3d81"), feature = "v3d_deep", feature = "v3d_dispdone"))]
+fn v3d80_display_done_armed() {
     match probe_hub_ident0() {
         V3dPresence::Up(_) => {}
         V3dPresence::Down | V3dPresence::Poison(_) => {
@@ -7178,9 +7210,13 @@ fn v3d81_leg(
 /// doorbell-waiting [v3d80] handover send — the tag is sent once per boot or not at all, because a
 /// NOTIFY that may be honoured reply-lessly contaminates the next leg's pre-station whether or not
 /// that leg is about the same tag. [v3d75a]'s ENABLE_QPU send stands down with [v3d81q], which owns
-/// that tag.
+/// that tag. Arming a leg is necessary but no longer sufficient: since V3D75A-GATE and V3D80-GATE
+/// each TAG also carries its own arming switch (`UNAOS_V3D_QPU`, `UNAOS_V3D_DISPDONE`), both off by
+/// default, so an armed leg whose tag gate is off posts nothing, takes no station and says both
+/// halves on the wire.
 ///
-/// ⚠ The display leg may take the panel to black permanently. That is the hypothesis, not a fault.
+/// ⚠ The display leg may take the panel to black permanently — when the dispdone-gate is armed with
+/// it. That is the hypothesis, not a fault.
 #[cfg(feature = "v3d81")]
 fn v3d81_replyless_notify() {
     match probe_hub_ident0() {
@@ -7193,9 +7229,11 @@ fn v3d81_replyless_notify() {
         }
     }
     serial_println!(
-        ":: V3D: [v3d81] reply-less NOTIFY battery — ARMED LEGS qpu={} display={} | settle={}ms | tags SET_ENABLE_QPU=0x00030012 NOTIFY_DISPLAY_DONE=0x00030066 | each armed leg is the ONLY send of its tag on this boot (the doorbell-waiting rung above stands down); each leg reads the reply BUFFER, the register station and the firmware's own state, with GET_CLOCK_RATE as the positive control ::",
+        ":: V3D: [v3d81] reply-less NOTIFY battery — ARMED LEGS qpu={} display={} | TAG GATES qpu={} dispdone={} | settle={}ms | tags SET_ENABLE_QPU=0x00030012 NOTIFY_DISPLAY_DONE=0x00030066 | a leg SENDS only when its leg knob and its tag gate are BOTH on — an armed leg with its gate off posts nothing and says so, and takes no station; each leg that does send is the ONLY send of its tag on this boot (the doorbell-waiting rung above stands down); each sending leg reads the reply BUFFER, the register station and the firmware's own state, with GET_CLOCK_RATE as the positive control ::",
         cfg!(feature = "v3d81_qpu") as u32,
         cfg!(feature = "v3d81_display") as u32,
+        cfg!(feature = "v3d_qpu") as u32,
+        cfg!(feature = "v3d_dispdone") as u32,
         V3D81_SETTLE_MS
     );
 
@@ -7226,7 +7264,12 @@ fn v3d81_replyless_notify() {
         ":: V3D: [v3d81q] NOT ARMED — no reply-less SET_ENABLE_QPU on this boot. [v3d75a] above owns the doorbell-waiting send of this tag (itself sent only when the qpu-gate is armed) and its reading, whatever it says, stands unchanged ::"
     );
 
-    #[cfg(feature = "v3d81_display")]
+    // V3D80-GATE: same two-key shape as leg Q above — the leg's own knob arms the LEG, the
+    // `v3d_dispdone` switch arms the SEND. Both are required, because this tag stops the firmware
+    // display driver and costs the panel for the rest of the boot, and its verdict is banked
+    // (core+0x68 unchanged across the handover). Gate off, the leg reports that it posted nothing
+    // rather than taking stations either side of a send that did not happen.
+    #[cfg(all(feature = "v3d81_display", feature = "v3d_deep", feature = "v3d_dispdone"))]
     {
         serial_println!(
             ":: V3D: [v3d81d] ⚠ the next send may stop the firmware display driver — the panel may go BLACK from here and not come back. Serial is unaffected and carries the whole verdict; every screen-dependent reading this boot owns is already banked above ::"
@@ -7240,6 +7283,13 @@ fn v3d81_replyless_notify() {
             mailbox::notify_display_done_noreply,
         );
     }
+    #[cfg(all(
+        feature = "v3d81_display",
+        any(not(feature = "v3d_deep"), not(feature = "v3d_dispdone"))
+    ))]
+    serial_println!(
+        ":: V3D: [v3d81d] NOTIFY_DISPLAY_DONE SKIPPED — dispdone-gate off (arm with UNAOS_V3D_DISPDONE=1; this send stops the firmware display driver and blacks the panel for the boot). The leg is armed but posted nothing, so no station is a reading of this tag and NO [v3d81d] verdict is implied ::"
+    );
     #[cfg(not(feature = "v3d81_display"))]
     serial_println!(
         ":: V3D: [v3d81d] NOT ARMED — NOTIFY_DISPLAY_DONE was NOT SENT AT ALL on this boot: [v3d80] stands down for the whole v3d81 battery, not just for its own leg, so that the armed leg's pre-station is taken on a firmware that has not been told to hand over. No handover verdict of any kind is implied here ::"

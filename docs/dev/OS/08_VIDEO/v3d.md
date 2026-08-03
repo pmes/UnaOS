@@ -2008,8 +2008,9 @@ every boot buys no new information:
 | Knob | Feature | Effect |
 | --- | --- | --- |
 | `UNAOS_V3D=1` | `v3d` | The V3D bring-up + the **fast** probe battery: the `[v3d40]` probe kick and its single FLDONE wait, and all the pure-read decodes (`[v3d54]` submit/trace, `[v3d55]` clkliv/tilestate, `[v3d56]` poison/landing/int, `[v3d57]` Mesa diff, `[v3d58]` stations/xengine, `[v3d59]` mainline/ctstate). |
-| `UNAOS_V3D_DEEP=1` | `v3d_deep` (implies `v3d`) | **Adds** the three banked-verdict probes above — ~3.5 s of extra boot. Arm it only when the bench is deliberately re-opening one of those questions. Since V3D75A-GATE this knob is **no longer destructive**: the `SET_ENABLE_QPU` sends it used to reach are separately gated (below) and a deep boot leaves the mailbox — and therefore USB — alive. |
+| `UNAOS_V3D_DEEP=1` | `v3d_deep` (implies `v3d`) | **Adds** the three banked-verdict probes above — ~3.5 s of extra boot. Arm it only when the bench is deliberately re-opening one of those questions. Since V3D75A-GATE and V3D80-GATE this knob is **no longer destructive**: the `SET_ENABLE_QPU` and `NOTIFY_DISPLAY_DONE` sends it used to reach are separately gated (below), so a deep boot leaves the mailbox — and therefore USB — alive and keeps its panel. |
 | `UNAOS_V3D_QPU=1` | `v3d_qpu` (bare — an arming switch, inert without `v3d_deep`) | **Re-arms the two `SET_ENABLE_QPU` (tag 0x00030012) send sites** (`[v3d75a]`'s doorbell-waiting send and `[v3d81q]`'s reply-less one). This send **permanently wedges the VideoCore mailbox** on Pi 4 metal — every later `NOTIFY_XHCI_RESET` fails and USB is dead for the boot — and its diagnostic verdict is banked negative twice, so it is gated OFF by default rather than deleted. With deep armed and this off, each site prints an honest `SET_ENABLE_QPU SKIPPED` line and explicitly disclaims the verdicts the send would have fed. Arm only for a boot that deliberately sacrifices USB to re-open the QPU-enable question. |
+| `UNAOS_V3D_DISPDONE=1` | `v3d_dispdone` (bare — an arming switch, inert without `v3d_deep`) | **Re-arms the two `NOTIFY_DISPLAY_DONE` (tag 0x00030066) send sites** (`[v3d80]`'s doorbell-waiting handover and `[v3d81d]`'s reply-less one). This send **stops the firmware display driver** — the panel goes black for the rest of the boot, by design — and its verdict is now **banked** (boot `pi4-r23s1x`/boot3, 2026-08-03: core+0x68 read `0x00010001` unchanged across the handover, pre == post against the working part's `0x00000003`), so the handover does not move the wedge signature and the send has nothing left to teach. Gated OFF by default rather than deleted: a deep boot keeps its panel. With deep armed and this off, `[v3d80]` prints one `NOTIFY_DISPLAY_DONE SKIPPED` line and returns without taking either station — a post-handover readback on a boot with no handover would be a false result, not a null one — and an armed `[v3d81d]` says it posted nothing. Arm only for a boot that deliberately sacrifices the panel to re-open the handover question; serial is unaffected and carries the whole verdict. |
 
 Off (the default for an armed boot), the bring-up prints one line right after the `M1 probe PASS` gate:
 
@@ -3509,8 +3510,15 @@ degrades (`GET_PHYS_WH`, and the `GET_CLOCK_RATE` that serves as the control) ar
 attributed to `SET_ENABLE_QPU`. With only `UNAOS_V3D81_QPU` armed the handover tag is therefore not
 sent at all on that boot, and the wire says so on both `[v3d80]` and `[v3d81d]`.
 
-Every `[v3d81]` line states the armed legs, the settle, the tag ids and both stations, so a capture
-is self-describing and datable without the reader knowing how the image was built.
+Since V3D75A-GATE and V3D80-GATE, arming a leg is **necessary but not sufficient**. Each *tag* now
+carries its own arming switch as well — `UNAOS_V3D_QPU` for `SET_ENABLE_QPU`, `UNAOS_V3D_DISPDONE`
+for `NOTIFY_DISPLAY_DONE` — both off by default (see [The knob](#the-knob)), because both sends cost
+the boot something (the mailbox and therefore USB; the panel) and both verdicts are banked. A leg
+armed with its tag gate off posts nothing, takes no station either side of the send it did not make,
+and prints one `… SKIPPED — <tag>-gate off …` line that disclaims its own verdict explicitly.
+
+Every `[v3d81]` line states the armed legs, the tag gates, the settle, the tag ids and both stations,
+so a capture is self-describing and datable without the reader knowing how the image was built.
 
 Standing caveats for whoever reads the next boot. The legs run after `[v3d75b]`'s M_CTRL transplant
 and `[v3d77]`'s two pokes, so the fabric they act on carries that residue — both were readback-proven
