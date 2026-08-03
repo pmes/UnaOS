@@ -132,6 +132,22 @@ struct Window {
     scale: usize,
     z: u32,
     damaged: bool,
+    /// FBCON-DMG — the SOURCE-ROW band `[dmg_y0, dmg_y1)` of this window's surface that is known
+    /// damaged, when the damage arrived through a banded present. An EMPTY band (`dmg_y1 <= dmg_y0`,
+    /// which is what [`Window::empty`] and every [`Window::damage_all`] site leave behind) means THE
+    /// WHOLE BOX — so a window that never takes a banded present behaves exactly as it did before.
+    ///
+    /// Source rows and not panel rows, because that is the coordinate the *owner* of the surface
+    /// knows: the console tracks a dirty band in its own glyph grid and has no business re-deriving
+    /// the compositor's placement. The conversion happens once, through the same `r.y`/`r.scale` the
+    /// content blit uses (see [`damaged_box`]), so the band can never disagree with the pixels it
+    /// describes.
+    ///
+    /// **Substrate only in this milestone.** Nothing produces a non-empty band yet — the banded
+    /// present verb and the compositor's band propagation land next — so every field here is written
+    /// to the empty/whole-box value by every live path.
+    dmg_y0: usize,
+    dmg_y1: usize,
     title: [u8; MAX_TITLE],
     title_len: usize,
     /// Compat shim marker: window created implicitly by [`super::screen::present_surface`]. Such a
@@ -168,12 +184,53 @@ impl Window {
             scale: 1,
             z: 0,
             damaged: false,
+            dmg_y0: 0,
+            dmg_y1: 0,
             title: [0u8; MAX_TITLE],
             title_len: 0,
             compat: false,
             pinned: false,
             presented: false,
         }
+    }
+
+    /// FBCON-DMG — declare the WHOLE outer box damaged. This is what `r.damaged = true` meant before
+    /// the band existed, and every damage path in the tree still means exactly it: an empty band
+    /// reads as "the whole box", so clearing the band here is what keeps a chrome repaint, a move, a
+    /// raise, a focus change and a `damage_intersecting` unconditionally whole-box even when a banded
+    /// present is already pending on the same row.
+    fn damage_all(&mut self) {
+        self.damaged = true;
+        self.dmg_y0 = 0;
+        self.dmg_y1 = 0;
+    }
+
+    /// FBCON-DMG — declare SOURCE rows `[y0, y1)` damaged, widening whatever band is already pending.
+    ///
+    /// Fail-safe in the direction that cannot lose a pixel: a band already standing for the whole box
+    /// (empty, i.e. an unserviced [`Window::damage_all`]) STAYS the whole box, and an empty or
+    /// inverted argument is likewise promoted to the whole box rather than silently narrowing
+    /// anything.
+    ///
+    /// **No caller in this milestone** — the banded present verb that produces the band is the next
+    /// one. Kept here with the field it maintains so the invariant and its enforcement land together.
+    #[expect(dead_code, reason = "FBCON-DMG substrate; the banded present verb wires it next")]
+    fn damage_rows(&mut self, y0: usize, y1: usize) {
+        if y1 <= y0 {
+            self.damage_all();
+            return;
+        }
+        if self.damaged && self.dmg_y1 <= self.dmg_y0 {
+            return; // a whole-box repaint is already owed; it covers these rows.
+        }
+        if self.damaged {
+            self.dmg_y0 = self.dmg_y0.min(y0);
+            self.dmg_y1 = self.dmg_y1.max(y1);
+        } else {
+            self.dmg_y0 = y0;
+            self.dmg_y1 = y1;
+        }
+        self.damaged = true;
     }
 }
 
@@ -651,7 +708,7 @@ pub(super) fn compat_present(
         r.scale = scale;
         r.x = x;
         r.y = y;
-        r.damaged = true;
+        r.damage_all();
         r.presented = true;
     }
     composite();
@@ -754,7 +811,7 @@ pub fn present(id: WinId) -> bool {
         let mut t = table();
         let owner = match row_mut(&mut t, id) {
             Some(r) => {
-                r.damaged = true;
+                r.damage_all();
                 r.presented = true;
                 #[cfg(all(target_arch = "aarch64", feature = "witness"))]
                 if !r.compat {
@@ -847,7 +904,7 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
                 r.x = x.clamp(BORDER, max_x);
                 r.y = y.clamp(TITLE_H + BORDER, max_y);
                 r.pinned = true;
-                r.damaged = true;
+                r.damage_all();
                 if outer_box(r) == before { None } else { Some(before) }
             }
             None => return false,
@@ -1311,7 +1368,7 @@ pub fn focus_changed(asid: u64) {
         if prev != asid && prev != 0 {
             for r in t.rows.iter_mut() {
                 if r.used && !r.compat && r.owner_asid == prev {
-                    r.damaged = true;
+                    r.damage_all();
                 }
             }
         }
@@ -1355,7 +1412,7 @@ pub fn focus_changed(asid: u64) {
                     nhidden += 1;
                     // Damaged so that a later raise repaints from the source surface rather than
                     // trusting whatever survived on the panel.
-                    r.damaged = true;
+                    r.damage_all();
                 }
             }
         } else {
@@ -1366,7 +1423,7 @@ pub fn focus_changed(asid: u64) {
                 let z = t.next_z;
                 t.next_z = t.next_z.wrapping_add(1).max(1);
                 t.rows[i].z = z;
-                t.rows[i].damaged = true;
+                t.rows[i].damage_all();
                 if first_id == WIN_NONE {
                     first_id = t.rows[i].id;
                 }
@@ -1535,7 +1592,7 @@ pub fn repaint() {
         }
         for r in t.rows.iter_mut() {
             if repaintable(r) {
-                r.damaged = true;
+                r.damage_all();
             }
         }
     }
@@ -1656,7 +1713,7 @@ pub fn damage_intersecting(x: usize, y: usize, w: usize, h: usize) -> usize {
             continue;
         }
         if boxes_overlap(rect, outer_box(&t.rows[i])) {
-            t.rows[i].damaged = true;
+            t.rows[i].damage_all();
             n += 1;
         }
     }
@@ -4324,6 +4381,41 @@ fn outer_box(r: &Window) -> (usize, usize, usize, usize) {
     }
 }
 
+/// FBCON-DMG — the part of `r`'s outer box a banded present will actually repaint.
+///
+/// `band` is in SOURCE rows; the conversion to panel rows is `r.y + sy * r.scale`, the same mapping
+/// [`paint_window`] blits the content through, so the rectangle returned here is exactly the one the
+/// pass writes. `None` — every window that has not taken a banded present, which in this milestone is
+/// every window there is — returns [`outer_box`] unchanged, which is why every existing caller and
+/// every existing window is unaffected.
+///
+/// The result is intersected with the outer box, so a band cannot extend a window's damage past its
+/// own chrome however wrong the caller's rows are.
+///
+/// **No caller in this milestone**: the occlusion closure and the staged-present row range that
+/// consume it land next, together with the verb that produces a non-`None` `band`.
+#[expect(dead_code, reason = "FBCON-DMG substrate; the composite pass wires it next")]
+fn damaged_box(r: &Window, band: Option<(usize, usize)>) -> (usize, usize, usize, usize) {
+    let (bx, by, bw, bh) = outer_box(r);
+    let Some((sy0, sy1)) = band else {
+        return (bx, by, bw, bh);
+    };
+    if sy1 <= sy0 {
+        return (bx, by, bw, bh);
+    }
+    // F5 discipline: saturating throughout, so a nonsense band degrades to a large box the panel
+    // clip bounds rather than to a small one that under-damages.
+    let y0 = r.y.saturating_add(sy0.saturating_mul(r.scale)).max(by);
+    let y1 = r
+        .y
+        .saturating_add(sy1.saturating_mul(r.scale))
+        .min(by.saturating_add(bh));
+    if y1 <= y0 {
+        return (bx, by, bw, 0);
+    }
+    (bx, y0, bw, y1 - y0)
+}
+
 /// CLOSE-BOX (P79, bench: "put a close button in the upper right of the windows to exit") — the
 /// close box's panel rect as `(x, y, side)`, or `None` for a row that has no close box.
 ///
@@ -6175,7 +6267,7 @@ fn create_inner(
     row.surf = surf;
     row.surf_len = surf_len;
     row.z = z;
-    row.damaged = true;
+    row.damage_all();
     row.compat = compat;
     row.title_len = title.len().min(MAX_TITLE);
     row.title[..row.title_len].copy_from_slice(&title[..row.title_len]);
@@ -6353,7 +6445,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         // each other is a legibility problem the operator can fix by closing one; a window over the
         // instrument panel silently breaks the one surface that is supposed to be always readable.
         r.y = cy.min(usable_h.saturating_sub(bh));
-        r.damaged = true;
+        r.damage_all();
         if outer_box(r) != before && before.2 != 0 && before.3 != 0 {
             vacated[nv] = before;
             nv += 1;
