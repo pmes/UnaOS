@@ -756,6 +756,17 @@ confirms the bytes; it does not itself retire the bin.**
 
 ## 22. The empty-frame bisection — walk the wedge down to one packet class (V3D-48)
 
+> **⚠ BASELINE RETRACTED — read §49.8 before citing any negative from this section.** Every rung
+> below was measured behind `probe_job`'s bin frame, which opened and never closed (the §49.3
+> confound). On 2026-08-02 the R1 rung re-took the `Empty` frame as a boot's **first** CT0 kick
+> (R23 boot6) and **it retired**: `BFC` Δ1 on both engines, with the PTB writing real non-zero bytes
+> over the poison in both output regions. The premise "an empty bin frame does not retire" is
+> therefore **retracted**, and with it every reading in this file that leant on it. The ladder's
+> packet-class bisection is still a real measurement and its *relative* rungs still stand against
+> each other; what does not stand is any absolute negative taken from it. Re-take a rung with R1
+> placement (§49.7) before citing it. See §49.8 for the full three-boot bracket and §49.9 for the
+> bisection that replaces this one on the render-list side.
+
 The per-packet exoneration is now total: shader words (§21), `TILE_BINNING_MODE_CFG` (§20, 8/8 vs Mesa),
 the lone `FLUSH` terminator, the `CT0QMA→QMS→QTS|ENABLE→QBA→QEA` submit order, GMP, and the pre-armed
 overflow pool are each byte-perfect against Mesa/the kernel. Yet on metal the full draw's bin still never
@@ -1979,7 +1990,7 @@ latch-artifact reading is not contaminated by a `BPOS` write) and before `CT0QBA
 | --- | --- | --- |
 | `[v3d59] ctstate` | bit 3 set **at S0**, on a fresh-reset block whose CT1 renders clean | **The borrowed map is indicted, not the hardware.** Bit 3 is not `CTERR` on 4.x; discard every inferred column and do **not** arm `V3D59_ARM_CT0_RESET` — `CTRSTA` comes from the same map. This is the falsifier, and it is checked before every verdict below. |
 | `[v3d59] ctstate` | bit 3 (inferred `CTERR`) set at a station **other than** S0 | *On the borrowed map*, the CT0 control thread **faulted** — which would collapse the whole paradox to one undecoded bit. A **lead, not a verdict**: corroborate bit 3 independently before acting, then hunt what the CLE rejected at that station. |
-| `[v3d59] ctstate` | inferred `CTSUBS` set at S4 | *On the borrowed map*, the thread believes it is still inside a **sub-list** at the end of a list that reached `EA`, and such a thread never reaches the top-level `FLUSH`'s completion semantics. Audit every `BRANCH`/`RETURN` in the bin CL. The `CTRTSD[9:8]` window is printed as raw bits — the sources disagree on its width, so it is a candidate depth, not a depth. |
+| `[v3d59] ctstate` | inferred `CTSUBS` set at S4 | **RETRACTED (R23 boot7, 2026-08-02 — see §49.8).** Metal read bit 4 **set** at S3 and S4 with `CT0RA` reading **zero at all five stations**: the thread claims a sub-list and has no return address, so bit 4 is not `CTSUBS` on V3D 4.2 and this row cannot be read at all. The original text, kept for provenance: *on the borrowed map*, the thread believes it is still inside a sub-list at the end of a list that reached `EA`, and such a thread never reaches the top-level `FLUSH`'s completion semantics — audit every `BRANCH`/`RETURN` in the bin CL. **Do not act on that.** The falsification is one bit of a map borrowed on offset identity alone, so it indicts the borrow, not just the bit: `CTRSTA` (bit 15) comes from the same act and R6 is disarmed with it (§49.4). The `CTRTSD[9:8]` window was already only a candidate depth. |
 | `[v3d59] ctstate` | `CT0SYNC`/`CT1SYNC` non-zero at S0, or moving across the kick | *Possibly* the block carries CLE **rendezvous state** into the bin. **Weak row, two ways:** the read side effects of these registers are unverified, so a read-to-clear or read-to-decrement semaphore would be moved **by this probe itself** (five stations = five reads each), manufacturing the `sema_moved=1` it reports; and their reset values are unknown, so non-zero at S0 is not by itself abnormal. Confirm with a single-read boot before concluding anything. |
 | `[v3d59] ctstate` | `BXCF` non-zero | Something is configuring the PTB behind us on a block we reset ourselves. A bring-up fact, not a packet fact. |
 | `[v3d59] ctstate` | Clean `CT0CS`, semaphores at rest, `BXCF` zero, **`CT0LC` and `CT0PC` both unmoved** | The CLE consumed the address range without its list-item or primitive counters registering anything — it is not executing the list it fetched. Next surface is CL **fetch/decode**, not the PTB. |
@@ -3931,12 +3942,23 @@ difference left between how this driver uses the block and how every working dri
 
 ---
 
-**R6 — `CTRSTA`: the thread reset, and why the bar is now met.**
+**R6 — `CTRSTA`: the thread reset. DISARMED AGAIN (R23 boot7, 2026-08-02 — see §49.8).**
+
+> **The bar named below is no longer met.** R6's case rested on the borrowed VC4-era `CTnCS` map
+> being *good enough at the bits that matter*, with `0x70` read as a measurably illegal fetching
+> state. boot7 falsified that map at bit 4 — `CTSUBS` set with `CT0RA` zero at every station — and
+> `CTRSTA` (bit 15) is not an independent constant: it comes from the same borrow, on the same
+> offset-identity argument, with no separate corroboration anywhere in this file. Writing an
+> uncorroborated bit into a control register is the PI-V3D-4/-6 bug class, and the readback
+> mitigation below does not cover it: a wrong bit 15 may *do* something, and "nothing was risked"
+> was only ever true if the constant was merely inert. **Do not arm R6** until a `CTnCS` field
+> layout for V3D 4.2 is sourced rather than inferred. The rest of this entry is kept for provenance.
 
 *Action.* Write `CT0CS = CTRSTA` (bit 15) on an already-wedged CT0, read `CT0CS` back, then re-kick.
 Issue it **only** between rungs whose verdicts are already banked, never before a first kick.
 
-§32 and §33 kept this disarmed for two stated reasons, and both have moved:
+§32 and §33 kept this disarmed for two stated reasons, and both had moved as of §49.4 — the second of
+which §49.8 has since taken back:
 
 - *"the constant is inferred, not corroborated."* Still true — bit 15 comes from the VC4-era map
   carried across on offset identity, and `v3d.rs` records that only `CTRUN` is corroborated for
@@ -4062,6 +4084,7 @@ tag below, with the pre-existing `[v3d74a]` still present as the control).
 picks the list, so one build is one experiment. `1` and an empty value select `empty` (§49.6's top
 pick); an unrecognised value runs `empty` and says on the wire that it was not recognised, so a typo
 can never be read as a deliberate variant choice. The raw value rides the `[v3d85]` header line.
+PI-V3D-86 later added a fourth value **family**, `rclp<n>` — the prefix bisection; see §49.9.
 
 The exact deep-battery boot line for the sitting:
 
@@ -4135,3 +4158,260 @@ never wrong. Read `[v3d56] scan` where you would normally read `[v3d55] tilestat
 frame pair), R6 (`CTRSTA`), R8 (the instrument-free boot) and R9/R10 (`BXCF`/`QRMAXCNT`, recommended
 against in §49.5) are untouched. They are separate boots and separate arcs, and §49.4 is explicit
 that nothing below R1 is interpretable until R1 is taken.
+
+---
+
+### 49.8 The first-kick bracket — three metal boots, and what they cost the file (R23, 2026-08-02)
+
+The R1 rung was taken three times on the bench, one variant per boot, on the same image family and
+the same session: capture `pi4-r23s1x/ttyACM0.log`, marks `boot6` / `boot7` / `boot8`. This is the
+first time in the campaign that three *different* list classes were each measured as a boot's
+**first** CT0 kick, with nothing in front of them. Read them as a bracket; individually they each
+say less than the three of them say together.
+
+#### The bracket table
+
+| Boot | Variant | Image | `CT0CA` | `CT0CS` at S3/S4 | `BFC` | Poison (tile-state / pool) | `BMACTIVE` S0..S4 | Reading |
+|---|---|---|---|---|---|---|---|---|
+| boot6 | `empty` | `529e2263` | `QBA → QEA` (whole 14-byte list) | `0x20` → `0x00` | **Δ1** | 48 of 64 touched / 20 of 8192 touched | `00000` | **The empty frame RETIRED as kick #1** — a bin frame closed and the PTB wrote real, non-zero bytes into both regions |
+| boot7 | `rcl` | `529e2263` | **held `QBA`, 500 samples, never moved** | `0x18` at S3 **and** S4 (`CTERR`+`CTSUBS` on the borrowed map, `CTRUN`=0) | Δ0 | **INTACT 64/64 and 8192/8192** | `00000` | **Wedged at the first fetch.** The thread was provably loaded (`CT0EA` took `QEA` at S3) and then never issued one access |
+| boot8 | `m4` | `22e7997d` | `QBA → QEA` (whole 76-byte list) | `0x00` → `0x00` | Δ0 | **INTACT 64/64 and 8192/8192** | `00001` | **List consumed, frame OPENED and left open.** `CT0PC=3` (three primitives fed), `INT_STS` bit 16 latched, `retired=0` |
+
+Three list classes, three different failure *stations*. That is the point of the bracket.
+
+#### What the bracket retracts
+
+**RETRACTED — "an empty bin frame does not retire."** boot6 closed a bin frame (`BFC` Δ1) on both
+engines and the PTB wrote non-zero bytes over the poison in *both* output regions. Every reading in
+this file that rested on "the empty frame is the minimal case and it does not retire" was measured
+behind `probe_job`'s wedged frame, exactly as §49.3 warned. The `[v3d48]`/§22 ladder is **not** void —
+its packet-class bisection is still a real measurement — but its *baseline* is, and no negative from
+it may be cited without an R1-placed re-take. §22 now carries this pointer at its head.
+
+**RETRACTED — §33's inferred-`CTSUBS` row.** boot7 read `CTSUBS` (bit 4) **set** at S3 and S4 with
+`CT0RA` reading **zero at every one of the five stations**. A thread that is genuinely inside a
+sub-list has a return address; this one claims the state and has none. Bit 4 is therefore not
+`CTSUBS` on V3D 4.2, the VC4-era map §33 borrowed on offset identity alone is wrong *at that bit*,
+and §33's "audit every `BRANCH`/`RETURN` in the bin CL" row falls with it. §33's probe matrix is
+annotated accordingly.
+
+**DISARMED — R6 (`CTRSTA`).** R6's whole case for arming (§49.4) was that the wedged `0x70` word is
+*measurably* not a legal fetching state on the borrowed map, and that `CTRSTA` (bit 15) comes from
+that same map. boot7 falsified the map at bit 4 — the same map, the same provenance, the same
+single act of borrowing. Bit 15 is not independently corroborated by anything, so R6 goes back to
+disarmed and stays there until a `CTnCS` layout for 4.2 is sourced rather than inferred. R6's entry
+in §49.4 carries this.
+
+Two further facts the bracket banks, neither of them a retraction:
+
+- **`CT0CS = 0x18` is a fourth word.** §46.1's ground truth gives fetching `0x20` and this campaign's
+  banked wedge `0x70`. boot7 read `0x18` — `CTERR`(b3) + `CTSUBS`(b4), with `CTRUN` **clear** — at S3
+  and unchanged at S4. Nothing in this file predicts it, and with the bit-4 retraction above the word
+  cannot be decoded at all today; it is recorded as a raw signature, not as a decode.
+- **`INT_STS` bit 16 on boot8 is a QPU host interrupt, not a CLE or PTB signal.** Read from this
+  driver's own constants: `V3D_INT_QPU_MASK = 0xffff0000` / `V3D_INT_QPU_SHIFT = 16`, bit `16+n` =
+  QPU *n* raised a host interrupt (the QPU executed an instruction carrying the thread-end-with-host-
+  interrupt signal). `0x0001_0000` is therefore **QPU 0 signalled program end** — the coordinate
+  shader ran to completion — while `FLDONE` never latched and `BFC` never moved. It is deliberately
+  outside `V3D_CORE_IRQS` (`0xa7`), so it latches in the raw status regardless of the mask.
+  [READ-FROM-CODE] `unaos/crates/kernel/src/arch/aarch64/v3d.rs`, the V3D 4.x interrupt-bit block.
+
+#### The wall statement
+
+> **Two list classes execute; the RCL list's first packet freezes the CLE fetch.**
+
+Both **bin-class** lists — the 5-packet `empty` frame and the 14-packet `m4` draw — were walked end
+to end by the CLE (`CT0CA` reached `QEA` on both). The **render-class** list was not: `CT0CA` sat on
+`QBA` for 500 consecutive samples across a half-second wait, with the thread loaded and the MMU
+counters flat. The CLE is not broken as a fetch engine and the bin class is not uniquely rejected at
+fetch; what is rejected is the *first packet of the render list on CT0*. Everything below this line
+is about naming that packet.
+
+Note the shape this leaves: `empty` closes its frame, `m4` opens one and never closes it, `rcl`
+never starts. Those are three distinct defects, and only the third one is what §49.9 goes after.
+
+#### The candidate head-packet differences, from our own list builders
+
+All three lists are built in `unaos/crates/kernel/src/arch/aarch64/v3d.rs`. The inventories below are
+the builders' own emission order, corroborated on the wire by the `[v3d36]`/`[v3d57]` decodes in
+boot6/boot8 and by the `[v3d15]` byte dump in boot7.
+
+| | `empty` (bin) | `m4` (bin) | `rcl` (render) |
+|---|---|---|---|
+| Builder | `build_bin_cl_content_geom(.., BinContent::Empty, ..)` | `build_bin_cl` | `build_rcl` |
+| Arena offset | `OFF_PROBE_BIN_CL = 0x35000` | `OFF_BIN_CL = 0x10000` | `OFF_RCL = 0x8000` |
+| Packets | 5 | 14 | **20** |
+| Bytes | 14 | 76 | **106** |
+| First packet | `NUMBER_OF_LAYERS` (op 119, len 2) | `NUMBER_OF_LAYERS` (op 119, len 2) | **`TILE_RENDERING_MODE_CFG` (op 121, len 9), sub-id `COMMON`** |
+| Second packet | `TILE_BINNING_MODE_CFG` (op 120, len 9) | `TILE_BINNING_MODE_CFG` (op 120, len 9) | `TILE_RENDERING_MODE_CFG`, sub-id `CLEAR_COLORS_PART1` |
+| Terminator | `FLUSH` (op 4) | `FLUSH` (op 4) | `END_OF_RENDERING` (op 13) |
+| `CT0CA` outcome | walked `QBA→QEA` | walked `QBA→QEA` | **froze at `QBA`** |
+
+The concrete, code-read differences that are candidates for the freeze, each with the constant or
+call site it is read from:
+
+1. **First packet opcode/class.** The two lists that fetch both open on `NUMBER_OF_LAYERS`
+   (`P_NUMBER_OF_LAYERS = 119`); the list that does not opens on `TILE_RENDERING_MODE_CFG`
+   (`P_TRMC = 121`). 121 is the highest opcode in either list and the only head packet that is
+   *render-class*. [READ-FROM-CODE] `build_bin_cl_content_geom` first `w.pkt(...)`; `build_rcl` first
+   `w.pkt(...)`; `P_NUMBER_OF_LAYERS` / `P_TRMC` constants.
+2. **First packet length.** 2 bytes (bin) vs **9 bytes** (render). If the CLE prefetches a fixed
+   window and the head packet's declared length disagrees with what the *bin*-armed decoder expects,
+   the first fetch is exactly where that shows. [READ-FROM-CODE] `Pkt::new(P_NUMBER_OF_LAYERS, 2)` vs
+   `Pkt::new(P_TRMC, 9)`.
+3. **Sub-id-dispatched head packet.** `TILE_RENDERING_MODE_CFG` is four *different* packets sharing
+   one opcode, selected by a 4-bit sub-id at XML bit 0 (`TRMC_SUBID_COMMON` … `_ZS_CLEAR_VALUES`),
+   and the render list emits all four back to back as packets 0–3. No packet in either bin list is
+   sub-id-dispatched. [READ-FROM-CODE] the four `Pkt::new(P_TRMC, 9).f(0, 4, TRMC_SUBID_*)` calls.
+4. **Presence/absence of the bin prologue.** The bin lists carry the frame handshake
+   `NUMBER_OF_LAYERS → TILE_BINNING_MODE_CFG → FLUSH_VCD_CACHE → [OCCLUSION_QUERY_COUNTER] →
+   START_TILE_BINNING`; §33 T4 and the `[v3d57]` audit both bank that order as mainline-exact. The
+   render list has **no** `TILE_BINNING_MODE_CFG` and **no** `START_TILE_BINNING` at all, and its
+   `FLUSH_VCD_CACHE` sits at packet 16, not packet 2. [READ-FROM-CODE] `build_bin_cl_content_geom`
+   prologue; `build_rcl` — `P_FLUSH_VCD_CACHE` appears once, after the two tile loops.
+5. **`CFG`/`OQ` prologue.** `m4` carries `OCCLUSION_QUERY_COUNTER` (op 92, addr 0 = disabled) and
+   `CFG_BITS` (op 96); `empty` carries neither; `rcl` carries neither. This one is therefore
+   **excluded as the wall by the bracket itself** — `empty` has no OQ/CFG prologue and still fetched.
+   It is listed because §49.4 named it, and it is now closed. [READ-FROM-CODE] `build_bin_cl`'s
+   `P_OCCLUSION_QUERY_COUNTER` / `P_CFG_BITS` emissions vs their absence in the other two.
+6. **Tile-binning-mode config words.** `TILE_BINNING_MODE_CFG` (op 120, 9 bytes) is present in both
+   fetching lists with identical audited fields (initial block 128 B, overflow block 64 B, 1 RT,
+   32-bit BPP, 64×64 minus-one) and **absent** from the render list. Its render-side counterpart,
+   `TILE_LIST_INITIAL_BLOCK_SIZE` (op 126), sits at render packet 4 — past the freeze point, so the
+   bracket says nothing about it yet. [READ-FROM-CODE] `Pkt::new(P_TILE_BINNING_MODE_CFG, 9)` field
+   list; `Pkt::new(P_TILE_LIST_INITIAL_BLOCK_SIZE, 2)`.
+7. **List length and terminator class.** 106 bytes / `END_OF_RENDERING` (op 13) versus 14 and 76
+   bytes / `FLUSH` (op 4). Length is a weak candidate — the CLE froze before consuming any of it —
+   but it is the one property the next rung can move continuously, which is precisely why the next
+   rung moves it. [READ-FROM-CODE] `P_END_OF_RENDERING` (documented in the file as v3d_packet.xml
+   code 13, explicitly **not** `Halt`/0) vs `P_FLUSH = 4`.
+8. **Alignment — excluded.** All three lists start at 4 KiB-aligned arena offsets
+   (`0x35000` / `0x10000` / `0x8000`) and all three submits passed the `[v3d54]` audit with
+   `BA`/`EA`/span all OK. Head-packet alignment is not a live candidate. [READ-FROM-CODE] the
+   `OFF_*` constants; `[v3d54] submit` lines in all three captures.
+
+Candidates 1, 2, 3, 4 and 6 all sit at or before render packet 1 and the bracket cannot separate
+them, because every one of them differs at the *same* byte. Separating them needs a list that keeps
+some of the render head and drops the rest — which is §49.9.
+
+---
+
+### 49.9 The prefix bisection — `UNAOS_V3D_FIRSTKICK=rclp<n>` (PI-V3D-86)
+
+§49.8 leaves five candidate properties tied at the first byte. The bisection unties them the only way
+a read-only campaign can: keep the render list's head, shorten its tail, and find the shortest prefix
+that still freezes the fetch — and, going the other way, the longest prefix that still fetches.
+
+**The knob grammar.** `UNAOS_V3D_FIRSTKICK=rclp<n>`, where `<n>` is a **decimal, 1-based count of
+main-list packets to keep**. `rclp1` keeps only `TILE_RENDERING_MODE_CFG(COMMON)`; `rclp7` keeps
+through `MULTICORE_RENDERING_SUPERTILE_CFG`; `rclp19` keeps through `SUPERTILE_COORDINATES`. The
+value joins `empty` / `rcl` / `m4` on the *existing* knob rather than adding a second variable: the
+knob's presence still arms the feature, its value is still read with `option_env!` at compile time,
+and one build is still exactly one experiment. A separate numeric knob was rejected for a specific
+reason — the `[v3d85]` header prints the raw knob value, and `rclp7` names the whole experiment in
+one token that a capture, a build log and `strings` on the image all carry identically. A bare
+`rclp`, `rclp0`, a non-decimal suffix or a value above 4096 is **not recognised**: the boot runs
+`empty` and says `recognised=0` on the wire, so a typo can never read as a deliberate choice.
+
+**The list, and where the cuts fall.** The render list is 20 packets / 106 bytes, so the family is
+`rclp1` … `rclp19`. Boundaries are the builder's own — `RclWriter` counts packets and stops, so a cut
+is at a packet boundary *by construction* and there is no second encoding path to keep in sync:
+
+| n | last kept packet | op | prefix bytes | list bytes (+terminator) |
+|---|---|---|---|---|
+| 1 | `TILE_RENDERING_MODE_CFG` (COMMON) | 121 | 9 | 10 |
+| 2 | `TILE_RENDERING_MODE_CFG` (CLEAR_COLORS_PART1) | 121 | 18 | 19 |
+| 3 | `TILE_RENDERING_MODE_CFG` (COLOR) | 121 | 27 | 28 |
+| 4 | `TILE_RENDERING_MODE_CFG` (ZS_CLEAR_VALUES) | 121 | 36 | 37 |
+| 5 | `TILE_LIST_INITIAL_BLOCK_SIZE` | 126 | 38 | 39 |
+| 6 | `MULTICORE_RENDERING_TILE_LIST_SET_BASE` | 123 | 43 | 44 |
+| 7 | `MULTICORE_RENDERING_SUPERTILE_CFG` | 122 | 52 | 53 |
+| 8 | `TILE_COORDINATES` | 124 | 56 | 57 |
+| 9 | `END_OF_LOADS` | 26 | 57 | 58 |
+| 10 | `STORE_TILE_BUFFER_GENERAL` (dummy, buffer=None) | 29 | 70 | 71 |
+| 11 | `CLEAR_TILE_BUFFERS` | 25 | 72 | 73 |
+| 12 | `END_OF_TILE_MARKER` | 27 | 73 | 74 |
+| 13 | `TILE_COORDINATES` | 124 | 77 | 78 |
+| 14 | `END_OF_LOADS` | 26 | 78 | 79 |
+| 15 | `STORE_TILE_BUFFER_GENERAL` (dummy, buffer=None) | 29 | 91 | 92 |
+| 16 | `END_OF_TILE_MARKER` | 27 | 92 | 93 |
+| 17 | `FLUSH_VCD_CACHE` | 19 | 93 | 94 |
+| 18 | `START_ADDRESS_OF_GENERIC_TILE_LIST` | 20 | 102 | 103 |
+| 19 | `SUPERTILE_COORDINATES` | 23 | 105 | **106 — identical to plain `rcl`** |
+
+**The terminator.** Every truncated list gets one `END_OF_RENDERING` (op 13) appended, emitted
+through the same `Pkt`/`RclWriter` encoder every other packet in the file goes through — never a
+hand-placed byte. Op 13 is this file's audited render-list terminator and explicitly *not* `Halt`/0.
+
+**The audit, and why it is not `[v3d57]`.** `[v3d57]` (`v3d57_cl_mesa_diff`) and `[v3d36]`
+(`decode_cl_packets`) are **binning-CL** instruments: their opcode tables are the bin packet set, and
+the `rcl` variant has never been passed to them precisely because a bin-class decoder aimed at a
+render list manufactures nonsense packet names. That has not changed, and the prefix family inherits
+the `rcl` treatment — the `[v3d15]` byte dump is its inventory of record. What the family adds
+instead is `[v3d86]`, a truncation audit that states, per boot:
+
+- requested `n`, clamped `n`, the list's TOTAL packet count and the family's legal range;
+- prefix bytes, the terminator's opcode and length, the resulting list length, and the full list's
+  length for comparison;
+- **`prefix-is-a-true-prefix`** — a *measured* check, not an argument from construction: the full
+  list is laid down, a position-weighted sum is taken over its first `prefix_len` bytes, the
+  truncated list is laid over it and the same span is summed again. Unequal sums print
+  `TRUNCATION IS NOT A PREFIX` and say in terms that the boot bisects nothing and carries no verdict;
+- **the top-rung positive control** — at `n = 19` the prefix ends on `SUPERTILE_COORDINATES` and the
+  appended terminator re-creates `END_OF_RENDERING`, so `rclp19` must be byte-identical to plain
+  `rcl`. The line checks that and reports it on *every* prefix boot, so the family carries its own
+  falsifier for free.
+
+**Scope, unchanged.** The prefix variants are the `rcl` variant with a shorter list and nothing else:
+same seeded target, same three cache publishes, same bare `CT0QBA → CT0QEA` submit, **no**
+`CT0QMA`/`QMS`/`QTS`, **no** `BPOS=0`, **no** pre-kick L2T invalidate. Same read-only discipline as
+every other rung — `BXCF` and `MISCCFG.QRMAXCNT` stay EXCLUDED MEASURED, `CTRSTA` stays unimplemented
+(and, per §49.8, newly disarmed), no mailbox tag is sent. Witness format follows `[v3d85r1]` exactly,
+with the variant named as `rclp<n>` in every line's variant field.
+
+**Reading it.**
+
+| Outcome | Reading |
+|---|---|
+| `rclp1` freezes (`CT0CA` holds `QBA`) | The wall is inside `TILE_RENDERING_MODE_CFG(COMMON)` itself — opcode 121, its 9-byte length, or its sub-id dispatch. Candidates 1/2/3 survive; 4 and 6 (the absent bin prologue) are dead, because a 10-byte list has no room for a prologue to be missing *from* |
+| `rclp1` advances (`consumed=1`), some `rclpK` freezes | The head packet is legal on CT0 and the wall is at packet `K` — the bisection has a *name*, and the candidate list collapses to whatever packet `K` is. Expect `store-verified=0` on every rung cut before packets 9–10, and read it as a fetch fact only: the prose says so in terms |
+| every `rclpK` fetches up to `rclp19` | `rclp19` is byte-identical to `rcl`, so a fetching `rclp19` beside a frozen `rcl` means the two boots differ in something that is **not** the list — re-take `rcl` before believing either |
+| `[v3d86]` prints `TRUNCATION IS NOT A PREFIX` or the top-rung control reads 0 | Build defect. The kick below it bisects nothing; fix the builder before reading any rung of the family |
+
+**The first two boots.** Ends first, then bisect: `rclp1` asks "is the very first render packet the
+wall?", which is the single highest-information question in the family, and `rclp19` is the control
+that proves the family reproduces the frozen `rcl` it is bisecting.
+
+```
+UNAOS_WITNESS=1 UNAOS_PIUSB=1 UNAOS_GENET=1 UNAOS_SMP7=1 UNAOS_NETTEST=1 UNAOS_V3D=1 \
+UNAOS_VUGPAR=1 UNAOS_WEDGE2=1 UNAOS_V3D_DEEP=1 UNAOS_V3D_FIRSTKICK=rclp1 ./arroyo kernel8
+```
+
+```
+UNAOS_WITNESS=1 UNAOS_PIUSB=1 UNAOS_GENET=1 UNAOS_SMP7=1 UNAOS_NETTEST=1 UNAOS_V3D=1 \
+UNAOS_VUGPAR=1 UNAOS_WEDGE2=1 UNAOS_V3D_DEEP=1 UNAOS_V3D_FIRSTKICK=rclp19 ./arroyo kernel8
+```
+
+One variant per boot, never two — the R1 discipline is the reason the bracket above means anything.
+
+**The `[v3d85r1]` vocabulary fix that rides this arc.** boot8's verdict line printed
+*"THE M4 DRAW RETIRED AS KICK #1"* beside its own `retired=0`, `FRDONE=0` and `BFC Δ0` columns. The
+prose was reading the `executed` flag, which is true when the CLE merely **walks** the list. Consumed
+and closed are different facts and now have different names: the verdict line carries
+`consumed=` (CT0CA reached QEA) and `frame-closed=` (retired / FRDONE / BFC moved) as separate
+columns beside `executed=`, states the formula inline, and each verdict branch may only claim what
+its own columns support. The `executed` column's meaning is deliberately unchanged, so no banked
+reading of *that* column shifts. boot8's line under the fix reads
+*"THE LIST WAS CONSUMED BUT NO FRAME CLOSED ON KICK #1"*.
+
+The rcl class carried the same overclaim and is fixed with it: *"THE RENDER LIST EXECUTED ON CT0"* is
+now reserved for `store-verified=1` — the DRAM readback `clear_job` banks its PASS on — and a list
+that merely walked prints *"CONSUMED ON CT0 … BUT THE STORE DID NOT VERIFY"* and says on the wire
+that it is a fetch fact only. That distinction is not cosmetic for this arc: it is the *expected*
+shape of every prefix cut before the store packets (n < 9), and without it a whole family of boots
+would print a success sentence for a list that was truncated before it could succeed.
+
+**Gate.** `./arroyo check` green on both arches with the knob off; the full-knob `kernel8` build green
+with `UNAOS_V3D_DEEP=1 UNAOS_V3D_FIRSTKICK=rclp7`; `strings -a target/pi_baremetal/kernel8.img` shows
+`[v3d86]` and the raw `rclp7` value. QEMU raspi4b models no V3D, so there is no QEMU leg for this arc
+at all — the verdict is the attended metal boot.

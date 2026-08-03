@@ -569,8 +569,10 @@ v3d81_display = ["v3d81"]
 # implemented; no mailbox tag is sent. Requires `v3d`. DEFAULT OFF — with the feature off not one
 # line of the rung is compiled and an armed V3D boot runs its normal course. The knob VALUE picks the
 # list: `empty` (the `[v3d48]` Empty frame — §49.6's top pick; also selected by `1` or an empty
-# value), `rcl` (`[v3d74a]`'s render list on CT0's queue, bare QBA->QEA with no bin-class arming) or
-# `m4` (the real draw). One experiment per boot, by construction. Enable via `UNAOS_V3D=1
+# value), `rcl` (`[v3d74a]`'s render list on CT0's queue, bare QBA->QEA with no bin-class arming),
+# `m4` (the real draw), or PI-V3D-86's prefix-bisection family `rclp<n>` (the rcl list truncated after
+# main-list packet n, terminator appended — the rung that walks the rcl head packet down; `[v3d86]`
+# audits the cut). One experiment per boot, by construction. Enable via `UNAOS_V3D=1
 # UNAOS_V3D_FIRSTKICK=empty UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot deliberately produces a
 # SHORT capture that is missing every banked witness — it must never be diffed line-for-line against
 # a full deep boot; the rung says so on the wire, first line and last.

@@ -76,8 +76,10 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 #
 # PI-V3D-85: UNAOS_V3D_FIRSTKICK is BOTH — its presence arms the `v3d_firstkick` cargo feature (see
 # the kernel8 knob block below) and its VALUE is read with `option_env!` by arch/aarch64/v3d.rs to
-# pick which list the boot's one CT0 kick carries (`empty` | `rcl` | `m4`; `1` or an empty value
-# select `empty`). The raw value rides the `[v3d85]` header line, so a capture states its own variant.
+# pick which list the boot's one CT0 kick carries (`empty` | `rcl` | `m4` | `rclp<n>`; `1` or an
+# empty value select `empty`). PI-V3D-86's `rclp<n>` is the prefix bisection: the rcl list truncated
+# after main-list packet n. The raw value rides the `[v3d85]` header line, so a capture states its
+# own variant.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
@@ -1479,7 +1481,14 @@ kernel8() {
     # MISCCFG.QRMAXCNT stay EXCLUDED MEASURED (§49.5) and are read, never written; CTRSTA (R6) is not
     # implemented; no mailbox tag is sent. The VALUE picks the list — `empty` (§49.6's top pick; `1`
     # or an empty value select it too), `rcl` ([v3d74a]'s render list on CT0, bare QBA->QEA), `m4`
-    # (the real draw) — one experiment per boot, by construction. Implies UNAOS_V3D. ⚠ an armed boot
+    # (the real draw) — one experiment per boot, by construction. PI-V3D-86 adds the prefix-bisection
+    # family `rclp<n>` (n = 1..19 decimal, e.g. `rclp1`, `rclp7`): the SAME rcl submit with the render
+    # list truncated after main-list packet n and one audited END_OF_RENDERING terminator appended.
+    # R23 read the rcl list WEDGED at its first fetch (CT0CA held QBA, poison 64/64 + 8192/8192
+    # intact) while the empty and m4 BIN lists both walked to EA — so the wall is the rcl head packet,
+    # and the bisection walks the cut point down to name it. [v3d86] audits the truncation
+    # (byte-identity of the prefix + the n==19 top-rung control that must rebuild plain `rcl`).
+    # Implies UNAOS_V3D. ⚠ an armed boot
     # deliberately produces a SHORT capture missing every banked witness: label it and NEVER diff it
     # line-for-line against a full deep boot. QEMU raspi4b models no V3D, so kernel8-test green means
     # no regression and nothing more; the verdict is attended metal.

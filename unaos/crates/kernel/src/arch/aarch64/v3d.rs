@@ -1638,6 +1638,19 @@ const TILE_ALLOC_BLOCK_SIZE_128B: u64 = 1;
 /// `v3dX(emit_rcl)`. ATTENDED-METAL-UNVERIFIED: QEMU raspi4b models no V3D, so this is
 /// correct-by-construction against the cited Mesa sources, refined at the attended sitting.
 fn build_rcl() -> (usize, usize) {
+    let (main_len, sublist_len, _) = build_rcl_limited(usize::MAX);
+    (main_len, sublist_len)
+}
+
+/// PI-V3D-86 — `build_rcl` with a packet ceiling on the MAIN list. `limit == usize::MAX` is the
+/// full list and is what every pre-existing caller gets through `build_rcl`; a finite `limit`
+/// emits exactly the first `limit` packets and stops, which is the prefix-bisection rung's
+/// truncation primitive. Returns `(main_len, sublist_len, main_packets_emitted)`.
+///
+/// The sub-list is ALWAYS built in full, and always first: `GENERIC_TILE_LIST` embeds the sub-list's
+/// start/end addresses, so a prefix that includes that packet has to carry the same two words the
+/// full list carries, or the prefix would not be a prefix.
+fn build_rcl_limited(limit: usize) -> (usize, usize, usize) {
     let target = (arena_phys() + OFF_TARGET) as u32;
     let sublist_start = (arena_phys() + OFF_SUBLIST) as u32;
     let tile_alloc = (arena_phys() + OFF_TILEALLOC) as u32;
@@ -1680,7 +1693,7 @@ fn build_rcl() -> (usize, usize) {
 
     // ── Main render control list (OFF_RCL) — what CT1 executes. Frame config first (COMMON must be the
     // first TILE_RENDERING_MODE_CFG, ZS_CLEAR_VALUES last), then the per-layer render. ──
-    let mut w = RclWriter::new(OFF_RCL);
+    let mut w = RclWriter::new_limited(OFF_RCL, limit);
 
     // TILE_RENDERING_MODE_CFG (Common): 64×64 frame, 1 render target (minus_one → 0), 32-bit max BPP,
     // no MSAA, no double-buffer, Early-Z LT/LE, depth type 0.
@@ -1795,7 +1808,7 @@ fn build_rcl() -> (usize, usize) {
     );
     w.pkt(Pkt::new(P_END_OF_RENDERING, 1).done());
 
-    (w.len(), sublist_len)
+    (w.len(), sublist_len, w.npkts)
 }
 
 /// A fixed-capacity control-list packet: byte 0 is the opcode, the rest is the field payload. Fields
@@ -1846,10 +1859,23 @@ fn set_bits(buf: &mut [u8], mut bit: usize, mut width: usize, val: u64) {
 struct RclWriter {
     off: usize,
     start: usize,
+    /// PI-V3D-86 — how many packets this writer will still emit. `usize::MAX` on every pre-existing
+    /// call site, so the full list is unchanged byte for byte; a finite value truncates the list
+    /// **at a packet boundary by construction**, which is the whole point of the prefix bisection.
+    limit: usize,
+    /// Packets actually emitted. A caller that asked for `usize::MAX` reads the list's exact packet
+    /// count out of this — the count is the builder's own, never a hand-kept table that can drift.
+    npkts: usize,
 }
 impl RclWriter {
     fn new(start_off: usize) -> Self {
-        RclWriter { off: start_off, start: start_off }
+        RclWriter { off: start_off, start: start_off, limit: usize::MAX, npkts: 0 }
+    }
+    /// PI-V3D-86 — a writer that stops after `limit` packets. Truncation happens in `pkt`, so the
+    /// bytes it does emit are byte-identical to the unlimited writer's first `limit` packets: same
+    /// builder, same inputs, same order, no second encoding path to keep in sync.
+    fn new_limited(start_off: usize, limit: usize) -> Self {
+        RclWriter { off: start_off, start: start_off, limit, npkts: 0 }
     }
     #[inline]
     fn put(&mut self, b: u8) {
@@ -1864,10 +1890,14 @@ impl RclWriter {
     /// Append one encoded packet's exact bytes (`(&buf, len)` from `Pkt::done`).
     #[inline]
     fn pkt(&mut self, packet: (&[u8], usize)) {
+        if self.npkts >= self.limit {
+            return; // PI-V3D-86: past the prefix boundary — emit nothing, count nothing
+        }
         let (buf, len) = packet;
         for &b in &buf[..len] {
             self.put(b);
         }
+        self.npkts += 1;
     }
     #[inline]
     fn len(&self) -> usize {
@@ -12860,9 +12890,10 @@ pub fn run_visible_battery_again() -> u32 {
 // diffed line-for-line against a full deep boot. The rung prints that caveat itself, first and last,
 // so the capture carries its own reading instructions.
 
-/// PI-V3D-85 (R1) — the arming switch. `UNAOS_V3D_FIRSTKICK=<empty|rcl|m4>` (feature
+/// PI-V3D-85 (R1) — the arming switch. `UNAOS_V3D_FIRSTKICK=<empty|rcl|m4|rclp<n>>` (feature
 /// `v3d_firstkick`), DEFAULT OFF. Off, not one line of the rung is compiled and `bringup` runs its
-/// normal course; on, `bringup` takes the one kick after M3 and returns.
+/// normal course; on, `bringup` takes the one kick after M3 and returns. `rclp<n>` is PI-V3D-86's
+/// prefix-bisection family (v3d.md §49.9).
 const V3D85_FIRSTKICK: bool = cfg!(feature = "v3d_firstkick");
 
 /// PI-V3D-85 (R1) — which list the boot's one CT0 kick carries. §49.4 names three, and they are
@@ -12878,6 +12909,11 @@ enum V3d85Variant {
     Rcl,
     /// The real M4 draw as kick #1, so the M4 verdict is not read through the probe either.
     M4,
+    /// PI-V3D-86 — the `rcl` list TRUNCATED after packet `n`, with `END_OF_RENDERING` appended as the
+    /// terminator. `n` is 1-based and counts MAIN-list packets. This is the prefix bisection: the
+    /// `rcl` list freezes the CLE at its first fetch (§49.8), so the question is which head packet
+    /// the fetch cannot get past, and the cheapest way to ask it is to keep shortening the list.
+    RclPrefix(usize),
 }
 
 /// The raw knob text, echoed on the wire so a capture states its own build instead of requiring the
@@ -12903,10 +12939,36 @@ const fn v3d85_eq(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
+/// PI-V3D-86 — parse a `rclp<n>` value. Returns `Some(n)` for a well-formed decimal `n >= 1`, and
+/// `None` for anything else (bare `rclp`, `rclp0`, `rclp1x`, an overlong number). Kept a `const fn`
+/// for the same reason the rest of this knob is: the variant has to be a compile-time constant, so
+/// one build is one experiment and `strings` on the image names the experiment it ran.
+#[cfg(feature = "v3d_firstkick")]
+const fn v3d85_parse_rclp(b: &[u8]) -> Option<usize> {
+    if b.len() < 5 || !v3d85_eq(&[b[0], b[1], b[2], b[3]], b"rclp") {
+        return None;
+    }
+    let mut n: usize = 0;
+    let mut i = 4;
+    while i < b.len() {
+        let d = b[i];
+        if d < b'0' || d > b'9' {
+            return None;
+        }
+        n = n * 10 + (d - b'0') as usize;
+        if n > 4096 {
+            return None; // no control list in this file is remotely this long — reject, don't wrap
+        }
+        i += 1;
+    }
+    if n == 0 { None } else { Some(n) }
+}
+
 /// Parse the knob into (variant, recognised). `1` and an empty value both select `empty` — the knob
 /// has to answer to the `=1` form every other `UNAOS_*` switch in this tree uses, and `empty` is the
-/// rung §49.6 ranks first. An UNRECOGNISED value also runs `empty`, but `recognised=false` rides the
-/// wire so a typo can never be read as a deliberate variant choice.
+/// rung §49.6 ranks first. `rclp<n>` selects the PI-V3D-86 prefix bisection. An UNRECOGNISED value
+/// also runs `empty`, but `recognised=false` rides the wire so a typo can never be read as a
+/// deliberate variant choice.
 #[cfg(feature = "v3d_firstkick")]
 const fn v3d85_variant() -> (V3d85Variant, bool) {
     let b = match option_env!("UNAOS_V3D_FIRSTKICK") {
@@ -12919,6 +12981,8 @@ const fn v3d85_variant() -> (V3d85Variant, bool) {
         (V3d85Variant::M4, true)
     } else if v3d85_eq(b, b"empty") || v3d85_eq(b, b"1") || v3d85_eq(b, b"") {
         (V3d85Variant::Empty, true)
+    } else if let Some(n) = v3d85_parse_rclp(b) {
+        (V3d85Variant::RclPrefix(n), true)
     } else {
         (V3d85Variant::Empty, false)
     }
@@ -12928,6 +12992,30 @@ const fn v3d85_variant() -> (V3d85Variant, bool) {
 const V3D85_VARIANT: V3d85Variant = v3d85_variant().0;
 #[cfg(feature = "v3d_firstkick")]
 const V3D85_VARIANT_NAMED: bool = v3d85_variant().1;
+
+/// PI-V3D-86 — the variant's wire name, as one token. Every `[v3d85*]` line names the variant, and a
+/// prefix boot has to name its `n` in the SAME token the knob was set to (`rclp7`, not `rclp` + a
+/// separate column), or a capture cannot be matched to its build by reading one field.
+#[cfg(feature = "v3d_firstkick")]
+struct V3d85Tag;
+#[cfg(feature = "v3d_firstkick")]
+impl core::fmt::Display for V3d85Tag {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match V3D85_VARIANT {
+            V3d85Variant::Empty => f.write_str("empty"),
+            V3d85Variant::Rcl => f.write_str("rcl"),
+            V3d85Variant::M4 => f.write_str("m4"),
+            V3d85Variant::RclPrefix(n) => write!(f, "rclp{}", n),
+        }
+    }
+}
+
+/// True for the two variants that submit the RENDER control list on CT0 with NO bin-class arming —
+/// `rcl` and every `rclp<n>`. The prefix family is the `rcl` submit with a shorter list and nothing
+/// else changed, so every `bin_class`-gated branch has to treat them identically.
+#[cfg(feature = "v3d_firstkick")]
+const V3D85_RCL_CLASS: bool =
+    matches!(V3D85_VARIANT, V3d85Variant::Rcl | V3d85Variant::RclPrefix(_));
 
 // ── R2 — the V3D MMU access counters. ────────────────────────────────────────────────────────────
 //
@@ -13223,7 +13311,80 @@ fn v3d85_r7_emit(what: &str, s: &[V3d85Thread; 5], ra_nonzero: bool) {
     );
 }
 
-/// PI-V3D-85 (R1) — the boot's ONE CT0 kick, with R2/R3/R7 riding it.
+/// PI-V3D-86 — a plain additive checksum over an arena span, folded with a position weight so a
+/// reordering is not invisible. This is an evidence instrument, not a hash: its only job is to let
+/// the prefix-bisection line assert "these `pfx_len` bytes are the full list's first `pfx_len`
+/// bytes" as a MEASUREMENT rather than as an argument from construction.
+#[cfg(feature = "v3d_firstkick")]
+fn v3d85_arena_sum(off: usize, len: usize) -> u32 {
+    let mut acc: u32 = 0x811c_9dc5;
+    let mut i = 0;
+    while i < len && off + i < ARENA_BYTES {
+        let b = unsafe { (*(&raw const V3D_ARENA)).bytes[off + i] };
+        acc = acc.rotate_left(5) ^ (b as u32).wrapping_mul(i as u32 + 1);
+        i += 1;
+    }
+    acc
+}
+
+/// PI-V3D-86 — build the `rclp<n>` list in place at `OFF_RCL` and emit the truncation audit.
+///
+/// Returns `(list_len, sublist_len)`. The list is the full `rcl`'s first `n` MAIN-list packets, with
+/// one `END_OF_RENDERING` (v3d_packet.xml code 13 — the audited render-list terminator, and NOT
+/// `Halt`/0; see `P_END_OF_RENDERING`) appended, emitted through the same `Pkt`/`RclWriter` encoder
+/// every other packet in this file goes through.
+///
+/// Four builds, ~106 bytes each: probe the full packet count, probe the prefix's byte length,
+/// re-lay the FULL list and checksum its first `pfx_len` bytes, then re-lay the PREFIX and checksum
+/// the same span. Equal checksums are the byte-identity evidence; unequal is a build bug and the
+/// line says so instead of kicking.
+///
+/// `n` is clamped to `[1, total-1]`. The upper clamp is deliberate: at `n == total-1` the prefix
+/// ends on `SUPERTILE_COORDINATES` and the appended terminator re-creates `END_OF_RENDERING`, so the
+/// **top rung of the family must be byte-identical to plain `rcl`** — a positive control the line
+/// checks and reports, for free, on every prefix boot.
+#[cfg(feature = "v3d_firstkick")]
+fn v3d85_build_rcl_prefix(n_req: usize) -> (usize, usize) {
+    let (full_len, _, total) = build_rcl_limited(usize::MAX);
+    let n_max = total.saturating_sub(1).max(1);
+    let n = n_req.clamp(1, n_max);
+    let (pfx_len, _, emitted) = build_rcl_limited(n);
+    // Re-lay the FULL list, checksum its first `pfx_len` bytes, then re-lay the prefix over it.
+    let (_, sublist_len, _) = build_rcl_limited(usize::MAX);
+    let full_sum = v3d85_arena_sum(OFF_RCL, pfx_len);
+    let (again_len, _, _) = build_rcl_limited(n);
+    let pfx_sum = v3d85_arena_sum(OFF_RCL, pfx_len);
+    let identical = again_len == pfx_len && pfx_sum == full_sum;
+
+    // The terminator, through the audited encoder — never a hand-placed byte.
+    let mut t = RclWriter::new(OFF_RCL + pfx_len);
+    t.pkt(Pkt::new(P_END_OF_RENDERING, 1).done());
+    let term_len = t.len();
+    let list_len = pfx_len + term_len;
+    let rebuilds_full = n == n_max && list_len == full_len;
+
+    serial_println!(
+        ":: V3D: [v3d86] prefix-bisection ({}) — requested n={} clamped n={} of TOTAL={} main packets (family range 1..={}) | prefix bytes={} + terminator op={} len={} => list bytes={} (full rcl={}) | packets emitted={} | boundary-audit: prefix-is-a-true-prefix={} (weighted sum {:#010x} over the FULL list's first {} bytes vs {:#010x} over the truncated list's) | top-rung control: n==n_max rebuilds the full rcl byte-for-byte={} — {} ::",
+        V3d85Tag, n_req, n, total, n_max,
+        pfx_len, P_END_OF_RENDERING, term_len, list_len, full_len,
+        emitted,
+        identical as u32, full_sum, pfx_len, pfx_sum,
+        rebuilds_full as u32,
+        if !identical {
+            "TRUNCATION IS NOT A PREFIX — the shortened list's head bytes differ from the full list's. This is a BUILD DEFECT, not a hardware reading; whatever the kick below does, it does NOT bisect the rcl head and NO verdict may be drawn from it"
+        } else if emitted != n {
+            "the builder emitted a different packet count than the clamp asked for — read `emitted` as the truth and treat the requested n as unmet; the boundary is still a real packet boundary but it is not the one named"
+        } else if n == n_max && !rebuilds_full {
+            "the top rung did NOT reproduce the full rcl's byte length — the family's own positive control failed, so the terminator rule or the packet count is wrong. Fix that before reading any lower rung"
+        } else {
+            "the list kicked below is the rcl's first n packets, verbatim, plus one audited END_OF_RENDERING terminator — a shorter list of the SAME class, which is the only variable this rung moves"
+        }
+    );
+    (list_len, sublist_len)
+}
+
+/// PI-V3D-85 (R1) — the boot's ONE CT0 kick, with R2/R3/R7 riding it (and, on an `rclp<n>` value,
+/// PI-V3D-86's prefix bisection).
 ///
 /// Called from `bringup` after M3 (the CT1 clear job, which is R2's positive control and `[v3d58]
 /// xengine`'s render reference) and BEFORE `probe_job` — which is the kick this rung exists to get in
@@ -13231,14 +13392,14 @@ fn v3d85_r7_emit(what: &str, s: &[V3d85Thread; 5], ra_nonzero: bool) {
 #[cfg(feature = "v3d_firstkick")]
 fn v3d85_firstkick_rung() {
     serial_println!(
-        ":: V3D: [v3d85] R-LADDER BOOT — READ THIS FIRST. UNAOS_V3D_FIRSTKICK={} (variant={}, recognised={}). This boot runs EXACTLY ONE CT0 kick, placed before probe_job, and then RETURNS: no [v3d48] ladder, no [v3d63/64/66/68/69/71/73s/74/75/76/77/80/81] tails, no M4, no visible battery. The capture is DELIBERATELY missing every banked witness a reader of v3d.md expects — that is the point (a first kick with a ladder behind it is not a first kick) — and it MUST NOT be diffed line-for-line against a full deep boot. Rungs armed: R1 first-kick isolation, R2 MMU access counters, R3 CT0EA/CT0RA queue-vs-thread, R7 CT0CS bit4/bit6 decode. All four are READ-ONLY except the kick's own kernel-exact v3d_bin_job_run writes; BXCF and MISCCFG.QRMAXCNT are EXCLUDED MEASURED (v3d.md §49.5) and are read, never written; CTRSTA (R6) is not implemented; no mailbox tag is sent ::",
+        ":: V3D: [v3d85] R-LADDER BOOT — READ THIS FIRST. UNAOS_V3D_FIRSTKICK={} (variant={}, recognised={}). This boot runs EXACTLY ONE CT0 kick, placed before probe_job, and then RETURNS: no [v3d48] ladder, no [v3d63/64/66/68/69/71/73s/74/75/76/77/80/81] tails, no M4, no visible battery. The capture is DELIBERATELY missing every banked witness a reader of v3d.md expects — that is the point (a first kick with a ladder behind it is not a first kick) — and it MUST NOT be diffed line-for-line against a full deep boot. Rungs armed: R1 first-kick isolation, R2 MMU access counters, R3 CT0EA/CT0RA queue-vs-thread, R7 CT0CS bit4/bit6 decode, and on an rclp<n> value the PI-V3D-86 prefix bisection ([v3d86], v3d.md §49.9 — NOT the §49.4 ladder's R8, which is the instrument-free boot and is still unbuilt). All are READ-ONLY except the kick's own kernel-exact v3d_bin_job_run writes; BXCF and MISCCFG.QRMAXCNT are EXCLUDED MEASURED (v3d.md §49.5) and are read, never written; CTRSTA (R6) is not implemented; no mailbox tag is sent ::",
         V3D85_RAW,
-        match V3D85_VARIANT { V3d85Variant::Empty => "empty", V3d85Variant::Rcl => "rcl", V3d85Variant::M4 => "m4" },
+        V3d85Tag,
         V3D85_VARIANT_NAMED as u32
     );
     if !V3D85_VARIANT_NAMED {
         serial_println!(
-            ":: V3D: [v3d85] knob value {} is NOT one of empty|rcl|m4 (or 1) — running the `empty` rung, which is what v3d.md §49.6 ranks first. This line exists so a typo can never be read as a deliberate variant choice ::",
+            ":: V3D: [v3d85] knob value {} is NOT one of empty|rcl|m4|rclp<n> (or 1) — running the `empty` rung, which is what v3d.md §49.6 ranks first. This line exists so a typo can never be read as a deliberate variant choice ::",
             V3D85_RAW
         );
     }
@@ -13260,7 +13421,7 @@ fn v3d85_firstkick_rung() {
     }
 
     // ── Build the one list, per variant. ────────────────────────────────────────────────────────
-    let bin_class = V3D85_VARIANT != V3d85Variant::Rcl;
+    let bin_class = !V3D85_RCL_CLASS;
     let (cl_off, cl_len) = match V3D85_VARIANT {
         V3d85Variant::Empty => {
             // The `[v3d48]` Empty frame, byte for byte: NUMBER_OF_LAYERS + TILE_BINNING_MODE_CFG +
@@ -13279,6 +13440,17 @@ fn v3d85_firstkick_rung() {
             cache::clean_range(arena_phys() + OFF_RCL, rcl_len);
             cache::clean_range(arena_phys() + OFF_SUBLIST, sublist_len);
             (OFF_RCL, rcl_len)
+        }
+        // PI-V3D-86 — the same list, truncated after packet n. Everything else about this arm is the
+        // `Rcl` arm verbatim: same seeded target, same three publishes, same bare QBA→QEA submit. The
+        // list's LENGTH (and therefore its head-packet inventory) is the only variable that moves.
+        V3d85Variant::RclPrefix(n) => {
+            fill_target(0xDEAD_BEEF);
+            let (list_len, sublist_len) = v3d85_build_rcl_prefix(n);
+            cache::clean_range(arena_phys() + OFF_TARGET, TARGET_BYTES);
+            cache::clean_range(arena_phys() + OFF_RCL, list_len);
+            cache::clean_range(arena_phys() + OFF_SUBLIST, sublist_len);
+            (OFF_RCL, list_len)
         }
         V3d85Variant::M4 => {
             // The real draw. `triangle_job`'s step (0) publish block, verbatim — the M4 bin CL is
@@ -13341,6 +13513,8 @@ fn v3d85_firstkick_rung() {
         decode_cl_packets("v3d85 firstkick", cl_off, cl_len);
         v3d57_cl_mesa_diff("v3d85 firstkick", cl_off, cl_len);
     } else {
+        // The `rclp<n>` family lands here too: same render list, shorter. The dump is the packet
+        // inventory of record for this class, and [v3d86] above states where the cut fell.
         dump_cl_bytes("v3d85 firstkick RCL", cl_off, cl_len, 128);
     }
 
@@ -13374,7 +13548,8 @@ fn v3d85_firstkick_rung() {
         // publish), and `[v3d74a]` mirrors that. Adding an L2T flush on this variant alone would be a
         // divergence from the exact submit whose verdict this rung re-takes.
         serial_println!(
-            ":: V3D: [v3d85r1] rcl variant — NO CT0QMA/CT0QMS/CT0QTS written, NO BPOS=0, NO pre-kick L2T invalidate: the bin-class arming is the variable being removed, and the submit is byte-for-byte clear_job's/[v3d74a]'s (bare QBA->QEA, CPU clean_range only). S1 below is therefore a repeat of S0 by construction ::"
+            ":: V3D: [v3d85r1] {} variant (rcl class) — NO CT0QMA/CT0QMS/CT0QTS written, NO BPOS=0, NO pre-kick L2T invalidate: the bin-class arming is the variable being removed, and the submit is byte-for-byte clear_job's/[v3d74a]'s (bare QBA->QEA, CPU clean_range only). S1 below is therefore a repeat of S0 by construction. On an rclp<n> boot the ONLY further difference from plain rcl is the list's length — see [v3d86] ::",
+            V3d85Tag
         );
     }
     let st1 = v3d58_sample();
@@ -13456,19 +13631,37 @@ fn v3d85_firstkick_rung() {
     let fault =
         mmu_ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
     let bfc_delta = bfc_after.wrapping_sub(bfc_pre);
-    let executed = store_verified || frdone || retired || bfc_delta != 0 || smp_max >= ea;
+    // PI-V3D-86 (WITSWEEP) — split `executed` into the two facts it was silently conflating. The M4
+    // first-kick capture (boot8, 2026-08-02) printed "THE M4 DRAW RETIRED AS KICK #1" beside its own
+    // `retired=0` and `BFC Δ0` columns, because `executed` is true when the CLE merely WALKS the list.
+    // Draw-consumed and frame-closed are different words for different facts and now have different
+    // names; the verdict prose below may only use the one its columns support. The SET `executed`
+    // ranges over is deliberately unchanged, so no banked reading of that column shifts.
+    let consumed = smp_max >= ea; // the CLE stepped every packet — CT0CA reached QEA
+    let frame_closed = frdone || retired || bfc_delta != 0; // a frame actually CLOSED
+    let executed = store_verified || frame_closed || consumed;
 
     // ── The R1 verdict. ─────────────────────────────────────────────────────────────────────────
     let verdict: &str = if fault != 0 {
         "AN MMU FAULT LATCHED across the boot's first kick — instrument fault, not a first-kick verdict. Fix it before citing this rung; nothing here discriminates anything"
     } else if smp_n == 0 {
         "ZERO sampler ticks landed — the wait exited before the first ~1 ms tick, so the fetch columns are INCONCLUSIVE. The retire columns still stand on their own"
-    } else if executed && V3D85_VARIANT == V3d85Variant::Empty {
-        "THE EMPTY FRAME RETIRED AS KICK #1. The wall is state the block ACCUMULATES across kicks, not a cold-boot init gap — and the campaign's whole baseline is RETRACTED: every 'an empty bin frame does not retire' reading in v3d.md was taken behind a probe frame that opened and never closed (§49.3). Re-take the ladder from §22 with R1 placement before citing any banked negative"
-    } else if executed && V3D85_VARIANT == V3d85Variant::Rcl {
-        "THE RENDER LIST EXECUTED ON CT0 AS KICK #1 — thread 0 can fetch and execute from cold, so the death is BIN-CLASS-SPECIFIC and §46/§47's firmware branch (a per-thread enable the ARM cannot reach) is RETIRED. The next target is whatever distinguishes a bin submission before its first word: the QMA/QMS/QTS arming state and its interaction with thread start"
-    } else if executed {
-        "THE M4 DRAW RETIRED AS KICK #1 — the M4 verdict was being read through the probe frame all along. Every M4-derived negative in v3d.md is retracted and the arc's premise dissolves"
+    } else if frame_closed && V3D85_VARIANT == V3d85Variant::Empty {
+        "THE EMPTY FRAME RETIRED AS KICK #1 — a bin frame CLOSED (read the retired/FRDONE/BFC columns, not this sentence alone). The wall is state the block ACCUMULATES across kicks, not a cold-boot init gap — and the campaign's whole baseline is RETRACTED: every 'an empty bin frame does not retire' reading in v3d.md was taken behind a probe frame that opened and never closed (§49.3). Re-take the ladder from §22 with R1 placement before citing any banked negative"
+    } else if V3D85_RCL_CLASS && store_verified {
+        "THE RENDER LIST EXECUTED ON CT0 AS KICK #1 — and it is the DRAM store that says so (store-verified=1), not the walk. Thread 0 can fetch and execute from cold, so the death is BIN-CLASS-SPECIFIC and §46/§47's firmware branch (a per-thread enable the ARM cannot reach) is RETIRED. The next target is whatever distinguishes a bin submission before its first word: the QMA/QMS/QTS arming state and its interaction with thread start"
+    } else if V3D85_RCL_CLASS && executed {
+        // PI-V3D-86 (WITSWEEP) — the rcl class had the same overclaim shape the m4 branch did: a
+        // list that is merely WALKED is not a list that did its work, and for this class the work is
+        // the store. On an rclp<n> boot this is the EXPECTED shape for a truncated list that fetches
+        // but was cut before its store packets, so it must read as a fetch fact and nothing more.
+        "THE RENDER LIST WAS CONSUMED ON CT0 AS KICK #1 BUT THE STORE DID NOT VERIFY — CT0CA advanced (read consumed=/frame-closed= above for which), and the target region does NOT hold the clear colour. For the rcl class the DRAM store is the success criterion, so this is a FETCH fact only: thread 0 got past the head packet, and nothing here says the list completed. On an rclp<n> boot that is the expected reading for any prefix cut before the store packets — what it buys is the boundary, not a retire"
+    } else if frame_closed {
+        "THE M4 DRAW CLOSED A FRAME AS KICK #1 — the M4 verdict was being read through the probe frame all along. Every M4-derived negative in v3d.md is retracted and the arc's premise dissolves"
+    } else if consumed {
+        // PI-V3D-86 (WITSWEEP) — the branch boot8 actually took, and the one that used to print
+        // "RETIRED" beside `retired=0`/`BFC Δ0`. Consumed is not closed, and the words now differ.
+        "THE LIST WAS CONSUMED BUT NO FRAME CLOSED ON KICK #1 — CT0CA walked QBA→QEA, so the CLE stepped every packet, and yet retired=0, FRDONE=0 and BFC Δ0: nothing retired. Draw-consumed and frame-closed are DIFFERENT facts and only the first one happened. Read [v3d58] station for whether the bin frame even opened (BMACTIVE) and [v3d56] poison for whether the PTB wrote a byte; a closeless list that opens a frame and leaves it open is the §49.8 M4 shape"
     } else if smp_in_span == 0 {
         "STILL DEAD, AND FIRST-KICK-TRUE. CT0CA never held an address inside [QBA,QEA] at any sample, on the boot's FIRST CT0 kick, with nothing in front of it. The §49.3 confound is EXCLUDED: the banked negatives mean what they say, and every rung below R1 in the §49.4 ladder is finally measured against a baseline that is what it claims to be. Read [v3d85r2] for whether a second, mechanism-independent instrument agrees, and [v3d85r3] for whether the queue ever reached the thread at all"
     } else if smp_max == ba {
@@ -13477,9 +13670,10 @@ fn v3d85_firstkick_rung() {
         "CT0CA advanced into the list then stalled before QEA on the boot's FIRST kick — the CLE fetches and chokes mid-list at the max-in-span offset. Read it against §48.1 before believing the offset: print the RAW word, not the wrapped difference"
     };
     serial_println!(
-        ":: V3D: [v3d85r1] first-kick verdict ({}) — retired={} FRDONE={} store-verified={} executed={} | BFC {:#010x}->{:#010x} (Δ{}) RFC {:#010x}->{:#010x} (Δ{}) | PCS={:#010x} (BMACTIVE={} BMBUSY={} BMOOM={}) idled={} INT_STS={:#010x} waited={}us submit_sound={} | sampler samples={} in-span={} max-in-span={:#010x} vs QBA={:#010x} QEA={:#010x} | poison touched: tile-state={} of {}, pool={} of {} (drain completed={}) wrote-any={} | MMU_CTL={:#010x} fault={} — {} ::",
-        match V3D85_VARIANT { V3d85Variant::Empty => "empty", V3d85Variant::Rcl => "rcl", V3d85Variant::M4 => "m4" },
-        retired as u32, frdone as u32, store_verified as u32, executed as u32,
+        ":: V3D: [v3d85r1] first-kick verdict ({}) — retired={} FRDONE={} store-verified={} consumed={} frame-closed={} executed={} (executed = store-verified OR frame-closed OR consumed; CONSUMED means CT0CA reached QEA, FRAME-CLOSED means retired/FRDONE/BFC moved — the verdict prose below may only claim the one these columns support) | BFC {:#010x}->{:#010x} (Δ{}) RFC {:#010x}->{:#010x} (Δ{}) | PCS={:#010x} (BMACTIVE={} BMBUSY={} BMOOM={}) idled={} INT_STS={:#010x} waited={}us submit_sound={} | sampler samples={} in-span={} max-in-span={:#010x} vs QBA={:#010x} QEA={:#010x} | poison touched: tile-state={} of {}, pool={} of {} (drain completed={}) wrote-any={} | MMU_CTL={:#010x} fault={} — {} ::",
+        V3d85Tag,
+        retired as u32, frdone as u32, store_verified as u32,
+        consumed as u32, frame_closed as u32, executed as u32,
         bfc_pre, bfc_after, bfc_delta,
         rfc_pre, rfc_after, rfc_after.wrapping_sub(rfc_pre),
         pcs,
