@@ -274,18 +274,21 @@ const SYS_WIN_PRESENT: u64 = 30;
 // constraints to `inout("x1") a1 => _` (etc.) IN THE SAME COMMIT, or every stub here becomes
 // undefined behavior the moment the kernel stops restoring the clobbered registers. The identical
 // stub set in user-stat/src/main.rs carries the same invariant.
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn sys0(n: u64) -> u64 {
     let mut r: u64;
     core::arch::asm!("svc #0", inout("x0") 0u64 => r, in("x8") n, options(nostack));
     r
 }
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn sys1(n: u64, a0: u64) -> u64 {
     let mut r: u64;
     core::arch::asm!("svc #0", inout("x0") a0 => r, in("x8") n, options(nostack));
     r
 }
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn sys2(n: u64, a0: u64, a1: u64) -> u64 {
     let mut r: u64;
@@ -298,6 +301,7 @@ unsafe fn sys2(n: u64, a0: u64, a1: u64) -> u64 {
     );
     r
 }
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn sys3(n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     let mut r: u64;
@@ -311,6 +315,7 @@ unsafe fn sys3(n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     );
     r
 }
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn sys4(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     let mut r: u64;
@@ -321,6 +326,87 @@ unsafe fn sys4(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         in("x2") a2,
         in("x3") a3,
         in("x8") n,
+        options(nostack),
+    );
+    r
+}
+
+// ── x86_64 stubs, GRAFTED AT MERGE ASSEMBLY from the x86 trunk's WINX-7/TEARDOWN-1 port
+// (UnaOS-gemini f36ab3d5) — my body, their ABI layer. TEARDOWN-1's discipline carried intact:
+// `syscall` destroys rcx (return RIP) and r11 (RFLAGS) so both are clobbered; the kernel's
+// sysretq scrubs rdi/rsi/rdx/r8/r9/r10, so every argument register is `inlateout(...) => _` and
+// r8/r9 are `lateout` — the clobber list states the ABI the kernel actually implements, so the
+// compiler reloads what it must (declaring them `in(...)` once cost the second THREAD_SPAWN its
+// entry pointer: the kernel's scrubbed rdi=0 was validated and refused with -EFAULT).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn sys0(n: u64) -> u64 {
+    let mut r: u64;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") n => r,
+        lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _,
+        options(nostack),
+    );
+    r
+}
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn sys1(n: u64, a0: u64) -> u64 {
+    let mut r: u64;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") n => r,
+        inlateout("rdi") a0 => _,
+        lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _,
+        options(nostack),
+    );
+    r
+}
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn sys2(n: u64, a0: u64, a1: u64) -> u64 {
+    let mut r: u64;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") n => r,
+        inlateout("rdi") a0 => _,
+        inlateout("rsi") a1 => _,
+        lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _,
+        options(nostack),
+    );
+    r
+}
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn sys3(n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    let mut r: u64;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") n => r,
+        inlateout("rdi") a0 => _,
+        inlateout("rsi") a1 => _,
+        inlateout("rdx") a2 => _,
+        lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _,
+        options(nostack),
+    );
+    r
+}
+/// The fourth argument goes in **r10, not rcx** — `syscall` writes the return RIP into rcx as its
+/// first act, so a value there would be destroyed before the kernel could read it; r10 is SysV's
+/// nominee for exactly this reason.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn sys4(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let mut r: u64;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") n => r,
+        inlateout("rdi") a0 => _,
+        inlateout("rsi") a1 => _,
+        inlateout("rdx") a2 => _,
+        inlateout("r10") a3 => _,
+        lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _,
         options(nostack),
     );
     r

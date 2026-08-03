@@ -19511,13 +19511,14 @@ fn u11defer_build(entry_sym: *const u8) -> Option<U7Fix> {
 /// the chain (all FAT copies) exactly once.
 ///
 ///   A creates+writes DEFER.BIN, reports A_OPENED
-///     -> release B's unlink
+///     -> MEASURE the chain head `f0` from the on-disk name (B has not unlinked yet), release B's unlink
 ///   B opens+unlinks (name gone -> a re-open is -ENOENT), reports B_UNLINKED
 ///     -> CHECKPOINT-1: name GONE on disk, chain (cluster `f0`) STILL allocated in all FAT copies -> release A's read
 ///   A seeks+reads its ORIGINAL bytes (the deferred chain is alive), reports A_READ
 ///     -> CHECKPOINT-2: chain still allocated -> release A's close
 ///   A closes (last ref: the deferred free runs) + double-close -> -EBADF; both exit
-///     -> CHECKPOINT-3: chain FREED in all FAT copies + re-allocatable (first-free == `f0`)
+///     -> CHECKPOINT-3: chain FREED in all FAT copies + the free-set rank is restored (first-free is `f0` again,
+///        or the cluster that was already lower than `f0` while the chain was live)
 ///
 /// PASS iff both witnesses full AND all three cues fired AND both exited AND no kill AND both rows torn down AND
 /// the three on-disk checkpoints hold. Runtime-created file (no arroyo plant); needs a fresh image (DEFER.BIN
@@ -19530,10 +19531,12 @@ fn u11defer_run(demo_cpu: usize) {
     if crate::drivers::block::info().is_none() {
         return; // no SD -> the fixtures cannot create/open disk files; skip silently
     }
-    // Pre-flight: require DEFER.BIN ABSENT (a stale copy would confound the on-disk checks), and snapshot the
-    // first-free cluster `f0` — A's grow-from-empty write allocates it (first-fit), so `f0` is DEFER.BIN's chain
-    // head, which the three checkpoints track (allocated -> allocated -> freed + re-allocatable).
-    let f0 = match crate::fs::fat::mount() {
+    // Pre-flight: require DEFER.BIN ABSENT (a stale copy would confound the on-disk checks) and the volume to
+    // have at least one free cluster (A's grow-from-empty write needs one). U11-MEASURE: the pre-flight
+    // first-free is NOT the chain head — predicting the head from a first-fit snapshot taken before the spawn
+    // is unsound (any other allocator running in that window moves the file elsewhere). The head is MEASURED
+    // from the on-disk name after A reports A_OPENED; see the capture below.
+    match crate::fs::fat::mount() {
         Ok(fs) => {
             if fs.find_in_root(U11DEFER_NAME).is_ok() {
                 serial_println!(
@@ -19541,16 +19544,13 @@ fn u11defer_run(demo_cpu: usize) {
                 );
                 return;
             }
-            match fs.first_free_cluster() {
-                Ok(c) => c,
-                Err(_) => {
-                    serial_println!(":: U11-defer: no free cluster pre-demo — defer demo skipped ::");
-                    return;
-                }
+            if fs.first_free_cluster().is_err() {
+                serial_println!(":: U11-defer: no free cluster pre-demo — defer demo skipped ::");
+                return;
             }
         }
         Err(_) => return, // unmountable -> skip silently
-    };
+    }
 
     // Build + spawn A, then B. A creates the file B unlinks, but B parks on its GO word until A has created it,
     // so the create-before-open ordering is enforced by the launcher (below), not by spawn order.
@@ -19574,7 +19574,30 @@ fn u11defer_run(demo_cpu: usize) {
         wait_while_secs(secs, || flag.load(Ordering::Acquire) == 0);
         flag.load(Ordering::Acquire) != 0
     };
-    // Fresh-mount FAT snapshot: is DEFER.BIN's chain head `f0` still allocated in ALL FAT copies (non-zero)?
+
+    // Edge 1: A runs immediately (no GO gate on its open). Wait for A_OPENED — A has now created DEFER.BIN AND
+    // completed the 16-byte grow-write, and `write_grow` publishes the new chain head into the directory entry
+    // as its LAST step, so the on-disk name already resolves to the real head.
+    let a_opened = wait_flag(&U11DEFER_A_OPENED_F, 5);
+
+    // U11-MEASURE: capture the chain head from the NAME rather than predicting it. This is the one window in
+    // which the name is guaranteed to resolve: A has published it (A_OPENED), and B is still parked on its
+    // unlink GO — the launcher has not released it yet (next statement), so no unlink can race this mount.
+    // `ff_busy` is the lowest free cluster in that SAME snapshot, i.e. while the chain is still allocated; it is
+    // what CHECKPOINT-3's rank check is measured against (see there).
+    let (f0, ff_busy, measured) = match crate::fs::fat::mount() {
+        Ok(fs) => match fs.find_located(U11DEFER_NAME) {
+            Ok((de, _, _)) => {
+                let head = de.first_cluster();
+                let ff = fs.first_free_cluster().unwrap_or(0);
+                (head, ff, head >= 2 && ff >= 2)
+            }
+            Err(_) => (0, 0, false),
+        },
+        Err(_) => (0, 0, false),
+    };
+
+    // Fresh-mount FAT snapshot: is DEFER.BIN's measured chain head `f0` still allocated in ALL FAT copies?
     let chain_allocated = || -> bool {
         match crate::fs::fat::mount() {
             Ok(fs) => {
@@ -19595,8 +19618,6 @@ fn u11defer_run(demo_cpu: usize) {
         }
     };
 
-    // Edge 1: A runs immediately (no GO gate on its open). Wait for A_OPENED, then release B's unlink.
-    let a_opened = wait_flag(&U11DEFER_A_OPENED_F, 5);
     u11defer_release_go(b.slot, 0x3000);
     // Edge 2: wait for B_UNLINKED; CHECKPOINT-1 — the NAME is gone on disk, but the chain is STILL allocated.
     let b_unlinked = wait_flag(&U11DEFER_B_UNLINKED_F, 5);
@@ -19629,8 +19650,15 @@ fn u11defer_run(demo_cpu: usize) {
         && handle_row_is_clear(a.asid)
         && handle_row_is_clear(b.asid);
 
-    // CHECKPOINT-3: A's last close ran the deferred free — `f0` is now free in ALL FAT copies and re-allocatable
-    // (the first-free cluster is `f0` again, since nothing below it was ever freed). The name was gone since B.
+    // CHECKPOINT-3: A's last close ran the deferred free — `f0` is now free in ALL FAT copies, and the free-set
+    // RANK is restored. U11-MEASURE: with `f0` measured rather than predicted, the old `first_free == f0` is no
+    // longer the right expectation — the head can legitimately sit above a cluster that was already free while
+    // the chain was live. The rank check is kept (it is what catches an OVER-free that dropped a cluster below
+    // the chain, and a free that never reached the FAT's low end at all), just stated against the measured pair:
+    // once `f0` rejoins the free set, the lowest free cluster must be exactly `min(ff_busy, f0)` — `ff_busy`
+    // when something below the head was already free, and `f0` itself when the volume was packed below it (the
+    // original assertion, recovered exactly).
+    let want_ff = if ff_busy < f0 { ff_busy } else { f0 };
     let (freed_c3, reusable_c3) = match crate::fs::fat::mount() {
         Ok(fs) => {
             let nf = fs.num_fats();
@@ -19643,12 +19671,13 @@ fn u11defer_run(demo_cpu: usize) {
                 }
                 f += 1;
             }
-            (freed, fs.first_free_cluster() == Ok(f0))
+            (freed, fs.first_free_cluster() == Ok(want_ff))
         }
         Err(_) => (false, false),
     };
 
-    let ok = a_opened
+    let ok = measured
+        && a_opened
         && b_unlinked
         && a_read
         && a_witness == U11DEFER_A_WITNESS_ALL
@@ -19667,7 +19696,11 @@ fn u11defer_run(demo_cpu: usize) {
         );
     } else {
         serial_println!(
-            ":: U11-defer: cross-process unlink-defers-free FAIL — a_w={:#x} b_w={:#x} opened={} unlinked={} read={} done={} killed={} cleared={} c1(gone={},alive={}) c2_alive={} c3(freed={},reuse={}) (want {:#x}/{:#x}/t/t/t/2/0/t/t/t/t/t/t) ::",
+            ":: U11-defer: cross-process unlink-defers-free FAIL — head={} ff_busy={} measured={} want_ff={} a_w={:#x} b_w={:#x} opened={} unlinked={} read={} done={} killed={} cleared={} c1(gone={},alive={}) c2_alive={} c3(freed={},reuse={}) (want {:#x}/{:#x}/t/t/t/2/0/t/t/t/t/t/t) ::",
+            f0,
+            ff_busy,
+            measured,
+            want_ff,
             a_witness,
             b_witness,
             a_opened,
@@ -19851,15 +19884,15 @@ fn u11reap_build(entry_sym: *const u8) -> Option<U7Fix> {
 /// `SYS_CLOSE`. The launcher re-mounts the FAT at THREE checkpoints:
 ///
 ///   A creates+writes DEFER2.BIN, reports A_OPENED
-///     -> release B's unlink
+///     -> MEASURE the chain head `f0` from the on-disk name (B has not unlinked yet), release B's unlink
 ///   B opens+unlinks (name gone -> a re-open is -ENOENT), reports B_UNLINKED
 ///     -> CHECKPOINT-1: name GONE on disk, chain (cluster `f0`) STILL allocated -> release A's read
 ///   A seeks+reads its ORIGINAL bytes (the deferred chain is alive), reports A_READ
 ///     -> CHECKPOINT-2: chain still allocated -> release A's EXIT GO
 ///   A exits WITHOUT closing (teardown queues the orphan); B exits
 ///     -> CHECKPOINT-3: bounded YIELD-poll of the FAT until the reaper has FREED the chain (all FAT copies) +
-///        it is re-allocatable (`first_free == f0`) — the yields cede this core to the co-located reaper, so
-///        the cooperative-QEMU drain is deterministic.
+///        the free-set rank is restored (`first_free == min(ff_busy, f0)`) — the yields cede this core to the
+///        co-located reaper, so the cooperative-QEMU drain is deterministic.
 ///
 /// PASS iff both witnesses full AND all three cues fired AND both exited AND no kill AND both rows torn down AND
 /// the three checkpoints hold. Runtime-created file (no arroyo plant); needs a fresh image (DEFER2.BIN absent
@@ -19873,10 +19906,12 @@ fn u11reap_run(demo_cpu: usize) {
     if crate::drivers::block::info().is_none() {
         return; // no SD -> the fixtures cannot create/open disk files; skip silently
     }
-    // Pre-flight: require DEFER2.BIN ABSENT (a stale copy would confound the on-disk checks), and snapshot the
-    // first-free cluster `f0` — A's grow-from-empty write allocates it (first-fit), so `f0` is DEFER2.BIN's
-    // chain head, which the checkpoints track (allocated -> allocated -> freed-by-reaper + re-allocatable).
-    let f0 = match crate::fs::fat::mount() {
+    // Pre-flight: require DEFER2.BIN ABSENT (a stale copy would confound the on-disk checks) and the volume to
+    // have at least one free cluster (A's grow-from-empty write needs one). U11-MEASURE: the pre-flight
+    // first-free is NOT the chain head — predicting the head from a first-fit snapshot taken before the spawn
+    // is unsound (any other allocator running in that window moves the file elsewhere). The head is MEASURED
+    // from the on-disk name after A reports A_OPENED; see the capture below.
+    match crate::fs::fat::mount() {
         Ok(fs) => {
             if fs.find_in_root(U11REAP_NAME).is_ok() {
                 serial_println!(
@@ -19884,16 +19919,13 @@ fn u11reap_run(demo_cpu: usize) {
                 );
                 return;
             }
-            match fs.first_free_cluster() {
-                Ok(c) => c,
-                Err(_) => {
-                    serial_println!(":: U11-reap: no free cluster pre-demo — reaper demo skipped ::");
-                    return;
-                }
+            if fs.first_free_cluster().is_err() {
+                serial_println!(":: U11-reap: no free cluster pre-demo — reaper demo skipped ::");
+                return;
             }
         }
         Err(_) => return, // unmountable -> skip silently
-    };
+    }
 
     // Build + spawn A, then B (B parks on its GO until A has created the file, like u11defer).
     let Some(a) = u11reap_build(&raw const __u11reap_prog_a) else {
@@ -19915,7 +19947,30 @@ fn u11reap_run(demo_cpu: usize) {
         wait_while_secs(secs, || flag.load(Ordering::Acquire) == 0);
         flag.load(Ordering::Acquire) != 0
     };
-    // Fresh-mount FAT snapshot: is DEFER2.BIN's chain head `f0` still allocated in ALL FAT copies (non-zero)?
+
+    // Edge 1: A runs immediately (no GO gate on its open). Wait for A_OPENED — A has now created DEFER2.BIN AND
+    // completed the 16-byte grow-write, and `write_grow` publishes the new chain head into the directory entry
+    // as its LAST step, so the on-disk name already resolves to the real head.
+    let a_opened = wait_flag(&U11REAP_A_OPENED_F, 5);
+
+    // U11-MEASURE: capture the chain head from the NAME rather than predicting it. This is the one window in
+    // which the name is guaranteed to resolve: A has published it (A_OPENED), and B is still parked on its
+    // unlink GO — the launcher has not released it yet (next statement), so no unlink can race this mount.
+    // `ff_busy` is the lowest free cluster in that SAME snapshot, i.e. while the chain is still allocated; it is
+    // what CHECKPOINT-3's rank check is measured against (see there).
+    let (f0, ff_busy, measured) = match crate::fs::fat::mount() {
+        Ok(fs) => match fs.find_located(U11REAP_NAME) {
+            Ok((de, _, _)) => {
+                let head = de.first_cluster();
+                let ff = fs.first_free_cluster().unwrap_or(0);
+                (head, ff, head >= 2 && ff >= 2)
+            }
+            Err(_) => (0, 0, false),
+        },
+        Err(_) => (0, 0, false),
+    };
+
+    // Fresh-mount FAT snapshot: is DEFER2.BIN's measured chain head `f0` still allocated in ALL FAT copies?
     let chain_allocated = || -> bool {
         match crate::fs::fat::mount() {
             Ok(fs) => {
@@ -19936,8 +19991,6 @@ fn u11reap_run(demo_cpu: usize) {
         }
     };
 
-    // Edge 1: A runs immediately (no GO gate on its open). Wait for A_OPENED, then release B's unlink.
-    let a_opened = wait_flag(&U11REAP_A_OPENED_F, 5);
     u11defer_release_go(b.slot, 0x3000);
     // Edge 2: wait for B_UNLINKED; CHECKPOINT-1 — the NAME is gone on disk, but the chain is STILL allocated.
     let b_unlinked = wait_flag(&U11REAP_B_UNLINKED_F, 5);
@@ -19971,9 +20024,13 @@ fn u11reap_run(demo_cpu: usize) {
         && handle_row_is_clear(b.asid);
 
     // CHECKPOINT-3: A exited WITHOUT closing -> its teardown queued `f0` to the reaper. Bounded YIELD-poll the
-    // FAT until the reaper has freed it (all FAT copies) AND it is re-allocatable (`first_free == f0`, since
-    // nothing below it was ever freed). The yields cede this core to the co-located reaper so the cooperative-
-    // QEMU drain is deterministic. Times out (still false) if the reaper never runs -> the verdict FAILs loudly.
+    // FAT until the reaper has freed it (all FAT copies) AND the free-set RANK is restored. U11-MEASURE: with
+    // `f0` measured rather than predicted, the rank expectation is `min(ff_busy, f0)`, not `f0` — the head can
+    // legitimately sit above a cluster that was already free while the chain was live. The check still catches
+    // an OVER-free that dropped a cluster below the chain, and collapses to the original `first_free == f0`
+    // whenever the volume was packed below the head. The yields cede this core to the co-located reaper so the
+    // cooperative-QEMU drain is deterministic. Times out (still false) if the reaper never runs -> FAILs loudly.
+    let want_ff = if ff_busy < f0 { ff_busy } else { f0 };
     let (freed_c3, reusable_c3) = {
         let dstart = super::timer::cntpct();
         let ddeadline = 5 * super::timer::cntfrq();
@@ -19990,7 +20047,7 @@ fn u11reap_run(demo_cpu: usize) {
                         }
                         f += 1;
                     }
-                    (freed, fs.first_free_cluster() == Ok(f0))
+                    (freed, fs.first_free_cluster() == Ok(want_ff))
                 }
                 Err(_) => (false, false),
             };
@@ -20004,7 +20061,8 @@ fn u11reap_run(demo_cpu: usize) {
         }
     };
 
-    let ok = a_opened
+    let ok = measured
+        && a_opened
         && b_unlinked
         && a_read
         && a_witness == U11REAP_A_WITNESS_ALL
@@ -20023,7 +20081,11 @@ fn u11reap_run(demo_cpu: usize) {
         );
     } else {
         serial_println!(
-            ":: U11-reap: teardown-last-close reaper FAIL — a_w={:#x} b_w={:#x} opened={} unlinked={} read={} done={} killed={} cleared={} c1(gone={},alive={}) c2_alive={} c3(freed={},reuse={}) (want {:#x}/{:#x}/t/t/t/2/0/t/t/t/t/t/t) ::",
+            ":: U11-reap: teardown-last-close reaper FAIL — head={} ff_busy={} measured={} want_ff={} a_w={:#x} b_w={:#x} opened={} unlinked={} read={} done={} killed={} cleared={} c1(gone={},alive={}) c2_alive={} c3(freed={},reuse={}) (want {:#x}/{:#x}/t/t/t/2/0/t/t/t/t/t/t) ::",
+            f0,
+            ff_busy,
+            measured,
+            want_ff,
             a_witness,
             b_witness,
             a_opened,
