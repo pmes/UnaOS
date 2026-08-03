@@ -28,7 +28,11 @@ extended by that seat.
     CLOSED. The witness flips `ABSENT` -> `[wc-x] backbuffer resync ARMED bg=… (desktop layer
     not yet constructed)` at activation, and the desktop layer answers with
     `[wc-x] backbuffer resync WxH (desktop bg …)` when its `Screen` is constructed. `ABSENT` no
-    longer appears in any build. Banded present (`wm::present_rows`) is still stripped.
+    longer appears in any build. Banded present (`wm::present_rows`) is **no longer stripped** — the
+    x86 re-land's FBCON-DMG milestone restored it with its caller (`fbcon::route_present_banded`,
+    `#[cfg(all(target_arch = "x86_64", feature = "wc"))]`), so callee and caller are back together
+    and aarch64 still produces no band. Its x86 evidence class is `unproven`, not proven: no capture
+    yet carries a `[wc-h] scope=window-band` rollup (`08_VIDEO/engine.md`, FBCON-DMG).
 
 ## Known-opens ledger (carried from both batons; each is arc-sized unless noted)
 - SYS_WIN_PRESENT masked span — **AUDITED** (pi seat, 2026-08-03): 2.8 ms mean / 13.9 ms
@@ -91,3 +95,12 @@ extended by that seat.
   WEDGE boots' cbw_fault=0 with n=0; a waker conf written but never started; a strings probe
   reading 0 because the binary wasn't on the probed path. Positive controls or run-evidence,
   always.
+- **Spent-budget law**: an instrument with a fixed sample budget that is consumed before its subject
+  runs cannot falsify anything — its verdict describes the samples it took, never the behaviour it
+  was aimed at. Every capped instrument must be qualified on evidence that a sample was taken *after*
+  the subject started, and a rollup that closed early is `unproven`, not PASS and not FAIL. Round
+  example of the class: `[wc-h]`'s `SAMPLES = 4` per window id, spent on `win=1`'s whole-box creation
+  and first-paint presents, so the ~980 console lines printed after the rollup closed were
+  unobservable and the arc they were meant to measure (FBCON-DMG) stayed unproven while the rollup
+  read `AT-RISK`. Reachability (`strings`, banner) and observability are two claims; the feature-proof
+  hierarchy above settles only the first.
