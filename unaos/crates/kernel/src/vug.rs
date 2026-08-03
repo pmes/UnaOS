@@ -28,6 +28,10 @@
 use unaos_boot_info::FrameBufferInfo;
 
 use crate::pal::{Event, GneissPal, TargetPal};
+// The meter palette and the VUG-HONESTY classifier live in `ui_status` — the instrument strip is the
+// rule's permanent, both-arches consumer, while this demo is a shell verb. Reading them back keeps a
+// single definition of each and leaves this module free to be gated to the arches that launch it.
+use crate::ui_status::{classify_load_scaled, METER_BREATH, METER_DIM, METER_PARKED, PARKED};
 use crate::video::FrameBuffer;
 
 // ---------------------------------------------------------------------------------------------
@@ -218,67 +222,21 @@ const MAX_METER_CPUS: usize = 16;
 
 /// Fixed segment count of every CPU pulse bar (UI1-M2, Peter's sketch): filled ∝ load, and the
 /// EMPTY segments draw dim — an idle core reads alive-but-empty, never blank.
-pub(crate) const PULSE_SEGS: usize = 10;
+const PULSE_SEGS: usize = 10;
 
-// Meter palette (shared by the vug corner meters and the `pulse` full-screen monitor).
-pub(crate) const METER_DIM: u32 = 0x00_2A2432;
+// The rest of the meter palette. `METER_DIM` / `METER_BREATH` / `METER_PARKED` — the three the
+// instrument strip also draws with — are owned by `ui_status` and imported above; only the colours
+// this demo alone uses are declared here, so no constant has two definitions.
 const METER_LILAC: u32 = 0x00_B36BFF;
-pub(crate) const METER_PURPLE: u32 = 0x00_9B59B6;
+const METER_PURPLE: u32 = 0x00_9B59B6;
 const METER_LABEL: u32 = 0x00_8A8296;
-/// PULSE-ALIVE breath colour — clearly brighter than `METER_DIM`, dimmer than a load fill: the one
-/// sweeping segment an idle-but-scheduled core lights so "alive and idle" reads at a glance.
-pub(crate) const METER_BREATH: u32 = 0x00_5F4E86;
-/// Parked dash colour — cooler/dimmer than `METER_DIM` so a broken track reads as "not participating".
-pub(crate) const METER_PARKED: u32 = 0x00_3A3550;
 
-/// VUG-HONESTY parked-core marker (a load-array sentinel, disjoint from the 0..=100 percent range). A
-/// core whose pulse counters are frozen this window AND that is NOT the demo core is parked /
-/// never-scheduled: the display must not fabricate load for it. `load[c] == PARKED` selects a distinct
-/// DASHED bar (see [`draw_pulse_bar`]) — visually separable from an idle 0% bar (a solid dim track) so
-/// "idle" and "never woken" never read alike, and `run_pulse` prints `park` instead of a percent.
-pub(crate) const PARKED: u32 = u32::MAX;
-
-/// VUG-HONESTY — the pure per-core display decision. Given one core's per-window busy/idle tick deltas
-/// (`db`/`di`), whether it is the *demo core* (the core executing this render loop), and that loop's own
-/// measured render busy% (`own_load`), return the load to display (0..=100) or [`PARKED`]:
-///   * `db + di > 0`  → the scheduler accounted this core this window: honest busy fraction.
-///   * frozen + demo  → the demo core runs OUTSIDE the scheduler, so its own counters freeze; credit its
-///                      measured render load — the honest number for the core doing the drawing.
-///   * frozen + other → a core with no scheduling activity this window that is NOT drawing: parked /
-///                      never-woken. NEVER fabricate load. (The pre-fix code credited `own_load` to
-///                      EVERY frozen core, so a parked AP mirrored the busy demo core and read PINNED —
-///                      the display-honesty defect this arc closes. The merged idle/busy-heartbeats made
-///                      the *counters* honest and passed the one-shot boot witness, but the LIVE meter
-///                      samples per-window deltas: a parked EL2 secondary gets no periodic wake, so its
-///                      counters are frozen between windows and this fallback still fabricated.) Report
-///                      PARKED instead.
-pub(crate) fn classify_load(db: u64, di: u64, is_demo: bool, own_load: u32) -> u32 {
+/// VUG-HONESTY — the pure per-core display decision at percent scale: [`classify_load_scaled`] at
+/// `full = 100`. The rule itself, and the [`PARKED`] sentinel it returns for a frozen non-demo core,
+/// are stated once in `ui_status`; this is the demo's ten-segment view of the same decision, and
+/// [`parked_display_witness`] below covers every branch of it through this entry point.
+fn classify_load(db: u64, di: u64, is_demo: bool, own_load: u32) -> u32 {
     classify_load_scaled(db, di, is_demo, own_load, 100)
-}
-
-/// PULSE-2 — [`classify_load`] at an arbitrary full-scale, so a display with more resolution than
-/// "one bar in ten" can have more resolution than one percent.
-///
-/// The honesty rule is stated ONCE, here; `classify_load` is this function at `full = 100` and the
-/// VUG-HONESTY witness therefore still covers every branch of it. The instrument panel calls it at
-/// `full = 1000` (per-mille): its LED bar is ~1400 px wide on the bench panel, so a 1% quantum would
-/// be a 14 px jump — the display would step where the machine is smooth, which is exactly the
-/// "sensitivity" Peter asked the full width to buy. `own_load` is a percent by contract and is scaled
-/// to match. [`PARKED`] is `u32::MAX` and stays disjoint from `0..=full` at any sane scale.
-pub(crate) fn classify_load_scaled(
-    db: u64,
-    di: u64,
-    is_demo: bool,
-    own_load: u32,
-    full: u32,
-) -> u32 {
-    if db + di > 0 {
-        ((db * full as u64) / (db + di)) as u32
-    } else if is_demo {
-        (own_load as u64 * full as u64 / 100) as u32
-    } else {
-        PARKED
-    }
 }
 
 /// VUG-HONESTY witness — deterministic, arch-neutral, framebuffer-free. Exercises [`classify_load`]
@@ -374,10 +332,12 @@ impl CpuPulse {
 
 /// UI1-M2 — one segmented pulse bar: `PULSE_SEGS` fixed segments at `(x, y)`, filled ∝ `load`
 /// (rounded; any nonzero load lights at least one), the rest drawn `METER_DIM` so an idle bar
-/// reads alive-but-empty. `seg_w`/`seg_h`/`gap` come from the caller's metrics (the corner meter, the
-/// full-screen `pulse` and — PULSE-STRIP — the bottom status strip reuse this at three sizes, which is
-/// why it is generic over the PAL rather than tied to `TargetPal`). Returns the x just past the bar.
-pub(crate) fn draw_pulse_bar<P: crate::pal::GneissPal>(
+/// reads alive-but-empty. `seg_w`/`seg_h`/`gap` come from the caller's metrics — the corner meter and
+/// the full-screen `pulse` reuse this at two sizes, which is why it is generic over the PAL rather
+/// than tied to `TargetPal`. (The bottom status strip drew through it under PULSE-STRIP; PULSE-2 gave
+/// the strip its own gradient `ui_status::draw_led_bar`, so this is demo-private again.) Returns the x
+/// just past the bar.
+fn draw_pulse_bar<P: crate::pal::GneissPal>(
     pal: &mut P,
     x: usize,
     y: usize,

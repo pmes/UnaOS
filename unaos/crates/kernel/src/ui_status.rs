@@ -69,15 +69,16 @@
 //!   full, the one LED the boundary lands inside is lit in proportion to its coverage, and every LED
 //!   carries its own vertical lens gradient. A rising load brightens the next lamp continuously
 //!   instead of clicking it on. The stored load went to per-mille for the same reason (a 1% quantum is
-//!   a 14 px jump on a 1400 px bar) — see `vug::classify_load_scaled`, which states the VUG-HONESTY
+//!   a 14 px jump on a 1400 px bar) — see [`classify_load_scaled`], which states the VUG-HONESTY
 //!   rule once for both scales.
 //! * The scale runs green → amber → red across the bar (colour by POSITION, so a given lamp's colour
 //!   is stable and only the length moves). Test instrument, not chrome.
 //!
 //! The status band itself goes back to what it was before PULSE-STRIP: **text only**, host / ip /
 //! clock. The miniature bars are superseded. What PULSE-STRIP got right is kept verbatim and is the
-//! substrate here: the same `sched::meter_cpu_*` relaxed reads, the same [`crate::vug`] widget and
-//! palette, the same dirty pacing, the same zero-new-threads plumbing.
+//! substrate here: the same `sched::meter_cpu_*` relaxed reads, the same widget shape the `vug` demo
+//! used and the same palette (now owned here — see [`METER_DIM`]), the same dirty pacing, the same
+//! zero-new-threads plumbing.
 //!
 //! ### Reserving the band honestly
 //!
@@ -134,7 +135,8 @@
 //! disagree about the same core. `meter_cpu_ticks` stays as the FALLBACK, and it keeps its whole
 //! VUG-HONESTY meaning: `core_load` reports `tracked=false` for a core that is not inside `run()`, and
 //! for such a core the tick deltas are consulted exactly as before — a frozen non-demo core still reads
-//! [`PARKED`] rather than a fabricated bar, and `vug::parked_display_witness` still covers that branch.
+//! [`PARKED`] rather than a fabricated bar, and `crate::vug::parked_display_witness` still covers that
+//! branch (the witness stays with the demo; the rule it witnesses lives here).
 //! On x86 (no `core_load`) the source is unchanged in every particular.
 //!
 //! **Pacing is unchanged and stays.** 1 Hz is not the defect — skipping a window whose values moved is.
@@ -208,10 +210,68 @@
 //! the failure that would otherwise present as "PULSE-4 did nothing" on the bench and nowhere in a log.
 
 use crate::pal::GneissPal;
-use crate::vug::{METER_BREATH, METER_DIM, METER_PARKED, PARKED};
 use alloc::format;
 use alloc::string::String;
 use spin::Mutex;
+
+// ---------------------------------------------------------------------------------------------
+// The meter palette and the VUG-HONESTY display rule.
+//
+// These are the pulse's own primitives. They were carried by the in-kernel `vug` demo module while
+// the strip borrowed them, which left `vug` pinned cross-arch for no reason but this import: the
+// strip is the rule's permanent consumer and is compiled on both arches, the demo is a shell verb
+// that need not be. They live here now, and `vug` reads them back. The rationale comments below are
+// the originals, carried across with only their cross-references repointed.
+// ---------------------------------------------------------------------------------------------
+
+/// Meter palette — an unfilled segment: alive-but-empty, never blank.
+pub(crate) const METER_DIM: u32 = 0x00_2A2432;
+/// PULSE-ALIVE breath colour — clearly brighter than `METER_DIM`, dimmer than a load fill: the one
+/// sweeping segment an idle-but-scheduled core lights so "alive and idle" reads at a glance.
+pub(crate) const METER_BREATH: u32 = 0x00_5F4E86;
+/// Parked dash colour — cooler/dimmer than `METER_DIM` so a broken track reads as "not participating".
+pub(crate) const METER_PARKED: u32 = 0x00_3A3550;
+
+/// VUG-HONESTY parked-core marker (a load-array sentinel, disjoint from the 0..=100 percent range). A
+/// core whose pulse counters are frozen this window AND that is NOT the demo core is parked /
+/// never-scheduled: the display must not fabricate load for it. `load[c] == PARKED` selects a distinct
+/// DASHED bar (see [`draw_led_bar`]) — visually separable from an idle 0% bar (a solid dim track) so
+/// "idle" and "never woken" never read alike, and the percent column prints `park` instead of a number.
+pub(crate) const PARKED: u32 = u32::MAX;
+
+/// PULSE-2 — the VUG-HONESTY per-core display decision at an arbitrary full-scale, so a display with
+/// more resolution than "one bar in ten" can have more resolution than one percent.
+///
+/// Given one core's per-window busy/idle tick deltas (`db`/`di`), whether it is the *demo core* (the
+/// core executing the render loop), and that loop's own measured render busy% (`own_load`), return the
+/// load to display (`0..=full`) or [`PARKED`]:
+///   * `db + di > 0`  → the scheduler accounted this core this window: honest busy fraction.
+///   * frozen + demo  → the demo core runs OUTSIDE the scheduler, so its own counters freeze; credit its
+///                      measured render load — the honest number for the core doing the drawing.
+///   * frozen + other → a core with no scheduling activity this window that is NOT drawing: parked /
+///                      never-woken. NEVER fabricate load. (The pre-fix code credited `own_load` to
+///                      EVERY frozen core, so a parked AP mirrored the busy demo core and read PINNED —
+///                      the display-honesty defect that arc closed. The merged idle/busy-heartbeats made
+///                      the *counters* honest and passed the one-shot boot witness, but the LIVE meter
+///                      samples per-window deltas: a parked EL2 secondary gets no periodic wake, so its
+///                      counters are frozen between windows and this fallback still fabricated.) Report
+///                      PARKED instead.
+///
+/// The honesty rule is stated ONCE, here; `vug::classify_load` is this function at `full = 100` and the
+/// VUG-HONESTY witness therefore still covers every branch of it. The instrument panel calls it at
+/// `full = 1000` (per-mille): its LED bar is ~1400 px wide on the bench panel, so a 1% quantum would
+/// be a 14 px jump — the display would step where the machine is smooth, which is exactly the
+/// "sensitivity" Peter asked the full width to buy. `own_load` is a percent by contract and is scaled
+/// to match. [`PARKED`] is `u32::MAX` and stays disjoint from `0..=full` at any sane scale.
+pub(crate) fn classify_load_scaled(db: u64, di: u64, is_demo: bool, own_load: u32, full: u32) -> u32 {
+    if db + di > 0 {
+        ((db * full as u64) / (db + di)) as u32
+    } else if is_demo {
+        (own_load as u64 * full as u64 / 100) as u32
+    } else {
+        PARKED
+    }
+}
 
 /// The mDNS / DNS-SD host name the Pi answers on the share segment (net11/net17). A fixed literal —
 /// the strip names it for the operator; it is not derived from any driver's private state.
@@ -467,7 +527,7 @@ fn hash(s: &str) -> u64 {
 
 /// Full scale of the stored per-core load. Per-mille, not percent: the bar is ~1400 px wide on the
 /// bench panel, so a 1% quantum would move the fill 14 px at a time and the "super smooth" scaling the
-/// gradient LEDs exist for would be stepping under the gradient. See `vug::classify_load_scaled`.
+/// gradient LEDs exist for would be stepping under the gradient. See [`classify_load_scaled`].
 pub const PERMILLE_FULL: u32 = 1000;
 
 // ---------------------------------------------------------------------------------------------
@@ -1015,9 +1075,8 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
                 // there is no live number. The deltas are still consumed unconditionally above (the
                 // `prev` snapshot has to advance every window either way, or a core that later falls
                 // back would classify against a window minutes wide).
-                let new = live_permille(c).unwrap_or_else(|| {
-                    crate::vug::classify_load_scaled(db, di, c == demo, 0, PERMILLE_FULL)
-                });
+                let new = live_permille(c)
+                    .unwrap_or_else(|| classify_load_scaled(db, di, c == demo, 0, PERMILLE_FULL));
                 // `srcdelta` keeps its PULSE-3 meaning exactly: movement of the SOURCE, measured
                 // against the previous RAW reading, upstream of the envelope.
                 if new != st.raw[c] {
