@@ -29,12 +29,14 @@ pub enum BlockError {
     NotReady,
     Io,
     BadLba,
-    /// WEDGE-8 (F3): the xHCI controller is loaned out to another context (a BOT transaction or a
-    /// service pass is in flight) and this call refused to wait for it. Callers that CAN wait —
-    /// unmasked, schedulable contexts — never see this from a healthy device: `claim_xhci_for_io`
-    /// retries with a bounded `hlt` wait first. A caller running with IRQs MASKED gets it
-    /// immediately, because a masked wait on a driver lock is exactly the F3 deadlock; the FAT
-    /// layer retries OUTSIDE its masked span and surfaces `-EAGAIN` on exhaustion.
+    /// WEDGE-8 (F3) / WEDGE-10 (F2): the storage device is loaned out to another context and this
+    /// call refused to wait for it — the xHCI controller mid-BOT-transaction or mid-service-pass,
+    /// or the microSD card mid-CMD17/CMD24 sector transfer. Callers that CAN wait — unmasked,
+    /// schedulable contexts — never see this from a healthy device: `claim_xhci_for_io` and
+    /// `emmc2::claim_for_io` each retry with a bounded `hlt` wait first. A caller running with IRQs
+    /// MASKED gets it immediately, because a masked wait on a driver lock is exactly the deadlock
+    /// this family is named for; the FAT layer retries OUTSIDE its masked span and surfaces
+    /// `-EAGAIN` on exhaustion.
     Busy,
 }
 
@@ -284,6 +286,11 @@ pub fn read_block(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 
     // M6g: SD backend routes to the EMMC2/SDHCI driver; the xHCI body below is unchanged (and the
     // only path an x86 build compiles). read_block_512 re-guards the lba against its own num_blocks.
+    // WEDGE-10 (F2): this arm carries the same masked-instant-`Busy` / unmasked-bounded-wait split as
+    // `claim_xhci_for_io` below — implemented inside `emmc2::claim_for_io`, one level down, because the
+    // INSTALL-PI target calls `read_block_512`/`write_block_512` directly and must get the policy too.
+    // `Busy` therefore propagates from here exactly as it does from the xHCI arm, and `fat.rs` retries
+    // it outside its masked span.
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     if BACKEND.load(Ordering::Acquire) == BACKEND_SD {
         return crate::drivers::emmc2::read_block_512(lba, buf);
@@ -317,6 +324,9 @@ pub fn write_block(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     // U9: the SD backend now services in-place block WRITES (polled CMD24), routing to the EMMC2/SDHCI
     // driver just as reads route to `read_block_512`. write_block_512 re-guards the lba against its own
     // num_blocks. The xHCI body below is unchanged (and the only path an x86 build compiles).
+    // WEDGE-10 (F2): see the `read_block` arm — `emmc2::claim_for_io` applies the masked-instant-`Busy`
+    // split under this call, and the ~1.3 s CMD24 + programming-busy + CMD13 ladder now runs on a
+    // claimed loan with no driver lock held.
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     if BACKEND.load(Ordering::Acquire) == BACKEND_SD {
         return crate::drivers::emmc2::write_block_512(lba, buf);

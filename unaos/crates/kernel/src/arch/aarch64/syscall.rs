@@ -4495,14 +4495,40 @@ fn free_orphan_chain(first_cluster: u32) -> bool {
             return false;
         }
     };
-    if fs.free_chain(first_cluster).is_err() {
-        serial_println!(
-            "U11-defer: deferred free of chain @cluster {} — free_chain error, orphaned (leak)",
-            first_cluster
-        );
-        return false;
+    match fs.free_chain(first_cluster) {
+        Ok(_) => true,
+        // WEDGE-10 (F2): `Busy` is the ONE retryable error here, and it must not orphan the chain.
+        // It does not mean the free failed — it means the storage device was momentarily loaned to
+        // another context, so the FAT RMW refused (masked) or exhausted (unmasked) its bounded wait
+        // and mutated NOTHING. Every other `FatError` describes a real I/O or structural failure whose
+        // retry would be futile, and those keep the historical orphan path (lost clusters — benign,
+        // chkdsk-reclaimable). A transient loan is exactly the shape a periodic reaper absorbs: push
+        // the head back onto the deferred-free queue and let the next pass free it (the push `post()`s
+        // `REAPER_SEM`, so the retry is scheduled, not spun on). Before this arm a `Busy` here leaked
+        // the chain outright — the regression that surfaced when the SD card became a claimed loan.
+        Err(crate::fs::fat::FatError::Busy) => {
+            if deferred_free_push(first_cluster) {
+                serial_println!(
+                    "U11-defer: deferred free of chain @cluster {} — storage busy, requeued for the next reaper pass",
+                    first_cluster
+                );
+            } else {
+                // Queue full: nothing left to retry with, so fall back to the honest leak log.
+                serial_println!(
+                    "U11-defer: deferred free of chain @cluster {} — storage busy but queue full, orphaned (leak)",
+                    first_cluster
+                );
+            }
+            false
+        }
+        Err(_) => {
+            serial_println!(
+                "U11-defer: deferred free of chain @cluster {} — free_chain error, orphaned (leak)",
+                first_cluster
+            );
+            false
+        }
     }
-    true
 }
 
 // =============================================================================================
