@@ -523,6 +523,12 @@ FORBID \[wc-g\] .*-> BLIT
 REQUIRE \[wc-h\] win=.* compose_us=.* present_us=.* torn=.* -> BUFFERED
 REQUIRE \[wc-h\] win=.* staged=no reason=fixture -> DIRECT
 REQUIRE \[wc-h\] rollup win=.* scope=window .*declines=.* -> TEAR-FREE
+# --- Two-rollup awareness (GR15's WC-H banding, 2026-08-03): after the wm.rs merge a window MAY
+# --- emit a second rollup at scope=window-band sharing counters with scope=window. Both FORBIDs
+# --- below are COUNT-INSENSITIVE (>=1 hit fails either way), so a doubled AT-RISK line changes no
+# --- verdict; and on aarch64 the band rollup never fires at all (present_rows' callers are all
+# --- x86_64+wc gated — verified independently by both seats). Ruled no-spec-change; this comment
+# --- is the record so nobody re-derives it.
 FORBID \[wc-h\] .*-> AT-RISK
 FORBID \[wc-h\] .*-> UNSTAGED
 
