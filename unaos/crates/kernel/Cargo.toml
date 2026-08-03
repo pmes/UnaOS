@@ -381,6 +381,19 @@ v3d = ["baremetal"]
 # `UNAOS_V3D=1 UNAOS_V3D_DEEP=1 UNAOS_PI=1 ./arroyo kernel8`. See docs/dev/OS/08_VIDEO/v3d.md.
 v3d_deep = ["v3d"]
 
+# V3D75A-GATE: the arming switch for the `SET_ENABLE_QPU` (0x00030012) sends. On Pi 4 metal that tag
+# permanently WEDGES the VideoCore mailbox: every later NOTIFY_XHCI_RESET fails and USB is dead for
+# the rest of the boot. Its diagnostic verdict is banked negative twice (P86 doorbell-waiting, and the
+# [v3d81q] reply-less re-read), so the send has nothing left to teach and is not worth the boot it
+# costs. Both send sites — `[v3d75a]`'s doorbell-waiting one inside `v3d75_fabric_condition` and
+# `[v3d81q]`'s reply-less one — are gated on `all(v3d_deep, v3d_qpu)`; with this feature OFF each one
+# prints a single `SET_ENABLE_QPU SKIPPED — qpu-gate off …` line and sends nothing, which is what
+# makes `UNAOS_V3D_DEEP=1` non-destructive. Deliberately a BARE feature that implies nothing: it only
+# has an effect alongside `v3d_deep` (both sites ride the deep battery), so arming it alone changes no
+# behaviour. Enable via `UNAOS_V3D=1 UNAOS_V3D_DEEP=1 UNAOS_V3D_QPU=1 UNAOS_PI=1 ./arroyo kernel8`.
+# ⚠ an armed boot loses USB from the send onward — that is the known cost, not a fault.
+v3d_qpu = []
+
 # PI-V3D-69: the WRITE half of the initialisation-diff arc. The READ half (`[v3d69] fabric` stations —
 # PM_GRAFX, both V3D async-AXI-bridge control words in both candidate ASB blocks, V3D_MMUC_CONTROL)
 # rides `v3d_deep` and is read-only. THIS feature adds the one rung that WRITES: it re-runs mainline's

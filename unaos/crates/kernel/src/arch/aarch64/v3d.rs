@@ -994,7 +994,7 @@ pub fn bringup(fb: Option<FbTarget>) {
         );
     } else {
         serial_println!(
-            ":: V3D: [v3d] deep=off (banked verdicts skipped) — NOT run this boot: [v3d48] empty-frame bisection ladder (all 6 rungs banked non-retire), [v3d59] frameclose (banked DEAD-OPEN, zero bit changes), [v3d58] rerender (banked clean), [v3d71] mainline-geometry rung + fabric/[v3d73] CLE-progress samplers, [v3d73s] mainline-exact-submit rung, [v3d74] thread-swap rung. Fast probes only; re-arm with UNAOS_V3D_DEEP=1 ::"
+            ":: V3D: [v3d] deep=off (banked verdicts skipped) — NOT run this boot: the WHOLE 21-rung slow battery and every tail that rides it, i.e. [v3d48] empty-frame bisection ladder (all 6 rungs banked non-retire — the [v3d50]/[v3d51]/[v3d53] empty re-runs plus empty-frame/state-no-prims/prims-null-shader, with the [v3d52] cfg audit, the [v3d53] TMUWCF refutation and the [v3d72] clock-liveness bank), [v3d63] ptb-unit matrix (4 rungs), [v3d64] muxcal (1), [v3d66] ptbsweep (2), [v3d68] binwall (4), [v3d69] initdiff (1, between its READ-ONLY PM/ASB/MMUC fabric stations), [v3d71] mainline-geometry rung + fabric/[v3d73] CLE-progress samplers (1), [v3d73s] mainline-exact-submit rung (1), [v3d74] thread-swap rung (1); then the non-rung tails [v3d75] fabric-condition experiments, [v3d76] full-window sweep, [v3d77] unnamed-word transplants and the [v3d80] display handover (the [v3d81] reply-less legs imply deep, so they cannot be armed on a deep=off boot); and outside the ladder [v3d59] frameclose (banked DEAD-OPEN, zero bit changes) + [v3d58] rerender (banked clean). Fast probes only; re-arm with UNAOS_V3D_DEEP=1 ::"
         );
     }
 
@@ -7201,7 +7201,11 @@ fn v3d81_replyless_notify() {
 
     // Leg Q first: it cannot take the panel away, so its readings are taken while the display is
     // still whatever the firmware made it. Leg D can end the boot's video and therefore rides last.
-    #[cfg(feature = "v3d81_qpu")]
+    // V3D75A-GATE: the leg's own knob arms the LEG; the `v3d_qpu` switch arms the SEND. Both are
+    // required, because this tag permanently wedges the VideoCore mailbox on metal (USB dies for the
+    // rest of the boot) and its verdict is banked negative twice. Gate off, the leg reports that it
+    // sent nothing rather than taking stations either side of a send that did not happen.
+    #[cfg(all(feature = "v3d81_qpu", feature = "v3d_deep", feature = "v3d_qpu"))]
     v3d81_leg(
         "v3d81q",
         0x0003_0012,
@@ -7210,9 +7214,16 @@ fn v3d81_replyless_notify() {
         false,
         |ms| mailbox::enable_qpu_noreply(1, ms),
     );
+    #[cfg(all(
+        feature = "v3d81_qpu",
+        any(not(feature = "v3d_deep"), not(feature = "v3d_qpu"))
+    ))]
+    serial_println!(
+        ":: V3D: [v3d81q] SET_ENABLE_QPU SKIPPED — qpu-gate off (arm with UNAOS_V3D_QPU=1; this send wedges the VC mailbox and kills USB for the boot). The leg is armed but posted nothing, so no station is a reading of this tag and NO [v3d81q] verdict is implied ::"
+    );
     #[cfg(not(feature = "v3d81_qpu"))]
     serial_println!(
-        ":: V3D: [v3d81q] NOT ARMED — no reply-less SET_ENABLE_QPU on this boot. [v3d75a] above sent it the doorbell-waiting way and its reading (whatever it says) stands unchanged ::"
+        ":: V3D: [v3d81q] NOT ARMED — no reply-less SET_ENABLE_QPU on this boot. [v3d75a] above owns the doorbell-waiting send of this tag (itself sent only when the qpu-gate is armed) and its reading, whatever it says, stands unchanged ::"
     );
 
     #[cfg(feature = "v3d81_display")]
@@ -10223,31 +10234,52 @@ fn v3d75_fabric_condition() {
     // already been asked once, and its post-send diff would attribute this rung's effect to itself.
     // The rest of the rung still runs, which turns it into something it could not be before: the
     // same-boot PRE-SEND control for [v3d81q], taken at this exact position in the battery.
-    #[cfg(not(feature = "v3d81_qpu"))]
+    // V3D75A-GATE: and the send only happens at all when the `v3d_qpu` arming switch is on. The tag
+    // permanently wedges the VideoCore mailbox on metal — every later NOTIFY_XHCI_RESET fails and USB
+    // is dead for the rest of the boot — and its verdict is banked negative twice, so it is not worth
+    // the boot it costs. Gate off (the default), the rung still runs and becomes the same no-send
+    // control it is under [v3d81q]: nothing is sent, and the wire says so rather than implying a
+    // reading. Three states, one send: armed here, stood down for [v3d81q], or gated off entirely.
+    #[cfg(all(not(feature = "v3d81_qpu"), feature = "v3d_deep", feature = "v3d_qpu"))]
     match mailbox::set_enable_qpu(1) {
         Some(r) => serial_println!(":: V3D: [v3d75a] SET_ENABLE_QPU(1) — mailbox OK reply={:#010x} ::", r),
         None => serial_println!(":: V3D: [v3d75a] SET_ENABLE_QPU(1) — MAILBOX FAILED (tag unhandled or call error) ::"),
     }
+    #[cfg(all(
+        not(feature = "v3d81_qpu"),
+        any(not(feature = "v3d_deep"), not(feature = "v3d_qpu"))
+    ))]
+    serial_println!(
+        ":: V3D: [v3d75a] SET_ENABLE_QPU SKIPPED — qpu-gate off (arm with UNAOS_V3D_QPU=1; this send wedges the VC mailbox and kills USB for the boot). Nothing was sent and NO [v3d75] experiment-A verdict is implied ::"
+    );
     #[cfg(feature = "v3d81_qpu")]
     serial_println!(
-        ":: V3D: [v3d75a] SEND STOOD DOWN — UNAOS_V3D81_QPU is armed, so SET_ENABLE_QPU is sent EXACTLY ONCE this boot, reply-less, in [v3d81q]. The station and kick below are this boot's PRE-SEND control ::"
+        ":: V3D: [v3d75a] SEND STOOD DOWN — UNAOS_V3D81_QPU is armed, so SET_ENABLE_QPU is sent AT MOST ONCE this boot, reply-less, in [v3d81q] (and only if the qpu-gate is armed there). The station and kick below are this boot's PRE-SEND control ::"
     );
     let m_a = mmio_read(RPIVID_ASB_BASE, ASB_V3D_M_CTRL);
-    #[cfg(not(feature = "v3d81_qpu"))]
+    #[cfg(all(not(feature = "v3d81_qpu"), feature = "v3d_deep", feature = "v3d_qpu"))]
     serial_println!(
         ":: V3D: [v3d75a] M_CTRL after ENABLE_QPU: {:#010x} (was {:#010x}, piOS ref 0x00004040) — {} ::",
         m_a, m0,
         if m_a != m0 { "THE FIRMWARE PATH TOUCHED THE BRIDGE — the missing init is mailbox-reachable" }
         else { "unchanged — ENABLE_QPU alone does not program this bridge on this firmware" }
     );
-    #[cfg(feature = "v3d81_qpu")]
+    #[cfg(any(
+        feature = "v3d81_qpu",
+        not(feature = "v3d_deep"),
+        not(feature = "v3d_qpu")
+    ))]
     serial_println!(
-        ":: V3D: [v3d75a] M_CTRL pre-send control: {:#010x} (station {:#010x}, piOS ref 0x00004040) — no tag was sent, so equality here is the expected null and the value [v3d81q]'s post-send read is compared against ::",
+        ":: V3D: [v3d75a] M_CTRL pre-send control: {:#010x} (station {:#010x}, piOS ref 0x00004040) — no tag was sent here, so equality is the expected null and NO experiment-A verdict is implied; this is the value a reply-less [v3d81q] post-send read is compared against when one is armed ::",
         m_a, m0
     );
-    #[cfg(not(feature = "v3d81_qpu"))]
+    #[cfg(all(not(feature = "v3d81_qpu"), feature = "v3d_deep", feature = "v3d_qpu"))]
     let a = v3d75_kick_probe("v3d75a post-enable-qpu");
-    #[cfg(feature = "v3d81_qpu")]
+    #[cfg(any(
+        feature = "v3d81_qpu",
+        not(feature = "v3d_deep"),
+        not(feature = "v3d_qpu")
+    ))]
     let a = v3d75_kick_probe("v3d75a pre-send-control");
 
     // ── Experiment B: transplant the working value verbatim (skipped if A already retires). ──
