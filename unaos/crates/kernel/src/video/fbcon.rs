@@ -714,12 +714,12 @@ fn route_present_banded(band: Option<(usize, usize)>) {
     {
         return;
     }
-    // Everything owed, including bands from presents that declined earlier. FBCON-DMG's banded
-    // callee (`wm::present_rows`) is x86 re-land material (tier-3 sequencing) and absent from the
-    // merged wm.rs, so every owed band presents the whole box until callers and callee re-land
-    // together; the ledger still bounds WHEN presents happen, just not their height.
+    // Everything owed, including bands from presents that declined earlier.
     let owed = pend_take();
-    let ok = wm::present(id);
+    let ok = match owed {
+        Some((y0, y1)) => wm::present_rows(id, y0, y1),
+        None => wm::present(id),
+    };
     if !ok {
         // The row is gone (a panic tore the route down, or the window was closed underneath us).
         // Put the rows back rather than dropping them: if a route is ever re-established they are

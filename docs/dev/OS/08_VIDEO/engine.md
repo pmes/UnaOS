@@ -6224,3 +6224,162 @@ gate means the population was never sampled rather than that contention is absen
 * `<D4>` as the LAST token on a torn wire no longer implicates the sprite lock's *wait*. It still
   names `close_owner`'s cursor bracket as the phase, but a death there is now downstream of the claim
   — look at `refresh_locked`'s framebuffer work and at `WRITER`, not at a masked spin on `SPRITE`.
+
+## FBCON-DMG — the console window presents the rows that changed (x86 re-land M4, 2026-08-03)
+
+The console-as-a-window (`win=1`, 1314x750 on the rMBP bench) cost **3.9 MB and ~24 ms of present per
+printed line** — 1.5 frame budgets — with `[wc-h] torn=yes` on 3 of 4 samples. The console knew which
+rows it had dirtied the whole time; the information was thrown away twice before it could reach the
+compositor, and `wm` had nowhere to put it if it had arrived:
+
+* `FbCon::flush_dirty` reset the band and returned nothing on the routed path;
+* `PanelSink::flush` took the band, ignored it, and presented the whole box — once per 16-byte
+  `CHUNK`, so an 80-column line paid ~5 full-box presents;
+* a window row carried `damaged: bool` and nothing else, and `draw_window` recomputed `outer_box`
+  from scratch on every pass.
+
+### The band, and the invariant that makes every old path inert
+
+`Window` carries `dmg_y0`/`dmg_y1` — a **SOURCE-ROW** band, the coordinate the *owner* of the surface
+knows — beside `damaged`. **An EMPTY band (`dmg_y1 <= dmg_y0`) means THE WHOLE OUTER BOX.**
+`Window::empty` leaves one, and `Window::damage_all` clears the band on every call. Every damage path
+that predates this arc — `compat_present`, `present`, `move_to`, both `focus_changed` arms, the raise,
+`repaint`, `damage_intersecting`, `create_inner`, the tiler in `place` — goes through `damage_all`, so
+they all declare exactly what they declared before and unbanded presents are byte-for-byte unchanged.
+
+Source rows and not panel rows: the console tracks a dirty band in its own glyph grid and has no
+business re-deriving the compositor's placement. `damaged_box(r, band)` does the conversion once,
+through the same `r.y`/`r.scale` the content blit uses, and intersects with `outer_box`, so a band can
+neither disagree with the pixels it describes nor extend a window's damage past its own chrome.
+
+### The two present verbs
+
+`present(id)` and `present_rows(id, sy0, sy1)` both delegate to one private `present_banded(id, band)`.
+There is no second present path to keep in step: the pass, the occlusion closure, the staged-present
+discipline, the cursor bracket, VUGMIN-B's hidden-owner suppression, WC-N's accounting and every
+witness are the same code on the same path. A band the row does not contain (`y1 > r.h`) is **not**
+narrowed to the part that fits — that means the caller and the row disagree about the geometry, and
+the only answer that cannot leave a stale pixel is the whole box.
+
+### Band propagation through `composite_inner`
+
+The band is snapshotted **in the same critical section as the `dirty[i]` snapshot** and cleared with
+it, so a `present_rows` landing after the snapshot re-damages the row rather than having its rows
+absorbed by a pass that is no longer going to draw them. Nothing else in the pass moves — in
+particular **WC-L's deferred-erase drain still runs BEFORE the snapshot and outside the F4 `BlitGuard`
+window**, which is what its placement argument (and CURSOR-5's P64 fix) depends on.
+
+The occlusion closure then reads the *damaged region* of `i` — its band-clipped box — rather than its
+whole box, and **promotes every window it drags in to a whole-box repaint**:
+
+```rust
+let bi = damaged_box(&rows[i], bands[i]);
+for j in 0..MAX_WINDOWS {
+    if !rows[j].used || rows[j].z <= rows[i].z { continue; }
+    if dirty[j] && bands[j].is_none() { continue; }   // already whole-box: nothing to widen
+    if boxes_overlap(bi, outer_box(&rows[j])) { dirty[j] = true; bands[j] = None; grew = true; }
+}
+```
+
+Both halves are the conservative direction: a narrower `bi` can only reach *fewer* windows, and every
+window it does reach repaints at least the rows `i` is about to overwrite. A `j` that was itself banded
+must re-enter the fixed point (`bands[j].is_some()`), or a banded window could stay banded while a
+lower window repainted rows outside that band. Termination is unchanged: each `j` moves at most once
+into the `dirty && band.is_none()` state, which is the state the `continue` skips.
+
+### `draw_window` and `stage_window` — the band is WC-M's band
+
+`draw_window` converts the source band to box-relative rows (`damaged_box`, minus `by`) and hands
+`dy0`/`dy1` to `stage_window`. The box geometry passed to `paint_window` is still the WHOLE box, so
+the chrome keeps its true position across the seam exactly as a WC-M-banded present does — this reuses
+that machinery rather than adding a second kind of band. `stage_window` then:
+
+* clamps the range to the box (an out-of-box band gets the whole box — over-painting is free of
+  consequence, under-painting is not) and derives `span = dy1 - dy0`;
+* sizes `chunk_rows` off `span`, not `bh`, so a banded present of a box that would have needed several
+  WC-M bands takes **one**;
+* starts its banding loop at `dy0` and stops at `dy1`. `dy0 == 0 && dy1 == bh` is the pre-FBCON-DMG
+  loop verbatim;
+* keeps CURSOR-3's offer contract untouched — `chunk_rows >= span` is the same "single band" test
+  restated against the rows this present owes.
+
+Two extents follow whichever path actually ran, not the band: the cache clean at `draw_window`'s tail
+is derived from `staged` (the **direct fallback ignores the band and paints the whole box**, which can
+only over-paint), and `[wc-h]`'s `bytes=` reports `row_bytes * span` — what this present put on the
+glass — so a damage-limited console line reports its true cost instead of the cost of the box it lives
+in. (On x86 that last line is currently mute; see the ⚠ note under the gate results.)
+
+### The producer side, and the ledger that makes a declined present safe
+
+`fbcon` accumulates the band across a line and presents **ONCE**, at `PanelSink::finish`, instead of
+once per 16-byte `CHUNK`. A band that cannot be presented — the `ROUTE_BUSY` re-entry guard, the
+INSTGUI suspension, a `wm` that reports the row gone — is merged into the `PEND` ledger **before** any
+decline is tested, rather than dropped, so no glyph can be left stale by a declined present. Every
+degradation in that ledger repaints MORE, never less: `PEND` is always `try_lock`ed (this is reached
+from print context with interrupts enabled), and contention is answered with `PEND_FULL`, i.e. a
+whole-box present — exactly the behaviour this arc replaces, for one line.
+
+**Scroll.** The console wraps rather than scrolls, so only the wrap line unions the last cell row with
+the first and costs a full box — one line in `rows` (23 on the bench console), and the bounded worst
+case.
+
+### x86-scoped by construction — and this is checkable, not asserted
+
+The band is produced by exactly one call site, `fbcon::route_present_banded`, which is
+`#[cfg(all(target_arch = "x86_64", feature = "wc"))]`; it is the **only** caller of `wm::present_rows`
+in the tree, and `present_rows` is the only caller of `Window::damage_rows`. `FbCon::flush_dirty`
+returns `None` on every path that survives `cfg` on aarch64. So on aarch64 `dmg_y1 > dmg_y0` is
+unreachable, `bands[i]` is always `None`, `damaged_box` returns `outer_box`, `draw_window` passes
+`(0, bh)`, and `span == bh` — every aarch64 present is byte-for-byte the pre-arc present, including
+`[wc-h]`'s and COMPOSITE-2's numbers.
+
+### Gate results (FBCON-DMG, 2026-08-03)
+
+* `./arroyo check` — both arches green. `⚡ kernel features: ehcihid,kbdwit,smolnet`;
+  x86_64 16 warnings, aarch64 14 warnings.
+* `UNAOS_WITNESS=1 UNAOS_WC=1 UNAOS_IVB=1 UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1 UNAOS_KEPLER_FIFO=1
+  UNAOS_SMC=1 ./arroyo check` — both arches green.
+  `⚡ kernel features: witness,ehcihid,kbdwit,smc,smolnet,nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,intel-ivb,unaos_ivb`;
+  x86_64 36 warnings, aarch64 14 warnings.
+* **Warning-set delta: zero on both arches under both gates** — the sorted warning lines are
+  byte-identical to the pre-change baseline. That also proves the two FBCON-DMG-substrate
+  `#[expect(dead_code)]` markers came off correctly: `damage_rows` and `damaged_box` both gained
+  callers, and neither an unfulfilled-expectation nor a dead-code warning appears.
+* **No QEMU verdict, and none is possible.** `wcx::activate()` — the compositor's only x86 ignition —
+  has exactly one caller, `drivers/gpu/kepler_display.rs`, inside the Kepler takeover, for which QEMU
+  has no part. A QEMU run of this path would be vacuous. **Metal is the only verdict.**
+
+### ⚠ `[wc-h]` cannot fire on x86 in this tree — the arc's own evidence line is missing
+
+The 3.9 MB / ~24 ms / `torn=yes` numbers that motivate this arc came from `[wc-h] win=1`, and on the
+merged trunk **that instrument is unreachable on x86**. The R23 merge took the Pi's compositor as the
+`wm.rs` baseline, which arch-gated every WC-H producer: `wcg::stage_note`, `wcg::stage_flush` and the
+`decline!` macro's `wcg::stage_decline` are all `#[cfg(all(target_arch = "aarch64", feature =
+"witness"))]` here, where the pre-merge x86 tip had them at plain `#[cfg(feature = "witness")]`. The
+`stage_note(…, span, row_bytes * span, …)` change this arc makes is therefore **correct and, on x86,
+currently mute**.
+
+Re-widening those gates is a separate change to `video/wcg.rs`'s call sites and was deliberately not
+taken here — it is instrument scope, not FBCON-DMG scope, and it belongs with whoever re-lands the
+rest of the x86 witness surface. Until then the x86 bench cannot read the arc's cost directly; the
+lines below are what it CAN read.
+
+### Metal watch-list (FBCON-DMG)
+
+* `[wc-x] console-route first-paint win=N (glyphs -> window surface, damage-limited)` — the routed
+  first paint. **This line is NOT a discriminator for this arc.** It came back with the merge's
+  producer side and its `, damage-limited` wording was already on the wire while the consumer was
+  presenting whole boxes; it says the route exists, nothing about the band. Treat it as a
+  prerequisite, not as evidence.
+* **There is no x86 wire line that distinguishes a banded present from a whole-box one.** That is a
+  gap this arc inherits rather than creates (see the ⚠ note), and it should be closed by re-widening
+  the WC-H gates before anyone reads a bench boot as confirming or refuting FBCON-DMG on the wire.
+* **Wall-clock, since `[wc-h]` is mute here**: the boot-log print rate through the routed console.
+  A line that cost ~24 ms of present should now cost a band of a few rows; the arc lands as a visible
+  drop in the time the console spends painting, not as a witness line.
+* `[wc-a] composite windows=N drawn=M` and the WC-N per-window `comp=` accounting are `#[cfg(feature =
+  "witness")]` and DO reach x86 — they say a pass ran and which ids it drew, not how many rows.
+* A console line that leaves a stale glyph is the ledger failing, not the band: read `PEND_FULL`'s
+  effect (a whole-box present) as the fallback that should have covered it.
+* On aarch64 the whole watch-list is "nothing moved" — `[wc-h] box=`/`bytes=` must be byte-identical
+  to the pre-arc boot, since no band is ever produced there.
