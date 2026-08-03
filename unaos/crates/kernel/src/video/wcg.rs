@@ -124,10 +124,10 @@
 //! ([`crate::arch::now_cycles`], already both-arch, and [`clean_invalidate_surface`] below); the
 //! WC-L erase discipline the `[wc-k]` lines report is arch-neutral and always was, so reporting it
 //! on one arch only meant the x86 compositor ran that discipline with no witness over it. The
-//! module therefore COMPILES on both arches — but that is only half of what x86 needs, and the
-//! other half is not here: every `wcg::` call site in `wm.rs` is still gated
-//! `all(target_arch = "aarch64", feature = "witness")`, so an x86 witness build emits none of these
-//! lines. Widening those sites is its own arc, and two of them should not be widened at all — the
+//! module therefore COMPILES on both arches, and the other half followed: every `wcg::` call site in
+//! [`super::wm`] now carries a plain `#[cfg(feature = "witness")]` too, so an x86 witness build
+//! emits these lines and a banded present is distinguishable from a whole-box one on both arches.
+//! Two neighbouring sites deliberately stayed aarch64-only, because neither is a `wcg::` call: the
 //! WC-F reserved-box interlock talks to the VideoCore mailbox, and WC-L's deferral fixture drives a
 //! Pi-shaped stage path that needs a native x86 fixture instead. Budgeted at [`SAMPLES`]
 //! instrumented blits per window id

@@ -817,7 +817,7 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>) -> bool {
     // the only honest baseline for the `app` leg. The identity is captured under the table lock and
     // the checksum taken after it drops — a 64 KiB read is not something to hold the window table
     // across, and the surface cannot be unmapped underneath it while the owner is in the syscall.
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     let mut probe: Option<(usize, usize)> = None;
     // VUGMIN-B — is the presenting owner hidden? Read under the same guard that marks the row, so the
     // answer and the mark are taken against one table state.
@@ -834,7 +834,7 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>) -> bool {
                     _ => r.damage_all(),
                 }
                 r.presented = true;
-                #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+                #[cfg(feature = "witness")]
                 if !r.compat {
                     probe = Some((r.surf, r.surf_len));
                 }
@@ -852,7 +852,7 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>) -> bool {
         };
         skip = owner_hidden(&t, owner, SHELL_Z.load(core::sync::atomic::Ordering::Acquire));
     }
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     if let Some((surf, surf_len)) = probe {
         // WC-G's checksum is the OWNER's declaration of its own surface and is independent of whether
         // those pixels reach the panel, so it is taken on the suppressed path too — dropping it would
@@ -2307,7 +2307,7 @@ fn composite_inner() -> CursorTail {
         // first thing after it: the `blit`/`after` checksums mean "the surface as the copy found it"
         // and "as the copy left it", and anything inserted between them widens the interval they
         // measure into something other than the copy. Budgeted per window id; `None` once spent.
-        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        #[cfg(feature = "witness")]
         let wcg_probe = super::wcg::begin(rows[i].id, rows[i].surf, rows[i].surf_len, rows[i].compat);
         // CURSOR-3 — WHICH WINDOWS MAY CARRY THE SPRITE. WC-I's invariant "no verified pixel is ever
         // read with the sprite on the panel" is preserved here rather than weakened: this pass may
@@ -2325,7 +2325,7 @@ fn composite_inner() -> CursorTail {
         // repaint them. Excluding the window from the plan entirely is what would break the split.
         #[allow(unused_mut)]
         let mut may_overlay = true;
-        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        #[cfg(feature = "witness")]
         if wcg_probe.is_some() {
             may_overlay = false;
             // CURSOR-12 — attributed, and only when there was an offer to lose. A pass with no plan
@@ -2370,7 +2370,7 @@ fn composite_inner() -> CursorTail {
             // caller that predates this arc.
             bands[i],
         );
-        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        #[cfg(feature = "witness")]
         if let Some(p) = wcg_probe {
             let r = &rows[i];
             super::wcg::end(p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale);
@@ -2378,7 +2378,7 @@ fn composite_inner() -> CursorTail {
         // WC-H — print the back-layer sample the blit above recorded, if any. Deliberately AFTER
         // `wcg::end`: this emits to the serial UART, and inside the bracket it would be charged to
         // `[wc-g] us=`. See `wcg::stage_flush`.
-        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        #[cfg(feature = "witness")]
         super::wcg::stage_flush(rows[i].id);
         // WC-D — verify this window's blit against the scan-out, once per window id, from inside the pass
         // that drew it (the only place both the source surface and the destination rows are known).
@@ -4532,7 +4532,7 @@ const DEFER_GEOM: u32 = 1;
 const DEFER_CAP: u32 = 2;
 const DEFER_LOCK: u32 = 3;
 const DEFER_ALLOC: u32 = 4;
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[cfg(feature = "witness")]
 const _: () = assert!(
     DEFER_GEOM == super::wcg::DECL_GEOM
         && DEFER_CAP == super::wcg::DECL_CAP
@@ -4615,14 +4615,14 @@ fn defer_erase(x: usize, y: usize, w: usize, h: usize, reason: u32, requeued: bo
                 }
             }
             boxes[best] = union(boxes[best]);
-            #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+            #[cfg(feature = "witness")]
             super::wcg::erase_coalesce();
         }
         DEFER_N.store(*n, core::sync::atomic::Ordering::Relaxed);
     }
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     super::wcg::erase_defer(w, h, reason, requeued);
-    #[cfg(not(all(target_arch = "aarch64", feature = "witness")))]
+    #[cfg(not(feature = "witness"))]
     let _ = (reason, requeued);
 }
 
@@ -4796,9 +4796,9 @@ static STAGE: Mutex<alloc::vec::Vec<u8>> = Mutex::new(alloc::vec::Vec::new());
 
 /// WC-H — whether the one-shot fallback fixture has been spent. See the fixture block in
 /// [`stage_window`]: it forces exactly one non-compat composite onto the direct path so WC-D's
-/// scan-out read-back covers the fallback as well as the staged present. `witness`-gated and
-/// aarch64-only, so the flashable media are unaffected.
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+/// scan-out read-back covers the fallback as well as the staged present. `witness`-gated and nothing
+/// else — latching a bool and taking the direct path is arch-neutral; no flashable medium carries it.
+#[cfg(feature = "witness")]
 static FALLBACK_FIXTURE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -5495,7 +5495,7 @@ fn stage_window(
     // `wcg::stage_decline`.
     macro_rules! decline {
         ($reason:expr) => {{
-            #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+            #[cfg(feature = "witness")]
             super::wcg::stage_decline(r.id, $reason);
             return false;
         }};
@@ -5508,7 +5508,7 @@ fn stage_window(
     //
     // Armed on the composite WC-D is about to verify — the same predicate `composite_inner` tests
     // afterwards — so the fixture and the verification cannot land in different passes.
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     {
         if r.presented && r.id < 32 {
             let bit = 1u32 << r.id;
@@ -5562,7 +5562,7 @@ fn stage_window(
     // this window's compose, and all of its panel-facing copy. `stage_note` takes them as
     // `(t_end, t0, t1)` differences, so a zero base and two running totals feed it unchanged — no
     // witness signature moves for this arc, which is what lets the x86 tree take this diff as-is.
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     let (mut compose_cyc, mut present_cyc) = (0u64, 0u64);
 
     let fb_row = info.stride * bpp;
@@ -5574,8 +5574,8 @@ fn stage_window(
     while band < dy1 {
         let rows = chunk_rows.min(dy1 - band);
 
-        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
-        let b0 = crate::arch::aarch64::now_cycles();
+        #[cfg(feature = "witness")]
+        let b0 = crate::arch::now_cycles();
 
         // The back layer: same pixel format and bytes/pixel as the panel (so the composed bytes ARE
         // the panel's bytes and the present is a straight copy), but its own stride — the box width,
@@ -5630,8 +5630,8 @@ fn stage_window(
             }
         }
 
-        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
-        let b1 = crate::arch::aarch64::now_cycles();
+        #[cfg(feature = "witness")]
+        let b1 = crate::arch::now_cycles();
 
         // Present: one bulk copy per row. This is the whole of what the scan-out can catch
         // mid-flight, and it is the same primitive and the same shape as
@@ -5641,10 +5641,10 @@ fn stage_window(
             fb.blit((by + band + y) * fb_row + bx * bpp, &stage[src..src + row_bytes]);
         }
 
-        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        #[cfg(feature = "witness")]
         {
             compose_cyc += b1.saturating_sub(b0);
-            present_cyc += crate::arch::aarch64::now_cycles().saturating_sub(b1);
+            present_cyc += crate::arch::now_cycles().saturating_sub(b1);
         }
         band += rows;
     }
@@ -5658,7 +5658,7 @@ fn stage_window(
     // the glass", so a damage-limited console line reports its true cost instead of the cost of the
     // box it lives in. Unbanded presents have `span == bh` and their `[wc-h]` lines do not move —
     // which on aarch64, where no band is ever produced, is every present there is.
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     super::wcg::stage_note(
         r.id,
         bw,
@@ -5730,7 +5730,7 @@ fn stage_fill(
             // Named unconditionally: the reason is part of the CORRECTNESS decision (drop, not
             // defer) on every build, and only its reporting is witness-gated.
             let _reason: u32 = $reason;
-            #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+            #[cfg(feature = "witness")]
             super::wcg::erase_drop(w, h, _reason);
             return false;
         }};
@@ -5784,8 +5784,8 @@ fn stage_fill(
         stage.resize(row_bytes, 0);
     }
 
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
-    let t0 = crate::arch::aarch64::now_cycles();
+    #[cfg(feature = "witness")]
+    let t0 = crate::arch::now_cycles();
 
     // Compose: one row, in the panel's own pixel format so the present is a straight copy.
     for b in stage[..row_bytes].iter_mut() {
@@ -5805,8 +5805,8 @@ fn stage_fill(
     );
     layer.fill_rect(0, 0, w, 1, color);
 
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
-    let t1 = crate::arch::aarch64::now_cycles();
+    #[cfg(feature = "witness")]
+    let t1 = crate::arch::now_cycles();
 
     // Present: one bulk copy per row. ROW-CONTIGUITY is checked here rather than asserted in a
     // comment — each destination run must be exactly `row_bytes` long, must fit inside its scanline
@@ -5824,13 +5824,13 @@ fn stage_fill(
         fb.blit(off, &stage[..row_bytes]);
     }
 
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     super::wcg::erase_note(
         w,
         h,
         row_bytes,
         contig,
-        crate::arch::aarch64::now_cycles(),
+        crate::arch::now_cycles(),
         t0,
         t1,
         info.height,
