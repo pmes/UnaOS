@@ -59,7 +59,8 @@
 //! without overflow checks, so wrapping arithmetic is a real failure mode here, not a theoretical
 //! one.
 
-use spin::Mutex;
+use spin::relax::Spin as SpinRelax;
+use spin::{Mutex, MutexGuard};
 
 /// WC-A — the window table is fixed-size and statically allocated: the compositor runs from syscall
 /// context on a non-coherent scan-out path where a heap allocation (or a growable table) would be
@@ -131,17 +132,6 @@ struct Window {
     scale: usize,
     z: u32,
     damaged: bool,
-    /// FBCON-DMG — the SOURCE-ROW band `[dmg_y0, dmg_y1)` of this window's surface that is known
-    /// damaged, when the damage arrived through [`present_rows`]. An EMPTY band (`dmg_y1 <= dmg_y0`,
-    /// which is what [`Window::empty`] and every [`Window::damage_all`] site leave behind) means THE
-    /// WHOLE BOX — so a window that never takes a banded present behaves exactly as it did before.
-    ///
-    /// Source rows and not panel rows, because that is the coordinate the *owner* of the surface
-    /// knows: the console tracks a dirty band in its own glyph grid and has no business re-deriving
-    /// the compositor's placement. [`draw_window`] converts once, through the same `r.y`/`r.scale`
-    /// the content blit uses, so the band can never disagree with the pixels it describes.
-    dmg_y0: usize,
-    dmg_y1: usize,
     title: [u8; MAX_TITLE],
     title_len: usize,
     /// Compat shim marker: window created implicitly by [`super::screen::present_surface`]. Such a
@@ -178,48 +168,12 @@ impl Window {
             scale: 1,
             z: 0,
             damaged: false,
-            dmg_y0: 0,
-            dmg_y1: 0,
             title: [0u8; MAX_TITLE],
             title_len: 0,
             compat: false,
             pinned: false,
             presented: false,
         }
-    }
-
-    /// FBCON-DMG — declare the WHOLE outer box damaged. This is what `r.damaged = true` meant before
-    /// the band existed, and every damage path except [`present_rows`] still means exactly it: an
-    /// empty band reads as "the whole box", so clearing the band here is what keeps a chrome repaint,
-    /// a move, a raise, a focus change and a `damage_intersecting` unconditionally whole-box even
-    /// when a banded present is already pending on the same row.
-    fn damage_all(&mut self) {
-        self.damaged = true;
-        self.dmg_y0 = 0;
-        self.dmg_y1 = 0;
-    }
-
-    /// FBCON-DMG — declare SOURCE rows `[y0, y1)` damaged, widening whatever band is already pending.
-    ///
-    /// Fail-safe in the direction that cannot lose a pixel: a band already standing for the whole box
-    /// (empty, i.e. an unserviced [`damage_all`]) STAYS the whole box, and an empty or inverted
-    /// argument is likewise promoted to the whole box rather than silently narrowing anything.
-    fn damage_rows(&mut self, y0: usize, y1: usize) {
-        if y1 <= y0 {
-            self.damage_all();
-            return;
-        }
-        if self.damaged && self.dmg_y1 <= self.dmg_y0 {
-            return; // a whole-box repaint is already owed; it covers these rows.
-        }
-        if self.damaged {
-            self.dmg_y0 = self.dmg_y0.min(y0);
-            self.dmg_y1 = self.dmg_y1.max(y1);
-        } else {
-            self.dmg_y0 = y0;
-            self.dmg_y1 = y1;
-        }
-        self.damaged = true;
     }
 }
 
@@ -236,6 +190,92 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
     rows: [Window::empty(); MAX_WINDOWS],
     next_z: 1,
 });
+
+/// WEDGE-7 / F1 — **the sole acquisition path for [`TABLE`].** Masks IRQs for exactly the lifetime
+/// of the guard.
+///
+/// ## The defect this closes
+/// `TABLE` was acquired unmasked at 23 sites while `WINDOWS` (`arch::syscall`) is acquired MASKED at
+/// all 8 of its sites, and a masked span reaches `TABLE` through `wm::present`. That asymmetry is a
+/// deadlock on ONE core, with no ABBA cycle anywhere — the documented order `WINDOWS ⊃ TABLE ⊃
+/// WRITER` is honoured throughout, which is why no lock-ordering discipline addresses it:
+///
+/// 1. `render` (pinned, `PRIO_SERVICE`) takes `TABLE` unmasked inside `service_damage`/`composite`.
+/// 2. The timer PPI preempts it mid-hold — `timer_preempt` stores `STATE_READY` and switches out.
+///    `render` is now descheduled **still holding TABLE**, and it is pinned, so no other core can
+///    steal and finish it.
+/// 3. An aged-in EL0 vug on the SAME core wins the next pop and issues `SYS_WIN_PRESENT`, which
+///    masks IRQs, takes `WINDOWS`, and blocks on `TABLE`.
+/// 4. That core can no longer take a timer IRQ, so it never re-enters its scheduler, so `render` is
+///    never re-dispatched, so `TABLE` is never released. Permanent, silent, no panic.
+///
+/// It propagates: the spinner holds `WINDOWS` throughout, so every other vug on every other core
+/// that issues any window verb masks and blocks on `WINDOWS` too — a fleet-wide GUI freeze from one
+/// vug on one core. The foreground case is not even a coincidence: `run` places an EL0 program on
+/// the launching core, which is the shell's core, which is `render`'s core.
+///
+/// ## Why masking is the fix, and why the alternatives were rejected
+/// Masking establishes: *no core is ever preempted while holding `TABLE`*. Every critical section
+/// then runs to completion once entered, so every waiter — masked or not — waits at most one
+/// critical section. This is the WEDGE-4 discipline that fixed `RUN_QUEUES`, transposed to `wm`.
+/// It is affordable because all 23 sections are bounded `MAX_WINDOWS`-row scans with no print, no
+/// allocation, no I/O and no nested blocking lock; the two longest are the composite snapshot
+/// (8 rows + damage clear, with the blit itself OUTSIDE the guard) and the focus-raise scan.
+///
+/// A try-lock with backoff cannot work here: the holder is on the SAME core and cannot run while we
+/// back off, so a masked backoff is the same deadlock with extra steps. Moving the composite off the
+/// masked span is worse than useless — `arch::syscall` documents that the `WINDOWS` hold must span
+/// the composite precisely because a `CLOSE`+`CREATE` pair on other cores can recycle the id in the
+/// gap and land the caller's pixels under a different process's window identity. That is a
+/// protection, so dropping it to fix a deadlock is not on the table.
+///
+/// This ADDS masking; it removes no check, permission, checksum or page attribute. The cost is
+/// worst-case IRQ latency bounded by an 8-row scan — far below the `IrqGuard` spans already present
+/// in every window verb.
+///
+/// ## The invariant, and how to check it without booting
+/// *`wm::TABLE` is never held across a preemption point.* Checkable by grep, because this is the
+/// only acquisition path:
+/// ```text
+/// grep -n "TABLE\s*\.\s*lock" video/wm.rs   -> exactly ONE hit, inside `fn table()`
+/// grep -rn "\bTABLE\b" --include=*.rs src | grep -v video/wm.rs   -> no acquisitions (TABLE is private)
+/// ```
+/// Standing rule for future arcs: **no `TABLE` critical section may call anything that can block,
+/// print, or allocate.** True today; this guard makes it load-bearing.
+struct TableGuard {
+    // DECLARATION ORDER IS THE FIX. Rust drops struct fields in declaration order, so the lock
+    // guard is released FIRST and the IRQ mask is restored SECOND. The reverse would unmask while
+    // still holding TABLE, re-opening a preemption window in the hold's tail — which is precisely
+    // the bug, in miniature, at every unlock.
+    // `spin 0.12`'s guard is `<'a, T, R>` — the 2-generic form this tree requires.
+    inner: MutexGuard<'static, Table, SpinRelax>,
+    _irq: crate::arch::IrqMask,
+}
+
+impl core::ops::Deref for TableGuard {
+    type Target = Table;
+    #[inline]
+    fn deref(&self) -> &Table {
+        &self.inner
+    }
+}
+
+impl core::ops::DerefMut for TableGuard {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Table {
+        &mut self.inner
+    }
+}
+
+/// Acquire [`TABLE`] with IRQs masked. See [`TableGuard`].
+#[inline]
+fn table() -> TableGuard {
+    // Mask BEFORE the acquisition, not after: masking after would leave the spin itself
+    // preemptible, and a holder preempted between our acquire and our mask is the same wedge.
+    let _irq = crate::arch::IrqMask::new();
+    let inner = TABLE.lock();
+    TableGuard { inner, _irq }
+}
 
 /// FOCUS-VIS — **the SHELL's position in the z-order.** The desktop/console is a member of the stack the
 /// TAB ring already cycles through, not a backdrop the stack is painted onto.
@@ -277,64 +317,156 @@ pub fn focus_asid() -> u64 {
     FOCUS_ASID.load(core::sync::atomic::Ordering::Acquire)
 }
 
-// ---- CLICK-X86: the KERNEL's own windows get an owner, so that they can be CLICKED ---------------
-
-/// CLICK-X86 — base of the reserved band of owner ASIDs meaning **"the kernel owns this window"**.
-/// Values in `[KERNEL_OWNER_BASE, KERNEL_OWNER_BASE + 0xFF]` are handed to [`create_at`] by the
-/// kernel's own furniture (the panel console, the desktop demo); no address space can ever hold one
-/// (a real owner is a slot or ASID with a single-digit ceiling), and the band is far below
-/// `u64::MAX`, which the input router reserves as its own drop sentinel.
-///
-/// ### Why this exists — the argument for changing owner 0
-/// The console and the demo shipped as owner `0`, and both sites justified that by two consequences:
-/// such a row is outside [`focus_ring`] (no `TAB` cycles to the kernel's console) and outside
-/// [`close_owner`]'s reach (no EL0 task can close, move or present the kernel's window). Both are
-/// correct and both are preserved here — `focus_ring` skips this band explicitly, and `close_owner`
-/// refuses it outright.
-///
-/// What owner 0 ALSO bought was never argued for anywhere: [`hit_test`] skips owner 0, so the two
-/// largest objects on the x86 panel — the console the operator types into and the demo window in the
-/// corner — resolved to `None` for every pointer press. That is not a policy, it is a side effect of
-/// encoding "the kernel owns it" and "nobody owns it" in one value. Splitting them is the whole of
-/// this change: a kernel row is now HITTABLE (it is furniture on the panel and the operator will
-/// click it) while remaining unreachable as an EL0 focus target or an EL0 teardown victim.
-///
-/// A hit on such a row is not a hit on an app, so the router turns it into a shell-focus decision
-/// rather than a delivery — see `arch::x86_64::syscall::wc_click_route`.
-pub const KERNEL_OWNER_BASE: u64 = 0xFFFF_FF00;
-
-/// CLICK-X86: the panel console's row (`fbcon::panel_console_window_open`). Distinct from
-/// [`KERNEL_OWNER_DESKTOP`] so that [`focus_changed`] raises exactly the window that was clicked —
-/// one shared kernel owner would raise all of the furniture together and make "click the demo" and
-/// "click the console" indistinguishable z-order moves.
-pub const KERNEL_OWNER_CONSOLE: u64 = KERNEL_OWNER_BASE + 1;
-
-/// CLICK-X86: the desktop demo window's row (`wcx::activate`). See [`KERNEL_OWNER_CONSOLE`].
-pub const KERNEL_OWNER_DESKTOP: u64 = KERNEL_OWNER_BASE + 2;
-
-/// CLICK-X86 — is `asid` in the reserved kernel-owner band? See [`KERNEL_OWNER_BASE`].
-///
-/// `false` for `0`, which still means "nobody owns this row" (the compat shim's own rows, and the
-/// transient witness probes that must stay unclickable).
-pub fn is_kernel_owner(asid: u64) -> bool {
-    asid >= KERNEL_OWNER_BASE && asid <= KERNEL_OWNER_BASE + 0xFF
-}
-
-/// CLICK-X86 — is a FULL-SCREEN app presenting through the compat row right now?
-///
-/// The one question [`hit_test`] deliberately cannot answer: a compat row covers the panel but carries
-/// owner ASID 0 and is excluded from the scan, so a press over a full-screen app reads as a MISS. The
-/// router's desktop arm consumes a miss, which would break such an app's clicks, so it asks this
-/// first. Cheap: one atomic load plus, at most, one table lookup.
-pub fn compat_live() -> bool {
-    let id = COMPAT_WIN.load(core::sync::atomic::Ordering::Acquire);
-    id != WIN_NONE && is_compat_row(id)
-}
-
 /// FOCUS-VIS — the shell's current z. See [`SHELL_Z`].
 pub fn shell_z() -> u32 {
     SHELL_Z.load(core::sync::atomic::Ordering::Acquire)
 }
+
+// ---- VUGMIN-B: hidden-owner plumbing -----------------------------------------------------------
+
+/// VUGMIN-B — `wm`'s SHADOW of the hidden bitmask `arch::aarch64::syscall` owns, one bit per ASID.
+///
+/// It exists for the WITNESS and for nothing else. The authoritative bit lives in `HIDDEN_ASIDS` over
+/// in the syscall layer (that module owns the info page it is published through); this side only needs
+/// to know whether a given [`vugmin_publish`] call was a TRANSITION, so `hides`/`unhides` count state
+/// changes rather than the number of times focus moved. The publish itself is issued unconditionally
+/// (see `vugmin_publish`), so a shadow that drifts — ASID recycle clears the real bit through
+/// `boot::teardown_user_slot` without telling `wm` — can miscount a rollup but can never leave the real
+/// bit wrong. The counters are the soft thing here; the mechanism is not.
+#[cfg(feature = "witness")]
+static VUGMIN_SHADOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// VUGMIN-B — owners this module has pushed below the shell, owners it has brought back, and presents
+/// whose `composite()` was suppressed because the presenting owner was hidden. Reported by
+/// [`vugmin_rollup`], beside [`wci_rollup_scoped`]'s line.
+#[cfg(feature = "witness")]
+static VUGMIN_HIDES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static VUGMIN_UNHIDES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static VUGMIN_SKIPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// VUGMIN-B — is every live, non-compat window owned by `asid` sitting BELOW `shell`?
+///
+/// The predicate is deliberately **per-owner and all-or-nothing**: an app may own several windows (the
+/// focus ring is keyed by ASID and [`focus_changed`] raises them together), and an app with one window
+/// still on the panel is not hidden however many of its others are buried. Single-window vugs are the
+/// case that actually occurs; the quantifier is what keeps a two-window app from being told to idle
+/// while the operator is looking at half of it.
+///
+/// Answers `false` for an owner with no live window at all — "hidden" is a claim about windows that
+/// exist, and the empty case falls to the same safe side `set_hidden` fails to (keep rendering).
+///
+/// Compat rows are excluded for [`above_shell`]'s reason: a compat row carries owner ASID 0, is not a
+/// focus target, and can never be raised back over a shell that overtook it. ASID 0 is never marked.
+///
+/// Caller holds `TABLE`. One scan of eight rows, no allocation, no nested lock.
+fn owner_hidden(t: &Table, asid: u64, shell: u32) -> bool {
+    if asid == 0 {
+        return false;
+    }
+    let mut any = false;
+    for r in t.rows.iter() {
+        if !r.used || r.compat || r.owner_asid != asid {
+            continue;
+        }
+        any = true;
+        if above_shell(r, shell) {
+            return false;
+        }
+    }
+    any
+}
+
+/// VUGMIN-B — publish `asid`'s hidden state to the syscall layer, and count the transition.
+///
+/// **The seam is a DIRECT CALL, not a registered callback.** `video::wm` is not arch-neutral in
+/// practice: it already reaches `crate::arch::aarch64::now_cycles()` directly from the composite path
+/// under a plain `#[cfg(target_arch = "aarch64")]`, so a callback table here would be a second, weaker
+/// convention for the same thing — and a seam whose whole content is "one `u64`, one `bool`, no return
+/// value" earns no indirection. The `cfg` is what keeps the other builds honest — `arch::aarch64::syscall`
+/// is itself gated behind `baremetal`, so the call is compiled in exactly where the info page it
+/// publishes through exists, and everywhere else (x86_64, the hosted aarch64 build) this is nothing.
+///
+/// **Never called with `TABLE` held, and it would be safe if it were.** `set_hidden` takes NO LOCK: it
+/// is an `AtomicU64` `fetch_or`/`fetch_and` followed by one `write_volatile` of a `u32` into the slot's
+/// info page, whose address is pure pointer arithmetic (`slot_fb_info_ptr` = base + offset, a
+/// `debug_assert!` and nothing else). The page is per-slot kernel backing that lives as long as the
+/// slot, so there is no allocation, no mapping change and no serial print on the path. Callers here
+/// still publish OUTSIDE the table lock, because a snapshot taken under the lock and applied after it
+/// is the shape every other outward call in this file already has, and it keeps the rule ("no calls
+/// out from under `TABLE`") a rule rather than a case-by-case audit.
+///
+/// The publish is UNCONDITIONAL — `set_hidden` is idempotent, and skipping it on the strength of
+/// [`VUGMIN_SHADOW`] would let one stale shadow bit (ASID recycle clears the real bit behind `wm`'s
+/// back) leave a fresh tenant permanently idling. Republishing a bit that is already right costs one
+/// `u32` store on a path that runs at operator speed.
+fn vugmin_publish(asid: u64, hidden: bool) {
+    if asid == 0 || asid >= 64 {
+        return;
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    crate::arch::aarch64::syscall::set_hidden(asid, hidden);
+    #[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+    let _ = hidden;
+    #[cfg(feature = "witness")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let bit = 1u64 << asid;
+        let before = if hidden {
+            VUGMIN_SHADOW.fetch_or(bit, Relaxed)
+        } else {
+            VUGMIN_SHADOW.fetch_and(!bit, Relaxed)
+        };
+        if (before & bit != 0) != hidden {
+            if hidden {
+                VUGMIN_HIDES.fetch_add(1, Relaxed);
+            } else {
+                VUGMIN_UNHIDES.fetch_add(1, Relaxed);
+            }
+        }
+    }
+}
+
+/// VUGMIN-B — snapshot, for every live owner in the table, whether that owner is now hidden.
+///
+/// Returns the filled prefix length of `out`. Taken under `TABLE` by [`focus_changed`]'s **SHELL arm**
+/// right after the z-order has moved, and applied through [`vugmin_publish`] once the guard is dropped.
+///
+/// VUGMIN-C — **this is the shell arm's scan and only the shell arm's.** It used to serve both arms, on
+/// the reasoning that a predicate recomputed for every owner is a function of the table rather than of
+/// the code path that reached it. That reasoning is right about the SHELL arm (`focus_changed(0)` moves
+/// `SHELL_Z` above everything, so every owner's answer really does change in one step) and wrong about a
+/// RAISE: raising one window changes exactly one owner's z, but the scan re-published `hidden=false` for
+/// every owner still sitting above `SHELL_Z` — i.e. for every window ever raised since the last shell
+/// TAB. On the P73 bench wire one `[clickroute] press hit asid=4` produced `[vugpause2] resume` with
+/// `edge=unhide` for two OTHER address spaces, and a six-vug fleet stayed lit on all four cores forever.
+/// The raise arm now publishes only the ARRIVING owner's unhide (see [`focus_changed`] — VUGMIN-C had
+/// it publish the departing owner's hide too, which CLICK-PLAIN removed); this function keeps the
+/// whole-table shape because "the shell took the top, everyone is under it" is genuinely whole-table,
+/// and it is now the ONLY place a hidden bit is ever SET.
+fn vugmin_scan(t: &Table, shell: u32, out: &mut [(u64, bool); MAX_WINDOWS]) -> usize {
+    let mut n = 0usize;
+    for r in t.rows.iter() {
+        if !r.used || r.compat || r.owner_asid == 0 {
+            continue;
+        }
+        if out[..n].iter().any(|&(a, _)| a == r.owner_asid) {
+            continue;
+        }
+        out[n] = (r.owner_asid, owner_hidden(t, r.owner_asid, shell));
+        n += 1;
+    }
+    n
+}
+
+// VUGMIN-C's `owner_live` lived here. It existed for ONE caller — the raise arm's hide of the previous
+// focus holder — and guarded the one hazard that hide carried: a vug that exited while focused has had
+// its hidden bit cleared by `boot::teardown_user_slot` on the way out, so publishing `hidden=true` for it
+// afterwards would strand a set bit on a free slot and the next tenant of that ASID would come up
+// permanently idle with nothing left to unhide it. CLICK-PLAIN removed the hide (see `focus_changed`),
+// which removes the hazard with it: the raise arm now publishes only `hidden=false`, and a spurious
+// CLEAR on a free slot is the harmless direction — it is the state `teardown_user_slot` already leaves.
 
 /// Create a window owned by `owner_asid` over the caller's ARGB8888 surface at `surf` (EL1-visible
 /// address, `surf_len` bytes long, `stride` bytes per row) with source dimensions `w` x `h` and a
@@ -500,7 +632,7 @@ pub(super) fn compat_present(
         id
     };
     {
-        let mut t = TABLE.lock();
+        let mut t = table();
         let r = match row_mut(&mut t, id) {
             // F2 — re-check under the lock: the row could have been closed and recycled between the
             // guard above and here.
@@ -519,7 +651,7 @@ pub(super) fn compat_present(
         r.scale = scale;
         r.x = x;
         r.y = y;
-        r.damage_all();
+        r.damaged = true;
         r.presented = true;
     }
     composite();
@@ -527,8 +659,49 @@ pub(super) fn compat_present(
 
 /// Whether `id` names a live row that is the compat window (F2's identity test).
 fn is_compat_row(id: WinId) -> bool {
-    let t = TABLE.lock();
+    let t = table();
     row(&t, id).map(|r| r.compat).unwrap_or(false)
+}
+
+/// CLICK-SHELL r2 — **is a FULL-SCREEN app presenting right now?** i.e. does a live compat row exist.
+///
+/// The compat row is the `SYS_FB_PRESENT` shim's window: at most one exists system-wide (WC-A
+/// serialises its creation), it is created by the first full-screen present and closed at the
+/// presenting slot's teardown (`close_compat`). It carries owner ASID 0 and is exempt from
+/// [`hit_test`] and [`focus_ring`] alike, so from the router's side a full-screen app is invisible in
+/// every window query — which is exactly why the router needs to be able to ask this question
+/// directly. See `wc_click_route`'s miss arm: a press that hit-tests to nothing is a DESKTOP press
+/// unless a full-screen app owns the panel, in which case it is that app's press.
+pub fn compat_live() -> bool {
+    let id = COMPAT_WIN.load(core::sync::atomic::Ordering::Relaxed);
+    id != WIN_NONE && is_compat_row(id)
+}
+
+// ── CLICK-X86 seam, GRAFTED AT MERGE ASSEMBLY (r23 candidate) ────────────────────────────────
+// The x86 trunk's CLICK-X86 lineage gives the kernel's own windows (panel console, desktop demo)
+// clickable owner rows in a reserved band — hittable furniture that remains outside focus_ring
+// and close_owner's reach. The full lineage (its hit_test/focus_changed integration and the
+// fbcon/wcx registrations) re-lands as the x86 seat's own reviewed arc per the tier-3 baseline
+// ruling; what is grafted HERE is only the seam `arch/x86_64/syscall.rs` already depends on:
+// the band constants and the band predicate. Content taken verbatim from the x86 trunk's wm.rs
+// (UnaOS-gemini f36ab3d5); doc text condensed, semantics untouched.
+
+/// CLICK-X86: base of the reserved kernel-owner ASID band. Distinct from owner 0 ("nobody owns
+/// this row" — compat rows, transient witness probes, all unclickable) so that "the kernel owns
+/// it" and "nobody owns it" stop sharing one value: a kernel row is HITTABLE furniture while
+/// remaining unreachable as an EL0 focus target or teardown victim.
+pub const KERNEL_OWNER_BASE: u64 = 0xFFFF_FF00;
+
+/// CLICK-X86: the panel console's row (`fbcon::panel_console_window_open`).
+pub const KERNEL_OWNER_CONSOLE: u64 = KERNEL_OWNER_BASE + 1;
+
+/// CLICK-X86: the desktop demo window's row (`wcx::activate`).
+pub const KERNEL_OWNER_DESKTOP: u64 = KERNEL_OWNER_BASE + 2;
+
+/// CLICK-X86 — is `asid` in the reserved kernel-owner band? `false` for `0`, which still means
+/// "nobody owns this row".
+pub fn is_kernel_owner(asid: u64) -> bool {
+    asid >= KERNEL_OWNER_BASE && asid <= KERNEL_OWNER_BASE + 0xFF
 }
 
 /// WC-A / F3 — close the compat window, if one exists. **WC-B must call this from the EL0 teardown
@@ -552,60 +725,81 @@ pub fn close_compat() -> bool {
 /// performs its ownership check, its checksum and its focused-present accounting, then calls this.
 ///
 /// Returns `false` if `id` names no live window.
+///
+/// ### VUGMIN-B — a hidden owner's present does not composite
+/// If every window the presenting owner holds is below `SHELL_Z`, the pass would read the surface,
+/// clip it, and write it nowhere the operator can see: [`composite`] draws only rows that satisfy
+/// [`above_shell`], and by hypothesis none of this owner's do. The VUGMIN-A audit measured this as the
+/// missing half of the mechanism — the EL0 idle loop stops *most* presents from being issued, and this
+/// makes the ones that still arrive (a vug hidden mid-frame, a program that does not poll the bit at
+/// all, the frame in flight when the operator TABbed away) cost a table scan instead of a full pass.
+///
+/// **The row is still marked `damaged` and `presented` exactly as before**, and that is what makes the
+/// suppression invisible on unhide: `focus_changed`'s raise arm re-marks the raised rows damaged and
+/// ends in its own unconditional `composite()` (the call after the `<F6>` wedge mark), so the first
+/// thing the panel gets back is a full repaint from the LATEST surface content, not from whatever the
+/// last composited frame happened to be. Nothing is deferred here; a pass is skipped, not owed.
 pub fn present(id: WinId) -> bool {
-    present_banded(id, None)
-}
-
-/// FBCON-DMG — present `id`, declaring only SOURCE rows `[sy0, sy1)` of its surface damaged.
-///
-/// The whole of the difference from [`present`] is the extent the compositor repaints: the pass, the
-/// occlusion closure, the staged-present discipline, the cursor bracket and every witness are the
-/// same code on the same path. A caller that knows which of its rows changed can therefore stop
-/// paying for the ones that did not, without a second present path existing to keep in step.
-///
-/// Rows are the SURFACE's, not the panel's — see [`Window::dmg_y0`]. `sy1 <= sy0` (or a band the
-/// surface does not contain) degrades to the whole box rather than to nothing.
-///
-/// Returns `false` if `id` names no live window.
-pub fn present_rows(id: WinId, sy0: usize, sy1: usize) -> bool {
-    present_banded(id, Some((sy0, sy1)))
-}
-
-/// The body both present verbs share. `band` is `None` for a whole-box present, which is
-/// byte-for-byte the pre-FBCON-DMG `present`.
-fn present_banded(id: WinId, band: Option<(usize, usize)>) -> bool {
     // WC-G — the surface as the OWNER declared it finished. Taken here and nowhere else: this is the
     // one moment the owner is provably not writing (it is parked inside `SYS_WIN_PRESENT`), so it is
     // the only honest baseline for the `app` leg. The identity is captured under the table lock and
     // the checksum taken after it drops — a 64 KiB read is not something to hold the window table
     // across, and the surface cannot be unmapped underneath it while the owner is in the syscall.
-    #[cfg(feature = "witness")]
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
     let mut probe: Option<(usize, usize)> = None;
+    // VUGMIN-B — is the presenting owner hidden? Read under the same guard that marks the row, so the
+    // answer and the mark are taken against one table state.
+    let skip;
     {
-        let mut t = TABLE.lock();
-        match row_mut(&mut t, id) {
+        let mut t = table();
+        let owner = match row_mut(&mut t, id) {
             Some(r) => {
-                match band {
-                    // A band the surface does not contain is not narrowed to the part that fits —
-                    // it means the caller and the row disagree about the geometry, and the only
-                    // answer that cannot leave a stale pixel is the whole box.
-                    Some((y0, y1)) if y1 > y0 && y1 <= r.h => r.damage_rows(y0, y1),
-                    _ => r.damage_all(),
-                }
+                r.damaged = true;
                 r.presented = true;
-                #[cfg(feature = "witness")]
+                #[cfg(all(target_arch = "aarch64", feature = "witness"))]
                 if !r.compat {
                     probe = Some((r.surf, r.surf_len));
                 }
+                // A compat row reports owner 0, which `owner_hidden` answers `false` for: the compat /
+                // console path is never suppressed.
+                if r.compat { 0 } else { r.owner_asid }
             }
-            None => return false,
-        }
+            None => {
+                // WC-N — a present that named no live row: the window closed under its owner. No slot
+                // to charge it to, so it lands on the aggregate line.
+                #[cfg(feature = "witness")]
+                WCN_STALE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
+        };
+        skip = owner_hidden(&t, owner, SHELL_Z.load(core::sync::atomic::Ordering::Acquire));
     }
-    #[cfg(feature = "witness")]
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
     if let Some((surf, surf_len)) = probe {
+        // WC-G's checksum is the OWNER's declaration of its own surface and is independent of whether
+        // those pixels reach the panel, so it is taken on the suppressed path too — dropping it would
+        // make the `app` leg disagree with itself the moment a window went behind the shell.
         super::wcg::on_present(id, surf, surf_len);
     }
+    // WC-N — the ATTEMPT is recorded here, before the suppression branch, because an attempt is what
+    // the owner did and it happened either way. `hidden` is the branch it took. Outside the table
+    // lock (dropped at the block above), per this file's standing rule.
+    #[cfg(feature = "witness")]
+    wcn_note_present(id, skip);
+    if skip {
+        #[cfg(feature = "witness")]
+        {
+            VUGMIN_SKIPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // The cadence tick runs on the suppressed path too: a fleet that has just been hidden is
+            // still presenting, and a rollup that went quiet the moment VUGMIN engaged would lose the
+            // exact interval whose `hid=` count is the point.
+            wcn_tick();
+        }
+        return true;
+    }
     composite();
+    #[cfg(feature = "witness")]
+    wcn_tick();
     true
 }
 
@@ -620,6 +814,13 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>) -> bool {
 /// Returns `false` if `id` names no live window, or if the framebuffer is not ready (nothing sane to
 /// clamp against).
 pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
+    // WEDGE-1r2 `<D1>`/`<d1>` — a barrier-raising path begins, BEFORE the `WRITER`/`TABLE`
+    // acquisitions that stand between here and `DrainBarrier::drain`. See the ledger block above
+    // `DrainBarrier`: this is the region WEDGE-1's in-spin tripwire cannot report on, because a core
+    // that dies waiting on `TABLE` here never reaches the spin the tripwire lives in. Chain-gated
+    // (`mark_composite`) so it costs nothing outside a focus change — the shape every recorded wedge
+    // has — and so its rate cannot bury the chain it is joining.
+    crate::wedge2::mark_composite("<D1>", "<d1>");
     let fb = *super::WRITER.lock();
     // Guard intentionally dropped before the table lock: `place`/`composite` never hold the table
     // lock while touching `WRITER`, so keeping WRITER-then-TABLE strictly non-overlapping here is
@@ -630,7 +831,7 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
     let info = fb.info();
 
     let vacated = {
-        let mut t = TABLE.lock();
+        let mut t = table();
         match row_mut(&mut t, id) {
             Some(r) => {
                 let before = outer_box(r);
@@ -646,7 +847,7 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
                 r.x = x.clamp(BORDER, max_x);
                 r.y = y.clamp(TITLE_H + BORDER, max_y);
                 r.pinned = true;
-                r.damage_all();
+                r.damaged = true;
                 if outer_box(r) == before { None } else { Some(before) }
             }
             None => return false,
@@ -696,8 +897,11 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
 /// Close `id`, freeing its table row. The surface itself belongs to the owner's address space and is
 /// not touched here — WC-B unmaps it. Returns `false` if `id` names no live window.
 pub fn close(id: WinId) -> bool {
+    // WEDGE-1r2 `<D1>`/`<d1>` — see `move_to`. `close` reaches its barrier through a `TABLE` critical
+    // section, so the token has to precede the lock to cover the death that happens ON it.
+    crate::wedge2::mark_composite("<D1>", "<d1>");
     let vacated = {
-        let mut t = TABLE.lock();
+        let mut t = table();
         match row_mut(&mut t, id) {
             Some(r) => {
                 let b = outer_box(r);
@@ -707,6 +911,10 @@ pub fn close(id: WinId) -> bool {
             None => return false,
         }
     };
+    // WC-N — the slot may be handed to a new window immediately; clear the activity clock so the next
+    // tenant's first present is not measured against this one's last.
+    #[cfg(feature = "witness")]
+    wcn_forget(id);
     // F4 — same barrier as `close_owner`: this row's surface may be under an in-flight blit.
     let barrier = DrainBarrier::drain();
     #[cfg(feature = "witness")]
@@ -731,22 +939,24 @@ pub fn close(id: WinId) -> bool {
 /// (`clear_handle_row`) calls this so a dead ASID can never leave a window compositing from a
 /// surface whose address space is gone.
 pub fn close_owner(owner_asid: u64) -> usize {
-    // CLICK-X86: the kernel's own furniture is not an EL0 teardown victim. Owner 0 was unreachable
-    // here only because no teardown seam ever passes 0; the reserved band is unreachable because this
-    // refuses it outright, which is the stronger of the two statements and the one the `fbcon`/`wcx`
-    // comments actually claimed. See [`KERNEL_OWNER_BASE`]. (The owner-0 case is deliberately left
-    // alone — no caller passes it, and narrowing this guard to the new band keeps every existing
-    // caller's behaviour bit-for-bit.)
-    if is_kernel_owner(owner_asid) {
-        return 0;
-    }
+    // WEDGE-1r2 `<D1>`/`<d1>` — see `move_to`, and note that THIS is the path that matters most: it
+    // is reached from `sched::exit` → `clear_handle_row`, which has already masked interrupts, so a
+    // core that blocks on the `TABLE` acquisition below is unpreemptible and silent — and is upstream
+    // of the only place WEDGE-1 instrumented. It is also the hottest of the three (one call per EL0
+    // task exit, most of them owning no window), which is why the chain gate is what makes the token
+    // affordable here at all.
+    crate::wedge2::mark_composite("<D1>", "<d1>");
     let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut n = 0;
     {
-        let mut t = TABLE.lock();
+        let mut t = table();
         for r in t.rows.iter_mut() {
             if r.used && r.owner_asid == owner_asid {
                 vacated[n] = outer_box(r);
+                // WC-N — same slot-recycle reset as `close`. Under the table lock here because the
+                // row's id is only readable before the clear; `wcn_forget` is one relaxed store.
+                #[cfg(feature = "witness")]
+                wcn_forget(r.id);
                 *r = Window::empty();
                 n += 1;
             }
@@ -770,6 +980,28 @@ pub fn close_owner(owner_asid: u64) -> usize {
     reclaim(&moved[..nv]);
     // Re-open the barrier before recompositing — a composite under a raised barrier is a no-op.
     drop(barrier);
+    // WEDGE-2 `<D4>` — THE ERASE/RECLAIM HALF IS BEHIND US AND THE BARRIER IS DOWN; the cursor
+    // bracket is next, and with it the `SPRITE` acquisition.
+    //
+    // Without this token a death on `SPRITE` here is MISREPORTED as a death on `TABLE`: the last
+    // thing on the wire would be `<D3>`, and `<D3>` is emitted from inside `DrainBarrier::drain`,
+    // which every teardown reaches — so the reader would place the wedge in the erase/reclaim run
+    // and never look at the cursor at all. `<D4>` splits that region in two, and the split is the
+    // whole point: `<D3>` with no `<D4>` is the reclaim, `<D4>` as the LAST token on the wire is
+    // `cursor::repaint` — i.e. `SPRITE`, which is the F4 site and a different lock from F1's.
+    //
+    // This path is the one that matters for that distinction. `close_owner` runs on EVERY EL0 task
+    // exit (`sched::exit` → `clear_handle_row`), which has already masked interrupts, so a core that
+    // blocks on `SPRITE` below is unpreemptible and silent — and the symptom is not a stalled
+    // teardown but a dead panel: the sprite lock gates the cursor bracket every compositor path
+    // takes, so the freeze is total (panel, cursor and input at once) with nothing on the wire.
+    //
+    // Unconditional `mark`, NOT `mark_composite`, and that is the same rule `<D2>`/`<D3>` follow
+    // rather than a departure from `<D1>`'s: it sits past the `n == 0` early return, so its
+    // population is teardowns that genuinely freed a row and genuinely raised a barrier — 31 in the
+    // reference wedge2 run, not the 96 that made `<D1>` unaffordable ungated. And a wedge that eats
+    // the panel is worth naming whether or not a TAB happens to be in flight.
+    crate::wedge2::mark("<D4>");
     // CURSOR-14 — close the erase bracket before the composite; see `move_to`.
     super::cursor::repaint();
     composite();
@@ -863,7 +1095,6 @@ fn erase(boxes: &[(usize, usize, usize, usize)]) {
         return;
     }
     let info = fb.info();
-    let row_bytes = info.stride * info.bytes_per_pixel;
     for &(x, y, w, h) in boxes {
         if w == 0 || h == 0 || x >= info.width || y >= info.height {
             continue;
@@ -880,7 +1111,8 @@ fn erase(boxes: &[(usize, usize, usize, usize)]) {
         let y0 = y.min(info.height);
         let y1 = (y + h).min(info.height);
         if y1 > y0 {
-            fb.flush_range(y0 * row_bytes, (y1 - y0) * row_bytes);
+            // COMPOSITE-2 — the fill's own columns, not full-width scanlines (see `draw_window`).
+            fb.flush_rect(x, y0, w, y1 - y0);
         }
     }
 }
@@ -888,13 +1120,13 @@ fn erase(boxes: &[(usize, usize, usize, usize)]) {
 /// The ASID owning `id`, or `None` if `id` names no live window. The ownership gate WC-B's verbs use:
 /// a task may only present/move/close a window whose owner matches its own ASID.
 pub fn owner_of(id: WinId) -> Option<u64> {
-    let t = TABLE.lock();
+    let t = table();
     row(&t, id).map(|r| r.owner_asid)
 }
 
 /// A snapshot of `id`'s table row, or `None` if it names no live window.
 pub fn info(id: WinId) -> Option<WindowInfo> {
-    let t = TABLE.lock();
+    let t = table();
     row(&t, id).map(|r| WindowInfo {
         id: r.id,
         owner_asid: r.owner_asid,
@@ -919,16 +1151,12 @@ pub fn info(id: WinId) -> Option<WindowInfo> {
 /// A snapshot, never a handle — the caller re-validates before acting on it. Used by the syscall layer's
 /// tab-cycle to pick the next `EL0_INPUT_ACTIVE`; nothing in this module reads input state.
 pub fn focus_ring(out: &mut [u64; MAX_WINDOWS]) -> usize {
-    let t = TABLE.lock();
+    let t = table();
     let mut n = 0usize;
     let mut ids = [(0u32, 0u64); MAX_WINDOWS];
     let mut m = 0usize;
     for r in t.rows.iter() {
-        // CLICK-X86: kernel-owned rows (the console, the desktop demo) are skipped for the same
-        // reason owner-0 rows are — they name no address space, so they are not a focus target the
-        // ring can hand the keyboard to. This is the half of the owner-0 contract the reserved band
-        // preserves exactly; what it drops is `hit_test`'s exclusion. See [`KERNEL_OWNER_BASE`].
-        if r.used && !r.compat && r.owner_asid != 0 && !is_kernel_owner(r.owner_asid) {
+        if r.used && !r.compat && r.owner_asid != 0 {
             ids[m] = (r.id, r.owner_asid);
             m += 1;
         }
@@ -982,7 +1210,7 @@ pub fn hit_test(x: i32, y: i32) -> Option<(WinId, u64, u32)> {
     }
     let (px, py) = (x as usize, y as usize);
     let shell = shell_z();
-    let t = TABLE.lock();
+    let t = table();
     let mut best: Option<(WinId, u64, u32)> = None;
     for r in t.rows.iter() {
         if !r.used || r.compat || r.owner_asid == 0 || !above_shell(r, shell) {
@@ -1025,6 +1253,17 @@ pub fn hit_test(x: i32, y: i32) -> Option<(WinId, u64, u32)> {
 ///   desktop colour immediately, and the desktop is asked for a whole-panel present so the console's
 ///   text comes back over the erase. That is the "TAB to the shell, then read your command's output"
 ///   case, and it is a z-order fact rather than a special case.
+/// * **VUGMIN-C — a raise publishes an ARRIVAL, not a census.** The arriving owner is unhidden (the wake
+///   edge that restarts a parked vug); every other owner's hidden bit is left alone. Only the shell arm
+///   speaks for the whole table. Before this, a raise re-published `hidden=false` for every owner above
+///   `SHELL_Z`, so focusing any one window un-minimized the entire stack and the whole fleet rendered
+///   forever (P73).
+/// * **CLICK-PLAIN — a focus change never STOPS anything (P75).** VUGMIN-C also hid the DEPARTING owner
+///   here, so that only the focused vug ran. On top of click-to-focus that made a click appear to stop a
+///   vug the operator had not clicked, one click after the fact ("stop works like absolute garbage there
+///   is no reason to it"). A raise is now purely additive: it starts the window it names and leaves
+///   every other window exactly as the operator last saw it. Idling the whole fleet is still one
+///   gesture — focus the SHELL — which is the arm that genuinely speaks for the whole table.
 /// * **Both ends repaint.** The raise marks the affected windows damaged and composites, so the change
 ///   is on the panel before this returns rather than at the focused app's next present — which, for a
 ///   window whose app is idle or blocked in a read, might be never.
@@ -1049,6 +1288,16 @@ pub fn focus_changed(asid: u64) {
     // Boxes of windows this call pushed BELOW the shell — the pixels the console is about to own.
     let mut hidden = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut nhidden = 0usize;
+    // FV-EXEMPT — of those boxes, how many belong to a row that [`above_shell`] says is STILL VISIBLE.
+    // That number ought to be zero by the definition of the set, and it is not: see the shell arm.
+    let mut exempt = 0usize;
+    // VUGMIN-B/C — (owner asid, is it now hidden) pairs, built under the table lock below and published
+    // to the syscall layer after the guard drops. The SHELL arm fills this from [`vugmin_scan`] (every
+    // owner, all hidden); since CLICK-PLAIN the RAISE arm fills in exactly ONE row — `marks[0]`, the
+    // arriving owner, unhidden. Assigned on both arms, so it carries no initial value to be mistaken
+    // for a verdict. See [`vugmin_scan`].
+    let mut marks = [(0u64, false); MAX_WINDOWS];
+    let nmarks: usize;
 
     // FOCUS-HL: take the focus owner BEFORE the table lock, so the composite at the end of this call
     // already draws the new highlight. The window that is LOSING focus must be repainted too — the raise
@@ -1058,11 +1307,11 @@ pub fn focus_changed(asid: u64) {
     let prev = FOCUS_ASID.swap(asid, Ordering::Release);
 
     {
-        let mut t = TABLE.lock();
+        let mut t = table();
         if prev != asid && prev != 0 {
             for r in t.rows.iter_mut() {
                 if r.used && !r.compat && r.owner_asid == prev {
-                    r.damage_all();
+                    r.damaged = true;
                 }
             }
         }
@@ -1075,11 +1324,38 @@ pub fn focus_changed(asid: u64) {
             newz = z;
             for r in t.rows.iter_mut() {
                 if r.used && r.z < z {
+                    // FV-EXEMPT — **`r.z < z` IS NOT THE HIDING PREDICATE, AND THIS SET IS THEREFORE
+                    // NOT WHAT `hidden=` HAS BEEN CALLING IT.** [`above_shell`] is what decides
+                    // whether a row stops compositing, and it EXEMPTS compat rows on purpose: a
+                    // compat row is the full-screen present path, it carries owner ASID 0, it is not
+                    // a focus target, and it could never be raised back over a shell that overtook
+                    // it — so hiding it would strand a full-screen app's output for the rest of the
+                    // boot. Its z still falls below the shell here, so it is collected, erased to
+                    // `DESKTOP_BG`, and then repainted by the `composite` at the end of this call,
+                    // having never been hidden at all.
+                    //
+                    // Reachable, and on the desktop path: a BACKGROUND full-screen app (`bg` — the
+                    // case BGRUN-1 exists for) is on the panel while the operator TABs to the shell.
+                    // The visible cost is a whole-box desktop fill and an immediate repaint of the
+                    // same pixels; the durable one is that `erase` may DEFER that fill under `STAGE`
+                    // contention (WC-L), in which case the drain paints `DESKTOP_BG` over the app a
+                    // pass AFTER the repaint has already put it back.
+                    //
+                    // COUNTED, NOT CHANGED. Narrowing the set to `!above_shell(r, z)` is a one-token
+                    // edit and it is deliberately not taken here: what a bg full-screen app's pixels
+                    // should do across a shell TAB is a panel question, the gate has no HID to TAB
+                    // with, and this seat may not settle it from a headless run. `exempt=` puts the
+                    // contradiction on the wire so the next bench sitting can read it instead of
+                    // inferring it, and it is derived from `above_shell` rather than from `r.compat`
+                    // so a future exemption added there is carried automatically.
+                    if above_shell(r, z) {
+                        exempt += 1;
+                    }
                     hidden[nhidden] = outer_box(r);
                     nhidden += 1;
                     // Damaged so that a later raise repaints from the source surface rather than
                     // trusting whatever survived on the panel.
-                    r.damage_all();
+                    r.damaged = true;
                 }
             }
         } else {
@@ -1090,7 +1366,7 @@ pub fn focus_changed(asid: u64) {
                 let z = t.next_z;
                 t.next_z = t.next_z.wrapping_add(1).max(1);
                 t.rows[i].z = z;
-                t.rows[i].damage_all();
+                t.rows[i].damaged = true;
                 if first_id == WIN_NONE {
                     first_id = t.rows[i].id;
                 }
@@ -1098,6 +1374,38 @@ pub fn focus_changed(asid: u64) {
                 raised += 1;
             }
         }
+        // VUGMIN-B/C — the z-order is now final for this focus change, so this is the one moment the
+        // hidden state has a settled answer. Snapshot only; the publication is outside the guard.
+        if asid == 0 {
+            // SHELL arm: the shell took the top of the stack, so EVERY owner is under it and the
+            // whole-table scan is the honest answer. Unchanged from VUGMIN-B.
+            nmarks = vugmin_scan(&t, SHELL_Z.load(Ordering::Acquire), &mut marks);
+        } else {
+            // RAISE arm (VUGMIN-C, as amended by CLICK-PLAIN): publish the ARRIVAL and nothing else.
+            // The arriving owner unhides — that is the wake edge VUGPAUSE-2r2 exists to deliver, and
+            // it must still fire. Every OTHER owner's bit is left exactly as it was: an owner the
+            // SHELL arm hid stays hidden until it is itself raised, and an owner that was running keeps
+            // running.
+            //
+            // VUGMIN-C also HID the departing owner here, so that exactly one vug — the focused one —
+            // ran at a time. P75 is the ruling against that: "stop works like absolute garbage there is
+            // no reason to it". Combined with the router's click-to-focus, moving focus stopped a vug
+            // the operator had not clicked, one click after they clicked somewhere else, and no visible
+            // gesture explained it. **A focus change now starts things and never stops them.** The
+            // fleet-idling semantic VUGMIN-A/B designed is untouched and still reachable, from the arm
+            // that was always the honest place for it: focusing the SHELL hides every owner at once
+            // (above), which is a whole-table statement the operator makes deliberately.
+            marks[0] = (asid, false);
+            nmarks = 1;
+        }
+    }
+
+    // VUGMIN-B/C — tell the syscall layer who is hidden now. `TABLE` is dropped: `set_hidden` takes no
+    // lock (atomics + one `u32` info-page store), so this is a convention rather than a necessity, but
+    // it is the file's convention. The shell arm hides every owner at once; a raise publishes at most
+    // two rows, the owner arriving and the owner leaving, and says nothing at all about the rest.
+    for &(asid, hid) in marks[..nmarks].iter() {
+        vugmin_publish(asid, hid);
     }
 
     // WEDGE-2 `<F5>` — the z-bump is done and the table guard is dropped; the immediate REPAINT half
@@ -1116,14 +1424,36 @@ pub fn focus_changed(asid: u64) {
     }
     #[cfg(feature = "witness")]
     if asid == 0 {
-        serial_println!("[wc-fv] focus shell z={} hidden={}", newz, nhidden);
+        // FV-EXEMPT — `exempt` is the part of `hidden` that was erased and immediately repainted
+        // rather than hidden (see the shell arm). `hidden=N exempt=0` is the line reading it always
+        // implied; any other reading is the contradiction, named.
+        serial_println!(
+            "[wc-fv] focus shell z={} hidden={} exempt={}",
+            newz, nhidden, exempt
+        );
     } else {
         serial_println!(
             "[wc-fv] focus raise asid={:#x} windows={} top_win={} z={} shell_z={}",
             asid, raised, first_id, newz, shell_z()
         );
     }
-    let _ = (raised, first_id, newz);
+    // VUGMIN-C — and WHAT THE HIDDEN BIT DID, on the same breath as the raise it belongs to. The whole
+    // defect this replaced was invisible on the wire from `wm`'s side: the only trace was N
+    // `[vugpause2] resume ... edge=unhide` lines appearing in the syscall layer for ASIDs nobody had
+    // focused. One line per focus change, at operator rate, that names the transition and asserts the
+    // scope: exactly one unhide, at most one hide, nothing else published.
+    // CLICK-PLAIN keeps the line and narrows what it can say: `hid=none` on EVERY raise, because a raise
+    // no longer hides anything. Printing the field rather than deleting it is deliberate — it is the
+    // standing assertion that this arm publishes exactly one bit, and a future arc that reintroduces a
+    // hide here has to change the line to do it.
+    #[cfg(feature = "witness")]
+    if asid != 0 {
+        serial_println!(
+            "[vugmin] focus asid={:#x} unhid={} hid=none others=untouched",
+            asid, nmarks
+        );
+    }
+    let _ = (raised, first_id, newz, exempt);
     // WEDGE-2 `<F6>` — the `[wc-fv]` line above is the LAST thing every recorded wedge printed, so
     // this token is the one that matters most: it is emitted after that line and before the composite
     // pass. `<F6>` present with nothing after it says the chain survived the print and died inside
@@ -1198,14 +1528,14 @@ pub fn repaint() {
     #[cfg(not(feature = "baremetal"))]
     let focused: u64 = 0;
     {
-        let mut t = TABLE.lock();
+        let mut t = table();
         let repaintable = |r: &Window| r.used && (!r.compat || focused == 0);
         if !t.rows.iter().any(|r| repaintable(r)) {
             return;
         }
         for r in t.rows.iter_mut() {
             if repaintable(r) {
-                r.damage_all();
+                r.damaged = true;
             }
         }
     }
@@ -1247,7 +1577,7 @@ pub fn repaint() {
 /// that moves or closes immediately afterwards is repainted by the mover/closer's own composite.
 pub fn occluders(out: &mut [(usize, usize, usize, usize); MAX_WINDOWS]) -> usize {
     let shell = shell_z();
-    let t = TABLE.lock();
+    let t = table();
     let mut n = 0usize;
     for r in t.rows.iter() {
         if !r.used || r.compat || !above_shell(r, shell) {
@@ -1290,7 +1620,7 @@ pub fn occluders(out: &mut [(usize, usize, usize, usize); MAX_WINDOWS]) -> usize
 /// idle path is one atomic read ahead of a lock acquisition that was already happening.
 pub fn service_damage() {
     if DEFER_N.load(core::sync::atomic::Ordering::Relaxed) == 0 {
-        let t = TABLE.lock();
+        let t = table();
         if !t.rows.iter().any(|r| r.used && r.damaged) {
             return;
         }
@@ -1319,14 +1649,14 @@ pub fn damage_intersecting(x: usize, y: usize, w: usize, h: usize) -> usize {
         return 0;
     }
     let rect = (x, y, w, h);
-    let mut t = TABLE.lock();
+    let mut t = table();
     let mut n = 0usize;
     for i in 0..MAX_WINDOWS {
         if !t.rows[i].used || t.rows[i].damaged {
             continue;
         }
         if boxes_overlap(rect, outer_box(&t.rows[i])) {
-            t.rows[i].damage_all();
+            t.rows[i].damaged = true;
             n += 1;
         }
     }
@@ -1335,7 +1665,7 @@ pub fn damage_intersecting(x: usize, y: usize, w: usize, h: usize) -> usize {
 
 /// Number of live windows.
 pub fn count() -> usize {
-    let t = TABLE.lock();
+    let t = table();
     t.rows.iter().filter(|r| r.used).count()
 }
 
@@ -1384,7 +1714,14 @@ pub fn count() -> usize {
 /// repair is a whole-sprite [`super::cursor::repaint`] here, outside the guard, on exactly the footing
 /// the `Repaint` tail has had since WC-I. See `cursor::PRESENT_DIRTY`.
 pub fn composite() {
+    // COMPOSITE-2 — the whole-pass clock. Starts before the inner pass (which self-reports its
+    // sprite/wait/loop terms) and stops after the tail, so `pass_us` bounds everything a present
+    // pays for its composite, including the tail's sprite work.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let c2_t0 = crate::arch::aarch64::now_cycles();
     let mut tail = composite_inner();
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let c2_t1 = crate::arch::aarch64::now_cycles();
     // CURSOR-7 — read BEFORE the tail runs, so a repaint the tail is already going to do is not
     // duplicated, and a pass that would otherwise have done nothing at all is upgraded.
     let dirty = super::cursor::take_present_dirty();
@@ -1404,8 +1741,29 @@ pub fn composite() {
                 super::cursor::repaint();
             }
         }
+        CursorTail::Settle => {
+            // CURSOR-15 — the sessionless compose-through tail: the arrow never left the glass, and
+            // the settle is per-pixel against the finished front. Like `Adopt`, a repair request is
+            // appended rather than substituted — the settle answers only the pass's own deferrals.
+            super::cursor::settle_nosession();
+            if dirty {
+                super::cursor::repaint();
+            }
+        }
         CursorTail::Repaint => super::cursor::repaint(),
         CursorTail::Untouched => super::cursor::ensure_drawn(),
+    }
+    // COMPOSITE-2 — close the ledger: the tail interval is sprite work, the whole interval is the
+    // pass. One `now_cycles` read serves both accounts.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let end = crate::arch::aarch64::now_cycles();
+        let pass = end.saturating_sub(c2_t0);
+        C2_SPRITE_CYC.fetch_add(end.saturating_sub(c2_t1), Relaxed);
+        C2_PASSES.fetch_add(1, Relaxed);
+        C2_PASS_CYC.fetch_add(pass, Relaxed);
+        C2_PASS_MAX_CYC.fetch_max(pass, Relaxed);
     }
 }
 
@@ -1416,16 +1774,23 @@ pub fn composite() {
 /// the panel is already correct and only the module's bookkeeping is outstanding. Every early exit
 /// from the pass owes `Repaint` once the bracket has been taken — `Adopt` is reachable only from the
 /// one path that actually composed the sprite into a back layer.
+/// `Settle` is CURSOR-15's: the pass DEFERRED sessionlessly (`cursor::defer_nosession`), so the
+/// arrow is still on glass and the tail owes each deferred pixel a verdict against the finished
+/// front — never a bracket.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CursorTail {
     Untouched,
     Repaint,
+    Settle,
     Adopt,
 }
 
 /// The composite pass proper. Private so the cursor bracket above cannot be bypassed — every caller
 /// (including this module's own teardown paths) goes through [`composite`].
 fn composite_inner() -> CursorTail {
+    // COMPOSITE-2 — the pre-pass (drain + cursor bracket) clock opens here.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let c2_pre0 = crate::arch::aarch64::now_cycles();
     // WC-I — THE CURSOR BRACKET, decided BEFORE anything is registered as an in-flight blit.
     //
     // Before WC-I `composite` undrew the sprite unconditionally on every call — and `composite` runs
@@ -1466,6 +1831,9 @@ fn composite_inner() -> CursorTail {
     // outer box meets the sprite — so it can only be too large, never too small, and a pixel outside
     // it is a pixel this pass provably cannot reach.
     let mut disturbed = false;
+    // CURSOR-15 — the pass composed through the sprite WITHOUT a session (`defer_nosession`): the
+    // arrow is on glass and the tail owes the deferred pixels a `Settle`, never a bracket.
+    let mut deferred = false;
 
     // WC-L — DRAIN THE DEFERRED ERASES.
     //
@@ -1521,7 +1889,7 @@ fn composite_inner() -> CursorTail {
         let mut npaint = 0usize;
         #[allow(unused_mut)]
         let mut hit = {
-            let t = TABLE.lock();
+            let t = table();
             for r in t.rows.iter() {
                 if r.used && above_shell(r, shell) && boxes_overlap(sbox, outer_box(r)) {
                     paint[npaint] = outer_box(r);
@@ -1611,59 +1979,75 @@ fn composite_inner() -> CursorTail {
                     super::cursor::note_bracketed_pass();
                 }
             } else {
-                // CURSOR-5 — THE LOCK CLASS STOPS COSTING THE WHOLE SPRITE.
+                // CURSOR-15 — THE SESSIONLESS PASS COMPOSES THROUGH TOO. This arm is the P82 hover
+                // stutter: another pass owns the overlay session — under a presenting vug fleet the
+                // steady state, several cores compositing against one session — and until this arc
+                // the loser took `undraw_within_nosession` (a masked handback) plus a `Repaint` tail
+                // (a whole-sprite `refresh_locked`). One erase-and-rebuild of the arrow per
+                // overlapping present, ~123/s on P82, against a pointer redrawn at event cadence:
+                // `[flick2] sess_undraws` climbing at present rate was those tail refreshes landing
+                // inside other passes' open sessions, and `down_slow` was the intervals they cost.
                 //
-                // Another pass owns the overlay session, so this one cannot split the sprite across
-                // staged presents. CURSOR-3 and CURSOR-4 answered that by taking the ENTIRE sprite
-                // off the panel for the length of the pass — which is the duty cycle WC-I and
-                // CURSOR-4 spent two arcs removing, reinstated in full every time two cores composite
-                // at once. Under VUGPAR (vugband pinned at 99% on three cores, the P64 reality) that
-                // is not the rare case, it is the steady state, and it is the surviving half of
-                // "spotty over the vug".
+                // The handback's justification — hand a pixel back before a painter in THIS pass
+                // overwrites it, or its save-under goes stale — is answered the same way CURSOR-11
+                // answered it for the session owner: at the tail, per pixel, against the finished
+                // front, where it is answerable exactly (`cursor::settle_nosession` re-saves each
+                // taken pixel from the freshly-composited content BEFORE painting the arrow back —
+                // the FLICKER-2/3 session-fresh discipline extended to compose-through). The arrow
+                // stays on glass; nothing is handed back, so CURSOR-5's stale-stamp interleave has
+                // no first move; and the one duty the old generation bump performed for a concurrent
+                // owner — retiring its coverage where our blit overwrites a pixel its layer composed
+                // — is carried by `cursor::overlay_uncover_any` from `draw_window`, per painted box,
+                // exactly as CURSOR-4 retires the identical intra-pass hazard.
                 //
-                // The undraw's reason has never been the session. A pixel must be handed back before
-                // a painter in THIS pass overwrites it, or the save-under goes stale — and `paint` is
-                // already the conservative union of exactly those extents. That argument is
-                // independent of who owns the overlay, so the mask applies here too: pixels this pass
-                // can reach come down, pixels it provably cannot stay on the panel. WC-L's shape,
-                // exactly — DEFER the sprite operation, never DROP the sprite.
-                //
-                // The tail is `Repaint`, not `Adopt`: no session means no coverage to install, and
-                // `refresh_locked` settles both classes correctly in one acquisition — `undraw_locked`
-                // skips the pixels the mask handed back (their `saved` is stale by construction) and
-                // restores the rest, then `draw_locked` re-establishes the whole sprite from the
-                // finished front, where every pixel now holds whichever painter's content is final.
-                // CURSOR-5 lens MUST-FIX 1 — the SESSIONLESS entry point, not `undraw_within`. A
-                // pixel handed back here has changed owner behind the session-holder's back, and
-                // only a generation bump tells it so; see `cursor::undraw_within_nosession` for the
-                // interleave that proves the distinction is not cosmetic.
-                super::cursor::undraw_within_nosession(&paint[..npaint]);
+                // The tail is `Settle`, not `Repaint`: no session means no coverage to install, and
+                // no bracket means nothing to refresh — only the deferred verdicts are owed.
+                super::cursor::defer_nosession(&paint[..npaint]);
+                deferred = true;
                 #[cfg(feature = "witness")]
                 {
                     CUR3_DECL_LOCK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     // CURSOR-12 — the session refusal on its own, separated from `compose_into`'s
                     // contended `try_lock` inside the guard. `CUR3_DECL_LOCK` counts both and cannot
-                    // answer "did the offer die before it was made, or after".
+                    // answer "did the offer die before it was made, or after". Still counted: the
+                    // refusal still happens; CURSOR-15 changed the RESPONSE, not the predicate.
                     CUR12_NOSESSION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    super::cursor::note_masked_nosession();
-                    // CURSOR-11 — also a pass whose arrow left the glass. This one COULD in principle
-                    // be deferred, but it must not be: without the session there is no coverage to
-                    // install, so nothing would ever settle the deferred pixels and their save-under
-                    // would go stale silently. CURSOR-5's generation bump is exactly the signal the
-                    // session owner needs, and it is only produced by an actual handback.
-                    super::cursor::note_bracketed_pass();
+                    // CURSOR-15 — no `note_masked_nosession` (no masked undraw is taken — that
+                    // counter now measures a mechanism this arm no longer runs, and must read 0) and
+                    // no `note_bracketed_pass` (the arrow does not leave the glass here any more;
+                    // `[cursor11] passes=` picks this pass up via `defer_nosession` instead).
                 }
             }
-            disturbed = true;
+            // CURSOR-15 — `disturbed` only on the arms that actually took pixels down (`reserved`,
+            // and the session arm keeps it for `tail_of`'s `Adopt`, per CURSOR-11's widened
+            // reading). The deferring sessionless arm sets `deferred` instead: a `disturbed` there
+            // would turn its tail into the `Repaint` bracket this arc exists to remove.
+            if session || reserved_hit {
+                disturbed = true;
+            }
         }
     }
     #[cfg(feature = "witness")]
     {
         WCI_CURSOR_PASSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if disturbed {
+        // CURSOR-15 — `deferred` counts here too: this counter has meant "the pass's tail owes the
+        // sprite its pixels" since CURSOR-11 widened `disturbed`, and a deferring pass owes exactly
+        // that. Keeping it out would make the WC-I ratio read as a bracket collapse it is not.
+        if disturbed || deferred {
             WCI_CURSOR_BRACKETS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
+    // COMPOSITE-2 — pre-pass closed, wait clock opens: everything from here to the top of the blit
+    // loop is serialisation (WRITER read, TABLE lock, damage close, ordering, guard registration).
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let c2_wait0 = {
+        let t = crate::arch::aarch64::now_cycles();
+        C2_SPRITE_CYC.fetch_add(
+            t.saturating_sub(c2_pre0),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        t
+    };
 
     // WEDGE-1 — the framebuffer handle is taken BEFORE the guard. **Hardening, not a fix for a
     // diagnosed defect: the P66 wedge's mechanism is UNKNOWN and this is not it.**
@@ -1671,7 +2055,7 @@ fn composite_inner() -> CursorTail {
     // The first cut of this change claimed the old ordering was the wedge, on the argument that
     // `WRITER` is ordered under `SPRITE` and so admitted the sprite lock into the drain barrier's
     // wait set. That argument is WRONG and is recorded here so it is not re-derived: every one of the
-    // 27 `WRITER.lock()` sites in the tree is a single-statement `Copy` read (`*WRITER.lock()`) whose
+    // 35 `WRITER.lock()` sites in the tree is a single-statement `Copy` read (`*WRITER.lock()`) whose
     // guard dies at the semicolon, so no holder ever blocks on a second lock; and `SPRITE` is the
     // OUTER lock of the pair, so the implication runs the other way round anyway.
     //
@@ -1696,15 +2080,18 @@ fn composite_inner() -> CursorTail {
     crate::wedge2::mark_composite("<F7>", "<f7>");
     let fb = *super::WRITER.lock();
     if !fb.is_ready() {
-        return tail_of(disturbed, session);
+        // WC-N — a pass that produced no pixels for any window. See `WCN_ABORTED`.
+        #[cfg(feature = "witness")]
+        wcn_note_pass(false);
+        return tail_of(disturbed, session, deferred);
     }
 
     // F4 — the drain barrier. Register this composite as in-flight WHILE STILL HOLDING the table
     // lock, so the registration is ordered against any teardown that takes the lock afterwards: a
     // `close_owner` that clears rows can then tell whether some other core snapshotted those rows
     // before the clear and is still blitting from their (about to be unmapped) surfaces.
-    let (rows, mut dirty, mut bands, _blit) = {
-        let mut t = TABLE.lock();
+    let (rows, mut dirty, _blit) = {
+        let mut t = table();
         // F4 — the barrier, observed in the SAME critical section as the registration below. A
         // teardown raises it after clearing its rows, so seeing it up means there is nothing of that
         // ASID's left to draw and the teardown will recomposite when it finishes: skipping is both
@@ -1713,50 +2100,46 @@ fn composite_inner() -> CursorTail {
         // panel, and the caller's tail is what puts it back. Every early exit from here on owes the
         // same answer.
         if DRAIN_PENDING.load(core::sync::atomic::Ordering::Acquire) != 0 {
-            return tail_of(disturbed, session);
+            // WC-N — aborted under the F4 barrier. The `wcn_note_pass` call is one relaxed increment
+            // and takes no lock, so it is safe inside this critical section; keeping it here rather
+            // than after the early return is what makes the abort count exact.
+            #[cfg(feature = "witness")]
+            wcn_note_pass(false);
+            return tail_of(disturbed, session, deferred);
         }
         let mut dirty = [false; MAX_WINDOWS];
-        // FBCON-DMG — the band travels with the dirty flag and is cleared with it, in the same
-        // critical section, so a `present_rows` that lands after this snapshot re-damages the row
-        // rather than having its rows absorbed by a pass that is no longer going to draw them.
-        let mut bands = [None; MAX_WINDOWS];
         for (i, r) in t.rows.iter_mut().enumerate() {
             dirty[i] = r.used && r.damaged;
-            if dirty[i] && r.dmg_y1 > r.dmg_y0 {
-                bands[i] = Some((r.dmg_y0, r.dmg_y1));
-            }
             r.damaged = false;
-            r.dmg_y0 = 0;
-            r.dmg_y1 = 0;
         }
-        (t.rows, dirty, bands, BlitGuard::enter())
+        let guard = BlitGuard::enter();
+        // FLUID-3 — sample the in-flight depth AT registration (self included), under the same
+        // table lock the guard is ordered by. Two relaxed RMWs; see the ledger above `fluid3_emit`.
+        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        {
+            let d = BLIT_ACTIVE.load(core::sync::atomic::Ordering::Relaxed);
+            FL3_DEPTH_MAX.fetch_max(d, core::sync::atomic::Ordering::Relaxed);
+            if d > 1 {
+                FL3_OVERLAP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        (t.rows, dirty, guard)
     };
 
     // Close the damage set upwards over occlusion, to a fixed point (at most MAX_WINDOWS passes).
-    //
-    // FBCON-DMG — the closure now reads the DAMAGED region of `i` (its band-clipped box) rather than
-    // its whole box, and the windows it drags in are promoted to a WHOLE-BOX repaint. Both halves are
-    // the conservative direction: a narrower `bi` can only reach fewer windows, and every window it
-    // does reach repaints at least the rows `i` is about to overwrite. A `j` that was itself banded is
-    // widened here too, which is why `bands[j].is_some()` re-enters the fixed point — without it a
-    // banded window could stay banded while a lower window repainted rows outside that band.
     for _ in 0..MAX_WINDOWS {
         let mut grew = false;
         for i in 0..MAX_WINDOWS {
             if !dirty[i] {
                 continue;
             }
-            let bi = damaged_box(&rows[i], bands[i]);
+            let bi = outer_box(&rows[i]);
             for j in 0..MAX_WINDOWS {
-                if !rows[j].used || rows[j].z <= rows[i].z {
-                    continue;
-                }
-                if dirty[j] && bands[j].is_none() {
+                if dirty[j] || !rows[j].used || rows[j].z <= rows[i].z {
                     continue;
                 }
                 if boxes_overlap(bi, outer_box(&rows[j])) {
                     dirty[j] = true;
-                    bands[j] = None;
                     grew = true;
                 }
             }
@@ -1787,6 +2170,16 @@ fn composite_inner() -> CursorTail {
     // window (`WRITER`/`TABLE`/`BlitGuard`), while `<F8>` with no `<F9>` means it is in the blit loop
     // proper — `draw_window`, the WC-G/WC-D witnesses, or the sprite overlay they drive.
     crate::wedge2::mark_composite("<F8>", "<f8>");
+    // COMPOSITE-2 — wait closed, loop clock opens.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let c2_loop0 = {
+        let t = crate::arch::aarch64::now_cycles();
+        C2_WAIT_CYC.fetch_add(
+            t.saturating_sub(c2_wait0),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        t
+    };
     let mut drawn = 0usize;
     // CURSOR-3 — did any window in this pass carry the sprite through its staged present? Back-to-
     // front order means the LAST window to take the overlay is the topmost one that fully contains
@@ -1803,13 +2196,17 @@ fn composite_inner() -> CursorTail {
         // flag from while it was hidden. Outermost of the per-window guards: WC-G's sampler below
         // must never bracket a window this skip declines to draw.
         if !above_shell(&rows[i], shell) {
+            // WC-N — this row was damaged and this pass declined to repaint it. The compositor's end
+            // of the same fact `present`'s `hid` counts from the owner's end.
+            #[cfg(feature = "witness")]
+            wcn_note_below(rows[i].id);
             continue;
         }
         // WC-G — bracket the blit. `begin` must be the last thing before `draw_window` and `end` the
         // first thing after it: the `blit`/`after` checksums mean "the surface as the copy found it"
         // and "as the copy left it", and anything inserted between them widens the interval they
         // measure into something other than the copy. Budgeted per window id; `None` once spent.
-        #[cfg(feature = "witness")]
+        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
         let wcg_probe = super::wcg::begin(rows[i].id, rows[i].surf, rows[i].surf_len, rows[i].compat);
         // CURSOR-3 — WHICH WINDOWS MAY CARRY THE SPRITE. WC-I's invariant "no verified pixel is ever
         // read with the sprite on the panel" is preserved here rather than weakened: this pass may
@@ -1827,7 +2224,7 @@ fn composite_inner() -> CursorTail {
         // repaint them. Excluding the window from the plan entirely is what would break the split.
         #[allow(unused_mut)]
         let mut may_overlay = true;
-        #[cfg(feature = "witness")]
+        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
         if wcg_probe.is_some() {
             may_overlay = false;
             // CURSOR-12 — attributed, and only when there was an offer to lose. A pass with no plan
@@ -1864,13 +2261,11 @@ fn composite_inner() -> CursorTail {
             // CURSOR-7 — `disturbed`, not `plan.is_some()`: the question the present-overlap test has
             // to answer is "does this pass's TAIL owe the sprite a repaint", and both `Adopt` and
             // `Repaint` do. It is final by here (nothing below the bracket block writes it).
-            disturbed,
-            // FBCON-DMG — the band this window's damage was declared over. `None` for every window
-            // dragged in by the occlusion closure and for every whole-box present, which is every
-            // caller that predates this arc.
-            bands[i],
+            // CURSOR-15 — `deferred` answers the same question yes: the `Settle` tail owes every
+            // deferred pixel its verdict, so a deferring pass must not arm `PRESENT_DIRTY` either.
+            disturbed || deferred,
         );
-        #[cfg(feature = "witness")]
+        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
         if let Some(p) = wcg_probe {
             let r = &rows[i];
             super::wcg::end(p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale);
@@ -1878,7 +2273,7 @@ fn composite_inner() -> CursorTail {
         // WC-H — print the back-layer sample the blit above recorded, if any. Deliberately AFTER
         // `wcg::end`: this emits to the serial UART, and inside the bracket it would be charged to
         // `[wc-g] us=`. See `wcg::stage_flush`.
-        #[cfg(feature = "witness")]
+        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
         super::wcg::stage_flush(rows[i].id);
         // WC-D — verify this window's blit against the scan-out, once per window id, from inside the pass
         // that drew it (the only place both the source surface and the destination rows are known).
@@ -1892,8 +2287,23 @@ fn composite_inner() -> CursorTail {
                 }
             }
         }
+        // WC-N — pixels on glass for this window id. The only writer of `comp`.
+        #[cfg(feature = "witness")]
+        wcn_note_drawn(rows[i].id);
         drawn += 1;
     }
+    // COMPOSITE-2 — loop closed. The witness one-shots inside it (WC-G/WC-D/WC-C) are charged here
+    // when they fire; they are budgeted per window id, so the steady state they perturb is a handful
+    // of early passes and never the rollup average this line is read for.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    C2_LOOP_CYC.fetch_add(
+        crate::arch::aarch64::now_cycles().saturating_sub(c2_loop0),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    // WC-N — the pass reached the blit loop (`drawn == 0` is still a pass: it means every damaged row
+    // was below the shell, which is a fact about the shell and not about the pass).
+    #[cfg(feature = "witness")]
+    wcn_note_pass(true);
 
     #[cfg(feature = "witness")]
     if drawn > 0 && !COMPOSITE_WITNESSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
@@ -1950,7 +2360,7 @@ fn composite_inner() -> CursorTail {
     }
     let _ = drawn;
     let _ = overlaid;
-    tail_of(disturbed, session)
+    tail_of(disturbed, session, deferred)
 }
 
 /// CURSOR-3 — what the pass owes the sprite, from the two facts the pass records.
@@ -1973,12 +2383,20 @@ fn composite_inner() -> CursorTail {
 /// `note_present_over_sprite` "does this pass's tail owe the sprite a repaint", which a deferring
 /// pass answers yes to as firmly as a bracketing one. A pass that deferred must therefore NOT arm
 /// `PRESENT_DIRTY`, and with `disturbed == true` it does not.
-fn tail_of(disturbed: bool, session: bool) -> CursorTail {
+///
+/// **CURSOR-15 — `deferred` is the sessionless deferral, and `disturbed` outranks it.** A pass that
+/// BOTH deferred and disturbed (the drain took a masked handback in the same pass that later
+/// deferred) has `off` pixels only a whole-sprite refresh can put back; `Repaint`'s
+/// `refresh_locked` resets `pend` as it goes, so the deferral is settled by the bracket rather than
+/// dropped. `Settle` is taken only when the deferral is the pass's sole debt.
+fn tail_of(disturbed: bool, session: bool, deferred: bool) -> CursorTail {
     debug_assert!(!session || disturbed);
     if session && disturbed {
         CursorTail::Adopt
     } else if disturbed {
         CursorTail::Repaint
+    } else if deferred {
+        CursorTail::Settle
     } else {
         CursorTail::Untouched
     }
@@ -2027,17 +2445,16 @@ fn tail_of(disturbed: bool, session: bool) -> CursorTail {
 /// A guarded-out window still EMITS — a `-> SKIP` line naming the reason — so the one-shot latch is never
 /// burned silently. A gate whose REQUIRE fails then has a line saying why, instead of nothing at all.
 ///
-/// ### WCD-LIVE — the reference must hold still
+/// ### WCD-LIVE — the reference must hold still (lift of x86 76c724d6)
 /// Both passes derive the expected pixel from the SOURCE surface, which makes that surface the instrument's
 /// reference — and that surface is EL0-writable. A single-threaded app is quiescent inside `present`, so the
-/// reference is a constant and the comparison is sound. A multi-threaded one is not: once VUG.ELF ran two
-/// workers, sibling threads kept painting while verify read, and the witness compared scan-out against
-/// source bytes that were never blitted. The tell is `bad_cache != bad_ram` — the two passes disagreeing
-/// with each OTHER, which no blit defect can produce, since the blit is over before either pass starts —
-/// with counts that reshuffled every run (312/556, 500/568, 228/424 across three). The exposure is not
-/// closed by the app's own frame barrier either: verify runs from ANY pass that repaints these rows (a
-/// neighbour's present growing the dirty set, a desktop flush, a cursor repaint), and the one-shot latch is
-/// claimed by whichever reaches it first — by itself enough to explain the run-to-run instability.
+/// reference is a constant and the comparison is sound. A multi-threaded one is not: sibling threads keep
+/// painting while verify reads, and the witness compares scan-out against source bytes that were never
+/// blitted. The tell is `bad_cache != bad_ram` — the two passes disagreeing with each OTHER, which no blit
+/// defect can produce, since the blit is over before either pass starts — with counts that reshuffle every
+/// run. The exposure is not closed by the app's own frame barrier either: verify runs from ANY pass that
+/// repaints these rows (a neighbour's present growing the dirty set, a desktop flush, a cursor repaint),
+/// and the one-shot latch is claimed by whichever reaches it first.
 ///
 /// Two corrections, doing two different jobs:
 /// 1. **One source read.** The verdict used to take three independent reads of a mutable surface (pass 1,
@@ -2050,15 +2467,17 @@ fn tail_of(disturbed: bool, session: bool) -> CursorTail {
 ///    surface checksum is therefore read before the snapshot and again after the passes; unequal means EL0
 ///    repainted during the verdict, and the verdict is emitted as a third, distinct label:
 ///    `-> LIVE (unverifiable)`. That is reported instead of PASS *and* instead of FAIL, because a moving
-///    reference earns neither — a FAIL would accuse the compositor of a mismatch the instrument
-///    manufactured, and a PASS would be luck. It is never counted red: a live surface is a fact about the
-///    app, not a defect in the compositor. The counts stay printed so the disagreement stays inspectable.
+///    reference earns neither. It is never counted red: a live surface is a fact about the app, not a
+///    defect in the compositor. The counts stay printed so the disagreement stays inspectable.
+///
+/// LIVE counts as neither PASS nor FAIL; a REQUIRE asserting the LIVE line for a threaded app would be a
+/// deliberate spec change neither seat has made.
+///
+/// The owner's-own-present gate was deliberately NOT taken: owner presents are not quiescent either with
+/// free-running workers, and re-gating the one-shot VERIFIED latch would move clean verdicts.
 ///
 /// A quiescent surface brackets equal and snapshots to exactly the bytes it would have re-read, so
 /// single-threaded verdicts are byte-identical to before.
-///
-/// Cross-seat: the same defect was independently audited on aarch64 (Pi seat, `wm.rs` verify_window), which
-/// is where the three-reads-of-a-moving-target framing and the any-repainting-pass exposure came from.
 #[cfg(feature = "witness")]
 fn verify_window(fb: &super::FrameBuffer, r: &Window) {
     let info = fb.info();
@@ -2086,8 +2505,8 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
     // the print), so `bad_cache` and `bad_ram` could differ purely because they had read different bytes —
     // no cache story required. The two-pass design is a claim about the DESTINATION's cache state; nothing
     // in it wants the SOURCE re-read. One `want`-stream restores that: any surviving `bad_cache != bad_ram`
-    // is now a real statement about scan-out memory. `cols * rows * 4` bytes — 64 KiB at the 128x128 fixture,
-    // against a 48 MiB heap, paid once per window id under `witness`.
+    // is now a real statement about scan-out memory. `cols * rows * 4` bytes — 64 KiB at the 128x128
+    // fixture — paid once per window id under `witness`.
     let mut want_buf: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     if want_buf.try_reserve_exact(rows * cols).is_err() {
         serial_println!(
@@ -2206,9 +2625,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
     // `disturbed`, and the safe direction is to assume nothing owes the sprite a repaint: a live arrow
     // under these rows then arms the tail repair. The cost of being wrong is one spurious whole-sprite
     // repaint on the one-shot verify pass per window; the cost of the other guess is an erased arrow.
-    // FBCON-DMG: `None` — the WHOLE box. This is a REPAIR of whatever the invalidate above dropped,
-    // not a present of what a caller declared changed, so it has no band and must not borrow one.
-    draw_window(fb, r, focus != 0 && focus == r.owner_asid, None, false, false, None);
+    draw_window(fb, r, focus != 0 && focus == r.owner_asid, None, false, false);
 }
 
 /// WC-D — window ids whose [`verify_window`] verdict has already been emitted (bit `id`), so the read-back
@@ -2284,6 +2701,148 @@ const DRAIN_STALL_SPINS: u64 = 1 << 27;
 static DRAIN_STALL_REPORTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+// ---- WEDGE-1r2 — the drain barrier's silence, made readable --------------------------------------
+//
+// **What this arc found, and it is a finding about an INSTRUMENT rather than about a mechanism.**
+// `docs/dev/OS/08_VIDEO/engine.md` §WEDGE-2 opens by treating one inference as settled: *"The drain
+// barrier is exonerated. WEDGE-1's `[wedge1] DRAIN STALLED` tripwire fires from inside the
+// drain-barrier spin, and it stayed silent all three times."* That inference reads a silence as a
+// refutation, and it is only sound if the tripwire could have SPOKEN in the states it is being
+// cleared of. It could not, in two of them:
+//
+//  1. **It speaks through `serial_println!`, which takes a blocking lock.** The tripwire's own note
+//     admits this ("if the wedge is IN the serial path the tripwire blocks") and then argues it is
+//     "strictly no worse" than spinning — which is true about the MACHINE and false about the
+//     EVIDENCE. s44's capture stopped mid-word, i.e. a core died holding the UART; on that shape the
+//     tripwire's silence is structurally guaranteed and carries no information at all.
+//  2. **It exists only INSIDE the spin.** Every teardown reaches the barrier through its own
+//     `TABLE` critical section — `close`/`close_owner` clear their rows under the lock, `move_to`
+//     rewrites its geometry under it — and a core that dies waiting on `TABLE` there never reaches
+//     `drain()`. The teardown path can therefore BE the wedge site with the tripwire silent by
+//     construction, because the instrument is one lock downstream of the death.
+//
+// Neither is fixed by moving the threshold. What both need is a voice that acquires nothing, and
+// the tree already has one: WEDGE-2's `wedge2_raw_byte` — a lock-free bounded poll of the UART
+// TX-ready flag and one volatile store, taking no `SERIAL_PORT`, no `FBCON`, no `WRITER`, no
+// `TABLE`, no `SPRITE` and no allocator. So the teardown path gets tokens on the same terms the
+// focus chain has had since WEDGE-2:
+//
+//   `<D1>`/`<d1>` — a teardown began, BEFORE the `TABLE`/`WRITER` critical section that precedes the
+//                   barrier (`close`, `close_owner`, `move_to`). Uppercase on the core that owns the
+//                   open focus chain, lowercase on any other.
+//   `<D2>`        — that section is behind us; the barrier is going up and this core is about to spin.
+//   `<D3>`        — the spin returned. The barrier is held and the erase/reclaim half is next.
+//   `<D4>`        — the erase/reclaim half is behind us and the barrier is down; the cursor bracket
+//                   (`cursor::repaint`, and with it `SPRITE`) is next. `close_owner` only.
+//   `<D!>`        — the stall tripwire FIRED, emitted before its `serial_println!` so a blocked print
+//                   no longer erases the fact that the threshold was crossed.
+//
+// Read exactly as WEDGE-2's are read — by what is MISSING after the last one on a torn wire:
+// `<D1>` with no `<D2>` puts the death upstream of the barrier, in the teardown's own critical
+// section (blindness 2); `<D2>` with no `<D3>` puts it in the spin; `<D3>` with no `<D4>` puts it in
+// the erase/reclaim run; `<D4>` as the LAST token puts it in the cursor bracket, i.e. on `SPRITE`;
+// `<D!>` with no `[wedge1] DRAIN STALLED` line after it is blindness 1 caught in the act — the
+// tripwire fired and the serial lock ate it. A `<D1>` that is NOT the last thing on the wire is an
+// ordinary teardown that took an early return (no such row, an unmoved `move_to`); a `<D1>` that IS
+// the last thing is the finding.
+//
+// **`<D4>` EXISTS BECAUSE THE F4 DEATH WAS OTHERWISE MISATTRIBUTED TO F1.** Before it, the last
+// token on a `close_owner` that died in `cursor::repaint` was `<D3>` — emitted from inside
+// `DrainBarrier::drain`, which every teardown reaches — so a `SPRITE` wedge and a reclaim wedge were
+// the same wire trace, and the audited F1 site (`TABLE`, now closed by WEDGE-7's `fn table()`) was
+// the natural place to pin it. `SPRITE` is reached on EVERY EL0 exit through this path, and a core
+// that blocks on it here is IRQ-masked by `sched::exit`, so the outcome is a silent total freeze of
+// panel, cursor and input. The token does not fix that; it makes the capture say which lock it was.
+//
+// **`<D1>` speaks only while a focus chain is open, and that budget is a measured constraint rather
+// than a preference.** The first cut emitted it unconditionally at each teardown entry, and the
+// wedge2 regression run priced it: 96 tokens against the whole focus chain's 17, because
+// `close_owner` runs on EVERY EL0 task exit (`sched::exit` → `clear_handle_row`) and 65 of those 96
+// found no window and never raised a barrier at all. One of them interleaved into another core's
+// line mid-word (`:<D1: B>GRUN-ST: slot reclaim PASS`) and took a required witness off the wire —
+// the accepted cost of a lock-free token, spent on teardowns with nothing to say. So `<D1>` takes
+// `mark_composite`'s existing discipline, for the reason `mark_composite` states: the steady-state
+// rate would otherwise bury the chain in tokens. It is also the right AIM — all four recorded
+// lockups (P66/P67v2/P68/s44) happened during TAB cycling with a focus change in flight, which is
+// exactly `CHAIN_CORE != 0` — and the case split it comes with is itself evidence: `<D1>` says the
+// teardown is on the core running the focus change, `<d1>` says a vug exited on some OTHER core
+// while that chain was open, which is the P66 scene in one byte.
+//
+// `<D2>`/`<D3>`/`<D!>` stay unconditional: they fire only when a barrier is genuinely raised (31 in
+// that same run), a wedge in the drain is worth naming whether or not a TAB is in flight, and the
+// tripwire least of all may be gated on somebody else's state.
+//
+// **WHAT THE HEADLESS GATE CAN AND CANNOT WITNESS — stated here, because this whole block exists
+// because a silence got banked as a refutation.** `UNAOS_WEDGE2=1 kernel8-test` emits `<D2>`/`<D3>`
+// in pairs and NO `<D1>`/`<d1>` at all, and that zero is a SCENE fact rather than a wiring one: the
+// chain is open only for the body of `focus_changed`, and nothing in the fixture battery tears a
+// window down from inside that window (`clickplain_leg` closes before its `focus_changed(0)`;
+// `closebox_leg`'s router close runs after `focus_changed` has already called `chain_exit`). The
+// scene the token is aimed at — one core in a TAB while a vug exits on another — is the bench's,
+// which is precisely P66's. So `<D1>` absent on QEMU proves nothing either way and MUST NOT be read
+// as the mechanism being quiet; the pairing of `<D2>`/`<D3>` is what the gate does prove.
+//
+// One `<D2>` in that run reads as `<activD2>` on the wire — another core's line interleaved with the
+// token's own bytes. That is WEDGE-2's stated and accepted cost for taking no lock, unchanged here.
+//
+// Knob-gated with the rest of WEDGE-2 (`UNAOS_WEDGE2=1`): with the feature off `mark` is an empty
+// inline function and no token exists in the image, so no shipped media pay for this.
+
+/// WEDGE-1r2 — how often [`DrainBarrier::drain`] ran, and how long it actually SPUN.
+///
+/// ### Why the tripwire alone cannot answer this
+/// [`DRAIN_STALL_SPINS`] sits past ~10^8 spin hints on purpose, and its own note says why: a
+/// threshold a merely slow drain could reach would put a serial write on a hot IRQ-masked path. The
+/// consequence was left standing — the wire has exactly two readings, "nothing" and "wedged", with
+/// the whole interesting range between them unmeasured. A teardown that spins for milliseconds is
+/// not a wedge, but it IS a core held with interrupts masked (`sched::exit` masks before it reaches
+/// `clear_handle_row`), and today it is indistinguishable from a drain that returned at once.
+///
+/// A counter costs no print, so it can measure the range the tripwire deliberately declined to.
+///
+/// ### Why the high-water mark is published FROM INSIDE the loop
+/// A ledger written after the spin can only report drains that FINISHED — so the one drain that
+/// matters most, the one still going, contributes nothing and the rollup reads clean. That is
+/// WEDGE-4's W4-A defect exactly, and it is inadmissible here for the same reason: an instrument's
+/// silence is evidence only if the instrument can execute in the state it reports on. [`F4W_SPIN_MAX`]
+/// is therefore updated from within the spin, so a core that never leaves the loop has still
+/// published how far it got, and [`F4W_IN_SPIN`] stays raised for as long as that core is in there —
+/// which is what lets some OTHER core's rollup report a drain that is not coming back.
+///
+/// The stride is what keeps it off the hot path: one masked compare per iteration, one relaxed RMW
+/// per [`DRAIN_DWELL_STEP`]. The A72 LL/SC starvation SPIN-3 padded for is a function of how many
+/// cores hammer a line, and these have one writer per concurrently-draining teardown.
+#[cfg(feature = "witness")]
+static F4W_DRAINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WEDGE-1r2 — drains that found `BLIT_ACTIVE` non-zero and actually entered the spin. The
+/// denominator `spin_max` is meaningful against: `drains` with `spun=0` is a barrier that never had
+/// to wait for anybody, which is the healthy desktop's normal answer.
+#[cfg(feature = "witness")]
+static F4W_SPUN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WEDGE-1r2 — the longest spin any drain reached in this rollup window, published from inside the
+/// loop. See [`F4W_DRAINS`] for why that placement is a correctness property of the instrument.
+#[cfg(feature = "witness")]
+static F4W_SPIN_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WEDGE-1r2 — drains currently inside the spin. A GAUGE, not an accumulator: it is read rather than
+/// drained, and a non-zero reading taken by a core that is still running is the closest thing this
+/// module has to "somebody else is stuck right now".
+#[cfg(feature = "witness")]
+static F4W_IN_SPIN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// WEDGE-1r2 — how often the spin publishes its progress. A power of two so the test is a mask.
+#[cfg(feature = "witness")]
+const DRAIN_DWELL_STEP: u64 = 1 << 12;
+
+/// WEDGE-1r2 — spins past which a drain is worth calling a DWELL rather than a wait. Four orders of
+/// magnitude under [`DRAIN_STALL_SPINS`], and far past the handful of panel-clipped `memcpy`s the
+/// barrier is bounded against, so it names an interval no healthy teardown produces without
+/// competing with the tripwire for the wedge itself.
+#[cfg(feature = "witness")]
+const DRAIN_DWELL_NOTE: u64 = 1 << 16;
+
 /// F4 — a teardown's phase barrier, RAII so the barrier always re-opens. Raised by
 /// [`close`]/[`close_owner`] and dropped once the drain has completed.
 struct DrainBarrier;
@@ -2304,6 +2863,15 @@ impl DrainBarrier {
     /// is fixed at entry, finite, and every member is running a bounded panel-clipped blit.
     fn drain() -> Self {
         use core::sync::atomic::Ordering;
+        // WEDGE-1r2 `<D2>` — the caller's `TABLE` critical section is behind us, the barrier is going
+        // up, and this core is about to spin IRQ-masked. Raw and lock-free, for the reason the block
+        // above the ledger states: the `serial_println!` tripwire further down cannot speak while the
+        // serial lock is what the wedge is holding, so the token that says "we got this far" must not
+        // depend on it either. A `<D1>` never followed by this one puts the death upstream, in the
+        // caller's own critical section — the region WEDGE-1's tripwire is blind to by construction.
+        crate::wedge2::mark("<D2>");
+        #[cfg(feature = "witness")]
+        F4W_DRAINS.fetch_add(1, Ordering::Relaxed);
         DRAIN_PENDING.fetch_add(1, Ordering::AcqRel);
         // Ordered against the composite registration by the table lock: a composite either took the
         // lock BEFORE the clearing critical section (so it registered, and is counted here) or AFTER
@@ -2338,11 +2906,51 @@ impl DrainBarrier {
         // lock. If the wedge is IN the serial path the tripwire blocks — but the alternative on that
         // path was spinning here forever anyway, so it is strictly no worse, and on every other
         // shape of wedge it converts a silent hang into a named one.
+        //
+        // WEDGE-1r2 CORRECTS THE SECOND HALF OF THAT SENTENCE. "Strictly no worse" is a claim about
+        // the MACHINE, and it is true. It was then used as a claim about the EVIDENCE, and there it is
+        // false: engine.md §WEDGE-2 banked this tripwire's silence across P66/P67v2/P68 as *"the drain
+        // barrier is exonerated"*, while on the one wedge shape the wire actually points at — s44's
+        // capture stopped mid-word, i.e. a core died holding the UART — the silence was structurally
+        // guaranteed and said nothing whatever. A blocked print does not merely fail to report the
+        // stall; it erases the fact that the threshold was crossed, which is the difference between an
+        // instrument that is quiet and an instrument that cannot speak. The `<D!>` token below takes
+        // no lock and is emitted BEFORE the print, so from here on this tripwire's silence means the
+        // threshold was not reached rather than the report was eaten.
         let mut spins: u64 = 0;
+        // WEDGE-1r2 — has this drain been charged to `spun`/`in_spin` yet? Set on the FIRST iteration
+        // rather than before the loop, so a barrier that found `BLIT_ACTIVE == 0` and never waited is
+        // not counted as a wait. `drains` above already counts those.
+        #[cfg(feature = "witness")]
+        let mut entered = false;
         while BLIT_ACTIVE.load(Ordering::Acquire) != 0 {
+            #[cfg(feature = "witness")]
+            if !entered {
+                entered = true;
+                F4W_SPUN.fetch_add(1, Ordering::Relaxed);
+                // Raised HERE and lowered only after the loop, so a core that never comes out leaves
+                // it raised — that standing count is the whole point (see `F4W_IN_SPIN`).
+                F4W_IN_SPIN.fetch_add(1, Ordering::Relaxed);
+            }
             core::hint::spin_loop();
             spins = spins.wrapping_add(1);
+            // WEDGE-1r2 — publish progress FROM INSIDE the loop. A high-water mark written after the
+            // spin describes only drains that finished, so the one that never does would contribute
+            // nothing and the rollup would read clean over a held core — W4-A's defect, refused here.
+            // The stride keeps the RMW off the hot path; the masked compare is what runs per spin.
+            #[cfg(feature = "witness")]
+            if spins % DRAIN_DWELL_STEP == 0 {
+                F4W_SPIN_MAX.fetch_max(spins, Ordering::Relaxed);
+            }
             if spins == DRAIN_STALL_SPINS && !DRAIN_STALL_REPORTED.swap(true, Ordering::Relaxed) {
+                // WEDGE-1r2 `<D!>` — THE TRIPWIRE FIRED, said without taking a lock, and said BEFORE
+                // the line below. The tripwire's own note concedes that a wedge in the serial path
+                // blocks this print; what it did not follow through is that the blocked print then
+                // destroys the evidence that the threshold was ever crossed, which is precisely how a
+                // silence that could not have been broken came to be read as a refutation. This token
+                // survives that: `<D!>` with no `[wedge1] DRAIN STALLED` line after it says the stall
+                // is real AND that the serial path is where the core went to die.
+                crate::wedge2::mark("<D!>");
                 serial_println!(
                     ":: [wedge1] DRAIN STALLED core={} blit_active={} pending={} spins={} == tripwire ::",
                     crate::arch::sched::meter_current_cpu(),
@@ -2352,6 +2960,17 @@ impl DrainBarrier {
                 );
             }
         }
+        #[cfg(feature = "witness")]
+        if entered {
+            // The exact figure, now that it is known; the in-loop publication above is the floor that
+            // stands in for it while the drain is still running.
+            F4W_SPIN_MAX.fetch_max(spins, Ordering::Relaxed);
+            F4W_IN_SPIN.fetch_sub(1, Ordering::Relaxed);
+        }
+        // WEDGE-1r2 `<D3>` — the spin returned. `<D2>` with no `<D3>` puts the death in the spin
+        // itself, which is the one region WEDGE-1's tripwire CAN see — and pairs with `<D!>` to say
+        // whether it got far enough to try.
+        crate::wedge2::mark("<D3>");
         DrainBarrier
     }
 }
@@ -2515,13 +3134,18 @@ static CUR3_TAKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 
 /// CURSOR-3 — how each pass's tail was settled: `adopt` (the panel already carried the sprite, the
 /// module only had to agree), `repaint` (WC-I's bracket ran to completion), `ensure` (the pass never
-/// touched the sprite — WC-I's cheap tail, and the desktop case).
+/// touched the sprite — WC-I's cheap tail, and the desktop case). CURSOR-15 adds `settle` (the
+/// sessionless compose-through: the arrow never left the glass, the tail answered the deferred
+/// pixels against the finished front). On a hovered fleet `settle` should absorb what `repaint` used
+/// to count, at present cadence — that migration IS the fix, read straight off `[cursor3] rollup`.
 #[cfg(feature = "witness")]
 static CUR3_ADOPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "witness")]
 static CUR3_REPAINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "witness")]
 static CUR3_ENSURE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static CUR15_SETTLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// CURSOR-4 — the DECLINE BREAKDOWN. CURSOR-3's rollup reported `offers - taken` as one number, and
 /// the P62 wire (`offers=4181 taken=2427`) could say only that 42% of offers fell back — not which
@@ -2640,24 +3264,6 @@ static CUR12_EXCL_PROBE: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 static CUR12_EXCL_UNVERIFIED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// CURSOR-12 — total composite passes, the denominator every term above is read against.
-///
-/// ### FLICKER-3 — `passes == 0` is a statement about the SCENE, not about the mechanism
-///
-/// Every offer choke point in the kernel is inside [`composite_inner`]: this counter, the
-/// `sprite_plan()` acquisition, `overlay_open`/`defer_within` (`CUR3_PLANNED`) and
-/// `stage_window` → `compose_into` → [`note_cursor_overlay`] (`CUR3_OFFERS`/`CUR3_TAKEN`). There is
-/// no offer site outside it, so a window with `passes == 0` is a window in which [`composite`] was
-/// never called — not one in which offers were declined.
-///
-/// All nine callers of [`composite`] are window-layer events (`create_inner`, `create_at`,
-/// `present_banded`, `move_to`, `close`, `close_owner`, `focus_changed`, [`repaint`],
-/// [`service_damage`]). The desktop's flush can only reach the last, and that one returns without
-/// compositing when no row is damaged and no erase is deferred. So a full-screen presenter that owns
-/// the panel with NO compositor window on it — x86's in-kernel `vug` loop, `pal.render()` per frame
-/// at 75 fps — produces `passes == 0` at any frame rate, on a perfectly healthy kernel. Compose-through
-/// paints into a staged window's back layer; with no window layer it has no subject. `adm=empty` on
-/// the rollup line names that state so a capture cannot be read as a defect, which is the reading
-/// this counter's cumulative predecessor drew three times across two seats.
 #[cfg(feature = "witness")]
 static CUR12_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -2755,35 +3361,26 @@ fn cursor12_rollup(scope: &str) {
     } else {
         "mixed"
     };
-    // FLICKER-3 — THE ADMISSIBILITY PREDICATE, ON THE LINE ITSELF.
-    //
-    // CURSOR-14 made every term a delta and put `cum=` beside it, and then left the rule that makes
-    // the pair legible — "a block whose `passes == cum` is the whole-boot baseline and carries no
-    // verdict" — in `engine.md`, where a bench capture cannot reach it. That is the same shape of
-    // mistake as the one CURSOR-14 was fixing: the number is correct and the reader has no way to
-    // know which numbers are allowed to mean anything. So the block states its own admissibility:
-    //
-    // * `empty`    — `passes == 0`. NO COMPOSITE PASS RAN in this window, so every other term is
-    //   trivially 0 and none of them is evidence. On x86 this is the ordinary reading under the
-    //   full-screen `vug` presenter, which owns the panel with no compositor window on it:
-    //   `Screen::flush` reaches `wm::service_damage`, that function finds no damaged row and
-    //   returns, and `composite()` — which is where EVERY offer choke point lives — is never
-    //   entered. It says the offer mechanism had nothing to be offered to; it says nothing at all
-    //   about whether the mechanism works.
-    // * `baseline` — `passes >= cum`, i.e. this is the first block of the boot and its window is the
-    //   whole boot. The pre-pointer era is inside it by construction. No verdict.
-    // * `window`   — `passes < cum`. A real sample, and the only value under which `-> why` below
-    //   may be cited as evidence for or against anything.
-    let adm = if passes == 0 {
+    // CURSOR-16 (GR9 lift, 2026-07-30): the block states its own ADMISSIBILITY instead of leaving
+    // it to a doc. GR9's x86 `passes=0` read as a compose-through defect for two rounds when it was
+    // a SCENE fact: their presenter owns the panel with zero compositor windows, so `composite()`
+    // is never entered and no offer site exists. `adm=` names which scene this block measured:
+    //   empty    — composite() has never run this boot (no window layer; offers CANNOT exist)
+    //   idle     — composite() has run before but not in this window (no damage; zeros are idle)
+    //   baseline — first block, whole-boot totals (passes==cum)
+    //   window   — live window-scene sample (the only adm under which `-> none/nosprite` indicts)
+    let adm = if cum == 0 {
         "empty"
-    } else if passes >= cum {
+    } else if passes == 0 {
+        "idle"
+    } else if passes == cum {
         "baseline"
     } else {
         "window"
     };
     serial_println!(
-        "[cursor12] offer scope={} passes={} nosprite={} nohit={} reserved={} nosession={} planned={} excl_probe={} excl_unverified={} cum={} adm={} -> {}",
-        scope, passes, nosprite, nohit, reserved, nosession, planned, probe, unver, cum, adm, why
+        "[cursor12] offer scope={} adm={} passes={} nosprite={} nohit={} reserved={} nosession={} planned={} excl_probe={} excl_unverified={} cum={} -> {}",
+        scope, adm, passes, nosprite, nohit, reserved, nosession, planned, probe, unver, cum, why
     );
 }
 
@@ -2848,6 +3445,10 @@ fn note_cursor_tail(tail: CursorTail) {
             CUR3_REPAINT.fetch_add(1, Relaxed);
             "repaint"
         }
+        CursorTail::Settle => {
+            CUR15_SETTLE.fetch_add(1, Relaxed);
+            "settle"
+        }
         CursorTail::Untouched => {
             CUR3_ENSURE.fetch_add(1, Relaxed);
             return;
@@ -2859,7 +3460,13 @@ fn note_cursor_tail(tail: CursorTail) {
             name,
             CUR3_OFFERS.load(Relaxed),
             CUR3_TAKEN.load(Relaxed),
-            if tail == CursorTail::Adopt { "COMPOSED" } else { "BRACKETED" }
+            match tail {
+                CursorTail::Adopt => "COMPOSED",
+                // CURSOR-15 — the sessionless compose-through: not COMPOSED (nothing rode a
+                // layer) and emphatically not BRACKETED (the arrow never left the glass).
+                CursorTail::Settle => "THROUGH",
+                _ => "BRACKETED",
+            }
         );
     }
 }
@@ -2883,6 +3490,7 @@ fn cursor3_rollup(scope: &str) {
     let taken = CUR3_TAKEN.load(Relaxed);
     let adopt = CUR3_ADOPT.load(Relaxed);
     let repaint = CUR3_REPAINT.load(Relaxed);
+    let settle = CUR15_SETTLE.load(Relaxed);
     let ensure = CUR3_ENSURE.load(Relaxed);
     let straddle = CUR3_DECL_STRADDLE.load(Relaxed);
     let lock = CUR3_DECL_LOCK.load(Relaxed);
@@ -2907,9 +3515,9 @@ fn cursor3_rollup(scope: &str) {
     let disjoint = CUR6_DECL_DISJOINT.load(Relaxed);
     let partial = CUR6_DECL_PARTIAL.load(Relaxed);
     serial_println!(
-        "[cursor3] rollup scope={} planned={} offers={} taken={} adopt={} repaint={} ensure={} straddle={} disjoint={} partial={} lock={} budget={} stale={} -> {}",
-        scope, planned, offers, taken, adopt, repaint, ensure, straddle, disjoint, partial, lock,
-        budget, stale, verdict
+        "[cursor3] rollup scope={} planned={} offers={} taken={} adopt={} repaint={} settle={} ensure={} straddle={} disjoint={} partial={} lock={} budget={} stale={} -> {}",
+        scope, planned, offers, taken, adopt, repaint, settle, ensure, straddle, disjoint, partial,
+        lock, budget, stale, verdict
     );
     // CURSOR-5 — the coherence residual, immediately after the decline breakdown so a bench capture
     // shows "how often the mechanism ran" and "what it cost when it raced" as one block.
@@ -2926,6 +3534,743 @@ fn cursor3_rollup(scope: &str) {
     // compose-through did; this one is the only line that can say whether it ran at all, and on both
     // benches the answer so far is that it did not.
     cursor12_rollup(scope);
+    // FLICKER-2 — bracket latency and restore provenance beside the burst/drain pressure that can
+    // cause both, one line, so the P79 flicker cadence question ("does it ride the 5 s rollup
+    // burst?") is answerable from a single capture. The wm-side counters are passed in because the
+    // cursor module must not reach back into this one.
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        super::cursor::flick2_rollup(
+            scope,
+            F2W_DRAINS.load(Relaxed),
+            F2W_DRAIN_SKIPS.load(Relaxed),
+            F2W_DRAIN_MASKED.load(Relaxed),
+            WCN_BURST_LAST_MS.load(Relaxed),
+            WCN_BURST_MAX_MS.load(Relaxed),
+        );
+    }
+    // VUGMIN-B — and who the window layer told to go to sleep, on the same line block for the same
+    // reason: it is a fact about this compositor's passes, and the number it reports (`presents
+    // skipped`) is a subtraction from `cursor_passes` above.
+    vugmin_rollup(scope);
+}
+
+/// VUGMIN-B — the hidden-owner rollup: how many owners `wm` pushed below the shell, how many it brought
+/// back, and how many `SYS_WIN_PRESENT` composites that cost nothing were suppressed.
+///
+/// **Honest scope on the gate.** The headless QEMU run has no HID, so nothing ever TABs to the shell,
+/// so `focus_changed(0)` is never reached from an operator and no owner is ever hidden. All three
+/// counters are 0 there and the verdict says `DORMANT` rather than `CLEAN` — the line proves the
+/// counters are wired and that nothing hid by accident, which is exactly the claim a headless run can
+/// support. The number that carries the arc is `hides > 0` on the bench, where a shell TAB exists.
+#[cfg(feature = "witness")]
+fn vugmin_rollup(scope: &str) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let hides = VUGMIN_HIDES.load(Relaxed);
+    let unhides = VUGMIN_UNHIDES.load(Relaxed);
+    let skipped = VUGMIN_SKIPPED.load(Relaxed);
+    let live = VUGMIN_SHADOW.load(Relaxed).count_ones();
+    let verdict = if hides == 0 { "DORMANT" } else { "ENGAGED" };
+    serial_println!(
+        "[vugmin] wm scope={} hides={} unhides={} presents_skipped={} hidden_now={} -> {}",
+        scope, hides, unhides, skipped, live, verdict
+    );
+    wcn_emit_forced(scope);
+}
+
+// ---- WC-N: the per-window present-rate rollup ---------------------------------------------------
+
+/// WC-N — **"predetermined fps" as wire data.**
+///
+/// Two numbers already existed and neither answers the question. `[vugfps]` (user-vug) is the app's
+/// own count of frames it *issued*, drawn in its corner — it cannot know whether a frame reached
+/// glass. `[sched6]` counts the render task's passes and composites — fleet-wide, with no window in
+/// it. So when Peter reads six vugs running at visibly different rates, nothing on the wire says
+/// whether a given vug's rate is a CONSEQUENCE (it is competing for cores and the compositor) or a
+/// CEILING (something is pacing it at a fixed rate regardless of load). This rollup is that fact,
+/// per window, from the compositor's own side of the seam.
+///
+/// Four counts per live window, each a delta over the rollup window:
+///  * `att` — [`present`] calls that named this row. The owner's *attempt*: `SYS_WIN_PRESENT`
+///    performed its ownership check and handed us a finished surface.
+///  * `comp` — times this row was actually blitted by [`composite_inner`]'s loop. Pixels on glass.
+///    It can legitimately EXCEED `att`: a neighbour's present grows the dirty set upwards over
+///    occlusion, and this row is repainted inside that neighbour's pass. `comp > att` is therefore a
+///    reading about overlap, not an error — it is compositor work this window's owner did not ask
+///    for and does not know about.
+///  * `hid` — presents suppressed by the VUGMIN-B arm in [`present`]: every window this owner holds
+///    was below `SHELL_Z`, so the pass would have written nowhere the operator can see.
+///  * `bel` — passes in which this row was in the dirty set and then declined by [`above_shell`].
+///    The same fact as `hid` seen from the compositor's end: `hid` is the owner's own present being
+///    dropped, `bel` is somebody ELSE's pass declining to repaint this row.
+///
+/// **There is no occlusion cull, so there is no third skip class, and this rollup does not invent
+/// one.** A window wholly covered by another is still blitted — the dirty-set closure exists to
+/// repaint what is ON TOP, not to drop what is underneath. `comp - att` is where that cost shows.
+///
+/// ### The park, and why the rate is not `att / span`
+///
+/// VUGPAUSE-2 makes an idle vug *leave the run queues*: it blocks in the input wait and presents
+/// nothing at all, for as long as the operator leaves it alone. Divided by wall-clock span, that vug
+/// reads as `0.2/s` — indistinguishable from a vug that is being starved of cores at 0.2 fps, which
+/// is the exact confusion this witness exists to remove. So the denominator is the window's own
+/// ACTIVE time: consecutive presents closer together than [`WCN_PARK_GAP_MS`] accumulate into
+/// `active`, and any longer gap accumulates into `parked` instead and is charged to neither the
+/// numerator nor the denominator. A parked vug reports the rate it ran at *while it was running*,
+/// with its park time stated beside it. (The window's first present after a park opens a new active
+/// span rather than closing one, so `att` overstates the active interval by at most one present per
+/// park — visible only at very low counts, and always in the direction of a slightly optimistic
+/// rate.)
+///
+/// ### `gap` is the ceiling test
+///
+/// `gapmin`/`gapmax` are the shortest and longest ACTIVE inter-present gaps in the window, in ms. A
+/// rate that is a consequence of load scatters — a contended vug's gaps run from a few ms to tens.
+/// A rate that is a fixed ceiling does not: `gapmin` and `gapmax` collapse onto the same value
+/// (something is pacing the loop), and the collapse is visible on one line without a second run.
+/// That pair, not the rate, is what makes "predetermined fps" checkable.
+#[cfg(feature = "witness")]
+const WCN_ROLLUP_MS: u64 = 5000;
+
+/// WC-N — an inter-present gap longer than this is a PARK, not a slow frame. VUGPAUSE-2's backstop
+/// period is ~256 ms and a parked vug's next present waits on operator input, so anything past a
+/// quarter second is provably not the render loop pacing itself. The slowest rate this can misread
+/// as active is 4/s, which is already far below anything the fleet produces while rendering.
+#[cfg(feature = "witness")]
+const WCN_PARK_GAP_MS: u64 = 250;
+
+/// WC-N — one window slot's accumulators. Plain atomics rather than a `Mutex`: this is written from
+/// [`present`] (the owner's core, at frame rate) and from [`composite_inner`]'s blit loop (any core),
+/// and a witness must not add a lock to a path whose contention it is trying to measure. Every field
+/// is `Relaxed` — no other state is published through them and the rollup reads them one at a time
+/// anyway, so a line that catches a counter mid-increment is off by one and never inconsistent.
+#[cfg(feature = "witness")]
+struct WcnRow {
+    att: core::sync::atomic::AtomicU64,
+    comp: core::sync::atomic::AtomicU64,
+    hid: core::sync::atomic::AtomicU64,
+    bel: core::sync::atomic::AtomicU64,
+    /// Summed inter-present gaps at or under [`WCN_PARK_GAP_MS`] — the window's own active time.
+    active_ms: core::sync::atomic::AtomicU64,
+    /// Summed gaps longer than that — VUGPAUSE-2 park, excluded from the rate's denominator.
+    parked_ms: core::sync::atomic::AtomicU64,
+    /// Shortest / longest ACTIVE gap this rollup window. `u64::MAX` is the "no gap yet" sentinel.
+    gap_min: core::sync::atomic::AtomicU64,
+    gap_max: core::sync::atomic::AtomicU64,
+    /// `arch::ms()` of the last present that named this row. `0` = none yet. NOT reset at rollup:
+    /// the activity span is a property of the window, not of the reporting cadence, so a rollup
+    /// boundary must not manufacture a park out of the gap it straddles.
+    last_ms: core::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "witness")]
+impl WcnRow {
+    const fn new() -> Self {
+        use core::sync::atomic::AtomicU64;
+        Self {
+            att: AtomicU64::new(0),
+            comp: AtomicU64::new(0),
+            hid: AtomicU64::new(0),
+            bel: AtomicU64::new(0),
+            active_ms: AtomicU64::new(0),
+            parked_ms: AtomicU64::new(0),
+            gap_min: AtomicU64::new(u64::MAX),
+            gap_max: AtomicU64::new(0),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+/// WC-N — one slot per window id (`id - 1`). Written out rather than repeated by a `Copy` splat
+/// because `WcnRow` holds atomics; the assertion below is what keeps it honest if [`MAX_WINDOWS`]
+/// ever moves.
+#[cfg(feature = "witness")]
+static WCN: [WcnRow; 8] = [
+    WcnRow::new(),
+    WcnRow::new(),
+    WcnRow::new(),
+    WcnRow::new(),
+    WcnRow::new(),
+    WcnRow::new(),
+    WcnRow::new(),
+    WcnRow::new(),
+];
+
+#[cfg(feature = "witness")]
+const _: () = assert!(WCN.len() == MAX_WINDOWS);
+
+/// WC-N — composite passes that reached the blit loop, and passes that returned before it (the F4
+/// drain barrier was up, or the framebuffer was not ready). An aborted pass is a present that cost
+/// its owner a syscall and produced no pixels for ANY window, so it belongs on the aggregate line
+/// rather than charged to whichever row happened to trigger it.
+#[cfg(feature = "witness")]
+static WCN_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static WCN_ABORTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WC-N — presents that named no live row at all (a window closed under its owner). Aggregate-only:
+/// there is no slot to charge them to, and that is exactly what makes them worth counting.
+#[cfg(feature = "witness")]
+static WCN_STALE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WC-N — `arch::ms()` at the last rollup. Also the CLAIM: a core that wins the compare-exchange
+/// owns the emit and every other core in the same instant falls through to its present.
+#[cfg(feature = "witness")]
+static WCN_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// ---- COMPOSITE-2 — the per-pass cost ledger -----------------------------------------------------
+//
+// The compositor's measured wall is ~123 passes/s aggregate (~8 ms per pass at 1920x1200), which is
+// the fps ceiling for the whole vug fleet while V3D stays walled. Before rebuilding the hot path the
+// wire must say where those 8 ms go, and afterwards it must prove they moved. One [comp2] rollup
+// line rides the [wcn] cadence and partitions every pass's wall time into four accounts:
+//
+//   * `sprite_us` — the pre-pass region (deferred-erase drain + cursor bracket) plus the tail
+//     (`adopt`/`repaint`/`ensure_drawn`). Everything the sprite contract costs a pass.
+//   * `wait_us`   — WRITER read, TABLE lock, damage close, ordering, guard registration: the
+//     serialisation cost between the bracket and the first blit.
+//   * `blit_us`   — the blit loop proper (compose + present copies), MINUS the cache term below.
+//   * `cache_us`  — `draw_window`'s trailing `flush_range` (`DC CVAC` sweep + `DSB`), the
+//     non-coherent scan-out's tax, measured separately because it scales with CLEANED bytes and
+//     the fix for it (clean the box, not full-width scanlines) is distinct from the blit fix.
+//
+// Plus the two denominators every claim needs: `bytes_pp` (panel bytes written per pass) and
+// `dmg_px_pp` (damage-clipped box area per pass). aarch64 + witness only, like the other wire
+// instruments; counters are relaxed increments on the hot path and are drained by the emit.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_PASS_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_PASS_MAX_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_SPRITE_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_WAIT_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_LOOP_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_CACHE_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static C2_DMG_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// COMPOSITE-2 — drain the ledger and print the rollup line. Called from [`wcn_emit`] so the two
+/// instruments share one cadence and one `span`; all averages are per-pass, in microseconds.
+/// `blit_us` subtracts the cache term because the flush is timed INSIDE the loop (it is per-window,
+/// in `draw_window`), and reporting it twice would make the line un-addable.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+fn comp2_emit(span: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let passes = C2_PASSES.swap(0, Relaxed);
+    let pass_cyc = C2_PASS_CYC.swap(0, Relaxed);
+    let max_cyc = C2_PASS_MAX_CYC.swap(0, Relaxed);
+    let sprite_cyc = C2_SPRITE_CYC.swap(0, Relaxed);
+    let wait_cyc = C2_WAIT_CYC.swap(0, Relaxed);
+    let loop_cyc = C2_LOOP_CYC.swap(0, Relaxed);
+    let cache_cyc = C2_CACHE_CYC.swap(0, Relaxed);
+    let bytes = C2_BYTES.swap(0, Relaxed);
+    let dmg_px = C2_DMG_PX.swap(0, Relaxed);
+    if passes == 0 {
+        return;
+    }
+    let us = |cyc: u64| super::wcg::cycles_to_us(cyc / passes);
+    serial_println!(
+        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} cache_us={} bytes_pp={} dmg_px_pp={} rate={}.{}/s span={}ms",
+        passes,
+        us(pass_cyc),
+        super::wcg::cycles_to_us(max_cyc),
+        us(sprite_cyc),
+        us(wait_cyc),
+        us(loop_cyc.saturating_sub(cache_cyc)),
+        us(cache_cyc),
+        bytes / passes,
+        dmg_px / passes,
+        passes.saturating_mul(10_000) / span.max(1) / 10,
+        passes.saturating_mul(10_000) / span.max(1) % 10,
+        span
+    );
+}
+
+// ---- FLUID-3 — the vug-side wait ledger ----------------------------------------------------------
+//
+// P83 (Peter, live): pointer motion grows a fleet core's idle reserve, and each vug settles to a
+// characteristic fps below capacity. The load meter counts service time as busy, so the reserve is
+// REAL idle — fleet tasks leaving the run queues. The present path cannot queue (a present IS its
+// composite, run inline on the caller's core; there is no ack rendezvous to wait on), so the only
+// parks a live vug takes are its futex parks: the frame barrier behind its workers, and the workers
+// behind the next release. This line prices them, beside the present-side concurrency:
+//
+//   * `parks` / `park_us mean/max` / `p50/p90/p99` — completed futex parks this window and their
+//     duration distribution (log2 buckets, computed in `sched::fluid3_drain`). The percentiles are
+//     bucket UPPER bounds. Barrier parks behind healthy workers read tens-to-hundreds of us;
+//     milliseconds here is a parent parked behind a starved worker — the invisible idle the SCHED
+//     load line shows as reserve; the top bucket (>32 ms) is idle vugs on their input rings.
+//   * `depth_max` — high-water of concurrently in-flight composites (`BLIT_ACTIVE` sampled at guard
+//     registration). >1 proves presents do NOT serialize behind one consumer; 1 under a saturated
+//     fleet would mean they do.
+//   * `overlap` — passes that entered with another composite already in flight.
+//
+// aarch64 + witness, drained on the [wcn]/[comp2] cadence. The sched half lives in
+// `arch::aarch64::sched` (`fluid3_note_park` / `fluid3_drain`).
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static FL3_DEPTH_MAX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static FL3_OVERLAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// FLUID-3 — drain both halves of the ledger and print the rollup. Percentile figures are the upper
+/// bound of the log2 bucket in which the cumulative count crossed the mark, in microseconds.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+fn fluid3_emit(span: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let (parks, mean_us, max_us, hist) = crate::arch::aarch64::sched::fluid3_drain();
+    let depth = FL3_DEPTH_MAX.swap(0, Relaxed);
+    let overlap = FL3_OVERLAP.swap(0, Relaxed);
+    if parks == 0 && depth == 0 {
+        return;
+    }
+    let pct = |mark: u64| -> u64 {
+        // Smallest bucket upper bound covering `mark` parks cumulatively; `mark` is 1-based.
+        let mut cum = 0u64;
+        for (b, &h) in hist.iter().enumerate() {
+            cum += h as u64;
+            if cum >= mark {
+                return 1u64 << b;
+            }
+        }
+        1u64 << (hist.len() - 1)
+    };
+    serial_println!(
+        "[fluid3] parks={} park_us mean={} max={} p50<={} p90<={} p99<={} depth_max={} overlap={} span={}ms",
+        parks,
+        mean_us,
+        max_us,
+        pct(parks.div_ceil(2)),
+        pct((parks.saturating_mul(9)).div_ceil(10)),
+        pct((parks.saturating_mul(99)).div_ceil(100)),
+        depth,
+        overlap,
+        span
+    );
+}
+
+// ---- FLICKER-2 — the burst/drain pressure counters ----------------------------------------------
+//
+// Symptom (a) of Peter's P79 sitting is a slight cursor flicker on a ~5 s "pulse" — the cadence of
+// the [wcn] rollup burst above. The emission itself holds NO compositor lock (the `TABLE` snapshot
+// in `wcn_emit` is dropped before the first print) and runs at the tail of `present`, OUTSIDE the
+// composite pass and its cursor bracket — but on metal every line the winning core puts on the wire
+// is ~13 ms of IRQ-masked 115200-baud polling, and the UART holder also drains up to `serial_ring::
+// SLOTS` lines other cores staged. A timer-IRQ witness site ([pulse5]/[spread4]/[prio]) that fires
+// on a core which is MID-composite therefore stretches that pass — and any cursor bracket it holds —
+// by the whole burst. QEMU cannot reproduce any of this (no drawn sprite, instant UART), so the
+// burst is MEASURED instead: `wcn_emit` records its own wall time here, and `[flick2]` reports it
+// beside the sprite's observed down-intervals (see `cursor::flick2_rollup`) so the next bench boot
+// can read whether the flicker Peter sees rides the burst.
+#[cfg(feature = "witness")]
+static WCN_BURST_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static WCN_BURST_MAX_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// FLICKER-2 — drains that found queued boxes (the population the two counters below partition).
+#[cfg(feature = "witness")]
+static F2W_DRAINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// FLICKER-2 — drains whose boxes never met the sprite: the sprite was left on the panel untouched.
+/// Before this arc every one of these was a whole-sprite restore→repaint over the window under the
+/// pointer.
+#[cfg(feature = "witness")]
+static F2W_DRAIN_SKIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// FLICKER-2 — drains that met the sprite and took the MASKED handback instead of the full undraw.
+#[cfg(feature = "witness")]
+static F2W_DRAIN_MASKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WEDGE-1r2 — what the drain barrier actually cost this window, below the tripwire's threshold.
+///
+/// ### The admissibility clause, because this line's SILENCE is the thing that was misread
+/// `drains=0` says NO TEARDOWN RAN in this window. It does not say the drain barrier is healthy, and
+/// it is not evidence about any wedge: a boot with no window close and no task exit never reaches
+/// that code at all. The inference WEDGE-1's watch-list drew from a quiet tripwire — "the drain
+/// barrier is exonerated" — is exactly the reading this line exists to make impossible to repeat, so
+/// the verdict names the SCENE and never the outcome:
+///
+/// * `STRADDLE` — spin evidence with zero completed drains in this window: the drain that produced
+///                it was counted in a neighbouring window's `drains` (it straddled the rollup
+///                boundary). Read beside those neighbours. (A straddle whose `spin_max` clears the
+///                note prints `DWELL`, not `STRADDLE` — the precedence is severity-first.) A window
+///                with no evidence at all does not print; there is no `NONE` verdict.
+/// * `QUIET`    — drains ran, and none spun past [`DRAIN_DWELL_NOTE`]. The healthy steady state, and
+///                the only verdict here that is a statement about the barrier rather than about the
+///                scene.
+/// * `DWELL`    — a drain spun far enough to be a stalled core, four orders of magnitude under the
+///                tripwire. That is IRQ-masked time on a teardown's core, and it is the reading the
+///                tripwire's own threshold note deliberately declined to produce.
+/// * `INFLIGHT` — a drain was inside the spin at the instant ANOTHER core took this line. At operator
+///                teardown rates against a 5 s window, one sample is a coincidence worth noting and
+///                the same reading twice running is a core that is not coming out.
+///
+/// `tripwire=` carries [`DRAIN_STALL_REPORTED`] so the two instruments are read together: `fired`
+/// beside a `DWELL` is one stall growing, and `silent` beside an `INFLIGHT` is a drain that is stuck
+/// but has not yet reached [`DRAIN_STALL_SPINS`] — the state that used to produce nothing at all.
+///
+/// Emitted AHEAD of [`wcn_emit`]'s dirty-paced guard: a wedged teardown holds a core with interrupts
+/// masked, and if the only thing keeping this block off the wire were "no window presented in the
+/// last five seconds", the reading that names the wedge would be suppressed by the very condition it
+/// describes. Self-silencing when there is genuinely nothing to say, so an idle desktop still prints
+/// no wall of zeros.
+#[cfg(feature = "witness")]
+fn wedge1_dwell_emit(span: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let drains = F4W_DRAINS.swap(0, Relaxed);
+    let spun = F4W_SPUN.swap(0, Relaxed);
+    let spin_max = F4W_SPIN_MAX.swap(0, Relaxed);
+    // A GAUGE — loaded, never drained. Draining it would report a stuck core once and then forget it,
+    // which is the opposite of what a standing count is for.
+    let in_spin = F4W_IN_SPIN.load(Relaxed);
+    // Lens fix (s1u): the quiet-window early-out must also test the spin evidence. The swaps above
+    // have already drained `spun`/`spin_max`, so a drain that straddled the previous rollup boundary
+    // (counted there as `drains`, its spin published here) would have its DWELL evidence silently
+    // dropped by a `drains==0` return — banking QUIET for a window that measured a stall.
+    if drains == 0 && in_spin == 0 && spun == 0 && spin_max == 0 {
+        return;
+    }
+    let verdict = if in_spin > 0 {
+        "INFLIGHT"
+    } else if spin_max >= DRAIN_DWELL_NOTE {
+        "DWELL"
+    } else if drains == 0 {
+        // Reachable only via the straddle case above: spin evidence with zero completed drains in
+        // THIS window — the drain that produced it was counted in a neighbouring window's `drains`.
+        "STRADDLE"
+    } else if spin_max > 0 {
+        // WEDGE-1r3 (PA6 metal, 2026-08-01). A window that MEASURED a spin may not be called
+        // QUIET, whose contract is "the healthy steady state". PA6 printed
+        //   drains=20 spun=1 spin_max=6890 ... -> QUIET
+        // — the first non-zero spin this track has ever recorded, banked as healthy, because the
+        // only gate above was `spin_max >= DRAIN_DWELL_NOTE`. `DRAIN_DWELL_NOTE` is 1<<16 and is
+        // NOT calibrated against any measurement: its stated justification is relative only ("four
+        // orders under DRAIN_STALL_SPINS"), so a real dwell can sit at 65535 forever and every
+        // window still reads QUIET. Lowering the constant would only move an arbitrary line; the
+        // honest fix is to stop claiming health for a window that has evidence, and let the number
+        // speak. SPUN is not a fault — it is "contention was observed and stayed under the note".
+        "SPUN"
+    } else {
+        "QUIET"
+    };
+    serial_println!(
+        "[wedge1] dwell drains={} spun={} spin_max={} note={} in_spin={} tripwire={} span={}ms -> {}",
+        drains,
+        spun,
+        spin_max,
+        DRAIN_DWELL_NOTE,
+        in_spin,
+        if DRAIN_STALL_REPORTED.load(Relaxed) { "fired" } else { "silent" },
+        span,
+        verdict
+    );
+}
+
+/// WC-N — the slot for `id`, or `None` for an out-of-range id.
+#[cfg(feature = "witness")]
+fn wcn_slot(id: WinId) -> Option<&'static WcnRow> {
+    if id == WIN_NONE {
+        return None;
+    }
+    WCN.get(id as usize - 1)
+}
+
+/// WC-N — record one [`present`] against `id`, and fold its inter-present gap into the active/parked
+/// split. Called from `present` with the table lock DROPPED (`arch::ms()` is a register read, but the
+/// rule in this file is that nothing is called out from under `TABLE` and this is not the exception).
+#[cfg(feature = "witness")]
+fn wcn_note_present(id: WinId, hidden: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let Some(s) = wcn_slot(id) else { return };
+    s.att.fetch_add(1, Relaxed);
+    if hidden {
+        s.hid.fetch_add(1, Relaxed);
+    }
+    // `max(1)` keeps 0 as the "never presented" sentinel even if this is the very first millisecond
+    // of the boot; the cost is one ms of misattribution, once, ever.
+    let now = crate::arch::ms().max(1);
+    let last = s.last_ms.swap(now, Relaxed);
+    if last != 0 && now > last {
+        let gap = now - last;
+        if gap <= WCN_PARK_GAP_MS {
+            s.active_ms.fetch_add(gap, Relaxed);
+            s.gap_min.fetch_min(gap, Relaxed);
+            s.gap_max.fetch_max(gap, Relaxed);
+        } else {
+            s.parked_ms.fetch_add(gap, Relaxed);
+        }
+    }
+}
+
+/// WC-N — record that `id`'s row was blitted by a composite pass. The only "reached glass" writer.
+#[cfg(feature = "witness")]
+fn wcn_note_drawn(id: WinId) {
+    if let Some(s) = wcn_slot(id) {
+        s.comp
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// WC-N — record that `id`'s row was in a pass's dirty set and declined for sitting below the shell.
+#[cfg(feature = "witness")]
+fn wcn_note_below(id: WinId) {
+    if let Some(s) = wcn_slot(id) {
+        s.bel.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// WC-N — one composite pass reached (`drew = true`) or did not reach (`drew = false`) the blit loop.
+#[cfg(feature = "witness")]
+fn wcn_note_pass(drew: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if drew {
+        WCN_PASSES.fetch_add(1, Relaxed);
+    } else {
+        WCN_ABORTED.fetch_add(1, Relaxed);
+    }
+}
+
+/// WC-N — the dirty-paced tick, called at the tail of every [`present`].
+///
+/// Cadence follows `[pstrip]`/`[sched6]`: a fixed rollup period, one claim per period, and NOTHING
+/// printed for a period in which no window attempted or completed a present. Two consequences worth
+/// stating, because both are deliberate:
+///  * the line volume is bounded by construction — at most one block (live windows + one aggregate)
+///    per [`WCN_ROLLUP_MS`], however many cores are compositing;
+///  * a fleet that has wholly parked goes SILENT rather than printing a wall of zeros. The witness is
+///    driven by the traffic it measures, so "no `[wcn]` lines" reads as "nobody is presenting", which
+///    is the same thing the absence of the lines would have meant anyway.
+///
+/// The period's final partial window is therefore never emitted on its own account. The forced
+/// [`wcn_emit_forced`] path — fired from the fixture/desktop rollup beside `[vugmin]` — is what
+/// guarantees the gate a block regardless.
+#[cfg(feature = "witness")]
+fn wcn_tick() {
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed};
+    let now = crate::arch::ms();
+    let last = WCN_LAST_MS.load(Relaxed);
+    let span = now.wrapping_sub(last);
+    if span < WCN_ROLLUP_MS {
+        return;
+    }
+    // Claim the window. A loser does not retry: the winner is emitting the same evidence.
+    if WCN_LAST_MS
+        .compare_exchange(last, now, AcqRel, Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    wcn_emit("live", span, false);
+}
+
+/// WC-N — force a block out now, whatever the cadence says. Called from [`vugmin_rollup`] so the
+/// arc's line appears on the same scoped rollup every other window witness reports on, including on
+/// a headless gate whose last rollup window is still open when the fixture ends.
+#[cfg(feature = "witness")]
+fn wcn_emit_forced(scope: &str) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let now = crate::arch::ms();
+    let last = WCN_LAST_MS.swap(now, Relaxed);
+    wcn_emit(scope, now.wrapping_sub(last), true);
+}
+
+/// WC-N — drain the accumulators and print. `span` is the wall-clock length of the window being
+/// reported; `force` prints the aggregate even when nothing happened in it.
+///
+/// Counters are drained with `swap`, not read-then-store: a present landing on another core during
+/// the emit is carried into the NEXT window rather than lost, which is what keeps the per-window
+/// totals summable across a whole boot.
+#[cfg(feature = "witness")]
+fn wcn_emit(scope: &str, span: u64, force: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    // FLICKER-2 — the burst's own wall clock, from the identity snapshot to the last rollup byte.
+    // The reading means "how long the emitting core was occupied by this block"; it is stored only
+    // at the end of the function, so silent early-outs never overwrite a real burst's figure.
+    let t_burst = crate::arch::ms();
+    // Identity for the per-window lines, snapshotted under one acquisition so every line in a block
+    // is judged against one table state and one shell position. A slot with traffic but no live row
+    // is a window that closed inside this rollup window; it still gets its line (`live=no`), because
+    // dropping it would silently delete the last few frames of every window that ever exits.
+    let mut ident = [(0u64, false, false); MAX_WINDOWS]; // (owner asid, live, above shell)
+    {
+        let t = table();
+        let shell = SHELL_Z.load(core::sync::atomic::Ordering::Acquire);
+        for r in t.rows.iter() {
+            if !r.used || r.id == WIN_NONE || r.id as usize > MAX_WINDOWS {
+                continue;
+            }
+            ident[r.id as usize - 1] = (r.owner_asid, true, above_shell(r, shell));
+        }
+    }
+    let (mut t_att, mut t_comp, mut t_hid, mut t_bel) = (0u64, 0u64, 0u64, 0u64);
+    let mut wins = 0usize;
+    let mut lines: [Option<WcnLine>; MAX_WINDOWS] = [None; MAX_WINDOWS];
+    for (i, s) in WCN.iter().enumerate() {
+        let att = s.att.swap(0, Relaxed);
+        let comp = s.comp.swap(0, Relaxed);
+        let hid = s.hid.swap(0, Relaxed);
+        let bel = s.bel.swap(0, Relaxed);
+        let active = s.active_ms.swap(0, Relaxed);
+        let parked = s.parked_ms.swap(0, Relaxed);
+        let gmin = s.gap_min.swap(u64::MAX, Relaxed);
+        let gmax = s.gap_max.swap(0, Relaxed);
+        t_att += att;
+        t_comp += comp;
+        t_hid += hid;
+        t_bel += bel;
+        let (asid, live, above) = ident[i];
+        if live {
+            wins += 1;
+        }
+        if att == 0 && comp == 0 && bel == 0 {
+            continue;
+        }
+        // Tenths, for `[pstrip]`'s reason: an integer /s truncates every honest sub-1 Hz rate to 0.
+        // The rate's denominator is the window's ACTIVE time (see the module note above) and falls
+        // back to the wall span only when this window recorded no gap at all — a single present in
+        // the whole rollup, where there is no active interval to divide by and the wall answer is
+        // the honest upper bound rather than a divide by zero.
+        let den = if active > 0 { active } else { span.max(1) };
+        lines[i] = Some(WcnLine {
+            id: (i + 1) as WinId,
+            asid,
+            live,
+            above,
+            att,
+            comp,
+            hid,
+            bel,
+            arate: att.saturating_mul(10_000) / den.max(1),
+            crate_: comp.saturating_mul(10_000) / den.max(1),
+            active,
+            parked,
+            // The "no active gap at all" sentinel reports as `0..0`, which is what a single-present
+            // window honestly has: no interval to measure.
+            gap_min: if gmin == u64::MAX { 0 } else { gmin },
+            gap_max: gmax,
+        });
+    }
+    // WEDGE-1r2 — the drain barrier's dwell, taken BEFORE the dirty-paced guard below. A teardown
+    // that has consumed a core is a teardown that is not presenting, so gating this reading on
+    // present traffic would silence it under exactly the condition it reports on. It has its own
+    // self-silencing test (no drains, nobody spinning), so an idle desktop stays as quiet as before.
+    wedge1_dwell_emit(span);
+    if !force && t_att == 0 && t_comp == 0 {
+        return; // dirty-paced: a period with no present traffic prints nothing at all.
+    }
+    for l in lines.iter().flatten() {
+        serial_println!(
+            "[wcn] win={} asid={:#x} live={} above={} att={} comp={} hid={} bel={} rate={}.{}/s comp_rate={}.{}/s active={}ms parked={}ms gap={}..{}ms",
+            l.id,
+            l.asid,
+            if l.live { "yes" } else { "no" },
+            if l.above { "yes" } else { "no" },
+            l.att,
+            l.comp,
+            l.hid,
+            l.bel,
+            l.arate / 10,
+            l.arate % 10,
+            l.crate_ / 10,
+            l.crate_ % 10,
+            l.active,
+            l.parked,
+            l.gap_min,
+            l.gap_max
+        );
+    }
+    let passes = WCN_PASSES.swap(0, Relaxed);
+    let aborted = WCN_ABORTED.swap(0, Relaxed);
+    let stale = WCN_STALE.swap(0, Relaxed);
+    let att_rate = t_att.saturating_mul(10_000) / span.max(1);
+    let comp_rate = t_comp.saturating_mul(10_000) / span.max(1);
+    // The aggregate's denominator IS wall-clock, and deliberately so: "what did the fleet cost the
+    // panel over these five seconds" is a wall-clock question, and a fleet in which one vug is parked
+    // and five are running genuinely did present less per second of panel time. The per-window lines
+    // above are where the park is factored out; conflating the two denominators on one line would
+    // make the aggregate un-addable from its own rows.
+    let verdict = if t_att == 0 {
+        "IDLE"
+    } else if t_comp == 0 {
+        "STARVED"
+    } else {
+        "LIVE"
+    };
+    serial_println!(
+        "[wcn] rollup scope={} wins={} att={} comp={} hid={} bel={} stale={} passes={} aborted={} att_rate={}.{}/s comp_rate={}.{}/s span={}ms -> {}",
+        scope,
+        wins,
+        t_att,
+        t_comp,
+        t_hid,
+        t_bel,
+        stale,
+        passes,
+        aborted,
+        att_rate / 10,
+        att_rate % 10,
+        comp_rate / 10,
+        comp_rate % 10,
+        span,
+        verdict
+    );
+    // COMPOSITE-2 — the cost ledger rides the same cadence and the same span.
+    #[cfg(target_arch = "aarch64")]
+    comp2_emit(span);
+    // FLUID-3 — the wait ledger rides the same cadence and the same span.
+    #[cfg(target_arch = "aarch64")]
+    fluid3_emit(span);
+    // FLICKER-2 — stored only when a block actually went on the wire, so `burst_last` names the most
+    // recent REAL burst rather than the last silent early-out. On metal this is dominated by the
+    // IRQ-masked UART time of the lines above (plus any staged backlog the winning core drained);
+    // in QEMU it reads ~0, which is itself the point — the stall being measured does not exist there.
+    let dt = crate::arch::ms().wrapping_sub(t_burst);
+    WCN_BURST_LAST_MS.store(dt, Relaxed);
+    if dt > WCN_BURST_MAX_MS.load(Relaxed) {
+        WCN_BURST_MAX_MS.store(dt, Relaxed);
+    }
+}
+
+/// WC-N — one drained per-window line, held on the stack between the drain loop and the print loop.
+/// The two are separate passes because the DECISION to print at all is a property of the whole block
+/// (`force || any traffic`), and the drain must happen either way: a rollup that read the counters,
+/// decided to stay silent, and left them standing would fold two windows' traffic into the next line
+/// and misreport every rate in it.
+#[cfg(feature = "witness")]
+#[derive(Clone, Copy)]
+struct WcnLine {
+    id: WinId,
+    asid: u64,
+    live: bool,
+    above: bool,
+    att: u64,
+    comp: u64,
+    hid: u64,
+    bel: u64,
+    /// Attempt / completion rates in TENTHS of a present per second, over the active denominator.
+    arate: u64,
+    crate_: u64,
+    active: u64,
+    parked: u64,
+    gap_min: u64,
+    gap_max: u64,
+}
+
+/// WC-N — forget a slot's accumulators when its row is freed, so a recycled window id cannot inherit
+/// the previous tenant's gap history and report a park that never happened. The counts themselves are
+/// left to the next rollup to drain (they are real presents that really happened, and the line's
+/// `live=no` is what says the window is gone); only `last_ms` — the one field that spans rollups — is
+/// cleared, because it is the only one whose meaning depends on the row still being the same window.
+#[cfg(feature = "witness")]
+fn wcn_forget(id: WinId) {
+    if let Some(s) = wcn_slot(id) {
+        s.last_ms
+            .store(0, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// WC-A — whether the first `[wc-a] composite` witness has been emitted (first composite only; a
@@ -2951,6 +4296,14 @@ const CHROME_TITLE_FG: u32 = 0x00C8_C8D8;
 const CHROME_BORDER_FOCUS: u32 = 0x008C_8CB4;
 const CHROME_TITLE_BG_FOCUS: u32 = 0x003A_3A5A;
 
+/// CLOSE-BOX (P79) — the close box's chrome colours. Red-tinted deliberately: the box is the ONE
+/// piece of chrome a click ACTS on (see [`close_box`]), and it must read as such from across the
+/// bench, so it does not share the title strip's blue family. The focused window's box brightens
+/// with the rest of its chrome so the two never disagree about who has focus; the glyph reuses
+/// [`CHROME_TITLE_FG`] so the X is exactly as legible as the title beside it.
+const CHROME_CLOSE_BG: u32 = 0x0046_262C;
+const CHROME_CLOSE_BG_FOCUS: u32 = 0x00A0_3C46;
+
 /// The outer box `(x, y, w, h)` a window occupies on the panel, chrome included. A compat window
 /// (the `present_surface` shim) has no chrome, so its outer box is exactly its content.
 /// F5 — every product and sum here saturates. The kernel builds with overflow checks off, so a
@@ -2971,31 +4324,50 @@ fn outer_box(r: &Window) -> (usize, usize, usize, usize) {
     }
 }
 
-/// FBCON-DMG — the part of `r`'s outer box a banded present will actually repaint.
+/// CLOSE-BOX (P79, bench: "put a close button in the upper right of the windows to exit") — the
+/// close box's panel rect as `(x, y, side)`, or `None` for a row that has no close box.
 ///
-/// `band` is in SOURCE rows; the conversion to panel rows is `r.y + sy * r.scale`, the same mapping
-/// [`paint_window`] blits the content through, so the rectangle returned here is exactly the one the
-/// pass writes. `None` — every window that has not taken a [`present_rows`] — returns [`outer_box`]
-/// unchanged, which is why every existing caller and every existing window is unaffected.
+/// ### Geometry — one function, two consumers
+/// A [`TITLE_H`]-sided square at the RIGHT end of the title strip, flush against the inner edge of
+/// the border: `x = bx + bw - BORDER - side`, `y = by + BORDER`. Derived from the outer box so the
+/// drawn box and the hit-tested box are the same rect BY CONSTRUCTION — [`paint_window`] draws this
+/// rect and [`close_box_hit`] tests it, and there is deliberately no second copy of the arithmetic
+/// for the two to disagree over.
 ///
-/// The result is intersected with the outer box, so a band cannot extend a window's damage past its
-/// own chrome however wrong the caller's rows are.
-fn damaged_box(r: &Window, band: Option<(usize, usize)>) -> (usize, usize, usize, usize) {
-    let (bx, by, bw, bh) = outer_box(r);
-    let Some((sy0, sy1)) = band else {
-        return (bx, by, bw, bh);
-    };
-    if sy1 <= sy0 {
-        return (bx, by, bw, bh);
+/// ### Who gets one
+/// * **Compat rows: no.** The `present_surface` shim has no chrome at all — there is no strip to
+///   put a box in, and the full-screen app's own click-to-exit already owns its clicks.
+/// * **Owner-0 rows: no.** Kernel furniture (the CLICK-SHELL distinction: shell/desktop rows carry
+///   `owner_asid == 0`, which is also why [`hit_test`] never names them) is not an app the operator
+///   can exit; a close box on the console would be an invitation to kill the shell.
+/// * **A strip too narrow to hold the box plus one title glyph: no.** Degenerate geometry declines
+///   the control rather than drawing an unhittable sliver.
+fn close_box(r: &Window) -> Option<(usize, usize, usize)> {
+    if r.compat || r.owner_asid == 0 {
+        return None;
     }
-    // F5 discipline: saturating throughout, so a nonsense band degrades to a large box the panel
-    // clip bounds rather than to a small one that under-damages.
-    let y0 = r.y.saturating_add(sy0.saturating_mul(r.scale)).max(by);
-    let y1 = r.y.saturating_add(sy1.saturating_mul(r.scale)).min(by.saturating_add(bh));
-    if y1 <= y0 {
-        return (bx, by, bw, 0);
+    let (bx, by, bw, _bh) = outer_box(r);
+    let side = TITLE_H;
+    if bw < 2 * BORDER + 2 * side {
+        return None;
     }
-    (bx, y0, bw, y1 - y0)
+    Some((bx + bw - BORDER - side, by + BORDER, side))
+}
+
+/// CLOSE-BOX — does panel point `(x, y)` land in window `id`'s close box? The router's second
+/// question, asked only AFTER [`hit_test`] has named `id` as the owner of the point — so this is a
+/// rect test against one row, not a scan, and the z-order question is already settled by the time
+/// it runs. `false` for a dead id and for every row [`close_box`] declines.
+pub fn close_box_hit(id: WinId, x: i32, y: i32) -> bool {
+    if x < 0 || y < 0 {
+        return false;
+    }
+    let (px, py) = (x as usize, y as usize);
+    let t = table();
+    match row(&t, id).and_then(close_box) {
+        Some((cx, cy, s)) => px >= cx && px < cx + s && py >= cy && py < cy + s,
+        None => false,
+    }
 }
 
 fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize)) -> bool {
@@ -3014,7 +4386,7 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
 const MAX_DEFER: usize = MAX_WINDOWS;
 
 /// Why a fill could not stage. These mirror `wcg`'s `DECL_*`, and the mirror is not duplication for
-/// its own sake: `wcg` is compiled only under `witness`, while WC-L's decision about what to
+/// its own sake: `wcg` is compiled only for `aarch64 + witness`, while WC-L's decision about what to
 /// do with a fill that cannot stage — defer it or drop it — is a CORRECTNESS decision that every
 /// build makes, witness or not. The reason therefore has to exist outside the witness. The `const`
 /// assertions below tie the two vocabularies together at compile time on the builds that have both,
@@ -3023,7 +4395,7 @@ const DEFER_GEOM: u32 = 1;
 const DEFER_CAP: u32 = 2;
 const DEFER_LOCK: u32 = 3;
 const DEFER_ALLOC: u32 = 4;
-#[cfg(feature = "witness")]
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
 const _: () = assert!(
     DEFER_GEOM == super::wcg::DECL_GEOM
         && DEFER_CAP == super::wcg::DECL_CAP
@@ -3052,7 +4424,7 @@ static DEFER: Mutex<([(usize, usize, usize, usize); MAX_DEFER], usize)> =
 /// case must cost one relaxed load and no lock traffic at all.
 static DEFER_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// WC-L — latch for the deferral fixture in [`stage_fill`]. Witness + aarch64 only (see that block).
+/// WC-L — one-shot latch for the deferral fixture in [`stage_fill`]. Witness builds only.
 #[cfg(all(target_arch = "aarch64", feature = "witness"))]
 static DEFER_FIXTURE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -3106,14 +4478,14 @@ fn defer_erase(x: usize, y: usize, w: usize, h: usize, reason: u32, requeued: bo
                 }
             }
             boxes[best] = union(boxes[best]);
-            #[cfg(feature = "witness")]
+            #[cfg(all(target_arch = "aarch64", feature = "witness"))]
             super::wcg::erase_coalesce();
         }
         DEFER_N.store(*n, core::sync::atomic::Ordering::Relaxed);
     }
-    #[cfg(feature = "witness")]
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
     super::wcg::erase_defer(w, h, reason, requeued);
-    #[cfg(not(feature = "witness"))]
+    #[cfg(not(all(target_arch = "aarch64", feature = "witness")))]
     let _ = (reason, requeued);
 }
 
@@ -3168,19 +4540,47 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
     if n == 0 {
         return false;
     }
-    // The sprite comes off the panel before the first fill byte lands, exactly as `erase` does it,
-    // and the caller's tail puts it back. From here on EVERY return path must report `true`: the
-    // sprite is off the panel whether or not a single box went on to stage successfully.
+    // FLICKER-2 — the sprite bracket is owed only where a fill can actually REACH the sprite.
     //
-    // CURSOR-5 — and this undraw must never land inside an open overlay session (see the placement
-    // note in `composite_inner`: that interleave is the P64 flash). The ordering makes it structurally
-    // impossible for this pass; the probe below catches a future reorder that puts it back, and its
-    // counter is the one line item in `[cursor5]` that reads as a defect rather than as load.
+    // The previous shape took the FULL sprite down before the first fill byte landed, whatever the
+    // queue held — so a deferred erase anywhere on the panel cost a whole-sprite restore→repaint over
+    // whatever window the pointer was resting on, once per drain. Every such restore is also an
+    // opportunity for the colour guard's documented residual (a stale `saved` restored over a live
+    // window's fresh frame), which is exactly the "window under the cursor flickers occasionally"
+    // symptom: the fills were typically nowhere near the pointer, and the sprite paid anyway.
+    //
+    // The undraw's one justification — hand a pixel back before a painter in THIS operation
+    // overwrites it — applies only to sprite pixels inside the boxes about to be filled. So the test
+    // is the same one `composite_inner`'s bracket makes: if no queued box meets the sprite's box, the
+    // sprite is left entirely alone (and `false` is returned — the tail owes it nothing); if one
+    // does, the handback is MASKED to the queued boxes via `undraw_within_nosession`, whose
+    // generation bump is precisely what protects a concurrent core's open overlay session (see
+    // CURSOR-5's interleave analysis on that function). `sprite_box` is a snapshot and can be one
+    // pointer report stale; that degrades to an unnecessary masked handback or to the pre-FLICKER-2
+    // behaviour for one pass, never to a missed one — a sprite that moved INTO a fill box mid-drain
+    // is re-established by the mover's own `repaint`, exactly as it always was under the full undraw
+    // (which had the identical window: the snapshot was simply taken inside `undraw` itself).
+    //
+    // CURSOR-5 — the undraw must still never land inside an open overlay session on THIS core (the
+    // P64 flash). The ordering keeps that structurally impossible; the probe below still catches a
+    // future reorder, on the arm that actually disturbs the sprite.
     #[cfg(feature = "witness")]
-    super::cursor::note_drain_undraw();
-    super::cursor::undraw();
+    F2W_DRAINS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let sprite_hit = super::cursor::sprite_box()
+        .map(|sb| boxes[..n].iter().any(|&b| b.2 != 0 && b.3 != 0 && boxes_overlap(sb, b)))
+        .unwrap_or(false);
+    if sprite_hit {
+        #[cfg(feature = "witness")]
+        {
+            super::cursor::note_drain_undraw();
+            F2W_DRAIN_MASKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        super::cursor::undraw_within_nosession(&boxes[..n]);
+    } else {
+        #[cfg(feature = "witness")]
+        F2W_DRAIN_SKIPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     let info = fb.info();
-    let row_bytes = info.stride * info.bytes_per_pixel;
     let mut painted = false;
     for &(x, y, w, h) in boxes[..n].iter() {
         // Re-clip: a coalesced union is a synthesised box, and the panel geometry it was clipped
@@ -3196,7 +4596,8 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
         let y0 = y.min(info.height);
         let y1 = (y + h).min(info.height);
         if y1 > y0 {
-            fb.flush_range(y0 * row_bytes, (y1 - y0) * row_bytes);
+            // COMPOSITE-2 — the fill's own columns, not full-width scanlines (see `draw_window`).
+            fb.flush_rect(x, y0, w, y1 - y0);
         }
         damage_intersecting(x, y, w, h);
         painted = true;
@@ -3206,9 +4607,12 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
         // back under a departed window; the erase above can only paint `DESKTOP_BG`.
         super::screen::request_full_present();
     }
-    // NOT `painted`. The sprite was undrawn above, so the caller owes it a repaint even if every box
-    // re-deferred and nothing reached the panel.
-    true
+    // FLICKER-2 — the caller owes the sprite a repaint exactly when this drain disturbed it, which
+    // is the `sprite_hit` arm and NOT `painted`: a masked handback whose boxes all re-deferred has
+    // still taken pixels down (MUST-FIX 1's argument, unchanged), while a drain whose fills never met
+    // the sprite has provably touched none of its pixels and must not cost a restore→repaint cycle
+    // over the window under the pointer.
+    sprite_hit
 }
 
 // ---- WC-H: the window back-layer ---------------------------------------------------------------
@@ -3255,9 +4659,9 @@ static STAGE: Mutex<alloc::vec::Vec<u8>> = Mutex::new(alloc::vec::Vec::new());
 
 /// WC-H — whether the one-shot fallback fixture has been spent. See the fixture block in
 /// [`stage_window`]: it forces exactly one non-compat composite onto the direct path so WC-D's
-/// scan-out read-back covers the fallback as well as the staged present. `witness`-gated, so every
-/// shipping artifact is unaffected.
-#[cfg(feature = "witness")]
+/// scan-out read-back covers the fallback as well as the staged present. `witness`-gated and
+/// aarch64-only, so the flashable media are unaffected.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
 static FALLBACK_FIXTURE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -3332,19 +4736,6 @@ static FALLBACK_FIXTURE: core::sync::atomic::AtomicBool =
 /// are never on the panel without it. Returns whether that happened; the direct fallback path never
 /// takes the overlay (it has no back layer to save from), and reports `false` so the caller's tail
 /// falls back to WC-I's repaint.
-///
-/// ### FBCON-DMG — `band`, and what it may and may not skip
-///
-/// `band` is the SOURCE-ROW range this present was declared over (`None` = the whole window, which is
-/// every window that has not taken a [`present_rows`] and therefore every pre-FBCON-DMG caller). It
-/// narrows the STAGED path's row range and nothing else: the box geometry handed to [`paint_window`]
-/// is still the whole box, so the chrome keeps its true position across the seam exactly as a
-/// WC-M-banded present does — this reuses that machinery rather than adding a second kind of band.
-///
-/// The DIRECT fallback ignores it and paints the whole box. That is deliberate and it is the
-/// fail-safe direction: the fallback is the path taken when the back layer is unavailable, it is
-/// already the expensive regime, and a whole-box repaint there can only over-paint, never leave a
-/// stale glyph. The cache clean at the tail follows whichever extent actually ran.
 fn draw_window(
     fb: &super::FrameBuffer,
     r: &Window,
@@ -3352,7 +4743,6 @@ fn draw_window(
     cur: Option<super::cursor::Plan>,
     may_overlay: bool,
     bracketed: bool,
-    band: Option<(usize, usize)>,
 ) -> bool {
     // `stride`/`scale` are divisors below and `surf_len` bounds the reads, so all four are checked
     // here rather than trusted from the row.
@@ -3376,24 +4766,7 @@ fn draw_window(
     // allocator declining), in which case the direct path below runs exactly as it always has.
     let mut overlaid = false;
     let offer = if may_overlay { cur } else { None };
-    // FBCON-DMG — the band, as BOX-RELATIVE rows. `damaged_box` does the source→panel conversion and
-    // the clip to the box; subtracting `by` puts it in the coordinate `stage_window`'s loop counts in.
-    // An empty result means this pass's damage falls entirely outside the panel-clipped box, which is
-    // nothing to draw rather than everything.
-    let (dy0, dy1) = match band {
-        None => (0, bh),
-        Some(_) => {
-            let (_, dby, _, dbh) = damaged_box(r, band);
-            let y0 = dby.max(by).saturating_sub(by);
-            let y1 = (dby.saturating_add(dbh)).min(by + bh).saturating_sub(by);
-            if y1 <= y0 {
-                return false;
-            }
-            (y0, y1)
-        }
-    };
-    let staged = stage_window(fb, r, bx, by, bw, bh, dy0, dy1, pw, ph, focused, offer, &mut overlaid);
-    if !staged {
+    if !stage_window(fb, r, bx, by, bw, bh, pw, ph, focused, offer, &mut overlaid) {
         paint_window(fb, r, 0, 0, bx, by, bw, bh, pw, ph, focused, false);
     }
     // CURSOR-4 — this window has just painted its clipped outer box. If it did NOT compose the
@@ -3409,6 +4782,26 @@ fn draw_window(
         // `cursor::UNCOVER_LOST` for the interleave and for both symptoms it produces.
         if !super::cursor::overlay_uncover(&p, bx, by, bw, bh) {
             super::cursor::note_uncover_lost();
+        }
+    } else if cur.is_none() {
+        // CURSOR-15 — the SESSIONLESS pass owes a concurrent session owner the same duty, cross-
+        // pass. This pass composes through the sprite (`defer_nosession`) and hands nothing back,
+        // so the generation bump that used to retire the owner's session when we disturbed one of
+        // its pixels is gone; if this blit just overwrote a pixel the owner's layer COVERED, its
+        // tail would install a layer save the panel no longer holds and claim a pixel that is now
+        // ours. Clearing the coverage inside our painted box makes its tail settle those pixels
+        // against the finished front instead — CURSOR-4's back-to-front verdict rule, applied
+        // across passes. Gated on the sprite's advisory box: two relaxed atomics, and a one-report-
+        // stale answer degrades to a needless clear (bits the owner would have settled anyway) or
+        // to no clear over a box no live sprite met — never to a missed hazard, since a sprite that
+        // ARRIVED after the publish did so via a draw whose generation bump retires the session on
+        // its own. A contended clear invalidates the session wholesale, exactly as above.
+        if let Some(sb) = super::cursor::live_box_relaxed() {
+            if boxes_overlap(sb, (bx, by, bw, bh))
+                && !super::cursor::overlay_uncover_any(bx, by, bw, bh)
+            {
+                super::cursor::note_uncover_lost();
+            }
         }
     }
     // CURSOR-6 — THE DIRECT MEASUREMENT, and CURSOR-7 — THE REPAIR IT ARMS. This window's pixels are
@@ -3447,20 +4840,34 @@ fn draw_window(
         }
     }
 
-    // Clean the touched rows (superset: whole scanlines of the outer box) for the non-coherent
-    // scan-out — one `DC CVAC` sweep per window, not one per scanline. No-op on coherent targets.
-    // Unchanged by WC-H: staged or direct, the same panel rows were written by the time we get here.
-    // FBCON-DMG: the span follows the extent that actually ran — the band on a staged banded present,
-    // the whole box on the direct fallback (which ignores the band) and on every unbanded present.
-    // Cleaning rows nothing wrote would be harmless; cleaning fewer than were written would not, so
-    // this is derived from `staged` rather than from `band`.
-    let row_bytes = info.stride * info.bytes_per_pixel;
-    let (fy0, fy1) = if staged { (by + dy0, by + dy1) } else { (by, by + bh) };
-    let y0 = fy0.min(info.height);
-    let y1 = fy1.min(info.height);
+    // Clean the touched pixels for the non-coherent scan-out — one `DC CVAC` sweep per window with
+    // one `DSB`, over the BOX's own columns. COMPOSITE-2 narrowed this from full-width scanlines
+    // (`flush_range` over `[y0, y1)`): every write this pass made — chrome, content, staged rows,
+    // `compose_into`'s sprite pixels — lands inside the clipped outer box by construction, so the
+    // box (rounded out to cache lines by the arch sweep) is still a superset of the dirty bytes,
+    // and the margins of a 514-wide box on a 1920-wide panel stop being cleaned for nothing.
+    // No-op on coherent targets. Unchanged by WC-H: staged or direct, the same panel pixels were
+    // written by the time we get here.
+    let y0 = by.min(info.height);
+    let y1 = (by + bh).min(info.height);
+    // COMPOSITE-2 — the cache term and the pass's two denominators. `bytes` is what reached the
+    // panel (the clipped box), `dmg_px` its area; both are the numbers `[comp2]`'s per-byte claims
+    // divide by.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let c2_f0 = {
+        use core::sync::atomic::Ordering::Relaxed;
+        C2_BYTES.fetch_add((bw * bh * info.bytes_per_pixel) as u64, Relaxed);
+        C2_DMG_PX.fetch_add((bw * bh) as u64, Relaxed);
+        crate::arch::aarch64::now_cycles()
+    };
     if y1 > y0 {
-        fb.flush_range(y0 * row_bytes, (y1 - y0) * row_bytes);
+        fb.flush_rect(bx, y0, bw, y1 - y0);
     }
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    C2_CACHE_CYC.fetch_add(
+        crate::arch::aarch64::now_cycles().saturating_sub(c2_f0),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     // CURSOR-3: the cache clean above covers the sprite's pixels for free — they are inside these
     // rows, which is the whole point of composing them into the layer rather than poking them into
     // the front afterwards. Nothing extra is written to the front buffer on this path.
@@ -3520,13 +4927,36 @@ fn paint_window(
     let lbx = bx.saturating_sub(ox);
     // WC-M — signed: a band below the first has the box's top edge above its own row 0.
     let lby = by as isize - oy as isize;
+    // COMPOSITE-2 — the content extent, hoisted above the chrome so the border fill can subtract
+    // it. Identical derivation to the block below the chrome (which keeps its own copy for the
+    // early-return path's clarity): how many source cols/rows land on the panel AND inside the
+    // mapped slot, hence exactly which destination pixels the content loop is GUARANTEED to write.
+    let (c2_cols, c2_rows) = if r.x < pw && r.y < ph {
+        (
+            (pw - r.x).div_ceil(r.scale).min(r.w).min(r.stride / 4),
+            (ph - r.y).div_ceil(r.scale).min(r.h).min(r.surf_len / r.stride),
+        )
+    } else {
+        (0, 0)
+    };
     if !r.compat {
-        // Frame: fill the whole outer box in the border colour, then lay the title strip and the
-        // content over it. The only pixels that survive are the 1-px frame itself.
+        // Frame: fill the outer box in the border colour, then lay the title strip and the content
+        // over it. The only pixels that survive are the 1-px frame itself.
         //
         // WC-H relies on this fill being DENSE over the whole clipped box: it is what guarantees the
         // back layer carries no residue from the window it staged last. Every pixel the present
         // copies was written by this pass.
+        //
+        // COMPOSITE-2 — dense, but no longer DOUBLE. The old fill painted the whole box and the
+        // content loop then rewrote ~97% of it (a 514x526 bench box is 270k px of fill under 262k px
+        // of content), so the biggest single population of the compose was pixels written twice.
+        // The fill is now the box MINUS the content extent — four rects: the title band above it,
+        // the strip below it, and the side borders beside it. The invariant is preserved exactly,
+        // because the subtracted region is only what the content loop provably writes this same
+        // call: both painters clip with the same bounds at the same coordinates (destination
+        // width/height/length), so any subtracted pixel the clip would have denied the content is a
+        // pixel it denies the fill too. A window whose content is short (`cols == 0`/`rows == 0` —
+        // nothing visible or nothing mapped) keeps the full dense fill.
         // FOCUS-HL: the ONLY difference the focused window's chrome carries is these two colours. The
         // geometry is identical either way, so focus never moves a pixel — it just repaints the frame
         // and strip that were already going to be painted, at no extra cost per present.
@@ -3535,7 +4965,27 @@ fn paint_window(
         } else {
             (CHROME_BORDER, CHROME_TITLE_BG)
         };
-        fill_rect_v(dst, lbx, lby, bw, bh, border);
+        if c2_cols > 0 && c2_rows > 0 {
+            let cx0 = r.x.saturating_sub(ox);
+            let cy0 = r.y as isize - oy as isize;
+            let cx1 = cx0 + c2_cols * r.scale;
+            let cy1 = cy0 + (c2_rows * r.scale) as isize;
+            let box_x1 = lbx + bw;
+            let box_y1 = lby + bh as isize;
+            // Above the content (border + title band) and below it (bottom border + any clip gap).
+            fill_rect_v(dst, lbx, lby, bw, (cy0 - lby).max(0) as usize, border);
+            if box_y1 > cy1 {
+                fill_rect_v(dst, lbx, cy1, bw, (box_y1 - cy1) as usize, border);
+            }
+            // Beside it, only over the content's own rows.
+            let mid_h = (cy1 - cy0).max(0) as usize;
+            fill_rect_v(dst, lbx, cy0, cx0.saturating_sub(lbx), mid_h, border);
+            if box_x1 > cx1 {
+                fill_rect_v(dst, cx1, cy0, box_x1 - cx1, mid_h, border);
+            }
+        } else {
+            fill_rect_v(dst, lbx, lby, bw, bh, border);
+        }
         fill_rect_v(
             dst,
             lbx + BORDER,
@@ -3544,12 +4994,41 @@ fn paint_window(
             TITLE_H,
             title_bg,
         );
+        // CLOSE-BOX — the close control, over the strip's right end. The rect comes from
+        // `close_box` (the SAME function the router hit-tests, so what is drawn is what is
+        // clickable), converted to this destination's origin exactly as the strip above was; the
+        // title's width budget below excludes it so a long title truncates BESIDE the box rather
+        // than running under it. Signed-`y` discipline matches `fill_rect_v`/`draw_title`: a
+        // chunked stage's later bands see the box above their row 0 and skip those lines.
+        let close_w = match close_box(r) {
+            Some((cbx, cby, s)) => {
+                let clx = cbx.saturating_sub(ox);
+                let cly = cby as isize - oy as isize;
+                let close_bg = if focused { CHROME_CLOSE_BG_FOCUS } else { CHROME_CLOSE_BG };
+                fill_rect_v(dst, clx, cly, s, s, close_bg);
+                // The X glyph: two 2-px diagonals, inset so the strokes never touch the box edge.
+                let g = 3;
+                let n = s.saturating_sub(2 * g);
+                for i in 0..n {
+                    let dy = cly + (g + i) as isize;
+                    if dy < 0 {
+                        continue;
+                    }
+                    dst.put_pixel(clx + g + i, dy as usize, CHROME_TITLE_FG);
+                    dst.put_pixel(clx + g + i + 1, dy as usize, CHROME_TITLE_FG);
+                    dst.put_pixel(clx + g + (n - 1 - i), dy as usize, CHROME_TITLE_FG);
+                    dst.put_pixel(clx + g + (n - 1 - i) + 1, dy as usize, CHROME_TITLE_FG);
+                }
+                s + 2
+            }
+            None => 0,
+        };
         draw_title(
             dst,
             r,
             lbx + BORDER + 2,
             lby + BORDER as isize + 2,
-            bw.saturating_sub(2 * BORDER + 4),
+            bw.saturating_sub(2 * BORDER + 4 + close_w),
         );
     }
 
@@ -3584,6 +5063,24 @@ fn paint_window(
     // remains byte-for-byte the pre-WC-H path. On the back layer every pad byte is 0 by construction,
     // so the copy reproduces exactly what the per-pixel loop would have left.
     let dup = dup && r.scale > 1 && dbpp != 0 && dinfo.stride == dw;
+    // COMPOSITE-2 — the content upscale's WORD path. The measured wall was here: at 1920x1200 the
+    // per-pixel `put_pixel` compose was ~11 ms of a ~15 ms pass ([comp2] blit_us=12952 against
+    // present_us=896 for the same box), because every destination pixel paid a function call, four
+    // bounds checks, a format match and three byte stores. The hoist is exactly `encode4`'s: decide
+    // the swizzle ONCE per compose, encode each source pixel once, and write its `scale`-wide run
+    // as one clipped span of 4-byte words (64-bit pairs inside). `fill_span4` clips to the
+    // destination's width and mapped length — the same bounds `put_pixel` enforced per pixel — so
+    // the pixel set is identical; the only byte that differs is the pad, written 0 where
+    // `put_pixel` skipped it, which no reader decodes (scan-out ignores it, `read_pixel` reads 3
+    // bytes, and the staged layer's pads are already 0 by construction).
+    let fast = dst.word4()
+        && matches!(
+            dinfo.pixel_format,
+            unaos_boot_info::PixelFormat::Rgb | unaos_boot_info::PixelFormat::Bgr
+        );
+    // In LE memory Bgr stores `b, g, r` — the 0x00RRGGBB word unchanged — while Rgb stores
+    // `r, g, b`, the same word with R and B exchanged. Mirrors `FrameBuffer::encode4` exactly.
+    let swap = matches!(dinfo.pixel_format, unaos_boot_info::PixelFormat::Rgb);
     let surf = r.surf as *const u8;
     for row in 0..rows {
         // WC-M — where this source row's `scale` destination lines start, in the DESTINATION's own
@@ -3608,12 +5105,81 @@ fn paint_window(
         // `dup` composes exactly one line per source row and replicates it; without it every line is
         // written per-pixel. Either way the run starts at the first line this destination can hold.
         let sy_end = if dup { sy_first + 1 } else { r.scale };
+        // COMPOSITE-2 — the SINGLE-LINE row compose, flattened. When the row composes exactly one
+        // destination line (every staged `dup` row, and any `scale == 1` row) the whole line is one
+        // contiguous, clipped, word-aligned run — so the bounds work is done ONCE here and the
+        // column loop degenerates to "encode, store `scale` words, advance". This is where the
+        // remaining compose milliseconds lived after the span writer landed: at 128 source columns
+        // per row, even `fill_span4`'s once-per-span checks were ~half the per-column work. The
+        // span clamps are exactly the writer's: the destination's visible width and its mapped
+        // length, so the pixel set is identical to the general path below.
+        let fastline = if fast && sy_end == sy_first + 1 {
+            let dy = (dy0 + sy_first as isize) as usize;
+            let row_off = (dy * dinfo.stride + cx) * 4;
+            if dy < dh && cx < dw && row_off + 4 <= dst.len() {
+                let span = (cols * r.scale).min(dw - cx).min((dst.len() - row_off) / 4);
+                if span > 0 {
+                    Some((dst.base_addr() + row_off, span))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((line0, span)) = fastline {
+            // SAFETY: `line0 + span * 4 <= dst.base + dst.len()` by the clamp above; `line0` is
+            // 4-aligned (`word4` demands a word-aligned base and every term of `row_off` is a
+            // multiple of 4); the source reads carry `paint_window`'s own bound (`row < surf_len /
+            // stride`, `col < stride / 4`).
+            let mut p = line0 as *mut u32;
+            let mut rem = span;
+            let mut col = 0usize;
+            while rem > 0 && col < cols {
+                let px =
+                    unsafe { core::ptr::read_unaligned(surf.add(row_base + col * 4) as *const u32) }
+                        & 0x00FF_FFFF;
+                let raw = if swap {
+                    ((px & 0xFF) << 16) | (px & 0xFF00) | (px >> 16)
+                } else {
+                    px
+                };
+                let n = r.scale.min(rem);
+                for _ in 0..n {
+                    unsafe {
+                        p.write(raw);
+                        p = p.add(1);
+                    }
+                }
+                rem -= n;
+                col += 1;
+            }
+        } else if fast && sy_end == sy_first + 1 {
+            // The line is wholly clipped (off the destination's height/width/length): the general
+            // path below would have written nothing for it either. Skip straight to replication,
+            // whose own clips decide what, if anything, lands.
+        } else {
         for col in 0..cols {
             // Unaligned-safe read of the ARGB8888 pixel; low 24 bits are RRGGBB (alpha ignored —
             // this arc composites opaquely). In bounds by construction: `row < surf_len / stride`
             // and `col < stride / 4`, so `row_base + col * 4 + 4 <= surf_len`.
             let px = unsafe { core::ptr::read_unaligned(surf.add(row_base + col * 4) as *const u32) }
                 & 0x00FF_FFFF;
+            if fast {
+                let raw = if swap {
+                    ((px & 0xFF) << 16) | (px & 0xFF00) | (px >> 16)
+                } else {
+                    px
+                };
+                for sy in sy_first..sy_end {
+                    // `sy >= sy_first` makes `dy0 + sy` non-negative by construction.
+                    let dy = (dy0 + sy as isize) as usize;
+                    dst.fill_span4(cx + col * r.scale, dy, r.scale, raw);
+                }
+                continue;
+            }
             for sy in sy_first..sy_end {
                 // `sy >= sy_first` makes `dy0 + sy` non-negative by construction.
                 let dy = (dy0 + sy as isize) as usize;
@@ -3621,6 +5187,7 @@ fn paint_window(
                     dst.put_pixel(cx + col * r.scale + sx, dy, px);
                 }
             }
+        }
         }
         if !dup {
             continue;
@@ -3710,16 +5277,6 @@ fn paint_window(
 /// bands, over the box's whole row span. On the non-coherent Pi 4 the bands therefore tend to become
 /// visible together rather than one at a time — a mitigation worth having and NOT a guarantee (a
 /// cache line may be evicted at any point), which is why the seams above are described as real.
-///
-/// ### FBCON-DMG — `dy0`/`dy1`: which of the box's rows this present owes
-///
-/// Box-relative row range, `0..bh` for every present that did not declare a band — which is every
-/// present that existed before FBCON-DMG, and the branch every QEMU-gate window takes. When it IS
-/// narrowed, the banding loop below simply starts and stops there: each band it runs is the same
-/// band, composed the same way and presented by the same bulk row copies, and `paint_window` already
-/// takes the box geometry separately from the destination origin (that is WC-M's whole contract), so
-/// the chrome and the upscale keep their true geometry with nothing new to reason about. A one-line
-/// console change therefore costs one band of a few rows instead of `bh` rows of full-box compose.
 #[allow(clippy::too_many_arguments)]
 fn stage_window(
     fb: &super::FrameBuffer,
@@ -3728,8 +5285,6 @@ fn stage_window(
     by: usize,
     bw: usize,
     bh: usize,
-    dy0: usize,
-    dy1: usize,
     pw: usize,
     ph: usize,
     focused: bool,
@@ -3747,7 +5302,7 @@ fn stage_window(
     // `wcg::stage_decline`.
     macro_rules! decline {
         ($reason:expr) => {{
-            #[cfg(feature = "witness")]
+            #[cfg(all(target_arch = "aarch64", feature = "witness"))]
             super::wcg::stage_decline(r.id, $reason);
             return false;
         }};
@@ -3760,7 +5315,7 @@ fn stage_window(
     //
     // Armed on the composite WC-D is about to verify — the same predicate `composite_inner` tests
     // afterwards — so the fixture and the verification cannot land in different passes.
-    #[cfg(feature = "witness")]
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
     {
         if r.presented && r.id < 32 {
             let bit = 1u32 << r.id;
@@ -3777,19 +5332,13 @@ fn stage_window(
     if bw == 0 || bh == 0 || bpp == 0 {
         decline!(super::wcg::DECL_GEOM);
     }
-    // FBCON-DMG — the row range this present owes, clamped to the box. A caller that hands in a band
-    // outside the box gets the whole box: over-painting is free of consequence, under-painting is not.
-    let (dy0, dy1) = if dy1 > dy0 && dy1 <= bh { (dy0, dy1) } else { (0, bh) };
-    let span = dy1 - dy0;
     // `bw <= pw` and `bh <= ph` (both clipped by the caller), so neither product can wrap.
     let row_bytes = bw * bpp;
     // WC-M — the cap sizes a BAND, not the present. `chunk_rows` is how many whole rows of this box
     // fit under it; `bh` of them when the box fits outright, which is the pre-WC-M allocation and the
     // pre-WC-M single-pass present. Zero means one ROW does not fit — the only cap decline left, and
     // unreachable at any panel width this kernel can address.
-    // FBCON-DMG: `span`, not `bh` — the buffer only ever has to hold the rows this present writes,
-    // so a banded present of a box that would have needed several WC-M bands takes ONE.
-    let chunk_rows = if row_bytes == 0 { 0 } else { (MAX_STAGE_BYTES / row_bytes).min(span) };
+    let chunk_rows = if row_bytes == 0 { 0 } else { (MAX_STAGE_BYTES / row_bytes).min(bh) };
     if chunk_rows == 0 {
         decline!(super::wcg::DECL_CAP);
     }
@@ -3813,20 +5362,17 @@ fn stage_window(
     // this window's compose, and all of its panel-facing copy. `stage_note` takes them as
     // `(t_end, t0, t1)` differences, so a zero base and two running totals feed it unchanged — no
     // witness signature moves for this arc, which is what lets the x86 tree take this diff as-is.
-    #[cfg(feature = "witness")]
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
     let (mut compose_cyc, mut present_cyc) = (0u64, 0u64);
 
     let fb_row = info.stride * bpp;
     // WC-M — one band per turn. `band` is the box-relative row the buffer currently holds.
-    // FBCON-DMG — it starts at the damaged range's first row and stops at its last, instead of
-    // walking the whole box. `dy0 == 0 && dy1 == bh` is the unbanded present and is the pre-FBCON-DMG
-    // loop verbatim.
-    let mut band = dy0;
-    while band < dy1 {
-        let rows = chunk_rows.min(dy1 - band);
+    let mut band = 0usize;
+    while band < bh {
+        let rows = chunk_rows.min(bh - band);
 
-        #[cfg(feature = "witness")]
-        let b0 = crate::arch::now_cycles();
+        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        let b0 = crate::arch::aarch64::now_cycles();
 
         // The back layer: same pixel format and bytes/pixel as the panel (so the composed bytes ARE
         // the panel's bytes and the present is a straight copy), but its own stride — the box width,
@@ -3864,14 +5410,8 @@ fn stage_window(
         // no part of CURSOR-3's provenance argument covers that. A sprite straddling a seam is
         // therefore taken by nobody, `overlaid` stays false, and the caller's WC-I repaint tail puts
         // it back from the finished front — the same fallback every other decline already uses.
-        //
-        // FBCON-DMG leaves this contract exactly as it found it. The offer is still "this band holds
-        // the sprite's box outright"; the only thing that changed is which rows the band covers, and a
-        // band that does not contain the sprite declines here as it always did. `chunk_rows >= span`
-        // (not `>= bh`) is the same "single band" test restated against the rows this present owes —
-        // a banded present that runs in one turn is as much a single band as an unbanded one is.
         if let Some(plan) = cur {
-            let whole = chunk_rows >= span
+            let whole = chunk_rows >= bh
                 || (plan.by >= by + band && plan.by + plan.bh <= by + band + rows);
             if whole {
                 let c = super::cursor::compose_into(&layer, bx, by + band, plan);
@@ -3881,8 +5421,8 @@ fn stage_window(
             }
         }
 
-        #[cfg(feature = "witness")]
-        let b1 = crate::arch::now_cycles();
+        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        let b1 = crate::arch::aarch64::now_cycles();
 
         // Present: one bulk copy per row. This is the whole of what the scan-out can catch
         // mid-flight, and it is the same primitive and the same shape as
@@ -3892,28 +5432,23 @@ fn stage_window(
             fb.blit((by + band + y) * fb_row + bx * bpp, &stage[src..src + row_bytes]);
         }
 
-        #[cfg(feature = "witness")]
+        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
         {
             compose_cyc += b1.saturating_sub(b0);
-            present_cyc += crate::arch::now_cycles().saturating_sub(b1);
+            present_cyc += crate::arch::aarch64::now_cycles().saturating_sub(b1);
         }
         band += rows;
     }
 
-    // `bytes` is what REACHED THE PANEL, not what the buffer held — on a WC-M-banded present that is
-    // the whole box, and it is the number that says banding happened at all (a `-> BUFFERED` line
-    // whose `bytes=` exceeds `MAX_STAGE_BYTES` could not have been staged before WC-M).
-    //
-    // FBCON-DMG — `span`, not `bh`, and for exactly the same reason: the rows this present copied are
-    // the rows it owed. `[wc-h] box=WxH bytes=N` therefore keeps meaning "what this present put on
-    // the glass", so a damage-limited console line reports its true cost instead of the cost of the
-    // box it lives in. Unbanded presents have `span == bh` and their `[wc-h]` lines do not move.
-    #[cfg(feature = "witness")]
+    // `bytes` is the WHOLE box, not the buffer: it is what reached the panel, and on a banded present
+    // it is the number that says banding happened at all (a `-> BUFFERED` line whose `bytes=` exceeds
+    // `MAX_STAGE_BYTES` could not have been staged before this arc).
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
     super::wcg::stage_note(
         r.id,
         bw,
-        span,
-        row_bytes * span,
+        bh,
+        row_bytes * bh,
         compose_cyc + present_cyc,
         0,
         compose_cyc,
@@ -3980,7 +5515,7 @@ fn stage_fill(
             // Named unconditionally: the reason is part of the CORRECTNESS decision (drop, not
             // defer) on every build, and only its reporting is witness-gated.
             let _reason: u32 = $reason;
-            #[cfg(feature = "witness")]
+            #[cfg(all(target_arch = "aarch64", feature = "witness"))]
             super::wcg::erase_drop(w, h, _reason);
             return false;
         }};
@@ -4034,8 +5569,8 @@ fn stage_fill(
         stage.resize(row_bytes, 0);
     }
 
-    #[cfg(feature = "witness")]
-    let t0 = crate::arch::now_cycles();
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let t0 = crate::arch::aarch64::now_cycles();
 
     // Compose: one row, in the panel's own pixel format so the present is a straight copy.
     for b in stage[..row_bytes].iter_mut() {
@@ -4055,8 +5590,8 @@ fn stage_fill(
     );
     layer.fill_rect(0, 0, w, 1, color);
 
-    #[cfg(feature = "witness")]
-    let t1 = crate::arch::now_cycles();
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let t1 = crate::arch::aarch64::now_cycles();
 
     // Present: one bulk copy per row. ROW-CONTIGUITY is checked here rather than asserted in a
     // comment — each destination run must be exactly `row_bytes` long, must fit inside its scanline
@@ -4074,13 +5609,13 @@ fn stage_fill(
         fb.blit(off, &stage[..row_bytes]);
     }
 
-    #[cfg(feature = "witness")]
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
     super::wcg::erase_note(
         w,
         h,
         row_bytes,
         contig,
-        crate::arch::now_cycles(),
+        crate::arch::aarch64::now_cycles(),
         t0,
         t1,
         info.height,
@@ -4235,6 +5770,16 @@ pub fn focusvis_selftest() {
         got_stack, stack_ok, got_raise, raise_ok, got_shell, shell_ok, got_reraise, reraise_ok,
         if ok { "PASS" } else { "FAIL" }
     );
+
+    // VUGMIN-C — one more raise, purely to EXERCISE the transition the four legs above cannot reach.
+    // Every focus change in this fixture so far arrives from the shell (`prev == 0`), so every
+    // `[vugmin] focus` line it prints says `hid=none`. This one goes window→window with both owners
+    // live, which is the shape the arc is about, and puts `hid=asid=<b>` on the headless wire. It
+    // asserts no pixel — the panel claim is the four legs' — and it is deliberately AFTER the verdict
+    // line so it can perturb none of them. Both windows are closed on the next two lines, so the extra
+    // raise leaves nothing behind. (`vugmin_publish` no-ops for these synthetic ASIDs: 0xF0A/0xF0B are
+    // outside the 64-wide hidden mask, so this moves no real process's bit, only the witness.)
+    focus_changed(ASID_A);
 
     close(wa);
     close(wb);
@@ -4552,7 +6097,7 @@ fn retile_selftest() {
 /// The outer (chrome-inclusive) panel box of `id`, or `None` if `id` names no live window.
 #[cfg(feature = "witness")]
 fn info_box(id: WinId) -> Option<(usize, usize, usize, usize)> {
-    let t = TABLE.lock();
+    let t = table();
     row(&t, id).map(outer_box)
 }
 
@@ -4612,7 +6157,7 @@ fn create_inner(
             scale,
         ))
     });
-    let mut t = TABLE.lock();
+    let mut t = table();
     let slot = match t.rows.iter().position(|r| !r.used) {
         Some(s) => s,
         None => return WIN_NONE,
@@ -4630,7 +6175,7 @@ fn create_inner(
     row.surf = surf;
     row.surf_len = surf_len;
     row.z = z;
-    row.damage_all();
+    row.damaged = true;
     row.compat = compat;
     row.title_len = title.len().min(MAX_TITLE);
     row.title[..row.title_len].copy_from_slice(&title[..row.title_len]);
@@ -4772,7 +6317,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         .saturating_sub(crate::ui_status::chrome_h(ph))
         .max(1);
 
-    let mut t = TABLE.lock();
+    let mut t = table();
     let mut cx = GAP;
     let mut cy = GAP + TITLE_H + BORDER;
     let mut row_h = 0usize;
@@ -4808,7 +6353,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         // each other is a legibility problem the operator can fix by closing one; a window over the
         // instrument panel silently breaks the one surface that is supposed to be always readable.
         r.y = cy.min(usable_h.saturating_sub(bh));
-        r.damage_all();
+        r.damaged = true;
         if outer_box(r) != before && before.2 != 0 && before.3 != 0 {
             vacated[nv] = before;
             nv += 1;
@@ -4902,11 +6447,388 @@ static HT_SURF: [u32; 64] = [0x0020_C080; 64];
 ///    and the same inside point hits nothing. Visibility is a POSITION in the shared z-order, and what
 ///    you can click has to be what you can see: clicking a console that covers a window must reach the
 ///    console. This is [`above_shell`] holding on the input side as well as the drawing side.
+/// 6. **shell** (CLICK-SHELL, P71) — the ROUTER leg, and the only one that leaves this file. With A
+///    raised and focused, a press that hit-tests to nothing must (a) be consumed and (b) hand focus to
+///    the SHELL. Legs 1-5 assert the address lookup; this one asserts the POLICY built on it, because
+///    P71's finding was not a bad hit-test — `hit_test` answered `None` correctly and the router threw
+///    the answer away. Driven through the real `wc_click_route` (a synthetic `Button` press edge, then
+///    a release edge to leave the router's mask tracker as it was found), against the REAL cursor
+///    position, so it exercises the shipped path rather than a re-implementation of it. The leg reports
+///    SKIP rather than FAIL when the cursor happens to sit over a live window (nothing has moved the
+///    pointer on a headless gate, so it is parked at panel centre — but that is a fact about the
+///    fixture set, not something this witness may assume), and DORMANT on builds where the router does
+///    not exist (x86_64 and the hosted aarch64 build).
+/// 7. **bare** (CLICK-SHELL r2, P72) — leg 6's press again, from a focus that owns NO window and no
+///    compat row. Leg 6 asserts the policy for a WINDOWED focus, which is the case CLICK-SHELL got
+///    right; leg 7 asserts it for the focus that owns nothing on the panel, which is the case it got
+///    wrong and which this suite reported PASS on for the whole time the bench could not click into
+///    the shell. See [`clickshell_windowless_leg`].
+/// 8. **hit / deliver / wake** (CLICK-PLAIN, P75) — the HIT arm's policy, which legs 6 and 7 leave
+///    entirely unasserted: a press on an UNFOCUSED window must move focus and then reach that window's
+///    ring WHOLE (press and release both), the next press on it must be delivered too, and neither may
+///    cost — or precede — the VUGPAUSE-2r2 restore chain. Three fields rather than one because they
+///    fail in three different directions, and the last one is what pins the ORDER the fix depends on.
+///    See [`clickplain_leg`].
+/// 9. **close** (CLOSE-BOX, P79) — the one ACTION click in the grammar: a press in a window's close
+///    box is consumed by the router and the row goes away. See [`closebox_leg`].
+/// 10. **closereal** (CLOSE-FIX, P82) — the same close arm against a row the battery created through
+///    the ordinary path (`wa`), asserting the named row is the reaped row and the settle read-back
+///    is the `noproc-selftest` discriminator. See [`closebox_real_leg`].
 ///
 /// Self-cleaning on the FOCUS-VIS pattern: both windows are closed, `SHELL_Z` and `FOCUS_ASID` are
 /// restored (this calls `focus_changed` with SYNTHETIC asids, which must not be left naming an address
-/// space that does not exist), and the live set is repainted. `witness`-gated, one-shot, and ordered
-/// after every one-shot per-window latch so it cannot burn one with its own rows.
+/// space that does not exist), and the live set is repainted — and, since CLOSE-FIX, a teardown
+/// witness guard sweeps the table for any row still owned by a battery ASID and reports a reap as a
+/// FAIL-shaped line (a silent fixture leak polluted a whole bench boot's hit-tests in P82).
+/// `witness`-gated, one-shot, and ordered after every one-shot per-window latch so it cannot burn
+/// one with its own rows.
+/// CLICK-SHELL (P71) — leg 6 of [`hittest_selftest`], factored out because it is the one leg that
+/// leaves this file: it drives the ARCH router (`wc_click_route`), which exists only on the baremetal
+/// aarch64 build, through the same `#[cfg]` seam [`vugmin_publish`] already uses for `set_hidden`.
+///
+/// The fixture, in order: raise `asid` back above the shell (leg 5 buried everything) and give it
+/// focus; read the REAL cursor; bail out (`None` — asserted nothing) if the pointer happens to be over
+/// a live window, since then the press is a HIT and this leg has no fixture; otherwise drive one PRESS
+/// edge and check the three things P71 asks for — the press is CONSUMED, focus is now the SHELL
+/// (`el0_input_active() == 0`), and the previously focused window is BELOW the shell, which is what
+/// makes the shell focus the same state VUGMIN idles the fleet from.
+///
+/// One RELEASE edge follows, so the router's press/release tracker is left exactly as it was found: a
+/// witness that left a phantom press outstanding would make the operator's next real release drop.
+#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal"))]
+fn clickshell_leg(asid: u64, ix: i32, iy: i32, w: i32, h: i32) -> Option<bool> {
+    use crate::arch::aarch64::syscall as sc;
+    focus_changed(asid);
+    let (cx, cy) = crate::pal::cursor::pos(w, h);
+    if hit_test(cx, cy).is_some() {
+        return None; // pointer parked over a window: that is the HIT arm, not the desktop arm
+    }
+    sc::el0_input_set_active(asid);
+    let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
+    let refocused = sc::el0_input_active() == 0;
+    let buried = hit_test(ix, iy).is_none();
+    let _ = sc::wc_click_route(crate::pal::Event::Button(0));
+    Some(consumed && refocused && buried)
+}
+
+/// CLICK-SHELL, DORMANT half: no arch router in this build, so leg 6 asserts nothing.
+#[cfg(all(feature = "witness", not(all(target_arch = "aarch64", feature = "baremetal"))))]
+fn clickshell_leg(asid: u64, _ix: i32, _iy: i32, _w: i32, _h: i32) -> Option<bool> {
+    focus_changed(asid);
+    None
+}
+
+/// CLICK-SHELL r2 (P72) — leg 7 of [`hittest_selftest`], and the leg that would have caught the metal
+/// defect leg 6 slept through.
+///
+/// Leg 6 drives the miss arm with a focus that owns a window, which is the case CLICK-SHELL got right;
+/// it therefore passed on the gate for the whole time the bench could not click into the shell. The
+/// state that failed is the one leg 6 has no fixture for: a focus that owns **no window and no compat
+/// row** — a `run` program before its first present, a batch program that never presents, a windowed
+/// app that closed its last window. On the shipped predicate
+/// (`click_owner_is_windowed`) that focus took the DELIVER arm, so the press went to an app that owns
+/// nothing on the panel and the shell was reachable only by cycling the entire TAB ring.
+///
+/// `asid` is a synthetic owner of nothing. The fixture is `focus_changed(asid)` (which raises no
+/// window — it only publishes `FOCUS_ASID`) plus `el0_input_set_active(asid)`, so BOTH halves of the
+/// focus primitive name a windowless owner; the leg then drives one PRESS edge and requires the press
+/// to be CONSUMED and both halves to have moved to the shell (`el0_input_active() == 0` **and**
+/// `FOCUS_ASID == 0`), which is precisely the state a TAB-to-shell leaves. Checking `FOCUS_ASID` as
+/// well as the router's active ASID is the point: "focus moved" means the routing half and the VISIBLE
+/// half both moved, and a fix that did only the first would read as focused and look unfocused.
+///
+/// SKIPs (`None`) when a compat row is live, since that is the one state whose press is legitimately
+/// delivered rather than consumed — the exemption this leg must not assert against. A release edge
+/// follows for leg 6's reason: the router's press tracker is left as it was found.
+#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal"))]
+fn clickshell_windowless_leg(asid: u64) -> Option<bool> {
+    use crate::arch::aarch64::syscall as sc;
+    if compat_live() {
+        return None; // a full-screen app owns the panel: the deliver arm, not this leg's fixture
+    }
+    focus_changed(asid); // no window to raise — this only names the windowless owner
+    sc::el0_input_set_active(asid);
+    let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
+    let refocused = sc::el0_input_active() == 0;
+    let visible = FOCUS_ASID.load(core::sync::atomic::Ordering::Acquire) == 0;
+    let _ = sc::wc_click_route(crate::pal::Event::Button(0));
+    Some(consumed && refocused && visible)
+}
+
+/// CLICK-SHELL r2, DORMANT half: no arch router in this build, so leg 7 asserts nothing.
+#[cfg(all(feature = "witness", not(all(target_arch = "aarch64", feature = "baremetal"))))]
+fn clickshell_windowless_leg(_asid: u64) -> Option<bool> {
+    None
+}
+
+/// CLICK-PLAIN (P75) — leg 8 of [`hittest_selftest`]: **a press goes to the window under the cursor,
+/// and if that window was not focused, the focus goes there FIRST.**
+///
+/// Legs 6 and 7 assert the MISS arm's policy. This one asserts the HIT arm's. It was written for
+/// CLICK-SWALLOW, which consumed the focus-changing press so an app could never see a click it had not
+/// owned the focus for; P75 retired that rule (the withheld press made a click's visible effect a
+/// function of invisible state) and the leg's assertions invert with it. The three checks are the three
+/// the router has to get right at once, and the ORDER between the first and third is the whole content:
+///  * **hit** — a press on an UNFOCUSED window moves focus AND is delivered WHOLE to the raised owner's
+///    ring: depth 1 after the press, depth 2 after the release. The ring is the only honest place to ask
+///    that question ([`el0_input_depth`]); the router's return value says what the ROUTER decided, not
+///    what the app got, and the two are what the whole seam sits between. Checking the release as well
+///    as the press is what pins [`CLICK_PRESS_TARGET`] to the RAISED owner rather than the sentinel — a
+///    press delivered with a dropped release is the half-click that tracker exists to prevent, in the
+///    other direction.
+///  * **deliver** — the very next press, now on the SAME (and now focused) window, is delivered too:
+///    depth 3. The refocusing click must cost the operator nothing and must not consume the next one.
+///  * **wake** — the delivered press still runs the VUGPAUSE-2r2 restore chain, and runs it BEFORE the
+///    push. A router that queued the press first and moved focus after would pass the first two checks
+///    and strand a PARKED vug: the click would land in the ring of the app that was focused a moment
+///    ago. `el0_input_wake_edges` counts the NAMED edges the seam was asked to run, so this reads 2
+///    (focus arrival, then unhide) regardless of whether anything was parked — which matters, since on
+///    a headless gate nothing ever is.
+///
+/// Drives [`crate::arch::aarch64::syscall::el0_input_enqueue`] rather than `wc_click_route`, because
+/// the claim is about DELIVERY and the push lives on the far side of the router. The window is placed
+/// UNDER the real cursor (the router hit-tests the live pointer, so the fixture moves the window, not
+/// the pointer); `None` = not asserted, when the pointer sits somewhere this leg cannot build that
+/// fixture, when a compat row owns the panel, or when `owner` is not free to borrow.
+///
+/// Self-cleaning: the window is closed, the owner's ring is reset (via a focus arrival, the one
+/// primitive that clears it) and focus is dropped to the shell, so the slot is left exactly as found.
+#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal"))]
+fn clickplain_leg(owner: u64, other: u64, surf: usize, len: usize) -> Option<(bool, bool, bool)> {
+    use crate::arch::aarch64::syscall as sc;
+    use crate::pal::Event::Button;
+    if compat_live() {
+        return None; // the deliver-as-before exemption owns the panel: not this leg's fixture
+    }
+    // `owner` is a REAL private-slot ASID (it must be, or it would have no ring at all), so unlike
+    // ASID_A/B it could in principle name a LIVE app. Borrow it only if nothing is using it: it holds
+    // no input focus and owns no window in the table.
+    if sc::el0_input_active() == owner {
+        return None;
+    }
+    let mut ring = [0u64; MAX_WINDOWS];
+    let n = focus_ring(&mut ring);
+    if ring[..n].contains(&owner) {
+        return None;
+    }
+
+    let (pw, ph) = {
+        let info = super::WRITER.lock().info();
+        (info.width as i32, info.height as i32)
+    };
+    let (cx, cy) = crate::pal::cursor::pos(pw, ph);
+    // Room for the chrome above/left of the content origin and for the box below/right of it.
+    if cx < 64 || cy < 64 || cx + 64 >= pw || cy + 64 >= ph {
+        return None;
+    }
+
+    let w = create(owner, surf, len, 8, 8, 32, b"ht-s");
+    if w == WIN_NONE {
+        return None;
+    }
+    // Content origin two pixels up-left of the pointer, so the pointer is inside the content area —
+    // the same relation leg 1's probe point has to `ox`/`oy`, built the other way round.
+    move_to(w, (cx - 2) as usize, (cy - 2) as usize);
+    focus_changed(owner); // raise it above the fixture rows leg 5 left buried and leg 6 re-raised
+    if hit_test(cx, cy).map(|(_, a, _)| a) != Some(owner) {
+        close(w); // the pointer does not address this window after all: no fixture, assert nothing
+        focus_changed(0);
+        return None;
+    }
+
+    // --- hit: an UNFOCUSED hit. A focus arrival resets the ring, so `owner` starts empty; focus then
+    // moves to `other` (a synthetic ASID outside the slot range — it clears no ring and runs no wake
+    // edge of its own, so the baseline below is clean).
+    sc::el0_input_set_active(owner);
+    sc::el0_input_set_active(other);
+    let edges0 = sc::el0_input_wake_edges();
+    let queued = sc::el0_input_enqueue(Button(1));
+    let depth_press = sc::el0_input_depth(owner);
+    let refocused = sc::el0_input_active() == owner;
+    let edges1 = sc::el0_input_wake_edges();
+    let _ = sc::el0_input_enqueue(Button(0));
+    let depth_release = sc::el0_input_depth(owner);
+    let hit = queued && refocused && depth_press == 1 && depth_release == 2;
+    let woke = edges1.wrapping_sub(edges0) >= 2;
+
+    // --- deliver: the SAME window, now focused (the press above left focus here). Ordinary app input,
+    // and it must stack on the pair already in the ring rather than replace it.
+    let queued2 = sc::el0_input_enqueue(Button(1));
+    let delivered = queued2 && sc::el0_input_depth(owner) == 3;
+    let _ = sc::el0_input_enqueue(Button(0));
+
+    close(w);
+    sc::el0_input_set_active(owner); // the one primitive that resets a ring — leave the slot clean
+    sc::el0_input_set_active(0);
+    focus_changed(0);
+    Some((hit, delivered, woke))
+}
+
+/// CLICK-PLAIN, DORMANT half: no arch router (and no EL0 input rings) in this build, so leg 8
+/// asserts nothing.
+#[cfg(all(feature = "witness", not(all(target_arch = "aarch64", feature = "baremetal"))))]
+fn clickplain_leg(_owner: u64, _other: u64, _surf: usize, _len: usize) -> Option<(bool, bool, bool)> {
+    None
+}
+
+/// CLOSE-BOX (P79) — leg 9 of [`hittest_selftest`]: **a press in a window's close box routes to
+/// CLOSE, and the row goes away.**
+///
+/// Legs 6-8 assert where an ordinary press GOES. This one asserts the single exception to
+/// CLICK-SELECT's "a click only selects" grammar: the close box is window FURNITURE, and a press
+/// that lands in it is an action — the router consumes it, closes the owner's windows, and kills
+/// the owner. The leg drives the shipped router (`wc_click_route`, real cursor position — the
+/// CLICK-PLAIN fixture discipline: move the window under the pointer, never the pointer), with the
+/// window placed so its CLOSE BOX contains the cursor rather than its content area.
+///
+/// `owner` is synthetic and outside the private-slot range, deliberately: the router's kill arm
+/// skips an ASID with no process behind it, so the leg asserts the two things the WINDOW layer owes
+/// — the press is CONSUMED (it neither selects nor reaches any ring) and the row is GONE
+/// (`info(w)` empty) — without arming a real kill on the gate. The kill half of the arm is the
+/// SKILL-1 primitive `bg`/`run` already gate elsewhere; re-proving it here would add a process
+/// launch to a window-layer witness.
+///
+/// `None` = not asserted: a compat row owns the panel, the pointer parks where the fixture cannot
+/// straddle it with a close box (too near an edge for the chrome), the table is full, or the
+/// placement lands under some other window. A release edge follows the press either way, leaving
+/// the router's mask tracker as it was found (the release follows a DROPPED press, so it is
+/// consumed too — asserting nothing, restoring everything).
+#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal"))]
+fn closebox_leg(owner: u64, surf: usize, len: usize) -> Option<bool> {
+    use crate::arch::aarch64::syscall as sc;
+    if compat_live() {
+        return None; // the deliver-as-before exemption owns the panel: not this leg's fixture
+    }
+    let (pw, ph) = {
+        let info = super::WRITER.lock().info();
+        (info.width as i32, info.height as i32)
+    };
+    let (cx, cy) = crate::pal::cursor::pos(pw, ph);
+    // Room for a whole window left/below the pointer and its chrome above it.
+    if cx < 96 || cy < 96 || cx + 96 >= pw || cy + 96 >= ph {
+        return None;
+    }
+    let w = create(owner, surf, len, 8, 8, 32, b"ht-x");
+    if w == WIN_NONE {
+        return None;
+    }
+    // Place the CONTENT origin so the close box contains the pointer. From `close_box`'s own
+    // arithmetic (BORDER=1 cancels): the box spans x in [r.x + w*scale - side, r.x + w*scale) and
+    // y in [r.y - TITLE_H, r.y - TITLE_H + side); aim the pointer at the box's centre. The scale
+    // is read back from the row `create` actually minted, not re-derived.
+    let side = TITLE_H as i32;
+    let ws = match info(w) {
+        Some(wi) => (wi.w * wi.scale) as i32,
+        None => 0,
+    };
+    let (x, y) = (cx + side / 2 - ws, cy + TITLE_H as i32 - side / 2);
+    if ws == 0 || x < 0 || y < (TITLE_H + BORDER) as i32 {
+        close(w);
+        return None;
+    }
+    move_to(w, x as usize, y as usize);
+    focus_changed(owner); // raise it above the fixture rows the earlier legs left behind
+    sc::el0_input_set_active(owner); // the closed owner also holds focus: the arm must hand it back
+    // Fixture validity: the pointer must address THIS window, in its CLOSE BOX.
+    if hit_test(cx, cy).map(|(i, a, _)| (i, a)) != Some((w, owner)) || !close_box_hit(w, cx, cy) {
+        close(w);
+        sc::el0_input_set_active(0);
+        focus_changed(0);
+        return None;
+    }
+    let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
+    let gone = info(w).is_none();
+    let refocused = sc::el0_input_active() == 0;
+    let _ = sc::wc_click_route(crate::pal::Event::Button(0));
+    // The router's close arm already dropped focus to the shell (asserted above); nothing to clean
+    // beyond making sure a FAILED close does not leak the row.
+    if !gone {
+        close(w);
+        sc::el0_input_set_active(0);
+        focus_changed(0);
+    }
+    Some(consumed && gone && refocused)
+}
+
+/// CLOSE-BOX, DORMANT half: no arch router in this build, so leg 9 asserts nothing.
+#[cfg(all(feature = "witness", not(all(target_arch = "aarch64", feature = "baremetal"))))]
+fn closebox_leg(_owner: u64, _surf: usize, _len: usize) -> Option<bool> {
+    None
+}
+
+/// CLOSE-FIX (P82) — leg 10 of [`hittest_selftest`]: **a routed close click on a row the battery
+/// created through the ordinary path reaps THAT row, and the settle tag is the selftest tag.**
+///
+/// Leg 9 proves the close arm's mechanics on a probe row it builds for the purpose. What it cannot
+/// prove — and what P82 fell through — is that a close click resolves to the row the operator is
+/// actually looking at and that the wire's settle tag is honest about who (if anyone) was killed:
+/// the leg EXPECTED `noproc`, so a boot in which every real close also settled `noproc` read as
+/// green. This leg closes `wa` — a window the battery minted at the top of the run exactly as an
+/// app would — through the shipped router, and asserts three things leg 9 does not:
+///  * the ROW THE LEG NAMED is the one reaped (`info(wa)` empty afterwards — a router that
+///    threaded a constant, or resolved some other row first, fails here);
+///  * the settle READ-BACK ([`crate::arch::aarch64::syscall::wc_close_last_settle`]) is
+///    `noproc-selftest` and nothing else — `wa`'s owner is synthetic, so any OTHER tag means the
+///    close acted on a process it had no business finding, and plain `noproc` means the
+///    discriminator regressed;
+///  * the press was consumed and focus fell to the shell, as in leg 9.
+///
+/// Fixture discipline is leg 9's exactly (move the window's close box under the real pointer, never
+/// the pointer; validate with the same `hit_test` + `close_box_hit` pair the router uses; `None`
+/// when the fixture cannot be built). On the success path the row is gone through the router — the
+/// battery's own `close(wa)` tail then no-ops harmlessly; on every bail-out `wa` is left exactly
+/// where the battery can still close it.
+#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal"))]
+fn closebox_real_leg(w: WinId, owner: u64) -> Option<bool> {
+    use crate::arch::aarch64::syscall as sc;
+    if compat_live() {
+        return None; // the deliver-as-before exemption owns the panel: not this leg's fixture
+    }
+    let (pw, ph) = {
+        let info = super::WRITER.lock().info();
+        (info.width as i32, info.height as i32)
+    };
+    let (cx, cy) = crate::pal::cursor::pos(pw, ph);
+    if cx < 96 || cy < 96 || cx + 96 >= pw || cy + 96 >= ph {
+        return None;
+    }
+    let side = TITLE_H as i32;
+    let ws = match info(w) {
+        Some(wi) => (wi.w * wi.scale) as i32,
+        None => 0, // `wa` already gone (leg 9's retry fell through onto it): no fixture
+    };
+    let (x, y) = (cx + side / 2 - ws, cy + TITLE_H as i32 - side / 2);
+    if ws == 0 || x < 0 || y < (TITLE_H + BORDER) as i32 {
+        return None; // no row was minted here: `wa` stays for the battery's own close
+    }
+    move_to(w, x as usize, y as usize);
+    focus_changed(owner);
+    sc::el0_input_set_active(owner);
+    if hit_test(cx, cy).map(|(i, a, _)| (i, a)) != Some((w, owner)) || !close_box_hit(w, cx, cy) {
+        sc::el0_input_set_active(0);
+        focus_changed(0);
+        return None; // fixture invalid; the battery's `close(wa)` still owns the row
+    }
+    let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
+    let gone = info(w).is_none();
+    let settle_ok = sc::wc_close_last_settle() == sc::CLOSE_SETTLE_NOPROC_SELFTEST;
+    let refocused = sc::el0_input_active() == 0;
+    let _ = sc::wc_click_route(crate::pal::Event::Button(0));
+    if !gone {
+        // A FAILED close must not change who owns the cleanup: hand focus back and leave the row
+        // to the battery's tail.
+        sc::el0_input_set_active(0);
+        focus_changed(0);
+    }
+    Some(consumed && gone && settle_ok && refocused)
+}
+
+/// CLOSE-FIX, DORMANT half: no arch router in this build, so leg 10 asserts nothing.
+#[cfg(all(feature = "witness", not(all(target_arch = "aarch64", feature = "baremetal"))))]
+fn closebox_real_leg(_w: WinId, _owner: u64) -> Option<bool> {
+    None
+}
+
 #[cfg(feature = "witness")]
 pub fn hittest_selftest() {
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -4931,6 +6853,17 @@ pub fn hittest_selftest() {
 
     const ASID_A: u64 = 0xC0A;
     const ASID_B: u64 = 0xC0B;
+    /// CLICK-SHELL r2 leg 7's owner: synthetic, and deliberately never passed to `create` — the leg
+    /// needs a focus that owns NOTHING.
+    const ASID_C: u64 = 0xC0C;
+    /// CLICK-PLAIN leg 8's owner, and the one ASID here that is NOT synthetic: the leg asserts what
+    /// an app's input RING received, and rings exist only for private slots (`1..=USER_SLOTS`). The
+    /// HIGHEST slot, because slots are handed out from the bottom, so it is the last one a live app
+    /// would be holding — and the leg checks that it is free before borrowing it, and resets it after.
+    const PLAIN_ASID: u64 = 8;
+    /// CLOSE-BOX leg 9's owner: synthetic (outside the slot range) so the router's close arm has a
+    /// window row to remove and provably no process to kill — see [`closebox_leg`].
+    const ASID_X: u64 = 0xC0D;
 
     // One origin for both (so exactly one can own the probe point), upper-middle, clear of WC-F's
     // reserved boxes at the bottom edge. `move_to` pins the rows against the tiler below.
@@ -5004,14 +6937,65 @@ pub fn hittest_selftest() {
     // Raising A cannot lower anything, so a point unowned before the probes existed is unowned now
     // unless a probe row claims it — which is exactly the leg. A panel with no unowned point left
     // reports `skip` (the sibling's discipline) rather than a verdict it has no fixture for.
-    let outside_ok = miss_pt.map(|(x, y)| hit_test(x, y).is_none());
+    let outside_ok: Option<bool> = miss_pt.map(|(x, y)| hit_test(x, y).is_none());
     focus_changed(0);
     let hidden_ok = hit_test(ix, iy).is_none();
-    let ok =
-        inside_ok && topmost_ok && raise_ok && outside_ok.unwrap_or(true) && hidden_ok;
+
+    // Leg 6 — CLICK-SHELL. Re-raise A (leg 5 left every window under the shell) and give it focus,
+    // then drive one PRESS edge through the router with the pointer wherever it actually is. The
+    // fixture is only valid if that point hits nothing: `shell` is the verdict, `None` = not asserted.
+    let shell: Option<bool> = clickshell_leg(ASID_A, ix, iy, info.width as i32, info.height as i32);
+
+    // Leg 7 — CLICK-SHELL r2 (P72). The same press, from a focus that owns NO window and no compat
+    // row. Leg 6 covers the windowed focus and passed on this gate throughout the bench defect; this
+    // is the leg that fails without the predicate fix. ASID_C owns nothing by construction.
+    let bare: Option<bool> = clickshell_windowless_leg(ASID_C);
+
+    // Leg 8 — CLICK-PLAIN (P75). The HIT arm's policy, which legs 6 and 7 do not touch: a press on an
+    // UNFOCUSED window moves focus and is DELIVERED WHOLE to the raised owner, the next press on it is
+    // delivered too, and the wake edges run BEFORE the push. Needs a real
+    // private-slot ASID — the assertion is about a RING, and only slot ASIDs have one — so it runs
+    // last, borrows the highest slot, and hands it back reset. `ASID_A` stands in as the app that
+    // held focus before the click.
+    let plain: Option<(bool, bool, bool)> = clickplain_leg(PLAIN_ASID, ASID_A, s, len);
+
+    // Leg 9 — CLOSE-BOX (P79). The one action click in the grammar: a press in a window's close
+    // box is CONSUMED by the router, and the row is closed. Runs last — it is the only leg that
+    // REMOVES a row through the router — and self-cleans through the close itself (the row is the
+    // thing being asserted gone). ASID_X owns nothing but the leg's own window, so the router's
+    // kill arm is a witnessed no-op.
+    let closebox: Option<bool> = closebox_leg(ASID_X, s, len);
+
+    // Leg 10 — CLOSE-FIX (P82). The same close arm, driven against a row the battery created
+    // through the ordinary path (`wa`), asserting the ROW NAMED is the row reaped and the settle
+    // read-back is the SELFTEST tag — the discriminator that keeps this battery's wire lines
+    // distinguishable from a real operator close. Runs after leg 9 (so the probe row is gone) and
+    // consumes `wa` through the router on success; the tail's `close(wa)` then no-ops.
+    let closereal: Option<bool> = closebox_real_leg(wa, ASID_A);
+
+    let ok = inside_ok
+        && topmost_ok
+        && raise_ok
+        && outside_ok.unwrap_or(true)
+        && hidden_ok
+        && shell != Some(false)
+        && bare != Some(false)
+        && plain.map(|(a, b, c)| a && b && c) != Some(false)
+        && closebox != Some(false)
+        && closereal != Some(false);
+    let verdict3 = |v: Option<(bool, bool, bool)>, pick: fn((bool, bool, bool)) -> bool| match v {
+        Some(t) => {
+            if pick(t) {
+                "true"
+            } else {
+                "false"
+            }
+        }
+        None => "skip",
+    };
     let (mx, my) = miss_pt.unwrap_or((-1, -1));
     serial_println!(
-        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} miss=({},{}) hidden={} -> {}",
+        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} miss=({},{}) hidden={} shell={} bare={} hit={} deliver={} wake={} close={} closereal={} -> {}",
         ix, iy, inside_ok, topmost_ok, raise_ok,
         match outside_ok {
             Some(true) => "true",
@@ -5019,23 +7003,39 @@ pub fn hittest_selftest() {
             None => "skip",
         },
         mx, my, hidden_ok,
+        match shell { Some(true) => "true", Some(false) => "false", None => "skip" },
+        match bare { Some(true) => "true", Some(false) => "false", None => "skip" },
+        verdict3(plain, |t| t.0),
+        verdict3(plain, |t| t.1),
+        verdict3(plain, |t| t.2),
+        match closebox { Some(true) => "true", Some(false) => "false", None => "skip" },
+        match closereal { Some(true) => "true", Some(false) => "false", None => "skip" },
         if ok { "PASS" } else { "FAIL" }
     );
 
     close(wa);
     close(wb);
-    focus_reset();
-}
-
-/// CLICK-X86 — the restore every selftest that drives [`focus_changed`] with SYNTHETIC owners owes:
-/// drop the shell back to the bottom of the z-order, un-name the focus owner (it must not be left
-/// naming an address space that does not exist), and repaint the live set (a `focus_changed(0)` leg
-/// pushes every live window below the shell and consumes its damage flag).
-#[cfg(feature = "witness")]
-pub fn focus_reset() {
-    use core::sync::atomic::Ordering;
+    // CLOSE-FIX (P82) — the teardown WITNESS GUARD: no synthetic row may outlive the battery,
+    // and a leak may not be silent. The bench cost of one leaked probe row is a whole boot of
+    // polluted hit-tests — a real click resolving to a fixture ASID, an ASID-scoped kill finding
+    // nobody, undead `jobs` rows — so the guard is a sweep, not an assertion: every row still owned
+    // by one of the battery's synthetic ASIDs is reaped HERE, and the reap prints a FAIL-shaped
+    // line the regression spec forbids. Zero rows swept is free (`close_owner` returns before any
+    // panel work); the guard's cost exists only in the state it exists to kill.
+    let mut leaked = 0usize;
+    for a in [ASID_A, ASID_B, ASID_C, ASID_X] {
+        leaked += close_owner(a);
+    }
+    if leaked > 0 {
+        serial_println!(
+            "[clickroute] hit-test teardown LEAK — {} synthetic row(s) reaped -> FAIL",
+            leaked
+        );
+    }
+    // Same restore FOCUS-VIS owes and for the same reasons: drop the shell back to the bottom of the
+    // z-order, un-name the synthetic focus owner, and repaint the live set (this selftest's
+    // `focus_changed(0)` leg pushed EVERY live window below the shell and consumed its damage flag).
     SHELL_Z.store(0, Ordering::Release);
     FOCUS_ASID.store(0, Ordering::Release);
     repaint();
 }
-

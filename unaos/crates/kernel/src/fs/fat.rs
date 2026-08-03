@@ -76,6 +76,12 @@ pub enum FatError {
     /// on-disk field, caught before it reached the medium. Never returned on a healthy volume, because
     /// [`parse_bpb`] rejects at mount time any BPB whose total-sector claim exceeds its partition.
     OutOfVolume,
+    /// WEDGE-8 (F3): the storage driver is busy (the xHCI controller loan is held by another
+    /// context) and this call refused to wait for it — a masked span must NEVER block on a driver
+    /// lock (that wait is the F3 deadlock), and an unmasked one already waited its bounded budget.
+    /// The RMW wrappers ([`with_fat_lock_src`]/[`with_dir_lock_src`]) retry it OUTSIDE the masked
+    /// span; exhaustion surfaces as `-EAGAIN` — the caller may retry, nothing was mutated.
+    Busy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,8 +568,14 @@ fn u64le(b: &[u8], off: usize) -> u64 {
 /// (`crate::drivers::block::read_block` — the microSD on the Pi, the USB stick on x86/QEMU); `Usb` reads the
 /// USB mass-storage stick DIRECTLY through the xHCI controller (`read_block_usb`), independent of the block
 /// layer's backend selector — so on the Pi (where the SD backend owns the global device) the USB stick can be
-/// mounted read-only alongside the SD-hosted unafs volume. A `Usb`-sourced mount is STRICTLY read-only: the
-/// write path (`write_sector`) refuses the `Usb` source, so no FAT/dir/data write can ever reach the stick.
+/// mounted alongside the SD-hosted unafs volume.
+///
+/// USBFALL F3 (was PIUSB-27): a `Usb`-sourced mount is NO LONGER read-only — USB-WRITE routed `write_sector`'s
+/// `Usb` arm to the verified BOT WRITE(10) path (`drivers::block::write_block_usb`), so FAT, directory and data
+/// writes DO reach the stick. Two consequences the rest of this file now states explicitly rather than assuming
+/// away: the per-source lock-span cost documented on [`with_fat_lock`] (a `Usb` RMW is held under masked IRQs
+/// for up to the BOT deadline, not for a polled sector transfer), and USBFALL F1 in `drivers::block`, which
+/// stops a missing SD backend from silently redirecting `Default` writes onto this same stick.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BlockSource {
     Default,
@@ -579,6 +591,10 @@ fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Re
     };
     match r {
         Ok(n) if n >= SECTOR_SIZE => Ok(()),
+        // WEDGE-8 (F3): Busy is not an I/O failure — the controller is loaned out and this context
+        // refused (masked) or exhausted (unmasked) its wait. Kept distinct so the RMW wrappers can
+        // retry outside the masked span and EL0 sees `-EAGAIN`, never a false `-EIO`.
+        Err(crate::drivers::block::BlockError::Busy) => Err(FatError::Busy),
         _ => Err(FatError::Io),
     }
 }
@@ -594,7 +610,11 @@ fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Resul
         BlockSource::Default => crate::drivers::block::write_block(lba, buf),
         BlockSource::Usb => crate::drivers::block::write_block_usb(lba, buf),
     };
-    r.map_err(|_| FatError::Io)
+    r.map_err(|e| match e {
+        // WEDGE-8 (F3): see `read_sector` — Busy stays Busy so it can be retried, not mourned.
+        crate::drivers::block::BlockError::Busy => FatError::Busy,
+        _ => FatError::Io,
+    })
 }
 
 // ===================== MULTIBLK (2026-07-29) — counted sector runs =====================
@@ -718,10 +738,30 @@ static FAT_MUTATION: spin::Mutex<()> = spin::Mutex::new(());
 ///
 /// LOCK SPAN: callers hold this ONLY across a single FAT-sector RMW (`set_fat_entry`'s bounded `num_fats`
 /// read+write loop) — never across a free-search (`alloc_cluster`), a data-cluster zero-fill/write loop, or a
-/// `mount()`. That is why "held across block I/O" is safe here: the span is a couple of BOUNDED sector
-/// transfers with no scheduler yield, not an unbounded wait — bounded by the emmc2 busy-poll on the SD
-/// backend, and by the BOT pump's wall-clock deadline + polled event-ring drain on the xHCI backend (which
-/// PH-3 proved is reachable here; see [`FAT_MUTATION`] for the corrected invariant).
+/// `mount()`. That structural rule is unchanged; what the span COSTS, however, is a property of the
+/// [`BlockSource`] the RMW runs through, and USBFALL F2 states it per-source rather than as one blanket claim:
+///
+/// - [`BlockSource::Default`] — the pre-USB-WRITE premise, and still true. On Pi bare-metal the backend is the
+///   microSD (`emmc2`, a polled CMD17/CMD24 busy-poll; USBFALL F1 now REFUSES a `Default` write when no SD
+///   registered, so this arm can no longer be silently substituted by the stick). Under the QEMU raspi4b/virt
+///   models the spin-loop degrades to a spin. Either way: a couple of bounded polled sector transfers, no
+///   scheduler yield, microsecond-to-millisecond scale.
+/// - [`BlockSource::Usb`] — NOT "a couple of bounded polled sector transfers". USB-WRITE made this source
+///   writable (`write_sector` → `drivers::block::write_block_usb` → `xhci.storage_write10` → `scsi_write10` →
+///   `bot_transfer` → `pump_until_bot_done`), whose wall-clock deadline is `arch::hw_wait_budget() * 3`
+///   = 450_000_000 CNTVCT ticks (~8 s at the Pi's 54 MHz CNTFRQ), and whose pump body calls `crate::hlt()` —
+///   i.e. a `wfi` executed with `PSTATE.I` MASKED by this very hold. It is bounded and it is NOT a deadlock
+///   (WFI wakes on a pending physical interrupt even with I set — `arch/aarch64/mod.rs`), and the deadline is
+///   honoured, so the volume stays consistent. But on a FAILING transfer the worst case is a multi-second,
+///   non-preemptible hold (×`num_fats`): the scheduler cannot run, EL0 is frozen, panel/input tasks stall.
+///
+/// The span is therefore honest-but-expensive on `Usb`, not "safe because polled". This is deliberately left
+/// as a documented cost rather than a restructure: narrowing the span for one source would fork the RMW's
+/// atomicity argument, and shortening the deadline belongs to the xHCI/BOT layer (out of this lane). What
+/// USBFALL adds instead is EVIDENCE — see [`note_masked_usb_hold`], which witnesses the first masked-IRQ hold
+/// taken on a `Usb` source so the cost is observable at the bench instead of inferred. Callers reach the lock
+/// through [`with_fat_lock_src`]/[`with_dir_lock_src`], which carry the source explicitly: any NEW
+/// `BlockSource` must answer this paragraph before it can be held across the RMW.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
@@ -792,8 +832,11 @@ static DIR_MUTATION: spin::Mutex<()> = spin::Mutex::new(());
 
 /// Run `f` under the directory-sector mutation lock (aarch64), or unchanged (other arches). Same IRQ-masked,
 /// non-preemptible discipline as [`with_fat_lock`] (see its doc for the deadlock reasoning). LOCK SPAN: only
-/// a single directory-sector RMW (one bounded polled read + one write) — never a directory SCAN
-/// (`find_free_root_slot` / `find_located` stay outside; the F3-M3 namespace lock serializes those sequences).
+/// a single directory-sector RMW (one read + one write) — never a directory SCAN (`find_free_root_slot` /
+/// `find_located` stay outside; the F3-M3 namespace lock serializes those sequences). USBFALL F2: "one bounded
+/// POLLED read + one write" holds for [`BlockSource::Default`] only — on a `Usb` source the same span rides the
+/// BOT deadline with `wfi` under masked IRQs. See [`with_fat_lock`]'s LOCK SPAN paragraph for the per-source
+/// statement; call sites take this lock through [`with_dir_lock_src`], which carries the source.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn with_dir_lock<R>(f: impl FnOnce() -> R) -> R {
@@ -893,6 +936,103 @@ pub fn x86_rmw_overlaps() -> (u32, u32) {
         FAT_RMW_OVERLAPS.load(Ordering::Relaxed),
         DIR_RMW_OVERLAPS.load(Ordering::Relaxed),
     )
+}
+
+/// USBFALL F2: one-shot latch for [`note_masked_usb_hold`].
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static USBFALL_MASKED_USB_HOLD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// USBFALL F2 witness: record the FIRST time a FAT/dir sector RMW takes the masked-IRQ mutation lock on a
+/// [`BlockSource::Usb`] volume — the case the [`with_fat_lock`] LOCK SPAN paragraph calls out as bounded but
+/// expensive (a `pump_until_bot_done` deadline of `hw_wait_budget()*3`, with `wfi` inside, held under
+/// `PSTATE.I` masked). One line, once per boot, so the cost is OBSERVED at the bench rather than inferred;
+/// the quantity still owed from metal is the actual stall on a FAILING BOT write, which QEMU cannot produce.
+/// Behind the `witness` feature (UNAOS_WITNESS) — a default-quiet build compiles this away entirely and the
+/// hold is byte-identical to pre-USBFALL.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[inline]
+fn note_masked_usb_hold(source: BlockSource, site: &str) {
+    if source != BlockSource::Usb {
+        return;
+    }
+    if !USBFALL_MASKED_USB_HOLD.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(
+            ":: USBFALL: masked-IRQ FAT hold on the Usb source ({}) — span bounded by the BOT deadline, not by polled I/O ::",
+            site
+        );
+    }
+}
+
+/// USBFALL F2: default-quiet / non-aarch64 build — the witness is compiled out.
+#[cfg(not(all(target_arch = "aarch64", feature = "witness")))]
+#[inline(always)]
+fn note_masked_usb_hold(_source: BlockSource, _site: &str) {}
+
+/// WEDGE-8 (F3): retry bounds for a `Busy` FAT/dir RMW — the masked closure found the storage
+/// driver's controller loaned out and returned instantly (a masked context must never wait on a
+/// driver lock; that wait IS the F3 deadlock). Each retry re-runs the WHOLE closure from outside
+/// the `without_interrupts` span, with a `hlt()` between attempts so the scheduler can run the loan
+/// holder to completion. Both bounds are needed: the attempt cap keeps the aarch64 masked path
+/// (instant-`Busy` attempts, one timer tick apart) from spinning unbounded, and the wall-clock cap
+/// keeps the x86 path (whose block layer already waits its own bounded budget per attempt) from
+/// multiplying that budget by the attempt count. Exhaustion surfaces `FatError::Busy` → `-EAGAIN`:
+/// the RMW never started, nothing was mutated, the caller may retry.
+const RMW_BUSY_ATTEMPTS: u32 = 64;
+
+/// USBFALL F2: [`with_fat_lock`], with the [`BlockSource`] the guarded RMW will run through made EXPLICIT.
+/// Every `FatFs` call site uses this form so the span's per-source cost (see [`with_fat_lock`]'s LOCK SPAN
+/// paragraph) is visible at the point the lock is taken, and so a newly added source cannot inherit the
+/// "polled, therefore cheap" premise by accident.
+///
+/// WEDGE-8 (F3): the closure is now `Result`-typed and a `FatError::Busy` from inside it is RETRIED
+/// here, OUTSIDE the masked span (see [`RMW_BUSY_ATTEMPTS`]). The invariant this establishes for
+/// every span in `fs/`: no `without_interrupts` closure ever blocks on a driver lock — it fails
+/// fast with `Busy` and the wait (a `hlt`, schedulable, unmasked) happens out here.
+#[inline]
+fn with_fat_lock_src<R>(
+    source: BlockSource,
+    site: &str,
+    mut f: impl FnMut() -> Result<R, FatError>,
+) -> Result<R, FatError> {
+    note_masked_usb_hold(source, site);
+    let start = crate::arch::now_cycles();
+    let budget = crate::arch::hw_wait_budget();
+    for _ in 0..RMW_BUSY_ATTEMPTS {
+        match with_fat_lock(&mut f) {
+            Err(FatError::Busy) => {}
+            other => return other,
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+            break;
+        }
+        crate::hlt(); // unmasked here — the mask ended with the closure; let the holder run
+    }
+    Err(FatError::Busy)
+}
+
+/// USBFALL F2: the [`with_dir_lock`] twin of [`with_fat_lock_src`] — same reasoning, directory
+/// sectors; WEDGE-8 (F3): same `Busy` retry-outside-the-mask discipline.
+#[inline]
+fn with_dir_lock_src<R>(
+    source: BlockSource,
+    site: &str,
+    mut f: impl FnMut() -> Result<R, FatError>,
+) -> Result<R, FatError> {
+    note_masked_usb_hold(source, site);
+    let start = crate::arch::now_cycles();
+    let budget = crate::arch::hw_wait_budget();
+    for _ in 0..RMW_BUSY_ATTEMPTS {
+        match with_dir_lock(&mut f) {
+            Err(FatError::Busy) => {}
+            other => return other,
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+            break;
+        }
+        crate::hlt();
+    }
+    Err(FatError::Busy)
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1661,10 +1801,12 @@ impl FatFs {
     fn set_fat_entry(&self, cluster: u32, next: u32) -> Result<(), FatError> {
         // F2: serialize the WHOLE all-copies RMW under `FAT_MUTATION`. A concurrent writer mutating a
         // different entry in this same sector (or the other FAT copy) can no longer read-before-our-write and
-        // then clobber our update. The lock spans ONLY the bounded `num_fats` read-modify-write, so on aarch64
-        // the hold is a couple of polled sector transfers with no scheduler yield (see `with_fat_lock`). On
-        // x86 `with_fat_lock` is a zero-cost passthrough.
-        with_fat_lock(|| self.set_fat_entry_inner(cluster, next))
+        // then clobber our update. The lock spans ONLY the bounded `num_fats` read-modify-write — never a
+        // free-search or a data-cluster loop. USBFALL F2: what that span COSTS depends on `self.source`, and
+        // the claim is stated per-source on `with_fat_lock`'s LOCK SPAN paragraph (`Default` = bounded polled
+        // sector transfers; `Usb` = the BOT deadline with `wfi` under masked IRQs). Read it there rather than
+        // assuming "polled" here. On x86 `with_fat_lock` is a zero-cost passthrough.
+        with_fat_lock_src(self.source, "set_fat_entry", || self.set_fat_entry_inner(cluster, next))
     }
 
     /// F3: the lock-FREE body of [`FatFs::set_fat_entry`] — the all-copies FAT-sector RMW with NO
@@ -1804,7 +1946,7 @@ impl FatFs {
                 // but this re-check. The whole hold is one sector read + the bounded all-copies RMW (the
                 // `with_fat_lock` span rule). On x86 the lock is INERT — see `with_fat_lock` for what
                 // actually holds the x86 side together (it is NOT "one writer by construction").
-                let claimed = with_fat_lock(|| -> Result<bool, FatError> {
+                let claimed = with_fat_lock_src(self.source, "alloc_cluster", || -> Result<bool, FatError> {
                     let mut cbuf = [0u8; SECTOR_SIZE];
                     self.rd_sector(self.fat_start + sec, &mut cbuf)?;
                     let cur = match self.kind {
@@ -2454,7 +2596,7 @@ impl FatFs {
         }
         // F3-M2: the whole sector RMW under DIR_MUTATION — a concurrent RMW of a NEIGHBOURING slot in this
         // same sector can no longer read-before-our-write and clobber this publish (or vice versa).
-        with_dir_lock(|| {
+        with_dir_lock_src(self.source, "write_dir_entry_fields", || {
             let mut buf = [0u8; SECTOR_SIZE];
             self.rd_sector(lba, &mut buf)?;
             let hi = (first_cluster >> 16) as u16;
@@ -2485,7 +2627,7 @@ impl FatFs {
         if off + 32 > SECTOR_SIZE {
             return Err(FatError::Io); // a slot never straddles a sector; a bad offset is a caller bug
         }
-        with_dir_lock(|| {
+        with_dir_lock_src(self.source, "write_dir_entry_fields_mtime", || {
             let mut buf = [0u8; SECTOR_SIZE];
             self.rd_sector(lba, &mut buf)?;
             let hi = (first_cluster >> 16) as u16;
@@ -2597,7 +2739,7 @@ impl FatFs {
         // F3-M2: the slot WRITE is a sector RMW under DIR_MUTATION (the free-slot SCAN above stays outside —
         // per the with_dir_lock span rule; the scan-then-claim slot race itself is the F3-M3 namespace lock's).
         // JD6: this with_dir_lock slot-write body is TWINNED VERBATIM in `create_in_dir` — keep the two in sync.
-        with_dir_lock(|| {
+        with_dir_lock_src(self.source, "create_in_root", || {
             let mut buf = [0u8; SECTOR_SIZE];
             self.rd_sector(lba, &mut buf)?;
             // Write a fresh 32-byte entry: 11-byte name, attr, everything else zero (NTRes/times = 0,
@@ -2672,7 +2814,7 @@ impl FatFs {
         // F3-M2: the slot WRITE is a sector RMW under DIR_MUTATION — the free-slot SCAN above stays
         // outside, exactly as in `create_in_root`.
         // ⚠ VERBATIM TWIN of `create_in_root`'s with_dir_lock block — keep in sync (seat review diffs these).
-        with_dir_lock(|| {
+        with_dir_lock_src(self.source, "create_in_dir", || {
             let mut buf = [0u8; SECTOR_SIZE];
             self.rd_sector(lba, &mut buf)?;
             // Write a fresh 32-byte entry: 11-byte name, attr, everything else zero (NTRes/times = 0,
@@ -2927,7 +3069,7 @@ impl FatFs {
         if off + 32 > SECTOR_SIZE {
             return Err(FatError::Io); // a slot never straddles a sector; a bad offset is a caller bug
         }
-        with_dir_lock(|| {
+        with_dir_lock_src(self.source, "write_dir_entry_name", || {
             let mut buf = [0u8; SECTOR_SIZE];
             self.rd_sector(lba, &mut buf)?;
             buf[off..off + 11].copy_from_slice(raw);
@@ -3112,7 +3254,7 @@ impl FatFs {
         }
         // F3-M2: the sector RMW under DIR_MUTATION — a racing size-publish RMW of a sibling slot in this
         // sector can no longer resurrect the `0xE5` (lost-delete), nor this delete clobber its publish.
-        with_dir_lock(|| {
+        with_dir_lock_src(self.source, "mark_dir_deleted", || {
             let mut buf = [0u8; SECTOR_SIZE];
             self.rd_sector(dir_lba, &mut buf)?;
             buf[dir_off] = 0xE5;
@@ -3266,14 +3408,16 @@ pub fn fat_reason(e: FatError) -> &'static str {
     }
 }
 
-/// PIUSB-27: mount the USB stick's FAT volume READ-ONLY and emit the storage-ready witness. Called from
+/// PIUSB-27: mount the USB stick's FAT volume and emit the storage-ready witness. Called from
 /// the xHCI storage bring-up event (`service_storage`) so it fires ONCE per bring-up and again on every
-/// hot-plug re-enumeration. Strictly read-only: the mount reads through [`BlockSource::Usb`] (the xHCI
-/// direct path), so it works even when the microSD owns the global block device. On success it prints the
+/// hot-plug re-enumeration. The mount reads through [`BlockSource::Usb`] (the xHCI direct path), so it works
+/// even when the microSD owns the global block device. USBFALL F3: that source is WRITABLE since USB-WRITE —
+/// this particular witness only reads, but nothing about `Usb` makes it read-only. On success it prints the
 /// geometry (FAT type / size / cluster size) and the first-level entry list; on failure an honest reason.
 /// The live `GET /fs/usb` HTTP route re-mounts per request — this line is the boot/hot-plug evidence.
 /// PIUSB-27: main-loop hook — when the xHCI bring-up has raised the USB storage-ready edge, mount the
-/// stick's FAT volume read-only and emit the witness. Runs with the xHCI controller lock RELEASED (the
+/// stick's FAT volume and emit the witness (USBFALL F3: the mount is writable since USB-WRITE; only this
+/// witness path is read-only in practice, because it merely reads geometry and the root listing). Runs with the xHCI controller lock RELEASED (the
 /// mount re-locks it briefly through `read_block_usb`), exactly like `probe_once`; the edge re-arms on
 /// every hot-plug re-enumeration, so a re-inserted stick is re-mounted and re-witnessed. Safe to call
 /// every main-loop iteration — it no-ops until the edge is raised, then fires once per raise.
@@ -3284,11 +3428,12 @@ pub fn piusb27_service() {
     }
 }
 
-/// PIUSB-27: mount the USB stick's FAT volume READ-ONLY and emit the storage-ready witness — the
+/// PIUSB-27: mount the USB stick's FAT volume and emit the storage-ready witness — the
 /// geometry (FAT type / size / cluster size) and the first-level entry list on success, an honest reason
 /// on failure. The live `GET /fs/usb` HTTP route re-mounts per request; this line is the boot/hot-plug
-/// evidence. Strictly read-only: the mount reads through [`BlockSource::Usb`] (the xHCI direct path), so
-/// it works even when the microSD owns the global block device.
+/// evidence. The mount reads through [`BlockSource::Usb`] (the xHCI direct path), so it works even when the
+/// microSD owns the global block device. USBFALL F3: this witness READS only — the `Usb` source itself has
+/// been writable since USB-WRITE.
 #[cfg(target_arch = "aarch64")]
 pub fn piusb27_mount_witness() {
     match mount_source(BlockSource::Usb) {

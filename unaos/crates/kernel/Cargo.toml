@@ -480,6 +480,77 @@ v3d = ["baremetal"]
 # `UNAOS_V3D=1 UNAOS_V3D_DEEP=1 UNAOS_PI=1 ./arroyo kernel8`. See docs/dev/OS/08_VIDEO/v3d.md.
 v3d_deep = ["v3d"]
 
+# V3D75A-GATE: the arming switch for the `SET_ENABLE_QPU` (0x00030012) sends. On Pi 4 metal that tag
+# permanently WEDGES the VideoCore mailbox: every later NOTIFY_XHCI_RESET fails and USB is dead for
+# the rest of the boot. Its diagnostic verdict is banked negative twice (P86 doorbell-waiting, and the
+# [v3d81q] reply-less re-read), so the send has nothing left to teach and is not worth the boot it
+# costs. Both send sites — `[v3d75a]`'s doorbell-waiting one inside `v3d75_fabric_condition` and
+# `[v3d81q]`'s reply-less one — are gated on `all(v3d_deep, v3d_qpu)`; with this feature OFF each one
+# prints a single `SET_ENABLE_QPU SKIPPED — qpu-gate off …` line and sends nothing, which is what
+# makes `UNAOS_V3D_DEEP=1` non-destructive. Deliberately a BARE feature that implies nothing: it only
+# has an effect alongside `v3d_deep` (both sites ride the deep battery), so arming it alone changes no
+# behaviour. Enable via `UNAOS_V3D=1 UNAOS_V3D_DEEP=1 UNAOS_V3D_QPU=1 UNAOS_PI=1 ./arroyo kernel8`.
+# ⚠ an armed boot loses USB from the send onward — that is the known cost, not a fault.
+v3d_qpu = []
+
+# V3D80-GATE: the arming switch for the `NOTIFY_DISPLAY_DONE` (0x00030066) sends. That tag is vc4's
+# probe-time handover and it does exactly what it says: the firmware display driver STOPS, so the
+# panel goes BLACK for the rest of the boot — by design, not a fault. Its diagnostic verdict is now
+# BANKED (boot pi4-r23s1x/boot3, 2026-08-03): core+0x68 read 0x00010001 unchanged across the handover
+# (pre == post, working-part ref 0x00000003), so the handover does not move the wedge signature and
+# the send has nothing left to teach a deep boot. Both send sites — `[v3d80]`'s doorbell-waiting one
+# in `v3d80_display_done` and `[v3d81d]`'s reply-less one — are gated on `all(v3d_deep,
+# v3d_dispdone)`; with this feature OFF each one prints a single `NOTIFY_DISPLAY_DONE SKIPPED —
+# dispdone-gate off …` line and sends nothing, which is what lets a deep boot keep its panel.
+# Deliberately a BARE feature that implies nothing: it only has an effect alongside `v3d_deep` (both
+# sites ride the deep battery), so arming it alone changes no behaviour. Enable via `UNAOS_V3D=1
+# UNAOS_V3D_DEEP=1 UNAOS_V3D_DISPDONE=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot loses the panel
+# from the send onward — that is the known cost; serial carries the whole verdict.
+v3d_dispdone = []
+
+# PI-V3D-69: the WRITE half of the initialisation-diff arc. The READ half (`[v3d69] fabric` stations —
+# PM_GRAFX, both V3D async-AXI-bridge control words in both candidate ASB blocks, V3D_MMUC_CONTROL)
+# rides `v3d_deep` and is read-only. THIS feature adds the one rung that WRITES: it re-runs mainline's
+# `bcm2835_asb_power_on` ON half and re-kicks the `[v3d69]` control rung behind it. It is a separate
+# knob because it perturbs a live block, and it is gated on the finding as well as on the knob — when
+# the read half reports a clean fabric the rung declines and says so, writing nothing. Requires
+# `v3d_deep`. Enable via `UNAOS_V3D=1 UNAOS_V3D_DEEP=1 UNAOS_V3D69_REENABLE=1 UNAOS_PI=1 ./arroyo
+# kernel8`. See docs/dev/OS/08_VIDEO/v3d.md §41.
+v3d69_reenable = ["v3d_deep"]
+
+# PI-V3D-79: the genpd-faithful MINIMAL bringup — the S1S source audit's discriminator. On piOS,
+# v3d_reset() is the HANG path only; boot-time bring-up is genpd's bcm2835_asb_power_on alone:
+# deassert PM_V3DRSTN + release the two rpivid ASB bridges, from the firmware-parked state, with
+# no mailbox power/rate/gate calls and NO reset assert (pd->clk resolves NULL on 2711, so the
+# clock choreography no-ops). This knob makes bringup() do exactly that and nothing else — the
+# three mailbox SET calls and the [v3d50] OFF half are skipped — so one boot discriminates
+# whether one of OUR extra acts is what wedges thread 0. See docs/dev/OS/08_VIDEO/v3d.md §46.
+v3d79_minimal = ["v3d"]
+
+# PI-V3D-81: the reply-less NOTIFY legs. §46.5 established that this firmware acts on NOTIFY-class
+# tags WITHOUT sending a FIFO reply, which means every "MAILBOX FAILED" the campaign printed for one
+# was a statement about the doorbell and not about the tag: NOTIFY_DISPLAY_DONE (P92/P93) and
+# SET_ENABLE_QPU (P86) were mis-read, not refuted. These legs post the tag, wait for no reply, settle
+# a stated interval, and then read the EFFECT — the reply BUFFER (which the VPU writes by DMA whether
+# or not it rings), the register station, and the firmware's own clock/display state — with
+# GET_CLOCK_RATE as a positive control so that "nothing moved" is a fact about the firmware and not
+# about our reader. `v3d81` is the shared machinery and is never armed on its own; the two legs are
+# separately armable because they are independent hypotheses and a boot that sends both can attribute
+# a change to neither. Arming a leg STANDS DOWN [v3d75a]'s doorbell-waiting send of the same tag, and
+# stands [v3d80] down whichever leg is armed — it is the last rung before the battery and its NOTIFY
+# may be honoured reply-lessly, so leaving it in would contaminate [v3d81q]'s baseline with a
+# handover it never asked for. Each tag is sent once per boot or not at all. Also split on the wire:
+# `reg-moved` (MMIO, control-free) vs `fw-moved` (mailbox, only believed with a live control), so a
+# transport that dies mid-leg reports INCONCLUSIVE instead of banking itself as a REFUTATION.
+# Implies `v3d_deep` — the legs ride
+# the tail of the deep battery, where every banked reading they are compared against is taken.
+# Settle interval: `UNAOS_V3D81_SETTLE_MS` (option_env, default 250 ms, capped at 10 s). Enable via
+# `UNAOS_V3D=1 UNAOS_V3D81_QPU=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ the display leg may take the panel
+# to black permanently — that is the hypothesis. See docs/dev/OS/08_VIDEO/v3d.md §47.
+v3d81 = ["v3d_deep"]
+v3d81_qpu = ["v3d81"]
+v3d81_display = ["v3d81"]
+
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
 # the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding

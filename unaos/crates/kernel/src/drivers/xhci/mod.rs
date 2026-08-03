@@ -388,23 +388,116 @@ fn hub_port_change_feature_selector(bit: u16, is_ss: bool) -> Option<u16> {
     }
 }
 
-pub static XHCI_CONTROLLER: spin::Mutex<Option<XhciController>> = spin::Mutex::new(None);
+///   * the mutex is held only inside [`claim`]/[`XhciLoan::drop`]/[`install`], each a masked O(1)
+///     take/put (the WEDGE-7 IrqMask discipline: mask taken BEFORE the acquire, lock released
+///     BEFORE the unmask). No masked spinner can ever wait more than a few dozen cycles on it, and
+///     no holder of it can ever be preempted mid-hold.
+///   * the CONTROLLER ITSELF is loaned out by value (a `Box` move) to exactly one user at a time,
+///     which runs the long BOT work with NO lock held. Contenders are told [`XhciClaimError::Busy`]
+///     immediately and handle it honestly (a pump pass skips; the block layer surfaces `Busy`,
+///     which the FAT layer retries OUTSIDE its masked span and EL0 sees as `-EAGAIN`).
+///
+/// The invariant, checkable by grep (the F1 idiom): `XHCI_CONTROLLER.lock()` appears ONLY in
+/// `claim`/`Drop`/`install` in this file — the static is private, so the compiler enforces it.
+static XHCI_CONTROLLER: spin::Mutex<Option<alloc::boxed::Box<XhciController>>> =
+    spin::Mutex::new(None);
+
+/// True while the controller is loaned out via [`claim`]. Written only inside the masked mutex
+/// hold, so a `None` in the mutex disambiguates cleanly: loaned (`Busy`) vs never installed
+/// (`NotReady`).
+static XHCI_LOANED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Why [`claim`] returned no controller.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum XhciClaimError {
+    /// The controller was never installed (USB bring-up skipped or failed).
+    NotReady,
+    /// Another context holds the loan right now — a BOT transaction or service pass is in flight.
+    /// The claim did NOT wait: waiting is the caller's decision (and a masked caller must not).
+    Busy,
+}
+
+/// An exclusive loan of the xHCI controller, returned by [`claim`]. Derefs to [`XhciController`];
+/// dropping it returns the controller to the shared slot (masked O(1) put, panic-safe by RAII).
+pub struct XhciLoan(Option<alloc::boxed::Box<XhciController>>);
+
+impl core::ops::Deref for XhciLoan {
+    type Target = XhciController;
+    #[inline]
+    fn deref(&self) -> &XhciController {
+        self.0.as_deref().expect("XhciLoan invariant: Some until drop")
+    }
+}
+
+impl core::ops::DerefMut for XhciLoan {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut XhciController {
+        self.0.as_deref_mut().expect("XhciLoan invariant: Some until drop")
+    }
+}
+
+impl Drop for XhciLoan {
+    fn drop(&mut self) {
+        if let Some(x) = self.0.take() {
+            // WEDGE-8: masked micro-hold; field order of the locals is the fix in miniature — the
+            // guard (lock) drops before `_mask` restores, so we never run unmasked while holding.
+            let _mask = crate::arch::IrqMask::new();
+            let mut guard = XHCI_CONTROLLER.lock();
+            *guard = Some(x);
+            XHCI_LOANED.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Claim exclusive use of the xHCI controller. O(1), never waits: the internal mutex hold is a
+/// masked take (a preempted holder is impossible, so a spin on it is bounded by construction), and
+/// a controller already loaned out returns [`XhciClaimError::Busy`] instead of blocking. Callers
+/// that can afford to wait do so OUTSIDE this call, unmasked, with their own bounded policy.
+pub fn claim() -> Result<XhciLoan, XhciClaimError> {
+    let _mask = crate::arch::IrqMask::new();
+    let mut guard = XHCI_CONTROLLER.lock();
+    match guard.take() {
+        Some(x) => {
+            XHCI_LOANED.store(true, Ordering::Release);
+            Ok(XhciLoan(Some(x)))
+        }
+        None => Err(if XHCI_LOANED.load(Ordering::Acquire) {
+            XhciClaimError::Busy
+        } else {
+            XhciClaimError::NotReady
+        }),
+    }
+}
+
+/// Install the freshly initialised controller into the shared slot (boot bring-up, both arches).
+/// Masked micro-hold, same discipline as [`claim`].
+pub fn install(x: XhciController) {
+    let boxed = alloc::boxed::Box::new(x);
+    let _mask = crate::arch::IrqMask::new();
+    let mut guard = XHCI_CONTROLLER.lock();
+    *guard = Some(boxed);
+    XHCI_LOANED.store(false, Ordering::Release);
+}
 
 /// Human-readable mass-storage enumeration/bring-up state, for the shell `diskinfo` command when no
 /// block device is published. Lets a metal storage failure be diagnosed from the interactive shell
 /// (the boot enumeration log is wiped once the GUI takes over on the serial-less rMBP).
 pub fn storage_diag() -> alloc::string::String {
-    match &*XHCI_CONTROLLER.lock() {
-        Some(x) => alloc::format!("storage: slot {} — {}", x.storage_slot, x.storage_note),
-        None => alloc::string::String::from("storage: xHCI not initialised (USB bring-up skipped?)"),
+    // WEDGE-8: a shell diagnostic must not take the driver lock directly — it is reachable from
+    // contexts the F1 idiom forbids, and `claim()` distinguishes "busy" from "absent" besides.
+    match claim() {
+        Ok(x) => alloc::format!("storage: slot {} — {}", x.storage_slot, x.storage_note),
+        Err(XhciClaimError::Busy) => alloc::string::String::from("storage: xHCI busy (transaction in flight) — retry"),
+        Err(XhciClaimError::NotReady) => alloc::string::String::from("storage: xHCI not initialised (USB bring-up skipped?)"),
     }
 }
 
 /// Live port + slot summary for the shell `usbinfo` command (metal enumeration diagnosis).
 pub fn usb_summary() -> alloc::vec::Vec<alloc::string::String> {
-    match &*XHCI_CONTROLLER.lock() {
-        Some(x) => x.port_slot_summary(),
-        None => alloc::vec::Vec::from([alloc::string::String::from("xHCI not initialised")]),
+    match claim() {
+        Ok(x) => x.port_slot_summary(),
+        Err(XhciClaimError::Busy) => alloc::vec::Vec::from([alloc::string::String::from("xHCI busy (transaction in flight) — retry")]),
+        Err(XhciClaimError::NotReady) => alloc::vec::Vec::from([alloc::string::String::from("xHCI not initialised")]),
     }
 }
 
@@ -418,7 +511,8 @@ pub fn log_summary_once() {
     if N.fetch_add(1, Ordering::Relaxed) != 2000 {
         return;
     }
-    if let Some(x) = XHCI_CONTROLLER.lock().as_ref() {
+    let claimed = claim();
+    if let Ok(x) = claimed.as_ref() {
         serial_println!("xHCI: === USB topology summary ===");
         for line in x.port_slot_summary() {
             serial_println!("xHCI: {}", line);
@@ -432,7 +526,7 @@ pub fn log_summary_once() {
         let n = BOT_PUMP_COUNT.load(Ordering::Relaxed);
         let sum = BOT_PUMP_CYCLES.load(Ordering::Relaxed);
         serial_println!(
-            ":: BOT: pump budget={} peak={} sum={} mean={} n={} nowait={} timeouts={} storage_slot={} route={:#x} depth={} tag_mismatch={} bad_sig={} abandoned_in={} abandoned_out={} undrained={} short_in={} short_out={} ev_late={} ev_unaddressed={} db_in={} db_out={} ev_stopped={} ev_stopped_li={} ev_any={} wrap_push={} wrap_db={} w={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{} result=SUMMARY ::",
+            ":: BOT: pump budget={} peak={} sum={} mean={} n={} nowait={} timeouts={} storage_slot={} route={:#x} depth={} tag_mismatch={} bad_sig={} abandoned_in={} abandoned_out={} undrained={} short_in={} short_out={} ev_late={} ev_unaddressed={} cbw_fault={} db_in={} db_out={} ev_stopped={} ev_stopped_li={} ev_any={} wrap_push={} wrap_db={} w={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{} result=SUMMARY ::",
             budget, peak, sum, if n != 0 { sum / n } else { 0 },
             n, BOT_PUMP_NOWAIT.load(Ordering::Relaxed),
             BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed),
@@ -445,6 +539,10 @@ pub fn log_summary_once() {
             BOT_TD_UNDRAINED.load(Ordering::Relaxed),
             BOT_SHORT_DATA_IN.load(Ordering::Relaxed), BOT_SHORT_DATA_OUT.load(Ordering::Relaxed),
             BOT_EV_LATE_CLAIM.load(Ordering::Relaxed), BOT_EV_UNADDRESSED.load(Ordering::Relaxed),
+            // CBW-FAULT: LATE/duplicate command-block errors ONLY. Zero is expected and is NOT
+            // proof that no CBW failed — an ordinary CBW failure is claimed by the awaited stage
+            // under BOT-CBW and never reaches the safety net that increments this.
+            BOT_CBW_FAULT.load(Ordering::Relaxed),
             // ONSET-2 (M2): boot totals for the doorbell and stopped-event witnesses, plus the
             // log2-millisecond wait histogram `w=b0/b1/…/b11`. Bucket 0 is "under 1 ms", bucket k is
             // 2^(k-1)..2^k - 1 ms, bucket 11 saturates. If the polled-pump reading of the pace is
@@ -779,6 +877,17 @@ static BOT_STAGE_GEN: AtomicU32 = AtomicU32::new(0);
 /// means real event aliasing is happening on this platform and the first-write latch is earning its
 /// keep; zero means the rings are draining cleanly. Either way it is a fact, not an inference.
 pub static BOT_EV_LATE_CLAIM: AtomicU64 = AtomicU64::new(0);
+
+/// CBW-FAULT (pi4 seat, merged 2026-08-02): Transfer Events that named THIS transaction's CBW TRB
+/// with an error code AND arrived when the CBW was no longer the awaited stage — i.e. LATE or
+/// DUPLICATE command-block errors only.
+///
+/// Under BOT-CBW (§17) the CBW carries IOC and is awaited, so an ordinary CBW failure is claimed by
+/// `is_match` and aborts the transaction pre-data through the chokepoint's ring clean. It never
+/// touches this counter. **`cbw_fault=0` therefore does NOT mean no CBW failed** — it means no
+/// STRAGGLER error arrived after the stage moved on. Read it as a safety-net trip count, not a
+/// command-block health metric.
+pub static BOT_CBW_FAULT: AtomicU64 = AtomicU64::new(0);
 /// Error completions claimed by the BOT pump WITHOUT a TRB-address match — the narrow residue of
 /// the blanket `is_error` claim this arc removed. Only reachable for an error whose TRB pointer
 /// addresses nothing in either of this slot's bulk rings (the codes that post no TRB pointer at
@@ -1416,6 +1525,15 @@ struct BotPending {
     /// True once a Transfer Event has been recorded for this stage, so `residue == 0` is trusted as
     /// "everything moved" rather than "nothing observed yet". Doubles as the first-write latch.
     residue_seen: bool,
+    /// CBW-FAULT: physical address of the CBW TRB this transaction pushed, or 0. During the CBW's
+    /// own stage this is also `wait_trb_phys` and errors on it are claimed normally; the field is
+    /// held for the WHOLE transaction so the late/duplicate safety net can still recognise a
+    /// straggler once data or status has become the awaited stage.
+    cbw_trb_phys: u64,
+    /// CBW-FAULT: completion code of a LATE error reported against the CBW TRB, 0 if none. Kept
+    /// separate from `completion_code` on purpose: that one describes the stage the pump asked
+    /// about, and everything downstream of `run_bot_stage` is written about that stage.
+    cbw_error: u8,
 }
 
 /// In-flight FTDI console bulk-OUT transfer (U2.5). The FTDI TX is a single bulk-OUT stage — no
@@ -1909,6 +2027,9 @@ pub struct XhciController {
     /// stage_done=no stage_cc=0` on every metal capture — a structural lie, not a finding.
     /// Consumed (taken) by `bot_transfer` and handed to recovery as a parameter.
     bot_failed: Option<BotPending>,
+    /// CBW-FAULT: the CBW TRB address of the transaction currently in flight, 0 when none is.
+    /// Published at the push and inherited by every stage record the transaction arms.
+    bot_cbw_trb: u64,
     /// Consecutive failed recovery+retry cycles on `storage_slot`. Reset to 0 by ANY transaction
     /// that completes (including one that completes with a `Failed` CSW — a device that answers is
     /// not a device that is wedged). Compared against `BOT_RESCUE_N_CONSEC`.
@@ -2094,6 +2215,7 @@ impl XhciController {
             bot_tag: 1,
             bot_pending: None,
             bot_failed: None,
+            bot_cbw_trb: 0,
             bot_fail_streak: 0,
             bot_rescue_stage: 0,
             bot_surrendered_slot: 0,
@@ -2786,6 +2908,39 @@ impl XhciController {
                                             || s.bulk_out_ring.as_ref().is_some_and(|r| r.contains(param))
                                     };
                                     let unaddressed_error = is_error && !addressed;
+                                    // CBW-FAULT (pi4 seat, merged): a LATE/DUPLICATE error naming
+                                    // THIS transaction's command block. One exact address, pushed by
+                                    // this transaction, error codes only.
+                                    //
+                                    // The `!is_match` guard is what makes this a safety net rather
+                                    // than the primary claim. Under BOT-CBW the CBW carries IOC and
+                                    // is awaited, so while it IS the awaited stage both its success
+                                    // and its failure are claimed below by `is_match` and never
+                                    // reach here. What reaches here is a straggler: an error against
+                                    // the command block arriving once data or status has become the
+                                    // awaited stage. A CBW *success* cannot reach here either — not
+                                    // because none is posted (one is, now) but because `is_error`
+                                    // excludes it.
+                                    if is_error && !is_match
+                                        && p.cbw_trb_phys != 0 && param == p.cbw_trb_phys
+                                    {
+                                        if p.done {
+                                            BOT_EV_LATE_CLAIM.fetch_add(1, Ordering::Relaxed);
+                                            return;
+                                        }
+                                        BOT_CBW_FAULT.fetch_add(1, Ordering::Relaxed);
+                                        serial_println!(
+                                            ":: BOT: cbw fault slot={} dci={} trb={:#x} cc={} gen={} — a LATE error against the command block, after its own stage retired; failing here rather than burning the budget (USB MSC BOT 1.0 §6.6.1) ::",
+                                            slot_id, endpoint_id, param, completion_code, p.generation);
+                                        if let Some(bp) = self.bot_pending.as_mut() {
+                                            // Its OWN field: `completion_code`/`residue` describe the
+                                            // awaited stage and stay untouched, so nothing downstream
+                                            // can read a CBW's verdict as a data or status verdict.
+                                            bp.cbw_error = completion_code as u8;
+                                            bp.done = true;
+                                        }
+                                        return;
+                                    }
                                     if is_match || unaddressed_error {
                                         if p.done {
                                             // Fix 4 (2): the stage already has its completion.
@@ -6484,6 +6639,9 @@ impl XhciController {
         // BOT-CBW: the CBW carries IOC (1<<5) and is pumped to completion before anything else is
         // built, which is what §14.4 has always claimed the code does and what §17's A/B proved it
         // must. There is no build that can turn this off.
+        // CBW-FAULT: cleared first, so a refused push cannot leave the previous transaction's CBW
+        // address armed for the safety net to match against.
+        self.bot_cbw_trb = 0;
         let (cbw_trb_phys, cbw_idx, cbw_wrapped) = {
             let ring = self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap();
             let base = ring.get_ptr();
@@ -6491,6 +6649,10 @@ impl XhciController {
                 .map_err(|_| BotError::RingFull)?;
             (base + (idx as u64) * 16, idx, ring.wrapped_on_last_push())
         };
+        // CBW-FAULT: publish the address for the whole transaction. Every stage record armed after
+        // this inherits it, which is what lets the safety net recognise a straggler error against
+        // the command block once data or status has become the awaited stage.
+        self.bot_cbw_trb = cbw_trb_phys;
         {
             // The CBW is a first-class awaited stage: shape record, its own doorbell, its own pump.
             // `stage=cbw` on a TIMEOUT-SHAPE line is a reading no pre-2026-07-30 capture was able to
@@ -8203,6 +8365,7 @@ impl XhciController {
             slot_id, in_dci, out_dci, wait_trb_phys,
             done: false, completion_code: 0,
             generation, residue: 0, residue_seen: false,
+            cbw_trb_phys: self.bot_cbw_trb, cbw_error: 0,
         });
         let pump = self.pump_until_bot_done();
         let pending = self.bot_pending.take();

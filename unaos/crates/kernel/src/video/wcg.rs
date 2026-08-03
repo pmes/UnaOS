@@ -118,15 +118,8 @@
 //!
 //! ## Scope and cost
 //!
-//! `witness`-gated, and gated on nothing else: knob-off this module does not compile and every
-//! flashable artifact — Pi media and x86 ESP alike — is byte-identical with it absent. It was
-//! aarch64-only until the two primitives it needed acquired arch-neutral spellings
-//! ([`crate::arch::now_cycles`], already both-arch, and [`clean_invalidate_surface`] below); the
-//! WC-L erase discipline the `[wc-k]` lines report is arch-neutral and always was, so reporting it
-//! on one arch only meant the x86 compositor ran that discipline with no witness over it. What is
-//! still aarch64-gated at the wm.rs call sites is the WC-F reserved-box interlock (that probe is
-//! Pi-shaped) and WC-L's deferral fixture (it drives a Pi-shaped stage path; a native x86 fixture is
-//! its own arc). Budgeted at [`SAMPLES`] instrumented blits per window id
+//! `witness`-gated AND aarch64-only, like `wcf`: knob-off this module does not compile and the
+//! flashable Pi media are byte-identical. Budgeted at [`SAMPLES`] instrumented blits per window id
 //! and silent thereafter — the checksums are 64 KiB reads and the read-back is one probe per source
 //! pixel, from present context at EL0 frame rates, so an unbudgeted version would perturb the very
 //! timing it reports. Every sample prints; the terminal `verdict` line is one-shot.
@@ -134,7 +127,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::FrameBuffer;
-use crate::arch::now_cycles;
+use crate::arch::aarch64::{cache, now_cycles};
 
 /// Instrumented blits per window id. Four is enough to distinguish a steady state from a one-off
 /// and small enough that the checksum reads do not dominate the interval being timed.
@@ -709,55 +702,17 @@ fn checksum(surf: usize, surf_len: usize) -> u64 {
     h
 }
 
-/// The coherency leg's cache maintenance over the source surface.
-///
-/// On aarch64 this is the `DC CIVAC` sweep the module note argues for. On x86 the compositor, the
-/// owner and the scan-out all read the same coherent view — the same reason
-/// [`super::FrameBuffer::flush_range`] delegates to an arch hook that is a no-op there — so there is
-/// nothing to maintain and the leg reduces to reading the same bytes twice. `blit == civac` is then
-/// true by construction rather than by measurement, which is the honest reading of the counter on a
-/// coherent target: it can still catch a genuinely non-cacheable or mismatched alias, because such a
-/// mapping would diverge between the two reads for reasons the cache op never enters into.
-///
-/// The call site is identical on both arches by design — the ordering note in [`begin`] about where
-/// the clock starts relative to this call is load-bearing and must not acquire an arch split.
-#[inline]
-fn clean_invalidate_surface(addr: usize, len: usize) {
-    #[cfg(target_arch = "aarch64")]
-    crate::arch::cache::clean_invalidate_range(addr, len);
-    #[cfg(not(target_arch = "aarch64"))]
-    let _ = (addr, len);
-}
-
 /// CNTVCT_EL0 ticks converted to microseconds at the generic timer's own rate. `CNTFRQ_EL0` is read
 /// per call (a system register read, cheap next to a 64 KiB checksum) and falls back to the Pi 4's
 /// 54 MHz if the firmware left it zero, so a bad `CNTFRQ` degrades the number rather than dividing
 /// by zero.
-#[cfg(target_arch = "aarch64")]
-fn cycles_to_us(dt: u64) -> u64 {
+pub(super) fn cycles_to_us(dt: u64) -> u64 {
     let frq: u64;
     unsafe {
         core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack, preserves_flags));
     }
     let frq = if frq == 0 { 54_000_000 } else { frq };
     dt.saturating_mul(1_000_000) / frq
-}
-
-/// `rdtsc` ticks converted to microseconds at the rate `apic::calibrate` measured against the ACPI
-/// PM timer. Same contract as the aarch64 reader: read the rate per call, and degrade rather than
-/// divide by zero if it is unavailable.
-///
-/// The uncalibrated fallback is deliberately the rate [`crate::arch::HW_WAIT_BUDGET`] already
-/// assumes for an uncalibrated TSC (1.25 GHz — that budget's 2.5e9 cycles over its 2 s), so the two
-/// consumers of an unknown TSC rate in this kernel guess the same number. An uncalibrated reading is
-/// wrong by whatever the real part's ratio to that figure is, in either direction, so a `torn=` or
-/// `slow=` verdict taken before calibration would not be evidence of anything — calibration happens
-/// long before any window composites, so no sample this witness prints is in that regime.
-#[cfg(target_arch = "x86_64")]
-fn cycles_to_us(dt: u64) -> u64 {
-    let hz = crate::arch::apic::tsc_hz();
-    let hz = if hz == 0 { 1_250_000_000 } else { hz };
-    dt.saturating_mul(1_000_000) / hz
 }
 
 /// Whether any window still has budget. Gates the present-side checksum so the instrument stops
@@ -812,7 +767,7 @@ pub fn begin(id: u32, surf: usize, surf_len: usize, compat: bool) -> Option<Prob
     }
     let cks_blit = checksum(surf, surf_len);
     // The coherency leg. See the module note on why this cleans as well as invalidates.
-    clean_invalidate_surface(surf, surf_len);
+    cache::clean_invalidate_range(surf, surf_len);
     let cks_civac = checksum(surf, surf_len);
 
     let seq = APP_SEQ[i].load(Ordering::Relaxed);

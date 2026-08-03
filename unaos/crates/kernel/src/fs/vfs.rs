@@ -402,12 +402,16 @@ fn components(rel: &str) -> impl Iterator<Item = &str> {
 /// it mounts through, so ONE `MountTable` can carry BOTH FAT volumes the Pi
 /// exposes at once — the SD boot partition ([`Default`](crate::fs::fat::BlockSource::Default),
 /// at `/fat`) and the hot-plugged USB stick ([`Usb`](crate::fs::fat::BlockSource::Usb),
-/// at `/usb`) — each reaching its own device. A `Usb`-sourced mount is **strictly
-/// read-only by construction** (PIUSB-27: the block layer's `write_sector`
-/// refuses any non-`Default` source, so no FAT/dir/data write can ever reach the
-/// stick); the adapter mirrors that guard at the VFS layer, refusing every write
-/// verb with [`VfsError::Unsupported`] BEFORE it touches the block path, so a
-/// caller gets a clean "read-only volume" answer rather than an opaque I/O error.
+/// at `/usb`) — each reaching its own device.
+///
+/// USBFALL F3 (was PIUSB-27): a `Usb`-sourced mount is **no longer read-only by
+/// construction**. USB-WRITE routed `fat::write_sector`'s `Usb` arm to the verified
+/// BOT WRITE(10) path, and [`FatBackend::read_only`] reports `false` for the `Usb`
+/// source on aarch64 (and for `Default` whenever the block layer will accept its
+/// writes — see USBFALL F1 there) — so FAT/dir/data writes DO reach the stick and the
+/// adapter passes write verbs through rather than refusing them. The residual cost
+/// is documented on `fat::with_fat_lock` (a `Usb` sector RMW is held under masked
+/// IRQs for the BOT deadline, not for a polled transfer).
 pub struct FatBackend {
     volume: String,
     /// The volume principal every object on this foreign volume inherits.
@@ -450,13 +454,30 @@ impl FatBackend {
         }
     }
 
-    /// VFS-3/USB-WRITE: is this a read-only mount? Every current source has a
+    /// VFS-3/USB-WRITE: is this a read-only mount? Both current sources have a
     /// verified write path (`Default` = SD, `Usb` = BOT WRITE(10) with the
-    /// MISSION RMW+restore witness), so no mount is read-only by construction
-    /// today; a future source without a verified write path returns true here.
+    /// MISSION RMW+restore witness), so neither is read-only *by construction*;
+    /// a future source without a verified write path returns true here.
+    ///
+    /// USBFALL F1: a `Default` mount is additionally read-only *by condition* when
+    /// the block layer would refuse its writes — i.e. on Pi bare-metal with no SD
+    /// registered, where `write_block` fails closed rather than substituting the
+    /// USB stick. Without this the boot LOOKED writable and every write failed
+    /// late with an opaque `Io`; now the mount answers honestly up front and the
+    /// VFS write verbs return `Unsupported` ("read-only volume") before touching
+    /// the block path. Byte-inert on a healthy SD boot (`default_writable()` is
+    /// true before the first mount) and on every non-`baremetal` target, where
+    /// `default_writable()` is a constant `true`. `Usb` is unaffected: it reaches
+    /// the stick through its own `write_block_usb` handle, which the F1 guard
+    /// deliberately does not gate.
     #[cfg(target_arch = "aarch64")]
     fn read_only(&self) -> bool {
-        false
+        match self.source {
+            crate::fs::fat::BlockSource::Default => {
+                !crate::drivers::block::default_writable()
+            }
+            crate::fs::fat::BlockSource::Usb => false,
+        }
     }
 
     /// Resolve a volume-relative path to its FAT directory entry by walking the

@@ -218,9 +218,11 @@ pub fn activate() {
     // constructed and reports `[wc-x] backbuffer resync WxH` on the wire there. The colour source is
     // `wm::DESKTOP_BG` — the same constant the fill above used — and no new one is invented. The
     // adoption is a back-buffer (cached RAM) fill; nothing reads the panel back.
-    super::screen::adopt_desktop_bg(wm::DESKTOP_BG);
+    // WC-BBSYNC's callee (`screen::adopt_desktop_bg`) is x86 re-land material (tier-3 sequencing)
+    // and absent from the merged screen.rs, so the ghost-box hazard above stands OPEN on the wc
+    // path until the re-land arc restores caller and callee together.
     serial_println!(
-        "[wc-x] backbuffer resync ARMED bg={:08X} (desktop layer not yet constructed)",
+        "[wc-x] backbuffer resync ABSENT bg={:08X} (re-land owed; ghost-box hazard open)",
         wm::DESKTOP_BG
     );
 

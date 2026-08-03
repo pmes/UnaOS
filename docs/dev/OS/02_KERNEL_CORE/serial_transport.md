@@ -235,6 +235,12 @@ headroom over it, 655 over the entire rest of the tree.
   other's, which is the precise failure being closed. Both seats read one number.
 * **Cost**: 64 × 1536 = 96 KiB of `.bss` per staging ring × 3 rings (wire, FTDI, recorder) = 288 KiB,
   uniform on both arches, present on metal.
+* **The headroom is margin, not slack — do not shrink it.** Line lengths grow with the tree: the
+  415-byte uvug6 verdict that made 1024 untenable was extended by an arc landed the SAME DAY this
+  width was chosen (PAL-TYPEMATIC), and the 200-byte tste scan window it also broke had hidden five
+  verdict families from every replay in this tree's history — no drop marker, no truncation, correct
+  on the wire, absent from the record. A future pass that sees 288 KiB of `.bss` and trims the width
+  re-opens exactly that failure mode, one witness extension at a time.
 
 Truncation is still counted, still announced, and now **self-evident on the wire**: a clipped line has
 its tail overwritten in place with `…⟨SERWIT-2W: line truncated here⟩`, so a human reading a capture

@@ -6,7 +6,7 @@
 // here after SCSI bring-up, and read/write are serviced by locking the xHCI controller.
 
 use spin::Mutex;
-use crate::drivers::xhci::{XHCI_CONTROLLER, CswStatus};
+use crate::drivers::xhci::{self, CswStatus, XhciClaimError, XhciLoan};
 
 /// MULTIBLK: the largest number of 512-byte blocks ONE `read_blocks`/`write_blocks` call may carry.
 /// It is the xHCI SCSI staging buffer's capacity (`xhci::STORAGE_MAX_BLOCKS`), re-exported here so
@@ -37,6 +37,51 @@ pub enum BlockError {
     NotReady,
     Io,
     BadLba,
+    /// WEDGE-8 (F3) / WEDGE-10 (F2): the storage device is loaned out to another context and this
+    /// call refused to wait for it — the xHCI controller mid-BOT-transaction or mid-service-pass,
+    /// or the microSD card mid-CMD17/CMD24 sector transfer. Callers that CAN wait — unmasked,
+    /// schedulable contexts — never see this from a healthy device: `claim_xhci_for_io` and
+    /// `emmc2::claim_for_io` each retry with a bounded `hlt` wait first. A caller running with IRQs
+    /// MASKED gets it immediately, because a masked wait on a driver lock is exactly the deadlock
+    /// this family is named for; the FAT layer retries OUTSIDE its masked span and surfaces
+    /// `-EAGAIN` on exhaustion.
+    Busy,
+}
+
+/// WEDGE-8 (F3): claim the xHCI controller for one block transaction.
+///
+/// Masked callers (the FAT/dir RMW spans under `without_interrupts`) get an INSTANT
+/// `BlockError::Busy` when the controller is loaned out — the whole point of F3 is that a masked
+/// context must never wait on a driver lock, because the loan holder is preemptible and, once
+/// preempted on this core, can only run again if this core takes timer IRQs.
+///
+/// Unmasked callers keep the old effectively-blocking semantics, honestly bounded: retry the claim
+/// with a `hlt` between attempts (each wakes on the next IRQ, letting the scheduler run the loan
+/// holder) up to `hw_wait_budget()` wall-clock — long enough for any healthy service pass or BOT
+/// transaction, short enough that a wedged 25 s failing-transfer hold surfaces as `Busy` instead of
+/// hanging the caller forever.
+fn claim_xhci_for_io() -> Result<XhciLoan, BlockError> {
+    match xhci::claim() {
+        Ok(l) => return Ok(l),
+        Err(XhciClaimError::NotReady) => return Err(BlockError::NotReady),
+        Err(XhciClaimError::Busy) => {}
+    }
+    if crate::arch::irqs_masked() {
+        return Err(BlockError::Busy);
+    }
+    let start = crate::arch::now_cycles();
+    let budget = crate::arch::hw_wait_budget();
+    loop {
+        crate::hlt();
+        match xhci::claim() {
+            Ok(l) => return Ok(l),
+            Err(XhciClaimError::NotReady) => return Err(BlockError::NotReady),
+            Err(XhciClaimError::Busy) => {}
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+            return Err(BlockError::Busy);
+        }
+    }
 }
 
 /// BOTEV: one-shot latches for the "concrete cause" witness below. `BlockError::Io` is the coarse
@@ -198,8 +243,8 @@ pub fn read_block_usb(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
     if lba >= dev.num_blocks {
         return Err(BlockError::BadLba);
     }
-    let mut guard = XHCI_CONTROLLER.lock();
-    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    // WEDGE-8 (F3): a claimed LOAN, not a held lock — the BOT pump below runs with no lock held.
+    let mut xhci = claim_xhci_for_io()?;
     match xhci.storage_read10(lba as u32, 1) {
         Ok(res) if res.status == CswStatus::Passed => {}
         other => {
@@ -229,8 +274,8 @@ pub fn write_block_usb(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     if lba >= dev.num_blocks {
         return Err(BlockError::BadLba);
     }
-    let mut guard = XHCI_CONTROLLER.lock();
-    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    // WEDGE-8 (F3): a claimed LOAN, not a held lock — the BOT pump below runs with no lock held.
+    let mut xhci = claim_xhci_for_io()?;
     let dst = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
     let n = (dev.block_size as usize).min(buf.len());
     unsafe {
@@ -369,6 +414,59 @@ pub fn register_sd(dev: BlockDeviceInfo) {
     BACKEND.store(BACKEND_SD, Ordering::Release);
 }
 
+/// USBFALL F1: one-shot latch for the fail-closed refusal witness, so a write-heavy caller that keeps
+/// retrying cannot flood the console with the same line.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static SUBST_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// USBFALL F1: close the fail-OPEN backend substitution on the Pi bare-metal build.
+///
+/// On `aarch64 + baremetal` the canonical `Default` backend is the microSD: `emmc2::probe()` runs on the BSP
+/// synchronously (`main.rs`), long before any FAT-writing consumer, and flips `BACKEND` to `BACKEND_SD` from
+/// `register_sd`. If the card fails identify, `BACKEND` stays `BACKEND_XHCI` — and a later-enumerated USB
+/// stick populates the global `BLOCK_DEVICE` via `publish_usb_geometry`, at which point every
+/// `BlockSource::Default` WRITE silently lands on somebody's USB stick instead of the boot card. That is a
+/// fail-open SUBSTITUTION of one physical device for another, and it is what this refuses: on a build whose
+/// canonical backend is SD, a `Default` write with no registered SD returns `NotReady` and says so on serial
+/// once, producing an honest "no writable volume" boot instead of misdirected writes.
+///
+/// Deliberately WRITES ONLY. Reads may still fall through to the BOT path — a read cannot corrupt the wrong
+/// device, and the USB mount has its own dedicated `read_block_usb` handle regardless.
+///
+/// Deliberately `baremetal`-gated, NOT a blanket "xHCI writes are suspect" rule. On QEMU-virt aarch64
+/// (`test-arm`) and on x86 the SD backend is never compiled, xHCI IS the legitimate sole backend, and this
+/// function does not exist — those builds keep their pre-USBFALL write path byte-for-byte. The refusal is
+/// about substitution on a platform that has a canonical backend, not about xHCI.
+///
+/// Byte-inert on a healthy SD boot: `BACKEND_SD` is set before the first FAT write, so this returns `Ok`
+/// without touching the console.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn default_writable() -> bool {
+    BACKEND.load(Ordering::Acquire) == BACKEND_SD
+}
+
+/// USBFALL F1: targets without the SD backend (x86, QEMU-virt aarch64) have no substitution to refuse — the
+/// enumerated device IS the canonical `Default` backend, so `Default` writes are available whenever the block
+/// layer has one at all. Constant `true` keeps `write_block` and every `read_only()` consumer byte-identical
+/// to pre-USBFALL there.
+#[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+pub fn default_writable() -> bool {
+    true
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn guard_default_write_backend() -> Result<(), BlockError> {
+    if default_writable() {
+        return Ok(());
+    }
+    if !SUBST_REFUSED.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            ":: USBFALL: no SD backend registered — refusing Default WRITE (would land on the USB stick) ::"
+        );
+    }
+    Err(BlockError::NotReady)
+}
+
 /// Read one block (`lba`) into `buf`. Locks BLOCK_DEVICE only briefly (to read geometry),
 /// then locks the xHCI controller — never both at once — so there is no nested-lock deadlock.
 /// Returns the number of bytes copied.
@@ -380,13 +478,18 @@ pub fn read_block(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 
     // M6g: SD backend routes to the EMMC2/SDHCI driver; the xHCI body below is unchanged (and the
     // only path an x86 build compiles). read_block_512 re-guards the lba against its own num_blocks.
+    // WEDGE-10 (F2): this arm carries the same masked-instant-`Busy` / unmasked-bounded-wait split as
+    // `claim_xhci_for_io` below — implemented inside `emmc2::claim_for_io`, one level down, because the
+    // INSTALL-PI target calls `read_block_512`/`write_block_512` directly and must get the policy too.
+    // `Busy` therefore propagates from here exactly as it does from the xHCI arm, and `fat.rs` retries
+    // it outside its masked span.
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     if BACKEND.load(Ordering::Acquire) == BACKEND_SD {
         return crate::drivers::emmc2::read_block_512(lba, buf);
     }
 
-    let mut guard = XHCI_CONTROLLER.lock();
-    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    // WEDGE-8 (F3): a claimed LOAN, not a held lock — the BOT pump below runs with no lock held.
+    let mut xhci = claim_xhci_for_io()?;
 
     match xhci.storage_read10(lba as u32, 1) {
         Ok(res) if res.status == CswStatus::Passed => {}
@@ -405,6 +508,11 @@ pub fn read_block(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 
 /// Write one block (`lba`) from `buf` (zero-padded to the block size).
 pub fn write_block(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    // USBFALL F1: fail CLOSED rather than substituting the USB stick for a missing SD card. See
+    // `guard_default_write_backend` — compiled only where SD is the canonical backend (Pi bare-metal).
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    guard_default_write_backend()?;
+
     let dev = info().ok_or(BlockError::NotReady)?;
     if lba >= dev.num_blocks {
         return Err(BlockError::BadLba);
@@ -413,13 +521,16 @@ pub fn write_block(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     // U9: the SD backend now services in-place block WRITES (polled CMD24), routing to the EMMC2/SDHCI
     // driver just as reads route to `read_block_512`. write_block_512 re-guards the lba against its own
     // num_blocks. The xHCI body below is unchanged (and the only path an x86 build compiles).
+    // WEDGE-10 (F2): see the `read_block` arm — `emmc2::claim_for_io` applies the masked-instant-`Busy`
+    // split under this call, and the ~1.3 s CMD24 + programming-busy + CMD13 ladder now runs on a
+    // claimed loan with no driver lock held.
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     if BACKEND.load(Ordering::Acquire) == BACKEND_SD {
         return crate::drivers::emmc2::write_block_512(lba, buf);
     }
 
-    let mut guard = XHCI_CONTROLLER.lock();
-    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    // WEDGE-8 (F3): a claimed LOAN, not a held lock — the BOT pump below runs with no lock held.
+    let mut xhci = claim_xhci_for_io()?;
 
     // Stage the data into the controller's DMA buffer, then issue WRITE(10).
     let dst = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
@@ -506,8 +617,11 @@ pub fn read_blocks(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
         return Ok(buf.len());
     }
 
-    let mut guard = XHCI_CONTROLLER.lock();
-    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    // WEDGE-8: claim the controller as a LOAN — no lock is held across the BOT transaction below.
+    // `claim_xhci_for_io` returns `Busy` immediately to a masked caller (a masked wait on a driver
+    // lock IS the F3 deadlock) and otherwise waits its own bounded, unmasked budget.
+    let mut loan = claim_xhci_for_io()?;
+    let xhci = &mut *loan;
     match xhci.storage_read10(lba as u32, count as u16) {
         Ok(res) if res.status == CswStatus::Passed => {}
         other => {
@@ -537,8 +651,11 @@ pub fn write_blocks(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
         return Ok(());
     }
 
-    let mut guard = XHCI_CONTROLLER.lock();
-    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    // WEDGE-8: claim the controller as a LOAN — no lock is held across the BOT transaction below.
+    // `claim_xhci_for_io` returns `Busy` immediately to a masked caller (a masked wait on a driver
+    // lock IS the F3 deadlock) and otherwise waits its own bounded, unmasked budget.
+    let mut loan = claim_xhci_for_io()?;
+    let xhci = &mut *loan;
     let dst = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
     unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()); }
     match xhci.storage_write10(lba as u32, count as u16) {
@@ -556,8 +673,11 @@ pub fn write_blocks(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
 pub fn read_blocks_usb(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
     let dev = usb_info().ok_or(BlockError::NotReady)?;
     let count = span_blocks(&dev, lba, buf.len())?;
-    let mut guard = XHCI_CONTROLLER.lock();
-    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    // WEDGE-8: claim the controller as a LOAN — no lock is held across the BOT transaction below.
+    // `claim_xhci_for_io` returns `Busy` immediately to a masked caller (a masked wait on a driver
+    // lock IS the F3 deadlock) and otherwise waits its own bounded, unmasked budget.
+    let mut loan = claim_xhci_for_io()?;
+    let xhci = &mut *loan;
     match xhci.storage_read10(lba as u32, count as u16) {
         Ok(res) if res.status == CswStatus::Passed => {}
         other => {
@@ -576,8 +696,11 @@ pub fn read_blocks_usb(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 pub fn write_blocks_usb(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     let dev = usb_info().ok_or(BlockError::NotReady)?;
     let count = span_blocks(&dev, lba, buf.len())?;
-    let mut guard = XHCI_CONTROLLER.lock();
-    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    // WEDGE-8: claim the controller as a LOAN — no lock is held across the BOT transaction below.
+    // `claim_xhci_for_io` returns `Busy` immediately to a masked caller (a masked wait on a driver
+    // lock IS the F3 deadlock) and otherwise waits its own bounded, unmasked budget.
+    let mut loan = claim_xhci_for_io()?;
+    let xhci = &mut *loan;
     let dst = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
     unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()); }
     match xhci.storage_write10(lba as u32, count as u16) {

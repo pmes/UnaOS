@@ -32,6 +32,10 @@
 
 pub mod fbcon;
 pub mod framebuffer;
+// CRISPY-PI: the Crispy theme lifted from `kits/crispy/theme.json` (@ us-crispy 08b42ede) into a
+// (theme is declared below with its CRISPY-PI authorship note — a duplicate declaration here was
+// the MERGE-SWEEP defect: both branches added `pub mod theme;` independently and git auto-merged
+// them into two declarations WITHOUT raising a conflict. One survives, with the fuller provenance.)
 pub mod screen;
 // WC-A: the window table + compositor. Owns which pixels of which surface reach the panel; the
 // aarch64 window syscalls (WC-B) are thin fail-closed wrappers over its API.

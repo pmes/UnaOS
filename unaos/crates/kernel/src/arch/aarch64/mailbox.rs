@@ -18,8 +18,24 @@
 //     before posting and invalidated after the reply (arch::aarch64::cache). No-ops in QEMU.
 //
 // The GPU/DMA mutates the `MBOX` static behind the compiler's back, so every reply word is read
-// with `read_volatile` *after* `mbox_call` returns — never through a `&mut` held across the call,
+// with `read_volatile` *after* the call returns — never through a `&mut` held across the call,
 // which the optimiser could satisfy from a stale register.
+//
+// MBOX-1 adds two properties the transport lacked, both about how it behaves when it goes WRONG:
+//
+//   * **It fails clean.** A timed-out call used to return `false` and leave the FIFO and the request
+//     buffer exactly as the failure found them — so a late firmware reply became the next call's
+//     doorbell, and a failure-path buffer read hit our own posted words in the data cache and read
+//     them as a reply. Every timeout exit now drains the read FIFO (bounded) and runs the same cache
+//     invalidate the success path does, and says on the wire how many stale words it discarded. See
+//     `MboxLoan::timeout_clean`. This matters beyond one call: a wedged property channel takes the
+//     framebuffer, V3D power/clock, the `NOTIFY_XHCI_RESET` firmware reload and EMMC2's SD base
+//     clock down with it.
+//   * **It has ONE user at a time, and says so.** `MBOX` was a bare `static mut` resting on a
+//     "single-core boot, single-threaded" premise that the call graph no longer supports. It now
+//     lives behind a WEDGE-8-shaped claim/loan (`claim` / `MboxLoan`): a mutex held only for a
+//     masked O(1) take/put, the transport loaned out for the long CNTPCT poll with nothing held, and
+//     an immediate honest `Busy` for contenders. See `claim` for the audit and the reasoning.
 
 use unaos_boot_info::{FrameBufferInfo, PixelFormat};
 
@@ -38,6 +54,11 @@ const MBOX_WRITE: usize = MBOX_BASE + 0x20;
 const MBOX_FULL: u32 = 0x8000_0000; // STATUS: write FIFO full  -> can't post
 const MBOX_EMPTY: u32 = 0x4000_0000; // STATUS: read FIFO empty -> nothing to read
 const MBOX_RESPONSE: u32 = 0x8000_0000; // request-code reply: success
+/// Request-code reply: "error parsing request buffer" — the VPU read the message and found it
+/// MALFORMED. It wrote, but it never looked at any tag inside, so this code must never be read as
+/// evidence that a tag was acted on (PI-V3D-81, `NoReplySend::buffer_rejected`).
+#[cfg(feature = "v3d81")]
+const MBOX_ERROR: u32 = 0x8000_0001;
 
 const CH_PROP: u32 = 8; // ARM -> VC property tags
 
@@ -74,6 +95,8 @@ const TAG_GET_CLOCK_RATE: u32 = 0x0003_0002; // M6g: query a clock's current rat
 // byte-identical to baseline (these are additive, not called on any default path).
 #[cfg(any(feature = "v3d", feature = "piusb"))]
 const TAG_SET_DOMAIN_STATE: u32 = 0x0003_8030; // set a power-domain's on/off state (value {domain, state})
+const TAG_SET_ENABLE_QPU: u32 = 0x0003_0012; // firmware-side QPU/V3D enable (value {enable}) — the VPU init path the KMS overlay boot runs and a bare-metal boot never receives (PI-V3D-75)
+const TAG_NOTIFY_DISPLAY_DONE: u32 = 0x0003_0066; // vc4's probe-time handover: "firmware display driver, stop — the ARM owns the complex now" (PI-V3D-80)
 #[cfg(any(feature = "v3d", feature = "piusb"))]
 const TAG_SET_CLOCK_STATE: u32 = 0x0003_8001; // enable/disable a clock's GATE (value {clock_id, state})
 #[cfg(feature = "v3d")]
@@ -147,18 +170,33 @@ const fn parse_u32(s: Option<&str>) -> u32 {
     v
 }
 
-/// The property message buffer. One static buffer, used only during single-core boot
-/// (build_boot_info, before SMP/interrupts), so no locking is needed. The framebuffer message is
-/// 35 words; 48 words (192 bytes) rounds the allocation up to whole 64-byte cache lines so the
-/// clean/invalidate over it can't touch a neighbouring static's lines. **64-byte aligned** for the
-/// same reason — `DC IVAC/CIVAC` operate on whole lines, so a sub-line-aligned buffer would let a
-/// maintenance op clobber adjacent data; a line-aligned, line-padded buffer is self-contained. The
-/// mailbox ABI's own 16-byte alignment requirement is subsumed by this.
+/// The property message buffer. The framebuffer message is 35 words; 48 words (192 bytes) rounds
+/// the allocation up to whole 64-byte cache lines so the clean/invalidate over it can't touch a
+/// neighbouring static's lines. **64-byte aligned** for the same reason — `DC IVAC/CIVAC` operate on
+/// whole lines, so a sub-line-aligned buffer would let a maintenance op clobber adjacent data; a
+/// line-aligned, line-padded buffer is self-contained. The mailbox ABI's own 16-byte alignment
+/// requirement is subsumed by this.
+///
+/// MBOX-1: this buffer is reachable ONLY through [`MboxLoan`]. It used to be a bare `static mut` on
+/// the premise that mailbox use is confined to single-core boot; see [`claim`] for why that premise
+/// is false and what replaced it.
 #[repr(C, align(64))]
 struct MboxBuf {
     words: [u32; 48],
 }
 static mut MBOX: MboxBuf = MboxBuf { words: [0; 48] };
+
+/// MBOX-1 — the transport's availability flag, and the ONLY lock in this module. `true` = the
+/// transport is on the shelf; `false` = it is loaned to exactly one context. Held for a masked O(1)
+/// take/put and nothing else (WEDGE-8 discipline, `drivers/xhci::claim`): the LONG work — a property
+/// transaction whose CNTPCT deadline runs to 500 ms by default and 5 s for `NOTIFY_DISPLAY_DONE` —
+/// runs with this mutex NOT held, so no masked spinner can ever wait on it for more than a few dozen
+/// cycles and no holder of it can be preempted mid-hold.
+///
+/// The invariant is grep-checkable, the F1/WEDGE-8 idiom: `MBOX_FREE.lock()` appears ONLY in
+/// [`claim`] and `MboxLoan::drop`, and `MBOX` itself is named only by [`mbox_phys`] and the
+/// [`MboxLoan`] accessors — the statics are private, so the compiler enforces the rest.
+static MBOX_FREE: spin::Mutex<bool> = spin::Mutex::new(true);
 
 #[inline]
 fn mmio_read(addr: usize) -> u32 {
@@ -169,22 +207,140 @@ fn mmio_write(addr: usize, val: u32) {
     unsafe { core::ptr::write_volatile(addr as *mut u32, val) }
 }
 
-/// Base address of the `MBOX` static as a `usize` (for cache ranges and the post address).
+/// Base address of the `MBOX` static as a `usize` (for cache ranges and the post address). Takes an
+/// address only — never dereferences — so it needs no loan.
 #[inline]
 fn mbox_phys() -> usize {
     &raw const MBOX as usize
 }
-/// Read reply word `idx` straight from RAM. Use only after `mbox_call`: the GPU wrote the reply
-/// and `mbox_call` invalidated our cached copy, so this volatile load re-fetches the fresh value.
-#[inline]
-fn reply(idx: usize) -> u32 {
-    unsafe { core::ptr::read_volatile(&raw const MBOX.words[idx]) }
+
+/// MBOX-1 — the hard cap on any read-FIFO drain. A FIFO that will not empty in this many words is a
+/// fault, not a queue, and spinning on one would hang the boot the drain is meant to protect.
+const DRAIN_MAX: u32 = 64;
+
+/// MBOX-1 — empty the read FIFO without waiting for anything, returning how many words were
+/// discarded. Bounded by construction (see [`DRAIN_MAX`]). Pure MMIO: it touches the FIFO, never the
+/// request buffer, which is why it is callable with or without a loan.
+fn drain_read_fifo_bounded() -> u32 {
+    let mut n = 0;
+    while mmio_read(MBOX_STATUS) & MBOX_EMPTY == 0 && n < DRAIN_MAX {
+        let _ = mmio_read(MBOX_READ);
+        n += 1;
+    }
+    n
 }
-/// Write request word `idx`. Volatile so the store is committed to memory before `mbox_call`'s
-/// cache-clean pushes it to the GPU (no reliance on the optimiser ordering plain stores).
-#[inline]
-fn request(idx: usize, val: u32) {
-    unsafe { core::ptr::write_volatile(&raw mut MBOX.words[idx], val) }
+
+/// Why [`claim`] handed back no transport. One variant only: unlike the xHCI controller the mailbox
+/// is never "not yet installed" — it is a static buffer plus always-present MMIO, live from the
+/// first instruction — so `Busy` is the whole failure space.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MboxClaimError {
+    /// Another context holds the transport right now. The claim did NOT wait: waiting is the
+    /// caller's decision, and a masked caller must not.
+    Busy,
+}
+
+/// MBOX-1 — an exclusive loan of the VideoCore property transport: the `MBOX` request buffer and the
+/// mailbox FIFO pair, which are one indivisible resource (the buffer is where the reply lands, so a
+/// second writer between our post and our read-back corrupts both transactions). Dropping it returns
+/// the transport to the shelf — a masked O(1) put, panic-safe by RAII.
+///
+/// Every accessor that touches `MBOX` is a method here, so "no mailbox access without the loan" is a
+/// compile-time property of this module rather than a comment asking readers to be careful.
+pub struct MboxLoan(());
+
+impl Drop for MboxLoan {
+    fn drop(&mut self) {
+        // MBOX-1: masked micro-hold. Local order is the discipline in miniature — `guard` drops
+        // before `_mask` restores, so we never run unmasked while holding the lock.
+        let _mask = crate::arch::IrqMask::new();
+        let mut guard = MBOX_FREE.lock();
+        *guard = true;
+    }
+}
+
+/// MBOX-1 — claim exclusive use of the property transport. O(1), never waits.
+///
+/// ### The premise this replaces
+/// `MBOX` was a bare `static mut`, justified in a dozen doc comments by "single-user: boot-time,
+/// single-threaded, the framebuffer call is long done". That is no longer true, and the audit says
+/// where it stopped being true:
+///   * `emmc2::probe()` (`main.rs`) runs its `GET_CLOCK_RATE` on the BSP **after**
+///     `sched::start_aps` has put the secondaries to work — the two calls are adjacent lines.
+///   * `piusb::bringup_task` → `enumerate` → `notify_before_reset` → [`notify_xhci_reset`] runs
+///     later still, on the BSP, *past the GUI/input/render task spawn*, with AP tasks live.
+/// Neither is the single-threaded boot window the comments describe. No current caller runs masked
+/// and no current caller runs on an AP, so nothing has been observed to corrupt yet — but the
+/// premise the safety rested on is gone, and a torn property transaction is not a defect that
+/// announces itself: it hands back a plausible reply word from the wrong tag.
+///
+/// ### Why claim/loan and not a masked guard
+/// WEDGE-7 (`video::wm::table`) masks across the critical section, which is affordable there because
+/// every TABLE hold is a bounded row scan. A property transaction is not: it polls a CNTPCT deadline
+/// of 500 ms by default and 5 s for `NOTIFY_DISPLAY_DONE`, against a 12 ms quantum. Masking a core
+/// for half a second — let alone five — is the bug in another coat, and holding a plain mutex across
+/// it is the WEDGE-8 F3 death (a preempted holder that a masked spinner on the same core can never
+/// let run again). So WEDGE-8's shape applies: the mutex guards a masked O(1) take/put, the
+/// TRANSPORT is loaned out for the long poll with no lock held, and contenders get an immediate
+/// honest [`MboxClaimError::Busy`] instead of a wait.
+fn claim() -> Result<MboxLoan, MboxClaimError> {
+    let _mask = crate::arch::IrqMask::new();
+    let mut guard = MBOX_FREE.lock();
+    if *guard {
+        *guard = false;
+        Ok(MboxLoan(()))
+    } else {
+        Err(MboxClaimError::Busy)
+    }
+}
+
+/// MBOX-1 — the ONE caller policy that is not "fail loud": retry the claim, unmasked and bounded,
+/// for up to `budget_ms`. Used only by [`get_clock_rate`], whose refusal has a real cost — the EMMC2
+/// probe falls back to *assuming* 100 MHz for the SD base clock, which programs a wrong divider
+/// rather than merely losing a diagnostic. Every other entry point fails loud instead, because for
+/// them a `Busy` costs a log line and nothing else.
+///
+/// Refuses to wait at all when IRQs are masked (`arch::irqs_masked`, the WEDGE-8 rule): a masked
+/// waiter cannot be preempted OR take a timer IRQ, so spinning there is exactly the deadlock the
+/// claim/loan model exists to prevent. No caller is masked today; the check is what keeps that from
+/// silently changing.
+fn claim_bounded(budget_ms: u64) -> Result<MboxLoan, MboxClaimError> {
+    let first = claim();
+    if first.is_ok() || crate::arch::irqs_masked() {
+        return first;
+    }
+    let deadline = super::timer::cntpct() + cntfrq() / 1000 * budget_ms;
+    loop {
+        if let Ok(l) = claim() {
+            return Ok(l);
+        }
+        if super::timer::cntpct() >= deadline {
+            return Err(MboxClaimError::Busy);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// MBOX-1 — the refusal witness. One line, naming the operation that was turned away, so a `None`
+/// caused by contention is never mistaken on the wire for a `None` caused by a dead VideoCore. Same
+/// `:: MAILBOX: ... ::` grammar as the timeout witnesses.
+#[cold]
+fn witness_busy(op: &str) {
+    serial_println!(":: MAILBOX: BUSY — {} refused, transport loaned to another context ::", op);
+}
+
+/// MBOX-1 — claim or bail with this entry point's documented failure value, emitting the refusal
+/// witness on the way out. Keeps the Busy policy to one line per entry point instead of five.
+macro_rules! claim_or {
+    ($op:expr, $bail:expr) => {
+        match claim() {
+            Ok(loan) => loan,
+            Err(_) => {
+                witness_busy($op);
+                return $bail;
+            }
+        }
+    };
 }
 
 /// What `init_framebuffer` resolved: an ARM-physical framebuffer the video stack can draw on.
@@ -214,74 +370,135 @@ fn cntfrq() -> u64 {
 /// return false so init_framebuffer yields None and the kernel degrades to the serial console,
 /// mirroring the x86 xHCI wall-clock-deadline discipline. (QEMU always replies, so this never
 /// fires there.)
-fn mbox_call(len: usize) -> bool {
-    let buf_phys = mbox_phys() as u32;
-
-    // Clean our request out to RAM so the GPU (which doesn't snoop our cache) sees it.
-    cache::clean_range(mbox_phys(), len * 4);
-
-    // ~500 ms budget — generous vs the microseconds a real reply takes. CNTPCT is monotonic and
-    // won't wrap within any boot window, so a plain `>=` compare is sound.
-    let deadline = super::timer::cntpct() + cntfrq() / 2;
-    let timed_out = || super::timer::cntpct() >= deadline;
-
-    // Post: VC bus address of the buffer in the high 28 bits, channel in the low 4. Match Circle's
-    // BUS_ADDRESS exactly — strip any alias bits then OR the uncached alias — so a buffer that
-    // happened to sit above 1 GiB still resolves (it can't here; the kernel is in low RAM). The
-    // 64-byte alignment guarantees the low 4 bits are clear for the channel.
-    let msg = ((buf_phys & BUS_TO_PHYS) | BUS_UNCACHED) | CH_PROP;
-    while mmio_read(MBOX_STATUS) & MBOX_FULL != 0 {
-        if timed_out() {
-            serial_println!(":: MAILBOX: timeout waiting for write FIFO ::");
-            return false;
-        }
-        core::hint::spin_loop();
+impl MboxLoan {
+    /// Read reply word `idx` straight from RAM. Use only after [`Self::call`]: the GPU wrote the
+    /// reply and the call invalidated our cached copy, so this volatile load re-fetches the fresh
+    /// value. MBOX-1: on a call that FAILED the invalidate still ran (see [`Self::timeout_clean`]),
+    /// so this reads the GPU's memory rather than a cache hit on our own request words.
+    #[inline]
+    fn reply(&self, idx: usize) -> u32 {
+        unsafe { core::ptr::read_volatile(&raw const MBOX.words[idx]) }
     }
-    mmio_write(MBOX_WRITE, msg);
 
-    // Spin for *our* channel's reply (the property channel is the only one we use, but the FIFO is
-    // shared, so match the channel and discard anything else).
-    loop {
-        while mmio_read(MBOX_STATUS) & MBOX_EMPTY != 0 {
+    /// Write request word `idx`. Volatile so the store is committed to memory before [`Self::call`]'s
+    /// cache-clean pushes it to the GPU (no reliance on the optimiser ordering plain stores).
+    #[inline]
+    fn request(&mut self, idx: usize, val: u32) {
+        unsafe { core::ptr::write_volatile(&raw mut MBOX.words[idx], val) }
+    }
+
+    #[inline]
+    fn call(&mut self, len: usize) -> bool {
+        // ~500 ms budget — generous vs the microseconds a real reply takes.
+        self.call_budget(len, 500)
+    }
+
+    /// MBOX-1 — the timeout exit, and the only one. Returns `false` for the caller, but never before
+    /// putting the transport back in a state the NEXT call can trust:
+    ///
+    ///   * **Drain the read FIFO** (bounded, [`DRAIN_MAX`]). A firmware reply that arrives after our
+    ///     deadline is still coming; left in the FIFO it becomes the *next* call's doorbell, and that
+    ///     call then reads a buffer belonging to a tag it never sent. One late reply silently
+    ///     mis-attributes every transaction after it.
+    ///   * **Invalidate the buffer**, exactly as the success path does. Without this our own posted
+    ///     request words stay in the data cache, so a caller that reads reply slots on the failure
+    ///     path — [`notify_xhci_reset`] does, unconditionally — gets a cache hit on what it wrote and
+    ///     reads it as a reply. PIUSB-12 relies on the `echo` slot reading back 0 *as proof the
+    ///     invalidate happened*; on the old timeout path it read back the posted `dev_addr` and
+    ///     inverted that witness.
+    ///
+    /// Why this matters beyond one call: a wedged property channel takes the framebuffer, V3D
+    /// power/clock, the `NOTIFY_XHCI_RESET` firmware reload and EMMC2's SD base clock down with it.
+    /// The transport is allowed to fail — it is not allowed to fail DIRTY.
+    #[cold]
+    fn timeout_clean(&mut self, len: usize, what: &str) -> bool {
+        let drained = drain_read_fifo_bounded();
+        cache::clean_invalidate_range(mbox_phys(), len * 4);
+        serial_println!(
+            ":: MAILBOX: timeout {} — drained {} stale FIFO word(s), buffer invalidated ::",
+            what, drained
+        );
+        false
+    }
+
+/// PI-V3D-80: same call, caller-chosen reply budget, for a caller that has reason to think its tag
+/// takes longer than the default 500 ms. The kernel's mailbox wait is unbounded; ours stays
+/// bounded, just wider where the work is real.
+///
+/// ⚠ PI-V3D-81 correction (v3d.md §46.5). This entry point was added on the reading that
+/// `NOTIFY_DISPLAY_DONE` merely replies SLOWLY — that the firmware stops its whole display driver
+/// before answering. That reading is wrong, and no budget can repair it: P92 timed out at 500 ms,
+/// P93 timed out at 5 s, and the same P93 capture shows `NOTIFY_XHCI_RESET` timing out *while the
+/// VL805 firmware load it requests demonstrably works*. On this firmware a NOTIFY-class tag is
+/// acted on WITHOUT ever ringing the read FIFO, so a timeout here is a statement about the
+/// DOORBELL and not about the tag. Widening the budget only makes that statement more slowly. To
+/// read such a tag, post it with [`post_noreply`] and read its EFFECT.
+    fn call_budget(&mut self, len: usize, budget_ms: u64) -> bool {
+        let buf_phys = mbox_phys() as u32;
+
+        // Clean our request out to RAM so the GPU (which doesn't snoop our cache) sees it.
+        cache::clean_range(mbox_phys(), len * 4);
+
+        // CNTPCT is monotonic and won't wrap within any boot window, so a plain `>=` compare is sound.
+        let deadline = super::timer::cntpct() + cntfrq() / 1000 * budget_ms;
+        let timed_out = || super::timer::cntpct() >= deadline;
+
+        // Post: VC bus address of the buffer in the high 28 bits, channel in the low 4. Match Circle's
+        // BUS_ADDRESS exactly — strip any alias bits then OR the uncached alias — so a buffer that
+        // happened to sit above 1 GiB still resolves (it can't here; the kernel is in low RAM). The
+        // 64-byte alignment guarantees the low 4 bits are clear for the channel.
+        let msg = ((buf_phys & BUS_TO_PHYS) | BUS_UNCACHED) | CH_PROP;
+        while mmio_read(MBOX_STATUS) & MBOX_FULL != 0 {
             if timed_out() {
-                serial_println!(":: MAILBOX: timeout waiting for reply ::");
-                return false;
+                return self.timeout_clean(len, "waiting for write FIFO");
             }
             core::hint::spin_loop();
         }
-        let resp = mmio_read(MBOX_READ);
-        if resp & 0xF == CH_PROP {
-            break;
-        }
-        if timed_out() {
-            serial_println!(":: MAILBOX: timeout (only other-channel replies) ::");
-            return false;
-        }
-    }
+        mmio_write(MBOX_WRITE, msg);
 
-    // The GPU wrote its reply straight to RAM; drop our stale cached copy before reading it back.
-    // Clean+invalidate (not bare invalidate) is the always-safe choice — if any line were still
-    // dirty it's written back rather than discarded over the GPU's reply.
-    cache::clean_invalidate_range(mbox_phys(), len * 4);
-    reply(1) == MBOX_RESPONSE
+        // Spin for *our* channel's reply (the property channel is the only one we use, but the FIFO is
+        // shared, so match the channel and discard anything else).
+        loop {
+            while mmio_read(MBOX_STATUS) & MBOX_EMPTY != 0 {
+                if timed_out() {
+                    return self.timeout_clean(len, "waiting for reply");
+                }
+                core::hint::spin_loop();
+            }
+            let resp = mmio_read(MBOX_READ);
+            if resp & 0xF == CH_PROP {
+                break;
+            }
+            if timed_out() {
+                return self.timeout_clean(len, "(only other-channel replies)");
+            }
+        }
+
+        // The GPU wrote its reply straight to RAM; drop our stale cached copy before reading it back.
+        // Clean+invalidate (not bare invalidate) is the always-safe choice — if any line were still
+        // dirty it's written back rather than discarded over the GPU's reply.
+        cache::clean_invalidate_range(mbox_phys(), len * 4);
+        self.reply(1) == MBOX_RESPONSE
+    }
 }
 
 /// Ask the firmware for the current physical (display) resolution — the mode it auto-set from the
 /// monitor at boot. Returns `None` if the call fails or the size is implausible, so the caller
 /// falls back to a fixed mode.
 fn query_display_size() -> Option<(u32, u32)> {
-    request(0, 8 * 4); // total size (8 words used)
-    request(1, 0); // request
-    request(2, TAG_GET_PHYS_WH);
-    request(3, 8); // value buffer size
-    request(4, 0); // request code
-    request(5, 0); // width  (reply)
-    request(6, 0); // height (reply)
-    request(7, TAG_END);
-    if !mbox_call(8) {
+    let mut m = claim_or!("GET_PHYS_WH (display mode)", None);
+    m.request(0, 8 * 4); // total size (8 words used)
+    m.request(1, 0); // request
+    m.request(2, TAG_GET_PHYS_WH);
+    m.request(3, 8); // value buffer size
+    m.request(4, 0); // request code
+    m.request(5, 0); // width  (reply)
+    m.request(6, 0); // height (reply)
+    m.request(7, TAG_END);
+    if !m.call(8) {
         return None;
     }
-    let (width, height) = (reply(5), reply(6));
+    let (width, height) = (m.reply(5), m.reply(6));
     // Reject 0 (no mode) and absurd sizes; the back buffer must fit the 48 MiB heap.
     if (640..=3840).contains(&width) && (480..=2160).contains(&height) {
         Some((width, height))
@@ -293,45 +510,390 @@ fn query_display_size() -> Option<(u32, u32)> {
 /// M6g: ask the VideoCore firmware for a clock's current rate in Hz (RPi firmware property interface,
 /// tag `GET_CLOCK_RATE`; value buffer `{clock_id, rate}`). Returns `None` on a mailbox failure or a
 /// zero rate (clock not present / not running). Used ONLY by the EMMC2 probe on the BSP to resolve the
-/// SDHCI base clock when the controller's own `CAPABILITIES` base-clock field reads zero. The `MBOX`
-/// static is single-user: the boot framebuffer call is long done by SMP/probe time, and the probe runs
-/// single-threaded on the BSP (before the loader task is spawned), so no lock is needed — same as the
-/// framebuffer calls above.
+/// SDHCI base clock when the controller's own `CAPABILITIES` base-clock field reads zero.
+///
+/// MBOX-1 — the one BOUNDED-RETRY caller. The old doc here claimed the `MBOX` static was single-user
+/// because "the probe runs single-threaded on the BSP"; `emmc2::probe()` is in fact the line after
+/// `sched::start_aps`, so the secondaries are already running when this fires. It retries the claim
+/// for 600 ms (one default transaction budget plus slack) rather than failing loud, because its
+/// caller's fallback is not a lost diagnostic but a WRONG SD divider — `base_clock` assumes 100 MHz
+/// when this returns `None`. Every other entry point in this module fails loud instead.
 pub fn get_clock_rate(clock_id: u32) -> Option<u32> {
-    request(0, 8 * 4); // total size (8 words used)
-    request(1, 0); // request
-    request(2, TAG_GET_CLOCK_RATE);
-    request(3, 8); // value buffer size (2 words: clock_id, rate)
-    request(4, 0); // request code
-    request(5, clock_id); // clock id (reply preserves it)
-    request(6, 0); // rate (reply)
-    request(7, TAG_END);
-    if !mbox_call(8) {
+    let mut m = match claim_bounded(600) {
+        Ok(loan) => loan,
+        Err(_) => {
+            witness_busy("GET_CLOCK_RATE (emmc2 base clock, after a 600ms bounded retry)");
+            return None;
+        }
+    };
+    m.request(0, 8 * 4); // total size (8 words used)
+    m.request(1, 0); // request
+    m.request(2, TAG_GET_CLOCK_RATE);
+    m.request(3, 8); // value buffer size (2 words: clock_id, rate)
+    m.request(4, 0); // request code
+    m.request(5, clock_id); // clock id (reply preserves it)
+    m.request(6, 0); // rate (reply)
+    m.request(7, TAG_END);
+    if !m.call(8) {
         return None;
     }
-    let rate = reply(6);
+    let rate = m.reply(6);
     if rate == 0 { None } else { Some(rate) }
+}
+
+/// PI-V3D-75: ask the FIRMWARE to enable the QPU/V3D (`SET_ENABLE_QPU`, `0x00030012`). This is the
+/// VPU-side V3D init path: on a KMS-overlay piOS boot the firmware runs its own V3D bring-up (the
+/// mid-bin dump's `RPIVID_ASB_V3D_M_CTRL=0x4040` is its signature), while a bare-metal boot gets the
+/// parked state (`0x7`, bridges stopped, bits 6/14 never set). Returns the firmware's reply word
+/// (observed 0 on success per the historic mailbox interface), or `None` on a mailbox failure.
+#[cfg(feature = "v3d")]
+pub fn set_enable_qpu(enable: u32) -> Option<u32> {
+    let mut m = claim_or!("SET_ENABLE_QPU", None);
+    m.request(0, 7 * 4); // total size (7 words used)
+    m.request(1, 0); // request
+    m.request(2, TAG_SET_ENABLE_QPU);
+    m.request(3, 4); // value buffer size (1 word: enable)
+    m.request(4, 0); // request code
+    m.request(5, enable);
+    m.request(6, TAG_END);
+    if !m.call(7) {
+        return None;
+    }
+    Some(m.reply(5))
+}
+
+/// PI-V3D-80: `NOTIFY_DISPLAY_DONE` — the ONE mailbox act vc4's probe performs that no UnaOS boot
+/// ever has: a zero-length property telling the firmware display driver to stop, ceding the
+/// display/GPU complex to the ARM. The V3D-80 hypothesis: the VPU holds V3D thread-start to
+/// itself until the ARM claims ownership this way. ⚠ Side effect on a firmware-fb system: the
+/// firmware display driver stops — scanout of the mailbox-allocated framebuffer may die (black
+/// panel; serial unaffected).
+///
+/// ⚠ PI-V3D-81 (§46.5): this function cannot report whether the handover HAPPENED. It returns
+/// `Some(())` only when a DOORBELL arrives, and this firmware honours NOTIFY-class tags without
+/// ringing — so `None` means "no doorbell", never "no handover". Kept so the historic P92/P93 sends
+/// stay reproducible; [`notify_display_done_noreply`] is the reading path.
+#[cfg(feature = "v3d")]
+pub fn notify_display_done() -> Option<()> {
+    let mut m = claim_or!("NOTIFY_DISPLAY_DONE", None);
+    m.request(0, 6 * 4); // total size (6 words used)
+    m.request(1, 0); // request
+    m.request(2, TAG_NOTIFY_DISPLAY_DONE);
+    m.request(3, 0); // value buffer size (zero-length, like vc4's NULL/0 call)
+    m.request(4, 0); // request code
+    m.request(5, TAG_END);
+    // 5 s budget, kept only for reproducibility of P93. It was chosen on the belief that the
+    // firmware stops its whole display driver before replying; §46.5 refuted that — P93 timed out
+    // at 5 s exactly as P92 did at 500 ms, because there is no reply to wait for. A false return
+    // below is therefore "no doorbell", not "no handover".
+    if !m.call_budget(6, 5000) {
+        return None;
+    }
+    Some(())
+}
+
+// ── PI-V3D-81: the REPLY-LESS property post, and reading a tag by its EFFECT. ──────────────────
+//
+// P92/P93 (v3d.md §46.5) established the protocol fact this block exists to act on: on this
+// firmware (hash 3484b5dd…, piOS's own) a NOTIFY-class tag is acted on WITHOUT a doorbell coming
+// back on the read FIFO. `mbox_call` cannot express that. It returns only when a doorbell arrives,
+// so for such a tag it reports failure no matter how perfectly the VPU honoured the request — and
+// every V3D-80 verdict read through it was therefore a statement about the DOORBELL, not about the
+// tag. Raising the budget (P92 500 ms → P93 5 s) could not fix that; it only made the same
+// statement more slowly.
+//
+// A reply-less post keeps the request half of the protocol (buffer cleaned out to RAM, message
+// posted on channel 8) and drops the reply half. In place of waiting it WATCHES, for a bounded and
+// stated settle, through two channels that are independent of each other:
+//
+//   * the DOORBELL, if one ever comes — not required, but counted and timed. Its absence is the
+//     protocol claim under test; its presence refutes that claim on the spot for that tag.
+//   * the BUFFER, which the VPU writes by DMA and which nothing about the doorbell gates. The
+//     property protocol has the firmware stamp word 1 with `0x8000_0000` and the tag's own
+//     request word with bit 31 plus the response length. If those words are set, the message was
+//     parsed and the tag was HANDLED, whether or not anyone rang. This is the channel P92/P93
+//     never read — the buffer was posted and then abandoned when the doorbell wait timed out.
+//
+// The buffer channel only means something while the CPU can see VPU writes at all, so callers must
+// pair it with a positive control on an UNRELATED tag (`v3d.rs` [v3d81] uses `GET_CLOCK_RATE`): a
+// control that answers proves both the transport and our cache invalidate are alive at that instant,
+// which is what makes an untouched buffer attributable to the firmware's silence rather than to our
+// instrument's blindness. Without it, "nothing moved" is uninterpretable — the exact trap §46.5
+// records against panel-survival as a reading.
+//
+// One hazard is inherent and is instrumented rather than hidden: a tag that replies LATER than our
+// settle leaves a doorbell in the FIFO that the next ordinary `mbox_call` would consume as its own
+// reply, reading a buffer that the newer request has already overwritten. `post_noreply` therefore
+// drains and COUNTS the FIFO before posting (`stale_pre`) and again across the settle, and
+// [`drain_property_fifo`] lets a caller re-drain before each follow-up query — RETURNING the count,
+// because a drain that swallows a late doorbell silently destroys the only evidence that one ever
+// arrived. Every caller of it must print what it discarded: whichever drain runs first is where the
+// late reply shows up, and `stale_pre` will read 0 on a leg whose caller already swept the FIFO.
+
+/// PI-V3D-81 — everything a reply-less post left behind. Read the fields in this order: `posted`
+/// (did the message even reach the write FIFO — nothing below means anything if not), `doorbells`
+/// (did the reply half of the protocol happen after all), then the buffer words (did the VPU write
+/// a response without ringing).
+#[cfg(feature = "v3d81")]
+pub struct NoReplySend {
+    /// The message reached the write FIFO.
+    pub posted: bool,
+    /// Words drained from the read FIFO (any channel) BEFORE posting. Expected 0; non-zero means an
+    /// earlier reply-less post was answered late and this reading is standing on a dirty FIFO.
+    pub stale_pre: u32,
+    /// Property-channel doorbells that arrived during the settle. Greater than zero REFUTES
+    /// reply-lessness for this tag at this budget — the tag does reply, and §46.5's protocol
+    /// reading does not cover it.
+    pub doorbells: u32,
+    /// Microseconds from post to the FIRST doorbell. Meaningless unless `doorbells > 0`.
+    pub first_doorbell_us: u64,
+    /// Doorbells seen on other channels, drained and discarded. Expected 0 (we own the FIFO at boot).
+    pub other_ch: u32,
+    /// The settle actually spent, measured off CNTPCT rather than assumed from the request.
+    pub settle_us: u64,
+    /// Buffer word 1 after the settle: `0x8000_0000` = the VPU processed the message,
+    /// `0x8000_0001` = it rejected the buffer as malformed, `0` = it never wrote (what we posted).
+    pub overall: u32,
+    /// The tag's own request/response word (buffer word 4). Bit 31 set = THIS TAG was handled, with
+    /// its response length in bits [30:0]. The discriminating word — see `notify_xhci_reset`'s
+    /// PIUSB-12 note, which named it for the doorbell-bearing case and is what suggested reading it
+    /// for the doorbell-less one.
+    pub tag_code: u32,
+    /// Buffer word 5, printed raw because its meaning is per-tag: the first VALUE word for a valued
+    /// tag (`SET_ENABLE_QPU`'s enable echo) and the END marker for a zero-length one
+    /// (`NOTIFY_DISPLAY_DONE`, where it must read 0 both before and after).
+    pub word5: u32,
+    /// ARM-physical address of the message buffer, so a raw capture can be correlated.
+    pub buf_pa: usize,
+}
+
+#[cfg(feature = "v3d81")]
+impl NoReplySend {
+    /// The VPU parsed our message and REJECTED it (`overall = 0x8000_0001`, "error parsing request
+    /// buffer"). It wrote — so the transport and our invalidate were both alive — but it never
+    /// reached the tag, so this state must never read as "acted". Low-probability (these messages
+    /// are byte-for-byte the working doorbell-waiting senders' messages) and split out anyway,
+    /// because it is precisely the state in which the buffer channel says the opposite of what it
+    /// means: the one write that proves the tag was NOT looked at.
+    pub fn buffer_rejected(&self) -> bool {
+        self.overall == MBOX_ERROR
+    }
+
+    /// Did the VPU write a RESPONSE into our buffer? True = the message was parsed and the tag
+    /// acted on, doorbell or no doorbell. This is the "acted" half of the acted-vs-ignored
+    /// discrimination, and it costs no panel and no attended observer. A rejected buffer is
+    /// excluded — see [`Self::buffer_rejected`].
+    ///
+    /// Only the TRUE reading is control-free. A stamped `0x8000_0000` cannot come from our own
+    /// posted words, so it stands on its own; FALSE can equally mean our invalidate went blind,
+    /// which is what the caller's positive control is there to rule out.
+    pub fn buffer_written(&self) -> bool {
+        !self.buffer_rejected() && (self.overall != 0 || self.tag_code & 0x8000_0000 != 0)
+    }
+}
+
+/// PI-V3D-81 — empty the read FIFO without waiting for anything, returning how many words were
+/// discarded. Bounded by construction: a FIFO that will not empty is a fault, not a queue, and
+/// spinning on one here would hang the boot the instrument is meant to describe.
+///
+/// The count is not optional bookkeeping. A doorbell that arrives after a leg's settle is the only
+/// trace a late-replying tag leaves, and this function is what destroys it — so a caller that drops
+/// the return has silently deleted the evidence for the one hazard the reply-less path admits to.
+/// Print it.
+///
+/// MBOX-1: now a thin re-export of [`drain_read_fifo_bounded`], which the timeout path of
+/// [`MboxLoan::call_budget`] shares — one drain primitive, one bound, so the reply-less instrument
+/// and the ordinary transport cannot disagree about what "drained" means. Behaviour is unchanged
+/// (same `DRAIN_MAX` = 64 cap). Deliberately loan-free: it touches only the FIFO, and the reply-less
+/// legs call it between transactions.
+#[cfg(feature = "v3d81")]
+pub fn drain_property_fifo() -> u32 {
+    drain_read_fifo_bounded()
+}
+
+/// PI-V3D-81 — post `MBOX.words[0..len]` on the property channel and DO NOT wait for a reply.
+/// Settles `settle_ms` (bounded, measured), watching the read FIFO without requiring it, then
+/// re-reads the request buffer out of RAM so the caller can see whether the VPU wrote a response
+/// into it. Never blocks on the VideoCore: the only wait is the bounded write-FIFO-full wait and
+/// the settle itself, both off CNTPCT.
+#[cfg(feature = "v3d81")]
+impl MboxLoan {
+fn post_noreply(&mut self, len: usize, settle_ms: u64) -> NoReplySend {
+    let frq = cntfrq();
+    let elapsed_us = |from: u64| (super::timer::cntpct().wrapping_sub(from)).saturating_mul(1_000_000) / frq.max(1);
+
+    // Anything already in the FIFO belongs to an earlier transaction; take it out of the way and
+    // report it, so a reading taken over somebody else's late reply is never mistaken for a clean one.
+    let stale_pre = drain_read_fifo_bounded();
+
+    // Clean our request out to RAM — the GPU does not snoop our cache. Identical to `mbox_call`;
+    // the divergence is entirely on the reply side.
+    cache::clean_range(mbox_phys(), len * 4);
+
+    let msg = ((mbox_phys() as u32 & BUS_TO_PHYS) | BUS_UNCACHED) | CH_PROP;
+    let t0 = super::timer::cntpct();
+    let post_deadline = t0 + frq / 1000 * 50; // 50 ms just to get INTO the write FIFO
+    let mut posted = false;
+    loop {
+        if mmio_read(MBOX_STATUS) & MBOX_FULL == 0 {
+            mmio_write(MBOX_WRITE, msg);
+            posted = true;
+            break;
+        }
+        if super::timer::cntpct() >= post_deadline {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    // The settle. Not a wait for a reply — a stated interval during which the firmware may act, and
+    // during which we notice a doorbell if one comes without needing it to. Skipped outright when
+    // the post never landed: there is nothing for the firmware to act ON, so the whole interval (up
+    // to 10 s) would buy a leg that already carries no reading nothing but a slower boot. The
+    // measured `settle_us` then reads ~0, which is the honest record of what was actually waited.
+    let t_post = super::timer::cntpct();
+    let settle_end = if posted { t_post + frq / 1000 * settle_ms } else { t_post };
+    let (mut doorbells, mut other_ch, mut first_doorbell_us) = (0u32, 0u32, 0u64);
+    while super::timer::cntpct() < settle_end {
+        if mmio_read(MBOX_STATUS) & MBOX_EMPTY == 0 {
+            let w = mmio_read(MBOX_READ);
+            if w & 0xF == CH_PROP {
+                if doorbells == 0 {
+                    first_doorbell_us = elapsed_us(t_post);
+                }
+                doorbells += 1;
+            } else {
+                other_ch += 1;
+            }
+        }
+        core::hint::spin_loop();
+    }
+    let settle_us = elapsed_us(t_post);
+
+    // Drop our stale cached copy so the words we read are the VPU's, not ours. Clean+invalidate for
+    // the same reason `mbox_call` uses it: a still-dirty line is written back rather than discarded
+    // over a reply. If these words come back as we posted them, the firmware wrote nothing — and the
+    // caller's positive control is what turns that into a fact about the firmware.
+    cache::clean_invalidate_range(mbox_phys(), len * 4);
+    NoReplySend {
+        posted,
+        stale_pre,
+        doorbells,
+        first_doorbell_us,
+        other_ch,
+        settle_us,
+        overall: self.reply(1),
+        tag_code: self.reply(4),
+        word5: self.reply(5),
+        buf_pa: mbox_phys(),
+    }
+}
+}
+
+/// MBOX-1 — what a reply-less leg reports when the transport was already loaned: `posted = false`,
+/// every reading zero. `posted` is the first field the doc tells a reader to check, and it is false
+/// here for the honest reason — the message never reached the write FIFO.
+#[cfg(feature = "v3d81")]
+fn noreply_busy(op: &str) -> NoReplySend {
+    witness_busy(op);
+    NoReplySend {
+        posted: false,
+        stale_pre: 0,
+        doorbells: 0,
+        first_doorbell_us: 0,
+        other_ch: 0,
+        settle_us: 0,
+        overall: 0,
+        tag_code: 0,
+        word5: 0,
+        buf_pa: mbox_phys(),
+    }
+}
+
+/// PI-V3D-81 — `SET_ENABLE_QPU` posted reply-less. [v3d75a]/P86 read this tag's silence as "tag
+/// unhandled by this firmware" and closed the route; §46.5 reopened it, because that reading came
+/// from `mbox_call` and a NOTIFY-class silence means only "no doorbell". Same message bytes as
+/// [`set_enable_qpu`] — only the reply half differs, so a difference in outcome between the two is
+/// a difference in how we LISTENED, not in what we asked.
+#[cfg(feature = "v3d81_qpu")]
+pub fn enable_qpu_noreply(enable: u32, settle_ms: u64) -> NoReplySend {
+    let mut m = match claim() {
+        Ok(loan) => loan,
+        Err(_) => return noreply_busy("SET_ENABLE_QPU (reply-less)"),
+    };
+    m.request(0, 7 * 4); // total size (7 words used)
+    m.request(1, 0); // request
+    m.request(2, TAG_SET_ENABLE_QPU);
+    m.request(3, 4); // value buffer size (1 word: enable)
+    m.request(4, 0); // request code — the firmware stamps bit31|len here if it handles the tag
+    m.request(5, enable);
+    m.request(6, TAG_END);
+    m.post_noreply(7, settle_ms)
+}
+
+/// PI-V3D-81 — `NOTIFY_DISPLAY_DONE` posted reply-less: the send P92/P93 could only ever mis-read.
+/// Same zero-length message as [`notify_display_done`]; the difference is that this one does not
+/// pretend the absence of a doorbell is the absence of an act. ⚠ If the tag IS acted on, the
+/// firmware display driver stops and scanout of the mailbox-allocated framebuffer dies (black
+/// panel; serial unaffected) — that is the hypothesis, not a malfunction.
+#[cfg(feature = "v3d81_display")]
+pub fn notify_display_done_noreply(settle_ms: u64) -> NoReplySend {
+    let mut m = match claim() {
+        Ok(loan) => loan,
+        Err(_) => return noreply_busy("NOTIFY_DISPLAY_DONE (reply-less)"),
+    };
+    m.request(0, 6 * 4); // total size (6 words used)
+    m.request(1, 0); // request
+    m.request(2, TAG_NOTIFY_DISPLAY_DONE);
+    m.request(3, 0); // value buffer size (zero-length, like vc4's NULL/0 call)
+    m.request(4, 0); // request code — the firmware stamps bit31|len here if it handles the tag
+    m.request(5, TAG_END);
+    m.post_noreply(6, settle_ms)
+}
+
+/// PI-V3D-81 — the RAW display-mode query. [`query_display_size`] folds an implausible answer (0x0
+/// included) into `None` alongside a transport failure, which is right for choosing a framebuffer
+/// mode and fatal here: "the firmware reports no display mode any more" is precisely the reading
+/// that would show a stopped display driver, and it must not be indistinguishable from a dead
+/// mailbox. Same split, same reason, as `get_clock_rate_raw` vs `get_clock_rate`. `None` means
+/// ONLY that the transaction failed; `Some((0, 0))` is a successful query reporting no mode.
+#[cfg(feature = "v3d81")]
+pub fn query_display_size_raw() -> Option<(u32, u32)> {
+    let mut m = claim_or!("GET_PHYS_WH (raw display mode)", None);
+    m.request(0, 8 * 4); // total size (8 words used)
+    m.request(1, 0); // request
+    m.request(2, TAG_GET_PHYS_WH);
+    m.request(3, 8); // value buffer size
+    m.request(4, 0); // request code
+    m.request(5, 0); // width  (reply)
+    m.request(6, 0); // height (reply)
+    m.request(7, TAG_END);
+    if !m.call(8) {
+        return None; // transport failure — NOT a "no mode" answer
+    }
+    Some((m.reply(5), m.reply(6)))
 }
 
 /// PI-V3D-1: turn a firmware power domain on (`state = 1`) or off (`0`). Returns the state the
 /// firmware reports back (it echoes the achieved state in the reply's `state` word), or `None` on a
 /// mailbox failure. Used to power the V3D block (`POWER_DOMAIN_V3D`) before touching its registers —
-/// with the domain off, V3D MMIO reads garbage. Single-user `MBOX` like the other calls: the V3D
-/// bring-up runs single-threaded on the BSP after the boot framebuffer call is long done.
+/// with the domain off, V3D MMIO reads garbage. MBOX-1: claims the transport for the transaction and
+/// fails loud on contention (a refused domain set is a diagnostic loss, not a wrong divider).
 #[cfg(any(feature = "v3d", feature = "piusb"))]
 pub fn set_power_domain(domain: u32, state: u32) -> Option<u32> {
-    request(0, 8 * 4); // total size (8 words used)
-    request(1, 0); // request
-    request(2, TAG_SET_DOMAIN_STATE);
-    request(3, 8); // value buffer size (2 words: domain, state)
-    request(4, 0); // request code
-    request(5, domain);
-    request(6, state); // reply preserves/echoes the achieved state
-    request(7, TAG_END);
-    if !mbox_call(8) {
+    let mut m = claim_or!("SET_DOMAIN_STATE", None);
+    m.request(0, 8 * 4); // total size (8 words used)
+    m.request(1, 0); // request
+    m.request(2, TAG_SET_DOMAIN_STATE);
+    m.request(3, 8); // value buffer size (2 words: domain, state)
+    m.request(4, 0); // request code
+    m.request(5, domain);
+    m.request(6, state); // reply preserves/echoes the achieved state
+    m.request(7, TAG_END);
+    if !m.call(8) {
         return None;
     }
-    Some(reply(6))
+    Some(m.reply(6))
 }
 
 /// PI-V3D-2: enable or disable a firmware-managed clock's GATE (RPi firmware property tag
@@ -344,18 +906,19 @@ pub fn set_power_domain(domain: u32, state: u32) -> Option<u32> {
 /// `Some(false)` if present-but-off, `None` on a mailbox failure or an absent clock.
 #[cfg(any(feature = "v3d", feature = "piusb"))]
 pub fn set_clock_state(clock_id: u32, on: bool) -> Option<bool> {
-    request(0, 8 * 4); // total size (8 words used)
-    request(1, 0); // request
-    request(2, TAG_SET_CLOCK_STATE);
-    request(3, 8); // value buffer size (2 words: clock_id, state)
-    request(4, 0); // request code
-    request(5, clock_id);
-    request(6, if on { 1 } else { 0 }); // reply: achieved state (bit0 active, bit1 not-present)
-    request(7, TAG_END);
-    if !mbox_call(8) {
+    let mut m = claim_or!("SET_CLOCK_STATE", None);
+    m.request(0, 8 * 4); // total size (8 words used)
+    m.request(1, 0); // request
+    m.request(2, TAG_SET_CLOCK_STATE);
+    m.request(3, 8); // value buffer size (2 words: clock_id, state)
+    m.request(4, 0); // request code
+    m.request(5, clock_id);
+    m.request(6, if on { 1 } else { 0 }); // reply: achieved state (bit0 active, bit1 not-present)
+    m.request(7, TAG_END);
+    if !m.call(8) {
         return None;
     }
-    let state = reply(6);
+    let state = m.reply(6);
     if state & 0x2 != 0 {
         return None; // firmware reports the clock not present
     }
@@ -365,40 +928,43 @@ pub fn set_clock_state(clock_id: u32, on: bool) -> Option<bool> {
 /// PIUSB-32: the read-only power/clock STATE witnesses. Each returns the raw firmware `state` reply word
 /// (bit0 = on/active, bit1 = "does-not-exist") so the census can print the whole word, or `None` on a
 /// mailbox transport failure. Query-only: none of these three tags mutates firmware state — they are the
-/// diagnostic companions to `set_power_domain` / `set_clock_state`. Single-user `MBOX` like every other
-/// call here (the census runs single-threaded on the BSP, boot framebuffer call long done).
+/// diagnostic companions to `set_power_domain` / `set_clock_state`. MBOX-1: each claims the transport
+/// for its transaction and fails loud on contention — a census reading taken over somebody else's
+/// buffer would be worse than no reading.
 #[cfg(feature = "piusb")]
 pub fn get_power_state(device_id: u32) -> Option<u32> {
-    request(0, 8 * 4);
-    request(1, 0);
-    request(2, TAG_GET_POWER_STATE);
-    request(3, 8); // value buffer (2 words: device_id, state)
-    request(4, 0);
-    request(5, device_id);
-    request(6, 0); // state (reply)
-    request(7, TAG_END);
-    if !mbox_call(8) {
+    let mut m = claim_or!("GET_POWER_STATE", None);
+    m.request(0, 8 * 4);
+    m.request(1, 0);
+    m.request(2, TAG_GET_POWER_STATE);
+    m.request(3, 8); // value buffer (2 words: device_id, state)
+    m.request(4, 0);
+    m.request(5, device_id);
+    m.request(6, 0); // state (reply)
+    m.request(7, TAG_END);
+    if !m.call(8) {
         return None;
     }
-    Some(reply(6))
+    Some(m.reply(6))
 }
 
 /// PIUSB-32: read-only power-DOMAIN state (the same domain-id namespace `set_power_domain` writes —
 /// e.g. `POWER_DOMAIN_V3D`). Returns the firmware `state` word (bit0 on, bit1 does-not-exist).
 #[cfg(feature = "piusb")]
 pub fn get_domain_state(domain: u32) -> Option<u32> {
-    request(0, 8 * 4);
-    request(1, 0);
-    request(2, TAG_GET_DOMAIN_STATE);
-    request(3, 8); // value buffer (2 words: domain, state)
-    request(4, 0);
-    request(5, domain);
-    request(6, 0); // state (reply)
-    request(7, TAG_END);
-    if !mbox_call(8) {
+    let mut m = claim_or!("GET_DOMAIN_STATE", None);
+    m.request(0, 8 * 4);
+    m.request(1, 0);
+    m.request(2, TAG_GET_DOMAIN_STATE);
+    m.request(3, 8); // value buffer (2 words: domain, state)
+    m.request(4, 0);
+    m.request(5, domain);
+    m.request(6, 0); // state (reply)
+    m.request(7, TAG_END);
+    if !m.call(8) {
         return None;
     }
-    Some(reply(6))
+    Some(m.reply(6))
 }
 
 /// PIUSB-32: read-only CLOCK gate state (the clock-id namespace `set_clock_state` writes — e.g.
@@ -407,18 +973,19 @@ pub fn get_domain_state(domain: u32) -> Option<u32> {
 /// directly, and must not depend on `piusb` happening to be enabled in the same build.
 #[cfg(any(feature = "piusb", feature = "v3d"))]
 pub fn get_clock_state(clock_id: u32) -> Option<u32> {
-    request(0, 8 * 4);
-    request(1, 0);
-    request(2, TAG_GET_CLOCK_STATE);
-    request(3, 8); // value buffer (2 words: clock_id, state)
-    request(4, 0);
-    request(5, clock_id);
-    request(6, 0); // state (reply)
-    request(7, TAG_END);
-    if !mbox_call(8) {
+    let mut m = claim_or!("GET_CLOCK_STATE", None);
+    m.request(0, 8 * 4);
+    m.request(1, 0);
+    m.request(2, TAG_GET_CLOCK_STATE);
+    m.request(3, 8); // value buffer (2 words: clock_id, state)
+    m.request(4, 0);
+    m.request(5, clock_id);
+    m.request(6, 0); // state (reply)
+    m.request(7, TAG_END);
+    if !m.call(8) {
         return None;
     }
-    Some(reply(6))
+    Some(m.reply(6))
 }
 
 /// PI-V3D-55: the RAW `GET_CLOCK_RATE` query — transport failure and a genuine **0 Hz grant** are
@@ -432,18 +999,19 @@ pub fn get_clock_state(clock_id: u32) -> Option<u32> {
 /// and its callers are untouched.
 #[cfg(feature = "v3d")]
 pub fn get_clock_rate_raw(clock_id: u32) -> Option<u32> {
-    request(0, 8 * 4); // total size (8 words used)
-    request(1, 0); // request
-    request(2, TAG_GET_CLOCK_RATE);
-    request(3, 8); // value buffer size (2 words: clock_id, rate)
-    request(4, 0); // request code
-    request(5, clock_id); // clock id (reply preserves it)
-    request(6, 0); // rate (reply)
-    request(7, TAG_END);
-    if !mbox_call(8) {
+    let mut m = claim_or!("GET_CLOCK_RATE (raw)", None);
+    m.request(0, 8 * 4); // total size (8 words used)
+    m.request(1, 0); // request
+    m.request(2, TAG_GET_CLOCK_RATE);
+    m.request(3, 8); // value buffer size (2 words: clock_id, rate)
+    m.request(4, 0); // request code
+    m.request(5, clock_id); // clock id (reply preserves it)
+    m.request(6, 0); // rate (reply)
+    m.request(7, TAG_END);
+    if !m.call(8) {
         return None; // transport failure — NOT a 0 Hz grant
     }
-    Some(reply(6)) // a successful transaction, rate verbatim (0 included)
+    Some(m.reply(6)) // a successful transaction, rate verbatim (0 included)
 }
 
 /// PI-V3D-1: set a firmware-managed clock's rate in Hz. Returns the rate the firmware actually
@@ -453,19 +1021,20 @@ pub fn get_clock_rate_raw(clock_id: u32) -> Option<u32> {
 /// needed.
 #[cfg(feature = "v3d")]
 pub fn set_clock_rate(clock_id: u32, rate_hz: u32) -> Option<u32> {
-    request(0, 9 * 4); // total size (9 words used)
-    request(1, 0); // request
-    request(2, TAG_SET_CLOCK_RATE);
-    request(3, 12); // value buffer size (3 words: clock_id, rate, skip_turbo)
-    request(4, 0); // request code
-    request(5, clock_id);
-    request(6, rate_hz); // reply: the rate actually set
-    request(7, 0); // skip_turbo = 0
-    request(8, TAG_END);
-    if !mbox_call(9) {
+    let mut m = claim_or!("SET_CLOCK_RATE", None);
+    m.request(0, 9 * 4); // total size (9 words used)
+    m.request(1, 0); // request
+    m.request(2, TAG_SET_CLOCK_RATE);
+    m.request(3, 12); // value buffer size (3 words: clock_id, rate, skip_turbo)
+    m.request(4, 0); // request code
+    m.request(5, clock_id);
+    m.request(6, rate_hz); // reply: the rate actually set
+    m.request(7, 0); // skip_turbo = 0
+    m.request(8, TAG_END);
+    if !m.call(9) {
         return None;
     }
-    let set = reply(6);
+    let set = m.reply(6);
     if set == 0 { None } else { Some(set) }
 }
 
@@ -507,17 +1076,42 @@ pub struct NotifyResp {
 /// "tag honoured, VL805 reset ran" (tag_code bit31 set) from "tag silently dropped" (bit31 clear).
 /// Linux (`rpi_reset_reset`) checks only the overall return code; we witness every word because the
 /// CNR-never-clears wall means we must know WHICH layer is failing.
+///
+/// MBOX-1 — this is the call the dirty-timeout defect hurt most, and the reason the fix is not
+/// cosmetic. It reads its three witness words on EVERY path, `ok` or not. Before MBOX-1 a timed-out
+/// call left the buffer's cache lines holding the words we posted, so the failure-path read of
+/// `echo` returned our own `dev_addr` — and PIUSB-12 above documents a zero there as the PROOF that
+/// cache invalidation worked. The witness inverted itself exactly when it was most needed. The
+/// timeout path now invalidates (see [`MboxLoan::timeout_clean`]), so these words are the GPU's
+/// memory on both paths.
+///
+/// On contention the transport is not claimed at all: `ok = false` with every word zero, preceded by
+/// the `BUSY` witness line. Fail loud — `notify_before_reset` already prints the full word set, so a
+/// refusal is visible rather than inferred.
 #[cfg(feature = "piusb")]
 pub fn notify_xhci_reset(dev_addr: u32) -> NotifyResp {
-    request(0, 7 * 4); // total size (7 words used)
-    request(1, 0); // request
-    request(2, TAG_NOTIFY_XHCI_RESET);
-    request(3, 4); // value buffer size (1 word: the PCI device address)
-    request(4, 0); // request code (firmware overwrites with 0x8000_0000|len if honoured)
-    request(5, dev_addr);
-    request(6, TAG_END);
-    let ok = mbox_call(7);
-    NotifyResp { ok, overall: reply(1), tag_code: reply(4), echo: reply(5), buf_pa: mbox_phys() }
+    let mut m = match claim() {
+        Ok(loan) => loan,
+        Err(_) => {
+            witness_busy("NOTIFY_XHCI_RESET");
+            return NotifyResp { ok: false, overall: 0, tag_code: 0, echo: 0, buf_pa: mbox_phys() };
+        }
+    };
+    m.request(0, 7 * 4); // total size (7 words used)
+    m.request(1, 0); // request
+    m.request(2, TAG_NOTIFY_XHCI_RESET);
+    m.request(3, 4); // value buffer size (1 word: the PCI device address)
+    m.request(4, 0); // request code (firmware overwrites with 0x8000_0000|len if honoured)
+    m.request(5, dev_addr);
+    m.request(6, TAG_END);
+    let ok = m.call(7);
+    NotifyResp {
+        ok,
+        overall: m.reply(1),
+        tag_code: m.reply(4),
+        echo: m.reply(5),
+        buf_pa: mbox_phys(),
+    }
 }
 
 /// WC-E — the SCAN-OUT GROUND TRUTH witness. One line, once, at framebuffer bring-up, carrying every
@@ -546,10 +1140,20 @@ pub fn notify_xhci_reset(dev_addr: u32) -> NotifyResp {
 /// call is non-fatal — it prints a FAIL line and returns, because a diagnostic must never be able to
 /// take down the boot it is diagnosing.
 fn witness_fb_geometry(base: u64, size: u32, pitch: u32, req_w: u32, req_h: u32) {
+    // MBOX-1: the loan covers ONE transaction — fill, call, read back — and is dropped before
+    // `query_pitch` below, which is a transaction of its own and claims for itself.
+    let mut m = match claim() {
+        Ok(loan) => loan,
+        Err(_) => {
+            witness_busy("fb-geometry query");
+            serial_println!("[wc-e] fb-geometry query FAILED — scan-out ground truth unavailable");
+            return;
+        }
+    };
     let mut i = 0usize;
     macro_rules! put {
         ($val:expr) => {{
-            request(i, $val);
+            m.request(i, $val);
             i += 1;
         }};
     }
@@ -598,18 +1202,21 @@ fn witness_fb_geometry(base: u64, size: u32, pitch: u32, req_w: u32, req_h: u32)
     put!(TAG_END);
 
     let total = i;
-    request(0, (total * 4) as u32);
-    if !mbox_call(total) {
+    m.request(0, (total * 4) as u32);
+    if !m.call(total) {
         serial_println!("[wc-e] fb-geometry query FAILED — scan-out ground truth unavailable");
         return;
     }
 
-    let (phys_w, phys_h) = (reply(phys_idx), reply(phys_idx + 1));
-    let (virt_w, virt_h) = (reply(virt_idx), reply(virt_idx + 1));
-    let (off_x, off_y) = (reply(off_idx), reply(off_idx + 1));
-    let depth = reply(depth_idx);
-    let order = reply(order_idx);
-    let alpha = reply(alpha_idx);
+    let (phys_w, phys_h) = (m.reply(phys_idx), m.reply(phys_idx + 1));
+    let (virt_w, virt_h) = (m.reply(virt_idx), m.reply(virt_idx + 1));
+    let (off_x, off_y) = (m.reply(off_idx), m.reply(off_idx + 1));
+    let depth = m.reply(depth_idx);
+    let order = m.reply(order_idx);
+    let alpha = m.reply(alpha_idx);
+    // MBOX-1: every reply word is now in a local — release the transport before `query_pitch`, which
+    // is a separate transaction and claims for itself. Holding across it would self-deny.
+    drop(m);
     let bpp = (depth / 8).max(1);
     // The two identities a scan-out defect breaks. `row_ok`: the pitch the HVS steps by must be exactly
     // one virtual row of pixels — anything else shears every row against the one above it. `fit_ok`: the
@@ -634,7 +1241,10 @@ fn witness_fb_geometry(base: u64, size: u32, pitch: u32, req_w: u32, req_h: u32)
     #[cfg(feature = "witness")]
     {
         let get_pitch = query_pitch();
-        // SAFETY: single-core boot, before SMP/interrupts (same discipline as `MBOX` itself).
+        // SAFETY: `SCANOUT` is written exactly once, here, during single-core boot (framebuffer
+        // bring-up in `build_boot_info`, before SMP), and is read-only afterwards. Unlike `MBOX`
+        // — which MBOX-1 moved behind a claim/loan because its single-user premise was false —
+        // this static genuinely has one writer at one point in the boot.
         unsafe {
             core::ptr::write_volatile(
                 &raw mut SCANOUT,
@@ -713,17 +1323,18 @@ pub fn scanout_truth() -> ScanoutTruth {
 /// than as agreement: a diagnostic must fail loud, never silently agree with the thing it checks.
 #[cfg(feature = "witness")]
 fn query_pitch() -> u32 {
-    request(0, 7 * 4);
-    request(1, 0);
-    request(2, TAG_GET_PITCH);
-    request(3, 4);
-    request(4, 0);
-    request(5, 0);
-    request(6, TAG_END);
-    if !mbox_call(7) {
+    let mut m = claim_or!("GET_PITCH (independent read)", 0);
+    m.request(0, 7 * 4);
+    m.request(1, 0);
+    m.request(2, TAG_GET_PITCH);
+    m.request(3, 4);
+    m.request(4, 0);
+    m.request(5, 0);
+    m.request(6, TAG_END);
+    if !m.call(7) {
         return 0;
     }
-    reply(5)
+    m.reply(5)
 }
 
 /// Bring up the VideoCore framebuffer: pick a resolution (the firmware's current mode if sane,
@@ -746,10 +1357,15 @@ pub fn init_framebuffer() -> Option<FbAlloc> {
     // A single message carrying every framebuffer tag. Layout per tag: id, value-buffer-size,
     // request-code(0), value words… A local macro (not a closure) appends words so we can still
     // read `i` between tags to capture the reply slots.
+    //
+    // MBOX-1: `query_display_size` above already ran and released its own loan; this claim covers
+    // the allocation transaction only, and is released before `witness_fb_geometry` and the V3D
+    // bring-up at the tail — both of which re-enter this module and would otherwise self-deny.
+    let mut m = claim_or!("framebuffer allocate", None);
     let mut i = 0usize;
     macro_rules! put {
         ($val:expr) => {{
-            request(i, $val);
+            m.request(i, $val);
             i += 1;
         }};
     }
@@ -800,16 +1416,19 @@ pub fn init_framebuffer() -> Option<FbAlloc> {
     put!(TAG_END);
 
     let total = i;
-    request(0, (total * 4) as u32);
+    m.request(0, (total * 4) as u32);
 
-    if !mbox_call(total) {
+    if !m.call(total) {
         serial_println!(":: MAILBOX: framebuffer allocate FAILED ::");
         return None;
     }
 
-    let fb_bus = reply(alloc_base_idx);
-    let fb_size = reply(alloc_base_idx + 1);
-    let pitch = reply(pitch_idx);
+    let fb_bus = m.reply(alloc_base_idx);
+    let fb_size = m.reply(alloc_base_idx + 1);
+    let pitch = m.reply(pitch_idx);
+    // MBOX-1: allocation transaction complete and every reply word copied out — hand the transport
+    // back before anything below re-enters this module.
+    drop(m);
     if fb_bus == 0 || fb_size == 0 || pitch == 0 {
         serial_println!(
             ":: MAILBOX: bad framebuffer reply (base={:#x} size={} pitch={}) ::",

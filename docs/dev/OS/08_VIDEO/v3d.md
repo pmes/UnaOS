@@ -2008,7 +2008,9 @@ every boot buys no new information:
 | Knob | Feature | Effect |
 | --- | --- | --- |
 | `UNAOS_V3D=1` | `v3d` | The V3D bring-up + the **fast** probe battery: the `[v3d40]` probe kick and its single FLDONE wait, and all the pure-read decodes (`[v3d54]` submit/trace, `[v3d55]` clkliv/tilestate, `[v3d56]` poison/landing/int, `[v3d57]` Mesa diff, `[v3d58]` stations/xengine, `[v3d59]` mainline/ctstate). |
-| `UNAOS_V3D_DEEP=1` | `v3d_deep` (implies `v3d`) | **Adds** the three banked-verdict probes above — ~3.5 s of extra boot. Arm it only when the bench is deliberately re-opening one of those questions. |
+| `UNAOS_V3D_DEEP=1` | `v3d_deep` (implies `v3d`) | **Adds** the three banked-verdict probes above — ~3.5 s of extra boot. Arm it only when the bench is deliberately re-opening one of those questions. Since V3D75A-GATE and V3D80-GATE this knob is **no longer destructive**: the `SET_ENABLE_QPU` and `NOTIFY_DISPLAY_DONE` sends it used to reach are separately gated (below), so a deep boot leaves the mailbox — and therefore USB — alive and keeps its panel. |
+| `UNAOS_V3D_QPU=1` | `v3d_qpu` (bare — an arming switch, inert without `v3d_deep`) | **Re-arms the two `SET_ENABLE_QPU` (tag 0x00030012) send sites** (`[v3d75a]`'s doorbell-waiting send and `[v3d81q]`'s reply-less one). This send **permanently wedges the VideoCore mailbox** on Pi 4 metal — every later `NOTIFY_XHCI_RESET` fails and USB is dead for the boot — and its diagnostic verdict is banked negative twice, so it is gated OFF by default rather than deleted. With deep armed and this off, each site prints an honest `SET_ENABLE_QPU SKIPPED` line and explicitly disclaims the verdicts the send would have fed. Arm only for a boot that deliberately sacrifices USB to re-open the QPU-enable question. |
+| `UNAOS_V3D_DISPDONE=1` | `v3d_dispdone` (bare — an arming switch, inert without `v3d_deep`) | **Re-arms the two `NOTIFY_DISPLAY_DONE` (tag 0x00030066) send sites** (`[v3d80]`'s doorbell-waiting handover and `[v3d81d]`'s reply-less one). This send **stops the firmware display driver** — the panel goes black for the rest of the boot, by design — and its verdict is now **banked** (boot `pi4-r23s1x`/boot3, 2026-08-03: core+0x68 read `0x00010001` unchanged across the handover, pre == post against the working part's `0x00000003`), so the handover does not move the wedge signature and the send has nothing left to teach. Gated OFF by default rather than deleted: a deep boot keeps its panel. With deep armed and this off, `[v3d80]` prints one `NOTIFY_DISPLAY_DONE SKIPPED` line and returns without taking either station — a post-handover readback on a boot with no handover would be a false result, not a null one — and an armed `[v3d81d]` says it posted nothing. Arm only for a boot that deliberately sacrifices the panel to re-open the handover question; serial is unaffected and carries the whole verdict. |
 
 Off (the default for an armed boot), the bring-up prints one line right after the `M1 probe PASS` gate:
 
@@ -2277,3 +2279,1712 @@ not previously reach becomes reachable, and no CLE or PTB state is touched. Its 
 reads plus a sentinel seed into an unmapped page no job can address. The same poison-honest hub-identity
 gate applies, so QEMU `raspi4b` prints none of it — **P62 metal reads `[v3d62] mmufix` and
 `[v3d62] fault`.**
+
+## 36. Inside the PTB frame unit — the first two discriminators (V3D-63)
+
+Every instrument *outside* the PTB frame open/close unit now reads clean, so V3D-63
+attacks two of the three claims the campaign still carries as facts but has never
+falsified: that the control list executed (C1), and that items were fed to the PTB
+(C2). Two probes, one boot, both `UNAOS_V3D_DEEP`-gated (each rung carries the
+ladder's ~0.5 s `FLDONE` backstop) and both dormant on QEMU raspi4b, which models no
+V3D block and returns at `BLOCK-DOWN` long before they run. `kernel8-test` green for
+this arc means **no regression, nothing more**.
+
+Both probes are driven from one 2×2 matrix at the tail of `empty_frame_bisection`:
+`{Empty, Full}` × `{CL@0x35000, CL@0x39000}`, four kicks, one PCTR bank armed across
+each. `submit_bisect_rung_at` is the generalised rung submitter — same byte-for-byte
+kick as the `[v3d48]` ladder, with the CL's arena offset chosen by the caller.
+
+### `[v3d63] ctrartifact` — is `CT0LC` a counter or a mirror?
+
+The campaign's most-cited fact rests on `CT0LC` 0→`0x10000` and `CT0PC` 0→3, and
+`0x10000` is bit-identical to `OFF_BIN_CL`. Publishing the *same* content at two
+arena offsets separates the two readings; adding the `Empty`/`Full` axis separates
+"placement-independent" from "content-dependent" instead of confounding them.
+
+| Reading | Verdict |
+|---|---|
+| `CT0LC` echoes the CL's own offset/BA at both placements | **C1 falsified** — mirror, not count; re-aim at the CT0 kick / bin-thread start |
+| `CT0LC` changes with placement, content held fixed | C1's evidence contaminated; "the list executed" is unproven |
+| `CT0LC` placement-independent *and* content-dependent | **C1 stands**, now on a controlled reading |
+| `CT0LC` independent of both | evidence inert — cite it neither way |
+| `CT0PC` nonzero on a zero-primitive rung | **C2 loses its last support**, independently of RANK 1 |
+
+`CT0CS`'s `CTRUN` at wait-exit is printed per rung as a second, independent read on
+whether the bin control thread ever started.
+
+### `[v3d63] ptbctr` — the counter bank, and what it deliberately does not claim
+
+The arc asked for three *named* sources: CLE bin-thread active cycles, PTB
+primitives-binned, PTB primitives-clipped. **All three are DROPPED, not guessed, and
+the witness line says so on every boot.** This file admits a PCTR source id only when
+it falls between the two verified anchors — 16 `QPU_CYCLES_VALID_INSTR` and 32
+`CYCLE_COUNT` (the latter pinned to `v3d_regs.h V3D_PCTR_CYCLE_COUNT(ver)=32` for
+ver<71). Every candidate for those three names lies *outside* that bracket, and this
+tree carries no copy of `enum drm_v3d_perfcnt` to transcribe from. Naming them from
+memory is precisely the fabricated-constant class of PI-V3D-4/6/7.
+
+What is armed instead is a **search, not a claim**: seven source ids
+(`V3D63_SWEEP_SRC = [1, 10, 11, 12, 13, 28, 29]`) written into the SRC mux and
+printed **raw, by index, with no semantic label** — the treatment V3D-60 gave the
+unsourced MMU interrupt halves. Writing an id into a 7-bit SRC field selects a mux;
+it asserts nothing about what that mux carries.
+
+**PCTR slot 2 is reserved, and the sweep may never occupy it.** `wait_fldone` samples
+PCTR counter 2 on every bin wait and `emit_v3d55_clock_liveness` prints it as a hard
+hardware verdict — `counter2(src32 CYCLE_COUNT)` — gated only on `PCTR_EN` bit 2,
+which this bank always sets. A swept id parked there would have made all four banked
+rungs print a fabricated *"CYCLE_COUNT FLAT — the V3D core clock is NOT advancing"*
+off an unidentified mux, contradicting the bank's own control. `PCTR_SRC_CYCLE_COUNT`
+is therefore pinned to slot 2, where it keeps the established `[v3d55]` witness
+truthful **and** serves as this bank's control — one counter, both roles, no
+re-labelling of an existing witness string. The seven swept ids live in slots
+0,1,3,4,5,6,7; `v3d63_slot` is the single place that mapping is written down.
+
+A counter's `OVERFLOW` bit is ORed into the moved-mask alongside its value: a source
+that wrapped exactly back to zero would otherwise read as "never moved", which is the
+same silent-instrument failure this campaign keeps having to unwind.
+
+- src32 zero on any rung ⇒ the bank never counted ⇒ **INCONCLUSIVE**, explicitly not
+  clean. Instrument first; read no slot as evidence.
+- src32 live and every swept source zero on all four rungs ⇒ seven unidentified event
+  sources are silent on a demonstrably clocked block. This becomes evidence *about the
+  PTB/CLE* only once a source id is transcribed from the uapi enum and cross-checked
+  against the 16/32 anchors — the next arc's first task.
+- swept sources move on `Full` and stay zero on the zero-primitive rungs ⇒ a
+  content-dependent signal, the signature a genuine primitive/thread counter shows.
+  Identify the moving ids before naming what they prove.
+- any swept source moves on a zero-primitive frame ⇒ whatever the mux carries is not
+  gated on primitive content.
+
+Programming order is the exact `v3d_perfmon_start` idiom already used by
+`pctr_setup_cs_witness`, including the PI-V3D-39 SRC read-back that forces the posted
+source-selects to retire before the counters are cleared and enabled. Only PCTR
+config registers are written — no CLE/PTB state is touched, no GMP write, no
+`MMU_CTL` change, no new MMIO window.
+
+---
+
+## 37. Calibrating the seven muxes against known ground truth (V3D-64)
+
+V3D-63 armed a raw sweep of seven **unidentified** PCTR source ids and refused to name
+them. P65v2 metal (capture `pi4-r23s1o`) came back with a shape: on zero-primitive bin
+rungs `src13 ≈ 161M` and `src28 ≈ 645M` against the `src32 CYCLE_COUNT` control's
+`≈ 645M`, with `src1/10/11/12/29` flat at 0. `src28` looks 1:1 with the core clock and
+`src13` looks like clock/4 — but "looks like" is precisely the reasoning that produced
+the PI-V3D-4/6/7 fabricated constants. This tree still carries no `enum drm_v3d_perfcnt`
+to transcribe from, and **naming an id from memory remains banned**.
+
+The honest identification channel is **calibration**: run the same bank across legs
+whose truth is already established, and classify each mux by behaviour alone.
+
+### The three legs
+
+| Leg | What it is | Ground truth it supplies |
+|---|---|---|
+| **L1 idle** | a fixed `V3D64_IDLE_MS` (4 ms) wall-clock window off CNTPCT, **no job submitted** | there is no work, so anything that accumulates here is clock-derived |
+| **L2 render** | the known-good CT1 clear job — `clear_job(None)`, the retiring M3 job `[v3d58] rerender` already reuses (**no new job is invented**), panel blit suppressed, its own store byte-verified | real, completing render work |
+| **L3 bin** | one banked `Empty` rung of the `[v3d48]` ladder via `submit_bisect_rung_at(…, bank: true)` | the bin path — the frame opens and never retires, so a retirement-gated mux stays flat while a clock-derived one climbs through the ~0.5 s backstop |
+
+Two reading notes for capture work. **The permille is a leg-fraction, not a duty cycle** —
+on L2 it says what share of *that leg's own elapsed core cycles* the slot counted, and
+the leg spans the whole `clear_job` call (setup, kick, CT1 idle-wait, verify), not just
+the render frame; it is not "the render pipe was busy X‰ of the time". And the **L3 rung
+prints its own line under the `[v3d48]` tag**, not `[v3d64]`: `submit_bisect_rung_at`
+hard-labels its CL decode, Mesa diff and `wait_fldone` witnesses `v3d48 bisect` for every
+caller. Readers who count rungs by tag will see one extra `[v3d48]` rung on a
+`UNAOS_V3D_DEEP` boot; it belongs to this battery.
+
+Every slot is reported as a **permille ratio against `src32`'s delta on its own leg**.
+That is the whole point: a ratio held constant across three legs of wildly different
+duration and workload is a strong statement about what a mux is derived from — and one
+this file can make **without a name**.
+
+### The classification table shape
+
+Per swept id, one line: the raw value and permille on each leg, each leg's validity, and
+one of four **behaviour classes**:
+
+| Class | Condition | Reading |
+|---|---|---|
+| `CLOCK-LIKE` | permille within `[900, 1100]` of `src32` on **every** valid leg, no overflow anywhere, **and L1 valid** | derived from the core clock, not from work |
+| `WORK-GATED-RENDER` | moved on L2 only; flat on L1 and L3, **and L1 valid** | gated on real render work |
+| `SILENT` | zero on every valid leg, **overflow included** | idle, a retiring render frame and a bin kick all left it flat |
+| `OTHER (RATIO UNUSABLE)` | moved, but latched an **overflow** on some valid leg | the raw value is a wrapped residue, so the permille is not a ratio and the slot is never band-tested; shorten the leg or re-measure |
+| `OTHER (IDLE-BLIND)` | would have been CLOCK-LIKE or WORK-GATED-RENDER, but **L1 was invalid** | the differential stands; the idle claim does not |
+| `OTHER` | moves, but neither 1:1 with `src32` nor render-only | read the per-leg permille: a ratio *held constant* across legs is clock-derived at that divisor; a ratio that *varies* is work-correlated |
+
+Two guards the table depends on. **Overflow disqualifies the ratio, it does not just flag
+it**: a wrapped `u32` is a residue rather than a delta, and a mux that wrapped once and
+landed inside the ±10% window would otherwise be published as CLOCK-LIKE off a truncated
+count — so any latched overflow on a valid leg forces `OTHER (RATIO UNUSABLE)` and the
+band test is never applied. And **both idle-asserting classes require L1 to be valid**.
+`CLOCK-LIKE` and `WORK-GATED-RENDER` each make a claim *about the idle leg* ("no work
+exists to gate on", "flat on idle"), and two valid legs out of three does not guarantee
+L1 is one of them. An invalid L1 is in fact the plausible failure here: `src32`
+`CYCLE_COUNT` reading zero across a pure-idle window is exactly what an activity-gated
+core clock would do. When L1 drops out the slot falls through to `OTHER (IDLE-BLIND)`,
+whose wording claims nothing about idle.
+
+A leg counts as a measurement only if **its own `src32` control moved**; a leg whose
+control read zero is INCONCLUSIVE, never "silent". Fewer than two valid legs ⇒ the whole
+battery prints `muxcal INCONCLUSIVE` and classifies nothing. A leg that did not run at
+all (L2 with no passing M3 baseline, L3 fail-closed on a range escape) is printed as
+**NOT RUN**, never folded in as a zero. `OVERFLOW` is ORed into movement throughout, so
+a mux that wrapped exactly to zero cannot read as flat.
+
+### Expected outcome tree on metal
+
+Against the P65v2 shape, the discriminating outcomes are:
+
+- **`src28` CLOCK-LIKE** (≈1000‰ on all three legs, idle included) ⇒ it is a second
+  core-clock-derived counter, and every P65v2 reading of it as PTB/CLE activity is void.
+- **`src28` OTHER, ≈1000‰ on L3 but ≈0 on L1** ⇒ it is *not* free-running: it is gated on
+  something the bin kick supplies, and the 1:1 with `src32` on bin rungs was a
+  coincidence of the backstop window. This is the outcome that would make it interesting.
+- **`src13` OTHER at a constant ≈250‰ across all three legs** ⇒ clock/4, confirmed as a
+  fixed divisor of the same clock rather than a work counter.
+- **`src13` ≈250‰ on L3 but a different ratio on L2** ⇒ work-correlated, and the
+  clock/4 reading is retracted.
+- **`src1/10/11/12/29` SILENT across all three legs** ⇒ five muxes that a retiring render
+  frame does not move either. Their silence on the bin path stops being evidence about
+  the PTB specifically.
+- **any of the five moving on L2 only** ⇒ `WORK-GATED-RENDER`, the first positive
+  identification of a work-gated mux in this sweep.
+
+### What is deliberately NOT claimed
+
+**No source id is named here, and none may be inferred from these lines.** A class says
+how a mux responded to a pure-idle window, a retiring CT1 render frame and a bin kick. It
+says nothing about which unit it counts.
+
+**The standing rule this arc establishes:** when a later arc transcribes an id from
+`enum drm_v3d_perfcnt` and cross-checks it against this file's verified anchors (16
+`valid_instr`, 32 `cycle_count`), **the transcribed name must match the class measured
+here, or the transcription is rejected.** A name implying render or primitive work on a
+mux measured `CLOCK-LIKE`, or a clock/cycle name on a mux measured `WORK-GATED-RENDER`,
+is mis-transcribed. Calibration checks the transcription, never the reverse.
+
+Slot 2 stays `PCTR_SRC_CYCLE_COUNT` under the `[v3d55]`/`V3D63_CTRL_SLOT` contract — the
+slot `wait_fldone` samples for its clock-liveness verdict *and* this bank's own control —
+so the L3 leg's `[v3d55]` line remains truthful. Writes are **PCTR config registers
+only**, the same `v3d63_pctr_arm` idiom: no `CT*`/GMP/`MMU_CTL` write beyond what the
+reused legs already perform, and no new MMIO window. The battery is `UNAOS_V3D_DEEP`-gated
+and hub-identity gated, printing an explicit `SKIPPED` line when the block is down — QEMU
+raspi4b returns at `BLOCK-DOWN` long before it runs, so `kernel8-test` green for this arc
+means **no regression, nothing more**.
+
+---
+
+## 38. The first named source id — transcription under the calibration rail (V3D-65)
+
+V3D-63 **dropped** three named PCTR sources rather than guess them, and V3D-64 closed with
+a standing rule: when an id is finally transcribed, *the name must match the measured
+class, or the transcription is rejected*. V3D-65 transcribes exactly **one** id and
+submits it to that rule, in the same boot, on the same legs, with a verdict word on the
+wire.
+
+### The blocker is retired — where the enum came from
+
+Both prior arcs recorded the same wall: *"this tree carries no copy of `enum
+drm_v3d_perfcnt` to transcribe from"*. It is no longer true of the build host.
+
+| | |
+|---|---|
+| **File** | `include/uapi/drm/v3d_drm.h` — the Linux uapi header |
+| **Copy read** | `/usr/src/kernels/7.1.5-200.fc44.x86_64/include/uapi/drm/v3d_drm.h` (Fedora `kernel-devel` for 7.1.5-200.fc44, the build host's own running kernel; reachable from the session sandbox as `/run/host/usr/src/kernels/7.1.5-200.fc44.x86_64/…`) |
+| **What** | the anonymous `enum { V3D_PERFCNT_* }` at the tail of the header, first member `V3D_PERFCNT_FEP_VALID_PRIMTS_NO_PIXELS` at index 0 |
+| **Applicability** | the enum's own comment scopes those indices to **V3D 4.2**. This hardware *is* V3D 4.2, so the deprecation note is a positive applicability statement for us. Newer cores must query `DRM_IOCTL_V3D_PERFMON_GET_COUNTER`; we are not a newer core. |
+
+### What licenses the transcription — a six-for-six index cross-check
+
+This is strictly stronger than V3D-63's "must fall between the 16/32 anchors" bracket
+rule. Counting that enum from 0, **every** source id this file already carries from
+earlier arcs lands on exactly the name it was given — six hits, zero misses:
+
+| id | enum member at that index | this file's constant |
+|---|---|---|
+| 14 | `QPU_ACTIVE_CYCLES_VERTEX_COORD_USER` | `PCTR_SRC_QPU_ACTIVE_CYCLES_VERTEX_COORD_USER` |
+| 16 | `QPU_CYCLES_VALID_INSTR` | `PCTR_SRC_QPU_CYCLES_VALID_INSTR` — **anchor** |
+| 17 | `QPU_CYCLES_TMU_STALL` | `PCTR_SRC_QPU_CYCLES_WAITING_TMU` |
+| 24 | `TMU_TCACHE_ACCESS` | `PCTR_SRC_TMU_TCACHE_ACCESS` |
+| 25 | `TMU_TCACHE_MISS` | `PCTR_SRC_TMU_TCACHE_MISS` |
+| 32 | `CYCLE_COUNT` | `PCTR_SRC_CYCLE_COUNT` — **anchor** |
+
+`32 == CYCLE_COUNT` independently re-pins the `v3d_regs.h V3D_PCTR_CYCLE_COUNT(ver)=32`
+anchor from a second, unrelated file. Six independent hits with no misses is not an
+accident of ordering: on 4.2 the **enum index is the hardware source id**, exactly as this
+file has assumed since PI-V3D-21 — now demonstrated rather than assumed.
+
+### The one id, and why this one
+
+**Index 28 is `V3D_PERFCNT_BIN_ACTIVE`.** It is picked over every other candidate because
+it is the only id that is *both* bin/PTB-side *and* already carries a **measured V3D-64
+behaviour class** on the same boot:
+
+- **It is the sweep's one mover.** P65v2 metal (capture `pi4-r23s1o`) read `src28 ≈ 645M`
+  against a `src32 CYCLE_COUNT` control of `≈ 645M` on zero-primitive bin rungs — the only
+  swept slot at 1:1 there. V3D-64 flagged exactly that as the ambiguity worth resolving:
+  free-running clock, or gated on something the bin kick supplies? Under the name
+  `BIN_ACTIVE` the second reading is the live one, and it is the campaign's first direct
+  observable *of the binner*: the frame opens, the bin unit stays active across the whole
+  ~0.5 s `FLDONE` backstop, and it still never retires. "The binner is engaged and never
+  finishes" is precisely the wall this track has been circling.
+- **Every other bin/PTB-side candidate is out of reach of the rail this boot.** 35
+  `PTB_PRIMS_BINNED`, the `PTB_MEM_*` family and 57 `CLE_ACTIVE` are not in
+  `V3D63_SWEEP_SRC`, so naming one of them would publish an **unchecked** name — the exact
+  thing this arc exists to refuse. One id, and it must be one calibration can judge.
+- **The five confirmed-silent ids (1, 10, 11, 12, 29) are checkable but uninformative.** A
+  `SILENT` measurement is consistent with almost any name on a bin path that bins no
+  primitives.
+
+**Ids 1, 10, 11, 12, 13 and 29 stay raw and unnamed.** The V3D-63 treatment holds for them
+and nothing in the V3D-65 lines may be read as naming them by adjacency.
+
+### `[v3d65] srcname` — the anchor check
+
+The predicates are derived from the name and from nothing else. `BIN_ACTIVE` means "the
+bin unit is active", so, in V3D-64's own vocabulary:
+
+| Predicate | Leg | What the name requires | Failing it means |
+|---|---|---|---|
+| **P1 idle-flat** | L1 pure idle, no job submitted | reads **zero**, overflow included | it ticks with no bin work ⇒ it measures the clock, not the binner |
+| **P2 bin-live** | L3 banked `Empty` rung, frame opens and holds open across the backstop | **moves** | a `SILENT` mux is not a bin-activity counter |
+| **P3 class** | — | measured class is neither `CLOCK-LIKE` nor `SILENT` | states the verdict against the *published* class string, not only raw slot values |
+
+P3 is redundant with P1+P2 by construction; it is evaluated anyway so the verdict is
+pinned to the class line a reader actually sees.
+
+**L2 is reported and is *not* a reject condition.** Whether a CT1-only clear job spins the
+bin unit is a question the name `BIN_ACTIVE` does not settle, and an anchor check may not
+reject on a prediction the name never made. The L2 raw value, overflow flag and permille
+are printed so the capture carries the observation.
+
+**A verdict requires L1 and L3 to be valid legs** (each leg's own `src32` control moved).
+Without them the probe prints `anchor-check INCONCLUSIVE` and says **neither PASS nor
+REJECTED** — a name is never confirmed off an uninstrumented bank, which is the failure
+mode this campaign keeps unwinding.
+
+### The two outcomes, and what each does and does not license
+
+- **`PASS`** — src28 is flat across a pure-idle window and moves on a bin kick whose frame
+  opens and never retires. Every predicate the name makes is borne out by behaviour
+  measured independently of the name. The campaign then has a **named bin-side
+  observable**: the bin unit *is engaged* across the whole `FLDONE` backstop while the
+  frame still fails to close — the binner is not absent and not asleep, it is running and
+  not finishing. Two standing limits: this confirms the **id↔name transcription and the
+  mux's behaviour**, not any semantic beyond "bin unit active"; and it names **one** id.
+- **`REJECTED`** — the name is **withdrawn**, src28 reverts to a raw unnamed mux under the
+  V3D-63 treatment, and nothing in the tree may cite it as the binner. Note what a reject
+  does *not* implicate: the six-for-six index cross-check is independent of the
+  measurement, so the likely fault would be the **id↔mux mapping on this silicon** (a SRC
+  field that does not select the enum's source on 4.2), not the enum reading.
+
+### Cost, gating and where the verdict is taken
+
+The check adds **no job, no leg, no register write and no second measurement** — it reads
+the three legs `[v3d64]` already measured, inside `v3d64_mux_calibration`, after that
+probe's own verdict line. It therefore inherits V3D-64's gating unchanged: `UNAOS_V3D_DEEP`
+plus the hub-identity gate, with an explicit `SKIPPED` line when the block is down.
+
+**QEMU raspi4b models no V3D PCTR block at all**, so this never runs there — the caller
+returns at `BLOCK-DOWN` long before it. The `PASS`/`REJECTED` verdict is **metal-attended,
+always**. `kernel8-test` green for this arc means the default boot is byte-inert and the
+suite did not regress, and nothing more.
+
+### Outcome on metal — `REJECTED` (recorded here, drives V3D-66)
+
+The P69 metal boot ran the check and it **rejected** the name: `src28` measured
+**`CLOCK-LIKE`** — 1:1 with the `src32 CYCLE_COUNT` control on *every* leg, the pure-idle
+leg included, where `BIN_ACTIVE`'s own P1 predicate requires zero. Per the rule as written,
+the name is **withdrawn** and `src28` reverts to a raw unnamed mux; nothing in this tree
+cites it as the binner.
+
+What that does and does not implicate is exactly what the reject wording pre-committed to.
+The six-for-six index cross-check is independent of the measurement and **stands**, so the
+enum reading is right; the fault is downstream of it — on this silicon the 7-bit `SRC`
+field does not select the enum's source for every id. **`id↔mux` validity is partial, and
+partial per id.** That is the standing caveat every later arc must carry, and it is the
+reason §39 measures instead of transcribing.
+
+## 39. Widening the sweep to the PTB-neighbourhood ids — measurement, not transcription (V3D-66)
+
+With `id↔mux` only partially valid, a name lifted from the enum is worth exactly the
+behaviour that backs it. V3D-66 therefore adds **eight more source ids** to the calibration
+and publishes their raw counts and behaviour classes. **It names nothing.** Transcription is
+left to V3D-67, which will have these classes to be judged against.
+
+### The eight ids, cited exactly
+
+Same header, same copy, same enum as V3D-65 — `include/uapi/drm/v3d_drm.h`, read from
+`/usr/src/kernels/7.1.5-200.fc44.x86_64/include/uapi/drm/v3d_drm.h` (reachable from the
+session sandbox as `/run/host/usr/src/kernels/…`), the anonymous `enum { V3D_PERFCNT_* }`
+whose first member `V3D_PERFCNT_FEP_VALID_PRIMTS_NO_PIXELS` is index 0 and whose own
+comment scopes these indices to V3D 4.2 — this hardware.
+
+| id | enum member in that copy | line |
+|---|---|---|
+| 30 | `V3D_PERFCNT_L2T_HITS` | `v3d_drm.h:653` |
+| 31 | `V3D_PERFCNT_L2T_MISSES` | `v3d_drm.h:654` |
+| 33 | `V3D_PERFCNT_QPU_CYCLES_STALLED_VERTEX_COORD_USER` | `v3d_drm.h:656` |
+| 34 | `V3D_PERFCNT_QPU_CYCLES_STALLED_FRAGMENT` | `v3d_drm.h:657` |
+| 35 | `V3D_PERFCNT_PTB_PRIMS_BINNED` | `v3d_drm.h:658` |
+| 36 | `V3D_PERFCNT_AXI_WRITES_WATCH_0` | `v3d_drm.h:659` |
+| 37 | `V3D_PERFCNT_AXI_READS_WATCH_0` | `v3d_drm.h:660` |
+| 38 | `V3D_PERFCNT_AXI_WRITE_STALLS_WATCH_0` | `v3d_drm.h:661` |
+
+**A correction to the brief that raised this arc, recorded rather than quietly absorbed.**
+The set was requested as "the `PTB_BLOCKED_CYCLES` / `PTB_PRIMS_BINNED` family". There is
+**no `V3D_PERFCNT_PTB_BLOCKED_CYCLES` in this header at all** — `grep PTB` over the enum
+returns exactly seven members (10 `PRIM_VIEWPOINT_DISCARD`, 11 `PRIM_CLIP`, 12 `PRIM_REV`,
+35 `PRIMS_BINNED`, plus `PTB_MEM_WRITES`, `PTB_MEM_READS`, `PTB_W_MEM_WORDS` in the
+AXI/memory tail). Of the eight indices above exactly **one**, 35, is a PTB member. The set
+is swept as given because the set is what the brief pinned, and because — after the V3D-65
+reject — what an id's enum member *says* is not what licenses anything. It is a **search
+window** and is defensible only as one; 35's PTB name buys it no head start over the other
+seven.
+
+### Batching against the PCTR slot count
+
+The bank is **eight counters** (`V3D_V4_PCTR_0_SRC_0_3` / `_4_7`, one 7-bit `SRC` field
+each) and **slot 2 is permanently reserved** for the `src32 CYCLE_COUNT` control per the
+`[v3d55]`/`V3D63_CTRL_SLOT` contract — `wait_fldone` samples PCTR counter 2 on every bin
+wait and prints a hard clock-liveness verdict off it. Seven usable sweep slots, and
+`V3D63_SWEEP_SRC`'s seven ids already fill them. So the eight new ids run as **two extra
+passes of four**: a fresh arm of the same bank with only slots 0,1,2,3,4 enabled
+(`V3D66_PCTR_MASK = 0x1F`), the same `v3d63_slot` packing, the same control in slot 2, and
+each pass **re-runs all three legs** so every permille is taken against a control measured
+on its own pass. Slots 5..7 are left unselected *and* disabled, so an unselected mux can
+never be mistaken for a measurement.
+
+The legs are V3D-64's, unchanged and reused, no new job class invented: **L1** a 4 ms pure
+idle window with nothing submitted, **L2** the known-good `clear_job` (only a job that
+passed is ground truth), **L3** one banked `Empty` rung of the `[v3d48]` ladder. The L3 rung
+is submitted with `bank: false` so it does not re-arm the seven-id bank over ours; the pass
+arms and reads its own bank around the kick. `V3D63_SWEEP_SRC` and everything `[v3d63]`,
+`[v3d64]` and `[v3d65]` print are untouched.
+
+### The new class — `WORK-GATED-BIN`
+
+V3D-64's vocabulary had `WORK-GATED-RENDER` but no mirror on the bin side; a mux that moved
+only on a bin kick printed a bare `OTHER`. V3D-66 splits that case out, **defined by
+predicate and by nothing else**:
+
+> the L1 idle leg is **valid** *and* the L3 bin leg is **valid** *and* the slot **moved** on
+> L3 (raw ≠ 0 or a latched overflow) *and* the slot did **not** move on L1 *and* the slot did
+> not move on L2 if L2 is valid.
+
+It requires a valid L1 on purpose: "moves only on bin" is a claim about the idle leg, and a
+boot whose L1 dropped out cannot make it — such a slot falls through to V3D-64's own
+`OTHER (IDLE-BLIND)` wording, which claims nothing about idle. It **cannot collide with
+`CLOCK-LIKE`**: the predicate demands a valid L1 on which the slot read zero, whose permille
+is 0 and therefore outside the ±10 % band `CLOCK-LIKE` requires on every valid leg. The
+split is a **refinement of `OTHER`**, not a reinterpretation of any class V3D-64 already
+published — `[v3d63]`/`[v3d64]`/`[v3d65]` still call `v3d64_classify` directly and their
+output is byte-identical.
+
+A mux in `WORK-GATED-BIN` is the thing the render CLE's wall actually needs: a candidate
+witness for whether the binner emits anything at all. V3D-67 may test a PTB name against it —
+under the rule, and only under the rule.
+
+### What is deliberately NOT claimed
+
+- **No id is named.** Not 35, whose enum member is `PTB_PRIMS_BINNED`. The wire lines print
+  `srcNN=value` and a class, with the standing caveat that V3D-65 proved `id↔mux` validity
+  partial on this silicon.
+- **No class is a semantic.** A class says how a mux responded to a pure-idle window, a
+  retiring CT1 render frame and a bin kick. It says nothing about which unit it counts.
+- **The standing rule is unchanged and restated on the wire:** a transcribed name must match
+  the class measured here or the transcription is rejected. Calibration checks the
+  transcription, never the reverse.
+
+### Cost, gating and where the verdict is taken
+
+Two passes × (a 4 ms idle window + one CT1 clear job + one banked `Empty` rung with its
+~0.5 s `FLDONE` backstop) = **two more rungs and ~1 s of extra deep boot**; the `[v3d]
+deep=on` budget line now reads **13 rungs / ~7 s**. Gating is V3D-64's, unchanged:
+`UNAOS_V3D_DEEP` plus the hub-identity gate, with an explicit `SKIPPED` line when the block
+is down. Writes are PCTR config registers only — no new MMIO window, no new job, no new CL.
+
+**QEMU raspi4b models no V3D block**, so `[v3d66]` never runs there and every class below is
+**metal-attended**. `kernel8-test` green for this arc means the default boot is byte-inert
+and the suite did not regress, and nothing more.
+
+---
+
+## 40. Varying the frame — the one input the campaign never varied (V3D-68)
+
+Nine arcs have varied the control list's content, its placement, its length, the cache mode
+around it, the reset before it, the interrupt policy over it and the counter bank across it.
+Go back through every bin frame this campaign has ever kicked — `[v3d40]`'s probe, the six
+`[v3d48]` ladder rungs, `[v3d50]`/`[v3d51]`/`[v3d53]`, `[v3d63]`'s 2×2 matrix,
+`[v3d64]`/`[v3d66]`'s L3 legs, the real M4 draw — and every single one of them programmed the
+**same** `TILE_BINNING_MODE_CFG`: a 64×64 frame, which at this tree's established 64×64 bin
+tile is **exactly one tile**. §31 proved that geometry is encoded exactly as Mesa encodes it.
+It could not prove it is a geometry the PTB can close, because it never compared it with
+another. A one-tile frame is the most degenerate legal frame there is, and it is the frame on
+which the campaign's most load-bearing fact was measured.
+
+That fact is itself unvaried. "An empty bin frame must retire" is sourced from the kernel's
+`v3d_bin_job_run`, which asserts nothing of the kind, and **no Mesa path ever submits one** —
+gallium drops a job whose draw bounds enclose nothing; v3dv never starts a frame it will not
+draw into. "The empty frame did not retire" may simply be the hardware's honest answer to a
+question no driver asks.
+
+### The candidate ranking, and what already excludes each
+
+| Rank | Candidate | Excluding evidence |
+|---|---|---|
+| **1** | **Frame geometry / tile count** — `TILE_BINNING_MODE_CFG` width/height, and the tile-state array that must scale with it | **Nothing.** §31 audited the *encoding* of one geometry, never a second geometry. Unvaried in every arc. |
+| **2** | **The empty-frame premise** — a minimal *non-empty* frame at a *non-degenerate* geometry | Partially varied: `Full` at 64×64 also wedges (§22). What was never varied is content **×** geometry jointly. |
+| **3** | **Tile-alloc pool arming** — is the pool consulted, or merely latched? | `BMOOM=0`, `OUTOMEM` never fired (§23) — consistent with "pool fine" *and* with "pool never consulted". `BPCS` reloads from the `CT0QMS` write (§32 S1), so the register path is live. Armed here as a **witness**, not a perturbation. |
+| 4 | The CL epilogue — `HALT` vs `FLUSH` vs `FLUSH_ALL_STATE`, `INCREMENT_SEMAPHORE` | **CLOSED by §33 T4**: `v3dX(bcl_epilogue)` emits a bare `FLUSH` (4) — no `INCREMENT_SEMAPHORE`, no `FLUSH_ALL_STATE`. Our terminator is already mainline-exact. Not armed. |
+| 5 | `CT0CA` vs `CT0EA` end condition | `CT0CA` reaches `EA` every rung and the submit audit is byte-exact (§28 `[v3d54]`). The CLE demonstrably consumed the `FLUSH`. Not armed. |
+| 6 | PTB output address config (`CT0QMA`/`QMS`/`QTS`) | Byte-exact against `v3d_bin_job_run`, echoes verified (§23 `[v3d49]`); the uapi confirms `qma`=tile alloc, `qms`=its size, `qts`=tile state — our mapping. Not armed. |
+| 7 | L2T / slice-cache interposition on PTB writes | The `[v3d51]` FLUSH vs `[v3d53]` kernel-exact CLEAR differential wedged both ways (§29), and CT1 stores land through the same L2T. Not armed. |
+| 8 | Clock / power gating of the PTB sub-unit | `clkdom` ACTIVE at 500 MHz, `clkliv` Δ249 M (§29); `src32 CYCLE_COUNT ≈ 645 M` across the bin leg (§37). The block is clocked. `MISCCFG.QRMAXCNT` stays disarmed per `V3D55_ARM_QRMAXCNT`. |
+| 9 | GCA / GMP interposition | `PROT_ENABLE=0`, `gmpdelta` clean, and V3D-62's armed fault policy caught nothing on either channel (§35, §"fault-reporting instrument"). GCA is a `ver<41` path. Not armed. |
+| — | `BXCF` (PTB binner extra config) | Mainline defines it and **writes it from no path**. Read and printed per rung; **never written** — a rung that both re-shaped the frame and poked an undocumented PTB config register would discriminate nothing. |
+
+### The battery — `[v3d68] binwall`
+
+Four rungs, `UNAOS_V3D_DEEP`-gated, riding the very tail of `empty_frame_bisection` (after
+every banked verdict and every calibration leg, because this is the only battery that
+re-points `CT0QTS` and publishes poison rather than zeros into the shared bin regions).
+
+| Rung | Frame | Tiles | Content | What it discriminates |
+|---|---|---|---|---|
+| 1 | 64×64 | 1 | `Empty` | the campaign's banked frame, re-run **in this boot** so every other rung is a differential against a same-boot control, not against another capture |
+| 2 | 128×128 | 4 | `Empty` | geometry alone |
+| 3 | 256×256 | 16 | `Empty` | geometry alone, at 16× the tile count |
+| 4 | 256×256 | 16 | `Full` | the smallest non-empty frame at a **non-degenerate** geometry — same shader record, same vertex data, same triangle as M4; only the frame it is binned into differs |
+
+Each rung is `submit_bisect_rung_geom` — the identical `[v3d48]` kick sequence, cache
+maintenance, `[v3d54]` submission audit and ~0.5 s `FLDONE` backstop — with three coupled
+changes that are the one variable: the CFG packet's width/height, a dedicated 24 KiB
+tile-state array at `OFF_V3D68_TSDA` (sized to the whole region regardless of the rung, so an
+under-provisioned TSDA can never be the confound), and the packing witness's expected
+width/height. Clip window, viewport offset and clipper scaling stay at their 64×64 values on
+every rung.
+
+Both bin regions are **poisoned**, not zeroed, with `[v3d56]`'s index-encoding seed: "the PTB
+wrote zeros" and "the PTB wrote nothing" are different answers, and the old detector was
+256 bytes. This one is 24 KiB.
+
+### The reservation prediction — a positive PTB signal without a retire
+
+Mesa `v3d_util.c::v3d_tile_alloc_sizes` states that the PTB requests the tile-alloc **initial
+block per tile** at `START_TILE_BINNING`, before and independent of any primitive, then
+allocates in aligned 4 KiB chunks (two up front). §30 measured `BPCA` advancing by exactly
+`align(1·128, 4096) + 8192 = 0x3000` on the one-tile frame — the formula's value to the byte,
+over a pool the poison proved untouched. **One calibration point cannot separate "reserved
+per tile" from "grabs three 4 KiB chunks regardless."**
+
+A 16-tile frame reserves 2048 B, which still rounds to `0x3000`. Under the 32×32 tile-size
+contingency the *same* frame is 64 tiles and reserves 8192 B, which rounds to `0x4000`. So the
+`BPCA` column measures the effective tile size **and** tests the per-tile reservation model at
+the same time, **on a frame that never retires**. Both predictions are printed per rung with
+their own match flags; a match at both hypotheses means the prediction did not discriminate on
+that frame, and the tile size stays *as established*, never *as measured*.
+
+### The outcome tree
+
+- **Any rung retires** ⇒ the wall is not unconditional. A retire on a multi-tile **empty**
+  frame means the one-tile frame was the defect and every "empty does not retire" verdict in
+  this campaign was measured on a degenerate frame. A retire only on the **non-empty** rung
+  means a 4.2 binner does not close a frame it was given nothing to bin, and the campaign's
+  most load-bearing premise is **retracted**. Either way the next arc is a bring-up arc.
+- **No retire, but poison disturbed** ⇒ the first bin-side memory traffic the campaign has ever
+  caught, caught by growing the detector rather than changing the engine. The wall moves
+  strictly downstream of the write.
+- **No retire, no byte, but a reading moved with tile count** ⇒ the frame unit *is* responsive
+  to frame shape. Geometry reaches the PTB front end, so the front end is running.
+- **No retire, no byte, every reading bit-identical across 1/4/16 tiles and across
+  empty/non-empty** ⇒ frame geometry is excluded with the same force as encoding, submission,
+  cache mode, reset, MMU and clock. That removes the last shape- or content-shaped theory on
+  the board and leaves exactly two never-written mainline-defined configuration registers —
+  PTB `BXCF` and `MISCCFG.QRMAXCNT` — plus the possibility that this block needs an
+  initialisation the campaign has not found.
+
+Two guards the tree depends on. **Fewer than two rungs kicked ⇒ `INCONCLUSIVE`**, never a clean
+result: a geometry ladder with one frame has no differential. And **the poison column is
+evidence only when every rung's L2T write-back completed** — a rung whose drain did not finish
+disqualifies the memory-side reading for the whole ladder, while the retire and register
+columns (MMIO reads, not memory reads) stand on their own.
+
+### Fail-closed sizing
+
+A rung is kicked only when its tile-state array fits the dedicated region **under both tile-size
+hypotheses**: 256×256 is 16 tiles at 64×64 (4 KiB) and 64 tiles at 32×32 (16 KiB), both under
+24 KiB. `v3d68_geom_sound` enforces that bound plus the Mesa-minimum pool at the contingent
+tile count, and a geometry that cannot be bounded is **reported and skipped, never kicked** — a
+mis-estimated tile size can cost the ladder a reading, never a write outside the arena.
+
+### Cost, gating and what is not armed
+
+Four more rungs with their `FLDONE` backstops plus a poison fill and scan of a 24 KiB tile-state
+region and the 32 KiB pool per rung; the `[v3d] deep=on` budget line now reads **17 rungs /
+~9 s**. Writes are the rungs' own already-existing kick sequence and the PCTR config the
+`[v3d63]` bank arms — **no `BXCF` write, no `QRMAXCNT` write, no `CTRSTA`, no GMP or `MMU_CTL`
+change, no new MMIO window, and the real M4 draw untouched.**
+
+The gating is verified by building `kernel8` both ways: the armed-with-deep image carries 12
+`[v3d68]` strings, the armed-without-deep image carries **zero** and is 54,720 bytes smaller.
+**QEMU raspi4b models no V3D block**, so the battery returns at its hub-identity gate with an
+explicit `SKIPPED` line and every verdict here is **metal-attended**; `kernel8-test` green for
+this arc (86/86) means the default boot is byte-inert and the suite did not regress, and
+nothing more.
+
+---
+
+## 41. Diffing the initialisation paths — reading the fabric, not the engine (V3D-69)
+
+§40 excluded frame geometry and frame content with the same force as encoding, submission, cache
+mode, reset, MMU and clock, and named what was left: PTB `BXCF` (mainline defines it and writes it
+from no path), `MISCCFG.QRMAXCNT` (disarmed since §29), **or an initialisation this campaign has not
+found**. Nine arcs had varied the state this driver puts *in front of* the block. This one stops
+probing our own state and reconstructs what mainline does between cold power and its first
+successful bin kick, then diffs.
+
+### 41.1 The reconstructed mainline path
+
+Sourced from working knowledge of the Linux tree (`drivers/soc/bcm/bcm2835-power.c`,
+`drivers/gpu/drm/v3d/*`, `arch/arm/boot/dts/bcm2711.dtsi`). **No network was available**, so every
+step below is a reconstruction from memory and each one carries its own confidence marker. A step
+marked **UNCERTAIN** is one this tree must not treat as settled.
+
+| # | Stage | Step | Confidence |
+|---|---|---|---|
+| 1 | firmware | `start4.elf` powers the GRAFX rail, runs the inrush/POWOK/ISPOW/MEMREP/ISFUNC ramp and leaves the V3D clock present | established (this is why our mailbox `SET_DOMAIN_STATE` domain 10 ACKs) |
+| 2 | DT | `v3d` node: `power-domains = <&pm GRAFX_V3D>`, `resets = <&pm BCM2835_RESET_V3D>`, `clocks = <&firmware_clocks 5>`, `reg` = hub + core0 | high |
+| 3 | DT | `pm` node carries **three** reg ranges: `pm` (VC `0x7e100000`), `asb` (VC `0x7e00a000`), `rpivid_asb` (VC `0x7ec11000`) | **DT-VERIFIED** (V3D-70) — decoded from the shipping `bcm2711-rpi-4-b.dtb`; see §41.8 |
+| 4 | `bcm2835-power` | `bcm2835_power_power_on(PM_GRAFX)` — the POWUP → POWOK → ISPOW → MEMREP/MRDONE → ISFUNC ramp — **returns early on BCM2711** (`if (power->rpivid_asb) return 0`): the firmware owns it | high; this tree has asserted it since §PI-V3D-3 |
+| 5 | `bcm2835-power` | `bcm2835_asb_power_on(PM_GRAFX, ASB_V3D_M_CTRL, ASB_V3D_S_CTRL, PM_V3DRSTN)`: enable the domain clock, ~1 µs settle, **deassert `PM_V3DRSTN`** (bit 6, PM password), then `bcm2835_asb_enable` the **master** then the **slave** bridge | high on the sequence and on bit 6 |
+| 6 | `bcm2835-power` | `bcm2835_asb_control` **re-routes** `ASB_V3D_{S,M}_CTRL` to the `rpivid_asb` block whenever that block is present — always, on BCM2711 | high |
+| 7 | `bcm2835-power` | ASB word bits: `REQ_STOP`(0), `ACK`(1), `EMPTY`(2), `FULL`(3); enable = clear `REQ_STOP` with the PM password, then poll until `ACK` clears | high on 0/1, medium on 2/3 |
+| 8 | `bcm2835-power` | Generic PM word bits `POWUP`(3) `POWOK`(4) `ISFUNC`(5) `MRDONE`(7) `MEMREP`(8) `ISPOW`(9) `ENAB`(12), inrush shift 13 | **UNCERTAIN** — reconstructed, and it collides with the per-domain reset-bit defines in the same word |
+| 9 | v3d probe | `clk_prepare_enable`, `devm_reset_control_get`, ioremap `hub` + `core0` (`gca`/`bridge` are `ver<41` only) | high |
+| 10 | v3d probe | read `V3D_HUB_IDENT1`, derive `ver = tver*10 + rev` | established (§35, §"V3D-61") |
+| 11 | v3d probe | `dma_set_mask_and_coherent(...)` before any DMA allocation | **UNCERTAIN** on the mask width |
+| 12 | `v3d_gem_init` | allocate a **4 MiB** page table (zeroed) and a 4 KiB MMU scratch page; `drm_mm_init` starts at **page 1** — "various bits of HW treat 0 as special" | high on the shape, medium on the size |
+| 13 | `v3d_init_hw_state` → `v3d_init_core` | `MISCCFG.OVRTMUOUT` only when `ver < 41`; then `L2TFLSTA = 0`, `L2TFLEND = ~0` | high — mirrored since §PI-V3D-51 |
+| 14 | `v3d_mmu_set_page_table` | `MMU_PT_PA_BASE = pt_paddr >> 12`; `MMU_CTL = ENABLE \| PT_INVALID_{ENABLE,ABORT,INT} \| WRITE_VIOLATION_{ABORT,INT} \| CAP_EXCEEDED_{ABORT,INT}`; `MMU_ILLEGAL_ADDR = scratch_pfn \| ENABLE` | high — mirrored, §"V3D-62" |
+| 15 | `v3d_mmu_flush_all` | `MMUC_CONTROL = FLUSH \| ENABLE`, wait the flush out, then `MMU_CTL \|= TLB_CLEAR` and wait | high on the writes, medium on the wait bits |
+| 16 | `v3d_irq_enable` | unmask the core working set **and** the hub half | high — mirrored, §26 |
+| 17 | first job | `v3d_bin_job_run`: `CT0QMA`/`CT0QMS`, `CT0QTS \| ENABLE`(bit 1), then `CT0QBA`/`CT0QEA` as the GO | established, byte-exact since §23 |
+
+### 41.2 The diff against our bring-up
+
+We boot bare-metal off `start4.elf` with no Linux, so anything the DT/power framework does that the
+firmware does not do by default is a candidate hole.
+
+| Mainline step | Ours | Status |
+|---|---|---|
+| 1, 4 (firmware rail + ramp) | mailbox `SET_DOMAIN_STATE` domain 10, `SET_CLOCK_RATE` id 5 @ 500 MHz, `SET_CLOCK_STATE` | **covered**, and mainline skips the ramp on BCM2711 anyway |
+| 5 (`PM_V3DRSTN` + both bridges) | `v3d_reset_cycle` = OFF half then `enable_pm_asb` | **written, never read back as a verdict** → the V3D-69 read half |
+| 6 (which ASB block) | we drive `rpivid_asb` at `0xFEC1_1000` | **DT-verified correct** (§41.8); the routing column stays as the cross-check |
+| 7 (`EMPTY`/`FULL`) | never read | **never looked at** → new columns |
+| 12 (page table shape) | identity-mapped arena only; iova ≠ 0 by construction | equivalent-in-effect; the "page 0 is special" rule is respected |
+| 13, 14, 16, 17 | mirrored byte-exact | covered (§26, §29, §35, §"V3D-62") |
+| 15 (`MMUC_CONTROL`) | we write `FLUSH \| ENABLE` in `program_mmu` | **written, never read back** → the V3D-69 `MMUC` column |
+| 11 (DMA mask) | N/A — no DMA API; physical addresses throughout | not a hole |
+
+### 41.3 The ranked holes
+
+1. **`MMUC_CONTROL.ENABLE` never confirmed latched.** Cheapest to check, and a real defect if it
+   reads clear. It would not by itself explain a *bin-exclusive* wall — the render path crosses the
+   same MMU — so it is a thing to fix and re-measure, not a verdict on the binner.
+2. **ASB routing.** If `ASB_V3D_{S,M}_CTRL` are not actually backed at `0xFEC1_1000`, every release
+   this driver has issued since PI-V3D-3 landed on a window nobody reads. *Settled by V3D-70:* the
+   base is DT-correct, and the identity falsifier is the legacy block's `ASB_AXI_BRDG_ID` at `+0x20`
+   — the only identity register any ASB reg range in the DT actually covers (§41.8).
+3. **The PM_GRAFX isolation bits.** Mainline never writes them on BCM2711, so a divergence here is
+   a firmware-configuration finding, not a driver one — and the bit map is UNCERTAIN, so the raw
+   word gets primary billing and the decode is explicitly hedged.
+4. **The ASB master-bridge hypothesis** — ranked **last**, deliberately.
+
+### 41.4 Why the bridge hypothesis is ranked last
+
+The attractive story: the binner's AXI path through the master bridge was never enabled, so the
+block is alive on the register bus (every MMIO read works, every job latches, every register echoes)
+yet cannot master a write to memory — which matches *every* observation, including the total absence
+of an error or an interrupt.
+
+It does not survive contact with the render engine. On this same block, this same boot: a **CT1
+render job retires and lands CPU-verified pixels in arena memory** (§`[v3d58] xengine`); the **CLE
+fetches every bin control list out of DRAM** and `CT0CA` walks it to `EA` (§28); and the **V3D MMU's
+own page-table walk is a memory read**. V3D 4.2 puts *one* master port behind the hub MMU per core —
+the PTB does not have a private one — so those three facts are direct evidence that the master
+bridge passes both reads and writes. A stopped master would take the render path and the list fetch
+down with the binner, and it demonstrably does not.
+
+That is a refutation on inference, and the inference rests on a block diagram this tree has never
+read a register out of. Hence the arc: four MMIO reads settle the branch on the wire instead.
+
+### 41.5 The rungs
+
+**Read half — `[v3d69] fabric` (rides `UNAOS_V3D_DEEP`, writes nothing).** Two stations, either side
+of one banked `Empty` control rung that is the `[v3d48]` kick verbatim. Each station is seven MMIO
+loads inside the Device window `boot.rs` already maps — no new mapping (columns as corrected by
+V3D-70; the station lines carry the `[v3d70]` tag):
+
+| Column | Read | Mainline expectation |
+|---|---|---|
+| `PM_GRAFX` raw + `V3DRSTN` | `PM_BASE + 0x10c` | `V3DRSTN` **set** |
+| `PM_GRAFX` POWUP/POWOK/ISFUNC/MRDONE/MEMREP/ISPOW/ENAB | same word | *whatever `start4.elf` left* — mainline never writes them on BCM2711; map **UNCERTAIN** |
+| `rpivid_asb` identity | — | **none exists**: `ASB_AXI_BRDG_ID` is at `+0x20`, one word past this range's `0x20` length. No identity column is printed for this block |
+| `ASB_V3D_M_CTRL` / `S_CTRL` + `REQ_STOP`/`ACK`/`EMPTY`/`FULL` | `0xFEC1_1000 + 0x0c` / `+0x08` | `REQ_STOP = 0` **and** `ACK = 0` on both |
+| legacy `asb` `ASB_AXI_BRDG_ID` | `0xFE00_A000 + 0x20` | ASCII `'brdg'` = `0x62726467` — **the** identity check, and the only one in DT range |
+| legacy `asb` `M_CTRL` / `S_CTRL` | `+0x0c` / `+0x08` | some *other* peripheral's bridges, or dead — routing falsifier only |
+| `V3D_MMUC_CONTROL` + `ENABLE`/`FLUSH` | hub `+0x1000` | `ENABLE` **set** |
+
+**Write half — `[v3d69] reenable` (separate knob `UNAOS_V3D69_REENABLE`, off by default even on a
+deep boot).** Re-runs mainline's `bcm2835_asb_power_on` ON half (`enable_pm_asb`) and re-kicks the
+control rung, so the retire verdict either side is a same-boot differential. It is **gated on the
+finding as well as on the knob**: when the read half reports a clean fabric it declines, writes
+nothing, and says so — re-releasing an already-released bridge perturbs a live block and the outcome
+would be uninterpretable either way.
+
+### 41.6 Expected wire, per outcome branch
+
+- **`ASB_AXI_BRDG_ID` ≠ `'brdg'`** ⇒ no bridge reading may be cited at all. The bases are DT-verified,
+  so this branch is not an address guess going wrong — it is the ASB address space failing mainline's
+  own probe. STOP and report; do not run another rung.
+- **Either bridge reads `REQ_STOP=1` or `ACK=1`** ⇒ the campaign's model of its own block is wrong
+  and the render evidence has to be re-read. This is the only branch on which the write half is
+  meaningful. Read it against `[v3d58] xengine` and the legacy-routing column *before* arming.
+- **Bridges released, `MMUC_CONTROL.ENABLE` clear** ⇒ a genuine initialisation hole, and the first
+  one this arc found. Fix, then re-measure; it is not a binner verdict.
+- **Fabric clean *and* identity matched** ⇒ the **bridge/routing branch CLOSES** on a measurement
+  rather than on inference, and PM/ASB power sequencing joins the excluded list alongside encoding,
+  submission, cache mode, reset, MMU, clock, frame geometry and frame content. What is left of the
+  wall is **`BXCF`, `MISCCFG.QRMAXCNT`, or deeper block init** — not this layer.
+
+The `EMPTY`/`FULL` columns are a **two-sample read either side of a ~0.5 s wait, not a sampler**:
+"EMPTY at both stations" is consistent with a bridge that was busy and drained, and is evidence of
+nothing on its own. Only `REQ_STOP`/`ACK` carry a verdict, and the witness says so.
+
+### 41.7 Gating and cost
+
+One more rung on a deep boot (the `[v3d] deep=on` budget line now reads **18 rungs / ~9.5 s**) plus
+seven MMIO reads per station. Verified by building `kernel8` three ways: **no deep** carries **zero**
+`v3d69` strings; **deep** carries the read half only (11, and **zero** `[v3d69] reenable`); **deep +
+`UNAOS_V3D69_REENABLE`** carries 16, including the 3 reenable lines — 1,856 bytes larger. QEMU
+raspi4b models neither V3D nor the `rpivid_asb` block, so the probe returns at its hub-identity gate
+with an explicit `SKIPPED` line; `kernel8-test` green for this arc (86/86) means the default boot is
+byte-inert and the suite did not regress, **and nothing more**. Every verdict in §41 is
+metal-attended.
+
+### 41.8 The `pm` node, decoded from the shipping DTB (V3D-70)
+
+§41 was written with no network, so its reg table was a reconstruction and its uncertain rows were
+marked as such. The shipping device tree in this tree's own firmware payload
+(`target/pi_baremetal/bcm2711-rpi-4-b.dtb`) settles them. `/soc/watchdog@7e100000`, `compatible =
+"brcm,bcm2711-pm", "brcm,bcm2835-pm-wdt"`:
+
+| `reg-names` | VC bus address | length | ARM PA (`0x7e…`→`0xFE…`) | this driver |
+|---|---|---|---|---|
+| `pm` | `0x7e100000` | `0x114` | `0xFE10_0000` | `PM_BASE` — **correct** |
+| `asb` | `0x7e00a000` | `0x024` | `0xFE00_A000` | `LEGACY_ASB_BASE` — **correct** |
+| `rpivid_asb` | `0x7ec11000` | `0x020` | `0xFEC1_1000` | `RPIVID_ASB_BASE` — **correct** |
+
+Both bases the driver has used since PI-V3D-3 are DT-correct. The **lengths** carry the finding.
+Mainline's `bcm2835-power.c` reads its identity word `ASB_AXI_BRDG_ID` at offset **`0x20`** and
+expects the ASCII tag `'brdg'` (`0x62726467`). That offset is *inside* the legacy range (`0x24`
+long) and *outside* the `rpivid_asb` range (`0x20` long). Therefore:
+
+- the legacy block has an in-range identity register, and it is the **only** ASB identity check the
+  DT covers — a match validates the `pm`-node address space both bases are derived from;
+- the `rpivid_asb` block has **no** identity register in its DT range at all.
+
+What `[v3d69]` printed as `rpivid_asb BRDG_VERSION` was offset `+0x00` of that block, which is not
+an identity register in any range. Its `0x00000000` was therefore **not evidence of a dead window**,
+and the "establish the base from the DT" branch it would have triggered was chasing a decode
+artifact, not a fault. The column is retired; the honest "no identity register in this DT range"
+note replaces it, and the legacy `+0x20` read is the identity check.
+
+With identity set aside, the P74 wire already read shows every fabric column healthy: `PM_GRAFX`
+`V3DRSTN = 1`; both `rpivid_asb` `M_CTRL`/`S_CTRL` moving `0x7 → 0x4` across our stop/release, i.e.
+a **real** bridge acknowledging (request-stop set ⇒ `ACK` set, cleared ⇒ `ACK` clear); `MMUC.ENABLE`
+latched. So the bridge hypothesis is **excluded by read**, the release writes have been correct
+since PI-V3D-3, and the **bridge/routing branch of §41 closes**. The wall's remaining candidates are
+`BXCF`, `MISCCFG.QRMAXCNT`, or deeper block init.
+
+Unchanged by the DTB: the **generic PM word bit map** (step 8) stays **UNCERTAIN**. The device tree
+gives addresses and lengths, not bit meanings, so the `[v3d70]` PM line keeps the raw word first and
+its decode explicitly hedged.
+
+## 42. The piOS dump-diff — both named suspects excluded measured; the geometry rung and the in-flight fabric read (V3D-71)
+
+V3D-68 ended with two named suspects (`BXCF`, `MISCCFG.QRMAXCNT`) plus "an initialisation this
+campaign has not found"; V3D-69/70 closed the fabric branch by read. V3D-71 starts from the first
+**ground-truth register images of a binner that works**: two attended `devmem` dumps taken on this
+same Pi 4 under working mainline (v3d+vc4 loaded) — `v3d-dump-idle` and `v3d-dump-mid-render`
+(bench capture, 2026-07-29, `glxgears -fullscreen` for the mid-render image).
+
+### 42.1 The dump-diff table's conclusion
+
+Diffing the dumps against our side settles the V3D-68 suspects **by measurement, not argument**:
+
+| Suspect | Working mainline reads | Ours reads | Verdict |
+|---|---|---|---|
+| `PTB BXCF` | `0x00000000` (idle **and** mid-render) | `0x00000000` | **EXCLUDED MEASURED** — a binner that closes frames runs with the identical word; do not re-litigate |
+| `MISCCFG` (`QRMAXCNT`) | `0x00000006` (both dumps) | `0x00000006` | **EXCLUDED MEASURED** — ditto |
+| `MMU_DEBUG_INFO` (hub `+0x1238`) | `0x00000550` (both dumps) | *was the table's one UNKNOWN-ours row* | closed by leg 3 below |
+
+Frame shape, frame content (V3D-68) and fabric identity/state (V3D-69/70) were excluded prior. What
+the diff then leaves as **PTB-visible** differences between the two systems is the **address
+geometry of the bin frame**: mainline bins with its buffers at MMU iovas in the tens of MiB — pool
+`CT0QMA=0x0129A000`/`0x09BDF000` with `CT0QMS≈0x88000` (~544 KiB), CL `CT0QBA=0x03033000`/
+`0x0338A000`, tile-state `CT0QTS=0x01325002`/`0x0437F002` — while every rung this campaign ever
+kicked handed it identity-mapped arena addresses below 4 MiB and a 32 KiB pool.
+
+### 42.2 The three legs (one boot, all riding `UNAOS_V3D_DEEP`, no new knob)
+
+**Leg 1 — `[v3d71] mainline-geom`, the shape-match rung.** Same physical arena, mainline-LIKE iovas:
+the driver's own page table (grown to `PT_CAP=16384`, 64 MiB of iova — entries beyond the arena stay
+published zeros, so the growth also removes the old past-table-end read) gains a window mapped only
+for this rung: pool iova `0x03000000` sized at the dump's `0x88000` — **iova-aliased cyclically onto
+the 32 KiB physical pool**, so any PTB write through any alias lands in poison — CL at `0x03089000`
+(an unmapped guard page below it), the 24 KiB [v3d68] poisoned tile-state detector at `0x0308A000`.
+One `[v3d48]`-style Empty kick (same 64x64 frame — the ONE variable is the addresses), kernel-exact
+submit order, same FLDONE backstop; afterwards the window is unmapped so every later job runs on the
+translation its verdicts were banked under. No off-mainline config write anywhere: the deltas are
+PTEs in our table, the per-job `CT0Q*` latches, and mainline's own `v3d_mmu_flush_all` idiom.
+
+**Leg 2 — `[v3d71f]`, the in-flight fabric sampler.** During that rung's ~0.5 s FLDONE wait,
+`wait_fldone` folds one sample of `rpivid_asb` `M_CTRL` + `S_CTRL` (plus `PCS.BMACTIVE` as the
+qualifier) at its ~1 ms cadence — armed only for this rung, zero MMIO on every other wait. The
+witness prints min/max/distinct-values/count for both words.
+
+**Leg 3 — `[v3d71] fabric MMU_DEBUG_INFO`.** One read of hub `+0x1238` folded into the `[v3d69]`
+fabric stations, decoded per `v3d_drv.c` (`va_width = 30 + [7:4]`, `pa_width = 30 + [11:8]`) and
+compared against mainline's `0x550` — the dump-diff table's one UNKNOWN-ours row.
+
+### 42.3 Reading key
+
+| Wire line | Reading | Convicts / excludes |
+|---|---|---|
+| `[v3d71] mainline-geom verdict — retired=1` or any poison touched | the same Empty frame that wedges at identity iovas produced a retire or PTB traffic at mainline-like iovas | **address-geometry/pool-size branch CONVICTED** — next arc adopts mainline's allocation geometry outright |
+| `[v3d71] … fault latched=1` | the window translation refused an access (client + VA on the fault-latch line) | instrument fault — fix the map; **no** geometry verdict |
+| `[v3d71] … retired=0, no fault, poison intact, drain completed` | still dead with every PTB-visible input mainline-shaped | the **last PTB-visible difference is EXCLUDED MEASURED**; the wall is not in the frame's inputs at all |
+| `[v3d71f] … M_CTRL left 0x4` (any distinct word beyond quiescent, esp. `0x8000`) | beats ENTER the fabric while the frame is open | writes **ISSUE and die downstream** — fabric/routing re-opens, this time measured in-flight |
+| `[v3d71f] … pinned at 0x4 across the wait with BMACTIVE=1` | mainline shows `0x8000` under live master writes; ours never leaves quiescent | the PTB **never issues a single beat** — core-internal verdict, upstream of the master bridge |
+| `[v3d71f] … BMACTIVE never set / 0 samples` | sampler did not overlap an open frame | INCONCLUSIVE — no verdict |
+| `[v3d71] fabric … MMU_DEBUG_INFO match=1` | capability word bit-identical to mainline | the UNKNOWN-ours row closes as excluded |
+| `[v3d71] fabric … match=0` | hub-MMU capability divergence | report; re-read every `VIO_ADDR` decode against the printed `va_width` |
+
+QEMU raspi4b models no V3D: the whole battery returns at the hub-identity gate with an explicit
+`SKIPPED` line, so `kernel8-test` green means **no regression and nothing more** — every verdict in
+this section is metal-attended, read at the next bench boot with `UNAOS_V3D_DEEP=1`.
+
+## 43. Is the clock even ticking? — PCTR armed across the wedged bin (V3D-72)
+
+The P82 wire established, and does not re-litigate: the PTB never issues one beat into the fabric
+(`[v3d71f]`, 500 BMACTIVE=1 samples, M/S_CTRL pinned quiescent — the wall is **core-internal**,
+upstream of the master bridge), and the frame stays dead under mainline address geometry with the
+poison fully intact through a completed L2T drain (`[v3d71]`). Every fabric, routing and input
+theory is closed. But the same wire named its own gap: **both** `[v3d55]` clkliv lines — on the
+final `[v3d48]` Empty rung and on the `[v3d71]` mainline-geom rung — printed *"counter 2 was NOT
+enabled across this wait — no clock verdict here"*. The CYCLE_COUNT battery had only ever been
+armed around the PROBE bin, so the campaign has **never measured whether the core's clock domain is
+advancing while BMACTIVE=1 on the wedged bin itself**. With everything else excluded, a gated
+internal clock sub-domain (invisible in every config register, unlocked by some init mainline
+performs and we lack) is the leading remaining theory — and the PCTR counter file is the one
+instrument inside the core.
+
+### 43.1 What V3D-72 arms (rides `UNAOS_V3D_DEEP`, no new knob)
+
+A four-slot PCTR bank (`[v3d72] clkarm` / `[v3d72] clkliv-x`), armed with the exact
+`v3d_perfmon_start` idiom this file already uses (EN=0 → SRC → read-back → CLR while stopped →
+OVERFLOW clear → EN last; PCTR writes are counter-file config that mainline writes on every perfmon
+start — no off-mainline register experimentation), across exactly two windows:
+
+- the canonical `[v3d48]` **empty-frame** rung (arm → kick → read/stop after the FLDONE wait);
+- the `[v3d71]` **mainline-geom** rung (armed last before the GO, read after the `[v3d71f]` emit).
+
+Slots, every source id one this tree has already anchored (the PI-V3D-33 sourcing rule admits ids
+only against the verified 16/32 anchors; no PTB-family id survives it — the same verdict V3D-63
+recorded — and src35 was explored by v3d67 and is not revisited):
+
+| Slot | Source | Discriminates |
+|---|---|---|
+| 0 | src14 `QPU_ACTIVE_CYCLES_VERTEX_COORD_USER` | any vertex/coord shader execution during the wait |
+| 1 | src16 `QPU_CYCLES_VALID_INSTR` | any QPU instruction issue at all |
+| 2 | src32 `CYCLE_COUNT` | the core clock itself — the reserved `[v3d55]` slot (file law), so the pre-existing clkliv witness now prints `armed=1` with a real Δ on these two waits, with `wait_fldone` unchanged |
+| 3 | src24 `TMU_TCACHE_ACCESS` | intra-core memory-side (TMU cache) traffic |
+
+Counters are cleared while stopped at arm, so each read **is** its Δ across the window; overflow
+bits count as movement (a counter that wrapped exactly to zero must not read "never moved"). The
+bank is stopped (EN=0) at read, so every rung outside the two windows prints exactly as before.
+
+### 43.2 Reading key
+
+| `[v3d72] clkliv-x` pattern | Reading | Convicts / excludes |
+|---|---|---|
+| Δsrc32 `CYCLE_COUNT` = 0 (and no overflow) | the core's own cycle counter is **frozen** while the wedged bin holds BMACTIVE=1 | **THE WALL FOUND** — a gated clock sub-domain; mainline's missing init is a clock/power **unlock**, not a unit enable. Must agree with the same window's `[v3d55]` clkliv (same slot 2, ~1 ms cadence) |
+| Δsrc32 > 0, all unit slots (src14/16/24) = 0 | core clocked and idle: no QPU issue, no TMU-cache traffic, binner silent on an open frame | clock branch **EXONERATED** on the wedged bin itself, for every domain this counter file observes — the wall is a **unit-level enable/state** inside an always-clocked core |
+| Δsrc32 > 0, any unit slot > 0 | the core is not merely clocked but **active** during a wait that never retired | unexpected — re-open the branch of whichever unit moved (QPU issue vs TMU cache) before any clock theory |
+| `PCTR_EN(at read)` lost the 0x0F mask | something reprogrammed the counter file inside the window | every Δ INCONCLUSIVE, not zero — find the reprogrammer first |
+| `[v3d55]` clkliv `armed=0` on either window | the arming did not span the wait | instrument regression — the whole point of this arc is that these two lines now read `armed=1` |
+
+QEMU raspi4b models no V3D: both windows sit behind the hub-identity gate and the `UNAOS_V3D_DEEP`
+feature, so `kernel8-test` green means **no regression and nothing more** — the Δ verdict is
+metal-attended, read at the next bench boot with `UNAOS_V3D_DEEP=1`.
+
+## 44. Does the CLE ever fetch? — the in-flight progress sampler and the submit-sequence diff (V3D-73)
+
+The P83 wire established, and does not re-litigate: the core is **clocked and completely idle**
+across the wedged wait (`[v3d72]` clkliv-x — CYCLE_COUNT advanced 703,077,589 cycles while src14 =
+src16 = src24 = 0), the PTB never issues one beat into the fabric (`[v3d71f]` pinned 0x4), BMACTIVE=1
+with no fault and the poison fully intact. The clock branch is dead; the wall is a **unit-level
+enable/trigger** — "clocked but never TRIGGERED" — and the CLE→PTB frame-close path is the named
+next place to look. V3D-73 asks the one question that splits that path in two: **does control-list
+thread 0 ever fetch and advance through our bin list, or does it never start?** V3D-54 proved the
+LATCH (CT0QBA/QEA hold exactly our list); it never proved a fetch.
+
+The latent evidence that motivates the instrument: under the `[v3d71]` mainline-geom rung — the one
+kick in the whole campaign whose QBA was **unique in iova space** — the `[v3d54]` trace printed
+`CT0CA off 0xfd2c2000` against BA=0x03089000, i.e. raw CT0CA = 0x0034B000: the **previous**
+identity-iova kick's list address. CT0CA never held the new QBA at all. Every earlier rung reused
+the same CL address, so their `CT0CA == BA` readings could never distinguish "loaded QBA, never
+advanced" from "stale word that happens to equal QBA" — and the `[v3d54]` offset arithmetic turned
+the stale raw word into a misleading `(mid) stalled mid-list` verdict. The wedged `CT0PC=3` /
+`CT0LC=0x30000` readings are the same class of stale hold.
+
+### 44.1 Leg 1 — `[v3d73]` cle-progress, the in-flight fetch sampler
+
+The `[v3d71f]` idiom exactly: a static accumulator armed only around the rungs that want it;
+`wait_fldone` folds one sample per ~1 ms tick when armed (one static bool read, zero MMIO, on every
+other wait). Sampled: **CT0CA** (raw word — min/max/distinct capped at 4 with overflow reported,
+plus three derived counters: samples with CA inside [QBA,QEA], samples with CA == QBA, and the
+highest in-span CA seen vs QEA), **CT0CS** (raw distinct words; only CTRUN(bit5) decoded, per the
+§32/§40 CTnCS hedge), **CT0LC**, **CT0PC**, **BFC**. All five are seeded at arm time (pre-GO), so
+`first` is the before-kick word and a stale hold reads as `changes=0` with the stale address
+printed. Armed across two waits: the `[v3d71]` mainline-geom rung (unique-QBA, the unambiguous
+read) and the `[v3d73s]` leg-3 rung below.
+
+### 44.2 Leg 2 — the submit-sequence diff vs mainline
+
+Compiled from the mainline facts this tree already records (the `v3d_bin_job_run` order at the
+CT0Q* facts block in `v3d.rs`, the `[v3d59]` mainline ledger T1–T4, `v3d_invalidate_caches` at
+`bin_prejob_invalidate_kernel_exact`, `v3d_irq_enable`/`v3d_mmu_set_page_table` sourcing) and
+against the attended piOS dumps — no external source fetched.
+
+| # | Mainline `v3d_bin_job_run` write (order) | Ours | Divergence |
+|---|---|---|---|
+| 1 | `V3D_PTB_BPOS = 0` — FIRST write of every bin job (BPOA untouched) | `bin_prejob_bpos_clear`, same position since V3D-57 | none |
+| 2 | `v3d_invalidate_caches`: L3/L2C (no-ops on 4.2) → `SLCACTL` all → `L2TFLSTA=0`/`L2TFLEND=~0` → `L2TCACTL = L2TFLS\|FLM=CLEAR` | all rungs but `[v3d53]` run `FLM=FLUSH`, L2T-first | **(c) mode/order** — individually controlled by the v3d51-vs-v3d53 differential (both wedge) |
+| 3 | `v3d_switch_perfmon` — no-op when no perfmon attached (the common case) | `[v3d63]/[v3d72]` PCTR arming occupies the same slot on armed rungs | none (same idiom) |
+| 4 | `CT0QMA` then `CT0QMS` (guarded by `job->qma`; always set for bin jobs) | same order, always written | none |
+| 5 | `CT0QTS = ENABLE(bit1) \| qts` (guarded by `job->qts`) | same value, same position | none |
+| — | *(nothing)* | **echo READS of CT0QTS/QMS/QMA** (`[v3d49]`/`[v3d71]` frame-enables witness) | **(b) interleaved reads** inside the latch block |
+| 6 | `CT0QBA` | same | none |
+| — | *(nothing — the ISR does all W1C)* | **`INT_CLR` W1C write between CT0QBA and CT0QEA** on every kick | **(a) interleaved write inside the queue pair** |
+| 7 | `CT0QEA` — **the QEA write IS the GO** (queue-register auto-start; no CTnCS write anywhere on the mainline submit path) | same | none |
+
+**Verdict of the diff: no register mainline writes on the bin submit path that we do not.** The
+config space was exhausted measured at P83; rows (a)/(b)/(c) show the **sequence** was not — no kick
+in this campaign has ever been `v3d_bin_job_run` verbatim with nothing interleaved. Each divergence
+is individually benign-looking, and (c) was individually controlled, but the conjunction never ran.
+
+### 44.3 Leg 3 — `[v3d73s]`, the mainline-exact submit (rides `UNAOS_V3D_DEEP`, no new knob)
+
+One more Empty rung at identity addresses (after `[v3d71]` unmaps its window), whose submit is the
+byte-exact transcription: stale-latch W1C and all instrument reads BEFORE the sequence, then
+`BPOS=0` → kernel-exact `FLM=CLEAR` invalidate → `CT0QMA → CT0QMS → CT0QTS|ENABLE → CT0QBA →
+CT0QEA` as five consecutive uninterrupted writes, one `dsb` after the GO. Same poison detectors
+(24 KiB tile-state + 32 KiB pool), same FLDONE backstop, the `[v3d73]` sampler across its wait.
+Within license: every write is one mainline makes on this path, in mainline's order — this leg
+**removes** off-mainline instrument traffic rather than adding an experiment.
+
+### 44.4 Reading key
+
+| Wire line | Reading | Convicts / excludes |
+|---|---|---|
+| `[v3d73] … in-span=0` (CA never inside [QBA,QEA]; stale pre-kick word printed) | **the CLE never fetches its first word** — the queue latched but thread 0 never consumed it | the trigger is **upstream of list execution entirely** (a thread-start condition); list content, addresses and terminator semantics are all unreachable and therefore exonerated for this wedge |
+| `[v3d73] … CA pinned at QBA` (in-span>0, max-in-span==QBA) | the queue loaded but the first word never fetched/advanced | same verdict, one station later: the trigger dies at thread start / first fetch |
+| `[v3d73] … max-in-span==QEA` | the list **executes** — with the PTB silent (`[v3d71f]`) and no FLDONE | the FLUSH terminator fails to trigger the PTB frame-close: the wall moves **into the terminator/frame-close semantics** |
+| `[v3d73] … advanced then stalled mid-span` | the CLE fetches but chokes at the printed offset | localise the packet at that byte |
+| `[v3d73] … BFC Δ>0` | a frame closed under the sampler | read the leg's retire witness — the wedge did not reproduce |
+| `[v3d73s] verdict — retired=1` or poison touched | the uninterrupted sequence retired what the instrumented one wedged | **the submit sequence is convicted** — our own interleaved MMIO was breaking the trigger; adopt the uninterrupted sequence as the only submit path |
+| `[v3d73s] … STILL DEAD` | no retire, no fault, poison intact through a completed drain | the **submit sequence is exhausted alongside the config space**: no write mainline makes that we lack, no order it keeps that we broke — the trigger hunt moves fully upstream of the submit interface |
+| `[v3d73] … samples=0` | the wait exited before the first tick | INCONCLUSIVE — no verdict |
+
+QEMU raspi4b models no V3D: both legs sit behind the hub-identity gate and `UNAOS_V3D_DEEP`, so
+`kernel8-test` green means **no regression and nothing more** — every verdict here is
+metal-attended, read at the next bench boot with `UNAOS_V3D_DEEP=1`.
+
+> **NOTE (2026-08-01, V3D-82).** The `[v3d54]` trace itself now applies this section's lesson
+> instead of merely being corrected by it. Its CT0CA line prints the **raw** first/last words
+> alongside the offsets (`CT0CA raw 0x…->0x… off 0x…->0x…`), and its interpretation arm checks the
+> raw word against the raw `[BA, EA]` span before naming a stall: a raw CA **outside** the span is
+> classified `(stale)` — a stale pre-kick address, the CLE never demonstrably entered this list,
+> with `[v3d73]` named as the deciding instrument — while only a raw CA genuinely inside the span
+> keeps the `(mid)` "advanced then stalled mid-list" reading. No future reader has to undo the
+> wrapping arithmetic by hand, and the P83-class artifact ("stalled at offset 0x2d000" on a
+> 106-byte list) can no longer print as a verdict. In the same change, the shared `v3d75_kick_probe`
+> — the kick every deep leg after V3D-74 rides (`[v3d75a]`/`[v3d75b]`, `[v3d77a]`/`[v3d77b]`,
+> `[v3d80 post-handover]`, `[v3d81q]`, and `[v3d81d post-handover]` when that leg is armed — every
+> caller of the shared probe) — now **emits** the `[v3d73]` witness it was already arming (wait → emit →
+> read-span, the `[v3d74a]` idiom), so the sampler rides every CT0-kicking deep leg and the fetch
+> verdict on those legs is measured, not extrapolated from the three originally-armed rungs.
+
+## 45. Thread 0 or bin class? — the thread-swap discriminator (V3D-74)
+
+The P84 wire established, and this arc does not re-litigate: `[v3d73s]` = the byte-exact mainline
+submit sequence changes **nothing** — the submit interface is exhausted alongside the config space.
+`[v3d73]` cle-progress = CT0's queue **loads** (CA holds our list, CTRUN=1) but the CLE **never
+fetches the first word** — 500 samples, zero movement, the core clocked (703M cycles over the wait)
+and idle. Meanwhile **thread 1 works** on the same CLE hardware: CT1/RCL jobs fetch, execute,
+retire and land byte-verified pixels (`[v3d58]` xengine, banked since M3). Same silicon, two
+threads: one alive, one loaded-but-never-fetches.
+
+Two hypotheses fit, and they send the hunt in opposite directions:
+
+1. **Bin-class lists are dead as a class** — something about a bin submission upstream of the
+   first fetch (the CT0QMA/QMS/QTS tile-memory arming state, or bin-mode selection) kills the
+   fetch before it starts. Then thread 0 *can* fetch, and the next instrument targets whatever
+   distinguishes a bin submission before its first word.
+2. **Thread 0 is dead as a thread** — it never starts regardless of list class: a per-thread
+   enable/power state no register this campaign knows controls. Then the hunt leaves the core's
+   programming interface entirely; firmware/VPU-side per-thread init becomes the leading space.
+
+### 45.1 Leg A — `[v3d74a]` rcl-on-ct0, the swap
+
+Take the minimal render list thread 1 provably executes — the M3 clear-job RCL, the smallest
+retiring rung in the file, byte-verified on metal since M3 — and submit it on **CT0's** queue
+(CT0QBA/CT0QEA), otherwise byte-identical to the retiring CT1 submit: QBA, `dsb`, QEA, `dsb`,
+and **nothing else**. Deliberately no QMA/QMS/QTS arming — that is exactly the bin-class state
+under suspicion, being removed. The `[v3d73]` sampler is armed across the wait; the FLDONE wait
+supplies the ~1 ms tick window (an executing RCL retires with **FRDONE**, not FLDONE, so the wait
+always runs its full ~0.5 s backstop and `FRDONE=1` on the `[v3d44]` timeout line is a *positive*
+reading on this leg). Same `[v3d68]` poison detectors (24 KiB tile-state + 32 KiB pool, drained
+and scanned), plus the clear-job store verify (sentinel-seeded target vs `CLEAR_RGBA`) as the
+strongest possible positive. A bonus of the swap: the RCL's address was never latched into CT0Q*
+by any prior kick, so a `CA==QBA` reading on this leg is unambiguous — the `[v3d73]` stale-word
+trap cannot reproduce here.
+
+Placement: last in the deep ladder, after `[v3d73s]` — leg A latches an RCL-class queue into
+CT0Q*, so every bin-class reading must already be banked before it runs.
+
+### 45.2 Leg B — `[v3d74b]` bcl-on-ct1: a documented no-op, on the tree's own register map
+
+The mirror leg — the Empty bin list on CT1's queue with the bin-side memory latches armed as
+`[v3d71]` does — **cannot be expressed**: the `v3d_regs.h` map this driver transcribed shows the
+bin tile-memory latches are thread-0-only. CT0QTS (0x15c), CT0QMA (0x170) and CT0QMS (0x174)
+have **no CT1 counterparts** — the adjacent slots are CT1SYNC (0x158) and CT1QCFG (0x178).
+Thread 1 has no PTB tile-memory plumbing to arm, so "the bin-side arming, mirrored" is not a
+register sequence that exists; and a bin list reaching `START_TILE_BINNING` on a thread with no
+PTB access risks wedging CT1 — the only thread this campaign has ever seen retire, and the
+working reference every cross-engine verdict (`[v3d58]` xengine, `[v3d64]`/`[v3d66]` render legs,
+`[v3d58]` rerender) rests on. The discriminator is therefore one-sided by hardware design:
+`[v3d74b]` emits the rationale on the wire and kicks nothing; leg A carries the verdict alone.
+
+### 45.3 Reading key
+
+| Wire line | Reading | Consequence |
+|---|---|---|
+| `[v3d74a] … store-verified=1` (or `FRDONE=1` / `RFC Δ>0` / sampler `max-in-span==QEA`) | **thread 0 can fetch and execute** — the render-class list ran on CT0 the moment the bin-class arming was absent | the death is **bin-job-configuration-specific**, upstream of the first fetch; next instrument: the QMA/QMS/QTS arming-state permutation ladder |
+| `[v3d74a] … advanced then stalled mid-span` | thread 0 **fetches** an RCL-class list, then chokes mid-list (an RCL without render-side plumbing may legitimately choke past the fetch) | the class discrimination stands — thread 0 starts when the submission is not bin-armed; the choke offset is a separate localisable fact |
+| `[v3d74a] … CA loaded QBA, never advanced` (unambiguous here — fresh address) | the same loaded-but-never-fetches signature as the bin class, now on a render-class list | **thread 0 itself never starts regardless of list class** — a per-thread enable/power state outside the known register space; the hunt leaves the core's programming interface (firmware/VPU-side per-thread init) |
+| `[v3d74a] … CA never held QBA` | thread 0 did not even load the swapped queue | same verdict, one station earlier |
+| `[v3d74a] … samples=0` or MMU fault latched | instrument failure | INCONCLUSIVE — no verdict; fix before citing |
+
+### 45.4 The S1S bench ask — the piOS dump taken MID-BIN
+
+If leg A reads *thread 0 never starts*, the next discriminator is not a register this driver can
+reach: it is a **piOS register dump captured mid-bin** — the same dump rig as V3D-71's, but
+triggered while a mainline bin job is in flight (between `v3d_bin_job_run`'s QEA write and its
+FLDONE), so the capture shows the CLE/PTB/hub state of a thread 0 that *is* fetching. Diffing
+that against our wedged mid-bin state is the first look at whatever per-thread condition the
+firmware/VPU establishes and we do not. This is the standing bench ask for the S1S sitting.
+
+QEMU raspi4b models no V3D: `[v3d74]` sits behind the hub-identity gate and `UNAOS_V3D_DEEP`, so
+`kernel8-test` green means **no regression and nothing more** — the verdict is metal-attended,
+read at the next bench boot with `UNAOS_V3D_DEEP=1`.
+
+## 46. The S1S firmware-init campaign — every register divergence explained (V3D-75…78)
+
+The §45.4 bench ask was answered the same sitting (2026-07-30): the dump rig grew a
+`--trigger ct0run` mode (in-process mmap spin on `CT0CS.CTRUN`, instant snapshot + 1 ms settle)
+and caught a genuine mid-bin capture (in-span=True; settle proves it: `CT0CS 0x20→0x00`,
+`BFC 0xE4→0xE5` across the millisecond). Four rungs and one condition boot then closed the
+entire register-visible search space.
+
+### 46.1 The mid-bin diff and its three divergences
+
+Against every wedged UnaOS reading: `RPIVID_ASB_V3D_M_CTRL` 0x4040 vs our 0x4; the legacy ASB
+bridges parked (0x5) on both sides; wedged `CT0CS` 0x70 (bits 4+6 above CTRUN) vs 0x20 while
+genuinely fetching. A full-window sweep was added on both sides (`[v3d76]` in the DEEP battery;
+`--sweep` in the dump script — same `SWEEP phys= val=` line format, `diff` is the instrument).
+The sweep reduced the structural divergences to exactly two UNNAMED words, absent from mainline
+`v3d_regs.h`: core0+0x68 (piOS 0x3, ours 0x10001) and hub+0x68 (piOS 0x2, ours 0).
+
+### 46.2 The verdicts, in order (each read on metal)
+
+| Rung / boot | Experiment | Verdict |
+|---|---|---|
+| `[v3d75a]` P86 | mailbox `SET_ENABLE_QPU(1)` (0x00030012) | MAILBOX FAILED — tag unhandled by this firmware; route closed |
+| `[v3d75b]` P86 | `M_CTRL = pw\|0x4040` transplant | did NOT hold — VPU-owned bits (mid-bin2 later showed them cycling 0x4050→0x4060 live) |
+| `[v3d77a]` P88 | core0+0x68 ← 0x3 | readback unchanged — READ-ONLY status word |
+| `[v3d77b]` P88 | hub+0x68 ← 0x2 | readback unchanged — READ-ONLY |
+| P89-KMSCOND | byte-identical kernel + `dtoverlay=vc4-kms-v3d` + dtbos in the FAT | NOTHING changes at handoff: entry bridges still 0x7, core+0x68 still 0x10001, `[v3d74a]` still never-starts — start4.elf does not establish the condition, overlay or not |
+| idle-dump recheck | V3D-71-era `v3d-dump-idle.txt` | **idle piOS `M_CTRL=0x4` — OUR value.** The high bits are bridge ACTIVITY STATUS (an effect of AXI traffic), not an enabling condition |
+
+### 46.3 Where that leaves the wall
+
+Every ARM-visible register divergence between the wedged and the working system is now
+explained as job-state, free-running counters, VPU-owned live status, or read-only status.
+core0+0x68 bit16 (0x10001 wedged vs 0x3 fetching) remains valuable as the wedge's visible
+SIGNATURE — a diagnosis window, not a knob. The instrument-lie ledger gains n+1: a fabric
+status word read mid-render, mistaken for init state.
+
+The remaining truth channels are outside the register file: the VPU firmware's own V3D state
+(not ARM-visible), and whatever the Linux driver chain requests THROUGH the firmware at probe
+time that our bringup does not (clock/reset/power sequencing differences — a source-audit of
+raspberrypi-power/raspberrypi-clk/v3d-probe on BCM2711 is the next instrument, before any
+further boot is spent).
+
+### 46.4 V3D-79 — the genpd-faithful minimal bringup (P90, read on metal)
+
+The source audit (rpi-6.6.y: `v3d_drv.c`, `v3d_gem.c`, `bcm2835-power.c`, `clk-bcm2835.c`,
+`bcm2711.dtsi`) established that piOS never resets V3D at boot — `v3d_reset()` is the hang path;
+boot-time bring-up is genpd `bcm2835_asb_power_on` alone (deassert `PM_V3DRSTN`, release the two
+rpivid bridges; `pd->clk` resolves NULL on 2711 so the clock choreography no-ops; the v3d node
+has no clock of its own). `UNAOS_V3D79_MINIMAL` reproduces exactly that and nothing else.
+
+**P90 verdict: STILL DEAD.** BLOCK-UP without any mailbox call (the block decodes on bridge
+release alone), and `[v3d74a]` reads the identical never-starts signature. Every ARM-side act,
+order and register the working system touches is now matched or removed — **the ARM-side
+divergence space is EMPTY.** Two riders: (a) on the MINIMAL boot the firmware *reports* the V3D
+clock gated at 250 MHz while CYCLE_COUNT free-runs at ~499 MHz — the firmware clock-state report
+is not trustworthy (instrument-lie ledger +1); (b) our mailbox power/rate/gate calls are
+therefore neither harmful nor sufficient — cosmetic to the wedge.
+
+**Remaining space, now exclusive: the environment the FIRMWARE boots under.** piOS's start4.elf
+/fixup4.dat (its own build) + its config.txt lines vs our pinned 1.20260521 set with a bare
+config. The next discriminator is P91-ENVSWAP: OUR kernel + the piOS card's exact firmware
+files and config lines (minus kernel=/os selection). Retire there → bisect the environment
+(firmware build first, then config lines). Still-dead there closes the ARM-testable universe;
+what remains is VPU-internal state requiring firmware-side instrumentation.
+
+### 46.5 V3D-80 — the display handover, and the reply-less-notify discovery (P92/P93)
+
+vc4's probe performs ONE mailbox act no UnaOS boot ever has: `NOTIFY_DISPLAY_DONE` (0x00030066,
+zero-length) — the firmware display driver stops and the ARM owns the display/GPU complex.
+P92 sent it with the default 500 ms reply budget: timeout. P93 with 5 s: timeout again — and the
+same capture shows `NOTIFY_XHCI_RESET` (0x00030058) followed by mailbox timeouts too, *while the
+VL805 firmware load it requests demonstrably works*. Reading: **on this firmware
+(hash 3484b5dd…, = piOS's own), NOTIFY-class tags are acted on without a FIFO reply** — a
+mailbox-protocol instrument lie (ledger +1): "MAILBOX FAILED" on a notify tag means only
+"no reply", not "no effect". It also reopens [v3d75a]'s ENABLE_QPU verdict from "tag unhandled"
+to "possibly acted, reply-less".
+
+Discriminator for whether P93's handover took effect: the PANEL. The [v3d80] rung runs ~15 s
+into the battery; a display that goes black there = the firmware display driver stopped = the
+handover HAPPENED and the kick's DEAD read refutes the hypothesis for real. A display that
+survives = the tag was ignored and the hypothesis stands untested. (Attended read — recorded
+at the bench.)
+
+> **Superseded by §47 — do not stop here.** The panel was the only discriminator available at
+> P93 and it is a poor one: attended, single-shot, and unable to separate "nothing happened" from
+> "something happened where nobody was looking". §47 (V3D-81) replaces it with three machine-read
+> channels and a positive control, and it is where the handover verdict now comes from. The
+> protocol fact above stands unchanged; only the *reading method* is superseded. Note also that
+> `mbox_call_budget`'s 5 s budget was introduced on the belief that the tag replies slowly — that
+> belief is what this section refutes, and no budget can repair it.
+
+## 47. The reply-less NOTIFY, read by effect (V3D-81)
+
+§46.5 closed the ARM-testable space and left exactly one thread live, and it is a thread about
+METHOD rather than about hardware. On this firmware a NOTIFY-class tag is acted on without a FIFO
+doorbell. `mbox_call` returns only when a doorbell arrives. Every verdict this campaign read
+through it for such a tag was therefore a statement about the doorbell and not about the tag —
+including the two that closed routes: `NOTIFY_DISPLAY_DONE` (P92 at 500 ms, P93 at 5 s, both
+"MAILBOX FAILED") and `SET_ENABLE_QPU` (P86, recorded as "tag unhandled by this firmware"). Neither
+was refuted. Both were mis-read.
+
+V3D-81 sends them properly: post the tag, wait for no reply, settle a stated interval, then read
+the EFFECT.
+
+### 47.1 Why panel survival was never enough
+
+P93's only discriminator was the bench panel: black = the display driver stopped = the handover
+happened = a dead kick refutes the hypothesis; alive = the tag was ignored = the hypothesis stands
+untested. That reading is correct and nearly useless. It is a null result, it needs an attended
+human at the exact moment, and it cannot separate "nothing happened" from "something happened
+somewhere nobody was looking". The instrument must decide **acted vs ignored** by itself, on the
+wire, or a boot spent on it is a boot spent on a coin flip.
+
+Three channels do that, and all three are independent of the doorbell:
+
+1. **The reply buffer.** The VPU writes its response into the request buffer by DMA; the doorbell
+   is a separate mechanism. `overall = 0x8000_0000`, or the tag's own request word carrying bit 31,
+   means the message was parsed and the tag HANDLED — acted, whatever the effect. P92/P93 posted
+   that buffer and abandoned it when the wait timed out; nobody has ever read those words for
+   either tag. (PIUSB-12 named this word as the discriminating one for the doorbell-bearing case;
+   V3D-81 is that reading carried across to the doorbell-less one.)
+2. **The register station**, pre and post, bracketing only the send: core0+0x68 (the wedge
+   signature, §46.3), hub+0x68, both RPIVID ASB bridge words, CT0CS. Any movement = the VPU reacted.
+3. **The firmware's own state**, asked before and after: `GET_CLOCK_RATE`/`GET_CLOCK_STATE` for V3D
+   and `GET_PHYS_WH` for the display. The last is the panel observation made in software — a
+   firmware that stopped its display driver should stop answering (or answer differently) about
+   DISPLAY geometry while still answering about CLOCKS. That asymmetry is the handover, machine-read.
+
+And the control that makes a null reading mean anything: `GET_CLOCK_RATE` after the send, on a tag
+unrelated to either hypothesis. If it answers, the transport and the cache invalidate were both
+alive when the buffer was read, so an untouched buffer is the firmware's silence rather than our
+blindness. If it does not answer, the leg reports INCONCLUSIVE instead of inventing a verdict.
+
+`query_display_size_raw` and `get_clock_rate_raw` exist for the same reason: the ordinary wrappers
+fold "the firmware reports no display mode" and "0 Hz" into `None` alongside a transport failure,
+and those are precisely the answers a stopped driver would give.
+
+### 47.1a Control-independent vs control-dependent evidence
+
+Of the three channels, two are read WITHOUT the mailbox and one is read THROUGH it, and the verdict
+ladder must not treat them alike. The reply buffer and the register station are direct reads: a
+stamped response word cannot be manufactured by our own posted values, and an MMIO register diff
+needs no VideoCore cooperation to be believed. The firmware's own state is three `mbox_call`s.
+
+The failure that follows is the one this section exists to name. **If the transport dies anywhere
+inside a leg, all three firmware fields go `Some(x)` → `None` at once.** That is maximal apparent
+"movement", produced entirely by the instrument breaking, and it appears on precisely the boot where
+the firmware can no longer be asked anything. Folded into a single `station-moved` flag it prints
+ACTED, EFFECT ELSEWHERE — *a refutation* — with `control-alive=0` sitting unread in the same line,
+and it takes the campaign's last open tag off the list on the strength of a dead mailbox. The
+INCONCLUSIVE arm, meanwhile, becomes unreachable in the one state it was written for.
+
+So the wire carries `reg-moved` and `fw-moved` separately, and the ladder is ordered:
+
+1. `posted=0` or `buffer-rejected=1` → **instrument failure, no verdict.**
+2. `kick=1` → **the wall was this tag.**
+3. `acted-on-buffer=1` or `reg-moved=1` → **ACTED, EFFECT ELSEWHERE.** Control-independent; stands
+   whatever the mailbox is doing.
+4. `fw-moved=1` **and** `control-alive=1` → **ACTED, EFFECT ELSEWHERE (firmware state).** The weaker
+   channel, admitted only with the reader proven alive; cite which channel carried it.
+5. `control-alive=0` → **INCONCLUSIVE.** Reached whenever the control is dead and no
+   control-independent channel moved — including, deliberately, the case where `fw-moved=1` because
+   the transport died.
+6. otherwise → **IGNORED.**
+
+This is the §46.5 lesson applied to the instrument itself: an instrument's reading is evidence only
+where the instrument can actually run, and an arm that reports "the mailbox failed" must not be
+outvoted by the movement that mailbox failure invents.
+
+### 47.2 Reading key
+
+| Wire reading | Verdict |
+|---|---|
+| `send … doorbells=N>0` | the tag is **not reply-less** at this settle — §46.5's protocol reading does not cover it, `mbox_call` can carry it, and P92/P93's timeouts want re-explaining |
+| `send … MESSAGE REJECTED` (`overall=0x80000001`) | the VPU parsed the buffer and threw it out as malformed; the tag was never reached. A write that means the opposite of acted — **instrument fault, no verdict** |
+| `send … REPLY-LESS AND ACTED` (`overall`/`tag_code` stamped) | the message was parsed and the tag HANDLED with no doorbell — the fact P92/P93 could not see |
+| `verdict … kick=1` | **the wall was this tag**: thread 0 starts once it is sent reply-less. Productionize the send in bringup before first submit |
+| `verdict … kick=0 acted-on-buffer=1` or `reg-moved=1` | **ACTED, EFFECT ELSEWHERE** — read without the mailbox, so it holds regardless of `control-alive`. A real refutation; the tag comes off the open list |
+| `verdict … kick=0 fw-moved=1 control-alive=1`, `reg-moved=0`, `acted-on-buffer=0` | **ACTED, EFFECT ELSEWHERE (firmware state)** — a refutation on the weaker channel; name the channel when citing it |
+| `verdict … control-alive=0` (`acted-on-buffer=0`, `reg-moved=0`) | **INCONCLUSIVE — no verdict, whatever `fw-moved` says**, because a dead transport drives all three firmware fields to `None` and is indistinguishable from the firmware changing its mind. On the display leg a control that dies is *candidate* evidence the display driver stopped — candidate, not proof |
+| `verdict … kick=0`, everything else 0, `control-alive=1` | **IGNORED** — the reader was alive and the firmware left no trace: the tag does nothing an ARM can see and the hypothesis stays UNTESTED (P93's position, now stated from evidence) |
+| `station … fifo-drained-before-queries=N>0` | a doorbell arrived late and was swept here. On a POST station: the tag replied after its settle expired, so it is not reply-less at this budget |
+| `[v3d81] battery done … N stale word(s) discarded`, N>0 | same tell for a reply landing after the LAST station; also the reason no later `mbox_call` inherits it and prints a spurious MAILBOX FAILED |
+| `display-liveness … display query moved while the clock query still answers` | the firmware DISPLAY driver specifically stopped — the handover happened, no panel needed |
+
+### 47.3 Arming, and the one-send rule
+
+`UNAOS_V3D81_QPU` and `UNAOS_V3D81_DISPLAY` arm the legs separately, because they are independent
+hypotheses and a boot that sends both can attribute a change to neither. Each implies
+`UNAOS_V3D_DEEP` (the legs ride the tail of the deep battery, where every reading they are compared
+against is taken). `UNAOS_V3D81_SETTLE_MS` sets the settle (default 250 ms, capped at 10 s).
+
+Arming a leg **stands down the doorbell-waiting send of the same tag above** — `[v3d75a]` for
+ENABLE_QPU — and says so on the wire. A tag sent twice makes the reply-less rung's pre-station a
+lie, and it also turns the stood-down rung into something better: `[v3d75a]`'s station and kick
+become the same-boot PRE-SEND control for `[v3d81q]`.
+
+`[v3d80]` stands down more broadly: **any** armed leg suppresses it, not just `UNAOS_V3D81_DISPLAY`.
+Per-tag would not be enough. `[v3d80]` is the last rung before the battery, and by §46.5's own
+reading its `NOTIFY_DISPLAY_DONE` may be honoured reply-lessly — with the effect landing anywhere
+inside the 5 s the doomed doorbell wait burns, or after it. The fields a stopping display driver
+degrades (`GET_PHYS_WH`, and the `GET_CLOCK_RATE` that serves as the control) are exactly the fields
+`[v3d81q]`'s stations read, so a late-landing handover straddling `[v3d81q]`'s pre-station would be
+attributed to `SET_ENABLE_QPU`. With only `UNAOS_V3D81_QPU` armed the handover tag is therefore not
+sent at all on that boot, and the wire says so on both `[v3d80]` and `[v3d81d]`.
+
+Since V3D75A-GATE and V3D80-GATE, arming a leg is **necessary but not sufficient**. Each *tag* now
+carries its own arming switch as well — `UNAOS_V3D_QPU` for `SET_ENABLE_QPU`, `UNAOS_V3D_DISPDONE`
+for `NOTIFY_DISPLAY_DONE` — both off by default (see [The knob](#the-knob)), because both sends cost
+the boot something (the mailbox and therefore USB; the panel) and both verdicts are banked. A leg
+armed with its tag gate off posts nothing, takes no station either side of the send it did not make,
+and prints one `… SKIPPED — <tag>-gate off …` line that disclaims its own verdict explicitly.
+
+Every `[v3d81]` line states the armed legs, the tag gates, the settle, the tag ids and both stations,
+so a capture is self-describing and datable without the reader knowing how the image was built.
+
+Standing caveats for whoever reads the next boot. The legs run after `[v3d75b]`'s M_CTRL transplant
+and `[v3d77]`'s two pokes, so the fabric they act on carries that residue — both were readback-proven
+not to hold (§46.2), and the pre-station prints the values, but the residue is real and named. And
+if a tag replies LATER than the settle, its doorbell would be consumed by the next ordinary property
+call as if it were that call's own reply. The FIFO is drained before every post and before every
+station query, and **every drain prints its count** — `stale-pre` on the send line,
+`fifo-drained-before-queries` on each station, and a final sweep at the tail of the battery so that
+a reply landing after the last station is not left for an unrelated subsystem to consume and report
+as its own MAILBOX FAILED. Whichever drain runs first is where a late doorbell shows up; a drain
+that swallowed the count silently would have destroyed the only evidence it ever arrived.
+
+QEMU raspi4b models no V3D, so `[v3d81]` sits behind the hub-identity gate: `kernel8-test` green
+means no regression and nothing more. The verdict is metal-attended.
+
+## 48. The CLE stall decoded — there is no packet at the stall offset (V3D-82 verdict, 2026-08-01)
+
+The S1U opening arc: the PA4 `[v3d54]` line read `CT0CA off 0x2d000 (mid)` against the 106-byte
+`[v3d74a]` RCL (`BA=0x0031e000 EA=0x0031e06a`) — "stalled mid-list, choked on the packet at that
+offset". The arc's task was to decode the list byte-for-byte and name that packet. Both halves
+are now closed, off the banked capture alone, with no boot spent.
+
+### 48.1 The stall offset names no packet — it names the previous list's base address
+
+Hand-verified arithmetic across every "STALLED mid-list" reading in the PA4 capture: all three
+reported offsets decode to the SAME absolute CT0CA word.
+
+| leg | BA | reported off | raw CT0CA |
+|---|---|---|---|
+| v3d63 (14 B @ 0x0034f000) | 0x0034f000 | 0xffffc000 | **0x0034b000** |
+| v3d71 mainline-geom | 0x03089000 | 0xfd2c2000 | **0x0034b000** |
+| v3d74a…v3d81q (106 B) | 0x0031e000 | 0x2d000 | **0x0034b000** |
+
+0x2d000 would be byte 184,320 of a 106-byte list — impossible as progress, exact as one frozen
+register. 0x0034b000 is the BA of every pre-wedge probe list; CT0CA moved genuinely in the
+pre-wedge era (offsets 0x4c, 0xe walked with CTRUN=0), latched 0x0034b000 at the wedge onset
+(the v3d53 rung, where CTRUN stuck 1), and has never changed since. The `(mid)` verdict was
+`emit_v3d54_trace`'s fallthrough arm — `!(==BA) && !(==EA)` over a wrapping subtract, no span
+check (the §44 P83 trap, reproduced verbatim on PA4).
+
+Adversarial review closed the loopholes: a fetch-and-park between 1 ms samples is triply
+incoherent (CA parks at EA on completion; CTRUN would clear, it is frozen 1 at CS=0x70
+changes=0; BFC Δ0 and BPCA adv=0), and the sampler's own MMIO reads demonstrably execute in
+the wedged state, so its zero is admissible.
+
+**Direct measurement existed for every leg all along.** `v3d75_kick_probe` armed the `[v3d73]`
+sampler on every funneled leg (v3d75a/b, v3d77a/b, v3d81q — and v3d80 post-handover, when that
+leg is armed) and folded its span facts into
+each kick line — `sampler samples=500 in-span=0 max-in-span=0x00000000` — while the `[v3d73]`
+verdict line itself never printed (the emit call was missing; fixed by V3D-82). No leg in the
+PA4 capture ever held a CT0CA inside its submitted span. The v3d81q reading is measurement,
+not inference.
+
+### 48.2 The list itself is well-formed — content exonerated by decode, not by inference
+
+First byte-level RCL audit of the campaign (§31/V3D-57 audited only the bin CL). The 106-byte
+M3 clear-job RCL decodes as 20 packets, exactly 106 bytes, every boundary opcode-aligned,
+against the V3D 4.2 encoding (`v3d_packet_v42.xml` naming): the TILE_RENDERING_MODE_CFG
+bracket in correct order (COMMON → CLEAR_COLORS_PART1 → COLOR → ZS_CLEAR_VALUES),
+TILE_LIST_INITIAL_BLOCK_SIZE, MULTICORE_TILE_LIST_SET_BASE/SUPERTILE_CFG, the GFXH-1742
+double dummy-store block, FLUSH_VCD_CACHE, START_ADDRESS_OF_GENERIC_TILE_LIST (whose 26-byte
+sub-list, with the real RT0 store, decodes clean), SUPERTILE_COORDINATES, END_OF_RENDERING
+(code 13 — the PI-V3D-10 fix present). No unknown opcode, no length mismatch, no field out of
+range; packet shape matches Mesa's minimal clear-job emitters with only benign micro-ordering
+divergence. Full offset→packet table: the S1U landing report and its decode script.
+
+### 48.3 Where that leaves the wall
+
+The arc premise dissolves and the §45 verdict stands STRENGTHENED: **the CLE never fetched a
+byte of any list since the wedge onset; there is no choking packet because there is no fetch.**
+List content — previously exonerated only by unreachability — is now exonerated by direct
+decode as well. The wall remains exactly where `[v3d74a]` left it: thread 0 never starts,
+regardless of list class, a per-thread condition outside the ARM-visible register space
+(§46.3–46.4). The instrument that manufactured the "mid-list stall" reading is fixed (V3D-82,
+§44 NOTE): `[v3d54]` now prints raw CA and classifies out-of-span words as `(stale)`, and the
+`[v3d73]` verdict line rides every CT0-kicking deep leg.
+
+Instrument-lie ledger +1 (the campaign's n+2 of this shape): a wrapping offset over a frozen
+register, printed under a verdict string that presumed the register valid.
+
+**NOTE — V3D-83 (same day): the audit generalized the fix.** A sweep of the aarch64 witness
+surface for the same class — a derived value computed from a raw register word whose freeze
+would go undetected — found the identical unguarded idiom over BPCA, CT0CA's PTB sibling, at
+five sites, and the PI-V3D-82 idiom was transplanted to each: `[v3d41]` `ptb_frame_witness`
+now seeds a `bpca_pre` beside `bfc_pre`/`rfc_pre` and requires an observed pre→post transition
+landing in the pool span before any "the PTB emitted bytes" claim; the `[v3d55]` pool phantom
+arm and the `[v3d56]` bpca-vs-bytes mismatch arm gate on the raw word sitting inside the pool
+span, routing out-of-span words to an explicit no-verdict stale arm; `[v3d58]` station S4 and
+the `[v3d71]` mainline-geom line (both display-only consumers) carry an out-of-pool `(stale?)`
+tell. In every case the raw word is printed beside the derived figure and the deciding
+instrument (the poison scans) is named. No banked verdict is reinterpreted — the fix constrains
+what future lines can claim, not the meaning of past captures.
+
+## 49. The init-gap ladder — what mainline does between cold power and its first bin job, and the three measurements that were never uncontaminated (V3D-84)
+
+§40 left three candidates: PTB `BXCF`, `MISCCFG.QRMAXCNT`, and *an initialisation this
+campaign has not found*. §42 then closed the first two **by measurement** against a working
+binner. This section answers the third as far as software archaeology can, and its principal
+finding is not a new register. It is that **three of the campaign's load-bearing negatives were
+measured on a block that already held an unclosed bin frame**, and that the instrument carrying
+the most recent of them is a single register §48 has already proven capable of lying.
+
+This is a research section. It changes no driver code and arms nothing. It delivers an exclusion
+table, an act-by-act mainline diff, and a ranked ladder for the next code arc.
+
+### 49.1 The exclusion table — what a new theory may not re-propose
+
+Every row below is closed, and by what. A rung that re-opens one of these needs new evidence,
+not a new argument.
+
+| Closed | By | Where |
+|---|---|---|
+| Bin CL encoding, opcode, length, field form, prologue order, terminator | Mesa `v3d_packet.xml` v42 audit, 0 divergences; `v3dX(bcl_epilogue)` | §31, §33 T4 |
+| RCL content (the `[v3d74a]` list) | byte-level decode, 20 packets / 106 bytes, no unknown opcode | §48.2 |
+| Coordinate-shader words, thread-end, VPM contract | real `v3d_compile()` ver 42, byte-identical | §11, §21 |
+| Shader record, attribute record, segment sizes | 15/15 field audit vs Mesa | §14, §10 |
+| Submission latch (`CT0QBA`/`QEA`/`QMA`/`QMS`/`QTS`) | read-back audit, byte-exact every kick | §28 |
+| Submit **sequence** (order, interleaving, `BPOS=0` position) | `[v3d73s]`, `v3d_bin_job_run` verbatim, nothing interleaved | §44.3 |
+| Frame geometry (1 / 4 / 16 tiles) and frame content (empty / full) | `[v3d68]`, bit-identical across all four rungs | §40 |
+| Address geometry (mainline-like iovas, 544 KiB pool) | `[v3d71]` mainline-geom | §42 |
+| MMU: enable, table base, PTE validity, fault policy on both channels, illegal-address catcher | `[v3d55] mmucfg`/`pte`, `[v3d62] mmufix`/`fault` | §29, §35 |
+| GMP | `PROT_ENABLE=0`, `gmpdelta` clean across the frame | §35 |
+| L2T / slice cache mode and order (FLUSH vs kernel-exact CLEAR) | `[v3d51]` vs `[v3d53]` differential — both wedge | §27, §29 |
+| TMUWCF combiner drain | sourced: `v3d_clean_caches` is a post-render job, never a bin job | §27 |
+| Overflow arming (`BPOA`/`BPOS`) | T1: mainline enters **every** bin frame with `BPOS=0` and no block | §33 |
+| Clock: rate, gate, domain liveness inside the wedged wait | `clkdom` 500 MHz ACTIVE; `[v3d72]` CYCLE_COUNT Δ703 M with every unit slot at 0 | §29, §43 |
+| PM/ASB fabric: bases, identity, bridge state, in-flight beats | DT-verified; `M_CTRL/S_CTRL` 0x7→0x4 across stop/release; `[v3d71f]` 500 samples pinned quiescent | §41.8, §42 |
+| Reset path, and its absence | OFF→ON cycle applied and measured; `[v3d79]` genpd-minimal (no reset, no mailbox) equally dead | §24, §46.4 |
+| Interrupt policy, core **and** hub working sets | `[v3d49]`, `[v3d52]`; `INT_STS` latches raw regardless of mask | §23, §26 |
+| `PTB BXCF` | piOS reads `0x00000000` idle **and** mid-render; ours `0x00000000` | §42.1 |
+| `MISCCFG` / `QRMAXCNT` | piOS reads `0x00000006` in both dumps; ours `0x00000006` | §42.1 |
+| **`V3D_HUB_AXICFG` (hub `+0x0000`) and `V3D_HUB_UIFCFG` (hub `+0x0004`)** | **closed by this section.** `[v3d76]` sweeps `hub[0x0,0x100)` and diffs it against the piOS capture; §46.1 reduced the whole structural diff to two words, and neither is at `+0x0000` or `+0x0004`. Mainline writes `AXICFG` from exactly one path — the `ver<41` bridge reset, restoring a value that reset disturbs — which the BCM2711 `reset_control` path does not take. Our values already match a working binner. | §46.1, §41.2 |
+| `GCA`, `V3D_CTL_L2CACTL`, `v3d_reset_by_bridge` | `ver < 41` / `ver <= 32` paths; this part is ver 42 | §24, §25 |
+| CSD / TFU init | mainline performs none before a bin job; neither block participates in binning | §46 |
+| Per-thread register divergence (full-window) | `[v3d76]` sweep, both sides: exactly two unnamed words, both proven read-only | §46.1, §46.2 |
+| `SET_ENABLE_QPU`, `NOTIFY_DISPLAY_DONE` | read by effect, not by doorbell | §47 |
+
+**What survives.** After that table the wall is stated as: *the CT0 queue latches, the thread does
+not fetch, the PTB never issues a beat, the core is clocked and idle, nothing faults, and a CT1
+render frame on the same block retires and byte-verifies its store — before and after.*
+
+### 49.2 The mainline path, act by act, with our status
+
+Reconstructed from the Linux V3D stack (`drivers/gpu/drm/v3d/{v3d_drv,v3d_gem,v3d_sched,v3d_irq,v3d_mmu}.c`,
+`drivers/soc/bcm/bcm2835-power.c`) and the BCM2711 device tree. **Facts only** — register offsets,
+write order and control flow. Linux is GPL-2.0-only and no comment text is reproduced here; the
+licence rule of §33 applies unchanged.
+
+| # | Mainline act, cold power → first bin job | Ours | Status |
+|---|---|---|---|
+| 1 | firmware powers the GRAFX rail and leaves the V3D clock present | mailbox domain 10 / clock id 5 (or nothing, under `[v3d79]`) | covered; P90 proved both variants equally dead — **cosmetic** |
+| 2 | genpd `bcm2835_asb_power_on`: deassert `PM_V3DRSTN`, release rpivid master then slave | `enable_pm_asb`, same order, same bits | covered, DT-verified (§41.8) |
+| 3 | `reset_control_reset` — **not on the boot path**; only `v3d_reset()`, the hang-recovery path | our OFF half runs it every boot | we do **more** than mainline; `[v3d79]` removed it — still dead |
+| 4 | `clk_prepare_enable` on the firmware clock | `SET_CLOCK_STATE` | covered |
+| 5 | ioremap `hub` + `core0`; `gca`/`bridge` are `ver<41`-only | fixed bases, no gca/bridge | covered |
+| 6 | read `HUB_IDENT1`, derive `ver = tver*10 + rev` | same, corrected at V3D-61 | covered |
+| 7 | read `MMU_DEBUG_INFO`, derive va/pa width, set the DMA mask | read and matched (`0x550`) | covered; the mask itself is a Linux allocator constraint, not a register |
+| 8 | 4 MiB zeroed page table; the iova allocator **starts at page 1** — page 0 is never handed out | 64 KiB table, arena identity-mapped well above 0, `PTE[0] = 0` | equivalent in effect |
+| 9 | `v3d_init_core`: `MISCCFG` only `ver<41`; then `L2TFLSTA=0`, `L2TFLEND=~0` unconditionally | mirrored (`v3d_init_hw_state`) | covered (§25) |
+| 10 | `v3d_mmu_set_page_table`: `PT_PA_BASE`, the full `MMU_CTL` fault policy, `ILLEGAL_ADDR` at an unmapped scratch page | mirrored, `MMU_CTL = 0x0640_9801` | covered (§35) |
+| 11 | `v3d_mmu_flush_all`: wait `TLB_CLEARING` clear → `MMUC_CONTROL = FLUSH\|ENABLE` → **wait `MMUC_CONTROL.FLUSHING` clear** → `MMU_CTL \|= TLB_CLEAR` → wait `TLB_CLEARING` clear | `program_mmu` writes `MMUC_CONTROL` then `MMU_CTL\|=TLB_CLEAR` **back-to-back** and polls only the trailing `TLB_CLEARING` | **GAP — R4a below.** Two of mainline's three waits are absent |
+| 12 | `v3d_irq_init`: `INT_CLR = V3D_CORE_IRQS` (core) and `HUB_INT_CLR = V3D_HUB_IRQS` (hub) — **clear stale latches** — then request the IRQs, then `v3d_irq_enable` | `v3d_irq_enable` writes the two mask pairs only; no init-time `INT_CLR` on either block | **GAP — R4b below** |
+| 13 | `v3d_irq_enable`: core `MSK_SET=~IRQS`/`MSK_CLR=IRQS`, hub the same | mirrored, `0xa7` / `0x3a` | covered (§23, §26) |
+| 14 | an installed ISR that W1Cs `INT_STS` on every event | none — we poll | structural divergence; cannot gate the **first** frame, which never latches anything |
+| 15 | no perfmon attached on the common path | PCTR banks armed around most rungs | off-mainline traffic — R8 |
+| 16 | the first V3D job on any Pi is a Mesa CL submit: a **bin job with its render job already queued behind it on the same tile state** | a bare CT1 clear job, then bin jobs alone, forever | **never tested — R5 below** |
+| 17 | `v3d_bin_job_run`: `BPOS=0` → `v3d_invalidate_caches` → `CT0QMA`/`QMS` → `CT0QTS\|ENABLE` → `CT0QBA` → `CT0QEA` | byte-exact, uninterrupted, at `[v3d73s]` | covered (§44) |
+
+Three registers mainline **defines** and this driver has never defined, read, or written appear in
+the ladder below (R2, R3). They are not writes mainline performs — they are instruments mainline's
+header supplies and this campaign never picked up.
+
+### 49.3 The confound — every decisive negative was measured downstream of an unclosed frame
+
+`bringup` runs `clear_job` (CT1) and then `triangle_job`, whose first act is `probe_job`. The
+probe's bin is **the first CT0 kick of the boot**; every other CT0 kick in the file — the six
+`[v3d48]` rungs, the `[v3d63]` matrix, the `[v3d64]`/`[v3d66]` legs, `[v3d68]`'s four rungs,
+`[v3d69]`, `[v3d71]`, `[v3d73s]`, `[v3d74a]`, and M4 itself — runs after it.
+
+§48.1 dates the wedge inside the boot: `CT0CA` **moved genuinely in the pre-wedge era** (offsets
+`0x4c`, `0xe` walked, `CTRUN=0`), latched `0x0034b000` at the `[v3d53]` rung where `CTRUN` stuck
+`1`, and has not changed since. §29 states the mechanism in its own words: *because `CTRUN` stays
+`1`, every later kick is a no-op*. §32's stations confirm the entry condition — `BMACTIVE` reads
+`0` at S0 on the probe and `1` at S4.
+
+Three consequences, each of which retires or re-scopes a banked verdict:
+
+1. **Thread 0 demonstrably fetches and executes on the boot's early CT0 kicks.** §45's verdict —
+   *thread 0 never starts regardless of list class* — was read from `[v3d74a]`, which is placed
+   **last in the deep ladder**, roughly twenty kicks after `CTRUN` stuck. On a CT0 that is still
+   running a frame it never finished, "the queue loaded and never advanced" is the *expected*
+   reading and carries no information about thread health. The §46 firmware-side campaign
+   (V3D-75…80) and the §47 reply-less-NOTIFY work were both raised on that verdict.
+2. **"An empty bin frame does not retire" has never been measured on a virgin block.** The
+   `[v3d48]` ladder runs after `probe_job`, so the Empty rung has always been kick #2 or later,
+   behind a probe frame that opened and never closed. §40 calls that premise the campaign's most
+   load-bearing fact and correctly notes no Mesa path ever submits an empty frame; what §40 did
+   not note is that it has also never been submitted **first**.
+3. **`[v3d68]`'s "bit-identical across 1/4/16 tiles and empty/non-empty" is a statement about a
+   wedged block.** All four rungs ride the tail of `empty_frame_bisection`. Bit-identical readings
+   across four kicks that were all no-ops is exactly what a stuck `CTRUN` produces, and is weaker
+   evidence about frame geometry than it appears.
+
+None of this refutes the wall. The first kick still fails to retire, and that failure is real and
+first-kick-true. What it does is invalidate the *chain of inference* that led from "the empty frame
+does not retire" to "thread 0 is dead as a thread" to "the condition is outside the ARM-visible
+register space" — because every link after the first was measured through a block that had already
+stopped answering.
+
+### 49.4 The ladder — cheapest-decisive first
+
+Each rung states the exact access, the reading under *this was the missing init*, the reading under
+*still dead*, and what a negative excludes. Every rung is one boot or less, and every one admits an
+honest negative.
+
+---
+
+**R1 — one experiment per boot: make the rung under test the boot's FIRST CT0 kick.**
+
+*Action.* A knob (`UNAOS_V3D_FIRSTKICK=<empty|rcl|m4>`) that runs exactly one CT0 kick, placed
+**before** `probe_job`, with the full witness suite (`[v3d54]` submit + trace, `[v3d58]` stations,
+`[v3d73]` sampler, `[v3d68]` poison scans, `[v3d44]` FLDONE wait) and then **returns** — no ladder,
+no battery, no second kick. Three boots, or one boot per variant.
+
+- `empty` — the `[v3d48]` Empty frame as kick #1. Re-takes the campaign's most load-bearing
+  measurement without the probe frame in front of it.
+- `rcl` — `[v3d74a]`'s render list on CT0 as kick #1. Re-takes §45's thread-vs-class discriminator
+  on a CT0 that has never been asked to bin.
+- `m4` — the real draw as kick #1, so the M4 verdict is not read through the probe either.
+
+*Missing-init reading.* `empty` retires (`FLDONE`, `BFC Δ1`, `BMACTIVE→0`) — the wall is state the
+block accumulates across kicks, not a cold-boot init gap, and the whole campaign's baseline is
+retracted. Or `rcl` store-verifies while `empty` wedges — thread 0 is healthy from cold and the
+death is bin-class-specific, which retires §46/§47's firmware branch outright.
+
+*Still-dead reading.* `empty` wedges identically as kick #1: `CTRUN=1`, `BMACTIVE=1`, poison intact,
+`[v3d73]` in-span=0. Then the banked verdicts are first-kick-true, the confound is excluded, and
+every later rung in this ladder is measured against a baseline that finally means what it says.
+
+*A negative excludes.* Measurement contamination — the one hypothesis that currently sits underneath
+every other verdict in this file. **This rung is first because nothing below it is interpretable
+until it is taken.**
+
+---
+
+**R2 — the MMU access counters: an independent witness for "the CLE never fetched".**
+
+*Action.* Pure reads of three hub registers this driver has never defined, at offsets already named
+in `v3d.rs`'s own MMU comment block and consistent with its established anchors
+(`MMU_CTL 0x1200`, `PT_PA_BASE 0x1204`, `VIO_ID 0x122c`):
+
+| Register | Hub offset |
+|---|---|
+| `V3D_MMU_HIT` | `0x1208` |
+| `V3D_MMU_MISSES` | `0x120c` |
+| `V3D_MMU_STALLS` | `0x1210` |
+| `V3D_MMU_ADDR_CAP` | `0x1214` (decode `ENABLE` bit 31 + the page-count field) |
+
+Sample all four **before and after** each of: the M3 CT1 clear job (the known-good positive
+control), the first CT0 bin kick, and the ~0.5 s wedged wait. Report deltas, and treat a zero delta
+on the CT1 control as INCONCLUSIVE rather than as a bin verdict.
+
+*Missing-init reading.* `ΔHIT`/`ΔMISSES` nonzero across the CT0 kick — **the CLE did issue
+translations**, `CT0CA` is a lying register on the bin path exactly as it was on the offset
+arithmetic (§48), and "the CLE never fetches" is retracted. The hunt returns to what happens
+*after* the fetch.
+
+*Still-dead reading.* `ΔHIT = ΔMISSES = ΔSTALLS = 0` across the CT0 kick while the CT1 control moves
+them — the thread genuinely never issued a memory access, now on a second instrument that shares no
+mechanism with `CT0CA`.
+
+*A negative excludes.* The possibility that §48's verdict rests on a single frozen register. This is
+the cheapest rung in the ladder — about eight MMIO loads — and it is decisive either way. `ADDR_CAP`
+is read in the same pass because V3D-62 armed `CAP_EXCEEDED_ABORT` **without** anyone ever reading
+the cap it aborts against; if bit 31 is set and the page field is small, every access above it is
+aborted silently and that has been true since V3D-62.
+
+---
+
+**R3 — the CLE's thread registers, as distinct from its queue registers.**
+
+*Action.* Read `V3D_CLE_CT0EA` (core `0x0108`) and `V3D_CLE_CT0RA` (core `0x0118`) at the five
+`[v3d58]` stations. Both offsets follow from this file's **own** established map — `CT0CS 0x0100`
+/ `CT1CS 0x0104`, `CT0CA 0x0110` / `CT1CA 0x0114`, `CT0LC 0x0120` / `CT1LC 0x0124` — leaving
+`0x0108`/`0x010c` and `0x0118`/`0x011c` as the `CTnEA` and `CTnRA` pairs in the same
+n-interleaved layout. This is derivation from corroborated anchors, not a fabricated constant.
+
+The point is the distinction the campaign has never drawn: `CTnQBA`/`CTnQEA` are the **queue**
+registers the driver writes; `CTnCA`/`CTnEA` are the **thread's** working current/end addresses.
+The queue transfers into the thread when the thread starts.
+
+*Missing-init reading.* `CT0EA` never takes the value written to `CT0QEA` across the kick — the
+**queue-to-thread transfer never happened**, which is one station upstream of "never fetched" and
+names a different mechanism entirely. `CT0RA` non-zero additionally settles §33's inferred-`CTSUBS`
+row with the actual return-address register instead of a borrowed bit.
+
+*Still-dead reading.* `CT0EA == CT0QEA` with `CT0CA` frozen — the thread *did* load and then stalled
+at its first fetch. Combined with R2 this is the tightest statement the campaign can make.
+
+*A negative excludes.* The "the queue never transferred" branch, and — via `CT0RA` — the sub-list
+hypothesis §33 raised and never followed.
+
+---
+
+**R4 — the two mainline probe steps still unmirrored.**
+
+*(a) The MMU flush completion waits.* `v3d_mmu_flush_all` waits for `TLB_CLEARING` to clear *before*
+starting, writes `MMUC_CONTROL = FLUSH|ENABLE`, then **waits for `MMUC_CONTROL.FLUSHING` to clear**,
+and only then writes `MMU_CTL |= TLB_CLEAR`. `program_mmu` issues the two writes back-to-back and
+polls only the trailing `TLB_CLEARING`. Add both waits with before/after echoes.
+
+*(b) The init-time interrupt clear.* `v3d_irq_init` W1Cs `INT_CLR = V3D_CORE_IRQS` on the core and
+`HUB_INT_CLR = V3D_HUB_IRQS` on the hub at probe, before unmasking. Add both at the head of
+`v3d_irq_enable`, printing the pre-clear latch words — a stale latch inherited from firmware has
+never been looked at on either block.
+
+*Missing-init reading.* The first-kick Empty frame retires with the waits in place. (a) is the more
+interesting half: a TLB clear issued on top of an in-flight MMUC flush is a real race with a real
+mainline guard, and a half-cleared TLB producing a first fetch that stalls forever with no fault is
+consistent with the signature.
+
+*Still-dead reading.* Both land as no-ops, echoes clean.
+
+*A negative excludes.* The last two mainline probe-path acts this driver does not perform. §46.4
+claims the ARM-side divergence space is empty; these two rows are the counter-examples, and closing
+them is what makes that claim true rather than nearly true. Weak prior, cheap, and mirror-exact —
+the §26/§27 pattern.
+
+---
+
+**R5 — the frame pair: a bin job with its render job queued behind it.**
+
+*Action.* Submit the M4 bin on CT0 and, **without waiting for `FLDONE`**, submit the matching RCL on
+CT1 against the same tile-state and tile-alloc buffers; then wait for both, sampling `PCS`, `BFC`,
+`RFC` and the `[v3d73]` span facts across the whole window.
+
+Every frame the working reference system has ever closed had a render job queued behind it: a Mesa
+CL submit is a bin job and a render job on the same tile state, and the first V3D job on any booted
+Pi is such a pair. This driver has submitted the bin alone, every time, for the entire campaign.
+§23 exonerated the ordering **by citation** — `v3d_bin_job_run` touches only CT0 — but that is a
+statement about the driver's write set, not about what the hardware's frame unit waits on.
+
+*Missing-init reading.* `FLDONE` latches, `BFC` advances, once CT1 is armed for the same frame.
+
+*Still-dead reading.* The bin wedges identically and the render job either wedges behind it or
+retires against an empty tile list.
+
+*A negative excludes.* The last untested frame-level ordering hypothesis, and the only structural
+difference left between how this driver uses the block and how every working driver does.
+
+---
+
+**R6 — `CTRSTA`: the thread reset, and why the bar is now met.**
+
+*Action.* Write `CT0CS = CTRSTA` (bit 15) on an already-wedged CT0, read `CT0CS` back, then re-kick.
+Issue it **only** between rungs whose verdicts are already banked, never before a first kick.
+
+§32 and §33 kept this disarmed for two stated reasons, and both have moved:
+
+- *"the constant is inferred, not corroborated."* Still true — bit 15 comes from the VC4-era map
+  carried across on offset identity, and `v3d.rs` records that only `CTRUN` is corroborated for
+  V3D 4.x. **The mitigation is that the readback is the verdict**: the write is issued on a thread
+  already proven dead, and if `CT0CS` does not move, the bit is wrong and nothing was risked.
+- *"no reading justifies it."* This has changed. §46.1 supplies ground truth from the mid-bin piOS
+  capture: a **genuinely fetching** mainline CT0 reads `CT0CS = 0x20` (`CTRUN` alone), while our
+  wedged thread reads `0x70` — bits 4 and 6 set in addition. The wedged word is measurably not a
+  legal fetching state, and §48 established the condition is *latched and persistent* (frozen since
+  the `[v3d53]` rung). A latched illegal thread state is precisely what a thread reset exists for.
+
+*Missing-init reading.* `CT0CS` returns to `0x00`/`0x20` and the next kick fetches — the wedge is
+clearable, R1's one-experiment-per-boot cost collapses to one boot for the whole ladder, and the
+campaign regains the ability to take more than one honest bin measurement per boot.
+
+*Still-dead reading.* `CT0CS` unchanged at `0x70` — either the bit is not `CTRSTA` on 4.2 (in which
+case discard the entire borrowed map, `CTSUBS` included) or the wedge survives a thread reset, which
+is itself a strong new fact.
+
+---
+
+**R7 — decode the two bits that separate a fetching thread from a wedged one.**
+
+*Action.* Analysis plus reads, no writes. `CT0CS` wedged `0x70` vs mainline-fetching `0x20`: bit 4
+is `CTSUBS` on the VC4 map (the thread believes it is inside a sub-list); **bit 6 appears in no
+published map at all**. Cross-read against `CT0RA` from R3 — a thread genuinely inside a sub-list
+has a return address, and a thread that only *claims* to does not. Sample both across R1's first
+kick, where the transition into `0x70` can be watched for the first time.
+
+This is the **only ground-truth-anchored state divergence** between the wedged and the working
+system that §46.3 set aside as "job state" without decoding. It is free, and it is the difference
+between naming the wedge and describing it.
+
+---
+
+**R8 — remove all off-mainline instrument traffic, for the whole boot.**
+
+*Action.* One boot with the PCTR file fully disabled (`EN=0`, `SRC=0`), no `INT_CLR` inside the
+queue pair, no station reads, no `[v3d55]` mailbox round-trips inside the kick path — `[v3d73s]`'s
+discipline extended from one rung to the entire boot, combined with R1's single-kick placement.
+Weak prior: P90's `[v3d79]` MINIMAL boot came close on the bring-up side but still ran the
+instrumented battery. It is the last untried conjunction, and it costs one boot.
+
+---
+
+### 49.5 The two named registers, and the honest safety argument
+
+The brief carries `BXCF` and `MISCCFG.QRMAXCNT` forward from §40's verdict. §42 — written after
+§40 — closed both **by measurement**, and this section will not launder that.
+
+| | `PTB BXCF` (core `0x0310`) | `MISCCFG.QRMAXCNT` (core `0x0018`, bits `[3:1]`) |
+|---|---|---|
+| Disarm condition set at | §33: *arm if `BXCF` reads non-zero* | §29: *arm if `QRMAXCNT` reads floored (`0`)* |
+| What metal read | `0x00000000` (§33 battery) | `MISCCFG = 0x6`, `QRMAXCNT = 3` (§30) |
+| What a **working binner** reads | `0x00000000`, idle **and** mid-render (§42.1) | `0x00000006`, both dumps (§42.1) |
+| Verdict recorded | EXCLUDED MEASURED — *do not re-litigate* | EXCLUDED MEASURED — *ditto* |
+
+**The evidence bar was met — in the negative.** §29's own matrix says it outright: *`QRMAXCNT != 0`
+⇒ no divergence; the QoS branch is not justified — refuted without a write.* The reading that would
+have licensed the write never came, and §42 then went further and matched both words against a
+binner that closes frames. Arming either write today is not "finally taking the last rung"; it is
+**deliberately diverging from a working reference on a register where we are already identical to
+it**. That is the inverse of the method this campaign has run on for thirty arcs.
+
+Two further points against, both structural:
+
+- `BXCF`'s documented fields are `CLIPDISA` (bit 0) and `RWORDERDISA` (bit 1) — **disable** bits.
+  Writing them can only remove PTB function. There is no value of `BXCF` that starts a dead binner
+  which `0x00000000` does not already supply.
+- The only `QRMAXCNT` experiment that is not simply "become different from piOS" is raising it
+  *above* the working system's value (3 → 7), which tests the hypothesis *this silicon needs a
+  deeper request queue than the silicon that works*. Nothing in the campaign supports that.
+
+**Recommendation: leave `V3D55_ARM_QRMAXCNT` and any `BXCF` write disarmed, and rank both below
+every rung above.** If the lead elects to burn them anyway as an exhaustion play, the safe design is
+fixed and should be stated in the code that carries it:
+
+- scoped read-modify-write of the named field only, every other bit of the word preserved;
+- issued **after** R1's first-kick verdict is banked, never before it, so the boot's one
+  uncontaminated measurement is not spent on an excluded theory;
+- echo-back printed, with the piOS reference value on the same line;
+- the witness must state on the wire that the register is EXCLUDED MEASURED and that the expected
+  outcome is **no change** — so a capture cannot later be read as though the write were licensed;
+- restore the reference value before any other rung runs.
+
+### 49.6 Ranking, and what the next arc should spend
+
+| Rung | Cost | Decides |
+|---|---|---|
+| R1 first-kick isolation | 1–3 boots | whether any banked negative in this file means what it says |
+| R2 MMU access counters | ~8 reads, rides R1 | whether the CLE ever issued a translation, independent of `CT0CA` |
+| R3 `CT0EA`/`CT0RA` | 2 reads/station, rides R1 | whether the queue ever transferred into the thread |
+| R7 `CT0CS` bit 4/6 decode | free, rides R1 | names the wedge state against the working reference |
+| R4 MMUC waits + init `INT_CLR` | 1 boot | empties the mainline-mirror space for real |
+| R5 bin+render frame pair | 1 boot | the last untested frame-level ordering |
+| R6 `CTRSTA` | rides any boot after R1 | whether the wedge is clearable — and if so, collapses R1's cost |
+| R8 instrument-free boot | 1 boot | the last untried conjunction |
+| R9/R10 `BXCF` / `QRMAXCNT` | 1 boot | **nothing** — both EXCLUDED MEASURED; listed for completeness, recommended against |
+
+R1, R2, R3 and R7 all ride a single boot. That boot is the whole first sitting, and it either
+restores or retracts the foundation the last ten arcs were built on.
+
+**Standing caveat for whoever reads it.** R1 deliberately suppresses the rest of the battery, so a
+capture taken under it will be missing every banked witness the file's readers expect. That is the
+point — a first kick with a ladder behind it is not a first kick — but it means such a capture must
+be labelled at the top and never diffed line-for-line against a full deep boot.
+
+QEMU `raspi4b` models no V3D block, so every rung above sits behind the hub-identity gate and
+`kernel8-test` green means **no regression and nothing more**. Every verdict in this section is
+metal-attended, and this section itself arms nothing: it is a plan, and the writes it describes
+belong to the next code arc.

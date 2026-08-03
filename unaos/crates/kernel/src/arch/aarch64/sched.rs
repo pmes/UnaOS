@@ -55,6 +55,45 @@ pub const PRIO_NORMAL: u8 = 1;
 pub const PRIO_HIGH: u8 = 2;
 pub const PRIO_RT: u8 = 3;
 
+/// SCHED-PRIO — the INTERACTIVE SERVICE BAND: the level the panel's own latency-critical tasks run
+/// at, one step above the `PRIO_NORMAL` every EL0 program (and every ordinary kernel worker) lands
+/// at. An alias for [`PRIO_HIGH`], named for its meaning so the spawn sites read as policy rather
+/// than as a magic number, and so this band and the storage service (`irqstorage`, already
+/// `PRIO_HIGH`) can be told apart in the source even though they share a level today.
+///
+/// ### What the band is for (P73/P75)
+/// The compositor pass owner (`main.rs::render_service` — `Screen::flush` → `wm::service_damage`,
+/// plus the cursor bracket), the input router (`input_service`) and the HID report pump (`usb_pump`)
+/// were ORDINARY `PRIO_NORMAL` tasks, i.e. exact round-robin peers of six EL0 vug render fleets.
+/// Under fleet load the triage measured composites collapsing 0.99→0.43/s and WM-lock erase defers
+/// going 29%→76%: the panel's own service work was queued behind every vug that happened to be ready.
+/// The band makes those three win a contested dispatch.
+///
+/// ### Why this is not real time, and cannot starve EL0
+///   * The band is ONE level up, not the top; nothing here is `PRIO_RT`.
+///   * The anti-starvation sweep is untouched. An EL0 task that waits `AGE_TICKS` dispatch passes is
+///     RELOCATED into this very band and then shares it round-robin, so the worst case for a vug is
+///     bounded exactly as before — the band buys ordering, not exclusion. `[prio] agedin=` counts
+///     precisely those promotions, so the escape valve is visible rather than assumed.
+///   * All three tasks BLOCK for a living (`GUI_CHANNEL.recv`, `RX_READY.wait`, `sleep_ticks`). None
+///     of them can hold a core: they are off the run queue entirely whenever there is no work, which
+///     is what makes "highest ready level" cheap to grant.
+///   * The EL0 task a wake preempts loses at most the REMAINDER of its quantum, never a whole one —
+///     see `preempt_hint`, which trims to one tick rather than switching anything out by force.
+///
+/// ### Priority inversion
+/// The band's paths take three locks, and none of them can invert unboundedly:
+///   * `wm::STAGE` and `cursor::OVERLAY` are taken with `try_lock` on every path a service task
+///     reaches (`stage_window`, `stage_rows`, `compose_into`, the `DEFER` drain probe) — a service
+///     task never waits on a lock an EL0 present holds; it declines and falls back.
+///   * `wm::TABLE` is a blocking `lock()`, but every holder takes NO further scheduler-visible lock
+///     while holding it (the compositor snapshots rows and releases before any framebuffer write),
+///     so a hold is a bounded straight-line section, and an EL0 holder that is descheduled mid-hold
+///     is aged into this same band within `AGE_TICKS` and runs it out.
+///   * `RqGuard` sections are IRQ-masked and O(ready tasks) at worst, so no run-queue section is
+///     ever preemptible at all.
+pub const PRIO_SERVICE: u8 = PRIO_HIGH;
+
 /// AARCH64-PRIO — anti-starvation aging. A ready task that has WAITED in a run queue this many aging
 /// units without being dispatched is RELOCATED one effective level UP (its BASE `priority` is
 /// unchanged); repeated, a low task under continuous higher-priority load climbs to parity, runs, then
@@ -190,6 +229,35 @@ pub struct Task {
     /// mutated ONLY by the stealer while it exclusively owns the popped `Box` (retargeting `cpu`), so it
     /// never races the owning core's dispatch. Honors the brief's "pinned tasks stay pinned" contract.
     steal_ok: bool,
+    /// SPREAD-5 — CNTPCT timestamp at which this task was last PARKED, or 0 if it has never parked.
+    /// Written by `park_blocked` (the sole park funnel) while it exclusively owns the Box; read by
+    /// `make_ready` (the sole wake funnel) while it exclusively owns the Box. No other code touches
+    /// it, so it needs no atomic and no lock despite park and wake happening on different cores —
+    /// the Box handoff through the wait queue / sleeper list is the synchronisation.
+    ///
+    /// CNTPCT rather than the per-CPU `ticks`: park and wake are frequently on different cores, and
+    /// the per-CPU tick counters are independent (a core that idles at WFI accrues them at its own
+    /// pace), so a difference across cores would not be a duration. CNTPCT is system-global,
+    /// fixed-frequency and always advancing — the same property the load accounting relies on.
+    park_cyc: u64,
+    /// SPREAD-6 (VUG-PACE-2) — CNTPCT timestamp at which the PLACEMENT QUESTION was last asked for
+    /// this task (stamped at spawn, where placement is first decided, and by every `rewake_place`
+    /// call thereafter). Same Box-handoff synchronisation argument as `park_cyc`: written only by
+    /// whoever exclusively owns the Box.
+    ///
+    /// Why it exists: SPREAD-5 gates re-placement on a >= 100 ms park, and a frame-paced task NEVER
+    /// parks that long — so whatever core assignment contention-era wakes left it with was PERMANENT.
+    /// The s1q wire shows the cost as the residual "predestined fps": win1 pinned at 30.9/s for tens
+    /// of seconds with two runnable EL0 tasks time-sharing c2 (99% busy) while c0/c1/c3 sat idle and
+    /// `rewake=` never moved. This stamp lets a micro-park wake ask the question again on a slow
+    /// clock (see `PLACE_REFRESH_MS`) without restoring SPREAD-4's per-frame churn.
+    place_cyc: u64,
+    /// SPREAD-7 — CNTPCT timestamp at which this task was last made READY by `make_ready` (EL0 tasks
+    /// only; 0 = not currently priced). Consumed (read + zeroed) by the `dispatch_next` that first
+    /// runs the task, yielding the wake-to-dispatch latency the `[spread7]` witness aggregates. Same
+    /// Box-handoff synchronisation argument as `park_cyc`: written only by whoever exclusively owns
+    /// the Box (the wake funnel on write, the dispatching core on consume).
+    wake_cyc: u64,
 }
 
 /// One CPU's scheduler bookkeeping (interior-mutable atomics, so the array is a plain static).
@@ -245,6 +313,43 @@ static SCHED: [SchedCpu; NUM_CPUS] = [const { SchedCpu::new() }; NUM_CPUS];
 /// any scheduling path. This is the SEAM a real per-core utilization feed would replace.
 static CPU_BUSY: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
 static CPU_IDLE: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+
+/// SCHED-PRIO — the BASE priority of the task currently dispatched on each core, or [`PRIO_NONE`]
+/// when the core is in its scheduler/idle context (or has never run the loop). Published by
+/// `dispatch_next` around the switch, and the ONLY cross-core-readable fact about a running task
+/// this module exposes: `SCHED[cpu].current` is a raw `*mut Task` whose Box the owning core may
+/// reclaim at any moment, so it may never be dereferenced from another core. One relaxed byte can.
+///
+/// Read by [`preempt_hint`]; never read on the switch path itself.
+static CUR_PRIO: [AtomicU8; NUM_CPUS] = [const { AtomicU8::new(PRIO_NONE) }; NUM_CPUS];
+
+/// SCHED-PRIO — "no task running here". `u8::MAX` outranks every real level, so an idle core is
+/// never a preemption candidate: the poke/reschedule SGI already wakes it, and there is nothing to
+/// take the CPU away from.
+const PRIO_NONE: u8 = u8::MAX;
+
+/// SCHED-PRIO — the `[prio]` witness counters. All monotonic, relaxed, per core; read only by
+/// `prio_witness`, which reports per-window DELTAS against its own last snapshot.
+///
+///   * `PRIO_SVC_DISPATCH` — dispatches whose task's BASE priority is at or above `PRIO_SERVICE`
+///     (an aged-up EL0 task counts as EL0, which is the honest reading: the band did not win that
+///     dispatch, the anti-starvation sweep did).
+///   * `PRIO_EL0_DISPATCH` — dispatches of an EL0/user task (`user_entry != 0`), the population the
+///     band is being ranked against.
+///   * `PRIO_DEFER` — service-band wakes that landed on a core running a LOWER-band task, i.e. the
+///     times the compositor/router was ready but had to wait out (a trimmed remainder of) somebody
+///     else's quantum. This is the residual latency the band does NOT remove, kept visible on
+///     purpose — a `defer` that stays small beside a large `svc` is the band working.
+///   * `PRIO_AGED_IN` — `RunQueue::age` relocations that lifted a below-band task INTO the band.
+static PRIO_SVC_DISPATCH: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+static PRIO_EL0_DISPATCH: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+static PRIO_DEFER: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+static PRIO_AGED_IN: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+/// Last-window snapshots, so `[prio]` can print per-window deltas beside the running totals.
+static PRIO_LAST_SVC: AtomicU64 = AtomicU64::new(0);
+static PRIO_LAST_EL0: AtomicU64 = AtomicU64::new(0);
+static PRIO_LAST_DEFER: AtomicU64 = AtomicU64::new(0);
+static PRIO_LAST_AGED: AtomicU64 = AtomicU64::new(0);
 
 /// SCHED-7 — the CNTPCT busy span `dispatch_next` folded into the load window on the CURRENT pass
 /// (0 when the run queue was empty). `run()` reads+clears it after every pass and folds the REST of
@@ -327,6 +432,51 @@ fn load_window_cyc() -> u64 {
 /// Sentinel `recent_pct` meaning "no window has completed yet" (fall back to the partial window).
 const LOAD_PCT_NONE: u32 = u32::MAX;
 
+// PULSE-5 — A WINDOW THAT CLOSES ONLY AT A DISPATCH BOUNDARY CANNOT REPORT A CORE THAT NEVER
+// REACHES ONE.
+//
+// SCHED-5/SCHED-7 fold a span into the window at exactly two points: after `switch_context` returns
+// (busy) and at the bottom of `run()`'s pass (idle). Both are DISPATCH BOUNDARIES. So the reported
+// number — `recent_pct`, the last COMPLETED window — is only as fresh as the core's last boundary:
+//
+//   * best case (a core cycling the loop): the value is a *previous* window, i.e. 250-500 ms old
+//     by construction. That is the P69 shape — "45% unused" printed while vugs were starving.
+//   * worst case (one compute-bound task holding the core): the busy span is UNBOUNDED — nothing is
+//     folded and nothing rolls, so `recent_pct` freezes at its pre-storm value for as long as the
+//     task runs. In the QEMU raspi4b gate there is no Group-1 timer delivery at all, so there is no
+//     preemption to break the span and the freeze is total; on metal the quantum (3 ticks, ~12 ms)
+//     does break it, but the value still lags a whole window, and the core trips SCHED-8's
+//     `tracked()` staleness bound whenever a fold gap exceeds ~500 ms — at which point every honest
+//     consumer (`SCHED: load`, `top`, `ui_status::live_permille`) drops to `--`/no-live-number and
+//     the status strip falls back to the coarse dispatch-pass classifier.
+//
+// Everything downstream of that number inherits the lag, and two of the consumers are DECISION
+// paths, not displays: `pick_cpu`'s tie-break key 4 (placement) and `video::screen::flush_parallel`'s
+// helper ranking + headroom weights (which core gets a render band). A stale-low percent on a
+// saturated core therefore attracts MORE work to the core that is already the problem.
+//
+// THE FIX IS AGE-ON-READ, not account-at-tick. `busy_pct()` now adds the CURRENTLY-EXECUTING span
+// (`now - run_t0`) into the window's busy total at READ time, so a long-running task's core reads
+// honestly busy within a single read, with no dispatch boundary required. See `run_t0` and
+// `busy_pct` for the mechanism and the ordering argument.
+//
+// Why not account-at-tick (close/roll the window from the 250 Hz timer IRQ)? Three reasons, in
+// order of weight:
+//   1. The tick does not exist where the bug is worst. `timer::on_tick` / `timer_preempt` are
+//      METAL-ONLY — QEMU raspi4b never delivers the timer PPI — so a tick-driven window would be
+//      dead code in the gate that has to prove it, and would leave the total-freeze case unfixed on
+//      exactly the platform where the span is never broken at all.
+//   2. It cannot see the in-flight span without moving state. The busy anchor (`busy_t0`) is a
+//      LOCAL in `dispatch_next`, live on the scheduler stack across `switch_context`; a tick
+//      handler firing on top of the running task would have to take ownership of that anchor and
+//      re-publish a partial span — i.e. push state the dispatch path exclusively owns into a
+//      shared, interrupt-reentrant location, on the switch path, to buy a COARSER answer.
+//   3. The cost lands on the wrong path. Account-at-tick pays on every tick of every core forever;
+//      age-on-read pays only when someone asks, and readers are the rare path (a 4 Hz strip, a
+//      1024-tick witness, placement).
+// Age-on-read costs ONE relaxed store on the dispatch path, one relaxed store in the fold, and one
+// extra sysreg read + two loads per READ. It is strictly cheaper and strictly fresher.
+
 /// One core's load accounting slot. All fields written ONLY by the owning core's scheduler loop
 /// (single-writer, Relaxed); read cross-core by introspection. The last-task triple is seqlock-
 /// protected (odd `last_seq` = write in progress) so a reader never reconstructs a torn `&str`.
@@ -340,6 +490,34 @@ struct CoreAccount {
     win_idle_cyc: AtomicU64,
     /// Busy percent (0..=100) of the last COMPLETED window, or `LOAD_PCT_NONE` before the first.
     recent_pct: AtomicU32,
+    /// SPREAD-9 — the SERVICE-BAND share of `win_busy_cyc`: CNTPCT cycles of the current window
+    /// spent executing tasks whose BASE priority is `>= PRIO_SERVICE`. Always `<= win_busy_cyc`
+    /// (folded by the same call, same single writer, same window roll). Exists so EL0 placement can
+    /// subtract the time that no longer competes with EL0: with services preempting at IPI receipt
+    /// (`ipi_preempt`), service execution costs an EL0 co-resident latency measured in
+    /// microseconds, and letting it inflate the placement percent kept a hole in the fleet's
+    /// spread wherever the service band currently lived.
+    win_svc_cyc: AtomicU64,
+    /// SPREAD-9 — service-band busy percent (0..=100) of the last COMPLETED window (0 before the
+    /// first — with no history the honest default is "no service load", which reduces to the
+    /// pre-arc reading). Companion of `recent_pct`, filled by the same window roll.
+    recent_svc_pct: AtomicU32,
+    /// PULSE-5 — CNTPCT timestamp at which the CURRENTLY-EXECUTING task's span began on this core,
+    /// or 0 when this core is not inside a task (scheduler overhead, idle, or it left `run()`).
+    /// Published by the owning core immediately before `switch_context` and cleared by the fold in
+    /// `account()`; it is the ONLY thing a reader needs to age the in-flight span (`now - run_t0`)
+    /// into the current window, which is what makes `busy_pct()` independent of dispatch boundaries.
+    ///
+    /// ORDERING (the one subtle part). A cross-core reader must never count the same span twice —
+    /// once as `now - run_t0` and again inside `win_busy_cyc` after the fold folded it. The writer's
+    /// order in `account()` is: clear `run_t0` (Relaxed) THEN publish `win_busy_cyc` (Release). The
+    /// reader's order in `busy_pct()` is: load `win_busy_cyc` (Acquire) THEN load `run_t0`
+    /// (Relaxed). If the reader's Acquire load observes the post-fold busy total it
+    /// synchronizes-with that Release store, so the preceding `run_t0 = 0` is visible to its later
+    /// load and the span cannot be added twice. The converse skew (reader sees the pre-fold total
+    /// and a freshly-cleared `run_t0`) merely UNDER-counts by one span for one read — which is
+    /// exactly the pre-PULSE-5 behaviour, so it is never worse than the code it replaces.
+    run_t0: AtomicU64,
     /// SCHED-8 — CNTPCT timestamp of the most recent `account()` fold (0 = never accounted). A core
     /// running `run()` folds a busy OR idle span every dispatch pass, so this stays fresh; a core that
     /// left `run()` (the Pi/tegra BSP `hlt_loop`s after spawning services; the virt boot core spin-loops
@@ -365,6 +543,9 @@ impl CoreAccount {
             win_busy_cyc: AtomicU64::new(0),
             win_idle_cyc: AtomicU64::new(0),
             recent_pct: AtomicU32::new(LOAD_PCT_NONE),
+            win_svc_cyc: AtomicU64::new(0),
+            recent_svc_pct: AtomicU32::new(0),
+            run_t0: AtomicU64::new(0),
             last_acct_cyc: AtomicU64::new(0),
             last_seq: AtomicU64::new(0),
             last_id: AtomicU64::new(0),
@@ -374,25 +555,40 @@ impl CoreAccount {
     }
 
     /// SCHED-5 — fold a measured span into the rolling window (single-writer, owning core). Exactly one
-    /// of `busy_cyc` / `idle_cyc` is non-zero per call: `account(delta, 0)` after a task's execution
-    /// span (around `switch_context`), `account(0, delta)` after an idle WFI. On window completion
+    /// of `busy_cyc` / `idle_cyc` is non-zero per call: `account(delta, 0, ..)` after a task's execution
+    /// span (around `switch_context`), `account(0, delta, 0)` after an idle WFI. On window completion
     /// (busy+idle cycles reaching the ~250 ms budget) it snapshots the busy TIME fraction and resets.
     /// Relaxed loads/stores are sound because only this core's scheduler loop ever writes its slot.
+    ///
+    /// SPREAD-9 — `svc_cyc` is the service-band portion of `busy_cyc`: equal to it when the span just
+    /// measured belonged to a task of BASE priority `>= PRIO_SERVICE`, else 0 (and always 0 on the
+    /// idle call). It rides the same fold so `win_svc_cyc`/`recent_svc_pct` can never skew against
+    /// the totals they are subtracted from.
     #[inline]
-    fn account(&self, busy_cyc: u64, idle_cyc: u64) {
+    fn account(&self, busy_cyc: u64, idle_cyc: u64, svc_cyc: u64) {
         // SCHED-8: mark the slot fresh — every dispatch pass in `run()` folds a span, so a core still
         // inside the scheduler keeps this current; a core that left `run()` stops touching it (goes STALE).
         self.last_acct_cyc.store(now_cyc(), Ordering::Relaxed);
+        // PULSE-5: any fold ENDS the in-flight span — whatever was executing has now been measured
+        // and is about to land in `win_busy_cyc`, so a reader must stop aging it. Cleared BEFORE the
+        // busy total is published (Release, below) so the pair can never be read as a double count;
+        // see `run_t0`'s ordering note. One relaxed store; no branch, both call sites covered.
+        self.run_t0.store(0, Ordering::Relaxed);
         let busy = self.win_busy_cyc.load(Ordering::Relaxed) + busy_cyc;
         let idle = self.win_idle_cyc.load(Ordering::Relaxed) + idle_cyc;
+        let svc = self.win_svc_cyc.load(Ordering::Relaxed) + svc_cyc;
         let total = busy + idle;
         if total >= load_window_cyc() {
             self.recent_pct.store((busy * 100 / total) as u32, Ordering::Relaxed); // total>=budget>0
-            self.win_busy_cyc.store(0, Ordering::Relaxed);
+            self.recent_svc_pct.store((svc * 100 / total) as u32, Ordering::Relaxed); // SPREAD-9
+            self.win_svc_cyc.store(0, Ordering::Relaxed);
             self.win_idle_cyc.store(0, Ordering::Relaxed);
+            self.win_busy_cyc.store(0, Ordering::Release); // PULSE-5: publishes the `run_t0` clear
+            PULSE5_FOLD_WINDOWS.fetch_add(1, Ordering::Relaxed);
         } else {
-            self.win_busy_cyc.store(busy, Ordering::Relaxed);
+            self.win_svc_cyc.store(svc, Ordering::Relaxed);
             self.win_idle_cyc.store(idle, Ordering::Relaxed);
+            self.win_busy_cyc.store(busy, Ordering::Release); // PULSE-5: publishes the `run_t0` clear
         }
     }
 
@@ -409,19 +605,110 @@ impl CoreAccount {
         self.last_seq.store(seq + 2, Ordering::Release); // even: stable
     }
 
-    /// Busy percent (0..=100) for `core_load`: the last completed window, or the partial window if
-    /// none has completed yet (0 when the core has never run a pass).
-    fn busy_pct(&self) -> u32 {
-        let recent = self.recent_pct.load(Ordering::Relaxed);
-        if recent != LOAD_PCT_NONE {
-            return recent;
-        }
-        let busy = self.win_busy_cyc.load(Ordering::Relaxed);
-        let total = busy + self.win_idle_cyc.load(Ordering::Relaxed);
-        if total == 0 {
+    /// PULSE-5 — CNTPCT cycles the core has ALREADY spent inside the task it is executing right now,
+    /// or 0 if it is not inside one. This is the quantity SCHED-5's fold cannot see until the task
+    /// switches back, and therefore the quantity whose absence froze `busy_pct` under a compute-bound
+    /// task. One relaxed load + one sysreg read; safe from any core (CNTPCT is system-global, so
+    /// `now - run_t0` is a real elapsed span whichever core evaluates it).
+    #[inline]
+    fn live_span_cyc(&self) -> u64 {
+        let t0 = self.run_t0.load(Ordering::Relaxed);
+        if t0 == 0 {
             0
         } else {
-            (busy * 100 / total) as u32
+            now_cyc().wrapping_sub(t0)
+        }
+    }
+
+    /// PULSE-5 — busy percent (0..=100) for `core_load`, computed for the window AS IT STANDS NOW
+    /// rather than as of the last completed one. Three cases, in the order they are tested:
+    ///
+    ///   1. The in-flight span alone covers a whole window: the last ~250 ms were, in their
+    ///      entirety, this core executing one task. That is 100%, and no other term can change it —
+    ///      this is the compute-bound case the arc exists for, and it is now a single read away
+    ///      from the truth instead of an unbounded wait for a dispatch boundary.
+    ///   2. The current (partial) window plus the in-flight span already spans a full window's
+    ///      worth of measured time: report that occupancy directly. No stale term is consulted.
+    ///   3. The window is still short: report the measured part at full weight and fill only the
+    ///      REMAINDER of the window from the last completed window's rate. This is what keeps the
+    ///      number continuous — a core that has just rolled its window does not drop to a noisy
+    ///      two-millisecond sample — while bounding how much of the answer can be historical: the
+    ///      stale term's weight is exactly the fraction of the window not yet measured, and it
+    ///      decays to zero as the window fills. Before any window has completed (`LOAD_PCT_NONE`)
+    ///      there is no historical rate, so it falls through to the measured part alone.
+    ///
+    /// Read order (`win_busy_cyc` Acquire, then `run_t0`) is load-bearing against double-counting a
+    /// span that the fold has just banked; see `run_t0`. Lock-free, allocation-free, callable from
+    /// any core, and cheap enough for `pick_cpu`: two atomic loads, one sysreg read, integer math.
+    fn busy_pct(&self) -> u32 {
+        let budget = load_window_cyc();
+        // Acquire pairs with `account`'s Release store; it must be read BEFORE `run_t0`.
+        let win_busy = self.win_busy_cyc.load(Ordering::Acquire);
+        let win_idle = self.win_idle_cyc.load(Ordering::Relaxed);
+        let live = self.live_span_cyc();
+        if live >= budget {
+            return 100; // case 1 — the whole window is one uninterrupted execution span
+        }
+        let busy = win_busy + live;
+        let elapsed = busy + win_idle;
+        let recent = self.recent_pct.load(Ordering::Relaxed);
+        if elapsed >= budget || recent == LOAD_PCT_NONE {
+            // case 2 (and the pre-first-window fallback): measured time only.
+            if elapsed == 0 {
+                0
+            } else {
+                ((busy * 100 / elapsed) as u32).min(100)
+            }
+        } else {
+            // case 3 — measured part at full weight, the unmeasured remainder at the last window's
+            // rate. `busy` < 2*budget and `recent` <= 100, so both products stay far inside u64.
+            let rem = budget - elapsed;
+            (((busy * 100 + recent as u64 * rem) / budget) as u32).min(100)
+        }
+    }
+
+    /// SPREAD-9 — busy percent EXCLUDING the service band: the load figure EL0 placement weighs now
+    /// that services preempt at IPI receipt. Same three-case shape and read ordering as `busy_pct`
+    /// (which see), with the service share removed from each term:
+    ///
+    ///   * the windowed part subtracts `win_svc_cyc` from `win_busy_cyc` (same fold, so never skewed
+    ///     the wrong way; `saturating_sub` covers the one-call read race between the two loads);
+    ///   * the in-flight span counts only if the task executing RIGHT NOW is below the band —
+    ///     `live_is_svc` is the caller's `CUR_PRIO` read for this core, the same published word
+    ///     `preempt_hint` keys on;
+    ///   * the historical fill uses `recent_pct - recent_svc_pct` (snapshotted by the same roll).
+    ///
+    /// ELAPSED time keeps the FULL busy (service included): the answer is "what fraction of this
+    /// core's time went to work an EL0 arrival would actually wait behind", not a renormalization
+    /// that would inflate the EL0 share on a service-heavy core.
+    fn el0_busy_pct(&self, live_is_svc: bool) -> u32 {
+        let budget = load_window_cyc();
+        // Acquire pairs with `account`'s Release store; it must be read BEFORE `run_t0` (see `run_t0`).
+        let win_busy = self.win_busy_cyc.load(Ordering::Acquire);
+        let win_svc = self.win_svc_cyc.load(Ordering::Relaxed);
+        let win_idle = self.win_idle_cyc.load(Ordering::Relaxed);
+        let live = self.live_span_cyc();
+        let live_el0 = if live_is_svc { 0 } else { live };
+        if live_el0 >= budget {
+            return 100; // case 1 — the whole window is one uninterrupted below-band execution span
+        }
+        let el0_busy = win_busy.saturating_sub(win_svc) + live_el0;
+        let elapsed = win_busy + live + win_idle;
+        let recent = self.recent_pct.load(Ordering::Relaxed);
+        if elapsed >= budget || recent == LOAD_PCT_NONE {
+            // case 2 (and the pre-first-window fallback): measured time only.
+            if elapsed == 0 {
+                0
+            } else {
+                ((el0_busy * 100 / elapsed) as u32).min(100)
+            }
+        } else {
+            // case 3 — measured part at full weight, the unmeasured remainder at the last window's
+            // below-band rate.
+            let recent_el0 =
+                recent.saturating_sub(self.recent_svc_pct.load(Ordering::Relaxed)) as u64;
+            let rem = budget - elapsed;
+            (((el0_busy * 100 + recent_el0 * rem) / budget) as u32).min(100)
         }
     }
 
@@ -437,17 +724,40 @@ impl CoreAccount {
         if last == 0 {
             return false; // never accounted — this core has not run the scheduler loop
         }
+        // PULSE-5: a core with an IN-FLIGHT execution span is being accounted by definition — it is
+        // inside `run()`, executing a dispatched task, and `busy_pct()` now measures that span
+        // live. Before this arm, a core holding one compute-bound task for longer than two windows
+        // went `--` at exactly the moment it was the busiest thing on the machine: the fold gap
+        // aged past the staleness bound, `SCHED: load` printed `--`, and `ui_status::live_permille`
+        // returned None so the status strip fell back to the dispatch-pass classifier — the
+        // "45% unused while vugs starved" reading. The fold-age bound below still governs every
+        // core that is NOT executing (BSP `hlt_loop`, post-CAPSTONE spin, never-scheduled), which
+        // is the case SCHED-8 introduced it for; `fold_age_cyc` is deliberately left untouched, so
+        // WEDGE-1's much tighter "may I pin work here" gate keeps reading the raw fold age and
+        // still disqualifies a core that is not going round the dispatch loop.
+        if self.run_t0.load(Ordering::Relaxed) != 0 {
+            return true;
+        }
         now_cyc().wrapping_sub(last) < load_window_cyc().saturating_mul(2)
     }
 
     /// WEDGE-1 — cycles since the last fold, or `u64::MAX` if this core has never folded a span.
     /// The raw quantity `tracked()` thresholds; see `CoreLoad::fold_age_cyc`.
     fn fold_age_cyc(&self) -> u64 {
+        self.fold_age_from(now_cyc())
+    }
+
+    /// SPREAD-13 — [`fold_age_cyc`](Self::fold_age_cyc) against a caller-supplied `now`, so a scan
+    /// that asks the freshness question of EVERY core pays one CNTPCT read instead of one per core.
+    /// Identical quantity and identical never-folded sentinel; the only difference is who reads the
+    /// counter. Using a single `now` across the scan is also the more honest reading — the four ages
+    /// are then comparable to each other rather than each measured from its own instant.
+    fn fold_age_from(&self, now: u64) -> u64 {
         let last = self.last_acct_cyc.load(Ordering::Relaxed);
         if last == 0 {
             return u64::MAX;
         }
-        now_cyc().wrapping_sub(last)
+        now.wrapping_sub(last)
     }
 
     /// Read the last-task triple with a bounded seqlock retry. `&'static str` reconstruction is sound:
@@ -487,6 +797,10 @@ pub struct CoreLoad {
     /// SCHED-5 — busy TIME fraction (0..=100): CNTPCT cycles spent executing tasks over the most recent
     /// ~250 ms window (was, pre-SCHED-5, the fraction of dispatch PASSES that ran work — a cadence proxy
     /// that read ~50% for a task waking once per tick; now it is real CPU utilization).
+    ///
+    /// PULSE-5 — and it is CURRENT, not last-window. The value includes the span the core is executing
+    /// at this instant, so a core inside a multi-second compute-bound task reads ~100% on the first
+    /// read rather than reporting its pre-storm percent until the task ends. See `CoreAccount::busy_pct`.
     pub busy_pct_recent: u32,
     /// Cumulative context switches into a task on this core since boot.
     pub ctx_switches: u64,
@@ -585,6 +899,16 @@ impl RunQueue {
     fn len(&self) -> usize {
         self.levels.iter().map(VecDeque::len).sum()
     }
+    /// SPREAD-9 — ready tasks BELOW the service band: the depth EL0 placement weighs. A queued
+    /// service-band task is not competition an EL0 task will ever wait a quantum behind — it
+    /// preempts at IPI receipt, runs a micro pass and blocks — so counting it made the core hosting
+    /// the services read deeper than the load an EL0 arrival would actually contend with (the
+    /// placement half of the dissolved service-core reserve). Effective level is the right key here:
+    /// an aged-up EL0 task sitting IN the band is transiently excluded, which errs toward the old
+    /// (conservative) reading for exactly the population the anti-starvation valve is about to run.
+    fn len_below_band(&self) -> usize {
+        self.levels[..PRIO_SERVICE as usize].iter().map(VecDeque::len).sum()
+    }
     /// Dequeue the front of the HIGHEST non-empty level (strict priority over the effective level,
     /// round-robin within).
     fn pop_highest(&mut self) -> Option<Box<Task>> {
@@ -621,7 +945,14 @@ impl RunQueue {
     /// raw `VecDeque` move that leaves `priority` (base) untouched — NOT `push`. A `push_back` into
     /// `level + 1` may reallocate under the run-queue lock; that is benign here exactly as at `spawn`
     /// (the heap lock is always innermost — run-queue → heap is the only ordering, never inverted).
-    fn age(&mut self, elapsed: u32) {
+    ///
+    /// SCHED-PRIO — returns how many of this sweep's relocations landed a task INTO the interactive
+    /// service band (from below `PRIO_SERVICE` to at or above it). That number is the fairness escape
+    /// valve made countable: it is exactly how often a below-band task (an EL0 vug) had waited long
+    /// enough to be lifted to parity with the compositor, and `[prio] agedin=` reports it. Counting
+    /// here costs one comparison on a path that is already O(ready tasks) and off the switch.
+    fn age(&mut self, elapsed: u32) -> u32 {
+        let mut into_band = 0u32;
         for level in (0..NUM_PRIORITIES - 1).rev() {
             let n = self.levels[level].len();
             for _ in 0..n {
@@ -630,12 +961,16 @@ impl RunQueue {
                 if task.wait_ticks >= AGE_TICKS {
                     task.wait_ticks -= AGE_TICKS; // carry surplus credit, don't discard it
                     debug_assert!(level + 1 < NUM_PRIORITIES, "age: promotion above top level");
+                    if level + 1 >= PRIO_SERVICE as usize && level < PRIO_SERVICE as usize {
+                        into_band += 1;
+                    }
                     self.levels[level + 1].push_back(task); // RELOCATE up one level (base unchanged)
                 } else {
                     self.levels[level].push_back(task);
                 }
             }
         }
+        into_band
     }
 }
 
@@ -685,6 +1020,167 @@ fn irq_save_mask() -> u64 {
 #[inline]
 fn irq_restore(daif: u64) {
     unsafe { core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack, preserves_flags)) };
+}
+
+// --- WEDGE-4 — the run-queue lock discipline, and the instruments that witness a breach. ---
+
+/// WEDGE-4 — which run-queue section (if any) the core at this index is currently inside.
+/// `0` = none; otherwise `((queue + 1) << 32) | (owner tid as u32)`.
+///
+/// Two consumers, both diagnostic: `timer_preempt` reads THIS core's word to catch a preempt landing
+/// inside a section (probe W4-A — the precondition for the wedge, which the masking below makes
+/// impossible, so a line from it means the discipline has been breached again), and `wedge4_rq_stall`
+/// scans all cores to name the holder of a queue it could not acquire (probe W4-B). Sections never
+/// nest — every acquisition below takes exactly one queue and drops it before taking another — so a
+/// single word per core is enough.
+static IN_RQ_SECTION: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+
+/// WEDGE-4 W4-B — try_lock attempts before a run-queue acquisition is declared stalled. Same order as
+/// WEDGE-1's `DRAIN_STALL_SPINS`: far beyond any legitimate hold (push/pop are O(NUM_PRIORITIES), the
+/// aging sweep O(ready tasks)), so reaching it means the holder is off-CPU and never coming back.
+const RQ_STALL_SPINS: u64 = 1 << 26;
+
+/// WEDGE-4 W4-A — cap on the preempt-in-section witness, so a breach reports itself without flooding.
+const W4A_PRINT_MAX: u32 = 8;
+static W4A_PRINTS: AtomicU32 = AtomicU32::new(0);
+
+type RqLockGuard = spin::MutexGuard<'static, RunQueue, spin::Spin>;
+
+/// WEDGE-4 — one raw byte at the UART, taking NO lock. Same seam as WEDGE-2's breadcrumbs
+/// (`crate::arch::serial::wedge2_raw_byte` is this call): a bounded volatile poll of the PL011 TX-full
+/// bit and one volatile store. `serial_println!` cannot be used here — it masks IRQ and takes the
+/// serial lock, and this instrument exists precisely for a core that is spinning IRQ-masked forever.
+#[inline(never)]
+fn w4_str(s: &str) {
+    for b in s.as_bytes() {
+        super::serial::SerialPort.write_byte(*b);
+    }
+}
+
+/// WEDGE-4 — a decimal integer through the same lock-free seam (no formatter, no allocation).
+#[inline(never)]
+fn w4_dec(v: u64) {
+    let mut buf = [0u8; 20];
+    let mut n = 0;
+    let mut v = v;
+    loop {
+        buf[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while n > 0 {
+        n -= 1;
+        super::serial::SerialPort.write_byte(buf[n]);
+    }
+}
+
+/// WEDGE-4 W4-B — the wedge namer: one line identifying the queue that could not be acquired and, if
+/// some core is inside a section on it, that section's owner. Emitted ONCE per stalled acquisition
+/// (at exactly `RQ_STALL_SPINS`); the caller then keeps spinning, so behaviour is unchanged and this
+/// only makes a silent wedge legible.
+#[inline(never)]
+fn wedge4_rq_stall(core: usize, queue: usize) {
+    w4_str("\r\n[wedge4] RQ STALL core=");
+    w4_dec(core as u64);
+    w4_str(" queue=");
+    w4_dec(queue as u64);
+    for c in 0..NUM_CPUS {
+        let s = IN_RQ_SECTION[c].load(Ordering::Acquire);
+        if s != 0 && (s >> 32) == queue as u64 + 1 {
+            w4_str(" owner_core=");
+            w4_dec(c as u64);
+            w4_str(" owner_tid=");
+            w4_dec(s & 0xffff_ffff);
+            break;
+        }
+    }
+    w4_str("\r\n");
+}
+
+/// WEDGE-4 W4-B — acquire `queue`'s lock, spinning as before, but bounded well enough to say so once.
+#[inline]
+fn rq_lock_witnessed(queue: usize, core: usize) -> RqLockGuard {
+    let mut spins: u64 = 0;
+    loop {
+        if let Some(guard) = RUN_QUEUES[queue].try_lock() {
+            return guard;
+        }
+        spins = spins.wrapping_add(1);
+        if spins == RQ_STALL_SPINS {
+            wedge4_rq_stall(core, queue);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// WEDGE-4 — the tid dispatched on `cpu` right now, or 0 outside a scheduled task. Owner attribution
+/// for the probes only; relaxed, and the `&'static`-lifetime Box is live for as long as it is
+/// `current`.
+#[inline]
+fn current_tid_relaxed(cpu: usize) -> u64 {
+    let raw = SCHED[cpu].current.load(Ordering::Relaxed) as *const Task;
+    if raw.is_null() { 0 } else { unsafe { (*raw).id } }
+}
+
+/// WEDGE-4 — a held run-queue lock together with the IRQ state it masked. See [`rq`].
+struct RqGuard {
+    daif: u64,
+    core: usize,
+    guard: Option<RqLockGuard>,
+}
+
+impl Drop for RqGuard {
+    fn drop(&mut self) {
+        self.guard = None; // release the spinlock FIRST
+        IN_RQ_SECTION[self.core].store(0, Ordering::Release);
+        irq_restore(self.daif); // then restore the caller's IRQ state (nested masks stay masked)
+    }
+}
+
+impl Deref for RqGuard {
+    type Target = RunQueue;
+    fn deref(&self) -> &RunQueue {
+        self.guard.as_ref().expect("rq: guard released while borrowed")
+    }
+}
+
+impl DerefMut for RqGuard {
+    fn deref_mut(&mut self) -> &mut RunQueue {
+        self.guard.as_mut().expect("rq: guard released while borrowed")
+    }
+}
+
+/// WEDGE-4 — take `queue`'s run-queue lock with IRQ MASKED for exactly the length of the hold. This is
+/// the only admissible way to acquire `RUN_QUEUES`.
+///
+/// `RUN_QUEUES` is a bare `spin::Mutex` with no interrupt discipline of its own, while the scheduler
+/// side (`dispatch_next`, `make_ready`, `try_steal`) takes it IRQ-masked. Before this, the spawn and
+/// placement paths took the same lock from ordinary preemptible task context: a timer preempt landing
+/// inside one of those sections froze the holder, and every masked acquisition of that queue then span
+/// forever — a 100%-busy core that dispatches nothing, panics nothing and prints nothing, cascading to
+/// its siblings through `try_steal`'s all-queues peek. Masking closes the window; nothing else changes,
+/// and no protection is weakened.
+///
+/// The hold is the whole span, so keep it as short as it already was (`RunQueue::push` may reallocate
+/// under it — pre-existing, and the heap lock stays innermost).
+#[inline]
+fn rq(queue: usize) -> RqGuard {
+    let daif = irq_save_mask();
+    let core = percpu::this_cpu().cpu_index as usize;
+    let guard = rq_lock_witnessed(queue, core);
+    debug_assert_eq!(
+        IN_RQ_SECTION[core].load(Ordering::Relaxed),
+        0,
+        "rq: run-queue sections must not nest"
+    );
+    IN_RQ_SECTION[core].store(
+        ((queue as u64 + 1) << 32) | (current_tid_relaxed(core) & 0xffff_ffff),
+        Ordering::Release,
+    );
+    RqGuard { daif, core, guard: Some(guard) }
 }
 
 // `switch_context(old_sp: *mut u64, new_sp: u64)` — AAPCS64: x0 = old_sp, x1 = new_sp. Saves DAIF +
@@ -900,6 +1396,1217 @@ static ONLINE_MASK: [AtomicBool; NUM_CPUS] = [const { AtomicBool::new(false) }; 
 /// the scan starts at a rotating offset so consecutive auto-placements fan out instead of stacking.
 static AUTO_ROTATE: AtomicUsize = AtomicUsize::new(0);
 
+// SPREAD-3 — COMMITTED LOAD, NOT AN INSTANTANEOUS SNAPSHOT.
+//
+// SCHED-3's two placement signals are both blind to the thing EL0 spawns actually create: a long-lived,
+// compute-bound resident that is RUNNING rather than QUEUED.
+//
+//   * ready-queue DEPTH (`RunQueue::len`) counts tasks WAITING in the queue. The task a core is
+//     currently executing lives in `SCHED[cpu].current`, NOT in `RUN_QUEUES[cpu]` — so a core spinning
+//     flat-out inside one compute-bound vug reads depth 0, exactly like a genuinely idle core.
+//   * the rolling busy fraction (`CoreAccount::busy_pct`) is a ~250 ms LAGGING window. A burst of
+//     spawns issued inside one window all read the SAME pre-burst percentage, so they all agree on the
+//     same "least busy" core and all land on it. (PULSE-5 has since removed the WORST of that lag —
+//     `busy_pct` now ages the in-flight execution span in at read time, so a core running one
+//     compute-bound task no longer reports its pre-storm percent indefinitely. It is still a rolling
+//     window and still cannot see a spawn that has not started executing, which is precisely why the
+//     committed-residents key below remains key 1 and is NOT superseded by the fresher percent.)
+//
+// Together those produce the P68 measurement (27 bg-el0 -> c3, 18 -> c0, 8 -> c1, ~0 -> c2 while
+// c0/c3 sat at 99% and c1/c2 at ~80%): placement keeps re-reading a signal that has not yet caught up
+// with the placements it already made, and because the scheduler is no-migrate, nothing ever corrects
+// it. Operator-visible as stagger inversion — vugs launched early run slower than their replacements.
+//
+// The fix is to make the placement decision account for what has ALREADY been committed to a core:
+// a per-core count of LIVE EL0 residents, incremented at the moment of placement (before the enqueue,
+// so it is visible to the very next spawn) and decremented when the task is reaped. It is O(1), needs
+// no new Task field (an EL0 task is exactly one with a non-zero `user_entry`), carries no migration
+// machinery, and — unlike depth and busy_pct — it cannot lag the decisions it is meant to inform.
+
+/// SPREAD-3 — live EL0 residents committed to each core. Bumped by every EL0 spawn path
+/// (`spawn_user_inner`, `spawn_user_thread`) at placement time and dropped on every reap path
+/// (`exit`, `retire_killed`). This is the COMMITTED-load signal `pick_cpu` reads first: unlike
+/// ready-queue depth it counts a task that is currently RUNNING, and unlike the rolling busy window
+/// it updates synchronously with the placement rather than ~250 ms later.
+/// SPIN-3 (2026-07-30, the P96 exoneration cascade): the BCM2711's A72 cores have NO LSE atomics —
+/// every RMW is an LL/SC retry loop, and an exclusive reservation broken by another core's store to
+/// the SAME CACHE LINE retries forever under sustained contention. The per-cpu accounting atomics
+/// were adjacent (4-8 to a 64-byte line): the yield storm hammering its own counters at MHz rates
+/// starved rx-backstop's `make_ready` fetch_add on a NEIGHBORING counter for 20-200 s, IRQ-masked —
+/// with every lock witness reading clean, because the locks live on other lines. One padded slot per
+/// core ends the false sharing; the reservation granule is the line.
+#[repr(align(64))]
+struct PaddedUsize(AtomicUsize);
+#[repr(align(64))]
+struct PaddedSlotRow([AtomicU32; KILL_ASID_SLOTS]);
+
+static EL0_RESIDENTS: [PaddedUsize; NUM_CPUS] =
+    [const { PaddedUsize(AtomicUsize::new(0)) }; NUM_CPUS];
+
+/// SPREAD-3 — commit one EL0 resident to `cpu`. Called BEFORE the run-queue push so a concurrent
+/// `pick_cpu` on another core can never place a second resident against a stale count. Returns the
+/// new (inclusive) resident count, which the placement witness prints.
+///
+/// `allow(dead_code)`: the only callers are the two EL0 spawn paths, which are `baremetal`-gated (the
+/// `virt`/JC3 aarch64 build runs kernel threads only and creates no EL0 task). The RELEASE side stays
+/// ungated because `exit()` is shared by both worlds — it simply never fires there (`user_entry == 0`).
+#[allow(dead_code)]
+#[inline]
+fn el0_resident_enter(cpu: usize) -> usize {
+    if cpu >= NUM_CPUS {
+        return 0;
+    }
+    EL0_RESIDENTS[cpu].0.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+/// SPREAD-3 — release one EL0 resident from `cpu` (task reaped). Saturating at zero: an accounting
+/// slip must never underflow into `usize::MAX` and permanently exclude a healthy core from placement.
+/// EL0 tasks are `steal_ok = false` (never migrated), so the `cpu` recorded at spawn is still the
+/// core being released here.
+#[inline]
+fn el0_resident_leave(cpu: usize) {
+    if cpu >= NUM_CPUS {
+        return;
+    }
+    let _ = EL0_RESIDENTS[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        if n == 0 { None } else { Some(n - 1) }
+    });
+}
+
+// SPREAD-4 — A COMMITTED RESIDENT IS NOT THE SAME THING AS A RUNNABLE ONE.
+//
+// SPREAD-3's residents key fixed the burst problem (N spawns in one window no longer agree on one
+// core), but it counts HEADS, not LOAD: a vug spinning flat out and a vug parked on its input futex
+// weigh exactly the same. On a live fleet that is the dominant error, because a windowed EL0 app
+// spends most of its life PARKED — VUGPAUSE-2 made the idle vug block on `SYS_INPUT_WAIT` and its
+// workers block on the phase futex, so a four-vug desktop with one active window reads
+// `residents = 4` spread over the cores that happened to be least loaded at spawn time, and every
+// later placement steers around load that is not there. The P73 wire is the shape that produces:
+// per-core busy swinging 3-5x while the residents counts stay flat and even.
+//
+// The second half is that the count is only ever consulted at SPAWN. EL0 tasks are `steal_ok = false`
+// (they carry per-core address-space state), so `try_steal` can never correct them — and neither can
+// anything else, because `make_ready` returns a woken task to `task.cpu` unconditionally. A vug that
+// was placed on c1 when c1 was idle re-runs on c1 forever, however crowded c1 later becomes. That is
+// the "parked-then-resumed vug re-runs on its original core regardless of current load" half, and it
+// is also the sched half of the vug speed-up delay: when its peers park, the surviving vug's own
+// worker threads stay bunched on the cores they were spawned onto and the fleet-of-one never spreads.
+//
+// SPREAD-4 fixes both with one counter and one decision point:
+//
+//   1. LIVE RESIDENTS. `EL0_PARKED` tracks how many of a core's committed residents are currently
+//      BLOCKED. `el0_active` = committed - parked is the RUNNABLE resident count, and that is what
+//      `pick_cpu` keys on. A parked vug stops anchoring load to its core the moment it blocks and
+//      starts counting again the moment it wakes. Nothing else about SPREAD-3's accounting moves:
+//      `EL0_RESIDENTS` keeps its exact enter/leave sites and its exact meaning.
+//   2. RE-PLACE AT WAKE. `make_ready` is the single funnel every wake goes through (sleeper drain,
+//      `Semaphore::post`, `futex_wake`, the kill sweeps), and a task arriving there is parked — it
+//      owns no core, holds no per-core register state, and is about to be pushed onto SOME queue.
+//      That is the one instant at which an EL0 task can be moved for free, so that is where the
+//      committed-load signal gets a second look. See `rewake_place`.
+
+/// SPREAD-4 — how many of each core's committed EL0 residents are currently PARKED (blocked in a wait
+/// queue or on the sleeper list). Incremented by `park_blocked` and decremented by `make_ready`, which
+/// are the sole park/wake funnels: every blocking primitive an EL0 task can reach (`Semaphore::wait`,
+/// `futex_wait`, `sleep_ticks`) parks by setting `park_kind` and switching back, and every wake path
+/// re-readies through `make_ready`. The pair is therefore exactly balanced.
+///
+/// `retire_killed` needs no arm here: the task it reaps was just POPPED FROM A RUN QUEUE, so it was
+/// READY (already un-parked by the `make_ready` that the kill sweep performed) and only its
+/// `EL0_RESIDENTS` credit is outstanding. `exit()` likewise runs on a RUNNING task.
+static EL0_PARKED: [PaddedUsize; NUM_CPUS] =
+    [const { PaddedUsize(AtomicUsize::new(0)) }; NUM_CPUS];
+
+/// SPREAD-4 — note that a committed EL0 resident of `cpu` has gone to sleep.
+#[inline]
+fn el0_parked_enter(cpu: usize) {
+    if cpu < NUM_CPUS {
+        EL0_PARKED[cpu].0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// SPREAD-4 — note that a parked EL0 resident of `cpu` is runnable again. Saturating at zero for the
+/// same reason `el0_resident_leave` is: an accounting slip must never underflow into `usize::MAX` and
+/// make a busy core look permanently empty (the failure mode here is the DANGEROUS direction —
+/// `el0_active` would saturate to 0 and the core would attract every placement on the machine).
+#[inline]
+fn el0_parked_leave(cpu: usize) {
+    if cpu >= NUM_CPUS {
+        return;
+    }
+    let _ = EL0_PARKED[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        if n == 0 { None } else { Some(n - 1) }
+    });
+}
+
+/// SPREAD-4 — RUNNABLE EL0 residents on `cpu`: committed minus parked. This is the committed-load
+/// signal `pick_cpu` keys on and the one `rewake_place` compares cores by. Saturating rather than
+/// wrapping: the two counters are updated by different cores at different instants, so a reader can
+/// legitimately observe `parked > residents` for a few cycles mid-wake (the parked decrement lands
+/// before the resident transfer). Saturation makes that transient read 0 — one placement decision
+/// made against a count that is one low — instead of a huge number that would exclude the core.
+#[inline]
+fn el0_active(cpu: usize) -> usize {
+    if cpu >= NUM_CPUS {
+        return 0;
+    }
+    EL0_RESIDENTS[cpu].0
+        .load(Ordering::Acquire)
+        .saturating_sub(EL0_PARKED[cpu].0.load(Ordering::Acquire))
+}
+
+/// SPREAD-13 — COMMITTED EL0 residents on `cpu`: `EL0_RESIDENTS` without SPREAD-4's parked
+/// subtraction. This is OWNERSHIP rather than contention — "does any EL0 task call this core home" —
+/// and it is the reading the co-placement predicate needs, because it changes only at spawn, at reap,
+/// and at a placement move. It cannot flicker on a park/wake edge, which `el0_active` does once per
+/// frame per task. See the SPREAD-13 block above `spare_cores`.
+#[inline]
+fn el0_committed(cpu: usize) -> usize {
+    if cpu >= NUM_CPUS {
+        return 0;
+    }
+    EL0_RESIDENTS[cpu].0.load(Ordering::Acquire)
+}
+
+// SPREAD-10 — A VUG'S TRIPLE LIVES TOGETHER; THE RENDEZVOUS COMES HOME.
+//
+// FLUID-3 closed the present-path hypothesis: presents run inline (~2.5 ms) on the caller's core,
+// there is no queue and no consumer, and the aggregate rate is conserved. The remaining pace-setter
+// for a vug's settled fps is the FUTEX PARK at its frame barrier — the parent parks on `DONE` behind
+// its two workers (workers on `PHASE`), and when the three tasks of one vug sit scattered across
+// saturated cores, every frame pays a cross-core rendezvous: wake SGI, queue wait behind foreign
+// residents, then the parent's own re-dispatch. The [fluid3] millisecond park buckets ARE that price,
+// per frame, and the wildly-unequal per-vug rates (19..80/s on the same binary) are a pure function
+// of WHERE each triple landed. The fix is placement, not pacing: bias the members of one
+// address-space slot toward the same core, so the rendezvous resolves against LOCAL wakes — the
+// worker's `PHASE` wake and the parent's `DONE` wake land on a queue the target core is already
+// dispatching, the spin-then-park windows catch them, and the cross-core IPI + foreign-queue wait
+// drops out of the frame loop.
+//
+// The identification costs nothing new: a triple is exactly the tasks sharing one address-space slot
+// (`user_ttbr0 >> 48` — the ASID `spawn_user_thread` propagates from the parent, the same key the
+// PHASE futex hashes under). What placement lacked was a per-core view of it; `SLOT_CORE_RES` below
+// is that view, maintained at the exact sites the SPREAD-3 committed-residents counter already
+// occupies.
+//
+// The weight (the whole tuning argument, in one place): one cross-core rendezvous costs ~1-3 ms per
+// frame ([fluid3] p50..p90 millisecond buckets under storm; [spread7] wd_mean prices one run-queue
+// position at ~4-6 ms saturated). The co-residency bonus must therefore be worth LESS than one
+// runnable resident (or triples would pile onto saturated cores and regress SPREAD-4's margin
+// discipline) and MORE than the depth/pct tie-breaks (or nothing would ever converge). Half a
+// runnable resident — ~2-3 ms-equivalent, squarely the price of the rendezvous it buys back — is the
+// bonus, applied in doubled-load units wherever placement compares cores. Concretely:
+//
+//   * at SPAWN (`pick_cpu`): a core hosting a same-slot sibling wins every tie on runnable residents
+//     but can never beat a core with one FEWER resident. Pure preference, zero pile-up risk.
+//   * at REWAKE (`rewake_place`): a second qualifying lane beside the margin lane — a candidate
+//     hosting MORE same-slot siblings than home qualifies at margin 0 (equal load allowed, heavier
+//     never), so triples actually converge on a balanced fleet where the margin-2 lane would hold
+//     every member exactly where it is. Sequential such moves strictly increase the slot's
+//     co-residency (each move is toward strictly-more siblings), so convergence terminates; the
+//     SPREAD-6 refresh clock (~4 asks/s per task, per-task and unsynchronized) is what carries a
+//     shifted fleet to the new answer within ~250 ms.
+//   * RETENTION: home hosting a sibling is half a resident harder to leave via the margin lane (on
+//     the integer lattice that bites as one extra resident: a triple is broken up by pure load only
+//     for a >= margin+1 win). A core that saturates still sheds: both lanes compare RUNNABLE load,
+//     and a big enough delta clears the retention — co-residency is a preference, never an anchor.
+//
+// Siblings are counted COMMITTED (not runnable-adjusted): a parked parent still names the core its
+// workers should rendezvous on — that is precisely the anchor this arc exists to create.
+//
+// SPREAD-13 CORRECTS THIS BLOCK IN TWO PLACES, and both corrections are consequences of the sentence
+// immediately above rather than objections to it. The asymmetry it declares — siblings weighed
+// COMMITTED, load weighed RUNNABLE — is right when cores are contended and is the mechanism that pins
+// a barrier-synchronised triple to one core when they are not:
+//
+//   * "zero pile-up risk" (the SPAWN bullet) holds against a core with one fewer RUNNABLE resident,
+//     which is what it says. It does not hold against a core with one fewer COMMITTED one: a core
+//     whose same-slot tasks are all momentarily parked reads `res == 0` and scores `2*0 + 1 - 1 = 0`,
+//     strictly below a core that owns nothing at all. That is a pile-up onto a core that is 99% busy,
+//     decided against a core that is 0% busy.
+//   * "a preference, never an anchor" (the RETENTION bullet) holds for the margin lane, which is the
+//     lane it is about. It does not hold for `rewake_place`'s early-out, which returns home WITHOUT
+//     SCANNING when `home_act < 2 && home_sibs > 0` — and a co-resident triple taking turns presents
+//     exactly that reading however saturated its core is. There the retention is an anchor, and the
+//     PA3 desktop (one window, `c1=99%` beside three cores at 0%) is what it anchored.
+//
+// Neither correction changes the weight or the lanes. SPREAD-13 leaves every line of this block in
+// force whenever the machine has no spare core, and suspends the whole of it — bonus, discount,
+// sibling lane, retention and early-out together — whenever it does. See the SPREAD-13 block above
+// `spare_cores` for why suspension rather than re-tuning, and for the pattern this is the third
+// instance of on this track.
+
+/// SPREAD-10 — committed EL0 residents per (core, address-space slot). Slot index is the ASID
+/// (1..=`boot::USER_SLOTS`; index 0 — kernel tasks and the shared window — is never counted and never
+/// biases). Enter/leave sites mirror `EL0_RESIDENTS` exactly: both EL0 spawn paths, the `make_ready`
+/// move (transfer home -> target), and every reap path. Lock-free; same saturating-leave discipline.
+static SLOT_CORE_RES: [PaddedSlotRow; NUM_CPUS] =
+    [const { PaddedSlotRow([const { AtomicU32::new(0) }; KILL_ASID_SLOTS]) }; NUM_CPUS];
+
+/// SPREAD-10 — placements the co-residency bonus DECIDED: rewake moves that qualified only through
+/// the sibling lane, plus spawns whose winner differs from what the bonus-free key would have picked.
+/// The `[spread10]` witness prints it; climbing without bound beside a flat `cores_per_slot`
+/// histogram would be the thrash signature (the convergence argument above says sequential moves
+/// terminate, so it should settle to the fleet's churn rate).
+static SPREAD10_CO_MOVES: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-10 — the address-space slot of a task, or 0 for "no slot, no bias" (kernel tasks, the
+/// shared window, and any out-of-range ASID). The same `>> 48` extraction every ASID consumer uses.
+#[inline]
+fn slot_of(user_ttbr0: u64) -> usize {
+    let asid = (user_ttbr0 >> 48) as usize;
+    if asid != 0 && asid < KILL_ASID_SLOTS { asid } else { 0 }
+}
+
+/// SPREAD-10 — commit one slot resident to `cpu`. Called beside every `el0_resident_enter`.
+///
+/// `allow(dead_code)`: `el0_resident_enter`'s reason verbatim — the only callers are the two EL0
+/// spawn paths, which are `baremetal`-gated; the release side stays ungated because `exit()` is
+/// shared by both worlds.
+#[allow(dead_code)]
+#[inline]
+fn slot_res_enter(cpu: usize, user_ttbr0: u64) {
+    let slot = slot_of(user_ttbr0);
+    if slot != 0 && cpu < NUM_CPUS {
+        SLOT_CORE_RES[cpu].0[slot].fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// SPREAD-10 — release one slot resident from `cpu`. Called beside every `el0_resident_leave`.
+/// Saturating for `el0_resident_leave`'s reason: an accounting slip must never underflow and turn a
+/// core into a permanent phantom sibling magnet.
+#[inline]
+fn slot_res_leave(cpu: usize, user_ttbr0: u64) {
+    let slot = slot_of(user_ttbr0);
+    if slot != 0 && cpu < NUM_CPUS {
+        let _ = SLOT_CORE_RES[cpu].0[slot].fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            if n == 0 { None } else { Some(n - 1) }
+        });
+    }
+}
+
+/// SPREAD-10 — committed same-slot residents on `cpu` (0 for the no-slot sentinel).
+#[inline]
+fn slot_res(cpu: usize, slot: usize) -> u32 {
+    if slot == 0 || cpu >= NUM_CPUS {
+        return 0;
+    }
+    SLOT_CORE_RES[cpu].0[slot].load(Ordering::Acquire)
+}
+
+/// SPREAD-4 — how much less loaded another core must be before a waking EL0 task is moved onto it,
+/// in RUNNABLE residents. Two, not one, and the gap is the whole stability argument: with a margin of
+/// one, two cores carrying `n` and `n-1` would trade a task back and forth on every wake (each move
+/// makes the destination the loaded one), and a windowed vug wakes on every frame. A margin of two
+/// cannot oscillate — moving a task across a gap of two leaves the two cores at `n-1` and `n`, which
+/// is a gap of one, which is below the threshold — so each imbalance is corrected at most once.
+const REWAKE_MARGIN: usize = 2;
+
+// SPREAD-12 — HYSTERESIS AGAINST AN EMPTY CORE BUYS NOTHING.
+//
+// The margin above is a stability argument and a correct one — between two cores that are both
+// CARRYING something. Charged against a core carrying NOTHING it stops being hysteresis and becomes
+// a floor, and the measured desktop is what that floor costs: one window open,
+// `:: SCHED: load c0=0% c1=54% c2=98% c3=0% ::`. Half the machine idle while a vug's triple
+// time-slices the other half. On this board that is not an aesthetic complaint — V3D has never
+// started a thread, every pixel is CPU work, so a core at 0% is frame rate left on the floor.
+//
+// Work the refusal through, because the arithmetic names the culprit exactly. The triple sits
+// 1-on-c1, 2-on-c2. The task on c2 asks: `home_act` 2 with a sibling beside it, so `home_eff` is
+// 2*2+1-1 = 4; idle c3 reads `act` 0 and no siblings, so `eff` is 1. The margin lane wants
+// `1 + 2*REWAKE_MARGIN <= 4` — five into four — and declines. The sibling lane (SPREAD-10) requires
+// `sibs > home_sibs`, and an empty core hosts no siblings, so the one lane that could still move
+// something structurally cannot apply to the one candidate that would help. The task on c1 fares no
+// better: `home_eff` 3 against the same `eff` 1, still short. Both cores answer "stay", forever, and
+// [spread10] `ymoves` stops at 1 — SPREAD-11 handed the yield path the placement question and the
+// predicate had no answer to give it.
+//
+// So the defect is NOT that the comparison came out equal; it did not. Zero residents against two is
+// the widest win available on the board. It is that a threshold calibrated for the gap between `n`
+// and `n-1` was being charged against a gap between `n` and ZERO. Note that SPAWN placement already
+// gets this right: `pick_cpu_slot` compares `eff < best_eff` with no margin at all, so a NEW task is
+// sent to precisely the idle core an existing task is forbidden to move to. The two halves of
+// placement disagreed about the same fleet; this closes that gap.
+//
+// THE LANE: a third qualifier beside the margin and sibling lanes — the candidate has ZERO runnable
+// EL0 residents and home carries at least `RECRUIT_MIN_HOME`. Both halves are load-bearing:
+//
+//   * DESTINATION EMPTY, not merely lighter. This is what makes the margin unnecessary rather than
+//     merely inconvenient. Oscillation requires the destination to become the loaded side and hand
+//     the task back; a move onto an empty core leaves it at 1 and home at `home_act - 1 >= 1`, so a
+//     return move needs the DESTINATION to pick up a second runnable resident AND home to fall to
+//     zero — a genuine reversal of the load, not the jitter the margin was written to damp. The
+//     margin is not weakened for the population it was written about — that population is untouched.
+//   * HOME CONTENDED, at least two runnable residents. `home_act` INCLUDES the moving task on both
+//     call paths (`make_ready` un-parks it into the count before asking; a yielding task never left
+//     the count), so `>= 2` means precisely "this task is time-slicing against a peer" — there is a
+//     real queue wait to buy back. Without this half the lane would churn: a task already alone on
+//     its core would chase whichever core reads emptier this microsecond, vacating one to fill
+//     another and never settling.
+//
+// TERMINATION, and what it actually rests on — which is NOT a monotone count of empty cores, because
+// `act == 0` does not mean "empty core". `el0_active` is RESIDENTS minus PARKED, and SPREAD-4 chose
+// that subtraction deliberately: the number measures runnable CONTENTION, not ownership. A core
+// holding two committed residents that are both parked on their frame futex — the fluid3 barrier
+// shape described above `SLOT_CORE_RES`, where "the parent parks on `DONE` behind its two workers",
+// i.e. the commonest state in this fleet — reads zero and is recruitable. So the zero-reading set is
+// NOT monotone: a core leaves it on recruitment and rejoins it the instant its residents park, and a
+// FIXED task population can therefore re-offer this lane indefinitely. Two things bound it instead:
+//
+//   * DIRECTION, per firing. The resident credits move before the enqueue, so the destination is off
+//     zero for as long as its new resident stays runnable, while the source held >= 2 and keeps
+//     >= 1. No firing increases the zero-reading count, and the lane cannot fire twice onto the same
+//     core within one runnable interval. Against a CONTINUOUSLY runnable population — which is the
+//     population this lane exists for, a vug's triple time-slicing two cores while two sit at 0% —
+//     the set is monotone after all and the strong claim does hold: at most one firing per
+//     initially-empty core, then quiet.
+//   * THE CLOCK, per task, for every other population. Neither call path asks the placement question
+//     more than once per REWAKE_MIN_PARK_MS of park (the wake path) or once per PLACE_REFRESH_MS
+//     (the yield/refresh path), and both re-arm `place_cyc` on the ask. A task whose core keeps
+//     flickering to zero underneath it migrates at single-digit moves per second, not once per
+//     dispatch. That is bounded churn, not a livelock — but it IS churn, and it is the failure mode
+//     `recruit` exists to expose. The remedy if metal shows it would be to qualify the lane on
+//     COMMITTED residents (`EL0_RESIDENTS`) rather than runnable ones, which is a different reading
+//     of "empty", not a restoration of the margin — the margin is still the wrong instrument against
+//     a gap of two.
+//
+// Two tasks refreshing in the same instant can both aim at one empty core; the refresh clock is
+// per-task and unsynchronized so it is unlikely, and it is self-correcting rather than harmful — the
+// resident credits move before the enqueue, so the core they vacated is now the empty one and the
+// next refresh (within PLACE_REFRESH_MS) recruits it.
+//
+// WHAT THIS DOES TO SPREAD-10, stated plainly because it is the obvious objection: it splits a
+// triple, and it is supposed to. SPREAD-10 fixed the co-residency bonus at HALF a runnable resident
+// and said why in the same breath — it "can never beat a core with one FEWER resident", because a
+// triple piling onto a saturated core would regress the margin discipline. The idle lane fires only
+// where the candidate has at least TWO fewer runnable residents than home. It is therefore not an
+// override of SPREAD-10's weight but an ENFORCEMENT of it: the margin lane had been suppressing the
+// very comparison SPREAD-10 declared the bonus must lose. Wherever every core carries a runnable
+// resident the lane never fires at all and co-placement keeps exactly the behaviour it was tuned
+// for. The triple comes apart only when a core is reading zero beside a saturated one — the
+// one-window desktop, the machine that is measurably broken.
+//
+// THE HAZARD, and why the freshness gate is the entire safety story here. An idle core and a WEDGED
+// core are indistinguishable on load: both read `el0_active` 0 and 0% busy, and the wedged one is
+// the MORE attractive candidate by every tie-break in this function. An EL0 task is
+// `steal_ok = false` — the core it lands on is the only core that will ever run it — so recruiting
+// a wedged core parks that task forever, and this lane would aim the whole fleet at it. What tells
+// the two apart is `fold_age_cyc`: `run()` folds an idle span on EVERY dispatch pass (SCHED-7's
+// wall-minus-busy fold), so a core idling INSIDE the scheduler loop is milliseconds fresh, while a
+// core that has left the loop stops stamping and is disqualified within ~30 ms. The lane is placed
+// ahead of that gate in the predicate chain so it inherits it unconditionally, and the rejections
+// are counted separately: on this track, mid-hunt on a deterministic single-core lockup, a climbing
+// `rstale` is a positive sighting of the wedge rather than a mere inefficiency.
+
+/// SPREAD-12 — how many runnable residents home must carry before an empty core may be recruited
+/// away from it. Two: the moving task plus a peer it is actually time-slicing against. One would
+/// mean moving a task that already owns its core outright, which buys nothing and never settles.
+///
+/// DO NOT RAISE THIS TO 3 "for safety". At `home_act >= 3` the margin lane ALREADY admits every
+/// `act == 0` candidate (`home_eff >= 6` against `eff <= 1`, and `1 + 2*REWAKE_MARGIN = 5`), so a 3
+/// here makes the idle lane a strict no-op: `best_idle_lane_only` can never set, `recruit` reads a
+/// plausible 0 forever, and the wire says "converged" for a lane that was never consulted. 2 is the
+/// only value at which this lane has any behaviour of its own. The dangerous re-tuning direction is
+/// UP, which is the opposite of the one the early-out's coupling note below warns about.
+const RECRUIT_MIN_HOME: usize = 2;
+
+// SPREAD-13 — CO-PLACEMENT IS A CONTENTION POLICY, AND AN EMPTY MACHINE HAS NO CONTENTION.
+//
+// The PA3 measurement, with SPREAD-12 already in force: ONE window rendering steadily ([comp2]
+// rate=231/s), `:: SCHED: load c0=0% c1=99% c2=0% c3=0% ::`, [spread10] recruit=81 (the idle lane IS
+// firing), [fluid3] parks=0 across 60 s (the barrier no longer parks at all). The run-queue storm is
+// gone, recruitment works, nothing parks — and a single vug still cannot use more than one core.
+//
+// The thing still holding the triple together is SPREAD-10, and the arithmetic is worth writing out
+// because it names the defect exactly. Co-placement counts siblings COMMITTED and load RUNNABLE, and
+// says why in its own block: "Siblings are counted COMMITTED (not runnable-adjusted): a parked parent
+// still names the core its workers should rendezvous on." That asymmetry is what pins a
+// barrier-synchronised triple:
+//
+//   * ATTRACTION uses committed weight. A core hosting two same-slot tasks that are momentarily
+//     parked reads `act == 0` AND `sibs == 2`, so `eff = 2*0 + 1 - 1 = 0` — the LOWEST value the
+//     doubled-load lattice can produce, strictly below a genuinely empty core's `2*0 + 1 = 1`. A
+//     scattered member therefore prefers the core its parked siblings live on over a core that owns
+//     nothing at all, and the sibling lane (margin 0) admits the move.
+//   * REPULSION uses runnable weight. Once the triple is co-resident, whichever member is asking is
+//     usually the only RUNNABLE one on that core, so `home_act == 1`. The early-out
+//     (`home_act < 2 && home_sibs > 0`) then returns home without scanning at all, and even when it
+//     does scan, SPREAD-12's idle lane needs `home_act >= RECRUIT_MIN_HOME` (2) and the margin lane
+//     needs a gap of two. A core sitting at 99% busy with three committed EL0 residents reads
+//     `home_act = 1` and is, to every lane in this function, an uncontended core.
+//
+// So the triple gathers under committed weight and cannot come apart under runnable weight. That is
+// not a threshold that needs re-tuning; it is a policy whose PREMISE has failed. SPREAD-10's cost
+// model is explicit that the thing co-placement buys back is "queue wait behind FOREIGN residents" on
+// SATURATED cores — 1-3 ms per frame, priced from [spread7] wd_mean under storm. On a core that owns
+// nothing there is no foreign resident and no queue: the wake lands on a core sitting in WFI and the
+// same wd_mean reads in the TENS of microseconds. Co-placement is buying back a cost that is not
+// being charged, and paying for it with three quarters of the machine.
+//
+// THIS IS THE THIRD ARC ON THIS TRACK WITH THE SAME SHAPE, and the pattern is now worth naming rather
+// than re-discovering: SPREAD-11's placement predicate declined equal-load moves (right under
+// contention, wrong when empty); the vug frame barrier's spin budget was denominated in YIELDS, so its
+// wall-clock coverage collapsed as the machine emptied and yields got cheaper (right under contention,
+// wrong when empty); and now co-placement. Each was tuned against a saturated four-core board, each
+// was correct there, and each misbehaves on an idle one. The common error is not the tuning — it is
+// that none of the three asked whether its own premise still held.
+//
+// THE FIX is to make co-placement conditional rather than to delete it. Under the six-window desktop
+// the bonus is a measured win and deleting it regresses the case the desktop actually ships. So:
+// co-placement applies EXACTLY as it does today whenever the machine has no spare core, and is
+// suspended — every term of it, at spawn and at rewake alike — whenever it does.
+//
+// "SPARE" IS COMMITTED-EMPTY, DISPATCH-FRESH AND KERNEL-COLD (the third half is SPREAD-14's), and
+// all three are load-bearing:
+//
+//   * COMMITTED, not runnable. `el0_active == 0` is the reading SPREAD-12's idle lane uses, and its
+//     own block explains why that set is not monotone: a core whose residents are all parked reads
+//     zero and rejoins the set once per frame. A predicate built on it would flip at frame rate and
+//     the triple would split and re-pack every few frames — precisely the flapping this arc has to
+//     bound. `EL0_RESIDENTS` moves only at spawn, at reap, and at a placement move, so `spare` is a
+//     slow variable by construction. SPREAD-12 wrote this remedy down in advance ("qualify the lane
+//     on COMMITTED residents rather than runnable ones, which is a different reading of 'empty'");
+//     this is that reading, applied to the policy rather than to the lane.
+//   * DISPATCH-FRESH (WEDGE-1's gate). A WEDGED core reads zero committed residents forever. Without
+//     the freshness half, one wedged core would hold co-placement suspended across the whole fleet
+//     permanently — a silent, machine-wide regression of the policy in exactly the failure this track
+//     is hunting. A core that has left the dispatch loop is not spare; it is broken.
+//   * KERNEL-COLD (SPREAD-14). Both halves above are EL0-shaped instruments, and a core saturated by
+//     PINNED KERNEL work is invisible to both: it owns no EL0 resident ever (`EL0_RESIDENTS` moves
+//     only on the EL0 spawn/reap/move paths), and it is dispatch-fresh BECAUSE of the very load in
+//     question — it goes round `run()` dispatching that work. With `UNAOS_VUGPAR=1` on the bench
+//     build line this is not hypothetical: `flush_parallel` spawns per-frame `vugband` tasks —
+//     kernel, `PRIO_NORMAL`, `steal_ok = false` — onto up to three helper cores on every full-screen
+//     present, and P65v2 measured the result (`c0=99 c1=68 c2=99 c3=63`, the 99s pure band load). Such
+//     a core read spare, suspending co-placement fleet-wide, and scored the floor `eff == 1` in the
+//     scan below, making a 99%-busy core the PREFERRED split target over staying home. The third
+//     half closes it with a signal that already exists and already means exactly the right thing:
+//     `el0_busy_pct` is documented as "what fraction of this core's time went to work an EL0 arrival
+//     would actually wait behind", and on a committed-EMPTY core every point of it is kernel-task
+//     burn (there is no EL0 resident to produce EL0 time). See `SPARE_KBUSY_PCT_MAX` for the bound
+//     and its derivation, and `kernel_busy_hot` for the instrument argument.
+//
+// WHAT BOUNDS THIS IS A CLOCK, NOT A STRUCTURE, and the distinction is the whole of this paragraph:
+// the first draft of this block claimed the suspension could not flap at all, and that claim is false
+// at the whiteboard. What IS true, and is what keeps the lane's firing count finite per unit of new
+// spare capacity:
+//
+//   * every split moves a task ONTO a core with zero committed residents; the credit moves before the
+//     enqueue, so that core leaves the spare set immediately and `spare` strictly decreases. Home
+//     never becomes spare from its own split — `spread_lane` requires `home_sibs > 0`, so home keeps
+//     a committed resident besides the mover.
+//   * no split ever increases `spare` directly.
+//
+// What is FALSE is the step the first draft built on top of that: that a RETURN move therefore needs
+// some OTHER task to have taken ownership of the destination, i.e. a real change in the committed
+// population. It does not. The split's own destination is what drives `spare` to zero; that re-arms
+// the sibling lane on the next ask; the sibling lane's move vacates the destination again, which
+// restores `spare`. The committed population is identical at both ends of the cycle. It is written
+// out here rather than left for a future reader to rediscover on the wire:
+//
+//   4 cores; window A owns `a1,a2,a3` (slot sA), window B owns `b1,b2,b3` (slot sB).
+//   S1  c0={a1,b3} c1={} c2={a2,a3} c3={b1,b2} ⇒ `spare == 1` (c1) ⇒ co-placement suspended.
+//       `a2` asks from c2: `home_act == 1`, `home_sibs == 1`, `home_eff == 3`. c1 is admitted by the
+//       spread lane ALONE (`eff == 1`) and wins ⇒ SPREAD13_SPLIT++, `a2` → c1.
+//   S2  c0={a1,b3} c1={a2} c2={a3} c3={b1,b2} ⇒ `spare == 0` ⇒ co-placement re-armed.
+//       `a2` asks from c1: `home_sibs == 0`, so the early-out declines to swallow the ask and the
+//       scan runs. c2 hosts `a3` ⇒ `toward`, and `act(c2) <= home_act` ⇒ the sibling lane admits ⇒
+//       SPREAD10_CO_MOVES++ and SPREAD13_REPACK++, `a2` → c2. That is S1 again.
+//
+// The precondition is not exotic — any core whose committed population is exactly one, beside a
+// sibling-hosting core reading `act <= home_act` — and the six-window desktop reaches it whenever a
+// window closes and leaves a core singly owned.
+//
+// SO THE HONEST BOUND IS THE PLACEMENT CLOCK: the SAME class of bound SPREAD-12 fell back on, not a
+// stronger one. The cycle's period is one placement ASK per participating task, and asking is exactly
+// what SPREAD-6's escapement rate-limits — at most once per `PLACE_REFRESH_MS` (250 ms) on the
+// refresh path, or once per `REWAKE_MIN_PARK_MS` (100 ms) on the wake path when the barrier park runs
+// long. Worst case that is 4-10 migrations per second per participating task: bounded below frame
+// rate and orders of magnitude below dispatch rate, which is why it ships as a known cost rather than
+// as a defect. SPREAD-6's latch-and-escapement is therefore NOT superseded here; it is the mechanism
+// doing the bounding.
+//
+// WHICH MAKES `split` AND `repack` CLIMBING TOGETHER AN EXPECTED READING, not a falsification — see
+// `SPREAD13_REPACK` for the full reading rule. What WOULD falsify the bound is either counter
+// climbing at DISPATCH rate, which means an escapement is not holding. If the metal read says the
+// churn is not paying for itself, the remedy is real hysteresis rather than a threshold: refuse the
+// sibling lane for a task whose last placement was a spread-lane split within N ms — SPREAD-6's
+// escapement applied to the LANE rather than to the ask. Deliberately not done here, because it adds
+// a second clock to tune ahead of any measurement saying the first is insufficient, and `split` /
+// `repack` on the wire exist precisely to produce that measurement.
+//
+// THE COST, stated plainly rather than hidden. A window that is IDLE (VUGPAUSE-2 parks its triple on
+// SYS_INPUT_WAIT for seconds) is indistinguishable here from one that is barrier-synchronised, so its
+// triple will also be spread, and its next wake pays a cross-core rendezvous it would not have paid.
+// That is bounded by the placement clock above rather than by a move count — the 2-cycle applies to
+// an idle window's triple exactly as it does to a busy one — and the split fleet is ALREADY spread
+// when the window becomes active, which is the good case; the population it costs is a window nobody
+// is measuring the frame rate of. Accepted knowingly.
+//
+// Explicit pins are untouched by all of this: `pick_cpu_slot` returns a non-`CPU_AUTO` request
+// verbatim before any of this arithmetic runs, and `rewake_place` is only ever reached from the EL0
+// wake and yield paths. Render and input stay single-core.
+
+/// SPREAD-14 — how much below-service-band busy a committed-empty core may carry and still count
+/// SPARE, in percent. At or above this it is "kernel-hot": something an EL0 arrival would wait
+/// behind is already burning the core, and on a committed-empty core that something can only be
+/// kernel work (pinned bands being the measured case).
+///
+/// 25 is derived from the lattice this predicate feeds, not tuned: the spread lane fires at margin 0
+/// on the claim that the destination is FREE, so "free" must mean the hidden load is below the
+/// smallest quantum the doubled-load lattice distinguishes — HALF a runnable resident, the
+/// co-residency bonus's own unit. One time-slicing `PRIO_NORMAL` peer takes half the core (50% of
+/// below-band time); half a resident is therefore 25%. A committed-empty core burning >= 25% on
+/// kernel work is carrying at least the half-resident that separates a genuinely spare core's
+/// `eff == 1` from a contended one, and the margin-0 claim would be dishonest for it.
+///
+/// The failure direction is asymmetric on purpose: a false "kernel-hot" merely keeps co-placement
+/// LIVE, which is the pre-SPREAD-13 behaviour and correct on a machine with no free core; a false
+/// "spare" is the P65v2 state — an EL0 task handed to a 99%-busy core that placement priced at zero.
+const SPARE_KBUSY_PCT_MAX: u32 = 25;
+
+/// SPREAD-14 — is this committed-empty core saturated by kernel work an EL0 arrival would wait
+/// behind? `el0_busy_pct` is the existing SPREAD-9 signal read for exactly its documented meaning;
+/// with `el0_committed(cpu) == 0` (the callers' contract) every point of it is attributable to
+/// kernel tasks below the service band — per-frame pinned `vugband` workers under `UNAOS_VUGPAR=1`
+/// being the population that motivated the check. The one imprecision is a reap mid-window: EL0 time
+/// from a just-reaped resident lingers in the ~250 ms window while committed already reads 0, which
+/// errs toward "not spare" for at most one window — the safe direction.
+///
+/// It can execute in the state it reports on, which is what lets its answer stand as evidence: the
+/// percent is folded by the reported core's own dispatch loop, and both callers test freshness
+/// FIRST, so a core that stopped folding is disqualified as stale before this stale percent could be
+/// read as either hot or cold. And it is a ~250 ms low-passed window, not an instantaneous flag —
+/// per-frame band tasks are transient (spawned, run, reaped inside one flush), so any "is a band
+/// here NOW" reading would flicker at frame rate, precisely the flapping `spare` is built to
+/// exclude; the windowed percent moves on the same timescale as the placement clock instead.
+///
+/// Lock-free (a handful of atomic loads + one division), per the `spare_cores` contract.
+#[inline]
+fn kernel_busy_hot(cpu: usize) -> bool {
+    ACCT[cpu].el0_busy_pct(CUR_PRIO[cpu].load(Ordering::Relaxed) >= PRIO_SERVICE)
+        >= SPARE_KBUSY_PCT_MAX
+}
+
+/// SPREAD-13 — online cores that own NO committed EL0 resident, are provably still dispatching, and
+/// (SPREAD-14) are not kernel-hot: the machine's spare capacity, in cores. Zero means every core is
+/// somebody's home — or is burning a resident's worth of kernel work — and co-placement's contention
+/// premise holds; nonzero means a vug's triple has somewhere to go that costs nobody anything, and
+/// the co-residency bonus is suspended for as long as that is true.
+///
+/// Returns `(spare, khot)`: `khot` counts the cores refused spare status ONLY by the kernel-heat
+/// test — committed-empty, dispatch-fresh cores that would have read spare before SPREAD-14. It is a
+/// gauge for the `[spread10]` wire (`spare_cores` discards it), computed by the same scan so the
+/// instrument cannot be elsewhere when the state it reports on occurs. On a build without `vugpar`
+/// it should read 0; nonzero there means some OTHER pinned kernel work is saturating an unowned
+/// core, which is worth seeing either way.
+///
+/// One CNTPCT read for the whole scan (`fold_age_from`), then a few relaxed-to-acquire loads per
+/// core (the heat test's loads are paid only by cores that pass the first two halves). No lock, no
+/// run-queue access — which is required at both call sites: `rewake_place` runs inside
+/// `make_ready`'s IRQ-masked section under WEDGE-4's rq() discipline, and `pick_cpu_slot` runs before
+/// the spawn's own enqueue.
+fn spare_scan() -> (usize, usize) {
+    let now = now_cyc();
+    let fresh = dispatch_fresh_cyc();
+    let mut spare = 0usize;
+    let mut khot = 0usize;
+    for cpu in 0..NUM_CPUS {
+        if ONLINE_MASK[cpu].load(Ordering::Acquire)
+            && el0_committed(cpu) == 0
+            && ACCT[cpu].fold_age_from(now) < fresh
+        {
+            if kernel_busy_hot(cpu) {
+                khot += 1;
+            } else {
+                spare += 1;
+            }
+        }
+    }
+    (spare, khot)
+}
+
+/// SPREAD-15 — the witness-only detail scan. `spare_scan` above stays byte-for-byte the hot-path
+/// version: it runs inside `make_ready`'s IRQ-masked section and before a spawn's enqueue, and its
+/// contract (no lock, no rq access, one CNTPCT read) is why co-placement can consult it at all.
+/// This variant is called from `spread10_witness` ONLY — the emit path, never a placement decision —
+/// so it can afford to carry the raw inputs out.
+///
+/// It exists because `spare=`/`khot=` are counts with no raw word beside them: from the line you
+/// could not tell WHICH core was refused (so it could not be crossed against `:: SCHED: load ::`),
+/// by how much it missed the bound (26% and 99% printed identically), or how many cores were
+/// excluded by FRESHNESS rather than heat — the scan computes `fold_age_from` and throws the result
+/// away, so a low `spare` was indistinguishable from "the cores were stale". That last one is the
+/// staleness tell this track requires beside a derived value.
+///
+/// Returns `(spare, khot, spare_mask, khot_mask, spare_max_pct, kstale)`.
+fn spare_scan_detail() -> (usize, usize, u32, u32, u32, usize) {
+    let now = now_cyc();
+    let fresh = dispatch_fresh_cyc();
+    let (mut spare, mut khot, mut kstale) = (0usize, 0usize, 0usize);
+    let (mut spare_mask, mut khot_mask, mut spare_max_pct) = (0u32, 0u32, 0u32);
+    for cpu in 0..NUM_CPUS {
+        if !ONLINE_MASK[cpu].load(Ordering::Acquire) || el0_committed(cpu) != 0 {
+            continue;
+        }
+        // Committed-empty but not provably dispatching: excluded BEFORE the heat test runs, so it
+        // is neither spare nor khot and must not be silently folded into either.
+        if ACCT[cpu].fold_age_from(now) >= fresh {
+            kstale += 1;
+            continue;
+        }
+        let pct = ACCT[cpu].el0_busy_pct(CUR_PRIO[cpu].load(Ordering::Relaxed) >= PRIO_SERVICE);
+        if pct >= SPARE_KBUSY_PCT_MAX {
+            khot += 1;
+            khot_mask |= 1 << cpu;
+        } else {
+            spare += 1;
+            spare_mask |= 1 << cpu;
+            // The decisive number for the "does the bound need hysteresis" question: how close the
+            // spare set actually sits to it. Dwell near the bound argues for a band; a bimodal
+            // distribution with nothing near it argues the dither is coming from somewhere else.
+            if pct > spare_max_pct {
+                spare_max_pct = pct;
+            }
+        }
+    }
+    (spare, khot, spare_mask, khot_mask, spare_max_pct, kstale)
+}
+
+/// SPREAD-13 — the predicate itself; see [`spare_scan`] for the full contract.
+#[inline]
+fn spare_cores() -> usize {
+    spare_scan().0
+}
+
+/// SPREAD-13 — triples the suspension actually BROKE UP: rewake/yield moves that ONLY the spread lane
+/// admitted (the margin, sibling and idle lanes all declined the same candidate). It is counted at the
+/// one place it is decidable, and it names the arc's CORE case — see "what it does not count" below
+/// for the part of the delta this attribution cannot reach.
+///
+/// It can execute in every state it reports on, which is the property this track requires of a
+/// counter rather than assumes: a slot task can leave a core hosting its committed siblings by exactly
+/// two routes, `make_ready`'s wake path and SPREAD-11's yield path, and BOTH funnel through
+/// `rewake_place`. There is no third route for the event to happen down while the instrument is
+/// elsewhere. And an admitted spare core always WINS its comparison: its `eff` (1) is strictly below
+/// home's (`2*home_act + 1 >= 3`, since `home_act` always includes the asking task), and the only
+/// `continue` between the lane test and the comparison is the freshness gate, which `rstale` counts.
+///
+/// WHAT IT DOES NOT COUNT, because a lane-ONLY counter's zero is evidence only against a population
+/// the reader can name. Under suspension a spread-lane candidate has zero COMMITTED residents, hence
+/// zero runnable ones (`el0_active = residents - parked`), hence `eff == 1`; and `bias_sibs == 0`
+/// gives `home_eff == 2*home_act + 1`. So `margin_lane` (`1 + 2*REWAKE_MARGIN <= home_eff`) and
+/// `idle_lane` (`act == 0 && home_act >= RECRUIT_MIN_HOME`) reduce to the SAME condition,
+/// `home_act >= 2`, and both co-admit there. `split` therefore counts the `home_act == 1` splits
+/// ONLY — which is the state this arc exists for, the co-resident triple taking turns, and the reason
+/// the field is worth having. A split at `home_act >= 2` is a real move that this arc's suspension
+/// enabled, and no lane-only counter records it (the same co-admission zeroes `SPREAD12_RECRUIT`; see
+/// its block); it lands in `[spread4] rewake` with every other move.
+///
+/// So the reading rule is narrower than "the lane never fired": `split == 0` with `spare > 0` means no
+/// `home_act == 1` split was made — either the lane was never offered that state, or the freshness
+/// gate refused the candidate (`rstale`, same line). It does NOT mean the suspension moved nothing.
+static SPREAD13_SPLIT: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-13 — the FLAP METER, and the reason it is a separate counter from `split` rather than a
+/// ratio the operator is asked to infer. A repack is the inverse event: a rewake/yield move that lands
+/// a slot task ON a core already hosting its committed siblings, FROM a core hosting none. It is
+/// counted on the raw sibling map with NO lane attribution, so it catches the sibling lane (the usual
+/// route, `spare == 0`) and the margin lane alike — under suspension a loaded home (`home_act == 3`)
+/// can carry a slot task onto a lightly loaded sibling-hosting core on load alone, with `spare > 0`.
+/// Both are repacks and neither is exempt; a repack is NOT evidence of `spare == 0` on its own.
+///
+/// Read it against `split` on the same line, and read both against the PLACEMENT CLOCK:
+///
+///   * `split` stepping a few times and `repack` flat — the triple came apart and stayed apart. The
+///     good read.
+///   * both climbing together at the rate of placement asks (single digits/s per participating task)
+///     — the reachable 2-cycle written out above `spare_cores`. EXPECTED and clock-bounded, not a
+///     falsification: the split's own destination drives `spare` to zero, the sibling lane returns the
+///     task, `spare` is restored, and nothing about the committed population changed. Judge it against
+///     the `:: SCHED: load ::` line — work still spread across cores means the churn is buying the
+///     spread it was meant to buy; back to one core at 98% beside three at 0% means it is not, and the
+///     next arc is the split hysteresis named above `spare_cores`.
+///   * either counter climbing at DISPATCH rate rather than at ask rate — SPREAD-6's escapement is not
+///     holding. That is the real falsification, and it falsifies the bound rather than the lane.
+///   * `repack` climbing with `split` flat — not this arc at all: SPREAD-10 gathering triples on a
+///     genuinely full machine, which is what it is for.
+///
+/// Same execution argument as `split`: a repack is a move, every move is decided here, and both call
+/// paths funnel through this function.
+static SPREAD13_REPACK: AtomicU64 = AtomicU64::new(0);
+
+// SPREAD-5 — A PER-FRAME PARK IS NOT A BACKGROUND→FOREGROUND TRANSITION.
+//
+// SPREAD-4 re-placed an EL0 task on EVERY wake. That was right about WHERE a long-parked task should
+// land and wrong about HOW OFTEN the question is worth asking, because in this fleet parking is not a
+// rare event: VUGPAUSE-2 parks the idle vug on `SYS_INPUT_WAIT` and VUG-PACE parks each worker on the
+// phase futex after 64 spin passes, so every vug task in the fleet parks and wakes ONCE PER FRAME. The
+// P75 metal wire is what that costs: `rewake=3256 and climbing` on a six-vug fleet — thousands of
+// placement decisions per minute, each one a potential migration, against a load signal that swings
+// within a frame. The measured symptoms are migration churn, not imbalance: per-window rates that
+// diverge 5x (win5 125/s, win1 23/s, win2/3 frozen), a stuttery mouse under the full fleet, and the
+// paradox that the fifth and sixth vug beat a lone vug's frame rate.
+//
+// The fix is to separate the two shapes of park that share one funnel:
+//
+//   * a MICRO-PARK — the frame-loop park. The task is coming back within a frame, onto a core whose
+//     load has not meaningfully changed, and it still owns its warm caches there. Nothing about the
+//     placement question has moved since the last time it was asked. Return it to `task.cpu`, which is
+//     exactly the pre-SPREAD-4 behaviour, and the one that was correct for this case all along.
+//   * a REAL TRANSITION — a window that was idle/background for a human interval and is now getting
+//     work again. Its core assignment IS stale, the load has genuinely moved, and the cache footprint
+//     is cold anyway, so the move is close to free. This is the case SPREAD-4 was built for, and it
+//     keeps SPREAD-4's machinery unchanged: the margin-2 threshold and the WEDGE-1 freshness guard.
+//
+// The discriminator is how long the task was parked, and nothing else — no notion of focus, no window
+// identity, no new coupling from the scheduler up into the compositor.
+
+/// SPREAD-5 — how long a task must have been parked for its wake to count as a real background→
+/// foreground transition rather than a frame-loop micro-park, in milliseconds.
+///
+/// 100 ms sits in a wide gap between the two populations, which is why the number is not delicate:
+///
+///   * a 60 fps frame is 16.7 ms and a 30 fps frame is 33 ms, so a frame-loop park is at most a few
+///     tens of milliseconds. 100 ms is THREE 30 fps frames — a task that parks and wakes on the frame
+///     clock cannot reach it even if the fleet drops to 10 fps under load.
+///   * VUGPAUSE-2's backstop wake is 256 ms, so a genuinely idle window — one parked with no input and
+///     no frame to draw — crosses 100 ms on its very first backstop period and every one after. The
+///     long-park path stays reachable for exactly the population it is meant to serve.
+///
+/// The gap is ~3x on the near side and ~2.5x on the far side, so neither population lands near the
+/// boundary. Erring low costs some churn back; erring high costs a slower correction after a focus
+/// change (one extra backstop period). 100 ms is comfortably inside both margins.
+const REWAKE_MIN_PARK_MS: u64 = 100;
+
+/// SPREAD-5 — [`REWAKE_MIN_PARK_MS`] in CNTPCT cycles. Frequency-derived like `load_window_cyc` (which
+/// is `CNTFRQ/4`), so the threshold is the same wall-clock span on the BCM2711's ~54 MHz counter and on
+/// QEMU virt's ~62.5 MHz one. `.max(1)` so a nonsense CNTFRQ can never make the threshold zero, which
+/// would silently restore SPREAD-4's re-place-on-every-wake behaviour.
+// SPREAD-6 (VUG-PACE-2) — THE PLACEMENT LATCH, AND ITS ESCAPEMENT.
+//
+// SPREAD-5's damping was right about churn and silently wrong about one population: a task that never
+// stops. A frame-paced vug parks and wakes every frame, each park tens of milliseconds, so under
+// SPREAD-5 the placement question is never asked again for as long as the vug keeps rendering — its
+// core assignment is frozen at whatever the LAST long-park wake (or the spawn) decided, under whatever
+// load existed at that instant. When the surrounding fleet then pauses or exits, the survivor keeps the
+// contention-era packing forever. The s1q wire is the measurement: win1 held 30.7-30.9/s across ten
+// straight rollups — two runnable EL0 tasks time-sharing c2 at 99% busy while three cores sat idle —
+// with [spread4] rewake frozen at 26 and short= climbing by hundreds per window. A stable rate that is
+// a pure function of stale packing is exactly Peter's "vug wants to go back to what it thinks its fps
+// is supposed to be even though it could run faster": the fps was never a target, it was a latch.
+//
+// The escapement: a micro-park wake MAY still ask the placement question, at most once per
+// `PLACE_REFRESH_MS` per task. That bounds the asking rate at ~4/s per task (a six-vug fleet is ~72
+// asks/s of lock-free arithmetic, against SPREAD-4's measured ~540 placement calls/s), and asking is
+// not moving: `rewake_place`'s margin-2 threshold and freshness gate still decide, so a balanced fleet
+// answers "stay" and the counters show it. What changes is only that a pile-up now comes apart within
+// a quarter second of the load leaving, instead of never.
+const PLACE_REFRESH_MS: u64 = 250;
+
+/// SPREAD-6 — [`PLACE_REFRESH_MS`] in CNTPCT cycles, frequency-derived exactly like
+/// [`rewake_min_park_cyc`] and for the same reason.
+#[inline]
+fn place_refresh_cyc() -> u64 {
+    let frq = load_window_cyc().saturating_mul(4); // == CNTFRQ_EL0, cached
+    (frq / 1000).saturating_mul(PLACE_REFRESH_MS).max(1)
+}
+
+#[inline]
+fn rewake_min_park_cyc() -> u64 {
+    let frq = load_window_cyc().saturating_mul(4); // == CNTFRQ_EL0, cached
+    (frq / 1000).saturating_mul(REWAKE_MIN_PARK_MS).max(1)
+}
+
+/// SPREAD-4 — choose the core a waking EL0 task should run on, given the core it was parked from.
+/// Returns `home` unless some other online core is at least `REWAKE_MARGIN` runnable residents
+/// lighter, in which case it returns the lightest such core (rolling busy fraction breaking ties —
+/// PULSE-5 made that number current rather than a lagging window, which is what makes it usable on a
+/// decision path at all).
+///
+/// Called with the waking task ALREADY un-parked from `home`'s parked count, so `home`'s figure is
+/// the load the task would be joining, not including itself — the comparison is apples to apples.
+///
+/// FRESHNESS GATE (WEDGE-1's, for WEDGE-1's reason). An EL0 task is `steal_ok = false`: whichever
+/// queue it lands on is the only core that will ever run it, so handing it to a core that has stopped
+/// going round its dispatch loop parks it forever. A candidate must therefore have folded a load span
+/// within `dispatch_fresh_cyc()`. This is deliberately conservative in the safe direction — declining
+/// every candidate simply leaves the task at home, which is the pre-SPREAD-4 behaviour.
+///
+/// Lock-free by construction (atomics and a handful of CNTPCT reads; no run-queue lock), which is
+/// required: `make_ready` calls this INSIDE the IRQ-masked wake path and the `rq()` discipline forbids
+/// nesting a second run-queue section under the push that follows. SPREAD-13's predicate is held to
+/// the same contract — `spare_cores` is two atomic loads per core over one CNTPCT read, and touches no
+/// queue.
+///
+/// SPREAD-10 — `slot` (0 = no bias) adds the co-residency term. Loads are compared in DOUBLED units
+/// (`2*act + 1`, the +1 a uniform shift so the half-resident bonus never underflows at act 0): a core
+/// hosting more same-slot siblings than home is half a resident lighter than it reads, home hosting a
+/// sibling is half a resident harder to leave, and a SECOND qualifying lane admits a sibling-bound
+/// move at margin 0 (candidate hosts strictly MORE siblings AND is no more loaded than home) — the
+/// lane that lets a scattered triple converge on a balanced fleet, where the margin lane would never
+/// move anyone. Rationale + weight tuning: the SPREAD-10 block above `SLOT_CORE_RES`.
+///
+/// SPREAD-12 adds a THIRD lane, for the case both of the others structurally cannot serve: a
+/// candidate with zero runnable EL0 residents, when home carries at least `RECRUIT_MIN_HOME`. The
+/// margin lane declines it because `REWAKE_MARGIN` is hysteresis calibrated for two loaded cores; the
+/// sibling lane declines it because an empty core hosts no siblings. Between them they left two cores
+/// of this machine at 0% while a third saturated. The lane carries no margin — a move onto a core
+/// reading zero cannot be handed back until that core is itself contended — and it sits AHEAD of the
+/// freshness gate, which is what keeps it from mistaking a wedged core for an idle one. Full
+/// argument, including what actually bounds the firing rate (`act == 0` is "nobody runnable here",
+/// not "empty core"): the SPREAD-12 block above `RECRUIT_MIN_HOME`.
+///
+/// SPREAD-13 makes SPREAD-10's whole contribution CONDITIONAL, and adds a FOURTH lane for the state
+/// that condition opens up. While the machine has a spare core (`spare_cores() > 0` — committed-empty,
+/// dispatch-fresh and, per SPREAD-14, kernel-cold) the co-residency terms are suspended entirely: `sibs` reads 0 everywhere, so
+/// the home retention bonus, the `toward` discount and the sibling lane all vanish and a slot task is
+/// weighed exactly as a slotless one. In their place, a candidate that owns NO committed EL0 resident
+/// qualifies whenever home hosts a committed sibling of ours — the state SPREAD-12's idle lane cannot
+/// reach, because a barrier-synchronised triple reads `home_act == 1` no matter how saturated its core
+/// is. When `spare_cores()` is zero every line below behaves exactly as it did before this arc. Why
+/// suspension rather than deletion, why "spare" is committed rather than runnable, and what bounds the
+/// flapping (a clock, not a structure — with the reachable 2-cycle written out): the SPREAD-13 block
+/// above `spare_cores`. Note also that suspension makes `best_idle_lane_only` unreachable, so
+/// `SPREAD12_RECRUIT` reads zero for as long as it lasts; that is documented at the counter.
+fn rewake_place(home: usize, slot: usize) -> usize {
+    if home >= NUM_CPUS {
+        return home;
+    }
+    let home_act = el0_active(home);
+    // SPREAD-10 — home's committed same-slot siblings, EXCLUDING the waking task itself (it is still
+    // committed at home; the transfer happens after the decision).
+    let home_sibs = slot_res(home, slot).saturating_sub(1);
+    // SPREAD-13 — does co-placement's contention premise still hold? Asked once per placement, and
+    // only for a task that HAS a slot: a slotless task carries no co-residency term to suspend, so the
+    // kernel-thread and `virt`/JC3 paths keep their exact former cost (not one extra atomic load) and
+    // their exact former behaviour.
+    let coplace = slot == 0 || spare_cores() == 0;
+    // SPREAD-4's cheap early-out, kept — unless the task is slot-scattered (home hosts none of its
+    // siblings), in which case the sibling lane must still get its scan: at low load a sibling-bound
+    // move is exactly the cheap, convergence-carrying case.
+    // SPREAD-12: the early-out must not outrank the recruitment lane, so it keys on the LOWER of the
+    // two thresholds. They are equal today; writing the coupling down keeps a later re-tuning of
+    // REWAKE_MARGIN from silently DELETING the idle lane rather than merely re-tuning the margin.
+    // SPREAD-13: nor may it outrank the spread lane, and here that matters MORE, because the state
+    // the spread lane exists for is precisely a `home_act == 1` reading on a saturated core — the
+    // co-resident triple taking turns. Under suspension a slot-CONCENTRATED task must therefore get
+    // its scan, which is the one case this clause used to swallow. Note the scattered case
+    // (`home_sibs == 0`) already scanned before this arc and still does, so no new scan is introduced
+    // anywhere except the one the lane needs.
+    if home_act < REWAKE_MARGIN.min(RECRUIT_MIN_HOME) && (slot == 0 || home_sibs > 0) && coplace {
+        return home; // home is not carrying enough to be worth correcting
+    }
+    // SPREAD-13 — the co-residency weight home and every candidate are scored with. Under suspension
+    // it is zero on both sides, so a slot task is weighed EXACTLY as a slotless one and no term of
+    // SPREAD-10 survives to bias the comparison. The RAW `home_sibs` is kept alive beside it because
+    // the spread lane and the two witness counters ask a different question — "is this a co-placed
+    // triple at all" — which is true whether or not the bonus is currently being applied.
+    let bias_sibs = if coplace { home_sibs } else { 0 };
+    // Doubled-unit effective load of home: the half-resident retention bonus when staying preserves
+    // an existing co-residency.
+    let home_eff = 2 * home_act + 1 - usize::from(bias_sibs > 0);
+    let fresh = dispatch_fresh_cyc();
+    let mut best = home;
+    let mut best_eff = home_eff;
+    let mut best_sibs = bias_sibs;
+    let mut best_pct = u32::MAX;
+    let mut best_sib_lane_only = false; // did the winner qualify ONLY via the sibling lane?
+    // SPREAD-12 — did the winner qualify ONLY via the idle lane? That is that arc's whole behavioural
+    // delta, and `recruit` on the wire is exactly this flag counted.
+    // SPREAD-13 — and it CANNOT BE SET while `coplace` is false: with `bias_sibs` zeroed, `idle_lane`
+    // and `margin_lane` both reduce to `home_act >= 2` for any candidate reading `act == 0`, so the
+    // exclusivity this flag demands never holds. `recruit` is a structural zero for the duration of a
+    // suspension; the derivation and the reading rule live at `SPREAD12_RECRUIT`. Left as-is rather
+    // than made subsumption-aware, because redefining `recruit` to mean "narrowest qualifying lane"
+    // would silently rewrite SPREAD-12's counter for the `spare == 0` regime too.
+    let mut best_idle_lane_only = false;
+    // SPREAD-13 — did the winner qualify ONLY via the spread lane? Same discipline, same reason:
+    // lane-only attribution is the only count that names THIS arc's delta rather than the fleet's
+    // churn.
+    let mut best_spread_lane_only = false;
+    for cpu in 0..NUM_CPUS {
+        if cpu == home || !ONLINE_MASK[cpu].load(Ordering::Acquire) {
+            continue;
+        }
+        let act = el0_active(cpu);
+        // SPREAD-13: `coplace` false zeroes this, which is what collapses `toward`, the discount and
+        // the sibling lane together — one suspension, not three.
+        let sibs = if coplace && slot != 0 { slot_res(cpu, slot) } else { 0 };
+        let toward = sibs > bias_sibs; // moving here strictly increases the triple's co-residency
+        let eff = 2 * act + 1 - usize::from(toward);
+        // Lane 1 (SPREAD-4, unchanged for slotless tasks): enough of a load win to pay for the move.
+        let margin_lane = eff + 2 * REWAKE_MARGIN <= home_eff;
+        // Lane 2 (SPREAD-10): sibling-bound, margin 0 — equal load allowed, heavier never.
+        let sib_lane = toward && act <= home_act;
+        // Lane 3 (SPREAD-12): the candidate is EMPTY and home is contended. No margin, because
+        // against zero there is no oscillation to damp; see the block above `RECRUIT_MIN_HOME` for
+        // the termination argument and for why this enforces SPREAD-10's weight rather than
+        // overruling it.
+        let idle_lane = act == 0 && home_act >= RECRUIT_MIN_HOME;
+        // Lane 4 (SPREAD-13): co-placement is suspended, home hosts a committed sibling of ours, and
+        // this candidate owns NOTHING. Both qualifiers are needed. Requiring a committed sibling at
+        // home is what keeps this a co-placement fix rather than a second, looser spreading policy —
+        // a task with no sibling at home is not being held by SPREAD-10 and is already lanes 1 and 3's
+        // business. Requiring the candidate to be committed-EMPTY (not merely idle-reading) is what
+        // makes the firing count monotone, since the move itself takes the core out of the spare set;
+        // `el0_active == 0` would flicker back once per frame and this lane would oscillate with it.
+        // SPREAD-14 adds a KERNEL-COLD refusal for this lane, placed AFTER the freshness gate below
+        // rather than in this conjunction — see the comment there for why the order is load-bearing.
+        let spread_lane = !coplace && home_sibs > 0 && el0_committed(cpu) == 0;
+        if !margin_lane && !sib_lane && !idle_lane && !spread_lane {
+            continue; // not enough of a win to pay for the move
+        }
+        if ACCT[cpu].fold_age_cyc() >= fresh {
+            // SPREAD-12: a core that reads EMPTY but is not provably dispatching is the wedge
+            // signature, not an idle core. Counted apart from the ordinary declines because this is
+            // the one rejection here that means something is wrong rather than something is fine.
+            // SPREAD-13 folds its own empty-core lane into the SAME counter, deliberately: the two
+            // lanes read "empty" differently (runnable vs committed) but a stale rejection means the
+            // identical thing under both, and splitting the field would make each half look quiet.
+            // It is also what keeps `split == 0` interpretable — without it, a spread lane firing
+            // into a wedged core would leave NO trace at all, which is the structural silence this
+            // track sends arcs back for.
+            if idle_lane || spread_lane {
+                SPREAD12_STALE.fetch_add(1, Ordering::Relaxed);
+            }
+            continue; // not provably dispatching — never hand it a task only it can run
+        }
+        // SPREAD-14 — the spread lane's candidate must also be KERNEL-COLD, the same third half
+        // `spare_cores` grew: a committed-empty core saturated by pinned kernel bands (`vugband`,
+        // per-frame under `UNAOS_VUGPAR=1`) reads `act == 0`, hence the floor `eff == 1`, and would
+        // WIN this scan outright (`1 < home_eff`) — handing a triple member to a 99%-busy core the
+        // lattice priced at zero. Refused HERE, after the freshness gate, and only when no other
+        // lane admits, and both restrictions are load-bearing:
+        //
+        //   * AFTER freshness, so the percent `kernel_busy_hot` reads is provably being folded by a
+        //     live dispatch loop — and so a WEDGED empty core still lands in `rstale` first, exactly
+        //     as before this arc. Tested in the lane conjunction instead, a core wedged mid-task
+        //     (whose live span pins `el0_busy_pct` at 100) would be refused as "hot" and leave no
+        //     trace at all — the structural silence this track sends arcs back for.
+        //   * SPREAD-LANE-ONLY, so this refusal is exactly this arc's delta and no other lane's
+        //     admission changes: margin- and idle-lane candidacies (which predate SPREAD-13 and do
+        //     not consult committed emptiness) keep their pre-SPREAD-14 behaviour verbatim.
+        //
+        // Among the candidates that remain, the existing `pct` tie-break below already orders
+        // equal-`eff` spares by the same signal, so a mildly-warm core (below the bound) still ranks
+        // behind a cold one.
+        if spread_lane && !margin_lane && !sib_lane && !idle_lane && kernel_busy_hot(cpu) {
+            // SPREAD-15: count it. The stale decline 23 lines above takes a counter for the stated
+            // reason that a decline leaving NO trace is "the structural silence this track sends
+            // arcs back for" — and this refusal, added later, left exactly that silence. `split == 0`
+            // does not cover it: `split` counts spread-lane ADMISSIONS, and a refusal is by
+            // definition not one, so whether this arc's delta has ever fired on metal was
+            // unanswerable from any capture. Same relaxed fetch_add, same rationale.
+            SPREAD14_HOTREF.fetch_add(1, Ordering::Relaxed);
+            continue; // committed-empty but burning a resident's worth of kernel work — not spare
+        }
+        // SPREAD-9: the tie-break percent excludes service-band time, exactly as in `pick_cpu` — a
+        // waking task must not decline the core the service band lives on for load that would
+        // preempt-and-vanish rather than compete (the rewake half of the dissolved reserve).
+        let pct = ACCT[cpu].el0_busy_pct(CUR_PRIO[cpu].load(Ordering::Relaxed) >= PRIO_SERVICE);
+        // Choose by effective load; ties fall to MORE siblings (all members of a slot then rank the
+        // same target core, which is what keeps concurrent asks pointing one way), then lower pct.
+        if eff < best_eff
+            || (eff == best_eff && (sibs > best_sibs || (sibs == best_sibs && pct < best_pct)))
+        {
+            best = cpu;
+            best_eff = eff;
+            best_sibs = sibs;
+            best_pct = pct;
+            best_sib_lane_only = sib_lane && !margin_lane;
+            best_idle_lane_only = idle_lane && !margin_lane && !sib_lane;
+            best_spread_lane_only = spread_lane && !margin_lane && !sib_lane && !idle_lane;
+        }
+    }
+    // SPREAD-10 — a move only the sibling lane admitted is a placement the bonus decided.
+    if best != home && best_sib_lane_only {
+        SPREAD10_CO_MOVES.fetch_add(1, Ordering::Relaxed);
+    }
+    // SPREAD-12 — a move only the idle lane admitted is a core that arc recruited that nothing else
+    // would have. Counted at the one place it is decidable. SPREAD-13: silent whenever `coplace` is
+    // false, per the flag's declaration above — this line does not execute in that regime, so its zero
+    // reports nothing about it.
+    if best != home && best_idle_lane_only {
+        SPREAD12_RECRUIT.fetch_add(1, Ordering::Relaxed);
+    }
+    // SPREAD-13 — a move only the spread lane admitted is a triple this arc took apart that nothing
+    // else could have: the margin lane could not (home reads `home_act == 1` while its core saturates),
+    // the sibling lane is suspended, and the idle lane wants `home_act >= RECRUIT_MIN_HOME`. That
+    // conjunction pins the counted population to `home_act == 1`; at `home_act >= 2` the margin and
+    // idle lanes co-admit and the move is not counted here (nor anywhere lane-attributed).
+    if best != home && best_spread_lane_only {
+        SPREAD13_SPLIT.fetch_add(1, Ordering::Relaxed);
+    }
+    // SPREAD-13 — the flap side, counted on the raw sibling map rather than the suspended one, and
+    // WITHOUT any lane attribution: the question is not which rule re-gathered the triple but whether
+    // it got re-gathered at all. `slot_res(best, ..)` is read before the caller moves the credits, so
+    // it is the destination's siblings excluding this task — the same exclusion `home_sibs` makes.
+    if best != home && slot != 0 && home_sibs == 0 && slot_res(best, slot) > 0 {
+        SPREAD13_REPACK.fetch_add(1, Ordering::Relaxed);
+    }
+    best
+}
+
+/// SPREAD-4 — wakes that moved an EL0 task to a lighter core, and wakes that left it where it was.
+/// The ratio is the arc's own honesty check: a fleet in balance should be nearly all `stay`.
+///
+/// SPREAD-5 narrows the population both counters describe: they now count only wakes that ASKED the
+/// placement question (parked longer than [`REWAKE_MIN_PARK_MS`]). `rewake` should therefore climb by
+/// roughly one per real focus change rather than once per frame per task.
+static SPREAD4_REWAKE: AtomicU64 = AtomicU64::new(0);
+/// SPREAD-11 — yield-path slot re-placements (the P94 idle-desktop livelock fix). Counts moves made
+/// at the READY re-enqueue (yield/preempt) refresh, the path that never passes `make_ready` and so
+/// never saw SPREAD-10's co-placement at all.
+static SPREAD11_YIELD_MOVES: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-12 — idle cores RECRUITED: placements that ONLY the empty-core lane admitted (the margin
+/// and sibling lanes both declined the same candidate). Counted at `rewake_place`, so it covers the
+/// wake path and SPREAD-11's yield path alike. The expected metal signature on the one-window desktop
+/// is a small step followed by flat, with the `:: SCHED: load ::` line on the same wire showing the
+/// 0%-cores taking work: on a continuously-runnable population the termination argument above
+/// `RECRUIT_MIN_HOME` bounds the step at one per initially-empty core. A SLOW climb after that does
+/// not falsify the lane — it is the park-flicker case that same argument admits (a core whose
+/// residents are all parked reads zero again), bounded by the placement clocks at single-digit moves
+/// per second per task, and it is read against the load line: still spread = churn that is paying
+/// for itself, back to a 0%-beside-98% split = churn that is not, and the answer is to qualify the
+/// lane on committed residents. A climb at dispatch rate would mean the clocks are not holding, and
+/// that is a bug in this arc.
+///
+/// SPREAD-13 — READ THIS FIELD ONLY AGAINST `spare == 0`. While `spare > 0` it is a STRUCTURAL ZERO
+/// and its silence is not evidence of anything. The arithmetic, written out because this track does
+/// not let a counter's zero go unexplained: suspension forces `bias_sibs = 0`, so
+/// `home_eff = 2*home_act + 1`, and a candidate reading `act == 0` computes `eff = 1`. Then
+/// `margin_lane` (`1 + 2*REWAKE_MARGIN <= home_eff`) and `idle_lane`
+/// (`act == 0 && home_act >= RECRUIT_MIN_HOME`) are the same condition, `home_act >= 2`; so
+/// `idle_lane` IMPLIES `margin_lane`, and `best_idle_lane_only` — which demands exclusivity — is
+/// identically false. The lane itself is unchanged and still admits; it is the ATTRIBUTION that does
+/// not survive, and the move lands unattributed in `[spread4] rewake`. (It was always the retention
+/// bonus that made this field reachable at all: even before SPREAD-13 the same collapse held whenever
+/// `home_sibs == 0`, so `recruit` only ever fired with `home_sibs > 0` and `home_act` exactly
+/// `RECRUIT_MIN_HOME`. Zeroing `bias_sibs` removes the one reachable case.)
+///
+/// This matters concretely rather than pedantically: PA3 printed `recruit=81` from a machine whose
+/// state reads `spare > 0` under this arc, so the SAME bench boot now prints `recruit=0`. That zero
+/// means "the attribution is unavailable in this regime" — NOT "recruitment stopped being needed" and
+/// NOT "the idle lane stopped firing". Whether the machine is spreading while suspended is read from
+/// `split` and the `:: SCHED: load ::` line, not from this field.
+static SPREAD12_RECRUIT: AtomicU64 = AtomicU64::new(0);
+
+// SPREAD-12 — THERE IS DELIBERATELY NO "OFFERED AND DECLINED" COUNTER HERE, and the reason is worth
+// keeping, because the first cut of this arc shipped one and it could not fire in the state it
+// claimed to report. It bumped on `best == home` while some candidate had read `act == 0`. But
+// `best_eff` starts at `home_eff` and only ever decreases, and it only decreases when `best` moves
+// off home; the lane requires `home_act >= 2`, so `home_eff >= 4`, while ANY candidate with
+// `act == 0` computes `eff <= 1`. An empty candidate that REACHES the comparison therefore always
+// wins it. The only `continue` between the lane test and the comparison is the freshness gate — so
+// "an empty core was on offer and the task stayed" implies every empty candidate was stale-rejected,
+// which is precisely what `rstale` already counted in the same call. Its zero was structural, and
+// its doc told the operator to read that zero as convergence: the W4-A shape, an instrument that
+// cannot execute in the state it reports on. `recruit` (took one) and `rstale` (could not trust one)
+// cover every reachable outcome of the lane between them.
+
+/// SPREAD-12 — empty cores rejected by the freshness gate: the candidate read zero runnable EL0
+/// residents but had not folded a load span within `dispatch_fresh_cyc()`, so it is not provably
+/// going round its dispatch loop. On a healthy fleet this stays at zero, because an idle core inside
+/// `run()` folds a span every pass. It is deliberately split out from the ordinary declines because
+/// on this track it is not a performance number at all: an EL0 task is `steal_ok = false`, so a core
+/// that looks empty and is not dispatching is exactly the wedge SPIN-1..8 is hunting, and this
+/// counter is the placement path sighting it from the outside. Per the block above, it is also the
+/// ONLY way a contended task can be offered an empty core and still stay, so it carries that reading
+/// too — there is no second counter for it.
+///
+/// SPREAD-13 widened the population without changing the meaning: this now also counts SPREAD-13's
+/// spread-lane rejections, where "empty" is read as zero COMMITTED residents rather than zero runnable
+/// ones. Two lanes, two readings of empty, one verdict — the core was not dispatching and was not
+/// given work only it could run. Keeping them in one field is what preserves the reading for BOTH
+/// arcs: `recruit == 0` and `split == 0` are each interpretable only against a `rstale` that would
+/// have caught the refusals, and two half-populated fields would have made each lane look quiet for
+/// the other's reason.
+static SPREAD12_STALE: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-15 — times the SPREAD-14 kernel-heat half REFUSED a spread-lane candidate. This arc's
+/// delta had no counter, so `hotref == 0` vs "never reached the conjunction" were indistinguishable
+/// on the wire; the refusal's own precondition was reachable in 9 of 46 PA6 windows and 11 of 112
+/// PA5c windows, and whether it ever fired in any of them could not be read.
+static SPREAD14_HOTREF: AtomicU64 = AtomicU64::new(0);
+
+static SPREAD4_STAY: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-5 — EL0 wakes that skipped placement entirely because the park was a frame-loop micro-park.
+/// This is the damping made visible: it is the count of `rewake_place` calls SPREAD-4 would have made
+/// and SPREAD-5 does not. On a running fleet it should dwarf `rewake` + `stay` by orders of magnitude;
+/// if it does not, the fleet is not parking per frame and this arc's premise needs re-checking.
+static SPREAD5_SHORT_STAY: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-6 — micro-park wakes that asked the placement question anyway because the last ask was more
+/// than [`PLACE_REFRESH_MS`] ago. Climbs at ~4/s per continuously-running EL0 task; the OUTCOME of each
+/// ask still lands in `rewake`/`stay`, so `refresh` large with `rewake` flat is a fleet that keeps
+/// asking and keeps being told it is already in the right place — the escapement idling, as designed.
+static SPREAD6_REFRESH: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-7 — EL0 wakes that landed in the TICK-QUANTIZED arm of the wake path: the woken task is an
+/// equal-or-higher-band peer (below the service band) of the task running on its target core, so
+/// nothing preempts for it — it waits in the run queue for the incumbent's next dispatch boundary,
+/// up to a full quantum (~12 ms) before SPREAD-8's same-band trim (see `preempt_hint`'s SPREAD-7 and
+/// SPREAD-8 sections). On a frame-barrier fleet this climbs at roughly the fleet's park rate;
+/// `quant` flat while the fleet stutters means wakes are landing on idle cores or being absorbed by
+/// the spin windows, and the ceiling is elsewhere.
+static SPREAD7_QUANT: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-8 — equal-band EL0 wakes that TRIMMED the incumbent's quantum (the policy SPREAD-7's
+/// diagnosis proposed, now implemented in `preempt_hint`'s same-band arm). Counted only when the
+/// `swap(1)` actually LOWERED the countdown (previous value > 1) — a wake landing when the incumbent
+/// was already on its final tick changed nothing and is not counted, so `trim <= quant` by
+/// construction and the gap is the already-about-to-yield population. On a storm this climbs at
+/// roughly the fleet's park rate, and `wd_mean` on the same line drops from half-quantum scale
+/// (~6000 us) to at most one tick (~4000 us worst, less typically). The counter moves under QEMU
+/// too (`dispatch_next` stores `QUANTUM_TICKS` on every dispatch, so the swap reads > 1), but with
+/// no live timer IRQ the shortened countdown is never consumed — the latency effect is metal-only,
+/// as with every preemption behaviour in this module.
+static SPREAD8_TRIM: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-7 — wake-to-dispatch latency for EL0 wakes: CNTPCT cycles from `make_ready`'s stamp to the
+/// `dispatch_next` that first runs the woken task, summed / counted / max'd. This prices the
+/// quantization `SPREAD7_QUANT` counts: on an idle fleet `wd_mean` is IPI-scale (microseconds); on a
+/// saturated one it converges on the half-quantum (~6 ms) plus queue depth. Cumulative, lock-free,
+/// owner-core writes only for SUM/N (dispatch), MAX via `fetch_max`.
+static SPREAD7_WD_SUM: AtomicU64 = AtomicU64::new(0);
+static SPREAD7_WD_N: AtomicU64 = AtomicU64::new(0);
+static SPREAD7_WD_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-9 — the pending IPI-receipt preemption, per CPU: the highest service BAND whose wake is
+/// queued on this core and found a LOWER-band incumbent running (0 = none pending; every real band
+/// is `>= 1`, and only service bands `>= PRIO_SERVICE` are ever stored). Set by `preempt_hint`'s
+/// service arm BEFORE `make_ready` sends the wake SGI (so the flag is visible by the time the SGI
+/// lands), consumed exactly once (`swap(0)`) by `ipi_preempt` on the target core — one preemption
+/// per IPI, by construction. `fetch_max` rather than `store` so two concurrent wakes of different
+/// service bands leave the higher one pending.
+static KICK_BAND: [AtomicU8; NUM_CPUS] = [const { AtomicU8::new(0) }; NUM_CPUS];
+
+/// SPREAD-9 — IPI-receipt preemptions performed: `ipi_preempt` found a pending kick band above the
+/// running task's and dispatched from the IRQ-exit path instead of returning to the incumbent. On
+/// metal under fleet load this climbs with the service wake rate; the wakes it serves are the ones
+/// whose `svc_lat` collapses from tick scale to IPI scale.
+static SPREAD9_KICK: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-9 — service-band wake-to-dispatch latency (CNTPCT cycles): `make_ready` stamp to first
+/// dispatch, for wakes of BASE priority `>= PRIO_SERVICE` (the population `preempt_hint`'s service
+/// arm and `ipi_preempt` serve). Split from the SPREAD-7 aggregates so the EL0 `wake2disp` pricing
+/// keeps its exact population and the service band's number is readable on its own: this is the
+/// figure that should sit at IPI scale (mean < 100 us) once services preempt at IPI receipt.
+static SPREAD9_SVC_SUM: AtomicU64 = AtomicU64::new(0);
+static SPREAD9_SVC_N: AtomicU64 = AtomicU64::new(0);
+static SPREAD9_SVC_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// SPREAD-4 — rate limit for the per-event `[spread4] rewake` trace, on the same terms as
+/// `[smpbal] steal`: name the first few moves, then go quiet so a steadily-rebalancing desktop cannot
+/// flood the serial log. The cumulative counters in `spread4_witness` carry the steady state.
+#[cfg(feature = "pi")]
+const SPREAD4_LOG_MAX: u32 = 16;
+#[cfg(feature = "pi")]
+static SPREAD4_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+
 /// Register `cpu` as an online, scheduling core — a candidate for `CPU_AUTO` load-balanced placement.
 /// Called by the BSP as it releases the APs (`start_aps`); idempotent, introspection-only bookkeeping
 /// (no effect on any existing caller-pinned spawn, so boot behavior is byte-identical without CPU_AUTO).
@@ -910,29 +2617,105 @@ pub fn mark_online(cpu: usize) {
 }
 
 /// Resolve a requested `cpu` to a concrete core. An explicit index passes through verbatim (the
-/// no-migrate pin contract). `CPU_AUTO` selects the least-loaded online core: minimum ready-queue
-/// depth first, then the lower rolling-window busy fraction, then a rotating cursor for round-robin
-/// spread on ties. Falls back to core 0 only if no core is online yet (early BSP staging).
+/// no-migrate pin contract). `CPU_AUTO` selects the least-loaded online core, keyed in this order:
+///
+///   1. SPREAD-3/SPREAD-4 — fewest RUNNABLE EL0 residents (`el0_active` = committed minus parked).
+///      This is the only signal that is already true at the instant of the decision, so N spawns in a
+///      burst spread instead of all agreeing on one core. It is the primary key precisely because a
+///      running compute-bound EL0 task is invisible to both keys below. SPREAD-4 subtracts the PARKED
+///      residents: a vug blocked on its input futex owes its core nothing, and counting it kept
+///      placement steering around load that was not there (see `EL0_PARKED`).
+///   2. minimum ready-queue DEPTH — the classic "will this task wait" signal, still the right
+///      discriminator between cores carrying equal resident counts.
+///   3. lower rolling-window busy fraction, then
+///   4. a rotating cursor, so cores that tie on every measurable signal fill round-robin.
+///
+/// Keys 2-4 are SCHED-3's chain, unchanged; SPREAD-3 only puts committed load ahead of them. When no
+/// EL0 task exists (the `virt`/JC3 kernel-thread builds, and the placement-spread witness that runs
+/// at the top of `start_aps`) every core reads 0 residents, key 1 is a universal tie, and placement
+/// is byte-identical to SCHED-3. Falls back to core 0 only if no core is online yet (early BSP staging).
 fn pick_cpu(requested: usize) -> usize {
+    pick_cpu_slot(requested, 0)
+}
+
+/// SPREAD-10 — `pick_cpu` with the co-residency term. `slot` 0 (every kernel spawn, the shared
+/// window) reduces EXACTLY to the SCHED-3/SPREAD-9 key chain: the primary key is compared in doubled
+/// units (`2*res + 1`), which is order-isomorphic to `res` when no bonus applies. A nonzero slot
+/// discounts a core already holding same-slot siblings by half a resident — enough to win every
+/// runnable-resident tie (ahead of the depth/pct tie-breaks), never enough to beat a core with one
+/// fewer runnable resident. Weight rationale: the SPREAD-10 block above `SLOT_CORE_RES`.
+///
+/// SPREAD-13 — the bonus is suspended here on the same terms as in `rewake_place`, and for a reason
+/// specific to this site. The half-resident weight was calibrated so it "can never beat a core with one
+/// FEWER runnable resident", and against a core with one fewer RUNNABLE resident it indeed cannot. But
+/// the sibling core's own count is runnable too, so a core hosting a slot's PARKED tasks reads
+/// `res == 0` and scores `2*0 + 1 - 1 = 0` — below a genuinely spare core's 1. The one state in which
+/// the spawn bonus outranks an empty core is therefore exactly the state in which it must not: a worker
+/// being spawned onto the core where its parked siblings live, while a core owning nothing sits idle.
+/// Suspending it costs nothing anywhere else, because whenever the sibling core has even one runnable
+/// resident the plain key chain already sends the spawn to the emptier core.
+fn pick_cpu_slot(requested: usize, slot: usize) -> usize {
     if requested != CPU_AUTO {
-        return requested;
+        return requested; // the no-migrate pin contract: render/input stay exactly where they are put
     }
+    // SPREAD-13 — asked only for a slotted spawn, so the kernel-thread path (`pick_cpu`) and the
+    // `virt`/JC3 builds pay nothing and behave identically to before this arc.
+    let coplace = slot == 0 || spare_cores() == 0;
     let rot = AUTO_ROTATE.fetch_add(1, Ordering::Relaxed);
     let mut best: Option<usize> = None;
+    let mut best_eff = usize::MAX;
     let mut best_depth = usize::MAX;
     let mut best_pct = u32::MAX;
+    // SPREAD-10 — the bonus-free winner, tracked in parallel so `co_moves` can count exactly the
+    // spawns the bonus DECIDED (winner differs from what the plain key chain would have picked).
+    let mut plain: Option<usize> = None;
+    let mut plain_res = usize::MAX;
+    let mut plain_depth = usize::MAX;
+    let mut plain_pct = u32::MAX;
     for i in 0..NUM_CPUS {
-        let cpu = (rot + i) % NUM_CPUS; // rotating start => equal-load cores fill round-robin
+        let cpu = (rot + i) % NUM_CPUS; // rotating start => fully-tied cores fill round-robin
         if !ONLINE_MASK[cpu].load(Ordering::Acquire) {
             continue;
         }
-        let depth = RUN_QUEUES[cpu].lock().len();
-        let pct = ACCT[cpu].busy_pct();
-        if depth < best_depth || (depth == best_depth && pct < best_pct) {
+        let res = el0_active(cpu); // SPREAD-4: runnable residents, not merely committed ones
+        // SPREAD-10: half-resident discount for a core already hosting this task's siblings; the +1
+        // shift keeps the subtraction above zero at res 0. SPREAD-13: not while a core owns nothing.
+        let eff = 2 * res + 1 - usize::from(coplace && slot_res(cpu, slot) > 0);
+        // SPREAD-9 — the dissolved service-core reserve: keys 2 and 3 now weigh only work that
+        // actually COMPETES with a new arrival. A queued/running service-band task preempts at IPI
+        // receipt, runs a micro pass and blocks — it is latency-invisible to a co-resident — but the
+        // full depth and the service-inclusive busy percent made whichever core currently hosted the
+        // band read loaded, so placement steered the fleet around a hole that followed the services
+        // (the ~40%-busy core beside three 99% ones under an 18-task storm). Below-band depth and
+        // the service-subtracted percent are the same signals minus exactly that time; the service
+        // tasks themselves keep their pins and their placement freedom untouched.
+        let depth = rq(cpu).len_below_band();
+        let pct = ACCT[cpu].el0_busy_pct(CUR_PRIO[cpu].load(Ordering::Relaxed) >= PRIO_SERVICE);
+        let better = eff < best_eff
+            || (eff == best_eff
+                && (depth < best_depth || (depth == best_depth && pct < best_pct)));
+        if better {
             best = Some(cpu);
+            best_eff = eff;
             best_depth = depth;
             best_pct = pct;
         }
+        let plain_better = res < plain_res
+            || (res == plain_res
+                && (depth < plain_depth || (depth == plain_depth && pct < plain_pct)));
+        if plain_better {
+            plain = Some(cpu);
+            plain_res = res;
+            plain_depth = depth;
+            plain_pct = pct;
+        }
+    }
+    // SPREAD-10 — a spawn steered off the plain winner is a placement the bonus decided. SPREAD-13
+    // needs no arm of its own here: with the bonus suspended `eff` and `res` order the cores
+    // identically, so `best == plain` by construction and this simply stops counting — which is the
+    // honest reading, since under suspension there are no bonus-decided spawns to count.
+    if slot != 0 && best.is_some() && best != plain {
+        SPREAD10_CO_MOVES.fetch_add(1, Ordering::Relaxed);
     }
     best.unwrap_or(0)
 }
@@ -971,8 +2754,11 @@ fn spawn_inner(
         // SMP-BAL: a load-balanced (CPU_AUTO) kernel task has no core affinity → steal-eligible. A task
         // spawned onto an explicit core is pinned there (no-migrate), so stealing never touches it.
         steal_ok: requested_cpu == CPU_AUTO,
+        park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
+        place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
+        wake_cyc: 0, // SPREAD-7: never woken yet; `make_ready` stamps it
     });
-    RUN_QUEUES[cpu].lock().push(task);
+    rq(cpu).push(task);
     // PI-SCHED-1 — placement witness. The scheduler PINS a task to the caller-chosen core and never
     // migrates it (see `Task.cpu` / `make_ready`), so the placement is decided entirely at the spawn
     // site; this line makes that decision auditable (the probe's core deliverable). Gated behind the
@@ -1063,7 +2849,9 @@ fn spawn_user_inner(
     user_ttbr0: u64,
     requested_cpu: usize,
 ) -> u64 {
-    let cpu = pick_cpu(requested_cpu);
+    // SPREAD-10: bias toward the core(s) already holding this address space's tasks. For a fresh
+    // slot the count is zero everywhere and this is byte-identical to the plain key chain.
+    let cpu = pick_cpu_slot(requested_cpu, slot_of(user_ttbr0));
     assert!(cpu < NUM_CPUS, "spawn_user: cpu out of range");
     // BG-SPREAD witness aid — record the decision so the caller can read back where its task landed.
     LAST_USER_PLACEMENT.store(cpu, Ordering::Release);
@@ -1087,20 +2875,35 @@ fn spawn_user_inner(
         user_ttbr0,
         // SMP-BAL: EL0/slot tasks carry per-core TTBR0/ASID state — always pinned, never stolen.
         steal_ok: false,
+        park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
+        place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
+        wake_cyc: 0, // SPREAD-7: never woken yet; `make_ready` stamps it
     });
     // SKILL-1: count this task against its address-space slot BEFORE the push, so it is countable before
     // it can ever be dispatched (and thus before any ASID-scoped kill could observe a short count).
     asid_thread_enter(user_ttbr0);
-    RUN_QUEUES[cpu].lock().push(task);
+    // SPREAD-3: commit this EL0 resident to its core BEFORE the enqueue, so the very next `pick_cpu`
+    // already sees it. PINNED EL0 spawns are counted too — the pin is honored verbatim (placement is
+    // untouched), but the residents it parks on that core are real committed load and a later
+    // `CPU_AUTO` placement must see them.
+    let residents = el0_resident_enter(cpu);
+    slot_res_enter(cpu, user_ttbr0); // SPREAD-10: same instant, same core — the sibling map stays true
+    rq(cpu).push(task);
     // PI-SCHED-1 — placement witness for EL0 tasks (the vug/midden GUI-app loads land here — the
-    // "all vug load on core 2" sighting). Same `pi`-gating + rationale as `spawn_inner`.
+    // "all vug load on core 2" sighting). Same `pi`-gating + rationale as `spawn_inner`. SPREAD-3 folds
+    // the counted value into the existing `policy:` field (shape unchanged, still one parseable line)
+    // so the next attended boot can check the accounting against the observed spread. `residents` is
+    // INCLUSIVE of this task: it is the committed count on that core after this placement.
     #[cfg(feature = "pi")]
     serial_println!(
-        ":: SCHED: task '{}' -> core {} (policy: {} EL0, no-migrate) ::",
+        ":: SCHED: task '{}' -> core {} (policy: {} EL0 residents={}, no-migrate) ::",
         name,
         cpu,
-        if requested_cpu == CPU_AUTO { "load-balanced" } else { "caller-pinned" }
+        if requested_cpu == CPU_AUTO { "load-balanced" } else { "caller-pinned" },
+        residents
     );
+    #[cfg(not(feature = "pi"))]
+    let _ = residents;
     poke_cpu(cpu);
     id
 }
@@ -1129,7 +2932,9 @@ pub fn spawn_user_thread(
     user_ttbr0: u64,
     requested_cpu: usize,
 ) -> JoinHandle {
-    let cpu = pick_cpu(requested_cpu);
+    // SPREAD-10: THE co-placement site — a worker spawns under its parent's slot root, so the bias
+    // lands it beside the parent (or its earlier-spawned sibling) whenever the load terms tie.
+    let cpu = pick_cpu_slot(requested_cpu, slot_of(user_ttbr0));
     assert!(cpu < NUM_CPUS, "spawn_user_thread: cpu out of range");
     let done = Arc::new(Semaphore::new(0));
     done.init(); // reserve the waiter list BEFORE the thread can run + post (alloc-free park)
@@ -1153,17 +2958,27 @@ pub fn spawn_user_thread(
         user_ttbr0,
         // SMP-BAL: shared-ASID EL0 thread — per-core address-space state, always pinned.
         steal_ok: false,
+        park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
+        place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
+        wake_cyc: 0, // SPREAD-7: never woken yet; `make_ready` stamps it
     });
     // SKILL-1: this is the path that MAKES a slot multi-threaded, so it is the one the ASID-scoped kill
     // exists for — count the sibling before it can be dispatched.
     asid_thread_enter(user_ttbr0);
-    RUN_QUEUES[cpu].lock().push(task);
+    // SPREAD-3: a shared-ASID EL0 thread burns a core exactly like a slot task does — count it as a
+    // committed resident on the same terms (before the enqueue; released on its `exit()`).
+    let residents = el0_resident_enter(cpu);
+    slot_res_enter(cpu, user_ttbr0); // SPREAD-10: same instant, same core — the sibling map stays true
+    rq(cpu).push(task);
     #[cfg(feature = "pi")]
     serial_println!(
-        ":: SCHED: thread '{}' -> core {} (ELF-2 shared-ASID EL0 thread, no-migrate) ::",
+        ":: SCHED: thread '{}' -> core {} (ELF-2 shared-ASID EL0 thread residents={}, no-migrate) ::",
         name,
-        cpu
+        cpu,
+        residents
     );
+    #[cfg(not(feature = "pi"))]
+    let _ = residents;
     poke_cpu(cpu);
     JoinHandle { done, id }
 }
@@ -1199,7 +3014,7 @@ pub fn other_online_cpu(not: usize) -> usize {
         if c == not || !ONLINE_MASK[c].load(Ordering::Acquire) {
             continue;
         }
-        let depth = RUN_QUEUES[c].lock().len();
+        let depth = rq(c).len();
         if depth < best_depth {
             best_depth = depth;
             best = Some(c);
@@ -1296,15 +3111,218 @@ fn poke_cpu(target: usize) {
     }
 }
 
-/// Mark a parked/just-woken task READY, push it onto its PINNED CPU's run queue, and poke that CPU.
-/// Used by the sleeper drain (same CPU) and, from M4b, `Semaphore::post` (cross-CPU wake). The task
-/// always returns to `task.cpu`, so its per-CPU (TPIDR_EL2) view stays correct on resume — tasks do
-/// not migrate. Caller runs with IRQ masked.
-fn make_ready(task: Box<Task>) {
-    let target = task.cpu as usize;
+/// SCHED-PRIO — shorten the running task's quantum on `target` when a HIGHER-band task has just been
+/// made ready there, so the band's ordering preference actually turns into latency.
+///
+/// ### Why a hint and not a switch
+/// Strict priority is applied at the DISPATCH BOUNDARY (`pop_highest`), which means a woken service
+/// task waits for the running task to reach one: a yield, a block, or quantum expiry. With
+/// `QUANTUM_TICKS = 3` at ~4 ms/tick, an EL0 vug that never yields (they spin) can hold the core for
+/// up to ~12 ms past the wake — per wake, on the cursor's path. Trimming the countdown to ONE tick
+/// caps that at ~4 ms without any cross-core register surgery, without an extra IPI, and without
+/// touching the switch path.
+///
+/// ### Why it is safe
+///   * It only ever LOWERS a countdown, and never below 1 — the interrupted task always gets at least
+///     one more tick, so there is no way to livelock a task out of making progress, and no way to
+///     preempt one that is mid-anything: `timer_preempt` is the sole consumer and it already runs
+///     only at a legitimate boundary (post-EOI, with the run-queue guard's `IN_RQ_SECTION` tripwire
+///     watching for a section breach).
+///   * The two atomics are a cross-core relaxed load (`CUR_PRIO`) and a cross-core relaxed store
+///     (`quantum`), both racy by construction and both benign: the worst outcome of losing the race
+///     with the owning core's own `quantum.store(QUANTUM_TICKS)` is that this wake does not get its
+///     trim and the service task waits the ordinary quantum — exactly the pre-arc behaviour.
+///   * `CUR_PRIO` is the ONLY thing read cross-core. `SCHED[target].current` is deliberately not
+///     touched: it is a raw pointer to a Box the owning core can free at any instant.
+///   * On QEMU raspi4b there is no live timer IRQ, so there is no quantum countdown and this is inert
+///     — the gate exercises the counter, and the trim itself is a metal-only effect (as with every
+///     other preemption behaviour in this module).
+/// ### SPREAD-7 — the same-band quantization made countable (the ~35 fps ceiling)
+/// SCHED-PRIO built the trim for the service band only, and P79's storm-6 wire (pi4-r23s1r) showed
+/// what that leaves on the table for everyone below it. A vug frame is a THREE-TASK RENDEZVOUS
+/// (parent + two workers on the PHASE futex), and every rendezvous the spin window does not catch
+/// becomes a park followed by a wake. The wake's SGI only breaks WFI — `gic::handle_irq` counts SGIs
+/// and returns — so a woken PRIO_NORMAL task landing on a BUSY core sits in the run queue until the
+/// running task reaches a dispatch boundary: yield, block, or quantum expiry, up to a full quantum
+/// (~12 ms, mean ~6 ms) per park. A frame with two or three uncaught rendezvous is 15-35 ms of pure
+/// queue wait, which is the metal reading exactly: per-window rates pinned at 21-39/s (26-48 ms
+/// frames, in quantum-sized steps), `gap` minima of 15 ms on the lucky windows and 32-71 ms on the
+/// crowded ones, and the rare ~50/s escape being a stretch where the spin windows caught every
+/// rendezvous and nothing parked. The ceiling was never a target or a cap (VUG-PACE) — it is wake
+/// latency quantized by the co-resident's quantum.
+///
+/// CROSS-ARCH CONVERGENCE. x86's `make_ready` has the same three-arm shape: idle target ->
+/// IPI-paced (our `poke_cpu` SGI, already present and metal-validated); higher-band wake -> preempt
+/// (our service trim above); equal-or-lower-band wake onto a busy core -> waits for the tick, on
+/// both arches, as SCHED-PRIO designed it. SPREAD-7 landed the instrument for that last arm:
+/// `SPREAD7_QUANT` counts exactly the wakes it quantizes (a woken EL0 task, below the service band,
+/// equal-or-higher than the target core's running band — an idle core reads `CUR_PRIO == PRIO_NONE`
+/// (`u8::MAX`) and never matches), and the wake-to-dispatch stamps in `dispatch_next` price what
+/// each one cost. `quant` climbing at the fleet's park rate with `wd_mean` in the half-quantum
+/// range IS the ceiling, live on the wire.
+///
+/// ### SPREAD-8 — the same-band trim (the policy, implemented)
+/// POLICY: an equal-band wake is worth at most ONE tick of the incumbent's time, not a full
+/// quantum. SPREAD-7's wire pricing (pi4-r23s1r) is the motivation: every uncaught rendezvous paid
+/// a mean ~6 ms / worst ~12 ms of pure run-queue wait behind an incumbent of the SAME band, and
+/// that wait — not rendering, not compositing — was the whole fps ceiling. So the same-band arm now
+/// gets the SCHED-PRIO trim: `prio >= cur` => the incumbent's countdown drops to 1. The TICK BOUND
+/// is the churn guard: the incumbent still finishes its current tick (nothing is switched out by
+/// force, exactly as the service trim above), so the worst case is one extra dispatch boundary per
+/// tick per core — structurally incapable of re-running SPREAD-4's ~540-moves/s disease, whose
+/// engine was per-frame MIGRATION, not dispatch. Same safety argument as the service trim: the swap
+/// only ever lowers the countdown toward 1 (a raced `quantum.store(QUANTUM_TICKS)` from the owning
+/// core loses at most this wake's trim — the pre-SPREAD-8 behaviour), `timer_preempt` remains the
+/// sole consumer, and `CUR_PRIO` is still the only cross-core read. `SPREAD8_TRIM` counts the wakes
+/// whose swap actually lowered a countdown, so the wire can prove the policy fires (`trim=` beside
+/// `quant=` on the `[spread7]` line, climbing together at the park rate).
+fn preempt_hint(target: usize, prio: u8, el0: bool) {
+    let cur = CUR_PRIO[target].load(Ordering::Relaxed);
+    if prio >= PRIO_SERVICE {
+        if prio > cur {
+            SCHED[target].quantum.store(1, Ordering::Relaxed);
+            PRIO_DEFER[target].fetch_add(1, Ordering::Relaxed);
+            // SPREAD-9 — arm the IPI-receipt preemption: a HIGHER-band service wake no longer waits
+            // for the next timer tick. `make_ready` calls this hint BEFORE it sends the wake SGI, so
+            // by the time `gic::handle_irq` acks that SGI on the target the band is pending there and
+            // `ipi_preempt` (IRQ-exit, post-EOI — the same boundary `timer_preempt` uses) dispatches
+            // instead of returning to the incumbent. The quantum trim above is kept as the fallback
+            // for the races (kick consumed by an earlier in-flight SGI, IRQ landing inside a masked
+            // section): the wake then costs at most one tick, the SCHED-PRIO behaviour. Equal-band
+            // wakes (`prio == cur`) deliberately take neither arm here and keep SPREAD-8's one-tick
+            // policy — immediate preemption is the service band's alone, so the fleet cannot churn
+            // itself with it.
+            KICK_BAND[target].fetch_max(prio, Ordering::Relaxed);
+        }
+        return;
+    }
+    // SPREAD-7 count + SPREAD-8 trim: `prio >= cur` with `prio < PRIO_SERVICE` implies `cur` is a
+    // real below-service level, so PRIO_NONE (idle) and any service-band runner are excluded for
+    // free. An equal-band wake is worth at most ONE tick of the incumbent's time, not a full
+    // quantum (see SPREAD-8 above): trim the countdown, tick-bounded, and count both the quantized
+    // population (quant=) and the trims that actually shortened a countdown (trim=).
+    if el0 && prio >= cur {
+        SPREAD7_QUANT.fetch_add(1, Ordering::Relaxed);
+        if SCHED[target].quantum.swap(1, Ordering::Relaxed) > 1 {
+            SPREAD8_TRIM.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Mark a parked/just-woken task READY, push it onto a run queue, and poke that CPU. Used by the
+/// sleeper drain (same CPU) and, from M4b, `Semaphore::post` (cross-CPU wake). Caller runs with IRQ
+/// masked.
+///
+/// A KERNEL task always returns to `task.cpu` exactly as before — that is the no-migrate contract the
+/// kernel blocking primitives are written against (`Condvar::wait` rebuilds its `!Send` guard on the
+/// resuming core; `spawn_inner`'s caller-pinned tasks are pinned on purpose), and nothing here
+/// touches it.
+///
+/// SPREAD-4 — AN EL0 TASK GETS ITS PLACEMENT RE-EXAMINED HERE, AND ONLY HERE. Two things have to be
+/// true at once for a move to be sound, and this is the only point in a task's life where both are:
+///
+///   * the task owns no core state. It is parked: not `current` anywhere, not in any run queue, no
+///     live register context beyond the saved frame on its own kernel stack (which is a Global
+///     identity mapping, valid under every root). `dispatch_next` installs `user_ttbr0` on whichever
+///     core dispatches it, so the address space follows the task rather than the core.
+///   * we already hold the decision. The wake is going to push onto SOME queue in the next few
+///     instructions, so choosing a different one costs one comparison and no extra machinery.
+///
+/// The residual is the old core's TTBR0, which keeps pointing at the moved task's slot root until
+/// that core next dispatches a user task. That is benign and stays benign: the slot L1 tables are a
+/// STATIC array (`boot::SLOT_L1`), never freed to the heap, and `teardown_user_slot` broadcasts
+/// `tlbi aside1is` for the ASID on the last release — so a core left holding the value has no stale
+/// translations and no dangling page. It runs EL1 code, which never touches a low VA.
+///
+/// The counters are kept consistent across the move in one order: un-park at home (so `home`'s figure
+/// excludes the waker itself), pick, then transfer the RESIDENT credit home -> target and retarget
+/// `task.cpu`. Both reap paths (`exit`, `retire_killed`) release against `task.cpu`, so the transfer
+/// is what keeps them releasing the core that is actually carrying the task.
+fn make_ready(mut task: Box<Task>) {
+    let home = task.cpu as usize;
+    let mut target = home;
+    // SPREAD-4: `user_entry != 0` is the same EL0 test SPREAD-3's enter/leave sites use, so the parked
+    // accounting covers exactly the population the resident accounting does. A kernel task falls
+    // straight through to the unchanged push below.
+    if task.user_entry != 0 {
+        el0_parked_leave(home);
+        // SPREAD-5: ask the placement question only for a wake that follows a real absence. `park_cyc`
+        // is stamped by `park_blocked`, the sole park funnel, so a zero here means this task reached
+        // `make_ready` without ever having parked — the kill sweeps can re-ready a task that was never
+        // blocked. Treat that as a short stay: it declines the move, which is the pre-SPREAD-4
+        // behaviour and the conservative direction (a task is never moved on a duration we did not
+        // measure). `saturating_sub` covers the same case defensively; CNTPCT itself is monotonic.
+        let now = now_cyc();
+        let parked_cyc = now.saturating_sub(task.park_cyc);
+        let long_park = task.park_cyc != 0 && parked_cyc >= rewake_min_park_cyc();
+        task.park_cyc = 0; // consumed — the next park stamps it afresh
+        // SPREAD-6: a micro-park may still ask, on a slow clock. Without this, a task that never stops
+        // never re-asks and its packing latches forever — the residual "predestined fps" (see
+        // PLACE_REFRESH_MS). `place_cyc == 0` (a Task literal that predates the stamp discipline —
+        // none today, but cheap to be honest about) counts as due: asking is safe, moving is gated.
+        let refresh = !long_park && now.saturating_sub(task.place_cyc) >= place_refresh_cyc();
+        if !long_park && !refresh {
+            // The micro-park path: no placement call, no counters but this one, and `target` stays
+            // `home`. `stay` is deliberately NOT incremented — it means "asked and declined", and
+            // folding thousands of unasked frame wakes into it would bury the signal it carries.
+            SPREAD5_SHORT_STAY.fetch_add(1, Ordering::Relaxed);
+        } else {
+            if refresh {
+                SPREAD6_REFRESH.fetch_add(1, Ordering::Relaxed);
+            }
+            task.place_cyc = now; // the question is being asked NOW — re-arm the refresh clock
+            // SPREAD-10: the slot names the task's futex-coupled siblings; `rewake_place` biases
+            // toward the core(s) already holding them (0 = unslotted, no bias).
+            target = rewake_place(home, slot_of(task.user_ttbr0));
+            if target != home {
+                el0_resident_leave(home);
+                let act = el0_resident_enter(target);
+                // SPREAD-10: the slot-residency credit moves with the resident credit, same order,
+                // so a concurrent sibling's placement ask never sees this task counted twice.
+                slot_res_leave(home, task.user_ttbr0);
+                slot_res_enter(target, task.user_ttbr0);
+                task.cpu = target as u32;
+                SPREAD4_REWAKE.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "pi")]
+                if SPREAD4_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < SPREAD4_LOG_MAX {
+                    serial_println!(
+                        ":: [spread4] rewake asid={} tid={} from=c{} to=c{} act={} parked={}ms ::",
+                        task.user_ttbr0 >> 48,
+                        task.id,
+                        home,
+                        target,
+                        act,
+                        cyc_to_ms(parked_cyc)
+                    );
+                }
+                #[cfg(not(feature = "pi"))]
+                let _ = act;
+            } else {
+                SPREAD4_STAY.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
     debug_assert!(target < NUM_CPUS, "make_ready: cpu out of range");
     task.state.store(STATE_READY, Ordering::Release);
-    RUN_QUEUES[target].lock().push(task);
+    // SCHED-PRIO: read the base priority BEFORE the Box is moved into the queue (after the push it
+    // belongs to whichever core dispatches it next and must not be touched from here).
+    let prio = task.priority;
+    let el0 = task.user_entry != 0;
+    if el0 || prio >= PRIO_SERVICE {
+        // SPREAD-7: stamp the wake so the dispatching core can price the run-queue wait. EL0 (the
+        // population whose frame rendezvous the [spread7] witness is instrumenting) — and, SPREAD-9,
+        // the service band, whose wait lands in the separate `svc_lat` aggregates. Ordinary
+        // kernel-worker wake traffic (sleeper drain, semaphores) stays out of both means.
+        task.wake_cyc = now_cyc();
+    }
+    rq(target).push(task);
+    // SCHED-PRIO: the wake path is where interactive latency is actually decided — `GUI_CHANNEL.recv`
+    // (compositor), `RX_READY.wait` (input router) and `sleep_ticks` (HID pump) all come back through
+    // here. Called AFTER the push (the task must already be queued when the target looks) and —
+    // SPREAD-9 — BEFORE the poke: the hint's service arm arms `KICK_BAND`, and the flag has to be
+    // set before the SGI it answers is sent, or the target's `ipi_preempt` could ack the SGI, find
+    // no pending band, and return to the incumbent it was meant to preempt.
+    preempt_hint(target, prio, el0);
     poke_cpu(target);
 }
 
@@ -1382,10 +3400,34 @@ pub fn current_id() -> Option<u64> {
 // wait, degrades to exactly the pre-arc PORPHANED behaviour — never to freeing a row under a live task.
 // =============================================================================================
 
-/// How many kills may be in flight at once. Small on purpose: the only requester is the single-threaded
-/// `run_user_image` deadline path, and `MAX_PROCS` (4) bounds how many rows can be at risk. Exhaustion
-/// returns `None` and the caller falls back to PORPHANED — it never grows the table (a STOP tripwire).
-pub const MAX_KILL_REQS: usize = 4;
+/// How many kills may be in flight at once. Small on purpose: the requesters are the `run_user_image`
+/// deadline path and the shell's `kill`, and the `Proc` table bounds how many rows can be at risk.
+/// Exhaustion returns `None` and the caller falls back to PORPHANED — it never grows the table on demand
+/// (a STOP tripwire).
+///
+/// PROCS-6 — this is now DERIVED from `MAX_PROCS` rather than written down beside it, because the old
+/// literal 4 was not an independent choice: it was the process table's size, and the comment said so.
+/// Once the cap rose to 6 the two numbers silently decoupled, and the decoupling is not benign — the
+/// tables are COUPLED in the failure direction. Six killable rows against four kill slots means an
+/// operator hammering `kill` across a full panel of vugs exhausts the kill table first; every request
+/// past the fourth arms nothing, falls back to PORPHANED, and parks a row. Those parked rows are then
+/// reclaimable only through KILLBOUND's quiescence witness, which is the narrower path (it needs the
+/// victim's ASID drained to zero live EL0 tasks) — so the shortfall converts confirmable kills into
+/// rows that wedge until their tasks happen to retire. That is the exact shape of the P60 wedge this
+/// machinery exists to prevent, re-introduced by a capacity change one file away.
+///
+/// Keeping the slots `>=` the rows makes the shortfall unrepresentable: every row that can be killed
+/// has a slot to be killed through, so `KILL_EXHAUSTED` can only ever be reached by concurrent
+/// requesters racing on the SAME rows, never by capacity.
+///
+/// It is a literal rather than `= syscall::MAX_PROCS` for a boring reason: `syscall` is gated behind
+/// `baremetal` and this module is not, so the constant cannot NAME the process table in every build
+/// that compiles it. The coupling is enforced instead by a `const` assert in `syscall.rs` — the one
+/// module that can see both constants, and the only configuration in which a `Proc` table exists at
+/// all, hence the only one where a shortfall could mean anything. Drift fails the build there. The
+/// assert is an inequality rather than an equality on purpose: a future arc may want kill headroom
+/// ABOVE the row count, but never below it.
+pub const MAX_KILL_REQS: usize = 6;
 
 const KILL_FREE: u8 = 0;
 /// Armed and owned by a live requester; the retiring task publishes `KILL_DONE` for it to observe.
@@ -1748,6 +3790,15 @@ pub fn kill_check_current() {
 fn retire_killed(idx: usize, task: Box<Task>) {
     let tid = task.id;
     let ttbr0 = task.user_ttbr0;
+    // SPREAD-3: the off-CPU reap arm — release this task's committed EL0 residency. Mirrors the
+    // `exit()` arm exactly (same `user_entry != 0` EL0 test, same recorded `cpu`), because a killed
+    // vug frees its core just as thoroughly as one that returned, and a resident that is never
+    // released would permanently bias placement away from a core that is in fact idle.
+    if task.user_entry != 0 {
+        el0_resident_leave(task.cpu as usize);
+        // SPREAD-10: and its slot-residency credit — a dead sibling must stop attracting its triple.
+        slot_res_leave(task.cpu as usize, task.user_ttbr0);
+    }
     // M6d: the same slot retirement `exit()` performs, executed on the scheduler stack. Legal here for
     // the same reason it is legal there — the kernel half of every root is Global and identical, so
     // repointing TTBR0 to the boot root pulls nothing out from under the running (scheduler) context.
@@ -1806,6 +3857,17 @@ pub fn exit() -> ! {
         // SKILL-1: drop this task out of its address space's live-thread count — on EVERY exit path, not
         // just the killed one, or the count drifts and a later ASID-scoped kill would never confirm.
         let remaining = asid_thread_leave((*raw).user_ttbr0);
+        // SPREAD-3: the on-CPU reap arm — release this task's committed EL0 residency. `user_entry != 0`
+        // is exactly the EL0 test used at placement (kernel threads are constructed with `user_entry: 0`),
+        // so increment and decrement cover the same population. `exit()` is the single funnel for every
+        // non-killed retirement — `sys_exit`, `SYS_THREAD_EXIT`, the M6b fault-kill, `kill_check_current`
+        // and a kernel entry's return all land here — so one decrement here covers them all.
+        if (*raw).user_entry != 0 {
+            el0_resident_leave((*raw).cpu as usize);
+            // SPREAD-10: release the slot-residency credit on the same funnel, or a retired triple
+            // member would keep pulling its siblings toward a core it no longer runs on.
+            slot_res_leave((*raw).cpu as usize, (*raw).user_ttbr0);
+        }
         // Settle any kill request naming this task (by tid, or by ASID for a whole-process kill). Placed
         // HERE — after the slot teardown and the joiner post, with only the state store and the final
         // switch left.
@@ -1877,6 +3939,19 @@ pub fn timer_preempt() {
     // the aggregate cadence; the emit itself is change-only and single-core per window (see the fn).
     load_witness_tick();
     let cpu = percpu::this_cpu().cpu_index as usize;
+    // WEDGE-4 W4-A — the fix's own tripwire. Every run-queue section now runs IRQ-masked (`rq`), so a
+    // timer IRQ can no longer land inside one and this word must read 0 here. A line from it means the
+    // discipline has been breached again — i.e. some acquisition reached the lock without masking.
+    let section = IN_RQ_SECTION[cpu].load(Ordering::Acquire);
+    if section != 0 && W4A_PRINTS.fetch_add(1, Ordering::Relaxed) < W4A_PRINT_MAX {
+        w4_str("\r\n[wedge4] preempt-in-section core=");
+        w4_dec(cpu as u64);
+        w4_str(" queue=");
+        w4_dec((section >> 32) - 1);
+        w4_str(" tid=");
+        w4_dec(section & 0xffff_ffff);
+        w4_str("\r\n");
+    }
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     if raw.is_null() {
         return; // scheduler/idle context, or an unscheduled core (the BSP)
@@ -1903,11 +3978,128 @@ pub fn timer_preempt() {
     }
 }
 
+/// SPREAD-9 — preempt at IPI RECEIPT: the wake SGI's answer to `preempt_hint`'s service arm. Called
+/// from `gic::handle_irq` AFTER EOI when the acked INTID was an SGI, on the core the SGI targeted —
+/// the exact position `timer_preempt` occupies for the timer PPI, and deliberately so: it reuses
+/// `timer_preempt`'s context-switch machinery verbatim (mark the incumbent READY, `switch_context`
+/// to the scheduler from the IRQ frame; the task resumes here IRQ-masked when re-dispatched and
+/// unwinds back through `__vec_irq`'s epilogue, which restores its banked ELR/SPSR/SP_EL0). No new
+/// switch path exists.
+///
+/// The policy, and the bound: ONE preemption per IPI, service band only. The pending band is
+/// consumed with a single `swap(0)`, so an SGI can trigger at most one dispatch; the band is only
+/// ever armed by a service-band wake that found a LOWER-band incumbent, so the fleet (PRIO_NORMAL)
+/// can never preempt itself and no wake-storm churn regression is possible — an EL0 wake takes
+/// exactly the SPREAD-7/8 path it took before this arc. Equal-band service wakes never arm the kick
+/// (`prio > cur` in the hint), keeping SPREAD-8's approved one-tick policy for that arm.
+///
+/// Why dispatching here is sound, point by point:
+///   * RqGuard/WEDGE-4: every run-queue section runs IRQ-masked (`rq`), so this IRQ cannot have
+///     landed inside one; the `IN_RQ_SECTION` check below is the same tripwire `timer_preempt`
+///     carries, made load-bearing — on a breach we DECLINE the switch (the armed quantum trim
+///     still bounds the wake at one tick) rather than dispatch over a torn queue.
+///   * Nesting: the IRQ vector runs with IRQ masked end to end and `switch_context` banks DAIF, so
+///     there is no nested-IRQ context to dispatch from — exactly the `timer_preempt` situation.
+///   * The re-check against `CUR_PRIO` is this core's OWN word (published by `dispatch_next`), so
+///     a stale hint — the incumbent already switched to a service task by the time the SGI lands —
+///     declines instead of preempting the band with itself.
+///
+/// On QEMU raspi4b the SGIs are live (unlike the timer PPI), so the gate exercises this path end to
+/// end; the LATENCY effect it exists for is metal-only, as with every preemption behaviour here.
+pub fn ipi_preempt() {
+    if !SCHED_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let band = KICK_BAND[cpu].swap(0, Ordering::Relaxed);
+    if band == 0 {
+        return; // ordinary wake ping — breaking the WFI was the whole job
+    }
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
+    if raw.is_null() {
+        return; // scheduler/idle context — the interrupted dispatch loop picks the wake up itself
+    }
+    if CUR_PRIO[cpu].load(Ordering::Relaxed) >= band {
+        return; // incumbent is already at/above the woken band — nothing to reclaim
+    }
+    if IN_RQ_SECTION[cpu].load(Ordering::Acquire) != 0 {
+        return; // discipline breach (never expected): decline; the quantum trim still bounds the wake
+    }
+    // SKILL-1 on-CPU kill boundary, exactly as at the top of `timer_preempt`'s switch arm: this is a
+    // legitimate involuntary boundary, so a killed incumbent dies here rather than running on.
+    kill_check_current();
+    SPREAD9_KICK.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        (*raw).state.store(STATE_READY, Ordering::Release);
+        switch_context(
+            &raw mut (*raw).ctx_sp,
+            SCHED[cpu].scheduler_sp.load(Ordering::Acquire),
+        );
+    }
+}
+
+// --- SPIN-8 — the wedged core's position inside the scheduler loop itself. ---
+//
+// PA1 killed the last hypothesis that had a name. SPIN-7's per-core IRQ accounting read
+// `total=5448 last=30 unhandled=0` FROZEN across the whole 38 s stall: c3 is not being EATEN by
+// interrupts, it is taking NONE — not even its own timer. Beside SPIN-6 (saved SP valid), SPIN-5
+// (dispatch heartbeat frozen, so the core's scheduler genuinely never runs again) and clean
+// witnesses on every lock that has one, exactly one region survives: the core is spinning inside
+// `run()`'s IRQ-MASKED span. That span is short and enumerable, and a FROZEN phase beside a FROZEN
+// pass counter names which statement of it — with no FIQ, no GIC reconfiguration, and no cost past
+// one relaxed store to a private cache line per step.
+//
+// The unmasked phases (8/9/10) are excluded A PRIORI by the frozen IRQ total — a core parked there
+// would still take its timer tick. Reading one of them on the wedged core would therefore be a
+// finding in its own right: the mask discipline is not what this comment believes.
+const SPIN8_LOOP_TOP: u64 = 1; // loop top, IRQ still as the previous pass left it
+const SPIN8_DRAIN: u64 = 2; // drain_due_sleepers        (masked)
+const SPIN8_BACKSTOP: u64 = 3; // input_wait_backstop -> futex_wake (masked)
+const SPIN8_DISPATCH: u64 = 4; // dispatch_next entered     (masked)
+const SPIN8_RQ: u64 = 5; // dispatch_next: aging + pop under the run-queue lock (masked)
+const SPIN8_TASK: u64 = 6; // switched INTO a task — the normal reading for a busy core
+const SPIN8_EMPTY: u64 = 7; // dispatch_next: empty queue, unmasked, returning false
+const SPIN8_STEAL: u64 = 8; // try_steal                 (UNMASKED)
+const SPIN8_IDLE: u64 = 9; // hlt / WFI                 (UNMASKED)
+const SPIN8_ACCT: u64 = 10; // pass accounting           (UNMASKED)
+
+#[repr(align(64))]
+struct PaddedU64(AtomicU64);
+
+/// SPIN-8 — where each core is in its scheduler loop right now. Own cache line per core (SPIN-3's
+/// lesson: an A72 LL/SC reservation broken by a neighbour's store to the same line retries forever).
+static SCHED_PHASE: [PaddedU64; NUM_CPUS] = [const { PaddedU64(AtomicU64::new(0)) }; NUM_CPUS];
+
+/// SPIN-8 — completed passes of `run()`'s loop on each core. The discriminator: a phase alone could
+/// be a snapshot of a healthy core moving fast, but a phase that does not change WHILE THIS DOES NOT
+/// EITHER, across consecutive `[spin1]` prints seconds apart, is a core standing still.
+static SCHED_PASSES: [PaddedU64; NUM_CPUS] = [const { PaddedU64(AtomicU64::new(0)) }; NUM_CPUS];
+
+#[inline]
+fn spin8(cpu: usize, phase: u64) {
+    if cpu < NUM_CPUS {
+        SCHED_PHASE[cpu].0.store(phase, Ordering::Relaxed);
+    }
+}
+
+/// SPIN-8 — `(phase, passes)` for the `[spin1]` witness. Read from another core; both are relaxed
+/// single-writer words, so a torn pair is impossible and a stale pair is harmless.
+fn spin8_state(cpu: usize) -> (u64, u64) {
+    if cpu >= NUM_CPUS {
+        return (0, 0);
+    }
+    (
+        SCHED_PHASE[cpu].0.load(Ordering::Relaxed),
+        SCHED_PASSES[cpu].0.load(Ordering::Relaxed),
+    )
+}
+
 /// Dispatch the front task of `cpu`'s queue: switch into it, and when it switches back (yield /
 /// preempt / exit) requeue it (READY) or free it (FINISHED). Returns whether a task ran. The caller
 /// runs on this CPU's scheduler stack. IRQ is masked across pop+switch (nothing may re-enter the
 /// scheduler on its own stack); on an empty queue IRQ is left UNMASKED for the caller to idle.
 fn dispatch_next(cpu: usize) -> bool {
+    spin8(cpu, SPIN8_DISPATCH);
     mask_irq();
     // SCHED-7: start each pass with no busy span recorded; the busy branch below overwrites this with
     // the task's measured execution span. An empty pass leaves it 0, so `run()` folds the whole pass
@@ -1918,21 +4110,29 @@ fn dispatch_next(cpu: usize) -> bool {
     // pop so a long-waiting task cannot be dispatched before it is aged in the same pass. The sweep
     // and pop share the lock; `age` carries surplus credit past `AGE_TICKS`, so a coarse cadence loses
     // nothing. Owning-CPU-only counters (Relaxed). See `AGE_TICKS` for why the clock is passes, not ticks.
+    spin8(cpu, SPIN8_RQ);
     let next = {
-        let mut q = RUN_QUEUES[cpu].lock();
+        let mut q = rq(cpu);
         let passes = SCHED[cpu].age_passes.fetch_add(1, Ordering::Relaxed) + 1;
         let elapsed = passes - SCHED[cpu].age_last_sweep.load(Ordering::Relaxed);
         if elapsed >= AGING_INTERVAL {
-            q.age(elapsed.min(u32::MAX as u64) as u32);
+            // SCHED-PRIO: the sweep now reports how many relocations reached the interactive service
+            // band. Folded into the witness counter here (still under the run-queue lock, one relaxed
+            // add on a path that already took the lock) rather than inside `age`, which has no `cpu`.
+            let into_band = q.age(elapsed.min(u32::MAX as u64) as u32);
+            if into_band != 0 {
+                PRIO_AGED_IN[cpu].fetch_add(into_band as u64, Ordering::Relaxed);
+            }
             SCHED[cpu].age_last_sweep.store(passes, Ordering::Relaxed);
         }
         q.pop_highest() // highest-priority ready task; lock dropped here
     };
-    let Some(task) = next else {
+    let Some(mut task) = next else {
         CPU_IDLE[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
         // SCHED-5: idle TIME is measured at the WFI in `run()` (the span the core actually sleeps), not
         // here — this empty pass itself takes negligible time and returns straight to the idle loop.
         unmask_irq();
+        spin8(cpu, SPIN8_EMPTY);
         return false;
     };
     // SKILL-1 OFF-CPU kill boundary. A killed task is retired HERE — after the pop (so it is off every
@@ -1951,6 +4151,63 @@ fn dispatch_next(cpu: usize) -> bool {
     // (below), when the elapsed CNTPCT span is known. Single-writer (this core), relaxed; no lock added.
     ACCT[cpu].ctx_switches.fetch_add(1, Ordering::Relaxed);
     ACCT[cpu].note_last(task.id, task.name);
+    // SCHED-PRIO — the dispatch-share witness, and the running-priority publication that makes
+    // `preempt_hint` possible. BASE priority is what is counted and published: a task the aging sweep
+    // lifted is a below-band task that the ANTI-STARVATION path is running, not a band win, and it
+    // must not be able to shield itself from a real service wake by wearing the band's number.
+    let svc_band = task.priority >= PRIO_SERVICE;
+    if svc_band {
+        PRIO_SVC_DISPATCH[cpu].fetch_add(1, Ordering::Relaxed);
+    }
+    if task.user_entry != 0 {
+        PRIO_EL0_DISPATCH[cpu].fetch_add(1, Ordering::Relaxed);
+    }
+    CUR_PRIO[cpu].store(task.priority, Ordering::Relaxed);
+    // SPREAD-7: consume the wake stamp — this dispatch is the woken task first RUNNING, so the span
+    // since `make_ready` is exactly the run-queue wait the wake paid (the quantity the quantized arm
+    // of `preempt_hint` leaves unbounded below one quantum). Zeroed so a later preempt/requeue cycle
+    // of the same task is not double-priced: this measures wake latency, not scheduling in general.
+    if task.wake_cyc != 0 {
+        let wait = now_cyc().saturating_sub(task.wake_cyc);
+        task.wake_cyc = 0;
+        if task.priority >= PRIO_SERVICE {
+            // SPREAD-9: a service-band wake — price it in the svc_lat aggregates, NOT the SPREAD-7
+            // ones, so the EL0 wake2disp population is exactly what it was before this arc. BASE
+            // priority decides, mirroring the stamp site (`make_ready`) — an aged-up EL0 task was
+            // stamped as EL0 and is priced as EL0.
+            SPREAD9_SVC_SUM.fetch_add(wait, Ordering::Relaxed);
+            SPREAD9_SVC_N.fetch_add(1, Ordering::Relaxed);
+            SPREAD9_SVC_MAX.fetch_max(wait, Ordering::Relaxed);
+        } else {
+            SPREAD7_WD_SUM.fetch_add(wait, Ordering::Relaxed);
+            SPREAD7_WD_N.fetch_add(1, Ordering::Relaxed);
+            SPREAD7_WD_MAX.fetch_max(wait, Ordering::Relaxed);
+        }
+    }
+    // SPIN-6 (2026-07-30, the P99 conviction): the c3 wedge is a switch-in to a CORRUPTED saved
+    // frame — disp counters freeze, state reads RUNNING, the task's own phase marker never
+    // advances (bs_phase=1 bs_loops=36, deterministic). Validate the saved SP against the task's
+    // OWN stack bounds before restoring it: a frame outside its stack means the parked context was
+    // overwritten (leading suspect: a neighboring kernel-stack overflow). Refuse the switch loudly
+    // — a named refusal beats an anonymous dead core — and drop the task as unrecoverable.
+    {
+        let base = task.stack.as_ptr() as u64;
+        let top = base + task.stack.len() as u64;
+        let sp = task.ctx_sp;
+        if sp < base || sp > top {
+            serial_println!(
+                "[spin6] cpu={} REFUSING corrupt switch-in: task={}:{} ctx_sp={:#x} outside its stack [{:#x},{:#x}) — the parked frame was OVERWRITTEN (neighboring stack overflow?). Task dropped; core keeps dispatching",
+                cpu, task.id, task.name, sp, base, top
+            );
+            if task.user_entry != 0 {
+                // Same phantom-credit reasoning as park_blocked's dead-arm: it is never coming back.
+                el0_resident_leave(cpu);
+                slot_res_leave(cpu, task.user_ttbr0);
+            }
+            drop(task);
+            return true;
+        }
+    }
     task.state.store(STATE_RUNNING, Ordering::Release);
     SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed);
     let raw = Box::into_raw(task);
@@ -1984,25 +4241,42 @@ fn dispatch_next(cpu: usize) -> bool {
     // that fired while it ran) — the "busy" time for time-based load accounting. Two sysreg reads per
     // dispatch, off the per-instruction path.
     let busy_t0 = now_cyc();
+    // PULSE-5: publish that anchor before switching in, so the span is READABLE while it is still
+    // running instead of only after it ends. One relaxed store, no sysreg read of its own (it
+    // reuses the `busy_t0` this path already took), no ordering constraint on the switch. It is
+    // cleared by the fold below (`account`). This single store is the whole cost of the fix on the
+    // context-switch path.
+    ACCT[cpu].run_t0.store(busy_t0, Ordering::Relaxed);
+    // SPIN-8: the last store before the core leaves the scheduler. It stands for the whole span the
+    // dispatched task runs, so a healthy busy core reads phase=6 — and a wedged core reading 6 with a
+    // frozen pass counter would say the stall is inside the TASK, not the loop (the opposite verdict
+    // from every other phase, and the one SPIN-5's frozen heartbeat already argues against).
+    spin8(cpu, SPIN8_TASK);
     unsafe {
         switch_context(SCHED[cpu].scheduler_sp.as_ptr(), entry_sp);
     }
+    spin8(cpu, SPIN8_DISPATCH);
     let busy_cyc = now_cyc().wrapping_sub(busy_t0);
     // The switch-back always lands IRQ-masked (yield_now/exit mask first; timer_preempt runs in the
     // auto-masked IRQ handler), so the Box reclaim below can't race a re-entrant preempt on this
     // core. Re-assert the mask explicitly so that safety doesn't rest on an inherited DAIF that a
     // future switch-in path could leave enabled.
     mask_irq();
-    ACCT[cpu].account(busy_cyc, 0); // fold this task's execution span into the rolling load window
+    // Fold this task's execution span into the rolling load window; SPREAD-9 — tag the span with its
+    // band so `el0_busy_pct` can subtract service time from what EL0 placement weighs.
+    ACCT[cpu].account(busy_cyc, 0, if svc_band { busy_cyc } else { 0 });
     // SCHED-7: publish this pass's busy span so `run()` can subtract it from the pass's total wall
     // span and fold the remainder (scheduler overhead, then the WFI/poll-spin) in as idle.
     PASS_BUSY_CYC[cpu].store(busy_cyc, Ordering::Relaxed);
+    // SCHED-PRIO: back on the scheduler stack — nothing is running here, so nothing is preemptible.
+    // Published alongside the `current` clear it mirrors, and for the same reason.
+    CUR_PRIO[cpu].store(PRIO_NONE, Ordering::Relaxed);
     SCHED[cpu].current.store(0, Ordering::Release);
     // Consume the park action exactly once: read it and immediately reset to NONE, so a stale action
     // can never leak into the next task's switch-back. Only a task that switched back BLOCKED carries
     // a meaningful action.
     let park = SCHED[cpu].park_kind.swap(PARK_NONE, Ordering::Relaxed);
-    let task = unsafe { Box::from_raw(raw) };
+    let mut task = unsafe { Box::from_raw(raw) };
     match task.state.load(Ordering::Acquire) {
         STATE_FINISHED => drop(task), // free the stack
         STATE_BLOCKED => park_blocked(cpu, park, task), // sleeper list / (M4b) a wait queue
@@ -2011,7 +4285,31 @@ fn dispatch_next(cpu: usize) -> bool {
             // which also re-zeroes its aging clock — a task only ages while it sits WAITING.
             debug_assert_eq!(park, PARK_NONE, "non-blocked task carried a park action");
             task.state.store(STATE_READY, Ordering::Release);
-            RUN_QUEUES[cpu].lock().push(task);
+            // SPREAD-11 (2026-07-30, the P87/P92/P93/P94 idle-desktop livelock): a task that YIELDS
+            // instead of parking never passes `make_ready`, so SPREAD-10's co-placement never sees
+            // it — a spread vug triple that yield-spins its rendezvous ([spread10] 3c+=1 co_moves=0)
+            // storms the run-queue locks at wake-speed (P94 measured ctx +1.3M/win, svc=0, and
+            // rx-backstop starved 199 s inside make_ready). Give the READY re-enqueue the SAME
+            // refresh clock the park path has: at most once per PLACE_REFRESH_MS, ask rewake_place
+            // and move toward the slot's residents. Credits move exactly as SPREAD-10's rewake does.
+            let mut dest = cpu;
+            if task.user_entry != 0 {
+                let now = now_cyc();
+                if task.place_cyc != 0 && now.saturating_sub(task.place_cyc) >= place_refresh_cyc() {
+                    task.place_cyc = now;
+                    let target = rewake_place(cpu, slot_of(task.user_ttbr0));
+                    if target != cpu {
+                        el0_resident_leave(cpu);
+                        let _ = el0_resident_enter(target);
+                        slot_res_leave(cpu, task.user_ttbr0);
+                        slot_res_enter(target, task.user_ttbr0);
+                        task.cpu = target as u32;
+                        SPREAD11_YIELD_MOVES.fetch_add(1, Ordering::Relaxed);
+                        dest = target;
+                    }
+                }
+            }
+            rq(dest).push(task);
         }
     }
     true
@@ -2054,7 +4352,21 @@ pub fn note_core_idle(cpu: usize) {
 
 /// Park a task that switched back BLOCKED, per the action it set before switching. Runs in the
 /// scheduler context with IRQ masked and owns `task`.
-fn park_blocked(cpu: usize, park: u8, task: Box<Task>) {
+fn park_blocked(cpu: usize, park: u8, mut task: Box<Task>) {
+    // SPREAD-5: stamp the park instant while we still exclusively own the Box and BEFORE it is handed
+    // to a wait queue or the sleeper list (after which another core may take it at any moment). This is
+    // the sole park funnel, so this is the only writer; `make_ready` is the sole reader. Stamped for
+    // every task, not just EL0 — one register write on a path that is already switching contexts, and
+    // it keeps the field's meaning unconditional rather than "valid only for some tasks".
+    task.park_cyc = now_cyc();
+    // SPREAD-4: this is the SOLE park funnel — every blocking primitive an EL0 task can reach
+    // (`Semaphore::wait`, `futex_wait`, `sleep_ticks`) marks itself BLOCKED, sets `park_kind` and
+    // switches back into `dispatch_next`, which lands here. A parked resident owes its core no CPU, so
+    // it stops counting towards `el0_active` for as long as it sleeps; `make_ready` puts it back.
+    let el0_home = if task.user_entry != 0 { Some(task.cpu as usize) } else { None };
+    if let Some(home) = el0_home {
+        el0_parked_enter(home);
+    }
     match park {
         PARK_WAITQ => {
             // Lock-handoff: the blocking task acquired the wait queue's lock and held it ACROSS the
@@ -2076,6 +4388,13 @@ fn park_blocked(cpu: usize, park: u8, task: Box<Task>) {
         }
         _ => {
             // A BLOCKED task with no valid park action is a bug; don't leak it — drop it (frees the stack).
+            // SPREAD-4: it is never coming back through `make_ready`, so undo the park credit AND
+            // release its residency, or the core would carry a phantom resident for the rest of the boot.
+            if let Some(home) = el0_home {
+                el0_parked_leave(home);
+                el0_resident_leave(home);
+                slot_res_leave(home, task.user_ttbr0); // SPREAD-10: same phantom-credit reasoning
+            }
             debug_assert!(false, "BLOCKED task with no park action");
             drop(task);
         }
@@ -2100,6 +4419,65 @@ fn drain_due_sleepers(cpu: usize) {
             None => break,
         }
     }
+}
+
+/// VUGPAUSE-2: timer ticks between two runs of the input-wait backstop. A tick is ~4 ms, so 64 is ~256 ms
+/// — four wake/poll/re-park cycles per second for an idle vug. That is two decimal orders inside the
+/// tightest liveness bound it has to satisfy (UVUG-8r2's 2 s takeover heartbeat) and far below what a load
+/// meter can resolve, which is the whole point: the vug keeps its old "I am still polling" contract with
+/// the watchdogs while costing effectively nothing.
+#[cfg(feature = "baremetal")]
+const INPUT_WAIT_BACKSTOP_TICKS: u64 = 64;
+
+/// VUGPAUSE-2: the tick at which the next backstop pass is due. Global rather than per-CPU, and claimed by
+/// CAS, so the cadence is ONE pass per period across the whole machine and not one per core — six cores
+/// each waking every parked vug would be six times the work for exactly the same effect.
+#[cfg(feature = "baremetal")]
+static INPUT_WAIT_BACKSTOP_DUE: AtomicU64 = AtomicU64::new(0);
+
+/// VUGPAUSE-2: run the input-wait backstop if its period has elapsed. Called from the scheduler loop top,
+/// beside `drain_due_sleepers` and for the same structural reason — it is a periodic re-ready pass, it
+/// needs `make_ready`, and this is the one place in the kernel that runs forever on every core with IRQs
+/// masked and no lock held.
+///
+/// Metal-only by construction, and deliberately so: `timer::ticks()` advances from the timer IRQ, which
+/// QEMU raspi4b never delivers, so under QEMU this is a load of an atomic that never changes. Nothing is
+/// lost there — the headless run has no HID, so no vug ever freezes, so nothing ever parks.
+///
+/// Gated on `baremetal` because the thing it wakes is: `arch::aarch64::syscall` — which owns the input
+/// rings and therefore `SYS_INPUT_WAIT` — is itself a `baremetal`-only module. Without EL0 there is no
+/// input ring, nothing can park on one, and the backstop has nothing to do.
+#[inline]
+fn input_wait_backstop() {
+    #[cfg(not(feature = "baremetal"))]
+    return;
+    #[cfg(feature = "baremetal")]
+    {
+        input_wait_backstop_inner();
+    }
+}
+
+#[cfg(feature = "baremetal")]
+#[inline]
+fn input_wait_backstop_inner() {
+    let now = super::timer::ticks();
+    let due = INPUT_WAIT_BACKSTOP_DUE.load(Ordering::Relaxed);
+    if now < due {
+        return;
+    }
+    // Claim the period. A loser simply skips; it does not spin or retry.
+    if INPUT_WAIT_BACKSTOP_DUE
+        .compare_exchange(
+            due,
+            now.wrapping_add(INPUT_WAIT_BACKSTOP_TICKS),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+    super::syscall::el0_input_wake_backstop();
 }
 
 /// Run `cpu`'s run queue to completion, cooperatively (the M3a demo driver on the BSP): dispatch
@@ -2160,7 +4538,7 @@ fn try_steal(cpu: usize) -> bool {
         if c == cpu || !ONLINE_MASK[c].load(Ordering::Acquire) {
             continue;
         }
-        let depth = RUN_QUEUES[c].lock().len();
+        let depth = rq(c).len();
         if depth > best_depth {
             best_depth = depth;
             victim = Some(c);
@@ -2172,7 +4550,7 @@ fn try_steal(cpu: usize) -> bool {
     };
     // 2. Steal under the victim's lock only (re-check depth — it may have drained since the peek).
     let stolen = {
-        let mut vq = RUN_QUEUES[v].lock();
+        let mut vq = rq(v);
         if vq.len() < STEAL_MIN_DEPTH {
             None
         } else {
@@ -2186,7 +4564,7 @@ fn try_steal(cpu: usize) -> bool {
     // 3. Re-home onto this core and enqueue (we exclusively own the Box here).
     let name = task.name;
     task.cpu = cpu as u32;
-    RUN_QUEUES[cpu].lock().push(task);
+    rq(cpu).push(task);
     // Rate-limited steal witness (pi-gated: fires on the target + kernel8-test, byte-identical elsewhere).
     #[cfg(feature = "pi")]
     if STEAL_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < STEAL_LOG_MAX {
@@ -2234,21 +4612,34 @@ fn run(cpu: usize) -> ! {
         // idle WFI and re-enters this loop — so an idle core with only a pending sleeper still makes
         // progress; worst-case wake latency is one tick. `dispatch_next` re-masks (redundant here),
         // then either switches into a task or, on an empty queue, unmasks and returns false to idle.
+        // SPIN-8: one pass tick + a phase marker per step of the masked span. See the phase table
+        // above `dispatch_next`. This counter is the "is this core alive at all" word — frozen here
+        // while `[spin1]` keeps printing from a sibling core is the wedge, stated positively.
+        if cpu < NUM_CPUS {
+            SCHED_PASSES[cpu].0.fetch_add(1, Ordering::Relaxed);
+        }
+        spin8(cpu, SPIN8_LOOP_TOP);
         mask_irq();
+        spin8(cpu, SPIN8_DRAIN);
         drain_due_sleepers(cpu);
+        spin8(cpu, SPIN8_BACKSTOP);
+        input_wait_backstop();
         if !dispatch_next(cpu) {
             // SMP-BAL: local queue is empty — before parking, try to pull a steal-eligible task off the
             // MOST-loaded core (work redistribution). A successful steal enqueues onto THIS core, so we
             // loop straight back and `dispatch_next` runs it; nothing is parked. This is what lets an
             // idle core (incl. the BSP once it runs `run_bsp`) drain a saturated core's backlog. Only an
             // idle core ever steals, so it never competes with useful local work.
+            spin8(cpu, SPIN8_STEAL);
             if !try_steal(cpu) {
                 // Nothing to steal either: park until the next tick/IPI — WFI on metal, a light poll-spin
                 // in QEMU (no Group-1 timer). This span is idle; it is folded in below along with the
                 // rest of the pass, so it does not matter whether WFI actually sleeps or returns at once.
+                spin8(cpu, SPIN8_IDLE);
                 crate::arch::hlt();
             }
         }
+        spin8(cpu, SPIN8_ACCT);
         // SCHED-7: fold EVERY cycle this pass did NOT spend executing a task in as IDLE — the whole
         // pass span (`t_prev`→now) minus the busy span `dispatch_next` already accounted. This closes
         // the phantom-100% hole: the old code bracketed ONLY the explicit WFI, so on a core whose WFI
@@ -2259,7 +4650,7 @@ fn run(cpu: usize) -> ! {
         // (task-execution / wall-time): ~0 for a provably-idle workload, ~100 for a CPU-bound one.
         let t_now = now_cyc();
         let busy = PASS_BUSY_CYC[cpu].swap(0, Ordering::Relaxed);
-        ACCT[cpu].account(0, t_now.wrapping_sub(t_prev).saturating_sub(busy));
+        ACCT[cpu].account(0, t_now.wrapping_sub(t_prev).saturating_sub(busy), 0);
         t_prev = t_now;
     }
 }
@@ -2394,6 +4785,20 @@ pub struct Semaphore {
 // the type doc for the full happens-before argument.
 unsafe impl Sync for Semaphore {}
 
+/// WEDGE-5 (2026-07-30, the P94/P95 rx-backstop starvation): the semaphore raw lock was the ONLY
+/// unwitnessed masked spin on the starved task's path (the run-queue lock has WEDGE-4 and never
+/// fired). Episodes crossing the stall threshold count here; the max spin ever seen rides beside
+/// it. Printed by [spin1] from the witness core — never from inside the spin (the serial lock must
+/// not nest under a stalled acquisition).
+static SEM_STALL_EPISODES: AtomicU64 = AtomicU64::new(0);
+static SEM_SPIN_MAX: AtomicU64 = AtomicU64::new(0);
+/// SPIN-4 — rx-backstop's self-reported position (1 = about to sleep, 2 = in post) + loop count.
+/// Written by the task itself (main.rs), read by [spin1]. A frozen loops counter beside phase=1 says
+/// "stuck in sleep_ticks / never rewoken-but-shown-running"; phase=2 says "stuck inside post".
+pub static RX_BS_PHASE: AtomicU8 = AtomicU8::new(0);
+pub static RX_BS_LOOPS: AtomicU64 = AtomicU64::new(0);
+const SEM_STALL_SPINS: u64 = 50_000_000; // ~seconds at spin_loop speed — far past any honest hold
+
 impl Semaphore {
     /// Construct a semaphore with `initial` permits. `const` so it can initialise a `static`.
     pub const fn new(initial: i64) -> Self {
@@ -2414,9 +4819,27 @@ impl Semaphore {
 
     #[inline]
     fn lock_raw(&self) {
+        // WEDGE-5: witnessed like the run-queue lock — count the stall, never print in here (the
+        // serial lock must not nest under a stalled acquisition).
+        let mut spins: u64 = 0;
         while self.locked.swap(true, Ordering::Acquire) {
+            spins = spins.wrapping_add(1);
+            if spins == SEM_STALL_SPINS {
+                SEM_STALL_EPISODES.fetch_add(1, Ordering::Relaxed);
+            }
             core::hint::spin_loop();
         }
+        SEM_SPIN_MAX.fetch_max(spins, Ordering::Relaxed);
+    }
+
+    /// WEDGE-5 introspection for the [spin1] witness: (locked, count, waiters_len). The waiters
+    /// length is read UNLOCKED — witness-only; a torn read is acceptable and never dereferenced.
+    pub fn debug_state(&self) -> (bool, i64, usize) {
+        (
+            self.locked.load(Ordering::Relaxed),
+            self.count.load(Ordering::Relaxed),
+            unsafe { (*self.waiters.get()).len() },
+        )
     }
 
     #[inline]
@@ -2566,13 +4989,37 @@ impl Semaphore {
 
 /// Distinct futex keys the kernel can have waiters parked on at once (never grown — same discipline as
 /// the thread/proc tables).
-const NFUTEX: usize = 16;
+///
+/// VUGPAUSE-2 raised this from 16, and the raise is load-bearing rather than defensive. A vug used to hold
+/// ONE live key (its `DONE` barrier word), so a six-vug fleet fit in 16 with room to spare. It now holds
+/// THREE while idle — the barrier word, the `PHASE` release word both workers park on, and its input ring
+/// — which is 18 for the same fleet: over the old pool, and the overflow does not fail loudly. It returns
+/// `TableFull`, every caller degrades to a spin, and the arc's whole benefit quietly evaporates on exactly
+/// the workload it was built for. Sized to 64 so a full `USER_SLOTS` fleet cannot reach it; a bucket is a
+/// lock, a key and a `VecDeque` header, so the pool is small even at this width.
+const NFUTEX: usize = 64;
 
 /// One futex wait bucket: a keyed FIFO wait queue with a Semaphore-style raw lock handed to the scheduler.
 struct FutexBucket {
     /// Raw spinlock guarding `key` + `waiters` (Acquire on lock, Release on unlock; the PARK_WAITQ
     /// lock-handoff releases it AFTER the scheduler pushes the blocking Box).
     locked: AtomicBool,
+    /// WEDGE-6 — who holds `locked`: `((cpu + 1) << 32) | (tid as u32)`. This is the field W4-B gets
+    /// for free from `IN_RQ_SECTION`; the futex bucket had no equivalent, and a witness that names
+    /// only the victim costs a whole boot to follow up. Diagnostic only — never read on a control path.
+    ///
+    /// **The invariant is "valid while `locked` is true", NOT "0 means free".** `unlock_raw` clears it,
+    /// but the PARK_WAITQ lock-handoff does not: the scheduler releases the handed-off lock in
+    /// `park_blocked` with a bare `(*lock).store(false)` through a `*const AtomicBool`, which cannot
+    /// reach a bucket-specific field (the same handoff serves `Semaphore` and `Condvar`). So after a
+    /// handoff release this word is stale until the next acquirer overwrites it.
+    ///
+    /// That costs the witness nothing, because the stall loop only spins — and so only ever reads this
+    /// — while `locked` is true, and the one case the witness exists for is precisely a waiter that
+    /// parked across the switch and is STILL holding the lock. There, the stale-after-release window
+    /// does not exist and this word names exactly the right task. Do not grow a second reader that
+    /// treats `0` as "free".
+    holder: AtomicU64,
     /// The physical-address key this bucket serves, or 0 = free. Claimed on the first waiter for a key,
     /// released back to 0 when its last waiter leaves.
     key: AtomicU64,
@@ -2583,22 +5030,89 @@ struct FutexBucket {
 // SAFETY: every access to `key`/`waiters` is serialised by `locked`; identical argument to `Semaphore`.
 unsafe impl Sync for FutexBucket {}
 
+/// WEDGE-6 — try-attempts before a futex bucket acquisition is declared stalled. Same order as
+/// WEDGE-4's `RQ_STALL_SPINS` and WEDGE-5's `SEM_STALL_SPINS`: far past any legitimate hold, so
+/// reaching it means the holder is off-CPU and not coming back.
+const FUTEX_STALL_SPINS: u64 = 1 << 26;
+
+/// WEDGE-6 — the last unwitnessed unbounded spin inside the scheduler's IRQ-masked span, given the
+/// same voice as the run-queue lock's W4-B.
+///
+/// `input_wait_backstop` runs on EVERY core on EVERY scheduler pass with IRQ masked (VUGPAUSE-2), and
+/// it calls `futex_wake`, which scans EVERY bucket and takes each one's raw lock. Meanwhile
+/// `futex_wait`'s PARK_WAITQ hand-off holds a bucket's lock ACROSS a context switch — released by the
+/// scheduler in `park_blocked`, not by the waiter. So a waiter that parks and whose core never
+/// reaches `park_blocked` leaves that bucket locked, and every other core's scheduler loop then spins
+/// on it forever, IRQ-masked, dispatching nothing and printing nothing. That is the PA1 signature
+/// exactly, and until now this lock was the one member of the masked span that could produce it in
+/// silence. Lock-free UART seam (`w4_str`), one line per stalled acquisition, then keep spinning —
+/// behaviour unchanged, the wedge merely legible.
+#[inline(never)]
+fn futex_stall_witness(b: &FutexBucket) {
+    let idx = (b as *const FutexBucket as usize).wrapping_sub(FUTEX.as_ptr() as usize)
+        / core::mem::size_of::<FutexBucket>();
+    w4_str("\r\n[wedge6] FUTEX STALL core=");
+    w4_dec(percpu::this_cpu().cpu_index as u64);
+    w4_str(" bucket=");
+    w4_dec(idx as u64);
+    w4_str(" key=");
+    w4_dec(b.key.load(Ordering::Relaxed));
+    // WEDGE-6: name the CULPRIT, not just the victim — W4-B's owner_core/owner_tid, which the futex
+    // bucket now carries in its own word. Read while `locked` is true (we are inside the stall loop),
+    // which is exactly the state the field's invariant covers — see `FutexBucket::holder`. A zero here
+    // means the acquirer had not yet published itself when we sampled: a few instructions wide, so
+    // reaching a 2^26 spin bound inside it means the lock is free and something else is wrong.
+    let h = b.holder.load(Ordering::Acquire);
+    if h != 0 {
+        w4_str(" holder_core=");
+        w4_dec((h >> 32) - 1);
+        w4_str(" holder_tid=");
+        w4_dec(h & 0xffff_ffff);
+    } else {
+        w4_str(" holder=UNPUBLISHED");
+    }
+    w4_str(" — this bucket's raw lock has been held past every legitimate hold; the prime suspect is a waiter that parked across the switch on a core that never reached park_blocked\r\n");
+}
+
+/// WEDGE-6 — stalled futex acquisitions seen since boot, for the `[spin1]` line (the print above is
+/// once per episode and lock-free; this is the count a witness pass can read from another core).
+static FUTEX_STALLS: AtomicU64 = AtomicU64::new(0);
+
 impl FutexBucket {
     const fn new() -> Self {
         FutexBucket {
             locked: AtomicBool::new(false),
+            holder: AtomicU64::new(0),
             key: AtomicU64::new(0),
             waiters: UnsafeCell::new(VecDeque::new()),
         }
     }
     #[inline]
     fn lock_raw(&self) {
+        // WEDGE-6: bounded-witness spin, exactly WEDGE-4's W4-B shape. The counter is bumped before
+        // the print so a core that stalls with the UART itself unavailable still leaves a number.
+        let mut spins: u64 = 0;
         while self.locked.swap(true, Ordering::Acquire) {
+            spins = spins.wrapping_add(1);
+            if spins == FUTEX_STALL_SPINS {
+                FUTEX_STALLS.fetch_add(1, Ordering::Relaxed);
+                futex_stall_witness(self);
+            }
             core::hint::spin_loop();
         }
+        // WEDGE-6: publish the holder AFTER the acquisition, so the word is only ever written by the
+        // core that owns the lock.
+        let core = percpu::this_cpu().cpu_index as usize;
+        self.holder.store(
+            ((core as u64 + 1) << 32) | (current_tid_relaxed(core) & 0xffff_ffff),
+            Ordering::Release,
+        );
     }
     #[inline]
     fn unlock_raw(&self) {
+        // WEDGE-6: clear the holder BEFORE the release, so the word is never stale-attributed to a
+        // core that has already let go (and never written by a core that no longer owns the lock).
+        self.holder.store(0, Ordering::Relaxed);
         self.locked.store(false, Ordering::Release);
     }
     #[inline]
@@ -2656,7 +5170,22 @@ pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
             let mut claimed = None;
             for b in FUTEX.iter() {
                 b.lock_raw();
-                if b.key.load(Ordering::Relaxed) == 0 {
+                // FUTEX-DUP (VUG-PACE-2) — accept a bucket ANOTHER waiter keyed to `key` between our
+                // existence scan above and this claim pass. Two waiters entering together on a key with
+                // no standing bucket (the ONLY two-concurrent-waiter key in the system is user-vug's
+                // PHASE word: both workers park on it in the same instant, once per frame) could each
+                // complete the existence scan before either had stored the key, and the old claim loop
+                // — which tested `== 0` alone — then minted TWO buckets for one key. `futex_wake`
+                // stopped at the first, and the second bucket's waiter slept forever: the s1q win1
+                // lockup (att=0, no fault, parent parked at the frame barrier behind its stranded
+                // worker). This check closes the common window; the wake-side full scan below is the
+                // correctness backstop for the sliver it cannot (a foreign bucket freeing mid-scan).
+                let k = b.key.load(Ordering::Relaxed);
+                if k == key {
+                    claimed = Some(b);
+                    break;
+                }
+                if k == 0 {
                     b.key.store(key, Ordering::Relaxed);
                     claimed = Some(b);
                     break;
@@ -2707,6 +5236,11 @@ pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
         unsafe { (*b.waiters.get()).len() } < WAIT_CAPACITY,
         "futex waiter overflow (raise WAIT_CAPACITY)"
     );
+    // FLUID-3 — the park clock. Opens here (the last instruction before the switch out) and closes
+    // on the first instruction after resume, so it prices the WHOLE invisible interval: blocked in
+    // the bucket, plus `make_ready`-to-dispatch. This is the vug-side wait the P83 idle reserve is
+    // made of; see the ledger above `fluid3_note_park`.
+    let fl3_t0 = super::now_cycles();
     unsafe {
         debug_assert_eq!((*raw).cpu as usize, cpu, "futex_wait: task on the wrong CPU");
         (*raw).state.store(STATE_BLOCKED, Ordering::Release);
@@ -2717,23 +5251,45 @@ pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
         switch_context(&raw mut (*raw).ctx_sp, SCHED[cpu].scheduler_sp.load(Ordering::Acquire));
     }
     // Resumed once `futex_wake` moved us back to our run queue (it released the lock).
+    fluid3_note_park(super::now_cycles().saturating_sub(fl3_t0));
     irq_restore(daif);
     FutexWait::Woken
 }
 
-/// FUTEX_WAKE: wake up to `n` waiters parked on `key`; returns the number actually woken. Releases the
+/// FUTEX-DUP (VUG-PACE-2) — wakes that found MORE THAN ONE bucket serving their key. Every count here
+/// is one occurrence of the double-claim race `futex_wait`'s claim loop can still lose (see the note
+/// there); before the full-scan fix each one was a permanently stranded waiter — the s1q win1 lockup.
+/// Expected to stay at 0 on almost every boot; nonzero is the race observed AND survived.
+static FUTEX_DUP: AtomicU64 = AtomicU64::new(0);
+/// FUTEX-DUP — rate limit for the per-event witness line, `[spread4] rewake`-style: the first few
+/// occurrences name themselves, the cumulative counter carries the rest.
+static FUTEX_DUP_LOG: AtomicU32 = AtomicU32::new(0);
+const FUTEX_DUP_LOG_MAX: u32 = 8;
+
+/// FUTEX_WAKE: wake up to `n` waiters parked on `key`; returns the number actually woken. Releases a
 /// bucket back to free once its last waiter leaves. Waiters are re-readied OUTSIDE the bucket lock (the
 /// run-queue lock must never nest under it — same rule as `Semaphore::post`).
+///
+/// FUTEX-DUP (VUG-PACE-2): the scan visits EVERY bucket serving `key`, not just the first. The claim
+/// race in `futex_wait` can leave two buckets keyed alike (two waiters entering together on a key with
+/// no standing bucket), and the old `break` after the first match stranded the second bucket's waiter
+/// on a key nothing would ever name again — with user-vug's PHASE futex that was a worker asleep
+/// forever, the parent parked at the frame barrier behind it, and a window that stopped presenting with
+/// no fault anywhere (the s1q win1 signature: att=0, parked=0ms, composited by neighbors only). The
+/// early exit now happens only once `n` waiters are woken; the extra cost on the common single-bucket
+/// wake is one pass over the remaining bucket keys, each a lock/load/unlock with no waiter traffic.
 pub fn futex_wake(key: u64, n: usize) -> usize {
     debug_assert!(key != 0, "futex key must be non-zero");
     let daif = irq_save_mask();
     let mut woken = 0usize;
+    let mut buckets_hit = 0u32;
     for b in FUTEX.iter() {
         b.lock_raw();
         if b.key.load(Ordering::Relaxed) != key {
             b.unlock_raw();
             continue;
         }
+        buckets_hit += 1;
         while woken < n {
             let next = unsafe { (*b.waiters.get()).pop_front() };
             match next {
@@ -2754,7 +5310,31 @@ pub fn futex_wake(key: u64, n: usize) -> usize {
             b.key.store(0, Ordering::Relaxed); // last waiter gone — release the bucket
         }
         b.unlock_raw();
-        break;
+        if woken >= n {
+            break; // the wake's budget is spent — semantics unchanged from the single-bucket scan
+        }
+    }
+    if buckets_hit > 1 {
+        // WITSWEEP — the witness's own blind spot, stated: `[futexdup]` CANNOT fire for an n==1 wake.
+        // The scan `break`s the moment the budget is met (`woken >= n` above), so a single-waiter wake
+        // that finds its waiter in the FIRST matching bucket never visits a second one — a duplicate
+        // pair keyed alike is then both UNWITNESSED (buckets_hit stays 1) and left UNDRAINED (the
+        // second bucket keeps its key and its waiter until some later wake on that key scans past the
+        // first). This arc's target case (user-vug's PHASE futex) wakes n==2, so the scan runs past
+        // the first bucket and the duplicate is both drained and counted; the blind spot is real only
+        // for keys woken strictly one-at-a-time, where the strand it could hide is also the one the
+        // full-scan fix exists to absorb. A zero FUTEX_DUP therefore means "no duplicate SEEN", not
+        // "no duplicate happened".
+        //
+        // The race happened and the full scan absorbed it. Witness it: this exact shape was a silent
+        // permanent strand before the fix, so each early occurrence is worth a line on the wire.
+        FUTEX_DUP.fetch_add(1, Ordering::Relaxed);
+        if FUTEX_DUP_LOG.fetch_add(1, Ordering::Relaxed) < FUTEX_DUP_LOG_MAX {
+            serial_println!(
+                ":: [futexdup] key={:#x} buckets={} woken={} (double-claim absorbed) ::",
+                key, buckets_hit, woken
+            );
+        }
     }
     irq_restore(daif);
     woken
@@ -2815,6 +5395,60 @@ pub fn futex_parked_total() -> usize {
     }
     irq_restore(daif);
     n
+}
+
+// ---- FLUID-3 — price the futex park (the vug-side wait the load meter proves is real idle) -------
+//
+// P83 bench observation (Peter, live): pointer motion INCREASES a fleet core's idle, and each vug
+// SETTLES to a characteristic fps below available capacity. The SCHED load meter counts service time
+// as busy (`CoreAccount::busy_pct`), so the growing reserve is genuine idle: fleet tasks stop being
+// runnable. The only place a live (non-paused) vug leaves the run queues is `futex_wait` — the frame
+// barrier (`DONE`), the worker release (`PHASE`) and the idle input ring are all futex parks — so the
+// park duration distribution IS the invisible wait this arc exists to price. Measured from just
+// before the context switch out to the first instruction after resume, so it includes wake-to-
+// dispatch latency: exactly the interval the parked core may sit idle while the meter shows reserve.
+//
+// Drained on the `[wcn]`/`[comp2]` cadence by `video::wm`'s `[fluid3]` emit, which pairs it with the
+// present-side concurrency figures. The histogram is log2 in microseconds (bucket b holds parks in
+// [2^(b-1), 2^b) us, top bucket open-ended) — enough to read the modes: a barrier park behind a
+// healthy worker is tens-to-hundreds of us; a park behind a starved worker on a saturated core is
+// milliseconds; an idle vug's input-ring park is seconds and lands in the top bucket.
+const FL3_BUCKETS: usize = 16;
+static FL3_PARK_N: AtomicU64 = AtomicU64::new(0);
+static FL3_PARK_CYC: AtomicU64 = AtomicU64::new(0);
+static FL3_PARK_MAX_CYC: AtomicU64 = AtomicU64::new(0);
+static FL3_HIST: [AtomicU32; FL3_BUCKETS] = [const { AtomicU32::new(0) }; FL3_BUCKETS];
+
+/// FLUID-3 — fold one completed futex park into the window's ledger. Called on the resumed task's
+/// own path with IRQs still masked; three relaxed RMWs and one shift, no locks.
+#[inline]
+fn fluid3_note_park(cyc: u64) {
+    FL3_PARK_N.fetch_add(1, Ordering::Relaxed);
+    FL3_PARK_CYC.fetch_add(cyc, Ordering::Relaxed);
+    FL3_PARK_MAX_CYC.fetch_max(cyc, Ordering::Relaxed);
+    let cyc_per_us = (load_window_cyc().saturating_mul(4) / 1_000_000).max(1);
+    let us = (cyc / cyc_per_us).max(1);
+    let b = ((64 - us.leading_zeros()) as usize).min(FL3_BUCKETS - 1);
+    FL3_HIST[b].fetch_add(1, Ordering::Relaxed);
+}
+
+/// FLUID-3 — drain the park ledger: `(parks, mean_us, max_us, hist)`. The histogram is log2-us as
+/// documented on the statics; the caller (`video::wm::fluid3_emit`) derives percentiles from it.
+pub fn fluid3_drain() -> (u64, u64, u64, [u32; FL3_BUCKETS]) {
+    let n = FL3_PARK_N.swap(0, Ordering::Relaxed);
+    let cyc = FL3_PARK_CYC.swap(0, Ordering::Relaxed);
+    let max = FL3_PARK_MAX_CYC.swap(0, Ordering::Relaxed);
+    let mut hist = [0u32; FL3_BUCKETS];
+    for (i, h) in FL3_HIST.iter().enumerate() {
+        hist[i] = h.swap(0, Ordering::Relaxed);
+    }
+    let cyc_per_us = (load_window_cyc().saturating_mul(4) / 1_000_000).max(1);
+    (
+        n,
+        cyc.checked_div(n).unwrap_or(0) / cyc_per_us,
+        max / cyc_per_us,
+        hist,
+    )
 }
 
 /// KILLBOUND — sweep every wait an EL0 task can be parked in and evict the ones an armed kill names.
@@ -3457,7 +6091,7 @@ fn skill_rerun_body(_: usize) {
 /// never be interrupted — it would wedge this single cooperative core. That trigger is metal-only.
 #[cfg(feature = "pi")]
 pub fn skill_kill_witness(cpu: usize) {
-    let queue_empty = || RUN_QUEUES[cpu].lock().len() == 0;
+    let queue_empty = || rq(cpu).len() == 0;
     let slots_free = || {
         (0..MAX_KILL_REQS).all(|i| KILLS[i].state.load(Ordering::Acquire) == KILL_FREE)
     };
@@ -3803,6 +6437,24 @@ static LOAD_WITNESS_LAST: AtomicU64 = AtomicU64::new(u64::MAX);
 /// `ctx_switches` sum snapshot at the last emission, to derive the per-window context-switch delta.
 static LOAD_WITNESS_CTX: AtomicU64 = AtomicU64::new(0);
 
+/// PULSE-5 — count of load windows closed by a FOLD (`account` reaching the budget at a dispatch
+/// boundary). It is the denominator of the arc's claim: reads are no longer waiting on these. Bumped
+/// once per window per core (~4/s/core), never per dispatch, so it adds nothing measurable to the
+/// switch path.
+static PULSE5_FOLD_WINDOWS: AtomicU64 = AtomicU64::new(0);
+/// PULSE-5 — high-water in-flight execution span (CNTPCT cycles) seen at witness sample time. This is
+/// the staleness that used to be invisible: pre-PULSE-5 a span this long contributed NOTHING to the
+/// reported percent until it ended. Sampled only by the witness (~1 s cadence, metal-only), so it is
+/// a floor on the true maximum, never an inflation of it.
+static PULSE5_SPAN_MAX_CYC: AtomicU64 = AtomicU64::new(0);
+
+/// CNTPCT cycles → milliseconds, for witness output only. Uses the same cached CNTFRQ the load window
+/// is derived from, so the two numbers are always expressed against one clock.
+fn cyc_to_ms(cyc: u64) -> u64 {
+    let frq = load_window_cyc().saturating_mul(4).max(1); // load_window_cyc() == CNTFRQ/4
+    cyc / (frq / 1000).max(1)
+}
+
 /// SCHED-2 periodic load heartbeat: called once per `timer_preempt` (per core, per tick, metal-only).
 /// The core whose atomic increment lands exactly on the `LOAD_WITNESS_INTERVAL` boundary is the sole
 /// emitter for that window (fetch_add hands each multiple to exactly one core), so there is no
@@ -3839,6 +6491,480 @@ fn load_witness_tick() {
     serial_println!(
         ":: SCHED: load c0={} c1={} c2={} c3={} (ctx +{}/win) ::",
         c(0), c(1), c(2), c(3), ctx_delta
+    );
+    pulse5_witness();
+    spread4_witness(); // SPREAD-4: the placement signal beside the load it is derived from
+    prio_witness(); // SCHED-PRIO: who WON those dispatches, beside where they were placed
+}
+
+/// PULSE-5 — the proof line for age-on-read. It says three things and nothing else: how long each
+/// core has been inside its current task RIGHT NOW (`live cN=..ms` — the term the reported percents
+/// now include and previously omitted entirely), the worst such span seen so far (`span_max` — the
+/// staleness the old `recent_pct` would have been carrying, invisibly, for that whole span), and how
+/// many windows the FOLD path closed (`folds` — unchanged machinery, kept so the line shows the
+/// dispatch-boundary path still working rather than replaced; reads simply no longer wait on it).
+/// A `span_max` well past `window` beside a `SCHED: load` line that still reads honestly busy is the
+/// whole arc in one line.
+///
+/// THREE callers, deliberately: `load_witness_tick` (metal, the attended-boot proof, inheriting that
+/// line's change-only suppression so it adds no steady-state chatter), `load_accounting_witness`
+/// (once, in the QEMU battery — otherwise nothing in the gate exercises the aged read at all, since
+/// `timer_preempt` never runs on raspi4b), and `storm_census` (STORM-HEADROOM: re-emitted at the
+/// storm verb's launch boundaries, from task context, so a fleet capture reads this line at the
+/// instant the fleet changes size rather than at the timer's). Reads only; safe from any core.
+fn pulse5_witness() {
+    let mut live_ms = [0u64; 4];
+    for cpu in 0..NUM_CPUS.min(4) {
+        let span = ACCT[cpu].live_span_cyc();
+        PULSE5_SPAN_MAX_CYC.fetch_max(span, Ordering::Relaxed);
+        live_ms[cpu] = cyc_to_ms(span);
+    }
+    // SPIN-1 (2026-07-30, the P87/P92/P93 desktop lockup): a core inside ONE task for >10 s while
+    // the witness still runs is the wedge signature ([prio] el0 huge, svc=0, comp2 rate collapsed)
+    // — and until now the line never NAMED the task. Cross-CPU current read: the pointer load is
+    // atomic; deref is safe in practice because a task that has been current for 10 s is
+    // definitionally not mid-drop. Prints every witness pass while the condition holds.
+    for cpu in 0..NUM_CPUS.min(4) {
+        if cyc_to_ms(ACCT[cpu].live_span_cyc()) > 10_000 {
+            let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+            if !raw.is_null() {
+                let (id, name, st) = unsafe { ((*raw).id, (*raw).name, (*raw).state.load(Ordering::Relaxed)) };
+                let (rxl, rxc, rxw) = {
+                    #[cfg(feature = "baremetal")]
+                    { crate::arch::serial::RX_READY.debug_state() }
+                    #[cfg(not(feature = "baremetal"))]
+                    { (false, 0i64, 0usize) }
+                };
+                let (sched_phase, sched_passes) = spin8_state(cpu);
+                serial_println!(
+                    "[spin1] cpu={} span={}ms task={}:{} state={} park={} | rx_ready locked={} count={} waiters={} | sem_stalls={} sem_spin_max={} | bs_phase={} bs_loops={} | disp busy={} idle={} | irq total={} last={} unhandled={} unhandled_last={} | sched phase={} passes={} futex_stalls={} — one task has owned this core the whole span; the [prio]/[comp2] lines beside this name the starvation",
+                    cpu, cyc_to_ms(ACCT[cpu].live_span_cyc()), id, name, st,
+                    SCHED[cpu].park_kind.load(Ordering::Relaxed),
+                    rxl as u32, rxc, rxw,
+                    SEM_STALL_EPISODES.load(Ordering::Relaxed),
+                    SEM_SPIN_MAX.load(Ordering::Relaxed),
+                    RX_BS_PHASE.load(Ordering::Relaxed),
+                    RX_BS_LOOPS.load(Ordering::Relaxed),
+                    // SPIN-5: c3's own scheduler heartbeat. Frozen busy+idle across consecutive
+                    // [spin1] prints = the CORE's scheduler is wedged (the current pointer is real
+                    // and the stall is in the dispatch/resume path); advancing = current is a lie.
+                    meter_cpu_ticks(cpu).0,
+                    meter_cpu_ticks(cpu).1,
+                    // SPIN-7: the IRQ story on the stalled core — a racing total beside a frozen
+                    // task = interrupt storm; unhandled_last names the screaming line.
+                    crate::arch::gic::IRQ_TOTAL[cpu & 7].load(Ordering::Relaxed),
+                    crate::arch::gic::IRQ_LAST_INTID[cpu & 7].load(Ordering::Relaxed),
+                    crate::arch::gic::IRQ_UNHANDLED[cpu & 7].load(Ordering::Relaxed),
+                    crate::arch::gic::IRQ_UNHANDLED_LAST[cpu & 7].load(Ordering::Relaxed),
+                    // SPIN-8: WHERE in its own scheduler loop the stalled core stands, and whether
+                    // it is standing still. `passes` frozen across consecutive prints is the wedge;
+                    // `phase` names the statement. See the SPIN8_* table above `dispatch_next`.
+                    sched_phase,
+                    sched_passes,
+                    // WEDGE-6: futex-bucket acquisitions that outran every legitimate hold. Non-zero
+                    // beside phase=3 is the whole verdict — the backstop's `futex_wake` is the wedge.
+                    FUTEX_STALLS.load(Ordering::Relaxed)
+                );
+            }
+        }
+    }
+    serial_println!(
+        "[pulse5] live c0={}ms c1={}ms c2={}ms c3={}ms span_max={}ms window={}ms folds={}",
+        live_ms[0], live_ms[1], live_ms[2], live_ms[3],
+        cyc_to_ms(PULSE5_SPAN_MAX_CYC.load(Ordering::Relaxed)),
+        cyc_to_ms(load_window_cyc()),
+        PULSE5_FOLD_WINDOWS.load(Ordering::Relaxed),
+    );
+}
+
+/// SCHED-PRIO — the proof line for the interactive service band, in the `[pulse5]`/`[spread4]` mould
+/// and emitted from the same two sites, so the dispatch share reads beside the load it explains.
+///
+/// It says four things, all as PER-WINDOW deltas (the running totals follow, so a single line is
+/// still interpretable if the previous one was suppressed):
+///
+///   * `svc` — dispatches won by a task whose BASE priority is in the band. On a busy panel this is
+///     the compositor + router + HID pump getting the core the moment they are ready.
+///   * `el0` — dispatches of EL0/user tasks over the same window. `svc` and `el0` are not a partition
+///     (ordinary `PRIO_NORMAL` kernel workers are in neither); they are the two populations the arc
+///     is about, and their RATIO is the reading. The band is working when `svc` is a small, steady
+///     share and `el0` stays LARGE — a collapsing `el0` would mean the fleet is being starved, which
+///     is the failure this arc must not cause.
+///   * `defer` — service-band wakes that found a lower-band task running on the target core, i.e. the
+///     residual "the compositor was ready and still had to wait" (bounded to one tick by
+///     `preempt_hint`). Large `defer` beside large `svc` is contention being resolved; large `defer`
+///     with `svc` near zero would mean the band is not being granted and something is wrong.
+///   * `agedin` — anti-starvation relocations that lifted a below-band task INTO the band. This is
+///     the fairness valve; a nonzero figure under load is the proof that EL0 cannot be excluded.
+///
+/// Reads only, lock-free, safe from any core, no `pi` gate (matching its two neighbours): the
+/// counters exist on every aarch64 build and simply stay zero where there is no EL0 and no panel.
+///
+/// THREE callers, and the third is why this is `pub`. `load_witness_tick` and
+/// `load_accounting_witness` are the two `[pulse5]`/`[spread4]` sites; the first is metal-only
+/// (`timer_preempt` never runs on raspi4b) and the second fires exactly ONCE, early, before the panel
+/// tasks are spawned at all — so between them nothing would ever print this line at the moment it is
+/// about: a live compositor contending with a live fleet. The third caller is the render task's own
+/// rate-limited `[sched6]` block (`main.rs::render_service`), which ticks on both QEMU and metal for
+/// as long as the panel is up, and which reports the composites/s figure this line explains.
+pub fn prio_witness() {
+    let mut svc = 0u64;
+    let mut el0 = 0u64;
+    let mut defer = 0u64;
+    let mut aged = 0u64;
+    for cpu in 0..NUM_CPUS {
+        svc += PRIO_SVC_DISPATCH[cpu].load(Ordering::Relaxed);
+        el0 += PRIO_EL0_DISPATCH[cpu].load(Ordering::Relaxed);
+        defer += PRIO_DEFER[cpu].load(Ordering::Relaxed);
+        aged += PRIO_AGED_IN[cpu].load(Ordering::Relaxed);
+    }
+    let d_svc = svc.saturating_sub(PRIO_LAST_SVC.swap(svc, Ordering::Relaxed));
+    let d_el0 = el0.saturating_sub(PRIO_LAST_EL0.swap(el0, Ordering::Relaxed));
+    let d_defer = defer.saturating_sub(PRIO_LAST_DEFER.swap(defer, Ordering::Relaxed));
+    let d_aged = aged.saturating_sub(PRIO_LAST_AGED.swap(aged, Ordering::Relaxed));
+    serial_println!(
+        "[prio] svc={} el0={} defer={} agedin={} /win (band>={}, totals svc={} el0={})",
+        d_svc, d_el0, d_defer, d_aged, PRIO_SERVICE, svc, el0,
+    );
+}
+
+/// SPREAD-4 — the proof line for live residents + re-placement, in the `[pulse5]` mould and emitted
+/// from the same three sites (`load_witness_tick`, `load_accounting_witness`, and — since
+/// STORM-HEADROOM — `storm_census`, which re-emits it at the storm verb's launch boundaries), so the
+/// placement signal is readable beside the load numbers it is derived from. It says exactly three
+/// things:
+///
+///   * `cN=active/committed` — per core, the runnable resident count `pick_cpu` now keys on, over the
+///     SPREAD-3 committed count it used to. `2/5` is the arc in one field: three of that core's five
+///     EL0 residents are parked and were, until now, steering placement away from a core with room.
+///   * `rewake` / `stay` — how many EL0 wakes moved to a lighter core and how many did not, counted
+///     over the wakes that ASKED (SPREAD-5: long parks only). A fleet in balance is nearly all `stay`;
+///     a burst of `rewake` is a pile-up being taken apart. Post-SPREAD-5 `rewake` should track real
+///     focus changes — single digits over a session, not the thousands P75 measured.
+///   * `short` — SPREAD-5: wakes that skipped placement because the park was a frame-loop micro-park.
+///     Expected to dominate `rewake + stay` by orders of magnitude on a windowed fleet; that ratio IS
+///     the damping. `short` climbing while `rewake` stays flat is the arc working.
+///   * `refresh` — SPREAD-6: micro-park wakes that asked anyway because the task's last placement ask
+///     was over `PLACE_REFRESH_MS` ago (the escapement that unlatches stale packing — the residual
+///     "predestined fps"). ~4/s per continuously-running EL0 task; its OUTCOMES land in
+///     `rewake`/`stay`, so `refresh` climbing with `rewake` flat is a fleet already in place.
+///   * `margin` / `minpark` — the two thresholds those decisions were made against (runnable-resident
+///     gap, and minimum park duration), so a reading is interpretable without the source.
+///
+/// Reads only, lock-free, safe from any core. Not `pi`-gated, matching `pulse5_witness` beside it: it
+/// is one introspection line on a path that already prints one, and the counters it reads exist on
+/// every aarch64 build (they simply stay zero where there is no EL0).
+fn spread4_witness() {
+    serial_println!(
+        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} short={} refresh={} margin={} minpark={}ms",
+        el0_active(0),
+        EL0_RESIDENTS[0].0.load(Ordering::Relaxed),
+        el0_active(1),
+        EL0_RESIDENTS[1].0.load(Ordering::Relaxed),
+        el0_active(2),
+        EL0_RESIDENTS[2].0.load(Ordering::Relaxed),
+        el0_active(3),
+        EL0_RESIDENTS[3].0.load(Ordering::Relaxed),
+        SPREAD4_REWAKE.load(Ordering::Relaxed),
+        SPREAD4_STAY.load(Ordering::Relaxed),
+        SPREAD5_SHORT_STAY.load(Ordering::Relaxed),
+        SPREAD6_REFRESH.load(Ordering::Relaxed),
+        REWAKE_MARGIN,
+        REWAKE_MIN_PARK_MS,
+    );
+    spread7_witness();
+    spread10_witness();
+}
+
+/// SPREAD-10 — the co-placement proof line, beside `[spread4]` (same emit sites, so the sibling map
+/// is readable next to the per-core load it biases). `slots 1c/2c/3c+` is the cores-per-slot
+/// histogram over live slots (slots whose committed count is zero everywhere are not counted): the
+/// arc's expected metal signature is the population collapsing into `1c`/`2c` under storm, with the
+/// `[fluid3]` park percentiles on the same wire dropping out of the millisecond buckets and the
+/// per-vug `[wcn]` rates converging upward. `co_moves` is cumulative placements the co-residency
+/// bonus DECIDED (sibling-lane rewakes + bonus-steered spawns): it should step at convergence edges
+/// (spawn bursts, load shifts) and go flat between them — climbing steadily beside a static
+/// histogram would be thrash, which the strictly-increasing-co-residency move rule is built to
+/// exclude. Reads only, lock-free, safe from any core; all-zero (no live slot) on the QEMU battery
+/// before EL0 exists, which proves the wiring exactly as `[spread4]`'s zero baseline does.
+///
+/// SPREAD-12 adds the recruitment pair on the same line, deliberately beside `co_moves`: the two
+/// arcs pull in opposite directions by design (co-placement gathers a slot, recruitment spreads it
+/// when a core is genuinely empty), and reading them apart would make either one look like a bug.
+/// `recruit` is empty cores taken; `rstale` is empty cores refused by the freshness gate, which is
+/// also the only way an empty core can be offered to a contended task and NOT taken (see the block
+/// beside `SPREAD12_RECRUIT` for why a separate "declined" field would have been a structural zero).
+/// The healthy one-window signature is `recruit` stepping a few times and settling, `rstale` at
+/// zero, and the `:: SCHED: load ::` line no longer showing a 0% core beside a 98% one.
+///
+/// SPREAD-13 NARROWED `recruit` TO `spare == 0`, and this is a change in an EXISTING field's meaning
+/// rather than a new one, so it is stated here where the field is printed. While `spare > 0` the
+/// suspension zeroes the retention bonus, which makes the margin lane co-admit every candidate the
+/// idle lane admits, which makes `recruit`'s lane-only attribution identically false. `recruit=0`
+/// beside `spare>0` therefore says NOTHING about recruitment — not that it stopped, not that it is no
+/// longer needed, not that the idle lane went quiet. It is uninterpretable in that regime, by
+/// construction. Read it only on lines where `spare=0`; the derivation is above `SPREAD12_RECRUIT`.
+/// Anyone holding a prior from PA3's `recruit=81` should expect `recruit=0` on the same machine now.
+///
+/// SPREAD-13 adds the conditionality triple, and the three fields are only interpretable together:
+///
+///   * `spare` — cores owning no committed EL0 resident and provably dispatching, sampled NOW. It is
+///     the predicate itself: `spare=0` means co-placement is live and every other field on this line
+///     carries its pre-SPREAD-13 meaning; `spare>0` means it is suspended. This is a gauge rather
+///     than a counter and is trustworthy as one precisely because it is built on COMMITTED residents
+///     — it moves at spawn/reap/move, not at frame rate, so a single sample is representative of the
+///     window rather than of the microsecond. The same field read against `1c`/`2c`/`3c+` is the
+///     whole one-window story in one line: three tasks on three cores with a fourth spare reads
+///     `3c+=1 spare=1`, and the load line beside it should show three cores carrying work.
+///   * `khot` (SPREAD-14) — the same gauge's refusals-for-kernel-heat: committed-empty,
+///     dispatch-fresh cores that `spare` would have counted before the kernel-cold half existed.
+///     Under `UNAOS_VUGPAR=1` with a full-screen present running, the expected reading is `khot`
+///     equal to the band helper count while `spare` reads 0 — co-placement correctly LIVE on a
+///     machine whose "free" cores are blitting; the pre-SPREAD-14 build read `spare=3` there. On a
+///     no-`vugpar` build `khot` must read 0, and a nonzero is a sighting of some other pinned kernel
+///     load saturating an unowned core, not noise. Computed by the same scan as `spare` (one
+///     instrument, both fields), so its zero is evidence on any line where `spare` is legible.
+///   * `split` — triples this arc took apart, counted as spread-lane-ONLY moves, which means the
+///     `home_act == 1` case only: at `home_act >= 2` the margin and idle lanes co-admit the same
+///     candidate and the move goes unattributed. See `SPREAD13_SPLIT` for that population.
+///   * `repack` — the flap side: moves that put a slot task back onto a core hosting its siblings
+///     from a core hosting none, counted with no lane attribution (so a margin-lane repack under
+///     suspension counts too). `split` stepping with `repack` flat is the arc holding. Both climbing
+///     at the rate of placement asks is the reachable 2-cycle documented above `spare_cores` —
+///     EXPECTED, clock-bounded at `PLACE_REFRESH_MS`/`REWAKE_MIN_PARK_MS`, and judged against the
+///     load line rather than treated as a defect. Only a climb at DISPATCH rate falsifies the bound.
+///
+/// Reading `split=0`: check `spare` first. `spare=0` means the lane is correctly dormant on a
+/// contended machine and says nothing about the arc. `spare>0` with `rstale` climbing means the lane
+/// fired and the freshness gate refused it, which is a wedge sighting rather than a placement result.
+/// `spare>0` with `rstale=0` and `3c+` still populated needs the load line before it is called a
+/// falsification: it is one if the load is still piled on a single core, and it is the
+/// `home_act >= 2` attribution gap above if the load line shows the work already spread.
+///
+/// THE QEMU BATTERY PRINTS `spare=0`, and that is a true reading rather than a broken one — worth
+/// writing down because it is the shape this track sends arcs back for. The battery's single emit
+/// comes from `load_accounting_witness`, which runs once early, before EL0 exists and before the APs
+/// have folded a span recently enough to clear `dispatch_fresh_cyc` (the same instant `[pulse5]`
+/// reports `folds=0` on that wire). A core that has never provably dispatched is NOT spare, by the
+/// definition above, so the field reports the state correctly and the battery proves wiring only —
+/// exactly as `[spread4]`'s all-zero baseline does beside it. On metal the emit comes from
+/// `load_witness_tick` inside `timer_preempt`, where every core is going round `run()` and folding a
+/// span every pass, so the freshness half never suppresses a genuinely spare core there.
+fn spread10_witness() {
+    let mut on1 = 0u32;
+    let mut on2 = 0u32;
+    let mut on3 = 0u32;
+    for slot in 1..KILL_ASID_SLOTS {
+        let mut cores = 0u32;
+        for cpu in 0..NUM_CPUS {
+            if SLOT_CORE_RES[cpu].0[slot].load(Ordering::Relaxed) > 0 {
+                cores += 1;
+            }
+        }
+        match cores {
+            0 => {}
+            1 => on1 += 1,
+            2 => on2 += 1,
+            _ => on3 += 1,
+        }
+    }
+    // SPREAD-13/14: one scan feeds both fields — the predicate itself (so `split`'s reading is
+    // decidable) and the cores the kernel-heat half refused it.
+    let (spare, khot, sparem, khotm, sparepct, kstale) = spare_scan_detail();
+    serial_println!(
+        "[spread10] slots 1c={} 2c={} 3c+={} co_moves={} ymoves={} recruit={} rstale={} spare={} khot={} hotref={} khotm={:#06x} sparem={:#06x} sparepct={} kstale={} split={} repack={}",
+        on1,
+        on2,
+        on3,
+        SPREAD10_CO_MOVES.load(Ordering::Relaxed),
+        SPREAD11_YIELD_MOVES.load(Ordering::Relaxed),
+        SPREAD12_RECRUIT.load(Ordering::Relaxed),
+        SPREAD12_STALE.load(Ordering::Relaxed),
+        spare,
+        khot,
+        SPREAD14_HOTREF.load(Ordering::Relaxed),
+        khotm,
+        sparem,
+        sparepct,
+        kstale,
+        SPREAD13_SPLIT.load(Ordering::Relaxed),
+        SPREAD13_REPACK.load(Ordering::Relaxed),
+    );
+}
+
+/// SPREAD-7 — the wake-quantization proof line, emitted beside `[spread4]` from the same sites.
+/// `quant` is how many EL0 wakes landed in the tick-quantized arm (equal-or-higher band than the
+/// target's running task, below the service band; see `preempt_hint`); `trim` (SPREAD-8) is how
+/// many of those wakes actually shortened the incumbent's countdown — the same-band trim policy
+/// firing; `wake2disp` prices ALL EL0 wakes: mean and max CNTPCT-derived microseconds from
+/// `make_ready` to first dispatch, over `n` wakes. The P79 ceiling read as `quant` climbing at the
+/// fleet park rate with `wd_mean` in the thousands of microseconds (half-quantum scale); with
+/// SPREAD-8 in force the expected signature is `trim` climbing beside `quant` and `wd_mean`
+/// bounded by one tick (~4000 us worst). A healthy fleet reads `wd_mean` in the tens (SGI +
+/// dispatch pass). Cumulative counters, reads only, safe from any core.
+fn spread7_witness() {
+    let n = SPREAD7_WD_N.load(Ordering::Relaxed);
+    let sum = SPREAD7_WD_SUM.load(Ordering::Relaxed);
+    let frq = load_window_cyc().saturating_mul(4).max(1); // == CNTFRQ_EL0, cached
+    let cyc_per_us = (frq / 1_000_000).max(1);
+    serial_println!(
+        "[spread7] quant={} trim={} wake2disp n={} mean={}us max={}us",
+        SPREAD7_QUANT.load(Ordering::Relaxed),
+        SPREAD8_TRIM.load(Ordering::Relaxed),
+        n,
+        sum.checked_div(n).unwrap_or(0) / cyc_per_us,
+        SPREAD7_WD_MAX.load(Ordering::Relaxed) / cyc_per_us,
+    );
+    // SPREAD-9 — the immediate-preemption proof line, beside [spread7] so the before/after is one
+    // wire read. `kick` = IPI-receipt preemptions performed (`ipi_preempt` dispatched instead of
+    // returning to the incumbent); `svc_lat` = service-band wake-to-dispatch, the number the kicks
+    // exist to collapse. Metal expectation under fleet load: `kick` climbing with the service wake
+    // rate and `svc_lat` mean < 100 us (IPI + dispatch pass — down from tick scale). In QEMU the
+    // SGIs are live but timer-driven service wakes are not, so the gate proves the counters and the
+    // switch path, not the latency.
+    let sn = SPREAD9_SVC_N.load(Ordering::Relaxed);
+    serial_println!(
+        "[spread9] kick={} svc_lat n={} mean={}us max={}us",
+        SPREAD9_KICK.load(Ordering::Relaxed),
+        sn,
+        SPREAD9_SVC_SUM.load(Ordering::Relaxed).checked_div(sn).unwrap_or(0) / cyc_per_us,
+        SPREAD9_SVC_MAX.load(Ordering::Relaxed) / cyc_per_us,
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// STORM-HEADROOM — the census the `storm` shell verb takes at its launch boundaries.
+// ---------------------------------------------------------------------------------------------
+//
+// The question is "what breaks FIRST as the fleet grows", and until now a storm run could not
+// answer it. Every quantity that would name a ceiling already exists, but each rides a clock of its
+// own: `:: SCHED: load ::` and its `[pulse5]`/`[spread4]`/`[spread7]`/`[spread9]`/`[spread10]`/
+// `[prio]` train ride `timer_preempt`'s ~1 s window (metal-only), `[fluid3]`/`[comp2]` ride the
+// compositor's. Reading a storm against them meant correlating by eye across two unsynchronised
+// cadences — and the interval that matters, the seconds in which the fleet is actually being built,
+// is SHORTER THAN ONE WINDOW. The launch boundary is a third clock, and the only one that samples
+// the fleet at the instant it changes size.
+//
+// This block mints no counter. Every number below already existed and is read through the accessor
+// that already owns it; what is new is WHEN they are sampled and that they are sampled TOGETHER.
+//
+// WHY DEPTH AND SATURATION ARE PRINTED AS A PAIR, always. The note above `pick_cpu` says why one
+// alone is uninterpretable: a core spinning flat-out inside one compute-bound vug holds that task in
+// `current`, NOT in its run queue, so it reads depth 0 exactly like a genuinely idle core. The pair
+// separates three different ceilings that the load line alone conflates:
+//   * `busy=99% rq=0/0` — saturated with nothing waiting; the ceiling is that core's throughput.
+//   * `busy=99% rq=6/6` — saturated with a queue behind it; the ceiling is PLACEMENT, and
+//     `[spread10] rstale`/`recruit` on the same block say whether placement was offered a way out.
+//   * `busy=-- ` — the core is not dispatching at all; nothing about it is a load measurement.
+//
+// WHAT THIS INSTRUMENT'S SILENCE MEANS — because a measurement whose absence is misread is worse
+// than no measurement. Apart from one `boot-baseline` line taken by `load_accounting_witness` (which
+// exists only so the gate EXECUTES this code), every `[storm]` line is emitted from the SHELL task
+// inside the `storm` verb. So it can run for exactly as long as the shell is dispatched. That is the
+// state a headroom probe is about, and its readings are honest there — but a fleet that starves the
+// shell also silences the probe, and starving the shell is one of the outcomes it is hunting. Its
+// silence is therefore NEVER a refutation of anything.
+//
+// Two properties make that silence READABLE rather than mute: the `pre` census is emitted BEFORE the
+// first launch, and one line is emitted after EACH successful launch — so the last `[storm] k=` on
+// the wire names the launch after which the shell stopped reporting, and a truncated tail is itself
+// the measurement. The instruments that survive a starved shell are the timer-driven ones —
+// `load_witness_tick` and the `[spin1]` block inside `pulse5_witness` — which run from the timer IRQ
+// on every core and depend on no task being schedulable. Read those BESIDE this block, never
+// instead of it, and never read a missing `post` as a clean run.
+//
+// WHAT IS DELIBERATELY ABSENT, and why each absence is a correctness property rather than a gap:
+//   * `[prio]`'s per-window DELTAS. `prio_witness` swaps its `PRIO_LAST_*` snapshots as it prints,
+//     so calling it here would silently shorten the next periodic `[prio]` line's window — a probe
+//     that alters what it measures. At a boundary sample the cumulative totals carry the same
+//     information and cost the periodic line nothing, so `storm_census` prints those instead.
+//   * `[fluid3]`'s park-duration percentiles. `fluid3_drain` CONSUMES the buckets it reports; they
+//     belong to the compositor, which drains them on the `[comp2]` cadence. Sampling them here would
+//     take the very samples the `[fluid3]` line is computed from — the same defect, larger. Read
+//     `[fluid3]` from its own cadence beside a storm run; park PRESSURE is still represented here,
+//     through `[spread4] short/rewake` and `[spread7] wake2disp`, which are cumulative and safe to
+//     re-read.
+//
+// COST, priced rather than waved away. `storm_probe` takes each core's run-queue lock once through
+// the `rq()` guard — IRQ-masked for the hold, WEDGE-4's law, the only admissible acquisition — for
+// an O(NUM_PRIORITIES) length read. That is byte-for-byte the hold `pick_cpu` already takes on every
+// EL0 spawn, and it happens once per launch rather than once per frame. Not zero, and saying so is
+// the point: an instrument that stands on the measured path has to state its own weight.
+
+/// STORM-HEADROOM — one boundary sample: per-core saturation, run-queue depth and EL0 residency,
+/// under the caller's `phase` label so a capture reads back in launch order. See the block above for
+/// what the pairs mean, what the line's absence does not prove, and what this hold costs.
+///
+/// TWO callers, and the second one exists for the reason stated at its site: the `storm` verb (the
+/// measurement this is for) and `load_accounting_witness` (one `boot-baseline` line, so the QEMU
+/// battery actually EXECUTES this function rather than merely compiling it).
+pub fn storm_probe(phase: &str) {
+    let mut ready = [0usize; 4];
+    let mut below = [0usize; 4];
+    let mut ctx = 0u64;
+    for cpu in 0..NUM_CPUS.min(4) {
+        // Both depths under ONE hold, so the total and the below-band figure describe the same queue
+        // state rather than two instants a lock release apart.
+        {
+            let q = rq(cpu);
+            ready[cpu] = q.len();
+            below[cpu] = q.len_below_band();
+        }
+        ctx += core_load(cpu).ctx_switches;
+    }
+    // SCHED-8's `--`-for-untracked rendering, from the same accessor the `:: SCHED: load ::` line
+    // uses: a core that has left the dispatch loop carries a FROZEN percent, and printing it as a
+    // number here would put a stale saturation reading in the middle of a headroom argument.
+    let b = |i: usize| {
+        let ld = core_load(i);
+        if ld.tracked {
+            alloc::format!("{}%", ld.busy_pct_recent)
+        } else {
+            alloc::string::String::from("--")
+        }
+    };
+    serial_println!(
+        "[storm] {} | busy c0={} c1={} c2={} c3={} | rq(ready/below-band) c0={}/{} c1={}/{} c2={}/{} c3={}/{} | el0(runnable/committed) c0={}/{} c1={}/{} c2={}/{} c3={}/{} | ctx={}",
+        phase,
+        b(0), b(1), b(2), b(3),
+        ready[0], below[0], ready[1], below[1], ready[2], below[2], ready[3], below[3],
+        el0_active(0), EL0_RESIDENTS[0].0.load(Ordering::Relaxed),
+        el0_active(1), EL0_RESIDENTS[1].0.load(Ordering::Relaxed),
+        el0_active(2), EL0_RESIDENTS[2].0.load(Ordering::Relaxed),
+        el0_active(3), EL0_RESIDENTS[3].0.load(Ordering::Relaxed),
+        ctx,
+    );
+}
+
+/// STORM-HEADROOM — the FULL boundary block, emitted at the two ends of a storm (the per-launch
+/// lines in between are [`storm_probe`] alone, which is the cheap half).
+///
+/// It is [`storm_probe`] followed by the standing witness train re-emitted at THIS instant instead
+/// of the timer's — `[pulse5]` (live spans + the `[spin1]` starvation block), then `[spread4]`,
+/// which already chains `[spread7]`/`[spread9]`/`[spread10]`: placement declines (`rstale`),
+/// recruitment, co-placement, wake-to-dispatch latency and the park/wake ratios, all in their
+/// existing wording so a storm capture and a steady-state capture are read with one vocabulary.
+///
+/// It closes with `[prio]`'s CUMULATIVE totals, read directly rather than through `prio_witness`,
+/// for the reason given in the block above: that function consumes the deltas the periodic line is
+/// made of, and a probe must not spend the instrument it is standing next to.
+pub fn storm_census(phase: &str) {
+    storm_probe(phase);
+    pulse5_witness();
+    spread4_witness(); // chains [spread7] -> [spread9], and [spread10]
+    let mut svc = 0u64;
+    let mut el0 = 0u64;
+    let mut defer = 0u64;
+    let mut aged = 0u64;
+    for cpu in 0..NUM_CPUS {
+        svc += PRIO_SVC_DISPATCH[cpu].load(Ordering::Relaxed);
+        el0 += PRIO_EL0_DISPATCH[cpu].load(Ordering::Relaxed);
+        defer += PRIO_DEFER[cpu].load(Ordering::Relaxed);
+        aged += PRIO_AGED_IN[cpu].load(Ordering::Relaxed);
+    }
+    serial_println!(
+        "[storm] {} prio totals svc={} el0={} defer={} agedin={} (cumulative — the per-window deltas stay with [prio])",
+        phase, svc, el0, defer, aged,
     );
 }
 
@@ -3894,6 +7020,28 @@ pub fn load_accounting_witness() {
             any_busy, any_ctx
         );
     }
+    // PULSE-5: the aged-read state behind the percents just asserted, on the one path the QEMU
+    // battery actually reaches. Separate line, so the PASS/FAIL line the gate matches is untouched.
+    pulse5_witness();
+    // SPREAD-4: same reasoning, same site. In the QEMU battery this runs before any EL0 task exists,
+    // so it reads all-zero — which is the honest baseline, and it proves the counters are wired and
+    // the line is emitted. The numbers that matter are the ones `load_witness_tick` prints on metal.
+    spread4_witness();
+    // SCHED-PRIO: same reasoning again. `timer_preempt` never runs on raspi4b, so `load_witness_tick`
+    // is unreachable there and this is the ONLY site that emits `[prio]` in the QEMU battery. The
+    // dispatch counters are live on that path (the cooperative loop dispatches through the same
+    // `dispatch_next`), so the line carries real numbers, not a wired-and-zero placeholder.
+    prio_witness();
+    // STORM-HEADROOM: the probe's own machinery, exercised by the gate. Every other line here is
+    // emitted by SOME path the battery reaches; `storm_probe` is reached only by an operator typing
+    // `storm`, so without this call its first execution ever would be on an attended bench, and a
+    // formatting or lock-ordering defect in it would surface exactly where it costs the most. This is
+    // the `[spread4]`-baseline argument one step further: that line proves its counters are wired,
+    // and this one proves the run-queue reads and the pair rendering RUN. Only the cheap half — the
+    // full `storm_census` would re-emit the three lines directly above it. Deliberately taken AFTER
+    // them so the PASS/FAIL line the gate matches, and the witness order it has always printed in,
+    // are untouched.
+    storm_probe("boot-baseline");
 }
 
 /// M3b/M4a/M4-capstone: turn on preemptive scheduling and put a workload on the APs, then flip
@@ -4078,8 +7226,11 @@ fn spawn_stealable_on(name: &'static str, entry: fn(usize), arg: usize, cpu: usi
         user_sp: 0,
         user_ttbr0: 0,
         steal_ok: true, // the point of the fixture: movable, but staged on one core
+        park_cyc: 0, // SPREAD-5: never parked yet; the first park_blocked stamps it.
+        place_cyc: now_cyc(), // SPREAD-6: spawn placement counts as the first ask of the question
+        wake_cyc: 0, // SPREAD-7: never woken yet; `make_ready` stamps it
     });
-    RUN_QUEUES[cpu].lock().push(task);
+    rq(cpu).push(task);
     poke_cpu(cpu);
 }
 
@@ -4355,7 +7506,7 @@ pub fn run_capstone_boot_core(cpu: usize) -> ! {
     // VUG-HONESTY: witness the parked-core display rule on this virt boot (deterministic, no framebuffer)
     // — a frozen non-demo core reads PARKED, never the demo core's fabricated load. The GICv3/test-arm
     // capture proves the display-honesty fix that completes the merged idle/busy-heartbeat counters.
-    let _ = crate::ui_status::parked_display_witness();
+    let _ = crate::vug::parked_display_witness();
     // AARCH64-PRIO M3: prove fixed-priority + anti-starvation aging before the CAPSTONE. Self-contained
     // and bounded (stages its own tasks, drains them, leaves the queue empty), so it never perturbs the
     // CAPSTONE that follows — it just adds the `priority+aging PASS` line to this cooperative boot.
