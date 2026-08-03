@@ -16,6 +16,57 @@ at `BLOCK-DOWN`), so **every fact below was settled on metal**, not in emulation
 
 ---
 
+## THE CT0/CT1 CLASS LAW — render lists run on CT1, never on CT0
+
+> **This is a standing design rule of this driver, not a campaign note.** It is the outcome of the
+> §49 first-kick ladder and it binds every submission path in `v3d.rs`. Read it before writing any
+> code that hands the CLE a control list.
+
+**The rule.** The V3D 4.2 CLE has two control threads and they are **not interchangeable**:
+
+| thread | register file | class it accepts | what it is |
+|---|---|---|---|
+| **CT0** | `CT0CS` `0x100` · `CT0CA` `0x110` · `CT0QBA` `0x160` · `CT0QEA` `0x168` · `CT0QMA` `0x170` · `CT0QMS` `0x174` · `CT0QTS` `0x15c` | **BIN-class control lists only** | the **binner**. Feeds the PTB; consumes `TILE_BINNING_MODE_CFG`, `START_TILE_BINNING`, `NUMBER_OF_LAYERS`, state, geometry, `FLUSH` |
+| **CT1** | `CT1CS` `0x104` · `CT1CA` `0x114` · `CT1EA` `0x10c` · `CT1QBA` `0x164` · `CT1QEA` `0x16c` | **RENDER-class control lists** | the **renderer**. Consumes `TILE_RENDERING_MODE_CFG`, `TILE_LIST_INITIAL_BLOCK_SIZE`, `TILE_COORDINATES`, the store/clear packets, `END_OF_RENDERING` |
+
+Therefore, without exception:
+
+1. **A render control list is submitted to `CT1QBA`/`CT1QEA`. Never to `CT0QBA`/`CT0QEA`.** Not as a
+   probe, not as a shortcut, not "because CT0 is the one that is already armed".
+2. **CT0 gets bin-class content only.** A single render-class opcode anywhere in a CT0-bound list
+   wedges the thread at that byte — including at byte 0, which is the usual case because render
+   lists open with `TILE_RENDERING_MODE_CFG`.
+3. **The bin-memory arming (`CT0QMA`/`CT0QMS`/`CT0QTS`, `BPOS=0`) is CT0's, and it does not make CT0
+   accept a render list.** Arming and class are independent axes (§49.10) and neither substitutes
+   for the other.
+4. **A wedge on CT0 whose list contains render-class packets is not a hardware bug and not an
+   encoding bug — it is this rule being broken.** Check the list's class *first*, before opening
+   `v3d_packet.xml`.
+
+**The silicon evidence, in one paragraph.** Eight metal boots of the `UNAOS_V3D_FIRSTKICK` family
+put one control list on CT0 as the boot's *first* kick — no probe frame in front of it, one variant
+per boot, same block, same MMU table, same L2T config, same arena, fault-gated — and the outcome
+splits perfectly on list class and on nothing else. Bin-class lists work: `empty` retired,
+`emptyunarm` retired *without any bin arming at all*, `m4` walked `CT0CA` from `QBA` to `QEA`.
+Render-class lists do not: `rcl`, `rclp1` and `rclp19` all froze at packet 0, and `rclp1` proved
+length is not the variable when a 10-byte list froze exactly like the 106-byte one. The two head-swap
+boots isolated the cause to the head *opcode's class*: boot10 prepended `NUMBER_OF_LAYERS` (op 119,
+**bin**-class) to the render list and `CT0CA` advanced **exactly 2 bytes** — the encoder, the submit
+and the address range are all sound — then froze on the byte where `TILE_RENDERING_MODE_CFG` begins;
+boot12 prepended `TILE_LIST_INITIAL_BLOCK_SIZE` (op 126, **render**-class, **no sub-id dispatch**,
+same 2-byte length, and byte-for-byte the packet that same list already carries at main-packet 5, all
+three facts *measured* on the wire) and `CT0CA` advanced **0 bytes**, `at-QBA=1`, on a boot with
+`mmu-fault-latched=0`. Op 126 carries no sub-id, so dispatch is exonerated; op 126 is not TRMC, so
+the TRMC encoding is exonerated; the one property op 121 and op 126 share is that they are
+render-class opcodes on the bin thread. The same boot's `[v3d58] xengine` line closes it from the
+other side — CT1 completed a frame and landed a byte-verified store on the *same block, same MMU
+table, same clock, same arena* in which CT0 refused the first byte — so no global explanation (MMU
+write permission, GMP, L2T ordering, clock, AXI/QoS) survives. **CT0 is bin-only silicon-side.** Full
+derivation: §49.8 (the bracket), §49.9 (`rclp<n>`), §49.10 (`rclhead`, boot10), §49.11 (`rclhead126`,
+boot12 — the class verdict); what the law retracts is §49.11a; the executable proof is §49.12.
+
+---
+
 ## 1. The bin control list requires fixed-function clip/viewport state (V3D-17)
 
 The binner binned nothing because `build_bin_cl` emitted geometry with the hardware
@@ -4678,6 +4729,14 @@ nothing, and §26's hub-INT and §36's PTB-frame instruments both point at it.
 
 ### 49.11 The last split — `UNAOS_V3D_FIRSTKICK=rclhead126` (PI-V3D-88)
 
+> **This section is answered — the `== QBA` row. RENDER-CLASS OPCODES AS A CLASS STALL CT0's
+> DECODER.** boot12 (`rclhead126`) froze at `QBA` with `advance from QBA = 0 bytes`, on a fault-free
+> boot, where boot10's bin-class op 119 advanced 2. The sub-id dispatch and the TRMC encoding are
+> both exonerated; what is left is the class. **CT0 is bin-only silicon-side and the fix is a driver
+> fix** — see *boot12 — the class verdict* at the end of this section, the standing rule at
+> [**THE CT0/CT1 CLASS LAW**](#the-ct0ct1-class-law--render-lists-run-on-ct1-never-on-ct0) at the top
+> of this file, the §49.11a audit of what that retracts, and §49.12 for the executable proof.
+
 §49.10 outcome A says the wall is the head packet and names it: `TILE_RENDERING_MODE_CFG`, opcode
 121. But "opcode 121" is not one property. It is **two**, and boot10 could not tell them apart
 because op 121 has both:
@@ -4778,3 +4837,91 @@ restoring; the full-knob `kernel8` build green once with `UNAOS_V3D_DEEP=1
 UNAOS_V3D_FIRSTKICK=rclhead126`; `strings -a target/pi_baremetal/kernel8.img` shows `[v3d87h]`,
 `[v3d87u]` and the raw `rclhead126` value. QEMU raspi4b models no V3D, so there is no QEMU leg for
 this arc at all — the verdict is the attended metal boot.
+
+---
+
+#### boot12 — the class verdict, CONFIRMED
+
+**The construction audit read clean before the kick, and it is measured, not asserted.** `[v3d87h]`,
+verbatim from the wire:
+
+> prepended op=126 (RENDER-class, NOT sub-id-dispatched, 2 bytes, through the same `Pkt`/`RclWriter`
+> encoder as every other packet in this file) ahead of the FULL rcl (106 bytes, 20 main packets) =>
+> list bytes=108 | byte-identity audit (MEASURED, not asserted): weighted sum over the plain list's
+> `[0,106)` = `0x0b61a528` vs the same weights over the built list's `[2,108)` = `0x0b61a528`,
+> `tail-is-plain-rcl=1` | head byte `@+0` = 126 (expected 126, `placed=1`) | boundary byte `@+2` = 121
+> (expected the plain rcl's own head op 121 = `P_TRMC=121`, `intact=1`) | in-list twin: `has-twin=1`
+> main-packet-5 `@+2+36=0x8026` op=126 `bytes-equal-to-the-prepended-packet=1`
+
+The in-list twin check is what makes the negative mean **class** and not *our encoding of op 126*:
+the two bytes in front of the list are byte-for-byte the op-126 packet the same list already carries
+at main-packet 5. The head is the list's own packet moved to the front.
+
+**The kick froze at the first byte.** `[v3d87h]`'s verdict line, verbatim:
+
+> prepended head op=126 (RENDER-class, no sub-id dispatch) | `QBA=0x0034b000` `head_len=2`
+> render-head boundary=`QBA+2=0x0034b002` `QEA=0x0034b06c` | sampler `samples=500` `in-span=500`
+> `max-in-span=0x0034b000` (advance from QBA = **0 bytes**) | `at-QBA=1` `at-boundary=0`
+> `past-boundary=0` | `mmu-fault-latched=0` (this line is GATED on it, exactly as `[v3d85r1]` is) —
+> **CT0CA HELD QBA AND NEVER ADVANCED** … It froze where op 119 advanced. **RENDER-CLASS OPCODES AS A
+> CLASS STALL CT0's DECODER, AND OP 126 JOINING OP 121 IN THE FREEZE PROVES IT IS THE CLASS, NOT THE
+> PACKET**
+
+The boot12 column, against boot10 in the same terms:
+
+| column | boot10 (`rclhead`, op **119**, bin-class) | boot12 (`rclhead126`, op **126**, render-class) |
+|---|---|---|
+| `QBA` / `QEA` | `0x00990000` / `0x0099006c` | `0x0034b000` / `0x0034b06c` |
+| `head_len`, boundary | 2, `QBA+2` | 2, `QBA+2` (**identical arithmetic**) |
+| `tail-is-plain-rcl` | 1 (`0x842c89ba` both sides) | 1 (`0x0b61a528` both sides) |
+| in-list twin | `has-twin=0` (op 119 has none) | **`has-twin=1`, bytes-equal=1** |
+| sampler `max-in-span` | `0x00990002` | `0x0034b000` |
+| **advance from `QBA`** | **2 bytes** | **0 bytes** |
+| `at-QBA`/`at-boundary`/`past-boundary` | `0`/`1`/`0` | **`1`**/`0`/`0` |
+| `MMU_CTL` / `mmu-fault-latched` | `0x060d0c01` / `0` | `0x060d0c01` / **`0`** |
+| `CT0CS` S4 (`[v3d85r7]`) | — | `0x00000018` (`CTERR=1 CTSUBS=1 CTRUN=0`) |
+| `[v3d85r3]` queue→thread | transfer happened | **`CT0EA` took `QEA` at S3, `moved=1`; `CT0RA` zero at every station** |
+| poison | intact | tile-state `0 of 64`, pool `0 of 8192` — fully intact, write-back completed |
+| `retired`/`consumed`/`frame-closed` | `0`/`0`/`0` | `0`/`0`/`0` |
+
+**Two properties went in, one came out.** Op 126 has no sub-id field and died anyway, so the
+**sub-id dispatch is exonerated**. Op 126 is not `TILE_RENDERING_MODE_CFG` and died identically, so
+the **TRMC encoding is exonerated** — there is nothing to re-check field-by-field against the v42
+reference, and the `== QBA + head_len` row's whole fix direction is void. What is left is the single
+property op 121 and op 126 share: **they are render-class opcodes, and they were put on the BIN
+thread.**
+
+**The bracket is complete, and it is the whole argument in eight rows.** Every member of the family
+was one boot, one variant, same block, same MMU table, same arena:
+
+| variant | list class | head packet | outcome |
+|---|---|---|---|
+| `empty` | bin | — | **retired** — frame closed |
+| `emptyunarm` | bin | — | **retired** (unarmed submit; asterisked by a latched fault, §49.10) |
+| `m4` | bin | — | **consumed** — `CT0CA` walked `QBA→QEA` |
+| `rcl` | render | op 121 (TRMC) | **frozen at packet 0** |
+| `rclp1` | render | op 121 (TRMC) | **frozen at packet 0** — a 10-byte list froze like the 106-byte one |
+| `rclp19` | render | op 121 (TRMC) | **frozen at packet 0** |
+| `rclhead` (119) | render tail, **bin-class head** | op 119 | **advanced exactly 2, then froze at TRMC** |
+| `rclhead126` | render tail, **render-class head** | op 126 | **frozen at `QBA`, 0 bytes** |
+
+Length is not the variable (`rclp1` vs `rcl`). The submit shape is not the variable (`emptyunarm`
+retired without any arming; `rclhead` advanced without it). The head *opcode* is the variable, and
+the head opcode's **class** is what it selects on: a bin-class head is eaten, a render-class head is
+not, and the very first render-class byte is where the decoder stops.
+
+**The corroborating asymmetry, on the same boot.** `[v3d58] xengine`, verbatim: *"RENDER(CT1) ran=1
+verified-store=1 RFC=0x00000001 | BIN(CT0) retired=0 wrote-any-arena-byte=0 BFC=0x00000000 | SHARED at
+bin time: MMU_CTL=0x060d0c01 (ENABLE=1 faults=0x0) PT_PA_BASE=0x00000333 L2TCACTL=0x00000000
+arena=0x343000+0x40000 — ASYMMETRY CONFIRMED."* CT1 completed a frame and landed a byte-verified store
+on the **same block, same MMU table, same L2T config, same clock and same arena** in which CT0 refused
+the first byte of a render list. The two threads are not equivalent, and the working one is the one
+the render list belongs on.
+
+**What this names.** §49 ends where it was built to end: with a **named defect**, not a candidate
+list. The defect is ours. CT0 is bin-only silicon-side; this driver has been handing it render-class
+control lists; the fix is a driver fix and there is nothing left to debug in the encoding. The
+standing rule is written at the top of this file
+([**THE CT0/CT1 CLASS LAW**](#the-ct0ct1-class-law--render-lists-run-on-ct1-never-on-ct0)), the audit
+of what it retracts is §49.11a, and the executable proof is §49.12.
+
