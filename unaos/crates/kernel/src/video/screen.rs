@@ -353,6 +353,48 @@ pub fn request_full_present() {
     FULL_PRESENT.store(true, core::sync::atomic::Ordering::Release);
 }
 
+/// WC-BBSYNC — "unarmed" for [`DESKTOP_BG_SEED`]. Every colour that reaches this path is an
+/// `0x00RRGGBB` triple (the top byte is unused on both the desktop and the compositor side), so
+/// `0xFFFF_FFFF` is outside the range a caller can legitimately pass and needs no second flag.
+const SEED_NONE: u32 = 0xFFFF_FFFF;
+
+/// WC-BBSYNC — the colour a newly-built [`Screen`]'s BACK buffer is born holding, once the window
+/// compositor has taken the panel. [`SEED_NONE`] means unarmed, which is every aarch64 build, every
+/// default x86 build, and every `wc` boot up to the instant `video::wcx::activate` clears the glass.
+///
+/// ### Why a latch, and why it is consumed HERE rather than set here
+///
+/// The two events are ~290 lines of `kernel_main` apart and in that order: the compositor activates
+/// from inside PCI enumeration (`kepler::init` -> `takeover_display`), and the desktop layer's
+/// `Screen` is not constructed until the GUI loop, long afterwards. So there is no `Screen` for
+/// activation to reach even in principle — the compositor can only record the colour it just put on
+/// the glass, and the desktop layer adopts it when it comes into existence.
+///
+/// What it fixes: `Screen::new` allocates its back store with `vec![0u8; len]` and arms FULL-PANEL
+/// damage, so a desktop layer born after a compositor takeover holds BLACK over a panel the
+/// compositor just painted `wm::DESKTOP_BG`, with the damage to carry that black to the glass already
+/// set. On the nominal path the first `console.draw` clears the back buffer before the first present
+/// and the black never ships — but that is a coincidence of two independently-declared constants
+/// (`console::Console::BG` and `wm::DESKTOP_BG`) happening to be the same number, and of no present
+/// falling between the construction and that first clear. Seeding the buffer makes the desktop layer
+/// agree with the glass BY CONSTRUCTION instead.
+///
+/// A back-buffer (cached RAM) fill, not a panel read-back: nothing here reads the framebuffer, so the
+/// write-only-VRAM discipline is untouched.
+static DESKTOP_BG_SEED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(SEED_NONE);
+
+/// WC-BBSYNC — record the desktop colour the compositor has just established on the glass, so every
+/// [`Screen`] built from here on starts its back buffer in agreement with it. Idempotent; the caller
+/// owns the colour (this module invents none).
+///
+/// Armed only by `video::wcx`, which is `cfg(all(target_arch = "x86_64", feature = "wc"))`. On
+/// aarch64 and on every non-`wc` x86 build there is no caller, the latch stays [`SEED_NONE`], and
+/// [`Screen::new`] pays exactly one relaxed-cost atomic load.
+pub fn adopt_desktop_bg(color: u32) {
+    DESKTOP_BG_SEED.store(color, core::sync::atomic::Ordering::Release);
+}
+
 /// WC-I — one step of the row-span walk that subtracts the window layer from a damage rect.
 ///
 /// Given the occluder boxes, a scanline `y`, a cursor `xs` and the rect's right edge `x1`, returns
@@ -449,6 +491,21 @@ impl Screen {
         let mut back_store = vec![0u8; len];
         let mut back = FrameBuffer::new();
         back.init(back_store.as_mut_ptr() as usize, len, info);
+        // WC-BBSYNC — adopt the desktop colour the compositor put on the glass, if one was recorded
+        // (see `DESKTOP_BG_SEED` for why the two events cannot be one call). Writes cached RAM
+        // through the back handle, which re-encodes per framebuffer layout exactly as every other
+        // back-buffer fill does; the front framebuffer is neither read nor written here. Unarmed on
+        // every other build, where this is one relaxed load and the zeroed `vec!` stands.
+        let seed = DESKTOP_BG_SEED.load(core::sync::atomic::Ordering::Acquire);
+        if seed != SEED_NONE {
+            back.fill_screen(seed);
+            serial_println!(
+                "[wc-x] backbuffer resync {}x{} (desktop bg {:08X})",
+                info.width,
+                info.height,
+                seed
+            );
+        }
         Self {
             front,
             back_store,

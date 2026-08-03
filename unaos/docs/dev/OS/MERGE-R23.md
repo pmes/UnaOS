@@ -18,9 +18,17 @@ extended by that seat.
   A_OPENED edge, never predicted from a pre-spawn first-fit snapshot.
 - **Stripped at merge**: the two orphaned x86-wc call sites (`wm::present_rows`,
   `screen::adopt_desktop_bg`). Banded present degrades to whole-box; the
-  `[wc-x] backbuffer resync ABSENT (re-land owed; ghost-box hazard open)` witness marks the
+  `[wc-x] backbuffer resync ABSENT (re-land owed; ghost-box hazard open)` witness marked the
   open seam. The x86 re-land arc (CLICK-X86 / FBCON-DMG / FLICKER + vug.rs cfg-strip with the
   ui_status seam) restores callers and callees together.
+  - **WC-BBSYNC re-landed** (x86 seat, 2026-08-03, hand port of `9a68d99d` onto the merged
+    anchors — the origin commit is an ancestor of trunk, so its content was overwritten rather
+    than reverted and it cannot be cherry-picked). `screen::adopt_desktop_bg` + `DESKTOP_BG_SEED`
+    are back and `wcx::activate` arms the latch, so the ghost-box hazard on the wc path is
+    CLOSED. The witness flips `ABSENT` -> `[wc-x] backbuffer resync ARMED bg=… (desktop layer
+    not yet constructed)` at activation, and the desktop layer answers with
+    `[wc-x] backbuffer resync WxH (desktop bg …)` when its `Screen` is constructed. `ABSENT` no
+    longer appears in any build. Banded present (`wm::present_rows`) is still stripped.
 
 ## Known-opens ledger (carried from both batons; each is arc-sized unless noted)
 - SYS_WIN_PRESENT masked span — **AUDITED** (pi seat, 2026-08-03): 2.8 ms mean / 13.9 ms
