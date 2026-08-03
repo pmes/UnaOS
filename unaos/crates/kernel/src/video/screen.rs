@@ -497,6 +497,17 @@ impl Screen {
         self.mark(x, y, x + 1, y + 1);
     }
 
+    /// CURSOR-SAVE-UNDER (grafted at merge assembly from the x86 trunk, f36ab3d5 — its `pal`
+    /// cursor path depends on it): read one pixel from the BACK buffer (cached heap RAM — cheap;
+    /// the front framebuffer is never read back, keeping the WC/write-only VRAM contract). Lets
+    /// `pal::cursor` stash the pixels under the sprite and restore them on move/hide, so every
+    /// `Screen`-backed surface inherits trail-free cursor motion without per-surface damage
+    /// tracking.
+    #[inline]
+    pub fn read_back_pixel(&self, x: usize, y: usize) -> Option<u32> {
+        self.back.get_pixel(x, y)
+    }
+
     pub fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32) {
         self.back.fill_rect(x, y, w, h, color);
         self.mark(x, y, x + w, y + h);

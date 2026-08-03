@@ -161,6 +161,10 @@ fn fat_errno(e: FatError) -> &'static str {
         // WEDGE-8 (F3): the storage driver's controller loan was busy past the bounded retry —
         // the operation never started; running the command again is the honest remedy.
         FatError::Busy => "-EAGAIN",
+        // Merge seam: the x86 trunk's fat.rs added OutOfVolume (a range check past the volume
+        // end); it is an addressing error, not a device fault, but -EIO is the closest errno
+        // this tagger's callers understand. Grafted at assembly.
+        FatError::OutOfVolume => "-EIO",
     }
 }
 

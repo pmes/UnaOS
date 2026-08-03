@@ -103,6 +103,12 @@ pub mod bootpace;
 pub mod pal;
 pub mod ui;
 pub mod ui_status;
+// Merge assembly: the x86 trunk deleted vug.rs wholesale and the auto-merge silently took the
+// deletion (the same defect class as the duplicate `pub mod theme;` — no conflict raised). The
+// pi4 side's standing law forbids that deletion: `run_bsp` is why EL0 vugs run, and
+// `classify_load_scaled`/`METER_*`/`PARKED` are the pulse-strip classifier `ui_status` reads.
+// Restored from hw-pi4@e860181a.
+pub mod vug;
 pub mod video;
 pub mod clock;
 #[cfg(feature = "logts")]

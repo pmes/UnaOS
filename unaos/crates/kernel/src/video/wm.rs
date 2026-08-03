@@ -677,6 +677,33 @@ pub fn compat_live() -> bool {
     id != WIN_NONE && is_compat_row(id)
 }
 
+// ── CLICK-X86 seam, GRAFTED AT MERGE ASSEMBLY (r23 candidate) ────────────────────────────────
+// The x86 trunk's CLICK-X86 lineage gives the kernel's own windows (panel console, desktop demo)
+// clickable owner rows in a reserved band — hittable furniture that remains outside focus_ring
+// and close_owner's reach. The full lineage (its hit_test/focus_changed integration and the
+// fbcon/wcx registrations) re-lands as the x86 seat's own reviewed arc per the tier-3 baseline
+// ruling; what is grafted HERE is only the seam `arch/x86_64/syscall.rs` already depends on:
+// the band constants and the band predicate. Content taken verbatim from the x86 trunk's wm.rs
+// (UnaOS-gemini f36ab3d5); doc text condensed, semantics untouched.
+
+/// CLICK-X86: base of the reserved kernel-owner ASID band. Distinct from owner 0 ("nobody owns
+/// this row" — compat rows, transient witness probes, all unclickable) so that "the kernel owns
+/// it" and "nobody owns it" stop sharing one value: a kernel row is HITTABLE furniture while
+/// remaining unreachable as an EL0 focus target or teardown victim.
+pub const KERNEL_OWNER_BASE: u64 = 0xFFFF_FF00;
+
+/// CLICK-X86: the panel console's row (`fbcon::panel_console_window_open`).
+pub const KERNEL_OWNER_CONSOLE: u64 = KERNEL_OWNER_BASE + 1;
+
+/// CLICK-X86: the desktop demo window's row (`wcx::activate`).
+pub const KERNEL_OWNER_DESKTOP: u64 = KERNEL_OWNER_BASE + 2;
+
+/// CLICK-X86 — is `asid` in the reserved kernel-owner band? `false` for `0`, which still means
+/// "nobody owns this row".
+pub fn is_kernel_owner(asid: u64) -> bool {
+    asid >= KERNEL_OWNER_BASE && asid <= KERNEL_OWNER_BASE + 0xFF
+}
+
 /// WC-A / F3 — close the compat window, if one exists. **WC-B must call this from the EL0 teardown
 /// seam** — the same place in `clear_handle_row` that calls [`close_owner`] — because the compat row
 /// has no real owner ASID (`present_surface` is reached through the `SYS_FB_PRESENT` hook, whose
