@@ -2507,6 +2507,29 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
     // in it wants the SOURCE re-read. One `want`-stream restores that: any surviving `bad_cache != bad_ram`
     // is now a real statement about scan-out memory. `cols * rows * 4` bytes — 64 KiB at the 128x128
     // fixture — paid once per window id under `witness`.
+    //
+    // WEDGE-12 (F6) — **the third masked allocation, enumerated here and deliberately NOT closed.**
+    // The R24 span audit listed two `ALLOCATOR` acquisitions inside `SYS_WIN_PRESENT`'s mask
+    // (`stage_window`'s and `stage_fill`'s); this is a third, and it reaches the global heap `Mutex`
+    // twice — once here and once when `want_buf` drops. `verify_window` is called from
+    // `composite_inner`, which is inside the mask, so it is the same family shape as the two
+    // WEDGE-12 removed.
+    //
+    // It is not closed the same way because its worst case is not bounded by anything `wm` owns.
+    // `stage_window`'s was: `MAX_STAGE_BYTES` capped it at 4 MiB whatever the panel, so a pre-size
+    // drops no work. This buffer is `rows * cols * 4` bytes, and `rows`/`cols` come from the ROW's
+    // surface — `surf_len / stride` by `stride / 4`. For an EL0 window that is the 64 KiB mapped-slot
+    // cap (`FB_WIN_SLOT_SIZE`, a 128x128 ARGB surface), but a KERNEL-created row carries whatever
+    // extent its creator passed: `fbcon::panel_console_window_open` (x86 + `wc`) presents a non-compat
+    // console window sized to `MAX_STAGE_BYTES / 4` = 1,048,576 panel pixels, i.e. a **4 MB** snapshot,
+    // and nothing in `wm` bounds a future creator below that. Pre-sizing a static to 64 KiB would turn
+    // that window's `[wc-d]` verdict from PASS/FAIL into SKIP — capping the instrument rather than
+    // fixing the lock, which is the "silently drop work" outcome the milestone's own STOP rule names.
+    //
+    // So it is reported rather than shipped. Two facts bound the exposure meanwhile: it is
+    // `witness`-gated (it never reaches flashable media), and it is one-shot per window id
+    // (`VERIFIED`), not per pass. Closing it properly means hoisting the snapshot out of the masked
+    // span, which is span restructuring — M3's scope, not this one's.
     let mut want_buf: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     if want_buf.try_reserve_exact(rows * cols).is_err() {
         serial_println!(
@@ -2886,8 +2909,11 @@ impl DrainBarrier {
         // THE GUARD-WINDOW INVARIANT, stated honestly. It is NOT "no blocking lock is acquired after
         // `BlitGuard::enter()`" — that is false and always has been. On witness builds the window
         // contains `serial_println!` (the `[wc-a]`/`[wc-c]` lines and every print in `verify_window`),
-        // `wcg::begin`/`end`, and `stage_window`'s `try_reserve`/`resize` into the global allocator on
-        // buffer growth. The invariant this barrier actually needs is weaker and true:
+        // `wcg::begin`/`end`, and `verify_window`'s `try_reserve_exact` for the source snapshot.
+        // WEDGE-12 removed the other allocator entry `stage_window`/`stage_fill` used to have on
+        // buffer growth (see `reserve_stage`); `verify_window`'s is `witness`-only and is the one
+        // enumerated but NOT closed by that arc — see its doc comment.
+        // The invariant this barrier actually needs is weaker and true:
         //
         //     no lock acquired inside the window has a holder that can block UNBOUNDEDLY.
         //
@@ -3113,6 +3139,78 @@ fn wci_rollup_scoped(scope: &str) {
         scope, windowed, intrusions, passes, brackets, verdict
     );
     cursor3_rollup(scope);
+    // WEDGE-12 — chained here on `[cursor3]` → `[wedge9]` → `[wedge11]`'s own precedent: this is the
+    // same pass's contention story at `wm`'s two remaining masked-span locks, and one seam is easier
+    // to keep in step than two. Adjacent to the cursor pair on purpose, so a bench reader comparing
+    // refusals across the family is comparing like with like.
+    wedge12_rollup(scope);
+}
+
+// ---- WEDGE-12 (F6) witnesses -------------------------------------------------------------------
+//
+// Two findings, one commit, one line. The census answers the two questions the arc's claims rest on
+// and nothing else:
+//
+//   * is the `DEFER` guard actually carrying the traffic (`holds=`), or is the grep invariant true
+//     only because the path never runs;
+//   * did the masked staging paths ever find `STAGE` short (`short_win=`/`short_fill=`), which is
+//     the only way an allocation could still have been wanted under the mask.
+//
+// There is no `refused=` here and there is not meant to be: the micro-guard refuses nobody by
+// construction (WEDGE-7's row in the family table), so a `Busy` column would be permanently zero and
+// would read as a mechanism that never fired rather than one that cannot.
+
+/// WEDGE-12 — acquisitions through [`defer_q`], the sole `DEFER` path. Non-zero is what makes the
+/// grep invariant a statement about the running system rather than about the source.
+#[cfg(feature = "witness")]
+static W12_DEFER_HOLDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WEDGE-12 — masked staged presents that found [`STAGE`] shorter than the box needed and declined
+/// instead of growing. Expected zero on any boot [`reserve_stage`] reached.
+#[cfg(feature = "witness")]
+static W12_SHORT_WIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WEDGE-12 — the same, for [`stage_fill`]'s one composed row. Expected zero, and further out of
+/// reach than [`W12_SHORT_WIN`] by three orders of magnitude.
+#[cfg(feature = "witness")]
+static W12_SHORT_FILL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WEDGE-12 — the F6 rollup: `DEFER`'s guard and `STAGE`'s pre-size, on one line because they share
+/// a gate.
+///
+/// Verdicts, and what each one licenses a reader to conclude:
+///
+/// * `QUIET` — nothing was ever short and the guard carried traffic. The arc's claim holds: no
+///   allocation was reachable from a masked pass and no `DEFER` hold was preemptible. **This is the
+///   expected reading**, and it is `QUIET` rather than `CLEAN` because zero is the whole of the
+///   evidence — the family's house style.
+/// * `UNWITNESSED` — the guard never ran, so `reserved=` is the only fact on the line. A headless
+///   boot with no compositor pass reads this and it is not a finding.
+/// * `UNRESERVED` — [`reserve_stage`] secured nothing, so every staged present is declining. The
+///   panel never initialised, or the heap refused at init.
+/// * `SHORT` — a masked pass wanted more than the pre-size held. Not a deadlock (nothing allocated;
+///   the box took the documented decline) but the pre-size is wrong for this panel and the bound in
+///   [`stage_worst_case`] is what to re-derive.
+#[cfg(feature = "witness")]
+fn wedge12_rollup(scope: &str) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let holds = W12_DEFER_HOLDS.load(Relaxed);
+    let short_win = W12_SHORT_WIN.load(Relaxed);
+    let short_fill = W12_SHORT_FILL.load(Relaxed);
+    let reserved = STAGE_RESERVED.load(Relaxed);
+    let verdict = if short_win > 0 || short_fill > 0 {
+        "SHORT"
+    } else if reserved == 0 {
+        "UNRESERVED"
+    } else if holds == 0 {
+        "UNWITNESSED"
+    } else {
+        "QUIET"
+    };
+    serial_println!(
+        "[wedge12] defer-guard+stage-presize scope={} holds={} reserved={} short_win={} short_fill={} -> {}",
+        scope, holds, reserved, short_win, short_fill, verdict
+    );
 }
 
 // ---- CURSOR-3 witnesses ------------------------------------------------------------------------
@@ -4410,14 +4508,103 @@ const _: () = assert!(
 /// **Lock discipline.** This is a LEAF: it is acquired only by [`defer_erase`] and
 /// [`drain_deferred`], it is held for an array copy and nothing else, and no other lock of this
 /// module — `TABLE`, `STAGE`, `WRITER`, the cursor module's `SPRITE` — is ever taken while it is
-/// held. That is what lets it use a blocking `lock()` where [`STAGE`] uses `try_lock`: a deferral
-/// has nowhere left to fall back to, so losing a box here would lose the repaint outright, and a
-/// leaf held for a bounded array write cannot deadlock. The converse order is the one that matters
-/// and it is the one the code takes: `STAGE` (released) → `DEFER`, and `DEFER` (released) →
-/// `STAGE`/`TABLE` in the drain. No new inversion is introduced because `DEFER` is never held across
-/// any acquisition at all.
+/// held. The ordering statement below is still true and still worth keeping: the converse order is
+/// the one that matters and it is the one the code takes: `STAGE` (released) → `DEFER`, and `DEFER`
+/// (released) → `STAGE`/`TABLE` in the drain. No inversion is introduced because `DEFER` is never
+/// held across any acquisition at all.
+///
+/// ### WEDGE-12 (F6) — why "a bounded leaf cannot deadlock" was the wrong argument
+///
+/// That is what this block used to say, and it is correct about ABBA and silent about the family
+/// this tree has been closing since WEDGE-7. The F1–F5 defect has no cycle in it:
+///
+/// > a masked span blocks on a lock a *preemptible* task holds; the holder is preempted mid-hold;
+/// > tasks never migrate and pinned tasks are never stolen, so the holder never runs again; the
+/// > masked spinner can take no timer IRQ, so that core dies silently — no panic.
+///
+/// `DEFER` was the statement verbatim. [`drain_deferred`] runs at the head of every
+/// [`composite_inner`], and `composite` is reached from `wm::present` inside `SYS_WIN_PRESENT`'s
+/// IRQ mask — so that acquisition was a **masked** blocking `lock()`. The other acquisition,
+/// [`defer_erase`], is reached from [`erase`] via [`stage_fill`] on the unmasked, preemptible
+/// `wm::close`/`move_to`/render paths. Masked waiter, preemptible holder: F6.
+///
+/// Boundedness is what makes the *fix* affordable, not what makes the bug absent — the family doc's
+/// sentence, and the one the old argument conflated.
+///
+/// ### The idiom: masked micro-guard (WEDGE-7's), and the enumeration that chose it
+///
+/// The choice is a procedure, not a preference (the F5 lesson: `cursor::OVERLAY` looked like a
+/// micro-guard candidate and was disqualified by two sections a later arc had moved panel work
+/// into). `DEFER` has **exactly two** acquisitions in the whole tree, and the mask covers both:
+///
+/// 1. [`defer_erase`] — one `MAX_DEFER`(8)-slot array write, or, on a full queue, an 8-entry
+///    least-added-area union scan plus one slot write; one relaxed store; under `witness` one
+///    `fetch_add` (`wcg::erase_coalesce` is an atomic increment and nothing else). The `[wc-k]`
+///    serial line is emitted **after** the block closes, deliberately, and stays there.
+/// 2. [`drain_deferred`] — one 264-byte `Copy` snapshot of the queue, one field write, one relaxed
+///    store. No call of any kind inside the hold.
+///
+/// No print, no allocation, no I/O, no wall-clock poll, no nested lock, in either. Worst-case IRQ
+/// latency added by this guard is one 8-entry union scan — the same order as `TABLE`'s 8-row
+/// composite snapshot, and far below the `IrqGuard` spans every window verb already takes.
+///
+/// A claim/loan conversion was considered and refused for the reason WEDGE-7's row states: a
+/// deferral has **nowhere left to fall back to**. `stage_fill` reaches `defer_erase` precisely
+/// because the staged path already declined, so a `Busy` here would drop the box, and a dropped box
+/// is the P61 ghost — a dead window's last frame left on the panel for the rest of the boot. The
+/// micro-guard refuses nobody, which is exactly what this lock needs.
+///
+/// ### The invariant, checkable without booting
+/// *`wm::DEFER` is never held across a preemption point,* because this is the only acquisition path:
+/// ```text
+/// grep -n "DEFER\s*\.\s*lock" video/wm.rs   -> exactly ONE hit, inside `fn defer_q()`
+/// ```
+/// `DEFER` is module-private, so no other file can acquire it. Standing rule for future arcs: **no
+/// `DEFER` critical section may call anything that can block, print, or allocate** — true today, and
+/// this guard is what makes it load-bearing.
 static DEFER: Mutex<([(usize, usize, usize, usize); MAX_DEFER], usize)> =
     Mutex::new(([(0, 0, 0, 0); MAX_DEFER], 0));
+
+/// The deferred-erase queue as [`MAX_DEFER`] boxes plus a live count. Named so [`DeferGuard`] can
+/// spell its `Deref` target without repeating the tuple.
+type DeferQueue = ([(usize, usize, usize, usize); MAX_DEFER], usize);
+
+/// WEDGE-12 — [`DEFER`]'s guard, in [`TableGuard`]'s shape and for [`TableGuard`]'s reason.
+struct DeferGuard {
+    // DECLARATION ORDER IS THE FIX, exactly as in `TableGuard`: Rust drops struct fields in
+    // declaration order, so the lock guard is released FIRST and the IRQ mask restored SECOND.
+    // The reverse would unmask while still holding `DEFER`, re-opening a preemption window in the
+    // hold's tail — the bug, in miniature, at every unlock.
+    inner: MutexGuard<'static, DeferQueue, SpinRelax>,
+    _irq: crate::arch::IrqMask,
+}
+
+impl core::ops::Deref for DeferGuard {
+    type Target = DeferQueue;
+    #[inline]
+    fn deref(&self) -> &DeferQueue {
+        &self.inner
+    }
+}
+
+impl core::ops::DerefMut for DeferGuard {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut DeferQueue {
+        &mut self.inner
+    }
+}
+
+/// WEDGE-12 — acquire [`DEFER`] with IRQs masked. The SOLE acquisition path. See [`DEFER`].
+#[inline]
+fn defer_q() -> DeferGuard {
+    // Mask BEFORE the acquisition, not after: masking after would leave the spin itself
+    // preemptible, and a holder preempted between our acquire and our mask is the same wedge.
+    let _irq = crate::arch::IrqMask::new();
+    let inner = DEFER.lock();
+    #[cfg(feature = "witness")]
+    W12_DEFER_HOLDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    DeferGuard { inner, _irq }
+}
 
 /// Cheap "is anything owed" flag, mirroring `DEFER.1` and maintained under the lock. The drain runs
 /// at the head of every composite — which is every window present, on every core — so the common
@@ -4452,7 +4639,10 @@ fn defer_erase(x: usize, y: usize, w: usize, h: usize, reason: u32, requeued: bo
         return;
     }
     {
-        let mut q = DEFER.lock();
+        // WEDGE-12 — masked micro-guard. Everything between here and the closing brace is the
+        // bounded, call-free section the guard's affordability argument enumerates; the `[wc-k]`
+        // deferral line below stays OUTSIDE it.
+        let mut q = defer_q();
         let (boxes, n) = &mut *q;
         if *n < MAX_DEFER {
             boxes[*n] = (x, y, w, h);
@@ -4531,7 +4721,9 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
         return false;
     }
     let (boxes, n) = {
-        let mut q = DEFER.lock();
+        // WEDGE-12 — masked micro-guard. One `Copy` snapshot, one field write, one relaxed store,
+        // and no call at all: the section this guard has to afford.
+        let mut q = defer_q();
         let snap = *q;
         q.1 = 0;
         DEFER_N.store(0, core::sync::atomic::Ordering::Relaxed);
@@ -4642,10 +4834,26 @@ const MAX_STAGE_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// This is the one heap allocation this module makes, and the module header's "no heap in the
 /// compositor" note is narrowed rather than contradicted: the allocation happens on GROWTH only (the
-/// steady state is a lock, a paint and a copy, with no allocator involvement), it uses `try_reserve`
-/// so exhaustion returns an error instead of panicking from present context, and every failure —
+/// steady state is a lock, a paint and a copy, with no allocator involvement), and every failure —
 /// exhaustion, over-cap geometry, or another core holding the lock — falls back to the direct path.
 /// A window can therefore never fail to be drawn because of the back-layer.
+///
+/// ### WEDGE-12 (F6) — the growth happens at [`reserve_stage`], never on the pass
+///
+/// "On GROWTH only" was not good enough. The growth path called `Vec::try_reserve`, which takes the
+/// **global heap `Mutex`** (`allocator.rs`), and `stage_window`/`stage_fill` are both reached from
+/// `composite_inner` inside `SYS_WIN_PRESENT`'s IRQ mask. That is the F1–F5 defect statement with
+/// the widest-shared lock in the kernel on the wrong side of it: a masked present blocking on a heap
+/// lock any preemptible EL1 context in the tree can be holding when the timer takes it.
+///
+/// You cannot micro-guard the global heap, so WEDGE-8's answer applies instead — take the growth out
+/// of the masked path rather than harden the lock. [`reserve_stage`] sizes this buffer **once,
+/// unmasked, at panel-init time**, to the worst case the panel's own geometry permits; both staging
+/// paths then find `len()` already sufficient and never touch the allocator. The `if` they used to
+/// grow in is still there and is now a **decline**, routed through the `DECL_ALLOC` / `DEFER_ALLOC`
+/// exits those paths already had, so a short buffer costs a deferred repaint and never a heap
+/// acquisition. `[wedge12]`'s `short_win=`/`short_fill=` are the counters that say whether it ever
+/// fires; the expected reading is zero.
 ///
 /// `try_lock`, never `lock`: two cores can composite at once (a present on one, a desktop-flush
 /// repaint on the other). The loser takes the direct path rather than blocking a present behind
@@ -4656,6 +4864,93 @@ const MAX_STAGE_BYTES: usize = 4 * 1024 * 1024;
 /// buffer, and the rows copied to the front carry the same zero pad `Screen`'s back buffer has
 /// always presented.
 static STAGE: Mutex<alloc::vec::Vec<u8>> = Mutex::new(alloc::vec::Vec::new());
+
+/// WEDGE-12 — the bytes [`reserve_stage`] has actually secured, for the `[wedge12]` line. Relaxed
+/// throughout: it is a report, and `STAGE`'s own lock is what orders the buffer.
+static STAGE_RESERVED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// WEDGE-12 — the largest [`STAGE`] length any staged path can ask for on a `pw x ph x bpp` panel.
+///
+/// ### The bound, derived from the two askers rather than asserted
+///
+/// * [`stage_window`] asks for `need = row_bytes * chunk_rows` with
+///   `chunk_rows = min(MAX_STAGE_BYTES / row_bytes, bh)`. The first term of that `min` gives
+///   `need <= MAX_STAGE_BYTES` unconditionally; the second gives `need <= bh * row_bytes =
+///   bh * bw * bpp`. Its caller [`draw_window`] clips the outer box to the panel before the call
+///   (`bw = bw.min(pw - bx)`, `bh = bh.min(ph - by)`), so `bw <= pw` and `bh <= ph` and therefore
+///   `need <= pw * ph * bpp`.
+/// * [`stage_fill`] asks for one composed ROW — `need = w * bpp`, with `(x, y, w, h)` panel-clipped
+///   by both callers — so `need <= pw * bpp`, three orders of magnitude under the first.
+///
+/// Hence `max(need) = min(MAX_STAGE_BYTES, pw * ph * bpp)`, and **both arms are attainable**: a
+/// 1024-wide, 1024-tall box on a bench-sized panel needs exactly `MAX_STAGE_BYTES`, while a panel
+/// whose whole area is under the cap can never ask for more than that area. Neither arm is a policy
+/// choice, so pre-sizing to this number drops no work — the decline the pass keeps is unreachable,
+/// not a silent cap.
+///
+/// ### The numbers this produces
+///
+/// | panel | `pw * ph * bpp` | reserved |
+/// | --- | --- | --- |
+/// | QEMU raspi4b 640x480x4 | 1,228,800 | **1,228,800** (1.17 MiB) |
+/// | bench Pi 1920x1200x4 | 9,216,000 | **4,194,304** (4 MiB, the cap) |
+///
+/// Against `allocator::HEAP_SIZE` (48 MiB) the bench worst case is 8.5% of the heap, and it is
+/// memory the buffer already reaches in the WC-M banded steady state — the reservation moves *when*
+/// it is taken, not *how much*.
+fn stage_worst_case(info: &unaos_boot_info::FrameBufferInfo) -> usize {
+    let area = info.width.saturating_mul(info.height).saturating_mul(info.bytes_per_pixel);
+    area.min(MAX_STAGE_BYTES)
+}
+
+/// WEDGE-12 — size [`STAGE`] to [`stage_worst_case`] from an UNMASKED context, so no staged present
+/// ever reaches the global heap lock. Returns the bytes now held.
+///
+/// Called from `video::init_panel`, which runs once from `kernel_main` immediately after `WRITER` is
+/// attached, on both arches and on both the baremetal and QEMU `kernel8` paths — the earliest point
+/// at which the panel's geometry is known, with IRQs live, the heap long since initialised
+/// (`arch::memory::init` runs at `kernel_main`'s head) and no compositor pass in flight.
+///
+/// `try_lock`, never `lock`: `STAGE`'s standing rule is that it is acquired with `try_lock` on every
+/// path (`arch::aarch64::sched`'s service-band note depends on it), and a reservation is not a
+/// reason to introduce the tree's first blocking acquisition of it. Nothing else holds the buffer at
+/// init, so the contended arm is a formality; it leaves the buffer as it found it and the pass's own
+/// declines report the shortfall honestly.
+///
+/// Idempotent and grow-only: calling it twice, or after a geometry change, is safe and never
+/// shrinks. A failure to reserve is not fatal — every staged present then declines through
+/// `DECL_ALLOC` / `DEFER_ALLOC` into the paths those declines already had, which is a deferred
+/// repaint and never a lost window.
+pub fn reserve_stage(info: &unaos_boot_info::FrameBufferInfo) -> usize {
+    let want = stage_worst_case(info);
+    if want == 0 {
+        return 0;
+    }
+    let Some(mut stage) = STAGE.try_lock() else {
+        return STAGE_RESERVED.load(core::sync::atomic::Ordering::Relaxed);
+    };
+    if stage.len() < want {
+        let add = want - stage.len();
+        // The ONE `try_reserve` left in this module's staging path, and it is here precisely because
+        // here is unmasked. An exhausted heap returns the shorter buffer rather than panicking.
+        if stage.try_reserve(add).is_ok() {
+            stage.resize(want, 0);
+        }
+    }
+    let got = stage.len();
+    STAGE_RESERVED.store(got, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "witness")]
+    serial_println!(
+        "[wedge12] stage-reserve panel={}x{}x{} want={} got={} -> {}",
+        info.width,
+        info.height,
+        info.bytes_per_pixel,
+        want,
+        got,
+        if got >= want { "RESERVED" } else { "SHORT" }
+    );
+    got
+}
 
 /// WC-H — whether the one-shot fallback fixture has been spent. See the fixture block in
 /// [`stage_window`]: it forces exactly one non-compat composite onto the direct path so WC-D's
@@ -5347,14 +5642,16 @@ fn stage_window(
         Some(g) => g,
         None => decline!(super::wcg::DECL_LOCK),
     };
+    // WEDGE-12 — this is where the growth used to be, and the growth was a masked acquisition of the
+    // global heap `Mutex`. `reserve_stage` has already sized the buffer to `stage_worst_case`, which
+    // is `>= need` for every box this panel can produce, so the branch is unreachable in a boot that
+    // reserved. If it is ever taken — no reservation, a heap too small at init, or a panel that grew
+    // afterwards — this DECLINES exactly as an exhausted heap used to, and the pass reaches the panel
+    // through the direct path. What it does not do, ever, is allocate under the mask.
     if stage.len() < need {
-        let add = need - stage.len();
-        // `try_reserve` + `resize`: an exhausted heap returns here instead of panicking from present
-        // context. The buffer only ever grows, so a steady window size allocates exactly once.
-        if stage.try_reserve(add).is_err() {
-            decline!(super::wcg::DECL_ALLOC);
-        }
-        stage.resize(need, 0);
+        #[cfg(feature = "witness")]
+        W12_SHORT_WIN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        decline!(super::wcg::DECL_ALLOC);
     }
 
     // WC-M — the two halves are now accumulated ACROSS bands rather than read off one pair of
@@ -5557,16 +5854,16 @@ fn stage_fill(
         Some(g) => g,
         None => defer!(DEFER_LOCK),
     };
+    // WEDGE-12 — same removal as `stage_window`'s, and even further out of reach here: one composed
+    // ROW is at most `pw * bpp` bytes, and `reserve_stage` secured `min(MAX_STAGE_BYTES, pw*ph*bpp)`.
+    // The branch stays as the honest report of an unreserved buffer, and it DEFERS (transient) rather
+    // than dropping, exactly as an exhausted heap did.
     if stage.len() < row_bytes {
-        let add = row_bytes - stage.len();
-        // Same `try_reserve` + `resize` contract as `stage_window`: an exhausted heap declines here
-        // rather than panicking from a close path.
-        if stage.try_reserve(add).is_err() {
-            // Drop the guard before queueing: `DEFER` must never be taken while `STAGE` is held.
-            drop(stage);
-            defer!(DEFER_ALLOC);
-        }
-        stage.resize(row_bytes, 0);
+        #[cfg(feature = "witness")]
+        W12_SHORT_FILL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // Drop the guard before queueing: `DEFER` must never be taken while `STAGE` is held.
+        drop(stage);
+        defer!(DEFER_ALLOC);
     }
 
     #[cfg(all(target_arch = "aarch64", feature = "witness"))]

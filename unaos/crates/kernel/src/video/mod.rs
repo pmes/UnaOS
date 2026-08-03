@@ -115,4 +115,12 @@ pub fn init_panel(base: usize, len: usize, info: FrameBufferInfo) {
     surface.fill_screen(PANEL_BG);
 
     serial_println!(":: Framebuffer painted #1E1E1E ::");
+
+    // WEDGE-12 (F6) — size the compositor's staging buffer HERE, where the panel's geometry has just
+    // become known, IRQs are live and no composite pass exists yet. `wm`'s staged presents run inside
+    // `SYS_WIN_PRESENT`'s IRQ mask, so a buffer that grew on the pass would be a masked acquisition of
+    // the global heap `Mutex` — the F1-F5 family defect with the widest-shared lock in the kernel.
+    // Growing it once, from here, is what lets the masked paths be allocation-free. See
+    // `wm::reserve_stage` for the bound and `[wedge12]` for the census.
+    wm::reserve_stage(&info);
 }
