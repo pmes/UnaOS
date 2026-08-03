@@ -342,8 +342,53 @@ fn main() {
         data_dir.join("hello.txt"),
         "Hello from UnaOS on real hardware!\nThis file was read off the FAT32 DATA volume by the in-kernel FAT reader.\n",
     ).unwrap();
+
+    // STOR-1 fixtures: scripts/make-fat-img.sh plants these for the QEMU single-stick FAT image, and
+    // the STOR-1 storage witnesses (arch/x86_64/syscall.rs) are calibrated against their exact bytes.
+    // On metal, the kernel's fs::fat::mount() binds the USB stick — i.e. THIS data volume, not the ESP
+    // — so a witness that reads a "non-staged on-disk file" needs that file physically here too, or it
+    // fails for a media reason (fixture absent) rather than a code reason. Byte-identical to the QEMU
+    // plant; see make-fat-img.sh's stage_contents() for the specification these mirror.
+
+    // STOR-1 S7: README.TXT, read dynamically off the pre-stage set. The witness (s7_openany_witness)
+    // only checks the file begins with this 16-byte PREFIX and is >= 16 bytes, so the exact trailing
+    // text is not witness-critical — kept byte-identical to make-fat-img.sh's `part` layout anyway.
+    std::fs::write(
+        data_dir.join("readme.txt"),
+        "UnaOS read-only FAT32/16 reader test volume (part layout).\n",
+    ).unwrap();
+
+    // U9x M2: SCRATCH.BIN — 1024 bytes of 0xEE (U9X_SCRATCH_FILL). Without this on-disk, the U9x fixture
+    // still passes in its M1 in-memory-only mode (SCRATCH_CLUSTER stays 0), but silently skips the M2
+    // disk-write-back proof — planting it here exercises the real path on metal instead of the fallback.
+    std::fs::write(data_dir.join("SCRATCH.BIN"), vec![0xEEu8; 1024]).unwrap();
+
+    // U10 GROW: GROW.BIN — 512 bytes of 0xC1 (U10_GROW_FILLER), exactly one 512-byte cluster. Same M1
+    // fallback caveat as SCRATCH.BIN above (GROW_CLUSTER stays 0 without a real on-disk file).
+    std::fs::write(data_dir.join("GROW.BIN"), vec![0xC1u8; 512]).unwrap();
+
+    // STOR-1 S8: S8W.BIN — 64 bytes of 0xA5 (the s8_write_witness SEED). NEVER a staged name
+    // (HELLO/SCRATCH/GROW.BIN) and NEVER README.TXT (S7 checks that file's prefix) — a dedicated
+    // dynamic-open RW target the witness overwrites in place, reads back, then restores, so the file
+    // stays pristine and idempotent across boots.
+    std::fs::write(data_dir.join("S8W.BIN"), vec![0xA5u8; 64]).unwrap();
+
+    // SINKHOLE-1/ZEOLITE-2: BLOCK.TXT — the DNS resolver's hosts-format blocklist, read via the same S7
+    // dynamic-open path. Absent, the resolver falls back to its compiled-in builtin list (not a hard
+    // fail) — planted here so metal exercises the real on-disk parse instead of the fallback. Byte-
+    // identical to make-fat-img.sh's heredoc.
+    std::fs::write(
+        data_dir.join("BLOCK.TXT"),
+        "# zeolite DNS sinkhole blocklist (hosts format)\n\
+         0.0.0.0 ads.example\n\
+         0.0.0.0 track.example   # inline comment tolerated\n\
+         \n\
+         ; semicolon comments and blank lines are skipped\n\
+         127.0.0.1 telemetry.example\n",
+    ).unwrap();
+
     println!(
-        "   WINX-7 PKG: data volume tree target/x86_64_data/ — {} (+ hello.txt)",
+        "   WINX-7 PKG: data volume tree target/x86_64_data/ — {} (+ hello.txt, readme.txt, SCRATCH.BIN, GROW.BIN, S8W.BIN, BLOCK.TXT)",
         if staged_data.is_empty() { "no EL0 artifacts built".to_string() } else { staged_data.join(", ") }
     );
 
