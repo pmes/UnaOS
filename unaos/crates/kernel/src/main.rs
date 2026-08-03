@@ -2625,7 +2625,7 @@ fn route_input_to_active_el0() -> usize {
 /// belonging to a fixture, and when that fixture exited mid-test its teardown ran
 /// `clear_handle_row(1)` -> `USER_INPUT_ACTIVE.compare_exchange(1, 0)`, revoking the focus this test had just
 /// set. A router pass that had already enqueued the Key then found no active target for the Mouse and
-/// returned `routed=1`: the observed `:: EL0: input router — routed=1|0 … :: FAIL ::`, ~1 boot in 7 under
+/// returned `routed=1`: the observed `:: USER: input router — routed=1|0 … :: FAIL ::`, ~1 boot in 7 under
 /// contention. Nothing was dropped by the queue (`[uvug10] evq drop` stayed 0) and nothing leaked to
 /// GUI_CHANNEL — the events were simply routed to a focus that no longer existed.
 ///
@@ -2712,11 +2712,11 @@ fn input_router_selftest() {
     );
     if routed == 2 && sent1 == sent0 {
         serial_println!(
-            ":: EL0: input router — routed=2 (key+mouse) to active-focus ring, Timer dropped, GUI_CHANNEL bypassed :: PASS ::"
+            ":: USER: input router — routed=2 (key+mouse) to active-focus ring, Timer dropped, GUI_CHANNEL bypassed :: PASS ::"
         );
     } else {
         serial_println!(
-            ":: EL0: input router — routed={} gui_sent_delta={} :: FAIL ::",
+            ":: USER: input router — routed={} gui_sent_delta={} :: FAIL ::",
             routed,
             sent1.wrapping_sub(sent0)
         );

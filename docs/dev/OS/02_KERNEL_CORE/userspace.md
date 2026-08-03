@@ -486,7 +486,7 @@
   - **QEMU proof.** A new BSP-side `input_router_selftest()` runs the REAL router drain against a fake active
     focus (ASID 1, before any service task or EL0 slot is live, `EVENT_QUEUE` empty): a Key + a Mouse pushed into
     `EVENT_QUEUE` are routed to the focused ring (`routed == 2`), a Timer is dropped, and `GUI_CHANNEL` is bypassed
-    (`GUI_SENT` unchanged) — `:: EL0: input router — routed=2 (key+mouse) to active-focus ring, Timer dropped,
+    (`GUI_SENT` unchanged) — `:: USER: input router — routed=2 (key+mouse) to active-focus ring, Timer dropped,
     GUI_CHANNEL bypassed :: PASS ::`. This proves the router->ring edge; the ELF-5 `:: EL0: input test … ::`
     witness proves ring->EL0-drain; together they cover the full path. **HONEST QEMU NOTE:** the real HID *edge*
     (a USB keypress landing in `EVENT_QUEUE`) is metal-only — QEMU raspi4b delivers no USB HID — so the selftest
@@ -496,7 +496,7 @@
     Lane: `main.rs` (the router branch + `route_input_to_active_el0` + `input_router_selftest`) + the
     `run_user_image` focus-registration call site in `arch/aarch64/syscall.rs` + this doc.
 - **INROUTE (landed 2026-07-25)** — the router selftest above was **flaky**, roughly 1 boot in 7 under a loaded
-  cascade: `:: EL0: input router — routed=1|0 gui_sent_delta=0 :: FAIL ::`, seen by two independent executors on
+  cascade: `:: USER: input router — routed=1|0 gui_sent_delta=0 :: FAIL ::`, seen by two independent executors on
   unrelated diffs, so the race predated both. **Root cause:** the selftest's stated precondition was false. It
   borrows the two pieces of *global* input state — it fakes focus onto **ASID 1** and pushes synthetic events
   into `pal::EVENT_QUEUE` — and then counts deliveries, so any concurrent owner of either makes the count wrong.
@@ -519,7 +519,7 @@
   stale_dropped=1 revokes=0 gui_sent_delta=0` line prints before the verdict; `revokes` is a new counter
   incremented whenever a slot teardown actually revokes the *live* focus (`el0_focus_revokes()`), so `revokes=0`
   is the standing proof the measurement window stayed clean and a reintroduced concurrent owner is diagnosable
-  from the log alone. **Gate:** the `:: EL0: input router … PASS ::` and `[inroute] … revokes=0` lines are both
+  from the log alone. **Gate:** the `:: USER: input router … PASS ::` and `[inroute] … revokes=0` lines are both
   REQUIREs in `pi4-regression.spec` now (the FAIL half was already covered by the default `FAIL ::` FORBID, but
   nothing required the PASS, so a selftest that silently stopped running went green). A/B: the interleaving
   forced deterministically at the old call site reproduces `routed=1`; 20 consecutive runs on the fixed build are
@@ -2038,7 +2038,7 @@
     - `UNAOS_QMP_PORT=4501 ./arroyo kernel8-test 210` → **✅ MBENCH PASS — 86/86 required witnesses,
       0 forbidden hit(s), 26281 lines scanned**, with
       `[clickroute] hit-test at (215,135) inside=true topmost=true raise=true outside=true hidden=true -> PASS`
-      and `:: EL0: input router — routed=2 (key+mouse) … :: PASS ::` unchanged (the router selftest pushes
+      and `:: USER: input router — routed=2 (key+mouse) … :: PASS ::` unchanged (the router selftest pushes
       Key/Mouse/Timer and **no** Button, so it never consults the hit-test and stays deterministic).
     - the aarch64/virt leg: `./arroyo test-arm` could not resolve AAVMF firmware in this container (arroyo
       searches five absolute paths, none writable here and no override knob), so the run was performed by

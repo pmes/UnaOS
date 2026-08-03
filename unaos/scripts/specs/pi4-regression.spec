@@ -288,9 +288,9 @@ REQUIRE UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c
 # ---     now, and the `revokes=0` line pins the PRECONDITION the arc fixed: this test must own the
 # ---     global input focus for its window, so a slot teardown revoking focus mid-measurement (which
 # ---     is what made it flake ~1 boot in 7) fails the gate instead of merely being unlucky.
-REQUIRE EL0: input router — routed=2 .*GUI_CHANNEL bypassed :: PASS
+REQUIRE USER: input router — routed=2 .*GUI_CHANNEL bypassed :: PASS
 REQUIRE \[inroute\] router window — routed=2 stale_dropped=1 revokes=0
-FORBID EL0: input router.*FAIL
+FORBID USER: input router.*FAIL
 #
 # --- 2. The el0-wcb window-verb ledger, ALL THIRTEEN bits. The literal mask matters: a partial
 # ---    mask still prints `witness=0x...` and the verdict already refuses it, but pinning 0x1fff
