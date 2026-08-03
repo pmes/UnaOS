@@ -20,7 +20,7 @@
 //! spine that document specifies — the mount table, the path resolver, the
 //! backend trait, and thin adapters over the two backends that already exist
 //! (native UnaFS and FAT). It is deliberately **unconsumed** this arc: no shell
-//! command, syscall, or EL0 path routes through it yet. The spine + doc land
+//! command, syscall, or user path routes through it yet. The spine + doc land
 //! alone so the design can be reviewed before consumers move onto it.
 //!
 //! ## Why this exists

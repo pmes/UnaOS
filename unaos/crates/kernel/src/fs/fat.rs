@@ -593,7 +593,7 @@ fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Re
         Ok(n) if n >= SECTOR_SIZE => Ok(()),
         // WEDGE-8 (F3): Busy is not an I/O failure — the controller is loaned out and this context
         // refused (masked) or exhausted (unmasked) its wait. Kept distinct so the RMW wrappers can
-        // retry outside the masked span and EL0 sees `-EAGAIN`, never a false `-EIO`.
+        // retry outside the masked span and user mode sees `-EAGAIN`, never a false `-EIO`.
         Err(crate::drivers::block::BlockError::Busy) => Err(FatError::Busy),
         _ => Err(FatError::Io),
     }
@@ -753,7 +753,7 @@ static FAT_MUTATION: spin::Mutex<()> = spin::Mutex::new(());
 ///   i.e. a `wfi` executed with `PSTATE.I` MASKED by this very hold. It is bounded and it is NOT a deadlock
 ///   (WFI wakes on a pending physical interrupt even with I set — `arch/aarch64/mod.rs`), and the deadline is
 ///   honoured, so the volume stays consistent. But on a FAILING transfer the worst case is a multi-second,
-///   non-preemptible hold (×`num_fats`): the scheduler cannot run, EL0 is frozen, panel/input tasks stall.
+///   non-preemptible hold (×`num_fats`): the scheduler cannot run, user mode is frozen, panel/input tasks stall.
 ///
 /// The span is therefore honest-but-expensive on `Usb`, not "safe because polled". This is deliberately left
 /// as a documented cost rather than a restructure: narrowing the span for one source would fork the RMW's
@@ -2165,7 +2165,7 @@ impl FatFs {
     /// directory (`vec![0u8; de.size]` — a natural reading of "read the file into this") therefore got
     /// a result of exactly `2 * de.size`, silently, with the file's real bytes sitting behind a run of
     /// zeros. That is the doubling that blocked `bg /fat/STAT.ELF` and `bg /fat/VUG.ELF` on x86: the
-    /// directory said 8472 / 12568 and the loader was handed 16944 / 25136 — past the 16 KiB EL0
+    /// directory said 8472 / 12568 and the loader was handed 16944 / 25136 — past the 16 KiB user
     /// window, so both were rejected as oversize. It read as time-dependent (early boot fine, later
     /// broken) only because the doubling is invisible until `2 * size` crosses a caller's cap: U2's
     /// 72-byte HELLO.BIN doubles to 144 and still fits, an 8472-byte ELF does not. Clearing here is
@@ -2190,7 +2190,7 @@ impl FatFs {
             return Err(FatError::BadChain);
         }
         // MULTIBLK: collect the chain, then read it in contiguous runs. This is the path
-        // `load_program_into_slot` uses for every EL0 program on the volume, so it is exactly the
+        // `load_program_into_slot` uses for every user program on the volume, so it is exactly the
         // path the boot-time `FS: 8472 STAT.ELF` / `FS: 12568 VUG.ELF` reads run down: 17 and 25
         // sectors respectively, previously 17 and 25 separate READ(10)s plus one FAT sector read per
         // cluster hop. Guards unchanged and now single-sourced in `collect_chain`: bad/free cluster
@@ -2847,7 +2847,7 @@ impl FatFs {
     // `FAT_MUTATION`/`DIR_MUTATION`. Consumed by the aarch64 panel's `mkdir`/`rmdir` (JD7) AFTER this
     // arc merges: call, never edit.
     //
-    // LOCKING (invariant 5 — SOUND WITHOUT the syscall-layer NAMESPACE lock, because EL1 shell callers
+    // LOCKING (invariant 5 — SOUND WITHOUT the syscall-layer NAMESPACE lock, because kernel shell callers
     // reach fat.rs directly): every SECTOR mutation is SMP-atomic via the existing per-RMW locks, and
     // `DIR_MUTATION` is never widened past its documented single-sector-RMW span (holding it across a
     // directory SCAN or across `free_chain`'s block I/O would break the IRQ-masked-non-preemptible span
@@ -2856,9 +2856,9 @@ impl FatFs {
     // two-cores-mid-syscall interleave: `remove_dir`'s emptiness-scan -> `delete_located` is not atomic
     // against a concurrent `create_in_dir` INTO the same target directory (a file linked between the
     // scan and the free is orphaned in a freed chain). EXCLUDED_BY_SEQUENCING today — the only FS
-    // mutators are the single-threaded EL1 panel shell, EL0 syscalls (serialized by the syscall
+    // mutators are the single-threaded kernel panel shell, user syscalls (serialized by the syscall
     // NAMESPACE lock), and the await-verdict-sequenced reaper; none races another FS mutator. The fix
-    // when concurrent EL1 mutators appear is a fat.rs namespace lock spanning both sequences — a future
+    // when concurrent kernel mutators appear is a fat.rs namespace lock spanning both sequences — a future
     // seam change that would have to touch `create_in_dir`, so it is out of this additive grant.
     // =============================================================================================
 
@@ -2978,7 +2978,7 @@ impl FatFs {
     ///
     /// CONCURRENCY (invariant 3): the emptiness-scan -> `delete_located` is NOT atomic against a
     /// concurrent `create_in_dir` into THIS target (check-then-delete TOCTOU). Honest-scope,
-    /// EXCLUDED_BY_SEQUENCING today (no concurrent EL1 FS mutators; EL0 sequences ride the syscall
+    /// EXCLUDED_BY_SEQUENCING today (no concurrent kernel FS mutators; user sequences ride the syscall
     /// NAMESPACE lock) — ledgered in SECURITY.md alongside F3's residual; see the FATDIRS block comment.
     pub fn remove_dir(
         &self,
@@ -3039,15 +3039,15 @@ impl FatFs {
     // LOCKING (invariants 4/5 — SOUND WITHOUT the syscall-layer NAMESPACE lock, the FATDIRS bar):
     // every SECTOR mutation rides the existing per-RMW `DIR_MUTATION` span, and `DIR_MUTATION` is
     // NEVER widened to span both of MOVE's two dir-sector RMWs at once (its documented contract is
-    // single-sector; cross-sector atomicity of the two writes is EXCLUDED_BY_SEQUENCING for EL1
+    // single-sector; cross-sector atomicity of the two writes is EXCLUDED_BY_SEQUENCING for kernel
     // callers). The composite locate->mutate sequences are therefore NOT held under one lock; the
-    // residual is the SAME class FATDIRS ledgered (no concurrent EL1 FS mutators today; EL0 rides the
+    // residual is the SAME class FATDIRS ledgered (no concurrent kernel FS mutators today; user rides the
     // syscall NAMESPACE lock) — see SECURITY.md's FATMOVE entry.
     //
     // U6/ACL (invariant 5): `fat.rs` is ACL-blind by layering — the `OWNED_FILES` ACL keys by
     // `(dir_lba, dir_off)` up in aarch64 `syscall.rs`. A rename/move CHANGES that key, so a future
-    // EL0 rename/move path MUST re-key or refuse an OWNED file (ledgered in SECURITY.md + the JD10
-    // brief). This arc builds NO EL0 plumbing; the EL1 panel runs as ASID 0 (the PUBLIC principal),
+    // user rename/move path MUST re-key or refuse an OWNED file (ledgered in SECURITY.md + the JD10
+    // brief). This arc builds NO user-mode plumbing; the kernel panel runs as ASID 0 (the PUBLIC principal),
     // so a panel-driven rename/move touches no ACL row.
     //
     // ERRNO FIDELITY: the seam reuses existing `FatError` variants (adding one would break the

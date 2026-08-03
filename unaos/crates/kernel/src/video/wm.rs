@@ -16,7 +16,7 @@
 
 //! WC-A — the window table and the compositor.
 //!
-//! Every EL0 program renders into its OWN off-screen ARGB8888 surface and never touches the real
+//! Every user program renders into its OWN off-screen ARGB8888 surface and never touches the real
 //! scan-out; the kernel owns the panel. This module is the seam between "a task has a surface" and
 //! "pixels reach the HVS": a fixed table of at most [`MAX_WINDOWS`] windows (id, owner ASID,
 //! geometry, z-order, surface pointer/stride, damage flag, short title) plus a back-to-front
@@ -24,14 +24,14 @@
 //! upscale and kernel-drawn chrome (a 1-px border and a title strip).
 //!
 //! **Chrome is kernel-drawn, always.** An app draws only inside its own surface; the border and the
-//! title strip are painted by the compositor from the kernel's copy of the title. An EL0 program
+//! title strip are painted by the compositor from the kernel's copy of the title. A user program
 //! therefore cannot forge another window's frame, and the presentation-modes law ("never fake host
 //! chrome") is enforced structurally rather than by convention.
 //!
 //! **Composite on present, no thread.** [`present`] marks a window damaged and immediately runs the
 //! composite pass from the presenting task's own context (the same discipline
 //! [`super::screen::present_surface`] has always used: the render task is parked while a full-screen
-//! EL0 program owns the panel, so routing through it would present nothing). There is no compositor
+//! user program owns the panel, so routing through it would present nothing). There is no compositor
 //! thread in this arc.
 //!
 //! **Non-coherent scan-out.** Each composited region is cleaned with `FrameBuffer::flush_range` over
@@ -46,9 +46,9 @@
 //!
 //! Two obligations WC-B cannot skip:
 //! - [`create`] takes `surf_len`, the **real byte length of the mapped slot**. It must come from the
-//!   mapping code, never from EL0-supplied dimensions; it is what bounds every source read the
+//!   mapping code, never from user-supplied dimensions; it is what bounds every source read the
 //!   compositor performs.
-//! - [`close_compat`] must be called from the EL0 teardown seam next to [`close_owner`]. The compat
+//! - [`close_compat`] must be called from the user teardown seam next to [`close_owner`]. The compat
 //!   window has no owner ASID (the `SYS_FB_PRESENT` hook signature carries none), so `close_owner`
 //!   can never reap it.
 //!
@@ -121,12 +121,12 @@ struct Window {
     w: usize,
     h: usize,
     stride: usize,
-    /// EL1-visible address of the owner's ARGB8888 surface. Held as a `usize` so the table is `Send`.
+    /// kernel-visible address of the owner's ARGB8888 surface. Held as a `usize` so the table is `Send`.
     surf: usize,
     /// F1 — length in BYTES of the mapped surface slot at `surf`. The compositor never reads past
     /// `surf + surf_len`; [`create`] rejects any geometry that could. Without this the extent came
-    /// from EL0 and a `w=h=10000, stride=40000` window over a 4 KiB slot would have the compositor
-    /// read ~400 MB of EL1 memory and paint kernel bytes onto the panel (`put_pixel` clips WRITES,
+    /// from user mode and a `w=h=10000, stride=40000` window over a 4 KiB slot would have the compositor
+    /// read ~400 MB of kernel memory and paint kernel bytes onto the panel (`put_pixel` clips WRITES,
     /// never the source READ).
     surf_len: usize,
     scale: usize,
@@ -204,14 +204,14 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
 /// 2. The timer PPI preempts it mid-hold — `timer_preempt` stores `STATE_READY` and switches out.
 ///    `render` is now descheduled **still holding TABLE**, and it is pinned, so no other core can
 ///    steal and finish it.
-/// 3. An aged-in EL0 vug on the SAME core wins the next pop and issues `SYS_WIN_PRESENT`, which
+/// 3. An aged-in user mode vug on the SAME core wins the next pop and issues `SYS_WIN_PRESENT`, which
 ///    masks IRQs, takes `WINDOWS`, and blocks on `TABLE`.
 /// 4. That core can no longer take a timer IRQ, so it never re-enters its scheduler, so `render` is
 ///    never re-dispatched, so `TABLE` is never released. Permanent, silent, no panic.
 ///
 /// It propagates: the spinner holds `WINDOWS` throughout, so every other vug on every other core
 /// that issues any window verb masks and blocks on `WINDOWS` too — a fleet-wide GUI freeze from one
-/// vug on one core. The foreground case is not even a coincidence: `run` places an EL0 program on
+/// vug on one core. The foreground case is not even a coincidence: `run` places a user program on
 /// the launching core, which is the shell's core, which is `render`'s core.
 ///
 /// ## Why masking is the fix, and why the alternatives were rejected
@@ -468,7 +468,7 @@ fn vugmin_scan(t: &Table, shell: u32, out: &mut [(u64, bool); MAX_WINDOWS]) -> u
 // which removes the hazard with it: the raise arm now publishes only `hidden=false`, and a spurious
 // CLEAR on a free slot is the harmless direction — it is the state `teardown_user_slot` already leaves.
 
-/// Create a window owned by `owner_asid` over the caller's ARGB8888 surface at `surf` (EL1-visible
+/// Create a window owned by `owner_asid` over the caller's ARGB8888 surface at `surf` (kernel-visible
 /// address, `surf_len` bytes long, `stride` bytes per row) with source dimensions `w` x `h` and a
 /// short `title` (truncated to [`MAX_TITLE`]).
 ///
@@ -478,7 +478,7 @@ fn vugmin_scan(t: &Table, shell: u32, out: &mut [(u64, bool); MAX_WINDOWS]) -> u
 ///
 /// # Surface-extent contract (F1) — WC-B MUST honour this
 /// `surf_len` is the **real byte length of the mapped slot**, as the mapping code knows it — never a
-/// value derived from EL0-supplied dimensions. `w`, `h` and `stride` may come straight from the
+/// value derived from user-supplied dimensions. `w`, `h` and `stride` may come straight from the
 /// caller; this function rejects any combination that would read outside the slot
 /// (`w * 4 > stride`, or `h * stride > surf_len`), so the compositor's source reads are bounded by
 /// construction rather than by trusting the app.
@@ -596,7 +596,7 @@ pub(super) fn compat_present(
     y: usize,
 ) {
     use core::sync::atomic::Ordering;
-    // F1 — the compat path's dimensions are NOT EL0-supplied: `present_surface` is reached through
+    // F1 — the compat path's dimensions are NOT user-supplied: `present_surface` is reached through
     // the `SYS_FB_PRESENT` hook, which passes the kernel's own `boot::FB_SURFACE_*` constants. The
     // hook signature carries no slot length, so the tightest bound available here is the extent those
     // constants describe. That makes `surf_len` a restatement of `h * stride` rather than an
@@ -689,7 +689,7 @@ pub fn compat_live() -> bool {
 /// CLICK-X86: base of the reserved kernel-owner ASID band. Distinct from owner 0 ("nobody owns
 /// this row" — compat rows, transient witness probes, all unclickable) so that "the kernel owns
 /// it" and "nobody owns it" stop sharing one value: a kernel row is HITTABLE furniture while
-/// remaining unreachable as an EL0 focus target or teardown victim.
+/// remaining unreachable as a user focus target or teardown victim.
 pub const KERNEL_OWNER_BASE: u64 = 0xFFFF_FF00;
 
 /// CLICK-X86: the panel console's row (`fbcon::panel_console_window_open`).
@@ -704,7 +704,7 @@ pub fn is_kernel_owner(asid: u64) -> bool {
     asid >= KERNEL_OWNER_BASE && asid <= KERNEL_OWNER_BASE + 0xFF
 }
 
-/// WC-A / F3 — close the compat window, if one exists. **WC-B must call this from the EL0 teardown
+/// WC-A / F3 — close the compat window, if one exists. **WC-B must call this from the user teardown
 /// seam** — the same place in `clear_handle_row` that calls [`close_owner`] — because the compat row
 /// has no real owner ASID (`present_surface` is reached through the `SYS_FB_PRESENT` hook, whose
 /// signature carries no ASID, so the shim cannot learn who is presenting) and therefore
@@ -730,7 +730,7 @@ pub fn close_compat() -> bool {
 /// If every window the presenting owner holds is below `SHELL_Z`, the pass would read the surface,
 /// clip it, and write it nowhere the operator can see: [`composite`] draws only rows that satisfy
 /// [`above_shell`], and by hypothesis none of this owner's do. The VUGMIN-A audit measured this as the
-/// missing half of the mechanism — the EL0 idle loop stops *most* presents from being issued, and this
+/// missing half of the mechanism — the user idle loop stops *most* presents from being issued, and this
 /// makes the ones that still arrive (a vug hidden mid-frame, a program that does not poll the bit at
 /// all, the frame in flight when the operator TABbed away) cost a table scan instead of a full pass.
 ///
@@ -942,7 +942,7 @@ pub fn close_owner(owner_asid: u64) -> usize {
     // WEDGE-1r2 `<D1>`/`<d1>` — see `move_to`, and note that THIS is the path that matters most: it
     // is reached from `sched::exit` → `clear_handle_row`, which has already masked interrupts, so a
     // core that blocks on the `TABLE` acquisition below is unpreemptible and silent — and is upstream
-    // of the only place WEDGE-1 instrumented. It is also the hottest of the three (one call per EL0
+    // of the only place WEDGE-1 instrumented. It is also the hottest of the three (one call per user
     // task exit, most of them owning no window), which is why the chain gate is what makes the token
     // affordable here at all.
     crate::wedge2::mark_composite("<D1>", "<d1>");
@@ -968,7 +968,7 @@ pub fn close_owner(owner_asid: u64) -> usize {
     // F4 — the rows are gone, but a composite on another core may have snapshotted them a moment ago
     // and still be reading those surfaces. Raise the phase barrier and drain before returning: the
     // caller is about to unmap the ASID's memory, and today that would be a stale read, but under
-    // WC-B's per-ASID surface mappings it becomes an EL1 abort mid-blit.
+    // WC-B's per-ASID surface mappings it becomes a kernel abort mid-blit.
     let barrier = DrainBarrier::drain();
     #[cfg(feature = "witness")]
     serial_println!("[wc-a] close_owner asid={:#x} closed={}", owner_asid, n);
@@ -990,7 +990,7 @@ pub fn close_owner(owner_asid: u64) -> usize {
     // whole point: `<D3>` with no `<D4>` is the reclaim, `<D4>` as the LAST token on the wire is
     // `cursor::repaint` — i.e. `SPRITE`, which is the F4 site and a different lock from F1's.
     //
-    // This path is the one that matters for that distinction. `close_owner` runs on EVERY EL0 task
+    // This path is the one that matters for that distinction. `close_owner` runs on EVERY user task
     // exit (`sched::exit` → `clear_handle_row`), which has already masked interrupts, so a core that
     // blocks on `SPRITE` below is unpreemptible and silent — and the symptom is not a stalled
     // teardown but a dead panel: the sprite lock gates the cursor bracket every compositor path
@@ -1178,7 +1178,7 @@ pub fn focus_ring(out: &mut [u64; MAX_WINDOWS]) -> usize {
 /// ### Why this exists
 /// The EL0IN-FOCUS audit established that the pointer-button path has **no window hit-test at all**:
 /// focus has exactly three sources (the `run` grant, the grant's clear, and the TAB ring), and a
-/// `Button` under EL0 focus goes straight to the focused app's ring regardless of where the pointer
+/// `Button` under user focus goes straight to the focused app's ring regardless of where the pointer
 /// is. That is P69's bench symptom in one sentence — clicking *anywhere* click-pauses the *focused*
 /// vug, because the click was never addressed to a window in the first place. This function is the
 /// missing address lookup, and it is deliberately the whole of the window system's contribution:
@@ -1495,7 +1495,7 @@ fn above_shell(r: &Window, shell: u32) -> bool {
 /// correct back-to-front.
 ///
 /// **COMPAT windows are excluded, and that exclusion is what makes this affordable.** A compat row is
-/// the full-screen present path (`screen::present_surface`), and while a full-screen EL0 program owns
+/// the full-screen present path (`screen::present_surface`), and while a full-screen user program owns
 /// the panel the render task is parked inside `dispatch_command` and is not flushing at all — there is
 /// no second writer to order against, so a repaint there would be pure cost with nothing to fix. It is
 /// not a small cost either: the first cut of this function repainted compat rows too, and re-blitting
@@ -1508,7 +1508,7 @@ fn above_shell(r: &Window, shell: u32) -> bool {
 pub fn repaint() {
     // BGRUN-1 COMPOSITION FIX (WC-E lens should-fix 2): the compat exclusion's premise — "compat
     // implies the render task is parked, so there is no second writer" — was true when the ONLY way
-    // to run a compat (full-screen) EL0 app was the blocking foreground `run`. `bg` breaks it: a
+    // to run a compat (full-screen) user app was the blocking foreground `run`. `bg` breaks it: a
     // background compat app presents directly to the scan-out while the desktop keeps flushing —
     // exactly the two-writer collision this function exists to order. The exclusion key is therefore
     // the FOCUSED compat surface, not the compat flag: the foreground case (incl. the boot-time
@@ -1516,12 +1516,12 @@ pub fn repaint() {
     // (`run_user_image` sets it before its wait loop), while a bg compat app can never acquire it
     // (the TAB ring walks windows only). A compat row cannot be keyed by OWNER — `compat_present`
     // creates it with owner_asid 0 (the SYS_FB_PRESENT hook carries none) — so the key is coarser:
-    // repaint compat rows only while NO EL0 program holds input focus (`focused == 0`, the
+    // repaint compat rows only while NO user program holds input focus (`focused == 0`, the
     // bg-app-at-the-prompt state). Every foreground run — `run` verb and the boot witnesses alike —
     // sets focus before its wait loop, so the EXEC-UVUG deadline case stays excluded. Residual,
     // stated: a bg compat app still shimmers while the operator is TABbed into some OTHER app
     // (focused != 0 excludes all compat rows); cosmetic, bounded by TABbing back to the shell.
-    // Focus lives in the baremetal EL0 input router (syscall.rs is baremetal-gated); elsewhere 0
+    // Focus lives in the baremetal user input router (syscall.rs is baremetal-gated); elsewhere 0
     // means every compat row repaints, which is vacuous there (compat_present is unreachable).
     #[cfg(feature = "baremetal")]
     let focused = crate::arch::syscall::el0_input_active();
@@ -2310,7 +2310,7 @@ fn composite_inner() -> CursorTail {
         let live = rows.iter().filter(|r| r.used).count();
         serial_println!("[wc-a] composite windows={} drawn={}", live, drawn);
     }
-    // WC-C — the SIDE-BY-SIDE witness. The arc's claim is "two EL0 programs, two windows, both on the
+    // WC-C — the SIDE-BY-SIDE witness. The arc's claim is "two user programs, two windows, both on the
     // panel at once"; a screenshot shows it to a human but proves nothing to a gate, and the per-window
     // `[wc-a] create` lines say only that rows EXISTED, never that two were composited in one pass. This
     // fires from inside the pass that actually drew them, and checksums each window's SOURCE bytes, so a
@@ -2318,7 +2318,7 @@ fn composite_inner() -> CursorTail {
     // from one that drew real content. FNV-1a over `surf_len` — the mapping-code length, the same bound
     // `draw_window` reads under, so the checksum can never walk past the slot.
     //
-    // One-shot: this runs from present context at EL0 frame rates, and the checksum is a 64 KiB read.
+    // One-shot: this runs from present context at user-mode frame rates, and the checksum is a 64 KiB read.
     #[cfg(feature = "witness")]
     if drawn > 0 {
         let real = rows.iter().filter(|r| r.used && !r.compat).count();
@@ -2447,7 +2447,7 @@ fn tail_of(disturbed: bool, session: bool, deferred: bool) -> CursorTail {
 ///
 /// ### WCD-LIVE — the reference must hold still (lift of x86 76c724d6)
 /// Both passes derive the expected pixel from the SOURCE surface, which makes that surface the instrument's
-/// reference — and that surface is EL0-writable. A single-threaded app is quiescent inside `present`, so the
+/// reference — and that surface is user-writable. A single-threaded app is quiescent inside `present`, so the
 /// reference is a constant and the comparison is sound. A multi-threaded one is not: sibling threads keep
 /// painting while verify reads, and the witness compares scan-out against source bytes that were never
 /// blitted. The tell is `bad_cache != bad_ram` — the two passes disagreeing with each OTHER, which no blit
@@ -2464,7 +2464,7 @@ fn tail_of(disturbed: bool, session: bool, deferred: bool) -> CursorTail {
 ///    source re-read; with the snapshot, a surviving `bad_cache != bad_ram` is again a real one.
 /// 2. **A liveness bracket.** The snapshot makes the passes self-consistent but cannot make a mid-flight
 ///    snapshot equal to what was blitted a moment earlier, so it does not make the verdict *earned*. The
-///    surface checksum is therefore read before the snapshot and again after the passes; unequal means EL0
+///    surface checksum is therefore read before the snapshot and again after the passes; unequal means user
 ///    repainted during the verdict, and the verdict is emitted as a third, distinct label:
 ///    `-> LIVE (unverifiable)`. That is reported instead of PASS *and* instead of FAIL, because a moving
 ///    reference earns neither. It is never counted red: a live surface is a fact about the app, not a
@@ -2496,12 +2496,12 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
     // WCD-LIVE, opening bracket. The snapshot below makes the two passes AGREE with each other, but it
     // cannot make a mid-flight snapshot equal to what `draw_window` actually blitted — so it removes the
     // instrument's self-contradiction without making the verdict earned. This checksum, read here and again
-    // after the passes, is what decides whether it WAS earned: unequal means EL0 repainted the surface
+    // after the passes, is what decides whether it WAS earned: unequal means user repainted the surface
     // during the verdict, so the reference moved and neither PASS nor FAIL is a statement about the blit.
     let cksum_pre = surface_checksum(r);
 
     // WCD-LIVE — read the SOURCE exactly ONCE, into a snapshot both passes share. Before this, a verdict
-    // took three independent reads of an EL0-mutable surface (pass 1, post-IVAC pass 2, and the checksum in
+    // took three independent reads of a user-mutable surface (pass 1, post-IVAC pass 2, and the checksum in
     // the print), so `bad_cache` and `bad_ram` could differ purely because they had read different bytes —
     // no cache story required. The two-pass design is a claim about the DESTINATION's cache state; nothing
     // in it wants the SOURCE re-read. One `want`-stream restores that: any surviving `bad_cache != bad_ram`
@@ -2750,14 +2750,14 @@ static DRAIN_STALL_REPORTED: core::sync::atomic::AtomicBool =
 // token on a `close_owner` that died in `cursor::repaint` was `<D3>` — emitted from inside
 // `DrainBarrier::drain`, which every teardown reaches — so a `SPRITE` wedge and a reclaim wedge were
 // the same wire trace, and the audited F1 site (`TABLE`, now closed by WEDGE-7's `fn table()`) was
-// the natural place to pin it. `SPRITE` is reached on EVERY EL0 exit through this path, and a core
+// the natural place to pin it. `SPRITE` is reached on EVERY user exit through this path, and a core
 // that blocks on it here is IRQ-masked by `sched::exit`, so the outcome is a silent total freeze of
 // panel, cursor and input. The token does not fix that; it makes the capture say which lock it was.
 //
 // **`<D1>` speaks only while a focus chain is open, and that budget is a measured constraint rather
 // than a preference.** The first cut emitted it unconditionally at each teardown entry, and the
 // wedge2 regression run priced it: 96 tokens against the whole focus chain's 17, because
-// `close_owner` runs on EVERY EL0 task exit (`sched::exit` → `clear_handle_row`) and 65 of those 96
+// `close_owner` runs on EVERY user task exit (`sched::exit` → `clear_handle_row`) and 65 of those 96
 // found no window and never raised a barrier at all. One of them interleaved into another core's
 // line mid-word (`:<D1: B>GRUN-ST: slot reclaim PASS`) and took a required witness off the wire —
 // the accepted cost of a lock-free token, spent on teardowns with nothing to say. So `<D1>` takes
@@ -4722,7 +4722,7 @@ static FALLBACK_FIXTURE: core::sync::atomic::AtomicBool =
 /// `present_surface` shim: its box is the whole panel, so staging it would cost a panel-sized
 /// allocation and a full extra panel copy per present — enough, on the evidence of the `repaint`
 /// exclusion that preceded it, to blow the `EXEC-UVUG` frame deadline. It also does not need it:
-/// while a foreground full-screen EL0 program owns the panel the render task is parked, so the
+/// while a foreground full-screen user program owns the panel the render task is parked, so the
 /// contention this arc exists to remove is not present. `wcg::begin` already returns `None` for
 /// compat rows, so the instrumented population and the staged population are the same set.
 ///
@@ -6020,7 +6020,7 @@ pub fn vacate_selftest() {
 /// ### Why this is the P61 shape and the single-window vacate is not
 /// [`vacate_selftest`]'s two legs place their window explicitly (`move_to`, which PINS the row) and
 /// close it alone, so the only box in play is the one the closer erases. A real app's window is never
-/// pinned — nothing in EL0 moves a window, so every real window is laid out by the TILER — and a
+/// pinned — nothing in user mode moves a window, so every real window is laid out by the TILER — and a
 /// tiled window's position is a function of HOW MANY windows exist. `close` calls `place(WIN_NONE)`
 /// after freeing the row, which re-tiles every surviving unpinned window into the compacted layout:
 /// the survivors MOVE, and the closer erases only the box the CLOSED window vacated, never the boxes
@@ -6664,7 +6664,7 @@ fn clickplain_leg(owner: u64, other: u64, surf: usize, len: usize) -> Option<(bo
     Some((hit, delivered, woke))
 }
 
-/// CLICK-PLAIN, DORMANT half: no arch router (and no EL0 input rings) in this build, so leg 8
+/// CLICK-PLAIN, DORMANT half: no arch router (and no user input rings) in this build, so leg 8
 /// asserts nothing.
 #[cfg(all(feature = "witness", not(all(target_arch = "aarch64", feature = "baremetal"))))]
 fn clickplain_leg(_owner: u64, _other: u64, _surf: usize, _len: usize) -> Option<(bool, bool, bool)> {

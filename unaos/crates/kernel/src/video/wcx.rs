@@ -82,7 +82,7 @@ const DEMO_W: usize = 96;
 const DEMO_H: usize = 64;
 
 /// The demo surface, in ARGB8888 with a stride of exactly one row. Kernel-owned cached RAM: the
-/// compositor reads it as a source and never writes it, and nothing in EL0 can reach it.
+/// compositor reads it as a source and never writes it, and nothing in user mode can reach it.
 ///
 /// `static mut` rather than a `Mutex`: `wm::create` takes the surface as a raw address it will read
 /// from composite context, so the buffer must have a stable address independent of any guard. It is
@@ -265,7 +265,7 @@ pub fn activate() {
     // CLICK-X86 — owner [`wm::KERNEL_OWNER_DESKTOP`]: this window belongs to the KERNEL, not to any
     // address space, and both consequences that reading was chosen for still hold — it is outside the
     // focus ring (`focus_ring` skips the reserved band) and outside `close_owner`'s reach (which
-    // refuses it), so no EL0 task may present, move or close it. It is now HITTABLE, which owner 0
+    // refuses it), so no user task may present, move or close it. It is now HITTABLE, which owner 0
     // silently prevented: the demo is panel furniture in the corner and the operator will click it.
     // A distinct band value from the console's, so a click raises exactly the window under the hand.
     let id = wm::create_at(

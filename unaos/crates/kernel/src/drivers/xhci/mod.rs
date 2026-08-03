@@ -395,7 +395,7 @@ fn hub_port_change_feature_selector(bit: u16, is_ss: bool) -> Option<u16> {
 ///   * the CONTROLLER ITSELF is loaned out by value (a `Box` move) to exactly one user at a time,
 ///     which runs the long BOT work with NO lock held. Contenders are told [`XhciClaimError::Busy`]
 ///     immediately and handle it honestly (a pump pass skips; the block layer surfaces `Busy`,
-///     which the FAT layer retries OUTSIDE its masked span and EL0 sees as `-EAGAIN`).
+///     which the FAT layer retries OUTSIDE its masked span and user mode sees as `-EAGAIN`).
 ///
 /// The invariant, checkable by grep (the F1 idiom): `XHCI_CONTROLLER.lock()` appears ONLY in
 /// `claim`/`Drop`/`install` in this file — the static is private, so the compiler enforces it.
@@ -1702,7 +1702,7 @@ pub struct DeviceSlot {
     /// would over-arm the ring: the original UI1-MOUSE M2 hazard). Any OTHER mismatching `param`
     /// is not a dup: it means the completion the endpoint just retired is one we cannot account
     /// for, and the old `return` left the interrupt-IN endpoint permanently un-armed — the P54b
-    /// metal fact (mouse dead after an EL0 focus drop, keyboard alive). Those re-arm.
+    /// metal fact (mouse dead after a user focus drop, keyboard alive). Those re-arm.
     pub mouse_prev_phys: u64,
     /// Count of REAL (non-dup) pointer reports serviced since arming — drives the bounded serial
     /// mouse-witness (first report + every Nth), never one-line-per-report.
@@ -3386,7 +3386,7 @@ impl XhciController {
                                         // exit must discard the DATA, never the PIPELINE. The old
                                         // unconditional `return` retired the pointer interrupt-IN
                                         // endpoint forever on ANY mismatched completion — the P54b
-                                        // metal fact (after an EL0 app's focus drop the mouse is
+                                        // metal fact (after a user app's focus drop the mouse is
                                         // permanently dead while the independently-armed keyboard
                                         // keeps working). Discriminate:
                                         //   * `param == mouse_prev_phys` — a genuine Panther-Point dup

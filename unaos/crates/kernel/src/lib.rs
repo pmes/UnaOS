@@ -115,7 +115,7 @@ pub mod ui_status;
 // them outright and compiles on both arches; `vug` imports them back. `shell.rs` gates its `vug` and
 // `pulse` arms to match, so on x86 those words reach the ordinary unknown-command reply.
 //
-// (The comment this replaces justified the restore with "`run_bsp` is why EL0 vugs run". `run_bsp`
+// (The comment this replaces justified the restore with "`run_bsp` is why user vugs run". `run_bsp`
 // appears nowhere in vug.rs — it lives in `arch/{aarch64,x86_64}/sched.rs`, and the EL0 vug is the
 // `VUG.ELF` vessel, not this module. Only the classifier half of that claim was ever true, and it
 // now points at `ui_status`.)

@@ -51,7 +51,7 @@
 //! cacheable writes to the same PA it is coherent *by construction*, and no witness is needed to say
 //! so. What the `civac` leg actually tests is narrower and is the part that is not guaranteed — an
 //! **alias-attribute mismatch**: the surface reached through two mappings whose memory attributes or
-//! shareability disagree (the EL0 `user_data_page` leaf vs the kernel's identity leaf), or a
+//! shareability disagree (the user-mode `user_data_page` leaf vs the kernel's identity leaf), or a
 //! non-cacheable/mismatched alias somewhere in the chain, either of which puts the two views outside
 //! the architecture's coherency guarantee. So `coher=0` means "no alias-attribute mismatch on this
 //! surface", NOT "coherency is fine in general" — the latter was never in doubt for the plain
@@ -68,7 +68,7 @@
 //!
 //! ## `own=` — the leg the bench observation demanded
 //!
-//! Two EL0 apps with unrelated paint loops (the uvug crystal's 300-frame renderer and `stat.elf`'s
+//! Two user apps with unrelated paint loops (the uvug crystal's 300-frame renderer and `stat.elf`'s
 //! trivial ~20 fps counter repaint) garble the same way, so the defect is in the SHARED path. This
 //! witness runs per WINDOW ID, not for window 0, so that claim is provable on the wire rather than
 //! asserted.
@@ -77,7 +77,7 @@
 //! own `SYS_WIN_PRESENT`, so its owner is parked inside the syscall and cannot be writing.
 //! `own=no`: this window was repainted as **collateral** — the damage set is closed upward over
 //! occlusion, so presenting window A repaints every higher-z window that overlaps it. In that case
-//! B's owner is running free at EL0 with nothing at all serialising it against the copy of its
+//! B's owner is running free in user mode with nothing at all serialising it against the copy of its
 //! surface. `own=no` with `blit != after` is the source-tearing mechanism caught in the act, and it
 //! is reachable only because two windows overlap — which is the configuration the bench runs.
 //!
@@ -132,7 +132,7 @@
 //! Pi-shaped stage path that needs a native x86 fixture instead. Budgeted at [`SAMPLES`]
 //! instrumented blits per window id
 //! and silent thereafter — the checksums are 64 KiB reads and the read-back is one probe per source
-//! pixel, from present context at EL0 frame rates, so an unbudgeted version would perturb the very
+//! pixel, from present context at user-mode frame rates, so an unbudgeted version would perturb the very
 //! timing it reports. Every sample prints; the terminal `verdict` line is one-shot.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};

@@ -110,7 +110,7 @@ fn resolve_path(fs: &FatFs, path: &str) -> Result<Resolved, String> {
 //
 // DESIGN NOTE (why this rides fat.rs directly, not the SYS_OPEN/WRITE syscall layer):
 // The SVC syscall path is EL0/ASID-keyed and lives in the out-of-lane `arch/aarch64/syscall.rs`;
-// the kernel shell runs at EL1 as ASID 0 (on the tegra post-drop core TTBR0_EL1[63:48] = 0 — it
+// the kernel shell runs in kernel mode as ASID 0 (on the tegra post-drop core TTBR0_EL1[63:48] = 0 — it
 // never switches TTBR0 to a user slot), so it cannot invoke the SVC path. The shell therefore rides
 // the SAME F3-locked fat.rs PUBLIC entry points the U9/U10/U11 syscalls call — the dir-aware
 // `create_in_dir`/`locate_in_dir` twins (JD6; `first_cluster == 0` ⇒ the root twins
@@ -121,8 +121,8 @@ fn resolve_path(fs: &FatFs, path: &str) -> Result<Resolved, String> {
 // create is PUBLIC (no owner row), so shell-created files are plain public FAT files. The shell does
 // not — and cannot without an out-of-lane pub accessor — consult the U6 `OWNED_FILES` ACL; that is
 // correct: the panel shell is the local trusted operator console, the same trust as the boot window.
-// (A future arc that runs EL0 tasks and returns to the shell must re-establish ASID 0 before shell
-// FAT ops — today the shell is cooperative EL1 and never installs a user-slot TTBR0.)
+// (A future arc that runs user tasks and returns to the shell must re-establish ASID 0 before shell
+// FAT ops — today the shell is cooperative kernel and never installs a user-slot TTBR0.)
 //
 // SCOPE (JD6): the WHOLE tree the shell can `cd` into. `resolve_write_target` normalizes the path
 // against the cwd and walks to the PARENT directory via the read-only `resolve_path`, then the
@@ -132,7 +132,7 @@ fn resolve_path(fs: &FatFs, path: &str) -> Result<Resolved, String> {
 // the directory chain). JD7 layers `mkdir`/`rmdir` on top via the `fat::create_dir`/`remove_dir`
 // FATDIRS seam (call-never-edit, like JD6's write path): `rm` stays file-only (`-EISDIR` on a
 // directory — use `rmdir`), and `rmdir` removes an EMPTY directory (non-empty ⇒ `-ENOTEMPTY`, the
-// root refused). The seam's internal F3 locking is sound for these EL1 callers without the syscall
+// root refused). The seam's internal F3 locking is sound for these kernel callers without the syscall
 // NAMESPACE lock (it reaches fat.rs directly) — see fat.rs's FATDIRS block + docs/SECURITY.md.
 // JD8 layers `cp <src> <dst>` (file copy) on the SAME primitives — no new fat.rs surface: it STREAMS
 // the source through the offset-aware `read_at` into the create-or-truncate `create_in_dir`/
@@ -146,7 +146,7 @@ fn resolve_path(fs: &FatFs, path: &str) -> Result<Resolved, String> {
 //
 // SAFETY (M3): every fat.rs write returns a `Result`; a stalled USB write surfaces as
 // `FatError::Io` (the block layer's `write_block` rides the SAME JD3 wall-clock-bounded BOT pump as
-// reads — a dead transfer times out, never WFI-parks the timerless EL1 core). Writes are
+// reads — a dead transfer times out, never WFI-parks the timerless kernel core). Writes are
 // WRITE-THROUGH (BOT WRITE(10) / polled SD CMD24 complete before the command returns — no write-back
 // cache), and each fat.rs step is atomic under F3's FAT_MUTATION/DIR_MUTATION locks, so a mid-
 // sequence failure leaves the volume consistent: a failed grow keeps the OLD (smaller) size (size is
@@ -489,7 +489,7 @@ fn fs_rmdir(console: &mut Console, arg: &str) {
 /// no NEW primitive) feeding `write_grow`, so a file of ANY size copies with a bounded
 /// (`CP_WINDOW`-byte) heap footprint and NO truncation. There is deliberately no size ceiling. The
 /// per-window `write_grow` re-walks the growing destination chain (bounded, and every FAT/data access
-/// rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless EL1
+/// rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless kernel
 /// core); a future single-pass primitive could tighten that, tracked as a JD9 note.
 fn fs_cp(console: &mut Console, src: &str, dst: &str, force: bool) {
     let fs = match crate::fs::fat::mount() {
@@ -545,7 +545,7 @@ fn fs_cp(console: &mut Console, src: &str, dst: &str, force: bool) {
 ///
 /// SIZE HANDLING (the JD8-M2 decision, unchanged): STREAMS in fixed `CP_WINDOW`-byte windows, so a file of
 /// ANY size copies with a bounded heap footprint and NO truncation (no size ceiling). Every FAT/data access
-/// rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless EL1 core.
+/// rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless kernel core.
 fn copy_file_into(
     fs: &FatFs,
     de_src: &DirEntry,
@@ -801,7 +801,7 @@ struct RmStats {
 /// the entry list before any mutation, and each child is re-located BY NAME (`0xE5`-marking one sibling
 /// never moves another entry's slot), so deleting as we go never invalidates the walk. Every op rides
 /// the JD3 wall-clock BOT pump (bounded — a stalled transfer is `-EIO`, never a hang on the timerless
-/// EL1 core). Depth is capped at `CP_MAX_DEPTH` (honest `-ELOOP`) — the JD9 belt-and-braces backstop
+/// kernel core). Depth is capped at `CP_MAX_DEPTH` (honest `-ELOOP`) — the JD9 belt-and-braces backstop
 /// against a malformed self-referential volume (`read_dir`'s own chain-loop guard is the first line).
 fn rm_tree(
     fs: &FatFs,
@@ -898,7 +898,7 @@ fn force_remove_existing(
 /// operator can re-run `rm -r` to clear the remainder). Recursion is depth-capped (`CP_MAX_DEPTH`,
 /// honest `-ELOOP`).
 ///
-/// PRINCIPAL — unchanged. The shell is EL1 ASID 0, the PUBLIC principal; `rm -r` consults no U6/K-line
+/// PRINCIPAL — unchanged. The shell is kernel ASID 0, the PUBLIC principal; `rm -r` consults no U6/K-line
 /// `OWNED_FILES` ACL and composes the same F3-locked `read_dir`/`locate_in_dir`/`delete_located`/
 /// `remove_dir` primitives JD6/JD7/JD9 already exercise and ledger, so it inherits their locking
 /// analysis unchanged (no new fat.rs surface, no new lock, no new namespace interaction).
@@ -974,8 +974,8 @@ fn fs_rm_recursive(console: &mut Console, arg: &str, force: bool) {
 /// parent is a file → `-ENOTDIR`; dst dir full → `-ENOSPC`; a non-8.3 dst name → `-EINVAL`; a
 /// directory across parents → `-EISDIR`.
 ///
-/// ACL NOTE: this shell is EL1 ASID 0 = the PUBLIC principal, so a panel `mv` consults no U6/K-line
-/// `OWNED_FILES` ACL and is ACL-neutral by construction (the row re-key for a moved EL0-owned file is
+/// ACL NOTE: this shell is kernel ASID 0 = the PUBLIC principal, so a panel `mv` consults no U6/K-line
+/// `OWNED_FILES` ACL and is ACL-neutral by construction (the row re-key for a moved user-owned file is
 /// a future K-line seam, ledgered in the pi4 FATMOVE SECURITY note). CRASH SAFETY is the seam's job:
 /// `move_entry` publishes the destination BEFORE `0xE5`ing the source, so a power-cut mid-move leaves
 /// a benign duplicate (two names, one chain), never a lost chain.
@@ -1118,7 +1118,7 @@ fn cat_render(console: &mut Console, fs: &FatFs, de: &DirEntry, canon: &str) {
 /// `head 10` of a huge file reads only the first window(s), never the whole file. A byte ceiling
 /// (`HEAD_MAX`) backstops a file with no (or too few) newlines so an unterminated giant line still
 /// bounds the read and the heap. A directory or the root is `-EISDIR`. Every access rides the JD3
-/// wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless EL1 core.
+/// wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless kernel core.
 fn fs_head(console: &mut Console, arg: &str, n: u32) {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
@@ -2366,7 +2366,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // PI-APP-1: v3d-gated so the knob-off build's help text stays byte-identical to baseline.
             #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
             console.println("APPS:     vug (3D sculptor), v3d (replay the visible GPU graphics battery)");
-            // BGRUN-1: background EL0 runs — the concurrent-apps line (windows coexist; TAB cycles).
+            // BGRUN-1: background user-mode runs — the concurrent-apps line (windows coexist; TAB cycles).
             #[cfg(feature = "baremetal")]
             console.println("PROC:     run <path> (foreground), bg <path> (background), jobs (list+reap), kill <pid>");
             // STORM-HEADROOM: the verb existed since P77 but was never listed, so the one command an
@@ -2864,12 +2864,12 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         },
         #[cfg(feature = "baremetal")]
         "run" => {
-            // EXEC-1: load an ELF64 EL0 program off the VFS namespace and execute it at EL0, reporting its
+            // EXEC-1: load an ELF64 user program off the VFS namespace and execute it in user mode, reporting its
             // exit status. Rides the SAME `MountTable` the `vfs` verb uses (`/fat` = FAT boot partition,
             // `/usb` = USB stick, `/` = native UnaFS), so `run /fat/ELFHELLO.ELF` loads the boot-partition
-            // fixture. The bytes are read here (EL1/ASID 0) and handed to the kernel loader
+            // fixture. The bytes are read here (kernel mode/ASID 0) and handed to the kernel loader
             // (`run_user_image`), which maps them into a fresh per-task slot with per-segment W^X pages and
-            // runs them under EL0 + the fault-kill net. `run <path>`.
+            // runs them under user mode + the fault-kill net. `run <path>`.
             match args.first() {
                 None => console.println("usage: run <path>   (load + execute an ELF64 EL0 program)"),
                 Some(&path) => run_program(console, path),
@@ -3372,7 +3372,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         },
         #[cfg(feature = "baremetal")]
         "bg" => {
-            // BGRUN-1: run an EL0 program in the BACKGROUND — the shell returns to its prompt at once and
+            // BGRUN-1: run a user program in the BACKGROUND — the shell returns to its prompt at once and
             // the program keeps running (and, if windowed, its window stays OPEN, so TAB has a ring to
             // walk — this is what turns the WC-TAB binding into a workflow: `run` blocks until its app
             // dies, so real windows never coexisted before this verb). `bg <path>`.
@@ -3400,7 +3400,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // remains is the same fleet `storm 6` builds. The clamp stays at 8 deliberately: an
             // operator who asks for more than the machine has must get a REFUSAL that names the
             // resource, not a silently-lowered request that reads as if it were granted. The cap is
-            // not a knob — see the `MAX_PROCS` block in `arch::syscall` for why 6 is where the EL0
+            // not a knob — see the `MAX_PROCS` block in `arch::syscall` for why 6 is where the user
             // slot reserve puts it, and treat moving it as an arc, not a tuning step.
             //
             // WHY THE CENSUS SITS HERE. Every scheduler quantity that could name a ceiling already
@@ -3604,12 +3604,12 @@ fn parse_num(s: &str) -> Option<u64> {
 /// at `/usb` returns `-ENOTSUP` (the FatBackend refuses writes on a non-Default
 /// source before touching the block layer). Rebuilt per invocation, so a stick
 /// hot-plugged (or ejected) between commands is picked up on the next `vfs`.
-/// EXEC-1: `run <path>` — load an ELF64 (or flat) EL0 program off the VFS namespace and execute it at EL0,
+/// EXEC-1: `run <path>` — load an ELF64 (or flat) user program off the VFS namespace and execute it in user mode,
 /// reporting its exit status. Reads the whole file through the same `MountTable` the `vfs` verb uses,
 /// bounds it to the kernel's 16 KiB user window (an oversize file is rejected with a clear message — never
 /// silently truncated), pre-checks the ELF64 magic + aarch64 machine for an early operator-friendly reason,
 /// then hands the bytes to the kernel loader `run_user_image`, which maps them into a fresh per-task slot
-/// (per-segment W^X pages) and runs them under EL0 + the fault-kill net. The kernel is the security
+/// (per-segment W^X pages) and runs them under user mode + the fault-kill net. The kernel is the security
 /// authority: this pre-check only sharpens the error text; `run_user_image` re-validates from scratch.
 ///
 /// Witness (headless-capturable): `:: EXEC: run <path> — loaded <n> bytes, entry 0x<..>, exit=<code> ::`.
@@ -3677,7 +3677,7 @@ fn run_program(console: &mut Console, path: &str) {
     let Some(bytes) = read_el0_image(console, "run", path) else {
         return;
     };
-    // Hand the bytes to the kernel loader: map into a fresh EL0 slot, run co-located, wait (bounded 5 s) for
+    // Hand the bytes to the kernel loader: map into a fresh user slot, run co-located, wait (bounded 5 s) for
     // the program to exit or fault. The image length + entry are reported for the witness.
     let n = bytes.len();
     let deadline = 5 * crate::arch::aarch64::timer::cntfrq();
@@ -3737,7 +3737,7 @@ struct BgJob {
 }
 
 /// BGRUN-1: the shell's job table. Bounded like every table in this kernel. LENS CORRECTION
-/// (round 1): the binding resource is the Proc table (`MAX_PROCS`), not the 8 EL0 address-space
+/// (round 1): the binding resource is the Proc table (`MAX_PROCS`), not the 8 user address-space
 /// slots — so the real ceiling is `MAX_PROCS - 1` bg jobs alongside one foreground `run`, and this
 /// table's full arm is reachable only if MAX_PROCS grows past it. 8 slots kept (harmless headroom).
 /// PROCS-6 raised the cap to 6: 6 bg jobs with no foreground `run` (5 with one), still under this
@@ -3753,7 +3753,7 @@ static BG_JOBS: spin::Mutex<[Option<BgJob>; 8]> = spin::Mutex::new([None; 8]);
 ///
 /// * **usb-fat leg** (a FAT16/32 stick is in): the FULL F3 chain — `create_in_root` /
 ///   `write_grow` appends / periodic `delete_located`, all on `BlockSource::Usb`, so every round
-///   runs the masked FAT/dir RMW spans against the xHCI loan exactly as EL0 `SYS_WRITE` does.
+///   runs the masked FAT/dir RMW spans against the xHCI loan exactly as user `SYS_WRITE` does.
 /// * **raw-scratch leg** (no FAT volume — the honest fallback, and it SAYS so): bounded
 ///   read/write/verify rounds on the last-but-one LBA via `read_block_usb`/`write_block_usb`,
 ///   original sector restored at the end (the `mission_write_selftest` RMW-restore discipline).

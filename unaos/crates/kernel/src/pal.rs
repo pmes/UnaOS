@@ -216,7 +216,7 @@ pub mod cursor {
     // paint.
     //
     // WHERE THE SWITCH IS MADE, AND WHY HERE RATHER THAN AT THE CALL SITES. Every pointer report on
-    // every x86 path — the console loop, the EL0 input router, any full-redraw loop's own drain —
+    // every x86 path — the console loop, the user input router, any full-redraw loop's own drain —
     // funnels through `move_rel`/`set_abs`, and every paint request funnels through `draw`/
     // `draw_over`/`restore`. Folding the delegation into those six functions moves the whole target
     // onto the compositor sprite without a single call-site change: a caller keeps calling
@@ -273,12 +273,12 @@ pub mod cursor {
     /// without the auto-hide half). Distinct from `visible()` because it answers a different question:
     /// "does this machine have a working pointer?", not "should the arrow be on screen right now?".
     ///
-    /// It was introduced so the EL0 input router could keep the sprite alive while an app holds focus
+    /// It was introduced so the user input router could keep the sprite alive while an app holds focus
     /// WITHOUT arming a cursor that never existed (QEMU raspi4b delivers no HID pointer, but the
     /// boot-time `input_router_selftest` pushes a synthetic `Event::Mouse` through the real router).
     ///
     /// EL0IN-FOCUS retired that use: this latch can only ever be SET by the very code it was gating, so
-    /// on a boot where an EL0 app took focus before the first real pointer report it stayed false
+    /// on a boot where a user app took focus before the first real pointer report it stayed false
     /// forever and the cursor was dead until the operator TAB'd back to the shell. The router now
     /// scopes the guard to the selftest's own call instead (`ROUTER_SELFTEST` in `main.rs`). Kept as the
     /// honest "does this machine have a working pointer?" predicate, distinct from `visible()`.
@@ -426,7 +426,7 @@ pub mod cursor {
     ///
     /// THE ONE CHOKE POINT. `move_rel` and `set_abs` are the only two functions in the kernel that
     /// change the pointer's position, so a repaint here is a repaint on every pointer report of every
-    /// x86 path — the console loop's drain, the full-screen demos' own drain, and the EL0 input
+    /// x86 path — the console loop's drain, the full-screen demos' own drain, and the user input
     /// router's keep-alive — without any of them being touched. That is what decouples the arrow's
     /// cadence from the panel present: `video::cursor::repaint` is a restore → save → draw over one
     /// glyph cell in the FRONT buffer (~200 read-backs at this panel's 2x block scale, then the same
@@ -469,7 +469,7 @@ pub mod cursor {
     /// before any pointer report has arrived and does not exist on x86 at all
     /// (`wm::wci_rollup_live` documents both consequences). An instrument for a pointer mechanism has
     /// to sample while the pointer is moving, and this is the one function every x86 motion path goes
-    /// through — the console loop's drain, the demos' drain, and the EL0 router's keep-alive.
+    /// through — the console loop's drain, the demos' drain, and the user router's keep-alive.
     ///
     /// Self-gating three times over, which is what keeps it off every gate: witness builds only, and
     /// it is unreachable without a real HID report, so both QEMU suites (which deliver no pointer)
@@ -656,7 +656,7 @@ lazy_static! {
 // all-zero-report-buffer theory is refuted by that same fact.
 //
 // LEADING THEORY (unified, and the one UVUG-10's fixture gate already kills): the boot `input_launcher`
-// fixture's orphan held `el0_input_active()` for the entire boot, so the router's EL0 branch
+// fixture's orphan held `el0_input_active()` for the entire boot, so the router's user branch
 // (`route_input_to_active_el0`, main.rs) swallowed the whole queue into a ring nothing would ever read —
 // while KEYS still reached the shell, because `input_service`'s UART path calls `gui_send` DIRECTLY and
 // never touches EVENT_QUEUE at all. That single mechanism explains "ptr=0 but key climbs", explains "from
@@ -687,7 +687,7 @@ lazy_static! {
 //         drain is not keeping up (check `depth` and the `[click2]` channel depth alongside).
 //       - `push ptr > 1` with `drop ptr = 0` -> produced and stored, then consumed by SOMEONE ELSE before
 //         the shell drain. `pop` far above the router's own `[uvug9]` totals names that second consumer;
-//         the candidates are an EL0 focus ring and `el0_input_set_active`'s pre-launch discard.
+//         the candidates are a user focus ring and `el0_input_set_active`'s pre-launch discard.
 //       - `push ptr = 1` (the selftest floor, unmoved) -> against the settled xHCI finding this should be
 //         unreachable; if it happens, the pointer endpoint itself stopped completing this boot and the
 //         question is back in the driver lane. Confirm against `MOUSE-1`'s report count before concluding.
@@ -699,7 +699,7 @@ static EVQ_PUSH_KEY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 static EVQ_DROP_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Key-class events DROPPED because the ring was full.
 static EVQ_DROP_KEY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Events successfully popped by ANY consumer (the router drain, an EL0 focus discard, `pump_and_poll`, …).
+/// Events successfully popped by ANY consumer (the router drain, a user focus discard, `pump_and_poll`, …).
 static EVQ_POP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// UVUG-10 — `(push_ptr, push_key, drop_ptr, drop_key, pop)`. Read by the router's `[uvug10] evq` witness.
@@ -1203,7 +1203,7 @@ pub const TYPEMATIC_IDLE_RUN_TO_LATCH: u32 = typematic::IDLE_RUN_TO_LATCH;
 fn pop_event() -> Option<Event> {
     let ev = crate::arch::without_interrupts(|| EVENT_QUEUE.lock().pop());
     if ev.is_some() {
-        // UVUG-10: total consumption, across EVERY consumer — the router drain, the EL0 focus-change
+        // UVUG-10: total consumption, across EVERY consumer — the router drain, the user focus-change
         // discard, `pump_and_poll`. `push - drop - pop` is the live ring occupancy; a `pop` count far
         // above the router drain's own `[uvug9]` totals names a second consumer as the thief.
         EVQ_POP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);

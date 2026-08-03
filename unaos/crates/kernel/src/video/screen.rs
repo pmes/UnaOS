@@ -1176,15 +1176,15 @@ impl Screen {
 /// per-frame spam; the mini-vug presents ~300 times).
 static UVUG2_WITNESSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// UVUG-2 PRESENT SEAM impl — composite an EL1-owned ARGB8888/XRGB surface `(ptr, w, h, stride)` onto
+/// UVUG-2 PRESENT SEAM impl — composite a kernel-owned ARGB8888/XRGB surface `(ptr, w, h, stride)` onto
 /// the real scan-out framebuffer. This is the function registered via
 /// `arch::aarch64::syscall::register_fb_present_hook`; `SYS_FB_PRESENT` calls it from the presenting
-/// task's syscall context (EL1). Convention: **centered** on the panel (clamped to the top-left origin
+/// task's syscall context (kernel mode). Convention: **centered** on the panel (clamped to the top-left origin
 /// when the surface exceeds the panel — off-panel pixels clip via `put_pixel`'s bounds checks).
 ///
 /// Concurrency: this writes DIRECTLY to the front framebuffer (a `Copy` handle taken from `WRITER`),
 /// not through the render task's back-buffered `Screen`. That is deliberate and sound here — there is
-/// no shared/global `Screen` to borrow, and while a full-screen EL0 program owns the panel the render
+/// no shared/global `Screen` to borrow, and while a full-screen user program owns the panel the render
 /// core is parked inside `dispatch_command` (SCREEN_APP_ACTIVE) and is not flushing, so the small
 /// centered blit does not race an owner. The writes are per-pixel volatile stores (`FrameBuffer` is
 /// `Copy`, no aliased `&mut`), followed by a `flush_range` cache-clean over the touched rows so the

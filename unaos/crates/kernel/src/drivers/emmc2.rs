@@ -133,10 +133,10 @@ struct SdCard {
 /// across the entire polled sector transfer. Those transfers are bounded — but by CNTPCT deadlines that
 /// sum to ~600 ms on a read (`CMD`/`DAT` inhibit 100 + `CMD_DONE` 100 + `READ_RDY` 200 + `DATA_DONE`
 /// 200) and ~1.3 s on a write (the same ladder plus `PROG_BUSY` 500 and a CMD13 round trip) — against a
-/// 12 ms scheduler quantum. The holders are ordinary PREEMPTIBLE tasks: an EL0 read walking a cluster
+/// 12 ms scheduler quantum. The holders are ordinary PREEMPTIBLE tasks: a user read walking a cluster
 /// chain, the `/fs/` unafs sector device, the shell's raw block verbs. Tasks never migrate and pinned
 /// tasks are never stolen, so once a holder was preempted mid-hold it never ran again while a masked
-/// acquirer (EL0 `SYS_WRITE` → `fat.rs` `without_interrupts` FAT/dir RMW → `drivers/block.rs` → here)
+/// acquirer (user `SYS_WRITE` → `fat.rs` `without_interrupts` FAT/dir RMW → `drivers/block.rs` → here)
 /// spun on this lock on that same core: that core could take no timer IRQ, the holder was never
 /// re-dispatched, and the core died silently — no panic, and with `FAT_MUTATION` still held by the
 /// spinner, the filesystem died with it. There is no ABBA cycle here either; lock ordering fixes none
@@ -161,7 +161,7 @@ struct SdCard {
 ///     CMD17/CMD24 ladder with NO lock held. A contender is told [`SdClaimError::Busy`] immediately
 ///     rather than spinning, and handles it honestly: [`claim_for_io`] waits only when unmasked, the
 ///     block layer surfaces `BlockError::Busy`, `fat.rs` retries the whole RMW OUTSIDE its masked span,
-///     and EL0 sees `-EAGAIN`.
+///     and user mode sees `-EAGAIN`.
 ///
 /// The whole claim/loan surface is module-private — tighter than F3's, which had to be `pub` because
 /// the xHCI controller is driven from many files. Every SD transfer goes through this file's two entry

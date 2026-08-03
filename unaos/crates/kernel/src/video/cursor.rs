@@ -342,7 +342,7 @@ impl core::ops::DerefMut for SpriteLoan {
 /// The ACQUIRER side — which the WEDGE-2 audit did not enumerate — is what makes it the worst member
 /// of the family. Three chains reach this module with interrupts already masked:
 ///
-/// * **EL0 task exit.** `sched::exit` masks, then `boot::teardown_user_slot` →
+/// * **user task exit.** `sched::exit` masks, then `boot::teardown_user_slot` →
 ///   `syscall::clear_handle_row` → `wm::close_owner`, which runs `cursor::undraw` (through `erase`),
 ///   then `cursor::repaint` (the `<D4>` token's site), then a whole `composite()` pass. Every entry
 ///   point in this module is reachable from it, masked.
@@ -1931,7 +1931,7 @@ fn undraw_locked(
 /// `None` on every one of those passes. The bracket now belongs to `Screen::flush` and covers only
 /// `present_background`; the composite that follows it runs with the sprite on the panel.
 /// WEDGE-9 — **Busy policy: fail soft, hand the repaint off, never wait.** Two of this function's
-/// three callers run with interrupts masked (`wm::erase` on the EL0-exit teardown chain, and
+/// three callers run with interrupts masked (`wm::erase` on the user-exit teardown chain, and
 /// `composite_inner`'s WC-F reserved arm inside a masked present), so a wait here is the F4 death
 /// outright. A refused undraw means the caller is about to paint over sprite pixels it could not hand
 /// back — which is precisely the condition [`owe_repaint`] exists for, and the whole-sprite refresh it
@@ -2624,7 +2624,7 @@ pub fn ensure_drawn() {
 ///
 /// ## WEDGE-9 — THE F4 SITE, and the one entry point whose Busy policy is split by caller
 ///
-/// This is where the family's worst death lived. `wm::close_owner` calls it on EVERY EL0 task exit,
+/// This is where the family's worst death lived. `wm::close_owner` calls it on EVERY user task exit,
 /// from a chain `sched::exit` has already IRQ-masked, and the `<D4>` token in `wm.rs` sits immediately
 /// before it precisely so a wire that ends there names this lock rather than `TABLE`. The other two
 /// masked chains — `SYS_WIN_PRESENT` and `SYS_FB_PRESENT`, both holding `IrqGuard` and `WINDOWS` —

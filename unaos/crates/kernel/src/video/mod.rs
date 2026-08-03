@@ -22,7 +22,7 @@
 //!   `FrameBuffer`s (the framebuffer + a cached-RAM back buffer). The steady-state GUI renderer.
 //! - [`fbcon`] — the boot/panic text console (a log sink for hardware with no serial port),
 //!   drawn straight to its own `FrameBuffer` handle (it runs pre-heap, so no back buffer).
-//! - [`wm`] — the window table and compositor: EL0 surfaces composited onto the panel with
+//! - [`wm`] — the window table and compositor: user surfaces composited onto the panel with
 //!   kernel-drawn chrome. `screen::present_surface` is a compat shim over its window 0.
 //! - [`WRITER`] — the framebuffer the GUI's `Screen` flushes to and that fbcon mirrors onto.
 //!

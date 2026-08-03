@@ -22,7 +22,7 @@
 //!
 //!   * `[boot-time]` — verdicts of the boot-sequenced fixtures (U-arc / M-arc), REPLAYED from a
 //!     kernel-side ring (`BOOT_RING`) that captures every `-> PASS`/`-> FAIL` line as it is emitted
-//!     during boot. These cannot be re-run on demand (they need an EL0 launcher refactor — TSTE-2),
+//!     during boot. These cannot be re-run on demand (they need a user launcher refactor — TSTE-2),
 //!     so `tste` replays the captured verdict rather than pretending to re-execute it.
 //!   * `[live]` — checks that HONESTLY re-run post-boot: scheduler introspection, heap round-trip,
 //!     the video geometry primitives (offscreen), and a fresh-task re-verification of the six sync
