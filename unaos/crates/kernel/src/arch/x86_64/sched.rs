@@ -2826,6 +2826,13 @@ fn run() -> ! {
                 // OWN kernel stack, never a just-freed sibling's (the U4x parent/children hazard the
                 // trampoline-only install could not cover). We are IF=0 here. Set unconditionally: for
                 // a kernel task both anchors are simply never consulted (it never enters from ring 3).
+                //
+                // U4y: note there is NO user-rsp twin to install here, by construction. The SYSCALL
+                // stub pushes the user rsp onto the task's own kernel stack rather than leaving it in
+                // `PerCpuData`, so it rides `ctx_rsp` through the switch with everything else on that
+                // stack and needs no re-install. It could not be re-installed from here in any case:
+                // this site never sees the incoming task's ring-3 rsp. Do not "restore symmetry" by
+                // adding a per-CPU user-rsp write — that shared slot is exactly the bug U4y removed.
                 let ktop = {
                     let s = unsafe { &(*raw).stack };
                     ((s.as_ptr() as usize + s.len()) & !0xF) as u64

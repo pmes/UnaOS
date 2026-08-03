@@ -26,7 +26,7 @@ const IA32_GS_BASE: u32 = 0xC000_0101;
 ///
 /// `syscall_kernel_rsp` / `syscall_user_rsp` are the SYSCALL/SYSRET stack-switch anchors (U1a).
 /// SYSCALL does not switch stacks itself, so the `unaos_syscall_entry` stub (see `syscall.rs`)
-/// `swapgs`es to bring THIS block into GS, saves the user rsp into `syscall_user_rsp`, and loads
+/// `swapgs`es to bring THIS block into GS, parks the user rsp in `syscall_user_rsp`, and loads
 /// the per-task kernel-stack top from `syscall_kernel_rsp`. They are reached from the naked stub
 /// by fixed gs-relative offsets (`{KERNEL,USER}_RSP_OFFSET`), asserted below — do not reorder the
 /// fields above them without updating the offsets. Both are plain `u64` (single-CPU, IRQ-masked
@@ -42,7 +42,19 @@ pub struct PerCpuData {
     pub ipis: AtomicU64,
     /// U1a: per-task kernel-stack top the SYSCALL stub switches to on entry from ring 3.
     syscall_kernel_rsp: u64,
-    /// U1a: scratch slot the SYSCALL stub saves the user rsp into across a syscall.
+    /// U4y: a THREE-INSTRUCTION landing pad, not a save slot. SYSCALL leaves the stub with no free
+    /// register (args + the rcx/r11 return frame + the callee-saved set the user keeps), so the
+    /// incoming user rsp must be parked somewhere addressable before `rsp` can be pointed at the
+    /// kernel stack. The stub stores it here and `push`es it onto the TASK'S OWN kernel stack two
+    /// instructions later; IF=0 throughout and there is no yield point in between, so per-CPU is
+    /// sound for that span and only that span.
+    ///
+    /// It must NOT hold the user rsp across the dispatch: a task that blocks inside a syscall
+    /// (SYS_YIELD, futex wait, sleep) switches out mid-syscall, and a per-CPU slot would then hand
+    /// its user rsp to whichever task `sysretq`s next on this core — two ring-3 tasks sharing one
+    /// stack. That was a real, metal-observed corruption (boot s68); the user rsp is a per-TASK
+    /// value and now lives on the per-task kernel stack, where the context switch preserves it.
+    /// There is deliberately no setter: the stub is the only writer and the only reader.
     syscall_user_rsp: u64,
 }
 

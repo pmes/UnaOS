@@ -2112,8 +2112,30 @@ unsafe extern "C" {
 // task's kernel stack, saves the return frame (rcx/r11), shuffles the (rax, rdi, rsi, rdx) syscall
 // args into the C ABI's (rdi, rsi, rdx, rcx), dispatches, restores, and `sysretq`s back to ring 3.
 // SYS_EXIT never returns (it switches to the scheduler), so the restore tail runs only for
-// returning syscalls. Alignment: after loading rsp = kernel-stack top (16-aligned) the two pushes
+// returning syscalls. Alignment: after loading rsp = kernel-stack top (16-aligned) the FOUR pushes
 // leave rsp 16-aligned, so the `call` meets the SysV (rsp % 16 == 8)-at-entry rule.
+//
+// U4y — WHERE THE USER RSP LIVES. The saved user rsp is a PER-TASK value, so it is parked on the
+// TASK'S OWN KERNEL STACK, not in the per-CPU block. `PerCpuData::syscall_user_rsp` survives only
+// as a three-instruction scratch landing pad: SYSCALL leaves us with no free register (rax/rdi/rsi/
+// rdx/r10 carry args, rcx/r11 carry the return frame, rbx/rbp/r12-r15 are the user's to keep), so
+// the incoming rsp must go SOMEWHERE addressable before we can load the kernel stack — but it is
+// read back and pushed two instructions later, with IF=0 and no yield point in between, so nothing
+// can observe or overwrite it there.
+//
+// This is the U4x reasoning applied to the user twin. Holding the user rsp in the per-CPU slot
+// ACROSS the dispatch was a live corruption bug: a task that BLOCKS inside a syscall (SYS_YIELD ->
+// `sched::yield_now()`, futex wait, sleep) context-switches out with its user rsp still in the
+// shared slot; the next task to `sysretq` on that core then loaded the BLOCKED task's user rsp and
+// ran ring 3 on a stack it did not own, with frame slots at equal offsets aliasing between the two.
+// Observed on metal (boot s68): a parent's `movl $0x0, 0x10(%rsp)` zeroed the low half of a
+// worker's saved surface pointer, and the worker took `vec=14 err=0x7 cr2=0x10000000000` writing
+// through it. The scheduler's dispatch site re-installs TSS.RSP0 and `syscall_kernel_rsp` per task
+// (sched.rs, U4x) but has no way to re-install a user rsp it never captured — the fix has to be
+// here. The kernel stack is the right home because it is exactly what the switch preserves per
+// task: `switch_context` parks rsp in `Task::ctx_rsp` and the stack is a `Box<[u8]>` owned by the
+// `Task`, so the pushed value is untouched across any number of intervening tasks and is freed only
+// with the task itself.
 //
 // U1a does NOT preserve the user's rbx/rbp/r12-r15/rdi/... across a syscall (only rcx/r11, which
 // SYSRET requires); the demo blob loads fresh registers for its second syscall, so this is sound
@@ -2122,8 +2144,17 @@ core::arch::global_asm!(
     ".globl unaos_syscall_entry",
     "unaos_syscall_entry:",
     "swapgs",                       // GS -> this CPU's PerCpuData (parked in KERNEL_GS_BASE shadow)
-    "mov gs:[{uoff}], rsp",         // save the user rsp
-    "mov rsp, gs:[{koff}]",         // switch to this task's kernel stack top
+    "mov gs:[{uoff}], rsp",         // park the user rsp — SCRATCH ONLY, consumed 2 instructions below
+    "mov rsp, gs:[{koff}]",         // switch to this task's kernel stack top (16-aligned)
+    // U4y: move the user rsp off the shared per-CPU slot and onto THIS TASK'S kernel stack, so a
+    // syscall that blocks and resumes later cannot hand its user rsp to whatever task sysrets next.
+    // Two copies, not one: three saved qwords (user rsp, r11, rcx) would leave rsp ≡ 8 (mod 16) here
+    // and the `call` below would enter `dispatch` 16-aligned — the exact inverse of the SysV rule,
+    // and a silent misalignment that only shows up on the callee's first 16-byte SSE spill. The
+    // duplicate is the alignment pad; making it a second copy of the same value rather than junk
+    // means the tail can drop either slot and still be right.
+    "push qword ptr gs:[{uoff}]",   // user rsp, now PER-TASK (alignment pad copy)
+    "push qword ptr gs:[{uoff}]",   // user rsp, now PER-TASK (the copy the tail pops)
     "push r11",                     // save user RFLAGS  (SYSRET restores from r11)
     "push rcx",                     // save user RIP     (SYSRET restores from rcx); rsp now 16-aligned
     // WINX-7: FIVE C arguments now, not four. `SYS_THREAD_SPAWN(entry, sp, arg, place)` is the first
@@ -2139,8 +2170,8 @@ core::arch::global_asm!(
     "mov rsi, rdi",                 // arg0 -> 2nd C arg
     "mov rdi, rax",                 // number -> 1st C arg
     "call {dispatch}",              // rax = return value (or never returns: SYS_EXIT -> scheduler)
-    "pop rcx",                      // restore user RIP   (rsp now = kernel-stack top, 16-aligned)
-    "pop r11",                      // restore user RFLAGS
+    "pop rcx",                      // restore user RIP   (SYSRET's target)
+    "pop r11",                      // restore user RFLAGS; rsp now = ktop-16, 16-aligned
     // --- U1b B2: canonical-rcx guard (CVE-2012-0217 shape). A non-canonical SYSRET target #GPs at
     // CPL 0 *after* the user rsp is loaded, running the #GP handler on a user-controlled stack.
     // Refuse to sysret such an rcx. rdx is scratch here (a caller-saved leftover, scrubbed below
@@ -2161,7 +2192,11 @@ core::arch::global_asm!(
     "xor r8d, r8d",
     "xor r9d, r9d",
     "xor r10d, r10d",
-    "mov rsp, gs:[{uoff}]",         // restore the user rsp
+    // U4y: recover THIS task's own user rsp from THIS task's kernel stack. The two slots hold the
+    // same value; drop the pad and pop the other. The kernel stack is abandoned from here — the next
+    // entry reloads rsp from `syscall_kernel_rsp` (= ktop), so nothing below ktop is ever read again.
+    "add rsp, 8",                   // drop the alignment pad copy
+    "pop rsp",                      // restore the user rsp  (rsp <- [rsp], per POP r64 semantics)
     "swapgs",                       // GS -> user
     "sysretq",                      // -> ring 3: rip = rcx, rflags = r11, rax = return value
     // Non-canonical return RIP: still CPL 0, still on the kernel stack, GS = PerCpuData (the entry
