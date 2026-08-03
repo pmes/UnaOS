@@ -2028,7 +2028,7 @@ fn composite_inner() -> CursorTail {
     // The first cut of this change claimed the old ordering was the wedge, on the argument that
     // `WRITER` is ordered under `SPRITE` and so admitted the sprite lock into the drain barrier's
     // wait set. That argument is WRONG and is recorded here so it is not re-derived: every one of the
-    // 27 `WRITER.lock()` sites in the tree is a single-statement `Copy` read (`*WRITER.lock()`) whose
+    // 35 `WRITER.lock()` sites in the tree is a single-statement `Copy` read (`*WRITER.lock()`) whose
     // guard dies at the semicolon, so no holder ever blocks on a second lock; and `SPRITE` is the
     // OUTER lock of the pair, so the implication runs the other way round anyway.
     //
