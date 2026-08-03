@@ -5117,6 +5117,23 @@ proof-of-law, and it is one variant in an experiment harness. Nothing in the com
 `triangle_job` or in `kick_bin_render` is touched. That is not an omission; a proof and a rewire are
 different changes and mixing them would mean neither could be reviewed on its own evidence.
 
+**PI-V3D-90 PROGRESS (2026-08-03, same session as boot13):**
+- **Step 1 DONE** (`ac9038af`): `v3d75_kick_probe` rehosted onto CT1 in boot13's proven shape —
+  the criterion can return true again; the CT0-bound `[v3d73]` sampler stays honestly unarmed
+  inside it; the five retracted negatives (`v3d75a/b`, `v3d77a/b`, `v3d80`) are RE-TAKEABLE at
+  the next deep-battery sitting and stay retracted until those boots run.
+- **Step 2 IN CODE**: `cle_class_witness(thread, head_op, label)` — the class law enforced at
+  submit, firing loudly where silicon freezes silently. Classification claims only what the
+  campaign measured (121/126 render, 119/120 bin; anything else prints class-unknown). Wired at
+  the six production submits: `clear_job`, `bin_job` (both arms), `triangle_job` (bin + render),
+  `kick_bin_render` (bin + render). The head op is READ BACK FROM DRAM at the submitted address —
+  never builder-declared. The first version declared the op as a constant, and the measurement
+  that killed it belongs in the record: LLVM proved every branch statically dead and deleted the
+  entire witness (strings=0 on its own build) — a compile-time-satisfiable assert is vacuous by
+  construction, one more member of the vacuity family (spent-budget, vacuous-zero, unreachable
+  banner). Only a value the compiler cannot see makes an enforcement real. The §49 instrument
+  harness's deliberate cross-class kicks keep raw writes with their own justifications, by design.
+
 **THE NEXT ARC — the production rewire (PI-V3D-90).** Named here so it is a commitment and not a
 loose end. In order:
 

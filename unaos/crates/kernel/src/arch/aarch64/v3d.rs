@@ -432,6 +432,53 @@ const V3D_CLE_CT1QBA: usize = 0x0164; // CT1 queue begin address (v3d_regs.h V3D
 const V3D_CLE_CT1QEA: usize = 0x016c; // CT1 queue end address (v3d_regs.h V3D_CLE_CT1QEA) — QEA write kicks
 const V3D_CLE_CT1CS_CTRUN: u32 = 1 << 5; // per v3d_regs.h V3D_CLE_CTRUN
 
+/// PI-V3D-90 step 2 — the class law enforced at submit, not by review (v3d.md §49.12): CT0 is
+/// the BINNER (bin-class lists only), CT1 the RENDERER (render-class only); boot12 proved the
+/// silicon punishes a violation with a silent decoder freeze, so this witness fires LOUDLY
+/// where the freeze would be mute. `head_op` is BUILDER-DECLARED at each site (the constant the
+/// list was built with) — one notch weaker than an independent DRAM read-back of byte 0, which
+/// is this helper's named upgrade. Classification claims only what the campaign measured:
+/// 121/126 render [boot12], 119/120 bin [boot6/8/10]; anything else prints class-unknown
+/// rather than guessing. The §49 instrument harness's deliberate cross-class kicks do NOT call
+/// this — their raw writes carry their own justifications.
+#[inline]
+fn cle_class_witness(thread: u8, ba: u32, label: &str) {
+    // The head op is READ BACK from the list's own byte 0 at the submitted address — never taken
+    // from the builder's declaration. A declared constant is statically satisfiable and LLVM
+    // deletes the whole witness (measured: strings=0 on the first, declared, version of this fn);
+    // a DRAM read is the only form the compiler cannot prove away and the only one that catches a
+    // wrong list actually reaching the queue.
+    let base = arena_phys();
+    let arena = &raw const V3D_ARENA;
+    let head_op: u8 = {
+        let off = (ba as usize).wrapping_sub(base);
+        if (ba as usize) < base || off >= unsafe { (*arena).bytes.len() } {
+            serial_println!(
+                ":: V3D: [classlaw] {} CT{} ba={:#010x} OUTSIDE the arena — cannot read the head op; classify by hand ::",
+                label, thread, ba
+            );
+            return;
+        }
+        unsafe { core::ptr::read_volatile((*arena).bytes.as_ptr().add(off)) }
+    };
+    let class = match head_op {
+        121 | 126 => 1u8, // render [boot12: both freeze CT0]
+        119 | 120 => 0u8, // bin [boot6/8/10: execute on CT0]
+        _ => 2u8,
+    };
+    if class == 2 {
+        serial_println!(
+            ":: V3D: [classlaw] {} CT{} head-op={} CLASS-UNKNOWN — not in the measured table (121/126 render, 119/120 bin); classify it before trusting this kick ::",
+            label, thread, head_op
+        );
+    } else if (thread == 0) != (class == 0) {
+        serial_println!(
+            ":: V3D: [classlaw] VIOLATION — {} submits a {}-class list (head-op={}) to CT{}: the decoder will freeze silently (v3d.md §49.11-12). This line is the witness the silicon refuses to print ::",
+            label, if class == 1 { "RENDER" } else { "BIN" }, head_op, thread
+        );
+    }
+}
+
 // PI-V3D-8 — CT0 (the BINNING queue). The M4 triangle first runs a BIN job on CT0 (the coordinate
 // shader transforms the vertices, the PTB bins them into per-tile lists), then the RENDER job on CT1
 // consumes those lists via BRANCH_TO_IMPLICIT_TILE_LIST. Every offset below is transcribed VERBATIM
@@ -1465,6 +1512,7 @@ fn clear_job(fb: Option<FbTarget>) -> bool {
     // Order matters: program the queue-BEGIN address first, then writing the queue-END address is the
     // CLE's GO trigger (v3d_regs.h / the kernel v3d_gem submit path: CT1QBA then CT1QEA). With the
     // offsets now correct, this QEA write is what actually starts CT1.
+    cle_class_witness(1, ba as u32, "clear_job"); // builder-declared: build_rcl heads with P_TRMC
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QBA, ba as u32);
     dsb(); // BA must be latched before the EA write triggers the fetch
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QEA, ea as u32);
@@ -6706,6 +6754,7 @@ fn submit_bisect_rung_geom(
         (qts_echo & V3D_CLE_CT0QTS_ENABLE != 0) as u32,
         BIN_TILEALLOC_BYTES as u32, qms_echo,
     );
+    cle_class_witness(0, bin_ba, "bin_job"); // builder-declared: bin CLs head with NUMBER_OF_LAYERS
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
     dsb();
     // PI-V3D-49 fixed the VALUE (BPOS=0; the kernel never pre-arms BPOA/BPOS before the GO — overflow is
@@ -6817,6 +6866,7 @@ fn submit_bisect_rung_geom(
         dsb();
         mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, qts_val);
         dsb();
+        cle_class_witness(0, bin_ba, "bin_job/retry"); // builder-declared: same bin CL, retry arm
         mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
         dsb();
         mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
@@ -10698,6 +10748,7 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
         BIN_TILEALLOC_BYTES as u32,
         ts | V3D_CLE_CT0QTS_ENABLE,
     );
+    cle_class_witness(0, bin_ba, "triangle_job/bin"); // builder-declared: bin CL heads with NUMBER_OF_LAYERS
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
     dsb(); // BA latched before the GO
     // PI-V3D-21: arm the QPU-execution performance counters immediately before the GO so they span the
@@ -10773,6 +10824,7 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
     // render observes the bin's actual output.
     invalidate_gpu_caches("L2T flush (M4 render pre-kick)");
     let r_cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
+    cle_class_witness(1, rcl_ba, "triangle_job/render"); // builder-declared: the RCL heads with P_TRMC
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QBA, rcl_ba);
     dsb();
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QEA, rcl_ea); // GO
@@ -12220,6 +12272,7 @@ fn kick_bin_render(bin_off: usize, bin_len: usize, rcl_off: usize, rcl_len: usiz
         BIN_TILEALLOC_BYTES as u32,
         ts | V3D_CLE_CT0QTS_ENABLE,
     );
+    cle_class_witness(0, bin_ba, "kick_bin_render/bin"); // builder-declared: bin CLs head with NUMBER_OF_LAYERS
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
     dsb();
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
@@ -12238,6 +12291,7 @@ fn kick_bin_render(bin_off: usize, bin_len: usize, rcl_off: usize, rcl_len: usiz
     // bin's tile lists to the render CLE's branch fetch (the boot-P7 zero-stores root cause).
     invalidate_gpu_caches("L2T flush (battery render pre-kick)");
     let r_cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
+    cle_class_witness(1, rcl_ba, "kick_bin_render/render"); // builder-declared: the RCL heads with P_TRMC
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QBA, rcl_ba);
     dsb();
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QEA, rcl_ea); // GO
