@@ -23,10 +23,17 @@ extended by that seat.
   ui_status seam) restores callers and callees together.
 
 ## Known-opens ledger (carried from both batons; each is arc-sized unless noted)
-- SYS_WIN_PRESENT runs the WHOLE compositor pass under IrqGuard+WINDOWS (TABLE/WRITER/STAGE/
-  DEFER inside) — bigger than F4; next family-audit arc.
-- OVERLAY lacks its micro-guard.
-- unafs `with_unafs` has no Busy plumbing (transaction-restart arc).
+- SYS_WIN_PRESENT masked span — **AUDITED** (pi seat, 2026-08-03): 2.8 ms mean / 13.9 ms
+  worst-case IRQ-masked per present at 1920x1200 vs the 12 ms quantum (`[comp2] pass_us`,
+  engine.md — the number was already measured, never read as masked latency). 6 defect sites
+  over 9 locks; 4-milestone remediation sequenced (audit: plans/active/syswinpresent-audit-r24.md).
+  **M1 SHIPPED as WEDGE-11** (below); M2 (DEFER guard + STAGE pre-size), M3 (span shrink:
+  fb_checksum + sprite tail hoist), M4 (claim-id + revalidate-at-landing, needs fresh brief) open.
+- ~~OVERLAY lacks its micro-guard~~ **CLOSED — WEDGE-11** (claim/loan, not micro-guard: the
+  audit's own §5 miscounted; cursor.rs:1845/2460 are PRODUCTION panel-walk holds, so the
+  three-site micro-guard would mask-spin on preemptible I/O holders. `[wedge11] overlay-claim`
+  census, QUIET in QEMU; metal execution pending).
+- unafs `with_unafs` has no Busy plumbing (transaction-restart arc) — in flight, pi seat.
 - x86: ASID-0 dual-live collision; in-bounds surface write to unmapped page 5/16 at four
   windows (EL0 fault `err=0x6`, pre-existing, not the merge's); EL0 SYS_WIN_CREATE no-upscale
   speck (pi lineage likely fixes — prove at the x86 panel before closing).
