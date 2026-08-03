@@ -10533,8 +10533,10 @@ fn v3d75_fabric_condition() {
         OFF_SHADREC, OFF_PROBE_BIN_CL, true, None,
     ).map(|r| r.retired).unwrap_or(false);
 
-    // ── Experiment B: transplant the working value verbatim (skipped if A already retires). ──
-    if !a {
+    // ── Experiment B: transplant the working value verbatim. Gated on the HONEST criterion:
+    // the saturated CT1 probe (`a`) is always true post-rehost and had made B unreachable
+    // forever (boot17 finding); the bin criterion is the one that can actually be moved. ──
+    if !bin_after_a {
         mmio_write(RPIVID_ASB_BASE, ASB_V3D_M_CTRL, PM_PASSWORD | 0x4040);
         dsb();
         let m_b = mmio_read(RPIVID_ASB_BASE, ASB_V3D_M_CTRL);
