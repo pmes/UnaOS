@@ -3796,7 +3796,7 @@ Pi 4 boot prints the new line. QEMU `raspi4b` models no V3D block, so no `[v3d55
 
 ---
 
-**R1 — one experiment per boot: make the rung under test the boot's FIRST CT0 kick.**
+**R1 — one experiment per boot: make the rung under test the boot's FIRST CT0 kick.** *(BUILT — V3D-85, `UNAOS_V3D_FIRSTKICK=<empty|rcl|m4>`; see §49.7. R0 above lands in the same image, so the `[v3d55]` lines a first-kick capture carries are the fixed three-class ones.)*
 
 *Action.* A knob (`UNAOS_V3D_FIRSTKICK=<empty|rcl|m4>`) that runs exactly one CT0 kick, placed
 **before** `probe_job`, with the full witness suite (`[v3d54]` submit + trace, `[v3d58]` stations,
@@ -3824,7 +3824,7 @@ until it is taken.**
 
 ---
 
-**R2 — the MMU access counters: an independent witness for "the CLE never fetched".**
+**R2 — the MMU access counters: an independent witness for "the CLE never fetched".** *(BUILT — V3D-85, rides R1; see §49.7.)*
 
 *Action.* Pure reads of three hub registers this driver has never defined, at offsets already named
 in `v3d.rs`'s own MMU comment block and consistent with its established anchors
@@ -3858,7 +3858,7 @@ aborted silently and that has been true since V3D-62.
 
 ---
 
-**R3 — the CLE's thread registers, as distinct from its queue registers.**
+**R3 — the CLE's thread registers, as distinct from its queue registers.** *(BUILT — V3D-85, rides R1; see §49.7.)*
 
 *Action.* Read `V3D_CLE_CT0EA` (core `0x0108`) and `V3D_CLE_CT0RA` (core `0x0118`) at the five
 `[v3d58]` stations. Both offsets follow from this file's **own** established map — `CT0CS 0x0100`
@@ -3958,7 +3958,7 @@ is itself a strong new fact.
 
 ---
 
-**R7 — decode the two bits that separate a fetching thread from a wedged one.**
+**R7 — decode the two bits that separate a fetching thread from a wedged one.** *(BUILT — V3D-85, rides R1; see §49.7.)*
 
 *Action.* Analysis plus reads, no writes. `CT0CS` wedged `0x70` vs mainline-fetching `0x20`: bit 4
 is `CTSUBS` on the VC4 map (the thread believes it is inside a sub-list); **bit 6 appears in no
@@ -4027,10 +4027,10 @@ fixed and should be stated in the code that carries it:
 | Rung | Cost | Decides |
 |---|---|---|
 | R0 `[v3d55]` fill classification | free, **done pending metal** | nothing on its own — but it stops a first-order witness reading backwards, and retires the "wrote" verdicts taken from it |
-| R1 first-kick isolation | 1–3 boots | whether any banked negative in this file means what it says |
-| R2 MMU access counters | ~8 reads, rides R1 | whether the CLE ever issued a translation, independent of `CT0CA` |
-| R3 `CT0EA`/`CT0RA` | 2 reads/station, rides R1 | whether the queue ever transferred into the thread |
-| R7 `CT0CS` bit 4/6 decode | free, rides R1 | names the wedge state against the working reference |
+| R1 first-kick isolation — **BUILT, V3D-85 (§49.7)** | 1–3 boots | whether any banked negative in this file means what it says |
+| R2 MMU access counters — **BUILT, V3D-85 (§49.7)** | ~8 reads, rides R1 | whether the CLE ever issued a translation, independent of `CT0CA` |
+| R3 `CT0EA`/`CT0RA` — **BUILT, V3D-85 (§49.7)** | 2 reads/station, rides R1 | whether the queue ever transferred into the thread |
+| R7 `CT0CS` bit 4/6 decode — **BUILT, V3D-85 (§49.7)** | free, rides R1 | names the wedge state against the working reference |
 | R4 MMUC waits + init `INT_CLR` | 1 boot | empties the mainline-mirror space for real |
 | R5 bin+render frame pair | 1 boot | the last untested frame-level ordering |
 | R6 `CTRSTA` | rides any boot after R1 | whether the wedge is clearable — and if so, collapses R1's cost |
@@ -4049,3 +4049,89 @@ QEMU `raspi4b` models no V3D block, so every rung above sits behind the hub-iden
 `kernel8-test` green means **no regression and nothing more**. Every verdict in this section is
 metal-attended, and this section itself arms nothing: it is a plan, and the writes it describes
 belong to the next code arc.
+
+### 49.7 The rungs that were built — R1 + R2 + R3 + R7, one boot, one knob (V3D-85)
+
+§49.6's "R1, R2, R3 and R7 all ride a single boot" is now code. The four rungs share one arming
+switch and one placement, and nothing else in the file changed: the diff is additive, and with the
+knob off not one line of it is compiled (`strings` on a knob-off image finds zero occurrences of any
+tag below, with the pre-existing `[v3d74a]` still present as the control).
+
+**The knob.** `UNAOS_V3D_FIRSTKICK=<empty|rcl|m4>` ⇒ Cargo feature `v3d_firstkick` (implies `v3d`),
+**default OFF**. The knob's *presence* arms the feature; its *value* is read with `option_env!` and
+picks the list, so one build is one experiment. `1` and an empty value select `empty` (§49.6's top
+pick); an unrecognised value runs `empty` and says on the wire that it was not recognised, so a typo
+can never be read as a deliberate variant choice. The raw value rides the `[v3d85]` header line.
+
+The exact deep-battery boot line for the sitting:
+
+```
+UNAOS_WITNESS=1 UNAOS_PIUSB=1 UNAOS_GENET=1 UNAOS_SMP7=1 UNAOS_NETTEST=1 UNAOS_V3D=1 \
+UNAOS_VUGPAR=1 UNAOS_WEDGE2=1 UNAOS_V3D_DEEP=1 UNAOS_V3D_FIRSTKICK=empty ./arroyo kernel8
+```
+
+`UNAOS_V3D_DEEP=1` is carried for build parity with the bench's standing battery; under
+`UNAOS_V3D_FIRSTKICK` the deep tails are never *reached*, because `bringup` returns at the rung. Swap
+the value to `rcl` or `m4` for the other two variants — one per boot, never two.
+
+**Placement.** The rung sits in `bringup` immediately after M3 (`clear_job`, the CT1 frame that is
+R2's positive control and `[v3d58] xengine`'s render reference) and immediately **before**
+`triangle_job` — i.e. in front of `probe_job`, the kick this whole section exists to get ahead of.
+`bringup` then **returns**: no `probe_job`, no `[v3d48]` ladder, no `[v3d63…v3d81]` tails, no M4, no
+visible battery. The suppression is the instrument, not a limitation of it.
+
+**Scope.** Every access these rungs add is a READ. The only writes are the ones the kick itself
+already performs — the byte-exact `v3d_bin_job_run` sequence unchanged since §44, plus the
+stale-latch `INT_CLR` W1C every rung in this file makes. `PTB BXCF` and `MISCCFG.QRMAXCNT` stay
+**EXCLUDED MEASURED** (§49.5) and are read, never written. `CTRSTA` (R6) is **not implemented**. No
+mailbox tag is sent from this path, reply-less or otherwise.
+
+**The registers this arc names for the first time.** All reads, all derived from anchors already
+corroborated in this file — never fabricated constants.
+
+| Rung | Register | Offset | Derivation |
+|---|---|---|---|
+| R2 | `V3D_MMU_HIT` | hub `+0x1208` | contiguous with `MMU_CTL 0x1200` / `PT_PA_BASE 0x1204`, in mainline's own naming order |
+| R2 | `V3D_MMU_MISSES` | hub `+0x120c` | ditto |
+| R2 | `V3D_MMU_STALLS` | hub `+0x1210` | ditto |
+| R2 | `V3D_MMU_ADDR_CAP` | hub `+0x1214` | ditto; `ENABLE` bit 31 + a page-count field whose width this file's map does not name, so the raw word is printed beside the decode |
+| R3 | `V3D_CLE_CT0EA` | core `+0x0108` | the n-interleaved CLE map: `CT0CS 0x0100`/`CT1CS 0x0104`, `CT0CA 0x0110`/`CT1CA 0x0114`, `CT0LC 0x0120`/`CT1LC 0x0124` leave `0x0108`/`0x010c` as the `CTnEA` pair |
+| R3 | `V3D_CLE_CT0RA` | core `+0x0118` | same layout leaves `0x0118`/`0x011c` as the `CTnRA` pair |
+| R7 | `CT0CS` bit 6 | core `+0x0100` | not a new register — the bit that **appears in no published map** and that §46.1's ground truth isolates |
+
+**The witness tags, and what each reads under both outcomes.**
+
+| Tag | Line | Wedged (still-dead) shape | Fetching (missing-init) shape |
+|---|---|---|---|
+| `[v3d85]` | header + closer; knob value, variant, the standing caveat | printed either way — a capture under this knob is deliberately short and must **never** be diffed line-for-line against a deep boot | ditto |
+| `[v3d85r1]` | `S0 VIRGIN` + `first-kick verdict` | `retired=0 executed=0`, `BFC Δ0`, `PCS` `BMACTIVE=1`, sampler `in-span=0` (or `max-in-span==QBA`), poison fully intact ⇒ **the banked negatives are first-kick-true and the §49.3 confound is EXCLUDED** | `retired=1`/`store-verified=1`, `BFC Δ1`, `BMACTIVE→0` ⇒ the wall is accumulated state, not a cold-boot init gap, and the campaign's baseline is **retracted** |
+| `[v3d85r2]` | `mmu-access` ×4 windows (M3 CT1 control, CT0 kick, wedged wait, whole kick) + `addr-cap` | control moved, CT0 windows `ΔHIT=ΔMISSES=ΔSTALLS=0` ⇒ **the thread issued no memory access, on a second instrument sharing no mechanism with `CT0CA`** | CT0 `ΔHIT`/`ΔMISSES` non-zero ⇒ the CLE **did** translate, `CT0CA` is lying on the bin path exactly as it lied on the offset arithmetic (§48), and the hunt moves *after* the fetch |
+| `[v3d85r2]` | `addr-cap` (separate line, separate claim) | `ENABLE=0` ⇒ the V3D-62 `CAP_EXCEEDED_ABORT` arming has never had anything to abort — branch excluded | `ENABLE=1` with the page field **below** the arena's top page ⇒ every access above it has been silently aborted since V3D-62; a live candidate for the whole wall |
+| `[v3d85r3]` | 5 station rows + `queue-vs-thread` | `CT0EA` never takes `CT0QEA`'s value and never moves ⇒ **the queue-to-thread transfer never happened** — one station upstream of "never fetched", a different mechanism entirely | `CT0EA == CT0QEA` from S3 on with `CT0CA` frozen ⇒ the thread **did** load and then stalled at its first fetch; combined with R2 this is the tightest statement the campaign can make |
+| `[v3d85r7]` | 5 station rows + `cs-decode` | `CT0CS` reaches `0x70`; the row where bits 4/6 first set names the write that took the thread from legal to illegal. `CTSUBS=1` with `CT0RA==0` at every station ⇒ the thread only *claims* a sub-list, bit 4 is not `CTSUBS` on 4.2, and §33's inferred row falls (which also disarms R6's premise — same borrowed map). `CTSUBS=1` with `CT0RA!=0` ⇒ the sub-list state is consistent and §33's never-followed hypothesis is live again | `CT0CS` ends at `0x20` — `CTRUN` alone, byte-identical to the working mainline reference ⇒ the `0x70` signature is **not** a cold-boot property of this part |
+| `[v3d85r7]` | `first-station-reading-0x70` | `0` (already `0x70` at S0, before this driver wrote one CT0 register) ⇒ the signature is a **bring-up** fact, not a frame fact; chase bring-up | `≥3` ⇒ the transition is caused by the kick and is watchable for the first time |
+
+Two readings that are **not** verdicts and are labelled as such on the wire: a zero delta on R2's M3
+CT1 *control* retires R2 for that boot (the instrument does not count on this part, so every CT0
+window is INCONCLUSIVE and the `[v3d73]`/`CT0CA` evidence stands alone); and zero sampler ticks make
+the fetch columns INCONCLUSIVE while leaving the retire columns intact.
+
+**Gate.** `./arroyo check` green on both arches, knob off **and** knob on. Full-knob `kernel8` build
+green; `strings -a target/pi_baremetal/kernel8.img` shows `[v3d85]`, `[v3d85r1]`, `[v3d85r2]`,
+`[v3d85r3]`, `[v3d85r7]` with the knob on and **none** of them with it off. QEMU models no V3D, so
+there is no QEMU leg for this arc at all: the verdict is the attended metal boot.
+
+**R0 rides the same image, but not the same code path.** The `[v3d55]` fill-classification fix landed
+independently and is unconditional — however `v3d55_tilestate_readback` is called from `probe_job`,
+which a first-kick boot never reaches, so **no `[v3d55] tilestate`/`pool` line appears in a
+`UNAOS_V3D_FIRSTKICK` capture at all**. R1 is deliberately not wired to it: that function
+`clean_invalidate`s the poisoned regions *before* the L2T write-back, an ordering `probe_job` accepts
+on the strength of every arena writer cleaning to PoC, and R1's whole still-dead reading rests on
+those regions being untouched. The poison evidence in a first-kick capture comes from `[v3d56]`'s
+scans over the same two regions — the classifier R0 fixed `[v3d55]` to match, and the one that was
+never wrong. Read `[v3d56] scan` where you would normally read `[v3d55] tilestate`.
+
+**Not built, deliberately.** R4 (the two mainline probe steps still unmirrored), R5 (the bin+render
+frame pair), R6 (`CTRSTA`), R8 (the instrument-free boot) and R9/R10 (`BXCF`/`QRMAXCNT`, recommended
+against in §49.5) are untouched. They are separate boots and separate arcs, and §49.4 is explicit
+that nothing below R1 is interpretable until R1 is taken.

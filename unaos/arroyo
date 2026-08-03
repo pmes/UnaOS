@@ -73,6 +73,11 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # the effect is read (default 250 ms, capped at 10 s, ignored unless a UNAOS_V3D81_* leg is armed).
 # The value rides on the `[v3d81]` wire lines, so a capture states its own settle rather than
 # requiring the reader to remember the build.
+#
+# PI-V3D-85: UNAOS_V3D_FIRSTKICK is BOTH — its presence arms the `v3d_firstkick` cargo feature (see
+# the kernel8 knob block below) and its VALUE is read with `option_env!` by arch/aarch64/v3d.rs to
+# pick which list the boot's one CT0 kick carries (`empty` | `rcl` | `m4`; `1` or an empty value
+# select `empty`). The raw value rides the `[v3d85]` header line, so a capture states its own variant.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
@@ -1456,6 +1461,31 @@ kernel8() {
     if [ -n "${UNAOS_V3D81_DISPLAY:-}" ]; then
         K8_FEATS="${K8_FEATS},v3d81_display,v3d81,v3d_deep,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D81_DISPLAY: send NOTIFY_DISPLAY_DONE reply-less and read the effect ([v3d80] stands down) — ⚠ the panel may go black and stay black${COLOR_RESET}"
+    fi
+    # PI-V3D-85: UNAOS_V3D_FIRSTKICK=<empty|rcl|m4> adds the `v3d_firstkick` (+`v3d`) feature — the
+    # R-LADDER from docs/dev/OS/08_VIDEO/v3d.md §49. §49.3 named the confound underneath every banked
+    # negative in that file: `probe_job`'s bin is the FIRST CT0 kick of an ordinary boot, and every
+    # other CT0 kick runs behind it on a CT0 whose CTRUN stuck 1 at the [v3d53] rung and never
+    # cleared — so "the queue loaded and never advanced" was the EXPECTED reading and carried no
+    # information about thread health. Armed, `bringup` takes EXACTLY ONE CT0 kick, after M3 (the CT1
+    # clear job, which is R2's positive control) and BEFORE probe_job, with the full witness suite —
+    # then RETURNS. Riding that one kick, ALL READ-ONLY: R2 [v3d85r2] the four V3D MMU access
+    # registers (hub +0x1208/0x120c/0x1210/0x1214 = HIT/MISSES/STALLS/ADDR_CAP, never read by this
+    # driver before) across the CT1 control, the CT0 kick and the ~0.5 s wedged wait; R3 [v3d85r3]
+    # CT0EA/CT0RA (core +0x0108/+0x0118 — the THREAD's end/return addresses, as distinct from the
+    # QUEUE registers we write) at all five [v3d58] stations; R7 [v3d85r7] the CT0CS bit4/bit6 decode
+    # against §46.1's ground truth (mainline FETCHING = 0x20, our wedged thread = 0x70), cross-read
+    # against CT0RA. No V3D register is written that the kick itself does not already write; BXCF and
+    # MISCCFG.QRMAXCNT stay EXCLUDED MEASURED (§49.5) and are read, never written; CTRSTA (R6) is not
+    # implemented; no mailbox tag is sent. The VALUE picks the list — `empty` (§49.6's top pick; `1`
+    # or an empty value select it too), `rcl` ([v3d74a]'s render list on CT0, bare QBA->QEA), `m4`
+    # (the real draw) — one experiment per boot, by construction. Implies UNAOS_V3D. ⚠ an armed boot
+    # deliberately produces a SHORT capture missing every banked witness: label it and NEVER diff it
+    # line-for-line against a full deep boot. QEMU raspi4b models no V3D, so kernel8-test green means
+    # no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_FIRSTKICK:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_firstkick,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_FIRSTKICK=${UNAOS_V3D_FIRSTKICK}: the R-ladder — ONE CT0 kick before probe_job with R2/R3/R7 riding it, then bringup returns (⚠ short capture: no ladder, no M4, no battery — do not diff against a deep boot)${COLOR_RESET}"
     fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::

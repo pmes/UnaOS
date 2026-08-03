@@ -551,6 +551,31 @@ v3d81 = ["v3d_deep"]
 v3d81_qpu = ["v3d81"]
 v3d81_display = ["v3d81"]
 
+# PI-V3D-85: the R-LADDER — R1 first-kick isolation, with R2/R3/R7 riding the same boot
+# (docs/dev/OS/08_VIDEO/v3d.md §49). §49.3 established the confound underneath every banked negative
+# in that file: `probe_job`'s bin is the FIRST CT0 kick of an ordinary boot, and every other CT0 kick
+# runs behind it on a CT0 whose CTRUN stuck 1 at the `[v3d53]` rung and never cleared. This feature
+# makes `bringup` take EXACTLY ONE CT0 kick — placed after M3 (the CT1 clear job, which is R2's
+# positive control) and BEFORE `probe_job` — with the full witness suite, and then RETURN: no
+# `[v3d48]` ladder, no deep tails, no M4, no visible battery. Riding that one kick, all read-only:
+# R2 (`[v3d85r2]`) samples the four V3D MMU access registers (hub +0x1208/0x120c/0x1210/0x1214 —
+# HIT/MISSES/STALLS/ADDR_CAP, never defined by this driver before) across the CT1 control, the CT0
+# kick and the ~0.5 s wedged wait; R3 (`[v3d85r3]`) reads CT0EA/CT0RA (core +0x0108/+0x0118, the
+# THREAD's end/return addresses as distinct from the QUEUE registers we write) at all five `[v3d58]`
+# stations; R7 (`[v3d85r7]`) decodes CT0CS bit 4 (CTSUBS) and bit 6 (in no published map) against
+# §46.1's ground truth — mainline FETCHING reads 0x20, our wedged thread 0x70 — and cross-reads them
+# against CT0RA. Nothing here writes a V3D register the kick itself does not already write; BXCF and
+# MISCCFG.QRMAXCNT are EXCLUDED MEASURED (§49.5) and are read, never written; CTRSTA (R6) is not
+# implemented; no mailbox tag is sent. Requires `v3d`. DEFAULT OFF — with the feature off not one
+# line of the rung is compiled and an armed V3D boot runs its normal course. The knob VALUE picks the
+# list: `empty` (the `[v3d48]` Empty frame — §49.6's top pick; also selected by `1` or an empty
+# value), `rcl` (`[v3d74a]`'s render list on CT0's queue, bare QBA->QEA with no bin-class arming) or
+# `m4` (the real draw). One experiment per boot, by construction. Enable via `UNAOS_V3D=1
+# UNAOS_V3D_FIRSTKICK=empty UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot deliberately produces a
+# SHORT capture that is missing every banked witness — it must never be diffed line-for-line against
+# a full deep boot; the rung says so on the wire, first line and last.
+v3d_firstkick = ["v3d"]
+
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
 # the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding
