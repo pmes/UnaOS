@@ -11185,6 +11185,9 @@ fn sys_fb_present() -> i64 {
         sum,
     );
     drop(t);
+    drop(_irq);
+    // M3 shrink 2: cash the sprite tail composite_pass stashed — unmasked, lock-free epilogue.
+    crate::video::wm::composite_tail_owed();
     0
 }
 
@@ -11582,6 +11585,9 @@ fn sys_win_present(win: u64) -> i64 {
         sum,
     );
     drop(t);
+    drop(_irq);
+    // M3 shrink 2: cash the sprite tail composite_pass stashed — unmasked, lock-free epilogue.
+    crate::video::wm::composite_tail_owed();
     0
 }
 

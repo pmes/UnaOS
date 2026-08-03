@@ -797,6 +797,14 @@ pub fn present(id: WinId) -> bool {
         }
         return true;
     }
+    // M3 shrink 2 (aarch64 only): the present path defers the sprite tail to the syscall's
+    // unmasked epilogue (`composite_tail_owed`, called after the WINDOWS/IRQ drops) — the tail's
+    // MAX_PIX passes and whole-panel flush leave the masked span. x86 keeps the inline pair:
+    // nothing on its syscall side cashes an owed tail, and a tail deferred to the NEXT composite
+    // would lag the cursor a whole frame there.
+    #[cfg(target_arch = "aarch64")]
+    composite_pass();
+    #[cfg(not(target_arch = "aarch64"))]
     composite();
     #[cfg(feature = "witness")]
     wcn_tick();
@@ -1714,9 +1722,27 @@ pub fn count() -> usize {
 /// repair is a whole-sprite [`super::cursor::repaint`] here, outside the guard, on exactly the footing
 /// the `Repaint` tail has had since WC-I. See `cursor::PRESENT_DIRTY`.
 pub fn composite() {
+    composite_pass();
+    composite_tail_owed();
+}
+
+/// M3 shrink 2 — the owed-tail split. `composite_pass` runs the masked half (the inner pass) and
+/// STASHES the tail verdict + the COMPOSITE-2 clock marks; `composite_tail_owed` cashes them,
+/// normally from the syscall's unmasked epilogue. The pass also cashes a STALE owed tail first
+/// (masked — pathological only: a present whose caller never cashed), so a tail is deferred at
+/// most one pass and never lost — OVERLAY_CLOSE_OWED's shape. Encoding: 0 = none; else
+/// tail(1..=4) | dirty<<8.
+static OWED_TAIL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static OWED_C2_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static OWED_C2_T1: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn composite_pass() {
+    composite_tail_owed();
     // COMPOSITE-2 — the whole-pass clock. Starts before the inner pass (which self-reports its
-    // sprite/wait/loop terms) and stops after the tail, so `pass_us` bounds everything a present
-    // pays for its composite, including the tail's sprite work.
+    // sprite/wait/loop terms) and stops after the tail — the stashed t0 makes `pass_us` span the
+    // deferral gap too, so it still bounds everything a present pays for its composite.
     #[cfg(all(target_arch = "aarch64", feature = "witness"))]
     let c2_t0 = crate::arch::aarch64::now_cycles();
     let mut tail = composite_inner();
@@ -1730,6 +1756,33 @@ pub fn composite() {
     }
     #[cfg(feature = "witness")]
     note_cursor_tail(tail);
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        OWED_C2_T0.store(c2_t0, Relaxed);
+        OWED_C2_T1.store(c2_t1, Relaxed);
+    }
+    let code: u32 = match tail {
+        CursorTail::Adopt => 1,
+        CursorTail::Settle => 2,
+        CursorTail::Repaint => 3,
+        CursorTail::Untouched => 4,
+    } | if dirty { 0x100 } else { 0 };
+    OWED_TAIL.store(code, core::sync::atomic::Ordering::Release);
+}
+
+pub fn composite_tail_owed() {
+    let code = OWED_TAIL.swap(0, core::sync::atomic::Ordering::AcqRel);
+    if code == 0 {
+        return;
+    }
+    let dirty = code & 0x100 != 0;
+    let tail = match code & 0xff {
+        1 => CursorTail::Adopt,
+        2 => CursorTail::Settle,
+        3 => CursorTail::Repaint,
+        _ => CursorTail::Untouched,
+    };
     match tail {
         CursorTail::Adopt => {
             // `adopt_overlay` is the ONLY closer of the overlay session, so `Adopt` is never
@@ -1754,10 +1807,13 @@ pub fn composite() {
         CursorTail::Untouched => super::cursor::ensure_drawn(),
     }
     // COMPOSITE-2 — close the ledger: the tail interval is sprite work, the whole interval is the
-    // pass. One `now_cycles` read serves both accounts.
+    // pass. One `now_cycles` read serves both accounts. The marks come from the stash, so the
+    // interval spans a deferred tail's unmasked gap too (see composite_pass).
     #[cfg(all(target_arch = "aarch64", feature = "witness"))]
     {
         use core::sync::atomic::Ordering::Relaxed;
+        let c2_t0 = OWED_C2_T0.load(Relaxed);
+        let c2_t1 = OWED_C2_T1.load(Relaxed);
         let end = crate::arch::aarch64::now_cycles();
         let pass = end.saturating_sub(c2_t0);
         C2_SPRITE_CYC.fetch_add(end.saturating_sub(c2_t1), Relaxed);
