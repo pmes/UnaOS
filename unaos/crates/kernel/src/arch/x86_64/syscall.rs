@@ -2240,7 +2240,7 @@ const PF_ERR_INSTR: u64 = 1 << 4; // the access was an instruction fetch (needs 
 extern "C" fn syscall_ret_noncanonical() -> ! {
     let name = crate::arch::sched::current_name().unwrap_or("<ring3>");
     serial_println!(
-        ":: EL0-equiv FAULT: task '{}' KILLED — non-canonical sysret rip (CVE-2012-0217 guard) ::",
+        ":: RING-3 FAULT: task '{}' KILLED — non-canonical sysret rip (CVE-2012-0217 guard) ::",
         name
     );
     // Count it as a kill so a corrupted-RIP program still terminates cleanly; it is not one of the
@@ -11881,7 +11881,7 @@ fn winx_launcher(demo_cpu: usize) {
         return;
     };
     serial_println!(
-        ":: WINX-1: ring-3 windows — SYS_WIN_CREATE(29)/SYS_WIN_PRESENT(30) + SYS_GETINFO(7)/SYS_SLEEP_MS(5)/SYS_YIELD(4), an EL0 program paints a compositor window ::"
+        ":: WINX-1: ring-3 windows — SYS_WIN_CREATE(29)/SYS_WIN_PRESENT(30) + SYS_GETINFO(7)/SYS_SLEEP_MS(5)/SYS_YIELD(4), a ring-3 program paints a compositor window ::"
     );
     crate::arch::sched::spawn_user_in_space("winx-app", fix.entry, fix.sp, demo_cpu, fix.cr3);
 
@@ -12028,7 +12028,7 @@ fn winx2_launcher(_demo_cpu: usize) {
     let cap = user_window_size();
     if de.size == 0 || de.size as usize > cap {
         serial_println!(
-            ":: WINX-2: STAT.ELF is {} bytes, outside the {}-byte EL0 window — witness skipped ::",
+            ":: WINX-2: STAT.ELF is {} bytes, outside the {}-byte ring-3 window — witness skipped ::",
             de.size, cap
         );
         return;
@@ -12541,7 +12541,7 @@ fn winx7_launcher(_demo_cpu: usize) {
         return;
     };
     serial_println!(
-        ":: WINX-7: ring-3 threads + futex + input — SYS_THREAD_SPAWN(21)/_EXIT(22)/_JOIN(23), SYS_FUTEX(26), SYS_INPUT_POLL(27), two EL0 threads under one CR3 ::"
+        ":: WINX-7: ring-3 threads + futex + input — SYS_THREAD_SPAWN(21)/_EXIT(22)/_JOIN(23), SYS_FUTEX(26), SYS_INPUT_POLL(27), two ring-3 threads under one CR3 ::"
     );
     crate::arch::sched::spawn_user_in_space(
         WINX7_TASK_NAME,
@@ -12682,7 +12682,7 @@ fn winx8_launcher(_demo_cpu: usize) {
     let cap = user_window_size();
     if de.size == 0 || de.size as usize > cap {
         serial_println!(
-            ":: WINX-8: VUG.ELF is {} bytes, outside the {}-byte EL0 window — witness skipped ::",
+            ":: WINX-8: VUG.ELF is {} bytes, outside the {}-byte ring-3 window — witness skipped ::",
             de.size, cap
         );
         return;
@@ -12739,7 +12739,7 @@ fn winx8_launcher(_demo_cpu: usize) {
 
     if windowed && presents >= WINX8_MIN_PRESENTS && killed && reaped && gone && cleared {
         serial_println!(
-            ":: WINX-8: VUG.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents with {} EL0 thread(s), killed + reaped, teardown clean -> PASS ::",
+            ":: WINX-8: VUG.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents with {} ring-3 thread(s), killed + reaped, teardown clean -> PASS ::",
             entry, presents, threads
         );
     } else {
@@ -12795,7 +12795,7 @@ fn pulsew_launcher(_demo_cpu: usize) {
     let cap = user_window_size();
     if de.size == 0 || de.size as usize > cap {
         serial_println!(
-            ":: PULSE-W: PULSE.ELF is {} bytes, outside the {}-byte EL0 window — witness skipped ::",
+            ":: PULSE-W: PULSE.ELF is {} bytes, outside the {}-byte ring-3 window — witness skipped ::",
             de.size, cap
         );
         return;

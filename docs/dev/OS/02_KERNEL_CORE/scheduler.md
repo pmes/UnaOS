@@ -1319,7 +1319,7 @@ at the instant its size changes, so the verb now takes a census there. It mints
 it. What is new is *when* they are sampled and that they are sampled together.
 
 A run emits, on serial: a `:: STORM: begin ::` resource line (free/running/
-exited/porphaned `Proc` rows, free job rows, free EL0 slots), a `pre` census, one
+exited/porphaned `Proc` rows, free job rows, free user slots), a `pre` census, one
 `[storm] k=` line after each successful launch, a `:: STORM: REFUSED at launch
 k ::` line if one is refused, and a `post` census. The refusal line **re-reads
 the census** rather than referring to the message beside it, because those
@@ -1329,7 +1329,7 @@ oversized `/fat/VUG.ELF`) is console-only. A serial-only capture must be able to
 tell the fleet ceiling from a bad card — `free > 0` at the refusal means the
 process table was *not* the limit. The resource line is re-read **unconditionally
 after the burst** as `:: STORM: end ::` (not only on refusal): the reserve
-question — did two EL0 slots survive a full fleet? — is asked by the *success*
+question — did two user slots survive a full fleet? — is asked by the *success*
 path, and the answer is not derivable from the `begin` line (a vug that faults
 mid-burst leaves a `PEXITED` row and breaks the arithmetic; `[spread10]`'s slot
 histogram counts residency, not `SLOT_USED`). The census is `[storm]` plus

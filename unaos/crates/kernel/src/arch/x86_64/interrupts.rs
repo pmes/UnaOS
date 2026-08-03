@@ -158,13 +158,13 @@ unsafe fn ring3_fault_kill(vec: u8, err: u64, rip: u64, cr2: u64) -> ! {
     // rather than silently "killing" nothing.
     let Some(name) = crate::arch::sched::current_name() else {
         serial_println!(
-            ":: EL0-equiv FAULT from CPL3 with NO current task — vec={} err={:#x} rip={:#x} cr2={:#x} (kernel bug) ::",
+            ":: RING-3 FAULT from CPL3 with NO current task — vec={} err={:#x} rip={:#x} cr2={:#x} (kernel bug) ::",
             vec, err, rip, cr2
         );
         crate::hlt_loop();
     };
     serial_println!(
-        ":: EL0-equiv FAULT: task '{}' KILLED — vec={} err={:#x} rip={:#x} cr2={:#x} ::",
+        ":: RING-3 FAULT: task '{}' KILLED — vec={} err={:#x} rip={:#x} cr2={:#x} ::",
         name, vec, err, rip, cr2
     );
     crate::arch::syscall::record_ring3_kill(name, vec, err, cr2);

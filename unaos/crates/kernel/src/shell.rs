@@ -2871,7 +2871,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // (`run_user_image`), which maps them into a fresh per-task slot with per-segment W^X pages and
             // runs them under user mode + the fault-kill net. `run <path>`.
             match args.first() {
-                None => console.println("usage: run <path>   (load + execute an ELF64 EL0 program)"),
+                None => console.println("usage: run <path>   (load + execute an ELF64 user program)"),
                 Some(&path) => run_program(console, path),
             }
         },
@@ -3377,7 +3377,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // walk — this is what turns the WC-TAB binding into a workflow: `run` blocks until its app
             // dies, so real windows never coexisted before this verb). `bg <path>`.
             match args.first() {
-                None => console.println("usage: bg <path>   (run an ELF64 EL0 program in the background)"),
+                None => console.println("usage: bg <path>   (run an ELF64 user program in the background)"),
                 Some(&path) => {
                     bg_program(console, path);
                 }
@@ -3436,12 +3436,12 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             };
             let slots_free = crate::arch::boot::user_slots_free();
             console.println(&alloc::format!(
-                "storm: n={} — {}/{} process rows free, {}/{} job rows, {}/{} EL0 slots",
+                "storm: n={} — {}/{} process rows free, {}/{} job rows, {}/{} user slots",
                 n, rows_free, rows, jobs_free, jobs_rows,
                 slots_free, crate::arch::boot::USER_SLOTS
             ));
             serial_println!(
-                ":: STORM: begin n={} | proc rows free={} running={} exited={} porphaned={} of {} | job rows free={}/{} | EL0 slots free={}/{} ::",
+                ":: STORM: begin n={} | proc rows free={} running={} exited={} porphaned={} of {} | job rows free={}/{} | user slots free={}/{} ::",
                 n, rows_free, rows_running, rows_exited, rows_orphaned, rows,
                 jobs_free, jobs_rows, slots_free, crate::arch::boot::USER_SLOTS
             );
@@ -3458,7 +3458,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     // there. `free > 0` here means the table was NOT the limit.
                     let (f, r, e, o) = crate::arch::syscall::proc_table_headroom();
                     serial_println!(
-                        ":: STORM: REFUSED at launch {} of {} — fleet stands at {} | proc rows free={} running={} exited={} porphaned={} | EL0 slots free={} ::",
+                        ":: STORM: REFUSED at launch {} of {} — fleet stands at {} | proc rows free={} running={} exited={} porphaned={} | user slots free={} ::",
                         launched + 1, n, launched, f, r, e, o,
                         crate::arch::boot::user_slots_free()
                     );
@@ -3478,7 +3478,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             {
                 let (f, r, e, o) = crate::arch::syscall::proc_table_headroom();
                 serial_println!(
-                    ":: STORM: end | proc rows free={} running={} exited={} porphaned={} of {} | EL0 slots free={}/{} ::",
+                    ":: STORM: end | proc rows free={} running={} exited={} porphaned={} of {} | user slots free={}/{} ::",
                     f, r, e, o, crate::arch::syscall::proc_table_rows(),
                     crate::arch::boot::user_slots_free(), crate::arch::boot::USER_SLOTS
                 );
@@ -3640,7 +3640,7 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
     }
     if st.size > CAP {
         console.println(&alloc::format!(
-            "{}: {}: {} bytes exceeds the {}-byte EL0 user window (-E2BIG)",
+            "{}: {}: {} bytes exceeds the {}-byte user window (-E2BIG)",
             verb, path, st.size, CAP
         ));
         return None;

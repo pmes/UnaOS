@@ -62,9 +62,11 @@ extended by that seat.
   "cannot find sched in arch" — unestablished whether that path is ever run or predates the merge.
 - x86 sysret scrub: FIXED on trunk post-landing (all six scrubbed registers declared in every
   x86 ring-3 stub; previously `r10` was declared exactly once tree-wide).
-- Terminology: the `EL0-equiv FAULT` witness string is **x86-only** (`vec=14`/`cr2`/`err` are
-  x86 page-fault artefacts; `arch/aarch64` never emits it). It reads like an ARM exception and
-  has already cost a round-trip — any doc naming that fault says "x86 ring 3" explicitly.
+- Terminology: the x86 ring-3 fault witness string is **x86-only** (`vec=14`/`cr2`/`err` are
+  x86 page-fault artefacts; `arch/aarch64` never emits it). It was spelled `EL0-equiv FAULT`,
+  read like an ARM exception and cost a round-trip in review; it is now `:: RING-3 FAULT: … ::`
+  and any doc naming that fault says "x86 ring 3" explicitly. No spec or `arroyo` battery step
+  ever matched the old spelling (checked repo-wide at the rename), so no gate moved with it.
 
 ## Gate rules earned by this merge (binding; also in CLAUDE.md / LAWS)
 - Video-stack checks carry `UNAOS_WC=1`; banner must list `wc`.

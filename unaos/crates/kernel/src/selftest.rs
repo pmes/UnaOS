@@ -483,7 +483,7 @@ pub fn run(console: &mut Console, pal: &mut TargetPal) {
     );
     pager.line(console, pal, "----");
     pager.line(console, pal, &summary);
-    pager.line(console, pal, "footer: boot-sequenced EL0 fixtures re-run needs TSTE-2 (launcher refactor).");
+    pager.line(console, pal, "footer: boot-sequenced user fixtures re-run needs TSTE-2 (launcher refactor).");
     serial_println!(
         ":: TSTE: {} pass {} fail {} skip (+{} boot) ::",
         tally.pass, tally.fail, tally.skip, tally.boot

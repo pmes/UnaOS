@@ -2857,7 +2857,7 @@
   (#PF/#GP/#UD/#SS/#NP/#DE/#BR/#AC) now KILLS the offending task via the
   scheduler instead of halting the kernel; a CPL-0 fault stays fatal. The fault
   handler `swapgs`es to restore per-CPU GS (a ring-3 fault does not, unlike the
-  SYSCALL stub), logs `:: EL0-equiv FAULT: task '…' KILLED — vec=… err=… rip=…
+  SYSCALL stub), logs `:: RING-3 FAULT: task '…' KILLED — vec=… err=… rip=…
   cr2=… ::`, records `(task, vector, CR2)`-matched accounting, then reuses
   `sched::exit()` (same context `sys_exit` runs in). Three inline fixtures prove
   it — write to a kernel VA (#PF U+W), write to the RO code page (#PF U+W), exec
