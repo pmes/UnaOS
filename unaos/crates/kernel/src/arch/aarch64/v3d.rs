@@ -10524,6 +10524,14 @@ fn v3d75_fabric_condition() {
         not(feature = "v3d_qpu")
     ))]
     let a = v3d75_kick_probe("v3d75a pre-send-control");
+    // PI-V3D-91: the BIN-class CT0 criterion — the subject these hypotheses are actually about.
+    // An empty bin frame retires on healthy CT0 (boot6) and dies on the wedged mid-battery block
+    // (v3d74a), so unlike the CT1 probe above this one can genuinely move with an experiment.
+    // Same serial-battery scratch offsets as v3d68; bank=true so the rung self-documents.
+    let bin_after_a = submit_bisect_rung_geom(
+        "v3d91", "bin-criterion after experiment A window", BinContent::Empty,
+        OFF_SHADREC, OFF_PROBE_BIN_CL, true, None,
+    ).map(|r| r.retired).unwrap_or(false);
 
     // ── Experiment B: transplant the working value verbatim (skipped if A already retires). ──
     if !a {
@@ -10536,13 +10544,23 @@ fn v3d75_fabric_condition() {
             if m_b == 0x4040 { "held" } else { "did NOT hold — bits read-only or firmware-owned" }
         );
         let b = v3d75_kick_probe("v3d75b post-transplant");
+        let bin_after_b = submit_bisect_rung_geom(
+            "v3d91", "bin-criterion after experiment B", BinContent::Empty,
+            OFF_SHADREC, OFF_PROBE_BIN_CL, true, None,
+        ).map(|r| r.retired).unwrap_or(false);
         serial_println!(
-            ":: V3D: [v3d75] verdict — A={} B={} — CRITERION IS THE REHOSTED CT1 PROBE (PI-V3D-90 s1): a CT1 render kick executes regardless of firmware init, QPU enable or fabric state (boot13/14 measured), so a TRUE here attributes NOTHING to the experiment and a FALSE is a new fact about CT1, not about the bin wall. These legs' hypotheses are about THREAD 0 — re-testing them needs a BIN-class CT0 criterion (empty/m4 lists execute first-kick, boot6/8), named as PI-V3D-91 in v3d.md §49.13. Raw kick lines above are the evidence; this line refuses attribution by design ::",
-            a as u32, b as u32
+            ":: V3D: [v3d75] verdict — ct1: A={} B={} (health only, attributes nothing — saturated criterion, v3d.md §49.13) | PI-V3D-91 bin-criterion: after-A={} after-B={} — {} ::",
+            a as u32, b as u32, bin_after_a as u32, bin_after_b as u32,
+            if !bin_after_a && bin_after_b { "THE TRANSPLANT MOVED THE BIN CRITERION — M_CTRL is live on the bin wall; re-run to confirm ordering before productionizing" }
+            else if bin_after_a { "bin criterion already retiring before B — attribute to the A window (or to state this decode cannot see), not to the transplant" }
+            else { "bin criterion dead after both windows — neither experiment moves the bin wall; the PTB frame unit hunt (§49.13) stands" }
         );
     } else {
         serial_println!(
-            ":: V3D: [v3d75] verdict — A=1 — NO ATTRIBUTION: the criterion is the rehosted CT1 probe, which executes with or without the experiment (boot14: the PRE-send control also executed). The old prose ('the wall was firmware-side init') printed from exactly this saturated read and is RETRACTED-VOCABULARY (v3d.md §49.13). Re-test on a BIN-class CT0 criterion — PI-V3D-91 ::"
+            ":: V3D: [v3d75] verdict — ct1: A=1 (health only, attributes nothing — saturated criterion, v3d.md §49.13) | PI-V3D-91 bin-criterion after the A window: {} — {} ::",
+            bin_after_a as u32,
+            if bin_after_a { "the bin frame RETIRED mid-battery after the A window — if the A experiment was armed this boot, THAT is the first genuine attribution candidate; re-run with A disarmed to discriminate" }
+            else { "bin frame still dead — the A window moved nothing on thread 0; the PTB frame unit hunt (§49.13) stands" }
         );
     }
 }
