@@ -333,10 +333,14 @@ unsafe fn sys4(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 
 // ── x86_64 stubs, GRAFTED AT MERGE ASSEMBLY from the x86 trunk's WINX-7/TEARDOWN-1 port
 // (UnaOS-gemini f36ab3d5) — my body, their ABI layer. TEARDOWN-1's discipline carried intact:
-// `syscall` destroys rcx (return RIP) and r11 (RFLAGS) so both are clobbered; the kernel's
-// sysretq scrubs rdi/rsi/rdx/r8/r9/r10, so every argument register is `inlateout(...) => _` and
-// r8/r9/r10 — scrubbed by the kernel, and named by no stub except `sys4` (where r10 carries the
-// fourth argument and is therefore already `inlateout`) — are declared `lateout` everywhere else.
+// `syscall` destroys rcx (return RIP) and r11 (RFLAGS) so both are clobbered. The kernel's
+// sysretq tail additionally scrubs SIX registers — rdi/rsi/rdx/r8/r9/r10 — to zero on EVERY
+// syscall return, unconditionally, regardless of how many arguments that syscall actually took.
+// So every stub here, no matter its arity, must declare all six: `inlateout(reg) a => _` for
+// whichever ones happen to carry that stub's own arguments, `lateout(reg) _` for the rest. A
+// stub that only names the registers it passes (the arity mistake this block used to make) still
+// lets the compiler believe an unnamed one — say `rdx` in a 2-argument stub — survives the
+// syscall; it does not, and reusing it after the call reads back zero.
 // The clobber list states the ABI the kernel actually implements, so the compiler reloads what
 // it must (declaring them `in(...)` once cost the second THREAD_SPAWN its entry pointer: the
 // kernel's scrubbed rdi=0 was validated and refused with -EFAULT).
@@ -347,6 +351,7 @@ unsafe fn sys0(n: u64) -> u64 {
     core::arch::asm!(
         "syscall",
         inlateout("rax") n => r,
+        lateout("rdi") _, lateout("rsi") _, lateout("rdx") _,
         lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
         options(nostack),
     );
@@ -360,6 +365,7 @@ unsafe fn sys1(n: u64, a0: u64) -> u64 {
         "syscall",
         inlateout("rax") n => r,
         inlateout("rdi") a0 => _,
+        lateout("rsi") _, lateout("rdx") _,
         lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
         options(nostack),
     );
@@ -374,6 +380,7 @@ unsafe fn sys2(n: u64, a0: u64, a1: u64) -> u64 {
         inlateout("rax") n => r,
         inlateout("rdi") a0 => _,
         inlateout("rsi") a1 => _,
+        lateout("rdx") _,
         lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
         options(nostack),
     );

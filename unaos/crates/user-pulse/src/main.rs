@@ -119,11 +119,15 @@ mod sysabi {
 }
 
 /// x86_64 — U1b B1: the kernel's `sysretq` tail zeroes rdi/rsi/rdx/r8/r9/r10 before returning to ring
-/// 3, so every one of those six registers must be declared to the compiler as NOT surviving the
-/// `syscall` instruction: `inlateout(reg) a => _` for the ones carrying an argument, `lateout(reg) _`
-/// for the rest. A bare `in(reg)` promises rustc the register still holds its value afterward — a
-/// promise the kernel breaks — and the compiler is then free to reuse what it believes is a live
-/// value, which is undefined behaviour that surfaces only on real hardware, never in QEMU or `check`.
+/// 3, on EVERY syscall, unconditionally, regardless of how many arguments that syscall took. So every
+/// stub below — regardless of its own arity — must declare all six of those registers as NOT
+/// surviving the `syscall` instruction: `inlateout(reg) a => _` for whichever ones happen to carry
+/// that stub's own arguments, `lateout(reg) _` for the rest. Naming only the registers a given stub
+/// passes (and leaving the others unnamed) is the arity mistake this block used to make: the
+/// compiler is then free to believe an unnamed register — say `rdx` in a 2-argument stub — survives
+/// the call and reuse it, and it does not; it reads back zero. A bare `in(reg)` is worse still,
+/// promising rustc the register still holds its value afterward — a promise the kernel breaks — and
+/// that is undefined behaviour that surfaces only on real hardware, never in QEMU or `check`.
 #[cfg(target_arch = "x86_64")]
 mod sysabi {
     #[inline(always)]
@@ -133,6 +137,9 @@ mod sysabi {
             core::arch::asm!(
                 "syscall",
                 inlateout("rax") n => r,
+                lateout("rdi") _,
+                lateout("rsi") _,
+                lateout("rdx") _,
                 lateout("rcx") _,
                 lateout("r11") _,
                 lateout("r8") _,
@@ -151,6 +158,8 @@ mod sysabi {
                 "syscall",
                 inlateout("rax") n => r,
                 inlateout("rdi") a0 => _,
+                lateout("rsi") _,
+                lateout("rdx") _,
                 lateout("rcx") _,
                 lateout("r11") _,
                 lateout("r8") _,
@@ -170,6 +179,7 @@ mod sysabi {
                 inlateout("rax") n => r,
                 inlateout("rdi") a0 => _,
                 inlateout("rsi") a1 => _,
+                lateout("rdx") _,
                 lateout("rcx") _,
                 lateout("r11") _,
                 lateout("r8") _,

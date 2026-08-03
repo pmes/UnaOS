@@ -124,14 +124,20 @@ mod sysabi {
 ///
 /// TEARDOWN-1 — THE CLOBBER LIST MUST STATE THE ABI THE KERNEL IMPLEMENTS, not the one SysV describes.
 /// `syscall` itself destroys rcx (the return RIP) and r11 (the saved RFLAGS), and on top of that the
-/// kernel's `sysretq` tail SCRUBS rdi/rsi/rdx/r8/r9/r10 to zero on the way back to ring 3 (the U1b B1
-/// no-kernel-pointer-leak rule) while preserving the callee-saved set across the C dispatcher.
+/// kernel's `sysretq` tail SCRUBS SIX registers — rdi/rsi/rdx/r8/r9/r10 — to zero on the way back to
+/// ring 3 (the U1b B1 no-kernel-pointer-leak rule), on EVERY syscall, unconditionally, regardless of
+/// how many arguments that syscall took, while preserving the callee-saved set across the C
+/// dispatcher. So every stub below, whatever its own arity, declares all six.
 ///
 /// These stubs used to declare the argument registers `in(...)`, which promises the asm leaves them
 /// intact — so rustc was entitled to keep a value live in rdi across a `syscall` and reuse it, and it
 /// did. That is the whole reason a second `SYS_GETINFO` read here could report `pid=0`: not a kernel
-/// bug, a stub that lied about what the instruction does. Every argument register is `inlateout(...)
-/// => _` now, and r8/r9/r10 — scrubbed by the kernel, named by no stub here — are declared `lateout`.
+/// bug, a stub that lied about what the instruction does. A later fix declared each stub's own
+/// argument registers `inlateout(...) => _` but only named r8/r9/r10 as `lateout` — still an arity
+/// mistake, just a narrower one: `sys1` left rsi/rdx unnamed and `sys2` left rdx unnamed, so the
+/// compiler was still entitled to treat those as surviving the call. Every argument register is
+/// `inlateout(...) => _`, and every one of the six scrubbed registers a given stub does NOT use as
+/// an argument — including rsi/rdx below their own arity, not just r8/r9/r10 — is declared `lateout`.
 #[cfg(target_arch = "x86_64")]
 mod sysabi {
     #[inline(always)]
@@ -142,6 +148,8 @@ mod sysabi {
                 "syscall",
                 inlateout("rax") n => r,
                 inlateout("rdi") a0 => _,
+                lateout("rsi") _,
+                lateout("rdx") _,
                 lateout("rcx") _,
                 lateout("r11") _,
                 lateout("r8") _,
@@ -161,6 +169,7 @@ mod sysabi {
                 inlateout("rax") n => r,
                 inlateout("rdi") a0 => _,
                 inlateout("rsi") a1 => _,
+                lateout("rdx") _,
                 lateout("rcx") _,
                 lateout("r11") _,
                 lateout("r8") _,
