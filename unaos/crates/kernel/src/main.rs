@@ -2603,6 +2603,25 @@ fn pump_usb_into_gui() {
         x.service_slot_disposal();
         x.service_enum();
     }
+    // BOT-CENSUS-PI: the one-shot BOT phase-desync census (`:: BOT: phase … result=SUMMARY ::`) plus
+    // the USB topology dump. Its other two call sites ride the shared x86/virt BSP loop, which a Pi
+    // bare-metal boot NEVER reaches (the scheduler path owns those boots), so on the platform whose
+    // VL805 the counters were written to interrogate the counters incremented and the REPORT never
+    // fired — tag_mismatch/bad_sig/undrained/cbw_fault with no denominator. This pass is the Pi's
+    // equivalent site: it runs from `usb_pump` (~4 ms cadence, metal) and from the `input_service`
+    // poll-nap branch (every cooperative pass, QEMU raspi4b), i.e. on every bare-metal variant.
+    //
+    // PLACEMENT IS THE WHOLE TRICK: this call sits OUTSIDE the `claim()` loan scope above, after the
+    // `if let` block's closing brace has dropped the loan. Since WEDGE-8 `log_summary_once` claims its
+    // OWN loan internally, so calling it from inside the block would self-deny with `Busy` — and
+    // because the one-shot's N counter advances on EVERY call regardless of whether the claim
+    // succeeds, that would burn the single firing and suppress the census for the whole boot,
+    // permanently. Nothing between here and the loan's drop may re-claim the controller.
+    //
+    // Threshold unchanged (N == 2000, deliberately not retuned): at this pass's ~4 ms cadence that is
+    // ~8 s after the pump comes up, versus the x86 loop's frame cadence — late enough that boot
+    // enumeration has finished or visibly stalled, which is what the one-shot wants either way.
+    unaos_kernel::drivers::xhci::log_summary_once();
     // UVUG-5 typematic: BEFORE the drain, synthesise a held key's repeat into EVENT_QUEUE so it rides this
     // pass's routing exactly like a real key edge (`poll_events()` above already re-armed the HID rings and
     // pushed any genuine edges). No key held / not yet due -> no-op; QEMU has no HID so this never fires.
