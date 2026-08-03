@@ -5042,3 +5042,107 @@ firmware/fabric hypotheses those boots were meant to kill are **not** revived as
 returned to **untested**. Retesting them is cheap and is a natural rider on the next arc: swap
 `v3d75_kick_probe`'s body to the CT1 submission path (§49.12) and every one of those legs gets a
 success criterion that *can* return true.
+
+---
+
+### 49.12 The law, executed — `UNAOS_V3D_FIRSTKICK=rclct1` (PI-V3D-89)
+
+§49.11 ends with a driver law, and a law that has never been run is still an argument. This variant
+runs it.
+
+**The variant.** `rclct1` — the **plain `rcl` list**, byte for byte the `rcl` arm's, from the same
+`build_rcl()` call, at the same `OFF_RCL` address, with the same seeded target and the same three
+cache publishes — submitted on the **CT1 register file**. `CT1QBA` → `CT1QEA` instead of `CT0QBA` →
+`CT0QEA`. That is the entire difference. Against the `rcl` boot it is a **one-variable experiment**,
+and the variable is the thread.
+
+**The arming question, answered from the reference rather than guessed.** CT1 takes no arming and
+*cannot*: `CT0QMA` (0x170), `CT0QMS` (0x174) and `CT0QTS` (0x15c) are tile-allocation and tile-state
+memory — the **binner's** outputs — and the CLE register map carries no CT1 counterpart for any of
+them. Mainline programs all three exclusively in `v3d_bin_job_run`; its render path writes `CT1QBA`
+then `CT1QEA` and nothing else. **This driver's own `clear_job` is that sequence transcribed** — its
+`CT1QBA`→`CT1QEA` pair cites `v3d_regs.h` / the `v3d_gem` submit path in place — and it is the leg
+that banks a byte-verified store every boot at M3. So the submit is bare `CT1QBA`→`CT1QEA` with a CPU
+`clean_range` publish and no GPU-cache invalidate, which is **also the `rcl` arm's shape**. The pair
+therefore holds list, address, publishes *and submit shape* fixed, and moves only the register file.
+
+**Why this is not circular, and what it adds over M3.** `clear_job` already retires this list on CT1,
+including on this very boot a few hundred lines above the kick — `[v3d89]`'s `S0 pre-program` line
+prints that result as the **in-boot control**. What `rclct1` adds is that the `rcl` boot and the
+`rclct1` boot become the **same instrument**: same rung, same builder call, same fault gate, same
+poison detectors, same verdict grammar. Before it, "CT0 freezes, CT1 retires" spanned two different
+code paths and therefore two different sets of incidental differences. Now it is one variable in one
+harness — which is what this ladder has demanded of every other claim it makes.
+
+**The witness family — `[v3d89]`.** Five lines, in the established style:
+
+| line | what it states |
+|---|---|
+| `[v3d89] construction` | list length, sub-list length, that it is the plain `rcl` from the same `build_rcl()` call, and that nothing but the register file differs |
+| `[v3d89] arming` | the paragraph above, on the wire — *why* there is nothing to write, not merely that nothing was written |
+| `[v3d89] S0 pre-program` | `CT1CS`/`CT1CA`/`CT1EA` before the kick, plus M3's `ran=`/`verified=` as the in-boot control |
+| `[v3d89] submit` | the `[v3d54]` audit on CT1's registers — intended vs latched `[BA,EA)`, so a non-retire is a frame fact and not a submission artifact |
+| `[v3d89] cle-progress` | the CT1 counterpart of the `[v3d73]` sampler (~1 ms cadence, ~0.5 s backstop): `CT1CA`'s furthest advance **inside** `[QBA,QEA]`, `in-span`, `eq-QBA`, `changes`, `first_move` |
+| `[v3d89] rclct1 verdict` | `store-verified` / `consumed` / `frame-closed` / `executed`, `RFC`/`BFC` deltas, the two BIN-output poison regions as **negative controls**, and `mmu-fault-latched` |
+
+The verdict is **fault-gated exactly as `[v3d85r1]` and `[v3d87h]` are** — §49.10's asterisk is why —
+and it refuses to claim anything on an unsound submit or a zero-sample wait.
+
+> **A witness may not print a column it cannot interpret.** On `rclct1` the entire CT0 station
+> battery — `[v3d85r1]`, `[v3d85r2]`, `[v3d85r3]`, `[v3d85r7]`, `[v3d58]`, `[v3d73]` — is **skipped**,
+> because every one of them reads CT0 and this boot never kicks CT0. Running them would print a page
+> of columns that are all correctly zero and all meaningless. The boot-complete line says so in terms.
+
+**Both outcomes, pre-written.**
+
+| outcome | verdict, and what it means |
+|---|---|
+| **`executed` = 1** (store-verified, or frame-closed, or consumed) | **THE CT0/CT1 CLASS LAW IS CONFIRMED EXECUTABLE.** The exact list bytes that held `CT0CA` at `QBA` and never advanced were fetched, stepped and closed by CT1 from the same address with the same publishes and the same submit shape. The law stops being an inference from a freeze and becomes a working path; the driver fix is **specified rather than proposed** |
+| **`executed` = 0** (CT1 froze too) | **The class law STANDS on boot12's CT0 evidence, which does not depend on this kick** — op 126 and op 121 still froze CT0 where bin-class op 119 advanced, and M3 still retires this same list on CT1 every boot. What it says instead is that **CT1 arming needs its own bracket**, because something about *this* kick differs from `clear_job`'s and it is not the list, the address, the publishes or the submit shape — all four are held fixed by construction. **The named differences, in order:** (1) **position** — this is a *second* CT1 kick on a boot where M3 already ran one to completion, so CT1 may carry end-of-frame state `clear_job` never sees, the exact mirror of the §49.3 confound that started this ladder; (2) the intervening L2T/SLC cache traffic and poison writes this rung makes between M3 and the GO; (3) frame-count state, `RFC` having already advanced once. Take them in that order — **position first**, by moving the kick ahead of M3 exactly as R1 moved the CT0 kick ahead of `probe_job` |
+
+**Scope — the production path is deliberately NOT rewired in this arc.** `rclct1` is the
+proof-of-law, and it is one variant in an experiment harness. Nothing in the compositor, in
+`triangle_job` or in `kick_bin_render` is touched. That is not an omission; a proof and a rewire are
+different changes and mixing them would mean neither could be reviewed on its own evidence.
+
+**THE NEXT ARC — the production rewire (PI-V3D-90).** Named here so it is a commitment and not a
+loose end. In order:
+
+1. **Rehost `v3d75_kick_probe` onto CT1** (§49.11a names it the historical mistake). One body swap,
+   and it immediately buys the **re-take of five retracted negatives** — `v3d75a`, `v3d75b`,
+   `v3d77a`, `v3d77b`, `v3d80` — with a success criterion that can return true. Cheapest first, and
+   it recovers banked evidence rather than producing new claims.
+2. **Audit the real compositor path end to end for class discipline** — every list that reaches a
+   CLE queue gets classified at its construction site, and the class is asserted against the thread
+   at submit time so the rule is enforced by the code rather than by review.
+3. **Route the render list of the M4/M5–M7 draw path to CT1** and re-take the bin/render split with
+   both threads carrying the class they are built for.
+4. **Only then** return to the bin wall (§6, §22), which §49.11a establishes the class law does
+   **not** explain — `probe_job`, `triangle_job` and `kick_bin_render` were always bin-class on CT0,
+   and that defect is still open and still untouched by any of this.
+
+**The boot.**
+
+```
+UNAOS_WITNESS=1 UNAOS_PIUSB=1 UNAOS_GENET=1 UNAOS_SMP7=1 UNAOS_NETTEST=1 UNAOS_V3D=1 \
+UNAOS_VUGPAR=1 UNAOS_WEDGE2=1 UNAOS_V3D_DEEP=1 UNAOS_V3D_FIRSTKICK=rclct1 ./arroyo kernel8
+```
+
+One variant per boot, never two — the R1 discipline is the reason the table above means anything.
+
+**Scope, unchanged.** Read-only discipline exactly as every rung in this family: the kick's own two
+queue writes are the only CLE writes; `BXCF` and `MISCCFG.QRMAXCNT` stay **EXCLUDED MEASURED** and
+are read, never written; `CTRSTA` stays unimplemented and disarmed; `CT1EA` is **read only** and its
+offset (core `+0x010c`) is derived from the map's CT0/CT1 `+4` mirror rule that this file already
+relies on for `CT1QBA`/`CT1QEA`, with the raw word printed beside the decode so the reading survives
+the offset being wrong; no mailbox tag is sent; the knob grammar is still
+`UNAOS_V3D_FIRSTKICK=<value>` read via `option_env!` at compile time, one build is one experiment,
+and an unrecognised value runs `empty` and says `recognised=0`.
+
+**Gate.** `./arroyo check` green on both arches with the knob off; direct
+`cargo +nightly check --target aarch64-unknown-none-softfloat --features v3d_firstkick,v3d` for the
+knob-on path, **canary-verified non-vacuous** by injecting a type error into `v3d89_rclct1_kick`,
+seeing it caught, and restoring; the full-knob `kernel8` build green once with `UNAOS_V3D_DEEP=1
+UNAOS_V3D_FIRSTKICK=rclct1`; `strings -a target/pi_baremetal/kernel8.img` shows the `[v3d89]` family
+and the raw `rclct1` value. QEMU raspi4b models no V3D, so there is no QEMU leg for this arc at all —
+the verdict is the attended metal boot.

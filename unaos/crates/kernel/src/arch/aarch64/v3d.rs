@@ -12909,7 +12909,8 @@ pub fn run_visible_battery_again() -> u32 {
 // so the capture carries its own reading instructions.
 
 /// PI-V3D-85 (R1) — the arming switch.
-/// `UNAOS_V3D_FIRSTKICK=<empty|rcl|m4|rclp<n>|rclhead[<op>]|emptyunarm>` (feature `v3d_firstkick`),
+/// `UNAOS_V3D_FIRSTKICK=<empty|rcl|rclct1|m4|rclp<n>|rclhead[<op>]|emptyunarm>` (feature
+/// `v3d_firstkick`),
 /// DEFAULT OFF. Off, not one line of the rung is compiled and `bringup` runs its normal course; on,
 /// `bringup` takes the one kick after M3 and returns. `rclp<n>` is PI-V3D-86's prefix-bisection
 /// family; `rclhead` and `emptyunarm` are PI-V3D-87's two discriminators (v3d.md §49.10);
@@ -12953,6 +12954,27 @@ enum V3d85Variant {
     ///   already carries at main-packet 5 — so prepending it holds the class fixed and removes the
     ///   dispatch. See v3d.md §49.11.
     RclHead(u8),
+    /// PI-V3D-89 (THE LAW, EXECUTABLE) — the plain `rcl` list, byte for byte the `Rcl` arm's, on the
+    /// **CT1 register file** instead of CT0's. This is the proof-of-law kick: §49.11 concluded that
+    /// render-class opcodes stall CT0's decoder as a class and that render lists belong on CT1, and
+    /// this variant is that conclusion executed rather than argued.
+    ///
+    /// The list, the seeded target, the three cache publishes and the `OFF_RCL` address are all the
+    /// `Rcl` arm verbatim. The ONE thing that moves is the register file the submit uses:
+    /// `CT1QBA`/`CT1QEA` in place of `CT0QBA`/`CT0QEA`. Against the `rcl` boot this is a one-variable
+    /// experiment, which is the whole point.
+    ///
+    /// **The arming question, answered from the reference rather than guessed.** CT1 takes NO arming.
+    /// The bin-memory registers are CT0-only — `CT0QMA` (0x170), `CT0QMS` (0x174) and `CT0QTS`
+    /// (0x15c) have no CT1 counterpart anywhere in the CLE map, because tile-allocation and
+    /// tile-state memory are the *binner's* outputs. Mainline programs them exclusively in
+    /// `v3d_bin_job_run`; `v3d_render_job_run` writes `CT1QBA` then `CT1QEA` and nothing else. This
+    /// driver's own `clear_job` is that path transcribed (v3d.rs, the `CT1QBA`→`CT1QEA` pair and its
+    /// citation of `v3d_regs.h` / the `v3d_gem` submit sequence), and it is the path M3 provably
+    /// retires on with a byte-verified store. So the submit here is bare `CT1QBA`→`CT1QEA` with a CPU
+    /// `clean_range` publish — identical in SHAPE to the `rcl` arm's bare submit, which means the
+    /// `rcl`-vs-`rclct1` pair holds the submit shape fixed too and moves only the thread.
+    RclCt1,
     /// PI-V3D-87 (ARMING-SWAP) — the known-good `empty` BIN list submitted through the RCL-CLASS
     /// SUBMIT SHAPE: no `CT0QMA`/`QMS`/`QTS`, no `BPOS=0`, no pre-kick L2T invalidate, bare
     /// `QBA`→`QEA` with a CPU `clean_range` publish only. Every kick that has ever executed carried
@@ -13067,6 +13089,12 @@ const fn v3d85_variant() -> (V3d85Variant, bool) {
     };
     if v3d85_eq(b, b"rcl") {
         (V3d85Variant::Rcl, true)
+    } else if v3d85_eq(b, b"rclct1") {
+        // PI-V3D-89 — tested BEFORE `rclp<n>`/`rclhead<op>` cannot matter (neither parser accepts a
+        // `ct1` suffix), but it is spelled out as its own arm rather than folded into the head-swap
+        // family because it is a different axis entirely: those vary the LIST, this one varies the
+        // THREAD.
+        (V3d85Variant::RclCt1, true)
     } else if v3d85_eq(b, b"m4") {
         (V3d85Variant::M4, true)
     } else if v3d85_eq(b, b"empty") || v3d85_eq(b, b"1") || v3d85_eq(b, b"") {
@@ -13105,6 +13133,7 @@ impl core::fmt::Display for V3d85Tag {
             // the same word); every other member of the family names its opcode in the token.
             V3d85Variant::RclHead(P_NUMBER_OF_LAYERS) => f.write_str("rclhead"),
             V3d85Variant::RclHead(op) => write!(f, "rclhead{}", op),
+            V3d85Variant::RclCt1 => f.write_str("rclct1"),
             V3d85Variant::EmptyUnarm => f.write_str("emptyunarm"),
         }
     }
@@ -13123,8 +13152,23 @@ impl core::fmt::Display for V3d85Tag {
 #[cfg(feature = "v3d_firstkick")]
 const V3D85_RCL_CLASS: bool = matches!(
     V3D85_VARIANT,
-    V3d85Variant::Rcl | V3d85Variant::RclPrefix(_) | V3d85Variant::RclHead(_)
+    V3d85Variant::Rcl
+        | V3d85Variant::RclPrefix(_)
+        | V3d85Variant::RclHead(_)
+        // PI-V3D-89 — `rclct1` carries the SAME render-class list; only the thread differs. The list
+        // class is a property of the bytes, not of the register file they are submitted through.
+        | V3d85Variant::RclCt1
 );
+
+/// PI-V3D-89 — the THREAD axis, and the third one this knob now has (list class, submit shape,
+/// thread). True only for `rclct1`: the kick goes to `CT1QBA`/`CT1QEA` instead of `CT0QBA`/`CT0QEA`.
+///
+/// This axis gets its own dedicated kick path rather than a branch inside the CT0 rung, because the
+/// whole `[v3d85r1/r2/r3/r7]` + `[v3d58]` station battery reads CT0 registers: running it across a
+/// CT1 kick would print a page of columns that are all correctly zero and all meaningless, and this
+/// file's standing rule is that a witness may not emit a column it cannot interpret.
+#[cfg(feature = "v3d_firstkick")]
+const V3D89_CT1: bool = matches!(V3D85_VARIANT, V3d85Variant::RclCt1);
 
 /// PI-V3D-87 — the SUBMIT-SHAPE axis, independent of the list class above. True when the kick writes
 /// the bin-memory arming (`BPOS=0`, the pre-kick L2T invalidate, `CT0QMA`/`CT0QMS`/`CT0QTS`) ahead of
@@ -13138,6 +13182,9 @@ const V3D85_BIN_ARM: bool = !matches!(
     V3d85Variant::Rcl
         | V3d85Variant::RclPrefix(_)
         | V3d85Variant::RclHead(_)
+        // PI-V3D-89 — CT1 takes no arming and CANNOT: CT0QMA/QMS/QTS have no CT1 counterpart in the
+        // CLE map at all. See the `RclCt1` variant doc.
+        | V3d85Variant::RclCt1
         | V3d85Variant::EmptyUnarm
 );
 
@@ -13205,6 +13252,15 @@ const V3D85_CS_WEDGED: u32 = 0x70;
 /// The working reference: `CTRUN` alone, read off a mainline CT0 that is genuinely fetching.
 #[cfg(feature = "v3d_firstkick")]
 const V3D85_CS_FETCHING: u32 = 0x20;
+
+/// PI-V3D-89 — `V3D_CLE_CT1EA`, core `+0x010c`. Thread 1's END address, the CT1 mirror of
+/// `V3D_CLE_CT0EA` (`+0x0108`) and what the `CT1QEA` GO transfers into. DERIVED from the register
+/// map's CT0/CT1 mirror rule — the CT1 word is CT0's `+4` throughout the block (`0x100`/`0x104`
+/// `CTnCS`, `0x110`/`0x114` `CTnCA`, `0x160`/`0x164` `CTnQBA`, `0x168`/`0x16c` `CTnQEA`), which this
+/// file already relies on for `CT1QBA`/`CT1QEA`. **Read only, never written**, and the `[v3d89]`
+/// line prints it raw beside the decode so the reading survives the offset being wrong.
+#[cfg(feature = "v3d_firstkick")]
+const V3D_CLE_CT1EA: usize = 0x010c;
 
 /// PI-V3D-85 (R2) — one reading of the four MMU access registers, taken as a unit so a before/after
 /// pair is comparable field by field. Four MMIO loads.
@@ -13762,23 +13818,263 @@ fn v3d87_unarm_verdict(
     );
 }
 
+/// PI-V3D-89 — **the class law, executed.** The plain `rcl` list on the CT1 register file.
+///
+/// §49.11 proved from the wire that render-class opcodes stall CT0's decoder as a class, and drew
+/// the driver conclusion: render control lists belong on CT1. That conclusion is currently an
+/// argument. This kick is the argument run as an experiment — the same list bytes, the same seeded
+/// target, the same three publishes, the same `OFF_RCL` address and the same bare
+/// queue-begin→queue-end submit SHAPE as the `rcl` variant, with exactly one thing moved: the
+/// register file. `CT1QBA`/`CT1QEA` instead of `CT0QBA`/`CT0QEA`.
+///
+/// **Why this is not a tautology, and what it adds over M3.** `clear_job` already retires this list
+/// on CT1 every boot, and it does so on THIS boot, a few hundred lines above — its PASS/FAIL is the
+/// in-boot control and `[v3d89]` cross-reads it. What `rclct1` adds is that the `rcl` boot and the
+/// `rclct1` boot are now the SAME instrument: same rung, same builder call, same fault gate, same
+/// poison detectors, same verdict grammar. Before this variant the comparison "CT0 freezes, CT1
+/// retires" spanned two different code paths (this rung vs `clear_job`) and therefore two different
+/// sets of incidental differences. Now it is one variable in one harness, which is what the rest of
+/// this ladder has demanded of every other claim it makes.
+///
+/// **The arming, from the reference and not from a guess.** CT1 takes none and can take none:
+/// `CT0QMA`/`CT0QMS`/`CT0QTS` are tile-allocation and tile-state memory — the BINNER's outputs — and
+/// have no CT1 counterpart in the CLE register map. Mainline programs them only in
+/// `v3d_bin_job_run`; its render path writes `CT1QBA` then `CT1QEA` and nothing else. This driver's
+/// `clear_job` is that sequence transcribed (see its `CT1QBA`→`CT1QEA` pair, which cites
+/// `v3d_regs.h` / the `v3d_gem` submit path), and it is the path M3 banks a byte-verified store on.
+/// So the submit below is bare `CT1QBA`→`CT1QEA` with a CPU `clean_range` publish and no GPU-cache
+/// invalidate — which is ALSO the `rcl` arm's shape, so the pair holds the submit shape fixed too.
+///
+/// Scope is the family's, unchanged: reads only apart from the kick's own two queue writes; no
+/// `BXCF`, no `MISCCFG.QRMAXCNT`, no `CTRSTA`, no mailbox tag.
+#[cfg(feature = "v3d_firstkick")]
+fn v3d89_rclct1_kick() {
+    // ── Build: the `Rcl` arm verbatim, including the sentinel seed. ─────────────────────────────
+    fill_target(0xDEAD_BEEF);
+    let (rcl_len, sublist_len) = build_rcl();
+    cache::clean_range(arena_phys() + OFF_TARGET, TARGET_BYTES);
+    cache::clean_range(arena_phys() + OFF_RCL, rcl_len);
+    cache::clean_range(arena_phys() + OFF_SUBLIST, sublist_len);
+    let ba = (arena_phys() + OFF_RCL) as u32;
+    let ea = ba + rcl_len as u32;
+    let tile_alloc = (arena_phys() + OFF_BIN_TILEALLOC) as u32;
+    let ts = (arena_phys() + OFF_TILESTATE) as u32;
+    if !arena_contains(ba as usize, rcl_len)
+        || !arena_contains(ts as usize, TILE_STATE_BYTES)
+        || !arena_contains(tile_alloc as usize, BIN_TILEALLOC_BYTES)
+    {
+        serial_println!(
+            ":: V3D: [v3d89] range escapes the arena — refusing the kick (fail-closed). NOTHING was kicked and NO verdict is implied ::"
+        );
+        return;
+    }
+    serial_println!(
+        ":: V3D: [v3d89] construction (rclct1) — the PLAIN rcl, byte for byte the `rcl` variant's list from the same build_rcl() call: main list {} bytes @ arena+{:#x}, generic per-tile sub-list {} bytes @ arena+{:#x}, target seeded 0xDEADBEEF and published with the other two. NOTHING about the list, the address or the publishes differs from the boot that froze on CT0 — the ONLY variable in this experiment is the register file the submit uses ::",
+        rcl_len, OFF_RCL, sublist_len, OFF_SUBLIST
+    );
+    dump_cl_bytes("v3d89 rclct1 RCL", OFF_RCL, rcl_len, 128);
+    serial_println!(
+        ":: V3D: [v3d89] arming (rclct1) — NO CT0QMA/CT0QMS/CT0QTS, NO BPOS=0, NO pre-kick L2T invalidate, and this is NOT the `rcl` arm's omission repeated: CT1 has no such registers to write. CT0QMA(0x170)/CT0QMS(0x174)/CT0QTS(0x15c) are tile-ALLOCATION and tile-STATE memory — the BINNER's outputs — and the CLE map carries no CT1 counterpart for any of them. Mainline programs them only in v3d_bin_job_run; its render path writes CT1QBA then CT1QEA and nothing else, and this driver's clear_job (the M3 leg that byte-verifies its store every boot) is that sequence transcribed. The submit below is therefore bare CT1QBA->CT1QEA with a CPU clean_range publish — the SAME SHAPE as the rcl arm's bare submit, so this pair holds list, address, publishes AND submit shape fixed and moves only the thread ::"
+    );
+
+    // The `[v3d68]` evidence-integrity detectors. On a CT1 render kick these two regions are pure
+    // NEGATIVE controls: a render list has no binner and must not write tile-state or the tile-alloc
+    // pool. The TARGET is this class's positive control and is verified below.
+    v3d56_poison_region(OFF_TILESTATE, TILE_STATE_BYTES);
+    v3d56_poison_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+
+    clear_mmu_fault_latch("v3d89 pre-kick");
+    let cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
+    let ca_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CA);
+    let ea_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1EA);
+    serial_println!(
+        ":: V3D: [v3d89] S0 pre-program (rclct1) — CT1CS={:#010x} CT1CA={:#010x} CT1EA={:#010x} (raw; CT1EA offset is the CT0+4 mirror, read-only — see its constant) | M3 clear_job on THIS boot: ran={} verified={} — that is the in-boot control for this kick, and it is the SAME list ::",
+        cs_pre, ca_pre, ea_pre,
+        V3D58_RENDER_RAN.load(Ordering::Acquire) as u32,
+        V3D58_RENDER_OK.load(Ordering::Acquire) as u32
+    );
+
+    // Every instrument access BEFORE the GO (the `[v3d73s]` discipline). Nothing is interleaved
+    // between the GO and the wait.
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
+    let rfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC);
+    let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    let arena_pre = v3d56_arena_digest();
+
+    // ── The GO. Two writes, and they are the only writes this rung makes to the CLE. ────────────
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QBA, ba);
+    dsb(); // BA must be latched before the EA write triggers the fetch
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QEA, ea); // GO
+    dsb();
+
+    // Submit audit, the `[v3d54]` way but on CT1's registers: a non-retire below is only a frame fact
+    // if the CLE was handed exactly the [BA,EA) we built.
+    let qba = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1QBA);
+    let qea = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1QEA);
+    let span_ok = qba == ba && qea == ea && qea.wrapping_sub(qba) as usize == rcl_len && rcl_len > 0;
+    serial_println!(
+        ":: V3D: [v3d89] submit (rclct1) — intended BA={:#010x} EA={:#010x} len={} | latched CT1QBA={:#010x} CT1QEA={:#010x} span={} — BA {} EA {} span {} — submission {} ::",
+        ba, ea, rcl_len, qba, qea, qea.wrapping_sub(qba),
+        if qba == ba { "OK" } else { "MISMATCH" },
+        if qea == ea { "OK" } else { "MISMATCH" },
+        if qea.wrapping_sub(qba) as usize == rcl_len { "OK" } else { "MISMATCH" },
+        if span_ok { "SOUND — a non-retire below is a genuine frame-close fact, not a submission artifact" } else { "UNSOUND — fix the submission before reading ANY verdict from this boot" }
+    );
+
+    // ── The CT1 progress sampler. The `[v3d73]` sampler is CT0-hardwired, so this is its CT1
+    // counterpart, written inline and kept to the same shape: ~1 ms cadence, ~0.5 s backstop, and it
+    // reports CT1CA's furthest advance INSIDE [QBA,QEA] so a stale or wrapped word cannot be read as
+    // progress. Exits early once CTRUN clears AND a frame-done has latched.
+    let frq = super::timer::cntfrq();
+    let start = super::timer::cntpct();
+    let deadline = start + frq / 2;
+    let tick = (frq / 1000).max(1);
+    let mut next = start;
+    let mut samples: u32 = 0;
+    let mut in_span: u32 = 0;
+    let mut at_qba: u32 = 0;
+    let mut max_in_span: u32 = 0;
+    let mut changes: u32 = 0;
+    let mut last_ca = ca_pre;
+    let mut first_move_us: u32 = 0;
+    let mut idled = false;
+    let mut sts: u32 = 0;
+    loop {
+        let now = super::timer::cntpct();
+        if now >= next {
+            let ca = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CA);
+            samples = samples.saturating_add(1);
+            if ca >= ba && ca <= ea {
+                in_span = in_span.saturating_add(1);
+                max_in_span = max_in_span.max(ca);
+            }
+            if ca == ba {
+                at_qba = at_qba.saturating_add(1);
+            }
+            if ca != last_ca {
+                changes = changes.saturating_add(1);
+                if first_move_us == 0 {
+                    let us = (now.wrapping_sub(start)).saturating_mul(1_000_000) / frq.max(1);
+                    first_move_us = us.min(u32::MAX as u64) as u32;
+                }
+                last_ca = ca;
+            }
+            next = next.saturating_add(tick);
+        }
+        sts = mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS);
+        let running = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS) & V3D_CLE_CT1CS_CTRUN != 0;
+        if !running && sts & V3D_INT_FRDONE != 0 {
+            idled = true;
+            break;
+        }
+        if now >= deadline {
+            idled = !running;
+            break;
+        }
+    }
+    let waited_us = {
+        let d = super::timer::cntpct().wrapping_sub(start);
+        (d.saturating_mul(1_000_000) / frq.max(1)).min(u32::MAX as u64) as u32
+    };
+    let cs_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
+    let ca_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CA);
+    let ea_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1EA);
+    serial_println!(
+        ":: V3D: [v3d89] cle-progress (rclct1) — samples={} QBA={:#010x} QEA={:#010x}(len={}) | CT1CA pre-GO={:#010x} last={:#010x} max-in-span={:#010x}(off {:#x} of {:#x}) in-span={} eq-QBA={} changes={} first_move={}us | CT1CS {:#010x}->{:#010x} (CTRUN {}->{}) | CT1EA {:#010x}->{:#010x} | idled={} waited={}us ::",
+        samples, ba, ea, rcl_len,
+        ca_pre, ca_done, max_in_span,
+        max_in_span.wrapping_sub(ba), rcl_len as u32,
+        in_span, at_qba, changes, first_move_us,
+        cs_pre, cs_done,
+        (cs_pre & V3D_CLE_CT1CS_CTRUN != 0) as u32,
+        (cs_done & V3D_CLE_CT1CS_CTRUN != 0) as u32,
+        ea_pre, ea_done, idled as u32, waited_us
+    );
+
+    // ── Evidence integrity, then the two criteria. ──────────────────────────────────────────────
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_FLUSH);
+    let flush_done = wait_bit_clear(
+        V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS, "L2T write-back (v3d89 scan)",
+    );
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_SLCACTL, V3D_SLCACTL_INVALIDATE_ALL);
+    dsb();
+    cache::invalidate_range(arena_phys(), ARENA_BYTES);
+    dsb();
+    let ts_scan = v3d56_scan(ts, TILE_STATE_BYTES);
+    let pool_scan = v3d56_scan(tile_alloc, BIN_TILEALLOC_BYTES);
+    v3d56_emit_scan("v3d89 rclct1", "tile-state (BIN output — negative control)", ts, &ts_scan, flush_done);
+    v3d56_emit_scan("v3d89 rclct1", "tile-alloc pool (BIN output — negative control)", tile_alloc, &pool_scan, flush_done);
+    v3d56_emit_landing("v3d89 rclct1", &arena_pre, &v3d56_arena_digest());
+
+    // The render class's own criterion, and the one `clear_job` banks its PASS on: the DRAM store.
+    cache::clean_invalidate_range(arena_phys() + OFF_TARGET, TARGET_BYTES);
+    let store_verified = verify_target(CLEAR_RGBA);
+
+    let rfc_after = mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC);
+    let bfc_after = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    let rfc_delta = rfc_after.wrapping_sub(rfc_pre);
+    let frdone = sts & V3D_INT_FRDONE != 0;
+    let mmu_ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let fault =
+        mmu_ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+    let consumed = max_in_span >= ea;
+    let frame_closed = frdone || rfc_delta != 0;
+    let executed = store_verified || frame_closed || consumed;
+
+    // ── The verdict. Fault-gated exactly as `[v3d85r1]` and `[v3d87h]` are, and BOTH outcome
+    // sentences are written out ahead of the boot so the capture reads itself.
+    let verdict: &str = if fault != 0 {
+        "AN MMU FAULT LATCHED across this kick — instrument fault, not a verdict. Fix it before citing this rung; nothing here discriminates anything (the same gate [v3d85r1] and [v3d87h] carry, and the same reason: a boot whose memory path faulted cannot tell a decode stall from a fault-induced stop)"
+    } else if !span_ok {
+        "THE SUBMIT WAS UNSOUND — CT1QBA/CT1QEA did not latch the [BA,EA) we built, so nothing below is a statement about the thread. Re-take"
+    } else if samples == 0 {
+        "ZERO sampler ticks landed — the wait exited before the first ~1 ms tick, so the fetch columns are INCONCLUSIVE. The store and frame columns still stand on their own"
+    } else if executed {
+        "THE RENDER LIST EXECUTED ON CT1 — THE CT0/CT1 CLASS LAW IS CONFIRMED EXECUTABLE. The exact list bytes that held CT0CA at QBA and never advanced (boot12, §49.11) were fetched, stepped and closed by CT1 from the same address, with the same publishes and the same bare queue-begin->queue-end submit shape; the ONLY thing that changed is the register file. The law is no longer an inference from a freeze — it is a working path, and the driver fix is now specified rather than proposed: route every render control list to CT1QBA/CT1QEA. The production compositor rewire is deliberately NOT done in this arc; it is named as the next one in v3d.md §49.12"
+    } else {
+        "CT1 ALSO FROZE ON THIS LIST — and this does NOT retract the class law, which rests on boot12's CT0 evidence and does not depend on this kick at all: op 126 and op 121 still froze CT0 where bin-class op 119 advanced, and M3's clear_job still retires this same list on CT1 every boot (read the S0 line's in-boot control above). What it says instead is that CT1 ARMING NEEDS ITS OWN BRACKET, because something about THIS kick differs from clear_job's and it is not the list, the address, the publishes or the submit shape — all four are held fixed by construction. The named differences to bracket, in order: (1) POSITION — this is a SECOND CT1 kick on a boot where M3 already ran one to completion, so CT1 may be carrying end-of-frame state clear_job never sees, which is the mirror of the §49.3 confound that started this whole ladder; (2) the intervening L2T/SLC cache traffic and the poison writes this rung makes between M3 and this GO, which clear_job has nothing of; (3) frame-count state, RFC having already advanced once this boot. Take them in that order — position first, by moving this kick AHEAD of M3 exactly as R1 moved the CT0 kick ahead of probe_job"
+    };
+    serial_println!(
+        ":: V3D: [v3d89] rclct1 verdict — store-verified={} consumed={} frame-closed={} executed={} (executed = store-verified OR frame-closed OR consumed; CONSUMED means CT1CA reached QEA, FRAME-CLOSED means FRDONE/RFC moved; this line may only claim what these columns support) | RFC {:#010x}->{:#010x} (Δ{}) BFC {:#010x}->{:#010x} (Δ{}) | FRDONE={} INT_STS={:#010x} idled={} waited={}us submit_sound={} | sampler samples={} in-span={} eq-QBA={} max-in-span={:#010x} vs QBA={:#010x} QEA={:#010x} | negative controls (BIN outputs, must stay intact): tile-state touched={} of {}, pool touched={} of {} (drain completed={}) | MMU_CTL={:#010x} mmu-fault-latched={} — {} ::",
+        store_verified as u32, consumed as u32, frame_closed as u32, executed as u32,
+        rfc_pre, rfc_after, rfc_delta,
+        bfc_pre, bfc_after, bfc_after.wrapping_sub(bfc_pre),
+        frdone as u32, sts, idled as u32, waited_us, span_ok as u32,
+        samples, in_span, at_qba, max_in_span, ba, ea,
+        ts_scan.zeroed + ts_scan.overwritten, ts_scan.words,
+        pool_scan.zeroed + pool_scan.overwritten, pool_scan.words,
+        flush_done as u32,
+        mmu_ctl, (fault != 0) as u32,
+        verdict
+    );
+
+    // Leave the field clean, exactly as every rung in this file does.
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
+    clear_mmu_fault_latch("v3d89 post-kick");
+}
+
 /// PI-V3D-85 (R1) — the boot's ONE CT0 kick, with R2/R3/R7 riding it (and, on an `rclp<n>` value,
 /// PI-V3D-86's prefix bisection).
 ///
 /// Called from `bringup` after M3 (the CT1 clear job, which is R2's positive control and `[v3d58]
 /// xengine`'s render reference) and BEFORE `probe_job` — which is the kick this rung exists to get in
 /// front of. `bringup` returns immediately afterwards: no ladder, no battery, no second kick.
+///
+/// PI-V3D-89: on `rclct1` the kick goes to CT1 instead and the whole CT0 station battery is skipped —
+/// see `v3d89_rclct1_kick` and `V3D89_CT1` for why a CT1 boot may not print CT0's columns.
 #[cfg(feature = "v3d_firstkick")]
 fn v3d85_firstkick_rung() {
     serial_println!(
-        ":: V3D: [v3d85] R-LADDER BOOT — READ THIS FIRST. UNAOS_V3D_FIRSTKICK={} (variant={}, recognised={}). This boot runs EXACTLY ONE CT0 kick, placed before probe_job, and then RETURNS: no [v3d48] ladder, no [v3d63/64/66/68/69/71/73s/74/75/76/77/80/81] tails, no M4, no visible battery. The capture is DELIBERATELY missing every banked witness a reader of v3d.md expects — that is the point (a first kick with a ladder behind it is not a first kick) — and it MUST NOT be diffed line-for-line against a full deep boot. Rungs armed: R1 first-kick isolation, R2 MMU access counters, R3 CT0EA/CT0RA queue-vs-thread, R7 CT0CS bit4/bit6 decode, on an rclp<n> value the PI-V3D-86 prefix bisection ([v3d86], v3d.md §49.9 — NOT the §49.4 ladder's R8, which is the instrument-free boot and is still unbuilt), and on rclhead<op>/emptyunarm the PI-V3D-87/88 discriminators ([v3d87h]/[v3d87u], v3d.md §49.10 and §49.11 — rclhead126 is the render-CLASS vs sub-id-DISPATCH split). All are READ-ONLY except the kick's own kernel-exact v3d_bin_job_run writes; BXCF and MISCCFG.QRMAXCNT are EXCLUDED MEASURED (v3d.md §49.5) and are read, never written; CTRSTA (R6) is not implemented; no mailbox tag is sent ::",
+        ":: V3D: [v3d85] R-LADDER BOOT — READ THIS FIRST. UNAOS_V3D_FIRSTKICK={} (variant={}, recognised={}). This boot runs EXACTLY ONE kick — CT0 on every variant EXCEPT rclct1, which kicks CT1 instead (PI-V3D-89, [v3d89], v3d.md §49.12: the class law executed — the plain rcl on the CT1 register file, the one variable being the register file itself; on that variant the CT0 station battery below is SKIPPED because it reads CT0 and CT0 is never kicked) — placed before probe_job, and then RETURNS: no [v3d48] ladder, no [v3d63/64/66/68/69/71/73s/74/75/76/77/80/81] tails, no M4, no visible battery. The capture is DELIBERATELY missing every banked witness a reader of v3d.md expects — that is the point (a first kick with a ladder behind it is not a first kick) — and it MUST NOT be diffed line-for-line against a full deep boot. Rungs armed: R1 first-kick isolation, R2 MMU access counters, R3 CT0EA/CT0RA queue-vs-thread, R7 CT0CS bit4/bit6 decode, on an rclp<n> value the PI-V3D-86 prefix bisection ([v3d86], v3d.md §49.9 — NOT the §49.4 ladder's R8, which is the instrument-free boot and is still unbuilt), and on rclhead<op>/emptyunarm the PI-V3D-87/88 discriminators ([v3d87h]/[v3d87u], v3d.md §49.10 and §49.11 — rclhead126 is the render-CLASS vs sub-id-DISPATCH split). All are READ-ONLY except the kick's own kernel-exact v3d_bin_job_run writes; BXCF and MISCCFG.QRMAXCNT are EXCLUDED MEASURED (v3d.md §49.5) and are read, never written; CTRSTA (R6) is not implemented; no mailbox tag is sent ::",
         V3D85_RAW,
         V3d85Tag,
         V3D85_VARIANT_NAMED as u32
     );
     if !V3D85_VARIANT_NAMED {
         serial_println!(
-            ":: V3D: [v3d85] knob value {} is NOT one of empty|rcl|m4|rclp<n>|rclhead|rclhead119|rclhead126|emptyunarm (or 1) — running the `empty` rung, which is what v3d.md §49.6 ranks first. NOTE for the rclhead family specifically: only opcodes this file has an AUDITED encoding for are accepted (119 NUMBER_OF_LAYERS, 126 TILE_LIST_INITIAL_BLOCK_SIZE), because a head packet is not a byte pattern to be invented at the knob. This line exists so a typo can never be read as a deliberate variant choice ::",
+            ":: V3D: [v3d85] knob value {} is NOT one of empty|rcl|rclct1|m4|rclp<n>|rclhead|rclhead119|rclhead126|emptyunarm (or 1) — running the `empty` rung, which is what v3d.md §49.6 ranks first. NOTE for the rclhead family specifically: only opcodes this file has an AUDITED encoding for are accepted (119 NUMBER_OF_LAYERS, 126 TILE_LIST_INITIAL_BLOCK_SIZE), because a head packet is not a byte pattern to be invented at the knob. This line exists so a typo can never be read as a deliberate variant choice ::",
             V3D85_RAW
         );
     }
@@ -13797,6 +14093,18 @@ fn v3d85_firstkick_rung() {
             );
             return;
         }
+    }
+
+    // PI-V3D-89 — the THREAD axis takes its own path and returns. Everything below this point reads
+    // CT0's register file (the [v3d85r1/r2/r3/r7] rungs, the [v3d58] stations, the [v3d73] sampler),
+    // and on a CT1 kick every one of those columns would be correctly zero and entirely meaningless.
+    // A witness may not print a column it cannot interpret, so the CT1 kick gets its own instrument.
+    if V3D89_CT1 {
+        v3d89_rclct1_kick();
+        serial_println!(
+            ":: V3D: [v3d85] R-LADDER BOOT COMPLETE — one CT1 kick taken and nothing else. This was the PI-V3D-89 rclct1 variant: the CT0 station battery ([v3d85r1/r2/r3/r7], [v3d58], [v3d73]) was NOT run, because it reads CT0 and this boot never kicked CT0. probe_job, the [v3d48] ladder, M4 and the visible battery were not run either, by design ::"
+        );
+        return;
     }
 
     // ── Build the one list, per variant. ────────────────────────────────────────────────────────
@@ -13823,7 +14131,13 @@ fn v3d85_firstkick_rung() {
             cache::clean_range(arena_phys() + OFF_PROBE_BIN_CL, n);
             (OFF_PROBE_BIN_CL, n)
         }
-        V3d85Variant::Rcl => {
+        // PI-V3D-89 — `RclCt1` shares this arm, and the sharing is deliberate for the same reason
+        // `emptyunarm` shares `empty`'s: the two variants must be the SAME LIST or the pair is not a
+        // one-variable experiment. It is also unreachable in practice — `V3D89_CT1` returns above,
+        // and `v3d89_rclct1_kick` builds the list itself from this same `build_rcl()` call — so this
+        // arm exists to keep the match exhaustive WITHOUT a `todo!()`/`unreachable!()` panic path in
+        // a kernel, and to stay correct if that early return is ever removed.
+        V3d85Variant::Rcl | V3d85Variant::RclCt1 => {
             // `[v3d74a]`'s list: the proven M3 render control list, seeded target and all.
             fill_target(0xDEAD_BEEF);
             let (rcl_len, sublist_len) = build_rcl();
