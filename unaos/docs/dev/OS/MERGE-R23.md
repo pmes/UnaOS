@@ -94,6 +94,14 @@ extended by that seat.
   (read "argument registers" as per-stub, not the scrubbed six) and the gap crashed VUG.ELF on
   metal (`rsi` zeroed under a live `&mut` — err=0x5 cr2=0x0). A commit message is a claim;
   gate the claim, not the diff's existence. Fixed and disassembly-proven same day.
+- **Syscall-return register handling diverges BY DESIGN — never port a "fix" across arches**:
+  aarch64 needs no GPR scrub on the svc return because `RESTORE_GPRS` overwrites the full file
+  from the task's own entry frame (kernel values structurally cannot leak; exceptions.rs
+  `__vec_svc`); x86 NEEDS its six-register sysret scrub because its dispatch leaves kernel
+  values in caller-saved registers. Same invariant, opposite mechanisms. Likewise the saved
+  user stack pointer is per-TASK state on both arches — aarch64 banks SP_EL0 on the task's own
+  kernel stack (M6e, hazard named in the entry comment); x86's per-CPU slot version of this was
+  a cross-task stack-aliasing bug (s68) fixed 2026-08-03 to converge on the aarch64 shape.
 - **Vacuous-zero law**: a zero from a counter whose subject never ran is vacuous, not passing —
   every zero-anomaly verdict must be qualified on evidence the subject ran at all (e.g. a
   `cbw_fault=0` claim requires `n>0 storage_slot!=0` beside it, and the capture should carry the
