@@ -13,8 +13,15 @@ several sessions can work in parallel without stepping on each other.
   `kernel8` / `kernel8-run` / `kernel8-test` (Pi 4 bare-metal image / QEMU raspi4b).
   Env knobs: `UNAOS_WC` (**arms the x86 window compositor — any gate touching
   the video stack MUST carry `UNAOS_WC=1`, and the run MUST show `wc` in the
-  `⚡ kernel features:` banner; without it the video stack is not compiled and
-  the gate is vacuous**), `UNAOS_PI`, `UNAOS_BAREMETAL`, `UNAOS_SKIP_XHCI`, `UNAOS_BOOTLOG`,
+  `⚡ kernel features:` banner. It gates `video/wcx.rs` — the x86 panel path —
+  and the console-window routing, NOT the whole video stack: `video/mod.rs`
+  declares `pub mod wm;` unconditionally, so a *type* gate on `wm.rs` is not
+  vacuous without it. What IS vacuous without it is any gate that claims to
+  exercise the compositor, because `wcx::activate()` has exactly one caller,
+  `drivers/gpu/kepler_display.rs` — on x86 the compositor's ignition is the
+  Kepler takeover, so a behavioural video gate needs `UNAOS_WC` AND the
+  kepler knobs, and must be verified reachable (`strings`), not merely
+  compiled (banner)**), `UNAOS_PI`, `UNAOS_BAREMETAL`, `UNAOS_SKIP_XHCI`, `UNAOS_BOOTLOG`,
   `UNAOS_SCHED_DEMO`, `UNAOS_USBDEBUG`, `UNAOS_FBW`/`UNAOS_FBH` (panel-geometry
   override — QEMU raspi4b is 640x480 while the bench Pi is 1920x1200, and the
   window compositor's upscale is a function of the panel, so
