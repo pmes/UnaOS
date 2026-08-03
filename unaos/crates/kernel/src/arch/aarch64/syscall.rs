@@ -11152,6 +11152,9 @@ fn sys_fb_present() -> i64 {
         Err(e) => return e,
     };
     let slot = (asid - 1) as usize;
+    // M3: the compat surface's pointer and size are slot-derived constants — nothing here needs the
+    // window table — so the checksum runs before the mask is ever taken.
+    let sum = fb_checksum(super::boot::slot_fb_surface_ptr(slot), super::boot::FB_SURFACE_SIZE);
     // WC-B: the compat wrapper presents the caller's REGION SLOT 0 surface at the legacy 32×32 geometry,
     // with the legacy witness accounting, whether or not a window entry was ever bound (a window entry
     // only adds the compositor-visible damage mark). Deliberately independent of the window table so this
@@ -11179,6 +11182,7 @@ fn sys_fb_present() -> i64 {
         super::boot::FB_SURFACE_STRIDE,
         super::boot::FB_SURFACE_SIZE,
         crate::video::wm::WIN_NONE,
+        sum,
     );
     drop(t);
     0
@@ -11187,6 +11191,10 @@ fn sys_fb_present() -> i64 {
 /// WC-B: the ONE present body both `SYS_FB_PRESENT` and `SYS_WIN_PRESENT` run — witness accounting, the
 /// UVUG-8r2 focus-scoped counter bump, the compositor damage mark, and the blit. Factored so the two
 /// verbs cannot drift; every ELF-3/UVUG-8 invariant below is unchanged from the single-surface version.
+/// M3 (span shrink): `sum` is the caller's `fb_checksum` over the SAME surface, computed OUTSIDE
+/// the IRQ mask — the checksum reads the caller's own surface while the caller is parked in the
+/// syscall, so it needs the ownership verdict, not the mask (~65 K masked volatile reads leave the
+/// span). The store-then-count ordering below is unchanged; both callers keep it by construction.
 fn present_surface_common(
     asid: u64,
     surf: *mut u8,
@@ -11195,8 +11203,9 @@ fn present_surface_common(
     stride: u32,
     size: usize,
     wm_id: crate::video::wm::WinId,
+    sum: u64,
 ) {
-    let sum = fb_checksum(surf, size);
+    let _ = size;
     FB_PRESENT_CHECKSUM.store(sum, Ordering::Release);
     FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
     // UVUG-8r2: bump the FOCUS-SCOPED present counter too — the one `run_user_image`'s suspension cap reads.
@@ -11536,6 +11545,14 @@ fn sys_win_present(win: u64) -> i64 {
     }
     let id = win as usize;
     let slot = (asid - 1) as usize;
+    // M3 (span shrink): snapshot–checksum–revalidate. Hold #1 is the masked micro-hold that
+    // resolves ownership and snapshots the row; the 64 KiB checksum then runs UNMASKED over the
+    // caller's own surface (the caller is parked in this syscall — its surface cannot change);
+    // hold #2 re-validates that the row still IS the snapshot before any pixel work runs under
+    // it. A row closed/recycled between the holds fails re-validation and the present is refused
+    // fail-closed (EBADF) — the recycled-id protection is preserved by the same hold-validated
+    // present as before, minus ~65 K volatile reads of masked time. (M4, a separate briefed arc,
+    // is the one that may relax the hold itself; this milestone deliberately does not.)
     let _irq = IrqGuard::mask_save();
     let t = WINDOWS.lock();
     if t[id].owner == 0 {
@@ -11545,7 +11562,15 @@ fn sys_win_present(win: u64) -> i64 {
         return EACCES;
     }
     let e = t[id];
+    drop(t);
+    drop(_irq);
     let surf = super::boot::slot_fb_win_surface_ptr(slot, e.rslot as usize);
+    let sum = fb_checksum(surf, e.pages as usize * 0x1000);
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    if t[id].owner != asid || t[id].rslot != e.rslot || t[id].wm_id != e.wm_id {
+        return EBADF;
+    }
     present_surface_common(
         asid,
         surf,
@@ -11554,6 +11579,7 @@ fn sys_win_present(win: u64) -> i64 {
         e.w as u32 * 4,
         e.pages as usize * 0x1000,
         e.wm_id,
+        sum,
     );
     drop(t);
     0
