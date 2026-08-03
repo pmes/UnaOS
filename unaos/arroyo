@@ -8,7 +8,8 @@
 #   ./arroyo arm           Build & boot aarch64
 #   ./arroyo test [secs]   Headless x86_64 run; serial captured to target/serial.log
 #   ./arroyo test-arm [s]  Headless aarch64 run; serial -> target/serial-arm.log
-#   ./arroyo check         Quick syntax check (both targets)
+#   ./arroyo check         Syntax check: kernel (both targets, default + cfg-gated feature legs)
+#                          + the ring-3 user-* crates
 #   ./arroyo build         Build both targets (no QEMU)
 #   ./arroyo clean         Purge all build artifacts
 
@@ -810,6 +811,197 @@ test_x86_64() {
 
 # --- Utility Functions ---
 
+# GATE-USER: the RING-3 crates under crates/user-* are each their OWN cargo workspace (every one of
+# them carries an empty `[workspace]` table, so the parent unaos workspace never drags a no_std/no_main
+# EL0 program into a host build). That isolation is correct for `cargo build`, but it silently made
+# `./arroyo check` a KERNEL-ONLY gate: nothing outside crates/kernel was ever compiled, so a session
+# could "gate" a userspace change on a green check that could not have gone red. The user crates were
+# only ever type-checked as a side effect of a MEDIA build (`kernel8` / `esp-x86` / the builder), which
+# is minutes of link+objcopy+staging away and is not what anyone runs before committing.
+#
+# This matrix closes that hole. One row per (crate, arch) pair the project GENUINELY ships — the arch
+# column is the load-bearing part, because these crates are not uniformly portable:
+#
+#   user-blob      aarch64 only. The flat EL0 hello/K2/midden blobs (4 [[bin]]s, all checked by the one
+#                  cargo invocation). Hand-written aarch64 asm; its x86 twin is a SEPARATE crate.
+#   user-blob-x86  x86_64 only. That twin — a naked x86 asm stream. Neither crate can build for the
+#                  other's arch and neither is meant to; forcing it would be an invented target.
+#   user-elf       aarch64 only. ELF-1 ships as ELFHELLO.ELF on the Pi media and has no x86 sibling —
+#                  there is no user-elf-x86.ld and no x86 build recipe anywhere in this script. Adding
+#                  one here would be inventing a product, not gating an existing one.
+#   user-pulse     BOTH. Arch-neutral above two syscall stubs; built as PULSE.ELF (aarch64) and
+#   user-stat      PULSE-X86.ELF (x86) — see build_user_pulse_x86 / build_user_aarch64. Same for the
+#   user-vug       STAT/VUG pair. These three are exactly where a syscall-number or stub drift between
+#                  the two arches shows up, so both legs are checked.
+#
+# Fields (whitespace-separated; the 4th field runs to end-of-line):
+#   1 crate dir under crates/
+#   2 arch label (display only — the real arch comes from the target, field 3)
+#   3 cargo --target override, or `-` to take the crate's own .cargo/config.toml default. The aarch64
+#     legs use `-` because every crate's config.toml already defaults to ../../aarch64-base.json (as
+#     does user-blob-x86's, which defaults to x86_64-unknown-none.json); the x86 legs of the three
+#     dual-arch crates must override it explicitly, exactly as build_user_stat_x86 & friends do.
+#   4 RUSTFLAGS. Mirrored VERBATIM from each crate's media build recipe rather than left empty. `check`
+#     never invokes the linker, so the -T/-z flags are inert here — but RUSTFLAGS is part of cargo's
+#     fingerprint, so a check that passed DIFFERENT flags would invalidate the crate's target/ dir and
+#     force a full build-std recompile every time an operator alternated `check` and `kernel8`.
+#
+# -Z build-std comes from each crate's own .cargo/config.toml [unstable] table, so only
+# -Z json-target-spec is passed here (the .json target specs need it); NIGHTLY_FLAGS is a KERNEL
+# feature/flag set and deliberately does not apply.
+USER_CHECK_MATRIX=(
+  "user-blob-x86 x86_64  -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-blob-x86/user-blob-x86.ld"
+  "user-stat     x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-vug      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-pulse    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-blob     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld"
+  "user-elf      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-stat     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-vug      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-pulse    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+)
+
+# Type-check every USER_CHECK_MATRIX row whose arch label matches $1, and print one summary line in the
+# same shape as the kernel legs (`✅ userspace <arch> OK`).
+#
+# It does NOT stop at the first failure. A broken shared syscall stub typically breaks the same crate on
+# both arches and often two crates at once; aborting on the first would hand back one error per run and
+# cost a full round-trip per crate. Every failure is collected and NAMED, and the function returns 1 —
+# `set -e` at the top of this script then carries that straight out of check_both as a non-zero exit.
+check_user_arch() {
+    local _want="$1"
+    local _rc=0 _n=0 _failed=""
+    local _row _crate _arch _tgt _rustflags _targ_arg
+    echo -e "${COLOR_YELLOW}⚡ Syntax Check: userspace (${_want})...${COLOR_RESET}"
+    for _row in "${USER_CHECK_MATRIX[@]}"; do
+        read -r _crate _arch _tgt _rustflags <<< "$_row"
+        [ "$_arch" = "$_want" ] || continue
+        _n=$((_n + 1))
+        # `-` = take the crate's .cargo/config.toml default target; anything else is an explicit override.
+        _targ_arg=""
+        [ "$_tgt" = "-" ] || _targ_arg="--target $_tgt"
+        cd "$WORKSPACE_DIR/crates/$_crate"
+        # `|| _rc=...` keeps set -e from aborting the loop; the failure is recorded and reported below.
+        if RUSTFLAGS="$_rustflags" cargo +nightly check --release -Z json-target-spec $_targ_arg; then
+            echo -e "${COLOR_GREEN}  ✅ ${_crate} (${_arch})${COLOR_RESET}"
+        else
+            echo -e "${COLOR_RED}  ❌ ${_crate} (${_arch}) FAILED to compile${COLOR_RESET}"
+            _failed="${_failed} ${_crate}"
+            _rc=1
+        fi
+    done
+    cd "$WORKSPACE_DIR"
+    if [ "$_rc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ userspace ${_want} FAILED:${_failed}${COLOR_RESET}"
+        return 1
+    fi
+    echo -e "${COLOR_GREEN}✅ userspace ${_want} OK (${_n} crates)${COLOR_RESET}"
+}
+
+# GATE-CFG: the DEFAULT feature set is a tiny fraction of this kernel. `[features]` in
+# crates/kernel/Cargo.toml carries 76 knobs plus `default = []`, so the two legs below compile only
+# what survives with every knob off — and `$KERNEL_FEATURES` (the UNAOS_* → cargo-feature mapping at
+# the top of this script) adds knobs only when the OPERATOR sets them, which nobody does before a
+# commit. Everything behind a `#[cfg(feature = ...)]` was therefore NEVER type-checked by the gate.
+# That is not a theoretical hole. `video/wcg.rs` is declared `#[cfg(feature = "witness")] pub mod wcg;`
+# in video/mod.rs, and the project's DONE gate is "`./arroyo check` green for both arches" — so a
+# session could gate a change to wcg.rs on a check that could not have gone red. Measured directly: a
+# deliberate `let _x: u32 = "nope";` appended to wcg.rs left `./arroyo check` at EXIT 0, while the same
+# tree with `witness` armed failed at EXIT 101 and named the line. Same class as the GATE-USER hole
+# above, and wider — that one missed 5 small crates, this one missed most of the kernel.
+#
+# THE ARCH SPLIT IS NOT COSMETIC — it is forced, and both halves were measured, not assumed:
+#   * aarch64 board features on an x86 compile: HARD FAIL. `--target x86_64-unaos.json` with
+#     pi/baremetal/v3d/piusb/genet/nsspan/piinstall* armed produced ~20 errors (`unresolved import
+#     crate::drivers::emmc2`, `cannot find 'boot'/'aarch64' in 'arch'`, missing `arch::sched`/
+#     `arch::syscall` items). Those features name aarch64-only modules; arming them on x86 is an
+#     INVENTED configuration, not coverage.
+#   * `pi` + `tegra` together: HARD FAIL, and deliberately so — the kernel itself refuses with
+#     `error: kernel features 'pi' and 'tegra' are mutually exclusive — pick one board UART` (plus a
+#     duplicate `GICD_BASE`). They select different board UARTs/GIC bases. So there is NO single
+#     "everything on" aarch64 leg; two board legs are the minimum that covers both families.
+#   * x86-family features on an aarch64 compile: compiles GREEN but VACUOUS — `wc`/`instgui`/kepler/
+#     `smc`/`videobench`/`irqstorage`/`ehcihid`/`mtraw`/BENCH-RIDE etc. sit behind
+#     `target_arch = "x86_64"` module gates, so aarch64 emits nothing for them. Carrying them on the
+#     arm legs would buy zero coverage and cost a compile, so they are excluded ON EVIDENCE.
+#
+# COVERAGE ARGUMENT (why 3 legs + the 2 default legs are enough). The union of the three feature lists
+# below is EXACTLY the `[features]` table minus `default` — 76 of 76, no more and no less, so a knob
+# added to Cargo.toml without a leg here is a one-line diff to spot. And the DEFAULT legs already
+# compile the all-off state for both arches — so for every feature BOTH polarities of its `#[cfg]` are
+# type-checked, which is what makes the 61
+# `not(feature = "pi")` / 21 `not(feature = "tegra")` / 14 `not(feature = "baremetal")` sites in the
+# tree real coverage rather than an accident. The three default-ON features (`ehcihid`, `kbdwit`,
+# `smolnet`) and the negative knob `noportsw` are the one asymmetry worth stating: their opt-OUT state
+# has no `#[cfg(not(...))]` site anywhere in src/ (verified), so nothing is left unchecked.
+#
+# Fields (whitespace-separated, 3 of them; features must contain no spaces):
+#   1 leg label — printed on the ✅/❌ line and in the failure summary, so a red gate names the LEG
+#     and not just "the kernel".
+#   2 --target json, relative to crates/kernel (same form the default legs use).
+#   3 comma-separated cargo feature list.
+#
+# COST: these share the ordinary target/ dir on purpose. Cargo hashes the enabled-feature set into
+# each unit's `-Cmetadata`, so a differing feature set gets its OWN fingerprint + rlib and coexists
+# with the default legs' artifacts instead of evicting them — alternating `check` and a media build
+# does NOT thrash. Warm, all three legs are cache hits; cold-for-these-feature-sets they cost about
+# 3-6 s each on top of a warm dependency graph.
+KERNEL_CFG_MATRIX=(
+  # x86_64, every feature that emits x86 code. Covers (among others) wcg (witness), wcx + the fbcon
+  # CONSOLE-WINDOW route (wc), instgui, the Kepler trio, IVB/GMUX, VPERF (videobench/videocap), the
+  # EHCI family + KBDWIT, MTRAW + its inject sub-knob, STOR-1 (irqstorage), the BOT fault/ring
+  # experiments, BENCH-RIDE (therm/pcilink/vrom), SMC, the rasterizer and the installer engine.
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,rast,installdemo"
+  # aarch64 board leg 1 — Raspberry Pi 4 bare metal. `baremetal` ⇒ `pi`, which is what unlocks wcf
+  # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
+  # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
+  # three-rung INSTALL-PI ladder. Cannot carry the tegra family — see the mutual-exclusion note above.
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm"
+  # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
+  # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
+  # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
+  # (the QEMU-virt virtio-net driver, which carries no board gate of its own and so type-checks here).
+  "arm-tegra   ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet"
+)
+
+# Type-check every KERNEL_CFG_MATRIX leg and print one summary line per leg, in the same shape as the
+# kernel and userspace legs above.
+#
+# Like check_user_arch it does NOT stop at the first failure: a broken shared helper typically breaks
+# more than one leg, and aborting on the first would hand back one leg per run — a full round-trip
+# each. Every failing leg is collected and NAMED (leg label + the crate that failed to compile), and
+# the function returns 1, which check_both turns into a non-zero exit for the whole gate.
+#
+# NOTE this deliberately does NOT consult $KERNEL_FEATURES. These legs are a FIXED coverage matrix:
+# if an operator's UNAOS_* environment could add to them, the gate would mean something different for
+# every operator, and "check green" would stop being a shared fact. The operator's own knob set is
+# already what the two default legs compile.
+check_kernel_cfg() {
+    local _rc=0 _n=0 _failed=""
+    local _row _leg _tgt _feats
+    echo -e "${COLOR_YELLOW}⚡ Syntax Check: kernel cfg-gated coverage (${#KERNEL_CFG_MATRIX[@]} legs)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/kernel"
+    for _row in "${KERNEL_CFG_MATRIX[@]}"; do
+        read -r _leg _tgt _feats <<< "$_row"
+        _n=$((_n + 1))
+        echo -e "${COLOR_CYAN}  → ${_leg}${COLOR_RESET}"
+        # `if ... else` (not a bare command) so `set -e` cannot abort the loop before every leg has run.
+        if cargo +nightly check --release --target "$_tgt" $NIGHTLY_FLAGS --features "$_feats"; then
+            echo -e "${COLOR_GREEN}  ✅ ${_leg}${COLOR_RESET}"
+        else
+            echo -e "${COLOR_RED}  ❌ ${_leg} — unaos-kernel FAILED to compile${COLOR_RESET}"
+            _failed="${_failed} ${_leg}"
+            _rc=1
+        fi
+    done
+    cd "$WORKSPACE_DIR"
+    if [ "$_rc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ kernel cfg coverage FAILED (crate unaos-kernel), legs:${_failed}${COLOR_RESET}"
+        return 1
+    fi
+    echo -e "${COLOR_GREEN}✅ kernel cfg coverage OK (${_n} legs)${COLOR_RESET}"
+}
+
 check_both() {
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: x86_64...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
@@ -824,6 +1016,33 @@ check_both() {
       $NIGHTLY_FLAGS $(arm_features)
     cd "$WORKSPACE_DIR"
     echo -e "${COLOR_GREEN}✅ aarch64 OK${COLOR_RESET}"
+
+    # GATE-CFG: the cfg-gated coverage legs, immediately behind the two DEFAULT kernel legs so all the
+    # kernel verdicts sit together in the scrollback. The default legs stay first and unchanged: they
+    # are what the operator's own UNAOS_* knobs compile, and they are the fastest way to a diagnostic
+    # for the edit that was just made. `_krc` carries a red leg past the userspace legs below, so a
+    # green userspace can never mask a broken feature-gated kernel.
+    local _krc=0
+    check_kernel_cfg || _krc=1
+
+    # GATE-USER: the ring-3 crates, per arch, AFTER the kernel legs. Ordering is deliberate — the kernel
+    # is what most edits touch, so its diagnostics stay at the top of the scrollback; and a userspace stub
+    # that disagrees with the kernel is easier to read once the kernel's own verdict is already in.
+    #
+    # Both legs run even if the first fails, for the same reason check_user_arch does not stop at its own
+    # first failure: one run should name every broken crate. `_urc` carries the verdict past the second
+    # leg so a green aarch64 can never mask a red x86_64.
+    local _urc=0
+    check_user_arch x86_64  || _urc=1
+    check_user_arch aarch64 || _urc=1
+    if [ "$_urc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — userspace crates did not compile (see above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_krc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — cfg-gated kernel code did not compile (see above)${COLOR_RESET}"
+        return 1
+    fi
 }
 
 build_both() {
@@ -2056,7 +2275,7 @@ show_menu() {
     echo -e "  ${COLOR_CYAN}1)${COLOR_RESET} Boot x86_64    (Build + QEMU GUI)"
     echo -e "  ${COLOR_CYAN}2)${COLOR_RESET} Boot aarch64   (Build + QEMU)"
     echo -e "  ${COLOR_CYAN}3)${COLOR_RESET} Test x86_64    (Headless, capture serial -> target/serial.log)"
-    echo -e "  ${COLOR_CYAN}4)${COLOR_RESET} Check          (Both targets)"
+    echo -e "  ${COLOR_CYAN}4)${COLOR_RESET} Check          (Both targets + cfg-gated feature legs + userspace)"
     echo -e "  ${COLOR_CYAN}5)${COLOR_RESET} Build          (Both targets)"
     echo -e "  ${COLOR_CYAN}6)${COLOR_RESET} Clean"
     echo -e "  ${COLOR_CYAN}q)${COLOR_RESET} Quit"
