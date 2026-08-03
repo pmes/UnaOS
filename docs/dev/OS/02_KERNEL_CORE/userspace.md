@@ -1285,7 +1285,7 @@
   - **The meter was right; the placement was the bug.** This is the inverse of P61. There, the load line was
     accurate and the *process table* was blind; here the load line is accurate and there is nothing wrong
     with it at all. The evidence was in the scheduler's own placement witness, which printed the same thing
-    for every launch: `:: SCHED: task 'bg-el0' -> core 1 (policy: caller-pinned EL0, no-migrate) ::`. Every
+    for every launch: `:: SCHED: task 'bg-user' -> core 1 (policy: caller-pinned EL0, no-migrate) ::`. Every
     `bg` runs from the same shell context, so "the caller's core" is one fixed core for the whole boot.
   - **The parents stacked; the workers never did.** A bg vug's ELF-2 worker threads already spread —
     `SYS_THREAD_SPAWN`'s `place = 1` routes them through `sched::other_online_cpu`, the least-loaded
@@ -1337,7 +1337,7 @@
     `arch/aarch64/syscall.rs` (the placement one-liner, the fixture and the leg) +
     `arch/aarch64/sched.rs` (`last_user_placement` / `online_cpu_count`, witness aids only) + the spec + this
     doc. QEMU-green ≠ correct: the metal confirmation rides the attended sitting, where the property to watch
-    is the `SCHED: task 'bg-el0' -> core N` lines across several `bg` launches — and then whether the fourth
+    is the `SCHED: task 'bg-user' -> core N` lines across several `bg` launches — and then whether the fourth
     bg vug still slows the first three.
 - **KILLBOUND (this arc)** — the **unkillable parked task**, and the two bounded tables it wedged. P60 was
   an attended sitting on a real Pi 4, and the failure was reached by hand, not by a fixture: after several
@@ -2274,7 +2274,7 @@
   crash" shape is **not** present in this app.
 
   **Which leaves the reporting hole, and it is a real one.** A fatal EL0 fault does print — but the
-  line named only the **task name**, and every `bg` launch runs under the single literal `"bg-el0"`
+  line named only the **task name**, and every `bg` launch runs under the single literal `"bg-user"`
   (`spawn_user_image_bg`). With two `STAT.ELF` instances on the panel, the line said "one of them
   died" and nothing more; the operator's `kill <pid>` was the first evidence of *which*, and the
   death reads as silent. **Fix:** `aarch64_el0_fault_handler` now prints

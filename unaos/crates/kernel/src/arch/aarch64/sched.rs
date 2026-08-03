@@ -1412,7 +1412,7 @@ static AUTO_ROTATE: AtomicUsize = AtomicUsize::new(0);
 //     window and still cannot see a spawn that has not started executing, which is precisely why the
 //     committed-residents key below remains key 1 and is NOT superseded by the fresher percent.)
 //
-// Together those produce the P68 measurement (27 bg-el0 -> c3, 18 -> c0, 8 -> c1, ~0 -> c2 while
+// Together those produce the P68 measurement (27 bg-user -> c3, 18 -> c0, 8 -> c1, ~0 -> c2 while
 // c0/c3 sat at 99% and c1/c2 at ~80%): placement keeps re-reading a signal that has not yet caught up
 // with the placements it already made, and because the scheduler is no-migrate, nothing ever corrects
 // it. Operator-visible as stagger inversion — vugs launched early run slower than their replacements.

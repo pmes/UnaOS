@@ -7529,7 +7529,7 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
     // EXEC1-M publish order — see the block comment in `run_user_image`; identical window, identical fix.
     PROCS[pi].asid.store(asid, Ordering::Release);
     let pid = super::sched::spawn_user_slot(
-        "bg-el0",
+        "bg-user",
         mapped.base,
         mapped.sp,
         mapped.ttbr0,
@@ -10677,7 +10677,7 @@ fn spinhunt_witness() {
 ///
 /// WHAT THE EXISTING LEGS COULD NOT CATCH. Every `bg` leg in this file launches ONE program at a
 /// time, so none of them can observe a relationship BETWEEN launches — and stacking is only visible
-/// as a relationship. The `:: SCHED: task 'bg-el0' -> core N ::` placement line has always carried
+/// as a relationship. The `:: SCHED: task 'bg-user' -> core N ::` placement line has always carried
 /// the raw fact, but a spec REQUIRE matches one line at a time and cannot count distinct cores
 /// across several; this leg does the counting in the kernel and states the result in one assertable
 /// line. (The `SCHED: load` row cannot substitute: attended P62 showed it reading a flat

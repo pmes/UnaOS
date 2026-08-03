@@ -322,7 +322,7 @@ ASID/parent-placement keyed and reads no band state.
 SPREAD-2 fixed how a *single* frame's work is divided. SPREAD-3 fixes the layer
 above it: where a *newly spawned* EL0 task is put in the first place.
 
-The measurement (P68, from the serial wire) was that `bg-el0` launches placed by
+The measurement (P68, from the serial wire) was that `bg-user` launches placed by
 `load-balanced EL0` did not spread at all — **27** landed on core 3, **18** on
 core 0, **8** on core 1, and essentially none on core 2, while sustained load
 read `c0=99% c3=99%` against `c1/c2 ≈ 80%`. Because the scheduler is no-migrate,
@@ -381,12 +381,12 @@ existing `policy:` field, so it stays one parseable line and the
 `SCHED: task '…' -> core N` prefix the pi4 spec matches on is unchanged:
 
 ```
-:: SCHED: task 'bg-el0' -> core 2 (policy: load-balanced EL0 residents=1, no-migrate) ::
+:: SCHED: task 'bg-user' -> core 2 (policy: load-balanced EL0 residents=1, no-migrate) ::
 ```
 
 `residents` is **inclusive** of the task just placed — the committed count on
 that core after this placement. The next attended boot therefore proves the
-accounting directly: successive `bg-el0` launches should walk the cores rather
+accounting directly: successive `bg-user` launches should walk the cores rather
 than repeating one, and `residents` should climb evenly across them instead of
 running up on a single core.
 

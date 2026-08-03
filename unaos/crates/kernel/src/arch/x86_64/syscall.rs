@@ -2400,7 +2400,7 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
     // wrong — a real WINX-7 bug, on its own counter. The most likely shape it would take is the
     // refcount defect: an address space freed under a still-running sibling, which faults the survivor
     // rather than returning a wrong bit. Not in PROCS, so the launcher times out to FAIL.
-    if name == EL0_THREAD_NAME || name == WINX7_TASK_NAME {
+    if name == USER_THREAD_NAME || name == WINX7_TASK_NAME {
         WINX7_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
@@ -4260,7 +4260,7 @@ fn sys_thread_spawn(entry: u64, sp: u64, arg: u64, place: u64) -> i64 {
     // and if the parent exited in that window an unretained slot would be freed under a live thread.
     crate::arch::sched::user_space_retain(cr3);
     let join = crate::arch::sched::spawn_user_thread(
-        EL0_THREAD_NAME,
+        USER_THREAD_NAME,
         entry,
         sp,
         arg as usize,
@@ -4319,7 +4319,7 @@ fn sys_thread_exit() -> i64 {
 /// The kernel-side name every ring-3 worker thread carries. Fixed (not derived from the program) for the
 /// same reason a window title is: it appears on the wire and in the fault-kill log, so it must not be
 /// anything ring 3 chose.
-const EL0_THREAD_NAME: &str = "el0-thread";
+const USER_THREAD_NAME: &str = "user-thread";
 
 /// WINX-7 thread accounting — successful spawns, completed joins, and thread exits. Global rather than
 /// per-slot: they exist to let a witness assert what happened on a boot, not to enforce anything.
@@ -11383,7 +11383,7 @@ const KILL_CONFIRM_MS: u64 = 2000;
 /// WINX-2: the task name a foreground `run` program is spawned under.
 const RUN_TASK_NAME: &str = "shell-run";
 /// WINX-2: the task name a background `bg` program is spawned under.
-const BG_TASK_NAME: &str = "bg-el0";
+const BG_TASK_NAME: &str = "bg-user";
 
 /// WINX-2: the outcome of [`run_user_image`] — the program exited with a status, was killed by the
 /// fault-kill net (a CONTAINED fault), or overran its deadline (still running / stuck, and then killed).

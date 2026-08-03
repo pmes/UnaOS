@@ -843,7 +843,7 @@ FORBID SPINHUNT: .*-> FAIL
 # ---
 # ---    P62 (attended): four bg vugs, each visibly slower than the last, while the `SCHED: load` row
 # ---    stayed flat at c0=51 c1=99 c2=52 c3=0. The meter was right and nothing in it was the bug:
-# ---    every launch printed `SCHED: task 'bg-el0' -> core 1 (policy: caller-pinned EL0, no-migrate)`,
+# ---    every launch printed `SCHED: task 'bg-user' -> core 1 (policy: caller-pinned EL0, no-migrate)`,
 # ---    so all four parents shared one core's 100% while c3 idled. Their ELF-2 worker threads already
 # ---    spread (`other_online_cpu`); only the parents piled up.
 # ---
