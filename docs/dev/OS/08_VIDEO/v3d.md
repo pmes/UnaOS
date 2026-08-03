@@ -3313,6 +3313,12 @@ metal-attended, read at the next bench boot with `UNAOS_V3D_DEEP=1`.
 
 ## 45. Thread 0 or bin class? — the thread-swap discriminator (V3D-74)
 
+> **ANSWERED — the answer is CLASS. §45's leg A is STANDING (reinterpreted).** Hypothesis 2 below
+> ("thread 0 is dead as a thread") is **dead**: `empty` and `m4` both execute on CT0 (§49.8). Leg A's
+> frozen RCL was the first sighting of what §49.11 proved — CT0 refuses **render-class** opcodes.
+> Leg B is STANDING. See [**THE CT0/CT1 CLASS
+> LAW**](#the-ct0ct1-class-law--render-lists-run-on-ct1-never-on-ct0) and the ledger in §49.11a.
+
 The P84 wire established, and this arc does not re-litigate: `[v3d73s]` = the byte-exact mainline
 submit sequence changes **nothing** — the submit interface is exhausted alongside the config space.
 `[v3d73]` cle-progress = CT0's queue **loads** (CA holds our list, CTRUN=1) but the CLE **never
@@ -3386,6 +3392,15 @@ QEMU raspi4b models no V3D: `[v3d74]` sits behind the hub-identity gate and `UNA
 read at the next bench boot with `UNAOS_V3D_DEEP=1`.
 
 ## 46. The S1S firmware-init campaign — every register divergence explained (V3D-75…78)
+
+> **⚠ PARTIALLY RETRACTED-BY-CLASS-LAW (§49.11a).** Every *kick* verdict in this section
+> (`[v3d75a]`, `[v3d75b]`, `[v3d77a]`, `[v3d77b]`, and §46.5's `[v3d80]`) was read through
+> `v3d75_kick_probe`, which submits a **render-class control list to CT0** and therefore returns
+> `false` unconditionally — for a reason unrelated to the experiment under test. Those negatives are
+> **RETRACTED**; the hypotheses they were meant to kill are returned to **untested**, not revived.
+> §46.5's claim that *"the ARM-testable universe is CLOSED"* **falls with them.** The **register
+> readbacks** in this section (`M_CTRL` did not hold; core0+0x68 and hub+0x68 are read-only; the
+> sweep diff) are direct register facts and **STAND**.
 
 The §45.4 bench ask was answered the same sitting (2026-07-30): the dump rig grew a
 `--trigger ct0run` mode (in-process mmap spin on `CT0CS.CTRUN`, instant snapshot + 1 ms settle)
@@ -3477,6 +3492,14 @@ at the bench.)
 > belief is what this section refutes, and no budget can repair it.
 
 ## 47. The reply-less NOTIFY, read by effect (V3D-81)
+
+> **⚠ THE `kick=` COLUMN IS RETRACTED-BY-CLASS-LAW (§49.11a); THE REST STANDS IN FULL.** Every leg's
+> `kick=` value came from `v3d75_kick_probe` — a **render-class list on CT0**, which cannot pass. Read
+> `kick=0` on any `[v3d81*]` line as **no information**. Everything else in this section is
+> untouched: §47.1a's **control-INDEPENDENT** evidence — `acted-on-buffer`, `buffer-rejected`,
+> `doorbell`, `reg-moved`, `fw-moved` and the display-liveness leg — never consulted the kick. §47.1a
+> drew exactly the distinction that saves this section, which is the strongest argument in the file
+> for making it.
 
 §46.5 closed the ARM-testable space and left exactly one thread live, and it is a thread about
 METHOD rather than about hardware. On this firmware a NOTIFY-class tag is acted on without a FIFO
@@ -4925,3 +4948,97 @@ standing rule is written at the top of this file
 ([**THE CT0/CT1 CLASS LAW**](#the-ct0ct1-class-law--render-lists-run-on-ct1-never-on-ct0)), the audit
 of what it retracts is §49.11a, and the executable proof is §49.12.
 
+---
+
+### 49.11a The CT0 submission audit — every site, and what the law retracts (PI-V3D-88 M2)
+
+§49.11's fix direction names two jobs: audit `probe_job`'s historical construction, and audit *every*
+path that reaches CT0 with a render-class list. Both were done by **reading the builders**, not by
+reading comments — every row's packet inventory below is the opcode sequence its builder function
+actually emits.
+
+#### The inventory — all ten `CT0QBA` write sites
+
+| # | line | function | list source | packet inventory (opcodes, in order) | class | role |
+|---|---|---|---|---|---|---|
+| 1 | 6214 | `probe_job` | `build_bin_cl_generic(OFF_PROBE_BIN_CL, …)` → `build_bin_cl_content_geom(…, Full)` | 119, 120, 19, 92, 6, 96, 107, 108, 110, 111, 71, 64, 36, 4 | **BIN** | witness/probe (attribute-DMA) |
+| 2 | 6709 | `submit_bisect_rung_geom` | `build_bin_cl_content_geom(…, content)` | `Empty` = 119, 120, 19, 6, 4 · `Full` = row 1 | **BIN** | witness (§22 empty-frame bisection) |
+| 3 | 6820 | `submit_bisect_rung_geom` re-kick | same buffer, re-latched | as row 2 | **BIN** | witness (conditional resubmit) |
+| 4 | 9934 | `v3d71_mainline_geometry` | `build_bin_cl_content_geom(…, Empty)` | 119, 120, 19, 6, 4 | **BIN** | witness (§42 address geometry) |
+| 5 | 10119 | `v3d73_mainline_submit` | `build_bin_cl_content_geom(…, Empty)` | 119, 120, 19, 6, 4 | **BIN** | witness (§44.3 mainline-exact submit) |
+| **6** | **10278** | **`v3d74_thread_swap`** (leg A) | **`build_rcl()`** | **121×4, 126, 123, 122, 124, 26, 29, 25, 27, 124, 26, 29, 27, 19, 20, 23, 13** | **RENDER** | §45 discriminator — *deliberate* |
+| **7** | **10523** | **`v3d75_kick_probe`** | **`build_rcl()`** | identical to row 6 | **RENDER** | reusable "did it work?" probe |
+| 8 | 10692 | `triangle_job` | `build_bin_cl(num_attrs)` | as row 1 | **BIN** | production M4 draw |
+| 9 | 12214 | `kick_bin_render` | callers pass `build_bin_cl_at(…)` (M5/M6/M7) | 119, 120, 19, 92, 6, 71, {64, 36}×draws, 4 | **BIN** | production/compositor battery |
+| **10** | **13956** | **`v3d85_firstkick_rung`** | knob-selected | `empty`/`emptyunarm`/`m4` = **BIN**; `rcl`/`rclp<n>`/`rclhead<op>` = **RENDER** | **both** | §49 firstkick — *deliberate* |
+
+#### `probe_job` is EXONERATED — the headline finding, and it is a negative
+
+**`probe_job` does not feed CT0 a render-class list, and never did.** §49.11's fix direction
+anticipated that it might; the code says otherwise. The chain is three lines and fully traceable:
+`build_bin_cl_generic(OFF_PROBE_BIN_CL, OFF_PROBE_SHADREC, num_attrs)` fills the buffer,
+`bin_ba = arena_phys() + OFF_PROBE_BIN_CL` takes its address, and that address goes to `CT0QBA`.
+`build_bin_cl_generic` forwards to `build_bin_cl_content(…, BinContent::Full)` →
+`build_bin_cl_content_geom`, and reading that builder end to end, **every opcode it can emit on any
+`BinContent` arm is bin-class or class-neutral**: 119, 120, 19, 92, 6, 96, 107, 108, 110, 111, 71,
+64, 36, 4. There is no 121, no 126, no 122/123/124, no 25/26/27/29, no 20/23, no 13. `probe_job`
+touches `CT0QBA` exactly once; there is no second kick hidden in it.
+
+> **One opcode is not a discriminator.** `P_FLUSH_VCD_CACHE` (19) is emitted by
+> `build_bin_cl_content_geom` **and** by `build_rcl_limited`. It appears in both classes. Do not read
+> it as render contamination in a bin list.
+
+The same holds for `triangle_job` (row 8) and `kick_bin_render` (row 9) — **the production draw path
+and the compositor battery have always been bin-class on CT0.** The class law therefore **does not
+explain the original empty-bin defect** (§6, §22): those lists are the right class for the thread
+they are on, and `empty` and `m4` both prove bin-class lists execute on CT0. **The bin wall is a
+separate, still-open defect and nothing in §49.11 closes it.** Saying so is the point of this audit —
+a law that explained everything would be explaining too much.
+
+#### Where render-class content genuinely reaches CT0 — three sites, all instruments
+
+None of the three is in a production path, and two of the three were correct science:
+
+- **Row 6, `v3d74_thread_swap` leg A (§45)** — the RCL on CT0 *is* the experiment. It asked
+  thread-vs-class, and boot12 has now answered it: **class**. Not a mistake; it is the law's founding
+  observation. Introduced by **`8f78cd19`** *"video/v3d: V3D-74 — thread 0 or bin class? the swap
+  discriminator"*.
+- **Row 10, `v3d85_firstkick_rung` (§49)** — the whole `rcl`/`rclp<n>`/`rclhead<op>` family is
+  deliberately render-class-on-CT0, one variant per boot, and it is the instrument that produced the
+  law. Not a mistake.
+- **Row 7, `v3d75_kick_probe` — this is the historical mistake.** Introduced by **`282319f1`**
+  *"video/v3d: V3D-75 — the fabric condition (mid-bin dump diff: ENABLE_QPU + the M_CTRL
+  transplant)"*, it compacted §45's *deliberately wedged* arrangement into a **reusable,
+  general-purpose "did my fix work?" success criterion** — and then six unrelated experiments were
+  judged by it. Under the class law that probe returns `false` **unconditionally**, for a reason that
+  has nothing to do with whatever the experiment changed. It is a control that cannot pass.
+
+Rows 6 and 7 also **conflate class with arming** (both strip `CT0QMA`/`QMS`/`QTS` along with
+switching to a render list), which is the confound §49.10 had to break with `emptyunarm`. Only row
+10's `empty`/`emptyunarm` pair separates the two axes.
+
+#### The retraction ledger
+
+A negative measured through `v3d75_kick_probe` is a statement about the probe, not about the
+experiment. Marked in place:
+
+| verdict | section | status | why |
+|---|---|---|---|
+| **V3D-75a** — `SET_ENABLE_QPU(1)` does not free thread 0 | §46 | **RETRACTED-BY-CLASS-LAW** | read through `v3d75_kick_probe` (`v3d75a`). The probe could not have retired whatever ENABLE_QPU did |
+| **V3D-75b** — the `M_CTRL 0x4040` transplant is "a passenger, not the condition" | §46 | **RETRACTED-BY-CLASS-LAW** | same probe (`v3d75b post-transplant`). The `M_CTRL` readback itself (did the bits hold?) is a register fact and **STANDS** |
+| **V3D-77a/b** — the core- and hub-unnamed register writes change nothing | §46.1–46.3 | **RETRACTED-BY-CLASS-LAW** | `v3d77a core-unnamed` / `v3d77b hub-unnamed`, both `v3d75_kick_probe` |
+| **V3D-80** — `NOTIFY_DISPLAY_DONE` "did not free thread 0"; *"the ARM-testable universe is CLOSED"* | §46.5 | **RETRACTED-BY-CLASS-LAW** | `v3d80 post-handover`, same probe. **The closure claim falls with it** — the ARM-testable universe was never closed; a whole thread was untested. The `core+0x68` movement reading is register-channel evidence and **STANDS** |
+| **V3D-81** — the reply-less NOTIFY family, the `kick=` column only | §47 | **RETRACTED-BY-CLASS-LAW (kick column only)** | `v3d75_kick_probe(kick_label)`. §47.1a's **control-INDEPENDENT** evidence — `acted-on-buffer`, `buffer-rejected`, `doorbell`, `reg-moved`, `fw-moved`, the display-liveness leg — never used the kick and **STANDS in full**. §47.1a's own distinction is what saves it |
+| **V3D-74 leg A** — the RCL froze on CT0 | §45.1 | **STANDING (reinterpreted)** | the observation is sound and is now the law's founding datum. §45's question "thread 0 or bin class?" is **answered: CLASS** |
+| **V3D-74 leg B** — `bcl` on CT1 is a documented no-op | §45.2 | **STANDING** | not measured through the probe |
+| **V3D-48 / §22 empty-frame bisection**, §42 (V3D-71), §44 (V3D-73/73s), §48 (V3D-82) | — | **STANDING** | every one submitted a **bin-class** list to CT0. Right class, right thread; their negatives are genuine bin-path facts |
+| **§1–§21, §29–§31 shader/CL/encoding facts** | — | **STANDING** | measured through `probe_job`/`triangle_job`, both bin-class |
+| **§49.8 first-kick bracket**, bin-class rows (`empty`, `emptyunarm`, `m4`) | §49.8 | **STANDING** | bin lists on the bin thread; these are the law's positive controls |
+
+**What the retractions cost, stated plainly.** Five banked negatives across §46 and §47 turn out to
+have been measured through an instrument that could not pass, and one of them (**V3D-80**) carried a
+*closure* claim — that the ARM-testable universe was exhausted — which is now known to be false. The
+firmware/fabric hypotheses those boots were meant to kill are **not** revived as likely; they are
+returned to **untested**. Retesting them is cheap and is a natural rider on the next arc: swap
+`v3d75_kick_probe`'s body to the CT1 submission path (§49.12) and every one of those legs gets a
+success criterion that *can* return true.

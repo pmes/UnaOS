@@ -10503,6 +10503,24 @@ fn v3d75_fabric_condition() {
 /// bare QBA→QEA, [v3d73] sampler armed, store-verify + retire signals read. Returns true if the
 /// kick shows execution (store-verified / FRDONE / FLDONE / RFC Δ / CA reached QEA). Poison scans
 /// are not re-run here — [v3d74a] establishes evidence-integrity for this boot's arrangement.
+///
+/// ⚠ **RETRACTED INSTRUMENT — THIS PROBE CANNOT PASS. DO NOT ADD CALLERS.** (PI-V3D-88, v3d.md
+/// §49.11a.) It submits `build_rcl()` — a **RENDER-class** control list — to **CT0**, the bin
+/// thread. boot12 proved render-class opcodes stall CT0's decoder *as a class*: `CT0CA` never leaves
+/// `QBA`. This function therefore returns `false` **unconditionally**, for a reason that has nothing
+/// to do with whatever experiment is being judged by it.
+///
+/// It was introduced by `282319f1` (V3D-75) as a reusable success criterion, and six unrelated legs
+/// were read through it — `v3d75a`, `v3d75b`, `v3d77a`, `v3d77b`, `v3d80 post-handover`, and every
+/// `[v3d81*]` leg's `kick=` column. **All of those kick verdicts are RETRACTED-BY-CLASS-LAW**; the
+/// hypotheses they were meant to kill are *untested*, not refuted, and §46.5's "the ARM-testable
+/// universe is CLOSED" falls with them. The register readbacks and §47.1a's control-INDEPENDENT
+/// evidence on those same legs never used this kick and STAND.
+///
+/// The fix is to submit on **CT1** (see the CT0/CT1 class law at the top of v3d.md). PI-V3D-89
+/// builds and proves that path as the `rclct1` firstkick variant (§49.12); rehosting this probe's
+/// body onto it — and thereby re-taking the five retracted negatives with a criterion that *can*
+/// return true — is that arc's named follow-on, deliberately NOT done here.
 fn v3d75_kick_probe(label: &str) -> bool {
     fill_target(0xDEAD_BEEF);
     let (rcl_len, sublist_len) = build_rcl();
