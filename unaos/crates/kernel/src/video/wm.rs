@@ -5654,14 +5654,21 @@ fn stage_window(
     // whose `bytes=` exceeds `MAX_STAGE_BYTES` could not have been staged before WC-M).
     //
     // FBCON-DMG — `span`, not `bh`, and for exactly the same reason: the rows this present copied are
-    // the rows it owed. `[wc-h] box=WxH bytes=N` therefore keeps meaning "what this present put on
-    // the glass", so a damage-limited console line reports its true cost instead of the cost of the
-    // box it lives in. Unbanded presents have `span == bh` and their `[wc-h]` lines do not move —
-    // which on aarch64, where no band is ever produced, is every present there is.
+    // the rows it owed. `[wc-h] bytes=N` therefore keeps meaning "what this present put on the
+    // glass", so a damage-limited console line reports its true cost instead of the cost of the box
+    // it lives in. Unbanded presents have `span == bh` and their `[wc-h]` numbers do not move — which
+    // on aarch64, where no band is ever produced, is every present there is.
+    //
+    // BOTH heights go to the witness, and that is the FBCON-DMG instrument fix. `span` alone told it
+    // how much was written but never how much COULD have been, so it could not tell a banded present
+    // of a tall box from a whole-box present of a short one — and with the two sharing one sample
+    // budget, the four samples were spent on creation-time whole-box presents before the console had
+    // banded once. `stage_note` classifies on `span < bh` and budgets the two classes apart.
     #[cfg(feature = "witness")]
     super::wcg::stage_note(
         r.id,
         bw,
+        bh,
         span,
         row_bytes * span,
         compose_cyc + present_cyc,

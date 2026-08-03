@@ -134,6 +134,12 @@
 //! and silent thereafter — the checksums are 64 KiB reads and the read-back is one probe per source
 //! pixel, from present context at user-mode frame rates, so an unbudgeted version would perturb the very
 //! timing it reports. Every sample prints; the terminal `verdict` line is one-shot.
+//!
+//! FBCON-DMG splits that budget in two for `[wc-h]` alone: [`SAMPLES`] WHOLE-BOX samples and
+//! [`SAMPLES`] BANDED ones per window id, because a single budget is spent by whichever class arrives
+//! first and the first class is always whole-box (window creation, first paint). See [`H_BTAKEN`].
+//! The tallies behind them are unbudgeted and the rollup is one line per budget, so the wire can say
+//! `banded=0` as readily as it can say `banded=980`.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -215,6 +221,12 @@ static H_FIXTURE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 static H_PEND: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// Per-id: what the pending sample IS — [`KIND_STAGED`] or one of the decline reasons.
 static H_KIND: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+/// Per-id: whether the pending sample's present was BANDED — 1 banded, 0 whole-box. Carried beside
+/// [`H_KIND`] rather than folded into it because a decline has no span at all to classify.
+static H_BAND: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+/// Per-id: the pending sample's span — the rows the present actually wrote, which is `bh` for a
+/// whole-box present and strictly less for a banded one.
+static H_SPAN: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 
 /// The pending sample is a staged composite; the timing fields are meaningful.
 const KIND_STAGED: u32 = 0;
@@ -284,6 +296,58 @@ static H_COMPOSE: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 static H_PRESENT: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 static H_RECTSCAN: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 
+// ---- FBCON-DMG — telling a banded present from a whole-box one ----------------------------------
+
+/// Per-id: BANDED `[wc-h]` sample lines taken, capped at [`SAMPLES`]. A budget of its OWN, and that
+/// separation is the entire reason this counter exists.
+///
+/// FBCON-DMG made a console present write only the rows its damage covers, and the first boot that
+/// carried it could not prove so on the wire. The reason is arithmetic rather than subtlety: the four
+/// samples [`H_TAKEN`] budgets are spent by whatever composites arrive FIRST, and what arrives first
+/// is window creation and first paint — whole-box presents, every one of them. The ~980 damage-banded
+/// console presents that followed were past budget, so [`stage_note`] returned before recording
+/// anything, and the feature's whole observable footprint was four lines describing the one case it
+/// does not change. **An instrument whose budget is spent by the control can never see the
+/// treatment**, and that made the feature unfalsifiable rather than merely unreported.
+///
+/// So a banded present spends a different budget. A window may burn all four whole-box samples during
+/// creation and still record four banded samples afterwards, which is exactly the population
+/// FBCON-DMG exists to alter. Declines keep sharing [`H_TAKEN`] with the whole-box samples: a decline
+/// never reached the banding loop, so it has no span to classify and no claim to the banded budget.
+static H_BTAKEN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+/// Per-id: banded presents RECORDED, and unbudgeted — the count is taken before either budget test,
+/// so it keeps running long after the lines stop. The lines are a trace; this is the census, and a
+/// boot that bands 980 times must not report 4 just because 4 is all it printed.
+static H_BANDED: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+/// Per-id: whole-box presents recorded, unbudgeted, for the same reason and to the same standard.
+/// Kept as its own counter rather than derived from `samples - banded` because the two budgets make
+/// that subtraction wrong — declines spend [`H_TAKEN`] too, and they are neither.
+static H_WHOLE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+/// Per-id: the NARROWEST banded present seen, packed `span << 32 | bytes`. `u64::MAX` means no banded
+/// present has been recorded at all, which the rollup prints as `minspan=0 minspan_bytes=0` beside
+/// `banded=0` rather than inventing a width.
+///
+/// Packed into ONE atomic rather than kept as two, so `fetch_min` yields a span together with the
+/// byte count that BELONGS to it. Two independent minima would be free to pair the span of one
+/// present with the bytes of another and report a cost no present ever had — the sort of composite
+/// figure that reads as a measurement and is not one. `span` occupies the high half so the ordering
+/// is by span; `bytes` is `row_bytes * span` at a fixed window width, so the low half can only ever
+/// agree with that ordering, never invert it.
+static H_MINSPAN: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
+
+/// Per-id rollup latches. Bit [`ROLL_WHOLE`] for the whole-box budget's rollup, bit [`ROLL_BAND`] for
+/// the banded one; each fires at most once per window per boot.
+///
+/// A latch, and not the old `if n == SAMPLES` test against the pending slot. There is one pending slot
+/// per id ([`stage_flush`]), so a concurrent composite can overwrite the very sample that would have
+/// carried `n == SAMPLES` — and where losing a trace line is the documented, acceptable cost of not
+/// putting a queue on the present path, losing a ROLLUP is not: it is the line the spec's FORBIDs sit
+/// on. The latch reads the budget counter instead, which no overwrite can disturb, so the rollup
+/// fires on whichever flush first observes the budget spent.
+static H_ROLLED: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+const ROLL_WHOLE: u32 = 1 << 0;
+const ROLL_BAND: u32 = 1 << 1;
+
 /// WC-H — report one staged window composite: how long the off-screen compose took, how long the
 /// row-copy present into the live scan-out took, and whether that present alone is still longer than
 /// the beam's time on the window's box.
@@ -309,11 +373,26 @@ static H_RECTSCAN: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// the same reason: nothing observable inside a boot can tell "sampling finished" from "the next app
 /// has not launched yet", so a global summary would be a completeness claim the instrument cannot
 /// support. See [`W_SAMPLES`].
+///
+/// ### FBCON-DMG — `bh` and `span` are two arguments, not one
+///
+/// `span` is the rows this present WROTE; `bh` is the height of the box they live in. The present is
+/// **banded** exactly when `span < bh` and **whole-box** when `span == bh`, and until this signature
+/// carried both, nothing downstream could tell the two apart — `bh` was the parameter's name and
+/// `span` was the value the sole call site passed into it, which made every banded present look like
+/// a short window. That is why this line could confirm FBCON-DMG's cost but never its absence, and
+/// why the fix had to reach the classification rather than only the print.
+///
+/// `rectscan_us` stays derived from `span`, not `bh`, and deliberately so: the tearing threshold is
+/// the beam's time on the rows the present actually touches, and crediting a banded present with the
+/// whole box's scan time would raise the bar it is measured against and hide tears. That is unchanged
+/// behaviour — `span` is the value this argument slot always held.
 #[allow(clippy::too_many_arguments)]
 pub fn stage_note(
     id: u32,
     bw: usize,
     bh: usize,
+    span: usize,
     bytes: usize,
     t_end: u64,
     t0: u64,
@@ -324,20 +403,43 @@ pub fn stage_note(
     if i >= IDS {
         return;
     }
-    let n = H_TAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
-    if n > SAMPLES {
-        H_TAKEN[i].store(SAMPLES + 1, Ordering::Relaxed);
-        return;
+    // Classify and census FIRST, before either budget test. Past budget the LINE stops but the count
+    // must not — the same rule `stage_decline` already follows, and here it is the difference between
+    // "this window banded 4 times" and the truth.
+    let banded = span < bh;
+    if banded {
+        H_BANDED[i].fetch_add(1, Ordering::Relaxed);
+        H_MINSPAN[i].fetch_min(((span as u64) << 32) | (bytes as u64 & 0xFFFF_FFFF), Ordering::Relaxed);
+    } else {
+        H_WHOLE[i].fetch_add(1, Ordering::Relaxed);
     }
+    // Two budgets, one per class. See [`H_BTAKEN`] for why a shared one made the feature invisible.
+    let n = if banded {
+        let n = H_BTAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
+        if n > SAMPLES {
+            H_BTAKEN[i].store(SAMPLES + 1, Ordering::Relaxed);
+            return;
+        }
+        n
+    } else {
+        let n = H_TAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
+        if n > SAMPLES {
+            H_TAKEN[i].store(SAMPLES + 1, Ordering::Relaxed);
+            return;
+        }
+        n
+    };
     let compose_us = cycles_to_us(t1.saturating_sub(t0));
     let present_us = cycles_to_us(t_end.saturating_sub(t1));
-    let rectscan_us = if panel_h == 0 { 0 } else { FRAME_US * bh as u64 / panel_h as u64 };
+    let rectscan_us = if panel_h == 0 { 0 } else { FRAME_US * span as u64 / panel_h as u64 };
     if present_us > rectscan_us {
         H_TORN[i].fetch_add(1, Ordering::Relaxed);
     }
     H_MAXPRES[i].fetch_max(present_us, Ordering::Relaxed);
     H_KIND[i].store(KIND_STAGED, Ordering::Relaxed);
+    H_BAND[i].store(banded as u32, Ordering::Relaxed);
     H_BOX[i].store(((bw as u64) << 32) | bh as u64, Ordering::Relaxed);
+    H_SPAN[i].store(span as u64, Ordering::Relaxed);
     H_BYTES[i].store(bytes as u64, Ordering::Relaxed);
     H_COMPOSE[i].store(compose_us, Ordering::Relaxed);
     H_PRESENT[i].store(present_us, Ordering::Relaxed);
@@ -365,25 +467,65 @@ pub fn stage_note(
 /// the rollup reports — `torn`, `maxpresent_us` — are updated at RECORD time and miss nothing, while
 /// the per-sample lines are a best-effort trace. A queue would fix the trace at the cost of putting
 /// allocation or a lock on the present path, which is not a trade this witness is worth.
+///
+/// **The ROLLUPS are not part of that best-effort trace, and no longer ride on the pending slot.**
+/// They are latched off the budget counters instead ([`H_ROLLED`]), so an overwritten sample can cost
+/// a trace line but never the line the spec's verdicts are read from. There are two of them, one per
+/// budget — see [`stage_rollup`] for what each one's `scope=` claims and what it deliberately does
+/// not.
 pub fn stage_flush(id: u32) {
     let i = id as usize;
     if i >= IDS {
         return;
     }
     let n = H_PEND[i].swap(0, Ordering::AcqRel);
-    if n == 0 {
-        return;
+    if n != 0 {
+        emit_sample(id, i);
     }
+    // FBCON-DMG — the whole-box rollup fires as it always did, at the first flush that observes the
+    // whole-box/decline budget spent. The banded one is new and fires on its own budget, which in a
+    // real boot is LATER: window creation spends the whole-box budget before the console has printed a
+    // line. A boot that never bands therefore ends with exactly one rollup, reading `banded=0` — and a
+    // boot that bands ends with two, the second carrying the real count and the narrowest span. Both
+    // outcomes are visible on the wire, which is what makes the feature falsifiable in either
+    // direction rather than only confirmable.
+    if H_TAKEN[i].load(Ordering::Relaxed) >= SAMPLES
+        && H_ROLLED[i].fetch_or(ROLL_WHOLE, Ordering::Relaxed) & ROLL_WHOLE == 0
+    {
+        stage_rollup(id, i, "window");
+    }
+    if H_BTAKEN[i].load(Ordering::Relaxed) >= SAMPLES
+        && H_ROLLED[i].fetch_or(ROLL_BAND, Ordering::Relaxed) & ROLL_BAND == 0
+    {
+        stage_rollup(id, i, "window-band");
+    }
+}
+
+/// Print the one pending `[wc-h]` sample line for window `id`.
+///
+/// **The key order here is load-bearing across seats.** `win=`, `compose_us=`, `present_us=`, `torn=`
+/// and the terminal `-> BUFFERED` are matched, in that order, by another platform track's regression
+/// gate. Fields may be INSERTED between them — FBCON-DMG's `span=` and `band=` are — but none of those
+/// five may be renamed, reordered, or moved off the end without a paired spec change on that side.
+fn emit_sample(id: u32, i: usize) {
     let kind = H_KIND[i].load(Ordering::Relaxed);
     if kind == KIND_STAGED {
         let bx = H_BOX[i].load(Ordering::Relaxed);
         let present_us = H_PRESENT[i].load(Ordering::Relaxed);
         let rectscan_us = H_RECTSCAN[i].load(Ordering::Relaxed);
+        // FBCON-DMG — `box=` is the WHOLE box again, and `span=` the rows this present wrote. Before
+        // the split those were one number and it was the span, so a banded present of a 66x780 box
+        // reported `box=66x78` and was indistinguishable on the wire from a whole-box present of a
+        // short window. `bytes=` is unchanged and still `row_bytes * span` — what reached the glass.
+        // On aarch64 no band is ever produced, so `span == bh`, `box=` prints exactly what it always
+        // printed, and `band=no` on every line.
         serial_println!(
-            "[wc-h] win={} box={}x{} bytes={} compose_us={} present_us={} rectscan_us={} torn={} -> BUFFERED",
+            "[wc-h] win={} box={}x{} span={} band={} bytes={} compose_us={} present_us={} rectscan_us={} torn={} -> BUFFERED",
             id,
             bx >> 32,
             bx & 0xFFFF_FFFF,
+            H_SPAN[i].load(Ordering::Relaxed),
+            if H_BAND[i].load(Ordering::Relaxed) != 0 { "yes" } else { "no" },
             H_BYTES[i].load(Ordering::Relaxed),
             H_COMPOSE[i].load(Ordering::Relaxed),
             present_us,
@@ -396,33 +538,69 @@ pub fn stage_flush(id: u32) {
         // FORBIDs sit on the rollup where the aggregate lives.
         serial_println!("[wc-h] win={} staged=no reason={} -> DIRECT", id, decl_name(kind));
     }
-    if n == SAMPLES {
-        let torn_n = H_TORN[i].load(Ordering::Relaxed);
-        let decl_n = H_DECLINE[i].load(Ordering::Relaxed);
-        // Precedence: a measured tear outranks an unmeasured one. `UNSTAGED` is not a lesser verdict
-        // — it says composites reached the panel through the unbuffered path, so the TEAR-FREE claim
-        // the staged samples support does not cover the window's actual behaviour. `fixture` is
-        // excluded from `declines` because the kernel asked for it (see `DECL_FIXTURE`); it is
-        // printed separately so the exclusion is visible rather than assumed.
-        let verdict = if torn_n > 0 {
-            "AT-RISK"
-        } else if decl_n > 0 {
-            "UNSTAGED"
-        } else {
-            "TEAR-FREE"
-        };
-        serial_println!(
-            "[wc-h] rollup win={} scope=window samples={} torn={} declines={} fixture={} maxpresent_us={} frame_us={} -> {}",
-            id,
-            n,
-            torn_n,
-            decl_n,
-            H_FIXTURE[i].load(Ordering::Relaxed),
-            H_MAXPRES[i].load(Ordering::Relaxed),
-            FRAME_US,
-            verdict
-        );
-    }
+}
+
+/// One window's `[wc-h] rollup` line, fired once per budget by [`stage_flush`].
+///
+/// `scope=window` is the whole-box-and-decline budget's rollup and is the line that existed before
+/// FBCON-DMG, with its verdict, its precedence and its leading fields untouched. `scope=window-band`
+/// is the banded budget's, printed by the same code with the same counters so the two can never drift
+/// into disagreeing about a shared quantity.
+///
+/// ### What `banded=` claims, and what it does not
+///
+/// `whole=` and `banded=` are the UNBUDGETED censuses — every present [`stage_note`] classified, not
+/// the handful it printed — so a console that bands a thousand times says a thousand. What neither
+/// number claims is completeness: like every rollup in this module it reports the presents seen up to
+/// the moment its budget spent, because nothing observable inside a boot can distinguish "this window
+/// is finished compositing" from "the next line has not been printed yet" (see [`W_SAMPLES`]). The
+/// honest reading of `banded=0` on a `scope=window` line is therefore "no banded present had been
+/// recorded when this window spent its whole-box budget" — which, paired with the ABSENCE of a
+/// `scope=window-band` line for that window anywhere later in the boot, is the wire's way of saying
+/// the window never banded at all. That pair is the falsification test: one line for the negative,
+/// two for the positive.
+///
+/// `minspan=` is the narrowest band seen and `minspan_bytes=` the bytes that band actually copied,
+/// taken together from one packed atomic ([`H_MINSPAN`]) so they always describe the same present.
+/// Both read `0` when nothing banded, which `banded=0` on the same line disambiguates from a real
+/// zero-row present — a present of no rows does not exist, `stage_window` declines on `bh == 0`.
+///
+/// Banding does NOT enter the verdict precedence, and that is deliberate. A banded present is the
+/// feature working, not a defect; folding it into `AT-RISK`/`UNSTAGED`/`TEAR-FREE` would change what
+/// the spec's existing FORBIDs mean on a line they already guard.
+fn stage_rollup(id: u32, i: usize, scope: &str) {
+    let torn_n = H_TORN[i].load(Ordering::Relaxed);
+    let decl_n = H_DECLINE[i].load(Ordering::Relaxed);
+    // Precedence: a measured tear outranks an unmeasured one. `UNSTAGED` is not a lesser verdict
+    // — it says composites reached the panel through the unbuffered path, so the TEAR-FREE claim
+    // the staged samples support does not cover the window's actual behaviour. `fixture` is
+    // excluded from `declines` because the kernel asked for it (see `DECL_FIXTURE`); it is
+    // printed separately so the exclusion is visible rather than assumed.
+    let verdict = if torn_n > 0 {
+        "AT-RISK"
+    } else if decl_n > 0 {
+        "UNSTAGED"
+    } else {
+        "TEAR-FREE"
+    };
+    let ms = H_MINSPAN[i].load(Ordering::Relaxed);
+    let (minspan, minbytes) = if ms == u64::MAX { (0, 0) } else { (ms >> 32, ms & 0xFFFF_FFFF) };
+    serial_println!(
+        "[wc-h] rollup win={} scope={} samples={} torn={} declines={} fixture={} whole={} banded={} minspan={} minspan_bytes={} maxpresent_us={} frame_us={} -> {}",
+        id,
+        scope,
+        SAMPLES,
+        torn_n,
+        decl_n,
+        H_FIXTURE[i].load(Ordering::Relaxed),
+        H_WHOLE[i].load(Ordering::Relaxed),
+        H_BANDED[i].load(Ordering::Relaxed),
+        minspan,
+        minbytes,
+        H_MAXPRES[i].load(Ordering::Relaxed),
+        FRAME_US,
+        verdict
+    );
 }
 
 // ---- WC-K — the staged DESKTOP FILL's own witness ----------------------------------------------
