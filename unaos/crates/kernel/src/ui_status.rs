@@ -136,7 +136,8 @@
 //! VUG-HONESTY meaning: `core_load` reports `tracked=false` for a core that is not inside `run()`, and
 //! for such a core the tick deltas are consulted exactly as before — a frozen non-demo core still reads
 //! [`PARKED`] rather than a fabricated bar, and `crate::vug::parked_display_witness` still covers that
-//! branch (the witness stays with the demo; the rule it witnesses lives here).
+//! branch (the witness stays with the demo — and so is aarch64-only, since `vug` is; the rule it
+//! witnesses lives here and is compiled on both arches).
 //! On x86 (no `core_load`) the source is unchanged in every particular.
 //!
 //! **Pacing is unchanged and stays.** 1 Hz is not the defect — skipping a window whose values moved is.
@@ -257,8 +258,11 @@ pub(crate) const PARKED: u32 = u32::MAX;
 ///                      counters are frozen between windows and this fallback still fabricated.) Report
 ///                      PARKED instead.
 ///
-/// The honesty rule is stated ONCE, here; `vug::classify_load` is this function at `full = 100` and the
-/// VUG-HONESTY witness therefore still covers every branch of it. The instrument panel calls it at
+/// The honesty rule is stated ONCE, here, and this is the definition BOTH arches compile —
+/// deliberately, since the strip is the rule's permanent consumer. `vug::classify_load` is this
+/// function at `full = 100`, and the VUG-HONESTY witness that runs beside it covers every branch of
+/// the rule through that entry point; `vug` is aarch64-only, so on x86 the rule is exercised by the
+/// strip alone. The instrument panel calls it at
 /// `full = 1000` (per-mille): its LED bar is ~1400 px wide on the bench panel, so a 1% quantum would
 /// be a 14 px jump — the display would step where the machine is smooth, which is exactly the
 /// "sensitivity" Peter asked the full width to buy. `own_load` is a percent by contract and is scaled

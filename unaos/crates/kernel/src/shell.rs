@@ -18,6 +18,10 @@ use alloc::vec::Vec;
 use alloc::string::String;
 use crate::console::Console;
 use crate::fs::fat::{DirEntry, FatError, FatFs};
+// The in-kernel `vug` demo (the `vug` and `pulse` verbs) is an aarch64 module — see the `pub mod vug`
+// note in `lib.rs`. The verbs that drive it are gated to match, so on x86 they are not registered at
+// all and fall through to the normal unknown-command reply.
+#[cfg(target_arch = "aarch64")]
 use crate::vug;
 use crate::pal::TargetPal;
 
@@ -2307,10 +2311,17 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
     // console visible. PI-APP-1: `v3d` blits the visible battery onto the live scanout, so it too
     // keeps the console off (a repaint would overwrite the replayed tiles). Aarch64+v3d only; the
     // knob-off build never registers the command, so this OR-clause is constant-folded away there.
+    //
+    // This predicate must track which verbs are actually REGISTERED below, not which words exist. On
+    // x86 neither `vug` nor `pulse` is registered (the demo module is aarch64-only), so nothing here
+    // takes the screen: claiming otherwise would suppress the console repaint that carries the
+    // "Unknown command" reply, and typing `vug` would present as a hang instead of a refusal.
     #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
     let took_screen = command == "vug" || command == "pulse" || command == "v3d";
-    #[cfg(not(all(target_arch = "aarch64", feature = "v3d")))]
+    #[cfg(all(target_arch = "aarch64", not(feature = "v3d")))]
     let took_screen = command == "vug" || command == "pulse";
+    #[cfg(not(target_arch = "aarch64"))]
+    let took_screen = false;
 
     match command {
         "ver" | "version" => {
@@ -2343,7 +2354,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("          usnapls <gen> [path], usnapcat <gen> <path>  (read a snapshot; current-ACL enforced)");
             console.println("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
             console.println("          time  (shared civil clock: ISO-8601 UTC + source; unsynced until SNTP/setdate)");
+            // `pulse` draws through the aarch64-only `vug` module, so it is listed only where it can
+            // actually run — help text that advertises a verb the build cannot dispatch is worse than
+            // no help at all.
+            #[cfg(target_arch = "aarch64")]
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
+            #[cfg(not(target_arch = "aarch64"))]
+            console.println("SMP:      sched (per-CPU run queues)");
             #[cfg(target_arch = "aarch64")]
             console.println("          top  (per-core load: recent busy%, ctx-switches, last task)");
             // PI-APP-1: v3d-gated so the knob-off build's help text stays byte-identical to baseline.
@@ -3212,6 +3229,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 None => console.println("usage: get <a.b.c.d> [port] [path]"),
             }
         },
+        // The in-kernel 3D sculptor. Aarch64 only, matching `crate::vug`: the whole arm vanishes on
+        // x86, where the verb is therefore an ordinary unrecognised word.
+        #[cfg(target_arch = "aarch64")]
         "vug" => {
              match args.first().copied() {
                  Some("bebox") => {
@@ -3250,6 +3270,10 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
             // On a real replay `took_screen` keeps the console off the freshly-blitted tiles.
         },
+        // UI1-M3's full-screen monitor draws through the same `vug` module, so it is gated the same
+        // way. x86 keeps the per-core instrument it always had — the `ui_status` strip and `sched` —
+        // and this verb is an unrecognised word there.
+        #[cfg(target_arch = "aarch64")]
         "pulse" => {
             // UI1-M3: the full-screen system monitor (BeOS Pulse homage). Any key exits; the
             // console repaints over it on the way out (same contract as the vug crystal).

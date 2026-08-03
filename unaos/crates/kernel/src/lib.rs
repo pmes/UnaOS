@@ -103,11 +103,23 @@ pub mod bootpace;
 pub mod pal;
 pub mod ui;
 pub mod ui_status;
-// Merge assembly: the x86 trunk deleted vug.rs wholesale and the auto-merge silently took the
-// deletion (the same defect class as the duplicate `pub mod theme;` — no conflict raised). The
-// pi4 side's standing law forbids that deletion: `run_bsp` is why EL0 vugs run, and
-// `classify_load_scaled`/`METER_*`/`PARKED` are the pulse-strip classifier `ui_status` reads.
-// Restored from hw-pi4@e860181a.
+// The in-kernel 3D sculptor and the full-screen `pulse` monitor — the `vug`, `vug bebox`, `vug wire`
+// and `pulse` shell verbs, plus `parked_display_witness` (called from `arch::aarch64::sched`).
+//
+// Aarch64 only, and the gate is the whole story of the module's ownership. The x86 trunk deleted
+// vug.rs deliberately; the R23 merge took the pi4 body wholesale and restored the verbs on x86 as a
+// side effect, so this gate is what puts x86 back where it meant to be while leaving the Pi exactly
+// as it is. Nothing outside aarch64 needs the module: the pieces that ARE shared — the meter palette
+// (`METER_DIM`/`METER_BREATH`/`METER_PARKED`), the `PARKED` sentinel and the VUG-HONESTY
+// `classify_load_scaled` rule the instrument strip reads — were moved into `ui_status`, which owns
+// them outright and compiles on both arches; `vug` imports them back. `shell.rs` gates its `vug` and
+// `pulse` arms to match, so on x86 those words reach the ordinary unknown-command reply.
+//
+// (The comment this replaces justified the restore with "`run_bsp` is why EL0 vugs run". `run_bsp`
+// appears nowhere in vug.rs — it lives in `arch/{aarch64,x86_64}/sched.rs`, and the EL0 vug is the
+// `VUG.ELF` vessel, not this module. Only the classifier half of that claim was ever true, and it
+// now points at `ui_status`.)
+#[cfg(target_arch = "aarch64")]
 pub mod vug;
 pub mod video;
 pub mod clock;

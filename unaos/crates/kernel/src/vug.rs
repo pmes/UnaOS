@@ -20,39 +20,28 @@
 //! crystal-lined cavity in rock. So the demo shows what the name promises: a real-time,
 //! software-rendered rotating quartz crystal on the panel, drawn through the Gneiss PAL.
 //!
-//! Everything here is arch-neutral (compiled on x86_64 and aarch64, reachable from the Orin
-//! panel shell) and float-free: geometry and the rotation/projection maths run in Q16.16
-//! fixed point. The renderer is the engine's proving ground — each engine primitive
-//! (`draw_line`, `fill_triangle`, `pump_and_poll`) lands with a visible artifact here.
-
-use unaos_boot_info::FrameBufferInfo;
+//! The code here is arch-NEUTRAL — it names no register and no arch module, and drives everything
+//! through the Gneiss PAL — but the module is COMPILED only for aarch64 (`#[cfg]` on the `pub mod
+//! vug` declaration in `lib.rs`, which carries the reasoning). Its callers are the aarch64 `vug` and
+//! `pulse` shell verbs and the Pi/Orin panel shell; nothing on x86 launches it. Arch-neutral source
+//! is what makes the gate a one-line decision rather than a port.
+//!
+//! It is also float-free: geometry and the rotation/projection maths run in Q16.16 fixed point. The
+//! renderer is the engine's proving ground — each engine primitive (`draw_line`, `fill_triangle`,
+//! `pump_and_poll`) lands with a visible artifact here.
 
 use crate::pal::{Event, GneissPal, TargetPal};
 // The meter palette and the VUG-HONESTY classifier live in `ui_status` — the instrument strip is the
 // rule's permanent, both-arches consumer, while this demo is a shell verb. Reading them back keeps a
 // single definition of each and leaves this module free to be gated to the arches that launch it.
 use crate::ui_status::{classify_load_scaled, METER_BREATH, METER_DIM, METER_PARKED, PARKED};
-use crate::video::FrameBuffer;
 
-// ---------------------------------------------------------------------------------------------
-// Background painter (called once at boot from main.rs — signature is load-bearing, out of lane).
-// ---------------------------------------------------------------------------------------------
-
-pub fn init(base: usize, len: usize, info: FrameBufferInfo) {
-    serial_println!(":: VUG Init ::");
-    serial_println!(":: FB Size: {}x{} (stride {}) ::", info.width, info.height, info.stride);
-    serial_println!(":: FB Format: {:?} ::", info.pixel_format);
-
-    // Paint the background through the shared surface (format/bounds handled in one place).
-    // Can-Am dark grey: #1E1E1E.
-    let mut surface = FrameBuffer::new();
-    surface.init(base, len, info);
-    surface.fill_screen(BG);
-
-    serial_println!(":: Framebuffer painted #1E1E1E ::");
-}
-
-// SPLASH-2: the boot splash lives in `crate::splash` (its own module, own tracer).
+// SPLASH-2: the boot splash lives in `crate::splash` (its own module, own tracer). A `vug::init`
+// background painter used to sit here, commented "called once at boot from main.rs — signature is
+// load-bearing". It had no callers anywhere in the tree (main.rs never mentions `vug`), and the boot
+// paint it described belongs to `splash`; it is removed rather than carried as a `pub` entry point
+// that nothing enters. `crate::video::FrameBuffer` and `unaos_boot_info::FrameBufferInfo` were
+// imported for it alone and go with it.
 
 // ---------------------------------------------------------------------------------------------
 // Fixed-point maths (Q16.16). No float in the kernel.
