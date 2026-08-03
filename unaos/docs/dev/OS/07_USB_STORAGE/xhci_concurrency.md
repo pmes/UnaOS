@@ -135,6 +135,33 @@ Two riders that both instances observe:
   it — see the table. An honest, immediate refusal is the point; a `None` from contention must never
   be indistinguishable on the wire from a `None` from dead hardware.
 
+### unafs joins the `Busy`-aware callers (UNAFSTXN)
+
+WEDGE-10 landed with one caller knowingly left out: `fs::unafs::with_unafs`, which wraps a whole
+native-volume transaction in `without_interrupts` and had no `Busy` plumbing at all. A refusal
+therefore arrived already collapsed — `SectorError::Io("block layer: Busy")` at the crate seam, then
+whatever the closure made of a failed op one layer up, which on the `is_err()`-shaped read paths can
+read as *the object is absent*. That is precisely the indistinguishability the rider above forbids,
+and it made a temporary condition a permanent verdict. `with_unafs` now RESTARTS instead: the sector
+seam latches the `Busy`, and a transaction that took one without flipping a root aborts, discards the
+cached mount inside the same hold (the K9-PARITY discard, which re-derives root, inode map and
+refcount map from the medium on the next attempt), and re-runs the whole closure. The abort is safe
+by FORMAT, not by discipline — a `Busy` is only ever produced by a refused claim, before any command
+is issued, and K8a copy-on-write never overwrites a committed block, so the committed tree at abort
+is byte-for-byte what it was at entry and the dead transaction's fresh blocks are the same
+power-cut-equivalent leak the crate's own `txn_unwind` is built around. Bounded like the FAT RMW
+retry it is modelled on, and paired for the same reason: eight attempts (not `fat.rs`'s sixty-four —
+a restarted unafs transaction re-runs a full CoW transaction off a discarded mount, not one sector
+RMW) *and* `hw_wait_budget()` of wall clock. Each bound binds a different backend: the wall-clock cap
+binds emmc2, where the masked claimant has already spent WEDGE-10's 2.6 s bounded spin before the
+`Busy` is surfaced at all, so the thing to prevent is multiplying that by the attempt count; the
+attempt cap binds xHCI, which keeps instant-`Busy` for masked claimants and would never reach the
+deadline. Exhaustion returns the new `MountError::Busy` — nothing was mutated, the caller may retry.
+The one case the restart declines is a `Busy` in a transaction that had ALREADY committed: re-running
+could double-apply, so the closure's result stands and the census counts it (`declined_durable`).
+Witness `:: UNAFSTXN: unafs txn restarted on Busy — restarts=… verdict=… ::`, behind `witness`
+(UNAOS_WITNESS) and silent at zero, which is the expected reading.
+
 ### The instances
 
 Each instance makes its lock private and funnels acquisition through one or two named places, so the
@@ -143,7 +170,7 @@ invariant is checkable by grep without booting.
 | lock | idiom | commit | `Busy` policy |
 | --- | --- | --- | --- |
 | `video::wm::TABLE` (F1) | masked micro-guard — one `TABLE.lock()`, in `fn table()` | WEDGE-7 `97357c70` | none, by construction: nobody is refused, and a waiter waits at most one bounded row scan |
-| `drivers::xhci::XHCI_CONTROLLER` (F3) | claim/loan — `claim` / loan-drop / `install` | WEDGE-8 `dac6edb5` | pump/service passes skip the pass and retry ms later; the block layer surfaces `BlockError::Busy`; a masked FAT/dir RMW refuses to wait and retries the whole closure outside the `without_interrupts` span (64 attempts, `hw_wait_budget()` wall-clock), then `-EAGAIN` at the syscall boundary; diagnostics report "busy" |
+| `drivers::xhci::XHCI_CONTROLLER` (F3) | claim/loan — `claim` / loan-drop / `install` | WEDGE-8 `dac6edb5` | pump/service passes skip the pass and retry ms later; the block layer surfaces `BlockError::Busy`; a masked FAT/dir RMW refuses to wait and retries the whole closure outside the `without_interrupts` span (64 attempts, `hw_wait_budget()` wall-clock), then `-EAGAIN` at the syscall boundary; a masked unafs transaction aborts and restarts (8 attempts, same wall-clock cap), then `MountError::Busy`; diagnostics report "busy" |
 | `arch::aarch64::mailbox::MBOX_FREE` | claim/loan — `claim` / `MboxLoan::drop` | MBOX-1 `c227f420` | `get_clock_rate` alone retries (`claim_bounded`, unmasked, 600 ms) because its refusal makes EMMC2 *assume* a 100 MHz SD base clock and program a wrong divider; every other entry point fails loud with `:: MAILBOX: BUSY — {op} refused … ::` and returns its documented failure value |
 | `video::cursor::SPRITE` (F4) | claim/loan — `claim` / `SpriteLoan::drop`; WEDGE-7's idiom audited and refused | audit in WEDGE-2 `be4ea433` (`<D4>`, the F4 death token), landed WEDGE-9 `e860181a` | stated per entry point; the one rule none may break is losing a repaint silently, so every refusal arms `REPAINT_OWED` and a composite tail cashes it. `repaint` alone retries (`claim_bounded`, unmasked, 2 ms) |
 | `video::cursor::OVERLAY` (F5) | claim/loan — `overlay_claim` / `OverlayLoan::drop`; WEDGE-7's idiom enumerated and refused | WEDGE-11 (this arc) | every former `try_lock` site keeps the fallback it already had for a contended lock (decline the offer, leave the bits standing, `#[must_use]` `false`); `overlay_open` reads `Busy` as "another pass owns the overlay" and takes CURSOR-3's whole-sprite bracket; `adopt_overlay` — the session's ONLY closer — waits `2 × OVERLAY_WORST_HOLD_MS`, CNTPCT-bounded, **masked included**, then defers the close to the next `overlay_open` via `OVERLAY_CLOSE_OWED` |
