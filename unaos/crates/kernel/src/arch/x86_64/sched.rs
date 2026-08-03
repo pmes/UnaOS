@@ -630,7 +630,7 @@ extern "C" fn task_trampoline() -> ! {
 
     // WINX-7: the completion `post()` moved DOWN into `exit()`, which this call reaches immediately.
     // It used to live here, which was correct while only KERNEL threads were joinable — a kernel
-    // thread's one completion edge is "entry returned". An EL0 THREAD (`spawn_user_thread`) never
+    // thread's one completion edge is "entry returned". A ring-3 THREAD (`spawn_user_thread`) never
     // runs `entry` at all: it `iretq`s to ring 3 and finishes at `SYS_THREAD_EXIT`, a fault-kill, or
     // the scheduler's `KillSwitch` reap, none of which pass through here. Putting the post at the
     // single terminus every task funnels through means one implementation covers all four edges and
@@ -789,7 +789,7 @@ extern "C" fn user_task_trampoline() -> ! {
     // program needs.
     //
     // WINX-7 — the ONE EXCEPTION, and it is a DELIBERATE ABI VALUE rather than kernel residue: `rdi`
-    // carries this task's `arg`, so a `SYS_THREAD_SPAWN`ed EL0 thread enters its `extern "C"` worker
+    // carries this task's `arg`, so a `SYS_THREAD_SPAWN`ed ring-3 thread enters its `extern "C"` worker
     // entry with the SysV first argument already in place (the aarch64 twin puts the same word in x0;
     // see `spawn_user_thread`). It is bound as an explicit `in("rdi")` operand — NOT left to the
     // register allocator — precisely so the scrub below can drop its `xor edi, edi` without opening a
@@ -944,7 +944,7 @@ fn spawn_user_inner(
 }
 
 // ---------------------------------------------------------------------------------------------
-// WINX-7: EL0 THREADS — several ring-3 tasks sharing ONE address space.
+// WINX-7: ring-3 THREADS — several ring-3 tasks sharing ONE address space.
 //
 // `spawn_user_in_space` / `spawn_user_preemptible` already put a ring-3 task in a private CR3, and
 // U4x's dispatch-site install of CR3 + TSS.RSP0 + `syscall_kernel_rsp` already made a SECOND
@@ -973,7 +973,7 @@ fn spawn_user_inner(
 // ---------------------------------------------------------------------------------------------
 
 /// WINX-7: per-slot EXTRA-HOLDER counts for the user address spaces. `USER_SPACE_REFS[s]` is the
-/// number of live tasks in slot `s` BEYOND the first — i.e. the number of `SYS_THREAD_SPAWN`ed EL0
+/// number of live tasks in slot `s` BEYOND the first — i.e. the number of `SYS_THREAD_SPAWN`ed ring-3
 /// threads that have not yet retired. A single-task process keeps this at 0, so its first (and only)
 /// `user_space_release` frees the slot and every pre-WINX-7 path behaves byte-identically.
 ///
@@ -983,9 +983,9 @@ fn spawn_user_inner(
 static USER_SPACE_REFS: [AtomicU32; crate::arch::memory::USER_SLOTS] =
     [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
 
-/// TEARDOWN-1: per-slot ADDRESS-SPACE DOOM — "every EL0 task under this slot is owed its death".
+/// TEARDOWN-1: per-slot ADDRESS-SPACE DOOM — "every ring-3 task under this slot is owed its death".
 ///
-/// WHY A KILL MUST BE ADDRESS-SPACE SCOPED, not task scoped. `SYS_THREAD_SPAWN` gives an EL0 program
+/// WHY A KILL MUST BE ADDRESS-SPACE SCOPED, not task scoped. `SYS_THREAD_SPAWN` gives a ring-3 program
 /// several tasks under one slot, and only the LAST of them to leave releases the address space (see
 /// `USER_SPACE_REFS`). A `KillSwitch` names ONE task — the leader `run`/`bg` spawned — so killing it
 /// reaped the leader and left its workers running: the refcount never reached zero, so
@@ -1395,7 +1395,7 @@ pub fn exit() -> ! {
     unsafe {
         // WINX-7: signal completion to any joiner FIRST — before the address space is torn down and
         // before the state flip. This is the single terminus every task reaches (a kernel thread via
-        // `task_trampoline`, an EL0 process via `SYS_EXIT`, an EL0 thread via `SYS_THREAD_EXIT`, a
+        // `task_trampoline`, a ring-3 process via `SYS_EXIT`, a ring-3 thread via `SYS_THREAD_EXIT`, a
         // faulting ring-3 task via `ring3_fault_kill`), which is exactly why the post belongs here
         // and not in the trampoline. The task's OWN `done_sem` Arc clone is the liveness anchor for
         // this `post()` — it MUST remain in the Box until `run()` drops it on the Finished path, so
@@ -1411,7 +1411,7 @@ pub fn exit() -> ! {
         // every process root), so restoring the kernel CR3 doesn't pull the stack out from under us.
         //
         // WINX-7: the free is now REFCOUNTED (`user_space_release`) because an address space can hold
-        // several tasks — a process plus its `SYS_THREAD_SPAWN`ed EL0 threads. The pre-WINX-7 code
+        // several tasks — a process plus its `SYS_THREAD_SPAWN`ed ring-3 threads. The pre-WINX-7 code
         // freed unconditionally, which for a threaded program meant the FIRST thread to finish pulled
         // the slot (and its window surfaces, and its handle row) out from under its still-running
         // siblings. `user_space_release` frees only on the LAST holder's exit; every earlier exit
@@ -1649,11 +1649,11 @@ impl Semaphore {
 }
 
 // ---------------------------------------------------------------------------------------------
-// WINX-7: FUTEX — a keyed EL0 wait/wake primitive (backs SYS_FUTEX(26))
+// WINX-7: FUTEX — a keyed ring-3 wait/wake primitive (backs SYS_FUTEX(26))
 // ---------------------------------------------------------------------------------------------
 //
-// A futex lets EL0 build a userspace mutex/condvar out of one shared u32: block on that word iff it
-// still holds an expected value, and wake N blocked waiters. It is what makes an EL0 thread pool
+// A futex lets ring 3 build a userspace mutex/condvar out of one shared u32: block on that word iff it
+// still holds an expected value, and wake N blocked waiters. It is what makes a ring-3 thread pool
 // possible at all — `user-vug`'s per-frame barrier is exactly "the parent blocks until both workers
 // have bumped `done`", and without a real park that is a spin that burns a core per waiting thread.
 //
@@ -1893,7 +1893,7 @@ pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
 /// key already claimed since its own find scan, or a wake finding waiters in more than one bucket for
 /// its key. Expected to read 0 on a healthy boot; nonzero is the double-claim race observed AND
 /// absorbed (before this arc the wake side's `break`-after-first-match made the second bucket's waiter
-/// a permanent strand — a parked EL0 worker nothing would ever name again).
+/// a permanent strand — a parked ring-3 worker nothing would ever name again).
 static FUTEX_DUP: AtomicU64 = AtomicU64::new(0);
 /// FUTEX-DUP — per-event line budget, on the same terms as every other rate-limited witness here: the
 /// first few occurrences name themselves on the wire, [`futex_dup_witness`] carries the steady state.
@@ -2911,7 +2911,7 @@ fn reap_killed(task: Box<Task>) {
     // address space out from under its siblings. (A killed PROCESS is the common case and still frees
     // here: its refcount is 0 unless it spawned threads.)
     if task.user_cr3 != 0 {
-        // TEARDOWN-1: DOOM the address space before dropping our hold on it, so every sibling EL0 thread
+        // TEARDOWN-1: DOOM the address space before dropping our hold on it, so every sibling ring-3 thread
         // follows this task out at its own next kill boundary and the refcount can actually reach zero.
         // Armed here rather than at the requester — a `bg_kill` names a pid, and the set of tasks that
         // pid's program owns is knowable only from the slot. Idempotent, so a sibling reaping after us
@@ -2966,13 +2966,13 @@ pub fn kill_check_current() {
     yield_now(); // -> scheduler -> reap_killed; never comes back
 }
 
-/// TEARDOWN-1: sweep the kernel waits an EL0 task can be parked in and EVICT the ones an armed kill
+/// TEARDOWN-1: sweep the kernel waits a ring-3 task can be parked in and EVICT the ones an armed kill
 /// names. Called from [`KillSwitch::request`] once the arming store is published, so the predicate
 /// below (the task's own `kill` flag) already matches. Returns how many tasks were evicted.
 ///
 /// THE SET IS ENUMERABLE, and that is the whole reason this is a finite function rather than a hope.
 /// Every park on this arch routes through one of the three `PARK_*` actions, and only two of them can
-/// hold an EL0 task indefinitely:
+/// hold a ring-3 task indefinitely:
 ///   * PARK_SLEEP — the per-CPU `SLEEPERS` lists (`SYS_SLEEP_MS`). Swept here.
 ///   * PARK_WAITQ on a futex bucket (`SYS_FUTEX`). Swept here. This is the one that could park
 ///     FOREVER — a barrier whose other side is gone is woken by nobody — and so the one that made a
@@ -2993,7 +2993,7 @@ pub fn kill_check_current() {
 ///
 /// THE REMAINING BOUND, stated: a killed task already parked on a kernel `Semaphore` is not evicted. It
 /// retires at the syscall boundary when that semaphore is posted, so it is LATE, not immortal — and both
-/// EL0 semaphore parks wait on something that is itself killable (a thread, a child process), so the
+/// ring-3 semaphore parks wait on something that is itself killable (a thread, a child process), so the
 /// post is reachable. Closing it properly needs a `kill_wake_parked_semaphores` hook in `syscall` (the
 /// shape aarch64 uses); that is a separate arc, not a silent gap.
 fn kill_wake_parked() -> u32 {

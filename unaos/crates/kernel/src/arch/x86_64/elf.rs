@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! WINX-2 — the x86_64 EL0 ELF64 loader.
+//! WINX-2 — the x86_64 ring-3 ELF64 loader.
 //!
 //! The x86 twin of the aarch64 EXEC-1 loader (`arch/aarch64/syscall.rs`: `validate_elf` /
 //! `map_image_into_slot`). Until this module, x86 had NO ring-3 program loader at all: every ring-3

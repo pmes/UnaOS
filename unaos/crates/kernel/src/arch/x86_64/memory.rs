@@ -333,14 +333,14 @@ impl PageTable {
 // WINX-1 — the per-process off-screen FRAMEBUFFER REGION (SYS_WIN_CREATE / SYS_WIN_PRESENT).
 //
 // The x86 twin of aarch64 `boot.rs`'s ELF-3/WC-B FB hole, with the SAME VA layout, because the layout
-// is part of the window ABI: an EL0 program reads its surface at a FIXED offset from its own window
+// is part of the window ABI: a ring-3 program reads its surface at a FIXED offset from its own window
 // base, and `crates/user-stat` / `crates/user-vug` hardcode `base + 0x5000`. Layout in the hole
 // immediately above the 16 KiB program window:
 //
 //     [+0x4000]                          the RO info page (1 page) — geometry the app reads
 //     [+0x5000 + w * FB_WIN_SLOT_SIZE]   window `w`'s RW surface slot (16 pages), w in 0..FB_WIN_SLOTS
 //
-// EL0 NEVER gets the real scan-out: it owns only these off-screen surface bytes, and the kernel
+// Ring 3 NEVER gets the real scan-out: it owns only these off-screen surface bytes, and the kernel
 // composites them through SYS_WIN_PRESENT. A surface is negotiated at create time and only its
 // PAGE-MULTIPLE size is actually mapped — the rest of the 64 KiB slot stays UNMAPPED (leaf 0), so
 // nothing beyond the negotiated surface is reachable from ring 3.
@@ -447,7 +447,7 @@ pub fn slot_cr3(s: usize) -> u64 {
 // WINX-1 — FB region accessors + lazy mapping.
 //
 // The KERNEL identity pointers below are how the compositor and the info-page writer touch these
-// bytes: the backing is `.bss`, so its address IS its physical address and its kernel VA. EL0 sees the
+// bytes: the backing is `.bss`, so its address IS its physical address and its kernel VA. Ring 3 sees the
 // same frames at `USER_BASE + offset` in its own address space, and only after the matching `map_*`
 // call. Nothing here reads or writes through the ring-3 VA.
 //
@@ -520,8 +520,8 @@ pub fn slot_fb_win_surface_ptr(s: usize, w: usize) -> *mut u8 {
     unsafe { slot_backing_ptr(s).add(FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE) }
 }
 
-/// WINX-1: the EL0 VA of window surface slot `w`. The SAME VA in every process slot; the FRAME differs
-/// per process (its own backing), installed by `map_slot_fb_win`. This is the VA an EL0 program
+/// WINX-1: the ring-3 VA of window surface slot `w`. The SAME VA in every process slot; the FRAME differs
+/// per process (its own backing), installed by `map_slot_fb_win`. This is the VA a ring-3 program
 /// computes as `its own window base + 0x5000 + w * 0x10000`.
 pub fn fb_win_surface_va(w: usize) -> u64 {
     debug_assert!(w < FB_WIN_SLOTS);
@@ -530,7 +530,7 @@ pub fn fb_win_surface_va(w: usize) -> u64 {
 
 /// WINX-1: install one leaf of slot `s`'s FB region at byte offset `off` from the window base.
 /// `writable` distinguishes the RW surface pages from the RO info page. Always NX — nothing in the FB
-/// region is code, and a surface EL0 could execute would be a W^X hole by construction.
+/// region is code, and a surface ring 3 could execute would be a W^X hole by construction.
 ///
 /// IDEMPOTENT by design (a re-create of the same region slot re-installs identical leaves). The `invlpg`
 /// is unconditional and cheap: mapping a previously-NOT-PRESENT leaf needs no shootdown on x86 (a
@@ -552,14 +552,14 @@ unsafe fn map_slot_fb_page(s: usize, off: usize, writable: bool) {
     }
 }
 
-/// WINX-1: map slot `s`'s RO info page (EL0 read-only — the kernel publishes geometry there and EL0
+/// WINX-1: map slot `s`'s RO info page (ring-3 read-only — the kernel publishes geometry there and ring-3
 /// must not be able to forge it; the kernel writes through the identity alias, never this leaf).
 /// Idempotent — every window create calls it.
 pub unsafe fn map_slot_fb_info(s: usize) {
     unsafe { map_slot_fb_page(s, FB_INFO_OFF, false) };
 }
 
-/// WINX-1: map exactly `pages` pages of slot `s`'s window surface slot `w` (EL0 RW, NX). Only the
+/// WINX-1: map exactly `pages` pages of slot `s`'s window surface slot `w` (ring-3 RW, NX). Only the
 /// NEGOTIATED page-multiple size is mapped; the rest of the 64 KiB VA slot stays unmapped, so a program
 /// that walks past its own surface takes a contained ring-3 fault instead of reading a neighbour window.
 pub unsafe fn map_slot_fb_win(s: usize, w: usize, pages: usize) {

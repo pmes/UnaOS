@@ -60,7 +60,7 @@ const SYS_WIN_PRESENT: u64 = 30;
 const SYS_THREAD_SPAWN: u64 = 21;
 const SYS_THREAD_EXIT: u64 = 22;
 const SYS_THREAD_JOIN: u64 = 23;
-// WINX-7: SYS_FUTEX(uaddr, op, val) -> op-specific / -errno — the EL0 wait/wake a userspace mutex or
+// WINX-7: SYS_FUTEX(uaddr, op, val) -> op-specific / -errno — the ring-3 wait/wake a userspace mutex or
 // frame barrier is built out of. `op`: 0 = WAIT (block iff `*uaddr == val`), 1 = WAKE (wake up to
 // `val` waiters; returns the count woken). 24/25 (`SYS_FB_MAP`/`SYS_FB_PRESENT`) stay reserved and
 // unimplemented on x86 — see the window-verb note above.
@@ -69,8 +69,8 @@ const SYS_FUTEX: u64 = 26;
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
 // WINX-7: SYS_INPUT_POLL() -> a packed input event (>= 0, bit 63 always clear) / -EAGAIN when the
-// caller's ring is empty. The delivery half of "an EL0 app can be interactive": the kernel holds a
-// small per-process ring, the router fills the FOCUSED process's ring, and EL0 drains its own
+// caller's ring is empty. The delivery half of "a ring-3 app can be interactive": the kernel holds a
+// small per-process ring, the router fills the FOCUSED process's ring, and ring 3 drains its own
 // nonblocking. 28 is unassigned on both arches.
 const SYS_INPUT_POLL: u64 = 27;
 // U4x: the process-model pair (same numbers as aarch64 U4). `sys_spawn` loads the fixed on-disk
@@ -1824,7 +1824,7 @@ unsafe extern "C" {
     static unaos_user_u11m2_unlink: u8;
 }
 
-// --- U6x owner/grants ring-3 fixtures (the aarch64 `el0-uowner-a`/`el0-uowner-b` twins): TWO EL0 programs in
+// --- U6x owner/grants ring-3 fixtures (the aarch64 `el0-uowner-a`/`el0-uowner-b` twins): TWO ring-3 programs in
 // ONE blob — process A (`u6gx-owner`) creates OWNED.BIN PRIVATE, and process B (`u6gx-grantee`, a DIFFERENT
 // address space) is denied by default, granted, exercised, then revoked. The launcher (`u6gx_launcher`)
 // choreographs them with a single GO word (launcher -> fixture: the next step the fixture may proceed to) and a
@@ -2524,7 +2524,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_WIN_CREATE => sys_win_create(a0, a1),
         SYS_WIN_PRESENT => sys_win_present(a0),
         // WINX-7: threads, futex and input, at their shared cross-arch numbers. Unconditional (no
-        // feature gate), for the same reason the process and window verbs are: they are core EL0
+        // feature gate), for the same reason the process and window verbs are: they are core ring-3
         // surface that a windowed application is written against, not an optional subsystem. A
         // program that never calls them pays nothing — an unused match arm is not a cost.
         //
@@ -2537,7 +2537,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_FUTEX => sys_futex(a0, a1, a2),
         SYS_INPUT_POLL => sys_input_poll(),
         // PULSE-1: the per-core load sample. Unconditional for the same reason the window verbs are —
-        // core EL0 surface a monitoring app is written against, backed by a sampler that is always
+        // core ring-3 surface a monitoring app is written against, backed by a sampler that is always
         // compiled.
         SYS_CPUPULSE => sys_cpupulse(a0),
         SYS_SPAWN => sys_spawn(),
@@ -2905,7 +2905,7 @@ fn copy_to_user(user_ptr: u64, src: &[u8]) -> Result<(), i64> {
 //
 // The x86 twins of aarch64's `sys_yield`/`sys_sleep_ms`/`sys_getinfo`, at the SHARED numbers, with the
 // same ring-3 contracts (yield/sleep return 0 unconditionally; getinfo returns 0 or `-EFAULT`). They
-// exist because a windowed EL0 app paces itself: `user-stat` calls `SYS_SLEEP_MS` once per frame and
+// exist because a windowed ring-3 app paces itself: `user-stat` calls `SYS_SLEEP_MS` once per frame and
 // `SYS_GETINFO` once at startup to learn the pid it paints, and neither had an x86 arm.
 //
 // ONE REAL ARCH DIVERGENCE, and it is a simplification. The aarch64 handlers must call `remask_irq()`
@@ -2970,7 +2970,7 @@ fn sys_getinfo(user_ptr: u64) -> i64 {
 //
 // The kernel already samples per-core busy/idle ticks for its own full-screen `pulse` monitor and the vug
 // corner meters (`vug::CpuPulse`). This verb exposes the SAME two accessors that sampler reads
-// (`sched::meter_cpu_count` / `meter_cpu_ticks` / `meter_current_cpu`) to EL0, so a WINDOWED pulse app can
+// (`sched::meter_cpu_count` / `meter_cpu_ticks` / `meter_current_cpu`) to ring 3, so a WINDOWED pulse app can
 // be a ring-3 program rather than a second in-kernel drawing loop. The kernel-side sampler is untouched by
 // this arc — there is exactly one place the counters are maintained, and this is a read of it.
 //
@@ -2992,7 +2992,7 @@ fn sys_getinfo(user_ptr: u64) -> i64 {
 /// PULSE-1: the ABI cap on cores `SYS_CPUPULSE` reports. Fixed, because it sizes a `#[repr(C)]` struct a
 /// ring-3 program declares from this document — it is ABI, not an implementation detail, and it is
 /// deliberately NOT read from `vug::MAX_METER_CPUS` (that constant is the in-kernel meter's scratch cap and
-/// is free to change without breaking a shipped EL0 binary). They happen to be equal today at 16.
+/// is free to change without breaking a shipped ring-3 binary). They happen to be equal today at 16.
 const PULSE_MAX_CPUS: usize = 16;
 
 /// PULSE-1: `SYS_CPUPULSE`'s payload. `#[repr(C)]` plain-old-data, no padding (all `u64`), so the byte
@@ -3067,7 +3067,7 @@ fn sys_sleep_ms(ms: u64) -> i64 {
 // caller other than `video/wcx.rs`'s kernel-drawn demo window.
 //
 // TWO INDICES, deliberately distinct (the aarch64 distinction, and it matters for the same reasons):
-//   * the WINDOW ID (0..WIN_MAX) — GLOBAL, what EL0 passes to the verbs;
+//   * the WINDOW ID (0..WIN_MAX) — GLOBAL, what ring 3 passes to the verbs;
 //   * the REGION SLOT (0..FB_WIN_SLOTS) — PER-ADDRESS-SPACE, which 64 KiB surface slot of the owner's
 //     own FB region backs it. Region slots are allocated lowest-first per slot, so a process's FIRST
 //     window always lands on region slot 0 — the VA (`base + 0x5000`) that `crates/user-stat` and
@@ -3157,8 +3157,8 @@ fn win_pages_for(w: u32, h: u32) -> Option<usize> {
 /// region slot. Layout of the page (all u32, little-endian) — the aarch64 layout, so one arch-neutral
 /// program parses both:
 ///   `[0x40 + r*0x20]` per region slot `r`: magic, win_id, w, h, stride, size, surface-offset-from-info-base.
-/// A region slot with no live window keeps a zeroed entry (magic 0), so EL0 can tell live from stale.
-/// Written through the KERNEL identity pointer — the EL0 alias of this page is read-only, which is the
+/// A region slot with no live window keeps a zeroed entry (magic 0), so ring 3 can tell live from stale.
+/// Written through the KERNEL identity pointer — the ring-3 alias of this page is read-only, which is the
 /// point: a program cannot forge the geometry the compositor was told about.
 ///
 /// The `[0x00..0x1C]` legacy ELF-3 header and the `[0x20]` process-flags word are aarch64-only (they
@@ -3194,7 +3194,7 @@ const FB_MAGIC: u32 = 0x4E49_5755;
 /// tumbles until it is killed).
 ///
 /// It is published in the RO info page's process-flags word rather than returned from a syscall so a
-/// program can read it once, cheaply, with no new verb — and it is read-only to EL0, so a program can
+/// program can read it once, cheaply, with no new verb — and it is read-only to ring 3, so a program can
 /// learn how it was launched but cannot claim to have been launched some other way.
 static SLOT_DETACHED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
     [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
@@ -3204,7 +3204,7 @@ static SLOT_DETACHED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
 const FB_FLAG_DETACHED: u32 = 1 << 0;
 
 /// WINX-7: publish slot `slot`'s process-flags word into its RO info page. Written through the KERNEL
-/// identity pointer — EL0's alias of this page is read-only — and called from `sys_win_create`, which
+/// identity pointer — ring 3's alias of this page is read-only — and called from `sys_win_create`, which
 /// is what maps the info page in the first place, so the word is present the moment a program can read
 /// it and never before.
 fn fb_info_write_flags(slot: usize) {
@@ -3277,7 +3277,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // with a stale `wm_id`. The surface pointer is the kernel's identity view of the leaves just mapped,
     // and `surf_len` is the REAL byte length of that mapped slot (`pages * 0x1000`, the page-multiple
     // this verb negotiated) — never a recomputed `h * stride`. That distinction is wm's F1 extent
-    // contract: `w`/`h`/`stride` are EL0-influenced, `pages` comes from the mapping code, and it is
+    // contract: `w`/`h`/`stride` are ring-3-influenced, `pages` comes from the mapping code, and it is
     // `surf_len` that bounds every source read the compositor performs.
     // CLICK-X86 — the compositor owner is `slot + 1`, the SAME `+1` bias `EL0_INPUT_ACTIVE` carries,
     // and for the same reason stated there: x86 slot 0 is a REAL address space, so an unbiased owner
@@ -3305,7 +3305,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // WINX-7: if NOBODY currently has input focus, the process that just opened a window gets it.
     //
     // This is the minimum viable focus POLICY, and it is deliberately the weakest one that makes an
-    // interactive EL0 app reachable at all. x86 has no focus-cycling key yet (the aarch64 WC-C TAB
+    // interactive ring-3 app reachable at all. x86 has no focus-cycling key yet (the aarch64 WC-C TAB
     // ring lives in that arch's router seam, which this arc does not have a twin of), so without some
     // rule a program launched with `bg` would create a window, poll `SYS_INPUT_POLL` forever, and
     // never receive a single event — indistinguishable from broken input.
@@ -3418,7 +3418,7 @@ mod wc_shim {
     ///
     /// A refusal is NOT an error for the syscall: the window still exists as far as this process is
     /// concerned (its surface is mapped and its own), it simply has no compositor row, so presents are
-    /// accounted and dropped. That is the fail-closed direction — nothing extra is exposed to EL0 — and
+    /// accounted and dropped. That is the fail-closed direction — nothing extra is exposed to ring 3 — and
     /// it keeps a headless run (no panel, `wm` never ready) from failing a program that only draws.
     /// CLICK-X86: `owner` is the `+1`-BIASED slot (`slot + 1`), matching `EL0_INPUT_ACTIVE`, so that
     /// `wm::hit_test`'s answer is directly comparable with the input focus and slot 0's windows are
@@ -3452,17 +3452,17 @@ mod wc_shim {
 }
 
 // =============================================================================================
-// WINX-7 — INPUT INTO EL0: `SYS_INPUT_POLL(27)`, the per-process input ring, the router seam, and
+// WINX-7 — INPUT INTO RING 3: `SYS_INPUT_POLL(27)`, the per-process input ring, the router seam, and
 // the focus registration. The x86 twin of aarch64's ELF-5.
 //
-// An interactive EL0 app needs keys and mouse. It already has a surface (`SYS_WIN_CREATE`), pacing
+// An interactive ring-3 app needs keys and mouse. It already has a surface (`SYS_WIN_CREATE`), pacing
 // (`SYS_SLEEP_MS`) and, as of this arc, threads and a futex; this is the delivery half.
 //
 // SHAPE. The kernel holds a small per-SLOT ring of packed events. The router — the shell's own event
 // drain, which is the single place every HID event on this arch passes through — offers each drained
 // event to `el0_input_route`, which forwards it into the FOCUSED process's ring or hands it back for
-// the shell to consume. EL0 drains its own ring nonblocking through `SYS_INPUT_POLL`. One producer
-// (the single router drain) and one consumer (the owning EL0 task) per ring, so the ring is a
+// the shell to consume. Ring 3 drains its own ring nonblocking through `SYS_INPUT_POLL`. One producer
+// (the single router drain) and one consumer (the owning ring-3 task) per ring, so the ring is a
 // lock-free SPSC: free-running head/tail, occupancy = `tail - head`.
 //
 // FOCUS GATING IS THE WHOLE SECURITY ARGUMENT, and it is why the ACTIVE slot is consulted on the
@@ -3482,7 +3482,7 @@ mod wc_shim {
 // =============================================================================================
 
 /// WINX-7 packed-event type tags (bits [55:48] of the packed u64). Shared with aarch64 by law, so one
-/// arch-neutral EL0 program decodes the same wire form on both.
+/// arch-neutral ring-3 program decodes the same wire form on both.
 const INPUT_EV_KEY_DOWN: u64 = 1; // a key PRESS   (payload[7:0] = ASCII / the C0 arrow codes)
 const INPUT_EV_KEY_UP: u64 = 2; // a key RELEASE (payload[7:0] = same)
 const INPUT_EV_MOUSE_REL: u64 = 3; // relative pointer motion  (payload[31:16] = dx, [15:0] = dy, i16)
@@ -3494,7 +3494,7 @@ const INPUT_EV_BUTTON: u64 = 5; // a pointer button state    (payload[7:0] = but
 const INPUT_RING_CAP: usize = 32;
 
 /// The per-process input rings, keyed by address-space SLOT. One producer (the router) + one consumer
-/// (the owning EL0 task) per ring => lock-free SPSC.
+/// (the owning ring-3 task) per ring => lock-free SPSC.
 static EL0_INPUT_BUF: [[AtomicU64; INPUT_RING_CAP]; crate::arch::memory::USER_SLOTS] =
     [const { [const { AtomicU64::new(0) }; INPUT_RING_CAP] }; crate::arch::memory::USER_SLOTS];
 /// Consumer index (free-running; advanced by `sys_input_poll`). Real slot = `head & (CAP - 1)`.
@@ -3504,7 +3504,7 @@ static EL0_INPUT_HEAD: [AtomicU32; crate::arch::memory::USER_SLOTS] =
 static EL0_INPUT_TAIL: [AtomicU32; crate::arch::memory::USER_SLOTS] =
     [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
 
-/// The slot currently designated to RECEIVE input, `+1`-BIASED: 0 means "no EL0 target — the shell
+/// The slot currently designated to RECEIVE input, `+1`-BIASED: 0 means "no ring-3 target — the shell
 /// owns the keyboard", and `s + 1` means slot `s` has focus.
 ///
 /// The bias is not cosmetic. aarch64 can use a bare ASID because ASID 0 is its shared/boot context
@@ -3541,12 +3541,12 @@ pub fn el0_input_stats() -> (u64, u64, u64) {
     )
 }
 
-/// Pack a `pal::Event` into the WINX-7 wire form, or `None` for an event that carries nothing an EL0
+/// Pack a `pal::Event` into the WINX-7 wire form, or `None` for an event that carries nothing a ring-3
 /// app can use (`Timer`/`None`/`Unknown` are kernel-internal pacing and non-events).
 ///
 /// BIT 63 IS ALWAYS CLEAR by construction — the type tag lives at [55:48] — which is what lets
 /// `sys_input_poll` hand the packed value straight back as a NON-NEGATIVE `i64` that is unambiguously
-/// distinguishable from `-EAGAIN`. EL0 tests `ev >> 63` and needs no separate out-parameter.
+/// distinguishable from `-EAGAIN`. Ring 3 tests `ev >> 63` and needs no separate out-parameter.
 fn pack_input(ev: crate::pal::Event) -> Option<u64> {
     use crate::pal::Event;
     let pack_xy = |x: i32, y: i32| -> u64 { ((x as i16 as u16 as u64) << 16) | (y as i16 as u16 as u64) };
@@ -3562,7 +3562,7 @@ fn pack_input(ev: crate::pal::Event) -> Option<u64> {
 }
 
 /// Push a pre-packed event into `slot`'s ring — the SPSC producer half. DROP-NEWEST on a full ring, so
-/// a backlog can never clobber an event the EL0 consumer has not read yet: an app that falls behind
+/// a backlog can never clobber an event the ring-3 consumer has not read yet: an app that falls behind
 /// loses the events it could not have handled anyway, rather than having its next read silently
 /// replaced by a later one (which would corrupt a press/release pairing). `slot` is validated by the
 /// caller. Returns whether the event was queued.
@@ -3583,8 +3583,8 @@ fn el0_input_push(slot: usize, packed: u64) -> bool {
 
 /// WINX-7 ROUTER SEAM (public, in-lane): offer one input event to the FOCUSED process's ring.
 ///
-/// Returns `true` if the event was queued for an EL0 app (the caller must NOT also give it to the
-/// shell), `false` if there is no focused EL0 target, the event carries nothing deliverable, or the
+/// Returns `true` if the event was queued for a ring-3 app (the caller must NOT also give it to the
+/// shell), `false` if there is no focused ring-3 target, the event carries nothing deliverable, or the
 /// target ring was full. Single producer: exactly one drain loop may call this.
 pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
     let active = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
@@ -3604,8 +3604,8 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
 /// WINX-7 ROUTER FOLD POINT (public, in-lane) — the ONE line the shell's event drain needs.
 ///
 /// Hands `ev` to [`el0_input_enqueue`] and reports the outcome AS AN EVENT, so a caller folds this in
-/// without restructuring its drain: the event comes back UNCHANGED when no EL0 app took it (the shell
-/// handles it exactly as before), and comes back as `Event::Unknown` when an EL0 ring consumed it.
+/// without restructuring its drain: the event comes back UNCHANGED when no ring-3 app took it (the shell
+/// handles it exactly as before), and comes back as `Event::Unknown` when a ring-3 ring consumed it.
 ///
 /// `Event::Unknown` and not `Event::None` — deliberately, and it is the whole reason this wrapper
 /// exists rather than a bare boolean. Every drain loop on this arch treats `Event::None` as
@@ -3764,7 +3764,7 @@ static CLICK_PRESSES: AtomicU64 = AtomicU64::new(0);
 static CLICK_DELIVERED: AtomicU64 = AtomicU64::new(0);
 
 /// CLICK-X86: `(presses, delivered)` — every press edge the router judged, and how many of them were
-/// addressed to an EL0 ring. The difference is the count of presses that belonged to the shell.
+/// addressed to a ring-3 ring. The difference is the count of presses that belonged to the shell.
 pub fn click_stats() -> (u64, u64) {
     (
         CLICK_PRESSES.load(Ordering::Acquire),
@@ -4143,7 +4143,7 @@ pub fn clickroute_selftest() {
 }
 
 // =============================================================================================
-// WINX-7 — EL0 THREADS: `SYS_THREAD_SPAWN(21)` / `SYS_THREAD_EXIT(22)` / `SYS_THREAD_JOIN(23)`.
+// WINX-7 — ring-3 THREADS: `SYS_THREAD_SPAWN(21)` / `SYS_THREAD_EXIT(22)` / `SYS_THREAD_JOIN(23)`.
 //
 // The syscall half; the lifetime machinery is `sched::spawn_user_thread` +
 // `sched::user_space_retain`/`user_space_release` (see the section header there for why teardown had
@@ -4160,7 +4160,7 @@ pub fn clickroute_selftest() {
 // that the tenant which spawned the thread is entirely gone — not idle, gone — and its row is dead.
 // =============================================================================================
 
-/// How many concurrently-tracked joinable EL0 threads the kernel holds handles for. A small fixed
+/// How many concurrently-tracked joinable ring-3 threads the kernel holds handles for. A small fixed
 /// pool (`user-vug` uses 2 per process); `-EAGAIN` when exhausted, after the scavenge below has had
 /// its chance. STOP tripwire: a deliberate cap, like `USER_SLOTS` — do not raise it for a demo.
 const NTHREAD: usize = 8;
@@ -4178,7 +4178,7 @@ struct ThreadRec {
     join: crate::arch::sched::JoinHandle,
 }
 
-/// The thread-handle table; the index IS the handle returned to EL0. A `SpinMutex` (not the per-slot
+/// The thread-handle table; the index IS the handle returned to ring 3. A `SpinMutex` (not the per-slot
 /// atomic sidecars the handle table uses) because a `JoinHandle` is a non-`Copy` owned value that
 /// `join` must MOVE out. The lock is held only for the claim or the take — NEVER across the blocking
 /// join, which would park a task holding a spinlock every other thread verb needs.
@@ -4305,7 +4305,7 @@ fn sys_thread_join(handle: u64) -> i64 {
     0
 }
 
-/// WINX-7: `SYS_THREAD_EXIT()` — terminate the calling EL0 thread. Never returns.
+/// WINX-7: `SYS_THREAD_EXIT()` — terminate the calling ring-3 thread. Never returns.
 ///
 /// `sched::exit()` does both halves: it posts this task's completion (waking a joiner) and drops its
 /// hold on the shared address space, which tears the slot down only if this was the LAST thread. A
@@ -4316,7 +4316,7 @@ fn sys_thread_exit() -> i64 {
     crate::arch::sched::exit() // diverges
 }
 
-/// The kernel-side name every EL0 worker thread carries. Fixed (not derived from the program) for the
+/// The kernel-side name every ring-3 worker thread carries. Fixed (not derived from the program) for the
 /// same reason a window title is: it appears on the wire and in the fault-kill log, so it must not be
 /// anything ring 3 chose.
 const EL0_THREAD_NAME: &str = "el0-thread";
@@ -4358,7 +4358,7 @@ pub fn thread_stats() -> (u64, u64, u64) {
 ///
 /// `-EAGAIN` for BOTH the mismatch and the pool-exhausted cases is the aarch64 twin's choice and is
 /// kept for wire compatibility: a correct futex user re-checks its condition and retries on `-EAGAIN`,
-/// which is the right behaviour under either cause, and merging them keeps one arch-neutral EL0 loop.
+/// which is the right behaviour under either cause, and merging them keeps one arch-neutral ring-3 loop.
 fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
     if uaddr & 3 != 0 || user_range_ok(uaddr, 4, UserAccess::Write).is_err() {
         return EFAULT;
@@ -5273,7 +5273,7 @@ fn sys_close(handle: u64) -> i64 {
 ///     (RO open) / a non-File kind / no handle / a revoked cap all -> `-EACCES` (delete is a mutation, gated by
 ///     the SAME single CAP_WRITE resolve as write), and a stale descriptor (`file_desc_validate`) -> `-EACCES`;
 ///   * SCAFFOLD GUARD — only a CREATED file is unlinkable this arc: an immutable STAGED file (HELLO.BIN is live
-///     EL0 code; SCRATCH.BIN/GROW.BIN are demo fixtures) has `FILE_CREATED == false` -> `-EACCES`, so ring 3 can
+///     ring-3 code; SCRATCH.BIN/GROW.BIN are demo fixtures) has `FILE_CREATED == false` -> `-EACCES`, so ring 3 can
 ///     never `0xE5` an immutable staged file;
 ///   * on success: CAPTURE the file's bytes + enqueue the on-disk delete (a `CreateGrowDelete` op — the fixture's
 ///     create/grow never persisted on x86, so the launcher create+grow+deletes to exercise `fat::delete_located`);
@@ -6348,7 +6348,7 @@ fn stage_hello() -> bool {
 // Arbitrary-runtime-file open awaits an interrupt-driven / IF-safe storage path (deferred).
 
 /// U9x: the DEDICATED writable scratch file the File-WRITE fixture opens + overwrites (NEVER `HELLO.BIN`,
-/// which other fixtures load as EL0 code). The wstage seed is ALWAYS the in-memory const (below) — present
+/// which other fixtures load as ring-3 code). The wstage seed is ALWAYS the in-memory const (below) — present
 /// regardless of disk, so the in-memory core is self-contained. M2 KEEPS that seed (it equals the on-disk
 /// plant byte-for-byte) and additionally, when a FAT volume is present, CAPTURES this file's on-disk chain head
 /// (the launcher pre-flight -> `SCRATCH_CLUSTER`) so a dirty write is flushed to disk at teardown; the launcher
@@ -6427,7 +6427,7 @@ const DYN_FILE_MAX: usize = 64 * 1024;
 const U10C_NAME: &str = "FRESH.BIN";
 const U10D_NAME: &str = "DELME.BIN";
 /// U11x M2: the cross-process defer demo's runtime-created file (created by the launcher on a scratch row, opened
-/// + unlinked by the EL0 fixture from ITS row — the pi4 `DEFER.BIN` twin). Absent from the staged set.
+/// + unlinked by the ring-3 fixture from ITS row — the pi4 `DEFER.BIN` twin). Absent from the staged set.
 const U11M2_NAME: &str = "DEFER.BIN";
 /// U11x M2: the 16-byte pattern the launcher writes into DEFER.BIN (the fixture read-verifies the first 8 bytes;
 /// the `.ascii` in the fixture MUST match). 16 chars. The pi4 twin's `U11_DEFER_PATTERN`.
@@ -6488,7 +6488,7 @@ fn staged_lookup(name: &str) -> Option<(u32, u32)> {
 
 /// U9x M2: the on-disk FAT chain head for a staged file — the flush target a RW `sys_open` records into its
 /// descriptor's `FILE_CLUSTER`. Only SCRATCH.BIN (index 1) is ever opened writable and flushed; its cluster is
-/// captured by the launcher pre-flight into `SCRATCH_CLUSTER`. HELLO.BIN (index 0) is read-only EL0 code — never
+/// captured by the launcher pre-flight into `SCRATCH_CLUSTER`. HELLO.BIN (index 0) is read-only ring-3 code — never
 /// written, so it has no flush target (`0`). `0` also means "no disk backing" (no FAT / not yet captured), which
 /// drops a write to the M1 in-memory path (no flush). A future writable staged file adds its own arm here.
 fn staged_cluster(idx: u32) -> u32 {
@@ -6586,7 +6586,7 @@ static FILE_GREW: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
     [const { [const { AtomicBool::new(false) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
 /// U10 M2/M3: the descriptor names a runtime-CREATED file (O_CREAT of a name absent from the staged set), not a
 /// staged-backed one. Routes teardown to a `CreateGrow` deferred op (create the dir entry + grow-from-empty on
-/// disk). ALSO the ONLY thing that admits `sys_unlink` (a staged/immutable file — e.g. HELLO.BIN EL0 code — has
+/// disk). ALSO the ONLY thing that admits `sys_unlink` (a staged/immutable file — e.g. HELLO.BIN ring-3 code — has
 /// `FILE_CREATED == false` and is refused with `-EACCES`), so it MUST reset on slot reuse or a recycled slot
 /// would let an unrelated staged RW open be unlinked. Reset on every alloc/free/teardown. Where `FILE_USED`.
 static FILE_CREATED: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
@@ -8141,7 +8141,7 @@ fn dyn_name_get(row: usize, idx: usize, out: &mut [u8; MAX_NAME]) -> usize {
 /// boot even though the CONTENT may now change. This IS a deliberate widening: any ring-3 task with `sys_open`
 /// can now overwrite any genuinely-arbitrary (non-staged, non-U10) on-disk file. It is bounded three ways:
 /// (1) MF2 stays closed by EXCLUSION — `sys_open_dynamic` canonicalizes to 8.3 UPPERCASE and drops every staged
-/// name (HELLO.BIN EL0 code) and every U10 owned/created name in ANY casing BEFORE this path, so a writable
+/// name (HELLO.BIN ring-3 code) and every U10 owned/created name in ANY casing BEFORE this path, so a writable
 /// dynamic descriptor can only name a file that is neither code nor ownable; (2) the ACL surface is unchanged —
 /// a dynamic on-disk file has no U10 name-id, so it can never enter `OWNED_FILES` and is PUBLIC-by-default for
 /// writes exactly as S7 made it for reads (invariant 5: mirror created-file policy, don't invent new policy);
@@ -8240,7 +8240,7 @@ fn sys_open_staged(row: usize, sidx: u32, size: u32, mode: u64) -> i64 {
     //    content, so a read before any write sees the original bytes), then a descriptor, then a handle. RO
     //    (bit0 clear) keeps the U6bx read-only path: no writable slot, `CAP_READ` only.
     let rw = mode & 1 != 0;
-    // STOR-1 review (MF2): HELLO.BIN (staged index 0) is IMMUTABLE EL0 CODE — the program image the U2
+    // STOR-1 review (MF2): HELLO.BIN (staged index 0) is IMMUTABLE ring-3 CODE — the program image the U2
     // loader ran and `sys_spawn` re-instantiates. Model it read-only AT THE SOURCE: refuse a writable
     // open. This is the ROOT-CAUSE close for the S3 live write-through — which resolves the target BY
     // NAME (`find_located` + `write_at`) and would otherwise overwrite the boot-critical executable on
@@ -11346,7 +11346,7 @@ fn u8_kernel_check() -> bool {
 }
 
 // =============================================================================================
-// WINX-2 — the EL0 PROGRAM LIFECYCLE: `run` (synchronous) and `bg` (detached) on x86.
+// WINX-2 — the ring-3 PROGRAM LIFECYCLE: `run` (synchronous) and `bg` (detached) on x86.
 //
 // The x86 twins of aarch64's EXEC-1 `run_user_image` and BGRUN-1 `spawn_user_image_bg` / `bg_poll` /
 // `bg_kill`, with the same operator-visible contracts. `shell.rs` calls these through
@@ -11553,7 +11553,7 @@ pub fn run_user_image(
     Ok((RunOutcome::Timeout, mapped.entry))
 }
 
-/// WINX-2: load an EL0 image and spawn it WITHOUT waiting — the shell's `bg <path>` entry. Returns
+/// WINX-2: load a ring-3 image and spawn it WITHOUT waiting — the shell's `bg <path>` entry. Returns
 /// `(pid, slot, entry)`; the caller records the pid and reaps it later via [`bg_poll`], or stops it with
 /// [`bg_kill`]. Mirrors `run_user_image`'s front half exactly and diverges only in not waiting.
 ///
@@ -11690,11 +11690,11 @@ pub fn bg_kill(pid: u64, _slot: u64) -> &'static str {
 }
 
 // =============================================================================================
-// WINX-1: the ring-3 WINDOW fixture + its launcher. The x86 proof that an EL0 program can put a window
+// WINX-1: the ring-3 WINDOW fixture + its launcher. The x86 proof that a ring-3 program can put a window
 // on the compositor and present into it — the first one that ever could.
 //
 // It is an INLINE, position-independent blob (the sock2/u9x/u11x idiom — NOT an on-disk ELF), because
-// x86 has no EL0 ELF loader yet: `run_user_image`/`spawn_user_image_bg` and the `run`/`bg` shell verbs
+// x86 has no ring-3 ELF loader yet: `run_user_image`/`spawn_user_image_bg` and the `run`/`bg` shell verbs
 // are `#[cfg(feature = "baremetal")]`, i.e. aarch64 Pi-4-only, and building that loader is its own arc.
 // The inline blob proves the SYSCALL SURFACE and the compositor binding, which is what this arc owes;
 // running `crates/user-stat`'s actual ELF on x86 is the next arc's deliverable, and it will exercise
@@ -11757,7 +11757,7 @@ unaos_user_winx:
     mov rcx, 16384
     rep stosd
 
-    // (3) Read the pattern back through the same mapping: proves the leaves really are EL0-RW and
+    // (3) Read the pattern back through the same mapping: proves the leaves really are ring-3-RW and
     //     really are this process's own frames, not a stale or shared one.
     cmp dword ptr [r14], 0xFF20C0FF
     jne 2f
@@ -15559,7 +15559,7 @@ fn u11x_build() -> Option<U7xFix> {
 /// mint its `(gen, idx)` file-id; free it (bumping the gen); then RE-claim the SAME slot (first-fit) for a
 /// "different file" — and prove the OLD file-id is now rejected by `file_desc_validate` (a generation mismatch)
 /// EVEN THOUGH the slot is live again (`FILE_USED` true), while a FRESH file-id minted against the reused slot
-/// resolves. That is exactly "no silent rebind on slot reuse", isolated from disk/EL0 timing. Leaves the row clean
+/// resolves. That is exactly "no silent rebind on slot reuse", isolated from disk/ring-3 timing. Leaves the row clean
 /// (no descriptor leaked). The aarch64 `u11_check_gen_rebind` twin (x86 `files_alloc`/`row` shape).
 fn u11x_check_gen_rebind() -> bool {
     const A: usize = 6; // scratch private row (clear here — every fixture has torn down; u9x used row 5)
@@ -15640,7 +15640,7 @@ fn u11x_launcher(demo_cpu: usize) {
     }
     let cleared = files_row_is_clear(fix.slot) && handle_row_is_clear(fix.slot);
 
-    // Kernel-side mechanistic proof of the gen-tag (isolated from EL0 timing) — runs AFTER teardown so nothing
+    // Kernel-side mechanistic proof of the gen-tag (isolated from ring-3 timing) — runs AFTER teardown so nothing
     // else touches the scratch row.
     let gen_ok = u11x_check_gen_rebind();
 
@@ -15685,7 +15685,7 @@ fn u11m2_build() -> Option<U7xFix> {
 }
 
 /// One U11x M2 phase: the launcher plays "process S" on the held scratch row `srow` — CREATE DEFER.BIN through
-/// the PRODUCT open path (`open_create_new`), write the pattern into its wstage, then spawn the EL0
+/// the PRODUCT open path (`open_create_new`), write the pattern into its wstage, then spawn the ring-3
 /// `u11m2-unlink` fixture (its OWN slot/row — the allocator cannot hand it `srow`, which is held) to open the
 /// file CROSS-PROCESS and unlink it. After the fixture exits + tears down, prove the DEFER (C1): the delete op
 /// is still HELD (disk mode), the file is unlink-PENDING at refcount 1 (only `srow`'s open left), the name is
@@ -15944,12 +15944,12 @@ fn s5_witness_run(r1: usize, r2: usize, nameid: usize) -> Option<bool> {
 /// all three wstage slots are free; it peaks at two and releases before the phases). REUSES DEFER.BIN — no new U10
 /// name, so ZERO knob-off footprint. Requires knob-on + FAT + service (created reads route live); SKIPS SILENTLY
 /// otherwise (no serial line — the DONE gate's `test 40` knob-on stays 18 PASS + MISSION + bx-blockreq). The
-/// u11m2 / u6gx EL0 fixtures supply the production-faithful DISPATCH proof (a real SYS_READ of a cross-process
+/// u11m2 / u6gx ring-3 fixtures supply the production-faithful DISPATCH proof (a real SYS_READ of a cross-process
 /// sibling returns the correct pattern from an EMPTY-wstage sibling -> the read can only be live). Every leg tears
 /// the scratch rows down via the real teardown funnel (decrefs OPENF[DEFER] to 0) + deletes the on-disk file +
 /// asserts the name is left idle — never a force-store of OPENF/DYN_DELETED_G, never a stranded slot/refcount.
 /// STOR-1 S6 carry-over (seat fold-in 1): witness MF2 — a WRITABLE open of HELLO.BIN (staged index 0, immutable
-/// EL0 code) is refused `-EACCES`. Kernel-side: resolve HELLO.BIN's staged index, then drive a RW open through the
+/// ring-3 code) is refused `-EACCES`. Kernel-side: resolve HELLO.BIN's staged index, then drive a RW open through the
 /// REAL staged-open guard (`sys_open_staged`) on a scratch PRIVATE row. A private row proves MF2 in ISOLATION —
 /// NOT SHARED_ROW (whose own RW refusal would mask MF2; MF2 is checked FIRST, so this is faithful). Uncounted idiom
 /// (no ` PASS`/`FAIL ::`). Gated on the knob-on FAT path (bench media is knob-on and HELLO.BIN is staged there);
@@ -16110,7 +16110,7 @@ fn s7_openany_witness() {
 /// distinct 16-byte pattern at offset 8; `submit_read_file` reads it back == pattern; then it RESTORES the 0xA5
 /// seed bytes and re-verifies — so the image/card is left pristine and the witness is IDEMPOTENT across boots +
 /// power-cuts (it never depends on prior content). Negative leg: `sys_open_dynamic(.., "hello.bin", 1)` — a
-/// case-variant of staged EL0 code — MUST be refused `< 0` (the MF2-under-S8 regression lock). (STOR-1 S9
+/// case-variant of staged ring-3 code — MUST be refused `< 0` (the MF2-under-S8 regression lock). (STOR-1 S9
 /// retired the former past-EOF-returns-0 leg: a past-EOF write now GROWS, witnessed by `s9_grow_witness` on a
 /// throwaway file — S8W.BIN must NOT be grown here or it would lose idempotency. This witness is now purely
 /// in-EOF overwrite.) Gated on the knob-on FAT path; SILENT skip otherwise (no serial line — knob-off / no-FAT
@@ -16176,7 +16176,7 @@ fn s8_write_witness() {
             }
         }
     }
-    // (a) MF2-UNDER-S8 regression lock: a case-variant of staged EL0 code ("hello.bin") RW MUST be refused — the
+    // (a) MF2-UNDER-S8 regression lock: a case-variant of staged ring-3 code ("hello.bin") RW MUST be refused — the
     // canonicalize-to-UPPERCASE exclusion drops it before any disk resolution. Must be `< 0` (installs nothing).
     let deny = sys_open_dynamic(r, "hello.bin", 1);
     let excl_ok = deny < 0;
@@ -16214,7 +16214,7 @@ fn s8_write_witness() {
 /// refused `-ENOSPC` (the cap fires BEFORE any user deref, so the buf is never touched, exactly as S8's eof-zero
 /// leg). The PER-WRITE page cap is a short-count clamp verified by review (like S8's user-pointer clamp NOTE — no
 /// user memory is mappable from the launcher context to drive it). Refusal leg: `sys_open_dynamic("hello.bin", 1)`
-/// — staged EL0 code — MUST still be refused `< 0` (the MF2-under-S8/S9 lock is untouched). Gated on the knob-on
+/// — staged ring-3 code — MUST still be refused `< 0` (the MF2-under-S8/S9 lock is untouched). Gated on the knob-on
 /// FAT path; SILENT skip otherwise. Tears the scratch row down through the real funnel + deletes S9G.BIN.
 #[cfg(feature = "irqstorage")]
 fn s9_grow_witness() {
@@ -16281,7 +16281,7 @@ fn s9_grow_witness() {
             }
         }
     }
-    // Refusal leg: a case-variant of staged EL0 code ("hello.bin") RW MUST still be refused (MF2 lock intact).
+    // Refusal leg: a case-variant of staged ring-3 code ("hello.bin") RW MUST still be refused (MF2 lock intact).
     let deny = sys_open_dynamic(r, "hello.bin", 1);
     let excl_ok = deny < 0;
     // Teardown: release the scratch row through the real funnel, THEN delete the on-disk file (idempotent cleanup).
@@ -16580,7 +16580,7 @@ fn u6gx_wait_sig(slot: usize, step: u64) -> bool {
 /// U6x launcher + verdict — UnaFS owner/grants, the x86 twin of the reviewed aarch64 U6 (owned-by-default at
 /// SYS_OPEN + SYS_FGRANT delegation + F1 owner-only unlink), folding pi4's post-hoc F1 fix from the start and
 /// asserting the U11x M2 combined path (owner unlink while a grantee holds open -> deferred; re-create -EBUSY;
-/// ownership dies at the last close). Two EL0 processes A (owner) + B (grantee) on their own cores (cooperative
+/// ownership dies at the last close). Two ring-3 processes A (owner) + B (grantee) on their own cores (cooperative
 /// ring 3 hogs its core, so — like U7x — each needs a dedicated AP; the launcher on a third), choreographed with
 /// per-slot GO/SIG words. Chained off `u11m2_launcher` (LAST in the demo chain). Needs 3 online APs + storage;
 /// fewer skips cleanly. Every path releases both slots + B's Proc entry before returning (no strand).
