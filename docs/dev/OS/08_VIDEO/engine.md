@@ -6349,7 +6349,51 @@ unreachable, `bands[i]` is always `None`, `damaged_box` returns `outer_box`, `dr
   has exactly one caller, `drivers/gpu/kepler_display.rs`, inside the Kepler takeover, for which QEMU
   has no part. A QEMU run of this path would be vacuous. **Metal is the only verdict.**
 
-### ⚠ `[wc-h]` cannot fire on x86 in this tree — the arc's own evidence line is missing
+### ✅ METAL VERDICT (rMBP boot s69, 2026-08-03, trunk `2bdae79b`) — it works, and the log carries its own control
+
+```
+[wc-h] win=3 box=66x78   bytes=20592    compose_us=7   present_us=131  rectscan_us=722  torn=no  -> BUFFERED
+[wc-h] rollup win=3 scope=window samples=4 torn=0 declines=0 fixture=0 maxpresent_us=131  frame_us=16667 -> TEAR-FREE
+
+[wc-h] win=2 box=770x526 bytes=1620080 compose_us=135 present_us=9743 rectscan_us=4870 torn=yes -> BUFFERED
+[wc-h] rollup win=2 scope=window samples=4 torn=4 declines=0 fixture=0 maxpresent_us=9859 frame_us=16667 -> AT-RISK
+```
+
+`win=3` is the banded console window; `win=2` is an unbanded window **in the same boot**, which is
+what the console looked like before this arc. That makes the comparison an internal control rather
+than a cross-boot claim: **20,592 bytes vs 1,620,080, and 131 µs vs 9,743 µs** — the console present
+now costs well under 1 % of a 16.7 ms frame budget where the unbanded window costs 58 % of one.
+
+Against the origin's motivating numbers (3.9 MB and ~24 ms per printed line, `torn=yes` on 3 of 4
+samples): both are down roughly two orders of magnitude, and the tearing verdict moved from
+`torn=yes` to `torn=0 -> TEAR-FREE`.
+
+Companion results from the same boot: `WINX-8` went `presents=1 … FAIL` → `3 presents … -> PASS`
+(the U4y user-RSP fix, see `docs/SECURITY.md`), and WC-BBSYNC printed **both** halves of its paired
+witness — `ARMED` at activation and `backbuffer resync 2880x1800` from `Screen::new`. One half alone
+would have meant a latch armed but never consumed.
+
+### The instrument had to be widened first — recorded because the arc was briefly unverifiable
+
+The 3.9 MB / ~24 ms / `torn=yes` numbers that motivate this arc came from `[wc-h] win=1`, and on the
+merged trunk **that instrument was unreachable on x86**. The R23 merge took the Pi's compositor as the
+`wm.rs` baseline, which arch-gated every WC-H producer: `wcg::stage_note`, `wcg::stage_flush` and the
+`decline!` macro's `wcg::stage_decline` were all `#[cfg(all(target_arch = "aarch64", feature =
+"witness"))]` here, where the pre-merge x86 tip had them at plain `#[cfg(feature = "witness")]`. So
+for a few hours FBCON-DMG was implemented on x86 and **completely unobservable** there — no wire line
+distinguished a banded present from a whole-box one.
+
+22 `wcg::` call sites were widened to plain `witness`, restoring `f9cbf59a`'s intent. `[wc-h]`/
+`[wc-g]`/`[wc-k]` went 0/0/0 → 3/2/5 in the x86 image, **identical to the aarch64 witness image**,
+which is the cross-check that both arches now carry the same instrument set. aarch64 byte-identity
+was held through the change (`llvm-objcopy -O binary`, not an ELF diff).
+
+⚠ **Trap worth keeping:** the first cut of that widening broke aarch64 byte-identity by 8 bytes at
+24-byte stride — the `core::panic::Location` array — because three added **comment** lines shifted
+source line numbers, which are baked into `.rodata` and not merely into DWARF. Every hunk had to be
+rewritten line-count-neutral. A comment is enough to break this check.
+
+### (superseded) `[wc-h]` cannot fire on x86 in this tree
 
 The 3.9 MB / ~24 ms / `torn=yes` numbers that motivate this arc came from `[wc-h] win=1`, and on the
 merged trunk **that instrument is unreachable on x86**. The R23 merge took the Pi's compositor as the
