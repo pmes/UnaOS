@@ -5100,6 +5100,18 @@ and it refuses to claim anything on an unsound submit or a zero-sample wait.
 | **`executed` = 1** (store-verified, or frame-closed, or consumed) | **THE CT0/CT1 CLASS LAW IS CONFIRMED EXECUTABLE.** The exact list bytes that held `CT0CA` at `QBA` and never advanced were fetched, stepped and closed by CT1 from the same address with the same publishes and the same submit shape. The law stops being an inference from a freeze and becomes a working path; the driver fix is **specified rather than proposed** |
 | **`executed` = 0** (CT1 froze too) | **The class law STANDS on boot12's CT0 evidence, which does not depend on this kick** — op 126 and op 121 still froze CT0 where bin-class op 119 advanced, and M3 still retires this same list on CT1 every boot. What it says instead is that **CT1 arming needs its own bracket**, because something about *this* kick differs from `clear_job`'s and it is not the list, the address, the publishes or the submit shape — all four are held fixed by construction. **The named differences, in order:** (1) **position** — this is a *second* CT1 kick on a boot where M3 already ran one to completion, so CT1 may carry end-of-frame state `clear_job` never sees, the exact mirror of the §49.3 confound that started this ladder; (2) the intervening L2T/SLC cache traffic and poison writes this rung makes between M3 and the GO; (3) frame-count state, `RFC` having already advanced once. Take them in that order — **position first**, by moving the kick ahead of M3 exactly as R1 moved the CT0 kick ahead of `probe_job` |
 
+**METAL VERDICT — boot13, 2026-08-03, capture `pi4-r23s1x` (mark "R23 boot13"): THE EXECUTED
+BRANCH FIRED.** `[v3d89] rclct1 verdict — store-verified=1 consumed=1 frame-closed=1 executed=1 |
+RFC 0x1→0x2 (Δ1) | FRDONE=1 | mmu-fault-latched=0` — the exact bytes that froze CT0 in boot12
+were fetched, stepped and closed by CT1, a RENDER frame retired (`RFC` advanced for the first
+time under this driver's own kick), the seeded target store byte-verified, and the bin-output
+negative controls stayed fully intact (poison 64/64 + 8192/8192). The class law is a working
+path; PI-V3D-90 below is unblocked. One instrument follow-up from the same wire: `[v3d56]
+landing` reported `STRAY=4` (arena pages 0–3 changed) — its region map predates this variant and
+carries no RENDER-TARGET region, while the byte-verified store proves the target legitimately
+wrote; teach the landing witness the render-target region (and derive the pages from the arena
+layout) before reading any future STRAY off an rclct1-class boot as displacement.
+
 **Scope — the production path is deliberately NOT rewired in this arc.** `rclct1` is the
 proof-of-law, and it is one variant in an experiment harness. Nothing in the compositor, in
 `triangle_job` or in `kick_bin_render` is touched. That is not an omission; a proof and a rewire are
