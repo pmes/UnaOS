@@ -1,88 +1,76 @@
-# WHITE BOARD — GR14, 2026-08-03
+# WHITE BOARD — GR14 close, 2026-08-03
 
 **This is a whiteboard, not a record.** Wiped and rewritten whenever it changes. It carries one
-thing: **what Peter needs to know or decide, right now.** Durable facts live in the baton; per-boot
-status lives in `~/unaos-bench/PLAYBOOK-x86.md`.
+thing: **what Peter needs to know or decide, right now.** Durable facts live in the baton
+(`~/.claude/plans/unaos/active/unaos-gemini-coord-baton.md`); per-boot status lives in
+`~/unaos-bench/PLAYBOOK-x86.md`.
 
 ---
 
-# OPEN — nothing needs a decision
+# OPEN — nothing
 
-No blocking questions. Two jobs in flight, both dispatched, neither needs input.
-
----
-
-# THE FIND OF THE DAY — a kernel bug, not a program bug
-
-The SYSCALL stub saves the ring-3 stack pointer into a **per-CPU** slot
-(`PerCpuData::syscall_user_rsp`). `USER_RSP_OFFSET` is referenced in exactly one place and the
-field has **no setter anywhere**; the scheduler's dispatch site installs CR3, `TSS.RSP0` and
-`syscall_kernel_rsp` per task and not the user twin.
-
-Any task that blocks *inside* a syscall — `SYS_YIELD` context-switches from within one, futex wait
-likewise — leaves its user RSP in the shared slot, and the next task to `sysret` on that core runs
-**on another task's stack**.
-
-Caught on metal (s68): VUG's worker and parent aliased at `0x10(%rsp)`; a 32-bit `movl $0x0` in the
-parent zeroed the low half of the worker's saved surface pointer — `USER_BASE+0x5000` → `USER_BASE`
-exactly — and the worker wrote to its own read-only code page.
-
-**How well it hid is the lesson.** It presented as a graphics bug in `render_band`, and the first
-two hypotheses dispatched were both about the program. The only reason the corrupted value landed
-on a recognisable constant instead of junk is that the aliasing store happened to be 32-bit.
-
-Fox audited the aarch64 twin: **not present.** `__vec_svc` banks SP_EL0 onto the task's own kernel
-stack, and its comment names this exact hazard as the reason. They hit the class at M6e and fixed
-it structurally. The x86 fix converges on their design — `percpu.rs:46` currently calls the slot a
-"scratch slot", which is the wrong mental model and is arguably why it survived.
+Trunk `f43b70ce`, everything pushed, both arches green under the full knob set. No blocked work,
+no owed relays, no open tripwires. The arc closed on metal.
 
 ---
 
-# LANDED TODAY
+# → GR15 — THE PICKUP
 
-**Merge closed.** Condition A met on both rigs at `bfa2c174`; trunk unified.
+## What is true right now
 
-**Storage — S7 passes on metal for the first time ever**, and U10/U10c/U10d now run their real FAT
-write-back leg. They had been "passing" in a silent in-memory fallback with no disk proof, because
-the metal DATA volume never staged the fixtures the QEMU image did. Five fixtures now planted by
-the builder, contents cross-checked against the witness constants.
+- **The x86 video re-land is DONE and metal-proven** (boot s69). M1 witness repair, M2 WC-BBSYNC,
+  M3 damage-band substrate, M4 the banded present, plus the witness widening that made any of it
+  observable on this arch.
+- **U4y is fixed and confirmed** — the SYSCALL stub was parking the ring-3 stack pointer in a
+  per-CPU slot, so two ring-3 tasks sharing a core ran on the same user stack whenever either
+  blocked inside a syscall. Ledgered in `docs/SECURITY.md`.
+- **Storage is real on metal for the first time.** S7 passes at all; U9x/U10 run their genuine FAT
+  write-back leg instead of a silent in-memory fallback.
+- The bench is armed and the card is a valid boot vehicle (`2bdae79b`, one docs commit behind).
 
-**The sysret scrub, twice.** The kernel zeroes six GPRs on return to ring 3; the stubs declared
-some of them. The first fix declared `r8/r9/r10` and left `rdi/rsi/rdx` open in the low-arity
-stubs — its own commit message overclaimed, and it crashed metal. Now complete and proven by
-disassembly, not assertion.
+## Where the next arc starts — and it is already measured
 
-**Video re-land: M1, M2, M3 in.** Witness build repaired (trunk could not compile x86 under
-`witness` at all). WC-BBSYNC re-landed — the `resync ABSENT` line is gone. FBCON-DMG substrate
-landed behaviour-inert. **M4 (the banded present) is the last piece and is in flight.**
+Boot s69, both windows in the same boot, so this is an internal control rather than a claim:
 
-**Vocabulary.** ARM privilege terms out of x86 and arch-neutral files; `el0_input_*` →
-`user_input_*` on both arches; `bg-el0` → `bg-user`. The one wire string a live gate matched was
-changed with its spec lines in the same commit, and Fox boot-proved it: 91/91, 0 forbidden.
+```
+win=3 (banded console) bytes=20592    present_us=131   torn=no  -> TEAR-FREE
+win=2 (UNBANDED)       bytes=1620080  present_us=9743  torn=yes -> AT-RISK
+```
+
+**`win=2` is the next arc.** 9.7 ms is 58 % of a frame budget and it tears on 4 of 4 samples. The
+banding machinery already exists and is proven; this applies it to a second consumer, and the same
+instrument can measure before and after.
+
+Three smaller items behind it, in the baton's MENU: `comp2_emit`/WC-L still aarch64-narrow
+(deliberate — widening `comp2_emit` drags COMPOSITE-2's whole ledger with it); `bg`-launched VUG
+has never run its real path on x86 (the `[0x20]` flags word is aarch64-only, so `detached` always
+reads false and every `bg` VUG takes the 300-frame cap); and `./arroyo check` never compiles the
+`user-*` crates at all, so it is vacuous for any userspace change.
+
+## How Peter wants to be worked with
+
+- **He pushes. The seat never does** — and never reports a push as owed without a `git fetch` in
+  that same turn. He pushes between turns; a stale list wastes a round-trip every time.
+- **Coordinate, don't type.** Plan the work and run executors in parallel on non-overlapping files.
+  Hand-editing code while he waits is the wrong shape.
+- **Never instruct him on his own bench.** Report media state and what was verified; stop there.
+- **Metal is the verdict**, `strings` is the artifact, and the banner is neither.
+- Kepler and iGPU belong to Gemini's lane. Build knobs are fine; the driver files are not.
 
 ---
 
 # THE PATTERN WORTH KEEPING
 
-Six instruments this session looked authoritative and could not fail:
+Seven instruments this session looked authoritative and could not fail: a waker reported armed that
+was never started; one that fired on every idle line; a `strings` probe reading 0 because the tool
+was absent; a count reading registers by line; a `pid=` echo for a command that failed with
+permission denied; Fox's `cbw_fault=0` with `n=0`; and U9x/U10 "passing" in a fallback mode.
 
-- a waker reported armed that was never started, then one that fired on every idle line
-- a `strings` probe reading 0 because the tool was absent, and a second counting lines not registers
-- a `pid=` echo for a command that failed with permission denied
-- `cbw_fault=0` on the Pi with `n=0` — a counter that never counted (Fox's, same class)
-- U9x/U10 "passing" in a fallback mode with no disk write-back
-- byte-identity between two kernels, confounded entirely by an 8-char git-sha stamp
+**A probe that cannot read zero proves nothing.** Every check now carries a positive and a negative
+control, and the evidence ladder is explicit: a green banner says it compiled, `strings` says it is
+present, an executed witness on metal says it ran — claim the highest rung you actually reached.
 
-**The rule that came out of it:** a probe that cannot read zero proves nothing. Every check now
-carries a positive AND a negative control, and a green banner is not evidence the code is
-reachable — `strings` shows it is present, an executed witness on metal shows it runs.
-
----
-
-# STANDING
-
-- The card predates M2/M3 and both fixes. The next metal round wants a fresh build.
-- 21 `wcg::` call sites in `wm.rs` are still aarch64-gated, so `[wc-k]` compiles on x86 and can
-  never fire. Known, queued, real-risk against Pi semantics.
-- On x86 a `bg`-launched VUG always reads `detached=false` (the `[0x20]` flags word is aarch64-only
-  and stays zeroed here), so it takes the 300-frame cap — that path has never been exercised.
+Two verification traps from today, both of which nearly inverted a verdict: two boots share one
+capture file, so confirm a fix by "nothing after the boundary" and never by a whole-file grep; and
+the saved `UNAOS.LOG` files are all 66048 bytes because the kernel reserves that size, so only the
+hash tells them apart.
