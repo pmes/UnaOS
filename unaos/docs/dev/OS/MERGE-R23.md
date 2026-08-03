@@ -49,8 +49,15 @@ extended by that seat.
   **Residual open, pi seat's:** the awaited-CBW architecture is unverified on Pi silicon — every pi
   `cbw_fault=0` in the archive reads `n=0 storage_slot=0` and is vacuous. Discriminator: a pi metal
   boot with `storage_slot != 0` and BOT traffic to `n > 0`, SUMMARY captured.
-- kernel8 cross-commit byte-identity is NOT currently a valid instrument (1410-byte diff on an
-  x86-confined source change; clean-dirs reproducibility discriminator queued).
+- kernel8 byte-identity — **INSTRUMENT RESTORED, with a usage rule** (discriminator run
+  2026-08-03, report plans/review/kernel8-reproducibility-verdict.md): two clean-tree builds of
+  one sha are byte-identical (0 differing bytes; path/timestamp do not leak). The 1410-byte
+  cross-commit diff was ENTIRELY the embedded 8-char git-sha stamp (`arroyo:47` →
+  `genet.rs:2572` `option_env!` → content-addressed rodata symbol reorder → ADRP/ADD ripple);
+  a stamp-neutralized control proved the x86-cfg'd source diff contributed ZERO bytes to the
+  aarch64 kernel8. RULE: same-sha byte-identity is valid evidence from CLEAN trees only;
+  cross-commit comparison requires neutralizing the stamp (detach source, soft-reset to the
+  reference sha). Corollary: builds must never run under RAM-backed /tmp (caused a host OOM).
 - **Trunk 47f955a3 does not compile x86 under `witness`** (x86 seat, post-landing): two more
   orphaned x86 call sites, gated on `witness` not `wc` (`wcg.rs:130` imports
   `crate::arch::aarch64` unconditionally; `wm::focus_reset` missing at x86 syscall.rs:4142).
