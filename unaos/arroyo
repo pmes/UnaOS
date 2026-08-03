@@ -76,10 +76,11 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 #
 # PI-V3D-85: UNAOS_V3D_FIRSTKICK is BOTH — its presence arms the `v3d_firstkick` cargo feature (see
 # the kernel8 knob block below) and its VALUE is read with `option_env!` by arch/aarch64/v3d.rs to
-# pick which list the boot's one CT0 kick carries (`empty` | `rcl` | `m4` | `rclp<n>`; `1` or an
-# empty value select `empty`). PI-V3D-86's `rclp<n>` is the prefix bisection: the rcl list truncated
-# after main-list packet n. The raw value rides the `[v3d85]` header line, so a capture states its
-# own variant.
+# pick which list the boot's one CT0 kick carries (`empty` | `rcl` | `m4` | `rclp<n>` | `rclhead` |
+# `emptyunarm`; `1` or an empty value select `empty`). PI-V3D-86's `rclp<n>` is the prefix bisection:
+# the rcl list truncated after main-list packet n. PI-V3D-87's `rclhead` and `emptyunarm` are the two
+# discriminators that cut the last two candidates apart (v3d.md §49.10). The raw value rides the
+# `[v3d85]` header line, so a capture states its own variant.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
@@ -1479,7 +1480,9 @@ kernel8() {
     # against §46.1's ground truth (mainline FETCHING = 0x20, our wedged thread = 0x70), cross-read
     # against CT0RA. No V3D register is written that the kick itself does not already write; BXCF and
     # MISCCFG.QRMAXCNT stay EXCLUDED MEASURED (§49.5) and are read, never written; CTRSTA (R6) is not
-    # implemented; no mailbox tag is sent. The VALUE picks the list — `empty` (§49.6's top pick; `1`
+    # implemented; no mailbox tag is sent. An UNRECOGNISED value runs `empty` and prints
+    # recognised=0, so a typo can never read as a deliberate variant choice.
+    # The VALUE picks the list — `empty` (§49.6's top pick; `1`
     # or an empty value select it too), `rcl` ([v3d74a]'s render list on CT0, bare QBA->QEA), `m4`
     # (the real draw) — one experiment per boot, by construction. PI-V3D-86 adds the prefix-bisection
     # family `rclp<n>` (n = 1..19 decimal, e.g. `rclp1`, `rclp7`): the SAME rcl submit with the render
@@ -1488,6 +1491,16 @@ kernel8() {
     # intact) while the empty and m4 BIN lists both walked to EA — so the wall is the rcl head packet,
     # and the bisection walks the cut point down to name it. [v3d86] audits the truncation
     # (byte-identity of the prefix + the n==19 top-rung control that must rebuild plain `rcl`).
+    # PI-V3D-87 adds the two DISCRIMINATORS (v3d.md §49.10), after boot9's `rclp1` froze exactly like
+    # the full rcl and so exhausted LENGTH as a variable inside the rcl class, leaving two candidates:
+    # `rclhead` — the FULL rcl with one bin-class-legal NUMBER_OF_LAYERS packet (op 119, 2 B, the head
+    # both executing lists open with) PREPENDED, so [v3d87h] can report CT0CA's advance in PACKET
+    # terms: stopping at QBA+2 names the TRMC opcode as the wall, stopping at QBA says the head opcode
+    # is not the discriminator. [v3d87h] audits the construction by MEASUREMENT (position-weighted sum
+    # over the shifted span vs the plain list's, the [v3d86] way). `emptyunarm` — the known-good EMPTY
+    # bin list through the RCL-CLASS SUBMIT (no CT0QMA/QMS/QTS, no BPOS=0, no pre-kick L2T invalidate,
+    # bare QBA->QEA, CPU clean_range only): if it FREEZES the arming is the wall, if it retires the
+    # arming is excluded and the opcode hypothesis stands alone. [v3d87u] writes out both branches.
     # Implies UNAOS_V3D. ⚠ an armed boot
     # deliberately produces a SHORT capture missing every banked witness: label it and NEVER diff it
     # line-for-line against a full deep boot. QEMU raspi4b models no V3D, so kernel8-test green means

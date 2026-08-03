@@ -3807,7 +3807,7 @@ Pi 4 boot prints the new line. QEMU `raspi4b` models no V3D block, so no `[v3d55
 
 ---
 
-**R1 — one experiment per boot: make the rung under test the boot's FIRST CT0 kick.** *(BUILT — V3D-85, `UNAOS_V3D_FIRSTKICK=<empty|rcl|m4>`; see §49.7. R0 above lands in the same image, so the `[v3d55]` lines a first-kick capture carries are the fixed three-class ones.)*
+**R1 — one experiment per boot: make the rung under test the boot's FIRST CT0 kick.** *(BUILT — V3D-85, `UNAOS_V3D_FIRSTKICK=<empty|rcl|m4|rclp<n>|rclhead|emptyunarm>`; see §49.7, §49.9, §49.10. R0 above lands in the same image, so the `[v3d55]` lines a first-kick capture carries are the fixed three-class ones.)*
 
 *Action.* A knob (`UNAOS_V3D_FIRSTKICK=<empty|rcl|m4>`) that runs exactly one CT0 kick, placed
 **before** `probe_job`, with the full witness suite (`[v3d54]` submit + trace, `[v3d58]` stations,
@@ -4085,6 +4085,7 @@ picks the list, so one build is one experiment. `1` and an empty value select `e
 pick); an unrecognised value runs `empty` and says on the wire that it was not recognised, so a typo
 can never be read as a deliberate variant choice. The raw value rides the `[v3d85]` header line.
 PI-V3D-86 later added a fourth value **family**, `rclp<n>` — the prefix bisection; see §49.9.
+PI-V3D-87 added two more, `rclhead` and `emptyunarm` — the discriminators; see §49.10.
 
 The exact deep-battery boot line for the sitting:
 
@@ -4298,6 +4299,11 @@ some of the render head and drops the rest — which is §49.9.
 
 ### 49.9 The prefix bisection — `UNAOS_V3D_FIRSTKICK=rclp<n>` (PI-V3D-86)
 
+> **This section is answered.** `rclp1` (boot9) exhausted LENGTH as a variable in one cut — see
+> *boot9 — the bisection answered in one cut* at the end of this section for the fold, and
+> **§49.10** for the two discriminators that cut the last two candidates apart and for the
+> **four-outcome composition table** that says what each pair of results concludes and does next.
+
 §49.8 leaves five candidate properties tied at the first byte. The bisection unties them the only way
 a read-only campaign can: keep the render list's head, shorten its tail, and find the shortest prefix
 that still freezes the fetch — and, going the other way, the longest prefix that still fetches.
@@ -4415,3 +4421,152 @@ would print a success sentence for a list that was truncated before it could suc
 with `UNAOS_V3D_DEEP=1 UNAOS_V3D_FIRSTKICK=rclp7`; `strings -a target/pi_baremetal/kernel8.img` shows
 `[v3d86]` and the raw `rclp7` value. QEMU raspi4b models no V3D, so there is no QEMU leg for this arc
 at all — the verdict is the attended metal boot.
+
+---
+
+#### boot9 (`rclp1`) — the bisection answered in one cut, and what it left
+
+`rclp1` is the 9-byte `TILE_RENDERING_MODE_CFG(COMMON)` head plus one audited `END_OF_RENDERING`:
+**10 bytes, prefix-identity MEASURED**, the shortest legal member of the family. It **froze exactly
+like the full 106-byte `rcl`** — `CT0CA` held `QBA` and never advanced.
+
+Set that beside the bracket and the family collapses in one step:
+
+| boot | variant | bytes | outcome |
+|---|---|---|---|
+| 6 | `empty` (bin) | 14 | frame closed — **retired** |
+| 7 | `rcl` (render) | 106 | froze at `QBA` |
+| 8 | `m4` (bin) | 76 | walked `QBA→QEA` — **consumed**, no close |
+| 9 | `rclp1` (render) | **10** | froze at `QBA` |
+
+**LENGTH is exhausted as a variable inside the rcl class.** 10 bytes and 106 bytes die identically,
+while 14 bytes and 76 bytes both fetch. §49.8 candidate 7 is dead, and so is candidate 2 in the form
+it was stated — a 10-byte list cannot be too long for a prefetch window that a 76-byte list clears.
+Candidates 4 and 6 (the absent bin prologue) were already dead per the reading table above: a 10-byte
+list has no room for a prologue to be missing *from*. What survives from §49.8 is candidate 1/3 as a
+single lump — **the head opcode and its sub-id dispatch**, indistinguishable at the same first byte.
+
+But boot9 also surfaced a candidate that was never on the §49.8 list at all, because §49.8 was a
+table of *list* properties and this one is not. From the `[v3d85r1]` rcl-class note on the boot9
+capture: **rcl-class kicks also omit the bin-memory arming.** No `CT0QMA`, no `CT0QMS`, no `CT0QTS`,
+no `BPOS=0`, no pre-kick L2T invalidate — a bare `QBA`→`QEA` with a CPU `clean_range` publish and
+nothing else. Every kick this campaign has watched *execute* carried that arming; every kick it has
+watched *freeze* omitted it. List class and submit shape have been **perfectly confounded** for the
+whole campaign, and no boot in the bracket can tell them apart.
+
+**Two candidates remain, and they are not the same kind of thing:**
+
+1. **The head opcode** — `TILE_RENDERING_MODE_CFG` (op 121) with its 4-bit sub-id dispatch, a
+   property of the *list*.
+2. **The bin-memory arming** — the three `CT0Q*` writes and the `BPOS=0`/L2T invalidate that the
+   rcl-class submit omits, a property of the *submit*.
+
+---
+
+### 49.10 The two discriminators — `rclhead` and `emptyunarm` (PI-V3D-87)
+
+One variant per candidate, each moving exactly one thing and holding the other fixed. Both join the
+same `UNAOS_V3D_FIRSTKICK` grammar (presence arms `v3d_firstkick`, value read with `option_env!` at
+compile time, one build is one experiment, an unrecognised value runs `empty` and says
+`recognised=0`), and both keep the read-only discipline unchanged: `BXCF` and `MISCCFG.QRMAXCNT` stay
+EXCLUDED MEASURED and are read, never written; `CTRSTA` stays unimplemented and disarmed; no mailbox
+tag is sent.
+
+**`rclhead` — the head swap.** The **full** `rcl` list with **one** innocuous, bin-class-legal packet
+PREPENDED ahead of its `TILE_RENDERING_MODE_CFG` head: `NUMBER_OF_LAYERS` (`P_NUMBER_OF_LAYERS = 119`,
+2 bytes, layer count 0) — the packet **both** executing lists open with, emitted through the same
+`Pkt`/`RclWriter` encoder as every other packet in the file. Everything else is the `rcl` arm
+verbatim: same seeded target, same three cache publishes, same bare `QBA`→`QEA` submit. The render
+head has moved from list offset `+0` to list offset `+2` and nothing else changed.
+
+The audit is `[v3d87h]`, and it is a **measurement**, the `[v3d86]` way, not an argument from
+construction: the plain `rcl` is laid down and position-weight-summed over all `full_len` bytes; the
+head packet is encoded into the scratch gap past the list end so its length comes from the *encoder*
+and not from a constant; the list is shifted up by that length, highest byte first so the copy cannot
+eat its own source; the head packet goes into the hole; then the **shifted** span is summed again.
+`v3d85_arena_sum`'s weights are relative to its own `off`, so equal sums are exactly the claim *bytes
+`2..N` of the built list are byte-identical to plain `rcl`'s `0..N-2`*. The line also checks the two
+bytes the whole reading turns on — byte `+0` must be op 119, byte `+2` must be the plain list's own
+head op and equal to `P_TRMC = 121`. Any failure prints `THE TAIL IS NOT PLAIN rcl` / `BUILD DEFECT`
+and says in terms that the kick below carries no verdict.
+
+The verdict is `[v3d87u]`'s sibling `[v3d87h]`, and it reports `CT0CA`'s furthest advance in **packet
+terms** rather than as a raw address — the three addresses that mean something are `QBA`, `QBA +
+head_len`, and anything past it:
+
+| `max-in-span` | Reading |
+|---|---|
+| `== QBA` (never advanced) | The packet at `+0` is now the exact head both executing bin lists open with, and the fetch still froze at the first byte. **The head opcode is not the discriminator** — whatever stops this fetch stops it before any packet is decoded, so candidates 1/3 fall together. What is left is the submit |
+| `== QBA + head_len` | The CLE ate the prepended packet and froze at the byte where `TILE_RENDERING_MODE_CFG` begins. **The TRMC opcode itself stalls the decode.** The fetch engine, this submit and this address range are all fine — the block decodes a bin packet on CT0 and refuses the very next one. Candidate 1/3 confirmed as a group; the arming candidate is dead, because the same unarmed submit just moved `CT0CA` two bytes |
+| `> QBA + head_len`, `< QEA` | Head exonerated, wall moved to a named later offset — read the raw word (§48.1), never the wrapped difference |
+| `>= QEA` | The whole list walked with a bin-legal packet in front of it. Neither candidate survives as stated; re-take plain `rcl` in the same session before believing it |
+| `in-span == 0` | The thread never reached the list — the question was never put. Read `[v3d85r3]`; **not** evidence about either candidate |
+
+**`emptyunarm` — the arming swap.** The known-good **`empty` bin list** — byte for byte, from the
+*same match arm* as the `empty` variant, so there is no second construction path that could quietly
+make them different lists — submitted through the **rcl-class submit shape**: no `CT0QMA`/`QMS`/`QTS`,
+no `BPOS=0`, no pre-kick L2T invalidate, bare `CT0QBA`→`CT0QEA` with a CPU `clean_range` publish only.
+This is `clear_job`'s/`[v3d74a]`'s submit verbatim — the `else` branch the `rcl` family already takes,
+now reached with a bin list in hand. The `empty` boot and this boot differ in **three register writes
+plus `BPOS=0` and the L2T invalidate, and in nothing else at all**.
+
+Building it required splitting one flag into two. `bin_class` was doing double duty — picking the
+decoder *and* the success criterion *and* the submit shape — and that conflation **was** the confound:
+it made "bin list" and "armed submit" the same boolean by construction. They are now `bin_list` (list
+class: which decoder reads it, and whether the DRAM store is its criterion) and `bin_arm` (submit
+shape). `emptyunarm` is the one variant where they disagree. `store-verified` follows `bin_list`, so
+it reads 0 on this boot — a bin list never writes the target and `verify_target` is meaningless on
+one; the criterion here is `frame-closed`.
+
+| Outcome | Reading (`[v3d87u]`) |
+|---|---|
+| Frame **closes** | **The arming is EXCLUDED.** It is not what separates the lists that execute from the list that does not, the confound is broken from this side, and the opcode/class hypothesis stands alone |
+| Walks but no frame closes | Fetch is independent of the arming; retire is not. The arming is **not** the fetch wall, but it is load-bearing for *closing* a bin frame. The delta against the `empty` capture is the arming and nothing else |
+| **Freezes at `QBA`** | **The arming is the wall.** The exact list that walks `QBA→QEA` and closes its frame *with* the arming did not advance one byte *without* it. The rcl class never froze for being a render list — it froze because nothing armed the bin memory. Every §49.8 head-packet candidate is displaced by a submit-shape defect that has been under this campaign the whole time. Next step is not another list: it is `CT0QMA`/`QMS`/`QTS` on a **render** submit |
+
+#### How the two compose — the four outcome combinations
+
+The two boots are independent and each has a binary reading (`rclhead`: does `CT0CA` advance past the
+prepended head? `emptyunarm`: does the unarmed bin list still execute?). Four combinations, each with
+its named conclusion and its next step:
+
+| # | `rclhead` | `emptyunarm` | Conclusion | Next step |
+|---|---|---|---|---|
+| **A** | advances to the TRMC boundary and stops | executes (frame closes) | **The TRMC head packet is the wall, alone.** The arming is excluded from the other side, so the two candidates are cut cleanly and only candidate 1/3 survives — the CLE decodes a bin packet on CT0 and refuses op 121 | Split candidate 1 from 3: a render-class packet that is *not* sub-id-dispatched at the head. `TILE_LIST_INITIAL_BLOCK_SIZE` (op 126, 2 bytes, no sub-id) prepended in place of `NUMBER_OF_LAYERS` decides opcode-class vs sub-id dispatch |
+| **B** | advances to the TRMC boundary and stops | freezes at `QBA` | **Contradiction — both readings cannot hold.** `rclhead` proves the unarmed submit can move `CT0CA` two bytes; `emptyunarm` proves an unarmed submit cannot move it at all. One of the two boots is not measuring what it claims | Do not theorise. Re-take both captures in one session, verify `[v3d87h]`'s byte-identity line and `[v3d87u]`'s submit line both read clean, and check the `[v3d85r3]` queue-to-thread transfer on each — a failed transfer on the `emptyunarm` leg explains it without any new mechanism |
+| **C** | freezes at `QBA` | executes (frame closes) | **Neither candidate survives.** The head opcode is excluded (a bin-legal head still froze) and the arming is excluded (an unarmed bin list still ran). The discriminating property is neither the head packet nor the submit shape, and §49.8's whole framing is spent | Return to what is left that differs between the two: the **arena region** and the addresses. `empty` kicks from `OFF_PROBE_BIN_CL = 0x35000`, the rcl family from `OFF_RCL = 0x8000`. Kick the `empty` list from `OFF_RCL` — one boot, same list, same submit, different address |
+| **D** | freezes at `QBA` | freezes at `QBA` | **The arming is the wall, and it explains both.** The head opcode is excluded by `rclhead`, and `emptyunarm` shows the freeze follows the *submit* across a change of list class. Everything §49.8 attributed to the render list was attributable to the submit that carried it | Arm a **render** submit: `CT0QMA`/`CT0QMS`/`CT0QTS` + `BPOS=0` + the pre-kick L2T invalidate ahead of a plain `rcl` kick. If it fetches, the campaign's wall is named and the fix is a driver fix, not a silicon question |
+
+Outcomes **A** and **D** are the two that resolve the campaign; **C** is the honest null that sends it
+to the address axis; **B** is the only one that is a bug report about the instruments rather than a
+reading of the hardware, and it is written down precisely so it cannot be mistaken for one.
+
+**The two boots, and their order.** `rclhead` first: it is the one that can produce a *positive*
+(`CT0CA` moving two bytes is the only forward motion this campaign has ever seen on CT0 with a render
+list), and A/B/C/D all read more sharply with it in hand.
+
+```
+UNAOS_WITNESS=1 UNAOS_PIUSB=1 UNAOS_GENET=1 UNAOS_SMP7=1 UNAOS_NETTEST=1 UNAOS_V3D=1 \
+UNAOS_VUGPAR=1 UNAOS_WEDGE2=1 UNAOS_V3D_DEEP=1 UNAOS_V3D_FIRSTKICK=rclhead ./arroyo kernel8
+```
+
+```
+UNAOS_WITNESS=1 UNAOS_PIUSB=1 UNAOS_GENET=1 UNAOS_SMP7=1 UNAOS_NETTEST=1 UNAOS_V3D=1 \
+UNAOS_VUGPAR=1 UNAOS_WEDGE2=1 UNAOS_V3D_DEEP=1 UNAOS_V3D_FIRSTKICK=emptyunarm ./arroyo kernel8
+```
+
+One variant per boot, never two — the R1 discipline is the reason the table above means anything.
+
+**Gate.** `./arroyo check` green on both arches with the knob off; direct
+`cargo +nightly check --target aarch64-unknown-none-softfloat --features v3d_firstkick,v3d` for the
+knob-on path (`./arroyo check` never compiles it — the PI-V3D-86 precedent); the full-knob `kernel8`
+build green once with `UNAOS_V3D_DEEP=1 UNAOS_V3D_FIRSTKICK=rclhead`;
+`strings -a target/pi_baremetal/kernel8.img` shows `[v3d87h]`, `[v3d87u]` and both raw variant values.
+QEMU raspi4b models no V3D, so there is no QEMU leg for this arc at all — the verdict is the attended
+metal boot.
+
+> **Note on the `[v3d87h]` scratch encode.** The head packet is encoded once into the gap between the
+> list's end and `OFF_SUBLIST` purely to learn its length from the encoder. That scratch lands inside
+> the final list's own span (`head_len < full_len`), so the shift overwrites it and no residue
+> survives into the kicked bytes. The `[v3d87h]` byte-identity sum is taken *after* the shift and
+> would catch it if it ever did.

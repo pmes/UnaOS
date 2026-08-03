@@ -12890,10 +12890,11 @@ pub fn run_visible_battery_again() -> u32 {
 // diffed line-for-line against a full deep boot. The rung prints that caveat itself, first and last,
 // so the capture carries its own reading instructions.
 
-/// PI-V3D-85 (R1) — the arming switch. `UNAOS_V3D_FIRSTKICK=<empty|rcl|m4|rclp<n>>` (feature
-/// `v3d_firstkick`), DEFAULT OFF. Off, not one line of the rung is compiled and `bringup` runs its
-/// normal course; on, `bringup` takes the one kick after M3 and returns. `rclp<n>` is PI-V3D-86's
-/// prefix-bisection family (v3d.md §49.9).
+/// PI-V3D-85 (R1) — the arming switch.
+/// `UNAOS_V3D_FIRSTKICK=<empty|rcl|m4|rclp<n>|rclhead|emptyunarm>` (feature `v3d_firstkick`),
+/// DEFAULT OFF. Off, not one line of the rung is compiled and `bringup` runs its normal course; on,
+/// `bringup` takes the one kick after M3 and returns. `rclp<n>` is PI-V3D-86's prefix-bisection
+/// family; `rclhead` and `emptyunarm` are PI-V3D-87's two discriminators (v3d.md §49.10).
 const V3D85_FIRSTKICK: bool = cfg!(feature = "v3d_firstkick");
 
 /// PI-V3D-85 (R1) — which list the boot's one CT0 kick carries. §49.4 names three, and they are
@@ -12914,6 +12915,20 @@ enum V3d85Variant {
     /// `rcl` list freezes the CLE at its first fetch (§49.8), so the question is which head packet
     /// the fetch cannot get past, and the cheapest way to ask it is to keep shortening the list.
     RclPrefix(usize),
+    /// PI-V3D-87 (HEAD-SWAP) — the FULL `rcl` list with ONE innocuous, bin-class-legal packet
+    /// PREPENDED ahead of its `TILE_RENDERING_MODE_CFG` head: `NUMBER_OF_LAYERS` (`P_NUMBER_OF_LAYERS
+    /// = 119`, 2 bytes), the packet BOTH executing lists open with. `rclp1` (v3d.md §49.9, boot9)
+    /// exhausted LENGTH as a variable inside the rcl class — a 10-byte list froze exactly like the
+    /// 106-byte one — so the remaining question about the head is about the OPCODE, and this variant
+    /// asks it by moving the render head one packet downstream of a head the CLE provably eats.
+    RclHead,
+    /// PI-V3D-87 (ARMING-SWAP) — the known-good `empty` BIN list submitted through the RCL-CLASS
+    /// SUBMIT SHAPE: no `CT0QMA`/`QMS`/`QTS`, no `BPOS=0`, no pre-kick L2T invalidate, bare
+    /// `QBA`→`QEA` with a CPU `clean_range` publish only. Every kick that has ever executed carried
+    /// the bin-memory arming and every kick that has ever frozen omitted it, so arming and list class
+    /// have been perfectly confounded for the whole campaign; this variant is the only boot that
+    /// separates them, and the list is byte-for-byte the one `empty` retires on.
+    EmptyUnarm,
 }
 
 /// The raw knob text, echoed on the wire so a capture states its own build instead of requiring the
@@ -12981,6 +12996,10 @@ const fn v3d85_variant() -> (V3d85Variant, bool) {
         (V3d85Variant::M4, true)
     } else if v3d85_eq(b, b"empty") || v3d85_eq(b, b"1") || v3d85_eq(b, b"") {
         (V3d85Variant::Empty, true)
+    } else if v3d85_eq(b, b"rclhead") {
+        (V3d85Variant::RclHead, true)
+    } else if v3d85_eq(b, b"emptyunarm") {
+        (V3d85Variant::EmptyUnarm, true)
     } else if let Some(n) = v3d85_parse_rclp(b) {
         (V3d85Variant::RclPrefix(n), true)
     } else {
@@ -13006,16 +13025,42 @@ impl core::fmt::Display for V3d85Tag {
             V3d85Variant::Rcl => f.write_str("rcl"),
             V3d85Variant::M4 => f.write_str("m4"),
             V3d85Variant::RclPrefix(n) => write!(f, "rclp{}", n),
+            V3d85Variant::RclHead => f.write_str("rclhead"),
+            V3d85Variant::EmptyUnarm => f.write_str("emptyunarm"),
         }
     }
 }
 
-/// True for the two variants that submit the RENDER control list on CT0 with NO bin-class arming —
-/// `rcl` and every `rclp<n>`. The prefix family is the `rcl` submit with a shorter list and nothing
-/// else changed, so every `bin_class`-gated branch has to treat them identically.
+/// True for every variant whose kicked list is a RENDER-class control list — `rcl`, every
+/// `rclp<n>`, and PI-V3D-87's `rclhead`. This axis picks the DECODER (a bin-class decoder aimed at a
+/// render list manufactures nonsense packet names) and the SUCCESS CRITERION (for the render class
+/// the criterion is the DRAM store `clear_job` banks its PASS on; a bin list never writes the
+/// target, so `verify_target` is meaningless on one).
+///
+/// PI-V3D-87 split this from the arming axis below. Until now the two were ONE flag, and that was
+/// not a simplification — it was the confound: every list this campaign ever kicked either was a bin
+/// list AND carried the arming, or was a render list AND omitted it. `emptyunarm` exists precisely to
+/// break that pairing, so the flag has to come apart first.
 #[cfg(feature = "v3d_firstkick")]
-const V3D85_RCL_CLASS: bool =
-    matches!(V3D85_VARIANT, V3d85Variant::Rcl | V3d85Variant::RclPrefix(_));
+const V3D85_RCL_CLASS: bool = matches!(
+    V3D85_VARIANT,
+    V3d85Variant::Rcl | V3d85Variant::RclPrefix(_) | V3d85Variant::RclHead
+);
+
+/// PI-V3D-87 — the SUBMIT-SHAPE axis, independent of the list class above. True when the kick writes
+/// the bin-memory arming (`BPOS=0`, the pre-kick L2T invalidate, `CT0QMA`/`CT0QMS`/`CT0QTS`) ahead of
+/// `QBA`→`QEA`; false for the bare `[v3d74a]`/`clear_job` submit (CPU `clean_range` publish only).
+///
+/// `emptyunarm` is the one variant where this disagrees with `!V3D85_RCL_CLASS`: a BIN list through
+/// the RENDER-class submit.
+#[cfg(feature = "v3d_firstkick")]
+const V3D85_BIN_ARM: bool = !matches!(
+    V3D85_VARIANT,
+    V3d85Variant::Rcl
+        | V3d85Variant::RclPrefix(_)
+        | V3d85Variant::RclHead
+        | V3d85Variant::EmptyUnarm
+);
 
 // ── R2 — the V3D MMU access counters. ────────────────────────────────────────────────────────────
 //
@@ -13383,6 +13428,151 @@ fn v3d85_build_rcl_prefix(n_req: usize) -> (usize, usize) {
     (list_len, sublist_len)
 }
 
+/// PI-V3D-87 (HEAD-SWAP) — build the `rclhead` list in place at `OFF_RCL` and emit the construction
+/// audit. Returns `(list_len, sublist_len, head_len)`; `head_len` is the prepended packet's length as
+/// the ENCODER produced it, which the verdict line needs to name the render-head boundary.
+///
+/// The list is the FULL `rcl`, unchanged in every byte, with one `NUMBER_OF_LAYERS` packet
+/// (`P_NUMBER_OF_LAYERS = 119`, 2 bytes, layer count 0 — the exact packet `build_bin_cl_at` and
+/// `build_bin_cl_content_geom` both open with) PREPENDED ahead of its `TILE_RENDERING_MODE_CFG` head.
+/// The head packet goes down through the same `Pkt`/`RclWriter` encoder every other packet in this
+/// file goes through — never a hand-placed byte.
+///
+/// Construction, in the order it has to happen so the audit is a MEASUREMENT and not an argument:
+/// lay the plain `rcl` down and take a position-weighted sum over all of it; encode the head packet
+/// into the scratch gap past the list's end to learn its exact length from the encoder rather than
+/// from a constant; shift the whole plain list up by that length, highest byte first so the copy can
+/// never eat its own source; write the head packet into the hole; then re-sum the SHIFTED span. The
+/// weights in `v3d85_arena_sum` are relative to its own `off`, so an equal sum over
+/// `[OFF_RCL+head_len, +full_len)` and over the pre-shift `[OFF_RCL, +full_len)` is exactly the claim
+/// "bytes `head_len..N` of the new list are byte-identical to plain `rcl`'s `0..N-head_len`".
+///
+/// The scratch encode lands inside the final list's own span (`head_len < full_len`), so the shift
+/// overwrites it and no residue survives into the kicked bytes.
+#[cfg(feature = "v3d_firstkick")]
+fn v3d87_build_rcl_head() -> (usize, usize, usize) {
+    // 1. The plain rcl, laid down and measured before anything touches it.
+    let (full_len, sublist_len, total) = build_rcl_limited(usize::MAX);
+    let plain_sum = v3d85_arena_sum(OFF_RCL, full_len);
+    let plain_head_op = arena_byte(OFF_RCL);
+
+    // 2. The head packet, encoded into the gap past the list's end purely to learn its length from
+    //    the encoder. `OFF_RCL + full_len` is ~0x806a and `OFF_SUBLIST` is 0x9000, so the gap is real.
+    let mut probe = RclWriter::new(OFF_RCL + full_len);
+    probe.pkt(Pkt::new(P_NUMBER_OF_LAYERS, 2).f(0, 8, 0).done());
+    let head_len = probe.len();
+
+    // 3. Shift the plain list up by `head_len`, descending so a source byte is always read before
+    //    the destination write that would clobber it.
+    let mut i = full_len;
+    while i > 0 {
+        i -= 1;
+        let b = arena_byte(OFF_RCL + i);
+        arena_write_bytes(OFF_RCL + head_len + i, &[b]);
+    }
+
+    // 4. The head packet, for real this time, at the front.
+    let mut h = RclWriter::new(OFF_RCL);
+    h.pkt(Pkt::new(P_NUMBER_OF_LAYERS, 2).f(0, 8, 0).done());
+    let list_len = head_len + full_len;
+
+    // 5. The audit — measured, the [v3d86] way.
+    let shifted_sum = v3d85_arena_sum(OFF_RCL + head_len, full_len);
+    let tail_identical = h.len() == head_len && shifted_sum == plain_sum;
+    let head_op = arena_byte(OFF_RCL);
+    let boundary_op = arena_byte(OFF_RCL + head_len);
+    let head_placed = head_op == P_NUMBER_OF_LAYERS;
+    let boundary_intact = boundary_op == plain_head_op && boundary_op == P_TRMC;
+
+    serial_println!(
+        ":: V3D: [v3d87h] head-swap construction ({}) — prepended op={} ({} bytes, layer count 0, through the same Pkt/RclWriter encoder as every other packet in this file) ahead of the FULL rcl ({} bytes, {} main packets) => list bytes={} | byte-identity audit (MEASURED, not asserted): weighted sum over the plain list's [0,{}) = {:#010x} vs the same weights over the built list's [{},{}) = {:#010x}, tail-is-plain-rcl={} | head byte @+0 = {} (expected P_NUMBER_OF_LAYERS={}, placed={}) | boundary byte @+{} = {} (expected the plain rcl's own head op {} = P_TRMC={}, intact={}) — {} ::",
+        V3d85Tag,
+        P_NUMBER_OF_LAYERS, head_len, full_len, total, list_len,
+        full_len, plain_sum, head_len, list_len, shifted_sum, tail_identical as u32,
+        head_op, P_NUMBER_OF_LAYERS, head_placed as u32,
+        head_len, boundary_op, plain_head_op, P_TRMC, boundary_intact as u32,
+        if !tail_identical {
+            "THE TAIL IS NOT PLAIN rcl — the shifted bytes do not sum to the bytes that were laid down. This is a BUILD DEFECT, not a hardware reading; whatever the kick below does, it does NOT swap the head and NO verdict may be drawn from it"
+        } else if !head_placed || !boundary_intact {
+            "THE HEAD OR THE BOUNDARY IS NOT THE EXPECTED OPCODE — the tail sums right but the two bytes this rung's whole reading turns on are wrong. BUILD DEFECT; do not read the kick"
+        } else {
+            "the list kicked below is plain rcl with exactly one bin-class-legal 2-byte packet in front of it — the render head has moved from list offset +0 to list offset +2 and NOTHING else about the submit, the target seed, the publishes or the list content has changed"
+        }
+    );
+    (list_len, sublist_len, head_len)
+}
+
+/// PI-V3D-87 (HEAD-SWAP) — the verdict, stated in PACKET terms rather than in raw addresses.
+///
+/// `CT0CA`'s furthest observed advance is the whole measurement, and the three readings that matter
+/// are three exact addresses: `QBA` (never advanced at all), `QBA + head_len` (ate the prepended
+/// packet, stopped at the render head), and anything beyond (ate the render head too). The `[v3d73]`
+/// sampler supplies `max-in-span`; this line does nothing but name which boundary that address is
+/// and say what each naming means. Both branches are written out so the capture reads itself.
+#[cfg(feature = "v3d_firstkick")]
+fn v3d87_head_verdict(ba: u32, ea: u32, head_len: usize, smp_n: u32, smp_in_span: u32, smp_max: u32) {
+    let boundary = ba + head_len as u32;
+    let advance = smp_max.wrapping_sub(ba);
+    let at_qba = smp_in_span != 0 && smp_max == ba;
+    let at_boundary = smp_max == boundary;
+    let past_boundary = smp_in_span != 0 && smp_max > boundary;
+    let verdict: &str = if smp_n == 0 {
+        "ZERO sampler ticks landed — the wait exited before the first tick and this rung measured NOTHING. Not a verdict in either direction; re-take the boot"
+    } else if smp_in_span == 0 {
+        "CT0CA NEVER HELD AN ADDRESS INSIDE [QBA,QEA] AT ANY SAMPLE — the thread did not even reach the list, so the head-swap question was never actually put. This is the `never loaded` shape, one station upstream of everything this rung is about; read [v3d85r3] for whether the queue transferred into the thread at all, and do NOT read this boot as evidence about either candidate"
+    } else if at_qba {
+        "CT0CA HELD QBA AND NEVER ADVANCED — the packet at list offset +0 is now NUMBER_OF_LAYERS (op 119, 2 bytes), the exact head both executing bin lists open with, and the fetch STILL froze at the very first byte. THE HEAD OPCODE IS NOT THE DISCRIMINATOR: whatever stops this fetch stops it before any packet is decoded, so it cannot be a property of the head packet's opcode, its length or its sub-id dispatch (§49.8 candidates 1/2/3 all fall together). What is left is the SUBMIT, not the list — read the `emptyunarm` boot's verdict beside this one, because between them they decide it"
+    } else if at_boundary {
+        "CT0CA ADVANCED EXACTLY head_len BYTES AND STOPPED ON THE RENDER HEAD — the CLE ate the prepended NUMBER_OF_LAYERS packet and then froze at the byte where TILE_RENDERING_MODE_CFG begins. THE TRMC OPCODE ITSELF STALLS THE DECODE. This is the tightest positive result the rung can produce: the fetch engine, this submit and this address range are all fine — the block decodes a bin-class packet on CT0 and refuses the very next one. §49.8 candidates 1/2/3 (opcode 121, its 9-byte length, its sub-id dispatch) are confirmed as a group and the arming candidate is DEAD, because the same unarmed submit just moved CT0CA two bytes"
+    } else if smp_max >= ea {
+        "CT0CA REACHED QEA — the whole list, render head and all, was walked with a bin-legal packet in front of it. Neither candidate survives in the form §49.8 states them: the render head is decodable on CT0 after all, and what plain rcl's freeze depends on is the head packet being FIRST rather than being present. Re-take plain `rcl` in the same session before believing this, and read `store-verified=` on the verdict line below for whether it also did its work"
+    } else if past_boundary {
+        "CT0CA ADVANCED PAST THE RENDER HEAD AND STALLED MID-LIST — the prepended packet and TILE_RENDERING_MODE_CFG were both consumed and the CLE choked further in. The head is exonerated and the wall has moved to a named later offset; read the raw max-in-span word against the [v3d86]-style packet table in v3d.md §49.9 to name the packet, and per §48.1 print the RAW word, never the wrapped difference"
+    } else {
+        "CT0CA's furthest sample sits BELOW QBA or otherwise outside the boundaries this rung names — read the raw words. Not a verdict"
+    };
+    serial_println!(
+        ":: V3D: [v3d87h] head-swap verdict ({}) — QBA={:#010x} head_len={} render-head boundary=QBA+{}={:#010x} QEA={:#010x} | sampler samples={} in-span={} max-in-span={:#010x} (advance from QBA = {} bytes) | at-QBA={} at-boundary={} past-boundary={} — {} ::",
+        V3d85Tag,
+        ba, head_len, head_len, boundary, ea,
+        smp_n, smp_in_span, smp_max, advance,
+        at_qba as u32, at_boundary as u32, past_boundary as u32,
+        verdict
+    );
+}
+
+/// PI-V3D-87 (ARMING-SWAP) — the verdict for `emptyunarm`, both branches written out.
+///
+/// The list is byte-for-byte the one the `empty` variant retires on; the submit is byte-for-byte the
+/// `rcl` family's. Exactly one thing moved, so exactly two readings are possible and each names the
+/// surviving candidate outright.
+#[cfg(feature = "v3d_firstkick")]
+fn v3d87_unarm_verdict(
+    ba: u32,
+    ea: u32,
+    frame_closed: bool,
+    consumed: bool,
+    smp_n: u32,
+    smp_in_span: u32,
+    smp_max: u32,
+) {
+    let verdict: &str = if smp_n == 0 {
+        "ZERO sampler ticks landed — the fetch columns are INCONCLUSIVE this boot. The retire columns on [v3d85r1] still stand on their own; read them, not this line"
+    } else if frame_closed {
+        "THE EMPTY FRAME RETIRED WITHOUT ANY BIN-CLASS ARMING — a frame CLOSED on a submit that wrote no CT0QMA, no CT0QMS, no CT0QTS, no BPOS=0 and issued no pre-kick L2T invalidate. THE ARMING IS EXCLUDED as the wall: it is not what separates the lists that execute from the list that does not, and the whole confound §49.8 could not see past is broken from this side. The opcode/class hypothesis then stands ALONE, and the `rclhead` boot is the one that decides it"
+    } else if consumed || smp_max > ba {
+        "THE EMPTY LIST WAS WALKED BUT NO FRAME CLOSED, WITHOUT THE ARMING — CT0CA advanced (read consumed=/max-in-span= for how far) and yet retired=0, FRDONE=0, BFC Δ0. FETCH is therefore independent of the arming while RETIRE is not: the arming is NOT the fetch wall the rcl class dies at, but it IS load-bearing for closing a bin frame. Read this beside the `empty` boot, which closed its frame on the same list WITH the arming — the delta between those two captures is the arming and nothing else"
+    } else {
+        "THE EMPTY LIST FROZE AT QBA WITHOUT THE ARMING — the exact list that walks QBA→QEA and closes its frame when the arming is present did not advance one byte when it was removed. THE ARMING IS THE WALL. The rcl class never froze because it is a render list; it froze because nothing armed the bin memory before its kick, and every §49.8 head-packet candidate (opcode, length, sub-id dispatch) is displaced by a submit-shape defect that has been sitting under this campaign the whole time. Next step is not another list — it is CT0QMA/CT0QMS/CT0QTS on a render submit"
+    };
+    serial_println!(
+        ":: V3D: [v3d87u] arming-swap verdict ({}) — the `empty` bin list, byte for byte, through the rcl-class submit: NO CT0QMA/CT0QMS/CT0QTS, NO BPOS=0, NO pre-kick L2T invalidate, bare CT0QBA->CT0QEA with a CPU clean_range publish only | QBA={:#010x} QEA={:#010x} | frame-closed={} consumed={} sampler samples={} in-span={} max-in-span={:#010x} — {} ::",
+        V3d85Tag,
+        ba, ea, frame_closed as u32, consumed as u32, smp_n, smp_in_span, smp_max,
+        verdict
+    );
+}
+
 /// PI-V3D-85 (R1) — the boot's ONE CT0 kick, with R2/R3/R7 riding it (and, on an `rclp<n>` value,
 /// PI-V3D-86's prefix bisection).
 ///
@@ -13392,14 +13582,14 @@ fn v3d85_build_rcl_prefix(n_req: usize) -> (usize, usize) {
 #[cfg(feature = "v3d_firstkick")]
 fn v3d85_firstkick_rung() {
     serial_println!(
-        ":: V3D: [v3d85] R-LADDER BOOT — READ THIS FIRST. UNAOS_V3D_FIRSTKICK={} (variant={}, recognised={}). This boot runs EXACTLY ONE CT0 kick, placed before probe_job, and then RETURNS: no [v3d48] ladder, no [v3d63/64/66/68/69/71/73s/74/75/76/77/80/81] tails, no M4, no visible battery. The capture is DELIBERATELY missing every banked witness a reader of v3d.md expects — that is the point (a first kick with a ladder behind it is not a first kick) — and it MUST NOT be diffed line-for-line against a full deep boot. Rungs armed: R1 first-kick isolation, R2 MMU access counters, R3 CT0EA/CT0RA queue-vs-thread, R7 CT0CS bit4/bit6 decode, and on an rclp<n> value the PI-V3D-86 prefix bisection ([v3d86], v3d.md §49.9 — NOT the §49.4 ladder's R8, which is the instrument-free boot and is still unbuilt). All are READ-ONLY except the kick's own kernel-exact v3d_bin_job_run writes; BXCF and MISCCFG.QRMAXCNT are EXCLUDED MEASURED (v3d.md §49.5) and are read, never written; CTRSTA (R6) is not implemented; no mailbox tag is sent ::",
+        ":: V3D: [v3d85] R-LADDER BOOT — READ THIS FIRST. UNAOS_V3D_FIRSTKICK={} (variant={}, recognised={}). This boot runs EXACTLY ONE CT0 kick, placed before probe_job, and then RETURNS: no [v3d48] ladder, no [v3d63/64/66/68/69/71/73s/74/75/76/77/80/81] tails, no M4, no visible battery. The capture is DELIBERATELY missing every banked witness a reader of v3d.md expects — that is the point (a first kick with a ladder behind it is not a first kick) — and it MUST NOT be diffed line-for-line against a full deep boot. Rungs armed: R1 first-kick isolation, R2 MMU access counters, R3 CT0EA/CT0RA queue-vs-thread, R7 CT0CS bit4/bit6 decode, on an rclp<n> value the PI-V3D-86 prefix bisection ([v3d86], v3d.md §49.9 — NOT the §49.4 ladder's R8, which is the instrument-free boot and is still unbuilt), and on rclhead/emptyunarm the PI-V3D-87 discriminators ([v3d87h]/[v3d87u], v3d.md §49.10). All are READ-ONLY except the kick's own kernel-exact v3d_bin_job_run writes; BXCF and MISCCFG.QRMAXCNT are EXCLUDED MEASURED (v3d.md §49.5) and are read, never written; CTRSTA (R6) is not implemented; no mailbox tag is sent ::",
         V3D85_RAW,
         V3d85Tag,
         V3D85_VARIANT_NAMED as u32
     );
     if !V3D85_VARIANT_NAMED {
         serial_println!(
-            ":: V3D: [v3d85] knob value {} is NOT one of empty|rcl|m4|rclp<n> (or 1) — running the `empty` rung, which is what v3d.md §49.6 ranks first. This line exists so a typo can never be read as a deliberate variant choice ::",
+            ":: V3D: [v3d85] knob value {} is NOT one of empty|rcl|m4|rclp<n>|rclhead|emptyunarm (or 1) — running the `empty` rung, which is what v3d.md §49.6 ranks first. This line exists so a typo can never be read as a deliberate variant choice ::",
             V3D85_RAW
         );
     }
@@ -13421,9 +13611,21 @@ fn v3d85_firstkick_rung() {
     }
 
     // ── Build the one list, per variant. ────────────────────────────────────────────────────────
-    let bin_class = !V3D85_RCL_CLASS;
+    // PI-V3D-87 — TWO axes, deliberately no longer one flag. `bin_list` says what class of list is
+    // being kicked (which decoder reads it, and whether the DRAM store is its success criterion);
+    // `bin_arm` says whether the submit carries the bin-memory arming. Every prior boot had them
+    // equal, which is exactly why the campaign could not tell the list class and the submit shape
+    // apart; `emptyunarm` is the boot where they differ.
+    let bin_list = !V3D85_RCL_CLASS;
+    let bin_arm = V3D85_BIN_ARM;
+    // The head-swap variant needs its prepended packet's length again at verdict time, to say where
+    // the render head starts in PACKET terms. Zero on every other variant, and unread there.
+    let mut head_len: usize = 0;
     let (cl_off, cl_len) = match V3D85_VARIANT {
-        V3d85Variant::Empty => {
+        // PI-V3D-87 — `emptyunarm` shares this arm with `empty` ON PURPOSE, and the sharing is the
+        // control: the two variants differ in the SUBMIT below and in nothing else, so there is no
+        // second construction path that could quietly make them different lists.
+        V3d85Variant::Empty | V3d85Variant::EmptyUnarm => {
             // The `[v3d48]` Empty frame, byte for byte: NUMBER_OF_LAYERS + TILE_BINNING_MODE_CFG +
             // FLUSH_VCD_CACHE + START_TILE_BINNING + FLUSH. No shader state, no primitives.
             let n = build_bin_cl_content_geom(
@@ -13447,6 +13649,18 @@ fn v3d85_firstkick_rung() {
         V3d85Variant::RclPrefix(n) => {
             fill_target(0xDEAD_BEEF);
             let (list_len, sublist_len) = v3d85_build_rcl_prefix(n);
+            cache::clean_range(arena_phys() + OFF_TARGET, TARGET_BYTES);
+            cache::clean_range(arena_phys() + OFF_RCL, list_len);
+            cache::clean_range(arena_phys() + OFF_SUBLIST, sublist_len);
+            (OFF_RCL, list_len)
+        }
+        // PI-V3D-87 — the head swap. Again the `Rcl` arm verbatim except for the builder: same
+        // seeded target, same three publishes, same bare QBA→QEA submit. The list's HEAD PACKET is
+        // the only variable that moves.
+        V3d85Variant::RclHead => {
+            fill_target(0xDEAD_BEEF);
+            let (list_len, sublist_len, hl) = v3d87_build_rcl_head();
+            head_len = hl;
             cache::clean_range(arena_phys() + OFF_TARGET, TARGET_BYTES);
             cache::clean_range(arena_phys() + OFF_RCL, list_len);
             cache::clean_range(arena_phys() + OFF_SUBLIST, sublist_len);
@@ -13509,12 +13723,15 @@ fn v3d85_firstkick_rung() {
     // `v3d57_cl_mesa_diff` are BINNING-CL instruments (see their headers) and are not pointed at the
     // `rcl` variant's render list — that list is already decoded byte-for-byte in §48.2 and a
     // bin-class decoder aimed at it would manufacture nonsense packet names. It gets a hex dump.
-    if bin_class {
+    if bin_list {
+        // PI-V3D-87 — `emptyunarm` lands here: the list IS a bin CL, so the bin-class decoders are
+        // the right instruments for it no matter what submit shape carries it below.
         decode_cl_packets("v3d85 firstkick", cl_off, cl_len);
         v3d57_cl_mesa_diff("v3d85 firstkick", cl_off, cl_len);
     } else {
-        // The `rclp<n>` family lands here too: same render list, shorter. The dump is the packet
-        // inventory of record for this class, and [v3d86] above states where the cut fell.
+        // The `rclp<n>` family and PI-V3D-87's `rclhead` land here too: same render list, shorter or
+        // with one packet in front. The dump is the packet inventory of record for this class, and
+        // [v3d86]/[v3d87h] above state exactly what was done to it.
         dump_cl_bytes("v3d85 firstkick RCL", cl_off, cl_len, 128);
     }
 
@@ -13533,7 +13750,7 @@ fn v3d85_firstkick_rung() {
     // Kernel-exact ORDER: BPOS=0 is `v3d_bin_job_run`'s FIRST write, ahead of the invalidate and the
     // tile-memory latch. Skipped on the `rcl` variant, whose whole point is the ABSENCE of bin-class
     // arming (the `[v3d74a]` discipline: bare QBA→QEA and nothing else).
-    if bin_class {
+    if bin_arm {
         bin_prejob_bpos_clear("v3d85 firstkick");
         invalidate_gpu_caches("L2T flush (v3d85 firstkick pre-kick)");
         let qts_val = ts | V3D_CLE_CT0QTS_ENABLE;
@@ -13543,13 +13760,23 @@ fn v3d85_firstkick_rung() {
         dsb();
         bin_mem_prekick_witness("v3d85 firstkick", tile_alloc, BIN_TILEALLOC_BYTES as u32, qts_val);
     } else {
-        // Deliberately NOTHING here. `clear_job` — the CT1 leg this list provably retires on — issues
-        // no GPU-cache invalidate before its kick either (a CPU `clean_range` to PoC is its whole
-        // publish), and `[v3d74a]` mirrors that. Adding an L2T flush on this variant alone would be a
-        // divergence from the exact submit whose verdict this rung re-takes.
+        // Deliberately NOTHING here. `clear_job` — the CT1 leg the rcl list provably retires on —
+        // issues no GPU-cache invalidate before its kick either (a CPU `clean_range` to PoC is its
+        // whole publish), and `[v3d74a]` mirrors that. Adding an L2T flush on these variants alone
+        // would be a divergence from the exact submit whose verdict this rung re-takes.
+        //
+        // PI-V3D-87 — `emptyunarm` takes this branch with a BIN list, which is the whole point: the
+        // three writes below are the only thing removed, and they are removed from the one list this
+        // campaign has watched retire.
         serial_println!(
-            ":: V3D: [v3d85r1] {} variant (rcl class) — NO CT0QMA/CT0QMS/CT0QTS written, NO BPOS=0, NO pre-kick L2T invalidate: the bin-class arming is the variable being removed, and the submit is byte-for-byte clear_job's/[v3d74a]'s (bare QBA->QEA, CPU clean_range only). S1 below is therefore a repeat of S0 by construction. On an rclp<n> boot the ONLY further difference from plain rcl is the list's length — see [v3d86] ::",
-            V3d85Tag
+            ":: V3D: [v3d85r1] {} variant ({}) — NO CT0QMA/CT0QMS/CT0QTS written, NO BPOS=0, NO pre-kick L2T invalidate: the bin-class arming is the variable being removed, and the submit is byte-for-byte clear_job's/[v3d74a]'s (bare QBA->QEA, CPU clean_range only). S1 below is therefore a repeat of S0 by construction. {} ::",
+            V3d85Tag,
+            if bin_list { "PI-V3D-87 arming swap: a BIN list on the rcl-class submit" } else { "rcl class" },
+            if bin_list {
+                "The list is byte-for-byte the one the `empty` variant retires on — same builder, same arm, same geometry — so this boot and the `empty` boot differ in these three register writes and NOTHING else. See [v3d87u] below for what each outcome means"
+            } else {
+                "On an rclp<n> boot the ONLY further difference from plain rcl is the list's length (see [v3d86]); on an rclhead boot it is the one prepended head packet (see [v3d87h])"
+            }
         );
     }
     let st1 = v3d58_sample();
@@ -13615,8 +13842,10 @@ fn v3d85_firstkick_rung() {
     let wrote_any = ts_scan.zeroed + ts_scan.overwritten + pool_scan.zeroed + pool_scan.overwritten > 0;
     ptb_frame_witness("v3d85 firstkick", bfc_pre, rfc_pre, bpca_pre, tile_alloc);
 
-    // The `rcl` variant's own positive: the DRAM-truth readback `clear_job` banks its PASS on.
-    let store_verified = if bin_class {
+    // The `rcl` variant's own positive: the DRAM-truth readback `clear_job` banks its PASS on. Gated
+    // on the LIST class, not the submit shape (PI-V3D-87): a bin list never writes the target, so
+    // `verify_target` is meaningless on `emptyunarm` however that list is submitted.
+    let store_verified = if bin_list {
         false
     } else {
         cache::clean_invalidate_range(arena_phys() + OFF_TARGET, TARGET_BYTES);
@@ -13646,6 +13875,11 @@ fn v3d85_firstkick_rung() {
         "AN MMU FAULT LATCHED across the boot's first kick — instrument fault, not a first-kick verdict. Fix it before citing this rung; nothing here discriminates anything"
     } else if smp_n == 0 {
         "ZERO sampler ticks landed — the wait exited before the first ~1 ms tick, so the fetch columns are INCONCLUSIVE. The retire columns still stand on their own"
+    } else if V3D85_VARIANT == V3d85Variant::EmptyUnarm {
+        // PI-V3D-87 — the arming swap gets its own branch rather than inheriting `empty`'s, because
+        // the two boots' sentences are about different things: `empty`'s is about the §49.3 confound,
+        // this one is about the arming. The full both-branch reading is on [v3d87u] below.
+        "PI-V3D-87 ARMING SWAP — this boot kicked the `empty` bin list through the rcl-class submit (no CT0QMA/QMS/QTS, no BPOS=0, no pre-kick L2T invalidate). Read [v3d87u] below for the verdict; the columns on THIS line are its evidence and neither sentence may claim more than they support"
     } else if frame_closed && V3D85_VARIANT == V3d85Variant::Empty {
         "THE EMPTY FRAME RETIRED AS KICK #1 — a bin frame CLOSED (read the retired/FRDONE/BFC columns, not this sentence alone). The wall is state the block ACCUMULATES across kicks, not a cold-boot init gap — and the campaign's whole baseline is RETRACTED: every 'an empty bin frame does not retire' reading in v3d.md was taken behind a probe frame that opened and never closed (§49.3). Re-take the ladder from §22 with R1 placement before citing any banked negative"
     } else if V3D85_RCL_CLASS && store_verified {
@@ -13688,6 +13922,18 @@ fn v3d85_firstkick_rung() {
         mmu_ctl, (fault != 0) as u32,
         verdict
     );
+    // PI-V3D-87 — the two discriminator verdicts, each stated in the terms its own variant moves and
+    // each writing out BOTH branches, so the capture is self-reading in the boot6-9 style. They come
+    // after the R1 line because they are readings OF its columns.
+    match V3D85_VARIANT {
+        V3d85Variant::RclHead => {
+            v3d87_head_verdict(ba, ea, head_len, smp_n, smp_in_span, smp_max)
+        }
+        V3d85Variant::EmptyUnarm => {
+            v3d87_unarm_verdict(ba, ea, frame_closed, consumed, smp_n, smp_in_span, smp_max)
+        }
+        _ => {}
+    }
     v3d58_xengine("v3d85 firstkick", retired, wrote_any);
 
     // Leave the field clean, exactly as every rung in this file does.
