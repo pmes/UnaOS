@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use alloc::string::String;
 use crate::console::Console;
 use crate::fs::fat::{DirEntry, FatError, FatFs};
+use crate::vug;
 use crate::pal::TargetPal;
 
 /// JD4: the shell's current working directory as a NORMALIZED, CANONICAL absolute path
@@ -157,12 +158,9 @@ fn fat_errno(e: FatError) -> &'static str {
         FatError::Unsupported => "-EINVAL", // not a representable 8.3 name
         FatError::NoDisk | FatError::NotFat => "-ENODEV",
         FatError::Io | FatError::BadChain => "-EIO",
-        // PARTITION (GR9): an access that fell outside the mounted volume's own partition extent.
-        // Reported as `-EFAULT` rather than folded into `-EIO`, because it is categorically not a
-        // medium fault: the disk was never asked. It means the filesystem computed an address that
-        // is not its to touch, and the extent gate refused it before it reached the block layer. On
-        // a healthy volume this string never appears.
-        FatError::OutOfVolume => "-EFAULT",
+        // WEDGE-8 (F3): the storage driver's controller loan was busy past the bounded retry —
+        // the operation never started; running the command again is the honest remedy.
+        FatError::Busy => "-EAGAIN",
     }
 }
 
@@ -2294,22 +2292,21 @@ impl History {
 }
 
 /// Run one command. Returns `true` if the command took over the whole screen with its own
-/// graphics (e.g. `v3d`), so the caller should NOT repaint the console over it.
+/// graphics (e.g. `vug`), so the caller should NOT repaint the console over it.
 pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetPal) -> bool {
     // Split command and args (simple whitespace split)
     let mut parts = cmd_line.trim().split_whitespace();
     let command = parts.next().unwrap_or("");
     let args: Vec<&str> = parts.collect();
 
-    // PI-APP-1: `v3d` blits the visible battery onto the live scanout, so it keeps the console off
-    // (a repaint would overwrite the replayed tiles). It is now the ONLY screen-taking command —
-    // the `vug` crystal and the full-screen `pulse` monitor are gone (the pulse lives in the
-    // always-on bottom strip, `ui_status`). Aarch64+v3d only; with the knob off the command is
-    // never registered and nothing takes the screen.
+    // The `vug` and `pulse` commands paint full-screen views; everything else leaves the
+    // console visible. PI-APP-1: `v3d` blits the visible battery onto the live scanout, so it too
+    // keeps the console off (a repaint would overwrite the replayed tiles). Aarch64+v3d only; the
+    // knob-off build never registers the command, so this OR-clause is constant-folded away there.
     #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
-    let took_screen = command == "v3d";
+    let took_screen = command == "vug" || command == "pulse" || command == "v3d";
     #[cfg(not(all(target_arch = "aarch64", feature = "v3d")))]
-    let took_screen = false;
+    let took_screen = command == "vug" || command == "pulse";
 
     match command {
         "ver" | "version" => {
@@ -2342,15 +2339,20 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("          usnapls <gen> [path], usnapcat <gen> <path>  (read a snapshot; current-ACL enforced)");
             console.println("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
             console.println("          time  (shared civil clock: ISO-8601 UTC + source; unsynced until SNTP/setdate)");
-            console.println("SMP:      sched (per-CPU run queues)  [per-core load: the always-on pulse strip]");
+            console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
             #[cfg(target_arch = "aarch64")]
             console.println("          top  (per-core load: recent busy%, ctx-switches, last task)");
             // PI-APP-1: v3d-gated so the knob-off build's help text stays byte-identical to baseline.
             #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
-            console.println("APPS:     v3d (replay the visible GPU graphics battery)");
+            console.println("APPS:     vug (3D sculptor), v3d (replay the visible GPU graphics battery)");
             // BGRUN-1: background EL0 runs — the concurrent-apps line (windows coexist; TAB cycles).
-            #[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
+            #[cfg(feature = "baremetal")]
             console.println("PROC:     run <path> (foreground), bg <path> (background), jobs (list+reap), kill <pid>");
+            // STORM-HEADROOM: the verb existed since P77 but was never listed, so the one command an
+            // attended bench uses to load the scheduler was discoverable only from the source. The
+            // cap is stated here because it is the first thing a `storm 8` reading needs.
+            #[cfg(feature = "baremetal")]
+            console.println("          storm [n]  (launch n vugs; n>6 is refused by the process table — serial carries the [storm] census)");
             console.println("POWER:    batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
             console.println("WITNESS:  bootlog (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
@@ -2839,7 +2841,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // foreign volume-level path from the same surface. `vfs <op> <path>`.
             vfs_cmd(console, &args);
         },
-        #[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
+        #[cfg(feature = "baremetal")]
         "run" => {
             // EXEC-1: load an ELF64 EL0 program off the VFS namespace and execute it at EL0, reporting its
             // exit status. Rides the SAME `MountTable` the `vfs` verb uses (`/fat` = FAT boot partition,
@@ -3206,8 +3208,27 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 None => console.println("usage: get <a.b.c.d> [port] [path]"),
             }
         },
-        // PI-APP-1: the V3D visible-battery app. Registered as a shell-command match arm — the
-        // kernel's convention for a launchable UI program. It replays
+        "vug" => {
+             match args.first().copied() {
+                 Some("bebox") => {
+                     console.println("Vug: BeBox tribute (press any key)...");
+                     vug::run_bebox_mode(pal);
+                     // Tribute screen stays up; `took_screen` keeps the console off it.
+                 }
+                 Some("wire") => {
+                     console.println("Vug: sculpting the quartz (wireframe)...");
+                     vug::run_crystal(pal, vug::Mode::Wire);
+                     console.draw(pal); // clean exit: restore the shell over the demo
+                 }
+                 _ => {
+                     console.println("Vug: sculpting the quartz (solid)...");
+                     vug::run_crystal(pal, vug::Mode::Solid);
+                     console.draw(pal); // clean exit: restore the shell over the demo
+                 }
+             }
+        },
+        // PI-APP-1: the V3D visible-battery app. Registered in the same launcher path as `vug` (a
+        // shell-command match arm — the kernel's convention for a launchable UI program). It replays
         // the four visible V3D stages (gradient / animate / multi-primitive / blit) onto the live
         // framebuffer so the graphics are watchable while the system is up — the boot-time battery
         // flashes past before the monitor wakes. Reuses the state boot established (no GPU re-init);
@@ -3224,6 +3245,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 console.draw(pal);
             }
             // On a real replay `took_screen` keeps the console off the freshly-blitted tiles.
+        },
+        "pulse" => {
+            // UI1-M3: the full-screen system monitor (BeOS Pulse homage). Any key exits; the
+            // console repaints over it on the way out (same contract as the vug crystal).
+            console.println("Pulse: system monitor (press any key)...");
+            vug::run_pulse(pal);
+            console.draw(pal); // clean exit: restore the shell over the monitor
         },
         "tste" | "selftest" => {
             // The in-OS self-test suite (TSTE-1). Prints a three-section PASS/FAIL/SKIP table in the
@@ -3314,7 +3342,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
              crate::hlt_loop();
              crate::hlt_loop();
         },
-        #[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
+        #[cfg(feature = "baremetal")]
         "bg" => {
             // BGRUN-1: run an EL0 program in the BACKGROUND — the shell returns to its prompt at once and
             // the program keeps running (and, if windowed, its window stays OPEN, so TAB has a ring to
@@ -3322,16 +3350,133 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // dies, so real windows never coexisted before this verb). `bg <path>`.
             match args.first() {
                 None => console.println("usage: bg <path>   (run an ELF64 EL0 program in the background)"),
-                Some(&path) => bg_program(console, path),
+                Some(&path) => {
+                    bg_program(console, path);
+                }
             }
         },
-        #[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
+        #[cfg(feature = "baremetal")]
+        "storm" => {
+            // STORM-VERB (Peter, P77 sitting): launch a whole vug fleet in one command — `storm [n]`,
+            // default 6, so an operator can raise a load storm without typing `bg /fat/VUG.ELF` six
+            // times. Each launch is EXACTLY the bg path (same spawn, same job table, same messages);
+            // this verb adds the loop and, since STORM-HEADROOM, the MEASUREMENT around the loop. It
+            // still decides nothing about how a vug is spawned or where it is placed. Stops honestly
+            // at the first failure — a partial fleet is reported as such, never rounded up.
+            //
+            // STORM-HEADROOM — WHAT ACTUALLY BOUNDS `n`. The sentence this replaces ("the job table
+            // (8 slots) and PROCS-6's bg cap bound n") was true and useless: it named both bounds
+            // without saying which one BITES. The clamp below admits 8; `syscall::proc_table_rows()`
+            // is 6. So `storm 7` and `storm 8` cannot succeed as asked on ANY boot, empty or not —
+            // the seventh launch is refused by the process table, the loop stops, and the fleet that
+            // remains is the same fleet `storm 6` builds. The clamp stays at 8 deliberately: an
+            // operator who asks for more than the machine has must get a REFUSAL that names the
+            // resource, not a silently-lowered request that reads as if it were granted. The cap is
+            // not a knob — see the `MAX_PROCS` block in `arch::syscall` for why 6 is where the EL0
+            // slot reserve puts it, and treat moving it as an arc, not a tuning step.
+            //
+            // WHY THE CENSUS SITS HERE. Every scheduler quantity that could name a ceiling already
+            // exists, but on other clocks: the `:: SCHED: load ::` train is timer-driven (~1 s
+            // windows, metal-only) and `[fluid3]`/`[comp2]` ride the compositor. The seconds in which
+            // a fleet is being BUILT are shorter than one of those windows, so the launch boundary is
+            // the only clock that samples the machine at the instant its size changes. `pre` is taken
+            // before the first launch, one `[storm] k=` line after each successful one, `post` after
+            // the burst. That layout is what makes a WEDGE readable as well as a refusal: if the
+            // fleet starves the shell, this verb stops printing, and the last `k=` on the wire names
+            // the launch it stopped after. Its silence proves nothing on its own — the timer-driven
+            // `:: SCHED: load ::` / `[pulse5]` / `[spin1]` lines are the instruments that survive a
+            // starved shell, and they are what a silent tail must be read against.
+            let n = args
+                .first()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(6)
+                .clamp(1, 8);
+            // STORM-FATW: `fat` anywhere in the args arms the USB-traffic writer (below). A bare
+            // `storm fat` keeps the default fleet of 6 (the non-numeric arg falls through the parse).
+            let fatw = args.iter().any(|a| *a == "fat");
+            // Pre-flight resource census. The refusal string already names what ran out AT a refusal;
+            // this names the headroom when there is NO refusal, which is the reading "storm 6 launched
+            // 6/6" silently withholds. Taken before the burst so a partial fleet can be attributed to
+            // rows that were already spoken for (live work, corpses awaiting `jobs`, or the PORPHANED
+            // rows `jobs` can never reap) rather than to the cap.
+            let rows = crate::arch::syscall::proc_table_rows();
+            let (rows_free, rows_running, rows_exited, rows_orphaned) =
+                crate::arch::syscall::proc_table_headroom();
+            let (jobs_free, jobs_rows) = {
+                let j = BG_JOBS.lock();
+                (j.iter().filter(|s| s.is_none()).count(), j.len())
+            };
+            let slots_free = crate::arch::boot::user_slots_free();
+            console.println(&alloc::format!(
+                "storm: n={} — {}/{} process rows free, {}/{} job rows, {}/{} EL0 slots",
+                n, rows_free, rows, jobs_free, jobs_rows,
+                slots_free, crate::arch::boot::USER_SLOTS
+            ));
+            serial_println!(
+                ":: STORM: begin n={} | proc rows free={} running={} exited={} porphaned={} of {} | job rows free={}/{} | EL0 slots free={}/{} ::",
+                n, rows_free, rows_running, rows_exited, rows_orphaned, rows,
+                jobs_free, jobs_rows, slots_free, crate::arch::boot::USER_SLOTS
+            );
+            crate::arch::sched::storm_census("pre");
+            let mut launched = 0usize;
+            for _ in 0..n {
+                if !bg_program(console, "/fat/VUG.ELF") {
+                    // `bg_program` has already said WHY, but not uniformly on this wire: a SPAWN
+                    // refusal also prints `:: BGRUN: bg … rejected (…)` to serial, while an
+                    // IMAGE-READ failure (missing, empty or oversized /fat/VUG.ELF) is console-only.
+                    // A serial-only capture would therefore be unable to tell the fleet ceiling from
+                    // a bad card, which is exactly the confusion this arc exists to remove — so this
+                    // line re-reads the census rather than pointing at a neighbour that may not be
+                    // there. `free > 0` here means the table was NOT the limit.
+                    let (f, r, e, o) = crate::arch::syscall::proc_table_headroom();
+                    serial_println!(
+                        ":: STORM: REFUSED at launch {} of {} — fleet stands at {} | proc rows free={} running={} exited={} porphaned={} | EL0 slots free={} ::",
+                        launched + 1, n, launched, f, r, e, o,
+                        crate::arch::boot::user_slots_free()
+                    );
+                    break;
+                }
+                launched += 1;
+                crate::arch::sched::storm_probe(&alloc::format!("k={}/{}", launched, n));
+            }
+            console.println(&alloc::format!("storm: launched {}/{} vugs", launched, n));
+            serial_println!(":: STORM: launched {}/{} vugs ::", launched, n);
+            // Review must-fix (R23S1T): re-read the resource census UNCONDITIONALLY after the burst,
+            // not only on refusal. `user_slots_free`'s whole reason to exist is "did the 2-slot
+            // reserve survive a FULL fleet" — and the success path (storm 6, six launches, no
+            // refusal) is exactly the state that question is about. Nor is it derivable:
+            // `rows_free_before - launched` breaks the moment a vug faults mid-burst and leaves a
+            // PEXITED row, and `[spread10]`'s slot histogram counts residency, not SLOT_USED.
+            {
+                let (f, r, e, o) = crate::arch::syscall::proc_table_headroom();
+                serial_println!(
+                    ":: STORM: end | proc rows free={} running={} exited={} porphaned={} of {} | EL0 slots free={}/{} ::",
+                    f, r, e, o, crate::arch::syscall::proc_table_rows(),
+                    crate::arch::boot::user_slots_free(), crate::arch::boot::USER_SLOTS
+                );
+            }
+            // `post` is taken immediately, so its busy percents still carry the pre-burst window —
+            // that is intended: it is the ZERO MARK for the cumulative counters, against which the
+            // next few timer-driven windows are read. The settled fleet is described by those lines,
+            // not by this one.
+            crate::arch::sched::storm_census("post");
+            // STORM-FATW (Peter, R23 boot1 sitting): `storm [n] fat` also arms a kernel writer task
+            // that drives bounded USB storage traffic UNDER the fleet — the missing half of the
+            // WEDGE-8/F3 metal provocation (the fleet supplies preemption pressure; this supplies
+            // the driver-claim traffic). See `storm_fat_writer` for the two legs and their honesty
+            // rules. Armed AFTER the burst so the census lines above describe the fleet alone.
+            if fatw {
+                crate::arch::sched::spawn_auto("stormfatw", storm_fat_writer, 0);
+                console.println("storm: fat writer armed — watch :: STORM: fatw lines on serial");
+            }
+        },
+        #[cfg(feature = "baremetal")]
         "jobs" => {
             // BGRUN-1: list background programs and REAP the exited ones (this verb is the reaper — a
             // PEXITED row stays claimed until it is polled here, and the table is bounded). `jobs`.
             bg_jobs(console);
         },
-        #[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
+        #[cfg(feature = "baremetal")]
         "kill" => {
             // BGRUN-1: kill a background program by pid (SKILL-1 underneath — ASID-scoped, so ELF-2
             // sibling threads die with it; unconfirmed kills park the row PORPHANED and settle at the
@@ -3443,106 +3588,12 @@ fn parse_num(s: &str) -> Option<u64> {
 /// EXEC-1/BGRUN-1: the shared read-and-precheck front of `run` and `bg` — stat + bound + read off the
 /// VFS, then the friendly ELF64/aarch64 pre-check (the kernel loader is the real gate; a flat blob
 /// passes through to the position-independent flat path). `verb` names the caller in every message.
-#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
+#[cfg(feature = "baremetal")]
 fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc::vec::Vec<u8>> {
-    // WINX-3: fetch the bytes per-arch, then run the SHARED header pre-checks below on the result.
-    #[cfg(target_arch = "x86_64")]
-    let bytes = read_el0_image_bytes_x86(console, verb, path)?;
-    #[cfg(target_arch = "aarch64")]
-    let bytes = read_el0_image_bytes_aarch64(console, verb, path)?;
-    read_el0_image_check(console, verb, path, bytes)
-}
-
-/// WINX-3: the x86 byte fetch. It reads the FAT boot partition's ROOT DIRECTORY directly through
-/// `crate::fs::fat` rather than the VFS `MountTable` the aarch64 twin uses.
-///
-/// WHY, honestly: `fs/vfs.rs`'s `impl VfsBackend for FatBackend` (and for `NativeBackend`) is
-/// `#[cfg(target_arch = "aarch64")]`. Widening that would enable a large body of VFS code on x86 whose
-/// on-x86 behaviour this arc has not proven — x86 storage is the staged/flush model, not aarch64's
-/// synchronous in-place one — and `fs/` is outside this arc's lane besides. The FAT root read used here
-/// is the SAME API the x86 U2/U9x/U10x paths already exercise on this arch, so it rests on proven code.
-///
-/// CONSEQUENCE, and it is a real limitation: x86 `run`/`bg` accept a boot-partition root file only —
-/// `/fat/NAME` (or a bare `NAME`), 8.3 names, no subdirectories, no `/usb`, no native `/` volume.
-/// aarch64 keeps its full VFS namespace. Widening x86 to the full namespace is the follow-on that goes
-/// with making the VFS backends arch-neutral.
-#[cfg(target_arch = "x86_64")]
-fn read_el0_image_bytes_x86(
-    console: &mut Console,
-    verb: &str,
-    path: &str,
-) -> Option<alloc::vec::Vec<u8>> {
-    let cap = crate::arch::x86_64::syscall::user_window_size();
-    // Accept `/fat/NAME` (the documented operator form) or a bare `NAME`. Anything else names a volume
-    // this arch cannot reach yet — say so precisely rather than failing as "not found".
-    let name = match path.strip_prefix("/fat/") {
-        Some(n) => n,
-        None => match path.strip_prefix('/') {
-            // A rooted path into some other volume.
-            Some(_) => {
-                console.println(&alloc::format!(
-                    "{}: {}: x86 {} reads the FAT boot partition only — use /fat/<NAME>", verb, path, verb
-                ));
-                return None;
-            }
-            None => path,
-        },
-    };
-    if name.is_empty() || name.contains('/') {
-        console.println(&alloc::format!(
-            "{}: {}: x86 {} takes a boot-partition root file (no subdirectories)", verb, path, verb
-        ));
-        return None;
-    }
-    let fs = match crate::fs::fat::mount() {
-        Ok(f) => f,
-        Err(_) => {
-            console.println(&alloc::format!("{}: {}: no FAT boot partition mounted", verb, path));
-            return None;
-        }
-    };
-    let de = match fs.find_in_root(name) {
-        Ok(d) => d,
-        Err(_) => {
-            console.println(&alloc::format!(
-                "{}: {}: no such file on the boot partition (-ENOENT)", verb, path
-            ));
-            return None;
-        }
-    };
-    if de.size == 0 {
-        console.println(&alloc::format!("{}: {}: empty file", verb, path));
-        return None;
-    }
-    if de.size as usize > cap {
-        console.println(&alloc::format!(
-            "{}: {}: {} bytes exceeds the {}-byte EL0 user window (-E2BIG)",
-            verb, path, de.size, cap
-        ));
-        return None;
-    }
-    // Reject up-front from the ON-DISK directory size (the U2 truncation lesson): `read_file` caps the
-    // copy at min(de.size, cap), so a silently-short read would otherwise look like a valid small image.
-    let mut bytes = alloc::vec![0u8; de.size as usize];
-    if fs.read_file(&de, &mut bytes, cap).is_err() {
-        console.println(&alloc::format!("{}: {}: read failed", verb, path));
-        return None;
-    }
-    Some(bytes)
-}
-
-/// WINX-3: the aarch64 byte fetch — the original `read_el0_image` body, unchanged, over the full VFS
-/// namespace (`/` native, `/fat` boot partition, `/usb` stick).
-#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
-fn read_el0_image_bytes_aarch64(
-    console: &mut Console,
-    verb: &str,
-    path: &str,
-) -> Option<alloc::vec::Vec<u8>> {
     use crate::fs::vfs::NodeKind;
     // Cap = the kernel user window; a file at or under it may still be rejected by the loader (a flat blob
     // is re-bounded to one code page), but this is the hard read ceiling — we never read past it.
-    let cap: u64 = crate::arch::aarch64::boot::USER_REGION_SIZE as u64;
+    const CAP: u64 = crate::arch::aarch64::boot::USER_REGION_SIZE as u64;
     let mt = vfs_mount_table();
     let st = match mt.stat(path) {
         Ok(s) => s,
@@ -3559,10 +3610,10 @@ fn read_el0_image_bytes_aarch64(
         console.println(&alloc::format!("{}: {}: empty file", verb, path));
         return None;
     }
-    if st.size > cap {
+    if st.size > CAP {
         console.println(&alloc::format!(
             "{}: {}: {} bytes exceeds the {}-byte EL0 user window (-E2BIG)",
-            verb, path, st.size, cap
+            verb, path, st.size, CAP
         ));
         return None;
     }
@@ -3573,19 +3624,6 @@ fn read_el0_image_bytes_aarch64(
             return None;
         }
     };
-    Some(bytes)
-}
-
-/// WINX-3: the SHARED ELF header pre-check both arches run on the fetched bytes. A friendly check that
-/// only sharpens the error text — the kernel loader re-validates every one of these fields from scratch
-/// and is the actual authority. aarch64's messages and values are unchanged.
-#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
-fn read_el0_image_check(
-    console: &mut Console,
-    verb: &str,
-    path: &str,
-    bytes: alloc::vec::Vec<u8>,
-) -> Option<alloc::vec::Vec<u8>> {
     if bytes.len() >= 20 && bytes[0..4] == [0x7F, b'E', b'L', b'F'] {
         if bytes[4] != 2 {
             console.println(&alloc::format!("{}: {}: not an ELF64 image (EI_CLASS != 2)", verb, path));
@@ -3595,15 +3633,10 @@ fn read_el0_image_check(
             console.println(&alloc::format!("{}: {}: not little-endian (EI_DATA != 1)", verb, path));
             return None;
         }
-        // WINX-3: the expected e_machine is per-arch — 183 (EM_AARCH64) or 62 (EM_X86_64).
         let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
-        #[cfg(target_arch = "aarch64")]
-        let (want, arch_name) = (183u16, "aarch64");
-        #[cfg(target_arch = "x86_64")]
-        let (want, arch_name) = (62u16, "x86_64");
-        if machine != want {
+        if machine != 183 {
             console.println(&alloc::format!(
-                "{}: {}: not an {} image (e_machine {} != {})", verb, path, arch_name, machine, want
+                "{}: {}: not an aarch64 image (e_machine {} != 183)", verb, path, machine
             ));
             return None;
         }
@@ -3611,7 +3644,7 @@ fn read_el0_image_check(
     Some(bytes)
 }
 
-#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
+#[cfg(feature = "baremetal")]
 fn run_program(console: &mut Console, path: &str) {
     let Some(bytes) = read_el0_image(console, "run", path) else {
         return;
@@ -3619,15 +3652,7 @@ fn run_program(console: &mut Console, path: &str) {
     // Hand the bytes to the kernel loader: map into a fresh EL0 slot, run co-located, wait (bounded 5 s) for
     // the program to exit or fault. The image length + entry are reported for the witness.
     let n = bytes.len();
-    // WINX-3: a 5-second bound, expressed in each arch's own unit. aarch64's `run_user_image` takes a
-    // CNTPCT span (`cntfrq()` = one second) and its expression is unchanged; the x86 twin takes
-    // milliseconds against the global 1 kHz timebase. Deliberately NOT unified into one arch-neutral
-    // unit, because that would mean changing the aarch64 loader's signature — and aarch64 must stay
-    // byte-identical through this arc.
-    #[cfg(target_arch = "aarch64")]
     let deadline = 5 * crate::arch::aarch64::timer::cntfrq();
-    #[cfg(target_arch = "x86_64")]
-    let deadline: u64 = 5_000;
     match crate::arch::syscall::run_user_image("shell-run", &bytes, deadline) {
         Ok((outcome, entry)) => {
             use crate::arch::syscall::RunOutcome;
@@ -3645,6 +3670,14 @@ fn run_program(console: &mut Console, path: &str) {
                     ));
                     serial_println!(
                         ":: EXEC: run {} — loaded {} bytes, entry {:#x}, exit=FAULT ::",
+                        path, n, entry
+                    );
+                }
+                RunOutcome::Closed => {
+                    // CLOSE-CLEAN: the operator closed the window; the program's exit is clean.
+                    console.println(&alloc::format!("run: {}: closed (window close box)", path));
+                    serial_println!(
+                        ":: EXEC: run {} — loaded {} bytes, entry {:#x}, exit=CLOSED ::",
                         path, n, entry
                     );
                 }
@@ -3666,7 +3699,7 @@ fn run_program(console: &mut Console, path: &str) {
 
 /// BGRUN-1: one shell-side background job. The PATH is copied (bounded) so `jobs` can name it — the
 /// kernel row carries only the fixed task name. The pid is the durable key; asid rides for `kill`.
-#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
+#[cfg(feature = "baremetal")]
 #[derive(Clone, Copy)]
 struct BgJob {
     pid: u64,
@@ -3676,19 +3709,167 @@ struct BgJob {
 }
 
 /// BGRUN-1: the shell's job table. Bounded like every table in this kernel. LENS CORRECTION
-/// (round 1): the binding resource is the Proc table (`MAX_PROCS` = 4), not the 8 EL0 address-space
-/// slots — so the real ceiling is 3 bg jobs alongside one foreground `run`, and this table's
-/// full arm is reachable only if MAX_PROCS grows past it. 8 slots kept (harmless headroom).
+/// (round 1): the binding resource is the Proc table (`MAX_PROCS`), not the 8 EL0 address-space
+/// slots — so the real ceiling is `MAX_PROCS - 1` bg jobs alongside one foreground `run`, and this
+/// table's full arm is reachable only if MAX_PROCS grows past it. 8 slots kept (harmless headroom).
+/// PROCS-6 raised the cap to 6: 6 bg jobs with no foreground `run` (5 with one), still under this
+/// table's 8 and under the compositor's 8 windows, so the full arm remains unreachable — kept anyway,
+/// because it is what makes an untrackable job impossible rather than merely unlikely.
 /// Shell access is single-task, but the Mutex keeps the invariant explicit rather than relying on it.
-#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
+#[cfg(feature = "baremetal")]
 static BG_JOBS: spin::Mutex<[Option<BgJob>; 8]> = spin::Mutex::new([None; 8]);
+
+/// STORM-FATW: the bounded USB-traffic writer `storm [n] fat` arms — the driver-claim half of the
+/// WEDGE-8/F3 metal provocation (the vug fleet is the preemption half). Two legs, decided once at
+/// start by whether the stick carries a mountable FAT volume:
+///
+/// * **usb-fat leg** (a FAT16/32 stick is in): the FULL F3 chain — `create_in_root` /
+///   `write_grow` appends / periodic `delete_located`, all on `BlockSource::Usb`, so every round
+///   runs the masked FAT/dir RMW spans against the xHCI loan exactly as EL0 `SYS_WRITE` does.
+/// * **raw-scratch leg** (no FAT volume — the honest fallback, and it SAYS so): bounded
+///   read/write/verify rounds on the last-but-one LBA via `read_block_usb`/`write_block_usb`,
+///   original sector restored at the end (the `mission_write_selftest` RMW-restore discipline).
+///   This still contends for the claim under the fleet, but the masked-RMW leg is NOT exercised —
+///   the begin line names that, so a green run cannot be over-read.
+///
+/// Honesty rules: `Busy`/`-EAGAIN` outcomes are counted and reported as `busy=` — under WEDGE-8
+/// they are the fix WORKING (pre-fix, that contention was the silent dead core). Ten consecutive
+/// hard I/O errors abort the run rather than burn the remaining rounds on a dead device. Bounded
+/// (300 rounds, one `hlt` breather each) so an armed writer always ends and reports. Re-arming
+/// while one runs just adds a second contender — noisy but bounded, and contention is the point.
+#[cfg(feature = "baremetal")]
+fn storm_fat_writer(_: usize) {
+    use crate::fs::fat::BlockSource;
+    const ROUNDS: u32 = 300;
+    const REDELETE_EVERY: u32 = 64; // exercise the dir-RMW delete/create cycle, and cap file growth
+    let mut ok = 0u32;
+    let mut busy = 0u32;
+    let mut io = 0u32;
+    let mut io_run = 0u32; // consecutive hard errors — the abort counter
+    let fat_leg = crate::fs::fat::mount_source(BlockSource::Usb);
+    serial_println!(
+        ":: STORM: fatw begin rounds={} leg={} ::",
+        ROUNDS,
+        if fat_leg.is_ok() { "usb-fat (full F3 chain: masked RMW vs xHCI loan)" }
+        else { "raw-scratch (no FAT volume on the stick — masked-RMW leg NOT exercised)" }
+    );
+    let mut pattern = [0u8; 512];
+    match fat_leg {
+        Ok(fs) => {
+            const NAME: &str = "STORMW.TMP";
+            // (de-fields we carry between rounds: dir slot + chain head + size)
+            let mut cur: Option<(u64, usize, u32, u32)> = None; // (dir_lba, dir_off, first_cluster, size)
+            for r in 0..ROUNDS {
+                for (i, b) in pattern.iter_mut().enumerate() {
+                    *b = (r as u8) ^ (i as u8);
+                }
+                let step: Result<(), crate::fs::fat::FatError> = (|| {
+                    if cur.is_none() {
+                        let (de, lba, off) = match fs.find_located(NAME) {
+                            Ok(t) => t,
+                            Err(crate::fs::fat::FatError::NotFound) => fs.create_in_root(NAME, 0x20)?,
+                            Err(e) => return Err(e),
+                        };
+                        cur = Some((lba, off, de.first_cluster(), de.size));
+                    }
+                    let (lba, off, first, size) = cur.unwrap();
+                    if r % REDELETE_EVERY == REDELETE_EVERY - 1 {
+                        fs.delete_located(lba, off, first)?;
+                        cur = None;
+                        return Ok(());
+                    }
+                    let (_w, new_size, new_first) = fs.write_grow(first, size, lba, off, size, &pattern)?;
+                    cur = Some((lba, off, new_first, new_size));
+                    Ok(())
+                })();
+                match step {
+                    Ok(()) => { ok += 1; io_run = 0; }
+                    Err(crate::fs::fat::FatError::Busy) => { busy += 1; io_run = 0; }
+                    Err(_) => {
+                        io += 1;
+                        io_run += 1;
+                        cur = None; // re-resolve the slot next round — the volume may have moved under us
+                        if io_run >= 10 {
+                            serial_println!(":: STORM: fatw ABORT at r={} — 10 consecutive I/O errors ::", r);
+                            break;
+                        }
+                    }
+                }
+                if r % 50 == 49 {
+                    serial_println!(":: STORM: fatw r={}/{} ok={} busy={} io={} ::", r + 1, ROUNDS, ok, busy, io);
+                }
+                crate::hlt();
+            }
+            // Leave the volume clean: best-effort delete of the scratch file.
+            if let Some((lba, off, first, _)) = cur {
+                let _ = fs.delete_located(lba, off, first);
+            }
+            serial_println!(
+                ":: STORM: fatw done leg=usb-fat ok={} busy={} io={} (busy>0 with no freeze = WEDGE-8 witnessed live) ::",
+                ok, busy, io
+            );
+        }
+        Err(_) => {
+            let Some(dev) = crate::drivers::block::usb_info() else {
+                serial_println!(":: STORM: fatw done leg=none — no USB block device enumerated; nothing exercised ::");
+                return;
+            };
+            if dev.num_blocks < 4 {
+                serial_println!(":: STORM: fatw done leg=none — device too small for a scratch sector ::");
+                return;
+            }
+            let scratch = dev.num_blocks - 2;
+            let mut orig = [0u8; 512];
+            if crate::drivers::block::read_block_usb(scratch, &mut orig).is_err() {
+                serial_println!(":: STORM: fatw done leg=none — scratch LBA {} unreadable; nothing exercised ::", scratch);
+                return;
+            }
+            let mut verify = [0u8; 512];
+            for r in 0..ROUNDS {
+                for (i, b) in pattern.iter_mut().enumerate() {
+                    *b = (r as u8) ^ (i as u8);
+                }
+                let step: Result<(), crate::drivers::block::BlockError> = (|| {
+                    crate::drivers::block::write_block_usb(scratch, &pattern)?;
+                    let n = crate::drivers::block::read_block_usb(scratch, &mut verify)?;
+                    if n < verify.len() || verify != pattern {
+                        return Err(crate::drivers::block::BlockError::Io);
+                    }
+                    Ok(())
+                })();
+                match step {
+                    Ok(()) => { ok += 1; io_run = 0; }
+                    Err(crate::drivers::block::BlockError::Busy) => { busy += 1; io_run = 0; }
+                    Err(_) => {
+                        io += 1;
+                        io_run += 1;
+                        if io_run >= 10 {
+                            serial_println!(":: STORM: fatw ABORT at r={} — 10 consecutive I/O errors ::", r);
+                            break;
+                        }
+                    }
+                }
+                if r % 50 == 49 {
+                    serial_println!(":: STORM: fatw r={}/{} ok={} busy={} io={} ::", r + 1, ROUNDS, ok, busy, io);
+                }
+                crate::hlt();
+            }
+            // RMW-restore: put the original sector back, and say whether that succeeded.
+            let restored = crate::drivers::block::write_block_usb(scratch, &orig).is_ok();
+            serial_println!(
+                ":: STORM: fatw done leg=raw-scratch lba={} ok={} busy={} io={} restored={} (masked-RMW leg NOT exercised — no FAT volume) ::",
+                scratch, ok, busy, io, restored
+            );
+        }
+    }
+}
 
 /// BGRUN-1: `bg <path>` — read the image, spawn it detached, record the job. The shell prompt is
 /// back the moment this returns; the program (and its window, if it creates one) keeps running.
-#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
-fn bg_program(console: &mut Console, path: &str) {
+#[cfg(feature = "baremetal")]
+fn bg_program(console: &mut Console, path: &str) -> bool {
     let Some(bytes) = read_el0_image(console, "bg", path) else {
-        return;
+        return false;
     };
     let n = bytes.len();
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
@@ -3703,7 +3884,7 @@ fn bg_program(console: &mut Console, path: &str) {
                     "bg: {}: job table full — spawned pid {} was killed ({})",
                     path, pid, why
                 ));
-                return;
+                return false;
             };
             let mut name = [0u8; 32];
             let nlen = path.len().min(32);
@@ -3714,17 +3895,19 @@ fn bg_program(console: &mut Console, path: &str) {
                 ":: BGRUN: bg {} — loaded {} bytes, entry {:#x}, pid={} asid={} DETACHED ::",
                 path, n, entry, pid, asid
             );
+            true
         }
         Err(why) => {
             console.println(&alloc::format!("bg: {}: {}", path, why));
             serial_println!(":: BGRUN: bg {} — rejected ({}) ::", path, why);
+            false
         }
     }
 }
 
 /// BGRUN-1: `jobs` — list background jobs and reap the exited ones. This is the SOLE reaper for
 /// bg rows: an exited job's kernel row stays claimed (PEXITED) until it is polled here.
-#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
+#[cfg(feature = "baremetal")]
 fn bg_jobs(console: &mut Console) {
     use crate::arch::syscall::BgPoll;
     let mut jobs = BG_JOBS.lock();
@@ -3756,6 +3939,15 @@ fn bg_jobs(console: &mut Console) {
                 serial_println!(":: BGRUN: jobs — pid={} exit=FAULT reaped ::", job.pid);
                 *slot = None;
             }
+            BgPoll::Closed => {
+                // CLOSE-CLEAN: the operator clicked the window's close box — a clean, asked-for
+                // exit. Reads like a normal completed job, never like a fault.
+                console.println(&alloc::format!(
+                    "  pid {:>3}  closed (reaped)  {}", job.pid, name
+                ));
+                serial_println!(":: BGRUN: jobs — pid={} exit=CLOSED reaped ::", job.pid);
+                *slot = None;
+            }
             BgPoll::Gone => {
                 // Row already gone (e.g. a kill reaped it, or PORPHANED settled and was reclaimed by
                 // the exit path). Drop the stale entry honestly.
@@ -3771,7 +3963,7 @@ fn bg_jobs(console: &mut Console) {
 
 /// BGRUN-1: `kill <pid>` — kill a recorded background job (SKILL-1 underneath). The row is reaped by
 /// the next `jobs`; the table entry stays until then so the operator sees the outcome there.
-#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), target_arch = "x86_64"))]
+#[cfg(feature = "baremetal")]
 fn bg_kill_cmd(console: &mut Console, pid: u64) {
     let jobs = BG_JOBS.lock();
     let Some(job) = jobs.iter().flatten().find(|j| j.pid == pid).copied() else {
@@ -3808,9 +4000,8 @@ fn vfs_mount_table() -> crate::fs::vfs::MountTable {
 }
 
 /// Render a `VfsError` as an errno-style operator line, matching the shell's
-/// `-ENOENT`/`-EISDIR` house style. WINX-3: the body is arch-neutral, so the gate simply widened to
-/// cover x86's new `run`/`bg` callers; the aarch64 text is unchanged.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+/// `-ENOENT`/`-EISDIR` house style.
+#[cfg(target_arch = "aarch64")]
 fn vfs_err(e: crate::fs::vfs::VfsError) -> String {
     use crate::fs::vfs::VfsError::*;
     match e {

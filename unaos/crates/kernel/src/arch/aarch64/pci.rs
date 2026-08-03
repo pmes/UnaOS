@@ -122,7 +122,7 @@ pub fn init(dtb_addr: u64, dtb_size: usize) {
             xhci.start();
 
             // Store globally
-            *crate::drivers::xhci::XHCI_CONTROLLER.lock() = Some(xhci);
+            crate::drivers::xhci::install(xhci);
         }
     }
 }

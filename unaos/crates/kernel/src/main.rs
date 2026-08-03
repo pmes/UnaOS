@@ -952,7 +952,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial_println!(":: Enumerating USB. Plug in a stick / keyboard / mouse, then type or move the mouse. ::");
         serial_println!(":: Watch for: 'MISSION SUCCESS' (storage), 'POINTER ... ABSOLUTE/RELATIVE', 'KEY', and the USB-DEBUG lines below. ::");
         loop {
-            if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
+            // WEDGE-8 (F3): a claimed LOAN — the synchronous BOT work below runs with no lock
+            // held, so nothing that spins on the controller can ever wait out a preempted holder.
+            // Busy (another context has the loan) skips this pass; the next one is milliseconds out.
+            if let Ok(mut xhci) = unaos_kernel::drivers::xhci::claim() {
                 xhci.poll_events();
                 // BOOTPACE M2 — CONSOLE-FIRST: `service_ftdi` runs AHEAD of `service_storage`, so on
                 // the pass that finally releases the deferred SCSI bring-up the console has already
@@ -1115,10 +1118,48 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 // PIUSB-26: the xHCI event pump on its own ~4 ms cadence (see `usb_pump`). Co-located
                 // on the input core; timer-gated like the neighbours (its `sleep_ticks` nap needs the
                 // live timer IRQ). In QEMU raspi4b (not spawned) the input task's poll-nap still pumps.
-                unaos_kernel::arch::sched::spawn("usb-pump", usb_pump, 0, input_cpu);
+                // SCHED-PRIO: the HID-report path runs in the interactive SERVICE band. Its passes are
+                // micro (see `[piusb26]` — a `poll_events` on an empty ring), it naps between them,
+                // and it is the whole latency budget of a moving mouse: a pump pass that queues behind
+                // a spinning vug is a pointer report that arrives late, which is the P73 symptom.
+                unaos_kernel::arch::sched::spawn_prio(
+                    "usb-pump",
+                    usb_pump,
+                    0,
+                    input_cpu,
+                    unaos_kernel::arch::sched::PRIO_SERVICE,
+                );
             }
-            unaos_kernel::arch::sched::spawn("input", input_service, 0, input_cpu);
-            unaos_kernel::arch::sched::spawn("render", render_service, 0, render_cpu);
+            // SCHED-PRIO — the two panel service tasks join the band (see `sched::PRIO_SERVICE` for
+            // the policy, the non-starvation argument and the lock/inversion accounting).
+            //
+            //   * `input`  — the input ROUTER: drains the UART/HID source and posts into GUI_CHANNEL.
+            //     Everything downstream of a keystroke or a pointer report is gated on this task
+            //     getting the core.
+            //   * `render` — the COMPOSITOR PASS OWNER: `Screen::flush` → `wm::service_damage`, the
+            //     cursor bracket, and the deferred-erase queue's liveness guarantee. The triage
+            //     measured its composites collapsing 0.99→0.43/s under a six-vug fleet and its
+            //     WM-lock erase defers going 29%→76%; it was a round-robin peer of every one of those
+            //     fleets, on a core they are also placed on.
+            //
+            // `rx-backstop`, `status-tick` and `orphan-reaper` deliberately STAY at PRIO_NORMAL: the
+            // first two are coarse periodic pokes with no latency requirement (a late 4 Hz strip
+            // sample is invisible), and the reaper is background block I/O. Elevating them would put
+            // the strip's `format!` + full-width band fill ahead of the fleet for no panel benefit.
+            unaos_kernel::arch::sched::spawn_prio(
+                "input",
+                input_service,
+                0,
+                input_cpu,
+                unaos_kernel::arch::sched::PRIO_SERVICE,
+            );
+            unaos_kernel::arch::sched::spawn_prio(
+                "render",
+                render_service,
+                0,
+                render_cpu,
+                unaos_kernel::arch::sched::PRIO_SERVICE,
+            );
             // U11-M2b: the deferred-free REAPER — a forever kernel service task that frees a cluster chain
             // orphaned when a program EXITS holding the last cross-process open of an unlinked file (teardown
             // is the last close, but block I/O is illegal there, so `clear_files_row` queues the chain head and
@@ -1296,7 +1337,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     loop {
         // Poll xHCI Controller, then run any deferred storage work (synchronous BOT
         // transactions run here, in a safe non-event context).
-        if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
+        // WEDGE-8 (F3): a claimed LOAN — the BOT work runs with no lock held; a Busy claim
+        // (another context has the loan) skips this pass and the next frame retries.
+        if let Ok(mut xhci) = unaos_kernel::drivers::xhci::claim() {
             xhci.poll_events();
             // BOOTPACE M2 — CONSOLE-FIRST: `service_ftdi` ahead of `service_storage`, so the console
             // is armed before the deferred SCSI bring-up (which `service_storage` now holds until the
@@ -1346,6 +1389,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Gated on storage internally; re-flushes on growth, throttled; never blocks boot.
         #[cfg(target_arch = "x86_64")]
         unaos_kernel::flight_recorder::service();
+        // WITSWEEP (SERWIT-2 reachability): on x86 the mirror-tap announcement + one-shot verdict ride
+        // `flight_recorder::service()` (its first statement). That function is x86-only, so on aarch64
+        // the whole `[mirror]`/`:: SERWIT-2 ::` block never reached the wire and the TSTE tap-drop
+        // counters were write-only. Mirror the x86 placement here: this loop iteration is an IRQs-
+        // unmasked, no-locks-held, non-print context, exactly the contract `mirror_service` states.
+        // Always-on — SERWIT is law, not a knob. (The aarch64 BAREMETAL builds never reach this loop —
+        // the scheduler path owns them; their call rides `pump_usb_into_gui`, see there.)
+        #[cfg(target_arch = "aarch64")]
+        unaos_kernel::serial_ring::mirror_service();
         // U2 (x86): once a block device is present, load HELLO.BIN off the FAT volume and run it in
         // ring 3 (one-shot, gated like probe_once). Must live HERE, in the main loop — not with the
         // pre-xHCI U1a/U1b demo — because `fat::mount()` needs the usb-storage block device that
@@ -2222,7 +2274,7 @@ fn jd2_console_pump(_arg: usize) {
     };
     let phase1_start = cntpct();
     let first_key: Option<u8> = loop {
-        if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
+        if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
             x.poll_events();
         }
         match unaos_kernel::pal::next_event() {
@@ -2266,7 +2318,7 @@ fn jd2_console_pump(_arg: usize) {
     }
 
     loop {
-        if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
+        if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
             x.poll_events();
         }
         let mut keyed = false;
@@ -2709,6 +2761,16 @@ fn input_router_selftest() {
 ///       which is what the `IDLE_RUN_TO_LATCH` run threshold buys.
 ///   (F) genuine idle re-reports — an unchanged held set repeated past the threshold. MUST latch, so the P51
 ///       wedge guard still arms on the hardware it was written for.
+/// PAL-TYPEMATIC adds the CHAIN B legs — the defect KEYSTAT traced and specified but could not fix in its lane
+/// (a liveness lapse never re-armed, and the streaming verdict was boot-wide, so a hold could stop dead with
+/// the key still down and nothing on the wire):
+///   (G) LAPSE THEN STILL-HELD — the lapse disarms, then a report whose held set still contains the key must
+///       RE-ARM it and repeat again, with no release and no re-press anywhere in the sequence.
+///   (H) LAPSE THEN RELEASED — the same lapse, but the next report's held set is empty. The release outranks
+///       the parked key absolutely: nothing re-arms and no repeat is ever produced. This is the leg that
+///       proves the re-arm did not reopen the P51 stuck-repeat hole it sits next to.
+///   (I) VERDICT SCOPED TO ITS HOLD — latch the streaming verdict legitimately, then end the hold; the verdict
+///       must be gone, so the NEXT hold is judged on its own evidence rather than inheriting this one's.
 /// Runs once on the BSP before any input/render service task, when EVENT_QUEUE is empty; drains what it pushes.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn typematic_selftest() {
@@ -2767,19 +2829,80 @@ fn typematic_selftest() {
     pal::typematic_test_reset();
     while pal::next_event().is_some() {}
 
-    if baseline && suppressed && !repeated && rollover_clean && nonascii_clean && idle_latches {
+    // --- PAL-TYPEMATIC: chain B. The lapse must RE-ARM on evidence, and the verdict must expire with its hold.
+    // (G) LAPSE THEN STILL-HELD: a liveness lapse disarms 'g', but the next report still carries 'g' in its
+    //     held set. That report is proof the lapse's inference was wrong, so the repeat must resume — WITHOUT
+    //     a release and re-press, which is exactly what KEYSTAT recorded as the missing behaviour.
+    pal::typematic_test_reset();
+    pal::typematic_note_report(b'g', &[b'g']);
+    pal::typematic_test_force_lapse();
+    let lapse_disarms = pal::typematic_test_armed().is_none();
+    pal::typematic_note_report(0, &[b'g']); // no press edge — only "still held"
+    let lapse_rearms = pal::typematic_test_armed() == Some(b'g');
+    pal::typematic_test_force_due();
+    let rearm_repeats = pal::typematic_tick() == Some(b'g');
+    while pal::next_event().is_some() {}
+
+    // (H) LAPSE THEN RELEASED: the same lapse, but the next report's held set is EMPTY. A release outranks the
+    //     parked key absolutely — nothing may re-arm, and no repeat may EVER be produced afterwards. This is
+    //     the leg that keeps the re-arm from reopening the P51 stuck-repeat hole.
+    pal::typematic_test_reset();
+    pal::typematic_note_report(b'h', &[b'h']);
+    pal::typematic_test_force_lapse();
+    pal::typematic_note_report(0, &[]); // released
+    let release_beats_lapse = pal::typematic_test_armed().is_none();
+    let mut ghost_repeat = false;
+    for _ in 0..64 {
+        pal::typematic_test_force_due();
+        if pal::typematic_tick().is_some() {
+            ghost_repeat = true;
+            break;
+        }
+    }
+    while pal::next_event().is_some() {}
+
+    // (I) VERDICT SCOPED TO ITS HOLD: latch the streaming verdict the legitimate way (leg F's shape), then end
+    //     the hold. The verdict must be GONE — boot-wide stickiness is the half of chain B that made a later
+    //     silent hold stop after ~15 repeats with nothing on the wire.
+    pal::typematic_test_reset();
+    pal::typematic_note_report(b'i', &[b'i']);
+    for _ in 0..(pal::TYPEMATIC_IDLE_RUN_TO_LATCH + 1) {
+        pal::typematic_note_report(0, &[b'i']);
+    }
+    let hold_latches = pal::typematic_test_streams_latched();
+    pal::typematic_note_report(0, &[]); // the hold ends
+    let verdict_expires = !pal::typematic_test_streams_latched();
+    pal::typematic_test_reset();
+    while pal::next_event().is_some() {}
+
+    let chain_b = lapse_disarms
+        && lapse_rearms
+        && rearm_repeats
+        && release_beats_lapse
+        && !ghost_repeat
+        && hold_latches
+        && verdict_expires;
+
+    if baseline && suppressed && !repeated && rollover_clean && nonascii_clean && idle_latches && chain_b {
         serial_println!(
-            ":: uvug6: typematic — baseline repeat OK, backpressure suppressed inject, report-level release disarmed dropped-KeyUp hold; UVUG-9 evidence gate: rollover-release + non-ascii-tap did NOT latch, genuine idle re-reports DID :: PASS ::"
+            ":: uvug6: typematic — baseline repeat OK, backpressure suppressed inject, report-level release disarmed dropped-KeyUp hold; UVUG-9 evidence gate: rollover-release + non-ascii-tap did NOT latch, genuine idle re-reports DID; PAL-TYPEMATIC chain B: a liveness lapse RE-ARMS on a still-held report and repeats again, a release outranks it with no ghost repeat, and the streaming verdict expires with its hold :: PASS ::"
         );
     } else {
         serial_println!(
-            ":: uvug6: typematic — baseline={} suppressed={} repeated={} rollover_clean={} nonascii_clean={} idle_latches={} :: FAIL ::",
+            ":: uvug6: typematic — baseline={} suppressed={} repeated={} rollover_clean={} nonascii_clean={} idle_latches={} lapse_disarms={} lapse_rearms={} rearm_repeats={} release_beats_lapse={} ghost_repeat={} hold_latches={} verdict_expires={} :: FAIL ::",
             baseline,
             suppressed,
             repeated,
             rollover_clean,
             nonascii_clean,
-            idle_latches
+            idle_latches,
+            lapse_disarms,
+            lapse_rearms,
+            rearm_repeats,
+            release_beats_lapse,
+            ghost_repeat,
+            hold_latches,
+            verdict_expires
         );
     }
 }
@@ -2798,11 +2921,24 @@ fn typematic_selftest() {
 ///   (3) queued keys are forwarded into `GUI_CHANNEL` in the SAME `Event::Key` shape UART bytes take
 ///       (see `input_service`), so a USB keystroke reaches the shell/panel exactly like a serial byte.
 ///
-/// The XHCI_CONTROLLER lock is released before the drain (its guard scope ends) so a backpressured
+/// The xHCI loan (WEDGE-8) is returned before the drain (its scope ends) so a backpressured
 /// `GUI_CHANNEL.send` never blocks while holding the controller. Same global handle `enumerate` seeded.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn pump_usb_into_gui() {
-    if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
+    // WITSWEEP (SERWIT-2 reachability, baremetal leg): the aarch64 baremetal builds never reach the
+    // shared BSP loop below (the scheduler path owns them), so the mirror-tap announcement + one-shot
+    // verdict ride this pass instead — it runs from `usb_pump` (~4 ms cadence, metal) and from the
+    // `input_service` poll-nap branch (every cooperative pass, QEMU raspi4b), i.e. on every baremetal
+    // variant. Placed BEFORE the XHCI_CONTROLLER lock: `mirror_service` prints, and its contract is
+    // IRQs unmasked, no locks held, non-print context — all true at the top of a scheduled-task pass.
+    // A few relaxed atomic loads when quiet; prints only on un-announced loss + the one-shot verdict.
+    unaos_kernel::serial_ring::mirror_service();
+    // WEDGE-8 (F3): THE F3 HOLDER SITE. This claim is a LOAN, not a lock hold — the services below
+    // (service_storage's bring-up matrices reach `pump_until_bot_done`, budget hw_wait_budget()*3
+    // ≈ 8.3 s on a failing transfer) run with NO lock held, so a mid-service preemption of this
+    // task parks the CONTROLLER, not a lock every masked FS writer spins on. A Busy claim means a
+    // block-layer transaction is in flight; skip the pass — the next one is ~4 ms out.
+    if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
         x.poll_events();
         x.service_storage();
         x.service_hubs();
@@ -3038,10 +3174,10 @@ fn pump_usb_into_gui() {
     // This pump path runs on metal (the `usb_pump` ~4 ms task) and in QEMU raspi4b (the input
     // service's poll-nap fallback), so the storage-ready edge is finally polled where it matters.
     //
-    // DEADLOCK: the mount re-locks XHCI_CONTROLLER via `read_block_usb`, so it MUST run outside any
-    // scope holding that lock. The controller guard above is dropped at the end of its `if let`
-    // scope (before the event-drain loop), so we are lock-free here — same discipline as the main
-    // loop, where this call sits after `probe_once` with the guard released. The edge is one-shot
+    // LOAN DISCIPLINE (was DEADLOCK): the mount re-claims the xHCI loan via `read_block_usb`, so it
+    // MUST run outside any scope holding the loan — a claim while we still held it would return
+    // Busy and the mount would fail for the pass. The loan above is returned at the end of its
+    // `if let` scope (before the event-drain loop), so we are loan-free here. The edge is one-shot
     // per raise (`take_usb_ready`), so calling it every ~4 ms pass is a cheap no-op until a stick's
     // bring-up raises it, then it mounts + witnesses once (and again on every hot-plug re-enum).
     if !PIUSB28_ARMED.swap(true, core::sync::atomic::Ordering::Relaxed) {
@@ -3318,9 +3454,18 @@ fn input_service(_: usize) {
 /// redundantly pokes an empty FIFO (cheap). Never returns.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn rx_backstop(_: usize) {
+    // SPIN-4: phase markers — every prior theory about WHERE this task stalls (semaphore lock,
+    // run-queue lock, LL/SC false sharing) died with clean witnesses while the stall persisted.
+    // The task now states its own position: [spin1] prints phase+loops, so the stalled call names
+    // itself. 1 = about to sleep, 2 = returned from sleep / entering post.
+    use unaos_kernel::arch::sched::{RX_BS_LOOPS, RX_BS_PHASE};
+    use core::sync::atomic::Ordering;
     loop {
+        RX_BS_PHASE.store(1, Ordering::Relaxed);
         unaos_kernel::arch::sched::sleep_ticks(50); // ~200 ms at the 250 Hz per-core tick
+        RX_BS_PHASE.store(2, Ordering::Relaxed);
         unaos_kernel::arch::serial::RX_READY.post();
+        RX_BS_LOOPS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -3595,11 +3740,20 @@ fn render_service(_: usize) {
             let comps_per_s = s6_composites.saturating_mul(1000) / span.max(1);
             let mean_cyc = s6_cyc / s6_passes.max(1);
             serial_println!(
-                "[sched6] passes={}/s composites={}/s mean={} cyc/pass (dirty-paced strip@1Hz)",
+                // PULSE-4: the strip's cadence moved to 4 Hz; this witness's own 5 s span is
+                // deliberately UNCHANGED (wire volume). The label names the strip's rate, not this
+                // line's, so it tracks `PSTRIP_PERIOD_MS` rather than restating a stale literal.
+                "[sched6] passes={}/s composites={}/s mean={} cyc/pass (dirty-paced strip@{}ms)",
                 passes_per_s,
                 comps_per_s,
-                mean_cyc
+                mean_cyc,
+                unaos_kernel::ui_status::PSTRIP_PERIOD_MS
             );
+            // SCHED-PRIO: the dispatch-share line, emitted on `[sched6]`'s cadence and immediately
+            // after it, so a capture reads "composites=N/s" and "who won the dispatches that produced
+            // them" as one pair. This is the only site that fires while a fleet is actually live —
+            // the scheduler's own two emitters are metal-only and boot-once respectively.
+            unaos_kernel::arch::sched::prio_witness();
             s6_passes = 0;
             s6_composites = 0;
             s6_cyc = 0;
@@ -3608,7 +3762,8 @@ fn render_service(_: usize) {
     }
 }
 
-/// PI-UI-2 status-strip refresh pulse (metal only): once per second, post an `Event::Timer` to
+/// PI-UI-2 status-strip refresh pulse (metal only): once per `ui_status::PSTRIP_PERIOD_MS` (PULSE-4:
+/// 250 ms, was a hard-coded second — see that module's latency-budget note), post an `Event::Timer` to
 /// GUI_CHANNEL so the render task re-draws the status strip (lease IP / wall clock advance) even when
 /// no keystroke is arriving. Mirrors the `rx_backstop` shape — a tiny periodic wake, off the render
 /// core's critical path. Gated on `timer::is_live()` at spawn (a `sleep_ticks` nap needs the timer
@@ -3616,10 +3771,14 @@ fn render_service(_: usize) {
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn status_tick(_: usize) {
     loop {
-        unaos_kernel::arch::sched::sleep_ticks(250); // ~1 s at the 250 Hz per-core tick
+        // PULSE-4: the wake cadence is DERIVED from the strip's own sample period, not hard-coded
+        // beside it. This was `sleep_ticks(250)` — a literal second — and it is the OUTER term of the
+        // strip's latency budget: raising `PSTRIP_PERIOD_MS` alone would have left metal sampling at
+        // 1 Hz regardless, i.e. PULSE-4 doing nothing on the only machine whose panel Peter watches.
+        unaos_kernel::arch::sched::sleep_ticks(unaos_kernel::ui_status::PSTRIP_PERIOD_TICKS);
         // GUI-CLICK-2: suppress the status-strip pulse while a full-screen app owns the screen.
         // render_service is blocked inside dispatch_command and cannot drain GUI_CHANNEL, so an
-        // ungated 1 Hz Timer would fill the 64-slot channel in ~64 s — a slow re-run of the exact
+        // ungated Timer would fill the 64-slot channel in ~16 s at PULSE-4's 4 Hz — a re-run of the exact
         // saturation the pointer-path gate prevents (and the strip is not visible under the app
         // anyway). The pulse resumes the instant the command returns.
         // GUI-WIRE: the watchdog escape hatch. If the active full-screen app has stopped making
@@ -3713,9 +3872,17 @@ fn x86_usb_pump(cpu: usize) {
         // BSP is still finishing. One tick costs nothing and keeps the first pass off that seam.
         unaos_kernel::arch::sched::sleep_ticks(1);
         // Poll xHCI, then run any deferred storage work (synchronous BOT transactions run here, in a
-        // safe non-event context). The lock is released at the end of this block — everything below
-        // re-locks briefly, so there is no nested-lock hazard.
-        if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
+        // safe non-event context).
+        //
+        // WEDGE-8: this is a LOAN, not a lock. The controller is taken out of the shared slot under
+        // a masked O(1) hold and handed back when `loan` drops at the end of this block, so the
+        // multi-second BOT chain that `service_storage` can start runs with NO driver lock held —
+        // which is what stops a preempted holder from deadlocking a masked FS waiter (the F3
+        // family). A failed `claim()` means another context holds the loan, or the controller is not
+        // installed yet; either way this pass skips, exactly as the old `if let Some` did on an
+        // empty slot.
+        if let Ok(mut loan) = unaos_kernel::drivers::xhci::claim() {
+            let xhci = &mut *loan;
             xhci.poll_events();
             // BOOTPACE M2 — CONSOLE-FIRST: `service_ftdi` ahead of `service_storage`, so the console
             // is armed before the deferred SCSI bring-up puts its multi-second chain on the wire.
@@ -3996,6 +4163,14 @@ fn x86_render_service(cpu: usize) {
 // the ms-clock, and the verdict prints the real numbers either way — a timeout shows up as a short
 // `sent` count and reads FAIL, never as silence, which would be an ironic way for this particular
 // fixture to fail.
+// ── SERWIT-1 ────────────────────────────────────────────────────────────────────────────────────
+// Drive the serial-transport stress fixture: one kernel worker per online AP, all parked on a gate so
+// their bursts overlap instead of trickling one core at a time (a trickle would never contend, and a
+// fixture that cannot reproduce the defect it guards is decoration). The BSP is not scheduled, so it
+// waits the same bounded-on-`ticks()` way `await_verdict` does rather than joining, then prints the
+// verdict itself. Bounded on both ends: the wait gives up on the ms-clock, and the verdict prints the
+// real numbers either way — a timeout shows up as a short `sent` count and reads FAIL, never as
+// silence, which would be an ironic way for this particular fixture to fail.
 #[cfg(all(target_arch = "x86_64", feature = "witness"))]
 fn serwit1_run(online: &[usize]) {
     let workers = unaos_kernel::serial_ring::serwit_worker_count(online.len());

@@ -17,6 +17,20 @@
 #     Re-measured 2026-07-25 (MBENCH-HONEST, this host, 63 witnesses): 8 s -> 41/63 TRUNCATED;
 #     60 s -> 63/63 PASS, last required witness (`BANDY-ACL`) at line 1035 of 1682. The 8 s default
 #     this arc removed was not marginal — it stopped less than a third of the way through the chain.
+#     FLAKE-1 (2026-07-28): the exit contract GAINS a fourth code and loses none. 0 PASS / 1 FAIL /
+#     3 TRUNCATED are exactly as above; NEW `4` = HARNESS FLAKE — QEMU never produced a capture, so the
+#     run is neither a pass, a regression, nor a truncation. It exists because a `kernel8-test 150` on
+#     this bench finished GREEN with no serial-pi.log at all: mbench errored `[Errno 2] No such file or
+#     directory` and a downstream `&&` masked it. Cause is a check-then-bind race on the QMP port (the
+#     `lsof` pre-scan runs, QEMU binds seconds later after the build, and a concurrent worktree gate can
+#     win the bind and kill ours before `-serial file:` creates the log) — unclosable atomically from
+#     shell, so `test_kernel8()` now gates on LIVENESS (pid alive + log non-empty within
+#     UNAOS_K8T_LIVE_SECS, default 5) and RETRIES on the next port, twice, loudly; exhausted retries or
+#     an empty log at assert time exit 4 instead of reaching mbench with nothing to replay.
+#     Second FLAKE-1 measurement, and why TRUNCATED now mentions host load: the sufficient window is
+#     LOAD-DEPENDENT. Same host, same image, 2026-07-28 — 150 s -> TRUNCATED under concurrent
+#     build/QEMU load; 210 s -> PASS clean. This is the same MACHINE-DEPENDENT margin noted above,
+#     observed within ONE machine over time rather than between machines.
 #   Metal:      ~/pi-serial.log (pi-bench-connect.sh bridge capture)
 #
 # Metal caveat (unaos-hazards): some real-Pi boots bring up only 3 of 4 cores and
@@ -71,6 +85,19 @@ REQUIRE U5: capabilities.*-> PASS
 REQUIRE U6: general object table.*-> PASS
 REQUIRE U6b: real File handles.*-> PASS
 REQUIRE U7: cross-process transfer.*-> PASS
+# U7FIX (P63 metal-only): the U7 fixtures' GO parks must outlast the LAUNCHER, and the launcher's deadlines
+# are wall-clock while a bare-yield park is denominated in ITERATIONS — ~1 ms each under QEMU's emulation but
+# a few hundred ns on a real idle A72 core. On metal the child gave up before GO was ever released
+# (`child=0x0 used=0 snap=false`, parent stuck at the partial `0x3`). The park primitive is SYS_SLEEP_MS now
+# (a real 250 Hz tick on metal; still a cooperative yield under QEMU, where nothing was broken).
+# NOTE what this REQUIRE can and cannot do: because SYS_SLEEP_MS degrades to a yield under QEMU, QEMU cannot
+# tell the fixed park from the broken one and CANNOT gate the fix itself — that confirmation is the bench's.
+# What it DOES gate, on both, is the launcher's new parked-out assertion: neither fixture may have exited
+# before its GO was released. That is the fact that names the defect directly, and its absence is what made
+# P63 a puzzle. The reported margins are also the early warning — they shrink before they cliff.
+REQUIRE \[u7fix\] park margin — child parked [0-9]+ms before GO \(parked_out=0\), parent parked [0-9]+ms before GO \(parked_out=false\); park primitive=SYS_SLEEP_MS budget=0x8000
+FORBID \[u7fix\] .*child parked [0-9]+ms before GO \(parked_out=[1-9]
+FORBID \[u7fix\] .*parent parked [0-9]+ms before GO \(parked_out=true
 REQUIRE U8: revocation trees.*-> PASS
 REQUIRE U9: real File writes.*-> PASS
 REQUIRE U10: file growth.*-> PASS
@@ -310,6 +337,26 @@ FORBID \[wc-d\] verify .*-> FAIL
 REQUIRE \[wc-fv\] focus-vis .*-> PASS
 FORBID \[wc-fv\] focus-vis .*-> FAIL
 
+# --- 4c. WEDGE-1r2: the drain barrier's DWELL ledger must reach the wire. WEDGE-1's `DRAIN STALLED`
+# ---    tripwire measures only past ~10^8 spins and speaks through a blocking serial lock, so its
+# ---    silence carried no information — and §WEDGE-2 banked it as "the drain barrier is exonerated"
+# ---    across three silicon lockups. `[wedge1] dwell` is the reading below that threshold. It is
+# ---    REQUIREd for the reason the arc exists: an instrument that can vanish without the gate
+# ---    noticing is an instrument whose next silence gets misread the same way.
+# ---    `-> QUIET` (drains ran, none of them spun) is the healthy gate answer — as is `-> SPUN`
+# ---    (WEDGE-1r3: a short spin was measured and stayed under `note`; PA6 metal printed exactly
+# ---    this and the old ladder banked it as QUIET). But the REQUIRE
+# ---    pins only the LINE, not the verdict: under a loaded CI host a slow QEMU blit honestly reads
+# ---    DWELL/INFLIGHT, and a gate that fails on an honest reading teaches people to ignore it
+# ---    (lens fix, s1u — the verdict pin was a flake in waiting). The gate question is "does the
+# ---    instrument still exist and publish", and that is what the pattern below asserts.
+REQUIRE \[wedge1\] dwell drains=.*spin_max=.*->
+
+# --- STORM-HEADROOM (s1u lens nit): the boot-baseline census is the proof the storm instrument
+# ---    still exists and publishes — the same existence-pin rationale as the dwell REQUIRE above.
+# ---    Without it, the load_accounting_witness call could vanish with the gate green.
+REQUIRE \[storm\] boot-baseline \| busy
+
 # --- BGRUN-1: background EL0 runs (bg/jobs/kill). Headless-observable core of the contract,
 # ---   REQUIREd per the round-1 lens: leg 1 proves spawn->exit->reap (the sole-reaper contract);
 # ---   leg 2 proves a killed bg row settles (confirmed-kill reaps in place; no leaked PRUNNING row
@@ -323,8 +370,13 @@ FORBID \[wc-fv\] focus-vis .*-> FAIL
 # ---   races its own exit. Leg 3 keeps the persistence proof regardless: STAT.ELF has no exit condition
 # ---   AT ALL, focused or not, where VUG's persistence is conditional on the detached bit.
 REQUIRE BGRUN-ST: spawn->exit->reap PASS
+# --- PROCS-6: the cap itself, pinned. The reclaim leg below drives MAX_PROCS+2 launches, so its own
+# ---   PASS text cannot tell you which capacity it exercised; this line can, and a silent regression
+# ---   of the cap back to 4 (or a raise past the EL0 slot pool) fails HERE rather than mysteriously.
+REQUIRE BGRUN-ST: process table capacity = 6 rows \(bg programs alive at once; EL0 slots 8\)
 # --- BGRUN-SCAV: exited-but-unreaped rows must not deny a launch the machine can satisfy. MAX_PROCS+2
-# ---   bg launches with NO intervening reap; every one must succeed. Goes red on the pre-fix kernel.
+# ---   bg launches with NO intervening reap; every one must succeed (8 launches at the PROCS-6 cap, the
+# ---   last two served only by the PEXITED scavenge). Goes red on the pre-fix kernel.
 REQUIRE BGRUN-ST: slot reclaim PASS
 REQUIRE BGRUN-ST: kill mid-run PASS \(pid=[0-9]+, killed — row reaped
 REQUIRE BGRUN-ST: persist\+kill PASS \(pid=[0-9]+,
@@ -602,6 +654,39 @@ FORBID \[wc-k\] .*contig=no
 FORBID \[wc-k\] .*-> SPLIT
 FORBID \[wc-k\] .*-> AT-RISK
 FORBID \[wc-k\] .*-> UNSTAGED
+# --- WC-L: the direct fallback is GONE. P64 (capture pi4-r23s1o) caught WC-K's last resort firing
+# ---    twice on focus tab-cycle transitions at ~99% core load --
+# ---    `[wc-k] erase box=514x526 staged=no reason=lock -> DIRECT` -- which is the exact
+# ---    front-buffer writing shape WC-G convicted and WC-K existed to remove. A fill that cannot
+# ---    take the staging lock is now queued as DEFERRED DAMAGE and erased through the staged path
+# ---    by the next composite pass, which also re-damages the windows the paint reached (WC-J's
+# ---    `reclaim` shape, reused). One frame late is a cost; a torn front-buffer write is a defect.
+# ---
+# ---    The two FORBIDs above are therefore now unreachable BY CONSTRUCTION rather than by luck:
+# ---    no emitter in `wcg` can produce `staged=no` or `-> DIRECT` for `[wc-k]` at all. They stay,
+# ---    because they are where a reintroduced fallback would land.
+# ---
+# ---    `-> DEFERRED` is REQUIRED, not merely permitted: a witness build forces exactly one
+# ---    deferral per boot (the one-shot fixture in `wm::stage_fill`), because QEMU has no
+# ---    contention of its own and a path whose only witness is a hardware boot is a path that
+# ---    regresses between hardware boots -- which is how WC-K shipped a fallback nobody had seen
+# ---    fire. The `BUFFERED` line the drain produces one pass later is covered by the REQUIRE above.
+# ---
+# ---    `staged=drop`/`-> LOST` is a fill that could neither stage nor defer (permanent `geom`/`cap`
+# ---    reasons, unreachable on any panel this kernel drives). It feeds `declines=` and so the
+# ---    `-> UNSTAGED` FORBID; the explicit FORBID here names the symptom as well as the verdict.
+# ---
+# ---    `-> STARVED` is the DELIVERY verdict, and it is separate from the tearing one on purpose. A
+# ---    deferral that arrives is a latency cost; a deferral that keeps being requeued is a repaint
+# ---    that has NOT happened, which on the panel is a dead window's last frame where the desktop
+# ---    should be -- the P61 ghost by a new route. `TEAR-FREE` printed over that would be exactly
+# ---    WC-K's mistake (a verdict describing the samples it liked rather than the panel), so past
+# ---    `E_REDEFER_MAX` requeues the rollup says STARVED instead. It also gets a one-shot
+# ---    `scope=starve` line of its own, because the sampled rollup fires at fill 4 and starvation
+# ---    by its nature arrives late -- an already-printed rollup cannot retract.
+REQUIRE \[wc-k\] erase box=.* staged=defer reason=.* requeued=no -> DEFERRED
+FORBID \[wc-k\] .*-> LOST
+FORBID \[wc-k\] .*-> STARVED
 # --- PULSE-2: the always-running per-core CPU pulse, as an INSTRUMENT PANEL in the standing gap at
 # ---    the bottom of the panel -- below the tiled windows, above the PI-UI-2 status line.
 # ---
@@ -650,11 +735,76 @@ REQUIRE \[pstrip\] armed .*full=1000
 # ---    change draws nothing at all. Requiring a rollup whose `skipped=` is non-zero pins that the
 # ---    always-running pulse is genuinely paced and not a 1 Hz repaint wearing a flag.
 REQUIRE \[pstrip\] rollup samples=[0-9]+ redraws=[0-9]+ skipped=[1-9]
-# ---    The busy-loop FORBID. The rate is printed in tenths precisely so this can bite: anything at
-# ---    or above 5.0 presents/s sustained over a rollup window is the strip having become a spinner
-# ---    on the render core -- the SCHED-6 regression, re-entered through the pulse. 4.x and below is
-# ---    left legal so a genuinely churning machine is not called a bug.
-FORBID \[pstrip\] rollup .*rate=([5-9]|[1-9][0-9]+)\.[0-9]/s
+# --- PULSE-3: THE SOURCE, not the pacing.
+# ---
+# ---    P64, attended, capture pi4-r23s1o. Three vugs held the cores at a sustained 99% and the
+# ---    vugband workers churned ~1M context switches a window; the strip printed
+# ---    `rollup samples=10 redraws=0 skipped=10` and Peter watched the gradient LEDs sit still.
+# ---    Verbatim: "gradient good but pulse not real-time".
+# ---
+# ---    The dirty test was right and the 1 Hz pace was right. The FEED was wrong. PULSE-STRIP took
+# ---    vug's VUG-1 M3b counters (`meter_cpu_ticks` -- CPU_BUSY/CPU_IDLE, bumped once per dispatch
+# ---    PASS) and PULSE-2 carried them forward. Those are pass counts, and the scheduler had already
+# ---    retired that metric: SCHED-5's own note is "TIME, NOT PASSES ... it counts scheduler
+# ---    activity, not CPU time". A core running CPU-bound tasks back to back dispatches at a
+# ---    near-constant rate and never reaches the empty-queue branch, so busy/(busy+idle) pins at full
+# ---    scale and stays flat while the utilization underneath it wanders. Hence a bar that never
+# ---    moved -- and hence `[spinhunt]`'s `load settled c2=53` disagreeing with SCHED's `c2=99%` in
+# ---    the same window: two sources, and the panel was reading the wrong one.
+# ---
+# ---    The strip now reads `sched::core_load().busy_pct_recent` -- the SCHED-5/SCHED-7 rolling
+# ---    ~250 ms CNTPCT busy-TIME fraction, the same number `top` and the `SCHED: load` heartbeat
+# ---    print, so instrument and console can no longer disagree about one core. `meter_cpu_ticks`
+# ---    remains the fallback for a core SCHED-8 reports untracked, which is where VUG-HONESTY's
+# ---    PARKED decision lives, so a frozen non-demo core still reads parked and never a fabricated bar.
+# ---
+# ---    `live=k/n` is the assertion that the strip is ON that feed: k counts cores returning a live
+# ---    number. `live=0/n` is the regression exactly -- every core back on the dispatch-pass
+# ---    fallback. (k==n is NOT required: a core legitimately outside `run()` is honestly untracked.)
+REQUIRE \[pstrip\] src live=[1-9][0-9]*/[0-9]+ quantum=[0-9]+ stepres=([0-9]+px|coarse) mono=(yes|no) (PASS|FAIL|SKIP-GEOM)
+FORBID \[pstrip\] src live=0/
+# ---    The other half: a real-time source is worth nothing to a meter too coarse to render its
+# ---    steps. `stepres=` is what ONE source quantum (1% -> 10 permille) moves the lit length on this
+# ---    panel's bar; zero means the display quantizes the feed away and the bars would freeze again
+# ---    for a different reason. `mono=` catches a geometry collapsed to a constant fill being read as
+# ---    a steady load.
+# ---
+# ---    A RED MUST NAME THE RIGHT SUBSYSTEM. `stepres` is bar_w/100, so on any panel whose bar is
+# ---    under 100 px it is zero for a GEOMETRY reason -- a shrunken UNAOS_FBW, a WC-F reservation
+# ---    that grew, a layout regression -- and a blanket `stepres=0px` FORBID would report every one
+# ---    of those as a SOURCE regression, i.e. exactly backwards. So the witness refuses to state a
+# ---    pixel resolution it cannot attribute: below the bound it prints `stepres=coarse` and verdicts
+# ---    SKIP-GEOM, and the geometry FORBIDs on the `armed` line above (`panel=..0x..`, `row_h=0`,
+# ---    single-digit `leds=`) are what go red instead. `stepres=0px` is therefore only ever printed
+# ---    by a panel wide enough to have resolved the step, where it does mean what this FORBID says.
+FORBID \[pstrip\] src .*stepres=0px
+FORBID \[pstrip\] src .*mono=no
+FORBID \[pstrip\] src .*FAIL
+# ---    x86 has no `core_load` and is deliberately untouched by PULSE-3, so there is no live feed to
+# ---    be on or off there; the witness reports `live=n/a ... SKIP-ARCH` on that arch rather than
+# ---    standing a permanent FAIL in every x86 log. This spec is pi4-only, so SKIP-ARCH must not
+# ---    appear here -- an aarch64 boot printing it would mean the cfg gate itself has inverted.
+FORBID \[pstrip\] src .*SKIP-ARCH
+# ---    `srcdelta=` in the rollup is the replay-visible half of "not real-time": the count of windows
+# ---    in which the SOURCE moved, printed beside the count actually drawn. A busy window that reads
+# ---    `srcdelta=0` is a stale feed; a window with a large `srcdelta` and `redraws=0` is the dirty
+# ---    test swallowing real movement. Neither was legible in the P64 capture, and both are now.
+REQUIRE \[pstrip\] rollup .* srcdelta=[0-9]+ rate=
+# ---    The busy-loop FORBID. The rate is printed in tenths precisely so this can bite: a rate
+# ---    sustained above the strip's own legal ceiling over a rollup window is the strip having become
+# ---    a spinner on the render core -- the SCHED-6 regression, re-entered through the pulse.
+# ---    PULSE-4 raised the bound 5.0 -> 6.0, because the ceiling moved and the old bound no longer
+# ---    had headroom above it. Two independent sources feed rate=: the sample-paced load redraws,
+# ---    capped by PSTRIP_PERIOD_MS (4/s at 250 ms), and the status TEXT redraw, which is outside the
+# ---    period gate and fires on the composed line's seconds field (~1/s). A busy 10 s window can
+# ---    therefore reach exactly 5.0/s legitimately -- a false red on a correctly-paced strip.
+# ---    6.0 is deliberately kept as a bound on `rate=` in its full meaning (every present the strip
+# ---    causes, whatever drove it) rather than netting the text redraws out: a spinner that repainted
+# ---    via the text path would be just as much the regression this catches, and excluding a term
+# ---    from the number is how a witness stops measuring the thing it is named after. The margin is
+# ---    now 1.0/s over the legal ceiling, so a real spinner (free-running at the event rate, tens/s)
+# ---    still trips it by a wide margin.
+FORBID \[pstrip\] rollup .*rate=([6-9]|[1-9][0-9]+)\.[0-9]/s
 # --- SPINHUNT: a worker thread whose leader exited without joining it must reach a terminus.
 # ---
 # ---    P61: with several bg vugs launched, killed and relaunched, one core read a SUSTAINED 99%
@@ -713,3 +863,42 @@ FORBID SPINHUNT: .*-> FAIL
 # ---    tie-break in `pick_cpu` gives 2..=3. See docs/dev/OS/02_KERNEL_CORE/userspace.md BG-SPREAD.
 REQUIRE BGSPREAD: 3 bg launches over [0-9]+ online cores -> cores [0-9]+,[0-9]+,[0-9]+ distinct=[2-9] \(want >= 2\) PASS
 FORBID BGSPREAD: .*-> FAIL
+
+# SPREAD-2 — VUG-PAR band distribution. The `[spread2]` rollup only exists when the image carries the
+# `vugpar` feature (UNAOS_VUGPAR=1), which the default suite does not set, so these are FORBIDs rather
+# than a REQUIRE: zero hits on a default log, real assertions on a UNAOS_VUGPAR=1 log. Under vugpar the
+# rollup reads e.g. `cores 4 bands 60,60,38,60 rows 3755,3149,1781,1939 rpb 6258,5248,4686,3231 ratio 193`.
+#
+# `ratio` is max/min ROWS-PER-BAND in hundredths, not max/min rows: a core that goes tracked late in a
+# window draws fewer bands, and comparing its raw row total would red a perfectly healthy split.
+# Normalized, the weights are bounded — headroom runs 100 down to HEADROOM_FLOOR (25), so the fattest
+# average band can legitimately be 4x the thinnest and no more. 5x or worse means the weighting
+# inverted or ran away (or the `lo == 0` sentinel fired: a core drew bands but no rows all window).
+# There is deliberately no `cores 1` tripwire: `nh == 0` exits to the serial path before any rollup,
+# so nbands is always >= 2 and such a line cannot print.
+FORBID \[spread2\] .* ratio ([5-9][0-9]{2}|[0-9]{4,})
+
+# CLOSE-BOX — the close button (P79: "put a close button in the upper right of the windows to
+# exit"), and the ONE action click in the CLICK-SELECT grammar: a press in a window's close box is
+# consumed by the router, closes the owner's windows, and kills the owner. Leg 9 of the hit-test
+# witness drives the shipped router with a probe window's close box placed under the real cursor;
+# `close=true` is the row provably going away through a routed press. CLOSE-FIX (P82) adds leg 10:
+# `closereal=true` is the SAME arm reaping a row the battery created through the ordinary path,
+# with the settle read-back asserted `noproc-selftest` — the leg that fails if a close resolves to
+# the wrong row or the discriminator regresses. The line is the whole CLICK-ROUTE suite's verdict,
+# so pinning it here also pins legs 1-9 (`-> PASS` at the tail).
+# See docs/dev/OS/08_VIDEO/engine.md CLOSE-BOX.
+REQUIRE \[clickroute\] hit-test at .*close=true closereal=true -> PASS
+
+# CLOSE-FIX (P82) — the wire DISCRIMINATOR. The bench read `close=win3 asid=3085 settle=noproc`
+# and could not tell the selftest's synthetic no-op from a real click whose ASID-scoped kill found
+# nobody (the leg's own line was byte-identical to the failure it slept through). The battery's
+# close legs must now settle `noproc-selftest` — REQUIREd here — and a plain `settle=noproc` on
+# this gate is FORBIDden outright: no operator clicks on a headless gate, so the only thing that
+# can print it is a close resolving a real slot ASID with no process behind it — P82's exact
+# kill-finds-nobody shape. The teardown guard's LEAK line is the third tripwire: a synthetic row
+# that outlives the battery polluted a whole bench boot's hit-tests, so a reap at teardown is a
+# FAIL, never housekeeping.
+REQUIRE \[clickroute\] close=win[0-9]+ asid=[0-9]+ at .* settle=noproc-selftest
+FORBID \[clickroute\] close=.* settle=noproc$
+FORBID \[clickroute\] hit-test teardown LEAK

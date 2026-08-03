@@ -45,12 +45,9 @@ struct Damage {
 }
 
 impl Damage {
-    /// VUG-FPS-4 — does `self` cover every pixel of `o`? The no-dropped-pixel invariant of
-    /// [`DamageSet`] stated as a predicate, which is what the boot selftest checks.
-    #[cfg(feature = "witness")]
     #[inline]
-    fn contains(&self, o: &Damage) -> bool {
-        self.x0 <= o.x0 && self.y0 <= o.y0 && self.x1 >= o.x1 && self.y1 >= o.y1
+    fn overlaps(&self, o: &Damage) -> bool {
+        self.x0 < o.x1 && o.x0 < self.x1 && self.y0 < o.y1 && o.y0 < self.y1
     }
     #[inline]
     fn union(&self, o: &Damage) -> Damage {
@@ -76,17 +73,6 @@ impl Damage {
 /// SUPERSET of the true damage — never drops a dirty pixel, only (rarely) reflushes a clean one.
 const MAX_DAMAGE_RECTS: usize = 16;
 
-/// VUG-FPS-4 — the merge floor: a fusion whose RESULT is no bigger than this is always taken, even
-/// when the byte test below would refuse it. Rationale in the same currency as the test: a rect this
-/// small costs less to reflush whole than it costs to carry a second entry through the flush loop
-/// (and through the WC-I span walk, which is per-rect), and holding the slot open is what keeps the
-/// set from overflowing into a forced bridge later. 64x64 px = 16 KiB at 32 bpp, ~0.15% of one
-/// 1920x1200 frame. Because a rect that reached its size through this clause is BY CONSTRUCTION at
-/// most this large, the total slack the clause can inject is bounded by
-/// `MAX_DAMAGE_RECTS * MERGE_FLOOR_PX` (256 KiB on that panel) no matter how many marks a frame
-/// makes — the cost model stays bounded, which is the whole point of it.
-const MERGE_FLOOR_PX: u64 = 64 * 64;
-
 /// A small bounded set of damage rectangles. `len == 0` means nothing changed (flush is a no-op).
 struct DamageSet {
     rects: [Damage; MAX_DAMAGE_RECTS],
@@ -108,52 +94,17 @@ impl DamageSet {
         self.len = 1;
     }
 
-    /// VUG-FPS-4 — the merge question, answered in the currency the flush actually spends: BYTES.
-    ///
-    /// The present walks the set and blits each rect row by row, so a frame's flush cost is the SUM
-    /// OF THE RECTS' AREAS. Overlap is not a correctness problem for it — two rects sharing pixels
-    /// simply copy those pixels twice, which is exactly what "sum of areas" already says. So fusing
-    /// `a` and `b` is worth it precisely when the fused box costs no more than the two blits it
-    /// replaces: `union.area() <= a.area() + b.area()`.
-    ///
-    /// That is a COST test, not a topology test, and the difference is the bug it fixes. The old rule
-    /// merged on overlap alone, which meant a rect straddling two far-apart rects fused all three into
-    /// their bounding box and the flush paid for the dead gap between them. VUG-FPS-3 keeps a moving
-    /// object's previous and current footprints as two deliberately separate rects for exactly that
-    /// reason; under this test no third rect can bridge them unless bridging is genuinely cheaper.
-    ///
-    /// Returns the fused rect when fusing wins, `None` when the two should stay separate.
-    #[inline]
-    fn worth_fusing(a: &Damage, b: &Damage) -> Option<Damage> {
-        let u = a.union(b);
-        let ua = u.area();
-        if ua <= a.area() + b.area() || ua <= MERGE_FLOOR_PX {
-            Some(u)
-        } else {
-            None
-        }
-    }
-
-    /// Add `r`, fusing it into every rect fusion is CHEAPER for ([`worth_fusing`](Self::worth_fusing)),
-    /// cascading — a fusion grows `r`, which can bring a rect that just refused into range, so the scan
-    /// restarts. Termination: a restart costs one set entry, so at most `len` of them happen.
-    ///
-    /// Rects that decline to fuse are kept side by side, overlapping or not; the flush is correct
-    /// either way (it copies a superset) and this is the shape that costs fewer bytes.
-    ///
-    /// On a full set something must give, and the choice is made in the same byte terms: either fold
-    /// `r` into an existing rect, or fuse the cheapest existing PAIR and let `r` take the freed slot.
-    /// The second option is what stops a late-arriving `r` from being forced to bridge a wide gap
-    /// merely because it was last through the door. Both options are a union, so the set stays a
-    /// correct SUPERSET of the true damage — no dirty pixel is ever dropped.
+    /// Add `r`, merging it into every rect it overlaps (cascading, since a merge can grow `r` into
+    /// reach of a rect it previously missed). On a full set with no overlap, fold `r` into the
+    /// existing rect whose union grows the total area least — keeps the flush a tight superset.
     fn add(&mut self, mut r: Damage) {
         if r.x0 >= r.x1 || r.y0 >= r.y1 {
             return;
         }
         let mut i = 0;
         while i < self.len {
-            if let Some(u) = Self::worth_fusing(&self.rects[i], &r) {
-                r = u;
+            if self.rects[i].overlaps(&r) {
+                r = r.union(&self.rects[i]);
                 self.len -= 1;
                 self.rects[i] = self.rects[self.len];
                 i = 0; // r grew; rescan from the start
@@ -164,154 +115,19 @@ impl DamageSet {
         if self.len < MAX_DAMAGE_RECTS {
             self.rects[self.len] = r;
             self.len += 1;
-            return;
-        }
-        // Option A — fold `r` into rect `k`. The set's total area (= the flush's byte cost) changes by
-        // `area(k ∪ r) - area(k)`; `r`'s own area is not added because `r` never gets a slot.
-        let mut fold_at = 0usize;
-        let mut fold_cost = u64::MAX;
-        for k in 0..self.len {
-            let cost = self.rects[k].union(&r).area() - self.rects[k].area();
-            if cost < fold_cost {
-                fold_cost = cost;
-                fold_at = k;
-            }
-        }
-        // Option B — fuse the existing pair `(a, b)` and append `r` in the freed slot. Total area
-        // changes by `area(a ∪ b) - area(a) - area(b) + area(r)`. The leading term is a `saturating_sub`
-        // because an OVERLAPPING pair fuses for less than nothing; clamping the saving at zero only
-        // ever makes this option look slightly worse than it is, so the choice stays conservative.
-        let mut pair = (0usize, 0usize);
-        let mut pair_cost = u64::MAX;
-        for a in 0..self.len {
-            for b in (a + 1)..self.len {
-                let u = self.rects[a].union(&self.rects[b]);
-                let cost = u
-                    .area()
-                    .saturating_sub(self.rects[a].area() + self.rects[b].area())
-                    + r.area();
-                if cost < pair_cost {
-                    pair_cost = cost;
-                    pair = (a, b);
+        } else {
+            let mut best = 0usize;
+            let mut best_grow = u64::MAX;
+            for k in 0..self.len {
+                let grow = self.rects[k].union(&r).area() - self.rects[k].area();
+                if grow < best_grow {
+                    best_grow = grow;
+                    best = k;
                 }
             }
-        }
-        if pair_cost < fold_cost && self.len >= 2 {
-            let (a, b) = pair;
-            self.rects[a] = self.rects[a].union(&self.rects[b]);
-            self.len -= 1;
-            self.rects[b] = self.rects[self.len];
-            self.rects[self.len] = r;
-            self.len += 1;
-        } else {
-            self.rects[fold_at] = self.rects[fold_at].union(&r);
+            self.rects[best] = self.rects[best].union(&r);
         }
     }
-
-    /// VUG-FPS-4 — total area of the set, which IS the byte cost of the flush divided by bytes/pixel.
-    /// The selftest's yardstick: a number to compare against the true damage it was fed.
-    #[cfg(feature = "witness")]
-    fn total_area(&self) -> u64 {
-        let mut a = 0u64;
-        for k in 0..self.len {
-            a += self.rects[k].area();
-        }
-        a
-    }
-
-    /// VUG-FPS-4 — is every rect of `fed` covered by some rect of the set? The no-dropped-pixel
-    /// invariant, checked directly rather than inferred from rect counts.
-    #[cfg(feature = "witness")]
-    fn covers_all(&self, fed: &[Damage]) -> bool {
-        fed.iter().all(|f| (0..self.len).any(|k| self.rects[k].contains(f)))
-    }
-}
-
-/// VUG-FPS-4 — the damage-accounting boot selftest. One-shot, `witness`-gated, arch-neutral: it runs
-/// pure [`DamageSet`] arithmetic on synthetic rects and touches no framebuffer, so it costs the same
-/// nothing on every target and reads identically in an x86 `./arroyo test` log and a pi4 capture.
-///
-/// It states the property this arc exists for as a number rather than a story. The `bridge` case is
-/// VUG-FPS-3's shape exactly — two far-apart footprints of one moving object, then a third rect that
-/// overlaps both — and the assertion is that the set still holds three rects whose combined area is a
-/// small fraction of their bounding box. Under the old overlap-merge rule this printed `rects=1` and
-/// a `cost=` equal to the full bounding box; that regression, should it ever return, turns the line
-/// red here instead of turning up as a frame-rate mystery on the bench.
-///
-/// The other three cases fence the change in: `tiled` proves the cost test still fuses what is
-/// genuinely cheaper to fuse (a rect count that only ever grows would be its own bandwidth bug),
-/// `full` proves the bound holds under adversarial pressure, and `covered` proves that across every
-/// case above, no fed pixel was dropped.
-#[cfg(feature = "witness")]
-pub fn damage_cost_selftest() {
-    use core::sync::atomic::{AtomicBool, Ordering};
-    static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.swap(true, Ordering::Relaxed) {
-        return;
-    }
-
-    let mut ok = true;
-    let mut covered = true;
-    let mut fed: Vec<Damage> = Vec::new();
-
-    // 1. THE BRIDGE. `prev` and `cur` are one object's vacated and current footprints, 900 px apart;
-    // `bridge` is a wide, thin rect (a status strip, a window edge, the old back-buffer cursor trail)
-    // that overlaps both. Fusing all three costs 964*64 px; keeping them costs 4096+4096+18000.
-    let prev = Damage { x0: 0, y0: 0, x1: 64, y1: 64 };
-    let cur = Damage { x0: 900, y0: 0, x1: 964, y1: 64 };
-    let bridge = Damage { x0: 32, y0: 20, x1: 932, y1: 40 };
-    let mut ds = DamageSet::empty();
-    for d in [prev, cur, bridge] {
-        ds.add(d);
-        fed.push(d);
-    }
-    let bridge_rects = ds.len;
-    let bridge_cost = ds.total_area();
-    let bridge_bbox = prev.union(&cur).area();
-    if bridge_rects != 3 || bridge_cost >= bridge_bbox {
-        ok = false;
-    }
-    covered &= ds.covers_all(&fed);
-
-    // 2. TILED. Two boxes that stack into their union with nothing wasted — the cost test must take
-    // this one, or every scrolled console line would accumulate its own slot.
-    let mut ds = DamageSet::empty();
-    ds.add(Damage { x0: 10, y0: 10, x1: 110, y1: 20 });
-    ds.add(Damage { x0: 10, y0: 20, x1: 110, y1: 30 });
-    let tiled_rects = ds.len;
-    if tiled_rects != 1 || ds.total_area() != 100 * 20 {
-        ok = false;
-    }
-
-    // 3. FULL. Feed far more widely-scattered rects than the set can hold. The set must stay at its
-    // cap, and every fed rect must still be covered — the always-safe union fallback, witnessed.
-    let mut ds = DamageSet::empty();
-    fed.clear();
-    for k in 0..(MAX_DAMAGE_RECTS * 3) {
-        let x = (k * 61) % 1900;
-        let y = (k * 37) % 1180;
-        let d = Damage { x0: x, y0: y, x1: x + 8, y1: y + 8 };
-        ds.add(d);
-        fed.push(d);
-    }
-    let full_len = ds.len;
-    covered &= ds.covers_all(&fed);
-    if full_len > MAX_DAMAGE_RECTS {
-        ok = false;
-    }
-    ok &= covered;
-
-    serial_println!(
-        "[dmgcost] bridge rects={} cost={} bbox={} | tiled rects={} | full len={}/{} | covered={} -> {}",
-        bridge_rects,
-        bridge_cost,
-        bridge_bbox,
-        tiled_rects,
-        full_len,
-        MAX_DAMAGE_RECTS,
-        if covered { "yes" } else { "NO" },
-        if ok { "OK" } else { "FAIL" }
-    );
 }
 
 /// VUG-PAR — the maximum number of parallel flush bands (1 render core + up to 3 helper APs). The Pi
@@ -537,44 +353,6 @@ pub fn request_full_present() {
     FULL_PRESENT.store(true, core::sync::atomic::Ordering::Release);
 }
 
-/// WC-BBSYNC — "unarmed" for [`DESKTOP_BG_SEED`]. Every colour that reaches this path is an
-/// `0x00RRGGBB` triple (the top byte is unused on both the desktop and the compositor side), so
-/// `0xFFFF_FFFF` is outside the range a caller can legitimately pass and needs no second flag.
-const SEED_NONE: u32 = 0xFFFF_FFFF;
-
-/// WC-BBSYNC — the colour a newly-built [`Screen`]'s BACK buffer is born holding, once the window
-/// compositor has taken the panel. [`SEED_NONE`] means unarmed, which is every aarch64 build, every
-/// default x86 build, and every `wc` boot up to the instant [`super::wcx::activate`] clears the glass.
-///
-/// ### Why a latch, and why it is consumed HERE rather than set here
-///
-/// The two events are ~290 lines of `kernel_main` apart and in that order: the compositor activates
-/// from inside PCI enumeration (`kepler::init` -> `takeover_display`), and the desktop layer's
-/// `Screen` is not constructed until the GUI loop, long afterwards. So there is no `Screen` for
-/// activation to reach even in principle — the compositor can only record the colour it just put on
-/// the glass, and the desktop layer adopts it when it comes into existence.
-///
-/// What it fixes: `Screen::new` allocates its back store with `vec![0u8; len]` and arms FULL-PANEL
-/// damage, so a desktop layer born after a compositor takeover holds BLACK over a panel the
-/// compositor just painted `wm::DESKTOP_BG`, with the damage to carry that black to the glass already
-/// set. On the nominal path the first `console.draw` clears the back buffer before the first present
-/// and the black never ships — but that is a coincidence of two independently-declared constants
-/// (`console::Console::BG` and `wm::DESKTOP_BG`) happening to be the same number, and of no present
-/// falling between the construction and that first clear. Seeding the buffer makes the desktop layer
-/// agree with the glass BY CONSTRUCTION instead.
-///
-/// A back-buffer (cached RAM) fill, not a panel read-back: nothing here reads the framebuffer, so the
-/// write-only-VRAM discipline is untouched.
-static DESKTOP_BG_SEED: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(SEED_NONE);
-
-/// WC-BBSYNC — record the desktop colour the compositor has just established on the glass, so every
-/// [`Screen`] built from here on starts its back buffer in agreement with it. Idempotent; the caller
-/// owns the colour (this module invents none).
-pub fn adopt_desktop_bg(color: u32) {
-    DESKTOP_BG_SEED.store(color, core::sync::atomic::Ordering::Release);
-}
-
 /// WC-I — one step of the row-span walk that subtracts the window layer from a damage rect.
 ///
 /// Given the occluder boxes, a scanline `y`, a cursor `xs` and the rect's right edge `x1`, returns
@@ -668,30 +446,9 @@ impl Screen {
                 computed
             );
         }
-        // VUG-FPS-4 — the damage-accounting selftest rides the first `Screen` construction rather than
-        // a call site of its own: every target that has a damage set builds one here, and the fixture
-        // is pure arithmetic, so this is the earliest point on every arch at which the witness is both
-        // reachable and meaningful. One-shot inside, so the later `Screen::new` calls cost nothing.
-        #[cfg(feature = "witness")]
-        damage_cost_selftest();
         let mut back_store = vec![0u8; len];
         let mut back = FrameBuffer::new();
         back.init(back_store.as_mut_ptr() as usize, len, info);
-        // WC-BBSYNC — adopt the desktop colour the compositor put on the glass, if one was recorded
-        // (see `DESKTOP_BG_SEED` for why the two events cannot be one call). Writes cached RAM
-        // through the back handle, which re-encodes per framebuffer layout exactly as every other
-        // back-buffer fill does; the front framebuffer is neither read nor written here. Unarmed on
-        // every other build, where this is one relaxed load and the zeroed `vec!` stands.
-        let seed = DESKTOP_BG_SEED.load(core::sync::atomic::Ordering::Acquire);
-        if seed != SEED_NONE {
-            back.fill_screen(seed);
-            serial_println!(
-                "[wc-x] backbuffer resync {}x{} (desktop bg {:08X})",
-                info.width,
-                info.height,
-                seed
-            );
-        }
         Self {
             front,
             back_store,
@@ -738,16 +495,6 @@ impl Screen {
     pub fn put_pixel(&mut self, x: usize, y: usize, color: u32) {
         self.back.put_pixel(x, y, color);
         self.mark(x, y, x + 1, y + 1);
-    }
-
-    /// CURSOR-SAVE-UNDER: read one pixel from the BACK buffer (cached heap RAM — a cheap read;
-    /// the front framebuffer is never read back, keeping the WC/write-only VRAM contract).
-    /// This is what lets `pal::cursor` stash the pixels under the sprite and restore them on
-    /// move/hide, so every `Screen`-backed surface inherits trail-free cursor motion without
-    /// per-surface damage tracking.
-    #[inline]
-    pub fn read_back_pixel(&self, x: usize, y: usize) -> Option<u32> {
-        self.back.get_pixel(x, y)
     }
 
     pub fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32) {
@@ -933,6 +680,8 @@ impl Screen {
     ///   path — the desktop is not a staged surface — so a bracket here costs exactly one
     ///   restore/save/draw per present and buys coherence. `cursor::note_desktop_over_sprite`
     ///   (CURSOR-6) remains what it always was: a hole detector for THIS bracket, expected 0.
+    ///   FLICKER-3 — the bracket is now taken only when the present can reach the sprite; see
+    ///   [`Self::bracket_needed`] for the decision and for the classes that keep it unconditionally.
     /// * **The composite below runs with the sprite ON GLASS.** `sprite_plan()` returns a real plan,
     ///   so the pass takes the machinery that already exists: a staged window composes the arrow into
     ///   its own rows (`compose_into`/`adopt_overlay`), CURSOR-11's pend class defers the handback
@@ -948,59 +697,24 @@ impl Screen {
     /// CURSOR-9's colour-guard residual is therefore mended sooner than before, not later.
     /// `TOUCHED_SINCE_DRAW` is untouched: a present landing under a live sprite still arms the
     /// repair through `note_present_over_sprite`, and it now has a live sprite to arm it for.
-    ///
-    /// ### FLICKER-3 — the bracket is DAMAGE-GATED, not paid at present cadence
-    ///
-    /// CURSOR-13 narrowed the bracket's SPAN to the desktop blit. It left its RATE alone: the pair
-    /// still ran on every flush, unconditionally, whether or not this present had a single damaged
-    /// pixel anywhere near the arrow. On a fast presenter that is 75 restore→save→draw cycles a
-    /// second over the sprite's box in the FRONT buffer, and each one is an interval in which the
-    /// arrow is genuinely not on the panel — the heavy-flicker mechanism the Pi seat diagnosed and
-    /// fixed as FLICKER-3, present in the same shape here.
-    ///
-    /// The gate is the bracket's own justification read as a predicate. `undraw` exists so that a
-    /// pixel this present is about to overwrite is handed back BEFORE the overwrite, or the
-    /// save-under describes pixels that are no longer there. A present whose damage does not meet
-    /// the sprite's box cannot overwrite one sprite pixel, so it owes the sprite nothing.
-    ///
-    /// Three properties make the skip safe rather than merely cheap:
-    ///
-    /// * **Conservative by construction.** [`damage_meets`] tests the RAW damage set — before
-    ///   WC-I's window subtraction narrows it — against the sprite's box, and treats a pending
-    ///   `FULL_PRESENT` as an unconditional meet (that flag is consumed inside
-    ///   [`present_background`], and it turns the damage into the whole panel). Every span the
-    ///   present actually copies is therefore inside a rect this test saw, so "no overlap" here
-    ///   implies "no copied span touched the arrow" there. There is no false skip.
-    /// * **Exact, not advisory.** The box comes from `cursor::sprite_box()`, which takes `SPRITE`,
-    ///   rather than from `live_box_relaxed()`, which is publish-order advisory and reads `None`
-    ///   for the instant a concurrent draw is republishing its box. One lock acquisition replaces
-    ///   two that did hundreds of pixel reads and writes between them, so the gate is cheaper than
-    ///   the thing it gates even when it decides to bracket.
-    /// * **The arrow still ends on glass.** The skip path takes `ensure_drawn()`, WC-I's idempotent
-    ///   tail — one lock acquisition and a boolean when the sprite is already up, a real draw when
-    ///   something else (`wm::erase`, an auto-hide expiry that has since ended) took it down. The
-    ///   invariant `pal::TargetPal::render` rests on — "a present that composites nothing at all
-    ///   still leaves the arrow on glass" — is unchanged; only the verb is, and `repaint`'s
-    ///   restore→save→draw on an undisturbed sprite is exactly the churn WC-I removed elsewhere.
-    ///
-    /// **The falsifier is `[cursor6] desktop_over=`, unchanged and still expected 0.** It is
-    /// computed from the surviving spans and the live box INSIDE `present_background`, i.e. from
-    /// the other side of this decision, so a skip that should not have been taken shows up there as
-    /// `UNBRACKETED` rather than as a silent hole. `flush_skip=N/M` on the same line reports how
-    /// often the gate fired against how often it ran; see [`super::cursor::note_flush_gate`] for
-    /// why the denominator is not optional.
     pub fn flush(&mut self) {
-        // FLICKER-3 — decide the bracket BEFORE the damage set is consumed. `present_background`
-        // clears `self.damage` on entry, so this is the only point at which the question is
-        // answerable at all.
-        let bracket = match super::cursor::sprite_box() {
-            // Nothing is on the panel to hand back. `ensure_drawn` below still owes it a draw if
-            // the pointer is visible, which is what the old unconditional `repaint` was doing here.
-            None => false,
-            Some(b) => self.damage_meets(b),
-        };
-        // CURSOR-13 — the DESKTOP bracket. Opens here, closes before the window layer is touched.
+        // FLICKER-3 — the CURSOR-13 bracket is owed only when this present can actually REACH the
+        // sprite. It used to be unconditional: every desktop present — chiefly the status strip's
+        // per-core load bars, a one-line band at the panel bottom repainting about once a second —
+        // took the whole sprite down and redrew it, wherever the pointer stood. That is P80's
+        // "the core idle bars cause mouse to flicker when they move", and it is the same shape
+        // FLICKER-2 removed from `drain_deferred`: a whole-sprite bracket paid for paint that can
+        // never touch a sprite pixel. The undraw's one justification — hand a pixel back before a
+        // painter in THIS operation overwrites it — applies only when some damage rect meets the
+        // sprite's box, so `bracket_needed` tests exactly that and a disjoint present leaves the
+        // arrow on glass entirely. The decision's snapshot can be one pointer report stale, with the
+        // same degradation `drain_deferred` argues: a sprite that moved INTO the damage mid-present
+        // is re-established by the mover's own `repaint`, and `present_background`'s CURSOR-6 probe
+        // (`note_desktop_over_sprite`) now doubles as the detector for that race — a blit that lands
+        // on a live sprite is counted there, on either path.
+        let bracket = self.bracket_needed();
         if bracket {
+            // CURSOR-13 — the DESKTOP bracket. Opens here, closes before the window layer is touched.
             super::cursor::undraw();
         }
         let intruded = self.present_background();
@@ -1008,11 +722,7 @@ impl Screen {
         // is the whole point of that arc: `sprite_plan()` must be able to answer.
         if bracket {
             super::cursor::repaint();
-        } else {
-            super::cursor::ensure_drawn();
         }
-        #[cfg(feature = "witness")]
-        super::cursor::note_flush_gate(!bracket);
         // Only when background pixels actually landed ON a window — which, with the subtraction in
         // place, is the fallback path only. `repaint` self-guards on there being a window layer to
         // restore (one table-lock acquisition, then out).
@@ -1023,37 +733,53 @@ impl Screen {
         }
     }
 
-    /// FLICKER-3 — could the present this flush is about to run write a pixel inside `b`?
+    /// FLICKER-3 — does this present owe the sprite the CURSOR-13 bracket?
     ///
-    /// Answered against the damage set as it stands NOW, which is a superset of what
-    /// [`present_background`] will actually copy: that function subtracts the window layer from
-    /// every rect (WC-I) and can only ever narrow. A `false` here therefore proves no copied span
-    /// meets `b`; a `true` may be a rect the subtraction would have emptied, which costs one
-    /// unnecessary bracket and never a missed one.
+    /// The skip is deliberately narrow: it is taken ONLY for a sprite that is on glass, currently
+    /// visible, with no whole-panel present pending and every damage rect disjoint from its box —
+    /// i.e. exactly the class where the bracket restores and redraws an arrow nothing in this
+    /// present can touch. Every other class keeps the bracket it has always had:
     ///
-    /// `FULL_PRESENT` is read, not consumed — [`present_background`] owns the `swap`, and taking it
-    /// here would drop a whole-panel repaint on the floor. Pending means the damage is about to
-    /// become the entire panel, so the answer is unconditionally yes.
-    fn damage_meets(&self, b: (usize, usize, usize, usize)) -> bool {
-        if FULL_PRESENT.load(core::sync::atomic::Ordering::Acquire) {
+    /// * **No sprite on glass** — the undraw is a no-op, but the repaint may owe a DRAW (this is
+    ///   the desktop-cadence recovery path for a sprite something took down without a tail), so it
+    ///   stays.
+    /// * **Visibility lapsed (CURSOR-HIDE)** — this bracket's repaint at desktop cadence is what
+    ///   takes a timed-out sprite off the panel; skipping here would leave a parked arrow standing
+    ///   past its 1.5 s.
+    /// * **`FULL_PRESENT` pending** — the present's paint set is the whole panel; every sprite
+    ///   pixel is in it. Read with `load`, not `swap`: consuming the flag is `present_background`'s
+    ///   job and it must still see it.
+    ///
+    /// Only the live-sprite decision is counted (`[flick2] flush_undraw=`/`flush_skip=`): the
+    /// legacy classes cannot blink an arrow the operator can see, and counting them would bury the
+    /// discriminator this exists to put on the wire.
+    fn bracket_needed(&self) -> bool {
+        let Some((sx, sy, sw, sh)) = super::cursor::sprite_box() else {
+            return true;
+        };
+        if !crate::pal::cursor::visible() {
             return true;
         }
-        let (sx, sy, sw, sh) = b;
-        if sw == 0 || sh == 0 {
-            return false;
-        }
-        let (sx1, sy1) = (sx + sw, sy + sh);
-        self.damage.rects[..self.damage.len]
-            .iter()
-            .any(|d| d.x0 < sx1 && sx < d.x1 && d.y0 < sy1 && sy < d.y1)
+        let taken = FULL_PRESENT.load(core::sync::atomic::Ordering::Acquire)
+            || (0..self.damage.len).any(|i| {
+                let d = self.damage.rects[i];
+                let x1 = d.x1.min(self.info.width);
+                let y1 = d.y1.min(self.info.height);
+                d.x0 < x1
+                    && d.y0 < y1
+                    && d.x0 < sx + sw
+                    && sx < x1
+                    && d.y0 < sy + sh
+                    && sy < y1
+            });
+        super::cursor::note_flush_bracket(taken);
+        taken
     }
 
     /// Present the back buffer: copy each damaged rectangle to the framebuffer, row by row (each
     /// row a single bulk copy), then clear the damage. No-op if nothing changed. VUG-FPS: the set
-    /// holds separately-tracked dirty regions, so a rotating crystal plus two corner widgets blit as
-    /// a few tight rectangles instead of one panel-spanning box. VUG-FPS-4: those regions are not
-    /// guaranteed disjoint — a pair the cost test refused to fuse simply copies its shared pixels
-    /// twice, which is both correct (the copy is idempotent) and, by that test, the cheaper shape.
+    /// holds disjoint dirty regions, so a rotating crystal plus two corner widgets blit as a few
+    /// tight rectangles instead of one panel-spanning box.
     ///
     /// The DESKTOP half of [`flush`] — it knows nothing about windows; see that function for the
     /// layering. Split out so both of its exits (the parallel band path and the serial fallback) are
@@ -1166,19 +892,13 @@ impl Screen {
         // CURSOR-6 — the sprite's box, once for the whole present, read WITHOUT the sprite lock. This
         // function is bracketed by `flush` (`cursor::undraw` → here → `cursor::repaint`; CURSOR-13
         // narrowed that bracket from the whole flush to this call, and the bracket's OWNER moved from
-        // the render task to `flush` itself — the invariant this witness tests did not change). So a
-        // live sprite must never be seen here; if one is, the bracket has a hole and the desktop is
-        // erasing the arrow at flush rate — the spotty symptom, from the other layer. Diagnostic
-        // only: nothing below is conditional on it, so a stale answer costs precision and never a
-        // pixel.
-        //
-        // FLICKER-3 — and the invariant STILL does not change, which is the point of stating it
-        // here. The bracket is now conditional, but its condition (`Screen::damage_meets`) is
-        // evaluated against a SUPERSET of the spans this loop copies: the raw damage rects, before
-        // the window subtraction below narrows them. So on a flush that skipped the bracket, every
-        // span reaching the panel is provably outside the sprite's box and this latch stays clear.
-        // A live sprite seen here is a broken gate or a broken bracket, and either way it is the
-        // same defect it always was.
+        // the render task to `flush` itself). FLICKER-3 narrowed it once more: a present whose damage
+        // is provably disjoint from a live sprite skips the bracket and runs with the arrow on glass —
+        // so "a live sprite must never be seen here" became "a live sprite must never be seen UNDER A
+        // DAMAGE RECT here". The per-rect overlap test below asks exactly that, on both arms, so the
+        // counter keeps its meaning: a hit is a desktop blit landing on a live arrow, whether from a
+        // bracket hole or from a skip decision the sprite outran. Diagnostic only: nothing below is
+        // conditional on it, so a stale answer costs precision and never a pixel.
         #[cfg(feature = "witness")]
         let sprite_box = super::cursor::live_box_relaxed();
         #[cfg(feature = "witness")]

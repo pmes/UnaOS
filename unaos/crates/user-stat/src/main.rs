@@ -73,6 +73,14 @@ const SYS_GETINFO: u64 = 7;
 const SYS_WIN_CREATE: u64 = 29;
 const SYS_WIN_PRESENT: u64 = 30;
 
+// WITSWEEP — REGISTER-SURVIVAL INVARIANT (sys1..sys3): the `in("x1")`/`in("x2")`/`in("x8")`
+// constraints below PROMISE the compiler those registers survive the `svc`. That is sound today only
+// because the kernel's SVC return path restores the full x0-x30 + FP register file (`__vec_svc` →
+// SAVE_GPRS/RESTORE_GPRS in arch/aarch64/exceptions.rs) — the "preserves every GPR except x0" note
+// above is a kernel implementation fact, not an ABI guarantee. The x86 tree already hardens its
+// sysret with a GPR scrub; any future aarch64 SVC-return scrub arc MUST flip these constraints to
+// `inout("x1") a1 => _` (etc.) IN THE SAME COMMIT, or these stubs become undefined behavior. The
+// identical stub set in user-vug/src/main.rs carries the same invariant.
 #[cfg(target_arch = "aarch64")]
 mod sysabi {
     #[inline(always)]

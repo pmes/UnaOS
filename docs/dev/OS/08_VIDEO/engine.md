@@ -299,7 +299,8 @@ PULSE-STRIP. The miniature bars are superseded. `click1_hit_test` is unchanged:
 the strip's band is still `height − line_h`, and the instrument is not a view, so
 it takes neither TAB nor a click.
 
-**Data path.** Unchanged from PULSE-STRIP: the same per-core busy/idle counters
+**Data path (superseded by PULSE-3 below — kept for the record).** Unchanged from
+PULSE-STRIP: the same per-core busy/idle counters
 `pulse` and `top` read (`sched::meter_cpu_count` / `meter_cpu_ticks` /
 `meter_current_cpu`), lock-free relaxed loads, never on a scheduler path.
 `own_load` is passed as `0` — the panel is drawn by a *scheduled* task, so its
@@ -350,82 +351,235 @@ REQUIREd so a revert to percent is caught; `reserved=` is what the tiler subtrac
 The rollup is the pacing assertion: `samples` counts meter reads, `redraws` counts
 frames actually drawn and presented, and the spec REQUIREs a rollup with a non-zero
 `skipped=`. The rate is printed in **tenths** so the FORBID can bite: `rate=` at or
-above `5.0/s` sustained is the panel having become a spinner on the render core,
+above the bound sustained (5.0/s as written here; PULSE-4 raised it to 6.0/s when
+the cadence moved — see that section) is the panel having become a spinner on the render core,
 i.e. the SCHED-6 regression re-entered through the pulse. Visual verdict is the
 bench's.
 
-## 4d. `PULSE.ELF` — the windowed pulse (PULSE-1)
+### PULSE-3 — the strip was reading the wrong load source
 
-`pulse` and the PULSE-2 panel are both *in-kernel* drawing loops, and both own
-the geometry they draw into: the shell verb takes the whole screen, the panel
-owns a reserved band. Neither can sit on the desktop beside another window, be
-backgrounded, TAB'd to or moved. **`PULSE.ELF` (`crates/user-pulse`) is the same
-instrument as a ring-3 window** — sibling to `STAT.ELF` and `VUG.ELF`, launched
-with `bg /fat/PULSE.ELF`, killed with `kill <pid>` or ESC in its own window.
+Peter's attended verdict at P64, with the finished gradient instrument on the
+bench panel: *"gradient good but pulse not real-time"*. The gradient itself is
+settled — colours, geometry and the WC-F corner yield are not in question here.
 
-**What it draws.** A 128×128 ARGB8888 window (`SYS_WIN_CREATE`, one window
-slot), one row per core: the core number, a `PULSE_SEGS`-segment bar filled ∝
-that core's load over the refresh window, and a 4-character verdict cell. The
-metrics are derived from the core count, so 1 core and 16 cores both fit the one
-slot. Refresh is **~4 Hz** (`REFRESH_MS = 250`), which is both the repaint period
-and the delta window the percent is computed over.
-
-**Where the numbers come from.** `SYS_CPUPULSE(49)` (see
-`02_KERNEL_CORE/userspace.md`) hands EL0 the *raw cumulative* per-core
-`(busy, idle)` tick counts plus the core the caller is executing on. The app
-keeps the previous snapshot and does its own windowed delta math. **The kernel
-sampler is untouched** — `vug::CpuPulse` remains the only place those counters
-are maintained, and this is a read of the same two accessors it reads.
-
-**The honesty rule crosses the boundary with it.** `vug::classify_load`'s
-two-source rule is restated in the app's `classify`, and the three cases keep the
-kernel's visual idioms — copied palette values (`METER_*`), not linked code,
-because EL0 cannot link kernel code:
-
-| counters this window | core | bar | cell |
-| :--- | :--- | :--- | :--- |
-| moved (`db + di > 0`) | any | filled ∝ busy fraction (`METER_PURPLE`), rest `METER_DIM` | `  N%` |
-| moved, fraction 0 | any | the PULSE-ALIVE breath — one swept segment in `METER_BREATH` | `  0%` |
-| **frozen** | the observer's own | the breath | `run` |
-| **frozen** | any other | **DASHED** — alternate segments in `METER_PARKED` | `park` |
-
-The last row is the VUG-HONESTY invariant: a core nothing schedules must never
-read like an idle one, and must never be given a fabricated percent. The
-third row is where a ring-3 observer *differs* from the kernel loop and says so:
-the kernel credits a frozen demo core with the render loop's own measured busy%,
-which is a second measurement a windowed app does not have — so the app claims
-life (`run`) and no load, rather than inventing a number.
-
-**The baseline is not a reading.** The startup sample is cumulative counters with
-no window behind them; painting it would show every core frozen-and-parked, which
-is a fact about the instrument and not about the machine. The app therefore
-sleeps one refresh interval before its first sample, and the first frame it ever
-presents already has a real window behind it.
-
-**Serial evidence** (one start line, one alive line, one close line — a
-long-lived app is never a firehose):
+**What the capture said.** In `pi4-r23s1o`, three vugs held the cores at a
+sustained 99% and the vugband workers churned ~1M context switches per window.
+The strip printed, for ten seconds running:
 
 ```
-:: PULSE-A: start pid=<n> win=<id> ncpu=<n> cpu=<n> segs=10 ::
-:: PULSE-A: first-window c0 busy/idle=0/0 -> park ::
-:: PULSE-A: first-window c1 busy/idle=0/255 -> 0% ::
-:: PULSE-A: first-window c2 busy/idle=<n>/<n> -> <n>% (observer) ::
-:: PULSE-A: alive pid=<n> frames=8 ::
-:: PULSE-A: closed pid=<n> frames=<n> ::
+[pstrip] rollup samples=10 redraws=0 skipped=10 rate=0.0/s period=1000ms
+[sched6] passes=1/s composites=0/s (dirty-paced strip@1Hz)
 ```
 
-The `first-window` lines are the EL0 twin of `CpuPulse::refresh`'s per-core
-tick-delta evidence, and they are what makes "the app drew something" and "the app
-drew the RIGHT something" distinguishable to a headless gate — the bars themselves
-are invisible there. They are emitted **one per core** rather than as one wide
-line: on a contended serial path a wide line gets TORN by another core's writer
-(observed on this arc's first FAT-attached run, shredded mid-line by a `[wc-d]
-verify` line), and evidence an unrelated writer can shred is not evidence. One-shot
-and bounded at 16 lines. A garbled `SYS_CPUPULSE` payload shows up here as absurd
-deltas rather than as a plausible picture.
+Ten consecutive windows in which the meter concluded that nothing on the panel had
+moved, against a machine that was visibly moving. The same capture's `[spinhunt]`
+fixture reported `load settled c2=53` while SCHED's own load line reported
+`c2=99%` in the same window — two numbers for one core, which is the tell.
 
-The end-to-end gate witness is kernel-side and FAT-attached — see `PULSE-W` in
-`02_KERNEL_CORE/userspace.md`.
+**Root cause: the feed, not the pacing.** The dirty test was correct and the 1 Hz
+pace was correct. PULSE-STRIP inherited `vug`'s VUG-1 M3b feed — `meter_cpu_ticks`,
+i.e. the cumulative `CPU_BUSY`/`CPU_IDLE` counters `dispatch_next` bumps once per
+dispatch **pass** — and PULSE-2 carried it forward verbatim. Those are pass counts,
+and the scheduler had already retired that metric two arcs earlier; SCHED-5's
+standing note in `arch/aarch64/sched.rs` says so in as many words: *"TIME, NOT
+PASSES … it counts scheduler activity, not CPU time"*. A core running CPU-bound
+tasks back to back dispatches at a near-constant rate and never reaches the
+empty-queue branch, so `db/(db+di)` pins at full scale and stays flat while the
+utilization underneath it wanders. A flat source through a correct dirty test is a
+frozen bar — exactly what Peter watched. It is also why `[spinhunt]` and SCHED
+could not be reconciled: the strip and the console were on different feeds.
+
+**The fix.** `live_permille(cpu)` makes `sched::core_load(cpu).busy_pct_recent` —
+the SCHED-5/SCHED-7 rolling ~250 ms CNTPCT busy-**time** fraction, the number `top`
+and the `SCHED: load` heartbeat already print — the strip's primary source. One
+feed, so the instrument and the console can no longer disagree about one core.
+`meter_cpu_ticks` stays as the fallback and keeps its full meaning: SCHED-8 reports
+`tracked=false` for a core not currently inside `run()`, and such a core is
+classified through `vug::classify_load_scaled` exactly as before, so a frozen
+non-demo core still reads `PARKED` rather than a fabricated bar and
+`parked_display_witness` still covers that branch. The tick deltas are still
+consumed every window whether or not they are used, or a core that later falls back
+would classify against a window minutes wide. On x86 there is no `core_load` and
+the source is unchanged in every particular.
+
+**Pacing is untouched.** 1 Hz stays; skipping a window whose values moved was the
+defect, and that was never the pace gate. An idle desktop still reads a hard 0 on
+every core, still moves no lit length, and still redraws nothing — the
+default-quiet contract and the spec's non-zero `skipped=` both hold.
+
+**Witnesses.** The rollup gains `srcdelta=`: windows in which the *source* moved,
+printed beside the windows actually drawn. A busy window reading `srcdelta=0` is a
+stale feed; a large `srcdelta` with `redraws=0` is the dirty test swallowing real
+movement. Neither was legible in the P64 capture. `[pstrip] src`, emitted once at
+arm time, closes the headless half:
+
+```
+[pstrip] src live=4/4 quantum=10 stepres=13px mono=yes PASS
+[pstrip] rollup samples=10 redraws=3 skipped=7 srcdelta=3 rate=0.3/s period=1000ms
+```
+
+`live=k/n` counts cores returning a live number; `live=0/n` is the PULSE-3
+regression exactly — every core back on the dispatch-pass fallback — and is
+FORBIDden. `k == n` is deliberately *not* required: a core legitimately outside
+`run()` is honestly untracked. `stepres=` is what one source quantum (the feed is a
+percent, so 10‰) moves the lit length on this panel's bar; `stepres=0px` would mean
+a real-time source feeding a meter too coarse to render its steps — the same frozen
+bars for a different reason — and is FORBIDden too, as is a non-monotonic fill.
+
+**A red must name the right subsystem**, which is why two of the witness's verdicts
+are skips rather than failures:
+
+* `stepres` is `bar_w / 100`, so on any panel whose bar is under 100 px it is zero
+  for a *geometry* reason — a shrunken `UNAOS_FBW`, a WC-F reservation that grew, a
+  layout regression. A blanket `stepres=0px` FORBID would report every one of those
+  as a source regression, backwards. Below the bound the witness refuses to state a
+  pixel resolution it cannot attribute: it prints `stepres=coarse` and verdicts
+  `SKIP-GEOM`, and the `armed` line's own geometry FORBIDs go red instead. So
+  `stepres=0px` is only ever printed by a panel wide enough to have resolved the
+  step, where it means exactly what the FORBID says it means.
+* **x86 is untouched by PULSE-3** — there is no `core_load` and therefore no live
+  feed to be on or off — so `live=0/n FAIL` would be a standing untruth in every
+  x86 log. The witness is cfg-gated to report `live=n/a … SKIP-ARCH` there. The
+  pi4 spec FORBIDs `SKIP-ARCH`, since an aarch64 boot printing it would mean the
+  cfg gate had inverted.
+
+The witness is re-emitted **once** at the first rollup. Its arm-time fire is taken
+the instant the panel exists, before every core has necessarily entered `run()`, so
+a transient `live=0` is possible there and would otherwise stand as the log's only
+word on the feed; ten seconds of settled boot later the answer is not transient.
+Once only — insurance against an early fire, not a second periodic witness.
+
+### PULSE-4 — the latency budget: a correct meter that still read dead
+
+PULSE-3's fix works and the attended P65v2 capture proves it *mechanically*:
+`[pstrip] src live=4/4 stepres=13px PASS`, rollups at `redraws=6-8/10 srcdelta=6-8
+rate=0.5-0.7/s`. Peter, watching that same panel while vugs churned: **"well off
+live tracking"**. Both statements are true, because *"the strip redraws"* and
+*"the strip tracks"* are different claims. PULSE-4 is the second one.
+
+**The budget, term by term.** What stood between a load changing and a pixel moving:
+
+| term | before | worst case |
+|---|---|---|
+| source window (`busy_pct_recent`, rolling) | ~250 ms | 250 ms |
+| wake + sample cadence (`PSTRIP_PERIOD_MS`) | 1000 ms | 1000 ms |
+| dirty threshold (1 px of lit length) | 13 px per source quantum | 0 ms |
+| display filter | none | 0 ms |
+| **step → pixels** | | **~1.25 s** |
+
+**The cadence was the whole of it.** A second is already past the ~250–300 ms at
+which a human stops reading a meter as attached to the machine — but the sharper
+failure is one an average latency hides: **a burst shorter than the sample period
+could begin and end entirely between two samples and leave no mark on the panel at
+all.** Sub-second vug churn was not being drawn late; it was not being drawn. Six to
+eight redraws a window, every one of them of a load the operator had already stopped
+seeing. That is the gap between the log and the verdict.
+
+The other two terms were *not* the defect and are deliberately untouched:
+
+* **The dirty threshold is already at the panel's floor** — one pixel of lit length,
+  against 13 px of movement per source quantum. It cannot be why anything went
+  unseen. Sub-1% wander *is* invisible, but that is the SOURCE's quantum
+  (`busy_pct_recent` is a percent), not the threshold's.
+* **The ~250 ms source window is scheduler-lane and is left alone.** It now sets the
+  floor of this budget and is the next thing worth questioning if 250 ms cadence
+  still does not satisfy the eye — but narrowing it changes what `top` and
+  `SCHED: load` report, which is a scheduler decision, not a display one.
+  **Flagged, not touched.**
+
+**The fix is two changes, and they are a pair.**
+
+1. **`PSTRIP_PERIOD_MS` 1000 → 250.** One sample per source window — the fastest
+   cadence at which consecutive samples carry independent evidence; faster would
+   re-read overlapping evidence and put motion in the log with no new fact behind
+   it. Worst-case step→pixels falls from ~1.25 s to ~500 ms and a 250 ms burst can no
+   longer fall between samples. PULSE-2's stated reason for the second ("sampling
+   faster would only add reads the 1 Hz redraw could never show") was circular: the
+   redraw could not show them because the sample *was* the redraw's cadence.
+2. **Instant attack, ~1 s decay** (`attack_decay`). Cadence alone makes a burst
+   *drawn*; the envelope makes it *seen* — a 250 ms spike at 4 Hz is one frame,
+   which is technically drawn and humanly invisible. Rises are taken outright, with
+   no filter of any kind, so nothing is traded for the calm; falls proceed at a
+   bounded **rate** — full scale per decay constant — rather than as a geometric
+   approach to the target. That distinction is not cosmetic: a geometric filter
+   asymptotes, and the last few per-mille it creeps through are exactly the values
+   whose lit length still moves a pixel, so one busy second would buy five or six
+   seconds of decay repaints. A rate converges exactly, within one decay constant,
+   and then the panel is genuinely still. A fall smaller than one step passes through
+   untouched, so ordinary downward tracking is not slowed — only a fall big enough to
+   be a burst ending gets the dwell. It stays inside VUG-HONESTY because the displayed
+   value is always between two numbers the source actually reported — it can lag a
+   fall, never lead a rise, and never exceed the highest reading the feed has given.
+
+**The metal wake is the outer term**, and it was the trap: `status_tick`'s nap was a
+hard-coded `sleep_ticks(250)` — a literal second — beside a 1000 ms period constant.
+Raising `PSTRIP_PERIOD_MS` alone would have left metal sampling at 1 Hz regardless,
+i.e. PULSE-4 doing nothing on the only machine whose panel anyone watches. The nap
+now derives from `ui_status::PSTRIP_PERIOD_TICKS`, so the wake and the sample are the
+same number by construction. (The QEMU poll-nap branch already read the constant.)
+
+**Dirty pacing is unchanged and the default-quiet law stands.** Cadence raises the
+ceiling on how fast the strip *can* respond; it repaints nothing that has not moved.
+An idle core still reads a hard 0, its lit length still does not move, and the idle
+panel's redraw rate is still set by the status text's seconds field at ~1/s — the
+same as at 1 Hz, four times the samples notwithstanding. The decay converges to an
+exact 0 (a 1‰-per-sample floor under the geometric step) rather than asymptoting, so
+a machine that goes quiet stops redrawing instead of creeping forever. The spec's
+non-zero `skipped=` REQUIRE still holds.
+
+**Two margins moved with the cadence, and both are stated here rather than
+re-derived later.**
+
+* **The busy-loop FORBID went 5.0 → 6.0/s.** Two independent sources feed `rate=`:
+  sample-paced load redraws, capped by `PSTRIP_PERIOD_MS` at 4/s, and the status
+  *text* redraw, which is outside the period gate and fires on the composed line's
+  seconds field at ~1/s. A busy window can therefore reach exactly 5.0/s
+  legitimately — the old bound had zero headroom over the new legal ceiling and
+  would have gone red on a correctly-paced strip. The bound is raised rather than
+  the text redraws netted out of `rate=`: a spinner repainting via the text path is
+  just as much the regression this catches, and dropping a term from a number is how
+  a witness stops measuring the thing it is named after.
+* **GUI-CLICK-2's saturation deadline went ~64 s → ~16 s.** `status_tick`'s Timer
+  post is gated on `SCREEN_APP_ACTIVE` because `render_service` is blocked inside
+  `dispatch_command` while a full-screen app owns the screen and cannot drain
+  `GUI_CHANNEL`; at 4 Hz an ungated pulse would fill the 64-slot channel four times
+  sooner. The gate is unchanged and still closes it, and the same 4x applies to the
+  `gui_watchdog::poll()` that rides this task — the escape hatch returning input to
+  the shell from a wedged app now fires four times as often, which is the direction
+  that helps. Named so GUI-CLICK-2's sizing is not re-derived blind.
+
+**Witnesses** — the budget as a reading, not as a bench observation:
+
+```
+[pstrip] armed cores=4 panel=(280,1096,1480x92) ... period=250ms attack=instant decay=1000ms
+[pstrip] rollup samples=40 redraws=10 skipped=30 srcdelta=12 rate=1.0/s srate=4.0/s gapmax=252ms lat_max_ms=254 period=250ms decay=1000ms
+```
+
+* `srate=` is the **achieved** sample rate and `gapmax=` its worst excursion. The
+  strip samples on a wake it does not own, so `PSTRIP_PERIOD_MS` is a floor and these
+  are what the machine really delivered — a wake that quietly stayed at 1 Hz reads
+  `srate=1.0/s` however this module is configured, which is precisely the failure
+  that would otherwise present as "PULSE-4 did nothing" on the bench and nowhere in
+  a log.
+* `lat_max_ms=` is the worst **source-moved → pixels-on-panel** latency in the
+  window, measured in-kernel. The stopwatch opens at `sample_time - gap` (the
+  earliest instant the detected change could have occurred, so the number is an upper
+  bound rather than a flattering one) and closes where `changed` is decided, which is
+  pixels-on-panel to within one band blit. An already-open measurement is never
+  restarted: a run of sub-pixel moves that only becomes visible on the fifth sample
+  is a five-sample latency, and reporting it as one would hide exactly the "the value
+  wandered for a second before the bar admitted it" case. `lat_max_ms=0` means no
+  source movement was ever left waiting for a paint.
+* `srcdelta=` keeps its PULSE-3 meaning exactly — it is measured against the previous
+  **raw** reading, upstream of the envelope. Measuring it on the display would keep
+  it non-zero for a second after the machine went quiet and turn the stale-source
+  alarm into a tautology.
+
+**The visual verdict remains the bench's.** QEMU can confirm the cadence, the pacing
+and the latency numbers; whether ~500 ms worst-case with a 1 s decay tail actually
+reads as *live* to someone watching vugs churn is a question only the panel in front
+of Peter can answer. If it still does not, the budget above says where the remaining
+time is: the ~250 ms source window, in the scheduler's lane.
 
 ## 5. Serial evidence
 
@@ -1108,32 +1262,6 @@ that with the cap described under Layout above** (`wm::legibility_cap`), not wit
 and, at forced bench geometry (`UNAOS_FBW=1920 UNAOS_FBH=1200`), `[wc-d] verify win=1 surf=128x128 scale=4x
 at (9,21) panel=1920x1200 checked=262144 bad_cache=0 bad_ram=0 -> PASS`.
 
-#### WCD-LIVE — the reference has to hold still (2026-07-29)
-
-WC-D derives every expected pixel from the owner's surface, which makes that EL0-writable surface the
-instrument's reference. That is sound only while the owner is quiescent, and it stopped being true when
-VUG.ELF began running two worker threads: siblings kept painting while `verify_window` read, so the witness
-compared scan-out against source bytes that were never blitted, and a correct compositor drew a `-> FAIL`
-(`bad_cache=312 bad_ram=556`, reshuffling every run — 500/568, 228/424). The tell was the two passes
-disagreeing with *each other*, which no blit defect can produce, since the blit is over before either pass
-starts. Nor was the exposure closed by the app's own frame barrier: `verify_window` runs from any pass that
-repaints those rows — a neighbour's present, a desktop flush, a cursor repaint — and the one-shot latch goes
-to whichever arrives first. Two corrections, doing two different jobs. **One source read:** the verdict used
-to take three independent reads of a mutable surface (pass 1, post-`IVAC` pass 2, and the `cksum=` in the
-print), so the two counts could differ with no cache story at all; the source rect is now snapshotted once
-and both passes compare against that single `want`-stream, which restores `bad_cache` vs `bad_ram` as a real
-claim about the destination's cache state (the fixture now reports 508/508, 420/420 — equal every run).
-**A liveness bracket:** the snapshot makes the passes self-consistent but cannot make a mid-flight snapshot
-equal to what was blitted a moment earlier, so the surface checksum is read before the snapshot and again
-after the passes, and an unequal bracket emits a third, distinct verdict — `[wc-d] … cksum=… cksum_pre=…
--> LIVE (unverifiable)`. It replaces PASS *and* FAIL, because a moving reference earns neither, and it is
-never counted red: a live surface is a fact about a multi-threaded app, not a compositor defect. Quiescent
-windows bracket equal and snapshot exactly the bytes they would have re-read, so every single-threaded
-verdict is byte-identical to before — the five clean `[wc-d]` lines in `test-fat` kept their `cksum=` values
-across the change. Gate: `test 90` 31 PASS / 0 FAIL unchanged; `test-fat part 90` 41 PASS / **1 FAIL → 0
-FAIL**, plus the one new LIVE line. The compositor was never modified; this is a witness-only correction,
-and the same defect was independently audited on the aarch64 seat.
-
 ### WC-E — the garble was never in the pixels: two writers, one scan-out, no ordering
 
 WC-D left the defect cornered and unexplained. The composited pixels were byte-correct in the RAM the HVS
@@ -1443,6 +1571,99 @@ and the compat `mapped=32x32 … checksum=0x8d99530ca96d4b25` are unchanged. Not
 What QEMU therefore cannot exercise is the sprite itself: the first draw, the save-under restore and the
 `[cursor] armed` line are **unverified until the next bench boot**, exactly as WC-D's `bad_ram` column is.
 
+#### FLICKER-2 — the two P79 flickers: one fixed, both instrumented
+
+P79 (bench, storm 6, mouse otherwise good) reported two residual flickers: (a) a slight cursor
+flicker on a ~5 s "pulse", and (b) an occasional flicker of the vug window *under* the pointer.
+
+**Symptom (b) — root cause found and fixed: restore-before-install.** A session-owning pass updates
+`sp.saved` (the sprite's save-under) only at its tail (`adopt_overlay`'s coverage install). Between
+`compose_into` delivering the arrow inside a window's freshly presented rows and that install, the
+covered pixels' true under-content — the window's *new* frame — exists only in the session's layer
+save (`ov.saved`); `sp.saved` still holds the previous frame. Any full undraw arriving in that window
+(a pointer move's `repaint` on another core, `wm::erase`, or the WC-L drain) found the panel holding
+the arrow's colour there, passed the colour guard, and restored `sp.saved` — stamping last frame's
+window content into a live window for one frame. The interleave fires at the `[cursor5] adopt_incoh`
+rate (~1/s on the P79 capture, mouse motion being the usual trigger); the visible subset is the
+occasional flicker. `undraw_locked` now consults the open session under `SPRITE → OVERLAY` order
+(`try_lock`, never blocking a `compose_into` inside the blit guard): if the session coherently
+describes the live sprite (epoch + geometry, the `adopt_overlay` predicate), covered pixels restore
+from the layer save. `[flick2] sess_undraws=`/`sess_px=` count the fixed path running; `sess_lockmiss=`
+counts the bounded `try_lock` fallback.
+
+**Symptom (b), second mechanism, also removed: the drain's whole-sprite bracket.** `drain_deferred`
+took the FULL sprite down before painting any deferred erase box, wherever those boxes were — so a
+deferred erase anywhere on the panel cost a whole-sprite restore→repaint over the window under the
+pointer, each restore an extra roll of the colour-guard residual. The drain now tests its queued
+boxes against `sprite_box()` first: disjoint boxes leave the sprite entirely alone
+(`[flick2] drain_skip=`), intersecting ones take the masked `undraw_within_nosession` handback
+(`drain_masked=`), whose generation bump already protects a concurrent core's open session.
+
+**Symptom (a) — instrumented, not provable off-metal.** The `[wcn]` rollup burst (measured 5003–5005 ms
+cadence on the P79 capture, matching the reported pulse) emits *between* passes, holds no compositor
+lock (`wcn_emit`'s `TABLE` snapshot drops before its first print), and SERWIT-1's staging ring means a
+contended core stages and returns rather than blocking. What remains is wall time on the *winning*
+core: each line is ~13 ms of IRQ-masked 115200-baud polling, the holder also drains up to 64 staged
+lines, and the timer-IRQ witness sites (`[pulse5]`/`[spread4]`/`[prio]`) can fire on a core that is
+mid-composite with the arrow off the glass — stretching that bracket by the whole burst. QEMU cannot
+show any of this (no drawn sprite, instant UART), so the next bench boot reads it directly from the
+`[flick2]` line: `down_max=` (longest full-undraw→draw interval per rollup window), `down_slow=`
+(intervals ≥ 20 ms — a visible blink), `down_last_at=` (monotonic ms of the last one, to place against
+the nearest burst), and `burst_last=`/`burst_max=` (the `[wcn]` block's own measured wall time). If the
+flicker rides the pulse, `down_slow` events cluster at burst positions with `down_max` ≈ `burst_last`;
+if both read low while Peter still sees the pulse flicker, the cause is outside the bracket path and
+the next suspect is the vug present cadence itself.
+
+Gate scope, stated plainly: `[flick2]` reads `UNWITNESSED` on QEMU by construction (the sprite is
+never drawn), so the QEMU gates prove no-regression only; both verdicts above are argued from the
+interleave analysis and await the next attended bench boot for pixel-level confirmation.
+
+#### FLICKER-3 — the P80 residuals: the flush bracket and the masked stale restore
+
+P80 (bench, attended, FLICKER-2 aboard and improved) reported two residuals: (a) "the core idle
+bars cause mouse to flicker when they move", and (b) "vug can still get disturbed by the mouse",
+occasionally.
+
+**Symptom (a) — the CURSOR-13 desktop bracket was unconditional.** The status strip's per-core load
+bars are desktop furniture: `ui_status` paints them into the `Screen` back buffer and marks their
+one-line band as damage, and the render task's `pal.render()` → `Screen::flush()` presents it.
+`flush` opened the CURSOR-13 bracket — a FULL `cursor::undraw()` before `present_background`, a
+full `cursor::repaint()` after — on every present, wherever the damage was; so every bars repaint
+(~1/s idle, faster when loads move) took the whole sprite off the glass and redrew it, and the
+operator saw the arrow blink in time with the bars. Same shape FLICKER-2 removed from
+`drain_deferred`, one layer up. `Screen::flush` now asks `bracket_needed()` first: a present whose
+damage rects are all provably disjoint from a live, visible sprite skips the bracket entirely and
+runs with the arrow on glass. The skip is deliberately narrow — no sprite on glass (the repaint may
+owe a recovery draw), a lapsed CURSOR-HIDE visibility (this bracket's repaint is what takes a
+timed-out arrow down), and a pending `FULL_PRESENT` all keep the unconditional bracket.
+`present_background`'s CURSOR-6 probe (`desktop_over=`) now tests per-damage-rect overlap on both
+arms and doubles as the detector for a skip decision the sprite outran (moved into the damage
+mid-present — re-established by the mover's own `repaint`, exactly the `drain_deferred` argument).
+`[flick2] flush_undraw=`/`flush_skip=` count the live-sprite decision; with the pointer parked away
+from the strip, `flush_skip` should dominate.
+
+**Symptom (b) — the masked undraw restored a stale save.** The P80 wire ruled the FLICKER-2
+`try_lock` fallback out (`sess_lockmiss=0` across the whole attended phase) while `[cursor5]`
+climbed steadily (`stale_compose=1468`, `adopt_incoh=1386`, `masked_nosession=68`): concurrent
+passes were routinely active inside a session owner's compose-to-install window. FLICKER-2 gave the
+session-fresh restore to `undraw_locked` (full undraws) only; `undraw_within_locked` — the masked
+path behind `undraw_within_nosession`, i.e. the sessionless composite arm and the WC-L drain —
+still restored `sp.saved` unconditionally. Inside that window a covered pixel's `sp.saved` is last
+frame's window content, the colour guard passes (the session owner's present put our colour there),
+and the masked undraw stamped the stale pixel into the live vug under the pointer — occasional
+because it needs the cross-core interleave, which is P80's (b) exactly. The masked path now takes
+the same `SPRITE → OVERLAY` `try_lock` and restores covered pixels from the session's layer save;
+a contended read falls back for one undraw and feeds the shared `sess_lockmiss`. The caller's
+conditional generation bump is unchanged — a handback still retires the owner's session.
+`[flick2] mask_sess=` counts the lifted path running; `sess_px=` now aggregates layer-restored
+pixels from both entry points.
+
+Gate scope: unchanged from FLICKER-2 — `UNWITNESSED` on QEMU by construction; both fixes are argued
+from the wire correlation plus interleave analysis and await the next attended bench boot. One
+reading note for that boot: `down_max=`/`down_slow=` include CURSOR-HIDE spans (a full undraw with
+no draw until the next pointer report — the P80 capture's 150 s `down_max` is a parked pointer, not
+a blink), so judge (a) by `flush_skip` dominating and by the chair, not by `down_max` alone.
+
 ### FOCUS-VIS — focus you can SEE, and a shell you can read
 
 P59 (bench, 2026-07-25) put two backgrounded windows on the panel — the UVUG crystal and `STAT.ELF` —
@@ -1552,13 +1773,40 @@ cannot collide with WC-F's reserved probe boxes at the bottom edge, and run from
 
 ```
 [wc-fv] focus raise asid=0xf0a windows=1 top_win=1 z=7 shell_z=0
-[wc-fv] focus shell z=8 hidden=2
+[wc-fv] focus shell z=8 hidden=2 exempt=0
 [wc-fv] focus raise asid=0xf0b windows=1 top_win=2 z=9 shell_z=8
 [wc-fv] focus-vis at (641,314) a=0xff2020 b=0x20ff20 stack=0x20ff20/true raise=0xff2020/true shell=0x2d2b55/true reraise=0x20ff20/true -> PASS
 ```
 
 The `shell` leg reads `0x2d2b55` — `DESKTOP_BG` exactly — which is the erase landing, i.e. the window
 layer genuinely stopped owning those pixels rather than merely being reordered among itself.
+
+##### FV-EXEMPT — `hidden=` has been counting rows that were never hidden
+
+The shell arm collects its erase set with `r.z < z`. That is **not** the hiding predicate:
+`above_shell` is what decides whether a row stops compositing, and it **exempts compat rows** on
+purpose — a compat row is the full-screen present path, carries owner ASID 0, is not a focus target,
+and could never be raised back over a shell that overtook it, so hiding it would strand a full-screen
+app's output for the rest of the boot. Its `z` still falls below the shell, so it is collected,
+erased to `DESKTOP_BG`, and then repainted by the `composite` at the end of the same call — having
+never been hidden at all.
+
+Reachable, and on the desktop path: a **background** full-screen app (`bg` — the BGRUN-1 case) is on
+the panel while the operator TABs to the shell. The visible cost is a whole-box desktop fill followed
+by an immediate repaint of the same pixels; the durable one is that `erase` may **defer** that fill
+under `STAGE` contention (WC-L), in which case the drain paints `DESKTOP_BG` over the live app one
+pass *after* the repaint has already put it back.
+
+`exempt=` is that contradiction on the wire — the part of `hidden=` that was erased-and-repainted
+rather than hidden. It is derived from `above_shell` rather than from `r.compat`, so a future
+exemption added there is carried automatically. `hidden=N exempt=0` is the reading the field always
+implied.
+
+**Counted, not changed.** Narrowing the erase set to `!above_shell(r, z)` is a one-token edit and is
+deliberately not taken: what a bg full-screen app's pixels should do across a shell TAB is a panel
+question, the headless gate has no HID to TAB with, and it interacts with BGRUN-1's two-writer
+shimmer. The gate reads `exempt=0` (no compat row is live when the fixtures TAB), which is the honest
+headless outcome and not evidence either way — the bench sitting is where this reads non-zero.
 
 #### FOCUS-VIS gate results (2026-07-25, QEMU raspi4b @ `UNAOS_FBW=1920 UNAOS_FBH=1200`)
 
@@ -1702,31 +1950,8 @@ panel_height`, not a whole frame period.
 Budgeted at four samples per window id (the checksums are 64 KiB reads and the read-back is one probe per
 source pixel, from present context at EL0 frame rates — an unbudgeted version would perturb the timing it
 reports). Per-window, not per-window-0, so the shared-path claim is provable on the wire. `witness`-gated
-and nothing else: knob-off, `video/wcg.rs` does not compile and every artifact — Pi media and x86 ESP
-alike — is byte-identical.
-
-**Both arches, since the port.** `wcg` was `aarch64 + witness` for as long as it imported
-`arch::aarch64::{cache, now_cycles}` directly. The WC-H/WC-K/WC-L staging and erase disciplines it reports
-on are arch-neutral (`wm.rs` has no arch split in them), so gating the *reporting* on aarch64 meant the x86
-compositor ran those disciplines with no witness over them at all. The port replaced the two imports with
-arch-neutral spellings — `crate::arch::now_cycles`, which both arch modules already export as a facade
-(rdtsc / CNTVCT), and a local `clean_invalidate_surface` that is `DC CIVAC` on aarch64 and a no-op on x86,
-the same shape `FrameBuffer::flush_range` already uses for its arch hook — and widened every `wm.rs` call
-site from `all(target_arch = "aarch64", feature = "witness")` to `feature = "witness"`. `cycles_to_us`
-carries the one genuine arch split: `CNTFRQ_EL0` on aarch64, `apic::tsc_hz()` (the ACPI-PM-calibrated rate)
-on x86.
-
-Two gates deliberately did **not** widen, and both are Pi-shaped rather than incidental: the WC-F
-reserved-box interlock in `composite_inner` (that probe talks to the VideoCore mailbox, so `wcf` stays
-`aarch64 + witness + baremetal`), and WC-L's `DEFER_FIXTURE`, whose one-shot forced deferral exists to make
-the DEFERRED→BUFFERED queue round trip reproduce under `kernel8-test`. A native x86 fixture for that round
-trip is its own arc.
-
-Byte-inertness was checked rather than asserted: with `witness` off, the `llvm-objcopy -O binary` image of
-`unaos-kernel` is identical to the pre-port image on **both** targets. (The intermediate that was not — a
-three-line doc comment in `wm.rs` — moved seven `core::panic::Location` line numbers by exactly 3 and
-nothing else, which is why the comment was written line-neutral. Worth remembering: the ELF is not a usable
-inertness oracle here, since DWARF records source offsets the loadable image does not.)
+and aarch64-only like `wcf`: knob-off, `video/wcg.rs` does not compile and the flashable media are
+byte-identical.
 
 #### What the gate found
 
@@ -2735,91 +2960,288 @@ find `DESKTOP_BG` byte-for-byte at 5/5 and 3/3 — the staged fill lands the ide
 * The cursor over a closing window: the sprite must reappear after the fill, never be erased into the
   desktop and never leave a stale patch — the `undraw`/composite bracket is the thing being watched.
 
-### SPAWN-PLACE — a window is never presented where it will not stay
+## 9. CRISPY-PI — the theme table (`video/theme.rs`)
 
-**The invariant:** *no pixel of a window is ever presented at a position it will not occupy.*
+The Crispy desktop theme now exists kernel-side as a `const` table:
+`crates/kernel/src/video/theme.rs`. It carries the 21 palette roles (chrome face,
+the two bevels, frame keyline, the four title-gradient stops, the two title inks,
+button face/pressed/ink, content fill/ink, scroll track/thumb, accent, and the
+three circular title-bar controls) plus the gloss highlight and its three scalars,
+and all thirteen metrics (`frame`, `bevel`, `title_height`, `corner_radius`,
+`widget_radius`, `well_radius`, `scrollbar_width`, `button_height`,
+`button_pad_x`, `gap`, `control_box`, `text_px`, `line_height_pct`).
 
-Observed on the metal (rMBP s41, photo + wire): both windows the x86 activation opens — the console
-(`win=1`) and the calibration demo (`win=2`) — appeared at the panel's TOP-LEFT first and then jumped
-to their final places, leaving the vacated boxes on glass as residue.
+**The shared-source law.** The source of record is `kits/crispy/theme.json` @
+`us-crispy-modern` `0787ba9f`, read on the host by `libs/quartzite/src/theme.rs`. Both
+arches — aarch64 Pi 4 and x86_64 — source their chrome and desktop constants from
+this one table, and the table mirrors that one json. No per-arch invented numbers.
+A value changes in the kit json first, then is re-lifted here.
 
-#### Root cause
+**Representation and the pinned rounding rule.** Colours are packed `0x00RRGGBB`:
+the json palette carries no per-colour alpha, so the top byte is zero rather than
+an invented `0xFF`. Each literal was produced from its json triple by quartzite's
+own converter, `to_u8(v) = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8` — clamp,
+×255, +0.5, truncate toward zero, evaluated in `f32` at every step. Doing that
+rounding at authoring time is what keeps the kernel free of float at runtime.
 
-`wm::create` **composites before it returns**. That is deliberate and predates this arc (`create_inner`:
-"the window's kernel chrome is on the panel the moment the row exists … the create runs INSIDE the
-cursor bracket"), and a create takes its geometry from the TILER, which packs from the top-left. Both
-callers then computed the placement they actually wanted and applied it with `wm::move_to`:
+**How far the fidelity claim reaches.** Bit-for-bit agreement with a
+quartzite-drawn pixel holds for **flat fills** — any surface painted with a palette
+role at full opacity. It does *not* extend to the gloss ramp. Two independent
+reasons: a quantized endpoint is not the host's f32 (`0.5` as `u8` would be `128`,
+i.e. `0.50196`); and, more fundamentally, the host never rounds the endpoints at
+all — it interpolates in f32 across the ramp and rounds each *composited per-pixel*
+alpha, which no table of endpoint constants can reproduce by itself. Matching it is
+a property of the interpolator the wiring arc writes. The three gloss scalars are
+therefore carried at **Q16** (`value × 65536`, same round-half-up rule) rather
+than `u8`, cutting endpoint error from ~2e-3 to ~4e-6 so the only residual error
+sits in the interpolator where it belongs, and leaving no lossy `u8` in the table
+as a trap. The title gradient *stops* are exact colours; only the interpolation
+between them carries the same caveat.
 
-* `video/fbcon.rs::panel_console_window_open` — centre the console's outer box;
-* `video/wcx.rs::activate` — pin the demo into the bottom-right corner.
+**What is not lifted.** The json's `content_surface.Paper` block (`base_rgb`,
+`algo: "Laid"`, `amplitude: 0.02`, `scale: 4.0`, `octaves: 3`, `seed: 4223012511`)
+is deliberately absent, not an oversight. It is a *material* — quartzite's
+`surface.rs` layer, a procedural paper texture a content region composites under
+its content — not chrome, and not a constant: lifting it means porting a
+multi-octave noise generator, a rasterizer concern. It belongs beside the
+surface/material code when it lands, reading `base_rgb` from `CONTENT_FILL` (the
+two agree by construction). This table stays palette + metrics only.
 
-So the sequence was create → composite at (GAP, GAP) → move_to → erase the abandoned box → composite
-again. Two consequences, and the second is the one that also fed the residue report: a full frame of
-each window is presented at the tiler's origin, and the move manufactures a vacated box that something
-then has to reclaim. `move_to` was doing its job; it was being asked a question that should never have
-been posed.
+**Taste gate is CLOSED — APPROVED** (iteration 3, Peter, 2026-07-26). The visual
+verdict has been taken on the kit these numbers come from, so they are no longer
+provisional. Because every consumer will read the names and never the literals, a
+later verdict change still edits that one file.
 
-#### The fix — geometry decided BEFORE the row exists
+**Wiring is a follow-up arc.** Nothing consumes the table yet; `wm.rs`,
+`screen.rs` and fbcon are untouched by CRISPY-PI. The module is byte-inert by
+construction (all `const`, no statics, no code, compile-time-only assertions), and
+that was verified rather than assumed: `target/pi_baremetal/kernel8.img` hashes
+identically with and without the change. `./arroyo check` clean on both arches;
+`./arroyo kernel8-test 90` MBENCH 80/80 required witnesses, 0 forbidden.
 
-`wm::create` takes no geometry, so two verbs were added beside it (both additive; no existing verb
-changed behaviour):
+#### CRISPY-PI-2 — the re-lift from the approved kit
 
-* **`wm::spawn_geometry(w, h) -> Option<(scale, outer_w, outer_h)>`** — the size the window WILL be, from
-  the tiler's own scale rule, with no row in the table. The rule itself was factored out of `place`
-  into `place_scale(pw, ph, w, h)` and both call it, so this is the layout's answer and not a second
-  copy of it.
-* **`wm::create_at(…, x, y)`** — `create` with the final CONTENT origin supplied up front. The row is
-  born at that origin, `scale` set from the same rule, and `pinned` (as `move_to` pins it), so `place`
-  skips it and the create's own composite paints it once, where it stays. `(x, y)` is clamped on both
-  bounds exactly as `move_to` clamps it (F5).
+CRISPY-PI lifted `us-crispy` `08b42ede` with the taste gate open, and said in as many
+words that a verdict change would edit that one file. The verdict came in on
+**iteration 3** (Peter, 2026-07-26) and moved the source of record to
+`us-crispy-modern` `0787ba9f`. CRISPY-PI-2 is that edit, and it is the shared-source
+law working as designed: the kit changed first, the table followed, and no consumer
+had to be touched because there are still no consumers reading literals.
 
-Both callers now query, place, then create. `panel_console_window_open` and `wcx::activate` contain no
-`move_to` at all; there is no first frame at the tiler's origin and no vacated box to reclaim.
-`wcx` reports it on the wire:
+Nothing structural changed. The rounding rule was **re-verified at the new commit**,
+not assumed: `libs/quartzite/src/theme.rs` @ `0787ba9f` still converts a channel with
+`(v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8`, so every literal was re-derived in `f32`
+by that same rule. Colours are still `0x00RRGGBB` with no invented alpha, the gloss
+scalars are still Q16, the Paper block is still not lifted for the same
+material-versus-chrome reason, and the fidelity claim still reaches exactly as far as
+flat fills.
+
+What moved:
+
+* **Palette.** 19 of the 21 roles changed value; `content_fill` and `gloss.highlight`
+  are byte-identical to CRISPY-PI's. The kit as a whole moves lighter and cooler — the
+  chrome face goes `0x00D6D5D3` → `0x00ECECEE`, the frame keyline lifts from near-black
+  `0x004F4E4D` to a mid grey `0x00B4B4B9`, and the title gradients compress into a much
+  shallower ramp.
+* **The controls.** `CONTROL_BOX`'s single square role is gone; iteration 3 draws
+  **three circles**, each with its own fill — `CONTROL_CLOSE`, `CONTROL_MID`,
+  `CONTROL_ZOOM`, a ramp of the accent hue from darkest to lightest. The json carries no
+  separate radius key, so the geometry stays one lifted number (`control_box`, now read
+  as a diameter) with `CONTROL_RADIUS` derived from it.
+* **New metrics.** `widget_radius` = 8 and `well_radius` = 15 — the kit now distinguishes
+  a raised widget's corner from a recessed well's, where before every corner was the
+  window's.
+* **Gloss.** `0.14 / 0.5 / 0.0`, down from `0.34 / 0.55 / 0.06`: a much subtler
+  highlight that now dies out completely at the bottom instead of leaving a floor.
+
+**The assertions were re-derived, not carried.** The const-assert blocks state
+relations the *new* json implies. Two are worth naming because they are exactly the
+traps a mechanical re-lift sets. `BEVEL_LIGHT` and `GLOSS_HIGHLIGHT` are both pure
+white at this commit, so no distinctness is asserted between them and a comment says
+why — asserting it would fail the build, and silently dropping it would lose the fact.
+`GLOSS_BOTTOM_ALPHA_Q16` is exactly `0`, which makes the old `<= Q16_ONE` bound on it
+vacuously true, so it is removed in favour of the direction assertion
+(`TOP > BOTTOM`) that still does real work. `CORNER_RADIUS < TITLE_HEIGHT` survives on
+the new numbers (12 < 34), as does `CONTROL_BOX < TITLE_HEIGHT`; new bounds cover the
+two new radii and the circular control.
+
+**Still byte-inert, still verified rather than assumed.**
+`target/pi_baremetal/kernel8.img` hashes `104981f1864f2bbf…` both with and without the
+change — the table has no consumers, so a wholesale swap of every literal in it must
+not move a single byte of the image, and does not.
+
+##### CRISPY-PI-2 gate results (2026-07-26, QEMU raspi4b)
+
+`./arroyo check`: both arches clean. `./arroyo kernel8`: clean.
+`./arroyo kernel8-test`: **84/84 required witnesses, 0 forbidden**, 3123 lines scanned.
+
+One process note worth keeping. At the brief's 90 s window the harness returned
+84/84 with 0 forbidden but marked the capture `TRUNCATED (INCONCLUSIVE)` — the boot
+was cut mid-line at 1991 lines. Every witness had in fact printed, so it was tempting
+to read it as a pass; it is not one, by the harness's own rule, and it was re-run at
+150 s to get the conclusive 3123-line result above. A green count inside a truncated
+capture proves only that nothing had failed *yet*.
+
+### WC-L — the staged erase loses its DIRECT fallback
+
+WC-K staged the desktop fill but kept `fill_rect` as the last resort, and reported it. The metal
+answered on the P64 attended boot (capture `pi4-r23s1o`, lines 2041/2054):
 
 ```
-[wc-x] spawn-place win=2 box=770x526 at (2102,1116) (created in place, no move)
+[wc-k] erase box=514x526 staged=no reason=lock -> DIRECT
 ```
 
-#### MOVE-VACATE — the read-back that decides the residue question
+Twice, both on focus tab-cycle transitions (`[wc-c] focus tab-cycle`, `[wc-fv] focus shell hidden=2`)
+under ~99% core load. Every other erase that boot was `staged=yes … -> BUFFERED` and the rollup said
+`TEAR-FREE`. The spec FORBIDs both `staged=no` and `-> DIRECT`, so this was a structural red, not a
+cosmetic one: under the exact conditions the discipline exists for — contention — the erase path was
+writing the desktop fill straight into the buffer the HVS was scanning, which is the writing shape
+WC-G convicted and WC-K existed to remove. **The fallback did not make WC-K robust; it made WC-K
+conditional on nothing else wanting the lock.**
 
-The s41 wire also carried `[wc-k] erase box=1314x750 staged=yes … torn=yes -> BUFFERED` for the box the
-console vacated, while the panel kept the old pixels. Those two statements are not about the same
-thing: `[wc-k]` reports that `stage_fill` composed its row and copied it out, not that those rows are
-what the scan-out is showing when the shutter opens. (`torn=yes` on x86 is a timing verdict on an
-unsynced GOP — expected, and not evidence either way.)
+#### Deferred damage, not a direct write
 
-The code path is not in dispute: `wm::stage_fill` presents with `fb.blit(off, …)`, a direct
-`copy_nonoverlapping` into `FrameBuffer::base`, once per row, and `flush_range` — the documented x86
-no-op — only publishes what the blit already wrote. So the erase either lands in the front buffer or a
-LATER writer repaints those rows; the wire cannot tell which, and the x86 QEMU gate cannot reproduce
-it at all (`wcx::activate` is reached only from `kepler_display::takeover_display`, so a QEMU x86 boot
-logs zero `[wc-…]` lines — verified on the gate log for this arc).
+There is no direct fill behind `stage_fill` any more. The four decline reasons split by whether a
+retry can ever succeed, and the split is the design:
 
-`wcx::move_vacate_probe` (witness builds, x86, one-shot) makes the next metal boot answer it by
-READING THE PANEL BACK, the way WC-J's verdicts do. It opens its own 8x8 scratch window in a clear
-corner — deliberately not a move of the console or the demo, which under SPAWN-PLACE never move —
-presents it, `move_to`s it once, samples five points in the vacated box (content origin, two content
-diagonals, title strip, lower border) and closes it:
+* **`lock`, `alloc` — transient.** Another core holds `STAGE` right now, or the heap could not grow
+  right now. The box is pushed onto `DEFER` as *deferred damage* — a desktop-colour repaint owed —
+  and `drain_deferred` erases it through the staged path on the next composite pass.
+* **`geom`, `cap` — permanent for that box.** A degenerate rect and an over-cap row are the same next
+  pass as this one, so deferring them would queue work that can never come off and the drain would
+  re-defer forever. They are dropped, counted as `declines`, and reported `-> LOST` so the existing
+  `-> UNSTAGED` FORBID catches them. Neither is reachable on any panel this kernel drives (a single
+  row is at most `width * 4` bytes, three orders of magnitude under `MAX_STAGE_BYTES`); the branch
+  exists so that if one ever becomes reachable it is a loud red rather than a silent spin.
+
+The drain is **WC-J's `reclaim` shape reused, not a second queue with its own rules**: erase,
+`damage_intersecting`, `request_full_present`. It runs at the head of `composite_inner`, *before* the
+dirty-set snapshot, so the windows the deferred paint reached are repainted by that same pass — a
+deferral costs one frame of latency and never a second composite. It runs *before* the F4
+`BlitGuard` for the reason the WC-I cursor bracket states: it acquires `SPRITE` (through `undraw`)
+and `TABLE`, and the drain barrier's termination argument requires that a draining teardown wait only
+on bounded blits, never on another core's lock.
+
+**Lock order.** `DEFER` is a leaf. It is acquired only by `defer_erase` and `drain_deferred`, held for
+an array copy, and no other lock — `TABLE`, `STAGE`, `WRITER`, `SPRITE` — is ever taken while it is
+held. The queue is emptied into a local snapshot before any staging is attempted, and the `alloc`
+path drops the `STAGE` guard before queueing. That is what lets `DEFER` use a blocking `lock()` where
+`STAGE` uses `try_lock`: a deferral has nowhere left to fall back to, so losing a box would lose the
+repaint outright, and a leaf held across no acquisition cannot invert anything. No new inversion is
+introduced.
+
+On a full queue (`MAX_DEFER` = `MAX_WINDOWS`) a box is unioned into an existing entry rather than
+dropped. Sound for the same reason `reclaim` is: the drain re-damages every window the painted box
+intersects, so enlarging it costs repaint work and can never leave a window with a bite taken out of
+it. Dropping would leave a dead window's last frame on the panel for the rest of the boot — the P61
+ghost. The victim is the entry whose union adds the **least area**, not slot 0: always unioning into
+slot 0 grows without bound, dragging one entry's corners out until it covers most of the panel and
+every later drain repaints most of the panel and re-damages every window on it.
+
+#### What guarantees a deferred box is ever painted
+
+The drain runs at the head of `composite_inner`, so the ordinary liveness argument is "some window
+presents, which composites, which drains". That argument is weakest exactly where it is least
+obvious: **a box is deferred because a window was torn down, and if it was the last window there is
+nothing left to present.** The only thing still running is then WC-E's periodic desktop
+flush → `wm::service_damage`.
+
+Checking that path showed the first cut had a real hole, not merely an undocumented assumption:
+`service_damage` early-returned unless some row was `used && damaged`, and with no windows left no
+row is either. A box deferred by the last closing window would have sat on the queue for the rest of
+the boot, showing that window's final frame — the exact P61 ghost WC-J removed, re-entering by a new
+route. `service_damage` therefore now also runs the pass when `DEFER_N` is non-zero.
+
+So: **the desktop's flush cadence, not a window present, is what bounds a deferral's latency in the
+general case.** The dependency is load-bearing and worth restating — if WC-E's periodic flush were
+removed or made conditional on a live window layer, the deferred queue would lose its only guarantee
+in precisely the case it was built for. The cost on the idle path is one relaxed atomic load ahead of
+a table-lock acquisition that was already happening.
+
+**Arch-neutral.** The deferred-erase path — queue, drain, defer/drop decision, the `DEFER_*` reason
+constants — is uncfg'd and compiled on x86 too, because removing a direct front-buffer write is a
+correctness change and `wm.rs` is shared. Only the *reporting* is gated: `video::wcg` is
+`aarch64 + witness` only (pre-existing, `video/mod.rs`), so no `[wc-k]` line of any kind is reachable
+on x86 — which also means neither `staged=no` nor `-> DIRECT` can be printed on either arch.
+
+#### The witness
+
+`staged=defer` and `-> DEFERRED`, deliberately **not** `staged=no`/`-> DIRECT`. Both forbidden strings
+name the tearing regime; a deferral is neither, and giving it that vocabulary would either fail honest
+boots or force the FORBID to be loosened — and the FORBID is the arc's verdict. Deferral lines are
+unbudgeted to a 16-line spam bound, on WC-K's reasoning: what they report is a fill the panel has *not
+received yet*, and a boot that starts deferring after the rollup has fired must still be visible.
+
+The rollup gains `defers=`, `redefers=` and `coalesced=`. `defers=` and `coalesced=` do not enter the
+verdict precedence: a deferral that *arrives* came through the staged path one pass late, so it
+neither tore nor went direct, and demoting `TEAR-FREE` for it would make the honest report of
+contention indistinguishable from the regime the arc removed.
+
+`redefers=` does enter it. A requeue is a repaint that has **not happened**, and past `E_REDEFER_MAX`
+(8, one full queue's worth) the honest reading is that the erase path is not draining — which on the
+panel is a dead window's frame where the desktop should be. Printing `TEAR-FREE` over a visible ghost
+would be WC-K's mistake repeated in a new place: a verdict describing the samples it liked rather
+than the panel. The new `-> STARVED` sits below `-> UNSTAGED` in the precedence, because a starved
+box may still arrive (delayed, not lost) where a dropped one provably never will.
+
+Starvation also gets its own one-shot `scope=starve` line. The sampled rollup fires at fill 4, and
+starvation by its nature arrives late — it needs a loaded, long-running desktop, not a boot's first
+four fills — and a rollup that has already printed cannot retract. Same reasoning that makes the
+deferral lines unbudgeted: a FORBID is only worth having if the boot can still trip it.
+
+#### The cursor, and why the drain returns "sprite disturbed" rather than "painted"
+
+`drain_deferred` returns whether it took the sprite off the panel, **not** whether it painted a box.
+The first cut returned `painted`, which was a bug of the same family as the one the arc fixes: the
+drain undrew the sprite, every box then re-deferred, `composite_inner` saw `disturbed = false`, took
+the `Untouched` tail — and the sprite was removed and never restored, every pass, for as long as the
+contention lasted. That is, precisely the conditions this arc exists for. A pointer that vanishes
+under load is not a lesser failure than a torn erase.
+
+The undraw is still lazy, because undrawing on every drain would re-create WC-I's spotty sprite (an
+undraw/repaint per composite, on every core, is what WC-I removed). A `STAGE.try_lock()` probe runs
+*before* the queue is emptied or the sprite touched: if the staging lock is unavailable — the
+dominant contention case, and the one P64 caught — nothing can be painted this pass, so the queue is
+left intact and the sprite is never disturbed. The probe is advisory, not a reservation; the guard is
+dropped and `stage_fill` takes the lock itself. Losing that race costs one wasted pass with the
+bracket taken, which is benign in the direction that matters: it can cost a repaint, never skip one.
+
+#### The QEMU fixture, and what it does not prove
+
+QEMU has no contention of its own, which is exactly why WC-K shipped a fallback nobody had seen fire.
+A witness build therefore forces **one** deferral per boot: a one-shot latch in `stage_fill`, the WC-H
+fallback fixture's shape, gated on `!requeued` so the drain's retry is guaranteed to take the real
+staged path and the queued box is provably delivered rather than cycling.
+
+It proves the `-> DEFERRED` line, the queue round trip, the drain's re-damage, and the `BUFFERED`
+erase one pass later. It does **not** prove behaviour under genuine lock contention; that proof rides
+the next metal boot, and `redefers=` is where it will show.
+
+#### WC-L gate results (2026-07-26, QEMU raspi4b)
+
+`./arroyo kernel8-test 90` — **81/81 required witnesses, 0 forbidden**, 1886 lines scanned:
 
 ```
-[wc-x] move-vacate win=N scale=Sx from=(ax,ay) to=(bx,ay) box=WxH painted=true desktop=5/5 stale=0/5 -> PASS
+[wc-k] erase box=192x192 staged=defer reason=lock requeued=no -> DEFERRED
+[wc-k] erase box=192x192 staged=yes rowbytes=768 runs=192 contig=yes compose_us=178 present_us=542 rectscan_us=6666 torn=no -> BUFFERED
+[wc-k] erase box=130x142 staged=yes rowbytes=520 runs=142 contig=yes compose_us=7 present_us=182 rectscan_us=4930 torn=no -> BUFFERED
+[wc-k] rollup scope=fills samples=4 rows=618 torn=0 noncontig=0 declines=0 defers=1 redefers=0 coalesced=0 maxpresent_us=542 frame_us=16667 -> TEAR-FREE
 ```
 
-* `desktop=5/5` — the erase reaches the glass. Residue in a photo is then a later writer over rows no
-  window covers any more; the desktop's own damage-limited present is the candidate to look at
-  (`screen::flush` subtracts the window layer's occluders from its damage, and `reclaim` deliberately
-  asks it for a full present), and the fix belongs on that path, not in `erase`.
-* `stale=5/5` — the window's own pixels survived the fill: the erase's rows and the window's rows
-  disagree about the box, and the fix belongs in `wm::erase` / `stage_fill`.
-* `painted=false` — the probe never owned its box; the leg proves nothing and says so.
+The forced 192x192 deferral comes back `BUFFERED` on the next pass — the round trip, end to end.
+`declines=0`, `redefers=0`, `coalesced=0`. `./arroyo check`: both arches clean.
 
-#### Gate results
+#### Metal watch-list (WC-L)
 
-`./arroyo check` clean on both arches with `wc` off and on (witness on in both). `./arroyo test` (x86,
-`UNAOS_WC=1`) and `./arroyo test-arm`: green. Neither gate exercises the compositor's x86 activation —
-see above — so SPAWN-PLACE's proof is the metal photo (no jump, no residue) plus the `[wc-x]
-spawn-place` line, and MOVE-VACATE's proof is its own read-back verdict on the same boot.
+* The two P64 `-> DIRECT` lines must not recur — they are now unreachable by construction, so their
+  return would mean a fallback was reintroduced, not that contention got worse.
+* `defers=` non-zero on the bench is *expected and fine*; `redefers=` non-zero is the signal that the
+  staging lock is held longer than a composite interval.
+* Tab-cycle focus transitions under load: a deferred erase is one frame late, so a vacated box may
+  show its old contents for a single frame. That is the accepted cost. What must never appear is a
+  *partially* filled box or a horizontal band boundary.
+* `coalesced=` non-zero would mean more than `MAX_WINDOWS` boxes owed at once — worth understanding,
+  though the union keeps it correct.
 
 ### WC-M — the staging cap stops being a present cap
 
@@ -3776,6 +4198,149 @@ and an intact serial fallback. It does not exercise either change.
   survives an IRQ-masked spin (the tripwire only fires from inside one specific loop) before it
   theorises further.
 
+> **Superseded by §WEDGE-1r2.** The third bullet's "no tripwire line ⇒ this instrument is not at the
+> site" is not a sound inference, and §WEDGE-2 below turned it into a settled premise. Read
+> §WEDGE-1r2 before drawing anything from a quiet `[wedge1]`.
+
+### WEDGE-1r2 — the drain tripwire's silence was not evidence
+
+**This is a finding about an INSTRUMENT, not about a mechanism. No behaviour changes, no fix, no new
+lock; the spin is byte-for-byte what WEDGE-1 left.**
+
+§WEDGE-2 opens by treating one inference as settled: *"The drain barrier is exonerated. WEDGE-1's
+`[wedge1] DRAIN STALLED` tripwire fires from inside the drain-barrier spin, and it stayed silent all
+three times."* Reading a silence as a refutation is only sound where the instrument could have spoken
+in the states it is being cleared of. This one could not, in two of them:
+
+1. **It speaks through `serial_println!`, which takes a blocking lock.** WEDGE-1's own note concedes
+   this ("if the wedge is IN the serial path the tripwire blocks") and answers it with "strictly no
+   worse" — a claim about the *machine*, true, that was then used as a claim about the *evidence*,
+   where it is false. s44's capture stopped **mid-word**, i.e. a core died holding the UART. On that
+   shape the tripwire's silence is structurally guaranteed and carries no information at all. A
+   blocked print does not merely fail to report the stall; it erases the fact that the threshold was
+   ever crossed.
+2. **It exists only INSIDE the spin.** Every teardown reaches the barrier through its own `TABLE`
+   critical section — `close`/`close_owner` clear rows under the lock, `move_to` rewrites geometry
+   under it — and a core that dies waiting on `TABLE` there never reaches `drain()`. The teardown
+   path can therefore *be* the wedge site with the tripwire silent by construction, because the
+   instrument sits one lock downstream of the death. `close_owner` is the sharp case: it is reached
+   from `sched::exit` → `clear_handle_row`, which has already masked interrupts.
+
+Neither is answered by moving the threshold. Both are answered by a voice that acquires nothing, and
+the tree already has one — WEDGE-2's `wedge2_raw_byte`.
+
+#### The teardown tokens (knob-gated with the rest of WEDGE-2)
+
+| Token | Emitted at | Read as |
+| --- | --- | --- |
+| `<D1>` / `<d1>` | teardown entry, **before** the `TABLE`/`WRITER` section (`close`, `close_owner`, `move_to`) | uppercase = the core owning the open focus chain, lowercase = a teardown on some OTHER core while that chain is open. `<D1>` with no `<D2>` puts the death upstream of the barrier — blindness 2 |
+| `<D2>` | that section is behind us; the barrier is going up and this core is about to spin | `<D2>` with no `<D3>` puts the death in the spin |
+| `<D3>` | the spin returned; the barrier is held | pairs with `<D2>` |
+| `<D!>` | the stall tripwire fired, **before** its `serial_println!` | `<D!>` with no `DRAIN STALLED` line after it is blindness 1 caught in the act |
+
+`<D1>` is chain-gated (`wedge2::mark_composite`) and the budget is measured, not preferred: the first
+cut emitted it unconditionally and the wedge2 gate run priced it at **96 tokens against the focus
+chain's 17**, because `close_owner` runs on every EL0 task exit and 65 of those 96 found no window
+and raised no barrier. One interleaved into another core's line mid-word
+(`:<D1: B>GRUN-ST: slot reclaim PASS`) and took a required witness off the wire — 87/88. The gate is
+also the right aim: all four recorded lockups happened during TAB cycling with a focus change in
+flight, which is exactly `CHAIN_CORE != 0`.
+
+#### `[wedge1] dwell` — the range the tripwire deliberately declined to measure
+
+`DRAIN_STALL_SPINS` sits past ~10⁸ spin hints on purpose (a threshold a merely slow drain could reach
+would put a serial write on a hot IRQ-masked path). The consequence was left standing: the wire had
+exactly two readings, *nothing* and *wedged*, with the whole interesting range between them
+unmeasured. A counter costs no print, so it can measure it.
+
+```
+[wedge1] dwell drains=N spun=M spin_max=K note=65536 in_spin=J tripwire=silent|fired span=Tms -> VERDICT
+```
+
+* `STRADDLE` — spin evidence with zero completed drains in this window: the drain that produced it
+  was counted in a neighbouring window's `drains` (it straddled the rollup boundary). Read beside
+  those neighbours. A straddle whose `spin_max` clears `note` prints `DWELL` — severity wins the
+  precedence. (A window with no evidence at all does not print — there is no `NONE` verdict.)
+* `SPUN` — drains completed and at least one of them spun, but `spin_max` stayed under `note`.
+  Contention was observed and was short. **Not a fault**; it is the reading that used to be lost.
+
+  **Why it exists (WEDGE-1r3, PA6 metal 2026-08-01).** The ladder's only gate above `QUIET` was
+  `spin_max >= DRAIN_DWELL_NOTE`, so any spin below the note was banked as `QUIET` — whose contract
+  is "the healthy steady state". PA6 printed `drains=20 spun=1 spin_max=6890 ... -> QUIET`, the
+  first non-zero spin this track has ever recorded, filed as healthy. Note that `DRAIN_DWELL_NOTE`
+  (`1<<16`) is **not calibrated against any measurement** — its stated justification is purely
+  relative ("four orders under `DRAIN_STALL_SPINS`"), and `DRAIN_STALL_SPINS` is itself only
+  "comfortably past a second of real time". So a genuine dwell can sit at 65535 indefinitely and
+  every window still reads `QUIET`. Lowering the constant would move an arbitrary line rather than
+  fix the lens; the fix is that a window which measured a spin no longer claims health, and the
+  raw `spin_max` is left to speak. The gate REQUIREs the line, never the verdict, so `SPUN` is
+  gate-neutral by construction.
+
+  **What `spun`/`spin_max` actually measure — do not read them as lock contention.** They count the
+  `DrainBarrier`'s wait on `BLIT_ACTIVE`, an `AtomicUsize` refcount of in-flight composites — a
+  *phase barrier*, not a lock. A non-zero `spin_max` means a teardown on one core waited for a
+  composite in flight on another. `wm::TABLE` spin time is **entirely uninstrumented**: `spin::Mutex`
+  has no counter anywhere in the tree. PA6's `spun=1` is therefore evidence of cross-core concurrency
+  inside `wm` — the population every masked-spinner interleaving requires — and evidence of nothing
+  about `TABLE` itself.
+
+  **`in_spin=0` beside `spun>0` is not a contradiction.** `in_spin` is a gauge sampled at rollup
+  time by a presenting core; a short spin completes long before the sample. It exists to catch a
+  drain that never returns, not to sample contention.
+
+  **What this line's silence is worth — the honest boundary (s1u lens must-fix).** The dwell emit
+  rides `wcn_emit`, whose drivers are `present()` and the fixture/pointer forced rollups, and
+  `wcn_emit` holds the `TABLE` lock before the emit — the WEDGE-1r2 change bypassed only the
+  dirty-paced guard, not the cadence or the lock. So in a scene where nothing presents, or where a
+  core dies holding `TABLE`, this line CANNOT print, and per the reachability rule its silence there
+  is evidence of nothing. The instruments for those regimes are the `<D…>` tokens (raw-UART,
+  chain-gated, emitted before the locks) and the tripwire itself. Bank dwell-line silence as
+  "no teardown activity" only on a wire that shows presents continuing (`[wc-c]`/`[pstrip]` alive).
+* `QUIET` — drains ran and none spun past `note`. The only verdict here that is a statement about the
+  barrier rather than about the scene.
+* `DWELL` — a drain spun far enough to be a stalled core, four orders of magnitude under the
+  tripwire. IRQ-masked time on a teardown's core.
+* `INFLIGHT` — a drain was inside the spin when *another* core took the line. One sample at operator
+  teardown rates against a 5 s window is a coincidence; the same reading twice is a core that is not
+  coming out.
+
+`spin_max` is published **from inside the spin**, not after it. A ledger written after the loop
+reports only drains that finished, so the one that never does contributes nothing and the rollup
+reads clean over a held core — WEDGE-4's W4-A defect, refused here for the same reason. `in_spin` is
+a gauge (loaded, never drained) and stays raised for as long as that core is in there. The line is
+emitted **ahead of** `wcn_emit`'s dirty-paced guard, because a wedged teardown is not presenting and
+gating it on present traffic would silence it under exactly the condition it reports on.
+
+#### WEDGE-1r2 gate results (2026-07-30, QEMU raspi4b)
+
+`./arroyo check` green both arches, feature-off and with `witness,wedge2` armed; `kernel8` builds;
+`kernel8-test 150` **MBENCH PASS 89/89, 0 forbidden**, and again **89/89 with `UNAOS_WEDGE2=1`**
+(originally mis-recorded here as 88/88; the landing commit and an s1u tip re-run both read 89/89).
+Wire: `[wedge1] dwell drains=21 spun=0 spin_max=0 ... -> QUIET` — the barrier ran 21 times in a
+3-second window and never once had to wait for anybody, which was previously unmeasured in both
+directions.
+
+**What QEMU did not prove.** `<D1>`/`<d1>` do not appear at all, and that zero is a SCENE fact rather
+than a wiring one: the chain is open only for the body of `focus_changed`, and nothing in the fixture
+battery tears a window down from inside it (`clickplain_leg` closes before its `focus_changed(0)`;
+`closebox_leg`'s router close runs after `chain_exit`). The scene the token is aimed at — one core in
+a TAB while a vug exits on another — is the bench's, and is P66's. **`<D1>` absent on QEMU must not be
+read as the mechanism being quiet.** What the gate does prove is the `<D2>`/`<D3>` pairing (31 pairs)
+and the dwell line's wiring. One `<D2>` reads as `<activD2>` on the wire — another core's line
+interleaved with the token's bytes, WEDGE-2's stated and accepted cost for taking no lock.
+
+#### Metal watch-list (WEDGE-1r2)
+
+* `-> DWELL` or a repeated `-> INFLIGHT` locates a real stall well below the tripwire, and is the
+  first reading this instrument has ever been able to produce.
+* `<D!>` with no `[wedge1] DRAIN STALLED` line after it: the stall is real **and** the serial path is
+  where the core went to die. That combination is the one WEDGE-1 could not distinguish from health.
+* `<D1>`/`<d1>` as the LAST thing on a torn wire: the death is in the teardown's own `TABLE`/`WRITER`
+  section, upstream of the barrier — the region WEDGE-1 never covered, and the reason its silence
+  could not exonerate the teardown path.
+* A quiet `[wedge1]` still means **nothing about the barrier** unless `drains > 0`. That is the whole
+  point of the verdict naming the scene.
+
 ### WEDGE-2 — breadcrumbs, so the next wedge names its dying step
 
 WEDGE-1 ended with a request written into its own watch-list: *get a per-core heartbeat that survives
@@ -3796,9 +4361,16 @@ Four lockups, three of them silicon, all under a six-vug storm during TAB cyclin
 
 Two facts fall straight out of that table and are treated as settled here rather than re-litigated:
 
-* **The drain barrier is exonerated.** WEDGE-1's `[wedge1] DRAIN STALLED` tripwire fires from inside
+* ~~**The drain barrier is exonerated.** WEDGE-1's `[wedge1] DRAIN STALLED` tripwire fires from inside
   the drain-barrier spin, and it stayed silent all three times. Whatever stops the machine, it is not
-  that loop.
+  that loop.~~ **RETRACTED by §WEDGE-1r2.** The tripwire speaks through a blocking serial lock — and
+  s44 stopped mid-word, i.e. a core died holding the UART, the one shape on which its silence is
+  structurally guaranteed — and it exists only *inside* the spin, so a teardown that dies on the
+  `TABLE` acquisition upstream of `drain()` never reaches it. Its silence was therefore compatible
+  with the drain path being the site, and this bullet should never have been settled from it.
+  WEDGE-2's own reasoning below is unaffected (the breadcrumbs are worth having on their own terms),
+  but the drain barrier is **not** ruled out and the `<D1>`/`<D2>`/`<D3>`/`<D!>` tokens exist to
+  settle it properly on the next bench wedge.
 * **The mechanism is ARCH-NEUTRAL.** s44 reproduces the identical death shape on x86, so it lives in
   the shared wm/compositor/input-routing/sched interplay, not in anything BCM2711-specific.
 
@@ -3891,210 +4463,161 @@ six-vug storm. Positive verification is a wedge on the bench.
 * A wire that reaches `<F9>` and wedges later has exonerated the focus chain for that press, and the
   next instrument belongs downstream in the pump.
 
-### WEDGE-4 probe (x86) — `<W1>`/`<W2>`, the run-queue preempt window
+### WC-N — "predetermined fps" becomes wire data
 
-Two more tokens ride the same raw-byte primitive and the same `UNAOS_WEDGE2` knob, emitted by
-`arch/x86_64/sched.rs` (module `wedge4`). They exist because the x86 tree CONFIRMED the shape the
-pi seat's W4 candidate predicted (relay r23s1q): the dispatcher (`run`) and `timer_preempt` operate
-IRQ-masked, while the spawn/wake paths (`spawn_inner`, `spawn_user_inner`, `make_ready`) acquire a
-`RUN_QUEUES` lock with IF possibly 1. A quantum expiry inside that window switches the holder out
-mid-hold, and the scheduler context then spins IRQ-masked on a lock whose holder can only run again
-through this very dispatcher — permanent, silent, no panic, no Pi hardware required.
+Six vugs on the panel run at visibly different rates, and until this arc nothing on the wire could
+say **why**. The two numbers that existed answer adjacent questions:
 
-| Token | Meaning |
-|---|---|
-| `<W1>` | `timer_preempt` is switching away from a task that is INSIDE an unmasked run-queue critical section. The window is real and was just hit; whether a wedge follows depends on who needs that lock next. Capped at 16 emits. |
-| `<W2>` | the dispatcher's run-queue acquisition (loop-top pop or the switch-back requeue) exceeded a ~2e8-poll spin bound (seconds). The wedge is HAPPENING on this core, named at wedge time. After the token the path blocks exactly as the un-instrumented one would. Capped at 4 emits. |
+* `[vugfps]` (`user-vug`, commit `ff6ec88f`) is the **app's own** count of frames it *issued*, drawn
+  in its window corner. It is measured at EL0 from `SYS_GETINFO`'s tick and cannot know whether a
+  frame reached glass — a vug hidden below the shell draws a healthy `60` while presenting into a
+  pass that is suppressed before it touches a pixel.
+* `[sched6]` (`main.rs`) is the render task's passes and presented composites per second. Fleet-wide,
+  with no window in it: it says the compositor is busy, never which window the work was for.
 
-`<W1>` without `<W2>` on a healthy boot = the window fires and survives (the next acquirer was not
-this CPU's masked dispatcher). `<W2>` on the wire at wedge time = the candidate is CONFIRMED on
-silicon and the fix is the aarch64-spec'd one: mask IRQs across the spawn-path acquisitions —
-masking only, weakens nothing. Note the x86 wedge (s44) died with NO focus chain in flight — the
-`<F*>` chain cannot fire on an x86 image (no TAB router yet; `focus_changed` has no production
-caller, so its tokens dead-strip) — which is exactly why the sched-side probes are the x86
-instrument of record for this hunt.
+So the question Peter's phrase names — *is a given vug's effective present rate a CONSEQUENCE of load,
+or a CEILING somewhere?* — had no reading. `[wcn]` is that reading, taken on the compositor's own side
+of the seam, per window.
 
-Cross-arch key (the W probes are deliberately NOT token-for-token, unlike the F chain): x86 `<W1>`
-== aarch64 `[wedge4] preempt-in-section`, x86 `<W2>` == aarch64 `[wedge4] RQ STALL`. The aarch64
-probes print full witness lines and live outside the `UNAOS_WEDGE2` knob; ours are raw tokens
-behind it. aarch64's seven-site sweep found two fixture/witness acquisitions beyond the five
-production sites; the x86 analog is `run_queue_len` (shell status + sched selftest), covered.
+#### What it counts
 
-### CURSOR-X86 — the pointer stops moving at present rate
+Four counts per window, each a delta over the rollup window:
 
-**The bench verdict (s45 attended, rMBP 2012, EHCI trackpad).** Moving the pointer made the arrow
-lag badly — "slow as molasses" — and the panel's frame rate visibly fell while the pointer moved.
-Alongside it, the arrow disappeared under every window it crossed.
+| field  | meaning |
+| ------ | ------- |
+| `att`  | `wm::present` calls naming this row — the owner's **attempt**, after `SYS_WIN_PRESENT`'s ownership check |
+| `comp` | times the row was actually blitted by `composite_inner`'s loop — **pixels on glass** |
+| `hid`  | presents suppressed by the VUGMIN-B arm: every window this owner holds was below `SHELL_Z` |
+| `bel`  | passes in which the row was in the dirty set and then declined by `above_shell` |
 
-**Where the arrow lived, and why that was the whole defect.** On x86 the cursor was the OLDER
-back-buffer sprite (`pal::cursor`, CURSOR-VIS + CURSOR-SAVE-UNDER): `draw`/`draw_over` painted it
-through `GneissPal::draw_rect` into `Screen`'s BACK buffer, and the save-under was stashed from that
-same back buffer through `Screen::read_back_pixel`. That design was deliberate and, for its time,
-right — it kept the write-combining front buffer write-only, which is what VPERF-WC bought. But a
-back-buffer pixel is not on the panel. It reaches glass only when somebody calls `Screen::flush`.
-Two consequences followed, and both are structural rather than tunable:
+`comp` can legitimately **exceed** `att`: a neighbour's present grows the dirty set upwards over
+occlusion and repaints this row inside the neighbour's pass. `comp - att` is therefore a reading about
+overlap — compositor work this window's owner never asked for and cannot see — not an error.
 
-* **The arrow's update cadence was the desktop's PRESENT cadence.** Inside a full-screen app the
-  present *is* the frame, and a frame on that panel is expensive: `[vugfps4]` puts `flush` at 69–86%
-  of the whole frame budget at ~10.9 MB/frame, and `[wc-h] win=2 … bytes=1620080 present_us=9858`
-  measures the GOP write path at roughly 150 MB/s. So the arrow advanced once per 25–80 ms frame
-  while the trackpad reported every ~8 ms. The pointer travelled in visible jumps and trailed the
-  finger by a whole frame plus its flush.
-* **The arrow was BELOW the window layer.** `Screen::present_background` subtracts the compositor's
-  occluder boxes from the desktop's damage (WC-I), so back-buffer pixels are never copied where a
-  window is. That is correct for the desktop layer and wrong for a system cursor, which is by
-  definition the panel's last painter.
+`hid` and `bel` are the same fact from the two ends. `hid` is the owner's own present being dropped in
+`present`; `bel` is somebody *else's* pass declining to repaint the row. **There is no third skip
+class, because there is no occlusion cull:** a window wholly covered by another is still blitted (the
+dirty-set closure exists to repaint what is on top, not to drop what is underneath), and this witness
+does not invent a category the compositor does not have.
 
-**The machinery was already here, and it was dormant.** `video::cursor` is a FRONT-buffer sprite
-with a colour-guarded, painted-pixels-only save-under (~200 read-backs at this panel's 2× block
-scale, not a full-box stash), a `repair` hand-off that damages the windows a restore touched, and
-CURSOR-8's rate floor on that repair. The Pi's render task has driven it since CURSOR-1, with the
-pointer pass deliberately NOT marked dirty — *"a pointer report costs a save + a few small fills over
-one cell, not a `Screen::flush` of the sprite's damage box"*. On x86 the module was compiled, linked
-and never once asked to paint: the s45 wire reads `[cursor3] planned=0 offers=0 ensure=177` and
-`[wc-i] cursor_passes=177 cursor_brackets=0`.
+#### The park, and why the rate is not `att / span`
 
-**The switch, and why it is made inside `pal::cursor` rather than at the call sites.** Every pointer
-report on every x86 path — the console loop's drain, `vug`/`pulse`'s own frame drain, the EL0 input
-router's keep-alive — funnels through `move_rel`/`set_abs`, and every paint request funnels through
-`draw`/`draw_over`/`restore`. Folding the delegation into those verbs moves the whole target onto the
-compositor sprite with no call-site change at all, which is also what keeps the full-screen demos'
-loops correct without editing them: they keep calling `cursor::draw(pal)` once a frame, simply stop
-putting pixels in the back buffer, and the arrow nonetheless tracks the pointer at report rate
-because `move_rel` repainted it the moment the report landed.
+VUGPAUSE-2 makes an idle vug **leave the run queues** — it blocks in the input wait and presents
+nothing at all until the operator touches it. Divided by wall-clock span that vug reads as `0.2/s`,
+which is indistinguishable from a vug being *starved of cores* at 0.2 fps. That is exactly the
+confusion this witness exists to remove, so the per-window denominator is the window's own **active**
+time:
 
-| Verb | On a target where the compositor sprite owns the paint |
-|---|---|
-| `move_rel` / `set_abs` | update the shared position, then `video::cursor::repaint()` — the one choke point every report passes |
-| `draw` / `draw_over` | `video::cursor::ensure_drawn()` (WC-I's idempotent tail); no back-buffer pixels, no damage |
-| `restore` | `video::cursor::undraw()` — the auto-hide transition is the one place the sprite must come down and stay down |
+* consecutive presents closer together than `WCN_PARK_GAP_MS` (250 ms) accumulate into `active`;
+* any longer gap accumulates into `parked` instead, and is charged to neither numerator nor
+  denominator.
 
-`TargetPal::render` takes the bracket the Pi's render task has always taken around its own
-`pal.render()`: `undraw` → `Screen::flush` → `ensure_drawn`. Placing it in the PAL rather than at the
-x86 call sites is what makes it hold for every `Screen`-backed present on the target, including the
-ones inside the demos' frame loops. `ensure_drawn` and not `repaint` on the tail: the former
-re-establishes a sprite that is down and costs one lock acquisition and a boolean for one that is up,
-where `repaint` would run a full restore → save → draw cycle per present — the churn WC-I removed.
+250 ms is chosen against VUGPAUSE-2's own ~256 ms backstop period: anything past a quarter second is
+provably not a render loop pacing itself. A parked vug therefore reports the rate it ran at *while it
+was running*, with its park time stated beside it. (A window's first present after a park opens a new
+active span rather than closing one, so `att` overstates the active interval by at most one present
+per park — visible only at very low counts, and always slightly optimistic.)
 
-Ownership is named by one const, `pal::cursor::SPRITE_OWNS_PAINT` (`cfg!(target_arch = "x86_64")`).
-The back-buffer sprite is unchanged for every other target: aarch64's `virt`/UEFI GUI console has no
-compositor-sprite driver of its own, and the bare-metal Pi render task already drives `video::cursor`
-explicitly.
+The **aggregate** line's denominator is wall-clock, deliberately: "what did the fleet cost the panel
+over these five seconds" is a wall-clock question, and a fleet with one vug parked and five running
+genuinely did present less per second of panel time. Conflating the two denominators on one line would
+make the aggregate un-addable from its own rows.
 
-**Gate honesty.** The headless x86 battery delivers no pointer report, so `visible()` is false all
-boot, every verb above self-gates to nothing, and the suite proves NO-REGRESSION only (30 PASS /
-0 FAIL under `UNAOS_WC=1`). The latency and frame-rate verdicts are the next attended sitting's; the
-readings that would confirm the lift are `[cursor3] ensure`/`repaint` climbing with pointer motion
-where they read 0 before, and `[cursor6] desktop_over=0` holding (the bracket is not leaking).
+#### `gap` is the ceiling test
 
-**Observed and NOT fixed here.** Two things stand, both outside this arc's lane:
+`gap=min..max` is the shortest and longest **active** inter-present gap in the window, in ms. This
+pair, not the rate, is what makes "predetermined fps" checkable without a second run:
 
-* `DamageSet::add` (`video/screen.rs`) merges an incoming rect into every rect it overlaps, cascading
-  and rescanning after each merge. VUG-FPS-3 keeps the crystal's previous and current footprints as
-  two DELIBERATELY separate rects so a jumping crystal never flushes the dead gap between them; any
-  third rect that overlaps both fuses them back into one box spanning that gap. The back-buffer
-  cursor was exactly such a third rect whenever it sat on the crystal, which is one path by which
-  pointer motion could grow a frame's flush. Taking the arrow out of the damage set removes the
-  cursor as a bridge, but the general re-merge is still reachable by any two near-neighbour painters.
-  *(Fixed since, by VUG-FPS-4 below.)*
-* `[vugfps]`'s 12.8 → 34.8 fps ramp on the s45 capture is NOT mouse-driven: the pointer was
-  stationary for it, and the ramp is the crystal's own bounding box coming off its broadside
-  orientation (the frame budget is bandwidth-bound in the bbox, so a wide bbox is self-sustaining
-  until the tumble carries it edge-on). That capture contains no pointer-motion experiment, so the
-  metal verdict quoted above stands on the attended observation alone.
+* a rate that is a **consequence of load** scatters — a contended vug's gaps run from a few ms to
+  tens, so `min` and `max` are far apart;
+* a rate that is a **fixed ceiling** does not — `min` and `max` collapse onto one value, because
+  something is pacing the loop regardless of what else is happening.
 
-## VUG-FPS-4 — the damage set merges on cost, not on overlap
+A window that recorded no active gap at all (one present in the whole rollup) reports `0..0`, which is
+what it honestly has: no interval to measure.
 
-`DamageSet` (`video/screen.rs`) is a bounded set of at most `MAX_DAMAGE_RECTS` (16) dirty rectangles,
-accumulated between flushes. Its contract has always been: **hold a superset of the true damage —
-never drop a dirty pixel, at worst reflush a clean one — and stay bounded, folding rects together
-when the set is full.** What VUG-FPS-4 changes is the rule that decides *which* rects fold.
+#### Cadence
 
-### The rule that was wrong
+Dirty-paced, following `[pstrip]`/`[sched6]`: a fixed `WCN_ROLLUP_MS` (5000 ms) period, one claim per
+period taken by compare-exchange from the presenting core, and the tick itself driven from the tail of
+`wm::present` — including the VUGMIN-suppressed path, so a fleet that has just been hidden does not
+lose the very interval whose `hid=` count is the point.
 
-`add` merged an incoming rect into every rect it *overlapped*, cascading: a merge grows the incoming
-rect, which can bring a previously-untouched rect into contact, so the scan restarted. Overlap is a
-topological question, and the flush does not spend topology. It spends bytes.
+Two consequences, both deliberate:
 
-The consequence had a name before it had a fix. VUG-FPS-3 keeps a moving object's **previous** and
-**current** footprints as two deliberately separate rects, precisely so a jumping crystal never
-flushes the dead gap between them. Under an overlap rule, any third rect touching both — a status
-strip, a window edge, the back-buffer cursor while it still lived in the damage set — fused all three
-into their bounding box, and the frame paid for the gap after all. On the bench panel the desktop
-flush is 69–86% of the frame budget at 10.9 MB/frame over a ~150 MB/s GOP path, so those bridged
-bytes are not a rounding error; they are the whole cost.
+* line volume is bounded by construction — at most one block (live windows + one aggregate) per
+  period, however many cores are compositing;
+* a fleet that has **wholly parked goes silent** rather than printing a wall of zeros. The witness is
+  driven by the traffic it measures, so "no `[wcn]` lines" reads as "nobody is presenting".
 
-### The cost model
+Because the period's final partial window is never emitted on its own account, a **forced** emit fires
+from `vugmin_rollup`, on the same scoped rollup (`fixture` / `desktop`) every other window witness
+reports on. That is what guarantees the gate a block. A slot with traffic but no live row still gets
+its line, marked `live=no`: dropping it would silently delete the last frames of every window that
+ever exits.
 
-The present walks the set and blits each rect row by row. A frame's flush therefore costs the **sum
-of the rects' areas** — and overlap is not a correctness problem for it, because two rects sharing
-pixels simply copy those pixels twice, which "sum of areas" already accounts for. That gives an exact
-answer to the merge question:
-
-> Fuse `a` and `b` **iff** `union(a, b).area() <= a.area() + b.area()`.
-
-Fusing that passes this test never costs the flush a byte more than the two blits it replaces; fusing
-that fails it costs strictly more. It is a cost test, not a topology test, and it subsumes the old
-behaviour where the old behaviour was right: heavily-overlapping rects still fuse (their union is
-barely larger than either), and rects that *tile* — successive console lines, adjacent glyph boxes —
-now fuse too, which the overlap rule refused and which is free.
-
-One bounded exception, `MERGE_FLOOR_PX` (64x64 px = 16 KiB at 32 bpp): a fusion whose **result** is no
-larger than the floor is always taken. A rect that small costs less to reflush whole than it costs to
-carry a second entry through the flush loop and the per-rect WC-I span walk, and taking it keeps a
-slot free — which is what stops the set overflowing into a forced bridge later. The slack this clause
-can inject is bounded by construction: a rect that reached its size *through* the clause is at most
-`MERGE_FLOOR_PX`, so the whole set can carry at most `MAX_DAMAGE_RECTS * MERGE_FLOOR_PX` (256 KiB on a
-1920x1200 panel, ~2.3% of one frame) of it, no matter how many marks a frame makes.
-
-### When the set is full
-
-Something must fold, and the choice is made in the same currency. Two candidate shapes are costed and
-the cheaper wins:
-
-| Shape | Change in total set area (= flush bytes / bpp) |
-|---|---|
-| fold the incoming `r` into existing rect `k` | `area(k ∪ r) - area(k)` |
-| fuse the cheapest existing pair `(a, b)`, give `r` the freed slot | `area(a ∪ b) - area(a) - area(b) + area(r)` |
-
-The second shape is the one that matters: without it, a late-arriving rect is forced to bridge a wide
-gap merely because it was last through the door. Both shapes are unions, so the set remains a correct
-superset either way — the always-safe fallback is intact.
-
-### Worst case
-
-Adversarially scattered damage — many small rects, all far apart, none worth fusing — fills the set,
-and then every further `add` pays one fold. The bound holds by construction (16 rects, each a union of
-things that were genuinely damaged), and the fold always picks the cheapest of the two shapes above,
-so the *total* flush area is what degrades gracefully, not the rect count or the pixel coverage. The
-pathological input for the *old* rule — a chain of rects each overlapping the next, spanning the panel
-— now costs the sum of the chain instead of the panel-wide bounding box.
-
-### Witness
-
-`damage_cost_selftest()` (`video/screen.rs`, `witness`-gated, one-shot, called from the first
-`Screen::new`) runs pure `DamageSet` arithmetic on synthetic rects — no framebuffer, no timing — so it
-reads identically in an x86 `./arroyo test` log and a pi4 capture. One line:
+#### Wire format
 
 ```
-[dmgcost] bridge rects=3 cost=26192 bbox=61696 | tiled rects=1 | full len=16/16 | covered=yes -> OK
+[wcn] win=<id> asid=<owner> live=<yes|no> above=<yes|no> att=<n> comp=<n> hid=<n> bel=<n>
+      rate=<x.y>/s comp_rate=<x.y>/s active=<n>ms parked=<n>ms gap=<min>..<max>ms
+[wcn] rollup scope=<live|fixture|desktop> wins=<n> att=<n> comp=<n> hid=<n> bel=<n> stale=<n>
+      passes=<n> aborted=<n> att_rate=<x.y>/s comp_rate=<x.y>/s span=<n>ms -> <IDLE|STARVED|LIVE>
 ```
 
-* `bridge` is VUG-FPS-3's shape exactly: two footprints 900 px apart plus a third rect overlapping
-  both. `rects=3` and `cost` well under `bbox` is the fix. The old rule printed `rects=1` with `cost`
-  equal to `bbox`.
-* `tiled` proves the cost test still fuses what is genuinely cheaper to fuse — a rect count that only
-  ever grows would be its own bandwidth bug.
-* `full` feeds three times the cap in scattered rects and proves the bound holds.
-* `covered` checks the no-dropped-pixel invariant directly, across every case above.
+(one physical line each; wrapped here). Rates are fixed-point tenths, for `[pstrip]`'s reason — an
+integer `/s` truncates every honest sub-1 Hz rate to `0`. Aggregate-only fields: `stale` (presents
+naming no live row — a window closed under its owner, with no slot to charge them to), `passes` /
+`aborted` (composite passes that reached the blit loop, and passes that returned before it under the
+F4 drain barrier or an unready framebuffer — an aborted pass cost its owner a syscall and produced no
+pixels for *any* window). The verdict is `IDLE` when nothing was attempted, `STARVED` when presents
+were attempted and none reached glass, `LIVE` otherwise.
 
-The verdict word is `OK`/`FAIL` rather than `PASS`/`FAIL` on purpose: the batteries tally `PASS` lines,
-and this witness is deliberately additive to the existing tallies. A regression still turns the line
-red and still trips the generic `-> FAIL` scan.
+#### WC-N gate results (2026-07-29, QEMU raspi4b)
 
-**Signature stability.** No `[wc-…]` or `[vugfps]` line changed shape. `[vugfps]`'s `rects=N` now
-reports the cost-model rect count, which is the number it was always meant to report; `bytes/frame`
-and `union=WxH` are computed exactly as before.
+* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
+* `./arroyo kernel8-test` — **`✅ MBENCH PASS — 86/86 required witnesses, 0 forbidden hit(s), 5150
+  lines scanned`**. No gate entry was added; the arc's claim is the reading, not a new REQUIRE.
+
+Actual lines from `target/serial-pi.log`:
+
+```
+[wcn] win=1 asid=0x1 live=yes above=yes att=83 comp=85 hid=0 bel=0 rate=285.2/s comp_rate=292.0/s active=291ms parked=0ms gap=1..7ms
+[wcn] rollup scope=live wins=1 att=83 comp=85 hid=0 bel=0 stale=0 passes=86 aborted=0 att_rate=16.6/s comp_rate=17.0/s span=5000ms -> LIVE
+[wcn] win=1 asid=0x0 live=no above=no att=225 comp=244 hid=0 bel=1 rate=403.2/s comp_rate=437.2/s active=558ms parked=0ms gap=1..17ms
+[wcn] win=2 asid=0x0 live=no above=no att=4 comp=16 hid=0 bel=1 rate=6.6/s comp_rate=26.7/s active=0ms parked=0ms gap=0..0ms
+[wcn] rollup scope=fixture wins=0 att=229 comp=260 hid=0 bel=2 stale=0 passes=263 aborted=0 att_rate=382.9/s comp_rate=434.7/s span=598ms -> LIVE
+[wcn] win=1 asid=0x1 live=yes above=yes att=1118 comp=1126 hid=0 bel=3 rate=560.4/s comp_rate=564.4/s active=1995ms parked=0ms gap=1..7ms
+```
+
+The first block is the whole mechanism in one line: the fixture's window attempted 83 presents inside
+**291 ms of active time** out of a 5000 ms wall span — `rate=285.2/s` (what it does when it runs)
+against `att_rate=16.6/s` (what it cost the panel). Pre-WC-N only the second number was obtainable,
+and it would have been read as a 16 fps window. `gap=1..7ms` is the scatter signature: this window is
+**not** ceiling-limited in QEMU. `comp=85 > att=83` is the overlap reading — two repaints the owner
+did not ask for.
+
+#### Honest scope on the gate
+
+QEMU raspi4b has no HID, so nothing ever TABs to the shell and no owner is ever hidden: `hid=0` there
+is structural, and the `bel=` counts that do appear come from the fixture's own z manipulation rather
+than from an operator. The gate proves the counters are wired, the cadence is bounded, the park split
+does not divide by zero, and the parked/active denominators behave. The numbers that carry the arc —
+a hidden vug's `hid` climbing while its `[vugfps]` corner still reads 60, and a six-vug storm's `gap`
+spread — are bench readings.
+
+#### Metal watch-list (WC-N)
+
+* **`gapmin == gapmax` on a busy vug is the finding.** It would mean the rate is paced, not earned,
+  and the next question is by what — the present syscall, the drain barrier, or the app's own loop.
+* **`comp` far above `att` across the fleet** means the tiling has the windows overlapping enough that
+  every present costs several blits. That is a placement problem wearing a performance costume.
+* **`aborted` climbing** is the F4 drain barrier eating passes under load — presents that cost a
+  syscall and produced nothing, which is the P66 neighbourhood.
+* **`STARVED`** (`att > 0`, `comp == 0`) with `hid == 0` and `bel == 0` should be impossible; it would
+  mean presents are reaching `composite` and the blit loop is never drawing them.
+* **`parked` large while the operator says the vug looks frozen** is the good outcome — it says the
+  vug is in VUGPAUSE-2's idle and is waiting for input, not starved.
 
 ---
 
@@ -4352,95 +4875,6 @@ wiring and no-regression only. The line carries its evidence on the bench.
   `[wc-h] staged=no reason=` next.
 * **`[cursor12]` appearing at all on an rmbp capture** is itself the first result: it means the x86
   track can finally see the cursor mechanism it has been tuning blind.
-
-### CURSOR-WCR — the pointer path's uncached read cost, and where the second repaint actually is
-
-The x86 pointer complaint after CURSOR-X86 ("mouse still very laggy") was attributed to a double
-`video::cursor::repaint()` per HID report at `main.rs:2238/2242` and `main.rs:3232/3241`. **That
-attribution is wrong, and acting on it would have broken the Pi.** Both of those functions —
-`route_input_to_active_el0` and `render_service` — are `#[cfg(all(target_arch = "aarch64", feature =
-"baremetal"))]`. `pal::cursor::SPRITE_OWNS_PAINT` is `false` on aarch64, so `repaint_on_move` is a
-no-op there and those explicit `repaint()` calls are the *only* thing that paints the compositor
-sprite on the Pi render path. They are load-bearing, not redundant, and they do not exist on x86 at
-all.
-
-#### Where the x86 report really goes
-
-One pointer report through `kernel_main`'s console loop runs **four** front-buffer pixel walks, i.e.
-two whole repaints' worth of read-back:
-
-| # | site | walk |
-|---|------|------|
-| 1 | `pal::cursor::restore` → `video::cursor::undraw` | colour-guard read of every painted pixel |
-| 2 | `pal::cursor::move_rel` → `repaint` → `draw_locked` | save-under read of every painted pixel |
-| 3 | `TargetPal::render` → `cursor::undraw` (the flush bracket) | colour-guard read |
-| 4 | `TargetPal::render` → `cursor::ensure_drawn` → `draw_locked` | save-under read |
-
-`draw_over` → `ensure_drawn` between 2 and 3 is the documented idempotent no-op.
-
-#### The arithmetic
-
-The sprite is 8×8 arrow blocks plus a one-block drop shadow, `9·s` px square at block scale
-`s = clamp(height/900, 1, 4)`. Painted (and therefore read) pixels are `36·s²`: 28 arrow blocks plus
-the 8 shadow blocks the arrow does not already cover. The bench rMBP panel is 2880×1800, so `s = 2`
-and `N = 144`. (`s = 4` needs a ≥3600 px-tall panel; no bench machine has one.)
-
-`FrameBuffer::read_pixel` issues **three** separate `read_volatile` byte loads per pixel, and the
-panel is WC-mapped (`x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4)`) — WC is uncacheable for reads, so
-each byte load is its own aperture round trip.
-
-| | aperture read transactions per HID report |
-|---|---|
-| before | 4 walks × `N` px × 3 bytes = `12N` = **1728** at `s=2` |
-| after | 3 walks × `N` px × 1 word = `3N` = **432** at `s=2` |
-
-**4× overall**, from two independent changes:
-
-* **`PanelRead` (`video/cursor.rs`)** — where the layout is a full 4-byte pixel with a 4-byte-aligned
-  base (every x86 panel this kernel has met), one aligned volatile `u32` load returns the same three
-  colour bytes in one transaction. The read-side twin of the 3:1 `put_raw4`/`encode4` already take on
-  the write side. Values are `read_pixel`'s exactly — same bounds tests, same `0x00RRGGBB` inverse,
-  `None` on `U8` as before — so no save-under, colour-guard or fail-closed verdict changes. Applied
-  to all five front-buffer walks (`undraw_locked`, `undraw_within_locked`, `settle_pending_locked`,
-  `redraw_off_locked`, `draw_locked`); `compose_into`'s read of the RAM back layer is untouched.
-  x86-gated, like its write-side twins: aarch64's panel is cached RAM where three byte loads are
-  three L1 hits, and on that arch `PanelRead::of` never reports a fast path.
-* **Walk 1 deleted on x86 (`main.rs`)** — the leading `pal::cursor::restore` in the console loop's
-  `Mouse`/`MouseAbsolute` arms was `video::cursor::undraw()` immediately in front of a `repaint`
-  whose own `undraw_locked` performs the same restore. Beyond the wasted walk it cleaned WHOLE
-  SCANLINES (`flush_box`) where the repaint's `FlushUnion` cleans only the sprite's columns, it
-  published the panel with the arrow down and not yet back — the intermediate publication CURSOR-10
-  exists to remove — and it issued a second `damage_intersecting` per report. Kept unconditionally on
-  the back-buffer targets, where `restore` really is the only thing that takes the sprite off.
-
-#### Refused, with the reason
-
-* **Reusing the undraw's read values as the draw's save-under.** In `refresh_locked` the two walks
-  are one lock acquisition apart and largely overlap, so the second walk's `N` reads look free. They
-  are not: the front buffer has writers that do not hold `SPRITE` (that is why the colour guard
-  exists), and serving the save-under from the undraw's snapshot widens the stale-restore window from
-  "a painter wrote between our draw and this read" to "…or during the undraw walk". The failure mode
-  is a `FILL` stamped inside a window's rect — a `[wc-d] -> FAIL` the Pi spec forbids — and it is not
-  provable from QEMU, which delivers no pointer at all. Not taken.
-* **Skipping walks 3 and 4 — `TargetPal::render`'s bracket — when the present will write nothing.**
-  This is the remaining 2× and it is the right next move: on a motion-only pass the `Screen` has zero
-  damage, `present_background` returns early without touching the front, and the bracket's two walks
-  are pure waste. It cannot be done from `pal.rs` alone, because the gate needs two facts `Screen`
-  does not expose: whether the damage set is empty, and whether `FULL_PRESENT` is latched. Skipping
-  on a stale guess erases the arrow until the next report. **`video/screen.rs` is owned by a
-  concurrent editor, so this is flagged rather than taken** — it wants a `Screen::present_pending()`
-  predicate (damage non-empty ∨ `FULL_PRESENT`), after which `render`'s bracket becomes conditional
-  and the report cost falls to `2N`.
-
-#### Gate results (CURSOR-WCR)
-
-* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**, no new warnings.
-* `UNAOS_WC=1 ./arroyo test 75` — **36 PASS / 0 FAIL on three consecutive runs.**
-* `./arroyo test-arm 22` — banner, clean boot through USB enumeration, 0 FAIL.
-
-QEMU delivers no pointer report, so neither change is exercised by the suites: the gates prove
-compile and no-regression only. The 4× is arithmetic on the bench panel's geometry and is carried by
-the next attended sitting.
 
 ### CURSOR-13 — one owner for the sprite: the flush-path bracket dies, composite carries the arrow
 
@@ -5177,268 +5611,444 @@ Three of the four changes are in shared files and the pi seat should lift them:
 `pal::TargetPal::render` (change 1) is x86-only in effect: the bracket it removes was
 `cfg(target_arch = "x86_64")`, so aarch64 is byte-inert there.
 
----
+## CLOSE-BOX — the close button, and the single action-click exception (2026-07-29)
 
-## FLICKER-3 (x86 lift) — the flush bracket is damage-gated, and what `[cursor12] passes=0` means
+P79, bench sitting, Peter's direct request: *"put a close button in the upper right of the windows
+to exit."* Landed on the pi track as `video/wm: CLOSE-BOX`.
 
-GR9, x86 seat. Two questions, one path. The Pi seat (FLICKER-3) found the flush bracket being paid
-at present cadence unconditionally and fixed it with damage-overlap gating; this is that lift, plus
-the run-down of why x86's admissible `[cursor12]` blocks read `passes=0` where the Pi's read
-`planned`/`offers`/`taken` > 0.
+### Geometry
 
-### 1. Does our path match the Pi's?
+Every decorated (non-compat) app window's title strip now ends in a **close box**: a
+`TITLE_H`-sided square (12 px at 1x) flush against the inner edge of the border at the strip's
+RIGHT end — `x = bx + bw - BORDER - side`, `y = by + BORDER` in outer-box coordinates. The box is
+filled in a red-tinted chrome colour (`CHROME_CLOSE_BG`, brightening to `CHROME_CLOSE_BG_FOCUS`
+with the rest of the focused window's chrome) with a 2-px X glyph in the title foreground colour.
+The title's width budget excludes the box, so a long title truncates beside it rather than running
+under it.
 
-**In shape, yes; in the gating predicate, no — and the difference is forced by our code, not chosen.**
+One function, `wm::close_box(r)`, is the single source of the rect: `paint_window` draws it and
+`wm::close_box_hit(id, x, y)` (the router's test) checks it, so the drawn box and the clickable box
+are the same rect by construction. Rows that decline the box: **compat** (no chrome at all — the
+full-screen shim's own click-to-exit owns its clicks), **owner-0** (kernel furniture, the same
+CLICK-SHELL distinction that keeps `hit_test` from ever naming the console/desktop — a close box on
+shell furniture would be an invitation to kill the shell), and a strip too narrow to hold the box
+plus one title glyph.
 
-`Screen::flush` is arch-neutral (`pal::TargetPal::render` is `self.surface.flush()` on both targets
-since CURSOR-14), and before this arc its body was:
+### Routing precedence — close beats select
 
-```rust
-cursor::undraw();                 // bracket OPEN — unconditional
-let intruded = self.present_background();
-cursor::repaint();                // bracket CLOSED — unconditional
-if intruded { wm::repaint() } else { wm::service_damage() }
-```
+In `wc_click_route`'s PRESS arm the close-box guard is tested FIRST, on the window `hit_test` has
+already named for the point: a press in that window's close box takes the CLOSE arm, and only a
+press elsewhere in the window falls through to the ordinary select/deliver arms. The press is
+CONSUMED (`CLICK_TARGET_DROP`, so the release is dropped with it) — it is not delivered to the app,
+because the app it would address is being torn down.
 
-CURSOR-13 narrowed that bracket's **span** to the desktop blit. It never touched its **rate**. Every
-flush paid a full `restore → save → draw` over the sprite's box in the FRONT buffer, whether or not
-the present had a damaged pixel anywhere near the arrow — at 75 fps that is 75 intervals a second in
-which the arrow is genuinely off the panel. Same mechanism the Pi seat diagnosed.
+### Why this is the ONE action click, and why it does not breach CLICK-SELECT
 
-The relayed predicate — *"only erase where the new damage overlaps the previously flushed region"* —
-does not have a referent in our tree: `Screen` keeps no record of the region a previous flush
-covered, and the thing the bracket protects is not the previous flush's region but **the sprite's
-current panel box**. So the gate is stated against that instead:
+CLICK-SELECT (P77) is Peter's grammar and it is FINAL: a click on a window only SELECTS (focus +
+the cyan `clicks=N` ack); SPACE stops/starts; focus never stops or starts anything. The close box
+does not amend that rule, because the box is not the app's surface — it is **window furniture**,
+kernel chrome drawn and hit-tested by the window system itself. A click there is an instruction TO
+THE WINDOW SYSTEM ("this window goes away"), not input to the app, which is why it takes effect at
+the router and never enters the app's ring. Every other pixel of the window, title strip included,
+keeps the select-only grammar unchanged.
 
-> Take the bracket only when this present's damage set meets `cursor::sprite_box()`.
+### Close semantics
 
-That is the bracket's own justification read as a predicate. `undraw` exists so a pixel this present
-is about to overwrite is handed back before the overwrite; a present whose damage misses the sprite
-cannot overwrite one sprite pixel and owes the sprite nothing.
+The CLOSE arm (`wc_close_click`), in order:
 
-### 2. Why the skip is safe
+1. **Windows first** — `wm::close_owner(owner)` removes every row the owner holds (a vug parent
+   and its workers are one owner), so the click is answered on the panel immediately.
+2. **Focus** — if the closed owner held either half of focus, it is handed to the SHELL through the
+   one focus primitive (`el0_input_set_active(0)` then `focus_changed(0)`), the same state a
+   TAB-to-shell leaves.
+3. **Kill** — the SKILL-1 primitive, ASID-scoped (`sched::kill(pid, owner)`), so every sibling
+   thread dies with the parent; `kill` evicts targets parked in kernel waits (`futex_wake_killed`
+   scans all buckets), which is what reaches a fleet idled in `SYS_INPUT_WAIT`. On a CONFIRMED kill
+   the Proc row is **settled, never reaped** — a status store, a CAS
+   `PRUNNING -> PEXITED`, one `done` post, exactly the fault-kill shape — because this path races
+   whichever launcher owns the row (`bg`'s poll or a foreground `run_user_image` blocked in its
+   wait loop), and reaping here would re-open the double-reap hazard `bg_kill`'s LENS note
+   documents. **CLOSE-CLEAN (P80) amends the settle status**: the row settles with the fault-kill
+   SHAPE but the status is `EXEC_CLOSED_STATUS`, not `EXEC_KILLED_STATUS` — see below.
+   Both launchers converge on the settled row through their existing exit paths. An
+   UNCONFIRMED kill detaches (stays armed; the target dies at its next boundary) and leaves the row
+   alone. Owners outside the slot range (witness fixtures) skip the kill — the row close is the
+   whole effect.
 
-* **The test is a superset of what is copied.** `Screen::damage_meets` runs against the RAW damage
-  rects, before WC-I's window subtraction narrows them, and treats a pending `FULL_PRESENT` as an
-  unconditional meet (that flag is `swap`-consumed inside `present_background` and turns the damage
-  into the whole panel; the gate `load`s it and does not consume it). "No overlap" here therefore
-  implies "no copied span touched the arrow" there. There is no false skip; there are only
-  occasional false brackets, which cost exactly what today costs.
-* **The box is exact, not advisory.** `cursor::sprite_box()` takes `SPRITE`; `live_box_relaxed()`
-  reads `None` for the instant a concurrent draw is republishing, which would be a false *skip*.
-  One lock acquisition replaces two that did hundreds of pixel reads and writes between them, so
-  the gate is cheaper than the bracket even on the frames where it decides to bracket.
-* **The arrow still ends on glass.** The skip path takes WC-I's idempotent `ensure_drawn()` — one
-  lock and a boolean when the sprite is up, a real draw when something else (`wm::erase`, an
-  auto-hide that has since ended) took it down. The invariant `pal::TargetPal::render`'s doc rests
-  on is unchanged; only the verb is. (That doc still says "repaint" — a one-word nit in `pal.rs`,
-  outside this arc's lane, flagged rather than edited.)
-* **The falsifier already existed.** `[cursor6] desktop_over=` is computed from the *surviving*
-  spans and the live box inside `present_background`, i.e. from the other side of the decision. A
-  skip that should not have been taken shows up there as `UNBRACKETED`. Expected 0, as before.
+### CLOSE-CLEAN — a close-box exit reads *closed*, not *faulted* (2026-07-29)
 
-### 3. The witness, and why it has a denominator
+P80, bench sitting, Peter's verdict: *"i closed all the vugs with the x but jobs says faulted and
+reaped."* Root cause: the CLOSE-BOX settle reused the fault-kill sentinel (`EXEC_KILLED_STATUS`,
+`i32::MIN`) as the Proc row's exit status, and every classifier downstream — `bg_poll` for the
+`jobs` verb, the `run_user_image` wait for a foreground `run` — maps that sentinel to *Faulted*.
+An operator-requested close therefore printed as `FAULTED (contained; reaped)`, indistinguishable
+from a genuine contained fault.
 
-```
-[cursor6] rollup scope=… present_over=… masked=… repaired=… desktop_over=… mismatch=… uncover_lost=…/… flush_skip=N/M -> …
-```
+The fix is a second, distinct sentinel: `EXEC_CLOSED_STATUS` (`i32::MIN + 1`, equally
+non-colliding with real exit codes). `wc_close_click`'s confirmed-kill settle stores it instead of
+the kill sentinel; the classifiers grew a matching clean variant end to end:
 
-`flush_skip=` is appended; no existing field is re-spelled, so captures stay comparable.
+* `bg_poll` → `BgPoll::Closed`; the `jobs` verb prints `pid N  closed (reaped)  <name>` (serial:
+  `:: BGRUN: jobs — pid=N exit=CLOSED reaped ::`) — the shape of a normal completed job.
+* `run_user_image` → `RunOutcome::Closed`; a foreground `run` whose window is closed prints
+  `run: <path>: closed (window close box)` (serial: `exit=CLOSED`).
 
-**`M` (`flush_gate`) is not decoration.** A bare skip count cannot falsify anything, for the reason
-`[cursor12]` already cost this project three sittings: `flush_skip=0` is what a HEALTHY gate reads
-when it has simply not run yet, and it is also what a gate reads that is wired up but structurally
-unable to skip. Stated as the law requires:
+Genuine fault-kills are untouched — the fault-kill net still stores `EXEC_KILLED_STATUS` and still
+reads `FAULTED`; the two classifications never blur. The one race (a fault-kill and the close
+settle hitting the same task) is decided by the existing single-shot CAS: whichever settle wins
+the `PRUNNING -> PEXITED` flip has already published its own status, honestly.
 
-| reading | meaning |
-| --- | --- |
-| `flush_skip=0/0` | **no verdict.** No desktop present has happened. Instrument unarmed. |
-| `flush_skip=0/M`, `M>0` | The gate ran `M` times and never found a present that missed the arrow. A real reading — see §5. |
-| `flush_skip=N/M`, `N>0`, `desktop_over=0` | The gate is working: `N` brackets not paid, and nothing reached the arrow. |
-| `flush_skip=N/M`, `desktop_over>0` | The gate is WRONG. `UNBRACKETED` already says so. |
+### Witness
 
-### 4. `[cursor12] passes=0` — the offer sites are not bypassed; they are not reached
+* `[clickroute] close=win<id> asid=<owner> at (x,y) settle=<tag>` — one line per close click,
+  rate-limited `[spread4] rewake`-style (first 16 named, then quiet) so a stuck button over a
+  re-spawning owner cannot flood the wire. CLOSE-CLEAN moved the emit to after the settle and
+  added the `settle=` field: `closed` (kill confirmed, row settled clean), `noproc` (window
+  furniture only), `dead` (target already exited), `armed` (unconfirmed; request stays armed),
+  `exhausted` (no kill slot).
+* `[skill] close-box ...` — the kill's disposition (confirmed / stays-armed / nothing-to-kill).
+* **Leg 9** of `hittest_selftest` (`close=` field in the `[clickroute] hit-test` line): a probe
+  window is placed so its CLOSE BOX contains the real cursor (the CLICK-PLAIN fixture discipline —
+  move the window, never the pointer), one press is driven through the shipped router, and the leg
+  asserts the press was CONSUMED, the row is GONE (`info(w)` empty), and focus fell to the shell.
+  The owner is synthetic and outside the slot range, deliberately: the kill arm provably no-ops, so
+  the leg is a window-layer witness and the kill half stays gated where SKILL-1 already gates it.
+  Pinned in `scripts/specs/pi4-regression.spec` (`REQUIRE ... close=true -> PASS`), which also pins
+  legs 1–8 via the line's tail verdict.
 
-Every offer choke point in the tree lives inside `wm::composite_inner`: the `CUR12_PASSES` bump, the
-`sprite_plan()` acquisition, `overlay_open`/`defer_within` (`CUR3_PLANNED`), and
-`stage_window → compose_into → note_cursor_overlay` (`CUR3_OFFERS`/`TAKEN`). There is no offer site
-outside it. So `passes=0` is not "the offers were declined" and not "the wiring is missing" — it is
-**`wm::composite()` did not run at all in that window**.
+### Gate results (CLOSE-BOX, 2026-07-29, QEMU raspi4b)
 
-`composite()` has exactly nine call sites, and they are all window-layer events: `create_inner`,
-`create_at`, `present_banded` (both present verbs), `move_to`, `close`, `close_owner`,
-`focus_changed`, `repaint`, and `service_damage`. The last is the only one the desktop's flush can
-reach, and it is guarded:
+* `./arroyo check` — both arches green.
+* `./arroyo kernel8-test` — MBENCH PASS 87/87 (was 86; the new directive is the leg-9 pin), with
+  `[clickroute] close=win3 asid=3085 at (320,240)` and
+  `[clickroute] hit-test ... close=true -> PASS` on the wire.
+* `./arroyo test-arm` — MISSION SUCCESS (leg 9 DORMANT there: no arch router on the hosted build,
+  `close=skip`).
 
-```rust
-pub fn service_damage() {
-    if DEFER_N.load(Relaxed) == 0 {
-        let t = TABLE.lock();
-        if !t.rows.iter().any(|r| r.used && r.damaged) { return; }   // <- the exit
-    }
-    composite();
-}
-```
+Hardware verification (the bench click on a storm vug's close box: window gone, `[skill]
+close-box killed ... confirmed=1`, fleet count down by one) is owed at the next attended sitting.
 
-**On x86 the 75 fps presenter is the in-kernel full-screen `vug` loop** (`vug.rs`, `pal.render()`
-once per frame → `Screen::flush`), and it owns the panel with **no compositor window on it at all**.
-No row is used, so no row is damaged, `DEFER_N` is 0, `service_damage` takes the exit, and
-`composite()` never runs. `passes=0`, every window, at any frame rate.
+## CURSOR-15 — the sessionless present composes through: the hover stutter dies (2026-07-29)
 
-That is **correct by design, not a bypass.** Compose-through paints the arrow into a *staged
-window's back layer*; a raw desktop blit is not a staged surface and has no session, no coverage to
-install and nothing for `adopt_overlay` to settle against — CURSOR-13 says exactly this where it
-argues why `present_background` keeps its bracket. With no window layer the mechanism has no
-subject. **`passes=0` therefore reads: "the offer mechanism had nothing to be offered to."** It is
-not evidence about the mechanism's health in either direction.
+### The P82 mechanism
 
-The Pi's blocks read `planned`/`offers`/`taken` > 0 because the Pi bench sitting is EL0 vug windows
-presenting through `SYS_WIN_PRESENT → wm::present → composite()` — a windowed workload. The two
-seats are measuring two different scenes, not two different kernels.
+P82 (bench, attended, CURSOR-14 aboard): with the pointer parked over the presenting vug fleet the
+arrow stutters, and the wire names the shape — `[flick2] sess_undraws=290+` and climbing at present
+cadence (~123/s), `down_slow` accumulating. The same mechanism was measured independently on x86 the
+same night. The compose-through machinery itself is healthy (`[cursor12] planned`/`offers`/`taken`
+all fire), so the erase is not the session path: it is the passes that LOSE the session.
 
-**This closes a cross-seat divergence both seats have carried as a mystery for two rounds, so state
-it in the form that survives being quoted:**
+Under a presenting fleet several cores composite at once and exactly one owns the overlay session
+per pass. Every loser took `undraw_within_nosession` — a masked handback of the sprite pixels inside
+its paint set — followed by a `Repaint` tail, i.e. a whole-sprite `refresh_locked`
+(restore→save→draw). One erase-and-rebuild of the arrow per overlapping present, at PRESENT cadence,
+while the pointer's own repaint runs at EVENT cadence. `sess_undraws` is those tail refreshes
+landing while some other pass's session is open (the full undraw finds a coherent session and
+restores from the layer save — FLICKER-2's fixed path, running healthily but far too often), and
+`down_slow` is the intervals they cost. The sprite spends its life mid-restore: the stutter.
 
-| `passes=0` licenses you to conclude | `passes=0` does NOT license you to conclude |
-| --- | --- |
-| No composite pass ran in this window. | Anything about compose-through's health, in either direction. |
-| The scene had no window layer (or no window damage) for the whole window. | That offers were made and declined — no offer site was reached. |
-| Every other term in the block is trivially 0 and carries no information. | That the CURSOR-13/14 wiring is missing, bypassed, or regressed. |
-| The x86 and Pi captures are of DIFFERENT SCENES. | That the two seats are running different kernels, or that one seat's fix "did not land". |
+### The fix: COMPOSE-THROUGH for the sessionless arm
 
-The only reading that is evidence about the mechanism is a `adm=window` block **with a window layer
-on the panel** — i.e. `passes > 0`. Anything else is a measurement of the scene.
+The handback's one justification — a pixel a painter in this pass is about to overwrite must be
+handed back first, or its save-under goes stale — is answered the way CURSOR-11 answered it for the
+session owner: at the tail, per pixel, against the finished front. The sessionless arm now:
 
-**The admissibility predicate is now stated on the line itself** rather than only in this document:
-`[cursor12]` gains an `adm=` field — `empty` (`passes == 0`, no pass ran, no verdict), `baseline`
-(`passes >= cum`, the whole-boot rollup, no verdict), `window` (`passes < cum`, a real sample). A
-reader no longer has to do the subtraction to know whether the block can carry a verdict.
+* **defers instead of undrawing** (`cursor::defer_nosession`, the shared `defer_common` body with
+  `defer_within`): `pend` bits are marked inside the paint set, no framebuffer pixel is written, no
+  generation is bumped. The arrow stays on glass; the pass's blits composite over it where they
+  reach it.
+* **settles at a new tail** (`CursorTail::Settle` → `cursor::settle_nosession`): for each pending
+  pixel the colour guard asks the finished front whether a painter took it. Untouched → no read, no
+  write (the common case). Taken → `saved[i]` is re-taken from the freshly-composited content
+  BEFORE the arrow pixel is painted back over it — the FLICKER-2/3 session-fresh save-under
+  discipline, extended to compose-through. This is `settle_pending_locked`, unchanged; only the
+  second caller is new.
+* **gates the settle on session quiescence**: `settle_nosession` probes `OVERLAY` under the sprite
+  lock (`SPRITE` → `OVERLAY`, the documented order, `try_lock` never a wait). An open or contended
+  session leaves the bits standing (`ct_owner`) for the owner's own tail — `settle_pending_locked`
+  is bit-driven, not owner-driven, so `adopt_overlay` answers them against ITS finished front, and
+  its incoherent fallback resets `pend`, which is settlement by bracket. The gate is load-bearing:
+  a settle that read the front while the owner's rows were still in flight would install a stale
+  save. Because `adopt_overlay` closes the session and settles under one `SPRITE` acquisition, and
+  `settle_nosession` holds `SPRITE` across probe and settle, "no session open" really does mean the
+  previous owner's tail fully retired.
 
-### 5. The consequence for the x86 flicker, and the one thing outside this lane
+### Coherence consequences, stated
 
-With `vug` full-screen there is no compose-through to engage, so **FLICKER-3's gate is the whole of
-the available fix on this path** — and on this path it is currently expected to read
-`flush_skip=0/M`. `vug`'s VUG-FPS dirty-rect phase erases the pointer's *previous footprint* into
-the back buffer every frame:
+* **CURSOR-5's generation bump is not needed on this arm any more — its stale-stamp interleave has
+  no first move.** The bump existed because a sessionless handback WROTE `sp.saved` (pre-pass
+  content) into the owner's freshly-presented rows; the deferral writes nothing.
+* **The bump's second duty moves to a coverage clear.** If the sessionless pass's blit overwrites a
+  pixel the owner's layer COVERED, the owner's install would claim a panel pixel that is now the
+  loser's, with a layer save the panel no longer holds. `cursor::overlay_uncover_any` — called from
+  `draw_window` for plan-less windows whose box meets the advisory sprite box — clears the open
+  session's coverage inside the painted box, so the owner's tail settles those pixels against the
+  finished front instead. This is CURSOR-4's back-to-front verdict rule applied across passes; the
+  lens's rejected alternative on `undraw_within_nosession` is exactly right HERE because nothing
+  stale was written. A contended clear invalidates the session wholesale via the existing
+  `note_uncover_lost` → refuse-install → `refresh_locked` fallback, already priced.
+* **What still brackets, deliberately:** the pointer-move `repaint` (sprite RELOCATION keeps its
+  undraw/redraw — compose-through is for OTHER passes crossing a stationary sprite), `wm::erase`,
+  the WC-L deferred-erase drain (its fills paint the front directly, so `undraw_within_nosession`
+  survives with it as sole caller, generation bump and all), the WC-F reserved arm, an incoherent
+  adopt tail, and `Screen::flush`'s CURSOR-13 desktop bracket (unchanged — so `[cursor6]
+  desktop_over`'s meaning of "over" is untouched and its =0 verdict still catches a sprite-region
+  desync on the desktop path).
+* **Cross-pass settle residual, named:** a third concurrent pass can take a pixel between one
+  settle's front read and its arrow write. Same class as every settle, absorbed the same way:
+  `note_present_over_sprite` arms `TOUCHED_SINCE_DRAW`, the next full undraw's `repair` damages the
+  window, and the taker's own tail re-settles — the settle is idempotent and the last tail wins.
+* **`tail_of` precedence:** `disturbed` outranks `deferred` — a pass that both drained (masked
+  handback, `off` pixels) and deferred takes `Repaint`, whose `refresh_locked` resets `pend` as it
+  goes; the deferral is settled by the bracket rather than dropped.
 
-```rust
-// vug.rs, the per-frame erase
-if let Some((qx, qy, qw, qh)) = prev_cursor { pal.draw_rect(qx, qy, qw, qh, BG); }
-```
+### Witness (reading key)
 
-so the damage set contains the sprite's own box at frame rate, by construction, and the gate
-correctly refuses to skip: the back buffer really does hold `BG` under the arrow and that `BG`
-really is about to be blitted forward.
+* `[flick2] ... compose_through= ct_owner=` — sessionless compose-through passes, and settles left
+  to an open session's tail. Expected on metal: `compose_through` tracks the present rate while
+  `sess_undraws` and `mask_sess` COLLAPSE toward pointer-move-only counts and `down_slow` → 0 under
+  hover. That collapse is the arc's verdict.
+* `[cursor3] rollup ... settle=` (and sampled `tail=settle -> THROUGH`) — the new tail. On a hovered
+  fleet `settle` should absorb what `repaint` used to count.
+* `[cursor5] masked_nosession=` — must read 0 from this arc on: the mechanism it counts no longer
+  runs. Non-zero means someone reintroduced the sessionless handback.
+* `[cursor11] passes=` now includes sessionless deferrals (`defer_nosession` feeds the same
+  counters), so `passes`/`bracketed` remains the honest through-vs-bracket ratio.
+* `[cursor6]` is unchanged in meaning: a deferring pass reports `bracketed=true` to
+  `note_present_over_sprite` (its `Settle` tail owes the pixels a verdict), so its presents count as
+  `masked` — the denominator — exactly as CURSOR-11's session deferrals do, and `desktop_over` must
+  still be 0.
+* All of it `UNWITNESSED` on QEMU by construction (no HID pointer, sprite never drawn); the gate
+  proves no-regression only.
 
-That erase is a pre-`SPRITE_OWNS_PAINT` leftover. On x86 the sprite lives in the FRONT buffer and
-`pal::cursor::draw` delegates to `cursor::ensure_drawn()`, so painting `BG` over the cursor
-footprint in the BACK buffer restores nothing and accomplishes only one thing: it forces the desktop
-present to blit background over the arrow's panel box every frame, which is the unconditional erase
-this arc is trying to remove, reintroduced by the presenter itself.
+### Gate results (CURSOR-15, 2026-07-29, QEMU raspi4b)
 
-This was flagged out of lane and then authorized; it is FLICKER-4 below.
+* `./arroyo check` — both arches green, no new warnings in the arc files.
+* `./arroyo kernel8-test` — MBENCH PASS 87/87 required witnesses, 0 forbidden. New line shapes on
+  the wire: `[cursor3] rollup ... settle=0 ...`, `[flick2] ... compose_through=0 ct_owner=0 ...`,
+  `[cursor5] ... masked_nosession=0` — all UNWITNESSED/0, as the gate must read them.
+* `./arroyo test-arm` — MISSION SUCCESS.
 
-### Gate results (FLICKER-3 x86 lift, 2026-07-30)
+Hardware verification is owed at the next attended sitting: pointer parked over the presenting
+fleet, read `[flick2]` for `sess_undraws`/`mask_sess` collapsing and `down_slow` flat while
+`compose_through` climbs at present cadence, and the stutter gone from the chair.
+### CLOSE-FIX — the wire discriminator, the real-path close leg, and the teardown guard (2026-07-29)
 
-* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
-* `UNAOS_WITNESS=1 ./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**.
-* `strings target/x86_64-unaos/release/unaos-kernel` on a `--features witness` build — ` flush_skip=`
-  and `adm=` both present in the artifact, so the new witness text is not an `arroyo`-only knob.
-* No QEMU target run: forbidden this round on cost grounds. Metal is the verdict.
+P82, bench: `[clickroute] close=win3 asid=3085 at (961,599) settle=noproc` on a live boot —
+asid 3085 is `0xC0D`, the hit-test battery's leg-9 synthetic owner. The line was read as a REAL
+operator close carrying the selftest's fake ASID (kill finds no process, the vug survives its
+window, `jobs` accumulates undead rows). Reproducing the gate at bench geometry
+(`UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test`) shows the deeper defect: **leg 9's own
+wire line is byte-for-byte the shape of that failure** — `close=win3 asid=3085 at (960,600)
+settle=noproc`, at the boot cursor's panel centre — so the wire could not distinguish the
+battery's benign no-op from a click that killed nobody, and the REQUIRE passed either way. That
+is a gate-honesty defect, and the class it slept through is real: any synthetic row that
+outlives the battery sits in the table with a high z, hit-tests FIRST over a real window's close
+box, and starves the real owner's kill for the whole boot. Three fixes, one arc:
 
----
+1. **The discriminator.** `wc_close_click`'s out-of-slot-range arm now settles
+   `noproc-selftest`, a distinct tag; plain `noproc` is reserved for a REAL slot ASID with no
+   live process — P82's exact kill-finds-nobody shape. The spec REQUIREs the selftest tag and
+   FORBIDs plain `noproc` on the headless gate outright (no operator clicks there, so nothing
+   may legitimately print it).
+2. **Leg 10 (`closereal=`).** The close arm re-proven against a row the battery created through
+   the ordinary path (`wa`), through the shipped router, asserting: the NAMED row is the reaped
+   row, the settle read-back (`wc_close_last_settle`, a witness-only code the wire line cannot
+   provide to a leg) is `noproc-selftest` and nothing else, press consumed, focus to the shell.
+   A router that threads a constant, resolves the wrong row, or regresses the discriminator
+   fails this leg; leg 9 alone cannot catch any of the three.
+3. **The teardown witness guard + close fall-through.** `hittest_selftest`'s tail now sweeps the
+   table for rows still owned by any battery ASID and reaps them, printing
+   `[clickroute] hit-test teardown LEAK — N synthetic row(s) reaped -> FAIL` (spec-FORBIDden;
+   also caught by the default `-> FAIL` scan) — a fixture leak can no longer be silent or
+   permanent. And the router's close arm no longer stops at witness furniture: a resolution that
+   settles `noproc-selftest` re-runs the hit-test at the same point and closes the next row
+   whose close box contains it (bounded by the table size, one rate-limited wire line per hop),
+   so even a leaked fixture cannot starve the kill of the real owner the operator was aiming at.
+   Real settles (`closed`, `noproc`, `dead`, `armed`, `exhausted`) never retry.
 
-## FLICKER-4 — the presenter was manufacturing the overlap that forced the bracket
+Undead rows (window gone, process alive) accumulated by the defect remain reachable the honest
+way: they read `running` in `jobs` and die by `kill <pid>`; no sweep invents an exit for them.
 
-FLICKER-3 gated the flush bracket and then predicted it would read `flush_skip=0/M` on the vug path
-anyway, because `vug`'s VUG-FPS dirty-rect phase erases the pointer's previous footprint into the
-BACK buffer every frame. This is that erase, gated.
+### Gate results (CLOSE-FIX, 2026-07-29, QEMU raspi4b)
 
-### The premise, checked before the change
+* `./arroyo check` — both arches green.
+* `./arroyo kernel8-test` — MBENCH PASS 88/88 (was 87; the new REQUIRE is the
+  `settle=noproc-selftest` pin, the leg-10 pin folds into the existing hit-test REQUIRE), with
+  `close=true closereal=true -> PASS` and two `settle=noproc-selftest` lines on the wire, no
+  LEAK line, no plain `noproc`. Green at both default and bench geometry
+  (`UNAOS_FBW=1920 UNAOS_FBH=1200`).
+* `./arroyo test-arm` — MISSION SUCCESS (legs 9–10 DORMANT on the hosted build: `close=skip
+  closereal=skip`).
+## COMPOSITE-2 — measure the pass, then multiply it (2026-07-29)
 
-**On the front-buffer sprite path the erase is dead restoration.** `pal::cursor::draw` under
-`SPRITE_OWNS_PAINT` invalidates the (unused) back-buffer stash and delegates to
-`video::cursor::ensure_drawn()`; it never calls `paint()`, so **no cursor pixel is ever written into
-vug's back buffer on x86**. `pal.rs`'s own CURSOR-X86 note says as much in advance — the full-screen
-loops "simply stop putting pixels in the back buffer" — which was made true of the PAINT and never
-made true of the ERASE.
+The compositor's aggregate throughput wall — ~123 composite passes/s, ~8 ms per pass at 1920x1200,
+measured identically across P79/P80/P82 — is the fps ceiling for the whole vug fleet while V3D
+stays walled. This arc first put the pass's cost breakdown on the wire, then rebuilt the two terms
+the measurement convicted. No protocol, window-API, CURSOR-13-bracket or FLICKER-3 semantics moved;
+the WC-D/WC-G/HT oracles keep their verdicts (87/87).
 
-Nothing else consumes it. `prev_cursor` has exactly two uses in the file: this erase and its own
-assignment. The trail it exists to clean is cleaned elsewhere on this path: when the pointer moves,
-`video::cursor::repaint` restores the vacated FRONT-buffer pixels from the sprite's save-under, and
-`pal::cursor::restore`'s `SPRITE_OWNS_PAINT` arm delegates to `video::cursor::undraw` for the same
-reason. Removing the back-buffer fill therefore cannot strand a footprint here.
+### The instrument: `[comp2]` (aarch64 + witness, `video/wm.rs`)
 
-And the fill is not free. `draw_rect` marks damage, so every frame handed `Screen::flush` a damage
-rect covering the sprite's own panel box; the present blitted background forward over a live arrow,
-and FLICKER-3's gate *correctly* refused to skip, because the damage genuinely did meet the sprite.
-**The presenter was manufacturing the very overlap that forces the bracket, 75 times a second.**
+One rollup line rides the `[wcn]` cadence and partitions every pass's wall time:
 
-### The polarity, which is the part that matters
+    [comp2] rollup passes=N pass_us= max_us= sprite_us= wait_us= blit_us= cache_us=
+            bytes_pp= dmg_px_pp= rate=/s span=ms
 
-`vug.rs` is shared with the Pi seat and **their cursor model is genuinely different**: their
-`pal::cursor::draw` paints the sprite into the BACK buffer as merged runs every frame, so
-erase → redraw is the correct software-cursor cycle there and skipping it strands the previous
-footprint on screen. The erase is dead on one path and load-bearing on the other.
+* `sprite_us` — deferred-erase drain + cursor bracket + tail (`adopt`/`repaint`/`ensure`).
+* `wait_us` — WRITER read, TABLE lock, damage close, ordering, guard registration.
+* `blit_us` — the blit loop (compose + present), minus the cache term.
+* `cache_us` — `draw_window`'s trailing clean for the non-coherent HVS.
+* `bytes_pp` / `dmg_px_pp` — panel bytes written and damage-clipped box area, per pass.
 
-So the gate is written as a property, in erase-positive polarity, with the safe direction as the
-default — `pal::cursor::BACKBUF_SPRITE_NEEDS_ERASE`:
+### The measurement (QEMU raspi4b, `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test`)
 
-```rust
-if crate::pal::cursor::BACKBUF_SPRITE_NEEDS_ERASE {
-    if let Some((qx, qy, qw, qh)) = prev_cursor { pal.draw_rect(qx, qy, qw, qh, BG); }
-}
-```
+| term                          | before   | after   | change |
+|-------------------------------|----------|---------|--------|
+| `pass_us` (per-pass wall)     | 14912    | 2821    | 5.3x   |
+| `max_us`                      | 60213    | 13852   | 4.3x   |
+| `blit_us`                     | 12952    | 1720    | 7.5x   |
+| `cache_us`                    | 1007     | 267     | 3.8x   |
+| `sprite_us` / `wait_us`       | 22 / 10  | 3 / 4   | noise  |
+| `[wc-h]` 514x526 `compose_us` | 11034    | 850     | 13x    |
+| `[wc-h]` 514x526 `present_us` | 896      | 706     | ~1x    |
 
-* Named for the **paint model** (is the arrow in the back buffer?), not for an arch.
-* The erase is the branch guarded **IN**, never out.
-* `true` = erase = the back-buffer sprite model = the default.
-* **In a tree that has no `SPRITE_OWNS_PAINT` symbol, this constant does not exist and the call site
-  FAILS TO COMPILE.** That is deliberate and is the answer to the convergence question: there is no
-  `unwrap_or`, no `cfg!(feature = …)` that reads `false` when the feature is absent, and no arch
-  test at the call site — the three shapes that would turn a missing symbol into a stranded pointer
-  footprint. **A tree without the front-buffer sprite wants `BACKBUF_SPRITE_NEEDS_ERASE = true`.**
+The verdict was unambiguous: ~87% of the pass was the per-pixel compose — every destination pixel
+paid a `put_pixel` call (four bounds checks, a format match, three byte stores), and the dense
+chrome fill wrote the whole outer box only for the content loop to rewrite 97% of it. The present
+copy was already bulk (`copy_nonoverlapping` rows) and barely moved. Sprite and wait terms were
+never the wall. (The residual `pass_us - blit - cache` ≈ 0.8 ms is the WC-F ground-truth probe's
+per-pass repaint — witness+baremetal instrumentation, absent from production media.)
 
-### Proof the two paths went where they were supposed to
+### The rebuild (expected-value order, as the measurement justified)
 
-Measured by building each target twice — once with the gate, once with the line textually reverted
-to its pre-FLICKER-4 form — and comparing the `.text` section, which is codegen only (whole-ELF
-hashes differ either way because a source edit moves the line tables):
+1. **Word blits** (`framebuffer.rs`): `encode4` un-gated from x86; new `fill_span4` (per-span
+   bounds + swizzle hoist, 64-bit paired stores — the build is `+strict-align`, so spans check
+   word alignment and fall back to `put_pixel` rather than fault); `fill_rect`/`fill_rows` take
+   the span path on aarch64 (x86 keeps its loops so `videobench`'s poke counters keep meaning).
+   The only byte that differs is the pad, written 0 where `put_pixel` skipped it — no reader
+   decodes it (scan-out ignores it, `read_pixel` reads 3 bytes, the staged layer's pads are 0).
+2. **Flattened row compose** (`wm.rs paint_window`): the staged single-line case (every `dup` row,
+   every `scale==1` row) does its clipping once per row and degenerates to "encode, store `scale`
+   words, advance" over one contiguous run. Clip bounds identical to the span writer's.
+3. **Damage honesty — write each pixel once**: the chrome fill is now the outer box MINUS the
+   content extent (title band, bottom strip, side borders). The subtracted region is only what the
+   content loop provably writes in the same call — both painters clip with the same bounds at the
+   same coordinates — so WC-H's "every pixel the present copies was written by this pass"
+   invariant holds exactly; short content (`cols==0`/`rows==0`) keeps the full dense fill.
+4. **Cache honesty** (`flush_rect` + `arch/aarch64/cache.rs::clean_rows`): the post-blit clean
+   covers the box's own columns per row with ONE trailing `DSB`, instead of full-width scanlines —
+   3.7x fewer bytes cleaned for the bench's 514-wide box. Same swap on the two staged-erase flush
+   sites. WC-D's bare-`IVAC` discipline untouched.
 
-| target | `.text` sha256, gated | `.text` sha256, unguarded | size |
-| --- | --- | --- | --- |
-| aarch64 | `3f4f21d7a9cc…` | `3f4f21d7a9cc…` | **identical** |
-| x86_64 (witness) | `d71bae8ed490…` | `e261e8735ca4…` | 712 687 vs 713 103 B |
+**Not taken, and why**: cross-window occlusion coalescing (the fleet tiles; the dirty set is
+per-window and honest, so covered-pixel double-blits are not in the measured population) and
+band-parallel composite (`wait_us` ≈ 4 µs — no serialisation to spread; the surviving cost is
+byte throughput on compose+present, which more cores do not multiply and whose sched coupling the
+constraints priced as not worth a QEMU-only guess).
 
-**aarch64 is byte-identical**, so the Pi path is provably untouched. x86 differs and is 416 bytes
-smaller: the erase folded out, so the gate is live rather than trivially true.
+### Projection to metal, stated honestly
 
-### What `flush_skip=` should read now — stated so the bench can read it without us
+QEMU measures instruction count, not DRAM/write-combining bandwidth, so the 5.3x pass_us is an
+upper-bound shape, not a metal number. What transfers: the eliminated work is real (per-pixel call
+overhead ~10 instructions/px -> 2 stores per 8 bytes; ~2x panel bytes written per pass -> ~1x;
+3.7x cleaned bytes -> 1x), and on the A72 the compose (cached RAM) was CPU-bound in exactly the
+population QEMU models. If the metal pass is bandwidth-bound after the rebuild, the floor is the
+box's ~2.1 MB of traffic (compose write + present read/write + clean) against the Pi 4's ~4 GB/s
+practical DRAM bandwidth ≈ 0.5–1 ms/pass; if it stays instruction-bound the QEMU ratio applies to
+the measured 8 ms ≈ 1.5 ms/pass. Either way the honest projection is **~4–6x the pass rate — from
+~123/s aggregate to the 500–800/s band** — with the metal verdict owed to Peter's boot at the next
+attended sitting.
 
-`[cursor6]`'s terms are cumulative from boot, so read the CHANGE between two successive blocks, not
-the absolute ratio (a boot's worth of console flushes sits in `M` before vug ever starts).
+### Gate results (COMPOSITE-2, 2026-07-29, QEMU raspi4b)
 
-Before FLICKER-4 the prediction was `flush_skip` flat at 0 while `M` climbed at ~75/s. After it, on
-the vug path, the damage set per frame is the crystal's previous and current boxes plus the HUD and
-corner-meter blocks — and **none of those is a function of where the pointer is**. So:
+* `./arroyo check` — both arches green.
+* `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test` — MBENCH PASS 87/87, 12 consecutive runs
+  (one early 86/87 run during development did not reproduce across those 12 and left no captured
+  witness identity; recorded here so a recurrence is read as a flake candidate, not a surprise).
+* `./arroyo kernel8-test` (default geometry) — MBENCH PASS 87/87.
+* `./arroyo test-arm` — MISSION SUCCESS.
 
-* **Pointer parked over empty backdrop** — no rect meets the sprite. `flush_skip` should climb at
-  **very nearly the full flush rate**: between two blocks, ΔN ≈ ΔM. This is the reading that proves
-  FLICKER-4 landed, and it is the one to take first because it is the least ambiguous.
-* **Pointer held over the tumbling crystal, the HUD, or a corner meter** — the damage genuinely does
-  meet the sprite, the bracket is genuinely required, and ΔN falls toward 0. **That is the gate
-  working, not failing**, and an operator who only ever parks the pointer on the crystal will see
-  `flush_skip` near 0 for a correct reason. Read the two placements against each other.
-* **`desktop_over` must stay 0 throughout, in both placements.** A skip taken wrongly shows up
-  there, and the `UNBRACKETED` verdict already says so.
+## FLUID-3 — price the wait that motion buys (2026-07-29)
 
-ΔN ≈ 0 with the pointer on bare backdrop is the refutation, and it would mean something else in the
-frame is still damaging the sprite's box — the next thing to instrument would be which rect.
+Two live P83 bench observations (Peter, at the panel): **pointer motion increases a fleet core's
+idle** ("when I move the mouse it makes more reserve" — one core sits ~47% busy under a six-vug
+storm while the other three run 99%, and heavy motion windows deepen the reserve), and **each vug
+settles to a characteristic fps below available capacity** ("vug still wants to fall to its
+predetermined fps even though it could run faster"). The SCHED load meter counts service time as
+busy (`CoreAccount::busy_pct`; only placement uses the EL0-only figure), so the reserve is genuine
+idle — fleet tasks leaving the run queues with headroom measurably present.
 
-### Gate results (FLICKER-4, 2026-07-30)
+### What the P83 wire says (`pi4-r23s1r`, six-vug storm stretch)
 
-* `./arroyo check` — **`✅ x86_64 OK` / `✅ aarch64 OK`**; `UNAOS_WITNESS=1 ./arroyo check` — same.
-  No new warnings (`vug.rs`'s `own_load` warning is pre-existing and in the other loop).
-* `.text` comparison above: aarch64 identical, x86 changed.
-* `strings` of the `--features witness` x86 kernel still carries ` flush_skip=` and ` adm=`.
-* No QEMU target run: forbidden this round on cost grounds. Metal is the verdict.
+Correlating `[prio] el0=` per-window (motion proxy: EL0 dispatches spike under pointer events)
+against `SCHED: load`, `[wcn]` rates, `[comp2]` and `[spread9]` over the same windows:
+
+* The aggregate present rate is **conserved at ~258 passes/s** across the storm — quiet windows
+  (`el0` ≈ 0) and heavy-motion windows (`el0` ≈ 1.1 M) alike, `att_rate` 248–262/s, `aborted=0`.
+  One live window alone gets the whole figure (win5 solo: 255/s); six share it.
+* The shares are wildly unequal and stable over minutes: win1/2/4 ≈ 19–21/s, win3 ≈ 50/s,
+  win5/6 ≈ 71–80/s. Same binary, same class — the settled "predetermined fps" Peter feels.
+* One core holds a ~44–48% busy reserve in every storm window; under sustained motion the busy
+  cores sag from 99% to ~84% and the reserve core dips as low as 23% busy (motion window
+  `el0=589k`: c2=23%) — motion buys REAL idle while `att_rate` holds. Quiet mean total busy
+  336/400, motion mean 327/400 across the stretch, with the deep sags exclusively in motion
+  windows.
+* `[spread9] kick` deltas: ~4/window quiet vs ~13/window motion, both trivial against ~1290
+  passes/window — **H2 (preemption storm) refuted**.
+* `[comp2] sprite_us=1` per pass throughout motion windows — **H3 (compose-through cost)
+  refuted**.
+
+### What the code says (H1, corrected)
+
+`SYS_WIN_PRESENT` → `wm::present` → `composite()` runs the full pass **inline on the presenting
+task's own core** and returns when it finishes. There is no present queue, no single consumer, and
+no ack rendezvous: the "ack" IS the synchronous return, so (a) a vug's next frame is gated on its
+own composite completing — ~2.5 ms of service time per frame at fleet damage sizes — and nothing
+else. (b) The `[sched6]` "dirty-paced strip@250ms" cadence belongs to the shell's `render_service`
+strip repaint only; nothing batches or quantizes per-window presents. (c) The symmetry break
+between a 19 fps and an 80 fps window is therefore NOT in the present path (which is symmetric and
+first-come-first-served): the remaining pace-setter is where a live vug is allowed to leave the run
+queue at all — its futex parks (frame barrier `DONE` behind its two workers, workers on `PHASE`),
+crossed with placement packing. A parent whose workers sit deep in a saturated core's run queue
+parks for milliseconds per frame; that park is the reserve the load meter shows, and its duration —
+not any fps target (the vug has none) — is the settled rate.
+
+### The instrument: `[fluid3]` (aarch64 + witness; `video/wm.rs` + `arch/aarch64/sched.rs`)
+
+One line per `[wcn]`/`[comp2]` window:
+
+    [fluid3] parks=N park_us mean= max= p50<= p90<= p99<= depth_max= overlap= span=..ms
+
+* `parks` / `park_us` / percentiles — completed futex parks and their duration distribution
+  (log2-µs buckets, park-to-first-dispatch, stamped around `switch_context` in `futex_wait`).
+  Percentile figures are bucket upper bounds. Expected modes: tens-to-hundreds of µs = barrier
+  behind healthy workers; **milliseconds = a parent starved behind a packed worker — the P83
+  mechanism if confirmed**; >32 ms (top bucket) = idle vugs parked on input rings.
+* `depth_max` / `overlap` — high-water of concurrently in-flight composites (`BLIT_ACTIVE` at
+  guard registration) and passes that entered with another in flight. `depth_max>1` under storm
+  proves presents overlap rather than serialize behind one consumer.
+
+### The two fix directions (priced, not chosen — the frame-pacing contract is Peter's)
+
+* **Async present** — enqueue damage and return; a dedicated service performs passes. Decouples the
+  vug's frame loop from the pass cost entirely (each vug pays raster only; the ~2.5 ms moves to a
+  service core). Cost: breaks the WC-G/tearing invariant that the owner is parked inside
+  `SYS_WIN_PRESENT` while its surface is read — the one moment the surface is provably quiescent —
+  so it needs double-buffered surfaces or a copy, and it changes the barrier semantics VUG-PACE
+  deliberately preserved.
+* **Per-window fair compositor service** — keep the synchronous shape but make pass inclusion fair
+  across windows (e.g. round-robin damage service) so no window's share collapses to 19/s while a
+  sibling holds 80/s. Cost: adds a scheduler-like policy to the compositor; does not return the
+  parked milliseconds (the barrier park remains), only redistributes them.
+
+If `[fluid3]` shows the millisecond mode riding motion windows on the parents of the slow windows,
+the shares are a placement/park story and the second option is the wrong lever entirely — the fix
+is worker co-placement (keep a vug's workers adjacent to its parent), which is scheduler-side and
+in reach without touching the present contract.
+
+### Gate results (FLUID-3, 2026-07-29, QEMU raspi4b)
+
+* `./arroyo check` — both arches green.
+* `./arroyo kernel8-test` — MBENCH PASS 88/88.
+* `./arroyo test-arm` — MISSION SUCCESS.

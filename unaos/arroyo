@@ -67,6 +67,12 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # path at all. `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test` reproduces bench geometry, and is the
 # configuration the WC-D `[wc-d] verify` verdict was cleared in. NOTE these change compiled-in behaviour:
 # a build made with them is NOT the flashable default image.
+#
+# PI-V3D-81: UNAOS_V3D81_SETTLE_MS is the same kind of knob — read with `option_env!` by
+# arch/aarch64/v3d.rs, not a cargo feature. It sets how long a reply-less NOTIFY post settles before
+# the effect is read (default 250 ms, capped at 10 s, ignored unless a UNAOS_V3D81_* leg is armed).
+# The value rides on the `[v3d81]` wire lines, so a capture states its own settle rather than
+# requiring the reader to remember the build.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
@@ -682,7 +688,8 @@ prepare_aarch64() {
     local USB_IMG="${WORKSPACE_DIR}/builder/usb.img"
     if [ ! -f "$USB_IMG" ]; then
         echo -e "${COLOR_YELLOW}⚡ Creating usb.img (64 MiB, signed)...${COLOR_RESET}"
-        dd if=/dev/zero of="$USB_IMG" bs=1m count=0 seek=64 2>/dev/null
+        # bs in bytes: GNU dd (Linux) rejects the BSD `1m` suffix
+        dd if=/dev/zero of="$USB_IMG" bs=1048576 count=0 seek=64 2>/dev/null
         printf 'UNA-OS-DISK-001-ALPHA' | dd of="$USB_IMG" conv=notrunc 2>/dev/null
     fi
 }
@@ -1058,6 +1065,23 @@ EOF
 # and build a flashable .img for Raspberry Pi Imager. Links non-PIE at 0x80000 (aarch64-base.json,
 # relocation-model=static) with pi-baremetal.ld, then objcopy to a raw binary.
 KERNEL8_DIR="${WORKSPACE_DIR}/target/pi_baremetal"
+# SOURCE-ALONG: every pi4 image carries the exact source tree that built it. make-pi-img.sh writes
+# SRC.TGZ (deterministic gzip'd tar of the repo — no target/, no .git/, nothing .gitignore'd) and
+# SRC.SHA (one `sha256sum -c`-checkable line) into the FAT32 root next to kernel8.img, so a running
+# system — and the ledger — can always answer "what code is this". Same tree in => same bytes out
+# (tree-object based, pinned mtime, gzip -n); see make-pi-img.sh's SOURCE-ALONG block for the
+# determinism argument and docs/dev/OS/01_BOOT_HAL/arch_arm64.md §SOURCE-ALONG for the contract.
+#
+# DEFAULT ON, for `kernel8` AND `kernel8-test` alike — the self-hosting intent is that there is no
+# such thing as a UnaOS pi4 image without its source, and a test image that differs from a flashed
+# image in its FAT contents is exactly the kind of drift this arc exists to remove. Measured cost on
+# this tree: +1.3 s wall (1.83 s vs 0.49 s, readback included) and 5.24 MiB from a 19 MiB working
+# tree, i.e. well under the 5 s/cycle bar that
+# would have justified making it opt-in for tests. UNAOS_NOSRC=1 skips it if a cycle ever needs to.
+# The 56 MiB FAT (64 MiB image less the 8 MiB unafs tail) holds the ~6 MiB boot set + SRC.TGZ with
+# room to spare, so the 64 MiB size_mb below is UNCHANGED by this arc; make-pi-img.sh hard-fails
+# with a "GROW the size_mb argument" message rather than letting mcopy/ditto truncate, so that
+# headroom is checked at every build, not assumed.
 # PIUSB-16: the Pi GPU firmware blobs we stage (start4.elf/fixup4.dat), the base DTB, and the
 # miniuart-bt overlay come from the OFFICIAL raspberrypi/firmware repo at a pinned stable tag — NOT
 # scavenged from a stale third-party UEFI bundle. The prior source (pftf/RPi4 UEFI v1.52, ~2023) is a
@@ -1093,7 +1117,9 @@ k8_lock_acquire() {
     mkdir -p "${WORKSPACE_DIR}/target"
     while ! mkdir "$K8_LOCKDIR" 2>/dev/null; do
         holder=$(cat "$K8_LOCKDIR/pid" 2>/dev/null || echo "")
-        mtime=$(stat -f %m "$K8_LOCKDIR" 2>/dev/null || echo 0)
+        # BSD stat first, GNU stat second — the `|| echo 0` fallback alone would make every
+        # contended wait on Linux read age=huge and false-reclaim a live holder's lock
+        mtime=$(stat -f %m "$K8_LOCKDIR" 2>/dev/null || stat -c %Y "$K8_LOCKDIR" 2>/dev/null || echo 0)
         now=$(date +%s); age=$(( now - mtime ))
         if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
             echo -e "${COLOR_YELLOW}kernel8: stale build lock reclaimed — holder PID $holder dead (age ${age}s)${COLOR_RESET}" >&2
@@ -1360,6 +1386,49 @@ kernel8() {
         K8_FEATS="${K8_FEATS},v3d_deep,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_DEEP: the slow banked-verdict V3D probes (v3d48 ladder / v3d59 frameclose / v3d58 rerender) — adds ~3.5 s to an armed boot${COLOR_RESET}"
     fi
+    # PI-V3D-69: UNAOS_V3D69_REENABLE=1 adds the `v3d69_reenable` (+`v3d_deep`,+`v3d`) features — the
+    # WRITE half of the initialisation-diff arc. The READ half (the `[v3d69] fabric` stations: PM_GRAFX,
+    # both V3D async-AXI-bridge control words in both candidate ASB blocks, V3D_MMUC_CONTROL) rides
+    # UNAOS_V3D_DEEP and writes nothing. This knob adds the one rung that re-runs mainline's
+    # `bcm2835_asb_power_on` ON half and re-kicks the `[v3d69]` control rung behind it, so the retire
+    # verdict either side of the re-enable is a same-boot differential. Gated on the FINDING as well as
+    # on the knob: when the read half reports a clean fabric the rung declines, writes nothing and says
+    # so on the wire. Implies UNAOS_V3D_DEEP. See docs/dev/OS/08_VIDEO/v3d.md §41.
+    if [ -n "${UNAOS_V3D69_REENABLE:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d69_reenable,v3d_deep,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D69_REENABLE: re-run the mainline PM/ASB enable sequence and re-kick the [v3d69] control rung (declines when the fabric already reads clean)${COLOR_RESET}"
+    fi
+    # PI-V3D-79: UNAOS_V3D79_MINIMAL=1 adds the `v3d79_minimal` (+`v3d`) feature — the genpd-faithful
+    # minimal bringup: skip the three mailbox SET calls (power domain / clock rate / clock gate) and the
+    # [v3d50] OFF half; do only what piOS's boot-time path does (deassert V3DRSTN, release the two rpivid
+    # bridges). One boot discriminates whether one of our extra acts wedges thread 0. See v3d.md §46.
+    if [ -n "${UNAOS_V3D79_MINIMAL:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d79_minimal,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D79_MINIMAL: genpd-faithful minimal V3D bringup (no mailbox SETs, no reset assert)${COLOR_RESET}"
+    fi
+    # PI-V3D-81: the REPLY-LESS NOTIFY legs. v3d.md §46.5 established that this firmware acts on
+    # NOTIFY-class tags without sending a FIFO reply, so a `mbox_call` timeout on one says nothing
+    # about whether the tag was honoured — NOTIFY_DISPLAY_DONE (P92/P93) and SET_ENABLE_QPU (P86) were
+    # MIS-READ, not refuted. Each leg posts its tag, waits for no reply, settles UNAOS_V3D81_SETTLE_MS,
+    # then reads the EFFECT: the reply buffer the VPU writes by DMA (the channel P92/P93 never read),
+    # the register station either side of the send, and the firmware's own clock/display state, with
+    # GET_CLOCK_RATE as the positive control that makes a null reading interpretable. Separately
+    # armable BECAUSE they are independent hypotheses: a boot that sends both can attribute a change to
+    # neither. Arming a leg stands down [v3d75a]'s doorbell-waiting send of the same tag, and stands
+    # [v3d80] down outright whichever leg is armed — it sits immediately before the battery and its
+    # NOTIFY may be honoured reply-lessly, so leaving it in would hand [v3d81q] a baseline taken on a
+    # firmware already told to release the display. Sent once per boot or not at all. Each implies
+    # UNAOS_V3D_DEEP (the legs ride the tail of the deep battery, where their comparison readings are
+    # taken). ⚠ UNAOS_V3D81_DISPLAY may take the bench panel to black permanently — by design; serial
+    # carries the whole verdict. See docs/dev/OS/08_VIDEO/v3d.md §47.
+    if [ -n "${UNAOS_V3D81_QPU:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d81_qpu,v3d81,v3d_deep,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D81_QPU: send SET_ENABLE_QPU reply-less and read the effect ([v3d75a] and [v3d80] both stand down)${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_V3D81_DISPLAY:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d81_display,v3d81,v3d_deep,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D81_DISPLAY: send NOTIFY_DISPLAY_DONE reply-less and read the effect ([v3d80] stands down) — ⚠ the panel may go black and stay black${COLOR_RESET}"
+    fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::
     # spawn_joinable + JoinHandle join barrier), falling back to the single-core serial flush when no
@@ -1593,6 +1662,27 @@ run_kernel8() {
 # gating a CLEAN base and getting the identical shortfall). The measured floor is 60 s; the spec header
 # in scripts/specs/pi4-regression.spec carries the per-window measurements. `kernel8-test` is pi4-only —
 # no x86/arm caller reaches this function — so raising the default changes nothing for them.
+#
+# FLAKE-1 (2026-07-28): two flake modes were artifacted on the bench, and both produced a DISHONEST
+# verdict from a harness whose whole point is honesty. Named here so the tool reports them instead.
+#   (1) SILENT NO-CAPTURE. A `kernel8-test 150` finished looking green while QEMU had produced NO
+#       serial-pi.log at all; mbench then errored `[Errno 2] No such file or directory` and a
+#       downstream `&&`/pipe masked the failure. Root cause is a CHECK-THEN-BIND RACE on the QMP
+#       port: the `lsof` pre-scan below observes the port free, and QEMU binds it some seconds LATER
+#       (after the image build), so a concurrently-launching QEMU from another worktree gate — this
+#       host runs several at once — can win the bind and kill ours instantly, before `-serial file:`
+#       has created the log. That check-then-bind window CANNOT be closed atomically from shell: we
+#       do not hold the socket, QEMU does. The pre-scan stays (it narrows the window and is nearly
+#       always sufficient); the RETRY LOOP below is the actual mechanism. A launch that is not alive
+#       AND writing within UNAOS_K8T_LIVE_SECS (default 5) is treated as a flake, killed, and
+#       relaunched on the next port, bounded at 2 retries.
+#   (2) LOAD-SENSITIVE TRUNCATION. Under concurrent build/QEMU load a 150 s window truncated (exit 3,
+#       honestly) where 210 s passed clean. Not a bug — but the TRUNCATED explanation now says so.
+# EXIT CONTRACT (extends MBENCH-HONEST, does not alter it): 0 PASS / 1 FAIL / 3 TRUNCATED are exactly
+# as before; the NEW code 4 means HARNESS FLAKE — the run produced no usable capture, so it is neither
+# a pass, a regression, nor a truncation. Never fall through to mbench with a missing log.
+# `install_pi()` and `test_aarch64()` share this launch shape and have the same latent race; they are
+# deliberately NOT touched by this arc (lane discipline) and can inherit the retry helper later.
 test_kernel8() {
     local secs="${1:-60}"
     kernel8 # always rebuild from current source (incremental; ~seconds) so we never test a stale image
@@ -1607,16 +1697,53 @@ test_kernel8() {
     [ "$SDIMG" != "0" ] && SD_DRIVE="-drive if=sd,format=raw,file=${SDIMG}"
     # QMP port: default 4463, overridable (UNAOS_QMP_PORT) and auto-bumped past ports already in
     # use — parallel worktree sessions (hybrid mode) each run their own QEMU and MUST NOT collide.
+    # FLAKE-1: the pre-scan is a NARROWING measure, not a guarantee — see the header. It cannot be
+    # atomic (we never hold the socket; QEMU binds it later), so the liveness+retry loop below is the
+    # mechanism that actually turns a lost race into a named, bounded retry instead of a false green.
     local qmp_port="${UNAOS_QMP_PORT:-4463}"
     while lsof -iTCP:"$qmp_port" -sTCP:LISTEN >/dev/null 2>&1; do qmp_port=$((qmp_port + 1)); done
-    qemu-system-aarch64 \
-        -machine raspi4b \
-        -kernel "$KERNEL8_DIR/kernel8.img" \
-        -serial "file:${logf}" -serial null -display none \
-        ${SD_DRIVE} \
-        -qmp tcp:127.0.0.1:${qmp_port},server,nowait \
-        ${UNAOS_QEMU_EXTRA:-} &
-    local qpid=$!
+    # FLAKE-1 liveness gate: within UNAOS_K8T_LIVE_SECS (default 5) of launch, the QEMU pid must be
+    # ALIVE and $logf must exist and be GROWING PAST 0 BYTES. A QEMU that lost the QMP bind (or died
+    # on a bad arg) fails both within milliseconds. 2 retries, each on the next port up.
+    local live_secs="${UNAOS_K8T_LIVE_SECS:-5}"
+    local max_tries=3           # 1 launch + 2 retries
+    local qpid="" attempt=1 launched=0
+    while [ "$attempt" -le "$max_tries" ]; do
+        rm -f "$logf"
+        qemu-system-aarch64 \
+            -machine raspi4b \
+            -kernel "$KERNEL8_DIR/kernel8.img" \
+            -serial "file:${logf}" -serial null -display none \
+            ${SD_DRIVE} \
+            -qmp tcp:127.0.0.1:${qmp_port},server,nowait \
+            ${UNAOS_QEMU_EXTRA:-} &
+        qpid=$!
+        # Poll at 10 Hz so a healthy launch costs a fraction of a second, not the whole window.
+        local ticks=$((live_secs * 10)) t=0
+        while [ "$t" -lt "$ticks" ]; do
+            if ! kill -0 "$qpid" 2>/dev/null; then break; fi   # died => flake, no point waiting out the window
+            if [ -s "$logf" ]; then launched=1; break; fi
+            sleep 0.1
+            t=$((t + 1))
+        done
+        if [ "$launched" -eq 1 ]; then break; fi
+        kill "$qpid" 2>/dev/null || true                       # reap the remnant before retrying
+        wait "$qpid" 2>/dev/null || true
+        if [ "$attempt" -lt "$max_tries" ]; then
+            echo -e "${COLOR_YELLOW}⚠ kernel8-test: QEMU launch flake (port ${qmp_port}) — retrying on $((qmp_port + 1))${COLOR_RESET}"
+            qmp_port=$((qmp_port + 1))
+            while lsof -iTCP:"$qmp_port" -sTCP:LISTEN >/dev/null 2>&1; do qmp_port=$((qmp_port + 1)); done
+        fi
+        attempt=$((attempt + 1))
+    done
+    if [ "$launched" -ne 1 ]; then
+        echo -e "${COLOR_RED}✖ kernel8-test: HARNESS FLAKE — QEMU never came up (no serial capture at ${logf})"
+        echo -e "  after ${max_tries} launch attempts, each given ${live_secs}s to write its first byte (last port ${qmp_port})."
+        echo -e "  This run carries NO verdict: not a pass, not a regression, not a truncation. Exit 4."
+        echo -e "  Usual cause is a lost QMP-port race against a concurrent worktree gate, or a bad"
+        echo -e "  UNAOS_QEMU_EXTRA. Re-run when the host is quieter, or pin UNAOS_QMP_PORT to a free port.${COLOR_RESET}"
+        return 4
+    fi
     python3 "${WORKSPACE_DIR}/scripts/qmp_shoot.py" --port "$qmp_port" --wait "$((secs - 1))" --out "$png" 2>/dev/null || sleep "$secs"
     kill "$qpid" 2>/dev/null || true
     wait "$qpid" 2>/dev/null || true
@@ -1630,7 +1757,18 @@ test_kernel8() {
     #   was cut short — INCONCLUSIVE, neither a pass nor a regression; re-run with a longer window).
     # UNAOS_K8T_ASSERT=0 opts out, for the deliberate off-spec configurations (UNAOS_SDIMG=0 no-card
     # control, single-subsystem knob runs) where the full pi4 spec is not the contract being tested.
+    # FLAKE-1 adds exit 4 (HARNESS FLAKE), for the case where there is no capture to assert at all.
     if [ "${UNAOS_K8T_ASSERT:-1}" != "0" ]; then
+        # FLAKE-1 belt-and-braces: the liveness gate above should make this unreachable, but a QEMU
+        # that dies AFTER writing its first byte can still leave a truncated-to-zero log, and mbench
+        # given a missing path errors `[Errno 2] No such file or directory` — which is how the silent
+        # no-capture run got read as green. Name it as a flake (4) rather than a regression (1).
+        if [ ! -s "$logf" ]; then
+            echo -e "${COLOR_RED}✖ kernel8-test: HARNESS FLAKE — ${logf} is missing or empty; there is nothing to assert."
+            echo -e "  QEMU came up but produced no serial bytes. This run carries NO verdict — not a pass,"
+            echo -e "  not a regression, not a truncation. Exit 4; re-run.${COLOR_RESET}"
+            return 4
+        fi
         echo -e "${COLOR_CYAN}⚡ mbench: asserting the capture against scripts/specs/pi4-regression.spec${COLOR_RESET}"
         # `|| mrc=$?` rather than a bare call + `$?`: this script runs under `set -e`, so a FAIL (1) or
         # TRUNCATED (3) exit would otherwise abort here and swallow the explanation below.
@@ -1640,6 +1778,11 @@ test_kernel8() {
         if [ "$mrc" -eq 3 ]; then
             echo -e "${COLOR_YELLOW}⚠ kernel8-test: the boot was TRUNCATED at ${secs}s — this run proves NOTHING."
             echo -e "  Missing witnesses here are NOT a regression. Re-run with a longer window: ./arroyo kernel8-test 60${COLOR_RESET}"
+            # FLAKE-1: the window that suffices is HOST-LOAD DEPENDENT, not fixed. Artifacted on this
+            # bench 2026-07-28: 150 s truncated under concurrent build/QEMU load where 210 s passed clean.
+            echo -e "${COLOR_YELLOW}  The needed window scales with HOST LOAD: concurrent builds/QEMU gates slow the boot, so a"
+            echo -e "  window that passed on a quiet host truncates on a busy one (bench precedent 2026-07-28: 150 s"
+            echo -e "  TRUNCATED under load, 210 s clean). Try './arroyo kernel8-test 210', or re-run when quieter.${COLOR_RESET}"
         fi
         return $mrc
     fi

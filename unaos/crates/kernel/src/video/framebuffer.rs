@@ -226,12 +226,12 @@ impl FrameBuffer {
         }
     }
 
-    /// VPERF M4 (x86 only): encode `color` as the little-endian 4-byte pixel this surface
-    /// stores, when the layout is a full 4-byte pixel (bpp 4, Rgb/Bgr). Lets callers hoist the
-    /// per-pixel format decode out of their inner loops (`put_raw4` / the `fill_rows` fast
-    /// path). The X byte is encoded 0: `put_pixel` leaves it untouched, but every store this
-    /// kernel allocates starts zeroed and scan-out ignores it, so the visible bytes agree.
-    #[cfg(target_arch = "x86_64")]
+    /// VPERF M4: encode `color` as the little-endian 4-byte pixel this surface stores, when the
+    /// layout is a full 4-byte pixel (bpp 4, Rgb/Bgr). Lets callers hoist the per-pixel format
+    /// decode out of their inner loops (`put_raw4` / the `fill_rows` fast path / COMPOSITE-2's
+    /// span writer). The X byte is encoded 0: `put_pixel` leaves it untouched, but every store
+    /// this kernel allocates starts zeroed and scan-out ignores it, so the visible bytes agree.
+    /// (x86-only until COMPOSITE-2; the aarch64 compositor's bulk paths now hoist through it too.)
     #[inline]
     pub fn encode4(&self, color: u32) -> Option<u32> {
         if self.info.bytes_per_pixel != 4 {
@@ -266,6 +266,64 @@ impl FrameBuffer {
         unsafe { core::ptr::write_unaligned((self.base + offset) as *mut u32, raw) };
     }
 
+    /// COMPOSITE-2 — whether the WORD fast paths may run on this surface: a full 4-byte pixel
+    /// layout AND a word-aligned base, so every pixel offset `(y * stride + x) * 4` is 4-aligned
+    /// (the build is `+strict-align`; a misaligned `str` is not merely slow, it traps). Both real
+    /// framebuffers are page-aligned and the staged back layer is heap-allocated (16-aligned), so
+    /// this is true everywhere it matters — the check exists so a surface it is NOT true of falls
+    /// back to `put_pixel` instead of faulting.
+    #[inline]
+    pub fn word4(&self) -> bool {
+        self.info.bytes_per_pixel == 4 && self.base & 3 == 0
+    }
+
+    /// COMPOSITE-2 — fill a horizontal span of `w` pixels at `(x, y)` with one pre-encoded 4-byte
+    /// pixel (from [`encode4`](Self::encode4) of this surface). The compositor's inner-loop
+    /// primitive: the bounds checks and the format decode happen ONCE per span instead of once per
+    /// pixel, and the body is a word-wide fill (64-bit pairs where alignment allows) instead of
+    /// three byte stores per pixel. Clips exactly as a `put_pixel` loop over the same span would:
+    /// to the visible width and to the mapped length.
+    ///
+    /// Caller contract: only meaningful when [`word4`](Self::word4) is true (callers gate on it;
+    /// the checks here make a violation a no-op, never a fault). Writes the pad byte as 0 where
+    /// `put_pixel` leaves it untouched — no reader of these surfaces decodes the pad (scan-out
+    /// ignores it, `read_pixel` reads 3 bytes), and the staged back layer's pads are already 0.
+    #[inline]
+    pub fn fill_span4(&self, x: usize, y: usize, w: usize, raw: u32) {
+        if self.base == 0 || self.base & 3 != 0 || x >= self.info.width || y >= self.info.height {
+            return;
+        }
+        let w = w.min(self.info.width - x);
+        let off = (y * self.info.stride + x) * 4;
+        if off + 4 > self.len {
+            return;
+        }
+        let n = w.min((self.len - off) / 4);
+        if n == 0 {
+            return;
+        }
+        unsafe {
+            let mut p = (self.base + off) as *mut u32;
+            let end = p.add(n);
+            // Head: one 32-bit store to reach 8-byte alignment for the pair loop.
+            if (p as usize) & 7 != 0 && p < end {
+                p.write(raw);
+                p = p.add(1);
+            }
+            let raw2 = ((raw as u64) << 32) | raw as u64;
+            let mut q = p as *mut u64;
+            while (q as usize) + 8 <= end as usize {
+                q.write(raw2);
+                q = q.add(1);
+            }
+            let mut p = q as *mut u32;
+            while p < end {
+                p.write(raw);
+                p = p.add(1);
+            }
+        }
+    }
+
     /// Fill pixel rows `[y0, y1)` (clamped to the frame) with a colour.
     pub fn fill_rows(&self, y0: usize, y1: usize, color: u32) {
         let y_end = y1.min(self.info.height);
@@ -296,6 +354,18 @@ impl FrameBuffer {
             }
             return;
         }
+        // COMPOSITE-2 (aarch64): the same hoist, through the span writer, with the same
+        // firmware-short-buffer semantics — a row past the mapped length writes nothing and every
+        // partial row writes its prefix.
+        #[cfg(target_arch = "aarch64")]
+        if self.word4() {
+            if let Some(raw) = self.encode4(color) {
+                for y in y0..y_end {
+                    self.fill_span4(0, y, self.info.width, raw);
+                }
+                return;
+            }
+        }
         for y in y0..y_end {
             for x in 0..self.info.width {
                 self.put_pixel(x, y, color);
@@ -309,7 +379,22 @@ impl FrameBuffer {
     }
 
     /// Fill an axis-aligned rectangle (clipped by `put_pixel`'s bounds checks).
+    ///
+    /// COMPOSITE-2 (aarch64): word-wide row spans when the surface supports them — this is the
+    /// compositor's dense chrome/border fill (the whole outer box, every pass) and was the single
+    /// largest per-pixel population in the measured ~13 ms blit term. x86 keeps the per-pixel loop
+    /// so `videobench`'s poke counters keep their meaning.
     pub fn fill_rect(&self, x: usize, y: usize, w: usize, h: usize, color: u32) {
+        #[cfg(target_arch = "aarch64")]
+        if self.word4() {
+            if let Some(raw) = self.encode4(color) {
+                let y1 = y.saturating_add(h).min(self.info.height);
+                for row in y..y1 {
+                    self.fill_span4(x, row, w, raw);
+                }
+                return;
+            }
+        }
         for row in 0..h {
             for col in 0..w {
                 self.put_pixel(x + col, y + row, color);
@@ -383,6 +468,43 @@ impl FrameBuffer {
             return;
         }
         crate::arch::flush_framebuffer_range(self.base + byte_offset, end - byte_offset);
+    }
+
+    /// COMPOSITE-2 — make CPU writes to the pixel RECT `[x, x+w) x [y, y+h)` visible to a
+    /// non-coherent display controller, cleaning only the rect's own bytes per row instead of the
+    /// full-width scanlines [`flush_range`](Self::flush_range) forces. One `DSB` for the whole
+    /// rect (see `arch::flush_framebuffer_rows`), so the cost scales with the bytes the caller
+    /// actually wrote: a 514-wide box on a 1920-wide panel cleans 3.7x less than the scanline
+    /// sweep did. Clips like the writers it covers: to the visible width/height and to the mapped
+    /// length. No-op on cache-coherent targets, exactly as `flush_range` is.
+    pub fn flush_rect(&self, x: usize, y: usize, w: usize, h: usize) {
+        if self.base == 0 || self.info.bytes_per_pixel == 0 || self.info.stride == 0 || x >= self.info.width {
+            return;
+        }
+        let bpp = self.info.bytes_per_pixel;
+        let stride_b = self.info.stride * bpp;
+        let w = w.min(self.info.width - x);
+        let y1 = y.saturating_add(h).min(self.info.height);
+        if w == 0 || y >= y1 {
+            return;
+        }
+        let off = y * stride_b + x * bpp;
+        let row_len = w * bpp;
+        if off + row_len > self.len {
+            return;
+        }
+        // Rows whose full span fits the mapped length (a firmware-short buffer trims the tail,
+        // the same clamp `flush_range` applies at its end).
+        let rows = (((self.len - off - row_len) / stride_b) + 1).min(y1 - y);
+        // aarch64: the strided clean with ONE trailing `DSB` (see cache::clean_rows). Elsewhere the
+        // drain is range-independent (x86's SFENCE), so the rect collapses to the range call.
+        #[cfg(target_arch = "aarch64")]
+        crate::arch::aarch64::cache::clean_rows(self.base + off, row_len, rows, stride_b);
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = rows;
+            crate::arch::flush_framebuffer_range(self.base + off, row_len);
+        }
     }
 
     /// Flush the whole framebuffer to RAM. Used by the boot console (`fbcon`), which pokes scattered

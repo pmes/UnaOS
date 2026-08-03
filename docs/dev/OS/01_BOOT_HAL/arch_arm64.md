@@ -7539,3 +7539,85 @@ is still correct, resting instead on (a) `wfi` waking with PSTATE.I set, (b) a p
 drain, and (c) a wall-clock-bounded pump. `fs/fat.rs`'s comment has been corrected to state that
 real invariant. **No dispatch behavior was changed** — the pi4 lane owns any decision about whether
 a `baremetal` build should refuse the BOT fallback for `BLOCK_DEVICE`.
+## SOURCE-ALONG — the pi4 boot media carries its own source (`SRC.TGZ` / `SRC.SHA`)
+
+The first rung of the self-hosting ladder: **every UnaOS pi4 boot image carries the exact source tree
+that built it**, so a running system — and the ledger — can always answer *"what code is this"* without
+reference to an external checkout.
+
+### The FAT32 root contract
+
+`unaos/scripts/make-pi-img.sh` writes two files into the boot partition's FAT32 root, alongside
+`kernel8.img` / `start4.elf` / `fixup4.dat` / `bcm2711-rpi-4-b.dtb` / `config.txt` and the EL0 fixtures
+(`HELLO.BIN`, `K2OWN.BIN`, `K2IMP.BIN`, `MIDDEN.BIN`, `SCRATCH.BIN`, `GROW.BIN`, `ELFHELLO.ELF`,
+`VUG.ELF`, `STAT.ELF`):
+
+| File | Contents |
+|---|---|
+| `SRC.TGZ` | gzip'd tar of the repository source — **excluding** `target/`, `.git/`, and everything `.gitignore`'d. Paths are repo-root-relative (`unaos/…`, `libs/…`), no leading `./` and no wrapper prefix directory. |
+| `SRC.SHA` | Exactly one line: `<sha256>  SRC.TGZ` — the `sha256sum -c` / `shasum -a 256 -c` format, checkable in place from the FAT root. |
+
+Both names are 8.3-clean, so the kernel's read-only FAT reader can name them without long-filename
+support, and neither collides with any existing fixture. They ride MBR partition 1 (type `0x0C`); the
+unafs volume on partition 2 (type `0x7f`) is unaffected.
+
+### Determinism contract
+
+**Same source tree in ⇒ same `SRC.TGZ` bytes out**, on any host, from any branch, at any clock time.
+This is what makes `SRC.SHA` a usable ledger identity rather than a build nonce. The mechanism:
+
+- **Content set comes from git**, not from an exclude list — so `target/`, `.git/` and every
+  `.gitignore`'d path are excluded by construction and cannot drift out of sync with the ignore rules.
+- **Dirty worktrees are archived as they are, without stashing and without touching the real index.**
+  `git read-tree HEAD` + `git add -A` against a throwaway `GIT_INDEX_FILE`, then `git write-tree`, names
+  a tree object built from the *working tree* (uncommitted edits and untracked-but-not-ignored files
+  included). On a clean worktree that tree is bit-identical to `HEAD^{tree}`, so clean and dirty take one
+  code path with one set of guarantees.
+- **`git archive` of a TREE, never a commit-ish.** Archiving a commit injects a `pax_global_header`
+  carrying the commit sha, which would make the same source hash differently from two branches. Entries
+  come out sorted, uid/gid 0, mode-normalized.
+- **`--mtime=@315532800`** (1980-01-01 UTC, the FAT epoch) pins entry timestamps. Note the sharp edge
+  found here: git's approxidate does **not** parse `@0` and silently falls back to *now*, which makes the
+  archive look deterministic only within a single second. Any pinned mtime must be verified, not assumed.
+- **`gzip -n`** (no name, no timestamp in the gzip header), applied to the tar **as a file**. Streaming
+  `git archive | gzip` was measured to emit different deflate block boundaries run to run.
+- **Non-git source trees** — e.g. an image rebuilt from an unpacked `SRC.TGZ`, the next rung of the
+  ladder — fall back to GNU tar's `--sort=name --mtime --owner=0 --group=0 --numeric-owner` over an
+  explicitly-built, `LC_ALL=C`-sorted member list (`--no-recursion`), which reproduces both the
+  determinism and the `./`-free entry naming of the git path. The one honest gap: with no repository
+  there is no `.gitignore` to consult, so that branch prunes `.git/` and `target/` by name only. If
+  neither git nor a GNU tar is available the build **fails loudly** rather than shipping an image whose
+  `SRC.SHA` would be a lie; `UNAOS_NOSRC=1` is the acknowledgement.
+
+### Capacity — checked, never truncated
+
+The image is **64 MiB**: 56 MiB FAT32 boot partition (54.1 MiB usable after 2 FATs + reserved at 512-byte
+clusters) plus the 8 MiB unafs tail. Measured payload is ~10.6 MiB — ~5.3 MiB of boot set and fixtures
+plus ~5.3 MiB of `SRC.TGZ` from a 19 MiB working tree — so **this arc did not need to grow the image**.
+Before formatting anything, `make-pi-img.sh` sums the staged payload plus `SRC.TGZ`/`SRC.SHA` against the
+FAT partition size less a 4 MiB metadata slack, and on overflow aborts with a message naming the
+`size_mb` argument in `arroyo`'s `make-pi-img.sh` call. A too-small volume is a build failure, never a
+silent `mcopy`/`ditto` truncation.
+
+The check is backed by a **readback**: once the volume is written, `SRC.TGZ` is read back *out* of it
+(`mcopy ::/SRC.TGZ` on Linux, off the mountpoint on Darwin) and re-hashed against `SRC.SHA`. A FAT that
+dropped or truncated the payload fails the build with a `SOURCE-ALONG readback MISMATCH` line naming both
+hashes — it can never reach a flashed card. This is also the `./arroyo kernel8` gate's assertion, made
+self-checking rather than left to a manual `mdir`.
+
+### Default ON, including for tests
+
+`kernel8` and `kernel8-test` both carry the source. A test image whose FAT contents differ from a flashed
+image is exactly the drift this arc removes, so the knob is negative: **`UNAOS_NOSRC=1`** skips the block
+(printing a "image will NOT carry its source" warning to stderr) and is the only way to get an image
+without it. Measured cost on this tree: **+1.3 s wall** and
+**5.24 MiB** (1.83 s vs 0.49 s, readback included), against a 5 s/cycle bar that would have justified making it opt-in for tests — it does not
+come close, so the default stands.
+
+### Host portability
+
+Both host branches of `make-pi-img.sh` carry the pair: Darwin `cp`s it into the private mountpoint after
+`ditto`, Linux `mcopy -o`s it into the FAT image after the staging tree. In both cases the files are held
+in a scratch dir and copied in explicitly — `make-pi-img.sh` never mutates the staging directory it is
+handed. `UNAOS_SRC_ROOT` overrides the source tree, which otherwise resolves to the repo root two levels
+above the script.

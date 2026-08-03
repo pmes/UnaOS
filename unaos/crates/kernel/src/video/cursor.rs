@@ -333,7 +333,12 @@ static C5_MASKED_NOSESSION: AtomicU64 = AtomicU64::new(0);
 static C5_DRAIN_INSESSION: AtomicU64 = AtomicU64::new(0);
 
 /// CURSOR-5 — count a masked undraw taken without owning the session (called from `wm`).
+///
+/// CURSOR-15 — callerless by design, kept for the wire: the sessionless composite arm now composes
+/// through ([`defer_nosession`]) instead of mask-undrawing, so `[cursor5] masked_nosession=` must
+/// read 0 from this arc on. A non-zero reading means someone reintroduced the sessionless handback.
 #[cfg(feature = "witness")]
+#[allow(dead_code)]
 pub fn note_masked_nosession() {
     C5_MASKED_NOSESSION.fetch_add(1, Ordering::Relaxed);
 }
@@ -480,46 +485,11 @@ static C6_PRESENT_OVER: AtomicU64 = AtomicU64::new(0);
 static C6_PRESENT_MASKED: AtomicU64 = AtomicU64::new(0);
 
 /// CURSOR-6 — desktop presents (`Screen::present_background`) whose surviving damage spans met the
-/// live sprite box. `Screen::flush` brackets that call with [`undraw`]/[`repaint`], so this must
+/// live sprite box. The render task brackets its own flush with [`undraw`]/[`repaint`], so this must
 /// be 0; a non-zero count means the desktop reached the panel through a path that skipped the
 /// bracket, and the desktop is erasing the arrow ~20 times a second.
-///
-/// **FLICKER-3 gave this counter a second job and did not change its expected reading.** The
-/// bracket is now taken only when the present's damage meets the sprite's box, so this is also the
-/// designated detector for a WRONG SKIP: `Screen::damage_meets` tests a superset of the spans this
-/// function copies, so a skip can never let one of them reach the arrow, and the first thing that
-/// would refute that argument is this counter going non-zero.
 #[cfg(feature = "witness")]
 static C6_DESKTOP_OVER: AtomicU64 = AtomicU64::new(0);
-
-/// FLICKER-3 — desktop presents that reached the flush gate at all, and the subset that SKIPPED the
-/// bracket because this present's damage provably could not touch the live sprite.
-///
-/// ### Why there are two counters and not one
-/// A bare `flush_skip=` cannot falsify anything, and this counter pair exists because `[cursor12]`
-/// already taught the project that lesson at the cost of three sittings. `flush_skip=0` is what a
-/// HEALTHY gate reads when it has simply not run yet (no flush since boot), and it is also what a
-/// gate reads that is wired up but structurally never able to skip — the two are indistinguishable
-/// from the skip count alone. `flush_gate=` is the denominator that separates them:
-///
-/// * `flush_gate=0` — no desktop present has happened in this window. **No verdict**; the
-///   instrument is unarmed, exactly as `[cursor12] passes=0` is unarmed.
-/// * `flush_gate>0, flush_skip=0` — the gate ran and never once found a present whose damage
-///   missed the arrow. That is a real reading, and on x86 it is the expected one under the
-///   full-screen `vug` presenter, which erases the pointer's previous footprint into the BACK
-///   buffer every frame (`vug.rs`, the VUG-FPS dirty-rect phase) and so damages the sprite's own
-///   box at frame rate by construction.
-/// * `flush_skip` climbing with `flush_gate` — the bracket is being paid only when it buys
-///   something, which is the whole of this fix.
-///
-/// The falsifier is already on the same line and needs no new term: a skip that should NOT have been
-/// taken means the desktop blitted over a live arrow, and that is precisely what
-/// [`note_desktop_over_sprite`] counts. `flush_skip>0` with `desktop_over=0` is the gate working;
-/// `desktop_over>0` is the gate wrong, and the `UNBRACKETED` verdict already says so.
-#[cfg(feature = "witness")]
-static C6_FLUSH_GATE: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "witness")]
-static C6_FLUSH_SKIP: AtomicU64 = AtomicU64::new(0);
 
 /// CURSOR-6 — a [`compose_into`] that declined because the session no longer described THIS plan.
 /// CURSOR-4 left this exit silent, so it was the one decline class absent from `offers - taken`.
@@ -901,6 +871,143 @@ pub fn cursor11_rollup(scope: &str) {
     );
 }
 
+// ---- FLICKER-2 witnesses -------------------------------------------------------------------------
+//
+// Two P79 symptoms, both metal-only (QEMU never draws the sprite and its UART is instant), each with
+// one number that would decide it:
+//
+//   (a) "the pulse gives the mouse a slight flicker" — hypothesis: a serial witness burst (the 5 s
+//       `[wcn]` block, or a timer-IRQ `[prio]`/`[spread4]` site) lands IRQ-masked on a core that is
+//       mid-composite with the arrow off the glass, stretching the bracket from ~1 ms to the length
+//       of the burst. Decider: the DOWN-INTERVAL — wall time from a full undraw to the next draw —
+//       whose max and slow-count are tracked here, with the last slow event's timestamp so a capture
+//       reader can place it against the nearest burst (whose own duration `wm` measures).
+//   (b) "the vug under the mouse flickers occasionally" — one mechanism is FIXED this arc
+//       (restore-before-install: see `undraw_locked`); the counters here say how often the fixed
+//       path actually runs, which is the difference between "fixed" and "adjective".
+#[cfg(feature = "witness")]
+static F2_DOWN_AT_MS: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-2 — longest full-undraw→draw interval in the current rollup window (swapped to 0 by the
+/// rollup, so each line reports its own window).
+#[cfg(feature = "witness")]
+static F2_DOWN_MAX_MS: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-2 — down-intervals at or past [`F2_DOWN_SLOW_MS`], cumulative. Each one is an arrow
+/// absence long enough to read as a blink from the bench chair.
+#[cfg(feature = "witness")]
+static F2_DOWN_SLOW: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-2 — `arch::ms()` at the close of the most recent slow interval, for cadence correlation.
+#[cfg(feature = "witness")]
+static F2_DOWN_LAST_AT: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-2 — a down-interval a bench operator can plausibly see. ~1 vug frame at the P79 rates.
+#[cfg(feature = "witness")]
+const F2_DOWN_SLOW_MS: u64 = 20;
+/// FLICKER-2 — full undraws that found a coherent open overlay session and restored its covered
+/// pixels from the LAYER save. Every one of these would previously have stamped last frame's window
+/// content into a live window (the (b) mechanism, fixed).
+#[cfg(feature = "witness")]
+static F2_SESS_UNDRAWS: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-2 — pixels restored from a session's layer save rather than from `sp.saved`.
+#[cfg(feature = "witness")]
+static F2_SESS_PX: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-2 — full undraws that could not read `OVERLAY` (`try_lock` contended) and fell back to
+/// `sp.saved` for one undraw. Bounded staleness, counted rather than waited out.
+/// FLICKER-3 — the masked path (`undraw_within_locked`) now feeds this too, for the same fallback.
+#[cfg(feature = "witness")]
+static F2_SESS_LOCKMISS: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-3 — masked undraws (`undraw_within_locked`) that found a coherent open overlay session
+/// and restored covered pixels from the LAYER save. Before this arc every one of these restored
+/// `sp.saved` — the pre-present frame — into a live window: the P80 residual (b) mechanism.
+#[cfg(feature = "witness")]
+static F2_MASK_SESS: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-3 — desktop presents (`Screen::flush`) that met a live, visible sprite (or a pending
+/// whole-panel present) and took the CURSOR-13 bracket: one whole-sprite restore→redraw each.
+#[cfg(feature = "witness")]
+static F2_FLUSH_UNDRAWS: AtomicU64 = AtomicU64::new(0);
+/// FLICKER-3 — desktop presents whose damage set was provably disjoint from the live sprite and
+/// left it on glass. On an attended boot with the pointer parked away from the status strip this
+/// should dominate `flush_undraw`: the strip's per-second bars band is the dominant desktop damage.
+#[cfg(feature = "witness")]
+static F2_FLUSH_SKIPS: AtomicU64 = AtomicU64::new(0);
+/// CURSOR-15 — SESSIONLESS composite passes that COMPOSED THROUGH the sprite (deferred instead of
+/// mask-undrawing; see [`defer_nosession`]). This is the P82 mechanism inverted: before this arc
+/// every one of these passes took a masked undraw plus a `Repaint` tail — one full restore→save→draw
+/// per overlapping present, ~123/s under a hovered fleet, which is exactly the cadence `[flick2]`'s
+/// `sess_undraws` was climbing at. On the bench this should track the present rate while
+/// `sess_undraws`/`mask_sess` collapse toward the pointer-move rate.
+#[cfg(feature = "witness")]
+static F2_CT_PASSES: AtomicU64 = AtomicU64::new(0);
+/// CURSOR-15 — [`settle_nosession`] tails that found an overlay session OPEN (or `OVERLAY`
+/// contended) and left their pending bits standing for that session's own tail to settle. Not a
+/// loss: `settle_pending_locked` is bit-driven, not owner-driven, so the owner's `adopt_overlay`
+/// answers every standing bit against ITS finished front — or its fallback `refresh_locked` resets
+/// them, which is settlement by bracket. Counted because each one is a settle deferred by up to one
+/// pass, and a large ratio against `compose_through` would mean the fleet keeps a session open
+/// nearly always and the settle latency is worth another look.
+#[cfg(feature = "witness")]
+static F2_CT_TO_OWNER: AtomicU64 = AtomicU64::new(0);
+
+/// FLICKER-3 — record `Screen::flush`'s bracket decision for a LIVE, VISIBLE sprite. The legacy
+/// always-bracket classes (no sprite on glass, visibility lapsed, `is_ready` fallbacks) are not
+/// counted: they cannot blink an arrow the operator can see, and counting them would drown the one
+/// ratio this discriminator exists to put on the wire — how often a desktop present (the core-load
+/// bars, chiefly) takes the sprite down versus leaves it alone.
+pub fn note_flush_bracket(taken: bool) {
+    #[cfg(feature = "witness")]
+    if taken {
+        F2_FLUSH_UNDRAWS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        F2_FLUSH_SKIPS.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "witness"))]
+    let _ = taken;
+}
+
+/// FLICKER-2 — the arc's rollup, one line beside the other cursor rollups. The `wm`-side figures
+/// (drain shape and `[wcn]` burst wall time) arrive as arguments; everything else is this module's.
+///
+/// `down_max` is per-window (swapped); the rest are boot-cumulative. `down_last_at` is a raw
+/// monotonic-ms timestamp — subtract it from a burst's position to answer the cadence question.
+/// `UNWITNESSED` whenever the sprite has never been drawn (the QEMU gate, by construction).
+#[cfg(feature = "witness")]
+pub fn flick2_rollup(
+    scope: &str,
+    drains: u64,
+    drain_skips: u64,
+    drain_masked: u64,
+    burst_last_ms: u64,
+    burst_max_ms: u64,
+) {
+    let down_max = F2_DOWN_MAX_MS.swap(0, Ordering::Relaxed);
+    let slow = F2_DOWN_SLOW.load(Ordering::Relaxed);
+    let last_at = F2_DOWN_LAST_AT.load(Ordering::Relaxed);
+    let sess = F2_SESS_UNDRAWS.load(Ordering::Relaxed);
+    let sess_px = F2_SESS_PX.load(Ordering::Relaxed);
+    let lockmiss = F2_SESS_LOCKMISS.load(Ordering::Relaxed);
+    let mask_sess = F2_MASK_SESS.load(Ordering::Relaxed);
+    let flush_undraw = F2_FLUSH_UNDRAWS.load(Ordering::Relaxed);
+    let flush_skip = F2_FLUSH_SKIPS.load(Ordering::Relaxed);
+    let ct = F2_CT_PASSES.load(Ordering::Relaxed);
+    let ct_owner = F2_CT_TO_OWNER.load(Ordering::Relaxed);
+    let verdict = if !armed() {
+        "UNWITNESSED"
+    } else if down_max >= F2_DOWN_SLOW_MS {
+        "SLOW"
+    } else {
+        "OK"
+    };
+    // CURSOR-15 — `compose_through=`/`ct_owner=` beside the counters they should be draining:
+    // the P82 reading was `sess_undraws=290+` climbing at present cadence with `down_slow`
+    // accumulating; the expected post-fix wire is `compose_through` tracking the present rate while
+    // `sess_undraws` and `mask_sess` collapse toward pointer-move-only counts and `down_slow` -> 0
+    // under hover.
+    serial_println!(
+        "[flick2] scope={} down_max={}ms down_slow={} down_last_at={}ms sess_undraws={} sess_px={} sess_lockmiss={} mask_sess={} compose_through={} ct_owner={} flush_undraw={} flush_skip={} drains={} drain_skip={} drain_masked={} burst_last={}ms burst_max={}ms -> {}",
+        scope, down_max, slow, last_at, sess, sess_px, lockmiss, mask_sess, ct, ct_owner,
+        flush_undraw, flush_skip, drains, drain_skips, drain_masked, burst_last_ms, burst_max_ms,
+        verdict
+    );
+}
+
 /// CURSOR-6/7 — count a window present that landed on the live sprite box, and, when nothing in that
 /// pass owes the sprite a repaint, ARM the tail repair.
 ///
@@ -1073,18 +1180,6 @@ pub(super) fn note_desktop_over_sprite() {
     C6_DESKTOP_OVER.fetch_add(1, Ordering::Relaxed);
 }
 
-/// FLICKER-3 — record one pass through `Screen::flush`'s bracket gate, and whether it skipped.
-///
-/// Called once per flush, AFTER the present, from `Screen::flush` and nowhere else — outside every
-/// lock this module owns, so it is a pair of relaxed adds on a path that has just done a blit.
-#[cfg(feature = "witness")]
-pub(super) fn note_flush_gate(skipped: bool) {
-    C6_FLUSH_GATE.fetch_add(1, Ordering::Relaxed);
-    if skipped {
-        C6_FLUSH_SKIP.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 /// CURSOR-6 — the arc's rollup, printed by `wm` immediately after `[cursor5]`'s.
 ///
 /// Each line item answers a question `[cursor5]`'s `COHERENT` could not, which is the whole point of
@@ -1134,10 +1229,6 @@ pub fn cursor6_rollup(scope: &str, planned: u64) {
     let mismatch = C6_MISMATCH.load(Ordering::Relaxed);
     let lost = C6_UNCOVER_LOST.load(Ordering::Relaxed);
     let repaired = C7_REPAIRED.load(Ordering::Relaxed);
-    // FLICKER-3 — the gate's own reading, appended to this line rather than given one of its own:
-    // `desktop_over` is its falsifier and the two have to be read together or not at all.
-    let fskip = C6_FLUSH_SKIP.load(Ordering::Relaxed);
-    let fgate = C6_FLUSH_GATE.load(Ordering::Relaxed);
     // `desktop_over` first: of the three it is the one that would mean a BROKEN bracket rather than
     // a missing one, so a reader who sees it should look there before anything else. It is a
     // VERDICT term and no longer a gate FORBID — see the spec comment: this counter is
@@ -1166,8 +1257,8 @@ pub fn cursor6_rollup(scope: &str, planned: u64) {
         "INTACT"
     };
     serial_println!(
-        "[cursor6] rollup scope={} present_over={} masked={} repaired={} desktop_over={} mismatch={} uncover_lost={}/{} flush_skip={}/{} -> {}",
-        scope, over, masked, repaired, desktop, mismatch, lost, planned, fskip, fgate, verdict
+        "[cursor6] rollup scope={} present_over={} masked={} repaired={} desktop_over={} mismatch={} uncover_lost={}/{} -> {}",
+        scope, over, masked, repaired, desktop, mismatch, lost, planned, verdict
     );
 }
 
@@ -1226,96 +1317,6 @@ fn for_each_sprite_pixel(
                 i += 1;
             }
         }
-    }
-}
-
-/// CURSOR-WCR — one panel pixel read back as ONE bus transaction, where the layout allows it.
-///
-/// ### Why the read side needed its own primitive
-/// Every pixel walk in this module that touches the FRONT buffer is a read-back: the colour guard in
-/// [`undraw_locked`] asks "is our own colour still there", and the save-under in [`draw_locked`] asks
-/// "what is underneath". [`FrameBuffer::read_pixel`] answers both by decoding the layout per call and
-/// issuing THREE separate `read_volatile`s, one per colour byte. On a cached surface that costs
-/// nothing measurable. On the rMBP it does: the panel is WC-mapped (`x86 fb-wc: retyped 15 leaf(s) WC
-/// (PAT PA4)`), WC memory is UNCACHEABLE for reads, and an uncached byte load is a full round trip to
-/// the aperture that no cache line amortises. So a `refresh_locked` pair — undraw then draw, one per
-/// pointer report — pays six aperture round trips per painted pixel, at the trackpad's ~125 Hz.
-///
-/// Where the layout is a full 4-byte pixel (every x86 panel this kernel has met: `bytes_per_pixel`
-/// 4, `Rgb` or `Bgr`), the three colour bytes are three quarters of ONE aligned 32-bit word, and one
-/// aligned load returns all of them in one transaction. That is a 3:1 cut in aperture traffic on
-/// exactly the two walks the pointer path runs per report, and it is the read-side twin of the 3:1
-/// [`FrameBuffer::put_raw4`] already takes on the write side.
-///
-/// ### What is NOT changed
-/// The values. This is `read_pixel`'s contract, byte for byte: the same bounds tests (off-panel and
-/// past the mapped length both answer `None`), the same `0x00RRGGBB` inverse of `put_pixel`'s
-/// encoding, and `None` on any layout without one — `U8` averages and is not invertible, so it takes
-/// the slow path and refuses there exactly as before. The load stays `volatile`, so it is still not
-/// hoisted across or folded with the stores the same walk performs.
-///
-/// The decision is made ONCE per walk ([`PanelRead::of`]), not once per pixel: the per-pixel cost is
-/// a bounds test, a load and a shift. The fast path additionally requires a 4-byte-aligned base, so
-/// the load can never be an unaligned access even in principle; every framebuffer this kernel maps is
-/// page-aligned, and one that somehow is not simply falls back.
-///
-/// ### Arch scope
-/// x86_64 only, and deliberately: WC read cost is what motivates it, `put_raw4`/`encode4` are already
-/// x86-gated for the same reason, and the aarch64 panel is cached RAM where the three byte loads are
-/// three L1 hits. On aarch64 `of` never reports a fast path and every call is `read_pixel` verbatim.
-#[derive(Clone, Copy)]
-struct PanelRead {
-    fb: FrameBuffer,
-    /// `Some((base, row_bytes, bgr))` when the aligned-word path applies; `None` = defer to
-    /// [`FrameBuffer::read_pixel`].
-    fast: Option<(usize, usize, bool)>,
-}
-
-impl PanelRead {
-    /// Decide the read path for one pixel walk over `fb`.
-    fn of(fb: &FrameBuffer) -> Self {
-        #[cfg(target_arch = "x86_64")]
-        {
-            let info = fb.info();
-            let base = fb.base_addr();
-            let bgr = match info.pixel_format {
-                unaos_boot_info::PixelFormat::Bgr => true,
-                unaos_boot_info::PixelFormat::Rgb => false,
-                _ => return Self { fb: *fb, fast: None },
-            };
-            if base != 0 && base % 4 == 0 && info.bytes_per_pixel == 4 {
-                return Self { fb: *fb, fast: Some((base, info.stride * 4, bgr)) };
-            }
-        }
-        Self { fb: *fb, fast: None }
-    }
-
-    /// Read one pixel as `0x00RRGGBB`. Identical in value to `fb.read_pixel(x, y)`.
-    #[inline]
-    fn pixel(&self, x: usize, y: usize) -> Option<u32> {
-        if let Some((base, row_bytes, bgr)) = self.fast {
-            let info = self.fb.info();
-            if x >= info.width || y >= info.height {
-                return None;
-            }
-            let offset = y * row_bytes + x * 4;
-            if offset + 4 > self.fb.len() {
-                return None;
-            }
-            // SAFETY: bounds-checked against the mapped length above, and 4-byte aligned (the base
-            // is, and the offset is a multiple of 4). Volatile for the same reason `read_pixel`'s
-            // byte loads are: this walk's own stores must not be folded into it.
-            let v = unsafe { core::ptr::read_volatile((base + offset) as *const u32) };
-            // `put_pixel` lays the bytes down as [b,g,r] (Bgr) or [r,g,b] (Rgb); a little-endian word
-            // load returns them in that order from the low byte up. Bgr is therefore the identity
-            // under a 24-bit mask, and Rgb is that with the outer two bytes exchanged.
-            return Some(if bgr {
-                v & 0x00FF_FFFF
-            } else {
-                ((v & 0xFF) << 16) | (v & 0xFF00) | ((v >> 16) & 0xFF)
-            });
-        }
-        self.fb.read_pixel(x, y)
     }
 }
 
@@ -1472,10 +1473,41 @@ fn undraw_locked(
     let touched = TOUCHED_SINCE_DRAW.swap(false, Ordering::AcqRel);
     let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
     let off = sp.off;
+    // FLICKER-2 — RESTORE-BEFORE-INSTALL, the undraw half of `settle_pending_locked`'s ordering
+    // argument. A pass that owns the overlay session updates `sp.saved` only at its TAIL
+    // (`adopt_overlay`'s install); between `compose_into` and that install, every covered pixel's
+    // fresh under-content — the window's just-presented frame — exists only in `ov.saved`, while
+    // `sp.saved` still holds the PREVIOUS frame. A full undraw arriving in that window (a pointer
+    // move's `repaint` on another core, `wm::erase`, the WC-L drain) finds the panel holding our
+    // colour at those pixels (the arrow rode the staged rows), so the colour guard passes and the
+    // old code restored `sp.saved` — last frame's window content, stamped into a live window. That
+    // is symptom (b) of P79: an OCCASIONAL one-frame regression of the vug under the pointer, at
+    // exactly the rate `[cursor5] adopt_incoh` fires (~1/s on the P79 capture), visible only when
+    // the interleave lands after the rows do.
+    //
+    // The fix is to ask the session for the fresh value: if an open session coherently describes
+    // THIS sprite (same epoch, same geometry — the `adopt_overlay` predicate verbatim), a covered
+    // pixel's under-content is taken from `ov.saved` instead. Lock order `SPRITE` → `OVERLAY` is the
+    // documented one, and `try_lock` keeps the undraw from ever blocking on a `compose_into` holding
+    // `OVERLAY` inside the blit guard: a contended read falls back to the old behaviour for one
+    // undraw and is counted, never waited for. The epoch bump below then retires the session
+    // (`adopt_overlay` finds it incoherent and refreshes), exactly as before.
+    let ov = OVERLAY.try_lock();
+    let sess = ov.as_ref().filter(|g| {
+        g.session
+            && g.epoch == sp.epoch
+            && (g.bx, g.by, g.bw, g.bh, g.s) == (bx, by, bw, bh, s)
+    });
+    #[cfg(feature = "witness")]
+    {
+        if ov.is_none() {
+            F2_SESS_LOCKMISS.fetch_add(1, Ordering::Relaxed);
+        }
+        if sess.is_some() {
+            F2_SESS_UNDRAWS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     let saved = &sp.saved;
-    // CURSOR-WCR — the colour guard below is one FRONT-buffer read per painted pixel, and this walk
-    // is one of the two `refresh_locked` runs per pointer report. Decide the read path once.
-    let rd = PanelRead::of(&fb);
     for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
         // CURSOR-4: a pixel already handed back by a masked undraw is not ours and `saved[i]` is
         // stale for it. Restoring it here would stamp pre-pass content over whatever the compositor
@@ -1485,10 +1517,22 @@ fn undraw_locked(
         if off.get(i) {
             return;
         }
-        if i < saved.len() && rd.pixel(x, y) == Some(color) {
-            fb.put_pixel(x, y, saved[i]);
+        if i < saved.len() && fb.read_pixel(x, y) == Some(color) {
+            let under = match sess {
+                // FLICKER-2 — the layer's save is this pixel's CURRENT under-content: the window's
+                // freshly composed frame, captured by `compose_into` before the arrow was painted
+                // over it. `sp.saved[i]` describes the frame before that.
+                Some(g) if g.covered.get(i) && i < g.saved.len() => {
+                    #[cfg(feature = "witness")]
+                    F2_SESS_PX.fetch_add(1, Ordering::Relaxed);
+                    g.saved[i]
+                }
+                _ => saved[i],
+            };
+            fb.put_pixel(x, y, under);
         }
     });
+    drop(ov);
     match pend {
         Some(p) => p.add(bx, by, bw, bh),
         None => flush_box(&fb, by, bh),
@@ -1504,6 +1548,10 @@ fn undraw_locked(
     // same reason: the window in which the mirror disagrees with the panel must always be the one
     // where it claims a sprite that is not there, never the one where it denies a sprite that is.
     retract_box();
+    // FLICKER-2 — the arrow just left the glass entirely; `draw_locked` closes the interval. `max(1)`
+    // keeps 0 as the "not down" sentinel on a clock that can legitimately read 0 early in boot.
+    #[cfg(feature = "witness")]
+    F2_DOWN_AT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
     // CURSOR-9 — the rect is the REPAIR REQUEST, and it is owed only where a painter could have taken
     // one of our pixels. `None` here means "restored, provably exactly, nothing to mend"; the pixels
     // went back either way.
@@ -1658,6 +1706,54 @@ pub fn undraw_within(boxes: &[(usize, usize, usize, usize)]) {
 ///
 /// Returns how many pixels were newly deferred, for the witness.
 pub fn defer_within(boxes: &[(usize, usize, usize, usize)]) -> usize {
+    defer_common(boxes, false)
+}
+
+/// CURSOR-15 — the compose-through entry point for a pass that does NOT own the overlay session.
+///
+/// ### The P82 mechanism, and why the sessionless arm was the last undraw at present cadence
+/// CURSOR-11 removed the handback for the session-owning pass; the passes that LOSE `overlay_open` —
+/// which under a presenting vug fleet is most of them, several cores compositing at once and one
+/// session — still took [`undraw_within_nosession`] plus a `Repaint` tail. That is one masked
+/// handback AND one whole-sprite `refresh_locked` (a full restore→save→draw) per overlapping
+/// present, ~123/s on P82, while the pointer's own repaint runs at event cadence: the sprite spends
+/// its life mid-restore, which is the hover stutter, and every one of those tail refreshes lands
+/// inside some other pass's open session — the `[flick2] sess_undraws=290+` climbing on the wire.
+///
+/// ### Why the deferral is sound here after all, and what replaced CURSOR-11's objection
+/// CURSOR-11 kept this arm on the undraw with a stated reason: "without the session there is no
+/// coverage to install, so nothing would ever settle the deferred pixels". The install was never the
+/// settling mechanism for UNCOVERED pixels, though — [`settle_pending_locked`] is, and it needs no
+/// session of ours: it asks the finished front, per pixel, whether a painter took it. What the
+/// sessionless pass actually lacked was (a) a tail that runs the settle and (b) CURSOR-5's
+/// generation bump, whose real job was to retire a concurrent owner's session when we hand one of
+/// its composed pixels back. CURSOR-15 supplies both without the undraw:
+///
+/// * (a) the pass's tail is now `Settle` → [`settle_nosession`], which runs the same settle the
+///   adopt tail does, gated on no session being open (see there for why the gate is load-bearing);
+/// * (b) we hand nothing back — so the interleave [`undraw_within_nosession`] documents (stamping
+///   OUR stale save into the owner's freshly-presented rows) cannot happen at all, and the one
+///   residual (our blit overwriting a pixel the owner's session has COVERED, whose install would
+///   then claim a panel pixel we own) is closed by [`overlay_uncover_any`] from `wm::draw_window`,
+///   exactly the way CURSOR-4 closes the identical intra-pass hazard.
+///
+/// The pixel work is [`defer_within`]'s verbatim: mark [`Sprite::pend`] inside the paint set, write
+/// no framebuffer pixel, bump no generation. The arrow stays on glass; the pass's blits composite
+/// over it where they reach it; the tail then re-saves each taken pixel from the freshly-composited
+/// front BEFORE painting the arrow back over it — the FLICKER-2/3 session-fresh discipline, extended
+/// to the sessionless present. The paths that still bracket are the pointer's own [`repaint`]
+/// (sprite RELOCATION keeps its undraw/redraw), `wm::erase`, the deferred-erase drain (its fills
+/// paint the front directly, so its masked handback and generation bump both stand), the WC-F
+/// reserved arm, and an incoherent adopt tail.
+pub fn defer_nosession(boxes: &[(usize, usize, usize, usize)]) -> usize {
+    defer_common(boxes, true)
+}
+
+/// CURSOR-15 — the shared deferral body of [`defer_within`] / [`defer_nosession`]. One
+/// implementation on purpose: the two entry points differ only in who owes the settle (the adopt
+/// tail vs [`settle_nosession`]), never in which pixels are deferred or how.
+fn defer_common(boxes: &[(usize, usize, usize, usize)], nosession: bool) -> usize {
+    let _ = nosession;
     let mut sp = SPRITE.lock();
     if !sp.drawn {
         return 0;
@@ -1681,16 +1777,70 @@ pub fn defer_within(boxes: &[(usize, usize, usize, usize)]) -> usize {
     {
         C11_PASSES.fetch_add(1, Ordering::Relaxed);
         C11_PIX_DEFERRED.fetch_add(n as u64, Ordering::Relaxed);
+        if nosession {
+            F2_CT_PASSES.fetch_add(1, Ordering::Relaxed);
+        }
     }
     n
+}
+
+/// CURSOR-15 — the sessionless pass's tail: settle every pending verdict against the finished
+/// front, or leave the bits for an open session's own tail.
+///
+/// ### The gate, and why it is load-bearing rather than polite
+/// [`settle_pending_locked`]'s soundness rests on the front being FINAL for the pixels it reads: a
+/// save-under taken from a pixel some in-flight window is still going to overwrite is the stale save
+/// that stamps last frame's content into a live window. Our own pass's blits are behind us here —
+/// but a session OWNER's pass may still be mid-flight on another core, and its windows' rows land
+/// after ours. So the settle runs only when no overlay session is open (`OVERLAY` probed under the
+/// sprite lock, `SPRITE` → `OVERLAY`, the documented order; `try_lock`, never a wait). An open or
+/// contended session leaves the bits standing, counted in `ct_owner`, and they are settled by
+/// whichever tail closes the pass: the owner's [`adopt_overlay`] runs the same bit-driven settle
+/// against ITS finished front, and its incoherent fallback (`refresh_locked`) resets `pend`
+/// entirely, which is settlement by bracket.
+///
+/// **"No session open" really does mean the previous owner's tail has fully retired.**
+/// [`adopt_overlay`] closes the session and settles under ONE `SPRITE` acquisition, and this
+/// function holds `SPRITE` across its probe and settle — so it can never observe the closed-but-not-
+/// yet-settled middle of an adopt. A third sessionless pass still blitting concurrently can take a
+/// pixel after our read; that is the same cross-pass residual every settle has, absorbed the same
+/// way (`note_present_over_sprite` arms `TOUCHED_SINCE_DRAW`, the next full undraw's [`repair`]
+/// damages the window, and that pass's own tail re-settles the pixel — the settle is idempotent and
+/// the last tail wins).
+///
+/// A sprite that left the glass since the deferral (`!sp.drawn`) has nothing to settle: every full
+/// undraw and every draw resets `pend`, which is the same "settlement by bracket" the incoherent
+/// adopt relies on.
+pub fn settle_nosession() {
+    let mut unsupported_now = false;
+    {
+        let mut sp = SPRITE.lock();
+        if sp.drawn {
+            let free = match OVERLAY.try_lock() {
+                Some(g) => !g.session,
+                None => false,
+            };
+            if free {
+                settle_pending_locked(&mut sp, &mut unsupported_now);
+            } else {
+                #[cfg(feature = "witness")]
+                F2_CT_TO_OWNER.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    if unsupported_now && !UNSUPPORTED_REPORTED.swap(true, Ordering::Relaxed) {
+        serial_println!("[cursor] disabled: panel format has no read-back inverse");
+    }
 }
 
 /// CURSOR-11 — settle every [`Sprite::pend`] bit the pass's coverage install did not already claim.
 ///
 /// ### Ordering, and why it is load-bearing (the [wc-d] argument)
-/// This runs from [`adopt_overlay`], i.e. with the pass finished, the `BlitGuard` dropped and every
-/// window's rows on the panel — and it runs AFTER the coverage install, never before. Both halves of
-/// that ordering carry weight:
+/// This runs from [`adopt_overlay`] — and, since CURSOR-15, from [`settle_nosession`], whose gate
+/// (no open session) makes "after the install" vacuously true for that caller: there is no install
+/// outstanding anywhere when it runs. In both cases the pass is finished, the `BlitGuard` dropped
+/// and every window's rows on the panel — and on the adopt path it runs AFTER the coverage install,
+/// never before. Both halves of that ordering carry weight:
 ///
 /// * **After the pass.** The front buffer is final here, so `read_pixel` answers the only question
 ///   that matters — "did a painter in this pass take this pixel?" — with no race left in it. Asking
@@ -1744,15 +1894,13 @@ fn settle_pending_locked(sp: &mut Sprite, unsupported_now: &mut bool) {
     let off = sp.off;
     let mut wrote = false;
     let mut failed = false;
-    // CURSOR-WCR — one FRONT read per deferred pixel; decide the read path once for the walk.
-    let rd = PanelRead::of(&fb);
     {
         let saved = &mut sp.saved;
         for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
             if !deferred.get(i) || off.get(i) || i >= saved.len() || failed {
                 return;
             }
-            match rd.pixel(x, y) {
+            match fb.read_pixel(x, y) {
                 // Untouched: the arrow is still on glass and `saved[i]` still describes what is
                 // under it. This is the pixel class the arc exists to produce.
                 Some(now) if now == color => {}
@@ -1820,6 +1968,14 @@ fn settle_pending_locked(sp: &mut Sprite, unsupported_now: &mut bool) {
 /// extents — was rejected as strictly weaker: it repairs the bookkeeping (the hole) but leaves the
 /// stale pixel B already wrote inside A's window rect, since A would then repaint `P` from the front
 /// where B's stale value is sitting. Only invalidating the generation reaches both.
+///
+/// ### CURSOR-15 — the sessionless COMPOSITE arm no longer calls this
+/// That arm defers instead ([`defer_nosession`]): it writes nothing, so there is no "stale pixel B
+/// already wrote" and the coverage-clear alternative rejected above becomes exactly right for it
+/// ([`overlay_uncover_any`]). This function's one surviving caller is the WC-L deferred-erase drain,
+/// whose fills paint the front directly and therefore still owe the handback and the generation bump
+/// this function provides. The interleave analysis above is unchanged and still load-bearing for
+/// that caller.
 pub fn undraw_within_nosession(boxes: &[(usize, usize, usize, usize)]) {
     let restored = {
         let mut sp = SPRITE.lock();
@@ -1853,8 +2009,35 @@ fn undraw_within_locked(
     let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
     let mut off = sp.off;
     let mut handed_back = 0usize;
-    // CURSOR-WCR — the masked undraw's colour guard is the same FRONT read; same one-off decision.
-    let rd = PanelRead::of(&fb);
+    // FLICKER-3 — FLICKER-2's session-fresh restore, lifted to the masked path. The interleave is
+    // `undraw_locked`'s exactly, one entry point over: pass A owns the session, `compose_into` has
+    // delivered the arrow inside A's freshly presented rows (`ov.saved` holds the window's NEW frame
+    // under each covered pixel), and `adopt_overlay`'s install has not yet moved that into
+    // `sp.saved`. A masked undraw arriving in that window — since CURSOR-15 that is the WC-L drain,
+    // `undraw_within_nosession`'s one surviving caller — finds the panel holding our
+    // colour (A put it there), passes the colour guard, and before this arc restored `sp.saved`:
+    // LAST frame's window content, stamped into a live window under the pointer. That is the P80
+    // residual (b) — occasional because it needs a concurrent pass inside A's compose-to-install
+    // window, and the P80 wire's `sess_lockmiss=0` had already exonerated the other suspect (the
+    // `try_lock` fallback never fired). Same fix, same lock order (`SPRITE` → `OVERLAY`), same
+    // `try_lock`-never-block discipline; a contended read falls back to the old behaviour for one
+    // undraw and is counted in the shared `sess_lockmiss`. The caller's conditional generation bump
+    // is untouched — a handback still retires A's session, which then refreshes whole-sprite.
+    let ov = OVERLAY.try_lock();
+    let sess = ov.as_ref().filter(|g| {
+        g.session
+            && g.epoch == sp.epoch
+            && (g.bx, g.by, g.bw, g.bh, g.s) == (bx, by, bw, bh, s)
+    });
+    #[cfg(feature = "witness")]
+    {
+        if ov.is_none() {
+            F2_SESS_LOCKMISS.fetch_add(1, Ordering::Relaxed);
+        }
+        if sess.is_some() {
+            F2_MASK_SESS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     {
         let saved = &sp.saved;
         for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
@@ -1865,12 +2048,23 @@ fn undraw_within_locked(
             // Same colour guard as the full undraw, and for the same reason: a pixel another painter
             // has already taken is theirs, and putting our saved value back would be the stale
             // restore. The bit is set either way — guarded or not, this pixel is no longer ours.
-            if i < saved.len() && rd.pixel(x, y) == Some(color) {
-                fb.put_pixel(x, y, saved[i]);
+            if i < saved.len() && fb.read_pixel(x, y) == Some(color) {
+                let under = match sess {
+                    // FLICKER-3 — the layer's save is this pixel's CURRENT under-content (the
+                    // window's just-presented frame); `sp.saved[i]` describes the frame before it.
+                    Some(g) if g.covered.get(i) && i < g.saved.len() => {
+                        #[cfg(feature = "witness")]
+                        F2_SESS_PX.fetch_add(1, Ordering::Relaxed);
+                        g.saved[i]
+                    }
+                    _ => saved[i],
+                };
+                fb.put_pixel(x, y, under);
             }
             off.set(i);
         });
     }
+    drop(ov);
     sp.off = off;
     flush_box(&fb, by, bh);
     (if touched { Some((bx, by, bw, bh)) } else { None }, handed_back)
@@ -2161,6 +2355,48 @@ pub fn overlay_uncover(plan: &Plan, bx: usize, by: usize, bw: usize, bh: usize) 
     let boxes = [(bx, by, bw, bh)];
     let mut covered = ov.covered;
     for_each_sprite_pixel(plan.bx, plan.by, plan.bw, plan.bh, plan.s, |x, y, _c, i| {
+        if in_any(&boxes, x, y) {
+            covered.clear(i);
+        }
+    });
+    ov.covered = covered;
+    true
+}
+
+/// CURSOR-15 — [`overlay_uncover`] for a pass that holds NO plan: clear whatever open session's
+/// coverage bits fall inside the box this window has just painted.
+///
+/// ### The hazard this closes, and where the old code closed it
+/// A sessionless pass now composes through the sprite ([`defer_nosession`]) instead of handing
+/// pixels back, so [`undraw_within_nosession`]'s generation bump — whose documented job was to
+/// retire a concurrent owner's session when this pass disturbed one of its pixels — no longer runs
+/// on that arm. The residual it guarded: the owner's `compose_into` COVERED pixel `P` (arrow rode
+/// its present, layer save in `ov.saved[P]`), then OUR blit overwrote `P` with window content. The
+/// owner's [`adopt_overlay`] would install `ov.saved[P]` as the sprite's save-under and clear `P`'s
+/// bookkeeping — the module then believes the arrow is on the panel at `P`, where our content is.
+/// That is CURSOR-4's intra-pass higher-window hazard, cross-pass; the fix is CURSOR-4's too:
+/// clearing the coverage makes the owner's tail treat `P` as unclaimed and settle it against the
+/// finished front, where our content is visible and the colour guard answers correctly.
+///
+/// The walk uses the SESSION's own geometry — the plan-less caller has none to offer, and the bits
+/// being cleared are indexed against the session's sprite, not against anything of ours. No open
+/// session is a `true` (nothing to clear); a contended lock is a `false`, and the caller notes
+/// [`note_uncover_lost`] so the owner's tail declines the install wholesale — the same bounded,
+/// already-priced fallback `overlay_uncover` uses. `try_lock` only: this runs inside the
+/// `BlitGuard` window.
+#[must_use]
+pub fn overlay_uncover_any(bx: usize, by: usize, bw: usize, bh: usize) -> bool {
+    let mut ov = match OVERLAY.try_lock() {
+        Some(g) => g,
+        None => return false,
+    };
+    if !ov.session {
+        return true;
+    }
+    let boxes = [(bx, by, bw, bh)];
+    let (obx, oby, obw, obh, os) = (ov.bx, ov.by, ov.bw, ov.bh, ov.s);
+    let mut covered = ov.covered;
+    for_each_sprite_pixel(obx, oby, obw, obh, os, |x, y, _c, i| {
         if in_any(&boxes, x, y) {
             covered.clear(i);
         }
@@ -2471,15 +2707,13 @@ fn redraw_off_locked(sp: &mut Sprite, unsupported_now: &mut bool) {
     let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
     let mut off = sp.off;
     let mut failed = false;
-    // CURSOR-WCR — the off-pixel settle is a FRONT save-under read per pixel; same one-off decision.
-    let rd = PanelRead::of(&fb);
     {
         let saved = &mut sp.saved;
         for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
             if !off.get(i) || failed || i >= saved.len() {
                 return;
             }
-            match rd.pixel(x, y) {
+            match fb.read_pixel(x, y) {
                 Some(orig) => {
                     // CURSOR-5 — same detector as `draw_locked`'s, and the same argument: `off` says
                     // this pixel was handed back and nothing has re-delivered it, so our own fill has
@@ -2548,22 +2782,17 @@ fn draw_locked(
     let bw = side.min(info.width - bx);
     let bh = side.min(info.height - by);
 
-    // Save-under, PAINTED PIXELS ONLY (36 reads at scale 1, 144 at the bench panel's scale 2, against
-    // 1296 for the whole box). The per-frame cost matters here because WC-E composites on every
-    // desktop flush, which brackets this module ~20 times a second on the bench — and, since
-    // CURSOR-X86, `pal::cursor`'s repaint choke point runs it once per HID report at ~125 Hz.
-    //
-    // CURSOR-WCR — and on an x86 WC panel each of those reads is an aperture round trip, so the walk
-    // takes the aligned-word path: one transaction per pixel instead of three. See `PanelRead`.
+    // Save-under, PAINTED PIXELS ONLY (~50 reads at scale 1, against 1296 for the whole box). The
+    // per-frame cost matters here because WC-E composites on every desktop flush, which brackets this
+    // module ~20 times a second on the bench.
     let mut failed = false;
-    let rd = PanelRead::of(&fb);
     {
         let saved = &mut sp.saved;
         for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
             if failed || i >= saved.len() {
                 return;
             }
-            match rd.pixel(x, y) {
+            match fb.read_pixel(x, y) {
                 Some(orig) => {
                     // CURSOR-5 — the self-capture signature. The sprite is provably not on the panel
                     // here (the undraw above took it down, or it was never up), so a pixel that
@@ -2614,6 +2843,26 @@ fn draw_locked(
     // a stale pixel inside a window's rect.
     TOUCHED_SINCE_DRAW.store(false, Ordering::Release);
     publish_box(sp);
+    // FLICKER-2 — close the down-interval opened by the last full undraw. The interesting reading is
+    // the MAX per rollup window and the count of visibly long intervals: a bracket stretched by a
+    // serial burst landing IRQ-masked on the compositing core (symptom (a)'s hypothesis) shows up
+    // here as a >=20 ms interval, and its wall-clock timestamp lets a capture reader place it against
+    // the nearest `[wcn]`/`[prio]` block. QEMU never draws the sprite, so this stays 0 on the gate.
+    #[cfg(feature = "witness")]
+    {
+        let down = F2_DOWN_AT_MS.swap(0, Ordering::Relaxed);
+        if down != 0 {
+            let now = crate::arch::ms();
+            let dt = now.saturating_sub(down);
+            if dt > F2_DOWN_MAX_MS.load(Ordering::Relaxed) {
+                F2_DOWN_MAX_MS.store(dt, Ordering::Relaxed);
+            }
+            if dt >= F2_DOWN_SLOW_MS {
+                F2_DOWN_SLOW.fetch_add(1, Ordering::Relaxed);
+                F2_DOWN_LAST_AT.store(now, Ordering::Relaxed);
+            }
+        }
+    }
 
     for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, _i| {
         fb.put_pixel(x, y, color);
