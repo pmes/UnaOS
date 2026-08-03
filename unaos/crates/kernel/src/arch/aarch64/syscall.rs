@@ -175,8 +175,8 @@ const FUTEX_WAKE: u64 = 1;
 ///     ACTIVE app — the router only enqueues into the active process's ring), or `-EAGAIN` when the ring
 ///     is empty. The event is a packed u64 (bit 63 always clear, so it never collides with a negative
 ///     errno): [55:48] = type (see `INPUT_EV_*`), payload in the low 32 bits — key ASCII / button mask in
-///     [7:0], mouse dx/x in [31:16] (i16), dy/y in [15:0] (i16). The router seam is `el0_input_enqueue`
-///     (mirroring ELF-3's present seam); active-process registration is `el0_input_set_active`.
+///     [7:0], mouse dx/x in [31:16] (i16), dy/y in [15:0] (i16). The router seam is `user_input_enqueue`
+///     (mirroring ELF-3's present seam); active-process registration is `user_input_set_active`.
 const SYS_INPUT_POLL: u64 = 27;
 /// VUGPAUSE-2: the reserved id 28 is now SPENT — `SYS_INPUT_WAIT`, the BLOCKING half of the pair.
 ///   SYS_INPUT_WAIT() -> 0 / -EINVAL
@@ -188,7 +188,7 @@ const SYS_INPUT_POLL: u64 = 27;
 /// Implemented on the SAME kill-aware futex the barrier uses (`sched::futex_wait/_wake`), keyed by
 /// `input_futex_key(asid)` — a synthetic key outside the physical-address space that `sys_futex`'s user
 /// keys occupy, so an EL0 word can never alias an input key. The compare word is the ring's own TAIL,
-/// read at EL1 under the bucket lock, which is what makes the wait race-free against `el0_input_push`.
+/// read at EL1 under the bucket lock, which is what makes the wait race-free against `user_input_push`.
 const SYS_INPUT_WAIT: u64 = 28;
 
 /// WC-B: the WINDOW verbs — the multi-surface successor to the single-surface `SYS_FB_MAP`/`SYS_FB_PRESENT`
@@ -3940,7 +3940,7 @@ pub fn clear_handle_row(asid: u64) {
     // VUGMIN-C: and the resume-print pacing counter, for the ordinary recycle reason — the next tenant of
     // this slot must get its own first/second `[vugpause2] resume` lines printed rather than inheriting a
     // departed program's cadence and going quiet until the count next hits a power of two. Pacing state
-    // only; the cumulative `EL0_INPUT_WAKES` the rollup reports is boot-scoped and stays.
+    // only; the cumulative `USER_INPUT_WAKES` the rollup reports is boot-scoped and stays.
     clear_input_resumes(asid);
     // INROUTE: this CAS is a FOCUS REVOCATION, and it is asynchronous with respect to whoever currently
     // holds focus — it fires on the dying slot's core the instant that slot tears down. Count it. The
@@ -3949,7 +3949,7 @@ pub fn clear_handle_row(asid: u64) {
     // it drained. That is CORRECT for a real app (a dead slot must stop receiving input), but it is
     // indistinguishable from a routing bug in any witness that counts deliveries — see
     // `input_router_selftest`, which used to borrow ASID 1 while the fixture cascade was recycling it.
-    if EL0_INPUT_ACTIVE
+    if USER_INPUT_ACTIVE
         .compare_exchange(asid, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
@@ -3959,7 +3959,7 @@ pub fn clear_handle_row(asid: u64) {
     // engaged, and a REUSED ASID would inherit it — the next `run` into the same slot would start with its
     // deadline already suspended. CAS on `asid` so we only ever clear OUR OWN latch, never a live one belonging
     // to a different process. (The heartbeat needs no clear: `takeover_suspends` ignores it once the latch is 0,
-    // and `el0_input_set_active` resets it on the next focus anyway.)
+    // and `user_input_set_active` resets it on the next focus anyway.)
     let _ = EL0_TAKEOVER_ASID.compare_exchange(asid, 0, Ordering::AcqRel, Ordering::Acquire);
     // WC-B: close every WINDOW this ASID still owns — the window twin of the handle/file/input rows above,
     // and for the same reason: a window row outliving its owner would name a surface inside a backing
@@ -7125,7 +7125,7 @@ pub fn run_user_image(
     // on the slot's teardown, so an exited program's focus never lingers; the explicit clear covers the
     // Timeout path (task still alive, no teardown yet). Setting a focus RESETS the ring, so a fresh program
     // starts with an empty input queue.
-    el0_input_set_active(asid);
+    user_input_set_active(asid);
     // Deadline-bounded cooperative wait: yield so the co-located task runs; its SYS_EXIT (or the fault-kill
     // path) marks PROCS[pi] EXITED and records the status via the GENERIC child-reap short-circuit.
     //
@@ -7136,7 +7136,7 @@ pub fn run_user_image(
     // wedged-app Timeout are unchanged. On metal the app enters interactive takeover when it actually DRAINS a
     // real event through `SYS_INPUT_POLL` (the same edge it announces with `:: UVUG: interactive takeover ::`).
     //
-    // UVUG-8r2 fixes the liveness hole in the first cut. There, takeover was latched by `el0_input_push` (an
+    // UVUG-8r2 fixes the liveness hole in the first cut. There, takeover was latched by `user_input_push` (an
     // event merely REACHING the ring) and cleared only by a focus change — which, on the real `run` path, only
     // happens after this loop exits. So a HUNG interactive app (stops polling, never exits) suspended the
     // deadline FOREVER: `run_user_image` spun in `yield_now()` with no bound, the shell never came back, and
@@ -7267,7 +7267,7 @@ pub fn run_user_image(
     // Belt-and-suspenders with `clear_handle_row`'s teardown clear (which fired already if the program
     // exited/was killed and its slot was torn down) — and the SOLE clear on the Timeout path, where the
     // task is still alive and no teardown has run. Idempotent: a no-op if the designation was already 0.
-    el0_input_set_active(0);
+    user_input_set_active(0);
     // Reap the Proc entry. The scheduler's exit path already repointed THIS core to the boot root (ASID 0)
     // and dispatched back to the caller (the shell task), so the shell's ASID-0 invariant holds on return.
     //
@@ -7441,7 +7441,7 @@ pub fn run_user_image(
 // as long as the operator wants, and TAB walks between them.
 //
 // Contract differences from `run_user_image`, each deliberate:
-//   * NO `el0_input_set_active` — focus stays wherever it is. A windowed bg app receives input when
+//   * NO `user_input_set_active` — focus stays wherever it is. A windowed bg app receives input when
 //     the operator TABs into it (the WC-TAB shell binding / in-ring cycle), which resets its ring
 //     exactly as the foreground path does. There is no focus to restore on exit either: the slot
 //     teardown's `clear_handle_row` clears the designation iff the dying app held it.
@@ -11059,10 +11059,10 @@ pub fn set_hidden(asid: u64, on: bool) {
     if !on {
         // VUGPAUSE-2r2: the LAST of the three edges a click-to-restore crosses, and the decisive one — it
         // is the only one that fires after the flags word says visible, so a vug woken here cannot find
-        // itself frozen and re-park. Like the focus edge it was dead before this fix (`el0_input_set_active`
+        // itself frozen and re-park. Like the focus edge it was dead before this fix (`user_input_set_active`
         // ran microseconds earlier and had wiped the park hint), which is why an unhide could not restart
         // a backgrounded vug either.
-        el0_input_wake_edge(asid, "unhide");
+        user_input_wake_edge(asid, "unhide");
     }
 }
 
@@ -11209,7 +11209,7 @@ fn present_surface_common(
     // stranded until reboot. Worse, it is sticky: one timeout arms that defeat for the rest of the boot.
     // Scoping to the focused ASID makes an unfocused orphan's presents invisible here, which is what keeps
     // the cap honest.
-    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
         EL0_FOCUSED_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
     }
     // WC-INT — ONE forwarding, not two. Before integration both this body and `video::screen::present_surface`
@@ -11759,7 +11759,7 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
 // SHAPE (mirrors how the GUI routes input to kernel apps today — GUI-CLICK-2b's SCREEN_APP_ACTIVE gate +
 // gui_watchdog: only the ACTIVE app receives input). The kernel holds a small per-ASID ring of packed
 // events; the GUI router (main.rs `pump_usb_into_gui`) fills the ACTIVE process's ring when it drains
-// `pal::next_event()` — via the public `el0_input_enqueue` seam here (the ELF-3 present-hook twin). EL0
+// `pal::next_event()` — via the public `user_input_enqueue` seam here (the ELF-3 present-hook twin). EL0
 // polls its own ring nonblocking through SYS_INPUT_POLL. One producer (the single router task) + one
 // consumer (the EL0 task) per ring => a lock-free SPSC ring (free-running head/tail, occupancy = tail-head).
 //
@@ -11769,9 +11769,9 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
 //
 // DEFERRED ROUTER WIRING (2-3 lines, OUTSIDE this lane — main.rs `pump_usb_into_gui`, the next arc folds):
 // when an EL0 app owns the screen (an ELF-5 analogue of SCREEN_APP_ACTIVE, with the focused process's ASID
-// registered via `el0_input_set_active`), route drained pal events to the EL0 ring instead of GUI_CHANNEL:
+// registered via `user_input_set_active`), route drained pal events to the EL0 ring instead of GUI_CHANNEL:
 //     while let Some(ev) = unaos_kernel::pal::next_event() {
-//         unaos_kernel::arch::aarch64::syscall::el0_input_enqueue(ev); // -> the active EL0 app's ring
+//         unaos_kernel::arch::aarch64::syscall::user_input_enqueue(ev); // -> the active EL0 app's ring
 //     }
 // (Today only the in-kernel witness registers an active process + injects a test event — see
 // `input_launcher`. QEMU raspi4b delivers no USB HID, so the kernel-injected event is what proves the
@@ -11790,13 +11790,13 @@ const INPUT_RING_CAP: usize = 32;
 
 /// The per-process input rings, keyed by ASID (0 = the shared/boot context, never a delivery target). One
 /// producer (the router) + one consumer (the EL0 task) per ring => a lock-free SPSC ring.
-static EL0_INPUT_BUF: [[AtomicU64; INPUT_RING_CAP]; super::boot::USER_SLOTS + 1] =
+static USER_INPUT_BUF: [[AtomicU64; INPUT_RING_CAP]; super::boot::USER_SLOTS + 1] =
     [const { [const { AtomicU64::new(0) }; INPUT_RING_CAP] }; super::boot::USER_SLOTS + 1];
 /// Consumer index (free-running; advanced by SYS_INPUT_POLL). Real slot = `head & (CAP-1)`.
-static EL0_INPUT_HEAD: [AtomicU32; super::boot::USER_SLOTS + 1] =
+static USER_INPUT_HEAD: [AtomicU32; super::boot::USER_SLOTS + 1] =
     [const { AtomicU32::new(0) }; super::boot::USER_SLOTS + 1];
-/// Producer index (free-running; advanced by `el0_input_enqueue`). Occupancy = `tail - head`.
-static EL0_INPUT_TAIL: [AtomicU32; super::boot::USER_SLOTS + 1] =
+/// Producer index (free-running; advanced by `user_input_enqueue`). Occupancy = `tail - head`.
+static USER_INPUT_TAIL: [AtomicU32; super::boot::USER_SLOTS + 1] =
     [const { AtomicU32::new(0) }; super::boot::USER_SLOTS + 1];
 
 /// VUGPAUSE-2: per-slot "this ASID has a task parked in `SYS_INPUT_WAIT`" flag. Set immediately before the
@@ -11807,9 +11807,9 @@ static EL0_INPUT_TAIL: [AtomicU32; super::boot::USER_SLOTS + 1] =
 /// VUGPAUSE-2r2 — WHO MAY CLEAR THIS, and why the question is load-bearing. VUGPAUSE-2 described the flag
 /// as "a HINT, never a decision", on the strength of "a stale-clear flag is impossible (only the parker
 /// sets it, before parking)". Both halves were wrong, and P72 spent a bench session on the difference:
-///   * It IS a decision. `el0_input_wake` returns early on a clear flag, so every wake edge — the router's
+///   * It IS a decision. `user_input_wake` returns early on a clear flag, so every wake edge — the router's
 ///     own enqueue, focus arrival, unhide — is gated on it, not just the backstop.
-///   * A stale clear WAS reachable. `clear_input_row` cleared it, and `el0_input_set_active` calls
+///   * A stale clear WAS reachable. `clear_input_row` cleared it, and `user_input_set_active` calls
 ///     `clear_input_row` on a focus ARRIVAL: exactly the moment a parked, backgrounded vug is being handed
 ///     the keyboard. The arrival cleared the flag, then its own wake read the flag it had just cleared,
 ///     took the fast path, and woke nobody; `focus_changed`'s unhide and the press enqueue that followed
@@ -11820,35 +11820,35 @@ static EL0_INPUT_TAIL: [AtomicU32; super::boot::USER_SLOTS + 1] =
 /// teardown, and by nothing else. A stale-set flag costs one wasted `futex_wake` per backstop period on a
 /// key with no waiters; a stale-clear flag costs a task that never runs again, so the two are traded
 /// against each other in that direction on purpose. The backstop no longer reads it at all
-/// (`el0_input_wake_backstop`), which caps the whole failure class at one backstop period.
-static EL0_INPUT_PARKED: [AtomicBool; super::boot::USER_SLOTS + 1] =
+/// (`user_input_wake_backstop`), which caps the whole failure class at one backstop period.
+static USER_INPUT_PARKED: [AtomicBool; super::boot::USER_SLOTS + 1] =
     [const { AtomicBool::new(false) }; super::boot::USER_SLOTS + 1];
 
 /// VUGPAUSE-2: how many times a task has PARKED in `SYS_INPUT_WAIT`, and how many waiters the wake seam
 /// has released. Both are cumulative for the boot and drive the `[vugpause2]` witness.
-static EL0_INPUT_BLOCKS: AtomicU64 = AtomicU64::new(0);
-static EL0_INPUT_WAKES: AtomicU64 = AtomicU64::new(0);
+static USER_INPUT_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static USER_INPUT_WAKES: AtomicU64 = AtomicU64::new(0);
 
 /// CLICK-SWALLOW: how many NAMED wake edges (`focus` / `unhide` — the VUGPAUSE-2r2 restore chain) the
 /// wake seam has been ASKED to run, whether or not a waiter was there to release. Distinct from
-/// `EL0_INPUT_WAKES`, which counts waiters actually woken: a headless gate parks nobody, so only this
-/// counter can witness that the restore chain was REACHED. Read by [`el0_input_wake_edges`].
-static EL0_INPUT_WAKE_EDGES: AtomicU64 = AtomicU64::new(0);
+/// `USER_INPUT_WAKES`, which counts waiters actually woken: a headless gate parks nobody, so only this
+/// counter can witness that the restore chain was REACHED. Read by [`user_input_wake_edges`].
+static USER_INPUT_WAKE_EDGES: AtomicU64 = AtomicU64::new(0);
 
 /// VUGMIN-C: per-slot count of NAMED-EDGE resumes (`focus` / `unhide`) this ASID has actually taken.
 ///
-/// Exists only to pace `el0_input_wake_edge`'s print — the aggregate that the `[vugpause2]` rollup
-/// reports is `EL0_INPUT_WAKES` above and is unaffected by anything here. Per-ASID rather than global
+/// Exists only to pace `user_input_wake_edge`'s print — the aggregate that the `[vugpause2]` rollup
+/// reports is `USER_INPUT_WAKES` above and is unaffected by anything here. Per-ASID rather than global
 /// because the question the line answers ("did THIS vug resume, or is it stranded?") is per-ASID: a
 /// global cadence would let a busy vug's traffic silence a newly launched one's first resume.
-static EL0_INPUT_RESUMES: [AtomicU64; super::boot::USER_SLOTS + 1] =
+static USER_INPUT_RESUMES: [AtomicU64; super::boot::USER_SLOTS + 1] =
     [const { AtomicU64::new(0) }; super::boot::USER_SLOTS + 1];
 
 /// VUGMIN-C: drop `asid`'s resume-print pacing count. Called from slot teardown ONLY — the count paces a
 /// witness line across a whole tenancy, so nothing on the running path may reset it.
 fn clear_input_resumes(asid: u64) {
     if asid != 0 && asid as usize <= super::boot::USER_SLOTS {
-        EL0_INPUT_RESUMES[asid as usize].store(0, Ordering::Relaxed);
+        USER_INPUT_RESUMES[asid as usize].store(0, Ordering::Relaxed);
     }
 }
 
@@ -11868,19 +11868,19 @@ fn input_futex_key(asid: u64) -> u64 {
 ///
 /// Called from THREE edges, and all three are needed for a blocked vug to be as responsive as a polling
 /// one was:
-///   * `el0_input_push` — the event itself. This is the latency-critical one: the router publishes TAIL
+///   * `user_input_push` — the event itself. This is the latency-critical one: the router publishes TAIL
 ///     and then wakes, so the keypress that arrives while a vug is idle re-readies it in the same pass
 ///     the router runs in, not a poll period later.
-///   * `el0_input_set_active` — a focus ARRIVAL. Focus does not enqueue anything (it RESETS the ring), so
+///   * `user_input_set_active` — a focus ARRIVAL. Focus does not enqueue anything (it RESETS the ring), so
 ///     without this a vug parked on an empty ring would sleep through being handed the keyboard.
 ///   * `set_hidden(asid, false)` — an UNHIDE. The hidden bit lives in the info page, not in the ring, so
 ///     nothing about becoming visible again touches TAIL. A vug parked while hidden must be re-readied to
 ///     observe its own restore; this is the edge that makes VUGMIN's idle exit-able.
-fn el0_input_wake(asid: u64) -> usize {
-    el0_input_wake_edge(asid, "")
+fn user_input_wake(asid: u64) -> usize {
+    user_input_wake_edge(asid, "")
 }
 
-/// VUGPAUSE-2r2: `el0_input_wake` with the EDGE named, for the wire.
+/// VUGPAUSE-2r2: `user_input_wake` with the EDGE named, for the wire.
 ///
 /// A non-empty `edge` asks for a `[vugpause2] resume` line when this call actually releases someone. Only
 /// the two OPERATOR-RATE edges pass one — focus arrival and unhide, the pair that resumes a backgrounded
@@ -11896,11 +11896,11 @@ fn el0_input_wake(asid: u64) -> usize {
 /// (`resu<e7>sid=1`, `[f8>fv]`, `<fu>pause2]`) — a corrupted witness that also blocks the press path for
 /// tens of milliseconds while it corrupts. So the print is now on a per-ASID POWER-OF-TWO cadence: the
 /// 1st, 2nd, 4th, 8th, … resume for a given ASID prints, the rest are silent. Every resume is still
-/// counted — `EL0_INPUT_WAKES` (the `[vugpause2] blocked=/wakes=` rollup) is untouched, and the printed
+/// counted — `USER_INPUT_WAKES` (the `[vugpause2] blocked=/wakes=` rollup) is untouched, and the printed
 /// line now carries `n=`, that ASID's exact cumulative resume count, so a reader can subtract across two
 /// lines and know how many were elided. The first two resumes of every ASID print, which is what the
 /// "was this vug stranded or resumed?" read actually needs; a flood is what it does not.
-fn el0_input_wake_edge(asid: u64, edge: &str) -> usize {
+fn user_input_wake_edge(asid: u64, edge: &str) -> usize {
     if asid == 0 || asid as usize > super::boot::USER_SLOTS {
         return 0;
     }
@@ -11908,19 +11908,19 @@ fn el0_input_wake_edge(asid: u64, edge: &str) -> usize {
     // that make up the VUGPAUSE-2r2 restore chain. Counted here, ABOVE the parked fast path, because
     // the question the swallow witness has to answer is "was this edge REACHED?", not "did it find a
     // waiter": on a headless gate nothing is ever parked, so the woken count is always 0 and would
-    // prove nothing, while a swallow that skipped `el0_input_set_active` would show up here at once.
+    // prove nothing, while a swallow that skipped `user_input_set_active` would show up here at once.
     // Relaxed and off any hot path — the router's per-event push passes `""` and is not counted.
     if !edge.is_empty() {
-        EL0_INPUT_WAKE_EDGES.fetch_add(1, Ordering::Relaxed);
+        USER_INPUT_WAKE_EDGES.fetch_add(1, Ordering::Relaxed);
     }
-    if !EL0_INPUT_PARKED[asid as usize].load(Ordering::Acquire) {
+    if !USER_INPUT_PARKED[asid as usize].load(Ordering::Acquire) {
         return 0; // fast path: nobody has parked on this ring
     }
     let n = super::sched::futex_wake(input_futex_key(asid), usize::MAX);
     if n != 0 {
-        EL0_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
+        USER_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
         if !edge.is_empty() {
-            let seen = EL0_INPUT_RESUMES[asid as usize].fetch_add(1, Ordering::Relaxed) + 1;
+            let seen = USER_INPUT_RESUMES[asid as usize].fetch_add(1, Ordering::Relaxed) + 1;
             if seen.is_power_of_two() {
                 serial_println!(
                     "[vugpause2] resume asid={} edge={} woken={} n={}",
@@ -11954,18 +11954,18 @@ fn el0_input_wake_edge(asid: u64, edge: &str) -> usize {
 /// key with no waiters allocates nothing and readies nobody. That is a rounding error against the arc's
 /// measured idle win, and it is the price of the failure class being bounded at one period rather than
 /// unbounded. Any future stale-clear of the hint now costs an idle vug ~256 ms of latency, once.
-pub fn el0_input_wake_backstop() {
+pub fn user_input_wake_backstop() {
     for asid in 1..=super::boot::USER_SLOTS as u64 {
         let n = super::sched::futex_wake(input_futex_key(asid), usize::MAX);
         if n != 0 {
-            EL0_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
+            USER_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
         }
     }
 }
 
 /// The ASID of the process currently designated to RECEIVE input (0 = none). The router enqueues only into
-/// this process's ring — the ELF-5 twin of `SCREEN_APP_ACTIVE`. Set via `el0_input_set_active`.
-static EL0_INPUT_ACTIVE: AtomicU64 = AtomicU64::new(0);
+/// this process's ring — the ELF-5 twin of `SCREEN_APP_ACTIVE`. Set via `user_input_set_active`.
+static USER_INPUT_ACTIVE: AtomicU64 = AtomicU64::new(0);
 
 /// INROUTE: how many times a SLOT TEARDOWN revoked the live input focus (`clear_handle_row`'s CAS actually
 /// fired — the dying ASID *was* the focused one). Zero on a boot where no focused program ever exited; it
@@ -11982,18 +11982,18 @@ pub fn el0_focus_revokes() -> u64 {
 /// (`run /fat/VUG.ELF`) flips to interactive mode the instant it drains its FIRST real input event (the
 /// UVUG-4 input-driven switch) — the same edge the app announces with `:: UVUG: interactive takeover ::`.
 ///
-/// UVUG-8r2 moves the engage edge from PRODUCER to CONSUMER. The first cut latched in `el0_input_push` — an
-/// event merely REACHING the ring. That mis-fired on metal at t≈0: `el0_input_set_active` reset the per-ASID
+/// UVUG-8r2 moves the engage edge from PRODUCER to CONSUMER. The first cut latched in `user_input_push` — an
+/// event merely REACHING the ring. That mis-fired on metal at t≈0: `user_input_set_active` reset the per-ASID
 /// ring but NOT `pal::EVENT_QUEUE`, so the Enter KeyUp left over from typing `run /fat/VUG.ELF` drained
 /// straight into the new app's ring and engaged takeover before the app had run a single frame — giving EVERY
 /// keyboard-launched run (batch apps included, which never poll at all) a suspended deadline. Now the latch is
 /// set by `sys_input_poll` only when the app ACTUALLY CONSUMES a packed event, so it reflects the app's own
-/// behaviour rather than the router's; and `el0_input_set_active` drains the stale `pal::EVENT_QUEUE` so the
+/// behaviour rather than the router's; and `user_input_set_active` drains the stale `pal::EVENT_QUEUE` so the
 /// launch keystroke cannot be mistaken for in-app interaction in the first place.
 ///
 /// This latch is the `run_user_image` deadline's signal to SUSPEND — but only in conjunction with a fresh
 /// `EL0_TAKEOVER_HB` heartbeat (see `takeover_suspends`), so a hung app cannot suspend the deadline forever.
-/// Cleared on ANY focus change (`el0_input_set_active`) and on slot teardown (`clear_handle_row`), so a fresh
+/// Cleared on ANY focus change (`user_input_set_active`) and on slot teardown (`clear_handle_row`), so a fresh
 /// `run` always starts disengaged and the deadline is fully intact for the batch (no-HID) path.
 static EL0_TAKEOVER_ASID: AtomicU64 = AtomicU64::new(0);
 
@@ -12069,7 +12069,7 @@ fn pack_input(ev: crate::pal::Event) -> Option<u64> {
 /// GUI router (main.rs `pump_usb_into_gui`) when it drains `pal::next_event()` and an EL0 app owns input.
 /// Returns `true` if the event was queued, `false` if there is no active EL0 target, the event is not
 /// deliverable, or the ring is full (drop-newest — an unread event is never overwritten). Single producer.
-pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
+pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
     // WC-C: TAB is the COMPOSITOR's key, not the focused app's — the one keystroke the window system
     // reserves for itself, so an operator can always reach the other window even from an app that has
     // taken over the keyboard. Intercepted HERE, at the router seam, because this is the single choke
@@ -12090,22 +12090,22 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
     if wc_click_route(ev) {
         return false; // consumed, not queued — `[el0in] routed` must stay truthful
     }
-    let asid = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
+    let asid = USER_INPUT_ACTIVE.load(Ordering::Acquire);
     if asid == 0 || asid as usize > super::boot::USER_SLOTS {
         return false;
     }
     let Some(packed) = pack_input(ev) else {
         return false;
     };
-    el0_input_push(asid, packed)
+    user_input_push(asid, packed)
 }
 
 /// WC-C — the TAB focus-cycle. Returns `true` when the event was CONSUMED by the window system and must
 /// not reach any app's ring.
 ///
 /// Cycling means: take the compositor's focus ring (`video::wm::focus_ring` — the distinct owner ASIDs of
-/// the live windows, in window-id order) PLUS one more slot for the SHELL (`EL0_INPUT_ACTIVE == 0`), find
-/// where the current focus sits, and hand focus to the next slot. `el0_input_set_active` is the ONE way
+/// the live windows, in window-id order) PLUS one more slot for the SHELL (`USER_INPUT_ACTIVE == 0`), find
+/// where the current focus sits, and hand focus to the next slot. `user_input_set_active` is the ONE way
 /// focus moves, so the tab-cycle inherits everything that already hangs off it: the incoming ring is
 /// reset, the interactive-takeover latch is cleared (the newly-focused app has consumed nothing yet, so
 /// its `run` deadline re-arms and the UVUG-8 cap keeps holding PER WINDOW), and the outgoing app simply
@@ -12117,13 +12117,13 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
 /// the rotation, not an absence.
 ///
 /// WC-TAB closed the loop. WC-C shipped this as a one-way exit: once focus was the shell,
-/// `route_input_to_active_el0` was not called at all (`main.rs` gates on `el0_input_active() != 0`), so
+/// `route_input_to_active_el0` was not called at all (`main.rs` gates on `user_input_active() != 0`), so
 /// no TAB ever reached this function. The shell's own event drain now calls `wc_shell_focus_key`, the
 /// second entry point onto this same body, so the shell slot is a full position in the rotation —
 /// leavable and re-enterable — rather than a terminus.
 ///
 /// Two further deliberate consequences, neither hidden:
-///  * `el0_input_set_active` also drains `pal::EVENT_QUEUE`. We are called from inside a drain loop, so
+///  * `user_input_set_active` also drains `pal::EVENT_QUEUE`. We are called from inside a drain loop, so
 ///    anything typed BEHIND the Tab is discarded rather than delivered to the new focus, and it is the
 ///    same discard a launch already performs. WC-TAB note on PROVENANCE, since there are now two callers
 ///    and they do not share one: from the in-ring entry point those keystrokes were aimed at the window
@@ -12131,7 +12131,7 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
 ///    aimed at the PROMPT — type `ls`, then TAB quickly, and the `ls` bytes are dropped before the
 ///    console ever sees them. Kept anyway, and flagged rather than quietly fixed: the alternative is to
 ///    let pre-TAB shell bytes survive into a window's ring, which is a worse leak than losing a partial
-///    command line, and `el0_input_set_active`'s "a fresh focus starts clean" contract is relied on by
+///    command line, and `user_input_set_active`'s "a fresh focus starts clean" contract is relied on by
 ///    the UVUG-8r2 takeover reasoning. Splitting the discard by direction means splitting that contract,
 ///    which is an arc-sized change to the focus primitive, not a keybinding fix.
 ///  * The KeyUp is swallowed too, on the same predicate. Delivering a lone KeyUp for a KeyDown the app
@@ -12150,7 +12150,7 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
     crate::wedge2::mark("<F1>");
     let mut ring = [0u64; crate::video::wm::MAX_WINDOWS];
     let n = crate::video::wm::focus_ring(&mut ring);
-    let cur = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
+    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
     // BGRUN-1 GUARD REWRITE (supersedes WC-TAB's shared `n < 2`, deliberately). The old guard was
     // justified when windows could not outlive `run`: a lone window meant a parked shell, so consuming
     // TAB there could only rebuild the one-way trap. BGRUN-1 makes "focused window + free shell" the
@@ -12168,7 +12168,7 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
         return true; // swallow the release edge of a Tab whose press we consumed
     }
     let at = ring[..n].iter().position(|&a| a == cur);
-    // The ring has n WINDOW slots plus ONE MORE: slot `n` is the SHELL (`EL0_INPUT_ACTIVE == 0`, no EL0
+    // The ring has n WINDOW slots plus ONE MORE: slot `n` is the SHELL (`USER_INPUT_ACTIVE == 0`, no EL0
     // target). Without it the cycle is a closed loop over the live apps and the keyboard can never be
     // handed back — an operator who tabs into a window is stuck there until the app exits, with the
     // wedge watchdog as the only other way out. That is a trap, not a window manager, so "no app has
@@ -12192,16 +12192,16 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
         return true;
     }
     // WEDGE-2 `<F2>` — the ring was read and a destination chosen; the focus PRIMITIVE is next.
-    // `el0_input_set_active` clears the target's ring and drains up to 64 events off
+    // `user_input_set_active` clears the target's ring and drains up to 64 events off
     // `pal::EVENT_QUEUE` (a bounded loop against a live producer), so a `<F2>` with no `<F3>` puts
     // the death in the input-queue drain rather than anywhere in the compositor.
     crate::wedge2::mark("<F2>");
-    el0_input_set_active(next);
+    user_input_set_active(next);
     // WEDGE-2 `<F3>` — focus routing has moved; the VISIBLE half is next. This is the seam the three
     // silicon wedges all crossed: `[wc-fv] focus raise` is printed from inside `focus_changed`, so
     // every recorded wedge got at least this far.
     crate::wedge2::mark("<F3>");
-    // FOCUS-VIS — the other half of a focus change. `el0_input_set_active` moves where KEYSTROKES go;
+    // FOCUS-VIS — the other half of a focus change. `user_input_set_active` moves where KEYSTROKES go;
     // this moves what the PANEL shows. P59's bench report is what happens when only the first exists:
     // `[wc-c] focus tab-cycle` fired on every press and nothing on screen moved, so the newly focused
     // window stayed buried and the shell stayed covered. `next == 0` is the shell slot, and
@@ -12225,15 +12225,15 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
 
 /// Push a pre-packed event into `asid`'s ring (the SPSC producer half). Drop-newest on a full ring so a
 /// backlog can never clobber an event the EL0 consumer has not yet read. `asid` is validated by the caller.
-fn el0_input_push(asid: u64, packed: u64) -> bool {
+fn user_input_push(asid: u64, packed: u64) -> bool {
     let a = asid as usize;
-    let head = EL0_INPUT_HEAD[a].load(Ordering::Acquire);
-    let tail = EL0_INPUT_TAIL[a].load(Ordering::Relaxed); // this task is the sole producer
+    let head = USER_INPUT_HEAD[a].load(Ordering::Acquire);
+    let tail = USER_INPUT_TAIL[a].load(Ordering::Relaxed); // this task is the sole producer
     if tail.wrapping_sub(head) >= INPUT_RING_CAP as u32 {
         return false; // full — drop the newest
     }
-    EL0_INPUT_BUF[a][(tail as usize) & (INPUT_RING_CAP - 1)].store(packed, Ordering::Release);
-    EL0_INPUT_TAIL[a].store(tail.wrapping_add(1), Ordering::Release); // publish AFTER the slot store
+    USER_INPUT_BUF[a][(tail as usize) & (INPUT_RING_CAP - 1)].store(packed, Ordering::Release);
+    USER_INPUT_TAIL[a].store(tail.wrapping_add(1), Ordering::Release); // publish AFTER the slot store
     // UVUG-8r2: deliberately NO takeover latch here. Delivery into the ring proves only that the ROUTER acted;
     // it says nothing about whether the app is interactive (or even running). The latch is set on the CONSUMER
     // side, in `sys_input_poll`, when the app actually drains the event. See `EL0_TAKEOVER_ASID`.
@@ -12243,7 +12243,7 @@ fn el0_input_push(asid: u64, packed: u64) -> bool {
     // interleavings are the only two, and both are correct: a waiter that read TAIL before our store fails
     // its compare and never parks; one that parked before our store is on the bucket we are about to take.
     // There is no third case and therefore no lost wakeup.
-    el0_input_wake(asid);
+    user_input_wake(asid);
     true
 }
 
@@ -12251,7 +12251,7 @@ fn el0_input_push(asid: u64, packed: u64) -> bool {
 /// ASID resets that ring (a freshly-focused process starts with an empty queue — no stale input from a prior
 /// focus); passing 0 clears the designation (no EL0 target — enqueues become no-ops). Called by the focus
 /// owner (today the witness; on the folded router, the shell/compositor on a focus change).
-pub fn el0_input_set_active(asid: u64) {
+pub fn user_input_set_active(asid: u64) {
     // UVUG-8r2: a fresh focus must also start with an empty UPSTREAM queue. `clear_input_row` resets only the
     // per-ASID ring; `pal::EVENT_QUEUE` sits in front of it and, on metal, still holds the tail of the
     // keystroke that LAUNCHED this program — the Enter KeyUp from typing `run /fat/VUG.ELF`. Left there, the
@@ -12284,13 +12284,13 @@ pub fn el0_input_set_active(asid: u64) {
     // which a concurrent router push could re-store the OUTGOING asid into the latch after we cleared it. With
     // the engage edge moved to the consumer side that push can no longer write the latch at all, and this order
     // narrows the remaining window to near-nothing — but it does NOT close it. `sys_input_poll` reads
-    // `EL0_INPUT_ACTIVE` and writes the latch as two separate atomics, so a poll that read the OLD focus just
+    // `USER_INPUT_ACTIVE` and writes the latch as two separate atomics, so a poll that read the OLD focus just
     // before this store can still land its write after the clear below (a TOCTOU on the focus-drop edge). The
     // residue is harmless and self-healing: the stale latch names the OUTGOING asid, `takeover_suspends` only
-    // suspends when the latch matches the asid the wait loop is watching, and the next `el0_input_set_active`
+    // suspends when the latch matches the asid the wait loop is watching, and the next `user_input_set_active`
     // clears it again. Closing it properly would need focus+latch under one atomic or a seqlock, which is not
     // worth it for a window this narrow and this benign.
-    EL0_INPUT_ACTIVE.store(asid, Ordering::Release);
+    USER_INPUT_ACTIVE.store(asid, Ordering::Release);
     EL0_TAKEOVER_ASID.store(0, Ordering::Release);
     // Heartbeat reset to 0 as an "unset" sentinel. NOTE it is a value, not a tombstone: `takeover_suspends`
     // treats it as a real timestamp, so within the first `TAKEOVER_STALE_SECS` after CNTPCT origin a 0 reads as
@@ -12310,13 +12310,13 @@ pub fn el0_input_set_active(asid: u64) {
     // in `wc_click_route`): the woken vug re-reads its flags word, may find itself still hidden and
     // re-park, and is then released again by the unhide edge below — which is why BOTH edges are needed
     // and neither is redundant.
-    el0_input_wake_edge(asid, "focus");
+    user_input_wake_edge(asid, "focus");
 }
 
 /// WC-TAB — the SHELL half of the focus ring, closing the one-way exit WC-C left open.
 ///
-/// When focus is the shell slot, `el0_input_active()` is 0 and `main.rs` never calls
-/// `route_input_to_active_el0`, so `el0_input_enqueue` (and with it the TAB interception) is never
+/// When focus is the shell slot, `user_input_active()` is 0 and `main.rs` never calls
+/// `route_input_to_active_el0`, so `user_input_enqueue` (and with it the TAB interception) is never
 /// reached: TAB got as far as the console's `handle_key`, which ignores byte 9 outright — no completion,
 /// no binding, nothing. The rotation could be left but not re-entered.
 ///
@@ -12330,7 +12330,7 @@ pub fn el0_input_set_active(asid: u64) {
 ///
 /// Same predicate, same body, same witness as the in-ring cycle — this is a second entry point onto
 /// `wc_focus_key`, not a second implementation. Two consequences follow from that, both wanted:
-///  * With `EL0_INPUT_ACTIVE == 0` the current focus is in no window's slot, so the cycle takes the
+///  * With `USER_INPUT_ACTIVE == 0` the current focus is in no window's slot, so the cycle takes the
 ///    "unknown focus" arm and lands on the ring's head — the first window in window-id order.
 ///  * The `n < 2` guard is shared, so a system with one window (or none) leaves TAB an ordinary key
 ///    here too. That is deliberate symmetry, not an oversight: a lone window does not consume TAB, so
@@ -12340,7 +12340,7 @@ pub fn el0_input_set_active(asid: u64) {
 /// Returns `true` when the window system consumed the event; the caller must not forward it.
 /// A non-TAB event, or TAB with focus already on an app, returns `false` untouched.
 pub fn wc_shell_focus_key(ev: crate::pal::Event) -> bool {
-    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) != 0 {
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) != 0 {
         return false; // an app owns input — the router seam handles TAB, not us
     }
     wc_focus_key(ev)
@@ -12431,7 +12431,7 @@ pub fn wc_close_last_settle() -> u32 {
 ///    is answered on the panel immediately rather than after a kill settles. Idempotent against the
 ///    teardown's own `close_owner` (which will find zero rows).
 /// 2. **Focus next** — if the closed owner held focus (either half), it is handed to the SHELL
-///    through the one focus primitive, in the canonical order (`el0_input_set_active(0)` then
+///    through the one focus primitive, in the canonical order (`user_input_set_active(0)` then
 ///    `wm::focus_changed(0)`) — the same state a TAB-to-shell or a desktop-miss click leaves.
 ///    Without this the keyboard would keep addressing a process that is about to be dead.
 /// 3. **Kill last** — the SKILL-1 primitive, ASID-SCOPED (`sched::kill(pid, owner)`), so the vug
@@ -12472,8 +12472,8 @@ pub fn wc_close_last_settle() -> u32 {
 /// witness no-op from a click that killed nobody.
 fn wc_close_click(owner: u64) -> &'static str {
     let closed = crate::video::wm::close_owner(owner);
-    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == owner {
-        el0_input_set_active(0);
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == owner {
+        user_input_set_active(0);
     }
     if crate::video::wm::focus_asid() == owner {
         crate::video::wm::focus_changed(0);
@@ -12603,7 +12603,7 @@ fn click_owner_is_fullscreen(asid: u64) -> bool {
 /// ### The rule, on a PRESS edge
 /// Hit-test the cursor ([`crate::video::wm::hit_test`] — topmost visible window containing the point):
 ///  * **a DIFFERENT window than the focused one** — raise it to focus, through the one focus
-///    primitive that exists (`el0_input_set_active` + `wm::focus_changed`, in that order, exactly as
+///    primitive that exists (`user_input_set_active` + `wm::focus_changed`, in that order, exactly as
 ///    `wc_focus_key` calls them), and then DELIVER the press to it (CLICK-PLAIN, below). Click-to-focus,
 ///    with no second focus path invented for it: this is a new CALLER of the WEDGE path, so a
 ///    click-driven raise emits the same `<F1>`-`<F9>` breadcrumbs a TAB does, which is desirable — the
@@ -12650,7 +12650,7 @@ fn click_owner_is_fullscreen(asid: u64) -> bool {
 /// and there is no pointer gesture that reaches the console at all (only `TAB`).
 ///
 /// So a miss over a windowed focus does what the hit arm does, with the shell as the target: the ONE
-/// focus primitive (`el0_input_set_active(0)` then `wm::focus_changed(0)`, in that order), which is
+/// focus primitive (`user_input_set_active(0)` then `wm::focus_changed(0)`, in that order), which is
 /// literally the shell slot of `wc_focus_key`'s ring — no second shell-focus state is invented here,
 /// and everything already hanging off that path follows unchanged (the outgoing app's ring is left
 /// alone, its takeover latch is cleared, and VUGMIN's hidden bit is published by `focus_changed`'s own
@@ -12682,16 +12682,16 @@ fn click_owner_is_fullscreen(asid: u64) -> bool {
 ///
 /// **The order is the whole of the correctness here.** Both wake edges the VUGPAUSE-2r2 restore chain
 /// needs fire BEFORE the press is queued, from the two calls in that arm: the focus arrival
-/// (`el0_input_set_active`) and the unhide (`focus_changed` -> `set_hidden(asid, false)`). Only then
+/// (`user_input_set_active`) and the unhide (`focus_changed` -> `set_hidden(asid, false)`). Only then
 /// does the press reach the ring — which by that point is the RAISED owner's ring, because
-/// `el0_input_set_active` has already moved `EL0_INPUT_ACTIVE`. A press on a PARKED, hidden, unfocused
+/// `user_input_set_active` has already moved `USER_INPUT_ACTIVE`. A press on a PARKED, hidden, unfocused
 /// vug therefore produces the `[vugpause2] resume` pair, re-readies the waiter, AND hands it the click:
 /// the vug wakes, observes its restore, and reads one press.
 ///
 /// **Both callers converge on this without a second decision.** The arm returns `false` ("carry on with
 /// your normal path"), and both normal paths now address the new focus: the EL0-focus path
-/// (`el0_input_enqueue`) pushes to `EL0_INPUT_ACTIVE`, which this arm has just repointed; the SHELL path
-/// (`main.rs`'s Button arm) forwards through `gui_send` -> `click1_dispatch` -> `el0_input_enqueue`,
+/// (`user_input_enqueue`) pushes to `USER_INPUT_ACTIVE`, which this arm has just repointed; the SHELL path
+/// (`main.rs`'s Button arm) forwards through `gui_send` -> `click1_dispatch` -> `user_input_enqueue`,
 /// which funnels back through here, sees no edge (the mask tracker was swapped on entry) and lands in
 /// the same push.
 ///
@@ -12709,14 +12709,14 @@ fn click_owner_is_fullscreen(asid: u64) -> bool {
 /// already-focused window, and the newly RAISED owner on a press that moved focus to a window.
 ///
 /// Idempotent per edge: the mask tracker is swapped on entry, so a second call with the same mask sees
-/// no edge and answers `false`. The shell caller relies on that (it calls `el0_input_enqueue`, which
+/// no edge and answers `false`. The shell caller relies on that (it calls `user_input_enqueue`, which
 /// funnels through here again) — one report produces one decision.
 pub fn wc_click_route(ev: crate::pal::Event) -> bool {
     let crate::pal::Event::Button(mask) = ev else {
         return false;
     };
     let prev = CLICK_PREV_MASK.swap(mask as u32, Ordering::Relaxed) as u8;
-    let cur = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
+    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
     if mask & !prev != 0 {
         // PRESS edge.
         let (x, y) = click_pointer_pos();
@@ -12783,12 +12783,12 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                     "[clickroute] press hit asid={} win={} (was {}) delivered",
                     owner, win, cur
                 );
-                // The wake chain runs FIRST and in full: focus arrival (`el0_input_set_active` ->
-                // `el0_input_wake_edge(asid, "focus")`) then the raise and its unhide
-                // (`focus_changed` -> `set_hidden(asid, false)` -> `el0_input_wake_edge(asid,
-                // "unhide")`). Only then does the caller push, and by then `EL0_INPUT_ACTIVE` is
+                // The wake chain runs FIRST and in full: focus arrival (`user_input_set_active` ->
+                // `user_input_wake_edge(asid, "focus")`) then the raise and its unhide
+                // (`focus_changed` -> `set_hidden(asid, false)` -> `user_input_wake_edge(asid,
+                // "unhide")`). Only then does the caller push, and by then `USER_INPUT_ACTIVE` is
                 // `owner`, so the press lands in the ring of the window that was clicked.
-                el0_input_set_active(owner);
+                user_input_set_active(owner);
                 crate::video::wm::focus_changed(owner);
                 // The release must follow the press into the SAME ring: record the raised owner, not
                 // the sentinel, so the pair is delivered whole.
@@ -12808,7 +12808,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                         "[clickroute] press miss at ({},{}) -> shell focus (was {})",
                         x, y, cur
                     );
-                    el0_input_set_active(0);
+                    user_input_set_active(0);
                     crate::video::wm::focus_changed(0);
                     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
                     true
@@ -12830,9 +12830,9 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
     }
 }
 
-/// The ASID currently designated to receive input (0 = none) — the read side of `el0_input_set_active`.
-pub fn el0_input_active() -> u64 {
-    EL0_INPUT_ACTIVE.load(Ordering::Acquire)
+/// The ASID currently designated to receive input (0 = none) — the read side of `user_input_set_active`.
+pub fn user_input_active() -> u64 {
+    USER_INPUT_ACTIVE.load(Ordering::Acquire)
 }
 
 /// CLICK-SWALLOW witness read: how many events are sitting UNREAD in `asid`'s input ring. 0 for the
@@ -12840,22 +12840,22 @@ pub fn el0_input_active() -> u64 {
 ///
 /// This is the observation the swallow leg is built on, and it is the only honest one available: "was
 /// the app handed this click?" is a question about the RING, not about a return value. The producer
-/// (`el0_input_push`) and the consumer (`sys_input_poll`) are the only writers, and neither runs while
+/// (`user_input_push`) and the consumer (`sys_input_poll`) are the only writers, and neither runs while
 /// the selftest drives a synthetic edge, so the difference across one press is exactly the delivery.
-pub fn el0_input_depth(asid: u64) -> u32 {
+pub fn user_input_depth(asid: u64) -> u32 {
     if asid == 0 || asid as usize > super::boot::USER_SLOTS {
         return 0;
     }
     let a = asid as usize;
-    let head = EL0_INPUT_HEAD[a].load(Ordering::Acquire);
-    EL0_INPUT_TAIL[a].load(Ordering::Acquire).wrapping_sub(head)
+    let head = USER_INPUT_HEAD[a].load(Ordering::Acquire);
+    USER_INPUT_TAIL[a].load(Ordering::Acquire).wrapping_sub(head)
 }
 
 /// CLICK-SWALLOW witness read: the cumulative count of NAMED wake edges — see
-/// [`EL0_INPUT_WAKE_EDGES`]. The swallow leg samples it either side of a press to assert that
+/// [`USER_INPUT_WAKE_EDGES`]. The swallow leg samples it either side of a press to assert that
 /// consuming the click did not also skip the restore chain.
-pub fn el0_input_wake_edges() -> u64 {
-    EL0_INPUT_WAKE_EDGES.load(Ordering::Relaxed)
+pub fn user_input_wake_edges() -> u64 {
+    USER_INPUT_WAKE_EDGES.load(Ordering::Relaxed)
 }
 
 /// UVUG-8: the ASID currently in interactive takeover (0 = none) — the read side of the takeover latch. The
@@ -12896,11 +12896,11 @@ pub fn run_deadline_timed_out(in_takeover: bool, now: u64, budget_start: u64, de
 /// producer runs for the dying ASID, and on a focus change the router only ever targets the newly-active ASID.
 fn clear_input_row(asid: u64) {
     let a = asid as usize;
-    EL0_INPUT_HEAD[a].store(0, Ordering::Release);
-    EL0_INPUT_TAIL[a].store(0, Ordering::Release);
+    USER_INPUT_HEAD[a].store(0, Ordering::Release);
+    USER_INPUT_TAIL[a].store(0, Ordering::Release);
     // VUGPAUSE-2r2: the park hint is DELIBERATELY not touched here — see `clear_input_parked`, which the
     // teardown caller invokes and the focus caller must not. VUGPAUSE-2 cleared it on this line, and that
-    // was the P72 "a backgrounded vug can never be restarted" bug in one store: `el0_input_set_active`
+    // was the P72 "a backgrounded vug can never be restarted" bug in one store: `user_input_set_active`
     // calls this function on a focus ARRIVAL, microseconds before its own wake edge, so the arrival wiped
     // the very hint the wake seam consults and every subsequent edge — focus, unhide, the press itself,
     // and the backstop — took the "nobody is parked" fast path on a task that was, in fact, parked.
@@ -12918,7 +12918,7 @@ fn clear_input_row(asid: u64) {
 /// parker `exit()`s out of `sched::futex_wait`'s pre-park kill boundary and never reaches its own clear.
 fn clear_input_parked(asid: u64) {
     if asid != 0 && asid as usize <= super::boot::USER_SLOTS {
-        EL0_INPUT_PARKED[asid as usize].store(false, Ordering::Release);
+        USER_INPUT_PARKED[asid as usize].store(false, Ordering::Release);
     }
 }
 
@@ -12952,22 +12952,22 @@ fn sys_input_poll() -> i64 {
     // and the run regains its bound. Stamped only for the FOCUSED app so an unfocused EL0 task's polling can
     // never keep another process's takeover alive. One focus test now serves both (they were always the same
     // question — "is the caller the app that owns the screen?").
-    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
         crate::gui_watchdog::note_progress();
         EL0_TAKEOVER_HB.store(super::timer::cntpct(), Ordering::Release);
     }
     let a = asid as usize;
-    let head = EL0_INPUT_HEAD[a].load(Ordering::Relaxed); // this task is the sole consumer
-    let tail = EL0_INPUT_TAIL[a].load(Ordering::Acquire);
+    let head = USER_INPUT_HEAD[a].load(Ordering::Relaxed); // this task is the sole consumer
+    let tail = USER_INPUT_TAIL[a].load(Ordering::Acquire);
     if head == tail {
         return EAGAIN; // empty
     }
-    let packed = EL0_INPUT_BUF[a][(head as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
-    EL0_INPUT_HEAD[a].store(head.wrapping_add(1), Ordering::Release); // consume AFTER the load
+    let packed = USER_INPUT_BUF[a][(head as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
+    USER_INPUT_HEAD[a].store(head.wrapping_add(1), Ordering::Release); // consume AFTER the load
     // UVUG-8r2: the app just CONSUMED a real input event — the interactive-takeover edge, observed on the
     // consumer side (see `EL0_TAKEOVER_ASID` for why the producer side was wrong). Latch it, but only for the
     // FOCUSED app: a background EL0 task draining its own stale ring is not taking over the screen. Idempotent.
-    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
         EL0_TAKEOVER_ASID.store(asid, Ordering::Release);
     }
     packed as i64
@@ -12984,7 +12984,7 @@ fn sys_input_poll() -> i64 {
 /// instead of `SYS_YIELD` on the idle path only; the rendering path is untouched.
 ///
 /// The three deliberate properties, in the order they were argued:
-///   * SAME-TICK WAKE. The wake is issued by `el0_input_push` itself, so the latency from "the router
+///   * SAME-TICK WAKE. The wake is issued by `user_input_push` itself, so the latency from "the router
 ///     enqueued a keypress" to "the vug is ready to run" is one `make_ready` — strictly better than the
 ///     yield loop, which could not act until it was next dispatched.
 ///   * KILL-SURVIVABLE. This is KILLBOUND's futex, not a new primitive, so a parked vug inherits the
@@ -12993,7 +12993,7 @@ fn sys_input_poll() -> i64 {
 ///     the KILLBOUND arc was built for. That is also the answer to VUGGUARD/P60's "an unbounded
 ///     `futex_wait` is an unkillable empty window": it was, before KILLBOUND, and it is not now.
 ///   * BOUNDED ANYWAY. The `run` deadline and the GUI wedge watchdog both measure liveness in polls, so a
-///     genuinely idle vug that stopped polling would read as wedged. `el0_input_wake_backstop` keeps it
+///     genuinely idle vug that stopped polling would read as wedged. `user_input_wake_backstop` keeps it
 ///     polling a few times a second — see there for the full argument.
 fn sys_input_wait() -> i64 {
     let asid = current_asid();
@@ -13003,20 +13003,20 @@ fn sys_input_wait() -> i64 {
     // The same two liveness stamps `sys_input_poll` makes, under the same focus predicate and for the
     // same reason: reaching this syscall IS drain progress. Stamped BEFORE the park, so the clock the
     // watchdog reads starts at the moment the vug went to sleep rather than the moment it last drew.
-    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
         crate::gui_watchdog::note_progress();
         EL0_TAKEOVER_HB.store(super::timer::cntpct(), Ordering::Release);
     }
     let a = asid as usize;
-    let head = EL0_INPUT_HEAD[a].load(Ordering::Relaxed); // this task is the sole consumer
-    let tail = EL0_INPUT_TAIL[a].load(Ordering::Acquire);
+    let head = USER_INPUT_HEAD[a].load(Ordering::Relaxed); // this task is the sole consumer
+    let tail = USER_INPUT_TAIL[a].load(Ordering::Acquire);
     if head != tail {
         return 0; // already has work — never park on a non-empty ring
     }
     // Park on the ring's TAIL word. `futex_wait` re-reads it under the bucket lock and refuses to park if
     // it has moved, which closes the window between the load above and the park below.
-    EL0_INPUT_PARKED[a].store(true, Ordering::Release);
-    let n = EL0_INPUT_BLOCKS.fetch_add(1, Ordering::Relaxed) + 1;
+    USER_INPUT_PARKED[a].store(true, Ordering::Release);
+    let n = USER_INPUT_BLOCKS.fetch_add(1, Ordering::Relaxed) + 1;
     // Witness on a POWER-OF-TWO cadence (1, 2, 4, 8, …). An idle fleet parks thousands of times a minute,
     // so a per-park line would be a flood and a one-shot line would say nothing about whether the mechanism
     // kept working; a logarithmic cadence is bounded at ~40 lines for any conceivable boot and still shows
@@ -13026,14 +13026,14 @@ fn sys_input_wait() -> i64 {
         serial_println!(
             "[vugpause2] blocked={} wakes={} asid={}",
             n,
-            EL0_INPUT_WAKES.load(Ordering::Relaxed),
+            USER_INPUT_WAKES.load(Ordering::Relaxed),
             asid
         );
     }
     let key = input_futex_key(asid);
-    let uaddr = core::ptr::addr_of!(EL0_INPUT_TAIL[a]) as u64;
+    let uaddr = core::ptr::addr_of!(USER_INPUT_TAIL[a]) as u64;
     let r = super::sched::futex_wait(key, uaddr, tail);
-    EL0_INPUT_PARKED[a].store(false, Ordering::Release);
+    USER_INPUT_PARKED[a].store(false, Ordering::Release);
     match r {
         // Woken by a wake edge, or the ring moved under the compare (`Mismatch`) — either way the caller's
         // next drain is the thing that decides, so both are simply "go look".
@@ -13112,7 +13112,7 @@ unsafe extern "C" {
 /// its own uncounted `:: EL0: input test … ::` line). Copies the input blob into a fresh slot's code page,
 /// protects it EL0-RX/EL1-RO, REGISTERS the slot as the active input target, and runs `el0-input` on THIS
 /// core (so the cooperative-yield verdict drives it under QEMU). Once the program has done its initial poll
-/// (observed the empty ring), the launcher injects ONE KeyDown('A') through the REAL `el0_input_enqueue`
+/// (observed the empty ring), the launcher injects ONE KeyDown('A') through the REAL `user_input_enqueue`
 /// router seam (proving pack + active routing), then waits for the program to drain it and exit. The verdict
 /// asserts: initial poll == -EAGAIN, injection returned true, the drained event == the expected packed value,
 /// final poll == -EAGAIN. QEMU raspi4b has no USB HID, so the kernel-injected event is what proves the
@@ -13126,7 +13126,7 @@ fn input_launcher(_demo_cpu: usize) {
     // UVUG-10: DO NOT RUN THIS FIXTURE ON METAL.
     //
     // The fixture is a REAL interactive takeover: it registers itself as the active input target
-    // (`el0_input_set_active`) and spawns an EL0 program that spins on SYS_INPUT_POLL until it sees the one
+    // (`user_input_set_active`) and spawns an EL0 program that spins on SYS_INPUT_POLL until it sees the one
     // event the launcher injects. In QEMU raspi4b that is airtight — there is no USB HID, so the ONLY
     // producer is the kernel injection and the program drains it, reports, and exits 0. On metal with real
     // HID attached the premise collapses: live keyboard/pointer traffic is routed into the same ring before
@@ -13183,9 +13183,9 @@ fn input_launcher(_demo_cpu: usize) {
     let ttbr0 = super::boot::slot_ttbr0(slot);
     let asid = ttbr0 >> 48;
     install_console_cap(asid);
-    // ELF-5: register this process as the active input target BEFORE it runs, so `el0_input_enqueue` routes
+    // ELF-5: register this process as the active input target BEFORE it runs, so `user_input_enqueue` routes
     // to its ring (and resets the ring — a clean start).
-    el0_input_set_active(asid);
+    user_input_set_active(asid);
     let entry = base + (&raw const __input_prog as usize - bstart) as u64;
     let run_cpu = super::percpu::this_cpu().cpu_index as usize;
     super::sched::spawn_user_slot("el0-input", entry, sp, ttbr0, run_cpu);
@@ -13200,7 +13200,7 @@ fn input_launcher(_demo_cpu: usize) {
         super::sched::yield_now();
     }
     // Inject one KeyDown('A') through the REAL router seam — targets the active ASID (this program's ring).
-    let ok = el0_input_enqueue(crate::pal::Event::Key(b'A'));
+    let ok = user_input_enqueue(crate::pal::Event::Key(b'A'));
     INPUT_ENQUEUE_OK.store(ok, Ordering::Release);
     // Wait (bounded) for the program to drain the event and exit cleanly.
     while !INPUT_PARENT_DONE.load(Ordering::Acquire)
@@ -13209,7 +13209,7 @@ fn input_launcher(_demo_cpu: usize) {
         super::sched::yield_now();
     }
     // Clear the active designation (also cleared at slot teardown; explicit here for symmetry).
-    el0_input_set_active(0);
+    user_input_set_active(0);
 
     let obs0 = INPUT_OBS[0].load(Ordering::Acquire);
     let obs1 = INPUT_OBS[1].load(Ordering::Acquire);
@@ -14492,7 +14492,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // (the SYS_FB_* / SYS_FUTEX primitives it builds on are proven, and the futex pool is armed). Its own
     // uncounted `:: EXEC-UVUG: … ::` verdict; an honest skip without the fixture.
     uvug_witness(demo_cpu);
-    // ELF-5: input into EL0 — SYS_INPUT_POLL + the per-process ring + the `el0_input_enqueue` router seam.
+    // ELF-5: input into EL0 — SYS_INPUT_POLL + the per-process ring + the `user_input_enqueue` router seam.
     // A register-only EL0 program polls its ring empty (-EAGAIN), the launcher injects one KeyDown through
     // the real router seam, the program drains it (verifying the packed value) and polls empty again. In-RAM
     // (no disk), so it can never perturb the fixture battery; its own uncounted `:: EL0: input test — … ::`

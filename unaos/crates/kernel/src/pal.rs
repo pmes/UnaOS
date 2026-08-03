@@ -656,7 +656,7 @@ lazy_static! {
 // all-zero-report-buffer theory is refuted by that same fact.
 //
 // LEADING THEORY (unified, and the one UVUG-10's fixture gate already kills): the boot `input_launcher`
-// fixture's orphan held `el0_input_active()` for the entire boot, so the router's user branch
+// fixture's orphan held `user_input_active()` for the entire boot, so the router's user branch
 // (`route_input_to_active_el0`, main.rs) swallowed the whole queue into a ring nothing would ever read —
 // while KEYS still reached the shell, because `input_service`'s UART path calls `gui_send` DIRECTLY and
 // never touches EVENT_QUEUE at all. That single mechanism explains "ptr=0 but key climbs", explains "from
@@ -678,7 +678,7 @@ lazy_static! {
 // that floor of 1, or a healthy zero-HID boot looks like a live pointer.
 //
 // P56 VERDICT TABLE — read `[uvug10] evq` against `[uvug9] shell-path`, with the fixture now gated off
-// metal (so no orphan should exist and `el0_input_active()` should be 0 all boot):
+// metal (so no orphan should exist and `user_input_active()` should be 0 all boot):
 //   * EXPECTED: `[uvug9] ptr` climbs normally with a moving mouse and `push ptr` climbs with it. The orphan
 //     theory was right and the fixture gate was the fix; nothing further is owed.
 //   * `[uvug9] ptr=0` STILL, with no orphan alive -> the orphan theory is refuted and the hunt RESUMES at
@@ -687,7 +687,7 @@ lazy_static! {
 //         drain is not keeping up (check `depth` and the `[click2]` channel depth alongside).
 //       - `push ptr > 1` with `drop ptr = 0` -> produced and stored, then consumed by SOMEONE ELSE before
 //         the shell drain. `pop` far above the router's own `[uvug9]` totals names that second consumer;
-//         the candidates are a user focus ring and `el0_input_set_active`'s pre-launch discard.
+//         the candidates are a user focus ring and `user_input_set_active`'s pre-launch discard.
 //       - `push ptr = 1` (the selftest floor, unmoved) -> against the settled xHCI finding this should be
 //         unreachable; if it happens, the pointer endpoint itself stopped completing this boot and the
 //         question is back in the driver lane. Confirm against `MOUSE-1`'s report count before concluding.
@@ -1233,7 +1233,7 @@ pub fn requeue_event(event: Event) {
 /// The seam was written for a strict peek: pop uncounted, re-push uncounted, nothing enters or leaves the
 /// pipeline. The compositor's shell-side TAB breaks that symmetry — the TAB itself is consumed by the
 /// window system, and on a real focus change the events held in the peek buffer are discarded (they are
-/// out of the queue only because the peek holds them; `el0_input_set_active` drains `EVENT_QUEUE` on every
+/// out of the queue only because the peek holds them; `user_input_set_active` drains `EVENT_QUEUE` on every
 /// focus change and would have taken them itself). Those events entered through `push_event` and were
 /// COUNTED, so leaving them uncounted on the way out drifts `[uvug10] evq`'s `push - drop - pop`
 /// occupancy permanently high — by the buffer size plus one per consumed cycle. Call this with the number

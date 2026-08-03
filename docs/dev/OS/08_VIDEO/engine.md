@@ -1091,26 +1091,26 @@ the flat blob's single 4 KiB code page needed the crate's release profile to mov
 to `"z"` (3792 B, ~300 B of headroom); the per-blob page assertion in `arroyo kernel8` is what catches
 a regression.
 
-**Focus is a key.** TAB is reserved *by the window system*, intercepted at `el0_input_enqueue` — the one
+**Focus is a key.** TAB is reserved *by the window system*, intercepted at `user_input_enqueue` — the one
 choke point every event bound for an EL0 ring passes through, so no app can hold focus hostage by not
 implementing it. It walks `wm::focus_ring` (the distinct owner ASIDs of the live non-compat windows, in
 window-id order — a stable rotation, not a reordering stack) and hands focus to the next entry via
-`el0_input_set_active`, which is still the only way focus moves: the incoming ring is reset, the
+`user_input_set_active`, which is still the only way focus moves: the incoming ring is reset, the
 interactive-takeover latch is cleared, and the UVUG-8 cap therefore keeps holding *per window*. The
 matching KeyUp is swallowed on the same predicate (a lone release edge for a press the app never saw is
 exactly the shape UVUG-6 removed from the typematic path). With fewer than two windows in the ring the
 key falls through as an ordinary TAB.
 
-The ring carries **one slot beyond the windows: the shell** (`EL0_INPUT_ACTIVE == 0`). Without it the
+The ring carries **one slot beyond the windows: the shell** (`USER_INPUT_ACTIVE == 0`). Without it the
 cycle is a closed loop over the live apps — an operator who tabs into a window can never get the keyboard
 back, and the wedge watchdog becomes the only exit from a perfectly healthy app. So "no app has focus" is
 a position in the rotation, not an absence.
 
 **WC-TAB closed the loop.** WC-C shipped the shell slot as a one-way exit: with focus 0,
-`route_input_to_active_el0` is not called at all (`main.rs` gates on `el0_input_active() != 0`), so no
+`route_input_to_active_el0` is not called at all (`main.rs` gates on `user_input_active() != 0`), so no
 TAB reached the seam — the ring could be left but not re-entered. `pump_usb_into_gui` now calls
 `syscall::wc_shell_focus_key` from both of its non-routing paths. That is a second *entry point* onto
-the same `wc_focus_key` body, not a second implementation: same predicate, same `el0_input_set_active`
+the same `wc_focus_key` body, not a second implementation: same predicate, same `user_input_set_active`
 move, same `[wc-c] focus tab-cycle` witness. With focus 0 in no window's slot the cycle takes its
 "unknown focus" arm and lands on the ring's head, the first window in window-id order. The `n < 2` guard
 is shared, so with one window (or none) TAB remains an ordinary key at the shell too — deliberate
@@ -1127,7 +1127,7 @@ buffer is dropped rather than forwarded (a swallowed release edge keeps the buff
 the scan continues). It must not be sent onward — `render_service` is blocked inside the same
 `dispatch_command`, so pushing into the 64-slot `GUI_CHANNEL` would saturate it and block the pump task,
 exactly what that branch exists to prevent. Dropping the buffer is not a new policy either: it is what
-`el0_input_set_active` would have done to those same events itself, since it drains `pal::EVENT_QUEUE`
+`user_input_set_active` would have done to those same events itself, since it drains `pal::EVENT_QUEUE`
 on every real focus change; they are outside the queue only because the uncounted peek is holding them.
 
 **Scope, plainly:** as WC-C already conceded, the boot's own programs do not overlap in time, so a ring
@@ -1674,7 +1674,7 @@ and produced two observations that turn out to be one defect:
 2. **The shell was unreadable.** With windows up, the console — prompt, command line, command output —
    was underneath them. The operator could type and could not read.
 
-The common cause: **focus was a pure input-routing fact.** `el0_input_set_active` moved where keystrokes
+The common cause: **focus was a pure input-routing fact.** `user_input_set_active` moved where keystrokes
 went and nothing else, and the shell had no position in the z-order at all — it was the surface the
 window layer got painted *onto*. Nothing raised a focused window, and nothing could put the console in
 front of anything, because "in front of the console" was the only thing a window could be.
@@ -1693,7 +1693,7 @@ raspi4b has no HID.
 
 #### One seam: `wm::focus_changed(asid)`
 
-Called by `wc_focus_key` immediately after `el0_input_set_active`, with `asid == 0` meaning the ring's
+Called by `wc_focus_key` immediately after `user_input_set_active`, with `asid == 0` meaning the ring's
 SHELL slot.
 
 | `asid` | what happens |
@@ -4422,7 +4422,7 @@ started. Tokens are four bytes, angle-bracketed, and no other line in the tree e
 | Token | Emitted at | The phase it opens |
 | --- | --- | --- |
 | `<F1>` | `arch/aarch64/syscall.rs` — `wc_focus_key`, after the TAB edge is recognised | `wm::focus_ring` — reads the ring under the window `TABLE` lock. Both entry points (the in-ring router seam and `wc_shell_focus_key`) funnel through this one body. |
-| `<F2>` | `wc_focus_key`, destination chosen | `el0_input_set_active` — clears the target's ring and drains up to 64 events off `pal::EVENT_QUEUE` against a live producer |
+| `<F2>` | `wc_focus_key`, destination chosen | `user_input_set_active` — clears the target's ring and drains up to 64 events off `pal::EVENT_QUEUE` against a live producer |
 | `<F3>` | `wc_focus_key`, focus routing moved | `wm::focus_changed` — the visible half. Every recorded wedge got at least this far. |
 | `<F4>` | `video/wm.rs` — `focus_changed` entry (also claims the chain) | the `TABLE` critical section that does the z-bump / shell raise |
 | `<F5>` | `focus_changed`, table guard dropped | `erase` of the vacated boxes + `screen::request_full_present` |
@@ -5084,7 +5084,7 @@ to be a policy about.** The audit is recorded here in full so it is not re-run.
 3. **`wm::hit_test` has no x86 caller either.** The seam is present and arch-neutral; the address
    lookup has simply never been performed on this arch.
 4. **There is no ring-3 input delivery on x86 at all.** `arch/x86_64/syscall.rs` contains no
-   `el0_input_*` equivalent, no per-address-space input ring, and no `SYS_INPUT_POLL`. The file's own
+   `user_input_*` equivalent, no per-address-space input ring, and no `SYS_INPUT_POLL`. The file's own
    syscall-numbering note says so directly: 27 (`INPUT_POLL`) is reserved for x86's "later arcs".
    CLICK-PLAIN's central claim — that a focus-changing press is *delivered whole* into the raised
    owner's ring — has no addressee on x86.
@@ -5176,7 +5176,7 @@ each with what actually landed:
 
 1. **A press dispatch site — done.** `main.rs`'s x86 drain has an `Event::Button` arm, and the routing
    decision runs one step earlier still: the drain calls
-   `arch::x86_64::syscall::wc_click_route(raw)` *before* `el0_input_route`, because `el0_input_route`
+   `arch::x86_64::syscall::wc_click_route(raw)` *before* `user_input_route`, because `user_input_route`
    routes by FOCUS and a click belongs to the window under the cursor. The arm is `#[cfg]`-gated to
    x86 (the loop is shared with aarch64-UEFI, which routes clicks from its own drains).
 2. **Focusable windows — done, via a reserved kernel-owner band.** See the next subsection; this was
@@ -5215,7 +5215,7 @@ than overturning the decision:
   the transient witness probes, which must stay unclickable.
 
 **A second, separate ownership fix.** `SYS_WIN_CREATE` was handing the compositor an *unbiased* slot
-number while `EL0_INPUT_ACTIVE` carries `slot + 1`. Because x86 slot 0 is a real address space, the
+number while `USER_INPUT_ACTIVE` carries `slot + 1`. Because x86 slot 0 is a real address space, the
 first program to launch got a window with `owner_asid == 0` — skipped by both `hit_test` and
 `focus_ring`, i.e. neither clickable nor tabbable, silently and only for slot 0. The owner is now
 `slot + 1`, so the value `hit_test` returns is the value the router compares against the input focus,
@@ -5241,7 +5241,7 @@ release either follows it or is dropped — a press/release pair is never split 
 release is ever delivered to an app that did not see the press.
 
 **The one arm that differs from aarch64, and why.** On the kernel-row and desktop arms this router
-calls `el0_input_set_active(0)` but does **not** call `wm::focus_changed(0)`. On aarch64 the shell is
+calls `user_input_set_active(0)` but does **not** call `wm::focus_changed(0)`. On aarch64 the shell is
 the desktop layer *beneath* the window layer, so raising `SHELL_Z` reveals the console. On x86 the
 console **is a window row** (`fbcon::panel_console_window_open`), so raising `SHELL_Z` above every
 window would push the console below the shell, stop it compositing and erase it to the desktop colour
@@ -5694,7 +5694,7 @@ The CLOSE arm (`wc_close_click`), in order:
 1. **Windows first** — `wm::close_owner(owner)` removes every row the owner holds (a vug parent
    and its workers are one owner), so the click is answered on the panel immediately.
 2. **Focus** — if the closed owner held either half of focus, it is handed to the SHELL through the
-   one focus primitive (`el0_input_set_active(0)` then `focus_changed(0)`), the same state a
+   one focus primitive (`user_input_set_active(0)` then `focus_changed(0)`), the same state a
    TAB-to-shell leaves.
 3. **Kill** — the SKILL-1 primitive, ASID-scoped (`sched::kill(pid, owner)`), so every sibling
    thread dies with the parent; `kill` evicts targets parked in kernel waits (`futex_wake_killed`

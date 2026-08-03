@@ -4477,7 +4477,7 @@ fn input_wait_backstop_inner() {
     {
         return;
     }
-    super::syscall::el0_input_wake_backstop();
+    super::syscall::user_input_wake_backstop();
 }
 
 /// Run `cpu`'s run queue to completion, cooperatively (the M3a demo driver on the BSP): dispatch

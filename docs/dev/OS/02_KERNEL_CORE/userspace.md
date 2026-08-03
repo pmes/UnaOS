@@ -425,19 +425,19 @@
   MouseAbs, `5` Button), the low 32 bits the payload — key ASCII / button mask in `[7:0]`, mouse x/dx in
   `[31:16]` and y/dy in `[15:0]` (i16). Kernel side mirrors how the GUI routes input to kernel apps today
   (the GUI-CLICK-2b `SCREEN_APP_ACTIVE` gate + `gui_watchdog`: only the ACTIVE app receives input): a small
-  **per-ASID ring** (`EL0_INPUT_BUF`/`HEAD`/`TAIL`, cap 32), a single producer (the router) + single
+  **per-ASID ring** (`USER_INPUT_BUF`/`HEAD`/`TAIL`, cap 32), a single producer (the router) + single
   consumer (the EL0 task) so it is a **lock-free SPSC ring** (drop-newest on a full ring — an unread event is
-  never overwritten). Two **public in-lane seams** (the ELF-3 present-hook twins): `el0_input_enqueue(ev)`
-  (the router pushes a decoded `pal::Event` into the active process's ring) and `el0_input_set_active(asid)` /
-  `el0_input_active()` (focus registration — the ELF-5 analogue of `SCREEN_APP_ACTIVE`; setting a focus
+  never overwritten). Two **public in-lane seams** (the ELF-3 present-hook twins): `user_input_enqueue(ev)`
+  (the router pushes a decoded `pal::Event` into the active process's ring) and `user_input_set_active(asid)` /
+  `user_input_active()` (focus registration — the ELF-5 analogue of `SCREEN_APP_ACTIVE`; setting a focus
   resets that ring, so a freshly-focused app starts clean). Teardown folds in: `clear_handle_row` now resets
   the ASID's ring and clears the active designation if the dying slot held it (a reused ASID inherits no
   stale input; the router never enqueues to a dead slot). **SYS_INPUT_WAIT = 28 is DEFERRED** (documented at
-  the seam) — a blocking variant on a per-ASID `Semaphore` that `el0_input_enqueue` would post; QEMU has no
+  the seam) — a blocking variant on a per-ASID `Semaphore` that `user_input_enqueue` would post; QEMU has no
   real input source, so `SYS_INPUT_POLL` is the QEMU-provable rung this arc lands. Test (`__input_prog`,
   in-RAM, register-only): the program polls its ring empty (`-EAGAIN`), the launcher — after the initial
   empty observation, so the ordering is exact — injects ONE `KeyDown('A')` through the real
-  `el0_input_enqueue` seam, the program poll+yields until the event arrives, verifies the packed value, then
+  `user_input_enqueue` seam, the program poll+yields until the event arrives, verifies the packed value, then
   polls empty again. QEMU-verified (`UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`):
   `:: EL0: input test — poll-empty=EAGAIN enqueue=1 event=0x1000000000041 drained=EAGAIN :: PASS ::` (the
   packed event = `(KeyDown<<48) | 'A'`), with the whole prior battery (CAPSTONE 6/6, ELF1/EXEC1, ELF-2 threads,
@@ -445,19 +445,19 @@
   kernel-injected event is what proves the enqueue->drain + `-EAGAIN` paths — the router edge (real HID ->
   ring) is metal-only, lit up by the deferred fold. **DEFERRED ROUTER WIRING (2-3 lines, OUTSIDE this lane —
   `main.rs` `pump_usb_into_gui`, the next arc folds):** when an EL0 app owns the screen (an ELF-5 analogue of
-  `SCREEN_APP_ACTIVE`, its ASID registered via `el0_input_set_active`), route drained pal events to the EL0
+  `SCREEN_APP_ACTIVE`, its ASID registered via `user_input_set_active`), route drained pal events to the EL0
   ring instead of `GUI_CHANNEL`:
   ```rust
   while let Some(ev) = unaos_kernel::pal::next_event() {
-      unaos_kernel::arch::aarch64::syscall::el0_input_enqueue(ev); // -> the active EL0 app's ring
+      unaos_kernel::arch::aarch64::syscall::user_input_enqueue(ev); // -> the active EL0 app's ring
   }
   ```
   Lane: `arch/aarch64/syscall.rs` (the ring + seams + `sys_input_poll` + the `clear_handle_row` fold + the
   in-RAM witness) + this doc — no scheduler primitive, no driver, no `main.rs`/`pal.rs` change, no x86 file.
 - **INPUT-WIRE (landed 2026-07-23)** — folds ELF-5's deferred router wiring so a running EL0 program receives
   REAL keys/mouse. Two halves:
-  - **Router (main.rs `pump_usb_into_gui`).** When an EL0 program holds input focus (`el0_input_active() != 0`),
-    the GUI router drains `pal::next_event()` into that process's per-process ring via the `el0_input_enqueue`
+  - **Router (main.rs `pump_usb_into_gui`).** When an EL0 program holds input focus (`user_input_active() != 0`),
+    the GUI router drains `pal::next_event()` into that process's per-process ring via the `user_input_enqueue`
     seam — **keyboard AND mouse** (Key/KeyUp/Mouse/MouseAbsolute/Button; Timer/None/Unknown are dropped by the
     seam) — instead of `GUI_CHANNEL`. Factored into `route_input_to_active_el0()`, the single router->ring choke
     point. This branch takes **precedence over `SCREEN_APP_ACTIVE`**: the panel `run` verb dispatches through
@@ -465,10 +465,10 @@
     ring is the real sink. Unlike the kernel-app `SCREEN_APP_ACTIVE` gate (which LEAVES events in `EVENT_QUEUE`
     for the app's own `pump_and_poll`), the EL0 branch **drains** — an EL0 app cannot reach `EVENT_QUEUE`, so a
     left event would never be consumed.
-  - **Focus lifecycle (`run_user_image`).** Focus is registered (`el0_input_set_active(asid)`) right after the
+  - **Focus lifecycle (`run_user_image`).** Focus is registered (`user_input_set_active(asid)`) right after the
     slot exists and the pid is published, and BEFORE the wait loop yields (the co-located task cannot dispatch
-    until then, so no input is missed). It is cleared (`el0_input_set_active(0)`) on return: `clear_handle_row`
-    already clears the designation on slot teardown (verified — ELF-5's `EL0_INPUT_ACTIVE` compare-exchange), so
+    until then, so no input is missed). It is cleared (`user_input_set_active(0)`) on return: `clear_handle_row`
+    already clears the designation on slot teardown (verified — ELF-5's `USER_INPUT_ACTIVE` compare-exchange), so
     the explicit clear is belt-and-suspenders for the exit/kill path and the **sole** clear on the Timeout path
     (task still alive, no teardown). The shell regains input the instant the program returns.
   - **Watchdog / escape hatch — decision (UVUG-5 correction).** The original ELF-5 decision left the
@@ -504,12 +504,12 @@
   live". By that point in the boot the whole M6b..U7 fixture cascade has been spawned and is running on the APs,
   and **M6d alone holds all eight slots, ASIDs 1–8** (`:: M6d: per-task address spaces (8 slots, ASID 1-8…) ::`
   prints ~27 lines *before* the selftest's own verdict). ASID 1 was therefore a real, live fixture slot: when
-  that fixture exited mid-test its teardown ran `clear_handle_row(1)` → `EL0_INPUT_ACTIVE.compare_exchange(1, 0)`
+  that fixture exited mid-test its teardown ran `clear_handle_row(1)` → `USER_INPUT_ACTIVE.compare_exchange(1, 0)`
   and **revoked the focus the test had just set**. A router pass that had already enqueued the Key found no
   active target for the Mouse and returned `routed=1`. Nothing was dropped by the queue (`[uvug10] evq drop`
   stayed `0`) and nothing leaked into `GUI_CHANNEL` — the events were routed to a focus that no longer existed.
   **Real input is unaffected, and neither mechanism is a bug:** revoking focus on teardown is required (a dead
-  slot must stop receiving input), and `el0_input_set_active`'s pre-launch discard is correct for a real
+  slot must stop receiving input), and `user_input_set_active`'s pre-launch discard is correct for a real
   keystroke too (UVUG-8r2 — an event queued before an app existed was never meant for it). The defect was the
   *test's* precondition. **Fix:** make the precondition true by construction — `input_router_selftest()` now runs
   from the `start_aps` block **before the secondaries are started**, the only point in the boot where sole
@@ -582,8 +582,8 @@
   via `on_app_enter`, but nothing fed `note_progress` on the EL0 path, so a healthy polling app was declared
   wedged at 5 s and the shell was handed the keyboard back mid-run; fixed by feeding `gui_watchdog::note_progress`
   from `sys_input_poll` (see the corrected ELF-5 decision above). (2) **Router-delivery witness** — the
-  router→ring code path is verified correct (`el0_input_active()` precedence in `pump_usb_into_gui`;
-  `current_asid()` == the `el0_input_set_active` ASID both derive from `TTBR0_EL1[63:48]`), so the metal
+  router→ring code path is verified correct (`user_input_active()` precedence in `pump_usb_into_gui`;
+  `current_asid()` == the `user_input_set_active` ASID both derive from `TTBR0_EL1[63:48]`), so the metal
   no-takeover is a HID-delivery/timing question QEMU (no HID) cannot reproduce; a rate-limited
   `[el0in] routed N event(s) to active EL0 ring` line now fires the instant the router hands the active EL0 app
   real input, so the next sitting reads delivery directly instead of inferring it. (3) **Host-side typematic** —
@@ -688,7 +688,7 @@
     handle/file/input/latch clears, and for the same reason: a surviving row would name a surface inside a
     backing frame the slot's NEXT tenant gets, compositing the next program's private memory to the panel.
   - **UVUG-8 invariants preserved.** `SYS_WIN_PRESENT` and `SYS_FB_PRESENT` run one shared body, so the
-    **focus-scoped** `EL0_FOCUSED_PRESENT_COUNT` bump (under the same `EL0_INPUT_ACTIVE == asid` guard)
+    **focus-scoped** `EL0_FOCUSED_PRESENT_COUNT` bump (under the same `USER_INPUT_ACTIVE == asid` guard)
     happens for window presents too — a window verb that skipped it would hand a focused app a way to
     render forever without counting as progress, defeating the UVUG-8r2 suspension cap. Takeover latch,
     heartbeat and orphan lifecycle are untouched.
@@ -754,7 +754,7 @@
     `gui_watchdog::note_progress()` **unscoped**. A timed-out run leaves its EL0 task alive and spinning on that
     very syscall (this arch has no asynchronous kill primitive), so one timeout kept feeding the watchdog
     forever — disabling the escape hatch that hands the screen back when a *later* full-screen app wedges. Fix —
-    focus-scope it, joining the takeover heartbeat under one `EL0_INPUT_ACTIVE == asid` test; they were always
+    focus-scope it, joining the takeover heartbeat under one `USER_INPUT_ACTIVE == asid` test; they were always
     the same question. This is the part of the orphan residue that outlives the run.
   - **Mouse dead at the shell after a timeout while arrow keys still work** — **instrumented, not fixed.** The
     asymmetry's likeliest owner is `drivers::xhci`: the dup-Success guard (`mouse_expect_phys`) returns from the
@@ -831,7 +831,7 @@
     `queue_keyboard_read` are structurally identical in their `expect_phys`/`prev_phys` bookkeeping, so a
     guard mis-firing on the pointer would mis-fire on the working keyboard).
   - **Unified theory — and this arc's fixture gate is probably also the mouse fix.** The boot
-    `input_launcher` orphan held `el0_input_active()` for the *entire* boot, so the router's EL0 branch
+    `input_launcher` orphan held `user_input_active()` for the *entire* boot, so the router's EL0 branch
     (`route_input_to_active_el0`) swallowed the whole queue into a ring nothing would ever read. Keys still
     reached the shell because `input_service`'s UART path calls `gui_send` **directly** and never touches
     `EVENT_QUEUE` at all. One mechanism, no second defect, and it accounts for every observed fact including
@@ -994,7 +994,7 @@
   - **`spawn_user_image_bg`** (syscall.rs) is `run_user_image`'s front half, verbatim — same bounds, same
     console-cap endowment, same EXEC1-M asid-before-spawn publish order (the SYS_EXIT rescue arm covers the
     same mid-publish window here, correctly) — and then RETURNS `(pid, asid, entry)` instead of waiting.
-    Deliberate non-inheritances: no `el0_input_set_active` (focus stays put; the operator TABs into a bg
+    Deliberate non-inheritances: no `user_input_set_active` (focus stays put; the operator TABs into a bg
     window, which resets its ring exactly as the foreground path does), and no deadline/UVUG-8 machinery
     (nothing waits, so nothing can strand the SHELL; and — stated plainly, lens-corrected — NOTHING bounds
     a bg app: no deadline, no watchdog, no compositor cap. `kill <pid>` is the sole remedy, which is why
@@ -1608,9 +1608,9 @@
     EL0. Kernel draws border + title strip and nothing else. A refused create makes every repaint a
     no-op, so the bus witnesses never depend on the compositor. Fitting the 4 KiB flat-blob code page
     moved `crates/user-blob`'s release profile from `opt-level = "s"` to `"z"` (3792 B).
-  - **TAB is the window system's key.** Reserved at `el0_input_enqueue` (the single router→ring choke
+  - **TAB is the window system's key.** Reserved at `user_input_enqueue` (the single router→ring choke
     point, so no app can withhold it) whenever two or more windows are in `wm::focus_ring`; it advances
-    `EL0_INPUT_ACTIVE` to the next owner ASID in window-id order via `el0_input_set_active`, so the ring
+    `USER_INPUT_ACTIVE` to the next owner ASID in window-id order via `user_input_set_active`, so the ring
     reset, the takeover-latch clear and the UVUG-8 cap all keep working per window. The matching KeyUp is
     swallowed with it. Fewer than two windows: TAB is delivered as an ordinary key. The ring carries one
     slot beyond the windows — **the shell** (focus 0) — so tabbing into a window is not a trap. WC-C
@@ -1898,7 +1898,7 @@
   movement produced **no cursor motion at all** until the operator focused the shell window; from that moment
   the pointer was alive for the rest of the boot. The cause is a **self-disabling predicate** in the EL0 input
   router, and the chain is short enough to state in full:
-  1. `pump_usb_into_gui` (`main.rs:2503`) branches on `el0_input_active() != 0` **first**. With a windowed EL0
+  1. `pump_usb_into_gui` (`main.rs:2503`) branches on `user_input_active() != 0` **first**. With a windowed EL0
      app focused — the ordinary desktop state after `run` / `bg` — every drained pal event goes to
      `route_input_to_active_el0` and the function `return`s. `render_service`'s `Event::Mouse` /
      `Event::MouseAbsolute` arms (`main.rs:3122` / `3135`) — the `pal::cursor::move_rel` callers on the Pi's
@@ -1912,9 +1912,9 @@
      set the latch were unreachable: the shell arms by (1), the router arm by its own gate. The predicate
      could only become true through a path it had itself disabled — the shared pointer position never moved,
      `cursor::visible()` stayed false, and `video::cursor::repaint` drew nothing. Reports were **not lost**:
-     `el0_input_enqueue` delivered them and `[el0in] routed N event(s) to active EL0 ring` fired throughout.
+     `user_input_enqueue` delivered them and `[el0in] routed N event(s) to active EL0 ring` fired throughout.
      What was dead was the *system cursor*, not the routing.
-  4. TAB to the shell → `el0_input_set_active(0)` → the next pump pass takes the bare-shell drain →
+  4. TAB to the shell → `user_input_set_active(0)` → the next pump pass takes the bare-shell drain →
      `gui_send` → `render_service`'s ungated `move_rel` → latch stamped. `has_reported()` is true from then
      on, so the router's keep-alive works for the rest of the boot. Exactly the observed "dead, then alive".
 
@@ -1931,7 +1931,7 @@
   **Audited and deliberately NOT fixed here — click-to-focus does not exist.** The brief's second half
   ("clicks should focus-raise what is under the cursor") is not a regression; it was never built. Focus
   changes have exactly three sources: `run_user_image`'s grant and clear
-  (`arch/aarch64/syscall.rs:7034` / `7175`) and the TAB ring (`wc_shell_focus_key` → `el0_input_set_active`
+  (`arch/aarch64/syscall.rs:7034` / `7175`) and the TAB ring (`wc_shell_focus_key` → `user_input_set_active`
   → `wm::focus_changed`, `syscall.rs:11777`). The pointer-button path has **no window hit-test at all** —
   while an EL0 app holds focus a `Button` goes straight into its ring via `route_input_to_active_el0`, and on
   the shell path `click1_dispatch` (`main.rs:3022`) hit-tests only *console vs status strip*
@@ -1973,7 +1973,7 @@
 
   **The routing rule (`arch/aarch64/syscall.rs::wc_click_route`), on a PRESS edge:**
     - **hit on a DIFFERENT window than the focused one** → raise it first through the *one* focus
-      primitive that exists — `el0_input_set_active` then `wm::focus_changed`, in that order, exactly as
+      primitive that exists — `user_input_set_active` then `wm::focus_changed`, in that order, exactly as
       `wc_focus_key` calls them — then let the press fall through to the enqueue, which re-reads the now
       **new** active ASID and delivers there. No second focus path was invented: this is a new **caller**
       of the WEDGE path, so a click-driven raise emits the same `<F1>`–`<F9>` breadcrumbs a TAB does.
@@ -1998,17 +1998,17 @@
   release; it never fabricates one in a second app. The router keeps its **own** previous-mask tracker
   rather than sharing `main.rs`'s `CLICK1_PREV_MASK`: that one belongs to `click1_dispatch` and only ever
   sees the events that actually *reach* the shell. `wc_click_route` is idempotent per edge (the mask is
-  swapped on entry), which is what lets the shell caller re-enter it through `el0_input_enqueue`.
+  swapped on entry), which is what lets the shell caller re-enter it through `user_input_enqueue`.
 
   **Two callers, one body,** mirroring `wc_focus_key` / `wc_shell_focus_key`:
-    - `el0_input_enqueue` — the single choke point every event bound for an EL0 ring passes through, right
+    - `user_input_enqueue` — the single choke point every event bound for an EL0 ring passes through, right
       after the TAB interception and for the same reason. A consumed click returns `false` (**not**
       queued), so `[el0in] routed N` stays truthful.
     - the **bare-shell drain** in `pump_usb_into_gui` — click-to-focus from the shell slot, where today a
       click on a live `bg` app's window does nothing at all. On a raise it delivers the press itself and
       **breaks** the loop, exactly as the TAB interception breaks: that loop's destination is fixed at
       `gui_send` but focus has just moved. The press is delivered *there* rather than left for the next
-      pump pass because `el0_input_set_active` drains `pal::EVENT_QUEUE` as part of granting focus (the
+      pump pass because `user_input_set_active` drains `pal::EVENT_QUEUE` as part of granting focus (the
       UVUG-8r2 "a fresh focus starts clean" contract), so an event left behind would not survive the raise.
 
   **Untouched by construction:** the TAB ring and both run-grant focus sources; `focus_changed` and the
@@ -2046,7 +2046,7 @@
       with `QEMU_EFI-pflash.raw` bridged from `/run/host` — 4202 serial lines, **0 FAIL, 0 panic**, boot
       complete through `block:up`, `MOUSE-1` enumerating the `usb-tablet`. It is a no-regression leg by
       construction as well as by observation: the routing changes live in the Pi router
-      (`pump_usb_into_gui`, `baremetal`-gated) and in `el0_input_enqueue`, which has no caller on virt, and
+      (`pump_usb_into_gui`, `baremetal`-gated) and in `user_input_enqueue`, which has no caller on virt, and
       the window-verb witness block that hosts `hittest_selftest` does not run there at all.
     - **Metal is what proves the arc.** QEMU raspi4b delivers no HID, so no real `Button` exists on any
       gate boot and **every routing arm above is unverified in QEMU by nature**; the gates prove the
@@ -2061,7 +2061,7 @@
   **CLICK-SHELL (P71, attended).** "A miss does not move focus" left the out-of-focus vug holding the
   keyboard while the operator was demonstrably interacting with the shell, and left `TAB` as the only
   gesture that reaches the console at all. The miss arm now does what the hit arm does with the shell as
-  the target: the one focus primitive, `el0_input_set_active(0)` then `wm::focus_changed(0)`, which is
+  the target: the one focus primitive, `user_input_set_active(0)` then `wm::focus_changed(0)`, which is
   literally the shell slot of `wc_focus_key`'s ring — no second shell-focus state. The burial of every
   window under the console is the intended effect and is the same z-order move `TAB`-to-shell has always
   made. The press stays **consumed** (`CLICK_TARGET_DROP`, so the release is dropped with it): a
@@ -2091,7 +2091,7 @@
 
   **Witness.** `hittest_selftest` gains **leg 7, `bare=`** — the same press from a focus that owns
   nothing (synthetic ASID `0xC0C`, never passed to `create`), asserting the press is consumed **and**
-  both halves of the focus primitive moved to the shell (`el0_input_active() == 0` *and* `FOCUS_ASID ==
+  both halves of the focus primitive moved to the shell (`user_input_active() == 0` *and* `FOCUS_ASID ==
   0`); `skip` when a compat row is live, since that is the arm it must not assert against. Leg 6
   (`shell=`) covers the windowed focus and passed on every gate boot for the whole time the bench could
   not click into the shell — leg 7 is the honesty repair. Verified by reverting the predicate alone:
@@ -2132,19 +2132,19 @@
 
   **What the swallow does *not* touch — the restore chain.** Both VUGPAUSE-2r2 wake edges fire *before*
   the consume decision, from inside the two calls the arm already made: the focus arrival
-  (`el0_input_set_active` → `el0_input_wake_edge(asid, "focus")`) and the unhide (`wm::focus_changed` →
-  `set_hidden(asid, false)` → `el0_input_wake_edge(asid, "unhide")`). The swallow withholds a **ring
+  (`user_input_set_active` → `user_input_wake_edge(asid, "focus")`) and the unhide (`wm::focus_changed` →
+  `set_hidden(asid, false)` → `user_input_wake_edge(asid, "unhide")`). The swallow withholds a **ring
   push** and nothing else, so a press on a parked, hidden, unfocused vug still produces the `[vugpause2]
   resume` pair and still re-readies the waiter — the vug wakes, observes its own restore, and is simply
   not handed a click. A fix that consumed the press *early* would have passed every behavioural check and
   reintroduced P72 in a worse form (the vug would not come back at all), which is why the witness asserts
   this edge and not only the delivery.
 
-  **Both callers converge without a second decision.** The EL0-focus path (`el0_input_enqueue`) reads
+  **Both callers converge without a second decision.** The EL0-focus path (`user_input_enqueue`) reads
   `true` and returns "not queued". The **shell** path (`main.rs`'s `Button` arm) reads `true` and
   `continue`s its drain — which lands it exactly where its old `break` did, because
-  `el0_input_set_active` has already drained `EVENT_QUEUE` as part of granting focus, so the loop finds
-  nothing behind the press either way. `main.rs` is unchanged; its `el0_input_active() != before` arm is
+  `user_input_set_active` has already drained `EVENT_QUEUE` as part of granting focus, so the loop finds
+  nothing behind the press either way. `main.rs` is unchanged; its `user_input_active() != before` arm is
   now unreachable and left standing as the defensive check it was.
   UVUG's click-to-exit and the compat row are untouched: `hit_test` excludes compat rows and owner-0
   rows, so a full-screen app still reads as *no hit* and still takes the miss arm's deliver exemption.
@@ -2154,14 +2154,14 @@
   directions: `swallow=` (an unfocused hit moves focus **and** the owner's ring depth stays 0, checked
   after the press *and* after the release), `deliver=` (the very next press, now on that focused window,
   *is* queued and the ring depth is 1), `wake=` (the named-edge counter advanced by 2 across the
-  swallowed press — focus arrival, then unhide). Two new read-only seams carry it: `el0_input_depth(asid)`
+  swallowed press — focus arrival, then unhide). Two new read-only seams carry it: `user_input_depth(asid)`
   (unread events in a ring — the only honest way to ask what the *app* got, as opposed to what the
-  *router* decided) and `el0_input_wake_edges()` (cumulative named wake edges *asked for*, which is the
-  question a headless gate can answer; `EL0_INPUT_WAKES` counts waiters actually released and is always
+  *router* decided) and `user_input_wake_edges()` (cumulative named wake edges *asked for*, which is the
+  question a headless gate can answer; `USER_INPUT_WAKES` counts waiters actually released and is always
   0 there). Leg 8 is the only leg needing a real private-slot ASID — rings exist only for slots — so it
   borrows the **highest** slot (8, the last one a live app would hold), skips if that slot holds focus or
   owns a window, and hands it back reset. It places its window **under** the live cursor rather than
-  moving the pointer, and drives `el0_input_enqueue` rather than `wc_click_route`, since the claim is
+  moving the pointer, and drives `user_input_enqueue` rather than `wc_click_route`, since the claim is
   about delivery and the push lives on the far side of the router.
 
   **Gates:** `./arroyo check` ✅ x86_64 / ✅ aarch64 (and with `UNAOS_WITNESS=1`); `./arroyo kernel8-test`
@@ -2488,7 +2488,7 @@
     input path, on several cores, and the P73 capture shows the UART overrun mid-line in exactly those
     bursts (`resu<e7>sid=1`, `[f8>fv]`, `<fu>pause2]`). The print is now paced per ASID on powers of two
     (1st, 2nd, 4th, 8th, …) and carries `n=<cumulative resumes for this ASID>` so elisions are
-    countable. **Counters are unchanged** — `EL0_INPUT_WAKES`, and therefore the `[vugpause2]
+    countable. **Counters are unchanged** — `USER_INPUT_WAKES`, and therefore the `[vugpause2]
     blocked=/wakes=` rollup, still counts every resume. The pacing counter is per-ASID (a global cadence
     would let a busy vug silence a newly launched one's first resume) and is reset only by slot teardown.
   - **Headless gate:** unchanged. `[wc-fv] focus-vis`'s four legs are framebuffer read-backs of z-order
@@ -2511,11 +2511,11 @@
     `input_futex_key(asid)` = `(1 << 63) | asid`. A `sys_futex` key is the PHYSICAL address of an EL0
     word and a PA is < 2^40 here, so bit 63 puts every input key in a space no user word can name — an
     EL0 program cannot forge one and reach another process's ring. The compare word is the ring's own
-    `TAIL`, read at EL1 under the bucket lock that `el0_input_push`'s wake must take, which is what makes
+    `TAIL`, read at EL1 under the bucket lock that `user_input_push`'s wake must take, which is what makes
     the wait race-free against the router.
-  - **Three wake edges, each load-bearing.** `el0_input_push` (the event itself — this is the
+  - **Three wake edges, each load-bearing.** `user_input_push` (the event itself — this is the
     latency-critical one, and it makes the vug re-ready in the same pass the router runs, sooner than the
-    yield loop could act); `el0_input_set_active` (a focus ARRIVAL, which RESETS the ring rather than
+    yield loop could act); `user_input_set_active` (a focus ARRIVAL, which RESETS the ring rather than
     filling it, so nothing else would move `TAIL`); and `set_hidden(asid, false)` (an UNHIDE — the hidden
     bit lives in the info page, so becoming visible touches no ring at all).
   - **The workers had to go too.** A vug is one parent and TWO workers, and the workers yield-polled
@@ -2559,10 +2559,10 @@
   was doing its job (`[clickroute] press hit asid=3 win=3 (was 2)` on the stopped vugs) and that parking
   and most waking worked (`blocked=` and `wakes=` tracking closely), which is what made it look like a
   routing or compositing fault rather than the one-store bug it was.
-  - **Root cause: a stale-CLEAR of the park hint, by the focus arrival itself.** `EL0_INPUT_PARKED[asid]`
-    is the "someone is parked on this ring" flag, and `el0_input_wake` returns early when it is clear — so
+  - **Root cause: a stale-CLEAR of the park hint, by the focus arrival itself.** `USER_INPUT_PARKED[asid]`
+    is the "someone is parked on this ring" flag, and `user_input_wake` returns early when it is clear — so
     it gates **every** wake edge, not merely the backstop that VUGPAUSE-2 described as its only consumer.
-    `clear_input_row` cleared it, and `el0_input_set_active` calls `clear_input_row` on a focus **arrival**
+    `clear_input_row` cleared it, and `user_input_set_active` calls `clear_input_row` on a focus **arrival**
     — precisely the moment a parked, backgrounded vug is being handed the keyboard. The arrival therefore
     wiped the flag microseconds before its own wake read it; the wake took the fast path and released
     nobody, and so did `focus_changed`'s unhide and the press enqueue that followed. The backstop, gated on
@@ -2573,12 +2573,12 @@
     legitimately clears it — slot teardown, where the parker `exit()`s out of `futex_wait`'s pre-park kill
     boundary and never reaches its own clear — calls the new `clear_input_parked` explicitly. The
     invariant is now stated where the flag lives: **set by the parker before parking, cleared by the
-    parker on return or by teardown, and by nothing else.** (2) `el0_input_wake_backstop` no longer reads
+    parker on return or by teardown, and by nothing else.** (2) `user_input_wake_backstop` no longer reads
     the hint at all — it wakes all eight slot keys unconditionally. A backstop that can be disabled by the
     bug it exists to survive is not a backstop; unconditional costs ~31 `futex_wake` calls a second on
     keys that are almost always empty, and it caps this entire failure class at one ~256 ms period instead
     of forever. (3) The two operator-rate edges name themselves on the wire.
-  - **Why both the focus and the unhide edge are needed.** `wc_click_route` calls `el0_input_set_active`
+  - **Why both the focus and the unhide edge are needed.** `wc_click_route` calls `user_input_set_active`
     *then* `wm::focus_changed`, so the focus wake fires while the vug's hidden bit may still be set: the
     woken vug re-reads its flags word, finds itself frozen, and re-parks. The unhide wake is the one that
     fires after the flags word says visible, and the press enqueue behind it moves `TAIL`, so a vug
@@ -2745,7 +2745,7 @@
   That is P75 exactly.
 
   **Change 1 — the router delivers the focus-changing press (`wc_click_route`, hit arm).** The arm keeps
-  its order and loses its swallow: `el0_input_set_active(owner)` then `wm::focus_changed(owner)` (both
+  its order and loses its swallow: `user_input_set_active(owner)` then `wm::focus_changed(owner)` (both
   wake edges — focus arrival and unhide — fire *first*, so a parked, hidden vug is re-readied before
   anything is pushed), then it records the **raised owner** in `CLICK_PRESS_TARGET` and returns `false`.
   Both callers' normal paths now address the new focus, so the press lands in the raised window's ring
@@ -2980,7 +2980,7 @@ Conventions shared across arches:
   | 24 | `SYS_FB_MAP` | — | surface VA / `-errno` | aarch64 **ELF-3** — maps the process's off-screen surface (EL0-RW) + RO info page; EL0 never gets the scan-out |
   | 25 | `SYS_FB_PRESENT` | — | 0 / `-errno` | aarch64 **ELF-3** — kernel composites the surface to the screen (present hook); records the surface checksum |
   | 26 | `SYS_FUTEX` | uaddr, op, val | op-specific / `-errno` | aarch64 **ELF-3** — op 0 WAIT (block iff `*uaddr==val`), op 1 WAKE (wake ≤`val`); phys-addr-keyed wait queue |
-  | 27 | `SYS_INPUT_POLL` | — | packed event ≥ 0 / `-EAGAIN` | aarch64 **ELF-5** — nonblocking next input event for the caller (packed u64: `[55:48]`=type, low 32=payload), `-EAGAIN` when its per-process ring is empty; the router fills the ACTIVE process's ring via `el0_input_enqueue` |
+  | 27 | `SYS_INPUT_POLL` | — | packed event ≥ 0 / `-EAGAIN` | aarch64 **ELF-5** — nonblocking next input event for the caller (packed u64: `[55:48]`=type, low 32=payload), `-EAGAIN` when its per-process ring is empty; the router fills the ACTIVE process's ring via `user_input_enqueue` |
   | 28 | *(reserved)* | — | — | `SYS_INPUT_WAIT` — DEFERRED blocking twin of 27; the number stays unused |
   | 29 | `SYS_WIN_CREATE` | w, h | win id ≥ 0 / `-errno` | aarch64 **WC-B** — allocate a window owned by the caller's ASID and map its negotiated (page-multiple) ARGB8888 surface; `w`,`h` ∈ 1..=128; `-EINVAL` bad geometry / no per-process slot, `-EMFILE` the caller used all 8 of its own region slots, `-ENFILE` the global 8-window table is full |
   | 30 | `SYS_WIN_PRESENT` | win | 0 / `-errno` | aarch64 **WC-B** — damage-mark + composite the window; `-EBADF` unknown/free id, `-EACCES` owned by another ASID. Bumps the focus-scoped present counter under the same focus guard as `SYS_FB_PRESENT` (the UVUG-8r2 cap reads it) |

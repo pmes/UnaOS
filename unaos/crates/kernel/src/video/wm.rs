@@ -1149,7 +1149,7 @@ pub fn info(id: WinId) -> Option<WindowInfo> {
 /// still uses the compat path keeps whatever focus the launcher gave it.
 ///
 /// A snapshot, never a handle — the caller re-validates before acting on it. Used by the syscall layer's
-/// tab-cycle to pick the next `EL0_INPUT_ACTIVE`; nothing in this module reads input state.
+/// tab-cycle to pick the next `USER_INPUT_ACTIVE`; nothing in this module reads input state.
 pub fn focus_ring(out: &mut [u64; MAX_WINDOWS]) -> usize {
     let t = table();
     let mut n = 0usize;
@@ -1234,7 +1234,7 @@ pub fn hit_test(x: i32, y: i32) -> Option<(WinId, u64, u32)> {
 }
 
 /// FOCUS-VIS — **make a focus change VISIBLE.** The one seam the focus owner calls after
-/// `el0_input_set_active`; `asid == 0` means the SHELL slot of the ring.
+/// `user_input_set_active`; `asid == 0` means the SHELL slot of the ring.
 ///
 /// ### Why this exists (P59, bench)
 /// WC-C shipped the tab-cycle as an input-routing change and nothing else: `[wc-c] focus tab-cycle`
@@ -1524,7 +1524,7 @@ pub fn repaint() {
     // Focus lives in the baremetal user input router (syscall.rs is baremetal-gated); elsewhere 0
     // means every compat row repaints, which is vacuous there (compat_present is unreachable).
     #[cfg(feature = "baremetal")]
-    let focused = crate::arch::syscall::el0_input_active();
+    let focused = crate::arch::syscall::user_input_active();
     #[cfg(not(feature = "baremetal"))]
     let focused: u64 = 0;
     {
@@ -6490,7 +6490,7 @@ static HT_SURF: [u32; 64] = [0x0020_C080; 64];
 /// focus; read the REAL cursor; bail out (`None` — asserted nothing) if the pointer happens to be over
 /// a live window, since then the press is a HIT and this leg has no fixture; otherwise drive one PRESS
 /// edge and check the three things P71 asks for — the press is CONSUMED, focus is now the SHELL
-/// (`el0_input_active() == 0`), and the previously focused window is BELOW the shell, which is what
+/// (`user_input_active() == 0`), and the previously focused window is BELOW the shell, which is what
 /// makes the shell focus the same state VUGMIN idles the fleet from.
 ///
 /// One RELEASE edge follows, so the router's press/release tracker is left exactly as it was found: a
@@ -6503,9 +6503,9 @@ fn clickshell_leg(asid: u64, ix: i32, iy: i32, w: i32, h: i32) -> Option<bool> {
     if hit_test(cx, cy).is_some() {
         return None; // pointer parked over a window: that is the HIT arm, not the desktop arm
     }
-    sc::el0_input_set_active(asid);
+    sc::user_input_set_active(asid);
     let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
-    let refocused = sc::el0_input_active() == 0;
+    let refocused = sc::user_input_active() == 0;
     let buried = hit_test(ix, iy).is_none();
     let _ = sc::wc_click_route(crate::pal::Event::Button(0));
     Some(consumed && refocused && buried)
@@ -6530,9 +6530,9 @@ fn clickshell_leg(asid: u64, _ix: i32, _iy: i32, _w: i32, _h: i32) -> Option<boo
 /// nothing on the panel and the shell was reachable only by cycling the entire TAB ring.
 ///
 /// `asid` is a synthetic owner of nothing. The fixture is `focus_changed(asid)` (which raises no
-/// window — it only publishes `FOCUS_ASID`) plus `el0_input_set_active(asid)`, so BOTH halves of the
+/// window — it only publishes `FOCUS_ASID`) plus `user_input_set_active(asid)`, so BOTH halves of the
 /// focus primitive name a windowless owner; the leg then drives one PRESS edge and requires the press
-/// to be CONSUMED and both halves to have moved to the shell (`el0_input_active() == 0` **and**
+/// to be CONSUMED and both halves to have moved to the shell (`user_input_active() == 0` **and**
 /// `FOCUS_ASID == 0`), which is precisely the state a TAB-to-shell leaves. Checking `FOCUS_ASID` as
 /// well as the router's active ASID is the point: "focus moved" means the routing half and the VISIBLE
 /// half both moved, and a fix that did only the first would read as focused and look unfocused.
@@ -6547,9 +6547,9 @@ fn clickshell_windowless_leg(asid: u64) -> Option<bool> {
         return None; // a full-screen app owns the panel: the deliver arm, not this leg's fixture
     }
     focus_changed(asid); // no window to raise — this only names the windowless owner
-    sc::el0_input_set_active(asid);
+    sc::user_input_set_active(asid);
     let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
-    let refocused = sc::el0_input_active() == 0;
+    let refocused = sc::user_input_active() == 0;
     let visible = FOCUS_ASID.load(core::sync::atomic::Ordering::Acquire) == 0;
     let _ = sc::wc_click_route(crate::pal::Event::Button(0));
     Some(consumed && refocused && visible)
@@ -6571,7 +6571,7 @@ fn clickshell_windowless_leg(_asid: u64) -> Option<bool> {
 /// the router has to get right at once, and the ORDER between the first and third is the whole content:
 ///  * **hit** — a press on an UNFOCUSED window moves focus AND is delivered WHOLE to the raised owner's
 ///    ring: depth 1 after the press, depth 2 after the release. The ring is the only honest place to ask
-///    that question ([`el0_input_depth`]); the router's return value says what the ROUTER decided, not
+///    that question ([`user_input_depth`]); the router's return value says what the ROUTER decided, not
 ///    what the app got, and the two are what the whole seam sits between. Checking the release as well
 ///    as the press is what pins [`CLICK_PRESS_TARGET`] to the RAISED owner rather than the sentinel — a
 ///    press delivered with a dropped release is the half-click that tracker exists to prevent, in the
@@ -6581,11 +6581,11 @@ fn clickshell_windowless_leg(_asid: u64) -> Option<bool> {
 ///  * **wake** — the delivered press still runs the VUGPAUSE-2r2 restore chain, and runs it BEFORE the
 ///    push. A router that queued the press first and moved focus after would pass the first two checks
 ///    and strand a PARKED vug: the click would land in the ring of the app that was focused a moment
-///    ago. `el0_input_wake_edges` counts the NAMED edges the seam was asked to run, so this reads 2
+///    ago. `user_input_wake_edges` counts the NAMED edges the seam was asked to run, so this reads 2
 ///    (focus arrival, then unhide) regardless of whether anything was parked — which matters, since on
 ///    a headless gate nothing ever is.
 ///
-/// Drives [`crate::arch::aarch64::syscall::el0_input_enqueue`] rather than `wc_click_route`, because
+/// Drives [`crate::arch::aarch64::syscall::user_input_enqueue`] rather than `wc_click_route`, because
 /// the claim is about DELIVERY and the push lives on the far side of the router. The window is placed
 /// UNDER the real cursor (the router hit-tests the live pointer, so the fixture moves the window, not
 /// the pointer); `None` = not asserted, when the pointer sits somewhere this leg cannot build that
@@ -6603,7 +6603,7 @@ fn clickplain_leg(owner: u64, other: u64, surf: usize, len: usize) -> Option<(bo
     // `owner` is a REAL private-slot ASID (it must be, or it would have no ring at all), so unlike
     // ASID_A/B it could in principle name a LIVE app. Borrow it only if nothing is using it: it holds
     // no input focus and owns no window in the table.
-    if sc::el0_input_active() == owner {
+    if sc::user_input_active() == owner {
         return None;
     }
     let mut ring = [0u64; MAX_WINDOWS];
@@ -6639,27 +6639,27 @@ fn clickplain_leg(owner: u64, other: u64, surf: usize, len: usize) -> Option<(bo
     // --- hit: an UNFOCUSED hit. A focus arrival resets the ring, so `owner` starts empty; focus then
     // moves to `other` (a synthetic ASID outside the slot range — it clears no ring and runs no wake
     // edge of its own, so the baseline below is clean).
-    sc::el0_input_set_active(owner);
-    sc::el0_input_set_active(other);
-    let edges0 = sc::el0_input_wake_edges();
-    let queued = sc::el0_input_enqueue(Button(1));
-    let depth_press = sc::el0_input_depth(owner);
-    let refocused = sc::el0_input_active() == owner;
-    let edges1 = sc::el0_input_wake_edges();
-    let _ = sc::el0_input_enqueue(Button(0));
-    let depth_release = sc::el0_input_depth(owner);
+    sc::user_input_set_active(owner);
+    sc::user_input_set_active(other);
+    let edges0 = sc::user_input_wake_edges();
+    let queued = sc::user_input_enqueue(Button(1));
+    let depth_press = sc::user_input_depth(owner);
+    let refocused = sc::user_input_active() == owner;
+    let edges1 = sc::user_input_wake_edges();
+    let _ = sc::user_input_enqueue(Button(0));
+    let depth_release = sc::user_input_depth(owner);
     let hit = queued && refocused && depth_press == 1 && depth_release == 2;
     let woke = edges1.wrapping_sub(edges0) >= 2;
 
     // --- deliver: the SAME window, now focused (the press above left focus here). Ordinary app input,
     // and it must stack on the pair already in the ring rather than replace it.
-    let queued2 = sc::el0_input_enqueue(Button(1));
-    let delivered = queued2 && sc::el0_input_depth(owner) == 3;
-    let _ = sc::el0_input_enqueue(Button(0));
+    let queued2 = sc::user_input_enqueue(Button(1));
+    let delivered = queued2 && sc::user_input_depth(owner) == 3;
+    let _ = sc::user_input_enqueue(Button(0));
 
     close(w);
-    sc::el0_input_set_active(owner); // the one primitive that resets a ring — leave the slot clean
-    sc::el0_input_set_active(0);
+    sc::user_input_set_active(owner); // the one primitive that resets a ring — leave the slot clean
+    sc::user_input_set_active(0);
     focus_changed(0);
     Some((hit, delivered, woke))
 }
@@ -6728,23 +6728,23 @@ fn closebox_leg(owner: u64, surf: usize, len: usize) -> Option<bool> {
     }
     move_to(w, x as usize, y as usize);
     focus_changed(owner); // raise it above the fixture rows the earlier legs left behind
-    sc::el0_input_set_active(owner); // the closed owner also holds focus: the arm must hand it back
+    sc::user_input_set_active(owner); // the closed owner also holds focus: the arm must hand it back
     // Fixture validity: the pointer must address THIS window, in its CLOSE BOX.
     if hit_test(cx, cy).map(|(i, a, _)| (i, a)) != Some((w, owner)) || !close_box_hit(w, cx, cy) {
         close(w);
-        sc::el0_input_set_active(0);
+        sc::user_input_set_active(0);
         focus_changed(0);
         return None;
     }
     let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
     let gone = info(w).is_none();
-    let refocused = sc::el0_input_active() == 0;
+    let refocused = sc::user_input_active() == 0;
     let _ = sc::wc_click_route(crate::pal::Event::Button(0));
     // The router's close arm already dropped focus to the shell (asserted above); nothing to clean
     // beyond making sure a FAILED close does not leak the row.
     if !gone {
         close(w);
-        sc::el0_input_set_active(0);
+        sc::user_input_set_active(0);
         focus_changed(0);
     }
     Some(consumed && gone && refocused)
@@ -6803,21 +6803,21 @@ fn closebox_real_leg(w: WinId, owner: u64) -> Option<bool> {
     }
     move_to(w, x as usize, y as usize);
     focus_changed(owner);
-    sc::el0_input_set_active(owner);
+    sc::user_input_set_active(owner);
     if hit_test(cx, cy).map(|(i, a, _)| (i, a)) != Some((w, owner)) || !close_box_hit(w, cx, cy) {
-        sc::el0_input_set_active(0);
+        sc::user_input_set_active(0);
         focus_changed(0);
         return None; // fixture invalid; the battery's `close(wa)` still owns the row
     }
     let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
     let gone = info(w).is_none();
     let settle_ok = sc::wc_close_last_settle() == sc::CLOSE_SETTLE_NOPROC_SELFTEST;
-    let refocused = sc::el0_input_active() == 0;
+    let refocused = sc::user_input_active() == 0;
     let _ = sc::wc_click_route(crate::pal::Event::Button(0));
     if !gone {
         // A FAILED close must not change who owns the cleanup: hand focus back and leave the row
         // to the battery's tail.
-        sc::el0_input_set_active(0);
+        sc::user_input_set_active(0);
         focus_changed(0);
     }
     Some(consumed && gone && settle_ok && refocused)

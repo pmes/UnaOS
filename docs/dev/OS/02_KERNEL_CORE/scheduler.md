@@ -1506,7 +1506,7 @@ kernel services and the BSP calls `sched::run_bsp(0)`.
 | --- | --- | --- |
 | `x86_usb_pump` | `online_aps().last()` | The xHCI service family, `fat::probe_once`, the boot-ledger / flight-recorder pumps, the witness probe ladder, `e1000::service_net`. Touches no pixel. `sleep_ticks(1)` ≈ 1 ms — the same floor the old `hlt()`-paced loop had. |
 | `x86_input_service` | `online_aps().last()` | Drains `pal::EVENT_QUEUE` and forwards every event over `GUI_CHANNEL_X86`. Paints nothing, routes nothing. Also emits the 250 ms `Event::Timer` pulse. |
-| `x86_render_service` | `online_aps().first()` | Every pixel: builds its own `Screen`/`TargetPal`/`Console`, runs `wc_click_route` → `el0_input_route` → `handle_key`, the cursor sprite, CURSOR-HIDE, `pal.render()`. The shell runs here. |
+| `x86_render_service` | `online_aps().first()` | Every pixel: builds its own `Screen`/`TargetPal`/`Console`, runs `wc_click_route` → `user_input_route` → `handle_key`, the cursor sprite, CURSOR-HIDE, `pal.render()`. The shell runs here. |
 
 **`run_bsp(cpu)`** takes the caller's index for parity with the aarch64 twin and
 asserts it against `percpu::this_cpu()`; the body is `run()` (x86's `run` derives

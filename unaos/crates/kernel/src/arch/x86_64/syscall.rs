@@ -3279,12 +3279,12 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // this verb negotiated) — never a recomputed `h * stride`. That distinction is wm's F1 extent
     // contract: `w`/`h`/`stride` are ring-3-influenced, `pages` comes from the mapping code, and it is
     // `surf_len` that bounds every source read the compositor performs.
-    // CLICK-X86 — the compositor owner is `slot + 1`, the SAME `+1` bias `EL0_INPUT_ACTIVE` carries,
+    // CLICK-X86 — the compositor owner is `slot + 1`, the SAME `+1` bias `USER_INPUT_ACTIVE` carries,
     // and for the same reason stated there: x86 slot 0 is a REAL address space, so an unbiased owner
     // of 0 is indistinguishable from wm's "nobody owns this row". Unbiased, the first program to
     // launch got a window that `hit_test` skipped (`owner_asid == 0`) and `focus_ring` skipped, i.e.
     // it could be neither clicked nor tabbed to — silently, and only for slot 0. Biased, the value
-    // `hit_test` returns is the value the router compares against `EL0_INPUT_ACTIVE` with no
+    // `hit_test` returns is the value the router compares against `USER_INPUT_ACTIVE` with no
     // conversion at the one seam that decides who receives a keystroke.
     e.wm_id = wc_shim::create(
         (slot as u64) + 1,
@@ -3314,14 +3314,14 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // windowed app launched behind a focused one does not take the keyboard from it, so a background
     // program cannot arrange to receive keystrokes aimed at the window in front of it — which is the
     // property the producer-side focus gate exists to guarantee. Focus returns to the shell when the
-    // holder's slot is torn down (`el0_input_revoke_slot`), so the next app launched after that one
+    // holder's slot is torn down (`user_input_revoke_slot`), so the next app launched after that one
     // exits is focusable in turn. A real focus RING — click-to-focus, a reserved cycling key — is the
     // follow-on arc, and it will replace this rule rather than build on it.
-    if EL0_INPUT_ACTIVE
+    if USER_INPUT_ACTIVE
         .compare_exchange(0, (slot as u64) + 1, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        clear_input_row(slot); // a fresh focus starts clean, exactly as `el0_input_set_active` does
+        clear_input_row(slot); // a fresh focus starts clean, exactly as `user_input_set_active` does
         serial_println!(":: wc-x86: input focus -> slot {} (first window, shell was idle) ::", slot);
     }
     serial_println!(
@@ -3420,7 +3420,7 @@ mod wc_shim {
     /// concerned (its surface is mapped and its own), it simply has no compositor row, so presents are
     /// accounted and dropped. That is the fail-closed direction — nothing extra is exposed to ring 3 — and
     /// it keeps a headless run (no panel, `wm` never ready) from failing a program that only draws.
-    /// CLICK-X86: `owner` is the `+1`-BIASED slot (`slot + 1`), matching `EL0_INPUT_ACTIVE`, so that
+    /// CLICK-X86: `owner` is the `+1`-BIASED slot (`slot + 1`), matching `USER_INPUT_ACTIVE`, so that
     /// `wm::hit_test`'s answer is directly comparable with the input focus and slot 0's windows are
     /// not mistaken for wm's ownerless rows.
     pub fn create(
@@ -3460,7 +3460,7 @@ mod wc_shim {
 //
 // SHAPE. The kernel holds a small per-SLOT ring of packed events. The router — the shell's own event
 // drain, which is the single place every HID event on this arch passes through — offers each drained
-// event to `el0_input_route`, which forwards it into the FOCUSED process's ring or hands it back for
+// event to `user_input_route`, which forwards it into the FOCUSED process's ring or hands it back for
 // the shell to consume. Ring 3 drains its own ring nonblocking through `SYS_INPUT_POLL`. One producer
 // (the single router drain) and one consumer (the owning ring-3 task) per ring, so the ring is a
 // lock-free SPSC: free-running head/tail, occupancy = `tail - head`.
@@ -3495,13 +3495,13 @@ const INPUT_RING_CAP: usize = 32;
 
 /// The per-process input rings, keyed by address-space SLOT. One producer (the router) + one consumer
 /// (the owning ring-3 task) per ring => lock-free SPSC.
-static EL0_INPUT_BUF: [[AtomicU64; INPUT_RING_CAP]; crate::arch::memory::USER_SLOTS] =
+static USER_INPUT_BUF: [[AtomicU64; INPUT_RING_CAP]; crate::arch::memory::USER_SLOTS] =
     [const { [const { AtomicU64::new(0) }; INPUT_RING_CAP] }; crate::arch::memory::USER_SLOTS];
 /// Consumer index (free-running; advanced by `sys_input_poll`). Real slot = `head & (CAP - 1)`.
-static EL0_INPUT_HEAD: [AtomicU32; crate::arch::memory::USER_SLOTS] =
+static USER_INPUT_HEAD: [AtomicU32; crate::arch::memory::USER_SLOTS] =
     [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
-/// Producer index (free-running; advanced by `el0_input_push`). Occupancy = `tail - head`.
-static EL0_INPUT_TAIL: [AtomicU32; crate::arch::memory::USER_SLOTS] =
+/// Producer index (free-running; advanced by `user_input_push`). Occupancy = `tail - head`.
+static USER_INPUT_TAIL: [AtomicU32; crate::arch::memory::USER_SLOTS] =
     [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
 
 /// The slot currently designated to RECEIVE input, `+1`-BIASED: 0 means "no ring-3 target — the shell
@@ -3512,7 +3512,7 @@ static EL0_INPUT_TAIL: [AtomicU32; crate::arch::memory::USER_SLOTS] =
 /// (the WINX-1 fixture routinely does), so an unbiased 0 would silently mean "the first program to
 /// launch always has focus". This is the same reason `WinEntry` needs `WIN_OWNER_FREE` and `Proc`
 /// stores `slot + 1`.
-static EL0_INPUT_ACTIVE: AtomicU64 = AtomicU64::new(0);
+static USER_INPUT_ACTIVE: AtomicU64 = AtomicU64::new(0);
 
 /// How many times a slot TEARDOWN revoked the live input focus — i.e. the dying slot *was* the
 /// focused one. Zero on a boot where no focused program ever exited; it climbs by one per focused
@@ -3523,20 +3523,20 @@ static EL0_FOCUS_REVOKES: AtomicU64 = AtomicU64::new(0);
 /// Router accounting: events actually DELIVERED into some process's ring, and events DROPPED because
 /// the target ring was full. The drop counter is the honest half — a full ring is a real event loss
 /// and must be countable, not silent.
-static EL0_INPUT_DELIVERED: AtomicU64 = AtomicU64::new(0);
-static EL0_INPUT_DROPPED: AtomicU64 = AtomicU64::new(0);
+static USER_INPUT_DELIVERED: AtomicU64 = AtomicU64::new(0);
+static USER_INPUT_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// WINX-7: the slot currently receiving input, `+1`-biased (0 = the shell). The read side of
-/// [`el0_input_set_active`], for the router and the witnesses.
-pub fn el0_input_active() -> u64 {
-    EL0_INPUT_ACTIVE.load(Ordering::Acquire)
+/// [`user_input_set_active`], for the router and the witnesses.
+pub fn user_input_active() -> u64 {
+    USER_INPUT_ACTIVE.load(Ordering::Acquire)
 }
 
 /// WINX-7: `(delivered, dropped, focus_revokes)` — the router's own accounting, for the witness line.
-pub fn el0_input_stats() -> (u64, u64, u64) {
+pub fn user_input_stats() -> (u64, u64, u64) {
     (
-        EL0_INPUT_DELIVERED.load(Ordering::Acquire),
-        EL0_INPUT_DROPPED.load(Ordering::Acquire),
+        USER_INPUT_DELIVERED.load(Ordering::Acquire),
+        USER_INPUT_DROPPED.load(Ordering::Acquire),
         EL0_FOCUS_REVOKES.load(Ordering::Acquire),
     )
 }
@@ -3566,18 +3566,18 @@ fn pack_input(ev: crate::pal::Event) -> Option<u64> {
 /// loses the events it could not have handled anyway, rather than having its next read silently
 /// replaced by a later one (which would corrupt a press/release pairing). `slot` is validated by the
 /// caller. Returns whether the event was queued.
-fn el0_input_push(slot: usize, packed: u64) -> bool {
-    let head = EL0_INPUT_HEAD[slot].load(Ordering::Acquire);
-    let tail = EL0_INPUT_TAIL[slot].load(Ordering::Relaxed); // the router is the sole producer
+fn user_input_push(slot: usize, packed: u64) -> bool {
+    let head = USER_INPUT_HEAD[slot].load(Ordering::Acquire);
+    let tail = USER_INPUT_TAIL[slot].load(Ordering::Relaxed); // the router is the sole producer
     if tail.wrapping_sub(head) >= INPUT_RING_CAP as u32 {
-        EL0_INPUT_DROPPED.fetch_add(1, Ordering::Relaxed);
+        USER_INPUT_DROPPED.fetch_add(1, Ordering::Relaxed);
         return false; // full — drop the newest
     }
-    EL0_INPUT_BUF[slot][(tail as usize) & (INPUT_RING_CAP - 1)].store(packed, Ordering::Release);
+    USER_INPUT_BUF[slot][(tail as usize) & (INPUT_RING_CAP - 1)].store(packed, Ordering::Release);
     // Publish the tail AFTER the slot store: the consumer's Acquire load of the tail is what makes
     // the payload visible to it, so the two stores must not be reordered.
-    EL0_INPUT_TAIL[slot].store(tail.wrapping_add(1), Ordering::Release);
-    EL0_INPUT_DELIVERED.fetch_add(1, Ordering::Relaxed);
+    USER_INPUT_TAIL[slot].store(tail.wrapping_add(1), Ordering::Release);
+    USER_INPUT_DELIVERED.fetch_add(1, Ordering::Relaxed);
     true
 }
 
@@ -3586,8 +3586,8 @@ fn el0_input_push(slot: usize, packed: u64) -> bool {
 /// Returns `true` if the event was queued for a ring-3 app (the caller must NOT also give it to the
 /// shell), `false` if there is no focused ring-3 target, the event carries nothing deliverable, or the
 /// target ring was full. Single producer: exactly one drain loop may call this.
-pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
-    let active = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
+pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
+    let active = USER_INPUT_ACTIVE.load(Ordering::Acquire);
     if active == 0 {
         return false; // the shell owns the keyboard
     }
@@ -3598,12 +3598,12 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
     let Some(packed) = pack_input(ev) else {
         return false;
     };
-    el0_input_push(slot, packed)
+    user_input_push(slot, packed)
 }
 
 /// WINX-7 ROUTER FOLD POINT (public, in-lane) — the ONE line the shell's event drain needs.
 ///
-/// Hands `ev` to [`el0_input_enqueue`] and reports the outcome AS AN EVENT, so a caller folds this in
+/// Hands `ev` to [`user_input_enqueue`] and reports the outcome AS AN EVENT, so a caller folds this in
 /// without restructuring its drain: the event comes back UNCHANGED when no ring-3 app took it (the shell
 /// handles it exactly as before), and comes back as `Event::Unknown` when a ring-3 ring consumed it.
 ///
@@ -3613,8 +3613,8 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
 /// first keystroke routed to a window and strand everything queued behind it. `Event::Unknown`
 /// already falls through every such loop's catch-all arm as a no-op, which is precisely the
 /// "swallowed, keep draining" semantics required.
-pub fn el0_input_route(ev: crate::pal::Event) -> crate::pal::Event {
-    if el0_input_enqueue(ev) {
+pub fn user_input_route(ev: crate::pal::Event) -> crate::pal::Event {
+    if user_input_enqueue(ev) {
         crate::pal::Event::Unknown
     } else {
         ev
@@ -3630,8 +3630,8 @@ fn clear_input_row(slot: usize) {
     if slot >= crate::arch::memory::USER_SLOTS {
         return;
     }
-    EL0_INPUT_HEAD[slot].store(0, Ordering::Release);
-    EL0_INPUT_TAIL[slot].store(0, Ordering::Release);
+    USER_INPUT_HEAD[slot].store(0, Ordering::Release);
+    USER_INPUT_TAIL[slot].store(0, Ordering::Release);
 }
 
 /// WINX-7 FOCUS REGISTRATION (public, in-lane): designate which process receives input.
@@ -3641,7 +3641,7 @@ fn clear_input_row(slot: usize) {
 /// focus were aimed at that window, and delivering them to the new one is both wrong and, for a
 /// button, actively harmful (a release with no matching press is a fabricated click). Clearing focus
 /// leaves every ring alone — from then on events legitimately belong to the shell.
-pub fn el0_input_set_active(slot_plus1: u64) {
+pub fn user_input_set_active(slot_plus1: u64) {
     if slot_plus1 != 0 {
         let slot = (slot_plus1 - 1) as usize;
         if slot >= crate::arch::memory::USER_SLOTS {
@@ -3649,7 +3649,7 @@ pub fn el0_input_set_active(slot_plus1: u64) {
         }
         clear_input_row(slot); // a fresh focus starts clean
     }
-    EL0_INPUT_ACTIVE.store(slot_plus1, Ordering::Release);
+    USER_INPUT_ACTIVE.store(slot_plus1, Ordering::Release);
 }
 
 /// WINX-7: revoke input focus if the dying `slot` holds it, and reset its ring. Called from
@@ -3662,9 +3662,9 @@ pub fn el0_input_set_active(slot_plus1: u64) {
 /// windowed app would leave focus pointing at its own dead slot forever and every later keystroke
 /// would be enqueued into a ring with no consumer — the keyboard would appear to stop working with
 /// no message anywhere.
-fn el0_input_revoke_slot(slot: usize) {
+fn user_input_revoke_slot(slot: usize) {
     let biased = (slot as u64) + 1;
-    if EL0_INPUT_ACTIVE
+    if USER_INPUT_ACTIVE
         .compare_exchange(biased, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
@@ -3691,20 +3691,20 @@ fn sys_input_poll() -> i64 {
     let Some(slot) = crate::arch::x86_64::memory::current_slot() else {
         return EAGAIN;
     };
-    let head = EL0_INPUT_HEAD[slot].load(Ordering::Relaxed); // sole consumer
-    let tail = EL0_INPUT_TAIL[slot].load(Ordering::Acquire);
+    let head = USER_INPUT_HEAD[slot].load(Ordering::Relaxed); // sole consumer
+    let tail = USER_INPUT_TAIL[slot].load(Ordering::Acquire);
     if head == tail {
         return EAGAIN; // empty
     }
-    let packed = EL0_INPUT_BUF[slot][(head as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
-    EL0_INPUT_HEAD[slot].store(head.wrapping_add(1), Ordering::Release); // consume AFTER the load
+    let packed = USER_INPUT_BUF[slot][(head as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
+    USER_INPUT_HEAD[slot].store(head.wrapping_add(1), Ordering::Release); // consume AFTER the load
     packed as i64
 }
 
 /// CLICK-X86 witness read: how many events sit UNREAD in the ring of the `+1`-biased slot `active`.
 /// `0` for the shell slot and for anything outside the private-slot range (they have no ring). The
 /// selftest's only way to say "the press was DELIVERED" rather than "the router said it would be".
-pub fn el0_input_depth(active: u64) -> u32 {
+pub fn user_input_depth(active: u64) -> u32 {
     if active == 0 {
         return 0;
     }
@@ -3712,9 +3712,9 @@ pub fn el0_input_depth(active: u64) -> u32 {
     if slot >= crate::arch::memory::USER_SLOTS {
         return 0;
     }
-    EL0_INPUT_TAIL[slot]
+    USER_INPUT_TAIL[slot]
         .load(Ordering::Acquire)
-        .wrapping_sub(EL0_INPUT_HEAD[slot].load(Ordering::Acquire))
+        .wrapping_sub(USER_INPUT_HEAD[slot].load(Ordering::Acquire))
 }
 
 // =============================================================================================
@@ -3787,7 +3787,7 @@ fn click_pointer_pos() -> (i32, i32) {
 }
 
 /// CLICK-X86 — **route a pointer button by POSITION rather than by focus.** The shell's event drain
-/// calls this on every event, BEFORE `el0_input_route`; non-`Button` events return `false` untouched.
+/// calls this on every event, BEFORE `user_input_route`; non-`Button` events return `false` untouched.
 ///
 /// Returns `true` when the event was CONSUMED and the caller must not deliver or forward it. Under
 /// CLICK-PLAIN that is only the arms with no app to deliver to (a press on kernel furniture or on the
@@ -3818,9 +3818,9 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
 /// Hit-test the point (`wm::hit_test` — the topmost visible window whose outer box contains it):
 ///
 ///  * **a window owned by a DIFFERENT address space than the focused one** — raise it to focus
-///    through the one focus primitive that exists (`el0_input_set_active` then `wm::focus_changed`,
+///    through the one focus primitive that exists (`user_input_set_active` then `wm::focus_changed`,
 ///    in that order), and then **DELIVER the press to it**. The wake half runs FIRST and in full, so
-///    by the time the caller pushes, `EL0_INPUT_ACTIVE` already names the raised owner and the press
+///    by the time the caller pushes, `USER_INPUT_ACTIVE` already names the raised owner and the press
 ///    lands in the ring of the window that was clicked. Click-to-focus, with no second focus path
 ///    invented for it.
 ///
@@ -3836,7 +3836,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
 ///    click landed on the kernel's furniture, which owns no address space and has no input ring. Two
 ///    things happen and they are separate: the row is RAISED (`focus_changed(owner)`, so the click
 ///    has a visible effect — the console comes to the front under the hand), and the KEYBOARD goes
-///    back to the shell (`el0_input_set_active(0)`), because the console is the shell's surface and
+///    back to the shell (`user_input_set_active(0)`), because the console is the shell's surface and
 ///    clicking it must be how the operator reaches it. The press itself is consumed: on x86 the shell
 ///    has no click consumer at all, so there is nothing to deliver it to, and re-addressing it after
 ///    the fact would split a pair whose press edge no consumer saw.
@@ -3865,7 +3865,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         return false;
     };
     let prev = CLICK_PREV_MASK.swap(mask as u32, Ordering::Relaxed) as u8;
-    let cur = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
+    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
     if mask & !prev != 0 {
         // PRESS edge.
         CLICK_PRESSES.fetch_add(1, Ordering::Relaxed);
@@ -3873,7 +3873,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
             // KERNEL FURNITURE — raise it, hand the keyboard to the shell, consume the press.
             Some((win, owner, _z)) if crate::video::wm::is_kernel_owner(owner) => {
                 clickroute_witness(x, y, win, owner, cur, "consume", 0);
-                el0_input_set_active(0);
+                user_input_set_active(0);
                 crate::video::wm::focus_changed(owner);
                 CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
                 true
@@ -3882,8 +3882,8 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
             Some((win, owner, _z)) if owner != cur => {
                 clickroute_witness(x, y, win, owner, cur, "raise+deliver", owner);
                 // The wake half, in order: the focus arrival first, then the raise. Only then does
-                // the caller push — and by then `EL0_INPUT_ACTIVE` is `owner`.
-                el0_input_set_active(owner);
+                // the caller push — and by then `USER_INPUT_ACTIVE` is `owner`.
+                user_input_set_active(owner);
                 crate::video::wm::focus_changed(owner);
                 // The release must follow the press into the SAME ring: record the raised owner, not
                 // the sentinel, so the pair is delivered whole.
@@ -3904,7 +3904,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
                 // compat row is the only other thing that can.
                 if cur != 0 && !crate::video::wm::compat_live() {
                     clickroute_witness(x, y, crate::video::wm::WIN_NONE, 0, cur, "consume", 0);
-                    el0_input_set_active(0);
+                    user_input_set_active(0);
                     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
                     true
                 } else {
@@ -4014,7 +4014,7 @@ pub fn clickroute_selftest() {
     }
 
     // Biased slots, i.e. the values `SYS_WIN_CREATE` now hands the compositor and the values
-    // `EL0_INPUT_ACTIVE` carries — the whole point of the bias is that these are the SAME numbers.
+    // `USER_INPUT_ACTIVE` carries — the whole point of the bias is that these are the SAME numbers.
     const OWNER_A: u64 = 1; // slot 0
     const OWNER_B: u64 = 2; // slot 1
     // In the reserved kernel band, so `wm::is_kernel_owner` answers for it exactly as it does for the
@@ -4072,29 +4072,29 @@ pub fn clickroute_selftest() {
     ];
     let desktop_pt = corners.iter().copied().find(|&(x, y)| wm::hit_test(x, y).is_none());
 
-    let saved_focus = el0_input_active();
+    let saved_focus = user_input_active();
 
     // Leg 2/3 — focus on A, press over B. Delivered, not swallowed; the pair lands whole in B's ring.
-    el0_input_set_active(OWNER_A);
+    user_input_set_active(OWNER_A);
     wm::focus_changed(OWNER_A);
     CLICK_PREV_MASK.store(0, Ordering::Relaxed);
     let press_consumed = wc_click_route_at(Event::Button(1), bpx, bpy);
-    let raised_ok = el0_input_active() == OWNER_B;
-    let deliver_ok = !press_consumed && raised_ok && el0_input_enqueue(Event::Button(1));
-    let depth_press = el0_input_depth(OWNER_B);
+    let raised_ok = user_input_active() == OWNER_B;
+    let deliver_ok = !press_consumed && raised_ok && user_input_enqueue(Event::Button(1));
+    let depth_press = user_input_depth(OWNER_B);
     let rel_consumed = wc_click_route_at(Event::Button(0), bpx, bpy);
-    let rel_ok = !rel_consumed && el0_input_enqueue(Event::Button(0));
-    let depth_rel = el0_input_depth(OWNER_B);
+    let rel_ok = !rel_consumed && user_input_enqueue(Event::Button(0));
+    let depth_rel = user_input_depth(OWNER_B);
     let depth_ok = depth_press == 1 && depth_rel == 2 && rel_ok;
 
     // Leg 4 — a press over KERNEL furniture, from a live app focus. Consumed; keyboard to the shell;
     // the raise is the row's own z-bump and `SHELL_Z` must not move.
-    el0_input_set_active(OWNER_A);
+    user_input_set_active(OWNER_A);
     wm::focus_changed(OWNER_A);
     let shell_z_before = wm::shell_z();
     let kernel_consumed = wc_click_route_at(Event::Button(1), kpx, kpy);
     let kernel_ok =
-        kernel_consumed && el0_input_active() == 0 && wm::shell_z() == shell_z_before;
+        kernel_consumed && user_input_active() == 0 && wm::shell_z() == shell_z_before;
 
     // Leg 6 — the release after a CONSUMED press is dropped, never delivered.
     let nofab_ok = wc_click_route_at(Event::Button(0), kpx, kpy);
@@ -4102,10 +4102,10 @@ pub fn clickroute_selftest() {
     // Leg 5 — a press over the bare desktop, from a live app focus.
     let desktop_ok = match desktop_pt {
         Some((x, y)) => {
-            el0_input_set_active(OWNER_A);
+            user_input_set_active(OWNER_A);
             wm::focus_changed(OWNER_A);
             let consumed = wc_click_route_at(Event::Button(1), x, y);
-            let ok = consumed && el0_input_active() == 0;
+            let ok = consumed && user_input_active() == 0;
             wc_click_route_at(Event::Button(0), x, y);
             Some(ok)
         }
@@ -4136,7 +4136,7 @@ pub fn clickroute_selftest() {
     wm::close(wa);
     wm::close(wb);
     wm::close(wk);
-    el0_input_set_active(saved_focus);
+    user_input_set_active(saved_focus);
     CLICK_PREV_MASK.store(0, Ordering::Relaxed);
     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
     wm::focus_reset();
@@ -9640,7 +9640,7 @@ pub fn clear_handle_row(slot: usize) {
     // no consumer, which presents to the operator as the keyboard silently ceasing to work. The
     // generation bump above also retires this slot's thread-table rows for the lazy scavenge in
     // `sys_thread_spawn` — a killed threaded program leaks no rows permanently.
-    el0_input_revoke_slot(slot);
+    user_input_revoke_slot(slot);
     // WINX-7: the detached mark is per-TENANT, not per-slot, so it must die with the tenant — a
     // foreground `run` landing in a slot a `bg` job just vacated must not inherit "I was detached"
     // and skip its own frame cap.
@@ -12515,10 +12515,10 @@ fn winx7_build() -> Option<U7xFix> {
 /// are proved after the machinery they build on.
 ///
 /// The launcher does three things the fixture cannot do for itself:
-///   1. GRANTS IT FOCUS explicitly (`el0_input_set_active`), rather than relying on the create-time
+///   1. GRANTS IT FOCUS explicitly (`user_input_set_active`), rather than relying on the create-time
 ///      auto-grant. Both paths exist and both are correct, but a witness that depended on the implicit
 ///      one would silently stop testing input the day the focus policy changed.
-///   2. INJECTS an input event through the real `el0_input_enqueue` router seam — the same function
+///   2. INJECTS an input event through the real `user_input_enqueue` router seam — the same function
 ///      the shell's drain calls. QEMU delivers no USB HID at all, so a kernel-side injection is the
 ///      only way this leg can be witnessed headlessly, and routing it through the seam rather than
 ///      straight into the ring means the focus gate is on the tested path.
@@ -12558,7 +12558,7 @@ fn winx7_launcher(_demo_cpu: usize) {
     let mut injected: u32 = 0;
     while WINX7_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < deadline {
         if !focused && winx_slot_has_window(fix.slot) {
-            el0_input_set_active((fix.slot as u64) + 1);
+            user_input_set_active((fix.slot as u64) + 1);
             focused = true;
         }
         if focused && injected < 64 {
@@ -12566,7 +12566,7 @@ fn winx7_launcher(_demo_cpu: usize) {
             // recognisable if it ever needs to be read off the wire. Injected repeatedly because the
             // fixture reaches its poll only after the barrier, and a single early injection would be
             // consumed by nothing (drop-newest on a full ring makes repetition harmless).
-            if el0_input_enqueue(crate::pal::Event::Key(b'k')) {
+            if user_input_enqueue(crate::pal::Event::Key(b'k')) {
                 injected += 1;
             }
         }
@@ -12591,7 +12591,7 @@ fn winx7_launcher(_demo_cpu: usize) {
     let cleared = !winx_slot_has_window(fix.slot);
     // Focus must have returned to the shell when the slot was torn down. If it had not, every later
     // keystroke on this boot would be enqueued into a ring with no consumer.
-    let focus_released = el0_input_active() == 0;
+    let focus_released = user_input_active() == 0;
 
     // SERIAL SETTLE — see the note in `winx_launcher`: the UART writer drops lines on contention and
     // this verdict follows the compositor's close/erase burst from another core.
