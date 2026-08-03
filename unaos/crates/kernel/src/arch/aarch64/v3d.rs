@@ -10537,14 +10537,12 @@ fn v3d75_fabric_condition() {
         );
         let b = v3d75_kick_probe("v3d75b post-transplant");
         serial_println!(
-            ":: V3D: [v3d75] verdict — A(enable-qpu)={} B(m-ctrl-0x4040)={} — {} ::",
-            a as u32, b as u32,
-            if b { "THE WALL WAS THE FABRIC CONDITION — the transplanted M_CTRL value lets thread 0 start; productionize the init" }
-            else { "both experiments dead — the M_CTRL divergence is a passenger, not the condition; the firmware-init diff hunt continues (next stations: the KMS overlay's other VPU-side writes — full piOS/UnaOS boot-state diff)" }
+            ":: V3D: [v3d75] verdict — A={} B={} — CRITERION IS THE REHOSTED CT1 PROBE (PI-V3D-90 s1): a CT1 render kick executes regardless of firmware init, QPU enable or fabric state (boot13/14 measured), so a TRUE here attributes NOTHING to the experiment and a FALSE is a new fact about CT1, not about the bin wall. These legs' hypotheses are about THREAD 0 — re-testing them needs a BIN-class CT0 criterion (empty/m4 lists execute first-kick, boot6/8), named as PI-V3D-91 in v3d.md §49.13. Raw kick lines above are the evidence; this line refuses attribution by design ::",
+            a as u32, b as u32
         );
     } else {
         serial_println!(
-            ":: V3D: [v3d75] verdict — A(enable-qpu)=1 — THE WALL WAS FIRMWARE-SIDE V3D INIT, and it is MAILBOX-REACHABLE: SET_ENABLE_QPU(1) lets thread 0 start; productionize the call in bringup ::"
+            ":: V3D: [v3d75] verdict — A=1 — NO ATTRIBUTION: the criterion is the rehosted CT1 probe, which executes with or without the experiment (boot14: the PRE-send control also executed). The old prose ('the wall was firmware-side init') printed from exactly this saturated read and is RETRACTED-VOCABULARY (v3d.md §49.13). Re-test on a BIN-class CT0 criterion — PI-V3D-91 ::"
         );
     }
 }

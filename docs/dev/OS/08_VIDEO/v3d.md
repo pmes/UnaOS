@@ -5134,6 +5134,18 @@ different changes and mixing them would mean neither could be reviewed on its ow
   banner). Only a value the compiler cannot see makes an enforcement real. The §49 instrument
   harness's deliberate cross-class kicks keep raw writes with their own justifications, by design.
 
+**§49.13 — boot14's saturated-criterion lesson (PI-V3D-91 named).** The rehosted CT1 probe
+executes regardless of firmware init, QPU enable or fabric state (boot13/14 measured: the
+v3d75a PRE-send control executed) — so every v3d75/77/80 leg verdict that read a lone EXECUTED
+as attribution was vocabulary-lagged and is RETRACTED-VOCABULARY; boot14's "A(enable-qpu)=1 —
+the wall was firmware-side init" line is the type specimen. The verdicts now refuse attribution
+in code. The five hypotheses are about THREAD 0: **PI-V3D-91** = rebuild those legs on a
+BIN-class CT0 criterion (empty/m4 lists execute first-kick, boot6/8 — a criterion that can
+genuinely fail on the bin wall), then re-take. The wall itself, remeasured clean on boot14:
+CLE fully exonerated ([v3d59] ctstate — list executed, CT0LC/CT0PC moved, items fed), bin frame
+DEAD-OPEN ([v3d59] frameclose, 64 samples zero movement) — **the PTB frame unit, between
+item-accept and pool-write**, is the whole remaining target.
+
 **THE NEXT ARC — the production rewire (PI-V3D-90).** Named here so it is a commitment and not a
 loose end. In order:
 
