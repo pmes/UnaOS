@@ -74,9 +74,9 @@ surfaces `Busy`/`-EAGAIN` to callers, which is precisely the case that used to d
 
 ## The family and its two idioms
 
-WEDGE-8's shape is no longer one arc's fix. Three locks in this tree now carry the F1–F4 discipline
-(`wm::TABLE`, `XHCI_CONTROLLER`, the mailbox transport) and a fourth (`cursor::SPRITE`) is mid-
-conversion — and they carry it in **two** idioms. That is not an inconsistency left behind by three
+WEDGE-8's shape is no longer one arc's fix. Five locks in this tree now carry the F1–F5 discipline
+(`wm::TABLE`, `XHCI_CONTROLLER`, the mailbox transport, `cursor::SPRITE`, `cursor::OVERLAY`) — and
+they carry it in **two** idioms. That is not an inconsistency left behind by three
 authors; it is the choice the discipline actually asks of every lock it is applied to.
 
 The invariant is the same in both cases, and it is the one the family's defect violates:
@@ -145,10 +145,54 @@ invariant is checkable by grep without booting.
 | `video::wm::TABLE` (F1) | masked micro-guard — one `TABLE.lock()`, in `fn table()` | WEDGE-7 `97357c70` | none, by construction: nobody is refused, and a waiter waits at most one bounded row scan |
 | `drivers::xhci::XHCI_CONTROLLER` (F3) | claim/loan — `claim` / loan-drop / `install` | WEDGE-8 `dac6edb5` | pump/service passes skip the pass and retry ms later; the block layer surfaces `BlockError::Busy`; a masked FAT/dir RMW refuses to wait and retries the whole closure outside the `without_interrupts` span (64 attempts, `hw_wait_budget()` wall-clock), then `-EAGAIN` at the syscall boundary; diagnostics report "busy" |
 | `arch::aarch64::mailbox::MBOX_FREE` | claim/loan — `claim` / `MboxLoan::drop` | MBOX-1 `c227f420` | `get_clock_rate` alone retries (`claim_bounded`, unmasked, 600 ms) because its refusal makes EMMC2 *assume* a 100 MHz SD base clock and program a wrong divider; every other entry point fails loud with `:: MAILBOX: BUSY — {op} refused … ::` and returns its documented failure value |
-| `video::cursor::SPRITE` (F4) | **in flight** — claim/loan; WEDGE-7's idiom audited and refused | audit in WEDGE-2 `be4ea433` (`<D4>`, the F4 death token) | to be stated by that arc |
+| `video::cursor::SPRITE` (F4) | claim/loan — `claim` / `SpriteLoan::drop`; WEDGE-7's idiom audited and refused | audit in WEDGE-2 `be4ea433` (`<D4>`, the F4 death token), landed WEDGE-9 `e860181a` | stated per entry point; the one rule none may break is losing a repaint silently, so every refusal arms `REPAINT_OWED` and a composite tail cashes it. `repaint` alone retries (`claim_bounded`, unmasked, 2 ms) |
+| `video::cursor::OVERLAY` (F5) | claim/loan — `overlay_claim` / `OverlayLoan::drop`; WEDGE-7's idiom enumerated and refused | WEDGE-11 (this arc) | every former `try_lock` site keeps the fallback it already had for a contended lock (decline the offer, leave the bits standing, `#[must_use]` `false`); `overlay_open` reads `Busy` as "another pass owns the overlay" and takes CURSOR-3's whole-sprite bracket; `adopt_overlay` — the session's ONLY closer — waits `2 × OVERLAY_WORST_HOLD_MS`, CNTPCT-bounded, **masked included**, then defers the close to the next `overlay_open` via `OVERLAY_CLOSE_OWED` |
 
 The F4 row is what makes the family a family rather than a coincidence of two arcs. WEDGE-2 added
 `<D4>` precisely because an F4 death on `SPRITE` was reaching the wire as F1's trace and being
 attributed to a lock WEDGE-7 had already closed; the span audit that came with it is the same
 question this section asks of every candidate, answered "not maskable" — which names the idiom the
 conversion has to use before the conversion is written.
+
+### F5 — `cursor::OVERLAY`, and what the enumeration is for
+
+The fifth application is the one that shows why the enumeration is a *procedure* and not a formality.
+`OVERLAY` is `SPRITE`'s neighbour: `composite` claims the sprite at its head and the overlay at both
+ends, and `SYS_WIN_PRESENT` masks across the whole of it, so a blocking `OVERLAY.lock()` inside that
+mask is the family's defect statement verbatim — a masked waiter on a lock whose holder is an
+ordinary preemptible render/HID context. There are three such acquisitions (`overlay_open`, and
+`adopt_overlay` twice), and WEDGE-9 flagged them in writing while converting `SPRITE`, recording that
+"both holds are bounded and neither can block on anything while held — the WEDGE-7 precondition" and
+deferring the guard to a later arc. Read at face value that is a certification that `OVERLAY`
+qualifies for the masked micro-guard, and this arc set out to give it one.
+
+It does not qualify, and the reason is the criterion above applied to the right set. WEDGE-9's note
+weighed the two *blocking* holds. The micro-guard masks at the **sole acquisition path**, so its
+precondition binds every section the mask would cover — the `try_lock` sites included, because under
+the guard they become masked holders too. `OVERLAY` has eight acquisitions, not three, and two of
+them (`undraw_locked` and `undraw_within_locked`, since FLICKER-2/3 moved the session-fresh restore
+*inside* the hold) walk up to `MAX_PIX` = 1296 `read_pixel`/`put_pixel` pairs against the panel while
+holding it. That is WEDGE-2's third disqualifier for `SPRITE`, verbatim, one lock over — and the rule
+that "one unbounded section is enough, because the mask covers all of them" is what turns it from a
+detail into the answer. Guarding only the three blocking sites would have been the partial conversion
+this section already refuses by name: it leaves the two sections that matter unmasked and preemptible,
+so the masked `overlay_open` still spins on a holder that can be preempted, while the lock now *looks*
+hardened.
+
+So `OVERLAY` takes claim/loan, and with it the rider WEDGE-10 established: **one** caller may wait,
+because for one caller refusal is not a priced fallback. `adopt_overlay` is the session's only closer,
+and an abandoned session makes every later `overlay_open` decline for the rest of the boot — the
+mechanism switched off, not one frame lost. It therefore spends a CNTPCT deadline of `2 ×` the worst
+hold, *including when masked*, on WEDGE-10's distinction: an unbounded masked spin ends only if the
+holder runs, whereas a wall-clock wait ends whether or not it does, so it is a bounded stall and not
+the deadlock. Behind the wait sits WEDGE-9's other rider — a refusal is deferred damage, never
+silence: the close is owed to the next `overlay_open`, which cashes it under the claim it needs
+anyway, before it tests the session flag.
+
+Two general lessons, both cheap to state and expensive to rediscover. First, **a deferral note is not
+an audit**: WEDGE-9's flag was honest about what it had checked and was read as having checked more,
+so the enumeration has to be redone by the arc that acts on it. Second, **the qualifying set moves**:
+`OVERLAY` may well have qualified when the note was written, and FLICKER-2/3 disqualified it later by
+moving pixel work inside a hold for reasons that had nothing to do with this family. A lock's idiom is
+a property of its current sections, so any arc that adds work under an existing hold owes this section
+a re-read.

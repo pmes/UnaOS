@@ -282,7 +282,8 @@ enum SpriteClaimError {
 /// **The loan is not a lock.** Holding it blocks nobody: a contender's [`claim`] takes `SPRITE_FREE`
 /// for a few dozen cycles, observes `false`, and returns [`SpriteClaimError::Busy`] immediately. That
 /// is what makes it safe to hold across the long pixel work, across a `flush_box`, and — see
-/// [`adopt_overlay`] — across a blocking `OVERLAY.lock()`.
+/// [`adopt_overlay`] — across an overlay acquisition (a blocking `OVERLAY.lock()` when WEDGE-9 was
+/// written; a bounded [`overlay_claim_bounded`] since WEDGE-11).
 struct SpriteLoan(());
 
 impl Drop for SpriteLoan {
@@ -667,15 +668,17 @@ pub fn note_masked_nosession() {
 /// here by construction, which is correct: they are absorbed by [`compose_into`]'s generation check
 /// and counted as `stale_compose`, where they read as load rather than as breakage.
 ///
-/// `try_lock`, and a contended lock counts NOTHING: this core cannot be the one holding `OVERLAY`
-/// (nothing on this path holds it across the drain), so contention proves the holder is someone
-/// else — the case that must not count. Blocking would also put `OVERLAY` into a wait the drain does
-/// not need.
+/// WEDGE-11 — **Busy policy: count nothing.** A refused claim counts NOTHING, for the reason the
+/// `try_lock` it replaces did: this core cannot be the one holding the overlay (nothing on this path
+/// holds it across the drain), so a refusal proves the holder is someone else — the case that must not
+/// count. Waiting would also put the overlay into a wait the drain does not need. Not even
+/// [`note_overlay_refused`] fires here: this is a witness-only probe, and a probe that could not look
+/// is not a contention event anyone should read as one.
 #[cfg(feature = "witness")]
 pub fn note_drain_undraw() {
-    let mine = match OVERLAY.try_lock() {
-        Some(g) => g.session && g.owner_cpu == crate::arch::sched::meter_current_cpu(),
-        None => false,
+    let mine = match overlay_claim() {
+        Ok(g) => g.session && g.owner_cpu == crate::arch::sched::meter_current_cpu(),
+        Err(_) => false,
     };
     if mine {
         C5_DRAIN_INSESSION.fetch_add(1, Ordering::Relaxed);
@@ -857,8 +860,8 @@ pub fn note_uncover_lost() {
 /// barrier spins IRQ-masked and unpreemptible until every registered blit retires; a blocking `SPRITE`
 /// acquisition there is exactly the wait its termination argument excludes (docs/dev/OS/08_VIDEO
 /// §WEDGE-1's audited-exception list). CURSOR-3/4/5 already spend their whole design on that
-/// constraint: the only sprite work admissible inside the guard is `OVERLAY.try_lock` and relaxed
-/// atomics. So this flag is a relaxed store inside the guard, and the *repair* is `cursor::repaint()`
+/// constraint: the only sprite work admissible inside the guard is a non-waiting overlay acquisition
+/// (`OVERLAY.try_lock` before WEDGE-11, [`overlay_claim`] since) and relaxed atomics. So this flag is a relaxed store inside the guard, and the *repair* is `cursor::repaint()`
 /// run from `wm::composite`, outside the guard, on the same footing as the `Repaint` tail that has
 /// existed since WC-I. No new lock, no new lock ORDER, and nothing added to the drain's wait set.
 ///
@@ -1178,6 +1181,10 @@ pub fn cursor11_rollup(scope: &str) {
     // own precedent: it is this pass's story one layer down, and one seam is easier to keep in step
     // than two.
     wedge9_rollup(scope);
+    // WEDGE-11 — chained off `[wedge9]` on the same precedent, and adjacent to it on purpose: the two
+    // are one pass's contention story at the two locks the composite path claims, and a bench reader
+    // comparing `refused=` across them is comparing like with like.
+    wedge11_rollup(scope);
 }
 
 // ---- FLICKER-2 witnesses -------------------------------------------------------------------------
@@ -1838,11 +1845,16 @@ fn undraw_locked(
     // The fix is to ask the session for the fresh value: if an open session coherently describes
     // THIS sprite (same epoch, same geometry — the `adopt_overlay` predicate verbatim), a covered
     // pixel's under-content is taken from `ov.saved` instead. Lock order `SPRITE` → `OVERLAY` is the
-    // documented one, and `try_lock` keeps the undraw from ever blocking on a `compose_into` holding
-    // `OVERLAY` inside the blit guard: a contended read falls back to the old behaviour for one
+    // documented one, and the claim keeps the undraw from ever blocking on a `compose_into` holding
+    // the overlay inside the blit guard: a refused read falls back to the old behaviour for one
     // undraw and is counted, never waited for. The epoch bump below then retires the session
     // (`adopt_overlay` finds it incoherent and refreshes), exactly as before.
-    let ov = OVERLAY.try_lock();
+    //
+    // WEDGE-11 — **Busy policy: the pre-FLICKER-2 behaviour, for one undraw.** THIS is the hold that
+    // disqualified the masked micro-guard for this lock: the loop below walks up to `MAX_PIX` panel
+    // `read_pixel`/`put_pixel` pairs with the overlay held. Under claim/loan that is a loan, so no
+    // masked presenter can be waiting on it.
+    let ov = overlay_claim().ok();
     let sess = ov.as_ref().filter(|g| {
         g.session
             && g.epoch == sp.epoch
@@ -2238,9 +2250,16 @@ pub fn settle_nosession() {
             }
         };
         if sp.drawn {
-            let free = match OVERLAY.try_lock() {
-                Some(g) => !g.session,
-                None => false,
+            // WEDGE-11 — **Busy policy: leave the bits standing.** A refused probe is exactly a
+            // contended `try_lock` was: it cannot prove no session is open, so the gate answers "not
+            // free" and the pending bits are settled by whichever tail closes the pass. Counted, so a
+            // reader can tell a refusal from a genuinely open session.
+            let free = match overlay_claim() {
+                Ok(g) => !g.session,
+                Err(_) => {
+                    note_overlay_refused();
+                    false
+                }
             };
             if free {
                 settle_pending_locked(&mut sp, &mut unsupported_now);
@@ -2457,7 +2476,11 @@ fn undraw_within_locked(
     // `try_lock`-never-block discipline; a contended read falls back to the old behaviour for one
     // undraw and is counted in the shared `sess_lockmiss`. The caller's conditional generation bump
     // is untouched — a handback still retires A's session, which then refreshes whole-sprite.
-    let ov = OVERLAY.try_lock();
+    //
+    // WEDGE-11 — **Busy policy: as `undraw_locked`'s**, and this is its twin in the audit: the second
+    // of the two ≤`MAX_PIX` panel walks taken with the overlay held, and the second reason the masked
+    // micro-guard could not be given to this lock.
+    let ov = overlay_claim().ok();
     let sess = ov.as_ref().filter(|g| {
         g.session
             && g.epoch == sp.epoch
@@ -2776,13 +2799,14 @@ pub struct Composed {
 /// CURSOR-3 — the published plan. Separate from [`SPRITE_STATE`] on purpose: [`compose_into`] runs from
 /// inside `wm`'s `BlitGuard` window, and F4's drain barrier spins IRQ-masked until every registered
 /// blit retires. A `lock()` there would put a second blocking wait into that termination argument.
-/// This one is only ever `try_lock`ed from that side — the same discipline, and for the same reason,
-/// that WC-H's `STAGE` uses — so a contended pass simply declines the overlay and falls back to
-/// WC-I's bracket. The SPRITE lock is never taken inside the guard at all.
+/// This one is only ever CLAIMED from that side (WEDGE-11; `try_lock`ed before it) — the same
+/// discipline, and for the same reason, that WC-H's `STAGE` uses — so a contended pass simply declines
+/// the overlay and falls back to WC-I's bracket. The sprite is never claimed inside the guard at all.
 ///
-/// **Lock order: `SPRITE` → `OVERLAY`.** [`adopt_overlay`] takes both, in that order, outside the
-/// guard; [`compose_into`] takes only this one. No cycle exists and none may be introduced.
-static OVERLAY: Mutex<Overlay> = Mutex::new(Overlay {
+/// **Claim order: `SPRITE` → `OVERLAY`.** [`adopt_overlay`] claims both, in that order, outside the
+/// guard; [`compose_into`] claims only this one. No cycle exists and none may be introduced — and
+/// since WEDGE-11 neither claim is a wait that a holder can outlive (see [`overlay_claim`]).
+static mut OVERLAY_STATE: Overlay = Overlay {
     session: false,
     owner_cpu: 0,
     epoch: 0,
@@ -2793,7 +2817,304 @@ static OVERLAY: Mutex<Overlay> = Mutex::new(Overlay {
     s: 0,
     covered: Bits::EMPTY,
     saved: [0; MAX_PIX],
-});
+};
+
+/// WEDGE-11 — the overlay's availability flag, and the ONLY lock over [`OVERLAY_STATE`]. `true` = the
+/// overlay is on the shelf; `false` = it is loaned to exactly one context. Held for a masked O(1)
+/// take/put and nothing else, exactly as [`SPRITE_FREE`] is.
+///
+/// ### The audit that chose the idiom (F5, the fifth application of the F1–F4 family)
+/// WEDGE-9 converted `SPRITE` and flagged this lock as "a separate arc's work", on the reading that
+/// `OVERLAY`'s two BLOCKING acquirers ([`overlay_open`] and [`adopt_overlay`]) are both bounded and
+/// therefore that WEDGE-7's masked micro-guard would fit. That reading enumerated the wrong set. The
+/// micro-guard masks at the SOLE acquisition path, so its precondition binds every section the mask
+/// would cover — the `try_lock` sites included — and the family doc is explicit that one unbounded
+/// section disqualifies the lock "because the mask covers all of them", with a partial conversion
+/// refused by name. All eight acquisitions, at the boundary this arc found them:
+///
+/// ```text
+///   bounded    note_drain_undraw      session + owner_cpu compare          try_lock
+///   bounded    settle_nosession       session flag probe                   try_lock
+///   bounded    overlay_open           O(1) field writes + covered.reset     BLOCKING
+///   bounded    overlay_uncover        <=MAX_PIX index walk, RAM only       try_lock
+///   bounded    overlay_uncover_any    <=MAX_PIX index walk, RAM only       try_lock
+///   bounded    adopt_overlay          <=MAX_PIX walk over two RAM arrays   BLOCKING
+///   UNBOUNDED  undraw_locked          <=MAX_PIX fb.read_pixel/put_pixel    try_lock
+///   UNBOUNDED  undraw_within_locked   <=MAX_PIX fb.read_pixel/put_pixel    try_lock
+///   (compose_into: three <=MAX_PIX passes over a STAGED layer, inside the BlitGuard window)
+/// ```
+///
+/// The last two are the decisive ones and they are WEDGE-2's third disqualifier verbatim: FLICKER-2/3
+/// put the session-fresh restore inside the `OVERLAY` hold, so both undraws now walk up to `MAX_PIX`
+/// (1296) `read_pixel`/`put_pixel` pairs against `super::WRITER` — the PANEL, non-coherent scan-out —
+/// while holding this lock. The family doc's criterion excludes I/O by name. So the micro-guard is
+/// refused here for the same reason it was refused for `SPRITE`, and the discipline goes on the LOCK:
+/// masked O(1) take/put, the long pixel work on the loan with nothing held.
+///
+/// The F5 defect this closes is the family's, one lock over from F4: `SYS_WIN_PRESENT` masks, calls
+/// `wm::present` → `composite()`, and `composite` calls [`overlay_open`] at its head and
+/// [`adopt_overlay`] at its tail — both of which BLOCKED on this mutex. The holder they blocked on
+/// could be an ordinary preemptible task inside `undraw_locked`'s panel walk. Preempt that holder and
+/// the masked presenter can take no timer IRQ, the holder is never re-dispatched on that core, and the
+/// core dies silently. WEDGE-9 removed the spinnable `SPRITE` from underneath this exact chain; it did
+/// not remove this one, and the chain reaches both.
+///
+/// The invariant is grep-checkable, the F1/WEDGE-8 idiom: `OVERLAY_FREE.lock()` appears ONLY in
+/// [`overlay_claim`] and `OverlayLoan::drop`, and `OVERLAY_STATE` is named ONLY by the two
+/// [`OverlayLoan`] accessors — both statics are private, so the compiler enforces the rest.
+static OVERLAY_FREE: Mutex<bool> = Mutex::new(true);
+
+/// WEDGE-11 — why [`overlay_claim`] handed back no overlay. One variant only, as with the sprite: the
+/// overlay is a static that is live from the first instruction, so there is no "not yet installed".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OverlayClaimError {
+    /// Another context holds the overlay right now. The claim did NOT wait: waiting is the caller's
+    /// decision, and only one caller in this module makes it.
+    Busy,
+}
+
+/// WEDGE-11 — an exclusive loan of the overlay session state.
+///
+/// Dropping it returns the overlay to the shelf — a masked O(1) put, panic-safe by RAII. `Deref`/
+/// `DerefMut` are the only two places [`OVERLAY_STATE`] is named.
+///
+/// **The loan is not a lock.** Holding it blocks nobody: a contender's [`overlay_claim`] takes
+/// `OVERLAY_FREE` for a few dozen cycles, observes `false`, and returns [`OverlayClaimError::Busy`]
+/// immediately. That is what makes it safe to hold across `undraw_locked`'s panel walk.
+struct OverlayLoan(());
+
+impl Drop for OverlayLoan {
+    fn drop(&mut self) {
+        // WEDGE-11: masked micro-hold. Local drop order is WEDGE-7's guard field order in miniature —
+        // locals drop in REVERSE declaration order, so `guard` is released FIRST and `_mask` restores
+        // SECOND. The reverse would unmask while still holding the lock, re-opening a preemption
+        // window in the hold's tail, which is the family bug at every unlock.
+        let _mask = crate::arch::IrqMask::new();
+        let mut guard = OVERLAY_FREE.lock();
+        *guard = true;
+    }
+}
+
+impl core::ops::Deref for OverlayLoan {
+    type Target = Overlay;
+    #[inline]
+    fn deref(&self) -> &Overlay {
+        // SAFETY: the loan is handed out by `overlay_claim` only while `OVERLAY_FREE` held `true`, and
+        // it flips the flag to `false` under the lock before returning — so at most one `OverlayLoan`
+        // exists at a time and this is the unique live reference to the static.
+        unsafe { &*(&raw const OVERLAY_STATE) }
+    }
+}
+
+impl core::ops::DerefMut for OverlayLoan {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Overlay {
+        // SAFETY: as `deref` — the loan is the overlay's exclusivity token.
+        unsafe { &mut *(&raw mut OVERLAY_STATE) }
+    }
+}
+
+/// WEDGE-11 — claim exclusive use of the overlay. O(1), never waits.
+///
+/// Every site that used to `try_lock` calls this and takes `Busy` for the answer it already had for a
+/// contended lock — the fallbacks are unchanged, because `try_lock` was already a refusal idiom. The
+/// two sites that used to BLOCK are the conversion: [`overlay_open`] now treats `Busy` as "another
+/// pass owns the overlay", which is the answer it already produced for an open session, and
+/// [`adopt_overlay`] is the one caller that cannot simply walk away — see [`overlay_claim_bounded`].
+fn overlay_claim() -> Result<OverlayLoan, OverlayClaimError> {
+    let _mask = crate::arch::IrqMask::new();
+    let mut guard = OVERLAY_FREE.lock();
+    if *guard {
+        *guard = false;
+        Ok(OverlayLoan(()))
+    } else {
+        Err(OverlayClaimError::Busy)
+    }
+}
+
+/// WEDGE-11 — the worst legitimate hold of the overlay loan, in milliseconds.
+///
+/// Derived, not chosen, and taken from the longest section in the audit on [`OVERLAY_FREE`]:
+/// `compose_into` runs at most three ≤`MAX_PIX` passes over a staged layer, and the two undraws one
+/// ≤`MAX_PIX` panel pass each. WEDGE-9 priced the same quantity for the sprite — "two ≤`MAX_PIX` pixel
+/// passes and one `flush_box` over the union — well under a millisecond even on the bench's 1920x1200
+/// panel" — and no overlay section is longer than that, so 1 ms is a ceiling rather than an estimate.
+const OVERLAY_WORST_HOLD_MS: u64 = 1;
+
+/// WEDGE-11 — the budget [`overlay_claim_bounded`] spends: **2× the worst hold**, the WEDGE-10 rule.
+/// A claimant that outlasts two entire worst-case holds and still finds the overlay out has met
+/// something pathological, not load. It is also a QUARTER of [`REPAIR_MIN_MS`], so a bounded wait can
+/// never stack two pointer reports on top of each other — the same bound WEDGE-9's `CLAIM_RETRY_MS`
+/// lands on, from the same panel arithmetic.
+const OVERLAY_CLAIM_BUDGET_MS: u64 = 2 * OVERLAY_WORST_HOLD_MS;
+
+/// WEDGE-11 — the ONE caller policy that waits at all: re-attempt the O(1) [`overlay_claim`] under a
+/// CNTPCT deadline. Used only by [`adopt_overlay`], and used there **even when masked**.
+///
+/// ### Why a MASKED bounded wait, when WEDGE-9's `claim_bounded` refuses to wait masked
+/// The two callers are not in the same position, and the difference is what the refusal costs.
+/// [`repaint`]'s refusal costs one deferred repaint, which [`owe_repaint`] cashes at the next
+/// composite tail — so it can afford the WEDGE-8 rule outright. [`adopt_overlay`] is the ONLY closer
+/// of an overlay session: a refusal there abandons an open session, and an abandoned session makes
+/// every later [`overlay_open`] answer `false` for the rest of the boot. That is not one frame; it is
+/// the mechanism switched off. So this arc pays for the close with a bounded wait, and backs the wait
+/// with [`owe_overlay_close`] for the case where even the budget is not enough.
+///
+/// **The wait is a bounded STALL, not the F-family deadlock**, and the distinction is WEDGE-10's,
+/// stated the same way: the defect this family closes is an UNBOUNDED masked spin on a lock whose
+/// same-core preempted holder can never run again — the wait can only end if the holder runs, and the
+/// holder can only run if the waiter stops. This wait ends unconditionally on wall clock whether or
+/// not the holder ever runs. The two contention cases separate cleanly:
+///
+///   * CROSS-CORE (the VUGPAR steady state — two cores compositing at once) — the holder runs on its
+///     own core, its hold is one bounded pixel pass, and it returns the loan well inside the budget.
+///   * SAME-CORE PREEMPTED HOLDER (the F5 corner) — the holder cannot run while we spin, the budget
+///     expires, and we take the deferred close. Bounded stall, then an honest refusal. Never a dead
+///     core, which is the whole point.
+///
+/// Never `hlt`: a WFI under masked IRQs is not this policy's business, and an unmasked caller gets its
+/// progress for free anyway — [`overlay_claim`] masks only for its own O(1) hold, so IRQs are live
+/// between attempts and the scheduler can run the loan holder.
+fn overlay_claim_bounded(budget_ms: u64) -> Result<OverlayLoan, OverlayClaimError> {
+    let first = overlay_claim();
+    if first.is_ok() {
+        return first;
+    }
+    // No trustworthy monotonic counter on this machine: take one more O(1) attempt and accept the
+    // answer. A spin with no measurable deadline is exactly the unbounded wait this function exists
+    // to avoid, so it is never entered.
+    let Some((t0, hz)) = mono_now_hz() else {
+        return overlay_claim();
+    };
+    let budget = hz.saturating_mul(budget_ms) / 1000;
+    loop {
+        core::hint::spin_loop();
+        if let Ok(l) = overlay_claim() {
+            #[cfg(feature = "witness")]
+            W11_WAITED_OK.fetch_add(1, Ordering::Relaxed);
+            return Ok(l);
+        }
+        let Some((now, _)) = mono_now_hz() else {
+            return Err(OverlayClaimError::Busy);
+        };
+        if now.wrapping_sub(t0) >= budget {
+            return Err(OverlayClaimError::Busy);
+        }
+    }
+}
+
+/// WEDGE-11 — record a refused claim. The counting half of every `Busy` in this module's overlay
+/// surface; the POLICY half is stated at each site, because the fallbacks differ.
+#[cold]
+fn note_overlay_refused() {
+    #[cfg(feature = "witness")]
+    {
+        W11_REFUSED.fetch_add(1, Ordering::Relaxed);
+        if crate::arch::irqs_masked() {
+            W11_REFUSED_MASKED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// WEDGE-11 — an overlay session [`adopt_overlay`] could not close, deferred to the next
+/// [`overlay_open`].
+///
+/// ### Deferred damage, never silence — [`owe_repaint`]'s pattern, one lock over
+/// A refusal at the tail leaves `session` set with coverage bits nobody will ever install. Without
+/// this flag that is permanent: `adopt_overlay` is the only closer, it only runs for a pass that
+/// opened a session, and every later `overlay_open` finds the abandoned session and declines. So the
+/// close is not dropped, it is OWED — and [`overlay_open`] cashes it under the very claim it needs
+/// anyway, before it tests the session flag. The mechanism is switched off for at most one composite
+/// pass rather than for the boot, and the passes in between take CURSOR-3's whole-sprite bracket,
+/// which is always available and always correct.
+///
+/// Arming it is sound without holding the overlay, and only because the session it abandons is
+/// single-owner: the session that is open when we are refused is OUR pass's, no other pass can have
+/// one, and the next successful claim is by definition not concurrent with any holder.
+///
+/// [`owe_repaint`] is armed alongside, because an abandoned session is also an uninstalled coverage
+/// set: the panel holds the arrow at pixels whose `saved` the module never took, which is exactly the
+/// condition a whole-sprite refresh against the finished front resolves.
+#[cold]
+fn owe_overlay_close() {
+    note_overlay_refused();
+    OVERLAY_CLOSE_OWED.store(true, Ordering::Release);
+    #[cfg(feature = "witness")]
+    W11_ABANDONED.fetch_add(1, Ordering::Relaxed);
+    owe_repaint();
+}
+
+/// WEDGE-11 — see [`owe_overlay_close`]. Consumed by [`overlay_open`], under its own claim.
+static OVERLAY_CLOSE_OWED: AtomicBool = AtomicBool::new(false);
+
+/// WEDGE-11 — overlay claims refused for [`OverlayClaimError::Busy`], over every entry point.
+#[cfg(feature = "witness")]
+static W11_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// WEDGE-11 — of [`W11_REFUSED`], those taken with interrupts MASKED. This is the F5 population: every
+/// one of these at [`overlay_open`] or [`adopt_overlay`] is a core that would have spun unpreemptibly,
+/// and silently, before this arc.
+#[cfg(feature = "witness")]
+static W11_REFUSED_MASKED: AtomicU64 = AtomicU64::new(0);
+
+/// WEDGE-11 — [`overlay_claim_bounded`] waits that succeeded inside [`OVERLAY_CLAIM_BUDGET_MS`].
+/// Contention absorbed without abandoning a session; only [`adopt_overlay`] can produce these.
+#[cfg(feature = "witness")]
+static W11_WAITED_OK: AtomicU64 = AtomicU64::new(0);
+
+/// WEDGE-11 — sessions abandoned by a refused tail, i.e. closes deferred to [`overlay_open`].
+#[cfg(feature = "witness")]
+static W11_ABANDONED: AtomicU64 = AtomicU64::new(0);
+
+/// WEDGE-11 — owed closes actually cashed at an [`overlay_open`]. Deferred, then paid.
+#[cfg(feature = "witness")]
+static W11_CLOSED_LATE: AtomicU64 = AtomicU64::new(0);
+
+/// WEDGE-11 — the overlay claim/loan rollup, chained off `[wedge9]`'s because it is the same pass's
+/// story one lock over: `[wedge9]` says how often a context could not claim the SPRITE, this says how
+/// often it could not claim the OVERLAY.
+///
+/// * **`refused`** — claims that found the overlay loaned out. Contention, not damage: every site but
+///   the tail already had a fallback for a contended `try_lock` and takes the same one.
+/// * **`masked`** — of those, the ones taken with interrupts masked. Before this arc a masked refusal
+///   at `overlay_open`/`adopt_overlay` was instead an unpreemptible spin on a preemptible holder, i.e.
+///   the F5 wedge itself. **This number being non-zero is the mechanism being caught, not a fault.**
+/// * **`waited`** — [`adopt_overlay`]'s bounded waits that succeeded, costing no abandoned session.
+/// * **`abandoned` / `owed` / `closed`** — tails that could not close their session even after the
+///   budget, whether one is outstanding right now, and how many a later [`overlay_open`] closed.
+///   `closed` may trail `abandoned` by one: the last owed close is cashed by the NEXT pass to open a
+///   session, which on a quiescing panel may not come. `owed=1` at rollup time is that, caught in
+///   flight, not a leak.
+///
+/// `QUIET` where nothing was ever refused, which on QEMU raspi4b is the expected reading: no HID
+/// pointer report means `sprite_plan()` is always `None`, so no session is ever opened and the overlay
+/// is never held long enough to be met. The gate proves the WIRING; the mechanism is metal-only for
+/// the same reason WEDGE-7, WEDGE-2 and WEDGE-9 are — `timer_preempt` never runs on raspi4b, so no
+/// holder can be preempted and F5 cannot occur there.
+#[cfg(feature = "witness")]
+pub fn wedge11_rollup(scope: &str) {
+    let refused = W11_REFUSED.load(Ordering::Relaxed);
+    let masked = W11_REFUSED_MASKED.load(Ordering::Relaxed);
+    let waited = W11_WAITED_OK.load(Ordering::Relaxed);
+    let abandoned = W11_ABANDONED.load(Ordering::Relaxed);
+    let closed = W11_CLOSED_LATE.load(Ordering::Relaxed);
+    let owed = OVERLAY_CLOSE_OWED.load(Ordering::Relaxed);
+    // A refusal away from the tail is a priced fallback and says nothing about the handoff, so only
+    // the ABANDONED population can read `LOST`: a session closed by nobody, with none pending.
+    let verdict = if refused == 0 && waited == 0 {
+        "QUIET"
+    } else if abandoned == 0 {
+        "ABSORBED"
+    } else if closed > 0 || owed {
+        "DEFERRED"
+    } else {
+        "LOST"
+    };
+    serial_println!(
+        "[wedge11] overlay-claim scope={} refused={} masked={} waited={} abandoned={} owed={} closed={} -> {}",
+        scope, refused, masked, waited, abandoned, u8::from(owed), closed, verdict
+    );
+}
 
 /// CURSOR-4 — open the pass's overlay session, or report that another pass owns it.
 ///
@@ -2802,11 +3123,33 @@ static OVERLAY: Mutex<Overlay> = Mutex::new(Overlay {
 /// it. `false` means the caller must fall back to CURSOR-3's whole-sprite bracket: full undraw,
 /// `Repaint` tail, no plan handed to any window.
 ///
-/// `lock()` rather than `try_lock()` is admissible here for the same reason `sprite_plan()`'s is —
-/// this runs outside the guard, so this lock is not in F4's drain wait set. Inside the guard the
-/// overlay is only ever `try_lock`ed.
+/// WEDGE-11 — this used to be a BLOCKING `OVERLAY.lock()`, admitted on the argument that it runs
+/// outside the `BlitGuard` and so is not in F4's drain wait set. True, and beside the point the family
+/// makes: `composite` is called from `wm::present` inside `SYS_WIN_PRESENT`'s mask, so this was a
+/// masked acquirer blocking on a lock whose holder — `undraw_locked`, mid panel walk — is an ordinary
+/// preemptible task. That is F5, and it is why the acquisition is now a claim.
+///
+/// **Busy policy: report the overlay taken.** `Busy` means another context holds the loan, which for
+/// this caller is indistinguishable in consequence from an open session — the answer is `false` either
+/// way, and `false` is a fully priced answer here: the pass runs CURSOR-3's whole-sprite bracket,
+/// which is always available and always correct. Nothing is lost and nothing waits.
+///
+/// It is also the one place an owed close is cashed — see [`owe_overlay_close`]. The order matters:
+/// the abandoned session is retired BEFORE the `session` test, or the deferral would defer forever.
 pub fn overlay_open(plan: &Plan) -> bool {
-    let mut ov = OVERLAY.lock();
+    let mut ov = match overlay_claim() {
+        Ok(l) => l,
+        Err(_) => {
+            note_overlay_refused();
+            return false;
+        }
+    };
+    if OVERLAY_CLOSE_OWED.swap(false, Ordering::AcqRel) {
+        ov.session = false;
+        ov.covered.reset();
+        #[cfg(feature = "witness")]
+        W11_CLOSED_LATE.fetch_add(1, Ordering::Relaxed);
+    }
     if ov.session {
         return false;
     }
@@ -2848,9 +3191,15 @@ fn overlay_matches(ov: &Overlay, plan: &Plan) -> bool {
 /// is sound for this case and only for this case.
 #[must_use]
 pub fn overlay_uncover(plan: &Plan, bx: usize, by: usize, bw: usize, bh: usize) -> bool {
-    let mut ov = match OVERLAY.try_lock() {
-        Some(g) => g,
-        None => return false,
+    // WEDGE-11 — **Busy policy: `false`, the caller's existing obligation.** A refused claim is the
+    // contended `try_lock` this replaces, and the `#[must_use]` contract already forces the caller to
+    // invalidate the session rather than shrug. Counted; nothing else changes.
+    let mut ov = match overlay_claim() {
+        Ok(g) => g,
+        Err(_) => {
+            note_overlay_refused();
+            return false;
+        }
     };
     if !overlay_matches(&ov, plan) {
         return true;
@@ -2889,9 +3238,14 @@ pub fn overlay_uncover(plan: &Plan, bx: usize, by: usize, bw: usize, bh: usize) 
 /// `BlitGuard` window.
 #[must_use]
 pub fn overlay_uncover_any(bx: usize, by: usize, bw: usize, bh: usize) -> bool {
-    let mut ov = match OVERLAY.try_lock() {
-        Some(g) => g,
-        None => return false,
+    // WEDGE-11 — **Busy policy: `false`**, as [`overlay_uncover`]'s, and routed the same way by the
+    // caller ([`note_uncover_lost`], then the owner's tail declines the install wholesale).
+    let mut ov = match overlay_claim() {
+        Ok(g) => g,
+        Err(_) => {
+            note_overlay_refused();
+            return false;
+        }
     };
     if !ov.session {
         return true;
@@ -2936,9 +3290,15 @@ pub fn compose_into(layer: &FrameBuffer, ox: usize, oy: usize, plan: Plan) -> Co
         let (lx, ly) = (x - ox, y - oy);
         if lx < li.width && ly < li.height { Some((lx, ly)) } else { None }
     };
-    let mut ov = match OVERLAY.try_lock() {
-        Some(g) => g,
-        None => {
+    // WEDGE-11 — **Busy policy: decline the offer (`Composed::locked`).** The field is named for the
+    // lock it used to be and keeps its meaning exactly: this offer did nothing at all, and `wm` clears
+    // the coverage bits inside this window's box so the tail repaints them from the front. This site
+    // runs inside the `BlitGuard` window, so it may not wait under any circumstances — the claim never
+    // does.
+    let mut ov = match overlay_claim() {
+        Ok(g) => g,
+        Err(_) => {
+            note_overlay_refused();
             out.locked = true;
             return out;
         }
@@ -3089,18 +3449,25 @@ pub fn adopt_overlay() {
             // undraw may put one stale frame back before its draw re-saves from the finished front,
             // and [`repair`] damages the windows it reached. That is CURSOR-9's documented residual,
             // absorbed by CURSOR-9's machinery.
-            {
-                let mut ov = OVERLAY.lock();
-                ov.session = false;
-                ov.covered.reset();
+            //
+            // WEDGE-11 — the close is now a BOUNDED claim rather than a blocking lock, and if even
+            // that is refused the close is OWED to the next `overlay_open` ([`owe_overlay_close`],
+            // which arms `owe_repaint` itself). The obligation is unchanged; only the wait is.
+            match overlay_claim_bounded(OVERLAY_CLAIM_BUDGET_MS) {
+                Ok(mut ov) => {
+                    ov.session = false;
+                    ov.covered.reset();
+                    owe_repaint();
+                }
+                Err(_) => owe_overlay_close(),
             }
-            owe_repaint();
             return;
         }
     };
     let restored = {
-        // WEDGE-9 — the `OVERLAY.lock()` below is a BLOCKING acquisition taken while this function
-        // holds the sprite LOAN, and that is admissible where it was not admissible before. The
+        // WEDGE-9 — the overlay acquisition below (a blocking `OVERLAY.lock()` then; a bounded claim
+        // since WEDGE-11) is taken while this function holds the sprite LOAN, and that is admissible
+        // where it was not admissible before. The
         // WEDGE-2 audit named this nesting as the first of three disqualifiers for WEDGE-7's masked
         // micro-guard: masking `SPRITE` across the section would have put a masked spinner on
         // `OVERLAY`, reproducing the family shape one level down. Under claim/loan there is no such
@@ -3111,80 +3478,97 @@ pub fn adopt_overlay() {
         // only place that holds the sprite while taking the overlay, and nothing takes them the other
         // way round.
         //
-        // What the loan does NOT excuse is the acquisition itself. `OVERLAY`'s blocking acquirers are
-        // `overlay_open` (O(1) field writes) and this one (a bounded ≤`MAX_PIX` index walk over two
-        // arrays, no I/O, and no lock taken inside the hold); every other site `try_lock`s. Both
-        // holds are bounded and neither can block on anything while held — the WEDGE-7 precondition —
-        // and WEDGE-9 strictly improves the picture by removing the spinnable lock this one used to
-        // be nested inside. Giving `OVERLAY` the masked micro-guard as well is a separate arc's work
-        // and is flagged rather than done here.
+        // What the loan did NOT excuse is the acquisition itself, and WEDGE-11 is the arc WEDGE-9
+        // flagged for it — reaching the opposite conclusion about the idiom, on an enumeration
+        // WEDGE-9 did not perform. WEDGE-9 weighed only the two BLOCKING acquirers (`overlay_open`,
+        // O(1); this one, a bounded ≤`MAX_PIX` walk over two RAM arrays) and concluded the masked
+        // micro-guard would fit. But the micro-guard masks at the SOLE acquisition path, so its
+        // precondition binds every section the mask covers — the `try_lock` sites too — and two of
+        // those (`undraw_locked`, `undraw_within_locked`, since FLICKER-2/3 put the session-fresh
+        // restore inside the hold) walk ≤`MAX_PIX` `read_pixel`/`put_pixel` pairs against the PANEL.
+        // That is the family doc's excluded-by-name I/O, so the micro-guard is refused here for the
+        // same reason WEDGE-2 refused it for `SPRITE`, and this lock joins the claim/loan half of the
+        // family instead. See [`OVERLAY_FREE`] for the full audit.
+        //
         // CURSOR-4 — the session closes here, unconditionally, whatever the pass managed. `composite`
         // routes every exit through its tail, so this is the one place that can release it, and a
-        // session that outlived its pass would lock the mechanism out for the rest of the boot.
-        let coherent = {
-            let mut ov = OVERLAY.lock();
-            // CURSOR-5's coherence question, computed on its OWN terms and nothing else: does the
-            // open session still describe the sprite that exists? This is what `adopt_incoh` counts,
-            // and it must stay answerable independently of anything CURSOR-6 added.
-            let c5_coherent = ov.session
-                && sp.drawn
-                && ov.epoch == sp.epoch
-                && (ov.bx, ov.by, ov.bw, ov.bh, ov.s) == (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
-            // CURSOR-6 — `!uncover_lost` is a SECOND, independent reason to decline the install. A
-            // dropped coverage clear means at least one `covered` bit describes a pixel some window
-            // has since overwritten, and the install below would hand that pixel's stale save to the
-            // module AND clear its `off` bit. Neither the generation nor the geometry moved, so
-            // `c5_coherent` cannot see it. Declining routes the pass to `refresh_locked`, which
-            // re-establishes the whole sprite from the finished front buffer — CURSOR-3's fallback,
-            // always available and always correct.
-            //
-            // The two are AND-ed for the DECISION and counted SEPARATELY for the evidence. The first
-            // cut suppressed `adopt_incoh` whenever a lost clear coincided, which would have hidden
-            // a real CURSOR-5 incoherence behind a CURSOR-6 one — a silent counter, which is exactly
-            // the failure mode that made P65v2 unreadable.
-            let coherent = c5_coherent && !uncover_lost;
-            if coherent {
-                // Install the layer-derived save-under for every pixel a present delivered. Those
-                // pixels are on the panel already — this is bookkeeping, not painting, which is what
-                // makes the composed path cheaper than the bracket as well as steadier.
-                let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
-                let covered = ov.covered;
-                let src = &ov.saved;
-                let mut off = sp.off;
-                // CURSOR-11 — the install RETIRES the pending verdict for every pixel it claims, and
-                // it does so here rather than leaving it to `settle_pending_locked` because these are
-                // the pixels whose save-under the layer, and only the layer, can supply. The panel
-                // holds our `FILL` at each of them now (the row copies delivered it), so a front read
-                // would answer "untouched" and keep the PRE-PRESENT pixel as the save-under — the
-                // stale save that stamps last frame's window content back into a live window. See
-                // `settle_pending_locked` for why this ordering is the whole coherence argument.
-                let mut pend = sp.pend;
-                let dst = &mut sp.saved;
-                for_each_sprite_pixel(bx, by, bw, bh, s, |_x, _y, _c, i| {
-                    if covered.get(i) && i < dst.len() && i < src.len() {
-                        dst[i] = src[i];
-                        off.clear(i);
-                        if pend.get(i) {
-                            pend.clear(i);
-                            #[cfg(feature = "witness")]
-                            C11_PIX_INSTALLED.fetch_add(1, Ordering::Relaxed);
+        // session that outlived its pass would lock the mechanism out for the rest of the boot. That
+        // obligation is what buys this ONE site a bounded wait — see [`overlay_claim_bounded`] — and
+        // [`owe_overlay_close`] for what happens when even the budget is not enough.
+        let coherent = match overlay_claim_bounded(OVERLAY_CLAIM_BUDGET_MS) {
+            Ok(mut ov) => {
+                // CURSOR-5's coherence question, computed on its OWN terms and nothing else: does the
+                // open session still describe the sprite that exists? This is what `adopt_incoh` counts,
+                // and it must stay answerable independently of anything CURSOR-6 added.
+                let c5_coherent = ov.session
+                    && sp.drawn
+                    && ov.epoch == sp.epoch
+                    && (ov.bx, ov.by, ov.bw, ov.bh, ov.s) == (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
+                // CURSOR-6 — `!uncover_lost` is a SECOND, independent reason to decline the install. A
+                // dropped coverage clear means at least one `covered` bit describes a pixel some window
+                // has since overwritten, and the install below would hand that pixel's stale save to the
+                // module AND clear its `off` bit. Neither the generation nor the geometry moved, so
+                // `c5_coherent` cannot see it. Declining routes the pass to `refresh_locked`, which
+                // re-establishes the whole sprite from the finished front buffer — CURSOR-3's fallback,
+                // always available and always correct.
+                //
+                // The two are AND-ed for the DECISION and counted SEPARATELY for the evidence. The first
+                // cut suppressed `adopt_incoh` whenever a lost clear coincided, which would have hidden
+                // a real CURSOR-5 incoherence behind a CURSOR-6 one — a silent counter, which is exactly
+                // the failure mode that made P65v2 unreadable.
+                let coherent = c5_coherent && !uncover_lost;
+                if coherent {
+                    // Install the layer-derived save-under for every pixel a present delivered. Those
+                    // pixels are on the panel already — this is bookkeeping, not painting, which is what
+                    // makes the composed path cheaper than the bracket as well as steadier.
+                    let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
+                    let covered = ov.covered;
+                    let src = &ov.saved;
+                    let mut off = sp.off;
+                    // CURSOR-11 — the install RETIRES the pending verdict for every pixel it claims, and
+                    // it does so here rather than leaving it to `settle_pending_locked` because these are
+                    // the pixels whose save-under the layer, and only the layer, can supply. The panel
+                    // holds our `FILL` at each of them now (the row copies delivered it), so a front read
+                    // would answer "untouched" and keep the PRE-PRESENT pixel as the save-under — the
+                    // stale save that stamps last frame's window content back into a live window. See
+                    // `settle_pending_locked` for why this ordering is the whole coherence argument.
+                    let mut pend = sp.pend;
+                    let dst = &mut sp.saved;
+                    for_each_sprite_pixel(bx, by, bw, bh, s, |_x, _y, _c, i| {
+                        if covered.get(i) && i < dst.len() && i < src.len() {
+                            dst[i] = src[i];
+                            off.clear(i);
+                            if pend.get(i) {
+                                pend.clear(i);
+                                #[cfg(feature = "witness")]
+                                C11_PIX_INSTALLED.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
-                    }
-                });
-                sp.off = off;
-                sp.pend = pend;
+                    });
+                    sp.off = off;
+                    sp.pend = pend;
+                }
+                ov.session = false;
+                ov.covered.reset();
+                // Counted on CURSOR-5's OWN predicate, so a lost clear can neither create nor mask an
+                // `adopt_incoh`. The two mechanisms overlap freely and each is counted where it belongs
+                // (`uncover_lost` is bumped at `note_uncover_lost`); a pass that hit both appears in
+                // both, which is the truth and is what lets a bench reader add them up.
+                #[cfg(feature = "witness")]
+                if !c5_coherent {
+                    C5_ADOPT_INCOH.fetch_add(1, Ordering::Relaxed);
+                }
+                coherent
             }
-            ov.session = false;
-            ov.covered.reset();
-            // Counted on CURSOR-5's OWN predicate, so a lost clear can neither create nor mask an
-            // `adopt_incoh`. The two mechanisms overlap freely and each is counted where it belongs
-            // (`uncover_lost` is bumped at `note_uncover_lost`); a pass that hit both appears in
-            // both, which is the truth and is what lets a bench reader add them up.
-            #[cfg(feature = "witness")]
-            if !c5_coherent {
-                C5_ADOPT_INCOH.fetch_add(1, Ordering::Relaxed);
+            // WEDGE-11 — **Busy policy: defer the close, take the bracket.** `false` routes the pass
+            // to `refresh_locked`, the whole-sprite rebuild against the finished front, which is
+            // exactly what an incoherent adopt already does and needs no overlay state at all. The
+            // coverage install is discarded — CURSOR-9's documented residual, the same one WEDGE-9's
+            // refusal at the sprite claim above accepts.
+            Err(_) => {
+                owe_overlay_close();
+                false
             }
-            coherent
         };
         // The sprite's own generation moved under us (another core ran a full `repaint` mid-pass), or
         // the pointer has moved since the plan was taken, or it has gone invisible: none of the
