@@ -45,24 +45,29 @@ then it is a known, accepted risk rather than an oversight.
 
 The two unfolded branches above. Then the GR13 menu that never got picked up — see the baton.
 
-## Fox relayed twice on 2026-08-02; both verified in-tree, neither needs action now
+## Fox: two relays 2026-08-02, both round-tripped and CLOSED
 
-- **The settle trim reconciles.** Fox reads the Pi's trim as 694→100, not 150→100. Both are
-  right about different baselines: the settle used to be `hw_wait_budget()/4`, and that
-  function really is arch-conditional (x86 calibrates off the TSC, aarch64 returns a fixed
-  150 M ticks) — ~500 ms on x86, ~694 ms on the Pi. BOOTPACE M4 flattened it to 150 on both;
-  my arc took that to 100. Fox's own evidence says 100 ms is **safe** on the Pi (`CCS=1`
-  before the settle spin across five captures plus PA6; required settle 0 ms observed), so
-  this is corroboration, not a conflict. Both seats now agree `/on` is unmeasured — and
-  unmeasurable on the Pi. **The one thing left open is whether `hw-pi4` carries M4 at all**;
-  if not, the two branches hold different settle histories and the merge needs a real answer.
+- **The settle trim reconciles, and it leaves one real merge decision.** 150→100 and Fox's
+  694→100 are both right about different baselines: the settle used to be
+  `hw_wait_budget()/4`, and that function really is arch-conditional (x86 calibrates off the
+  TSC, aarch64 returns a fixed 150 M ticks) — ~500 ms on x86, ~694 ms on the Pi. BOOTPACE M4
+  flattened it to 150 on both; my arc took that to 100 for `/pre`. **`hw-pi4` does not carry
+  M4** — Fox checked `dac6edb5`, and I confirmed independently at the reachable tip
+  (`origin/hw-pi4:...xhci/mod.rs:3121` is still `hw_wait_budget() / 4`, greps 0 for
+  BOOTPACE/CCSTRIM). **Agreed answer, both seats: the merged tree takes our flat `/pre = 100
+  ms`**, the Pi drops 694→100, both stories collapse to one. A merge *decision*, not a
+  conflict to resolve textually. Fox's evidence independently says 100 ms is safe on the Pi.
+  Both seats now state `/on` is unmeasured, and unmeasurable there.
+  🚩 At merge, `hw_wait_budget() / 4` still appears in **both** trees at a second site — a
+  `usbdebug` event-ring diagnostic budget. That one is a policy number, correctly derived;
+  M4 left it alone deliberately. Not evidence of an incomplete M4.
 - **WEDGE-8 is coming for the shared xHCI static, but it is not on origin.** Fox made
   `XHCI_CONTROLLER` private behind a claim/loan API. I checked: `dac6edb5` is not in this
-  repo, `origin/hw-pi4` tips at WEDGE-7, and the static there is still public and unboxed. So
-  it lives on Fox's disk only — nothing to rebase over, don't chase it. When it lands, this
-  tree has **27 `.lock()` sites** to convert against their invariant of 3. Flagged for the
-  integrator: 4 of those are in `aarch64/xusb_tegra.rs`, the **Jetson** lane's file, which
-  Fox's converted-sites list does not mention.
+  repo, `origin/hw-pi4` tips at WEDGE-7, and the static there is still public and unboxed —
+  it lives on Fox's disk only. Nothing to rebase over; don't chase it. When it lands, this
+  tree has **27 `.lock()` sites** to convert against their invariant of 3. ✅ The Jetson-lane
+  worry is closed: all 4 `aarch64/xusb_tegra.rs` sites *are* converted in `dac6edb5` (their
+  first relay listed only the x86 ones), and the tegra combination type-checks green.
 
 ## How Peter wants to be worked with
 
