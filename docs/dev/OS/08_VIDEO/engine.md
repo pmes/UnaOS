@@ -4235,8 +4235,20 @@ the tree already has one — WEDGE-2's `wedge2_raw_byte`.
 | --- | --- | --- |
 | `<D1>` / `<d1>` | teardown entry, **before** the `TABLE`/`WRITER` section (`close`, `close_owner`, `move_to`) | uppercase = the core owning the open focus chain, lowercase = a teardown on some OTHER core while that chain is open. `<D1>` with no `<D2>` puts the death upstream of the barrier — blindness 2 |
 | `<D2>` | that section is behind us; the barrier is going up and this core is about to spin | `<D2>` with no `<D3>` puts the death in the spin |
-| `<D3>` | the spin returned; the barrier is held | pairs with `<D2>` |
+| `<D3>` | the spin returned; the barrier is held | pairs with `<D2>`; `<D3>` with no `<D4>` puts the death in the erase/reclaim run |
+| `<D4>` | the erase/reclaim half is behind us and the barrier is down; the cursor bracket (`cursor::repaint`, and with it `SPRITE`) is next. `close_owner` only | `<D4>` as the LAST token on a torn wire puts the death on `SPRITE` — the **F4** site, not F1's `TABLE` |
 | `<D!>` | the stall tripwire fired, **before** its `serial_println!` | `<D!>` with no `DRAIN STALLED` line after it is blindness 1 caught in the act |
+
+**`<D4>` exists because the F4 death was otherwise misattributed to F1.** Before it, a `close_owner`
+that died in `cursor::repaint` left `<D3>` as the last token on the wire — and `<D3>` is emitted from
+inside `DrainBarrier::drain`, which *every* teardown reaches, so a `SPRITE` wedge and a reclaim wedge
+produced the same trace and the audited F1 site (`TABLE`, closed by WEDGE-7's `fn table()`) was the
+natural place to pin it. `SPRITE` is reached on **every** EL0 exit through this path, and a core that
+blocks on it there is IRQ-masked by `sched::exit`, so the outcome is a silent total freeze of panel,
+cursor and input. The token does not fix that — it makes the capture name the lock. It is
+unconditional (`wedge2::mark`), on `<D2>`/`<D3>`'s terms rather than `<D1>`'s: it sits past the
+`n == 0` early return, so its population is teardowns that genuinely freed a row and raised a
+barrier, and a wedge that eats the panel is worth naming whether or not a TAB is in flight.
 
 `<D1>` is chain-gated (`wedge2::mark_composite`) and the budget is measured, not preferred: the first
 cut emitted it unconditionally and the wedge2 gate run priced it at **96 tokens against the focus
@@ -4329,6 +4341,18 @@ read as the mechanism being quiet.** What the gate does prove is the `<D2>`/`<D3
 and the dwell line's wiring. One `<D2>` reads as `<activD2>` on the wire — another core's line
 interleaved with the token's bytes, WEDGE-2's stated and accepted cost for taking no lock.
 
+**`<D4>` gate reading (210 s full-knob window, MBENCH PASS 90/90, 26398 lines).** `<D2>`=31,
+`<D3>`=32, `<D4>`=3, `<D1>`=0, `<D!>`=0. The `<D2>`/`<D3>` gap is one more interleave of the same
+kind and not a missing token — the split `<D2>` is legible on the wire as
+`run /fat/<DVUG.ELF2> <D3>— loaded 12568 bytes`, its two halves wrapped around another core's
+`EXEC-UVUG` line, so the true pairing is 32/32. `<D4>`=3 against `<D3>`=32 is the expected ratio and
+is itself the token's design: `<D4>` sits past `close_owner`'s `n == 0` early return, so it counts
+only the teardowns that actually freed a row, while `<D3>` counts every barrier `close`, `move_to`
+and `close_owner` raise between them. All three `<D4>`s are followed by further output (two by the
+focus chain's own `<F4><F5>`), i.e. no wedge — which is what this gate can show and the limit of it:
+`timer_preempt` never runs on raspi4b, so F4 cannot occur there and a clean QEMU run is a wiring
+proof, never a refutation of the mechanism.
+
 #### Metal watch-list (WEDGE-1r2)
 
 * `-> DWELL` or a repeated `-> INFLIGHT` locates a real stall well below the tripwire, and is the
@@ -4338,6 +4362,11 @@ interleaved with the token's bytes, WEDGE-2's stated and accepted cost for takin
 * `<D1>`/`<d1>` as the LAST thing on a torn wire: the death is in the teardown's own `TABLE`/`WRITER`
   section, upstream of the barrier — the region WEDGE-1 never covered, and the reason its silence
   could not exonerate the teardown path.
+* `<D4>` as the LAST thing on a torn wire: the death is on **`SPRITE`**, in `close_owner`'s cursor
+  bracket — F4, downstream of everything F1 and the barrier cover. Expect it to come with a dead
+  panel rather than a merely stalled teardown: the sprite lock gates the cursor bracket every
+  compositor path takes, so panel, cursor and input stop together. Until this token existed that
+  death read as `<D3>`-then-silence and was attributed to the reclaim run or to F1's `TABLE`.
 * A quiet `[wedge1]` still means **nothing about the barrier** unless `drains > 0`. That is the whole
   point of the verdict naming the scene.
 

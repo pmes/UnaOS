@@ -953,6 +953,28 @@ pub fn close_owner(owner_asid: u64) -> usize {
     reclaim(&moved[..nv]);
     // Re-open the barrier before recompositing — a composite under a raised barrier is a no-op.
     drop(barrier);
+    // WEDGE-2 `<D4>` — THE ERASE/RECLAIM HALF IS BEHIND US AND THE BARRIER IS DOWN; the cursor
+    // bracket is next, and with it the `SPRITE` acquisition.
+    //
+    // Without this token a death on `SPRITE` here is MISREPORTED as a death on `TABLE`: the last
+    // thing on the wire would be `<D3>`, and `<D3>` is emitted from inside `DrainBarrier::drain`,
+    // which every teardown reaches — so the reader would place the wedge in the erase/reclaim run
+    // and never look at the cursor at all. `<D4>` splits that region in two, and the split is the
+    // whole point: `<D3>` with no `<D4>` is the reclaim, `<D4>` as the LAST token on the wire is
+    // `cursor::repaint` — i.e. `SPRITE`, which is the F4 site and a different lock from F1's.
+    //
+    // This path is the one that matters for that distinction. `close_owner` runs on EVERY EL0 task
+    // exit (`sched::exit` → `clear_handle_row`), which has already masked interrupts, so a core that
+    // blocks on `SPRITE` below is unpreemptible and silent — and the symptom is not a stalled
+    // teardown but a dead panel: the sprite lock gates the cursor bracket every compositor path
+    // takes, so the freeze is total (panel, cursor and input at once) with nothing on the wire.
+    //
+    // Unconditional `mark`, NOT `mark_composite`, and that is the same rule `<D2>`/`<D3>` follow
+    // rather than a departure from `<D1>`'s: it sits past the `n == 0` early return, so its
+    // population is teardowns that genuinely freed a row and genuinely raised a barrier — 31 in the
+    // reference wedge2 run, not the 96 that made `<D1>` unaffordable ungated. And a wedge that eats
+    // the panel is worth naming whether or not a TAB happens to be in flight.
+    crate::wedge2::mark("<D4>");
     // CURSOR-14 — close the erase bracket before the composite; see `move_to`.
     super::cursor::repaint();
     composite();
@@ -2683,15 +2705,27 @@ static DRAIN_STALL_REPORTED: core::sync::atomic::AtomicBool =
 //                   open focus chain, lowercase on any other.
 //   `<D2>`        — that section is behind us; the barrier is going up and this core is about to spin.
 //   `<D3>`        — the spin returned. The barrier is held and the erase/reclaim half is next.
+//   `<D4>`        — the erase/reclaim half is behind us and the barrier is down; the cursor bracket
+//                   (`cursor::repaint`, and with it `SPRITE`) is next. `close_owner` only.
 //   `<D!>`        — the stall tripwire FIRED, emitted before its `serial_println!` so a blocked print
 //                   no longer erases the fact that the threshold was crossed.
 //
 // Read exactly as WEDGE-2's are read — by what is MISSING after the last one on a torn wire:
 // `<D1>` with no `<D2>` puts the death upstream of the barrier, in the teardown's own critical
-// section (blindness 2); `<D2>` with no `<D3>` puts it in the spin; `<D!>` with no `[wedge1] DRAIN
-// STALLED` line after it is blindness 1 caught in the act — the tripwire fired and the serial lock
-// ate it. A `<D1>` that is NOT the last thing on the wire is an ordinary teardown that took an early
-// return (no such row, an unmoved `move_to`); a `<D1>` that IS the last thing is the finding.
+// section (blindness 2); `<D2>` with no `<D3>` puts it in the spin; `<D3>` with no `<D4>` puts it in
+// the erase/reclaim run; `<D4>` as the LAST token puts it in the cursor bracket, i.e. on `SPRITE`;
+// `<D!>` with no `[wedge1] DRAIN STALLED` line after it is blindness 1 caught in the act — the
+// tripwire fired and the serial lock ate it. A `<D1>` that is NOT the last thing on the wire is an
+// ordinary teardown that took an early return (no such row, an unmoved `move_to`); a `<D1>` that IS
+// the last thing is the finding.
+//
+// **`<D4>` EXISTS BECAUSE THE F4 DEATH WAS OTHERWISE MISATTRIBUTED TO F1.** Before it, the last
+// token on a `close_owner` that died in `cursor::repaint` was `<D3>` — emitted from inside
+// `DrainBarrier::drain`, which every teardown reaches — so a `SPRITE` wedge and a reclaim wedge were
+// the same wire trace, and the audited F1 site (`TABLE`, now closed by WEDGE-7's `fn table()`) was
+// the natural place to pin it. `SPRITE` is reached on EVERY EL0 exit through this path, and a core
+// that blocks on it here is IRQ-masked by `sched::exit`, so the outcome is a silent total freeze of
+// panel, cursor and input. The token does not fix that; it makes the capture say which lock it was.
 //
 // **`<D1>` speaks only while a focus chain is open, and that budget is a measured constraint rather
 // than a preference.** The first cut emitted it unconditionally at each teardown entry, and the
