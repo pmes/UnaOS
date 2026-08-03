@@ -98,6 +98,15 @@ fn map_blk(e: crate::drivers::block::BlockError) -> InstallError {
         crate::drivers::block::BlockError::NotReady => InstallError::NotReady,
         crate::drivers::block::BlockError::BadLba => InstallError::BadLba,
         crate::drivers::block::BlockError::Io => InstallError::Io,
+        // WEDGE-10 (F2): the storage device was momentarily loaned to another context, so this sector op
+        // refused its bounded wait and touched nothing. `InstallError` has no transient/retry variant —
+        // the installer engine is a one-shot boot-path ladder with no retry loop to feed — so this maps
+        // to `Io`: COARSE BUT HONEST. The install fails cleanly and loudly rather than proceeding on a
+        // sector it never actually read or wrote, which is the only property the ladder's verify stages
+        // depend on. (Unreachable in practice here: the Pi installer runs on the BSP before any other
+        // context can hold the loan.) If this path ever grows a retry, `Busy` is the one error worth
+        // retrying — see the reaper's requeue arm in `arch::aarch64::syscall::free_orphan_chain`.
+        crate::drivers::block::BlockError::Busy => InstallError::Io,
     }
 }
 

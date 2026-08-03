@@ -902,3 +902,84 @@ REQUIRE \[clickroute\] hit-test at .*close=true closereal=true -> PASS
 REQUIRE \[clickroute\] close=win[0-9]+ asid=[0-9]+ at .* settle=noproc-selftest
 FORBID \[clickroute\] close=.* settle=noproc$
 FORBID \[clickroute\] hit-test teardown LEAK
+
+# --- MBOX-1 — the VideoCore property transport: it fails CLEAN, and has ONE user at a time -------
+# ---    Two properties landed on this wire with no directive behind either. What the transport does
+# ---    when it goes WRONG is the interesting half, so most of this block is FORBIDs.
+#
+# ---    THE POSITIVE WITNESS. `:: MAILBOX: framebuffer ... ::` is one COMPLETED property transaction
+# ---    — request cleaned out to RAM, doorbell matched on the property channel, reply invalidated and
+# ---    read back — taken through MBOX-1's claim/loan. It is REQUIREd for the reason PULSE-3's
+# ---    `stepres` note gives: A RED MUST NAME THE RIGHT SUBSYSTEM. A transport that self-denied at
+# ---    boot (the per-transaction rider: `init_framebuffer` releases the loan before re-entering the
+# ---    module, and holding across that would `Busy` itself) takes the framebuffer, V3D power/clock,
+# ---    the NOTIFY_XHCI_RESET reload and EMMC2's SD base clock down with it — which without this line
+# ---    reads as thirty video reds with nothing pointing at the mailbox.
+# ---    Geometry VALUES are deliberately not pinned: the gate panel is 640x480 and the bench is
+# ---    1920x1200, and `[wc-e] fb-geometry` above already pins the numbers. That directive is also
+# ---    the transport's SECOND transaction, i.e. the standing proof the loan came back and was
+# ---    re-claimable; it needed no change for MBOX-1 and gets none.
+REQUIRE :: MAILBOX: framebuffer [0-9]+x[0-9]+ pitch=[0-9]+B stride=[0-9]+px base=0x[0-9a-f]+ size=[0-9]+ ::
+#
+# ---    THE TIMEOUT WITNESS IS NOT REQUIRED, and that is structural rather than a judgement call:
+# ---    QEMU's firmware model always replies, so `:: MAILBOX: timeout ... ::` cannot fire on this
+# ---    gate BY CONSTRUCTION. A REQUIRE would be red on every green boot. It is metal-only.
+#
+# ---    Which leaves the question worth answering — is a timeout line on this gate a FAULT? Not
+# ---    uniformly, and a blanket FORBID would be exactly the false red CURSOR-6 refused to write.
+# ---    The emitter has three exits and they do not mean the same thing:
+# ---      * `timeout waiting for write FIFO`       — the VPU never drained our post. There is no tag
+# ---                                                 and no firmware state for which that is normal.
+# ---      * `timeout (only other-channel replies)` — doorbells for channels we never post on, until
+# ---                                                 the deadline. This kernel uses CH_PROP and
+# ---                                                 nothing else; never legitimate either.
+# ---      * `timeout waiting for reply`            — no doorbell came back. THIS ONE IS LEGITIMATE
+# ---                                                 for a NOTIFY-class tag: v3d.md §46.5 (P92/P93)
+# ---                                                 established that this firmware honours such
+# ---                                                 tags WITHOUT ringing, and `notify_display_done`
+# ---                                                 times out by design. It is `#[cfg(feature =
+# ---                                                 "v3d")]`, so it is not even in this gate's
+# ---                                                 image — but this spec is replayed against metal
+# ---                                                 captures, and forbidding it would red exactly
+# ---                                                 the reply-less investigation boots the module is
+# ---                                                 written around.
+#
+# ---    So the first two are forbidden outright, and the third is caught by its DRAIN COUNT instead,
+# ---    which is the sharper assertion in any case. `drained 0` is a tag that simply never answered;
+# ---    `drained [1-9]` says a reply WAS sitting in the read FIFO when the deadline passed — the
+# ---    late-reply seed MBOX-1 exists to close, which left in place becomes the NEXT call's doorbell
+# ---    and mis-attributes every transaction after it. That is a fault on any exit, under any knob,
+# ---    on QEMU and on metal alike.
+FORBID :: MAILBOX: timeout waiting for write FIFO
+FORBID :: MAILBOX: timeout \(only other-channel replies\)
+FORBID :: MAILBOX: timeout .* drained [1-9]
+#
+# ---    THE BUSY WITNESS, forbidden outright. MBOX-1's caller audit is that no current caller runs
+# ---    masked and none runs on an AP, so nothing contends today and `:: MAILBOX: BUSY ... ::` is
+# ---    unreachable on a healthy boot. Two things can print it and neither is the protection merely
+# ---    working: a genuinely concurrent second caller — the torn-transaction hazard the claim/loan
+# ---    model was built against, arriving — or a path that held its loan across a re-entry and denied
+# ---    itself. Same standing as `[wc-k] staged=no`: the FORBID is where a reintroduced fault lands.
+FORBID :: MAILBOX: BUSY
+
+# --- WEDGE-2 `<D4>` — WHY THIS GATE PINS NOTHING, stated rather than left as an omission ---------
+# ---    `<D4>` is the F4 death token: emitted on every EL0 teardown that actually freed a row, past
+# ---    `close_owner`'s `n == 0` early return, AFTER the reclaim and after the drain barrier comes
+# ---    down. So `<D3>` with no `<D4>` puts a death in the reclaim run, and `<D4>` as the LAST token
+# ---    on the wire puts it in the cursor bracket, i.e. on `cursor::SPRITE`. Before it both produced
+# ---    the same trace and the F4 death was being attributed to F1 — a lock WEDGE-7 had closed.
+#
+# ---    It cannot be REQUIREd here. The whole `wedge2` module is knob-gated (`UNAOS_WEDGE2=1`, see
+# ---    arroyo): with the feature off `mark` compiles to an empty body and the image holds no token
+# ---    at all. Confirmed on this arc's baseline capture — 16674 lines, zero `<D1>`..`<D4>`. A
+# ---    REQUIRE would be red on every green boot, which is the same defect as a witness that vanished.
+#
+# ---    Nor is it FORBIDden, and that is the half worth writing down. The tempting reading — a token
+# ---    in a DEFAULT log would mean the cfg gate inverted and a shipped image is paying for the
+# ---    instrument — is true as far as it goes, but this spec is replayed against metal captures
+# ---    (~/pi-serial.log) and a wedge hunt IS a `UNAOS_WEDGE2=1` boot where every token is present on
+# ---    purpose. On the hunt that finds nothing — the machine survives, the battery runs to the end —
+# ---    a `<D4>` FORBID reds a healthy capture, and CURSOR-6's ruling applies verbatim: a false red
+# ---    costs Peter a bench sitting chasing a bug that is not there. The tokens' value is diagnostic
+# ---    and ORDERED ("which was last on the wire"), which this grammar cannot express regardless.
+# ---    Token table and the reading procedure: docs/dev/OS/08_VIDEO/engine.md WEDGE-2.

@@ -219,6 +219,11 @@ fn map_blk(e: block::BlockError) -> InstallError {
         block::BlockError::NotReady => InstallError::NotReady,
         block::BlockError::BadLba => InstallError::BadLba,
         block::BlockError::Io => InstallError::Io,
+        // WEDGE-10 (F2): the storage device was momentarily loaned out and this sector op refused its
+        // bounded wait, touching nothing. `InstallError` has no transient variant and the engine has no
+        // retry loop, so this is COARSE BUT HONEST `Io`: the install fails cleanly rather than
+        // proceeding on a sector it never read or wrote. Twin of `install::pi::map_blk`'s arm.
+        block::BlockError::Busy => InstallError::Io,
     }
 }
 
