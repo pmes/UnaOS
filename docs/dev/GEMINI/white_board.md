@@ -7,43 +7,53 @@ cross-session handoff lives in the baton, per-boot status in `~/unaos-bench/PLAY
 
 # OPEN
 
-## 1. One push, at arc close — not yet
+## 1. One push — now due
 
 ```
 git push origin UnaOS-gemini
 ```
 
-Nothing is owed before it. `origin/UnaOS-gemini` was verified at `0965544b` this session with a
-`git fetch` in the same call; the tree was clean and nothing was unpushed. This is the only push
-GR15 will need unless the arc splits onto a second branch, which will be named here the moment it
-is decided rather than when it is reached.
+Four commits, `0a8f5048` → `e67219d0`, on top of `0965544b`. That is the whole
+arc and the only push it needs. Nothing else is owed.
 
-## 2. A metal boot will be needed for a verdict — media not yet built
+## 2. No metal verdict yet — and no media to give one
 
-GR15 is not asking for one yet. When the media exists this line will say so, name the commit it
-carries and the knobs it was built with, and report what was verified by reading back off the card.
-Until then there is nothing to act on.
+The arc built the instrument that can finally answer whether FBCON-DMG works. It
+has not been booted, because **no removable media is present in the reader** —
+verified this session, not assumed. Nothing here is a request; it is the reason
+the evidence class in the docs still reads `unproven` rather than resolved.
+
+When a card is available the discriminator is one line: a `[wc-h] rollup win=1`
+carrying `scope=window-band`. Two rollups for `win=1` means the banding reaches
+the panel. One rollup only is a real negative. `banded=0` on the `scope=window`
+line is neither — that rollup fires at window creation, before any banded present
+can exist.
 
 ---
 
-# RECORDED THIS SESSION — no action needed, but the record was wrong
+# BENCH STATE — verified as processes, not as config
 
-Two things were written into the x86 docs as established fact and are not.
+- squawk alive on `/dev/ttyUSB0`, session `rmbp-s66-cand444`, ~4h40m uptime.
+- Both wakers armed **as running processes**. Mine went down mid-session — a
+  waker wakes you by exiting, so its own firing disarms the bench — and was
+  re-armed on a fresh anchor.
+- The waker pattern was changed from `AT-RISK|torn=yes` to `rollup win=`. The old
+  one could only ever go red: after a successful fix those strings vanish and it
+  would never fire at all. The new one was controlled four ways — silent on the
+  real log tail and on idle `[schedx86]` chatter, fires on `AT-RISK`, on
+  `TEAR-FREE`, and on the crit leg.
 
-**The window-id mapping was inverted.** `win=1` is the panel console (box 1314x750), `win=2` is the
-WC-X demo (96x64 at scale 8), `win=3` is the MOVE-VACATE probe (8x8, witness builds only). The
-docs had `win=3` as the banded console. Verified off the s69 wire, and the box arithmetic
-corroborates independently.
+---
 
-**FBCON-DMG is `unproven`, not metal-proven.** The console's four `[wc-h]` samples are all
-whole-box — `bytes=3942000` is exactly 1314 × 750 × 4 — which is the conviction case named in the
-s69 playbook's own watch list. But it is not evidence the feature is broken: `SAMPLES = 4` in
-`video/wcg.rs:145` hard-caps and never reopens, so the budget was spent on window-creation and
-first-paint presents. In that boot the samples land at capture lines 4752–4763 and the log runs to
-5744 — roughly 980 lines of console output after the rollup closed, none of it observable. The
-instrument stopped before its subject ran.
+# RECORDED — no action needed
 
-U4y is unaffected. It really was confirmed on metal.
+The x86 record carried two errors and both are corrected in `e67219d0`: the
+window-id mapping was inverted (`win=1` is the console, not `win=3`), and
+FBCON-DMG was recorded as metal-proven when the instrument could not observe it
+either way. U4y is unaffected — it really was confirmed on metal.
 
-Also worth keeping: that capture file holds **four** boots, not one — `console-route first-paint`
-announces at lines 468, 1779, 3289 and 4759.
+The gate itself was worse than the record. `./arroyo check` — the DONE gate named
+in `CLAUDE.md` — passed with **exit 0** on a blatant type error in `video/wcg.rs`,
+because that file is `witness`-gated and was never compiled. It also never
+compiled any `user-*` crate. Both holes are closed in `944b853e`, and both were
+proven to go red before being called fixed.
