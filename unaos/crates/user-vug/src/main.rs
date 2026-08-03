@@ -264,6 +264,12 @@ const SYS_INPUT_WAIT: u64 = 28;
 // WC-C: the WINDOW verbs replace the single-surface SYS_FB_MAP/SYS_FB_PRESENT compat pair.
 const SYS_WIN_CREATE: u64 = 29;
 const SYS_WIN_PRESENT: u64 = 30;
+// FBCON-DMG: `SYS_WIN_PRESENT_ROWS(win, y0, y1)` — a present that declares which SOURCE rows of this
+// program's own surface actually changed, so the compositor repaints only those. x86 only, for now; the
+// aarch64 kernel does not define 33 and answers `-ENOSYS` (-38) from its dispatcher's default arm, which
+// is why `present_rows` below carries a MANDATORY whole-box fallback rather than treating a failure as an
+// error. Additive: 30 is untouched and still the only present this program makes on aarch64.
+const SYS_WIN_PRESENT_ROWS: u64 = 33;
 
 // WITSWEEP — REGISTER-SURVIVAL INVARIANT (sys0..sys4): these stubs use `in("x1")`/`in("x2")`/
 // `in("x3")`/`in("x8")`, which PROMISES the compiler those registers hold their values across the
@@ -507,6 +513,31 @@ fn input_poll() -> u64 {
 #[inline(always)]
 fn input_wait() {
     unsafe { sys0(SYS_INPUT_WAIT) };
+}
+
+/// FBCON-DMG: present SOURCE rows `[y0, y1)` of `win`, with the MANDATORY whole-box fallback.
+///
+/// Returns exactly what a present returns — 0, or a negative errno with bit 63 set — so every call site
+/// keeps checking the result the way it already does (`rc >> 63 != 0` -> `stall_witness`).
+///
+/// THE FALLBACK IS THE POINT, and its shape is deliberately the dullest one available: try the banded
+/// verb; on ANY negative return, fall through to the byte-for-byte call this program made before this
+/// function existed. Nothing is latched, nothing is remembered, no ordering changes, and nothing about
+/// what has been drawn depends on which branch ran. So on aarch64 — where 33 is undefined and the
+/// dispatcher's default arm answers `-ENOSYS` (-38) having done nothing else — the observable behaviour
+/// of this program is what it is today, plus one syscall that returns -38 and touches nothing. It is NOT
+/// an error path: an older kernel is not a failure, it is a kernel without this verb.
+///
+/// Rows are the SURFACE's own, not the panel's, and `[y0, y1)` is half-open. The kernel refuses an empty,
+/// inverted or over-tall band with `-EINVAL` rather than quietly widening it, so a mistake in a caller's
+/// damage arithmetic shows up as a whole-box present here (via this fallback) instead of hiding.
+#[inline(always)]
+fn present_rows(win: u64, y0: u32, y1: u32) -> u64 {
+    let rc = unsafe { sys3(SYS_WIN_PRESENT_ROWS, win, y0 as u64, y1 as u64) };
+    if rc >> 63 == 0 {
+        return rc;
+    }
+    unsafe { sys1(SYS_WIN_PRESENT, win) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1087,6 +1118,17 @@ const CLICK_X: i32 = FPS_BOX_W + 3;
 /// CLICK-PLAIN: click-counter digits — cool cyan, so the two numbers in the corner never read as one.
 const CLICK_C: u32 = 0xFF6C_D8E8;
 
+/// FBCON-DMG: the exact SOURCE rows `draw_hud` touches — the half-open band `[HUD_Y0, HUD_Y1)`.
+///
+/// Derived from the painter, not guessed. `draw_hud` is two `draw_num` calls and nothing else; `draw_num`
+/// clears its backing box over `while y < 11` (rows 0..=10) and then stamps digits through `draw_digit`
+/// at `y = 2` with a 7-row glyph (rows 2..=8), which is strictly inside that clear. The two calls differ
+/// only in `x0`/colour, so their row extent is identical. Nothing else in this program writes rows 0..11
+/// on the HUD-only path. If `draw_num`'s clear height or `draw_digit`'s `y` origin ever moves, THIS
+/// CONSTANT MOVES WITH IT — an under-declared band leaves stale pixels on the panel.
+const HUD_Y0: u32 = 0;
+const HUD_Y1: u32 = 11;
+
 /// Draw a 1-3 digit readout (clamped to 999) at `x0` in the top band, over whatever the frame rendered.
 /// Runs in the PARENT, after the frame barrier and before the present, so no worker is writing.
 ///
@@ -1615,7 +1657,13 @@ pub extern "C" fn _start() -> ! {
                 if v != fps || fi.clicks > 0 {
                     fps = v;
                     unsafe { draw_hud(surf, fps, clicks) };
-                    let rc = unsafe { sys1(SYS_WIN_PRESENT, win) };
+                    // FBCON-DMG: this is the one present in the program whose damage is genuinely a BAND.
+                    // Nothing rendered this pass — the frame path did not run — and the only writer since
+                    // the last present was `draw_hud` immediately above, whose extent is `[HUD_Y0, HUD_Y1)`
+                    // by construction. So 11 of 128 source rows is the whole truth about what changed, and
+                    // repainting the other 117 is work the compositor was being asked to do for nothing,
+                    // once per second, for as long as a vug sits idled on an operator's desktop.
+                    let rc = present_rows(win, HUD_Y0, HUD_Y1);
                     if rc >> 63 != 0 {
                         stall_witness(&W_PRESENT, frame, b"present rc=", (rc as i64).unsigned_abs() as u32);
                     }
@@ -1765,6 +1813,13 @@ pub extern "C" fn _start() -> ! {
         // lost per-process slot, a torn-down surface) would present as an unexplained freeze — frames still
         // advancing here, nothing changing on screen, and the kernel's no-render cap firing on a program that
         // believed it was drawing. An error has bit 63 set (negative errno), exactly like an empty input poll.
+        //
+        // FBCON-DMG: WHOLE BOX HERE, deliberately, and this is not an oversight. The rendering path just ran
+        // the crystal across the FULL surface (the two workers own the top and bottom halves and between
+        // them write every row), so the damaged band IS `[0, SH)` and there is nothing to narrow. Declaring
+        // it through the banded verb would buy the compositor no work back and would cost every aarch64
+        // frame a syscall that can only fail. The banded verb belongs on the idle HUD path above, where the
+        // damage is 11 rows; here the honest answer is the one this line already gives.
         let rc = unsafe { sys1(SYS_WIN_PRESENT, win) };
         if rc >> 63 != 0 {
             stall_witness(&W_PRESENT, frame, b"present rc=", (rc as i64).unsigned_abs() as u32);

@@ -49,6 +49,18 @@ const SYS_GETINFO: u64 = 7;
 // explicitly retire a window, and a window is retired correctly at slot teardown (`win_close_slot`).
 const SYS_WIN_CREATE: u64 = 29;
 const SYS_WIN_PRESENT: u64 = 30;
+// FBCON-DMG: `SYS_WIN_PRESENT_ROWS(win, y0, y1)` — the DAMAGE-CARRYING present. ADDITIVE: 30 keeps its
+// exact one-argument shape on both arches, because widening it in place is not safe. The dispatcher's own
+// note (see `syscall_dispatch`) records that a program which does not load an argument register "simply
+// passes junk to a verb that does not read it", and three of the four ring-3 stub sets declare rsi/rdx/r10
+// as `lateout` CLOBBERS they never write — so junk that happened to land in range would silently
+// UNDER-repaint an existing caller of 30. A new number cannot be reached by an old binary at all.
+//
+// 33 is the first number free on BOTH arches. The shared block runs 1..=32 and the aarch64 table ends
+// there (`const SYS_WIN_CLOSE: u64 = 32;`, arch/aarch64/syscall.rs:215) with nothing defined or reserved
+// above it; x86's own private block starts at 40 (`SYS_SOCKET`). Taking 33 keeps the ABI alignable — an
+// aarch64 twin can mint the same number later without moving anything.
+const SYS_WIN_PRESENT_ROWS: u64 = 33;
 // WINX-7: the THREAD verbs, at the shared numbers the aarch64 ELF-2 arc minted. Semantics are the
 // aarch64 twins', verbatim:
 //   SYS_THREAD_SPAWN(entry, sp, arg, place) -> thread handle >= 0 / -errno. A new ring-3 task under the
@@ -2558,6 +2570,10 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         // x86 panel, and a refused `wm::create` degrades to a surface with no compositor row.
         SYS_WIN_CREATE => sys_win_create(a0, a1),
         SYS_WIN_PRESENT => sys_win_present(a0),
+        // FBCON-DMG: the damage-carrying present, at its own number. x86-only for now — aarch64 does not
+        // define 33, so a ring-3 program that tries it there falls to that dispatcher's `_ => -38`
+        // (`-ENOSYS`) arm, which does nothing else, and the client's whole-box fallback covers it.
+        SYS_WIN_PRESENT_ROWS => sys_win_present_rows(a0, a1, a2),
         // WINX-7: threads, futex and input, at their shared cross-arch numbers. Unconditional (no
         // feature gate), for the same reason the process and window verbs are: they are core ring-3
         // surface that a windowed application is written against, not an optional subsystem. A
@@ -3405,6 +3421,62 @@ fn sys_win_present(win: u64) -> i64 {
     0
 }
 
+/// FBCON-DMG: `SYS_WIN_PRESENT_ROWS(win, y0, y1)` -> 0, or a negative errno. The DAMAGE-CARRYING present:
+/// composite the caller's window declaring only SOURCE rows `[y0, y1)` of its own surface changed. Rows
+/// are the SURFACE's, not the panel's, and the half-open interval is the C convention `y1 == y0 + count`.
+///
+/// ADDITIVE, at its own number (33). `SYS_WIN_PRESENT(30)` is untouched on both arches and keeps its exact
+/// one-argument shape — see the number's declaration for why widening 30 in place could not be made safe.
+///
+/// GATING IS `sys_win_present`'S, VERBATIM, AND IN THE SAME ORDER: `win_caller_slot()` first, then
+/// `-EBADF` on an out-of-range id, `-EBADF` on a free row, `-EACCES` on another process's live window. A
+/// damage hint is not a weaker capability than a present, so it does not get a weaker check.
+///
+/// A BAD RANGE IS `-EINVAL`, NOT A SILENT WHOLE-BOX. `y1 <= y0` (empty or inverted) and `y1` past the
+/// window's surface height `h` are both refused outright. `video::wm::present_rows` does degrade such a
+/// band to the whole box internally, and that degrade is the right behaviour for the KERNEL callers it was
+/// written for — it is fail-safe, never fail-silent, in the sense that no pixel is left stale. But at the
+/// ABI it would be fail-SILENT in the sense that matters here: a ring-3 program with an off-by-one in its
+/// damage arithmetic would repaint correctly, at full cost, forever, and the syscall would answer `0` every
+/// time. The bug would be invisible in exactly the place the verb exists to make visible. Refusing tells
+/// the caller its arithmetic is wrong on the first frame, and the mandatory whole-box fallback every client
+/// carries for the `-ENOSYS` case (older kernel / aarch64) catches this one too — so an explicit error
+/// costs a correct picture nothing and buys a debuggable one. `y0` needs no separate bound: `y0 < y1 <= h`.
+///
+/// LOCK SPAN and LOCK ORDER are `sys_win_present`'s, unchanged and for the same reasons: the ownership
+/// check, the geometry snapshot and the present run under ONE continuous hold of `WINDOWS`, which is the
+/// OUTERMOST lock, with `video::wm`'s state acquired strictly inside it.
+fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
+    let slot = match win_caller_slot() {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if win >= WIN_MAX as u64 {
+        return EBADF;
+    }
+    let id = win as usize;
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    if t[id].owner == WIN_OWNER_FREE {
+        return EBADF;
+    }
+    if t[id].owner != slot {
+        return EACCES;
+    }
+    let e = t[id];
+    // The range check runs against THIS row's surface height, read under the same hold that validated the
+    // ownership — so the `h` the band is judged against is provably the `h` of the window being presented.
+    if y1 <= y0 || y1 > e.h as u64 {
+        return EINVAL;
+    }
+    // The same counter the whole-box verb bumps: this IS a present that reached the compositor, and the
+    // headless witness must not go blind on a window that switched to banded presents.
+    FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
+    wc_shim::present_rows(e.wm_id, y0 as usize, y1 as usize);
+    drop(t);
+    0
+}
+
 /// WINX-1: total `SYS_WIN_PRESENT` calls that reached the compositor — the headless witness's proof that
 /// a present actually happened, independent of whether a panel was attached.
 static FB_PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -3475,6 +3547,16 @@ mod wc_shim {
     pub fn present(id: WinId) {
         if id != WIN_NONE {
             wm::present(id);
+        }
+    }
+
+    /// FBCON-DMG: `video::wm::present_rows` — the same pass, damage-marking only SOURCE rows
+    /// `[sy0, sy1)`. Called with `WINDOWS` held, exactly like [`present`]. The band has already been
+    /// validated against this row's surface height by `sys_win_present_rows`, so wm's own whole-box
+    /// degrade is unreachable from the syscall path — it stays as wm's contract with its other callers.
+    pub fn present_rows(id: WinId, sy0: usize, sy1: usize) {
+        if id != WIN_NONE {
+            wm::present_rows(id, sy0, sy1);
         }
     }
 
