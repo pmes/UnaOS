@@ -1465,7 +1465,14 @@ kernel8() {
         K8_FEATS="${K8_FEATS},v3d81_display,v3d81,v3d_deep,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D81_DISPLAY: send NOTIFY_DISPLAY_DONE reply-less and read the effect ([v3d80] stands down) — ⚠ the panel may go black and stay black${COLOR_RESET}"
     fi
-    # PI-V3D-85: UNAOS_V3D_FIRSTKICK=<empty|rcl|m4> adds the `v3d_firstkick` (+`v3d`) feature — the
+    # PI-V3D-85/86/87/88: UNAOS_V3D_FIRSTKICK=<empty|rcl|m4|rclp1..rclp19|rclhead|rclhead119|
+    # rclhead126|emptyunarm|rclct1> adds the `v3d_firstkick` (+`v3d`) feature — one token is one
+    # experiment (unrecognised values run `empty` with recognised=0 on the wire). rclp<n> = the
+    # §49.9 prefix bisection; rclhead<op> = the §49.10-11 head-swap discriminators; emptyunarm =
+    # the arming swap; rclct1 = the §49.11 proof-of-law (render list on CT1, the fix arc's rung).
+    # CAMPAIGN VERDICT (boot12, 2026-08-03): render-class opcodes stall CT0's decoder — CT0 is
+    # bin-only in silicon; RCLs run on CT1. Below is the ORIGINAL §49 framing this family began
+    # from — the R-LADDER from docs/dev/OS/08_VIDEO/v3d.md §49. §49.3 named the confound underneath every banked
     # R-LADDER from docs/dev/OS/08_VIDEO/v3d.md §49. §49.3 named the confound underneath every banked
     # negative in that file: `probe_job`'s bin is the FIRST CT0 kick of an ordinary boot, and every
     # other CT0 kick runs behind it on a CT0 whose CTRUN stuck 1 at the [v3d53] rung and never
