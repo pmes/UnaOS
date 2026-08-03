@@ -10504,23 +10504,19 @@ fn v3d75_fabric_condition() {
 /// kick shows execution (store-verified / FRDONE / FLDONE / RFC Δ / CA reached QEA). Poison scans
 /// are not re-run here — [v3d74a] establishes evidence-integrity for this boot's arrangement.
 ///
-/// ⚠ **RETRACTED INSTRUMENT — THIS PROBE CANNOT PASS. DO NOT ADD CALLERS.** (PI-V3D-88, v3d.md
-/// §49.11a.) It submits `build_rcl()` — a **RENDER-class** control list — to **CT0**, the bin
-/// thread. boot12 proved render-class opcodes stall CT0's decoder *as a class*: `CT0CA` never leaves
-/// `QBA`. This function therefore returns `false` **unconditionally**, for a reason that has nothing
-/// to do with whatever experiment is being judged by it.
-///
-/// It was introduced by `282319f1` (V3D-75) as a reusable success criterion, and six unrelated legs
-/// were read through it — `v3d75a`, `v3d75b`, `v3d77a`, `v3d77b`, `v3d80 post-handover`, and every
-/// `[v3d81*]` leg's `kick=` column. **All of those kick verdicts are RETRACTED-BY-CLASS-LAW**; the
-/// hypotheses they were meant to kill are *untested*, not refuted, and §46.5's "the ARM-testable
-/// universe is CLOSED" falls with them. The register readbacks and §47.1a's control-INDEPENDENT
-/// evidence on those same legs never used this kick and STAND.
-///
-/// The fix is to submit on **CT1** (see the CT0/CT1 class law at the top of v3d.md). PI-V3D-89
-/// builds and proves that path as the `rclct1` firstkick variant (§49.12); rehosting this probe's
-/// body onto it — and thereby re-taking the five retracted negatives with a criterion that *can*
-/// return true — is that arc's named follow-on, deliberately NOT done here.
+/// **REHOSTED ONTO CT1 — PI-V3D-90 step 1 (2026-08-03), PENDING METAL re-take.** The original
+/// probe submitted `build_rcl()` — a RENDER-class list — to **CT0** and therefore returned
+/// `false` unconditionally (boot12's class law, v3d.md §49.11a); six legs' kick verdicts were
+/// RETRACTED-BY-CLASS-LAW (`v3d75a/b`, `v3d77a/b`, `v3d80 post-handover`, the `[v3d81*]` kick
+/// columns) and their hypotheses returned to *untested*. boot13 (`rclct1`, §49.12) proved the
+/// same list EXECUTES on CT1 — store-verified, RFC Δ1, FRDONE — so this body now submits on
+/// **CT1QBA→CT1QEA** in exactly that proven shape, and the criterion can return true again.
+/// The five retracted negatives become RE-TAKEABLE the next metal sitting that runs their legs;
+/// their verdicts stay retracted until those boots happen. Two deliberate differences from the
+/// CT0 body: the `[v3d73]` sampler is NOT armed (it is hard-bound to CT0 registers — an
+/// instrument that cannot observe its subject stays silent rather than printing beside it;
+/// per-sample fetch tracing for CT1 lives on the `rclct1` rung), and the CA-reached-end leg of
+/// `executed` reads `CT1CA` directly at done-time instead of the sampler max.
 fn v3d75_kick_probe(label: &str) -> bool {
     fill_target(0xDEAD_BEEF);
     let (rcl_len, sublist_len) = build_rcl();
@@ -10537,31 +10533,26 @@ fn v3d75_kick_probe(label: &str) -> bool {
     mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
     dsb();
     let rfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC);
-    v3d73_sampler_arm(ba as u32, ea as u32);
-    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, ba as u32);
+    // PI-V3D-90 step 1: the render list goes to the RENDER thread — CT1QBA→CT1QEA, the exact
+    // shape boot13 proved ([v3d89]: bare queue writes, CPU clean_range publish, no bin arming —
+    // CT1 has no QMA/QMS/QTS to write). The [v3d73] sampler is CT0-bound and stays unarmed here.
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QBA, ba as u32);
     dsb();
-    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, ea as u32); // GO — queue auto-start
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QEA, ea as u32); // GO — queue auto-start
     dsb();
     let (sts, us, fldone) = wait_fldone(label, ba as u32, ea as u32);
-    // PI-V3D-82: emit (and thereby disarm) the [v3d73] witness on EVERY leg riding this probe —
-    // the v3d74a idiom exactly (wait -> emit -> read_span). Before this, the probe armed the
-    // sampler and folded its span facts into the kick line below, but the [v3d73] verdict line
-    // itself never printed and the sampler was left armed; the v3d75a/b, v3d77a/b and v3d81q
-    // legs were extrapolating the fetch verdict instead of measuring it.
-    v3d73_sampler_emit(label); // [v3d73] — the fetch verdict on this leg's own kick
-    let (smp_n, smp_in_span, smp_max) = v3d73_sampler_read_span();
-    let cs_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
-    let ca_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
+    let cs_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
+    let ca_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CA);
     let rfc_delta = mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC).wrapping_sub(rfc_pre);
     let frdone = sts & V3D_INT_FRDONE != 0;
     cache::clean_invalidate_range(arena_phys() + OFF_TARGET, TARGET_BYTES);
     let verified = verify_target(CLEAR_RGBA);
-    let executed = verified || frdone || fldone || rfc_delta != 0 || smp_max >= ea as u32;
+    let executed = verified || frdone || fldone || rfc_delta != 0 || ca_done >= ea as u32;
     serial_println!(
-        ":: V3D: [{}] kick — store-verified={} FRDONE={} FLDONE={} RFCΔ={} | CT0CS={:#010x} CT0CA={:#010x} | sampler samples={} in-span={} max-in-span={:#010x} vs QBA={:#010x} QEA={:#010x} | INT_STS={:#010x} waited={}us -> {} ::",
+        ":: V3D: [{}] kick (CT1 — rehosted, PI-V3D-90 s1) — store-verified={} FRDONE={} FLDONE={} RFCΔ={} | CT1CS={:#010x} CT1CA={:#010x} vs QBA={:#010x} QEA={:#010x} | sampler=UNARMED (CT0-bound instrument; CT1 fetch trace lives on the rclct1 rung) | INT_STS={:#010x} waited={}us -> {} ::",
         label, verified as u32, frdone as u32, fldone as u32, rfc_delta,
-        cs_done, ca_done, smp_n, smp_in_span, smp_max, ba as u32, ea as u32, sts, us,
-        if executed { "EXECUTED" } else if smp_in_span > 0 { "fetched-not-retired" } else { "DEAD" }
+        cs_done, ca_done, ba as u32, ea as u32, sts, us,
+        if executed { "EXECUTED" } else if ca_done > ba as u32 && ca_done <= ea as u32 { "fetched-not-retired" } else { "DEAD" }
     );
     mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
     dsb();
