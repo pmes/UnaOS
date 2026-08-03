@@ -335,9 +335,11 @@ unsafe fn sys4(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 // (UnaOS-gemini f36ab3d5) — my body, their ABI layer. TEARDOWN-1's discipline carried intact:
 // `syscall` destroys rcx (return RIP) and r11 (RFLAGS) so both are clobbered; the kernel's
 // sysretq scrubs rdi/rsi/rdx/r8/r9/r10, so every argument register is `inlateout(...) => _` and
-// r8/r9 are `lateout` — the clobber list states the ABI the kernel actually implements, so the
-// compiler reloads what it must (declaring them `in(...)` once cost the second THREAD_SPAWN its
-// entry pointer: the kernel's scrubbed rdi=0 was validated and refused with -EFAULT).
+// r8/r9/r10 — scrubbed by the kernel, and named by no stub except `sys4` (where r10 carries the
+// fourth argument and is therefore already `inlateout`) — are declared `lateout` everywhere else.
+// The clobber list states the ABI the kernel actually implements, so the compiler reloads what
+// it must (declaring them `in(...)` once cost the second THREAD_SPAWN its entry pointer: the
+// kernel's scrubbed rdi=0 was validated and refused with -EFAULT).
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn sys0(n: u64) -> u64 {
@@ -345,7 +347,7 @@ unsafe fn sys0(n: u64) -> u64 {
     core::arch::asm!(
         "syscall",
         inlateout("rax") n => r,
-        lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _,
+        lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
         options(nostack),
     );
     r
@@ -358,7 +360,7 @@ unsafe fn sys1(n: u64, a0: u64) -> u64 {
         "syscall",
         inlateout("rax") n => r,
         inlateout("rdi") a0 => _,
-        lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _,
+        lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
         options(nostack),
     );
     r
@@ -372,7 +374,7 @@ unsafe fn sys2(n: u64, a0: u64, a1: u64) -> u64 {
         inlateout("rax") n => r,
         inlateout("rdi") a0 => _,
         inlateout("rsi") a1 => _,
-        lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _,
+        lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
         options(nostack),
     );
     r
@@ -387,7 +389,7 @@ unsafe fn sys3(n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
         inlateout("rdi") a0 => _,
         inlateout("rsi") a1 => _,
         inlateout("rdx") a2 => _,
-        lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _,
+        lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _, lateout("r10") _,
         options(nostack),
     );
     r

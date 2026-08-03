@@ -56,7 +56,12 @@
 //   aarch64: x8 = number, args x0..x5, return in x0, `svc #0`. The kernel SVC path preserves every GPR
 //            except x0.
 //   x86_64:  rax = number, args rdi/rsi/rdx, return in rax, `syscall`. The instruction itself clobbers
-//            rcx (the saved RIP) and r11 (the saved RFLAGS), so both are declared clobbered.
+//            rcx (the saved RIP) and r11 (the saved RFLAGS), so both are declared clobbered — and the
+//            kernel's `sysretq` tail additionally SCRUBS rdi/rsi/rdx/r8/r9/r10 to zero on the way back
+//            to ring 3 (U1b B1, `arch/x86_64/syscall.rs`), so every one of those six is declared
+//            `inlateout(...) => _` (the arguments) or `lateout(...) => _` (r8/r9/r10, which no stub
+//            below uses as an argument) — never a bare `in(...)`, which would promise the compiler a
+//            value the kernel has already zeroed.
 // ---------------------------------------------------------------------------------------------
 const SYS_WRITE: u64 = 1;
 const SYS_EXIT: u64 = 2;
@@ -113,6 +118,12 @@ mod sysabi {
     }
 }
 
+/// x86_64 — U1b B1: the kernel's `sysretq` tail zeroes rdi/rsi/rdx/r8/r9/r10 before returning to ring
+/// 3, so every one of those six registers must be declared to the compiler as NOT surviving the
+/// `syscall` instruction: `inlateout(reg) a => _` for the ones carrying an argument, `lateout(reg) _`
+/// for the rest. A bare `in(reg)` promises rustc the register still holds its value afterward — a
+/// promise the kernel breaks — and the compiler is then free to reuse what it believes is a live
+/// value, which is undefined behaviour that surfaces only on real hardware, never in QEMU or `check`.
 #[cfg(target_arch = "x86_64")]
 mod sysabi {
     #[inline(always)]
@@ -124,6 +135,9 @@ mod sysabi {
                 inlateout("rax") n => r,
                 lateout("rcx") _,
                 lateout("r11") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
                 options(nostack),
             )
         };
@@ -136,9 +150,12 @@ mod sysabi {
             core::arch::asm!(
                 "syscall",
                 inlateout("rax") n => r,
-                in("rdi") a0,
+                inlateout("rdi") a0 => _,
                 lateout("rcx") _,
                 lateout("r11") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
                 options(nostack),
             )
         };
@@ -151,10 +168,13 @@ mod sysabi {
             core::arch::asm!(
                 "syscall",
                 inlateout("rax") n => r,
-                in("rdi") a0,
-                in("rsi") a1,
+                inlateout("rdi") a0 => _,
+                inlateout("rsi") a1 => _,
                 lateout("rcx") _,
                 lateout("r11") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
                 options(nostack),
             )
         };
@@ -167,11 +187,14 @@ mod sysabi {
             core::arch::asm!(
                 "syscall",
                 inlateout("rax") n => r,
-                in("rdi") a0,
-                in("rsi") a1,
-                in("rdx") a2,
+                inlateout("rdi") a0 => _,
+                inlateout("rsi") a1 => _,
+                inlateout("rdx") a2 => _,
                 lateout("rcx") _,
                 lateout("r11") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
                 options(nostack),
             )
         };

@@ -131,7 +131,7 @@ mod sysabi {
 /// intact — so rustc was entitled to keep a value live in rdi across a `syscall` and reuse it, and it
 /// did. That is the whole reason a second `SYS_GETINFO` read here could report `pid=0`: not a kernel
 /// bug, a stub that lied about what the instruction does. Every argument register is `inlateout(...)
-/// => _` now, and r8/r9 — scrubbed by the kernel, named by no stub — are declared `lateout`.
+/// => _` now, and r8/r9/r10 — scrubbed by the kernel, named by no stub here — are declared `lateout`.
 #[cfg(target_arch = "x86_64")]
 mod sysabi {
     #[inline(always)]
@@ -146,6 +146,7 @@ mod sysabi {
                 lateout("r11") _,
                 lateout("r8") _,
                 lateout("r9") _,
+                lateout("r10") _,
                 options(nostack),
             )
         };
@@ -164,6 +165,7 @@ mod sysabi {
                 lateout("r11") _,
                 lateout("r8") _,
                 lateout("r9") _,
+                lateout("r10") _,
                 options(nostack),
             )
         };
@@ -183,6 +185,7 @@ mod sysabi {
                 lateout("r11") _,
                 lateout("r8") _,
                 lateout("r9") _,
+                lateout("r10") _,
                 options(nostack),
             )
         };
