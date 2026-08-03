@@ -1209,9 +1209,21 @@ would mean a starved PTB request queue: a genuine BCM2711 knob never touched.
 separate *PTB-wrote-but-no-FLDONE* from *PTB-never-wrote*. After the PROBE bin, `v3d55_tilestate_readback`
 performs an L2T write-back (the §18/V3D-42 order: drain the binner's L2T-parked bytes to DRAM, *then* drop the
 CPU's stale lines), scans the **whole** `TILE_STATE_BYTES` TSDA **and the whole `BIN_TILEALLOC_BYTES` pool**
-counting nonzero words plus the first-nonzero index, and prints `BPCA`/`BPCS`/`BFC` alongside.
+classifying every word against the fill published before the kick, and prints `BPCA`/`BPCS`/`BFC` alongside.
 
-Two integrity properties this readback must carry, because the negative reading is the interesting one:
+Three integrity properties this readback must carry, because the negative reading is the interesting one:
+
+- **The classification is against the pre-kick fill, not against zero** (the R0 fix, §49.4). Both regions are
+  pre-filled with the V3D-56 poison `0xA5A5A5A5 ^ i`, which is nonzero at *every* index. The original line
+  counted **nonzero words** and read any nonzero count as "the PTB WROTE" — so an entirely **untouched**
+  region scored `nonzero_words == words` and the witness asserted a PTB write on the strength of its own
+  poison. Every `[v3d55] tilestate` / `pool` "wrote" verdict taken since V3D-56 armed the poison was therefore
+  inverted. The line now reports three disjoint counts — `INTACT` (the word equals its pre-kick fill ⇒ **not**
+  written), `ZEROED` (the word reads `0` where the fill was not `0` ⇒ written, with zero bytes — what an empty
+  tile list emits), `WRITTEN` (any other value ⇒ written, with real data) — plus `touched = ZEROED + WRITTEN`
+  and the first non-poison word with its index, value and expected value. When `V3D56_POISON` is off the two
+  regions are pre-zeroed, `ZEROED` is unreachable, and the line states on the wire that no write/no-write
+  verdict follows.
 
 - **The write-back's completion is threaded into the verdict.** `invalidate_gpu_caches` discards its `L2TFLS`
   poll result; V3D-55 runs the byte-identical sequence inline and **keeps** the completion bit. Under exactly
@@ -1241,10 +1253,12 @@ true identity.
 | `[v3d55] clkdom` | gate inactive / rate 0 / granted ≠ 500 MHz | Powered-but-unclocked (or clamped) — alone sufficient to explain a dead flush unit. |
 | `[v3d55] misccfg` | `QRMAXCNT == 0` | Request queue **floored** — arm `V3D55_ARM_QRMAXCNT` next arc and re-run. |
 | `[v3d55] misccfg` | `QRMAXCNT != 0` | No divergence; the QoS branch is **not** justified — refuted without a write. |
-| `[v3d55] tilestate` | nonzero words **> 0** | The PTB **wrote** per-tile output ⇒ the defect is isolated to the **FLDONE/BFC frame-close latch itself** — the narrowest target the campaign has ever had. |
-| `[v3d55] tilestate` | **all zero**, `flush_done = 1` | On this evidence the PTB wrote nothing ⇒ the defect is **upstream** of frame-close. |
-| `[v3d55] tilestate` / `pool` | **all zero**, `flush_done = 0` | **No verdict.** `L2TFLS` never cleared, so the bytes may still be parked in L2T — read `clkliv`/`clkdom` first. |
-| `[v3d55] pool` | full pool all-zero, `flush_done = 1`, `BPCA` advanced off base | `BPCA` is a **phantom/aliased** write pointer — the P40 contradiction is an addressing one; `mmucfg` + the `pte` lines decide. |
+| `[v3d55] tilestate` | `WRITTEN` **> 0** | The PTB **wrote** per-tile output ⇒ the defect is isolated to the **FLDONE/BFC frame-close latch itself** — the narrowest target the campaign has ever had. |
+| `[v3d55] tilestate` | `WRITTEN = 0`, `ZEROED` **> 0** | The PTB **wrote zeros** — the write an empty tile list makes. Still a write: no "never written" reading may be taken. A class the pre-zeroed era could not observe. |
+| `[v3d55] tilestate` | `INTACT = words` (`touched = 0`), `flush_done = 1` | The poison is untouched ⇒ on this evidence the PTB wrote nothing and the defect is **upstream** of frame-close. |
+| `[v3d55] tilestate` / `pool` | `touched = 0`, `flush_done = 0` | **No verdict.** `L2TFLS` never cleared, so the bytes may still be parked in L2T — read `clkliv`/`clkdom` first. |
+| `[v3d55] tilestate` / `pool` | `INTACT = words` with `fill=zero` | **No verdict** — the build pre-zeroed the region (`V3D56_POISON` off), so "never written" and "written with zeros" are the same reading. Re-arm the poison. |
+| `[v3d55] pool` | `touched = 0`, `flush_done = 1`, `BPCA` advanced off base | **Not** a phantom pointer. `BPCA` is the pool's *allocation* pointer (§30), so a reservation advance over a provably untouched pool is architectural for a frame that binned no primitives — compare the printed advance against the Mesa prediction on the same line. |
 | `[v3d55] pool` | `BPCA == 0x0` | **Not** "parked at the pool base" — `0x0` is not the pool base. Either a genuinely reset register or a block not returning live values; check the `[v3d45]` dump for a block-wide zero/poison pattern. |
 | `[v3d55] mmucfg` | `ENABLE = 0`, or `PT_PA_BASE` ≠ ours | The GPU is not consulting (or not walking) the table the `pte` lines decode — the aliasing question is wide open and those lines describe memory the hardware never reads. |
 | `[v3d55] pte` | any PTE invalid / non-identity / read-only | The mapping we **published** is wrong for that region ⇒ a silent no-write is an **addressing** defect, not a frame-close one. |
@@ -1260,11 +1274,16 @@ true identity.
 :: V3D: [v3d55] qrmaxcnt (<tag>) — MISCCFG 0x……… -> wrote 0x……… -> echo 0x……… (QRMAXCNT n -> m) — <verdict> ::
 :: V3D: [v3d55] clkliv (<what>) — PCTR_EN=0x……… counter2(src32 CYCLE_COUNT) armed=<0|1>
         0x………->0x……… Δ=<n> moves=<n> first_move=<n>us last_change=<n>us over <n>us (<n> samples) — <verdict> ::
-:: V3D: [v3d55] tilestate (<tag>) — TSDA iova=0x……… bytes=<n> words=<n> nonzero_words=<n> first_nz=[<i|-1>]
+:: V3D: [v3d55] tilestate (<tag>) — TSDA iova=0x……… bytes=<n> words=<n> fill=<poison(0xA5A5A5A5^i)|zero>
+        INTACT=<n> ZEROED=<n> WRITTEN=<n> touched=<n>
+        | first_nonpoison=[<i|-1>] (got 0x……… expected 0x………)
         | L2T write-back completed=<0|1> (L2TCACTL after=0x………) | head w0..w7 = 0x……… ×8 — <verdict> ::
-:: V3D: [v3d55] pool (<tag>) — pool iova=0x……… bytes=<n> words=<n> nonzero_words=<n> first_nz=[<i|-1>]
-        (FULL-pool scan) | L2T write-back completed=<0|1> | head w0..w7 = 0x……… ×8
-        | BPCA=0x……… (adv 0x… off pool base) BPCS=0x……… BFC=0x……… — <verdict> ::
+:: V3D: [v3d55] pool (<tag>) — pool iova=0x……… bytes=<n> words=<n> fill=<poison(0xA5A5A5A5^i)|zero>
+        INTACT=<n> ZEROED=<n> WRITTEN=<n> touched=<n>
+        | first_nonpoison=[<i|-1>] (got 0x……… expected 0x………) (FULL-pool scan)
+        | L2T write-back completed=<0|1> | head w0..w7 = 0x……… ×8
+        | BPCA=0x……… (adv 0x… off pool base, Mesa-predicted empty-bin advance 0x3000)
+        BPCS=0x……… BFC=0x……… — <verdict> ::
 :: V3D: [v3d55] mmucfg (<tag>) — MMU_CTL=0x……… ENABLE=<0|1> fault_bits=0x……… | PT_PA_BASE=0x……… (pages)
         vs ours=0x……… (table phys 0x………) — <verdict> ::
 :: V3D: [v3d55] pte (<tag>) <region> iova=0x……… — CPU-side PT[<idx>]=0x……… (our PUBLISHED table, not a
@@ -3736,6 +3755,47 @@ honest negative.
 
 ---
 
+**R0 — fix the instrument before spending a boot on it: `[v3d55] tilestate`/`pool` scored its own
+poison as a PTB write.** — **DONE (code), PENDING METAL.**
+
+*The bug.* `v3d55_tilestate_readback` counted **nonzero words** in the tile-state array and the
+tile-alloc pool and read any nonzero count as *the PTB WROTE*. Since V3D-56 both regions are
+pre-filled with `0xA5A5A5A5 ^ i`, which is nonzero at every index — so a region the PTB never touched
+scored `nonzero_words == words` and the witness asserted a write on the strength of its own poison.
+The `pool` line carried the same defect, and its "the pool carries binner bytes" arm fired on intact
+poison too. Metal evidence (§30, §48, the `[v3d56]` and `[v3d68]` scans, which classify correctly)
+says the PTB has likely never written a byte, so wherever the `[v3d55]` "wrote" arm fired it was
+**inverted**. No rung below is worth a boot while a first-order witness reads backwards.
+
+*The fix.* Classify every word against the fill published before the kick, in three disjoint classes,
+and report all three counts plus the first non-poison word:
+
+| Class | Test | Meaning |
+|---|---|---|
+| `INTACT` | `word == 0xA5A5A5A5 ^ index` | **not written** |
+| `ZEROED` | `word == 0` (and the fill was not `0`) | **written**, with zero bytes — what an empty tile list emits |
+| `WRITTEN` | anything else | **written**, with real data |
+
+`touched = ZEROED + WRITTEN` is the "was this region written at all" count, and
+`first_nonpoison=[i] (got … expected …)` names the first disturbed word. Positive evidence (`touched
+> 0`) still precedes the `flush_done` guard — disturbed bytes are in DRAM whatever the drain did —
+while the negative reading stays gated on a completed L2T write-back, exactly as before. Under a
+zero-fill build (`V3D56_POISON` off) `ZEROED` is unreachable and both lines say on the wire that no
+write/no-write verdict follows. The `pool` line additionally prints the Mesa-predicted empty-bin
+`BPCA` advance beside the measured one and no longer re-asserts the phantom-pointer verdict §30
+retracted.
+
+*What it costs.* Nothing at runtime — the same scan loop, the same gating (`UNAOS_V3D`, metal-only
+behind the hub-identity gate), no new knob, no new register access, no change to the kick path.
+
+*What it decides.* Nothing on its own. It makes every later reading of these two lines mean what it
+says, and it retires the "wrote" verdicts previously taken from them.
+
+*Status.* Code landed and in the image; the verdict itself is **metal-attended** and unread until a
+Pi 4 boot prints the new line. QEMU `raspi4b` models no V3D block, so no `[v3d55]` line appears there.
+
+---
+
 **R1 — one experiment per boot: make the rung under test the boot's FIRST CT0 kick.**
 
 *Action.* A knob (`UNAOS_V3D_FIRSTKICK=<empty|rcl|m4>`) that runs exactly one CT0 kick, placed
@@ -3966,6 +4026,7 @@ fixed and should be stated in the code that carries it:
 
 | Rung | Cost | Decides |
 |---|---|---|
+| R0 `[v3d55]` fill classification | free, **done pending metal** | nothing on its own — but it stops a first-order witness reading backwards, and retires the "wrote" verdicts taken from it |
 | R1 first-kick isolation | 1–3 boots | whether any banked negative in this file means what it says |
 | R2 MMU access counters | ~8 reads, rides R1 | whether the CLE ever issued a translation, independent of `CT0CA` |
 | R3 `CT0EA`/`CT0RA` | 2 reads/station, rides R1 | whether the queue ever transferred into the thread |

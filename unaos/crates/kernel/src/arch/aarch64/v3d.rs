@@ -2386,12 +2386,102 @@ fn v3d55_pte_line(tag: &str, what: &str, iova: u32) {
     );
 }
 
+/// The word the pre-kick fill leaves at index `i` in the two bin scratch regions: the V3D-56
+/// index-encoding poison when `V3D56_POISON` is armed (the default since V3D-56), and the historical
+/// zero otherwise. Both the tile-state array and the tile-alloc pool are filled from index 0, so a
+/// region-relative index is the correct argument for either.
+#[inline]
+fn v3d55_prekick_word(i: usize) -> u32 {
+    if V3D56_POISON { v3d56_poison_word(i) } else { 0 }
+}
+
+/// A human name for the pre-kick fill, printed on the witness so a capture is self-describing.
+#[inline]
+fn v3d55_fill_name() -> &'static str {
+    if V3D56_POISON { "poison(0xA5A5A5A5^i)" } else { "zero" }
+}
+
+/// One pre-filled region classified word by word against the fill published before the kick.
+///
+/// PI-V3D-R0 (the instrument bug this fixes): the original readback counted **nonzero** words and read
+/// any nonzero count as "the PTB WROTE". Since V3D-56 the region is pre-filled with `0xA5A5A5A5 ^ i`,
+/// which is nonzero at every index, so an ENTIRELY UNTOUCHED region scored `nonzero_words == words` and
+/// the line asserted a PTB write on the strength of its own poison. Metal evidence says the PTB has
+/// likely never written a byte, so that verdict was inverted wherever it fired. The fix is to compare
+/// against the published fill rather than against zero, and to report the three classes separately:
+///
+/// * `intact` — the word still equals its pre-kick fill: **not written**;
+/// * `zeroed` — the word reads `0` where the fill was not `0`: **written, with zero bytes** (the write
+///   an empty tile list makes, and the class the pre-zeroed era was structurally unable to observe);
+/// * `written` — any other value: **written, with real data**.
+///
+/// `first_*` describe the first word that is NOT the pre-kick fill; `first_i` is −1 when the whole
+/// region is untouched.
+struct V3d55Fill {
+    words: usize,
+    intact: u32,
+    zeroed: u32,
+    written: u32,
+    first_i: i32,
+    first_got: u32,
+    first_exp: u32,
+    head: [u32; 8],
+}
+
+impl V3d55Fill {
+    /// Words the PTB disturbed, whichever way — the "was this region written at all" count.
+    #[inline]
+    fn touched(&self) -> u32 {
+        self.zeroed + self.written
+    }
+}
+
+/// Classify a pre-filled region read through `iova`. The iova is identity-mapped to the arena VA, so
+/// the CPU load address is literally the address the GPU was handed — the property `[v3d55] pte`
+/// publishes. The caller owns the L2T write-back + CPU invalidate that make DRAM authoritative.
+fn v3d55_classify_fill(iova: u32, bytes: usize) -> V3d55Fill {
+    let words = bytes / 4;
+    let mut f = V3d55Fill {
+        words,
+        intact: 0,
+        zeroed: 0,
+        written: 0,
+        first_i: -1,
+        first_got: 0,
+        first_exp: 0,
+        head: [0u32; 8],
+    };
+    for i in 0..words {
+        let v = unsafe { core::ptr::read_volatile((iova as usize + i * 4) as *const u32) };
+        if i < 8 {
+            f.head[i] = v;
+        }
+        let exp = v3d55_prekick_word(i);
+        if v == exp {
+            f.intact += 1;
+            continue;
+        }
+        if v == 0 {
+            f.zeroed += 1;
+        } else {
+            f.written += 1;
+        }
+        if f.first_i < 0 {
+            f.first_i = i as i32;
+            f.first_got = v;
+            f.first_exp = exp;
+        }
+    }
+    f
+}
+
 /// PI-V3D-55 (RANK 4): the tile-state readback. `bin_pool_witness` reads only the first 8 bytes of the
 /// pool and of the tile-state array; that is too coarse to distinguish "the PTB wrote tile-state but no
 /// FLDONE fired" from "the PTB never wrote anything". Read the WHOLE tile-state array (TILE_STATE_BYTES,
-/// the 48-B-per-tile TSDA generously sized for the single 64×64 tile) plus the pool head, AFTER an L2T
-/// write-back so the binner's L2T-parked bytes reach DRAM (the V3D-42 mechanism), and count nonzero
-/// words rather than eyeballing a prefix. Then dump the PTEs covering the CL, tile-state and pool iovas.
+/// the 48-B-per-tile TSDA generously sized for the single 64×64 tile) plus the whole pool, AFTER an L2T
+/// write-back so the binner's L2T-parked bytes reach DRAM (the V3D-42 mechanism), and classify every
+/// word against the pre-kick fill rather than against zero (see `V3d55Fill` for why counting nonzero
+/// words was an inverted instrument). Then dump the PTEs covering the CL, tile-state and pool iovas.
 /// Read-only: an L2T write-back plus CPU-side cache maintenance and loads.
 fn v3d55_tilestate_readback(tag: &str, cl_iova: u32, ts_iova: u32, pool_iova: u32) {
     // Drain the binner's writes out of L2T into DRAM, then drop the CPU's stale lines (V3D-42 order).
@@ -2414,22 +2504,8 @@ fn v3d55_tilestate_readback(tag: &str, cl_iova: u32, ts_iova: u32, pool_iova: u3
 
     // Full tile-state array scan. The iova is identity-mapped to the arena VA, so the CPU load address
     // is literally the address the GPU was handed in CT0QTS — the same-page property [v3d42] prints.
-    let words = TILE_STATE_BYTES / 4;
-    let mut nonzero = 0u32;
-    let mut first_nz_word = -1i32;
-    let mut w = [0u32; 8];
-    for i in 0..words {
-        let v = unsafe { core::ptr::read_volatile((ts_iova as usize + i * 4) as *const u32) };
-        if v != 0 {
-            nonzero += 1;
-            if first_nz_word < 0 {
-                first_nz_word = i as i32;
-            }
-        }
-        if i < 8 {
-            w[i] = v;
-        }
-    }
+    let ts_fill = v3d55_classify_fill(ts_iova, TILE_STATE_BYTES);
+    let w = ts_fill.head;
     // Pool head + the PTB write pointer, side by side: BPCA off the pool base says the PTB CLAIMED to
     // emit bytes; a zero pool head with an advanced BPCA is the P40 phantom-pointer signature.
     let bpca = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA);
@@ -2438,22 +2514,8 @@ fn v3d55_tilestate_readback(tag: &str, cl_iova: u32, ts_iova: u32, pool_iova: u3
     // "the pool reads all-zero therefore BPCA is a phantom" reading below is a claim about the whole
     // pool, and BPCA was observed at P40 some 0x3000 bytes IN — far past any prefix. A prefix scan
     // could not have seen those bytes, so the prefix could never have supported the claim.
-    let pool_words = BIN_TILEALLOC_BYTES / 4;
-    let mut pool_nonzero = 0u32;
-    let mut pool_first_nz = -1i32;
-    let mut p = [0u32; 8];
-    for i in 0..pool_words {
-        let v = unsafe { core::ptr::read_volatile((pool_iova as usize + i * 4) as *const u32) };
-        if v != 0 {
-            pool_nonzero += 1;
-            if pool_first_nz < 0 {
-                pool_first_nz = i as i32;
-            }
-        }
-        if i < 8 {
-            p[i] = v;
-        }
-    }
+    let pool_fill = v3d55_classify_fill(pool_iova, BIN_TILEALLOC_BYTES);
+    let p = pool_fill.head;
     let bfc = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
     // PI-V3D-83 (the PI-V3D-82 idiom over BPCA): before reading any wrapping offset as an advance,
     // require the raw word to sit inside the pool span — an out-of-span word is a stale pre-kick/
@@ -2461,43 +2523,64 @@ fn v3d55_tilestate_readback(tag: &str, cl_iova: u32, ts_iova: u32, pool_iova: u3
     let bpca_in_pool =
         bpca >= pool_iova && bpca <= pool_iova.wrapping_add(BIN_TILEALLOC_BYTES as u32);
 
+    // ── The verdicts, taken against the PRE-KICK FILL and not against zero ────────────────────────
+    //
+    // Ordering rule, unchanged from the original line: a DISTURBED word is positive evidence whatever
+    // the flush did — the bytes are demonstrably in DRAM — so the touched branches precede the
+    // `flush_done` guard. Only the negative ("nothing was written") reading depends on the drain
+    // having completed, and that guard stays exactly where it was.
+    let ts_verdict = if ts_fill.written != 0 {
+        "the PTB WROTE per-tile output — words carry values that are neither the pre-kick fill nor zero, so a bin frame demonstrably produced tile state and the defect is DOWNSTREAM of the write: isolated to the FLDONE/BFC frame-close latch itself (the narrowest target yet)"
+    } else if ts_fill.zeroed != 0 {
+        "the pre-kick fill was ZEROED (and only zeroed) — the PTB DID write this region, with zero bytes, which is what an EMPTY tile list emits. This is a WRITE, not an untouched region: any reading built on 'the tile state was never written' is false for this boot. Cross-read [v3d56] poison and the BPCA-semantics note"
+    } else if !flush_done {
+        // The negative reading is only as good as the drain that produced it.
+        "tile-state is UNDISTURBED BUT THE L2T WRITE-BACK DID NOT COMPLETE (L2TFLS never cleared before the backstop) — this is NOT evidence that the PTB wrote nothing: the binner's bytes may still be parked in L2T, exactly as a dead/half-clocked flush domain would leave them. NO upstream/downstream verdict from this line; read [v3d55] clkliv and clkdom first"
+    } else if !V3D56_POISON {
+        // Zero-fill build: 'untouched' and 'written with zeros' are the same reading. Say so.
+        "tile-state is ENTIRELY ZERO after a COMPLETED L2T write-back — but this build PRE-ZEROED the region (V3D56_POISON is off), so 'never written' and 'written with zeros' are indistinguishable here and no upstream verdict follows. Re-arm the poison fill for the discriminating read"
+    } else {
+        "the pre-kick POISON is FULLY INTACT after a COMPLETED L2T write-back — every word still equals 0xA5A5A5A5^i, so the PTB wrote NOTHING here: not per-tile state, not zeros, not a header. On this evidence the defect is UPSTREAM of frame-close (the bin frame produced no output at all)"
+    };
     serial_println!(
-        ":: V3D: [v3d55] tilestate ({}) — TSDA iova={:#010x} bytes={} words={} nonzero_words={} first_nz=[{}] | L2T write-back completed={} (L2TCACTL after={:#010x}) | head w0..w7 = {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} — {} ::",
-        tag, ts_iova, TILE_STATE_BYTES, words, nonzero, first_nz_word,
+        ":: V3D: [v3d55] tilestate ({}) — TSDA iova={:#010x} bytes={} words={} fill={} INTACT={} ZEROED={} WRITTEN={} touched={} | first_nonpoison=[{}] (got {:#010x} expected {:#010x}) | L2T write-back completed={} (L2TCACTL after={:#010x}) | head w0..w7 = {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} — {} ::",
+        tag, ts_iova, TILE_STATE_BYTES, ts_fill.words, v3d55_fill_name(),
+        ts_fill.intact, ts_fill.zeroed, ts_fill.written, ts_fill.touched(),
+        ts_fill.first_i, ts_fill.first_got, ts_fill.first_exp,
         flush_done as u32, l2t_after,
         w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
-        if nonzero != 0 {
-            // A nonzero readback is positive evidence regardless of the flush outcome — bytes are there.
-            "the PTB WROTE tile-state: a bin frame demonstrably produced per-tile output, so the defect is DOWNSTREAM of the write — isolated to the FLDONE/BFC frame-close latch itself (the narrowest target yet)"
-        } else if !flush_done {
-            // The negative reading is only as good as the drain that produced it.
-            "tile-state reads zero BUT THE L2T WRITE-BACK DID NOT COMPLETE (L2TFLS never cleared before the backstop) — this is NOT evidence that the PTB wrote nothing: the binner's bytes may still be parked in L2T, exactly as a dead/half-clocked flush domain would leave them. NO upstream/downstream verdict from this line; read [v3d55] clkliv and clkdom first"
-        } else {
-            "tile-state is ENTIRELY ZERO after a COMPLETED L2T write-back: on this evidence the PTB wrote no per-tile state, placing the defect UPSTREAM of frame-close (the bin frame produced no output at all)"
-        }
+        ts_verdict
     );
+    let pool_verdict = if pool_fill.written != 0 {
+        "the pool carries binner bytes — words that are neither the pre-kick fill nor zero, so primitive-list output exists in DRAM and frame-close is the only missing step"
+    } else if pool_fill.zeroed != 0 {
+        "the pre-kick fill was ZEROED (and only zeroed) — the PTB DID write into the pool, with zero bytes, which is what an EMPTY tile list emits. The pool is NOT untouched, and no 'nothing was written' reading may be taken from this line"
+    } else if !flush_done {
+        "pool reads UNDISTURBED BUT THE L2T WRITE-BACK DID NOT COMPLETE — no PTB-write verdict from this line (the bytes may still be parked in L2T); see [v3d55] tilestate and the clock witnesses"
+    } else if bpca == 0 {
+        // A block whose registers read 0x0 is not a PTB parked at the pool base — do not conflate.
+        "BPCA reads 0x0, which is NOT the pool base — the register is either genuinely reset or the block is not returning live values; this says nothing about where a PTB write pointer stands (check the other CLE/PTB registers in the [v3d45] dump for a block-wide zero/poison pattern)"
+    } else if bpca != pool_iova && !bpca_in_pool {
+        "BPCA holds a word OUTSIDE the pool span — a stale pre-kick/residue address, not a write pointer into THIS pool: no phantom/address verdict from this line (the frozen-register rule, v3d.md §48); the fill classification above is the deciding instrument"
+    } else if !V3D56_POISON {
+        "the pool is ENTIRELY ZERO — but this build PRE-ZEROED it (V3D56_POISON is off), so a PTB write of zero bytes is invisible and NO write/no-write verdict follows. Re-arm the poison fill"
+    } else if bpca != pool_iova {
+        "BPCA ADVANCED off the pool base (in-span) while the pre-kick POISON is FULLY INTACT — no byte was written anywhere in the pool. Read this with the V3D-56 BPCA-semantics note: BPCA is the pool's ALLOCATION pointer, not a bytes-written counter, so a reservation advance over an untouched pool is ARCHITECTURAL for a frame that binned no primitives (the phantom/aliased-pointer verdict is retracted on that conjunction); compare the printed advance against the Mesa reservation prediction before reading anything further into it"
+    } else {
+        "pool POISON FULLY INTACT with BPCA exactly at the pool base after a completed write-back — the PTB emitted nothing and never moved its write pointer this kick"
+    };
     serial_println!(
-        ":: V3D: [v3d55] pool ({}) — pool iova={:#010x} bytes={} words={} nonzero_words={} first_nz=[{}] (FULL-pool scan) | L2T write-back completed={} | head w0..w7 = {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} | BPCA={:#010x} (adv {:#x} off pool base{}) BPCS={:#010x} BFC={:#010x} — {} ::",
-        tag, pool_iova, BIN_TILEALLOC_BYTES, pool_words, pool_nonzero, pool_first_nz,
+        ":: V3D: [v3d55] pool ({}) — pool iova={:#010x} bytes={} words={} fill={} INTACT={} ZEROED={} WRITTEN={} touched={} | first_nonpoison=[{}] (got {:#010x} expected {:#010x}) (FULL-pool scan) | L2T write-back completed={} | head w0..w7 = {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} | BPCA={:#010x} (adv {:#x} off pool base{}, Mesa-predicted empty-bin advance {:#x}) BPCS={:#010x} BFC={:#010x} — {} ::",
+        tag, pool_iova, BIN_TILEALLOC_BYTES, pool_fill.words, v3d55_fill_name(),
+        pool_fill.intact, pool_fill.zeroed, pool_fill.written, pool_fill.touched(),
+        pool_fill.first_i, pool_fill.first_got, pool_fill.first_exp,
         flush_done as u32,
         p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
         bpca, bpca.wrapping_sub(pool_iova),
         if bpca != 0 && !bpca_in_pool { ", out-of-span=stale" } else { "" },
+        V3D56_EXPECTED_EMPTY_BPCA_ADVANCE,
         bpcs, bfc,
-        if pool_nonzero != 0 {
-            "the pool carries binner bytes — primitive-list output exists in DRAM; frame-close is the only missing step"
-        } else if !flush_done {
-            "pool reads all-zero BUT THE L2T WRITE-BACK DID NOT COMPLETE — no PTB-write verdict from this line (the bytes may still be parked in L2T); see [v3d55] tilestate and the clock witnesses"
-        } else if bpca == 0 {
-            // A block whose registers read 0x0 is not a PTB parked at the pool base — do not conflate.
-            "BPCA reads 0x0, which is NOT the pool base — the register is either genuinely reset or the block is not returning live values; this says nothing about where a PTB write pointer stands (check the other CLE/PTB registers in the [v3d45] dump for a block-wide zero/poison pattern)"
-        } else if bpca != pool_iova && !bpca_in_pool {
-            "BPCA holds a word OUTSIDE the pool span — a stale pre-kick/residue address, not a write pointer into THIS pool: no phantom/address verdict from this line (the frozen-register rule, v3d.md §48); the poison scans are the deciding instrument"
-        } else if bpca != pool_iova {
-            "BPCA ADVANCED off the pool base (in-span) yet the FULL pool reads all-zero after a COMPLETED L2T write-back — on this evidence BPCA is a PHANTOM/aliased write pointer and the address question reopens (see [v3d55] mmucfg + the pte lines)"
-        } else {
-            "pool all-zero with BPCA exactly at the pool base after a completed write-back — the PTB emitted nothing and never moved its write pointer this kick"
-        }
+        pool_verdict
     );
     // The MMU configuration readback (what the GPU actually walks) FIRST, then our published PTEs —
     // neither half is a translation probe on its own; the pair is what carries the discrimination.
