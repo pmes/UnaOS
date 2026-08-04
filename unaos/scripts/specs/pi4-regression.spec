@@ -107,6 +107,28 @@ REQUIRE CAPSTONE COMPLETE
 # --- per-arc verdicts (granular diagnosis when the chain breaks mid-way) -----------
 REQUIRE M6b: EL0 fault isolation.*-> PASS
 REQUIRE M6g: disk-loaded EL0 program exited ok -> PASS
+# --- ERET-SCRUB (R23S1Z): the EL0 return-path residue witnesses. Two EL0 fixtures on the shared window
+# --- read the register file the kernel hands them and report what they find. `el0-eretentry` ORs x0-x30,
+# --- both lanes of v0-v31, FPSR/FPCR and TPIDR_EL0/TPIDRRO_EL0 at its first instruction (0 == the
+# --- `user_task_trampoline` scrub left nothing behind); `el0-eretsvc` plants a distinct sentinel in every
+# --- GPR the ABI does not overwrite, mirrors one into v0-v31, records SP_EL0, crosses a SYS_YIELD (which
+# --- context-switches INSIDE the handler), and reports a per-register mismatch bitmap (0 == `__vec_svc`'s
+# --- restore returned every one of them).
+# --- CONVICTABILITY (the 2026-08-04 rule): each REQUIRE is paired with a FORBID matched against THIS
+# --- emitter's literal FAIL text — `:: ERET-SCRUB: first-entry residue or={:#x} reported={} killed={} ->
+# --- FAIL ::` and `:: ERET-SCRUB: syscall-return residue bitmap={:#x} reported={} killed={} -> FAIL ::`
+# --- (arch/aarch64/syscall.rs, `eret_scrub_verdict`). The PASS and FAIL shapes are deliberately DISJOINT
+# --- — PASS carries `residue = 0` / `preserved`, FAIL carries `residue or=` / `residue bitmap=` — so
+# --- neither FORBID can red a green capture, and a defect verdict convicts on its own content instead of
+# --- leaning on the default `-> FAIL` scan. Both fixtures PASS on the value ZERO, so the emitter also
+# --- carries `reported=`: a witness that never spoke reads FAIL, never a silent pass. The third FORBID
+# --- covers the launch-side skip (entries not latched), which would otherwise drop both REQUIREs
+# --- silently in a capture that is not short.
+REQUIRE :: ERET-SCRUB: first-entry GPR/FP/TPIDR residue = 0 .*-> PASS ::
+REQUIRE :: ERET-SCRUB: syscall-return preserved .*-> PASS ::
+FORBID :: ERET-SCRUB: first-entry residue or=
+FORBID :: ERET-SCRUB: syscall-return residue bitmap=
+FORBID :: ERET-SCRUB: witness entries not latched
 REQUIRE U4: process model.*-> PASS
 REQUIRE U5: capabilities.*-> PASS
 REQUIRE U6: general object table.*-> PASS

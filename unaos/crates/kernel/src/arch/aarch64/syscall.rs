@@ -230,6 +230,12 @@ const M6F_EXIT_STATUS: u64 = 0x6F;
 /// discipline). A spawned CHILD is reaped through the Proc table by pid (see the SYS_EXIT arm), not by this
 /// status. Fresh value (the retired M7 demo used `0x77`); distinct from the M6D/M6E/M6F sentinels and 0.
 const U4_EXIT_STATUS: u64 = 0x74;
+/// ERET-SCRUB witnesses (R23S1Z): the sentinel `sys_exit` status both EL0 return-path fixtures
+/// (`el0-eretentry`, `el0-eretsvc`) use, so their exits land in `EL0_ERET_DONE` and never perturb the
+/// M6b/M6d/M6e/M6f counters — the same sentinel discipline every fixture family above follows. Must
+/// match the `movz x0, #0x83` in `__eret_prog_entry`/`__eret_prog_svc`; distinct from every other
+/// sentinel in this file (0x6D..0x82, 0xB5) and from 0.
+const ERET_EXIT_STATUS: u64 = 0x83;
 /// U4 demo: the nonzero WITNESS token the parent reports iff it reaped BOTH children by handle with status 0.
 /// A token (not a pid) — `sys_spawn` now returns a handle, so the verdict only needs non-zero-means-both-ok.
 /// Must match `movz x23, #0xC4` in `__u4_prog_parent`; `u4_launcher` only checks it is non-zero.
@@ -551,6 +557,500 @@ __user_prog_spin:
     svc #0
 2:  b 2b                                   // sys_exit never returns; belt-and-braces guard
 
+    // ERET-SCRUB witness A (first-entry residue). Runs as the VERY FIRST EL0 instructions of a fresh
+    // task and ORs together everything the architecture makes EL0-readable at entry: x0-x30, both
+    // 64-bit lanes of v0-v31, FPSR/FPCR, TPIDR_EL0/TPIDRRO_EL0. Reports the OR — 0 means no kernel
+    // value survived into EL0's register file. x30 is the accumulator, so its OWN entry value is
+    // folded in by construction; x0 carries `Task.arg` (0 for a `spawn_user` task), so folding it in
+    // strengthens the check rather than weakening it. Register-only: writes NO memory, so it is safe
+    // on the SHARED user window (the M6e stack STOP tripwire).
+    .balign 4
+    .globl __eret_prog_entry
+__eret_prog_entry:
+    orr x30, x30, x0
+    orr x30, x30, x1
+    orr x30, x30, x2
+    orr x30, x30, x3
+    orr x30, x30, x4
+    orr x30, x30, x5
+    orr x30, x30, x6
+    orr x30, x30, x7
+    orr x30, x30, x8
+    orr x30, x30, x9
+    orr x30, x30, x10
+    orr x30, x30, x11
+    orr x30, x30, x12
+    orr x30, x30, x13
+    orr x30, x30, x14
+    orr x30, x30, x15
+    orr x30, x30, x16
+    orr x30, x30, x17
+    orr x30, x30, x18
+    orr x30, x30, x19
+    orr x30, x30, x20
+    orr x30, x30, x21
+    orr x30, x30, x22
+    orr x30, x30, x23
+    orr x30, x30, x24
+    orr x30, x30, x25
+    orr x30, x30, x26
+    orr x30, x30, x27
+    orr x30, x30, x28
+    orr x30, x30, x29
+    // FP/SIMD file: OR-reduce v1-v31 into v0 (needs no GPR), then fold both lanes into x30.
+    orr v0.16b, v0.16b, v1.16b
+    orr v0.16b, v0.16b, v2.16b
+    orr v0.16b, v0.16b, v3.16b
+    orr v0.16b, v0.16b, v4.16b
+    orr v0.16b, v0.16b, v5.16b
+    orr v0.16b, v0.16b, v6.16b
+    orr v0.16b, v0.16b, v7.16b
+    orr v0.16b, v0.16b, v8.16b
+    orr v0.16b, v0.16b, v9.16b
+    orr v0.16b, v0.16b, v10.16b
+    orr v0.16b, v0.16b, v11.16b
+    orr v0.16b, v0.16b, v12.16b
+    orr v0.16b, v0.16b, v13.16b
+    orr v0.16b, v0.16b, v14.16b
+    orr v0.16b, v0.16b, v15.16b
+    orr v0.16b, v0.16b, v16.16b
+    orr v0.16b, v0.16b, v17.16b
+    orr v0.16b, v0.16b, v18.16b
+    orr v0.16b, v0.16b, v19.16b
+    orr v0.16b, v0.16b, v20.16b
+    orr v0.16b, v0.16b, v21.16b
+    orr v0.16b, v0.16b, v22.16b
+    orr v0.16b, v0.16b, v23.16b
+    orr v0.16b, v0.16b, v24.16b
+    orr v0.16b, v0.16b, v25.16b
+    orr v0.16b, v0.16b, v26.16b
+    orr v0.16b, v0.16b, v27.16b
+    orr v0.16b, v0.16b, v28.16b
+    orr v0.16b, v0.16b, v29.16b
+    orr v0.16b, v0.16b, v30.16b
+    orr v0.16b, v0.16b, v31.16b
+    umov x0, v0.d[0]
+    orr x30, x30, x0
+    umov x0, v0.d[1]
+    orr x30, x30, x0
+    mrs x0, tpidr_el0
+    orr x30, x30, x0
+    mrs x0, tpidrro_el0
+    orr x30, x30, x0
+    mrs x0, fpsr
+    orr x30, x30, x0
+    mrs x0, fpcr
+    orr x30, x30, x0
+    mov x0, x30                            // SYS_REPORT(residue OR); 0 == clean
+    mov x8, #3
+    svc #0
+    mov x8, #2                             // SYS_EXIT(ERET_EXIT_STATUS)
+    movz x0, #0x83
+    svc #0
+1:  b 1b
+
+    // ERET-SCRUB witness B (syscall-return preservation). Plants a DISTINCT sentinel
+    // (0xE7ED_00NN_0000_0000) in every GPR the syscall ABI does not overwrite, mirrors one sentinel
+    // into all of v0-v31, records SP_EL0 in x27, then issues SYS_YIELD — the syscall that runs the
+    // MOST kernel code between the `__vec_svc` save and its `eret` (it context-switches inside the
+    // handler, so another task's Rust — and its NEON — runs in between). On return it rebuilds every
+    // expected value and sets bit N of a bitmap for each register that did not come back. Bit 0 is
+    // never set: x0 is the deliberate return value. Bit 27 = x27 clobbered OR SP_EL0 changed; bit 31
+    // = some v0-v31 lane did not survive. Reports the bitmap — 0 means the eret leaked nothing and
+    // dropped nothing. Register-only: writes NO memory (the shared-window STOP tripwire).
+    .balign 4
+    .globl __eret_prog_svc
+__eret_prog_svc:
+    movz x1, #0xE7ED, lsl #48
+    movk x1, #1, lsl #32
+    movz x2, #0xE7ED, lsl #48
+    movk x2, #2, lsl #32
+    movz x3, #0xE7ED, lsl #48
+    movk x3, #3, lsl #32
+    movz x4, #0xE7ED, lsl #48
+    movk x4, #4, lsl #32
+    movz x5, #0xE7ED, lsl #48
+    movk x5, #5, lsl #32
+    movz x6, #0xE7ED, lsl #48
+    movk x6, #6, lsl #32
+    movz x7, #0xE7ED, lsl #48
+    movk x7, #7, lsl #32
+    movz x9, #0xE7ED, lsl #48
+    movk x9, #9, lsl #32
+    movz x10, #0xE7ED, lsl #48
+    movk x10, #10, lsl #32
+    movz x11, #0xE7ED, lsl #48
+    movk x11, #11, lsl #32
+    movz x12, #0xE7ED, lsl #48
+    movk x12, #12, lsl #32
+    movz x13, #0xE7ED, lsl #48
+    movk x13, #13, lsl #32
+    movz x14, #0xE7ED, lsl #48
+    movk x14, #14, lsl #32
+    movz x15, #0xE7ED, lsl #48
+    movk x15, #15, lsl #32
+    movz x16, #0xE7ED, lsl #48
+    movk x16, #16, lsl #32
+    movz x17, #0xE7ED, lsl #48
+    movk x17, #17, lsl #32
+    movz x18, #0xE7ED, lsl #48
+    movk x18, #18, lsl #32
+    movz x19, #0xE7ED, lsl #48
+    movk x19, #19, lsl #32
+    movz x20, #0xE7ED, lsl #48
+    movk x20, #20, lsl #32
+    movz x21, #0xE7ED, lsl #48
+    movk x21, #21, lsl #32
+    movz x22, #0xE7ED, lsl #48
+    movk x22, #22, lsl #32
+    movz x23, #0xE7ED, lsl #48
+    movk x23, #23, lsl #32
+    movz x24, #0xE7ED, lsl #48
+    movk x24, #24, lsl #32
+    movz x25, #0xE7ED, lsl #48
+    movk x25, #25, lsl #32
+    movz x26, #0xE7ED, lsl #48
+    movk x26, #26, lsl #32
+    movz x28, #0xE7ED, lsl #48
+    movk x28, #28, lsl #32
+    movz x29, #0xE7ED, lsl #48
+    movk x29, #29, lsl #32
+    movz x30, #0xE7ED, lsl #48
+    movk x30, #30, lsl #32
+    mov x27, sp                            // x27's expected value IS SP_EL0 (checked as bit 27)
+    // Mirror x26's sentinel into every vector register (the FP file's expected value).
+    dup v0.2d, x26
+    dup v1.2d, x26
+    dup v2.2d, x26
+    dup v3.2d, x26
+    dup v4.2d, x26
+    dup v5.2d, x26
+    dup v6.2d, x26
+    dup v7.2d, x26
+    dup v8.2d, x26
+    dup v9.2d, x26
+    dup v10.2d, x26
+    dup v11.2d, x26
+    dup v12.2d, x26
+    dup v13.2d, x26
+    dup v14.2d, x26
+    dup v15.2d, x26
+    dup v16.2d, x26
+    dup v17.2d, x26
+    dup v18.2d, x26
+    dup v19.2d, x26
+    dup v20.2d, x26
+    dup v21.2d, x26
+    dup v22.2d, x26
+    dup v23.2d, x26
+    dup v24.2d, x26
+    dup v25.2d, x26
+    dup v26.2d, x26
+    dup v27.2d, x26
+    dup v28.2d, x26
+    dup v29.2d, x26
+    dup v30.2d, x26
+    dup v31.2d, x26
+    mov x8, #4                             // SYS_YIELD — a context switch INSIDE the handler
+    svc #0
+    // ---- x30 is checked first, then becomes the bitmap accumulator (x0 = the scratch) ----
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #30, lsl #32
+    eor  x0, x0, x30
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #30
+    mov  x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #1, lsl #32
+    eor  x0, x0, x1
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #1
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #2, lsl #32
+    eor  x0, x0, x2
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #2
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #3, lsl #32
+    eor  x0, x0, x3
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #3
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #4, lsl #32
+    eor  x0, x0, x4
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #4
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #5, lsl #32
+    eor  x0, x0, x5
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #5
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #6, lsl #32
+    eor  x0, x0, x6
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #6
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #7, lsl #32
+    eor  x0, x0, x7
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #7
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #9, lsl #32
+    eor  x0, x0, x9
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #9
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #10, lsl #32
+    eor  x0, x0, x10
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #10
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #11, lsl #32
+    eor  x0, x0, x11
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #11
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #12, lsl #32
+    eor  x0, x0, x12
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #12
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #13, lsl #32
+    eor  x0, x0, x13
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #13
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #14, lsl #32
+    eor  x0, x0, x14
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #14
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #15, lsl #32
+    eor  x0, x0, x15
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #15
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #16, lsl #32
+    eor  x0, x0, x16
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #16
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #17, lsl #32
+    eor  x0, x0, x17
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #17
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #18, lsl #32
+    eor  x0, x0, x18
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #18
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #19, lsl #32
+    eor  x0, x0, x19
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #19
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #20, lsl #32
+    eor  x0, x0, x20
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #20
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #21, lsl #32
+    eor  x0, x0, x21
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #21
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #22, lsl #32
+    eor  x0, x0, x22
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #22
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #23, lsl #32
+    eor  x0, x0, x23
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #23
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #24, lsl #32
+    eor  x0, x0, x24
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #24
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #25, lsl #32
+    eor  x0, x0, x25
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #25
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #26, lsl #32
+    eor  x0, x0, x26
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #26
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #28, lsl #32
+    eor  x0, x0, x28
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #28
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #29, lsl #32
+    eor  x0, x0, x29
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #29
+    orr  x30, x30, x0
+    // x8 must come back holding the syscall NUMBER we passed in (bit 8).
+    mov  x0, #4
+    eor  x0, x0, x8
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #8
+    orr  x30, x30, x0
+    // bit 27: x27 clobbered, or SP_EL0 came back different (the banked-SP_EL0 restore).
+    mov  x0, sp
+    eor  x0, x0, x27
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #27
+    orr  x30, x30, x0
+    // bit 31: the FP/SIMD file. x26 (already convicted above) holds the expected lane value and x29
+    // (likewise) is the scratch accumulator. v0 is folded in by hand, then REBUILT as the expected
+    // vector so v1-v31 can be compared without another GPR.
+    umov x0, v0.d[0]
+    eor  x0, x0, x26
+    mov  x29, x0
+    umov x0, v0.d[1]
+    eor  x0, x0, x26
+    orr  x29, x29, x0
+    dup  v0.2d, x26
+    eor  v1.16b, v1.16b, v0.16b
+    eor  v2.16b, v2.16b, v0.16b
+    eor  v3.16b, v3.16b, v0.16b
+    eor  v4.16b, v4.16b, v0.16b
+    eor  v5.16b, v5.16b, v0.16b
+    eor  v6.16b, v6.16b, v0.16b
+    eor  v7.16b, v7.16b, v0.16b
+    eor  v8.16b, v8.16b, v0.16b
+    eor  v9.16b, v9.16b, v0.16b
+    eor  v10.16b, v10.16b, v0.16b
+    eor  v11.16b, v11.16b, v0.16b
+    eor  v12.16b, v12.16b, v0.16b
+    eor  v13.16b, v13.16b, v0.16b
+    eor  v14.16b, v14.16b, v0.16b
+    eor  v15.16b, v15.16b, v0.16b
+    eor  v16.16b, v16.16b, v0.16b
+    eor  v17.16b, v17.16b, v0.16b
+    eor  v18.16b, v18.16b, v0.16b
+    eor  v19.16b, v19.16b, v0.16b
+    eor  v20.16b, v20.16b, v0.16b
+    eor  v21.16b, v21.16b, v0.16b
+    eor  v22.16b, v22.16b, v0.16b
+    eor  v23.16b, v23.16b, v0.16b
+    eor  v24.16b, v24.16b, v0.16b
+    eor  v25.16b, v25.16b, v0.16b
+    eor  v26.16b, v26.16b, v0.16b
+    eor  v27.16b, v27.16b, v0.16b
+    eor  v28.16b, v28.16b, v0.16b
+    eor  v29.16b, v29.16b, v0.16b
+    eor  v30.16b, v30.16b, v0.16b
+    eor  v31.16b, v31.16b, v0.16b
+    orr  v1.16b, v1.16b, v2.16b
+    orr  v1.16b, v1.16b, v3.16b
+    orr  v1.16b, v1.16b, v4.16b
+    orr  v1.16b, v1.16b, v5.16b
+    orr  v1.16b, v1.16b, v6.16b
+    orr  v1.16b, v1.16b, v7.16b
+    orr  v1.16b, v1.16b, v8.16b
+    orr  v1.16b, v1.16b, v9.16b
+    orr  v1.16b, v1.16b, v10.16b
+    orr  v1.16b, v1.16b, v11.16b
+    orr  v1.16b, v1.16b, v12.16b
+    orr  v1.16b, v1.16b, v13.16b
+    orr  v1.16b, v1.16b, v14.16b
+    orr  v1.16b, v1.16b, v15.16b
+    orr  v1.16b, v1.16b, v16.16b
+    orr  v1.16b, v1.16b, v17.16b
+    orr  v1.16b, v1.16b, v18.16b
+    orr  v1.16b, v1.16b, v19.16b
+    orr  v1.16b, v1.16b, v20.16b
+    orr  v1.16b, v1.16b, v21.16b
+    orr  v1.16b, v1.16b, v22.16b
+    orr  v1.16b, v1.16b, v23.16b
+    orr  v1.16b, v1.16b, v24.16b
+    orr  v1.16b, v1.16b, v25.16b
+    orr  v1.16b, v1.16b, v26.16b
+    orr  v1.16b, v1.16b, v27.16b
+    orr  v1.16b, v1.16b, v28.16b
+    orr  v1.16b, v1.16b, v29.16b
+    orr  v1.16b, v1.16b, v30.16b
+    orr  v1.16b, v1.16b, v31.16b
+    umov x0, v1.d[0]
+    orr  x29, x29, x0
+    umov x0, v1.d[1]
+    orr  x29, x29, x0
+    cmp  x29, #0
+    cset x0, ne
+    lsl  x0, x0, #31
+    orr  x30, x30, x0
+    mov  x0, x30                           // SYS_REPORT(bitmap); 0 == nothing leaked, nothing dropped
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2                            // SYS_EXIT(ERET_EXIT_STATUS)
+    movz x0, #0x83
+    svc  #0
+2:  b 2b
+
     .balign 4
     .globl __fault_blob_end
 __fault_blob_end:
@@ -564,6 +1064,8 @@ unsafe extern "C" {
     static __user_prog_code_write: u8;
     static __user_prog_stack_exec: u8;
     static __user_prog_spin: u8;
+    static __eret_prog_entry: u8;
+    static __eret_prog_svc: u8;
 }
 
 // --- M6d inline EL0 fixtures (per-task address spaces). Position-independent, register/stack-only, so
@@ -2913,6 +3415,43 @@ static EL0_M6G_KILLED: AtomicU32 = AtomicU32::new(0);
 /// Set by `m6f_verdict` as its last act: the M6g loader waits on this so every LOADER M6g line lands after
 /// the M6b/M6e/M6d/M6f verdict lines (the Part-B probe's two early M6g lines land before the demo).
 static M6F_VERDICT_PRINTED: AtomicBool = AtomicBool::new(false);
+
+// =============================================================================================
+// ERET-SCRUB accounting (R23S1Z) — the EL0 return-path residue witnesses.
+//
+// The aarch64 EL0 return paths were audited from the vectors outward (see docs/SECURITY.md) and every
+// one of them is clean BY CONSTRUCTION: `__vec_svc`/`__vec_irq`/`__vec_serror` restore the WHOLE
+// x0-x30 file (and v0-v31/FPSR/FPCR) from the interrupted task's OWN entry frame before their `eret`,
+// and `user_task_trampoline` zeroes x0-x30, v0-v31, FPSR/FPCR and TPIDR_EL0/TPIDRRO_EL0 before the
+// FIRST `eret` into a task. Neither property had ever been OBSERVED FROM EL0 — the ledger said so in
+// as many words ("rests on the code path, not a fixture that reads the file"). These two fixtures are
+// that observation: one reads the register file at first entry and demands zero, the other plants
+// sentinels, crosses a syscall that context-switches, and demands every one of them back.
+//
+// Both exit with `ERET_EXIT_STATUS`, so they land in `EL0_ERET_DONE` and leave every other family's
+// counters byte-identical. Both are register-only (they write NO memory), which is what lets them run
+// on the SHARED user window without tripping the M6e per-task-stack STOP tripwire.
+// =============================================================================================
+/// EL0 VA of `__eret_prog_entry` inside the shared window's code page; latched by `setup()`.
+static ERET_ENTRY_VA: AtomicU64 = AtomicU64::new(0);
+/// EL0 VA of `__eret_prog_svc` inside the shared window's code page; latched by `setup()`.
+static ERET_SVC_VA: AtomicU64 = AtomicU64::new(0);
+/// The shared window's initial SP_EL0 (same value `El0Demo.sp` carries); latched by `setup()`.
+static ERET_SP: AtomicU64 = AtomicU64::new(0);
+/// `el0-eretentry`'s reported OR of every EL0-readable register at first entry. 0 == no residue.
+static ERET_ENTRY_OR: AtomicU64 = AtomicU64::new(0);
+/// True once `el0-eretentry` actually reported — a value of 0 is only meaningful if it was WRITTEN.
+static ERET_ENTRY_REPORTED: AtomicBool = AtomicBool::new(false);
+/// `el0-eretsvc`'s reported mismatch bitmap (bit N = register xN did not survive the syscall; bit 27
+/// also covers SP_EL0; bit 31 covers the v0-v31 file). 0 == nothing leaked and nothing was dropped.
+static ERET_SVC_BITMAP: AtomicU64 = AtomicU64::new(0);
+/// True once `el0-eretsvc` actually reported (same reasoning as `ERET_ENTRY_REPORTED`).
+static ERET_SVC_REPORTED: AtomicBool = AtomicBool::new(false);
+/// ERET-SCRUB fixtures that reached their sentinel `sys_exit` (want 2).
+static EL0_ERET_DONE: AtomicU32 = AtomicU32::new(0);
+/// ERET-SCRUB fixtures KILLED by a fault (want 0). Kept OFF the M6b `killed_unexpected` counter so a
+/// return-path regression surfaces as its OWN FAIL line, not as a phantom M6b regression.
+static EL0_ERET_KILLED: AtomicU32 = AtomicU32::new(0);
 
 // =============================================================================================
 // U4 accounting — the process model + per-process handle table: sys_spawn (load+run a child from storage,
@@ -5519,6 +6058,12 @@ pub fn setup() -> El0Demo {
     // The shared window is never torn down (ASID 0), so this endowment persists for the whole boot; the M6b
     // fault fixtures and the M6e spinner share ASID 0 but never write, so the single fixed cap serves them all.
     install_console_cap(0);
+    // ERET-SCRUB: latch the two return-path witness entries (and the shared SP_EL0) into statics, so the
+    // fixtures can be spawned from a kernel task INSIDE this module (`m6e_verdict`) without threading two
+    // more fields through `El0Demo` and its caller. Same code page, same `fentry` alignment assert.
+    ERET_ENTRY_VA.store(fentry(&raw const __eret_prog_entry), Ordering::Release);
+    ERET_SVC_VA.store(fentry(&raw const __eret_prog_svc), Ordering::Release);
+    ERET_SP.store((base + size as u64) & !0xF, Ordering::Release);
     El0Demo {
         sp: (base + size as u64) & !0xF, // 16-aligned top of the window = initial user stack pointer
         hello: base, // the loaded blob's `_start` is at offset 0 of the copy (base is 16 KiB-aligned)
@@ -5599,6 +6144,14 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
     // must land in its own counter, never inflating the M6b `killed_unexpected` count.
     if matches!(name, "el0-getinfo" | "el0-hostile" | "el0-yield" | "el0-sleep") {
         EL0_M6F_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    // ERET-SCRUB: the two return-path witnesses are register-only and fault on nothing, so a kill here is a
+    // real bug in the EL0 return path itself (the likeliest shape: SP_EL0 came back wrong and the fixture's
+    // report never left EL0). Its own counter — never the M6b `killed_unexpected` count — and the verdict
+    // below prints FAIL from the missing report regardless.
+    if matches!(name, "el0-eretentry" | "el0-eretsvc") {
+        EL0_ERET_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
     // M6g: the untrusted disk-loaded program. A kill here is contained (the whole point) and reported by
@@ -5843,6 +6396,77 @@ pub fn m6e_verdict(_: usize) {
         done,
         irqs
     );
+    // ERET-SCRUB (R23S1Z): launch the two EL0 return-path residue witnesses from here. This is the host
+    // because `m6e-verdict` is spawned UNCONDITIONALLY (main.rs), unlike the M6d/M6f verdicts, which only
+    // exist when their slot allocation succeeded — a witness that can silently not-run is exactly the
+    // shape the spec's convictability hardening exists to refuse. Both fixtures live in the SHARED window's
+    // code page (`setup()` latched their VAs), need no address-space slot, and write no memory, so they add
+    // no slot pressure and cannot disturb the M6d/M6f slot budget. `CPU_AUTO` places them on an ONLINE
+    // scheduled AP — never the unscheduled BSP, which `spawn_user` forbids.
+    eret_scrub_launch();
+}
+
+/// ERET-SCRUB: spawn the two EL0 return-path witnesses plus their verdict task. Separated from
+/// `m6e_verdict` only so the launch reads as one thing; called exactly once.
+fn eret_scrub_launch() {
+    let entry = ERET_ENTRY_VA.load(Ordering::Acquire);
+    let svc = ERET_SVC_VA.load(Ordering::Acquire);
+    let sp = ERET_SP.load(Ordering::Acquire);
+    if entry == 0 || svc == 0 || sp == 0 {
+        // Unreachable on any boot that ran `setup()` (which is every EL0-capable boot). Named rather than
+        // silent: a zero VA here would otherwise `eret` a task to 0 and read as a mystery EL0 fault.
+        serial_println!(":: ERET-SCRUB: witness entries not latched — return-path residue witnesses SKIPPED ::");
+        return;
+    }
+    super::sched::spawn_user("el0-eretentry", entry, sp, super::sched::CPU_AUTO);
+    super::sched::spawn_user("el0-eretsvc", svc, sp, super::sched::CPU_AUTO);
+    super::sched::spawn("eret-verdict", eret_scrub_verdict, 0, super::sched::CPU_AUTO);
+}
+
+/// ERET-SCRUB verdict task: wait (bounded, CNTPCT) for both EL0 return-path witnesses, then print the
+/// two lines that turn the code-path argument into an observation.
+///
+/// Line 1 — FIRST ENTRY. `el0-eretentry` ORed x0-x30, both lanes of v0-v31, FPSR/FPCR and
+/// TPIDR_EL0/TPIDRRO_EL0 at its first EL0 instructions. A non-zero OR is a kernel value that survived
+/// `user_task_trampoline`'s scrub into EL0's architectural state.
+///
+/// Line 2 — SYSCALL RETURN. `el0-eretsvc` planted a distinct sentinel in every GPR the syscall ABI does
+/// not overwrite, mirrored one into v0-v31, recorded SP_EL0, and crossed a `SYS_YIELD` (which
+/// context-switches INSIDE the handler, so an unrelated task's Rust and NEON ran between `__vec_svc`'s
+/// save and its `eret`). Bit N of the reported bitmap means xN did not come back; bit 27 also covers
+/// SP_EL0, bit 31 the whole v0-v31 file. Bit 0 is never set — x0 is the deliberate return value.
+///
+/// Both PASS values are 0, so both arms demand the report actually HAPPENED (`*_REPORTED`) and that
+/// neither fixture was killed. A missing report, a kill, or a timeout is a FAIL, never a silent pass.
+pub fn eret_scrub_verdict(_: usize) {
+    // ~5 s; both fixtures are a few hundred instructions and finish in well under 1 s.
+    let _ = wait_while_secs(5, || EL0_ERET_DONE.load(Ordering::Acquire) < 2);
+    let entry_or = ERET_ENTRY_OR.load(Ordering::Acquire);
+    let entry_rep = ERET_ENTRY_REPORTED.load(Ordering::Acquire);
+    let svc_map = ERET_SVC_BITMAP.load(Ordering::Acquire);
+    let svc_rep = ERET_SVC_REPORTED.load(Ordering::Acquire);
+    let killed = EL0_ERET_KILLED.load(Ordering::Acquire);
+
+    if entry_rep && entry_or == 0 && killed == 0 {
+        serial_println!(
+            ":: ERET-SCRUB: first-entry GPR/FP/TPIDR residue = 0 (x0-x30, v0-v31, FPSR/FPCR, TPIDR_EL0/RO read at EL0) -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: ERET-SCRUB: first-entry residue or={:#x} reported={} killed={} -> FAIL ::",
+            entry_or, entry_rep, killed
+        );
+    }
+    if svc_rep && svc_map == 0 && killed == 0 {
+        serial_println!(
+            ":: ERET-SCRUB: syscall-return preserved x1-x30 + x8 + SP_EL0 + v0-v31 across SYS_YIELD (bitmap=0x0) -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: ERET-SCRUB: syscall-return residue bitmap={:#x} reported={} killed={} -> FAIL ::",
+            svc_map, svc_rep, killed
+        );
+    }
 }
 
 /// The M6d demo's per-task entry points (all at the SAME user VAs — the point of ASID isolation) and the
@@ -6161,6 +6785,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             fb_report(a0);
             wcb_report(a0);
             input_report(a0);
+            eret_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -6419,6 +7044,8 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 EL0_M6D_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == M6F_EXIT_STATUS {
                 EL0_M6F_DONE.fetch_add(1, Ordering::AcqRel);
+            } else if a0 == ERET_EXIT_STATUS {
+                EL0_ERET_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == U4_EXIT_STATUS {
                 EL0_U4_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == U5_EXIT_STATUS {
@@ -6777,6 +7404,24 @@ fn note_interleave() {
 /// M6f: record a value an M6f EL0 fixture reported via SYS_REPORT, keyed by the reporting task's name.
 /// (M6d names fall through to `m6d_report`, which the SYS_REPORT arm also calls; the name spaces are
 /// disjoint, so each function ignores the other's tasks.)
+/// ERET-SCRUB: route the two return-path witnesses' `SYS_REPORT` values by task name, and record that
+/// the report HAPPENED. The reported-flag is load-bearing: for both fixtures the PASSING value is 0, so
+/// a verdict that read the counter alone could not tell "EL0 saw a clean register file" from "the
+/// fixture never ran / was killed before it could speak". Any other task's report is ignored.
+fn eret_report(value: u64) {
+    match super::sched::current_name() {
+        Some("el0-eretentry") => {
+            ERET_ENTRY_OR.store(value, Ordering::Release);
+            ERET_ENTRY_REPORTED.store(true, Ordering::Release);
+        }
+        Some("el0-eretsvc") => {
+            ERET_SVC_BITMAP.store(value, Ordering::Release);
+            ERET_SVC_REPORTED.store(true, Ordering::Release);
+        }
+        _ => {}
+    }
+}
+
 fn m6f_report(value: u64) {
     match super::sched::current_name() {
         Some("el0-getinfo") => M6F_GETINFO_WITNESS.store(value, Ordering::Release),
