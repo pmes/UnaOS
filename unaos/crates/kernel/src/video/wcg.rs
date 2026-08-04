@@ -140,6 +140,57 @@
 //! first and the first class is always whole-box (window creation, first paint). See [`H_BTAKEN`].
 //! The tallies behind them are unbudgeted and the rollup is one line per budget, so the wire can say
 //! `banded=0` as readily as it can say `banded=980`.
+//!
+//! ## WC-H2 — the rollup had to outlive its own budget
+//!
+//! Three defects in that arrangement were found by reading two consecutive metal boots
+//! (`rmbp-gr15-s70`), and all three are the same mistake wearing different clothes: **a line that
+//! fires when a BUDGET spends can only ever describe the moment the budget spent.**
+//!
+//! 1. *It fired seconds into the boot and never again.* The banded rollup latches at
+//!    `H_BTAKEN >= SAMPLES` — four banded presents — which in boot A of that capture landed at line
+//!    519 of 1904, moments after console routing began. [`H_MINSPAN`], [`H_BANDED`] and [`H_WHOLE`]
+//!    are UNBUDGETED and keep counting for the whole boot, but nothing ever printed them again. The
+//!    consequence is on the wire: boot A's line read `banded=1 minspan=736` of a 750-row box, and a
+//!    session read it and concluded banding buys the console nothing. Boot B's `scope=window` line
+//!    happened to fire late (line 2796 of 3119 — luck, not design: that window's whole-box budget
+//!    filled after its banded one) and read `banded=271 minspan=96`. Ninety-six rows of seven hundred
+//!    and fifty: 13% of the surface, and the exact opposite conclusion. The instrument reported a
+//!    startup burst and was believed.
+//! 2. *`samples=` printed the CONSTANT.* The print site passed [`SAMPLES`] rather than any counter,
+//!    so `samples=4` was uninformative on every rollup this module has ever emitted — it restated the
+//!    budget's definition. It now comes from the live budget counter, and [`H_LINES`] carries the
+//!    count that genuinely differs from it (see below).
+//! 3. *Budgeted and unbudgeted quantities shared one line with no marking.* `torn=7` appeared beside
+//!    `samples=4` and read as "7 of 4". Worse than the confusion was the truth underneath it: `torn`
+//!    was NOT a whole-boot tally either. The tear test sat INSIDE the budget gate, so it could count
+//!    at most `2 * SAMPLES` — 8 — over an entire boot, and a window that composited cleanly for its
+//!    first eight presents and tore for the next thousand printed `torn=0 -> TEAR-FREE`. The
+//!    `AT-RISK` verdict, and the spec FORBID that rests on it, were budget-limited.
+//!
+//! The fix is three-part and every part is load-bearing on its own:
+//!
+//! - **The tear test and `maxpresent_us` move OUT of the budget gate** ([`stage_note`]), so `torn=`
+//!   becomes a genuine whole-boot census and `AT-RISK` is reachable at any point in the boot. Cost is
+//!   two subtractions, a multiply and a divide per present — arithmetic, no serial, no checksum, so
+//!   the "unbudgeted version would perturb the timing" objection that governs the CHECKSUMS does not
+//!   reach it.
+//! - **The rollup RE-FIRES** ([`census_refresh`]), so those whole-boot censuses are actually read
+//!   after the console has run. Neither half is sufficient alone: an unbudgeted `torn` that is only
+//!   ever printed at second four is still invisible, and a re-fired line carrying a budget-capped
+//!   `torn` still cannot say more than 8.
+//! - **Every field says which population it is drawn from**, via repeated `pop=` markers. See
+//!   [`stage_rollup`].
+//!
+//! **What the re-fired line does NOT claim.** [`W_SAMPLES`]'s note is the standing law here and it is
+//! not repealed: nothing observable inside a boot can distinguish "this window is finished
+//! compositing" from "the next line has not been printed yet", so no line in this module may claim
+//! completeness. A refreshed rollup claims strictly less than that — it is a RUNNING census with the
+//! moment it was taken stamped on it (`age_ms=`) and its ordinal among this window's rollups
+//! (`emit=`). The reader's rule is the one that follows from that: for any `win=`, the line with the
+//! greatest `emit=` supersedes every earlier one, and rollup lines are never summed. They are
+//! snapshots of monotone totals, not deltas, which is also why re-emission cannot double-count
+//! anything — see [`census_refresh`].
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -208,9 +259,17 @@ static W_MAXUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 
 /// Per-id: `[wc-h]` samples taken, capped at [`SAMPLES`].
 static H_TAKEN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
-/// Per-id: samples whose PRESENT phase alone outran the beam's time on the box.
+/// Per-id: presents whose PRESENT phase alone outran the beam's time on the box.
+///
+/// **Unbudgeted since WC-H2, and that is the whole of its meaning.** The tear test used to sit below
+/// the two budget gates in [`stage_note`], so this counter could not exceed `2 * SAMPLES` no matter
+/// what the boot did — eight, forever. `AT-RISK` and the pi4 spec's FORBID on it were therefore
+/// scoped to a window's first handful of presents while reading as a claim about the window. It is
+/// now taken on every present, before either gate.
 static H_TORN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
-/// Per-id: the largest present-phase duration seen, in microseconds.
+/// Per-id: the largest present-phase duration seen, in microseconds. Unbudgeted since WC-H2, for the
+/// same reason as [`H_TORN`]: a maximum over four startup presents is not a maximum over the boot,
+/// and it was being printed as one.
 static H_MAXPRES: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// Per-id: composites that did NOT reach the back layer and ran on the direct (pre-WC-H) path — the
 /// tearing regime. Excludes the deliberate fixture decline, which is counted separately.
@@ -270,6 +329,7 @@ pub fn stage_decline(id: u32, reason: u32) {
     if i >= IDS {
         return;
     }
+    mark_seen(i);
     let n = H_TAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
     if n > SAMPLES {
         H_TAKEN[i].store(SAMPLES + 1, Ordering::Relaxed);
@@ -334,6 +394,77 @@ static H_WHOLE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// is by span; `bytes` is `row_bytes * span` at a fixed window width, so the low half can only ever
 /// agree with that ordering, never invert it.
 static H_MINSPAN: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
+
+// ---- WC-H2 — the state a REFRESHED rollup needs, and nothing more ------------------------------
+
+/// Per-id: `now_cycles()` at this window's first recorded present or decline, or 0 before there is
+/// one. The origin `age_ms=` is measured from, and the reason it is per-WINDOW rather than global:
+/// the gate's apps start more than 3 s apart, so a boot-relative age would say more about launch
+/// order than about how long this window has been compositing.
+///
+/// `age_ms=` is the field that separates defect 1's two readings on sight. Boot A's `banded=1
+/// minspan=736` was taken at an age of milliseconds; boot B's `banded=271 minspan=96` at an age of
+/// seconds. Nothing on the old line distinguished them, and the serial log carries no timestamps of
+/// its own, so the distinction had to be manufactured here or not at all.
+static H_T0: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+
+/// Per-id: `now_cycles()` as of the END of this window's most recent rollup emission — after the
+/// serial write, deliberately, so [`CENSUS_PERIOD_US`] bounds the *duty cycle* the refresh imposes on
+/// the composite path rather than merely the interval between its starts.
+///
+/// Also the refresh's mutual exclusion: it is armed by a `compare_exchange` on this cell, so of two
+/// cores flushing the same window at the same instant exactly one prints. See [`census_refresh`].
+static H_LASTROLL: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+
+/// Per-id: [`census_total`] as of the most recent rollup emission. The refresh's other gate: a window
+/// whose censuses have not moved has nothing new to say, and reprinting an unchanged line would spend
+/// serial time to restate the previous one. An idle window therefore goes quiet with its last line
+/// describing its last active state, which is the correct steady-state report for it.
+static H_LASTCENSUS: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// Per-id: rollup lines emitted for this window so far. Printed as `emit=`, one-based.
+///
+/// Not decoration. `emit=1` standing as the ONLY rollup for a window whose censuses are still
+/// growing is how this arc's own machinery is falsified from the wire: it says the refresh never
+/// armed — [`stage_flush`] unreached, the clock reading zero, or the delta gate stuck — and it says
+/// so without needing a second boot to compare against.
+static H_EMIT: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// Per-id: per-sample `[wc-h]` lines actually printed by [`emit_sample`]. Printed as `lines=`.
+///
+/// This is the count that genuinely diverges from `samples=`. There is one pending slot per id, so a
+/// concurrent composite can overwrite a recorded sample before it is printed, and the module has
+/// always documented that the trace is a subset — but it left the reader to notice the shortfall by
+/// counting lines by hand. The `rmbp-gr15-s70` capture has it: window 3's first rollup follows three
+/// `-> BUFFERED` lines and announces four samples. `lines=3 samples=4` states the loss instead of
+/// leaving it to arithmetic, and `lines=0` alongside a non-zero `samples=` would say the trace path
+/// is dead rather than merely lossy.
+///
+/// **It is a WINDOW count, and `samples=` is a SCOPE count — so `lines` may legitimately EXCEED it.**
+/// A window emits sample lines against both budgets and for its declines, so the ceiling here is
+/// `2 * SAMPLES`, while `samples=` never exceeds one budget. The same capture shows the shape: window
+/// 1's `scope=window` rollup in the newer boot follows SEVEN per-sample lines, four whole-box and
+/// three of the four banded records (one overwritten). `lines=7 samples=4` is not a contradiction and
+/// must not be read as one; the comparison `lines=` is for is against `2 * budget=`, and the
+/// comparison `samples=` is for is against the `pop=all-presents` census beside it.
+static H_LINES: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// Minimum wall time between two rollup emissions for one window.
+///
+/// The refresh's whole cost is serial. A rollup line is ~250 bytes and the UART runs at 115200 baud,
+/// so one line is ~20 ms of a core's time on the composite path — the same path whose microsecond
+/// timings this module exists to report, which is why the figure cannot simply be made small. Two
+/// seconds puts one window's refresh at a ~1% duty cycle and the worst case ([`IDS`] windows all
+/// compositing hard) at ~8%.
+///
+/// It is also what bounds the residual error this arc does NOT remove. The last refreshed line of a
+/// boot is taken up to `CENSUS_PERIOD_US` of presents before the final one, so its censuses are a
+/// LOWER BOUND on the boot's true totals, short by at most one period's worth. Against the ~27
+/// presents/second the `rmbp-gr15-s70` console sustained that is a tail of up to ~54 of ~271 — where
+/// the defect being fixed reported 1 of 271. The bound is stated rather than hidden because there is
+/// no honest way to close it from inside this file: a genuinely final census needs a boot-end or
+/// shell-verb call site, and every such site lives in another module.
+const CENSUS_PERIOD_US: u64 = 2_000_000;
 
 /// Per-id rollup latches. Bit [`ROLL_WHOLE`] for the whole-box budget's rollup, bit [`ROLL_BAND`] for
 /// the banded one; each fires at most once per window per boot.
@@ -403,6 +534,7 @@ pub fn stage_note(
     if i >= IDS {
         return;
     }
+    mark_seen(i);
     // Classify and census FIRST, before either budget test. Past budget the LINE stops but the count
     // must not — the same rule `stage_decline` already follows, and here it is the difference between
     // "this window banded 4 times" and the truth.
@@ -413,6 +545,28 @@ pub fn stage_note(
     } else {
         H_WHOLE[i].fetch_add(1, Ordering::Relaxed);
     }
+    // WC-H2 — the TEAR TEST is a census too, and it belongs on this side of the budget gate for the
+    // same reason `banded` does.
+    //
+    // It used to sit below, inside the gate, which capped `H_TORN` at `2 * SAMPLES` — eight — for a
+    // whole boot. A window that composited cleanly through its first eight presents and then tore for
+    // the next thousand printed `torn=0` and the rollup called it `TEAR-FREE`, with the spec's FORBID
+    // on `-> AT-RISK` never able to fire. The verdict was scoped to the startup burst while reading
+    // like a claim about the window.
+    //
+    // The module's standing objection to unbudgeted work does not reach here. What it protects is the
+    // CHECKSUMS — 64 KiB volatile reads and a per-pixel read-back, which would perturb the very
+    // interval they are timing. This is two saturating subtractions, one multiply and one divide on
+    // values the caller already handed us; it touches no memory outside two atomics and writes
+    // nothing to the UART. `maxpresent_us` moves for the same reason and at the same price: a maximum
+    // over a window's first four presents is precisely the startup-burst reading this arc exists to
+    // stop reporting as a steady state.
+    let present_us = cycles_to_us(t_end.saturating_sub(t1));
+    let rectscan_us = if panel_h == 0 { 0 } else { FRAME_US * span as u64 / panel_h as u64 };
+    if present_us > rectscan_us {
+        H_TORN[i].fetch_add(1, Ordering::Relaxed);
+    }
+    H_MAXPRES[i].fetch_max(present_us, Ordering::Relaxed);
     // Two budgets, one per class. See [`H_BTAKEN`] for why a shared one made the feature invisible.
     let n = if banded {
         let n = H_BTAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
@@ -429,13 +583,9 @@ pub fn stage_note(
         }
         n
     };
+    // Only the per-SAMPLE line's fields are computed past the gate now; `present_us` and
+    // `rectscan_us` were taken above, where the census needs them.
     let compose_us = cycles_to_us(t1.saturating_sub(t0));
-    let present_us = cycles_to_us(t_end.saturating_sub(t1));
-    let rectscan_us = if panel_h == 0 { 0 } else { FRAME_US * span as u64 / panel_h as u64 };
-    if present_us > rectscan_us {
-        H_TORN[i].fetch_add(1, Ordering::Relaxed);
-    }
-    H_MAXPRES[i].fetch_max(present_us, Ordering::Relaxed);
     H_KIND[i].store(KIND_STAGED, Ordering::Relaxed);
     H_BAND[i].store(banded as u32, Ordering::Relaxed);
     H_BOX[i].store(((bw as u64) << 32) | bh as u64, Ordering::Relaxed);
@@ -468,6 +618,10 @@ pub fn stage_note(
 /// the per-sample lines are a best-effort trace. A queue would fix the trace at the cost of putting
 /// allocation or a lock on the present path, which is not a trade this witness is worth.
 ///
+/// WC-H2 puts that shortfall on the wire instead of leaving it to be counted by hand: the rollup's
+/// `lines=` is how many per-sample lines this window actually emitted, against its `samples=`. See
+/// [`H_LINES`].
+///
 /// **The ROLLUPS are not part of that best-effort trace, and no longer ride on the pending slot.**
 /// They are latched off the budget counters instead ([`H_ROLLED`]), so an overwritten sample can cost
 /// a trace line but never the line the spec's verdicts are read from. There are two of them, one per
@@ -485,20 +639,126 @@ pub fn stage_flush(id: u32) {
     // FBCON-DMG — the whole-box rollup fires as it always did, at the first flush that observes the
     // whole-box/decline budget spent. The banded one is new and fires on its own budget, which in a
     // real boot is LATER: window creation spends the whole-box budget before the console has printed a
-    // line. A boot that never bands therefore ends with exactly one rollup, reading `banded=0` — and a
-    // boot that bands ends with two, the second carrying the real count and the narrowest span. Both
-    // outcomes are visible on the wire, which is what makes the feature falsifiable in either
-    // direction rather than only confirmable.
+    // line. A boot that never bands therefore never emits a `scope=window-band` line at all, and a
+    // boot that bands emits exactly one. That PRESENCE-OR-ABSENCE is the falsification test, and it is
+    // what WC-H2 left untouched when it stopped relying on these one-shots for the census.
+    //
+    // What it did NOT leave untouched is the belief that one line each was enough. Both latches fire
+    // when a four-sample BUDGET spends, which is seconds into the boot, and the censuses they carried
+    // — `banded`, `minspan`, `whole`, and now `torn` — go on counting for the rest of it. So the
+    // `scope=window` line is kept current by `census_refresh` below, and the reader takes the greatest
+    // `emit=` for each `win=`.
     if H_TAKEN[i].load(Ordering::Relaxed) >= SAMPLES
         && H_ROLLED[i].fetch_or(ROLL_WHOLE, Ordering::Relaxed) & ROLL_WHOLE == 0
     {
-        stage_rollup(id, i, "window");
+        stage_rollup(id, i, "window", H_TAKEN[i].load(Ordering::Relaxed));
     }
     if H_BTAKEN[i].load(Ordering::Relaxed) >= SAMPLES
         && H_ROLLED[i].fetch_or(ROLL_BAND, Ordering::Relaxed) & ROLL_BAND == 0
     {
-        stage_rollup(id, i, "window-band");
+        stage_rollup(id, i, "window-band", H_BTAKEN[i].load(Ordering::Relaxed));
     }
+    // WC-H2 — and then, for the rest of the boot, keep the censuses on those lines readable.
+    census_refresh(id, i);
+}
+
+/// WC-H2 — note that this window has been seen, once, so `age_ms=` has an origin.
+///
+/// `compare_exchange` from 0 rather than a plain store: the origin must be the FIRST record, and a
+/// later store would silently reset the age and make every subsequent rollup look like a startup
+/// burst — reintroducing the defect from the other end. `now_cycles()` returning 0 exactly once at
+/// boot would leave the origin unset and the age reading as the raw uptime, which is conservative in
+/// the right direction (it can only make a line look OLDER, never younger, so it cannot manufacture
+/// the "this is steady state" reading).
+#[inline]
+fn mark_seen(i: usize) {
+    if H_T0[i].load(Ordering::Relaxed) == 0 {
+        let _ = H_T0[i].compare_exchange(0, now_cycles(), Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
+
+/// WC-H2 — every present, decline and fixture this window has had, budget or no budget. The quantity
+/// the refresh's delta gate is taken over, and the denominator a reader should hold `samples=` up
+/// against.
+#[inline]
+fn census_total(i: usize) -> u32 {
+    H_WHOLE[i]
+        .load(Ordering::Relaxed)
+        .wrapping_add(H_BANDED[i].load(Ordering::Relaxed))
+        .wrapping_add(H_DECLINE[i].load(Ordering::Relaxed))
+        .wrapping_add(H_FIXTURE[i].load(Ordering::Relaxed))
+}
+
+/// WC-H2 — re-emit this window's `scope=window` rollup so its UNBUDGETED censuses are read after the
+/// console has actually run.
+///
+/// ### Why this had to exist
+///
+/// See the module note's WC-H2 section for the two boots that convict the old arrangement. The short
+/// form: `H_MINSPAN`, `H_BANDED`, `H_WHOLE`, `H_DECLINE` and (now) `H_TORN` count for the whole boot,
+/// and every one of them was printed exactly once, at the arbitrary instant a four-sample budget
+/// spent. One boot printed `banded=1 minspan=736` and another printed `banded=271 minspan=96` for the
+/// SAME window doing the SAME work, because the two budgets happened to fill in a different order.
+///
+/// ### Why `scope=window`, and only `scope=window`
+///
+/// Every census field on the line is per-WINDOW; only `samples=`/`budget=` belong to the scope. The
+/// two scopes therefore print identical censuses, and refreshing both would double the serial cost to
+/// restate the same numbers. `scope=window` is the window's line — the one the pi4 spec REQUIREs and
+/// the one the FORBIDs sit on — so that is the one kept current. `scope=window-band` keeps its
+/// original job unchanged: a one-shot marker for the moment the banded budget spent, whose presence
+/// or absence is still the "did this window ever band" falsification test the [`stage_rollup`] note
+/// describes.
+///
+/// ### Reachability, and how it is guaranteed rather than assumed
+///
+/// [`stage_flush`] is the sole call site and `video::wm`'s composite pass calls it once per window
+/// per pass, immediately after `wcg::end` — the same place that already prints every `[wc-h]` sample
+/// line. So the refresh runs on exactly the population it reports on: a window that is compositing is
+/// a window whose flush is being called. It needs no new call site, no timer and no thread, and there
+/// is nothing to keep alive between passes.
+///
+/// The corollary matters as much: a window that STOPS compositing stops refreshing. The last line for
+/// such a window describes its last active state, not a later moment, and `age_ms=` says which.
+///
+/// ### Why re-emission cannot double-count
+///
+/// Every quantity on the line is a MONOTONE TOTAL, incremented exactly once per event at record time,
+/// before any budget or emission test. Nothing printed here is a delta and nothing is reset by
+/// printing it. A rollup line is therefore a snapshot, and re-taking a snapshot of a counter cannot
+/// add to it — the arithmetic that would double-count belongs to a reader who SUMS lines, which is
+/// why the module note states the reader's rule (`greatest emit= per win=` wins; never sum) and why
+/// `emit=` is on the line at all.
+///
+/// Two cores flushing the same window at the same instant would be the one way to get two lines
+/// bearing the same census, which is not double-counting but is noise. The `compare_exchange` on
+/// [`H_LASTROLL`] excludes it: the loser observed the same `last` and its swap fails, so it returns
+/// without printing.
+fn census_refresh(id: u32, i: usize) {
+    // Never BEFORE the window's own first rollup. The refresh is a continuation of that line, not a
+    // second instrument, and firing early would put a `scope=window` line on the wire before the
+    // budget it reports had been spent — a line whose `samples=` was honestly short but which the
+    // spec's REQUIRE would match all the same.
+    if H_ROLLED[i].load(Ordering::Relaxed) & ROLL_WHOLE == 0 {
+        return;
+    }
+    // Delta gate: nothing new to say, say nothing. This is what keeps an idle desktop silent.
+    let total = census_total(i);
+    if total == H_LASTCENSUS[i].load(Ordering::Relaxed) {
+        return;
+    }
+    // Rate gate. Checked before the `compare_exchange` so the common case — a window compositing at
+    // frame rate, arriving here dozens of times a second — costs one clock read and a compare.
+    let last = H_LASTROLL[i].load(Ordering::Relaxed);
+    let now = now_cycles();
+    if cycles_to_us(now.saturating_sub(last)) < CENSUS_PERIOD_US {
+        return;
+    }
+    // Arm: exactly one core proceeds. See the note above.
+    if H_LASTROLL[i].compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    stage_rollup(id, i, "window", H_TAKEN[i].load(Ordering::Relaxed));
 }
 
 /// Print the one pending `[wc-h]` sample line for window `id`.
@@ -508,6 +768,11 @@ pub fn stage_flush(id: u32) {
 /// gate. Fields may be INSERTED between them — FBCON-DMG's `span=` and `band=` are — but none of those
 /// five may be renamed, reordered, or moved off the end without a paired spec change on that side.
 fn emit_sample(id: u32, i: usize) {
+    // WC-H2 — count the line, not the sample. `samples=` counts what was RECORDED; this counts what
+    // reached the wire, and the gap between them is the documented pending-slot overwrite. See
+    // [`H_LINES`]. Incremented before the print so a line lost to a panic mid-`serial_println!` is
+    // reported as attempted rather than as never taken.
+    H_LINES[i].fetch_add(1, Ordering::Relaxed);
     let kind = H_KIND[i].load(Ordering::Relaxed);
     if kind == KIND_STAGED {
         let bx = H_BOX[i].load(Ordering::Relaxed);
@@ -551,14 +816,18 @@ fn emit_sample(id: u32, i: usize) {
 ///
 /// `whole=` and `banded=` are the UNBUDGETED censuses — every present [`stage_note`] classified, not
 /// the handful it printed — so a console that bands a thousand times says a thousand. What neither
-/// number claims is completeness: like every rollup in this module it reports the presents seen up to
-/// the moment its budget spent, because nothing observable inside a boot can distinguish "this window
-/// is finished compositing" from "the next line has not been printed yet" (see [`W_SAMPLES`]). The
-/// honest reading of `banded=0` on a `scope=window` line is therefore "no banded present had been
-/// recorded when this window spent its whole-box budget" — which, paired with the ABSENCE of a
-/// `scope=window-band` line for that window anywhere later in the boot, is the wire's way of saying
-/// the window never banded at all. That pair is the falsification test: one line for the negative,
-/// two for the positive.
+/// number claims is completeness: nothing observable inside a boot can distinguish "this window is
+/// finished compositing" from "the next line has not been printed yet" (see [`W_SAMPLES`]), so the
+/// honest reading is always "as of `age_ms=`", never "for the boot".
+///
+/// WC-H2 changed WHEN they are read, not what they claim. They used to be printed once, at the
+/// arbitrary instant a four-sample budget spent — which is why boot A of `rmbp-gr15-s70` reported
+/// `banded=1 minspan=736` for the same window that boot B reported `banded=271 minspan=96` for. The
+/// line is now refreshed while the window composites ([`census_refresh`]), so `banded=0` on the
+/// GREATEST-`emit=` `scope=window` line means "this window had not banded as of `age_ms=`", and
+/// paired with the ABSENCE of a `scope=window-band` line anywhere in the boot it is the wire's way of
+/// saying the window never banded at all. That pair remains the falsification test: no band line for
+/// the negative, exactly one for the positive.
 ///
 /// `minspan=` is the narrowest band seen and `minspan_bytes=` the bytes that band actually copied,
 /// taken together from one packed atomic ([`H_MINSPAN`]) so they always describe the same present.
@@ -568,7 +837,59 @@ fn emit_sample(id: u32, i: usize) {
 /// Banding does NOT enter the verdict precedence, and that is deliberate. A banded present is the
 /// feature working, not a defect; folding it into `AT-RISK`/`UNSTAGED`/`TEAR-FREE` would change what
 /// the spec's existing FORBIDs mean on a line they already guard.
-fn stage_rollup(id: u32, i: usize, scope: &str) {
+///
+/// ### WC-H2 — `pop=`, and why the marking is positional
+///
+/// The old line put `samples=4` and `torn=7` side by side with nothing to say they were counted over
+/// different populations, and `torn=7` on a line whose budget was 4 read as "7 of 4". Every field now
+/// sits under a `pop=` marker naming the population it is drawn from, and the marker governs
+/// everything up to the next one:
+///
+/// | marker | covers | means |
+/// |--------|--------|-------|
+/// | `pop=budgeted` | `samples` `budget` | THIS SCOPE's budget only — at most [`SAMPLES`] events |
+/// | `pop=all-presents` | `torn` … `maxpresent_us` | every present/decline this WINDOW has had |
+/// | `pop=constant` | `frame_us` | a compile-time constant, not a measurement |
+///
+/// `pop=` repeats rather than each field carrying its own suffix because the alternative was to
+/// RENAME `torn=`, `whole=`, `banded=` and the rest, and another platform track's regression gate
+/// reads this line: `win=`, `scope=`, `declines=` and the terminal `-> TEAR-FREE` are matched by
+/// `unaos/scripts/specs/pi4-regression.spec`, which permits fields to be INSERTED between them and
+/// nothing else. Markers are insertions. A naive key/value parser that folds a line into a map will
+/// keep only the last `pop=` and lose the others — accepted knowingly, because such a parser loses
+/// only the markers and no field's value, and the markers are meant to be read positionally.
+///
+/// ### `samples=` is a counter now, and what it can and cannot tell you
+///
+/// It used to print [`SAMPLES`] — the constant — so it restated the budget's own definition and
+/// `samples=4` carried no information on any rollup ever emitted. It now comes from the live budget
+/// counter for the scope that fired, clamped to `budget=`.
+///
+/// Be precise about what that fixes. The rollup fires only when its budget is spent, so on a line
+/// that exists `samples` still necessarily EQUALS `budget` — the honest gain is that it is now a
+/// reading rather than an assertion, and that the pairing makes the real comparison visible: 4
+/// sampled out of the `whole + banded + declines` the census reports. The field that genuinely
+/// diverges is `lines=`, which counts what reached the wire; see [`H_LINES`].
+///
+/// ### What a FAIL reads like
+///
+/// The point of the refresh is that these all stay reachable for the whole boot instead of the first
+/// four presents:
+///
+/// - `-> AT-RISK` — `torn > 0`. Now countable past the budget and now printed after the console has
+///   run, so a window that tears only under load says so. The pi4 spec FORBIDs it.
+/// - `-> UNSTAGED` — `declines > 0`; a composite reached the panel through the pre-WC-H direct path.
+///   Also FORBIDden.
+/// - `banded=0` on the latest line of a window the console is known to be routing damage into —
+///   FBCON-DMG is not reaching the compositor at all.
+/// - `minspan=` at or near the box height with a large `banded=` — banding is happening and buying
+///   nothing. This is the reading a session drew from boot A's `banded=1 minspan=736`; the difference
+///   is that `emit=` and `age_ms=` now say whether the line describes a startup burst or a steady
+///   state, so the same conclusion would this time be supportable or refutable rather than guessed.
+/// - `emit=1` as a window's only rollup while its censuses are still growing — the refresh itself is
+///   broken, and the line is back to describing the first four presents.
+/// - `lines=0` beside a non-zero `samples=` — the per-sample trace path is dead, not merely lossy.
+fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     let torn_n = H_TORN[i].load(Ordering::Relaxed);
     let decl_n = H_DECLINE[i].load(Ordering::Relaxed);
     // Precedence: a measured tear outranks an unmeasured one. `UNSTAGED` is not a lesser verdict
@@ -585,22 +906,45 @@ fn stage_rollup(id: u32, i: usize, scope: &str) {
     };
     let ms = H_MINSPAN[i].load(Ordering::Relaxed);
     let (minspan, minbytes) = if ms == u64::MAX { (0, 0) } else { (ms >> 32, ms & 0xFFFF_FFFF) };
+    // `age_ms=` from this window's own origin. A window with no origin yet cannot reach here (both
+    // recorders call `mark_seen` before touching a budget), so the 0 branch is the unreachable-clock
+    // case and reads as an age of zero rather than as the raw uptime.
+    let t0 = H_T0[i].load(Ordering::Relaxed);
+    let age_ms = if t0 == 0 { 0 } else { cycles_to_us(now_cycles().saturating_sub(t0)) / 1000 };
+    let emit = H_EMIT[i].fetch_add(1, Ordering::Relaxed) + 1;
+    // KEY ORDER IS LOAD-BEARING ACROSS SEATS. `win=`, `scope=`, `declines=` and the terminal
+    // `-> {verdict}` are matched in this order by the pi4 track's regression spec, which also relies
+    // on `scope=window ` carrying a TRAILING SPACE so its pattern cannot match `scope=window-band`.
+    // Everything WC-H2 added — `emit=`, `age_ms=`, the `pop=` markers, `budget=`, `lines=` — is an
+    // INSERTION between existing keys. Nothing is renamed, nothing is reordered, and the terminal
+    // stays terminal.
     serial_println!(
-        "[wc-h] rollup win={} scope={} samples={} torn={} declines={} fixture={} whole={} banded={} minspan={} minspan_bytes={} maxpresent_us={} frame_us={} -> {}",
+        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} declines={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} pop=constant frame_us={} -> {}",
         id,
         scope,
+        emit,
+        age_ms,
+        taken.min(SAMPLES),
         SAMPLES,
         torn_n,
         decl_n,
         H_FIXTURE[i].load(Ordering::Relaxed),
         H_WHOLE[i].load(Ordering::Relaxed),
         H_BANDED[i].load(Ordering::Relaxed),
+        H_LINES[i].load(Ordering::Relaxed),
         minspan,
         minbytes,
         H_MAXPRES[i].load(Ordering::Relaxed),
         FRAME_US,
         verdict
     );
+    // Re-arm the refresh from AFTER the serial write, so `CENSUS_PERIOD_US` bounds the duty cycle
+    // this instrument imposes on the composite path and not merely the gap between line starts. Both
+    // stores happen on every emission — including the two latched ones — so the first refresh is
+    // measured from the window's first rollup rather than from boot, and a window whose first rollup
+    // is its last activity never refreshes at all.
+    H_LASTCENSUS[i].store(census_total(i), Ordering::Relaxed);
+    H_LASTROLL[i].store(now_cycles(), Ordering::Relaxed);
 }
 
 // ---- WC-K — the staged DESKTOP FILL's own witness ----------------------------------------------
