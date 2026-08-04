@@ -157,6 +157,24 @@ const PTE_NX: u64 = 1 << 63;
 /// Physical-address field of a page-table entry (bits 51:12).
 const PTE_ADDR: u64 = 0x000F_FFFF_FFFF_F000;
 
+// --- memory-type selector bits (PAT index = PAT:PCD:PWT) -------------------------------------
+// A leaf's memory type is chosen by a 3-bit index into IA32_PAT, assembled from three PTE bits.
+// PCD and PWT are always bits 4 and 3; the PAT bit MOVES with the leaf level, which is the whole
+// reason the two constants below are distinct and must never be used at the wrong level:
+//   * 4 KiB PTE  -> PAT is bit 7 (bit 12 is address);
+//   * 2 MiB / 1 GiB leaf -> PAT is bit 12 (bit 7 is the HUGE flag, hence `PTE_PAT_4K == PTE_HUGE`
+//     numerically — the same bit position means two different things at two different levels).
+const PTE_PWT: u64 = 1 << 3;
+const PTE_PCD: u64 = 1 << 4;
+const PTE_PAT_4K: u64 = 1 << 7;
+const PTE_PAT_HUGE: u64 = 1 << 12;
+
+/// The PAT bit for a leaf at `level` (1 = 4 KiB, 2 = 2 MiB, 3 = 1 GiB).
+#[inline]
+fn pat_bit_for_level(level: u8) -> u64 {
+    if level == 1 { PTE_PAT_4K } else { PTE_PAT_HUGE }
+}
+
 #[inline]
 fn pml4_index(va: u64) -> usize { ((va >> 39) & 0x1FF) as usize }
 #[inline]
@@ -856,6 +874,41 @@ pub fn ensure_pat_wc() {
 /// Runs the fb-leaf retype exactly once (the PAT program is idempotent and re-runs harmlessly).
 static FB_WC_DONE: AtomicBool = AtomicBool::new(false);
 
+/// Physical span of the LEAVES `set_framebuffer_wc` typed WC, as `[FB_WC_LO, FB_WC_HI)`. Empty
+/// while `LO >= HI` (the initial state), which is the honest encoding of "nothing retyped yet".
+///
+/// This exists so `map_mmio_window` can tell a deliberately-typed leaf from an ordinary one. It is
+/// the retyped LEAVES' span, not the caller's `[fb_base, fb_base+fb_len)`: the leaves are huge, so
+/// the protected extent is rounded OUT to leaf boundaries — that is exactly the extent whose memory
+/// type an MMIO remap would actually change, so the range and the hazard have the same granularity.
+/// Recorded as a single min/max interval rather than a list: the fb is one contiguous aperture, and
+/// the containment test is only half of the guard (see `leaf_is_fb_wc`), so a conservative hull
+/// costs nothing in precision.
+static FB_WC_LO: AtomicU64 = AtomicU64::new(u64::MAX);
+static FB_WC_HI: AtomicU64 = AtomicU64::new(0);
+
+/// True iff the leaf `[leaf_start, leaf_start+leaf_size)` is one `set_framebuffer_wc` typed WC and
+/// which STILL carries that type. Deliberately a conjunction of two independent facts:
+///   1. it overlaps the recorded WC leaf span — i.e. `set_framebuffer_wc` really walked over it; and
+///   2. its PAT bit is still set — i.e. it really is still selecting PA4 (=WC) and not something a
+///      later edit already changed.
+///
+/// Either half alone would be too loose. (1) alone would protect an unmapped/never-retyped leaf that
+/// merely falls inside the hull; (2) alone would infer intent from a bit that, while this tree never
+/// sets it anywhere else (see `PAT_WC_INDEX`), is ultimately firmware-controlled. Requiring both
+/// means the only leaves that escape UC typing are ones we can point at a `:: x86 fb-wc:` line for.
+fn leaf_is_fb_wc(entry: u64, leaf_start: u64, leaf_size: u64, pat_bit: u64) -> bool {
+    if entry & pat_bit == 0 {
+        return false;
+    }
+    let (lo, hi) = (FB_WC_LO.load(Ordering::Acquire), FB_WC_HI.load(Ordering::Acquire));
+    if lo >= hi {
+        return false; // no fb retype has happened — nothing to protect
+    }
+    let leaf_end = leaf_start.saturating_add(leaf_size);
+    leaf_start < hi && lo < leaf_end
+}
+
 /// Mutable pointer to the LEAF entry mapping `va` + its level (1 = 4 KiB, 2 = 2 MiB, 3 = 1 GiB), or
 /// `None` if unmapped. The write-capable twin of `translate` — we need the entry's address to retype
 /// its memory-type selector bits.
@@ -930,19 +983,26 @@ pub fn set_framebuffer_wc(fb_base: u64, fb_len: u64) {
                         _ => 1 << 12,
                     };
                     // The PAT bit sits at bit 7 in a 4 KiB PTE but bit 12 in a 2 MiB/1 GiB leaf.
-                    let pat_bit: u64 = if level == 1 { 1 << 7 } else { 1 << 12 };
-                    let pcd: u64 = 1 << 4;
-                    let pwt: u64 = 1 << 3;
+                    let pat_bit = pat_bit_for_level(level);
+                    let leaf_start = va & !(leaf_size - 1);
                     unsafe {
                         let e = *entry;
                         // Select PAT index 4 = (PAT=1, PCD=0, PWT=0). Memory type only.
-                        let ne = (e | pat_bit) & !(pcd | pwt);
+                        let ne = (e | pat_bit) & !(PTE_PCD | PTE_PWT);
                         if ne != e {
                             *entry = ne;
                             leaves += 1;
                         }
+                        // Publish the leaf's extent so `map_mmio_window` will not later retype it
+                        // back to UC. Recorded for every leaf that ENDS UP WC, not only the ones
+                        // this call changed: a leaf that was already WC is just as deliberate, and
+                        // just as easy for a BAR remap that contains it to silently clobber.
+                        if *entry & pat_bit != 0 {
+                            FB_WC_LO.fetch_min(leaf_start, Ordering::AcqRel);
+                            FB_WC_HI.fetch_max(leaf_start.saturating_add(leaf_size), Ordering::AcqRel);
+                        }
                     }
-                    va = (va & !(leaf_size - 1)).saturating_add(leaf_size);
+                    va = leaf_start.saturating_add(leaf_size);
                 }
                 None => va = va.saturating_add(1 << 12), // unmapped gap — step one page
             }
@@ -963,16 +1023,73 @@ pub fn set_framebuffer_wc(fb_base: u64, fb_len: u64) {
     );
 }
 
-/// Map a physical MMIO window into the identity map with Uncacheable (UC) attributes (PCD|PWT).
-/// Creates intermediate page tables if they are absent.
-/// If an existing huge page leaf is encountered, it applies PCD|PWT without clearing the HUGE/PAT bit.
+/// Map a physical MMIO window into the identity map with Uncacheable (UC) attributes, creating
+/// intermediate page tables where they are absent.
+///
+/// ## What "UC" means here, precisely
+/// A leaf's memory type is an INDEX into IA32_PAT, assembled from three PTE bits as (PAT, PCD, PWT).
+/// This function writes index 3 = (PAT=0, PCD=1, PWT=1). Power-on PAT is [WB, WT, UC-, UC] in
+/// entries 0..3 and duplicates them in 4..7 (see `PAT_WC_INDEX`), and the only slot this kernel ever
+/// reprograms is PA4 — `ensure_pat_wc` writes that one slot and preserves all seven others, on the
+/// BSP and on every AP. So PA3 is UC (strong, uncacheable, never combined, never reordered by the
+/// memory type) on every core for the life of the boot. Device register windows get exactly that.
+///
+/// This is a behavioural change from the previous `*entry |= PCD|PWT`, which left the PAT bit alone.
+/// On a leaf with PAT already clear the two are identical (index 3 either way). They differ only on a
+/// leaf that carries PAT=1, where the old code produced index 7 — also UC by the power-on table, so
+/// the old code was not wrong about device windows; it was wrong about the ONE leaf class that opts
+/// out of the table, below.
+///
+/// ## The Write-Combining exception
+/// `set_framebuffer_wc` deliberately retypes the framebuffer's leaves to PA4 = WC and latches itself
+/// so it never runs again. The Kepler BAR1 aperture (256 MiB at the fb's own base) CONTAINS those
+/// leaves, so mapping BAR1 as an MMIO window used to silently drag the panel back to uncacheable and
+/// nothing ever put it back: metal measured a flat ~162 MB/s, size-invariant, against 7.6 -> 53.8 fps
+/// with WC live. A window mapping is a statement about a range that the caller has NOT looked at leaf
+/// by leaf; it must not overrule a per-leaf decision someone else made on purpose. So a leaf that
+/// `leaf_is_fb_wc` recognises is SKIPPED — not re-typed, not partially re-typed, not touched at all.
+///
+/// Merely clearing the PAT bit alongside PCD|PWT (index 7 -> index 3) would have made this function's
+/// old doc comment true and fixed nothing: both indices are UC, so the panel would still be slow.
+/// The skip is the part that matters; the PAT clear is for the leaves we DO type, so that "UC" here
+/// names one specific PAT slot instead of two that merely happen to agree today.
+///
+/// Genuine MMIO stays UC by construction. `leaf_is_fb_wc` demands BOTH that the leaf overlap the span
+/// `set_framebuffer_wc` actually walked AND that its PAT bit still be set. A BAR0 register window, a
+/// second device, any leaf no fb retype ever covered — none can satisfy the first condition, so every
+/// one of them takes the UC path exactly as before. Before any fb retype has run at all the span is
+/// empty and the predicate is constant-false, so early-boot windows (SDHC, bench) are unaffected.
+///
+/// The guard is therefore order-dependent, and that is fine in both directions. `fbcon::init` calls
+/// `set_framebuffer_wc` during console bring-up, long before any GPU probe, which is the order that
+/// needs the guard. The reverse order needs nothing: a window mapped BEFORE the fb retype is typed UC
+/// here and then retyped WC by `set_framebuffer_wc` afterwards, which is the correct end state anyway.
+///
+/// Granularity honesty: the identity map's leaves are 2 MiB (metal + QEMU both show `l2`) or 1 GiB, so
+/// typing a window types whole leaves — a small BAR makes its entire containing leaf UC. That was
+/// already true and is unchanged. The consequence for the skip is the mirror image: if the fb shares a
+/// leaf with a device register, that register was ALREADY WC the moment `set_framebuffer_wc` ran, and
+/// skipping preserves that state rather than creating it. This function cannot separate them without
+/// splitting the leaf, and it does not split leaves.
+///
+/// Permissions are never touched: every write below is a read-modify-write of the PAT/PCD/PWT
+/// selector bits only. P/RW/U/S/NX/G/A/D and the address field are carried through unchanged. The only
+/// entries whose permission bits this function sets are ones it CREATES (absent intermediate tables,
+/// and absent 4 KiB leaves, which it makes PRESENT|WRITABLE|NX as before).
+///
+/// `wbinvd` is not issued, for the same reason `set_framebuffer_wc` does not: these are device
+/// apertures the CPU has not cached (firmware types them UC via var-range MTRRs), so no line holds
+/// data that a type change could strand.
 pub fn map_mmio_window(pa: u64, size: usize) {
     if pa == 0 || size == 0 {
         return;
     }
     let end = pa.saturating_add(size as u64);
-    let pcd = 1 << 4;
-    let pwt = 1 << 3;
+    // Leaves we asserted UC, and leaves left alone because they are the fb's deliberate WC typing.
+    // Counted per LEAF, so a window that walks 4 KiB entries counts pages — the sum is not a fixed
+    // function of the window size, which is the point: it says what the walk actually found.
+    let mut uc_leaves = 0u32;
+    let mut wc_kept = 0u32;
 
     with_page_tables_writable(|| {
         let mut va = pa;
@@ -983,39 +1100,59 @@ pub fn map_mmio_window(pa: u64, size: usize) {
                     let frame = alloc_page_frame();
                     *pml4e = (frame & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE;
                 }
-                
+
                 let pdpt = (*pml4e & PTE_ADDR) as *mut u64;
                 let pdpte = pdpt.add(pdpt_index(va));
                 if *pdpte & PTE_PRESENT != 0 && *pdpte & PTE_HUGE != 0 {
-                    *pdpte |= pcd | pwt;
-                    va = (va & !((1 << 30) - 1)).saturating_add(1 << 30);
+                    let leaf_start = va & !((1u64 << 30) - 1);
+                    if leaf_is_fb_wc(*pdpte, leaf_start, 1 << 30, PTE_PAT_HUGE) {
+                        wc_kept += 1;
+                    } else {
+                        *pdpte = (*pdpte | PTE_PCD | PTE_PWT) & !PTE_PAT_HUGE;
+                        uc_leaves += 1;
+                    }
+                    va = leaf_start.saturating_add(1 << 30);
                     continue;
                 }
                 if *pdpte & PTE_PRESENT == 0 {
                     let frame = alloc_page_frame();
                     *pdpte = (frame & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE;
                 }
-                
+
                 let pd = (*pdpte & PTE_ADDR) as *mut u64;
                 let pde = pd.add(pd_index(va));
                 if *pde & PTE_PRESENT != 0 && *pde & PTE_HUGE != 0 {
-                    *pde |= pcd | pwt;
-                    va = (va & !((1 << 21) - 1)).saturating_add(1 << 21);
+                    let leaf_start = va & !((1u64 << 21) - 1);
+                    if leaf_is_fb_wc(*pde, leaf_start, 1 << 21, PTE_PAT_HUGE) {
+                        wc_kept += 1;
+                    } else {
+                        *pde = (*pde | PTE_PCD | PTE_PWT) & !PTE_PAT_HUGE;
+                        uc_leaves += 1;
+                    }
+                    va = leaf_start.saturating_add(1 << 21);
                     continue;
                 }
                 if *pde & PTE_PRESENT == 0 {
                     let frame = alloc_page_frame();
                     *pde = (frame & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE;
                 }
-                
+
                 let pt = (*pde & PTE_ADDR) as *mut u64;
                 let pte = pt.add(pt_index(va));
                 if *pte & PTE_PRESENT == 0 {
-                    *pte = (va & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | PTE_NX | pcd | pwt;
+                    // Fresh leaf: PAT is clear by construction, so this is index 3 = UC.
+                    *pte = (va & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | PTE_NX | PTE_PCD | PTE_PWT;
+                    uc_leaves += 1;
+                } else if leaf_is_fb_wc(*pte, va & !((1u64 << 12) - 1), 1 << 12, PTE_PAT_4K) {
+                    // The 4 KiB path carries the identical hazard: `set_framebuffer_wc` retypes
+                    // whatever leaf level it finds, and a firmware that mapped the fb with 4 KiB PTEs
+                    // would leave PAT at bit 7 here. Same rule, different bit.
+                    wc_kept += 1;
                 } else {
-                    *pte |= pcd | pwt;
+                    *pte = (*pte | PTE_PCD | PTE_PWT) & !PTE_PAT_4K;
+                    uc_leaves += 1;
                 }
-                
+
                 va = va.saturating_add(1 << 12);
             }
         }
@@ -1026,4 +1163,15 @@ pub fn map_mmio_window(pa: u64, size: usize) {
         unsafe { invlpg(flush_va) };
         flush_va = flush_va.saturating_add(1 << 12);
     }
+
+    // Wire line: says what the walk DID, so a boot log can show the WC leaves surviving a containing
+    // BAR map rather than leaving it to be inferred from a frame rate. `wc-kept` is nonzero only for
+    // a window that overlaps the framebuffer's leaves; every other window prints `wc-kept=0`.
+    serial_println!(
+        ":: x86 mmio-map: {:#x}..{:#x} uc={} (PAT PA3) wc-kept={} ::",
+        pa,
+        end,
+        uc_leaves,
+        wc_kept
+    );
 }
