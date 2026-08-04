@@ -5217,3 +5217,15 @@ target: (bits-appear × wall-moves) convicts the domain-init; (bits-appear × wa
 0x4040 as a sufficient condition; (no-bits × wall-moves) attributes to the cycle's reset side;
 (no-bits × wall-stands) closes the mailbox family entirely and sends the hunt to the PTB bracket
 and the piOS boot-state diff.
+
+**Boot20 verdict (PA28 @1cbfd254, 2026-08-04) [booted, pi4-r23s1x boot20]: case 4 — the cycle
+changes neither the bridge nor the wall.** The transition was real (OFF reply/readback 0, ON
+reply/readback 1 — the first genuine domain off→on a bare-metal boot has ever run); `M_CTRL` read
+`0x00000004` at all four stations (pre, off, post-ON, post-release). Recovery was clean end to end:
+block back UP, MMU/IRQ re-established, the bin criterion submitted sound (dead, as everywhere), the
+CT1 health kick EXECUTED, the compositor kept the panel, zero CRIT. **The mailbox domain family is
+CLOSED**: with ENABLE_QPU (boots 17/19), the M_CTRL transplant (18), the KMS overlay (19) and the
+domain cycle (20), every ARM-reachable and every mailbox-reachable hypothesis for the bin wall is
+exhausted on honest instruments. What programs piOS's 0x4040 — and whether it matters at all — is
+firmware-internal. The hunt is now exactly two-pronged: the PTB frame-unit bracket (§49.13's named
+target, item-accept → pool-write) and the piOS boot-state diff's VPU stations.
