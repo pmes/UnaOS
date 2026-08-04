@@ -1,4 +1,4 @@
-# WHITE BOARD — 2026-08-03
+# WHITE BOARD — 2026-08-04
 
 **Peter's sheet.** What I need from you, right now. Nothing else goes here —
 cross-session handoff lives in the baton, per-boot status in `~/unaos-bench/PLAYBOOK-x86.md`.
@@ -7,53 +7,48 @@ cross-session handoff lives in the baton, per-boot status in `~/unaos-bench/PLAY
 
 # OPEN
 
-## 1. One push — now due
+## 1. One push
 
-```
+```bash
 git push origin UnaOS-gemini
 ```
 
-Four commits, `0a8f5048` → `e67219d0`, on top of `0965544b`. That is the whole
-arc and the only push it needs. Nothing else is owed.
+`origin/UnaOS-gemini` was verified at `5a740f0d` with a fetch in the same call.
+Outstanding above it: the docs commit only. Everything else you have already
+pushed.
 
-## 2. No metal verdict yet — and no media to give one
+## 2. Still no metal verdict — and still nothing to act on
 
-The arc built the instrument that can finally answer whether FBCON-DMG works. It
-has not been booted, because **no removable media is present in the reader** —
-verified this session, not assumed. Nothing here is a request; it is the reason
-the evidence class in the docs still reads `unproven` rather than resolved.
+No removable media, and **no serial device at all** — `/dev/ttyUSB*` and
+`/dev/ttyACM*` do not exist. squawk closed cleanly at 20:27Z on 08-03
+(`SQUAWK MARK … session-end`), not a crash. No watchers are armed, because there
+is nothing for them to watch.
 
-When a card is available the discriminator is one line: a `[wc-h] rollup win=1`
-carrying `scope=window-band`. Two rollups for `win=1` means the banding reaches
-the panel. One rollup only is a real negative. `banded=0` on the `scope=window`
-line is neither — that rollup fires at window creation, before any banded present
-can exist.
-
----
-
-# BENCH STATE — verified as processes, not as config
-
-- squawk alive on `/dev/ttyUSB0`, session `rmbp-s66-cand444`, ~4h40m uptime.
-- Both wakers armed **as running processes**. Mine went down mid-session — a
-  waker wakes you by exiting, so its own firing disarms the bench — and was
-  re-armed on a fresh anchor.
-- The waker pattern was changed from `AT-RISK|torn=yes` to `rollup win=`. The old
-  one could only ever go red: after a successful fix those strings vanish and it
-  would never fire at all. The new one was controlled four ways — silent on the
-  real log tail and on idle `[schedx86]` chatter, fires on `AT-RISK`, on
-  `TEAR-FREE`, and on the crit leg.
+This is reported state, not a request. The consequence is that FBCON-DMG's
+evidence class stays `unproven`: the instrument that can answer it now exists and
+is proven present in the image, but has never been booted.
 
 ---
 
-# RECORDED — no action needed
+# WHAT MOVED TODAY
 
-The x86 record carried two errors and both are corrected in `e67219d0`: the
-window-id mapping was inverted (`win=1` is the console, not `win=3`), and
-FBCON-DMG was recorded as metal-proven when the instrument could not observe it
-either way. U4y is unaffected — it really was confirmed on metal.
+- **`5a740f0d` DMG-REFUSE — executed, not merely compiled.** Syscall 33's three
+  refusal arms had nothing that could reach them; the `-EINVAL` arm is the whole
+  justification for the verb and had never run. 19 probes from two ring-3 slots,
+  green in QEMU, and proven able to fail by flipping one expectation.
+- **`ae639f5a` ARTIFACT-AUDIT.** The real `esp-x86` image was built and probed.
+  Everything from both GR15 code commits is present, including the syscall-33
+  client path decoded instruction-for-instruction in `VUG.ELF`.
 
-The gate itself was worse than the record. `./arroyo check` — the DONE gate named
-in `CLAUDE.md` — passed with **exit 0** on a blatant type error in `video/wcg.rs`,
-because that file is `witness`-gated and was never compiled. It also never
-compiled any `user-*` crate. Both holes are closed in `944b853e`, and both were
-proven to go red before being called fixed.
+# TWO TRAPS NOW WRITTEN DOWN — both would have inverted a reading
+
+**`strings`, `readelf`, `objdump` and `nm` are not on this host.** A naive probe
+reads zero hits for everything, which is indistinguishable from the code being
+missing. `busybox strings` is what works.
+
+**The `[wc-h]` literals do not tell you the compositor is armed.** `span=`,
+`band=`, `window-band` and the rest are byte-identical in an image built with the
+compositor knobs OFF — they ride on `witness` alone. The discriminators are the
+symbols `wcx::activate` and `takeover_display`. And `[wc-x]`/`kepler` fall to
+**1**, not 0, with the knobs off — the survivor is `[wc-x] backbuffer resync` — so
+testing `> 0` gives a false positive on an unarmed image.
