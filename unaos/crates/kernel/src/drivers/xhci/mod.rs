@@ -6688,6 +6688,18 @@ impl XhciController {
         // `cause` is a log label only; `TransferError(13)` reads as "short transfer" on the `clean`
         // line, which is what the fold is.
         self.bot_clean_rings(slot_id, BotError::TransferError(13));
+        // boot22 (PA31) proved host-side ring cleanup alone is NOT enough after a fold: the
+        // device is still a phase ahead, and the 13-byte CSW's 5-byte TAIL survived into the head
+        // of the RETRY's data buffer — no USBS at offset 0, so the fold correctly declined, and
+        // CSW-tail+capacity-fragment minted `Disk block_size=83886080`. The device's phase must be
+        // reset too: Bulk-Only Mass Storage Reset + clear-halts, the same `recover_bot_full` the
+        // timeout ladder uses (it re-proves the pipes with TUR). Only after BOTH sides reset is the
+        // next transaction's data stage guaranteed to start at its own first byte.
+        let recovered = self.recover_bot_full(slot_id, BotError::TransferError(13), None);
+        serial_println!(
+            ":: BOT: [piusb41] post-fold device phase reset — recover_bot_full={} — a fold means the device already re-entered its CBW wait out of step; host-only ring cleanup leaves its next CSW tail in our next data buffer (boot22's garbage-geometry lesson) ::",
+            recovered
+        );
         // `run_bot_stage` parks the failed stage record here on a timeout for recovery's evidence
         // line. The fold IS the resolution, so drop it — otherwise a later transaction's recovery
         // could attribute this stage's pipe to itself.
@@ -8964,6 +8976,18 @@ impl XhciController {
             let d = core::slice::from_raw_parts(data_phys as *const u8, 8);
             let last_lba = ((d[0] as u32) << 24) | ((d[1] as u32) << 16) | ((d[2] as u32) << 8) | (d[3] as u32);
             let block_size = ((d[4] as u32) << 24) | ((d[5] as u32) << 16) | ((d[6] as u32) << 8) | (d[7] as u32);
+            // [piusb41] geometry sanity — boot22's lesson: a phase-shifted reply (CSW tail + real
+            // capacity fragment) parsed here as block_size=83886080 and MINTED A DISK. No real
+            // USB stick reports anything but a small power-of-two sector; anything else is not a
+            // strange disk, it is a corrupt reply, and the honest verdict is Failed-shaped refusal
+            // upstream (the caller's sense/retry path), never a Disk line the block layer trusts.
+            if !(block_size.is_power_of_two() && (512..=4096).contains(&block_size)) {
+                serial_println!(
+                    ":: PIUSB: [piusb41] READ CAPACITY reply REJECTED — block_size={} last_lba={:#010x} is not a sane sector geometry (want a power of two in 512..=4096) — phase-shifted or corrupt reply, no disk is minted from it ::",
+                    block_size, last_lba
+                );
+                return Err(BotError::TransferError(8));
+            }
             Ok((block_size, last_lba))
         }
     }
