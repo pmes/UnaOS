@@ -799,6 +799,160 @@ the UART leg already reaches `serial.log` and the ring is not replayed there). *
 ≠ metal-visible — a diagnostic must assert the console PATH it will actually reach on the target, not
 merely that its code path ran.**
 
+### VPERF-WC-REGRESS — a BAR remap silently un-typed the panel for two weeks (fixed `72a4adf1`, metal-confirmed s70 2026-08-04) ✅
+
+The round-9 result above was correct when it was taken and was **quietly undone on 2026-07-21**.
+`a9445e4e` (K-GPU-1) introduced `map_mmio_window` and had `drivers/gpu/kepler.rs` map **both** Kepler
+BARs. BAR1 is the 256 MiB aperture at `0x90000000` — the very aperture the round-9 readout above
+names as the framebuffer's home (`bar1 owns fb (base=0x90000000)`). The window mapper wrote
+`*entry |= PCD|PWT` over every leaf it walked and left the PAT bit alone, so each of the fb's 15 WC
+leaves went from PAT index **4** (WC) to index **7**. Order sealed it: `set_framebuffer_wc` runs from
+`fbcon::init`, long before any GPU probe, so the retype always landed first and was always overwritten
+afterwards. From 2026-07-21 to 2026-08-04 the panel on the bench was strong-UC.
+
+#### Why nothing caught it: index 7 is also UC
+
+Power-on PAT is `[WB,WT,UC-,UC]` in 0–3 and *duplicates* those in 4–7, so index 7 is UC and index 3 is
+UC. Any check phrased as *"is the framebuffer uncacheable?"* answers **yes** in both the healthy and the
+broken state, and `vperf`'s `fbmem` readout — the witness this section built for exactly this question —
+reports an `eff=` that reads `UC` for index 7 just as it did for the pre-VPERF-WC `pat=WB eff=UC`. The
+discriminator was never the effective type; it was **which slot**. `72a4adf1` therefore does two things,
+and only the second is the fix:
+
+- it clears the PAT bit alongside setting PCD|PWT, so "UC" in that function names PA3 — one slot — rather
+  than two that merely happen to agree today; and
+- it **skips** any leaf `leaf_is_fb_wc` recognises. A window mapping is a statement about a range the
+  caller has *not* looked at leaf by leaf; it must not overrule a per-leaf decision another subsystem made
+  on purpose.
+
+The first change alone would have made the old doc comment true and fixed nothing — both indices are UC,
+so the panel would still be slow. `leaf_is_fb_wc` demands BOTH that the leaf overlap the span
+`set_framebuffer_wc` actually walked AND that its PAT bit still be set, so a BAR0 register window, a
+second device, or any leaf no fb retype ever covered cannot satisfy the first condition and takes the UC
+path exactly as before.
+
+#### The wire (rMBP boot s70, 2026-08-04, trunk `72a4adf1`)
+
+`map_mmio_window` now says what its walk did, per window, so the outcome is on the wire instead of being
+inferred from a frame rate:
+
+```
+:: x86 mmio-map: 0xc1400000..0xc1800000 uc=2   (PAT PA3) wc-kept=0  ::    iGPU BAR0, 4 MiB
+:: x86 mmio-map: 0xc0000000..0xc1000000 uc=8   (PAT PA3) wc-kept=0  ::    Kepler BAR0, 16 MiB
+:: x86 mmio-map: 0x90000000..0xa0000000 uc=113 (PAT PA3) wc-kept=15 ::    Kepler BAR1, 256 MiB
+:: x86 mmio-map: 0xc1820000..0xc1821000 uc=1   (PAT PA3) wc-kept=0  ::    SDHC BAR0, 4 KiB
+```
+
+(The trailing comments are annotation, not wire text.) Every count is checkable against its aperture:
+4 MiB and 16 MiB are 2 and 8 huge leaves, the SDHC window is a single 4 KiB leaf, and BAR1's 256 MiB is
+128 huge leaves of which **113 + 15 = 128**. The 15 are the same 15 the round-9 line above names —
+`retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000` spans `0x90000000..0x91e00000` at 2 MiB
+granularity, which is 15 leaves exactly.
+
+**`wc-kept` is nonzero on exactly one window in the whole boot**, which is the guard's entire claim: it
+protects the framebuffer and nothing else. A second nonzero `wc-kept`, on any other device window, would
+itself be the finding.
+
+`:: x86 fb-wc: retyped 15 leaf(s) … ::` does **not** appear in an s70 capture, and its absence is not
+evidence — it runs from `fbcon::init`, inside the boot-blind window described under *Two standing capture
+hazards* in §8. The round-9 quotation above remains the only capture of that line.
+
+#### What it cost, per window (pre-fix boot → post-fix boot, both in the same capture file)
+
+`[wc-h] rollup … maxpresent_us=` for `win=1`/`2`/`3`/`4`; `win=5` never produces a rollup in either boot,
+so its row is per-present figures and is marked as such.
+
+| win | what | box | `maxpresent_us` before | after | verdict before → after |
+|---|---|---|---|---|---|
+| 1 | panel console | 1314x750 | 24271 | **2789** | AT-RISK → **TEAR-FREE** |
+| 2 | WC-X demo | 770x526 | 9859 | **1097** | AT-RISK → **TEAR-FREE** |
+| 4 | ring-3 window | 770x782 | 14535 | **1627** | AT-RISK → **TEAR-FREE** |
+| 3 | MOVE-VACATE probe | 66x78 | 130 | **22** | TEAR-FREE → TEAR-FREE |
+| 5 | ring-3 window (per-present) | 1026x270 | 6666 | **751** | `torn=yes` → `torn=no` |
+
+The panel write rate is `bytes/present_us` on a whole-box present and is the cleanest single number.
+Same window, same 3,942,000 B, like for like: **162 B/µs** before (24,269 µs, on both pre-fix samples)
+against **1,414–1,482 B/µs** after (2,789 µs and 2,660 µs) — **8.7–9.1x**, against the ~10x this section
+predicted for the original retype. `win=3` was TEAR-FREE on both boots and that is not noise; the model
+below says it had to be.
+
+#### The derivation that explains why this was invisible for two weeks
+
+`[wc-h]` calls a present torn when `present_us > rectscan_us`. Both terms are derived, and the derivation
+collapses:
+
+```
+present_us   = bw · 4 · span / BW              (bw = outer box width in px, span = rows written)
+rectscan_us  = span · FRAME_US / panel_h       (rectscan is derived from span, deliberately — §WC-H)
+
+present_us       bw · 4 · panel_h
+———————————  =  ——————————————————             ← span CANCELS
+rectscan_us        BW · FRAME_US
+```
+
+**The tear ratio does not depend on the band.** It is a function of the window's *width* and the panel's
+*write bandwidth*, and of nothing else. So every `AT-RISK` verdict in the pre-fix boot was reporting the
+aperture's memory type, not the damage tracking — and the same `BW` term drove all of them at once.
+
+The model is falsifiable and it holds on every window in the pre-fix capture. Solving for the width at
+which a window starts to tear, `bw_crit = BW · FRAME_US / (4 · panel_h)`:
+
+* pre-fix, `BW` = 162 B/µs → `bw_crit` ≈ **376 px**. `win=3` at 66 px is the only window under it, and
+  `win=3` is the only window that reads `torn=no`. `win=2` (770), `win=5` (1026), `win=1` (1314) and
+  `win=4` (770) are all over it and all read `torn=yes`.
+* post-fix, `BW` = 1482 B/µs → `bw_crit` ≈ **3431 px**, wider than the 2880 px panel. No window on this
+  machine can tear, which is why every rollup flipped together.
+
+**The direct empirical falsification is already on the pre-fix wire**, and it is the strongest datum here:
+`[wc-h] win=4 box=770x782 span=6 band=yes bytes=18480 compose_us=3 present_us=116 rectscan_us=55 torn=yes`.
+A **six-row** band — 0.8 % of the box — still tore. Narrowing damage by two orders of magnitude moved the
+verdict not at all, exactly as the cancellation says it cannot.
+
+Two corroborating facts, both from the pre-fix boot:
+
+* **The slowdown was per-byte, not per-boundary.** A 66 px-wide window and a 1314 px-wide one blitted at
+  the same rate — 20,592 B / 130 µs = 158 B/µs against 3,942,000 B / 24,269 µs = 162 B/µs. Row starts are
+  cache-line aligned on both (panel pitch is 16,384 B = 256 lines exactly, per
+  `:: kdisp: fbcon-view … stride_px=4096 … row_bytes=16384 ::`), so 66·4 = 264 B ends a row with a partial
+  line after 4 full ones, and 1314·4 = 5256 B after 82. A partial-line penalty 20x more frequent per byte
+  in one case than the other cannot produce the same B/µs. A per-byte cost can, and did.
+* **The same core moved the same bytes 10.7x faster into RAM, in the same present.** That present's
+  `compose_us=2279` put all 3,942,000 B into the cached back buffer at **1,730 B/µs**, through a strictly
+  *more* expensive per-pixel path than the present's straight row copies — upscale indexing, colour
+  encoding, chrome. The destination was the cost, not the work. Post-fix `compose_us` is 2247–2316 µs,
+  i.e. unchanged, as it must be: the back buffer was always cached RAM and the fix touched no leaf outside
+  BAR1.
+
+**The reusable lesson.** Every one of those `AT-RISK` verdicts was a true statement about the wrong
+subject. A tear verdict computed as *time-to-write vs. time-to-scan* is a bandwidth ratio wearing a
+correctness label, and when the bandwidth term is wrong by 9x the verdict is wrong for every window at
+once. **A whole-panel regression does not present as a defect in one window's path; it presents as every
+window in that path holding the same opinion.** A verdict that moves together across unrelated subjects is
+evidence about their shared term, and the shared term here was never in the compositor.
+
+#### Not a `docs/SECURITY.md` ledger entry — the argument, so it is not re-litigated
+
+It is tempting, because it is a page-table defect on a mapping the whole system shares. It is not one:
+
+* **No protection was weakened, in either direction.** Both the defect and the fix write only the three
+  memory-type selector bits (PAT/PCD/PWT). Every permission bit — PRESENT, WRITABLE, USER, NX — is
+  preserved on every edit, and the one path that writes a *fresh* leaf writes `PRESENT|WRITABLE|NX` with
+  no USER bit. No MTRR, no CR4, no EFER. That is the same seat-signed scope VPERF-WC already carries
+  above, and the regression stayed inside it.
+* **No aliasing hazard was created or closed.** The SDM 11.12.4 concern is a WB alias of a WC/UC region
+  holding stale lines. Nothing here involves WB: the defect moved a leaf between two *uncacheable*
+  indices (4 → 7), and the fix moves the leaves it does type between two uncacheable indices (7 → 3). No
+  cache line ever held fb data, which is why neither `set_framebuffer_wc` nor `map_mmio_window` issues
+  `wbinvd`.
+* **The new skip does not let a device register escape UC.** `leaf_is_fb_wc` requires overlap with the
+  span the fb retype actually walked *and* a live PAT bit. A register sharing a leaf with the fb was
+  already WC the moment `set_framebuffer_wc` ran, before this commit existed; the guard changes nothing
+  about that leaf's exposure.
+
+What remains is a 9x performance regression on one aperture, and the hardening ledger tracks isolation
+properties, not throughput. Filing it there would dilute the meaning of an `[x]` in that list. Its home is
+here, next to the section whose result it silently reverted.
+
 ## 7. Headless render-path witnesses (VWIT)
 
 The two drawing primitives (§1) reach the framebuffer by two different paths, and each has its own
@@ -1261,6 +1415,56 @@ that with the cap described under Layout above** (`wm::legibility_cap`), not wit
 0 forbidden** (the arc adds the `[wc-d] … -> PASS` REQUIRE and the `-> FAIL` FORBID) · `test-arm` green ·
 and, at forced bench geometry (`UNAOS_FBW=1920 UNAOS_FBH=1200`), `[wc-d] verify win=1 surf=128x128 scale=4x
 at (9,21) panel=1920x1200 checked=262144 bad_cache=0 bad_ram=0 -> PASS`.
+
+#### WC-D on x86: the console window's FAIL was the instrument reading its own ink (fixed `7091c23a`, 2026-08-04)
+
+*One thing the rect is not guarded against*, above, names the shape of this defect and picks the wrong
+half of it. The console window (`win=1`) had never produced anything but `-> FAIL` on metal — identical
+signature across s69 and s70's first boot, `bad_cache=74544 bad_ram=74544 first=(788,553) got=0x000000
+want=0xc0c0c0` — and it was **not** a blit defect. The *reference* moved, not the destination.
+
+`verify_window` snapshotted `want` from the source surface **after** `draw_window` had already blitted,
+from a call site that sits immediately after `wcg::end` and `stage_flush`. Those emit `[wc-g]` and
+`[wc-h]`; once the console is routed, `serial_println!` mirrors through fbcon into `win=1`'s *own*
+surface, and `route_present_banded` merges the band then declines the present on the `ROUTE_BUSY`
+re-entry guard, because we are already inside `composite`. So glyphs legitimately land in the surface
+that are legitimately not yet on the panel, and WC-D charged the difference to the blit. Two lines
+earlier `[wc-g]` reported `fbbad=0/965632` — the same comparison, clean — and `nonzero=33200` was
+byte-identical on every PASS and every FAIL across both captures: **the destination never changed, only
+the reference did.** An instrument whose own output is part of its subject.
+
+The reference is now taken *before* the blit and carried in one value with the latch claim and the rect,
+so it cannot structurally be taken from the wrong side of `draw_window` again. It sits before
+`wcg::begin` rather than between `begin` and `draw_window`, because the snapshot is a multi-MB source
+read for the console and inside WC-G's bracket it would manufacture a false `slow=yes` out of this
+witness's own cost. Moving the latch ahead of the blit inverted CURSOR-3's sprite exclusion (which tested
+`VERIFIED & bit == 0` to withhold the cursor from the rows about to be read); that condition now admits
+the pre-claimed case, or one false FAIL would have been traded for another.
+
+Three field changes, all inserted, nothing renamed or reordered, and the `-> PASS`/`-> FAIL` terminals
+unchanged, so the pi4 track's gate is unaffected:
+
+| field | what it says |
+|---|---|
+| `band=<y0..y1\|none>` | a banded present verifies the **band**, not the box. Deferring the one-shot to a whole-box present would make the verdict hostage to a caller that may never issue one — the routed console bands every present after the first — and the spec would fail with no line at all. A band that clips empty declines **without** claiming the latch. |
+| `ram_indep=<yes\|no>` | whether the second pass was an independent read of scan-out memory. **x86 has no bare invalidate**: `CLFLUSH` writes back first (the instrument healing the defect it measures) and `INVD` is a crash, so `bad_cache == bad_ram` was a *tautology* there and had been read as corroboration while carrying nothing. It is now on the wire as `ram_indep=no`, and the second pass is honestly a destination-stability re-read rather than a scan-out claim. |
+| `moved=<n>` | per-pixel, lazy liveness: only a pixel that already disagrees triggers a source re-read, counted here instead of charged to the blit. A whole-verdict bracket would have reported LIVE on every console verdict — an instrument that cannot fail. |
+
+**Metal result (s70, post-fix boot).** The first PASS the console window has ever produced:
+
+```
+[wc-d] verify win=1 surf=1312x736 band=0..160 scale=1x at (784,457) panel=2880x1800 checked=209920 bad_cache=0 bad_ram=0 ram_indep=no moved=0 nonzero=33200 cksum=0x6dd2231b1f0b8325 first=none -> PASS
+```
+
+`checked=209920` = 1312 × 160, the band rather than the box; `nonzero=33200` is the same value the FAILs
+carried, which is the point. Proven able to fail: one deliberately corrupted destination pixel, source
+untouched, reported `FAIL` naming `(12,26) got=0xff00ff want=0x20c0ff` with `moved=0` — correctly charged
+to the blit — on the banded verdict as well as the whole-box one; reverted, no residue.
+
+⚠ **Format vintage is how you date a `[wc-d]` line.** A line with `band=`/`ram_indep=`/`moved=` is
+post-`7091c23a`; one without is older. The s70 capture file contains **both**, because it holds two boots
+— the old-format `-> FAIL` for `win=1` in it is the pre-fix boot and must not be quoted as a current
+result. See *Two standing capture hazards* under FBCON-DMG's metal status.
 
 ### WC-E — the garble was never in the pixels: two writers, one scan-out, no ordering
 
@@ -2247,6 +2451,14 @@ path this arc actually changed.
   margin to watch is 1444 µs against 7305 µs — a 5x headroom on the gate that metal must not consume.
   An `AT-RISK` rollup on the bench means the row copies alone are still losing the race and the next step
   is fewer bytes per present (damage sub-rects within the window box), not a bigger buffer.
+  > ⚠ **That last prescription is WITHDRAWN (2026-08-04).** The bench did return `AT-RISK`, on every
+  > window, and fewer bytes per present could not have moved a single verdict: `present_us/rectscan_us`
+  > reduces to `bw·4·panel_h/(BW·FRAME_US)` — the span cancels, so the ratio is independent of the band.
+  > A six-row band out of 782 still read `torn=yes` on the pre-fix bench boot. The bandwidth term was the
+  > defect (the panel had been mapped strong-UC since 2026-07-21); see
+  > *§6 → VPERF-WC-REGRESS*. The rest of this bullet — that `AT-RISK` means the copies are losing the
+  > race — stands; only the proposed remedy was wrong, and it was wrong for a reason the instrument
+  > could not print.
 * `[wc-h] rollup ... declines=0`. A non-zero `declines=` on the bench means composites are reaching
   the panel unbuffered — most likely `reason=lock`, i.e. real contention with the desktop flush that
   QEMU's timing does not reproduce. That is the one number most likely to differ on metal, and it now
@@ -6336,9 +6548,9 @@ Two extents follow whichever path actually ran, not the band: the cache clean at
 is derived from `staged` (the **direct fallback ignores the band and paints the whole box**, which can
 only over-paint), and `[wc-h]`'s `bytes=` reports `row_bytes * span` — what this present put on the
 glass — so a damage-limited console line reports its true cost instead of the cost of the box it lives
-in. (On x86 that line now fires and now carries `span=`/`band=` on its own banded budget; no metal
-boot has yet been captured with that instrument, so the arc's evidence class is still `unproven` —
-see *The instrument* and *Metal status* below.)
+in. (On x86 that line now fires and now carries `span=`/`band=` on its own banded budget; boot s70
+captured it, and the arc's evidence class is **`metal-proven`** — see *The instrument* and
+*Metal status* below.)
 
 ### The producer side, and the ledger that makes a declined present safe
 
@@ -6379,7 +6591,8 @@ goes through `damage_all`, which clears the band. The ~980 damage-banded console
 were therefore all past budget, and the feature's entire observable footprint was four lines
 describing the one case it does not change. **An instrument whose budget is spent by the control can
 never see the treatment** — that made the arc unfalsifiable, not merely unreported, and it is the
-`unproven` verdict's whole cause. Declines keep sharing the whole-box budget: a decline never reached
+whole cause of s69's `unproven` verdict. The split closed it: s70 reports `banded=271 minspan=96` for
+the same window. Declines keep sharing the whole-box budget: a decline never reached
 the banding loop, so it has no span to classify and no claim on the banded budget.
 
 **`whole=`, `banded=` and `minspan=` are UNBUDGETED censuses.** They are taken before either budget
@@ -6581,7 +6794,7 @@ establish execution. Stated per claim, because the three are routinely collapsed
 |---|---|
 | present in artifact | **yes**, for the symbols and literals tabulated above |
 | reachable | **not established here** — reachability is the `strings`/symbol pair's ceiling, and observability is a further claim again (see *The instrument had to be widened first* below) |
-| executed | only DMG-REFUSE's ABI arms, on QEMU; **no metal boot** |
+| executed | not by this audit. DMG-REFUSE's ABI arms are executed on QEMU; the console's banded present is executed on **metal**, boot s70 — but both of those are wire verdicts, and neither is something an artifact probe can reach. Recorded here only so the rungs are not collapsed: *this table did not move when s70 landed.* |
 
 **The client side is decoded, and it is proof.** In `VUG.ELF` there is exactly one `mov eax,33`, and
 the bytes around it are unambiguous:
@@ -6644,15 +6857,112 @@ FBCON-DMG **console** verdict. The console's band does not come from vug, or fro
 in *Metal watch-list* below — therefore **stands unchanged**. The two paths share `wm::present_rows`
 and nothing else; a quiet vug cannot silence the console.
 
-### Metal status (rMBP boot s69, 2026-08-03, trunk `2bdae79b`) — evidence class `unproven`
+### Metal status (rMBP boot s70, 2026-08-04, trunk `72a4adf1`) — evidence class `metal-proven` ✅
 
-**Neither confirmed nor refuted.** The boot ran the arc's code and the `[wc-h]` instrument fired on
-x86 for the first time, but every sample it was allowed to take was spent before the console started
-printing. Nothing in that capture distinguishes a banded console present from a whole-box one.
+**Confirmed.** The console window bands, the bands are narrow, and the whole boot is tear-free. Both
+rollups for `win=1`, verbatim from `capture/rmbp-gr15-s70/ttyUSB0.log`, second boot:
 
-An earlier revision of this section read the boot as a metal confirmation. It was misattributed —
-it credited the console with another window's numbers — and the correction is recorded here rather
-than deleted, because the misattribution is the more useful artefact.
+```
+[wc-h] rollup win=1 scope=window-band samples=4 torn=0 declines=0 fixture=0 whole=3 banded=4 minspan=160 minspan_bytes=840960 maxpresent_us=2660 frame_us=16667 -> TEAR-FREE
+[wc-h] rollup win=1 scope=window      samples=4 torn=0 declines=0 fixture=0 whole=4 banded=271 minspan=96 minspan_bytes=504576 maxpresent_us=2789 frame_us=16667 -> TEAR-FREE
+```
+
+**271 banded presents on `win=1`, narrowest 96 rows of a 736-row surface — 13 %.** `minspan_bytes`
+corroborates the span independently: 1314 × 96 × 4 = 504,576, and 1314 × 160 × 4 = 840,960. Every
+per-present line for `win=1` in that boot reads `torn=no`, and `declines=0`/`fixture=0` say the samples
+are real staged composites rather than the fallback fixture. The banded present is the console's normal
+path, not an occasional one: `banded=271` against `whole=4`.
+
+Companion confirmations from the same boot: `win=2`, `win=3` and `win=4` all rolled up `TEAR-FREE`, and
+`[wc-d] verify win=1 … band=0..160 … -> PASS` is the first PASS the console window has ever produced
+(see *WC-D on x86* in §8's WC-D section). The panel-typing regression that had every window reading
+`AT-RISK` is the subject of *§6 → VPERF-WC-REGRESS*; it is the reason this boot's numbers and the
+pre-fix boot's differ by ~9x, and it is not a compositor change.
+
+#### ⚠ The census is on whichever rollup fires LAST — and on x86 that is `scope=window`
+
+*The falsification rule* above reads "the second line's `banded=` is the real census", assuming the print
+order `scope=window` then `scope=window-band`. **On this boot the order is inverted**, and a reader who
+follows the rule by `scope=` rather than by position takes `banded=4 minspan=160` as the census and
+misses `banded=271 minspan=96`.
+
+The mechanism is in `wcg.rs` and is not a defect: `H_TAKEN` counts whole-box samples **and declines**;
+`H_BTAKEN` counts banded ones. Both rollups fire from `stage_flush` at the first flush that observes
+their own budget spent. The routed console bands so heavily that its banded budget fills on presents 2–6
+while its whole-box budget is still at 3 — so `scope=window-band` prints first, and `scope=window` prints
+hundreds of presents later carrying far larger running totals. The two rollups **share every counter**
+(as *The falsification rule* already states), so the later line is simply the same census further along.
+
+**Read the rollups in print order, and take the census from the last one.** `wcg.rs`'s own comment on
+`stage_flush` — "the banded one … in a real boot is LATER" — describes the aarch64/QEMU shape and does
+not hold for a routed x86 console. The reading rules that are unaffected: one rollup only, with no
+`scope=window-band` line anywhere later, is still the real negative; and `banded=0` on an early
+`scope=window` line is still not a refutation.
+
+#### ⚠ Correction — "the console bands but gains nothing" was an ARTEFACT, and it was mine
+
+An earlier session read `minspan=736` off this arc's rollup and concluded the console bands to the full
+surface height, i.e. that FBCON-DMG buys the console nothing. **That is wrong.** The steady state is 96
+rows, not 736.
+
+The `minspan=736` reading came from the pre-fix boot's rollups, which fired when the 4-sample banded
+budget was spent — seconds into routing, during the startup burst, when the only bands so far were the
+whole-height ones that window creation and first paint produce. `H_MINSPAN` is **unbudgeted** and keeps
+updating for the life of the boot; it was simply never printed again. In the post-fix boot the same
+counter is caught later and reads 96.
+
+**The trap, stated generally, because it will recur:** *a budgeted rollup that prints unbudgeted censuses
+reports the startup burst, not the steady state.* `samples=` is a budget constant; `whole=`, `banded=`,
+`minspan=` and `minspan_bytes=` are running totals with no budget at all. The moment a rollup fires is a
+statement about the budgeted fields only. Do not read an unbudgeted census as a final value unless it was
+printed by the last rollup of the boot.
+
+#### ⚠ Two boots in one file — and the first `mmio-map` line is NOT the boundary
+
+`capture/rmbp-gr15-s70/ttyUSB0.log` (3,119 lines) holds **two** boots: a pre-fix one and the post-fix
+one. Attribute by boot boundary **before** attributing by window id — this file will otherwise hand a
+reader both a stale `[wc-d] … -> FAIL` for `win=1` and a set of `AT-RISK` rollups that were fixed hours
+earlier.
+
+The boundary is **line 1544**, a bare `14` — the tail of a `[serwit] c=? n=14` line, the FTDI console
+coming up mid-burst. It is not announced. Independent corroborators, each appearing exactly twice:
+
+| marker | boot 1 | boot 2 |
+|---|---|---|
+| `:: SERWIT-1: 6 cores x 24 lines …` | 56 | 1608 |
+| `xHCI: === Enumerating Port 1 …` | 280 | 1832 |
+| `:: GPACE: … since-entry=` | 788 (`28957ms`) | 2337 (`21896ms`) |
+| `:: x86 mmio-map: 0x90000000..` | *absent* | 1905 |
+
+**Line 1905 — the `wc-kept=15` line — is 361 lines INSIDE boot 2, not its start**, and taking it for the
+boundary misattributes everything from 1544 to 1904 (the whole second xHCI/EHCI/iGPU bring-up, and
+SERWIT-1's second FAIL) to the wrong boot. Boot 1's `mmio-map` lines do not appear at all; they were
+emitted inside its boot-blind window.
+
+Format vintage is the cheapest per-line discriminator for this file: a `[wc-d]` line carrying
+`band=`/`ram_indep=`/`moved=` is boot 2, one without is boot 1.
+
+#### Two standing capture hazards on this bench
+
+Neither is a video finding; both are recorded here because they are hit while reading video captures.
+
+* **`SERWIT-1` is structurally unpassable on this machine — PASS=0 since gr7, and it always will be.**
+  It reads `FAIL — sent=150 (want 150) dropped=0 truncated=0 submitted=151 emitted=0 inflight=0
+  balanced=false`, identically in both s70 boots. The rMBP has no 16550: `guard.is_some()` is false, so
+  `note_emitted()` is never reached; staging is suppressed once `UART_STATE == 2`, so the ring stays
+  empty and `drain` counts nothing. It is a conservation law counting a path this machine does not use.
+  **The lines are on the wire** — SERWIT-2's ftdi tap reads `submitted=1021 absorbed=1021 staged=94
+  dropped=0 suppressed=0 torn=5 inflight=0` and its rollup `-> PASS` in the same boot (boot 1: 1024/1024).
+  This is §6's VPERF-OBS lesson at a second call site: *a diagnostic must assert the console PATH it will
+  actually reach on the target.* Record the real cost too — a permanently-red verdict in every capture
+  trains readers to skim `FAIL` lines, which is the failure mode that hides the next real one.
+* **The first ~22–29 s of every boot is unobservable.** `:: BOOTLOG: [21761 ms] ftdi:console-up ::` in
+  boot 2, `[28869 ms]` in boot 1, and the replay ring that should carry the early log overflows long
+  before either. Everything emitted before that point exists only if some later replay happens to carry
+  it. This is why `:: x86 fb-wc: retyped 15 leaf(s) … ::` never appears in a modern capture even though
+  it runs on every x86 boot — `fbcon::init` is 20+ seconds early. **An absent early line is not a
+  negative on this bench.** Confirm the line's emission time against `BOOTLOG` before reading its
+  absence as anything.
 
 #### The window-id map — read this before attributing any `[wc-x]` or `[wc-h]` line
 
@@ -6670,7 +6980,31 @@ The box arithmetic corroborates the wire independently, through `TITLE_H = 12` a
 not the console.** A reading that puts the banded console at `win=3` is crediting this arc with the
 probe's 8x8 box, which is cheap because it is small, not because anything narrowed it.
 
-#### What the boot actually says about `win=1`
+⚠ **Only `win=1` and `win=2` are stable identities. Ids 3 and above are RECYCLED SLOTS.** The probe is
+opened and closed early, and every later ring-3 window takes whichever slot is free, so a single boot
+carries several unrelated `win=3` windows. In s70's second boot, slot 3 is created five separate times
+under `asid=0x0`, `0x1`, `0xc0a` and `0x1` again, at surfaces `8x8` and `128x128`; slots 4 and 5 appear
+as ring-3 windows under `asid=0x2` at `128x128 @ 6x` (box 770x782) and `128x32 @ 8x` (box 1026x270) —
+box arithmetic again: 128·6 + 2 = 770, 128·6 + 12 + 2 = 782; 128·8 + 2 = 1026, 32·8 + 12 + 2 = 270.
+**Pair every `[wc-h]`/`[wc-d]` line for an id ≥ 3 with the nearest preceding `[wc-a] create win=<id>`
+before quoting it**, and read `asid=` and `surf=` to know which window it is. This is why the s70 table
+above quotes `win=4` and `win=5` as "ring-3 window" and not by name.
+
+### (superseded) Metal status — the s69 reading (rMBP boot s69, 2026-08-03, trunk `2bdae79b`)
+
+**Superseded by s70, above.** Retained because its two failure modes — a budget spent before the subject
+ran, and a misattribution by window id — are the reusable part.
+
+**Neither confirmed nor refuted at the time.** The boot ran the arc's code and the `[wc-h]` instrument
+fired on x86 for the first time, but every sample it was allowed to take was spent before the console
+started printing. Nothing in that capture distinguishes a banded console present from a whole-box one.
+
+An earlier revision of this section read the boot as a metal confirmation. It was misattributed —
+it credited the console with another window's numbers — and the correction is recorded here rather
+than deleted, because the misattribution is the more useful artefact. (The window-id map that settles
+such attributions now lives under *Metal status* for s70, above.)
+
+#### What the s69 boot actually says about `win=1`
 
 Quoted verbatim, and therefore in the **single-budget wire format s69 ran** — that capture predates
 `span=`/`band=` and the census fields, so their absence here is the format's vintage and not a
@@ -6706,11 +7040,11 @@ the four presents `[wc-h]` saw and says nothing about the ~980 it could not.
 
 That single budget is the defect *The instrument: two sample budgets, two rollups* above now fixes:
 the tree since carries a separate banded budget (`H_BTAKEN`) and a `scope=window-band` rollup, so the
-same boot repeated today would record its banded console presents. No metal boot has carried that
-instrument yet, which is why this section's evidence class remains `unproven` rather than resolved in
-either direction.
+same boot repeated today would record its banded console presents. **It did** — s70 carried the split
+instrument and reported `banded=271 minspan=96` for `win=1`, which is what resolved the arc. The
+prediction in this paragraph was tested and held.
 
-#### Verification trap: that capture file holds FOUR boots, not one
+#### Verification trap: the s69 capture file holds FOUR boots, not one
 
 `[wc-x] console-route first-paint` announces at capture lines 468, 1779, 3289 and 4759 — four
 separate boots in one file, s69 being the fourth. A whole-file read mixes them, and each boot
@@ -6725,15 +7059,15 @@ before quoting any number out of that file.
 banded or whole-box. The `, damage-limited` wording describes the route's intent, not the present's
 extent. It says the console reached a window surface at all; that is a prerequisite, not a result.
 
-#### What would close this
+#### What closed this
 
-An `[wc-h]` sample budget that is still open when the console prints. That was `wcg.rs` scope rather
-than FBCON-DMG scope, and it has since been taken there: the band-scoped budget whole-box creation
-presents cannot spend is `H_BTAKEN`, and it prints its own `scope=window-band` rollup (see *The
-instrument* above). What is still outstanding is the OBSERVATION — a metal boot captured with that
-instrument in the image, carrying a `scope=window-band` rollup for `win=1`. Until one exists, the
-honest x86 readings of this arc are the wall-clock one in the watch-list below and the code argument
-in the sections above; neither is a wire verdict, and the evidence class stays `unproven`.
+An `[wc-h]` sample budget still open when the console prints. That was `wcg.rs` scope rather than
+FBCON-DMG scope, and it was taken there: the band-scoped budget whole-box creation presents cannot
+spend is `H_BTAKEN`, and it prints its own `scope=window-band` rollup (see *The instrument* above).
+The outstanding item was the OBSERVATION — a metal boot captured with that instrument in the image,
+carrying a banded rollup for `win=1`. **Boot s70 is that observation**, 2026-08-04; see *Metal status*
+above. One caveat learned in the closing: the census landed on the `scope=window` line rather than the
+`scope=window-band` one, for the reason set out under *The census is on whichever rollup fires LAST*.
 
 Companion results from the same boot, unaffected by any of the above: `WINX-8` went
 `presents=1 … FAIL` → `3 presents … -> PASS` (the U4y user-RSP fix, whose metal confirmation stands —
@@ -6764,9 +7098,9 @@ rewritten line-count-neutral. A comment is enough to break this check.
 **Necessary, and not sufficient.** Widening the gates put `[wc-h]` in the x86 image and it fires
 there; it did not make the arc observable, because at s69 the instrument's single four-sample budget
 per id was spent on `win=1` before the console started printing. The budget split has since closed
-that gap in the code (*The instrument: two sample budgets, two rollups*), leaving only the metal
-observation outstanding. See *Metal status* above. Reachability and observability are two claims, and
-the `strings` pair only ever proved the first.
+that gap in the code (*The instrument: two sample budgets, two rollups*), and boot s70 supplied the
+metal observation that closed it. See *Metal status* above. Reachability and observability are two
+claims, and the `strings` pair only ever proved the first.
 
 ### (superseded) `[wc-h]` cannot fire on x86 in this tree
 
@@ -6801,24 +7135,34 @@ lines below are what it CAN read.
   present; its `, damage-limited` wording was already on the wire while the consumer was presenting
   whole boxes. It says the route exists, nothing about the band. Treat it as a prerequisite, not as
   evidence — including where an older revision of this doc cited it as one.
-* **The discriminator is a `scope=window-band` rollup for `win=1`.** `[wc-h]` now reaches x86, and
-  per present it reports `box=` (the whole box), `span=` (the rows written), `band=yes|no` and
-  `bytes=` (`row_bytes * span`); banded presents now spend a budget of their own, so the whole-box
-  creation presents can no longer close the instrument before the console prints. Read it as follows,
-  and see *The falsification rule* above before quoting any of it:
-  * **two rollups for `win=1`** — `scope=window` then `scope=window-band` — is the arc working, with
-    `banded=` on the second line the true count and `minspan=`/`minspan_bytes=` the narrowest band;
-  * **one rollup only** (`scope=window`, no `window-band` line anywhere later in the boot) is the
-    real negative: that window never banded;
-  * **`banded=0` on the `scope=window` line is NOT a negative.** That rollup closes at window
-    creation, before any banded present can exist. Quoting it as a refutation is the mistake this
+* **The discriminator is TWO rollups for `win=1`.** `[wc-h]` now reaches x86, and per present it
+  reports `box=` (the whole box), `span=` (the rows written), `band=yes|no` and `bytes=`
+  (`row_bytes * span`); banded presents spend a budget of their own, so the whole-box creation
+  presents can no longer close the instrument before the console prints. Read it as follows, and see
+  *The falsification rule* above before quoting any of it:
+  * **two rollups for `win=1`** — one `scope=window`, one `scope=window-band` — is the arc working.
+    **Take the census from whichever printed LAST, not from the `scope=window-band` one.** On s70 the
+    order inverted and `banded=271 minspan=96` landed on the `scope=window` line while
+    `scope=window-band` carried `banded=4 minspan=160`; the two share every counter, so the later
+    line is the same census further along. Mechanism under *The census is on whichever rollup fires
+    LAST* in *Metal status*.
+  * **one rollup only** (no second `scope=` anywhere later in the boot) is the real negative: that
+    window never banded;
+  * **`banded=0` on an early `scope=window` line is NOT a negative.** That rollup can close at window
+    creation, before any banded present exists. Quoting it as a refutation is the mistake this
     section exists to prevent.
-  * No metal boot has yet carried this instrument, so no x86 wire line has distinguished a banded
-    console present from a whole-box one *to date*. Do not read s69's `AT-RISK` rollup as refuting
-    the arc, and do not read a small-box `TEAR-FREE` rollup on `win=2`/`win=3` as confirming it.
+  * **Settled on metal, 2026-08-04 (s70): `banded=271`, `minspan=96` of 736 rows, `torn=0`,
+    `-> TEAR-FREE`.** Do not read s69's `AT-RISK` rollup as refuting the arc — the panel was mapped
+    strong-UC on that boot (*§6 → VPERF-WC-REGRESS*) and every window read `AT-RISK` together. And
+    do not read a small-box `TEAR-FREE` rollup on `win=2`/`win=3` as confirming it.
 * **Wall-clock, still worth taking beside the wire**: the boot-log print rate through the routed
   console. A line that cost ~24 ms of present should now cost a band of a few rows; the arc lands as
-  a visible drop in the time the console spends painting, not only as a witness line.
+  a visible drop in the time the console spends painting, not only as a witness line. Note the two
+  effects are separable and were confounded once already: the ~24 ms was the strong-UC aperture, not
+  the band. Post-fix, measured on s70, a whole-box console present costs 2.66–2.79 ms and the banded
+  presents sampled there cost 0.57 ms (160 rows) and 1.03 ms (288 rows); the boot's narrowest band, 96
+  rows, was counted by the census but never sampled, so its ~0.34 ms is derived from the measured
+  1,482 B/µs and is not a wire figure.
 * `[wc-a] composite windows=N drawn=M` and the WC-N per-window `comp=` accounting are `#[cfg(feature =
   "witness")]` and DO reach x86 — they say a pass ran and which ids it drew, not how many rows.
 * A console line that leaves a stale glyph is the ledger failing, not the band: read `PEND_FULL`'s
