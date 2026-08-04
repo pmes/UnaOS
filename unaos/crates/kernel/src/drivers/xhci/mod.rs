@@ -825,6 +825,13 @@ const BOT_BUDGET_SCALE_ESCALATION: u64 = 1;
 /// a HID) says the opposite and would move the investigation somewhere else entirely. The 2026-07-29
 /// capture had to argue this by eye, from the FTDI slot's unrelated log lines.
 pub static BOT_FOREIGN_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// [piusb41] PA34: consecutive zero-data CSW folds this boot. The PA34 boot proved the replayed
+/// CSW is not queued data (the drain found the IN pipe QUIET) — the device RE-MANUFACTURES its
+/// stale status as the answer to every new command: a stuck BOT state machine, with media seated.
+/// No host-side ring or reset act reaches that state; the rescue ladder's port power-cycle does.
+/// Two consecutive folds are the trigger (one fold is a legal device answer; two in a row on
+/// fresh tags is the stuck signature). Cleared by `bot_rescue_clear` (fresh enumeration).
+pub static BOT_FOLD_STREAK: AtomicU64 = AtomicU64::new(0);
 /// Escalation rungs attempted (a = Reset Device, b = port power-cycle) and surrenders. Zero on a
 /// clean boot, so any non-zero reading is itself the finding.
 pub static BOT_RESCUE_RESET_DEVICE: AtomicU64 = AtomicU64::new(0);
@@ -6720,6 +6727,24 @@ impl XhciController {
         // sized TDs until it goes quiet, so the next real transaction's data stage starts at its
         // own first byte.
         self.bot_drain_stale_csw(slot_id, in_dci, out_dci, csw_phys);
+        // PA34's verdict closed the queue theory: the drain found the pipe QUIET and the very next
+        // command still received the stale CSW — the device re-manufactures it. State machines are
+        // not drained, they are power-cycled; two consecutive folds is the stuck signature and the
+        // rescue ladder's port-cycle rung is the one act that reaches device-internal state. The
+        // re-enumeration it delegates gives the reader a cold BOT engine and bring-up a fresh run.
+        let streak = BOT_FOLD_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak >= 2 {
+            BOT_FOLD_STREAK.store(0, Ordering::Relaxed);
+            serial_println!(
+                ":: BOT: [piusb41] fold streak={} — drain-quiet + repeat fold = the device re-manufactures its stale CSW (stuck BOT state machine, media seated) — escalating to port power-cycle ::",
+                streak);
+            let cycled = self.rescue_port_cycle(slot_id);
+            serial_println!(
+                ":: BOT: [piusb41] port power-cycle result={} — {} ::",
+                cycled,
+                if cycled { "device re-enumerates cold; bring-up re-runs on the fresh slot" }
+                else { "cycle refused/failed — the surrender path owns what remains" });
+        }
 
         Some(BotResult { status, residue })
     }
@@ -8634,6 +8659,9 @@ impl XhciController {
     fn bot_rescue_clear(&mut self, slot_id: u8) {
         self.bot_fail_streak = 0;
         self.bot_rescue_stage = 0;
+        // [piusb41] PA34: a fresh enumeration is a cold device state machine — the fold streak
+        // starts over with it, so a post-cycle device gets its clean two-strike allowance back.
+        BOT_FOLD_STREAK.store(0, Ordering::Relaxed);
         if self.bot_surrendered_slot == slot_id {
             self.bot_surrendered_slot = 0;
         }
