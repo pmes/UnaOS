@@ -6507,6 +6507,143 @@ is claimed by no line it prints.
   in an aarch64 capture. `pi4-regression.spec` is untouched. (Contrast the UVUG7-W lesson recorded in
   `arroyo`: `witness` alone is *not* inert on aarch64 — that bit an arch-neutral file. This is not one.)
 
+### ARTIFACT-AUDIT — what an x86 image can and cannot be asked (2026-08-04)
+
+DMG-REFUSE proves the ABI's refusal contract on QEMU; FBCON-DMG's pixel verdict still waits on metal.
+Between those two sits a cheaper question the bench reaches for first — *is this feature actually in
+the image on the stick?* — and the obvious way of asking it returns the wrong answer four different
+ways. All counts below were taken against the real `esp-x86` build
+(`UNAOS_WITNESS/WC/IVB/KEPLER/KEPLER_TAKEOVER/KEPLER_FIFO/SMC/IRQSTORAGE/SCHED_DEMO` all set) and
+against the same tree built with the compositor knobs OFF, and every one of them is reproducible.
+
+#### The probe that cannot fire: this host has no binutils
+
+`which strings readelf objdump nm` exits **1 with no output**. A `strings`-based probe on this host
+therefore reports **zero hits for every literal**, and zero hits is indistinguishable from the code
+genuinely being absent — the failure reads as the alarming answer, not as a broken instrument. This
+is a live instance of the standing law: a probe that cannot fire proves nothing.
+
+`busybox strings -n 4` is present (`/usr/bin/busybox`) and is what every string count in this section
+was taken with. Symbol facts were taken by parsing `.symtab` out of `kernel.elf` directly, since `nm`
+is likewise unavailable. **Check the probe before reading the result** — the first probe of a session
+against an artifact should be a positive control on a literal known to be there.
+
+#### The `[wc-h]` literals do NOT discriminate — the compositor knobs do not gate them
+
+This is the important one, because it is the probe a reader of FBCON-DMG would naturally reach for.
+The arc's own vocabulary is **byte-for-byte identical in a build with the compositor knobs off**:
+
+| literal | knobs ON | knobs OFF |
+|---|---|---|
+| `span=` | 5 | 5 |
+| `minspan=` | 1 | 1 |
+| `band=` | 1 | 1 |
+| `window-band` | 1 | 1 |
+| `whole=` | 1 | 1 |
+| `banded=` | 1 | 1 |
+| `[wc-h] win=` | 2 | 2 |
+| `[wc-h] rollup win=` | 1 | 1 |
+
+(Counts are `busybox strings -n 4 kernel.elf | grep -c`, i.e. matching *lines*. The `span=` row is 5
+rather than 4 because one of the five is the `minspan=` line and one is an unrelated `:: GPACE: span=`
+— which is itself a reason to read the matched lines, not only the tally.)
+
+The cause is checkable in the tree rather than inferred: `video/mod.rs` declares
+`#[cfg(feature = "witness")] pub mod wcg;`, and the comment on that declaration says so in as many
+words — *"`witness`-gated and nothing else"*. `[wc-h]` is `wcg`'s line, so it enters the image with
+`UNAOS_WITNESS=1` alone. `UNAOS_WC` gates `#[cfg(all(target_arch = "x86_64", feature = "wc"))] pub mod
+wcx;`, and `UNAOS_KEPLER` gates `#[cfg(feature = "nvidia-kepler")] pub mod kepler_display;`.
+
+**So probing a stick for the FBCON-DMG vocabulary tells you nothing about whether the compositor is
+armed.** What discriminates:
+
+| probe | knobs ON | knobs OFF |
+|---|---|---|
+| `[wc-x]` | 22 | 1 |
+| `kepler` | 102 | 1 |
+| symbol `video::wcx::activate` | present, 4181 B | **absent** |
+| symbol `kepler_display::takeover_display` | present, 7517 B | **absent** |
+
+The **symbol pair is the better witness**, for two reasons. It is exactly the ignition chain this
+subsystem's ground rules name: `takeover_display` is the ONE caller of `wcx::activate`
+(`drivers/gpu/kepler_display.rs:454`, the tree's only occurrence), so both symbols present means the
+chain is in the image and either absent means it cannot start. And it is a clean binary — where the
+two string counts fall to `1`, not to `0`, because a knob-independent literal survives in each case.
+**Treat `1` as the floor for those two, not as a hit**; a reader who tests `> 0` gets a false positive
+off an unarmed image.
+
+#### The rung this reaches: PRESENT-IN-ARTIFACT, with routing INFERRED
+
+An artifact audit establishes presence. It does not establish reachability, and it certainly does not
+establish execution. Stated per claim, because the three are routinely collapsed:
+
+| claim | what this audit establishes |
+|---|---|
+| present in artifact | **yes**, for the symbols and literals tabulated above |
+| reachable | **not established here** — reachability is the `strings`/symbol pair's ceiling, and observability is a further claim again (see *The instrument had to be widened first* below) |
+| executed | only DMG-REFUSE's ABI arms, on QEMU; **no metal boot** |
+
+**The client side is decoded, and it is proof.** In `VUG.ELF` there is exactly one `mov eax,33`, and
+the bytes around it are unambiguous:
+
+```
+b8 21 00 00 00              mov  eax, 33          ; SYS_WIN_PRESENT_ROWS
+ba 0b 00 00 00              mov  edx, 11          ; y1 = HUD_Y1
+4c 8b b4 24 f8 00 00 00     mov  r14, [rsp+0xf8]  ; win
+4c 89 f7                    mov  rdi, r14
+31 f6                       xor  esi, esi         ; y0 = HUD_Y0 = 0
+0f 05                       syscall
+48 85 c0                    test rax, rax
+79 0f                       jns  +0xf             ; success -> done
+b8 1e 00 00 00              mov  eax, 30          ; SYS_WIN_PRESENT — the mandatory fallback
+4c 89 f7                    mov  rdi, r14
+0f 05                       syscall
+```
+
+That is `present_rows`'s whole-box fallback (`crates/user-vug/src/main.rs:535`) inlined, with the
+constant band `(0, 11)` visible in the immediates. Nothing about it is inferred.
+
+**The kernel side is NOT decoded.** The dispatcher's lowering for arm `33` could not be identified in
+`syscall_dispatch_inner`: **zero** hits for `cmp r/m,0x21` in any encoding tried (`48 83 /7 21`,
+`83 /7 21`, `48 81 /7 21 00 00 00`, `3d 21 00 00 00`) and **zero** for the memory-indexed jump table
+form `ff 24`. There are four `jmp reg` (`ff e0`–`ff e7`), so the switch is plausibly a computed jump
+through a register — but *plausibly* is the honest word, and no target was resolved.
+
+What **is** measured is the body, not the routing: exactly **two** `lock inc qword [rip+…]` sites
+targeting `FB_PRESENT_COUNT` occur inside `syscall_dispatch_inner`, matching the two
+`FB_PRESENT_COUNT.fetch_add` call sites in the source — `sys_win_present` (verb 30) and
+`sys_win_present_rows` (verb 33) — both of which are inlined into the dispatcher, and neither of which
+appears as a standalone symbol. `sys_win_present_rows` has exactly one caller in the tree,
+`arch/x86_64/syscall.rs:2584`, the dispatcher arm itself.
+
+> **Routing is therefore INFERRED, not proven** — inferred from the body being inlined into
+> `syscall_dispatch_inner` with no other caller that could have put it there. It is a good inference
+> and it is not a decode. The original audit reached the same place differentially (the bump-site
+> count going 1 → 2 against a pre-commit build, with 19 feature-marker string counts held identical to
+> rule out a knob confound); the absolute count of 2 reproduces it without needing the second build.
+
+#### The vug idle trap — and precisely what it does NOT threaten
+
+`user-vug`'s banded present is on its **idle HUD path only**. The single `present_rows` call site
+(`crates/user-vug/src/main.rs:1666`) sits inside the idle loop, is further gated `!hidden && overlay`,
+and fires only when the fps digit changes or a click arrives — **at most once per second, and only
+while idle**. A vug that never sits idle, or that is hidden, or that is running with the overlay off,
+issues **no banded present at all**. The source says as much at that site: it is *"the one present in
+the program whose damage is genuinely a BAND."*
+
+So a capture in which syscall 33 never carries a band is not evidence against the syscall; it may
+simply be a capture in which nothing idled. Confirm the idle condition before reading the absence.
+
+**The scope of that trap must not be blurred, because the natural misreading is the wrong way round.**
+It is a false negative for the **syscall-33 exercise** — vug's own window — and **NOT** for the
+FBCON-DMG **console** verdict. The console's band does not come from vug, or from ring 3 at all:
+`FbCon::flush_dirty` → `route_present_rows` → `route_present_banded` → `wm::present_rows`
+(`video/fbcon.rs:325`, `:688`, `:696`, `:720`), driven from `PanelSink` on **every printed line**
+(call sites at `fbcon.rs:795`, `:986`, `:1046`). That is frequent and not idle-dependent. The
+`scope=window-band` rollup for `win=1` — the discriminator set out under *The falsification rule* and
+in *Metal watch-list* below — therefore **stands unchanged**. The two paths share `wm::present_rows`
+and nothing else; a quiet vug cannot silence the console.
+
 ### Metal status (rMBP boot s69, 2026-08-03, trunk `2bdae79b`) — evidence class `unproven`
 
 **Neither confirmed nor refuted.** The boot ran the arc's code and the `[wc-h]` instrument fired on
@@ -6651,6 +6788,13 @@ lines below are what it CAN read.
 * **`win=1` is the console.** `win=2` is the demo window and `win=3` is the MOVE-VACATE probe; see
   the window-id map under *Metal status*. Every number quoted for this arc must come from `win=1`,
   and a capture file may hold several boots — attribute by boot boundary before attributing by id.
+* **Before blaming the boot, confirm the image was armed — and do not confirm it with `[wc-h]`.**
+  Every `[wc-h]` literal this arc added is present with `UNAOS_WITNESS=1` alone, identically in an
+  image built with the compositor knobs OFF, so finding them on a stick proves nothing about the
+  compositor. The witnesses that discriminate are the symbols `video::wcx::activate` and
+  `kepler_display::takeover_display` — present together, or the ignition chain is not in the image at
+  all. Note also that `strings`/`nm` are **not** on this host: an empty probe result is a broken
+  instrument until proven otherwise. Full counts and method under *ARTIFACT-AUDIT* above.
 * `[wc-x] console-route first-paint win=N (glyphs -> window surface, damage-limited)` — the routed
   first paint. **This line is NOT a discriminator for this arc.** It is emitted at `fbcon.rs:731`,
   outside the `match owed`, keyed only on `ok`, so it prints identically for a banded and a whole-box
