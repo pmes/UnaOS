@@ -546,6 +546,36 @@ v3d_pmcycle = []
 # ./arroyo kernel8`. See docs/dev/OS/08_VIDEO/v3d.md §49.15.
 v3d_ptbbracket = []
 
+# PI-V3D-94: the arming switch for the two channels NOBODY samples. Boot21 closed the ARM-visible
+# V3D surface (§49.15: sixteen stations, 348,908 samples, zero motion — dead at item-accept on the
+# wide set), and the piOS sweep diff (§49.16) then named what that closure does NOT cover. Two of
+# those channels are readable from this kernel today, and this one feature arms both.
+#   HALF A — the HUB-TRAFFIC DELTA. Six unmapped hub words at +0x8c/+0x90/+0x94/+0xa0/+0xa4/+0xa8
+#   are monotone across boots (+0x94 stepped 0x1400 -> 0x1800 -> 0x1c00 over boots 18->21), the
+#   shape of hub-level traffic counters, and no rung samples them. The rung snapshots all six
+#   PRE-submit and again POST-FLDONE-backstop around the PI-V3D-91 bin criterion (its OWN window,
+#   not `[v3d93]`'s, so the two arm independently) and prints the deltas. A delta > 0 across a
+#   wedged window means the HUB saw traffic every core-side station denied; delta = 0 extends
+#   dead-at-item-accept to the hub. The six words are deliberately NOT added to the `[v3d93]`
+#   in-loop array — that would change the sample rate §49.15's baseline is stated in.
+#   HALF B — the DIRECT CM CLOCK STATION. One line at bringup right after the mailbox clock grant:
+#   CM_V3DCTL / CM_V3DDIV (offsets +0x038/+0x03C are INFERRED and tagged so) plus every nonzero word
+#   in CM[0xFE101000, +0x100), printed beside the firmware's own GET_CLOCK_RATE/GET_CLOCK_STATE —
+#   so the wire carries the hardware reading next to the report already on the §46.4 instrument-lie
+#   ledger (it claimed the clock gated at 250 MHz while CYCLE_COUNT free-ran at ~499 MHz). CM space
+#   is fully decoded on BCM2711 and sits inside the Device-nGnRnE GiB boot.rs L1[3] already maps, so
+#   no new MMU mapping is opened and no page-table edit is needed.
+# Gated on `all(v3d_deep, v3d_hubcm)`; OFF (default) prints ONE `[v3d94] SKIPPED — hubcm-gate off`
+# line covering both halves and samples nothing. A bare feature that implies nothing, like the other
+# arming switches. READ-ONLY by construction and therefore SAFE to arm: half A issues no V3D
+# register write of its own (only the criterion's, which the ladder already runs many times per
+# boot), half B issues no write at all — no CM password constant exists in this file — and its only
+# mailbox traffic is the two read-only clock property tags `[v3d55]` already sends. No panel risk,
+# no V3D loss, nothing it can wedge; safe to combine with anything. Enable via `UNAOS_V3D=1
+# UNAOS_V3D_DEEP=1 UNAOS_V3D_HUBCM=1 UNAOS_PI=1 ./arroyo kernel8`.
+# See docs/dev/OS/08_VIDEO/v3d.md §49.17.
+v3d_hubcm = []
+
 # PI-V3D-69: the WRITE half of the initialisation-diff arc. The READ half (`[v3d69] fabric` stations —
 # PM_GRAFX, both V3D async-AXI-bridge control words in both candidate ASB blocks, V3D_MMUC_CONTROL)
 # rides `v3d_deep` and is read-only. THIS feature adds the one rung that WRITES: it re-runs mainline's

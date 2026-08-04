@@ -1450,6 +1450,29 @@ kernel8() {
         K8_FEATS="${K8_FEATS},v3d_ptbbracket"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_PTBBRKT: ARM the [v3d93] PTB frame-unit bracket — read-only first-change ordering across item-accept -> pool-write; no boot cost; inert without UNAOS_V3D_DEEP${COLOR_RESET}"
     fi
+    # PI-V3D-94: UNAOS_V3D_HUBCM=1 adds the `v3d_hubcm` feature — the arming switch for the two
+    # channels NOBODY samples ([v3d94]). Boot21 closed the ARM-visible V3D surface (§49.15) and the
+    # piOS sweep diff (§49.16) named what that closure does not cover; this knob arms both halves
+    # that are readable from the kernel today.
+    #   HALF A (deep battery, right after [v3d93], before [v3d75] so the fabric is untouched): the
+    #   six unmapped hub work-counters at +0x8c/+0x90/+0x94/+0xa0/+0xa4/+0xa8 — monotone across
+    #   boots 18->21, sampled by no rung — snapshotted PRE-submit and POST-FLDONE-backstop around
+    #   the PI-V3D-91 bin criterion, deltas printed. Delta > 0 across a wedged window means the HUB
+    #   saw traffic every core-side station denied; delta = 0 extends dead-at-item-accept to the hub.
+    #   HALF B (bringup, immediately after the mailbox clock grant): the DIRECT clock-manager read —
+    #   CM_V3DCTL/CM_V3DDIV at 0xFE101038/0x3C (offsets INFERRED, tagged so on the wire) plus every
+    #   nonzero word in CM[0xFE101000,+0x100), printed beside the firmware's own GET_CLOCK_RATE /
+    #   GET_CLOCK_STATE. The firmware's clock report is on the §46.4 instrument-lie ledger; this is
+    #   the first direct reading that can audit it.
+    # Inert without UNAOS_V3D_DEEP. Like UNAOS_V3D_PTBBRKT this knob is READ-ONLY and carries NO
+    # boot cost: half A issues no V3D register write of its own (only the criterion's), half B
+    # issues no write at all and sends only the two read-only clock property tags [v3d55] already
+    # sends. No panel risk, no V3D loss, nothing it can wedge. Safe to combine with anything.
+    # See docs/dev/OS/08_VIDEO/v3d.md §49.17.
+    if [ -n "${UNAOS_V3D_HUBCM:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_hubcm"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_HUBCM: ARM the [v3d94] hub-traffic delta + direct CM clock station — read-only; no boot cost; inert without UNAOS_V3D_DEEP${COLOR_RESET}"
+    fi
     # PI-V3D-69: UNAOS_V3D69_REENABLE=1 adds the `v3d69_reenable` (+`v3d_deep`,+`v3d`) features — the
     # WRITE half of the initialisation-diff arc. The READ half (the `[v3d69] fabric` stations: PM_GRAFX,
     # both V3D async-AXI-bridge control words in both candidate ASB blocks, V3D_MMUC_CONTROL) rides

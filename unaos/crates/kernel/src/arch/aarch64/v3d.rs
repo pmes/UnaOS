@@ -943,6 +943,17 @@ pub fn bringup(fb: Option<FbTarget>) {
         }
     } }
 
+    // PI-V3D-94 half B: the DIRECT clock-manager read, placed HERE — immediately after the mailbox
+    // clock grant and before anything else touches the block — so the wire carries the hardware
+    // reading next to the firmware report it audits. §46.4's instrument-lie ledger records that
+    // report claiming the V3D clock gated at 250 MHz while CYCLE_COUNT free-ran at ~499 MHz; no
+    // reading of the clock manager itself has ever been taken on either side. READ-ONLY: CM reads
+    // plus the two read-only property tags `[v3d55] clkdom` already sends later (skipped under
+    // MINIMAL, whose discriminator is that bringup sends no mailbox tag at all). Gate-off compiles
+    // to nothing here; the one `[v3d94] SKIPPED` line rides the deep battery with half A.
+    #[cfg(all(feature = "v3d_deep", feature = "v3d_hubcm"))]
+    v3d94_cm_station(V3D79_MINIMAL);
+
     // PI-V3D-50: the kernel-faithful V3D core RESET CYCLE (was PI-V3D-3's ON-half-only `enable_pm_asb`).
     // The kernel `v3d_reset_v3d` power-CYCLES the GRAFX_V3D domain (OFF then ON) to return the core to a
     // clean reset; UnaOS only ever ran the ON half once, on a firmware-powered block, leaving any stale
@@ -7033,6 +7044,14 @@ fn empty_frame_bisection() {
     // that [v3d75] onward reads: its only register writes are the PI-V3D-91 criterion's, which is
     // the same submit the ladder above has already run many times on this boot.
     v3d93_ptb_bracket();
+    // PI-V3D-94 half A: the hub-traffic delta rides immediately after `[v3d93]` and, like it, BEFORE
+    // `[v3d75]` — same untouched-fabric requirement, same reason. It takes its own criterion window
+    // rather than sharing the bracket's, so the two arm independently and neither can silently
+    // change the other's window; the six hub work-counters are deliberately NOT added to the
+    // bracket's in-loop array, which would change the sample rate §49.15's baseline is stated in.
+    // Read-only apart from the criterion's own writes, so nothing `[v3d75]` onward reads is
+    // perturbed. This call also carries the ONE `[v3d94] SKIPPED` line for both halves of the arc.
+    v3d94_hub_traffic();
     // PI-V3D-75: the fabric-condition experiments ride LAST — [v3d74a]'s thread-0-never-starts
     // verdict must already be banked on THIS boot's untouched fabric before either experiment
     // (firmware ENABLE_QPU, then the M_CTRL=0x4040 write) mutates it.
@@ -11069,6 +11088,265 @@ fn v3d93_ptb_bracket_armed() {
         mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1SYNC),
     );
     v3d93_sampler_emit("bin-criterion", sync_pre, sync_post, retired);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// PI-V3D-94 — the two channels NOBODY samples (v3d.md §49.17).
+//
+// §49.15 closed the ARM-visible V3D surface: sixteen stations at the FLDONE poll loop's own rate,
+// zero motion, DEAD AT ITEM-ACCEPT ON THE WIDE SET. §49.16's piOS sweep diff then named what that
+// closure does NOT cover, and two of those channels are readable from this kernel today:
+//
+//   (A) SIX HUB WORK-COUNTERS at hub +0x8c/+0x90/+0x94/+0xa0/+0xa4/+0xa8. Unmapped in every source
+//       this tree has, but MONOTONE across boots (+0x94 stepped 0x1400 → 0x1800 → 0x1c00 over boots
+//       18→21) — the shape of hub-level traffic counters. The `[v3d93]` bracket does not sample
+//       them. If they step across a window in which every core-side station is dead, the HUB saw
+//       traffic the core denied.
+//
+//   (B) THE CLOCK MANAGER, never read directly on either side. The firmware's clock REPORT is
+//       already on the §46.4 instrument-lie ledger — it reported the V3D clock gated at 250 MHz
+//       while CYCLE_COUNT free-ran at ~499 MHz — and every clock verdict in this file rests on that
+//       report. CM space is fully decoded on BCM2711 and the read is safe.
+//
+// Both halves are READ-ONLY. Half A issues no register write of its own; its only writes are the
+// ones inside the PI-V3D-91 bin criterion it reuses unchanged. Half B issues NO write at all — the
+// CM password is deliberately never defined in this file, so no store can arm a clock by accident.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Number of `[v3d94]` half-A hub work-counters.
+const V3D94_HUB_N: usize = 6;
+
+/// The six unmapped hub words §49.16 flagged as monotone across boots. Offsets from `V3D_HUB_BASE`,
+/// all inside the `hub[0x0,0x100)` window `[v3d76]` already sweeps on every deep boot — so no read
+/// here touches an address this driver has not already read safely on metal, and the excluded hub
+/// TFU window (0x100–0x1000) stays excluded.
+const V3D94_HUB_COUNTERS: [(&str, usize); V3D94_HUB_N] = [
+    ("hub+0x8c", 0x008C),
+    ("hub+0x90", 0x0090),
+    ("hub+0x94", 0x0094),
+    ("hub+0xa0", 0x00A0),
+    ("hub+0xa4", 0x00A4),
+    ("hub+0xa8", 0x00A8),
+];
+
+// ─── Half B: the clock manager. ──────────────────────────────────────────────────────────────────
+/// ARM PA of the BCM2711 clock-manager block (VC bus 0x7E101000). Inside the 0xC000_0000–0xFFFF_FFFF
+/// Device-nGnRnE GiB that `boot.rs` L1[3] already maps — the SAME window `PM_BASE` (0xFE10_0000) and
+/// `LEGACY_ASB_BASE` (0xFE00_A000) are read through — so this station opens NO new MMU mapping and
+/// needs no page-table edit. CM space is fully decoded on BCM2711; reads are safe.
+const CM_BASE: usize = 0xFE10_1000;
+/// **INFERRED.** `CM_V3DCTL` at +0x038 / `CM_V3DDIV` at +0x03C is the conventional `clk-bcm2835.c`
+/// CM slot layout for the V3D clock, but this tree carries no source-cited confirmation of it for
+/// BCM2711. The station therefore prints these two by name AND dumps the nonzero words of
+/// `CM[0x0,0x100)` around them, so the inference is checkable from the wire rather than taken on
+/// trust.
+const CM_V3DCTL: usize = 0x0038;
+const CM_V3DDIV: usize = 0x003C;
+/// `CM_*CTL` field map — INFERRED from the same conventional layout: SRC[3:0], ENAB (bit 4),
+/// KILL (bit 5), BUSY (bit 7), FLIP (bit 8). Printed as a decode BESIDE the raw word, never instead
+/// of it.
+const CM_CTL_ENAB: u32 = 1 << 4;
+const CM_CTL_KILL: u32 = 1 << 5;
+const CM_CTL_BUSY: u32 = 1 << 7;
+const CM_CTL_FLIP: u32 = 1 << 8;
+
+/// PI-V3D-94 half B — the DIRECT clock-manager read, printed at bringup beside the firmware's own
+/// `GET_CLOCK_RATE` / `GET_CLOCK_STATE` answers, so the wire carries the measurement next to the
+/// report it audits (§46.4's instrument-lie ledger entry: gated at 250 MHz reported while
+/// CYCLE_COUNT free-ran at ~499 MHz).
+///
+/// **READ-ONLY, absolutely.** No CM write, and no CM password constant exists in this file. The two
+/// mailbox queries are the same read-only property tags `[v3d55] clkdom` already sends later in the
+/// boot; they are SKIPPED under `v3d79_minimal`, whose whole discriminator is that bringup sends no
+/// mailbox tag at all.
+#[cfg(all(feature = "v3d_deep", feature = "v3d_hubcm"))]
+fn v3d94_cm_station(minimal: bool) {
+    let ctl = mmio_read(CM_BASE, CM_V3DCTL);
+    let div = mmio_read(CM_BASE, CM_V3DDIV);
+    let (rate, state) = if minimal {
+        (None, None)
+    } else {
+        (
+            mailbox::get_clock_rate_raw(mailbox::CLOCK_ID_V3D),
+            mailbox::get_clock_state(mailbox::CLOCK_ID_V3D),
+        )
+    };
+    let rate_hz = rate.unwrap_or(0);
+    let state_w = state.unwrap_or(0);
+    // DIVI[23:12] / DIVF[11:0] — INFERRED with the rest of the layout.
+    let divi = (div >> 12) & 0xFFF;
+    let divf = div & 0xFFF;
+    let enab = ctl & CM_CTL_ENAB != 0;
+    let fw_active = state_w & 0x1 != 0;
+    serial_println!(
+        ":: V3D: [v3d94] cm-station (offsets INFERRED) — CM_V3DCTL@{:#010x}={:#010x} (SRC={} ENAB={} KILL={} BUSY={} FLIP={}) | CM_V3DDIV@{:#010x}={:#010x} (DIVI={} DIVF={}) | firmware report: GET_CLOCK_RATE={} Hz GET_CLOCK_STATE={:#010x} (active={}) {} — direct CM read vs the report on the §46.4 instrument-lie ledger: {} ::",
+        CM_BASE + CM_V3DCTL,
+        ctl,
+        ctl & 0xF,
+        enab as u32,
+        (ctl & CM_CTL_KILL != 0) as u32,
+        (ctl & CM_CTL_BUSY != 0) as u32,
+        (ctl & CM_CTL_FLIP != 0) as u32,
+        CM_BASE + CM_V3DDIV,
+        div,
+        divi,
+        divf,
+        rate_hz,
+        state_w,
+        fw_active as u32,
+        if minimal {
+            "[NOT QUERIED — v3d79_minimal bringup sends no mailbox tag; the firmware fields are placeholders]"
+        } else if rate.is_none() || state.is_none() {
+            "[mailbox FAILED — the firmware fields carry nothing]"
+        } else {
+            "[mailbox OK — rate verbatim, 0 = a real 0 Hz grant]"
+        },
+        if ctl == 0 && div == 0 {
+            "BOTH CM WORDS READ ZERO. Either the V3D clock slot is NOT at +0x038/+0x03C (the offsets are INFERRED and this is exactly the shape of a wrong guess) or the slot is genuinely unprogrammed. The window dump below decides which: a CM block with other nonzero words but zeros here is a real unprogrammed slot; an all-zero window means the read landed nowhere useful and nothing about the clock follows"
+        } else if minimal {
+            "no firmware report was taken this boot, so this is a raw CM reading with nothing to audit against — bank the words and compare against a non-MINIMAL boot"
+        } else if rate.is_none() || state.is_none() {
+            "the CM words read, but the firmware report failed — half of the comparison is missing and no audit verdict follows"
+        } else if enab != fw_active {
+            "DIVERGENCE — the CM enable bit and the firmware's clock-state report DISAGREE. The report is the one already on the instrument-lie ledger; this is the first direct reading in this driver's history that can convict it"
+        } else {
+            "the CM enable bit AGREES with the firmware's active bit. Not a null result: it is the first time that report has been audited against the hardware it describes, and the DIVI/DIVF pair is the first direct frequency evidence this driver has ever carried"
+        }
+    );
+    // The checkable window: every nonzero word in CM[0x0,0x100), in the `[v3d76]` SWEEP line format
+    // so it diffs against a piOS capture with no re-formatting. The neighbourhood is what makes the
+    // INFERRED offsets falsifiable from the wire.
+    let mut off = 0usize;
+    let mut nonzero = 0u32;
+    while off < 0x100 {
+        let v = mmio_read(CM_BASE, off);
+        if v != 0 {
+            nonzero += 1;
+            serial_println!("SWEEP phys={:#010x} val={:#010x}", CM_BASE + off, v);
+        }
+        off += 4;
+    }
+    serial_println!(
+        ":: V3D: [v3d94] cm-window end — {} nonzero words in CM[{:#x},{:#x}); READ-ONLY (no CM write, and no CM password constant exists in this file) ::",
+        nonzero,
+        CM_BASE,
+        CM_BASE + 0x100
+    );
+}
+
+/// PI-V3D-94 half A — the hub-traffic bracket (v3d.md §49.17). Gate-off prints one SKIPPED line
+/// covering BOTH halves of the arc; half B's bringup site stays silent when the gate is off
+/// (default-quiet law — bringup runs on boots the deep battery does not).
+fn v3d94_hub_traffic() {
+    #[cfg(any(not(feature = "v3d_deep"), not(feature = "v3d_hubcm")))]
+    serial_println!(
+        ":: V3D: [v3d94] SKIPPED — hubcm-gate off (arm with UNAOS_V3D_HUBCM=1). BOTH halves stood down: the hub work-counter delta across the bin criterion, and the direct clock-manager station at bringup. The arc is READ-ONLY when armed — no V3D or CM register write, no mailbox tag beyond the two read-only clock queries [v3d55] already sends. Nothing was sampled and NO [v3d94] verdict is implied ::"
+    );
+    #[cfg(all(feature = "v3d_deep", feature = "v3d_hubcm"))]
+    v3d94_hub_traffic_armed();
+}
+
+/// PI-V3D-94 half A, the armed body.
+///
+/// **SHAPE — a PRE/POST DELTA, not an in-loop sampler, and the choice is deliberate.** The obvious
+/// alternative was to add these six words to `V3D93_STATIONS`. That is REJECTED for two reasons.
+/// (1) Sixteen reads per sample is the `[v3d93]` loop's budget, and §49.15's 348,908-sample baseline
+/// was taken at exactly that cost; widening the array to twenty-two changes the sample rate the
+/// baseline is stated in and invalidates it. (2) A counter that only ever moves FORWARD needs no
+/// ordering trace — "did it step across the window" is answered completely by two samples, and
+/// ordering is the bracket's whole value. So this rung takes its own window: the same `[v3d91]`-shape
+/// criterion, snapshotted before the submit and again after the criterion's FLDONE backstop returns.
+///
+/// It runs its OWN criterion submit rather than sharing `[v3d93]`'s, so the two rungs arm
+/// independently — half A must be readable on a boot where the bracket is off, and neither rung may
+/// silently change the other's window. That costs one extra bin submit per armed boot, which is the
+/// same submit the ladder above already runs many times.
+///
+/// The honest limit is named rather than hidden: a pre/post delta cannot say WHEN inside the window
+/// the counters stepped, nor separate traffic caused by the criterion from traffic another agent
+/// (VPU, display, firmware) put through the hub in the same interval. A Δ>0 is therefore evidence
+/// that the hub is not quiescent across the window; attribution is a second question, and the way to
+/// ask it is a null window — the same delta across an interval with no submit in it.
+#[cfg(all(feature = "v3d_deep", feature = "v3d_hubcm"))]
+fn v3d94_hub_traffic_armed() {
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down | V3dPresence::Poison(_) => {
+            serial_println!(
+                ":: V3D: [v3d94] SKIPPED — hub absent/poison (QEMU raspi4b or block-down). No hub-traffic bracket ran and NO verdict is implied ::"
+            );
+            return;
+        }
+    }
+    serial_println!(
+        ":: V3D: [v3d94] hub-traffic — {} UNMAPPED hub work-counters (+0x8c…+0xa8; §49.16: monotone across boots 18→21, sampled by no rung) snapshotted PRE-submit and POST-FLDONE-backstop around the PI-V3D-91 bin criterion. READ-ONLY: no register write and no mailbox send belongs to this rung, its only writes being the criterion's own. §49.17 ::",
+        V3D94_HUB_N
+    );
+    let mut pre = [0u32; V3D94_HUB_N];
+    let mut i = 0;
+    while i < V3D94_HUB_N {
+        pre[i] = mmio_read(V3D_HUB_BASE, V3D94_HUB_COUNTERS[i].1);
+        i += 1;
+    }
+    // The PI-V3D-91 criterion, unchanged and unbanked — the `[v3d91]`/`[v3d93]` call-site shape.
+    // `bank` is false: arming the PCTR bank is a write this instrument has no license to make.
+    let retired = submit_bisect_rung_geom(
+        "v3d94",
+        "hub-traffic bin-criterion",
+        BinContent::Empty,
+        OFF_SHADREC,
+        OFF_PROBE_BIN_CL,
+        false,
+        None,
+    )
+    .map(|r| r.retired)
+    .unwrap_or(false);
+    let mut post = [0u32; V3D94_HUB_N];
+    i = 0;
+    while i < V3D94_HUB_N {
+        post[i] = mmio_read(V3D_HUB_BASE, V3D94_HUB_COUNTERS[i].1);
+        i += 1;
+    }
+    let mut stepped = 0u32;
+    let mut went_backwards = 0u32;
+    i = 0;
+    while i < V3D94_HUB_N {
+        let back = post[i] < pre[i];
+        let delta = if back { pre[i] - post[i] } else { post[i] - pre[i] };
+        if delta != 0 {
+            stepped += 1;
+            if back {
+                went_backwards += 1;
+            }
+        }
+        serial_println!(
+            "::   [v3d94] {} @{:#010x} — pre={:#010x} post={:#010x} delta={}{} ::",
+            V3D94_HUB_COUNTERS[i].0,
+            V3D_HUB_BASE + V3D94_HUB_COUNTERS[i].1,
+            pre[i],
+            post[i],
+            if back { "-" } else { "+" },
+            delta
+        );
+        i += 1;
+    }
+    let verdict: &str = if retired {
+        "THE BIN FRAME RETIRED under the bracket — the wall did not reproduce on this boot, so any delta above describes a WORKING frame. That makes it the reference reading the wedged case has never had; do not read it as a wall verdict"
+    } else if went_backwards > 0 {
+        "at least one word moved BACKWARDS across the window. These are then not monotone counters, or not counters at all: §49.16's monotone-across-boots observation does not survive an intra-boot decrement, and the 'hub work-counter' reading of +0x8c…+0xa8 must be withdrawn before anything is built on it"
+    } else if stepped > 0 {
+        "DELTA>0 ON A WEDGED WINDOW — THE HUB SAW TRAFFIC EVERY CORE-SIDE STATION DENIED. §49.15's dead-at-item-accept closure covers the core-visible surface only; something crossed the hub while all sixteen bracket stations held still. The next question is ATTRIBUTION — whether the criterion caused it or another agent (VPU, display, firmware) did — and the way to ask it is a null window: the same pre/post delta across an interval with no submit in it"
+    } else {
+        "DELTA=0 ON ALL SIX — DEAD AT ITEM-ACCEPT EXTENDS TO THE HUB. The counters §49.16 flagged as the one moving channel outside the bracket did not move across the criterion window either. The core denies the work and the hub records none, which closes the last ARM-readable channel the sweep diff named and leaves the firmware-side prong (§49.14) as the only surface"
+    };
+    serial_println!(
+        ":: V3D: [v3d94] hub-traffic (bin-criterion) — counters={} stepped={} backwards={} | criterion retired={} — {} ::",
+        V3D94_HUB_N,
+        stepped,
+        went_backwards,
+        retired as u32,
+        verdict
+    );
 }
 
 /// PI-V3D-75's discriminator kick: the [v3d74a] leg, compacted — the proven M3 RCL on CT0's queue,

@@ -5417,3 +5417,85 @@ one `--trigger ct0run` mid-bin; scp all three to `~/unaos-bench/capture/`. Until
 core-CTL constants are unexamined territory, not excluded territory. The hub TFU window
 (0x100–0x1000) stays excluded on both sides by decision: no source-cited register list, and
 unbacked V3D-hub reads can fault.
+
+**§49.17 — PI-V3D-94: the two channels nobody samples (hub work-counters + the clock manager).**
+§49.15 closed the ARM-visible V3D surface and §49.16 named what that closure does not cover. Two of
+the named channels are readable from this kernel today, and `[v3d94]` reads both. One feature
+(`v3d_hubcm`, bare, default OFF), one knob (`UNAOS_V3D_HUBCM=1`), one `[v3d94] SKIPPED — hubcm-gate
+off` line when it is off. **Read-only, both halves**: half A issues no register write of its own —
+its only writes are the PI-V3D-91 criterion's, which the ladder already runs many times per boot —
+and half B issues no write at all. No CM password constant exists anywhere in `v3d.rs`, deliberately,
+so no store in this driver can arm a clock by accident.
+
+*Half A — the hub-traffic delta (deep battery, immediately after `[v3d93]`, before `[v3d75]`).* The
+six unmapped hub words at `+0x8c/+0x90/+0x94/+0xa0/+0xa4/+0xa8` are snapshotted PRE-submit and again
+after the criterion's FLDONE backstop returns, and the six deltas are printed with a verdict. Two
+design points are load-bearing. (1) The six are **not** added to `V3D93_STATIONS`: sixteen reads per
+sample is the budget §49.15's 348,908-sample baseline was taken at, and widening the array to
+twenty-two would restate the sample rate that baseline is quoted in. A counter that only moves
+forward needs no ordering trace — two samples answer the question completely. (2) The rung takes its
+**own** criterion window rather than sharing the bracket's, so the two arm independently and neither
+can silently change the other's window; the cost is one extra bin submit per armed boot. The honest
+limit, named rather than hidden: a pre/post delta cannot say *when* inside the window a counter
+stepped, nor separate traffic the criterion caused from traffic another agent (VPU, display,
+firmware) put through the hub in the same interval.
+
+| half A outcome | reading |
+| --- | --- |
+| **Δ>0, criterion wedged** | **THE HUB SAW TRAFFIC EVERY CORE-SIDE STATION DENIED.** §49.15's dead-at-item-accept closure covers the core-visible surface only; something crossed the hub while all sixteen bracket stations held still. Attribution is the next question, and the way to ask it is a null window — the same delta across an interval with no submit in it |
+| **Δ=0 on all six** | **DEAD AT ITEM-ACCEPT EXTENDS TO THE HUB.** The one moving channel §49.16 found outside the bracket does not move across the criterion window either: the core denies the work and the hub records none. That closes the last ARM-readable channel the sweep diff named, and the firmware-side prong (§49.14) is the only surface left |
+| **any word moved backwards** | These are not monotone counters, or not counters at all. §49.16's monotone-across-boots observation does not survive an intra-boot decrement, and the "hub work-counter" reading of +0x8c…+0xa8 is withdrawn before anything is built on it |
+| **criterion RETIRED** | The wall did not reproduce on this boot; the deltas describe a **working** frame and are banked as the reference reading, not as a wall verdict |
+
+*Half B — the direct CM clock station (bringup, immediately after the mailbox clock grant).* One
+line carrying `CM_V3DCTL` and `CM_V3DDIV` with their decoded fields, printed **beside** the
+firmware's own `GET_CLOCK_RATE`/`GET_CLOCK_STATE` answers, followed by every nonzero word in
+`CM[0xFE101000, +0x100)` in the `[v3d76]` SWEEP line format. The point is the pairing: the firmware's
+clock report is already on the §46.4 instrument-lie ledger — it claimed the V3D clock gated at
+250 MHz while `CYCLE_COUNT` free-ran at ~499 MHz — and every clock verdict in this file rests on it.
+This is the first reading in the driver's history that can audit that report against the hardware it
+describes.
+
+**The offsets are INFERRED and tagged so on the wire.** `+0x038`/`+0x03C` is the conventional
+`clk-bcm2835.c` CM slot layout for V3D; this tree carries no source-cited confirmation for BCM2711.
+The surrounding window dump is what makes the inference falsifiable without a second boot — a CM
+block with CTL/DIV-shaped neighbours but zeros at the V3D slot is a genuinely unprogrammed slot,
+whereas an all-zero window means the read landed nowhere useful and nothing about the clock follows.
+
+**Mapping, checked before writing the half.** `0xFE101000` sits inside the 0xC000_0000–0xFFFF_FFFF
+Device-nGnRnE GiB that `boot.rs` L1[3] maps — the same window `PM_BASE` (0xFE10_0000) and
+`LEGACY_ASB_BASE` (0xFE00_A000) are already read through. No new MMU mapping is opened and no
+page-table edit is needed, so half B ships.
+
+| half B outcome | reading |
+| --- | --- |
+| **CM ENAB disagrees with the firmware's active bit** | **DIVERGENCE.** The report is the one already on the instrument-lie ledger; this is the first direct reading that can convict it, and every clock verdict resting on that report is re-read |
+| **CM ENAB agrees, DIVI/DIVF nonzero** | Not a null result. The report is audited against its hardware for the first time, and the DIVI/DIVF pair is the first direct frequency evidence this driver has carried — a divisor that contradicts the granted rate is itself a finding |
+| **both slot words zero, other CM words nonzero** | The slot is real and genuinely unprogrammed: firmware granted the V3D clock without programming this CM slot, which is a divergence from the `clk-bcm2835` model in its own right |
+| **whole window zero** | The read landed nowhere useful — wrong base or an undecoded block on this silicon. Nothing about the clock follows and the half is INCONCLUSIVE by construction |
+
+**QEMU note (host gate, not a metal verdict).** `kernel8-test` exercises half B for free: QEMU's
+CPRMAN model answers with 24 nonzero words in the window, CTL/DIV-shaped pairs at `+0x28/+0x2c` and
+`+0x30/+0x34` either side, and **zero at `+0x38/+0x3c`** — the third row above. That is corroboration
+of the *layout* (the V3D slot sits where the inference put it, between its populated neighbours) and
+says nothing about the bench Pi's firmware, which is the boot that decides. Half A cannot run on
+QEMU at all — no V3D — and prints its hub-absent SKIPPED line.
+
+#### 49.17.1 The boot, and the gate
+
+```
+UNAOS_WITNESS=1 UNAOS_PIUSB=1 UNAOS_GENET=1 UNAOS_SMP7=1 UNAOS_NETTEST=1 UNAOS_V3D=1 \
+UNAOS_VUGPAR=1 UNAOS_WEDGE2=1 UNAOS_V3D_DEEP=1 UNAOS_V3D_HUBCM=1 ./arroyo kernel8
+```
+
+Inert without `UNAOS_V3D_DEEP`. Because both halves are read-only the knob may be combined with any
+other, unlike `PMCYCLE`/`QPU`/`DISPDONE`; it may also be armed alongside `UNAOS_V3D_PTBBRKT=1`, and
+that is the recommended pairing — one boot then carries the bracket's ordering table and the hub
+delta across the same wedged state.
+
+**Gate (host, taken at PA30).** `./arroyo check` green on both arches; the full-knob `kernel8` build
+green with the arming knob echoed; `strings -a target/pi_baremetal/kernel8.img` shows the `[v3d94]`
+armed strings with `[v3d93]` as the positive control that the proof discriminates at all; and the
+converse control — the knob-off build carries the `hubcm-gate off` SKIPPED line and **none** of the
+armed banners. `kernel8-test` green (MBENCH 91/91) is a no-regression statement plus the QEMU CM
+reading above; the verdict on both halves is the attended metal boot.
