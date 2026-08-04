@@ -71,7 +71,34 @@ COMPLETE :: SCHED: task 'el0-midden' -> core
 COMPLETE :: BANDY-RT:
 
 # --- the aggregate: 23 fixture verdicts -------------------------------------------
-COUNT 23 -> PASS
+# ---    RE-SCOPED (2026-08-04, R23S1Y follow-up). The bare `-> PASS` pattern stopped meaning
+# ---    "23 fixtures passed" some arcs ago: the live capture scores 48 hits against it, because the
+# ---    compositor's PER-COMPOSITE verdicts (`[wc-d] verify …  -> PASS`, 14 of them on this boot,
+# ---    plus [wc-f]/[wc-fv]/[wc-i]/[wc-j]/[clickroute]) match the same three characters. Their count
+# ---    is a function of how many windows the battery happened to open, i.e. UNBOUNDED — so the
+# ---    aggregate carried ~25 lines of slack and a whole fixture could stop printing with the COUNT
+# ---    still green. Measured: delete `:: M6d: SP-relative sentinel readback -> PASS ::` from the
+# ---    live capture and the old directive reports 47 hits -> PASS.
+# ---    The fix is the regex, not the floor. A raised floor would be hostage to the compositor's
+# ---    window count; the narrowed one counts only lines of the FIXTURE VERDICT form — `:: LABEL:
+# ---    … -> PASS ::`, doubly framed, which no `[wc-*]` line is — and lands on exactly the 23 the
+# ---    number always named: M6b, M6d x3, M6f x3, M6g, U4, U5, U6, U6b, U7, U8, U9, U10,
+# ---    U10-create, U10-delete, U11, U11-defer, U11-reuse, U11-reap, U6-grants. Zero slack: one
+# ---    deleted fixture line -> 22, FAIL.
+# ---    THE FOUR EXCLUSIONS ARE THE KERNEL'S OWN RULING, not a convenience. `elf1_launcher` and
+# ---    `exec1_launcher` (arch/aarch64/syscall.rs) are documented as emitting ONE *uncounted* line
+# ---    that "never perturbs the 23-fixture battery", and both have honest skip exits — no SD card,
+# ---    no FAT volume, ELFHELLO.ELF/VUG.ELF absent — so counting them would red a metal boot on a
+# ---    card that simply lacks the fixture. EXEC-UVUG is the same launcher shape (and its real
+# ---    assertion is the `UVUG: frames=300 … checksum=` REQUIRE below, which is sharper). SERWIT-2
+# ---    is excluded for a different and weaker reason, stated so it can be revisited: it has NO
+# ---    skip path (`mirror_verdict_once`, one-shot on main-loop entry, prints PASS or `FAIL ::`)
+# ---    and its FAIL is already convicted by the default `FAIL ::` FORBID, but its ABSENCE is not,
+# ---    and this arc had no UNAOS_SKIP_XHCI capture to prove the ftdi tap's presence is unconditional.
+# ---    Promoting it to a REQUIRE is the open ruling.
+# ---    MAINTENANCE RULE, since the floor is now tight: a new fixture that prints `:: LABEL: … ->
+# ---    PASS ::` raises the measured count, and the floor must be raised with it in the same commit.
+COUNT 23 :: (?!ELF1:|EXEC1:|EXEC-UVUG:|SERWIT-2:)[A-Za-z0-9_-]+: .*-> PASS ::
 
 # --- scheduler capstone: all 6 sync primitives in one boot -------------------------
 COUNT 6 CAPSTONE \w+: PASS
@@ -741,6 +768,27 @@ REQUIRE \[pstrip\] armed .*full=1000
 # ---    change draws nothing at all. Requiring a rollup whose `skipped=` is non-zero pins that the
 # ---    always-running pulse is genuinely paced and not a 1 Hz repaint wearing a flag.
 REQUIRE \[pstrip\] rollup samples=[0-9]+ redraws=[0-9]+ skipped=[1-9]
+# ---    …and the REQUIRE above is an EXISTENCE test, which is the wrong shape for this witness.
+# ---    The rollup fires every 10 s: 16 of them on the live capture. One unpaced window hides behind
+# ---    fifteen healthy ones, because a single `skipped=[1-9]` line satisfies the REQUIRE and nothing
+# ---    reads the other fifteen. Pacing is a UNIVERSAL claim — EVERY window must skip — and in this
+# ---    grammar universals are written as a FORBID on the defect shape, never as a COUNT (COUNT is a
+# ---    floor, `hits >= need`; there is no ceiling and no cross-directive equality, so "all 16 healthy"
+# ---    is not expressible, and any literal rollup census would be a function of the capture window).
+# ---    Polarity, from the emitter (ui_status.rs, the PSTRIP_ROLLUP_MS block): `skipped` is printed as
+# ---    `samples.saturating_sub(redraws)`, so skipped=0 means every sample redrew — the pacing
+# ---    delivered nothing that window. The module's own note names it: making the breath sweep a dirty
+# ---    source "would redraw the whole panel every single sample and turn the pacing proof (`skipped=`
+# ---    in the rollup) into a constant zero — a 1 Hz repaint wearing a flag".
+# ---    MEASURED MARGIN, stated because it is thinner than it looks: skipped over the live capture's
+# ---    16 windows ran 2,4,6,8,8,9,10,10,10,11,11,11,12,12,14,15 — the busiest window came within TWO
+# ---    samples of tripping this FORBID on its own merits. A one-off honest zero on a heavily loaded
+# ---    boot is therefore possible, and this line would call it a fault. The residual is the EMITTER's:
+# ---    a per-window raw difference has no stable floor, so no per-line predicate can separate "unpaced"
+# ---    from "genuinely busy". The clean fix is a self-verdict in the emitter (a `paced=yes/no` computed
+# ---    against a stated criterion, or a cumulative since-boot ratio at the last rollup); until then this
+# ---    FORBID catches the collapse case, which is the defect shape the module was written against.
+FORBID \[pstrip\] rollup .*skipped=0 srcdelta=
 # --- PULSE-3: THE SOURCE, not the pacing.
 # ---
 # ---    P64, attended, capture pi4-r23s1o. Three vugs held the cores at a sustained 99% and the
@@ -1000,10 +1048,23 @@ FORBID :: MAILBOX: BUSY
 # --- Each line below was validated red-side against its emitter's reconstructed FAIL text and
 # --- green-side (0 hits) against the live 91/91 capture. NOT closable by FORBID, left to lead
 # --- rulings: [wedge1] STRADDLE (deliberate non-pin, ruling owed), [storm] boot-baseline +
-# --- [spinhunt] load lines (pure census), [wc-h] fixture (absence-shaped), [pstrip] rollup
-# --- skipped= (needs a COUNT re-scope). Adjacent findings recorded in the landing report:
-# --- COUNT 23 -> PASS has ~25 lines of slack; [wc-g]/[wc-h] FORBID reach ends at sample-budget
+# --- [spinhunt] load lines (pure census), [wc-h] fixture (absence-shaped). Adjacent findings
+# --- recorded in the landing report: [wc-g]/[wc-h] FORBID reach ends at sample-budget
 # --- exhaustion, narrower than the spec prose claims.
+# --- COUNT RE-SCOPES (2026-08-04, same day, follow-up) — the two COUNT-shaped items above are
+# --- CLOSED, each validated in both directions by log surgery on the live 91/91 capture:
+# ---   * `[pstrip] rollup skipped=` did NOT want a COUNT. Pacing is a universal over an
+# ---     unbounded number of rollups and COUNT is a floor; the convictable form is a FORBID on
+# ---     the defect polarity (skipped=0). See the PULSE-4 block. Injecting one unpaced rollup
+# ---     among sixteen: was PASS, now FAIL — and FORBID outranks truncation (verdict rule 1), so
+# ---     it convicts in a short capture too, which no COUNT re-scope could have done.
+# ---   * `COUNT 23 -> PASS`'s ~25 lines of slack were the compositor's per-composite verdicts,
+# ---     closed by narrowing the regex to the fixture-verdict form rather than raising the floor.
+# ---     See the aggregate block. Deleting one fixture's PASS line: was PASS (47 hits), now FAIL
+# ---     (22 of 23). This one stays class-C — an absent fixture line in a TRUNCATED capture still
+# ---     grades INCONCLUSIVE (rule 2 outranks rule 3). A fixture that RUNS and fails is convicted
+# ---     by the default `FAIL ::` FORBID; only vanishing is absence-shaped, and absence has no
+# ---     FORBID-shaped fix in this grammar.
 FORBID M6b: EL0 fault isolation FAIL
 FORBID M6g: disk-loaded EL0 program FAIL
 FORBID U4: process model FAIL
