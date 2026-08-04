@@ -989,3 +989,54 @@ FORBID :: MAILBOX: BUSY
 # ---    costs Peter a bench sitting chasing a bug that is not there. The tokens' value is diagnostic
 # ---    and ORDERED ("which was last on the wire"), which this grammar cannot express regardless.
 # ---    Token table and the reading procedure: docs/dev/OS/08_VIDEO/engine.md WEDGE-2.
+
+# --- CONVICTABILITY HARDENING (2026-08-04, R23S1Y) — provenance: GR15's mbench blind-spot relay
+# --- (a witness whose FAIL wording misses the default forbids and has no dedicated FORBID cannot
+# --- convict by rule 1), verified and sharpened by this track's own audit over all 91 witnesses:
+# --- 40 were class-C (REQUIRE-drop only), and because truncation OUTRANKS a missing REQUIRE
+# --- (verdict rule 2), every class-C failure in a short capture degraded to INCONCLUSIVE.
+# --- Two were outright green-while-failing: [cursor3] -> INCOHERENT and [cursor6] -> OVERWRITTEN
+# --- (defect verdicts added after their spec rationales were written; nothing forbade them).
+# --- Each line below was validated red-side against its emitter's reconstructed FAIL text and
+# --- green-side (0 hits) against the live 91/91 capture. NOT closable by FORBID, left to lead
+# --- rulings: [wedge1] STRADDLE (deliberate non-pin, ruling owed), [storm] boot-baseline +
+# --- [spinhunt] load lines (pure census), [wc-h] fixture (absence-shaped), [pstrip] rollup
+# --- skipped= (needs a COUNT re-scope). Adjacent findings recorded in the landing report:
+# --- COUNT 23 -> PASS has ~25 lines of slack; [wc-g]/[wc-h] FORBID reach ends at sample-budget
+# --- exhaustion, narrower than the spec prose claims.
+FORBID M6b: EL0 fault isolation FAIL
+FORBID M6g: disk-loaded EL0 program FAIL
+FORBID U4: process model FAIL
+FORBID U5: capabilities FAIL
+FORBID U6: general object table FAIL
+FORBID U6b: real File handles FAIL
+FORBID U7: cross-process transfer FAIL
+FORBID U8: revocation trees FAIL
+FORBID U9: real File writes FAIL
+FORBID U10: file growth FAIL
+FORBID U10-create: file create FAIL
+FORBID U10-delete: file delete FAIL
+FORBID U11: open-file lifecycle FAIL
+FORBID U11-defer: cross-process unlink-defers-free FAIL
+FORBID U11-reuse: .*orphan-head sweep FAIL
+FORBID U11-reap: teardown-last-close reaper FAIL
+FORBID U6-grants: owner/grants FAIL
+FORBID K1-persist:.*rebuild\+enforce FAIL
+FORBID K1-corrupt:.*at boot FAIL
+FORBID F2-witness:.*-> SERIALIZATION REGRESSION
+FORBID F3-witness:.*-> SERIALIZATION REGRESSION
+FORBID K2-liveenf:.*rebuild\+enforce FAIL
+FORBID K3-revoke:.*durable-first FAIL
+FORBID K3-mount:.*byte-verified FAIL
+FORBID K3-mount: located but mount FAILED
+FORBID K4-ready:.*prefix\) FAIL
+FORBID :: UVUG: frames=[0-9]+ threads=[0-9]+ checksum=(?!0xe68285b85121ac7c)
+FORBID \[inroute\] router window — (?!routed=2 stale_dropped=1 revokes=0)
+FORBID \[wc-c\] side-by-side (?!windows=2 drawn=2)
+FORBID BGRUN-ST: process table capacity = (?!6 rows)
+FORBID \[wc-e\] fb-geometry .*row_ok=false
+FORBID \[wc-e\] fb-geometry .*fit_ok=false
+FORBID \[cursor3\] .*-> INCOHERENT
+FORBID \[cursor6\] .*-> OVERWRITTEN
+FORBID \[pstrip\] armed .*full=(?!1000 )[0-9]+
+FORBID \[spinhunt\] SYS_EXIT .*orphan-reap NOT ARMED
