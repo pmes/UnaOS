@@ -831,6 +831,51 @@ so the panel would still be slow. `leaf_is_fb_wc` demands BOTH that the leaf ove
 second device, or any leaf no fb retype ever covered cannot satisfy the first condition and takes the UC
 path exactly as before.
 
+#### ⚠ Correction — the retype line was never the missed witness, and it could not have been
+
+`0b66d9cd`'s message reasons that this regression "could hide behind a line that never arrived", naming
+`:: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::` as the witness the
+boot-blind window swallowed. **The premise is wrong, and it matters more than the line's absence does.**
+Had that line arrived in every capture from 2026-07-21 onward, it would have read exactly as it always
+had, and nobody would have learned anything.
+
+Checked against every text log under `capture/`:
+
+```
+for f in $(find . -type f ! -name '._*'); do awk '/x86 fb-wc/' "$f"; done \
+  | cat -v | sed 's/\^\[\[[0-9;]*m//g' | sort | uniq -c
+```
+
+**130 occurrences, across 26 files, 2026-07-18 through 2026-08-04 — every one of them byte-identical**:
+`retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000`. Boots before the regression, boots during
+it, and boots after `72a4adf1` all print the same fifteen leaves over the same span. (Five of the 130
+carry a leading fragment of another line — `xHCI: Requesting Device Descr`, a run of NULs — which is
+serial interleaving in the capture, not a variant message.)
+
+The reason is structural. `set_framebuffer_wc` prints when the retype **runs**, from `fbcon::init`,
+before any GPU probe exists to undo it. The clobber happened afterwards, in `map_mmio_window`, and wrote
+nothing this line reads. The retype was attempted, reported, and reverted, in that order, on every one of
+those 130 boots — and the report is emitted at step two.
+
+**The lesson, stated generally because it is not about framebuffers.** *A witness that reports an ACTION
+cannot detect a later silent revert of that action's RESULT.* Its value is fixed at the moment it fires;
+anything that changes the state afterwards is outside what it can say, no matter how loudly it says it.
+Only a witness that reads the state back — and reads it back late enough to be after every writer — can
+falsify a revert. That witness did not exist in this tree until `72a4adf1` added
+`:: x86 mmio-map: … wc-kept=N ::`, which reports what each window walk **left behind**, per window, at the
+moment the last writer runs. It is the discriminator; the retype line never was. Compare the two before
+reaching for either:
+
+| line | fires | reports | can it catch a later revert? |
+|---|---|---|---|
+| `:: x86 fb-wc: retyped 15 leaf(s) … ::` | `fbcon::init`, before any GPU probe | that the retype **ran** | **no** — identical in all 130 captures, healthy and broken alike |
+| `:: x86 mmio-map: … wc-kept=N ::` | each `map_mmio_window` walk, after the retype | how many fb leaves that walk **left WC** | **yes** — `wc-kept=0` on BAR1 is the regression, on the wire |
+
+The line's absence from modern captures is a separate and real problem — see *Two standing capture
+hazards* in §8, and `docs/dev/OS/02_KERNEL_CORE/serial_transport.md` §*`UNAOS.LOG`* for the second channel
+that recovers boot-blind head. But it is a problem about observability, not about this regression: fixing
+the capture would not have surfaced this defect one boot sooner.
+
 #### The wire (rMBP boot s70, 2026-08-04, trunk `72a4adf1`)
 
 `map_mmio_window` now says what its walk did, per window, so the outcome is on the wire instead of being
@@ -6942,6 +6987,14 @@ emitted inside its boot-blind window.
 Format vintage is the cheapest per-line discriminator for this file: a `[wc-d]` line carrying
 `band=`/`ram_indep=`/`moved=` is boot 2, one without is boot 1.
 
+⚠ **The file has since grown to 4,765 lines and a THIRD boot** (`SERWIT-1: 6 cores` at 3366,
+`ftdi:console-up` at `[20025 ms]`), which the table above predates. Do not treat any line count or
+boundary here as final on a live capture — a watcher keeps appending. The stable discriminator is the
+raw TSC figure: **`hz=` is unique per boot** and appears in every `EPACE`/`GPACE`/`BPACE` line, so
+`awk '/hz=[0-9]/{print NR": "$0}'` segments the file in one pass regardless of how many boots it holds
+(here `hz=2693849020`, `2693851785`, `2693849494`). `clock: TSC calibrated ~2693 MHz` is **not** a
+discriminator — it is rounded, and reads identically in every boot on this machine.
+
 #### Two standing capture hazards on this bench
 
 Neither is a video finding; both are recorded here because they are hit while reading video captures.
@@ -6962,7 +7015,12 @@ Neither is a video finding; both are recorded here because they are hit while re
   it. This is why `:: x86 fb-wc: retyped 15 leaf(s) … ::` never appears in a modern capture even though
   it runs on every x86 boot — `fbcon::init` is 20+ seconds early. **An absent early line is not a
   negative on this bench.** Confirm the line's emission time against `BOOTLOG` before reading its
-  absence as anything.
+  absence as anything. A boot-blind head is often **recoverable** from the card: `UNAOS.LOG` keeps the
+  earliest bytes where the FTDI mirror keeps the latest, so the two channels are complementary by
+  construction — see `docs/dev/OS/02_KERNEL_CORE/serial_transport.md` §*`UNAOS.LOG` — the complementary
+  capture channel*, including the `hz=` cross-match that must be run before trusting any copy. Note that
+  recovering the line changes nothing about the VPERF-WC-REGRESS finding: the retype line reads
+  identically in the healthy and broken states (see §6, *the retype line was never the missed witness*).
 
 #### The window-id map — read this before attributing any `[wc-x]` or `[wc-h]` line
 

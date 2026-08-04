@@ -6,6 +6,14 @@ Source: `unaos/crates/kernel/src/bootpace.rs`.
 Stamp sites: `main.rs`, `arch/x86_64/pci.rs`, `drivers/xhci/mod.rs`, `fs/fat.rs`,
 `flight_recorder.rs`.
 
+> **Before quoting any armed-build x86 figure from this document, read §10.** A
+> framebuffer memory-typing regression ran from 2026-07-21 to 2026-08-04 and
+> inflated every `nvidia-kepler`-armed metal reading taken after the Kepler probe.
+> §10c classifies each claim; the short version is that the EHCI and xHCI results
+> survive, the desktop *delta* survives but its absolute does not, and
+> `pci-usb d=4620ms` must be re-measured. Default-build and aarch64 figures are
+> unaffected.
+
 ## 1. Why it exists
 
 Until this arc the only measurement of the boot's wall clock was a stopwatch and
@@ -344,12 +352,36 @@ EPACE-TRIM M3 (landed after this boot) skips the PSS wait on the HSE path only; 
 path keeps the full EHCI 4.8 handshake. Expected next ledger: `ehci-hid-done d=` ≈ 2.0 s,
 `sched-dis=0ms` on the sub-split, boot to desktop ≈ 8.0 s with all four GPU/SMC lanes in.
 
+**Prediction closed — both halves achieved, same capture.**
+`/home/pmes/unaos-bench/capture/rmbp-gr12/ttyUSB0.log` holds four boots and its
+fourth is the post-M3 one:
+
+| line | reading |
+|---|---|
+| 3787 | `:: EPACE: selftest=0ms evid=0ms init=2010ms hz=2693847134 ::` |
+| 4334 | `:: BPACE: ehci-hid-done t=2999ms d=2010ms ::` |
+| 4348 | `:: BPACE: total gui=8048ms … result=LEDGER ::` |
+
+`init=2010ms` against `ehci-hid-done d=2010ms` — the §8 self-check held exactly, a
+third time. The `init=` progression across that one capture's four boots is
+6324 → 6324 → 4010 → 2010 ms, and `total gui=` moves 12429 → 12429 → 10037 → 8048 ms.
+§9 cites the 12429 → 8048 move as context for GPACE without saying it is this
+prediction landing; it is. See §10 for what the 8048 ms absolute is worth and what
+the 4.4 s delta is worth — they are not the same answer.
+
 ## 9. GPACE — the inside of `pci-usb` (GR13)
 
 Once EPACE took `ehci-hid-done` down, the s60 capture's largest remaining block
 was `pci-usb d=4620ms`. Same shape as §8, same remedy: per §7 the instrument for
 the inside of a dominating phase is the phase's own witness, so the split lives
 in `arch/x86_64/pci.rs` as GPACE, not as more ring stamps.
+
+> **`pci-usb d=4620ms` and its `kepler=4393ms` split are SUSPENDED as magnitudes**
+> — see §10. Every armed reading taken between 2026-07-21 and 2026-08-04 spans the
+> framebuffer memory-typing regression, and the Kepler probe is where the regression
+> is *caused*, so this block contains the fault by construction. The
+> instrument's design, its self-check and its baseline law are unaffected; only the
+> numbers need re-taking on a `72a4adf1`-or-later build.
 
 Two things about that delta are easy to misread, and GPACE exists to make both
 mistakes unavailable.
@@ -374,6 +406,13 @@ It is also a *deterministic* burn, not a device- or contention-dependent one:
 across the four boots in the s60 capture `pci-usb` reads 4576 / 4576 / 4575 /
 4620 ms while `gui=` moves 12429 → 8048. A block that stable across a 4.4 s swing
 is fixed iteration counts and a fixed volume of MMIO.
+
+**That stability does not exonerate the magnitude.** All four of those boots ran
+the same pre-`72a4adf1` build, so all four were handicapped identically; a
+constant handicap reproduces as a constant. Stability across repetitions
+falsifies *contention* and *device variance* as explanations — which is all this
+paragraph ever claimed — and says nothing about a systematic offset shared by
+every repetition. §10 is the general form of that distinction.
 
 ### The two lines
 
@@ -447,8 +486,8 @@ the classes are disjoint sequential spans inside `span`. The printed domain is
 deliberate: each class floors to ms independently, so a residual computed in
 cycles and then floored a ninth time leaves the printed row short of the printed
 `span` by up to `N_GPACE + 1 = 8` ms. Against the 4620 ms armed block that is
-noise; against the ~100 ms default-build baseline of §9a — the reading this
-document calls load-bearing — it is up to 8%, sitting in exactly the field whose
+noise; against the ~113 ms default-build baseline of §9a — the row this
+document calls load-bearing — it is up to 7%, sitting in exactly the field whose
 job is to prove nothing went unattributed. A reader adds up the line, so the line
 must add up. `Σfloor(x_k/d) ≤ floor(Σx_k/d) ≤ floor(span/d)` for any integer
 `d ≥ 1` makes the subtraction non-negative by construction whenever
@@ -508,7 +547,7 @@ exactly one exit, and the report sits on it.
 | build | reading |
 |---|---|
 | bench media, GPU knobs armed | both lines print; `span` ≈ 4600 ms with `kepler=` dominant; `build=kepler+takeover+…` |
-| default `./arroyo esp-x86` | both lines still print, with `detect=0ms(n=0) igpu=0ms(n=0) kepler=0ms(n=0)`, `build=default(no-gpu-knobs)`, `span` ≈ 100 ms |
+| default `./arroyo esp-x86` | both lines still print, with `detect=0ms(n=0) igpu=0ms(n=0) kepler=0ms(n=0)`, `build=default(no-gpu-knobs)`, `span` ≈ 113 ms |
 | `UNAOS_SKIP_XHCI=1` | the lines are **absent entirely** — `pci::init` is never called |
 
 The middle reading is the load-bearing one: it is what proves the numbers report
@@ -516,4 +555,179 @@ the GPU path rather than the reporter's own liveness. A build with the GPU code
 compiled out that still printed a large `kepler=` would convict the instrument.
 The third matches BPACE's own "did not run (b)" asymmetry (§5).
 
+**Provenance of the ≈113 ms, and what it is not.** This document previously wrote
+that row as "≈ 100 ms" while §6 recorded `pci-usb … 113 ms` for the same tag on
+the same machine. There is one number, not two: 113 ms, from the 2026-07-30
+default-build metal ledger in §6. The row now carries it.
+
+But it is a **BPACE** number. No metal capture has ever printed
+`build=default(no-gpu-knobs)` — `awk '/default.no-gpu-knobs/'` over
+`/home/pmes/unaos-bench/capture/` returns nothing, because §6 predates GPACE and
+every armed boot since has carried the knobs. So the middle row is a *derived
+expectation*: GPACE's `span` must equal BPACE's `pci-usb d=` by construction
+(see "How the self-check is enforced"), and the one measured `pci-usb d=` on a
+knobless build is 113 ms. Calling it a "reading" overstated it. The first metal
+default-build GPACE line is still owed, and when it arrives it is the check on
+this row — not the other way round.
+
+This row is unaffected by §10: a default build never maps Kepler BAR1 and never
+lost WC.
+
 Read the lines with `awk '/GPACE/'` — **not** `grep`.
+
+## 10. The framebuffer write-combining regression (2026-07-21 → 2026-08-04)
+
+Every armed metal figure this document records between those dates was taken on a
+machine whose panel was running strong-uncacheable instead of write-combining.
+This section says which of them survive, which are inflated, and which must be
+re-taken — because "the instrument was honest" and "the number means what we
+thought" are different claims, and the regression separates them.
+
+`set_framebuffer_wc` retypes the framebuffer's huge-page leaves to PAT index 4
+(WC). The Kepler probe later maps BAR1 — `0x90000000` + 256 MiB, which *contains*
+the framebuffer — and `map_mmio_window` ORed `PCD|PWT` onto each leaf without
+clearing the PAT bit, turning index 4 into index 7: strong UC, which
+`ensure_pat_wc` never reprograms. `FB_WC_DONE` latches the retype, so nothing put
+it back. Fixed in `72a4adf1` (`arch/x86_64/memory.rs`), confirmed on metal.
+
+### 10a. Scope — three independent narrowings
+
+The blast radius is much smaller than "every figure since 2026-07-21", in three
+ways that compound:
+
+1. **Only `nvidia-kepler`-armed builds.** The clobber is reached only through
+   `crate::drivers::gpu::kepler::init(gpu)` at `arch/x86_64/pci.rs:620`, inside a
+   `#[cfg(feature = "nvidia-kepler")]` match arm. A default `./arroyo esp-x86`
+   build never maps BAR1 and never lost WC — so §6, §9a's middle row, and every
+   default-build figure are untouched.
+2. **Only x86.** The faulty function is `arch::x86_64::memory::map_mmio_window`.
+   aarch64 has no counterpart in that role: its same-named function lives in
+   `arch/aarch64/mmu_tegra.rs`, is called only from the Tegra RTL8168 path
+   (`rtl8168_tegra.rs`), and never sees a framebuffer. Every Pi, Jetson and QEMU
+   figure is untouched — not because an arm returned early, but because the code
+   is not shared at all.
+3. **Only the part of a boot after the Kepler probe.** The retype happens at
+   fbcon init; the clobber happens inside `kepler::init`, three lines after
+   `[NVIDIA] Initializing Kepler GPU`. In the one capture that recorded both
+   (`rmbp-gr15-s70/ttyUSB0.log`, third boot) they are 541 log lines apart —
+   `x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4)` at line 3122, the BAR1
+   `x86 mmio-map: 0x90000000..0xa0000000` at line 3663. In wall-clock, on the
+   pre-fix boot below: BPACE `enum:p1 t=3378ms`, plus GPACE `detect=5ms igpu=1ms`,
+   puts the clobber at **≈3.38 s**. Everything a ledger stamps before that ran at
+   full WC speed and is unaffected.
+
+### 10b. The controlled pre/post pair
+
+`/home/pmes/unaos-bench/capture/rmbp-gr15-s70/ttyUSB0.log` holds **three** boots,
+not two. Boundaries — each landmark appears three times, in step:
+
+| landmark | boot 1 | boot 2 | boot 3 |
+|---|---|---|---|
+| `SERWIT-1: 6 cores` | 56 | 1608 | 3366 |
+| `Enumerating Port 1` | 280 | 1832 | 3590 |
+| GPACE `since-entry` | 788 | 2337 | 4097 |
+| `FB Init` | 789 | 2338 | 4098 |
+
+Boot 1 ends at line 1543 and boot 2 begins at 1544. Boot 1 is the pre-fix boot:
+it prints no `x86 mmio-map` line at all, because `72a4adf1` added that line.
+Boots 2 and 3 print it with `wc-kept=15` over BAR1 — the fix taking effect.
+
+Two traps in this file:
+
+- **Line 1905 is not the boundary.** It is a `mmio-map` line 361 lines *inside*
+  boot 2. Treating it as the split misattributes an entire bring-up.
+- **Only boot 3 captured its own head.** `FTDI-CAP … early-boot capture INTACT`,
+  the `fb-wc: retyped` line and `X86_64 Memory Init` each appear exactly once, at
+  3121/3122/3128. Boots 1 and 2 begin mid-stream. This does not weaken the
+  comparison — every mark compared below comes from the `BOOTLOG` replay block,
+  which is printed late — but it is why the retype→clobber line distance in §10a
+  is measurable in boot 3 only.
+
+The `BOOTLOG` replay, boot 1 → boot 2:
+
+| mark | pre-fix | post-fix | Δ |
+|---|---|---|---|
+| `ehci:kbd-armed` | 2813 ms | 3001 ms | +188 |
+| `portsw:flip` | 2922 ms | 3110 ms | +188 |
+| `gui:handoff` | 28701 ms | 21593 ms | **−7108** |
+| `ftdi:console-up` | 28869 ms | 21761 ms | −7108 |
+| `block:up` | 35190 ms | 28078 ms | −7112 |
+
+Everything upstream of `gui:handoff` is unchanged or slightly *slower* (the +188 ms
+is common to both early marks and is unrelated boot-to-boot variance, not a
+regression effect — it is upstream of the clobber). The two intervals that bracket
+the saving are flat: `gui:handoff`→`console-up` is 168 ms in **both** boots, and
+`console-up`→`block:up` is 6321 vs 6317 ms. The entire 7108 ms therefore lands
+inside the GUI/Kepler phase and nowhere else.
+
+GPACE agrees from an independent origin: `kepler=25315ms` → `18169ms`
+(boot 3: `17079ms`), a 7146 ms move that matches the BOOTLOG 7108 ms to 38 ms.
+The work is identical — 221 Kepler log lines in each boot, spanning ~420 lines of
+output in each.
+
+**Mechanism.** The console is mirrored into a 1314×750 panel window, so each
+mirrored line costs a present. Same window, same byte count, from `[wc-h]`:
+
+| | pre-fix | post-fix |
+|---|---|---|
+| `present_us`, win=1 full frame (3 942 000 B) | 24269 | 2660 / 2789 |
+| `present_us`, win=1, all sizes | 23815 – 24269 | 233 – 2789 |
+| `compose_us`, same 3.9 MB | 2279 / 2265 | 2247 / 2266 / 2316 |
+
+`compose_us` is the control: the identical 3.9 MB composited into **cached RAM**
+does not move. That is what confines the handicap to framebuffer writes and rules
+out a general slowdown. Console geometry is byte-identical across both boots
+(`box=1314x750` throughout), so `PANEL_SCALE` is not a confound.
+
+The arithmetic is consistent but not exact, and should not be stated as exact:
+7108 ms at ~21.6 ms saved per full-window present is ~329 presents, against 221
+instrumented Kepler lines inside a ~420-line span. Per-line present counts are not
+established by this capture — some presents are banded (`span=736`) and cheaper.
+What the capture does establish is the *class* of cost and its magnitude.
+
+### 10c. Claim classification
+
+| claim | verdict |
+|---|---|
+| EHCI-HID `init=` 6324 → 2010 ms (§8a/§8b) | **survives.** Both readings are stamped at ~3.0 s, before the clobber. The mechanism — deleting a hard-coded 2000 ms PSS wait — is a constant, independent of write rate. |
+| `xhci-settle` 500 → 150 → 100 ms, and `xhci-settle d=7289ms` (§6/§6a) | **survives.** Both are stamped at ~3.3 s and earlier; entirely pre-clobber. |
+| desktop 12.4 → 8.0 s | **delta survives, absolute inflated.** The 4.4 s move is 98.5% the EHCI saving, which is pre-clobber. But `total gui=8048ms` is a post-clobber endpoint: ~4890 ms of it is the handicap. Quote the delta, not the absolute. |
+| `pci-usb d=4620ms` / `kepler=4393ms` — "the 4.6 s block" (§9) | **must be re-measured.** The window spans the clobber and contains the probe that causes it. Four-boot stability does not help (§9). |
+| §6 metal baseline, §9a default row | **unaffected** — default build, §10a(1). |
+| any aarch64 / Pi / Jetson / QEMU figure | **unaffected** — §10a(2). |
+
+### 10d. How fast is it, honestly
+
+The speedup is not one number, and "9×" unqualified is wrong in every context
+except one:
+
+- **8.7 – 9.1×** for large framebuffer writes — the present of a 3.9 MB frame,
+  24269 → 2660 / 2789 µs. This is the only place 9× belongs.
+- **5.2×** end-to-end for the console composite, which is compose + present:
+  2279 + 24269 = 26548 µs → 2316 + 2789 = 5105 µs. Compose is now **45%** of the
+  cost, so further work on the present buys progressively less.
+- **1.33×** to `gui:handoff` (28701 → 21593 ms) and to `ftdi:console-up`;
+  **1.25×** to `block:up` (35190 → 28078 ms), because the post-handoff storage
+  chain never paid the handicap and so gains nothing.
+
+Below ~20 KB the ratio is unreliable: the smallest presents land at 116–130 µs
+against 13–22 µs of timer granularity, and the ratio there is dominated by
+quantisation, not by memory type.
+
+### 10e. Cycles → milliseconds: use 2.6938 GHz, not 2.3 GHz
+
+Commit `d5d4684f` describes this board as "2.3 GHz Ivy Bridge base"; `03df9398`,
+`4d4919be` and `72a4adf1` all work in the measured TSC rate, ~2.6938 GHz. They
+disagree by 17%, which is enough to move a converted figure out of agreement with
+the ledger it is being checked against.
+
+**For any BPACE / EPACE / GPACE conversion, the correct rate is the measured TSC
+rate**, and the capture prints it: `hz=2693847134` … `2693851785` across every
+boot in `rmbp-gr12` and `rmbp-gr15-s70`. This is not a preference — it is the
+same `origin_hz()` the three instruments divide their own cycle counts by (§8,
+"Instrument-baseline"; §9, "How the self-check is enforced"), so converting with
+anything else breaks the property that makes their cross-checks meaningful. The
+2.3 GHz figure is the part's nominal base clock and is not what the TSC ticks at
+on this board; do not use it for instrument arithmetic.
+
+Read this capture with `awk '/pattern/'` — **not** `grep`.

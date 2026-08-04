@@ -358,6 +358,149 @@ Truncation takes the tail, so a clipped probe loses its sentinel by construction
 assertion (`TRUNCATED` delta == 0 across the stress window) and the on-the-wire sentinel count are
 independent, for the same reason SERWIT-1 sequence-numbers its burst.
 
+## `UNAOS.LOG` — the complementary capture channel
+
+The `flightrec` tap in the SERWIT-2 table is not just a fourth mirror to keep honest. It is a **second
+capture channel**, and on this bench it is the only one that holds the head of a boot. This section is
+how to read it, and the one check that must be run before any of it can be believed.
+
+### It keeps the earliest bytes, on purpose
+
+`crates/kernel/src/flight_recorder.rs` — `RING_CAP = 64 KiB` (`:86`). `LogRing::append` (`:97-110`)
+computes `room = RING_CAP - self.len` and, when `room == 0`, adds to `dropped` and **returns without
+writing**. There is no head eviction anywhere in the type.
+
+```rust
+let room = RING_CAP - self.len;
+if room == 0 {
+    self.dropped = self.dropped.saturating_add(bytes.len());
+    return;
+}
+```
+
+That is the exact opposite of the FTDI mirror (`drivers/xhci/ftdi.rs`, `Ring::push_byte` — "drop-oldest
+on overflow"), and the opposition is the point:
+
+| channel | on overflow | what survives | what is lost |
+|---|---|---|---|
+| FTDI mirror → the capture file | drop-**oldest** | the tail, up to console-up and everything after | the pre-console head |
+| flight recorder → `UNAOS.LOG` | drop-**newest** (stop and count) | `t=0` forward, until the ring fills | everything after the ring is full |
+
+Neither channel alone covers a boot on this machine. Together they overlap heavily, and the overlap is
+what lets a reader stitch them with confidence rather than by hope.
+
+**The file is self-describing about its own truncation.** `capture` (`:218-224`) appends the drop note
+only when `dropped > 0`, and always closes with the end-of-log marker (`:229`):
+
+```
+:: FLIGHTREC: 9646 byte(s) dropped (ring full / contended) ::
+:: FLIGHTREC: end of log (65536 captured byte(s); the remainder of this 66048-byte file is reserved padding) ::
+```
+
+`RESERVE_BYTES = RING_CAP + 512 = 66048` (`:247`) is why every saved copy on the bench is exactly that
+size, and why everything past the end marker is NUL padding rather than log.
+
+### Proven recovery — s67 and s68
+
+Both boots' serial capture (`capture/rmbp-s66-cand444/ttyUSB0.log`, four boots in one file) contains
+**zero** `x86 fb-wc` and **zero** `X86_64 Memory Init`. Their `UNAOS.LOG` copies contain both, plus
+`SMEP on`, `KERNEL HEAP ALLOCATED`, the `DMAR: IOMMU present …` line, `clock: TSC calibrated`, and
+`SMP: starting APs`. The head was on the card the whole time.
+
+Aligning each copy against its own boot's segment of the serial file, line for line:
+
+| | s67 | s68 |
+|---|---|---|
+| `UNAOS.LOG` log content runs to | line 1044 | line 1042 |
+| serial replay's first line corresponds to `UNAOS.LOG` line | 53 | 73 (mid-line — the replay starts inside it) |
+| lines recovered that the serial never had | **~52** | **~72** |
+| overlapping lines available to stitch on | **~992** | **~970** |
+| bytes the recorder itself dropped, at the tail | 9646 | 10983 |
+
+The two loss figures are the model working: the mirror lost tens of lines off the head, the recorder lost
+~10 KB off the tail, and roughly 970–990 lines are present in both.
+
+> ⚠ **Do not use a line's position in `UNAOS.LOG` as the replay boundary.** `RWLOCK: [cpu7] done 5/5,
+> torn=false, max_concurrent_readers=3 => PASS` sits at line **299** in both copies and is a good
+> alignment anchor once you have found the boundary — it is a single, distinctive, once-per-boot line —
+> but it is nowhere near where the replay begins. Find the boundary by walking back from the anchor:
+> establish the constant offset between the two files at the anchor, then find the first serial line of
+> that boot's segment. The offset drifts by a few lines across a boot (the channels do not carry an
+> identical line set), so re-check it near the boundary rather than extrapolating from one point.
+
+### The cross-match is mandatory, and this is the trap that makes it so
+
+`reserve_log` (`:285`) has three cases, and the first one is the hazard (`:290-295`):
+
+```rust
+Ok((de, _dl, _doff))
+    if de.size as usize >= RESERVE_BYTES && de.first_cluster() >= 2 =>
+{
+    // Big enough already: reuse the existing chain in place. NO FAT/dir mutation whatsoever.
+    return Ok((de.first_cluster(), de.size, true));
+}
+```
+
+An already-large-enough `UNAOS.LOG` is **reused untouched**, and `PAD_NEXT` only clears the stale tail on
+the first *successful* flush. So a boot that never reaches storage — it panicked early, it wedged before
+the main loop, the card was pulled — leaves the **previous** boot's log on the card, at the right size,
+with a well-formed header and a well-formed end marker. **It is structurally indistinguishable from a
+fresh one.** Nothing in the file says which boot wrote it.
+
+This is not hypothetical. The bench archive already carries the failure:
+
+* `capture/s62-s65-UNAOS.LOG.saved` — one file named for four sessions. Its `hz=2693855145` matches the
+  **sixth and last** of the six boots in `capture/rmbp-s62-probe/ttyUSB0.log`. The other five have no
+  saved copy at all.
+* `capture/rmbp-s62-probe/UNAOS.LOG.s62` — same session, `hz=2693856980`, which is the **first** of those
+  six boots. Two copies from one session, each a different boot, and only the cross-match says so.
+* `capture/s71-UNAOS.LOG.saved` — `hz=2693851785`, which is the **second** of the three boots in
+  `capture/rmbp-gr15-s70/ttyUSB0.log`, not the third (`hz=2693849494`).
+
+**The rule, non-negotiable: cross-match `hz=` between the `UNAOS.LOG` copy and the serial capture before
+attributing a single line of it.** The raw TSC calibration figure is unique per boot and is printed into
+both channels, in the `EPACE`/`GPACE`/`BPACE` ledger lines:
+
+```
+awk '/hz=[0-9]/' <UNAOS.LOG copy>                 # one value; that is the boot the file is
+awk '/hz=[0-9]/{print NR": "$0}' <serial log>     # segments the serial file by boot
+```
+
+Observed values, all distinct, all on the same machine: `2693845865` (s61), `2693846860` (s66),
+`2693849020`, `2693849494`, `2693849905`, `2693851785`, `2693853305` (s67), `2693853945` (s68),
+`2693855145`, `2693855465`, `2693856025`, `2693856745`, `2693856980`, `2693857105`.
+
+**`clock: TSC calibrated ~2693 MHz (invariant)` is NOT the discriminator.** It is rounded to the MHz and
+is byte-identical in every capture on this bench. Only the ten-digit `hz=` separates boots. A filename is
+not evidence either — every example above is a file whose name disagrees with its contents.
+
+### Honest scope — what this channel is still for
+
+`0b66d9cd` raised the FTDI mirror's `CAP` from 64 KiB to 256 KiB (`drivers/xhci/ftdi.rs:93`), so the
+serial capture should now carry the head itself. **On the evidence available, that is compiled and not
+yet metal-proven** — every boot in the archive predates the change. Until a capture shows otherwise,
+`UNAOS.LOG` remains the recovery path for a boot-blind head.
+
+Two claims about it are commonly overstated and are wrong:
+
+* **It is not "the only record for boots where FTDI never comes up".** `ftdi=none` in a `UNAOS.LOG` copy
+  is a *snapshot*, not a verdict. The `BPACE` ledger prints repeatedly, and the early prints (`n=22`,
+  `n=24`) are emitted before the console opens, so they read `ftdi=none` by definition. The same boots'
+  serial shows the later prints carrying the real figure — s67 `ftdi=21743ms`, s68 `ftdi=21425ms`, s70's
+  three boots `29472ms` / `22126ms` / `20390ms`. FTDI came up in **every** boot in the archive; it came up
+  *late*. The recorder's ring is simply full before the ledger line that would have said so. The honest
+  basis for keeping this channel is narrower and sufficient: *it is the only record of the pre-console
+  head on boots whose pre-console volume overflowed the mirror.*
+* **Its coverage is not the whole boot.** Every reserve-era copy reports exactly `65536 captured byte(s)`
+  — i.e. the ring is **always** full, on every boot, and always stops. It covers `t=0` forward to roughly
+  **8–22 s** depending on how long that boot took to reach the GUI (the `BPACE total gui=` figures inside
+  the rings run 7828 ms to 21575 ms), and nothing after. It is a boot-head channel, not a session log.
+
+Finally: **the archive offers no before/after on a pre-2026-07-21 state.** The earliest saved copy is
+`capture/rmbp-r23s6/UNAOS.LOG.prior-boot` (2026-07-22, 29,025 bytes — pre-reservation, with no end-of-log
+marker); every other copy is from 2026-08-02 or later. Any question of the form "what did this line read
+before the regression landed?" cannot be answered from this channel.
+
 ## aarch64
 
 The PL011/Tegra path did **not** share the drop defect: its `_print` used a blocking `SERIAL_PORT.lock()`,
