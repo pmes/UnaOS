@@ -33,7 +33,7 @@
 //! ROOT-PORT only this arc (the hub-downstream walk is HID-only); FTDI behind a hub is a future arc.
 
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
 
 /// FT232 identity as emulated by QEMU `usb-serial` (and the real FT232R cable).
@@ -62,9 +62,35 @@ pub const FTDI_BAUD_115200: u16 = 0x001A;
 /// stop = 0, bits 7:0 data = 8).
 pub const FTDI_DATA_8N1: u16 = 0x0008;
 
-/// Boot-capture ring capacity. 64 KiB comfortably holds the whole pre-FTDI boot log so that when
-/// the console comes up mid-boot the entire early log replays out the cable.
-const CAP: usize = 64 * 1024;
+/// Boot-capture ring capacity, so that when the console comes up mid-boot the entire early log
+/// replays out the cable.
+///
+/// **256 KiB, measured — not guessed.** The 64 KiB this started at stopped being enough, and the
+/// bench captures say so with an exact number: `drain_ftdi`'s
+/// `:: U2.5: FTDI TX mirror -> PASS (N boot bytes replayed) ::` pegged at 65731 — i.e. `CAP` + 195 —
+/// on five of the six boots in `capture/rmbp-gr15-s70` and `capture/rmbp-s66-cand444`. A replay total
+/// that EXCEEDS the ring can only mean the ring was already full when the console came up, i.e.
+/// drop-oldest had eaten the head of the boot. The one boot that came in under (57598) is also the
+/// only one whose capture still begins at `:: x86 fb-wc: retyped … ::`; every saturated boot begins
+/// mid-line, tens of KiB later, with both `fb-wc` (the framebuffer's memory type — the line a panel
+/// regression would have been convicted by) and `:: X86_64 Memory Init ::` gone.
+///
+/// The console does not come up until ~28.9 s (`ftdi:console-up`), so 4x is headroom against the
+/// pre-console log growing further, not against the present measurement.
+///
+/// Cost: 256 KiB of `.bss`. It is a zero-initialised `static`, so it adds nothing to either kernel
+/// image (`.bss (NOLOAD)` in `pi-baremetal.ld`, NOBITS in the x86 ELF) and nothing to the allocator,
+/// which does not exist yet when the first `_print` reaches [`mirror`].
+///
+/// It does NOT cost 4x the replay time. The ring only ever holds what the boot actually printed, so
+/// the replay is (real pre-console volume) / 11.5 KB/s at 115200 baud; raising `CAP` lengthens it only
+/// by the bytes currently being thrown away. The worst case is bounded and worth stating plainly: a
+/// boot that genuinely fills all 256 KiB spends ~23 s draining it out the cable (against ~5.7 s for a
+/// full 64 KiB today), and `drain_ftdi` owns the main loop for that stretch. Per-transfer risk is
+/// unchanged — more 512-byte bulk-OUTs, each with the same budget the bench measures at
+/// `:: FTDI: tx pump budget=5387698040 used=91103400 … result=OK ::`, ~59x headroom, and no capture in
+/// the tree has ever logged `FTDI TX disabled`.
+const CAP: usize = 256 * 1024;
 
 /// A fixed, heap-free circular byte buffer. The very first `_print`s predate the allocator, so the
 /// ring must be a `static` with an inline array — never `Vec`. Drop-oldest on overflow.
@@ -127,9 +153,31 @@ static STAGE: crate::serial_ring::LineRing<64, 240> = crate::serial_ring::LineRi
 /// reader sees the wire and never sees the cable.
 static UNANNOUNCED: AtomicU32 = AtomicU32::new(0);
 
+/// CAPWIT — whether the capture still owes the wire its opening integrity verdict. Spent on the first
+/// drain after the console goes live, which is the first moment anything can be said out loud at all.
+static VERDICT_DUE: AtomicBool = AtomicBool::new(true);
+
+/// CAPWIT — ring-overflow BYTES already announced on the cable.
+///
+/// Deliberately distinct from [`UNANNOUNCED`], which counts whole LINES lost to lock contention. These
+/// are different failures with different fixes: contention loses a line while the ring has room,
+/// overflow loses the head of the boot because the ring ran out of it. Folding them together is how a
+/// full ring would get to hide behind a quiet mutex.
+static ANNOUNCED_DROPS: AtomicU64 = AtomicU64::new(0);
+
 /// Lines staged for the cable but not yet copied into the capture ring.
 pub fn staged_in_flight() -> u64 {
     STAGE.in_flight()
+}
+
+/// Bytes the capture ring has evicted (oldest-first) because it was full — i.e. how much of the boot
+/// log the cable can no longer replay.
+///
+/// `None` means the ring was busy and the count could not be read. That is NOT the same as zero and is
+/// not reported as zero: a drop counter whose contended path reads as "nothing was lost" is an
+/// instrument that cannot falsify the thing it exists to catch.
+pub fn dropped_bytes() -> Option<u64> {
+    RING.try_lock().map(|r| r.dropped)
 }
 
 /// Append a formatted `_print` to the boot-capture ring.
@@ -220,6 +268,75 @@ fn drain_staged_into(ring: &mut Ring) {
     }
 }
 
+/// CAPWIT — write the capture's own integrity verdict into the cable's TX staging buffer.
+///
+/// Returns `Some(len)` when a verdict line was written to `dst` (the caller pushes exactly those bytes
+/// and calls again), `None` when nothing is owed or it would not fit.
+///
+/// **The line goes straight into `dst` and never into the ring.** That is not a stylistic choice. This
+/// runs with `RING` held, so a `serial_println!` here would re-enter [`mirror`] and, on the panic path,
+/// `_print`'s other sinks — and worse, a verdict pushed into a FULL ring would evict the very early
+/// bytes it is reporting on, so the act of reporting the loss would enlarge it. Writing into the DMA
+/// staging buffer costs the ring nothing and puts the verdict AHEAD of the replay it describes.
+///
+/// No state is consumed unless the line is actually delivered, so a caller with a short `max` simply
+/// retries on the next drain rather than silently burning the one announcement.
+///
+/// # Safety
+/// `dst` must point to a writable region of at least `max` bytes.
+unsafe fn emit_verdict(ring: &Ring, dst: *mut u8, max: usize) -> Option<usize> {
+    let dropped = ring.dropped;
+    let first = VERDICT_DUE.load(Ordering::Relaxed);
+    let announced = ANNOUNCED_DROPS.load(Ordering::Relaxed);
+    if !first && dropped <= announced {
+        return None;
+    }
+
+    let mut buf = [0u8; 192];
+    let mut w = crate::serial_ring::BoundedWriter {
+        buf: buf.as_mut_ptr(),
+        cap: buf.len(),
+        n: 0,
+        truncated: false,
+    };
+    // Three readings, and the instrument can produce all three. A witness that can only report success
+    // is not a witness; this one names the failure and the number, and says so on the wire.
+    let _ = if first && dropped == 0 {
+        fmt::Write::write_fmt(
+            &mut w,
+            format_args!(
+                "\n:: FTDI-CAP: early-boot capture INTACT -- 0 byte(s) dropped ({} of {} buffered) ::\n",
+                ring.len, CAP
+            ),
+        )
+    } else if first {
+        fmt::Write::write_fmt(
+            &mut w,
+            format_args!(
+                "\n:: FTDI-CAP: early-boot capture TRUNCATED -- {} byte(s) LOST off the head before this line (ring cap {}, {} survived) ::\n",
+                dropped, CAP, ring.len
+            ),
+        )
+    } else {
+        fmt::Write::write_fmt(
+            &mut w,
+            format_args!(
+                "\n:: FTDI-CAP: capture ring OVERFLOWED -- {} further byte(s) lost ({} total, ring cap {}) ::\n",
+                dropped - announced, dropped, CAP
+            ),
+        )
+    };
+
+    let len = w.n;
+    if len == 0 || len > max {
+        return None;
+    }
+    core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, len);
+    VERDICT_DUE.store(false, Ordering::Relaxed);
+    ANNOUNCED_DROPS.store(dropped, Ordering::Relaxed);
+    Some(len)
+}
+
 /// Whether the FTDI TX sink is live (console up + not disabled).
 #[inline]
 pub fn is_live() -> bool {
@@ -249,6 +366,13 @@ pub unsafe fn drain_into(dst: *mut u8, max: usize) -> usize {
     // push out the cable, so a staged line reaches the wire on this pass rather than waiting for the
     // next print. A quiet machine that stopped printing must not leave its last lines in the ring.
     drain_staged_into(&mut ring);
+    // CAPWIT: the capture states its own integrity BEFORE the replay it describes. A reader who is
+    // handed a truncated boot log must be TOLD SO, on the wire, with the byte count — not left to
+    // notice that a line they were not looking for is missing. That inference is what failed here for
+    // two weeks, and the cable is the only channel an attended metal sitting has.
+    if let Some(n) = emit_verdict(&ring, dst, max) {
+        return n;
+    }
     let n = max.min(ring.len);
     for i in 0..n {
         let idx = (ring.head + i) % CAP;

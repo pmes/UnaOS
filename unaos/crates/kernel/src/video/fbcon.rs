@@ -86,10 +86,26 @@ const CELL_H: usize = 8;
 
 /// PANEL-CONSOLE glyph scale. The 2012 rMBP panel is 2880 px across ~286 mm (~0.1 mm/px), so an
 /// unscaled 8x8 cell is ~0.8 mm — metal (sitting #30) confirmed marks that small are simply not
-/// visible to the naked eye at bench distance. 4x gives a 32x32 px cell (~3.2 mm) with a 0.4 mm
-/// stroke — 90 columns x 56 rows (metal s34 verdict on 6x: "great, slightly large").
+/// visible to the naked eye at bench distance. 6x was tried and judged "great, slightly large"
+/// (metal s34); 4x — a 32x32 px cell, ~3.2 mm, 0.4 mm stroke — was then CONFIRMED legible on glass.
+///
+/// WHY IT IS NOW 2. Legibility stopped being the only constraint once the console became a WINDOW.
+/// The routed surface is 1312x736, so a 32x32 cell buys 41 columns by 23 rows = 943 characters —
+/// fewer than six of the compositor's own 110-200 character witness lines, i.e. the whole console is
+/// overwritten every ~6 printed lines. And a line that STRADDLES the row-ring wrap dirties
+/// `{row 22, row 0}`, over which `mark_rows`' min/max bounding box IS the whole surface: at 23 rows
+/// the console saturates its own damage band by construction, roughly every 23rd newline.
+///
+/// A 16x16 cell gives 82x46 = 3772 characters — 4x the capacity and half the wrap rate — and costs
+/// LESS to paint, not more: `draw_glyph` pokes `scale²` pixels per set font bit, so the same text is
+/// a quarter of the pixel work and each line's damage band is half as tall.
+///
+/// LEGIBILITY AT 2x IS UNPROVEN. 8x8 is known invisible and 32x32 is known good; 16x16 (~1.6 mm
+/// cell, ~0.2 mm stroke) has never been on this glass. That is a bench judgement, not a code one,
+/// and this constant is the single knob that reverses it — everything downstream (cell size, grid,
+/// window extent, damage rows, the panic re-derive) is computed from it, never assumed.
 #[cfg(target_arch = "x86_64")]
-const PANEL_SCALE: usize = 4;
+const PANEL_SCALE: usize = 2;
 
 const FG_DEFAULT: u32 = 0x00C0_C0C0; // light grey text
 const BG_DEFAULT: u32 = 0x0000_0000; // black background
@@ -519,6 +535,82 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
     crate::arch::memory::set_framebuffer_wc(fb_addr, fb_len as u64);
 }
 
+/// PANEL-QUIET (x86, PANEL-CONSOLE lane only) — the tags whose lines are written for `serial.log`
+/// and for nobody standing at the bench.
+///
+/// Two costs, and the second is the one that bites. The obvious one is capacity: the routed console
+/// holds 943 characters at `PANEL_SCALE = 4` and 3772 at 2, and one `[wc-h] rollup` line is several
+/// of its rows either way. The other is RE-ENTRANCY. These lines are emitted from inside the very
+/// composite that a console present asked for, so each one mirrors back into the console surface,
+/// gets merged into [`PEND`] by [`route_present_banded`], is then declined by the [`ROUTE_BUSY`]
+/// guard, and is carried by the NEXT present — widening a band that had just been made narrow. The
+/// compositor's own telemetry was inflating the damage it was reporting (see [`ROUTE_BUSY`]).
+///
+/// WHAT IS EXCLUDED, AND WHY EACH ONE. `[wc-g]` (per-present coherency probe), `[wc-h]` (per-present
+/// staging cost) and `[wc-d]` (per-window surface verify) all fire from within a present — they ARE
+/// the re-entrant family. `[wcn]` (window-census rollup) and `[schedx86]` (render-queue depth) are
+/// periodic telemetry with no on-glass reader. All five are serial-log instruments with spec
+/// REQUIREs behind them, and the wire keeps every one of them byte for byte: this policy governs the
+/// GLASS only, and the FTDI ring, `UNAOS.LOG` and the `tste` ring all tap upstream of here, in
+/// `arch::serial::_print`.
+///
+/// WHAT IS DELIBERATELY NOT EXCLUDED: `[wc-x]` — the console's own route / first-paint / decline
+/// announcements, which are exactly what a bench reader is looking FOR; `[fbcon]` and `[mirror]`,
+/// which announce mirror loss; boot milestones; every untagged line; and PANIC text.
+#[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
+const PANEL_MUTE_TAGS: [&[u8]; 5] = [b"[wc-g]", b"[wc-h]", b"[wc-d]", b"[wcn]", b"[schedx86]"];
+
+/// Bytes of a line's head the sniff needs in order to decide — the longest [`PANEL_MUTE_TAGS`] entry.
+#[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
+const TAG_SNIFF: usize = 10;
+
+/// PANEL-QUIET — capture just enough of a line's HEAD to test it against [`PANEL_MUTE_TAGS`].
+///
+/// A `fmt::Write` sink rather than a string compare, because `_print` is handed
+/// `core::fmt::Arguments` and the tag lives inside the format string's leading literal piece, which
+/// is not materialised anywhere. Nothing is allocated and nothing is retained — the sink is
+/// [`TAG_SNIFF`] bytes of stack — and it returns `Err` the instant it is full, which ABORTS the
+/// format walk instead of rendering the whole line a second time. Re-walking a prefix of `args` is
+/// free of consequence: `Arguments` is `Copy` and `_print` already hands the same value to two
+/// sinks.
+#[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
+struct TagSniff {
+    buf: [u8; TAG_SNIFF],
+    n: usize,
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
+impl TagSniff {
+    fn new() -> Self {
+        TagSniff { buf: [0u8; TAG_SNIFF], n: 0 }
+    }
+
+    /// True when the head is a bracketed tag on the mute list. A line that does not START with `[`
+    /// can never match, so the common case costs one byte compare.
+    fn muted(&self) -> bool {
+        let head = &self.buf[..self.n];
+        if head.first() != Some(&b'[') {
+            return false;
+        }
+        PANEL_MUTE_TAGS.iter().any(|t| head.starts_with(t))
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
+impl core::fmt::Write for TagSniff {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.n >= TAG_SNIFF {
+                // Decided. `Err` stops `write_fmt` walking the rest of the line.
+                return Err(core::fmt::Error);
+            }
+            self.buf[self.n] = b;
+            self.n += 1;
+        }
+        Ok(())
+    }
+}
+
 /// Mirror formatted output to the framebuffer (called from the serial `_print`). Lock-free of
 /// deadlock: interrupts are masked and the lock is `try_lock`ed, so a contended line just skips
 /// the screen (serial still has it) rather than spinning.
@@ -544,6 +636,30 @@ pub fn _print(args: core::fmt::Arguments) {
     if !PANIC_MIRROR.load(Ordering::Relaxed) && !PANEL_CONSOLE.load(Ordering::Relaxed) {
         tap.suppress();
         return;
+    }
+    // PANEL-QUIET (x86): the panel console is a bench-eye channel, not a second copy of the serial
+    // log. Once PANEL-CONSOLE has armed the mirror, the compositor's and scheduler's own telemetry
+    // is kept off the GLASS — see `PANEL_MUTE_TAGS` for the list and for the re-entrancy that makes
+    // this a damage fix and not just a legibility one.
+    //
+    // THE PANIC OVERRIDE IS PRESERVED TWICE OVER, and the two are independent on purpose (the same
+    // belt-and-braces `draw_fb` uses). Belt: the gate demands `PANIC_MIRROR` be CLEAR, so from
+    // `panic_screen` onwards not one line can be muted, whatever it says. Braces: the test is a
+    // POSITIVE match against a fixed tag list, so panic text — which carries none of those tags —
+    // could not be muted even if it reached here before the flag flipped.
+    //
+    // COUNTED, NEVER VANISHED: a muted line charges the tap `suppressed`, the ledger's term for
+    // "declined by policy" as opposed to lost, so `submitted == absorbed + dropped + suppressed`
+    // still holds exactly. This is also why the charge is here and not deeper: every exit from this
+    // function charges exactly once.
+    #[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
+    if PANEL_CONSOLE.load(Ordering::Relaxed) && !PANIC_MIRROR.load(Ordering::Relaxed) {
+        let mut sniff = TagSniff::new();
+        let _ = core::fmt::Write::write_fmt(&mut sniff, args);
+        if sniff.muted() {
+            tap.suppress();
+            return;
+        }
     }
     // PANEL-DEFER (x86): mirror through the split layout/paint path when the draw target is VRAM
     // (no cached-RAM shadow) and we are not on the panic path. See `panel_mirror` for the invariant.
@@ -1301,8 +1417,8 @@ fn win_content_extent(pw: usize, ph: usize, cell_w: usize, cell_h: usize) -> (us
 /// `rows` grid; this call re-points the first at the window's surface and re-derives the second from
 /// the window's extent. `PANEL_SCALE` is untouched, so a glyph is the same size on glass it was —
 /// the window is composited at scale 1 (the surface is far too large for `wm`'s scale rule to
-/// magnify), so a surface pixel is a panel pixel and the console's own 4x cell is the whole of the
-/// magnification, exactly as before.
+/// magnify), so a surface pixel is a panel pixel and the console's own `PANEL_SCALE` cell is the
+/// whole of the magnification, exactly as before.
 ///
 /// ### Front-buffer discipline
 ///
