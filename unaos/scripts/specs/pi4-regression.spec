@@ -98,7 +98,10 @@ COMPLETE :: BANDY-RT:
 # ---    Promoting it to a REQUIRE is the open ruling.
 # ---    MAINTENANCE RULE, since the floor is now tight: a new fixture that prints `:: LABEL: … ->
 # ---    PASS ::` raises the measured count, and the floor must be raised with it in the same commit.
-COUNT 23 :: (?!ELF1:|EXEC1:|EXEC-UVUG:|SERWIT-2:)[A-Za-z0-9_-]+: .*-> PASS ::
+# ---    FLOOR 23 -> 25 (2026-08-04, same day): the ERET-SCRUB pair prints the doubly-framed
+# ---    fixture-verdict form, so the maintenance rule above applies — two new fixtures, floor +2,
+# ---    same landing. Measured on the eret branch gate run: 93/93 with both new lines present.
+COUNT 25 :: (?!ELF1:|EXEC1:|EXEC-UVUG:|SERWIT-2:)[A-Za-z0-9_-]+: .*-> PASS ::
 
 # --- scheduler capstone: all 6 sync primitives in one boot -------------------------
 COUNT 6 CAPSTONE \w+: PASS
