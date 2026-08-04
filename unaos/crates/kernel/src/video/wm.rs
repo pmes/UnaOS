@@ -2303,6 +2303,21 @@ fn composite_inner() -> CursorTail {
             wcn_note_below(rows[i].id);
             continue;
         }
+        // WC-D — the REFERENCE, taken BEFORE the blit. See `verify_reference` and the WCD-PRE section
+        // of `verify_window`'s ledger for why it cannot be taken any later: the read-back's reference
+        // used to be snapshotted from inside `verify_window`, which runs after `wcg::end` and
+        // `stage_flush`, and both of those PRINT. With the console routed into a window,
+        // `serial_println!` lands in that window's OWN surface and `route_present_banded` declines the
+        // present (the compositor is already inside `composite`), so the source legitimately gains
+        // pixels that are legitimately not on the panel yet — and the instrument read that mutation as
+        // corruption. The reference has to be the bytes `draw_window` consumed, so it is captured here.
+        //
+        // Before `wcg::begin`, not between it and `draw_window`: this reads the whole content rect
+        // (multiple megabytes for the console window), and inside WC-G's bracket that read would be
+        // charged to `[wc-g] us=` — manufacturing a `slow=yes` tear report out of this witness's own
+        // cost. WC-G's bracket must still contain the copy and nothing else.
+        #[cfg(feature = "witness")]
+        let wcd_ref = verify_reference(&fb, &rows[i], bands[i]);
         // WC-G — bracket the blit. `begin` must be the last thing before `draw_window` and `end` the
         // first thing after it: the `blit`/`after` checksums mean "the surface as the copy found it"
         // and "as the copy left it", and anything inserted between them widens the interval they
@@ -2334,12 +2349,20 @@ fn composite_inner() -> CursorTail {
                 CUR12_EXCL_PROBE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
+        // WCD-PRE — `wcd_ref.is_some()` is now part of the test, and it has to be. The VERIFIED latch
+        // used to be claimed AFTER this block, so on the verifying pass the `== 0` arm was still true
+        // and the sprite was correctly withheld from the rows WC-D was about to read back. Moving the
+        // reference (and with it the claim) ahead of the blit inverts that read: the bit is already set
+        // by the time we get here. The armed reference is the same fact, asked of the pass that owns
+        // the read-back rather than of the latch.
         #[cfg(feature = "witness")]
         {
             let r = &rows[i];
             if !r.compat && r.presented && r.id < 32 {
                 let bit = 1u32 << r.id;
-                if VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit == 0 {
+                if wcd_ref.is_some()
+                    || VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit == 0
+                {
                     may_overlay = false;
                     if plan.is_some() {
                         CUR12_EXCL_UNVERIFIED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2382,15 +2405,14 @@ fn composite_inner() -> CursorTail {
         super::wcg::stage_flush(rows[i].id);
         // WC-D — verify this window's blit against the scan-out, once per window id, from inside the pass
         // that drew it (the only place both the source surface and the destination rows are known).
+        //
+        // The eligibility test and the one-shot latch moved up to `verify_reference`; what is left here
+        // is the read-back itself, which must stay AFTER `stage_flush` so `[wc-d]` keeps its place in
+        // the log behind `[wc-g]`/`[wc-h]`. That those two printed into this window's surface in the
+        // meantime no longer matters: the reference was frozen before the blit.
         #[cfg(feature = "witness")]
-        {
-            let r = &rows[i];
-            if !r.compat && r.presented && r.id < 32 {
-                let bit = 1u32 << r.id;
-                if VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0 {
-                    verify_window(&fb, r);
-                }
-            }
+        if let Some(vr) = wcd_ref {
+            verify_window(&fb, &rows[i], vr);
         }
         // WC-N — pixels on glass for this window id. The only writer of `comp`.
         #[cfg(feature = "witness")]
@@ -2561,19 +2583,14 @@ fn tail_of(disturbed: bool, session: bool, deferred: bool) -> CursorTail {
 /// repaints these rows (a neighbour's present growing the dirty set, a desktop flush, a cursor repaint),
 /// and the one-shot latch is claimed by whichever reaches it first.
 ///
-/// Two corrections, doing two different jobs:
-/// 1. **One source read.** The verdict used to take three independent reads of a mutable surface (pass 1,
-///    post-`IVAC` pass 2, and the checksum inside the print), so the two counts could differ with no cache
-///    story at all. The source rect is now snapshotted ONCE and both passes compare against that single
-///    `want`-stream. The two-pass design is a claim about the DESTINATION's cache state and never wanted the
-///    source re-read; with the snapshot, a surviving `bad_cache != bad_ram` is again a real one.
-/// 2. **A liveness bracket.** The snapshot makes the passes self-consistent but cannot make a mid-flight
-///    snapshot equal to what was blitted a moment earlier, so it does not make the verdict *earned*. The
-///    surface checksum is therefore read before the snapshot and again after the passes; unequal means user
-///    repainted during the verdict, and the verdict is emitted as a third, distinct label:
-///    `-> LIVE (unverifiable)`. That is reported instead of PASS *and* instead of FAIL, because a moving
-///    reference earns neither. It is never counted red: a live surface is a fact about the app, not a
-///    defect in the compositor. The counts stay printed so the disagreement stays inspectable.
+/// The first correction was **one source read**: the verdict used to take three independent reads of a
+/// mutable surface (pass 1, post-`IVAC` pass 2, and the checksum inside the print), so the two counts could
+/// differ with no cache story at all. The source rect is snapshotted ONCE and both passes compare against
+/// that single `want`-stream. The two-pass design is a claim about the DESTINATION's cache state and never
+/// wanted the source re-read; with the snapshot, a surviving `bad_cache != bad_ram` is again a real one.
+///
+/// The second was a **liveness bracket** around the snapshot. WCD-PRE below replaces it; see there for why a
+/// whole-surface bracket could not survive a routed console, and what took its place.
 ///
 /// LIVE counts as neither PASS nor FAIL; a REQUIRE asserting the LIVE line for a threaded app would be a
 /// deliberate spec change neither seat has made.
@@ -2581,68 +2598,102 @@ fn tail_of(disturbed: bool, session: bool, deferred: bool) -> CursorTail {
 /// The owner's-own-present gate was deliberately NOT taken: owner presents are not quiescent either with
 /// free-running workers, and re-gating the one-shot VERIFIED latch would move clean verdicts.
 ///
-/// A quiescent surface brackets equal and snapshots to exactly the bytes it would have re-read, so
-/// single-threaded verdicts are byte-identical to before.
+/// ### WCD-PRE — the reference is taken BEFORE the blit (x86, two boots of false FAIL)
+/// The snapshot above fixed the passes' disagreement with each OTHER but left the reference itself taken
+/// from the wrong INSTANT. `verify_window` runs after `draw_window`, after `wcg::end` and after
+/// `stage_flush`, and the last two PRINT. Once the console is routed into a window, `serial_println!` fans
+/// out through `fbcon::_print` into that window's own surface; `route_present_banded` merges the glyphs into
+/// the pending band and then declines the present, because the compositor is already inside `composite` and
+/// the re-entry guard refuses (the hazard is written out verbatim at the head of `fbcon`'s routing). So
+/// between the blit and the read-back the SOURCE legitimately gains pixels that are legitimately NOT on the
+/// panel yet — and the witness, snapshotting there, adopted them as its reference and reported the
+/// difference as corruption:
+///
+/// ```text
+/// [wc-d] verify win=1 surf=1312x736 ... checked=965632 bad_cache=74544 bad_ram=74544
+///        nonzero=33200 first=(788,553) got=0x000000 want=0xc0c0c0 -> FAIL
+/// ```
+///
+/// Three things convict the instrument rather than the compositor. `0xc0c0c0` is `fbcon`'s `FG_DEFAULT` —
+/// console glyph ink, not chrome. `nonzero` was byte-identical on every PASS and every FAIL across both
+/// captures, so the DESTINATION never moved; only the reference did. And `[wc-g]`, two lines earlier, ran the
+/// SAME comparison from a pre-blit reference and printed `fbbad=0/965632`.
+///
+/// The reference is therefore captured by [`verify_reference`] from the composite loop, before the blit and
+/// before `wcg::begin` — the bytes `draw_window` actually consumed. The one-shot latch moves with it, since
+/// whoever takes the reference is who owes the verdict.
+///
+/// That relocation also retires the whole-surface liveness bracket, which could not survive here: its closing
+/// read would have to happen after the blit, every position after the blit is either inside WC-G's timed
+/// bracket (where a multi-megabyte source read would be charged to `[wc-g] us=`) or after the prints (where
+/// the console's surface has moved BY CONSTRUCTION), and a bracket that reports `-> LIVE` on every console
+/// verdict is an instrument that cannot fail. Liveness is now asked PER PIXEL and only of pixels that already
+/// disagree: a mismatching destination pixel whose SOURCE no longer holds the value in `want` had its
+/// reference move under it and is counted `moved=` instead of being charged to the blit. A clean blit never
+/// reaches that re-read at all, so the common path pays nothing for it, and the attribution is finer than the
+/// whole-verdict veto it replaces — one live pixel no longer vetoes a million still ones. The residual hole is
+/// named honestly: a genuine blit defect at a pixel whose source ALSO moved afterwards is attributed to
+/// liveness and not charged. The old bracket had the same hole and a coarser one, since any moving pixel
+/// vetoed the whole rect.
+///
+/// ### WCD-BAND — a banded present never promised the whole box
+/// `composite` hands `draw_window` the FBCON-DMG band the damage was declared over, and the staged path then
+/// repaints only those rows. Asserting whole-surface equality after such a present is unsound quite apart from
+/// the print hazard: the rows outside the band hold whatever the previous present left, and the source has
+/// moved on since. The verified rect is therefore CLIPPED to the band, and `band=` on the wire says which rows
+/// the verdict covers.
+///
+/// Clipping rather than waiting for a whole-box present, deliberately. Deferring the one-shot would make it
+/// hostage to a caller that may never issue one — the routed console bands every present it makes after the
+/// first, so the verdict would simply never be emitted and the spec's REQUIRE would fail with no line at all
+/// to say why, which is the failure mode the `-> SKIP` discipline exists to prevent. The clipped rect is
+/// smaller but every pixel in it is earned: the band is the region this pass promised to repaint, and BOTH
+/// paths repaint it (the direct fallback ignores the band and paints the whole box, a superset).
+///
+/// A band that clips empty declines the pass WITHOUT claiming the latch, unlike the geometry `-> SKIP`s. An
+/// empty band is a property of one present, not of the row, so burning a one-shot on it would cost the window
+/// its only verdict over a transient; a degenerate row will still be degenerate next pass, so claiming and
+/// naming it is right there.
+///
+/// ### WCD-RAMINDEP — what `bad_ram` is worth on x86
+/// The two-pass design rests on a BARE invalidate between the passes, and `aarch64` has one (`DC IVAC`).
+/// x86_64 does not: `CLFLUSH`/`CLFLUSHOPT` write dirty lines back before invalidating them — the exact
+/// `CIVAC` mistake this ledger already rejects, an instrument healing the defect it claims to measure — and
+/// `INVD` discards every line in the cache, which is not a diagnostic, it is a crash. So the invalidate is
+/// `aarch64`-only, and on x86 the second pass re-reads the same destination through the same cache state as
+/// the first.
+///
+/// Printing two numbers that are equal by construction is what invited the misreading above, so the arch is
+/// now on the wire as `ram_indep=yes|no`. The second pass is still RUN on x86 rather than faked, because
+/// there it is not vacuous — it is a STABILITY re-read of the destination: `bad_cache != bad_ram` with
+/// `ram_indep=no` means something wrote the panel under the verdict. What it is not, and now says it is not,
+/// is an independent statement about whether the pixels reached the memory the scan-out reads.
 #[cfg(feature = "witness")]
-fn verify_window(fb: &super::FrameBuffer, r: &Window) {
+fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
     let info = fb.info();
-    if r.surf == 0 || r.scale == 0 || r.stride < 4 || r.x >= info.width || r.y >= info.height {
-        serial_println!("[wc-d] verify win={} -> SKIP (degenerate row/geometry)", r.id);
-        return;
-    }
-    // The same bounds `draw_window` blitted under — verify exactly what was drawn, never more.
-    let cols = (info.width - r.x).div_ceil(r.scale).min(r.w).min(r.stride / 4);
-    let rows = (info.height - r.y).div_ceil(r.scale).min(r.h).min(r.surf_len / r.stride);
-    if cols == 0 || rows == 0 {
-        serial_println!("[wc-d] verify win={} -> SKIP (no visible content rect)", r.id);
-        return;
-    }
+    let VerifyRef { row0, row1, cols, banded, cksum_pre, want } = vr;
 
-    // WCD-LIVE, opening bracket. The snapshot below makes the two passes AGREE with each other, but it
-    // cannot make a mid-flight snapshot equal to what `draw_window` actually blitted — so it removes the
-    // instrument's self-contradiction without making the verdict earned. This checksum, read here and again
-    // after the passes, is what decides whether it WAS earned: unequal means user repainted the surface
-    // during the verdict, so the reference moved and neither PASS nor FAIL is a statement about the blit.
-    let cksum_pre = surface_checksum(r);
-
-    // WCD-LIVE — read the SOURCE exactly ONCE, into a snapshot both passes share. Before this, a verdict
-    // took three independent reads of a user-mutable surface (pass 1, post-IVAC pass 2, and the checksum in
-    // the print), so `bad_cache` and `bad_ram` could differ purely because they had read different bytes —
-    // no cache story required. The two-pass design is a claim about the DESTINATION's cache state; nothing
-    // in it wants the SOURCE re-read. One `want`-stream restores that: any surviving `bad_cache != bad_ram`
-    // is now a real statement about scan-out memory. `cols * rows * 4` bytes — 64 KiB at the 128x128
-    // fixture — paid once per window id under `witness`.
-    let mut want_buf: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
-    if want_buf.try_reserve_exact(rows * cols).is_err() {
-        serial_println!(
-            "[wc-d] verify win={} -> SKIP (no memory for {}x{} source snapshot)",
-            r.id, cols, rows
-        );
-        return;
-    }
-    {
-        let surf = r.surf as *const u8;
-        for row in 0..rows {
-            let row_base = row * r.stride;
-            for col in 0..cols {
-                // SAFETY: identical bound to `draw_window`'s read — `row < surf_len / stride` and
-                // `col < stride / 4`, so `row_base + col * 4 + 4 <= surf_len`.
-                want_buf.push(
-                    unsafe { core::ptr::read_unaligned(surf.add(row_base + col * 4) as *const u32) }
-                        & 0x00FF_FFFF,
-                );
-            }
-        }
-    }
+    // WCD-PRE — the per-pixel liveness question, asked only of pixels that already disagree. `want` was
+    // frozen before the blit; if the SOURCE no longer holds that value, this pixel's reference moved
+    // between the snapshot and now (a sibling app thread, or — on the routed console — `fbcon::_print`
+    // fanning `[wc-g]`/`[wc-h]` into this very surface), and the disagreement is not the blit's to answer.
+    let source_px = |row: usize, col: usize| -> u32 {
+        // SAFETY: `verify_reference` established the same bound `draw_window` reads under —
+        // `row < surf_len / stride` and `col < stride / 4`, so `row * stride + col * 4 + 4 <= surf_len`.
+        let p = (r.surf as *const u8).wrapping_add(row * r.stride + col * 4) as *const u32;
+        let v: u32 = unsafe { core::ptr::read_unaligned(p) };
+        v & 0x00FF_FFFF
+    };
 
     let pass = |fb: &super::FrameBuffer| {
         let mut checked = 0usize;
         let mut bad = 0usize;
+        let mut moved = 0usize;
         let mut nonzero = 0usize;
         let mut first = (0usize, 0usize, 0u32, 0u32);
-        for row in 0..rows {
+        for row in row0..row1 {
             for col in 0..cols {
-                let want = want_buf[row * cols + col];
+                let want = want[(row - row0) * cols + col];
                 for sy in 0..r.scale {
                     let dy = r.y + row * r.scale + sy;
                     for sx in 0..r.scale {
@@ -2657,26 +2708,35 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
                             nonzero += 1;
                         }
                         if got != want {
-                            if bad == 0 {
-                                first = (dx, dy, got, want);
+                            // WCD-PRE — attribute before charging. The re-read costs nothing on a clean
+                            // blit, which never gets here.
+                            if source_px(row, col) != want {
+                                moved += 1;
+                            } else {
+                                if bad == 0 {
+                                    first = (dx, dy, got, want);
+                                }
+                                bad += 1;
                             }
-                            bad += 1;
                         }
                     }
                 }
             }
         }
-        (checked, bad, nonzero, first)
+        (checked, bad, moved, nonzero, first)
     };
 
-    let (checked, bad_cache, nonzero, first_cache) = pass(fb);
+    let (checked, bad_cache, moved_cache, nonzero, first_cache) = pass(fb);
 
     // Discard, never clean — see the doc comment. Bare `IVAC` is what makes `bad_ram` able to fail.
+    // WCD-BAND: the extent follows the verified rows, not the whole window, so a banded verdict
+    // invalidates only the scanlines it is about to re-read.
+    // WCD-RAMINDEP: `aarch64` only, and x86 says so on the wire rather than pretending.
     #[cfg(target_arch = "aarch64")]
     {
         let row_bytes = info.stride * info.bytes_per_pixel;
-        let y0 = r.y;
-        let y1 = (r.y + rows * r.scale).min(info.height);
+        let y0 = (r.y + row0 * r.scale).min(info.height);
+        let y1 = (r.y + row1 * r.scale).min(info.height);
         if y1 > y0 {
             crate::arch::cache::invalidate_range(
                 fb.base_addr() + y0 * row_bytes,
@@ -2684,37 +2744,45 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
             );
         }
     }
+    let ram_indep = cfg!(target_arch = "aarch64");
 
-    let (_, bad_ram, _, first_ram) = pass(fb);
+    let (_, bad_ram, moved_ram, _, first_ram) = pass(fb);
     // `cksum` is the `[wc-c]` FNV over the SOURCE slot, carried here so a verdict is content-aware: without
     // it a blank surface blitted faithfully onto a blank rect is a PASS indistinguishable from a verified
-    // crystal. `nonzero` is the same question asked of the DESTINATION. WCD-LIVE also makes it the closing
-    // bracket of the liveness check — the same number, read twice.
+    // crystal. `nonzero` is the same question asked of the DESTINATION. `cksum_pre` is the same FNV taken at
+    // reference time; the pair is now DIAGNOSTIC only — WCD-PRE explains why a whole-surface bracket cannot
+    // be a verdict input on a routed console — but it stays printed on the LIVE line, where the question
+    // "did the surface move at all" is exactly what the reader wants next.
     let cksum = surface_checksum(r);
-    let live = cksum != cksum_pre;
+    // The worse of the two passes: a pixel whose reference moved during EITHER read-back is unadjudicated,
+    // and taking the max keeps a single moving pixel from being averaged out of the line.
+    let moved = moved_cache.max(moved_ram);
     let ok = bad_cache == 0 && bad_ram == 0;
+    let live = ok && moved > 0;
     let first = if bad_cache > 0 { first_cache } else { first_ram };
+    let band = BandFmt(if banded { Some((row0, row1)) } else { None });
     if live {
-        // WCD-LIVE — the reference moved, so NEITHER verdict was earned: a `FAIL` here would accuse the
-        // compositor of a mismatch the witness manufactured, and a `PASS` would be luck. Report the fact
-        // instead, with the counts kept visible so the disagreement stays readable. Distinct label, never
-        // red: a live surface is a property of a multi-threaded app, not a defect.
+        // WCD-PRE — every disagreement was explained by a reference that moved, so nothing is chargeable
+        // to the blit, but the rect was not fully adjudicated either. Report the fact instead, with the
+        // counts kept visible so the disagreement stays readable. Distinct label, never red: a live
+        // surface is a property of a multi-threaded app (or of the console printing into its own window),
+        // not a defect in the compositor.
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} scale={}x at ({},{}) panel={}x{} checked={} bad_cache={} bad_ram={} nonzero={} cksum={:#018x} cksum_pre={:#018x} -> LIVE (unverifiable)",
-            r.id, r.w, r.h, r.scale, r.x, r.y, info.width, info.height,
-            checked, bad_cache, bad_ram, nonzero, cksum, cksum_pre
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} cksum_pre={:#018x} -> LIVE (unverifiable)",
+            r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
+            checked, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum, cksum_pre
         );
     } else if ok {
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} scale={}x at ({},{}) panel={}x{} checked={} bad_cache=0 bad_ram=0 nonzero={} cksum={:#018x} first=none -> PASS",
-            r.id, r.w, r.h, r.scale, r.x, r.y, info.width, info.height,
-            checked, nonzero, cksum
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={} bad_cache=0 bad_ram=0 ram_indep={} moved={} nonzero={} cksum={:#018x} first=none -> PASS",
+            r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
+            checked, yn(ram_indep), moved, nonzero, cksum
         );
     } else {
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} scale={}x at ({},{}) panel={}x{} checked={} bad_cache={} bad_ram={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
-            r.id, r.w, r.h, r.scale, r.x, r.y, info.width, info.height,
-            checked, bad_cache, bad_ram, nonzero, cksum,
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
+            r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
+            checked, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum,
             first.0, first.1, first.2, first.3
         );
     }
@@ -2735,12 +2803,158 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
     draw_window(fb, r, focus != 0 && focus == r.owner_asid, None, false, false, None);
 }
 
+/// WC-D — the reference half of the verdict: the SOURCE bytes, the rect they cover, and the surface
+/// checksum at the instant they were read. Built by [`verify_reference`] before the blit and consumed by
+/// [`verify_window`] after it; holding the two halves in one value is what makes it impossible to take the
+/// reference from the wrong side of `draw_window` again (WCD-PRE).
+#[cfg(feature = "witness")]
+struct VerifyRef {
+    /// First and one-past-last SOURCE row of the verified rect. `row1 - row0` is the whole visible content
+    /// height for a whole-box present and the FBCON-DMG band for a banded one (WCD-BAND).
+    row0: usize,
+    row1: usize,
+    /// Source columns per row. `want` is indexed `(row - row0) * cols + col`.
+    cols: usize,
+    /// Whether the present that armed this reference was banded — the `band=` field on the wire.
+    banded: bool,
+    /// `surface_checksum` at reference time, i.e. pre-blit. Diagnostic; see the note by `cksum` in
+    /// [`verify_window`] for why it is no longer a verdict input.
+    cksum_pre: u64,
+    /// The snapshot itself, `0x00FF_FFFF`-masked exactly as `draw_window`'s read masks.
+    want: alloc::vec::Vec<u32>,
+}
+
+/// WC-D — capture the read-back's reference, from the composite loop, BEFORE `draw_window` runs.
+///
+/// The eligibility test and the one-shot latch live here rather than at the read-back because whoever takes
+/// the reference is who owes the verdict: a second core reaching this window in the same instant must find
+/// the bit already claimed and decline, or two references would be taken and one verdict emitted from the
+/// wrong one. See WCD-PRE in [`verify_window`]'s ledger for why the reference cannot be taken any later, and
+/// WCD-BAND for why the rect is clipped.
+///
+/// ### Which failures burn the latch
+/// The `-> SKIP` discipline is unchanged: once the bit is claimed, EVERY path emits a line, so a gate whose
+/// REQUIRE fails always has a line saying why. The ordering below is what decides which failures are worth
+/// claiming for. A degenerate row (no surface, zero scale, off-panel origin, empty content rect) is a
+/// property of the ROW — it will still be degenerate next pass, so claiming and naming it is the honest
+/// move. An empty BAND is a property of one present, so it declines without claiming and waits for a present
+/// that has visible rows; burning a window's only verdict on a transient would be the same class of mistake
+/// as the false FAIL this arc exists to close.
+#[cfg(feature = "witness")]
+fn verify_reference(
+    fb: &super::FrameBuffer,
+    r: &Window,
+    band: Option<(usize, usize)>,
+) -> Option<VerifyRef> {
+    // FOCUS-VIS — `presented`, so the one-shot is not claimed by the create-time composite of a blank
+    // surface. `compat` rows have no chrome and no owner to verify against; `id < 32` is the latch width.
+    if r.compat || !r.presented || r.id >= 32 {
+        return None;
+    }
+    let bit = 1u32 << r.id;
+    if VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit != 0 {
+        return None;
+    }
+    // Claim exactly once, and only from the path that is about to print. `claim` is the `fetch_or` winner
+    // test, so every `serial_println!` below is emitted by one core.
+    let claim = || VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0;
+
+    let info = fb.info();
+    if r.surf == 0 || r.scale == 0 || r.stride < 4 || r.x >= info.width || r.y >= info.height {
+        if claim() {
+            serial_println!("[wc-d] verify win={} -> SKIP (degenerate row/geometry)", r.id);
+        }
+        return None;
+    }
+    // The same bounds `draw_window` blitted under — verify exactly what was drawn, never more.
+    let cols = (info.width - r.x).div_ceil(r.scale).min(r.w).min(r.stride / 4);
+    let rows = (info.height - r.y).div_ceil(r.scale).min(r.h).min(r.surf_len / r.stride);
+    if cols == 0 || rows == 0 {
+        if claim() {
+            serial_println!("[wc-d] verify win={} -> SKIP (no visible content rect)", r.id);
+        }
+        return None;
+    }
+
+    // WCD-BAND — clip to the rows this present promised to repaint. The band is in SOURCE rows, which is
+    // the coordinate `rows` counts in, so the clip is a `min` and not a re-derivation of `damaged_box`'s
+    // panel arithmetic — there is deliberately no second copy of that conversion to disagree with.
+    let (row0, row1, banded) = match band {
+        None => (0, rows, false),
+        Some((sy0, sy1)) => {
+            let y0 = sy0.min(rows);
+            let y1 = sy1.min(rows);
+            if y1 <= y0 {
+                // No claim — see the ledger above. This present has no visible damaged rows; the next one
+                // will.
+                return None;
+            }
+            (y0, y1, true)
+        }
+    };
+
+    if !claim() {
+        return None;
+    }
+    // Latch is ours from here: every return below prints.
+    let mut want: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    if want.try_reserve_exact((row1 - row0) * cols).is_err() {
+        serial_println!(
+            "[wc-d] verify win={} -> SKIP (no memory for {}x{} source snapshot)",
+            r.id, cols, row1 - row0
+        );
+        return None;
+    }
+    // Read the SOURCE exactly ONCE, into a snapshot both read-back passes share. Before WCD-LIVE a verdict
+    // took three independent reads of a user-mutable surface, so `bad_cache` and `bad_ram` could differ
+    // purely because they had read different bytes — no cache story required. One `want`-stream, taken at
+    // one instant, on the correct side of the blit.
+    {
+        let surf = r.surf as *const u8;
+        for row in row0..row1 {
+            let row_base = row * r.stride;
+            for col in 0..cols {
+                // SAFETY: identical bound to `draw_window`'s read — `row < surf_len / stride` and
+                // `col < stride / 4`, so `row_base + col * 4 + 4 <= surf_len`.
+                want.push(
+                    unsafe { core::ptr::read_unaligned(surf.add(row_base + col * 4) as *const u32) }
+                        & 0x00FF_FFFF,
+                );
+            }
+        }
+    }
+    let cksum_pre = surface_checksum(r);
+    Some(VerifyRef { row0, row1, cols, banded, cksum_pre, want })
+}
+
+/// WC-D — `band=` on the wire: `none` for a whole-box verdict, `y0..y1` in SOURCE rows for a banded one.
+/// A `Display` shim rather than a formatted `alloc::string::String`, so the verdict costs no allocation it
+/// could fail.
+#[cfg(feature = "witness")]
+struct BandFmt(Option<(usize, usize)>);
+
+#[cfg(feature = "witness")]
+impl core::fmt::Display for BandFmt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            None => f.write_str("none"),
+            Some((y0, y1)) => write!(f, "{}..{}", y0, y1),
+        }
+    }
+}
+
+/// WC-D — `ram_indep=` on the wire. See WCD-RAMINDEP.
+#[cfg(feature = "witness")]
+fn yn(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
+}
+
 /// WC-D — window ids whose [`verify_window`] verdict has already been emitted (bit `id`), so the read-back
-/// runs once per window rather than once per frame. The latch is set BEFORE `verify_window` runs (the
-/// `fetch_or` in `composite` claims the bit), so the invariant that keeps the gate diagnosable is carried
-/// by `verify_window` itself: EVERY path through it emits a line — PASS, FAIL, or `-> SKIP` with a reason.
-/// A future early return added without a line would burn the latch silently and leave the spec's REQUIRE
-/// failing with nothing to explain why.
+/// runs once per window rather than once per frame. The latch is claimed by [`verify_reference`] — BEFORE
+/// the blit, since WCD-PRE moved the reference there and the claim has to travel with it — so the invariant
+/// that keeps the gate diagnosable is carried by that function: EVERY path that claims the bit emits a line,
+/// PASS, FAIL, LIVE, or `-> SKIP` with a reason. A future early return added without a line would burn the
+/// latch silently and leave the spec's REQUIRE failing with nothing to explain why.
 #[cfg(feature = "witness")]
 static VERIFIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
