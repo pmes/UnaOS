@@ -1422,6 +1422,19 @@ kernel8() {
         K8_FEATS="${K8_FEATS},v3d_dispdone"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_DISPDONE: ARM the NOTIFY_DISPLAY_DONE sends ([v3d80] + [v3d81d]) — ⚠ stops the firmware display driver and blacks the panel for the boot; inert without UNAOS_V3D_DEEP${COLOR_RESET}"
     fi
+    # PI-V3D-92: UNAOS_V3D_PMCYCLE=1 adds the `v3d_pmcycle` feature — the arming switch for the
+    # mailbox power-domain CYCLE experiment ([v3d92], tail of the deep battery). Powers firmware
+    # domain 10 OFF then ON — the one transition a bare-metal boot never runs (boot-time ON lands on
+    # an already-on domain), and the last untested mailbox act after boots 17/18/19 excluded
+    # ENABLE_QPU, the M_CTRL transplant and the KMS overlay. The decisive ASB M_CTRL read prints
+    # BEFORE recovery, so the datum banks even if the block dies. Inert without UNAOS_V3D_DEEP.
+    # ⚠ an armed boot may lose V3D from the cycle onward if recovery fails. Do NOT combine with
+    # UNAOS_V3D_QPU (wedges the mailbox this rung needs) or UNAOS_V3D_DISPDONE/UNAOS_V3D81_* (their
+    # stations would read a power-cycled core). See docs/dev/OS/08_VIDEO/v3d.md §49.14.
+    if [ -n "${UNAOS_V3D_PMCYCLE:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_pmcycle"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_PMCYCLE: ARM the [v3d92] power-domain OFF->ON cycle — ⚠ may cost V3D for the boot if recovery fails; inert without UNAOS_V3D_DEEP; never with QPU/DISPDONE/V3D81${COLOR_RESET}"
+    fi
     # PI-V3D-69: UNAOS_V3D69_REENABLE=1 adds the `v3d69_reenable` (+`v3d_deep`,+`v3d`) features — the
     # WRITE half of the initialisation-diff arc. The READ half (the `[v3d69] fabric` stations: PM_GRAFX,
     # both V3D async-AXI-bridge control words in both candidate ASB blocks, V3D_MMUC_CONTROL) rides

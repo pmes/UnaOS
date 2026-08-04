@@ -5187,3 +5187,33 @@ seeing it caught, and restoring; the full-knob `kernel8` build green once with `
 UNAOS_V3D_FIRSTKICK=rclct1`; `strings -a target/pi_baremetal/kernel8.img` shows the `[v3d89]` family
 and the raw `rclct1` value. QEMU raspi4b models no V3D, so there is no QEMU leg for this arc at all —
 the verdict is the attended metal boot.
+
+**§49.14 — the VPU-side hunt: boot19 excludes the KMS overlay; PI-V3D-92 named (the domain-cycle
+experiment).** Boot18 left one named fabric divergence (`RPIVID ASB_V3D_M_CTRL` 0x4 vs piOS mid-bin
+0x4040) and proved the bits unwritable from the ARM core. The VPU-side candidates were: the
+firmware's config.txt/dtoverlay path, a mailbox tag family, and the piOS boot-state diff's VPU
+stations. Boot19 (PA27, 2026-08-04) took the first: PA26's byte-identical kernel plus
+`dtoverlay=vc4-kms-v3d` and the overlay blobs (pinned fw 1.20260521) on the FAT — the firmware read
+`overlay_map.dtb`, loaded `vc4-kms-v3d-pi4`, and **M_CTRL still read 0x00000004 at the [v3d75]
+station** [booted, pi4-r23s1x boot19]. The overlay-alone hypothesis is EXCLUDED; the mailbox fb
+(1920x1200) survived the overlay, so the KMS-boot panel hazard did not fire on a bare-metal boot
+either. piOS's 0x4040 therefore appears only when its *kernel driver* brings V3D up at runtime.
+
+What that leaves in the mailbox family, honestly accounted: `SET_ENABLE_QPU` — tested and excluded
+(boots 17/19); the `M_CTRL` transplant — refused by silicon (boot18); `SET_DOMAIN_STATE(10, ON)` —
+sent every boot and ACKs, **but always onto a domain the firmware already powered** (PI-V3D-2), so
+the VPU's real off→on domain-init transition has never once run for a bare-metal boot, while piOS's
+`v3d_reset` semantics is exactly a power cycle. **PI-V3D-92** = that cycle: `[v3d92]` rides the tail
+of the deep battery (after `[v3d77]`; `[v3d80]`/`[v3d81]` must not be armed beside it, and the
+qpu-gate must be OFF because SET_ENABLE_QPU wedges the mailbox this rung needs). Sequence:
+pre-station (GET_DOMAIN_STATE + both ASB words) → OFF → **the decisive ASB M_CTRL read immediately
+after ON, printed before any recovery so the datum banks even if the block dies** → clock/bridge/
+MMU/IRQ recovery → the PI-V3D-91 bin criterion + CT1 health kick, with a four-way composed verdict
+(bits×criterion). No V3D core register is read between OFF and the post-recovery presence probe.
+Armed by `UNAOS_V3D_PMCYCLE=1` (`v3d_pmcycle`, bare feature, default OFF); an armed boot may lose
+V3D from the cycle onward if recovery fails — experiment-boot cost, same acceptance class as
+`[v3d80]`'s panel. Whatever the verdict, the PTB frame-unit bracket (§49.13) remains the standing
+target: (bits-appear × wall-moves) convicts the domain-init; (bits-appear × wall-stands) exonerates
+0x4040 as a sufficient condition; (no-bits × wall-moves) attributes to the cycle's reset side;
+(no-bits × wall-stands) closes the mailbox family entirely and sends the hunt to the PTB bracket
+and the piOS boot-state diff.

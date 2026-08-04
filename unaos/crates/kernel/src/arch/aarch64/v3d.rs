@@ -7025,6 +7025,11 @@ fn empty_frame_bisection() {
     // PI-V3D-77: the unnamed-word transplants ride after the sweep (so the sweep records the
     // pre-transplant file) — the diff's two config-shaped divergences, poked and kicked.
     v3d77_unnamed_words();
+    // PI-V3D-92: the domain-cycle experiment rides after [v3d77] — it powers domain 10 OFF then
+    // ON, destroying all V3D core state, so every reading on this boot's original fabric must
+    // already be banked. Before [v3d80]/[v3d81] positionally, but those legs must NOT be armed on
+    // a pmcycle boot (their stations would read a power-cycled core); the arming docs both say so.
+    v3d92_domain_cycle();
     // PI-V3D-80: the display handover rides ABSOLUTELY LAST — NOTIFY_DISPLAY_DONE stops the
     // firmware display driver, so scanout of the firmware framebuffer may die the moment it runs.
     // Every screen-dependent reading this boot owns must already be banked.
@@ -10565,6 +10570,136 @@ fn v3d75_fabric_condition() {
             else { "bin frame still dead — the A window moved nothing on thread 0; the PTB frame unit hunt (§49.13) stands" }
         );
     }
+}
+
+/// PI-V3D-92 — the mailbox power-domain CYCLE experiment. Boots 17/18/19 exhausted every
+/// ARM-reachable bin-wall hypothesis on honest instruments (ENABLE_QPU excluded, the M_CTRL
+/// transplant refused by silicon, the KMS overlay changes nothing at handoff), leaving "whatever
+/// VPU-side path programs M_CTRL to 0x4040". One mailbox act remains untested: a genuine OFF→ON
+/// transition of firmware power domain 10. Our boot-time `SET_DOMAIN_STATE(10, ON)` lands on a
+/// domain the firmware already powered (PI-V3D-2's ACK), so the VPU's real domain-init transition
+/// never runs for a bare-metal boot — while piOS's `v3d_reset` semantics is exactly a power
+/// CYCLE. This rung is that cycle, via the same replying tag every boot already uses.
+///
+/// Ordering + hazards, all deliberate:
+///   * Rides AFTER [v3d77] — the cycle destroys all V3D core state, so every reading on this
+///     boot's original fabric must already be banked. [v3d80]/[v3d81] must NOT be armed on a
+///     pmcycle boot (their stations would read a power-cycled core, not the boot fabric).
+///   * Must fly with the qpu-gate OFF: SET_ENABLE_QPU wedges the VC mailbox for the boot, and
+///     this rung needs a LIVE mailbox after the battery (v3d75a's verdicts are banked; QPU has
+///     nothing left to teach on a pmcycle boot).
+///   * The decisive read — ASB M_CTRL immediately after ON — prints BEFORE any recovery step, so
+///     the datum banks even if the block never comes back. NO V3D core register is touched
+///     between OFF and the post-recovery presence probe (a core read on an unpowered block is a
+///     synchronous external abort); the ASB bridge words live in the always-on PM block and are
+///     safe throughout.
+///   * If recovery fails, the boot loses V3D from here on — an armed pmcycle boot is an
+///     experiment boot by definition (same acceptance class as [v3d80]'s panel cost), and the
+///     gate-off default keeps every other boot untouched.
+fn v3d92_domain_cycle() {
+    #[cfg(any(not(feature = "v3d_deep"), not(feature = "v3d_pmcycle")))]
+    serial_println!(
+        ":: V3D: [v3d92] domain-cycle SKIPPED — pmcycle-gate off (arm with UNAOS_V3D_PMCYCLE=1; the cycle powers domain 10 OFF then ON and may cost V3D for the rest of the boot if recovery fails). Nothing was sent and NO [v3d92] verdict is implied ::"
+    );
+    #[cfg(all(feature = "v3d_deep", feature = "v3d_pmcycle"))]
+    v3d92_domain_cycle_armed();
+}
+
+/// PI-V3D-92, the armed body — compiled only when the rung actually cycles, so no line in it can
+/// print beside a cycle that never happened.
+#[cfg(all(feature = "v3d_deep", feature = "v3d_pmcycle"))]
+fn v3d92_domain_cycle_armed() {
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down | V3dPresence::Poison(_) => {
+            serial_println!(
+                ":: V3D: [v3d92] SKIPPED — hub absent/poison (QEMU raspi4b or block-down). No cycle ran and NO verdict is implied ::"
+            );
+            return;
+        }
+    }
+    let d_pre = mailbox::get_domain_state(mailbox::POWER_DOMAIN_V3D);
+    let m0 = mmio_read(RPIVID_ASB_BASE, ASB_V3D_M_CTRL);
+    let s0 = mmio_read(RPIVID_ASB_BASE, ASB_V3D_S_CTRL);
+    serial_println!(
+        ":: V3D: [v3d92] domain-cycle — pre-station: GET_DOMAIN_STATE(10)={:?} RPIVID M_CTRL={:#010x} S_CTRL={:#010x} (piOS mid-bin ref M=0x00004040) — sending OFF then ON: the one transition a bare-metal boot never runs (boot-time ON lands on an already-on domain). ⚠ V3D core state dies here by design; the panel blit path is at risk for the rest of the boot if recovery fails ::",
+        d_pre, m0, s0
+    );
+
+    // ── OFF. From here until the post-recovery presence probe, NO V3D core register is read. ──
+    let off_reply = mailbox::set_power_domain(mailbox::POWER_DOMAIN_V3D, 0);
+    settle_ms(2);
+    let d_off = mailbox::get_domain_state(mailbox::POWER_DOMAIN_V3D);
+    let m_off = mmio_read(RPIVID_ASB_BASE, ASB_V3D_M_CTRL);
+    let s_off = mmio_read(RPIVID_ASB_BASE, ASB_V3D_S_CTRL);
+    serial_println!(
+        ":: V3D: [v3d92] OFF — SET_DOMAIN_STATE(10,0) reply={:?} readback={:?} | ASB while off: M_CTRL={:#010x} S_CTRL={:#010x} (PM block, safe to read with the domain down) ::",
+        off_reply, d_off, m_off, s_off
+    );
+
+    // ── ON — THE transition. The decisive station prints before any recovery act. ──
+    let on_reply = mailbox::set_power_domain(mailbox::POWER_DOMAIN_V3D, 1);
+    settle_ms(2);
+    let d_on = mailbox::get_domain_state(mailbox::POWER_DOMAIN_V3D);
+    let m_on = mmio_read(RPIVID_ASB_BASE, ASB_V3D_M_CTRL);
+    let s_on = mmio_read(RPIVID_ASB_BASE, ASB_V3D_S_CTRL);
+    serial_println!(
+        ":: V3D: [v3d92] ON — SET_DOMAIN_STATE(10,1) reply={:?} readback={:?} | ASB after the REAL off->on transition: M_CTRL={:#010x} S_CTRL={:#010x} (piOS ref M=0x00004040, our handoff value 0x4/0x7) — {} ::",
+        on_reply, d_on, m_on, s_on,
+        if m_on & 0x4040 == 0x4040 { "THE VPU DOMAIN-INIT PROGRAMS THE BRIDGE — the missing init is this transition; the criterion below decides whether it moves the bin wall" }
+        else { "bridge word unchanged by the transition — the VPU's domain-init path does not program these bits either; whatever writes 0x4040 is still upstream" }
+    );
+
+    // ── Recovery: clocks first (rate then gate, bringup order), then the genpd ON half. ──
+    let rate = mailbox::set_clock_rate(mailbox::CLOCK_ID_V3D, 500_000_000);
+    let gate = mailbox::set_clock_state(mailbox::CLOCK_ID_V3D, true);
+    serial_println!(
+        ":: V3D: [v3d92] recovery — clock rate={:?} gate-active={:?}; releasing bridges (genpd ON half — RMW, never clears bits the VPU set) ::",
+        rate, gate
+    );
+    enable_pm_asb();
+    let m_rel = mmio_read(RPIVID_ASB_BASE, ASB_V3D_M_CTRL);
+    serial_println!(
+        ":: V3D: [v3d92] post-release station — M_CTRL={:#010x} (vs post-ON {:#010x}) — any delta here is OUR release, not the VPU ::",
+        m_rel, m_on
+    );
+    settle_ms(2);
+    match probe_hub_ident0() {
+        V3dPresence::Up(v) => {
+            serial_println!(":: V3D: [v3d92] block back UP — hub IDENT0={:#010x}; re-establishing L2T window, MMU, IRQs ::", v);
+        }
+        V3dPresence::Down | V3dPresence::Poison(_) => {
+            serial_println!(
+                ":: V3D: [v3d92] RECOVERY FAILED — hub absent/poison after the cycle. The decisive M_CTRL datum above STANDS; no criterion can run and V3D is down for the rest of this boot (armed-boot cost, stated in the arming doc) ::"
+            );
+            super::exceptions::serror_drain_request("v3d92: post-cycle probe not up");
+            return;
+        }
+    }
+    v3d_init_hw_state();
+    if !program_mmu() {
+        serial_println!(":: V3D: [v3d92] MMU re-program FAILED post-cycle — criterion cannot run; the M_CTRL datum above stands ::");
+        super::exceptions::serror_drain_request("v3d92: post-cycle MMU program failed");
+        return;
+    }
+    v3d_irq_enable();
+
+    // ── The criterion pair: the honest BIN-class CT0 criterion (PI-V3D-91), then CT1 health. ──
+    let bin = submit_bisect_rung_geom(
+        "v3d92", "bin-criterion after domain cycle", BinContent::Empty,
+        OFF_SHADREC, OFF_PROBE_BIN_CL, true, None,
+    ).map(|r| r.retired).unwrap_or(false);
+    let ct1 = v3d75_kick_probe("v3d92 post-cycle");
+    serial_println!(
+        ":: V3D: [v3d92] verdict — M_CTRL after real off->on: {:#010x} (piOS ref 0x00004040) | PI-V3D-91 bin-criterion after cycle: {} | ct1-health: {} — {} ::",
+        m_on, bin as u32, ct1 as u32,
+        match (m_on & 0x4040 == 0x4040, bin) {
+            (true, true) => "THE WALL WAS THE DOMAIN-INIT: the VPU transition programs the bridge AND the bin frame retires — productionize as cycle-at-bringup and re-run to confirm ordering",
+            (true, false) => "the VPU transition programs the bridge yet the bin frame still dies — the 0x4040 bits are exonerated as a sufficient condition; the PTB frame unit hunt (§49.13) stands on a narrower field",
+            (false, true) => "the bridge word never moved yet the bin frame RETIRED after the cycle — the cycle reset something else that matters; attribute to the cycle, not the bits, and bisect what the transition cleared",
+            (false, false) => "cycle changes neither the bridge nor the wall — the mailbox domain family is now exhausted with ENABLE_QPU and the transplant; what programs 0x4040 (and whether it matters) is firmware-internal, and the hunt moves to the PTB bracket (§49.13) and the piOS boot-state diff",
+        }
+    );
 }
 
 /// PI-V3D-75's discriminator kick: the [v3d74a] leg, compacted — the proven M3 RCL on CT0's queue,

@@ -508,6 +508,24 @@ v3d_qpu = []
 # from the send onward — that is the known cost; serial carries the whole verdict.
 v3d_dispdone = []
 
+# PI-V3D-92: the arming switch for the mailbox power-domain CYCLE experiment. Boots 17/18/19
+# exhausted every ARM-reachable bin-wall hypothesis (ENABLE_QPU excluded, the M_CTRL=0x4040
+# transplant refused by silicon, the vc4-kms-v3d overlay changes nothing at handoff); the one
+# untested mailbox act is a genuine OFF→ON transition of firmware power domain 10 — boot-time ON
+# lands on an already-on domain (PI-V3D-2), so the VPU's real domain-init path never runs for a
+# bare-metal boot, while piOS's v3d_reset semantics is exactly a cycle. The armed rung `[v3d92]`
+# rides the tail of the deep battery (after `[v3d77]`): pre-station → OFF → the decisive ASB
+# M_CTRL read immediately after ON (printed before any recovery, so the datum banks even if the
+# block never comes back) → clock/bridge/MMU/IRQ recovery → the PI-V3D-91 bin criterion + CT1
+# health kick. Gated on `all(v3d_deep, v3d_pmcycle)`; OFF (default) prints one `[v3d92] SKIPPED —
+# pmcycle-gate off` line and sends nothing. A bare feature that implies nothing, like the other
+# arming switches. ⚠ an armed boot may lose V3D (and with it the panel blit path) from the cycle
+# onward if recovery fails — experiment-boot cost. Do NOT arm together with UNAOS_V3D_QPU
+# (SET_ENABLE_QPU wedges the VC mailbox this rung needs) or UNAOS_V3D_DISPDONE/UNAOS_V3D81_*
+# (their stations would read a power-cycled core). Enable via `UNAOS_V3D=1 UNAOS_V3D_DEEP=1
+# UNAOS_V3D_PMCYCLE=1 UNAOS_PI=1 ./arroyo kernel8`.
+v3d_pmcycle = []
+
 # PI-V3D-69: the WRITE half of the initialisation-diff arc. The READ half (`[v3d69] fabric` stations —
 # PM_GRAFX, both V3D async-AXI-bridge control words in both candidate ASB blocks, V3D_MMUC_CONTROL)
 # rides `v3d_deep` and is read-only. THIS feature adds the one rung that WRITES: it re-runs mainline's
