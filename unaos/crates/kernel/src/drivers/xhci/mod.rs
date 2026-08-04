@@ -6427,16 +6427,24 @@ impl XhciController {
                     dci, dir, if ok { "yes" } else { "no" }, cc, why, ep_state, after);
                 if !ok {
                     if cc == 19 {
-                        // BOTEV (evidence only): Stop Endpoint is legal only from Running
-                        // (xHCI 1.2 §4.6.9); a Context State Error says the endpoint was not
-                        // Running when the command executed, so the state-aware arm chose on a
-                        // stale read.
+                        // boot23 (PA32) upgraded this from evidence to behaviour: Stop Endpoint is
+                        // legal only from Running (xHCI 1.2 §4.6.9), so a Context State Error here
+                        // means the endpoint is ALREADY out of Running and our output-context read
+                        // of `1` was stale (the context is only written back on state transitions
+                        // the controller chooses to record — the (stale: EP running) annotation
+                        // family). "Not Running" is this arm's entire goal, so the refusal IS the
+                        // goal state and the resync proceeds to Set TR Dequeue. Boot23's failure
+                        // shape: fold-clean stopped the pipes, clear-halt left them Stopped, this
+                        // arm re-read a stale Running and its cc=19 hard-fail took the whole
+                        // recovery down (`recover_bot_full=false`) — leaving the device phase
+                        // unreset and the stale CSW replaying forever.
                         serial_println!(
-                            ":: BOT: resync note dci={} dir={} illegal-stop-on-state read={} now={} — Context State Error on Stop Endpoint ::",
+                            ":: BOT: resync stage=stop-ep dci={} dir={} cc=19 treated as already-stopped (stale context read={} now={}) — proceeding to set-deq ::",
                             dci, dir, ep_state, after);
+                    } else {
+                        serial_println!("xHCI: BOT recover: Stop Endpoint failed (slot {} dci {})", slot_id, dci);
+                        return false;
                     }
-                    serial_println!("xHCI: BOT recover: Stop Endpoint failed (slot {} dci {})", slot_id, dci);
-                    return false;
                 }
             }
             3 => {
@@ -6685,9 +6693,10 @@ impl XhciController {
         // `Ok`, and `bot_transfer` only cleans on `Err` — without this call a folded transaction
         // would be the one success path that could return with a dirty ring.
         //
-        // `cause` is a log label only; `TransferError(13)` reads as "short transfer" on the `clean`
-        // line, which is what the fold is.
-        self.bot_clean_rings(slot_id, BotError::TransferError(13));
+        // boot23 (PA32): the fold's own pre-clean is GONE. It stopped the pipes, then
+        // `recover_bot_full`'s resync re-read a stale Running, issued a second Stop, ate cc=19 and
+        // hard-failed the whole recovery — the double-clean was the provocation. Recovery owns the
+        // complete resync (and the cc=19 arm below it is now stale-read-tolerant besides).
         // boot22 (PA31) proved host-side ring cleanup alone is NOT enough after a fold: the
         // device is still a phase ahead, and the 13-byte CSW's 5-byte TAIL survived into the head
         // of the RETRY's data buffer — no USBS at offset 0, so the fold correctly declined, and
