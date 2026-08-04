@@ -4712,7 +4712,7 @@ impl XhciController {
             // doesn't match), which keeps the retraction correct even if some earlier path already
             // zeroed `storage_slot`. A replug enumerates as a NEW slot and republishes through the
             // normal attach path, so the entry is fresh rather than duplicated.
-            crate::drivers::block::unpublish_usb_geometry(i as u8);
+            crate::drivers::block::unpublish_usb_geometry(i as u8, crate::drivers::block::usb_publish_gen());
             // BOT-RESCUE: a slot that leaves takes its escalation state with it. Without this a
             // surrendered slot id, once recycled by the controller for the NEXT device, would
             // refuse that innocent device's transfers up front — the surrender must bind to the
@@ -8629,13 +8629,13 @@ impl XhciController {
     /// arc's actual guarantee: a sick disk can never again spin the system at ~6 s per attempt
     /// forever. It is cleared when the slot is disposed or re-enumerated, so a physical replug is a
     /// clean slate and needs no operator action beyond the replug.
-    fn bot_surrender(&mut self, slot_id: u8, cause: BotError) {
+    fn bot_surrender(&mut self, slot_id: u8, cause: BotError, ladder_gen: u64) {
         if self.bot_surrendered_slot == slot_id {
             return; // already surrendered; one verdict line per disk, not one per caller
         }
         BOT_RESCUE_SURRENDER.fetch_add(1, Ordering::Relaxed);
         self.bot_surrendered_slot = slot_id;
-        let retracted = crate::drivers::block::unpublish_usb_geometry(slot_id);
+        let retracted = crate::drivers::block::unpublish_usb_geometry(slot_id, ladder_gen);
         if self.storage_slot == slot_id {
             self.storage_slot = 0;
             self.storage_pending_bringup = false;
@@ -8706,6 +8706,10 @@ impl XhciController {
     fn bot_rescue_escalate(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32,
         dir: Direction, cause: BotError) -> Result<BotResult, BotError>
     {
+        // PA35 race: the ladder may itself resurrect the device (its port-cycle re-enumerates and
+        // the fresh bring-up PUBLISHES mid-ladder). The surrender at the ladder's end may only
+        // retract the publish generation the ladder was earned against — captured HERE, at entry.
+        let ladder_gen = crate::drivers::block::usb_publish_gen();
         self.bot_fail_streak = self.bot_fail_streak.saturating_add(1);
         let streak = self.bot_fail_streak;
         // Exponential back-off: a device wedged mid-internal-stall is made worse by being hammered.
@@ -8743,7 +8747,7 @@ impl XhciController {
         }
 
         // (c) Surrender.
-        self.bot_surrender(slot_id, cause);
+        self.bot_surrender(slot_id, cause, ladder_gen);
         Err(cause)
     }
 
@@ -10852,7 +10856,7 @@ impl XhciController {
             // USB-UNPLUG: same retraction as the root-port teardown — a disk pulled from a HUB port
             // must leave the block registry too, or the installer keeps listing it. Slot-id matched,
             // so only the slot that actually published geometry is retracted.
-            crate::drivers::block::unpublish_usb_geometry(i as u8);
+            crate::drivers::block::unpublish_usb_geometry(i as u8, crate::drivers::block::usb_publish_gen());
             if self.configuring_slot == i as u8 { self.configuring_slot = 0; }
             if self.ftdi_configuring_slot == i as u8 { self.ftdi_configuring_slot = 0; }
             if self.ftdi_slot == i as u8 {
