@@ -6552,6 +6552,150 @@ impl XhciController {
         true
     }
 
+    /// ZERO-DATA CSW FOLD ([piusb41]) — the device answered the CBW with its STATUS instead of the
+    /// data phase, so the status wrapper landed in the DATA-stage buffer. Called once, immediately
+    /// after an IN data stage's `run_bot_stage` returns (success, short, error OR timeout), before
+    /// anything is decided from that outcome and before the CSW stage is built. Returns
+    /// `Some(BotResult)` when the transaction has been FOLDED — the caller must return it as the
+    /// transaction's result and must NOT push a CSW stage — and `None` when this was an ordinary
+    /// data stage that should be judged normally.
+    ///
+    /// ## The defect this closes (boot21, Pi 4 metal, `[booted]` capture)
+    ///
+    /// READ CAPACITY(10) (`tag=5`, `cdb0=0x25`, `dCBWDataTransferLength=8`) is answered by the
+    /// stick with NO data phase at all: it sends its 13-byte CSW straight back on the bulk-IN pipe.
+    /// The host's outstanding IN TD at that moment is the 8-byte DATA stage, so the first 8 bytes
+    /// of that CSW — `55 53 42 53 05 00 00 00`, i.e. `USBS` followed by the command's OWN
+    /// `dCBWTag` — are DMA-written into the data buffer. `[piusb40] readcap-wedge` photographs
+    /// exactly that, with `landed=true` against the 0xA5 poison, so the bytes are a hard DRAM fact,
+    /// not an inference.
+    ///
+    /// The engine had no handling for it. Under `cbw=always-awaited` the data stage's wait can only
+    /// be released by a transfer completion for the data TRB, so it burned the full ~6 s budget, the
+    /// recovery ladder reset both endpoints, the retry (`tag=6`) met the identical response, and
+    /// bring-up surrendered the disk. A post-wedge INQUIRY over the control pipe returned `Ok`, so
+    /// the pipes were fully alive: the failure is TRANSACTION-shaped, not transport-shaped, and no
+    /// amount of endpoint resetting could ever have cleared it.
+    ///
+    /// Zero-data replies are legal BOT behaviour, not a device bug. USB MSC BOT 1.0 §6.7.2 case 2
+    /// (`Hi > Dn`) is precisely "the host expected data IN, the device sent none and went straight to
+    /// its status phase"; the host is obliged to accept the CSW and complete the command. The only
+    /// non-conformance on the wire is WHERE the status landed, and that is the host's own doing —
+    /// the host had an 8-byte TD posted where the device expected the status to be read.
+    ///
+    /// ## Why the fold must NOT then wait for a CSW stage
+    ///
+    /// This is the whole point of the fix, and skipping it would be worse than the wedge. The device
+    /// has ALREADY sent its status; its own BOT state machine is back at "await CBW". If the host
+    /// went on to push the 13-byte CSW TRB anyway, one of two things happens, and both are phase
+    /// SHIFTS that outlive the transaction:
+    ///   * nothing answers the IN token (the device has nothing to send) — the CSW stage burns its
+    ///     own full budget, converting a recoverable misphase into the same wedge one stage later; or
+    ///   * the token is answered by the status of the NEXT command the host issues, so from then on
+    ///     every command reads the PREVIOUS command's CSW. Tags would then mismatch forever
+    ///     (`BOT_TAG_MISMATCH`), and a `Passed` verdict would be attributed to the wrong CDB —
+    ///     a silent-corruption shape, not a stall.
+    /// So the fold completes the command HERE, from the status the device already sent, and the
+    /// caller returns without ever building stage 3.
+    ///
+    /// ## What is actually readable, and what is assumed
+    ///
+    /// Only `min(data_len, 13)` bytes of the CSW can be in the data buffer — the TD is `data_len`
+    /// long and the controller cannot write past it. For the READ CAPACITY case that is 8 bytes:
+    /// `dCSWSignature` + `dCSWTag` and nothing else. The tail 5 bytes (`dCSWDataResidue` +
+    /// `bCSWStatus`) were NOT written anywhere the host can read: a device packet longer than the
+    /// TD's remaining buffer is an overflow, which this controller reports on the transfer event
+    /// (Babble Detected, cc=3, xHCI 1.2 §6.4.5) and whose excess bytes it DISCARDS — there is no
+    /// second buffer they spill into. `handle_event_trb` claims that event by TRB address like any
+    /// other error, and the data-stage arm below treats a cc it does not recognise as a hard fault;
+    /// neither path can reconstruct the missing 5 bytes. So:
+    ///   * `data_len >= 13` — the whole CSW is present; `residue` and `status` are the DEVICE's own,
+    ///     parsed and reported verbatim.
+    ///   * `data_len < 13` — `bCSWStatus` is unreadable. The transaction is completed as `Failed`
+    ///     with `residue = data_len`, and the witness says `status=Failed(tail-truncated)` so the
+    ///     assumption is never mistaken for a reading. `Failed` is the only safe choice: the
+    ///     requested bytes provably did NOT arrive (the buffer holds the status wrapper, not
+    ///     payload), so reporting `Passed` would hand `scsi_read_capacity10` four bytes of `USBS`
+    ///     as a block size. `Failed` routes into `bot_check_condition` -> REQUEST SENSE, which is
+    ///     both the BOT-legal next command and the one that makes the device state its own reason.
+    ///     `residue = data_len` is the literal truth: none of the requested transfer moved.
+    ///
+    /// ## Detection criterion
+    ///
+    /// The buffer's own first 8 bytes: `dCSWSignature == "USBS"` AND `dCSWTag ==` the tag of the
+    /// CBW that is in flight RIGHT NOW. Deliberately NOT gated on the stage's completion code or on
+    /// a short residue, and that is a widening on purpose — boot21's data stage produced NO
+    /// completion the pump could claim at all, so any criterion phrased in terms of the transfer
+    /// event would miss the one capture the fix exists for, and a controller that reported the
+    /// 8-byte TD as a plain `cc=1 residue=0` success would miss it too. The criterion costs nothing
+    /// in false positives: real payload would have to match a fixed 4-byte signature AND a
+    /// monotonically-increasing 32-bit tag that no earlier transaction can carry — 2^-64 per stage.
+    fn bot_fold_zero_data_csw(&mut self, slot_id: u8, cdb0: u8, tag: u32,
+        data_phys: u64, data_len: u32) -> Option<BotResult>
+    {
+        // Below 8 bytes there is no room for signature + tag, so the transaction cannot be
+        // identified and nothing may be folded on a guess.
+        if data_len < 8 {
+            return None;
+        }
+        let avail = data_len.min(13) as usize;
+        // XHCI-COHERENCE: consumer boundary. The buffer was `clean`ed before the doorbell and
+        // DMA-written by the controller, so there is no dirty line to lose; invalidate so this reads
+        // DRAM rather than the pre-transfer cache. Idempotent with the full-length invalidate the
+        // normal IN path performs later over a superset of this range.
+        dma_coherency::inval(data_phys as usize, avail);
+        let d = unsafe { core::slice::from_raw_parts(data_phys as *const u8, avail) };
+        let sig = (d[0] as u32) | ((d[1] as u32) << 8) | ((d[2] as u32) << 16) | ((d[3] as u32) << 24);
+        let buf_tag = (d[4] as u32) | ((d[5] as u32) << 8) | ((d[6] as u32) << 16) | ((d[7] as u32) << 24);
+        if sig != 0x53425355 || buf_tag != tag {
+            return None; // an ordinary data stage — judge it normally
+        }
+
+        let (status, status_name, residue) = if avail >= 13 {
+            let res = (d[8] as u32) | ((d[9] as u32) << 8) | ((d[10] as u32) << 16) | ((d[11] as u32) << 24);
+            match d[12] {
+                0 => (CswStatus::Passed, "Passed", res),
+                1 => (CswStatus::Failed, "Failed", res),
+                2 => (CswStatus::PhaseError, "PhaseError", res),
+                _ => (CswStatus::Unknown, "Unknown", res),
+            }
+        } else {
+            // See "What is actually readable" above: the status byte rode off the end of an
+            // undersized TD and was discarded by the controller's overflow handling.
+            (CswStatus::Failed, "Failed(tail-truncated)", data_len)
+        };
+
+        serial_println!(
+            ":: BOT: [piusb41] zero-data CSW folded — cdb0={:#04x} tag={:#010x} status={} residue={} — the device declined the data phase; command completed from the data-stage CSW ::",
+            cdb0, tag, status_name, residue);
+
+        // PHASE-RESYNC. Two things are left over and both must go before the next CBW is born.
+        //   * The data TD. On the timeout path it is still outstanding on the bulk-IN ring with the
+        //     controller parked on it; on the overflow path the endpoint is HALTED (Babble is a halt
+        //     condition, xHCI 1.2 §4.10.2.4) and the TD is un-retired either way. A stranded TD that
+        //     the next doorbell can be pointed at is exactly the condition `bot_clean_rings` exists
+        //     to end — §14's stale-CBW replay.
+        //   * Any event the stop/reset itself produces, which must not be mistaken for the next
+        //     transaction's completion.
+        // `bot_clean_rings` does both — Stop/Reset Endpoint (whichever the EP State admits), the
+        // authoritative pre/post strand scans, Set TR Dequeue to our enqueue position, and the
+        // drains around them. REUSED verbatim rather than reimplemented: this is the same cleanup
+        // the error chokepoint in `bot_transfer` performs, and it is the only code in the driver
+        // whose `live=0` post-scan is a real assertion. It is invoked HERE because the fold returns
+        // `Ok`, and `bot_transfer` only cleans on `Err` — without this call a folded transaction
+        // would be the one success path that could return with a dirty ring.
+        //
+        // `cause` is a log label only; `TransferError(13)` reads as "short transfer" on the `clean`
+        // line, which is what the fold is.
+        self.bot_clean_rings(slot_id, BotError::TransferError(13));
+        // `run_bot_stage` parks the failed stage record here on a timeout for recovery's evidence
+        // line. The fold IS the resolution, so drop it — otherwise a later transaction's recovery
+        // could attribute this stage's pipe to itself.
+        self.bot_failed = None;
+
+        Some(BotResult { status, residue })
+    }
+
     /// The single-attempt Bulk-Only Transport transaction: CBW -> (optional data) -> CSW.
     /// `bot_transfer` wraps this with Reset Recovery + one bounded retry.
     fn bot_transfer_once(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32, dir: Direction)
@@ -6738,7 +6882,22 @@ impl XhciController {
             self.bot_doorbell(slot_id, out_dci, false);
             if data_dci != out_dci { self.bot_doorbell(slot_id, data_dci, true); }
 
-            let (code, residue) = self.run_bot_stage(slot_id, in_dci, out_dci, data_trb_phys)?;
+            let stage = self.run_bot_stage(slot_id, in_dci, out_dci, data_trb_phys);
+            // ZERO-DATA CSW FOLD ([piusb41]) — BEFORE the outcome above is judged and before the
+            // `?` can propagate a timeout. The device may have skipped the data phase and put its
+            // 13-byte CSW where this data stage's buffer is; when it did, the transaction is
+            // complete already and stage 3 must never be built. See `bot_fold_zero_data_csw` for
+            // the criterion, the truncation rule, and why a CSW-stage wait after a fold is the
+            // phase shift this fix exists to prevent. IN only: an OUT data stage's buffer is
+            // host-written and the device cannot have put anything in it.
+            if !data_out {
+                if let Some(folded) = self.bot_fold_zero_data_csw(
+                    slot_id, *cdb.first().unwrap_or(&0), tag, data_phys, data_len)
+                {
+                    return Ok(folded);
+                }
+            }
+            let (code, residue) = stage?;
             // BOT-PHASE fix 3 — SHORT-TRANSFER HONESTY.
             //
             // The Transfer Event's TRB Transfer Length field is the RESIDUE: the bytes of this TD
@@ -8297,7 +8456,17 @@ impl XhciController {
         // slots[0..2] are behind the pointer, slots[2] IS the dequeue slot, slots[3..] are ahead.
         let at_deq_fresh = slots[2].1 == colour;
         let ahead_fresh = slots[3..].iter().any(|s| s.1 == colour);
-        let all_stale = slots.iter().all(|s| s.1 != colour);
+        // The two BEHIND-slots are excluded from this one clause, and only from this one.
+        // `slots[0]` and `slots[1]` sit at deq-2 and deq-1: events this pump ALREADY CONSUMED. A
+        // consumed event necessarily carries the CURRENT colour — that is what made it consumable —
+        // so including them made `all_stale` false on a ring where the producer had posted nothing
+        // at all. boot21's necropsy #1 is exactly that: a plain nothing-posted pattern that fell
+        // through every clause and was graded "inconclusive" by the catch-all. The proposition
+        // being tested is "nothing was posted that we have not already taken", which is a claim
+        // about the dequeue slot and the slots AHEAD of it, so it is computed over precisely those.
+        // The raw slot list printed below is UNCHANGED — a reader still sees both behind-slots'
+        // colours and can check this reasoning against the same line.
+        let all_stale = slots[2..].iter().all(|s| s.1 != colour);
         let pos_agree = hw_slot == sw_deq as i64;
         // Each clause claims only what its pattern can carry. None of them can name WHICH transfer
         // an event belongs to — that is the shape line's job — and none can prove a negative about
