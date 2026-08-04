@@ -39,7 +39,22 @@ lazy_static! {
 /// a stream of bogus `[serial] dropped N lines` markers about output that was never lost — fbcon
 /// mirrors every one of those lines to the framebuffer regardless. On a serial-less machine the UART
 /// path stays exactly what it always was: a no-op.
+///
+/// SERWIT-1D: it is also the CONFIGURATION the conservation law is asserted against. A line that this
+/// machine's 16550 never received because there is no 16550 is neither emitted nor lost, and calling it
+/// either one makes the ledger lie; see [`uart_absent`] and `serial_ring::DECLINED`.
 static UART_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// SERWIT-1D — has this machine been proven to have NO 16550 at 0x3F8?
+///
+/// `false` while the answer is still unknown (before the first `_print` resolves the lazy `SERIAL1`),
+/// which is the conservative reading: "unknown" must not license the weaker of the two configuration
+/// laws. `_print` runs long before any fixture, so by the time [`crate::serial_ring::serwit_verdict`]
+/// asks, the answer is settled and stays settled — `SERIAL1` is initialised once and never re-probed.
+#[inline]
+pub fn uart_absent() -> bool {
+    UART_STATE.load(core::sync::atomic::Ordering::Relaxed) == 2
+}
 
 #[doc(hidden)]
 pub fn _print(args: ::core::fmt::Arguments) {
@@ -107,14 +122,30 @@ pub fn _print(args: ::core::fmt::Arguments) {
                 }
                 crate::serial_ring::note_emitted();
             } else {
-                // No 16550 on this machine. Nothing was written, nothing was lost that fbcon does not
-                // already carry — and there is no reason to keep a backlog nobody will ever drain.
-                crate::serial_ring::drain(|_| {});
+                // No 16550 on this machine. Nothing was written, nothing was lost that fbcon and the
+                // FTDI mirror below do not already carry — and there is no reason to keep a backlog
+                // nobody will ever drain.
+                //
+                // SERWIT-1D: this outcome is DECLINED, and it is neither of the other two. It is not
+                // `emitted` — no byte reached a 16550, because there is none — and calling it emitted
+                // is the lie that `drain(|_| {})` used to tell, since `drain` charges `EMITTED` for
+                // every line it consumes and this sink is `|_| {}`. Nor is it `dropped`: the line is
+                // on the wire via the FTDI mirror, whose own conservation law is asserted separately
+                // by SERWIT-2's `ftdi` tap. So it gets its own terminal state and its own counter.
+                crate::serial_ring::note_declined();
+                crate::serial_ring::discard_staged();
             }
         } else if UART_STATE.load(Ordering::Relaxed) != 2 {
             // Contended. Defer rather than drop; if the ring is full the loss is COUNTED and the next
             // drain announces it on the wire as `[serial] dropped N lines`.
             crate::serial_ring::stage(args);
+        } else {
+            // SERWIT-1D: contended AND there is no 16550 — the branch that had no counter at all.
+            // Staging here would fill a ring nobody drains, so the line correctly goes nowhere on this
+            // transport; what was missing is the accounting for it. Un-counted, it left `SUBMITTED`
+            // with no matching term, which is precisely the shape of hole this whole module exists to
+            // make impossible.
+            crate::serial_ring::note_declined();
         }
     });
     // Mirror to the framebuffer console so diagnostics/panics are visible on hardware that has

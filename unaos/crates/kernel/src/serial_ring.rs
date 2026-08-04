@@ -78,12 +78,53 @@
 //!
 //! ### Accounting
 //! [`SUBMITTED`] counts every `_print`; [`EMITTED`] counts every line that actually reached the UART
-//! (direct, drained, or raw); [`DROPPED`] counts ring-full losses; [`STAGED`] counts deferrals. The
-//! conservation law the SERWIT-1 fixture ([`serwit_verdict`]) asserts is
+//! (direct, drained, or raw); [`DECLINED`] counts lines the 16550 path refused because this machine has
+//! no 16550; [`DROPPED`] counts ring-full losses; [`STAGED`] counts deferrals. The conservation law the
+//! SERWIT-1 fixture ([`serwit_verdict`]) asserts is
 //!
 //! ```text
-//!     SUBMITTED == EMITTED + DROPPED + in_flight()      (and, on a healthy transport, DROPPED == 0)
+//!     SUBMITTED == EMITTED + DECLINED + DROPPED + in_flight()   (and, always, DROPPED == 0)
 //! ```
+//!
+//! ### SERWIT-1D — why there are four terminal states and not three
+//!
+//! The law above used to read `SUBMITTED == EMITTED + DROPPED + in_flight()`, and on the bench x86
+//! machine it was **structurally unpassable**: a 2012 rMBP has no 16550 at 0x3F8, so `SERIAL1` holds
+//! `None`, [`note_emitted`] is unreachable, the staging branch is disabled (nobody would ever drain the
+//! ring), and `EMITTED` stayed at 0 for the whole life of the boot. Every capture ever taken on that
+//! bench — every one, going back months — printed
+//!
+//! ```text
+//!     :: SERWIT-1: FAIL — sent=150 (want 150) dropped=0 truncated=0 submitted=151 emitted=0 …
+//! ```
+//!
+//! Note the shape of that line: `sent` matched, `dropped` was 0, `truncated` was 0. Nothing was lost.
+//! The witness was convicting the machine for lacking hardware it does not use, while the 150 lines
+//! went out perfectly well over the FTDI cable. **That is a worse failure than the one it guards
+//! against**, because an instrument that is red in every boot forever teaches every reader to skip FAIL
+//! lines — and this tree has already lost a real `[wc-d]` verdict and a two-week panel regression to
+//! exactly that habit.
+//!
+//! The fix is not to relax the law but to state the right one. A line handed to a transport that does
+//! not exist on this machine ended in a **fourth** terminal state, distinct from all three others:
+//!
+//! * it is not `EMITTED` — no byte reached a 16550, because there is none;
+//! * it is not `DROPPED` — nothing was lost; the line is on the wire via the FTDI mirror, and *that*
+//!   transport's conservation law is asserted independently by SERWIT-2's `ftdi` tap;
+//! * it is not in flight — it was never staged.
+//!
+//! So it is `DECLINED`: refused by policy, not lost. This is the same distinction [`TapCounters`]
+//! already draws with `suppressed`, for the same reason — lumping "declined on purpose" in with "lost"
+//! makes a silently-lossy transport indistinguishable from a correctly-quiet one.
+//!
+//! **This does not weaken the law.** On a machine that HAS a 16550, `UART_STATE == 1` and both
+//! declining branches in `arch::serial::_print` are unreachable — they are guarded by the same single
+//! fact, `guard.is_some() == false`. So `DECLINED` is provably 0 there, the verdict *asserts* it is 0
+//! there, and the equation reduces term-for-term to the old one. No configuration that could fail
+//! before can pass now. What changes is only that the *absent*-16550 configuration, which previously
+//! had no statable law at all, now has one — and a stricter one in its own way: with no UART, `EMITTED`
+//! must be exactly 0, so any future code that charges `EMITTED` for a line that reached nothing (the
+//! lie the old `drain(|_| {})` told; see [`discard_staged`]) turns the verdict red.
 //!
 //! Before this module existed there was NO counter of any kind on any serial path — not a sequence
 //! number, not a drop count, nothing. A drop was undetectable after the fact by construction; the only
@@ -202,6 +243,11 @@ static TAIL: AtomicU64 = AtomicU64::new(0);
 pub static SUBMITTED: AtomicU64 = AtomicU64::new(0);
 /// Every line that actually reached the UART — direct, drained, or via the raw panic path.
 pub static EMITTED: AtomicU64 = AtomicU64::new(0);
+/// SERWIT-1D — lines the 16550 path DECLINED because this machine has no 16550. A terminal state of
+/// its own, and emphatically not loss: the line is on the wire via the FTDI mirror, whose own law
+/// SERWIT-2's `ftdi` tap asserts. Provably 0 on any machine that has a UART (both declining branches
+/// are unreachable there), which is why the verdict can assert `declined == 0` in that configuration.
+pub static DECLINED: AtomicU64 = AtomicU64::new(0);
 /// Lines lost to a full ring, cumulative. The conservation law's error term; must read 0.
 pub static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Lines that took the deferred path at least once (diagnostic — a deferred line is NOT a lost one).
@@ -245,6 +291,31 @@ pub fn note_submitted() {
 #[inline]
 pub fn note_emitted() {
     EMITTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// SERWIT-1D — count one line the 16550 path declined for want of a 16550. See [`DECLINED`].
+#[inline]
+pub fn note_declined() {
+    DECLINED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Does this machine lack a 16550, so that the DECLINED configuration law is the one to assert?
+///
+/// x86-only by construction. On aarch64 `SERIAL_PORT` is a unit struct whose `write_byte` is always
+/// driven (PL011 or Tegra NS16550) and whose `_print` always reaches `note_emitted`, so that arch has
+/// no declining branch to account for and the strict `DECLINED == 0` law is the correct one for it.
+/// The `cfg` makes this a literal `false` there — the Pi/Jetson code paths are untouched, byte for
+/// byte, and this whole arc is invisible from `arch/aarch64/serial.rs`.
+#[inline]
+fn uart_absent() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::serial::uart_absent()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 /// Lines currently sitting in the ring, staged but not yet drained.
@@ -369,7 +440,28 @@ pub fn stage(args: fmt::Arguments) -> bool {
 /// Stops at the first slot that is claimed but not yet published rather than skipping it: skipping
 /// would reorder the wire, and the staging writer is a handful of instructions from publishing, so the
 /// next drain picks it up. Bounded by [`SLOTS`] iterations, so this cannot lengthen a print unboundedly.
-pub fn drain<F: FnMut(&str)>(mut emit: F) {
+pub fn drain<F: FnMut(&str)>(emit: F) {
+    drain_into(emit, &EMITTED, true);
+}
+
+/// SERWIT-1D — empty the staging ring on a machine that has NO 16550, charging every line to
+/// [`DECLINED`] instead of [`EMITTED`].
+///
+/// This is what the no-UART branch of `arch::serial::_print` used to do as `drain(|_| {})`, and that
+/// spelling was an accounting lie: [`drain`] charges `EMITTED` for every line it consumes, so lines
+/// thrown into a `|_| {}` sink were counted as having reached the wire. It was invisible only because
+/// the verdict on that machine was already permanently red. (The window is narrow but real: lines can
+/// be staged before `UART_STATE` resolves to "absent", and those are exactly the lines this drains.)
+///
+/// [`report_losses`] is deliberately NOT run here: its only sink is the absent UART, so announcing into
+/// a no-op sink would clear `DROPPED_PENDING` without any reader ever seeing the marker. `DROPPED` is
+/// cumulative and is what the verdict asserts on, so nothing is lost by leaving the pending count
+/// standing.
+pub fn discard_staged() {
+    drain_into(|_| {}, &DECLINED, false);
+}
+
+fn drain_into<F: FnMut(&str)>(mut emit: F, ledger: &AtomicU64, announce: bool) {
     let mut guard = 0usize;
     loop {
         if guard > SLOTS {
@@ -391,11 +483,13 @@ pub fn drain<F: FnMut(&str)>(mut emit: F) {
         if let Ok(s) = core::str::from_utf8(bytes) {
             emit(s);
         }
-        EMITTED.fetch_add(1, Ordering::Relaxed);
+        ledger.fetch_add(1, Ordering::Relaxed);
         slot.state.store(EMPTY, Ordering::Release);
         TAIL.store(tail.wrapping_add(1), Ordering::Release);
     }
-    report_losses(&mut emit);
+    if announce {
+        report_losses(&mut emit);
+    }
 }
 
 /// Put any un-announced loss on the wire as a real, greppable line. This is the sentence that turns a
@@ -436,8 +530,9 @@ fn report_losses<F: FnMut(&str)>(emit: &mut F) {
 // parallel harness: several cores hammer `serial_println!` at once with SEQUENCE-NUMBERED lines, and
 // the BSP then asserts the conservation law above. Two independent proofs come out of one run:
 //
-//   1. **In-kernel** — `SUBMITTED == EMITTED + DROPPED + in_flight()` with `DROPPED == 0`. This is the
-//      assertion the `-> PASS` verdict is made of.
+//   1. **In-kernel** — `SUBMITTED == EMITTED + DECLINED + DROPPED + in_flight()` with `DROPPED == 0`,
+//      plus the configuration clause of [`SerwitTally::config_law`]. This is the assertion the
+//      `-> PASS` verdict is made of.
 //   2. **On the wire** — every stress line carries `c=<core> n=<seq>`, so the log itself can be
 //      checked externally (`awk '/\[serwit\]/' target/serial.log | wc -l` must equal cores × burst).
 //      A counter that agreed with itself while the wire lost lines would be a worthless instrument;
@@ -505,6 +600,215 @@ const SERWIT_PAD: &str = concat!(
 /// `TRUNCATED` at the moment the gate opened, so the verdict asserts on the WINDOW's delta.
 static SERWIT_TRUNC_BASE: AtomicU64 = AtomicU64::new(0);
 
+/// `DECLINED` at the moment the counters were snapshotted, so the verdict asserts on the WINDOW's
+/// delta like every other term. Baselined inside [`serwit_snapshot`] rather than returned from it:
+/// that is the exact instant `base_submitted` is taken, and the two must share one instant or the
+/// equation acquires a spurious slack. (`serwit_snapshot`'s signature belongs to a call site in
+/// `main.rs`; SERWIT-3 baselines `TRUNCATED` the same way, for the same reason.)
+static SERWIT_DECLINED_BASE: AtomicU64 = AtomicU64::new(0);
+
+// ─────────────────────────────────────────────────────────── BEGIN SERWIT-LAW ───────────────────────
+// Everything between these markers is PURE — no atomics, no `no_std` intrinsics, no I/O — so the law
+// can be extracted verbatim and exercised off-target. That is deliberate: the go-red paths of a witness
+// must be demonstrable without booting the machine the witness runs on, and a truth table produced by
+// re-typing the predicate into a scratch file proves nothing about the predicate that ships.
+
+/// One SERWIT-1 window's tallies, as deltas across the stress window.
+#[derive(Clone, Copy)]
+pub struct SerwitTally {
+    /// Lines the workers believe they submitted (their own count, from the other side).
+    pub sent: u64,
+    /// Lines the workers were supposed to submit.
+    pub want: u64,
+    /// `SUBMITTED` delta — every `_print` in the window, including the verdict's own header line.
+    pub submitted: u64,
+    /// `EMITTED` delta — lines that reached a real 16550.
+    pub emitted: u64,
+    /// `DECLINED` delta — lines the 16550 path refused for want of a 16550.
+    pub declined: u64,
+    /// `DROPPED` delta — ring-full losses. Must be 0.
+    pub dropped: u64,
+    /// `TRUNCATED` delta — lines that reached the ring but not intact. Must be 0.
+    pub truncated: u64,
+    /// Lines still sitting in the staging ring.
+    pub inflight: u64,
+    /// The configuration: is there no 16550 on this machine?
+    pub uart_absent: bool,
+}
+
+impl SerwitTally {
+    /// **Conservation.** Every submitted line ended in exactly one terminal state. This is the clause
+    /// that catches the original defect — a line that evaporates with no counter leaves `submitted`
+    /// with no matching term, and the equality fails by exactly the number of vanished lines.
+    pub const fn balanced(&self) -> bool {
+        self.submitted == self.emitted + self.declined + self.dropped + self.inflight
+    }
+
+    /// **The configuration clause**, and the reason the verdict names the transport on the wire.
+    ///
+    /// * A machine WITH a 16550 must decline nothing: both declining branches are guarded by
+    ///   `guard.is_some() == false`, so a non-zero `declined` there means lines were silently withheld
+    ///   from a working UART.
+    /// * A machine WITHOUT one must emit nothing: `note_emitted` is unreachable, so a non-zero
+    ///   `emitted` there means something charged the "reached the wire" ledger for a line that reached
+    ///   nothing — the exact lie `drain(|_| {})` used to tell.
+    ///
+    /// Each configuration therefore asserts the term the other one cannot check. Neither is a
+    /// weakening: the clause is an ADDITIONAL requirement on top of [`balanced`](Self::balanced), and
+    /// on a UART-bearing machine `declined == 0` collapses the conservation equation back, term for
+    /// term, to the three-state law this replaced.
+    pub const fn config_law(&self) -> bool {
+        if self.uart_absent {
+            self.emitted == 0
+        } else {
+            self.declined == 0
+        }
+    }
+
+    /// The full verdict. PASS demands all five clauses at once.
+    pub const fn passes(&self) -> bool {
+        self.sent == self.want
+            && self.dropped == 0
+            && self.truncated == 0
+            && self.balanced()
+            && self.config_law()
+    }
+
+    /// The transport that actually carried the window's lines, for the wire.
+    pub fn carrier(&self) -> &'static str {
+        if self.uart_absent {
+            "ftdi-mirror"
+        } else {
+            "16550@0x3F8"
+        }
+    }
+
+    /// The configuration clause, spelled for the wire, so a reader can tell WHICH law was asserted
+    /// without knowing the machine.
+    pub fn config_law_name(&self) -> &'static str {
+        if self.uart_absent {
+            "emitted==0"
+        } else {
+            "declined==0"
+        }
+    }
+}
+
+/// A tally for the truth table below. Argument order is the struct's field order:
+/// `sent, want, submitted, emitted, declined, dropped, truncated, inflight, uart_absent`.
+const fn tally(
+    sent: u64,
+    want: u64,
+    submitted: u64,
+    emitted: u64,
+    declined: u64,
+    dropped: u64,
+    truncated: u64,
+    inflight: u64,
+    uart_absent: bool,
+) -> SerwitTally {
+    SerwitTally {
+        sent,
+        want,
+        submitted,
+        emitted,
+        declined,
+        dropped,
+        truncated,
+        inflight,
+        uart_absent,
+    }
+}
+
+// ── THE TRUTH TABLE: what this witness can still catch, checked by the compiler ──────────────────
+//
+// The law is pure integer arithmetic, so it is `const`-evaluable, so its go-red paths can be asserted
+// at COMPILE TIME — every `./arroyo check`, on both arches, for free, emitting not one byte of code.
+// That is the point. The failure mode this whole change exists to remove is an instrument that carries
+// no information: a verdict red in every boot teaches readers to skip it, and a verdict that cannot go
+// red is strictly worse because it *looks* like evidence. A truth table pinned in the build is what
+// stops the second failure from replacing the first — an edit that relaxes the predicate into
+// unconditional PASS does not merely go unnoticed, it fails to compile.
+//
+// Numbers are the bench's real shape: 6 workers × (24 + 1 wide probe) = 150 sent, 151 submitted (the
+// verdict prints its own header line inside the window).
+
+// ── Configuration A: a machine WITH a 16550 (QEMU x86, the Pi). The pre-existing law, unchanged. ──
+const _: () = assert!(
+    tally(150, 150, 151, 151, 0, 0, 0, 0, false).passes(),
+    "uart present, every line reached the wire: must PASS"
+);
+const _: () = assert!(
+    tally(150, 150, 151, 149, 0, 0, 0, 2, false).passes(),
+    "uart present, two lines still staged: in flight is accounted, must PASS"
+);
+// THE ORIGINAL DEFECT — `try_lock` failed and the line evaporated with no counter anywhere.
+const _: () = assert!(
+    !tally(150, 150, 151, 144, 0, 0, 0, 0, false).passes(),
+    "uart present, 7 lines vanished uncounted: must FAIL"
+);
+const _: () = assert!(
+    !tally(150, 150, 151, 148, 0, 3, 0, 0, false).passes(),
+    "uart present, ring-full loss: must FAIL"
+);
+const _: () = assert!(
+    !tally(150, 150, 151, 151, 0, 0, 1, 0, false).passes(),
+    "uart present, a wide line clipped: must FAIL"
+);
+const _: () = assert!(
+    !tally(126, 150, 127, 127, 0, 0, 0, 0, false).passes(),
+    "uart present, a worker never finished its burst: must FAIL"
+);
+// The new clause on this side: lines withheld from a UART that exists and works.
+const _: () = assert!(
+    !tally(150, 150, 151, 140, 11, 0, 0, 0, false).passes(),
+    "uart present but 11 lines were declined anyway: must FAIL"
+);
+
+// ── Configuration B: a machine with NO 16550 (the bench rMBP). ──
+const _: () = assert!(
+    tally(150, 150, 151, 0, 151, 0, 0, 0, true).passes(),
+    "uart absent, every line declined and carried by the FTDI mirror: must PASS"
+);
+// The bench's OBSERVED tally with no fourth term — i.e. exactly what the tree printed before this
+// change, scored by the new predicate. It still reads FAIL, and for the right reason: 151 lines
+// submitted and nothing accounting for them is a hole, whatever the machine. The fix is the counter,
+// not the predicate; if the DECLINED sites were ever removed from `_print`, this is the case that
+// would fire.
+const _: () = assert!(
+    !tally(150, 150, 151, 0, 0, 0, 0, 0, true).passes(),
+    "uart absent, 151 submitted and nothing accounted for: must FAIL"
+);
+const _: () = assert!(
+    !tally(150, 150, 151, 0, 147, 0, 0, 0, true).passes(),
+    "uart absent, 4 lines fell out of the accounting: must FAIL"
+);
+// THE LIE THE OLD `drain(|_| {})` TOLD — charging EMITTED for lines that reached nothing. Note that
+// this case BALANCES; only the configuration clause catches it, which is why that clause exists.
+const _: () = assert!(
+    !tally(150, 150, 151, 9, 142, 0, 0, 0, true).passes(),
+    "uart absent, 9 lines claim to have reached a 16550 that is not there: must FAIL"
+);
+const _: () = assert!(
+    !tally(150, 150, 151, 0, 148, 3, 0, 0, true).passes(),
+    "uart absent, ring-full loss is still loss: must FAIL"
+);
+const _: () = assert!(
+    !tally(150, 150, 151, 0, 151, 0, 1, 0, true).passes(),
+    "uart absent, a wide line clipped: must FAIL"
+);
+const _: () = assert!(
+    !tally(126, 150, 127, 0, 127, 0, 0, 0, true).passes(),
+    "uart absent, a worker never finished its burst: must FAIL"
+);
+// Double-counting is a real accounting bug, never a sampling artefact: `submit` runs strictly before
+// any outcome for the same line, so `accounted > submitted` cannot happen by timing.
+const _: () = assert!(
+    !tally(150, 150, 151, 0, 152, 0, 0, 0, true).passes(),
+    "uart absent, one line charged to two ledgers: must FAIL"
+);
+// ───────────────────────────────────────────────────────────── END SERWIT-LAW ───────────────────────
+
 /// One worker's burst. Runs as an ordinary scheduled kernel task on its own core.
 pub fn serwit_worker(cpu: usize) {
     while !SERWIT_GO.load(Ordering::Acquire) {
@@ -548,10 +852,16 @@ pub fn serwit_all_done(workers: usize) -> bool {
 /// `base_*` are the counter snapshots taken before the workers were released, so the assertion is on
 /// the DELTA across the stress window and is unaffected by whatever the rest of the boot printed.
 ///
-/// PASS demands three things at once, not merely "no drops": every worker line was submitted
-/// (`sent == workers * burst`), nothing was dropped or truncated, and the conservation law balances
-/// exactly. A run that lost lines *without* counting them would fail the third clause — which is the
-/// clause that would have caught the original defect.
+/// PASS demands everything in [`SerwitTally::passes`] at once, not merely "no drops": every worker
+/// line was submitted (`sent == workers * burst`), nothing was dropped or truncated, the conservation
+/// law balances exactly, and the configuration clause for THIS machine's transport holds. A run that
+/// lost lines *without* counting them fails the balance clause — which is the clause that would have
+/// caught the original defect.
+///
+/// SERWIT-1D: both wire lines name the transport (`uart16550=present|absent`, `carrier=…`) and the
+/// configuration clause that was asserted (`law=…`), because "passed with a balanced ledger over a
+/// real UART" and "passed with a balanced ledger over the FTDI cable because there is no UART" are
+/// different facts and a reader with only the log must be able to tell them apart.
 pub fn serwit_verdict(workers: usize, base_submitted: u64, base_emitted: u64, base_dropped: u64) {
     // Anything still in flight belongs to the window too; drain it by taking the UART once more.
     // A plain `serial_println!` does that as a side effect (the holder drains before it writes).
@@ -561,50 +871,66 @@ pub fn serwit_verdict(workers: usize, base_submitted: u64, base_emitted: u64, ba
         SERWIT_BURST
     );
 
-    let sent = SERWIT_SENT.load(Ordering::Relaxed);
-    // +1: SERWIT-3's wide-line probe, one per worker.
-    let want = workers as u64 * (SERWIT_BURST + 1);
-    let truncated = TRUNCATED.load(Ordering::Relaxed) - SERWIT_TRUNC_BASE.load(Ordering::Relaxed);
-    let submitted = SUBMITTED.load(Ordering::Relaxed) - base_submitted;
-    let emitted = EMITTED.load(Ordering::Relaxed) - base_emitted;
-    let dropped = DROPPED.load(Ordering::Relaxed) - base_dropped;
-    let inflight = in_flight();
-    let staged = STAGED.load(Ordering::Relaxed);
     // `submitted` counts this verdict's own prints too, and `emitted` lags by however many lines are
-    // still queued behind this one; the law is stated with both slacks made explicit rather than
+    // still queued behind this one; the law is stated with every slack made explicit rather than
     // fudged, so `balanced` is a real equality and not a tolerance.
-    let balanced = submitted == emitted + dropped + inflight;
-    if sent == want && dropped == 0 && truncated == 0 && balanced {
+    let t = SerwitTally {
+        sent: SERWIT_SENT.load(Ordering::Relaxed),
+        // +1: SERWIT-3's wide-line probe, one per worker.
+        want: workers as u64 * (SERWIT_BURST + 1),
+        submitted: SUBMITTED.load(Ordering::Relaxed) - base_submitted,
+        emitted: EMITTED.load(Ordering::Relaxed) - base_emitted,
+        declined: DECLINED.load(Ordering::Relaxed) - SERWIT_DECLINED_BASE.load(Ordering::Relaxed),
+        dropped: DROPPED.load(Ordering::Relaxed) - base_dropped,
+        truncated: TRUNCATED.load(Ordering::Relaxed) - SERWIT_TRUNC_BASE.load(Ordering::Relaxed),
+        inflight: in_flight(),
+        uart_absent: uart_absent(),
+    };
+    let staged = STAGED.load(Ordering::Relaxed);
+    let uart = if t.uart_absent { "absent" } else { "present" };
+    if t.passes() {
         serial_println!(
-            ":: SERWIT-1: contended serial — {} lines sent (incl. {} wide-line probes at ~{}B), {} \
-             deferred to the staging ring, 0 dropped, 0 truncated, accounting balanced \
-             (submitted={} emitted={} inflight={}) -> PASS ::",
-            sent,
+            ":: SERWIT-1: contended serial [uart16550={} carrier={} law={}] — {} lines sent (incl. \
+             {} wide-line probes at ~{}B), {} deferred to the staging ring, 0 dropped, 0 truncated, \
+             accounting balanced (submitted={} emitted={} declined={} inflight={}) -> PASS ::",
+            uart,
+            t.carrier(),
+            t.config_law_name(),
+            t.sent,
             workers,
             SERWIT_PAD.len() + 39,
             staged,
-            submitted,
-            emitted,
-            inflight
+            t.submitted,
+            t.emitted,
+            t.declined,
+            t.inflight
         );
     } else {
         serial_println!(
-            ":: SERWIT-1: FAIL — sent={} (want {}) dropped={} truncated={} submitted={} emitted={} \
-             inflight={} balanced={} ::",
-            sent,
-            want,
-            dropped,
-            truncated,
-            submitted,
-            emitted,
-            inflight,
-            balanced
+            ":: SERWIT-1: FAIL — uart16550={} carrier={} sent={} (want {}) dropped={} truncated={} \
+             submitted={} emitted={} declined={} inflight={} balanced={} law({})={} ::",
+            uart,
+            t.carrier(),
+            t.sent,
+            t.want,
+            t.dropped,
+            t.truncated,
+            t.submitted,
+            t.emitted,
+            t.declined,
+            t.inflight,
+            t.balanced(),
+            t.config_law_name(),
+            t.config_law()
         );
     }
 }
 
 /// Snapshot the counters the verdict differences against.
 pub fn serwit_snapshot() -> (u64, u64, u64) {
+    // SERWIT-1D's fourth term shares this instant rather than travelling through the return type; see
+    // [`SERWIT_DECLINED_BASE`].
+    SERWIT_DECLINED_BASE.store(DECLINED.load(Ordering::Relaxed), Ordering::Relaxed);
     (
         SUBMITTED.load(Ordering::Relaxed),
         EMITTED.load(Ordering::Relaxed),

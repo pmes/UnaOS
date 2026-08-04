@@ -76,17 +76,98 @@ instructions wide and involves two genuinely concurrent lines; nothing is lost e
 
 ## Accounting and the conservation law
 
-Four counters, all `Relaxed` (they gate diagnostics and order nothing):
+Five counters, all `Relaxed` (they gate diagnostics and order nothing):
 
 ```
-SUBMITTED == EMITTED + DROPPED + in_flight()        and, on a healthy transport, DROPPED == 0
+SUBMITTED == EMITTED + DECLINED + DROPPED + in_flight()      and, always, DROPPED == 0
 ```
 
 `SUBMITTED` counts every `_print`; `EMITTED` counts every submitted line that reached the UART;
+`DECLINED` counts lines the 16550 path refused because this machine has no 16550 (see SERWIT-1D below);
 `DROPPED` counts ring-full losses; `STAGED` counts deferrals (a deferred line is *not* a lost one, and
 the two must never be conflated). The `[serial] dropped …` marker is deliberately **not** counted in
 `EMITTED` — it was never submitted by anyone, and counting it would corrupt the law in exactly the runs
 where the law matters.
+
+## SERWIT-1D — the law counted a transport this machine does not have
+
+SERWIT-1 printed `FAIL` in **every capture ever taken on the x86 bench**, going back to gr7. PASS = 0,
+everywhere:
+
+```
+:: SERWIT-1: FAIL — sent=150 (want 150) dropped=0 truncated=0 submitted=151 emitted=0 inflight=0
+   balanced=false ::
+```
+
+Read the numbers: `sent` matched `want`, `dropped` was 0, `truncated` was 0. **Nothing was lost.** The
+150 lines went out perfectly well — over the FTDI cable, as SERWIT-2's own tap confirms
+(`tap ftdi: submitted=1024 absorbed=1024 … dropped=0`, `-> PASS`). The witness was structurally
+unpassable on that machine, and the reason is mechanical:
+
+* a 2012 rMBP has no 16550 at 0x3F8, so `SERIAL1` holds `None`;
+* `note_emitted` sits inside `if let Some(uart) = guard.as_mut()`, so it is unreachable;
+* the staging branch is guarded by `UART_STATE != 2`, so with the port known-absent nothing is staged
+  either — correctly, since nobody would ever drain that ring;
+* the ring therefore stays empty, `drain` counts nothing, and `EMITTED` never leaves 0.
+
+The old three-state law convicted the machine for lacking hardware it does not use. **That is a worse
+defect than the one the witness guards against**, because an instrument red in every boot forever trains
+every reader to skip `FAIL` lines — and this tree has already lost a genuinely broken `[wc-d]` verdict
+(two boots, unexamined) and a two-week panel regression (`AT-RISK` printing every boot) to exactly that
+habit. Permanently-red instruments are camouflage for real failures.
+
+### The fix is a fourth terminal state, not a relaxed law
+
+A line handed to a transport that does not exist on this machine ended somewhere that is none of the
+three existing outcomes. It is not `EMITTED` (no byte reached a 16550, because there is none); it is not
+`DROPPED` (nothing was lost — the line is on the wire via the FTDI mirror, whose own conservation law
+SERWIT-2's `ftdi` tap asserts independently); it was never staged, so it is not in flight. It is
+`DECLINED`: refused by policy, not lost — the same distinction `TapCounters` already draws with
+`suppressed`, for the same reason.
+
+Two `_print` sites charge it, and one of them had **no counter at all** before this change — the
+contended-and-no-UART branch, a line leaving `SUBMITTED` with no matching term, which is precisely the
+shape of hole this module exists to make impossible. The other site replaced `drain(|_| {})` with
+`discard_staged()`, fixing a second latent lie: `drain` charges `EMITTED` for every line it consumes, so
+lines thrown into a `|_| {}` sink were being counted as having reached the wire.
+
+### Why this is not a weakening
+
+On a machine that HAS a 16550, `UART_STATE == 1` and both declining branches are unreachable — they are
+guarded by the same single fact, `guard.is_some() == false`. `DECLINED` is provably 0 there, **the
+verdict asserts it is 0 there**, and the equation reduces term for term to the law it replaced. No
+configuration that could fail before can pass now.
+
+What is new is a *configuration clause*, asserted on top of conservation, which gives each machine the
+term the other one cannot check:
+
+| configuration          | clause asserted | what it catches                                        |
+|------------------------|-----------------|--------------------------------------------------------|
+| 16550 present          | `declined == 0` | lines silently withheld from a UART that works         |
+| 16550 absent           | `emitted == 0`  | a line charged to "reached the wire" that reached nothing |
+
+Both verdict lines now name the transport and the clause, because "balanced over a real UART" and
+"balanced over the FTDI cable because there is no UART" are different facts and a reader holding only
+the log must be able to tell them apart:
+
+```
+:: SERWIT-1: contended serial [uart16550=absent carrier=ftdi-mirror law=emitted==0] — 150 lines sent
+   (incl. 6 wide-line probes at ~1287B), 0 deferred to the staging ring, 0 dropped, 0 truncated,
+   accounting balanced (submitted=151 emitted=0 declined=151 inflight=0) -> PASS ::
+```
+
+### The go-red paths are checked by the compiler
+
+The law is pure integer arithmetic over a `SerwitTally`, so it is `const`-evaluable, so its truth table
+is pinned in the build as `const _: () = assert!(…)` — fifteen rows, evaluated on every `./arroyo check`
+on both arches, emitting not one byte of code. A witness that cannot go red is strictly worse than the
+permanently-red one it replaces, because it *looks* like evidence; the truth table is what stops the
+second failure from quietly replacing the first. Mutation-checked, by extracting the marked block and
+compiling it with `--emit=metadata`:
+
+* `passes() := true` → rejected (`uart present, 7 lines vanished uncounted: must FAIL`)
+* `balanced()` with the `DECLINED` term removed → rejected (the no-16550 PASS row stops holding)
+* `config_law() := true` → rejected (both configuration rows fire)
 
 ## The SERWIT-1 witness
 
@@ -99,7 +180,8 @@ then asserts the conservation law across the stress window.
 
 Two independent proofs come out of one run, which is the point:
 
-1. **In-kernel** — the law balances with `dropped == 0`. This is what the `-> PASS` is made of.
+1. **In-kernel** — the law balances with `dropped == 0`, and this machine's configuration clause holds
+   (SERWIT-1D). This is what the `-> PASS` is made of.
 2. **On the wire** — every line is sequence-numbered, so the log falsifies the counter from outside:
    ```
    awk '/\[serwit\]/' target/serial.log | sed 's/.*\[serwit\]/[serwit]/' | sort -u | wc -l
@@ -109,13 +191,17 @@ Two independent proofs come out of one run, which is the point:
 Verdict line:
 
 ```
-:: SERWIT-1: contended serial — 72 lines sent, 48 deferred to the staging ring, 0 dropped,
-   accounting balanced (submitted=73 emitted=73 inflight=0) -> PASS ::
+:: SERWIT-1: contended serial [uart16550=present carrier=16550@0x3F8 law=declined==0] — 72 lines sent,
+   48 deferred to the staging ring, 0 dropped, accounting balanced
+   (submitted=73 emitted=73 declined=0 inflight=0) -> PASS ::
 ```
 
-The `deferred` figure is the load-bearing one: it says two thirds of the fixture's lines took the
-`try_lock`-failure branch, i.e. the branch that used to discard them. A run reporting `deferred=0`
-would mean the fixture failed to contend and proved nothing.
+On a UART-bearing machine the `deferred` figure is the load-bearing one: it says two thirds of the
+fixture's lines took the `try_lock`-failure branch, i.e. the branch that used to discard them. A run
+reporting `deferred=0` there would mean the fixture failed to contend and proved nothing. On a machine
+with **no** 16550 the deferral branch is correctly disabled (nobody would drain the ring), so
+`deferred=0` is the expected reading and `declined` is the figure that carries the traffic — see
+SERWIT-1D.
 
 **Acceptance criterion.** The gate's `PASS` tally must be *identical* across consecutive runs — that
 stability, not the absolute number, is the property being defended. Six consecutive
