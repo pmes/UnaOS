@@ -6435,6 +6435,78 @@ existing FORBIDs mean on a line they already guard.
   has exactly one caller, `drivers/gpu/kepler_display.rs`, inside the Kepler takeover, for which QEMU
   has no part. A QEMU run of this path would be vacuous. **Metal is the only verdict.**
 
+### DMG-REFUSE — the refusal arms, witnessed (2026-08-04)
+
+The paragraph above argues that a bad band must be `-EINVAL` rather than a silent whole-box present.
+Until this witness, **nothing in the tree could reach that arm, or either of the other two.** The one
+client, `crates/user-vug`, always passes the constant band `(0, 11)` on a 128-row surface for a window
+it owns, so `-EBADF`, `-EACCES` and `-EINVAL` were unreachable on QEMU *and* on metal. A refusal
+nothing can trip is not a protection; it is a comment.
+
+`dmg_refuse_launcher` (`arch/x86_64/syscall.rs`) runs **two** ring-3 slots, because `-EACCES` cannot be
+reached with one — `dmg-owner` holds a live window while `dmg-probe` fires 19 probes and packs a 3-bit
+result code per probe into its exit status. The launcher plants the owner's row id and a provably-free
+row id into the prober's data page (the U7x GO-word idiom), so no id is guessed; it computes the
+expected codes from the **live window table** and re-reads that table before releasing the owner, so a
+race in the fixture is reported `NOT RUN` rather than graded as a kernel defect.
+
+What makes it non-vacuous, in the order that matters:
+
+| leg | probes | the accepting twin that stops it passing by construction |
+|---|---|---|
+| `-EINVAL` | P5–P11 | P3 `(h=128, 0, 33)` **accepts** the identical band P11 `(h=32, 0, 33)` refuses — so the bound is provably *the window's own height*, not a constant. P0 accepts at exactly `y1 == h`; P7 refuses one past it. |
+| `-EACCES` | P12, P13 | P13's band is **malformed** and still returns `-EACCES`, not `-EINVAL` — the ownership gate provably runs *before* the range check, so the range check cannot be used to probe another process's surface height. |
+| `-EBADF` | P14–P17 | P15 is a malformed band on a **free row** and still `-EBADF` (same order proof); P16 is id 8 == `WIN_MAX`, P17 is `u64::MAX`. |
+| liveness | P18 | the same present as P0, fired **last** — the 13 refusals left the window presentable. |
+
+The strongest control is kernel-side and the fixture cannot forge it: `FB_PRESENT_COUNT` is bumped only
+after all four checks pass, so the launcher requires the delta across the whole run to be **exactly 6**,
+the number of accepting probes (`dmg-owner` presents zero times). A refusal arm that returned the right
+errno but still repainted would over-count; an accept that silently did nothing would under-count.
+Neither is visible to a return-code check.
+
+Result code `0` means **NEVER ATTEMPTED** and is also the reset value of the witness word, so a fixture
+that never spawned reports `0x0`, disagrees with all 19 expectations, and prints `first_bad=P0 got=0`.
+There is no bit pattern that means "pass" and is also the zero value — the inversion that made the
+storage witnesses untrustworthy. Every skip path prints the literal `NOT RUN`, and `x86-fat.spec`
+`FORBID`s it, so a skip fails the gate instead of passing quietly.
+
+**This witness says nothing about pixels.** It is headless-complete by design — with no panel
+`wm::create` refuses, `wm_id` is `WIN_NONE`, the shim no-ops, and the syscall still returns 0 and still
+bumps the counter — so what it proves is the **ABI's refusal contract**. Whether the compositor
+repaints only the banded rows is `wm::present_rows`, needs `UNAOS_WC=1` plus the Kepler takeover, and
+is claimed by no line it prints.
+
+#### Gate results (DMG-REFUSE, 2026-08-04)
+
+* `./arroyo check` — **EXIT=0**, all five legs green: `x86_64`, `aarch64`, and the three cfg-coverage
+  legs `x86-all` (which carries `witness`, so the fixture bodies are type-checked), `arm-pi`,
+  `arm-tegra`. No warning names the new code.
+* `./arroyo test 60` (headless QEMU x86, `witness` self-armed) — **19/19 probes agree, `presents=6`**,
+  `32 -> PASS` and zero `FAIL`/`PANIC`/`EXCEPTION:` in `target/serial.log`. Observed arrangement:
+  `ids=(a=0 b0=1 b1=2 free=7)` — the owner took row 0, the prober rows 1 and 2 (lowest-first), and
+  row 7 was free for the `-EBADF` probes, exactly as the launcher predicted from the table.
+* **Proven able to go red.** With `DMG_CODES[12]` deliberately flipped `2 -> 3` (a single-variable
+  break that leaves the accept count at 6), the same boot reported
+  `first_bad=P12 got=2 want_code=3 … presents=6 (want 6)` — the grader named the probe, and the
+  independent present-counter control stayed green, confirming the isolation. Reverted; re-run green.
+* **Spec regexes proven with the real grader, in both directions.** `mbench --replay` of the green
+  capture against the three added directives: `✅ MBENCH PASS — 1/1 required`. The same three against
+  the reddened capture: `❌ MBENCH FAIL — 0/1 required, 1 forbidden hit`. Worth noting from that run —
+  the three *default* FORBIDs (`-> FAIL`, `FAIL ::`, `PANIC`) all scored **0 hits** on a log containing
+  `:: DMG-REFUSE FAIL — … ::`. The dedicated `FORBID DMG-REFUSE FAIL` is not belt-and-braces; without
+  it the FAIL text is invisible to the gate, exactly as the `x86-fat.spec` comment already records for
+  the S-witnesses.
+* **NOT executed: the `test-fat` gate itself.** This host has no `mtools`, so `make-fat-img.sh` aborts
+  at `mcopy` before QEMU starts. The `REQUIRE` added to `x86-fat.spec` is therefore reasoned, not run —
+  see the provenance note in that file. (The first attempt at this *looked* green because
+  `target/serial.log` still held the previous plain-`test` run; the FAT invocation never rewrote it.
+  Caught by timestamp, and recorded here because the stale-capture trap is the more useful artefact.)
+* **aarch64 inert by address, not by feature.** The code lives in `arch/x86_64/syscall.rs`, which
+  `arch/mod.rs`'s `cfg_if!` never reaches on an aarch64 build, so the string `DMG-REFUSE` cannot occur
+  in an aarch64 capture. `pi4-regression.spec` is untouched. (Contrast the UVUG7-W lesson recorded in
+  `arroyo`: `witness` alone is *not* inert on aarch64 — that bit an arch-neutral file. This is not one.)
+
 ### Metal status (rMBP boot s69, 2026-08-03, trunk `2bdae79b`) — evidence class `unproven`
 
 **Neither confirmed nor refuted.** The boot ran the arc's code and the `[wc-h]` instrument fired on

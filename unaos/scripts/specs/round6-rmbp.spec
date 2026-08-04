@@ -78,6 +78,15 @@ REQUIRE S8-write:.*overwrote a live 16-byte pattern in place.*witness OK
 # --- alloc+chain, readback, -ENOSPC ceiling, MF2 intact; log rmbp-serial-2026-07-16-sitting.log)
 # --- — PROMOTED to REQUIRE, exactly as S8-write was.
 REQUIRE S9-grow:.*extended 0 -> .* bytes.*witness OK
+# --- DMG-REFUSE = the SYS_WIN_PRESENT_ROWS(33) refusal arms (-EBADF / -EACCES / -EINVAL), landed
+# --- 2026-08-04 and NEVER captured on metal — so PENDING, not REQUIRE. It is QEMU-green (headless-
+# --- complete: two inline ring-3 blobs, no block device, no panel), and `x86-fat.spec` REQUIREs it
+# --- there. Promote here after the first attended capture, exactly as S8-write and S9-grow were.
+# --- Calling it REQUIRE before metal has seen it is the FBCON-DMG mistake and is not repeated.
+# --- The two FORBIDs are live NOW regardless: a FAIL verdict or a `NOT RUN` skip fails this bench.
+PENDING DMG-REFUSE:.*19/19 probes.*witness OK
+FORBID DMG-REFUSE FAIL
+FORBID DMG-REFUSE:.*NOT RUN
 
 # --- VPERF (this boot DECIDES VPERF-WC — all landed post-bench, never on metal) -----
 # THE DECIDER: eff=WC → VPERF-WC dead; eff=UC (or any non-WC) → VPERF-WC triggers

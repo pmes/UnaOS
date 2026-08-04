@@ -2451,6 +2451,14 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         WINX7_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // DMG-REFUSE: both refusal-witness halves are register + inline-data only — their sole user stores
+    // are to their own RW data page and their own stack, and neither ever touches a surface. So a
+    // fault-kill means a window verb faulted a well-behaved program: a real bug, on its own counter,
+    // never the U1b `killed_unexpected` count. Not in PROCS, so the launcher times out to FAIL.
+    if name == "dmg-owner" || name == "dmg-probe" {
+        DMG_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     // SOCK-2: the UDP round-trip fixture is register + inline-data only (its only user store is the recv
     // buffer in its own data page) and well-behaved; a kill is a real SOCK-2 bug — its own counter, never
     // the U1b `killed_unexpected` count. Not in PROCS, so the launcher times out to FAIL on `SOCK2_DONE`.
@@ -2827,6 +2835,21 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
                     // worker threads terminate through `SYS_THREAD_EXIT`, which never enters this arm.
                     WINX7_WITNESS.store(a0 as u32, Ordering::Release);
                     WINX7_DONE.fetch_add(1, Ordering::AcqRel);
+                }
+                Some("dmg-probe") => {
+                    // DMG-REFUSE: the prober conveys its 19-probe sweep as a PACKED 57-bit status —
+                    // 3 bits per probe — so `a0` is stored WHOLE, not narrowed to u32 like every
+                    // bitmask fixture above it. Code 0 (never attempted) is the reset value, so a
+                    // fixture that died before probing reports 0 and grades as FAIL, never as a pass.
+                    DMG_PROBE_WITNESS.store(a0, Ordering::Release);
+                    DMG_DONE.fetch_add(1, Ordering::AcqRel);
+                }
+                Some("dmg-owner") => {
+                    // DMG-REFUSE: the owner half's 2-bit witness (created / released cleanly). It exists
+                    // only to hold a live window in a DIFFERENT address-space slot for the duration of
+                    // the prober's sweep — which is the only honest way to reach the -EACCES arm.
+                    DMG_OWNER_WITNESS.store(a0 as u32, Ordering::Release);
+                    DMG_DONE.fetch_add(1, Ordering::AcqRel);
                 }
                 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
                 Some("sock2-udp") => {
@@ -12645,7 +12668,9 @@ fn winx7_build() -> Option<U7xFix> {
 ///      working futex. It is a COUNTER rather than a sample of the parked set, which the first cut
 ///      used and which was flaky by construction: a park beginning and ending between two samples is
 ///      invisible, so a perfectly healthy run could report "no park observed" purely on timing.
-fn winx7_launcher(_demo_cpu: usize) {
+// DMG-REFUSE: `demo_cpu` lost its leading underscore here — WINX-7 itself still places its fixture by
+// name rather than by core, but the DMG-REFUSE launcher chained off this function's tail does use it.
+fn winx7_launcher(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
         return;
@@ -12754,6 +12779,611 @@ fn winx7_launcher(_demo_cpu: usize) {
             WINX7_DONE.load(Ordering::Acquire),
             WINX7_WITNESS_ALL
         );
+    }
+
+    // DMG-REFUSE: chain the SYS_WIN_PRESENT_ROWS refusal witness immediately after WINX-7, in program
+    // order on this one task — WINX-7's verdict has waited on its own teardown, so the window table is
+    // empty and two address-space slots are free. It runs BEFORE `winx8_launcher`/`pulsew_launcher`,
+    // which also create windows, so it never has to reason about their rows.
+    dmg_refuse_launcher(demo_cpu);
+}
+
+// =============================================================================================
+// DMG-REFUSE — the REFUSAL arms of `SYS_WIN_PRESENT_ROWS(33)`.
+//
+// WHY THIS EXISTS. The verb has three refusal arms — `-EBADF` (an out-of-range id, or a free row),
+// `-EACCES` (a live window owned by another slot) and `-EINVAL` (a malformed band). The `-EINVAL` arm
+// is the deliberate design choice of the whole FBCON-DMG commit: the syscall refuses a bad band rather
+// than silently degrading to a whole-box present, precisely so that a ring-3 damage bug is visible on
+// the first frame instead of costing full price forever. But the only client in the tree,
+// `crates/user-vug`, always passes the same constant band `(0, 11)` on a 128-row surface for a window
+// it owns — so until this fixture, NOTHING could reach any of the three arms, on QEMU or on metal. A
+// check nothing can trip proves nothing, and a refusal nothing can reach is not a protection, it is a
+// comment.
+//
+// SHAPE: TWO ring-3 slots, because `-EACCES` cannot be reached with one. `dmg-owner` creates a window
+// and parks; `dmg-probe` creates two windows of DIFFERENT heights and fires 19 probes at the verb,
+// packing a 3-bit result code per probe into its exit status. The launcher plants the owner's window
+// id and a provably-free id into the prober's data page (the U7x GO-word idiom), so the prober never
+// GUESSES an id — and the launcher computes what each probe SHOULD return from the live window table,
+// not from a constant, then re-reads that table after the prober is done to prove the ground truth did
+// not move underneath it.
+//
+// THE OWNERSHIP GATE IS NOT WEAKENED TO MAKE THIS TESTABLE. `-EACCES` is reached by ARRANGING the
+// situation — a second live ring-3 address space holding a window — which is the only honest way to
+// reach it and the reason this fixture is a pair rather than a single blob.
+//
+// EVERY REFUSAL IS PAIRED WITH AN ACCEPTING TWIN differing in exactly ONE field, which is what stops
+// the fixture from passing by construction:
+//   * P3 `(id_b0, 0, 33)` accepts on h=128 · P11 `(id_b1, 0, 33)` refuses on h=32 — the SAME band, so
+//     the bound is provably the WINDOW's own height and not a constant.
+//   * P0 `(id_b0, 0, 128)` accepts at exactly `y1 == h` · P7 `(id_b0, 0, 129)` refuses one past it.
+//   * P12/P13 refuse `-EACCES` on the owner's id · P0..P4 accept on the prober's own ids.
+// A verb that refused everything fails P0..P4 and P18; one that accepted everything fails all 13
+// refusals; one that returned a single constant errno fails at least two arms. There is no constant
+// return value that passes.
+//
+// ORDER IS WITNESSED, not assumed. P13 fires a MALFORMED band at another slot's window and must get
+// `-EACCES`, not `-EINVAL`; P15 fires a malformed band at a FREE row and must get `-EBADF`. Both prove
+// the ownership gate runs BEFORE the range check — which is the contract's explicit claim, and which
+// also means the range check cannot be used to probe another process's surface height.
+//
+// THE STRONGEST CONTROL IS KERNEL-SIDE AND THE FIXTURE CANNOT FORGE IT: `FB_PRESENT_COUNT` is bumped
+// only after ALL FOUR checks pass, and before the compositor shim. The launcher samples it around the
+// whole run and requires the delta to be EXACTLY 6 — the number of accepting probes. `dmg-owner`
+// deliberately presents zero times, so the delta is entirely the prober's. A refusal arm that returned
+// the right errno but still repainted would over-count; an accept that silently did nothing would
+// under-count. No return-code check can see either.
+//
+// PANEL-INDEPENDENT, so it runs in CI rather than only at the bench: headless, `wm::create` refuses and
+// `wm_id` is `WIN_NONE`, so the shim no-ops — but the syscall still returns 0 and still bumps the
+// counter. What this fixture proves is the ABI's refusal contract. It says NOTHING about whether the
+// compositor repaints only the banded rows; that is `video::wm::present_rows`, needs a real panel
+// (`UNAOS_WC=1` plus the Kepler takeover), and is not claimed by any line below.
+//
+// NOT PAINTED, deliberately: the fixture never writes its surfaces. `memory::clear_slot_fb` zeroes the
+// whole FB region on slot teardown, so a freshly allocated slot's surfaces are already zero and a
+// present of an unpainted surface can disclose nothing. Skipping the paint keeps ~10 lines of
+// hand-written assembly out of the blob, which is where this fixture is most likely to be wrong.
+//
+// x86-ONLY BY ADDRESS, not by feature: this whole file is behind `arch/mod.rs`'s
+// `cfg_if!(target_arch = "x86_64")`, so aarch64 never parses a byte of it. Syscall 33 is undefined
+// there and still answers from that dispatcher's `-ENOSYS` arm. The call site additionally inherits
+// `#[cfg(all(target_arch = "x86_64", feature = "witness"))]` from main.rs through the launcher chain.
+// =============================================================================================
+
+/// DMG-REFUSE: how many probes the prober fires. Must equal the table in the blob and `DMG_CODES`.
+const DMG_PROBES: usize = 19;
+
+/// DMG-REFUSE: the magic the launcher plants at the prober's param block. The prober refuses to run
+/// without it and exits with witness 0 — so "the launcher never planted" is loud, not a silent skip.
+const DMG_MAGIC: u64 = 0x444D_4752; // 'DMGR'
+
+/// DMG-REFUSE: the prober's param block, at the fixture's data page (window base + 0x3000) — the same
+/// offset the U7x GO word uses, and for the same reason (page 3 is the fixture's own RW data page, well
+/// clear of the stack which starts at +0x4000-16 and never descends 4 KiB).
+///   `+0x00` magic  ·  `+0x08` the owner's window id  ·  `+0x10` a provably-FREE window id
+///   `+0x18` (written BACK by the prober) its first window id  ·  `+0x20` its second window id
+const DMG_PARAM_OFF: usize = 0x3000;
+/// DMG-REFUSE: the owner's release word, at ITS data page +0x3000. The owner exits only when this goes
+/// nonzero, which the launcher does strictly AFTER the prober has finished — so the owner's window is
+/// provably live for the whole probe sweep.
+const DMG_GO_OFF: usize = 0x3000;
+
+/// DMG-REFUSE: the expected result CODE for each probe, in table order. The codes are the prober's own
+/// classification alphabet: 0 = NEVER ATTEMPTED, 1 = returned 0, 2 = `-EACCES`, 3 = `-EBADF`,
+/// 4 = `-EINVAL`, 5 = some other negative, 6 = some other non-zero positive.
+///
+/// 0 MEANING "NEVER ATTEMPTED" IS THE WHOLE ABSENCE STORY. It is also the reset value of the witness
+/// word, so a fixture that never spawned, or died at its first instruction, reports `0x0` — which
+/// disagrees with all 19 expectations and prints `first_bad=P0 got=0`. There is no bit pattern that
+/// means "pass" and is also the zero value, which is exactly the defect that made the storage
+/// witnesses untrustworthy on this project.
+const DMG_CODES: [u8; DMG_PROBES] = [
+    1, 1, 1, 1, 1, // P0..P4  accepts (legal bands on the prober's OWN windows)
+    4, 4, 4, 4, 4, 4, 4, // P5..P11  -EINVAL (bad ranges, incl. the per-window-height pair with P3)
+    2, 2, // P12,P13  -EACCES (the owner's live window; P13's band is malformed => ORDER proof)
+    3, 3, 3, 3, // P14..P17 -EBADF (a free row x2 => ORDER proof, then two out-of-range ids)
+    1, // P18  accept, LAST — the window still presents after all 13 refusals
+];
+
+/// DMG-REFUSE: how many probes expect a `0` return, i.e. the exact `FB_PRESENT_COUNT` delta the whole
+/// run must produce. Derived from `DMG_CODES` so it can never drift from the table.
+const DMG_ACCEPTS: u64 = {
+    let mut n = 0u64;
+    let mut i = 0;
+    while i < DMG_PROBES {
+        if DMG_CODES[i] == 1 {
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+};
+
+/// DMG-REFUSE: `DMG_CODES` packed the way the prober packs its own observations — 3 bits per probe,
+/// probe `i` at bit `3*i`. 19 * 3 = 57 bits, so it fits a `u64` with room to spare.
+const DMG_EXPECT: u64 = {
+    let mut w = 0u64;
+    let mut i = 0;
+    while i < DMG_PROBES {
+        w |= (DMG_CODES[i] as u64) << (3 * i);
+        i += 1;
+    }
+    w
+};
+
+// DMG-REFUSE ring-3 fixtures. Register + inline-data only, position-independent (RIP-relative), the
+// WINX-1/U7x blob idiom. Both convey their witness as their `SYS_EXIT` status, routed BY NAME in the
+// `SYS_EXIT` arm (x86 has no `SYS_REPORT`).
+//
+// REGISTER DISCIPLINE, and it is load-bearing: `syscall` destroys RCX and R11 in HARDWARE, and this
+// kernel's sysret tail additionally scrubs rdi/rsi/rdx/r8-r10. Only rbx, rbp, r12-r15 (and rsp) survive
+// a syscall here — the same set WINX-1 and the U7x pair rely on. So every value that must live across a
+// probe is in r12-r15, and rcx/rdx/rdi/rsi are recomputed inside each iteration.
+//
+// `dmg-probe` register map:
+//   r12 = the 57-bit witness accumulator   r13 = the probe index i
+//   r14 = the probe table VA               r15 = the resolved-id array (on its own stack)
+//
+// THE PROBE TABLE IS DATA, NOT CODE. Each 24-byte entry is `(selector, y0, y1)` and the loop is a
+// single ~40-instruction body, so the 19 probes cost no assembly at all beyond the table. That is the
+// point: hand-written assembly is where this fixture is most likely to be wrong, and a table-driven
+// sweep collapses 19 chances to get it wrong into one. The selector indexes the id array the setup
+// builds on the stack, which is how a probe can name an id the fixture only learns at runtime:
+//   0 = the prober's 128x128 window   1 = the prober's 128x32 window   2 = the OWNER's window
+//   3 = a provably-free row           4 = 8 (== WIN_MAX, the first out-of-range id)
+//   5 = u64::MAX (a wildly out-of-range id)
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_dmg_blob_start
+unaos_user_dmg_blob_start:
+    .balign 16
+    .globl unaos_user_dmg_owner
+unaos_user_dmg_owner:
+    xor  r12d, r12d                           // witness = 0
+    lea  rbx, [rip + unaos_user_dmg_blob_start]
+    add  rbx, 0x3000                          // rbx = the GO word VA (own RW data page)
+
+    // (0) SYS_WIN_CREATE(128, 128). This window is the ENTIRE point of this half: it is the live
+    //     window owned by a DIFFERENT address-space slot that the prober's -EACCES probes need.
+    mov  rax, 29
+    mov  rdi, 128
+    mov  rsi, 128
+    syscall
+    test rax, rax
+    js   59f                                  // no window -> exit with an empty witness (loud)
+    or   r12, 1                               // bit0: created
+
+    // (1) Park until the launcher releases GO. SYS_SLEEP_MS is a real blocking sleep that deschedules,
+    //     so this half never hogs a core (unlike the U7x pair, whose GO spins forced a third AP) — which
+    //     is why this fixture needs no dedicated core and cannot deadlock the launcher's own polling.
+    //     Bounded: 3000 * 20ms = 60 s, far past the launcher's own deadlines.
+    mov  r13, 3000
+50: mov  rax, [rbx]
+    test rax, rax
+    jnz  58f
+    mov  rax, 5                               // SYS_SLEEP_MS
+    mov  rdi, 20
+    syscall
+    dec  r13
+    jnz  50b
+    jmp  59f                                  // never released -> exit WITHOUT bit1 (the launcher FAILs)
+58: or   r12, 2                               // bit1: released cleanly by the launcher
+59: mov  rax, 2                               // SYS_EXIT(witness)
+    mov  rdi, r12
+    syscall
+51: jmp  51b                                  // sys_exit never returns; guard
+
+    .balign 16
+    .globl unaos_user_dmg_probe
+unaos_user_dmg_probe:
+    xor  r12d, r12d                           // witness = 0 == every probe NEVER ATTEMPTED
+    lea  rbx, [rip + unaos_user_dmg_blob_start]
+    add  rbx, 0x3000                          // rbx = the param block VA
+
+    // (0) The planted magic. Without it the ids are garbage, so the only honest thing to do is refuse
+    //     to run and report a witness of 0 — which the launcher grades as FAIL, never as a pass.
+    mov  rax, [rbx]
+    mov  rdx, 0x444D4752
+    cmp  rax, rdx
+    jne  79f
+
+    // (1) SYS_WIN_CREATE(128, 128) -> the tall window. h = 128.
+    mov  rax, 29
+    mov  rdi, 128
+    mov  rsi, 128
+    syscall
+    test rax, rax
+    js   79f
+    mov  r13, rax                             // (temporarily) id_b0
+
+    // (2) SYS_WIN_CREATE(128, 32) -> the SHORT window. h = 32. Its whole reason for existing is P11:
+    //     the identical band that P3 accepts on h=128 must be refused here, which is the only way to
+    //     witness that the bound is read from THIS row rather than from a constant.
+    mov  rax, 29
+    mov  rdi, 128
+    mov  rsi, 32
+    syscall
+    test rax, rax
+    js   79f
+    mov  r14, rax                             // (temporarily) id_b1
+
+    // (3) Build the resolved-id array on our own stack. rsp starts at window base + 0x4000 - 16, and
+    //     the param block is at +0x3000, so 48 bytes of stack cannot collide with it.
+    sub  rsp, 48
+    mov  r15, rsp                             // r15 = id array base (survives syscalls)
+    mov  [r15 + 0], r13                       // sel 0 = the 128x128 window
+    mov  [r15 + 8], r14                       // sel 1 = the 128x32 window
+    mov  rax, [rbx + 8]
+    mov  [r15 + 16], rax                      // sel 2 = the OWNER's window (planted)
+    mov  rax, [rbx + 16]
+    mov  [r15 + 24], rax                      // sel 3 = a provably-free row (planted)
+    mov  qword ptr [r15 + 32], 8              // sel 4 = WIN_MAX, the first out-of-range id
+    mov  qword ptr [r15 + 40], -1             // sel 5 = u64::MAX, wildly out of range
+
+    // (4) Report our own ids BACK through the param block, so the launcher can cross-check them
+    //     against the live window table rather than trusting its own prediction.
+    mov  [rbx + 24], r13
+    mov  [rbx + 32], r14
+
+    lea  r14, [rip + unaos_user_dmg_table]    // r14 = table base (r13/r14 re-purposed from here)
+    xor  r13d, r13d                           // r13 = probe index i
+
+70: cmp  r13, 19
+    jae  78f
+    mov  rax, r13
+    imul rax, rax, 24                         // entry stride
+    add  rax, r14
+    mov  rcx, [rax + 0]                       // selector
+    mov  rdi, [r15 + rcx*8]                   // -> the resolved window id
+    mov  rsi, [rax + 8]                       // y0
+    mov  rdx, [rax + 16]                      // y1
+    mov  rax, 33                              // SYS_WIN_PRESENT_ROWS
+    syscall
+    // rax = rc. rcx and r11 are gone (hardware), rdi/rsi/rdx scrubbed — none are live across this.
+
+    // Classify rc into a 3-bit code in rdx.
+    test rax, rax
+    jz   71f
+    cmp  rax, -13
+    jz   72f
+    cmp  rax, -9
+    jz   73f
+    cmp  rax, -22
+    jz   74f
+    test rax, rax
+    js   75f
+    mov  edx, 6                               // some other NON-ZERO POSITIVE return
+    jmp  76f
+71: mov  edx, 1                               // returned 0
+    jmp  76f
+72: mov  edx, 2                               // -EACCES
+    jmp  76f
+73: mov  edx, 3                               // -EBADF
+    jmp  76f
+74: mov  edx, 4                               // -EINVAL
+    jmp  76f
+75: mov  edx, 5                               // some other NEGATIVE errno
+
+    // Pack: witness |= code << (3 * i). 3 * 18 = 54, so the shift never leaves the word.
+76: mov  rcx, r13
+    lea  rcx, [rcx + rcx*2]                   // rcx = 3*i; cl is the shift count
+    shl  rdx, cl
+    or   r12, rdx
+    inc  r13
+    jmp  70b
+
+78: add  rsp, 48
+79: mov  rax, 2                               // SYS_EXIT(witness)
+    mov  rdi, r12
+    syscall
+77: jmp  77b                                  // sys_exit never returns; guard
+
+    // ---- the probe table: 19 entries of (selector, y0, y1), read RIP-relative out of the RX-RO code
+    // ---- page. Kept in EXACT correspondence with `DMG_CODES` above; the launcher grades against that.
+    .balign 8
+unaos_user_dmg_table:
+    .quad 0, 0,   128                         // P0  accept — y1 == h exactly (the boundary that must NOT refuse)
+    .quad 0, 0,   1                           // P1  accept — the minimum legal band
+    .quad 0, 127, 128                         // P2  accept — the last row
+    .quad 0, 0,   33                          // P3  accept — 33 rows on h=128 (accepting twin of P11)
+    .quad 1, 0,   32                          // P4  accept — the full height of the SHORT window
+    .quad 0, 64,  64                          // P5  EINVAL — empty (y1 == y0)
+    .quad 0, 64,  32                          // P6  EINVAL — inverted
+    .quad 0, 0,   129                         // P7  EINVAL — one past h
+    .quad 0, 0,   -1                          // P8  EINVAL — y1 = u64::MAX (no truncation in the bound)
+    .quad 0, 128, 128                         // P9  EINVAL — at h, and empty
+    .quad 0, 128, 129                         // P10 EINVAL — wholly past h
+    .quad 1, 0,   33                          // P11 EINVAL — the SAME band P3 accepts, on h=32
+    .quad 2, 0,   11                          // P12 EACCES — the owner's live window, a VALID band
+    .quad 2, 64,  32                          // P13 EACCES — the owner's window, a MALFORMED band (ORDER)
+    .quad 3, 0,   11                          // P14 EBADF  — a free row, a valid band
+    .quad 3, 64,  32                          // P15 EBADF  — a free row, a malformed band (ORDER)
+    .quad 4, 0,   11                          // P16 EBADF  — id 8 == WIN_MAX, the first out-of-range id
+    .quad 5, 0,   11                          // P17 EBADF  — id u64::MAX
+    .quad 0, 0,   128                         // P18 accept — LAST: the window still presents after 13 refusals
+
+    .globl unaos_user_dmg_blob_end
+unaos_user_dmg_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_dmg_blob_start: u8;
+    static unaos_user_dmg_blob_end: u8;
+    static unaos_user_dmg_owner: u8;
+    static unaos_user_dmg_probe: u8;
+}
+
+/// DMG-REFUSE: the prober's packed 19-probe observation (its `SYS_EXIT` status, routed by name).
+static DMG_PROBE_WITNESS: AtomicU64 = AtomicU64::new(0);
+/// DMG-REFUSE: the owner's 2-bit witness — bit0 it created its window, bit1 it was released cleanly.
+static DMG_OWNER_WITNESS: AtomicU32 = AtomicU32::new(0);
+/// DMG-REFUSE: fixtures that reached their witness exit (want 2). Gates the launcher's reads.
+static DMG_DONE: AtomicU32 = AtomicU32::new(0);
+/// DMG-REFUSE: a fault-kill of either half. Both are well-behaved (register + inline data, and the only
+/// user stores are to their own RW data page and their own stack), so a kill is a real bug here.
+static DMG_KILLED: AtomicU32 = AtomicU32::new(0);
+/// DMG-REFUSE: the owner's full witness — created AND released cleanly.
+const DMG_OWNER_ALL: u32 = 0x3;
+
+/// DMG-REFUSE: build one fixture slot (the `u7x_build` shape) — allocate, scrub the whole program
+/// window (so no prior tenant's bytes can be mistaken for a planted param block or a released GO),
+/// copy the shared two-entry blob into the RX-RO code page through the identity alias, and return the
+/// run params for the requested entry symbol.
+fn dmg_build(entry_sym: *const u8) -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_dmg_blob_start as usize;
+    let bend = &raw const unaos_user_dmg_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "DMG-REFUSE blob does not fit in a code page");
+    let off = (entry_sym as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// DMG-REFUSE: the live window table, as two bitmaps — every OCCUPIED row, and the rows owned by slot
+/// `s`. This is the launcher's GROUND TRUTH: the expectation table is built from it and re-verified
+/// against it, so no probe is graded against a prediction.
+fn dmg_win_masks(s: usize) -> (u32, u32) {
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    let mut occ = 0u32;
+    let mut own = 0u32;
+    for i in 0..WIN_MAX {
+        if t[i].owner != WIN_OWNER_FREE {
+            occ |= 1 << i;
+            if t[i].owner == s {
+                own |= 1 << i;
+            }
+        }
+    }
+    (occ, own)
+}
+
+/// DMG-REFUSE: read probe `i`'s 3-bit code out of a packed witness word.
+fn dmg_code(w: u64, i: usize) -> u32 {
+    ((w >> (3 * i)) & 0x7) as u32
+}
+
+/// DMG-REFUSE launcher + verdict. Chained off `winx7_launcher`'s tail in program order.
+///
+/// Flow, and every step's failure prints a line carrying the literal `NOT RUN` rather than returning
+/// silently — a witness that can skip quietly is the defect this fixture exists to avoid:
+///   1. One-shot. Sample `FB_PRESENT_COUNT`. Require the window table to be EMPTY at entry (it is: the
+///      WINX-7 verdict waited on its own teardown, and the two later window witnesses run after us).
+///   2. Build + spawn `dmg-owner`; wait (bounded) until its window is really in the table, then read
+///      its row id KERNEL-SIDE. Pick `id_free` as the HIGHEST free row — `sys_win_create` allocates
+///      strictly lowest-first, so a high row cannot be handed to the prober while low rows are free.
+///   3. Build `dmg-probe`, PLANT `(magic, id_a, id_free)` into its data page, spawn it, wait for its
+///      witness exit.
+///   4. RE-READ the table before releasing the owner: `id_a` must still be the owner's and `id_free`
+///      must still be free, or the run is reported NOT RUN rather than graded — a fixture that cannot
+///      tell its own race from a kernel bug is worse than no fixture.
+///   5. Release the owner, wait for its exit and both slots' teardown, then grade.
+fn dmg_refuse_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let presents_before = fb_present_count();
+    let (occ_entry, _) = dmg_win_masks(usize::MAX);
+    if occ_entry != 0 {
+        serial_println!(
+            ":: DMG-REFUSE: the window table was not empty at entry (occupied={:#04x}) — refusal witness NOT RUN ::",
+            occ_entry
+        );
+        return;
+    }
+
+    serial_println!(
+        ":: DMG-REFUSE: SYS_WIN_PRESENT_ROWS(33) refusal arms — two ring-3 slots, {} probes across -EBADF/-EACCES/-EINVAL and their accepting twins ::",
+        DMG_PROBES
+    );
+
+    // 2. The OWNER half. Its core: a sibling if the pool has one, else this demo's — neither half spins
+    //    (the owner blocks in SYS_SLEEP_MS, the prober runs straight through), so sharing cannot wedge.
+    let Some(owner) = dmg_build(&raw const unaos_user_dmg_owner) else {
+        serial_println!(
+            ":: DMG-REFUSE: no free address-space slot for the owner half — refusal witness NOT RUN ::"
+        );
+        return;
+    };
+    let owner_cpu = crate::arch::smp::worker_cpu(1).unwrap_or(demo_cpu);
+    crate::arch::sched::spawn_user_in_space("dmg-owner", owner.entry, owner.sp, owner_cpu, owner.cr3);
+
+    let odeadline = crate::arch::ticks() + 5000;
+    while !winx_slot_has_window(owner.slot) && crate::arch::ticks() < odeadline {
+        crate::arch::sched::yield_now();
+    }
+    let (occ_a, own_a) = dmg_win_masks(owner.slot);
+    if own_a.count_ones() != 1 {
+        serial_println!(
+            ":: DMG-REFUSE: the owner half never created exactly one window within 5000ms (occupied={:#04x} owned={:#04x}) — refusal witness NOT RUN ::",
+            occ_a, own_a
+        );
+        dmg_release_go(owner.slot);
+        return;
+    }
+    let id_a = own_a.trailing_zeros() as u64;
+    // The HIGHEST free row. `sys_win_create` scans lowest-first, so this row cannot be allocated to the
+    // prober's two windows while lower rows remain free — it is free at plant time and provably stays so.
+    let Some(id_free) = (0..WIN_MAX).rev().find(|&i| occ_a & (1 << i) == 0).map(|i| i as u64) else {
+        serial_println!(
+            ":: DMG-REFUSE: no free window row to probe -EBADF with (occupied={:#04x}) — refusal witness NOT RUN ::",
+            occ_a
+        );
+        dmg_release_go(owner.slot);
+        return;
+    };
+
+    // 3. The PROBER half, with the owner's id and the free id planted into its data page.
+    let Some(probe) = dmg_build(&raw const unaos_user_dmg_probe) else {
+        serial_println!(
+            ":: DMG-REFUSE: no free address-space slot for the prober half — refusal witness NOT RUN ::"
+        );
+        dmg_release_go(owner.slot);
+        return;
+    };
+    unsafe {
+        let p = crate::arch::memory::slot_backing_ptr(probe.slot).add(DMG_PARAM_OFF) as *mut u64;
+        core::ptr::write_volatile(p.add(1), id_a);
+        core::ptr::write_volatile(p.add(2), id_free);
+        // The magic LAST: it is the prober's proof that the ids beside it are real, so it must become
+        // visible only after they are. x86-TSO keeps these stores in program order.
+        core::ptr::write_volatile(p, DMG_MAGIC);
+    }
+    crate::arch::sched::spawn_user_in_space("dmg-probe", probe.entry, probe.sp, demo_cpu, probe.cr3);
+
+    let pdeadline = crate::arch::ticks() + 10_000;
+    while DMG_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < pdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let witness = DMG_PROBE_WITNESS.load(Ordering::Acquire);
+    let presents = fb_present_count() - presents_before;
+
+    // The ids the prober says it was given, read back out of its own param block.
+    let (rep_b0, rep_b1) = unsafe {
+        let p = crate::arch::memory::slot_backing_ptr(probe.slot).add(DMG_PARAM_OFF) as *const u64;
+        (core::ptr::read_volatile(p.add(3)), core::ptr::read_volatile(p.add(4)))
+    };
+
+    // 4. GROUND TRUTH RE-READ, before the owner is released and while every window is still live.
+    let (occ_re, own_re) = dmg_win_masks(owner.slot);
+    // The two ids below are RING 3's report, so they are bound-checked BEFORE they reach a shift — a
+    // fixture bug must not become a kernel shift-overflow panic in the launcher that grades it.
+    let ground_ok = rep_b0 < WIN_MAX as u64
+        && rep_b1 < WIN_MAX as u64
+        && own_re == (1 << id_a)
+        && occ_re & (1 << id_free) == 0
+        && occ_re & (1 << rep_b0) != 0
+        && occ_re & (1 << rep_b1) != 0
+        && rep_b0 != id_a
+        && rep_b1 != id_a
+        && rep_b0 != rep_b1;
+    if !ground_ok {
+        serial_println!(
+            ":: DMG-REFUSE: the window table moved under the probe (id_a={} id_free={} b0={} b1={} entry={:#04x} recheck={:#04x} owned={:#04x}) — refusal witness NOT RUN ::",
+            id_a, id_free, rep_b0, rep_b1, occ_a, occ_re, own_re
+        );
+        dmg_release_go(owner.slot);
+        return;
+    }
+
+    // 5. Release the owner and collect both exits + the teardown proof.
+    dmg_release_go(owner.slot);
+    let vdeadline = crate::arch::ticks() + 8000;
+    while DMG_DONE.load(Ordering::Acquire) < 2 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let owner_witness = DMG_OWNER_WITNESS.load(Ordering::Acquire);
+    let killed = DMG_KILLED.load(Ordering::Acquire);
+
+    let tdeadline = crate::arch::ticks() + 4000;
+    while (winx_slot_has_window(owner.slot) || winx_slot_has_window(probe.slot))
+        && crate::arch::ticks() < tdeadline
+    {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = !winx_slot_has_window(owner.slot) && !winx_slot_has_window(probe.slot);
+
+    // Grade probe by probe, so a disagreement NAMES the probe rather than handing over a bitmask to
+    // decode by hand. `first_bad` is what makes deliberately breaking one expectation a cheap way to
+    // prove this witness can go red.
+    let mut first_bad = usize::MAX;
+    for i in 0..DMG_PROBES {
+        if dmg_code(witness, i) != DMG_CODES[i] as u32 {
+            first_bad = i;
+            break;
+        }
+    }
+
+    // SERIAL SETTLE — see `winx_launcher`: `serial::_print` drops lines on `try_lock` contention, and
+    // this verdict lands right after a compositor create/present/close burst printed from another core.
+    // Everything reported is already latched in locals, and both fixtures are gone, so yielding is free.
+    for _ in 0..64 {
+        crate::arch::sched::yield_now();
+    }
+
+    if first_bad == usize::MAX
+        && presents == DMG_ACCEPTS
+        && owner_witness == DMG_OWNER_ALL
+        && cleared
+        && killed == 0
+        && DMG_DONE.load(Ordering::Acquire) == 2
+    {
+        serial_println!(
+            ":: DMG-REFUSE: SYS_WIN_PRESENT_ROWS(33) refused every malformed band — {}/{} probes from two ring-3 slots agree: 6 legal bands returned 0, 7 bad ranges -EINVAL, 2 presents of another slot's LIVE window -EACCES, 4 free/out-of-range ids -EBADF; ownership is checked BEFORE the range (a malformed band on another slot's window is still -EACCES, on a free row still -EBADF), the height bound is the WINDOW's own (33 rows accepted on h=128, refused on h=32), the window still presented after all 13 refusals, and the present counter advanced by exactly {} — no refusal reached the compositor == expected — witness OK ::",
+            DMG_PROBES, DMG_PROBES, presents
+        );
+    } else {
+        let (got, want) = if first_bad == usize::MAX {
+            (0u32, 0u32)
+        } else {
+            (dmg_code(witness, first_bad), DMG_CODES[first_bad] as u32)
+        };
+        serial_println!(
+            ":: DMG-REFUSE FAIL — probes={:#018x} want={:#018x} first_bad=P{} got={} want_code={} ids=(a={} b0={} b1={} free={}) presents={} (want {}) owner_witness={:#x} (want {:#x}) done={}/2 killed={} cleared={} tables=(entry={:#04x} recheck={:#04x}) ::",
+            witness,
+            DMG_EXPECT,
+            if first_bad == usize::MAX { 255 } else { first_bad },
+            got,
+            want,
+            id_a,
+            rep_b0,
+            rep_b1,
+            id_free,
+            presents,
+            DMG_ACCEPTS,
+            owner_witness,
+            DMG_OWNER_ALL,
+            DMG_DONE.load(Ordering::Acquire),
+            killed,
+            cleared,
+            occ_a,
+            occ_re
+        );
+    }
+}
+
+/// DMG-REFUSE: release the owner half's park word (its window base + 0x3000), through the slot's
+/// identity backing — the `u7x_release_go` path, and sound for the same reason: x86-TSO means the
+/// parked fixture's next aliased load after its 20 ms sleep observes the store.
+fn dmg_release_go(slot: usize) {
+    unsafe {
+        let go = crate::arch::memory::slot_backing_ptr(slot).add(DMG_GO_OFF) as *mut u64;
+        core::ptr::write_volatile(go, 1);
     }
 }
 

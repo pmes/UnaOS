@@ -70,3 +70,23 @@ FORBID S6-witness FAIL
 FORBID S7-openany FAIL
 FORBID S8-write FAIL
 FORBID S9-grow FAIL
+
+# --- DMG-REFUSE: the SYS_WIN_PRESENT_ROWS(33) refusal arms (-EBADF / -EACCES / -EINVAL), 2026-08-04.
+# --- REQUIRE, not OPTIONAL: this witness is headless-complete — two inline ring-3 blobs, no block
+# --- device and no panel — so it runs on EVERY x86 QEMU boot, and its ABSENCE is a gate failure. That
+# --- is deliberate: a FORBID alone cannot catch silence, and a witness that can vanish quietly is the
+# --- exact defect that made the storage witnesses above untrustworthy. Uses the `— witness OK ::`
+# --- idiom, so it does NOT add to the `COUNT 22 -> PASS` above.
+# --- The third line is the loud-absence rule: every skip path in the launcher prints `NOT RUN`, and a
+# --- skip must fail the gate rather than pass it silently.
+# --- VERIFICATION PROVENANCE, stated because it is NOT complete: these three lines were proven against
+# --- a real capture with `mbench --replay` (green log -> exit 0; a deliberately-reddened log -> exit 1,
+# --- caught by the FORBID), but on the `./arroyo test` path, NOT `test-fat` — this host has no `mtools`,
+# --- so `make-fat-img.sh` aborts at `mcopy` before QEMU ever starts. The REQUIRE is sound by
+# --- construction (same kernel, same `witness` build; the launcher chains off `winx7_launcher` inside
+# --- `u8x_launcher`, which does NOT gate on a block device, so the FAT path runs a SUPERSET of the
+# --- chain) — but it has not been executed on this exact gate. First runner of `test-fat sf`: if this
+# --- line is the only red, suspect this note before suspecting the kernel.
+REQUIRE DMG-REFUSE:.*19/19 probes.*witness OK
+FORBID DMG-REFUSE FAIL
+FORBID DMG-REFUSE:.*NOT RUN
