@@ -5,50 +5,47 @@ cross-session handoff lives in the baton, per-boot status in `~/unaos-bench/PLAY
 
 ---
 
-# OPEN
+# OPEN — nothing
 
-## 1. One push
-
-```bash
-git push origin UnaOS-gemini
-```
-
-`origin/UnaOS-gemini` was verified at `5a740f0d` with a fetch in the same call.
-Outstanding above it: the docs commit only. Everything else you have already
-pushed.
-
-## 2. Still no metal verdict — and still nothing to act on
-
-No removable media, and **no serial device at all** — `/dev/ttyUSB*` and
-`/dev/ttyACM*` do not exist. squawk closed cleanly at 20:27Z on 08-03
-(`SQUAWK MARK … session-end`), not a crash. No watchers are armed, because there
-is nothing for them to watch.
-
-This is reported state, not a request. The consequence is that FBCON-DMG's
-evidence class stays `unproven`: the instrument that can answer it now exists and
-is proven present in the image, but has never been booted.
+No pushes owed. `origin/UnaOS-gemini` is at `d5a1bf0a`, same as local, verified with a fetch. Tree
+clean. No decisions waiting on you.
 
 ---
 
-# WHAT MOVED TODAY
+# WHERE THE BOOT TIME ACTUALLY GOES
 
-- **`5a740f0d` DMG-REFUSE — executed, not merely compiled.** Syscall 33's three
-  refusal arms had nothing that could reach them; the `-EINVAL` arm is the whole
-  justification for the verb and had never run. 19 probes from two ring-3 slots,
-  green in QEMU, and proven able to fail by flipping one expectation.
-- **`ae639f5a` ARTIFACT-AUDIT.** The real `esp-x86` image was built and probed.
-  Everything from both GR15 code commits is present, including the syscall-33
-  client path decoded instruction-for-instruction in `VUG.ELF`.
+Last boot was **27.9 seconds**. Kepler is **17.1 of them** — 61 %, in one block:
 
-# TWO TRAPS NOW WRITTEN DOWN — both would have inverted a reading
+```
+kepler=17138ms   sdhc=117ms   nic=12ms   detect=5ms   igpu=1ms   xtail=0ms   resid=2ms
+```
 
-**`strings`, `readelf`, `objdump` and `nm` are not on this host.** A naive probe
-reads zero hits for everything, which is indistinguishable from the code being
-missing. `busybox strings` is what works.
+Everything that is not Kepler adds up to under a second. That is the whole remaining boot problem.
 
-**The `[wc-h]` literals do not tell you the compositor is armed.** `span=`,
-`band=`, `window-band` and the rest are byte-identical in an image built with the
-compositor knobs OFF — they ride on `witness` alone. The discriminators are the
-symbols `wcx::activate` and `takeover_display`. And `[wc-x]`/`kepler` fall to
-**1**, not 0, with the knobs off — the survivor is `[wc-x] backbuffer resync` — so
-testing `> 0` gives a false positive on an unarmed image.
+It cannot be worked on yet, because the log reports it as **one number with nothing inside it**. The
+next arc's job is to break it down so a boot names which part is slow — and `drivers/gpu/kepler*.rs`
+is Gemini's lane, so that has to be agreed before anything is written.
+
+---
+
+# WHAT LANDED TODAY — ten commits, `7091c23a` → `d5a1bf0a`
+
+The one that mattered: **the panel had been running uncached since 2026-07-21.** An MMIO remap was
+silently un-typing the framebuffer's page-table entries from write-combining back to uncached, and
+nothing said so. Fixing it made the panel **8.7–9.1× faster** on large writes and took every window
+from AT-RISK to tear-free. The boot's GUI phase dropped ~7.1 seconds.
+
+Every "the compositor is tearing" conclusion from the last two weeks was reading that, not the
+compositor.
+
+Three instruments turned out to be hiding real defects rather than merely being noisy:
+
+- **SERWIT-1** had been red in every boot since gr7 — it could not pass on this machine — and was
+  concealing two genuine accounting bugs the whole time. It passes now, for the first time.
+- **WC-H's tear counter** stopped counting after eight presents, so a window that tore a thousand
+  times still reported "tear-free". The Pi track's gate rested on that number too.
+- **WC-D** was reading its own log output back off the screen and reporting the difference as
+  corruption.
+
+Also: the console holds 4× more text, the compositor's own chatter no longer paints itself onto the
+glass, and the first ~29 seconds of boot are no longer lost from the capture.
