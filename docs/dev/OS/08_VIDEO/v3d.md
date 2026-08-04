@@ -5396,3 +5396,24 @@ observable station at poll rate. The bin-wall hunt's only remaining path is firm
 instrumentation — the piOS boot-state diff's VPU stations (§49.14) — which is a bench/tooling
 decision, not another kernel rung. The [v3d93] bracket stays in the tree as the standing wide-set
 instrument for any future state the block reaches.
+
+**§49.16 — the piOS sweep diff (2026-08-04): zero unexplained divergences against every surviving
+reference, and an evidence correction to §46.1.** Boot21's `[v3d76]` settled wedged sweep was
+diffed against the only piOS artifacts on the box — the curated 60-register idle and mid-render
+dumps of 2026-07-29. Result: 55 registers overlap, 18 diverge, every one class (a) known or
+(b) consequence-of-wedge/job-state; **class (c) = zero**. All six non-V3D fabric words (PM_GRAFX,
+both ASB blocks) MATCH piOS idle. **Correction, evidence law:** §46.1's "the sweep reduced the
+structural divergences to exactly two unnamed words" has NO surviving artifact — no piOS `SWEEP`
+output exists on the box or in git; the claim is a doc memory, not a reproducible diff. What the
+surviving diff cannot reach, honestly: 41 nonzero sweep words with no piOS value (led by seven
+unmapped config-shaped core-CTL constants at core0 +0x0c/+0x14/+0x20/+0x2c/+0x44/+0x80/+0x84,
+bit-stable across four boots), every register that reads zero for us (the exact shape of a missing
+enable), six hub work-counters (+0x8c…+0xa8, monotone, a hub-side traffic channel the §49.15
+bracket does not sample), and the clock-manager block, never read directly on either side — while
+the firmware's clock-state report is already on the §46.4 instrument-lie ledger. **The sitting ask
+that closes it** (script updated, `v3d-dump-pios.sh --sweep`, [v3d76]-identical windows + CM
+block): boot the bench Pi on stock piOS and take `--sweep` at idle, `--sweep` under glxgears, and
+one `--trigger ct0run` mid-bin; scp all three to `~/unaos-bench/capture/`. Until then the seven
+core-CTL constants are unexamined territory, not excluded territory. The hub TFU window
+(0x100–0x1000) stays excluded on both sides by decision: no source-cited register list, and
+unbacked V3D-hub reads can fault.
