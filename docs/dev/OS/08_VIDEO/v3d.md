@@ -5385,3 +5385,14 @@ with `UNAOS_V3D_DEEP=1 UNAOS_V3D_PTBBRKT=1`; `strings -a target/pi_baremetal/ker
 `[v3d93]` family, with the `[v3d92]` family on the same image as the positive control that the proof
 discriminates at all. QEMU raspi4b models no V3D, so there is no QEMU leg — `kernel8-test` green
 means no regression and nothing more, and the verdict is the attended metal boot.
+
+**§49.15 boot21 verdict (PA29 @2c0f5ca9, 2026-08-04) [booted, pi4-r23s1x boot21]: OUTCOME (b) —
+DEAD AT ITEM-ACCEPT ON THE WIDE SET.** 348,908 samples across all 16 stations at the FLDONE poll
+loop's own rate: not one bit of motion — no pool pointer, no overflow request (BPOS held 0), no
+GMP/MMU/L2T event, CT0SYNC/CT1SYNC at rest pre/post. The CLE feeds items and nothing
+architecturally visible responds. Combined with boots 17–20, **the ARM-visible V3D surface is now
+closed in its entirety**: every mapped register, every mailbox act, every fabric write, and every
+observable station at poll rate. The bin-wall hunt's only remaining path is firmware-side
+instrumentation — the piOS boot-state diff's VPU stations (§49.14) — which is a bench/tooling
+decision, not another kernel rung. The [v3d93] bracket stays in the tree as the standing wide-set
+instrument for any future state the block reaches.
