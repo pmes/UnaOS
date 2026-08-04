@@ -8220,6 +8220,114 @@ impl XhciController {
         self.port_link_witness("timeout");
     }
 
+    /// [piusb40] witness 3 — the event-ring necropsy. Photograph the ring at the instant of a BOT
+    /// timeout, BEFORE any recovery touches it.
+    ///
+    /// The two surviving explanations for the READ CAPACITY wedge are indistinguishable in every
+    /// pre-arc capture: an event that was posted and never consumed (consumer behind the producer,
+    /// or reading the wrong colour) leaves the same log as an event that was never posted at all.
+    /// The difference lives in the ring itself — where the controller's dequeue pointer sits
+    /// against ours, and what colour the slots around our position carry. Both go on one line here.
+    ///
+    /// Ordering is the whole point of the call site. This runs before `return Err(Timeout)` and
+    /// therefore before the escalation ladder resets endpoints or republishes the ERDP; a necropsy
+    /// taken after recovery would be a photograph of the recovery.
+    ///
+    /// Read it WITH witness 1, not instead of it. The ring can only report what the controller did
+    /// on the event path — it cannot say whether bytes moved, which is witness 1's question, and
+    /// the two verdicts are built to agree. When they disagree, believe witness 1: DRAM contents
+    /// are a harder fact than a pointer comparison against a producer that may have moved between
+    /// the two reads.
+    fn bot_event_necropsy(&self) {
+        // (index, cycle, trb_type) for the 8-slot window around our dequeue position.
+        let mut slots = [(0usize, 0u32, 0u32); 8];
+        let (sw_deq, colour, popped) = {
+            let guard = EVENT_RING.lock();
+            let ring = match guard.as_ref() {
+                Some(r) => r,
+                None => {
+                    serial_println!(
+                        ":: BOT: [piusb40] necropsy — event ring uninitialised — no photograph possible, this timeout predates the interrupter ::");
+                    return;
+                }
+            };
+            let deq = ring.dequeue_index;
+            for k in 0..8 {
+                // deq-2 .. deq+5: two slots BEHIND the pointer so the line shows what we just
+                // consumed and in which colour, and five ahead so a producer that ran past us is
+                // visible rather than inferred. `+ EVENT_RING_SIZE` before the subtraction keeps
+                // the arithmetic in usize when deq is 0 or 1.
+                let i = (deq + event::EVENT_RING_SIZE - 2 + k) % event::EVENT_RING_SIZE;
+                dma_coherency::clean_inval(
+                    &ring.trbs[i] as *const Trb as usize,
+                    core::mem::size_of::<Trb>(),
+                );
+                // Trb is `packed`: copy the whole struct out volatile, then read fields off the
+                // copy — a reference to an individual field would be unaligned (see `has_event`).
+                let t = unsafe { core::ptr::read_volatile(&ring.trbs[i]) };
+                slots[k] = (i, t.control & 1, (t.control >> 10) & 0x3F);
+            }
+            (deq, if ring.cycle_bit { 1u32 } else { 0u32 }, ring.popped)
+        };
+
+        let (iman, erdp) = unsafe {
+            let rtsoff = core::ptr::read_volatile((self.base_addr + 0x18) as *const u32) & !0x1F;
+            let ir0_base = self.base_addr + rtsoff as usize + 0x20;
+            let iman = core::ptr::read_volatile(ir0_base as *const u32);
+            // TWO 32-bit reads, never one 64-bit load: the brcmstb RC forces a genuine 32-bit split
+            // on this register, which is the same hardware fact that makes `write_erdp` store the
+            // high dword first. A u64 read here would return mirror garbage in the high half and
+            // the derived slot index would be nonsense.
+            let lo = core::ptr::read_volatile((ir0_base + 0x18) as *const u32) as u64;
+            let hi = core::ptr::read_volatile((ir0_base + 0x1C) as *const u32) as u64;
+            (iman, (hi << 32) | lo)
+        };
+
+        // Where the CONTROLLER thinks our dequeue pointer sits. -1 means EVENT_RING_PHYS_BASE is
+        // still 0, so no derivation is possible and only the raw ERDP above carries information. An
+        // out-of-range positive index is NOT an arithmetic bug — an ERDP pointing outside our own
+        // ring is itself a finding, so it is printed exactly as computed.
+        let phys_base = unsafe { EVENT_RING_PHYS_BASE };
+        let hw_slot: i64 = if phys_base == 0 {
+            -1
+        } else {
+            (((erdp & !0xF).wrapping_sub(phys_base)) / 16) as i64
+        };
+
+        // slots[0..2] are behind the pointer, slots[2] IS the dequeue slot, slots[3..] are ahead.
+        let at_deq_fresh = slots[2].1 == colour;
+        let ahead_fresh = slots[3..].iter().any(|s| s.1 == colour);
+        let all_stale = slots.iter().all(|s| s.1 != colour);
+        let pos_agree = hw_slot == sw_deq as i64;
+        // Each clause claims only what its pattern can carry. None of them can name WHICH transfer
+        // an event belongs to — that is the shape line's job — and none can prove a negative about
+        // the device, only about this ring.
+        let verdict = if at_deq_fresh {
+            "an event in OUR colour is sitting AT the dequeue slot — it was posted and never consumed. Consumer-side defect: the pump's drain walked past a fresh TRB rather than the controller staying silent"
+        } else if ahead_fresh {
+            "a slot AHEAD of our pointer carries our colour while the slot AT it does not — producer and consumer are desynced, the controller wrote past a position we never advanced through. Proves an event reached DRAM; does NOT identify which transfer posted it"
+        } else if all_stale && pos_agree {
+            "every photographed slot is stale-coloured and the controller's ERDP agrees with ours — nothing was posted on this ring at all. Transport verdict, and it should agree with the readcap-wedge line reading landed=false"
+        } else if !pos_agree {
+            "no fresh colour in view, but hw ERDP and our dequeue disagree on position — the controller is working from a pointer we did not publish (torn or stale ERDP), which is a different fault from a missing event and is not evidence about the device"
+        } else {
+            "no fresh colour, positions agree, but the window is not uniformly stale — inconclusive; read the raw slots on this line, not this clause"
+        };
+
+        serial_println!(
+            ":: BOT: [piusb40] necropsy — sw deq={} colour={} popped={} | hw ERDP={:#x} (slot {}) IMAN={:#x} | ring: {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} — {} ::",
+            sw_deq, colour, popped, erdp, hw_slot, iman,
+            slots[0].0, slots[0].1, slots[0].2,
+            slots[1].0, slots[1].1, slots[1].2,
+            slots[2].0, slots[2].1, slots[2].2,
+            slots[3].0, slots[3].1, slots[3].2,
+            slots[4].0, slots[4].1, slots[4].2,
+            slots[5].0, slots[5].1, slots[5].2,
+            slots[6].0, slots[6].1, slots[6].2,
+            slots[7].0, slots[7].1, slots[7].2,
+            verdict);
+    }
+
     /// BOT-RESCUE escalation (c): SURRENDER. Mark the disk FAILED, retract it from the block
     /// registry, and stop issuing transfers to the slot.
     ///
@@ -8539,6 +8647,12 @@ impl XhciController {
                     let db_out_d = BOT_DB_OUT.load(Ordering::Relaxed).wrapping_sub(db_out_at_entry);
                     self.bot_timeout_witness(&p, foreign, evts, db_in_d, db_out_d);
                 }
+                // [piusb40] witness 3. HERE, and not one line later: everything past this return
+                // is recovery, and recovery mutates the ring it would be photographing. Unlike the
+                // witnesses above it is unconditional on `bot_pending` — a timeout with nothing
+                // pending still has an event ring worth reading, and that combination is itself
+                // one of the patterns the verdict clauses distinguish.
+                self.bot_event_necropsy();
                 return Err(BotError::Timeout);
             }
         }
@@ -8640,10 +8754,43 @@ impl XhciController {
     }
 
     /// SCSI READ CAPACITY(10) (0x25), 8 bytes BE. Returns (block_size, last_lba).
+    ///
+    /// [piusb40] witness 1 — the data-landed discriminator. boot20 wedges HERE, deterministically
+    /// and identically across two enumerations: TUR and INQUIRY complete (the pump reports n=1,2
+    /// result=OK, and INQUIRY's 36-byte data-in provably landed — the shape line carries
+    /// maxlen=36), then this 8-byte data-IN times out with no transfer event and a CSW that never
+    /// reaches DRAM. Every instrument the arc had before this reads the SAME on two incompatible
+    /// stories: a transfer that ran and lost its completion event, and a transfer that never ran at
+    /// all. IMAN=0x3 cannot break the tie either — it is Pi steady state on the success lines too.
+    ///
+    /// Poison breaks it. The 8-byte reply window is ours until the controller DMAs over it, so a
+    /// byte that is no longer 0xA5 is positive proof the data phase executed, and an intact window
+    /// is positive proof nothing moved. The `clean` is load-bearing, not hygiene: poison left
+    /// sitting in a dirty cache line would read back "unchanged" from the CPU no matter what the
+    /// controller did, and the witness would lie in the direction of the wrong verdict.
     fn scsi_read_capacity10(&mut self, slot: u8) -> Result<(u32, u32), BotError> {
         let data_phys = self.storage_data_phys(slot)?;
         let cdb = [0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        self.bot_transfer(slot, &cdb, data_phys, 8, Direction::In)?;
+        unsafe { core::ptr::write_bytes(data_phys as *mut u8, 0xA5, 8); }
+        dma_coherency::clean(data_phys as usize, 8);
+        match self.bot_transfer(slot, &cdb, data_phys, 8, Direction::In) {
+            Ok(_) => {}
+            Err(e) => {
+                // Pull the window back FROM DRAM, not from whatever the CPU cached before the wedge.
+                dma_coherency::clean_inval(data_phys as usize, 8);
+                let d = unsafe { core::slice::from_raw_parts(data_phys as *const u8, 8) };
+                let landed = d.iter().any(|&b| b != 0xA5);
+                serial_println!(
+                    ":: PIUSB: [piusb40] readcap-wedge — err={:?} data=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] poison=0xA5 landed={} — {} ::",
+                    e, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], landed,
+                    if landed {
+                        "the 8 bytes ARE in DRAM: the transfer COMPLETED and only its completion event went missing — event-path defect, read the necropsy line"
+                    } else {
+                        "no byte moved: the transfer never ran — transport-side, upstream of the event ring"
+                    });
+                return Err(e);
+            }
+        }
         unsafe {
             let d = core::slice::from_raw_parts(data_phys as *const u8, 8);
             let last_lba = ((d[0] as u32) << 24) | ((d[1] as u32) << 16) | ((d[2] as u32) << 8) | (d[3] as u32);
@@ -8752,7 +8899,37 @@ impl XhciController {
         self.storage_note = "INQUIRY";
         let (vendor, product) = self.scsi_inquiry(slot)?;
         self.storage_note = "READ CAPACITY";
-        let (block_size, last_lba) = self.scsi_read_capacity10(slot)?;
+        // [piusb40] witness 2 — the post-wedge pipe control. Witness 1 says whether the reply bytes
+        // reached DRAM; it says nothing about whether the bulk pipes are still alive afterwards,
+        // and "0x25 specifically is cursed" and "the transport died" predict the same silence.
+        // INQUIRY is the right probe precisely because it is the command that provably completed on
+        // these same two endpoints moments earlier in this very function — so any difference
+        // between then and now belongs to the wedge, not to the command.
+        //
+        // Run ONCE, and never retried: the escalation ladder would reset the pipes, and a recovered
+        // transport is exactly the state the necropsy line is trying to photograph. This costs the
+        // failure path one round-trip and the success path nothing at all.
+        let (block_size, last_lba) = match self.scsi_read_capacity10(slot) {
+            Ok(v) => v,
+            Err(e) => {
+                let ctl = self.scsi_inquiry(slot);
+                let ctl_s: &str = match &ctl {
+                    Ok(_) => "Ok",
+                    Err(BotError::Timeout) => "Err(Timeout)",
+                    Err(BotError::Stall) => "Err(Stall)",
+                    Err(_) => "Err(other)",
+                };
+                serial_println!(
+                    ":: PIUSB: [piusb40] post-wedge INQUIRY control — result={} — {} ::",
+                    ctl_s,
+                    if ctl.is_ok() {
+                        "the bulk pipes still complete a full CBW/data/CSW round-trip AFTER the wedge: the failure is specific to the READ CAPACITY transaction, not a dead pipe"
+                    } else {
+                        "the pipes are dead from the wedge onward: whatever wedged 0x25 took the transport with it"
+                    });
+                return Err(e);
+            }
+        };
         let num_blocks = last_lba as u64 + 1;
 
         let vendor_s = core::str::from_utf8(&vendor).unwrap_or("?").trim_end();
