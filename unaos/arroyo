@@ -1435,6 +1435,21 @@ kernel8() {
         K8_FEATS="${K8_FEATS},v3d_pmcycle"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_PMCYCLE: ARM the [v3d92] power-domain OFF->ON cycle — ⚠ may cost V3D for the boot if recovery fails; inert without UNAOS_V3D_DEEP; never with QPU/DISPDONE/V3D81${COLOR_RESET}"
     fi
+    # PI-V3D-93: UNAOS_V3D_PTBBRKT=1 adds the `v3d_ptbbracket` feature — the arming switch for the
+    # PTB FRAME-UNIT BRACKET ([v3d93], deep battery, after [v3d74] and BEFORE [v3d75] so the fabric
+    # is still untouched). Boot20 closed the mailbox domain family; this is the register-side prong
+    # of what is left. The rung seeds sixteen stations PRE-QBA, reuses the PI-V3D-91 bin criterion
+    # unchanged, folds one full-station sample per iteration of that criterion's own FLDONE poll
+    # loop (not the ~1 ms cadence tick), and prints a FIRST-CHANGE ordering table after the window
+    # closes — which register moves first, at what sample, item-accept side vs pool-write side.
+    # Inert without UNAOS_V3D_DEEP. Unlike the other v3d arming switches this one is READ-ONLY and
+    # carries NO boot cost: it issues no V3D register write of its own and sends no mailbox tag, so
+    # there is no panel risk, no V3D loss and nothing it can wedge. Safe to combine with anything.
+    # See docs/dev/OS/08_VIDEO/v3d.md §49.15.
+    if [ -n "${UNAOS_V3D_PTBBRKT:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_ptbbracket"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_PTBBRKT: ARM the [v3d93] PTB frame-unit bracket — read-only first-change ordering across item-accept -> pool-write; no boot cost; inert without UNAOS_V3D_DEEP${COLOR_RESET}"
+    fi
     # PI-V3D-69: UNAOS_V3D69_REENABLE=1 adds the `v3d69_reenable` (+`v3d_deep`,+`v3d`) features — the
     # WRITE half of the initialisation-diff arc. The READ half (the `[v3d69] fabric` stations: PM_GRAFX,
     # both V3D async-AXI-bridge control words in both candidate ASB blocks, V3D_MMUC_CONTROL) rides

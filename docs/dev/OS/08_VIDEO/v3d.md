@@ -5229,3 +5229,159 @@ domain cycle (20), every ARM-reachable and every mailbox-reachable hypothesis fo
 exhausted on honest instruments. What programs piOS's 0x4040 — and whether it matters at all — is
 firmware-internal. The hunt is now exactly two-pronged: the PTB frame-unit bracket (§49.13's named
 target, item-accept → pool-write) and the piOS boot-state diff's VPU stations.
+
+---
+
+### 49.15 The PTB frame-unit bracket — first-change ordering across item-accept → pool-write (PI-V3D-93)
+
+§49.13 names the target and §49.14 closes everything around it. This section builds the instrument
+that measures it.
+
+**What is already known, and therefore may not be re-measured.** The CLE executes the bin list
+cleanly: `CT0LC`/`CT0PC` both move across the kick and the control thread feeds items to the PTB
+(`[v3d59] ctstate`, the final verdict arm). The bin frame is then **DEAD-OPEN** — `BMACTIVE`=1,
+`BMBUSY`=0, and not one bit of movement across 64 samples of `PCS`/`CT0CS`/`BFC`/`BPCA`/`BPCS`
+(`[v3d59] frameclose`). The RENDER engine on the same block, the same MMU and the same clock retires
+frames and lands byte-verified stores (`[v3d58] xengine`, and §49.12's `rclct1` on CT1). Every
+ARM-reachable and every mailbox-reachable fabric hypothesis is exhausted (boots 17–20).
+
+**The gap the bracket exists to close.** Every "nothing moved" verdict in this file rests on a
+**five-register** poll taken at a **1 ms** grid, and always after the FLDONE backstop had already
+given up. Two objections survive that instrument and neither has ever been answered: the set may be
+too narrow (a register outside those five could be moving), and the grid may be too coarse (motion
+confined to one frame's worth of time falls between ticks). Until both are closed, "the PTB frame
+unit is dead" is a claim about `frameclose`, not about the silicon.
+
+#### 49.15.1 The station set
+
+Every station below is an offset **already defined and already used in `v3d.rs`** — the bracket
+invents no register, and nothing here is carried in from outside knowledge. Each row cites the
+constant's definition site.
+
+| # | Station | Base + offset | Source (`v3d.rs`) | Class | Why it could move between item-accept and pool-write |
+|---|---|---|---|---|---|
+| 0 | `CT0CS` | core `+0x0100` | `V3D_CLE_CT0CS`, line 421 | cle | The control thread's own status. `CTRUN` dropping mid-window is the CLE giving up rather than the PTB stalling |
+| 1 | `CT0CA` | core `+0x0110` | `V3D_CLE_CT0CA`, line 490 | cle | Current fetch address. If it advances while the PTB is silent, the CLE is still feeding a unit that is not consuming |
+| 2 | `CT0LC` | core `+0x0120` | `V3D_CLE_CT0LC`, line 542 | cle | List counter — the item-accept marker itself. §49.13's fact is that this moves; the bracket dates *when* |
+| 3 | `CT0PC` | core `+0x0128` | `V3D_CLE_CT0PC`, line 543 | cle | Primitive counter. Second item-accept marker; a `CT0LC`/`CT0PC` split in time would separate list-item accept from primitive accept |
+| 4 | `PCS` | core `+0x0130` | `V3D_CLE_PCS`, line 544 | frame | `BMACTIVE`/`BMBUSY`/`BMOOM`. A `BMBUSY` pulse anywhere in the window is the unit attempting work — the single most decisive bit the coarse poll could have missed |
+| 5 | `BFC` | core `+0x0134` | `V3D_CLE_BFC`, line 557 | frame | Bin frame count — frame close. The terminal marker of the whole chain |
+| 6 | `BPCA` | core `+0x0300` | `V3D_PTB_BPCA`, line 559 | ptb | **The pool-write pointer.** Its first change is the definition of "the PTB wrote" |
+| 7 | `BPCS` | core `+0x0304` | `V3D_PTB_BPCS`, line 560 | ptb | Remaining pool bytes. Moves with, or just before, `BPCA`; the two together date the reservation vs the write |
+| 8 | `BPOA` | core `+0x0308` | `V3D_PTB_BPOA`, line 561 | ptb | Overflow address. **Never polled during a window before.** Movement means the PTB got far enough to want more memory — which would place the wall *downstream* of item-accept outright |
+| 9 | `BPOS` | core `+0x030c` | `V3D_PTB_BPOS`, line 562 | ptb | Overflow size, cleared to 0 before every kick (`bin_prejob_bpos_clear`). Any non-zero value inside the window is the PTB writing its own overflow request — the strongest possible "the unit is alive" datum |
+| 10 | `BXCF` | core `+0x0310` | `V3D_PTB_BXCF`, line 583 | ptb | Binner extra config. Never polled during a window. A config word that changes mid-frame would mean the unit is reconfiguring itself |
+| 11 | `INT_STS` | core `+0x0050` | `V3D_CTL_INT_STS`, line 649 | frame | `FLDONE`/`FRDONE`/`OUTOMEM` raw latch. `OUTOMEM` in particular has only ever been read once, after the fact |
+| 12 | `GMP_STATUS` | core `+0x0800` | `V3D_GMP_STATUS`, line 328 | fabric | `WR_ACTIVE`/`RD_ACTIVE`/`VIO`. This is the pool write seen at the protection unit — a write attempt that never reaches DRAM would still show here |
+| 13 | `L2TCACTL` | core `+0x0030` | `V3D_CTL_L2TCACTL`, line 286 | fabric | `L2TFLS` reads 1 while a flush is in progress. The PTB's pool traffic passes L2T; a flush starting inside the window is cache-side evidence of a write |
+| 14 | `MMU_CTL` | **hub** `+0x1200` | `V3D_MMU_CTL`, line 230 | fabric | `PT_INVALID`/`WRITE_VIOLATION`/`CAP_EXCEEDED` latches. Dating a fault to a sample index converts a sticky bit into a causal event |
+| 15 | `MMU_DEBUG_INFO` | **hub** `+0x1238` | `V3D_MMU_DEBUG_INFO`, line 235 | fabric | Read at fault time today, never across a window |
+
+**Two registers are deliberately excluded from the in-loop set**, and sampled only at the pre-arm and
+post-window stations: `CT0SYNC` (core `+0x0154`, line 581) and `CT1SYNC` (core `+0x0158`, line 582).
+`[v3d59] ctstate`'s own verdict records the hazard in terms — the read side effects of these two are
+unverified, and a semaphore register that decrements or clears on read would be *moved by the probe
+itself*. Five reads per register was already enough to worry that witness; this loop would issue
+thousands. They are still reported, as a pre/post pair with a `moved=` column, so the datum is not
+lost — only the manufacture of it is prevented.
+
+**Registers considered and NOT taken.** The PTB-adjacent unnamed words the `[v3d76]` sweep covers
+(core `0x4000–0x4A00`, hub `0x0000–0x0100`) are a 640-word window, not a station set; sampling them
+per-iteration would cost more than the frame lasts, and `[v3d77]` already transplanted the two
+config-shaped ones (core `+0x68`, hub `+0x68`) and banked both dead. If the bracket returns outcome
+(a), the sweep window is the natural second pass, restricted to whatever neighbourhood the first
+mover names. No MMU *counter* registers are mapped in this driver — only the control/fault words
+above — so none are cited. **Nothing in this section is INFERRED**: every offset above is a
+corroborated `v3d_regs.h` name already carried in `v3d.rs` with its citation in place. The only
+inference anywhere near this instrument is the `CTnCS` bit decode past `CTRUN`, which the bracket
+does not use — it compares `CT0CS` as a **raw word**, so a wrong bit map cannot produce or suppress
+a first-change datum.
+
+#### 49.15.2 The bracket
+
+The sampler follows `[v3d59] frameclose`'s cadence pattern — seed a baseline, fold the full station
+set repeatedly, compare against the seed, print strictly afterwards — with three changes that are
+the whole point of the rung.
+
+1. **It runs DURING the window, not after it.** `frameclose` polls once the FLDONE backstop has
+   already expired. This folds from inside the criterion's own retire wait.
+2. **It runs at the poll loop's rate, not on a 1 ms grid.** The fold is placed in `wait_fldone`'s
+   main loop body rather than in its `~1 ms` cadence branch, beside the `INT_STS` read that ends the
+   wait. The `v3d71`/`v3d73` samplers keep their cadence-tick position and are untouched.
+3. **It records FIRST-CHANGE ordering, not a moved/not-moved flag.** Per station: the pre-QBA seed,
+   the first value that differed from it, the sample index and microsecond offset at which that
+   happened, the running change count, and the last value. The witness then prints the movers in
+   first-change order, ranked.
+
+**The contract the fold inherits.** `v3d71_sampler_take` and `v3d73_sampler_take` established it and
+`v3d93_sampler_take` keeps it exactly: *one static bool read and zero MMIO on every wait in the
+driver except the single window the rung arms it across.* Sixteen reads and sixteen compares per
+sample is bounded work, it happens only inside the armed window, and the wait's duration is unchanged
+regardless — the `~0.5 s` CNTPCT deadline is what ends the loop, not the number of iterations it
+managed. Nothing in the fold path formats or prints; serial inside the window would dominate the very
+timing being measured, which is the rule `frameclose` already sets.
+
+**Coverage, stated rather than assumed.** The seed is taken before the criterion submit, so `first`
+is a genuine pre-QBA word and a block that never moves reads as `moved=0` with the pre-kick value
+printed. The one sub-window the fold cannot reach is `wait_bit_clear`'s `CT0CS` spin, which runs
+between the GO and `wait_fldone` and has no hook. On the wedged block `CTRUN` reads clear
+(`[v3d59] frameclose`: `CT0CS` static across 64 samples), so that spin exits on its first test and
+the gap is nil; on a boot where `CTRUN` is genuinely set the bracket starts late, and `samples`
+together with the criterion's own `idled=` column say so on the wire.
+
+#### 49.15.3 The submit shape, and why
+
+`submit_bisect_rung_geom`'s wait is **internal** — `wait_bit_clear` on `CT0CS`, then `wait_fldone` —
+so a sampler wrapped around the call would bracket the entire submit and see only its endpoints,
+which is exactly the endpoint measurement §49.13 already has. Two options remained:
+
+| option | shape | why not / why |
+|---|---|---|
+| transcribe the criterion's submit into the rung, sampler beside the `QBA`/`QEA` writes | maximal control of the loop | **REJECTED.** It forks the PI-V3D-91 criterion into a second copy that can silently drift from the one every §49 verdict is banked against. The bracket would stop being the same instrument — the failure mode this ladder has had to unwind twice (§49.11a's class-law retraction, §49.13's saturated criterion) |
+| call the criterion **unchanged**, exactly as the `[v3d91]` call sites do, and fold from inside `wait_fldone` on the `v3d71`/`v3d73` hook contract | one criterion, one instrument | **TAKEN.** No second copy, no drift, and it keeps the rung honestly read-only |
+
+`bank` is passed **false** for the same reason: `true` arms the PCTR counter bank, which is a write
+this instrument has no license to make, and `submit_bisect_rung_geom` documents that the unbanked
+path issues no extra MMIO at all.
+
+**Read-only discipline.** The rung issues **no V3D register write of its own** and sends **no mailbox
+tag of any kind**. Its only register writes are the ones inside the criterion submit it reuses — the
+same submit the `[v3d48]` ladder above it already runs many times on the same boot. It is therefore
+the first arming switch in this family that carries **no boot cost**: no panel risk, no V3D loss, no
+mailbox exposure, nothing it can wedge.
+
+**Ride position.** After `[v3d74]`, before `[v3d75]`. The "before" is load-bearing: everything from
+`[v3d75]` onward mutates this boot's fabric (`[v3d75]`'s `ENABLE_QPU` send and `M_CTRL` transplant,
+`[v3d77]`'s unnamed-word pokes, `[v3d92]`'s power cycle), and an ordering trace is only worth taking
+on the block as it stands — the same untouched-fabric requirement `[v3d75]`'s own ordering comment
+states for `[v3d74a]`'s verdict. The "after `[v3d74]`" half is because the bracket's reading is drawn
+against that rung's banked thread-0 fact from the same boot. Because the rung writes nothing, its
+position costs the rungs below it nothing.
+
+#### 49.15.4 Both outcomes, pre-written
+
+| outcome | verdict, and where the hunt goes |
+|---|---|
+| **(a) some station outside `frameclose`'s five moved** | **THE FRAME UNIT IS ALIVE PAST WHAT `frameclose` COULD SEE.** §49.13's DEAD-OPEN reading was an artifact of a five-register poll at a 1 ms grid, not a property of the unit. The wall moves **downstream of the last mover** in the ordering table: that register's own unit becomes the next bracket, the `[v3d76]` sweep window is re-run restricted to its neighbourhood, and every "dead" verdict in §49 that rests on the narrow set is re-read. A `BPOS`/`BPOA` mover is the strongest form of this — it would mean the PTB got as far as requesting memory — and a `BMBUSY` pulse in `PCS` is the second strongest |
+| **(a′) motion confined to `frameclose`'s own five** | The bracket reproduces §49.13 at a far finer sample rate over a wider set and adds no new station. This is outcome (b) with the coarse-instrument objection **closed by measurement** rather than assumed away |
+| **(b) nothing moved** | **DEAD AT ITEM-ACCEPT ON THE WIDE SET.** Sixteen stations, sampled at the poll loop's own rate, across the whole retire window: the CLE feeds items and nothing architecturally visible responds — no pool pointer, no overflow request, no protection or MMU event, no cache activity, no busy pulse. The unit does not fail to *complete*; it never observably *starts*. Both surviving objections to §49.13 are then answered, **no ARM-visible station is left to bracket**, and the register-side prong of §49.14's two-pronged hunt is exhausted. The remaining surface is firmware-side instrumentation — the piOS boot-state diff's VPU stations |
+| **criterion RETIRED** | The wall did not reproduce on this boot. The ordering table then describes a **working** frame, which is the reference trace the wedged case has never had; it is banked as such and explicitly **not** read as a wall verdict |
+| **`samples=0`** | The criterion's FLDONE poll never folded a sample. INCONCLUSIVE — no verdict, by construction |
+
+#### 49.15.5 The boot, and the gate
+
+```
+UNAOS_WITNESS=1 UNAOS_PIUSB=1 UNAOS_GENET=1 UNAOS_SMP7=1 UNAOS_NETTEST=1 UNAOS_V3D=1 \
+UNAOS_VUGPAR=1 UNAOS_WEDGE2=1 UNAOS_V3D_DEEP=1 UNAOS_V3D_PTBBRKT=1 ./arroyo kernel8
+```
+
+Armed by `UNAOS_V3D_PTBBRKT=1` (`v3d_ptbbracket`, bare feature, default OFF, implying nothing —
+inert without `UNAOS_V3D_DEEP`). Gate-off prints one `[v3d93] ptb-bracket SKIPPED — ptbbracket-gate
+off` line and samples nothing. Because the rung is read-only it may be combined with any other knob,
+unlike `PMCYCLE`/`QPU`/`DISPDONE`.
+
+**Gate.** `./arroyo check` green on both arches with the knob off; the full-knob `kernel8` build green
+with `UNAOS_V3D_DEEP=1 UNAOS_V3D_PTBBRKT=1`; `strings -a target/pi_baremetal/kernel8.img` shows the
+`[v3d93]` family, with the `[v3d92]` family on the same image as the positive control that the proof
+discriminates at all. QEMU raspi4b models no V3D, so there is no QEMU leg — `kernel8-test` green
+means no regression and nothing more, and the verdict is the attended metal boot.

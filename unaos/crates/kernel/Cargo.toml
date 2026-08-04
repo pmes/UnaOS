@@ -526,6 +526,26 @@ v3d_dispdone = []
 # UNAOS_V3D_PMCYCLE=1 UNAOS_PI=1 ./arroyo kernel8`.
 v3d_pmcycle = []
 
+# PI-V3D-93: the arming switch for the PTB FRAME-UNIT BRACKET. Boot20 closed the mailbox domain
+# family (§49.14) and left the hunt two-pronged; this is the register-side prong. The wall is
+# cornered to the PTB frame unit between item-accept and pool-write — the CLE executes the bin list
+# cleanly (CT0LC/CT0PC move, items fed) while the bin frame sits DEAD-OPEN (BMACTIVE=1, BMBUSY=0,
+# zero movement across 64 samples of PCS/CT0CS/BFC/BPCA/BPCS). What has never been measured is the
+# ORDER in which the architecturally-visible words move during that window, over a station set wider
+# than frameclose's five. The armed rung `[v3d93]` rides the deep battery after `[v3d77]`'s
+# predecessor `[v3d74]` and BEFORE `[v3d75]`, so it reads the fabric as it stands: it seeds sixteen
+# stations PRE-QBA, reuses the PI-V3D-91 bin criterion UNCHANGED and unbanked, folds one full-station
+# sample per iteration of that criterion's own FLDONE poll loop (not the ~1 ms cadence tick), and
+# prints a first-change ordering table only AFTER the window closes. Gated on
+# `all(v3d_deep, v3d_ptbbracket)`; OFF (default) prints one `[v3d93] ptb-bracket SKIPPED —
+# ptbbracket-gate off` line and samples nothing. A bare feature that implies nothing, like the other
+# arming switches. READ-ONLY by construction and therefore SAFE to arm: the rung issues no V3D
+# register write of its own and sends no mailbox tag, its only writes being those inside the
+# criterion submit the ladder already runs many times per boot — no panel risk, no V3D loss, no
+# mailbox exposure. Enable via `UNAOS_V3D=1 UNAOS_V3D_DEEP=1 UNAOS_V3D_PTBBRKT=1 UNAOS_PI=1
+# ./arroyo kernel8`. See docs/dev/OS/08_VIDEO/v3d.md §49.15.
+v3d_ptbbracket = []
+
 # PI-V3D-69: the WRITE half of the initialisation-diff arc. The READ half (`[v3d69] fabric` stations —
 # PM_GRAFX, both V3D async-AXI-bridge control words in both candidate ASB blocks, V3D_MMUC_CONTROL)
 # rides `v3d_deep` and is read-only. THIS feature adds the one rung that WRITES: it re-runs mainline's

@@ -3152,6 +3152,14 @@ fn wait_fldone(what: &str, trace_ba: u32, trace_ea: u32) -> (u32, u64, bool) {
             samples = samples.saturating_add(1);
             next_sample = now + sample_tick;
         }
+        // PI-V3D-93: fold one FULL-STATION sample at the POLL LOOP's rate, not the ~1 ms cadence
+        // above. Same contract as the two samplers in the cadence branch — one static bool read and
+        // ZERO MMIO on every wait except the single window `[v3d93]` arms it across — but the
+        // bracket's question is first-change ORDERING inside one frame, and a 1 ms grid cannot
+        // order events at that scale. The extra reads are bounded (16 per sample) and confined to
+        // the armed window; the wait's duration is unchanged either way, since the ~0.5 s CNTPCT
+        // deadline below is what ends it.
+        v3d93_sampler_take();
         let sts = mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS);
         if sts & V3D_INT_FLDONE != 0 {
             let waited_us = (super::timer::cntpct().wrapping_sub(start)).saturating_mul(1_000_000) / frq.max(1);
@@ -7015,6 +7023,16 @@ fn empty_frame_bisection() {
     // with an RCL-class queue, so every bin-class reading above must already be banked; and its
     // verdict is read AGAINST [v3d73]'s loaded-but-never-fetches fact from this same boot.
     v3d74_thread_swap();
+    // PI-V3D-93: the PTB frame-unit bracket rides AFTER [v3d74] and BEFORE [v3d75] — and the
+    // "before" is the load-bearing half. Everything from [v3d75] onward mutates the fabric this
+    // boot ([v3d75]'s ENABLE_QPU send and M_CTRL transplant, [v3d77]'s unnamed-word pokes,
+    // [v3d92]'s power cycle), and the bracket's whole claim is an ordering trace taken on the
+    // block AS IT STANDS — the same untouched-fabric requirement [v3d75]'s own comment states for
+    // [v3d74a]'s verdict. It sits after [v3d74] because its reading is drawn against that rung's
+    // banked thread-0 fact from this same boot. It writes nothing itself, so it perturbs nothing
+    // that [v3d75] onward reads: its only register writes are the PI-V3D-91 criterion's, which is
+    // the same submit the ladder above has already run many times on this boot.
+    v3d93_ptb_bracket();
     // PI-V3D-75: the fabric-condition experiments ride LAST — [v3d74a]'s thread-0-never-starts
     // verdict must already be banked on THIS boot's untouched fabric before either experiment
     // (firmware ENABLE_QPU, then the M_CTRL=0x4040 write) mutates it.
@@ -10700,6 +10718,357 @@ fn v3d92_domain_cycle_armed() {
             (false, false) => "cycle changes neither the bridge nor the wall — the mailbox domain family is now exhausted with ENABLE_QPU and the transplant; what programs 0x4040 (and whether it matters) is firmware-internal, and the hunt moves to the PTB bracket (§49.13) and the piOS boot-state diff",
         }
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// PI-V3D-93 — the PTB frame-unit bracket: FIRST-CHANGE ordering across item-accept → pool-write.
+//
+// The wall is cornered (v3d.md §49.13/§49.15). The CLE executes the bin list cleanly — CT0LC/CT0PC
+// move, items are fed to the PTB ([v3d59] ctstate) — and the bin frame is DEAD-OPEN: BMACTIVE=1,
+// BMBUSY=0, zero bit movement across 64 samples of PCS/CT0CS/BFC/BPCA/BPCS ([v3d59] frameclose).
+// Every ARM- and mailbox-reachable fabric hypothesis is exhausted (boots 17-20, §49.14). What has
+// never been measured is the ORDER in which the architecturally-visible words move during the one
+// window that matters, across a station set WIDER than the five frameclose polls.
+//
+// This rung is a pure INSTRUMENT. It issues no V3D register write of its own and sends no mailbox
+// tag; its only writes are the ones inside the PI-V3D-91 bin criterion it reuses unchanged.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Number of `[v3d93]` in-loop stations.
+const V3D93_N: usize = 16;
+
+/// The `[v3d93]` in-loop station set — every architecturally-visible word that could move between
+/// the CLE handing an item to the PTB and the PTB writing the tile-alloc pool. `(name, base, off)`;
+/// every offset is a constant already defined and cited elsewhere in this file, so the bracket
+/// invents no register. Two registers are deliberately ABSENT from this array and sampled only at
+/// the pre-arm and post-window stations: `CT0SYNC`/`CT1SYNC`, whose READ side effects are
+/// unverified — `[v3d59] ctstate`'s own verdict records that five reads per register could
+/// manufacture the movement they report, and this loop would issue thousands.
+const V3D93_STATIONS: [(&str, usize, usize); V3D93_N] = [
+    // ── CLE side: the item-accept markers. Does thread 0 keep feeding while the PTB is silent? ──
+    ("CT0CS", V3D_CORE0_BASE, V3D_CLE_CT0CS),
+    ("CT0CA", V3D_CORE0_BASE, V3D_CLE_CT0CA),
+    ("CT0LC", V3D_CORE0_BASE, V3D_CLE_CT0LC),
+    ("CT0PC", V3D_CORE0_BASE, V3D_CLE_CT0PC),
+    // ── Frame/completion markers. ──
+    ("PCS", V3D_CORE0_BASE, V3D_CLE_PCS),
+    ("BFC", V3D_CORE0_BASE, V3D_CLE_BFC),
+    // ── PTB side: the pool-write markers. This is the half no instrument has ever seen move. ──
+    ("BPCA", V3D_CORE0_BASE, V3D_PTB_BPCA),
+    ("BPCS", V3D_CORE0_BASE, V3D_PTB_BPCS),
+    ("BPOA", V3D_CORE0_BASE, V3D_PTB_BPOA),
+    ("BPOS", V3D_CORE0_BASE, V3D_PTB_BPOS),
+    ("BXCF", V3D_CORE0_BASE, V3D_PTB_BXCF),
+    // ── Completion latch. ──
+    ("INT_STS", V3D_CORE0_BASE, V3D_CTL_INT_STS),
+    // ── Fabric/memory path the pool write would traverse. ──
+    ("GMP_STATUS", V3D_CORE0_BASE, V3D_GMP_STATUS),
+    ("L2TCACTL", V3D_CORE0_BASE, V3D_CTL_L2TCACTL),
+    ("MMU_CTL", V3D_HUB_BASE, V3D_MMU_CTL),
+    ("MMU_DEBUG", V3D_HUB_BASE, V3D_MMU_DEBUG_INFO),
+];
+
+/// Causal class of each station, parallel to `V3D93_STATIONS` — the whole point of the bracket is to
+/// say which SIDE moved first, so the class travels with the datum instead of being re-derived.
+const V3D93_CLASS: [&str; V3D93_N] = [
+    "cle", "cle", "cle", "cle", "frame", "frame", "ptb", "ptb", "ptb", "ptb", "ptb", "frame",
+    "fabric", "fabric", "fabric", "fabric",
+];
+
+/// Which stations `[v3d59] frameclose` already polls (PCS/CT0CS/BFC/BPCA/BPCS). A `true` here means
+/// "movement at this station teaches nothing new — §49.13's negative already covers it"; the
+/// bracket's whole evidential claim is about the `false` entries.
+const V3D93_FRAMECLOSE_COVERED: [bool; V3D93_N] = [
+    true, false, false, false, true, true, true, true, false, false, false, false, false, false,
+    false, false,
+];
+
+/// The `[v3d93]` first-change accumulator. Fixed-size arrays in a static — no heap, no allocation,
+/// and nothing in the fold path formats or prints (serial inside the window would dominate the very
+/// timing the bracket measures; `[v3d59] frameclose` sets the same rule).
+struct V3d93Sampler {
+    armed: bool,
+    samples: u32,
+    t0: u64,
+    seed: [u32; V3D93_N],
+    last: [u32; V3D93_N],
+    changes: [u32; V3D93_N],
+    moved: [bool; V3D93_N],
+    first_idx: [u32; V3D93_N],
+    first_tick: [u64; V3D93_N],
+    first_val: [u32; V3D93_N],
+}
+
+static mut V3D93_SAMPLER: V3d93Sampler = V3d93Sampler {
+    armed: false,
+    samples: 0,
+    t0: 0,
+    seed: [0; V3D93_N],
+    last: [0; V3D93_N],
+    changes: [0; V3D93_N],
+    moved: [false; V3D93_N],
+    first_idx: [0; V3D93_N],
+    first_tick: [0; V3D93_N],
+    first_val: [0; V3D93_N],
+};
+
+/// Arm the bracket for the criterion submit about to run. Seeds every station with its PRE-QBA word,
+/// so "moved" always means "moved away from the value the block held before the queue was written",
+/// never "differs from the previous sample". `armed` is set LAST, so the seed can never be taken
+/// against a sampler that is already folding.
+fn v3d93_sampler_arm() {
+    let s = &raw mut V3D93_SAMPLER;
+    unsafe {
+        (*s).samples = 0;
+        (*s).t0 = super::timer::cntpct();
+        let mut i = 0;
+        while i < V3D93_N {
+            let v = mmio_read(V3D93_STATIONS[i].1, V3D93_STATIONS[i].2);
+            (*s).seed[i] = v;
+            (*s).last[i] = v;
+            (*s).changes[i] = 0;
+            (*s).moved[i] = false;
+            (*s).first_idx[i] = 0;
+            (*s).first_tick[i] = 0;
+            (*s).first_val[i] = 0;
+            i += 1;
+        }
+        (*s).armed = true;
+    }
+}
+
+/// One full-station sample. **No-op unless armed** — one static bool read and zero MMIO on every
+/// other wait in the driver, which is the same contract `v3d71_sampler_take`/`v3d73_sampler_take`
+/// carry. Unlike those two it is folded from `wait_fldone`'s POLL LOOP rather than its ~1 ms cadence
+/// tick: the bracket's question is ordering, and a 1 ms grid cannot order events inside one frame.
+/// Bounded work per call (16 reads + 16 compares), and only for the one armed window.
+fn v3d93_sampler_take() {
+    let s = &raw mut V3D93_SAMPLER;
+    unsafe {
+        if !(*s).armed {
+            return;
+        }
+        let idx = (*s).samples;
+        (*s).samples = (*s).samples.saturating_add(1);
+        let mut i = 0;
+        while i < V3D93_N {
+            let v = mmio_read(V3D93_STATIONS[i].1, V3D93_STATIONS[i].2);
+            if v != (*s).last[i] {
+                (*s).changes[i] = (*s).changes[i].saturating_add(1);
+                (*s).last[i] = v;
+            }
+            if !(*s).moved[i] && v != (*s).seed[i] {
+                (*s).moved[i] = true;
+                (*s).first_idx[i] = idx;
+                (*s).first_tick[i] = super::timer::cntpct();
+                (*s).first_val[i] = v;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Disarm and emit the `[v3d93]` witness: one line per station that MOVED, in first-change order,
+/// then one line per station that did not, then the composed verdict. Printing happens strictly
+/// AFTER the window has closed.
+fn v3d93_sampler_emit(what: &str, sync_pre: (u32, u32), sync_post: (u32, u32), retired: bool) {
+    let s = &raw mut V3D93_SAMPLER;
+    unsafe {
+        (*s).armed = false;
+        let frq = super::timer::cntfrq().max(1);
+        let t0 = (*s).t0;
+        let samples = (*s).samples;
+
+        // ── The ordering table: selection-print by first-change tick. N=16, so O(N²) is free. ──
+        let mut printed = [false; V3D93_N];
+        let mut rank = 0u32;
+        let mut moved_count = 0u32;
+        let mut new_count = 0u32; // movers OUTSIDE frameclose's five
+        loop {
+            let mut best: i32 = -1;
+            let mut best_tick = u64::MAX;
+            let mut i = 0;
+            while i < V3D93_N {
+                if (*s).moved[i] && !printed[i] && (*s).first_tick[i] <= best_tick {
+                    best_tick = (*s).first_tick[i];
+                    best = i as i32;
+                }
+                i += 1;
+            }
+            if best < 0 {
+                break;
+            }
+            let b = best as usize;
+            printed[b] = true;
+            rank += 1;
+            moved_count += 1;
+            if !V3D93_FRAMECLOSE_COVERED[b] {
+                new_count += 1;
+            }
+            let us = (best_tick.wrapping_sub(t0)).saturating_mul(1_000_000) / frq;
+            serial_println!(
+                "::   [v3d93] #{} MOVED {} [{}] — seed={:#010x} first={:#010x} last={:#010x} at sample {} (+{}us) changes={} | frameclose-covered={} ::",
+                rank,
+                V3D93_STATIONS[b].0,
+                V3D93_CLASS[b],
+                (*s).seed[b],
+                (*s).first_val[b],
+                (*s).last[b],
+                (*s).first_idx[b],
+                us,
+                (*s).changes[b],
+                V3D93_FRAMECLOSE_COVERED[b] as u32,
+            );
+        }
+        let mut i = 0;
+        while i < V3D93_N {
+            if !(*s).moved[i] {
+                serial_println!(
+                    "::   [v3d93] --  STATIC {} [{}] — held {:#010x} for all {} samples ::",
+                    V3D93_STATIONS[i].0,
+                    V3D93_CLASS[i],
+                    (*s).seed[i],
+                    samples,
+                );
+            }
+            i += 1;
+        }
+
+        // ── Class rollup: which SIDE of item-accept → pool-write showed motion at all. ──
+        let mut cle_moved = false;
+        let mut ptb_moved = false;
+        let mut fabric_moved = false;
+        let mut first_new: i32 = -1;
+        let mut first_new_tick = u64::MAX;
+        let mut last_mover: i32 = -1;
+        let mut last_tick = 0u64;
+        i = 0;
+        while i < V3D93_N {
+            if (*s).moved[i] {
+                match V3D93_CLASS[i] {
+                    "cle" => cle_moved = true,
+                    "ptb" => ptb_moved = true,
+                    "fabric" => fabric_moved = true,
+                    _ => {}
+                }
+                if !V3D93_FRAMECLOSE_COVERED[i] && (*s).first_tick[i] < first_new_tick {
+                    first_new_tick = (*s).first_tick[i];
+                    first_new = i as i32;
+                }
+                if (*s).first_tick[i] >= last_tick {
+                    last_tick = (*s).first_tick[i];
+                    last_mover = i as i32;
+                }
+            }
+            i += 1;
+        }
+        let name_of = |k: i32| if k < 0 { "-" } else { V3D93_STATIONS[k as usize].0 };
+        let sema_moved = sync_pre.0 != sync_post.0 || sync_pre.1 != sync_post.1;
+
+        let verdict: &str = if samples == 0 {
+            "ZERO samples landed — the criterion's FLDONE poll never folded one. INCONCLUSIVE; nothing on this line is a measurement"
+        } else if retired {
+            "THE BIN FRAME RETIRED under the bracket — the wall did not reproduce on this boot. Every ordering datum above describes a WORKING frame, which makes it the reference trace the wedged case has never had; do not read it as a wall verdict"
+        } else if new_count > 0 {
+            "OUTCOME (a) — THE FRAME UNIT IS ALIVE PAST WHAT frameclose COULD SEE. At least one station outside PCS/CT0CS/BFC/BPCA/BPCS moved during the window, so §49.13's DEAD-OPEN reading was an artifact of a five-register poll, not a property of the unit. The wall moves DOWNSTREAM of the last mover named above: take that register's own unit as the next bracket, and re-read every 'dead' verdict in §49 that rests on the narrow set"
+        } else if moved_count > 0 {
+            "the only motion was inside frameclose's own five registers — the bracket reproduces §49.13 at a far finer sample rate and adds no new station. The unit is dead at item-accept on the WIDE set too; treat this as outcome (b) with the coarse-instrument objection now closed"
+        } else {
+            "OUTCOME (b) — DEAD AT ITEM-ACCEPT ON THE WIDE SET. Not one of the sixteen stations moved a single bit across the whole window, at the FLDONE poll loop's own rate rather than a 1 ms grid: the CLE feeds items ([v3d59] ctstate: CT0LC/CT0PC move) and NOTHING architecturally visible responds. No pool pointer, no overflow request, no protection or MMU event, no cache activity. The PTB frame unit does not merely fail to complete — it never observably starts, and there is no remaining ARM-visible station to bracket. The surface left is firmware-side instrumentation (the piOS boot-state diff's VPU stations, §49.14)"
+        };
+
+        serial_println!(
+            ":: V3D: [v3d93] ptb-bracket ({}) — samples={} stations={} (in-loop; CT0SYNC/CT1SYNC sampled pre/post ONLY, read side effects unverified) | criterion retired={} | moved={} of which NEW (outside frameclose's five)={} | class-motion: cle={} ptb={} fabric={} | first NEW mover={} last mover={} | CT0SYNC {:#010x}->{:#010x} CT1SYNC {:#010x}->{:#010x} (moved={}) — {} ::",
+            what,
+            samples,
+            V3D93_N,
+            retired as u32,
+            moved_count,
+            new_count,
+            cle_moved as u32,
+            ptb_moved as u32,
+            fabric_moved as u32,
+            name_of(first_new),
+            name_of(last_mover),
+            sync_pre.0,
+            sync_post.0,
+            sync_pre.1,
+            sync_post.1,
+            sema_moved as u32,
+            verdict,
+        );
+    }
+}
+
+/// PI-V3D-93 — the PTB frame-unit bracket (v3d.md §49.15). Gate-off prints one SKIPPED line.
+fn v3d93_ptb_bracket() {
+    #[cfg(any(not(feature = "v3d_deep"), not(feature = "v3d_ptbbracket")))]
+    serial_println!(
+        ":: V3D: [v3d93] ptb-bracket SKIPPED — ptbbracket-gate off (arm with UNAOS_V3D_PTBBRKT=1; the rung is READ-ONLY — it issues no V3D register write of its own and sends no mailbox tag, its only writes being those inside the PI-V3D-91 bin criterion it reuses). Nothing was sampled and NO [v3d93] verdict is implied ::"
+    );
+    #[cfg(all(feature = "v3d_deep", feature = "v3d_ptbbracket"))]
+    v3d93_ptb_bracket_armed();
+}
+
+/// PI-V3D-93, the armed body — compiled only when the bracket actually samples, so no line in it can
+/// print beside a window that never opened.
+///
+/// **SUBMIT SHAPE — the honest option, chosen after reading the code.** `submit_bisect_rung_geom`'s
+/// wait is INTERNAL (`wait_bit_clear` on CT0CS, then `wait_fldone`), so a sampler written around the
+/// call would bracket the whole submit and see only its endpoints — useless for ordering. The two
+/// ways out were (1) transcribe the criterion's submit into this rung so the loop sits beside the
+/// QBA/QEA writes, or (2) call the criterion UNCHANGED, exactly as the `[v3d91]` call sites do, and
+/// fold the sampler from inside `wait_fldone` on the established `v3d71`/`v3d73` hook contract.
+/// **Option (2) is taken.** Transcribing the submit would fork the PI-V3D-91 criterion into a second
+/// copy that could silently drift from the one every §49 verdict is banked against — the bracket
+/// would stop being the same instrument, which is the failure mode this ladder has had to unwind
+/// twice already. Option (2) also keeps the rung honestly READ-ONLY: the fold issues reads only, and
+/// the criterion's own writes are the only writes on the path. `bank` is passed **false** for the
+/// same reason — `true` would arm the PCTR bank, which is a write this instrument has no license to
+/// make (and `submit_bisect_rung_geom` documents that the unbanked path issues no extra MMIO).
+///
+/// The one window this cannot cover is named rather than hidden: `wait_bit_clear`'s CT0CS spin runs
+/// between the GO and `wait_fldone`, and it has no fold hook. On the wedged block CTRUN reads clear
+/// ([v3d59] frameclose: CT0CS static), so that spin exits immediately and the gap is nil; on a boot
+/// where CTRUN is genuinely set the bracket starts late, and `samples` plus the criterion's own
+/// `idled=` column say so.
+#[cfg(all(feature = "v3d_deep", feature = "v3d_ptbbracket"))]
+fn v3d93_ptb_bracket_armed() {
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down | V3dPresence::Poison(_) => {
+            serial_println!(
+                ":: V3D: [v3d93] SKIPPED — hub absent/poison (QEMU raspi4b or block-down). No bracket ran and NO verdict is implied ::"
+            );
+            return;
+        }
+    }
+    serial_println!(
+        ":: V3D: [v3d93] ptb-bracket — bracketing the PI-V3D-91 bin criterion with {} stations sampled at the FLDONE poll loop's own rate (not the ~1ms cadence tick), seeded PRE-QBA, recording FIRST-CHANGE ordering across item-accept -> pool-write. READ-ONLY: no register write and no mailbox send belongs to this rung. §49.15 ::",
+        V3D93_N
+    );
+    let sync_pre = (
+        mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0SYNC),
+        mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1SYNC),
+    );
+    v3d93_sampler_arm();
+    // The PI-V3D-91 criterion, unchanged and unbanked — the `[v3d91]` call-site shape.
+    let retired = submit_bisect_rung_geom(
+        "v3d93",
+        "ptb-bracket bin-criterion",
+        BinContent::Empty,
+        OFF_SHADREC,
+        OFF_PROBE_BIN_CL,
+        false,
+        None,
+    )
+    .map(|r| r.retired)
+    .unwrap_or(false);
+    let sync_post = (
+        mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0SYNC),
+        mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1SYNC),
+    );
+    v3d93_sampler_emit("bin-criterion", sync_pre, sync_post, retired);
 }
 
 /// PI-V3D-75's discriminator kick: the [v3d74a] leg, compacted — the proven M3 RCL on CT0's queue,
