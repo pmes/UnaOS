@@ -430,9 +430,10 @@ fn owner_hidden(t: &Table, asid: u64, shell: u32) -> bool {
 /// VUGMIN-B — publish `asid`'s hidden state to the syscall layer, and count the transition.
 ///
 /// **The seam is a DIRECT CALL, not a registered callback.** `video::wm` is not arch-neutral in
-/// practice: it already reaches `crate::arch::aarch64::now_cycles()` directly from the composite path
-/// under a plain `#[cfg(target_arch = "aarch64")]`, so a callback table here would be a second, weaker
-/// convention for the same thing — and a seam whose whole content is "one `u64`, one `bool`, no return
+/// practice: the `[fluid3]` ledger reaches `crate::arch::aarch64::sched::fluid3_drain()` directly
+/// under a plain `#[cfg(target_arch = "aarch64")]`, as do this file's EL0 fixtures, so a callback
+/// table here would be a second, weaker convention for the same thing — and a seam whose whole
+/// content is "one `u64`, one `bool`, no return
 /// value" earns no indirection. The `cfg` is what keeps the other builds honest — `arch::aarch64::syscall`
 /// is itself gated behind `baremetal`, so the call is compiled in exactly where the info page it
 /// publishes through exists, and everywhere else (x86_64, the hosted aarch64 build) this is nothing.
@@ -1795,11 +1796,20 @@ pub fn composite() {
     // COMPOSITE-2 — the whole-pass clock. Starts before the inner pass (which self-reports its
     // sprite/wait/loop terms) and stops after the tail, so `pass_us` bounds everything a present
     // pays for its composite, including the tail's sprite work.
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
-    let c2_t0 = crate::arch::aarch64::now_cycles();
+    //
+    // FBCON-DMG — a PASS clock takes no band, and not because one was unavailable to it. A pass
+    // composites every dirty window plus everything the occlusion closure dragged in, each with its
+    // own `bands[i]` (and `None` for every window the closure added), so there is no single band for
+    // this interval to be narrowed by. What it measures is what ran, which is already the banded cost
+    // once the loop below is charging banded extents: the band moves this number by shortening the
+    // work, not by dividing the reading. The same holds for all six inner clocks — only the two
+    // EXTENT counters in `draw_window` had an arithmetic dependence on the band, and they are the
+    // only place this widening changed arithmetic.
+    #[cfg(feature = "witness")]
+    let c2_t0 = crate::arch::now_cycles();
     let mut tail = composite_inner();
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
-    let c2_t1 = crate::arch::aarch64::now_cycles();
+    #[cfg(feature = "witness")]
+    let c2_t1 = crate::arch::now_cycles();
     // CURSOR-7 — read BEFORE the tail runs, so a repaint the tail is already going to do is not
     // duplicated, and a pass that would otherwise have done nothing at all is upgraded.
     let dirty = super::cursor::take_present_dirty();
@@ -1833,10 +1843,10 @@ pub fn composite() {
     }
     // COMPOSITE-2 — close the ledger: the tail interval is sprite work, the whole interval is the
     // pass. One `now_cycles` read serves both accounts.
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     {
         use core::sync::atomic::Ordering::Relaxed;
-        let end = crate::arch::aarch64::now_cycles();
+        let end = crate::arch::now_cycles();
         let pass = end.saturating_sub(c2_t0);
         C2_SPRITE_CYC.fetch_add(end.saturating_sub(c2_t1), Relaxed);
         C2_PASSES.fetch_add(1, Relaxed);
@@ -1866,9 +1876,11 @@ enum CursorTail {
 /// The composite pass proper. Private so the cursor bracket above cannot be bypassed — every caller
 /// (including this module's own teardown paths) goes through [`composite`].
 fn composite_inner() -> CursorTail {
-    // COMPOSITE-2 — the pre-pass (drain + cursor bracket) clock opens here.
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
-    let c2_pre0 = crate::arch::aarch64::now_cycles();
+    // COMPOSITE-2 — the pre-pass (drain + cursor bracket) clock opens here. Band-free for the reason
+    // `composite`'s clock is: this interval runs before the table snapshot that produces `bands` at
+    // all, so no band is even in scope here, let alone one this reading could be narrowed by.
+    #[cfg(feature = "witness")]
+    let c2_pre0 = crate::arch::now_cycles();
     // WC-I — THE CURSOR BRACKET, decided BEFORE anything is registered as an in-flight blit.
     //
     // Before WC-I `composite` undrew the sprite unconditionally on every call — and `composite` runs
@@ -2117,9 +2129,9 @@ fn composite_inner() -> CursorTail {
     }
     // COMPOSITE-2 — pre-pass closed, wait clock opens: everything from here to the top of the blit
     // loop is serialisation (WRITER read, TABLE lock, damage close, ordering, guard registration).
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     let c2_wait0 = {
-        let t = crate::arch::aarch64::now_cycles();
+        let t = crate::arch::now_cycles();
         C2_SPRITE_CYC.fetch_add(
             t.saturating_sub(c2_pre0),
             core::sync::atomic::Ordering::Relaxed,
@@ -2271,10 +2283,13 @@ fn composite_inner() -> CursorTail {
     // window (`WRITER`/`TABLE`/`BlitGuard`), while `<F8>` with no `<F9>` means it is in the blit loop
     // proper — `draw_window`, the WC-G/WC-D witnesses, or the sprite overlay they drive.
     crate::wedge2::mark_composite("<F8>", "<f8>");
-    // COMPOSITE-2 — wait closed, loop clock opens.
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    // COMPOSITE-2 — wait closed, loop clock opens. `bands` exists by here, but it is a per-window
+    // array over the whole dirty set: the interval this clock covers is the SUM over that set, so
+    // there is no single band to charge it against. The banded cost shows up in the reading itself,
+    // because a banded window's `draw_window` copies fewer rows inside this interval.
+    #[cfg(feature = "witness")]
     let c2_loop0 = {
-        let t = crate::arch::aarch64::now_cycles();
+        let t = crate::arch::now_cycles();
         C2_WAIT_CYC.fetch_add(
             t.saturating_sub(c2_wait0),
             core::sync::atomic::Ordering::Relaxed,
@@ -2422,9 +2437,9 @@ fn composite_inner() -> CursorTail {
     // COMPOSITE-2 — loop closed. The witness one-shots inside it (WC-G/WC-D/WC-C) are charged here
     // when they fire; they are budgeted per window id, so the steady state they perturb is a handful
     // of early passes and never the rollup average this line is read for.
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     C2_LOOP_CYC.fetch_add(
-        crate::arch::aarch64::now_cycles().saturating_sub(c2_loop0),
+        crate::arch::now_cycles().saturating_sub(c2_loop0),
         core::sync::atomic::Ordering::Relaxed,
     );
     // WC-N — the pass reached the blit loop (`drawn == 0` is still a pass: it means every damaged row
@@ -4055,33 +4070,69 @@ static WCN_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 //     non-coherent scan-out's tax, measured separately because it scales with CLEANED bytes and
 //     the fix for it (clean the box, not full-width scanlines) is distinct from the blit fix.
 //
-// Plus the two denominators every claim needs: `bytes_pp` (panel bytes written per pass) and
-// `dmg_px_pp` (damage-clipped box area per pass). aarch64 + witness only, like the other wire
-// instruments; counters are relaxed increments on the hot path and are drained by the emit.
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+// Plus the denominators every claim needs: `bytes_pp` (panel bytes written per pass), `dmg_px_pp`
+// (the area those bytes covered) and `box_px_pp` (the area the same passes' outer boxes would have
+// covered whole). `witness`-gated and nothing else — like `wcg`, and unlike the `[fluid3]` ledger
+// below, which reads aarch64's own scheduler and therefore stays there. Counters are relaxed
+// increments on the hot path and are drained by the emit.
+//
+// ## FBCON-DMG — why the pass's two extents are now two counters
+//
+// This ledger was `all(target_arch = "aarch64", feature = "witness")` for as long as the only banded
+// present in the tree was x86's (`fbcon::route_present_rows`, `all(x86_64, feature = "wc")`). On the
+// one arch that counted, `band` was therefore provably always `None`, the outer box WAS the extent
+// written, and charging `bw * bh` was exact rather than approximate.
+//
+// Widening the gate alone would have turned that identity into a lie without changing a line of
+// arithmetic. The x86 console window bands hard — metal, this morning, a 736-row surface presenting
+// a 96-row minimum span — so a whole-box charge there would over-report `bytes` and `dmg_px` by the
+// box/band ratio, up to ~8x on that measurement. Every per-byte figure divided out of this line
+// would then have been wrong by that factor in the flattering direction (cost per byte too LOW,
+// throughput per pass too HIGH), which is the failure mode a cost ledger exists to prevent.
+//
+// So the two extents are charged separately: `dmg_px` is what `draw_window` actually painted and
+// `box_px` is what the same call would have painted whole. Their ratio is the banding ratio, ON THE
+// LINE — which is what makes a wrong widening falsifiable from the ledger by itself instead of only
+// by cross-reading `[wc-h] minspan=`. Equal terms mean nothing banded, and on aarch64 they are equal
+// BY CONSTRUCTION (no caller of [`present_rows`] compiles for that arch — see [`Window::dmg_y0`] and
+// the counting block in [`draw_window`]), so aarch64's numbers are exactly what they were before the
+// widening, including this line's new field.
+#[cfg(feature = "witness")]
 static C2_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[cfg(feature = "witness")]
 static C2_PASS_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[cfg(feature = "witness")]
 static C2_PASS_MAX_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[cfg(feature = "witness")]
 static C2_SPRITE_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[cfg(feature = "witness")]
 static C2_WAIT_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[cfg(feature = "witness")]
 static C2_LOOP_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[cfg(feature = "witness")]
 static C2_CACHE_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[cfg(feature = "witness")]
 static C2_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[cfg(feature = "witness")]
 static C2_DMG_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// FBCON-DMG — the whole-box area of the same `draw_window` calls `C2_DMG_PX` charges the painted
+/// area of. Never used as a denominator; it exists so the line can be read against itself.
+#[cfg(feature = "witness")]
+static C2_BOX_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// COMPOSITE-2 — drain the ledger and print the rollup line. Called from [`wcn_emit`] so the two
 /// instruments share one cadence and one `span`; all averages are per-pass, in microseconds.
 /// `blit_us` subtracts the cache term because the flush is timed INSIDE the loop (it is per-window,
 /// in `draw_window`), and reporting it twice would make the line un-addable.
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+///
+/// The cycle→microsecond conversion is `wcg`'s, which already carries a reader per arch (CNTVCT at
+/// `CNTFRQ_EL0` on aarch64, `rdtsc` at the rate `apic::calibrate` measured on x86); this line
+/// therefore needs no arch split of its own, and the two arches' `*_us` figures mean the same thing.
+///
+/// FBCON-DMG — `box_px_pp` is INSERTED between `dmg_px_pp` and `rate=`, not appended: `span=` stays
+/// the terminal field so any matcher anchored on the end of this line is unaffected. See the module
+/// note above for what the pair is for.
+#[cfg(feature = "witness")]
 fn comp2_emit(span: u64) {
     use core::sync::atomic::Ordering::Relaxed;
     let passes = C2_PASSES.swap(0, Relaxed);
@@ -4093,12 +4144,13 @@ fn comp2_emit(span: u64) {
     let cache_cyc = C2_CACHE_CYC.swap(0, Relaxed);
     let bytes = C2_BYTES.swap(0, Relaxed);
     let dmg_px = C2_DMG_PX.swap(0, Relaxed);
+    let box_px = C2_BOX_PX.swap(0, Relaxed);
     if passes == 0 {
         return;
     }
     let us = |cyc: u64| super::wcg::cycles_to_us(cyc / passes);
     serial_println!(
-        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} cache_us={} bytes_pp={} dmg_px_pp={} rate={}.{}/s span={}ms",
+        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} cache_us={} bytes_pp={} dmg_px_pp={} box_px_pp={} rate={}.{}/s span={}ms",
         passes,
         us(pass_cyc),
         super::wcg::cycles_to_us(max_cyc),
@@ -4108,6 +4160,7 @@ fn comp2_emit(span: u64) {
         us(cache_cyc),
         bytes / passes,
         dmg_px / passes,
+        box_px / passes,
         passes.saturating_mul(10_000) / span.max(1) / 10,
         passes.saturating_mul(10_000) / span.max(1) % 10,
         span
@@ -4539,8 +4592,8 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
         span,
         verdict
     );
-    // COMPOSITE-2 — the cost ledger rides the same cadence and the same span.
-    #[cfg(target_arch = "aarch64")]
+    // COMPOSITE-2 — the cost ledger rides the same cadence and the same span, on BOTH arches now:
+    // the counters and the emit are `witness`-gated and nothing else, and this block already is.
     comp2_emit(span);
     // FLUID-3 — the wait ledger rides the same cadence and the same span.
     #[cfg(target_arch = "aarch64")]
@@ -5240,27 +5293,60 @@ fn draw_window(
     let (fy0, fy1) = if staged { (by + dy0, by + dy1) } else { (by, by + bh) };
     let y0 = fy0.min(info.height);
     let y1 = fy1.min(info.height);
-    // COMPOSITE-2 — the cache term and the pass's two denominators. `bytes` is what reached the
-    // panel (the clipped box), `dmg_px` its area; both are the numbers `[comp2]`'s per-byte claims
-    // divide by.
+    // COMPOSITE-2 — the cache term and the pass's denominators. `bytes` is what reached the panel,
+    // `dmg_px` its area; both are the numbers `[comp2]`'s per-byte claims divide by, and `box_px` is
+    // the whole-box area they would have been charged as before this arc.
     //
-    // FBCON-DMG leaves both terms as the WHOLE box, and that is not an oversight: this block is
-    // `target_arch = "aarch64"`, where `band` is provably always `None` (the only producer is the
-    // routed console window, which is `all(target_arch = "x86_64", feature = "wc")`), so `bw * bh` IS
-    // the extent that ran. Narrowing them here would be a change with no arch that can observe it.
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    // ### FBCON-DMG — the extent is `y1 - y0`, and it is deliberately the FLUSH's own expression
+    //
+    // While this block was `target_arch = "aarch64"` it charged `bw * bh`, the whole box, on the
+    // argument (correct at the time, and load-bearing) that `band` is provably `None` on that arch —
+    // the only producer of a band is the routed console window, `all(x86_64, feature = "wc")`, and
+    // `wm::present_rows` has no other caller that compiles for aarch64. Whole-box WAS the extent that
+    // ran, so the numbers were honest and narrowing them would have been unobservable.
+    //
+    // That argument does not survive the widening. On x86 the console bands, so the ledger has to
+    // charge the rows the pass actually wrote, and the rows it actually wrote are exactly the ones
+    // the cache clean two lines down is about to sweep: `[y0, y1)`, derived above from `staged`
+    // rather than from `band` precisely because the direct fallback IGNORES the band and repaints
+    // whole. Reusing that expression rather than re-deriving it from `dy0`/`dy1` is the point — the
+    // ledger and the flush cannot drift apart into disagreeing about what this call painted, because
+    // there is only one derivation and both read it.
+    //
+    // ### Why aarch64's numbers cannot move
+    //
+    // `band == None` forces `(dy0, dy1) == (0, bh)` at the top of this function. Then BOTH arms of
+    // the `staged` conditional above produce `(fy0, fy1) == (by, by + bh)` — the staged arm because
+    // `by + dy0 == by` and `by + dy1 == by + bh`, the direct arm literally. F6 has already clipped
+    // `bh` to `ph - by`, so `by < ph` and `by + bh <= ph == info.height`, and the two `.min` clamps
+    // are no-ops: `y0 == by`, `y1 == by + bh`, hence `y1 - y0 == bh`. The new `bw * (y1 - y0)` is
+    // therefore not merely equivalent to the old `bw * bh` on aarch64 — it evaluates the same
+    // integer, on every pass, and `box_px` charges that same integer a second time. Nothing on that
+    // arch reads differently by one.
+    #[cfg(feature = "witness")]
     let c2_f0 = {
         use core::sync::atomic::Ordering::Relaxed;
-        C2_BYTES.fetch_add((bw * bh * info.bytes_per_pixel) as u64, Relaxed);
-        C2_DMG_PX.fetch_add((bw * bh) as u64, Relaxed);
-        crate::arch::aarch64::now_cycles()
+        let wrote = bw * (y1 - y0);
+        C2_BYTES.fetch_add((wrote * info.bytes_per_pixel) as u64, Relaxed);
+        C2_DMG_PX.fetch_add(wrote as u64, Relaxed);
+        C2_BOX_PX.fetch_add((bw * bh) as u64, Relaxed);
+        crate::arch::now_cycles()
     };
     if y1 > y0 {
         fb.flush_rect(bx, y0, bw, y1 - y0);
     }
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    // COMPOSITE-2 — the cache term is band-correct without arithmetic of its own: it brackets a
+    // `flush_rect` over `[y0, y1)`, the same rows charged above, so a banded present pays a banded
+    // sweep and the interval measures it.
+    //
+    // On x86 that call is one `SFENCE` and no sweep at all — `flush_rect` takes the
+    // `not(target_arch = "aarch64")` arm, where the drain is range-independent — so `cache_us` there
+    // reads 0 once the per-pass division and the cycles→us truncation have run. That zero is a
+    // measurement, not a hole: it says the scan-out is coherent and the extent cost nothing to
+    // publish, and it is why `blit_us` and `loop_us` coincide on that arch.
+    #[cfg(feature = "witness")]
     C2_CACHE_CYC.fetch_add(
-        crate::arch::aarch64::now_cycles().saturating_sub(c2_f0),
+        crate::arch::now_cycles().saturating_sub(c2_f0),
         core::sync::atomic::Ordering::Relaxed,
     );
     // CURSOR-3: the cache clean above covers the sprite's pixels for free — they are inside these
