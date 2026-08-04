@@ -6639,7 +6639,7 @@ impl XhciController {
     /// in false positives: real payload would have to match a fixed 4-byte signature AND a
     /// monotonically-increasing 32-bit tag that no earlier transaction can carry — 2^-64 per stage.
     fn bot_fold_zero_data_csw(&mut self, slot_id: u8, cdb0: u8, tag: u32,
-        data_phys: u64, data_len: u32) -> Option<BotResult>
+        data_phys: u64, data_len: u32, in_dci: u8, out_dci: u8, csw_phys: u64) -> Option<BotResult>
     {
         // Below 8 bytes there is no room for signature + tag, so the transaction cannot be
         // identified and nothing may be folded on a guess.
@@ -6713,8 +6713,77 @@ impl XhciController {
         // line. The fold IS the resolution, so drop it — otherwise a later transaction's recovery
         // could attribute this stage's pipe to itself.
         self.bot_failed = None;
+        // boot24 (PA33): even a SUCCESSFUL Mass Storage Reset does not make this hardware discard
+        // the CSW the host never consumed — the device replayed its tag-5 CSW into the retry's
+        // data stage AFTER recover_bot_full=true (the geometry clamp caught it; 'Generic USB SD
+        // Reader'). On this silicon the only consume is a READ: drain the IN pipe with bare CSW-
+        // sized TDs until it goes quiet, so the next real transaction's data stage starts at its
+        // own first byte.
+        self.bot_drain_stale_csw(slot_id, in_dci, out_dci, csw_phys);
 
         Some(BotResult { status, residue })
+    }
+
+    /// [piusb41] boot24 — drain the IN pipe of replayed CSWs after a fold. Evidence chain, one
+    /// boot per link: boot22 proved the CSW's tail leaks into the next data buffer; boot23 proved
+    /// the recovery ladder can be made to succeed; boot24 proved that even a SUCCESSFUL Bulk-Only
+    /// Mass Storage Reset leaves the unconsumed CSW queued — the device ('Generic USB SD Reader')
+    /// replays it to every IN until something reads it. So something reads it: a bare CSW-sized IN
+    /// TD, no CBW in front, pointed at the CSW buffer, up to two passes.
+    ///
+    /// A TIMEOUT here is the CLEAN outcome — the pipe had nothing queued — and costs one
+    /// escalation-scale budget, not the first-attempt 3x: this path has already burned a full
+    /// budget by definition, and "empty" must be cheap. The timed-out drain TD is stranded by
+    /// construction and is ended by the same `bot_clean_rings` every timeout path uses; the parked
+    /// failure record is dropped so no later transaction's recovery can claim this pipe.
+    fn bot_drain_stale_csw(&mut self, slot_id: u8, in_dci: u8, out_dci: u8, csw_phys: u64) {
+        for pass in 0..2u32 {
+            unsafe { core::ptr::write_bytes(csw_phys as *mut u8, 0, 13); }
+            dma_coherency::clean(csw_phys as usize, 13);
+            let trb_phys = {
+                let ring = match self.slots[slot_id as usize].bulk_in_ring.as_mut() {
+                    Some(r) => r,
+                    None => return,
+                };
+                let base = ring.get_ptr();
+                let idx = match ring.push(Trb {
+                    parameter: csw_phys, status: 13,
+                    control: (1 << 10) | (1 << 5) | (1 << 2), // Normal, IOC, ISP — the CSW-stage shape
+                }) {
+                    Ok(i) => i,
+                    Err(_) => return, // ring full mid-recovery: the next timeout's clean owns it
+                };
+                base + (idx as u64) * 16
+            };
+            self.bot_doorbell(slot_id, in_dci, true);
+            let saved = self.bot_budget_scale;
+            self.bot_budget_scale = BOT_BUDGET_SCALE_ESCALATION;
+            let stage = self.run_bot_stage(slot_id, in_dci, out_dci, trb_phys);
+            self.bot_budget_scale = saved;
+            match stage {
+                Ok((cc, residue)) => {
+                    dma_coherency::clean_inval(csw_phys as usize, 13);
+                    let d = unsafe { core::slice::from_raw_parts(csw_phys as *const u8, 13) };
+                    let sig = (d[0] as u32) | ((d[1] as u32) << 8) | ((d[2] as u32) << 16) | ((d[3] as u32) << 24);
+                    let stale_tag = (d[4] as u32) | ((d[5] as u32) << 8) | ((d[6] as u32) << 16) | ((d[7] as u32) << 24);
+                    let is_csw = sig == 0x5342_5355;
+                    serial_println!(
+                        ":: BOT: [piusb41] drained stale IN pass={} cc={} residue={} is_csw={} tag={:#010x} status_byte={:#04x} — {} ::",
+                        pass, cc, residue, is_csw, stale_tag, d[12],
+                        if is_csw { "a replayed CSW consumed off the pipe; the next data stage starts clean" }
+                        else { "the pipe carried something that is NOT a CSW — recorded raw above, drain stops here rather than eat unknown data" });
+                    if !is_csw { return; }
+                }
+                Err(_) => {
+                    self.bot_clean_rings(slot_id, BotError::Timeout);
+                    self.bot_failed = None;
+                    serial_println!(
+                        ":: BOT: [piusb41] drain pass={} — IN pipe quiet (timeout is the CLEAN outcome here); stranded drain TD cleaned ::",
+                        pass);
+                    return;
+                }
+            }
+        }
     }
 
     /// The single-attempt Bulk-Only Transport transaction: CBW -> (optional data) -> CSW.
@@ -6913,7 +6982,8 @@ impl XhciController {
             // host-written and the device cannot have put anything in it.
             if !data_out {
                 if let Some(folded) = self.bot_fold_zero_data_csw(
-                    slot_id, *cdb.first().unwrap_or(&0), tag, data_phys, data_len)
+                    slot_id, *cdb.first().unwrap_or(&0), tag, data_phys, data_len,
+                    in_dci, out_dci, csw_phys)
                 {
                     return Ok(folded);
                 }
