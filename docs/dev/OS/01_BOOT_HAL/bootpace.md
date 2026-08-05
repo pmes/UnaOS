@@ -731,3 +731,175 @@ anything else breaks the property that makes their cross-checks meaningful. The
 on this board; do not use it for instrument arithmetic.
 
 Read this capture with `awk '/pattern/'` — **not** `grep`.
+
+### 10f. Re-derivation: the SCHED-X86 render-placement argument under the true write rate
+
+Queue item from §10c. The regression did not only inflate boot figures; it fed a
+*design* argument. Several placement and presentation decisions were justified by
+"a present costs most of a frame on this panel", and that cost was a measurement
+of the UC clobber, not of the panel. This subsection redoes the arithmetic and
+says what the placement decision would look like if it were being made today. It
+is analysis for a decision, not the decision — nothing here changes code, and the
+one measurement that would settle it has not been taken.
+
+#### The premise, and where it actually lives
+
+There is no single document that states "render is placed here because a
+full-screen present costs ~50 ms". The premise is distributed across four code
+comments, each carrying a different number, and no two of them are reconcilable
+with each other:
+
+| site | figure as written | classification |
+|---|---|---|
+| `arch/x86_64/memory.rs:1047` | "flat ~162 MB/s, size-invariant … 7.6 -> 53.8 fps with WC live" | **measured** (metal, `rmbp-gr15-s70`) |
+| `arch/x86_64/sched.rs:2383` (`Channel::try_recv`, the DRAIN doc) | "A 2880x1800 present is ~50 ms" | **inferred**, origin not recorded |
+| `pal.rs:195-198` (CURSOR-X86) | `flush` = 69–86% of the frame budget at 10.9 MB/frame; "measured write bandwidth … ~150 MB/s" from `[wc-h] win=2 bytes=1620080 present_us=9858` | **measured** rate, quoted 9% low: 1 620 080 / 9858 µs = **164.3 MB/s** |
+| `video/fbcon.rs:967` (FBCON-DMG) | "the 24 ms measured in `[wc-h] win=1`" | **measured** — this is the 1314×750 console window, 3 942 000 B |
+
+All four are the same reading of the same defect. 3 942 000 B / 24 269 µs =
+**162.4 MB/s**; the `win=2` sample gives 164.3 MB/s at a byte count 2.4× smaller,
+which is exactly the size-invariance `memory.rs` names. The rate is real and the
+instruments were honest. What none of them knew is that it was the memory type
+talking.
+
+#### The corrected arithmetic
+
+Post-fix, same window, same byte count (§10b): 3 942 000 B / 2660 µs =
+**1482 MB/s**; / 2789 µs = **1413 MB/s**. Take **1.41 – 1.48 GB/s** as the WC
+write rate and re-cost every present the premise depended on:
+
+| payload | bytes | at 162.4 MB/s (UC) | at 1.41 – 1.48 GB/s (WC) |
+|---|---|---|---|
+| console window, `box=1314x750` | 3 942 000 | 24.3 ms *(measured)* | 2.66 / 2.79 ms *(measured)* |
+| `[wc-h] win=2` sample | 1 620 080 | 9.9 ms *(measured)* | ~1.1 ms *(inferred)* |
+| `[vugfps]` damage-limited frame | 10 900 000 | 67 ms *(inferred)* | **7.4 – 7.7 ms** *(inferred)* |
+| **full panel**, 2880×1800×4 | 20 736 000 | 128 ms *(inferred)* | **14.0 – 14.7 ms** *(inferred)* |
+
+Two things fall out immediately.
+
+**The `sched.rs` "~50 ms" was never a full-screen present.** At 162.4 MB/s, 50 ms
+buys 8.1 MB — 39% of a 2880×1800 panel. A genuine full-panel present cost **128
+ms** under UC, not 50. The 50 ms figure is consistent with a damage-limited
+present of roughly `[vugfps]` size, and the comment's own corroborating figures
+agree with that reading (`memory.rs`'s 7.6 fps = 132 ms/frame is the full-panel
+number; `rast_demo.rs`'s "~22 fps" = 45 ms is the damage-limited one). Whichever
+payload the 50 ms described, dividing by the measured ratio gives **~5.6 ms**.
+
+**A full-panel present is now approximately one frame, not eight to ten.** 14.0 –
+14.7 ms sits inside a 16.7 ms (60 Hz) budget and marginally *outside* a 13.3 ms
+(75 Hz) one. The panel's actual refresh rate is not established anywhere in this
+tree — do not assume 75 Hz here; the honest statement is "one frame, ±10%",
+which is a materially different regime from "most of a frame" and a completely
+different regime from "eight frames".
+
+#### What the premise was actually holding up, item by item
+
+Read from code. Four decisions cite present cost; only one of them depends on it.
+
+1. **Rule 1 — the pump and the render task must be on different cores**
+   (`main.rs:1216-1222`, `scheduler.md` §SCHED-X86). Rests on `XHCI_CONTROLLER`
+   being a raw `spin::Mutex` with two preemptible takers, which hard-deadlocks on
+   one core. **Bandwidth-independent. Unchanged. Do not relax it on the strength
+   of this section** — the deadlock is a liveness property and 9× more headroom
+   does not touch it.
+2. **Rule 2 — never place a COOPERATIVE (IF=0) ring-3 task on core 0.** Rests on
+   core 0 being the sole advancer of `arch::ms()`. **Unchanged.** Its neighbour —
+   never place a cooperative ring-3 task on the *render* core — is also unchanged:
+   a task that owns its core until it syscalls stalls the panel for an unbounded
+   time, and unbounded does not shrink by 9×.
+3. **The PAT/WC paragraph in `scheduler.md`** ("pinning render to an AP would have
+   made that AP's fb PTE select PA4=WB … effective-UC"). Already resolved by
+   `smp::ap_entry` calling `ensure_pat_wc()` on **every** AP, and the doc already
+   says the placement decision is therefore not load-bearing. §10's clobber was a
+   *different* mechanism (a leaf retype, not a per-core MSR) and does not revive
+   this argument. **Unchanged.**
+4. **`smp::worker_cpu`'s blanket exclusion of the render core** (`smp.rs:55-88`).
+   This is the one. It has two justifications welded together: cooperative ring-3
+   tasks stall the panel (item 2, still sound and sufficient on its own), *and*
+   the render core has no slack to share (present cost — **now 9× weaker**).
+
+And the open question `scheduler.md` records but does not answer:
+`syscall::bg_place_cpu` deliberately places `bg`/`run` programs on the caller's
+core, which since SCHED-X86 is the render core, "so a foreground `run` degrades
+the panel for its duration".
+
+#### What the decision looks like under the true rate
+
+Inferred throughout — this is the argument, not a result.
+
+The render core's duty cycle is what the premise was really about. HID reports
+arrive at 125 Hz (8 ms apart; `video/cursor.rs:1745`). Under UC, an isolated
+damage-limited present at ~50 ms against an 8 ms report interval means the render
+task cannot keep up by roughly 6×: the DRAIN in `x86_render_service` was not an
+optimisation but the only thing standing between the desktop and an unbounded
+`GUI_CHANNEL_X86` backlog. Under WC the same present is ~5.6 ms — *inside* the
+report interval. Even the full-panel worst case, 14 ms, is under two report
+intervals. The render task stops being a permanently saturated core and becomes a
+bursty one.
+
+That reverses the sign of the argument in item 4, and only item 4:
+
+- **Keep the DRAIN.** Its worst case is a 64-slot channel drained to one present
+  instead of 64; the amplification is unchanged by the write rate, only its
+  urgency drops. A present-per-event build would now cost 64 × 5.6 ms rather than
+  64 × 50 ms, which is still catastrophic. This is cheap insurance and there is
+  no argument for removing it.
+- **Split item 4's two justifications.** Cooperative ring-3 must still never land
+  on the render core (liveness). *Preemptible* work has only the slack argument
+  behind it, and the slack argument is now weak. The concrete consequence is the
+  `PARTIAL` verdict: `PLACE-CHECK` reports `PARTIAL` when `pool < 3`, and on the
+  QEMU default `-smp 6` the pool meets the requirement with **zero slack**, so one
+  AP failing INIT-SIPI-SIPI silently skips U7x/SOCK-4/U6gx — U6gx being the only
+  automated exercise of the STOR-1 S5 mitigation. Admitting preemptible non-xHCI
+  work onto the render core as a *fallback when `pool < 3`* converts a skipped
+  fixture into a slightly jittery panel. On the corrected arithmetic that is the
+  better trade; on the old arithmetic it was not.
+- **`bg_place_cpu` can probably close as "correct as written".** `run`/`bg` use
+  `spawn_user_preemptible` (IF=1), so the co-located program is preempted normally
+  and the interference is bounded by the timeslice, not by the program. The panel
+  degradation it was flagged for is now ~5.6 ms of stolen present per contended
+  slice rather than ~50. Closing it means accepting that a foreground `run` makes
+  the desktop *slightly* choppy instead of unusable — which is ordinary
+  single-core-desktop behaviour, not a defect. The condition on that closure is
+  that nothing routes a *cooperative* spawn through it.
+- **The `exclusive` tier stops being the only acceptable tier.** `tier=exclusive
+  pool=5` on the 8-core metal box is unaffected either way; what changes is that
+  `tier`s below it are no longer evidence of a broken desktop.
+
+None of this touches rules 1 and 2, and none of it is a reason to un-pin render or
+to fold it back onto the BSP: the reason render is a scheduled task on its own
+core is that the BSP was never popping a run queue (2 BGRUN spawns, zero
+`SYS_WIN_CREATE`, `c0:0/0` beside `0/263`), which has nothing to do with
+bandwidth.
+
+#### The measurement that would confirm or refute it
+
+**Everything above rests on one unmeasured extrapolation**: that the 1.41 –
+1.48 GB/s measured at 3 942 000 B still holds at 20 736 000 B. UC was
+size-invariant, so extrapolating from it was safe; WC is combining-buffer
+behaviour and there is no evidence in the record that it is. Every post-fix
+`present_us` in `rmbp-gr15-s70` is the 1314×750 console window on the FBCON-DMG
+banded path during boot. **There is not one WC-live full-panel present in the
+capture record.** Take that first.
+
+Prerequisites for any of these to mean anything: `UNAOS_WC=1` plus the Kepler
+knobs (the compositor's only ignition on x86 is the Kepler takeover), `wc` in the
+`⚡ kernel features:` banner, and — the one that makes the run post-fix rather
+than a repeat of the premise — the boot must print `x86 mmio-map:
+0x90000000..0xa0000000` with `wc-kept=15`. Without that line the panel is UC
+again and every number below reproduces the old argument. Read with
+`awk '/pattern/'`, not `grep`.
+
+| # | witness line | source | confirms | refutes |
+|---|---|---|---|---|
+| 1 | `[wc-h] win=… box=…x… span=… band=… bytes=… compose_us=… present_us=… rectscan_us=… torn=… -> BUFFERED` | `video/wcg.rs:788` | a row with `bytes` at/near 20 736 000 and `present_us` ≈ 14 000 – 14 700 (i.e. `bytes`/`present_us` still 1.4 – 1.5 GB/s) | `present_us` ≫ 25 000 at that byte count — WC does not hold at full-panel size, the extrapolation fails, and item 4's slack argument survives |
+| 2 | `[wc-h] rollup … maxpresent_us=… frame_us=… ` | `video/wcg.rs:922` | `maxpresent_us` is the single number the placement argument needs — the **worst** present in the window, not the mean. Confirms if it stays under ~15 000 | a `maxpresent_us` in the tens of thousands means the render core still has a stall long enough to matter, whatever the average says |
+| 3 | `[schedx86] depth sent=… recv=… inflight=… (render core N)` | `main.rs:4166` | `inflight` at 0–1 through a sustained trackpad sweep plus a console scroll: the render task is keeping up, and "the render core is saturated" is dead | `inflight` climbing toward the 64-slot cap — the backlog the DRAIN exists to prevent is still forming, and no placement should be relaxed |
+| 4 | `:: [vugfps4] drain=…us draw=…us flush=…us tail=…us sum=…us (=1e6/fps)` and `:: [vugfps] …fps …bytes/frame flushed…` | `vug.rs:966` / `vug.rs:943` | `flush` falling to well under 30% of `sum`. `pal.rs`'s "69–86% of the frame budget" is a UC-era figure and inverts if this holds — the frame stops being flush-bound | `flush` still the majority of `sum` — the present is still the frame and CURSOR-X86's premise stands unmodified |
+| 5 | `:: SCHED-X86 PLACE: aps=… render=c… svc=c… worker=[…] xhci=[…] tier=… pool=… ::` and `:: SCHED-X86 PLACE-CHECK: actual=c… arg=c… published=c… pool=… collide=… tier=… verdict=… ::` | `smp.rs:250` / `smp.rs:320` | not evidence for or against the arithmetic — this is the **state any change would move**, recorded so a before/after exists. Today's metal reading is `tier=exclusive pool=5 verdict=PASS` | `verdict=FAIL` at any point stops the whole enquiry: the renderer is not where it was published, and no timing read from that boot describes the core it names |
+
+Witness 1 is the load-bearing one and it is cheap: it needs a single full-panel
+present on a WC-live boot. Until it exists, item 4 and `bg_place_cpu` should be
+recorded as *arguments whose premise has been withdrawn*, not as decisions
+reversed — a withdrawn premise leaves a decision unjustified, which is not the
+same as leaving it wrong.
