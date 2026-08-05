@@ -53,7 +53,8 @@
 //!
 //!   1. **RESERVE, once.** On the FIRST main-loop pass where a block device is present, the recorder
 //!      makes `UNAOS.LOG` exist at a FIXED `RESERVE_BYTES` size (create + one `write_grow` of zeros,
-//!      or reuse an already-large-enough entry from a previous boot untouched). This is the recorder's
+//!      or reuse an already-large-enough entry from a previous boot untouched, then stamp its head in
+//!      place so a reader can tell which boot claimed it — FRSTAMP, see `boot_stamp`). This is the recorder's
 //!      ONLY lifetime FAT/directory mutation, and it is exclusive BY CONSTRUCTION, not by luck: it runs
 //!      on the BSP, in the main loop, at a call site that PRECEDES every fixture/launcher spawn in the
 //!      same iteration (`main.rs`: `flight_recorder::service()` sits above `u2_probe_once()` and the
@@ -74,16 +75,19 @@
 //!
 //! Cost of the shape: `UNAOS.LOG` is always `RESERVE_BYTES` on disk, with the captured log as its
 //! prefix, an explicit end-of-log marker line, and zero padding after it. The reserve is one bounded
-//! 64 KiB zero-fill at boot (the same order as the flush the old code did every 4096 iterations).
+//! `RESERVE_BYTES` (256 KiB + slack) zero-fill at boot — bigger than the old per-4096-iteration
+//! flush, but still one bounded write on the reserve pass only.
 
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use spin::Mutex;
 
-/// Ring capacity. A full vm-image boot to the shell is a few hundred short serial lines
-/// (`[INFO]…` / `::…::` / `-> PASS`), well under 64 KiB; sized to hold the whole boot log without
-/// evicting the banner. A fixed static (BSS) — no heap.
-const RING_CAP: usize = 64 * 1024;
+/// Ring capacity. 64 KiB held "a full vm-image boot" when that claim was written, but the FTDI
+/// module's own measured bench boots record 65 731 pre-console bytes on the SAME stream — and this
+/// ring drops NEWEST when full, so the tail of the boot (the kepler block, the GPACE/BPACE
+/// ledgers) is precisely what a too-small ring loses. 256 KiB matches the FTDI capture ring
+/// (GR15) and absorbs the `logts` prefix overhead (+12 bytes/line). A fixed static (BSS) — no heap.
+const RING_CAP: usize = 256 * 1024;
 
 struct LogRing {
     buf: [u8; RING_CAP],
@@ -162,7 +166,7 @@ pub fn capture(args: fmt::Arguments) {
     tap.submit();
     if let Some(mut ring) = RING.try_lock() {
         drain_staged(&mut ring);
-        let _ = fmt::write(&mut *ring, args);
+        let _ = ring_write(&mut ring, args);
         tap.absorb();
         return;
     }
@@ -181,18 +185,54 @@ pub fn capture(args: fmt::Arguments) {
     // Staging ring full: one free retry at the sink before the line is declared lost.
     if let Some(mut ring) = RING.try_lock() {
         drain_staged(&mut ring);
-        let _ = fmt::write(&mut *ring, args);
+        let _ = ring_write(&mut ring, args);
         tap.absorb();
         return;
     }
     tap.drop_line();
 }
 
+/// This sink's line-start flag — mutated only while `RING` is held (by the prefixing writer and by
+/// [`drain_staged`]'s bare-byte correction).
+#[cfg(feature = "logts")]
+static LINE_START: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// CLOCK-2b: the direct (lock-held) write into the boot-log ring, timestamp-prefixed under `logts`
+/// so `UNAOS.LOG` self-dates the same way the FTDI capture does — this file is the whole log a
+/// `vm-image` consumer will ever have. Staged lines are folded in bare by [`drain_staged`] on
+/// purpose: a prefix rendered at drain time would stamp the drain, not the emission.
+fn ring_write(ring: &mut LogRing, args: fmt::Arguments) -> fmt::Result {
+    #[cfg(feature = "logts")]
+    {
+        use core::fmt::Write;
+        crate::logts::TapPrefixWriter { inner: ring, state: &LINE_START }.write_fmt(args)
+    }
+    #[cfg(not(feature = "logts"))]
+    fmt::write(ring, args)
+}
+
 /// Fold every staged line into the byte ring, in order. **Caller must hold `RING`.** Pure memcpy — see
 /// the I/O note in [`capture`].
+///
+/// CLOCK-2b: staged bytes bypass the prefixing writer (deliberately — see [`ring_write`]), so the
+/// drainer re-trues the sink's line-start flag from the last byte it pushed; a staged fragment
+/// without a trailing `\n` would otherwise leave the flag claiming line-start and the next prefix
+/// would land mid-line.
 fn drain_staged(ring: &mut LogRing) {
-    let n = STAGE.drain(|s| ring.append(s.as_bytes()));
+    #[cfg(feature = "logts")]
+    let mut last_byte: Option<u8> = None;
+    let n = STAGE.drain(|s| {
+        ring.append(s.as_bytes());
+        #[cfg(feature = "logts")]
+        {
+            last_byte = s.as_bytes().last().copied().or(last_byte);
+        }
+    });
     crate::serial_ring::TAP_FLIGHTREC.absorb_n(n);
+    #[cfg(feature = "logts")]
+    if let Some(b) = last_byte {
+        LINE_START.store(b == b'\n', core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Current number of captured bytes (for the flush's grow-detection). Cheap `try_lock`; `None` if the
@@ -209,6 +249,10 @@ fn captured_len() -> Option<usize> {
 fn snapshot() -> Option<(alloc::vec::Vec<u8>, usize)> {
     let ring = RING.try_lock()?;
     let mut out = alloc::vec::Vec::with_capacity(ring.len + 256);
+    // FRSTAMP: the boot-identity line is FIRST, at offset 0, so the flush's own bytes supersede the
+    // `state=reserved` stamp this boot wrote at reservation time (see `boot_stamp`). Everything below
+    // it is this boot's capture.
+    out.extend_from_slice(boot_stamp(REUSED.load(Ordering::Relaxed), true).as_bytes());
     // A self-identifying header IN THE FILE only (never emitted on the live serial stream, so the boot
     // output is byte-unchanged). Gives the tester a clear "this is a UnaOS boot log" marker and a
     // stable grep target — the bootloader's own banner runs in a separate UEFI binary before the
@@ -243,7 +287,9 @@ const FLUSH_EVERY_ITERS: u32 = 4096;
 /// `RING_CAP` ring + the `dropped` note + the end-of-log marker, so a full ring never needs the file to
 /// grow — a grow would be a FAT mutation, and the whole point of the reservation is that the recorder
 /// performs exactly ONE of those, at boot, when it is provably the only writer. 512 bytes of slack over
-/// `RING_CAP` covers the three fixed-form trailer/header lines with room to spare.
+/// `RING_CAP` covers the four fixed-form header/trailer lines (the FRSTAMP boot-identity line, the
+/// self-identifying header, the `dropped` note and the end-of-log marker — under ~360 bytes even with
+/// 20-digit counter values) with room to spare.
 const RESERVE_BYTES: usize = RING_CAP + 512;
 
 /// Bootstrap state for the reservation. `0` = not attempted, `1` = reserved (`LOG_FIRST`/`LOG_SIZE` are
@@ -267,16 +313,75 @@ static LOG_SIZE: AtomicU32 = AtomicU32::new(0);
 /// spent overwriting known zeros with zeros. The pad is only ever needed in the ONE case that leaves
 /// a stale tail: reusing an already-large-enough file. `reserve_log` now says which case it took.
 static PAD_NEXT: AtomicBool = AtomicBool::new(false);
+/// The same `reused` verdict, kept for the whole boot so the FRSTAMP line can carry it. `PAD_NEXT`
+/// cannot serve: it is consumed (swapped false) by the first flush, which is exactly the flush whose
+/// header has to say which case the reservation took.
+static REUSED: AtomicBool = AtomicBool::new(false);
+
+/// FRSTAMP — the file's FIRST line: which boot owns these bytes.
+///
+/// The stale-log trap this closes: `reserve_log`'s reuse case leaves a previous boot's `UNAOS.LOG`
+/// byte-identical on disk, and a boot that dies before its first flush therefore hands the reader a
+/// complete, plausible, WRONG log with no way to tell — the reader was left cross-matching `hz=` out
+/// of the body by hand. So the reservation itself now stamps the file, and the stamp names the state
+/// it was written in:
+///
+///   * `state=reserved` — written the instant the file was claimed, before any capture reached it.
+///     The bytes BELOW it are not this boot's log (in the reuse case they are the previous boot's).
+///   * `state=flushed` — written by [`snapshot`] as the first line of a real flush. The bytes below
+///     it are this boot's capture.
+///
+/// The guarantee begins AT RESERVATION, not at power-on: a boot that dies before storage comes up
+/// never reaches `service()`'s reserve pass and leaves the previous boot's file wholly intact —
+/// including its `state=flushed` stamp, which then truthfully describes a PREVIOUS boot. A file-only
+/// reader cannot detect that window from the file alone; cross-matching `hz=`/body content against
+/// an independent record (the FTDI capture) remains the check for it. What the stamp closes is the
+/// stale-file trap for every boot that got as far as claiming the file.
+///
+/// The boot identity is `hz` (the ledger's counter rate, from `bootpace::origin_hz`) plus `cy` (the
+/// raw free-running counter at the moment of the stamp — monotonic within a boot, unrelated across
+/// boots). `hz=0` means the timebase was not calibrated yet; it is printed as 0 and `cy` stays raw
+/// ticks, because a fabricated millisecond here is exactly the kind of number a later reader would
+/// trust. Two boots of the same image differ in `cy` even when `hz` is identical.
+fn boot_stamp(reused: bool, flushed: bool) -> alloc::string::String {
+    alloc::format!(
+        ":: FR-BOOT: hz={} cy={} reused={} state={} ::\n",
+        crate::bootpace::origin_hz(),
+        crate::arch::now_cycles(),
+        reused,
+        if flushed { "flushed" } else { "reserved" }
+    )
+}
+
+/// Write the `state=reserved` stamp over the head of the freshly reserved file.
+///
+/// IN PLACE (`write_at` over the already-reserved chain), so this is NOT a FAT mutation and the
+/// single-FAT-writer invariant of the module doc is untouched — the reservation remains the
+/// recorder's only lifetime FAT/directory mutation. Cost is the one sector the stamp lands in.
+///
+/// In the reuse case the stamp is followed by a note line and NOTHING ELSE: the previous boot's
+/// remaining bytes are deliberately left in place rather than zeroed. If this boot never flushes,
+/// that older log is the only evidence on the volume, and the two lines above it are enough to stop
+/// a reader from mistaking it for this boot's.
+fn stamp_reservation(reused: bool) -> Result<usize, crate::fs::fat::FatError> {
+    let mut head = boot_stamp(reused, false);
+    if reused {
+        head.push_str(
+            ":: FR: the bytes below are a PREVIOUS boot's log (its head overwritten by this stamp) until this boot's first flush replaces them ::\n",
+        );
+    }
+    write_log(head.as_bytes())
+}
 
 /// The recorder's ONE lifetime FAT/directory mutation: make `/UNAOS.LOG` exist at exactly
 /// `RESERVE_BYTES`. Returns `(first_cluster, on-disk size, reused)`, where `reused` is true only in
 /// the first case below — the one that leaves a PREVIOUS boot's bytes on disk and therefore obliges
 /// the first flush to pad (see `PAD_NEXT`). In the other two cases this call has just zero-filled the
-/// whole file, so padding it again would be ~258 redundant single-sector BOT transactions.
+/// whole file, so padding it again would be ~1026 redundant single-sector BOT transactions.
 ///
 /// Three cases:
 ///   * already present and already big enough (a previous boot of the same image) — reuse it UNTOUCHED,
-///     zero mutation at all;
+///     zero mutation at all (the caller then stamps its head in place; see [`stamp_reservation`]);
 ///   * present but too small / chainless (an old short log) — `delete_located` + `create_in_root` +
 ///     one `write_grow` of zeros;
 ///   * absent — `create_in_root` + one `write_grow` of zeros.
@@ -353,22 +458,37 @@ pub fn service() {
     // launcher / storage service submitter can exist (this call site precedes every `U*_probe_once` in
     // the same main-loop iteration, and they gate on the same `block::info()`). This is the recorder's
     // only FAT/directory mutation for the whole boot.
-    if RESERVED.load(Ordering::Acquire) == 0 {
+    // The claim is a CAS, not load-then-store: `service()` has three call sites (two BSP loop
+    // shapes and the SCHED-X86 `x86_usb_pump` task), and a load/store gate would let a second
+    // caller pass `!= 1` below and flush `state=flushed` over offset 0 while the first was still
+    // writing `state=reserved` there (GR16 review). The winner holds the in-progress state (3)
+    // until the FRSTAMP is on disk, so nobody can flush a file whose claim line is mid-write.
+    if RESERVED
+        .compare_exchange(0, 3, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+    {
         match reserve_log() {
             Ok((first, size, reused)) => {
                 LOG_FIRST.store(first, Ordering::Release);
                 LOG_SIZE.store(size, Ordering::Release);
                 // FRWRITE: pad the first flush ONLY when we reused a previous boot's file — the
                 // create/grow paths just zero-filled it, so padding would rewrite known zeros at a
-                // cost of ~129 READ(10) + ~129 WRITE(10) single-sector BOT transactions.
+                // cost of ~513 READ(10) + ~513 WRITE(10) single-sector BOT transactions
+                // (RESERVE_BYTES / 512).
                 PAD_NEXT.store(reused, Ordering::Relaxed);
+                REUSED.store(reused, Ordering::Relaxed);
+                // FRSTAMP: claim the file for THIS boot now, while it is provably ours, rather than at
+                // the first flush — a boot that dies before flushing must not leave a previous boot's
+                // log looking fresh. Write-in-place, so still not a FAT mutation.
+                let stamp = stamp_reservation(reused).is_ok();
                 RESERVED.store(1, Ordering::Release);
                 serial_println!(
-                    ":: FR: {} reserved {} bytes @cluster {} reused={} — flushes are write-in-place only (single FAT writer preserved) ::",
+                    ":: FR: {} reserved {} bytes @cluster {} reused={} stamped={} — flushes are write-in-place only (single FAT writer preserved) ::",
                     LOG_NAME,
                     size,
                     first,
-                    reused
+                    reused,
+                    stamp
                 );
             }
             Err(e) => {
