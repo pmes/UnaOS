@@ -255,14 +255,26 @@ pub fn mono_ticks() -> Option<u64> {
 }
 
 /// CLOCK-2 — the lock-free-safe snapshot the serial log-timestamp prefix (`crate::logts`) reads on
-/// every line. Returns `(monotonic milliseconds since boot, current UTC Unix seconds if anchored)`.
-/// The monotonic part is fully lock-free (one counter read); the civil part uses `try_lock` and
-/// yields `None` if the anchor lock is momentarily contended — so this NEVER blocks or panics and is
-/// safe from early boot, IRQ-masked handlers, and any core. A `None` civil part simply keeps the
-/// prefix in its monotonic form for that one line.
+/// every line. Returns `(monotonic milliseconds since KERNEL ENTRY, current UTC Unix seconds if
+/// anchored)`. The monotonic part is fully lock-free (two atomic loads + one counter read); the
+/// civil part uses `try_lock` and yields `None` if the anchor lock is momentarily contended — so
+/// this NEVER blocks or panics and is safe from early boot, IRQ-masked handlers, and any core. A
+/// `None` civil part simply keeps the prefix in its monotonic form for that one line.
+///
+/// The mono leg subtracts `bootpace::origin_cycles()` — the `entry` stamp — rather than serving the
+/// raw counter: on x86 the raw TSC counts from processor RESET, so an unsubtracted prefix reads as
+/// "ms since power-on, firmware included" and disagrees with every BPACE/GPACE `t=` by seconds. A
+/// line printed before the origin exists (or before calibration) gets `None`, which the prefix
+/// renders as an explicit unknown rather than a fabricated zero.
 #[cfg(feature = "logts")]
 pub fn logts_now() -> (Option<u64>, Option<u64>) {
-    let mono_ms = monotonic().map(|(ticks, freq)| ticks.saturating_mul(1000) / freq);
+    let mono_ms = monotonic().and_then(|(ticks, freq)| {
+        let origin = crate::bootpace::origin_cycles();
+        if origin == 0 {
+            return None; // no `entry` stamp yet — "since entry" does not exist to measure
+        }
+        Some(ticks.wrapping_sub(origin).saturating_mul(1000) / freq)
+    });
     let unix = match UNIX_ANCHOR.try_lock() {
         Some(guard) => guard.as_ref().map(|a| {
             let elapsed = match monotonic() {

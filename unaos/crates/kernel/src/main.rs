@@ -723,6 +723,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // 4b''') so the invariant TSC is calibrated; silent if this machine has no invariant TSC.
         unaos_kernel::arch::syscall::clock_x1_witness();
 
+        // LOGWIT-1 (witness + logts): the CLOCK-2b tap prefix's own fixture. Every other timestamped
+        // line on a bench capture is only as trustworthy as the claim that the prefix reaches the FTDI
+        // ring — the rMBP has no 16550, so the cable's ring IS the evidence, and the only thing that
+        // ever attested to the tap was that it compiled. This emits a nonce marker, reads the capture
+        // ring back through `ftdi::peek_recent`, and asserts the marker returned wearing a well-formed
+        // 12-column prefix; it rejects an unprefixed and a malformed copy of its own marker first, so a
+        // vacuous matcher reports FORBID rather than a green PASS. Runs HERE because the prefix's
+        // monotonic form needs `calib` (step 4b''') behind it — earlier and the honest reading would
+        // be the `?ms` form, which passes but proves less.
+        #[cfg(all(feature = "witness", feature = "logts"))]
+        unaos_kernel::logts::logwit1();
+
         // SNTP-X86 GATE (witness battery): the deterministic x86 SNTP client battery — canned datagrams
         // through the shared parser + the `crate::clock` anchor path, no NIC/network required. Proves x86
         // SNTP correctness under `./arroyo test` in any environment (the live boot sync in `service_net`

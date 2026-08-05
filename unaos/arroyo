@@ -94,8 +94,9 @@ _feats=""
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
 [ -n "${UNAOS_BOOTLOG:-}" ] && _feats="${_feats}bootlog,"
 # CLOCK-2: UNAOS_LOGTS=1 arms the `logts` feature — a compact timestamp prefix on each serial LINE
-# (monotonic ms → UTC after a civil anchor). UART byte-stream only; default OFF => serial byte-
-# identical (witness/mbench specs parse serial lines). Kept in sync with builder/src/main.rs.
+# (monotonic ms → UTC after a civil anchor). CLOCK-2b: the prefix covers the UART and both capture
+# transports (FTDI capture ring, UNAOS.LOG); default OFF => serial byte-identical (witness/mbench
+# specs parse serial lines). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_LOGTS:-}" ] && _feats="${_feats}logts,"
 # WEDGE-2: UNAOS_WEDGE2=1 arms the `wedge2` feature — raw-UART `<F1>`..`<F9>` breadcrumbs along the
 # TAB->focus-raise chain, written BEFORE each phase so a core that dies IRQ-masked mid-phase still

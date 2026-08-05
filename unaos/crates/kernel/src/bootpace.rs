@@ -240,6 +240,15 @@ pub fn origin_hz() -> u64 {
     counter_hz()
 }
 
+/// The counter value of the `entry` stamp — the zero every `t=`/`since-entry` is measured from —
+/// or 0 when no stamp has been recorded yet. Exposed for the same reason as [`origin_hz`]: an
+/// out-of-module timestamp (the `logts` line prefix) must subtract the LEDGER's origin, not invent
+/// its own, or its absolute column disagrees with every BPACE/GPACE figure by the firmware+
+/// bootloader duration the raw counter includes.
+pub fn origin_cycles() -> u64 {
+    ORIGIN.load(Ordering::Relaxed)
+}
+
 /// Copy the buffered stamps (oldest→newest) into `out`, returning how many were written. Snapshots
 /// under the lock and releases it BEFORE the caller prints, so serial/FTDI I/O never runs while the
 /// ring is held.

@@ -180,6 +180,27 @@ pub fn dropped_bytes() -> Option<u64> {
     RING.try_lock().map(|r| r.dropped)
 }
 
+/// Copy the most recently buffered bytes into `dst` WITHOUT consuming them, newest-aligned to the
+/// end of the ring: on success `dst[..n]` holds the last `n` bytes the capture received, in order.
+///
+/// `None` means the ring was busy — not "the capture is empty". The two readings are different facts
+/// and a caller that folded them together would report a contended lock as an absent log.
+///
+/// **`try_lock` only, no allocation, no mutation.** This is a read path onto the sink that the
+/// primary `_print` also feeds, so it must obey `mirror`'s discipline exactly: blocking here would let
+/// a reader stall the wire, and consuming here would eat bytes the cable still owes the bench.
+/// Deliberately does NOT fold [`STAGE`] in — a staged line has not reached the ring yet, and a peek
+/// that quietly drained staging would change what the next `drain_into` replays.
+pub fn peek_recent(dst: &mut [u8]) -> Option<usize> {
+    let ring = RING.try_lock()?;
+    let n = dst.len().min(ring.len);
+    let start = (ring.head + (ring.len - n)) % CAP;
+    for (i, slot) in dst[..n].iter_mut().enumerate() {
+        *slot = ring.buf[(start + i) % CAP];
+    }
+    Some(n)
+}
+
 /// Append a formatted `_print` to the boot-capture ring.
 ///
 /// **try_lock only, never blocks** — the discipline of the SERIAL1 `_print` path, and non-negotiable:
@@ -205,7 +226,7 @@ pub fn mirror(args: fmt::Arguments) {
     tap.submit();
     if let Some(mut ring) = RING.try_lock() {
         drain_staged_into(&mut ring);
-        let _ = fmt::write(&mut *ring, args);
+        let _ = ring_write(&mut ring, args);
         tap.absorb();
         return;
     }
@@ -226,12 +247,32 @@ pub fn mirror(args: fmt::Arguments) {
     // Staging ring full: one free retry at the sink before the line is declared lost.
     if let Some(mut ring) = RING.try_lock() {
         drain_staged_into(&mut ring);
-        let _ = fmt::write(&mut *ring, args);
+        let _ = ring_write(&mut ring, args);
         tap.absorb();
         return;
     }
     tap.drop_line();
     UNANNOUNCED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// This sink's line-start flag — mutated only while `RING` is held (by the prefixing writer and by
+/// [`drain_staged_into`]'s bare-byte correction).
+#[cfg(feature = "logts")]
+static LINE_START: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// CLOCK-2b: the direct (lock-held) write into the capture ring, timestamp-prefixed under `logts`.
+/// This ring IS the bench's evidence on a machine with no 16550, and the UART-side prefix never
+/// reaches it. Staged lines are folded in bare by [`drain_staged_into`] on purpose — a prefix
+/// rendered at drain time would stamp the drain, not the emission. Under `logts` the ring's
+/// `dropped` byte count includes prefix bytes that were never on the UART wire.
+fn ring_write(ring: &mut Ring, args: fmt::Arguments) -> fmt::Result {
+    #[cfg(feature = "logts")]
+    {
+        use core::fmt::Write;
+        crate::logts::TapPrefixWriter { inner: ring, state: &LINE_START }.write_fmt(args)
+    }
+    #[cfg(not(feature = "logts"))]
+    fmt::write(ring, args)
 }
 
 /// Copy every staged line into the capture ring, in order, and put any un-announced loss into the
@@ -240,9 +281,21 @@ pub fn mirror(args: fmt::Arguments) {
 /// **Caller must hold `RING`** — that is what makes the drainer unique. No print, no allocation and no
 /// second lock happens in here, so it is safe from the same IRQ-masked print context `mirror` is.
 fn drain_staged_into(ring: &mut Ring) {
+    // CLOCK-2b: the drainer writes ring bytes WITHOUT going through the prefixing writer (staged
+    // lines are deliberately bare — a drain-time prefix would stamp the drain, not the emission),
+    // so it must keep the sink's line-start flag true to where the ring actually is. A staged
+    // `serial_print!` FRAGMENT (no trailing `\n`) would otherwise leave the flag claiming
+    // line-start and the next prefix would land mid-line, stamping text with a time it was not
+    // emitted at.
+    #[cfg(feature = "logts")]
+    let mut last_byte: Option<u8> = None;
     let n = STAGE.drain(|s| {
         for &b in s.as_bytes() {
             ring.push_byte(b);
+        }
+        #[cfg(feature = "logts")]
+        {
+            last_byte = s.as_bytes().last().copied().or(last_byte);
         }
     });
     crate::serial_ring::TAP_FTDI.absorb_n(n);
@@ -265,6 +318,14 @@ fn drain_staged_into(ring: &mut Ring) {
         for &b in &buf[..len] {
             ring.push_byte(b);
         }
+        #[cfg(feature = "logts")]
+        {
+            last_byte = buf[..len].last().copied().or(last_byte);
+        }
+    }
+    #[cfg(feature = "logts")]
+    if let Some(b) = last_byte {
+        LINE_START.store(b == b'\n', core::sync::atomic::Ordering::Relaxed);
     }
 }
 

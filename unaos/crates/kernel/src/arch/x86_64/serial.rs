@@ -110,8 +110,9 @@ pub fn _print(args: ::core::fmt::Arguments) {
                     crate::serial_ring::drain(&mut sink);
                 }
                 // CLOCK-2: with `logts`, prefix each serial LINE with a compact timestamp (monotonic
-                // ms → UTC after a civil anchor exists). Only the UART byte-stream is touched; the
-                // fbcon + capture-ring mirrors below still receive the raw `args`. OFF => identical.
+                // ms → UTC after a civil anchor exists). CLOCK-2b: the FTDI capture ring and the
+                // flight recorder prefix their own streams too (see the taps below); fbcon and the
+                // tste selftest ring still receive the raw `args`. OFF => identical.
                 #[cfg(feature = "logts")]
                 {
                     let _ = crate::logts::PrefixWriter { inner: uart }.write_fmt(args);
