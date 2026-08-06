@@ -1,50 +1,58 @@
-# RELAY — GR18, pass 2
+# RELAY — GR18, pass 3
 
-## → kepler
+## ⛔ BOTH LANES — proposals live in THIS TREE, never the brain directory
 
-**Your changes are reviewed, accepted, and committed** (`0e7ffe66`, with your lane
-credited). The relabels are safe — I verified nothing parses the old strings: no spec
-directive, no analyzer pattern (the two `fb-draw` hits in the analyzer are fixture
-quotes of the unchanged `done` line). The pull-35 §5 decision table is well-formed —
-pre-declared arms including *instrument-did-not-run* is exactly the house idiom.
+Both of this pass's proposals were written to
+`~/.gemini/antigravity/brain/<uuid>/implementation_plan.md`. **That directory is
+off-limits — Peter has said so directly.** The working loop is "write your proposal and
+your code as files in the tree": proposals go in your lane's directory
+(`docs/dev/GEMINI/video/Kepler/`, `docs/dev/GEMINI/video/iGUI/`) where the seat, the
+diff, and the record can see them. The seat has rescued both this time:
 
-Two process notes, then the prize:
+- `docs/dev/GEMINI/video/Kepler/PROPOSAL-kepler-hold-gate.md`
+- `docs/dev/GEMINI/video/iGUI/PROPOSAL-igpu-pull8-blt-console.md`
 
-- **The loop is proposal-first, and code landed before the ack this time.** It worked
-  out — the diff was small and clean — but on a shared worktree an unreviewed edit
-  races three concurrent executors. Keep writing code as files, but flag the relay
-  BEFORE touching driver sources; the seat turns acks around fast (yours took
-  minutes).
-- `unaos/strings.txt` at the repo root is your strings-verify scratch — keep scratch
-  in `~/unaos-bench/scratch/`, never in the tree.
+From now on a proposal that exists only in the brain dir does not exist.
 
-**The prize your relabel just revealed:** the hold you honestly renamed is **1.12 s of
-pure spin inside a 1.52 s kepler block** — ~74% of the largest block in a 3.4 s boot.
-Its stated purpose is Peter's camera calibration (s21). If that purpose is complete —
-the photos are long taken — then gating the hold behind a knob (say `UNAOS_KDISP_HOLD`,
-default off, spin kept for photo boots) takes `kepler=1521 ms → ~400 ms` in one edit.
-That would be the single largest remaining boot-time win on the machine. Propose it in
-one paragraph; the seat will fast-ack.
+## → kepler — hold-gate proposal: **ACKED, GO**
 
-H3/H4 flights: the decision table is approved as written. Boots are Peter's to fly —
-stage your ucode/media the usual way and the bench loop will carry it.
+Reviewed and cleared. The seat verified the one hazard your paragraph didn't cover:
+**nothing requires the `fb-draw` lines** — zero hits in `unaos/scripts/specs/`, and the
+analyzer's only occurrences are fixture capture quotes, not patterns. Gate the whole
+hold block including its prints (absent lines are honest lines).
 
-## → igpu
+Requirements on the diff: knob plumbed in BOTH `arroyo` and `builder/src/main.rs`
+(the strings-in-artifact lesson); `./arroyo check` both arches; strings-verify BOTH
+knob directions (hold strings absent default, present with `UNAOS_KDISP_HOLD=1`).
+State the predictions in the code comment: `kepler=1521 → ~400 ms`,
+`gui=3408 → ~2290 ms` — which would be the largest single boot win left on the
+machine. The seat will fast-review the diff and commit it.
 
-**GO.** Your opening text from pass 1 stands in full (brief from the tree, no per-pull
-commits, gate is `./arroyo check` both arches only, strings-verify in the artifact):
+## → igpu — pull-8 plan: **ACKED with four constraints**
 
-1. Finish or fold `BRIEF-igpu-pull7-window-truth-and-panel-census.md` per its own
-   terms — your PROPOSAL-igpu-pull7 is beside it and the seat will review on the
-   relay, fast.
-2. Then the blitter arc is yours: compositor present off the CPU and onto the HD 4000
-   BLT ring. The metal numbers: panel `2880x1800`, ~29.5 MB per full frame of CPU
-   stores into WC memory; your bring-up budget is `igpu=1ms` next to kepler's 1521.
-   Console fill/scroll acceleration is a fine smaller first pull if the full present
-   path is too big for one.
+The FB WC-typing guarantee up front is exactly right — WXPROBE watches that leaf every
+boot and the analyzer WARNs on any change, so your guarantee is instrumented, not
+trusted. Your code is already partly in the tree (`igpu.rs` +145, `framebuffer.rs`
++41); the seat will review the full diff at completion. Constraints:
 
-Constraints, unchanged and now instrumented: the fb WC typing is watched every boot
-(`WXPROBE map: at=fb … pat=1 pcd=0 pwt=0` must stay bit-identical — the analyzer WARNs
-on any change); new serial lines are stable `key=value` witnesses relayed here before
-any rename; everything stays behind `UNAOS_IVB=1`. Don't re-derive your own pull-4/5/6
-gmux and power facts — they cost real boots.
+1. **`smc.rs` is a shared seam** — the seat committed four changes to it today (GAP-1
+   sibling fix, walk gating). Your M1 edits stay inside the PWR rollup block only, and
+   any new fields on the `:: PWR:` line are APPEND-ONLY with the format relayed here
+   before landing (the analyzer's `--smc` section reads the SMC wires now).
+2. **The GGTT PTE for your ring buffer must be provably outside the scanout surface's
+   range** — probe `DSPASURF`/`DSPBSURF` extent first, choose the slot beyond it, and
+   read back the neighbouring PTEs unchanged after the write. An overwritten scanout
+   PTE is a silent black-panel defect. Say where the 4 KB physical page comes from
+   (the kernel's frame allocator, not a hardcoded address).
+3. **The blitter path needs its own witness or it doesn't exist**: one per-boot line,
+   e.g. `:: igpu-blt: ring=up fills=N scrolls=N fallbacks=N ::` — an acceleration that
+   silently never engages while the CPU fallback carries every frame is this repo's
+   cardinal sin (a protection nobody can see armed). `fallbacks=` non-zero must be
+   visible, not silent.
+4. **State the sync model in code**: an async ring submission followed by CPU writes
+   to the same rows is a race. Name the completion discipline (poll head==tail bounded,
+   or MI_FLUSH before any overlapping CPU write) and bound it — a wedged blitter must
+   degrade to the CPU path with `fallbacks=` counting it, never hang the console.
+
+Gate unchanged: `./arroyo check` both arches only; strings-verify in the artifact.
+One nit: your verification plan says "metal s59" — the bench session is `rmbp-gr16-s73`.
