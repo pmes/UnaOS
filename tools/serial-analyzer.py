@@ -462,20 +462,42 @@ def wcg_group(body):
 #     full-coverage pass. That is the shape in which paygo would be a coverage CUT rather
 #     than a deferral: 1/16 of the surface verified, forever, with every verdict CLEAN.
 
-WCG_PAYGO_RE = re.compile(
-    r'^\[wc-g\] paygo win=(\d+) state=(\w+) emit=(\d+) lattice_n=(\d+) deferred=(\d+) '
+# TWO INSTRUMENTS, ONE READER RULE. `wcg.rs` deferred the glass read-back first; `wm.rs`
+# (peer commit 0f1d3dfc) then gave the wc-d scan-out verify the same treatment, and gave it
+# deliberately the SAME KEY SET -- its own comment says so: "The key set is `[wc-g] paygo`'s
+# exactly, so one reader rule serves both". So this reader is parameterised by tag rather
+# than duplicated, and a third instrument adopting the shape costs one table entry.
+#
+# What differs between them is real, and is read off the line rather than assumed:
+#   * battery depth. wc-g budgets FOUR samples per window; wc-d has TWO STAGES (lattice then
+#     full) and prints `budget=2` as a literal, with `taken=` counting stages CLOSED;
+#   * the sample line. wc-g's is `[wc-g] win=N seq=N …`, wc-d's is `[wc-d] verify win=N …`,
+#     and wc-d's `coverage=` marker is inserted between `checked=` and `bad_cache=` where
+#     wc-g's sits between `fbbad=` and `us=`. Both are INSERTIONS, which is what keeps the
+#     pi4 gate's spans and `-> PASS`/`-> FAIL` terminals matching what they always matched.
+PAYGO_RE = re.compile(
+    r'^\[(wc-g|wc-d)\] paygo win=(\d+) state=(\w+) emit=(\d+) lattice_n=(\d+) deferred=(\d+) '
     r'defer_ms=(\d+) since_entry_ms=(\d+) clock=(\w+) taken=(\d+) budget=(\d+) -> (\w+)\b')
-# `coverage=` is an INSERTION between `fbbad=` and `us=` on a sample line. Absent on any
-# build without the knob, which is a different thing from `coverage=full` and is counted
-# apart: an unmarked pass says nothing about what it covered.
+WCD_VERIFY_RE = re.compile(r'^\[wc-d\] verify win=(\d+)\b')
+# `coverage=` is an INSERTION on a sample line. Absent on any build without the knob, which
+# is a different thing from `coverage=full` and is counted apart: an unmarked pass says
+# nothing about what it covered.
 COVERAGE_RE = re.compile(r'\bcoverage=(?:lattice(\d+)|(full))\b')
 
+# tag -> (sample-line matcher, what one sample IS, what the battery buys)
+PAYGO_TAGS = {
+    'wc-g': (WCG_PASS_RE, 'samples', 'glass read-back (checksum passes)'),
+    'wc-d': (WCD_VERIFY_RE, 'verifies', 'scan-out read-back (panel verify)'),
+}
 
-def paygo_stats(chunk):
-    """Per-window paygo census over ONE WHOLE BOOT SEGMENT (see the note above for why the
-    kepler window is the wrong scope). Returns None when the boot carries no paygo line at
-    all -- a witness-armed boot without the knob, where every field here would be a zero
-    pretending to be a measurement."""
+
+def paygo_stats(chunk, tag='wc-g'):
+    """Per-window paygo census for ONE instrument over ONE WHOLE BOOT SEGMENT (see the note
+    above for why the kepler window is the wrong scope). Returns None when the boot carries
+    no paygo line for that tag -- a witness-armed boot without the knob, or a capture that
+    predates the instrument, where every field here would be a zero pretending to be a
+    measurement."""
+    sample_re = PAYGO_TAGS[tag][0]
     wins = {}
 
     def win(wid):
@@ -488,20 +510,25 @@ def paygo_stats(chunk):
     defer_ms = None
     for r in chunk:
         body = r['body']
-        m = WCG_PAYGO_RE.match(body)
+        m = PAYGO_RE.match(body)
         if m:
+            # One regex serves both instruments, so the tag is a FILTER here, not a
+            # formality: folding wc-d's two-stage battery into wc-g's four-sample one would
+            # produce a table that reconciles with neither.
+            if m.group(1) != tag:
+                continue
             any_paygo = True
-            w = win(m.group(1))
+            w = win(m.group(2))
             w['paygo'].append({
-                'state': m.group(2), 'emit': int(m.group(3)),
-                'lattice_n': int(m.group(4)), 'deferred': int(m.group(5)),
-                'defer_ms': int(m.group(6)), 'since_entry_ms': int(m.group(7)),
-                'clock': m.group(8), 'taken': int(m.group(9)),
-                'budget': int(m.group(10)), 'verdict': m.group(11), 'row': r,
+                'state': m.group(3), 'emit': int(m.group(4)),
+                'lattice_n': int(m.group(5)), 'deferred': int(m.group(6)),
+                'defer_ms': int(m.group(7)), 'since_entry_ms': int(m.group(8)),
+                'clock': m.group(9), 'taken': int(m.group(10)),
+                'budget': int(m.group(11)), 'verdict': m.group(12), 'row': r,
             })
-            defer_ms = int(m.group(6))
+            defer_ms = int(m.group(7))
             continue
-        m = WCG_PASS_RE.match(body)
+        m = sample_re.match(body)
         if not m:
             continue
         w = win(m.group(1))
@@ -544,16 +571,21 @@ def paygo_stats(chunk):
     return {'wins': [wins[k] for k in sorted(wins, key=int)], 'defer_ms': defer_ms}
 
 
-def print_paygo_stats(pg):
+def print_paygo_stats(pg, tag='wc-g'):
+    unit, what = PAYGO_TAGS[tag][1], PAYGO_TAGS[tag][2]
     if pg is None:
-        print("  paygo: no '[wc-g] paygo' line in this boot — the battery ran unbudgeted "
-              "(no UNAOS_WCG_PAYGO), so there is no deferral to report.\n")
+        print(f"  paygo [{tag}]: no '[{tag}] paygo' line in this boot — that battery ran "
+              f"unbudgeted (no")
+        print(f"    UNAOS_WCG_PAYGO), or the capture predates the instrument. Either way "
+              f"there is no deferral")
+        print("    to report, and a table of zeros here would read like a measurement.\n")
         return
-    print(f"  paygo battery (WHOLE BOOT scope, not the kepler window: the deferral horizon "
-          f"is {pg['defer_ms']}ms since entry,")
-    print("    which on a paygo boot falls well after the kepler window closes — see the "
-          "note in the source)")
-    print(f"    {'win':>4} {'samples':>8} {'lattice':>8} {'full':>6} {'unmarked':>9} "
+    print(f"  paygo battery [{tag}] — {what} (WHOLE BOOT scope, not the kepler window: the "
+          f"deferral")
+    print(f"    horizon is {pg['defer_ms']}ms since entry, which on a paygo boot falls well "
+          f"after the kepler")
+    print("    window closes — see the note in the source)")
+    print(f"    {'win':>4} {unit:>9} {'lattice':>8} {'full':>6} {'unmarked':>9} "
           f"{'deferred':>9} {'emit':>5} {'taken/budget':>13} {'clock':>8}  status")
     for w in pg['wins']:
         status = 'PAID' if w['paid'] else (
@@ -569,8 +601,8 @@ def print_paygo_stats(pg):
     print("      log ends is spending its budget as it earns it, which is what paygo is.")
     warned = [w for w in pg['wins'] if w['warn']]
     for w in warned:
-        print(f"    WARN win={w['id']}: kept presenting to {w['last_ms']}ms — past the "
-              f"{w['horizon']}ms deferral horizon —")
+        print(f"    WARN [{tag}] win={w['id']}: still running at {w['last_ms']}ms — past "
+              f"the {w['horizon']}ms deferral horizon —")
         print(f"      yet NO full-coverage pass ever ran ({w['lattice']} lattice, 0 full). "
               f"The deferred pass never")
         print("      arrived, so this window's verdicts cover 1/N of its surface and no more. "
@@ -846,7 +878,8 @@ def wcg_report(label, content, boot_sel):
             print(f"  kepler window: {window}\n")
             # The paygo census is still worth printing: it is whole-boot scoped, so a boot
             # whose kepler anchors never appeared can still have a complete deferral story.
-            print_paygo_stats(paygo_stats(chunk))
+            for _tag in PAYGO_TAGS:
+                print_paygo_stats(paygo_stats(chunk, _tag), _tag)
             continue
         start, end = window
         windows += 1
@@ -1141,6 +1174,87 @@ WCG_FIXTURE_PAYGO_WARN = """\
 """
 
 
+# --wcg fixture 7 is SYNTHETIC and covers the SECOND instrument to adopt the paygo shape:
+# the wc-d scan-out verify (peer commit 0f1d3dfc, `video/wm.rs`). No capture carries these
+# lines yet -- the s73 boots predate the commit -- so every line below was generated from
+# the EXACT format strings at that commit rather than transcribed from a log:
+#
+#   wm.rs:2809  "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} \
+#                checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} nonzero={} \
+#                cksum={:#018x} first=none -> PASS"
+#   wm.rs:3374  fn wcd_coverage_note(step) -> " coverage=lattice16" | " coverage=full"
+#   wm.rs:3335  "[wc-d] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} \
+#                since_entry_ms={} clock={} taken={} budget=2 -> {}"
+#
+# The field VALUES are boot 7's real win=1 console-window verify, so the only synthetic part
+# is the paygo insertion itself. Note `budget=2` is a LITERAL in that format string: wc-d
+# has two STAGES (lattice, then full) where wc-g budgets four samples, and `taken=` counts
+# stages CLOSED. A reader that assumed wc-g's depth would mis-state every wc-d row.
+#
+# THE FIXTURE ALSO CARRIES wc-g PAYGO LINES, and that is its second job. One regex now
+# serves both instruments, so the tag FILTER is load-bearing: folding wc-d's two-stage
+# battery into wc-g's four-sample one would produce a table that reconciles with neither.
+# win=7 is wc-g's alone and win=1/win=2 are wc-d's, so a filter that leaked would show up
+# immediately as a window in the wrong census.
+#
+# win=1 pays: lattice verify, deferral, full verify past the horizon, `-> PAID`.
+# win=2 is the defect the WARN exists for, on THIS instrument: it keeps verifying to
+# 20000 ms and never gets past the lattice, so the panel read-back covers one source column
+# in sixteen for the rest of the boot while every verdict it prints says PASS.
+WCD_FIXTURE_PAYGO = """\
+[      0ms] bootpace: entry
+[     10ms] [NVIDIA] Initializing Kepler GPU at BDF 1:0:0
+[    110ms] :: kepler: takeover complete ::
+[   5180ms] [wc-d] verify win=1 surf=1312x736 band=0..64 scale=1x at (784,457) panel=2880x1800 checked=83968 coverage=lattice16 bad_cache=0 bad_ram=0 ram_indep=no moved=0 nonzero=8300 cksum=0x6ea90580b6e52525 first=none -> PASS
+[   5186ms] [wc-d] paygo win=1 state=waiting emit=1 lattice_n=16 deferred=1 defer_ms=15000 since_entry_ms=5186 clock=entry taken=1 budget=2 -> DEFERRED
+[   5200ms] [wc-d] verify win=2 surf=96x64 band=none scale=8x at (2103,1117) panel=2880x1800 checked=393216 coverage=lattice16 bad_cache=0 bad_ram=0 ram_indep=no moved=0 nonzero=91840 cksum=0x47b750fe2093a4da first=none -> PASS
+[   5205ms] [wc-d] paygo win=2 state=waiting emit=1 lattice_n=16 deferred=1 defer_ms=15000 since_entry_ms=5205 clock=entry taken=1 budget=2 -> DEFERRED
+[   5210ms] [wc-g] win=7 seq=0 own=no scale=1x app=0x7 blit=0x7 civac=0x7 after=0x7 fbbad=0/64 coverage=lattice16 us=10 rectscan_us=20 slow=no -> CLEAN
+[   5215ms] [wc-g] paygo win=7 state=waiting emit=1 lattice_n=16 deferred=1 defer_ms=15000 since_entry_ms=5215 clock=entry taken=1 budget=4 -> DEFERRED
+[   6000ms] :: GPACE: span=5990ms anchor=enum:p1 since-entry=6000ms hz=123456 build=kepler+takeover+fifo+ivb+wc+ == the pci-usb d= split ::
+[  17410ms] [wc-d] verify win=1 surf=1312x736 band=0..64 scale=1x at (784,457) panel=2880x1800 checked=83968 coverage=full bad_cache=0 bad_ram=0 ram_indep=no moved=0 nonzero=8300 cksum=0x6ea90580b6e52525 first=none -> PASS
+[  17410ms] [wc-d] paygo win=1 state=complete emit=2 lattice_n=16 deferred=7 defer_ms=15000 since_entry_ms=17410 clock=entry taken=2 budget=2 -> PAID
+[  20000ms] [wc-d] verify win=2 surf=96x64 band=none scale=8x at (2103,1117) panel=2880x1800 checked=393216 coverage=lattice16 bad_cache=0 bad_ram=0 ram_indep=no moved=0 nonzero=91840 cksum=0x47b750fe2093a4da first=none -> PASS
+[  20005ms] [wc-d] paygo win=2 state=waiting emit=2 lattice_n=16 deferred=42 defer_ms=15000 since_entry_ms=20005 clock=entry taken=1 budget=2 -> DEFERRED
+"""
+
+
+def paygo_expect_wcd(pg):
+    """The wc-d census: a two-STAGE battery, one window paid and one stuck on the lattice."""
+    w1 = paygo_window(pg, '1')
+    w2 = paygo_window(pg, '2')
+    return [
+        ('deferral horizon', pg['defer_ms'], 15000),
+        # The tag filter: wc-g's win=7 must NOT appear in the wc-d census.
+        ('windows in the wc-d census', [w['id'] for w in pg['wins']], ['1', '2']),
+        ('win1 lattice/full', (w1['lattice'], w1['full']), (1, 1)),
+        # budget=2, not 4: wc-d counts STAGES closed, wc-g counts samples taken.
+        ('win1 taken/budget (stages)', (w1['taken'], w1['budget']), (2, 2)),
+        ('win1 PAID', w1['paid'], True),
+        ('win1 deferral census', w1['deferred'], 7),
+        ('win1 WARN', w1['warn'], False),
+        ('win2 lattice/full', (w2['lattice'], w2['full']), (2, 0)),
+        ('win2 PAID', w2['paid'], False),
+        # 42, not 1+42: the census rule again, on the second instrument.
+        ('win2 deferral census', w2['deferred'], 42),
+        ('win2 last verify (ms)', w2['last_ms'], 20000),
+        ('win2 WARN (lattice-only past the horizon)', w2['warn'], True),
+        ('windows warned', [w['id'] for w in pg['wins'] if w['warn']], ['2']),
+    ]
+
+
+def paygo_expect_wcg_side(pg):
+    """The SAME fixture read as wc-g: only win=7, at wc-g's four-sample depth. This is the
+    other half of the tag-filter proof -- one regex serves both instruments, so a leak would
+    put wc-d's windows here."""
+    w7 = paygo_window(pg, '7')
+    return [
+        ('windows in the wc-g census', [w['id'] for w in pg['wins']], ['7']),
+        ('win7 taken/budget (samples)', (w7['taken'], w7['budget']), (1, 4)),
+        ('win7 PAID', w7['paid'], False),
+    ]
+
+
 def paygo_window(pg, wid):
     for w in pg['wins']:
         if w['id'] == wid:
@@ -1234,12 +1348,12 @@ def paygo_expect_warn(pg):
     ]
 
 
-def paygo_boot_stats(text, boot=1):
+def paygo_boot_stats(text, boot=1, tag='wc-g'):
     """Whole-boot paygo census for one fixture (never the kepler window -- see the note
     on paygo_stats)."""
     rows = load_rows(text)
     _hz, chunk = segment_by_hz(rows)[boot - 1]
-    return paygo_stats(chunk)
+    return paygo_stats(chunk, tag)
 
 
 def wcg_window_stats(text, boot=1):
@@ -1360,19 +1474,23 @@ def selftest(top):
     # rather than through the kepler-window helper above. Doing it any other way is the very
     # mistake the scope note on paygo_stats warns about, and a self-test that made it would
     # certify the bug.
-    for name, text, checker in (
-        ('paygo: real GR17 boot-7 census (deferred passes land AFTER the kepler window)',
-         WCG_FIXTURE_PAYGO, paygo_expect_real),
-        ('paygo: synthetic deferral that NEVER PAID (the coverage WARN)',
-         WCG_FIXTURE_PAYGO_WARN, paygo_expect_warn),
+    for name, text, checker, tag in (
+        ('paygo/wc-g: real GR17 boot-7 census (deferred passes land AFTER the kepler window)',
+         WCG_FIXTURE_PAYGO, paygo_expect_real, 'wc-g'),
+        ('paygo/wc-g: synthetic deferral that NEVER PAID (the coverage WARN)',
+         WCG_FIXTURE_PAYGO_WARN, paygo_expect_warn, 'wc-g'),
+        ('paygo/wc-d: the scan-out verify adopts the shape (two stages, budget=2)',
+         WCD_FIXTURE_PAYGO, paygo_expect_wcd, 'wc-d'),
+        ('paygo/wc-d fixture read as wc-g: the tag filter does not leak',
+         WCD_FIXTURE_PAYGO, paygo_expect_wcg_side, 'wc-g'),
     ):
         print(f"=== selftest: {name} ===")
-        pg = paygo_boot_stats(text)
+        pg = paygo_boot_stats(text, tag=tag)
         case_ok = pg is not None
         if pg is None:
-            print("    BAD no paygo lines found in fixture")
+            print(f"    BAD no [{tag}] paygo lines found in fixture")
         else:
-            print_paygo_stats(pg)
+            print_paygo_stats(pg, tag)
             for label, actual, want in checker(pg):
                 good = actual == want
                 if not good:
@@ -1383,15 +1501,28 @@ def selftest(top):
             ok = False
         print(f"=== selftest: {name}: {'PASS' if case_ok else 'FAIL'}\n")
 
-    # A witness-armed boot with no paygo knob must report the ABSENCE, not a table of zeros
-    # that reads like a measurement. The real s73 fixture (fixture 1) is exactly that boot.
-    print("=== selftest: paygo: witness-armed boot with NO paygo knob (must report absence) ===")
-    absent_ok = paygo_boot_stats(WCG_FIXTURE_S73) is None
+    # A boot with no paygo line for an instrument must report the ABSENCE, not a table of
+    # zeros that reads like a measurement. Three real cases, and they are three different
+    # reasons for the same silence:
+    #   * the s73 fixture is a witness-armed boot with no knob at all — neither instrument;
+    #   * the GR17 boot-7 fixture HAS wc-g paygo lines and no wc-d ones, because it predates
+    #     peer commit 0f1d3dfc. That asymmetry is the case a shared reader gets wrong, so it
+    #     is asserted rather than assumed.
+    print("=== selftest: paygo: instruments that emitted nothing must report ABSENCE ===")
+    absent = [
+        ('s73 (witness-armed, no paygo knob) has no wc-g census',
+         paygo_boot_stats(WCG_FIXTURE_S73, tag='wc-g')),
+        ('s73 has no wc-d census either',
+         paygo_boot_stats(WCG_FIXTURE_S73, tag='wc-d')),
+        ('GR17 boot 7 has no wc-d census (it predates 0f1d3dfc)',
+         paygo_boot_stats(WCG_FIXTURE_PAYGO, tag='wc-d')),
+    ]
+    absent_ok = all(pg is None for _, pg in absent)
     if not absent_ok:
         ok = False
-    print(f"    {'ok ' if absent_ok else 'BAD'} no-knob boot yields no paygo census: "
-          f"got {paygo_boot_stats(WCG_FIXTURE_S73) is None!r}, want True")
-    print(f"=== selftest: paygo: no-knob boot: {'PASS' if absent_ok else 'FAIL'}\n")
+    for label, pg in absent:
+        print(f"    {'ok ' if pg is None else 'BAD'} {label}: got {pg is None!r}, want True")
+    print(f"=== selftest: paygo: absence reporting: {'PASS' if absent_ok else 'FAIL'}\n")
 
     return ok
 

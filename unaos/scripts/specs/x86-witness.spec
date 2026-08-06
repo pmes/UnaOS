@@ -205,6 +205,72 @@ REQUIRE \[wc-d\] verify win=[0-9]+ .*bad_cache=0 bad_ram=0 .*-> PASS
 # FAIL is the correct answer for boot 8.
 FORBID \[wc-d\] verify .*-> FAIL
 
+# --- WC-D PAYGO: THE SAME PAIR, ON THE SECOND INSTRUMENT --------------------------------------
+# Peer commit `0f1d3dfc` (video/wm.rs) gave the wc-d scan-out verify the treatment wcg.rs gave
+# the glass read-back: the FIRST verify per window walks a 1-in-16 source-column lattice and
+# marks itself `coverage=lattice16`; the deferred verify runs at full coverage past the shared
+# 15 000 ms threshold and closes the battery with `[wc-d] paygo … state=complete … -> PAID`.
+# `budget=2` is a literal in that format string — wc-d has two STAGES where wc-g budgets four
+# samples, and `taken=` counts stages CLOSED.
+#
+# WHY THIS BLOCK EXISTS AT ALL. The `-> PASS` REQUIRE above is satisfiable by the LATTICE
+# verdict alone, so on a post-`0f1d3dfc` build a boot whose deferred verify never arrives stays
+# green while the panel read-back covers one source column in sixteen for the rest of the boot —
+# every verdict PASS, and honestly so, about the pixels it looked at. That is exactly the hole
+# the wc-g block closes with paired directives, reopened one instrument over. The REQUIRE above
+# is kept as the cross-build FLOOR (it matches on every build, paygo or not, because
+# `coverage=` is an insertion the `.*` spans); this block is the paygo-specific pair.
+#
+# THEY ARE `PENDING`, NOT `REQUIRE`, AND THAT IS THE WHOLE POINT OF THE IDIOM. No capture in
+# existence carries these lines: `0f1d3dfc` landed after the s73 sitting, so boots 7 and 8
+# predate it. A REQUIRE here would go falsely red on every capture ever taken — the "witness
+# that cannot match a real boot" defect, committed deliberately. mbench's PENDING is built for
+# precisely this (module docstring: "a witness that needs metal/code not yet flashed — reported
+# as an hourglass, never fails; lets a spec ship ahead of its bench. A PENDING that DOES match
+# is flagged for promotion to REQUIRE"), and round6-rmbp.spec is the in-tree precedent.
+# FIRST BUILD THAT CAN SATISFY THEM: any x86 `witness` + `logts` + UNAOS_WCG_PAYGO image built
+# at or after `0f1d3dfc`. THE FIRST CAPTURE FROM SUCH A BUILD PROMOTES ALL FOUR TO REQUIRE —
+# mbench prints "MATCHED: consider promoting to REQUIRE" on the run that first sees them, so
+# this note does not depend on anyone remembering it.
+#
+# VERIFICATION, stated because it is NOT a capture match. Each pattern was checked against
+# lines generated from the exact format strings at `0f1d3dfc`, with boot 7's real win=1
+# console-window field values substituted:
+#   wm.rs:2809  "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{}
+#                checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} nonzero={}
+#                cksum={:#018x} first=none -> PASS"
+#   wm.rs:3374  wcd_coverage_note(step) -> " coverage=lattice16" | " coverage=full"
+#   wm.rs:3335  "[wc-d] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={}
+#                since_entry_ms={} clock={} taken={} budget=2 -> {}"
+# The same four lines are embedded as a fixture in tools/serial-analyzer.py, which now reads
+# BOTH instruments' paygo wire (one reader rule, as wm.rs's own comment intends).
+#
+# Stage 1, and the marker's position is asserted, not spanned: `coverage=` is an INSERTION
+# between `checked=` and `bad_cache=`, which is what keeps the pi4 gate's existing `.*` spans
+# and `-> PASS`/`-> FAIL` terminals matching what they always matched. Pinning the neighbours
+# here is what would catch a marker that drifted to a different field boundary.
+# Synthesized line:
+#   [wc-d] verify win=1 surf=1312x736 band=0..64 scale=1x at (784,457) panel=2880x1800 checked=83968 coverage=lattice16 bad_cache=0 bad_ram=0 ram_indep=no moved=0 nonzero=8300 cksum=0x6ea90580b6e52525 first=none -> PASS
+PENDING \[wc-d\] verify win=1 .*checked=[0-9]+ coverage=lattice16 bad_cache=0 bad_ram=0 .*-> PASS
+# Stage 2 — the deferred verify actually arrives. Without this the directive above rewards a
+# build that samples the panel once at 1/16 and never looks again.
+# Synthesized line:
+#   [wc-d] verify win=1 … checked=83968 coverage=full bad_cache=0 bad_ram=0 … first=none -> PASS
+PENDING \[wc-d\] verify win=1 .*checked=[0-9]+ coverage=full bad_cache=0 bad_ram=0 .*-> PASS
+# The deferral line, with the two constants that must track the `coverage=lattice16` literal
+# (wm.rs asserts `WCD_LATTICE_N == 16` against wcg's `PAYGO_LATTICE_N` at compile time; this
+# keeps them honest ON THE WIRE), and `budget=2` — which is also the assertion that nobody
+# quietly gave wc-d wc-g's four-sample depth.
+# Synthesized line:
+#   [wc-d] paygo win=1 state=waiting emit=1 lattice_n=16 deferred=1 defer_ms=15000 since_entry_ms=5186 clock=entry taken=1 budget=2 -> DEFERRED
+PENDING \[wc-d\] paygo win=[0-9]+ state=waiting emit=[0-9]+ lattice_n=16 deferred=[0-9]+ defer_ms=15000 since_entry_ms=[0-9]+ clock=entry taken=[0-9]+ budget=2 -> DEFERRED
+# …and the battery closes. Same reasoning as the wc-g `-> PAID` REQUIRE: a gate in which every
+# window sat at `state=waiting` forever satisfies every other directive here and has replaced
+# the verify with an indefinite postponement.
+# Synthesized line:
+#   [wc-d] paygo win=1 state=complete emit=2 lattice_n=16 deferred=7 defer_ms=15000 since_entry_ms=17410 clock=entry taken=2 budget=2 -> PAID
+PENDING \[wc-d\] paygo win=[0-9]+ state=complete .*taken=[0-9]+ budget=2 -> PAID
+
 # --- THE DEFERRAL GATE'S OWN CLOCK -----------------------------------------------------------
 # `clock=` is not decoration. `since_entry_ms()` returns None until the bootpace entry stamp
 # lands, and the emitter refuses to print a fabricated zero: it prints `since_entry_ms=0
@@ -222,10 +288,15 @@ FORBID \[wc-d\] verify .*-> FAIL
 # horizon where an unarmed clock would do its damage. An unarmed reading in the first ten
 # seconds is not forbidden, because a first paygo line that genuinely predates the stamp is an
 # honest reading and a false red costs a bench sitting.
-# Emitter: `paygo_note` in crates/kernel/src/video/wcg.rs. Zero hits across all 8 boots of the
-# s73 capture — and REACHABLE: the pattern was matched against a hand-reddened copy of boot 7's
-# 15453 ms line with `clock=entry` replaced by `clock=unarmed`, which it caught.
-FORBID ^\[\s*[0-9]{5,}ms\] .*\[wc-g\] paygo .*clock=unarmed
+# BOTH INSTRUMENTS, one rule. `wcg::paygo_clock` is the shared source — wc-d's gate calls it
+# too (wm.rs `wcd_admit`) — so an unarmed clock strands the scan-out verify on its lattice
+# stage by the identical mechanism, and the rule is written `\[wc-[gd]\]` rather than left to
+# be noticed and re-derived when the next instrument adopts the shape.
+# Emitters: `paygo_note` in crates/kernel/src/video/wcg.rs, `wcd_paygo_note` in video/wm.rs.
+# Zero hits across all 8 boots of the s73 capture — and REACHABLE: the pattern was matched
+# against a hand-reddened copy of boot 7's 15453 ms line with `clock=entry` replaced by
+# `clock=unarmed`, which it caught.
+FORBID ^\[\s*[0-9]{5,}ms\] .*\[wc-[gd]\] paygo .*clock=unarmed
 
 # --- THE TIMESTAMP TAP'S OWN WITNESS --------------------------------------------------------
 # Every number in this file is quoted in milliseconds since kernel entry, and every one of them
