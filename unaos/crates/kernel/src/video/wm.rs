@@ -2686,7 +2686,7 @@ fn tail_of(disturbed: bool, session: bool, deferred: bool) -> CursorTail {
 #[cfg(feature = "witness")]
 fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
     let info = fb.info();
-    let VerifyRef { row0, row1, cols, banded, cksum_pre, want } = vr;
+    let VerifyRef { row0, row1, cols, banded, cksum_pre, want, step } = vr;
 
     // WCD-PRE — the per-pixel liveness question, asked only of pixels that already disagree. `want` was
     // frozen before the blit; if the SOURCE no longer holds that value, this pixel's reference moved
@@ -2707,7 +2707,19 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         let mut nonzero = 0usize;
         let mut first = (0usize, 0usize, 0u32, 0u32);
         for row in row0..row1 {
-            for col in 0..cols {
+            // WC-D/PAYGO — the lattice's per-row phase. A full pass (`step == 1`) starts at column 0 and
+            // advances by one, which is the `for col in 0..cols` loop this was before, exactly. A sampled
+            // pass rotates its first column by one per row, so over any `step` consecutive rows every
+            // column is probed exactly once and a one-pixel-wide vertical defect cannot sit in the gaps
+            // for longer than that. EVERY row is visited either way, and every `scale`x`scale` upscale
+            // cell of a probed column is probed whole — which is what makes a full-row band un-missable
+            // at any step. `step` is never 0: `verify_reference` supplies it and collapses it to 1 below
+            // the rect's own width. (Named `col0` and not `first`: this closure already has a `first`,
+            // the coordinates of the earliest chargeable mismatch, and shadowing it here would silently
+            // retype the thing the FAIL line prints.)
+            let col0 = if step == 1 { 0 } else { row % step };
+            let mut col = col0;
+            while col < cols {
                 let want = want[(row - row0) * cols + col];
                 for sy in 0..r.scale {
                     let dy = r.y + row * r.scale + sy;
@@ -2736,6 +2748,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
                         }
                     }
                 }
+                col += step;
             }
         }
         (checked, bad, moved, nonzero, first)
@@ -2776,6 +2789,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
     let live = ok && moved > 0;
     let first = if bad_cache > 0 { first_cache } else { first_ram };
     let band = BandFmt(if banded { Some((row0, row1)) } else { None });
+    // WC-D/PAYGO — `checked` is the honest denominator and always was, but a denominator does not say WHY
+    // it is small. This does, positionally, right beside the count it qualifies. Empty on every build but
+    // an x86 `wcg-paygo` one, so the three lines below stay byte-identical elsewhere.
+    let coverage = wcd_coverage_note(step);
     if live {
         // WCD-PRE — every disagreement was explained by a reference that moved, so nothing is chargeable
         // to the blit, but the rect was not fully adjudicated either. Report the fact instead, with the
@@ -2783,23 +2800,32 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         // surface is a property of a multi-threaded app (or of the console printing into its own window),
         // not a defect in the compositor.
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} cksum_pre={:#018x} -> LIVE (unverifiable)",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} cksum_pre={:#018x} -> LIVE (unverifiable)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum, cksum_pre
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum, cksum_pre
         );
     } else if ok {
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={} bad_cache=0 bad_ram=0 ram_indep={} moved={} nonzero={} cksum={:#018x} first=none -> PASS",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} nonzero={} cksum={:#018x} first=none -> PASS",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, yn(ram_indep), moved, nonzero, cksum
+            checked, coverage, yn(ram_indep), moved, nonzero, cksum
         );
     } else {
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum,
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum,
             first.0, first.1, first.2, first.3
         );
+    }
+    // WC-D/PAYGO — the battery's terminal line, emitted right behind the verdict that closed it. `step ==
+    // 1` is exactly "this pass ran at full coverage", which is the condition `wcd_claim` sealed
+    // `VERIFIED_FULL` on, so the two cannot disagree about whether the window still owes a verdict. A
+    // sampled pass prints nothing here — its `coverage=lattice16` marker already says what it was, and the
+    // `state=waiting` census will speak from the first composite this window is declined on.
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    if step == 1 {
+        wcd_complete(r.id);
     }
 
     // Restore what the `IVAC` may have dropped: redraw the window and re-run its flush. In a correct build
@@ -2835,8 +2861,16 @@ struct VerifyRef {
     /// `surface_checksum` at reference time, i.e. pre-blit. Diagnostic; see the note by `cksum` in
     /// [`verify_window`] for why it is no longer a verdict input.
     cksum_pre: u64,
-    /// The snapshot itself, `0x00FF_FFFF`-masked exactly as `draw_window`'s read masks.
+    /// The snapshot itself, `0x00FF_FFFF`-masked exactly as `draw_window`'s read masks. Read at FULL width
+    /// on every pass, sampled or not — WC-D/PAYGO's note explains why the lattice reduces probes and never
+    /// the reference.
     want: alloc::vec::Vec<u32>,
+    /// WC-D/PAYGO — the SOURCE-column stride this verdict's read-back walks at, and the one the `coverage=`
+    /// marker is derived from. Always 1 (full coverage) on aarch64 and on any x86 build without the
+    /// `wcg-paygo` knob, which is what makes the lattice arithmetic in [`verify_window`] fold away to the
+    /// `for col in 0..cols` loop it has always been. Carried in the reference rather than recomputed at the
+    /// read-back so the walk and its marker cannot disagree — the same rule `wcg` applies to `PAYGO_STEP`.
+    step: usize,
 }
 
 /// WC-D — capture the read-back's reference, from the composite loop, BEFORE `draw_window` runs.
@@ -2867,16 +2901,20 @@ fn verify_reference(
         return None;
     }
     let bit = 1u32 << r.id;
-    if VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit != 0 {
-        return None;
-    }
-    // Claim exactly once, and only from the path that is about to print. `claim` is the `fetch_or` winner
-    // test, so every `serial_println!` below is emitted by one core.
-    let claim = || VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0;
+    // WC-D/PAYGO — which verdict does this window still owe, and may it be taken NOW? `Some(step)` is the
+    // SOURCE-column stride the admitted pass runs at; `1` is full coverage and the only answer any build
+    // but an x86 `wcg-paygo` one ever gives. `None` declines, and on the deferring path the decline has
+    // already been counted and (on cadence) printed. See [`VERIFIED_FULL`] for the whole policy.
+    let step = wcd_admit(r.id, bit)?;
+    // Claim exactly once, and only from the path that is about to print. `claim_final` is the `fetch_or`
+    // winner test that also CLOSES the window's battery — the geometry `-> SKIP`s below use it because a
+    // degenerate row will still be degenerate at the deferred stage. Every `serial_println!` below is
+    // emitted by one core.
+    let claim_final = || wcd_claim_final(bit);
 
     let info = fb.info();
     if r.surf == 0 || r.scale == 0 || r.stride < 4 || r.x >= info.width || r.y >= info.height {
-        if claim() {
+        if claim_final() {
             serial_println!("[wc-d] verify win={} -> SKIP (degenerate row/geometry)", r.id);
         }
         return None;
@@ -2885,11 +2923,20 @@ fn verify_reference(
     let cols = (info.width - r.x).div_ceil(r.scale).min(r.w).min(r.stride / 4);
     let rows = (info.height - r.y).div_ceil(r.scale).min(r.h).min(r.surf_len / r.stride);
     if cols == 0 || rows == 0 {
-        if claim() {
+        if claim_final() {
             serial_println!("[wc-d] verify win={} -> SKIP (no visible content rect)", r.id);
         }
         return None;
     }
+    // WC-D/PAYGO — the lattice COLLAPSES on a rect narrower than its own step, for the reason
+    // `wcg::readback` gives at length: the per-row phase runs `row % step`, so where `cols < step` every
+    // row whose phase lands at or past `cols` probes ZERO pixels, and the window would be sampled one row
+    // in `step` while its line still claimed `coverage=lattice16`. Not hypothetical — the reviewed boot
+    // has `win=3` at `surf=8x8 scale=8x`, i.e. `cols == 8`. Below the step there is no coverage to buy,
+    // so the honest answer is to take the pass at FULL coverage and say so. The EFFECTIVE step is what
+    // travels in the reference from here on, so the walk, the `coverage=` marker and the latch the pass
+    // claims are all read from one cell rather than three that could disagree.
+    let step = if cols < step { 1 } else { step };
 
     // WCD-BAND — clip to the rows this present promised to repaint. The band is in SOURCE rows, which is
     // the coordinate `rows` counts in, so the clip is a `min` and not a re-derivation of `damaged_box`'s
@@ -2908,7 +2955,10 @@ fn verify_reference(
         }
     };
 
-    if !claim() {
+    // WC-D/PAYGO — stage-appropriate, and with the EFFECTIVE step: a sampled pass claims only the
+    // first-verdict latch and leaves the terminal one for the deferred pass, while a full pass — including
+    // a lattice that collapsed above — closes the battery outright. See [`wcd_claim`].
+    if !wcd_claim(bit, step) {
         return None;
     }
     // Latch is ours from here: every return below prints.
@@ -2939,7 +2989,7 @@ fn verify_reference(
         }
     }
     let cksum_pre = surface_checksum(r);
-    Some(VerifyRef { row0, row1, cols, banded, cksum_pre, want })
+    Some(VerifyRef { row0, row1, cols, banded, cksum_pre, want, step })
 }
 
 /// WC-D — `band=` on the wire: `none` for a whole-box verdict, `y0..y1` in SOURCE rows for a banded one.
@@ -2970,8 +3020,370 @@ fn yn(b: bool) -> &'static str {
 /// that keeps the gate diagnosable is carried by that function: EVERY path that claims the bit emits a line,
 /// PASS, FAIL, LIVE, or `-> SKIP` with a reason. A future early return added without a line would burn the
 /// latch silently and leave the spec's REQUIRE failing with nothing to explain why.
+///
+/// WC-D/PAYGO splits what this latch means on an x86 `wcg-paygo` build: it becomes the FIRST
+/// verdict's latch, and [`VERIFIED_FULL`] becomes the terminal one. On every other build there is
+/// one verdict and this is still it.
 #[cfg(feature = "witness")]
 static VERIFIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+// ---- WC-D/PAYGO — the read-back paid as the desktop uses it, not as the boot starts it ---------
+
+/// WC-D/PAYGO — window ids whose FULL-coverage verdict has been emitted. Terminal: past this bit a
+/// window owes nothing, and [`VERIFIED`] alone now means only "this window's FIRST verdict is out".
+///
+/// ### Why the read-back got the treatment the `[wc-g]` battery got
+///
+/// GR17 took the witness-armed kepler block from 17 077 ms to 2 564 ms and left `[wc-d]`'s verify as
+/// the largest instrument term inside it — 1 010 ms of a 2 581 ms window, three lines (boot 7 of the
+/// `rmbp-gr16-s73` capture). Nearly all of it is glass: [`verify_window`] probes every DESTINATION
+/// pixel of the verified rect, TWICE (the `bad_cache` pass and the `bad_ram` re-read), and each probe
+/// is a read of the WC-mapped Kepler BAR across PCIe — ~1 µs apiece even after `3c05856d` narrowed
+/// `FrameBuffer::read_pixel` to one aligned `u32`. That boot's three verdicts probe 481 280
+/// destination pixels per pass; `2 × 481 280 × ~1.05 µs` is the second the boot pays. The two
+/// full-surface FNVs (`cksum`, `cksum_pre`) are ~6 ms each against that, and the source snapshot is
+/// cacheable RAM.
+///
+/// So: the same policy, under the SAME knob. `UNAOS_WCG_PAYGO` arms ONE pay-as-you-go regime for the
+/// whole witness battery rather than one per witness — a second env var would let the two halves be
+/// armed apart, and a boot with one half armed is a boot whose `kepler=` figure describes neither
+/// configuration.
+///
+/// | stage | coverage | when | on the wire |
+/// |-------|----------|------|-------------|
+/// | 1 | LATTICE — every [`WCD_LATTICE_N`]th SOURCE column per row, phase rotating one column per row | immediately, as before | `coverage=lattice16` on the verdict |
+/// | 2 | FULL — every source column | once [`super::wcg::paygo_clock`] passes the shared threshold | `coverage=full`, then `[wc-d] paygo … state=complete … -> PAID` |
+///
+/// ### Three deviations from `[wc-g]`'s shape, each because WC-D's semantics demand it
+///
+/// 1. **WC-G has a four-sample battery to spread out; WC-D has a one-shot latch.** There is no budget
+///    here to spend more slowly, so the LATCH is split rather than the budget. A window is verified
+///    twice over a boot where it used to be verified once — once cheaply and at once, once fully and
+///    late — and each verdict is a complete, independent judgement of the blit that carried it, over
+///    that pass's own band, against that pass's own reference. Nothing is accumulated across the two.
+/// 2. **The decline PRINTS from where it is decided.** `wcg::paygo_open` may not, because it runs
+///    inside `wcg::begin` — between WC-D's frozen reference and the copy that reference describes —
+///    so with the console routed into a window its own glyphs would land in the surface WC-D froze
+///    (the full argument is at `wcg`'s `PAYGO_PEND`). [`verify_reference`] has no such hazard: it is
+///    the site that TAKES the reference, and on the declining path it takes none. Nor is any OTHER
+///    window's reference outstanding at that instant — each is taken at the top of its own composite
+///    iteration and consumed by [`verify_window`] at the bottom of the same one — so the line is
+///    emitted directly and needs no pending slot, no flush site and no second mechanism.
+/// 3. **No delta gate on the refresh.** `wcg::paygo_flush` runs on every composite pass whether or
+///    not that pass declined anything, so it needs a "has the census moved" test to keep an idle
+///    window quiet. This census is refreshed FROM the decline, so it has moved by construction and
+///    the test would be vacuous. The rate gate and its `compare_exchange` are kept verbatim: they
+///    bound the duty cycle this instrument imposes on the composite path and let exactly one core
+///    print when two decline the same window at once.
+///
+/// ### The snapshot stays whole, and so does every leg
+///
+/// [`verify_reference`]'s `want` buffer is read at full width on BOTH stages. It is cacheable RAM —
+/// microseconds against the glass's milliseconds — and keeping it whole is what lets
+/// `want[(row - row0) * cols + col]` and `source_px(row, col)` keep their exact indices, so the
+/// `moved=` re-read still asks its question of the same reference the comparison used. Sampling
+/// reduces PROBES; it does not reduce legs, and every leg survives it because the lattice changes
+/// only which destination pixels are visited, never what is asked of one:
+///
+/// - the `bad_cache`/`bad_ram` split still runs both passes over the same probe set, so the aarch64
+///   `IVAC` leg and the x86 stability re-read that `ram_indep=no` names are both intact;
+/// - `moved=` still attributes a disagreeing pixel to a reference that moved under it, per pixel;
+/// - `nonzero=` is still the destination's own content question, over the probes taken;
+/// - `cksum` / `cksum_pre` are full-surface FNVs and the step does not reach them at all;
+/// - every `scale`×`scale` UPSCALE cell of a probed source column is probed WHOLE, so nothing about
+///   the upscale is narrowed — which matters here in a way it does not for `[wc-g]`, whose read-back
+///   only ever probed one destination pixel per cell.
+///
+/// What narrows is horizontal reach. A lattice pass probes one source column in [`WCD_LATTICE_N`]
+/// per row, phase rotating one column per row. It therefore CATCHES: any full-row band (every row is
+/// visited at every step); any horizontal garble run of [`WCD_LATTICE_N`] source pixels or more, in
+/// any row, deterministically; any stride, pitch or origin fault, which displaces the whole surface
+/// and agrees with no probe in any row; and a one-source-pixel-wide vertical defect within
+/// [`WCD_LATTICE_N`] consecutive rows, because the phase visits every column exactly once over that
+/// span. It CANNOT catch an isolated single-pixel error at a source column that row's phase does not
+/// visit. That is the whole of the narrowing, and it is why stage 2 DEFERS full coverage rather than
+/// dropping it — every pixel is still adjudicated, on a live desktop instead of inside the boot.
+///
+/// ### A lattice verdict is never readable as a full clearance
+///
+/// `checked=` was always the honest denominator, but a denominator does not say WHY it is small — a
+/// banded present and a lattice pass over a whole box can print the same figure. `coverage=` says
+/// which, on the line, between the count and the verdict that count supports. A knob-on build marks
+/// the FULL verdicts too, so the marker's absence never carries the meaning; a knob-off build inserts
+/// the empty string. The `-> PASS` / `-> FAIL` / `-> LIVE` terminal and the key order around it are
+/// untouched, which is what keeps `scripts/specs/pi4-regression.spec`'s
+/// `REQUIRE … bad_cache=0 bad_ram=0.*-> PASS` and `FORBID … -> FAIL` reading the same line they
+/// always read — and aarch64 never compiles any of this, so its wire is byte-identical.
+///
+/// ### CURSOR-12's exclusion fires once more per window
+///
+/// `may_overlay` is withheld on the pass that holds a reference, so the deferred stage costs one
+/// further excluded compose per window — ~15 s in, not during the boot. The exclusion is NOT extended
+/// across the deferral: the test in `composite_inner` is `wcd_ref.is_some() || VERIFIED & bit == 0`,
+/// and [`VERIFIED`] is claimed by stage 1, so a window waiting for its full verdict composes the
+/// sprite exactly as a verified one does today. The `FALLBACK_FIXTURE` site reads the same latch and
+/// is a global one-shot, so it still fires on the first window to reach it, unmoved — with the
+/// consequence, stated because it is a real narrowing, that the direct-path present it forces is now
+/// verified at lattice coverage rather than in full.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static VERIFIED_FULL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// WC-D/PAYGO — per-id state width. The same 32 [`VERIFIED`]'s bitmask is, and for the same reason:
+/// `verify_reference` declines any `id >= 32` before it reaches any of this.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+const WCD_IDS: usize = 32;
+
+/// WC-D/PAYGO — the lattice's column step, in SOURCE columns. `wcg`'s sixteen, taken from `wcg`, for
+/// the reason its own note gives: sixteen is a coverage decision before it is a cost one, and one
+/// policy under one knob should not be two constants. Pinned to the `coverage=lattice16` literal at
+/// compile time — a marker whose wire says something its code does not do is the exact class of
+/// instrument this file keeps convicting.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+const WCD_LATTICE_N: usize = super::wcg::PAYGO_LATTICE_N;
+
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+const _: () = assert!(
+    WCD_LATTICE_N == 16,
+    "the `coverage=lattice16` literal must track wcg::PAYGO_LATTICE_N"
+);
+
+/// WC-D/PAYGO — per-id: composites the deferral gate declined to verify. UNBUDGETED and taken before
+/// any print test, on WC-H2's law: past a gate the LINE stops and the count must not, because a
+/// counter that stops counting is an instrument that lies. This is what makes "the read-back is
+/// waiting" a quantity rather than an impression.
+///
+/// Per ID, and there is deliberately no aggregate anywhere in this block. GR17 convicted a global
+/// `any()` budget gate of a ~1.3 s/boot tax for exactly that shape — eight slots of which the bench
+/// occupies three, five never-spendable ones holding the gate permanently open for every window — and
+/// the fix was to close it per window. Nothing here can be wrong in that way because there is nothing
+/// here that reads across ids.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCD_DEFERRED: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+
+/// WC-D/PAYGO — per-id: `[wc-d] paygo` lines emitted for this window so far. Printed as `emit=`,
+/// one-based. The reader's rule is `wcg`'s standing one: for any `win=`, the greatest `emit=`
+/// supersedes every earlier line, and these lines are never summed — they are snapshots of a monotone
+/// total, not deltas.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCD_EMIT: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+
+/// WC-D/PAYGO — per-id: the right to print the census-opening line, taken exactly once. Two cores
+/// declining the same window in the same instant must not both emit `emit=1`.
+///
+/// It exists as a separate latch from the cadence below because the FIRST line cannot go through the
+/// rate gate: [`crate::arch::now_cycles`] is an absolute `rdtsc` on x86 and `WCD_LASTROLL` starts at
+/// zero, so `cycles_to_us(now - 0)` scales an absolute counter by 1e6 and wraps somewhere north of
+/// ~1.9 h of machine uptime — which could hand the gate a small reading and silently swallow the line
+/// that opens the census. `wcg::paygo_flush` never meets this because its first line comes off
+/// `PAYGO_PEND` rather than off the cadence; this is the same guarantee reached from the other end.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCD_SAID: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+
+/// WC-D/PAYGO — per-id: `now_cycles()` as of the END of the most recent `[wc-d] paygo` emission. The
+/// refresh's rate gate and its mutual exclusion both, exactly as `wcg::PAYGO_LASTROLL` serves that
+/// module: two cores declining the same window at once both observe this value, and only the one
+/// whose `compare_exchange` succeeds prints. Re-armed after the serial write, so
+/// `wcg::CENSUS_PERIOD_US` bounds the duty cycle and not merely the gap between line starts.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCD_LASTROLL: [core::sync::atomic::AtomicU64; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; WCD_IDS];
+
+/// WC-D/PAYGO — may this window take a reference now, and at what probe step?
+///
+/// `Some(step)` admits the pass at that SOURCE-column stride; `None` declines it. The stage is read
+/// off the two latches and nothing else, so it is monotone and two cores cannot disagree about it:
+/// terminal bit set means the battery is closed; first bit clear means stage 1, which opens
+/// immediately and sampled; otherwise stage 2, which opens only past the shared threshold.
+///
+/// **The gate sits above everything the pass would spend.** A declined composite takes no reference,
+/// allocates no snapshot, touches no glass and claims no latch — it leaves the window exactly as it
+/// found it, so a window that stops compositing before the threshold simply never pays, and there is
+/// nothing here that can wedge: no wait, no retry, no queue, no core to make progress.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+fn wcd_admit(id: u32, bit: u32) -> Option<usize> {
+    if VERIFIED_FULL.load(core::sync::atomic::Ordering::Relaxed) & bit != 0 {
+        return None;
+    }
+    if VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit == 0 {
+        return Some(WCD_LATTICE_N);
+    }
+    let (since_ms, clock, payable) = super::wcg::paygo_clock();
+    if !payable {
+        wcd_decline(id, since_ms, clock);
+        return None;
+    }
+    Some(1)
+}
+
+/// Knob off, or not x86: one verdict per window at full coverage, exactly as before. Folds away.
+#[cfg(all(feature = "witness", not(all(target_arch = "x86_64", feature = "wcg-paygo"))))]
+#[inline]
+fn wcd_admit(_id: u32, bit: u32) -> Option<usize> {
+    if VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit != 0 {
+        None
+    } else {
+        Some(1)
+    }
+}
+
+/// WC-D/PAYGO — claim the verdict this pass owes, stage-appropriately. A sampled pass claims the
+/// FIRST-verdict latch and leaves the terminal one for the deferred pass; a FULL pass closes the
+/// battery outright, whichever stage it arrived from.
+///
+/// That last clause is what makes a COLLAPSED lattice correct rather than merely tolerable: a rect
+/// narrower than the step is walked at full coverage (see [`verify_reference`]), so it earned the
+/// terminal latch on its first pass and must not be re-verified later to say the same thing again.
+/// The winner test is a single `fetch_or` on exactly one mask either way, so two cores at the same
+/// stage cannot both print.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[inline]
+fn wcd_claim(bit: u32, step: usize) -> bool {
+    if step > 1 {
+        VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0
+    } else {
+        wcd_claim_final(bit)
+    }
+}
+
+/// WC-D/PAYGO — claim and CLOSE, whatever stage asked. The `-> SKIP` GEOMETRY paths use it: a
+/// degenerate row is a property of the ROW, will still be degenerate at stage 2, and re-running it
+/// there would buy a duplicate SKIP line and nothing else — which is the classification
+/// [`verify_reference`]'s own ledger already makes about which failures are worth claiming for.
+///
+/// The out-of-memory SKIP deliberately does NOT use it. An allocation failure is a property of one
+/// instant, not of the row, so leaving the terminal latch clear gives that window its full verdict
+/// later instead of spending its only chance on a transient.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[inline]
+fn wcd_claim_final(bit: u32) -> bool {
+    VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
+    VERIFIED_FULL.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0
+}
+
+#[cfg(all(feature = "witness", not(all(target_arch = "x86_64", feature = "wcg-paygo"))))]
+#[inline]
+fn wcd_claim(bit: u32, _step: usize) -> bool {
+    VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0
+}
+
+#[cfg(all(feature = "witness", not(all(target_arch = "x86_64", feature = "wcg-paygo"))))]
+#[inline]
+fn wcd_claim_final(bit: u32) -> bool {
+    wcd_claim(bit, 1)
+}
+
+/// WC-D/PAYGO — record a declined composite, and keep the window's census current on the wire.
+///
+/// The census moves FIRST and unbudgeted, before any print test. Then the first decline speaks
+/// unconditionally (see [`WCD_SAID`] for why it cannot go through the rate gate), and afterwards the
+/// waiting line is RE-EMITTED on `wcg::CENSUS_PERIOD_US` cadence — so `deferred=` is a running census
+/// with the moment it was taken stamped on it, not a figure frozen at the instant the deferral began.
+/// A one-shot there would be `wcg`'s convicted `H_TORN` shape exactly: printed once, at first decline,
+/// where the count is 1 by construction.
+///
+/// A window that stops compositing stops refreshing, which is not a gap: its last line describes its
+/// last active state and `since_entry_ms=` says when that was.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+fn wcd_decline(id: u32, since_ms: u64, clock: &'static str) {
+    let i = id as usize;
+    if i >= WCD_IDS {
+        return;
+    }
+    WCD_DEFERRED[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if WCD_SAID[i].swap(1, core::sync::atomic::Ordering::AcqRel) == 0 {
+        wcd_paygo_note(id, i, "waiting", "DEFERRED", since_ms, clock);
+        return;
+    }
+    let last = WCD_LASTROLL[i].load(core::sync::atomic::Ordering::Relaxed);
+    let now = crate::arch::now_cycles();
+    if super::wcg::cycles_to_us(now.saturating_sub(last)) < super::wcg::CENSUS_PERIOD_US {
+        return;
+    }
+    if WCD_LASTROLL[i]
+        .compare_exchange(
+            last,
+            now,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+    wcd_paygo_note(id, i, "waiting", "DEFERRED", since_ms, clock);
+}
+
+/// WC-D/PAYGO — the policy's own line: what regime this window is in, how much it has declined, and
+/// when the deferred half becomes payable.
+///
+/// A separate line rather than fields on the verdict, for the reason `wcg::paygo_note` gives: the
+/// verdict's key order and terminal are matched by another platform track's gate, and a field that
+/// track does not read is not worth a chance of breaking it. The key set is `[wc-g] paygo`'s exactly,
+/// so one reader rule serves both — `taken=`/`budget=` count the window's STAGES, of which there are
+/// two, and `taken=` counts stages CLOSED rather than lines printed, because a collapsed lattice
+/// closes both in one full-coverage verdict.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+fn wcd_paygo_note(id: u32, i: usize, state: &str, verdict: &str, since_ms: u64, clock: &str) {
+    let bit = 1u32 << id;
+    let taken = (VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit != 0) as u32
+        + (VERIFIED_FULL.load(core::sync::atomic::Ordering::Relaxed) & bit != 0) as u32;
+    let emit = WCD_EMIT[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    serial_println!(
+        "[wc-d] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} since_entry_ms={} clock={} taken={} budget=2 -> {}",
+        id,
+        state,
+        emit,
+        WCD_LATTICE_N,
+        WCD_DEFERRED[i].load(core::sync::atomic::Ordering::Relaxed),
+        super::wcg::PAYGO_DEFER_MS,
+        since_ms,
+        clock,
+        taken,
+        verdict
+    );
+    // Re-armed from AFTER the serial write, deliberately — see [`WCD_LASTROLL`].
+    WCD_LASTROLL[i].store(crate::arch::now_cycles(), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// WC-D/PAYGO — the battery's terminal line, emitted beside the verdict that closed it so the
+/// `deferred=` census is read at the moment full coverage is claimed and not only at the moment the
+/// waiting began. `deferred=0` here says the gate never declined this window at all.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+fn wcd_complete(id: u32) {
+    let i = id as usize;
+    if i >= WCD_IDS {
+        return;
+    }
+    let (since_ms, clock, _) = super::wcg::paygo_clock();
+    wcd_paygo_note(id, i, "complete", "PAID", since_ms, clock);
+}
+
+/// WC-D/PAYGO — the `coverage=` marker, inserted between `checked=` and `bad_cache=`: an INSERTION,
+/// which leaves the pi4 gate's `.*` spans and its `-> PASS` / `-> FAIL` terminals matching exactly
+/// what they matched before. The empty string on every build but an x86 `wcg-paygo` one, so those
+/// lines stay byte-identical.
+///
+/// Derived from the step the walk ACTUALLY used, never from the step that was asked for — see
+/// [`verify_reference`]'s collapse. A `coverage=` that misreports its own pass is worse than no
+/// marker at all.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[inline]
+fn wcd_coverage_note(step: usize) -> &'static str {
+    if step > 1 {
+        " coverage=lattice16"
+    } else {
+        " coverage=full"
+    }
+}
+
+#[cfg(all(feature = "witness", not(all(target_arch = "x86_64", feature = "wcg-paygo"))))]
+#[inline]
+fn wcd_coverage_note(_step: usize) -> &'static str {
+    ""
+}
 
 /// WC-C — FNV-1a 64 over a window's mapped surface slot, for the side-by-side witness. Bounded by
 /// `surf_len` (the length the MAPPING code supplied), so it shares `draw_window`'s F1 read bound; a null
@@ -6717,6 +7129,13 @@ fn create_inner(
     #[cfg(feature = "witness")]
     if id < 32 {
         VERIFIED.fetch_and(!(1u32 << id), core::sync::atomic::Ordering::Relaxed);
+        // WC-D/PAYGO — the terminal latch travels with the first-verdict one, or a recycled id would
+        // inherit its predecessor's completed battery and the new window would never be verified at all.
+        // The `deferred=`/`emit=` census deliberately does NOT reset: it is a per-ID total for the whole
+        // boot, and `emit=` has to stay monotone or the reader's "greatest `emit=` per `win=` supersedes"
+        // rule breaks across a recycle.
+        #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+        VERIFIED_FULL.fetch_and(!(1u32 << id), core::sync::atomic::Ordering::Relaxed);
     }
     // WC-J — a CREATE re-tiles the existing windows exactly as a close does (the layout is a function
     // of the live set), so it abandons their old boxes in the same way and they are reclaimed the same

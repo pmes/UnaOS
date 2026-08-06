@@ -584,7 +584,10 @@ static H_LINES: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// the defect being fixed reported 1 of 271. The bound is stated rather than hidden because there is
 /// no honest way to close it from inside this file: a genuinely final census needs a boot-end or
 /// shell-verb call site, and every such site lives in another module.
-const CENSUS_PERIOD_US: u64 = 2_000_000;
+/// `pub(super)` for the same reason as [`PAYGO_LATTICE_N`]: `video::wm`'s `[wc-d] paygo` census
+/// refreshes on this cadence and for these reasons, and a second period written down over there
+/// would be a second duty cycle to reason about.
+pub(super) const CENSUS_PERIOD_US: u64 = 2_000_000;
 
 /// Per-id rollup latches. Bit [`ROLL_WHOLE`] for the whole-box budget's rollup, bit [`ROLL_BAND`] for
 /// the banded one; each fires at most once per window per boot.
@@ -1670,8 +1673,12 @@ impl<'a> GlassRow<'a> {
 /// is 64 bytes at this panel's layout — the width of a cache line, and far narrower than any defect
 /// this witness has ever convicted. The cost follows from the coverage and not the other way round:
 /// one probe in sixteen is ~1/16 of a full pass's probes.
+///
+/// `pub(super)` because `video::wm`'s `[wc-d]` read-back samples on the SAME lattice under the SAME
+/// knob, and a second `16` written down over there is a second figure to keep in step by hand. See
+/// [`paygo_clock`] for the same argument about the threshold and the clock.
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
-const PAYGO_LATTICE_N: usize = 16;
+pub(super) const PAYGO_LATTICE_N: usize = 16;
 
 /// The `coverage=` marker has to NAME the step, and it is a `&'static str` — [`coverage_note`]
 /// explains why — so the literal and the constant are pinned together at compile time rather than
@@ -1699,7 +1706,7 @@ const _: () = assert!(
 /// full coverage; a window that has stopped keeps them unspent, which is exactly what this module
 /// already does with a window that stops presenting.
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
-const PAYGO_DEFER_MS: u64 = 15_000;
+pub(super) const PAYGO_DEFER_MS: u64 = 15_000;
 
 /// PAYGO — milliseconds since KERNEL ENTRY, or `None` while that question has no answer yet.
 ///
@@ -1740,6 +1747,31 @@ fn since_entry_ms() -> Option<u64> {
         return None;
     }
     Some(now_cycles().wrapping_sub(origin).saturating_mul(1000) / hz)
+}
+
+/// PAYGO — the deferral clock and its verdict, read ONCE. The one definition both witnesses gate on.
+///
+/// `video::wm`'s `[wc-d]` read-back defers on exactly this policy — same knob, same threshold, same
+/// entry stamp — so it reads the answer from here rather than keeping a second copy of the
+/// arithmetic. Two gates that agree today and disagree after one of them is edited is the drift this
+/// module keeps convicting, and [`since_entry_ms`]'s ledger is a long list of ways the expression
+/// can be got wrong: measured from reset instead of entry, scaled before it divided, guessed off an
+/// uncalibrated rate. There is no version of "wc-d writes its own" that does not eventually
+/// re-acquire one of those.
+///
+/// Returns `(since_entry_ms, clock, payable)`. `clock` is the `clock=` field's value on the wire and
+/// disambiguates a real zero from an absent one: `("unarmed", false)` says the entry stamp or the
+/// TSC calibration was not there to measure against, which is the state the gate DEFERS in, where
+/// `since_entry_ms=0 clock=entry` would be a genuine reading taken at entry.
+///
+/// [`paygo_arm`] and [`paygo_note`] both go through it too, deliberately — an exported helper that
+/// the exporting module does not itself use is a second implementation waiting to happen.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+pub(super) fn paygo_clock() -> (u64, &'static str, bool) {
+    match since_entry_ms() {
+        Some(ms) => (ms, "entry", ms >= PAYGO_DEFER_MS),
+        None => (0, "unarmed", false),
+    }
 }
 
 /// PAYGO — per-id: the probe step granted to the sample currently open, so [`end`] walks the glass
@@ -1885,12 +1917,9 @@ fn paygo_arm(i: usize) -> bool {
     if TAKEN[i].load(Ordering::Relaxed) == 0 {
         return true;
     }
-    // `None` — no entry stamp yet, or no calibrated rate — DEFERS. See [`since_entry_ms`] for why
-    // that is the conservative direction and what guessing instead would have cost.
-    match since_entry_ms() {
-        Some(ms) => ms >= PAYGO_DEFER_MS,
-        None => false,
-    }
+    // An unarmed clock — no entry stamp yet, or no calibrated rate — DEFERS. See [`since_entry_ms`]
+    // for why that is the conservative direction and what guessing instead would have cost.
+    paygo_clock().2
 }
 
 #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
@@ -1974,10 +2003,7 @@ fn paygo_note(id: u32, i: usize, state: &str, verdict: &str) {
     // the gate DEFERS in — where `since_entry_ms=0 clock=entry` would be a genuine reading taken at
     // entry. A fabricated zero that could mean either is the kind of field this module keeps
     // convicting.
-    let (since_ms, clock) = match since_entry_ms() {
-        Some(ms) => (ms, "entry"),
-        None => (0, "unarmed"),
-    };
+    let (since_ms, clock, _) = paygo_clock();
     serial_println!(
         "[wc-g] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} since_entry_ms={} clock={} taken={} budget={} -> {}",
         id,
