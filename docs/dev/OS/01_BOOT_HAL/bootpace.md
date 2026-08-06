@@ -547,7 +547,7 @@ exactly one exit, and the report sits on it.
 | build | reading |
 |---|---|
 | bench media, GPU knobs armed | both lines print; `span` ≈ 4600 ms with `kepler=` dominant; `build=kepler+takeover+…` |
-| default `./arroyo esp-x86` | both lines still print, with `detect=0ms(n=0) igpu=0ms(n=0) kepler=0ms(n=0)`, `build=default(no-gpu-knobs)`, `span` ≈ 113 ms |
+| default `./arroyo esp-x86` | both lines still print, with `detect=0ms(n=0) igpu=0ms(n=0) kepler=0ms(n=0)`, `build=default(no-gpu-knobs)`, `span=6ms` (MEASURED, s73 boot B 2026-08-06 — the ≈113 ms this table used to predict was a stale code-comment figure; the first metal default boot came in 19× under it) |
 | `UNAOS_SKIP_XHCI=1` | the lines are **absent entirely** — `pci::init` is never called |
 
 The middle reading is the load-bearing one: it is what proves the numbers report
@@ -903,3 +903,45 @@ present on a WC-live boot. Until it exists, item 4 and `bg_place_cpu` should be
 recorded as *arguments whose premise has been withdrawn*, not as decisions
 reversed — a withdrawn premise leaves a decision unjustified, which is not the
 same as leaving it wrong.
+
+### 10g. The 17-second kepler block, solved: it was the witness battery (s73, 2026-08-06)
+
+GR15 closed with `kepler=17138ms` of a 27.9 s boot as the one number left with
+nothing inside it. The s73 sitting opened it with four boots on metal, all at
+kernel `d86eadf8`:
+
+| boot | build | `kepler=` | `gui=` | resolution |
+|---|---|---|---|---|
+| A | kepler+wc+**witness**+logts | (civil-degraded) | ~50 s wall | 1 s — see below |
+| C | kepler+wc+logts (no witness) | **1402ms** | **4094ms** | 1 ms |
+| A2 | identical repeat of C | **1401ms** | 4102ms | 1 ms |
+| B | default(no-gpu-knobs)+logts | 0ms(n=0) | 3628ms | 1 ms |
+
+**The real Kepler bring-up is 1.40 s, deterministic to 1 ms across two boots.**
+The other ~15.7 s of the "kepler block" was the witness battery running inside
+the measured span — dominated by the `[wc-g]` glass-verify passes (four in boot
+A, ~3 s each, timestamped 15:30:51/54/57/31:00 in the capture) plus the rest of
+the boot-fixture ladder. Every witness-armed `kepler=` figure ever recorded
+carries that overhead inside it; the boots differ ONLY in the `witness` feature.
+
+Corollaries, each earned on s73:
+
+* **Baseline law closed (§9a).** Boot B printed `build=default(no-gpu-knobs)`
+  with `kepler=0ms(n=0)` for the first time in any capture — beside boot C's
+  `kepler=1402ms(n=1)` the zeros are proven to mean "path absent," not
+  "reporter dead." Measured `span=6ms` (the table's old ≈113 ms prediction was
+  a stale comment figure).
+* **Boot-to-boot variance is ~1 ms at the kepler class and ~10 ms at `gui=`**
+  (C vs A2) — the §10 queue's "n=1 per arm is uncharacterised" concern is
+  retired for witness-off arms. Witness-ON variance remains uncharacterised.
+* **Why boot A read in whole seconds:** the witness `sntp-x86` fixture's
+  set-clock leg planted its canned `2026-07-22T15:30:45Z` anchor ~1 s into
+  boot, flipping every later `logts` prefix to the 1-second civil form (and
+  dating every FAT write July 22). Fixed the same day: the fixture now clears
+  the anchor it planted (`clock::witness_clear_anchor`, fixture-only) and says
+  so on the wire — `:: [sntp-x86] canned anchor cleared ::` is the expected
+  line in every future witness capture.
+* **The next optimization target is the instrument, not the boot.** A 4.1 s
+  boot pays ~46 s of witness wall-clock when armed. The witness battery needs a
+  pay-as-you-go shape (budgeted passes, or off the boot path) before any
+  witness-armed timing figure is quoted as a boot cost again.
