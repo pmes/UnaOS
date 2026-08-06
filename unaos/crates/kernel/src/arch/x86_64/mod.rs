@@ -38,6 +38,13 @@ pub fn init() {
     // bit in a PTE means nothing to the hardware, so an audit here would be reporting on a protection
     // that is not yet armed. Read-only walk; publishes the negative control and the map's W^X census.
     memory::wx_audit_report();
+    // WXPROBE: the read-only reconnaissance the WXN-x86 split is designed from — leaf level and raw
+    // bits at the six addresses the split must classify, the control registers that decide its flush
+    // and its NX semantics, and the kernel's own PT_LOAD layout via `__ehdr_start`. Sits here rather
+    // than anywhere else for the same reason the audit does (EFER.NXE/CR4.SMEP are armed, the heap
+    // is not yet created, interrupts are still masked) and directly after it so the census and the
+    // specific addresses land adjacent in one capture. Writes nothing.
+    memory::wx_probe_report();
     x86_64::instructions::interrupts::enable();
 }
 

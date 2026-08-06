@@ -1145,6 +1145,266 @@ pub fn wx_audit_report() {
 }
 
 // =================================================================================================
+// WXPROBE — the read-only reconnaissance the WXN-x86 split needs before it can be designed.
+// -------------------------------------------------------------------------------------------------
+// WXAUDIT answers "how many leaves are W∧X". It cannot answer the questions a SPLITTER has to answer
+// first, because those are facts about SPECIFIC addresses and about the CPU's control state, and the
+// census is an aggregate. The split is an edit of a FOREIGN, already-live hierarchy — the firmware's
+// (the kernel never builds a page table; it inherits UEFI's across `exit_boot_services`) — so every
+// one of these is firmware policy, differs between OVMF and Apple EFI, and is knowable only from a
+// boot:
+//
+//   * LEAF LEVEL at the addresses that matter. Whether the kernel image, the AP trampoline page at
+//     physical 0x8000, the framebuffer and ordinary .bss sit under 1 GiB, 2 MiB or 4 KiB leaves
+//     decides how many huge leaves the split must break down, and therefore how large a static
+//     page-table pool it needs (there is no heap where the split must run — see `arch::init`).
+//   * The RAW leaf bits, not just the permission ones. GR15's lesson is that PAT/PCD/PWT are as
+//     load-bearing as W and NX: a splitter that rewrites a whole leaf value silently drops the PAT
+//     bit and re-UCs the panel. Printing the raw entry means a later reader can re-derive any bit we
+//     did not think to name, and the memory-type bits are named explicitly so the fb leaf's typing is
+//     visible before and after any future edit. The PAT bit MOVES with the level (bit 7 at 4 KiB,
+//     bit 12 at 2 MiB/1 GiB), so it is decoded through `pat_bit_for_level`, never a fixed mask.
+//   * The FOLDED permission, not only the leaf's. The audit classifies by the fold down the path; so
+//     does the hardware. `fw`/`fx`/`fu` are that fold, computed with the same `wx_fold`/`wx_violates`
+//     the census uses, so a probe line and the census line can never disagree about one address.
+//   * CR0.WP / CR4.PGE / EFER.NXE. `PGE` decides the FLUSH: changing a parent entry invalidates a
+//     gigabyte of translations, and a CR3 reload does NOT evict global entries — so if the firmware
+//     left PGE set the split must toggle CR4.PGE, and if it left it clear a CR3 reload suffices and a
+//     toggle would newly ENABLE global pages (a semantic change, not a flush). Nothing in this tree
+//     has ever read PGE.
+//   * `__ehdr_start` + the runtime phdr walk. The kernel is a PIE with no linker script and has no
+//     image-bounds symbols at all; the split needs exact per-segment [start,end) + flags to mark
+//     .text RX and everything else NX. LLD synthesises `__ehdr_start` at the image base when — and
+//     only when — something references it, and the ELF header and phdrs are inside the first PT_LOAD,
+//     so the bootloader's segment copy carries them into RAM. This probe is that reference: if the
+//     line prints, `rust-lld` under this build's own flags emits the symbol and the mechanism is
+//     available to the split; `ok=` says the bytes at that address really are this kernel's ELF
+//     header, which is the difference between "the symbol linked" and "the phdrs are readable".
+//
+// SCOPE. Strictly READ-ONLY: reads of page-table memory, of three control registers, and of the
+// kernel's own ELF header. It writes NOTHING — no page-table entry, no control register, no MSR — so
+// it cannot perturb the very map it is measuring, and it is safe to leave on every boot. It runs from
+// `arch::init` immediately after `wx_audit_report`, i.e. after `syscall::init` armed EFER.NXE and
+// CR4.SMEP, so the control-register line describes the same enforcing kernel the census describes.
+// Ungated, exactly like WXAUDIT: a reconnaissance line that is absent from the capture you happen to
+// be holding is worth nothing, and the whole probe is eight lines and a few hundred reads.
+// =================================================================================================
+
+/// Global bit of a page-table entry. Named here rather than in the flag block above because nothing
+/// in this tree has ever written it — it is read here purely to see what the firmware chose.
+const PTE_GLOBAL: u64 = 1 << 8;
+
+// LLD synthesises `__ehdr_start` at the loaded image base for any ELF link that references it. This
+// declaration IS the reference — remove it and the symbol stops being emitted. It is deliberately a
+// plain (strong) extern: if this build's linker did not define it the link fails loudly at build
+// time, which is a better answer than a runtime `absent` nobody notices.
+unsafe extern "C" {
+    static __ehdr_start: u8;
+}
+
+/// One address's mapping, as the hardware sees it: the leaf entry, the level it terminated at, and
+/// the FOLDED `(user, writable, nx)` triple from the whole PML4→PDPT→PD→PT path. `None` if any level
+/// on the path is not present. Read-only — the probe twin of `translate`, which returns the physical
+/// address and throws the permissions away.
+fn wx_probe_leaf(va: u64) -> Option<(u64, u8, (bool, bool, bool))> {
+    unsafe {
+        let e4 = *cr3_table().add(pml4_index(va));
+        if e4 & PTE_PRESENT == 0 {
+            return None;
+        }
+        let acc4 = wx_fold(WX_TOP, e4);
+        let e3 = *((e4 & PTE_ADDR) as *const u64).add(pdpt_index(va));
+        if e3 & PTE_PRESENT == 0 {
+            return None;
+        }
+        let acc3 = wx_fold(acc4, e3);
+        if e3 & PTE_HUGE != 0 {
+            return Some((e3, 3, acc3));
+        }
+        let e2 = *((e3 & PTE_ADDR) as *const u64).add(pd_index(va));
+        if e2 & PTE_PRESENT == 0 {
+            return None;
+        }
+        let acc2 = wx_fold(acc3, e2);
+        if e2 & PTE_HUGE != 0 {
+            return Some((e2, 2, acc2));
+        }
+        let e1 = *((e2 & PTE_ADDR) as *const u64).add(pt_index(va));
+        if e1 & PTE_PRESENT == 0 {
+            return None;
+        }
+        Some((e1, 1, wx_fold(acc2, e1)))
+    }
+}
+
+/// Emit one `WXPROBE map:` line for `va`. `at` is the stable name a capture is grepped by; every
+/// field is present on every line (an unmapped address prints `lvl=none` and zeros) so an `awk`
+/// column index means the same thing on every row.
+fn wx_probe_addr(at: &str, va: u64, nxe: bool) {
+    match wx_probe_leaf(va) {
+        Some((e, level, acc)) => {
+            let pat = pat_bit_for_level(level);
+            serial_println!(
+                ":: WXPROBE map: at={} va=0x{:X} lvl={} e=0x{:016X} p={} w={} u={} nx={} g={} pat={} pcd={} pwt={} fw={} fx={} fu={} ::",
+                at,
+                va,
+                match level {
+                    3 => "1G",
+                    2 => "2M",
+                    _ => "4K",
+                },
+                e,
+                (e & PTE_PRESENT != 0) as u8,
+                (e & PTE_WRITABLE != 0) as u8,
+                (e & PTE_USER != 0) as u8,
+                (e & PTE_NX != 0) as u8,
+                (e & PTE_GLOBAL != 0) as u8,
+                (e & pat != 0) as u8,
+                (e & PTE_PCD != 0) as u8,
+                (e & PTE_PWT != 0) as u8,
+                acc.1 as u8,
+                // Executable as the HARDWARE decides it: NX only counts when EFER.NXE is armed —
+                // the same vacuity leg the census carries, applied to a single address.
+                (!(nxe && acc.2)) as u8,
+                acc.0 as u8,
+            );
+        }
+        None => serial_println!(
+            ":: WXPROBE map: at={} va=0x{:X} lvl=none e=0x0 p=0 w=0 u=0 nx=0 g=0 pat=0 pcd=0 pwt=0 fw=0 fx=0 fu=0 ::",
+            at,
+            va
+        ),
+    }
+}
+
+/// Read the kernel's own ELF header and `PT_LOAD` program headers through `__ehdr_start` and print
+/// them on one line. Bounded: at most `MAX_SEG` segments are named (this kernel links four), and the
+/// count of `PT_LOAD`s actually seen is printed so a truncated list is visible as such.
+///
+/// Segment vaddrs are LINK-time (`p_vaddr`); the runtime address of a segment is `ehdr + p_vaddr`,
+/// which is exact because the image's `min_vaddr` is 0 and UEFI's `allocate_pages` is 4 KiB-aligned,
+/// so page alignment survives the load. `ehdr` is on the same line, so no reader has to guess.
+fn wx_probe_elf() {
+    const MAX_SEG: usize = 4;
+    const PT_LOAD: u32 = 1;
+    let ehdr = &raw const __ehdr_start as u64;
+    // SAFETY: reads only, through a pointer the linker itself resolved to the loaded image base.
+    // Every field offset below is architectural ELF64. The magic/class/phentsize checks below are
+    // what make the phdr reads safe to perform at all — on any mismatch we print `ok=0` and stop.
+    let ok = unsafe {
+        let p = ehdr as *const u8;
+        core::ptr::read_unaligned(p.cast::<u32>()) == 0x464C_457F // "\x7fELF"
+            && *p.add(4) == 2 // ELFCLASS64
+            && core::ptr::read_unaligned(p.add(54).cast::<u16>()) == 56 // e_phentsize
+    };
+    if !ok {
+        serial_println!(":: WXPROBE elf: ehdr=0x{:X} ok=0 phnum=0 load=0 ::", ehdr);
+        return;
+    }
+    let (phoff, phnum) = unsafe {
+        let p = ehdr as *const u8;
+        (
+            core::ptr::read_unaligned(p.add(32).cast::<u64>()),
+            core::ptr::read_unaligned(p.add(56).cast::<u16>()) as usize,
+        )
+    };
+    let mut seg = [(0u64, 0u64, 0u32); MAX_SEG];
+    let mut loads = 0usize;
+    for i in 0..phnum.min(64) {
+        // SAFETY: `phoff`/`phnum` come from the header validated above; each phdr is 56 bytes inside
+        // the first PT_LOAD, which the bootloader copied into RAM along with the header. Reads only.
+        let (ptype, flags, vaddr, memsz) = unsafe {
+            let ph = (ehdr + phoff + (i as u64) * 56) as *const u8;
+            (
+                core::ptr::read_unaligned(ph.cast::<u32>()),
+                core::ptr::read_unaligned(ph.add(4).cast::<u32>()),
+                core::ptr::read_unaligned(ph.add(16).cast::<u64>()),
+                core::ptr::read_unaligned(ph.add(40).cast::<u64>()),
+            )
+        };
+        if ptype != PT_LOAD {
+            continue;
+        }
+        if loads < MAX_SEG {
+            seg[loads] = (vaddr, memsz, flags);
+        }
+        loads += 1;
+    }
+    // `p_flags`: bit 0 = X, bit 1 = W, bit 2 = R. Rendered as a fixed 3-char RWX field so the RX
+    // segment (the only one the split may leave executable) is greppable by shape.
+    let f = |x: u32| -> [u8; 3] {
+        [
+            if x & 4 != 0 { b'R' } else { b'-' },
+            if x & 2 != 0 { b'W' } else { b'-' },
+            if x & 1 != 0 { b'X' } else { b'-' },
+        ]
+    };
+    let s = |i: usize| -> (u64, u64, [u8; 3]) {
+        if i < loads.min(MAX_SEG) { (seg[i].0, seg[i].1, f(seg[i].2)) } else { (0, 0, *b"---") }
+    };
+    let (v0, m0, f0) = s(0);
+    let (v1, m1, f1) = s(1);
+    let (v2, m2, f2) = s(2);
+    let (v3, m3, f3) = s(3);
+    let t = |x: [u8; 3]| -> [char; 3] { [x[0] as char, x[1] as char, x[2] as char] };
+    let (f0, f1, f2, f3) = (t(f0), t(f1), t(f2), t(f3));
+    serial_println!(
+        ":: WXPROBE elf: ehdr=0x{:X} ok=1 phnum={} load={} s0=0x{:X}+0x{:X}/{}{}{} s1=0x{:X}+0x{:X}/{}{}{} s2=0x{:X}+0x{:X}/{}{}{} s3=0x{:X}+0x{:X}/{}{}{} ::",
+        ehdr, phnum, loads,
+        v0, m0, f0[0], f0[1], f0[2],
+        v1, m1, f1[0], f1[1], f1[2],
+        v2, m2, f2[0], f2[1], f2[2],
+        v3, m3, f3[0], f3[1], f3[2],
+    );
+}
+
+/// **The reconnaissance lines.** Eight of them, emitted from `arch::init` immediately after the
+/// WXAUDIT census so the map's aggregate and the specific addresses that shape the split sit
+/// together in one capture. Read-only throughout; see the section header for why each fact is here.
+pub fn wx_probe_report() {
+    use x86_64::registers::control::{Cr0, Cr4};
+    const IA32_EFER: u32 = 0xC000_0080;
+    let cr0 = Cr0::read_raw() as u64;
+    let cr4 = Cr4::read_raw() as u64;
+    // SAFETY: reading IA32_EFER is a pure ring-0 MSR read with no side effects.
+    let efer = unsafe { x86_64::registers::model_specific::Msr::new(IA32_EFER).read() };
+    let nxe = efer & (1 << 11) != 0;
+    serial_println!(
+        ":: WXPROBE cpu: cr0=0x{:016X} wp={} cr4=0x{:016X} pge={} smep={} smap={} la57={} efer=0x{:016X} nxe={} lme={} ::",
+        cr0,
+        ((cr0 >> 16) & 1) as u8,  // CR0.WP — what makes the firmware's own table pages read-only
+        cr4,
+        ((cr4 >> 7) & 1) as u8,   // CR4.PGE — decides PGE-toggle vs CR3-reload for the split's flush
+        ((cr4 >> 20) & 1) as u8,  // CR4.SMEP
+        ((cr4 >> 21) & 1) as u8,  // CR4.SMAP
+        ((cr4 >> 12) & 1) as u8,  // CR4.LA57 — the walkers are 4-level only
+        efer,
+        nxe as u8,
+        ((efer >> 8) & 1) as u8,  // EFER.LME
+    );
+    // The six addresses the split has to classify. `kimg`/`ktext` bracket the image (base vs a live
+    // .text address — a function pointer is the only .text address available without a linker
+    // symbol, and it cross-checks the phdr line's R-X segment). `ap8000` is the AP trampoline page,
+    // the one genuine execute-outside-the-image in the tree. `fb` is the panel, whose leaf carries
+    // the GR15 WC typing. `bss` stands in for the heap, which does not exist yet at `arch::init`
+    // (the heap is created ~60 lines later in `kernel_main`) — both are ordinary RAM and get the
+    // same blanket NX, so the .bss leaf answers the same question. `lapic` is the one MMIO aperture
+    // already live at this point: `apic::init()` ran three calls ago, and no `map_mmio_window`
+    // caller (SDHCI, iGPU, Kepler BARs) has run yet.
+    wx_probe_addr("kimg", &raw const __ehdr_start as u64, nxe);
+    wx_probe_addr("ktext", wx_probe_report as *const () as u64, nxe);
+    wx_probe_addr("ap8000", 0x8000, nxe);
+    // `try_lock`, not `lock`: this is a diagnostic and must not be able to wedge the boot. On x86
+    // `WRITER` is seeded from `BootInfo` in `kernel_main` before `unaos_kernel::init()`, so it is
+    // live here; a `base` of 0 would mean the firmware gave us no framebuffer.
+    let fb = crate::video::WRITER.try_lock().map(|w| w.base() as u64).unwrap_or(0);
+    wx_probe_addr("fb", fb, nxe);
+    wx_probe_addr("bss", &raw const SLOT_BACKING as *const u8 as u64, nxe);
+    wx_probe_addr("lapic", 0xFEE0_0000, nxe);
+    wx_probe_elf();
+}
+
+// =================================================================================================
 // VPERF-WC — write-combining for the framebuffer mapping (x86, memory-TYPE only; seat-signed scope).
 // -------------------------------------------------------------------------------------------------
 // The M3 cached-RAM shadow already turned all VRAM traffic into write-only sequential blits
