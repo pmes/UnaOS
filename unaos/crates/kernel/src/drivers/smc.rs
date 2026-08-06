@@ -77,7 +77,9 @@ pub enum SmcError {
     /// The key does not exist on this SMC (status settled to CMD_DONE with no DATA_READY). Clean.
     Absent,
     /// A status handshake did not settle inside the bounded budget. Traced STOP-NOTE; never forced.
-    /// The payload names the step (0 = command, 1 = key arg, 2 = length/lookup, 3 = data byte).
+    /// The payload names the step (0 = command, 1 = key arg, 2 = length/lookup, 3 = data byte,
+    /// 4 = pre-command residue drain — see `STEP_RESIDUE`; that one fails *before* the transaction
+    /// starts, and its `pre=` on the DIAG line is the residue that defeated the drain).
     Stuck(u8),
 }
 
@@ -267,17 +269,67 @@ fn wait_busy_clear(step: u8) -> Result<(), SmcError> {
 /// read shows neither bit set, the loop body never runs, and no data byte is read: byte-behaviour-
 /// identical (no port write, no extra data read). The deadline keeps it finite even if a wedged SMC
 /// never settled; the command's own step-0 wait remains the real guard past that.
-fn settle_before_command() {
+/// Step code for a pre-command residue drain that could not reach idle. Steps 0..=3 are the
+/// transaction's own handshakes; this one happens *before* the command byte is written.
+const STEP_RESIDUE: u8 = 4;
+
+/// Drain cap for the pre-command residue clear (s73 Boot S). A *legitimate* stale value can never
+/// exceed the largest buffer any caller passes — 32 bytes, the scout's — so 64 is 2x the maximum
+/// residue the protocol can produce and cannot truncate a real drain. What it does cut short is a
+/// data phase that will not terminate: the old loop drained for the full `SMC_WAIT_CYCLES`, which at
+/// the ~15 us pacing quantum is on the order of 6600 reads, and Boot S proves that did not clear it.
+/// Failing at 64 reads (~1 ms) instead of ~109 ms turns a silent, expensive loss into a fast,
+/// attributed one; nothing that used to succeed can stop succeeding.
+const MAX_RESIDUE_DRAIN: u32 = 64;
+
+fn settle_before_command() -> Result<(), SmcError> {
     let start = crate::arch::now_cycles();
-    while read_status() & (ST_DATA_READY | ST_BUSY) != 0 {
-        if read_status() & ST_DATA_READY != 0 {
+    let mut drained: u32 = 0;
+    loop {
+        let st = read_status();
+        // Idle is the whole test: the controller is ready for a command exactly when its low nibble
+        // is CMD_DONE. Anything else is residue — this generalizes the old `DATA_READY|BUSY` bit
+        // list and so also covers a lingering `NEW_CMD`/`ACK` (command-phase residue), which the old
+        // test could not see at all. Note the observed s73 residue is `DATA_READY|ACK`, i.e. inside
+        // the old mask already; the NEW_CMD arm is defence-in-depth, not the fix for that.
+        if st & ST_MASK == ST_CMD_DONE {
+            return Ok(());
+        }
+        if st & ST_DATA_READY != 0 && drained < MAX_RESIDUE_DRAIN {
             let _ = read_data(); // drain a stale value byte to unstick the previous transaction
+            drained += 1;
+        } else if drained >= MAX_RESIDUE_DRAIN {
+            return Err(residue_fail(st, drained)); // draining is not working; stop paying for it
         }
         if crate::arch::now_cycles().wrapping_sub(start) >= SMC_WAIT_CYCLES {
-            break; // bounded — never spin forever; step-0's NEW_CMD|ACK wait still guards
+            return Err(residue_fail(st, drained));
         }
         poll_pause();
     }
+}
+
+/// The residue clear gave up. **This used to `break` in silence** — the single most consequential
+/// line in this driver's history of quiet instruments. Boot S caught it: `pre=0x45` is
+/// `DATA_READY|ACK`, and `DATA_READY` was *already in the old loop's mask*, so the guard had seen
+/// the residue, drained against it for its full budget, failed, said nothing, and let the command go
+/// out anyway — after which step 0 timed out and the DIAG reported a `stuck step 0` whose real cause
+/// had happened 109 ms earlier and left no trace. A guard that can lose must be able to say so.
+fn residue_fail(status: u8, drained: u32) -> SmcError {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static NOTED: AtomicBool = AtomicBool::new(false);
+    RESIDUE_FAILS.fetch_add(1, Ordering::Relaxed);
+    // `pre=` on the DIAG line reports the residue that defeated the drain, not a status read after
+    // it — so a `Stuck(4)` names the condition that actually stopped the transaction.
+    LAST_PRE_CMD_STATUS.store(status, Ordering::Relaxed);
+    if !NOTED.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            ":: SMC-DIAG: STOP-NOTE residue drain lost — status {:#04x} (low nibble {:#03x}) still not CMD_DONE after {} drained bytes; command NOT issued into it (bounded, not forced, noted once) == evidence ::",
+            status,
+            status & ST_MASK,
+            drained
+        );
+    }
+    SmcError::Stuck(STEP_RESIDUE)
 }
 
 /// Read the value of a 4-character key into `out`, returning the number of bytes read (up to
@@ -376,28 +428,43 @@ fn note_step0_stall() {
     STEP0_STALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Step-0 stalls since boot (a command byte the SMC never acknowledged inside the budget).
-pub fn step0_stalls() -> u32 {
-    STEP0_STALLS.load(core::sync::atomic::Ordering::Relaxed)
+/// Pre-command residue drains that could not reach idle (`Stuck(STEP_RESIDUE)`).
+static RESIDUE_FAILS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// `(step-0 stalls, residue-drain failures)` since boot.
+///
+/// CENSUS PLACEMENT (s73 Boot S). These rode the retry-ROLLUP line when they were added — and that
+/// line fired **zero times in the entire s73 capture**, six boots and ~24 minutes of uptime. The
+/// rollup only prints when the witness did NOT, and it resets its own clock every time the witness
+/// fires; on this SMC the pack state flaps often enough that `fire` is true well inside the 300 s
+/// period, so the rollup is starved permanently. A counter on a line that never prints is exactly
+/// the disease this arc exists to treat, so the counts now ride the `SMC-BATT` witness itself.
+pub fn stall_counts() -> (u32, u32) {
+    use core::sync::atomic::Ordering;
+    (STEP0_STALLS.load(Ordering::Relaxed), RESIDUE_FAILS.load(Ordering::Relaxed))
 }
 
 fn read_key_inner(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
     // 0) settle any residue from a prior (interrupted) transaction so step-0 starts clean (M2
-    //    idle-guard). No-op on an idle SMC — byte-identical on QEMU.
-    settle_before_command();
+    //    idle-guard). No-op on an idle SMC — byte-identical on QEMU. Now FALLIBLE: if the residue
+    //    cannot be cleared, the command is not issued into it and the caller gets `Stuck(4)` naming
+    //    that, rather than a `Stuck(0)` 109 ms later that blames the wrong step.
+    settle_before_command()?;
 
     // 1) command byte -> expect NEW_CMD|ACK.
     //
-    // STEP0-PRE (s73 wedge, 2026-08-06): latch the status the instant BEFORE the command write.
-    // The first real wedge the resurrected DIAG caught reported `stuck step 0` with the status
-    // flat at `0x48` — `0x40` idle-high | `0x08` = `ST_NEW_CMD`, with `ST_ACK` (0x04) missing, i.e.
-    // the controller had latched a command and never acknowledged it. That single byte does not say
-    // WHOSE command: it is equally consistent with
-    //   (a) we started clean and the SMC stalled on the command we just wrote, and
-    //   (b) `ST_NEW_CMD` was already asserted — residue from a prior incomplete transaction that
-    //       `settle_before_command` cannot see, because it only tests DATA_READY|BUSY.
-    // The two want opposite fixes, so the driver records the discriminator instead of guessing:
-    // `pre=` on the DIAG line reads `0x40` under (a) and `0x48` under (b).
+    // STEP0-PRE (s73, 2026-08-06): latch the status the instant BEFORE the command write. The
+    // discriminator was added to decide whether a `stuck step 0` meant the SMC stalled on OUR
+    // command (`pre` idle) or we wrote into residue (`pre` not idle). **Boot S answered it, and
+    // neither of the two predicted values came back**: `pre=0x45` = idle-high | `ST_ACK` |
+    // `ST_DATA_READY`, low nibble `0x05`.
+    //
+    // `ST_DATA_READY` was ALREADY in the old settle loop's mask. Since `pre` is sampled *after*
+    // `settle_before_command`, that byte proves the guard ran, drained against the residue for its
+    // entire budget, failed to reach idle, and exited through a silent `break` — then the command
+    // went out into a controller still mid-data-phase and step 0 timed out 109 ms later. The `0x48`
+    // the DIAG timeline shows is the *consequence* (our command latching `NEW_CMD` over the mess),
+    // not the cause. The cause is upstream and now returns `Stuck(STEP_RESIDUE)` instead of nothing.
     LAST_PRE_CMD_STATUS.store(read_status(), core::sync::atomic::Ordering::Relaxed);
     write_cmd(CMD_READ);
     if let Err(e) = wait_status(ST_AFTER_CMD, 0) {
@@ -519,7 +586,7 @@ pub fn present() -> bool {
 fn read_key_by_index(index: u32, name: &mut [u8; 4]) -> Result<(), SmcError> {
     let _guard = TXN.lock();
     // 0) settle any residue from a prior transaction (M2 idle-guard; no-op on an idle SMC).
-    settle_before_command();
+    settle_before_command()?;
 
     write_cmd(CMD_GET_KEY_BY_INDEX);
     wait_status(ST_AFTER_CMD, 0)?;
@@ -1255,6 +1322,7 @@ pub mod battery {
         // Under the `bootlog` feature (`UNAOS_BOOTLOG=1`, the boot-log-on-screen sitting mode) the
         // old full ~1 s cadence is restored unchanged, so a sitting can still watch discharge track.
         let (rsweep, rtotal) = retry_counts();
+        let (stall0, resid) = super::stall_counts();
         let mut w = WITNESSED.lock();
         let mut last = LAST_STATE.lock();
         // QUIET-AC: the state key must carry the SETTLED ac shape, never the instantaneous one. On
@@ -1325,7 +1393,11 @@ pub mod battery {
                 (None, false, d) => alloc::format!("derived:{}", d.as_str()),
             };
             serial_println!(
-                ":: SMC-BATT: present={} soc={}% volt={}mV amp={}mA full={}mAh rem={}mAh ac={} retries={}/{} == witness ::",
+                // `stall0=` / `resid=` are the step-0 and residue-drain census (see
+                // `super::stall_counts`) — they ride HERE, not the rollup, because the rollup line
+                // has never once fired on this machine. They are cumulative since boot: flat across
+                // a boot means the wedge was a blip, climbing means it is standing.
+                ":: SMC-BATT: present={} soc={}% volt={}mV amp={}mA full={}mAh rem={}mAh ac={} retries={}/{} stall0={} resid={} == witness ::",
                 s.present,
                 fu(s.soc_pct),
                 fu(s.volt_mv),
@@ -1335,6 +1407,8 @@ pub mod battery {
                 ac,
                 rsweep,
                 rtotal,
+                stall0,
+                resid,
             );
         }
 
@@ -1366,11 +1440,12 @@ pub mod battery {
                 // standing; one early stall and a flat count thereafter means transient — the
                 // distinction the one-shot DIAG structurally cannot draw.
                 serial_println!(
-                    ":: SMC-BATT: retry rollup — {} retries in the last {} ms (total {}, step0-stalls {}) == rollup ::",
+                    ":: SMC-BATT: retry rollup — {} retries in the last {} ms (total {}, stall0 {}, resid {}) == rollup ::",
                     unseen,
                     window,
                     rtotal,
-                    super::step0_stalls()
+                    stall0,
+                    resid
                 );
             }
         }

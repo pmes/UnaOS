@@ -753,3 +753,122 @@ corrupting the transaction — bounded, and the intended trade.
    different key wedging is a *confirmation*, not a new finding.
 4. Everything else unchanged: `probed=19 found=17`, `B0Pr` and `AC-W` absent `(x2)`, no `ac=stuck`,
    no mass-absence STOP-NOTE, `present=true` with volt tracking ~12.8 V.
+
+## Boot S: the discriminator answered, and it indicted the guard (s73, 2026-08-06)
+
+```
+:: SMC-DIAG: FIRST FAILURE key B0AV kind stuck step 0 t=3499ms pre=0x45 —
+   raw status timeline [48 48 …] (16 reads, ~15us apart) == evidence ::
+```
+
+### `pre=0x45` — bit 0 is `ST_DATA_READY`
+
+| Bit | Name | Set? |
+|---|---|---|
+| `0x40` | idle-high | yes |
+| `0x08` | `ST_NEW_CMD` | no |
+| `0x04` | `ST_ACK` | **yes** |
+| `0x02` | `ST_BUSY` | no |
+| `0x01` | **`ST_DATA_READY`** | **yes** |
+
+Low nibble `0x05` = `DATA_READY|ACK`. **Neither predicted value came back**, and the one that did
+overturns the diagnosis rather than confirming a branch of it.
+
+The previous section predicted `pre=0x48` would mean "command-phase residue the guard is blind to,
+because `settle_before_command` tests only `DATA_READY|BUSY`". But `pre=0x45` is `DATA_READY` — which
+was **already in that mask**. And `pre` is sampled *after* `settle_before_command` runs. So:
+
+> The guard was not blind. It saw the residue, drained against it for its entire ~109 ms budget,
+> failed to reach idle, exited through a silent `break`, and let the command go out anyway.
+
+Step 0 then timed out 109 ms later and the DIAG reported `stuck step 0` — blaming the step that
+*inherited* the problem. The `0x48` in the timeline is the consequence (our command latching
+`NEW_CMD` over an unfinished data phase), not the cause. **The cause is a residue clear that could
+lose without saying so** — the same quiet-instrument disease this whole arc has been treating, this
+time inside the very function written as GAP-2's defence-in-depth.
+
+Note the drain was not lazy: at the ~15 µs pacing quantum, 109 ms is on the order of **6600 data
+reads**, and `DATA_READY` still did not clear. More draining is not the answer.
+
+### Two of my own claims are retracted
+
+* **"Transient" is withdrawn.** `B0AV kind stuck step 0` is now **3 for 3** — Boots R, R2 and S.
+* **"The key identity is incidental" is falsified.** It is *positional*. `B0AV` is the key
+  immediately after `BRSC` in the sweep, and `BRSC` reads **`len=1` in all six boots** in the
+  capture while its true value is two bytes (`soc=100%` requires `[00 64]`). A short read leaves the
+  remainder of the value undrained with `DATA_READY` still asserted — which is precisely the
+  residue the next key's settle inherits. That next key is always `B0AV`.
+
+That is the **GAP 1 → GAP 2 chain, alive**, and now deterministic rather than intermittent: the
+truncation is the root cause, the residue is the mechanism, and `B0AV` is just the address it is
+delivered to. My prediction that "a different key wedging is a confirmation, not a new finding" had
+it backwards — the *same* key every time is the finding.
+
+One correction to the brief that prompted this: the three stalls are **not** all in the takeover
+window. Boots R and S fired at `t≈3.5 s`, but **Boot R2 fired at `t=10882 ms`**, long after the
+compositor was up. So the key correlation is 3/3 and the takeover-window correlation is only 2/3 —
+which further favours the positional mechanism over the LPC-contention one. The takeover hypothesis
+is not dead (it may govern *when* a truncation turns into a stall) but it is no longer the leading
+explanation, and nothing in this arc depends on it.
+
+### The fix: the guard may still lose, but it can no longer lose quietly
+
+`settle_before_command()` now returns `Result<(), SmcError>`:
+
+* **Idle is the test.** Ready means low nibble `== ST_CMD_DONE`. This generalizes the old
+  `DATA_READY|BUSY` bit list and so *also* covers a lingering `NEW_CMD`/`ACK`, which the old test
+  could not see. (The observed residue is `DATA_READY|ACK`, inside the old mask; the `NEW_CMD` arm
+  is defence-in-depth, not the fix for what was measured.)
+* **Bounded by bytes as well as time.** `MAX_RESIDUE_DRAIN = 64` is 2× the largest buffer any caller
+  passes (the scout's 32), so it **cannot truncate a legitimate drain** — the protocol cannot produce
+  more residue than one maximum-length value. What it cuts short is a non-terminating data phase:
+  ~1 ms to fail instead of ~109 ms. Nothing that used to succeed can stop succeeding.
+* **Loud.** A one-shot `:: SMC-DIAG: STOP-NOTE residue drain lost — status 0xNN … after N drained
+  bytes; command NOT issued into it ==` names the condition, with the byte and the drain count.
+* **Attributed.** It returns `Stuck(4)` (`STEP_RESIDUE`, a new step code documented on `SmcError`)
+  and stores the offending status so the DIAG's `pre=` reports *the residue that defeated the drain*.
+  A `Stuck(0)` will now mean what it says.
+* **The command is not issued into residue.** Per-attempt cost drops from ~218 ms (109 drain +
+  109 step-0) to ~1 ms, so a wedged key's three attempts cost ~3 ms instead of ~0.65 s. That also
+  shortens the worst-case sweep that review finding 1 identified as the interleave enabler.
+
+Not weakened: no protection is skipped, no wait is forced, the retry budget is unchanged, and the
+outcome for a genuinely wedged key is the same honest hole — reached faster and correctly labelled.
+
+### The census was itself mute — fixed
+
+`step0-stalls` was added last commit to the **retry-rollup** line. That line has fired **zero times
+in the entire s73 capture** — six boots, ~24 minutes of uptime. The rollup only prints when the
+witness did *not*, and it resets its own clock whenever the witness fires; on this SMC the pack state
+flaps often enough that `fire` lands well inside the 300 s period, starving the rollup permanently.
+
+A counter on a line that never prints is the exact disease this arc exists to treat, and I put one
+there. The counts now ride the `SMC-BATT` witness itself:
+
+```
+… ac=derived:idle retries=6/8 stall0=1 resid=1 == witness ::
+```
+
+Both are cumulative since boot. **Flat across a boot ⇒ blip; climbing ⇒ standing.** That is the
+transient-vs-standing question the one-shot DIAG structurally cannot answer, now on a line that
+actually prints.
+
+### Metal prediction (next `UNAOS_SMC=1` boot)
+
+1. `:: SMC-DIAG: STOP-NOTE residue drain lost — status 0x45 …` appears, **once**, around
+   `t≈3.5 s` — the same event Boot S recorded, now named at its true cause and ~109 ms cheaper.
+2. The boot's `FIRST FAILURE` becomes `key B0AV kind stuck step 4 pre=0x45` (residue), **not**
+   `step 0`. If it still reads `step 0` with `pre` idle (`0x40`), the residue theory is wrong and the
+   SMC really is stalling on our command — a clean falsifier either way.
+3. `stall0=` and `resid=` appear on every `SMC-BATT` witness line. Expect `resid` to climb by ~1 per
+   affected sweep and `stall0` to stay **low or flat**, since the command is no longer issued into
+   residue. `stall0` climbing alongside `resid` would mean step-0 stalls have a second, independent
+   cause.
+4. `B0AV` still holes on the affected sweep and still recovers (≈12.8 V within a sweep or two); the
+   fix is to the driver's honesty and cost, **not** a claim that the truncation is repaired.
+5. Everything else unchanged: `probed=19 found=17`, `AC-W`/`B0Pr` absent `(x2)`, no `ac=stuck`, no
+   mass-absence STOP-NOTE.
+
+**The open root cause remains GAP 1** — `BRSC` truncating to `len=1`, six boots for six. Repairing
+the value drain is a separate arc with its own evidence; this one stops the driver lying about which
+step failed, and stops it paying 218 ms to do so.
