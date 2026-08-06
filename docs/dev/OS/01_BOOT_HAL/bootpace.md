@@ -1346,3 +1346,45 @@ the resurrected SMC FIRST FAILURE fired on a REAL wedge on its first outing (`B0
 step 0`, status timeline 0x48 — a fault the AC-W false alarm used to bury), and KBDWIT reports
 the known-intermittent s58 keyboard silence (`NO-COMPLETIONS quiet=9017ms` — armed, never
 completing; standing issue, predates this sweep).
+
+**Correction (2026-08-06) — that second finding is not a finding.** The KBDWIT line above was read
+as an s58 recurrence. It is not one, and the same capture refutes it. In that same Boot R, on that
+same arming, with no re-arm and no `STOP-NOTE` between them, the keyboard delivered its first key at
+`[215418ms] EHCI-HID: KEY: 'l'` and 96 reports by `[276587ms]`. The dump had fired at `[11125ms]`.
+
+The corpus generalizes it. Across every capture carrying this witness — `rmbp-gr13`,
+`rmbp-s62-probe`, `rmbp-s66-cand444`, `rmbp-gr15-s70`, `rmbp-gr16-s73`, 23 boots — **every** kbd dump
+reads `reports=0`, and ten of those boots typed fine afterwards. The deadline is `KBDWIT_QUIET_MS`
+(4 s) after arming, i.e. 4.7–26 s into a boot; nobody types that fast. A boot-protocol keyboard NAKs
+indefinitely until a key is pressed, so `reports=0` at that deadline was measuring the absence of a
+typist and printing it in the grammar of a fault. The instrument's own section comment predicted
+this exactly ("IT CANNOT SEPARATE, at this deadline, an idle keyboard from the s58 recurrence") and
+the prediction came true against its own author's boot report.
+
+Boot R2 (the next boot in the same capture, dump at `[11156ms]`) is the control: it ran to
+`159290 ms` with **zero** `EHCI-HID: KEY` lines and the same `reports=0`. Nobody typed; nothing was
+reported.
+
+The registers were never in doubt in either boot, and none of them convict anything:
+`usbsts=0x00006000 hch=0 hse=0 pss=1 rs=1 pse=1`, `tok active=1 halted=0 xact=0 babble=0 dbuf=0
+missed=0 cerr=3 rem=10`, `adv=0x1a33`/`0x1b3b`. `cerr=3` un-burned means no transaction ever failed.
+Two readings that did look like findings are answered in the driver's KBDWIT section comment:
+`qtd_tok=0x00000000 qtd_driven=0` is the instrument declaring the standalone qTD **out of the
+transfer** on the overlay-direct path, not a missing write-back; and `horiz=0x00000001` on IN3 is the
+end of an intact chain (`fl0` → IN1 → IN3 → terminate), not a broken link.
+
+**Disposition: the instrument was fixed, the driver was not touched.** KBDWIT-2 adds `sched=` /
+`polls=` / `walks=` / `split_or=` to line 1 and a latched `SILENCE-BROKE` line at the first
+completion after a dump. `walks` counts service passes on which the controller's own split-progress
+words (`overlay[4]`/`overlay[5]` — C-prog-mask and FrameTag/S-bytes, EHCI 1.0 §3.5.4, words this
+driver never writes) moved, which answers "is the host side transacting against this QH?" **without
+a keypress**. Boot R and R2 already carry that answer in a single sample — `ovl5=0x00000017` vs
+`0x00000018`, a different FrameTag at the same QH position — so both boots were `WALKED` all along;
+`sched=` only makes the driver say so instead of leaving it to a reader with the spec open. Bounded
+at one extra line per endpoint per boot; read-only; no transfer-path write.
+
+s58 itself remains **open and unconvicted** — no capture in this corpus is an s58 boot, so nothing
+here refutes the original observation. What is closed is the false alarm: from now on
+`sched=WALKED reports=0` with no keypress is the baseline, and the recurrence signature is
+`sched=WALKED` + keys pressed + **no** `SILENCE-BROKE` (device/TT/toggle, host side excluded) or
+`sched=NOT-WALKED` (host side, convicted with no keypress needed).

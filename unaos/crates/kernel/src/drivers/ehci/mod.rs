@@ -147,6 +147,44 @@ struct IntEp {
     /// controller) on the arming path, of a register in the BAR that path is already driving.
     #[cfg(feature = "kbdwit")]
     kbdwit_armed_frindex: Option<u32>,
+    /// KBDWIT-2 — service passes that found this endpoint's qTD still ACTIVE. The denominator for
+    /// [`IntEp::kbdwit_walks`]; a poll count, not a time.
+    #[cfg(feature = "kbdwit")]
+    kbdwit_polls: u32,
+    /// KBDWIT-2 — of those passes, the ones on which the CONTROLLER's split-progress words moved.
+    ///
+    /// This is the term the s58 question actually turns on and the one the original dump could not
+    /// supply. `overlay[4]`/`overlay[5]` are qTD buffer pointers 1 and 2, which for a split
+    /// transaction carry C-prog-mask and FrameTag/S-bytes (EHCI 1.0 §3.5.4) — words only the host
+    /// controller writes, and only while it is executing start-/complete-splits against THIS queue
+    /// head. Sampling them once says nothing (any value could be residue); sampling them every poll
+    /// and counting the CHANGES separates the two states the deadline dump conflates:
+    ///
+    ///   * `walks > 0` — the controller is traversing to this QH and transacting on the wire every
+    ///     few frames. An endpoint with `reports=0` and `walks>0` is being polled and answered with
+    ///     NAK: the host side is doing its job and the silence is device-side or stimulus-side.
+    ///   * `walks == 0` over thousands of polls — the controller never touches this QH. Orphaned
+    ///     from the frame list, unreachable through the TT, or a schedule that is not traversing
+    ///     it. THAT is a host-side fault and it convicts without needing anyone to press a key.
+    ///
+    /// Aliasing cannot manufacture a false `walks=0`: FrameTag is the frame number's low bits at
+    /// each start-split and C-prog-mask advances within a frame, so a stationary pair across a
+    /// multi-second window of ~1 kHz polls is not a sampling artefact. It can slightly under-count
+    /// (two polls inside one frame see one change), which costs precision on the ratio and never
+    /// the zero/non-zero verdict this exists for.
+    #[cfg(feature = "kbdwit")]
+    kbdwit_walks: u32,
+    /// KBDWIT-2 — the previous poll's `(overlay[4], overlay[5])`, packed, for the change test.
+    #[cfg(feature = "kbdwit")]
+    kbdwit_split_prev: u64,
+    /// KBDWIT-2 — OR of every split-progress word pair observed. Prints the bits the controller
+    /// actually set, so `walks=0` can be read against "and it never set a single progress bit
+    /// either" rather than against a change count alone.
+    #[cfg(feature = "kbdwit")]
+    kbdwit_split_or: u64,
+    /// KBDWIT-2 — the `SILENCE-BROKE` one-shot. At most one such line per endpoint per boot.
+    #[cfg(feature = "kbdwit")]
+    kbdwit_broke: bool,
     /// MT-INVESTIGATION (IVY, `mtraw` only): bytes ONE armed transfer may accept — `mps` for every
     /// endpoint except the vendor-multitouch one, which is armed for the whole (grown) receive
     /// buffer so the controller accumulates a >MPS raw frame into it. See `arm_interrupt_ep`.
@@ -1727,6 +1765,25 @@ impl Controller {
             kbdwit_fired: false,
             #[cfg(feature = "kbdwit")]
             kbdwit_armed_frindex: kbdwit_fr0,
+            // KBDWIT-2: the split-progress accumulators start clean. `kbdwit_split_prev` is seeded
+            // with the pair the driver leaves behind — `overlay[4] = 0` on the overlay-direct path
+            // above, and on qtd-chain the controller loads zeros out of `write_qtd`'s buffer array
+            // — so the FIRST controller write already registers as a change rather than being
+            // swallowed by an uninitialized baseline. `overlay[5]` is deliberately included in that
+            // seed even though this driver never writes it: on overlay-direct it can hold residue
+            // from an earlier completed transfer on this QH, and seeding from the live word means a
+            // stale value is the baseline, not a phantom "walk".
+            #[cfg(feature = "kbdwit")]
+            kbdwit_polls: 0,
+            #[cfg(feature = "kbdwit")]
+            kbdwit_walks: 0,
+            #[cfg(feature = "kbdwit")]
+            kbdwit_split_prev: ((core::ptr::read_volatile(&(*qh).overlay[4]) as u64) << 32)
+                | core::ptr::read_volatile(&(*qh).overlay[5]) as u64,
+            #[cfg(feature = "kbdwit")]
+            kbdwit_split_or: 0,
+            #[cfg(feature = "kbdwit")]
+            kbdwit_broke: false,
             #[cfg(feature = "mtraw")]
             rx_total,
             #[cfg(feature = "mtraw_inject")]
@@ -1769,6 +1826,22 @@ impl Controller {
                 core::ptr::read_volatile(&(*e.qtd).token)
             };
             if tok & QTD_ACTIVE != 0 {
+                // KBDWIT-2: is the CONTROLLER actually walking to this queue head? Two volatile
+                // reads of words only it writes (split progress — see `IntEp::kbdwit_walks`),
+                // compared against the previous poll. This runs on every pass, before and after the
+                // deadline dump, because the dump's `sched=` verdict and the `SILENCE-BROKE` line's
+                // rate both read it. Read-only: nothing here writes a controller-visible word.
+                #[cfg(feature = "kbdwit")]
+                {
+                    let split = ((core::ptr::read_volatile(&(*e.qh).overlay[4]) as u64) << 32)
+                        | core::ptr::read_volatile(&(*e.qh).overlay[5]) as u64;
+                    e.kbdwit_polls = e.kbdwit_polls.saturating_add(1);
+                    e.kbdwit_split_or |= split;
+                    if split != e.kbdwit_split_prev {
+                        e.kbdwit_walks = e.kbdwit_walks.saturating_add(1);
+                        e.kbdwit_split_prev = split;
+                    }
+                }
                 // KBDWIT: still armed, nothing came back this pass — the only state from which the
                 // s58 silence is observable. The probe self-bounds (one dump per endpoint per boot)
                 // and returns after a single bool test once it has fired or before its deadline.
@@ -1781,7 +1854,43 @@ impl Controller {
             // can influence whether this endpoint counts as alive.
             #[cfg(feature = "kbdwit")]
             {
-                e.kbdwit_last_ms = crate::arch::ms();
+                let now = crate::arch::ms();
+                // KBDWIT-2 — `SILENCE-BROKE`: the second sample the original instrument's own
+                // section comment named as missing ("Convicting those would need a second,
+                // keypress-triggered sample, which this arc does not build"). This is it, and it is
+                // triggered by the stimulus rather than by a clock, so it lands exactly when the
+                // evidence exists instead of seconds into a boot nobody has touched yet.
+                //
+                // Fires only for an endpoint the deadline dump already declared silent, so a
+                // healthy chatty endpoint never prints it. One line, latched: at most one per
+                // endpoint per boot, on top of the deadline dump's seven.
+                //
+                // What it settles. The rmbp-gr16-s73 capture has nine boots, every one of them
+                // ending `class=never-completed reports=0` on the keyboard — and in boot 9 that
+                // SAME endpoint, on that SAME arming, with no re-arm and no STOP-NOTE, delivered
+                // its first key at 215418 ms and 96 reports by 276587 ms. The deadline dump had
+                // fired at 11125 ms. Nine boots of "NO-COMPLETIONS" and the one boot anybody typed
+                // in worked: the dump was measuring the absence of a typist. This line is what
+                // turns that from an archaeology exercise into a printed fact.
+                if e.kbdwit_fired && !e.kbdwit_broke {
+                    e.kbdwit_broke = true;
+                    let chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
+                    serial_println!(
+                        ":: KBDWIT: [{}] ep=IN{} addr={} SILENCE-BROKE armed_ms={} now_ms={} quiet_ms={} polls={} walks={} split_or={:#018x} reports={} toggle={} == witness ::",
+                        idx,
+                        (chars >> 8) & 0xF,
+                        chars & 0x7F,
+                        e.kbdwit_armed_ms,
+                        now,
+                        now.wrapping_sub(e.kbdwit_armed_ms),
+                        e.kbdwit_polls,
+                        e.kbdwit_walks,
+                        e.kbdwit_split_or,
+                        e.reports,
+                        e.toggle as u8,
+                    );
+                }
+                e.kbdwit_last_ms = now;
             }
             if tok & QTD_ERR_MASK != 0 {
                 serial_println!(
@@ -2036,15 +2145,92 @@ impl Controller {
 //     A clean dump is therefore NOT an acquittal of that class; it is silence about it. Convicting
 //     those would need a second, keypress-triggered sample, which this arc does not build.
 //
+// ── KBDWIT-2 (2026-08-06): THE PREDICTED FALSE ALARM ARRIVED, AND THE SECOND SAMPLE IS NOW BUILT ─
+//
+// The paragraph above predicted its own misreading, and the misreading duly happened. GR16 read
+// `rmbp-gr16-s73` boot 9 —
+//
+//   [ 11125ms] :: KBDWIT: [1] ep=IN3 addr=6 kind=kbd NO-COMPLETIONS class=never-completed
+//              quiet=9017ms armed_ms=1740 last_ms=0 now_ms=10757 reports=0 toggle=0 dead=0
+//
+// — as an s58 recurrence on the wire. It is not. In THAT SAME BOOT, on THAT SAME ARMING, with no
+// re-arm and no STOP-NOTE anywhere between them, the same endpoint delivered:
+//
+//   [215418ms] EHCI-HID: KEY: 'l' (scancode 0xf)
+//   [276587ms] :: EHCI-HID: [1] kbd 96 reports, last 00 00 .. == witness ::
+//
+// Across the whole capture corpus that carries this witness (gr13, s62-probe, s66-cand444,
+// gr15-s70, gr16-s73 — 23 boots) EVERY kbd dump reads `reports=0`, and ten of those boots later
+// typed fine. The deadline is 4.7-26 s into a boot; nobody types that fast. The instrument was
+// measuring the absence of a typist and printing it in the grammar of a fault.
+//
+// So the fix is the instrument, not the driver — nothing in the EHCI path is convicted by any of
+// this, and nothing in it is changed. Two additions, both read-only:
+//
+//   1. `sched=WALKED|NOT-WALKED|UNSAMPLED` with `polls=`/`walks=`/`split_or=` on line 1. The
+//      controller writes C-prog-mask and FrameTag/S-bytes into the QH overlay every time it
+//      executes a split against this endpoint; sampling that pair on every service pass and
+//      counting the changes answers "is the host side doing its job?" WITHOUT a keypress. It
+//      decides the half of the question that was always decidable and was never asked. See
+//      `IntEp::kbdwit_walks` for why aliasing cannot fake a zero.
+//   2. `SILENCE-BROKE`, the keypress-triggered second sample this comment said it did not build.
+//      One latched line at the first completion after a dump, carrying the elapsed silence and the
+//      poll/walk rate that spanned it.
+//
+// TWO READINGS OF THAT DUMP THAT LOOK LIKE FINDINGS AND ARE NOT. Both were put to this arc from
+// the R2 boot ([11156ms], the same capture, one boot later), so they are written down here rather
+// than re-litigated:
+//
+//   * `qtd_tok=0x00000000 qtd_driven=0` is NOT "the overlay never wrote back to the linked qTD",
+//     and it does not implicate the qTD list pointer or the horizontal linkage. `qtd_driven=0` is
+//     this instrument saying the standalone qTD IS NOT IN THE TRANSFER AT ALL: on the
+//     overlay-direct path — which is what `path=overlay-direct` on the line above declares, and
+//     what this metal settles into after the qTD-fetch HSE — `arm_interrupt_ep` writes the QH
+//     overlay in place and the controller is never handed a qTD address. `ovl0=0x00000001` is
+//     PTR_TERMINATE, set deliberately, and `cur=0x00000000` follows from it. The zero word is
+//     untouched pool memory; there is no write-back owed and none missing. This is exactly the
+//     reading `qtd_driven=` was added to prevent, and it still caught a reader, which is the
+//     argument for the flag rather than against it.
+//   * `horiz=0x00000001` on IN3 is not a broken chain either. IN3 armed first and took the old
+//     frame-list head (T-bit) as its `horiz`; IN1 armed second, prepended, and its
+//     `horiz=0x7b479242` points AT the IN3 queue head. `fl0=0x7b479302` is IN1. The chain is
+//     fl0 -> IN1 -> IN3 -> terminate, entire and in one direction.
+//
+// AND THE POSITIVE EVIDENCE THAT SETTLES IT WITHOUT A NEW BOOT. `ovl4=0x00000004 ovl5=0x00000017`
+// in boot 9, `ovl4=0x00000004 ovl5=0x00000018` in R2 — the SAME QH position, a different FrameTag.
+// Nothing in this driver writes `overlay[5]` on any path and the pool is zeroed, so those bits are
+// the host controller's own, written while it executed a start-split against this endpoint. Both
+// boots therefore already say WALKED; `sched=` only makes the driver say it out loud instead of
+// leaving it to a reader with the EHCI spec open. And R2 corroborates the stimulus reading from the
+// other side: it ran to 159290 ms with zero `EHCI-HID: KEY` lines. Nobody typed, and the endpoint
+// reported nothing. There is no third thing that needs explaining.
+//
+// WHAT EACH OUTCOME MEANS, on the next attended boot:
+//   * dump `sched=WALKED reports=0`, then `SILENCE-BROKE` on the first key — healthy. This is the
+//     baseline, and it is what every boot in the corpus above would have printed.
+//   * dump `sched=WALKED reports=0`, keys pressed, NO `SILENCE-BROKE` — the s58 recurrence, with
+//     the host side positively excluded: the controller is transacting and the device is not
+//     answering (or its answer is being discarded). Device-side, TT, or toggle. That is a real
+//     conviction and it is new.
+//   * dump `sched=NOT-WALKED` — the controller never reached the QH. Host-side, convicted on the
+//     spot, no keypress needed. Read line 5's `fl0`/`horiz` and line 6's `pse`/`pss` next.
+//   * `SILENCE-BROKE` with a large `quiet_ms` and no keypress at that instant — the endpoint
+//     completed something unprompted (a keep-alive, a resumed stream); the silence was never a
+//     fault at all.
+//
 // WHY PER-ENDPOINT, NOT PER-CONTROLLER. During the failure the trackpad is streaming on the SAME
 // controller, so any controller-level "is anything completing?" test reads HEALTHY on the exact
 // boot that motivated this instrument. The silence clock lives on `IntEp` and is stamped only by
 // that endpoint's own completions.
 //
 // BOUNDS. `kbdwit_fired` latches on the first dump: at most one dump per endpoint per boot, at
-// most `MAX_INT_EPS` (4) per controller for a whole boot. No loop, no retry, no wait, no
-// allocation, no register write — every access below is a read. Cost on the service path is one
-// bool test plus one `ms()` read before the deadline, and one bool test after it fires. Note the
+// most `MAX_INT_EPS` (4) per controller for a whole boot. `kbdwit_broke` latches the same way, so
+// KBDWIT-2 adds at most one further line per endpoint per boot — eight lines, once, per endpoint,
+// for the entire boot. No loop, no retry, no wait, no allocation, no register write — every access
+// below is a read. Cost on the service path is one bool test plus one `ms()` read before the
+// deadline, and one bool test after it fires; KBDWIT-2's sampler adds two volatile reads of
+// already-mapped DRAM plus a compare per endpoint per pass, on the ~1 kHz poll, and its counters
+// saturate rather than wrap. Note the
 // path this rides is `service()`, the POST-boot main-loop poll — NOT the `init()` bring-up block
 // the EPACE ledger measures and this seat just trimmed 6324 ms -> 2010 ms — so the deadline
 // cannot land inside that budget at all.
@@ -2229,10 +2415,34 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     // "never completed". Unreachable here — enumeration alone is ~1.8 s in before an endpoint can
     // complete anything — but `class=` PRINTS the sentinel as a verdict where `since` only branches
     // on it, so it is written down rather than left implicit.
+    //
+    // KBDWIT-2 adds `sched=`, and it is the field that makes this line answer something. `class=`
+    // reports what the DEVICE has delivered, which for a boot keyboard nobody has typed on is
+    // "nothing" on a perfectly healthy rig — the ambiguity the section comment above admits it
+    // cannot resolve. `sched=` reports what the CONTROLLER has been doing to this queue head, from
+    // words only the controller writes (`IntEp::kbdwit_walks`), and that half is decidable here:
+    //
+    //   sched=WALKED     the controller reached this QH and transacted against it on `walks` of
+    //                    `polls` passes. With `reports=0` this reads "polled and NAKed" — the host
+    //                    side is working and the silence is the device's or the operator's. It is
+    //                    the acquittal the deadline could never previously give.
+    //   sched=NOT-WALKED thousands of polls and the controller never touched the QH's split
+    //                    progress. A host-side fault, convicted without anyone pressing a key.
+    //
+    // There is deliberately NO third arm for "not sampled yet". The obvious safety valve — a
+    // `polls == 0` case, so a missing measurement could never masquerade as a conviction — was
+    // written, and a `strings` pass over the built rlib showed the compiler had deleted it: the
+    // sampler runs on the SAME service pass, immediately above the call to this probe, so
+    // `polls >= 1` holds by construction at every reachable entry (and `saturating_add` means it
+    // can never return to zero). A branch that cannot print is a branch a reader will one day trust
+    // as coverage, so it is gone rather than left as decoration. `polls=` is on the line regardless,
+    // which is what actually guards against reading a small sample as a verdict.
     serial_println!(
-        ":: KBDWIT: [{}] ep=IN{} addr={} kind={} NO-COMPLETIONS class={} quiet={}ms armed_ms={} last_ms={} now_ms={} reports={} toggle={} dead={} == witness ::",
+        ":: KBDWIT: [{}] ep=IN{} addr={} kind={} NO-COMPLETIONS class={} sched={} polls={} walks={} split_or={:#018x} quiet={}ms armed_ms={} last_ms={} now_ms={} reports={} toggle={} dead={} == witness ::",
         idx, epn, addr, kind,
         if e.kbdwit_last_ms == 0 { "never-completed" } else { "went-quiet" },
+        if e.kbdwit_walks > 0 { "WALKED" } else { "NOT-WALKED" },
+        e.kbdwit_polls, e.kbdwit_walks, e.kbdwit_split_or,
         now.wrapping_sub(since),
         e.kbdwit_armed_ms, e.kbdwit_last_ms, now,
         e.reports, e.toggle as u8, e.dead as u8,
