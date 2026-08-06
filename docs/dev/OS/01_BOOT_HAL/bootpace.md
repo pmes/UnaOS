@@ -952,6 +952,13 @@ reproducible), and the block decomposes exactly: four `[wc-g]` glass-verify pass
 2873/2876/2861/2878 ms (11.49 s), `[wc-d]` verifies 2321+497 ms (2.82 s), the `kdisp: fb-draw hold`
 loop 1.12 s (whose per-"second" tick measures 225 ms — its delay constant is ~4.4× fast; kepler
 lane, reported), and ~1.4 s of real bring-up — 16.8 of the 17.3 s span accounted, the remainder
-sub-100 ms lines. Fixture fix verified on the same wire: the canned anchor lives for exactly one
+sub-100 ms lines. *Corrected (GR17, `serial-analyzer --wcg`, same capture):* the "remainder" is not
+noise — the same 229 kepler/kdisp lines that cost 159 ms total (0.69 ms/line) on the witness-off
+boots cost 1438 ms (6.28 ms/line) on the armed boot, a distributed per-print tax that begins at
+`[wc-x] console-route first-paint` and is invisible to any top-gaps view because no single gap is
+large. Armed-boot bring-up is therefore ~1.35 s real + ~1.29 s print tax, and the tax mechanism
+(witness-build serial synchrony vs console-window present cost) is unattributed — it is the third
+instrument-cost term beside wc-g (11.5 s) and wc-d (2.8 s), and it caps what any wc-g-only reshape
+can recover. Fixture fix verified on the same wire: the canned anchor lives for exactly one
 line (`[15:30:45Z] … sets clock => PASS` → `[519ms] canned anchor cleared`). The wc-g pass is the
 single redesign target: ~2.87 s per pass, four passes, every witness-armed boot.
