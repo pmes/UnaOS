@@ -962,3 +962,55 @@ instrument-cost term beside wc-g (11.5 s) and wc-d (2.8 s), and it caps what any
 can recover. Fixture fix verified on the same wire: the canned anchor lives for exactly one
 line (`[15:30:45Z] … sets clock => PASS` → `[519ms] canned anchor cleared`). The wc-g pass is the
 single redesign target: ~2.87 s per pass, four passes, every witness-armed boot.
+
+## §10h — GR17: the pass decomposed on the wire, and every term attacked (2026-08-06)
+
+**Boot P (witness+logts, `370fa1e0`, kernel `e717e4c4…`) profiled the pass per phase and
+confirmed the GR17 cost model to a fraction of a percent.** Per win=1 pass, measured vs
+predicted: `readback_us=2832894–2837864` vs 2 834 000; `cks_blit_us/civac_us/cks_after_us`
+each 5 738–5 744 µs vs 5 700; `surf_bytes=3862528` and `probes=965632` exact; per-probe
+2.939 µs vs 2.935. **The glass read-back is 98.7 % of the pass**, and its cost is the latency
+of single-byte volatile reads from the WC-mapped Kepler BAR over PCIe: ~976 ns/byte, three
+byte reads per probed pixel. `kepler=17077ms(n=1)` — consistent with 17129/17138 (the prof
+lines' own serial is ~13 ms/pass, stated cost). Analyzer: `serial-analyzer --wcg`, boot 6.
+
+**The §10g per-print tax is convicted and fixed.** It was `wcg::on_present`'s budget gate: a
+global `any()` over eight window slots, of which this bench occupies three — five never-spendable
+slots held the gate permanently open, so every routed console line paid a full-surface 3.86 MB
+byte-at-a-time FNV. Arithmetic closes to 2.6 %: 4 cycles/byte × 3 862 528 B ÷ 2.693 GHz =
+5.74 ms/line predicted vs 5.59 ms/line measured (the residual 0.69 ms is the banded compose both
+builds pay). Onset at `console-route first-paint` because that is the first present a routed line
+reaches. The UART-drain hypothesis was falsified from the capture (23 220 B emitted within one
+civil second — a synchronous 115200 link caps at 11 520 B/s). Fix: the budget closes per window
+(`f7421a20`); no witness weakened — `begin` is the checksum's only reader and already refuses a
+spent id.
+
+**Every term of the 17.1 s witness-armed kepler block now has a landed fix** (all metal-pending
+until Boot Q):
+
+| term | was | fix | predicted |
+|---|---|---|---|
+| wc-g read-back ×4 | 11.5 s | bulk u64 glass reads (1 transaction/probe, not 3) + paygo battery: lattice pass 1 (`coverage=lattice16` on the wire), full passes 2–4 deferred past 15 s since entry | ~0.06 s in-window |
+| wc-d verify | 2.84 s | `read_pixel` widened to one aligned volatile u32 (`3c05856d`), same probes, same decisions | ~0.95 s |
+| per-print tax | ~1.29 s | per-window `on_present` budget (`f7421a20`) | ~0 |
+| real bring-up | 1.35 s | untouched | 1.35 s |
+
+**Boot Q flew the same day (witness+logts+`UNAOS_WCG_PAYGO`, `f7421a20`, kernel `aee612a7…`)
+and the predictions held: `kepler=2564ms` (predicted 2.3–2.6 s), from 17 077 ms — 6.7×.**
+Whole boot `gui=6242ms` witness-armed, from 20 727. Per term (analyzer boot 7): wc-g in-window
+128 ms (the 60 ms prediction was 2× optimistic — the lattice pass costs 126 ms with its
+checksums and serial, stated rather than absorbed); wc-d 1010 ms (predicted ~950 — the
+`read_pixel` widening measured 2.8×); bring-up 1360 ms vs the witness-off 1352 ms — **the
+per-print tax is gone to within 8 ms**. The wire behaved exactly as designed: pass 1 per
+window `coverage=lattice16` (`fbbad=0/60352` for the console window — 1/16 of 965 632, said
+out loud), deferral opened at `since_entry_ms=15453` `clock=entry`, `deferred=` ran as a
+census (`emit=2 deferred=264` on the console window mid-wait), win=3 completed its battery
+`-> PAID`, and every verdict stayed CLEAN — no COHER/RACE/BLIT anywhere in the boot.
+
+The remaining terms above a ~2 s `kepler=`: wc-d's full verify (1.01 s; its own lattice/defer
+treatment in wm.rs is the next lever) and 1.36 s of real bring-up. Witness in-window cost is
+now ~1.15 s against 15.7 s before GR17 — 13.7× — with full coverage still arriving via the
+deferred passes. Deferral honesty is spec-shaped: a lattice line carries `coverage=`,
+`deferred=` is a running census (`emit=` ordinal, `since_entry_ms=` / `clock=unarmed` guard),
+and no x86 spec yet reads any `[wc-g]` line — the pi4 gate is the only automated reader, a
+coverage gap recorded here deliberately.
