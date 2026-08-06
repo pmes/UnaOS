@@ -742,6 +742,56 @@ launch_aarch64() {
         ${UNAOS_QEMU_EXTRA:-}
 }
 
+# ── FAULT-SCAN: the harness's ONE fault-pattern list ────────────────────────────────────────────
+# THE list. Every serial-log verdict in this script reads it — the `test` / `test-fat` / `test-arm`
+# legs below and battery's `_step` — so a pattern added here arms every gate at once and there is no
+# second, drifting copy to keep in sync. mbench.py carries the same idea as DEFAULT_FORBIDS (`-> FAIL`,
+# `FAIL ::`, `PANIC`) for the spec-replay path; this is its shell twin for the legs that run no spec.
+#
+# WHY IT EXISTS. `./arroyo test` used to print the serial log and exit 0 UNCONDITIONALLY. Artifacted on
+# a W^X falsification run: an injected defect PANICKED the boot, the log said `=== KERNEL PANIC ===`,
+# and the harness still exited 0 — the fault was only found because a human read the log. An exit
+# status that cannot go red is not a gate. The spec-runner side got this treatment at ad8b52aa
+# ("the abort is not a pass"); these legs did not, because they never scanned anything at all.
+#
+# The patterns, and why each one:
+#   -> FAIL          the project's PASS/FAIL verdict idiom (`:: NAME: … -> FAIL ::`).
+#   FAIL ::          the other spelling of the same verdict.
+#   FAIL —           FATIMG-CI: the WINX end-to-end verdicts spell failure `:: WINX-2: … FAIL — <why> ::`,
+#                    which matched NEITHER of the two above. The em-dash keeps it narrow enough not to
+#                    fire on prose that merely contains the word FAIL. This ALSO reconciles the
+#                    x86-fat.spec S5 note ("the S5 FAIL text evades arroyo's detector", seat fold
+#                    2026-07-11): the STOR-1 `— witness OK ::` family (S4-mf2 / S4-race / S5 / S6-witness
+#                    / S7-openany / S8-write / S9-grow) spells its failure `:: S6-witness FAIL — … ::`,
+#                    so it is caught HERE now. The spec's per-witness FORBIDs stay as they are — they
+#                    name the individual witness in the verdict table, which this scan does not.
+#   PANIC            `main.rs`'s `#[panic_handler]` prints `=== KERNEL PANIC ===` as its first line, on
+#                    both arches, through the raw lock-free serial path (so it reaches the wire even
+#                    when the dying core held the UART mutex). Bare, uppercase, matching mbench's
+#                    default set. No kernel print literal contains the word otherwise — verified.
+#   panicked at      the Rust `PanicInfo` Display line that FOLLOWS the banner and carries the source
+#                    location. Listed separately on purpose: it is what still names the fault if the
+#                    banner is ever lost to a truncated write, and it is the line the scan quotes.
+#   EXCEPTION:       any CPL-0 / EL1 fault diagnostic — x86 `EXCEPTION: PAGE FAULT` / `GENERAL PROTECTION
+#                    FAULT` / `DOUBLE FAULT` / `MACHINE CHECK`, and aarch64 `=== AARCH64 EXCEPTION: … ===`
+#                    (the substring covers both). Already the standing FORBID in rmbp-boot.spec,
+#                    round6-rmbp.spec and x86-fat.spec, so this only extends it to the specless legs.
+#                    Ring-3 / EL0 intentional faults do NOT print it — they print `:: RING-3 FAULT: …
+#                    KILLED — …` and `:: EL0 FAULT: … KILLED — …`, which this list deliberately does not
+#                    match: U1b's fault-isolation demo kills three tasks on every clean x86 boot.
+FAULT_PATTERNS='-> FAIL|FAIL ::|FAIL — |PANIC|panicked at |EXCEPTION:'
+
+# Scan a serial capture against FAULT_PATTERNS. Prints every offending line with its line number and
+# returns 1 if any matched, 0 on a clean log. awk, not grep: control bytes in the serial logs break grep.
+scan_serial_faults() { # $1 = log file, $2 = label used in the quoted lines
+    local logf="$1" lbl="${2:-serial}"
+    [ -f "$logf" ] || return 0
+    awk -v p="$FAULT_PATTERNS" -v lbl="$lbl" '
+        $0 ~ p { n++; if (n <= 20) printf("  ✖ %s:%d: %s\n", lbl, FNR, $0) }
+        END { if (n > 20) printf("  ✖ … and %d more matching line(s)\n", n - 20); exit (n ? 1 : 0) }
+    ' "$logf"
+}
+
 # Headless aarch64 run: serial -> target/serial-arm.log, self-terminates after N secs.
 test_aarch64() {
     local secs="${1:-20}"
@@ -771,6 +821,17 @@ test_aarch64() {
     echo -e "${COLOR_PURPLE}════════════ SERIAL LOG (${logf}) ════════════${COLOR_RESET}"
     cat "$logf" 2>/dev/null || echo -e "${COLOR_RED}(no serial log produced)${COLOR_RESET}"
     echo -e "${COLOR_PURPLE}═══════════════════════════════════════════════════${COLOR_RESET}"
+
+    # FAULT-SCAN: this leg's EXIT STATUS now says what the log says (see FAULT_PATTERNS above).
+    if [ ! -s "$logf" ]; then
+        echo -e "${COLOR_RED}✖ test-arm: no serial bytes captured at ${logf} — QEMU produced nothing."
+        echo -e "  This run carries NO verdict: not a pass, not a regression. Exit 4.${COLOR_RESET}"
+        return 4
+    fi
+    if ! scan_serial_faults "$logf" "serial-arm.log"; then
+        echo -e "${COLOR_RED}❌ aarch64 test FAILED — the serial log carries fault text (lines above). Log at ${logf}${COLOR_RESET}"
+        return 1
+    fi
     echo -e "${COLOR_GREEN}✅ aarch64 test complete. Log at ${logf}${COLOR_RESET}"
 }
 
@@ -818,6 +879,18 @@ test_x86_64() {
     echo -e "${COLOR_PURPLE}════════════ SERIAL LOG (${SERIAL_LOG}) ════════════${COLOR_RESET}"
     cat "$SERIAL_LOG" 2>/dev/null || echo -e "${COLOR_RED}(no serial log produced)${COLOR_RESET}"
     echo -e "${COLOR_PURPLE}═══════════════════════════════════════════════════${COLOR_RESET}"
+
+    # FAULT-SCAN: this leg's EXIT STATUS now says what the log says (see FAULT_PATTERNS above).
+    # `test-fat` ends by calling this function, so it inherits the same verdict.
+    if [ ! -s "$SERIAL_LOG" ]; then
+        echo -e "${COLOR_RED}✖ test: no serial bytes captured at ${SERIAL_LOG} — QEMU produced nothing."
+        echo -e "  This run carries NO verdict: not a pass, not a regression. Exit 4.${COLOR_RESET}"
+        return 4
+    fi
+    if ! scan_serial_faults "$SERIAL_LOG" "serial.log"; then
+        echo -e "${COLOR_RED}❌ x86_64 test FAILED — the serial log carries fault text (lines above). Log at ${SERIAL_LOG}${COLOR_RESET}"
+        return 1
+    fi
     echo -e "${COLOR_GREEN}✅ Test run complete. Full log saved at ${SERIAL_LOG}${COLOR_RESET}"
 }
 
@@ -2315,12 +2388,16 @@ show_menu() {
 # 2026-07-11 alone): under battery load the best-effort console intermittently drops ONE
 # verdict line — always with ZERO explicit FAIL lines. On exactly that signature, re-run the
 # FAT chain once in isolation and let the appended re-run's verdicts stand; a log carrying any
-# real "-> FAIL"/"FAIL ::" line keeps its red (no retry). All output flows through _step's
-# capture, so the pattern + FAIL scans below see the COMBINED log (the PASS-line tally in the
-# summary inflates on a retry day — informational only, the retry announcement line explains).
+# FAULT_PATTERNS line keeps its red (no retry). All output flows through _step's
+# capture, so the pattern + FAULT_PATTERNS scans below see the COMBINED log (the PASS-line tally in
+# the summary inflates on a retry day — informational only, the retry announcement line explains).
+#
+# FAULT-SCAN: the retry gate reads THE shared list, not its own two-pattern copy. It has to: once
+# `test-fat` fails on its own fault scan, a PANIC would otherwise reach here, find no `-> FAIL` line,
+# be diagnosed as the console drop, and buy a spurious 200 s re-run of a boot already known to be dead.
 test_fat_drop_retry() { # $1 = the logfile _step is capturing (READ here, written via stdout)
     if "$0" test-fat sf 300; then return 0; fi
-    if ! awk 'BEGIN{f=0} /-> FAIL|FAIL ::/{f=1} END{exit f}' "$1"; then return 1; fi
+    if ! awk -v p="$FAULT_PATTERNS" 'BEGIN{f=0} $0 ~ p {f=1} END{exit f}' "$1"; then return 1; fi
     echo "battery: test-fat missed its verdict with ZERO FAIL lines — the ledgered console drop; ONE isolated re-run"
     UNAOS_FATIMG=sf "$0" test 200
 }
@@ -2329,9 +2406,18 @@ battery() {
     local t0=$SECONDS rc=0 results=""
     local blog_dir="target/battery"; mkdir -p "$blog_dir"
 
-    _step() { # name, expected-pattern (empty = rc only), logfile[:verdictfile], cmd...
+    _step() { # [--build] name, expected-pattern (empty = rc only), logfile[:verdictfile], cmd...
         # kernel8-test doesn't echo its serial log to stdout, so a step may name a separate
         # verdict file (logfile:verdictfile) — patterns are checked there instead.
+        #
+        # FAULT-SCAN `--build`: this step's verdict file is COMPILER OUTPUT, not a serial capture, so
+        # the fault scan below is skipped for it. FAULT_PATTERNS is a list of things a KERNEL says on
+        # the wire; a rustc diagnostic that happens to quote one of the source lines that PRINTS them
+        # (`serial_println!("EXCEPTION: PAGE FAULT")` and friends are real, greppable source text) would
+        # otherwise red a perfectly good build. These steps already carry the verdict that matters —
+        # their command's own exit status, which `check` and `esp-jetson` set correctly.
+        local faultscan=1
+        if [ "$1" = "--build" ]; then faultscan=0; shift; fi
         local name="$1" pattern="$2" logf="${3%%:*}" vf="${3#*:}"; shift 3
         echo -e "${COLOR_CYAN}⚡ battery: ${name}${COLOR_RESET}"
         if "$@" > "$logf" 2>&1; then local crc=0; else local crc=$?; fi
@@ -2340,13 +2426,13 @@ battery() {
         if [ -n "$pattern" ]; then
             awk -v p="$pattern" 'BEGIN{f=1} $0 ~ p {f=0} END{exit f}' "$vf" || ok=0
         fi
-        # Any explicit FAIL verdict line in a serial-backed step is a failure.
-        # FATIMG-CI: `FAIL —` is in the list because the WINX end-to-end verdicts spell their failure
-        # `:: WINX-2: ... FAIL — <reason> ::`, which matched NEITHER `-> FAIL` nor `FAIL ::`. Those are
-        # exactly the verdicts that carry the shipped `bg /fat/STAT.ELF` / `bg /fat/VUG.ELF` path, so a
-        # red one used to pass straight through this scan. The em-dash keeps the pattern narrow enough
-        # not to fire on prose that merely contains the word.
-        awk 'BEGIN{f=0} /-> FAIL|FAIL ::|FAIL — /{f=1} END{exit f}' "$vf" || ok=0
+        # Any fault line in a serial-backed step is a failure. FAULT-SCAN: the pattern set lives in the
+        # single FAULT_PATTERNS list (see above the test legs) — this scan used to carry its own copy of
+        # the three FAIL spellings and knew nothing about PANIC or EXCEPTION:, which is the same blind
+        # spot that let a panicked boot exit 0 from `./arroyo test`.
+        if [ "$faultscan" -eq 1 ]; then
+            awk -v p="$FAULT_PATTERNS" 'BEGIN{f=0} $0 ~ p {f=1} END{exit f}' "$vf" || ok=0
+        fi
         if [ "$ok" -eq 1 ]; then
             results="${results}  ✅ ${name}\n"
         else
@@ -2354,8 +2440,8 @@ battery() {
         fi
     }
 
-    _step "check (both arches)"        ""                    "$blog_dir/check.log"        "$0" check
-    _step "check (tegra)"              ""                    "$blog_dir/check-tegra.log"  env UNAOS_TEGRA=1 "$0" check
+    _step --build "check (both arches)"  ""                  "$blog_dir/check.log"        "$0" check
+    _step --build "check (tegra)"        ""                  "$blog_dir/check-tegra.log"  env UNAOS_TEGRA=1 "$0" check
     _step "x86 test 25 (MISSION)"      "MISSION SUCCESS"     "$blog_dir/test-x86.log"     "$0" test 25
     _step "x86 test-fat sf 300"        "U11m2.*-> PASS"      "$blog_dir/test-fat.log"     test_fat_drop_retry "$blog_dir/test-fat.log"
     _step "arm virt v2 (MISSION)"      "MISSION SUCCESS"     "$blog_dir/test-arm-v2.log"  "$0" test-arm 22
@@ -2398,7 +2484,7 @@ battery() {
     if awk 'BEGIN{f=1} /MBENCH TRUNCATED/{f=0} END{exit f}' "$blog_dir/kernel8.log" 2>/dev/null; then
         results="${results}       ↳ TRUNCATED (INCONCLUSIVE): the pi boot was CUT SHORT, not regressed — re-run before bisecting (${blog_dir}/kernel8.log)\n"
     fi
-    _step "esp-jetson (links)"         ""                    "$blog_dir/esp-jetson.log"   env UNAOS_TEGRA=1 "$0" esp-jetson
+    _step --build "esp-jetson (links)"   ""                  "$blog_dir/esp-jetson.log"   env UNAOS_TEGRA=1 "$0" esp-jetson
 
     local passes; passes=$(awk '/-> PASS|: PASS/{n++} END{print n+0}' "$blog_dir/test-fat.log" target/serial-pi.log 2>/dev/null || echo '?')
     echo -e "\n${COLOR_PURPLE}════════════ BATTERY SUMMARY ($(( SECONDS - t0 ))s) ════════════${COLOR_RESET}"
