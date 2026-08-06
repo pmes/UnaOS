@@ -1,54 +1,33 @@
-# WHITE BOARD — 2026-08-06 (GR17, mid-arc)
+# WHITE BOARD — 2026-08-06 (GR17)
 
-**Peter's sheet.** What I need from you, right now. Nothing else goes here —
-cross-session handoff lives in the baton, per-boot status in `~/unaos-bench/PLAYBOOK-x86.md`.
-
----
-
-# OPEN — one push owed, two lane decisions
-
-**1. PUSH OWED** — one batched push covers the whole arc so far (5 commits, `370fa1e0..b935aff8`;
-origin is at `59b37373`):
-
-```
-git push origin UnaOS-gemini
-```
-
-An adversarial review of the M3 commit is still running; if it forces a fix commit, the same
-push covers it — I'll update this line if the tip moves.
-
-**2. DECISION — `read_pixel` pays a gratuitous 3× (shared-core `video/framebuffer.rs`).**
-It issues three u8 PCIe reads where one u32 fetches all four bytes. One-expression change,
-zero coverage change; takes wc-d 2.84 s → ~0.95 s and speeds every future glass read.
-Shared kernel-core file, so it is not mine to touch mid-round. Whose lane, and when?
-
-**3. DECISION — the witness-boot per-print tax (~1.29 s, mechanism unattributed).**
-Same 229 bring-up lines: 0.69 ms/line witness-off, 6.28 ms/line witness-armed, starting at
-`[wc-x] console-route first-paint`. Likely fbcon/serial territory, not `wcg.rs`. Assign it
-(here or Gemini or later arc) or park it — it caps any wc-g-only reshape at ~5.8 s kepler.
+Two questions. Each carries only the background needed to answer it.
 
 ---
 
-# STATE — two boots staged, bench armed, card is yours
+## 1. `read_pixel` wastes 2 of every 3 PCIe reads — who lands the fix?
 
-- **Boot P (profiling)**: staged at `flash/gr17-prof/`, kernel `e717e4c4…`, strings-verified.
-  Decomposes each 2.87 s wc-g pass into four phases on the wire. Blocked only on media.
-- **Boot Q (pay-as-you-go verify)**: staged after the review verdict on M3 — knobs
-  `…WITNESS,LOGTS,WCG_PAYGO`; builder plumbing landed so the knob actually reaches media.
-- Card carries GR16's witness-ms build (`172a0e07…`) — Boot P needs a new write (on card-in,
-  serviced that wake). Waker + media watch armed and verified live; squawk on s73.
+`video/framebuffer.rs::read_pixel` fetches a pixel as three separate `read_volatile::<u8>`
+calls. On cacheable RAM that's free; on the Kepler BAR (WC-mapped, uncached reads) each u8
+read is its own non-posted PCIe transaction at ~976 ns. One `read_volatile::<u32>` fetches
+all four bytes in one transaction — same bytes, same decode, alpha masked as today, coverage
+identical.
 
-# WHAT LANDED THIS SESSION — 5 commits, two findings that move the target
+- Effect: wc-d's verify drops 2.84 s → ~0.95 s per witness boot. Every future glass read
+  gains the same 3×. (wc-g no longer cares — its own in-lane bulk path already landed.)
+- It is shared kernel-core: the Pi framebuffer is cacheable, so behaviorally neutral there,
+  but wc-d lines are matched by the pi4 gate — values shouldn't change, key order untouched.
+- The question: me now (out-of-lane sanction), the integrator at merge, or Gemini?
 
-- `370fa1e0` wc-g per-phase profiling (`[wc-g] prof`, `wit_us=` ledger)
-- `0a0570cd` analyzer `--wcg` — witness cost decomposed per instrument, selftests green,
-  reproduces §10g's numbers bit-identically from the s73 capture
-- `0d26303d` §10g correction (below)
-- `7551773b` M3 pay-as-you-go reshape (bulk u64 glass reads; `UNAOS_WCG_PAYGO`: lattice pass 1
-  + deferred full passes 2–4; x86-gated; under adversarial review)
-- `b935aff8` builder knob plumbing
+## 2. Witness builds pay ~6 ms per kernel print once the console routes — investigate now, or park?
 
-Findings: **98.7 % of each wc-g pass is the glass read-back** (glass byte ≈ 976 ns, pinned
-non-circularly via wc-d; full cost model with falsifiable Boot-P predictions in
-`~/unaos-bench/scratch/gr17-cost-model.md`). And §10g's "remainder" was real: the **per-print
-tax** in Open item 3.
+Measured on the existing s73 capture (no new boot needed to confirm it exists — only to
+explain it): the same 229 bring-up lines cost 159 ms total witness-off vs 1438 ms
+witness-armed. 0.69 vs 6.28 ms/line, starting exactly at `[wc-x] console-route first-paint`.
+
+- 6.28 ms/line is what a ~70-byte line costs if something drains the UART synchronously;
+  0.69 ms/line says witness-off prints don't wait. So the suspect is witness-build serial
+  synchrony, or each print paying a console-window present — mechanism unconfirmed either
+  way, and the code that decides it (fbcon/serial) is outside `wcg.rs`.
+- Why it's worth your call: after the wc-g reshape this tax is the second-largest witness
+  cost left (~1.29 s of the kepler block).
+- The question: assign it (me, Gemini, next arc) or park it until Boots P and Q have flown?
