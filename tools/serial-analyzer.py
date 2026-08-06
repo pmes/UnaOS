@@ -2,6 +2,8 @@
 import sys
 import re
 import argparse
+import contextlib
+import io
 
 def strip_control_bytes(text):
     # Strip \x00-\x1F except \n, \r, \t
@@ -478,7 +480,25 @@ def wcg_group(body):
 PAYGO_RE = re.compile(
     r'^\[(wc-g|wc-d)\] paygo win=(\d+) state=(\w+) emit=(\d+) lattice_n=(\d+) deferred=(\d+) '
     r'defer_ms=(\d+) since_entry_ms=(\d+) clock=(\w+) taken=(\d+) budget=(\d+) -> (\w+)\b')
-WCD_VERIFY_RE = re.compile(r'^\[wc-d\] verify win=(\d+)\b')
+# ANCHORED TO A REAL TERMINAL, and this was a defect rather than a tightening. The first cut
+# was `^\[wc-d\] verify win=(\d+)\b`, which matches EVERY wc-d line including its five SKIP
+# arms, and that broke the census in two directions at once:
+#
+#   * an ABORTED verdict counted as a pass. `-> SKIP (teardown)` carries a `coverage=` marker
+#     (it is emitted from the same field list), so a teardown abort at full coverage was
+#     counted in the `full` column -- and `full > 0` is exactly what the honesty check reads
+#     to decide a window got its deferred pass. An abort could therefore SATISFY the WARN it
+#     should have triggered: the window's coverage was never bought, and the check said it was;
+#   * the three GEOMETRY/OOM skips (`-> SKIP (degenerate row/geometry)`, `(no visible content
+#     rect)`, `(no memory for NxN source snapshot)`) are short lines carrying no `coverage=`
+#     at all, so each one inflated the `unmarked` column -- which is meant to mean "a pass that
+#     did not say what it covered", not "a pass that never happened".
+#
+# A verdict is now a line that ADJUDICATED: PASS, FAIL, or LIVE. SKIPs are counted apart, in
+# their own column, because "the verify declined to run" is a third thing and folding it into
+# either of the other two is how the check above went quietly wrong.
+WCD_VERIFY_RE = re.compile(r'^\[wc-d\] verify win=(\d+)\b.*-> (?:PASS|FAIL|LIVE)\b')
+WCD_SKIP_RE = re.compile(r'^\[wc-d\] verify win=(\d+)\b.*-> SKIP \(([a-z][a-z /]*)')
 # `coverage=` is an INSERTION on a sample line. Absent on any build without the knob, which
 # is a different thing from `coverage=full` and is counted apart: an unmarked pass says
 # nothing about what it covered.
@@ -504,6 +524,7 @@ def paygo_stats(chunk, tag='wc-g'):
         return wins.setdefault(wid, {
             'id': wid, 'lattice': 0, 'full': 0, 'unmarked': 0, 'lattice_n': None,
             'paygo': [], 'first_ms': None, 'last_ms': None, 'samples': 0,
+            'skips': 0, 'skip_reasons': {},
         })
 
     any_paygo = False
@@ -528,6 +549,17 @@ def paygo_stats(chunk, tag='wc-g'):
             })
             defer_ms = int(m.group(7))
             continue
+        if tag == 'wc-d':
+            m = WCD_SKIP_RE.match(body)
+            if m:
+                # A declined verify is neither a pass nor a coverage statement. Counted here
+                # and nowhere else -- see the note on WCD_VERIFY_RE for what folding it into
+                # the pass columns did to the honesty check.
+                w = win(m.group(1))
+                w['skips'] += 1
+                reason = m.group(2).strip()
+                w['skip_reasons'][reason] = w['skip_reasons'].get(reason, 0) + 1
+                continue
         m = sample_re.match(body)
         if not m:
             continue
@@ -556,6 +588,17 @@ def paygo_stats(chunk, tag='wc-g'):
         w['peak_emit'] = peak['emit'] if peak else 0
         paid = [p for p in w['paygo'] if p['verdict'] == 'PAID']
         w['paid'] = bool(paid)
+        # THE `UNPAID` VOCABULARY COLLISION, reconciled. This tool used "UNPAID" from the start
+        # for a statement about the CAPTURE -- a window still spending its budget when the log
+        # ended. The kernel then took the same word for a VERDICT: `wcd_seal` emits
+        # `[wc-d] paygo … state=sealed … -> UNPAID` when a window's teardown-abort budget is
+        # spent, meaning the battery closed and the coverage was never bought. Those are
+        # opposite in severity -- one is "not finished yet", the other is "will never finish"
+        # -- so printing one word for both would be the worst kind of wrong: plausible.
+        # The kernel's verdict wins the capital letters. The capture statement is reworded to
+        # "open" below, and the two can no longer be confused in a table or in a grep.
+        w['sealed'] = [p for p in w['paygo']
+                       if p['state'] == 'sealed' or p['verdict'] == 'UNPAID']
         w['taken'] = paid[0]['taken'] if paid else (
             max((p['taken'] for p in w['paygo']), default=0))
         w['budget'] = w['paygo'][0]['budget'] if w['paygo'] else 0
@@ -565,8 +608,13 @@ def paygo_stats(chunk, tag='wc-g'):
         # before the horizon was never owed a deferred pass, and a window that got one is
         # covered however long it ran.
         h = w['horizon']
-        w['warn'] = (h is not None and w['last_ms'] is not None
-                     and w['last_ms'] >= h and w['full'] == 0)
+        w['starved'] = (h is not None and w['last_ms'] is not None
+                        and w['last_ms'] >= h and w['full'] == 0)
+        # A SEALED window warns unconditionally, with no timing test. `-> UNPAID` is the
+        # kernel's own statement that this battery closed without buying its coverage, which
+        # is the WARN's exact subject arriving as a verdict rather than as an inference -- and
+        # it can be reached EARLY, before the horizon, where the timing test would miss it.
+        w['warn'] = w['starved'] or bool(w['sealed'])
 
     return {'wins': [wins[k] for k in sorted(wins, key=int)], 'defer_ms': defer_ms}
 
@@ -585,41 +633,77 @@ def print_paygo_stats(pg, tag='wc-g'):
     print(f"    horizon is {pg['defer_ms']}ms since entry, which on a paygo boot falls well "
           f"after the kepler")
     print("    window closes — see the note in the source)")
-    print(f"    {'win':>4} {unit:>9} {'lattice':>8} {'full':>6} {'unmarked':>9} "
+    skipcol = ' ' + f"{'skips':>6}" if tag == 'wc-d' else ''
+    print(f"    {'win':>4} {unit:>9} {'lattice':>8} {'full':>6} {'unmarked':>9}{skipcol} "
           f"{'deferred':>9} {'emit':>5} {'taken/budget':>13} {'clock':>8}  status")
     for w in pg['wins']:
-        status = 'PAID' if w['paid'] else (
-            'UNPAID at capture end' if w['paygo'] else 'no paygo line')
+        # Precedence: the kernel's own verdict outranks anything this tool infers.
+        if w['sealed']:
+            status = 'SEALED -> UNPAID (kernel verdict)'
+        elif w['paid']:
+            status = 'PAID'
+        elif w['paygo']:
+            status = 'open at capture end'
+        else:
+            status = 'no paygo line'
+        skips = ' ' + f"{w['skips']:>6}" if tag == 'wc-d' else ''
         print(f"    {w['id']:>4} {w['samples']:>8} {w['lattice']:>8} {w['full']:>6} "
-              f"{w['unmarked']:>9} {w['deferred']:>9} {w['peak_emit']:>5} "
+              f"{w['unmarked']:>9}{skips} {w['deferred']:>9} {w['peak_emit']:>5} "
               f"{str(w['taken']) + '/' + str(w['budget']):>13} "
               f"{','.join(w['clocks']) or '--':>8}  {status}")
     print("    deferred = the census beside the GREATEST emit=, never the column sum "
           "(it is a running total).")
-    print("    UNPAID is a statement about the CAPTURE, not the kernel: a window still "
-          "presenting when the")
-    print("      log ends is spending its budget as it earns it, which is what paygo is.")
+    # The two senses of "unpaid", kept apart on the page as well as in the code.
+    print("    SEALED -> UNPAID is the KERNEL's verdict: the battery closed and the coverage "
+          "was never bought.")
+    print("    'open at capture end' is this tool's statement about the CAPTURE: a window "
+          "still running when")
+    print("      the log ends is spending its budget as it earns it, which is what paygo is. "
+          "Not the same thing.")
+    if tag == 'wc-d':
+        print("    skips = verifies that DECLINED to adjudicate (teardown abort, degenerate "
+              "geometry, no rect,")
+        print("      no memory). Not passes, and deliberately not folded into any coverage "
+              "column — an aborted")
+        print("      verdict that counted as a full pass would satisfy the honesty check "
+              "below instead of firing it.")
     warned = [w for w in pg['wins'] if w['warn']]
     for w in warned:
-        print(f"    WARN [{tag}] win={w['id']}: still running at {w['last_ms']}ms — past "
-              f"the {w['horizon']}ms deferral horizon —")
-        print(f"      yet NO full-coverage pass ever ran ({w['lattice']} lattice, 0 full). "
-              f"The deferred pass never")
-        print("      arrived, so this window's verdicts cover 1/N of its surface and no more. "
-              "That is a coverage")
-        print("      CUT wearing a deferral's clothes, and every verdict it printed is CLEAN "
-              "about the pixels it")
-        print("      looked at. Check the gate's clock (a `clock=unarmed` paygo line can never "
-              "open it).")
+        print(f"    WARN [{tag}] win={w['id']}: coverage was never bought.")
+        if w['sealed']:
+            s = w['sealed'][0]
+            print(f"      The kernel SEALED this window at since_entry_ms={s['since_entry_ms']} "
+                  f"(state=sealed -> UNPAID):")
+            print("      its teardown-abort budget was spent, so it will not be verified again. "
+                  "This is a verdict,")
+            print("      not an inference, and it can arrive BEFORE the horizon — which is why "
+                  "no timing test guards it.")
+        if w['starved']:
+            print(f"      Still running at {w['last_ms']}ms — past the {w['horizon']}ms "
+                  f"deferral horizon — yet NO")
+            print(f"      full-coverage pass ever ran ({w['lattice']} lattice, 0 full). That is "
+                  f"a coverage CUT wearing a")
+            print("      deferral's clothes, and every verdict it printed is CLEAN about the "
+                  "pixels it looked at.")
+            print("      Check the gate's clock (a `clock=unarmed` paygo line can never open it).")
     if not warned:
-        print("    honesty check: every window that presented past the horizon got at least "
-              "one full-coverage pass.")
+        print("    honesty check: no window was sealed, and every window that ran past the "
+              "horizon got at least")
+        print("      one full-coverage pass.")
     unmarked = sum(w['unmarked'] for w in pg['wins'])
     if unmarked:
-        print(f"    NOTE: {unmarked} sample line(s) carry no `coverage=` marker at all. An "
-              f"unmarked pass is not")
-        print("      a full pass — it is a pass that did not say, and it is counted apart "
+        print(f"    NOTE: {unmarked} adjudicated line(s) carry no `coverage=` marker at all. An "
+              f"unmarked pass is")
+        print("      not a full pass — it is a pass that did not say, and it is counted apart "
               "rather than assumed.")
+    skipped = sum(w['skips'] for w in pg['wins'])
+    if skipped:
+        reasons = {}
+        for w in pg['wins']:
+            for k, v in w['skip_reasons'].items():
+                reasons[k] = reasons.get(k, 0) + v
+        detail = ', '.join(f"{k} x{v}" for k, v in sorted(reasons.items()))
+        print(f"    NOTE: {skipped} verify(s) declined to adjudicate — {detail}.")
     print("")
 
 
@@ -884,7 +968,8 @@ def wcg_report(label, content, boot_sel):
         start, end = window
         windows += 1
         print_wcg_stats(wcg_stats(chunk[start:end + 1]))
-        print_paygo_stats(paygo_stats(chunk))
+        for _tag in PAYGO_TAGS:
+            print_paygo_stats(paygo_stats(chunk, _tag), _tag)
 
     if not windows:
         print(f"{label}: no kepler window in any boot; nothing to decompose")
@@ -1219,6 +1304,69 @@ WCD_FIXTURE_PAYGO = """\
 """
 
 
+# --wcg fixture 8 is SYNTHETIC and is the REGRESSION GATE for the census defect described on
+# WCD_VERIFY_RE. Interlock round-3 (`6f1225b9`) + the verifier fixups (`98ffcf02`) gave wc-d two
+# more terminals, and both of them broke the first cut of this reader:
+#
+#   * `-> SKIP (teardown)` (wm.rs:2860) carries a FULL `coverage=` marker, because it is emitted
+#     from the same field list as the adjudicating arms. Counted as a verdict it lands in the
+#     `full` column, and `full > 0` is precisely what the honesty check reads — so an ABORT
+#     could satisfy the WARN it should have raised. win=4 below is that case, exactly;
+#   * `-> SKIP (degenerate row/geometry)` (wm.rs:3084) is a short line with no `coverage=` at
+#     all, so it inflated `unmarked`, which is supposed to mean "a pass that did not say what
+#     it covered" and not "a pass that never happened". win=5 is that case.
+#
+# win=4 is also the SEALED path (wm.rs:2886): once the teardown-abort budget is spent
+# (`aborts=7/6`, so `retry=no`), `wcd_seal` closes the battery and the paygo wire says so with
+# `state=sealed … -> UNPAID`. It is deliberately placed at since_entry_ms=9000, BEFORE the
+# 15000 ms horizon, so the fixture proves the WARN fires with no timing test — a sealed window
+# is a battery that never adjudicated, whenever it happened.
+#
+# Generated from the format strings at `98ffcf02`; the field values are Boot R's win=3 shape.
+WCD_FIXTURE_ABORT = """\
+[      0ms] bootpace: entry
+[     10ms] [NVIDIA] Initializing Kepler GPU at BDF 1:0:0
+[    110ms] :: kepler: takeover complete ::
+[   3000ms] [wc-d] verify win=4 surf=128x128 band=none scale=6x at (9,21) panel=2880x1800 checked=36864 coverage=lattice16 bad_cache=0 bad_ram=0 ram_indep=no moved=0 nonzero=36864 cksum=0x1122334455667788 first=none fills=3->3 fact=0/0 desk=1->2 dact=0/0 stable=yes -> PASS
+[   3005ms] [wc-d] paygo win=4 state=waiting emit=1 lattice_n=16 deferred=1 defer_ms=15000 since_entry_ms=3005 clock=entry taken=1 budget=2 -> DEFERRED
+[   4000ms] :: GPACE: span=3990ms anchor=enum:p1 since-entry=4000ms hz=123456 build=kepler+takeover+fifo+ivb+wc+ == the pci-usb d= split ::
+[   8990ms] [wc-d] verify win=4 surf=128x128 band=none scale=6x at (9,21) panel=2880x1800 checked=36864 coverage=full bad_cache=0 bad_ram=0 ram_indep=no moved=12 nonzero=36864 cksum=0x1122334455667788 first=(9,21) got=0x000000 want=0x1e1e1e rect=768x768+9+21 fills=15->17 fact=0/1 desk=3->4 dact=0/0 aborts=7/6 retry=no -> SKIP (teardown)
+[   9000ms] [wc-d] paygo win=4 state=sealed emit=2 lattice_n=16 deferred=2 defer_ms=15000 since_entry_ms=9000 clock=entry taken=1 budget=2 -> UNPAID
+[   9100ms] [wc-d] verify win=5 -> SKIP (degenerate row/geometry)
+"""
+
+
+def paygo_expect_abort(pg):
+    """The regression gate. Every one of these was WRONG before the WCD_VERIFY_RE anchor."""
+    w4 = paygo_window(pg, '4')
+    w5 = paygo_window(pg, '5')
+    return [
+        # The teardown SKIP carries `coverage=full`. It must NOT reach the coverage columns:
+        # pre-fix this read (1, 1) and the window looked fully covered.
+        ('win4 lattice/full (SKIP must not count as full)',
+         (w4['lattice'], w4['full']), (1, 0)),
+        ('win4 adjudicated verdicts', w4['samples'], 1),
+        ('win4 declined verifies', w4['skips'], 1),
+        ('win4 skip reasons', w4['skip_reasons'], {'teardown': 1}),
+        # The kernel's own verdict, and the vocabulary that is no longer shared with the
+        # capture statement.
+        ('win4 sealed by the kernel', bool(w4['sealed']), True),
+        ('win4 PAID', w4['paid'], False),
+        # Sealed at 9000ms, i.e. BEFORE the 15000ms horizon: the timing test alone would miss
+        # it, so this asserts the WARN does not depend on it.
+        ('win4 last adjudicated (ms)', w4['last_ms'], 3000),
+        ('win4 starved-by-timing', w4['starved'], False),
+        ('win4 WARN (sealed, regardless of timing)', w4['warn'], True),
+        # The geometry SKIP: counted as a skip, and NOT as an unmarked pass (pre-fix: 1).
+        ('win5 unmarked (geometry SKIP must not inflate)', w5['unmarked'], 0),
+        ('win5 adjudicated verdicts', w5['samples'], 0),
+        ('win5 declined verifies', w5['skips'], 1),
+        ('win5 skip reasons', w5['skip_reasons'], {'degenerate row/geometry': 1}),
+        ('win5 WARN', w5['warn'], False),
+        ('windows warned', [w['id'] for w in pg['wins'] if w['warn']], ['4']),
+    ]
+
+
 def paygo_expect_wcd(pg):
     """The wc-d census: a two-STAGE battery, one window paid and one stuck on the lattice."""
     w1 = paygo_window(pg, '1')
@@ -1483,6 +1631,8 @@ def selftest(top):
          WCD_FIXTURE_PAYGO, paygo_expect_wcd, 'wc-d'),
         ('paygo/wc-d fixture read as wc-g: the tag filter does not leak',
          WCD_FIXTURE_PAYGO, paygo_expect_wcg_side, 'wc-g'),
+        ('paygo/wc-d: teardown abort + seal — a declined verify is not a covered pass',
+         WCD_FIXTURE_ABORT, paygo_expect_abort, 'wc-d'),
     ):
         print(f"=== selftest: {name} ===")
         pg = paygo_boot_stats(text, tag=tag)
@@ -1508,6 +1658,27 @@ def selftest(top):
     #   * the GR17 boot-7 fixture HAS wc-g paygo lines and no wc-d ones, because it predates
     #     peer commit 0f1d3dfc. That asymmetry is the case a shared reader gets wrong, so it
     #     is asserted rather than assumed.
+    # THE REPORT PATH ITSELF, and this case exists because its absence let a real bug ship.
+    # Every paygo assertion above calls `paygo_stats`/`print_paygo_stats` DIRECTLY, which means
+    # none of them touches `wcg_report` -- the function that actually decides which censuses a
+    # `--wcg` run prints. A wiring edit left the main branch (boot WITH a kepler window) still
+    # printing only the wc-g census while the fixtures stayed green, and it was caught by
+    # running the tool on Boot R, not by the self-test. So the self-test now drives the whole
+    # report and asserts BOTH instruments reach the page.
+    print("=== selftest: paygo: --wcg prints a census for EVERY instrument ===")
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        wcg_report('<report-path fixture>', WCD_FIXTURE_ABORT, None)
+    _out = _buf.getvalue()
+    wired = [(f"--wcg report carries the [{t}] census", f"paygo battery [{t}]" in _out
+              or f"paygo [{t}]: no" in _out) for t in PAYGO_TAGS]
+    wired_ok = all(good for _, good in wired)
+    if not wired_ok:
+        ok = False
+    for label, good in wired:
+        print(f"    {'ok ' if good else 'BAD'} {label}: got {good!r}, want True")
+    print(f"=== selftest: paygo: report wiring: {'PASS' if wired_ok else 'FAIL'}\n")
+
     print("=== selftest: paygo: instruments that emitted nothing must report ABSENCE ===")
     absent = [
         ('s73 (witness-armed, no paygo knob) has no wc-g census',

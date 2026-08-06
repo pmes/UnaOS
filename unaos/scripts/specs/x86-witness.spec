@@ -271,6 +271,63 @@ PENDING \[wc-d\] paygo win=[0-9]+ state=waiting emit=[0-9]+ lattice_n=16 deferre
 #   [wc-d] paygo win=1 state=complete emit=2 lattice_n=16 deferred=7 defer_ms=15000 since_entry_ms=17410 clock=entry taken=2 budget=2 -> PAID
 PENDING \[wc-d\] paygo win=[0-9]+ state=complete .*taken=[0-9]+ budget=2 -> PAID
 
+# --- WC-D TEARDOWN INTERLOCK: THE ABORT, AND THE BATTERY THAT NEVER ADJUDICATED --------------
+# Round 3 (`6f1225b9`) brackets the read-back against foreign panel writes and makes every
+# verdict say what the panel did; `98ffcf02` settled the field list (`stable=` on PASS only —
+# it was removed from the FAIL arm as a structurally-forced constant, and the aarch64 FAIL arm
+# got its coverage slot back). When the interlock catches a write under the read-back, the
+# verify ABORTS rather than adjudicating: `-> SKIP (teardown)`.
+#
+# PI4 NEEDS NOTHING, verified rather than assumed. The whole interlock is arch-gated off
+# aarch64: `panel_stable` and `WCD_ABORTS` are `#[cfg(all(feature = "witness", target_arch =
+# "x86_64"))]`, and the abort block itself is `#[cfg(target_arch = "x86_64")]` (wm.rs:2844).
+# `SKIP (teardown)` has exactly ONE emitter in the tree and it is inside that gate, so no
+# aarch64 build can print it. pi4-regression.spec's `REQUIRE \[wc-d\] verify win=.*bad_cache=0
+# bad_ram=0.*-> PASS` and `FORBID \[wc-d\] verify .*-> FAIL` are also untouched: on aarch64
+# `wcd_coverage_note` returns "" and the plain PASS/FAIL arms (wm.rs:2942/:2969) are
+# byte-identical to what they were. Nothing to add there, and nothing to ask the integrator for.
+#
+# FIELD ORDER MATTERS HERE AND IT IS NOT WHAT IT LOOKS LIKE. `retry=` is printed BEFORE the
+# terminal, not after it — the format string ends `… aborts={}/{} retry={} -> SKIP (teardown)`
+# (wm.rs:2860). A pattern written as `-> SKIP \(teardown\).*retry=no` reads naturally and can
+# NEVER match, because nothing follows the terminal on that line. Stated because it is the exact
+# shape of vacuous instrument this file exists to refuse, and it was caught by generating the
+# line from the format string instead of writing the regex from the prose description.
+#
+# THE FORBID — `retry=no`. `retry=` answers "will this window be verified AGAIN", and
+# `WCD_ABORT_MAX` is 6, so `retry=no` means the abort budget is spent: `wcd_seal` closes the
+# window and the glass is never read for it again. A transient abort (`retry=yes`) is a cost —
+# the reference is handed back and the next composite re-verifies. A terminal one is COVERAGE
+# ABANDONED, and it is silent on every other line in this spec: the window simply stops
+# producing verdicts, and silence is not matchable. This is the directive that makes it loud.
+# Synthesized from wm.rs:2860 (Boot R win=3 field values, aborts past WCD_ABORT_MAX=6):
+#   [wc-d] verify win=3 surf=128x128 band=none scale=6x at (9,21) panel=2880x1800 checked=36864 coverage=full bad_cache=0 bad_ram=0 ram_indep=no moved=12 nonzero=36864 cksum=0x1122334455667788 first=(9,21) got=0x000000 want=0x1e1e1e rect=768x768+9+21 fills=15->17 fact=0/1 desk=3->4 dact=0/0 aborts=7/6 retry=no -> SKIP (teardown)
+FORBID \[wc-d\] verify .*retry=no -> SKIP \(teardown\)
+# The SHAPE, reported but never required. `OPTIONAL`, not `PENDING`, and the difference is the
+# advice each one gives a reader who sees it match: mbench prints "consider promoting to
+# REQUIRE" for a matched PENDING, which is exactly wrong for a fault path — nobody should ever
+# REQUIRE a teardown abort. `OPTIONAL` reports it as informational and never fails, which is the
+# behaviour wanted and the honest label for it. Same reasoning the pi4 gate applies to `[wc-f]`'s
+# retryable `-> DEFER`, which it deliberately leaves unforbidden.
+# A `retry=yes` abort is a real event worth seeing in the table (it prices the interlock's
+# contention); a `retry=no` one trips the FORBID above as well as showing up here.
+OPTIONAL \[wc-d\] verify .*aborts=[0-9]+/[0-9]+ retry=(yes|no) -> SKIP \(teardown\)
+# THE SEALED TERMINAL — the battery that never adjudicated. When the abort budget is spent under
+# paygo, `wcd_seal` is not enough on its own: a reader following `[wc-d] paygo` would otherwise
+# see a window reach `taken=2` and then go silent, sealed and unexplained on the one wire that
+# tracks the battery. So it emits its own terminal (wm.rs:2886) — `state=sealed … -> UNPAID`,
+# and deliberately not `PAID`, because the coverage was never bought.
+# FORBIDDEN outright. Every other paygo directive in this file is satisfied by a sealed window:
+# it printed a lattice verdict, it printed a DEFERRED line, its constants were right. What it
+# never did is adjudicate its own surface, and this is the only line that says so.
+# NOTE the vocabulary: `-> UNPAID` here is the KERNEL's verdict. `serial-analyzer --wcg` also
+# prints "open at capture end" for a window still spending its budget when a log ends — a
+# statement about the capture, deliberately reworded away from "UNPAID" so the two cannot be
+# confused. Only this one is a fault.
+# Synthesized from wm.rs:2886 + the paygo format at wm.rs:3929:
+#   [wc-d] paygo win=3 state=sealed emit=7 lattice_n=16 deferred=3 defer_ms=15000 since_entry_ms=9000 clock=entry taken=1 budget=2 -> UNPAID
+FORBID \[wc-d\] paygo win=[0-9]+ state=sealed .*-> UNPAID
+
 # --- THE DEFERRAL GATE'S OWN CLOCK -----------------------------------------------------------
 # `clock=` is not decoration. `since_entry_ms()` returns None until the bootpace entry stamp
 # lands, and the emitter refuses to print a fabricated zero: it prints `since_entry_ms=0
