@@ -1028,8 +1028,32 @@ pub fn scout() {
                 match read_key_by_index(idx, &mut name) {
                     Ok(()) => {
                         walked += 1;
-                        let ns = core::str::from_utf8(&name).unwrap_or("????");
-                        serial_println!(":: SMC-SCOUT: idx {} = {} ::", idx, ns);
+                        // WALK-QUIET (Boot V, GR18) — the WALK stays; its PER-NAME OUTPUT does not.
+                        //
+                        // Boot V is the measurement. The index walk printed 493 lines (~25 KB) at
+                        // ~1.75 s, and the FTDI console's drain of that block displaced the storage
+                        // bring-up that follows it: 11.4 s (Boot U, `SPACE ftdi=177ms wait=208`) went
+                        // to 14.9 s (Boot V, `ftdi=1519ms wait=1553`). ~3.5 s of boot, bought once,
+                        // for an inventory that does not change between boots and is already BANKED —
+                        // the full 493-name list is in the s73 capture slice (`bootV.log`). Printing
+                        // it every boot is paying for a constant.
+                        //
+                        // What is NOT constant is whether the walk still RUNS, and that is why only
+                        // the print is demoted. `read_key_by_index` is the GAP-1 sibling fix's only
+                        // exerciser; the summary line below (`index walk done (N of M names)`) is a
+                        // standing per-boot regression witness that the fix has not re-wedged, and it
+                        // costs one line. The SMC traffic itself is ~100 ms of port I/O against a
+                        // ~3.5 s serial cost, so the walk is kept always-on and the knob buys back
+                        // only the inventory dump.
+                        //
+                        // `UNAOS_SMCWALK=1` (feature `smcwalk`) restores the per-name lines for the
+                        // sitting that wants a fresh inventory. Default OFF; inert without
+                        // `UNAOS_SMC`, since this module is only compiled under it.
+                        #[cfg(feature = "smcwalk")]
+                        {
+                            let ns = core::str::from_utf8(&name).unwrap_or("????");
+                            serial_println!(":: SMC-SCOUT: idx {} = {} ::", idx, ns);
+                        }
                     }
                     // Absent and Stuck are different facts and no longer share a line (review
                     // finding 5): "the SMC has no key at this index" ends an enumeration normally,
@@ -1051,6 +1075,13 @@ pub fn scout() {
                     }
                 }
             }
+            // WALK-QUIET — THE standing witness, and the reason the walk is not itself knob-gated.
+            // `walked == count` every boot says GET_KEY_BY_INDEX still answers; a shortfall, or this
+            // line's absence, says the GAP-1 sibling fix has re-wedged. One line, always.
+            //
+            // PREDICTION for Boot W (falsifiable, write the reading beside it): with the per-name
+            // dump quiet, storage bring-up returns to ~11.4 s and `SPACE ftdi=` to ~180 ms (Boot V:
+            // 14.9 s / 1519 ms; Boot U: 11.4 s / 177 ms), and `gui=` returns to the ~3408 ms band.
             serial_println!(":: SMC-SCOUT: index walk done ({} of {} names) ::", walked, count);
         }
         _ => {

@@ -1929,6 +1929,11 @@ fn paygo_arm(i: usize) -> bool {
     if TAKEN[i].load(Ordering::Relaxed) == 0 {
         return true;
     }
+    // PAYGO-TERM/PAY-AT-CLOSE — this window is being torn down with its battery still owed, and the
+    // deferral has run out of future to be deferred into. See [`PAYGO_FORCE`].
+    if PAYGO_FORCE[i].load(Ordering::Relaxed) != 0 {
+        return true;
+    }
     // An unarmed clock — no entry stamp yet, or no calibrated rate — DEFERS. See [`since_entry_ms`]
     // for why that is the conservative direction and what guessing instead would have cost.
     paygo_clock().2
@@ -1938,6 +1943,57 @@ fn paygo_arm(i: usize) -> bool {
 #[inline]
 fn paygo_arm(_i: usize) -> bool {
     true
+}
+
+/// PAYGO-TERM — per-id: pay this window's remaining samples NOW, whatever the deferral clock says.
+///
+/// **The one place the threshold is overridden, and it is overridden by an event the threshold cannot
+/// see.** [`PAYGO_DEFER_MS`] answers "is the boot burst over"; the answer it gives an ORDINARY window
+/// is "not yet, wait". A window being CLOSED has no later to wait for — its surface is about to be
+/// unmapped and its slot recycled — so the deferral's own argument ("a window that stops presenting
+/// keeps its unspent budget, which costs nothing and is reported as unspent") stops holding: what it
+/// keeps is not unspent budget but an unterminated battery, printed as `state=waiting` and then
+/// silence. Boot V is that case with numbers: `win=4` closed at 13 767 ms with `deferred=1` pending
+/// and never said another word.
+///
+/// Set by `video::wm`'s pay-at-close and CLEARED by it before the row is freed — see there for the
+/// cost bound and for why the alternative (seal the window and print `state=sealed -> UNPAID`) was
+/// rejected. Never set by anything periodic: a mature deferral is taken by the service-pass taker on
+/// the ordinary path, where the clock has genuinely opened and no override is involved.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static PAYGO_FORCE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// PAYGO-TERM — does this window owe a deferred sample, i.e. was it DECLINED by the gate and is its
+/// battery still open? Says nothing about whether the deferral has matured; see [`paygo_ripe`].
+///
+/// `PAYGO_SAID` and not merely `TAKEN < SAMPLES` is the load-bearing part. A window that simply
+/// stopped presenting mid-battery keeps its unspent budget BY DESIGN — that is this module's standing
+/// behaviour and predates the deferral entirely — and forcing samples onto it would be inventing
+/// composites for a window nobody is drawing. Only a window the DEFERRAL GATE turned away has an
+/// obligation this arc created, and only those are taken.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+pub(super) fn paygo_pending(i: usize) -> bool {
+    i < IDS
+        && PAYGO_SAID[i].load(Ordering::Relaxed) != 0
+        && TAKEN[i].load(Ordering::Relaxed) < SAMPLES
+}
+
+/// PAYGO-TERM — is this window's deferred sample owed AND payable right now? The service-pass taker's
+/// whole predicate, read from the same [`paygo_clock`] the gate defers on so the taker cannot open a
+/// sample the gate would decline (which would spin: mark damaged, composite, get declined, repeat).
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+pub(super) fn paygo_ripe(i: usize) -> bool {
+    paygo_pending(i) && paygo_clock().2
+}
+
+/// PAYGO-TERM — arm/disarm the pay-at-close override. `video::wm::close` is the only caller and it
+/// pairs every `true` with a `false`; leaving one set would hand the slot's next tenant a battery
+/// with no deferral at all.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+pub(super) fn paygo_force(i: usize, on: bool) {
+    if i < IDS {
+        PAYGO_FORCE[i].store(u32::from(on), Ordering::Relaxed);
+    }
 }
 
 /// Knob off, or not x86: every sample opens exactly as it always did. Folds away entirely.
@@ -2084,6 +2140,31 @@ fn paygo_flush(_id: u32, _i: usize) {}
 #[inline]
 fn paygo_complete(id: u32, i: usize) {
     paygo_note(id, i, "complete", "PAID");
+}
+
+/// PAYGO-TERM — the OTHER terminal: this window was closed with its battery still owed, and the
+/// deferral had not matured, so nothing was bought and nothing will be.
+///
+/// **Why this is a line and not a payment.** `video::wm`'s pay-at-close DOES run the full battery for
+/// a window that dies past [`PAYGO_DEFER_MS`] — that work was already owed and the service-pass taker
+/// would have done it moments later. A window that dies BEFORE the threshold is the case this whole
+/// module exists for: Boot V closed `win=3`/`win=4`/`win=5` at 13.6–13.8 s, inside the boot burst, and
+/// their remaining coverage measures (from Boot V's own `prof` lines, 1.66 us/probe against the
+/// uncached panel) at ~27 ms per full `[wc-g]` sample and ~1.5 s for one full `[wc-d]` verdict on a
+/// 768x768 rect. Paying that at close would put seconds back onto the boot GR17 took them off — it
+/// would be the deferral gate defeated by its own teardown path. So the budget stays unspent and the
+/// wire SAYS SO.
+///
+/// **And it is deliberately not `-> UNPAID`.** That token belongs to `wm`'s teardown-interlock abort:
+/// a window whose read-back was overwritten under it, sealed after exhausting `WCD_ABORT_MAX`, which
+/// x86-witness.spec FORBIDs outright because it is a real defect. This is not that. `-> UNSPENT` says
+/// the budget was never spent and no verdict was owed — the designed steady state of a short-lived
+/// window — and it matches no directive in any spec, which is correct: there is nothing here to
+/// require and nothing to forbid.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+#[inline]
+pub(super) fn paygo_closed(id: u32, i: usize) {
+    paygo_note(id, i, "closed", "UNSPENT");
 }
 
 #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]

@@ -330,6 +330,17 @@ pub fn service_dump() {
     #[cfg(target_arch = "x86_64")]
     crate::arch::syscall::clock_x1_poll();
 
+    // PAYGO-TERM (GR18): the witness battery's service-pass taker, riding here for CLOCK-X1's exact
+    // reason and no other. A deferred `[wc-g]`/`[wc-d]` sample used to have only one taker — the next
+    // composite — and Boot V showed that is not a taker at all on a boot that goes idle: the last
+    // composite was at 13 776 ms against a 15 000 ms threshold, `x86_render_service` blocks on its
+    // event channel, and the console window sat `state=waiting` for the remaining 210 s. This is the
+    // hook that reaches every x86 service lane ungated, so a matured deferral gets taken whether or
+    // not anything is presenting. Self-throttled to 4 Hz; one relaxed load per pass otherwise. Folds
+    // to an empty fn without `witness` + `wcg-paygo`, and does not exist on aarch64.
+    #[cfg(target_arch = "x86_64")]
+    crate::video::wm::paygo_service();
+
     let mut buf = [(0u64, ""); CAP];
     let n = snapshot(&mut buf);
     if LAST_DUMPED_LEN.swap(n, Ordering::AcqRel) == n {

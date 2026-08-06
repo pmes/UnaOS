@@ -644,6 +644,24 @@ nsspan = []
 # byte-identical. See unaos/docs/dev/OS/09_PLATFORM/smc_battery.md.
 smc = []
 
+# WALK-QUIET (GR18): restore the SMC #KEY index walk's PER-NAME output (`UNAOS_SMCWALK=1`).
+#
+# The walk itself is always-on under `smc` — it is the GAP-1 sibling fix's only exerciser, and its
+# one-line summary (`index walk done (N of M names)`) is a standing per-boot regression witness that
+# the fix has not re-wedged. What this knob buys back is the INVENTORY DUMP: one `idx N = KEY ` line
+# per name, 493 of them (~25 KB) on the 2012 rMBP. Boot V measured what that costs — the FTDI
+# console's drain of the block displaced storage bring-up from 11.4 s to 14.9 s (`SPACE ftdi=` 177 ms
+# -> 1519 ms) — for an inventory that does not change between boots and is already banked in the s73
+# capture. Arm it for a sitting that wants a fresh list; leave it off for every boot that is timing
+# something.
+#
+# Inert without `smc` (drivers/smc.rs is only compiled under that feature), so it is NOT declared as
+# implying it: an operator who sets `UNAOS_SMCWALK` alone gets no SMC driver, which is what asking for
+# a louder driver you did not arm should do. Default OFF => the per-name `serial_println!` and its
+# `from_utf8` vanish; the walk and the summary are unchanged. x86_64 only in practice, arch-neutral in
+# the feature graph. Kept in sync with arroyo + builder/src/main.rs.
+smcwalk = []
+
 # RAST-1 / RAST-TEGRA: the `rast` software-rasterizer demo (UNAOS_RAST=1). Pulls in the
 # platform-neutral `rast` crate and links the knob-gated spinning-cube demo (rast_demo.rs), presented
 # through the existing panel `Screen` path (call-never-edit). The `rast` crate is no_std and arch-

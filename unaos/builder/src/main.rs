@@ -127,6 +127,12 @@ fn main() {
     // driver; the QEMU isa-applesmc device is attached below under the same knob so the protocol
     // machinery is gated by a known-key read. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_SMC").is_ok() { feats.push("smc"); }
+    // WALK-QUIET (GR18): UNAOS_SMCWALK=1 restores the #KEY index walk's PER-NAME output. The walk and
+    // its one-line summary are always-on under `smc`; this buys back the 493-line inventory dump that
+    // Boot V measured at ~3.5 s of displaced storage bring-up. Does NOT imply `smc` — inert without
+    // it. Kept in sync with arroyo's mapping; a knob mapped there and missing HERE ships the feature
+    // disabled while the banner claims it is on.
+    if std::env::var("UNAOS_SMCWALK").is_ok() { feats.push("smcwalk"); }
     // K-GPU: UNAOS_KEPLER=1 arms the GK107 (GT 650M) driver — probe/EVO-decode/PFIFO are further
     // gated by UNAOS_KEPLER_TAKEOVER / UNAOS_KEPLER_FIFO (option_env!, compile-time). Kept in sync
     // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature

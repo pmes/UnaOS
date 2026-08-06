@@ -189,6 +189,13 @@ _feats=""
 # the protocol machinery is gated by a known-key read; battery keys are metal-first. Default OFF =>
 # module + call sites unlinked, media byte-identical. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_SMC:-}" ] && _feats="${_feats}smc,"
+# WALK-QUIET (GR18): UNAOS_SMCWALK=1 restores the #KEY index walk's PER-NAME output. The walk always
+# runs under UNAOS_SMC and always prints its one-line summary (the GAP-1 sibling fix's per-boot
+# regression witness); this knob buys back the 493-line inventory dump, which Boot V measured at
+# ~3.5 s of displaced storage bring-up (SPACE ftdi= 177ms -> 1519ms) through the FTDI console drain.
+# Does NOT imply smc — without it the module is unlinked and this feature is inert. Default OFF.
+# Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_SMCWALK:-}" ] && _feats="${_feats}smcwalk,"
 # INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer +
 # FAT32 formatter + extent content-verify). The builder attaches a dedicated BLANK scratch disk over
 # the usb-storage slot under this knob (see builder/src/main.rs), against which the engine writes a
@@ -1038,7 +1045,7 @@ KERNEL_CFG_MATRIX=(
   # CONSOLE-WINDOW route (wc), instgui, the Kepler trio, IVB/GMUX, VPERF (videobench/videocap), the
   # EHCI family + KBDWIT, MTRAW + its inject sub-knob, STOR-1 (irqstorage), the BOT fault/ring
   # experiments, BENCH-RIDE (therm/pcilink/vrom), SMC, the rasterizer and the installer engine.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,rast,installdemo"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo"
   # aarch64 board leg 1 — Raspberry Pi 4 bare metal. `baremetal` ⇒ `pi`, which is what unlocks wcf
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the

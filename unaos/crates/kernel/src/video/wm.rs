@@ -976,6 +976,15 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
 /// Close `id`, freeing its table row. The surface itself belongs to the owner's address space and is
 /// not touched here — WC-B unmaps it. Returns `false` if `id` names no live window.
 pub fn close(id: WinId) -> bool {
+    // PAYGO-TERM — settle this window's battery while it still HAS a surface and a row. Everything
+    // below frees both, and after that there is no verdict to be had at any price. See
+    // [`paygo_at_close`]; it is a no-op for a window the deferral gate never turned away, which is
+    // every window on a build without the knob and most windows on one with it.
+    //
+    // Ahead of the WEDGE token deliberately: the composites it may run are ordinary passes and must
+    // not be threaded into the death chain the token opens.
+    #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+    paygo_at_close(id);
     // WEDGE-1r2 `<D1>`/`<d1>` — see `move_to`. `close` reaches its barrier through a `TABLE` critical
     // section, so the token has to precede the lock to cover the death that happens ON it.
     crate::wedge2::mark_composite("<D1>", "<d1>");
@@ -1778,6 +1787,168 @@ pub fn service_damage() {
     }
     composite();
 }
+
+/// PAYGO-TERM — THE SERVICE-PASS TAKER: give a matured deferral a taker that is not a present.
+///
+/// ### The gap this closes, in Boot V's own numbers
+///
+/// The deferral's liveness argument was "the window keeps compositing, so the pass after the
+/// threshold takes the sample". Boot V falsified it. Its last composite was at 13 776 ms against
+/// `defer_ms=15000`; the sched demo's post-storage cycles never ran, so nothing presented again, and
+/// `x86_render_service` — the compositor's own lane — blocks on `GUI_CHANNEL_X86.recv()`, so an idle
+/// panel produces no passes at all. `win=1`, the console, sat at `state=waiting taken=1` for the
+/// remaining 210 seconds of the boot. Four of x86-witness.spec's REQUIREs went red on a machine that
+/// was working perfectly: the battery had no defect, it had no TAKER.
+///
+/// A deferral whose only taker is a present is not deferred, it is CONDITIONAL on a present — and
+/// nothing in the policy ever said so. This restores the property the threshold implies: past
+/// `defer_ms`, an owed sample is taken whether or not anyone is drawing.
+///
+/// ### Why here, and what it costs when there is nothing to do
+///
+/// Reached from `bootpace::service_dump`, which the CLOCK-X1 verdict already rides for exactly this
+/// reason: it is the one call all three x86 service lanes make ungated (the BSP GUI loop, the
+/// `usbdebug` loop, and the SCHED-X86 `x86_usb_pump` task), so the taker reaches the media build that
+/// boots on the bench. Main-loop context in every one of them — never IRQ — which is the context
+/// `composite` already runs in from `service_damage` and from `sys_win_present`, and the context the
+/// read-back needs because it touches the panel.
+///
+/// Idle cost is one relaxed load and a `cycles_to_us`; past the rate gate but with nothing owed it is
+/// one table-lock acquisition and a scan of eight rows, which is `service_damage`'s own idle cost.
+///
+/// ### One window per pass, and why the predicate is read before the mark
+///
+/// The take is not performed here — it is the ORDINARY take, reached the ordinary way: mark the row
+/// damaged, composite, and `wcg::begin` / `wcd_admit` open the sample themselves because
+/// `paygo_clock` has genuinely opened. There is no second copy of the verify, and a window that would
+/// be declined is never marked ([`wcd_ripe`] and `wcg::paygo_ripe` read the same clock the gates
+/// defer on), so the taker cannot spin against its own gate.
+///
+/// At most one window per pass, deliberately. A full-coverage sample is not cheap — Boot V's `prof`
+/// lines put the uncached panel read-back at 1.66 us/probe, so `win=1`'s full sample is ~1.6 s of
+/// read-back — and taking every owed window in one pass would land the whole battery as a single
+/// stall. Spread over [`PAYGO_SVC_PERIOD_US`] the same work arrives as a sequence of passes the rest
+/// of the system runs between.
+///
+/// ### PREDICTION for Boot W (falsifiable; write the reading beside it)
+///
+/// `win=1` goes `state=complete … -> PAID` on both wires within ~1–2 s of the 15 000 ms threshold
+/// with ZERO presents in between (three more `[wc-g]` samples plus one `[wc-d]` full verdict, one per
+/// 250 ms pass), and mbench x86-witness returns 16/16 on a complete capture.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+pub fn paygo_service() {
+    // Rate gate first: this runs on a ~1 ms lane and the scan below takes the table lock.
+    let now = crate::arch::now_cycles();
+    let last = PAYGO_SVC_LAST.load(core::sync::atomic::Ordering::Relaxed);
+    // `now_cycles` is an absolute `rdtsc` on x86, so a zero `last` is "never run" and not a reading
+    // to subtract from — `cycles_to_us` of an absolute counter overflows its `* 1e6` at ~1.9 h and
+    // the gate's answer would then be noise. The first pass is always due.
+    if last != 0
+        && super::wcg::cycles_to_us(now.saturating_sub(last)) < PAYGO_SVC_PERIOD_US
+    {
+        return;
+    }
+    if PAYGO_SVC_LAST
+        .compare_exchange(
+            last,
+            now,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+    // Nothing is payable before the threshold, whatever the table holds. One shared read, from the
+    // same definition the two gates defer on.
+    if !super::wcg::paygo_clock().2 {
+        return;
+    }
+    let mut marked = None;
+    {
+        let mut t = table();
+        for r in t.rows.iter_mut() {
+            // `presented` and `!compat`: `verify_reference` declines both, so marking one would buy a
+            // repaint and no sample. A HIDDEN window is left alone too — the composite loop's
+            // `above_shell` guard would decline to draw it, and re-marking it every pass would be a
+            // 4 Hz repaint of a window nobody can see.
+            if !r.used || !r.presented || r.compat {
+                continue;
+            }
+            let i = r.id as usize;
+            if !(super::wcg::paygo_ripe(i) || wcd_ripe(i)) {
+                continue;
+            }
+            // THE BOUND, and it is not decoration. Every predicate above is a property of state the
+            // composite path itself moves, so the ordinary case terminates: each pass spends a sample
+            // and the battery closes. If some future guard declines to draw a row this taker believes
+            // is drawable, the pair would spin at `PAYGO_SVC_PERIOD_US` for the rest of the boot,
+            // repainting a window forever and never taking anything. So the attempts are counted and
+            // capped, and the cap SPEAKS once rather than going quiet — a taker that gave up is a
+            // fact about the instrument, and this module's standing law is that an instrument which
+            // stops must say so.
+            let tries = PAYGO_SVC_TRIES[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            if tries > PAYGO_SVC_MAX {
+                if tries == PAYGO_SVC_MAX + 1 {
+                    marked = Some((r.id, true));
+                }
+                continue;
+            }
+            r.damaged = true;
+            // Whole box, not a band: the deferred pass is the FULL-coverage one by definition, and a
+            // banded mark would hand `verify_reference` a band to narrow the very verdict this taker
+            // exists to complete.
+            r.dmg_y0 = 0;
+            r.dmg_y1 = 0;
+            marked = Some((r.id, false));
+            break;
+        }
+    }
+    match marked {
+        None => {}
+        Some((id, true)) => {
+            // `paygo-taker` and NOT `paygo`: every `[wc-d] paygo` line carries the battery key set
+            // (`state=`/`emit=`/`deferred=`/`taken=`) and both x86-witness.spec and
+            // `serial-analyzer --wcg` parse it positionally. A diagnostic wearing that tag with a
+            // different shape is a line that reads as a battery line and is not one — the exact
+            // class of instrument this module keeps convicting. A distinct tag matches no directive
+            // in any spec, which is right: there is nothing here to require and nothing to forbid.
+            serial_println!(
+                "[wc-d] paygo-taker STOP-NOTE win={} — gave up after {} attempts: the row is marked damaged and the composite declines to sample it. Battery left owed, nothing forced ::",
+                id, PAYGO_SVC_MAX
+            );
+        }
+        Some((_, false)) => composite(),
+    }
+}
+
+/// PAYGO-TERM — how often [`paygo_service`] may take one owed sample. 4 Hz.
+///
+/// Fast enough that a matured battery closes within ~1–2 s of the threshold (`win=1` owes three
+/// `[wc-g]` samples and one `[wc-d]` verdict after Boot V's `taken=1`), slow enough that the
+/// full-coverage read-backs arrive as separate passes rather than one stall. Not tied to
+/// `wcg::CENSUS_PERIOD_US`: that one paces a PRINT, this one paces WORK, and pinning them together
+/// would make either number un-tunable without moving the other.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+const PAYGO_SVC_PERIOD_US: u64 = 250_000;
+
+/// PAYGO-TERM — the taker's own liveness bound. See the note at the `fetch_add` that reads it.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+const PAYGO_SVC_MAX: u32 = 16;
+
+/// PAYGO-TERM — `now_cycles()` as of the last taken pass; `0` = never. The rate gate.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static PAYGO_SVC_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// PAYGO-TERM — per-id: marks this taker has made. Bounded by [`PAYGO_SVC_MAX`].
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static PAYGO_SVC_TRIES: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+
+/// Knob off, or not x86: there is no deferral, so there is nothing to take. Folds away entirely.
+#[cfg(not(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo")))]
+#[inline]
+pub fn paygo_service() {}
 
 /// CURSOR-1 — mark every window whose outer box overlaps `(x, y, w, h)` damaged, so the next
 /// composite redraws it from its source surface. Returns the number marked.
@@ -3836,6 +4007,10 @@ fn wcd_admit(id: u32, i: usize) -> Option<(usize, u32)> {
             }
             WCD_ST_FULL => {
                 let (since_ms, clock, payable) = super::wcg::paygo_clock();
+                // PAYGO-TERM/PAY-AT-CLOSE — a window being torn down has no later to defer into. See
+                // [`WCD_FORCE`], and `wcg::PAYGO_FORCE` for the argument in full.
+                let payable =
+                    payable || WCD_FORCE[i].load(core::sync::atomic::Ordering::Relaxed) != 0;
                 if !payable {
                     wcd_decline(id, i, since_ms, clock);
                     return None;
@@ -3849,6 +4024,167 @@ fn wcd_admit(id: u32, i: usize) -> Option<(usize, u32)> {
             _ => return None,
         }
     }
+}
+
+/// WC-D/PAYGO-TERM — per-id: pay this window's deferred verdict NOW, whatever the deferral clock
+/// says. The `wcg::PAYGO_FORCE` twin, set and cleared by [`close`]'s pay-at-close and by nothing else.
+/// Kept as a separate cell rather than read out of `wcg` because the two batteries have independent
+/// budgets (wc-d has two STAGES, wc-g four SAMPLES) and one can close while the other is still owed;
+/// a shared latch would make the first to finish disarm the second.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCD_FORCE: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+
+/// WC-D/PAYGO-TERM — does this window owe a deferred verdict? `WCD_ST_FULL` is the RESTING state that
+/// means "first verdict published, full one owed", which is exactly the population the deferral gate
+/// turns away; `WCD_SAID` narrows it to windows the gate has actually declined, for the reason
+/// `wcg::paygo_pending` gives. A `_RUN` state is another core's reference and is not ours to take.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+fn wcd_pending(i: usize) -> bool {
+    i < WCD_IDS
+        && WCD_SAID[i].load(core::sync::atomic::Ordering::Relaxed) != 0
+        && WCD_STATE[i].load(core::sync::atomic::Ordering::Acquire) == WCD_ST_FULL
+}
+
+/// WC-D/PAYGO-TERM — owed AND payable now. Read from `wcg::paygo_clock`, the same one definition
+/// [`wcd_admit`] defers on, so the taker cannot mark a window the admit would then decline.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+fn wcd_ripe(i: usize) -> bool {
+    wcd_pending(i) && super::wcg::paygo_clock().2
+}
+
+/// WC-D/PAYGO-TERM — arm/disarm the pay-at-close override. Paired by [`close`].
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+fn wcd_force(i: usize, on: bool) {
+    if i < WCD_IDS {
+        WCD_FORCE[i].store(u32::from(on), core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// PAYGO-TERM — per-slot: which wires have already printed their unspent-close terminal. Bit 0 is
+/// `[wc-g]`, bit 1 is `[wc-d]`. Never cleared, because neither battery is reset on a slot recycle —
+/// see the note at its only reader in [`paygo_at_close`].
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+static PAYGO_CLOSE_SAID: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+
+/// PAYGO-TERM — how many composites [`paygo_at_close`] will run to close one window's batteries.
+///
+/// `wcg` budgets four SAMPLES and `wc-d` two STAGES, and each pass spends at most one of each, so a
+/// window at Boot V's `taken=1` needs three passes; eight is that with headroom and a hard stop. It
+/// bounds a teardown path, which is the one place in this module an unbounded loop would be worst.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+const PAYGO_CLOSE_MAX: u32 = 8;
+
+/// PAYGO-TERM — PAY AT CLOSE, and the one case where it declines to pay.
+///
+/// ### The defect
+///
+/// Boot V closed `win=4` at 13 767 ms with `deferred=1` pending and `state=waiting` as its last word.
+/// The window died, its slot recycled, and the battery it had opened was never terminated on any
+/// wire — not `PAID`, not anything. The `state=sealed … -> UNPAID` note next door does not cover it:
+/// that fires only on the teardown-interlock abort path (`retry=no`), never on an ordinary close. A
+/// reader following the battery sees a window enter `waiting` and vanish.
+///
+/// ### What it does, and the case it deliberately does NOT pay
+///
+/// **Past the threshold: pay in full.** The deferral has matured, [`paygo_service`] would have taken
+/// these samples within a pass or two anyway, and the only thing special about this moment is that it
+/// is the last one where the surface still exists. The force latches (`wcg::PAYGO_FORCE`,
+/// [`WCD_FORCE`]) open both gates, the row is marked and composited up to [`PAYGO_CLOSE_MAX`] times,
+/// and the ordinary take path produces the ordinary terminal — `state=complete … -> PAID` — with no
+/// second copy of any verify anywhere.
+///
+/// **Before the threshold: do not pay, and say so.** This is the conflict this arc hit and it is
+/// recorded rather than smoothed over. Boot V's own `prof` lines measure the uncached panel read-back
+/// at 1.66 us/probe; a full `[wc-g]` sample on the 128x128@6x demo window is ~27 ms and its one full
+/// `[wc-d]` verdict walks 589 824 pixels twice — order 1.5 s. Boot V closes three such windows
+/// between 13.6 s and 13.8 s, inside the boot burst. Paying them at close would put several seconds
+/// straight back onto the boot that GR17 took them off, which is the deferral gate being defeated by
+/// its own teardown path — the exact cost this module exists to move. So the budget stays unspent,
+/// and the terminal line says `state=closed … -> UNSPENT`: a window that died inside its own deferral
+/// window, by design, with nothing bought and nothing owed. See `wcg::paygo_closed` for why that
+/// token is not `UNPAID`.
+///
+/// ### PREDICTION for Boot W
+///
+/// The three demo windows that close pre-maturity terminate `state=closed … -> UNSPENT` on both wires
+/// at ~13.6–13.8 s and cost the boot nothing; no window closes with `state=waiting` as its last line.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+fn paygo_at_close(id: WinId) {
+    let i = id as usize;
+    if i >= WCD_IDS {
+        return;
+    }
+    // Cheapest question first, and it is false for every window the gate never declined — which on
+    // an ordinary boot is most of them. Two relaxed loads, no lock.
+    if !(super::wcg::paygo_pending(i) || wcd_pending(i)) {
+        return;
+    }
+    // A row that is gone, unpresented or compat cannot be sampled: `verify_reference` declines all
+    // three, so marking it would buy repaints and no verdict. The note below still fires — the
+    // battery is just as terminal either way.
+    let drawable = {
+        let t = table();
+        matches!(row(&t, id), Some(r) if r.used && r.presented && !r.compat)
+    };
+    if drawable && super::wcg::paygo_clock().2 {
+        super::wcg::paygo_force(i, true);
+        wcd_force(i, true);
+        for _ in 0..PAYGO_CLOSE_MAX {
+            if !(super::wcg::paygo_pending(i) || wcd_pending(i)) {
+                break;
+            }
+            let marked = {
+                let mut t = table();
+                match row_mut(&mut t, id) {
+                    Some(r) if r.used => {
+                        r.damaged = true;
+                        // Whole box: the deferred pass is the FULL-coverage one by definition.
+                        r.dmg_y0 = 0;
+                        r.dmg_y1 = 0;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if !marked {
+                break;
+            }
+            composite();
+        }
+        // ALWAYS cleared, on every path out of the loop. A latch left standing would hand this
+        // slot's next tenant a battery with no deferral at all — the gate silently off for a window
+        // nobody armed it off for, which is this module's convicted failure shape.
+        super::wcg::paygo_force(i, false);
+        wcd_force(i, false);
+    }
+    // Whatever is still owed is owed forever now. One terminal per wire that still has a battery
+    // open; a wire that closed above already printed `-> PAID` and is no longer pending.
+    //
+    // ONE-SHOT PER SLOT, and the QEMU run that made this arc's first cut is why. Neither battery is
+    // reset when a slot recycles — `wcg::TAKEN`, `PAYGO_SAID`, `WCD_STATE` and `WCD_SAID` are all
+    // per-SLOT and survive the row being freed, which is a deliberate property of both modules and
+    // not this arc's to change. So `pending` stays true after the first unspent close, and without a
+    // latch every LATER close that lands on the same slot re-prints the same terminal: the first cut
+    // emitted `win=1 state=closed … -> UNSPENT` seven times in one `./arroyo test`, with the census
+    // climbing 2 -> 7 -> 16 -> 19 -> 21 -> 26 behind it. A terminal that fires repeatedly is not a
+    // terminal, it is the running-census shape `PAYGO_EMIT` was rewritten to stop pretending to be.
+    // One battery, one closing line; the slot goes quiet afterwards, which is what "terminal" means.
+    let said = PAYGO_CLOSE_SAID[i].load(core::sync::atomic::Ordering::Relaxed);
+    if super::wcg::paygo_pending(i) && said & 1 == 0 {
+        PAYGO_CLOSE_SAID[i].fetch_or(1, core::sync::atomic::Ordering::Relaxed);
+        super::wcg::paygo_closed(id, i);
+    }
+    if wcd_pending(i) && said & 2 == 0 {
+        PAYGO_CLOSE_SAID[i].fetch_or(2, core::sync::atomic::Ordering::Relaxed);
+        let (since_ms, clock, _) = super::wcg::paygo_clock();
+        wcd_paygo_note(id, i, "closed", "UNSPENT", since_ms, clock);
+    }
+    // The slot may be handed to a new window immediately (slot 3 recycles seven times in the s73
+    // capture) — the same reason `wcn_forget` exists. A stale attempt count would starve the next
+    // tenant's taker.
+    PAYGO_SVC_TRIES[i].store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Knob off: one verdict per window at full coverage. Same one-reference guarantee, two states.
