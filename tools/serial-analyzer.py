@@ -426,6 +426,171 @@ def wcg_group(body):
     return 'other'
 
 
+# --- paygo: the pay-as-you-go witness battery (GR17) ---------------------
+#
+# GR17 made the battery pay for itself as it is used, and the two lines below are how it
+# says so on the wire. Pass 1 over a window samples every PAYGO_LATTICE_N-th source pixel
+# and marks itself `coverage=lattice16`; passes 2..budget are FULL coverage and are DEFERRED
+# until the window is past `defer_ms` since kernel entry. That took the witness-armed
+# `kepler=` block from 17 077 ms to 2 564 ms on metal (bootpace.md section 10h).
+#
+#   [wc-g] win=1 seq=0 own=no scale=1x app=.. .. fbbad=0/60352 coverage=lattice16 us=.. -> CLEAN
+#   [wc-g] paygo win=1 state=waiting emit=1 lattice_n=16 deferred=1 defer_ms=15000 \
+#          since_entry_ms=5005 clock=entry taken=1 budget=4 -> DEFERRED
+#
+# SCOPE, and it is NOT the kepler window. This is the one thing about this section that a
+# reader must not get wrong, so it is enforced in code rather than trusted to a comment: on
+# a paygo boot the deferral horizon (15 000 ms) falls LONG AFTER the kepler window closes.
+# Measured on the s73 capture, boot 7: the window is 3646..6227 ms and holds three of the
+# seven paygo lines, while the deferred full pass on the console window (17 403 ms) and both
+# `-> PAID` completions (16 753 / 22 563 ms) are outside it. A paygo section scoped to the
+# kepler window would therefore report the console window as lattice-only and never-paid and
+# WARN about it — a false alarm — and would not see a single completion in the boot. So
+# `paygo_stats` runs over the WHOLE BOOT SEGMENT, and the report says which scope it used.
+#
+# Three rules this section will not break:
+#
+#   * `deferred=` IS A RUNNING CENSUS, NOT AN INCREMENT. The emitter prints the window's
+#     total-so-far on every line, so the reading is the value beside the GREATEST `emit=`
+#     and summing the column is always wrong. On the console window of boot 7 that is the
+#     difference between 264 (right) and 265 (a number with no meaning);
+#   * a window is only reported PAID when a `-> PAID` line was actually seen. UNPAID here is
+#     a statement about the CAPTURE, not a verdict about the kernel: a window that is still
+#     presenting when the log ends is spending its budget exactly as designed;
+#   * the WARN is the honesty check section 10h asks for, and it is deliberately narrow — a
+#     window that kept presenting PAST the deferral horizon and never once got a
+#     full-coverage pass. That is the shape in which paygo would be a coverage CUT rather
+#     than a deferral: 1/16 of the surface verified, forever, with every verdict CLEAN.
+
+WCG_PAYGO_RE = re.compile(
+    r'^\[wc-g\] paygo win=(\d+) state=(\w+) emit=(\d+) lattice_n=(\d+) deferred=(\d+) '
+    r'defer_ms=(\d+) since_entry_ms=(\d+) clock=(\w+) taken=(\d+) budget=(\d+) -> (\w+)\b')
+# `coverage=` is an INSERTION between `fbbad=` and `us=` on a sample line. Absent on any
+# build without the knob, which is a different thing from `coverage=full` and is counted
+# apart: an unmarked pass says nothing about what it covered.
+COVERAGE_RE = re.compile(r'\bcoverage=(?:lattice(\d+)|(full))\b')
+
+
+def paygo_stats(chunk):
+    """Per-window paygo census over ONE WHOLE BOOT SEGMENT (see the note above for why the
+    kepler window is the wrong scope). Returns None when the boot carries no paygo line at
+    all -- a witness-armed boot without the knob, where every field here would be a zero
+    pretending to be a measurement."""
+    wins = {}
+
+    def win(wid):
+        return wins.setdefault(wid, {
+            'id': wid, 'lattice': 0, 'full': 0, 'unmarked': 0, 'lattice_n': None,
+            'paygo': [], 'first_ms': None, 'last_ms': None, 'samples': 0,
+        })
+
+    any_paygo = False
+    defer_ms = None
+    for r in chunk:
+        body = r['body']
+        m = WCG_PAYGO_RE.match(body)
+        if m:
+            any_paygo = True
+            w = win(m.group(1))
+            w['paygo'].append({
+                'state': m.group(2), 'emit': int(m.group(3)),
+                'lattice_n': int(m.group(4)), 'deferred': int(m.group(5)),
+                'defer_ms': int(m.group(6)), 'since_entry_ms': int(m.group(7)),
+                'clock': m.group(8), 'taken': int(m.group(9)),
+                'budget': int(m.group(10)), 'verdict': m.group(11), 'row': r,
+            })
+            defer_ms = int(m.group(6))
+            continue
+        m = WCG_PASS_RE.match(body)
+        if not m:
+            continue
+        w = win(m.group(1))
+        w['samples'] += 1
+        cov = COVERAGE_RE.search(body)
+        if cov is None:
+            w['unmarked'] += 1
+        elif cov.group(2):
+            w['full'] += 1
+        else:
+            w['lattice'] += 1
+            w['lattice_n'] = int(cov.group(1))
+        if r['ts'] is not None:
+            if w['first_ms'] is None:
+                w['first_ms'] = r['ts']
+            w['last_ms'] = r['ts']
+
+    if not any_paygo:
+        return None
+
+    for w in wins.values():
+        # THE CENSUS RULE: greatest emit= wins, never a sum.
+        peak = max(w['paygo'], key=lambda p: p['emit'], default=None)
+        w['deferred'] = peak['deferred'] if peak else 0
+        w['peak_emit'] = peak['emit'] if peak else 0
+        paid = [p for p in w['paygo'] if p['verdict'] == 'PAID']
+        w['paid'] = bool(paid)
+        w['taken'] = paid[0]['taken'] if paid else (
+            max((p['taken'] for p in w['paygo']), default=0))
+        w['budget'] = w['paygo'][0]['budget'] if w['paygo'] else 0
+        w['clocks'] = sorted({p['clock'] for p in w['paygo']})
+        w['horizon'] = w['paygo'][0]['defer_ms'] if w['paygo'] else defer_ms
+        # The honesty check. Both halves are required: a window that stopped presenting
+        # before the horizon was never owed a deferred pass, and a window that got one is
+        # covered however long it ran.
+        h = w['horizon']
+        w['warn'] = (h is not None and w['last_ms'] is not None
+                     and w['last_ms'] >= h and w['full'] == 0)
+
+    return {'wins': [wins[k] for k in sorted(wins, key=int)], 'defer_ms': defer_ms}
+
+
+def print_paygo_stats(pg):
+    if pg is None:
+        print("  paygo: no '[wc-g] paygo' line in this boot — the battery ran unbudgeted "
+              "(no UNAOS_WCG_PAYGO), so there is no deferral to report.\n")
+        return
+    print(f"  paygo battery (WHOLE BOOT scope, not the kepler window: the deferral horizon "
+          f"is {pg['defer_ms']}ms since entry,")
+    print("    which on a paygo boot falls well after the kepler window closes — see the "
+          "note in the source)")
+    print(f"    {'win':>4} {'samples':>8} {'lattice':>8} {'full':>6} {'unmarked':>9} "
+          f"{'deferred':>9} {'emit':>5} {'taken/budget':>13} {'clock':>8}  status")
+    for w in pg['wins']:
+        status = 'PAID' if w['paid'] else (
+            'UNPAID at capture end' if w['paygo'] else 'no paygo line')
+        print(f"    {w['id']:>4} {w['samples']:>8} {w['lattice']:>8} {w['full']:>6} "
+              f"{w['unmarked']:>9} {w['deferred']:>9} {w['peak_emit']:>5} "
+              f"{str(w['taken']) + '/' + str(w['budget']):>13} "
+              f"{','.join(w['clocks']) or '--':>8}  {status}")
+    print("    deferred = the census beside the GREATEST emit=, never the column sum "
+          "(it is a running total).")
+    print("    UNPAID is a statement about the CAPTURE, not the kernel: a window still "
+          "presenting when the")
+    print("      log ends is spending its budget as it earns it, which is what paygo is.")
+    warned = [w for w in pg['wins'] if w['warn']]
+    for w in warned:
+        print(f"    WARN win={w['id']}: kept presenting to {w['last_ms']}ms — past the "
+              f"{w['horizon']}ms deferral horizon —")
+        print(f"      yet NO full-coverage pass ever ran ({w['lattice']} lattice, 0 full). "
+              f"The deferred pass never")
+        print("      arrived, so this window's verdicts cover 1/N of its surface and no more. "
+              "That is a coverage")
+        print("      CUT wearing a deferral's clothes, and every verdict it printed is CLEAN "
+              "about the pixels it")
+        print("      looked at. Check the gate's clock (a `clock=unarmed` paygo line can never "
+              "open it).")
+    if not warned:
+        print("    honesty check: every window that presented past the horizon got at least "
+              "one full-coverage pass.")
+    unmarked = sum(w['unmarked'] for w in pg['wins'])
+    if unmarked:
+        print(f"    NOTE: {unmarked} sample line(s) carry no `coverage=` marker at all. An "
+              f"unmarked pass is not")
+        print("      a full pass — it is a pass that did not say, and it is counted apart "
+              "rather than assumed.")
+    print("")
+
+
 def wcg_stats(win_rows):
     """Cost every line in the kepler window and fold it into groups.
 
@@ -679,10 +844,14 @@ def wcg_report(label, content, boot_sel):
         window = find_kepler_window(chunk)
         if isinstance(window, str):
             print(f"  kepler window: {window}\n")
+            # The paygo census is still worth printing: it is whole-boot scoped, so a boot
+            # whose kepler anchors never appeared can still have a complete deferral story.
+            print_paygo_stats(paygo_stats(chunk))
             continue
         start, end = window
         windows += 1
         print_wcg_stats(wcg_stats(chunk[start:end + 1]))
+        print_paygo_stats(paygo_stats(chunk))
 
     if not windows:
         print(f"{label}: no kepler window in any boot; nothing to decompose")
@@ -817,6 +986,262 @@ WCG_FIXTURE_NO_WINDOW = """\
 """
 
 
+# --wcg fixture 5 is REAL, and it is the PAYGO wire. It is boot 7 of
+# ~/unaos-bench/capture/rmbp-gr16-s73/ttyUSB0.log -- the first of the two
+# pay-as-you-go boots GR17 flew (`kepler=2564ms` on both, down from 17 077 ms;
+# bootpace.md section 10h). Two regions are stitched, and the seam is the point:
+#
+#   * the KEPLER WINDOW, trimmed by the same rule fixture 1 was cut with -- runs of
+#     consecutive lines in the same group had their interior dropped, which cannot move a
+#     group total because the merged gap lands on the run's last line and that line is in
+#     the same group. Every wc-* line and both anchors survive. 434 lines became 56;
+#   * every `[wc-g]` line AFTER the window, untouched. These are not decoration. On a paygo
+#     boot the deferral horizon (15 000 ms) falls long after the window closes at 6227 ms,
+#     so the console window's deferred full pass (17 403 ms) and BOTH `-> PAID` completions
+#     (16 753 / 22 563 ms) live out here. A fixture cut at the window would have proved a
+#     paygo reader that cannot see paygo.
+#
+# Every expected value in wcg_paygo_expect() below was checked bit-identical against the
+# UNTRIMMED boot before this text was embedded -- both the kepler-window decomposition (span,
+# all seven group costs, per-pass costs, serial census) and the whole-boot paygo census (per
+# window: samples, lattice/full/unmarked split, deferral census, peak emit, taken/budget,
+# PAID, last-present stamp). 76 comparisons, zero mismatches.
+#
+# The capture path is deliberately NOT read at runtime, for fixture 1's reason: a fixture
+# that needs a bench directory to still exist is a fixture that quietly stops running.
+WCG_FIXTURE_PAYGO = """\
+[   3646ms] [NVIDIA] Initializing Kepler GPU at BDF 1:0:0
+[   3646ms] :: x86 mmio-map: 0xc0000000..0xc1000000 uc=8 (PAT PA3) wc-kept=0 ::
+[   3652ms] :: x86 mmio-map: 0x90000000..0xa0000000 uc=113 (PAT PA3) wc-kept=15 ::
+[   3652ms] [NVIDIA] Chipset: 0xE7, Stepping: 1.20642
+[   4843ms] :: kdisp: fb-draw done ::
+[   4857ms] :: fbcon: glyphs-active base=90020000 pitch=16384 cell=16x16 cols=180 rows=112 scale=2 ::
+[   4858ms] :: [    3184 ms] portsw:flip ::
+[   4858ms] :: kdisp: console-repaint rows=4 ::
+[   4872ms] [wc-x] desktop-clear panel=2880x1800 bg=002D2B55
+[   4873ms] [wc-a] create win=1 asid=0xffffff01 surf=1312x736 stride=5248 scale=1x at (784,457) z=1
+[   4999ms] [wc-g] win=1 seq=0 own=no scale=1x app=0xcbf29ce484222325 blit=0x2088f1de4724e325 civac=0x2088f1de4724e325 after=0x2088f1de4724e325 fbbad=0/60352 coverage=lattice16 us=5119 rectscan_us=6814 slow=no -> CLEAN
+[   4999ms] [wc-g] prof win=1 seq=0 surf_bytes=3862528 cks_blit_us=5738 civac_us=5738 cks_after_us=5744 probes=60352 readback_us=102831
+[   4999ms] [wc-h] win=1 box=1314x750 span=750 band=no bytes=3942000 compose_us=2267 present_us=2660 rectscan_us=6944 torn=no -> BUFFERED
+[   4999ms] [wc-a] composite windows=1 drawn=1
+[   5005ms] [wc-h] win=1 box=1314x750 span=64 band=yes bytes=336384 compose_us=192 present_us=234 rectscan_us=592 torn=no -> BUFFERED
+[   5005ms] [wc-g] paygo win=1 state=waiting emit=1 lattice_n=16 deferred=1 defer_ms=15000 since_entry_ms=5005 clock=entry taken=1 budget=4 -> DEFERRED
+[   5180ms] [wc-d] verify win=1 surf=1312x736 band=0..64 scale=1x at (784,457) panel=2880x1800 checked=83968 bad_cache=0 bad_ram=0 ram_indep=no moved=0 nonzero=8300 cksum=0x6ea90580b6e52525 first=none -> PASS
+[   5185ms] [wc-x] console-route first-paint win=1 (glyphs -> window surface, damage-limited)
+[   5185ms] [wc-x] console-window win=1 panel=2880x1800 surf=1312x736 box=1314x750 at (783,444) cell=16x16 cols=82 rows=46
+[   5185ms] [wc-h] win=1 box=1314x750 span=80 band=yes bytes=420480 compose_us=239 present_us=290 rectscan_us=740 torn=no -> BUFFERED
+[   5185ms] [wc-x] console-window panic-fallback armed win=1 (panic paints the PANEL, not the window)
+[   5190ms] [wc-h] win=1 box=1314x750 span=750 band=no bytes=3942000 compose_us=2254 present_us=2660 rectscan_us=6944 torn=no -> BUFFERED
+[   5190ms] [wc-h] win=1 box=1314x750 span=48 band=yes bytes=252288 compose_us=144 present_us=177 rectscan_us=444 torn=no -> BUFFERED
+[   5190ms] [wc-x] activate panel=2880x1800 console_win=1
+[   5191ms] [wc-h] win=1 box=1314x750 span=64 band=yes bytes=336384 compose_us=191 present_us=233 rectscan_us=592 torn=no -> BUFFERED
+[   5191ms] [wc-h] rollup win=1 scope=window-band emit=1 age_ms=300 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 declines=0 fixture=0 whole=3 banded=4 lines=6 minspan=48 minspan_bytes=252288 maxpresent_us=2660 pop=constant frame_us=16667 -> TEAR-FREE
+[   5193ms] [wc-g] win=2 seq=0 own=no scale=8x app=0xcbf29ce484222325 blit=0x47b750fe2093a4da civac=0x47b750fe2093a4da after=0x47b750fe2093a4da fbbad=0/384 coverage=lattice16 us=1233 rectscan_us=4740 slow=no -> CLEAN
+[   5193ms] [wc-g] prof win=2 seq=0 surf_bytes=24576 cks_blit_us=36 civac_us=36 cks_after_us=36 probes=384 readback_us=622
+[   5193ms] [wc-h] win=2 box=770x526 span=526 band=no bytes=1620080 compose_us=135 present_us=1097 rectscan_us=4870 torn=no -> BUFFERED
+[   5193ms] [wc-c] side-by-side windows=2 drawn=2
+[   5200ms] [wc-x] spawn-place win=2 box=770x526 at (2102,1104) (created in place, no move)
+[   5201ms] [wc-h] win=2 box=770x526 span=526 band=no bytes=1620080 compose_us=135 present_us=1097 rectscan_us=4870 torn=no -> BUFFERED
+[   5201ms] [wc-g] paygo win=2 state=waiting emit=1 lattice_n=16 deferred=1 defer_ms=15000 since_entry_ms=5201 clock=entry taken=1 budget=4 -> DEFERRED
+[   6028ms] [wc-d] verify win=2 surf=96x64 band=none scale=8x at (2103,1117) panel=2880x1800 checked=393216 bad_cache=0 bad_ram=0 ram_indep=no moved=0 nonzero=91840 cksum=0x47b750fe2093a4da first=none -> PASS
+[   6029ms] [wcn] win=1 asid=0xffffff01 live=yes above=yes att=6 comp=7 hid=0 bel=0 rate=30.0/s comp_rate=35.0/s active=200ms parked=0ms gap=1..186ms
+[   6029ms] [wcn] win=2 asid=0xffffff02 live=yes above=yes att=1 comp=2 hid=0 bel=0 rate=0.1/s comp_rate=0.3/s active=0ms parked=0ms gap=0..0ms
+[   6029ms] [wcn] rollup scope=live wins=2 att=7 comp=9 hid=0 bel=0 stale=0 passes=9 aborted=0 att_rate=1.2/s comp_rate=1.5/s span=5663ms -> LIVE
+[   6030ms] [comp2] rollup passes=9 pass_us=128380 max_us=829460 sprite_us=0 wait_us=0 blit_us=127685 cache_us=0 bytes_pp=2078282 dmg_px_pp=519570 box_px_pp=1011006 rate=1.5/s span=5663ms
+[   6031ms] [wc-x] present win=2 rows=1104..1630 ok=true
+[   6031ms] [wc-g] win=3 seq=0 own=no scale=8x app=0xcbf29ce484222325 blit=0xda5b3a56c0971925 civac=0xda5b3a56c0971925 after=0xda5b3a56c0971925 fbbad=0/64 coverage=full us=22 rectscan_us=592 slow=no -> CLEAN
+[   6031ms] [wc-g] prof win=3 seq=0 surf_bytes=256 cks_blit_us=0 civac_us=0 cks_after_us=0 probes=64 readback_us=62
+[   6031ms] [wc-h] win=3 box=66x78 span=78 band=no bytes=20592 compose_us=7 present_us=14 rectscan_us=722 torn=no -> BUFFERED
+[   6031ms] [wc-a] create win=3 asid=0x0 surf=8x8 stride=32 scale=8x at (9,21) z=3
+[   6031ms] [wc-h] win=3 box=66x78 span=78 band=no bytes=20592 compose_us=7 present_us=21 rectscan_us=722 torn=no -> BUFFERED
+[   6031ms] [wc-g] paygo win=3 state=waiting emit=1 lattice_n=16 deferred=1 defer_ms=15000 since_entry_ms=6031 clock=entry taken=1 budget=4 -> DEFERRED
+[   6039ms] [wc-d] verify win=3 surf=8x8 band=none scale=8x at (9,21) panel=2880x1800 checked=4096 bad_cache=0 bad_ram=0 ram_indep=no moved=0 nonzero=4096 cksum=0xda5b3a56c0971925 first=none -> PASS
+[   6039ms] [wc-k] erase box=66x78 staged=yes rowbytes=264 runs=78 contig=yes compose_us=0 present_us=14 rectscan_us=722 torn=no -> BUFFERED
+[   6040ms] [wc-h] win=3 box=66x78 span=78 band=no bytes=20592 compose_us=7 present_us=14 rectscan_us=722 torn=no -> BUFFERED
+[   6040ms] [wc-h] rollup win=3 scope=window emit=1 age_ms=8 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 declines=0 fixture=0 whole=4 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=21 pop=constant frame_us=16667 -> TEAR-FREE
+[   6040ms] [wc-a] close win=3
+[   6040ms] [wc-k] erase box=66x78 staged=yes rowbytes=264 runs=78 contig=yes compose_us=0 present_us=21 rectscan_us=722 torn=no -> BUFFERED
+[   6041ms] [wc-x] move-vacate win=3 scale=8x from=(8,8) to=(90,8) box=66x78 painted=true desktop=5/5 stale=0/5 -> PASS
+[   6041ms] :: kdisp: landed trace [917D0210 0000FFFF DEAD0000 DEAD0000 DEAD0000 DEAD0000 DEAD0000] ::
+[   6210ms] [NVIDIA] Initialization complete (Phases 1-4)
+[   6211ms] [PCI-STOR] storage-class census (class 0x01 mass-storage, class 0x08/0x05 SDHCI)...
+[   6227ms] :: GPACE: span=2586ms anchor=enum:p1 since-entry=6226ms hz=2693865979 build=kepler+takeover+fifo+ivb+wc+smc+ == the pci-usb d= split ::
+[  15453ms] [wc-g] win=3 seq=0 own=no scale=6x app=0xcbf29ce484222325 blit=0xeb05052ea5b62325 civac=0xeb05052ea5b62325 after=0xeb05052ea5b62325 fbbad=0/16384 coverage=full us=1885 rectscan_us=7111 slow=no -> CLEAN
+[  15453ms] [wc-g] prof win=3 seq=0 surf_bytes=65536 cks_blit_us=97 civac_us=97 cks_after_us=97 probes=16384 readback_us=24967
+[  15453ms] [wc-g] paygo win=3 state=waiting emit=2 lattice_n=16 deferred=2 defer_ms=15000 since_entry_ms=15453 clock=entry taken=2 budget=4 -> DEFERRED
+[  15485ms] [wc-g] win=3 seq=1 own=yes scale=6x app=0xdd0a17e4be02a325 blit=0xdd0a17e4be02a325 civac=0xdd0a17e4be02a325 after=0xdd0a17e4be02a325 fbbad=0/16384 coverage=full us=2870 rectscan_us=7111 slow=no -> CLEAN
+[  15485ms] [wc-g] prof win=3 seq=1 surf_bytes=65536 cks_blit_us=97 civac_us=97 cks_after_us=97 probes=16384 readback_us=27879
+[  16753ms] [wc-g] win=3 seq=2 own=yes scale=6x app=0xdd0a17e4be02a325 blit=0xdd0a17e4be02a325 civac=0xdd0a17e4be02a325 after=0xdd0a17e4be02a325 fbbad=0/16384 coverage=full us=1839 rectscan_us=7111 slow=no -> CLEAN
+[  16753ms] [wc-g] prof win=3 seq=2 surf_bytes=65536 cks_blit_us=97 civac_us=97 cks_after_us=97 probes=16384 readback_us=24914
+[  16753ms] [wc-g] paygo win=3 state=complete emit=3 lattice_n=16 deferred=2 defer_ms=15000 since_entry_ms=16753 clock=entry taken=4 budget=4 -> PAID
+[  16753ms] [wc-g] rollup win=3 scope=window paygo=yes samples=4 coher=0 race=0 blit=0 clean=4 slow=0 maxus=2870 wit_us=78695 frame_us=16667 -> CLEAN
+[  17403ms] [wc-g] win=1 seq=0 own=no scale=1x app=0xcbf29ce484222325 blit=0x980bc87c8385e125 civac=0x980bc87c8385e125 after=0x980bc87c8385e125 fbbad=0/965632 coverage=full us=4908 rectscan_us=6814 slow=no -> CLEAN
+[  17403ms] [wc-g] prof win=1 seq=0 surf_bytes=3862528 cks_blit_us=5786 civac_us=5738 cks_after_us=5742 probes=965632 readback_us=622315
+[  17403ms] [wc-g] paygo win=1 state=waiting emit=2 lattice_n=16 deferred=264 defer_ms=15000 since_entry_ms=17403 clock=entry taken=2 budget=4 -> DEFERRED
+[  17420ms] [wc-g] win=2 seq=0 own=no scale=8x app=0xcbf29ce484222325 blit=0x47b750fe2093a4da civac=0x47b750fe2093a4da after=0x47b750fe2093a4da fbbad=0/6144 coverage=full us=1251 rectscan_us=4740 slow=no -> CLEAN
+[  17420ms] [wc-g] prof win=2 seq=0 surf_bytes=24576 cks_blit_us=36 civac_us=36 cks_after_us=36 probes=6144 readback_us=16286
+[  21230ms] [wc-g] win=4 seq=0 own=no scale=6x app=0xcbf29ce484222325 blit=0xeb05052ea5b62325 civac=0xeb05052ea5b62325 after=0xeb05052ea5b62325 fbbad=0/1024 coverage=lattice16 us=1845 rectscan_us=7111 slow=no -> CLEAN
+[  21230ms] [wc-g] prof win=4 seq=0 surf_bytes=65536 cks_blit_us=97 civac_us=97 cks_after_us=97 probes=1024 readback_us=1699
+[  21258ms] [wc-g] win=4 seq=0 own=no scale=6x app=0xcbf29ce484222325 blit=0xeb05052ea5b62325 civac=0xeb05052ea5b62325 after=0xeb05052ea5b62325 fbbad=0/16384 coverage=full us=1844 rectscan_us=7111 slow=no -> CLEAN
+[  21258ms] [wc-g] prof win=4 seq=0 surf_bytes=65536 cks_blit_us=97 civac_us=97 cks_after_us=97 probes=16384 readback_us=24848
+[  21260ms] [wc-g] win=5 seq=0 own=no scale=8x app=0xcbf29ce484222325 blit=0x9c1bda7f8c872325 civac=0x9c1bda7f8c872325 after=0x9c1bda7f8c872325 fbbad=0/256 coverage=lattice16 us=879 rectscan_us=2370 slow=no -> CLEAN
+[  21260ms] [wc-g] prof win=5 seq=0 surf_bytes=16384 cks_blit_us=24 civac_us=24 cks_after_us=24 probes=256 readback_us=405
+[  21290ms] [wc-g] win=4 seq=1 own=yes scale=6x app=0xeb05052ea5b62325 blit=0xeb05052ea5b62325 civac=0xeb05052ea5b62325 after=0xeb05052ea5b62325 fbbad=0/16384 coverage=full us=1781 rectscan_us=7111 slow=no -> CLEAN
+[  21290ms] [wc-g] prof win=4 seq=1 surf_bytes=65536 cks_blit_us=97 civac_us=97 cks_after_us=97 probes=16384 readback_us=27354
+[  22563ms] [wc-g] win=4 seq=2 own=yes scale=6x app=0xeb05052ea5b62325 blit=0xeb05052ea5b62325 civac=0xeb05052ea5b62325 after=0xeb05052ea5b62325 fbbad=0/16384 coverage=full us=23 rectscan_us=7111 slow=no -> CLEAN
+[  22563ms] [wc-g] prof win=4 seq=2 surf_bytes=65536 cks_blit_us=97 civac_us=97 cks_after_us=97 probes=16384 readback_us=24601
+[  22563ms] [wc-g] paygo win=4 state=complete emit=1 lattice_n=16 deferred=0 defer_ms=15000 since_entry_ms=22563 clock=entry taken=4 budget=4 -> PAID
+[  22563ms] [wc-g] rollup win=4 scope=window paygo=yes samples=4 coher=0 race=0 blit=0 clean=4 slow=0 maxus=1845 wit_us=79666 frame_us=16667 -> CLEAN
+[  22571ms] [wc-g] win=5 seq=1 own=yes scale=8x app=0x9c1bda7f8c872325 blit=0x9c1bda7f8c872325 civac=0x9c1bda7f8c872325 after=0x9c1bda7f8c872325 fbbad=0/4096 coverage=full us=795 rectscan_us=2370 slow=no -> CLEAN
+[  22571ms] [wc-g] prof win=5 seq=1 surf_bytes=16384 cks_blit_us=24 civac_us=24 cks_after_us=24 probes=4096 readback_us=6538
+[  23705ms] [wc-g] win=1 seq=0 own=no scale=1x app=0xcbf29ce484222325 blit=0x980bc87c8385e125 civac=0x980bc87c8385e125 after=0x980bc87c8385e125 fbbad=0/965632 coverage=full us=4938 rectscan_us=6814 slow=no -> CLEAN
+[  23705ms] [wc-g] prof win=1 seq=0 surf_bytes=3862528 cks_blit_us=5785 civac_us=5759 cks_after_us=5759 probes=965632 readback_us=563537
+[  23715ms] [wc-g] win=5 seq=1 own=no scale=8x app=0x9c1bda7f8c872325 blit=0x9c1bda7f8c872325 civac=0x9c1bda7f8c872325 after=0x9c1bda7f8c872325 fbbad=0/4096 coverage=full us=884 rectscan_us=2370 slow=no -> CLEAN
+[  23715ms] [wc-g] prof win=5 seq=1 surf_bytes=16384 cks_blit_us=24 civac_us=24 cks_after_us=24 probes=4096 readback_us=6555
+"""
+
+# --wcg fixture 6 is SYNTHETIC and exists for the case the metal has never produced: the
+# DEFERRAL THAT NEVER PAID. No capture shows it, which is exactly why it needs a fixture --
+# the WARN is the honesty check section 10h asks for, and an untested warning is a warning
+# that fires wrong the first time it matters.
+#
+# win=1 is the defect: it keeps presenting to 20 000 ms, well past the 15 000 ms horizon,
+# and every one of its passes is `coverage=lattice16`. Its gate is stuck (`clock=unarmed`
+# on the second paygo line -- the emitter's way of saying `since_entry_ms` could not be
+# read, so the deferral can never open). It must WARN and report UNPAID.
+#
+# win=2 is the CONTROL, and it is what makes the WARN meaningful rather than universal: same
+# boot, same horizon, lattice pass 1 then a deferred full pass, `-> PAID`. A check that
+# warns about every window says nothing about any of them.
+#
+# win=3 exercises two counters that must not be conflated with the above: a sample carrying
+# NO `coverage=` marker at all (counted apart -- an unmarked pass is not a full pass, it is
+# a pass that did not say), on a window that stops BEFORE the horizon and is therefore owed
+# no deferred pass and must NOT warn.
+#
+# The deferral census is also under test here: win=1 prints `deferred=1` then `deferred=99`.
+# The reading is 99 -- the value beside the greatest `emit=` -- and the column sum, 100, is
+# a number with no meaning. A reader that adds them gets a plausible-looking wrong answer,
+# which is the worst kind.
+WCG_FIXTURE_PAYGO_WARN = """\
+[      0ms] bootpace: entry
+[     10ms] [NVIDIA] Initializing Kepler GPU at BDF 1:0:0
+[    110ms] :: kepler: takeover complete ::
+[    200ms] [wc-g] win=1 seq=0 own=no scale=1x app=0x1 blit=0x1 civac=0x1 after=0x1 fbbad=0/64 coverage=lattice16 us=10 rectscan_us=20 slow=no -> CLEAN
+[    205ms] [wc-g] paygo win=1 state=waiting emit=1 lattice_n=16 deferred=1 defer_ms=15000 since_entry_ms=205 clock=entry taken=1 budget=4 -> DEFERRED
+[    220ms] [wc-g] win=2 seq=0 own=no scale=8x app=0x2 blit=0x2 civac=0x2 after=0x2 fbbad=0/16 coverage=lattice16 us=8 rectscan_us=20 slow=no -> CLEAN
+[    225ms] [wc-g] paygo win=2 state=waiting emit=1 lattice_n=16 deferred=1 defer_ms=15000 since_entry_ms=225 clock=entry taken=1 budget=4 -> DEFERRED
+[    240ms] [wc-g] win=3 seq=0 own=no scale=8x app=0x3 blit=0x3 civac=0x3 after=0x3 fbbad=0/16 us=8 rectscan_us=20 slow=no -> CLEAN
+[    300ms] :: GPACE: span=290ms anchor=enum:p1 since-entry=300ms hz=123456 build=kepler+takeover+fifo+ivb+wc+ == the pci-usb d= split ::
+[  16000ms] [wc-g] win=1 seq=0 own=no scale=1x app=0x1 blit=0x1 civac=0x1 after=0x1 fbbad=0/64 coverage=lattice16 us=10 rectscan_us=20 slow=no -> CLEAN
+[  16005ms] [wc-g] paygo win=1 state=waiting emit=2 lattice_n=16 deferred=99 defer_ms=15000 since_entry_ms=0 clock=unarmed taken=1 budget=4 -> DEFERRED
+[  16100ms] [wc-g] win=2 seq=1 own=yes scale=8x app=0x2 blit=0x2 civac=0x2 after=0x2 fbbad=0/256 coverage=full us=40 rectscan_us=20 slow=no -> CLEAN
+[  16110ms] [wc-g] paygo win=2 state=complete emit=2 lattice_n=16 deferred=1 defer_ms=15000 since_entry_ms=16110 clock=entry taken=4 budget=4 -> PAID
+[  20000ms] [wc-g] win=1 seq=0 own=no scale=1x app=0x1 blit=0x1 civac=0x1 after=0x1 fbbad=0/64 coverage=lattice16 us=10 rectscan_us=20 slow=no -> CLEAN
+"""
+
+
+def paygo_window(pg, wid):
+    for w in pg['wins']:
+        if w['id'] == wid:
+            return w
+    raise AssertionError(f'no paygo window {wid} in fixture')
+
+
+def wcg_paygo_expect(st):
+    """Expected values for the real boot-7 paygo window. METAL numbers, and the point of
+    them is the CONTRAST with wcg_expect() above: same bench, same battery, same four
+    samples per window -- and the kepler window's wc-g cost falls from 11 542 ms to 128 ms
+    because pass 1 now walks a 1-in-16 lattice and the full passes are deferred out of the
+    measured span. That 90x is what section 10h claims; this is it, re-derived from the
+    wire by this code path."""
+    g = st['groups']
+    return [
+        ('window span', st['span'], 2581),
+        ('wc-g cost', g['wc-g']['cost'], 128),
+        ('wc-d cost', g['wc-d']['cost'], 1010),
+        ('wc-h cost', g['wc-h']['cost'], 14),
+        ('wc-k cost', g['wc-k']['cost'], 0),
+        ('wcn cost', g['wcn']['cost'], 1),
+        ('bring-up cost', g['bring-up']['cost'], 1360),
+        ('other cost', g['other']['cost'], 68),
+        ('accounted == span', sum(e['cost'] for e in g.values()), 2581),
+        ('per-pass costs', [p['cost'] for p in st['passes']], [126, 2, 0]),
+        ('pass total', st['pass_cost'], 128),
+        ('prof lines present', st['has_prof'], True),
+        ('witness-tagged lines', st['serial_lines'], 30),
+        ('witness-tagged bytes', st['serial_bytes'], 4785),
+    ]
+
+
+def paygo_expect_real(pg):
+    """The whole-boot paygo census for the same fixture. Read against the untrimmed boot."""
+    w1 = paygo_window(pg, '1')
+    w3 = paygo_window(pg, '3')
+    w5 = paygo_window(pg, '5')
+    return [
+        ('deferral horizon', pg['defer_ms'], 15000),
+        ('windows seen', [w['id'] for w in pg['wins']], ['1', '2', '3', '4', '5']),
+        # The console window: one lattice pass in the kepler window, two deferred full
+        # passes long after it, and still spending its budget when the log ends.
+        ('win1 samples', w1['samples'], 3),
+        ('win1 lattice/full', (w1['lattice'], w1['full']), (1, 2)),
+        ('win1 lattice_n', w1['lattice_n'], 16),
+        # 264, NOT 265: the census is the value beside the greatest emit=, never the sum.
+        ('win1 deferral census', w1['deferred'], 264),
+        ('win1 peak emit', w1['peak_emit'], 2),
+        ('win1 taken/budget', (w1['taken'], w1['budget']), (2, 4)),
+        ('win1 PAID at capture end', w1['paid'], False),
+        ('win1 last present (ms)', w1['last_ms'], 23705),
+        ('win1 WARN', w1['warn'], False),
+        ('win3 all-full battery', (w3['lattice'], w3['full']), (0, 4)),
+        ('win3 PAID', w3['paid'], True),
+        ('win3 taken/budget', (w3['taken'], w3['budget']), (4, 4)),
+        ('win4 PAID', paygo_window(pg, '4')['paid'], True),
+        # A window that presented but never emitted a paygo line of its own: reported as
+        # 'no paygo line', which is not the same statement as UNPAID.
+        ('win5 paygo lines', len(w5['paygo']), 0),
+        ('win5 lattice/full', (w5['lattice'], w5['full']), (1, 2)),
+        ('unmarked samples in boot', sum(w['unmarked'] for w in pg['wins']), 0),
+        ('windows warned', [w['id'] for w in pg['wins'] if w['warn']], []),
+    ]
+
+
+def paygo_expect_warn(pg):
+    """The synthetic never-paid fixture. The WARN must fire on win=1 and ONLY on win=1."""
+    w1 = paygo_window(pg, '1')
+    w2 = paygo_window(pg, '2')
+    w3 = paygo_window(pg, '3')
+    return [
+        ('deferral horizon', pg['defer_ms'], 15000),
+        ('win1 lattice/full', (w1['lattice'], w1['full']), (3, 0)),
+        # 99, not 1+99: the census rule, asserted where getting it wrong is plausible.
+        ('win1 deferral census', w1['deferred'], 99),
+        ('win1 peak emit', w1['peak_emit'], 2),
+        ('win1 PAID', w1['paid'], False),
+        ('win1 last present (ms)', w1['last_ms'], 20000),
+        ('win1 WARN (never paid past the horizon)', w1['warn'], True),
+        ('win1 clocks seen', w1['clocks'], ['entry', 'unarmed']),
+        # The control: same boot, same horizon, deferred pass arrived.
+        ('win2 lattice/full', (w2['lattice'], w2['full']), (1, 1)),
+        ('win2 PAID', w2['paid'], True),
+        ('win2 WARN', w2['warn'], False),
+        # Unmarked pass, and a window that stopped before the horizon: no warn is owed.
+        ('win3 unmarked samples', w3['unmarked'], 1),
+        ('win3 lattice/full', (w3['lattice'], w3['full']), (0, 0)),
+        ('win3 WARN', w3['warn'], False),
+        ('windows warned', [w['id'] for w in pg['wins'] if w['warn']], ['1']),
+    ]
+
+
+def paygo_boot_stats(text, boot=1):
+    """Whole-boot paygo census for one fixture (never the kepler window -- see the note
+    on paygo_stats)."""
+    rows = load_rows(text)
+    _hz, chunk = segment_by_hz(rows)[boot - 1]
+    return paygo_stats(chunk)
+
+
 def wcg_window_stats(text, boot=1):
     """Costed stats for one fixture's kepler window, or None when it has none."""
     rows = load_rows(text)
@@ -879,7 +1304,12 @@ def selftest(top):
     --wcg: the real GR16/s73 kepler window (values asserted against metal), a
     synthetic window carrying the not-yet-shipped '[wc-g] prof' lines plus a
     deferred witness line and a '?ms' line, and two captures that must be
-    REFUSED -- one with no logts prefixes, one with no kepler window."""
+    REFUSED -- one with no logts prefixes, one with no kepler window.
+
+    --wcg paygo: the real GR17 boot-7 paygo wire (kepler window AND the deferred
+    passes that land after it), and a synthetic boot in which the deferral never
+    pays -- the one case metal has not produced, and the only one that exercises
+    the coverage WARN."""
     ok = True
 
     for name, text, expect_ok in (
@@ -900,6 +1330,8 @@ def selftest(top):
          WCG_FIXTURE_S73, True, wcg_expect),
         ('wcg: synthetic window WITH [wc-g] prof lines',
          WCG_FIXTURE_PROF, True, wcg_prof_expect),
+        ('wcg: real GR17 boot-7 paygo wire (lattice pass 1, deferred full passes)',
+         WCG_FIXTURE_PAYGO, True, wcg_paygo_expect),
         ('wcg: no logts prefixes (must refuse)', WCG_FIXTURE_NO_LOGTS, False, None),
         ('wcg: no kepler window (must refuse)', WCG_FIXTURE_NO_WINDOW, False, None),
     ):
@@ -923,6 +1355,43 @@ def selftest(top):
         print(f"=== selftest: {name}: {'PASS' if case_ok else 'FAIL'} "
               f"(expected {'ok' if expect_ok else 'refusal'}, got "
               f"{'ok' if got else 'refusal'})\n")
+
+    # The paygo census is WHOLE-BOOT scoped, so it is asserted through its own entry point
+    # rather than through the kepler-window helper above. Doing it any other way is the very
+    # mistake the scope note on paygo_stats warns about, and a self-test that made it would
+    # certify the bug.
+    for name, text, checker in (
+        ('paygo: real GR17 boot-7 census (deferred passes land AFTER the kepler window)',
+         WCG_FIXTURE_PAYGO, paygo_expect_real),
+        ('paygo: synthetic deferral that NEVER PAID (the coverage WARN)',
+         WCG_FIXTURE_PAYGO_WARN, paygo_expect_warn),
+    ):
+        print(f"=== selftest: {name} ===")
+        pg = paygo_boot_stats(text)
+        case_ok = pg is not None
+        if pg is None:
+            print("    BAD no paygo lines found in fixture")
+        else:
+            print_paygo_stats(pg)
+            for label, actual, want in checker(pg):
+                good = actual == want
+                if not good:
+                    case_ok = False
+                print(f"    {'ok ' if good else 'BAD'} {label}: "
+                      f"got {actual!r}, want {want!r}")
+        if not case_ok:
+            ok = False
+        print(f"=== selftest: {name}: {'PASS' if case_ok else 'FAIL'}\n")
+
+    # A witness-armed boot with no paygo knob must report the ABSENCE, not a table of zeros
+    # that reads like a measurement. The real s73 fixture (fixture 1) is exactly that boot.
+    print("=== selftest: paygo: witness-armed boot with NO paygo knob (must report absence) ===")
+    absent_ok = paygo_boot_stats(WCG_FIXTURE_S73) is None
+    if not absent_ok:
+        ok = False
+    print(f"    {'ok ' if absent_ok else 'BAD'} no-knob boot yields no paygo census: "
+          f"got {paygo_boot_stats(WCG_FIXTURE_S73) is None!r}, want True")
+    print(f"=== selftest: paygo: no-knob boot: {'PASS' if absent_ok else 'FAIL'}\n")
 
     return ok
 
