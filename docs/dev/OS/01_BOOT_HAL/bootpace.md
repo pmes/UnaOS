@@ -685,6 +685,132 @@ fixture ladder doing real transfers, not a wait — it is named here so the next
 not mistake the residual for more edge-blocking. The ~0 ms default floor is
 `sched::init` + `sched::enable` + one serial line, and there is nothing left in it.
 
+### 8f. `enum` decomposed to the millisecond — 79% of it is USB 2.0 minima (GR19, 2026-08-06)
+
+M4/M5 took `init=` 2021 → 1482 ms and left `enum` as the largest class: `enum=285ms(n=1)` on
+controller [0] and `enum=576ms(n=1)` on [1], 861 ms of the remaining 1470. This section
+decomposes those 861 ms **without a new boot**: the M1/M5 witness lines already carry
+timestamps at every phase boundary, so the post-M4/M5 boots of
+`~/unaos-bench/capture/rmbp-gr16-s73/ttyUSB0.log` (final boot, L15607-L15746) decompose the
+class arithmetically. Reading the timeline against the code:
+
+| item | site | [0] | [1] | total | verdict |
+|---|---|---|---|---|---|
+| `hubpwr` — bPwrOn2PwrGood + T_ATTDB | `bring_up_hub`, `settle_ms(pwr2good+100)` | 200 | 400 | **600 ms** | **floor.** USB 2.0 §11.23.2.1 (all three hubs declare `pwr-on 2 good 100 ms`) + §7.1.7.3. Confirms §8c; now cited at the site. |
+| `hubrst` — T_DRST + poll | port reset loop | 20 | 100 | **120 ms** | 10 ms is the §11.5.1.5 floor; the other 10 is **poll quantization** — see M6 |
+| T_RSTRCY — 10 ms/port | `settle_ms(10)` before `enumerate_at_zero` | 10 | 50 | **60 ms** | **floor**, USB 2.0 §7.1.7.5 |
+| SET_ADDRESS recovery — 2 ms/device | `settle_ms(2)` in `enumerate_at_zero` | 4 | 12 | **16 ms** | **floor**, USB 2.0 §9.2.6.3 |
+| `hidcfg` | `configure_hid` | 5 | 7 | **12 ms** | real work |
+| control transfers (the rest of `resid`) | `control()` | ~47 | ~7 | **~54 ms** | **undecomposed — instrumented, not trimmed.** See M7 |
+| sum | | 286 | 576 | **862 ms** | (matches `enum=286` / `576`, L15743-15744) |
+
+The per-port arithmetic is visible in the log rather than inferred. Controller [1]: root RMH
+addressed at `t=1521ms` (L15666) → `hub addr 1: 8 downstream ports` → +200 ms `hubpwr` → port 1
+reset clears at `1742ms` (L15668, `1521+200+20`) → child addressed at `1757ms` (L15669, i.e.
+10 T_RSTRCY + 2 SET_ADDRESS recovery + ~3 ms of wire) → and so on through five ports and two
+hub tiers to `M2 armed keyboard` at `2095ms` (L15682). Every gap is a named floor plus 1-3 ms.
+**676 of the 861 ms (79%) are USB 2.0 minima this arc will not touch.**
+
+**The one anomaly the timeline exposes, and why it is not trimmed.** Controller [0] spends
+`1241ms` → `1299ms` — **58 ms** (L15641 → L15642) — on a single device, `05ac:8510` at
+address 2. Subtract the 10 ms T_RSTRCY and the 2 ms SET_ADDRESS recovery and **46 ms** is three
+control transfers: `GET_DESCRIPTOR(8)`, `SET_ADDRESS`, `GET_DESCRIPTOR(18)`. The *same* three
+transfers against the RMH one tier up cost **2 ms** (L15638 → L15639), and against every device
+on controller [1] cost 1-3 ms. 46 ms is more than half of all `resid` in the boot and it is a
+single device. Two hypotheses fit it and they want opposite fixes:
+
+* **ours** — `overlay_txn` toggles `USBCMD.ASE` **per stage** and bounded-waits `USBSTS.ASS`
+  both ways. EHCI 1.0 §4.8.2 lets the controller defer that transition to a frame boundary, so
+  a control transfer can pay up to six ~1 ms handshakes it does not need. Hoisting ASE across
+  the three stages would be ours to take.
+* **the device's** — it NAKs its way through address assignment, in which case there is nothing
+  to trim and hoisting ASE would be a behavioural change to the transport path bought with
+  nothing.
+
+Per this ledger's own law an undecomposed constant is not trimmed. **EPACE-TRIM M7** measures
+it instead, and the measurement is what decides the next arc.
+
+**EPACE-TRIM M7 — the transport meter, and the two cuts that must not be added.** The EPACE
+line grows a second group, in braces:
+`… [hubpwr=… hubrst=… hidcfg=… resid=…] {xfer=…(n=…) ass=… act=…}`. `[]` is a **partition** —
+disjoint phase classes summing to `enum`. `{}` is an **overlapping** view: a control transfer
+runs inside whichever class is open, so `xfer` is a second cut of the same milliseconds and
+adding it to the bracket double-counts. The braces exist so that cannot happen by accident.
+`xfer` is wall time inside `control()` (every EP0 transfer, `n=` its count, both transports);
+`ass` is the two ASS handshakes per overlay stage; `act` is the wait for the overlay token's
+Active bit — the device and the wire. On QEMU's chain path `ass`/`act` stay 0 while `xfer`
+counts, which is the honest reading of a path that never runs `overlay_txn`, not a dead counter.
+`xfer − ass − act` is driver-side setup/teardown.
+
+**EPACE-TRIM M6 — the poll granularity, which M5's own capture convicted on its first boot.**
+M5 replaced a blind `settle_ms(50)` with the §11.5.1.5 T_DRST floor plus a 10 ms poll. Every
+port then reported the same thing: `PORT_RESET cleared after ~20 ms (T_DRST floor 10 ms + 1 poll
+step(s))` — six ports (L15641, L15668, L15671, L15674, L15677, L15680), three boots, **one poll
+step every time, never zero and never two**. That is the M5 signature one level down: the true
+clear point lies inside (10, 20] ms and the 10 ms grain rounds it up to 20. M6 takes the grain
+to 2 ms. It is nearly free because each probe is a hub-addressed `GET_PORT_STATUS` costing
+~0.15 ms here — the six no-connection probes for ports 3-7 between L15672 (`t=1794ms`) and
+L15674 (`t=1815ms`) fit inside the 1 ms that gap leaves over the 20 ms reset — so five buckets
+cost at most ~0.6 ms per port. The wall-clock budget is deliberately identical: 10 + 300 × 2 =
+610 ms against M5's 10 + 60 × 10 = 610 ms, same loud exit.
+
+Both M5 thresholds are now stated in **milliseconds** rather than step counts, so the next
+change of grain cannot silently move them, and M6 carries its own tripwire:
+
+* the bit never cleared — `EPACE-TRIM M5 TRIPWIRE`, and the line says it is a timeout, not a
+  measurement (unchanged).
+* `rst_ms >= 50` — `EPACE-TRIM M5 TRIPWIRE`: this hardware wanted the constant M5 replaced.
+* `rst_ms >= 20` — **`EPACE-TRIM M6 TRIPWIRE`**: the finer grain still landed at or past the
+  20 ms the 10 ms grain reported, so the grain was **not** quantizing and M6 bought nothing on
+  this port. A legitimate outcome on healthy hardware, which is exactly why it is a named
+  tripwire and not a failure — it can fire, and its absence is the trim paying.
+* `10 < rst_ms < 20` — the quiet line, now naming the grain it measured with.
+
+**Coverage, stated plainly: none.** As §8c recorded for M4/M5, the x86 QEMU targets attach
+`qemu-xhci` and no EHCI function, so `drivers/ehci` never executes there. M6 and M7 are
+metal-only; `./arroyo check` (both arches, plain and `UNAOS_WITNESS=1 UNAOS_LOGTS=1`) is the
+whole automated gate and QEMU-green carries zero information about either.
+
+**Prediction for the next metal boot** (before → after, and the lines that decide it):
+
+| reading | before (s73 boots 6-8) | predicted after |
+|---|---|---|
+| `EPACE: [0] hubrst=` | 20 ms (n=1) | **12-20 ms**, n=1 |
+| `EPACE: [1] hubrst=` | 100 ms (n=5) | **60-100 ms**, n=5 |
+| `EPACE: [0] enum=` | 285/286 ms | **277-286 ms** |
+| `EPACE: [1] enum=` | 576 ms | **536-576 ms** |
+| `EPACE: … init=` | 1482 ms | **1435-1484 ms** |
+| `BPACE: ehci-hid-done d=` | 1482 ms | same as `init=` ± the EPACE print cost (§8 self-check) |
+| `{xfer=…(n=…)}` on [0] | absent | present; `xfer` ≈ **50-60 ms** (the 46 ms anomaly plus a few), `n` ≈ **25-40** (one hub tier, two devices, six root-port probes, one chain-mode HSE attempt) |
+| `{xfer=…(n=…)}` on [1] | absent | present; `xfer` ≈ **10-25 ms**, `n` ≈ **60-95** (two hub tiers, six devices, ten port-status walks) |
+| `ass=` vs `act=` on [0] | absent | **the verdict.** `ass` ≳ 35 ms indicts our per-stage ASE toggle (next arc hoists it); `act` ≳ 35 ms acquits it and closes the 46 ms as the device's own |
+
+M6's saving is bounded at 0-48 ms and is *deliberately* an unknown inside that band — recovering
+the number the 10 ms grain was hiding is the point, and 0 ms (every port reporting the M6
+tripwire) is a valid, informative result, not a failure. The upper bound on `init=` is 2 ms
+above the 1482 baseline because the two EPACE lines each grew ~40 characters of `{}` group and
+those prints are inside the `init` span (§8c measured EPACE's own print cost at ~11 ms).
+
+**Structural falsifiers — the `n=` counts and the arming line, unchanged from §8c.** A trim that
+loses a device makes every `ms` reading above look *better*, so these gate the arc regardless of
+`init=`:
+
+| reading | required | what a change would mean |
+|---|---|---|
+| `EPACE: [1] hubrst n=` | **5** | a downstream port stopped being reset — M6 changed the loop |
+| `EPACE: [0] hubrst n=` | **1** | same |
+| `EPACE: [0] hubpwr n=` / `[1] hubpwr n=` | **1** / **2** | a hub tier vanished from the walk |
+| `EPACE: [0] rootrst n=` / `[1] rootrst n=` | **3** / **2** | unchanged by this arc; a move means M4's debounce placement shifted |
+| `EPACE: [0] enum n=` / `[1] enum n=` | **1** / **1** | the top-level span itself changed shape |
+| `:: EHCI-HID: [1] M2 armed keyboard addr=6 ep=IN3 mps=10 interval=8 (boot protocol) ==` witness `::` | **present, identical** | the internal keyboard is the whole point of this driver; if this line moves or goes, nothing else in the table matters |
+| six `PORT_RESET cleared after ~N ms` lines (or their M6-tripwire form) | **six, one per reset port** | a port stopped reporting — the silent-skip class |
+| `{xfer=…}` `n=` on [0] vs [1] | **[1] > [0]** | [1] walks two hub tiers and six devices to [0]'s one and two; an inversion means the meter is counting the wrong thing |
+
+**Not trimmed, and why.** `hubpwr` (600 ms), `rootrst` (480 ms), T_RSTRCY (60 ms) and
+SET_ADDRESS recovery (16 ms) are **1156 ms of USB 2.0 minima** across §8c and this section. The
+46 ms transfer anomaly is undecomposed and therefore untouched by law; M7 is what earns the
+right to trim it.
+
 ## 9. GPACE — the inside of `pci-usb` (GR13)
 
 Once EPACE took `ehci-hid-done` down, the s60 capture's largest remaining block

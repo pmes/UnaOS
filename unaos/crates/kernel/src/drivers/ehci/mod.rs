@@ -336,6 +336,11 @@ struct ReportLayout {
 // hidcfg) accumulate inside the top-level `enum` span; `resid=` prints `enum` minus its named
 // parts, so unattributed time is a visible number, never a silent absence.
 //
+// The line carries TWO cuts of the same boot and they are not addable. `[]` is the partition —
+// disjoint phase classes that sum to `enum`. `{}` (M7: `xfer`/`ass`/`act`) is an OVERLAPPING
+// view of the transport, which runs inside every one of those classes. Adding a `{}` term to
+// the `[]` sum double-counts; the braces are there so a reader cannot do it by accident.
+//
 // Instrument honesty (the can-this-lie-while-looking-right check):
 //   * Same clock as the code under measurement — `now_cycles()`/rdtsc, converted at PRINT time
 //     via `apic::tsc_hz()`, the exact rate `settle_ms` itself uses. If calibration is wrong the
@@ -367,11 +372,32 @@ const EPACE_TAGS: [&str; N_EPACE] =
 struct Epace {
     cy: [u64; N_EPACE],
     n: [u32; N_EPACE],
+    // ── EPACE-TRIM M7 (GR19) — the OVERLAPPING transport view ────────────────────────────────
+    // These three are NOT members of the `[]` bracket and must never be added to it. A control
+    // transfer runs *inside* whichever class happens to be open — hubpwr's PORT_POWER writes,
+    // hubrst's GET_PORT_STATUS polls, hidcfg's descriptor reads, resid's addressing traffic —
+    // so this is a second, crosscutting cut of the SAME milliseconds. It is printed in `{}` to
+    // keep the two views visually un-addable, and it exists to answer one question the `[]`
+    // view cannot: of the ~54 ms of pure wire time inside `enum` on the s73 baseline, how much
+    // is the device answering and how much is this driver's own per-stage ASE toggle?
+    //   `xfer` — wall time inside `control()`, every EP0 transfer in the driver, with `n=` the
+    //            transfer count. Charged on BOTH transports (chain and overlay-direct).
+    //   `ass`  — the two bounded USBSTS.ASS handshakes overlay_txn runs per stage (ASE 0→1 and
+    //            1→0). Overlay-direct ONLY: on QEMU's chain path this stays 0 while `xfer`
+    //            counts, which is the honest reading, not a broken counter.
+    //   `act`  — the bounded wait for the overlay token's Active bit to clear, i.e. the device
+    //            and the wire. Overlay-direct only, same caveat.
+    // `xfer - ass - act` is the driver-side setup/teardown and the serial cost of any witness
+    // line a failing transfer prints.
+    xfer_cy: u64,
+    xfer_n: u32,
+    ass_cy: u64,
+    act_cy: u64,
 }
 
 impl Epace {
     const fn new() -> Self {
-        Epace { cy: [0; N_EPACE], n: [0; N_EPACE] }
+        Epace { cy: [0; N_EPACE], n: [0; N_EPACE], xfer_cy: 0, xfer_n: 0, ass_cy: 0, act_cy: 0 }
     }
     /// Close a span opened at `t0` (a `now_cycles()` reading) into class `class`.
     fn add(&mut self, class: usize, t0: u64) {
@@ -379,6 +405,13 @@ impl Epace {
             .wrapping_add(crate::arch::now_cycles().wrapping_sub(t0));
         self.n[class] = self.n[class].saturating_add(1);
     }
+}
+
+/// M7 — close a span opened at `t0` into one of the overlapping transport accumulators. Free
+/// function rather than an `Epace` method so it can be called while `self` is otherwise borrowed.
+#[inline]
+fn epace_accum(slot: &mut u64, t0: u64) {
+    *slot = slot.wrapping_add(crate::arch::now_cycles().wrapping_sub(t0));
 }
 
 /// Cycles → whole ms at print time, `None` when the TSC rate is still unknown (pre-calibration) —
@@ -623,10 +656,32 @@ impl Controller {
         })
     }
 
+    /// EPACE-TRIM M7 (GR19) — the transport meter. Every EP0 control transfer in this driver
+    /// goes through this one function, so this is the only place that can price the transport as
+    /// a whole without double-counting. It measures `control_txn` and nothing else: the settles
+    /// that bracket transfers at the call sites (T_RSTRCY, SET_ADDRESS recovery, pwr2good) stay
+    /// outside, which is what makes `xfer=` subtractable from `resid=` by hand.
+    unsafe fn control(
+        &mut self,
+        t: &Target,
+        bm_req: u8,
+        b_req: u8,
+        w_value: u16,
+        w_index: u16,
+        w_length: u16,
+        dir_in: bool,
+    ) -> Result<u32, &'static str> {
+        let t0 = crate::arch::now_cycles();
+        let r = self.control_txn(t, bm_req, b_req, w_value, w_index, w_length, dir_in);
+        epace_accum(&mut self.pace.xfer_cy, t0);
+        self.pace.xfer_n = self.pace.xfer_n.saturating_add(1);
+        r
+    }
+
     /// One synchronous EP0 control transfer through the shared QH (the EHCI analogue of xHCI's
     /// `sync_control`: main-loop context, never inside an interrupt). Returns the transferred
     /// data-stage byte count. Bounded — a wedged Active bit is a traced Err, never a hang.
-    unsafe fn control(
+    unsafe fn control_txn(
         &mut self,
         t: &Target,
         bm_req: u8,
@@ -875,17 +930,35 @@ impl Controller {
         // printed as `PSS on=/off=`, i.e. a field labelled PERIODIC reporting the ASYNC
         // schedule, in the one path a reader only ever reaches while something is already
         // wrong. Bit 14 is PSS; see `STS_PSS`.
+        // EPACE-TRIM M7 (GR19) — the two ASS handshakes and the completion wait are metered
+        // separately. The s73 baseline puts ~54 ms of pure control-transfer time inside `enum`,
+        // 46 ms of it on a SINGLE device (controller 0's 05ac:8510 at addr 2, ttyUSB0.log L15641
+        // → L15642: 58 ms for three transfers, minus 10 ms T_RSTRCY and 2 ms SET_ADDRESS
+        // recovery), while the same three transfers against the RMH one tier up cost 2 ms
+        // (L15638 → L15639). Two hypotheses fit that, and they want opposite fixes: the ASE
+        // 0→1/1→0 toggle this function runs PER STAGE costs a frame boundary each way (EHCI 1.0
+        // §4.8.2 lets the controller defer the ASS transition), which would be ~6 handshakes per
+        // transfer and is ours to hoist; or the device NAKs its way through address assignment,
+        // which is the device's own and not trimmable. `ass` vs `act` separates them. Per the
+        // ledger's law an undecomposed constant is not trimmed — so this arc measures it and
+        // does not touch the toggle.
+        let ass_t0 = crate::arch::now_cycles();
         let ass_on = wait_bounded(|| {
             mmio_read32(self.op + OP_USBSTS).unwrap_or(0) & (1 << 15) != 0
         });
+        epace_accum(&mut self.pace.ass_cy, ass_t0);
+        let act_t0 = crate::arch::now_cycles();
         let done = wait_bounded(|| {
             core::ptr::read_volatile(&(*qh).overlay[2]) & QTD_ACTIVE == 0
         });
+        epace_accum(&mut self.pace.act_cy, act_t0);
         let cmd2 = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
         let _ = mmio_write32(self.op + OP_USBCMD, cmd2 & !CMD_ASE);
+        let ass_off_t0 = crate::arch::now_cycles();
         let ass_off = wait_bounded(|| {
             mmio_read32(self.op + OP_USBSTS).unwrap_or(0) & (1 << 15) == 0
         });
+        epace_accum(&mut self.pace.ass_cy, ass_off_t0);
         let tok = core::ptr::read_volatile(&(*qh).overlay[2]);
 
         if !done {
@@ -1139,6 +1212,12 @@ impl Controller {
         for port in 1..=nbr_ports as u16 {
             let _ = self.control(hub, 0x23, 3, 8, port, 0, false);
         }
+        // Two USB 2.0 minima back to back, and GR19 re-derived both rather than trim them:
+        // `pwr2good_ms` is the hub's own bPwrOn2PwrGood (§11.23.2.1, in 2 ms units — all three
+        // hubs on this machine declare 100 ms), and the `+ 100` is T_ATTDB (§7.1.7.3), the
+        // connect debounce that for an ALREADY-attached downstream device starts at power-good
+        // and must complete before the port reset below. `hubpwr=200ms(n=1)` / `400ms(n=2)` is
+        // 600 ms of this class on the s73 baseline and every millisecond of it is spec floor.
         settle_ms(pwr2good_ms + 100);
         self.pace.add(EP_HUBPWR, hubpwr_t0);
 
@@ -1168,17 +1247,41 @@ impl Controller {
             // constant that hides the number it is standing in for is exactly what the poll is
             // for. So: start at the USB 2.0 §11.5.1.5 T_DRST floor (10 ms — the minimum a hub may
             // drive reset for) and let the existing bounded poll measure the remainder. The budget
-            // (~600 ms) and its loud exit are unchanged. The cost is 10 + 10·poll_steps ms against
-            // the old flat 50: cheaper for any port that clears inside 40 ms, equal at 40-50, and
-            // dearer only past 50 — which is exactly where the `>= 4` threshold below starts
-            // printing, so the band where this trim stops paying can never be silent.
-            settle_ms(10);
+            // (~600 ms) and its loud exit are unchanged. The cost is T_DRST + GRAIN·poll_steps
+            // against the old flat 50: cheaper for any port that clears well inside 50 ms, and
+            // dearer only past it — which is exactly where the `rst_ms >= 50` threshold below
+            // starts printing, so the band where this trim stops paying can never be silent.
+            // (M5 shipped with GRAIN = 10; M6, immediately below, took it to 2 after the capture
+            // showed every port reporting exactly one 10 ms step. The threshold moved from a step
+            // count to a millisecond figure in the same change, so it no longer tracks the grain.)
+            settle_ms(T_DRST_MS);
             // Bounded reset-completion poll (explicit loop: each probe is itself a control
             // transfer, so the generic wait_bounded closure can't drive it). ~600 ms worst case.
+            //
+            // EPACE-TRIM M6 (GR19) — the poll's own GRANULARITY was the last constant in this
+            // class, and M5's capture convicted it on the first boot that carried M5. All six
+            // downstream ports, on all three post-M5 boots of rmbp-gr16-s73/ttyUSB0.log
+            // (L15641, L15668, L15671, L15674, L15677, L15680 and the same six in the two
+            // preceding boots), read `PORT_RESET cleared after ~20 ms (T_DRST floor 10 ms +
+            // 1 poll step(s))`. One step — never zero, never two — on every port of every boot
+            // is the M5 signature one level down: the true clear point lies inside (10, 20] ms
+            // and the 10 ms grain is rounding it UP to 20. `hubrst=20ms(n=1)` / `100ms(n=5)`
+            // (L15743-15744) is that rounding, six times over.
+            //
+            // A finer grain is nearly free here because each probe is a hub-addressed
+            // GET_PORT_STATUS costing ~0.15 ms on this silicon: the six no-connection probes
+            // for ports 3-7 between L15672 (t=1794ms) and L15674 (t=1815ms) fit inside the 1 ms
+            // that timeline leaves over the 20 ms reset. So 2 ms resolves the same interval to
+            // five buckets for at most ~0.6 ms of extra transfers per port. The wall-clock
+            // budget is deliberately unchanged — 10 + 300 x 2 = 610 ms against M5's
+            // 10 + 60 x 10 = 610 ms — and so is the loud exit.
+            const T_DRST_MS: u64 = 10; // USB 2.0 §11.5.1.5: minimum hub-driven reset duration
+            const GRAIN_MS: u64 = 2; // M6 poll resolution (was 10)
+            const POLL_STEPS: u32 = 300; // x GRAIN_MS = the same ~600 ms budget M5 had
             let mut status = 0u32;
             let mut ok = false;
             let mut poll_steps = 0u32;
-            for step in 0..60u32 {
+            for step in 0..POLL_STEPS {
                 if let Ok(4) = self.control(hub, 0xA3, 0, 0, port, 4, true) {
                     status = (*self.data_buf as u32)
                         | ((*self.data_buf.add(1) as u32) << 8)
@@ -1189,34 +1292,48 @@ impl Controller {
                         break;
                     }
                 }
-                settle_ms(10);
+                settle_ms(GRAIN_MS);
                 poll_steps = step + 1;
             }
+            // The observed reset duration, in ms — meaningful ONLY on the `ok` branch (see below).
+            let rst_ms = T_DRST_MS + poll_steps as u64 * GRAIN_MS;
             // T_RSTRCY (USB 2.0 §7.1.7.5) is NOT paid here: the `settle_ms(10)` at the bottom of
             // this loop body, immediately before `enumerate_at_zero`, already is it and predates
             // M5 (only hub-addressed ClearPortFeature traffic sits between the two points). An
             // extra one here would have been a second recovery interval, not a restored one.
             //
-            // The M5 report. Three cases, and the timeout case must not be read as a measurement:
-            // `poll_steps` counts sleeps, so on a budget exhaustion it says 60 whether the bit
-            // never cleared or GET_PORT_STATUS itself was failing. Only the `ok` branch is
-            // allowed to talk about reset timing.
+            // The M5/M6 report. Four cases, and the timeout case must not be read as a
+            // measurement: `poll_steps` counts sleeps, so on a budget exhaustion it says
+            // POLL_STEPS whether the bit never cleared or GET_PORT_STATUS itself was failing.
+            // Only the `ok` branches are allowed to talk about reset timing, and the thresholds
+            // are stated in MILLISECONDS so they survive the next change of grain.
             if !ok {
                 serial_println!(
                     ":: EHCI-HID: [{}] EPACE-TRIM M5 TRIPWIRE — hub {} port {} PORT_RESET did not clear inside the ~600 ms poll budget (status {:#010x}); this is a timeout, NOT a reset-time measurement — the poll may also have been failing to read == witness ::",
                     self.idx, hub.addr, port, status
                 );
-            } else if poll_steps >= 4 {
-                // >= 4, not > 4: at 4 steps the poll has already reached the 50 ms the trim
-                // replaced, so the boundary band is loud rather than silent.
+            } else if rst_ms >= 50 {
+                // >=, not >: at exactly 50 ms the poll has reached the constant M5 replaced, so
+                // the boundary band is loud rather than silent.
                 serial_println!(
                     ":: EHCI-HID: [{}] EPACE-TRIM M5 TRIPWIRE — hub {} port {} took ~{} ms to clear PORT_RESET, at or past the 50 ms constant M5 replaced == witness ::",
-                    self.idx, hub.addr, port, 10 + poll_steps * 10
+                    self.idx, hub.addr, port, rst_ms
+                );
+            } else if rst_ms >= 20 {
+                // M6's own tripwire, and the one that decides whether M6 was worth landing. The
+                // s73 baseline read exactly 20 ms on every port under a 10 ms grain; if the
+                // finer grain still lands at or past 20, the grain was NOT quantizing — this
+                // hub really does hold reset that long and M6 bought nothing on this port. That
+                // is a legitimate outcome, so the line is a named tripwire rather than a
+                // failure: it can fire on healthy hardware, and its absence is the trim paying.
+                serial_println!(
+                    ":: EHCI-HID: [{}] EPACE-TRIM M6 TRIPWIRE — hub {} port {} took ~{} ms to clear PORT_RESET ({} x {} ms poll steps past the {} ms T_DRST floor); at or past the 20 ms the 10 ms grain reported, so M6's finer grain bought nothing here == witness ::",
+                    self.idx, hub.addr, port, rst_ms, poll_steps, GRAIN_MS, T_DRST_MS
                 );
             } else if poll_steps > 0 {
                 serial_println!(
-                    ":: EHCI-HID: [{}] hub {} port {} PORT_RESET cleared after ~{} ms (T_DRST floor 10 ms + {} poll step(s)) ::",
-                    self.idx, hub.addr, port, 10 + poll_steps * 10, poll_steps
+                    ":: EHCI-HID: [{}] hub {} port {} PORT_RESET cleared after ~{} ms (T_DRST floor {} ms + {} x {} ms poll step(s)) ::",
+                    self.idx, hub.addr, port, rst_ms, T_DRST_MS, poll_steps, GRAIN_MS
                 );
             }
             // Ack the change bits we may have latched (C_PORT_CONNECTION=16, C_PORT_RESET=20).
@@ -3917,8 +4034,13 @@ pub fn init() {
             parts_ms[k] = v;
             unit = u;
         }
+        // M7: the overlapping transport view. Printed in `{}`, NEVER inside the `[]` bracket and
+        // never summed with it — see the accumulator comment on `Epace`.
+        let (xv, xu) = epace_fmt(c.pace.xfer_cy);
+        let (av, au) = epace_fmt(c.pace.ass_cy);
+        let (cv, cu) = epace_fmt(c.pace.act_cy);
         serial_println!(
-            ":: EPACE: [{}] {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) [{}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) resid={}{}] == witness ::",
+            ":: EPACE: [{}] {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) [{}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) resid={}{}] {{xfer={}{}(n={}) ass={}{} act={}{}}} == witness ::",
             c.idx,
             EPACE_TAGS[EP_WAKE], parts_ms[EP_WAKE], unit, c.pace.n[EP_WAKE],
             EPACE_TAGS[EP_HCRST], parts_ms[EP_HCRST], unit, c.pace.n[EP_HCRST],
@@ -3929,7 +4051,8 @@ pub fn init() {
             EPACE_TAGS[EP_HUBPWR], parts_ms[EP_HUBPWR], unit, c.pace.n[EP_HUBPWR],
             EPACE_TAGS[EP_HUBRST], parts_ms[EP_HUBRST], unit, c.pace.n[EP_HUBRST],
             EPACE_TAGS[EP_HIDCFG], parts_ms[EP_HIDCFG], unit, c.pace.n[EP_HIDCFG],
-            rv, ru
+            rv, ru,
+            xv, xu, c.pace.xfer_n, av, au, cv, cu
         );
     }
     {
