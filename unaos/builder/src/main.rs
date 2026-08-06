@@ -75,6 +75,10 @@ fn main() {
     // UNAOS_BOTCBWIOC is DELETED (2026-07-30): the CBW is awaited as its own stage in every build,
     // unconditionally, and no media can be produced with it off (usb_xhci.md §17).
     if std::env::var("UNAOS_BOTRING64").is_ok() { feats.push("botring64"); }
+    // GR17 pay-as-you-go wc-g battery (video/wcg.rs): lattice-sampled first pass + deferred full
+    // passes, x86-only paths, default OFF => byte-identical. Mapped here as well as in `arroyo`
+    // for the same reason as BOTRING64 above: a knob arroyo alone sets never reaches boot media.
+    if std::env::var("UNAOS_WCG_PAYGO").is_ok() { feats.push("wcg-paygo"); }
     // VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem readout,
     // display-BAR probe, scripted scroll scenario). x86_64-only module; default OFF.
     if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }
