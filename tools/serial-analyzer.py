@@ -1,84 +1,742 @@
 #!/usr/bin/env python3
+"""
+serial-analyzer.py — one reader for every UnaOS bench serial capture.
+
+CANONICAL COPY: tools/serial-analyzer.py in the UnaOS repo (git-tracked).  The
+bench copy at ~/unaos-bench/tools/serial-analyzer.py is a byte-identical copy of
+it; edit the repo copy and re-copy, never the other way round.  Until GR18 the
+two were separate lineages with DISJOINT feature sets — the repo copy had the
+timing modes (--gaps, --wcg) and could not split an x86 capture into boots at
+all, the bench copy had the census and the GR18 sections and knew nothing about
+gap costing.  A caller had to know which file it was holding.  This file is the
+merge; nothing was dropped from either side.
+
+WHAT IT DOES
+
+  (default)     split the capture into boots, pull every instrument witness line
+                out of each boot by an explicit family table, and classify
+                defects.  Loud failure on 0 boots / 0 witnesses.
+  --wxprobe     the 8-line WXPROBE reconnaissance block, DIFFed across boots.
+  --slowxfer    EPACE-TRIM M8 SLOW-XFER, with the control request decoded.
+  --smc         SMC-BATT gap/busy/late plus the SMC-SCOUT '#KEY' index walk.
+  --gaps        the largest inter-line time gaps in a logts-stamped capture.
+  --wcg         the witness cost inside the kepler window, decomposed by
+                instrument, plus the whole-boot pay-as-you-go (paygo) census.
+  --selftest    both fixture sets, in one run, exit 0 required.
+
+BOOT SPLITTING (explicit marker table, one entry per capture format):
+  * x86_64  / rMBP    ':: X86_64 Memory Init ::'      once per boot
+  * aarch64 / Pi 4    ':: AARCH64 Memory Init ::'     once per boot
+  * Orin    (legacy)  '... MARK ... boot<N> ...'      once per boot
+
+Each marker carries a list of EPOCH ANCHORS: the earliest per-boot line of
+that platform.  The parser walks back from the marker to the earliest anchor
+above it (bounded by the previous boot) so a boot's pre-marker head is
+attributed to the boot it belongs to.  This matters: on the Pi the whole V3D
+bring-up campaign runs ~1600 lines BEFORE ':: AARCH64 Memory Init ::', and on
+x86 the fb-wc / APIC / SMEP / SPLASH head runs ~9 lines before its marker.  The
+Orin 'MARK ... boot<N>' entry is the older lineage's splitter, kept as a
+platform path: do not fix one rig by breaking another.
+
+The TIMING modes split differently and deliberately so.  --gaps and --wcg cut on
+the per-boot 'hz=' token (segment_by_hz) because they need the boot's own
+timestamp origin, not its witness inventory, and an hz cut is refined to the
+visible stamp RESET.  Two splitters, two questions; both are exercised by
+--selftest.
+
+Witness extraction is an EXPLICIT FAMILY TABLE (WITNESS_FAMILIES), not a shape
+heuristic.  The predicate this replaced was `::.*witness.*::`, which captured
+only lines that self-declare '== witness ::' and therefore silently dropped
+every 'xHCI: ccs-margin' line (no '::' at all), every bracket-tagged Pi line
+([spread5], [wc-h], [prio], ...), and the ':: GPACE: OVERLAP ... ::' tripwire.
+Lines that match no family are NOT silently discarded — they are counted and
+sampled in the 'unclassified' report, and the witness-shaped subset of them is
+called out as a coverage gap so the table can be extended.
+
+Standing law this tool must obey: an instrument's silence is evidence only if
+the instrument could execute in the state it reports on.  Zero boots or zero
+witnesses is therefore a LOUD failure on stderr with a non-zero exit — never a
+printed header and a clean exit.
+
+LOGTS PREFIXES, AND THE ONE STRIPPING LAW.  Captures gained a per-line stamp —
+'[   1851ms] ', '[      ?ms] ', '[15:30:45Z] '.  The census/GR18 lineage was
+anchored with '^\\s*::' throughout and NONE of it matched a stamped line: the tool
+reported '0 boots, 0 witnesses, 103 families absent' on every current x86
+capture — not a stale reader, a DEAD one, and a quiet one, because the census
+still printed a clean-looking page.  Matching there is now done against a
+PREFIX-STRIPPED probe copy of each line while the original (stamp included) is
+what gets stored and printed.
+
+The timing lineage never had that blindness — it PARSES the stamp (parse_ts) and
+matches its patterns against the parsed body — but the two implementations of
+"where does the stamp end" had drifted apart in their tolerances, which is the
+same bug waiting to happen from the other side.  There is now one law:
+LOGTS_PREFIX_RE defines the stamp, strip_logts() removes it, the parse_ts
+readers accept exactly the shapes it accepts, and --selftest asserts the two
+agree on all three forms.  The stamp is evidence; it just is not part of any
+pattern.
+"""
+
 import sys
 import re
+import io
 import argparse
 import contextlib
-import io
+from collections import Counter, OrderedDict
+
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_NO_BOOTS = 2
+EXIT_NO_WITNESSES = 3
+# A section that parsed nothing at all: the wire is absent from the capture, so
+# the section cannot answer the question it was run to answer.
+EXIT_NO_DATA = 4
+# A section parsed its wire and found the thing it exists to catch.  Non-zero so
+# an automated caller cannot mistake a finding for a clean run.
+EXIT_FINDING = 5
+
 
 def strip_control_bytes(text):
-    # Strip \x00-\x1F except \n, \r, \t
+    # Strip \x00-\x1F except \n, \r, \t.  Captures carry raw control bytes;
+    # this is also why the bench inspects them with awk, never bare grep.
     return re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]', '', text)
 
+
+# The three logts prefix shapes, as the serial taps emit them:
+#   '[   1851ms] '  monotonic ms since kernel entry
+#   '[      ?ms] '  prefixed but the counter could not answer
+#   '[15:30:45Z] '  civil time
+# Anchored at the line head and matched ONCE — a stamp only ever appears there,
+# and a body that happens to contain a bracketed number (e.g. ':: [ 2392 ms]
+# portsw:flip ::', which the TIMELINE family exists to claim) must survive.
+LOGTS_PREFIX_RE = re.compile(
+    r'^\s*\[\s*(?:\d+\s*ms|\?\s*ms|\d{2}:\d{2}:\d{2}Z)\s*\]\s?')
+
+
+def strip_logts(line):
+    """Return the line body with any leading logts stamp removed.
+
+    Matching-only.  The caller keeps the original line: the stamp is the whole
+    reason --gaps-style timing work is possible, so it is never thrown away,
+    it is merely not part of any pattern."""
+    return LOGTS_PREFIX_RE.sub('', line, count=1)
+
+
+# ---------------------------------------------------------------------------
+# Boot splitting
+# ---------------------------------------------------------------------------
+
+BOOT_MARKERS = [
+    {
+        'platform': 'x86_64',
+        'label': ':: X86_64 Memory Init ::',
+        'marker': re.compile(r'^\s*::\s*X86_64 Memory Init\s*::'),
+        'epoch_anchors': [
+            re.compile(r'^\s*::\s*x86 fb-wc:'),
+            re.compile(r'^\s*APIC:\s*x2APIC software-enabled'),
+        ],
+        'number_re': None,
+    },
+    {
+        'platform': 'aarch64',
+        'label': ':: AARCH64 Memory Init ::',
+        'marker': re.compile(r'^\s*::\s*AARCH64 Memory Init\s*::'),
+        'epoch_anchors': [
+            re.compile(r'Read start4\.elf'),
+            re.compile(r'arm_loader:\s*Starting ARM with'),
+            re.compile(r'^\s*::\s*MAILBOX:\s*framebuffer'),
+        ],
+        'number_re': None,
+    },
+    {
+        # Legacy Orin capture format, e.g.
+        #   2026-07-19T22:29:39Z MARK MARK R23s1 boot12 ORIN ...
+        # Kept working deliberately: do not fix one rig by breaking another.
+        # Note this must NOT match the bench's session banner
+        #   === SQUAWK MARK 2026-08-01T16:28:57Z session-start ===
+        # which has ' MARK ' but no ' boot<N>'.
+        'platform': 'orin',
+        'label': 'MARK ... boot<N>',
+        'marker': re.compile(r'\sMARK\s.*\sboot\d+'),
+        'epoch_anchors': [],
+        'number_re': re.compile(r'boot(\d+)'),
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Witness families — explicit list.  First match wins, so tighter families
+# must be listed above looser ones (CCS-MARGIN above XHCI, SCHED-X86 above
+# SCHED).  The 'platform' column is documentary and drives the coverage
+# report; matching itself is platform-independent.
+# ---------------------------------------------------------------------------
+
+def _f(name, platform, pattern):
+    return (name, platform, re.compile(pattern))
+
+
+WITNESS_FAMILIES = [
+    # ---- cross-platform ---------------------------------------------------
+    _f('SERWIT-1',        'any',     r'^\s*::\s*SERWIT-1\b'),
+    _f('SERWIT-2',        'any',     r'^\s*::\s*SERWIT-2\b'),
+
+    # ---- x86_64 / rMBP ----------------------------------------------------
+    _f('BPACE',           'x86_64',  r'^\s*::\s*BPACE:'),
+    _f('EPACE',           'x86_64',  r'^\s*::\s*EPACE:'),
+    # Three line shapes share this prefix: the class split
+    # ('xtail= bench= detect= igpu= kepler= sdhc= nic= resid= == witness ::'),
+    # the self-check ('span= anchor= since-entry= hz= build= ...'), and the
+    # ':: GPACE: OVERLAP ... ::' tripwire.  Anchored on the prefix and on NO
+    # interior field, so the ten-fragment 'build=' (therm+/pcilink+/vrom+ and
+    # the 'default(no-gpu-knobs)' case) and the ms/cy unit switch cannot
+    # unmatch the family.
+    _f('GPACE',           'x86_64',  r'^\s*::\s*GPACE:'),
+    # No '::' anywhere on these; the old heuristic could never see them.
+    # Covers the healthy line (now carrying 'ppc=', and 'latest=none
+    # margin_ms=none' when no port ever asserted) and all three '!!' variants:
+    # BLOWN, TIGHT, and LATE — the last with 't_seen_ms=' and 'short_by_ms<='.
+    # Field names are deliberately absent from the pattern.
+    _f('CCS-MARGIN',      'x86_64',  r'xHCI:\s*(?:!!\s*)?ccs-margin\b'),
+    # SPACE, not colon, after 'SCHED-X86' on these three.  Different producers
+    # (smp.rs publish/confirm, syscall.rs bg placement) from the
+    # ':: SCHED-X86: ...' dispatch lines the next entry claims.  Named
+    # separately so a placement campaign that stops printing shows up as a hard
+    # zero in the census instead of hiding inside a bulk SCHED-X86 count.
+    _f('SCHED-X86-PLACE-CHECK', 'x86_64', r'^\s*::\s*SCHED-X86 PLACE-CHECK:'),
+    _f('SCHED-X86-PLACE',       'x86_64', r'^\s*::\s*SCHED-X86 PLACE:'),
+    _f('SCHED-X86-BGPLACE',     'x86_64', r'^\s*::\s*SCHED-X86 BG-PLACE:'),
+    _f('SCHED-X86',       'x86_64',  r'^\s*::\s*SCHED-X86\b'),
+    _f('SCHED-X86-DEPTH', 'x86_64',  r'\[schedx86\]'),
+    # All seven lines of the one-shot dump share this prefix.  Line 1 now reads
+    # 'NO-COMPLETIONS class=never-completed|went-quiet', line 2 gained
+    # 'qtd_driven=', line 3's data-toggle field is 'tog=' (never 'dt='), and
+    # line 7 is 'frindex arm= fire= post= ok= post_ok= adv= post_ms='.  None of
+    # those field names is in the pattern, on purpose.
+    _f('KBDWIT',          'x86_64',  r'^\s*::\s*KBDWIT:'),
+    # The STOP-NOTEs ride this prefix too, including the EP0-timeout one that
+    # now prints 'ASS on=/off=' where it used to print 'PSS on=/off='.
+    _f('EHCI-HID',        'x86_64',  r'^\s*(?:::\s*)?EHCI-HID:'),
+    _f('EHCI-CONFIG',     'x86_64',  r'^\s*(?:::\s*)?EHCI-CONFIG:'),
+    _f('EHCI-SCOUT',      'x86_64',  r'^\s*::\s*EHCI-SCOUT:'),
+    _f('EHCI-MT',         'x86_64',  r'^\s*::\s*EHCI-MT:'),
+    _f('MOUSE',           'x86_64',  r'^\s*::\s*MOUSE-\d'),
+    _f('PTR',             'x86_64',  r'^\s*::\s*PTR:'),
+    _f('BOT',             'x86_64',  r'^\s*::\s*BOT:'),
+    _f('STOR',            'x86_64',  r'^\s*::\s*(?:STOR-\d\b|bx-blockreq:|BLK:)'),
+    _f('PORTSW',          'x86_64',  r'^\s*::\s*PORTSW-\d'),
+    _f('PWR',             'x86_64',  r'^\s*::\s*PWR:'),
+    _f('SMC-BATT',        'x86_64',  r'^\s*::\s*SMC-BATT:'),
+    _f('SMC-SCOUT',       'x86_64',  r'^\s*::\s*SMC-SCOUT\b'),
+    _f('SMC-DIAG',        'x86_64',  r'^\s*::\s*SMC-DIAG\b'),
+    _f('PART',            'x86_64',  r'^\s*::\s*PART:'),
+    # The beacon-save / beacon-restore / runlist-rebuild / post-bind campaign,
+    # split out of the bulk KEPLER family for the same reason as the placement
+    # lines above: this is the arc under test and it has to be countable on its
+    # own.  Anchored on the sub-tag, not on 'restored=' / 'exit=' / 'clk=',
+    # so a renamed field does not silently unmatch the family.
+    # ':: kepler: witness post-bind ...' is a DIFFERENT line and stays in
+    # KEPLER — the prefix here requires the sub-tag immediately after 'kepler:'.
+    _f('KEPLER-RUNLIST',  'x86_64',  r'^\s*::\s*kepler:\s*'
+                                     r'(?:beacon-save|beacon-restore'
+                                     r'|runlist-rebuild|post-bind)\b'),
+    _f('KEPLER',          'x86_64',  r'^\s*::\s*kepler:'),
+    _f('KDISP',           'x86_64',  r'^\s*::\s*kdisp:'),
+    _f('IGPU',            'x86_64',  r'^\s*::\s*igpu:'),
+    _f('SDHC',            'x86_64',  r'\[sdhc\]'),
+    # bench_ride.rs — the rMBP probes whose build fragments GPACE's 'build='
+    # advertises (therm+ / pcilink+ / vrom+).
+    _f('BENCH-RIDE',      'x86_64',  r'^\s*::\s*(?:therm|pcilink|vrom):'),
+    _f('FLIGHTREC',       'x86_64',  r'^\s*::\s*(?:FLIGHTREC|FR)\b'),
+    _f('CLOCK-X1',        'x86_64',  r'^\s*::\s*CLOCK-X1\b'),
+    # GR18 / Boot V.  Eight lines per boot, read in detail by --wxprobe; the
+    # family entry is what keeps them out of the 'witness-shaped but
+    # unclassified' coverage gap.  Listed before SMEP because the cpu line
+    # carries 'smep=1' and SMEP's own family is a word-boundary match.
+    _f('WXPROBE',         'x86_64',  r'^\s*::\s*WXPROBE\s+(?:cpu|map|elf):'),
+    _f('SMEP',            'x86_64',  r'^\s*::\s*SMEP\b'),
+    _f('ACPI',            'x86_64',  r'^\s*::\s*ACPI:'),
+    _f('BOOTLOG',         'x86_64',  r'^\s*::\s*BOOTLOG:'),
+    # ':: x86 fb-wc: ...', ':: x86_64 PCI Init: ...', ':: X86_64 Memory Init ::'
+    _f('X86',             'x86_64',  r'^\s*::\s*[xX]86(?:_64)?\b'),
+    _f('FTDI',            'x86_64',  r'^\s*::\s*FTDI:'),
+    # boot timeline stamps, e.g. ':: [   842 ms] ehci:kbd-armed ::'
+    _f('TIMELINE',        'x86_64',  r'^\s*::\s*\[\s*\d+\s*ms\]'),
+    _f('PCI-PROBE',       'x86_64',  r'\[PCI(?:-PROBE|-STOR)?\]|\[MSI-X\]'),
+    _f('GPU-PROBE',       'x86_64',  r'\[GPU\]|\[NVIDIA\]|\[Intel\b'),
+    # USB hot-plug announcer, e.g. '>>> [CONTACT ESTABLISHED] SLOT 1'
+    _f('HOTPLUG',         'x86_64',  r'^\s*>>>\s'),
+
+    # ---- aarch64 / Pi 4 ---------------------------------------------------
+    # ':: V3D: ...' plus its indented bracket-tagged continuation lines,
+    # e.g. '::   [v3d60] MMU_ILLEGAL_ADDR ... ::'
+    _f('V3D',             'aarch64', r'^\s*::\s*(?:V3D:|\[v3d\d+)'),
+    _f('PI-GENET',        'aarch64', r'^\s*::\s*PI-GENET:'),
+    # not Pi-only: the rMBP capture also emits ':: PIUSB: [usbw] ... ::'
+    _f('PIUSB',           'any',     r'^\s*::\s*(?:PIUSB|piusb\d+):|\[piusb\d+\]'),
+    _f('SCHED',           'aarch64', r'^\s*::\s*SCHED(?:-LOAD)?:|\[sched\d+\]'
+                                     r'|^\s*::\s*INPUT on core\b'),
+    _f('AARCH64',         'aarch64', r'^\s*(?:::\s*)?AARCH64\b'),
+    _f('MAILBOX',         'aarch64', r'^\s*::\s*MAILBOX:'),
+    _f('SPREAD',          'aarch64', r'\[spread\d+\]'),
+    _f('PULSE',           'aarch64', r'\[pulse\d+\]'),
+    _f('PRIO',            'aarch64', r'\[prio\]'),
+    _f('PSTRIP',          'aarch64', r'\[pstrip\]'),
+    _f('KILLBOUND',       'aarch64', r'\[killbound\]|^\s*::\s*KILLBOUND:'),
+    _f('SKILL',           'aarch64', r'\[skill\]|^\s*::\s*SKILL-\d'),
+    _f('VUG',             'aarch64', r'\[vugmin\]|\[uvug\d+\]|\[u\d+fix\]'
+                                     r'|^\s*::\s*(?:VUG|UVUG|uvug\d+)\b'),
+    _f('FLUID',           'aarch64', r'\[fluid\d+\]'),
+    _f('COMPOSITE',       'aarch64', r'\[comp\d+\]'),
+    _f('WEDGE',           'aarch64', r'\[wedge\d+\]'),
+    _f('SPINHUNT',        'aarch64', r'\[spinhunt\]|^\s*::\s*SPINHUNT\b'),
+    _f('KEYSTAT',         'aarch64', r'\[keystat\]'),
+    _f('STORM',           'aarch64', r'\[storm\]'),
+    _f('SWEEP',           'aarch64', r'^\s*SWEEP\s+phys='),
+    _f('CAPSTONE',        'aarch64', r'^\s*::\s*CAPSTONE\b'),
+    _f('EL0',             'aarch64', r'^\s*::\s*EL0\b'),
+    # ':: BGRUN-SCAV:' / ':: BGRUN-ST:' AND the plain ':: BGRUN: bg ...' job
+    # lines.  The '-\w+' form dropped the colon variant outright.
+    _f('BGRUN',           'aarch64', r'^\s*::\s*BGRUN[-:]'),
+    _f('M6',              'aarch64', r'^\s*::\s*M6[a-z]\b'),
+    _f('SERROR-DRAIN',    'aarch64', r'^\s*::\s*SERROR-DRAIN\b'),
+    _f('SMPBAL',          'aarch64', r'\[smpbal\]|^\s*::\s*SMPBAL\b'),
+    _f('VFS2',            'aarch64', r'^\s*::\s*VFS2\b'),
+    _f('VFS3',            'aarch64', r'^\s*::\s*VFS3\b'),
+    _f('NET-GATE',        'aarch64', r'^\s*::\s*NET\d*-GATE:'),
+    # Jetson / Tegra track, and the aarch64 platform bring-up chatter.
+    _f('TEGRA',           'aarch64', r'^\s*::\s*(?:tegra:|SDMMC:)'),
+    _f('PCIE',            'aarch64', r'^\s*::\s*PCIE\d*\b'),
+    _f('AARCH64-PLAT',    'aarch64', r'^\s*::\s*(?:GIC\b|DTB\b|A78AE|JB1f'
+                                     r'|NS-SPAN)'),
+    _f('EXEC',            'aarch64', r'^\s*::\s*(?:ELF\d*|EXEC[\w-]*|BGSPREAD)\s*:'),
+    # native-fs / ACL / codec acceptance witnesses
+    _f('UNAFS',           'aarch64', r'^\s*::\s*(?:K\d[\w.\-]*|FAT[A-Z]+|CLOCK\d+-\w+'
+                                     r'|BANDY-[\w-]+|IMG-SIG|F\d+-witness|ls\d+)\s*:'
+                                     r'|^\s*UNAFS:'),
+    _f('BANNER',          'aarch64', r'^\s*::\s*UnaOS\b'),
+
+    # ---- families that fire on both rigs; listed last so the platform
+    # ---- specific entries above claim their lines first -------------------
+    # ':: wc-x86: ...' is the same compositor speaking without the bracket tag.
+    _f('WINCOMP',         'any',     r'\[wc-[a-z]+\]|\[wcn\]|^\s*::\s*wc-x86:'),
+    _f('CLICK',           'any',     r'\[click\d*\]|\[clickroute\]'),
+    _f('CURSOR',          'any',     r'\[cursor\d*\]'),
+    _f('SMP',             'any',     r'^\s*SMP:|\[smp\d+\]'),
+    # ':: U1a: ...' and the parenthesised form ':: U11m2(1): ...', which the
+    # ':'-only terminator dropped.
+    _f('U-SUITE',         'any',     r'^\s*::\s*U\d+[\w.\-]*[:(]'),
+    # ring-3 acceptance batteries.  Each anchored on its own stable prefix.
+    _f('WINX',            'any',     r'^\s*::\s*(?:WINX-\d|winx\d)\b'),
+    _f('SOCK',            'any',     r'^\s*::\s*SOCK-\d'),
+    _f('PULSE-W',         'any',     r'^\s*::\s*PULSE-W:'),
+    _f('ZEOLITE',         'any',     r'^\s*::\s*zeolite:'),
+    # the filesystem / capability acceptance ladder: ':: S3:', ':: S4-race(2):',
+    # ':: S5 FAIL —', ':: S6-witness:', ':: S7-openany', ':: S8-write',
+    # ':: S9-grow', ':: CFU:' / ':: CFU FAIL'.
+    _f('FS-ACCEPT',       'any',     r'^\s*::\s*(?:S\d[\w.\-]*|CFU)\b'),
+    _f('INSTALL',         'any',     r'^\s*::\s*(?:INSTALL|install|PIINSTALL)\b'),
+    _f('NET-X86',         'any',     r'^\s*::\s*(?:SMOLNET|DNS-X86-GATE'
+                                     r'|SNTP-X86-GATE)\b'
+                                     r'|\[dns-x86\]|\[sntp-x86\]'),
+    _f('SHELL',           'any',     r'^\s*::\s*(?:fs\d+:|ui\d+:|vfsw:|JC\d+:)'),
+    _f('SELFTEST',        'any',     r'^\s*::\s*TSTE\b'),
+    _f('XHCI',            'any',     r'^\s*(?:::\s*)?xHCI\b|\[XHCI\]|\[xhciint\]'),
+    # 'Framebuffer' capitalised is the announce line; the geometry lines that
+    # follow it are lower-case ':: framebuffer WxH stride=... ::' and
+    # ':: fb_addr=... fb_size=... ::', which the case-sensitive alternation
+    # dropped.
+    _f('FB',              'any',     r'^\s*::\s*(?:FB|[Ff]ramebuffer|fbcon|video'
+                                     r'|SPLASH|fb_addr=)\b'),
+    # ':: WARNING: No framebuffer detected ::' and friends.  Classified, not
+    # alarmed: at least one of them is the normal reading on a headless build,
+    # so it belongs in the census rather than in DEFECT_SIGNALS.
+    _f('WARN',            'any',     r'^\s*::\s*WARNING:'),
+    _f('VIDEO',           'any',     r'^\s*::\s*(?:VIDEO\b|VWIT:|vperf:|RAST\b'
+                                     r'|EDID\b)'),
+    _f('UI',              'any',     r'^\s*::\s*UI\d\b'),
+    _f('STAT',            'any',     r'^\s*::\s*(?:STAT|SVC)\b'),
+    _f('SYSCALL',         'any',     r'^\s*::\s*SYSCALL:'),
+    _f('KERNEL',          'any',     r'^\s*::\s*KERNEL\b'),
+    # listed after SCHED, which claims ':: INPUT on core ...'
+    _f('INPUT',           'any',     r'^\s*::\s*INPUT\b'),
+    _f('GUI',             'any',     r'\[gui\]'),
+    # Last entry deliberately: an acceptance battery announces itself with a
+    # witness mask, e.g. ':: NET2-GATE: ... PASS [w=0xff] ::'.  Listed after
+    # every named family so those claim their own lines first.
+    _f('GATE-BATTERY',    'any',     r'\[w=0x[0-9a-fA-F]+\]'),
+]
+
+# A line that no family claimed but which *looks* like an instrument speaking.
+# Reported as a coverage gap, never counted as a witness.
+WITNESS_SHAPED = re.compile(
+    r'==\s*witness\s*::'          # self-declared witness
+    r'|verdict='                  # carries a verdict
+    r'|^\s*::\s.*\s::\s*$'        # fully '::'-delimited emission
+)
+
+
+# ---------------------------------------------------------------------------
+# Defect classifier — alarm signals only.
+#
+# The classes this replaced were bare substring tests over the whole boot text
+# and were false-positive generators, so they are deliberately gone:
+#   'PASS'  — 'verdict=PASS' is on every healthy boot; the class was
+#             unconditional and therefore carried no information.
+#   'panic' — matched '[wc-x] console-window panic-fallback armed', i.e. the
+#             ARMING of the panic path on a perfectly healthy boot.
+#   'lease' — matched 'released' and 'hold released'.
+#   'RAS'   — a three-letter substring with no word boundary; never fired on
+#             either reference capture and cannot be trusted if it does.
+# ---------------------------------------------------------------------------
+
+#
+# Two rules govern what may go in this list:
+#
+#   1. A signal must match a line the tree can actually emit TODAY.  Every
+#      entry below was checked against its emitter at source.
+#   2. A signal must not fire on a reading the emitter itself declares
+#      unusable.  KBDWIT's 'ok=' flags are exactly that declaration, and the
+#      old single KBDWIT-STALL class ignored them — see below.
+#
+# Deliberately NOT alarmed on:
+#   'post_ms=0'          — the HEALTHY reading of KBDWIT line 7 on this rig.
+#                          Printing costs tens of microseconds against
+#                          FRINDEX's 125 us tick, so post == fire is normal.
+#   'place=DECLINED-EMPTY' — a real refusal, but the one every small-`aps`
+#                          configuration reaches.  DECLINED-COLLIDE is the
+#                          premise guard and IS alarmed.
+#   'verdict=PARTIAL'    — coverage is short, the placement rule is intact.
+#   'CCSMARGIN' (bare)   — the healthy token; only 'CCSMARGIN-' is a finding.
+#
+DEFECT_SIGNALS = [
+    ('GPACE-OVERLAP',
+     re.compile(r'GPACE:\s*OVERLAP'),
+     'GPACE tripwire: measured phase spans overlap — that instrument is lying'),
+    ('CCSMARGIN-DEFECT',
+     re.compile(r'result=CCSMARGIN-'),
+     'xHCI ccs-margin returned a qualified result (BLOWN/TIGHT/LATE); '
+     'the healthy line ends "result=CCSMARGIN" with nothing after'),
+    ('VERDICT-FAIL',
+     re.compile(r'verdict=FAIL\b'),
+     'an instrument reported verdict=FAIL'),
+    # CONCLUSIVE.  Both bits are read out of USBSTS on KBDWIT line 6, and both
+    # are latched fault states.  Guarded on 'ok=1': when the MMIO read failed
+    # the emitter prints the placeholder zeros hch=0/hse=0, so an unguarded
+    # test here would read a failed read as a clean controller.
+    ('KBDWIT-HALT',
+     re.compile(r'KBDWIT:.*\bok=1\b.*\b(?:hch=1|hse=1)\b'),
+     'keyboard witness: controller halted (hch=1) or host system error '
+     '(hse=1), read successfully (ok=1). A latched fault state'),
+    # NOT CONCLUSIVE ON ITS OWN, and labelled so.  A stopped FRINDEX gives
+    # arm == fire and therefore adv=0x0000 unconditionally, so there is no
+    # false-clean mode — but a HEALTHY counter whose advance across the window
+    # lands on an exact multiple of 16384 microframes reads adv=0x0000 too.
+    # That is a 1-in-16384 FALSE ALARM.  Worth a second boot before it is
+    # worth a conviction; adv!=0 needs no corroboration.
+    # Guarded on 'ok=1' for a stronger reason than the halt class above: when
+    # the FRINDEX read fails the emitter's own match arm falls through to
+    # adv = 0, so ok=0 GUARANTEES adv=0x0000.  Ungated, this class would fire
+    # on every failed read.  '\bok=' does not match 'post_ok=' — '_' is a word
+    # character, so there is no boundary before that 'ok'.
+    ('KBDWIT-FRINDEX-FROZEN',
+     re.compile(r'KBDWIT:.*\bfrindex\b.*\bok=1\b.*\badv=0x0000\b'),
+     'keyboard witness: FRINDEX did not advance across a >=4 s silence window '
+     '(adv=0x0000, read valid). SUSPECT, NOT PROOF — a healthy counter landing '
+     'on an exact 16384-microframe multiple reads the same. Corroborate with a '
+     'second boot, and with hch=/hse=/pss= on line 6'),
+    # The instrument declaring itself unusable.  On line 6 ok=0 means hch=/hse=
+    # are placeholder zeros (a false CLEAN); on line 7 it means adv= is a
+    # placeholder 0x0000 (a false ALARM).  Either way the dump cannot answer
+    # the question it was emitted to answer, and silence from a broken
+    # instrument is not evidence of health.
+    ('KBDWIT-UNREAD',
+     re.compile(r'KBDWIT:.*\bok=0\b'),
+     'keyboard witness: an MMIO read FAILED (ok=0), so the fields on that line '
+     'are placeholders, not measurements. Neither a clean nor a stall reading '
+     'may be taken from it'),
+    ('KEPLER-RESTORE-CORRUPT',
+     re.compile(r'::\s*kepler:.*\brestored=CORRUPT\b'),
+     'kepler beacon-restore / runlist-rebuild read back words that are not the '
+     'words written, or found a surviving 0xBEAC000n beacon sentinel where real '
+     'data should be (beacon_resid/mismatch nonzero)'),
+    ('KEPLER-BIND-DEADLINE',
+     re.compile(r'::\s*kepler:\s*post-bind\b.*\bexit=deadline\b'),
+     'kepler post-bind: PLAYLIST_RD/_RD_LEN never echoed the runlist we '
+     'submitted within budget — the submit was not accepted'),
+    ('BGPLACE-COLLIDE',
+     re.compile(r'SCHED-X86 BG-PLACE:.*\bplace=DECLINED-COLLIDE\b'),
+     'bg placement handed back the core it was asked from. Not reachable '
+     'through today\'s worker_pool, so this firing means a premise changed '
+     '(a second caller, a re-pinned shell, or worker_pool stopped filtering)'),
+    ('PANIC',
+     re.compile(r'\bPANIC\b|\bpanic:'),
+     'kernel panic'),
+]
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+def classify_line(line):
+    """Return the witness family name for a line, or None."""
+    for name, _platform, pattern in WITNESS_FAMILIES:
+        if pattern.search(line):
+            return name
+    return None
+
+
+def _find_markers(lines):
+    """Return [(index, spec, boot_number_or_None)] for every boot marker hit.
+
+    `lines` here is the PREFIX-STRIPPED probe copy — see strip_logts()."""
+    hits = []
+    for i, line in enumerate(lines):
+        for spec in BOOT_MARKERS:
+            if spec['marker'].search(line):
+                num = None
+                if spec['number_re']:
+                    m = spec['number_re'].search(line)
+                    if not m:
+                        continue          # ' MARK ' without a boot number
+                    num = m.group(1)
+                hits.append((i, spec, num))
+                break
+    return hits
+
+
+def _valid_anchors(lines, anchors, n_boots):
+    """Keep only epoch anchors that fire exactly once per boot in THIS file.
+
+    An anchor that fires more than once per boot silently corrupts the split:
+    'APIC: x2APIC software-enabled' looks like a boot epoch but every AP emits
+    it, so backtracking would drag a boot's start into the middle of the
+    previous one.  Counting first is cheap and makes the anchor list safe to
+    extend."""
+    keep = []
+    for anchor in anchors:
+        if sum(1 for line in lines if anchor.search(line)) == n_boots:
+            keep.append(anchor)
+    return keep
+
+
+def _boot_start_index(lines, marker_idx, lower_bound, anchors):
+    """Walk back from a boot marker to the earliest epoch anchor lying in
+    (lower_bound, marker_idx], so the boot's pre-marker head is attributed to
+    the boot it belongs to.  Falls back to the marker line itself."""
+    if not anchors:
+        return marker_idx
+    for i in range(lower_bound + 1, marker_idx + 1):
+        for anchor in anchors:
+            if anchor.search(lines[i]):
+                return i
+    return marker_idx
+
+
 def parse_log(filepath):
+    """Parse a capture file into a result dict.  Read-only: this tool never
+    writes to a capture."""
     with open(filepath, 'r', errors='replace') as f:
         content = f.read()
-    
-    content = strip_control_bytes(content)
-    
-    # Split by boots
-    # We look for lines containing "MARK " and " boot<N> "
-    # The actual line from logs is e.g.
-    # 2026-07-19T22:29:39Z MARK MARK R23s1 boot12 ORIN ...
-    
-    lines = content.split('\n')
-    
-    boots = []
-    current_boot = None
-    
-    for line in lines:
-        if ' MARK ' in line and ' boot' in line:
-            match = re.search(r'boot(\d+)', line)
-            if match:
-                boot_num = match.group(1)
-                current_boot = {
-                    'number': boot_num,
-                    'start_line': line,
-                    'witnesses': [],
-                    'lines': []
-                }
-                boots.append(current_boot)
-        if current_boot:
-            current_boot['lines'].append(line)
-            # Extract witness lines
-            if re.search(r'::.*witness.*::', line):
-                current_boot['witnesses'].append(line)
-    
-    # Classify each boot
-    for boot in boots:
-        boot_text = '\n'.join(boot['lines'])
-        classes = []
-        if 'RAS' in boot_text:
-            classes.append('RAS')
-        if 'panic' in boot_text.lower():
-            classes.append('panic')
-        if 'PASS' in boot_text:
-            classes.append('PASS')
-        if 'lease' in boot_text.lower():
-            classes.append('lease')
-        
-        boot['classes'] = classes if classes else ['unknown']
-        
-    return boots
+    return parse_content(filepath, content)
 
-def print_boot_summary(boot):
-    print(f"Boot {boot['number']}: {', '.join(boot['classes'])}")
-    print(f"  Start: {boot['start_line']}")
-    for w in boot['witnesses']:
-        print(f"  Witness: {w.strip()}")
+
+def parse_content(label, content):
+    """Parse capture TEXT.  Split out of parse_log so a self-test fixture goes
+    through the identical path a real capture does — a fixture that exercises a
+    private shortcut certifies the shortcut, not the tool."""
+    lines = strip_control_bytes(content).split('\n')
+    # Every pattern in this file is head-anchored, and 87% of the lines in a
+    # current capture carry a logts stamp in front of that head.  `probe` is
+    # what patterns are matched against; `lines` (stamp intact) is what is
+    # stored, printed and diffed.  Index-for-index, so a hit in one names the
+    # same line in the other.
+    probe = [strip_logts(line) for line in lines]
+    hits = _find_markers(probe)
+
+    # Validate each format's epoch anchors against this file's boot count
+    # before using them to backtrack.
+    anchor_cache = {}
+    for spec in BOOT_MARKERS:
+        n = sum(1 for _i, s, _n in hits if s['platform'] == spec['platform'])
+        anchor_cache[spec['platform']] = (
+            _valid_anchors(probe, spec['epoch_anchors'], n) if n else [])
+
+    # Resolve each marker to a boot span.
+    spans = []
+    prev_marker = -1
+    for idx, (marker_idx, spec, num) in enumerate(hits):
+        start = _boot_start_index(probe, marker_idx, prev_marker,
+                                  anchor_cache[spec['platform']])
+        spans.append([start, marker_idx, spec, num])
+        prev_marker = marker_idx
+    for i, span in enumerate(spans):
+        span.append(spans[i + 1][0] if i + 1 < len(spans) else len(lines))
+
+    boots = []
+    for seq, (start, marker_idx, spec, num, end) in enumerate(spans, start=1):
+        body = lines[start:end]
+        boot = {
+            'number': num if num is not None else str(seq),
+            'platform': spec['platform'],
+            'marker_label': spec['label'],
+            'start_index': start,
+            'end_index': end,
+            'marker_index': marker_idx,
+            'start_line': lines[start],
+            'marker_line': lines[marker_idx],
+            'lines': body,
+            # prefix-stripped, index-for-index with 'lines'; what the GR18
+            # sections match against.
+            'probe': probe[start:end],
+            'witnesses': [],          # [{'family': str, 'line': str}]
+            'families': Counter(),
+            'unclassified': [],
+            'dropped_witness_shaped': [],
+            'defects': [],            # [{'class','line'}]
+        }
+        for line, probe_line in zip(body, probe[start:end]):
+            if not line.strip():
+                continue
+            family = classify_line(probe_line)
+            if family:
+                boot['witnesses'].append({'family': family, 'line': line})
+                boot['families'][family] += 1
+            else:
+                boot['unclassified'].append(line)
+                if WITNESS_SHAPED.search(probe_line):
+                    boot['dropped_witness_shaped'].append(line)
+            for cls, pattern, _desc in DEFECT_SIGNALS:
+                if pattern.search(probe_line):
+                    boot['defects'].append({'class': cls, 'line': line})
+
+        boot['classes'] = (sorted({d['class'] for d in boot['defects']})
+                           or ['CLEAN'])
+        boots.append(boot)
+
+    return {
+        'path': label,
+        'total_lines': len(lines),
+        'boots': boots,
+        'preamble_lines': spans[0][0] if spans else len(lines),
+        'markers_tried': [s['label'] for s in BOOT_MARKERS],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+def _shape(line, width=100):
+    """Collapse digits so near-identical lines group together in a census."""
+    return re.sub(r'\d+', 'N', line.strip())[:width]
+
+
+def print_boot_summary(boot, samples=2, full=False, family_filter=None):
+    verdict = ', '.join(boot['classes'])
+    print(f"Boot {boot['number']}  [{boot['platform']}]  "
+          f"lines {boot['start_index'] + 1}..{boot['end_index']}  "
+          f"verdict: {verdict}")
+    print(f"  start:  {boot['start_line'].strip()}")
+    print(f"  marker: {boot['marker_line'].strip()}")
+
+    fams = boot['families']
+    if family_filter:
+        fams = Counter({k: v for k, v in fams.items()
+                        if family_filter.search(k)})
+    total = sum(fams.values())
+    print(f"  witnesses: {total} line(s) across {len(fams)} family/families")
+
+    if total == 0:
+        print("  !! NO WITNESSES IN THIS BOOT — the family table did not "
+              "match anything here")
+
+    for name in sorted(fams):
+        count = fams[name]
+        print(f"    {name:<18} {count:>5}")
+        picks = [w['line'] for w in boot['witnesses'] if w['family'] == name]
+        if not family_filter and not full:
+            picks = picks[:samples]
+        for line in picks:
+            print(f"        | {line.strip()}")
+
+    if boot['defects']:
+        print(f"  defects: {len(boot['defects'])}")
+        seen = OrderedDict()
+        for d in boot['defects']:
+            seen.setdefault(d['class'], []).append(d['line'])
+        for cls, hits in seen.items():
+            desc = next(x[2] for x in DEFECT_SIGNALS if x[0] == cls)
+            print(f"    !! {cls} x{len(hits)} — {desc}")
+            for line in (hits if full else hits[:samples]):
+                print(f"        | {line.strip()}")
+    else:
+        print("  defects: none")
+
+    dropped = boot['dropped_witness_shaped']
+    print(f"  unclassified: {len(boot['unclassified'])} line(s), "
+          f"of which {len(dropped)} witness-shaped")
+    if dropped:
+        print("    (coverage gap — these look like instruments speaking but "
+              "match no family in WITNESS_FAMILIES)")
+        for shape, count in Counter(_shape(x) for x in dropped).most_common(
+                len(dropped) if full else 5):
+            print(f"      {count:>5}  {shape}")
     print("")
 
+
+def print_file_report(result, samples=2, full=False, family_filter=None):
+    boots = result['boots']
+    platforms = sorted({b['platform'] for b in boots})
+    print(f"=== {result['path']} ===")
+    print(f"  lines: {result['total_lines']}   boots: {len(boots)}   "
+          f"platform(s): {', '.join(platforms) if platforms else 'none'}   "
+          f"pre-boot preamble: {result['preamble_lines']} line(s)")
+    print("")
+
+    for boot in boots:
+        print_boot_summary(boot, samples=samples, full=full,
+                           family_filter=family_filter)
+
+    # Whole-file family census, so a family that vanished between runs is
+    # visible without diffing every line.
+    census = Counter()
+    for boot in boots:
+        census.update(boot['families'])
+    print(f"--- witness families in {result['path']} ---")
+    for name in sorted(census):
+        platform = next(p for n, p, _ in WITNESS_FAMILIES if n == name)
+        print(f"  {name:<18} {census[name]:>6}   [{platform}]")
+    print("")
+
+    # Families the table knows about that this capture did not exercise.
+    absent = [(n, p) for n, p, _ in WITNESS_FAMILIES if n not in census]
+    if absent:
+        print(f"--- families in the table but absent from this capture "
+              f"({len(absent)}) ---")
+        print("  " + ", ".join(f"{n}[{p}]" for n, p in absent))
+        print("")
+
+
 def diff_boots(boots1, boots2):
+    """Compare two parses boot-by-boot.  Unchanged in contract: it consumes
+    the per-boot class list and witness set."""
     print("=== DIFF BETWEEN TWO LOG FILES ===")
-    
-    # We'll just compare boot counts and classifications for now, or match by number
+
     b1_dict = {b['number']: b for b in boots1}
     b2_dict = {b['number']: b for b in boots2}
-    
-    all_nums = sorted(list(set(b1_dict.keys()) | set(b2_dict.keys())), key=int)
+
+    def _key(n):
+        try:
+            return (0, int(n), '')
+        except ValueError:
+            return (1, 0, n)
+
+    all_nums = sorted(set(b1_dict) | set(b2_dict), key=_key)
     for num in all_nums:
         b1 = b1_dict.get(num)
         b2 = b2_dict.get(num)
-        
+
         if b1 and not b2:
             print(f"Boot {num} only in file 1")
         elif b2 and not b1:
@@ -86,22 +744,646 @@ def diff_boots(boots1, boots2):
         else:
             classes1 = set(b1['classes'])
             classes2 = set(b2['classes'])
-            w1 = set([w.strip() for w in b1['witnesses']])
-            w2 = set([w.strip() for w in b2['witnesses']])
-            
+            w1 = {w['line'].strip() for w in b1['witnesses']}
+            w2 = {w['line'].strip() for w in b2['witnesses']}
+            f1 = set(b1['families'])
+            f2 = set(b2['families'])
+
             if classes1 != classes2 or w1 != w2:
                 print(f"Boot {num} differs:")
                 if classes1 != classes2:
-                    print(f"  Classes: {list(classes1)} vs {list(classes2)}")
-                if w1 != w2:
-                    added = w2 - w1
-                    removed = w1 - w2
-                    if added:
-                        print(f"  Added witnesses: {added}")
-                    if removed:
-                        print(f"  Removed witnesses: {removed}")
+                    print(f"  Classes: {sorted(classes1)} vs {sorted(classes2)}")
+                if f1 != f2:
+                    if f2 - f1:
+                        print(f"  Families only in file 2: {sorted(f2 - f1)}")
+                    if f1 - f2:
+                        print(f"  Families only in file 1: {sorted(f1 - f2)}")
+                added = w2 - w1
+                removed = w1 - w2
+                print(f"  Witness lines: +{len(added)} / -{len(removed)}")
+                for line in sorted(added)[:5]:
+                    print(f"    + {line}")
+                for line in sorted(removed)[:5]:
+                    print(f"    - {line}")
             else:
                 print(f"Boot {num} matches exactly.")
+
+
+# ---------------------------------------------------------------------------
+# GR18 sections — the three wires Boot V added
+#
+# One reader each, and each one reports its own ABSENCE rather than printing an
+# empty table: a section that answers "nothing to see" identically whether the
+# wire was silent or the parser stopped matching is a section that cannot
+# falsify anything.
+# ---------------------------------------------------------------------------
+
+def _kv(body):
+    """Scan 'key=value' tokens out of a witness body into an OrderedDict.
+
+    Read by NAME, never by column.  `late=` was APPENDED to SMC-BATT (GR18)
+    exactly so that pre-existing fields keep their positions for a positional
+    awk — but a reader in this file has no such constraint and should not
+    acquire one, because the next append would break it."""
+    return OrderedDict(re.findall(r'([A-Za-z_][\w.]*)=(\S+)', body))
+
+
+def _num(text):
+    """Parse a counter that may carry a unit or a sign ('94%', '50ms', '-2286mA',
+    '1447').  Returns None when there is no number to read — never 0, which is a
+    value every one of these counters can legitimately hold."""
+    if text is None:
+        return None
+    m = re.match(r'^([+-]?\d+)', text)
+    return int(m.group(1)) if m else None
+
+
+# --- WXPROBE (--wxprobe) --------------------------------------------------
+
+WXPROBE_RE = re.compile(r'^\s*::\s*WXPROBE\s+(cpu|map|elf):\s*(.*?)\s*::\s*$')
+
+# The framebuffer leaf's expected typing.  Under the PAT MSR's default layout
+# the PAT/PCD/PWT triple selects the entry: 1/0/0 is PA4 = write-combining,
+# which is what ':: x86 fb-wc: retyped N leaf(s) WC (PAT PA4) ...' claims to
+# have installed.  0/0/0 is PA0 = write-back and 0/1/0 is PA2 = uncacheable —
+# and UC is not a hypothetical: map_mmio_window silently un-typed this exact
+# leaf from WC to UC for two weeks (GR15), costing 8.7-9.1x on every blit, and
+# nothing in the capture said so.  That is what this cross-check exists for.
+WC_EXPECT = OrderedDict([('pat', '1'), ('pcd', '0'), ('pwt', '0')])
+WC_PAT_ENTRY = {
+    ('0', '0', '0'): 'PA0 (write-back)',
+    ('0', '0', '1'): 'PA1 (write-through)',
+    ('0', '1', '0'): 'PA2 (UC-)',
+    ('0', '1', '1'): 'PA3 (uncacheable)',
+    ('1', '0', '0'): 'PA4 (write-combining)',
+}
+# The leaf the WC cross-check applies to.  Named, not guessed from the address:
+# 'fb' is the stable name the emitter promises a capture is grepped by.
+WC_LEAF = 'fb'
+
+
+def wxprobe_boot(boot):
+    """Pull one boot's WXPROBE block apart, or None if the boot carries none."""
+    cpu, elf, maps, n = None, None, OrderedDict(), 0
+    for line, probe_line in zip(boot['lines'], boot['probe']):
+        m = WXPROBE_RE.match(probe_line)
+        if not m:
+            continue
+        kind, body = m.group(1), m.group(2)
+        n += 1
+        fields = _kv(body)
+        if kind == 'cpu':
+            cpu = {'fields': fields, 'line': line}
+        elif kind == 'elf':
+            elf = {'fields': fields, 'line': line}
+        else:
+            at = fields.get('at')
+            if at is None:
+                continue
+            # Last one wins, and duplicates are reported: the emitter probes
+            # each name once per boot, so a second line for the same 'at' means
+            # the block ran twice and the two readings are not interchangeable.
+            maps.setdefault(at, []).append({'fields': fields, 'line': line})
+    if n == 0:
+        return None
+    return {'cpu': cpu, 'elf': elf, 'maps': maps, 'lines': n,
+            'number': boot['number']}
+
+
+def print_wxprobe_boot(wx):
+    print(f"Boot {wx['number']}  WXPROBE  ({wx['lines']} line(s), "
+          f"{len(wx['maps'])} leaf/leaves)")
+    if wx['cpu']:
+        f = wx['cpu']['fields']
+        print("  cpu:  " + "  ".join(
+            f"{k}={f.get(k, '-')}" for k in
+            ('cr0', 'wp', 'cr4', 'pge', 'smep', 'smap', 'la57', 'efer',
+             'nxe', 'lme')))
+    else:
+        print("  cpu:  !! MISSING — the block printed map/elf lines but no "
+              "cpu line")
+
+    print(f"  {'at':<8} {'lvl':<5} {'va':<12} {'entry':<20} "
+          f"{'p w u nx g':<12} {'pat pcd pwt':<12} {'fw fx fu'}")
+    for at, entries in wx['maps'].items():
+        if len(entries) > 1:
+            print(f"    !! {at}: {len(entries)} lines for one leaf in one boot "
+                  f"— the probe ran more than once; readings are not "
+                  f"interchangeable")
+        for e in entries:
+            f = e['fields']
+            print(f"  {at:<8} {f.get('lvl', '-'):<5} {f.get('va', '-'):<12} "
+                  f"{f.get('e', '-'):<20} "
+                  f"{f.get('p', '-')} {f.get('w', '-')} {f.get('u', '-')} "
+                  f"{f.get('nx', '-'):<2} {f.get('g', '-'):<4} "
+                  f"{f.get('pat', '-'):<3} {f.get('pcd', '-'):<3} "
+                  f"{f.get('pwt', '-'):<5} "
+                  f"{f.get('fw', '-')}  {f.get('fx', '-')}  {f.get('fu', '-')}")
+
+    if wx['elf']:
+        f = wx['elf']['fields']
+        segs = " ".join(f"{k}={f[k]}" for k in ('s0', 's1', 's2', 's3')
+                        if k in f)
+        print(f"  elf:  ehdr={f.get('ehdr', '-')} ok={f.get('ok', '-')} "
+              f"phnum={f.get('phnum', '-')} load={f.get('load', '-')}  {segs}")
+        if f.get('ok') == '0':
+            print("    !! WARN WXPROBE-ELF-UNREAD: ok=0 — the ELF header did "
+                  "not validate, so phnum/load/s* are placeholders, not "
+                  "measurements")
+    else:
+        print("  elf:  !! MISSING — the block printed no elf line")
+    print("")
+
+
+def wxprobe_fb_typing(wx):
+    """Cross-check the fb leaf against the WC expectation.
+
+    Returns (ok, [message]).  A MISSING fb leaf is not ok: the check exists to
+    catch a silent retyping, and a reader that treats an absent leaf as a pass
+    is the same failure one level up."""
+    entries = wx['maps'].get(WC_LEAF)
+    if not entries:
+        return False, [f"WARN FB-TYPING: boot {wx['number']} has no "
+                       f"'at={WC_LEAF}' leaf — the WC cross-check could not "
+                       f"run, which is not the same as passing"]
+    msgs, ok = [], True
+    for e in entries:
+        f = e['fields']
+        got = tuple(f.get(k, '-') for k in WC_EXPECT)
+        want = tuple(WC_EXPECT.values())
+        entry = WC_PAT_ENTRY.get(got, 'not a PAT combination this reader knows')
+        if got == want:
+            msgs.append(f"ok   boot {wx['number']} fb: pat={got[0]} "
+                        f"pcd={got[1]} pwt={got[2]} -> {entry}")
+        else:
+            ok = False
+            msgs.append(
+                f"WARN FB-TYPING: boot {wx['number']} fb is pat={got[0]} "
+                f"pcd={got[1]} pwt={got[2]} -> {entry}; WC needs "
+                f"pat={want[0]} pcd={want[1]} pwt={want[2]} (PA4). The panel "
+                f"is not write-combining on this boot")
+    return ok, msgs
+
+
+def wxprobe_diff(prev, cur):
+    """DIFF two consecutive WXPROBE blocks on the RAW leaf entry.
+
+    The raw 'e=' word is the subject, not the decoded flags: every flag this
+    tool prints is derived from it, so an entry that changed while the decoded
+    columns did not is still a changed mapping.  A changed fb entry is the GR15
+    regression signature and is reported as its own loud class."""
+    findings, notes = [], []
+    for at in list(prev['maps']) + [a for a in cur['maps']
+                                    if a not in prev['maps']]:
+        p = prev['maps'].get(at)
+        c = cur['maps'].get(at)
+        if not p or not c:
+            notes.append(f"leaf '{at}' present in boot "
+                         f"{prev['number'] if p else cur['number']} only")
+            continue
+        pe, ce = p[-1]['fields'].get('e'), c[-1]['fields'].get('e')
+        if pe != ce:
+            cls = ('WARN WXPROBE-FB-ENTRY-CHANGED'
+                   if at == WC_LEAF else 'WARN WXPROBE-ENTRY-CHANGED')
+            tail = (" — this is the GR15 regression signature: the framebuffer "
+                    "leaf was retyped between boots" if at == WC_LEAF else "")
+            findings.append(f"{cls}: leaf '{at}' entry {pe} -> {ce} across "
+                            f"boots {prev['number']} -> {cur['number']}{tail}")
+    # The cpu line is per-boot state the split is designed from; a change there
+    # is reported, never alarmed — a different EFER/CR4 is a different build or
+    # a different firmware handoff, both legitimate, both worth seeing.
+    if prev['cpu'] and cur['cpu']:
+        for k in ('cr0', 'wp', 'cr4', 'pge', 'smep', 'smap', 'la57', 'efer',
+                  'nxe', 'lme'):
+            pv, cv = prev['cpu']['fields'].get(k), cur['cpu']['fields'].get(k)
+            if pv != cv:
+                notes.append(f"cpu {k}: {pv} -> {cv} across boots "
+                             f"{prev['number']} -> {cur['number']}")
+    return findings, notes
+
+
+def wxprobe_report(result):
+    """Return (parsed_anything, clean)."""
+    blocks = [wx for wx in (wxprobe_boot(b) for b in result['boots']) if wx]
+    print(f"=== WXPROBE — {result['path']} ===")
+    if not blocks:
+        print(f"  no WXPROBE lines in {len(result['boots'])} boot(s)")
+        return False, True
+    print(f"  {len(blocks)} of {len(result['boots'])} boot(s) carry a WXPROBE "
+          f"block\n")
+    for wx in blocks:
+        print_wxprobe_boot(wx)
+        if wx['lines'] != 8:
+            print(f"  !! WARN WXPROBE-SHORT: boot {wx['number']} printed "
+                  f"{wx['lines']} of the 8 lines the block emits\n")
+
+    clean = True
+    print("--- fb WC typing cross-check (pat=1 pcd=0 pwt=0 => PA4) ---")
+    for wx in blocks:
+        ok, msgs = wxprobe_fb_typing(wx)
+        if not ok:
+            clean = False
+        for msg in msgs:
+            print(f"  {msg}")
+    print("")
+
+    print("--- consecutive-boot DIFF (raw leaf entry) ---")
+    if len(blocks) < 2:
+        # NOT a pass.  One block is one sample, and a regression signature that
+        # needs two boots to appear cannot appear in one.
+        print(f"  only {len(blocks)} boot carries a WXPROBE block in this "
+              f"capture — NO DIFF POSSIBLE. The fb-entry regression signature "
+              f"needs two boots to be visible; this section has not cleared "
+              f"it, it has not tested it.")
+    else:
+        any_finding = False
+        for prev, cur in zip(blocks, blocks[1:]):
+            findings, notes = wxprobe_diff(prev, cur)
+            for note in notes:
+                print(f"  note {note}")
+            for finding in findings:
+                any_finding = True
+                clean = False
+                print(f"  !! {finding}")
+        if not any_finding:
+            print(f"  {len(blocks) - 1} consecutive pair(s) compared: every "
+                  f"leaf entry identical across boots")
+    print("")
+    return True, clean
+
+
+def wxprobe_mode(result):
+    parsed, clean = wxprobe_report(result)
+    if not parsed:
+        print(f"ERROR: {result['path']}: --wxprobe parsed 0 WXPROBE lines. "
+              f"Either the capture predates the block or the wire moved.",
+              file=sys.stderr)
+        return EXIT_NO_DATA
+    if not clean:
+        print(f"WARNING: {result['path']}: --wxprobe reported at least one "
+              f"finding (see WARN lines above).", file=sys.stderr)
+        return EXIT_FINDING
+    return EXIT_OK
+
+
+# --- EHCI EPACE-TRIM M8 SLOW-XFER (--slowxfer) ----------------------------
+
+SLOWXFER_RE = re.compile(
+    r'^\s*::\s*EHCI-HID:\s*\[(\d+)\]\s*EPACE-TRIM\s+M8\s+SLOW-XFER\s+'
+    r'(?!cap\s+reached)(.*?)\s*==\s*witness\s*::\s*$')
+# The overflow line's payload is prose, not key=value, so it gets its own
+# pattern.  Anchored on 'cap reached' and on the numbers, NOT on the em dash
+# that separates them — a dash is a rendering detail and this capture carries
+# it as raw UTF-8.
+SLOWCAP_RE = re.compile(
+    r'^\s*::\s*EHCI-HID:\s*\[(\d+)\]\s*EPACE-TRIM\s+M8\s+SLOW-XFER\s+'
+    r'cap\s+reached\b.*?(\d+)\s+transfers\s+crossed\s+the\s+(\d+)\s*ms\s+'
+    r'threshold,\s*(\d+)\s+printed,\s*(\d+)\s+suppressed')
+
+USB_STD_REQ = {
+    0x00: 'GET_STATUS', 0x01: 'CLEAR_FEATURE', 0x03: 'SET_FEATURE',
+    0x05: 'SET_ADDRESS', 0x06: 'GET_DESCRIPTOR', 0x07: 'SET_DESCRIPTOR',
+    0x08: 'GET_CONFIGURATION', 0x09: 'SET_CONFIGURATION',
+    0x0A: 'GET_INTERFACE', 0x0B: 'SET_INTERFACE', 0x0C: 'SYNCH_FRAME',
+}
+USB_DESC_TYPE = {
+    1: 'DEVICE', 2: 'CONFIG', 3: 'STRING', 4: 'INTERFACE', 5: 'ENDPOINT',
+    6: 'DEVICE_QUALIFIER', 7: 'OTHER_SPEED_CONFIG', 0x0F: 'BOS',
+    0x21: 'HID', 0x22: 'HID_REPORT', 0x29: 'HUB',
+}
+# The controller a SLOW-XFER on which refutes the device-floor verdict.  The
+# enum46 argument is that the cost is the DEVICE's, and [1] has no device on
+# it — so a slow transfer there is the controller's own, and the verdict does
+# not survive it.
+ENUM46_FALSIFIER_IDX = 1
+
+
+def _hexnum(text):
+    """Parse '0x80' / '0x0100'.  None when it is not a hex literal — a request
+    decoded from a field that was not read is a fabrication."""
+    if text is None:
+        return None
+    try:
+        return int(text, 16)
+    except ValueError:
+        return None
+
+
+def decode_request(fields):
+    """Name the control request a SLOW-XFER line describes.
+
+    Decoded from bmreq/breq/wval/wlen as the USB 2.0 spec defines them; any
+    field that will not parse yields '?' rather than a guess."""
+    bm, br = _hexnum(fields.get('bmreq')), _hexnum(fields.get('breq'))
+    wval, wlen = _hexnum(fields.get('wval')), _num(fields.get('wlen'))
+    if bm is None or br is None:
+        return '?', ''
+    rtype = (bm >> 5) & 0x3
+    if rtype == 1:
+        return f'CLASS(breq=0x{br:02x})', ''
+    if rtype == 2:
+        return f'VENDOR(breq=0x{br:02x})', ''
+    name = USB_STD_REQ.get(br, f'STD(breq=0x{br:02x})')
+    if br == 0x06:
+        # wValue high byte is the descriptor type, low byte the index; wLength
+        # is what makes the two GET_DESCRIPTOR(DEVICE) calls of an enumeration
+        # tell themselves apart (8 = the first, address-0 probe; 18 = the full
+        # device descriptor).
+        detail = ''
+        if wval is not None:
+            dtype, didx = (wval >> 8) & 0xFF, wval & 0xFF
+            detail = f"{USB_DESC_TYPE.get(dtype, f'type=0x{dtype:02x}')}"
+            if didx:
+                detail += f" idx={didx}"
+        return (f'GET_DESCRIPTOR({wlen})' if wlen is not None
+                else 'GET_DESCRIPTOR(?)'), detail
+    if br == 0x05 and wval is not None:
+        return name, f'addr={wval}'
+    if br == 0x09 and wval is not None:
+        return name, f'cfg={wval}'
+    return name, ''
+
+
+def slowxfer_boot(boot):
+    """Pull one boot's SLOW-XFER lines and cap line, or None if it has none."""
+    xfers, caps = [], []
+    for line, probe_line in zip(boot['lines'], boot['probe']):
+        m = SLOWCAP_RE.match(probe_line)
+        if m:
+            caps.append({'idx': int(m.group(1)), 'crossed': int(m.group(2)),
+                         'threshold_ms': int(m.group(3)),
+                         'printed': int(m.group(4)),
+                         'suppressed': int(m.group(5)), 'line': line})
+            continue
+        m = SLOWXFER_RE.match(probe_line)
+        if m:
+            fields = _kv(m.group(2))
+            name, detail = decode_request(fields)
+            xfers.append({'idx': int(m.group(1)), 'fields': fields,
+                          'request': name, 'detail': detail, 'line': line})
+    if not xfers and not caps:
+        return None
+    return {'number': boot['number'], 'xfers': xfers, 'caps': caps}
+
+
+def print_slowxfer_boot(sx):
+    print(f"Boot {sx['number']}  EPACE-TRIM M8 SLOW-XFER  "
+          f"({len(sx['xfers'])} transfer(s), {len(sx['caps'])} cap line(s))")
+    if sx['xfers']:
+        print(f"    {'ctl':<4} {'seq':<6} {'request':<22} {'detail':<20} "
+              f"{'addr':<5} {'spd':<4} {'stg':<4} {'xfer':<8} {'act':<8} "
+              f"{'ass'}")
+    for x in sx['xfers']:
+        f = x['fields']
+        print(f"    [{x['idx']}]  {f.get('seq', '-'):<6} "
+              f"{x['request']:<22} {x['detail']:<20} "
+              f"{f.get('addr', '-'):<5} {f.get('spd', '-'):<4} "
+              f"{f.get('stg', '-'):<4} {f.get('xfer', '-'):<8} "
+              f"{f.get('act', '-'):<8} {f.get('ass', '-')}")
+    print("")
+
+
+def slowxfer_report(result):
+    """Return (parsed_anything, clean)."""
+    blocks = [sx for sx in (slowxfer_boot(b) for b in result['boots']) if sx]
+    print(f"=== EPACE-TRIM M8 SLOW-XFER — {result['path']} ===")
+    if not blocks:
+        # The EXPECTED baseline is one line on [0] and none on [1], so a
+        # capture with none at all is worth naming: either every transfer was
+        # under the 8 ms threshold, or the instrument did not run.
+        print(f"  no SLOW-XFER lines in {len(result['boots'])} boot(s) — "
+              f"either no control transfer crossed the M8 threshold, or the "
+              f"instrument did not execute. These are not the same reading "
+              f"and this wire alone cannot tell them apart.")
+        return False, True
+    print(f"  {len(blocks)} of {len(result['boots'])} boot(s) carry "
+          f"SLOW-XFER lines\n")
+    for sx in blocks:
+        print_slowxfer_boot(sx)
+
+    clean = True
+    print("--- controller [1] check (the enum46 falsifier) ---")
+    on_one = [(sx['number'], x) for sx in blocks for x in sx['xfers']
+              if x['idx'] == ENUM46_FALSIFIER_IDX]
+    if on_one:
+        clean = False
+        print(f"  !! WARN SLOW-XFER-ON-[1]: {len(on_one)} slow transfer(s) on "
+              f"controller [1]. This REFUTES the device-floor verdict: the "
+              f"enum46 argument holds only while the cost is the device's, "
+              f"and [1] carries no device.")
+        for num, x in on_one:
+            print(f"      boot {num}: {x['line'].strip()}")
+    else:
+        print(f"  no slow transfer on controller [{ENUM46_FALSIFIER_IDX}] in "
+              f"any boot — the device-floor verdict is not refuted by this "
+              f"capture")
+    print("")
+
+    print("--- print-cap overflow ---")
+    caps = [(sx['number'], c) for sx in blocks for c in sx['caps']]
+    if caps:
+        clean = False
+        for num, c in caps:
+            print(f"  !! WARN SLOW-XFER-CAP: boot {num} controller [{c['idx']}]"
+                  f" — {c['crossed']} transfer(s) crossed the "
+                  f"{c['threshold_ms']} ms threshold, {c['printed']} printed, "
+                  f"{c['suppressed']} suppressed. The per-boot table above is "
+                  f"TRUNCATED for that controller.")
+    else:
+        print("  no cap-reached line — every crossing that occurred was "
+              "printed")
+    print("")
+
+    print("--- request census ---")
+    census = Counter(f"[{x['idx']}] {x['request']}"
+                     for sx in blocks for x in sx['xfers'])
+    for key, count in census.most_common():
+        print(f"  {count:>4}  {key}")
+    print("")
+    return True, clean
+
+
+def slowxfer_mode(result):
+    parsed, clean = slowxfer_report(result)
+    if not parsed:
+        print(f"ERROR: {result['path']}: --slowxfer parsed 0 SLOW-XFER lines.",
+              file=sys.stderr)
+        return EXIT_NO_DATA
+    if not clean:
+        print(f"WARNING: {result['path']}: --slowxfer reported at least one "
+              f"finding (see WARN lines above).", file=sys.stderr)
+        return EXIT_FINDING
+    return EXIT_OK
+
+
+# --- SMC-BATT / SMC-SCOUT (--smc) -----------------------------------------
+
+# Anchored on 'present=' rather than on the SMC-BATT prefix alone: the same
+# prefix also carries prose lines (the AC-W absence note), which have no
+# counters on them and must not enter the census as a sample.
+SMCBATT_RE = re.compile(
+    r'^\s*::\s*SMC-BATT:\s*(present=.*?)\s*==\s*witness\s*::\s*$')
+KEYCOUNT_RE = re.compile(r'^\s*::\s*SMC-SCOUT:\s*#KEY\s+count=(\d+)\b')
+KEYWALK_RE = re.compile(
+    r'^\s*::\s*SMC-SCOUT:\s*index\s+walk\s+done\s*\((\d+)\s+of\s+(\d+)\s+'
+    r'names\)')
+
+# Cumulative-since-boot counters.  GREATEST WINS, NEVER SUM: each line reprints
+# the running total, so adding two lines together counts the same events twice.
+#
+# This capture alone carries FOUR generations of the line — no counters at all
+# (406 lines), 'stall0='/'resid=' (46), '...gap= busy=' (3), and
+# '...gap= busy= late=' (7).  'stall0' is listed alongside 'st0' because they
+# are the same quantity under its former name: reading only the new name would
+# report the old wire's counter as absent, which is a false silence rather than
+# a measurement.
+SMC_COUNTERS = ('gap', 'busy', 'late', 'rfail', 'short', 'unc', 'st0',
+                'stall0', 'resid')
+
+
+def smc_boot(boot):
+    """Pull one boot's SMC-BATT counter samples and #KEY walk, or None."""
+    samples, keycount, keywalk = [], None, None
+    for line, probe_line in zip(boot['lines'], boot['probe']):
+        m = SMCBATT_RE.match(probe_line)
+        if m:
+            samples.append({'fields': _kv(m.group(1)), 'line': line})
+            continue
+        m = KEYCOUNT_RE.match(probe_line)
+        if m:
+            keycount = {'count': int(m.group(1)), 'line': line}
+            continue
+        m = KEYWALK_RE.match(probe_line)
+        if m:
+            keywalk = {'named': int(m.group(1)), 'total': int(m.group(2)),
+                       'line': line}
+    if not samples and keywalk is None and keycount is None:
+        return None
+
+    stats = OrderedDict()
+    for key in SMC_COUNTERS:
+        vals = [_num(s['fields'].get(key)) for s in samples]
+        vals = [v for v in vals if v is not None]
+        stats[key] = {
+            # 'present' distinguishes a counter this build does not emit from
+            # one that is emitted and reads zero.  'late=' is absent on every
+            # pre-GR18 boot and that absence must not read as late=0.
+            'present': bool(vals),
+            'n': len(vals),
+            'max': max(vals) if vals else None,
+            'first': vals[0] if vals else None,
+            'delta': (max(vals) - vals[0]) if vals else None,
+        }
+    return {'number': boot['number'], 'samples': samples, 'stats': stats,
+            'keycount': keycount, 'keywalk': keywalk}
+
+
+def print_smc_boot(sm):
+    print(f"Boot {sm['number']}  SMC  ({len(sm['samples'])} SMC-BATT "
+          f"sample(s))")
+    if sm['samples']:
+        last = sm['samples'][-1]['fields']
+        print("  last reading: " + "  ".join(
+            f"{k}={last.get(k, '-')}" for k in
+            ('present', 'soc', 'volt', 'amp', 'rem', 'full', 'ac',
+             'retries')))
+        print(f"    {'counter':<8} {'max':>10} {'first':>10} {'delta':>10}   "
+              f"note")
+        for key, st in sm['stats'].items():
+            if not st['present']:
+                print(f"    {key:<8} {'absent':>10} {'-':>10} {'-':>10}   "
+                      f"not emitted on this boot"
+                      + ("  (pre-GR18 SMC-BATT wire)" if key == 'late' else ""))
+                continue
+            note = f"greatest of {st['n']} cumulative sample(s)"
+            print(f"    {key:<8} {st['max']:>10} {st['first']:>10} "
+                  f"{st['delta']:>10}   {note}")
+    else:
+        print("  no SMC-BATT counter sample in this boot")
+
+    if sm['keycount'] or sm['keywalk']:
+        kc = sm['keycount']['count'] if sm['keycount'] else None
+        if sm['keywalk']:
+            kw = sm['keywalk']
+            verdict = ('complete' if kw['named'] == kw['total'] and kw['total']
+                       else 'INCOMPLETE' if kw['total'] else 'empty')
+            print(f"  #KEY index walk: {kw['named']} of {kw['total']} names "
+                  f"({verdict}); #KEY count={kc if kc is not None else '-'}")
+            if kc is not None and kc != kw['total']:
+                print(f"    !! WARN SMC-KEYWALK-COUNT: #KEY said {kc} keys, "
+                      f"the walk enumerated {kw['total']}")
+        else:
+            print(f"  #KEY count={kc} — the walk never reported done")
+    else:
+        print("  #KEY index walk: not attempted in this boot")
+    print("")
+
+
+def smc_report(result):
+    """Return (parsed_anything, clean)."""
+    blocks = [sm for sm in (smc_boot(b) for b in result['boots']) if sm]
+    print(f"=== SMC — {result['path']} ===")
+    if not blocks:
+        print(f"  no SMC-BATT / SMC-SCOUT lines in {len(result['boots'])} "
+              f"boot(s)")
+        return False, True
+    print(f"  {len(blocks)} of {len(result['boots'])} boot(s) carry SMC "
+          f"lines\n")
+    for sm in blocks:
+        print_smc_boot(sm)
+
+    clean = True
+    print("--- gap / busy / late across the capture (cumulative: greatest "
+          "wins, never summed) ---")
+    print(f"  {'boot':<6} {'samples':>8} {'gap':>10} {'busy':>10} "
+          f"{'late':>10}")
+    for sm in blocks:
+        row = []
+        for key in ('gap', 'busy', 'late'):
+            st = sm['stats'][key]
+            row.append(str(st['max']) if st['present'] else 'absent')
+        print(f"  {sm['number']:<6} {len(sm['samples']):>8} "
+              f"{row[0]:>10} {row[1]:>10} {row[2]:>10}")
+    print("")
+
+    # 'late' is the GR18 append.  A capture that mixes boots with and without
+    # it is the normal reading mid-arc and is reported as such, not alarmed.
+    with_late = [sm['number'] for sm in blocks if sm['stats']['late']['present']]
+    without = [sm['number'] for sm in blocks
+               if sm['samples'] and not sm['stats']['late']['present']]
+    print(f"  late= present on boot(s): "
+          f"{', '.join(with_late) if with_late else 'none'}")
+    if without:
+        print(f"  late= ABSENT on boot(s): {', '.join(without)} — pre-GR18 "
+              f"wire. Absent is not zero and is not reported as zero.")
+    for sm in blocks:
+        st = sm['stats']['late']
+        if st['present'] and st['max']:
+            clean = False
+            print(f"  !! WARN SMC-LATE: boot {sm['number']} late={st['max']} "
+                  f"— value bytes arrived after the read stopped and were "
+                  f"drained-and-discarded")
+        unc = sm['stats']['unc']
+        if unc['present'] and unc['max']:
+            clean = False
+            print(f"  !! WARN SMC-UNC: boot {sm['number']} unc={unc['max']} "
+                  f"— a read the SMC would not close")
+    print("")
+    return True, clean
+
+
+def smc_mode(result):
+    parsed, clean = smc_report(result)
+    if not parsed:
+        print(f"ERROR: {result['path']}: --smc parsed 0 SMC lines.",
+              file=sys.stderr)
+        return EXIT_NO_DATA
+    if not clean:
+        print(f"WARNING: {result['path']}: --smc reported at least one finding "
+              f"(see WARN lines above).", file=sys.stderr)
+        return EXIT_FINDING
+    return EXIT_OK
+
 
 # --- logts gap analysis -------------------------------------------------
 #
@@ -124,9 +1406,18 @@ def diff_boots(boots1, boots2):
 # calibrated -- a real failure, reported as such and exited nonzero -- whereas a
 # capture that is entirely unprefixed is simply not a logts capture.
 
-TS_MONO_RE = re.compile(r'^\[\s*(\d+)ms\]\s')
-TS_CIVIL_RE = re.compile(r'^\[(\d{2}):(\d{2}):(\d{2})Z\]\s')
-TS_UNKNOWN_RE = re.compile(r'^\[\s*\?ms\]\s')
+# THE SAME THREE SHAPES LOGTS_PREFIX_RE STRIPS, one reader per kind so the
+# number can be read out.  Their tolerances are deliberately identical to it --
+# optional leading whitespace, optional space before 'ms' and inside the
+# brackets, at most one space after the ']' -- because a shape that strip_logts
+# removes but parse_ts does not recognise is a line the census reads as
+# timestamped and the timing modes read as contention-deferred.  That divergence
+# existed between the two lineages before the merge (this half wanted exactly one
+# space after the ']'), it never fired on a real capture, and it is now closed by
+# construction and asserted by selftest_logts().
+TS_MONO_RE = re.compile(r'^\s*\[\s*(\d+)\s*ms\s*\]\s?')
+TS_CIVIL_RE = re.compile(r'^\s*\[\s*(\d{2}):(\d{2}):(\d{2})Z\s*\]\s?')
+TS_UNKNOWN_RE = re.compile(r'^\s*\[\s*\?\s*ms\s*\]\s?')
 HZ_RE = re.compile(r'\bhz=(\d+)')
 
 # UNAOS.LOG-only fixed lines, written by the flight recorder DIRECTLY into the
@@ -270,14 +1561,23 @@ def print_gap_table(title, rows, top):
 
 
 def load_rows(content):
+    """Rows for the timing modes: the ORIGINAL line, its clock kind and stamp,
+    and the prefix-stripped `body` every pattern below is matched against.
+
+    `body` comes from strip_logts() -- the same function the census/GR18 half
+    uses for its probe copy -- rather than from the parse_ts match end, so there
+    is exactly one definition in this file of where a stamp stops and a line
+    starts.  On an unstamped row it is a no-op, which is why it can be applied
+    unconditionally."""
     rows = []
     for line in content.split('\n'):
         if not line.strip():
             continue
         parsed = parse_ts(line)
         if parsed:
-            kind, ts, body = parsed
-            rows.append({'line': line, 'kind': kind, 'ts': ts, 'body': body})
+            kind, ts, _body = parsed
+            rows.append({'line': line, 'kind': kind, 'ts': ts,
+                         'body': strip_logts(line)})
         elif FILE_META_RE.match(line):
             # UNAOS.LOG fixed lines are written straight to the file, never through
             # the serial taps -- unprefixed by construction, not deferred.
@@ -987,6 +2287,14 @@ def wcg_report(label, content, boot_sel):
     return True
 
 
+
+# ---------------------------------------------------------------------------
+# Fixtures — both lineages.  Timing fixtures first (--gaps / --wcg / paygo),
+# then the GR18 section fixtures.  Every one of them is fed through the same
+# entry point a real capture goes through: a fixture that exercises a private
+# shortcut certifies the shortcut, not the tool.
+# ---------------------------------------------------------------------------
+
 # --- synthetic self-test -------------------------------------------------
 
 # NOTE: no ':: FR-BOOT:' lines here on purpose. FRSTAMP is FILE-only (flight_recorder.rs appends
@@ -1575,8 +2883,167 @@ def wcg_prof_expect(st):
         ('accounted == span', sum(e['cost'] for e in st['groups'].values()), 2620),
     ]
 
+# ---------------------------------------------------------------------------
+# Fixtures and --selftest
+#
+# Fixture 1 is REAL: every line is quoted byte-for-byte out of Boot V
+# (~/unaos-bench/scratch/bootV.log, the slice of
+# ~/unaos-bench/capture/rmbp-gr16-s73/ttyUSB0.log).  Lines between the ones
+# quoted were dropped; nothing was edited.  The capture path is deliberately
+# NOT read at runtime — a fixture that needs a bench directory to still exist
+# is a fixture that quietly stops running.
+#
+# Fixture 2 is the same real block plus a SECOND boot carrying four things
+# metal has not produced and which therefore cannot be quoted: a retyped fb
+# leaf, a SLOW-XFER on controller [1], a cap-reached overflow line, and a
+# pre-GR18 SMC-BATT line with no 'late='.  Each mutation is marked below.  They
+# are exactly the readings the three sections exist to catch, so leaving them
+# untested until metal produces one would mean shipping three instruments whose
+# alarm paths have never executed.
+# ---------------------------------------------------------------------------
 
-def selftest(top):
+# The pre-GR18 SMC-BATT wire, REAL: this is the tail of the PREVIOUS boot,
+# still in the bootV.log slice at line 35.  It ends '... gap=376 busy=0' with
+# no 'late=' at all, which is the whole point of quoting it.
+_SMC_PRE_GR18 = (
+    "[ 174541ms] :: SMC-BATT: present=true soc=94% volt=12310mV amp=-2286mA "
+    "full=9962mAh rem=9438mAh ac=derived:discharging retries=0/0 st0=0 "
+    "rfail=0 rok=1 short=0 unc=0 gap=376 busy=0 == witness ::")
+
+GR18_FIXTURE_BOOTV = """\
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXPROBE cpu: cr0=0x0000000080000013 wp=0 cr4=0x0000000000100668 pge=0 smep=1 smap=0 la57=0 efer=0x0000000000000D01 nxe=1 lme=1 ::
+[      ?ms] :: WXPROBE map: at=kimg va=0x7B238000 lvl=2M e=0x000000007B2000E3 p=1 w=1 u=0 nx=0 g=0 pat=0 pcd=0 pwt=0 fw=1 fx=1 fu=0 ::
+[      ?ms] :: WXPROBE map: at=ktext va=0x7B338A90 lvl=2M e=0x000000007B2000E3 p=1 w=1 u=0 nx=0 g=0 pat=0 pcd=0 pwt=0 fw=1 fx=1 fu=0 ::
+[      ?ms] :: WXPROBE map: at=ap8000 va=0x8000 lvl=4K e=0x0000000000008003 p=1 w=1 u=0 nx=0 g=0 pat=0 pcd=0 pwt=0 fw=1 fx=1 fu=0 ::
+[      ?ms] :: WXPROBE map: at=fb va=0x90020000 lvl=2M e=0x00000000900010E3 p=1 w=1 u=0 nx=0 g=0 pat=1 pcd=0 pwt=0 fw=1 fx=1 fu=0 ::
+[      ?ms] :: WXPROBE map: at=bss va=0x7B4AF000 lvl=2M e=0x000000007B4000E3 p=1 w=1 u=0 nx=0 g=0 pat=0 pcd=0 pwt=0 fw=1 fx=1 fu=0 ::
+[      ?ms] :: WXPROBE map: at=lapic va=0xFEE00000 lvl=2M e=0x00000000FEE000E3 p=1 w=1 u=0 nx=0 g=0 pat=0 pcd=0 pwt=0 fw=1 fx=1 fu=0 ::
+[      ?ms] :: WXPROBE elf: ehdr=0x7B238000 ok=1 phnum=9 load=4 s0=0x0+0x30024/R-- s1=0x31030+0xF7EAF/R-X s2=0x129EE0+0x7120/RW- s3=0x1312C0+0x580448/RW- ::
+[      ?ms] :: X86_64 Memory Init ::
+[    968ms] :: EHCI-HID: [0] EPACE-TRIM M8 SLOW-XFER addr=0 hub=0.0 spd=HS bmreq=0x80 breq=0x06 wval=0x0100 widx=0x0000 wlen=8 stg=3 xfer=50ms act=50ms ass=0ms seq=1/8 == witness ::
+[   1745ms] :: SMC-SCOUT: key #KEY present len=4 bytes=[00 00 01 ed] (key count (metal-only; enables index enumeration)) ::
+[   1749ms] :: SMC-SCOUT: #KEY count=493 — walking index list ::
+[   1849ms] :: SMC-SCOUT: index walk done (493 of 493 names) ::
+[   1850ms] :: SMC-BATT: AC-W is absent on this SMC (clean negative answer, not a fault) — AC presence is UNKNOWN; ac=derived:* is inferred from the B0AC sign, and the key is re-probed every 60000 ms == witness ::
+[   1851ms] :: SMC-BATT: present=true soc=94% volt=12306mV amp=-2519mA full=9962mAh rem=9387mAh ac=derived:discharging retries=0/0 st0=0 rfail=0 rok=0 short=0 unc=0 gap=1447 busy=49 late=0 == witness ::
+[  63953ms] :: SMC-BATT: present=true soc=93% volt=12292mV amp=-2221mA full=9962mAh rem=9339mAh ac=derived:discharging retries=0/0 st0=0 rfail=0 rok=0 short=0 unc=0 gap=1680 busy=49 late=0 == witness ::
+[ 198939ms] :: SMC-BATT: present=true soc=92% volt=12250mV amp=-2294mA full=9962mAh rem=9239mAh ac=derived:discharging retries=0/0 st0=0 rfail=0 rok=0 short=0 unc=0 gap=2312 busy=49 late=0 == witness ::
+"""
+
+# Boot 2's mutations, each named where it appears:
+#   * fb leaf   e=...900010E3 pat=1 -> e=...900000F3 pat=0 pcd=1.  The PAT bit
+#     for a 2M leaf is bit 12, so clearing it and setting PCD is the exact bit
+#     pattern of a WC leaf that came back UC — the GR15 shape.
+#   * SLOW-XFER real [0] line with the controller index changed to [1].
+#   * a cap-reached line (metal has never exceeded the cap).
+#   * the real pre-GR18 SMC-BATT line, which has no 'late='.
+GR18_FIXTURE_TWOBOOT = GR18_FIXTURE_BOOTV + """\
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: WXPROBE cpu: cr0=0x0000000080000013 wp=0 cr4=0x0000000000100668 pge=0 smep=1 smap=0 la57=0 efer=0x0000000000000D01 nxe=1 lme=1 ::
+[      ?ms] :: WXPROBE map: at=kimg va=0x7B238000 lvl=2M e=0x000000007B2000E3 p=1 w=1 u=0 nx=0 g=0 pat=0 pcd=0 pwt=0 fw=1 fx=1 fu=0 ::
+[      ?ms] :: WXPROBE map: at=ktext va=0x7B338A90 lvl=2M e=0x000000007B2000E3 p=1 w=1 u=0 nx=0 g=0 pat=0 pcd=0 pwt=0 fw=1 fx=1 fu=0 ::
+[      ?ms] :: WXPROBE map: at=ap8000 va=0x8000 lvl=4K e=0x0000000000008003 p=1 w=1 u=0 nx=0 g=0 pat=0 pcd=0 pwt=0 fw=1 fx=1 fu=0 ::
+[      ?ms] :: WXPROBE map: at=fb va=0x90020000 lvl=2M e=0x00000000900000F3 p=1 w=1 u=0 nx=0 g=0 pat=0 pcd=1 pwt=0 fw=1 fx=1 fu=0 ::
+[      ?ms] :: WXPROBE map: at=bss va=0x7B4AF000 lvl=2M e=0x000000007B4000E3 p=1 w=1 u=0 nx=0 g=0 pat=0 pcd=0 pwt=0 fw=1 fx=1 fu=0 ::
+[      ?ms] :: WXPROBE map: at=lapic va=0xFEE00000 lvl=2M e=0x00000000FEE000E3 p=1 w=1 u=0 nx=0 g=0 pat=0 pcd=0 pwt=0 fw=1 fx=1 fu=0 ::
+[      ?ms] :: WXPROBE elf: ehdr=0x7B238000 ok=1 phnum=9 load=4 s0=0x0+0x30024/R-- s1=0x31030+0xF7EAF/R-X s2=0x129EE0+0x7120/RW- s3=0x1312C0+0x580448/RW- ::
+[      ?ms] :: X86_64 Memory Init ::
+[    968ms] :: EHCI-HID: [1] EPACE-TRIM M8 SLOW-XFER addr=0 hub=0.0 spd=HS bmreq=0x80 breq=0x06 wval=0x0100 widx=0x0000 wlen=18 stg=3 xfer=50ms act=50ms ass=0ms seq=1/8 == witness ::
+[   1000ms] :: EHCI-HID: [1] EPACE-TRIM M8 SLOW-XFER cap reached — 11 transfers crossed the 8 ms threshold, 8 printed, 3 suppressed == witness ::
+""" + _SMC_PRE_GR18 + "\n"
+
+
+def gr18_bootv_expect(result):
+    """Boot V, read end to end.  The first two assertions are the LOGTS
+    REGRESSION itself: every line in this fixture carries a stamp, and before
+    the strip_logts() fix this file parsed a stamped capture as zero boots and
+    zero witnesses while still printing a census that looked clean."""
+    boot = result['boots'][0]
+    wx = wxprobe_boot(boot)
+    fb = wx['maps']['fb'][-1]['fields']
+    fb_ok, _ = wxprobe_fb_typing(wx)
+    sx = slowxfer_boot(boot)
+    x0 = sx['xfers'][0]
+    sm = smc_boot(boot)
+    return [
+        ('boots parsed from a logts-stamped capture', len(result['boots']), 1),
+        ('WXPROBE reached the family table', boot['families']['WXPROBE'], 8),
+        ('wxprobe lines', wx['lines'], 8),
+        ('wxprobe leaves', list(wx['maps']),
+         ['kimg', 'ktext', 'ap8000', 'fb', 'bss', 'lapic']),
+        ('cpu smep/nxe', (wx['cpu']['fields']['smep'],
+                          wx['cpu']['fields']['nxe']), ('1', '1')),
+        ('elf ok/load', (wx['elf']['fields']['ok'],
+                         wx['elf']['fields']['load']), ('1', '4')),
+        ('fb raw entry', fb['e'], '0x00000000900010E3'),
+        ('fb pat/pcd/pwt', (fb['pat'], fb['pcd'], fb['pwt']), ('1', '0', '0')),
+        ('fb typing cross-check', fb_ok, True),
+        ('slow transfers', len(sx['xfers']), 1),
+        ('slow transfer controller', x0['idx'], 0),
+        ('slow transfer request decoded', x0['request'], 'GET_DESCRIPTOR(8)'),
+        ('slow transfer descriptor', x0['detail'], 'DEVICE'),
+        ('slow transfer cost', x0['fields']['xfer'], '50ms'),
+        ('cap lines', len(sx['caps']), 0),
+        ('smc samples (the prose AC-W line is NOT one)', len(sm['samples']), 3),
+        ('smc gap: greatest of 1447/1680/2312', sm['stats']['gap']['max'], 2312),
+        ('smc gap delta first->max', sm['stats']['gap']['delta'], 865),
+        ('smc gap is not the sum', sm['stats']['gap']['max'] == 1447 + 1680 + 2312,
+         False),
+        ('smc busy', sm['stats']['busy']['max'], 49),
+        ('smc late present', sm['stats']['late']['present'], True),
+        ('smc late', sm['stats']['late']['max'], 0),
+        ('#KEY count', sm['keycount']['count'], 493),
+        ('#KEY walk', (sm['keywalk']['named'], sm['keywalk']['total']),
+         (493, 493)),
+    ]
+
+
+def gr18_twoboot_expect(result):
+    """The alarm paths.  Every one of these is a reading metal has not yet
+    produced, which is precisely why it is asserted here."""
+    b1, b2 = result['boots']
+    wx1, wx2 = wxprobe_boot(b1), wxprobe_boot(b2)
+    findings, _notes = wxprobe_diff(wx1, wx2)
+    fb2_ok, fb2_msgs = wxprobe_fb_typing(wx2)
+    sx2 = slowxfer_boot(b2)
+    sm2 = smc_boot(b2)
+    cap = sx2['caps'][0]
+    return [
+        ('boots parsed', len(result['boots']), 2),
+        ('diff findings', len(findings), 1),
+        ('the finding names the fb leaf and the GR15 signature',
+         findings[0].startswith('WARN WXPROBE-FB-ENTRY-CHANGED') and
+         'GR15 regression signature' in findings[0], True),
+        ('boot 2 fb typing refused', fb2_ok, False),
+        ('the refusal decodes the PAT entry',
+         'PA2 (UC-)' in fb2_msgs[0], True),
+        ('slow transfer on [1] seen', [x['idx'] for x in sx2['xfers']], [1]),
+        ('the [1] transfer decodes as the full device descriptor',
+         sx2['xfers'][0]['request'], 'GET_DESCRIPTOR(18)'),
+        ('cap line crossed', cap['crossed'], 11),
+        ('cap line printed/suppressed', (cap['printed'], cap['suppressed']),
+         (8, 3)),
+        ('cap line threshold', cap['threshold_ms'], 8),
+        ('cap line is not read as a transfer', len(sx2['xfers']), 1),
+        ('boot 2 SMC-BATT has no late=', sm2['stats']['late']['present'], False),
+        ('absent late does NOT read as zero', sm2['stats']['late']['max'], None),
+        ('boot 2 gap still read', sm2['stats']['gap']['max'], 376),
+    ]
+
+
+# A properly stamped x86 boot that carries none of the three GR18 wires: the
+# absence case.  Every section must REFUSE on it rather than print an empty
+# table that reads like a measurement.
+SELFTEST_NO_GR18_WIRE = """\
+[      ?ms] :: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+[      ?ms] :: X86_64 Memory Init ::
+[   1744ms] :: EPACE: [0] wake=0ms(n=1) hcrst=47ms(n=2) smoke=29ms(n=1) rootrst=320ms(n=3) hseprobe=0ms(n=1) enum=285ms(n=1) [hubpwr=200ms(n=1) hubrst=12ms(n=1) hidcfg=5ms(n=1) resid=67ms] {xfer=60ms(n=28) ass=0ms act=58ms} == witness ::
+[   3513ms] :: BPACE: entry t=0ms d=0ms ::
+"""
+
+
+def selftest_timing(top):
     """Fixtures for both timing modes.
 
     --gaps: a mixed capture where '?ms' lines must be counted but must not become
@@ -1731,9 +3198,148 @@ def selftest(top):
     return ok
 
 
+def selftest_gr18():
+    """Drive the three GR18 sections through their real entry points.
+
+    Each case parses fixture TEXT with parse_content — the same function a
+    capture file goes through — then asserts against the section helpers AND
+    runs the section's own report, so a wiring edit that leaves the helpers
+    right and the report empty cannot pass."""
+    ok = True
+    for name, text, checker in (
+        ('GR18: Boot V, real lines (wxprobe + slowxfer + smc)',
+         GR18_FIXTURE_BOOTV, gr18_bootv_expect),
+        ('GR18: two boots — retyped fb leaf, SLOW-XFER on [1], cap overflow, '
+         'pre-GR18 SMC wire',
+         GR18_FIXTURE_TWOBOOT, gr18_twoboot_expect),
+    ):
+        print(f"=== selftest: {name} ===")
+        result = parse_content(f'<{name}>', text)
+        case_ok = True
+        if not result['boots']:
+            print("    BAD fixture parsed 0 boots")
+            case_ok = False
+        else:
+            for label, actual, want in checker(result):
+                good = actual == want
+                if not good:
+                    case_ok = False
+                print(f"    {'ok ' if good else 'BAD'} {label}: "
+                      f"got {actual!r}, want {want!r}")
+        if not case_ok:
+            ok = False
+        print(f"=== selftest: {name}: {'PASS' if case_ok else 'FAIL'}\n")
+
+    # THE REPORT PATH ITSELF.  Every assertion above calls the section helpers
+    # directly, so none of them touches the functions that decide what a
+    # --wxprobe / --slowxfer / --smc run actually prints and what it exits
+    # with.  A wiring edit could leave all of the above green while a section
+    # printed nothing.  These cases drive the report entry points and assert
+    # the exit code, which is the thing a caller reads.
+    print("=== selftest: GR18: section report paths and exit codes ===")
+    wired = []
+    for label, fixture, mode, want in (
+        ('--wxprobe on Boot V exits OK', GR18_FIXTURE_BOOTV, wxprobe_mode,
+         EXIT_OK),
+        ('--wxprobe on the retyped-leaf capture exits FINDING',
+         GR18_FIXTURE_TWOBOOT, wxprobe_mode, EXIT_FINDING),
+        ('--slowxfer on Boot V exits OK', GR18_FIXTURE_BOOTV, slowxfer_mode,
+         EXIT_OK),
+        ('--slowxfer on the [1] capture exits FINDING', GR18_FIXTURE_TWOBOOT,
+         slowxfer_mode, EXIT_FINDING),
+        ('--smc on Boot V exits OK', GR18_FIXTURE_BOOTV, smc_mode, EXIT_OK),
+        ('--wxprobe on a capture with no WXPROBE exits NO_DATA',
+         SELFTEST_NO_GR18_WIRE, wxprobe_mode, EXIT_NO_DATA),
+        ('--slowxfer on a capture with no SLOW-XFER exits NO_DATA',
+         SELFTEST_NO_GR18_WIRE, slowxfer_mode, EXIT_NO_DATA),
+        ('--smc on a capture with no SMC lines exits NO_DATA',
+         SELFTEST_NO_GR18_WIRE, smc_mode, EXIT_NO_DATA),
+    ):
+        result = parse_content(f'<{label}>', fixture)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            got = mode(result)
+        # A report that exits with a verdict and prints nothing is not a
+        # report; assert it put something on the page too.
+        wired.append((label, (got, bool(buf.getvalue().strip())),
+                      (want, True)))
+    wired_ok = True
+    for label, actual, want in wired:
+        good = actual == want
+        if not good:
+            wired_ok = False
+            ok = False
+        print(f"    {'ok ' if good else 'BAD'} {label}: got {actual!r}, "
+              f"want {want!r}")
+    print(f"=== selftest: GR18: report paths: "
+          f"{'PASS' if wired_ok else 'FAIL'}\n")
+    return ok
+
+
+def selftest_logts():
+    """The one stripping law: strip_logts() and the parse_ts readers must agree
+    on where a stamp ends.
+
+    They came from different lineages and had drifted — the timing reader wanted
+    exactly one space after the ']', the census stripper allowed none and also
+    tolerated a space before 'ms' and leading whitespace.  Any shape one accepts
+    and the other does not is a line that is timestamped for one half of this
+    file and deferred for the other, which is a miscount no output would
+    announce.  Asserted, not commented."""
+    print("=== selftest: logts: one stripping law (strip_logts == parse_ts) ===")
+    cases = [
+        ('monotonic',        '[   1851ms] :: BPACE: entry t=0ms d=0ms ::', 'mono'),
+        ('civil',            '[15:30:45Z] [wc-g] win=1 seq=0 -> CLEAN', 'civil'),
+        ('unknown',          '[      ?ms] :: X86_64 Memory Init ::', 'unknown'),
+        ('narrow monotonic', '[0ms] :: entry ::', 'mono'),
+        ('no stamp',         ':: FR-BOOT: hz=1 cy=2 reused=true state=flushed ::', None),
+    ]
+    checks = []
+    for label, line, want_kind in cases:
+        parsed = parse_ts(line)
+        kind = parsed[0] if parsed else None
+        body = parsed[2] if parsed else line
+        checks.append((f'{label}: parse_ts kind', kind, want_kind))
+        # The load-bearing one: same body from both implementations.
+        checks.append((f'{label}: body agrees with strip_logts',
+                       body, strip_logts(line)))
+    ok = True
+    for label, actual, want in checks:
+        good = actual == want
+        if not good:
+            ok = False
+        print(f"    {'ok ' if good else 'BAD'} {label}: got {actual!r}, want {want!r}")
+    print(f"=== selftest: logts: one stripping law: {'PASS' if ok else 'FAIL'}\n")
+    return ok
+
+
+def selftest(top):
+    """ONE self-test, both lineages.
+
+    The suites are kept as separate functions because they assert different
+    things through different entry points, but there is a single --selftest and a
+    single exit code: a merged tool whose two halves could pass independently
+    while the merged file was broken would be a tool nobody has actually tested.
+    """
+    results = []
+    print("########## self-test 1/3: logts stripping law ##########\n")
+    results.append(('logts stripping law', selftest_logts()))
+    print("########## self-test 2/3: timing modes (--gaps, --wcg, paygo) ##########\n")
+    results.append(('timing modes (--gaps / --wcg / paygo)', selftest_timing(top)))
+    print("########## self-test 3/3: census + GR18 sections ##########\n")
+    results.append(('census + GR18 sections (--wxprobe / --slowxfer / --smc)',
+                    selftest_gr18()))
+    print("########## self-test summary ##########")
+    for label, good in results:
+        print(f"  {'PASS' if good else 'FAIL'}  {label}")
+    ok = all(good for _, good in results)
+    print(f"  ==> {'ALL SUITES PASS' if ok else 'FAILURE'}")
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyze serial captures",
+        description="Analyze UnaOS bench serial captures (x86_64 / aarch64 / Orin)",
         epilog=("logts prefixes: '[  NNNNNms] ' is an absolute stamp in ms since KERNEL ENTRY "
                 "-- the same origin the BPACE/GPACE since-entry figures use, so the numbers can "
                 "be compared with those ledger lines directly. '[HH:MM:SSZ] ' is civil time. "
@@ -1742,54 +3348,132 @@ def main():
                 "that is entirely '?ms' is reported as 'counter never calibrated' and exits "
                 "nonzero."))
     parser.add_argument("logs", nargs='*', help="Log files to parse (1 or 2 files)")
+    parser.add_argument("--full", action="store_true",
+                        help="print every witness and defect line, not samples")
+    parser.add_argument("--samples", type=int, default=2, metavar="N",
+                        help="sample lines to show per family (default 2)")
+    parser.add_argument("--family", metavar="REGEX",
+                        help="only report families whose name matches REGEX "
+                             "(implies full output for those families)")
+    parser.add_argument("--wxprobe", action="store_true",
+                        help="read the 8-line WXPROBE block: per-boot table, "
+                             "consecutive-boot DIFF on the raw leaf entry, and "
+                             "the fb write-combining cross-check")
+    parser.add_argument("--slowxfer", action="store_true",
+                        help="read EPACE-TRIM M8 SLOW-XFER: per-boot table with "
+                             "the control request decoded, the controller-[1] "
+                             "check, and the print-cap overflow line")
+    parser.add_argument("--smc", action="store_true",
+                        help="read SMC-BATT gap/busy/late (cumulative: greatest "
+                             "wins, never summed) and the SMC-SCOUT #KEY index "
+                             "walk")
     parser.add_argument("--gaps", action="store_true",
                         help="report the largest inter-line time gaps in a logts-prefixed capture")
     parser.add_argument("--wcg", action="store_true",
                         help="decompose the witness cost inside the kepler window: per-instrument "
                              "attribution, per-pass [wc-g] costs, the [wc-g] prof phase table when "
-                             "the build emits one, and a serial-overhead estimate")
+                             "the build emits one, the pay-as-you-go census, and a serial-overhead "
+                             "estimate")
     parser.add_argument("--boot", type=int, default=None,
                         help="with --wcg, restrict the report to boot N (1-based)")
     parser.add_argument("--top", type=int, default=15,
                         help="how many gaps to list per table (default 15)")
     parser.add_argument("--selftest", action="store_true",
-                        help="run the synthetic prefix-parsing fixtures and exit")
+                        help="run every fixture set (timing modes + census/GR18 sections) and exit")
     args = parser.parse_args()
 
     if args.selftest:
-        sys.exit(0 if selftest(args.top) else 1)
+        sys.exit(EXIT_OK if selftest(args.top) else 1)
 
     if not args.logs:
         parser.error("no log files given")
 
+    # The TIMING modes cut the capture on 'hz=' rather than on the boot-marker
+    # table (see the module docstring), so they run off their own file read and
+    # are selected first.  Their exit is 0/1 as it always was: these two answer a
+    # measurement question, and 'refused' is their only failure.
     if args.wcg:
         ok = True
         for log_file in args.logs:
             if not wcg_mode(log_file, args.boot):
                 ok = False
-        sys.exit(0 if ok else 1)
+        sys.exit(EXIT_OK if ok else 1)
 
     if args.gaps:
         ok = True
         for log_file in args.logs:
             if not gaps_mode(log_file, args.top):
                 ok = False
-        sys.exit(0 if ok else 1)
+        sys.exit(EXIT_OK if ok else 1)
+
+    # The GR18 sections are per-boot readers over the same parse the census
+    # uses, so they share parse_log and are selected here rather than each
+    # re-walking the file.
+    sections = [(flag, fn) for flag, fn in
+                (('--wxprobe', wxprobe_mode), ('--slowxfer', slowxfer_mode),
+                 ('--smc', smc_mode))
+                if getattr(args, flag.lstrip('-').replace('-', '_'))]
+    if sections:
+        worst = EXIT_OK
+        for log_file in args.logs:
+            result = parse_log(log_file)
+            if not result['boots']:
+                print(f"ERROR: {log_file}: parsed 0 boots — no boot-start "
+                      f"marker matched. Markers tried: "
+                      f"{'; '.join(result['markers_tried'])}", file=sys.stderr)
+                worst = max(worst, EXIT_NO_BOOTS)
+                continue
+            for _flag, fn in sections:
+                worst = max(worst, fn(result))
+        sys.exit(worst)
 
     if len(args.logs) > 2:
-        print("Please provide 1 or 2 log files.")
-        sys.exit(1)
+        print("Please provide 1 or 2 log files.", file=sys.stderr)
+        sys.exit(EXIT_USAGE)
 
-    boots_list = []
+    family_filter = re.compile(args.family) if args.family else None
+
+    results = []
     for log_file in args.logs:
-        print(f"--- Parsing {log_file} ---")
-        boots = parse_log(log_file)
-        boots_list.append(boots)
-        for b in boots:
-            print_boot_summary(b)
-            
-    if len(boots_list) == 2:
-        diff_boots(boots_list[0], boots_list[1])
+        result = parse_log(log_file)
+        results.append(result)
+        print_file_report(result, samples=args.samples, full=args.full,
+                          family_filter=family_filter)
+
+    if len(results) == 2:
+        diff_boots(results[0]['boots'], results[1]['boots'])
+
+    # ---- loud-failure gate -------------------------------------------------
+    # This tool previously printed a header and exited 0 while parsing
+    # nothing.  An instrument that can report silence as success cannot
+    # falsify anything, so silence is now fatal and goes to stderr.
+    failed = False
+    for result in results:
+        if not result['boots']:
+            print(f"ERROR: {result['path']}: parsed 0 boots — no boot-start "
+                  f"marker matched. Markers tried: "
+                  f"{'; '.join(result['markers_tried'])}", file=sys.stderr)
+            failed = EXIT_NO_BOOTS
+    if failed:
+        sys.exit(EXIT_NO_BOOTS)
+
+    for result in results:
+        witnesses = sum(len(b['witnesses']) for b in result['boots'])
+        if witnesses == 0:
+            print(f"ERROR: {result['path']}: parsed "
+                  f"{len(result['boots'])} boot(s) but 0 witnesses — no entry "
+                  f"in WITNESS_FAMILIES matched. The capture format has moved "
+                  f"and the family table is stale.", file=sys.stderr)
+            failed = EXIT_NO_WITNESSES
+        for boot in result['boots']:
+            if not boot['witnesses']:
+                print(f"WARNING: {result['path']}: boot {boot['number']} "
+                      f"({boot['platform']}) has 0 witnesses.", file=sys.stderr)
+    if failed:
+        sys.exit(EXIT_NO_WITNESSES)
+
+    sys.exit(EXIT_OK)
+
 
 if __name__ == '__main__':
     main()
