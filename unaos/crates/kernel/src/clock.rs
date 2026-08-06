@@ -288,8 +288,20 @@ pub fn logts_now() -> (Option<u64>, Option<u64>) {
     (mono_ms, unix)
 }
 
+/// Remove the civil anchor entirely — witness-only, and it exists for exactly one caller: the
+/// `sntp-x86` fixture, whose live `set_anchor` test used to leave a CANNED July-22 anchor installed
+/// for the rest of the boot. That lie was load-bearing twice over: every FAT timestamp after ~1 s
+/// of uptime carried the canned date, and every `logts` prefix flipped to 1-second civil form —
+/// which is what degraded the GR16 s73 kepler breakdown to whole seconds. A fixture must not leave
+/// global state it fabricated; this is its cleanup path, not a general API.
+#[cfg(feature = "witness")]
+pub fn witness_clear_anchor() {
+    *UNIX_ANCHOR.lock() = None;
+}
+
 /// Anchor the civil clock to `unix_secs` (UTC), pairing it with `mono_now` (a `mono_ticks()` reading
-/// captured at the same instant) and tagging it with `source`. The ONLY writer of `UNIX_ANCHOR`.
+/// captured at the same instant) and tagging it with `source`. The ONLY writer of `UNIX_ANCHOR`
+/// (the witness-gated [`witness_clear_anchor`] above removes, never writes).
 /// Re-anchoring simply replaces the anchor — a fresh sync or operator correction wins.
 pub fn set_anchor(unix_secs: u64, mono_now: u64, source: ClockSource) {
     *UNIX_ANCHOR.lock() = Some(UnixAnchor { base_unix: unix_secs, anchor_ticks: mono_now, source });

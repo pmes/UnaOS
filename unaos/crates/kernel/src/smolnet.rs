@@ -1751,6 +1751,12 @@ pub fn sntp_x86_gate() {
     // 0x10 — the live anchor path: parse a canned reply and set the shared clock, then assert the
     // deterministic (non-extrapolated) anchor renders exactly INJ_ISO and is tagged Sntp{2}. Uses
     // `raw_anchor` so the free-running TSC never races the assertion.
+    // The set-clock leg plants a CANNED anchor to prove the live path. It must not stay planted:
+    // left in place it dated every FAT write July 22 and flipped every logts prefix to 1-second
+    // civil form for the rest of the boot — the s73 kepler breakdown lost its ms resolution to
+    // exactly this line. Snapshot whether a REAL anchor existed first (it cannot this early on
+    // x86, but a fixture that clobbers an operator's setdate would be the same defect again).
+    let had_real_anchor = crate::clock::raw_anchor().is_some();
     let set_ok = match net_sntp::parse(&good) {
         Sntp::Ok { unix_secs, stratum } => {
             let mono = crate::clock::mono_ticks().unwrap_or(0);
@@ -1773,6 +1779,13 @@ pub fn sntp_x86_gate() {
         ":: [sntp-x86] canned reply sets clock => {} ::",
         if set_ok { "2026-07-22T15:30:45Z PASS" } else { "FAIL" }
     );
+    if had_real_anchor {
+        // Defensive: never destroy an anchor the fixture did not plant. Say so instead.
+        serial_println!(":: [sntp-x86] pre-existing anchor left in place (canned value overwrote it — operator should re-setdate) ::");
+    } else {
+        crate::clock::witness_clear_anchor();
+        serial_println!(":: [sntp-x86] canned anchor cleared — clock unanchored again ::");
+    }
 
     let pass = w == 0x1f;
     serial_println!(
