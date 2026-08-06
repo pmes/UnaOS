@@ -447,27 +447,119 @@ this SMC, and the DIAG's fire condition reads from it:
 | `Absent`, key that already answered this boot | — | DIAG fires: `kind absent-unexpected` |
 | `Absent` of `REV ` | — | DIAG fires (seeded `Present`: the protocol requires it) |
 
-**Nothing is weakened.** A missing or undecoded SMC still reaches the DIAG: unclaimed ports read
-`0xff`, so `REV `'s step-0 `NEW_CMD|ACK` wait times out to `Stuck(0)` and dumps a flat-`ff` timeline.
-`SmcError::Absent` never was that path — it requires the status low nibble to read exactly `0x00`,
-which a wedge cannot produce. The bounded waits, the retry budget, the write surface and the
-`#KEY` wedge bound (Caveat 3) are all untouched.
+**Nothing is weakened** — but the first draft of this note argued that badly, and the argument is
+worth getting right because it is the whole safety case.
+
+The wrong version claimed `Absent` "requires the status low nibble to read exactly `0x00`, which a
+wedge cannot produce". That is false on its face, and this very note disproves it four paragraphs
+up: the healthy idle byte on this machine is `0x40`, whose low nibble **is** `0x00`. A bus stuck at
+`0x40` would satisfy that test.
+
+The real invariant is the *sequence*, and it is stronger. Reaching the length step — the only place
+`Absent` can be returned — means the transaction already passed **two different waits**:
+
+1. `wait_status(ST_AFTER_CMD = 0x0c, step 0)` after the command byte, and
+2. `wait_status(ST_AFTER_ARG = 0x04, step 1)` after each of the four key-name bytes.
+
+No constant satisfies both `0x0c` and `0x04`. So a bus stuck at **any** value — `0x00`, `0xff`,
+`0x40` alike — times out at step 0, yields `Stuck(0)`, and fires the DIAG unconditionally. `Absent`
+is reachable only from a controller that actively handshook through six exchanges and then answered
+"no such key", which is the definition of one that is working. The bounded waits, the retry budget,
+the write surface and the `#KEY` wedge bound (Caveat 3) are all untouched.
+
+#### One `Absent` is not enough to act on
+
+The DIAG's absent arm spends the boot's only latch, and the sweep beside it already retries a
+`Stuck` three times before believing it — so believing a *single* `Absent` was the weaker standard
+of the two. Both places that draw a conclusion from an absence now corroborate it first:
+
+* `read_key` re-reads once before firing the DIAG on an `Absent`-of-`Present`, and fires only if it
+  repeats. If the re-read succeeds, the value is returned rather than the hole.
+* the scout re-reads once before printing "this SMC does not carry it" — a confident claim about the
+  machine that also seeds KEY-SHAPE for the rest of the boot. The line now reads `absent (x2)`, and
+  a first-absent/second-present disagreement prints as the bad sample it was.
+
+#### Mass absence is the silent path
+
+Every absent key now prints a calm, individually reasonable inventory line — so an EC that acks
+`REV ` and then refuses everything else would emit a page of them and **no diagnostic at all**, since
+no single read failed in a way the DIAG recognises. That cannot be judged per key, only in aggregate,
+so the scout carries a floor: below `REV ` + `OSK0` answering (2 keys — the set even QEMU's minimal
+model carries), it emits
+
+```
+:: SMC-SCOUT: STOP-NOTE mass absence — only N of M keys answered, below the floor of 2 (REV + OSK0).
+   This reads like a controller that acks the presence probe and refuses the rest, NOT a machine
+   with a different key set; treat the absent lines above as unproven ::
+```
+
+#### Transactions are now serialized
+
+An SMC read is a six-exchange conversation with a stateful controller whose data reads *advance its
+own cursor*. Two interleaved conversations do not merely race for a value: one drains the other's
+data bytes, so the victim reads `ST_CMD_DONE` and reports a clean **`Absent` for a present key** —
+indistinguishable at the call site from the real thing, and under KEY-SHAPE enough to spend the DIAG
+latch on a phantom. This reintroduces the arc's own disease by a different door.
+
+It is reachable today: the `batmon` shell verb calls `snapshot()` unthrottled, a sweep against a
+wedging SMC overruns the 1000 ms throttle so two `refresh_if_due` callers can both find it due, and
+the service-task and vug-cadence sites are distinct paths. So `read_key_inner` and
+`read_key_by_index` now run under a `TXN` spin lock. **The lock is safe on every caller**: `pci::init`,
+the `main.rs` service bodies, the vug cadence, the `batmon` verb and `bench_ride` are all ordinary
+task context and **no interrupt handler touches the SMC**, so an ISR cannot spin on a lock its own
+interruptee holds; re-entrancy is impossible (`read_key_inner` calls only port I/O and `now_cycles`);
+and hold time is one transaction, bounded per step by `SMC_WAIT_CYCLES` exactly as before.
+
+The throttle-then-transact sequence outside the lock can still race — two callers may both sweep.
+That is a wasted sweep, not a wrong reading.
 
 Three smaller corrections ride along:
 
 * **`step 255` → `step n/a`** on the absent arm — a step that does not exist no longer prints as one.
-* **The scout's absent line names itself**: `key AC-W absent — this SMC does not carry it (clean
+* **The scout's absent line names itself**: `key AC-W absent (x2) — this SMC does not carry it (clean
   negative answer, not a fault) (AC adapter wattage / presence)`. That reading is the *inventory
   result*; it used to arrive dressed as `FIRST FAILURE … == evidence`.
 * **`B0Pr` joins `PROBE_KEYS`** (`probed` 18 → 19). `battery::snapshot()` reads it every sweep to
   decide `present`, but the scout never probed it, so its shape on this machine was undocumented and
   was being rediscovered 1 Hz at a time inside the sweep.
 
-### `AC-W` probe-once, and saying the unknown out loud
+#### What the DIAG still does not cover, deliberately
+
+`read_key_by_index` does not route to `dump_first_failure`, and the earlier claim that the DIAG fired
+"from whatever path (scout, battery sweep, enumeration)" was simply untrue — enumeration never
+reached it. The claim is dropped rather than the path wired up, because **Caveat 3 records the `#KEY`
+enumeration wedge as a standing condition on this machine**: routing it to the one-shot latch would
+re-spend the DIAG on a known fault every boot, which is precisely what was just removed from `AC-W`.
+
+The information is not lost — the scout's enumeration handler no longer collapses the two outcomes:
+
+* `index enumeration ended at idx N — GET_KEY_BY_INDEX answered no-such-index (clean stop)`
+* `index enumeration STOP-NOTE at idx N — handshake wedged at step S (bounded, not forced; Caveat 3)`
+
+If that STOP-NOTE ever stops appearing, it is the evidence for routing enumeration to the DIAG.
+
+#### There is no SWEEP-ABORT, and the comment claiming one was stale
+
+`battery::snapshot()` carried a comment describing a first-key-`Stuck` early return that the code no
+longer had — `6b34e1f7` removed the block. **The removal was the point, not collateral**, and that
+commit says so: *"a stuck key no longer invalidates the keys that answered … volt, full and rem
+dropped out while amp still read, one sweep before BRSC stuck aborted everything and latched
+present=false. Three unplugged boots produced zero PWR windows because of it."* On this SMC keys drop
+out independently, so keying the whole sweep on `BRSC` discards every other key's good reading and
+manufactures a `present=false` the pack never had. **It is not restored**; the comment is corrected
+to describe the code that exists and to record why the abort must not come back.
+
+Its stated purpose — not burning ~16 bounded stuck-handshake budgets per second on the vug cadence —
+is still served by the `FAIL_STREAK` backoff in `refresh_if_due` (1 s → 32 s on consecutive failed
+sweeps, reset by any good one). That throttles the *frequency* of expensive sweeps without discarding
+the keys that answered, which is the correct axis. The worst-case single sweep is still long; `TXN`
+serialization is what stops that from corrupting a concurrent reader.
+
+### Probe-once for any absent key, and saying the unknown out loud
 
 The 1 Hz sweep re-ran a full `AC-W` transaction every second to rediscover a fixed property of the
-SMC's firmware key set. Once the key is known absent the read is skipped, and the fact is stated
-once — this line *replaces* the every-boot false-alarm rather than adding to the log:
+SMC's firmware key set. Once a key is known absent the read is skipped, and for `AC-W` the fact is
+stated once — this line *replaces* the every-boot false-alarm rather than adding to the log:
 
 ```
 :: SMC-BATT: AC-W is absent on this SMC (clean negative answer, not a fault) — AC presence is
@@ -475,11 +567,49 @@ once — this line *replaces* the every-boot false-alarm rather than adding to t
    == witness ::
 ```
 
-The skip is **not** a cached claim: `ACW_REPROBE_MS` (60 s) re-tests it, so on a machine that does
+**The skip is not `AC-W`-specific**, because the argument never was: any key learned absent is a
+fixed property of the controller's firmware. `B0Pr` is the concrete reason it had to generalize —
+the sweep reads it every pass to decide `present`, its shape here is unknown until the next boot,
+and an `AC-W`-only skip would have left it re-probing at 1 Hz permanently: a second standing cost of
+exactly the kind this arc removed. `probe_once_skip` therefore keys on `shape_of(key) ==
+SHAPE_ABSENT` and covers `read_u16k` as well as the `AC-W` read.
+
+One timer serves all of them. The re-probe window is decided **once at the top of each sweep**, so
+every absent key re-probes together on the same minute; a per-key timer sharing one clock would have
+stretched any one key's re-probe to 60 s × the number of absent keys and made the cadence depend on
+`PROBE_KEYS` order.
+
+The skip is **not** a cached claim: `ABSENT_REPROBE_MS` (60 s) re-tests it, so on a machine that does
 carry `AC-W` — or if a clean `Absent` were ever produced by something other than a real lookup miss —
 the skip self-corrects within a minute and `ac_present` resolves to the direct answer. Falsifiable,
-not assumed. `ac_present` stays `None` while skipped, `ac_stuck` stays `false` (it is absent, not
-wedged), and the `ac=derived:` tagging is unchanged: **the unknown is reported as unknown.**
+not assumed. `ac_present` stays `None` while skipped and the `ac=derived:` tagging is unchanged:
+**the unknown is reported as unknown.**
+
+#### A liveness re-probe must not report as the sweep's AC state
+
+`ac_stuck` exists to separate two facts that both leave `ac_present = None`: *this machine has no
+`AC-W`* (stable, covered by the derived state) versus *`AC-W` is there and the handshake wedged*
+(a live fault). A re-probe of a key already known absent is neither — it is a liveness poll — and
+letting its failure set `ac_stuck` made the flag alternate `true` on the re-probe minute and `false`
+on the other 59 sweeps, **forever**.
+
+`ac_stuck` is part of the `LAST_STATE` quiet-witness key, so every one of those flips earned a
+witness line: two extra lines per minute, permanently, from an instrument whose entire purpose is to
+print once — and it would have falsified this note's own prediction 6 (`ac=stuck` must not appear) on
+the first metal boot. A wedged liveness poll now leaves the sweep's AC fields exactly as a skipped
+sweep would; only a genuine `AC-W` read (a key not known absent) can set `ac_stuck`.
+
+#### Related honesty gaps outside this driver (not fixed here)
+
+Two consumers report the AC picture more coarsely than the driver knows it. Both are outside
+`smc.rs` and were left alone:
+
+* `vug.rs`'s meter renders `chg`/`dis` straight off the `amp_ma` sign with **no deadband**, so the
+  on-screen flow indicator can flap between them at rest where the witness — which applies the
+  ±32 mA `AC_IDLE_DEADBAND_MA` and lands on `idle` — deliberately does not.
+* `shell.rs`'s `batmon` verb collapses *absent*, *stuck* and *derived* into a single `-`. That is
+  honest (it does claim unknown, never a number) but it cannot say "this machine has no `AC-W`, and
+  the derived state is idle" the way the serial witness does.
 
 ### Metal prediction (falsifiable, next `UNAOS_SMC=1` boot)
 
@@ -489,16 +619,23 @@ QEMU has no battery keys and cannot exercise this; the gates prove compilation a
 1. **`:: SMC-DIAG: FIRST FAILURE …` does not appear at all** — neither for `AC-W` nor any other key,
    provided no handshake wedges. This is the headline: the line stops being a fixture of every boot.
 2. `:: SMC-DIAG: pre-touch t=… raw status=0x40 ::` still prints, unchanged (it is not the one-shot).
-3. `:: SMC-SCOUT: key AC-W absent — this SMC does not carry it (clean negative answer, not a fault)
-   (AC adapter wattage / presence) ::` replaces the bare absent line.
+3. `:: SMC-SCOUT: key AC-W absent (x2) — this SMC does not carry it (clean negative answer, not a
+   fault) (AC adapter wattage / presence) ::` replaces the bare absent line. The `(x2)` is the
+   corroborating re-read; if it ever reads `first read said absent, second disagreed`, the s73
+   inventory was resting on a bad sample and the key set is not what we recorded.
 4. `:: SMC-SCOUT: end (present=Y probed=19 found=…) ::` — `probed` rises 18 → 19 (`B0Pr`).
    `found` = 18 if `B0Pr` answers, 17 if it too is absent; either is a *result*, and its `B0Pr`
    scout line now records which.
-5. The `AC-W is absent on this SMC …` line appears **exactly once**, from the first battery sweep.
-6. `SMC-BATT` lines are otherwise unchanged: still `ac=derived:idle` / `ac=?`, still `present=true
-   soc=100% volt≈12.8 V full=9962mAh`, `retries=` still non-zero. `ac=stuck` must not appear.
-7. **The falsifier for the whole verdict:** if a `FIRST FAILURE` line *does* appear, it will name a
-   `stuck` step with a non-`0x40` timeline (or an `absent-unexpected` regression) — a real fault
-   finally able to reach the instrument. The s73 boot-1 sweep drop-out (`retries=11/11` at 3350 ms)
-   makes that a live possibility, and it is now the *desired* outcome: the DIAG reporting the thing
-   it was built for instead of the thing it was buried under.
+5. **No `STOP-NOTE mass absence` line** — `found` will be 17 or 18, far above the floor of 2. It
+   appears only if the controller has degraded to acking `REV ` and refusing the rest.
+6. The `AC-W is absent on this SMC …` line appears **exactly once**, from the first battery sweep,
+   and `AC-W` costs one transaction per minute thereafter rather than one per second. Same for
+   `B0Pr` if it turns out absent.
+7. `SMC-BATT` lines are otherwise unchanged: still `ac=derived:idle` / `ac=?`, still `present=true
+   soc=100% volt≈12.8 V full=9962mAh`, `retries=` still non-zero. **`ac=stuck` must not appear** —
+   and unlike the previous draft of this prediction, the re-probe can no longer produce it.
+8. **The falsifier for the whole verdict:** if a `FIRST FAILURE` line *does* appear, it will name a
+   `stuck` step with a non-`0x40` timeline (or an `absent-unexpected` regression that survived a
+   corroborating re-read) — a real fault finally able to reach the instrument. The s73 boot-1 sweep
+   drop-out (`retries=11/11` at 3350 ms) makes that a live possibility, and it is now the *desired*
+   outcome: the DIAG reporting the thing it was built for instead of the thing it was buried under.

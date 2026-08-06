@@ -106,9 +106,18 @@ pub enum SmcError {
 /// itself requires and which is therefore seeded `Present` below. `Stuck` still fires the DIAG
 /// unconditionally from any key: a wedged handshake, not a clean lookup miss, is what the
 /// instrument was built to catch. **Nothing is weakened by this**: a missing/undecoded SMC still
-/// reaches the DIAG, because unclaimed ports read `0xff`, so `REV `'s step-0 `NEW_CMD|ACK` wait
-/// times out to `Stuck(0)` and dumps a flat-`ff` timeline. `SmcError::Absent` never was that path —
-/// it requires the status low nibble to read exactly `0x00`, which a wedge cannot produce.
+/// reaches the DIAG, and so does a bus stuck at any constant.
+///
+/// The reason is the *sequence*, not any single byte (review finding 2 — an earlier draft argued
+/// "a wedge cannot produce low-nibble `0x00`", which is plainly false: the healthy idle byte `0x40`
+/// on this very machine IS low-nibble `0x00`). Reaching `Absent` at all means the transaction got
+/// as far as the length step, and that requires **passing two different waits first**:
+/// `wait_status(ST_AFTER_CMD = 0x0c, step 0)` after the command byte, then
+/// `wait_status(ST_AFTER_ARG = 0x04, step 1)` after each of the four key bytes. No constant value
+/// satisfies both `0x0c` and `0x04` — so a bus stuck at *anything*, `0x00` and `0xff` and `0x40`
+/// alike, times out at step 0 and yields `Stuck(0)`, which fires the DIAG unconditionally. `Absent`
+/// is only reachable from a controller that actively handshook its way through six exchanges and
+/// then answered "no such key", which is the definition of a working SMC.
 const SHAPE_UNSEEN: u8 = 0;
 const SHAPE_PRESENT: u8 = 1;
 const SHAPE_ABSENT: u8 = 2;
@@ -275,25 +284,81 @@ fn settle_before_command() {
 /// `out.len()`). The classic Apple SMC READ handshake: command 0x10, four key bytes, one length
 /// byte, then value bytes while `DATA_READY` holds.
 pub fn read_key(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
-    let r = read_key_inner(key, out);
+    let r = read_txn(key, out);
     // SMC-DIAG dispatch (KEY-SHAPE, see above). The boot's FIRST genuinely failing key read — from
-    // whatever path (scout, battery sweep, enumeration) — dumps the raw status timeline, once. A
-    // clean `Absent` for a key that has never answered is a *learned fact about this machine's key
-    // set*, not a failure, and must not consume that one shot.
+    // the scout or the battery sweep — dumps the raw status timeline, once. A clean `Absent` for a
+    // key that has never answered is a *learned fact about this machine's key set*, not a failure,
+    // and must not consume that one shot.
     match r {
-        Ok(_) => note_shape(key, SHAPE_PRESENT),
-        Err(SmcError::Absent) => {
-            if shape_of(key) == SHAPE_PRESENT {
-                // It answered earlier this boot (or is the protocol-required `REV `) and now does
-                // not. A key cannot stop existing — this is a real fault worth the dump.
-                dump_first_failure(key, SmcError::Absent);
-            } else {
-                note_shape(key, SHAPE_ABSENT);
+        Ok(_) => {
+            note_shape(key, SHAPE_PRESENT);
+            r
+        }
+        Err(SmcError::Absent) if shape_of(key) == SHAPE_PRESENT => {
+            // CORROBORATE (review finding 1). A key that already answered this boot cannot have
+            // stopped existing, so this is either a real fault or a bad sample — and the sweep
+            // retries a `Stuck` three times before believing it, so believing a *single* `Absent`
+            // here was the weaker standard of the two. One re-read decides it. That matters because
+            // firing spends the boot's only DIAG latch: the very failure mode this arc exists to
+            // stop. `read_txn` serializes transactions so a concurrent reader can no longer drain
+            // our data bytes and manufacture the `CMD_DONE` that reads as `Absent`; this is the
+            // second line of defence, against any single-sample anomaly the lock does not cover
+            // (a transient EC hiccup, a truncated prior transaction the idle-guard half-cleared).
+            match read_txn(key, out) {
+                Ok(n) => {
+                    // The first read was the anomaly. The key is there, and we now hold its value:
+                    // return it rather than propagating a hole the caller would have to re-read.
+                    note_shape(key, SHAPE_PRESENT);
+                    Ok(n)
+                }
+                Err(SmcError::Absent) => {
+                    dump_first_failure(key, SmcError::Absent); // repeated: a real regression
+                    Err(SmcError::Absent)
+                }
+                Err(e) => {
+                    dump_first_failure(key, e); // wedged on the re-read: report what actually broke
+                    Err(e)
+                }
             }
         }
-        Err(e @ SmcError::Stuck(_)) => dump_first_failure(key, e),
+        Err(SmcError::Absent) => {
+            note_shape(key, SHAPE_ABSENT);
+            r
+        }
+        Err(e @ SmcError::Stuck(_)) => {
+            dump_first_failure(key, e);
+            r
+        }
     }
-    r
+}
+
+/// SMC-TXN serialization (review finding 1). One key read is a multi-step conversation with a
+/// stateful controller — command, four key bytes, a length byte, then N data reads that each
+/// *advance the SMC's own cursor*. Two interleaved conversations do not merely race for a value:
+/// one drains the other's data bytes, so the victim re-reads the status, sees the transaction it
+/// never finished has completed (`ST_CMD_DONE`), and reports a **clean `Absent` for a key that is
+/// present**. That is indistinguishable at the call site from the real thing, and under the
+/// KEY-SHAPE rule above it would fire the one-shot DIAG on a non-fault — reintroducing this arc's
+/// disease by a different door.
+///
+/// Interleaving is reachable today: the `batmon` shell verb calls `snapshot()` unthrottled, the
+/// service-task and vug-cadence callers both call `refresh_if_due()`, and a sweep against a
+/// wedging SMC runs well past the 1000 ms throttle, so two callers can both find it due.
+///
+/// **The lock is safe on every caller.** Every entry point — `pci::init` (boot), the `main.rs`
+/// service-loop bodies, the vug meter cadence, the `batmon` shell verb, and `bench_ride`'s probes —
+/// is ordinary task context; **no interrupt handler touches the SMC**, so an ISR cannot arrive and
+/// spin on a lock its own interruptee holds. Re-entrancy is impossible too: `read_key_inner` calls
+/// nothing but port I/O and `now_cycles`. Under a cooperative scheduler the holder never yields
+/// mid-transaction, so the lock is never contended across a yield; under a preemptive one a spinner
+/// burns its slice and the holder resumes. Hold time is one transaction, itself bounded by
+/// `SMC_WAIT_CYCLES` per step — the same bound that already capped every caller's own wait.
+static TXN: Mutex<()> = Mutex::new(());
+
+/// One serialized SMC transaction. Every path that talks to the controller goes through here.
+fn read_txn(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
+    let _guard = TXN.lock();
+    read_key_inner(key, out)
 }
 
 fn read_key_inner(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
@@ -398,7 +463,21 @@ pub fn present() -> bool {
 
 /// Read one key at `index` via GET_KEY_BY_INDEX (0x12). Metal-only: QEMU does not implement 0x12,
 /// so this returns `Stuck`/`Absent` there (bounded) and the scout reports enumeration unavailable.
+///
+/// **Does NOT route to `dump_first_failure`, deliberately** (review finding 5 — the over-claim that
+/// the DIAG covered "scout, battery sweep, enumeration" has been dropped from `read_key`, because
+/// this path never reached it). Routing it would be actively wrong here: Caveat 3 records that
+/// `#KEY` enumeration is a **standing** bounded wedge on this machine, so wiring it to the one-shot
+/// latch would re-spend the DIAG on a known condition every boot — precisely the disease this arc
+/// removed from `AC-W`. The information is not lost: the scout's enumeration handler now reports
+/// `Absent` and `Stuck(step)` as the distinct outcomes they are, instead of collapsing both into
+/// "unsupported or stuck". If enumeration ever stops being a standing wedge, that line is the
+/// evidence for routing it.
+///
+/// Serialized on `TXN` like every other transaction: it drives the same stateful cursor, so it can
+/// both corrupt and be corrupted by an interleaved `read_key`.
 fn read_key_by_index(index: u32, name: &mut [u8; 4]) -> Result<(), SmcError> {
+    let _guard = TXN.lock();
     // 0) settle any residue from a prior transaction (M2 idle-guard; no-op on an idle SMC).
     settle_before_command();
 
@@ -519,13 +598,41 @@ pub fn scout() {
             }
             Err(SmcError::Absent) => {
                 let name = core::str::from_utf8(&key[..]).unwrap_or("????");
-                // Absence at scout time is the INVENTORY RESULT, not a fault: the SMC looked the
-                // key up and answered "no such key". Said plainly on the line, because this is the
-                // reading that used to arrive dressed as `SMC-DIAG: FIRST FAILURE … == evidence`.
-                serial_println!(
-                    ":: SMC-SCOUT: key {} absent — this SMC does not carry it (clean negative answer, not a fault) ({}) ::",
-                    name, desc
-                );
+                // CORROBORATE (review finding 4). This line is a *confident claim about the
+                // machine* — "this SMC does not carry it" — and it seeds KEY-SHAPE for the rest of
+                // the boot, so it must not rest on one un-retried observation when the sweep next
+                // door retries a `Stuck` three times before believing it. Read it again; report
+                // only what reproduces.
+                let mut again = [0u8; 32];
+                match read_txn(key, &mut again) {
+                    Ok(n) => {
+                        // The first read was the anomaly, not the key set. Record it as present.
+                        found += 1;
+                        note_shape(key, SHAPE_PRESENT);
+                        serial_println!(
+                            ":: SMC-SCOUT: key {} present len={} bytes=[{}] — first read said absent, second disagreed (bad sample, not an inventory fact) ({}) ::",
+                            name, n, fmt_hex(&again[..n]), desc
+                        );
+                    }
+                    Err(SmcError::Absent) => {
+                        // Absence at scout time is the INVENTORY RESULT, not a fault: the SMC
+                        // looked the key up, twice, and answered "no such key". Said plainly,
+                        // because this is the reading that used to arrive dressed as
+                        // `SMC-DIAG: FIRST FAILURE … == evidence`.
+                        serial_println!(
+                            ":: SMC-SCOUT: key {} absent (x2) — this SMC does not carry it (clean negative answer, not a fault) ({}) ::",
+                            name, desc
+                        );
+                    }
+                    Err(SmcError::Stuck(step)) => {
+                        // Absent then Stuck is not an inventory fact at all — say so rather than
+                        // banking the absence.
+                        serial_println!(
+                            ":: SMC-SCOUT: key {} STOP-NOTE inconsistent — first read absent, re-read wedged at step {} (no inventory claim made) ({}) ::",
+                            name, step, desc
+                        );
+                    }
+                }
             }
             Err(SmcError::Stuck(step)) => {
                 let name = core::str::from_utf8(&key[..]).unwrap_or("????");
@@ -558,10 +665,21 @@ pub fn scout() {
                         let ns = core::str::from_utf8(&name).unwrap_or("????");
                         serial_println!(":: SMC-SCOUT: idx {} = {} ::", idx, ns);
                     }
-                    Err(_) => {
+                    // Absent and Stuck are different facts and no longer share a line (review
+                    // finding 5): "the SMC has no key at this index" ends an enumeration normally,
+                    // while a wedged handshake is a fault that happens to end it too. This path
+                    // deliberately does not touch the one-shot DIAG — see `read_key_by_index`.
+                    Err(SmcError::Absent) => {
                         serial_println!(
-                            ":: SMC-SCOUT: index enumeration stopped at idx {} (GET_KEY_BY_INDEX unsupported or stuck) ::",
+                            ":: SMC-SCOUT: index enumeration ended at idx {} — GET_KEY_BY_INDEX answered no-such-index (clean stop) ::",
                             idx
+                        );
+                        break;
+                    }
+                    Err(SmcError::Stuck(step)) => {
+                        serial_println!(
+                            ":: SMC-SCOUT: index enumeration STOP-NOTE at idx {} — handshake wedged at step {} (bounded, not forced; Caveat 3) ::",
+                            idx, step
                         );
                         break;
                     }
@@ -572,6 +690,23 @@ pub fn scout() {
         _ => {
             serial_println!(":: SMC-SCOUT: index enumeration unavailable (no #KEY — QEMU/limited SMC; metal yields the full list) ::");
         }
+    }
+
+    // MASS-ABSENCE FLOOR (review finding 4). Every absent key now prints a confident, individually
+    // reasonable "this SMC does not carry it" line — so an EC that acks `REV ` and then refuses
+    // everything else would emit a page of calm inventory lines and NO diagnostic at all, because
+    // no single read failed in a way the DIAG recognises. Mass absence is the silent path, and it
+    // is the shape a half-dead controller takes. It cannot be judged per key; only in aggregate.
+    //
+    // The floor is what an SMC answering at all must manage: `REV ` (the presence probe itself) and
+    // `OSK0`, both of which even QEMU's minimal model carries. Falling below it does not mean the
+    // key set differs from our guesses — it means the controller is not really answering.
+    const SCOUT_FOUND_FLOOR: u32 = 2;
+    if found < SCOUT_FOUND_FLOOR {
+        serial_println!(
+            ":: SMC-SCOUT: STOP-NOTE mass absence — only {} of {} keys answered, below the floor of {} (REV + OSK0). This reads like a controller that acks the presence probe and refuses the rest, NOT a machine with a different key set; treat the absent lines above as unproven ::",
+            found, probed, SCOUT_FOUND_FLOOR
+        );
     }
 
     serial_println!(
@@ -792,14 +927,34 @@ pub mod battery {
     /// (the SMC looked the key up and said no) is NOT retried.
     const READ_ATTEMPTS: u32 = 3;
 
-    /// AC-W PROBE-ONCE re-probe period. A key set is fixed by the SMC's firmware, so a learned
-    /// absence cannot go stale in practice — this exists so the learning stays **falsifiable**
-    /// rather than becoming an article of faith. One transaction a minute instead of one a second.
-    const ACW_REPROBE_MS: u64 = 60_000;
-    /// When `AC-W` was last actually probed (0 = never; the boot scout's probe is separate).
-    static ACW_LAST_PROBE_MS: Mutex<u64> = Mutex::new(0);
+    /// PROBE-ONCE re-probe period. A key set is fixed by the SMC's firmware, so a learned absence
+    /// cannot go stale in practice — this exists so the learning stays **falsifiable** rather than
+    /// becoming an article of faith. One transaction a minute per absent key instead of one a
+    /// second.
+    const ABSENT_REPROBE_MS: u64 = 60_000;
+    /// When the last re-probe window opened (0 = never; the boot scout's own probe is separate).
+    static ABSENT_LAST_PROBE_MS: Mutex<u64> = Mutex::new(0);
+    /// Whether THIS sweep is a re-probe window. Decided once at the top of `snapshot()` so that all
+    /// of the sweep's absent keys re-probe together on the same minute rather than each consuming
+    /// the window in turn (which would stretch any one key's re-probe to 60 s x however many absent
+    /// keys there are, and make the cadence depend on `PROBE_KEYS` order).
+    static REPROBE_WINDOW: Mutex<bool> = Mutex::new(false);
     /// Whether the "AC presence is unknown on this machine" statement has been made (once a boot).
     static ACW_NOTED: Mutex<bool> = Mutex::new(false);
+
+    /// PROBE-ONCE (review finding 7). True when `key` is known absent on this SMC and this sweep is
+    /// not a re-probe window — i.e. the transaction can be skipped, because the answer is already
+    /// known and cannot have changed.
+    ///
+    /// Generalized from the AC-W-only form: the argument was never about `AC-W`. Any key learned
+    /// absent is a fixed property of the controller's firmware, and re-asking at 1 Hz forever buys
+    /// nothing. `B0Pr` is the concrete reason this had to generalize — the sweep reads it every
+    /// pass to decide `present`, its shape on this machine is unknown until the next boot, and if
+    /// it comes back absent the AC-W-only form would have left it re-probing at 1 Hz permanently:
+    /// a second standing cost of exactly the kind this arc removed.
+    fn probe_once_skip(key: &[u8; 4]) -> bool {
+        super::shape_of(key) == super::SHAPE_ABSENT && !*REPROBE_WINDOW.lock()
+    }
 
     /// One key read's sweep-relevant outcome: value, clean absence, or an unresponsive handshake.
     enum KeyRead {
@@ -813,6 +968,11 @@ pub mod battery {
     /// is unchanged — `READ_ATTEMPTS` attempts max, each individually deadline-bounded, so total
     /// work stays bounded and no re-read can turn into a spin.
     fn read_u16k(key: &[u8; 4]) -> KeyRead {
+        // PROBE-ONCE: a key this SMC is known not to carry needs no transaction. Returns exactly
+        // what the read would have returned, so every caller downstream is unchanged.
+        if probe_once_skip(key) {
+            return KeyRead::Absent;
+        }
         for attempt in 0..READ_ATTEMPTS {
             if attempt > 0 {
                 note_retry(); // this pass is a re-read of a key that failed the previous one
@@ -836,16 +996,39 @@ pub mod battery {
 
     /// Read all battery keys and return a fresh snapshot (unthrottled). Pure reads.
     ///
-    /// SWEEP-ABORT (metal perf fix, 2026-07-18): if the FIRST key's handshake comes back Stuck —
-    /// the SMC is not answering at all, not merely lacking that key — the remaining keys are
-    /// skipped (they would each burn the same bounded multi-attempt timeout). On the sitting-1
-    /// metal GUI builds (SMC unresponsive every boot) an un-aborted sweep cost up to ~16 stuck
-    /// handshakes x the 0.1 s budget on the vug meter cadence — the "cursor really slows vug down"
-    /// stall was THIS, not the sprite. A clean `Absent` (QEMU) still sweeps every key, unchanged.
+    /// **There is no SWEEP-ABORT here, and that is deliberate** (review finding 6). A comment
+    /// describing a first-key-Stuck early return outlived the code until GR17; the block was
+    /// removed by `6b34e1f7`, and reading that commit shows the removal was the *point*, not
+    /// collateral: "a stuck key no longer invalidates the keys that answered … Metal showed why:
+    /// volt, full and rem dropped out while amp still read, one sweep before BRSC stuck aborted
+    /// everything and latched present=false. Three unplugged boots produced zero PWR windows
+    /// because of it." Restoring the abort would restore that: on this SMC individual keys drop out
+    /// independently, so keying the whole sweep on `BRSC` throws away every other key's good
+    /// reading and manufactures a `present=false` the pack never had.
+    ///
+    /// Its stated purpose — not burning ~16 bounded stuck-handshake budgets per second on the vug
+    /// cadence when the SMC is unresponsive — is still served, by the `FAIL_STREAK` backoff in
+    /// `refresh_if_due` (1 s → 32 s on consecutive failed sweeps, reset by any good one). That
+    /// throttles the *frequency* of expensive sweeps without discarding the keys that answered,
+    /// which is the correct axis. The worst-case single sweep is still long; `TXN` serialization
+    /// (see `read_txn`) is what keeps that from corrupting a concurrent reader.
     pub fn snapshot() -> BatterySnapshot {
         let mut s = BatterySnapshot::default();
         RETRIES_SWEEP.store(0, Ordering::Relaxed); // per-sweep retry counter (IVY-RETRY)
-        
+
+        // PROBE-ONCE: open a re-probe window at most once per `ABSENT_REPROBE_MS`, decided here so
+        // every absent key in this sweep re-probes on the same minute (see `REPROBE_WINDOW`).
+        let now_ms = crate::arch::ms();
+        {
+            let mut last = *ABSENT_LAST_PROBE_MS.lock();
+            let due = last == 0 || now_ms.wrapping_sub(last) >= ABSENT_REPROBE_MS;
+            if due {
+                last = now_ms;
+                *ABSENT_LAST_PROBE_MS.lock() = last;
+            }
+            *REPROBE_WINDOW.lock() = due;
+        }
+
         s.soc_pct = opt(read_u16k(b"BRSC"));
         s.volt_mv = opt(read_u16k(b"B0AV"));
         s.amp_ma = opt(read_u16k(b"B0AC")).map(|u| u as i16);
@@ -861,24 +1044,30 @@ pub mod battery {
         // the derived state legitimately covers; "AC-W is there but the handshake wedged" is a live
         // SMC fault a sitting needs to see. `ac_stuck` records which of the two produced the hole.
         s.ac_stuck = false;
+        // AC-W PROBE-ONCE (GR17, generalized in review finding 7 — the skip itself now lives in
+        // `probe_once_skip`). On a machine whose SMC has no `AC-W` — the 2012 rMBP, learned by the
+        // boot scout — re-running the full transaction every second cannot change the answer; it
+        // just spends an SMC transaction per second rediscovering a fixed property of the
+        // firmware's key set. Once known absent, the read is skipped and `ac_present` stays `None`.
+        //
+        // NOT a cached claim: it is re-tested every `ABSENT_REPROBE_MS`, so if this ran on a machine
+        // that does carry `AC-W` the skip self-corrects within a minute and `ac_present` resolves to
+        // the direct answer. Falsifiable, not assumed.
+        //
+        // AC-STUCK-FLAP (review finding 3): a re-probe of a known-absent key is a **liveness poll,
+        // not the sweep's AC read**, so its failure must not be reported as the sweep's AC state.
+        // Letting it set `ac_stuck` made that flag alternate true (re-probe minute) / false (the
+        // other 59 sweeps) forever; `ac_stuck` is in the `LAST_STATE` key, so each flip earned a
+        // witness line — two extra lines a minute, permanently, from an instrument whose entire
+        // purpose is to print once. It also falsified this arc's own prediction 6 (`ac=stuck` must
+        // not appear). A liveness poll that wedges leaves the sweep's AC fields exactly as a
+        // skipped sweep would.
+        let acw_known_absent = super::shape_of(b"AC-W") == super::SHAPE_ABSENT;
         s.ac_present = 'acw: {
-            // AC-W PROBE-ONCE (GR17). On a machine whose SMC has no `AC-W` — the 2012 rMBP, learned
-            // by the boot scout and re-learned by the first sweep — re-running the full transaction
-            // every second cannot change the answer; it just spends an SMC transaction per second
-            // rediscovering a fixed property of the firmware's key set. Once the key is known
-            // absent, the read is skipped and `ac_present` stays the honest `None`.
-            //
-            // NOT a cached claim: the learning is re-tested every `ACW_REPROBE_MS`, so if this ever
-            // ran on a machine that does carry `AC-W` — or if a clean `Absent` were ever produced by
-            // something other than a real lookup miss — the skip self-corrects within a minute and
-            // `ac_present` resolves to the direct answer. Falsifiable, not assumed.
-            if super::shape_of(b"AC-W") == super::SHAPE_ABSENT {
-                let now = crate::arch::ms();
-                let mut last = ACW_LAST_PROBE_MS.lock();
-                if *last != 0 && now.wrapping_sub(*last) < ACW_REPROBE_MS {
-                    break 'acw None; // known absent, not due for re-probe: ac_present stays unknown
+            if acw_known_absent {
+                if probe_once_skip(b"AC-W") {
+                    break 'acw None; // known absent, not a re-probe minute: AC presence unknown
                 }
-                *last = now;
                 // Say it ONCE, plainly, in place of the every-boot `FIRST FAILURE` line this
                 // replaces: the machine has no AC-W, so AC presence is genuinely UNKNOWN and the
                 // `ac=derived:…` field is an inference from the B0AC sign — never a measurement.
@@ -887,7 +1076,7 @@ pub mod battery {
                     *noted = true;
                     serial_println!(
                         ":: SMC-BATT: AC-W is absent on this SMC (clean negative answer, not a fault) — AC presence is UNKNOWN; ac=derived:* is inferred from the B0AC sign, and the key is re-probed every {} ms == witness ::",
-                        ACW_REPROBE_MS
+                        ABSENT_REPROBE_MS
                     );
                 }
             }
@@ -902,7 +1091,14 @@ pub mod battery {
                     _ => {}
                 }
             }
-            s.ac_stuck = true; // budget exhausted on a non-Absent failure: wedged, not absent
+            // Budget exhausted on a non-Absent failure: wedged, not absent — EXCEPT when this read
+            // was the liveness re-probe of a key already known absent (AC-STUCK-FLAP above). There,
+            // a wedge tells us only that the poll did not land; it is not evidence that a key this
+            // machine does not have is "there but stuck", and reporting it as such flapped the
+            // witness twice a minute forever. Leave the sweep's AC shape as the skipped case.
+            if !acw_known_absent {
+                s.ac_stuck = true;
+            }
             None
         };
         // IVY-AC: infer charge state from the B0AC sign. Computed always (it is cheap and costs no
@@ -922,12 +1118,20 @@ pub mod battery {
     /// Refresh the cached snapshot if the throttle interval elapsed. Call freely from the main
     /// loops / the vug meter cadence — the port I/O runs at most once per `REFRESH_MS`.
     ///
-    /// Concurrency: the SMC key/value transaction is not internally serialized. Every caller on the
-    /// x86 rMBP path runs on the BSP (boot `pci::init`, the main-loop poll, the vug cadence — all
-    /// single-threaded), so the throttle-then-transact sequence never interleaves in practice. If a
-    /// future path ever drives the SMC from multiple cores, wrap the transaction in a lock (a
-    /// garbled read is bounded — `Stuck` — never a hang, so this is a correctness-of-reading concern,
-    /// not a safety one).
+    /// Concurrency: the transaction IS now internally serialized — see `read_txn`'s `TXN` lock,
+    /// which this note used to merely prescribe ("if a future path ever drives the SMC from
+    /// multiple cores, wrap the transaction in a lock"). The prescription was overdue and the
+    /// premise understated the risk on two counts. Interleaving did not need a second core: the
+    /// `batmon` shell verb calls `snapshot()` unthrottled, two `refresh_if_due` callers can both
+    /// find the throttle expired when a sweep against a wedging SMC overruns `REFRESH_MS`, and the
+    /// service-task and vug-cadence sites are distinct call paths. And the consequence is worse than
+    /// a garbled read: one reader draining the other's data bytes leaves the victim seeing
+    /// `ST_CMD_DONE` and reporting a clean **`Absent` for a present key** — which under KEY-SHAPE
+    /// spends the boot's one-shot DIAG latch on a phantom.
+    ///
+    /// The throttle-then-transact sequence outside the lock can still race (two callers may both
+    /// decide a refresh is due and both sweep). That is a wasted sweep, not a wrong reading, and it
+    /// is bounded by the same throttle; the reading itself is now atomic per key.
     /// Consecutive failed sweeps since the last good one — drives the failure BACKOFF: the
     /// refresh interval doubles per failed sweep (1 s → 2 s → … capped at 32 s), so a machine
     /// whose SMC never answers pays the bounded stuck-handshake cost a couple of times a minute
