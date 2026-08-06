@@ -538,9 +538,17 @@ pub(crate) unsafe fn wake_run(bus: u8, dev: u8, func: u8, idx: usize) -> Option<
     Some(EhciFnHandle { op, n_ports, ppc, addr64: hccparams & 0x1 })
 }
 
+/// EPACE-TRIM M4 latch — set when `wake_route` took the trimmed (PPC=0) settle instead of the
+/// historical unconditional 150 ms. Read by `drivers::ehci`'s root-port failure paths so that a
+/// port which does not come up names the trim in the same line that reports the failure: the
+/// trimmed value can never be the silent cause of a regression.
+#[cfg(feature = "ehciconfig")]
+pub(crate) static PWR_SETTLE_TRIMMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Shared wake, second half: CONFIGFLAG=1 (route ports to this EHCI), port-power where PPC honors
-/// software control, then the ~150 ms connect-debounce settle. Same one-wake-path property as
-/// `wake_run`; the split exists so the EHCI-2 evidence mode can census between RS=1 and CF=1.
+/// software control, then the pre-look settle. Same one-wake-path property as `wake_run`; the
+/// split exists so the EHCI-2 evidence mode can census between RS=1 and CF=1.
 #[cfg(feature = "ehciconfig")]
 pub(crate) unsafe fn wake_route(h: &EhciFnHandle, idx: usize) {
     let (op, n_ports, ppc) = (h.op, h.n_ports, h.ppc);
@@ -573,8 +581,39 @@ pub(crate) unsafe fn wake_route(h: &EhciFnHandle, idx: usize) {
         serial_println!(":: EHCI-CONFIG: [{}] PPC=0 — ports always-powered, no PP write ::", idx);
     }
 
-    // Paced settle for connect debounce (~150ms) before the caller's next look at the ports.
-    settle_ms(150);
+    // EPACE-TRIM M4 (GR18) — the pre-look settle, priced by what actually happened above.
+    //
+    // This pause was one unconditional `settle_ms(150)` and it is 450 of the 461 ms EPACE
+    // charges to `hcrst=` (307 ms on controller 0, which routes twice, + 154 ms on controller 1;
+    // the HCRESET itself measures ~4 ms per call in the same capture). It bundled two different
+    // debts:
+    //
+    //   * PORT-POWER-GOOD — owed only when this function actually applied port power. On PPC=0
+    //     silicon the ports are always-powered and the PP write above is skipped entirely, which
+    //     the capture witnesses in as many words. rmbp-gr16-s73 ttyUSB0.log boot 7 prints
+    //     `PPC=0 — ports always-powered, no PP write` at L8192/L8205 (controller 0, both routes)
+    //     and L8224 (controller 1) — three routes, zero power transitions, and 150 ms of settle
+    //     charged to each of them for a transition that never happened. Same three lines in
+    //     boots 2/3/4/8. There is no power edge to settle: 0 ms owed.
+    //   * ATTACH DEBOUNCE (USB 2.0 §7.1.7.3, T_ATTDB = 100 ms) — owed either way, and already
+    //     paid IN FULL by the one caller that looks at a port: `reset_root_port` opens with its
+    //     own `settle_ms(100)`, explicitly labelled T_ATTDB, before it reads PORTSC. Paying it
+    //     here as well was the redundancy; the debounce is unchanged by this trim.
+    //
+    // What remains on the PPC=0 path is the CONFIGFLAG 0->1 port-mux re-route two writes above.
+    // 20 ms is already orders of magnitude over a register write, and the caller's 100 ms T_ATTDB
+    // still lands on top of it. PPC=1 silicon keeps the full 150 ms untouched: this arc has no
+    // measurement of a real power-on edge, and an undecomposed constant is not trimmed.
+    let settle = if ppc == 1 { 150 } else { 20 };
+    if ppc != 1 {
+        PWR_SETTLE_TRIMMED.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    serial_println!(
+        ":: EHCI-CONFIG: [{}] pre-look settle {} ms ({}) — caller's 100 ms T_ATTDB debounce follows ::",
+        idx, settle,
+        if ppc == 1 { "PPC=1, port power applied here" } else { "EPACE-TRIM M4: PPC=0, no power edge to settle" }
+    );
+    settle_ms(settle);
 }
 
 /// EHCI-2 evidence mode for one function: the shared wake with the two PORTSC censuses around the

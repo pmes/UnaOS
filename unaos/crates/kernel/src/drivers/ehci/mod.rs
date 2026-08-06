@@ -437,6 +437,19 @@ pub static EHCI_HID: Mutex<Option<Vec<Controller>>> = Mutex::new(None);
 static CHAIN_HSE_SEEN: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// EPACE-TRIM M4 tripwire text. `wake_route` trims its pre-look settle from 150 ms to 20 ms on
+/// PPC=0 silicon (no port-power edge was applied, so none is owed — see the comment there). Every
+/// root-port path that reports a port failing to come up appends this, so the one boot where the
+/// trimmed value turns out to matter says so on the failing line instead of leaving a reader to
+/// re-derive it. Empty string on the untrimmed path, so a healthy PPC=1 capture is unchanged.
+fn m4_note() -> &'static str {
+    if ehci_scout::PWR_SETTLE_TRIMMED.load(core::sync::atomic::Ordering::Relaxed) {
+        " [EPACE-TRIM M4 TRIPWIRE: the pre-look settle was the trimmed 20 ms (PPC=0); suspect this trim first]"
+    } else {
+        ""
+    }
+}
+
 /// PCI COMMAND register: Memory Space (bit 1) + Bus Master (bit 2). Read-checked, set only if
 /// clear (Peter-approved write-surface extension): without BME the controller can never fetch a
 /// single QH, so this is a hard precondition traced honestly rather than assumed.
@@ -864,8 +877,8 @@ impl Controller {
             let before = mmio_read32(addr).unwrap_or(0);
             if before & PORT_CCS == 0 {
                 serial_println!(
-                    ":: EHCI-HID: [{}] port {} connect dropped during reset sequence (PORTSC={:#010x}) ::",
-                    self.idx, port, before
+                    ":: EHCI-HID: [{}] port {} connect dropped during reset sequence (PORTSC={:#010x}){} ::",
+                    self.idx, port, before, m4_note()
                 );
                 return false;
             }
@@ -891,8 +904,8 @@ impl Controller {
             }
         }
         serial_println!(
-            ":: EHCI-HID: [{}] STOP-NOTE port {} did not enable on EHCI after paced retries — FS/LS-on-root-port release case (no companion on this silicon); reported, not forced ::",
-            self.idx, port
+            ":: EHCI-HID: [{}] STOP-NOTE port {} did not enable on EHCI after paced retries — FS/LS-on-root-port release case (no companion on this silicon); reported, not forced{} ::",
+            self.idx, port, m4_note()
         );
         false
     }
@@ -1093,12 +1106,25 @@ impl Controller {
                 self.pace.add(EP_HUBRST, hubrst_t0);
                 continue;
             }
-            settle_ms(50);
+            // EPACE-TRIM M5 (GR18) — this was a blind `settle_ms(50)` in front of a poll that
+            // already existed. The blind constant was measurably never the bound: EPACE reads
+            // `hubrst=50ms(n=1)` on controller 0 and `hubrst=250ms(n=5)` on controller 1 — 50.0 ms
+            // per port, to the millisecond, on every boot of rmbp-gr16-s73 (ttyUSB0.log L8302-8303
+            // and the same pair in boots 2/3/4/5/6/8). Exactly 50 ms per port means the poll's
+            // FIRST probe always found PORT_RESET already clear, i.e. the loop below has never
+            // once iterated and the true reset time is somewhere under 50 ms, unmeasured. A
+            // constant that hides the number it is standing in for is exactly what the poll is
+            // for. So: start at the USB 2.0 §11.5.1.5 T_DRST floor (10 ms — the minimum a hub may
+            // drive reset for) and let the existing bounded poll measure the remainder. The poll's
+            // step is 10 ms, so for any given hardware this can only cost less than the old
+            // constant, never more; the budget (~600 ms) and its loud exit are unchanged.
+            settle_ms(10);
             // Bounded reset-completion poll (explicit loop: each probe is itself a control
             // transfer, so the generic wait_bounded closure can't drive it). ~600 ms worst case.
             let mut status = 0u32;
             let mut ok = false;
-            for _ in 0..60 {
+            let mut poll_steps = 0u32;
+            for step in 0..60u32 {
                 if let Ok(4) = self.control(hub, 0xA3, 0, 0, port, 4, true) {
                     status = (*self.data_buf as u32)
                         | ((*self.data_buf.add(1) as u32) << 8)
@@ -1110,6 +1136,28 @@ impl Controller {
                     }
                 }
                 settle_ms(10);
+                poll_steps = step + 1;
+            }
+            // T_RSTRCY (USB 2.0 §7.1.7.5): 10 ms of reset recovery before the device is addressed.
+            // The old blind 50 ms supplied this by accident — it overshot the reset itself, and
+            // whatever was left over served as recovery. M5 makes it explicit rather than a side
+            // effect of an oversized constant, so the recovery survives the trim.
+            if ok {
+                settle_ms(10);
+            }
+            // The M5 measurement, printed only when there is something to report: silence means
+            // the port cleared inside the T_DRST floor. Past the 50 ms the trim replaced, this is
+            // a loud tripwire — that hardware wanted the old constant and the line says so.
+            if poll_steps > 4 {
+                serial_println!(
+                    ":: EHCI-HID: [{}] EPACE-TRIM M5 TRIPWIRE — hub {} port {} needed ~{} ms to clear PORT_RESET, past the 50 ms constant M5 replaced == witness ::",
+                    self.idx, hub.addr, port, 10 + poll_steps * 10
+                );
+            } else if poll_steps > 0 {
+                serial_println!(
+                    ":: EHCI-HID: [{}] hub {} port {} PORT_RESET cleared after ~{} ms (T_DRST floor 10 ms + {} poll step(s)) ::",
+                    self.idx, hub.addr, port, 10 + poll_steps * 10, poll_steps
+                );
             }
             // Ack the change bits we may have latched (C_PORT_CONNECTION=16, C_PORT_RESET=20).
             let _ = self.control(hub, 0x23, 1, 16, port, 0, false);

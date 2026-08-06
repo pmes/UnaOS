@@ -369,6 +369,127 @@ third time. The `init=` progression across that one capture's four boots is
 prediction landing; it is. See §10 for what the 8048 ms absolute is worth and what
 the 4.4 s delta is worth — they are not the same answer.
 
+### 8c. The 2021 ms floor decomposed, and the two waits that were not settles (GR18, 2026-08-06)
+
+`init=2010..2022ms` has been the same number on every metal boot since s59 — eight
+boots of `rmbp-gr16-s73/ttyUSB0.log` (2020, 2020, 2021, 2021, 2021, 2021, 2022, 2022)
+across witness-on, witness-off, kepler-armed and default builds. That constancy is
+itself the finding: a block that does not move when everything around it moves is not
+measuring anything. Per-class, boot 7 (`ttyUSB0.log` L8302-8304, `gui=6242ms`):
+
+| class | [0] | [1] | total | what it is | verdict |
+|---|---|---|---|---|---|
+| `hubpwr` | 200 (n=1) | 400 (n=2) | **600 ms** | `settle_ms(pwr2good_ms + 100)`; all three hubs declare `pwr-on 2 good 100 ms` | **spec floor — do not trim.** The `+100` is not margin: it is the USB 2.0 §7.1.7.3 T_ATTDB attach debounce, which for an already-attached downstream device starts at power-good and must complete before the port reset two lines below. 100 + 100 is exactly right; it was merely unlabelled. |
+| `rootrst` | 320 (n=2) | 160 (n=1) | **480 ms** | 100 T_ATTDB + 50 PR hold + 10 T_RSTRCY per attempt | spec floor — three USB 2.0 minima, no slack |
+| `hcrst` | 307 (n=2) | 154 (n=1) | **461 ms** | HCRESET + `wake_route`'s `settle_ms(150)` | **450 of the 461 is the settle** — see EPACE-TRIM M4 |
+| `hubrst` | 50 (n=1) | 250 (n=5) | **300 ms** | `settle_ms(50)` in front of a bounded poll | **50.0 ms per port, to the millisecond** — see EPACE-TRIM M5 |
+| `smoke` | 29 | 29 | 58 ms | 5 periodic DMA discriminator passes | real work |
+| `resid` | 29 | 68 | 97 ms | control transfers + hub recursion | real work |
+| `hidcfg` | 5 | 7 | 12 ms | | real work |
+| `wake` / `hseprobe` | 0 | 0 | 0 ms | | already zero since M1/M3 |
+| sum | 941 | 1069 | **2010 ms** | (+11 ms of EPACE's own print cost → `init=2021ms`) | |
+
+**EPACE-TRIM M4 — the port-power settle that guarded a power edge that never happened.**
+`ehci_scout::wake_route` closed with an unconditional `settle_ms(150)` described as a
+connect-debounce. It runs three times per boot (controller 0 routes twice — the probe-14
+re-init — and controller 1 once), which is the whole `hcrst=` column: 3 × ~154 ms against
+an HCRESET that measures ~4 ms. The settle bundled two debts and neither survives contact
+with the capture:
+
+* **Power-good** is owed only if this function applied port power. It does not, on this
+  silicon. Three lines say so in as many words, every boot:
+  `:: EHCI-CONFIG: [0] PPC=0 — ports always-powered, no PP write ::` (L8192, L8205) and
+  the same for `[1]` (L8224). The gap that follows each is the pure sleep:
+  L8192 `t=1419ms` → L8193 `t=1575ms` = **156 ms**, and L8224 `t=2364ms` →
+  L8225 `t=2520ms` = **156 ms**. No PP write, no edge, nothing to settle.
+* **Attach debounce** is owed either way — and is already paid in full by the only caller
+  that looks at a port. `reset_root_port` opens with `settle_ms(100)` labelled T_ATTDB
+  before its first PORTSC read. Paying it twice, serially, was the redundancy.
+
+M4 prices the settle by what happened: `PPC=1` keeps the full 150 ms untouched (this arc
+has no measurement of a real power-on edge, and an undecomposed constant is not trimmed);
+`PPC=0` takes 20 ms, which covers only the CONFIGFLAG 0→1 port-mux re-route, with the
+caller's 100 ms T_ATTDB still landing on top. Tripwire: `PWR_SETTLE_TRIMMED` latches on the
+trimmed path and every root-port failure line — the connect-dropped path and the
+`STOP-NOTE port N did not enable` path — appends
+`[EPACE-TRIM M4 TRIPWIRE: the pre-look settle was the trimmed 20 ms (PPC=0); suspect this
+trim first]`. The one boot where the old value mattered says so on the failing line.
+
+**EPACE-TRIM M5 — a blind sleep standing in front of a poll that already existed.**
+The downstream-port reset ran `settle_ms(50)`, then a bounded 60 × 10 ms poll of
+`PORT_RESET` with a ~600 ms budget. `hubrst=50ms(n=1)` and `hubrst=250ms(n=5)` — 50.0 ms
+per port on all eight boots — means the poll's **first** probe always found the bit
+already clear: the loop has never once iterated, and the real reset time is somewhere
+under 50 ms and has never been measured. M5 starts at the USB 2.0 §11.5.1.5 T_DRST floor
+(10 ms, the minimum a hub may drive reset for) and lets the existing poll measure the rest.
+Because the poll's step is 10 ms, this cannot cost more than the old constant on any
+hardware; the budget and its loud exit are unchanged. Two corrections ride with it:
+
+* T_RSTRCY (USB 2.0 §7.1.7.5, 10 ms of reset recovery before the device is addressed) was
+  being supplied *by accident* — the oversized 50 ms overshot the reset and the remainder
+  served as recovery. M5 makes it an explicit `settle_ms(10)` so it survives the trim.
+* The number is now printed. Silence means the port cleared inside the T_DRST floor; one
+  line names the observed milliseconds when it did not; past 50 ms — the constant M5
+  replaced — the line is a loud `EPACE-TRIM M5 TRIPWIRE`.
+
+**Prediction for the next metal boot** (before → after, and the lines that decide it):
+
+| reading | before (boots 7/8) | predicted after |
+|---|---|---|
+| `EPACE: [0] hcrst=` | 307 ms | **47 ms** (2 × ~4 ms HCRESET + 2 × 20 ms settle) |
+| `EPACE: [1] hcrst=` | 154 ms | **24 ms** |
+| `EPACE: [0] hubrst=` | 50 ms (n=1) | **20-32 ms** |
+| `EPACE: [1] hubrst=` | 250 ms (n=5) | **100-160 ms** |
+| `EPACE: … init=` | 2021 ms | **1460-1525 ms** |
+| `BPACE: ehci-hid-done d=` | 2021 ms | **1460-1525 ms** (self-check: must equal `init=` per §8) |
+| `BPACE: total gui=` | 6242 / 6266 ms | **≈ 5700 ms** |
+
+M4's share is deterministic (−130 ms × 3 = −390 ms of pure sleep); M5's is the measured
+unknown (−110 to −170 ms), which is the point of it. Falsifiers, in order: an
+`EPACE-TRIM M5 TRIPWIRE` line (the hubs wanted the old 50 ms); an
+`EPACE-TRIM M4 TRIPWIRE` clause on a root-port failure (the 150 ms was load-bearing); or
+`init=` and `ehci-hid-done d=` disagreeing by more than the EPACE print cost, which would
+mean one of the two instruments is lying rather than that the trim worked.
+
+**Not trimmed, and why.** `hubpwr` (600 ms) and `rootrst` (480 ms) are 1080 ms of USB 2.0
+minima. Cutting either buys a second and violates the spec; they are named here so the
+next reader does not have to re-derive that they are floors.
+
+### 8d. Where the armed-minus-off second lives outside the kepler window (GR18)
+
+`gui=6242ms` (witness + kepler) against `gui=4094ms` (witness-OFF, kepler, boot 2) is a
+2148 ms delta. §10h closed the in-window half; the out-of-window half is one line.
+
+| phase | boot 7 armed | boot 2 witness-OFF | Δ |
+|---|---|---|---|
+| `heap` | 253 | 296 | −43 (jitter) |
+| `calib` / `smp` / `pci-enter` | 210 | 210 | 0 |
+| **`sched`** | **951** | **17** | **+934** |
+| `ehci-hid-done` | 2021 | 2022 | −1 |
+| `pci-scan` | 100 | 0 | +100 (boot 8 reads 9 ms — jitter, not a witness cost) |
+| `xhci-*` (incl. `xhci-settle` 100) | 101 | 101 | 0 |
+| `pci-usb` (the kepler window) | 2587 | 1430 | +1157 |
+| `gui` | 15 | 15 | 0 |
+| | | | **+2147** |
+
+The entire `sched` delta is one witness that waits on a 1 Hz edge:
+
+```
+[    414ms] :: U2-0c: canonical-rcx guard refuses 0x8000_0000_0000_0000 -> PASS ::
+[   1210ms] :: CLOCK-X1: TSC invariant, ~2693 MHz; monotone (rdtsc +2143545592);
+             uptime 15->16 s (JD17 x86-frozen clock now advances) == witness ::
+```
+
+boot 7 L7990 → L7991, **796 ms**; boot 8 L10106 → L10107, **910 ms**; boot 3 (default,
+witness on) L2900 → L2901, **979 ms**. The witness-OFF boots (2 and 4) have no such gap
+and read `sched d=17ms`. CLOCK-X1 asserts that the uptime *seconds* counter advances, so
+it blocks for whatever is left of the current second — mean 500 ms, worst 1000 ms, and
+the boot pays it at the one moment nothing else is in flight. It is the same shape §10h
+solved for the video battery: the assertion is sound, the *placement* is the cost. The
+pay-as-you-go form — sample `uptime` here, assert the advance at the next witness
+boundary that is already ≥1 s later — costs zero and proves the same thing. Named, not
+taken, in this arc: it is one line in the clock witness, not in the EHCI lane.
+
 ## 9. GPACE — the inside of `pci-usb` (GR13)
 
 Once EPACE took `ehci-hid-done` down, the s60 capture's largest remaining block
