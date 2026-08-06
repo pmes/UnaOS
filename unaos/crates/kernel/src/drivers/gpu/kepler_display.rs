@@ -393,11 +393,11 @@ pub unsafe fn takeover_display(
         if surf2_bytes == gop_bytes { "exact" } else { "SIZE-MISMATCH" },
         gop_vram_offset, total_bytes, gop_vram_offset, gop_bytes);
 
-    // 5 s hold (standing length — Peter's camera calibration, s21)
+    // 1.12 s hold (standing length — Peter's camera calibration, s21)
     serial_println!(":: kdisp: fb-draw hold begin (photo A — full panel calibration) ::");
     for t in 1..=5 {
         for _ in 0..60_000_000 { core::hint::spin_loop(); }
-        serial_println!(":: kdisp: fb-draw hold t={}s ::", t);
+        serial_println!(":: kdisp: fb-draw hold t={}/5 (1.12s total) ::", t);
         // Dump on the FIRST and LAST tick
         if t == 1 || t == 5 {
             serial_println!(":: kdisp: fb-draw reg-dump t={} ptr={:08X} ptr_hi={:08X} size={:08X} store={:08X} fmt={:08X} ::",

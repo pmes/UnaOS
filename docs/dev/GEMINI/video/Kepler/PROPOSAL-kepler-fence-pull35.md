@@ -43,3 +43,16 @@ By seeding `CC_SCRATCH[1]` with a non-zero sentinel (`0xA5A50000`), the `host-ac
 
 ## 4. Falcon-Side Read (Carried Forward)
 The falcon-side read of `0x409504` inside the microcode via `iord` port `(0x14100)` remains intact and will execute natively.
+
+## 5. Milestone 3 — The Assertion (Decision Table)
+For the remaining untried hypotheses (3 and 4), the success criterion is pre-declared: **PFIFO channel validation stops refusing** (`err=2` goes away).
+
+### Hypothesis 3: CC_SCRATCH / ENGINE_TRIGGER (0xc08) Host Handshake Completing
+- **Worked**: Channel validation succeeds (`err=0`). We confirm that the host must complete the handshake with the Falcon (trigger write *and* response observed) for the channel to bind successfully.
+- **Did not work**: Channel validation fails (`err=2`). The handshake completion is not the missing requirement for channel validation.
+- **Instrument did not run**: The microcode never echoes or the host never receives the ack (e.g., `ucode-echo NO-ACK`), indicating a lower-level failure before the handshake could even be tested.
+
+### Hypothesis 4: DMACTL REQUIRE_CTX interacting with CHAN_CUR
+- **Worked**: Channel validation succeeds (`err=0`). We confirm that `DMACTL REQUIRE_CTX` must be correctly sequenced with `CHAN_CUR` for the channel to validate.
+- **Did not work**: Channel validation fails (`err=2`). The interaction between `REQUIRE_CTX` and `CHAN_CUR` is not the blocking factor.
+- **Instrument did not run**: Reaches a fault/hang before the `CHAN_CUR` binding or `REQUIRE_CTX` writes are executed, obscuring the result.

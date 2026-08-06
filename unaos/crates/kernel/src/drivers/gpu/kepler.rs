@@ -1042,7 +1042,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                 serial_println!(":: kepler: ucode-echo SUCCESS h2h3={} ::", h2h3_label);
                                                 break;
                                             } else {
-                                                serial_println!(":: kepler: ucode-echo FAILURE h2h3={} ::", h2h3_label);
+                                                serial_println!(":: kepler: ucode-echo NO-ACK h2h3={} ::", h2h3_label);
                                             }
                                         }
 
@@ -1146,7 +1146,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     
                                     // Witness check
                                     if (ch_1_0_pre & 0xC0000000) != 0xC0000000 {
-                                        serial_println!(":: kepler: WITNESS FAILED - bits stripped. Restoring inst_off+0x0C ::");
+                                        serial_println!(":: kepler: WITNESS STRIPPED. Restoring inst_off+0x0C ::");
                                         core::ptr::write_volatile((bar1 + inst_off + 0x0C) as *mut u32, (userd_off >> 32) as u32);
                                         // Re-test PFIFO_CHAN[1] to clear state
                                         mmio_write(bar0, 0x800000 + (1 * 8), 0);
