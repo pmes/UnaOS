@@ -1330,3 +1330,19 @@ deferred passes. Deferral honesty is spec-shaped: a lattice line carries `covera
 `deferred=` is a running census (`emit=` ordinal, `since_entry_ms=` / `clock=unarmed` guard),
 and no x86 spec yet reads any `[wc-g]` line — the pi4 gate is the only automated reader, a
 coverage gap recorded here deliberately.
+
+**§10h addendum — Boot R (kernel `7f488c31…`, `1b08332d`, same day): the whole sweep measured.**
+`gui=3767ms` (from 20 727 this morning — 5.5×; prediction band was 4.2–4.7 s, beaten).
+Per prediction: `sched d=155ms` (predicted 155–160, and now a constant — the CLOCK-X1 verdict
+fired from core 7 at `deferred 3451 ms TSC / 3438 ms APIC — CONSISTENT`, 13 ms of honest skew);
+`ehci-hid-done d=1482ms` (predicted 1400–1470 — 12 ms over the band top; the two new loud-skip
+"not walked" lines' serial cost was not in the model, noted); `hcrst=47/24 ms` exact,
+`rootrst n=3/n=2` exactly the moved debounce's +1, `hubrst=100ms(n=5)` in-band, `M2 armed
+keyboard addr=6 ep=IN3` present and identical; `kepler=1521ms` (wc-d's in-window verify now
+lattice — both batteries complete post-boot: wc-g and wc-d `-> PAID` for every presenting
+window); console-pace census `ran=7 held=262 busy=0 idle=1` — 262 line-merges retired by 7
+presents. Zero FAIL, zero TRIPWIRE, zero exceptions. Two live findings the boot handed back:
+the resurrected SMC FIRST FAILURE fired on a REAL wedge on its first outing (`B0AV kind stuck
+step 0`, status timeline 0x48 — a fault the AC-W false alarm used to bury), and KBDWIT reports
+the known-intermittent s58 keyboard silence (`NO-COMPLETIONS quiet=9017ms` — armed, never
+completing; standing issue, predates this sweep).
