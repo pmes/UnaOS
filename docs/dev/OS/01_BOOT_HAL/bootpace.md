@@ -945,3 +945,13 @@ Corollaries, each earned on s73:
   boot pays ~46 s of witness wall-clock when armed. The witness battery needs a
   pay-as-you-go shape (budgeted passes, or off the boot path) before any
   witness-armed timing figure is quoted as a boot cost again.
+
+**§10g addendum (boot A-ms, same day):** the witness-armed boot re-flown with the fixed fixture,
+full ms resolution end to end. `kepler=17129ms` (matches 17138/boot A — witness-on cost is itself
+reproducible), and the block decomposes exactly: four `[wc-g]` glass-verify passes at
+2873/2876/2861/2878 ms (11.49 s), `[wc-d]` verifies 2321+497 ms (2.82 s), the `kdisp: fb-draw hold`
+loop 1.12 s (whose per-"second" tick measures 225 ms — its delay constant is ~4.4× fast; kepler
+lane, reported), and ~1.4 s of real bring-up — 16.8 of the 17.3 s span accounted, the remainder
+sub-100 ms lines. Fixture fix verified on the same wire: the canned anchor lives for exactly one
+line (`[15:30:45Z] … sets clock => PASS` → `[519ms] canned anchor cleared`). The wc-g pass is the
+single redesign target: ~2.87 s per pass, four passes, every witness-armed boot.
