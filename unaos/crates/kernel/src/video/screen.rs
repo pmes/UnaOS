@@ -951,6 +951,30 @@ impl Screen {
                 if banded {
                     super::cursor::note_desktop_over_sprite();
                 }
+                // WC-I — this exit owes the intrusion probe too, and it is the exit that needs it
+                // MOST. The band workers perform no subtraction at all; the whole path is justified
+                // by `occ.is_empty()`, and `occ` is a snapshot. A window created between that read
+                // and the bands' writes gets whole clipped rects copied over it, with nothing
+                // subtracted and nothing counted. The bbox here is therefore the clipped damage
+                // itself, which IS what landed on the panel on this leg.
+                #[cfg(feature = "witness")]
+                {
+                    let mut bbox: Option<(usize, usize, usize, usize)> = None;
+                    for idx in 0..n {
+                        let d = self.damage.rects[idx];
+                        let x1 = d.x1.min(self.info.width);
+                        let y1 = d.y1.min(self.info.height);
+                        if d.x0 >= x1 || d.y0 >= y1 {
+                            continue;
+                        }
+                        bbox = Some(match bbox {
+                            None => (d.x0, d.y0, x1, y1),
+                            Some((a, b, c, e)) => (a.min(d.x0), b.min(d.y0), c.max(x1), e.max(y1)),
+                        });
+                    }
+                    let (stale, intruded) = super::wm::occluders_aged(occ, bbox);
+                    super::wm::note_desktop_flush(!occ.is_empty(), stale, intruded);
+                }
                 return false;
             }
         }
@@ -971,6 +995,13 @@ impl Screen {
         let sprite_box = super::cursor::live_box_relaxed();
         #[cfg(feature = "witness")]
         let mut over_sprite = false;
+        // WC-I — the union of the spans this present ACTUALLY copies to glass, accumulated as they
+        // are copied. Not the damage set and not the clipped rects: the subtraction is why those
+        // three differ, and the only rectangle that can convict the desktop of writing into a window
+        // is the one describing what reached the panel. Four comparisons per span, witness builds
+        // only. Consumed by `wm::occluders_aged` after the loop.
+        #[cfg(feature = "witness")]
+        let mut blit_bbox: Option<(usize, usize, usize, usize)> = None;
         // WCD-TEARDOWN — bracket the loop that actually copies background spans to glass, for
         // `[wc-d]`'s panel-write interlock. The bracket is HERE, around the writes, and not around
         // this function's `intruded` return value: that value has three exits and all three are
@@ -1008,6 +1039,18 @@ impl Screen {
                         if off + seg <= self.back_store.len() {
                             self.front.blit(off, &self.back_store[off..off + seg]);
                             flushed += seg as u64;
+                            // WC-I — this span reached glass; fold it into the present's union.
+                            // Inside the length guard, so a span the bounds check rejected is not
+                            // claimed as a write.
+                            #[cfg(feature = "witness")]
+                            {
+                                blit_bbox = Some(match blit_bbox {
+                                    None => (xs, y, gap_end, y + 1),
+                                    Some((a, b, c, e)) => {
+                                        (a.min(xs), b.min(y), c.max(gap_end), e.max(y + 1))
+                                    }
+                                });
+                            }
                         }
                         // CURSOR-6 — did this surviving span land on the sprite? Latched, not
                         // counted per span: the unit that means something is "one desktop present
@@ -1040,12 +1083,43 @@ impl Screen {
         if over_sprite {
             super::cursor::note_desktop_over_sprite();
         }
+        // WC-I — the intrusion probe, and the argument for why it is shaped the way it is.
+        //
+        // This call passed a LITERAL `false` from WC-I (`b72e55f4`) until now, which made
+        // `[wc-i] intrusions=` a structural zero for two weeks of captures: an instrument that could
+        // not fire, printing a constant a reader could mistake for evidence. WCD-TEARDOWN
+        // (`6f1225b9`) found the same rot from the other side and declined to build `[wc-d]`'s
+        // stability term on this function's return value, but left the counter standing.
+        //
+        // The literal was honest about one thing: the predicate it replaced IS a tautology. Every
+        // span the loop above copied was tested against `occ` before it was copied, so "did I write
+        // into a box I subtracted" cannot be true, and all three of this function's exits return
+        // `false` in consequence.
+        //
+        // What is NOT a tautology is the snapshot. `occ` was read once, at the top, and the window
+        // table is mutated from other cores for the whole length of this loop — a vug opening, a
+        // drag, a raise. A box that entered after the read was never subtracted from anything, so
+        // spans that landed on it are exactly the WC-I defect, arriving by race rather than by
+        // design. `occluders_aged` re-reads the table and asks that question against `blit_bbox`,
+        // the union of what actually reached glass.
+        //
+        // Two properties this deliberately keeps:
+        //  * **It changes no pixel.** The return value below stays `false` on every exit and the
+        //    probe feeds only the counter. The repair for this race is, as WC-I argued when it took
+        //    the snapshot, the mutator's own composite — a window that moved repaints itself. Wiring
+        //    the detection to `wm::repaint()` would make a witness build composite differently from
+        //    a shipped one, which is how instruments start lying in the other direction.
+        //  * **It does not restate `desk=`.** `PANEL_DESK_EPOCH` brackets this loop unconditionally
+        //    and without geometry, to date a scan-out read-back. This counts the subset whose layout
+        //    moved underneath and whose writes followed it there.
         #[cfg(feature = "witness")]
-        super::wm::note_desktop_flush(!occ.is_empty(), false);
-        // WC-I — the subtraction is exact: every span this loop copied was tested against the window
-        // layer, so no background pixel landed inside a window. Nothing is owed to WC-E's restore.
-        // (The `true` branch is kept live by the parallel path above, which returns its own `false`
-        // only because it runs exclusively when there are no occluders at all.)
+        {
+            let (stale, intruded) = super::wm::occluders_aged(occ, blit_bbox);
+            super::wm::note_desktop_flush(!occ.is_empty(), stale, intruded);
+        }
+        // Nothing is owed to WC-E's restore. (The previous note here claimed the `true` branch was
+        // "kept live by the parallel path above" — that path returns `false` and, until this change,
+        // called nothing at all. There is no `true` exit and there has not been one since WC-I.)
         false
     }
 

@@ -2609,11 +2609,13 @@ Nothing WC-D depends on moved: a window this pass paints is a window whose inter
 
 #### Witnesses
 
-`[wc-i] rollup scope={fixture|desktop} windowed_flushes=N intrusions=N cursor_passes=N
+`[wc-i] rollup scope={fixture|desktop} windowed_flushes=N stale=N intrusions=N cursor_passes=N
 cursor_brackets=N -> {CLEAN|INTRUDED|UNWITNESSED}`
 
 * `intrusions` — desktop presents that wrote background pixels inside a live window's box. The blip is
   this number being one per strip tick; the fix makes it 0.
+* `stale` — desktop presents whose occluder snapshot changed under the copy. See the correction below;
+  `intrusions` is only readable against this term.
 * `cursor_brackets`/`cursor_passes` — before WC-I these were equal by construction.
 * `scope=fixture` fires at the end of the window-verb witness block and proves the counters are wired.
   `scope=desktop` fires once the desktop has presented over a live window layer 64 times, which is the
@@ -2623,6 +2625,52 @@ cursor_brackets=N -> {CLEAN|INTRUDED|UNWITNESSED}`
 
 `[wc-i] reopen closed=W reopened=W survivor=W both=B reopen=B survivor_px=B -> PASS|FAIL` — the
 close→reopen scan-out read-back (see below).
+
+##### Correction (2026-08-06): `intrusions` was a structural zero for two weeks
+
+**Every `intrusions=0` printed between WC-I (`b72e55f4`, 2026-07-25) and this correction is a
+constant, not a measurement.** `wm::note_desktop_flush` has one writer, `Screen::present_background`,
+and it passed a **literal `false`** for the intrusion argument from the day the counter landed. The
+`INTRUDED` verdict was unreachable. That includes the numbers quoted in the WC-I gate results and in
+the WC-D/CURSOR sections below; read them as "the counter is wired", never as "the desktop did not
+intrude". The `stale=` term is absent from those lines because it did not exist.
+
+WCD-TEARDOWN (`6f1225b9`) found the same defect from the other side — it is why `[wc-d]`'s stability
+term is built on the `desk=` blit-loop bracket rather than on `present_background`'s return value —
+but it left the counter in place, so a stuck zero stayed on the wire for a further two weeks.
+
+**Why the literal was not simply a bug.** The predicate it stood in for is a tautology: the desktop
+subtracts the occluder snapshot from its own damage *before* it copies, so "did I write into a box I
+subtracted" is answered by construction, and all three of `present_background`'s exits return `false`
+in consequence.
+
+**What is counted now.** `occluders` is a snapshot, and the window table is mutated from other cores
+for the whole length of the copy. A window created, moved, resized or raised after that read was
+never subtracted from anything, so spans landing on its box are the original WC-I defect arriving by
+race instead of by design. `wm::occluders_aged` re-reads the table after the copy and returns two
+terms:
+
+* `stale` — the set differs elementwise from the snapshot. Exact, modulo an A→B→A flip inside one
+  present (which has also undone the exposure).
+* `intrusions` — some box present now and absent from the snapshot overlaps the **union of the spans
+  this present actually copied to glass**. Conservative in one direction, named: the union is a
+  rectangle, so an entered box overlapping it while sitting entirely inside a span the old table
+  already subtracted over-counts. Over-reporting is the correct side for a tripwire.
+
+Read them together. `stale=0 intrusions=0` says the race never arose; `stale=N intrusions=0` says it
+arose N times and the writes missed every box that entered. Those are different claims and the old
+line could not tell them apart.
+
+This does **not** restate `[wc-d]`'s `desk=`. That term counts blit loops unconditionally and without
+geometry, to date a scan-out read-back; a boot showing `desk=` climbing with `stale=0` is the
+informative case, because it says the desktop layer is busy and is not the thing painting over
+windows. The probe is witness-only, takes the table lock a second time per present, and drives no
+pixel: `present_background` still returns `false` from every exit, and the repair for this race is
+what WC-I said it was when it took the snapshot — the mutator's own composite.
+
+The `vugpar`+`baremetal` band exit is now probed too, and it is the exit that needed it most: those
+workers perform no subtraction at all, the whole path is justified by `occ.is_empty()`, and `occ` is
+the same snapshot. Its bbox is the clipped damage set, which is what lands on the panel on that leg.
 
 #### The close→reopen / undying-vug cluster: what this arc can and cannot say
 

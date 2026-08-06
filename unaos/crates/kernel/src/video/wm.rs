@@ -1672,6 +1672,63 @@ pub fn occluders(out: &mut [(usize, usize, usize, usize); MAX_WINDOWS]) -> usize
     n
 }
 
+/// WC-I — how did this present's occluder snapshot AGE while the desktop was copying?
+///
+/// [`occluders`] is a snapshot, and the sentence above ("a window that moves or closes immediately
+/// afterwards is repainted by the mover's own composite") is the correctness argument for taking one.
+/// It is a good argument and nothing here weakens it. What it does NOT do is make the window layer's
+/// staleness observable, and that gap is why `intrusions` sat at a structural zero for two weeks: the
+/// only predicate the desktop could offer after the fact was "did the subtraction I already performed
+/// succeed", which is a tautology (see [`WCI_INTRUSIONS`]).
+///
+/// This asks the question that can still be false: **did the set change under the copy, and if it did,
+/// did anything this present actually wrote land in a box that was not in the snapshot?** Both halves
+/// are returned, because they answer different things and the second is worthless without the first.
+///
+/// * `stale` — the current occluder set differs elementwise from `snap`. [`occluders`] emits rows in
+///   slot order and skips the same rows on both reads, so a plain sequence compare catches a create, a
+///   close, a move, a resize and a z-change; only an A→B→A flip inside one present hides, and a flip
+///   that lands back on the identical geometry has also un-done the exposure.
+/// * `intruded` — some box present NOW and absent from `snap` overlaps `bbox`, the union of the spans
+///   this present actually copied to glass. A box that ENTERED was never subtracted, so background
+///   pixels over it are background pixels inside a live window: the original WC-I predicate, on the
+///   only population where it can still be true.
+///
+/// **Conservative in one direction, named.** `bbox` is a union rectangle, not the span set, so an
+/// entered box that overlaps the union while sitting entirely inside a span the OLD table already
+/// subtracted counts as an intrusion it was not. That is over-reporting on a tripwire, which is the
+/// side to err on; the exact test would mean retaining every span of the present, and the per-span
+/// cost of that is not worth paying for a witness.
+///
+/// Takes the table lock a second time for the present. Witness builds only — the shipped desktop pays
+/// nothing, and the return value drives no pixel: `present_background` still returns `false` from
+/// every exit and the repair for this race is, as it always was, the mutator's own composite.
+#[cfg(feature = "witness")]
+pub(super) fn occluders_aged(
+    snap: &[(usize, usize, usize, usize)],
+    bbox: Option<(usize, usize, usize, usize)>,
+) -> (bool, bool) {
+    let mut cur = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
+    let ncur = occluders(&mut cur);
+    let cur = &cur[..ncur];
+    if cur.len() == snap.len() && cur.iter().zip(snap.iter()).all(|(a, b)| a == b) {
+        return (false, false);
+    }
+    let Some((bx0, by0, bx1, by1)) = bbox else {
+        return (true, false);
+    };
+    for b in cur.iter() {
+        if snap.contains(b) {
+            continue;
+        }
+        let (wx, wy, ww, wh) = *b;
+        if bx0 < wx + ww && wx < bx1 && by0 < wy + wh && wy < by1 {
+            return (true, true);
+        }
+    }
+    (true, false)
+}
+
 /// WC-I — composite whatever is ALREADY marked damaged, and nothing else.
 ///
 /// The desktop's post-present call once WC-I's subtraction is in place. [`repaint`] exists to undo an
@@ -4339,11 +4396,40 @@ static WCI_CURSOR_BRACKETS: core::sync::atomic::AtomicU64 = core::sync::atomic::
 /// ~1 Hz blip, counted: every one of these is a window that was erased and then restored, and the
 /// arc's claim is that after the subtraction in `Screen::present_background` the count is zero.
 ///
-/// Bumped by [`note_desktop_flush`] from the desktop's own present path, so a future change that
-/// reintroduces the overwrite (a new flush path, a parallel band that forgets the occluders) shows up
-/// as a non-zero rollup rather than as a panel artefact nobody can reproduce in QEMU.
+/// ### It was a stuck zero for two weeks, and this is the repair
+///
+/// From WC-I (`b72e55f4`, 2026-07-25) until now the counter's only writer passed a **literal
+/// `false`** — `note_desktop_flush(!occ.is_empty(), false)` — so `intrusions=0` on every capture was
+/// the constant, not the finding. WCD-TEARDOWN (`6f1225b9`) diagnosed the same thing one layer over
+/// (see [`PANEL_DESK_EPOCH`], which declined to build its stability term on `present_background`'s
+/// return value for exactly this reason) but left the counter standing, so a reader still had a
+/// zero that looked like evidence.
+///
+/// The literal was not laziness: the predicate it stood in for really is a tautology. The desktop
+/// subtracts the occluder snapshot from its own damage before it copies, so "did I write inside a box
+/// I just subtracted" is answered by construction, and `present_background`'s three exits are
+/// consequently all `false`.
+///
+/// **What is counted now is the only way the claim can still be false: the snapshot going stale under
+/// the copy.** A window that is created, moved, resized or raised after [`occluders`] returns was
+/// never subtracted, and any span this present copies over its box is a desktop pixel inside a live
+/// window — the original WC-I defect, arriving by race instead of by design. [`occluders_aged`] is the
+/// test; `stale`/`intrusions` below are its two terms.
+///
+/// This does not overlap [`PANEL_DESK_EPOCH`]'s `desk=`. That term counts blit LOOPS, unconditionally
+/// and without geometry, to bracket a scan-out read-back. This one counts loops whose window layout
+/// moved under them AND whose writes landed where it moved. A boot can show `desk=` climbing steadily
+/// with `stale=0`, and that is the informative case: it says the desktop layer is busy and is not the
+/// thing painting over windows.
 #[cfg(feature = "witness")]
 static WCI_INTRUSIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WC-I — desktop presents whose occluder snapshot changed before the copy finished. The denominator
+/// [`WCI_INTRUSIONS`] needs to mean anything: `stale=0 intrusions=0` says the race never arose, while
+/// `stale=N intrusions=0` says it arose N times and the writes missed every box that entered. The two
+/// readings are not the same claim, and before this term the rollup could not tell them apart.
+#[cfg(feature = "witness")]
+static WCI_STALE_SNAPSHOTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// WC-I — desktop presents that ran with at least one live window on the panel. The denominator the
 /// intrusion count is meaningful against: `windowed=0 intrusions=0` proves nothing, and the rollup
@@ -4351,11 +4437,22 @@ static WCI_INTRUSIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 #[cfg(feature = "witness")]
 static WCI_WINDOWED_FLUSHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// WC-I — record one desktop present that ran over a live window layer, and whether it intruded on
-/// it. Called by `Screen::present_background`, the only writer.
+/// WC-I — record one desktop present: whether it ran over a live window layer, whether its occluder
+/// snapshot aged under the copy, and whether anything it wrote landed in a box that entered.
+/// `Screen::present_background` is the only writer, on both of its presenting exits.
+///
+/// `stale` and `intruded` come from [`occluders_aged`] and are counted **outside** the `windowed`
+/// gate on purpose. The race's worst case is precisely the one where the snapshot was EMPTY — the
+/// windowless present, which on the `vugpar` band path performs no subtraction at all and copies whole
+/// clipped rects — so gating the intrusion count on `windowed` would blind it to its own worst case.
+/// `windowed_flushes` remains the denominator for the CLEAN verdict, which is a claim about the
+/// desktop running over a window layer and is a different claim.
 #[cfg(feature = "witness")]
-pub(super) fn note_desktop_flush(windowed: bool, intruded: bool) {
+pub(super) fn note_desktop_flush(windowed: bool, stale: bool, intruded: bool) {
     use core::sync::atomic::Ordering::Relaxed;
+    if stale {
+        WCI_STALE_SNAPSHOTS.fetch_add(1, Relaxed);
+    }
     if intruded {
         WCI_INTRUSIONS.fetch_add(1, Relaxed);
     }
@@ -4392,7 +4489,10 @@ static WCI_DESKTOP_ROLLED: core::sync::atomic::AtomicBool =
 /// full-desktop repaint that overwrote every window at once, and the unconditional cursor bracket
 /// that every one of those repaints then ran on top:
 ///  * `intrusions` — desktop presents that wrote background pixels inside a live window's box. The
-///    P60 blip is this number being one per status-strip tick; the fix makes it 0.
+///    P60 blip is this number being one per status-strip tick; the fix makes it 0. Read it WITH
+///    `stale`: see [`WCI_INTRUSIONS`] for why the zero it printed before this change was a constant.
+///  * `stale` — presents whose occluder snapshot changed under the copy. The denominator that tells
+///    `intrusions=0` (the race never arose) apart from `intrusions=0` (it arose and missed).
 ///  * `brackets`/`passes` — composite passes that had to take the sprite off the panel. See
 ///    [`WCI_CURSOR_PASSES`] for why the gate can only witness the wiring of this half.
 ///
@@ -4437,6 +4537,7 @@ fn wci_rollup_scoped(scope: &str) {
     use core::sync::atomic::Ordering::Relaxed;
     let windowed = WCI_WINDOWED_FLUSHES.load(Relaxed);
     let intrusions = WCI_INTRUSIONS.load(Relaxed);
+    let stale = WCI_STALE_SNAPSHOTS.load(Relaxed);
     let passes = WCI_CURSOR_PASSES.load(Relaxed);
     let brackets = WCI_CURSOR_BRACKETS.load(Relaxed);
     let verdict = if intrusions > 0 {
@@ -4447,8 +4548,8 @@ fn wci_rollup_scoped(scope: &str) {
         "CLEAN"
     };
     serial_println!(
-        "[wc-i] rollup scope={} windowed_flushes={} intrusions={} cursor_passes={} cursor_brackets={} -> {}",
-        scope, windowed, intrusions, passes, brackets, verdict
+        "[wc-i] rollup scope={} windowed_flushes={} stale={} intrusions={} cursor_passes={} cursor_brackets={} -> {}",
+        scope, windowed, stale, intrusions, passes, brackets, verdict
     );
     cursor3_rollup(scope);
 }
