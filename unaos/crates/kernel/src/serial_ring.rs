@@ -44,10 +44,14 @@
 //!   `compare_exchange` on a counter and the publish is one release store. The next core to hold the
 //!   UART lock drains the slot and writes it out INTACT (whole lines, so nothing is ever interleaved
 //!   or torn the way a raw byte-level fallback would be).
-//! * **Ring full** (a sustained burst deeper than [`SLOTS`]): the line is genuinely lost — but it is
-//!   COUNTED, and the next drain emits `[serial] dropped N lines (staging ring full)` on the wire
-//!   ahead of the next real line. Loss is never again silent, which is the whole point: an explicit
-//!   marker turns an invisible failure into a visible, greppable one.
+//! * **Ring full** (a sustained burst deeper than [`SLOTS`]): SERWIT-1B — the producer does NOT
+//!   discard the line on the spot. It goes round again, up to [`BACKPRESSURE_SPINS`] times, and every
+//!   turn is an attempt to make progress ITSELF rather than a wait on somebody else: re-try the UART
+//!   (winning it drains the whole ring and writes this line intact) and, failing that, re-try the
+//!   stage. Only when the bound expires is the line genuinely lost — and it is still COUNTED, and the
+//!   next drain still emits `[serial] dropped N lines (staging ring full)` on the wire ahead of the
+//!   next real line. Loss is never again silent, which is the whole point: an explicit marker turns an
+//!   invisible failure into a visible, greppable one.
 //! * **Panic** ([`enter_panic_mode`]): the Mutex is bypassed ENTIRELY and every byte — the staged
 //!   backlog first, then the panic text — goes out through the arch's raw, lock-free, bounded UART
 //!   primitive, synchronously. See the deadlock analysis below.
@@ -58,6 +62,55 @@
 //! core A claims a slot and core B acquires the UART lock before A's release store lands, the drain
 //! stops at A's not-yet-`READY` slot (it deliberately does NOT skip it — skipping would reorder) and B
 //! writes first. Those two lines were concurrent anyway; no line is lost either way.
+//!
+//! ### SERWIT-1B — why a full ring needs BACKPRESSURE and not a bigger ring
+//!
+//! For its first weeks this module treated a full ring as terminal: `stage` returned `false` and the
+//! line was gone. That branch was believed unreachable in practice ("a ring drained on every
+//! uncontended print essentially never reaches the full-and-must-drop state"), and on the bench x86
+//! machine nothing could ever prove otherwise, because that machine has no 16550 and never stages a
+//! line at all (see SERWIT-1D). The moment `./arroyo test`'s x86 leg started reading its own log
+//! (`arroyo/test`, 2026-08-06) the branch turned out to be reachable on **every** headless run:
+//!
+//! ```text
+//!     :: SERWIT-1: FAIL — … sent=125 (want 125) dropped=19 truncated=0
+//!        submitted=126 emitted=107 declined=0 inflight=0 balanced=true law(declined==0)=true ::
+//! ```
+//!
+//! Note which clauses held. `sent == want`, `truncated == 0`, the conservation law **balanced**, the
+//! configuration clause held. The accounting was perfect; nineteen lines were simply lost. Across four
+//! runs the figure was 19–36 and tracked host load, which names the mechanism exactly.
+//!
+//! **It is a rate problem, not a size problem.** A producer formats a line into a slot with one
+//! `memcpy`; the consumer pushes it through a 16550 a byte at a time, under TCG at some thousands of
+//! times the cost. Five cores in [`serwit_worker`]'s deliberately-contending burst therefore fill any
+//! finite ring and then overflow it, and the overflow is exactly `produced - consumed` for the window.
+//! Sizing the ring to `(cores - 1) × burst` would make *this fixture* fit and would make the ring a
+//! measurement of the fixture rather than a transport; the next burst one line longer drops again. A
+//! producer that outruns its consumer without bound must be *slowed*, or it must lose data. There is
+//! no third option and no depth that buys one.
+//!
+//! So the contended producer now applies backpressure, with three properties that keep it inside the
+//! rules the rest of this module is built on:
+//!
+//! * **Bounded, always.** [`BACKPRESSURE_SPINS`] turns, then the line is dropped and counted precisely
+//!   as before. The bound is not a tuning nicety, it is a correctness requirement: a print arriving
+//!   from an exception handler that interrupted THIS core inside its own UART-locked region would spin
+//!   on a holder that can never release, and an unbounded wait there is a hang. `dropped > 0` remains
+//!   a FAIL and the marker still goes on the wire, so if the bound is ever reached the run says so.
+//! * **It waits by working.** Each turn re-tries the UART itself, so winning the lock means draining
+//!   the whole ring and writing this line intact — the producer that was stalled becomes the consumer.
+//!   The wait is therefore progress-bearing, not a sleep on another core's goodwill, and it cannot
+//!   livelock at the tail of a burst (the case where the last holder has finished printing forever and
+//!   a pure "wait for room" would spin out its bound and drop every queued line).
+//! * **It costs nothing when the ring is not full.** The loop's first turn is the pre-existing
+//!   uncontended/contended path verbatim; `spins` only ever leaves 0 on a run that would previously
+//!   have LOST a line. [`STALLED`] and [`STALL_SPINS_MAX`] count that, and the SERWIT-1 verdict prints
+//!   both — so a green run states on the wire whether backpressure was exercised or merely present. A
+//!   fix that cannot be seen working is indistinguishable from a run that got lucky.
+//!
+//! What this does NOT do is introduce a lock, a `lock()`, or an unbounded wait anywhere; the panic and
+//! breadcrumb analyses below are unchanged, because the panic path returns before reaching any of it.
 //!
 //! ### Why nothing here can deadlock the panic or breadcrumb paths
 //! * **No lock is introduced.** The ring is three atomics plus per-slot atomics. There is no `Mutex`,
@@ -255,6 +308,26 @@ pub static STAGED: AtomicU64 = AtomicU64::new(0);
 /// Lines that fit the ring but not [`SLOT_LEN`], cumulative.
 pub static TRUNCATED: AtomicU64 = AtomicU64::new(0);
 
+/// SERWIT-1B — how many turns a producer whose line found the ring FULL takes before it gives up and
+/// counts the line lost. Each turn re-tries the UART and then the stage, so the bound is a ceiling on a
+/// wait that is already making progress; it exists solely so the wait is finite.
+///
+/// One million matches `arch::serial::raw_byte`'s TX-ready poll, deliberately: that is this tree's one
+/// existing bounded-wait magnitude, chosen for the same reason (a machine whose UART never drains must
+/// degrade rather than hang), and a second, differently-argued number would be a number nobody can
+/// check. Measured against it, the x86 headless burst — five cores, 125 lines, the shape that dropped
+/// 19–36 lines on every run — reaches a maximum of a few thousand turns; see [`STALL_SPINS_MAX`], which
+/// the SERWIT-1 verdict prints so the margin is on the wire rather than in this comment.
+pub const BACKPRESSURE_SPINS: u32 = 1_000_000;
+
+/// SERWIT-1B — lines that found the ring full and had to back-pressure. **Not loss**, and not a
+/// failure: every one of these is a line the pre-backpressure transport would have had to either drop
+/// or be lucky about. A non-zero reading is what proves the mechanism is engaged on this machine.
+pub static STALLED: AtomicU64 = AtomicU64::new(0);
+/// The deepest backpressure any single line needed, in turns. The headroom under
+/// [`BACKPRESSURE_SPINS`], stated as a measurement instead of an assumption.
+pub static STALL_SPINS_MAX: AtomicU32 = AtomicU32::new(0);
+
 /// Losses not yet announced on the wire. Reset to 0 by the drain that reports them, so the marker
 /// says how many lines went missing *since the last marker* rather than since boot.
 static DROPPED_PENDING: AtomicU32 = AtomicU32::new(0);
@@ -384,18 +457,46 @@ impl Write for SlotWriter {
     }
 }
 
+/// Count one line as genuinely lost: cumulatively, and as not-yet-announced so the next drain puts it
+/// on the wire. Split out of [`stage`] by SERWIT-1B so a caller that means to RETRY a full ring can do
+/// so without the first attempt having already written the line off.
+#[inline]
+pub fn note_dropped() {
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+    DROPPED_PENDING.fetch_add(1, Ordering::Relaxed);
+}
+
+/// SERWIT-1B — record that one line had to back-pressure, and how deep it went. See [`STALLED`].
+#[inline]
+pub fn note_stalled(spins: u32) {
+    STALLED.fetch_add(1, Ordering::Relaxed);
+    STALL_SPINS_MAX.fetch_max(spins, Ordering::Relaxed);
+}
+
 /// Defer one line into the ring. Returns `false` if the ring was full, in which case the loss has
 /// already been counted and will be announced by the next drain.
 ///
+/// [`try_stage`] plus the write-off. Callers that apply SERWIT-1B backpressure use `try_stage` and
+/// call [`note_dropped`] themselves once their bound expires; this spelling is the one for a caller
+/// with nowhere to retry to.
+pub fn stage(args: fmt::Arguments) -> bool {
+    if try_stage(args) {
+        return true;
+    }
+    note_dropped();
+    false
+}
+
+/// Defer one line into the ring. Returns `false` if the ring was FULL, having counted nothing — the
+/// line's fate is the caller's to decide (retry, or [`note_dropped`]).
+///
 /// Lock-free and wait-free apart from the CAS retry loop: no spin on another core's progress, no
 /// allocation, and no call back into `serial_println!`. Safe from an IRQ-masked or fault context.
-pub fn stage(args: fmt::Arguments) -> bool {
+pub fn try_stage(args: fmt::Arguments) -> bool {
     let seq = loop {
         let head = HEAD.load(Ordering::Acquire);
         let tail = TAIL.load(Ordering::Acquire);
         if head.wrapping_sub(tail) >= SLOTS as u64 {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            DROPPED_PENDING.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         if HEAD
@@ -887,12 +988,19 @@ pub fn serwit_verdict(workers: usize, base_submitted: u64, base_emitted: u64, ba
         uart_absent: uart_absent(),
     };
     let staged = STAGED.load(Ordering::Relaxed);
+    // SERWIT-1B: how hard the ring actually had to push back. Reported on BOTH verdicts and on purpose:
+    // `stalls=0` on a machine that stages nothing (no 16550) and `stalls=N maxspin=M` on one that does
+    // are different facts, and a green run that never exercised the backpressure must not read like a
+    // green run that did. `maxspin` against `BACKPRESSURE_SPINS` is the margin, on the wire.
+    let stalls = STALLED.load(Ordering::Relaxed);
+    let maxspin = STALL_SPINS_MAX.load(Ordering::Relaxed);
     let uart = if t.uart_absent { "absent" } else { "present" };
     if t.passes() {
         serial_println!(
             ":: SERWIT-1: contended serial [uart16550={} carrier={} law={}] — {} lines sent (incl. \
-             {} wide-line probes at ~{}B), {} deferred to the staging ring, 0 dropped, 0 truncated, \
-             accounting balanced (submitted={} emitted={} declined={} inflight={}) -> PASS ::",
+             {} wide-line probes at ~{}B), {} deferred to the staging ring, {} back-pressured on a \
+             full ring (deepest {} of {} turns), 0 dropped, 0 truncated, accounting balanced \
+             (submitted={} emitted={} declined={} inflight={}) -> PASS ::",
             uart,
             t.carrier(),
             t.config_law_name(),
@@ -900,6 +1008,9 @@ pub fn serwit_verdict(workers: usize, base_submitted: u64, base_emitted: u64, ba
             workers,
             SERWIT_PAD.len() + 39,
             staged,
+            stalls,
+            maxspin,
+            BACKPRESSURE_SPINS,
             t.submitted,
             t.emitted,
             t.declined,
@@ -908,7 +1019,8 @@ pub fn serwit_verdict(workers: usize, base_submitted: u64, base_emitted: u64, ba
     } else {
         serial_println!(
             ":: SERWIT-1: FAIL — uart16550={} carrier={} sent={} (want {}) dropped={} truncated={} \
-             submitted={} emitted={} declined={} inflight={} balanced={} law({})={} ::",
+             submitted={} emitted={} declined={} inflight={} stalls={} maxspin={}/{} balanced={} \
+             law({})={} ::",
             uart,
             t.carrier(),
             t.sent,
@@ -919,6 +1031,9 @@ pub fn serwit_verdict(workers: usize, base_submitted: u64, base_emitted: u64, ba
             t.emitted,
             t.declined,
             t.inflight,
+            stalls,
+            maxspin,
+            BACKPRESSURE_SPINS,
             t.balanced(),
             t.config_law_name(),
             t.config_law()

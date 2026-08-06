@@ -40,7 +40,7 @@ ordinary runs were the tail of the same distribution.
 | --- | --- |
 | Uncontended | Straight at the UART, as before — plus a drain of anything other cores staged. |
 | Contended (`try_lock` fails) | The whole formatted line is deferred into a lock-free staging ring. No spin, no block, no lock. The next core to hold the UART emits it **intact and in order**. |
-| Ring full (depth 64) | The line is lost — but COUNTED, and the next drain puts `[serial] dropped N lines, truncated M (staging ring full, depth 64)` on the wire. Loss is never silent again. |
+| Ring full (depth 64) | SERWIT-1B — the producer does **not** discard the line. It goes round again, up to `BACKPRESSURE_SPINS` (1,000,000) turns, and every turn re-tries the UART itself (winning it drains the whole ring and writes the line intact) before re-trying the stage. Only when the bound expires is the line lost — and it is still COUNTED, and the next drain still puts `[serial] dropped N lines, truncated M (staging ring full, depth 64)` on the wire. Loss is never silent again. |
 | Line longer than 240 bytes | Truncated at a UTF-8 char boundary, counted, and reported by the same marker. A shortened line never masquerades as a whole one. |
 | Panic | The Mutex is bypassed entirely: staged backlog then panic text, raw and synchronous, through the bounded lock-free UART primitive. |
 
@@ -49,8 +49,11 @@ shared by both arches' `_print`.
 
 ## Why nothing here can deadlock
 
-This is the constraint that shapes the whole design, because the alternative fixes (a bounded spin, a
-blocking acquire) all trade silence for a hang, and a hang in the console is worse than a drop.
+This is the constraint that shapes the whole design, because the obvious alternative fixes trade
+silence for a hang, and a hang in the console is worse than a drop. Note the word that does the work:
+an *unbounded* wait is what is forbidden. SERWIT-1B's backpressure is a bounded one, on the one branch
+that would otherwise lose the line outright, and it degrades to the old drop-and-count when its bound
+expires — see that section for why the bound is not optional.
 
 - **No lock is introduced.** The ring is a few atomics plus per-slot atomics. No `Mutex`, no `RwLock`,
   no allocation, and no reentrancy — `stage` and `drain` never call `serial_println!`.
@@ -64,8 +67,10 @@ blocking acquire) all trade silence for a hang, and a hang in the console is wor
   `serial_ring::enter_panic_mode()` before its first print. This is strictly better than the old
   behaviour, where a panic striking mid-print lost the `try_lock` *to its own core* and dropped the
   entire panic message — a red screen and silence.
-- **Every wait is bounded.** The only spin in the path is the arch's pre-existing bounded TX-ready
-  poll, so a machine with no UART still degrades instead of hanging.
+- **Every wait is bounded.** Two spins exist in the path and both carry a hard ceiling: the arch's
+  TX-ready poll, so a machine with no UART degrades instead of hanging, and SERWIT-1B's ring-full
+  backpressure, so a print from a context that interrupted the UART holder degrades to the old
+  drop-and-count instead of spinning on a lock that can never be released.
 
 ## Ordering
 
@@ -88,6 +93,72 @@ SUBMITTED == EMITTED + DECLINED + DROPPED + in_flight()      and, always, DROPPE
 the two must never be conflated). The `[serial] dropped …` marker is deliberately **not** counted in
 `EMITTED` — it was never submitted by anyone, and counting it would corrupt the law in exactly the runs
 where the law matters.
+
+## SERWIT-1B — the ring-full branch was reachable on every single run
+
+The `Ring full` row above used to end at "the line is lost". That branch was believed unreachable in
+practice — the module said so: *"a ring that is drained on every uncontended print is a ring that
+essentially never reaches the full-and-must-drop state"* — and on the x86 bench nothing could ever
+prove otherwise, because that machine has no 16550 and never stages a line at all (SERWIT-1D). It was
+`./arroyo test`'s x86 leg learning to read its own log (`arroyo/test`, 2026-08-06) that exposed it. The
+very first honest run:
+
+```
+:: SERWIT-1: FAIL — uart16550=present carrier=16550@0x3F8 sent=125 (want 125) dropped=19 truncated=0
+   submitted=126 emitted=107 declined=0 inflight=0 balanced=true law(declined==0)=true ::
+```
+
+Read which clauses held. `sent == want`. `truncated == 0`. The conservation law **balanced**. The
+configuration clause held. The accounting was perfect and nineteen lines were simply gone. Across four
+runs the figure was 19–36 and tracked host load.
+
+### It is a rate problem, not a size problem
+
+A producer formats a whole line into a slot with one `memcpy`. The consumer pushes that line through a
+16550 a byte at a time — under TCG, some thousands of times the cost. Five cores in the SERWIT-1 burst
+therefore fill *any* finite ring and then overflow it by exactly `produced − consumed` for the window.
+
+Sizing the ring to `(cores − 1) × burst` would make this fixture fit, and would turn the ring into a
+measurement of the fixture rather than a transport: the next burst one line longer drops again. **A
+producer that outruns its consumer without bound must be slowed, or it must lose data.** There is no
+third option and no depth that buys one.
+
+### What the fix is
+
+Backpressure at the producer, with three properties that keep it inside the rules the rest of the
+transport is built on:
+
+- **Bounded, always.** `BACKPRESSURE_SPINS` turns, then the line is dropped and counted exactly as
+  before. The bound is a correctness requirement, not a tuning knob: a print arriving from an exception
+  handler that interrupted *this* core inside its own UART-locked region would otherwise spin on a
+  holder that can never release, and an unbounded wait there is a hang. `dropped > 0` remains a FAIL.
+- **It waits by working.** Each turn re-tries the UART, so winning the lock means draining the whole
+  ring and writing the line intact — the stalled producer becomes the consumer. That is also what makes
+  it livelock-free at the tail of a burst, where a pure *wait-for-room* would spin out its bound and
+  drop every queued line because the last holder has stopped printing for good.
+- **It costs nothing when the ring is not full.** The loop's first turn is the pre-existing
+  uncontended/contended path verbatim. `STALLED` and `STALL_SPINS_MAX` count the exceptions, and the
+  verdict prints both, so a green run states on the wire whether the backpressure was *exercised* or
+  merely present — a fix that cannot be seen working is indistinguishable from a run that got lucky.
+
+The panic path returns before reaching any of this, so the deadlock analysis below is unchanged.
+
+### The falsification
+
+| Build | Ring | Backpressure | Result |
+| --- | --- | --- | --- |
+| pre-fix | 64 | none | `dropped=19` … `-> FAIL`, `./arroyo test` exit 1 |
+| fix | 64 | 1,000,000 | `dropped=0`, `stalls=16..31`, deepest `72..304` turns, `-> PASS` ×4 |
+| scratch A | 64 | **0** | `dropped=20 … stalls=0 maxspin=0/0` → `-> FAIL`, exit 1 |
+| scratch B | **4** | 1,000,000 | `dropped=0`, `stalls=111`, deepest `721` turns, `-> PASS` |
+
+Scratch A proves the gate still reds on loss and that the backpressure — not a witness edit — is what
+turned it green. Scratch B is the one that proves the diagnosis: with the ring cut by 16×, to a depth
+that could not hold even one core's worth of the burst, the run is **still** green. Ring depth is no
+longer load-bearing for correctness; it only sets how often a producer has to push back. Both scratch
+edits were reverted and the two source files byte-verified against their pre-falsification hashes.
+
+Boot timing is unaffected: `BPACE total gui=1834ms` before, `1754ms` after.
 
 ## SERWIT-1D — the law counted a transport this machine does not have
 
@@ -191,14 +262,18 @@ Two independent proofs come out of one run, which is the point:
 Verdict line:
 
 ```
-:: SERWIT-1: contended serial [uart16550=present carrier=16550@0x3F8 law=declined==0] — 72 lines sent,
-   48 deferred to the staging ring, 0 dropped, accounting balanced
-   (submitted=73 emitted=73 declined=0 inflight=0) -> PASS ::
+:: SERWIT-1: contended serial [uart16550=present carrier=16550@0x3F8 law=declined==0] — 125 lines sent
+   (incl. 5 wide-line probes at ~1287B), 96 deferred to the staging ring, 22 back-pressured on a full
+   ring (deepest 72 of 1000000 turns), 0 dropped, 0 truncated, accounting balanced
+   (submitted=126 emitted=126 declined=0 inflight=0) -> PASS ::
 ```
 
-On a UART-bearing machine the `deferred` figure is the load-bearing one: it says two thirds of the
+On a UART-bearing machine the `deferred` figure is the load-bearing one: it says three quarters of the
 fixture's lines took the `try_lock`-failure branch, i.e. the branch that used to discard them. A run
-reporting `deferred=0` there would mean the fixture failed to contend and proved nothing. On a machine
+reporting `deferred=0` there would mean the fixture failed to contend and proved nothing. The
+`back-pressured` figure is SERWIT-1B's: non-zero means the ring genuinely filled and the bounded retry
+is what kept `dropped` at 0, so the mechanism is being *exercised* by this run and not merely present
+in it; `deepest N of 1000000` is the margin left under the bound. On a machine
 with **no** 16550 the deferral branch is correctly disabled (nobody would drain the ring), so
 `deferred=0` is the expected reading and `declined` is the figure that carries the traffic — see
 SERWIT-1D.
