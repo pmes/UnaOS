@@ -332,6 +332,82 @@ FORBID matcher vacuous
 #   :: [sntp-x86] canned anchor cleared — clock unanchored again ::
 REQUIRE :: \[sntp-x86\] canned anchor cleared — clock unanchored again ::
 
+# --- CLOCK-X1: THE WALL CLOCK'S OWN PAYGO SPLIT ----------------------------------------------
+# `fca26306` split the x86 wall-clock witness the same way GR17 split the video battery: an ARMED
+# half that samples `uptime` and defers, and a VERDICT half delivered from `bootpace::
+# service_dump()` on the first service pass. `b4870d14` then taught its cross-check to convict
+# and woke the dead backwards branch. Between them they put four distinct lines on the wire and
+# left ZERO automated readers — the same gap §10h recorded for `[wc-g]`, one subsystem over.
+#
+# WHAT THIS GRAMMAR CANNOT SAY, again, and what is bought instead. The witness's real rule is an
+# IMPLICATION — "an armed line with no verdict line after it means the boot never reached a
+# service pass" — and mbench matches lines independently, with no ordering and no conditionals.
+# It cannot express that. What it CAN do is the cheap 90 %: pin that BOTH halves exist, and
+# forbid all three fault verdicts. A boot that armed and never delivered then shows as one
+# PENDING matched and one not, which is legible in the table even though it is not a verdict.
+# The implication itself stays a human rule, and saying so here is the point — an "absence is
+# loud" contract that is loud only to humans is worth writing down as such rather than
+# pretending the gate covers it.
+#
+# `PENDING`, NOT `REQUIRE`, and for the wc-d block's reason exactly. No capture carries these
+# lines: the s73 sitting predates `fca26306`, so all 8 of its boots print the PRE-split verdict
+#   :: CLOCK-X1: TSC invariant, ~2693 MHz; monotone (rdtsc +2143545592); uptime 15->16 s (JD17 x86-frozen clock now advances) == witness ::
+# with no `[paygo: …]` clause, and ZERO `SAMPLED — second-advance DEFERRED` lines anywhere.
+# REQUIREs here would red the spec on every capture that exists.
+# FIRST BUILD THAT CAN SATISFY THEM: any x86 image at or after `fca26306` + `b4870d14`. mbench
+# flags a match as "consider promoting to REQUIRE" on the first capture that carries them.
+#
+# VERIFICATION: patterns checked against lines generated from the exact format strings at
+# `b4870d14` (`arch/x86_64/syscall.rs`), with boot 7's real field values substituted.
+#
+# The ARMED half — syscall.rs:6038. `SAMPLED`/`DEFERRED` is the whole claim: the 1 Hz edge is no
+# longer paid for inside `sched`, and a build that quietly went back to paying there would stop
+# printing this line while every other CLOCK-X1 directive still passed.
+# Synthesized line:
+#   :: CLOCK-X1: TSC invariant, ~2693 MHz; uptime 15 s SAMPLED — second-advance DEFERRED to the first service pass (pay-as-you-go; a capture with no verdict line below never reached one) == witness ::
+PENDING :: CLOCK-X1: TSC invariant, ~[0-9]+ MHz; uptime [0-9]+ s SAMPLED — second-advance DEFERRED to the first service pass
+# The VERDICT half — syscall.rs:6141. Pinned through the FINAL clause `b4870d14` settled on, field
+# by field, because each one is a term the review added for a reason: `deferred N ms TSC / N ms
+# APIC` are the two independent timebases the cross-check compares (the old clause carried a
+# whole-second APIC count, far too coarse to convict — a 10 % `tsc_hz` error moved a 3 s deferral
+# by 300 ms and rounded away entirely), and `core=` names which CPU delivered the pass. A clause
+# that lost the TSC term would silently return the cross-check to the state that could not
+# convict, and would still match a pattern written loosely enough to span it.
+# Both terminals are accepted here on purpose: this directive asserts the INSTRUMENT DELIVERED,
+# and the SKEW half is the FORBID's business below — the same split the wc-g rollup uses.
+# Synthesized line:
+#   :: CLOCK-X1: TSC invariant, ~2693 MHz; monotone (rdtsc +2143545592); uptime 15->16 s (JD17 x86-frozen clock now advances) [paygo: deferred 796 ms TSC / 800 ms APIC, uptime +1 s, core=0 — CONSISTENT] == witness ::
+PENDING \(JD17 x86-frozen clock now advances\) \[paygo: deferred [0-9]+ ms TSC / [0-9]+ ms APIC, uptime \+[0-9]+ s, core=[0-9]+ — (CONSISTENT|SKEW)\]
+#
+# The three fault verdicts. NONE of them carries `-> FAIL` — they all end `== witness ::`, the
+# uncounted idiom — so the default FORBID set (`-> FAIL`, `FAIL ::`, `PANIC`) sails straight past
+# every one. That is precisely why they need naming here, and it is the same trap x86-fat.spec
+# documents for the STOR-1 witnesses.
+#
+# FROZEN — syscall.rs:6125. The JD17 defect itself, un-fixed: uptime not advancing at all. It now
+# prints BOTH deadlines (`N ms APIC / N ms TSC`) because the APIC deadline alone cannot survive
+# the case it most needs to — if the tick is dead too, `elapsed_ms` stays 0 forever and the poll
+# goes silent for the whole boot, i.e. the deadline would be measured by one of the counters
+# whose death it exists to report.
+# Synthesized line:
+#   :: CLOCK-X1: FROZEN — uptime still 15 s after 3000 ms APIC / 2998 ms TSC (rdtsc +8076000000, core=0); the JD17 second derivation does NOT advance == witness ::
+FORBID :: CLOCK-X1: FROZEN
+# SKEW — the cross-check convicting. The two timebases disagree by more than the scaled tolerance,
+# so one of them is lying about how much time passed; which one is the investigation, but neither
+# answer is healthy. Anchored on the clause rather than the bare word so it cannot be satisfied by
+# the word appearing in some future comment or unrelated line.
+# Synthesized line (the CONSISTENT line above with its terminal flipped):
+#   … [paygo: deferred 796 ms TSC / 1400 ms APIC, uptime +1 s, core=0 — SKEW] == witness ::
+FORBID :: CLOCK-X1: .*\[paygo: .*— SKEW\]
+# NON-MONOTONE — syscall.rs:6109, and REACHABLE now rather than dead. `b4870d14` moved the
+# backwards test AHEAD of the frozen branch: `u2 <= u1` swallowed `u2 < u1`, so a backwards uptime
+# was reported by the frozen line, which prints `u1` — the PRE-regression second — and hid the
+# fault behind a healthier-looking verdict. Either counter running backwards breaks the clock's
+# monotonicity contract.
+# Synthesized line:
+#   :: CLOCK-X1: NON-MONOTONE — rdtsc 900000000 -> 800000000, uptime 16 -> 15 s (core=3); the clock's monotonicity contract is broken == witness ::
+FORBID :: CLOCK-X1: NON-MONOTONE
+
 # --- WHAT IS DELIBERATELY NOT PINNED, stated rather than omitted -----------------------------
 #   * `kepler=2564ms`. It is the headline GR17 number and it is NOT a directive, because it is a
 #     MEASUREMENT on a specific machine: the 2012 rMBP's PCIe latency sets the read-back cost,
