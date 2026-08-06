@@ -221,17 +221,15 @@ FORBID \[wc-d\] verify .*-> FAIL
 # is kept as the cross-build FLOOR (it matches on every build, paygo or not, because
 # `coverage=` is an insertion the `.*` spans); this block is the paygo-specific pair.
 #
-# THEY ARE `PENDING`, NOT `REQUIRE`, AND THAT IS THE WHOLE POINT OF THE IDIOM. No capture in
-# existence carries these lines: `0f1d3dfc` landed after the s73 sitting, so boots 7 and 8
-# predate it. A REQUIRE here would go falsely red on every capture ever taken — the "witness
-# that cannot match a real boot" defect, committed deliberately. mbench's PENDING is built for
-# precisely this (module docstring: "a witness that needs metal/code not yet flashed — reported
-# as an hourglass, never fails; lets a spec ship ahead of its bench. A PENDING that DOES match
-# is flagged for promotion to REQUIRE"), and round6-rmbp.spec is the in-tree precedent.
-# FIRST BUILD THAT CAN SATISFY THEM: any x86 `witness` + `logts` + UNAOS_WCG_PAYGO image built
-# at or after `0f1d3dfc`. THE FIRST CAPTURE FROM SUCH A BUILD PROMOTES ALL FOUR TO REQUIRE —
-# mbench prints "MATCHED: consider promoting to REQUIRE" on the run that first sees them, so
-# this note does not depend on anyone remembering it.
+# PROMOTED PENDING → REQUIRE, 2026-08-06 (GR18). These four shipped as PENDING because no
+# capture then in existence carried the lines: `0f1d3dfc` landed after the s73 sitting, so
+# boots 7 and 8 predated it, and a REQUIRE would have gone falsely red on every capture ever
+# taken — the "witness that cannot match a real boot" defect, committed deliberately (mbench's
+# PENDING idiom; round6-rmbp.spec is the in-tree precedent). The promotion condition — the
+# first capture from a `witness` + `logts` + UNAOS_WCG_PAYGO build at or after `0f1d3dfc` —
+# was met by Boot U (metal, s73 capture, kernel `3477640c` @ `7814d258`): mbench replay
+# reported "pending 6/6 matched", each flagged "MATCHED: consider promoting to REQUIRE".
+# From that boot forward, a build that stops printing any of these four lines goes RED.
 #
 # VERIFICATION, stated because it is NOT a capture match. Each pattern was checked against
 # lines generated from the exact format strings at `0f1d3dfc`, with boot 7's real win=1
@@ -251,25 +249,25 @@ FORBID \[wc-d\] verify .*-> FAIL
 # here is what would catch a marker that drifted to a different field boundary.
 # Synthesized line:
 #   [wc-d] verify win=1 surf=1312x736 band=0..64 scale=1x at (784,457) panel=2880x1800 checked=83968 coverage=lattice16 bad_cache=0 bad_ram=0 ram_indep=no moved=0 nonzero=8300 cksum=0x6ea90580b6e52525 first=none -> PASS
-PENDING \[wc-d\] verify win=1 .*checked=[0-9]+ coverage=lattice16 bad_cache=0 bad_ram=0 .*-> PASS
+REQUIRE \[wc-d\] verify win=1 .*checked=[0-9]+ coverage=lattice16 bad_cache=0 bad_ram=0 .*-> PASS
 # Stage 2 — the deferred verify actually arrives. Without this the directive above rewards a
 # build that samples the panel once at 1/16 and never looks again.
 # Synthesized line:
 #   [wc-d] verify win=1 … checked=83968 coverage=full bad_cache=0 bad_ram=0 … first=none -> PASS
-PENDING \[wc-d\] verify win=1 .*checked=[0-9]+ coverage=full bad_cache=0 bad_ram=0 .*-> PASS
+REQUIRE \[wc-d\] verify win=1 .*checked=[0-9]+ coverage=full bad_cache=0 bad_ram=0 .*-> PASS
 # The deferral line, with the two constants that must track the `coverage=lattice16` literal
 # (wm.rs asserts `WCD_LATTICE_N == 16` against wcg's `PAYGO_LATTICE_N` at compile time; this
 # keeps them honest ON THE WIRE), and `budget=2` — which is also the assertion that nobody
 # quietly gave wc-d wc-g's four-sample depth.
 # Synthesized line:
 #   [wc-d] paygo win=1 state=waiting emit=1 lattice_n=16 deferred=1 defer_ms=15000 since_entry_ms=5186 clock=entry taken=1 budget=2 -> DEFERRED
-PENDING \[wc-d\] paygo win=[0-9]+ state=waiting emit=[0-9]+ lattice_n=16 deferred=[0-9]+ defer_ms=15000 since_entry_ms=[0-9]+ clock=entry taken=[0-9]+ budget=2 -> DEFERRED
+REQUIRE \[wc-d\] paygo win=[0-9]+ state=waiting emit=[0-9]+ lattice_n=16 deferred=[0-9]+ defer_ms=15000 since_entry_ms=[0-9]+ clock=entry taken=[0-9]+ budget=2 -> DEFERRED
 # …and the battery closes. Same reasoning as the wc-g `-> PAID` REQUIRE: a gate in which every
 # window sat at `state=waiting` forever satisfies every other directive here and has replaced
 # the verify with an indefinite postponement.
 # Synthesized line:
 #   [wc-d] paygo win=1 state=complete emit=2 lattice_n=16 deferred=7 defer_ms=15000 since_entry_ms=17410 clock=entry taken=2 budget=2 -> PAID
-PENDING \[wc-d\] paygo win=[0-9]+ state=complete .*taken=[0-9]+ budget=2 -> PAID
+REQUIRE \[wc-d\] paygo win=[0-9]+ state=complete .*taken=[0-9]+ budget=2 -> PAID
 
 # --- WC-D TEARDOWN INTERLOCK: THE ABORT, AND THE BATTERY THAT NEVER ADJUDICATED --------------
 # Round 3 (`6f1225b9`) brackets the read-back against foreign panel writes and makes every
@@ -406,13 +404,12 @@ REQUIRE :: \[sntp-x86\] canned anchor cleared — clock unanchored again ::
 # loud" contract that is loud only to humans is worth writing down as such rather than
 # pretending the gate covers it.
 #
-# `PENDING`, NOT `REQUIRE`, and for the wc-d block's reason exactly. No capture carries these
-# lines: the s73 sitting predates `fca26306`, so all 8 of its boots print the PRE-split verdict
-#   :: CLOCK-X1: TSC invariant, ~2693 MHz; monotone (rdtsc +2143545592); uptime 15->16 s (JD17 x86-frozen clock now advances) == witness ::
-# with no `[paygo: …]` clause, and ZERO `SAMPLED — second-advance DEFERRED` lines anywhere.
-# REQUIREs here would red the spec on every capture that exists.
-# FIRST BUILD THAT CAN SATISFY THEM: any x86 image at or after `fca26306` + `b4870d14`. mbench
-# flags a match as "consider promoting to REQUIRE" on the first capture that carries them.
+# PROMOTED PENDING → REQUIRE, 2026-08-06 (GR18), for the wc-d block's reason exactly: these
+# shipped PENDING because the s73 sitting's first 8 boots predate `fca26306` and print the
+# PRE-split verdict with no `[paygo: …]` clause — REQUIREs would have red the spec on every
+# capture that then existed. The promotion condition (first capture from an image at or after
+# `fca26306` + `b4870d14`) was met by Boot U (metal, kernel `3477640c` @ `7814d258`): both
+# matched on mbench replay ("pending 6/6 matched"). From that boot forward these are load-bearing.
 #
 # VERIFICATION: patterns checked against lines generated from the exact format strings at
 # `b4870d14` (`arch/x86_64/syscall.rs`), with boot 7's real field values substituted.
@@ -422,7 +419,7 @@ REQUIRE :: \[sntp-x86\] canned anchor cleared — clock unanchored again ::
 # printing this line while every other CLOCK-X1 directive still passed.
 # Synthesized line:
 #   :: CLOCK-X1: TSC invariant, ~2693 MHz; uptime 15 s SAMPLED — second-advance DEFERRED to the first service pass (pay-as-you-go; a capture with no verdict line below never reached one) == witness ::
-PENDING :: CLOCK-X1: TSC invariant, ~[0-9]+ MHz; uptime [0-9]+ s SAMPLED — second-advance DEFERRED to the first service pass
+REQUIRE :: CLOCK-X1: TSC invariant, ~[0-9]+ MHz; uptime [0-9]+ s SAMPLED — second-advance DEFERRED to the first service pass
 # The VERDICT half — syscall.rs:6141. Pinned through the FINAL clause `b4870d14` settled on, field
 # by field, because each one is a term the review added for a reason: `deferred N ms TSC / N ms
 # APIC` are the two independent timebases the cross-check compares (the old clause carried a
@@ -434,7 +431,7 @@ PENDING :: CLOCK-X1: TSC invariant, ~[0-9]+ MHz; uptime [0-9]+ s SAMPLED — sec
 # and the SKEW half is the FORBID's business below — the same split the wc-g rollup uses.
 # Synthesized line:
 #   :: CLOCK-X1: TSC invariant, ~2693 MHz; monotone (rdtsc +2143545592); uptime 15->16 s (JD17 x86-frozen clock now advances) [paygo: deferred 796 ms TSC / 800 ms APIC, uptime +1 s, core=0 — CONSISTENT] == witness ::
-PENDING \(JD17 x86-frozen clock now advances\) \[paygo: deferred [0-9]+ ms TSC / [0-9]+ ms APIC, uptime \+[0-9]+ s, core=[0-9]+ — (CONSISTENT|SKEW)\]
+REQUIRE \(JD17 x86-frozen clock now advances\) \[paygo: deferred [0-9]+ ms TSC / [0-9]+ ms APIC, uptime \+[0-9]+ s, core=[0-9]+ — (CONSISTENT|SKEW)\]
 #
 # The three fault verdicts. NONE of them carries `-> FAIL` — they all end `== witness ::`, the
 # uncounted idiom — so the default FORBID set (`-> FAIL`, `FAIL ::`, `PANIC`) sails straight past
