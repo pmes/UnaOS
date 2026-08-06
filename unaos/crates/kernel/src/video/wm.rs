@@ -1703,6 +1703,21 @@ pub fn occluders(out: &mut [(usize, usize, usize, usize); MAX_WINDOWS]) -> usize
 /// Takes the table lock a second time for the present. Witness builds only — the shipped desktop pays
 /// nothing, and the return value drives no pixel: `present_background` still returns `false` from
 /// every exit and the repair for this race is, as it always was, the mutator's own composite.
+///
+/// ### Cost, stated for the track that actually pays it
+///
+/// "Witness builds only" is not the same as "x86 only", and the second caller makes the difference
+/// concrete. The probe on `present_background`'s `vugpar`+`baremetal` band exit compiles into the
+/// **arm-pi bench build** — `arroyo`'s `arm-pi` leg carries `witness`, `baremetal` and `vugpar`
+/// together — where that exit is the full-screen VUG present's hot path. On every such present it
+/// adds a bbox loop over the damage set plus this function's second window-table lock acquisition
+/// and eight-row scan. That is **unmeasured on the Pi**; this arc gated on `check` and had no Pi
+/// bench time. The x86 legs do not carry `vugpar` at all, so on x86 only the serial exit is probed
+/// and the added work is the same second lock against a loop that already blits.
+///
+/// Stated rather than assumed away: if the pi track measures a regression in VUG frame rate, this
+/// call and its bbox loop are the first thing to bisect, and gating the band-exit probe behind its
+/// own knob is the obvious remedy.
 #[cfg(feature = "witness")]
 pub(super) fn occluders_aged(
     snap: &[(usize, usize, usize, usize)],
@@ -3341,7 +3356,12 @@ static PANEL_DESK_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 /// other. Named gap, one build shape: the `vugpar`+`baremetal` parallel present copies clipped
 /// rects to glass and returns ABOVE this bracket — a missed span on that leg. No shipped x86 leg
 /// carries those features today (`x86-all` has neither), so the gap is unreachable, but it is a
-/// property of that path, not of this counter, and it is stated rather than claimed away. The
+/// property of that path, not of this counter, and it is stated rather than claimed away. **That
+/// named gap is precisely the exit [`WCI_INTRUSIONS`]'s `stale=`/`intrusions=` probe instruments**
+/// — deliberately, because it is also the leg that performs no occluder subtraction at all — so on
+/// the band path the two terms are complementary rather than redundant: `desk=` is blind there and
+/// the WC-I terms speak. (`arm-pi` DOES carry all three features, so unlike here the WC-I probe on
+/// that leg is reachable and costed; see [`occluders_aged`].) The
 /// epoch also counts loops that ENTER, not rows written: a fully-occluded present bumps `desk=`
 /// and writes nothing, so `desk=E0->E1` reads "N loops ran", never "N loops wrote".
 #[cfg(all(feature = "witness", target_arch = "x86_64"))]
@@ -4421,6 +4441,36 @@ static WCI_CURSOR_BRACKETS: core::sync::atomic::AtomicU64 = core::sync::atomic::
 /// moved under them AND whose writes landed where it moved. A boot can show `desk=` climbing steadily
 /// with `stale=0`, and that is the informative case: it says the desktop layer is busy and is not the
 /// thing painting over windows.
+///
+/// The two DO meet at one place, and it is worth both notes pointing at it: [`PANEL_DESK_ACTIVE`]
+/// names a gap in its own bracket — the `vugpar`+`baremetal` parallel present copies clipped rects
+/// to glass and returns ABOVE the `DeskWriteGuard`, so `desk=` cannot see that leg. That leg is
+/// exactly where this probe now runs, because it is also the leg with no subtraction at all. The
+/// coverage is complementary rather than duplicated: on the band exit `desk=` is blind and
+/// `stale=`/`intrusions=` speak; on the serial loop both do, about different things.
+///
+/// ### `INTRUDED` is a TRIPWIRE verdict now, not a diagnosis
+///
+/// For two weeks the verdict was unreachable, so every historical line said `CLEAN` or
+/// `UNWITNESSED`. It is reachable again, and it is deliberately reachable with a KNOWN
+/// OVER-REPORTING MODE (see [`occluders_aged`]): the geometric test is a box against the union
+/// RECTANGLE of the present's spans, so an entered box that overlaps the union while sitting
+/// entirely inside a span the old table already subtracted counts as an intrusion it was not. A
+/// benign drag over a busy desktop can therefore print `INTRUDED` where the old line printed
+/// `CLEAN`, and that is not a regression in the compositor.
+///
+/// **The reading rule, in order:**
+///  * `stale=0` — the race never arose. `intrusions` is 0 by construction; nothing to read.
+///  * `stale=N intrusions=0` — the layout moved under N presents and the writes missed every box
+///    that entered. The subtraction's snapshot is aging and getting away with it.
+///  * `stale=N intrusions=M` — M of those presents wrote into the union a box entered. THIS IS A
+///    LEAD, NOT A CONVICTION. Confirm against the panel (the P60 blip is visible) or against
+///    `[wc-d]`'s per-window read-back before calling it the WC-I defect; `M` climbing in lockstep
+///    with window drags is the expected shape of the false positive, `M` climbing at the status
+///    strip's ~1 Hz with a still layout is the shape of the real one.
+///
+/// No spec in the tree reads any `[wc-i]` line, so nothing reds on this. That makes it more
+/// important, not less, that the verdict's new meaning is written where the reader is.
 #[cfg(feature = "witness")]
 static WCI_INTRUSIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 

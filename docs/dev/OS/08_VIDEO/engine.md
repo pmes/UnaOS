@@ -2661,6 +2661,38 @@ Read them together. `stale=0 intrusions=0` says the race never arose; `stale=N i
 arose N times and the writes missed every box that entered. Those are different claims and the old
 line could not tell them apart.
 
+**`INTRUDED` is now a TRIPWIRE verdict, and the earlier text on this page is superseded.** The bullet
+under "Metal watch-list" below still reads "a non-zero `intrusions` means a desktop path is still
+writing into a window box and names it as the cause". That was written when the counter could not
+fire; it is too strong now. The verdict went unreachable → reachable-with-a-known-over-report, and
+the over-report is the bbox conservatism named above: a benign window drag over a busy desktop can
+print `INTRUDED` where two weeks of captures printed `CLEAN`, without anything in the compositor
+having regressed. No spec in the tree reads any `[wc-i]` line, so nothing goes red on this — which
+makes writing the new meaning down more important, not less.
+
+The reading rule, in order:
+
+| line | meaning |
+|---|---|
+| `stale=0` | the race never arose; `intrusions` is 0 by construction, nothing to read |
+| `stale=N intrusions=0` | the layout moved under N presents and the writes missed every box that entered — the snapshot is aging and getting away with it |
+| `stale=N intrusions=M` | **a lead, not a conviction.** M presents wrote into the union a box entered |
+
+For the third row, confirm before calling it the WC-I defect: the P60 blip is visible on the panel,
+and `[wc-d]`'s per-window read-back adjudicates independently. `M` climbing in lockstep with window
+drags is the expected shape of the FALSE positive; `M` climbing at the status strip's ~1 Hz against a
+still layout is the shape of the real one.
+
+**Cost, and which track pays it.** "Witness-only" is not "x86-only". The probe on
+`present_background`'s `vugpar`+`baremetal` band exit compiles into the **arm-pi bench build** —
+`arroyo`'s `arm-pi` leg carries `witness`, `baremetal` and `vugpar` together — where that exit is the
+full-screen VUG present's hot path, and there it adds a bbox loop over the damage set plus a second
+window-table lock acquisition and eight-row scan per present. **That is unmeasured on the Pi**: this
+arc gated on `./arroyo check` and had no Pi bench time. The x86 legs carry no `vugpar` at all, so on
+x86 only the serial exit is probed. If the pi track sees a VUG frame-rate regression, this call and
+its bbox loop are the first thing to bisect, and putting the band-exit probe behind its own knob is
+the obvious remedy.
+
 This does **not** restate `[wc-d]`'s `desk=`. That term counts blit loops unconditionally and without
 geometry, to date a scan-out read-back; a boot showing `desk=` climbing with `stale=0` is the
 informative case, because it says the desktop layer is busy and is not the thing painting over
@@ -2671,6 +2703,11 @@ what WC-I said it was when it took the snapshot — the mutator's own composite.
 The `vugpar`+`baremetal` band exit is now probed too, and it is the exit that needed it most: those
 workers perform no subtraction at all, the whole path is justified by `occ.is_empty()`, and `occ` is
 the same snapshot. Its bbox is the clipped damage set, which is what lands on the panel on that leg.
+**That exit is exactly the gap `PANEL_DESK_ACTIVE` names in `[wc-d]`'s own bracket** — the band path
+copies clipped rects to glass and returns *above* the `DeskWriteGuard`, so `desk=` cannot see it
+(`98ffcf02`). The two notes now point at each other, and the coverage is complementary rather than
+duplicated: on the band exit `desk=` is blind and the WC-I terms speak; on the serial loop both do,
+about different things.
 
 #### The close→reopen / undying-vug cluster: what this arc can and cannot say
 
@@ -2731,7 +2768,9 @@ pointer report, so the sprite is never drawn. Both numbers carry their claim onl
 * **The blip is gone.** Several vugs running: no simultaneous per-second fuzz. `[wc-i] rollup
   scope=desktop ... intrusions=0 -> CLEAN` on the wire is the assertion; a non-zero `intrusions` means
   a desktop path is still writing into a window box and names it as the cause rather than leaving it to
-  a photograph.
+  a photograph. **Superseded 2026-08-06** — until then the counter could not fire at all, and now that
+  it can, `INTRUDED` is a tripwire with a known bbox over-report, not the naming of a cause. Read the
+  correction block above (`stale=`/`intrusions=` table) before acting on a non-zero `intrusions`.
 * **`[wc-h] rollup ... declines=0` should now hold with several windows**, not just one. The
   `reason=lock` declines WC-H anticipated were largely the desktop repaint compositing on a second
   core; with the blanket repaint gone, that contention source is gone with it. Residual declines are

@@ -1971,45 +1971,14 @@ impl Controller {
             // can influence whether this endpoint counts as alive.
             #[cfg(feature = "kbdwit")]
             {
-                let now = crate::arch::ms();
-                // KBDWIT-2 — `SILENCE-BROKE`: the second sample the original instrument's own
-                // section comment named as missing ("Convicting those would need a second,
-                // keypress-triggered sample, which this arc does not build"). This is it, and it is
-                // triggered by the stimulus rather than by a clock, so it lands exactly when the
-                // evidence exists instead of seconds into a boot nobody has touched yet.
-                //
-                // Fires only for an endpoint the deadline dump already declared silent, so a
-                // healthy chatty endpoint never prints it. One line, latched: at most one per
-                // endpoint per boot, on top of the deadline dump's seven.
-                //
-                // What it settles. The rmbp-gr16-s73 capture has nine boots, every one of them
-                // ending `class=never-completed reports=0` on the keyboard — and in boot 9 that
-                // SAME endpoint, on that SAME arming, with no re-arm and no STOP-NOTE, delivered
-                // its first key at 215418 ms and 96 reports by 276587 ms. The deadline dump had
-                // fired at 11125 ms. Nine boots of "NO-COMPLETIONS" and the one boot anybody typed
-                // in worked: the dump was measuring the absence of a typist. This line is what
-                // turns that from an archaeology exercise into a printed fact.
-                if e.kbdwit_fired && !e.kbdwit_broke {
-                    e.kbdwit_broke = true;
-                    let chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
-                    serial_println!(
-                        ":: KBDWIT: [{}] ep=IN{} addr={} SILENCE-BROKE armed_ms={} now_ms={} quiet_ms={} polls={} walks={} split_or={:#018x} reports={} toggle={} == witness ::",
-                        idx,
-                        (chars >> 8) & 0xF,
-                        chars & 0x7F,
-                        e.kbdwit_armed_ms,
-                        now,
-                        now.wrapping_sub(e.kbdwit_armed_ms),
-                        e.kbdwit_polls,
-                        e.kbdwit_walks,
-                        e.kbdwit_split_or,
-                        e.reports,
-                        e.toggle as u8,
-                    );
-                }
-                e.kbdwit_last_ms = now;
+                e.kbdwit_last_ms = crate::arch::ms();
             }
             if tok & QTD_ERR_MASK != 0 {
+                // KBDWIT-2: the silence ended, but it ended in a HALT — see
+                // `kbdwit_note_silence_end` for why this exit gets its own verdict word instead of
+                // sharing `SILENCE-BROKE` with the clean one below.
+                #[cfg(feature = "kbdwit")]
+                kbdwit_note_silence_end(e, idx, "SILENCE-ENDED-HALTED", tok);
                 serial_println!(
                     ":: EHCI-HID: [{}] STOP-NOTE interrupt endpoint halted (token {:#010x}) — endpoint retired, not forced ::",
                     idx, tok
@@ -2017,6 +1986,9 @@ impl Controller {
                 e.dead = true;
                 continue;
             }
+            // KBDWIT-2: a clean retirement — the endpoint answered. THE decision-table entry.
+            #[cfg(feature = "kbdwit")]
+            kbdwit_note_silence_end(e, idx, "SILENCE-BROKE", tok);
             // MT-INVESTIGATION (IVY): bytes actually received = armed total minus the residue the
             // controller left in Total Bytes To Transfer. Knob-off the armed total IS `e.mps`, so
             // the expression is unchanged; knob-on, on the vendor-multitouch endpoint, it is the
@@ -2284,15 +2256,28 @@ impl Controller {
 // So the fix is the instrument, not the driver — nothing in the EHCI path is convicted by any of
 // this, and nothing in it is changed. Two additions, both read-only:
 //
-//   1. `sched=WALKED|NOT-WALKED|UNSAMPLED` with `polls=`/`walks=`/`split_or=` on line 1. The
+//   1. `sched=WALKED|NOT-WALKED` with `polls=`/`walks=`/`split_or=` on line 1. The
 //      controller writes C-prog-mask and FrameTag/S-bytes into the QH overlay every time it
 //      executes a split against this endpoint; sampling that pair on every service pass and
 //      counting the changes answers "is the host side doing its job?" WITHOUT a keypress. It
 //      decides the half of the question that was always decidable and was never asked. See
 //      `IntEp::kbdwit_walks` for why aliasing cannot fake a zero.
-//   2. `SILENCE-BROKE`, the keypress-triggered second sample this comment said it did not build.
-//      One latched line at the first completion after a dump, carrying the elapsed silence and the
-//      poll/walk rate that spanned it.
+//   2. `SILENCE-BROKE` / `SILENCE-ENDED-HALTED`, the keypress-triggered second sample this comment
+//      said it did not build. One latched line at the first non-ACTIVE token after a dump, carrying
+//      the elapsed silence and the poll/walk rate that spanned it.
+//
+// WHICH NON-ACTIVE CLASSES LATCH THAT SECOND LINE, because "the qTD is no longer Active" is not one
+// event but two, and they mean opposite things:
+//   * A CLEAN retirement (`tok & QTD_ERR_MASK == 0`) prints `SILENCE-BROKE`. The endpoint answered.
+//   * A HALT (transaction error, babble, data-buffer error — the classes `QTD_ERR_MASK` covers)
+//     prints `SILENCE-ENDED-HALTED`, from inside the same block that emits `STOP-NOTE` and retires
+//     the endpoint. The silence ended, but it ended in a fault, and that is NOT the healthy row of
+//     the table below.
+// They share one latch and sit on opposite sides of the error test, so exactly one of them can ever
+// print for a given endpoint. The split is not cosmetic: emitted from a single site above that test
+// — as the first cut of this was — a halt would have printed `SILENCE-BROKE` and read as "the
+// device answered", inverting the table on exactly the boot this exists to adjudicate. See
+// `kbdwit_note_silence_end` for why `reports=` could not have disambiguated it either.
 //
 // TWO READINGS OF THAT DUMP THAT LOOK LIKE FINDINGS AND ARE NOT. Both were put to this arc from
 // the R2 boot ([11156ms], the same capture, one boot later), so they are written down here rather
@@ -2334,6 +2319,10 @@ impl Controller {
 //   * `SILENCE-BROKE` with a large `quiet_ms` and no keypress at that instant — the endpoint
 //     completed something unprompted (a keep-alive, a resumed stream); the silence was never a
 //     fault at all.
+//   * `SILENCE-ENDED-HALTED` — the silence ended in a fault, not an answer. Read `tok=` and the
+//     decoded `halted=`/`xact=`/`babble=`/`dbuf=` beside it, and the `STOP-NOTE` on the next line;
+//     `walks=` then says whether the controller had been transacting right up to the halt. This
+//     row does NOT belong to the healthy case above and must never be counted as one.
 //
 // WHY PER-ENDPOINT, NOT PER-CONTROLLER. During the failure the trackpad is streaming on the SAME
 // controller, so any controller-level "is anything completing?" test reads HEALTHY on the exact
@@ -2439,6 +2428,70 @@ fn kbdwit_eps(chars: u32) -> &'static str {
         2 => "high",
         _ => "rsvd",
     }
+}
+
+/// KBDWIT-2 — the silence ended. One latched line, per endpoint, per boot, for the FIRST
+/// non-ACTIVE token seen after the deadline dump declared this endpoint silent.
+///
+/// ### Why the caller splits this into two verdict words instead of one
+///
+/// The first cut of this line was emitted from a single site above the service loop's
+/// `QTD_ERR_MASK` test, i.e. on ANY non-ACTIVE token. That is wrong in the one direction an
+/// instrument must never be wrong. A qTD halted by a transaction error, babble or a stall is also
+/// non-ACTIVE — the very next block retires the endpoint as a fault and prints `STOP-NOTE` — so a
+/// halt would have latched `SILENCE-BROKE` and read as *"the device answered, all is well"*,
+/// inverting the decision table in the section comment above on precisely the boot the line was
+/// built to adjudicate. And `reports=` could not have rescued the reader: on this metal the genuine
+/// keypress case ALSO prints zero there, because `reports` is incremented further down, past the
+/// length gate.
+///
+/// So the caller places the two exits on opposite sides of the error test and names them apart:
+///
+///   * `SILENCE-BROKE` — a CLEAN retirement, and the only class the decision table's "healthy"
+///     row covers. Emitted below the error test.
+///   * `SILENCE-ENDED-HALTED` — the token carried `QTD_ERR_MASK`. Emitted inside the error block,
+///     alongside `STOP-NOTE`, which it deliberately duplicates the token of: `STOP-NOTE` says the
+///     endpoint died and this says how long it had been quiet, over how many polls, with what walk
+///     rate — the diagnostic payload that would have been lost by simply moving the latch and
+///     letting the halt print nothing.
+///
+/// They share the one `kbdwit_broke` latch, so they are mutually exclusive and the total is still
+/// at most one line per endpoint per boot. An `awk '/SILENCE-/'` finds both; neither can be
+/// mistaken for the other.
+///
+/// `reports_prior=` is named for what it is: the count BEFORE this completion, which is not yet
+/// (and may never be) incremented — a zero-length completion still retires the qTD and still ends
+/// the silence, but never bumps `reports`. `tok=` is raw and the status bits are decoded beside it,
+/// so a reader re-derives the class from the hex without trusting the verdict word.
+#[cfg(feature = "kbdwit")]
+unsafe fn kbdwit_note_silence_end(e: &mut IntEp, idx: usize, verdict: &str, tok: u32) {
+    if !e.kbdwit_fired || e.kbdwit_broke {
+        return;
+    }
+    e.kbdwit_broke = true;
+    let now = crate::arch::ms();
+    let chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
+    serial_println!(
+        ":: KBDWIT: [{}] ep=IN{} addr={} {} tok={:#010x} halted={} xact={} babble={} dbuf={} rem={} armed_ms={} now_ms={} quiet_ms={} polls={} walks={} split_or={:#018x} reports_prior={} toggle={} == witness ::",
+        idx,
+        (chars >> 8) & 0xF,
+        chars & 0x7F,
+        verdict,
+        tok,
+        (tok >> 6) & 1,
+        (tok >> 3) & 1,
+        (tok >> 4) & 1,
+        (tok >> 5) & 1,
+        (tok >> 16) & 0x7FFF,
+        e.kbdwit_armed_ms,
+        now,
+        now.wrapping_sub(e.kbdwit_armed_ms),
+        e.kbdwit_polls,
+        e.kbdwit_walks,
+        e.kbdwit_split_or,
+        e.reports,
+        e.toggle as u8,
+    );
 }
 
 /// KBDWIT — the probe. Called from the service loop for an endpoint whose qTD is STILL ACTIVE
