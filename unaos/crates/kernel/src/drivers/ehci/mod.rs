@@ -1239,16 +1239,63 @@ impl Controller {
 
         // 8-byte device-descriptor header first: learns the real bMaxPacketSize0 before any
         // longer read (the XENUM-3 short-read trap — a FS MPS0 is 8/16/32, never the 64 guess).
-        if self.control(&t, 0x80, 6, 0x0100, 0, 8, true).is_err() {
-            serial_println!(
-                ":: EHCI-HID: [{}] enumeration aborted: device at addr 0 (via hub {} port {}) never answered GET_DESCRIPTOR(8) ::",
-                self.idx, hub_addr, hub_port
-            );
-            return;
-        }
-        let mps0 = *self.data_buf.add(7) as u16;
-        if [8u16, 16, 32, 64].contains(&mps0) {
-            t.mps0 = mps0;
+        //
+        // BUY-2 (GR18) — **high speed does not need this request at all.** USB 2.0 §5.5.3 fixes
+        // the default control pipe's maximum data payload at 64 bytes for a high-speed device;
+        // there is no other legal MPS0 at HS. The pre-read is a full/low-speed concern only
+        // (§5.5.3: FS may be 8, 16, 32 or 64; LS is 8), which is exactly what the `else` branch
+        // of `t.mps0` above already encodes.
+        //
+        // The evidence that made it worth taking is Boot V's M8 line, metal, n=1:
+        //   :: EHCI-HID: [0] EPACE-TRIM M8 SLOW-XFER addr=0 hub=0.0 spd=HS bmreq=0x80 breq=0x06
+        //      wval=0x0100 widx=0x0000 wlen=8 stg=3 xfer=50ms act=50ms ass=0ms seq=1/8 == witness ::
+        // — the `05ac:8510`'s ~50 ms of NAK sat in THIS request, wholly in `act` (the device's
+        // own answer latency), with `ass=0` acquitting our per-stage ASE toggle. The enum46
+        // verdict (§5, BUY-2) held the trim until M8 named the request; M8 named it.
+        //
+        // Falsifier, and why the assumption is self-policing rather than silent: a HS device
+        // with MPS0 != 64 violates §5.5.3, but we do not have to take the spec's word for it —
+        // the 18-byte device descriptor read below carries `bMaxPacketSize0` at offset 7 anyway.
+        // The cross-check after that read compares it against the 64 assumed here, prints a
+        // witness line naming the offending device, and corrects `t.mps0` before any further
+        // transfer. Cost: one byte compare on a buffer we already read.
+        //
+        // Also moved, deliberately: this request doubled as the liveness probe ("never answered
+        // GET_DESCRIPTOR(8)"). For HS targets the first failure point is now SET_ADDRESS, whose
+        // own failure path below is equally loud (`address N BURNED`).
+        //
+        // PREDICTION for the next metal boot (falsifiable, and the M8 instrument stays armed to
+        // decide it either way):
+        //   * the `05ac:8510`'s enum window shrinks by what M8 measured — ~50 ms — if the NAK
+        //     belonged to the REQUEST. `EPACE: [0] enum=` ~285 → ~235 ms, `{xfer=}` on [0] loses
+        //     one transfer (`n=28` → `27`) and ~50 ms, `act=` ~57 → ~7 ms.
+        //   * `BPACE: ehci-hid-done d=` drops from ~1450 toward **~1400 ms**.
+        //   * the M8 SLOW-XFER line naming `wlen=8` **DISAPPEARS** — the request is no longer
+        //     sent to HS targets, so it cannot be slow.
+        //   * **the falsifier that decides bought-vs-moved:** if a ~50 ms M8 line REAPPEARS on
+        //     [0] naming `breq=0x06 wlen=18` (or `breq=0x05 wlen=0`), the NAK belonged to the
+        //     device's first-request SLOT rather than to GET_DESCRIPTOR(8) specifically — the
+        //     50 ms was moved, not bought, `enum=` stays ~285, and BUY-2's saving is 0. That is
+        //     a real finding either way and it is the one this edit is instrumented to make.
+        //   * structural, gating regardless of any ms above: `M2 armed keyboard addr=6 ep=IN3`
+        //     still present and identical on [1]; `M1 hub-downstream device addr=2 05ac:8510`
+        //     still present on [0]. A trim that loses a device reads faster for the worst reason.
+        //   * zero `BUY-2 FALSIFIED` lines, and zero `BUY-2 suspect` short-descriptor lines. One
+        //     of either means a HS device on this bench does not honour §5.5.3 and the skip must
+        //     be reverted for it.
+        let hs_skip_preread = eps == QH_EPS_HIGH;
+        if !hs_skip_preread {
+            if self.control(&t, 0x80, 6, 0x0100, 0, 8, true).is_err() {
+                serial_println!(
+                    ":: EHCI-HID: [{}] enumeration aborted: device at addr 0 (via hub {} port {}) never answered GET_DESCRIPTOR(8) ::",
+                    self.idx, hub_addr, hub_port
+                );
+                return;
+            }
+            let mps0 = *self.data_buf.add(7) as u16;
+            if [8u16, 16, 32, 64].contains(&mps0) {
+                t.mps0 = mps0;
+            }
         }
 
         let Some(addr) = self.alloc_addr() else { return };
@@ -1271,9 +1318,18 @@ impl Controller {
             return;
         };
         if n < 18 {
+            // BUY-2's second falsifier arm, and the honest limit of the first. A HS device whose
+            // real MPS0 were below 64 would end this IN on a short packet at its true MPS0 —
+            // i.e. it lands HERE, not on the `d[7] != 64` cross-check below, which never gets to
+            // run. `n` is then the device's actual MPS0, so this line names the number too.
             serial_println!(
-                ":: EHCI-HID: [{}] address {} BURNED (short device descriptor: {} bytes) ::",
-                self.idx, addr, n
+                ":: EHCI-HID: [{}] address {} BURNED (short device descriptor: {} bytes){} ::",
+                self.idx, addr, n,
+                if hs_skip_preread {
+                    " — BUY-2 suspect: on a HS target this is the shape a real bMaxPacketSize0 < 64 makes (USB 2.0 §5.5.3 forbids it); the byte count IS the device's MPS0, and the skipped 8-byte pre-read would have learned it"
+                } else {
+                    ""
+                }
             );
             return;
         }
@@ -1286,6 +1342,23 @@ impl Controller {
             QH_EPS_LOW => "LS",
             _ => "FS",
         };
+        // BUY-2's self-policing half. `d[7]` is bMaxPacketSize0 — the same field the skipped
+        // 8-byte pre-read would have carried, arriving here for free. If a high-speed device
+        // ever reports anything but 64 it has violated USB 2.0 §5.5.3, and the assumption above
+        // would otherwise have been wrong in silence for every transfer after this one. Name it
+        // and correct the stored MPS0 now: `bring_up_hub`/`configure_hid` below are the next
+        // users of `t.mps0`, so the correction lands before any further wire traffic. Only the
+        // legal set is accepted, exactly as the pre-read's own filter did.
+        if hs_skip_preread && d[7] != 64 {
+            serial_println!(
+                ":: EHCI-HID: [{}] BUY-2 FALSIFIED addr={} {:04x}:{:04x} spd=HS reports bMaxPacketSize0={} — USB 2.0 §5.5.3 permits only 64 at high speed; the skipped 8-byte pre-read would have caught this, MPS0 corrected for subsequent transfers == witness ::",
+                self.idx, addr, vid, pid, d[7]
+            );
+            let reported = d[7] as u16;
+            if [8u16, 16, 32, 64].contains(&reported) {
+                t.mps0 = reported;
+            }
+        }
         // The M1 witness. At depth 0 this line IS the topology fork decision (design §2.4).
         if depth == 0 {
             serial_println!(

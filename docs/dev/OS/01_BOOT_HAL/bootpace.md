@@ -863,6 +863,12 @@ change of grain cannot silently move them, and M6 carries its own tripwire:
 metal-only; `./arroyo check` (both arches, plain and `UNAOS_WITNESS=1 UNAOS_LOGTS=1`) is the
 whole automated gate and QEMU-green carries zero information about either.
 
+> **Corrected by §8h (GR18).** The paragraph above is wrong about the `./arroyo test` leg, which
+> attaches an ICH9 EHCI (`8086:24cd`) with a high-speed device on port 0 and does run
+> `drivers/ehci` end-to-end — `M1 root device … speed=HS` and `M2 armed keyboard` both print
+> there. The ms readings remain metal-only, but the *paths* are covered, and §8h uses that
+> coverage as a real gate. Read the claim as "no timing coverage", not "no execution".
+
 **Prediction for the next metal boot** (before → after, and the lines that decide it):
 
 | reading | before (s73 boots 6-8) | predicted after |
@@ -901,7 +907,80 @@ loses a device makes every `ms` reading above look *better*, so these gate the a
 **Not trimmed, and why.** `hubpwr` (600 ms), `rootrst` (480 ms), T_RSTRCY (60 ms) and
 SET_ADDRESS recovery (16 ms) are **1156 ms of USB 2.0 minima** across §8c and this section. The
 46 ms transfer anomaly is undecomposed and therefore untouched by law; M7 is what earns the
-right to trim it.
+right to trim it. **M7's successor M8 did earn it — see §8h, where the request is named and the
+trim taken.**
+
+### 8h. M8 named the request, and BUY-2 was taken (GR18, 2026-08-06)
+
+§8f left the ~46-52 ms transfer anomaly undecomposed and named M7's successor as the thing that
+would earn the right to trim it. **EPACE-TRIM M8 earned it on Boot V, metal, n=1:**
+
+```
+:: EHCI-HID: [0] EPACE-TRIM M8 SLOW-XFER addr=0 hub=0.0 spd=HS bmreq=0x80 breq=0x06
+   wval=0x0100 widx=0x0000 wlen=8 stg=3 xfer=50ms act=50ms ass=0ms seq=1/8 == witness ::
+```
+
+M8's own prediction held on every term it made: **one line, controller [0], addr 0**, the
+`05ac:8510`'s window, `xfer=` ≈ 50 ms with `act=` accounting for **all** of it, `ass=0ms`, and
+**zero lines on controller [1]** — the asymmetry that was the falsifier. The 50 ms is the
+device's own answer latency and it sits in **`0x80/0x06 GET_DESCRIPTOR(8)`**, the 8-byte
+MPS0 pre-read, `addr=0`, before addressing.
+
+**BUY-2 taken.** USB 2.0 §5.5.3 fixes the high-speed default control pipe at a 64-byte maximum
+data payload — a HS device has no other legal MPS0 — so that pre-read asks a high-speed device a
+question the spec already answered. The pre-read's own comment always said as much ("a FS MPS0
+is 8/16/32, never the 64 guess"): it is a full/low-speed concern. `enumerate_at_zero` now gates
+it on `eps != QH_EPS_HIGH` and goes straight to SET_ADDRESS for HS targets. **FS and LS paths,
+hub logic and every pacing constant are untouched.**
+
+**The assumption is self-policing, not silent.** The 18-byte device descriptor read that follows
+carries `bMaxPacketSize0` at offset 7 regardless, so the answer arrives for free one transfer
+later. Two arms cover it:
+
+* `d[7] != 64` on a HS target → `BUY-2 FALSIFIED … reports bMaxPacketSize0=N` names the device
+  and **corrects `t.mps0` before any further transfer** (`bring_up_hub` / `configure_hid` are the
+  next users).
+* a device whose real MPS0 were below 64 would end that IN on a short packet and never reach the
+  cross-check at all — so the `short device descriptor` BURNED line grew a HS-only suffix saying
+  the byte count *is* the device's MPS0. That is the honest limit of the first arm, stated at
+  the site rather than left to be discovered.
+
+The `never answered GET_DESCRIPTOR(8)` liveness probe moves with the request: for HS targets the
+first failure point is now SET_ADDRESS, whose `address N BURNED` path is equally loud.
+
+**Coverage — better than §8f's "none", and it is the automated gate that says so.** §8f recorded
+that the x86 QEMU targets attach `qemu-xhci` and no EHCI function. That is now false for the
+`./arroyo test` leg: it attaches an ICH9 EHCI (`8086:24cd`) with a **high-speed** device on port
+0, so the new branch is executed, not merely compiled:
+
+```
+:: EHCI-HID: [0] M1 root device addr=1 0627:0001 class=0x00 speed=HS -> TOPOLOGY B (direct device) == witness ::
+:: EHCI-HID: [0] M2 armed keyboard addr=1 ep=IN1 mps=8 interval=7 (boot protocol) == witness ::
+```
+
+`speed=HS` ⇒ the skip was taken; the 18-byte descriptor still read in full (VID:PID decoded);
+the endpoint still armed. `{xfer=…(n=7)}` against the **8** M8 recorded at its 1 ms calibration
+is the transfer this trim removed, counted. And the cross-check was falsified rather than
+trusted: with the condition temporarily inverted to `d[7] == 64` the run printed
+`BUY-2 FALSIFIED … reports bMaxPacketSize0=64`, which both proves the branch can fire *and*
+confirms QEMU's HS device honours §5.5.3. Metal remains the gate for the ms.
+
+**Prediction for the next metal boot** — and the falsifier that decides whether the 50 ms was
+**bought** or merely **moved**:
+
+| reading | before (Boot V) | predicted after |
+|---|---|---|
+| `M8 SLOW-XFER … breq=0x06 wlen=8` on [0] | present, `xfer=50ms` | **absent** — the request is no longer sent to a HS target |
+| `EPACE: [0] enum=` | ~285 ms | **~235 ms** |
+| `EPACE: [0] {xfer= n=}` | `n=28`, ~59 ms | **`n=27`**, ~9 ms |
+| `EPACE: [0] act=` | ~57 ms | **~7 ms** |
+| `BPACE: ehci-hid-done d=` | ~1450 ms | **~1400 ms** |
+| `M8 SLOW-XFER … wlen=18` (or `breq=0x05`) on [0] | absent | **absent.** If a ~50 ms line REAPPEARS here the NAK belonged to the device's first-request *slot*, not to GET_DESCRIPTOR(8) — the 50 ms was **moved, not bought**, `enum=` stays ~285, and BUY-2's saving is 0 |
+| `BUY-2 FALSIFIED` / `BUY-2 suspect` | absent | **absent.** Either one means a HS device on this bench does not honour §5.5.3 and the skip must be reverted for it |
+| `M2 armed keyboard addr=6 ep=IN3` on [1]; `M1 … addr=2 05ac:8510` on [0] | present | **present, identical.** Structural, and it gates the arc regardless of every ms above — a trim that loses a device reads faster for the worst possible reason |
+
+The M8 instrument stays armed precisely so the moved-vs-bought question answers itself on the
+next boot. Both outcomes are findings; only one of them is a saving.
 
 ## 9. GPACE — the inside of `pci-usb` (GR13)
 
