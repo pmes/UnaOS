@@ -57,21 +57,39 @@ It emits **two** lines, and the split is the point. Waiting *here* for the secon
 draw over the 1 Hz period — 18 to 979 ms across eight metal boots, and the whole of `BPACE: sched d=`
 (bootpace.md §8e). So the call site only SAMPLES (`uptime`, `rdtsc`, and the 1 kHz APIC tick), and
 `syscall::clock_x1_poll()` — called from `bootpace::service_dump()`, the one call every x86 service loop
-makes ungated — delivers the verdict from the first service pass, which is already seconds past the edge:
+makes ungated — delivers the verdict from the first service pass, which is already seconds past the edge.
+**Shape, not a capture quote** — the numbers below are illustrative (a real deferral runs ~2.2–3.6 s on
+a default build, ~19.6 s on a compositor boot); the s73 table in bootpace.md §8e holds the measured ones:
 
 ```
 :: CLOCK-X1: TSC invariant, ~2693 MHz; uptime 15 s SAMPLED — second-advance DEFERRED to the first
 service pass (pay-as-you-go; a capture with no verdict line below never reached one) == witness ::
-:: CLOCK-X1: TSC invariant, ~2693 MHz; monotone (rdtsc +14300000000); uptime 15->20 s (JD17 x86-frozen
-clock now advances) [paygo: deferred 5312 ms, +5 s uptime vs +5312 ms APIC — CONSISTENT] == witness ::
+:: CLOCK-X1: TSC invariant, ~2693 MHz; monotone (rdtsc +9749000000); uptime 15->18 s (JD17 x86-frozen
+clock now advances) [paygo: deferred 3620 ms TSC / 3608 ms APIC, uptime +3 s, core=7 — CONSISTENT]
+== witness ::
 ```
 
-The `[paygo: …]` clause is a cross-check the blocking form never had: the uptime advance is TSC-derived,
-the elapsed milliseconds are APIC-tick-derived, and `SKEW` (over 2 s apart) convicts a mis-calibrated
-`tsc_hz`. A second derivation that never moves prints `:: CLOCK-X1: FROZEN — uptime still N s after M ms
-of APIC ticks …` once 3000 ms of ticks have passed, replacing the old iteration-cap fallback line that
-reported a *pass* and so could not be told from a fast boot. The two lines are a pair: exactly one of
-them in a capture means the boot never reached a service pass.
+The `[paygo: …]` clause is a cross-check the blocking form never had: the deferral is printed as the
+TSC measured it AND as the APIC tick measured it, in milliseconds, and `SKEW` fires past
+`200 ms + 5 % of the deferral`. Both figures are shown because `apic::ticks()` counts interrupts and so
+undercounts by IF-masked time — that artefact must stay separable, on sight, from a real fault. And the
+fault it convicts is a **differentially mis-armed heartbeat**, not a mis-calibrated `tsc_hz`: both arms
+come off the same PM-timer denominator in `apic::calibrate`, so a bad PM reference scales them
+identically and is undetectable here.
+
+A second derivation that never moves prints `:: CLOCK-X1: FROZEN — uptime still N s after M ms APIC /
+K ms TSC …` once 3000 ms of APIC ticks **or** `tsc_hz × 3` cycles have passed — armed on both counters,
+since a deadline measured only by the tick cannot report a boot where the tick is dead too. It replaces
+the old iteration-cap fallback line that reported a *pass* and so could not be told from a fast boot.
+Either counter running backwards prints `:: CLOCK-X1: NON-MONOTONE …` carrying both `rdtsc` reads and
+both uptime reads, tested ahead of the frozen branch so a backwards clock cannot hide behind a stale
+`uptime still N s`. `core=N` on the verdict names the core it ran on: the sample is the BSP and the
+verdict is the service core, so the subtraction is cross-core and rests on this kernel never writing
+the TSC.
+
+Read the pair by WHICH line is present, not by counting: the FTDI ring is drop-oldest, so a verdict
+with no armed line above it is ring overflow and proves the witness fired, while an armed line with no
+verdict below it means the boot never reached a service pass.
 
 **QEMU/TCG note.** TCG cannot advertise the invariant-TSC feature —
 `TCG doesn't support requested feature: CPUID[eax=80000007h].EDX.invtsc [bit 8]` — even under `-cpu max`

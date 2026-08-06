@@ -595,30 +595,62 @@ the bench. The first service pass is seconds past the edge on every build, so th
 is observed with zero waiting. No knob: the witness is not optional, it is paid later.
 
 **What the deferred form proves that the blocking form could not.** The sample captures
-`arch::ticks()` alongside `rdtsc`, so the verdict cross-checks the TSC-derived uptime
-advance against an **independent** timebase and says so on the wire:
-`[paygo: deferred 5312 ms, +5 s uptime vs +5312 ms APIC — CONSISTENT]`. A `SKEW` there
-(disagreement over `CLOCK_X1_SKEW_S` = 2 s, which covers whole-second truncation on both
-counters plus tick coalescing) convicts a mis-calibrated `tsc_hz` — something the blocking
-form had no second clock to notice. And a second derivation that is genuinely stuck now
-prints `:: CLOCK-X1: FROZEN — uptime still N s after M ms of APIC ticks …`, where the old
+`arch::ticks()` alongside `rdtsc`, so the verdict cross-checks the deferral as the TSC
+measured it against the deferral as the APIC tick measured it, in MILLISECONDS, and prints
+both figures:
+`[paygo: deferred 3620 ms TSC / 3608 ms APIC, uptime +4 s, core=7 — CONSISTENT]`.
+
+Both numbers are on the wire deliberately. `apic::ticks()` counts INTERRUPTS, so it
+undercounts by the total time IF was masked, and the EHCI bring-up busy-spins masked by
+design — over a ~19.6 s compositor-boot deferral that loss is on the order of 2.5 s. Print
+only the difference and that artefact is indistinguishable from a calibration fault; print
+both and it is a readable number a reader separates on sight. The tolerance scales for the
+same reason: `SKEW` fires past `200 ms + 5 % of the deferral`, which catches a 10 %
+`tsc_hz` error at any deferral over ~2 s while absorbing ~5 % of masked time. (The
+first draft compared whole SECONDS with a flat ±2 s window — at a 3 s deferral that needed
+~65 % miscalibration to fire, and at 19.6 s it false-fired on masked-tick loss alone.)
+
+**What the cross-check cannot see**, and it is a real limit: `tsc_hz` and the APIC timer's
+`initcnt` are both derived from the same `pm_hz`/`elapsed_pm` denominator in
+`apic::calibrate`. A bad PM-timer reference scales both identically, the two views agree,
+and the error is provably undetectable here. What `SKEW` convicts is a **differentially
+mis-armed heartbeat** — one arm mis-derived while the other is right, the shape of the
+historical ~8× `FIXED_INITCNT` bug — not a calibration oracle.
+
+A second derivation that is genuinely stuck now prints
+`:: CLOCK-X1: FROZEN — uptime still N s after M ms APIC / K ms TSC …`, where the old
 iteration cap expired into a benign `monotone (… over 50000000 spins, <1 s)` line that
 *claimed the witness passed*. That fallback line is gone; it could not be told from a fast
-boot, which is the definition of an instrument that cannot falsify.
+boot, which is the definition of an instrument that cannot falsify. The frozen deadline is
+armed on BOTH counters (3000 ms of APIC ticks **or** `tsc_hz × 3` cycles), because a
+deadline measured only by the tick cannot survive the case where the tick is dead too:
+`elapsed_ms` would stay 0 and the poll would go silent for the whole boot.
 
 **What it can no longer see, stated plainly.** The blocking form always caught the FIRST
 transition and so always reported `u1 -> u1+1`. Delivered at a service pass the advance is
 several seconds, so "the uptime jumped further than wall time" is no longer visible as a
-surprising pair of adjacent integers. The APIC cross-check above replaces that reading and
-strengthens it — but a jump *smaller* than 2 s is now inside tolerance where before it
-would have been eyeballed. Recorded deliberately.
+surprising pair of adjacent integers. The millisecond cross-check replaces that reading and
+sharpens it — but a jump inside the scaled window is now tolerated where before it would
+have been eyeballed. Recorded deliberately.
 
-**Absence is loud.** The armed line and the verdict line are a PAIR, and the armed line
-says so in its own text (`a capture with no verdict line below never reached one`). One
-`:: CLOCK-X1:` line in a capture where the machine has an invariant TSC means the boot
-never reached a service pass — the same reading, and the same cause, as a missing
-`:: BPACE:` ledger block (§5). Zero `CLOCK-X1` lines still means what it always meant: no
-invariant TSC or no calibration, the honest silent gate.
+**The two halves run on different cores.** The sample is the BSP inside step 4d; on a
+SCHED-X86 build the verdict runs in `x86_usb_pump` on the service core (core 7 on the
+bench), so every subtraction is cross-core. That is sound only because this kernel never
+writes the TSC — no `wrmsr` to `IA32_TIME_STAMP_COUNTER` (0x10) or `IA32_TSC_ADJUST`
+(0xC000_0103) exists in the tree, and the APs are offered no sync step, so they keep the
+firmware's power-on synchronisation. The invariant was true when this landed and is stated
+here because nothing else states it; the verdict carries `core=N` so a boot that breaks it
+shows a skew attributable to a named core. The APIC half needs no such argument —
+`apic::ticks()` is one global counter driven by the BSP.
+
+**Absence is loud, and it is read by WHICH line is present, not by counting.** The FTDI
+capture ring is drop-oldest, so an overflowed capture can hold the verdict without the
+armed line — counting `CLOCK-X1` lines would misread that as the failure case. The rule:
+an armed line (`… SAMPLED — second-advance DEFERRED …`) with **no verdict line anywhere
+below it** means the boot never reached a service pass, the same reading and the same cause
+as a missing `:: BPACE:` ledger block (§5). A verdict line with no armed line above it is
+ring overflow and proves the witness fired. Zero `CLOCK-X1` lines still means what it
+always meant: no invariant TSC or no calibration, the honest silent gate.
 
 **Prediction for the next metal boot:**
 
@@ -629,11 +661,24 @@ invariant TSC or no calibration, the honest silent gate.
 | `BPACE: total gui=` | boot-dependent | lower by that boot's old wait (0–1000 ms) |
 | `CLOCK-X1` lines per boot | 1 | **2** — SAMPLED at `t≈460ms`, verdict after the first `BPACE:` block |
 
+**Watched side effect, not a risk claim.** Deleting a mean-500 ms block that sat directly
+after `sched::enable()` means everything downstream of it — the `witness` ring-3 fixture
+ladder, then the EHCI bring-up — now starts up to ~1 s earlier against unchanged hardware
+timers and unchanged firmware state. Nothing in either path is known to depend on that
+delay, and none of it was ever a documented settle. It is named here so the first boot is
+read with it in mind rather than discovering it: an EHCI or ring-3 anomaly that appears on
+the first post-trim boot and on no earlier capture should be tested against this before
+anything else.
+
 The headline is not the mean saving (~500 ms) but the **variance**: `sched d=` becomes a
 constant. Falsifiers, in order: a default-build `sched d=` above 10 ms (the sample still
-blocks somewhere); a `CLOCK-X1: FROZEN` line (either the clock really is stuck or
-`CLOCK_X1_FROZEN_MS` = 3000 is too tight against a slow first service pass); a `SKEW`
-clause (TSC and APIC calibrations disagree); or an armed line with no verdict.
+blocks somewhere); a `CLOCK-X1: FROZEN` line (either the clock really is stuck or the
+3000 ms / `tsc_hz × 3` deadline is too tight against a slow first service pass); a
+`NON-MONOTONE` line (either counter went backwards, with `a`/`b`/`u1`/`u2` naming which);
+a `SKEW` clause — read the two printed millisecond figures before blaming anything, since
+the two causes are **a differentially mis-armed heartbeat** and **APIC tick loss across a
+long IF-masked phase**, and only the first is a defect; or an armed line with no verdict
+below it.
 
 **Not trimmed, and why.** The 155 ms of post-sample work on a witness build is the ring-3
 fixture ladder doing real transfers, not a wait — it is named here so the next reader does

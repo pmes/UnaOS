@@ -5920,13 +5920,27 @@ pub fn canonical_guard_selftest() {
 static CLOCK_X1_U1: AtomicU64 = AtomicU64::new(u64::MAX);
 /// `rdtsc` at the sample, for the monotonicity half of the proof.
 static CLOCK_X1_CY: AtomicU64 = AtomicU64::new(0);
-/// `arch::ticks()` (the 1 kHz local-APIC tick) at the sample. This is the SECOND, INDEPENDENT
-/// timebase the deferred form gains for free: the verdict can now cross-check the uptime advance
-/// against a counter that is not the TSC.
+/// `arch::ticks()` (the 1 kHz local-APIC tick) at the sample. This is the second timebase the
+/// deferred form gains for free: the verdict cross-checks the deferral against a counter that is
+/// not the TSC. Not an *independent* one — both are armed off the same PM-timer denominator in
+/// `apic::calibrate`, so it convicts a DIFFERENTIALLY mis-armed heartbeat, not a bad PM reference
+/// (see `CLOCK_X1_SKEW_FLOOR_MS`).
 static CLOCK_X1_MS: AtomicU64 = AtomicU64::new(0);
 /// Set once the verdict (pass, NON-MONOTONE, or FROZEN) has been printed — the poll is one atomic
-/// load per service pass forever after.
+/// load per service pass forever after. Claimed through `claim_clock_x1_verdict`, never by a bare
+/// store.
 static CLOCK_X1_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Take the right to print the one-and-only CLOCK-X1 verdict. A compare-exchange, not the
+/// check-then-set the first draft used: every x86 build alive today runs exactly one service loop,
+/// so the race cannot happen *yet* — but `bootpace::service_dump`, the function this rides in, uses
+/// `swap` on its own length for exactly this fragility, and a witness that can double-print under a
+/// future second service task is a witness that will one day be read twice.
+fn claim_clock_x1_verdict() -> bool {
+    CLOCK_X1_DONE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
 
 /// How long the deferred verdict waits for the uptime second to advance before calling the clock
 /// FROZEN. The advance is owed within 1000 ms by construction; 3000 ms is three times the debt, so
@@ -5934,13 +5948,44 @@ static CLOCK_X1_DONE: AtomicBool = AtomicBool::new(false);
 /// still fires within one service pass of a genuinely frozen counter. Under a `tsc_hz` calibrated
 /// far too HIGH the uptime would crawl and this deadline would trip — that is a real defect the
 /// blocking form used to hide behind its benign "<1 s" fallback line, and it is now loud.
+///
+/// The poll applies the SAME 3-second budget to the TSC (`b - a >= tsc_hz * 3`) as a backstop, so
+/// the deadline does not depend on the health of the APIC tick alone. Without it, a boot where both
+/// timebases are dead leaves `elapsed_ms` pinned at 0 and the poll silent forever — the deadline
+/// measured by a counter whose death it exists to report.
 const CLOCK_X1_FROZEN_MS: u64 = 3000;
 
-/// Tolerance, in seconds, on the cross-check between the uptime advance (TSC-derived) and the
-/// elapsed APIC ticks. Two counters truncating to whole seconds can disagree by 1 s from truncation
-/// alone; the second second of slack covers tick loss across a long masked phase (the USB
-/// enumeration block runs with interrupts on, but the budget is not free of coalescing under QEMU).
-const CLOCK_X1_SKEW_S: u64 = 2;
+// ── The TSC-vs-APIC cross-check, and exactly what it can convict ───────────────────────────────
+//
+// The verdict compares the TSC's millisecond view of the deferral against the APIC tick's. The
+// first draft compared WHOLE SECONDS with a flat ±2 s tolerance, which was wrong in both
+// directions and could not fire usefully at either end:
+//
+//   * too COARSE to convict. Measured deferrals run 2192–3620 ms on a default build and ~19.6 s on
+//     a compositor boot. At 3 s, a flat 2 s window means `tsc_hz` must be off by ~65 % before the
+//     check notices; a 10 % calibration error — the size that actually breaks an RTO or a settle —
+//     is invisible.
+//   * too TIGHT to be trusted over a long deferral. `apic::ticks()` counts INTERRUPTS, so it
+//     undercounts by the total time IF was masked, and the EHCI bring-up busy-spins masked by
+//     design. At a ~19.6 s deferral the loss is on the order of 2.5 s, which the old rule reported
+//     as SKEW — and §8e would then have blamed the calibration for a masked-tick artefact.
+//
+// Comparing in MILLISECONDS with a tolerance that scales fixes both: `FLOOR` covers the fixed
+// costs (whole-second truncation on `uptime`, the sample-to-sample serial print, one tick of
+// quantisation), and the `/DIV` term grows the window with the deferral so accumulated masked-tick
+// loss stays inside it. 200 ms + 5 % catches a 10 % `tsc_hz` error at any deferral over ~2 s while
+// tolerating ~5 % of masked time — comfortably above the ~2.5 s measured over 19.6 s.
+//
+// WHAT IT CANNOT SEE, and this is a real limit: `tsc_hz` and the APIC timer's `initcnt` are BOTH
+// derived from the same `pm_hz`/`elapsed_pm` denominator in `apic::calibrate`. A bad PM-timer
+// reference scales both by the identical factor, the two views stay in agreement, and the error is
+// provably undetectable here. What this check convicts is a DIFFERENTIAL error — one of the two
+// arms mis-derived while the other is right, the shape of the historical ~8× `FIXED_INITCNT`
+// heartbeat bug. It is a differentially-mis-armed-heartbeat detector, not a calibration oracle.
+/// Fixed part of the skew window, in milliseconds.
+const CLOCK_X1_SKEW_FLOOR_MS: u64 = 200;
+/// Divisor for the proportional part: `elapsed_ms / DIV` = 5 % of the deferral.
+const CLOCK_X1_SKEW_DIV: u64 = 20;
 
 /// CLOCK-X1 (M3) — SAMPLE half: an UNCOUNTED serial witness (`== witness ::`, not a `-> PASS` line,
 /// so it never shifts a fixture COUNT) proving the x86 wall-clock timebase is live. It is SILENT
@@ -6000,25 +6045,34 @@ pub fn clock_x1_witness() {
 /// `x86_usb_pump` task — all three call it, ungated, which is why this site works on the media
 /// build that actually reaches the bench). Costs one relaxed load per pass once it has spoken.
 ///
+/// **The two halves run on different CPUs, and every subtraction here is cross-core.** The sample
+/// is taken on the BSP inside step 4d; on a SCHED-X86 build this verdict runs in `x86_usb_pump`,
+/// pinned to the service core (core 7 on the bench). Subtracting `a` from a `rdtsc` read on another
+/// core is only meaningful because this kernel NEVER writes the TSC — there is no `wrmsr` to
+/// `IA32_TIME_STAMP_COUNTER` (0x10) or `IA32_TSC_ADJUST` (0xC000_0103) anywhere in the tree, and the
+/// APs are never offered a TSC sync step — so the firmware's power-on synchronisation across the
+/// package is what the APs inherit and keep. The verdict prints `core=N` so a future boot that
+/// breaks that invariant shows a skew attributable to a named core rather than to the clock. The
+/// APIC-tick half needs no such argument: `apic::ticks()` is one global counter driven by the BSP.
+///
 /// It prints exactly one of three lines, then never speaks again:
 ///
 ///   * the PASS verdict — byte-identical to the pre-GR18 text up to `advances)`, so every doc
 ///     example and every human matcher still reads it, with a `[paygo: …]` clause appended that
 ///     names the deferral and the cross-check;
-///   * `NON-MONOTONE rdtsc` — a backwards TSC, unchanged in meaning;
-///   * `FROZEN` — the uptime second never advanced across `CLOCK_X1_FROZEN_MS` of APIC ticks. This
-///     is NEW: the blocking form's iteration cap expired into a benign "<1 s" fallback line that
-///     claimed the witness had passed, so a genuinely frozen second derivation could not be told
-///     from a fast boot. Deferring makes the two distinguishable, because "still the same second"
-///     three seconds later has only one explanation.
+///   * `NON-MONOTONE` — the TSC or the derived uptime went BACKWARDS. This branch is tested BEFORE
+///     the frozen branch: as first written it sat behind `u2 <= u1`, which excludes it, so a
+///     backwards TSC printed `FROZEN — uptime still {u1}` and the regression was hidden behind a
+///     stale number. It now carries `a`, `b`, `u1` and `u2` so the direction is unambiguous;
+///   * `FROZEN` — the uptime second never advanced. This is NEW: the blocking form's iteration cap
+///     expired into a benign "<1 s" fallback line that claimed the witness had PASSED, so a
+///     genuinely frozen second derivation could not be told from a fast boot.
 ///
 /// What the deferred form can no longer see, stated plainly: the blocking form observed the FIRST
 /// second transition, so it always reported `u1 -> u1+1`. Delivered at a service pass the advance
 /// may be several seconds, and an uptime that jumped FURTHER than wall time would once have shown
-/// up only as a surprising pair of numbers a reader had to notice. That loss is more than repaid:
-/// the elapsed APIC tick count is captured alongside the sample, so the verdict now asserts the
-/// advance against an INDEPENDENT timebase and says `CONSISTENT` or `SKEW` out loud — a runaway or
-/// crawling TSC is convicted here, which the blocking form could not do at all.
+/// up only as a surprising pair of numbers a reader had to notice. That loss is repaid by the
+/// millisecond cross-check below.
 pub fn clock_x1_poll() {
     if CLOCK_X1_DONE.load(Ordering::Relaxed) {
         return;
@@ -6034,41 +6088,65 @@ pub fn clock_x1_poll() {
     let a = CLOCK_X1_CY.load(Ordering::Relaxed);
     let b = crate::arch::now_cycles();
     let elapsed_ms = crate::arch::ticks().wrapping_sub(CLOCK_X1_MS.load(Ordering::Relaxed));
+    let hz = crate::arch::apic::tsc_hz();
+    // The TSC's own view of the deferral, in milliseconds. This is the quantity the cross-check
+    // compares — NOT a whole-second count, which is far too coarse to convict (a 10 % `tsc_hz`
+    // error moves a 3-second deferral by 300 ms and rounds away entirely).
+    let tsc_ms = if hz >= 1000 {
+        b.wrapping_sub(a) / (hz / 1000)
+    } else {
+        0
+    };
+    // Cheap and safe here: this is a service-loop context with GS live on every online CPU.
+    let core = crate::arch::percpu::this_cpu().cpu_index;
 
-    if u2 <= u1 {
-        if elapsed_ms >= CLOCK_X1_FROZEN_MS {
-            CLOCK_X1_DONE.store(true, Ordering::Relaxed);
+    // BACKWARDS first. Either counter running backwards is a monotonicity break, and it must be
+    // tested ahead of the frozen branch — `u2 <= u1` swallows `u2 < u1`, and the frozen line
+    // reports `u1`, which would print the PRE-regression second and hide the fault.
+    if u2 < u1 || b < a {
+        if claim_clock_x1_verdict() {
             serial_println!(
-                ":: CLOCK-X1: FROZEN — uptime still {} s after {} ms of APIC ticks (rdtsc +{}); the JD17 second derivation does NOT advance == witness ::",
-                u1,
-                elapsed_ms,
-                b.wrapping_sub(a)
+                ":: CLOCK-X1: NON-MONOTONE — rdtsc {} -> {}, uptime {} -> {} s (core={}); the clock's monotonicity contract is broken == witness ::",
+                a, b, u1, u2, core
             );
+        }
+        return;
+    }
+
+    if u2 == u1 {
+        // Frozen only once BOTH deadlines are past. The APIC deadline alone cannot survive the case
+        // it most needs to: if the tick is dead too, `elapsed_ms` stays 0 forever and this poll goes
+        // silent for the whole boot — the deadline would be measured by one of the counters whose
+        // death it exists to report. The TSC deadline is the independent backstop, and both figures
+        // are printed so "the APIC is dead as well" is legible rather than inferred.
+        if elapsed_ms >= CLOCK_X1_FROZEN_MS || (hz != 0 && b.wrapping_sub(a) >= hz * 3) {
+            if claim_clock_x1_verdict() {
+                serial_println!(
+                    ":: CLOCK-X1: FROZEN — uptime still {} s after {} ms APIC / {} ms TSC (rdtsc +{}, core={}); the JD17 second derivation does NOT advance == witness ::",
+                    u1, elapsed_ms, tsc_ms, b.wrapping_sub(a), core
+                );
+            }
         }
         return; // still inside the sampled second — say nothing, spend nothing, look again next pass
     }
 
-    CLOCK_X1_DONE.store(true, Ordering::Relaxed);
-
-    if b < a {
-        // A backwards rdtsc would break the clock's monotonicity contract — surface it (uncounted).
-        serial_println!(":: CLOCK-X1: NON-MONOTONE rdtsc {} -> {} == witness ::", a, b);
+    if !claim_clock_x1_verdict() {
         return;
     }
 
-    // Cross-check the TSC-derived advance against the APIC tick, the independent timebase.
-    let advanced = u2 - u1;
-    let apic_s = elapsed_ms / 1000;
-    let skew = advanced.abs_diff(apic_s) > CLOCK_X1_SKEW_S;
+    // Cross-check the TSC's millisecond view of the deferral against the APIC tick's. See
+    // `CLOCK_X1_SKEW_*` for what this can and cannot convict, and why the tolerance scales.
+    let skew = tsc_ms.abs_diff(elapsed_ms) > CLOCK_X1_SKEW_FLOOR_MS + elapsed_ms / CLOCK_X1_SKEW_DIV;
     serial_println!(
-        ":: CLOCK-X1: TSC invariant, ~{} MHz; monotone (rdtsc +{}); uptime {}->{} s (JD17 x86-frozen clock now advances) [paygo: deferred {} ms, +{} s uptime vs +{} ms APIC — {}] == witness ::",
-        crate::arch::apic::tsc_hz() / 1_000_000,
+        ":: CLOCK-X1: TSC invariant, ~{} MHz; monotone (rdtsc +{}); uptime {}->{} s (JD17 x86-frozen clock now advances) [paygo: deferred {} ms TSC / {} ms APIC, uptime +{} s, core={} — {}] == witness ::",
+        hz / 1_000_000,
         b.wrapping_sub(a),
         u1,
         u2,
+        tsc_ms,
         elapsed_ms,
-        advanced,
-        elapsed_ms,
+        u2 - u1,
+        core,
         if skew { "SKEW" } else { "CONSISTENT" }
     );
 }
