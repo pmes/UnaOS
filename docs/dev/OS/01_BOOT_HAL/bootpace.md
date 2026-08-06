@@ -106,7 +106,7 @@ strings unaos/target/x86_64_esp/kernel.elf | grep -c 'BPACE'      # must be >= 1
 | `acpi` | after `acpi::init` + `dmar_report` + `pm_timer_report` (x86) | the whole ACPI discovery phase |
 | `calib` | after `apic::calibrate` (x86) | the TSC/APIC calibration alone |
 | `smp` | after `smp::start_aps` (x86) | AP bring-up + the post-bring-up smoke test |
-| `sched` | after the step-4d scheduler block (x86) | `sched::init` + `enable` + the CLOCK-X1 witness (+ the `witness` ring-3 fixtures, when built) |
+| `sched` | after the step-4d scheduler block (x86) | `sched::init` + `enable` + the CLOCK-X1 witness **sample** (the verdict is deferred to the first service pass — §8e) (+ the `witness` ring-3 fixtures, when built) |
 | `pci-enter` | first statement of `arch::pci::init` (x86) | step 4e — `apic::report_tick_rate`, a 50 ms PM-timer window |
 | `ehci-hid` | before `drivers::ehci::init` | the knob-gated VPERF / EHCI-scout / SMC probes (all absent by default ⇒ ~0) |
 | `ehci-hid-done` | after `drivers::ehci::init` | the whole EHCI-3 HID bring-up: 256-bus config walk, wake, port reset, EP0 enumeration — subdivided by the EPACE lines (below), not by more ring stamps |
@@ -480,15 +480,101 @@ The entire `sched` delta is one witness that waits on a 1 Hz edge:
              uptime 15->16 s (JD17 x86-frozen clock now advances) == witness ::
 ```
 
-boot 7 L7990 → L7991, **796 ms**; boot 8 L10106 → L10107, **910 ms**; boot 3 (default,
-witness on) L2900 → L2901, **979 ms**. The witness-OFF boots (2 and 4) have no such gap
-and read `sched d=17ms`. CLOCK-X1 asserts that the uptime *seconds* counter advances, so
-it blocks for whatever is left of the current second — mean 500 ms, worst 1000 ms, and
-the boot pays it at the one moment nothing else is in flight. It is the same shape §10h
-solved for the video battery: the assertion is sound, the *placement* is the cost. The
-pay-as-you-go form — sample `uptime` here, assert the advance at the next witness
-boundary that is already ≥1 s later — costs zero and proves the same thing. Named, not
-taken, in this arc: it is one line in the clock witness, not in the EHCI lane.
+boot 7 L7990 → L7991, **796 ms**; boot 8 L10106 → L10107, **910 ms**. CLOCK-X1 asserts
+that the uptime *seconds* counter advances, so it blocks for whatever is left of the
+current second — mean 500 ms, worst 1000 ms, and the boot pays it at the one moment
+nothing else is in flight. It is the same shape §10h solved for the video battery: the
+assertion is sound, the *placement* is the cost. Named, not taken, in this arc: it is one
+line in the clock witness, not in the EHCI lane. **§8e takes it, and corrects the
+attribution above** — the delta is not a witness-build cost at all.
+
+### 8e. `sched` was never a witness cost — it was a coin flip against the 1 Hz edge (GR18)
+
+§8d read the `sched` delta off boots 7 and 8 and filed it under "witness-armed". That
+attribution is wrong, and the capture says so on one line: **boot 3 is a witness-OFF
+build and it paid 979 ms.** `clock_x1_witness()` has no `#[cfg]` on it — it is called
+unconditionally from the step-4d block in `main.rs`, on every x86 build, which is why all
+eight boots of `rmbp-gr16-s73/ttyUSB0.log` print a `CLOCK-X1` line. What varies is not the
+feature set. It is the *phase*.
+
+`clock::uptime_secs()` is `rdtsc / tsc_hz`, and on x86 the TSC counts from CPU reset, not
+from our entry — hence `uptime 14..24 s` on a boot whose own `t=` is under half a second:
+the reading is dominated by the firmware's POST. The old witness spun until it saw that
+whole-second value change, so its cost was `1000 − (uptime_ms mod 1000)` at the moment
+step 4d reached it: a uniform draw over the second, with a phase nobody can predict or
+control. Eight boots, the gap from the line before `CLOCK-X1` to `CLOCK-X1` itself:
+
+| boot | build | preceding line | `CLOCK-X1` | **wait** | uptime | `sched d=` |
+|---|---|---|---|---|---|---|
+| 2 | default | L1809 `t=456ms` | L1810 `t=474ms` | **18 ms** | 14→15 | 17 |
+| 4 | default | L3616 `t=456ms` | L3617 `t=483ms` | **27 ms** | 14→15 | 26 |
+| 5 | witness | L4737 `t=414ms` | L4738 `t=519ms` | **105 ms** | 14→15 | 260 |
+| 1 | witness | L66 `t=414ms` | L67 `t=904ms` | **490 ms** | 16→17 | 646 |
+| 6 | witness | L6353 `t=414ms` | L6354 `t=1021ms` | **607 ms** | 16→17 | 763 |
+| 7 | witness | L7990 `t=414ms` | L7991 `t=1210ms` | **796 ms** | 15→16 | 951 |
+| 8 | witness | L10106 `t=414ms` | L10107 `t=1324ms` | **910 ms** | 23→24 | 1066 |
+| 3 | **default** | L2900 `t=457ms` | L2901 `t=1436ms` | **979 ms** | 15→16 | **979** |
+
+Sorted by wait, the builds interleave completely — the witness-off boots hold both the
+minimum (18 ms) and the maximum (979 ms). `sched d=` decomposes exactly, on every row, as
+**wait + post**, where post is 155–156 ms on all five witness boots (the ring-3 fixture
+ladder that follows: LOGWIT-1, SNTP-X86-GATE, DNS-X86-GATE, U1a, U2-0a) and **0 ms** on all
+three default boots. Boots 2 and 4 did not "skip" anything; they arrived 18 and 27 ms
+before an edge and got the whole assertion for nearly free. That is luck, not a build
+difference, and it is exactly what makes the cost intolerable: it is unbudgetable.
+
+**The trim.** `clock_x1_witness()` now SAMPLES (`uptime`, `rdtsc`, and the 1 kHz APIC tick)
+and returns; `clock_x1_poll()` delivers the verdict from `bootpace::service_dump()` — the
+one call all three x86 service loops make ungated (BSP GUI, `usbdebug`, SCHED-X86
+`x86_usb_pump`), so it reaches the `./arroyo esp-x86` media build that actually boots on
+the bench. The first service pass is seconds past the edge on every build, so the advance
+is observed with zero waiting. No knob: the witness is not optional, it is paid later.
+
+**What the deferred form proves that the blocking form could not.** The sample captures
+`arch::ticks()` alongside `rdtsc`, so the verdict cross-checks the TSC-derived uptime
+advance against an **independent** timebase and says so on the wire:
+`[paygo: deferred 5312 ms, +5 s uptime vs +5312 ms APIC — CONSISTENT]`. A `SKEW` there
+(disagreement over `CLOCK_X1_SKEW_S` = 2 s, which covers whole-second truncation on both
+counters plus tick coalescing) convicts a mis-calibrated `tsc_hz` — something the blocking
+form had no second clock to notice. And a second derivation that is genuinely stuck now
+prints `:: CLOCK-X1: FROZEN — uptime still N s after M ms of APIC ticks …`, where the old
+iteration cap expired into a benign `monotone (… over 50000000 spins, <1 s)` line that
+*claimed the witness passed*. That fallback line is gone; it could not be told from a fast
+boot, which is the definition of an instrument that cannot falsify.
+
+**What it can no longer see, stated plainly.** The blocking form always caught the FIRST
+transition and so always reported `u1 -> u1+1`. Delivered at a service pass the advance is
+several seconds, so "the uptime jumped further than wall time" is no longer visible as a
+surprising pair of adjacent integers. The APIC cross-check above replaces that reading and
+strengthens it — but a jump *smaller* than 2 s is now inside tolerance where before it
+would have been eyeballed. Recorded deliberately.
+
+**Absence is loud.** The armed line and the verdict line are a PAIR, and the armed line
+says so in its own text (`a capture with no verdict line below never reached one`). One
+`:: CLOCK-X1:` line in a capture where the machine has an invariant TSC means the boot
+never reached a service pass — the same reading, and the same cause, as a missing
+`:: BPACE:` ledger block (§5). Zero `CLOCK-X1` lines still means what it always meant: no
+invariant TSC or no calibration, the honest silent gate.
+
+**Prediction for the next metal boot:**
+
+| reading | before | predicted after |
+|---|---|---|
+| `BPACE: sched d=`, default build | 17 / 26 / **979** ms | **0–3 ms, on every boot** |
+| `BPACE: sched d=`, witness build | 260 / 646 / 763 / 951 / 1066 ms | **155–160 ms, on every boot** |
+| `BPACE: total gui=` | boot-dependent | lower by that boot's old wait (0–1000 ms) |
+| `CLOCK-X1` lines per boot | 1 | **2** — SAMPLED at `t≈460ms`, verdict after the first `BPACE:` block |
+
+The headline is not the mean saving (~500 ms) but the **variance**: `sched d=` becomes a
+constant. Falsifiers, in order: a default-build `sched d=` above 10 ms (the sample still
+blocks somewhere); a `CLOCK-X1: FROZEN` line (either the clock really is stuck or
+`CLOCK_X1_FROZEN_MS` = 3000 is too tight against a slow first service pass); a `SKEW`
+clause (TSC and APIC calibrations disagree); or an armed line with no verdict.
+
+**Not trimmed, and why.** The 155 ms of post-sample work on a witness build is the ring-3
+fixture ladder doing real transfers, not a wait — it is named here so the next reader does
+not mistake the residual for more edge-blocking. The ~0 ms default floor is
+`sched::init` + `sched::enable` + one serial line, and there is nothing left in it.
 
 ## 9. GPACE — the inside of `pci-usb` (GR13)
 

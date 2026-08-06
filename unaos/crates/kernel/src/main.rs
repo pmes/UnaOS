@@ -719,8 +719,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             unaos_kernel::arch::syscall::canonical_guard_selftest();
         }
 
-        // CLOCK-X1 (M3): the x86 wall-clock timebase witness. Runs after `apic::calibrate` (step
-        // 4b''') so the invariant TSC is calibrated; silent if this machine has no invariant TSC.
+        // CLOCK-X1 (M3): the x86 wall-clock timebase witness — the SAMPLE half. Runs after
+        // `apic::calibrate` (step 4b''') so the invariant TSC is calibrated; silent if this machine
+        // has no invariant TSC. GR18 made it pay-as-you-go: it used to block here until it saw the
+        // uptime second advance, which cost a uniform draw over the 1 Hz edge (18–976 ms measured
+        // across eight metal boots) and WAS the whole `BPACE: sched d=` delta. It now samples and
+        // returns; the verdict is delivered by `clock_x1_poll()` from the first service pass, which
+        // is already seconds past the edge. See bootpace.md §8e.
         unaos_kernel::arch::syscall::clock_x1_witness();
 
         // LOGWIT-1 (witness + logts): the CLOCK-2b tap prefix's own fixture. Every other timestamped

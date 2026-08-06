@@ -320,6 +320,16 @@ static LAST_DUMPED_LEN: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// (`./arroyo esp-x86`) carries neither `witness` nor `usbdebug`, and a ledger that only exists in
 /// the builds nobody boots on hardware is not an instrument.
 pub fn service_dump() {
+    // CLOCK-X1 pay-as-you-go (GR18): deliver the deferred clock verdict. It rides HERE rather than
+    // at any of the three service-loop bodies because this function is the one call all three make
+    // ungated — the BSP GUI loop, the `usbdebug` loop and the SCHED-X86 `x86_usb_pump` task — so the
+    // witness reaches the media build that boots on the bench, which is the whole reason this
+    // ledger is ungated in the first place. One relaxed load per pass once the verdict has printed;
+    // the early-return below must NOT precede it, since the ledger stops growing long before the
+    // boot ends and the verdict would then never be delivered on a quiet boot.
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::syscall::clock_x1_poll();
+
     let mut buf = [(0u64, ""); CAP];
     let n = snapshot(&mut buf);
     if LAST_DUMPED_LEN.swap(n, Ordering::AcqRel) == n {

@@ -5908,40 +5908,147 @@ pub fn canonical_guard_selftest() {
     }
 }
 
-/// CLOCK-X1 (M3): a bounded, UNCOUNTED serial witness (`== witness ::`, not a `-> PASS` line, so it
-/// never shifts a fixture COUNT) proving the x86 wall-clock timebase is live. It is SILENT where the
-/// TSC path is honestly frozen — no invariant TSC or no calibration (`clock::uptime_secs()` is
-/// `None`) — so a machine without an invariant TSC prints nothing rather than a spurious verdict.
-/// When live it proves: (1) `monotonic()` returns `Some` (uptime is `Some`, freq nonzero);
-/// (2) two `rdtsc` reads are monotone and advancing (second ≥ first, and strictly greater across a
-/// bounded spin); (3) the wall-SECOND derivation `now()` uses to extend a seed advances — the exact
-/// mechanism JD17 documented as FROZEN on x86 — observed directly as `uptime` crossing a second
-/// within a bounded budget, or, if the run is too fast to cross one, reported as the raw cycle
-/// advance with the current uptime (the brief's tick-monotonicity + nonzero-freq fallback). It never
-/// seeds the global clock, so it leaves the operator's UNSET state untouched.
+// ── CLOCK-X1 pay-as-you-go state (GR18) ────────────────────────────────────────────────────────
+//
+// The witness is split across two moments: `clock_x1_witness()` SAMPLES at the step-4d scheduler
+// site (cheap, non-blocking) and `clock_x1_poll()` DELIVERS the verdict from the first service pass,
+// which is already seconds later. These four cells carry the sample between them. `u64::MAX` in
+// `CLOCK_X1_U1` is the disarmed sentinel — the witness never fires on a machine whose TSC path is
+// honestly frozen, and `uptime_secs()` can never legitimately read `u64::MAX` (it is
+// `rdtsc / tsc_hz`, and a 64-bit TSC at any real frequency cannot reach that in the life of the
+// machine), so the sentinel cannot be forged by a live clock.
+static CLOCK_X1_U1: AtomicU64 = AtomicU64::new(u64::MAX);
+/// `rdtsc` at the sample, for the monotonicity half of the proof.
+static CLOCK_X1_CY: AtomicU64 = AtomicU64::new(0);
+/// `arch::ticks()` (the 1 kHz local-APIC tick) at the sample. This is the SECOND, INDEPENDENT
+/// timebase the deferred form gains for free: the verdict can now cross-check the uptime advance
+/// against a counter that is not the TSC.
+static CLOCK_X1_MS: AtomicU64 = AtomicU64::new(0);
+/// Set once the verdict (pass, NON-MONOTONE, or FROZEN) has been printed — the poll is one atomic
+/// load per service pass forever after.
+static CLOCK_X1_DONE: AtomicBool = AtomicBool::new(false);
+
+/// How long the deferred verdict waits for the uptime second to advance before calling the clock
+/// FROZEN. The advance is owed within 1000 ms by construction; 3000 ms is three times the debt, so
+/// the deadline cannot fire on a healthy machine no matter how the sample straddles the edge, and
+/// still fires within one service pass of a genuinely frozen counter. Under a `tsc_hz` calibrated
+/// far too HIGH the uptime would crawl and this deadline would trip — that is a real defect the
+/// blocking form used to hide behind its benign "<1 s" fallback line, and it is now loud.
+const CLOCK_X1_FROZEN_MS: u64 = 3000;
+
+/// Tolerance, in seconds, on the cross-check between the uptime advance (TSC-derived) and the
+/// elapsed APIC ticks. Two counters truncating to whole seconds can disagree by 1 s from truncation
+/// alone; the second second of slack covers tick loss across a long masked phase (the USB
+/// enumeration block runs with interrupts on, but the budget is not free of coalescing under QEMU).
+const CLOCK_X1_SKEW_S: u64 = 2;
+
+/// CLOCK-X1 (M3) — SAMPLE half: an UNCOUNTED serial witness (`== witness ::`, not a `-> PASS` line,
+/// so it never shifts a fixture COUNT) proving the x86 wall-clock timebase is live. It is SILENT
+/// where the TSC path is honestly frozen — no invariant TSC or no calibration
+/// (`clock::uptime_secs()` is `None`) — so a machine without an invariant TSC prints nothing rather
+/// than a spurious verdict, and `clock_x1_poll()` stays disarmed for the whole boot.
+///
+/// The witness proves, across its two halves: (1) `monotonic()` returns `Some` (uptime is `Some`,
+/// freq nonzero) — HERE; (2) two `rdtsc` reads are monotone and advancing; (3) the wall-SECOND
+/// derivation `now()` uses to extend a seed advances — the exact mechanism JD17 documented as
+/// FROZEN on x86. (2) and (3) are delivered by `clock_x1_poll()`. It never seeds the global clock,
+/// so it leaves the operator's UNSET state untouched.
+///
+/// ── Why this half does not wait (GR18 pay-as-you-go) ───────────────────────────────────────────
+/// Until GR18 this function SPUN here until it saw `uptime` cross a whole second. The assertion was
+/// sound; the placement was the cost. `uptime_secs()` is `rdtsc / tsc_hz` and on x86 the TSC counts
+/// from CPU reset, so the phase of the next second edge relative to this call site is set by the
+/// firmware's POST duration — arbitrary, and unknowable to us. Eight metal boots
+/// (`rmbp-gr16-s73/ttyUSB0.log`) measured the wait as 18, 27, 105, 490, 607, 796, 910 and 976 ms:
+/// a uniform draw over the second, mean ~500 ms, worst ~1000 ms, paid at the one moment in boot
+/// when nothing else is in flight. It was the entire `BPACE: sched d=` delta (17 ms on the two
+/// lucky boots, 951–1066 ms on the unlucky ones — see bootpace.md §8d/§8e).
+///
+/// The pay-as-you-go form is §10h's shape applied to the clock: sample now, assert the advance at a
+/// checkpoint that is ALREADY past the edge. The first service pass is such a checkpoint on every
+/// x86 build — the earliest one is seconds after this line even on the leanest boot — so the wait
+/// costs zero and the same fact is proven. It is not a knob: nothing is optional here, the witness
+/// is simply paid later.
 pub fn clock_x1_witness() {
     // Frozen path: no invariant/calibrated TSC. `uptime_secs()` is `None` exactly when
-    // `clock::monotonic()` is `None`, so this is the honest silent gate.
+    // `clock::monotonic()` is `None`, so this is the honest silent gate — and it leaves the
+    // deferred half disarmed, which is why a machine with no invariant TSC prints NEITHER line.
     let u1 = match crate::clock::uptime_secs() {
         Some(u) => u,
         None => return,
     };
     let mhz = crate::arch::apic::tsc_hz() / 1_000_000;
 
-    // Monotone + advancing: two rdtsc reads across a bounded spin. The spin is a fixed iteration
-    // cap (not a wall-clock wait), so it can never hang the serial-less boot.
-    let a = crate::arch::now_cycles();
-    let mut spins = 0u64;
-    // Spin until either a wall second elapses (uptime advances) or a bounded iteration cap is hit,
-    // whichever comes first — deterministic and hang-proof under QEMU/TCG.
-    let mut u2 = u1;
-    while u2 == u1 && spins < 50_000_000 {
-        core::hint::spin_loop();
-        spins += 1;
-        u2 = crate::clock::uptime_secs().unwrap_or(u1);
+    CLOCK_X1_CY.store(crate::arch::now_cycles(), Ordering::Relaxed);
+    CLOCK_X1_MS.store(crate::arch::ticks(), Ordering::Relaxed);
+    // Arm LAST: `clock_x1_poll` reads this cell first, so publishing it after the other two (with
+    // Release/Acquire) means a poll that sees the sample sees all of it.
+    CLOCK_X1_U1.store(u1, Ordering::Release);
+
+    // The armed line and the verdict line are a PAIR. A capture holding this line with no second
+    // `:: CLOCK-X1:` line is a boot that never reached a service pass — the same reading as a
+    // missing `:: BPACE:` ledger block, and it is stated here so the absence is legible rather than
+    // silent (bootpace.md §8e).
+    serial_println!(
+        ":: CLOCK-X1: TSC invariant, ~{} MHz; uptime {} s SAMPLED — second-advance DEFERRED to the first service pass (pay-as-you-go; a capture with no verdict line below never reached one) == witness ::",
+        mhz, u1
+    );
+}
+
+/// CLOCK-X1 — VERDICT half. Called from `bootpace::service_dump()`, i.e. once per pass of whichever
+/// service loop this x86 build runs (the BSP GUI loop, the `usbdebug` loop, or the SCHED-X86
+/// `x86_usb_pump` task — all three call it, ungated, which is why this site works on the media
+/// build that actually reaches the bench). Costs one relaxed load per pass once it has spoken.
+///
+/// It prints exactly one of three lines, then never speaks again:
+///
+///   * the PASS verdict — byte-identical to the pre-GR18 text up to `advances)`, so every doc
+///     example and every human matcher still reads it, with a `[paygo: …]` clause appended that
+///     names the deferral and the cross-check;
+///   * `NON-MONOTONE rdtsc` — a backwards TSC, unchanged in meaning;
+///   * `FROZEN` — the uptime second never advanced across `CLOCK_X1_FROZEN_MS` of APIC ticks. This
+///     is NEW: the blocking form's iteration cap expired into a benign "<1 s" fallback line that
+///     claimed the witness had passed, so a genuinely frozen second derivation could not be told
+///     from a fast boot. Deferring makes the two distinguishable, because "still the same second"
+///     three seconds later has only one explanation.
+///
+/// What the deferred form can no longer see, stated plainly: the blocking form observed the FIRST
+/// second transition, so it always reported `u1 -> u1+1`. Delivered at a service pass the advance
+/// may be several seconds, and an uptime that jumped FURTHER than wall time would once have shown
+/// up only as a surprising pair of numbers a reader had to notice. That loss is more than repaid:
+/// the elapsed APIC tick count is captured alongside the sample, so the verdict now asserts the
+/// advance against an INDEPENDENT timebase and says `CONSISTENT` or `SKEW` out loud — a runaway or
+/// crawling TSC is convicted here, which the blocking form could not do at all.
+pub fn clock_x1_poll() {
+    if CLOCK_X1_DONE.load(Ordering::Relaxed) {
+        return;
     }
+    let u1 = CLOCK_X1_U1.load(Ordering::Acquire);
+    if u1 == u64::MAX {
+        return; // never armed: no invariant/calibrated TSC on this machine
+    }
+    let u2 = match crate::clock::uptime_secs() {
+        Some(u) => u,
+        None => u1, // cannot happen once armed (the gate is the same `monotonic()`); treat as frozen
+    };
+    let a = CLOCK_X1_CY.load(Ordering::Relaxed);
     let b = crate::arch::now_cycles();
-    let delta = b.wrapping_sub(a);
+    let elapsed_ms = crate::arch::ticks().wrapping_sub(CLOCK_X1_MS.load(Ordering::Relaxed));
+
+    if u2 <= u1 {
+        if elapsed_ms >= CLOCK_X1_FROZEN_MS {
+            CLOCK_X1_DONE.store(true, Ordering::Relaxed);
+            serial_println!(
+                ":: CLOCK-X1: FROZEN — uptime still {} s after {} ms of APIC ticks (rdtsc +{}); the JD17 second derivation does NOT advance == witness ::",
+                u1,
+                elapsed_ms,
+                b.wrapping_sub(a)
+            );
+        }
+        return; // still inside the sampled second — say nothing, spend nothing, look again next pass
+    }
+
+    CLOCK_X1_DONE.store(true, Ordering::Relaxed);
 
     if b < a {
         // A backwards rdtsc would break the clock's monotonicity contract — surface it (uncounted).
@@ -5949,19 +6056,21 @@ pub fn clock_x1_witness() {
         return;
     }
 
-    if u2 > u1 {
-        serial_println!(
-            ":: CLOCK-X1: TSC invariant, ~{} MHz; monotone (rdtsc +{}); uptime {}->{} s (JD17 x86-frozen clock now advances) == witness ::",
-            mhz, delta, u1, u2
-        );
-    } else {
-        // Too fast to cross a wall second within the cap: fall back to tick-monotonicity + nonzero
-        // freq (the brief's blessed fallback). A nonzero `delta` proves the counter advanced.
-        serial_println!(
-            ":: CLOCK-X1: TSC invariant, ~{} MHz; monotone (rdtsc +{} over {} spins, <1 s); uptime {} s == witness ::",
-            mhz, delta, spins, u1
-        );
-    }
+    // Cross-check the TSC-derived advance against the APIC tick, the independent timebase.
+    let advanced = u2 - u1;
+    let apic_s = elapsed_ms / 1000;
+    let skew = advanced.abs_diff(apic_s) > CLOCK_X1_SKEW_S;
+    serial_println!(
+        ":: CLOCK-X1: TSC invariant, ~{} MHz; monotone (rdtsc +{}); uptime {}->{} s (JD17 x86-frozen clock now advances) [paygo: deferred {} ms, +{} s uptime vs +{} ms APIC — {}] == witness ::",
+        crate::arch::apic::tsc_hz() / 1_000_000,
+        b.wrapping_sub(a),
+        u1,
+        u2,
+        elapsed_ms,
+        advanced,
+        elapsed_ms,
+        if skew { "SKEW" } else { "CONSISTENT" }
+    );
 }
 
 /// U2 Part-0a verdict (BSP-quiet, mirrors `await_verdict`): wait until the TF+SYSCALL fixture has
