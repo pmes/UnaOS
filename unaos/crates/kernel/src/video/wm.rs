@@ -2957,18 +2957,18 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         // has deliberately declined to abort on.
         #[cfg(target_arch = "x86_64")]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} stable={} -> FAIL",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> FAIL",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum,
             first.0, first.1, first.2, first.3,
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
-            seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active, yn(stable)
+            seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active
         );
         #[cfg(not(target_arch = "x86_64"))]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum,
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum,
             first.0, first.1, first.2, first.3
         );
     }
@@ -3278,9 +3278,15 @@ static VERIFIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::
 #[cfg(all(feature = "witness", target_arch = "x86_64"))]
 static PANEL_DESK_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// WCD-TEARDOWN — desktop blit loops in flight. With [`PANEL_DESK_EPOCH`] this is a true bracket, so
-/// unlike the counter it replaces it has no missed span: a loop already running when the read-back
-/// opened and still running when it closed shows as `dact` non-zero at one end or the other.
+/// WCD-TEARDOWN — desktop blit loops in flight. With [`PANEL_DESK_EPOCH`] this is a true bracket on
+/// every panel-writing path of `present_background`'s main loop: a loop already running when the
+/// read-back opened and still running when it closed shows as `dact` non-zero at one end or the
+/// other. Named gap, one build shape: the `vugpar`+`baremetal` parallel present copies clipped
+/// rects to glass and returns ABOVE this bracket — a missed span on that leg. No shipped x86 leg
+/// carries those features today (`x86-all` has neither), so the gap is unreachable, but it is a
+/// property of that path, not of this counter, and it is stated rather than claimed away. The
+/// epoch also counts loops that ENTER, not rows written: a fully-occluded present bumps `desk=`
+/// and writes nothing, so `desk=E0->E1` reads "N loops ran", never "N loops wrote".
 #[cfg(all(feature = "witness", target_arch = "x86_64"))]
 static PANEL_DESK_ACTIVE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
@@ -3351,9 +3357,12 @@ static PANEL_FILL_SEQ: [core::sync::atomic::AtomicU64; PANEL_FILL_RING] =
 #[cfg(all(feature = "witness", target_arch = "x86_64"))]
 const PANEL_FILL_RING: usize = 16;
 
-/// WCD-TEARDOWN — the fill bracket. Order is load-bearing: `ACTIVE` up FIRST, then the box published,
-/// then `EPOCH`. [`panel_seq`] reads them in the mirror order, and the two orders together are what
-/// make "no overlapping fill went unseen" a proof rather than a hope.
+/// WCD-TEARDOWN — the fill bracket. Order as coded: `ACTIVE` up first, then `EPOCH` (whose
+/// `fetch_add` yields this fill's seq), then the box and its stamp published into the ring. The
+/// box is therefore NOT visible to every reader that saw the epoch — a reader can observe the new
+/// epoch before the box stores land. What makes "no overlapping fill went unseen" hold is not
+/// the store order but the stamp check in [`panel_fill_hit`]: a slot whose stamp is not `seq + 1`
+/// is treated as an overlap, so an unpublished or recycled box can only ever fail CONSERVATIVE.
 #[cfg(all(feature = "witness", target_arch = "x86_64"))]
 struct PanelWriteGuard;
 
@@ -3435,6 +3444,13 @@ fn panel_fill_hit(before: PanelSeq, after: PanelSeq, rect: (usize, usize, usize,
         let pack = PANEL_FILL_BOX[slot].load(core::sync::atomic::Ordering::Acquire);
         if stamp != seq + 1 {
             // Slot recycled, or the publishing store has not landed. Cannot confirm; assume overlap.
+            return true;
+        }
+        // Seqlock read discipline: re-validate the stamp AFTER reading the box, or a fill sixteen
+        // seqs later could overwrite the slot between the two loads above and a NON-intersecting
+        // newer box would suppress a real overlap — the one unsafe direction this scan has. The
+        // re-load turns that interleaving into "cannot confirm; assume overlap".
+        if PANEL_FILL_SEQ[slot].load(core::sync::atomic::Ordering::Acquire) != seq + 1 {
             return true;
         }
         let fx = ((pack >> 48) & 0xFFFF) as usize;
