@@ -255,6 +255,25 @@ static W_CLEAN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 static W_SLOW: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 static W_MAXUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 
+/// WC-G/M1 — per-id: microseconds this window's SAMPLES spent inside the witness itself, summed
+/// across every sampled pass. `cks_blit_us + civac_us + cks_after_us + readback_us`, the four phases
+/// the `prof` line decomposes.
+///
+/// **What it is for, and why it is a per-window total rather than a per-sample field.** The `us=`
+/// leg times the copy and deliberately excludes everything this module does around it, which is
+/// correct for the tearing verdict and useless for the question M1 asks: an armed x86 boot spends
+/// ~2.87 s per instrumented pass and ~11.5 s of a 17.3 s block on four of them, against ~1.4 s of
+/// real GPU work. That cost is invisible on every existing line precisely BECAUSE the brackets are
+/// honest. `wit_us=` is the one number that says how much of the boot the instrument bought itself,
+/// and it belongs on the rollup because the interesting quantity is the window's total, not any one
+/// pass's share of it.
+///
+/// It is a LOWER bound on the witness's true cost and must be read as one. The serial writes — the
+/// sample line, and now the `prof` line — sit outside every bracket that feeds this sum, by the same
+/// rule that keeps `stage_flush`'s print outside WC-G's clock. So `wit_us=` is the measurement cost,
+/// not the reporting cost, and the reporting cost is stated separately at [`end`].
+static W_WITUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+
 // ---- WC-H — the back-layer's own witness -------------------------------------------------------
 
 /// Per-id: `[wc-h]` samples taken, capped at [`SAMPLES`].
@@ -1315,6 +1334,15 @@ pub struct Probe {
     cks_app: u64,
     cks_blit: u64,
     cks_civac: u64,
+    /// WC-G/M1 — microseconds the `blit` checksum took: one full-surface volatile read.
+    cks_blit_us: u64,
+    /// WC-G/M1 — microseconds the coherency leg took: [`clean_invalidate_surface`] plus the `civac`
+    /// re-read, bracketed TOGETHER and deliberately so. On aarch64 the cache op and the refill it
+    /// forces are one cost with one cause; splitting them would credit the sweep with ~nothing and
+    /// charge the refill to a read that is only expensive because the sweep dropped the lines. On
+    /// x86 the op is a no-op and this reduces to the second full-surface read, which is the honest
+    /// reading there — see [`clean_invalidate_surface`].
+    civac_us: u64,
     t0: u64,
 }
 
@@ -1336,10 +1364,20 @@ pub fn begin(id: u32, surf: usize, surf_len: usize, compat: bool) -> Option<Prob
         TAKEN[i].store(SAMPLES, Ordering::Relaxed);
         return None;
     }
+    // WC-G/M1 — phase timestamps around the EXISTING operations, all of them BEFORE `t0` is set.
+    // Four clock reads on a path that already does two full-surface volatile reads is arithmetic
+    // next to the work being measured, and — this is the load-bearing part — none of it lands
+    // between the `t0` assignment and the return, so the ordering law below is untouched and `us=`
+    // still contains the copy and nothing else.
+    let tp0 = now_cycles();
     let cks_blit = checksum(surf, surf_len);
+    let tp1 = now_cycles();
     // The coherency leg. See the module note on why this cleans as well as invalidates.
     clean_invalidate_surface(surf, surf_len);
     let cks_civac = checksum(surf, surf_len);
+    let tp2 = now_cycles();
+    let cks_blit_us = cycles_to_us(tp1.saturating_sub(tp0));
+    let civac_us = cycles_to_us(tp2.saturating_sub(tp1));
 
     let seq = APP_SEQ[i].load(Ordering::Relaxed);
     let own = SEEN_SEQ[i].swap(seq, Ordering::Relaxed) != seq;
@@ -1353,6 +1391,8 @@ pub fn begin(id: u32, surf: usize, surf_len: usize, compat: bool) -> Option<Prob
         cks_app: APP_CKS[i].load(Ordering::Relaxed),
         cks_blit,
         cks_civac,
+        cks_blit_us,
+        civac_us,
         // LOAD-BEARING ORDERING: the clock starts AFTER the `civac` re-read, and must stay there.
         // `clean_invalidate_range` drops every line of the surface, and the `cks_civac` checksum
         // immediately re-reads all of it — which is precisely what re-warms the source for the blit
@@ -1360,6 +1400,12 @@ pub fn begin(id: u32, surf: usize, surf_len: usize, compat: bool) -> Option<Prob
         // absorbs a full 64 KiB cache refill that the uninstrumented path never pays, inflating the
         // very number the timing verdict rests on. The measured interval must contain the copy and
         // nothing else.
+        //
+        // The law has a second half, which WC-G/M1's phase timings are the first thing to test:
+        // NOTHING may be inserted between this assignment and the return. It is the last field of
+        // the literal for that reason, so anything added to this function lands above it and is
+        // paid before the clock starts. `cks_blit_us` and `civac_us` are taken that way — they
+        // bracket the operations already there and do not move `t0`.
         t0: now_cycles(),
     })
 }
@@ -1373,7 +1419,12 @@ pub fn begin(id: u32, surf: usize, surf_len: usize, compat: bool) -> Option<Prob
 #[allow(clippy::too_many_arguments)]
 pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, stride: usize, scale: usize) {
     let us = cycles_to_us(now_cycles().saturating_sub(p.t0));
+    // WC-G/M1 — `us=` above is computed FIRST and from `p.t0` alone, exactly as it always was. Every
+    // phase clock below starts after it, so no profiling read can enter the timing verdict's bracket.
+    let tp0 = now_cycles();
     let cks_after = checksum(p.surf, p.surf_len);
+    let tp1 = now_cycles();
+    let cks_after_us = cycles_to_us(tp1.saturating_sub(tp0));
 
     // Re-derive the destination from the source, one probe per SOURCE pixel (the top-left
     // destination pixel of each upscale cell). Bounds mirror `draw_window`'s: the panel clip, the
@@ -1382,6 +1433,13 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
     let (pw, ph) = (info.width, info.height);
     let mut checked = 0usize;
     let mut bad = 0usize;
+    // WC-G/M1 — the read-back's own bracket. On x86 the glass is WC-mapped PCIe memory and every
+    // `read_pixel` is an uncached round trip to the device, one per SOURCE pixel, so this loop is
+    // the phase most likely to dominate the pass — which is exactly why it could not go on being
+    // reported as part of an undifferentiated total. The bracket wraps the loop and nothing else:
+    // `checked` and `bad` are declared above it and read below it, so the clock contains no
+    // formatting and no serial.
+    let tp2 = now_cycles();
     if x < pw && y < ph && scale > 0 && stride >= 4 {
         let cols = (pw - x).div_ceil(scale).min(w).min(stride / 4);
         let rows = (ph - y).div_ceil(scale).min(h).min(p.surf_len / stride);
@@ -1402,6 +1460,7 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
             }
         }
     }
+    let readback_us = cycles_to_us(now_cycles().saturating_sub(tp2));
 
     // Attribution, most specific first. A source that moved under the copy invalidates the
     // read-back's expectation (it was re-derived from bytes the blit never saw), so RACE outranks
@@ -1465,6 +1524,68 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
         verdict
     );
 
+    // WC-G/M1 — WHERE THE PASS ACTUALLY GOES.
+    //
+    // Everything above this point measures the COPY and its correctness, and does so by excluding
+    // the witness's own work from every bracket. That exclusion is right, and it is also why the
+    // instrument's cost has never appeared on any line it prints. On metal it is not small: an
+    // armed x86 boot spends ~2.87 s per instrumented pass, four passes, ~11.5 s of a 17.3 s block
+    // whose real GPU work is ~1.4 s. "The witness is expensive" is not an actionable statement; a
+    // per-phase decomposition is, and this line is that decomposition and nothing more. It draws no
+    // verdict and carries no threshold — reshaping the pass is a later decision that needs this
+    // measurement first.
+    //
+    // The four phases are the four things a pass does besides copying: two full-surface checksums
+    // before the blit (`cks_blit_us`, and `civac_us` for the cache op plus its re-read), one after
+    // (`cks_after_us`), and the per-source-pixel read-back against the glass (`readback_us`, with
+    // `probes=` the pixels it actually reached, so a rate can be derived rather than assumed).
+    // `surf_bytes=` is the size all three checksums walked, which is what makes the three of them
+    // comparable across windows of different sizes.
+    //
+    // ### Its own cost, stated rather than hidden
+    //
+    // ~150 bytes on the wire. At 115200 baud with the usual 10 bits per byte that is ~13 ms of a
+    // core's time per sampled pass — real, and charged to the composite path exactly like the
+    // sample line above it. It is OUTSIDE every bracket on this line and outside `us=`, by the same
+    // rule that puts `stage_flush`'s print after `wcg::end`: an instrument that inflates the number
+    // it appears next to is worse than no instrument. So the honest accounting is that a sampled
+    // pass now costs ~13 ms more wall time than it did and reports the same measurements it would
+    // have reported without the line. Against the ~2.87 s pass this decomposes, that is ~0.45%.
+    //
+    // ### Why it is a separate line, and why it needs no budget of its own
+    //
+    // Separate because the sample line's key order is load-bearing across seats — the pi4 spec
+    // matches `\[wc-g\] win=.* fbbad=.* slow=.* ->` with the verdict terminal — and four more keys
+    // in front of that terminal would be four more chances to break a gate on another platform for
+    // a field that platform does not read. No budget because there is nothing to budget: `end` is
+    // reachable only with a `Probe`, and `begin` hands one out only while [`SAMPLES`] is unspent.
+    // This line therefore rides the sample line's budget exactly, one for one, and adds no
+    // unbudgeted serial anywhere in the boot.
+    //
+    // It leads with `[wc-g] ` deliberately: `fbcon`'s `PANEL_MUTE_TAGS` mutes serial tags from the
+    // panel by that prefix, so an x86 witness build keeps this line off the glass it is measuring.
+    serial_println!(
+        "[wc-g] prof win={} seq={} surf_bytes={} cks_blit_us={} civac_us={} cks_after_us={} probes={} readback_us={}",
+        p.id,
+        p.seq,
+        p.surf_len,
+        p.cks_blit_us,
+        p.civac_us,
+        cks_after_us,
+        checked,
+        readback_us
+    );
+    // The per-window ledger the rollup's `wit_us=` reports. Accumulated AFTER the prints, so a
+    // window's total is the sum of the four measured phases and carries no serial time. See
+    // [`W_WITUS`].
+    W_WITUS[w].fetch_add(
+        p.cks_blit_us
+            .saturating_add(p.civac_us)
+            .saturating_add(cks_after_us)
+            .saturating_add(readback_us),
+        Ordering::Relaxed,
+    );
+
     // This window's rollup, once, when it spends its budget. Scoped to ONE window and deterministic
     // — no timer, and no claim about any window but this one. See [`W_SAMPLES`] for why there is no
     // global summary and why the "did any suspect ever fire" question is the spec's FORBIDs instead.
@@ -1489,8 +1610,18 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
         } else {
             "CLEAN"
         };
+        // WC-G/M1 — `wit_us=` is an INSERTION between `maxus=` and `frame_us=`, and that placement is
+        // the whole of what the spec permits here. The pi4 gate matches
+        // `\[wc-g\] rollup win=.* scope=window .*frame_us=.* ->`, so fields may be inserted between
+        // matched keys and nothing may be renamed, reordered, or moved past the terminal verdict. It
+        // sits beside `maxus=` because the two are the natural pair to read together: the longest
+        // single copy this window did, and the total this window's four samples spent measuring.
+        //
+        // It is a per-WINDOW total over SAMPLED passes — the same population `samples=` counts — and
+        // it is not a rate, a maximum, or a boot figure. Divide by `samples=` for a per-pass mean;
+        // the per-phase split is on the `prof` lines above.
         serial_println!(
-            "[wc-g] rollup win={} scope=window samples={} coher={} race={} blit={} clean={} slow={} maxus={} frame_us={} -> {}",
+            "[wc-g] rollup win={} scope=window samples={} coher={} race={} blit={} clean={} slow={} maxus={} wit_us={} frame_us={} -> {}",
             p.id,
             n,
             coher,
@@ -1499,6 +1630,7 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
             clean,
             slown,
             W_MAXUS[w].load(Ordering::Relaxed),
+            W_WITUS[w].load(Ordering::Relaxed),
             FRAME_US,
             dominant
         );
