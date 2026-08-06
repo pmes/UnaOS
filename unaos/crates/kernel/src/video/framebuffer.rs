@@ -210,14 +210,28 @@ impl FrameBuffer {
             return None;
         }
         let p = (self.base + offset) as *const u8;
-        // SAFETY: bounds-checked against `self.len` above; volatile so the read is not hoisted or
-        // folded with the stores the blit just performed.
-        let (a, b, c) = unsafe {
-            (
-                core::ptr::read_volatile(p),
-                core::ptr::read_volatile(p.add(1)),
-                core::ptr::read_volatile(p.add(2)),
-            )
+        // One 32-bit transaction instead of three 8-bit ones, where the pixel allows it. On
+        // cacheable RAM the cache made the three byte reads free, so nobody noticed; on a WC-mapped
+        // PCIe aperture every volatile u8 read is its own non-posted round trip (~976 ns measured,
+        // GR17 cost model), so every verify probe paid 3× for the same three bytes. Same bytes,
+        // same decode, same Some/None decisions: the wide path additionally requires 4-alignment
+        // and the fourth byte in-bounds, and falls back to the byte path at exactly those edges
+        // (unaligned base, truncated tail pixel) rather than ever changing an answer.
+        let (a, b, c) = if (self.base + offset) & 3 == 0 && offset + 4 <= self.len {
+            // SAFETY: 4-aligned and bounds-checked above; volatile for the same reason as the
+            // byte path.
+            let v = unsafe { core::ptr::read_volatile((self.base + offset) as *const u32) };
+            ((v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8)
+        } else {
+            // SAFETY: bounds-checked against `self.len` above; volatile so the read is not hoisted
+            // or folded with the stores the blit just performed.
+            unsafe {
+                (
+                    core::ptr::read_volatile(p),
+                    core::ptr::read_volatile(p.add(1)),
+                    core::ptr::read_volatile(p.add(2)),
+                )
+            }
         };
         match self.info.pixel_format {
             PixelFormat::Rgb => Some(((a as u32) << 16) | ((b as u32) << 8) | c as u32),
