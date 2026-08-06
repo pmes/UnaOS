@@ -1092,7 +1092,13 @@ residue are different mechanisms" is a hypothesis, not a finding. It remains a *
 short read that stops one byte early leaves one byte, and a single leftover byte is exactly what a
 settle drain would clear silently and instantly.
 
-## Boot U: GAP 1 CLOSED on metal (s73, 2026-08-06, kernel `3477640c` from `7814d258`)
+## Boot U: GAP 1 root-caused and fixed on metal (s73, 2026-08-06, kernel `3477640c` from `7814d258`)
+
+> This section was written as "GAP 1 CLOSED" and an adversarial review (GR18) refuted the *closure*
+> while confirming the *mechanism*. The claims below are corrected in place; the review round and
+> what it changed in the driver are at the end of the section. Short version: **GAP 1 is root-caused
+> and fixed in `read_key_inner`. It was not closed — the sibling path `read_key_by_index` still ran
+> the old drain, and this boot's own log carries the new failure line that proves it.**
 
 One boot, every prediction from the table above answered, all in the fix's favor:
 
@@ -1107,23 +1113,126 @@ One boot, every prediction from the table above answered, all in the fix's favor
 1. **The scout lines got longer — the headline held.** `BRSC len=2 [00 60]` (0x60 = 96, equal to the
    live `soc=96%`; the table's `[00 64]` was written when the pack read 100%). `REV` reads its full
    **6 bytes** — the QEMU model's length, now confirmed on silicon. `OSK0` reads **32 bytes whole**.
-   The `len=1` census: **2 of 24 scout reads**, and both (`BNum`, `BSIn`) are genuinely one-byte
-   keys. From 69-of-102-truncated to zero-truncated in one boot.
-2. **`gap=39` with `busy=0` — the complete story, confirmed.** `gap_wait` recovered 39 bytes the old
-   drain would have dropped, and `ST_BUSY` was never once observed set. The SMC never raises BUSY on
-   this machine; the old loop broke in every inter-byte gap it met. **The 2026-07-17
-   `wait_busy_clear` fix is hereby proven vacuous on this hardware — it has been a no-op since it
-   landed**, exactly as the `busy=` census was built to decide.
-3. **The B0AV wedge is gone without ever being addressed directly.** No `FIRST FAILURE` of any kind,
-   `st0=0 rfail=0`. The causal claim — fix the truncation and the wedge starves — is confirmed.
+   The `len=1` census: **2 of 17 present reads** (only a present read carries a `len=`; the earlier
+   "2 of 24" counted the probe list, not the answers). Both are `BNum` and `BSIn`. Note what that
+   last step is and is not: `PROBE_KEYS` is name-plus-description, **this repo has no declared
+   key-size table**, and `GET_KEY_INFO` (0x13) — the one instrument that would answer it — is
+   deliberately unissued. "Both are genuinely one-byte keys" is therefore Apple-SMC background
+   knowledge, not a measurement made here. The measured statement is the census: from
+   69-of-102-truncated (six boots, ~11.5 of 17 per boot) to 2-of-17 in one boot.
+2. **`gap=39` with `busy=0`.** `gap_wait` recovered 39 bytes the old drain would have dropped, and
+   `ST_BUSY` was never once observed set. **The 2026-07-17 `wait_busy_clear` fix is proven vacuous on
+   this hardware** — and that conviction is *qualified*, not a fallthrough zero: `gap=39` proves the
+   drain-loop body ran ≥39 times and `wait_busy_clear(3)` is its first statement, so the helper was
+   called ≥39 times and returned on its first status read every time.
+   The **stronger** sentence this section used to carry — "the SMC never raises BUSY on this
+   machine" — was more than the instrument could see when it was written. `wait_busy_clear` samples
+   BUSY once, at the *start* of a gap; the premise under test is that BUSY appears *during* the
+   shift, and `gap_wait` used to spin that whole window with no census at all. GR18 fixes the
+   instrument rather than the sentence: `gap_wait`'s poll now ORs its BUSY sightings into the same
+   counter, so from the next boot on `busy=0` covers the entire gap window and the strong sentence
+   becomes sayable. On Boot U's build it is not yet — read Boot U's `busy=0` as *"BUSY was never set
+   at the start of an inter-byte gap"*.
+3. **The B0AV wedge did not reappear.** No `FIRST FAILURE` of any kind, `st0=0 rfail=0`. That is
+   **consistent with** the causal claim (fix the truncation and the wedge starves); it does not
+   confirm it. `7814d258` disqualified the wedge's absence as a success criterion in its own
+   prediction — "a B0AV wedge may or may not reappear and is no longer the success criterion",
+   because Boot T showed the wedge vanishing with the truncation untouched — and a criterion
+   disqualified one boot cannot be re-qualified as confirmation the next. What settles GAP 1 is
+   `len=` and `gap=`, and those are what settled it.
 4. **`unc=0`** — closing works, promptly. `rok=1`: exactly one settle started dirty and was rescued,
-   so residue was seen, cleared, and *counted* this time.
-5. **`retries=0/0`** against the pre-fix sit's cumulative ≈0.58 retries per key read.
+   so residue was seen, cleared, and *counted* this time. But see the review note below on what
+   created that residue, and on why `unc=0` was **not** evidence that no read was truncated.
+5. **`retries=0/0`** against the pre-fix sit's cumulative ≈0.58 retries per key read — a fair
+   like-for-like: Boot T read `retries=3/3` at the same phase (1749 ms), 53 by 33.7 s, 433 by 150 s,
+   in the same unplugged/discharging power state. Boot U held 0/0 through 40.5 s. Coverage caveat:
+   the witness is edge-triggered and fired twice, so the closure rests on ~40 s of counter coverage,
+   not the hours a standing sit delivers.
+
+**Cost of the gap budget, priced correctly.** `SMC_GAP_CYCLES` is 16 × 35 000 cycles = **~208 µs**
+at this machine's measured 2 693 855 654 Hz (BPACE) — and it is a **per-gap** budget, not per-read:
+`gap_wait` can be entered once per byte, and `close_transaction` adds one more full window per read.
+Worst case per read is `(out.len() + 1) × 208 µs` → **~6.9 ms** for a 32-byte scout read and
+**≈130 ms** for the 19-key scout. `7814d258`'s "~4.5 ms for the scout" priced one gap per read and
+understates it by ~29x; do not quote it forward. The bound is for a hostile SMC that makes every
+byte boundary pay in full — **observed cost on Boot U was nil**: the scout ran 1743→1748 ms and
+`gui=3408ms` sits inside the 3407/3410 T/T2 band.
 
 Boot health around it: `gui=3408ms` (T/T2 band: 3407/3410 — no regression), `kepler=1522ms`,
-`sched d=67ms`, `ehci-hid-done d=1450ms`, zero new FAIL/TRIPWIRE lines (the kepler `ucode-echo` and
-sdhc `cmd8` prints predate this boot in the same capture).
+`sched d=67ms`, `ehci-hid-done d=1450ms`. **One new line, and it matters:**
 
-Status: **n=1** on the fix build. The standing sit accumulates the rest: `gap` should climb,
-`retries`/`short`/`busy` should hold at ~0 across hours. `GET_KEY_INFO 0x13` stays unissued — the
-falsifier door it guarded never opened.
+```
+:: SMC-SCOUT: index enumeration STOP-NOTE at idx 0 — handshake wedged at step 3 (bounded, not forced; Caveat 3) ::
+:: SMC-SCOUT: index walk done (0 of 493 names) ::
+```
+
+This section originally claimed "zero new FAIL/TRIPWIRE lines". **That was false**, and the line it
+missed is the fix's own sibling defect — see below.
+
+Status: **n=1** on the fix build. `GET_KEY_INFO 0x13` stays unissued — the falsifier door it guarded
+never opened.
+
+### Adversarial review round (GR18) — what the closure actually covers
+
+An adversarial pass re-derived Boot U's evidence independently. **The mechanism survives intact**:
+`REV` 2→6, `OSK0` 2→32, `#KEY` 1→4, `BRSC` 1→2 on the same build minus the drain fix, at the same
+boot phase and power state; values cross-validate across three independent keys to 0.1 %
+(`9571/9962 = 96.07 %` against `soc=96%`; `9538/9962 = 95.74 %` against `soc=95%` at 40.5 s — a
+one-byte shift in any of them moves the value by ≥256x). "A clear `DATA_READY` was never a
+done-signal" is correct and `gap_wait` fixes it.
+
+What the review narrowed, and what this change does about it:
+
+* **The closure covered `read_key_inner` only.** `read_key_by_index` still ran the *pre-fix* drain —
+  four name bytes, each aborting `Stuck(3)` the instant `DATA_READY` read clear — i.e. GAP 1
+  verbatim, live in the sibling path. Worse, the fix *opened the door onto it*: `#KEY` used to
+  truncate to `len=1 [00]`, so `count=0` and the walk never ran (Boot T: `index walk done (0 of 0
+  names)`); un-truncated it reads `[00 00 01 ed]` = 493 and the walk runs straight into the unfixed
+  code. That is the STOP-NOTE above. **Fixed here**: the name drain waits through `gap_wait()` like
+  the value drain, and `Gap::Done` (a name shorter than 4 bytes — a protocol error) and an expired
+  gap budget stay `Stuck(3)`.
+* **The old path also leaked an open transaction**, which is the residue-charged-to-the-next-key
+  defect `close_transaction` was written to end. The log fingerprints it: `rok=1` — exactly one
+  dirty settle in the whole boot — sitting between the abandoned walk at 1748 ms and the next
+  transaction (`AC-W`) at 1749 ms. **Fixed here**: every exit of `read_key_by_index` — `Ok`,
+  `Absent`, every `Err` — now returns through `close_transaction()`. (The pre-command
+  `settle_before_command()` stays outside that wrapper: if it fails, no command of ours was written
+  and there is no transaction of ours to close.) The equivalent gap on `read_key_inner`'s own error
+  paths remains open and is not in this change's scope.
+* **`Gap::StillOpen` was unmeasured.** `close_transaction` reported only when it *failed* to close.
+  If the delayed byte arrived a moment after `gap_wait` gave up, the drain read it, discarded it,
+  reached `CMD_DONE` and incremented nothing — so `unc=0` did **not** mean "no truncation", and
+  "every key whole" rested entirely on the `len=` census against sizes this repo does not declare.
+  **Fixed here**: `late=` counts every byte the drain discards. The two arms now partition
+  `StillOpen` — the late byte arrives ⇒ `late`, it never arrives and the SMC will not close ⇒ `unc`
+  — so `late=0 unc=0` over a boot makes "every read ended where the SMC said it ended" a
+  measurement. (`late` also counts the benign case of a key longer than the caller's buffer; the two
+  are told apart by which key was read.)
+* **Caveat 3 is stale as a statement about the SMC.** "`#KEY` enumeration is a standing bounded
+  wedge on this machine" described our own drain bug in un-fixed code, both times it was observed.
+  The bound itself (`SMC_WAIT_CYCLES` + `MAX_ENUM_KEYS`) is a protection and stays exactly as is;
+  what changes is the attribution.
+* **The load-bearing arm has no automated coverage.** QEMU's `isa-applesmc` holds `DATA_READY`
+  across all `len` bytes and never inserts an inter-byte gap, so on QEMU the drain reaches
+  `gap_wait` exactly once — after the last byte, with the status already `CMD_DONE` → `Gap::Done` →
+  the same `break` the old code took. `Gap::More` (**the entire fix**), `Gap::StillOpen`, and
+  `close_transaction`'s drain loop are **never taken on QEMU**. `#KEY` is absent there too, so the
+  enumeration walk fixed above does not run either. `./arroyo check` plus the cfg legs give
+  compile-and-link coverage; **the GAP-1 fix has no regression test anywhere except a metal boot**,
+  and a revert would show up only as `gap=` falling to 0 with `len=1` returning.
+
+### Prediction for the next metal boot (GR18 build)
+
+1. The `#KEY` walk **proceeds past idx 0** — names enumerate, `:: SMC-SCOUT: idx 0 = … ::` lines
+   appear, and the walk's own cap (`MAX_ENUM_KEYS = 512` against `count=493`) governs where it
+   stops, not a handshake.
+2. `index enumeration STOP-NOTE at idx 0` **disappears, or moves** to a later index.
+3. `late=` appears on the SMC-BATT witness (appended after `busy=`), expected **~0**.
+4. `gap` may rise, possibly sharply and early, as the walk's ~2000 name bytes pay the same census as
+   value bytes — a single boot-time step, then the slow sweep-driven climb as before.
+5. `short=0` and `busy=0` hold. `busy=0` now covers the whole gap window, not just its first poll.
+
+**Falsifier:** the walk still wedges at idx 0 *with the gap budget expiring* (`Stuck(3)` after a
+full ~208 µs window). That would mean the name phase genuinely stalls longer than the budget rather
+than tripping over a short poll, and the suspicion returns to `GET_KEY_INFO`/pacing — the door
+`7814d258` named and Boot U left shut.

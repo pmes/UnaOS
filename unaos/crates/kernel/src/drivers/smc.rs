@@ -270,10 +270,20 @@ fn wait_busy_clear(step: u8) -> Result<(), SmcError> {
     }
 }
 
-/// Inter-byte gap budget (GAP-1, s73). 16 pacing quanta — the same ~240 µs window the DIAG samples
-/// its 16-read timeline over, and ~450x shorter than `SMC_WAIT_CYCLES`. Long enough to cover a byte
-/// shift on a controller paced at ~15 µs, short enough that even if EVERY read paid it in full the
-/// 19-key scout would cost ~4.5 ms.
+/// Inter-byte gap budget (GAP-1, s73). 16 pacing quanta — the same window the DIAG samples its
+/// 16-read timeline over, and ~450x shorter than `SMC_WAIT_CYCLES`. Long enough to cover a byte
+/// shift on a controller paced at ~15 µs.
+///
+/// COST, priced correctly (adversarial review, GR18). `7814d258` priced this **per read** ("even if
+/// every read paid it in full the 19-key scout costs ~4.5 ms") and that is wrong twice over. The
+/// budget is **per gap**: `gap_wait` can be entered once per byte (`while n < out.len()`) and
+/// `close_transaction` adds one more full window per read. And at this machine's measured TSC
+/// (2 693 855 654 Hz, from BPACE) 16 × 35 000 cycles is **~208 µs**, not the ~240 µs the commit
+/// assumed off a 2.3 GHz guess. Worst case per read is therefore `(out.len() + 1) × 208 µs`:
+/// **~6.9 ms** for one 32-byte scout read and **≈130 ms** for the 19-key scout — ~29x the figure
+/// that was published. That bound is for a hostile SMC that makes every byte boundary pay the full
+/// window; observed cost on Boot U was nil (`gui=3408ms`, inside the 3407/3410 T/T2 band). The
+/// number that must not be quoted forward is ~4.5 ms.
 const SMC_GAP_CYCLES: u64 = 16 * SMC_POLL_PAUSE_CYCLES;
 
 /// What a clear `DATA_READY` in the middle of a value actually meant.
@@ -301,8 +311,22 @@ enum Gap {
 /// residue that wedges the next key is the remainder of a value we abandoned.
 fn gap_wait() -> Gap {
     let start = crate::arch::now_cycles();
+    let mut counted = false;
     loop {
         let s = read_status();
+        // BUSY-SEEN census, extended to cover the gap itself (adversarial review, GR18). `busy=0`
+        // used to be sampled at exactly ONE site — `wait_busy_clear`, which polls once at the START
+        // of each inter-byte gap, hundreds of nanoseconds after our own `read_data()`. But the
+        // premise under test is "BUSY is raised WHILE the SMC shifts the next byte in", i.e. during
+        // the gap, and this loop spins the entire rest of that window with no census at all. So the
+        // old `busy=0` was compatible with a real BUSY asserted a few µs after the first poll: it
+        // proved `wait_busy_clear` vacuous (which it is) but NOT "the SMC never raises BUSY". Same
+        // one-shot shape as `wait_busy_clear`'s, into the same counter, so `busy=0` now means the
+        // whole gap window was watched and BUSY was never set anywhere in it.
+        if !counted && s & ST_BUSY != 0 {
+            counted = true;
+            BUSY_SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         if s & ST_DATA_READY != 0 {
             return Gap::More;
         }
@@ -511,8 +535,20 @@ static RESIDUE_FAILS: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 ///   * `gap` — bytes `gap_wait` recovered that the old drain would have dropped. **Non-zero proves
 ///     the truncation mechanism**; zero means the bytes were never there and the cause is upstream
 ///     (the length byte, or the SMC genuinely serving short).
-///   * `busy` — times `ST_BUSY` was ever observed set. **Zero over a whole boot proves the GAP-1
-///     BUSY premise false** and the 2026-07-17 `wait_busy_clear` fix vacuous on this machine.
+///   * `busy` — times `ST_BUSY` was ever observed set, at the start of a gap (`wait_busy_clear`) or
+///     anywhere inside it (`gap_wait`). **Zero over a whole boot proves the GAP-1 BUSY premise
+///     false** and the 2026-07-17 `wait_busy_clear` fix vacuous on this machine.
+///   * `late` — value bytes that arrived AFTER the read stopped and were drained-and-discarded by
+///     `close_transaction` (adversarial review, GR18). This is the counter that makes "every key
+///     whole" a measurement instead of an inference. `Gap::StillOpen` — the truncation arm — used to
+///     be invisible: if the delayed byte showed up a moment later, `close_transaction` swallowed it
+///     silently and `unc` stayed 0, so `unc=0` did **not** mean "no truncation". Now the two arms
+///     partition it: the late byte arrives => `late`, it never arrives and the SMC will not close
+///     => `unc`. `late=0 unc=0` over a boot means every read ended where the SMC said it ended.
+///
+/// `late` counts one other, benign shape: a read that stopped because it filled the caller's buffer
+/// on a key longer than the buffer (`read_u16k`'s 2 bytes against a >2-byte key). That is a real
+/// discarded byte too and belongs in the same number; the two are told apart by which key was read.
 ///
 /// CENSUS PLACEMENT (s73 Boot S). These rode the retry-ROLLUP line when they were added — and that
 /// line fired **zero times in the entire s73 capture**, six boots and ~24 minutes of uptime. The
@@ -520,7 +556,7 @@ static RESIDUE_FAILS: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 /// fires; on this SMC the pack state flaps often enough that `fire` is true well inside the 300 s
 /// period, so the rollup is starved permanently. A counter on a line that never prints is exactly
 /// the disease this arc exists to treat, so the counts now ride the `SMC-BATT` witness itself.
-pub fn stall_counts() -> (u32, u32, u32, u32, u32, u32, u32) {
+pub fn stall_counts() -> (u32, u32, u32, u32, u32, u32, u32, u32) {
     use core::sync::atomic::Ordering;
     (
         STEP0_STALLS.load(Ordering::Relaxed),
@@ -530,6 +566,7 @@ pub fn stall_counts() -> (u32, u32, u32, u32, u32, u32, u32) {
         UNCLOSED.load(Ordering::Relaxed),
         GAP_RECOVERED.load(Ordering::Relaxed),
         BUSY_SEEN.load(Ordering::Relaxed),
+        LATE_BYTES.load(Ordering::Relaxed),
     )
 }
 
@@ -609,7 +646,11 @@ fn read_key_inner(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
                     GAP_RECOVERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 Gap::Done => break, // the SMC closed the transaction: genuine end-of-value
-                Gap::StillOpen => break, // truncation — `close_transaction` below reports it
+                // Truncation. `close_transaction` below is what REPORTS it, and until GR18 it
+                // reported nothing: a byte that showed up a moment late was drained and discarded
+                // in silence, and `unc` — which only counts drains that FAIL — stayed 0. `late=`
+                // now counts that byte, so this arm is no longer invisible.
+                Gap::StillOpen => break,
             }
         }
         out[n] = read_data();
@@ -634,6 +675,9 @@ static RESIDUE_RESCUED: core::sync::atomic::AtomicU32 = core::sync::atomic::Atom
 /// Sweep-path reads that returned fewer bytes than requested — the GAP-1 truncation, counted
 /// directly rather than inferred from an edge-triggered witness (Boot T instrument).
 pub(crate) static SHORT_READS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Value bytes that arrived after the read stopped and were discarded by `close_transaction` — the
+/// `Gap::StillOpen` truncation made countable (adversarial review, GR18). See `stall_counts`.
+static LATE_BYTES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Drain our own transaction to idle before returning. Bounded by the SHORT gap budget, not the
 /// transaction budget: if the SMC will not close promptly the next `settle_before_command` owns the
@@ -651,7 +695,13 @@ fn close_transaction() {
             return; // closed
         }
         if st & ST_DATA_READY != 0 && drained < MAX_RESIDUE_DRAIN {
+            // LATE-BYTE census (adversarial review, GR18). Every byte this drain throws away is a
+            // value byte the caller did NOT get: either the delayed byte of a `Gap::StillOpen` — the
+            // truncation, previously swallowed here in total silence — or the tail of a key longer
+            // than the caller's buffer. `unc` only ever reported a drain that FAILED, so `unc=0` was
+            // never evidence of "no truncation"; this is.
             let _ = read_data();
+            LATE_BYTES.fetch_add(1, Ordering::Relaxed);
             drained += 1;
         } else if drained >= MAX_RESIDUE_DRAIN {
             break;
@@ -732,7 +782,9 @@ pub fn present() -> bool {
 /// **Does NOT route to `dump_first_failure`, deliberately** (review finding 5 — the over-claim that
 /// the DIAG covered "scout, battery sweep, enumeration" has been dropped from `read_key`, because
 /// this path never reached it). Routing it would be actively wrong here: Caveat 3 records that
-/// `#KEY` enumeration is a **standing** bounded wedge on this machine, so wiring it to the one-shot
+/// `#KEY` enumeration is a **standing** bounded wedge on this machine (but read the GAP-1 SIBLING
+/// FIX note below — that caveat is now suspect, and the next metal boot decides whether the
+/// condition is standing at all), so wiring it to the one-shot
 /// latch would re-spend the DIAG on a known condition every boot — precisely the disease this arc
 /// removed from `AC-W`. The information is not lost: the scout's enumeration handler now reports
 /// `Absent` and `Stuck(step)` as the distinct outcomes they are, instead of collapsing both into
@@ -741,11 +793,42 @@ pub fn present() -> bool {
 ///
 /// Serialized on `TXN` like every other transaction: it drives the same stateful cursor, so it can
 /// both corrupt and be corrupted by an interleaved `read_key`.
+///
+/// GAP-1 SIBLING FIX (adversarial review, GR18). This path still ran the **pre-`7814d258`** drain:
+/// four name bytes, each aborting with `Stuck(3)` the moment `DATA_READY` read clear. On a machine
+/// that demonstrably serves its bytes across inter-byte gaps (`gap=39` in one boot) that is the
+/// GAP-1 bug verbatim, still live in the sibling of the function that was fixed — and worse, it was
+/// *unreachable before the fix and reachable after it*: `#KEY` used to truncate to `len=1 [00]`, so
+/// `count=0` and the walk never ran; un-truncated it reads `[00 00 01 ed]` = 493 and the walk runs
+/// straight into the unfixed drain. Boot U's `:: SMC-SCOUT: index enumeration STOP-NOTE at idx 0 —
+/// handshake wedged at step 3 ::` is that, and it is a line the fix's own boot introduced.
+///
+/// Two changes: the name drain asks `gap_wait()` what a clear `DATA_READY` meant (same mechanism as
+/// `read_key_inner`), and **every** exit path — `Ok`, `Absent`, every `Err` — now runs through
+/// `close_transaction()`. The old code returned `Stuck(3)` with the transaction wide open; the
+/// boot's own counters fingerprint the leak: `rok=1`, exactly one dirty settle in the whole boot,
+/// and it sits between the abandoned walk at 1748 ms and the next transaction at 1749 ms.
+///
+/// Caveat 3 ("`#KEY` enumeration is a standing bounded wedge on this machine") is therefore **stale
+/// as a statement about the SMC**: the wedge was our drain, in un-fixed code, both times.
 fn read_key_by_index(index: u32, name: &mut [u8; 4]) -> Result<(), SmcError> {
     let _guard = TXN.lock();
-    // 0) settle any residue from a prior transaction (M2 idle-guard; no-op on an idle SMC).
+    // 0) settle any residue from a prior transaction (M2 idle-guard; no-op on an idle SMC). Outside
+    //    the close-wrapper deliberately: if the settle fails, no command of OURS has been written,
+    //    there is no transaction of ours to close, and the settle has already drained for its own
+    //    budget. Charging an `unc` here would blame this call for the previous one's mess.
     settle_before_command()?;
+    // Everything past the command write is wrapped so that no exit path can leave the transaction
+    // open — the residue-charged-to-the-next-key defect `close_transaction` was written to end, on
+    // exactly the paths where it was still live.
+    let r = index_txn(index, name);
+    close_transaction();
+    r
+}
 
+/// The GET_KEY_BY_INDEX conversation proper. Split out so `read_key_by_index` can close the
+/// transaction on every return without duplicating the call at each `?`.
+fn index_txn(index: u32, name: &mut [u8; 4]) -> Result<(), SmcError> {
     write_cmd(CMD_GET_KEY_BY_INDEX);
     wait_status(ST_AFTER_CMD, 0)?;
     for b in index.to_be_bytes() {
@@ -768,13 +851,31 @@ fn read_key_by_index(index: u32, name: &mut [u8; 4]) -> Result<(), SmcError> {
         }
         poll_pause();
     }
-    // A key name is exactly 4 bytes; mirror read_key's per-byte BUSY-then-DATA_READY handshake
-    // (GAP-1 fix). Unlike a value read an early DATA_READY-clear here IS an error (a 4-byte name
-    // must fully drain), so it stays Stuck(3) rather than a clean stop.
+    // A key name is exactly 4 bytes, and it arrives the same way a value does — which means it
+    // arrives across the same inter-byte gaps. A clear `DATA_READY` here is not "the name ended
+    // early", it is "the next name byte is not shifted in yet", so each byte waits through
+    // `gap_wait()` exactly as `read_key_inner`'s drain does.
+    //
+    // What stays an error is the OTHER two answers. A name is fixed-length: the SMC returning to
+    // `CMD_DONE` mid-name is a short name — a protocol error, not a clean end (that is the one place
+    // this differs from a value read, where `Gap::Done` is the normal terminator). And a gap budget
+    // that expires with the transaction still open is the wedge this instrument exists to report.
+    // Both remain `Stuck(3)`, and both now return through `read_key_by_index`'s `close_transaction`.
     for slot in name.iter_mut() {
         wait_busy_clear(3)?;
         if read_status() & ST_DATA_READY == 0 {
-            return Err(SmcError::Stuck(3));
+            match gap_wait() {
+                // Counted into the SAME `gap` census as value reads, deliberately: the number means
+                // "bytes recovered that the old drain would have dropped", which is a property of
+                // the mechanism, not of the caller — splitting it would leave neither half a census
+                // of the mechanism. The walk is a single bounded boot-time burst, so a boot with
+                // enumeration running should show `gap` step up once, early, and then climb slowly
+                // with sweep traffic as before.
+                Gap::More => {
+                    GAP_RECOVERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                Gap::Done | Gap::StillOpen => return Err(SmcError::Stuck(3)),
+            }
         }
         *slot = read_data();
     }
@@ -1489,7 +1590,7 @@ pub mod battery {
         // Under the `bootlog` feature (`UNAOS_BOOTLOG=1`, the boot-log-on-screen sitting mode) the
         // old full ~1 s cadence is restored unchanged, so a sitting can still watch discharge track.
         let (rsweep, rtotal) = retry_counts();
-        let (stall0, rfail, rok, short, unc, gap, busy) = super::stall_counts();
+        let (stall0, rfail, rok, short, unc, gap, busy, late) = super::stall_counts();
         let mut w = WITNESSED.lock();
         let mut last = LAST_STATE.lock();
         // QUIET-AC: the state key must carry the SETTLED ac shape, never the instantaneous one. On
@@ -1564,7 +1665,9 @@ pub mod battery {
                 // `super::stall_counts`) — they ride HERE, not the rollup, because the rollup line
                 // has never once fired on this machine. They are cumulative since boot: flat across
                 // a boot means the wedge was a blip, climbing means it is standing.
-                ":: SMC-BATT: present={} soc={}% volt={}mV amp={}mA full={}mAh rem={}mAh ac={} retries={}/{} st0={} rfail={} rok={} short={} unc={} gap={} busy={} == witness ::",
+                // `late=` is APPENDED, never inserted (GR18): every pre-existing field keeps its
+                // position, so a capture-diff or a positional awk over an older log still lines up.
+                ":: SMC-BATT: present={} soc={}% volt={}mV amp={}mA full={}mAh rem={}mAh ac={} retries={}/{} st0={} rfail={} rok={} short={} unc={} gap={} busy={} late={} == witness ::",
                 s.present,
                 fu(s.soc_pct),
                 fu(s.volt_mv),
@@ -1581,6 +1684,7 @@ pub mod battery {
                 unc,
                 gap,
                 busy,
+                late,
             );
         }
 
@@ -1612,7 +1716,7 @@ pub mod battery {
                 // standing; one early stall and a flat count thereafter means transient — the
                 // distinction the one-shot DIAG structurally cannot draw.
                 serial_println!(
-                    ":: SMC-BATT: retry rollup — {} retries in the last {} ms (total {}, st0 {}, rfail {}, rok {}, short {}, unc {}, gap {}, busy {}) == rollup ::",
+                    ":: SMC-BATT: retry rollup — {} retries in the last {} ms (total {}, st0 {}, rfail {}, rok {}, short {}, unc {}, gap {}, busy {}, late {}) == rollup ::",
                     unseen,
                     window,
                     rtotal,
@@ -1622,7 +1726,8 @@ pub mod battery {
                     short,
                     unc,
                     gap,
-                    busy
+                    busy,
+                    late
                 );
             }
         }
