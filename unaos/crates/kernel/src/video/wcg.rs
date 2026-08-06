@@ -1410,10 +1410,19 @@ pub(super) fn cycles_to_us(dt: u64) -> u64 {
     dt.saturating_mul(1_000_000) / hz
 }
 
-/// Whether any window still has budget. Gates the present-side checksum so the instrument stops
-/// costing anything once it has said what it has to say.
-fn budget_left() -> bool {
-    (0..IDS).any(|i| TAKEN[i].load(Ordering::Relaxed) < SAMPLES)
+/// Whether THIS window still has budget. Gates the present-side checksum so the instrument stops
+/// costing anything once it has said what it has to say — per window, not globally.
+///
+/// It was a global `any()` over all [`IDS`] until GR17 metal convicted it: slots that no window
+/// ever occupies (this bench boots three windows of eight) can never spend their budget, so the
+/// global test was PERMANENTLY true and this checksum ran on every routed console line for the
+/// life of the boot — 3.86 MB of byte-at-a-time FNV per serial print, ~5.6 ms/line measured,
+/// ~1.3 s of the witness-armed kepler window and unbounded after it. Per-id, the gate closes the
+/// moment this window's four samples are spent, which is what the module's cheapness argument
+/// always assumed. A spent id has no reader left to starve: [`begin`] is the only consumer of
+/// `APP_CKS`/`APP_SEQ` and it returns `None` for a spent id.
+fn budget_left(i: usize) -> bool {
+    TAKEN[i].load(Ordering::Relaxed) < SAMPLES
 }
 
 /// Record the app-side frame at `SYS_WIN_PRESENT` entry — the checksum of what the owner declared
@@ -1425,7 +1434,7 @@ pub fn on_present(id: u32, surf: usize, surf_len: usize) {
     // it this checksum would run on every present for the whole deferral window, because a deferred
     // window's budget stays unspent and `budget_left` therefore stays true. See [`paygo_arm`]. It is
     // `true` and folds away on every build but an x86 `wcg-paygo` one.
-    if i >= IDS || !budget_left() || !paygo_arm(i) {
+    if i >= IDS || !budget_left(i) || !paygo_arm(i) {
         return;
     }
     APP_CKS[i].store(checksum(surf, surf_len), Ordering::Relaxed);
