@@ -308,10 +308,14 @@ struct ReportLayout {
 //     the print cost of the EPACE lines themselves. Disagreement means one of the two is lying.
 //   * This instrument can execute in every state it reports on: the accumulators are plain
 //     memory writes, and the print site sits on the one unconditional path out of `init`.
-const EP_WAKE: usize = 0; // wake_run: PMCSR D0 + legsup + RS + CONFIGFLAG (+ its 150 ms settle)
-const EP_HCRST: usize = 1; // quiesce_if_firmware_stale + RS restart (+ the probe-14 full re-init)
+const EP_WAKE: usize = 0; // wake_run only: PMCSR D0 + legsup + RS. CONFIGFLAG and the pre-look
+                          // settle live in wake_route, which every caller runs inside an
+                          // EP_HCRST span — they are charged to `hcrst`, never here.
+const EP_HCRST: usize = 1; // quiesce_if_firmware_stale + RS restart + wake_route (CF + pre-look
+                           // settle), including the probe-14 full re-init
 const EP_SMOKE: usize = 2; // the 5 periodic DMA smoke passes
-const EP_ROOTRST: usize = 3; // reset_root_port: 100 ms debounce + paced reset attempts
+const EP_ROOTRST: usize = 3; // the pre-scan T_ATTDB debounce (once per controller, ahead of the
+                             // CCS gate) + reset_root_port's paced reset attempts
 const EP_HSEPROBE: usize = 4; // the probe-14 bare GET_DESCRIPTOR(8) transport probe
 const EP_ENUM: usize = 5; // top-level enumerate_at_zero span (contains the three below)
 const EP_HUBPWR: usize = 6; // …hub PORT_POWER writes + the pwr2good settle
@@ -437,14 +441,16 @@ pub static EHCI_HID: Mutex<Option<Vec<Controller>>> = Mutex::new(None);
 static CHAIN_HSE_SEEN: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// EPACE-TRIM M4 tripwire text. `wake_route` trims its pre-look settle from 150 ms to 20 ms on
-/// PPC=0 silicon (no port-power edge was applied, so none is owed — see the comment there). Every
-/// root-port path that reports a port failing to come up appends this, so the one boot where the
-/// trimmed value turns out to matter says so on the failing line instead of leaving a reader to
-/// re-derive it. Empty string on the untrimmed path, so a healthy PPC=1 capture is unchanged.
+/// EPACE-TRIM M4 ANNOTATION — deliberately not called a tripwire. `wake_route` trims its pre-look
+/// settle from 150 ms to 20 ms on PPC=0 silicon (no port-power edge was applied, so none is owed —
+/// see the comment there), and every root-port path that reports a port failing to come up appends
+/// this so a reader does not have to re-derive which settle was in force. What it is NOT is a
+/// discriminator: PPC is a property of the silicon, not of the boot, so on the bench this string
+/// is present on every failure line and absent on none. It narrows a diagnosis; it cannot falsify
+/// the trim, and the §8c falsifier list does not pretend otherwise.
 fn m4_note() -> &'static str {
     if ehci_scout::PWR_SETTLE_TRIMMED.load(core::sync::atomic::Ordering::Relaxed) {
-        " [EPACE-TRIM M4 TRIPWIRE: the pre-look settle was the trimmed 20 ms (PPC=0); suspect this trim first]"
+        " [EPACE-TRIM M4 annotation: the pre-look settle was the trimmed 20 ms (PPC=0) — a constant on this silicon, so this is context, not evidence]"
     } else {
         ""
     }
@@ -867,9 +873,17 @@ impl Controller {
     /// Debounce + reset + enable one root port. Returns true when the port enabled on EHCI
     /// (PED=1 ⇒ a high-speed-capable device trained). PED=0 after a clean reset is the
     /// no-companion release case — paced retries (the xHCI metal lesson), then an honest STOP.
-    unsafe fn reset_root_port(&mut self, port: u32) -> bool {
+    ///
+    /// `debounce` pays the USB 2.0 §7.1.7.3 T_ATTDB connect debounce here. It is `false` for the
+    /// main port walk, which pays it once ahead of the CCS gate that decides whether this function
+    /// is called at all (see the M4 follow-up there) — the debt is paid exactly once, earlier. It
+    /// is `true` for the probe-14 re-init path, which re-routes CONFIGFLAG and comes straight back
+    /// to a known-connected port without passing the gate: that caller owns its own debounce.
+    unsafe fn reset_root_port(&mut self, port: u32, debounce: bool) -> bool {
         let addr = self.op + OP_PORTSC0 + 4 * port as u64;
-        settle_ms(100); // USB 2.0 TATTDB connect debounce (xHCI metal lesson, transport-free)
+        if debounce {
+            settle_ms(100); // USB 2.0 TATTDB connect debounce (xHCI metal lesson, transport-free)
+        }
         for (attempt, pace) in [(1u32, 0u64), (2, 200), (3, 400), (4, 600)] {
             if pace != 0 {
                 settle_ms(pace);
@@ -1115,9 +1129,11 @@ impl Controller {
             // once iterated and the true reset time is somewhere under 50 ms, unmeasured. A
             // constant that hides the number it is standing in for is exactly what the poll is
             // for. So: start at the USB 2.0 §11.5.1.5 T_DRST floor (10 ms — the minimum a hub may
-            // drive reset for) and let the existing bounded poll measure the remainder. The poll's
-            // step is 10 ms, so for any given hardware this can only cost less than the old
-            // constant, never more; the budget (~600 ms) and its loud exit are unchanged.
+            // drive reset for) and let the existing bounded poll measure the remainder. The budget
+            // (~600 ms) and its loud exit are unchanged. The cost is 10 + 10·poll_steps ms against
+            // the old flat 50: cheaper for any port that clears inside 40 ms, equal at 40-50, and
+            // dearer only past 50 — which is exactly where the `>= 4` threshold below starts
+            // printing, so the band where this trim stops paying can never be silent.
             settle_ms(10);
             // Bounded reset-completion poll (explicit loop: each probe is itself a control
             // transfer, so the generic wait_bounded closure can't drive it). ~600 ms worst case.
@@ -1138,19 +1154,25 @@ impl Controller {
                 settle_ms(10);
                 poll_steps = step + 1;
             }
-            // T_RSTRCY (USB 2.0 §7.1.7.5): 10 ms of reset recovery before the device is addressed.
-            // The old blind 50 ms supplied this by accident — it overshot the reset itself, and
-            // whatever was left over served as recovery. M5 makes it explicit rather than a side
-            // effect of an oversized constant, so the recovery survives the trim.
-            if ok {
-                settle_ms(10);
-            }
-            // The M5 measurement, printed only when there is something to report: silence means
-            // the port cleared inside the T_DRST floor. Past the 50 ms the trim replaced, this is
-            // a loud tripwire — that hardware wanted the old constant and the line says so.
-            if poll_steps > 4 {
+            // T_RSTRCY (USB 2.0 §7.1.7.5) is NOT paid here: the `settle_ms(10)` at the bottom of
+            // this loop body, immediately before `enumerate_at_zero`, already is it and predates
+            // M5 (only hub-addressed ClearPortFeature traffic sits between the two points). An
+            // extra one here would have been a second recovery interval, not a restored one.
+            //
+            // The M5 report. Three cases, and the timeout case must not be read as a measurement:
+            // `poll_steps` counts sleeps, so on a budget exhaustion it says 60 whether the bit
+            // never cleared or GET_PORT_STATUS itself was failing. Only the `ok` branch is
+            // allowed to talk about reset timing.
+            if !ok {
                 serial_println!(
-                    ":: EHCI-HID: [{}] EPACE-TRIM M5 TRIPWIRE — hub {} port {} needed ~{} ms to clear PORT_RESET, past the 50 ms constant M5 replaced == witness ::",
+                    ":: EHCI-HID: [{}] EPACE-TRIM M5 TRIPWIRE — hub {} port {} PORT_RESET did not clear inside the ~600 ms poll budget (status {:#010x}); this is a timeout, NOT a reset-time measurement — the poll may also have been failing to read == witness ::",
+                    self.idx, hub.addr, port, status
+                );
+            } else if poll_steps >= 4 {
+                // >= 4, not > 4: at 4 steps the poll has already reached the 50 ms the trim
+                // replaced, so the boundary band is loud rather than silent.
+                serial_println!(
+                    ":: EHCI-HID: [{}] EPACE-TRIM M5 TRIPWIRE — hub {} port {} took ~{} ms to clear PORT_RESET, at or past the 50 ms constant M5 replaced == witness ::",
                     self.idx, hub.addr, port, 10 + poll_steps * 10
                 );
             } else if poll_steps > 0 {
@@ -1181,6 +1203,10 @@ impl Controller {
             // A FS/LS child is reached via THIS hub's TT: hub_addr = the hub, port = this
             // port. A HS child needs no TT (fields stay zero).
             let (ha, hp) = if child_eps == QH_EPS_HIGH { (0, 0) } else { (hub.addr, port as u8) };
+            // T_RSTRCY (USB 2.0 §7.1.7.5): the 10 ms of reset recovery owed before the device is
+            // addressed. Correctly placed — the only traffic between the reset completing and
+            // here is hub-addressed ClearPortFeature. EPACE-TRIM M5 shortened the pre-poll sleep
+            // above; this interval is what keeps the recovery paid, and it predates M5.
             settle_ms(10);
             self.enumerate_at_zero(child_eps, ha, hp, depth + 1);
         }
@@ -3521,13 +3547,36 @@ pub fn init() {
                         }
                     }
                     c.pace.add(EP_SMOKE, smoke_t0);
+                    // EPACE-TRIM M4 follow-up (GR18 review finding 1). The FIRST look at a root
+                    // port is this scan, not `reset_root_port` — this `if` decides whether that
+                    // function is ever called. M4 shortened `wake_route`'s pre-look settle on the
+                    // strength of the caller paying T_ATTDB, and the caller that pays it is
+                    // downstream of a gate that had already sampled CCS. CF 0->1 is a real edge on
+                    // this path (the firmware-stale HCRESET drops CONFIGFLAG, and the first PORTSC
+                    // read comes back 0x00001803 with CSC latched), so sampling CCS ~49 ms after
+                    // it — inside the 100 ms the debounce is for — would let a port whose CCS has
+                    // not re-asserted fall through `continue` with no line, no EPACE class and no
+                    // annotation: a boot that reads FASTER than predicted precisely because the
+                    // internal keyboard went missing. So the debounce is paid HERE, ahead of the
+                    // gate, and dropped from `reset_root_port` for this path: the same 100 ms, at
+                    // the point that actually needs it, and `rootrst=` keeps its old total.
+                    let attdb_t0 = crate::arch::now_cycles();
+                    settle_ms(100); // USB 2.0 §7.1.7.3 T_ATTDB, ahead of the first CCS sample
+                    c.pace.add(EP_ROOTRST, attdb_t0);
                     for port in 0..h.n_ports {
                         let portsc = mmio_read32(h.op + OP_PORTSC0 + 4 * port as u64).unwrap_or(0);
                         if portsc & PORT_CCS == 0 || portsc & PORT_OWNER != 0 {
+                            // Loud, because this is the branch a too-short debounce would take.
+                            serial_println!(
+                                ":: EHCI-HID: [{}] port {} not walked: PORTSC={:#010x} CCS={} owner={} (post-T_ATTDB sample){} ::",
+                                idx, port, portsc, portsc & PORT_CCS,
+                                if portsc & PORT_OWNER != 0 { "companion" } else { "EHCI" },
+                                if portsc & PORT_CCS == 0 { m4_note() } else { "" }
+                            );
                             continue;
                         }
                         let rootrst_t0 = crate::arch::now_cycles();
-                        let root_ok = c.reset_root_port(port);
+                        let root_ok = c.reset_root_port(port, false);
                         c.pace.add(EP_ROOTRST, rootrst_t0);
                         if root_ok {
                             // Transport probe (probe-14): one bare chain-mode GET_DESCRIPTOR(8)
@@ -3570,7 +3619,10 @@ pub fn init() {
                                     }
                                     c.pace.add(EP_HCRST, hcrst2_t0);
                                     let rootrst2_t0 = crate::arch::now_cycles();
-                                    let root2_ok = c.reset_root_port(port);
+                                    // `true`: this path re-routed CONFIGFLAG a few lines up and
+                                    // returns straight to the port without passing the CCS gate,
+                                    // so it owns its own T_ATTDB. Unchanged by the M4 follow-up.
+                                    let root2_ok = c.reset_root_port(port, true);
                                     c.pace.add(EP_ROOTRST, rootrst2_t0);
                                     if !root2_ok {
                                         continue;

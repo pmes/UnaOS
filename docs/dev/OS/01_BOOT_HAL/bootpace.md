@@ -409,11 +409,38 @@ with the capture:
 M4 prices the settle by what happened: `PPC=1` keeps the full 150 ms untouched (this arc
 has no measurement of a real power-on edge, and an undecomposed constant is not trimmed);
 `PPC=0` takes 20 ms, which covers only the CONFIGFLAG 0→1 port-mux re-route, with the
-caller's 100 ms T_ATTDB still landing on top. Tripwire: `PWR_SETTLE_TRIMMED` latches on the
-trimmed path and every root-port failure line — the connect-dropped path and the
-`STOP-NOTE port N did not enable` path — appends
-`[EPACE-TRIM M4 TRIPWIRE: the pre-look settle was the trimmed 20 ms (PPC=0); suspect this
-trim first]`. The one boot where the old value mattered says so on the failing line.
+caller's 100 ms T_ATTDB still landing on top.
+
+**M4's real hazard was the ordering, and that is what the follow-up fixes.** The caller that
+pays T_ATTDB is not the first thing to look at a port. The first look is the CCS gate at the
+top of the port walk — `if portsc & PORT_CCS == 0 || portsc & PORT_OWNER != 0 { continue }` —
+and it decides whether `reset_root_port` is called at all. CF 0→1 is a real edge on this path
+(the firmware-stale HCRESET drops CONFIGFLAG, and the first PORTSC read comes back
+`0x00001803` with CSC latched), so as first written M4 sampled CCS ~49 ms after that edge
+where the old code sampled at ~180 — 51 ms inside the debounce the section above says is
+owed. A port whose CCS had not re-asserted would take the bare `continue`: no line, no EPACE
+class, no annotation, and a boot that reads *faster* than predicted for the worst possible
+reason, the internal keyboard missing. So the debounce is paid **ahead of the gate**
+(`settle_ms(100)` before the port loop, charged to `rootrst`) and dropped from
+`reset_root_port` for that path — the same 100 ms, at the point that needs it, `rootrst=`
+totals unchanged, `n=` one higher per controller. The probe-14 re-init path keeps its own
+debounce: it re-routes CONFIGFLAG and returns to a known-connected port without passing the
+gate. And the skip is now loud: `port N not walked: PORTSC=… CCS=… owner=…
+(post-T_ATTDB sample)`. That line, not a timing number, is what catches this class.
+
+**`PWR_SETTLE_TRIMMED` is an annotation, not a tripwire, and the code says so.** Every
+root-port failure line carries the settle that was in force, which narrows a diagnosis — but
+PPC is a property of the silicon, not of the boot, so on the bench the string is present on
+every failure and absent on none. A latch that cannot vary cannot falsify. It is excluded
+from the falsifier list below for that reason.
+
+**Coverage, stated plainly: M4 and M5 have no QEMU coverage at all.** The x86 QEMU targets
+attach `qemu-xhci` and nothing else — there is no EHCI function in the emulated machine, so
+`drivers/ehci` never runs there. Both trims are exercised only on metal, and the `ppc == 1`
+branch M4 deliberately leaves at 150 ms has no coverage anywhere: it is the untested-but-
+unchanged path, kept precisely because this arc has no measurement that would justify moving
+it. The gates for this work are `./arroyo check` (both arches) plus a metal boot; QEMU-green
+carries zero information about either trim.
 
 **EPACE-TRIM M5 — a blind sleep standing in front of a poll that already existed.**
 The downstream-port reset ran `settle_ms(50)`, then a bounded 60 × 10 ms poll of
@@ -422,15 +449,33 @@ per port on all eight boots — means the poll's **first** probe always found th
 already clear: the loop has never once iterated, and the real reset time is somewhere
 under 50 ms and has never been measured. M5 starts at the USB 2.0 §11.5.1.5 T_DRST floor
 (10 ms, the minimum a hub may drive reset for) and lets the existing poll measure the rest.
-Because the poll's step is 10 ms, this cannot cost more than the old constant on any
-hardware; the budget and its loud exit are unchanged. Two corrections ride with it:
+The cost becomes 10 + 10·`poll_steps` ms against the old flat 50: cheaper for any port that
+clears inside 40 ms, equal in the 40-50 band, dearer only past 50 — and the report threshold
+is `>= 4` precisely so that the band where the trim stops paying can never be silent. The
+budget and its loud exit are unchanged.
 
-* T_RSTRCY (USB 2.0 §7.1.7.5, 10 ms of reset recovery before the device is addressed) was
-  being supplied *by accident* — the oversized 50 ms overshot the reset and the remainder
-  served as recovery. M5 makes it an explicit `settle_ms(10)` so it survives the trim.
-* The number is now printed. Silence means the port cleared inside the T_DRST floor; one
-  line names the observed milliseconds when it did not; past 50 ms — the constant M5
-  replaced — the line is a loud `EPACE-TRIM M5 TRIPWIRE`.
+T_RSTRCY (USB 2.0 §7.1.7.5, 10 ms of reset recovery before the device is addressed) is **not**
+paid by M5 and never needed to be: the `settle_ms(10)` immediately before `enumerate_at_zero`
+already is it, correctly placed — only hub-addressed ClearPortFeature traffic sits between the
+reset completing and that point — and it predates this arc. The first cut of M5 added a second
+one under the belief that the old 50 ms had been supplying the recovery by accident; it was
+not, and the duplicate is gone. That interval is now labelled at its site so the next reader
+does not repeat the mistake.
+
+The number is now printed, in four cases that are deliberately not interchangeable:
+
+* `poll_steps == 0` — silent. **Expected on some ports, not framed as the norm**: an HS hub
+  typically holds PORT_RESET for ~20 ms through the handshake, so `poll_steps` of 1-2 on most
+  ports every boot is the healthy reading, not a regression. Silence means only that this
+  particular port cleared inside the 10 ms T_DRST floor.
+* `0 < poll_steps < 4` — one quiet line naming the observed milliseconds.
+* `poll_steps >= 4` **with the bit actually cleared** — `EPACE-TRIM M5 TRIPWIRE`: this
+  hardware wanted the old constant.
+* the bit never cleared — a *separate* `EPACE-TRIM M5 TRIPWIRE` that names the timeout and
+  says in the line that it is not a reset-time measurement. `poll_steps` counts sleeps, so on
+  budget exhaustion it reads 60 whether PORT_RESET was stuck or `GET_PORT_STATUS` itself was
+  failing; the first cut printed "needed ~610 ms to clear PORT_RESET" in both cases, which the
+  very next line contradicted.
 
 **Prediction for the next metal boot** (before → after, and the lines that decide it):
 
@@ -438,18 +483,37 @@ hardware; the budget and its loud exit are unchanged. Two corrections ride with 
 |---|---|---|
 | `EPACE: [0] hcrst=` | 307 ms | **47 ms** (2 × ~4 ms HCRESET + 2 × 20 ms settle) |
 | `EPACE: [1] hcrst=` | 154 ms | **24 ms** |
-| `EPACE: [0] hubrst=` | 50 ms (n=1) | **20-32 ms** |
-| `EPACE: [1] hubrst=` | 250 ms (n=5) | **100-160 ms** |
-| `EPACE: … init=` | 2021 ms | **1460-1525 ms** |
-| `BPACE: ehci-hid-done d=` | 2021 ms | **1460-1525 ms** (self-check: must equal `init=` per §8) |
-| `BPACE: total gui=` | 6242 / 6266 ms | **≈ 5700 ms** |
+| `EPACE: [0] hubrst=` | 50 ms | **10-22 ms** |
+| `EPACE: [1] hubrst=` | 250 ms | **50-110 ms** (10-22 ms × 5 ports) |
+| `EPACE: [0] rootrst=` | 320 ms | **320 ms, unchanged** — the debounce moved earlier inside the same class |
+| `EPACE: [1] rootrst=` | 160 ms | **160 ms, unchanged** |
+| `EPACE: … init=` | 2021 ms | **1400-1470 ms** |
+| `BPACE: ehci-hid-done d=` | 2021 ms | **1400-1470 ms** (self-check: must equal `init=` per §8) |
+| `BPACE: total gui=` | 6242 / 6266 ms | **≈ 5640-5700 ms** |
 
 M4's share is deterministic (−130 ms × 3 = −390 ms of pure sleep); M5's is the measured
-unknown (−110 to −170 ms), which is the point of it. Falsifiers, in order: an
-`EPACE-TRIM M5 TRIPWIRE` line (the hubs wanted the old 50 ms); an
-`EPACE-TRIM M4 TRIPWIRE` clause on a root-port failure (the 150 ms was load-bearing); or
-`init=` and `ehci-hid-done d=` disagreeing by more than the EPACE print cost, which would
-mean one of the two instruments is lying rather than that the trim worked.
+unknown (−170 to −240 ms), which is the point of it. This table is the **re-issued**
+prediction: the first cut said 1460-1525 ms because it double-paid T_RSTRCY, ~10 ms on each
+of six ports.
+
+**Structural falsifiers — the `n=` counts, which move independently of any timing.** A trim
+that quietly loses a device makes every `ms` reading in the table look *better*, so the
+counts are the real gate and any change to one falsifies the arc regardless of `init=`:
+
+| reading | required | what a change would mean |
+|---|---|---|
+| `EPACE: [0] rootrst n=` | **3** (was 2) | +1 is the pre-scan T_ATTDB becoming its own span. Anything else: a root port stopped being walked. |
+| `EPACE: [1] rootrst n=` | **2** (was 1) | same |
+| `EPACE: [0] hubpwr n=` / `[1] hubpwr n=` | **1** / **2** | a hub tier vanished from the walk |
+| `EPACE: [1] hubrst n=` | **5** | a downstream port stopped being reset — the exact silent-skip class finding 1 was about |
+| `:: EHCI-HID: [1] M2 armed keyboard addr=6 ep=IN3 mps=10 interval=8 (boot protocol) ==` witness `::` | **present, identical** | the internal keyboard is the whole point of this driver; if this line moves or goes, nothing else in the table matters |
+| `:: EHCI-HID: [N] port P not walked: …` | **absent** on a healthy boot | a root port failed the post-T_ATTDB CCS sample |
+
+Timing falsifiers, after those: an `EPACE-TRIM M5 TRIPWIRE` (the hubs wanted the old 50 ms,
+or the poll timed out); or `init=` and `ehci-hid-done d=` disagreeing by more than the EPACE
+print cost, which would mean one of the two instruments is lying rather than that the trim
+worked. The M4 annotation is deliberately **not** on this list — see above; it cannot vary on
+this silicon.
 
 **Not trimmed, and why.** `hubpwr` (600 ms) and `rootrst` (480 ms) are 1080 ms of USB 2.0
 minima. Cutting either buys a second and violates the spec; they are named here so the

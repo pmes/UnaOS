@@ -637,7 +637,18 @@ unsafe fn configure_controller(bus: u8, dev: u8, func: u8, idx: usize) -> (u32, 
 
     wake_route(&h, idx);
 
-    // ---- Census B: RS=1, CONFIGFLAG=1, ports powered, after settle. ----
+    // EPACE-TRIM M4 does not reach this artifact (GR18 review finding 2). censusB's whole meaning
+    // is "PORTSC after the route flip AND the full connect debounce" — it is the canonical EHCI-2
+    // evidence reading, and every earlier capture of it was taken 150 ms after the flip. M4 short-
+    // ened `wake_route`'s settle on the strength of its ONE other caller paying T_ATTDB itself;
+    // this evidence path has no such caller and would silently start sampling at 20 ms, changing
+    // what the artifact means without changing its name. Pay the remainder explicitly, and only
+    // where M4 actually took it (PPC=1 still gets the full 150 ms inside `wake_route`).
+    if ppc != 1 {
+        settle_ms(130);
+    }
+
+    // ---- Census B: RS=1, CONFIGFLAG=1, ports powered, after the full 150 ms settle. ----
     let census_b = census(op, n_ports, idx, "B");
 
     serial_println!(
