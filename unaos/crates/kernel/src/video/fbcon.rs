@@ -845,8 +845,10 @@ static PACE_LAST: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 static PACE_RAN: AtomicU64 = AtomicU64::new(0);
 
-/// FBCON-PACE census — presents the pacing gate HELD (rows left owed in [`PEND`], carried by the
-/// next present). `ran + held + busy` is every call that reached the gate with a live route.
+/// FBCON-PACE census — presents the pacing gate HELD, counting ONLY calls that had rows of their own
+/// to defer ([`Owed::Band`] / [`Owed::Whole`]). That is the count of coalesced LINES, which is what
+/// the name is read as; a service-hook pass that added nothing and was not yet due is `idle`, not
+/// held. See [`console_pace_census_once`] for the identity the four counters close.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 static PACE_HELD: AtomicU64 = AtomicU64::new(0);
 
@@ -856,6 +858,17 @@ static PACE_HELD: AtomicU64 = AtomicU64::new(0);
 /// difference between the two.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 static PACE_BUSY: AtomicU64 = AtomicU64::new(0);
+
+/// FBCON-PACE census — calls that owed nothing and presented nothing: a [`console_service`] pass on
+/// a clean or not-yet-due ledger, and a control-only print. Without it the identity does not close —
+/// the arm that wins the re-entry guard and finds [`Owed::Nothing`] was landing in no bucket at all,
+/// and it is the COMMON shape of the service hook.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PACE_IDLE: AtomicU64 = AtomicU64::new(0);
+
+/// FBCON-PACE — one-shot latch for [`console_pace_census_once`].
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PACE_CENSUS_DONE: AtomicBool = AtomicBool::new(false);
 
 /// FBCON-PACE — is a present DUE, i.e. has a frame period elapsed since the last one finished?
 ///
@@ -918,30 +931,85 @@ fn route_present_pending() {
     route_present_banded(Owed::Nothing, true)
 }
 
+/// FBCON-PACE — THE IDLE-LOOP SERVICE HOOK. Retire rows a held present left owed, **still paced**.
+///
+/// ### Why the bench lane needs it, and why it is not the forced flush
+///
+/// A held band is carried by the NEXT present, and on the print path the next present is the next
+/// print. When printing stops mid-burst the last band waits — after boot, potentially on operator
+/// action. [`detach`] is the backstop for GUI boots, and the metal bench lane **never detaches**:
+/// the `usbdebug` view keeps fbcon attached by design (`main.rs`, the USB-debug loop), which is
+/// exactly the lane the routed console runs on and the lane this arc's prediction is measured on.
+///
+/// So the `usbdebug` service loop calls this once per pass, beside `bootpace::service_dump`. The
+/// loop `hlt()`s and the x86 heartbeat is `apic::TICK_HZ` = 1 kHz, so a pass is at most ~1 ms out
+/// and **worst-case staleness of a held band is one frame period plus one pass, ≈ 17.7 ms** — the
+/// bound that replaces "until the next print".
+///
+/// It is deliberately the PACED call and not [`console_flush`]. A forced flush at the loop's 1 kHz
+/// cadence would present every held band within a millisecond, which is the pacing gate switched
+/// off for every line printed from inside the loop's own services — and those services (xHCI
+/// enumeration, storage, FTDI) are where a large share of the routed lines after
+/// `console-route first-paint` come from. Paced, this hook adds no present the gate would not
+/// already have allowed: it can only ever move a present EARLIER within the frame it was already
+/// going to happen in, so the predicted present count is unchanged.
+///
+/// Silent, and free on a clean ledger: `pend_take` answers `Owed::Nothing` and nothing is composited.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn console_service() {
+    route_present_banded(Owed::Nothing, true)
+}
+
 /// FBCON-PACE — a SYNC point: present everything owed NOW, whatever the pacing gate would say.
 ///
-/// The routed console has no timer to call it back — the flush rides the print path — so a burst
-/// that simply STOPS would leave its last band owed until the next print. This is the seam that
-/// closes that: it is called from [`detach`], the moment the GUI takes the panel and no further
-/// print will ever route, and it is `pub` so any idle-loop or end-of-boot caller can use it for the
-/// same reason. No-op unless the console is routed, so nothing off the x86 `wc` path even prints.
+/// Called from [`detach`], the moment the GUI takes the panel and no further print will ever route,
+/// and from [`console_pace_census_once`] so its own line lands. `pub` so any end-of-boot caller can
+/// use it for the same reason. SILENT — the census used to live here and was split out, because a
+/// flush that is called once per service pass must not print once per service pass.
+///
+/// No-op unless the console is routed, and free on a clean ledger.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub fn console_flush() {
+    route_present_banded(Owed::Nothing, false)
+}
+
+/// FBCON-PACE — the pacing census, once per boot.
+///
+/// Emitted from a one-shot in the `usbdebug` service loop beside `xhci::log_summary_once`, i.e.
+/// after enumeration and after the boot burst this arc reshapes, so the numbers cover the burst.
+/// `[wc-x]` is not on [`PANEL_MUTE_TAGS`], so it reaches the glass as well as the wire.
+///
+/// THE IDENTITY THE LINE ASSERTS: `ran + held + busy + idle` is every call that reached the gate
+/// with a live route and an unsuspended console — one bucket per call, no call in two, no call in
+/// none. (Calls that return earlier are outside it by construction: no route, or the INSTGUI
+/// suspension, both of which are declines this arc did not author.)
+///   * `ran`  — a present was issued to `wm`.
+///   * `held` — the gate deferred rows THIS call added. The count of coalesced lines.
+///   * `busy` — the [`ROUTE_BUSY`] re-entry guard declined.
+///   * `idle` — the call added nothing and presented nothing: a service-hook pass on a clean or
+///     not-yet-due ledger, or a control-only print. Kept OUT of `held` deliberately — charging it
+///     there would inflate "lines coalesced" with calls that carried no line at all.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn console_pace_census_once() {
     if CONSOLE_WIN.load(Ordering::Relaxed) == wm::WIN_NONE {
+        return;
+    }
+    if PACE_CENSUS_DONE.swap(true, Ordering::Relaxed) {
         return;
     }
     // The census goes out BEFORE the flush, so its own glyphs are carried by the flush it describes
     // rather than left owed behind it. The numbers therefore describe the run up to this line, which
     // is what they claim.
     serial_println!(
-        "[wc-x] console-pace ran={} held={} busy={} budget_us={} hz={}",
+        "[wc-x] console-pace ran={} held={} busy={} idle={} budget_us={} hz={}",
         PACE_RAN.load(Ordering::Relaxed),
         PACE_HELD.load(Ordering::Relaxed),
         PACE_BUSY.load(Ordering::Relaxed),
+        PACE_IDLE.load(Ordering::Relaxed),
         1_000_000 / PACE_HZ,
         crate::arch::apic::tsc_hz()
     );
-    route_present_banded(Owed::Nothing, false);
+    console_flush();
 }
 
 /// The body every routed present shares.
@@ -969,7 +1037,8 @@ pub fn console_flush() {
 /// ### The three flush triggers
 ///
 /// 1. **Time** — a frame period since the last present finished ([`pace_due`]). This is the trigger
-///    the hot path rides: it needs no timer, because the next print asks the question.
+///    the hot path rides: it needs no timer, because the next print asks the question — and, on the
+///    lane where printing can stop, because the service loop asks it too ([`console_service`]).
 /// 2. **Urgency** — a caller that passes `coalesce = false` is never held: the route's own first
 ///    paint, [`clear`], the INSTGUI resume, and the [`console_flush`] sync point.
 /// 3. **Panic** — [`pace_due`] returns `true` whenever [`PANIC_MIRROR`] is armed, so no panic output
@@ -988,16 +1057,27 @@ pub fn console_flush() {
 /// presents / 28 084 rows if saturation also flushed. Staleness is already bounded by the time
 /// trigger, which is the property a span bound would have been reached for.
 ///
+/// ### How stale a held band can get
+///
+/// Bounded, and by a different bound on each lane.
+///   * **The `usbdebug` bench lane** — one frame period (the gate) plus one service-loop pass. The
+///     loop `hlt()`s against the 1 kHz x86 heartbeat (`apic::TICK_HZ`), so a pass is ~1 ms out and
+///     the bound is **≈ 17.7 ms**. See [`console_service`].
+///   * **GUI boots** — the next print, with [`detach`] as the backstop: it flushes before the GUI
+///     takes the panel, so nothing the console painted is left owed at the handoff.
+///   * **Panic** — zero. Trigger 3.
+///
 /// ### What `[wc-h] span=` means now, and why the censuses stay honest
 ///
 /// `span=` used to be ONE console line's damage. It is now the union of every line since the last
 /// present, so the same wire word denotes a larger, rarer band — bands near the surface height on a
 /// boot burst, and single-line bands whenever printing is slower than a frame. `[wc-h]`'s
 /// `whole=`/`banded=` censuses count real presents either way and are the proof lines for this arc:
-/// `banded=` collapsing while the console keeps printing IS the feature working. Nothing becomes
-/// unobservable — a held present is counted in [`PACE_HELD`] and reported by [`console_flush`], a
-/// re-entry decline in [`PACE_BUSY`] (counted here for the first time), and the rows themselves are
-/// in [`PEND`], which no path in this file drops.
+/// `banded=` collapsing while the console keeps printing IS the feature working. (`wcg`'s own
+/// rollup doc is reconciled with both readings at its `banded=0` and `span=` notes.) Nothing becomes
+/// unobservable — every call that reaches the gate lands in exactly one of [`PACE_RAN`],
+/// [`PACE_HELD`], [`PACE_BUSY`] or [`PACE_IDLE`], reported by [`console_pace_census_once`], and the
+/// rows themselves are in [`PEND`], which no path in this file drops.
 ///
 /// The `[wc-d]` reference discipline is untouched: WCD-PRE takes its reference from the composite
 /// loop before the blit, and the print hazard it exists for is a print that MERGES and DECLINES —
@@ -1021,7 +1101,12 @@ fn route_present_banded(owed_now: Owed, coalesce: bool) {
     // FBCON-PACE: the gate. Rows stay owed; the next present carries them. The clock is read only on
     // the coalescing path — a caller that will present regardless has no question to ask it.
     if coalesce && !pace_due(crate::arch::now_cycles()) {
-        PACE_HELD.fetch_add(1, Ordering::Relaxed);
+        // `held` means "this call's own rows were deferred". A caller that brought no rows brought
+        // no line, so it is `idle` — see the identity on `console_pace_census_once`.
+        match owed_now {
+            Owed::Nothing => PACE_IDLE.fetch_add(1, Ordering::Relaxed),
+            _ => PACE_HELD.fetch_add(1, Ordering::Relaxed),
+        };
         return;
     }
     // Re-entry: see `ROUTE_BUSY`.
@@ -1040,6 +1125,7 @@ fn route_present_banded(owed_now: Owed, coalesce: bool) {
         // changed. (`pend_take`'s CONTENDED arm answers `Whole`, never `Nothing`, so a ledger that
         // MIGHT hold rows still repaints; degradation stays in the paint-MORE direction.)
         Owed::Nothing => {
+            PACE_IDLE.fetch_add(1, Ordering::Relaxed);
             ROUTE_BUSY.store(false, Ordering::Release);
             return;
         }
@@ -1096,6 +1182,17 @@ fn route_present_pending() {}
 #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
 #[inline]
 pub fn console_flush() {}
+
+/// No-op off the routed x86 path (see the x86 definition). The `usbdebug` service loop calls this
+/// on every arch and every build; off the routed path there is no ledger to service.
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+#[inline]
+pub fn console_service() {}
+
+/// No-op off the routed x86 path (see the x86 definition). There is no pacing gate to report on.
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+#[inline]
+pub fn console_pace_census_once() {}
 
 /// No-op off the wc path (see the x86 definition).
 #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
@@ -1334,9 +1431,18 @@ impl PanelSink {
         if self.routed {
             if self.band.1 > self.band.0 {
                 route_present_rows(self.band);
+            } else {
+                // An empty band on a routed line means the bytes were `\r`/control only — no glyph
+                // moved, so this line owes no rows of its own.
+                //
+                // FBCON-PACE: it must still reach the gate. This is the DOMINANT routed print path,
+                // and returning here without asking would mean a run of control-only lines gave a
+                // band an earlier line left held no chance to retire — compounding staleness on the
+                // one path that prints most. `route_present_pending` adds nothing and presents only
+                // what is already owed and due, which is what `print_masked` and `milestone` do with
+                // the same case.
+                route_present_pending();
             }
-            // An empty band on a routed line means the bytes were `\r`/control only — no glyph moved,
-            // so there is nothing on the surface to present and no present is owed.
             self.band = (0, 0);
             self.routed = false;
         }
@@ -1420,12 +1526,16 @@ impl core::fmt::Write for Sink<'_> {
 /// Hand the framebuffer to the GUI: stop mirroring serial output onto it. Call once the GUI has
 /// painted its first frame. Serial output is unaffected; panics re-enable the mirror.
 ///
-/// FBCON-PACE — THE SYNC POINT. This is the last moment a routed console line can reach glass: from
-/// the store below onwards `_print` returns at its first test and no further print will ever ask for
-/// a present. Anything the pacing gate is still holding is flushed FIRST, so the guarantee the gate
-/// makes ("a held band is carried by the next present") has a next present to be carried by even
-/// when the printing simply stops. No-op unless the console is routed into a window, so aarch64 and
-/// every x86 build without `wc` reach the store exactly as before.
+/// FBCON-PACE — THE SYNC POINT ON THE BOOTS THAT REACH IT. This is the last moment a routed console
+/// line can reach glass: from the store below onwards `_print` returns at its first test and no
+/// further print will ever ask for a present. Anything the pacing gate is still holding is flushed
+/// FIRST, so the guarantee the gate makes ("a held band is carried by the next present") has a next
+/// present to be carried by even when the printing simply stops.
+///
+/// It is NOT the bench lane's backstop and must not be mistaken for one: the metal `usbdebug` view
+/// keeps fbcon attached and never calls this at all. That lane is served per pass by
+/// [`console_service`]. No-op unless the console is routed into a window, so aarch64 and every x86
+/// build without `wc` reach the store exactly as before.
 pub fn detach() {
     console_flush();
     GUI_ACTIVE.store(true, Ordering::Relaxed);

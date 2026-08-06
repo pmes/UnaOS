@@ -911,6 +911,13 @@ fn emit_sample(id: u32, i: usize) {
         // short window. `bytes=` is unchanged and still `row_bytes * span` — what reached the glass.
         // On aarch64 no band is ever produced, so `span == bh`, `box=` prints exactly what it always
         // printed, and `band=no` on every line.
+        //
+        // FBCON-PACE — and on the ROUTED CONSOLE `span=` no longer describes one printed line. The
+        // console coalesces its damage and presents at most once per frame period, so this span is
+        // the UNION of every line since its last present: larger and rarer than it used to read, at
+        // or near the box height through a boot burst and single-line only when printing is slower
+        // than a frame. It is still exactly the rows this present wrote — the definition did not
+        // move, the producer did. See `fbcon::route_present_banded`.
         serial_println!(
             "[wc-h] win={} box={}x{} span={} band={} bytes={} compose_us={} present_us={} rectscan_us={} torn={} -> BUFFERED",
             id,
@@ -1008,7 +1015,12 @@ fn emit_sample(id: u32, i: usize) {
 /// - `-> UNSTAGED` — `declines > 0`; a composite reached the panel through the pre-WC-H direct path.
 ///   Also FORBIDden.
 /// - `banded=0` on the latest line of a window the console is known to be routing damage into —
-///   FBCON-DMG is not reaching the compositor at all.
+///   FBCON-DMG is not reaching the compositor at all. **FBCON-PACE qualifies this reading:** a
+///   SMALL `banded=` beside a console that is printing steadily is now the expected state, not a
+///   defect — the console coalesces per frame period, so `banded=` counts frames, not lines, and
+///   watching it collapse while `lines=` keeps climbing is the pacing gate working. The failure
+///   this bullet names is `banded=0` *exactly*: not one banded present in the whole window's life,
+///   which no amount of coalescing can produce while any routed line is drawn.
 /// - `minspan=` at or near the box height with a large `banded=` — banding is happening and buying
 ///   nothing. This is the reading a session drew from boot A's `banded=1 minspan=736`; the difference
 ///   is that `emit=` and `age_ms=` now say whether the line describes a startup burst or a steady

@@ -1016,6 +1016,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // BPACE: re-emit the boot-phase timing ledger whenever it grows. Ungated, deliberately —
             // see `bootpace::service_dump`. Cheap when idle (one snapshot + one length compare).
             unaos_kernel::bootpace::service_dump();
+            // FBCON-PACE: retire any console damage the pacing gate is holding. THIS LANE NEVER
+            // DETACHES (see the U2 note below — the usbdebug view keeps fbcon attached on purpose),
+            // so `fbcon::detach`'s sync flush is unreachable here and a burst that stops mid-frame
+            // would otherwise leave its last band owed until the next print — after boot, until the
+            // operator types. The call is PACED, not forced: it can only move a present earlier
+            // within the frame it was already going to happen in, never add one. Free on a clean
+            // ledger, and a no-op on every build where the console is not routed into a window.
+            unaos_kernel::video::fbcon::console_service();
             // FLIGHT-RECORDER (x86): flush the captured serial boot log to UNAOS.LOG (usbdebug metal
             // boot benefits from an on-disk log too). Gated on storage; throttled; never blocks boot.
             #[cfg(target_arch = "x86_64")]
@@ -1049,6 +1057,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             #[cfg(all(target_arch = "x86_64", feature = "witness"))]
             unaos_kernel::arch::syscall::u6bx_probe_once();
             unaos_kernel::drivers::xhci::log_summary_once();
+            // FBCON-PACE: the console's present census, once, HERE — beside the xHCI summary, i.e.
+            // after enumeration and after the boot burst the pacing gate reshapes, so the numbers
+            // cover the burst. This is the only place it is emitted on the bench lane: the census
+            // used to ride `fbcon::console_flush`, which this lane never calls (no detach), and a
+            // flush that now runs once per service pass must not print once per service pass.
+            unaos_kernel::video::fbcon::console_pace_census_once();
             // VPERF (videobench knob, x86 only): the deterministic scripted scroll scenario —
             // one-shot, fires after the one-shot fixtures above have gone quiet, so the screen
             // settles on the scenario tail (what the DONE-gate screendump compares).
