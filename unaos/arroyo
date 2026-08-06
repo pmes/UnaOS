@@ -91,6 +91,16 @@ _feats=""
 # ZERO `uvug7` strings and the witness cannot fire. Every boot now states its own witness build state on
 # the `:: AARCH64 build: witness=... ::` line, so absence is never mistaken for failure again.
 [ -n "${UNAOS_WITNESS:-}" ] && _feats="${_feats}witness,"
+# WC-G/M3 (PAYGO): UNAOS_WCG_PAYGO=1 arms the `wcg-paygo` feature — the pay-as-you-go reshape of the
+# `[wc-g]` glass battery (x86_64 only). Pass 1 becomes lattice-sampled and says so on the wire
+# (`coverage=lattice16`); passes 2..4 keep FULL coverage but wait for 15 s of uptime, so the ~11.5 s
+# the battery used to take out of the boot is paid on a live desktop instead. Only the read-back is
+# reshaped: the four checksum legs run in full on every sampled pass and every FORBID stays armed for
+# the whole boot. Needs UNAOS_WITNESS to reach anything — `video/wcg.rs` is `witness`-gated — and
+# means nothing on aarch64. DEFAULT OFF => every `[wc-g]` line is byte-identical to the pre-M3 wire.
+# NOT yet plumbed through `builder/src/main.rs`, which re-derives the x86 feature list from env for
+# the media/battery commands, so today this knob reaches `check` and not `test`/`esp-x86`.
+[ -n "${UNAOS_WCG_PAYGO:-}" ] && _feats="${_feats}wcg-paygo,"
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
 [ -n "${UNAOS_BOOTLOG:-}" ] && _feats="${_feats}bootlog,"
 # CLOCK-2: UNAOS_LOGTS=1 arms the `logts` feature — a compact timestamp prefix on each serial LINE
@@ -900,7 +910,7 @@ check_user_arch() {
 }
 
 # GATE-CFG: the DEFAULT feature set is a tiny fraction of this kernel. `[features]` in
-# crates/kernel/Cargo.toml carries 76 knobs plus `default = []`, so the two legs below compile only
+# crates/kernel/Cargo.toml carries 77 knobs plus `default = []`, so the two legs below compile only
 # what survives with every knob off — and `$KERNEL_FEATURES` (the UNAOS_* → cargo-feature mapping at
 # the top of this script) adds knobs only when the OPERATOR sets them, which nobody does before a
 # commit. Everything behind a `#[cfg(feature = ...)]` was therefore NEVER type-checked by the gate.
@@ -927,7 +937,7 @@ check_user_arch() {
 #     arm legs would buy zero coverage and cost a compile, so they are excluded ON EVIDENCE.
 #
 # COVERAGE ARGUMENT (why 3 legs + the 2 default legs are enough). The union of the three feature lists
-# below is EXACTLY the `[features]` table minus `default` — 76 of 76, no more and no less, so a knob
+# below is EXACTLY the `[features]` table minus `default` — 77 of 77, no more and no less, so a knob
 # added to Cargo.toml without a leg here is a one-line diff to spot. And the DEFAULT legs already
 # compile the all-off state for both arches — so for every feature BOTH polarities of its `#[cfg]` are
 # type-checked, which is what makes the 61
@@ -948,11 +958,13 @@ check_user_arch() {
 # does NOT thrash. Warm, all three legs are cache hits; cold-for-these-feature-sets they cost about
 # 3-6 s each on top of a warm dependency graph.
 KERNEL_CFG_MATRIX=(
-  # x86_64, every feature that emits x86 code. Covers (among others) wcg (witness), wcx + the fbcon
+  # x86_64, every feature that emits x86 code. Covers (among others) wcg (witness) and its PAYGO
+  # reshape (wcg-paygo — an x86-only `#[cfg]` inside a witness-only module, so this is the ONLY leg
+  # that type-checks it at all), wcx + the fbcon
   # CONSOLE-WINDOW route (wc), instgui, the Kepler trio, IVB/GMUX, VPERF (videobench/videocap), the
   # EHCI family + KBDWIT, MTRAW + its inject sub-knob, STOR-1 (irqstorage), the BOT fault/ring
   # experiments, BENCH-RIDE (therm/pcilink/vrom), SMC, the rasterizer and the installer engine.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,rast,installdemo"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,rast,installdemo"
   # aarch64 board leg 1 — Raspberry Pi 4 bare metal. `baremetal` ⇒ `pi`, which is what unlocks wcf
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the

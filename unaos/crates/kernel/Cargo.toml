@@ -43,6 +43,17 @@ gmux_igd = []
 # so witness coverage is unchanged-green; the boot/media builds (`x86`/`arm`/`esp-*`/`kernel8`) leave it
 # off. Gates CALL SITES only — never the fixture bodies. See review/unaos-default-quiet-LANDING.md.
 witness = []
+# WC-G/M3 (PAYGO): reshape the `witness` build's `[wc-g]` glass battery so a boot does not pay for
+# all four passes at once. x86_64 only, and it changes only the READ-BACK: pass 1 becomes
+# lattice-sampled (every 16th source pixel per row, phase rotating one column per row) and marks
+# itself `coverage=lattice16` on the wire; passes 2..4 stay FULL coverage but are deferred until 15 s
+# of uptime, so the battery completes on a live desktop instead of inside the boot burst. The four
+# checksum legs are untouched and every FORBID stays armed the whole boot. A deferred pass does not
+# spend budget and never goes quiet — it prints `[wc-g] paygo … -> DEFERRED` and keeps an unbudgeted
+# `deferred=` census. Requires `witness` (the module is `#[cfg(feature = "witness")]`); DEFAULT OFF =>
+# every `[wc-g]` line is byte-identical to the pre-M3 wire and aarch64 is unaffected either way.
+# Enable via `UNAOS_WCG_PAYGO=1`. See video/wcg.rs §WC-G/M3.
+wcg-paygo = []
 # Skip xHCI/USB bring-up entirely (`pci::init`). For real-hardware video bring-up where the
 # firmware/SMM may still own the xHCI controller (this branch has no BIOS->OS handoff) and wedge
 # its reset handshake — the controller's status bits never flip, so the bounded-but-slow timeout

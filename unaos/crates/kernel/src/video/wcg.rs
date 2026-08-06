@@ -191,11 +191,84 @@
 //! greatest `emit=` supersedes every earlier one, and rollup lines are never summed. They are
 //! snapshots of monotone totals, not deltas, which is also why re-emission cannot double-count
 //! anything — see [`census_refresh`].
+//!
+//! ## WC-G/M3 — what the battery costs, and paying for it as it is used
+//!
+//! M1 decomposed the pass and named the phase: on x86 an armed boot spends ~2.87 s per instrumented
+//! `[wc-g]` pass and ~11.5 s of a 17.3 s block on four of them, against ~1.4 s of real GPU work, and
+//! the glass read-back is where it goes. The reason is the target rather than the loop — the Kepler
+//! framebuffer is write-combining PCIe memory, so each `read_pixel` is three uncached round trips to
+//! the device and there is one `read_pixel` per source pixel. M3 does two things about that, and only
+//! one of them is a coverage decision.
+//!
+//! **The read shape, on x86 and unconditionally.** [`readback`] now walks a destination row through
+//! [`GlassRow`], which reads the aperture in aligned 64-bit words and holds the last word so that
+//! adjacent probes share a transaction. Three byte trips per pixel become one word trip per pixel,
+//! or per two pixels where the probes are contiguous. The SAME probe set is evaluated against the
+//! same bytes, with `read_pixel`'s bounds and colour decode reproduced exactly and delegated to
+//! wherever the wide path's preconditions do not hold — so `fbbad`, `checked` and every verdict are
+//! unchanged. Nothing about what this witness can catch moves, which is why it carries no knob.
+//! aarch64 keeps the per-probe `read_pixel` call it has always made.
+//!
+//! **The battery's shape, under `wcg-paygo` and on x86 only.** Knob off, the four passes are what
+//! they were and every line is byte-identical. Knob on, a window's battery is paid as the desktop
+//! uses it rather than as the boot starts it:
+//!
+//! | pass | coverage | when | on the wire |
+//! |------|----------|------|-------------|
+//! | 1 | LATTICE — every [`PAYGO_LATTICE_N`]th source pixel per row, phase rotating one column per row | immediately, as before | `coverage=lattice16` |
+//! | 2..[`SAMPLES`] | FULL — every source pixel | once uptime passes [`PAYGO_DEFER_US`] | `coverage=full` |
+//!
+//! ### What a sampled pass catches, and what it cannot
+//!
+//! Stating this is the point of the marker, so it is stated here in full rather than implied by the
+//! step. A lattice pass CATCHES:
+//!
+//! - **band and smear-class defects** — the defect class WC-G was built for and the shape in the
+//!   photograph. Every row is probed at every step, so a full-row band cannot be missed at all.
+//! - **any horizontal garble run of [`PAYGO_LATTICE_N`] pixels or more**, in any row, deterministically:
+//!   a run that wide contains a probe whatever the row's phase.
+//! - **stride and geometry faults** — a wrong row step, pitch or origin displaces the whole surface,
+//!   which no probe in any row agrees with.
+//! - **a one-pixel-wide vertical defect**, within [`PAYGO_LATTICE_N`] rows: the phase rotates by one
+//!   column per row, so every column is probed once over any `PAYGO_LATTICE_N` consecutive rows.
+//!
+//! It CANNOT catch an **isolated single-pixel blit error** — one wrong pixel, in one row, at a column
+//! that row's phase does not visit. That is the whole of the narrowing, and it is why full coverage
+//! is deferred rather than dropped: passes 2..4 probe every pixel, so the battery still ends with the
+//! coverage it always had, on a live desktop instead of inside the boot burst.
+//!
+//! ### Nothing stops counting, and nothing goes quiet
+//!
+//! WC-H2's law governs here too, and each half of it is discharged by a specific field:
+//!
+//! - A sampled pass is marked ON ITS OWN LINE. `checked` was always the honest denominator, but a
+//!   denominator does not say why it is small; `coverage=` does, and a knob-on build marks the full
+//!   passes too so the marker's absence is never the thing carrying the meaning. No `fbbad=0/…` in
+//!   this module ever reads as a clearance it did not earn.
+//! - A deferred pass is a pass DECLINED, not a counter capped. [`PAYGO_DEFERRED`] counts every
+//!   declined blit, unbudgeted, and the first decline on a window prints
+//!   `[wc-g] paygo … state=waiting … -> DEFERRED` — so a configuration in which the deferred half can
+//!   never run says so at the moment it starts waiting, rather than by an absence a reader would have
+//!   to notice. The same census is re-read as `deferred=` on the `state=complete` line beside the
+//!   rollup, and the rollup itself carries `paygo=yes` so the verdict names the policy it was drawn
+//!   under.
+//! - The budget is not spent by a decline, so a window that stops presenting keeps its remaining
+//!   samples unspent. That is not a new behaviour to reason about: it is exactly what this module
+//!   already does with a window that stops compositing.
+//!
+//! Every FORBID stays armed for the whole boot either way. The checksum legs — `app`, `blit`,
+//! `civac`, `after` — are cacheable RAM reads, cheap next to the glass, and run in full on EVERY
+//! sampled pass unchanged. Only the read-back is what sampling and deferral reshape.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::FrameBuffer;
 use crate::arch::now_cycles;
+/// WC-G/M3 — the wide glass read-back decodes the panel's colour order itself, where
+/// [`super::FrameBuffer::read_pixel`] decodes it per pixel. x86 only, like the path that uses it.
+#[cfg(target_arch = "x86_64")]
+use unaos_boot_info::PixelFormat;
 
 /// Instrumented blits per window id. Four is enough to distinguish a steady state from a one-off
 /// and small enough that the checksum reads do not dominate the interval being timed.
@@ -1316,7 +1389,11 @@ fn budget_left() -> bool {
 /// from `wm::present`, after the table lock is dropped and before the composite.
 pub fn on_present(id: u32, surf: usize, surf_len: usize) {
     let i = id as usize;
-    if i >= IDS || !budget_left() {
+    // WC-G/M3 — `paygo_arm` is the deferral gate's other end, and it is not an optimisation: without
+    // it this checksum would run on every present for the whole deferral window, because a deferred
+    // window's budget stays unspent and `budget_left` therefore stays true. See [`paygo_arm`]. It is
+    // `true` and folds away on every build but an x86 `wcg-paygo` one.
+    if i >= IDS || !budget_left() || !paygo_arm(i) {
         return;
     }
     APP_CKS[i].store(checksum(surf, surf_len), Ordering::Relaxed);
@@ -1346,6 +1423,417 @@ pub struct Probe {
     t0: u64,
 }
 
+// ---- WC-G/M3 — the glass read-back, and paying for it as it is used ----------------------------
+
+/// The destination read-back: re-derive what the blit should have landed and compare it against the
+/// glass, one probe per SOURCE pixel (the top-left destination pixel of each upscale cell). Returns
+/// `(bad, checked)` — the two numbers `fbbad=` prints, with `checked` the honest denominator of
+/// whatever coverage this pass actually ran.
+///
+/// Lifted out of [`end`] with its meaning intact. The bounds are still `draw_window`'s own — the
+/// panel clip, the `stride` column bound and the `surf_len` row bound — computed from the geometry
+/// the caller passed rather than re-derived, for the reason [`end`]'s note gives: a witness that
+/// disagreed with the blit about which pixels exist would report that disagreement as a defect.
+///
+/// `step` is the probe stride, and it is 1 on every path that existed before M3 — the aarch64 build,
+/// and any x86 build without the `wcg-paygo` knob — which makes the lattice arithmetic fold away to
+/// the original `for col in 0..cols` loop. See [`paygo_open`] for what a `step > 1` pass is and, on
+/// the module note, for what it can and cannot catch.
+fn readback(
+    fb: &FrameBuffer,
+    surf: usize,
+    surf_len: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    stride: usize,
+    scale: usize,
+    step: usize,
+) -> (usize, usize) {
+    let info = fb.info();
+    let (pw, ph) = (info.width, info.height);
+    let mut checked = 0usize;
+    let mut bad = 0usize;
+    if x >= pw || y >= ph || scale == 0 || stride < 4 || step == 0 {
+        return (bad, checked);
+    }
+    let cols = (pw - x).div_ceil(scale).min(w).min(stride / 4);
+    let rows = (ph - y).div_ceil(scale).min(h).min(surf_len / stride);
+    for row in 0..rows {
+        let row_base = row * stride;
+        let dy = y + row * scale;
+        // PAYGO — the lattice's per-row phase. A full pass (`step == 1`) starts at column 0, which is
+        // the pre-M3 loop exactly. A sampled pass rotates its first column by one per row, so over
+        // any `step` consecutive rows every column is probed exactly once and a one-pixel-wide
+        // vertical defect cannot sit in the gaps for longer than that. EVERY row is visited either
+        // way, which is what makes a full-row band un-missable at any step.
+        let first = if step == 1 { 0 } else { row % step };
+        // WC-G/M3 — one word window per destination row. New on x86; the other arches keep the
+        // per-probe `read_pixel` call this loop has always made. See [`GlassRow`].
+        #[cfg(target_arch = "x86_64")]
+        let mut glass = GlassRow::new(fb, dy);
+        let mut col = first;
+        while col < cols {
+            // SAFETY: identical bound to `draw_window`'s read —
+            // `row < surf_len / stride` and `col < stride / 4`.
+            let want = unsafe {
+                core::ptr::read_unaligned((surf as *const u8).add(row_base + col * 4) as *const u32)
+            } & 0x00FF_FFFF;
+            #[cfg(target_arch = "x86_64")]
+            let got = glass.pixel(x + col * scale);
+            #[cfg(not(target_arch = "x86_64"))]
+            let got = fb.read_pixel(x + col * scale, dy);
+            if let Some(got) = got {
+                checked += 1;
+                if got != want {
+                    bad += 1;
+                }
+            }
+            col += step;
+        }
+    }
+    (bad, checked)
+}
+
+/// WC-G/M3 (x86 only) — a one-word window over the WC-mapped glass, so a destination row's probes
+/// cost aligned 64-bit reads of the PCIe aperture instead of three byte reads apiece.
+///
+/// ### Why the read shape had to change
+///
+/// [`super::FrameBuffer::read_pixel`] takes THREE volatile byte reads per pixel. That is the right
+/// primitive for a format-aware one-off, and on this platform it is the wrong one for a full-surface
+/// sweep: the Kepler framebuffer is write-combining PCIe memory, so each of those reads is an
+/// uncached round trip to the device with nothing in the path to prefetch, cache or combine them.
+/// M1's `readback_us=` measured the consequence directly — the read-back is the phase that dominates
+/// an armed pass. The probed pixels are 4 bytes wide and 4-aligned, so an 8-aligned 64-bit read
+/// covers one or two of them: a contiguous probe run collapses to one transaction per two pixels and
+/// a strided one to one per pixel, against three per pixel before. The x86 target this kernel builds
+/// (`x86_64-unaos.json`) carries `+sse,+sse2`, but a scalar `u64` is the widest load that is
+/// unconditionally sound here — nothing in this path establishes that the SSE state is live for
+/// kernel code — so 64 bits is the width, deliberately.
+///
+/// ### Why it is the same measurement
+///
+/// [`Self::pixel`] reproduces `read_pixel`'s tests exactly and in the same order: off-panel, past the
+/// mapped length, and a layout with no colour inverse each yield `None` and so are not counted, and
+/// the Rgb/Bgr decode reads the same three bytes in the same order. Wherever a precondition of the
+/// wide path fails — a pixel that is not 4 bytes, a base that is not 8-aligned, or a probe whose
+/// containing word would run past the mapped length — it DELEGATES to `read_pixel`, so the fallback
+/// is the original code rather than a second implementation of it that could drift from it.
+///
+/// The cached word is only ever reused by a probe lying inside the SAME 8 bytes, and that probe's
+/// value came out of the same transaction. Two adjacent pixels from one consistent snapshot is not a
+/// stale read of one — it is strictly better than two byte-triples taken microseconds apart, which is
+/// what the old loop did.
+#[cfg(target_arch = "x86_64")]
+struct GlassRow<'a> {
+    fb: &'a FrameBuffer,
+    y: usize,
+    /// Whether the wide path may run at all. False makes every probe a `read_pixel` delegation, so
+    /// an unusual panel degrades to the original cost rather than to a wrong answer.
+    wide: bool,
+    bgr: bool,
+    base: usize,
+    len: usize,
+    /// Byte offset of this row's pixel 0 from `base`.
+    row_off: usize,
+    /// The last word read, and its offset from `base`. `usize::MAX` means nothing is cached, and no
+    /// valid offset can collide with it: a cached word always satisfies `off + 8 <= len`.
+    word: u64,
+    word_off: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl<'a> GlassRow<'a> {
+    #[inline]
+    fn new(fb: &'a FrameBuffer, y: usize) -> Self {
+        let info = fb.info();
+        let base = fb.base();
+        let wide = base != 0
+            && base % 8 == 0
+            && info.bytes_per_pixel == 4
+            && matches!(info.pixel_format, PixelFormat::Rgb | PixelFormat::Bgr)
+            && y < info.height;
+        Self {
+            fb,
+            y,
+            wide,
+            bgr: info.pixel_format == PixelFormat::Bgr,
+            base,
+            len: fb.len(),
+            row_off: y.wrapping_mul(info.stride).wrapping_mul(4),
+            word: 0,
+            word_off: usize::MAX,
+        }
+    }
+
+    /// One destination pixel as `0x00RRGGBB` — [`super::FrameBuffer::read_pixel`]'s exact contract,
+    /// including which coordinates yield `None` and therefore go uncounted.
+    #[inline]
+    fn pixel(&mut self, x: usize) -> Option<u32> {
+        if !self.wide || x >= self.fb.width() {
+            return self.fb.read_pixel(x, self.y);
+        }
+        let off = self.row_off + x * 4;
+        // `read_pixel`'s length test, character for character: it reads three bytes, so it accepts
+        // exactly `off + 3 <= len`.
+        if off + 3 > self.len {
+            return None;
+        }
+        let woff = off & !7usize;
+        if woff + 8 > self.len {
+            // The mapping ends inside this pixel's word. Three byte reads still fit where a 64-bit
+            // one does not, so this probe takes the original path and is counted just the same.
+            return self.fb.read_pixel(x, self.y);
+        }
+        if self.word_off != woff {
+            // SAFETY: `base` is 8-aligned and `woff` is a multiple of 8, so `base + woff` is
+            // 8-aligned; `woff + 8 <= len` keeps the read inside the mapped aperture. Volatile for
+            // the same reason `read_pixel`'s byte reads are — this has to be a real read of the
+            // scan-out, never folded with the stores the blit has just performed.
+            self.word = unsafe { core::ptr::read_volatile((self.base + woff) as *const u64) };
+            self.word_off = woff;
+        }
+        // `off - woff` is 0 or 4: a 4-aligned 4-byte pixel never straddles an 8-aligned boundary.
+        let v = (self.word >> (8 * (off - woff))) as u32;
+        let (a, b, c) = (v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF);
+        Some(if self.bgr { (c << 16) | (b << 8) | a } else { (a << 16) | (b << 8) | c })
+    }
+}
+
+// ---- WC-G/M3 — PAYGO: the battery stops being something the boot pays for all at once ----------
+
+/// PAYGO — the lattice's column step: a sampled pass probes every `PAYGO_LATTICE_N`th source pixel
+/// of every row instead of all of them.
+///
+/// Sixteen, and the figure is a coverage decision before it is a cost one. It is what the pass can
+/// still CATCH that fixes it: a horizontal garble run of `PAYGO_LATTICE_N` pixels or more contains a
+/// probe in every row it touches, whatever the row's phase, so the band-shaped smearing WC-G was
+/// built for is caught deterministically rather than probabilistically. Sixteen destination pixels
+/// is 64 bytes at this panel's layout — the width of a cache line, and far narrower than any defect
+/// this witness has ever convicted. The cost follows from the coverage and not the other way round:
+/// one probe in sixteen is ~1/16 of a full pass's probes.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+const PAYGO_LATTICE_N: usize = 16;
+
+/// The `coverage=` marker has to NAME the step, and it is a `&'static str` — [`coverage_note`]
+/// explains why — so the literal and the constant are pinned together at compile time rather than
+/// trusted to be kept in step by hand. A `coverage=lattice16` line over a step of 8 would be the
+/// exact class of instrument this module keeps convicting: one whose wire says something its code
+/// does not do.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+const _: () = assert!(
+    PAYGO_LATTICE_N == 16,
+    "the `coverage=lattice16` literal must track PAYGO_LATTICE_N"
+);
+
+/// PAYGO — uptime past which a window's DEFERRED, full-coverage samples may open.
+///
+/// The threshold is a wall-clock reading and not a phase marker, deliberately: nothing observable
+/// inside this module can tell "the boot burst is over" from "the next app has not launched yet",
+/// which is [`W_SAMPLES`]'s standing law applied to a new question. An uptime is at least a fact
+/// about the boot rather than an inference about it, and its failure mode is benign in the one
+/// direction that matters — a threshold set too late costs coverage that the wire then reports as
+/// unspent budget, where a phase predicate that fired early would silently put the cost back on the
+/// boot it was meant to leave.
+///
+/// Fifteen seconds sits past the armed x86 boot this arc reshapes and well inside any session a
+/// desktop is actually used in. A window still compositing then pays its remaining three samples at
+/// full coverage; a window that has stopped keeps them unspent, which is exactly what this module
+/// already does with a window that stops presenting.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+const PAYGO_DEFER_US: u64 = 15_000_000;
+
+/// PAYGO — per-id: the probe step granted to the sample currently open, so [`end`] walks the glass
+/// on the same terms [`begin`] admitted the sample on and the `coverage=` marker is read from the
+/// same cell as the step it describes. A marker derived independently of the walk could disagree
+/// with it, and a `coverage=` that misreports its own pass is worse than no marker at all.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static PAYGO_STEP: [AtomicU32; IDS] = [const { AtomicU32::new(1) }; IDS];
+
+/// PAYGO — per-id: blits the deferral gate declined to sample. UNBUDGETED and taken before any
+/// other test, on WC-H2's rule: past a gate the LINE stops and the count must not, because a
+/// counter that stops counting is an instrument that lies. This one is what makes "the battery is
+/// waiting" a quantity rather than an impression.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static PAYGO_DEFERRED: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// PAYGO — per-id: one-shot latch for the `state=waiting` line. The gate is reached at frame rate,
+/// and a line per declined blit would spend more serial time than the sampling saves.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static PAYGO_SAID: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// PAYGO — may this window open a sample now, and on what terms?
+///
+/// Sample 1 always opens, immediately, and opens LATTICE-SAMPLED. Samples 2..[`SAMPLES`] open at
+/// FULL coverage but only once [`PAYGO_DEFER_US`] of uptime has passed, so the battery completes on
+/// a live desktop instead of inside the boot burst.
+///
+/// **The gate sits above the budget test and that placement is the whole design.** A declined blit
+/// is one this pass does not SAMPLE — it does not spend budget, it does not print a `[wc-g]` line,
+/// and it leaves the window's remaining samples available for the next pass that qualifies. A window
+/// that stops presenting before the threshold simply keeps its unspent budget, which is what this
+/// module already does with a window that stops compositing ([`census_refresh`]'s corollary), so
+/// there is nothing here that can wedge: no wait, no retry, no queue, no core to make progress.
+///
+/// **And the decline is never silent.** The first one on a window emits `[wc-g] paygo … state=waiting
+/// … -> DEFERRED` carrying the count, the threshold and the uptime, so a configuration in which the
+/// deferred samples can never run says so on the wire at the moment it starts waiting rather than by
+/// the absence of lines that a reader would have to notice were missing. The counter keeps running
+/// behind the one-shot line and is reported again as `deferred=` when the battery completes.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+fn paygo_open(id: u32, i: usize) -> bool {
+    if TAKEN[i].load(Ordering::Relaxed) == 0 {
+        PAYGO_STEP[i].store(PAYGO_LATTICE_N as u32, Ordering::Relaxed);
+        return true;
+    }
+    if !paygo_arm(i) {
+        let n = PAYGO_DEFERRED[i].fetch_add(1, Ordering::Relaxed) + 1;
+        if PAYGO_SAID[i].swap(1, Ordering::Relaxed) == 0 {
+            paygo_note(id, i, "waiting", "DEFERRED", n, cycles_to_us(now_cycles()));
+        }
+        return false;
+    }
+    PAYGO_STEP[i].store(1, Ordering::Relaxed);
+    true
+}
+
+/// PAYGO — is this window's next sample payable RIGHT NOW? The ONE definition of the deferral test,
+/// so [`begin`]'s gate and [`on_present`]'s cannot drift apart.
+///
+/// **Why `on_present` has to ask it at all, and what it would cost not to.** `on_present` takes a
+/// full-surface checksum on EVERY present while [`budget_left`] is true, which is the arrangement
+/// that keeps the `app` leg fresh for whichever blit samples next. Its cheapness rests entirely on
+/// the budget spending FAST: four presents and the window goes quiet. Deferral breaks exactly that
+/// assumption — a window sits at one spent sample for the whole deferral window — so an `on_present`
+/// that ignored PAYGO would checksum the surface on every present for fifteen seconds. On the
+/// console window that is megabytes of byte-at-a-time FNV per present at frame rate, which would
+/// have cost more than the sampling saves and moved the boot cost rather than removing it. The
+/// deferral gate therefore governs both ends of the sample, not just the blit end.
+///
+/// **And the `app` leg stays live.** The predicate is the same on both ends, so the first present
+/// after the threshold checksums, and the blit that follows it opens the sample with a FRESH
+/// `cks_app` and a correctly incremented [`APP_SEQ`] — `own=yes` and the RACE-PRESENT leg armed,
+/// exactly as without the knob. The one seam is a present that straddles the threshold between the
+/// two calls: `on_present` skipped, `begin` opens. Then [`APP_SEQ`] did not move, `own` is false, and
+/// the `app` leg is simply not consulted for that one sample — the same thing that already happens on
+/// every collateral repaint. It cannot manufacture a verdict, only decline to add one, and the next
+/// present is unaffected.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+#[inline]
+fn paygo_arm(i: usize) -> bool {
+    TAKEN[i].load(Ordering::Relaxed) == 0 || cycles_to_us(now_cycles()) >= PAYGO_DEFER_US
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+#[inline]
+fn paygo_arm(_i: usize) -> bool {
+    true
+}
+
+/// Knob off, or not x86: every sample opens exactly as it always did. Folds away entirely.
+#[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+#[inline]
+fn paygo_open(_id: u32, _i: usize) -> bool {
+    true
+}
+
+/// PAYGO — the probe step in force for the sample [`end`] is closing. Constant 1 without the knob,
+/// which is what makes [`readback`]'s lattice arithmetic disappear from every other build.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+#[inline]
+fn probe_step(i: usize) -> usize {
+    PAYGO_STEP[i].load(Ordering::Relaxed) as usize
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+#[inline]
+fn probe_step(_i: usize) -> usize {
+    1
+}
+
+/// PAYGO — what the sample line says about its own coverage, inserted between `fbbad=` and `us=`.
+///
+/// **A sampled pass must never print a bare `fbbad=0/…` that reads as a full clearance.** `checked`
+/// has always been the honest denominator, but a denominator alone does not say WHY it is small —
+/// a short window and a lattice pass over a large one can print the same figure. `coverage=` says
+/// which, on the line, positionally, where the number it qualifies is.
+///
+/// A knob-on build marks EVERY sample line, `full` as well as `lattice16`. Marking only the sampled
+/// passes would make the marker's absence load-bearing, and an absent field is the one thing a
+/// reader cannot distinguish from a field they forgot to look for. A knob-off build inserts the
+/// empty string and its lines are byte-identical to the ones this module printed before M3, which is
+/// what keeps the aarch64 wire — and the pi4 gate reading it — untouched.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+#[inline]
+fn coverage_note(step: usize) -> &'static str {
+    if step > 1 {
+        " coverage=lattice16"
+    } else {
+        " coverage=full"
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+#[inline]
+fn coverage_note(_step: usize) -> &'static str {
+    ""
+}
+
+/// PAYGO — the rollup's policy marker, inserted after `scope=window`. The pi4 gate matches
+/// `scope=window ` with a trailing space so its pattern cannot match `scope=window-band`; an
+/// insertion after the key preserves that, and the empty string preserves the line exactly.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+const PAYGO_ROLLUP_NOTE: &str = " paygo=yes";
+
+#[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+const PAYGO_ROLLUP_NOTE: &str = "";
+
+/// PAYGO — the policy's own line: what the sampling regime is, how much it has declined, and when
+/// the deferred half becomes payable.
+///
+/// It is a separate line rather than fields on the sample line for the reason M1 gave for `prof`:
+/// the sample line's key order and terminal verdict are matched by another platform track's gate,
+/// and a field that track does not read is not worth a chance of breaking it. It fires exactly twice
+/// per window at most — once when the deferral starts (`state=waiting`), once when the battery
+/// completes (`state=complete`) — so it is bounded without needing a budget of its own.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+fn paygo_note(id: u32, i: usize, state: &str, verdict: &str, deferred: u32, up_us: u64) {
+    serial_println!(
+        "[wc-g] paygo win={} state={} lattice_n={} deferred={} defer_ms={} uptime_ms={} taken={} budget={} -> {}",
+        id,
+        state,
+        PAYGO_LATTICE_N,
+        deferred,
+        PAYGO_DEFER_US / 1000,
+        up_us / 1000,
+        TAKEN[i].load(Ordering::Relaxed).min(SAMPLES),
+        SAMPLES,
+        verdict
+    );
+}
+
+/// PAYGO — the closing half of [`paygo_note`], emitted beside the rollup so the `deferred=` census
+/// is read at the moment the battery is claimed complete rather than only at the moment it began
+/// waiting. `deferred=0` here says the deferral gate never declined this window at all.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+#[inline]
+fn paygo_complete(id: u32, i: usize) {
+    paygo_note(
+        id,
+        i,
+        "complete",
+        "PAID",
+        PAYGO_DEFERRED[i].load(Ordering::Relaxed),
+        cycles_to_us(now_cycles()),
+    );
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+#[inline]
+fn paygo_complete(_id: u32, _i: usize) {}
+
 /// Open a sample: take the `blit` checksum (the surface exactly as `draw_window` is about to read
 /// it), then the `civac` checksum (the same bytes through the coherent view), and start the clock.
 ///
@@ -1357,6 +1845,12 @@ pub struct Probe {
 pub fn begin(id: u32, surf: usize, surf_len: usize, compat: bool) -> Option<Probe> {
     let i = id as usize;
     if compat || surf == 0 || surf_len == 0 || i >= IDS {
+        return None;
+    }
+    // WC-G/M3 — PAYGO's coverage gate, and it must stay ABOVE the budget test: a deferred blit is
+    // one this pass declines to SAMPLE, not one it spends a sample on. Compiles to `true` and folds
+    // away whenever the knob is off or the arch is not x86. See [`paygo_open`].
+    if !paygo_open(id, i) {
         return None;
     }
     if TAKEN[i].fetch_add(1, Ordering::Relaxed) >= SAMPLES {
@@ -1428,38 +1922,21 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
 
     // Re-derive the destination from the source, one probe per SOURCE pixel (the top-left
     // destination pixel of each upscale cell). Bounds mirror `draw_window`'s: the panel clip, the
-    // stride column bound, and the `surf_len` row bound.
-    let info = fb.info();
-    let (pw, ph) = (info.width, info.height);
-    let mut checked = 0usize;
-    let mut bad = 0usize;
+    // stride column bound, and the `surf_len` row bound. WC-G/M3 moved the walk itself into
+    // [`readback`] so the two things that reshape it — the wide glass read and PAYGO's lattice —
+    // live where they can be read together, and so this function's brackets stayed where they are.
+    let ph = fb.info().height;
+    // WC-G/M3 — the terms this sample was admitted on. Read OUTSIDE the bracket below: it is one
+    // relaxed load, but the bracket's job is to contain the walk and nothing else.
+    let step = probe_step(p.id as usize);
     // WC-G/M1 — the read-back's own bracket. On x86 the glass is WC-mapped PCIe memory and every
-    // `read_pixel` is an uncached round trip to the device, one per SOURCE pixel, so this loop is
-    // the phase most likely to dominate the pass — which is exactly why it could not go on being
-    // reported as part of an undifferentiated total. The bracket wraps the loop and nothing else:
-    // `checked` and `bad` are declared above it and read below it, so the clock contains no
-    // formatting and no serial.
+    // probe is an uncached round trip to the device, so this walk is the phase most likely to
+    // dominate the pass — which is exactly why it could not go on being reported as part of an
+    // undifferentiated total. The bracket wraps the walk and nothing else, so the clock contains no
+    // formatting and no serial. (M3 narrowed what a probe COSTS and, under PAYGO, how many of them a
+    // pass takes; it did not move this bracket or change what it contains.)
     let tp2 = now_cycles();
-    if x < pw && y < ph && scale > 0 && stride >= 4 {
-        let cols = (pw - x).div_ceil(scale).min(w).min(stride / 4);
-        let rows = (ph - y).div_ceil(scale).min(h).min(p.surf_len / stride);
-        for row in 0..rows {
-            let row_base = row * stride;
-            for col in 0..cols {
-                // SAFETY: identical bound to `draw_window`'s read —
-                // `row < surf_len / stride` and `col < stride / 4`.
-                let want = unsafe {
-                    core::ptr::read_unaligned((p.surf as *const u8).add(row_base + col * 4) as *const u32)
-                } & 0x00FF_FFFF;
-                if let Some(got) = fb.read_pixel(x + col * scale, y + row * scale) {
-                    checked += 1;
-                    if got != want {
-                        bad += 1;
-                    }
-                }
-            }
-        }
-    }
+    let (bad, checked) = readback(fb, p.surf, p.surf_len, x, y, w, h, stride, scale, step);
     let readback_us = cycles_to_us(now_cycles().saturating_sub(tp2));
 
     // Attribution, most specific first. A source that moved under the copy invalidates the
@@ -1507,7 +1984,12 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
     W_MAXUS[w].fetch_max(us, Ordering::Relaxed);
 
     serial_println!(
-        "[wc-g] win={} seq={} own={} scale={}x app={:#018x} blit={:#018x} civac={:#018x} after={:#018x} fbbad={}/{} us={} rectscan_us={} slow={} -> {}",
+        // WC-G/M3 — `coverage=` is an INSERTION between `fbbad=` and `us=`, which is what the pi4
+        // gate's `\[wc-g\] win=.* fbbad=.* slow=.* ->` permits: nothing renamed, nothing reordered,
+        // the terminal still terminal. It is the empty string on every build but an x86 `wcg-paygo`
+        // one, so those lines are byte-identical to the ones this module printed before M3. See
+        // [`coverage_note`] for why a sampled pass may not print a bare `fbbad=0/…`.
+        "[wc-g] win={} seq={} own={} scale={}x app={:#018x} blit={:#018x} civac={:#018x} after={:#018x} fbbad={}/{}{} us={} rectscan_us={} slow={} -> {}",
         p.id,
         p.seq,
         if p.own { "yes" } else { "no" },
@@ -1518,6 +2000,7 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
         cks_after,
         bad,
         checked,
+        coverage_note(step),
         us,
         rectscan_us,
         if slow { "yes" } else { "no" },
@@ -1620,9 +2103,18 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
         // It is a per-WINDOW total over SAMPLED passes — the same population `samples=` counts — and
         // it is not a rate, a maximum, or a boot figure. Divide by `samples=` for a per-pass mean;
         // the per-phase split is on the `prof` lines above.
+        //
+        // WC-G/M3 — the battery this rollup closes was paid in two coverages under PAYGO, and the
+        // line that says so goes FIRST so a reader meets the policy before the verdict drawn under
+        // it. Nothing on a knob-off build.
+        paygo_complete(p.id, w);
         serial_println!(
-            "[wc-g] rollup win={} scope=window samples={} coher={} race={} blit={} clean={} slow={} maxus={} wit_us={} frame_us={} -> {}",
+            // WC-G/M3 — `paygo=yes` is an INSERTION after `scope=window`, and the trailing space the
+            // pi4 gate relies on to keep `scope=window ` from matching `scope=window-band` survives
+            // it. Empty on every other build.
+            "[wc-g] rollup win={} scope=window{} samples={} coher={} race={} blit={} clean={} slow={} maxus={} wit_us={} frame_us={} -> {}",
             p.id,
+            PAYGO_ROLLUP_NOTE,
             n,
             coher,
             race,
