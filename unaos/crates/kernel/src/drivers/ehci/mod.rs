@@ -393,11 +393,23 @@ struct Epace {
     xfer_n: u32,
     ass_cy: u64,
     act_cy: u64,
+    /// EPACE-TRIM M8 — how many single control transfers crossed the `M8_SLOW_MS` threshold on
+    /// this controller. Counts every crossing, including the ones past the `M8_SLOW_CAP` print
+    /// cap, so the cap can never turn a flood into a silence.
+    slow_n: u32,
 }
 
 impl Epace {
     const fn new() -> Self {
-        Epace { cy: [0; N_EPACE], n: [0; N_EPACE], xfer_cy: 0, xfer_n: 0, ass_cy: 0, act_cy: 0 }
+        Epace {
+            cy: [0; N_EPACE],
+            n: [0; N_EPACE],
+            xfer_cy: 0,
+            xfer_n: 0,
+            ass_cy: 0,
+            act_cy: 0,
+            slow_n: 0,
+        }
     }
     /// Close a span opened at `t0` (a `now_cycles()` reading) into class `class`.
     fn add(&mut self, class: usize, t0: u64) {
@@ -425,6 +437,26 @@ fn epace_fmt(cy: u64) -> (u64, &'static str) {
     match epace_ms(cy) {
         Some(ms) => (ms, "ms"),
         None => (cy, "cy"),
+    }
+}
+
+/// EPACE-TRIM M8 — the per-transfer anomaly threshold, in milliseconds. See the rationale on
+/// `Controller::slow_xfer_witness`; in one line, it is ~62× the measured healthy per-transfer
+/// cost on metal (0.13 ms), 2.1× under the most diluted form of the anomaly it must catch
+/// (52 ms / 3 transfers = 17 ms), and ~2× above the worst transfer QEMU was measured to produce.
+const M8_SLOW_MS: u64 = 8;
+/// Print cap per controller per boot. Crossings past it are counted, never printed — the FTDI
+/// console is a boot-time cost (~0.19 s of drain), so a pathological device must not flood it.
+const M8_SLOW_CAP: u32 = 8;
+
+/// `M8_SLOW_MS` in TSC cycles. Same shape as `ehci_scout::ms_cycles` (private there), including
+/// the pre-calibration fallback, so the threshold means the same thing this driver's settles do.
+fn m8_threshold_cy() -> u64 {
+    let hz = crate::arch::x86_64::apic::tsc_hz();
+    if hz != 0 {
+        hz.saturating_mul(M8_SLOW_MS) / 1000
+    } else {
+        2_300_000u64.saturating_mul(M8_SLOW_MS) // ~2.3e6 cycles/ms fallback
     }
 }
 
@@ -672,10 +704,112 @@ impl Controller {
         dir_in: bool,
     ) -> Result<u32, &'static str> {
         let t0 = crate::arch::now_cycles();
+        // M8: snapshot the two overlapping stage meters so this transfer's OWN share of them is
+        // a subtraction, not a new clock. Two u64 reads; nothing here touches the wire.
+        let ass0 = self.pace.ass_cy;
+        let act0 = self.pace.act_cy;
         let r = self.control_txn(t, bm_req, b_req, w_value, w_index, w_length, dir_in);
-        epace_accum(&mut self.pace.xfer_cy, t0);
+        // One `now_cycles()` read serves both the M7 accumulator and the M8 threshold test —
+        // inlining `epace_accum` here keeps the arithmetic bit-identical to what M7 has been
+        // printing while avoiding a second rdtsc on every transfer.
+        let xfer_cy = crate::arch::now_cycles().wrapping_sub(t0);
+        self.pace.xfer_cy = self.pace.xfer_cy.wrapping_add(xfer_cy);
         self.pace.xfer_n = self.pace.xfer_n.saturating_add(1);
+        self.slow_xfer_witness(t, bm_req, b_req, w_value, w_index, w_length, xfer_cy, ass0, act0);
         r
+    }
+
+    /// EPACE-TRIM M8 (GR18) — the resolution fix the enum46 verdict names as owed.
+    ///
+    /// M7 proved the `05ac:8510` (controller [0], addr 2, HS, behind the RMH) spends ~52 ms
+    /// NAKing across its three enumeration control transfers, and that none of it is ours:
+    /// `ass=0`, `wait_bounded` has no poll grain, RL=0 already retries maximally, and both
+    /// software settles are pinned to the USB 2.0 minimum. What M7 **cannot** say is WHICH
+    /// request eats it — `act_cy` is one per-controller accumulator, so "the time sits in address
+    /// assignment" is a window-level inference. That distinction is exactly what decides BUY-2
+    /// (dropping the 8-byte MPS0 pre-read for HS targets, which USB 2.0 §5.5.3 makes redundant
+    /// at high speed): if the 52 ms lives in `0x80/0x06 GET_DESCRIPTOR(8)`, BUY-2 buys ~52 ms;
+    /// if it lives in `0x00/0x05 SET_ADDRESS` or the post-address `GET_DESCRIPTOR(18)`, BUY-2
+    /// buys nothing and must not be taken. This function is the measurement and nothing else —
+    /// no pacing, no transfer logic, no retry behaviour is touched by it.
+    ///
+    /// PREDICTION (falsifiable, for the next metal boot): exactly one-ish line, on controller
+    /// **[0]**, addr 0 or 2, `05ac:8510`'s window, with `xfer=` at or near 52 ms and `act=`
+    /// accounting for essentially all of it — and **zero lines on controller [1]**, whose 82
+    /// control transfers cost 11 ms total (0.13 ms each). A line on [1] falsifies the verdict's
+    /// central claim (that the 52 ms is one device's own answer latency and not a driver-side
+    /// per-transfer cost), and would mean the threshold or the meter is wrong.
+    ///
+    /// Threshold — 8 ms, chosen to sit in the empty middle of a two-order-of-magnitude gap:
+    ///   * healthy per-transfer cost on this driver is **0.13 ms** (controller [1]: 11 ms across
+    ///     82 transfers, n=3 boots), so 8 ms is ~62× the healthy mean — no healthy transfer can
+    ///     reach it, and healthy boots print ZERO lines. That is what keeps this off the FTDI
+    ///     console budget (~0.19 s of boot spent draining it; this must not add to it).
+    ///   * the anomaly is 52 ms across at most three transfers. Even the *most* diluted case —
+    ///     the NAK time spread perfectly evenly, ~17 ms each — clears 8 ms by 2.1×, so the
+    ///     threshold cannot hide the phenomenon it was built to name. (The window holds exactly
+    ///     three transfers; there is no dilution past that for the margin to erode.)
+    ///   * 8 ms is also far below the 2 s `hw_wait_budget()`, so a transfer that times out is
+    ///     reported here too (in addition to its own STOP-NOTE) rather than silently skipped.
+    /// Both software settles in the enumeration window (10 ms T_RSTRCY, 2 ms SET_ADDRESS
+    /// recovery) sit at the CALL SITES, outside `control()`, so they cannot trip this.
+    ///
+    /// Why 8 and not the 5 this arc started from — measured, not guessed. The instrument was
+    /// falsified both ways before landing, by temporarily moving the two constants:
+    ///   * at **1 ms** `./arroyo test` printed all 8 of QEMU's control transfers, the slowest at
+    ///     4 ms (chain mode, so `ass=0 act=0` there — the honest reading, not a dead meter). That
+    ///     is the distribution 5 ms would have to clear.
+    ///   * at **5 ms** two consecutive QEMU runs of the same code disagreed: zero lines, then one
+    ///     (`GET_DESCRIPTOR(8)` at 5 ms). A threshold that flaps run-to-run on an unloaded host
+    ///     is inside the platform's jitter band, and a spurious QEMU line is worse than useless
+    ///     here — a reader could mistake it for the metal finding this instrument exists to make.
+    ///   * at **8 ms** QEMU is silent with ~2× headroom over its measured worst transfer, while
+    ///     metal keeps 2.1× of margin in the other direction. Both ends of the gap are paid for.
+    ///   * with the cap temporarily at 3 the overflow line printed "8 … 3 printed, 5 suppressed",
+    ///     so the escape valve is exercised, not merely compiled.
+    ///
+    /// Bounded output: at most `M8_SLOW_CAP` lines per controller per boot, with `seq=k/cap` in
+    /// every line so a truncated capture is self-describing; crossings past the cap are still
+    /// counted and reported once by the EPACE summary site. A pathological device therefore
+    /// costs a bounded number of serial lines, not a flood.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn slow_xfer_witness(
+        &mut self,
+        t: &Target,
+        bm_req: u8,
+        b_req: u8,
+        w_value: u16,
+        w_index: u16,
+        w_length: u16,
+        xfer_cy: u64,
+        ass0: u64,
+        act0: u64,
+    ) {
+        if xfer_cy < m8_threshold_cy() {
+            return;
+        }
+        self.pace.slow_n = self.pace.slow_n.saturating_add(1);
+        if self.pace.slow_n > M8_SLOW_CAP {
+            return; // counted, not printed — the summary site reports the overflow once.
+        }
+        let (xv, xu) = epace_fmt(xfer_cy);
+        let (av, au) = epace_fmt(self.pace.ass_cy.wrapping_sub(ass0));
+        let (cv, cu) = epace_fmt(self.pace.act_cy.wrapping_sub(act0));
+        let spd = match t.eps {
+            QH_EPS_HIGH => "HS",
+            QH_EPS_LOW => "LS",
+            _ => "FS",
+        };
+        // Stage count is exact and free: SETUP + STATUS always, DATA only when wLength > 0
+        // (`control_txn` above). The per-stage ass/act splits are the accumulator deltas.
+        let stg = if w_length > 0 { 3 } else { 2 };
+        serial_println!(
+            ":: EHCI-HID: [{}] EPACE-TRIM M8 SLOW-XFER addr={} hub={}.{} spd={} bmreq={:#04x} breq={:#04x} wval={:#06x} widx={:#06x} wlen={} stg={} xfer={}{} act={}{} ass={}{} seq={}/{} == witness ::",
+            self.idx, t.addr, t.hub_addr, t.hub_port, spd,
+            bm_req, b_req, w_value, w_index, w_length, stg,
+            xv, xu, cv, cu, av, au,
+            self.pace.slow_n, M8_SLOW_CAP
+        );
     }
 
     /// One synchronous EP0 control transfer through the shared QH (the EHCI analogue of xHCI's
@@ -4107,6 +4241,17 @@ pub fn init() {
             rv, ru,
             xv, xu, c.pace.xfer_n, av, au, cv, cu
         );
+        // EPACE-TRIM M8 — the print cap's escape valve. Silent on every boot that stayed inside
+        // the cap (including the expected baseline: one line on [0], none on [1]); it exists so
+        // that a device pathological enough to exceed the cap reports its true crossing count
+        // instead of looking like exactly `M8_SLOW_CAP` slow transfers.
+        if c.pace.slow_n > M8_SLOW_CAP {
+            serial_println!(
+                ":: EHCI-HID: [{}] EPACE-TRIM M8 SLOW-XFER cap reached — {} transfers crossed the {} ms threshold, {} printed, {} suppressed == witness ::",
+                c.idx, c.pace.slow_n, M8_SLOW_MS, M8_SLOW_CAP,
+                c.pace.slow_n.saturating_sub(M8_SLOW_CAP)
+            );
+        }
     }
     {
         let init_cy = crate::arch::now_cycles().wrapping_sub(init_t0);
