@@ -191,6 +191,12 @@ extern "x86-interrupt" fn page_fault_handler(
         }
     }
     // CPL-0 page fault: a kernel bug — fatal, unchanged.
+    // FBCON-PACE F1: un-route the console BEFORE printing. These terminals never panic, so
+    // neither of panic's two mirrors fires, and a routed console would HOLD every line after
+    // the first (pace gate) on a machine about to hlt forever — fault name on the glass,
+    // fault details lost. panic_screen() clears the route and arms the panic mirror, so the
+    // diagnostics below reach the panel directly, compositor-free and lock-free.
+    crate::video::fbcon::panic_screen();
     serial_println!("EXCEPTION: PAGE FAULT");
     serial_println!("Accessed Address: {:#x}", cr2);
     serial_println!("Error Code: {:?}", error_code);
@@ -208,6 +214,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
             ring3_fault_kill(VEC_GP, error_code, stack_frame.instruction_pointer.as_u64(), 0);
         }
     }
+    crate::video::fbcon::panic_screen(); // FBCON-PACE F1 — see page_fault_handler.
     serial_println!("EXCEPTION: GENERAL PROTECTION FAULT");
     serial_println!("Error Code: {:?}", error_code);
     serial_println!("{:#?}", stack_frame);
@@ -217,6 +224,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 /// Emit the CPL-0 (fatal) diagnostic for a non-#PF fault vector, then halt. Factored out so each
 /// error-code / no-error-code handler below stays a two-line dispatcher.
 fn fatal_fault(what: &str, vec: u8, err: u64, stack_frame: &InterruptStackFrame) -> ! {
+    crate::video::fbcon::panic_screen(); // FBCON-PACE F1 — see page_fault_handler.
     serial_println!("EXCEPTION: {} (vec={}, err={:#x})", what, vec, err);
     serial_println!("{:#?}", stack_frame);
     crate::hlt_loop();
@@ -333,6 +341,9 @@ extern "x86-interrupt" fn debug_handler(mut stack_frame: InterruptStackFrame) {
 /// it only prints (no GS-relative access) and halts; the IST stack guarantees it never triple-faults
 /// even if the check lands in the pre-`swapgs`/pre-stack-switch syscall-entry window.
 extern "x86-interrupt" fn machine_check_handler(stack_frame: InterruptStackFrame) -> ! {
+    // FBCON-PACE F1 (see page_fault_handler). GS-free contract preserved: panic_screen touches
+    // only fbcon statics, no GS-relative access.
+    crate::video::fbcon::panic_screen();
     serial_println!("EXCEPTION: MACHINE CHECK (#MC, vec={})", VEC_MC);
     serial_println!("{:#?}", stack_frame);
     crate::hlt_loop();
