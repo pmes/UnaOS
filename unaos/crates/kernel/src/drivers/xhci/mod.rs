@@ -1188,6 +1188,101 @@ pub const STORAGE_DATA_ALIGN: usize = 64 * 1024;
 /// holds. The block layer publishes this to `fs/fat.rs` so callers chunk instead of guessing.
 pub const STORAGE_MAX_BLOCKS: u16 = (STORAGE_DATA_BYTES / 512) as u16;
 
+// ── SPACE — the storage bring-up phase accumulator ──────────────────────────────────────────────
+//
+// The BPACE ledger reads `stor-bringup d=219..223ms` and `stor-ready d=997..1020ms` on all eleven
+// metal boots of `rmbp-gr16-s73`, and neither number says what it is made of. This instrument
+// splits both, on the EPACE precedent (`drivers/ehci/mod.rs`): cycle accumulators per phase CLASS,
+// printed as one line at the end of the bring-up.
+//
+// It exists because the two classes it measures are NOT what their names imply, and no capture can
+// show that on its own:
+//
+//   * `stor-bringup`'s `d=` runs from `enum:p5-done`, so it charges STORAGE for everything the
+//     service ladder does between the enumeration queue draining and `service_storage` being
+//     reached. On x86 that is `service_ftdi` → `drain_ftdi`, which empties the boot-capture ring
+//     out a 115200-baud console ≤512 B at a time, AWAITING each bulk transfer. `wait=` is the whole
+//     gap and `ftdi=` is the part of it the console owns; they are printed together so the next
+//     capture confirms or refutes that attribution directly, instead of by arithmetic on a byte
+//     count after the fact.
+//   * `stor-ready`'s `d=` is the SCSI chain, and the `{}` view names which STAGE of it. One BOT
+//     transaction is up to three awaited stages (CBW / DATA / CSW). A per-command split alone would
+//     report `tur=1016ms` and leave open whether this driver polled sixteen times or the device
+//     held a single answer — the `{}` cut is what separates those, and they call for opposite fixes.
+//
+// The `[]` bracket is the PARTITION: disjoint classes that sum to the bring-up span. The `{}` view
+// is an OVERLAPPING cut of the same milliseconds (every BOT stage runs inside one of the `[]`
+// classes), printed in braces so the two cannot be added by accident — the same discipline, and for
+// the same reason, as EPACE's `{xfer/ass/act}`.
+//
+// Instrument honesty (the can-this-lie-while-looking-right check):
+//   * Same clock as the code under measurement — `now_cycles()`, converted at PRINT time by
+//     `cycles_per_ms()`, the exact helper `settle_ms` and every pump budget already use. A wrong
+//     calibration makes the waits and this report wrong TOGETHER, which keeps the ratios truthful.
+//   * `total=` is this instrument's own arm→done span and `sum=` is the `[]` classes added up. They
+//     must agree to within the print cost of this line; any gap is unattributed time and appears as
+//     a number rather than as a silent absence.
+//   * `wait=` is stamped at the ARM site (where `storage_pending_bringup` is set), not on entry to
+//     `service_storage`, so it reports the gap the boot actually paid rather than a subset of it.
+//     A bring-up that was never armed prints `wait=0ms(n=0)`, which is distinguishable from a fast
+//     one — the fallthrough cannot masquerade as a good reading.
+//   * The `{}` counters are gated on `SPACE_ACTIVE`, so they describe THIS bring-up and can never
+//     be read against the boot-long BOT totals: the instrument-baseline law.
+//   * It prints on the FAILURE path too (`result=SPACE-FAIL`), so a bring-up that died still says
+//     how far it got and what it paid on the way.
+const SP_WAIT: usize = 0;   // arm → `service_storage` body: the service ladder ahead of storage
+const SP_SETCFG: usize = 1; // SET_CONFIGURATION(1) on EP0
+const SP_TUR: usize = 2;    // the TEST UNIT READY loop (n = attempts actually made)
+const SP_SENSE: usize = 3;  // REQUEST SENSE, only on a non-Passed TUR
+const SP_INQ: usize = 4;    // INQUIRY
+const SP_RDCAP: usize = 5;  // READ CAPACITY(10)
+const SP_PUB: usize = 6;    // geometry publish + the port-link/knobs witnesses
+const N_SPACE: usize = 7;
+const SPACE_TAGS: [&str; N_SPACE] =
+    ["wait", "setcfg", "tur", "sense", "inq", "rdcap", "pub"];
+
+/// Per-class cycle accumulators for the storage bring-up (`[]` partition).
+static SPACE_CY: [AtomicU64; N_SPACE] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+/// Per-class entry counts, so a zero class is readable as "never ran" vs "ran and cost nothing".
+static SPACE_N: [AtomicU32; N_SPACE] = [
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+];
+/// `now_cycles()` at the moment `storage_pending_bringup` was armed — the start of `wait` AND of
+/// `total`. Zero means the bring-up was reached without ever being armed.
+static SPACE_ARMED_AT: AtomicU64 = AtomicU64::new(0);
+/// Cycles `drain_ftdi` spent flushing the console ring WHILE a storage bring-up was pending, i.e.
+/// exactly the part of `wait` the console owns. Charged nowhere else, so it cannot absorb the
+/// ladder's other hooks.
+static SPACE_FTDI_CY: AtomicU64 = AtomicU64::new(0);
+/// Bulk-OUT transfers that flush cost, so `ftdi=` can be read against the ≤512 B chunking.
+static SPACE_FTDI_N: AtomicU32 = AtomicU32::new(0);
+/// True only between the start and the end of the SCSI bring-up. Gates the `{}` stage view so it
+/// describes this chain rather than the boot-long BOT totals.
+static SPACE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// `{}` — the OVERLAPPING per-stage cut of the same milliseconds. Never add these to the `[]` sum.
+static SPACE_CBW_CY: AtomicU64 = AtomicU64::new(0);
+static SPACE_CBW_N: AtomicU32 = AtomicU32::new(0);
+static SPACE_DATA_CY: AtomicU64 = AtomicU64::new(0);
+static SPACE_DATA_N: AtomicU32 = AtomicU32::new(0);
+static SPACE_CSW_CY: AtomicU64 = AtomicU64::new(0);
+static SPACE_CSW_N: AtomicU32 = AtomicU32::new(0);
+/// The single longest awaited stage of this bring-up, and which stage it was — the one reading that
+/// separates "the device held one answer" from "the driver made many calls".
+static SPACE_PEAK_CY: AtomicU64 = AtomicU64::new(0);
+static SPACE_PEAK_STAGE: AtomicU32 = AtomicU32::new(0);
+
+/// Close a span opened at `t0` into SPACE class `class`.
+#[inline]
+fn space_add(class: usize, t0: u64) {
+    SPACE_CY[class].fetch_add(
+        crate::arch::now_cycles().wrapping_sub(t0), Ordering::Relaxed);
+    SPACE_N[class].fetch_add(1, Ordering::Relaxed);
+}
+
 // --- MULTIBLK: M2 shape instrumentation ---
 //
 // M2 — the lost completion event — is still unexplained, and this arc does not claim to fix it.
@@ -2655,6 +2750,11 @@ impl XhciController {
                                     // synchronous BOT pump can run without re-entrancy).
                                     self.storage_slot = slot_id as u8;
                                     self.storage_pending_bringup = true;
+                                    // SPACE: the arm instant — the start of `wait` and of `total`.
+                                    // Stamped HERE and not on entry to `service_storage` because
+                                    // the gap between the two is precisely what this instrument
+                                    // exists to price.
+                                    SPACE_ARMED_AT.store(crate::arch::now_cycles(), Ordering::Relaxed);
                                     self.storage_note = "endpoints configured; SCSI bring-up pending";
                                     // Storage setup is done; move on to the next connected port.
                                     self.start_next_port();
@@ -8554,6 +8654,27 @@ impl XhciController {
     fn note_bot_pump(start: u64, budget: u64, route: u32, depth: u8, slot: u8) {
         let used = crate::arch::now_cycles().wrapping_sub(start);
         BOT_PUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+        // SPACE `{}` — the overlapping per-stage cut, collected ONLY while the bring-up chain is
+        // running. `BOT_LAST_STAGE` is stamped by `bot_transfer_once` immediately before it queues
+        // each stage's TRB, so it names the stage this wait belongs to. The peak carries its stage
+        // id with it: "one 1.0 s CSW" and "a thousand 1 ms CSWs" produce the same `csw=` total and
+        // demand opposite fixes, and the peak is the field that separates them.
+        if SPACE_ACTIVE.load(Ordering::Relaxed) {
+            let stage = BOT_LAST_STAGE.load(Ordering::Relaxed);
+            match stage {
+                3 => { SPACE_CBW_CY.fetch_add(used, Ordering::Relaxed);
+                       SPACE_CBW_N.fetch_add(1, Ordering::Relaxed); }
+                1 => { SPACE_DATA_CY.fetch_add(used, Ordering::Relaxed);
+                       SPACE_DATA_N.fetch_add(1, Ordering::Relaxed); }
+                2 => { SPACE_CSW_CY.fetch_add(used, Ordering::Relaxed);
+                       SPACE_CSW_N.fetch_add(1, Ordering::Relaxed); }
+                _ => {}
+            }
+            if used > SPACE_PEAK_CY.load(Ordering::Relaxed) {
+                SPACE_PEAK_CY.store(used, Ordering::Relaxed);
+                SPACE_PEAK_STAGE.store(stage, Ordering::Relaxed);
+            }
+        }
         // ONSET-2 (M2 witness 7): fold this wait into the log2-millisecond histogram.
         //
         // The capture carries only `sum`, `peak` and `n`, so it CANNOT answer whether the pace is
@@ -8724,7 +8845,10 @@ impl XhciController {
         // real silicon the endpoints stay inactive and every SCSI command fails (device never becomes
         // a block device). The HID and hub paths already SET_CONFIGURATION; storage did not.
         self.storage_note = "SET_CONFIGURATION";
-        match self.sync_control(slot, 0x00, 0x09, 1, 0, 0, 0, false) {
+        let t_setcfg = crate::arch::now_cycles();
+        let setcfg = self.sync_control(slot, 0x00, 0x09, 1, 0, 0, 0, false);
+        space_add(SP_SETCFG, t_setcfg);
+        match setcfg {
             Ok(1) => serial_println!("xHCI: storage SET_CONFIGURATION(1) OK (slot {})", slot),
             other => {
                 serial_println!("xHCI: storage SET_CONFIGURATION unexpected {:?} (slot {})", other, slot);
@@ -8741,19 +8865,38 @@ impl XhciController {
         // the new handler owns the runtime path only.
         BOT_SENSE_ACTIVE.store(true, Ordering::Relaxed);
         for attempt in 0..16 {
-            match self.scsi_test_unit_ready(slot) {
+            // SPACE: one span per ATTEMPT, so `tur=`'s `n=` is the attempt count. That is the field
+            // which decides how the total should be read: `tur=1016ms(n=1)` is a device holding one
+            // answer, `tur=1016ms(n=16)` is this loop spinning on a stick that never came ready, and
+            // only the first of those is a floor rather than a bug.
+            let t_tur = crate::arch::now_cycles();
+            let tur = self.scsi_test_unit_ready(slot);
+            space_add(SP_TUR, t_tur);
+            match tur {
                 Ok(CswStatus::Passed) => break,
-                Ok(_) => { let _ = self.scsi_request_sense(slot); }
+                Ok(_) => {
+                    let t_sense = crate::arch::now_cycles();
+                    let _ = self.scsi_request_sense(slot);
+                    space_add(SP_SENSE, t_sense);
+                }
                 Err(e) => { serial_println!("xHCI: TUR error {:?} (attempt {})", e, attempt); }
             }
         }
         BOT_SENSE_ACTIVE.store(false, Ordering::Relaxed);
 
         self.storage_note = "INQUIRY";
-        let (vendor, product) = self.scsi_inquiry(slot)?;
+        let t_inq = crate::arch::now_cycles();
+        let inq = self.scsi_inquiry(slot);
+        space_add(SP_INQ, t_inq);
+        let (vendor, product) = inq?;
         self.storage_note = "READ CAPACITY";
-        let (block_size, last_lba) = self.scsi_read_capacity10(slot)?;
+        let t_rdcap = crate::arch::now_cycles();
+        let rdcap = self.scsi_read_capacity10(slot);
+        space_add(SP_RDCAP, t_rdcap);
+        let (block_size, last_lba) = rdcap?;
         let num_blocks = last_lba as u64 + 1;
+        // SPACE: everything from here to the end of the bring-up is the publish/witness tail.
+        let t_pub = crate::arch::now_cycles();
 
         let vendor_s = core::str::from_utf8(&vendor).unwrap_or("?").trim_end();
         let product_s = core::str::from_utf8(&product).unwrap_or("?").trim_end();
@@ -8799,7 +8942,54 @@ impl XhciController {
         serial_println!(
             ":: BOT: knobs ring_trbs={} {} {} {} {} result=KNOBS ::",
             BOT_RING_TRBS, BOT_RING_KNOB_TAG, BOT_CBWIOC_KNOB_TAG, BOT_ORDER_TAG, BOT_PUMP_TAG);
+        space_add(SP_PUB, t_pub);
         Ok(())
+    }
+
+    /// SPACE: print the one-line split of the storage bring-up. Called on BOTH exits of
+    /// `bring_up_storage` (see `service_storage`), so a chain that died still reports what it paid.
+    ///
+    /// `total=` is the arm→now span measured by this instrument alone; `sum=` adds the `[]` classes.
+    /// The two are printed side by side deliberately: they are independent readings of the same
+    /// interval, and a disagreement larger than this line's own print cost means one of them is
+    /// lying. `resid=` is `total - sum`, i.e. time inside the bring-up that no class claimed — a
+    /// number, never a silent absence.
+    fn space_report(ok: bool) {
+        let per_ms = Self::cycles_per_ms().max(1);
+        // Cycles → ms with the SAME helper the waits themselves use. `cycles_per_ms` falls back to a
+        // nominal rate when the timebase is uncalibrated, so this can be wrong — but it is then
+        // wrong in step with every settle and budget in this driver, which keeps the ratios honest.
+        let ms = |cy: u64| cy / per_ms;
+        let armed = SPACE_ARMED_AT.load(Ordering::Relaxed);
+        let total = if armed != 0 {
+            ms(crate::arch::now_cycles().wrapping_sub(armed))
+        } else {
+            0
+        };
+        let mut sum = 0u64;
+        for c in 0..N_SPACE {
+            sum += ms(SPACE_CY[c].load(Ordering::Relaxed));
+        }
+        let peak_stage = match SPACE_PEAK_STAGE.load(Ordering::Relaxed) {
+            1 => "data", 2 => "csw", 3 => "cbw", _ => "none",
+        };
+        serial_println!(
+            ":: SPACE: [{}={}ms(n={}) {}={}ms(n={}) {}={}ms(n={}) {}={}ms(n={}) {}={}ms(n={}) {}={}ms(n={}) {}={}ms(n={}) resid={}ms] {{cbw={}ms(n={}) data={}ms(n={}) csw={}ms(n={}) peak={}ms@{}}} ftdi={}ms(n={}) total={}ms sum={}ms per_ms={} result={} ::",
+            SPACE_TAGS[SP_WAIT], ms(SPACE_CY[SP_WAIT].load(Ordering::Relaxed)), SPACE_N[SP_WAIT].load(Ordering::Relaxed),
+            SPACE_TAGS[SP_SETCFG], ms(SPACE_CY[SP_SETCFG].load(Ordering::Relaxed)), SPACE_N[SP_SETCFG].load(Ordering::Relaxed),
+            SPACE_TAGS[SP_TUR], ms(SPACE_CY[SP_TUR].load(Ordering::Relaxed)), SPACE_N[SP_TUR].load(Ordering::Relaxed),
+            SPACE_TAGS[SP_SENSE], ms(SPACE_CY[SP_SENSE].load(Ordering::Relaxed)), SPACE_N[SP_SENSE].load(Ordering::Relaxed),
+            SPACE_TAGS[SP_INQ], ms(SPACE_CY[SP_INQ].load(Ordering::Relaxed)), SPACE_N[SP_INQ].load(Ordering::Relaxed),
+            SPACE_TAGS[SP_RDCAP], ms(SPACE_CY[SP_RDCAP].load(Ordering::Relaxed)), SPACE_N[SP_RDCAP].load(Ordering::Relaxed),
+            SPACE_TAGS[SP_PUB], ms(SPACE_CY[SP_PUB].load(Ordering::Relaxed)), SPACE_N[SP_PUB].load(Ordering::Relaxed),
+            total.saturating_sub(sum),
+            ms(SPACE_CBW_CY.load(Ordering::Relaxed)), SPACE_CBW_N.load(Ordering::Relaxed),
+            ms(SPACE_DATA_CY.load(Ordering::Relaxed)), SPACE_DATA_N.load(Ordering::Relaxed),
+            ms(SPACE_CSW_CY.load(Ordering::Relaxed)), SPACE_CSW_N.load(Ordering::Relaxed),
+            ms(SPACE_PEAK_CY.load(Ordering::Relaxed)), peak_stage,
+            ms(SPACE_FTDI_CY.load(Ordering::Relaxed)), SPACE_FTDI_N.load(Ordering::Relaxed),
+            total, sum, per_ms,
+            if ok { "SPACE" } else { "SPACE-FAIL" });
     }
 
     /// Main-loop hook: once storage finishes configuring, run the SCSI bring-up (in a
@@ -8922,18 +9112,40 @@ impl XhciController {
         self.storage_pending_bringup = false;
         if self.storage_slot == 0 { return; }
 
+        // SPACE: close `wait` — the ladder gap between this bring-up being ARMED (at the
+        // Configure-Endpoint completion, inside `poll_events`) and this body being reached. It is
+        // closed BEFORE the `stor-bringup` stamp below because the stamp is what currently absorbs
+        // it: BPACE measures `stor-bringup d=` from `enum:p5-done`, so the ledger charges storage
+        // for a gap storage did not spend. `wait=` and `ftdi=` together say who did.
+        if SPACE_ARMED_AT.load(Ordering::Relaxed) != 0 {
+            space_add(SP_WAIT, SPACE_ARMED_AT.load(Ordering::Relaxed));
+        }
         serial_println!("xHCI: === STORAGE BRING-UP (TUR/INQUIRY/READ CAPACITY) ===");
         // BPACE: the SCSI bring-up chain begins. `d=` between this and `stor-ready` is the whole
         // TUR/INQUIRY/READ-CAPACITY negotiation — every one of whose stages is an awaited BOT
         // transaction, i.e. the phase the pump quantisation of §17.4 taxes hardest.
         crate::bootpace::record("stor-bringup");
-        match self.bring_up_storage() {
+        // SPACE: the `{}` per-stage view is scoped to exactly this chain. Armed here and disarmed on
+        // BOTH exits, so it can never be read against the boot-long BOT totals.
+        SPACE_ACTIVE.store(true, Ordering::Relaxed);
+        let brought_up = self.bring_up_storage();
+        SPACE_ACTIVE.store(false, Ordering::Relaxed);
+        match brought_up {
             Ok(()) => serial_println!("xHCI: storage ready."),
-            Err(e) => { serial_println!("xHCI: storage bring-up failed: {:?}", e); return; }
+            Err(e) => {
+                serial_println!("xHCI: storage bring-up failed: {:?}", e);
+                Self::space_report(false);
+                return;
+            }
         }
         // BPACE: reached only on SUCCESS — a failed bring-up returns above, so a ledger carrying
         // `stor-bringup` without `stor-ready` says the storage chain died rather than ran slowly.
         crate::bootpace::record("stor-ready");
+        // SPACE: printed AFTER the `stor-ready` stamp on purpose. This line's own serial cost would
+        // otherwise land inside `stor-ready d=`, and that number has to stay byte-comparable with
+        // every capture taken before this instrument existed — an instrument that moves the figure
+        // it reports on is the one failure mode this whole ledger is built to avoid.
+        Self::space_report(true);
 
         // PIUSB-35: decisive DMA-address witness. P45 refuted the cache theory (the LBA0 read still
         // returns all-zero with a Passed/residue=0 CSW even with PIUSB-34's clean-before-doorbell +
@@ -9411,7 +9623,22 @@ impl XhciController {
             if n == 0 {
                 break; // ring drained
             }
-            match self.ftdi_tx_stage(slot, out_dci, data_phys, n as u32) {
+            // SPACE: charge this awaited bulk-OUT to the console ONLY while a storage bring-up is
+            // already armed and waiting behind it. That is the exact overlap `wait=` is made of, and
+            // scoping it this way keeps the counter from absorbing the console's steady-state
+            // traffic — which is not on anyone's critical path and must not look as if it were.
+            let ftdi_t0 = if self.storage_pending_bringup {
+                Some(crate::arch::now_cycles())
+            } else {
+                None
+            };
+            let tx = self.ftdi_tx_stage(slot, out_dci, data_phys, n as u32);
+            if let Some(t0) = ftdi_t0 {
+                SPACE_FTDI_CY.fetch_add(
+                    crate::arch::now_cycles().wrapping_sub(t0), Ordering::Relaxed);
+                SPACE_FTDI_N.fetch_add(1, Ordering::Relaxed);
+            }
+            match tx {
                 Ok(1) | Ok(13) => self.ftdi_tx_total += n as u64,
                 Ok(_) => {
                     self.disable_ftdi_tx("bad completion code");
@@ -10753,6 +10980,9 @@ impl XhciController {
                 // context, next hook) — identical hand-off to the root path's async completion.
                 self.storage_slot = slot_id;
                 self.storage_pending_bringup = true;
+                // SPACE: the arm instant, same as the root path's — a hubbed stick pays the same
+                // ladder gap and must be measured by the same clock.
+                SPACE_ARMED_AT.store(crate::arch::now_cycles(), Ordering::Relaxed);
                 self.storage_note = "hub-downstream endpoints configured; SCSI bring-up pending";
                 serial_println!("xHCI: Endpoints Configured (Slot {}). Storage ready.", slot_id);
             }

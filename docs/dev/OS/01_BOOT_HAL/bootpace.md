@@ -696,6 +696,87 @@ not mistake the residual for more edge-blocking. The ~0 ms default floor is
 > survives from this paragraph is the shape of the claim (a residue that is work, not
 > edge-blocking) and the ~0 ms default floor; the attribution does not.
 
+### 8g. SPACE — the inside of `stor-bringup` + `stor-ready`, and why neither is storage's to trim (GR20, 2026-08-06)
+
+`stor-bringup d=219..223ms` and `stor-ready d=997..1020ms` are the last two undecomposed
+blocks on the path to a usable filesystem — together with `fat-mount d=4ms` they are the
+~1.24 s a boot pays after enumeration before the FAT volume can be read. Both are the same
+number on every metal boot of `rmbp-gr16-s73` (eleven of them: `stor-bringup` spans 4 ms
+end to end, `stor-ready` is bimodal at 997-998 / 1019-1020 ms). By §8c's reading that
+constancy is the finding, not the reassurance — so both were split before either was touched.
+
+**Neither block is what its name says, and the split is the whole result.**
+
+| class | metal | what it actually is | verdict |
+|---|---|---|---|
+| `wait` (= `stor-bringup d=`) | **~224 ms** | the service ladder ahead of `service_storage` — on x86, `drain_ftdi` clocking the port-5 enumeration burst out a 115200-baud console | **not storage.** See below |
+| `setcfg` | ~2 ms | SET_CONFIGURATION(1) on EP0 | real work |
+| `tur` (= nearly all of `stor-ready d=`) | **~1016 ms** | ONE awaited CSW for the first TEST UNIT READY | **device floor — do not trim** |
+| `sense` / `inq` / `rdcap` / `pub` | ~4 ms total | the rest of the SCSI chain | real work |
+| `fat-mount` | 4 ms | BPB + FAT read | real work (one boot in eleven reads 102 ms) |
+
+**`stor-bringup` is the console, not the disk, and the arithmetic is exact.** BPACE measures
+this class from `enum:p5-done`, so it charges storage for everything the ladder does between
+the enumeration queue draining and `service_storage` being reached. In the x86 ladder that is
+`service_ftdi` → `drain_ftdi`, which empties the boot-capture ring ≤512 B at a time and
+*awaits* each bulk-OUT. Boot S: the port-5 burst between `settle done; requesting slot` and
+`Port enumeration queue drained` is **2665 bytes**, which at 115200 8N1 is **231 ms** against a
+measured gap of **224 ms**; the burst is byte-identical (2665 B) on all four saved boots and the
+gap is 220/221/221/224 ms. That is why the class does not move: it is not a storage constant, it
+is a fixed volume of log divided by a fixed baud rate.
+
+**`stor-ready` is one device answer, and the histogram proves it is not a poll.** The chain's
+`{}` per-stage cut puts ~1016 ms in a single CSW wait: the device ACKs the 31-byte CBW in ~20 µs
+(`n=1`, 19960-23600 cycles across boots) and then holds the 13-byte status for a full second
+while the reader initialises the SD card behind it. The corroboration is the boot-long BOT wait
+histogram, which no amount of driver-side polling could fake: `w=1055/29/4/1/0/0/0/0/0/0/1/0` —
+of **1090** awaited BOT stages in the whole boot, 1055 finished under 1 ms, exactly **one** landed
+in the 512-1023 ms bucket, and that one wait is **82 %** of all BOT wait time the boot spent
+(`sum=3350927839` cycles, `peak=2736524760`). One answer, held once. There is no retry loop here
+to shorten, no settle to price, and no sleep to delete.
+
+**Nothing is trimmed by this arc, and that is the result rather than a shortfall.** §8c's own
+precedent governs: the `PPC=1` branch kept its full 150 ms because that arc had no measurement
+justifying a move. Here the measurement is decisive in the other direction — of the ~1.24 s,
+about 10 ms is UnaOS code and the rest is a serial console and a card reader. The two levers that
+do exist both sit outside this lane and are named here rather than taken:
+
+* **The 2665-byte burst.** 47 lines for one port, including `SLOT ID ALLOCATED: 2` three times
+  and the `SYSTEM ALERT / CONTACT ESTABLISHED / VENDOR ID / PRODUCT ID` block twice for the same
+  slot with two different VID:PIDs (`0bda:0326`, then `0964:0004`). Halving it would halve this
+  class. That is an enumeration-verbosity decision, and the second VID:PID pair looks like a
+  defect worth reading before anything is deleted for speed.
+* **The ladder order.** `service_ftdi` runs ahead of `service_storage` by BOOTPACE M2, so the
+  flush is serialised in front of a one-second device wait that could have overlapped it. M2's
+  stated purpose is a live wire for the storage chain, and the wire is live from `ftdi-up`
+  (t=3923 ms) — 7.6 s before this gap. But bounding the flush would leave the burst unsent across
+  the chain, which is exactly the loss M2 exists to prevent, so the trade is not this arc's to
+  make unilaterally. `main.rs` owns the ordering.
+
+**The instrument.** `drivers/xhci/mod.rs`, one line at the end of the bring-up, EPACE-shaped:
+`[]` is the disjoint partition (`wait/setcfg/tur/sense/inq/rdcap/pub` + `resid`), `{}` is the
+overlapping per-stage cut (`cbw/data/csw` + `peak=Nms@stage`) and must never be added to it, and
+`ftdi=` names the part of `wait` the console owns. `total=` (arm→done, measured only by this
+instrument) is printed beside `sum=` (the `[]` classes added up) so the two independent readings
+of the same interval can be checked against each other. It prints on the failure path too
+(`result=SPACE-FAIL`), and its zero states are distinguishable: `sense=0ms(n=0)` is "never ran",
+not "ran free". `wait=` is stamped at the ARM site, not on entry to `service_storage`, because
+the gap between those two is the entire point. The line is emitted AFTER the `stor-ready` stamp
+so its own serial cost cannot land inside the figure it reports on.
+
+**Coverage.** QEMU exercises the instrument but carries no information about either finding:
+`qemu-xhci`'s storage answers TEST UNIT READY in 1 ms (`tur=1ms(n=1)`) and there is no FTDI
+console at all (`ftdi=0ms(n=0)`), so the two classes that dominate on metal are both ~0 there.
+What the QEMU run does prove is that the instrument is self-consistent — `total=456ms` against
+`sum=454ms`, `{cbw n=3, data n=2, csw n=3}` for exactly the three BOT transactions the chain
+makes, TUR alone having no data stage.
+
+**Falsifiers for the next metal boot.** `ftdi=` much smaller than `wait=` refutes the console
+attribution and sends the 224 ms back to the ladder. `tur=` with `n>1` refutes the single-answer
+reading and would make a backoff or an early exit a justified trim after all. `peak=` not landing
+at `@csw` near 1000 ms refutes the stage attribution. `sum=` and `total=` disagreeing by more than
+this line's print cost means one of the two is lying.
+
 ### 8f. `enum` decomposed to the millisecond — 79% of it is USB 2.0 minima (GR19, 2026-08-06)
 
 M4/M5 took `init=` 2021 → 1482 ms and left `enum` as the largest class: `enum=285ms(n=1)` on
