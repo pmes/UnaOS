@@ -87,6 +87,33 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // measurement of firmware. Heap-free and lock-light, so it is safe this early.
     unaos_kernel::bootpace::record("entry");
 
+    // 0-WC. VPERF-WC HOIST (bootpace.md §11). Retype the framebuffer's identity-map leaves to
+    //     Write-Combining BEFORE the console's first paint instead of after it.
+    //
+    //     `fbcon::init` ends by calling `memory::set_framebuffer_wc` — but it BEGINS with
+    //     `fill_screen(BG_DEFAULT)`, a full-surface clear of every visible pixel (2880x1800x4 =
+    //     20.7 MB on the bench panel) written one dword at a time. Ordered as it was, that clear
+    //     paid the UNCACHEABLE rate the retype exists to escape (~160 MB/s vs ~1.47 GB/s measured,
+    //     §10d), and it is the largest term inside `BPACE: heap d=253ms`. Nothing in the retype
+    //     depends on fbcon: it needs only the base/length pair, which BootInfo already carries
+    //     here, and it already ran at exactly this point in boot — inside a call three lines below.
+    //
+    //     `set_framebuffer_wc` is self-latching (`FB_WC_DONE`) and no-ops on a zero base/length, so
+    //     the call left in place at the end of `fbcon::init` becomes an idempotent second call and
+    //     the retype still happens exactly once. The two BPACE stamps (`fb-wc`, `fb-wc-done`) sit
+    //     inside the latch and therefore MOVE with the retype — which is how the ledger says on its
+    //     own wire which of the two orderings a build has.
+    //
+    //     Watched side effect: the `:: x86 fb-wc: retyped N leaf(s) ... ::` line is now emitted
+    //     before fbcon is ready, so it reaches serial/FTDI but is no longer painted on the panel.
+    //     It was never durable on glass anyway — under the old ordering the clear preceded it, and
+    //     under this one the clear follows it.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::arch::memory::set_framebuffer_wc(
+        boot_info.framebuffer_addr,
+        boot_info.framebuffer_size as u64,
+    );
+
     // 0. Framebuffer log sink FIRST — mirror every serial_println! (and panics) to the screen,
     //    so boot diagnostics are visible on real hardware that has no serial port. No-op if the
     //    firmware gave us no framebuffer. The GUI repaints over it later on a successful boot.
