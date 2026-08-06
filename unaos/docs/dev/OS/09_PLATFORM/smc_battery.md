@@ -872,3 +872,222 @@ actually prints.
 **The open root cause remains GAP 1** — `BRSC` truncating to `len=1`, six boots for six. Repairing
 the value drain is a separate arc with its own evidence; this one stops the driver lying about which
 step failed, and stops it paying 218 ms to do so.
+
+## GAP 1, root-caused: `DATA_READY` clear was never a done-signal (s73, 2026-08-06)
+
+The `BRSC` truncation that feeds the `B0AV` wedge turns out not to be about `BRSC` at all.
+
+### The controls answer the "is it really one byte?" question first
+
+The brief offered a disposition: if the SMC genuinely serves one byte for `BRSC`, learn it per
+KEY-SHAPE like `AC-W` absence. **That is refuted by evidence already in the capture:**
+
+* `soc=100%` has printed **200 times**. `read_u16k` only returns a value on `Ok(2)` and computes
+  `(b[0] << 8) | b[1]`; `100` is `0x0064`. So the SMC serves `BRSC` as **two bytes — `[00 64]` —
+  whenever it is asked for two.**
+
+So `BRSC` is a two-byte key, the `len=1` is ours, and KEY-SHAPE must not learn it. Learning a
+truncation as a fact would be the `AC-W` mistake committed against a *real* defect.
+
+### It is not `BRSC`-specific — it is universal
+
+| Scout observation (32-byte request, six boots) | Value |
+|---|---|
+| Present-reads recorded | 102 |
+| Returned `len=1` | **69** |
+| Returned `len=2` | 33 |
+| Returned more than 2 | **0** |
+
+`REV `, whose value is 6 bytes on the QEMU model, reads `len=1` or `len=2` on metal — never 6. So
+every key on this machine is being cut short; `BRSC` is merely the one whose truncation has a
+visible downstream victim, because it is the key immediately before `B0AV` in the sweep.
+
+### Mechanism: delivered and dropped
+
+Of the brief's three candidates — never requested / requested but not waited for / delivered and
+dropped — it is the third, and the driver's own vocabulary convicts it.
+
+The drain treated `DATA_READY == 0` as *"end-of-value signalled by the SMC"*. **That is not a signal
+at all.** Everywhere else in this driver, a finished transaction is identified by the status
+returning to `ST_CMD_DONE` — at the length step (`s == ST_CMD_DONE ⇒ Absent`) and in
+`settle_before_command`. `DATA_READY` clear while the transaction is still **open** means the
+opposite of done: the next byte has not been shifted in yet.
+
+`pre=0x45` from Boot S is the proof, and it was already in hand: `DATA_READY|ACK`, with **`ACK` still
+asserted** — the preceding read had walked away from a transaction the SMC still considered live.
+The abandoned remainder is exactly the residue the next key inherits.
+
+The second half of the 2026-07-17 GAP-1 fix is suspect for a related reason. `wait_busy_clear` exists
+on the premise that the SMC raises `BUSY` during the byte shift. If it does not, that helper returns
+on its **first** status read, the gap is never covered, and the fix has been **vacuous since the day
+it landed** — which would explain a truncation that was declared fixed and then persisted for six
+boots. The `busy=` census settles that directly.
+
+### The fix
+
+* **`gap_wait()` replaces the break.** A clear `DATA_READY` mid-value now asks which of three things
+  happened: `More` (it came back — an inter-byte gap, read the byte), `Done` (status reached
+  `CMD_DONE` — genuine end-of-value), or `StillOpen` (neither, inside budget — the truncation).
+  Bounded by `SMC_GAP_CYCLES` = 16 pacing quanta ≈ 240 µs, the same window the DIAG samples over and
+  ~450× shorter than the transaction budget: even if *every* read paid it in full, the 19-key scout
+  would cost ~4.5 ms.
+* **`close_transaction()` runs before every value read returns.** Whatever `n` came out — buffer
+  full, or a gap given up on — the SMC may still be mid-value, and leaving it open is what hands the
+  next key its residue. Residue is now cleared by the transaction that *created* it instead of being
+  charged to the innocent key that follows. Bounded by the short gap budget; if the SMC will not
+  close promptly, the next `settle_before_command` still owns it and reports `Stuck(4)`.
+
+Neither can change what a caller receives: `close_transaction` runs after the value is in hand and
+cannot alter `n`, and `gap_wait` can only *add* bytes the old loop dropped. No protection is skipped,
+no wait is forced, no new command or port is touched, and the retry budget is unchanged.
+
+### The instruments that will prove or refute it
+
+Three counters join `stall0`/`resid` on the `SMC-BATT` witness line — the only SMC line that reliably
+prints:
+
+```
+… retries=6/8 stall0=0 resid=0 unclosed=0 gap=14 busy=0 == witness ::
+```
+
+| Field | Meaning | What it decides |
+|---|---|---|
+| `gap` | bytes `gap_wait` recovered that the old drain dropped | **non-zero ⇒ mechanism confirmed**; zero ⇒ the bytes were never there and the cause is upstream (the length byte, or the SMC serving short) |
+| `busy` | times `ST_BUSY` was ever observed set | **zero over a boot ⇒ the GAP-1 BUSY premise is false** and `wait_busy_clear` has always been a no-op here |
+| `rok` | settles that started dirty and reached `CMD_DONE` — residue **seen and cleared** | separates "no residue" from "residue rescued", which `rfail` alone cannot (see Boot T) |
+| `rfail` | drains that gave up (`Stuck(4)`) | renamed from `resid` |
+| `unclosed` | value reads that returned with the transaction still open | should fall to ~0; high means closing is not working either |
+
+### Metal prediction (next `UNAOS_SMC=1` boot)
+
+1. **`SMC-SCOUT` lines get longer.** `BRSC` reads `len=2 bytes=[00 64]`; `REV ` reads more than 2
+   (its true length, likely 6). The 69-of-102 `len=1` rate collapses. **This is the headline** — if
+   the lengths do not change, `gap_wait` is recovering nothing and the mechanism is elsewhere.
+2. **`gap` climbs and `busy` stays 0.** `gap` non-zero with `busy=0` is the complete story: the SMC
+   never raises BUSY, so the old loop broke in every inter-byte gap it met.
+3. **`B0AV` stops wedging.** No `FIRST FAILURE key B0AV kind stuck`, and `stall0`/`resid` stay at 0 —
+   because `BRSC` no longer leaves residue for it to inherit. This is the causal claim: fix the
+   truncation and the wedge disappears without ever being addressed directly.
+4. `unclosed` ≈ 0. A non-zero `unclosed` with `resid=0` would mean closing is working but not
+   promptly; `unclosed` high **and** `resid` high means the SMC will not close on demand at all.
+5. `soc=100%` keeps printing and the `-` holes get rarer (206 holes vs 200 good in the s73 capture).
+   `present=true`, volt ≈ 12.8 V, `probed=19 found=17`, `AC-W`/`B0Pr` absent `(x2)`, no `ac=stuck`.
+
+**Falsifier for the whole arc:** `gap=0` with the `len=1` rate unchanged. That would mean the bytes
+were never delivered, and the next suspect is the length byte — `read_key_inner` sends `out.len()`,
+the *buffer* size, where the Apple SMC protocol wants the key's real size (which is what
+`GET_KEY_INFO`, command `0x13`, exists to provide). That command is **not** issued today and adding
+it would be a deliberate expansion of this driver's command set, so it waits on this boot's evidence.
+
+### Boot T: the wedge did not form — and the counter could not say why
+
+Boot T ran `dd2c2649` (the residue-guard commit; the GAP-1 drain fix above was not yet in it) and
+chose neither predicted door. **No `FIRST FAILURE` line at all**, and `stall0=0 resid=0` throughout.
+
+**Hypothesis (b) — "`BRSC` read clean for once" — is refuted, twice:**
+
+* the scout still reads `key BRSC present len=1 bytes=[00]`, making the truncation **7 boots for 7**;
+* the sweep's `BRSC` behaviour is unchanged. (**I first wrote a percentage here and it was
+  meaningless** — see *The 50% was an artifact* below. The valid statement is the one above plus the
+  retry rate.)
+
+That is expected: `dd2c2649` changed nothing in the value drain. GAP 1 is untouched.
+
+**`resid=0` did not mean what it looks like.** `resid` counts drains that *fail*. A drain that
+succeeds was never counted, so `resid=0` is equally consistent with "there was no residue" and
+"there was residue on every affected sweep and the drain cleared it every time" — opposite facts
+about the machine, indistinguishable in the log. That is my own instrument repeating the exact defect
+this arc exists to find. Fixed here: `rok` counts settles that started dirty and reached `CMD_DONE`,
+and `resid` is renamed `rfail` so the pair reads as what it is.
+
+**A third hypothesis, better than either offered, and now testable.** The old settle loop's exit test
+was `DATA_READY|BUSY`. A status of **`0x44`** — idle-high | `ACK`, `DATA_READY` clear — passes that
+test while the transaction is still **open**, so the old loop could exit *claiming success* and then
+write a command into an open transaction: the step-0 wedge. (`pre=0x45` was the other old exit, the
+deadline break.) `dd2c2649` replaced that test with `low nibble == CMD_DONE`, so at `0x44` the driver
+now **waits** — microseconds, when the SMC closes promptly — instead of charging ahead. That would
+remove the wedge *and* produce `resid=0`, because the drain now succeeds where it used to exit early
+on a false settle. `rok > 0` on the next boot confirms it; `rok = 0` kills it.
+
+**Confounds, stated plainly: this is n=1 and three variables moved at once.**
+
+| | Boots R / R2 / S | Boot T |
+|---|---|---|
+| build | pre-`dd2c2649` | `dd2c2649` |
+| power | **adapter, idle** (`amp=0mA`, `ac=derived:idle`, soc 100%, rem 9962) | **battery, discharging** (`amp=-2497mA`, `ac=derived:discharging`, soc 100→99, rem falling) |
+| first SMC touch | `t≈1746 ms` | `t=1626 ms` |
+
+The machine was unplugged for Boot T. The SMC is doing materially different work — real current
+measurement with changing values instead of a resting pack — and the boot reached the SMC ~120 ms
+earlier. **No causal claim about the wedge can be made from this boot**, in either direction. It is a
+data point that the wedge is not unconditional, nothing more.
+
+### Revised prediction (next `UNAOS_SMC=1` boot, with the GAP-1 drain fix)
+
+Robust to the power-state confound — none of these depend on adapter vs battery:
+
+1. **`BRSC` reads `len=2 bytes=[00 64]` in the scout**, and `REV ` reads more than 2. Unchanged
+   `len=1` means `gap_wait` recovered nothing and the mechanism is upstream (the length byte — see
+   the falsifier above).
+2. **`gap > 0`.** This is the direct measurement of "delivered and dropped".
+3. **`busy = 0`** across the boot ⇒ `wait_busy_clear` has always been a no-op here and the
+   2026-07-17 GAP-1 fix was vacuous from the day it landed.
+4. **`rok` disambiguates Boot T.** `rok > 0` with `rfail = 0` means residue is real and being
+   rescued — which retroactively explains Boot T's `resid=0`. `rok = 0` **and** `gap > 0` would mean
+   `close_transaction` is now clearing residue at the source, before settle ever sees it (the
+   intended outcome).
+5. `unc ≈ 0`; **`short` falls sharply** — that counter, not any `soc` percentage, is the cleanest
+   single number for whether GAP 1 is actually fixed.
+6. A `B0AV` wedge may or may not reappear. **It is no longer the arc's success criterion**: Boot T
+   showed the wedge can vanish without the truncation being touched, so only the `len=` and `gap=`
+   evidence can settle GAP 1.
+
+### The Boot T sit: abundant short reads, and two instruments that lied about them
+
+The sit kept running and the per-key holes are frequent — `soc=-%`, `rem=-mAh`, `full=-mAh`,
+`volt=-mV`, `amp=-mA` — with `retries` climbing 3 → 433 over 150 s while `stall0=0 resid=0`
+throughout. Two conclusions were drawn from that shape, and **both were instrument artifacts.**
+
+#### The "sweep-by-sweep alternation" is the fire condition, not the SMC
+
+`soc` appears to alternate `-` / `99` line after line. It does not. `soc_pct` is part of the
+`LAST_STATE` quiet-witness key, so the witness fires on **both edges** of a drop — once when `soc`
+goes missing and once when it returns — and stays silent through every sweep in between. The gaps
+between consecutive witness lines say it plainly:
+
+```
+13s 1s 18s 1s 5s 1s 1s 1s 1s 1s 11s 1s 6s 1s 2s 1s 21s 1s 19s 2s 11s 1s 18s 1s 6s 1s 2s
+```
+
+Long gap, then 1 s. Those are **drop + recovery pairs** separated by 5–21 s stretches in which the
+key read cleanly every second and nothing printed. There is no square wave, and no periodicity to
+chase — the apparent regularity is edge-triggering.
+
+#### The 50% was an artifact — mine
+
+The previous section reported "`soc` good on 50% / 49% / 51% / 54% of witness lines" as if it were a
+truncation rate. **It is not a rate at all.** Because the witness fires on both edges of every drop,
+good and missing lines are ~50/50 *by construction*, whatever the SMC is doing. Counting an
+edge-triggered log and reporting it as a frequency is precisely the error this arc keeps finding in
+other people's instruments; I published it, and it is withdrawn.
+
+The cumulative `retries` counter is *not* edge-triggered and does give a real figure: **433 retries
+over 150 s ≈ 2.9/s**, against ~1 sweep/s and ~5 read keys per sweep — roughly 0.58 retries per key
+read. So the coordinator's "abundant" is right; the evidence for it is `retries`, not `soc` edges.
+
+Neither of those is a direct measurement, so this arc adds one. **`short`** counts sweep-path reads
+that returned `Ok(n)` with `n != 2` from a two-byte request — the truncation itself, counted where it
+happens, independent of any print policy.
+
+#### `resid=0` still cannot mean "no residue"
+
+The proposed discriminator — *the keys drop out without producing residue, or the residue guard would
+be counting it* — does not hold yet, for the reason the previous section already flagged: `resid`
+(now `rfail`) counts drains that **fail**. A drain that succeeds returns `Ok` and is counted nowhere,
+so `rfail=0` is exactly as consistent with "residue on every affected sweep, cleared every time" as
+with "no residue". The two are opposite facts and the log cannot yet separate them.
+
+`rok` — added here — is what makes that discriminator real. Until a boot reports it, "short reads and
+residue are different mechanisms" is a hypothesis, not a finding. It remains a *good* hypothesis: a
+short read that stops one byte early leaves one byte, and a single leftover byte is exactly what a
+settle drain would clear silently and instantly.
