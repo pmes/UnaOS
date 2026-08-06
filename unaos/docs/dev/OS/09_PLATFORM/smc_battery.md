@@ -279,6 +279,9 @@ wire truth:
   [16 bytes, ~15 µs apart] == evidence ::` — one-shot, fires on the boot's first failed key read
   from any path, usbdebug-independent, read-only (status reads only). Dead-flat `00`/`ff` vs
   busy-wedged vs oscillating status distinguishes absent-device / wedged-handshake / EC-not-ready.
+  **The fire condition here is the original one and was wrong** — it counted a clean `Absent` as a
+  failure, which spent the one-shot on `AC-W` every boot. Corrected in *SMC-DIAG was crying wolf*
+  below; the line's format and read-only character are unchanged.
 
 Perf coupling fixed the same arc (the "cursor slows vug" metal verdict was actually this): on an
 unresponsive SMC each battery sweep burned up to ~16 bounded stuck-handshake budgets (~0.1 s each)
@@ -297,6 +300,10 @@ addresses two of them and deliberately leaves the third alone.
 The 2012 rMBP's SMC carries **no `AC-W` key**: the read comes back a clean `Absent` (the SMC looked
 it up and said no), not a wedge. So `ac_present` can never resolve there, and the witness printed a
 bare `ac=?` on every line forever — a hole where the most user-visible fact belongs.
+
+> Since GR17 the key is **probed once and then skipped** (re-probed every 60 s so the learning stays
+> falsifiable), and its absence is stated once instead of being re-alarmed at every boot — see
+> *SMC-DIAG was crying wolf* at the end of this note. The inference below is unchanged.
 
 AC presence is nonetheless *inferable*, because the `B0AC` amperage is signed and its sign is
 metal-confirmed to flip correctly with the adapter (BATMON M2 sitting):
@@ -371,3 +378,127 @@ can confirm:
 
 The build gates (`arroyo check` both arches, `test`, `test-arm`) prove only that the code compiles
 and that the non-SMC kernel is unregressed.
+
+## SMC-DIAG was crying wolf — `AC-W` absence is not a failure (GR17, 2026-08-06)
+
+Every SMC boot of the 2012 rMBP printed this, and had done since `AC-W` entered `PROBE_KEYS`:
+
+```
+:: SMC-DIAG: FIRST FAILURE key AC-W kind absent step 255 t=3202ms — raw status timeline
+   [40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40] (16 reads, ~15us apart) == evidence ::
+```
+
+### What the line actually said
+
+| Field | Reads as | Actually means |
+|---|---|---|
+| `FIRST FAILURE` | something broke | `read_key` returned `Err` — but `Err` includes `Absent` |
+| `kind absent` | a fault mode | `SmcError::Absent`: the SMC **looked the key up and answered "no such key"**. A completed transaction with a negative result. The driver's own definition calls it *"Clean."* |
+| `step 255` | handshake step 255 | there is no step 255 — the real steps are 0..=3. `dump_first_failure` substituted `0xFF` for "no step applies" and printed the sentinel straight into the numeric field |
+| `[40 ×16]` | raw fault evidence | `0x40 & ST_MASK(0x0f)` = `0x00` = **`ST_CMD_DONE`**: idle, command complete. Bit 6 is this machine's static idle-high bit |
+
+The `[40 ×16]` timeline is the decisive part, and it decodes to the *opposite* of a fault. The same
+boot prints `:: SMC-DIAG: pre-touch t=… raw status=0x40 ::` two lines earlier — the cold status byte
+read **before any transaction is issued**. The "evidence" of the failure is byte-identical to the
+idle reading of a healthy controller. The dump's own rubric only names dead-flat `00`/`ff` (device
+absent), busy-wedged, and oscillating; flat-at-`0x40` is none of those, because the dump was never
+designed to fire on a clean `Absent`.
+
+### Verdict: false alarm — and a disabled instrument underneath
+
+`AC-W` absence on this machine was already an established, metal-confirmed fact (Caveat 1 above,
+2026-07-25; and the driver's own `AcDerived` comments). The s73 capture (3 SMC boots) confirms it is
+stable and isolated:
+
+* `probed=18 found=17` on all three boots — **`AC-W` is the only absent key**;
+* **zero** `STOP-NOTE handshake stuck` lines in the entire capture;
+* the `ac=` field is never `stuck` — 168 `derived:idle`, 58 `?`, 0 `stuck`;
+* the battery monitor does **not** degrade: `present=true soc=100% volt≈12817mV full=9962mAh` right
+  through, i.e. nothing downstream of the missing key is impaired.
+
+So AC wattage/presence is genuinely unreadable on this machine, exactly as documented, and the
+existing IVY-AC handling of that (`ac_present = None`, `ac=derived:*` tagged as an inference, `-`
+sentinels, the vug meter using only the `B0AC` sign) was already honest. **Nothing downstream
+fabricates an AC reading, and this arc changed none of that.**
+
+The real damage was upstream. `dump_first_failure` fires **once per boot** (`FIRED: AtomicBool`), and
+`AC-W` is the first key in `PROBE_KEYS` order to return any `Err` — deterministically, ~4 ms into the
+scout. A documented non-event therefore **consumed the diagnostic slot before any real failure could
+claim it**. The capture shows the burial concretely: boot 1's DIAG fired on `AC-W absent` at 3252 ms,
+and 98 ms later the first battery sweep dropped out completely —
+
+```
+[   3350ms] :: SMC-BATT: present=false soc=-% volt=-mV … ac=? retries=11/11 == witness ::
+```
+
+— a sweep that burned 11 bounded retries, i.e. a cluster of wedged reads. That is precisely the wire
+event the DIAG was built for (see the 2026-07-18 section), and it could not fire. The instrument had
+not been able to report a genuine first failure on any boot for weeks.
+
+### The fix — absence is learned, not alarmed at (KEY-SHAPE)
+
+`drivers/smc.rs` now keeps a per-boot table of what it has learned about each key's *existence* on
+this SMC, and the DIAG's fire condition reads from it:
+
+| Outcome | Before | Now |
+|---|---|---|
+| `Stuck(step)`, any key | DIAG fires | DIAG fires — **unchanged** |
+| `Absent`, key never seen to answer | DIAG fires (the bug) | learned `Absent`; the scout reports it as inventory |
+| `Absent`, key that already answered this boot | — | DIAG fires: `kind absent-unexpected` |
+| `Absent` of `REV ` | — | DIAG fires (seeded `Present`: the protocol requires it) |
+
+**Nothing is weakened.** A missing or undecoded SMC still reaches the DIAG: unclaimed ports read
+`0xff`, so `REV `'s step-0 `NEW_CMD|ACK` wait times out to `Stuck(0)` and dumps a flat-`ff` timeline.
+`SmcError::Absent` never was that path — it requires the status low nibble to read exactly `0x00`,
+which a wedge cannot produce. The bounded waits, the retry budget, the write surface and the
+`#KEY` wedge bound (Caveat 3) are all untouched.
+
+Three smaller corrections ride along:
+
+* **`step 255` → `step n/a`** on the absent arm — a step that does not exist no longer prints as one.
+* **The scout's absent line names itself**: `key AC-W absent — this SMC does not carry it (clean
+  negative answer, not a fault) (AC adapter wattage / presence)`. That reading is the *inventory
+  result*; it used to arrive dressed as `FIRST FAILURE … == evidence`.
+* **`B0Pr` joins `PROBE_KEYS`** (`probed` 18 → 19). `battery::snapshot()` reads it every sweep to
+  decide `present`, but the scout never probed it, so its shape on this machine was undocumented and
+  was being rediscovered 1 Hz at a time inside the sweep.
+
+### `AC-W` probe-once, and saying the unknown out loud
+
+The 1 Hz sweep re-ran a full `AC-W` transaction every second to rediscover a fixed property of the
+SMC's firmware key set. Once the key is known absent the read is skipped, and the fact is stated
+once — this line *replaces* the every-boot false-alarm rather than adding to the log:
+
+```
+:: SMC-BATT: AC-W is absent on this SMC (clean negative answer, not a fault) — AC presence is
+   UNKNOWN; ac=derived:* is inferred from the B0AC sign, and the key is re-probed every 60000 ms
+   == witness ::
+```
+
+The skip is **not** a cached claim: `ACW_REPROBE_MS` (60 s) re-tests it, so on a machine that does
+carry `AC-W` — or if a clean `Absent` were ever produced by something other than a real lookup miss —
+the skip self-corrects within a minute and `ac_present` resolves to the direct answer. Falsifiable,
+not assumed. `ac_present` stays `None` while skipped, `ac_stuck` stays `false` (it is absent, not
+wedged), and the `ac=derived:` tagging is unchanged: **the unknown is reported as unknown.**
+
+### Metal prediction (falsifiable, next `UNAOS_SMC=1` boot)
+
+QEMU has no battery keys and cannot exercise this; the gates prove compilation and reachability only
+(`strings target/x86_64_esp/kernel.elf` carries all four new strings). On the 2012 rMBP:
+
+1. **`:: SMC-DIAG: FIRST FAILURE …` does not appear at all** — neither for `AC-W` nor any other key,
+   provided no handshake wedges. This is the headline: the line stops being a fixture of every boot.
+2. `:: SMC-DIAG: pre-touch t=… raw status=0x40 ::` still prints, unchanged (it is not the one-shot).
+3. `:: SMC-SCOUT: key AC-W absent — this SMC does not carry it (clean negative answer, not a fault)
+   (AC adapter wattage / presence) ::` replaces the bare absent line.
+4. `:: SMC-SCOUT: end (present=Y probed=19 found=…) ::` — `probed` rises 18 → 19 (`B0Pr`).
+   `found` = 18 if `B0Pr` answers, 17 if it too is absent; either is a *result*, and its `B0Pr`
+   scout line now records which.
+5. The `AC-W is absent on this SMC …` line appears **exactly once**, from the first battery sweep.
+6. `SMC-BATT` lines are otherwise unchanged: still `ac=derived:idle` / `ac=?`, still `present=true
+   soc=100% volt≈12.8 V full=9962mAh`, `retries=` still non-zero. `ac=stuck` must not appear.
+7. **The falsifier for the whole verdict:** if a `FIRST FAILURE` line *does* appear, it will name a
+   `stuck` step with a non-`0x40` timeline (or an `absent-unexpected` regression) — a real fault
+   finally able to reach the instrument. The s73 boot-1 sweep drop-out (`retries=11/11` at 3350 ms)
+   makes that a live possibility, and it is now the *desired* outcome: the DIAG reporting the thing
+   it was built for instead of the thing it was buried under.

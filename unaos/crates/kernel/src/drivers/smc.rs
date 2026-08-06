@@ -38,6 +38,7 @@
 //!
 //! x86_64 only; the whole module is unlinked when the knob is off (media byte-identical).
 
+use spin::Mutex;
 use x86_64::instructions::port::Port;
 
 /// Data port (key bytes out, value bytes in). Brief write surface.
@@ -78,6 +79,97 @@ pub enum SmcError {
     /// A status handshake did not settle inside the bounded budget. Traced STOP-NOTE; never forced.
     /// The payload names the step (0 = command, 1 = key arg, 2 = length/lookup, 3 = data byte).
     Stuck(u8),
+}
+
+/// KEY-SHAPE — what this boot has learned about whether a key exists on THIS SMC.
+///
+/// **SMC-DIAG honesty (GR17).** `SmcError::Absent` is the read protocol's *successful negative
+/// answer*: the SMC looked the key up and settled to `CMD_DONE` — "no such key". It is not a
+/// failure. Treating it as one made the one-shot `SMC-DIAG` line fire on `AC-W` — a key this
+/// machine is **known** not to carry (`battery::AcDerived`; doc Caveat 1, metal-confirmed
+/// 2026-07-25) — on every boot, ~4 ms into the scout. Two separate things were wrong with that:
+///
+///   * **It published proof of health under a failure headline.** The metal timeline reads
+///     `[40 ×16]`; `40 & ST_MASK` is `0x00` = `ST_CMD_DONE`, and it is byte-identical to the cold
+///     `SMC-DIAG: pre-touch … raw status=0x40` the same boot prints two lines earlier — i.e. the
+///     "evidence" was the idle status of a healthy controller. The dump's own rubric only names
+///     dead-flat `00`/`ff`, busy-wedged and oscillating; flat-at-idle is not a fault shape.
+///   * **It consumed the diagnostic slot.** `dump_first_failure` fires ONCE per boot, and `AC-W` is
+///     the first key in `PROBE_KEYS` order to return any `Err`, deterministically. So a documented
+///     non-event spent the shot before any real failure could claim it: in the s73 capture boot 1
+///     fired the DIAG on `AC-W absent` at 3252 ms and the first battery sweep dropped out entirely
+///     98 ms later (`present=false … retries=11/11`) with nothing left to record the wire truth.
+///
+/// So absence is now **learned**, not alarmed at. A key that answers is `Present`; a key that
+/// cleanly answers "no" is `Absent`; and the DIAG treats absence as a failure only when the key had
+/// already proven it exists this boot — a genuine regression — or is `REV `, which the protocol
+/// itself requires and which is therefore seeded `Present` below. `Stuck` still fires the DIAG
+/// unconditionally from any key: a wedged handshake, not a clean lookup miss, is what the
+/// instrument was built to catch. **Nothing is weakened by this**: a missing/undecoded SMC still
+/// reaches the DIAG, because unclaimed ports read `0xff`, so `REV `'s step-0 `NEW_CMD|ACK` wait
+/// times out to `Stuck(0)` and dumps a flat-`ff` timeline. `SmcError::Absent` never was that path —
+/// it requires the status low nibble to read exactly `0x00`, which a wedge cannot produce.
+const SHAPE_UNSEEN: u8 = 0;
+const SHAPE_PRESENT: u8 = 1;
+const SHAPE_ABSENT: u8 = 2;
+
+/// Slots in the learned key-shape table. `PROBE_KEYS` (19) plus the sweep's own keys, with room to
+/// spare; a full table simply stops learning (reads still work, the DIAG just stays conservative).
+const SHAPE_SLOTS: usize = 32;
+
+struct KeyShapes {
+    n: usize,
+    keys: [[u8; 4]; SHAPE_SLOTS],
+    shape: [u8; SHAPE_SLOTS],
+}
+
+/// Seeded with `REV ` = `Present`: the driver's own presence test reads it, and an SMC that answers
+/// the ports but denies `REV ` is broken, not merely differently-equipped — that absence SHOULD
+/// still reach the DIAG on the very first read, with nothing prior to compare against.
+static SHAPES: Mutex<KeyShapes> = Mutex::new(KeyShapes {
+    n: 1,
+    keys: {
+        let mut k = [[0u8; 4]; SHAPE_SLOTS];
+        k[0] = *b"REV ";
+        k
+    },
+    shape: {
+        let mut s = [SHAPE_UNSEEN; SHAPE_SLOTS];
+        s[0] = SHAPE_PRESENT;
+        s
+    },
+});
+
+/// What this boot knows about `key` so far (`SHAPE_UNSEEN` if it has never been read).
+fn shape_of(key: &[u8; 4]) -> u8 {
+    let t = SHAPES.lock();
+    for i in 0..t.n {
+        if t.keys[i] == *key {
+            return t.shape[i];
+        }
+    }
+    SHAPE_UNSEEN
+}
+
+/// Record `key`'s observed shape. A key already known `Present` is never demoted to `Absent`: the
+/// fact that it once answered is exactly what makes a later absence a reportable regression, so it
+/// must survive the regression rather than be overwritten by it.
+fn note_shape(key: &[u8; 4], shape: u8) {
+    let mut t = SHAPES.lock();
+    for i in 0..t.n {
+        if t.keys[i] == *key {
+            if !(t.shape[i] == SHAPE_PRESENT && shape == SHAPE_ABSENT) {
+                t.shape[i] = shape;
+            }
+            return;
+        }
+    }
+    if t.n < SHAPE_SLOTS {
+        let n = t.n;
+        t.keys[n] = *key;
+        t.shape[n] = shape;
+        t.n = n + 1;
+    }
 }
 
 #[inline]
@@ -184,10 +276,22 @@ fn settle_before_command() {
 /// byte, then value bytes while `DATA_READY` holds.
 pub fn read_key(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
     let r = read_key_inner(key, out);
-    if let Err(e) = r {
-        // SMC-DIAG: the boot's FIRST failing key read — whatever path it came from (scout,
-        // battery sweep, enumeration) — dumps the raw status timeline, once, unconditionally.
-        dump_first_failure(key, e);
+    // SMC-DIAG dispatch (KEY-SHAPE, see above). The boot's FIRST genuinely failing key read — from
+    // whatever path (scout, battery sweep, enumeration) — dumps the raw status timeline, once. A
+    // clean `Absent` for a key that has never answered is a *learned fact about this machine's key
+    // set*, not a failure, and must not consume that one shot.
+    match r {
+        Ok(_) => note_shape(key, SHAPE_PRESENT),
+        Err(SmcError::Absent) => {
+            if shape_of(key) == SHAPE_PRESENT {
+                // It answered earlier this boot (or is the protocol-required `REV `) and now does
+                // not. A key cannot stop existing — this is a real fault worth the dump.
+                dump_first_failure(key, SmcError::Absent);
+            } else {
+                note_shape(key, SHAPE_ABSENT);
+            }
+        }
+        Err(e @ SmcError::Stuck(_)) => dump_first_failure(key, e),
     }
     r
 }
@@ -252,15 +356,23 @@ fn read_key_inner(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
 /// timeline (~15 µs apart — the applesmc pacing quantum) so the next sitting can read whether the
 /// status is dead-flat (0x00/0xFF: device absent / decoded nowhere), busy-wedged, or oscillating.
 /// Read-only: only 0x304 status reads — no new write surface.
+///
+/// GR17: this is now reached only for a `Stuck` handshake or an UNEXPECTED absence (KEY-SHAPE — a
+/// key that had already answered this boot). It is no longer reachable from an ordinary "this
+/// machine does not carry that key" answer, which is what burned the one shot on `AC-W` every boot
+/// and left the instrument permanently spent before the first real fault of the boot.
 fn dump_first_failure(key: &[u8; 4], err: SmcError) {
     use core::sync::atomic::{AtomicBool, Ordering};
     static FIRED: AtomicBool = AtomicBool::new(false);
     if FIRED.swap(true, Ordering::Relaxed) {
         return;
     }
+    // `Absent` carries no step — the lookup completed, it just answered "no". The old code printed
+    // the 0xFF sentinel straight into the numeric `step` field, so the line read `step 255`: a step
+    // that does not exist (the real ones are 0..=3). It renders `n/a` now.
     let (kind, step) = match err {
-        SmcError::Absent => ("absent", 0xFF),
-        SmcError::Stuck(s) => ("stuck", s),
+        SmcError::Absent => ("absent-unexpected", alloc::string::String::from("n/a")),
+        SmcError::Stuck(s) => ("stuck", alloc::format!("{}", s)),
     };
     let mut samples = [0u8; 16];
     for s in samples.iter_mut() {
@@ -343,6 +455,11 @@ const PROBE_KEYS: &[(&[u8; 4], &str)] = &[
     (b"B0RM", "battery 0 remaining capacity (mAh)"),
     (b"B0St", "battery 0 status bits"),
     (b"B0TF", "battery 0 time-to-full (min)"),
+    // INVENTORY HOLE closed (GR17): `battery::snapshot()` reads `B0Pr` on every sweep to decide
+    // `present`, but the scout never probed it — so its shape on this machine was undocumented, and
+    // whichever way it answers was being discovered 1 Hz at a time inside the sweep instead of once
+    // at boot. Scouting it also lets KEY-SHAPE learn it before the first sweep asks.
+    (b"B0Pr", "battery 0 present flag (the sweep's presence key)"),
     (b"CHBI", "charger battery current"),
     (b"CHBV", "charger battery voltage"),
     (b"AC-W", "AC adapter wattage / presence"),
@@ -402,7 +519,13 @@ pub fn scout() {
             }
             Err(SmcError::Absent) => {
                 let name = core::str::from_utf8(&key[..]).unwrap_or("????");
-                serial_println!(":: SMC-SCOUT: key {} absent ({}) ::", name, desc);
+                // Absence at scout time is the INVENTORY RESULT, not a fault: the SMC looked the
+                // key up and answered "no such key". Said plainly on the line, because this is the
+                // reading that used to arrive dressed as `SMC-DIAG: FIRST FAILURE … == evidence`.
+                serial_println!(
+                    ":: SMC-SCOUT: key {} absent — this SMC does not carry it (clean negative answer, not a fault) ({}) ::",
+                    name, desc
+                );
             }
             Err(SmcError::Stuck(step)) => {
                 let name = core::str::from_utf8(&key[..]).unwrap_or("????");
@@ -669,6 +792,15 @@ pub mod battery {
     /// (the SMC looked the key up and said no) is NOT retried.
     const READ_ATTEMPTS: u32 = 3;
 
+    /// AC-W PROBE-ONCE re-probe period. A key set is fixed by the SMC's firmware, so a learned
+    /// absence cannot go stale in practice — this exists so the learning stays **falsifiable**
+    /// rather than becoming an article of faith. One transaction a minute instead of one a second.
+    const ACW_REPROBE_MS: u64 = 60_000;
+    /// When `AC-W` was last actually probed (0 = never; the boot scout's probe is separate).
+    static ACW_LAST_PROBE_MS: Mutex<u64> = Mutex::new(0);
+    /// Whether the "AC presence is unknown on this machine" statement has been made (once a boot).
+    static ACW_NOTED: Mutex<bool> = Mutex::new(false);
+
     /// One key read's sweep-relevant outcome: value, clean absence, or an unresponsive handshake.
     enum KeyRead {
         Val(u16),
@@ -730,6 +862,35 @@ pub mod battery {
         // SMC fault a sitting needs to see. `ac_stuck` records which of the two produced the hole.
         s.ac_stuck = false;
         s.ac_present = 'acw: {
+            // AC-W PROBE-ONCE (GR17). On a machine whose SMC has no `AC-W` — the 2012 rMBP, learned
+            // by the boot scout and re-learned by the first sweep — re-running the full transaction
+            // every second cannot change the answer; it just spends an SMC transaction per second
+            // rediscovering a fixed property of the firmware's key set. Once the key is known
+            // absent, the read is skipped and `ac_present` stays the honest `None`.
+            //
+            // NOT a cached claim: the learning is re-tested every `ACW_REPROBE_MS`, so if this ever
+            // ran on a machine that does carry `AC-W` — or if a clean `Absent` were ever produced by
+            // something other than a real lookup miss — the skip self-corrects within a minute and
+            // `ac_present` resolves to the direct answer. Falsifiable, not assumed.
+            if super::shape_of(b"AC-W") == super::SHAPE_ABSENT {
+                let now = crate::arch::ms();
+                let mut last = ACW_LAST_PROBE_MS.lock();
+                if *last != 0 && now.wrapping_sub(*last) < ACW_REPROBE_MS {
+                    break 'acw None; // known absent, not due for re-probe: ac_present stays unknown
+                }
+                *last = now;
+                // Say it ONCE, plainly, in place of the every-boot `FIRST FAILURE` line this
+                // replaces: the machine has no AC-W, so AC presence is genuinely UNKNOWN and the
+                // `ac=derived:…` field is an inference from the B0AC sign — never a measurement.
+                let mut noted = ACW_NOTED.lock();
+                if !*noted {
+                    *noted = true;
+                    serial_println!(
+                        ":: SMC-BATT: AC-W is absent on this SMC (clean negative answer, not a fault) — AC presence is UNKNOWN; ac=derived:* is inferred from the B0AC sign, and the key is re-probed every {} ms == witness ::",
+                        ACW_REPROBE_MS
+                    );
+                }
+            }
             for attempt in 0..READ_ATTEMPTS {
                 if attempt > 0 {
                     note_retry();
