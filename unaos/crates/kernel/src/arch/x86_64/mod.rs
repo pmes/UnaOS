@@ -34,6 +34,16 @@ pub fn init() {
     // U1a: SYSCALL/SYSRET MSRs + NX/SMEP for the BSP. After gdt (STAR needs the selectors) and
     // percpu (GS base + KERNEL_GS_BASE); before `sti`.
     syscall::init();
+    // WXN-x86 M1: the PDPT-level NX sweep — the first NX bit this kernel puts in its own map. Sits
+    // HERE, and only here: after `syscall::init` because with EFER.NXE clear bit 63 is a RESERVED
+    // bit (setting it would fault the next translation of ANY kind, not just a fetch), and before
+    // `wx_audit_report` so the existing WXAUDIT census line IS the success signature rather than a
+    // stale "before" a reader has to reconcile with a second one. Before `wx_probe_report` too, so
+    // the WXPROBE `map:` lines are a post-sweep readback whose `e=` fields must be bit-identical to
+    // the pre-sweep capture (no leaf is written) while their folded `fx=` fields flip to 0 outside
+    // the spared GiBs (the parents did change). Needs no allocator — a PDPT-level sweep creates no
+    // tables — which is what lets it run this early, and interrupts are still masked.
+    memory::wxn_pdpt_sweep();
     // WXAUDIT: audit the live map now that EFER.NXE and CR4.SMEP are set — before this point an NX
     // bit in a PTE means nothing to the hardware, so an audit here would be reporting on a protection
     // that is not yet armed. Read-only walk; publishes the negative control and the map's W^X census.

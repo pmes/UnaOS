@@ -1405,6 +1405,457 @@ pub fn wx_probe_report() {
 }
 
 // =================================================================================================
+// WXN-x86 M1 — the PDPT-level NX sweep. The first NX bit this kernel has ever put in its own map.
+// -------------------------------------------------------------------------------------------------
+// WHAT IT DOES, in one sentence: it ORs bit 63 into every present, supervisor-only **PDPT** entry
+// except the one or two 1 GiB regions that must stay executable — the kernel image, and the low GiB
+// holding the AP trampoline page.
+//
+// WHY PARENTS AND NOT LEAVES. The hardware's execute permission for a page is the OR of NX down the
+// whole PML4→PDPT→PD→PT path, and `wx_fold` (the census's classifier, `:891-897`) folds it the same
+// way — so ONE bit on a PDPT entry retires 512 (or 262144) leaves at once, in silicon and in the
+// count. On the rMBP that is ~1022 entry writes instead of 66047. The decisive secondary benefit is
+// not the arithmetic, it is the blast radius: **this sweep never writes a leaf.** The framebuffer's
+// WC typing, every MMIO aperture's PAT/PCD/PWT, the Global bits the firmware chose — none of it is
+// on a PDPT entry, so none of it can be disturbed. GR15 (a whole-PTE rewrite that silently dropped
+// the panel's PAT bit and cost 8.7–9.1× on the blit path) is avoided structurally here, not by
+// discipline. Every write below is a read-modify-write that sets exactly one bit and nothing else.
+//
+// WHERE IT RUNS, and why that is not negotiable. `arch::init`, between `syscall::init()` and
+// `wx_audit_report()`:
+//   * AFTER `syscall::init` because with EFER.NXE clear, bit 63 is RESERVED, not ignored — setting
+//     it before NXE is armed faults on the next translation, of any kind. The sweep re-reads NXE
+//     itself and REFUSES rather than trusting the call site.
+//   * BEFORE `wx_audit_report` so the existing WXAUDIT census line IS the success signature. No
+//     second audit call, no reader having to work out which of two numbers is live.
+//   * BEFORE `wx_probe_report` so the WXPROBE `map:` lines are a post-sweep readback. Their `e=`
+//     fields must be **bit-identical** to the pre-sweep metal capture (Boot V: fb `e=0x900010E3`,
+//     ap8000 `e=0x8003`) — which is the strongest available statement that no leaf was touched —
+//     while their folded `fx=` fields flip to 0 everywhere outside the spared GiBs, which is the
+//     statement that the parents did change. One instrument, two independent claims.
+//   * BEFORE `sti`, and inside `with_page_tables_writable`, which masks interrupts anyway.
+//   * It needs no allocator, which is what lets it sit here at all: a PDPT-level sweep creates no
+//     tables, and the heap does not exist until ~60 lines later in `kernel_main`.
+//
+// WHAT M1 DELIBERATELY DOES NOT DO. It does not split a huge leaf (M2), it does not clear W on
+// `.text` (M3), and it does not set CR0.WP. That last one matters on metal: the rMBP's firmware
+// leaves **CR0.WP=0** (Boot V; QEMU leaves it 1), so until M3 arms WP deliberately a read-only PTE
+// bit does not bind ring 0 at all. NX enforcement does NOT depend on WP — it is EFER.NXE and bit 63
+// and nothing else — so this milestone is fully real on metal; but the RO half of W^X is not yet,
+// and `WXAUDIT-NXE`'s `wp_mask` says so on the wire. Setting WP is M3's job because it changes what
+// `with_page_tables_writable` means for the copy paths M3 introduces.
+//
+// THE COUNTER-HAZARD, stated once so the next arc inherits it rather than rediscovers it: an NX'd
+// non-leaf entry silently vetoes any FUTURE executable mapping created beneath it. Nothing in the
+// tree creates one today (`map_mmio_window` mints NX leaves; ring-3 lives under a separate PML4
+// slot at 1 TiB), but a later arc that maps executable memory under an identity GiB will find it
+// non-executable for reasons no leaf can explain.
+// =================================================================================================
+
+/// The most 1 GiB regions the sweep will ever spare: the trampoline's, plus the image's (which is
+/// ~6.7 MiB and can therefore straddle at most two). Four is slack, and overflowing it is a named
+/// panic rather than a silently under-spared map.
+const WXN_MAX_SPARE: usize = 4;
+
+/// Page tables the residue census will descend into per spared GiB before it gives up and says so.
+/// The census is a diagnostic, not a correctness leg; it must not be able to cost real boot time.
+const WXN_PT_CENSUS_CAP: u32 = 64;
+
+/// The 1 GiB regions left executable, as `va >> 30` indices. Tiny fixed-capacity set — no allocator
+/// exists where this runs.
+struct WxnSpare {
+    gib: [u64; WXN_MAX_SPARE],
+    n: usize,
+}
+
+impl WxnSpare {
+    const fn new() -> Self {
+        WxnSpare { gib: [0; WXN_MAX_SPARE], n: 0 }
+    }
+    fn contains(&self, g: u64) -> bool {
+        let mut i = 0;
+        while i < self.n {
+            if self.gib[i] == g {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+    /// Returns false only on capacity overflow (already-present is a success).
+    fn add(&mut self, g: u64) -> bool {
+        if self.contains(g) {
+            return true;
+        }
+        if self.n == WXN_MAX_SPARE {
+            return false;
+        }
+        self.gib[self.n] = g;
+        self.n += 1;
+        true
+    }
+}
+
+/// Runtime `[start, end)` of the loaded kernel image, from its own ELF header and `PT_LOAD` phdrs
+/// through `__ehdr_start`. `None` if the bytes at `__ehdr_start` are not a well-formed ELF64 header
+/// or carry no `PT_LOAD` — in which case the sweep refuses to run rather than guess at bounds.
+///
+/// The image is a PIE with `min_vaddr == 0`, so a segment's runtime address is `ehdr + p_vaddr`
+/// exactly; UEFI's `allocate_pages` is 4 KiB-aligned, so page alignment survives the load.
+fn wxn_image_bounds() -> Option<(u64, u64)> {
+    const PT_LOAD: u32 = 1;
+    let ehdr = &raw const __ehdr_start as u64;
+    // SAFETY: reads only, through a pointer the linker resolved to the loaded image base. The magic
+    // / class / phentsize checks are what make the phdr reads below safe to perform at all.
+    let ok = unsafe {
+        let p = ehdr as *const u8;
+        core::ptr::read_unaligned(p.cast::<u32>()) == 0x464C_457F // "\x7fELF"
+            && *p.add(4) == 2 // ELFCLASS64
+            && core::ptr::read_unaligned(p.add(54).cast::<u16>()) == 56 // e_phentsize
+    };
+    if !ok {
+        return None;
+    }
+    let (phoff, phnum) = unsafe {
+        let p = ehdr as *const u8;
+        (
+            core::ptr::read_unaligned(p.add(32).cast::<u64>()),
+            core::ptr::read_unaligned(p.add(56).cast::<u16>()) as usize,
+        )
+    };
+    let mut lo = ehdr; // the header itself is inside the first PT_LOAD, at p_vaddr 0
+    let mut hi = 0u64;
+    for i in 0..phnum.min(64) {
+        // SAFETY: `phoff`/`phnum` come from the header validated above; each phdr is 56 bytes inside
+        // the first PT_LOAD, which the bootloader copied into RAM along with the header.
+        let (ptype, vaddr, memsz) = unsafe {
+            let ph = (ehdr + phoff + (i as u64) * 56) as *const u8;
+            (
+                core::ptr::read_unaligned(ph.cast::<u32>()),
+                core::ptr::read_unaligned(ph.add(16).cast::<u64>()),
+                core::ptr::read_unaligned(ph.add(40).cast::<u64>()),
+            )
+        };
+        if ptype != PT_LOAD || memsz == 0 {
+            continue;
+        }
+        lo = lo.min(ehdr + vaddr);
+        hi = hi.max(ehdr + vaddr + memsz);
+    }
+    if hi <= lo { None } else { Some((lo, hi)) }
+}
+
+/// Count the present leaves inside the spared 1 GiB regions — i.e. the residue the sweep is about to
+/// LEAVE behind, computed independently of the census that will report it.
+///
+/// This is the milestone's self-prediction. `kern_WX` on the next line of the log must equal this
+/// number (minus any leaf the firmware already left read-only), and the two counts come from two
+/// separate walks of the same tables. A sweep that missed entries disagrees with itself, on one
+/// screen, without anyone having to hold a baseline in their head.
+///
+/// Returns `(leaves, 1G leaves, 2M leaves, 4K leaves, page tables descended, capped)`.
+fn wxn_spare_census(spare: &WxnSpare) -> (u32, u32, u32, u32, u32, bool) {
+    let (mut l1g, mut l2m, mut l4k, mut pts) = (0u32, 0u32, 0u32, 0u32);
+    let mut capped = false;
+    for s in 0..spare.n {
+        let g = spare.gib[s];
+        let va = g << 30;
+        // SAFETY: every page-table frame is identity-mapped and directly readable at ring 0. Reads
+        // only — this runs before the sweep and must not perturb what it is measuring.
+        unsafe {
+            let e4 = *cr3_table().add(pml4_index(va));
+            if e4 & PTE_PRESENT == 0 {
+                continue;
+            }
+            let e3 = *((e4 & PTE_ADDR) as *const u64).add(pdpt_index(va));
+            if e3 & PTE_PRESENT == 0 {
+                continue;
+            }
+            if e3 & PTE_HUGE != 0 {
+                l1g += 1;
+                continue;
+            }
+            let pd = (e3 & PTE_ADDR) as *const u64;
+            for k in 0..512 {
+                let e2 = *pd.add(k);
+                if e2 & PTE_PRESENT == 0 {
+                    continue;
+                }
+                if e2 & PTE_HUGE != 0 {
+                    l2m += 1;
+                    continue;
+                }
+                if pts >= WXN_PT_CENSUS_CAP {
+                    capped = true;
+                    continue;
+                }
+                pts += 1;
+                let pt = (e2 & PTE_ADDR) as *const u64;
+                for l in 0..512 {
+                    if *pt.add(l) & PTE_PRESENT != 0 {
+                        l4k += 1;
+                    }
+                }
+            }
+        }
+    }
+    (l1g + l2m + l4k, l1g, l2m, l4k, pts, capped)
+}
+
+/// **The sweep.** See the section header for the full argument. Called once, from `arch::init`,
+/// between `syscall::init()` and `wx_audit_report()`.
+///
+/// Refuses (loudly, without writing anything) if EFER.NXE is clear or if the image bounds cannot be
+/// derived. Panics if its own self-checks fail — a boot-breaking panic is the correct outcome for
+/// "I am about to mark the code I am executing non-executable", and for "the framebuffer leaf
+/// changed under a sweep that writes no leaves".
+pub fn wxn_pdpt_sweep() {
+    use x86_64::registers::control::{Cr0, Cr4};
+    const CR4_PGE: u64 = 1 << 7;
+    // The 1 GiB region holding the AP trampoline page, from `smp`'s own constant — not a second
+    // hard-coded 0x8000, so a retargeted SIPI vector cannot leave this sweep sparing the wrong GiB.
+    let tramp_gib = (super::smp::TRAMPOLINE_ADDR as u64) >> 30;
+
+    let cr0 = Cr0::read_raw() as u64;
+    let cr4 = Cr4::read_raw() as u64;
+    let wp = (cr0 >> 16) & 1;
+    let pge = cr4 & CR4_PGE != 0;
+
+    // Leg 1 — fail closed on NXE. The call site already orders this after `syscall::init`, but an
+    // ordering argument in a comment is not a check: with NXE clear, bit 63 is a RESERVED bit and
+    // every entry we set would fault the next translation through it. Ask the MSR, not the caller.
+    if !efer_nxe() {
+        serial_println!(
+            ":: WXN-x86: nxe=0 -> REFUSED (bit 63 is RESERVED with EFER.NXE clear; no entry written) ::"
+        );
+        return;
+    }
+
+    // Leg 2 — fail closed on bounds. Without exact image bounds the sweep cannot know which GiB to
+    // spare, and a wrong guess makes the kernel non-executable. No bounds, no sweep.
+    let Some((img_lo, img_hi)) = wxn_image_bounds() else {
+        serial_println!(
+            ":: WXN-x86: ehdr=0x{:X} elf=bad -> REFUSED (no image bounds; no entry written) ::",
+            &raw const __ehdr_start as u64
+        );
+        return;
+    };
+
+    let mut spare = WxnSpare::new();
+    let mut fits = spare.add(tramp_gib);
+    let mut g = img_lo >> 30;
+    while g <= (img_hi - 1) >> 30 {
+        fits &= spare.add(g);
+        g += 1;
+    }
+    assert!(
+        fits,
+        "WXN-x86: the kernel image spans more 1 GiB regions than WXN_MAX_SPARE ({}) — img=[{:#x},{:#x}); \
+         raising the cap is safe, sweeping with an under-spared set is not",
+        WXN_MAX_SPARE, img_lo, img_hi
+    );
+
+    // Leg 3 — the self-check that wrong bounds cannot survive. `wxn_pdpt_sweep` is itself a `.text`
+    // address, so it must lie inside the derived image span AND inside a spared GiB. If the phdr
+    // walk latched onto the wrong header, or the GiB arithmetic is off, this fires here — before a
+    // single entry is written — instead of as a dead machine one instruction after the flush.
+    let here = wxn_pdpt_sweep as *const () as u64;
+    assert!(
+        here >= img_lo && here < img_hi,
+        "WXN-x86: derived image bounds [{:#x},{:#x}) do not contain this function ({:#x}) — the phdr \
+         walk found the wrong ELF header",
+        img_lo, img_hi, here
+    );
+    assert!(
+        spare.contains(here >> 30),
+        "WXN-x86: the GiB holding kernel .text ({:#x}) is not in the spare set — sweeping would make \
+         the running kernel non-executable",
+        here >> 30
+    );
+    assert!(
+        spare.contains(tramp_gib),
+        "WXN-x86: the GiB holding the AP trampoline ({:#x}) is not in the spare set — sweeping would \
+         triple-fault every AP at its first post-paging fetch",
+        tramp_gib
+    );
+
+    // The residue prediction, computed BEFORE the sweep (the sweep changes no PD/PT contents, so the
+    // number is the same either way; taking it first keeps the edit window as short as possible).
+    let (sp_leaves, sp_1g, sp_2m, sp_4k, sp_pts, sp_capped) = wxn_spare_census(&spare);
+
+    // R2 / GR15 — the framebuffer leaf, read before and read back after. The argument that this
+    // sweep cannot disturb the panel's WC typing is airtight (a non-leaf entry's PWT/PCD affect only
+    // the caching of the page-table WALK, and bit 63 affects nothing but fetch permission), but GR15
+    // is exactly what happens when an argument is the only belt: the panel was uncached for two
+    // weeks behind a correct-sounding sentence. So: capture the raw leaf value, and PANIC on any
+    // change. A boot-breaking panic naming the two values is strictly better than a silently
+    // un-typed panel, which costs 8.7–9.1× on the blit path and is invisible to every permission
+    // instrument in the tree, WXAUDIT included.
+    let fb = crate::video::WRITER.try_lock().map(|w| w.base() as u64).unwrap_or(0);
+    let fb_before = if fb != 0 { wx_probe_leaf(fb).map(|(e, l, _)| (e, l)) } else { None };
+
+    let (mut pdpt_seen, mut nx_set, mut skip_spare) = (0u32, 0u32, 0u32);
+    let (mut skip_user, mut skip_pml4_user, mut already_nx, mut skip_selfmap) = (0u32, 0u32, 0u32, 0u32);
+
+    let root = cr3_table();
+    let root_pa = root as u64;
+    // On metal CR0.WP is already 0, so this wrapper is a no-op there; on QEMU (WP=1) the firmware's
+    // table pages are read-only to ring 0 and it is what makes the stores land. It also masks
+    // interrupts for the whole edit, which is free here (`sti` has not run yet).
+    with_page_tables_writable(|| {
+        // SAFETY: every page-table frame is identity-mapped and directly addressable at ring 0.
+        // Every store below is `e | PTE_NX` — a read-modify-write that sets exactly bit 63 and
+        // preserves the address field, the memory-type bits and every permission bit the firmware
+        // chose. No whole-entry value is ever written (GR15's law).
+        unsafe {
+            for i in 0..512usize {
+                let e4 = core::ptr::read_volatile(root.add(i));
+                if e4 & PTE_PRESENT == 0 {
+                    continue;
+                }
+                // D10: never touch a PML4 entry (`build_slot` copies those into every ring-3 slot at
+                // build time, so a PML4 edit would be invisible to live slots), and never descend
+                // into a user-reachable one.
+                if e4 & PTE_USER != 0 {
+                    skip_pml4_user += 1;
+                    continue;
+                }
+                let child = e4 & PTE_ADDR;
+                if child == root_pa {
+                    // Recursive self-map: "PDPT entries" under it are the PML4's own entries, and
+                    // writing NX there would veto the entire address space. Neither Apple EFI nor
+                    // OVMF builds one (`tables=1028`/`1034` prove it — a self-map would explode the
+                    // walk), but the guard costs one comparison and the failure mode is total.
+                    skip_selfmap += 1;
+                    continue;
+                }
+                let pdpt = child as *mut u64;
+                for j in 0..512usize {
+                    let p = pdpt.add(j);
+                    let e3 = core::ptr::read_volatile(p);
+                    if e3 & PTE_PRESENT == 0 {
+                        continue;
+                    }
+                    pdpt_seen += 1;
+                    if e3 & PTE_USER != 0 {
+                        // Ring-3-reachable subtree: not ours to restrict here, and the ring-3 W^X
+                        // legs own it. `user=0` on the census means this counter should stay 0 too;
+                        // a non-zero value would say the sweep is skipping real identity memory.
+                        skip_user += 1;
+                        continue;
+                    }
+                    if spare.contains(((i as u64) << 9) | j as u64) {
+                        skip_spare += 1;
+                        continue;
+                    }
+                    if e3 & PTE_NX != 0 {
+                        already_nx += 1;
+                        continue;
+                    }
+                    core::ptr::write_volatile(p, e3 | PTE_NX);
+                    nx_set += 1;
+                }
+            }
+        }
+    });
+
+    // D6 — the flush, and the branch on the wire. A PDPT-entry change invalidates a whole GiB of
+    // translations, so `invlpg` at 4 KiB stride is not viable (262144 instructions per GiB). A CR3
+    // reload flushes everything EXCEPT global entries, and `memory.rs` records that the firmware's
+    // huge identity leaves may carry the Global bit — so if PGE is set we clear-and-restore CR4.PGE,
+    // which does evict globals. We never *set* PGE: on a machine where firmware left it clear (the
+    // rMBP — Boot V, `pge=0`) no global entry can exist, a CR3 reload is a complete flush, and
+    // setting PGE would be a semantic change masquerading as one.
+    //
+    // Worth stating because it bounds the whole risk: every write above is a RESTRICTION with an
+    // unchanged output address. A missed flush can therefore only leave the protection vacuous on a
+    // stale entry — it can never fault and can never mistranslate.
+    if pge {
+        // SAFETY: clearing then restoring CR4.PGE flushes the entire TLB including global entries;
+        // CR4 ends bit-identical to how we found it. Interrupts are still masked (pre-`sti`).
+        unsafe {
+            Cr4::write_raw(cr4 & !CR4_PGE);
+            Cr4::write_raw(cr4);
+        }
+    } else {
+        // SAFETY: reloading CR3 with its own value is architecturally a full non-global TLB flush;
+        // with PGE clear there are no global entries to miss.
+        unsafe {
+            core::arch::asm!(
+                "mov {t}, cr3",
+                "mov cr3, {t}",
+                t = out(reg) _,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
+    serial_println!(
+        ":: WXN-x86: ehdr=0x{:X} img=[0x{:X},0x{:X}) gib_img={} gib_tramp={} spare_n={} pdpt_seen={} nx_set={} \
+         skip_spare={} skip_user={} skip_pml4_user={} skip_selfmap={} already_nx={} residue_leaves={} \
+         (1g={} 2m={} 4k={} pt={}{}) pge={} flush={} wp={} ::",
+        &raw const __ehdr_start as u64,
+        img_lo,
+        img_hi,
+        img_lo >> 30,
+        tramp_gib,
+        spare.n,
+        pdpt_seen,
+        nx_set,
+        skip_spare,
+        skip_user,
+        skip_pml4_user,
+        skip_selfmap,
+        already_nx,
+        sp_leaves,
+        sp_1g,
+        sp_2m,
+        sp_4k,
+        sp_pts,
+        if sp_capped { " CAPPED" } else { "" },
+        pge as u8,
+        if pge { "pge-toggle" } else { "cr3-reload" },
+        wp,
+    );
+
+    // The GR15 belt, cashed. `residue_leaves` above is what the WXAUDIT line on the next screen must
+    // report as `kern_WX` (less any leaf the firmware already left read-only); `WXN-FBWC` here is
+    // what says the panel survived. `fx=0` is the sweep working — the fb is now non-executable via
+    // its PDPT parent — while `e=` unchanged is the sweep having touched no leaf to achieve it.
+    if let Some((e_before, l_before)) = fb_before {
+        match wx_probe_leaf(fb) {
+            Some((e_after, l_after, acc)) => {
+                assert!(
+                    e_after == e_before && l_after == l_before,
+                    "WXN-x86: the framebuffer LEAF changed across a sweep that writes only PARENT \
+                     entries — before=0x{:016X}/lvl{} after=0x{:016X}/lvl{}. This is the GR15 defect \
+                     (a dropped PAT bit silently re-UCs the panel, 8.7-9.1x on the blit path) and it \
+                     is invisible to every permission instrument, so the boot stops here.",
+                    e_before, l_before, e_after, l_after
+                );
+                let pat = pat_bit_for_level(l_after);
+                serial_println!(
+                    ":: WXN-FBWC: fb=0x{:X} lvl={} e=0x{:016X} pat={} pcd={} pwt={} w={} fx={} -> LEAF BIT-IDENTICAL ::",
+                    fb,
+                    l_after,
+                    e_after,
+                    (e_after & pat != 0) as u8,
+                    (e_after & PTE_PCD != 0) as u8,
+                    (e_after & PTE_PWT != 0) as u8,
+                    (e_after & PTE_WRITABLE != 0) as u8,
+                    (!acc.2) as u8,
+                );
+            }
+            None => panic!(
+                "WXN-x86: the framebuffer mapping at {:#x} is gone after the sweep — it was present \
+                 (leaf 0x{:016X}) before it",
+                fb, e_before
+            ),
+        }
+    }
+}
+
+// =================================================================================================
 // VPERF-WC — write-combining for the framebuffer mapping (x86, memory-TYPE only; seat-signed scope).
 // -------------------------------------------------------------------------------------------------
 // The M3 cached-RAM shadow already turned all VRAM traffic into write-only sequential blits
