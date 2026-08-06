@@ -3979,6 +3979,11 @@ fn x86_usb_pump(cpu: usize) {
         // witness gate — the media `./arroyo esp-x86` writes carries neither `witness` nor
         // `usbdebug`, and this is the only build that reaches the bench.
         unaos_kernel::bootpace::service_dump();
+        // FBCON-PACE: retire held console damage on THIS lane too. The usbdebug loop got this call
+        // first, but the bench media carries `wc` without `usbdebug` — the console routes and THIS
+        // pump is its only always-running service loop, so without the paced hook here a burst's
+        // trailing band waits for the next print. Paced, not forced; free on a clean ledger.
+        unaos_kernel::video::fbcon::console_service();
         // FLIGHT-RECORDER: flush the captured serial boot log to UNAOS.LOG on the FAT volume.
         unaos_kernel::flight_recorder::service();
         // U2/U4x/U5x/U6x/U6bx (witness knob): the ring-3 fixture ladder, each one-shot and gated on
@@ -3999,6 +4004,9 @@ fn x86_usb_pump(cpu: usize) {
         unaos_kernel::install::install_probe_once();
         // One-shot USB topology dump to serial (enumeration diagnosis; `usbinfo` shows it live).
         unaos_kernel::drivers::xhci::log_summary_once();
+        // FBCON-PACE: the console's present census, once, beside the xHCI summary — same placement
+        // and reasoning as the usbdebug loop's copy, because THIS is the loop the bench media runs.
+        unaos_kernel::video::fbcon::console_pace_census_once();
         // Drain any frames the NIC has received into the network stack (no-op with no NIC).
         unaos_kernel::drivers::e1000::service_net();
     }
