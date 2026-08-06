@@ -15,6 +15,12 @@ pub mod memory;
 pub mod elf;
 
 pub fn init() {
+    // BPACE HPACE-1: `core-init d=` is the interval from the WC retype to here — on the current
+    // ordering that is the `WRITER` seed and its one line; if `set_framebuffer_wc` is ever hoisted
+    // ABOVE `fbcon::init` in `kernel_main`, the console's full-surface clear lands in this bucket
+    // instead of in `fb-wc`. Which bucket carries the big number therefore SAYS which ordering the
+    // build has, without anyone having to read the source. See bootpace.md §11.
+    crate::bootpace::record("core-init");
     gdt::init();
     interrupts::init_idt();
     // Pure local-APIC system: silence the legacy 8259 PIC, then software-enable the local

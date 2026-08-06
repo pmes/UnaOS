@@ -102,7 +102,11 @@ strings unaos/target/x86_64_esp/kernel.elf | grep -c 'BPACE'      # must be >= 1
 | tag | recorded at | what `d=` measures |
 |---|---|---|
 | `entry` | first statement of `kernel_main` | see note below — approximately firmware + bootloader |
-| `heap` | after `arch::memory::init` | early paging/framebuffer/heap setup |
+| `fb-wc` | `memory::set_framebuffer_wc`, just after the `FB_WC_DONE` latch (x86) | `entry` → the framebuffer's WC retype; on the current ordering that is `fbcon::init`'s full-surface clear (§11c) |
+| `fb-wc-done` | last statement of `set_framebuffer_wc` (x86) | the retype itself — leaf walk + the 4 KiB `invlpg` sweep + one line |
+| `core-init` | first statement of `arch::init()` (x86) | the `WRITER` seed and its line |
+| `mem-init` | first statement of `arch::memory::init` (x86) | `arch::init()` (GDT/IDT/APIC/percpu/SYSCALL MSRs) + the boot-info extraction + SPLASH-1 on a non-`witness` build |
+| `heap` | after `arch::memory::init` | `memory::init` ALONE — region scan, diagnostics, identity-map probe, `init_heap_raw`. Before GR20 this tag carried the whole `entry`→heap span; the four tags above now partition it (§11c) |
 | `acpi` | after `acpi::init` + `dmar_report` + `pm_timer_report` (x86) | the whole ACPI discovery phase |
 | `calib` | after `apic::calibrate` (x86) | the TSC/APIC calibration alone |
 | `smp` | after `smp::start_aps` (x86) | AP bring-up + the post-bring-up smoke test |
@@ -684,6 +688,13 @@ below it.
 fixture ladder doing real transfers, not a wait — it is named here so the next reader does
 not mistake the residual for more edge-blocking. The ~0 ms default floor is
 `sched::init` + `sched::enable` + one serial line, and there is nothing left in it.
+
+> **CORRECTED by §11a (GR20).** "the ring-3 fixture ladder" is wrong, and the same capture
+> says so: every line of the ladder — LOGWIT-1, both gates, U1a, U1b, U2-0a, U3 — carries
+> the SAME `t=414ms`. All 155 ms is `u3_5_run_fixture` alone, and 100 ms of that was a flat
+> `ticks() + 100` sleep, not a transfer. §11b trims it to an event-driven window. What
+> survives from this paragraph is the shape of the claim (a residue that is work, not
+> edge-blocking) and the ~0 ms default floor; the attribution does not.
 
 ### 8f. `enum` decomposed to the millisecond — 79% of it is USB 2.0 minima (GR19, 2026-08-06)
 
@@ -1465,8 +1476,9 @@ fired from core 7 at `deferred 3451 ms TSC / 3438 ms APIC — CONSISTENT`, 13 ms
 "not walked" lines' serial cost was not in the model, noted); `hcrst=47/24 ms` exact,
 `rootrst n=3/n=2` exactly the moved debounce's +1, `hubrst=100ms(n=5)` in-band, `M2 armed
 keyboard addr=6 ep=IN3` present and identical; `kepler=1521ms` (wc-d's in-window verify now
-lattice — both batteries complete post-boot: wc-g and wc-d `-> PAID` for every presenting
-window); console-pace census `ran=7 held=262 busy=0 idle=1` — 262 line-merges retired by 7
+lattice — both batteries complete post-boot: wc-g and wc-d `-> PAID` for every window still
+presenting at the 15 s horizon; windows whose last present precedes it read `DEFERRED` /
+"open at capture end", which the analyzer's honesty check correctly declines to warn on); console-pace census `ran=7 held=262 busy=0 idle=1` — 262 line-merges retired by 7
 presents. Zero FAIL, zero TRIPWIRE, zero exceptions. Two live findings the boot handed back:
 the resurrected SMC FIRST FAILURE fired on a REAL wedge on its first outing (`B0AV kind stuck
 step 0`, status timeline 0x48 — a fault the AC-W false alarm used to bury), and KBDWIT reports
@@ -1514,3 +1526,186 @@ here refutes the original observation. What is closed is the false alarm: from n
 `sched=WALKED reports=0` with no keypress is the baseline, and the recurrence signature is
 `sched=WALKED` + keys pressed + **no** `SILENCE-BROKE` (device/TT/toggle, host side excluded) or
 `sched=NOT-WALKED` (host side, convicted with no keypress needed).
+
+## 11. The boot head: `heap d=253ms` and the `sched` residue (GR20, 2026-08-06)
+
+Two blocks at the front of the ledger had never been opened. Both were CONSTANT — the
+sign of a cost this kernel chose, not one the hardware imposed — and a constant is
+exactly what a decomposition can convict.
+
+| block | reading in `rmbp-gr16-s73/ttyUSB0.log` | n |
+|---|---|---|
+| `heap d=` | **253 ms** on every witness boot, **296 ms** on every default boot | 8 / 3 |
+| `sched d=`, witness build | **155–156 ms**, after §8e unparked CLOCK-X1 | 5 |
+
+Byte-identical across eleven boots and two builds. Neither number had a single stamp
+inside it.
+
+### 11a. The `sched` residue is ONE fixture, and §8e named the wrong one
+
+§8e closed with "the 155 ms of post-sample work on a witness build is the ring-3 fixture
+ladder doing real transfers". The capture refutes that, and it takes one `awk` to see it.
+Between `smp` (`t=414ms`) and `sched` (`t=569ms`) on boot 11 (lines 15400–15448), every
+line of the ladder — U2-0c, the CLOCK-X1 sample, LOGWIT-1, the five SNTP-X86-GATE lines,
+the five DNS-X86-GATE lines, U1a, the three U1b faults, U2-0a, both U3 lines — carries the
+**same timestamp, `t=414ms`**. The next line, and the only one that moves, is:
+
+```
+[    414ms] :: U3.5: preemptible-ring-3 demo — spinner + co-task on core 1 ::
+[    569ms] :: U3.5: ring-3 preemption — IRQs-at-ring3=156, co-task ran, spinner resumed -> PASS ::
+```
+
+**All 155 ms of it is `u3_5_run_fixture`.** The whole rest of the ladder is free at this
+clock's resolution. `IRQs-at-ring3=156` is the same on all five witness boots, and 156
+timer IRQs at 1 kHz is 156 ms — the fixture's cost and the fixture's own evidence counter
+are the same number, which is what a purely clock-bounded fixture looks like.
+
+**UPACE — the fixture states its own four phases.** One line, four `ticks()` reads:
+
+```
+:: U3.5 pace: armed=Nms observe=Nms reap=Nms total=Nms (obs_irqs=N/N steps=N) ::
+```
+
+* `armed` — properties (a)+(b): the co-task's `U3_5_COTASK_STEPS = 8` iterations, each
+  `sleep_ticks(2)`. Its floor is not 8 × 2 ms: the spinner holds `QUANTUM_TICKS = 4`, so
+  each wake must outwait the spinner's remaining quantum and the honest floor is
+  ≈ `STEPS × QUANTUM_TICKS` = 32 ms. **Measured 56–57 ms.** This is real work proving the
+  DoS fix — a wait for an event that is the evidence — and is NOT trimmed.
+* `observe` — property (c). **This was the block.**
+* `reap` — the `KillSwitch` round trip. 1–5 ms, quantum-phase noise.
+
+### 11b. The trim: a duration that should always have been an event count
+
+Property (c) is *"the spinner RESUMES correctly across preemptions"*, and it was measured
+by `let obs_deadline = ticks() + 100; while ticks() < obs_deadline {}` — a flat 100 ms
+sleep on the BSP, unconditional, whatever happened inside it. The property is not a
+duration. It is a number of preemptions having occurred between two samples of the
+counter, and the pre-trim form never checked that even one did: a window in which the
+spinner was never once evicted passes it, because the counter climbs anyway.
+
+The window now waits for the event and keeps 100 ms as the deadline:
+
+```rust
+const U3_5_OBS_IRQS: u64 = 3 * crate::arch::sched::QUANTUM_TICKS as u64;  // 12
+const U3_5_OBS_BOUND_MS: u64 = 100;                                       // unchanged
+```
+
+**Floor, cited.** `IRQS_AT_RING3` ticks once per 1 kHz timer IRQ taken while the spinner
+is at CPL 3, so twelve is ~12 ms — 12× the clock's own granularity, and three full
+quantum expiries. One expiry would prove a single resume, which a task that wedges
+immediately after its first resume also passes; three is the smallest count that requires
+the resume path to work repeatedly. `QUANTUM_TICKS` is now `pub` and read from the
+scheduler rather than restated — a second copy of that number is exactly the kind of
+constant that survives a change to the first.
+
+**The bound is untouched**, so a TCG/QEMU run whose ring-3 IRQs under-deliver behaves
+exactly as it did before.
+
+**Tripwire.** `obs_irqs` is printed against its requirement. `observe=100ms` together with
+`obs_irqs < 12` means the window hit its *deadline* instead of its *event* — on metal that
+says ring-3 IRQs stopped arriving and the PASS above rests on a weaker reading than it
+claims. On TCG that combination is expected and benign, which is why the verdict still
+gates on `irqs > 0` and not on an exact count.
+
+**Measured pre/post pair, same host, same build, one variable.** The pre-trim leg was taken
+by forcing `U3_5_OBS_IRQS` to `u64::MAX` — the deadline path, i.e. the old code exactly:
+
+| leg | `armed` | `observe` | `reap` | `total` | `IRQs-at-ring3` |
+|---|---|---|---|---|---|
+| pre-trim (`UNAOS_WITNESS=1 UNAOS_LOGTS=1 ./arroyo test`) | 56 ms | **100 ms** | 1 ms | **157 ms** | 156 |
+| post-trim (same command) | 57 ms | **12 ms** | 5 ms | **74 ms** | 72 |
+
+The pre-trim QEMU total (157 ms, `IRQs-at-ring3=156`) reproduces the metal reading
+(155–156 ms, `IRQs-at-ring3=156`) to within 1–2 ms, because the fixture is clock-bounded
+end to end and nothing in it is CPU-bound. That agreement is what lets a QEMU pre/post
+pair stand in for a metal one *for this fixture* — and it is stated as a property of this
+fixture, not a general licence.
+
+**Prediction — metal, next witness boot:**
+
+| reading | before | predicted after |
+|---|---|---|
+| `BPACE: sched d=`, witness build | 155–156 ms | **66–76 ms** |
+| `BPACE: sched d=`, default build | 0–3 ms | **unchanged** (U3.5 is `witness`-only) |
+| `U3.5 pace: observe=` | *(absent)* | **12–14 ms**, with `obs_irqs=12/12` |
+| `U3.5 pace: armed=` | *(absent)* | **50–60 ms** |
+| `U3.5: ring-3 preemption` verdict | PASS | **PASS**, `IRQs-at-ring3` ≈ **70–80** |
+
+Falsifiers: `observe=100ms` with `obs_irqs<12` (deadline, not event — see the tripwire);
+`armed` above 80 ms (something in the co-task ladder regressed, not this trim); a U3.5
+FAIL on the first post-trim boot (the shorter window genuinely was load-bearing, which
+this arc's reading says it was not); or `sched d=` failing to drop by the `observe` delta,
+which would mean a second cost is hiding in step 4d that neither UPACE nor §8e has named.
+
+### 11c. HPACE-1 — four stamps inside `heap`
+
+`heap d=` was the interval from `entry` to `bootpace::record("heap")` with nothing in
+between: `fbcon::init`, the `WRITER` seed, `arch::init()`, the boot-info extraction, the
+SPLASH-1 paint and `memory::init` in one bucket. Four new stamps partition it, and none of
+them is in `main.rs` — each sits at the first (or last) statement of a function `main.rs`
+already calls, so the ledger subdivides the block without the entry point changing:
+
+| tag | recorded at | what `d=` measures |
+|---|---|---|
+| `fb-wc` | `memory::set_framebuffer_wc`, immediately after the `FB_WC_DONE` latch | everything from `entry` to the WC retype — on the current ordering, `fbcon::init`'s full-surface `fill_screen` + `flush_all` |
+| `fb-wc-done` | last statement of `set_framebuffer_wc` | the retype ITSELF — the leaf walk, the 4 KiB `invlpg` sweep over the whole span, one line |
+| `core-init` | first statement of `arch::init()` (x86) | the `WRITER` seed and its line |
+| `mem-init` | first statement of `arch::memory::init` (x86) | `arch::init()` — GDT/IDT/PIC-silence/APIC/percpu/SYSCALL-MSRs — plus the boot-info extraction and, on a non-`witness` build, SPLASH-1 |
+| `heap` | *(unchanged)* | `memory::init` ALONE: region scan, diagnostics, identity-map probe, `init_heap_raw` |
+
+The two retype stamps sit INSIDE the one-shot latch, so they record exactly once and they
+**move with the retype**. That is deliberate: it makes the ledger state which of the two
+possible orderings a build has, on its own wire, without anyone reading the source
+(§11d).
+
+**Conservation check, and it is the strongest falsifier here.** The five deltas partition
+the interval exactly, so `fb-wc + fb-wc-done + core-init + mem-init + heap` must reproduce
+the old single number — 253 ms on a witness build, 296 ms on a default one — and the
+43 ms gap between the two builds must land in `mem-init`, because SPLASH-1 is the only
+thing in the whole span that a `witness` build skips. A sum that misses, or a split that
+puts the 43 ms anywhere else, convicts the stamp placement before anything else is read.
+
+QEMU (`UNAOS_WITNESS=1 UNAOS_LOGTS=1 ./arroyo test`, 1280x800 panel):
+`entry d=0` → `fb-wc d=3` → `fb-wc-done d=7` → `core-init d=0` → `mem-init d=6` →
+`heap d=1`. The 7 ms on `fb-wc-done` is TCG's per-`invlpg` emulation cost over a 4 MB span,
+not a metal figure; on metal the same sweep is ~7200 `invlpg` at a couple of cycles each.
+
+### 11d. What the split is expected to say, and the trim it aims
+
+`fill_rows`'s x86 path writes the visible width of every row as individual `u32` stores —
+2880 × 1800 = 5 184 000 of them, 20.7 MB, on the bench panel. It runs INSIDE `fbcon::init`,
+which calls `set_framebuffer_wc` **at its end**. So the largest framebuffer write of the
+entire boot is the one write that happens before the Write-Combining retype, at the
+uncacheable rate the retype exists to escape. At §10d's measured rates that clear is
+~129 ms at UC against ~14 ms at WC — a lower bound at UC, since §10d's figure is a bulk
+blit and these are 5.18 M separate dword stores.
+
+Two independent readings agree with that shape before any new boot is taken: the
+`heap d=` block is 253 ms and nothing else in it is large enough to matter; and SPLASH-1,
+which does a comparable full-surface fill plus its traced rays but runs AFTER the retype,
+costs the 43 ms that separates a default boot from a witness one.
+
+**Prediction — metal, next boot, pre-patch:** `fb-wc d=` carries **130–250 ms** of the
+253 ms and every other new stamp reads **0–3 ms** (with `mem-init d=` additionally
+carrying ~43 ms on a default build). If `fb-wc d=` comes back under 50 ms, the clear is
+not the block — and because the five deltas partition the interval, whichever bucket
+carries the 253 ms names the real culprit instead. That is the whole point of stamping it
+rather than arguing about it.
+
+**The trim it aims is one hoist, and it is NOT in this arc's lane.**
+`memory::set_framebuffer_wc` moves above `video::fbcon::init` in `kernel_main`, so the
+clear pays the WC rate. It needs only the base/length pair BootInfo already carries there,
+it already runs at that exact point in boot (three lines lower, inside a call), it is
+self-latching so the existing call becomes an idempotent second one, and IRQs are still
+masked. Prepared as `~/unaos-bench/scratch/gr20-fbwc-hoist-main.patch` and NOT applied:
+`main.rs` belongs to the seat this round.
+
+Under that patch the retype's two stamps move with it, so the ledger reads
+`fb-wc d=~0` and the clear's cost reappears in `core-init d=` at the WC rate — the block
+moving between two named buckets AND shrinking by the §10d ratio, which is a far harder
+thing to fake than a total that got smaller. Watched side effect: the
+`:: x86 fb-wc: retyped N leaf(s) ... ::` line is emitted before fbcon is ready, so it
+reaches serial/FTDI but is no longer painted on the panel. It was never durable on glass —
+under the old ordering the clear preceded it, under the new one the clear follows it.
+
+Read this capture with `awk '/pattern/'` — **not** `grep`.

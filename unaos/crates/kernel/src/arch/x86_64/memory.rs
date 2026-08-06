@@ -41,6 +41,11 @@ pub fn region_is_usable(addr: u64, len: u64) -> bool {
 }
 
 pub fn init(boot_info: &'static mut BootInfo) {
+    // BPACE HPACE-1: the last sub-stamp before `heap`. `mem-init d=` is everything between the start
+    // of `arch::init()` and here — GDT/IDT/PIC-silence/APIC/percpu/SYSCALL-MSRs, the boot-info
+    // extraction, and (on a non-witness build) the SPLASH-1 paint. `heap d=` is then this function
+    // ALONE: the region scan, the diagnostics, the identity-map probe and `init_heap_raw`.
+    crate::bootpace::record("mem-init");
     serial_println!(":: X86_64 Memory Init ::");
 
     let regions: &'static [MemoryRegion] = unsafe {
@@ -967,6 +972,9 @@ pub fn set_framebuffer_wc(fb_base: u64, fb_len: u64) {
     if FB_WC_DONE.swap(true, Ordering::AcqRel) {
         return;
     }
+    // BPACE HPACE-1: the `heap` block's first sub-stamp. It sits AFTER the one-shot latch so it
+    // records exactly once, on the pass that actually retypes. See bootpace.md §11.
+    crate::bootpace::record("fb-wc");
     let fb_end = fb_base.saturating_add(fb_len);
     let mut leaves = 0u32;
     // Retype the fb leaves. Firmware page-table pages are read-only under CR0.WP=1, so drop WP for
@@ -1021,6 +1029,10 @@ pub fn set_framebuffer_wc(fb_base: u64, fb_len: u64) {
         fb_base,
         fb_end
     );
+    // BPACE HPACE-1: `fb-wc-done d=` is the retype itself — the leaf walk, the 4 KiB `invlpg` sweep
+    // over the whole span, and this one line. Everything the retype is BLAMED for costs exactly this
+    // much, and the number is now on the wire instead of being assumed small.
+    crate::bootpace::record("fb-wc-done");
 }
 
 /// Map a physical MMIO window into the identity map with Uncacheable (UC) attributes, creating

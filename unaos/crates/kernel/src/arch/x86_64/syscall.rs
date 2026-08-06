@@ -6439,6 +6439,26 @@ const U3_5_COTASK_STEPS: u32 = 8;
 /// NOT wedge the core (the co-task got CPU time via preemption).
 static U3_5_COTASK_PROGRESS: AtomicU32 = AtomicU32::new(0);
 
+/// U3.5 property (c): ring-3 timer IRQs the observation window must SEE before it accepts the
+/// counter reading — `3 * QUANTUM_TICKS`, i.e. at least three full quantum expiries.
+///
+/// This replaces a flat `ticks() + 100` sleep that was the single largest term in the witness build's
+/// `BPACE: sched d=155ms` (bootpace.md §11). The old window was a duration; the property is an EVENT
+/// COUNT, and stating it as one both costs less and proves more — "the counter climbed across at
+/// least three preemptions" instead of "the counter climbed over an interval in which some unknown
+/// number of preemptions happened". `IRQS_AT_RING3` ticks once per 1 kHz timer IRQ taken while the
+/// spinner is at CPL 3, so twelve of them is ~12 ms on a calibrated bench and the reading is 12x the
+/// clock's own granularity.
+///
+/// Floor, and why not lower: one quantum expiry proves a single resume, which a task that wedges
+/// immediately AFTER its first resume would also pass; three is the smallest count that requires the
+/// resume path to work repeatedly. The 100 ms deadline below is retained UNCHANGED as the bound, so a
+/// TCG/QEMU run that under-delivers ring-3 IRQs behaves exactly as it did before this trim.
+const U3_5_OBS_IRQS: u64 = 3 * crate::arch::sched::QUANTUM_TICKS as u64;
+/// Upper bound on the property-(c) observation window, in ms. Unchanged from the pre-trim constant —
+/// it was the whole window and is now only the deadline.
+const U3_5_OBS_BOUND_MS: u64 = 100;
+
 /// U3.5 kernel co-task pinned to the SPINNER'S core: take `U3_5_COTASK_STEPS` steps, sleeping between
 /// them so it time-shares the core with the preemptible spinner, then exit. Under cooperative ring 3
 /// this task would NEVER run (the spinner would hog the core forever); its completion is the proof the
@@ -6487,6 +6507,14 @@ pub fn u3_5_run_fixture(cpu: usize) {
     let irqs_before = crate::arch::interrupts::IRQS_AT_RING3.load(Ordering::Acquire);
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
 
+    // UPACE: this fixture is the WHOLE of the witness build's `BPACE: sched d=` residue (155–156 ms on
+    // every witness boot of `rmbp-gr16-s73/ttyUSB0.log`, and the ONLY line in the step-4d block whose
+    // two adjacent timestamps differ). §8e attributed that residue to "the ring-3 fixture ladder";
+    // the capture says otherwise — LOGWIT-1, SNTP-X86-GATE, DNS-X86-GATE, U1a, U1b, U2-0a and U3 all
+    // land on the SAME millisecond, and every one of the 155 ms sits between this line and the verdict
+    // below. So the fixture carries its own four-phase breakdown, at the resolution of the 1 kHz clock
+    // it already waits on. Cheap by construction: four `ticks()` reads and one line.
+    let t_enter = crate::arch::ticks();
     // Co-task first (queued at the spinner's priority), then the preemptible spinner — both on `cpu`.
     serial_println!(":: U3.5: preemptible-ring-3 demo — spinner + co-task on core {} ::", cpu);
     crate::arch::sched::spawn("u3.5-cotask", u3_5_cotask, 0, cpu, crate::arch::sched::PRIO_NORMAL);
@@ -6505,18 +6533,34 @@ pub fn u3_5_run_fixture(cpu: usize) {
         }
         core::hint::spin_loop();
     }
+    let t_armed = crate::arch::ticks();
 
-    // (c): the spinner is still running (not yet reaped). Sample its counter across a short bounded
-    // window and confirm it CLIMBED — forward progress over (necessarily several quanta of) preemptions
-    // proves each eviction was correctly resumed. The window spans many quanta at 1 kHz; the counter
-    // increments at CPU speed, so any live spinner grows it by a huge margin.
+    // (c): the spinner is still running (not yet reaped). Sample its counter across a bounded window
+    // and confirm it CLIMBED — forward progress over preemptions proves each eviction was correctly
+    // resumed.
+    //
+    // The window used to be a flat `ticks() + 100`: a fixed 100 ms sleep on the BSP, and (bootpace.md
+    // §11) the largest single term in `sched d=`. What property (c) actually needs is not a duration
+    // but a number of PREEMPTIONS to have happened between the two samples, so the window now WAITS
+    // FOR THAT EVENT — `U3_5_OBS_IRQS` further ring-3 timer IRQs — and keeps the 100 ms only as the
+    // deadline. It is strictly stronger: the pre-trim form could be satisfied by a window in which the
+    // spinner was never once evicted (the counter would climb anyway, and nothing checked), while this
+    // one cannot exit early unless the ring-3 IRQ counter moved by three quanta's worth. `obs_irqs` is
+    // printed so a short window is a readable number and not an inference.
     let progress_1 = read_counter();
-    let obs_deadline = crate::arch::ticks() + 100;
-    while crate::arch::ticks() < obs_deadline {
+    let irqs_obs_base = crate::arch::interrupts::IRQS_AT_RING3.load(Ordering::Acquire);
+    let obs_deadline = crate::arch::ticks() + U3_5_OBS_BOUND_MS;
+    let mut obs_irqs;
+    loop {
+        obs_irqs = crate::arch::interrupts::IRQS_AT_RING3.load(Ordering::Acquire) - irqs_obs_base;
+        if obs_irqs >= U3_5_OBS_IRQS || crate::arch::ticks() >= obs_deadline {
+            break;
+        }
         core::hint::spin_loop();
     }
     let progress_2 = read_counter();
     let resumed = progress_1 > 0 && progress_2 > progress_1;
+    let t_observed = crate::arch::ticks();
 
     // Reap the spinner via the scheduler (it never exits) and confirm it terminated within the bound.
     kill.request();
@@ -6525,6 +6569,7 @@ pub fn u3_5_run_fixture(cpu: usize) {
         core::hint::spin_loop();
     }
     let reaped = kill.is_reaped();
+    let t_reaped = crate::arch::ticks();
 
     let irqs = crate::arch::interrupts::IRQS_AT_RING3.load(Ordering::Acquire) - irqs_before;
     let cot = U3_5_COTASK_PROGRESS.load(Ordering::Acquire);
@@ -6539,6 +6584,25 @@ pub fn u3_5_run_fixture(cpu: usize) {
             irqs, cot, U3_5_COTASK_STEPS, progress_1, progress_2, reaped
         );
     }
+
+    // UPACE line. `armed` is (a)+(b) — the co-task's `U3_5_COTASK_STEPS` sleeps, each of which must
+    // outwait the spinner's remaining quantum, so its floor is roughly `STEPS * QUANTUM_TICKS` ms and
+    // it is REAL WORK proving the DoS fix, not a wait to be trimmed. `observe` is property (c) and is
+    // the term the event-driven window shortened. `obs_irqs < U3_5_OBS_IRQS` alongside
+    // `observe=100ms` is the tripwire: the window hit its deadline instead of its event, which on
+    // metal means ring-3 IRQs stopped arriving and the PASS above rests on a weaker reading than it
+    // claims. On TCG that combination is expected and benign (`IRQS_AT_RING3` under-delivers, which is
+    // why the gate is `> 0` and not an exact count).
+    serial_println!(
+        ":: U3.5 pace: armed={}ms observe={}ms reap={}ms total={}ms (obs_irqs={}/{} steps={}) ::",
+        t_armed.saturating_sub(t_enter),
+        t_observed.saturating_sub(t_armed),
+        t_reaped.saturating_sub(t_observed),
+        t_reaped.saturating_sub(t_enter),
+        obs_irqs,
+        U3_5_OBS_IRQS,
+        U3_5_COTASK_STEPS,
+    );
 
     // Slot lifecycle: on the PASS path the scheduler's reap already restored the kernel CR3 + freed
     // the slot. On a reap TIMEOUT (`!reaped`), the spinner never self-exits (it never syscalls), so it

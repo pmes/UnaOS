@@ -91,7 +91,11 @@ const TASK_STACK_SIZE: usize = 16 * 1024;
 
 /// Preemption quantum, in local-APIC timer ticks. After this many ticks a running task is
 /// preempted and rotated to the back of its run queue. Small so round-robin sharing is visible.
-const QUANTUM_TICKS: u32 = 4;
+///
+/// `pub` so a fixture that must observe N PREEMPTIONS sizes its window from the scheduler's own
+/// quantum rather than restating it (U3.5's property-(c) window, `syscall::U3_5_OBS_IRQS`). A second
+/// copy of this number is exactly the kind of constant that survives a change to this one.
+pub const QUANTUM_TICKS: u32 = 4;
 
 /// Priority aging (anti-starvation). A ready task that has WAITED in the run queue this many local
 /// ticks without being dispatched is promoted one effective level toward the top (its base priority
