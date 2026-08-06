@@ -217,7 +217,11 @@
 //! | pass | coverage | when | on the wire |
 //! |------|----------|------|-------------|
 //! | 1 | LATTICE — every [`PAYGO_LATTICE_N`]th source pixel per row, phase rotating one column per row | immediately, as before | `coverage=lattice16` |
-//! | 2..[`SAMPLES`] | FULL — every source pixel | once uptime passes [`PAYGO_DEFER_US`] | `coverage=full` |
+//! | 2..[`SAMPLES`] | FULL — every source pixel | once [`since_entry_ms`] passes [`PAYGO_DEFER_MS`] | `coverage=full` |
+//!
+//! The lattice COLLAPSES to full coverage on a rect narrower than its own step — see [`readback`] —
+//! and the marker is derived from the step the walk actually used, so a narrow window says
+//! `coverage=full` rather than claiming a sampling it did not perform.
 //!
 //! ### What a sampled pass catches, and what it cannot
 //!
@@ -247,12 +251,14 @@
 //!   passes too so the marker's absence is never the thing carrying the meaning. No `fbbad=0/…` in
 //!   this module ever reads as a clearance it did not earn.
 //! - A deferred pass is a pass DECLINED, not a counter capped. [`PAYGO_DEFERRED`] counts every
-//!   declined blit, unbudgeted, and the first decline on a window prints
-//!   `[wc-g] paygo … state=waiting … -> DEFERRED` — so a configuration in which the deferred half can
-//!   never run says so at the moment it starts waiting, rather than by an absence a reader would have
-//!   to notice. The same census is re-read as `deferred=` on the `state=complete` line beside the
-//!   rollup, and the rollup itself carries `paygo=yes` so the verdict names the policy it was drawn
-//!   under.
+//!   declined blit, unbudgeted, and the window's `[wc-g] paygo … state=waiting … -> DEFERRED` line is
+//!   RE-EMITTED on [`CENSUS_PERIOD_US`] cadence with an `emit=` ordinal — so `deferred=` is a running
+//!   census with its moment stamped (`since_entry_ms=`), not a figure frozen at the instant the
+//!   deferral began. A one-shot there would have been [`H_TORN`]'s convicted shape exactly: printed
+//!   once, at first decline, where the count is 1 by construction. The reader's rule is the module's
+//!   standing one — greatest `emit=` per `win=` wins, and these lines are never summed. The terminal
+//!   `state=complete … -> PAID` carries the same census, and the rollup carries `paygo=yes` so the
+//!   verdict names the policy it was drawn under.
 //! - The budget is not spent by a decline, so a window that stops presenting keeps its remaining
 //!   samples unspent. That is not a new behaviour to reason about: it is exactly what this module
 //!   already does with a window that stops compositing.
@@ -260,6 +266,28 @@
 //! Every FORBID stays armed for the whole boot either way. The checksum legs — `app`, `blit`,
 //! `civac`, `after` — are cacheable RAM reads, cheap next to the glass, and run in full on EVERY
 //! sampled pass unchanged. Only the read-back is what sampling and deferral reshape.
+//!
+//! ### What deferral costs somewhere else, stated because it is visible
+//!
+//! A spent probe declines the cursor sprite's overlay for that composite pass — `video::wm` sets
+//! `may_overlay = false` whenever `wcg::begin` hands out a `Probe`, because this witness reads its
+//! destination pixels back and a cursor composited into them would read as a blit defect. Knob off,
+//! all four of those passes happen during the boot burst, before anyone is pointing at anything.
+//! Knob on, three of the four move onto the LIVE DESKTOP, so three composite passes that would have
+//! carried the sprite no longer do. That is a visible-artifact class — a brief cursor drop — and it is
+//! named here rather than discovered on the bench. It is not a correctness loss: CURSOR-4 already
+//! rules the exclusion conservative and coverage-safe, the passes are budgeted and few, and the tail
+//! repaints. It is a cost that MOVED with the samples, not one this arc introduced.
+//!
+//! ### Who actually reads these lines
+//!
+//! Worth stating, because the key-order discipline above reads as though several gates depended on
+//! it: **no x86 spec reads any `[wc-g]` line.** `unaos/scripts/specs/pi4-regression.spec` is the only
+//! automated reader this module has, on either arch — two REQUIREs and three FORBIDs. Every
+//! insertion rule here therefore protects the PI4 track, which is precisely why an x86-only feature
+//! is held to it: the file is shared, the aarch64 wire must not move, and the one gate that would
+//! notice is on the other platform's bench. A field added here is checked against that spec because
+//! nothing on this side would catch the break.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -752,6 +780,10 @@ pub fn stage_flush(id: u32) {
     }
     // WC-H2 — and then, for the rest of the boot, keep the censuses on those lines readable.
     census_refresh(id, i);
+    // WC-G/M3 — and PAYGO's own census, on the same cadence and from the same site. This is also the
+    // only place a deferral may PRINT: `paygo_open` runs inside `begin`, between WC-D's frozen
+    // reference and the copy it describes, so it records and this emits. See [`PAYGO_PEND`].
+    paygo_flush(id, i);
 }
 
 /// WC-H2 — note that this window has been seen, once, so `age_ms=` has an origin.
@@ -1439,10 +1471,13 @@ pub struct Probe {
 /// and any x86 build without the `wcg-paygo` knob — which makes the lattice arithmetic fold away to
 /// the original `for col in 0..cols` loop. See [`paygo_open`] for what a `step > 1` pass is and, on
 /// the module note, for what it can and cannot catch.
+#[allow(clippy::too_many_arguments)]
 fn readback(
     fb: &FrameBuffer,
     surf: usize,
     surf_len: usize,
+    pw: usize,
+    ph: usize,
     x: usize,
     y: usize,
     w: usize,
@@ -1450,16 +1485,28 @@ fn readback(
     stride: usize,
     scale: usize,
     step: usize,
-) -> (usize, usize) {
-    let info = fb.info();
-    let (pw, ph) = (info.width, info.height);
+) -> (usize, usize, usize) {
     let mut checked = 0usize;
     let mut bad = 0usize;
     if x >= pw || y >= ph || scale == 0 || stride < 4 || step == 0 {
-        return (bad, checked);
+        return (bad, checked, step);
     }
     let cols = (pw - x).div_ceil(scale).min(w).min(stride / 4);
     let rows = (ph - y).div_ceil(scale).min(h).min(surf_len / stride);
+    // PAYGO — the lattice COLLAPSES on a rect narrower than its own step, and it has to.
+    //
+    // The claim the sampled pass rests on is "every row is probed", which is what makes a full-row
+    // band un-missable. That claim is false when `cols < step`: the per-row phase runs `row % step`,
+    // so every row whose phase lands at or past `cols` probes ZERO pixels, and a narrow window would
+    // be sampled on one row in `step` while its line still said `coverage=lattice16`. Not
+    // hypothetical — a 4x-upscaled 8-px-wide content rect gives `cols == 8`, and the reviewed boot
+    // has `win=3` running `fbbad=0/64` at `scale=8x`.
+    //
+    // Below the step there is no coverage to buy, so the honest answer is to take the pass at FULL
+    // coverage and say so. The effective step is RETURNED, not just used, so the `coverage=` marker
+    // is derived from what the walk actually did rather than from what was asked for — the same rule
+    // that put the step in a static rather than recomputing it in `end`.
+    let step = if cols < step { 1 } else { step };
     for row in 0..rows {
         let row_base = row * stride;
         let dy = y + row * scale;
@@ -1493,7 +1540,7 @@ fn readback(
             col += step;
         }
     }
-    (bad, checked)
+    (bad, checked, step)
 }
 
 /// WC-G/M3 (x86 only) — a one-word window over the WC-mapped glass, so a destination row's probes
@@ -1628,12 +1675,12 @@ const _: () = assert!(
     "the `coverage=lattice16` literal must track PAYGO_LATTICE_N"
 );
 
-/// PAYGO — uptime past which a window's DEFERRED, full-coverage samples may open.
+/// PAYGO — time SINCE KERNEL ENTRY past which a window's DEFERRED, full-coverage samples may open.
 ///
 /// The threshold is a wall-clock reading and not a phase marker, deliberately: nothing observable
 /// inside this module can tell "the boot burst is over" from "the next app has not launched yet",
-/// which is [`W_SAMPLES`]'s standing law applied to a new question. An uptime is at least a fact
-/// about the boot rather than an inference about it, and its failure mode is benign in the one
+/// which is [`W_SAMPLES`]'s standing law applied to a new question. An elapsed time is at least a
+/// fact about the boot rather than an inference about it, and its failure mode is benign in the one
 /// direction that matters — a threshold set too late costs coverage that the wire then reports as
 /// unspent budget, where a phase predicate that fired early would silently put the cost back on the
 /// boot it was meant to leave.
@@ -1643,7 +1690,48 @@ const _: () = assert!(
 /// full coverage; a window that has stopped keeps them unspent, which is exactly what this module
 /// already does with a window that stops presenting.
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
-const PAYGO_DEFER_US: u64 = 15_000_000;
+const PAYGO_DEFER_MS: u64 = 15_000;
+
+/// PAYGO — milliseconds since KERNEL ENTRY, or `None` while that question has no answer yet.
+///
+/// ### Why this is not `cycles_to_us(now_cycles())`, which is what it used to be
+///
+/// Two independent defects lived in that one expression, and the second only bites on metal.
+///
+/// **It measured from RESET, not from entry.** On x86 `now_cycles()` is `rdtsc`, which counts from
+/// processor reset — so the raw value includes firmware. On the 2012 rMBP bench, Apple EFI POST can
+/// plausibly eat most or all of fifteen seconds before the kernel is even entered, which means the
+/// gate could be open at the first composite and the deferral would silently never engage. The wire
+/// would still have said `-> PAID` with `deferred=0`, which is the worst available outcome: a
+/// feature reporting success for work it never did. This is not a new hazard and it has a settled
+/// answer in this tree — [`crate::clock::logts_now`] subtracts [`crate::bootpace::origin_cycles`]
+/// for exactly this reason, and so does every BPACE/GPACE `t=`. This does the same.
+///
+/// **It scaled before it divided.** `cycles_to_us` multiplies by 1e6 first, which is correct for the
+/// small DELTAS it was written for and overflows a `u64` at roughly 1.9 h of an absolute counter —
+/// after which the reading wraps and the gate's answer becomes noise. Scaling to milliseconds
+/// instead of microseconds moves that horizon out to ~76 days, and `saturating_mul` makes even that
+/// degrade toward a large reading (gate open) rather than wrap to a small one (gate stuck shut).
+///
+/// ### Why an unknown rate DEFERS rather than guesses
+///
+/// [`crate::bootpace::origin_hz`] is 0 until `apic::calibrate` has run. The old code reached
+/// `cycles_to_us`, whose uncalibrated fallback is 1.25 GHz against a real ~2.693 GHz part — a rate
+/// low by a factor of ~2.15, so a 15 s threshold would have opened at ~7 s of real time and put the
+/// cost back on the boot this arc exists to take it off. Returning `None` and DEFERRING is the
+/// conservative direction: an unknown clock delays coverage, which the wire reports as unspent
+/// budget, where a guessed clock silently spends it early. The same reasoning `origin_hz`'s own note
+/// gives — 0 means print raw ticks, never fabricate a millisecond.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+fn since_entry_ms() -> Option<u64> {
+    let origin = crate::bootpace::origin_cycles();
+    let hz = crate::bootpace::origin_hz();
+    if origin == 0 || hz == 0 {
+        // No `entry` stamp, or no calibrated rate: "since entry" does not exist to measure yet.
+        return None;
+    }
+    Some(now_cycles().wrapping_sub(origin).saturating_mul(1000) / hz)
+}
 
 /// PAYGO — per-id: the probe step granted to the sample currently open, so [`end`] walks the glass
 /// on the same terms [`begin`] admitted the sample on and the `coverage=` marker is read from the
@@ -1659,16 +1747,75 @@ static PAYGO_STEP: [AtomicU32; IDS] = [const { AtomicU32::new(1) }; IDS];
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
 static PAYGO_DEFERRED: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 
-/// PAYGO — per-id: one-shot latch for the `state=waiting` line. The gate is reached at frame rate,
-/// and a line per declined blit would spend more serial time than the sampling saves.
+/// PAYGO — per-id: whether this window has ever been declined, i.e. whether it is in the deferring
+/// regime at all. NOT a print latch any more, and the difference is [`paygo_refresh`]'s whole reason
+/// for existing — see [`PAYGO_EMIT`].
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
 static PAYGO_SAID: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// PAYGO — per-id: a `state=waiting` line owed but not yet printed.
+///
+/// **The print does not happen where the decline happens, and that is a correctness fix rather than
+/// a tidiness one.** [`paygo_open`] runs inside [`begin`], which `video::wm`'s composite pass calls
+/// BETWEEN `verify_reference`'s snapshot of the content rect and `draw_window`'s copy of it. With the
+/// console routed into a window, a `serial_println!` from there lands in that window's OWN surface —
+/// so the bytes `draw_window` then copies are not the bytes WC-D froze, and WC-D reads its own
+/// witness's output as corruption. The panel-side half is muted by `fbcon`'s `PANEL_MUTE_TAGS`, but
+/// a `bootlog` build compiles that mute out, and `arroyo`'s `x86-all` leg compiles `witness`,
+/// `wcg-paygo`, `wc` and `bootlog` together — so the configuration is reachable, not hypothetical.
+/// Nor do the two instruments' one-shots protect each other: `verify_reference` returns `None` for a
+/// row that is not `presented` or whose band is empty, and [`begin`] has no `presented` test at all,
+/// so the passes they claim can and do desynchronize.
+///
+/// So the decline is RECORDED here and printed from [`stage_flush`] — the site this module already
+/// established for exactly this hazard, after `wcg::end` has stopped the clock and after the copy
+/// that WC-D's frozen reference describes. One pending slot per id, like [`H_PEND`], and lost
+/// overlaps cost a trace line and never a census: [`PAYGO_DEFERRED`] is incremented at the decline.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static PAYGO_PEND: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// PAYGO — per-id: `[wc-g] paygo` lines emitted for this window so far. Printed as `emit=`, one-based.
+///
+/// **The line it ordinals used to be a one-shot, and a one-shot here was WC-H2's convicted shape
+/// wearing new clothes.** The first cut printed `deferred=` exactly once, at the first decline —
+/// where it is 1 BY CONSTRUCTION, so the field restated its own trigger and carried no information
+/// at all. The census went on climbing behind it, and the only other reading was at completion. A
+/// window that never completes its budget — which under deferral is every window the operator does
+/// not keep compositing for fifteen seconds — therefore reported a thousand declines as `deferred=1`
+/// and never printed a rollup either. That is precisely the defect [`H_MINSPAN`] and [`H_TORN`] were
+/// convicted of: a line that fires when something LATCHES can only ever describe the moment it
+/// latched.
+///
+/// The fix is the one this module already built rather than a second mechanism: the waiting line is
+/// re-emitted on [`CENSUS_PERIOD_US`] cadence from [`stage_flush`], gated on the census having
+/// actually moved, so `deferred=` is a RUNNING census with the moment it was taken stamped on it
+/// (`since_entry_ms=`) and its ordinal among this window's paygo lines (`emit=`). The reader's rule
+/// is the module's standing one: for any `win=`, the greatest `emit=` supersedes every earlier line,
+/// and these lines are never summed — they are snapshots of a monotone total, not deltas.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static PAYGO_EMIT: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// PAYGO — per-id: `now_cycles()` as of the END of the most recent paygo emission. The refresh's rate
+/// gate and its mutual exclusion both, exactly as [`H_LASTROLL`] serves the rollup: two cores
+/// flushing the same window at once both observe this value, and only the one whose
+/// `compare_exchange` succeeds prints.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static PAYGO_LASTROLL: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+
+/// PAYGO — per-id: [`PAYGO_DEFERRED`] as of the most recent emission. The delta gate: a window whose
+/// declines have not moved has nothing new to say, and reprinting an unchanged line would spend
+/// serial time to restate the previous one. A window that stops compositing therefore goes quiet with
+/// its last line describing its last active state — the same steady-state behaviour
+/// [`census_refresh`] has.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static PAYGO_LASTCENSUS: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 
 /// PAYGO — may this window open a sample now, and on what terms?
 ///
 /// Sample 1 always opens, immediately, and opens LATTICE-SAMPLED. Samples 2..[`SAMPLES`] open at
-/// FULL coverage but only once [`PAYGO_DEFER_US`] of uptime has passed, so the battery completes on
-/// a live desktop instead of inside the boot burst.
+/// FULL coverage but only once [`PAYGO_DEFER_MS`] of time SINCE KERNEL ENTRY has passed — entry, not
+/// reset, and not a guessed clock rate; see [`since_entry_ms`] for what each of those got wrong — so
+/// the battery completes on a live desktop instead of inside the boot burst.
 ///
 /// **The gate sits above the budget test and that placement is the whole design.** A declined blit
 /// is one this pass does not SAMPLE — it does not spend budget, it does not print a `[wc-g]` line,
@@ -1677,21 +1824,24 @@ static PAYGO_SAID: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// module already does with a window that stops compositing ([`census_refresh`]'s corollary), so
 /// there is nothing here that can wedge: no wait, no retry, no queue, no core to make progress.
 ///
-/// **And the decline is never silent.** The first one on a window emits `[wc-g] paygo … state=waiting
-/// … -> DEFERRED` carrying the count, the threshold and the uptime, so a configuration in which the
-/// deferred samples can never run says so on the wire at the moment it starts waiting rather than by
-/// the absence of lines that a reader would have to notice were missing. The counter keeps running
-/// behind the one-shot line and is reported again as `deferred=` when the battery completes.
+/// **And the decline is never silent — nor printed from here.** The census moves at the decline and
+/// the LINE is recorded for [`stage_flush`] to emit: this function runs inside [`begin`], between
+/// WC-D's frozen reference and the copy that reference describes, and a `serial_println!` from there
+/// lands in the console window's own surface. See [`PAYGO_PEND`] for the full argument and
+/// [`PAYGO_EMIT`] for why that line is then re-emitted on a cadence rather than printed once.
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
-fn paygo_open(id: u32, i: usize) -> bool {
+fn paygo_open(_id: u32, i: usize) -> bool {
     if TAKEN[i].load(Ordering::Relaxed) == 0 {
         PAYGO_STEP[i].store(PAYGO_LATTICE_N as u32, Ordering::Relaxed);
         return true;
     }
     if !paygo_arm(i) {
-        let n = PAYGO_DEFERRED[i].fetch_add(1, Ordering::Relaxed) + 1;
+        // Census first, unbudgeted, before any print test — WC-H2's rule. Then RECORD the line and
+        // let `stage_flush` print it: nothing in this function may write to the UART, because it runs
+        // between WC-D's frozen reference and the copy that reference describes. See [`PAYGO_PEND`].
+        PAYGO_DEFERRED[i].fetch_add(1, Ordering::Relaxed);
         if PAYGO_SAID[i].swap(1, Ordering::Relaxed) == 0 {
-            paygo_note(id, i, "waiting", "DEFERRED", n, cycles_to_us(now_cycles()));
+            PAYGO_PEND[i].store(1, Ordering::Release);
         }
         return false;
     }
@@ -1723,7 +1873,15 @@ fn paygo_open(id: u32, i: usize) -> bool {
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
 #[inline]
 fn paygo_arm(i: usize) -> bool {
-    TAKEN[i].load(Ordering::Relaxed) == 0 || cycles_to_us(now_cycles()) >= PAYGO_DEFER_US
+    if TAKEN[i].load(Ordering::Relaxed) == 0 {
+        return true;
+    }
+    // `None` — no entry stamp yet, or no calibrated rate — DEFERS. See [`since_entry_ms`] for why
+    // that is the conservative direction and what guessing instead would have cost.
+    match since_entry_ms() {
+        Some(ms) => ms >= PAYGO_DEFER_MS,
+        None => false,
+    }
 }
 
 #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
@@ -1799,20 +1957,78 @@ const PAYGO_ROLLUP_NOTE: &str = "";
 /// per window at most — once when the deferral starts (`state=waiting`), once when the battery
 /// completes (`state=complete`) — so it is bounded without needing a budget of its own.
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
-fn paygo_note(id: u32, i: usize, state: &str, verdict: &str, deferred: u32, up_us: u64) {
+fn paygo_note(id: u32, i: usize, state: &str, verdict: &str) {
+    let deferred = PAYGO_DEFERRED[i].load(Ordering::Relaxed);
+    let emit = PAYGO_EMIT[i].fetch_add(1, Ordering::Relaxed) + 1;
+    // `clock=` disambiguates a real zero from an absent one. `since_entry_ms=0 clock=unarmed` says
+    // the entry stamp or the TSC calibration was not there to measure against — which is the state
+    // the gate DEFERS in — where `since_entry_ms=0 clock=entry` would be a genuine reading taken at
+    // entry. A fabricated zero that could mean either is the kind of field this module keeps
+    // convicting.
+    let (since_ms, clock) = match since_entry_ms() {
+        Some(ms) => (ms, "entry"),
+        None => (0, "unarmed"),
+    };
     serial_println!(
-        "[wc-g] paygo win={} state={} lattice_n={} deferred={} defer_ms={} uptime_ms={} taken={} budget={} -> {}",
+        "[wc-g] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} since_entry_ms={} clock={} taken={} budget={} -> {}",
         id,
         state,
+        emit,
         PAYGO_LATTICE_N,
         deferred,
-        PAYGO_DEFER_US / 1000,
-        up_us / 1000,
+        PAYGO_DEFER_MS,
+        since_ms,
+        clock,
         TAKEN[i].load(Ordering::Relaxed).min(SAMPLES),
         SAMPLES,
         verdict
     );
+    // Re-arm the refresh from AFTER the serial write, so `CENSUS_PERIOD_US` bounds the duty cycle
+    // this instrument imposes on the composite path and not merely the gap between line starts —
+    // the same accounting `stage_rollup` uses. Both stores happen on EVERY emission, including the
+    // first and the terminal one, so the cadence is measured from the window's own last line.
+    PAYGO_LASTCENSUS[i].store(PAYGO_DEFERRED[i].load(Ordering::Relaxed), Ordering::Relaxed);
+    PAYGO_LASTROLL[i].store(now_cycles(), Ordering::Relaxed);
 }
+
+/// PAYGO — print the owed `state=waiting` line, or keep a still-deferring window's census current.
+///
+/// Called from [`stage_flush`], which `video::wm`'s composite pass calls once per window per pass —
+/// so this runs on exactly the population it reports on, needs no timer, no thread and no new call
+/// site, and a window that stops compositing stops refreshing. That last part is not a gap: its final
+/// line describes its last active state and `since_entry_ms=` says when that was.
+///
+/// The two gates below are [`census_refresh`]'s, for the same reasons: the DELTA gate keeps an idle
+/// window silent, and the RATE gate plus the `compare_exchange` keep the cost bounded and let exactly
+/// one core print when two flush the same window at once.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+fn paygo_flush(id: u32, i: usize) {
+    if PAYGO_PEND[i].swap(0, Ordering::AcqRel) != 0 {
+        paygo_note(id, i, "waiting", "DEFERRED");
+        return;
+    }
+    // Only while this window is actually deferring. Nothing before its first decline, and nothing
+    // after its battery completes — `state=complete` is that window's terminal paygo line.
+    if PAYGO_SAID[i].load(Ordering::Relaxed) == 0 || TAKEN[i].load(Ordering::Relaxed) >= SAMPLES {
+        return;
+    }
+    if PAYGO_DEFERRED[i].load(Ordering::Relaxed) == PAYGO_LASTCENSUS[i].load(Ordering::Relaxed) {
+        return;
+    }
+    let last = PAYGO_LASTROLL[i].load(Ordering::Relaxed);
+    let now = now_cycles();
+    if cycles_to_us(now.saturating_sub(last)) < CENSUS_PERIOD_US {
+        return;
+    }
+    if PAYGO_LASTROLL[i].compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    paygo_note(id, i, "waiting", "DEFERRED");
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+#[inline]
+fn paygo_flush(_id: u32, _i: usize) {}
 
 /// PAYGO — the closing half of [`paygo_note`], emitted beside the rollup so the `deferred=` census
 /// is read at the moment the battery is claimed complete rather than only at the moment it began
@@ -1820,14 +2036,7 @@ fn paygo_note(id: u32, i: usize, state: &str, verdict: &str, deferred: u32, up_u
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
 #[inline]
 fn paygo_complete(id: u32, i: usize) {
-    paygo_note(
-        id,
-        i,
-        "complete",
-        "PAID",
-        PAYGO_DEFERRED[i].load(Ordering::Relaxed),
-        cycles_to_us(now_cycles()),
-    );
+    paygo_note(id, i, "complete", "PAID");
 }
 
 #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
@@ -1925,7 +2134,12 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
     // stride column bound, and the `surf_len` row bound. WC-G/M3 moved the walk itself into
     // [`readback`] so the two things that reshape it — the wide glass read and PAYGO's lattice —
     // live where they can be read together, and so this function's brackets stayed where they are.
-    let ph = fb.info().height;
+    // WC-G/M3 — the panel geometry is read HERE, above the bracket, and passed down. `readback` used
+    // to call `fb.info()` itself, which put that read inside the `readback_us` clock; the bracket law
+    // in this module is that a bracket contains the operation it names and nothing else, and `ph` is
+    // needed below for `rectscan_us` regardless.
+    let info = fb.info();
+    let (pw, ph) = (info.width, info.height);
     // WC-G/M3 — the terms this sample was admitted on. Read OUTSIDE the bracket below: it is one
     // relaxed load, but the bracket's job is to contain the walk and nothing else.
     let step = probe_step(p.id as usize);
@@ -1936,7 +2150,11 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
     // formatting and no serial. (M3 narrowed what a probe COSTS and, under PAYGO, how many of them a
     // pass takes; it did not move this bracket or change what it contains.)
     let tp2 = now_cycles();
-    let (bad, checked) = readback(fb, p.surf, p.surf_len, x, y, w, h, stride, scale, step);
+    // `step_eff` is what the walk ACTUALLY used — `readback` collapses the lattice on a rect narrower
+    // than its own step — and it is what the `coverage=` marker below is derived from, so the wire
+    // reports the pass that ran rather than the pass that was requested.
+    let (bad, checked, step_eff) =
+        readback(fb, p.surf, p.surf_len, pw, ph, x, y, w, h, stride, scale, step);
     let readback_us = cycles_to_us(now_cycles().saturating_sub(tp2));
 
     // Attribution, most specific first. A source that moved under the copy invalidates the
@@ -2000,7 +2218,7 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
         cks_after,
         bad,
         checked,
-        coverage_note(step),
+        coverage_note(step_eff),
         us,
         rectscan_us,
         if slow { "yes" } else { "no" },

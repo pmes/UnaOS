@@ -98,8 +98,9 @@ _feats=""
 # reshaped: the four checksum legs run in full on every sampled pass and every FORBID stays armed for
 # the whole boot. Needs UNAOS_WITNESS to reach anything — `video/wcg.rs` is `witness`-gated — and
 # means nothing on aarch64. DEFAULT OFF => every `[wc-g]` line is byte-identical to the pre-M3 wire.
-# NOT yet plumbed through `builder/src/main.rs`, which re-derives the x86 feature list from env for
-# the media/battery commands, so today this knob reaches `check` and not `test`/`esp-x86`.
+# Kept in sync with builder/src/main.rs, which re-derives the x86 feature list from env and maps this
+# same variable (`UNAOS_WCG_PAYGO` -> `wcg-paygo`) — so the knob reaches the ESP a metal boot runs and
+# not only `check`. A knob wired into arroyo alone never reaches the boot media.
 [ -n "${UNAOS_WCG_PAYGO:-}" ] && _feats="${_feats}wcg-paygo,"
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
 [ -n "${UNAOS_BOOTLOG:-}" ] && _feats="${_feats}bootlog,"
