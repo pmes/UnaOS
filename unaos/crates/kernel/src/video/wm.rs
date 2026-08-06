@@ -1161,12 +1161,6 @@ pub const DESKTOP_BG: u32 = 0x002D_2B55;
 /// The undraw below is unchanged and still required: a raw desktop fill with no session is exactly
 /// the class CURSOR-13 kept bracketed.
 fn erase(boxes: &[(usize, usize, usize, usize)]) {
-    // WCD-TEARDOWN — the panel-write seqlock's WRITE side, and the first statement in the function so
-    // that `cursor::undraw` below (which also writes glass) is inside it. This is the ONE choke point
-    // for "a window's box stopped belonging to it and was repainted as desktop", which is the exact
-    // event that can pull the floor out from under a `[wc-d]` read-back. See [`PANEL_EPOCH`].
-    #[cfg(feature = "witness")]
-    let _panel = PanelWriteGuard::enter();
     // CURSOR-1: take the sprite off the panel before repainting desktop under it. Without this the
     // fills below would overwrite the sprite, and the save-under would later restore pre-erase
     // pixels over freshly-painted desktop — a stale patch the following composite would not repaint
@@ -2692,7 +2686,9 @@ fn tail_of(disturbed: bool, session: bool, deferred: bool) -> CursorTail {
 #[cfg(feature = "witness")]
 fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
     let info = fb.info();
-    let VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, seq, claim } = vr;
+    let VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
+        #[cfg(target_arch = "x86_64")] seq } = vr;
+    let wi = r.id as usize;
 
     // WCD-PRE — the per-pixel liveness question, asked only of pixels that already disagree. `want` was
     // frozen before the blit; if the SOURCE no longer holds that value, this pixel's reference moved
@@ -2800,54 +2796,64 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
     // an x86 `wcg-paygo` one, so the three lines below stay byte-identical elsewhere.
     let coverage = wcd_coverage_note(step);
     // WCD-TEARDOWN — close the panel-write window. Taken AFTER the last probe and before the first
-    // print, so it covers exactly the interval the verdict rests on and nothing this function itself
-    // does to the panel afterwards.
+    // print, so it covers exactly the interval the verdict rests on and nothing this function does
+    // to the panel afterwards. x86 only; see the WCD-TEARDOWN ledger for why the arch gate is a
+    // protection boundary and not a scoping convenience.
+    #[cfg(target_arch = "x86_64")]
     let seq_end = panel_seq_close();
+    #[cfg(target_arch = "x86_64")]
     let stable = panel_stable(seq, seq_end);
-    // WCD-TEARDOWN — the interlock, and the whole of it. It fires ONLY on `!ok`, which is what makes
-    // it unable to hide a defect rather than merely unlikely to:
+    // WCD-TEARDOWN — THE ABORT TEST, and the `moved > 0` arm is not decoration.
     //
-    // * The only verdicts it declines to publish are ones that would otherwise have been charged as
-    //   FAIL. A PASS is never converted, so no clearance this witness has ever issued moves, and the
-    //   pi4 gate's `REQUIRE … bad_cache=0 bad_ram=0 … -> PASS` cannot be satisfied by this path.
-    // * It cannot manufacture agreement. An erase writes desktop colour, which makes matching pixels
-    //   MISMATCH; there is no repaint that turns a wrong pixel into a right one. So a rect that reads
-    //   clean under a racing erase read clean on its own merits.
-    // * It does not consume the window's verdict. The latch is handed back and the next composite
-    //   verifies again, so a PERSISTENT defect — the only kind a one-shot witness could ever have
-    //   caught — survives every retry and is charged in full the first time no erase overlaps.
-    // * It cannot go quiet. Every abort prints, the odometer is unbudgeted, and past `WCD_ABORT_MAX`
-    //   the abort keeps the latch and says `terminal` — so a window that races forever ends with a
-    //   loud unadjudicated verdict rather than silence, which is the `-> SKIP` discipline this
-    //   function's ledger already requires of every path that claims the bit.
+    // The first cut fired on `!ok` alone and had a hole big enough to swallow the very defect it was
+    // written for. A foreign panel write whose pixels ALSO differ from the frozen source is attributed
+    // by WCD-PRE's per-pixel re-read to `moved`, not to `bad` — so `ok` stays TRUE, the verdict prints
+    // `-> LIVE`, and the repaint that produced it is invisible on a line that carried no interlock
+    // field at all. `moved > 0` closes that: any disagreement this pass could not charge to the blit
+    // is now adjudicated against the panel's stability, whichever bucket it landed in.
     //
-    // The residual hole, named as WCD-PRE names its own: a genuine one-off blit defect in a rect that
-    // was ALSO repainted under the read-back is handed back rather than charged, and if the window
-    // never presents again it goes unadjudicated. That is strictly smaller than the exposure it
-    // replaces, which was charging the compositor for the desktop's own repaint.
-    if !ok && !stable {
-        let i = r.id as usize;
+    // It also repairs an argument the first cut got wrong. That ledger claimed a foreign write "cannot
+    // manufacture agreement" because it makes matching pixels mismatch — false where `want` happens to
+    // equal the colour being written: a desktop-colour fill over a genuinely garbled pixel whose
+    // source reads `DESKTOP_BG` HEALS the mismatch and the rect passes on pixels the blit never
+    // produced. That exposure is widened by this witness's own deferral, which moves verdicts onto a
+    // live desktop where fills are common. It is not fully closable from inside a read-back — the
+    // evidence is gone by the time the pass looks — so it is named here and bounded by the stability
+    // test rather than claimed away.
+    #[cfg(target_arch = "x86_64")]
+    if !stable && (!ok || moved > 0) {
         // Odometer first, unbudgeted, before the budget test — the counter must not stop at its cap.
-        let aborts = if i < WCD_IDS {
-            WCD_ABORTS[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1
+        let aborts = if wi < WCD_IDS {
+            WCD_ABORTS[wi].fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1
         } else {
             u32::MAX
         };
-        let terminal = aborts > WCD_ABORT_MAX;
+        // WCD-TEARDOWN — `retry=` says whether this window will be VERIFIED AGAIN, which is not the
+        // same question as whether the abort handed the reference back. A terminal stage-1 abort keeps
+        // the window at `FIRST_RUN`->`DONE`... no: it publishes nothing and seals, so nothing further
+        // is owed. A terminal stage-2 abort likewise seals. Either way `retry=no` is the truth about
+        // the WINDOW, which is what a reader is asking. See the note in `WCD_ABORT_MAX`.
+        let retry = aborts <= WCD_ABORT_MAX;
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} epoch={}->{} writers={}/{} aborts={}/{} retry={} -> SKIP (teardown)",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} fills={}->{} active={}/{} intr={}->{} aborts={}/{} retry={} -> SKIP (teardown)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum,
-            seq.epoch, seq_end.epoch, seq.writers, seq_end.writers,
-            aborts, WCD_ABORT_MAX, yn(!terminal)
+            first.0, first.1, first.2, first.3,
+            seq.fills, seq_end.fills, seq.active, seq_end.active,
+            seq.intrusions, seq_end.intrusions,
+            aborts, WCD_ABORT_MAX, yn(retry)
         );
-        if !terminal {
-            // Hand the verdict back. Done AFTER the print, so the line and the release cannot be
-            // separated by a composite on another core that re-claims and prints between them.
-            wcd_release(claim);
+        if retry {
+            // Hand the verdict back AFTER the print, so the line and the release cannot be separated
+            // by a composite on another core that re-admits and prints between them.
+            wcd_release(wi, running);
+        } else {
+            // Budget spent: stop re-reading the glass, and close the window LOUDLY rather than
+            // leaving it owing a verdict no one will ever print. `retry=no` above is that statement.
+            wcd_seal(wi);
         }
-        // The repair redraw below still runs: this window's pixels were repainted as desktop under
-        // us, and putting them back is exactly what it is for.
+        // The repair redraw still runs: this window's pixels were overwritten under us, and putting
+        // them back is exactly what it is for.
         let focus = focus_asid();
         draw_window(fb, r, focus != 0 && focus == r.owner_asid, None, false, false, None);
         return;
@@ -2858,12 +2864,23 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
         // counts kept visible so the disagreement stays readable. Distinct label, never red: a live
         // surface is a property of a multi-threaded app (or of the console printing into its own window),
         // not a defect in the compositor.
+        // WCD-TEARDOWN — a LIVE verdict is the one place a foreign panel write can hide with `ok`
+        // still true (WCD-PRE files such a pixel under `moved`, not `bad`), so the interlock's reading
+        // rides this line even when the abort did not fire. Two cfg'd emissions rather than a shim:
+        // aarch64 has no interlock and its line must stay byte-identical to the pre-interlock wire.
+        #[cfg(target_arch = "x86_64")]
+        serial_println!(
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} cksum_pre={:#018x} fills={}->{} active={}/{} intr={}->{} -> LIVE (unverifiable)",
+            r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum, cksum_pre,
+            seq.fills, seq_end.fills, seq.active, seq_end.active, seq.intrusions, seq_end.intrusions
+        );
+        #[cfg(not(target_arch = "x86_64"))]
         serial_println!(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} nonzero={} cksum={:#018x} cksum_pre={:#018x} -> LIVE (unverifiable)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, nonzero, cksum, cksum_pre
-        );
-    } else if ok {
+        );    } else if ok {
         serial_println!(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} nonzero={} cksum={:#018x} first=none -> PASS",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
@@ -2882,9 +2899,12 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef) {
     // `VERIFIED_FULL` on, so the two cannot disagree about whether the window still owes a verdict. A
     // sampled pass prints nothing here — its `coverage=lattice16` marker already says what it was, and the
     // `state=waiting` census will speak from the first composite this window is declined on.
+    // WC-D — the verdict is published; advance the window and set the flags the rest of the module
+    // reads. After the print, so a `[wc-a]`-ordering reader sees verdict-then-transition.
+    wcd_commit(wi, running, step);
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     if step == 1 {
-        wcd_complete(r.id);
+        wcd_complete(r.id, wi);
     }
 
     // Restore what the `IVAC` may have dropped: redraw the window and re-run its flush. In a correct build
@@ -2930,12 +2950,14 @@ struct VerifyRef {
     /// `for col in 0..cols` loop it has always been. Carried in the reference rather than recomputed at the
     /// read-back so the walk and its marker cannot disagree — the same rule `wcg` applies to `PAYGO_STEP`.
     step: usize,
-    /// WCD-TEARDOWN — the panel-write seqlock as of the instant the blit was about to run. Compared
-    /// against a closing read after the last probe; see [`PANEL_EPOCH`].
+    /// WC-D — the RUNNING state this reference was admitted in, so a commit or a release knows which
+    /// transition it owes. See [`WCD_STATE`].
+    running: u32,
+    /// WCD-TEARDOWN — both panel-write detectors as of the instant the blit was about to run.
+    /// Compared against a closing read after the last probe; see [`PANEL_INTRUSIONS`]. x86 only —
+    /// aarch64 has no interlock at all (the arch gate is a protection boundary; see WCD-TEARDOWN).
+    #[cfg(target_arch = "x86_64")]
     seq: PanelSeq,
-    /// WCD-TEARDOWN — which latches this pass newly set, so an abandoned verdict hands back exactly
-    /// what it took and no more. See [`wcd_release`].
-    claim: u32,
 }
 
 /// WC-D — capture the read-back's reference, from the composite loop, BEFORE `draw_window` runs.
@@ -2965,32 +2987,31 @@ fn verify_reference(
     if r.compat || !r.presented || r.id >= 32 {
         return None;
     }
-    let bit = 1u32 << r.id;
-    // WC-D/PAYGO — which verdict does this window still owe, and may it be taken NOW? `Some(step)` is the
-    // SOURCE-column stride the admitted pass runs at; `1` is full coverage and the only answer any build
-    // but an x86 `wcg-paygo` one ever gives. `None` declines, and on the deferring path the decline has
-    // already been counted and (on cadence) printed. See [`VERIFIED_FULL`] for the whole policy.
-    let step = wcd_admit(r.id, bit)?;
+    // WC-D — which verdict does this window still owe, and may it be taken NOW? `step` is the
+    // SOURCE-column stride the admitted pass runs at (`1` is full coverage, and the only answer any
+    // build but an x86 `wcg-paygo` one ever gives) and `running` is the state token the commit or the
+    // release owes its transition to. `None` declines — battery closed, another core already holds
+    // the ONE reference, or (PAYGO) the deferral gate is shut, in which case the decline has already
+    // been counted and, on cadence, printed. See [`WCD_STATE`].
+    let i = r.id as usize;
+    let (step, running) = wcd_admit(r.id, i)?;
     // Claim exactly once, and only from the path that is about to print. `claim_final` is the `fetch_or`
     // winner test that also CLOSES the window's battery — the geometry `-> SKIP`s below use it because a
     // degenerate row will still be degenerate at the deferred stage. Every `serial_println!` below is
     // emitted by one core.
-    let claim_final = || wcd_claim_final(bit).is_some();
 
     let info = fb.info();
     if r.surf == 0 || r.scale == 0 || r.stride < 4 || r.x >= info.width || r.y >= info.height {
-        if claim_final() {
-            serial_println!("[wc-d] verify win={} -> SKIP (degenerate row/geometry)", r.id);
-        }
+        wcd_seal(i);
+        serial_println!("[wc-d] verify win={} -> SKIP (degenerate row/geometry)", r.id);
         return None;
     }
     // The same bounds `draw_window` blitted under — verify exactly what was drawn, never more.
     let cols = (info.width - r.x).div_ceil(r.scale).min(r.w).min(r.stride / 4);
     let rows = (info.height - r.y).div_ceil(r.scale).min(r.h).min(r.surf_len / r.stride);
     if cols == 0 || rows == 0 {
-        if claim_final() {
-            serial_println!("[wc-d] verify win={} -> SKIP (no visible content rect)", r.id);
-        }
+        wcd_seal(i);
+        serial_println!("[wc-d] verify win={} -> SKIP (no visible content rect)", r.id);
         return None;
     }
     // WC-D/PAYGO — the lattice COLLAPSES on a rect narrower than its own step, for the reason
@@ -3012,8 +3033,17 @@ fn verify_reference(
             let y0 = sy0.min(rows);
             let y1 = sy1.min(rows);
             if y1 <= y0 {
-                // No claim — see the ledger above. This present has no visible damaged rows; the next one
-                // will.
+                // No verdict — see the ledger above. An empty band is a property of ONE present, not of
+                // the row, so burning a window's only verdict on a transient would be the same class of
+                // mistake as the false FAIL WCD-PRE exists to close.
+                //
+                // Under the state machine this is a RELEASE and not merely a return. The reference was
+                // taken by `wcd_admit`'s CAS at the top of this function — earlier than the old
+                // `claim()` closure, which sat below this test and so was never reached here — so
+                // returning without handing the window back would wedge it in its RUNNING state and it
+                // would never be verified again. The old shape could not leak; this one can, and this
+                // is where it would have.
+                wcd_unwind(i, running);
                 return None;
             }
             (y0, y1, true)
@@ -3023,16 +3053,21 @@ fn verify_reference(
     // WC-D/PAYGO — stage-appropriate, and with the EFFECTIVE step: a sampled pass claims only the
     // first-verdict latch and leaves the terminal one for the deferred pass, while a full pass — including
     // a lattice that collapsed above — closes the battery outright. See [`wcd_claim`].
-    let Some(claim) = wcd_claim(bit, step) else {
-        return None;
-    };
-    // Latch is ours from here: every return below prints.
+    // The reference is ours from here — `wcd_admit`'s CAS made this core the only holder — so every
+    // return below prints, and every return below that does NOT publish a verdict must hand the
+    // window back.
     let mut want: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     if want.try_reserve_exact((row1 - row0) * cols).is_err() {
         serial_println!(
             "[wc-d] verify win={} -> SKIP (no memory for {}x{} source snapshot)",
             r.id, cols, row1 - row0
         );
+        // WCD-TEARDOWN — hand the window back rather than closing it. An allocation failure is a
+        // property of one INSTANT, not of the row, and a `step == 1` pass (every stage-2, and a
+        // collapsed lattice such as `win=3`'s 8x8 first pass) would otherwise have closed the battery
+        // outright — permanently retiring a window's verdict over a transient, which is the exact
+        // outcome this function's ledger says the OOM path avoids.
+        wcd_unwind(i, running);
         return None;
     }
     // Read the SOURCE exactly ONCE, into a snapshot both read-back passes share. Before WCD-LIVE a verdict
@@ -3058,8 +3093,10 @@ fn verify_reference(
     // verdict rests on: `draw_window`'s copy and both read-back passes. An erase landing before this
     // point is harmless by construction — the blit that follows repaints over it — and including it
     // would abandon verdicts for a race that cannot reach them. See [`PANEL_EPOCH`].
+    #[cfg(target_arch = "x86_64")]
     let seq = panel_seq();
-    Some(VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, seq, claim })
+    Some(VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
+        #[cfg(target_arch = "x86_64")] seq })
 }
 
 /// WC-D — `band=` on the wire: `none` for a whole-box verdict, `y0..y1` in SOURCE rows for a banded one.
@@ -3098,10 +3135,17 @@ fn yn(b: bool) -> &'static str {
 static VERIFIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 // ---- WCD-TEARDOWN — the panel-write interlock the read-back adjudicates against -----------------
+//
+// x86_64 ONLY, and the arch gate is a protection boundary rather than a scoping convenience. This
+// interlock can convert a `-> FAIL` into a `-> SKIP`, and `scripts/specs/pi4-regression.spec`'s
+// `FORBID \[wc-d\] verify .*-> FAIL` is another track's gate reading this witness's wire. A
+// feature-gated interlock would therefore have weakened a live protection on a bench this seat does
+// not own and cannot re-run. aarch64 keeps the pre-interlock behaviour verbatim: one verdict, no
+// abort, no release, no new field on any line.
 
-/// WCD-TEARDOWN — monotone count of desktop-repaint events over window boxes ([`erase`] entries).
+/// WCD-TEARDOWN — desktop-layer presents that wrote background pixels INTO the window layer.
 ///
-/// ### The defect this exists to stop mis-attributing (s73 boot 8)
+/// ### What boot 8 actually showed, and the writer I first named wrongly
 ///
 /// ```text
 /// [  25043ms] [wc-d] verify win=3 surf=128x128 band=none scale=6x at (9,21) panel=2880x1800
@@ -3109,195 +3153,184 @@ static VERIFIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::
 ///     first=(9,21) got=0x000000 want=0x1e1e1e -> FAIL
 /// ```
 ///
-/// Four things convict the INSTRUMENT rather than the blit, and they are the same four WCD-PRE used:
+/// Four things convict the INSTRUMENT rather than the blit, and they hold whatever wrote the panel:
 ///
-/// * `bad_cache=0` — the first read-back pass found all 589 824 destination pixels correct. A blit
-///   defect is over before either pass starts (`verify_window` runs after `draw_window` returns), so
-///   no defect can be invisible to pass 1 and visible to pass 2.
-/// * `bad_ram=197376` is **exactly 257 full destination rows** of the 768-row box (`197376 / 768`),
-///   and `first=(9,21)` is the box origin — a contiguous top-down sweep, which is the shape of a
-///   rectangle fill, not of a corruption.
-/// * `ram_indep=no`. On x86 there is no invalidate between the passes (WCD-RAMINDEP), so the second
-///   pass is a pure STABILITY re-read, and this file already documents what a disagreement means
-///   there: *"something wrote the panel under the verdict."* It did. The instrument detected the
-///   right fact and printed the wrong verdict for it.
-/// * `moved=0` — and this is the structural half. WCD-PRE's liveness leg asks whether the SOURCE
-///   moved under the reference; it did not, because the writer was repainting the DESTINATION. A
-///   source-liveness test is blind to a destination write by construction, so no amount of tightening
-///   WCD-PRE could ever have caught this.
+/// * `bad_cache=0` — pass 1 found all 589 824 destination pixels correct. A blit defect is over
+///   before either pass starts ([`verify_window`] runs after `draw_window` returns), so none can be
+///   invisible to pass 1 and visible to pass 2.
+/// * `bad_ram=197376` is exactly 257 full destination rows of the 768-row box, and `first=(9,21)` is
+///   the box origin — a contiguous top-down sweep, the shape of a rectangle paint.
+/// * `ram_indep=no` makes pass 2 a pure STABILITY re-read (WCD-RAMINDEP), which this file already
+///   documents to mean *"something wrote the panel under the verdict."*
+/// * `moved=0` is the structural half: WCD-PRE asks whether the SOURCE moved, and the writer was
+///   repainting the DESTINATION. A source-liveness leg is blind to that by construction.
 ///
-/// ### Where it comes from in the close path
+/// **The first version of this ledger then named [`erase`] as the writer, and the colour refutes it.**
+/// `erase` fills [`DESKTOP_BG`], `0x002D2B55`, which the wire confirms independently
+/// (`[wc-x] desktop-clear panel=2880x1800 bg=002D2B55`). The failing pixels read `0x000000` —
+/// `fbcon`'s `BG_DEFAULT`, i.e. CONSOLE background. No `erase` can produce that colour, so no `erase`
+/// produced those pixels, and an interlock guarding only `erase` would have left `panel_stable` true
+/// on the next recurrence and never fired. The prose below is what the evidence supports and no more.
 ///
-/// [`erase`] is the only writer that repaints a window's box as desktop, and it has three call sites
-/// whose barrier coverage is ASYMMETRIC:
+/// ### The writer the colour points at
 ///
-/// | site | `DrainBarrier` | why |
-/// |---|---|---|
-/// | [`move_to`] | **yes** | its own comment: *"a composite on another core may have snapshotted this row at its OLD geometry and still be blitting it; without the barrier that in-flight blit lands AFTER the erase"* |
-/// | [`reclaim`] from [`close`] / `close_owner` | **yes** | teardown raises it before the reclaim and drops it after |
-/// | [`reclaim`] from [`create_inner`], and `focus_changed`'s hidden-box erase | **no** | `create_inner` says so outright: *"No drain barrier here: no row is being freed and no surface unmapped, so there is nothing an in-flight blit could be reading that is about to disappear"* |
+/// Black over a window box is the DESKTOP LAYER's own content reaching glass where the window layer
+/// should have masked it. `Screen::present_background` paints the desktop's damage set with the
+/// window boxes subtracted out (`wm::occluders`), and it already computes and RETURNS the exact fact
+/// that matters — its own doc: *"whether this present wrote background pixels INTO the window layer
+/// (an 'intrusion'). `false` is the normal answer ... `true` means the subtraction could not be
+/// applied."* An intrusion is precisely "the desktop layer wrote where a window's pixels live", which
+/// is precisely the event that can put console black inside a verified box.
 ///
-/// That last justification is sound for the hazard it names — a use-after-free of a surface about to
-/// be unmapped — and silent about this one. An in-flight `verify_window` is not reading a surface
-/// that is about to disappear; it is reading GLASS, and the erase overwrites the very pixels whose
-/// verdict is outstanding. `verify_window` runs inside the `BlitGuard` window (the drain's own ledger
-/// names *"every print in `verify_window`"* as living there), so a BARRIERED erase provably cannot
-/// race a read-back and an UNBARRIERED one provably can.
+/// It also resolves the timing puzzle the first draft could not. That draft tried to place the write
+/// against the `[wc-a] close` lines 2 ms later and failed, because those paths do not perform this
+/// write — they ARM it. `reclaim`, `move_to` and `focus_changed`'s shell arm all call
+/// `screen::request_full_present()`, which only sets `FULL_PRESENT`; the panel write happens later,
+/// from whichever context next reaches `Screen::flush`, outside every barrier those paths raise. A
+/// teardown-adjacent cause with a non-adjacent write is exactly what the log shows.
 ///
-/// **The panel is not wrong, only the verdict is.** Every unbarriered erase is followed by a
-/// composite that repaints the survivors over it, so the pixels self-heal within the pass — which is
-/// why the fix belongs in the witness and not in the compositor. Putting a `DrainBarrier` on
-/// `focus_changed` would also push a fresh member into a teardown's wait set on a path reached from
-/// `sched::exit` with interrupts masked, which is precisely what the drain's termination ledger
-/// warns against. It is reported to the seat as a separate finding rather than fixed from here.
+/// **Stated as a model, not a conviction.** One line cannot prove which writer ran. That is why the
+/// abort line carries `first=`, `got=` and `want=` (the colour is what falsified the first model, so
+/// the next recurrence must not have to go back to the capture to find it), and why this counter
+/// names an EVENT CLASS the code already computes rather than a mechanism this ledger asserts.
 ///
-/// ### Why a seqlock and not a "close in progress" flag
+/// ### Why an intrusion count and not a duration
 ///
-/// A flag answers "is a teardown running RIGHT NOW", which is the wrong question twice over: it is
-/// false during the half of the race that matters (the erase can be over before the read-back ends)
-/// and it names only one of the two unbarriered sites. This counts the EVENT instead, at the one
-/// choke point every such write passes through, so the read-back's question becomes the question it
-/// actually needs answered — *"did anyone repaint a box while I was reading?"* — which no future
-/// call site can accidentally opt out of.
+/// An intrusion is rare — `false` is the normal answer — so counting it costs one relaxed increment
+/// on a path that already branches on the flag, and a verdict is abandoned only when the desktop
+/// layer really did write into the window layer. A duration-style seqlock over the whole present
+/// would have been useless here for the opposite reason to `erase`'s: `present_background` runs every
+/// frame, so "a present was in flight" is true for essentially every read-back on a live desktop, and
+/// an interlock that fires on every verdict adjudicates nothing.
 ///
-/// Bumped once per [`erase`] ENTRY, paired with [`PANEL_WRITERS`] for the in-progress half. See
-/// [`panel_seq`] for the read side and the ordering argument that makes it airtight.
-#[cfg(feature = "witness")]
-static PANEL_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// **Named gap:** this is a counter, not a bracket. A single present that begins before a read-back
+/// opens AND ends after it closes bumps nothing inside the window and is missed. A desktop present is
+/// sub-frame; a read-back is ~1.2 s unsampled. The exposure is real, bounded, and stated rather than
+/// papered over — unlike [`PANEL_FILL_EPOCH`] below, whose writers are rare enough to bracket
+/// properly.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static PANEL_INTRUSIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// WCD-TEARDOWN — [`erase`] calls currently in flight. [`PANEL_EPOCH`] alone catches an erase that
-/// STARTS and one that FINISHES inside a read-back; this catches the third case, an erase already
-/// running when the read-back opened and still running when it closed, which bumps nothing in
-/// between. Both are needed and neither is sufficient.
-#[cfg(feature = "witness")]
-static PANEL_WRITERS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// WCD-TEARDOWN — the desktop layer's end of the interlock. Called from `Screen::flush` on the one
+/// branch that already knows an intrusion happened. See [`PANEL_INTRUSIONS`].
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+pub(super) fn note_panel_intrusion() {
+    PANEL_INTRUSIONS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
 
-/// WCD-TEARDOWN — the write side, as a guard so that [`erase`]'s early return (`!fb.is_ready()`)
-/// cannot leak an in-progress count. Order is fixed and load-bearing: `WRITERS` up FIRST, then
-/// `EPOCH`. [`panel_seq`] reads them in the mirror order, and the two orders together are what make
-/// "no overlapping erase went unseen" a proof rather than a hope.
-#[cfg(feature = "witness")]
+/// WCD-TEARDOWN — the desktop-colour box fills, which are the OTHER writer class that can land
+/// inside a verified box. Rare (teardown, move, deferred drain), so unlike [`PANEL_INTRUSIONS`] this
+/// half is a proper bracket and has no missed-span gap.
+///
+/// **Guarded at [`stage_fill`], not at [`erase`].** The first draft called `erase` "the one choke
+/// point" and it is not: `stage_fill(.., DESKTOP_BG, ..)` has two callers, `erase` and
+/// [`drain_deferred`], and the latter reaches the panel without passing through `erase` at all — so a
+/// guard on `erase` would have missed a writer that the s73 capture shows firing in bulk. Guarding
+/// the fill itself is what makes the claim true instead of merely intended, and no future call site
+/// can opt out of it.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static PANEL_FILL_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WCD-TEARDOWN — desktop-colour fills in flight. [`PANEL_FILL_EPOCH`] alone catches a fill that
+/// starts and one that finishes inside a read-back; this catches the third case, one already running
+/// when the read-back opened and still running when it closed. Both are needed, neither suffices.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static PANEL_FILL_ACTIVE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// WCD-TEARDOWN — the fill bracket, as a guard so an early return cannot leak an in-progress count.
+/// Order is load-bearing: `ACTIVE` up FIRST, then `EPOCH`; [`panel_seq`] reads them in the mirror
+/// order, and the two orders together are what make "no overlapping fill went unseen" a proof.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
 struct PanelWriteGuard;
 
-#[cfg(feature = "witness")]
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
 impl PanelWriteGuard {
     fn enter() -> Self {
-        PANEL_WRITERS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-        PANEL_EPOCH.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        PANEL_FILL_ACTIVE.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        PANEL_FILL_EPOCH.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         PanelWriteGuard
     }
 }
 
-#[cfg(feature = "witness")]
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
 impl Drop for PanelWriteGuard {
     fn drop(&mut self) {
-        PANEL_WRITERS.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+        PANEL_FILL_ACTIVE.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
     }
 }
 
-/// WCD-TEARDOWN — one reading of the panel-write seqlock.
-#[cfg(feature = "witness")]
+/// WCD-TEARDOWN — one reading of both detectors.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 struct PanelSeq {
-    epoch: u64,
-    writers: usize,
+    fills: u64,
+    active: usize,
+    intrusions: u64,
 }
 
-/// WCD-TEARDOWN — the read side. Taken by [`verify_reference`] before the reference and by
-/// [`verify_window`] after the last probe; [`panel_stable`] compares them.
-///
-/// **`EPOCH` first, then `WRITERS` — and the reverse at the closing read.** The write side raises
-/// `WRITERS` before `EPOCH`; a reader that took both in the same order at both ends has a hole. With
-/// the orders mirrored there is none: if the closing `writers` is 0 then this erase had not yet
-/// raised `WRITERS` when that read happened, so its `EPOCH` bump — which follows `WRITERS` in program
-/// order and is ordered with it by `AcqRel` — is also after the opening `epoch` read, and the epochs
-/// therefore differ. Every erase that overlaps the read-back at all moves at least one of the two.
-#[cfg(feature = "witness")]
+/// WCD-TEARDOWN — the opening read. `EPOCH` before `ACTIVE`, mirrored by [`panel_seq_close`]; see
+/// [`PANEL_FILL_EPOCH`]. With the orders mirrored, if the closing `active` is 0 then a fill that
+/// overlapped had not yet raised `ACTIVE` at that read, so its `EPOCH` bump — which follows `ACTIVE`
+/// in program order and is ordered with it by `AcqRel` — is also after the opening `EPOCH` read, and
+/// the epochs differ. Every overlapping fill moves at least one of the two.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
 fn panel_seq() -> PanelSeq {
-    let epoch = PANEL_EPOCH.load(core::sync::atomic::Ordering::Acquire);
-    let writers = PANEL_WRITERS.load(core::sync::atomic::Ordering::Acquire);
-    PanelSeq { epoch, writers }
+    let fills = PANEL_FILL_EPOCH.load(core::sync::atomic::Ordering::Acquire);
+    let active = PANEL_FILL_ACTIVE.load(core::sync::atomic::Ordering::Acquire);
+    let intrusions = PANEL_INTRUSIONS.load(core::sync::atomic::Ordering::Acquire);
+    PanelSeq { fills, active, intrusions }
 }
 
-/// WCD-TEARDOWN — closing read, mirrored (`WRITERS` then `EPOCH`); see [`panel_seq`].
-#[cfg(feature = "witness")]
+/// WCD-TEARDOWN — the closing read, mirrored (`ACTIVE` then `EPOCH`); see [`panel_seq`].
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
 fn panel_seq_close() -> PanelSeq {
-    let writers = PANEL_WRITERS.load(core::sync::atomic::Ordering::Acquire);
-    let epoch = PANEL_EPOCH.load(core::sync::atomic::Ordering::Acquire);
-    PanelSeq { epoch, writers }
+    let active = PANEL_FILL_ACTIVE.load(core::sync::atomic::Ordering::Acquire);
+    let fills = PANEL_FILL_EPOCH.load(core::sync::atomic::Ordering::Acquire);
+    let intrusions = PANEL_INTRUSIONS.load(core::sync::atomic::Ordering::Acquire);
+    PanelSeq { fills, active, intrusions }
 }
 
-/// WCD-TEARDOWN — was the panel free of desktop repaints for the whole read-back?
+/// WCD-TEARDOWN — was the panel free of foreign writes for the whole read-back?
 ///
-/// Conservative in the only direction that is safe: it answers `false` whenever it cannot prove
-/// `true`. A false `false` costs one re-verification; a false `true` is a FAIL charged to a blit that
-/// did not commit it, which is the defect this exists to close.
-#[cfg(feature = "witness")]
+/// Conservative in the only safe direction: it answers `false` whenever it cannot prove `true`. A
+/// false `false` costs one re-verification; a false `true` charges a blit for pixels it did not write.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
 #[inline]
 fn panel_stable(before: PanelSeq, after: PanelSeq) -> bool {
-    before.writers == 0 && after.writers == 0 && before.epoch == after.epoch
+    before.active == 0
+        && after.active == 0
+        && before.fills == after.fills
+        && before.intrusions == after.intrusions
 }
 
-/// WCD-TEARDOWN — per-id: read-backs abandoned because a desktop repaint ran under them. An
-/// ODOMETER, never reset — not by the abort itself and not by the window-recycle path that clears
-/// [`VERIFIED`], because a slot that keeps racing is a fact about the BOOT and a counter that
-/// forgets is the shape this module keeps convicting. Printed as `aborts=` and also the budget test,
-/// so it keeps counting past its own cap exactly as the spent-budget law requires.
-#[cfg(feature = "witness")]
+/// WCD-TEARDOWN — per-id: read-backs abandoned because a foreign panel write ran under them.
+///
+/// An ODOMETER: it keeps counting past the cap that stops the RETRIES, which is the spent-budget law
+/// this module applies to every capped counter. Printed as `aborts=`.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
 static WCD_ABORTS: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
 
-/// WCD-TEARDOWN — how many times one window may hand its verdict back before the next abort is
-/// TERMINAL.
+/// WCD-TEARDOWN — retries a window may spend before an abort stops handing the verdict back.
 ///
-/// It is a cost bound, not a correctness one, and both directions of getting it wrong are named. Too
-/// low and a window that races repeatedly reports a terminal SKIP where a verdict was reachable —
-/// loud, and the gate reads it. Too high and each retry is another full read-back (~1.2 s on the
-/// bench's console window when unsampled), so an unlucky boot could spend seconds re-verifying. Three
-/// is chosen against the observed rate: boot 7 ran the same fixture ladder with eleven consecutive
-/// clean verdicts and boot 8 raced once, so three retries is several times the observed exposure
-/// while capping the worst case at a few seconds.
-#[cfg(feature = "witness")]
-const WCD_ABORT_MAX: u32 = 3;
-
-/// WCD-TEARDOWN — hand this window's verdict back so a later composite can take it again.
+/// **Six, and the figure was re-derived for the regime this actually runs in.** The first cut said
+/// three "against the observed rate — boot 7 ran eleven clean verdicts and boot 8 raced once", and
+/// that calibration was measured on the PRE-DEFERRAL exposure while being spent in the post-deferral
+/// one. PAYGO moves the full verdict out of the boot burst and onto a live desktop, where the desktop
+/// layer is presenting continuously and the window set is churning — which is exactly where an
+/// intrusion is likeliest, so the budget is spent in a wider regime than the one it was sized in.
 ///
-/// Undoes EXACTLY the bits this pass newly latched — which is why [`verify_reference`] carries them
-/// in the reference instead of re-deriving them here. A stage-2 abort that cleared [`VERIFIED`] as
-/// well as [`VERIFIED_FULL`] would demote a window that already has a valid first verdict back to
-/// stage 1 and re-run the cheap pass forever; a stage-1 abort that cleared only the terminal bit
-/// would release nothing at all.
-#[cfg(feature = "witness")]
-#[inline]
-fn wcd_release(claim: u32) {
-    if claim & WCD_CLAIM_FIRST != 0 {
-        VERIFIED.fetch_and(
-            !(claim >> WCD_CLAIM_SHIFT),
-            core::sync::atomic::Ordering::Relaxed,
-        );
-    }
-    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
-    if claim & WCD_CLAIM_FULL != 0 {
-        VERIFIED_FULL.fetch_and(
-            !(claim >> WCD_CLAIM_SHIFT),
-            core::sync::atomic::Ordering::Relaxed,
-        );
-    }
-}
-
-/// WCD-TEARDOWN — claim bookkeeping packed into one `u32`: the low two bits say WHICH latches this
-/// pass newly set, and the window's own bit is carried in the high half so [`wcd_release`] needs no
-/// second argument that could disagree with the first.
-#[cfg(feature = "witness")]
-const WCD_CLAIM_FIRST: u32 = 1 << 0;
-/// Only the two-stage build has a terminal latch distinct from the first-verdict one, so this bit is
-/// PAYGO-gated: on a single-verdict build there is nothing it could name that `WCD_CLAIM_FIRST` does
-/// not already name, and defining it there would be a constant whose absence of use is the only
-/// honest thing about it.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
-const WCD_CLAIM_FULL: u32 = 1 << 1;
-#[cfg(feature = "witness")]
-const WCD_CLAIM_SHIFT: u32 = 2;
+/// The remaining exposure is stated rather than engineered away: [`WCD_ABORTS`] is per-ID and ids are
+/// recycled slot aliases (slot 3 recycles seven times in the s73 capture), so a late tenant of a hot
+/// slot can start with the budget partly spent and reach `retry=no` having adjudicated nothing
+/// itself. That is the deliberate trade named at the recycle site — the alternative hands a
+/// recycling slot fresh retries on every cycle, and one of the writers this interlock detects is
+/// reached FROM the recycle path, so the bound would stop bounding. Six doubles the headroom against
+/// a boot's worst observed churn while keeping the worst case at a few full read-backs, and the wire
+/// says `aborts=N/6` on every abort so a boot that is actually exhausting it says so out loud.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+const WCD_ABORT_MAX: u32 = 6;
 
 // ---- WC-D/PAYGO — the read-back paid as the desktop uses it, not as the boot starts it ---------
 
@@ -3407,6 +3440,14 @@ static VERIFIED_FULL: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 #[cfg(feature = "witness")]
 const WCD_IDS: usize = 32;
 
+/// The `id >= 32` guard in [`verify_reference`] and every `[AtomicU32; WCD_IDS]` above have to be the
+/// same number, and `VERIFIED`'s `1u32 << id` puts a hard ceiling on it. Pinned rather than trusted:
+/// the first cut carried the window's bit SHIFTED INSIDE a packed claim token, which silently threw
+/// the bit away for `id >= 30` and made a release clear nothing. The state machine retired the
+/// packing, and this keeps the remaining coupling honest.
+#[cfg(feature = "witness")]
+const _: () = assert!(WCD_IDS == 32, "WCD_IDS must match verify_reference's `id >= 32` guard");
+
 /// WC-D/PAYGO — the lattice's column step, in SOURCE columns. `wcg`'s sixteen, taken from `wcg`, for
 /// the reason its own note gives: sixteen is a coverage decision before it is a cost one, and one
 /// policy under one knob should not be two constants. Pinned to the `coverage=lattice16` literal at
@@ -3465,107 +3506,196 @@ static WCD_SAID: [core::sync::atomic::AtomicU32; WCD_IDS] =
 static WCD_LASTROLL: [core::sync::atomic::AtomicU64; WCD_IDS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; WCD_IDS];
 
-/// WC-D/PAYGO — may this window take a reference now, and at what probe step?
+/// WC-D — the per-id verdict progression, as ONE atomic per window.
 ///
-/// `Some(step)` admits the pass at that SOURCE-column stride; `None` declines it. The stage is read
-/// off the two latches and nothing else, so it is monotone and two cores cannot disagree about it:
-/// terminal bit set means the battery is closed; first bit clear means stage 1, which opens
-/// immediately and sampled; otherwise stage 2, which opens only past the shared threshold.
+/// ### Why a state machine replaced the pair of bitmasks
+///
+/// The first cut claimed `VERIFIED` and `VERIFIED_FULL` with two independent `fetch_or`s and let the
+/// stage be inferred from them. That admits a strand this witness's own one-reference invariant
+/// forbids. `BlitGuard` is a COUNT, so two cores can be inside the composite loop for the same
+/// window: core A claims the first verdict and takes a reference; core B, arriving past the deferral
+/// threshold, reads `VERIFIED` already set, concludes "stage 2" and claims the terminal latch through
+/// its own `fetch_or`. Two references are now outstanding for one window — which
+/// [`verify_reference`]'s ledger states can never happen — and if A then aborts and releases the
+/// first-verdict bit, the pair lands at `VERIFIED=0, VERIFIED_FULL=1`: a window terminally closed
+/// with no published first verdict, permanently `may_overlay=false` (so `CUR12_EXCL_UNVERIFIED`
+/// climbs without bound), and B's terminal line reading `taken=1 -> PAID`.
+///
+/// One cell and one `compare_exchange` per transition removes the strand by construction: a claim
+/// moves the window out of a RESTING state into the matching RUNNING state, and only the core that
+/// wins the CAS holds a reference. There is no ordering of two independent RMWs left to get wrong.
+///
+/// [`VERIFIED`] and [`VERIFIED_FULL`] survive as PUBLISHED flags — `composite_inner`'s `may_overlay`
+/// test and the `FALLBACK_FIXTURE` arm read them — and are now written only when a verdict actually
+/// commits, which is also what makes `taken=` on the paygo lines recycle-safe (finding: a `-> PAID`
+/// could read `taken=0` when a recycle cleared the masks between the claim and the print; the state
+/// cell is the single source of truth and the recycle resets it too).
+#[cfg(feature = "witness")]
+static WCD_STATE: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(WCD_ST_FIRST) }; WCD_IDS];
+
+/// Resting: owes its first verdict. The state every window starts and recycles into.
+#[cfg(feature = "witness")]
+const WCD_ST_FIRST: u32 = 0;
+/// Running: a reference for the first verdict is outstanding. At most one core is ever here.
+#[cfg(feature = "witness")]
+const WCD_ST_FIRST_RUN: u32 = 1;
+/// Resting: the first verdict is published and the FULL one is owed. PAYGO builds only — a
+/// single-verdict build goes `FIRST_RUN` straight to `DONE`.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+const WCD_ST_FULL: u32 = 2;
+/// Running: a reference for the full verdict is outstanding.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+const WCD_ST_FULL_RUN: u32 = 3;
+/// Terminal: this window owes nothing.
+#[cfg(feature = "witness")]
+const WCD_ST_DONE: u32 = 4;
+
+/// WC-D — how many verdicts this window has PUBLISHED, read off the one cell that knows. `taken=` on
+/// the wire. Recycle-safe because the recycle resets the same cell it reads.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+fn wcd_taken(i: usize) -> u32 {
+    match WCD_STATE[i].load(core::sync::atomic::Ordering::Relaxed) {
+        WCD_ST_FIRST | WCD_ST_FIRST_RUN => 0,
+        WCD_ST_DONE => 2,
+        _ => 1,
+    }
+}
+
+/// WC-D — may this window take a reference now, and at what probe step?
+///
+/// `Some((step, running))` admits the pass: `step` is the SOURCE-column stride and `running` is the
+/// state token the caller carries so a commit or a release knows which transition to make. `None`
+/// declines — because the battery is closed, because another core holds the only reference, or
+/// (PAYGO) because the deferral gate has not opened, in which case the decline is already counted
+/// and, on cadence, printed.
 ///
 /// **The gate sits above everything the pass would spend.** A declined composite takes no reference,
-/// allocates no snapshot, touches no glass and claims no latch — it leaves the window exactly as it
-/// found it, so a window that stops compositing before the threshold simply never pays, and there is
-/// nothing here that can wedge: no wait, no retry, no queue, no core to make progress.
+/// allocates no snapshot, touches no glass and moves no state.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
-fn wcd_admit(id: u32, bit: u32) -> Option<usize> {
-    if VERIFIED_FULL.load(core::sync::atomic::Ordering::Relaxed) & bit != 0 {
-        return None;
-    }
-    if VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit == 0 {
-        return Some(WCD_LATTICE_N);
-    }
-    let (since_ms, clock, payable) = super::wcg::paygo_clock();
-    if !payable {
-        wcd_decline(id, since_ms, clock);
-        return None;
-    }
-    Some(1)
-}
-
-/// Knob off, or not x86: one verdict per window at full coverage, exactly as before. Folds away.
-#[cfg(all(feature = "witness", not(all(target_arch = "x86_64", feature = "wcg-paygo"))))]
-#[inline]
-fn wcd_admit(_id: u32, bit: u32) -> Option<usize> {
-    if VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit != 0 {
-        None
-    } else {
-        Some(1)
-    }
-}
-
-/// WC-D/PAYGO — claim the verdict this pass owes, stage-appropriately. A sampled pass claims the
-/// FIRST-verdict latch and leaves the terminal one for the deferred pass; a FULL pass closes the
-/// battery outright, whichever stage it arrived from.
-///
-/// That last clause is what makes a COLLAPSED lattice correct rather than merely tolerable: a rect
-/// narrower than the step is walked at full coverage (see [`verify_reference`]), so it earned the
-/// terminal latch on its first pass and must not be re-verified later to say the same thing again.
-/// The winner test is a single `fetch_or` on exactly one mask either way, so two cores at the same
-/// stage cannot both print.
-/// Returns `None` when another core owns this verdict, or `Some(claim)` naming the latches THIS pass
-/// newly set — the token [`wcd_release`] needs if WCD-TEARDOWN hands the verdict back.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
-#[inline]
-fn wcd_claim(bit: u32, step: usize) -> Option<u32> {
-    if step > 1 {
-        if VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0 {
-            Some(WCD_CLAIM_FIRST | (bit << WCD_CLAIM_SHIFT))
-        } else {
-            None
+fn wcd_admit(id: u32, i: usize) -> Option<(usize, u32)> {
+    loop {
+        match WCD_STATE[i].load(core::sync::atomic::Ordering::Acquire) {
+            WCD_ST_FIRST => {
+                if wcd_cas(i, WCD_ST_FIRST, WCD_ST_FIRST_RUN) {
+                    return Some((WCD_LATTICE_N, WCD_ST_FIRST_RUN));
+                }
+                // Lost the CAS: another core moved this window. Re-read rather than decline, so a
+                // window that just transitioned is judged on its new state and not on a stale one.
+                continue;
+            }
+            WCD_ST_FULL => {
+                let (since_ms, clock, payable) = super::wcg::paygo_clock();
+                if !payable {
+                    wcd_decline(id, i, since_ms, clock);
+                    return None;
+                }
+                if wcd_cas(i, WCD_ST_FULL, WCD_ST_FULL_RUN) {
+                    return Some((1, WCD_ST_FULL_RUN));
+                }
+                continue;
+            }
+            // RUNNING (another core owns the only reference) or DONE.
+            _ => return None,
         }
-    } else {
-        wcd_claim_final(bit)
     }
 }
 
-/// WC-D/PAYGO — claim and CLOSE, whatever stage asked. The `-> SKIP` GEOMETRY paths use it: a
-/// degenerate row is a property of the ROW, will still be degenerate at stage 2, and re-running it
-/// there would buy a duplicate SKIP line and nothing else — which is the classification
-/// [`verify_reference`]'s own ledger already makes about which failures are worth claiming for.
-///
-/// The out-of-memory SKIP deliberately does NOT use it. An allocation failure is a property of one
-/// instant, not of the row, so leaving the terminal latch clear gives that window its full verdict
-/// later instead of spending its only chance on a transient.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
-#[inline]
-fn wcd_claim_final(bit: u32) -> Option<u32> {
-    // The first-verdict bit may already be set (a stage-2 pass), so only the terminal `fetch_or` is
-    // the winner test — and only the bits this call actually FLIPPED go into the release token.
-    let first = VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0;
-    if VERIFIED_FULL.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit != 0 {
-        return None;
-    }
-    let mut claim = WCD_CLAIM_FULL | (bit << WCD_CLAIM_SHIFT);
-    if first {
-        claim |= WCD_CLAIM_FIRST;
-    }
-    Some(claim)
-}
-
+/// Knob off: one verdict per window at full coverage. Same one-reference guarantee, two states.
 #[cfg(all(feature = "witness", not(all(target_arch = "x86_64", feature = "wcg-paygo"))))]
 #[inline]
-fn wcd_claim(bit: u32, _step: usize) -> Option<u32> {
-    if VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0 {
-        Some(WCD_CLAIM_FIRST | (bit << WCD_CLAIM_SHIFT))
+fn wcd_admit(_id: u32, i: usize) -> Option<(usize, u32)> {
+    if wcd_cas(i, WCD_ST_FIRST, WCD_ST_FIRST_RUN) {
+        Some((1, WCD_ST_FIRST_RUN))
     } else {
         None
     }
 }
 
-#[cfg(all(feature = "witness", not(all(target_arch = "x86_64", feature = "wcg-paygo"))))]
+#[cfg(feature = "witness")]
 #[inline]
-fn wcd_claim_final(bit: u32) -> Option<u32> {
-    wcd_claim(bit, 1)
+fn wcd_cas(i: usize, from: u32, to: u32) -> bool {
+    WCD_STATE[i]
+        .compare_exchange(
+            from,
+            to,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
+/// WC-D — a verdict was published: advance the window and publish the flags the rest of the module
+/// reads.
+///
+/// A FULL pass closes the battery whatever stage it arrived from, which is what makes a COLLAPSED
+/// lattice correct rather than merely tolerable: a rect narrower than the step is walked at full
+/// coverage (see [`verify_reference`]), so it earned the terminal state on its first pass and must
+/// not be re-verified later to say the same thing again.
+#[cfg(feature = "witness")]
+fn wcd_commit(i: usize, running: u32, step: usize) {
+    let bit = 1u32 << i;
+    VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    {
+        if step == 1 {
+            VERIFIED_FULL.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
+            WCD_STATE[i].store(WCD_ST_DONE, core::sync::atomic::Ordering::Release);
+        } else {
+            WCD_STATE[i].store(WCD_ST_FULL, core::sync::atomic::Ordering::Release);
+        }
+        let _ = running;
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    {
+        let _ = (running, step);
+        WCD_STATE[i].store(WCD_ST_DONE, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// WC-D — close this window with no further verdict owed, whatever stage asked. The `-> SKIP`
+/// GEOMETRY paths use it: a degenerate row is a property of the ROW, will still be degenerate at the
+/// deferred stage, and re-running it there would buy a duplicate SKIP line and nothing else.
+///
+/// The out-of-memory SKIP deliberately does NOT use it — an allocation failure is a property of one
+/// instant, not of the row.
+#[cfg(feature = "witness")]
+fn wcd_seal(i: usize) {
+    let bit = 1u32 << i;
+    VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    VERIFIED_FULL.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
+    WCD_STATE[i].store(WCD_ST_DONE, core::sync::atomic::Ordering::Release);
+}
+
+/// WC-D — hand the reference back with no verdict published and nothing counted.
+///
+/// The plain unwind, for the paths that decline a pass on a property of ONE PRESENT rather than of the
+/// row or of the panel: today the empty-band clip and the out-of-memory snapshot. Distinct from
+/// [`wcd_release`] only in that it is not arch-gated — every build has these paths, and only x86 has
+/// an interlock.
+#[cfg(feature = "witness")]
+fn wcd_unwind(i: usize, running: u32) {
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let resting = if running == WCD_ST_FULL_RUN { WCD_ST_FULL } else { WCD_ST_FIRST };
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    let resting = {
+        let _ = running;
+        WCD_ST_FIRST
+    };
+    WCD_STATE[i].store(resting, core::sync::atomic::Ordering::Release);
+}
+
+/// WC-D — hand this window's verdict back so a later composite can take it again.
+///
+/// Returns the window to the RESTING state its reference came from and publishes nothing, so a
+/// stage-2 abort cannot demote a window that already has a valid first verdict back to the cheap
+/// pass, and a stage-1 abort cannot release "nothing" by clearing a bit it never set. With one cell
+/// there is no pair to get out of step.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[inline]
+fn wcd_release(i: usize, running: u32) {
+    wcd_unwind(i, running);
 }
 
 /// WC-D/PAYGO — record a declined composite, and keep the window's census current on the wire.
@@ -3580,11 +3710,7 @@ fn wcd_claim_final(bit: u32) -> Option<u32> {
 /// A window that stops compositing stops refreshing, which is not a gap: its last line describes its
 /// last active state and `since_entry_ms=` says when that was.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
-fn wcd_decline(id: u32, since_ms: u64, clock: &'static str) {
-    let i = id as usize;
-    if i >= WCD_IDS {
-        return;
-    }
+fn wcd_decline(id: u32, i: usize, since_ms: u64, clock: &'static str) {
     WCD_DEFERRED[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if WCD_SAID[i].swap(1, core::sync::atomic::Ordering::AcqRel) == 0 {
         wcd_paygo_note(id, i, "waiting", "DEFERRED", since_ms, clock);
@@ -3620,9 +3746,11 @@ fn wcd_decline(id: u32, since_ms: u64, clock: &'static str) {
 /// closes both in one full-coverage verdict.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
 fn wcd_paygo_note(id: u32, i: usize, state: &str, verdict: &str, since_ms: u64, clock: &str) {
-    let bit = 1u32 << id;
-    let taken = (VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit != 0) as u32
-        + (VERIFIED_FULL.load(core::sync::atomic::Ordering::Relaxed) & bit != 0) as u32;
+    // `taken=` off the STATE cell, not off the published bitmasks. A recycle clears those between a
+    // claim and its print (slot 3 recycles seven times in the s73 capture, and a deferred stage-2
+    // straddles a recycle by construction), which is how a `-> PAID` could read `taken=0`. The state
+    // cell is reset by the same recycle, so it cannot disagree with itself.
+    let taken = wcd_taken(i);
     let emit = WCD_EMIT[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     serial_println!(
         "[wc-d] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} since_entry_ms={} clock={} taken={} budget=2 -> {}",
@@ -3645,11 +3773,7 @@ fn wcd_paygo_note(id: u32, i: usize, state: &str, verdict: &str, since_ms: u64, 
 /// `deferred=` census is read at the moment full coverage is claimed and not only at the moment the
 /// waiting began. `deferred=0` here says the gate never declined this window at all.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
-fn wcd_complete(id: u32) {
-    let i = id as usize;
-    if i >= WCD_IDS {
-        return;
-    }
+fn wcd_complete(id: u32, i: usize) {
     let (since_ms, clock, _) = super::wcg::paygo_clock();
     wcd_paygo_note(id, i, "complete", "PAID", since_ms, clock);
 }
@@ -6716,6 +6840,14 @@ fn stage_fill(
     color: u32,
     requeued: bool,
 ) -> bool {
+    // WCD-TEARDOWN — the desktop-colour fill bracket, here rather than in [`erase`]. The first cut
+    // guarded `erase` and called it "the one choke point"; it is not. This function has TWO callers
+    // that paint `DESKTOP_BG` onto the panel — `erase` and [`drain_deferred`] — and the deferred drain
+    // reaches glass without passing through `erase` at all, so the guard missed a whole writer the
+    // s73 capture shows firing in bulk. Guarding the fill is what makes the claim true rather than
+    // intended, and no future caller can opt out of it. See [`PANEL_FILL_EPOCH`].
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    let _panel = PanelWriteGuard::enter();
     // WC-L — the four decline reasons split by whether RETRYING can ever succeed, and the split is
     // load-bearing rather than tidy.
     //
@@ -7429,6 +7561,18 @@ fn create_inner(
         // rule breaks across a recycle.
         #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
         VERIFIED_FULL.fetch_and(!(1u32 << id), core::sync::atomic::Ordering::Relaxed);
+        // WC-D — the STATE cell is the one that actually re-arms the window; the two bitmasks above
+        // are published flags derived from it. Reset last, so no core can observe a cleared mask
+        // against a stale state.
+        WCD_STATE[id as usize].store(WCD_ST_FIRST, core::sync::atomic::Ordering::Release);
+        // WC-D/PAYGO — `WCD_SAID` travels with them. It is the "this window's census-opening line has
+        // been spoken" latch, and leaving it set would let a NEW tenant's first decline fall through
+        // to the 2 s cadence gate — silently breaking the guarantee `WCD_SAID`'s own note makes, that
+        // the first decline always speaks. The census totals (`WCD_DEFERRED`, `WCD_EMIT`) are NOT
+        // reset: `emit=` must stay monotone per id or the reader's "greatest `emit=` supersedes" rule
+        // breaks across a recycle.
+        #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+        WCD_SAID[id as usize].store(0, core::sync::atomic::Ordering::Relaxed);
         // WCD-TEARDOWN — `WCD_ABORTS` is deliberately NOT cleared here. Re-arming the latches hands
         // the new tenant a fresh verdict, which is right; re-arming the abort budget with it would
         // hand it fresh RETRIES, and this very function is one of the two unbarriered `erase` sites

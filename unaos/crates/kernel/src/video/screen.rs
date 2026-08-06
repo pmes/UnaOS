@@ -786,6 +786,19 @@ impl Screen {
             super::cursor::undraw();
         }
         let intruded = self.present_background();
+        // WCD-TEARDOWN — the desktop layer's end of `[wc-d]`'s panel-write interlock, and the only
+        // place in this module that knows it happened. An "intrusion" is `present_background`'s own
+        // word for "the window-box subtraction could not be applied, so background pixels landed
+        // INSIDE a window" — which is exactly the event that can put console black over a box a
+        // scan-out read-back is midway through verifying, and exactly what boot 8's `got=0x000000`
+        // (fbcon `BG_DEFAULT`, NOT `wm::DESKTOP_BG=0x002D2B55`) points at. Counted rather than
+        // bracketed because `false` is the normal answer: bracketing every present would make the
+        // interlock fire on every verdict and adjudicate nothing. See `wm::PANEL_INTRUSIONS` for the
+        // full ledger and for the span this counter does not cover.
+        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        if intruded {
+            super::wm::note_panel_intrusion();
+        }
         // CURSOR-13 — bracket CLOSED. Everything below composites with the arrow on the panel, which
         // is the whole point of that arc: `sprite_plan()` must be able to answer.
         if bracket {
