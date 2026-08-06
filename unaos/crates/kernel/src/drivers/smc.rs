@@ -361,14 +361,49 @@ fn read_txn(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
     read_key_inner(key, out)
 }
 
+/// STEP0-PRE: the status byte read immediately before the last command write (see
+/// `read_key_inner`). Reported by the DIAG so a step-0 stall can be attributed.
+static LAST_PRE_CMD_STATUS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// STEP0-STALL CENSUS. The DIAG is one-shot by design, so it reports the boot's FIRST wedge and
+/// says nothing about whether that wedge was a one-off or the first of hundreds — which is exactly
+/// the transient-vs-standing question a fix would have to turn on. Counting them costs no output
+/// (the total rides the existing retry-rollup line, which fires at most once per `RETRY_ROLLUP_MS`)
+/// and makes the distinction measurable across a whole boot.
+static STEP0_STALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn note_step0_stall() {
+    STEP0_STALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Step-0 stalls since boot (a command byte the SMC never acknowledged inside the budget).
+pub fn step0_stalls() -> u32 {
+    STEP0_STALLS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 fn read_key_inner(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
     // 0) settle any residue from a prior (interrupted) transaction so step-0 starts clean (M2
     //    idle-guard). No-op on an idle SMC — byte-identical on QEMU.
     settle_before_command();
 
     // 1) command byte -> expect NEW_CMD|ACK.
+    //
+    // STEP0-PRE (s73 wedge, 2026-08-06): latch the status the instant BEFORE the command write.
+    // The first real wedge the resurrected DIAG caught reported `stuck step 0` with the status
+    // flat at `0x48` — `0x40` idle-high | `0x08` = `ST_NEW_CMD`, with `ST_ACK` (0x04) missing, i.e.
+    // the controller had latched a command and never acknowledged it. That single byte does not say
+    // WHOSE command: it is equally consistent with
+    //   (a) we started clean and the SMC stalled on the command we just wrote, and
+    //   (b) `ST_NEW_CMD` was already asserted — residue from a prior incomplete transaction that
+    //       `settle_before_command` cannot see, because it only tests DATA_READY|BUSY.
+    // The two want opposite fixes, so the driver records the discriminator instead of guessing:
+    // `pre=` on the DIAG line reads `0x40` under (a) and `0x48` under (b).
+    LAST_PRE_CMD_STATUS.store(read_status(), core::sync::atomic::Ordering::Relaxed);
     write_cmd(CMD_READ);
-    wait_status(ST_AFTER_CMD, 0)?;
+    if let Err(e) = wait_status(ST_AFTER_CMD, 0) {
+        note_step0_stall();
+        return Err(e);
+    }
 
     // 2) four key-name bytes -> each acks.
     for &b in key.iter() {
@@ -445,12 +480,17 @@ fn dump_first_failure(key: &[u8; 4], err: SmcError) {
         poll_pause();
     }
     let name = core::str::from_utf8(&key[..]).unwrap_or("????");
+    // `pre=` is the status immediately before the command write (STEP0-PRE). On a `stuck step 0` it
+    // is the whole ballgame: `pre` idle means the SMC stalled on OUR command; `pre` already showing
+    // NEW_CMD means we wrote into residue the idle-guard does not detect. On any other step/kind it
+    // is merely the transaction's starting condition, still worth having.
     serial_println!(
-        ":: SMC-DIAG: FIRST FAILURE key {} kind {} step {} t={}ms — raw status timeline [{}] (16 reads, ~15us apart) == evidence ::",
+        ":: SMC-DIAG: FIRST FAILURE key {} kind {} step {} t={}ms pre={:#04x} — raw status timeline [{}] (16 reads, ~15us apart) == evidence ::",
         name,
         kind,
         step,
         crate::arch::ms(),
+        LAST_PRE_CMD_STATUS.load(Ordering::Relaxed),
         fmt_hex(&samples)
     );
 }
@@ -1320,11 +1360,17 @@ pub mod battery {
                 let window = now.wrapping_sub(*rolled_ms);
                 *rolled = rtotal;
                 *rolled_ms = now;
+                // STEP0-STALL CENSUS rides here rather than on its own line: a step-0 stall is a
+                // command byte the SMC never acknowledged, and after the s73 wedge the open
+                // question is its RATE, not its existence. `stalls=` climbing across rollups means
+                // standing; one early stall and a flat count thereafter means transient — the
+                // distinction the one-shot DIAG structurally cannot draw.
                 serial_println!(
-                    ":: SMC-BATT: retry rollup — {} retries in the last {} ms (total {}) == rollup ::",
+                    ":: SMC-BATT: retry rollup — {} retries in the last {} ms (total {}, step0-stalls {}) == rollup ::",
                     unseen,
                     window,
-                    rtotal
+                    rtotal,
+                    super::step0_stalls()
                 );
             }
         }

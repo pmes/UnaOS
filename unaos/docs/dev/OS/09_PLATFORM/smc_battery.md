@@ -639,3 +639,117 @@ QEMU has no battery keys and cannot exercise this; the gates prove compilation a
    corroborating re-read) — a real fault finally able to reach the instrument. The s73 boot-1 sweep
    drop-out (`retries=11/11` at 3350 ms) makes that a live possibility, and it is now the *desired*
    outcome: the DIAG reporting the thing it was built for instead of the thing it was buried under.
+
+## The instrument fired on its first metal boot — the B0AV step-0 stall (s73, 2026-08-06)
+
+The predictions above were checked against the next `UNAOS_SMC=1` boot. **All eight held**, and
+prediction 8 — the falsifier, the one that mattered — is the reason this section exists:
+
+```
+:: SMC-DIAG: FIRST FAILURE key B0AV kind stuck step 0 t=3497ms —
+   raw status timeline [48 48 48 48 48 48 48 48 48 48 48 48 48 48 48 48]
+   (16 reads, ~15us apart) == evidence ::
+```
+
+Confirmed the same boot: no `AC-W` `FIRST FAILURE`; `pre-touch … raw status=0x40`; `key AC-W absent
+(x2)`; `probed=19 found=17` (so **`B0Pr` is absent on this machine** — the sweep's presence key does
+not exist here, and `present` falls back to "did any of soc/volt/rem answer"); no `STOP-NOTE mass
+absence`; the `AC-W is absent …` line exactly once; and **zero `ac=stuck`** across 54 witness lines,
+which is the finding-3 fix holding on silicon.
+
+### Decoding `0x48`
+
+| Bit | Name | Set? |
+|---|---|---|
+| `0x40` | this machine's idle-high bit (see `pre-touch raw status=0x40`) | yes |
+| `0x08` | `ST_NEW_CMD` | **yes** |
+| `0x04` | `ST_ACK` | **no** |
+| `0x02` | `ST_BUSY` | no |
+| `0x01` | `ST_DATA_READY` | no |
+
+`0x48 & ST_MASK` = `0x08`. Step 0 waits for `ST_AFTER_CMD` = `NEW_CMD|ACK` = `0x0c`. So the
+controller **latched a command and never acknowledged it** — a half-open command handshake. This is
+not a dead bus (`0xff`), not idle (`0x40`), not busy. It is the SMC mid-conversation and not
+answering, and it held that state for the full ~0.1 s budget *plus* the 16 sample reads.
+
+Note what this decode does **not** settle: whose command. `NEW_CMD` asserted is equally consistent
+with *we started clean and the SMC stalled on the command we just wrote* and with *`NEW_CMD` was
+already set from a prior incomplete transaction*. The second would be a real hole in
+`settle_before_command`, which tests only `DATA_READY|BUSY` and is therefore **blind to command-phase
+residue**. The two want opposite fixes, so this arc adds the discriminator rather than guessing —
+see *What changed* below.
+
+### Verdict: a real fault, transient, fully recovered — and NOT made expected
+
+The wedge is genuine and the DIAG was right to spend its shot on it. But it is a blip, not a standing
+condition, and nothing about it is specific to `B0AV`:
+
+* **`B0AV` recovered completely.** Across the boot it read **48 good voltages against 6 holes**
+  (12796–12805 mV), the first good one 7 s later. The key is fine.
+* **The sweep did not degrade.** `present=true` throughout; `soc=100%`, `full=9962mAh`,
+  `rem=9962mAh` all continued. The wedged sweep produced `volt=-` and `soc=-` and BATMON-HOLD did
+  its job. `retries` ran 1–8 per sweep, the same rate as every prior boot.
+* **`B0AV` is incidental.** In the same sweep `BRSC` also failed — but with *short reads*
+  (`Ok(1)`, the GAP-1 truncation signature, which `read_u16k` rejects and retries without ever
+  producing a `Stuck`), so it never reached the DIAG. `B0AV` simply drew the first `Stuck`.
+
+**`B0AV` is therefore NOT marked expected-anything, and must not be.** A wedge is a fault; that is
+the whole distinction this arc drew against `AC-W`, whose absence was a *successful negative answer*.
+Suppressing a wedge class to protect the latch would be the AC-W mistake with the sign flipped.
+
+### The correlation worth recording
+
+The stall lands inside the **kepler takeover / compositor-ignition window**. Reconstructing from the
+serial clock (a constant 354 ms offset from `arch::ms()` on every other DIAG line this capture), the
+sweep spans roughly the same interval as `kdisp: fb-draw`, `fbcon: glyphs-active`, `[wc-x]
+desktop-clear`, the first `[wc-g]` window checksum — including a **`readback_us=102476`**, a 102 ms
+uncached framebuffer read-back — and `[wc-x] activate`.
+
+A coherent mechanism exists: the SMC sits behind the LPC bridge, and sustained uncached MMIO traffic
+can delay an LPC completion past our 0.1 s budget, which would present as exactly this — command
+latched, `ACK` late. **It is a correlation, not a demonstrated cause**, and per the standing law it
+stays labelled that way until a controlled experiment separates them. The falsifiable form is cheap:
+if the mechanism is real, step-0 stalls cluster in the takeover window and are rare after it.
+
+### What changed — instrumentation only, and why no fix
+
+**No behavioural change was made, deliberately.** The evidence base is *one wedge on one boot*, and
+the driver's existing handling is already correct at every step: the wait was bounded, never forced;
+the retry budget re-tried it; the failure became an honest hole rather than a fabricated value;
+BATMON-HOLD kept the last good reading; and the key recovered on its own. Changing retry policy off
+`n=1` is how this codebase has repeatedly acquired instruments that encode one boot's accident.
+
+The timing does suggest the retries after a step-0 stall may be partly wasted (the witness printed
+~14 ms after the DIAG, far too soon for two more full 0.1 s budgets — so attempts 2 and 3 evidently
+got *past* step 0 and failed as short reads instead). That is an inference from timestamps with a
+serial-latency wobble in it, and it is precisely what the new counter is there to settle. Two
+additions, both read-only, no new periodic output:
+
+* **`pre=0xNN` on the DIAG line** — the status latched immediately before the command write. On a
+  `stuck step 0` this is decisive: `pre=0x40` means the SMC stalled on *our* command (fix the wait
+  or accept the blip); `pre=0x48` means we wrote into command-phase residue and
+  `settle_before_command` needs to cover `NEW_CMD`, not just `DATA_READY|BUSY`.
+* **`step0-stalls` on the existing retry-rollup line** — the DIAG is one-shot by design, so it can
+  report the boot's first wedge and nothing about whether it was one of one or one of hundreds. That
+  rate is the transient-vs-standing question, and the one-shot structurally cannot answer it. The
+  census rides a line that already fires at most once per `RETRY_ROLLUP_MS`.
+
+`retries=` and the witness format are otherwise untouched, and the corroborating re-read and `TXN`
+lock are unaffected by this failure mode: the re-read only guards `Absent`-of-`Present` (this was
+`Stuck`), and the stall is a protocol-level stall rather than an interleave. `TXN` does mean a
+wedged sweep holds the lock for its duration, so a concurrent `batmon` verb waits rather than
+corrupting the transaction — bounded, and the intended trade.
+
+### Metal prediction (next `UNAOS_SMC=1` boot)
+
+1. `:: SMC-DIAG: FIRST FAILURE …` carries a `pre=` field. If a step-0 stall recurs, `pre` reads
+   **`0x40`** (SMC-side stall on our command) or **`0x48`** (command-phase residue — then
+   `settle_before_command` has a real hole and gets extended to wait out `NEW_CMD`).
+2. `:: SMC-BATT: retry rollup — … (total N, step0-stalls S) ::` appears at the 300 s mark. **`S`
+   small and flat** (1–3, not growing between rollups) confirms transient and closes this; `S`
+   climbing with each rollup means standing, and the takeover-window correlation becomes a
+   controlled experiment worth running.
+3. The wedged key need **not** be `B0AV` again — the claim is that the identity is incidental. A
+   different key wedging is a *confirmation*, not a new finding.
+4. Everything else unchanged: `probed=19 found=17`, `B0Pr` and `AC-W` absent `(x2)`, no `ac=stuck`,
+   no mass-absence STOP-NOTE, `present=true` with volt tracking ~12.8 V.
