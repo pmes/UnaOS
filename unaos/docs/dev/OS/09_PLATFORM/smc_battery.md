@@ -1091,3 +1091,39 @@ with "no residue". The two are opposite facts and the log cannot yet separate th
 residue are different mechanisms" is a hypothesis, not a finding. It remains a *good* hypothesis: a
 short read that stops one byte early leaves one byte, and a single leftover byte is exactly what a
 settle drain would clear silently and instantly.
+
+## Boot U: GAP 1 CLOSED on metal (s73, 2026-08-06, kernel `3477640c` from `7814d258`)
+
+One boot, every prediction from the table above answered, all in the fix's favor:
+
+```
+:: SMC-SCOUT: key REV  present len=6 bytes=[02 03 0f 00 00 36] ::
+:: SMC-SCOUT: key OSK0 present len=32 bytes=[6f 75 …] ::
+:: SMC-SCOUT: key BRSC present len=2 bytes=[00 60] ::
+:: SMC-BATT: present=true soc=96% volt=12353mV amp=-2525mA full=9962mAh rem=9571mAh
+   ac=derived:discharging retries=0/0 st0=0 rfail=0 rok=1 short=0 unc=0 gap=39 busy=0 == witness ::
+```
+
+1. **The scout lines got longer — the headline held.** `BRSC len=2 [00 60]` (0x60 = 96, equal to the
+   live `soc=96%`; the table's `[00 64]` was written when the pack read 100%). `REV` reads its full
+   **6 bytes** — the QEMU model's length, now confirmed on silicon. `OSK0` reads **32 bytes whole**.
+   The `len=1` census: **2 of 24 scout reads**, and both (`BNum`, `BSIn`) are genuinely one-byte
+   keys. From 69-of-102-truncated to zero-truncated in one boot.
+2. **`gap=39` with `busy=0` — the complete story, confirmed.** `gap_wait` recovered 39 bytes the old
+   drain would have dropped, and `ST_BUSY` was never once observed set. The SMC never raises BUSY on
+   this machine; the old loop broke in every inter-byte gap it met. **The 2026-07-17
+   `wait_busy_clear` fix is hereby proven vacuous on this hardware — it has been a no-op since it
+   landed**, exactly as the `busy=` census was built to decide.
+3. **The B0AV wedge is gone without ever being addressed directly.** No `FIRST FAILURE` of any kind,
+   `st0=0 rfail=0`. The causal claim — fix the truncation and the wedge starves — is confirmed.
+4. **`unc=0`** — closing works, promptly. `rok=1`: exactly one settle started dirty and was rescued,
+   so residue was seen, cleared, and *counted* this time.
+5. **`retries=0/0`** against the pre-fix sit's cumulative ≈0.58 retries per key read.
+
+Boot health around it: `gui=3408ms` (T/T2 band: 3407/3410 — no regression), `kepler=1522ms`,
+`sched d=67ms`, `ehci-hid-done d=1450ms`, zero new FAIL/TRIPWIRE lines (the kepler `ucode-echo` and
+sdhc `cmd8` prints predate this boot in the same capture).
+
+Status: **n=1** on the fix build. The standing sit accumulates the rest: `gap` should climb,
+`retries`/`short`/`busy` should hold at ~0 across hours. `GET_KEY_INFO 0x13` stays unissued — the
+falsifier door it guarded never opened.
