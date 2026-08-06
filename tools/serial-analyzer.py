@@ -481,8 +481,9 @@ PAYGO_RE = re.compile(
     r'^\[(wc-g|wc-d)\] paygo win=(\d+) state=(\w+) emit=(\d+) lattice_n=(\d+) deferred=(\d+) '
     r'defer_ms=(\d+) since_entry_ms=(\d+) clock=(\w+) taken=(\d+) budget=(\d+) -> (\w+)\b')
 # ANCHORED TO A REAL TERMINAL, and this was a defect rather than a tightening. The first cut
-# was `^\[wc-d\] verify win=(\d+)\b`, which matches EVERY wc-d line including its five SKIP
-# arms, and that broke the census in two directions at once:
+# was `^\[wc-d\] verify win=(\d+)\b`, which matches EVERY wc-d line including all four of its
+# SKIP arms (wm.rs:2917 teardown, :3141 degenerate row/geometry, :3149 no visible content rect,
+# :3197 no memory for the source snapshot), and that broke the census in two directions at once:
 #
 #   * an ABORTED verdict counted as a pass. `-> SKIP (teardown)` carries a `coverage=` marker
 #     (it is emitted from the same field list), so a teardown abort at full coverage was
@@ -498,7 +499,16 @@ PAYGO_RE = re.compile(
 # their own column, because "the verify declined to run" is a third thing and folding it into
 # either of the other two is how the check above went quietly wrong.
 WCD_VERIFY_RE = re.compile(r'^\[wc-d\] verify win=(\d+)\b.*-> (?:PASS|FAIL|LIVE)\b')
-WCD_SKIP_RE = re.compile(r'^\[wc-d\] verify win=(\d+)\b.*-> SKIP \(([a-z][a-z /]*)')
+# The reason is taken to the CLOSING PAREN, then digit runs are folded to `N`. Both halves are
+# needed for the census key to be stable AND readable. A character-class cut stops at the first
+# character it does not list, which on the OOM arm ("no memory for {}x{} source snapshot") lands
+# mid-phrase and keys the bucket as "no memory for" -- an entry that reads like a truncation
+# bug. Capturing to the paren fixes the readability but not the stability: the geometry is
+# interpolated, so `128x128` and `8x8` would open two buckets for one reason. Folding the digits
+# gives one key, "no memory for NxN source snapshot", whatever the surface was -- and it keeps
+# working for any future arm that interpolates a number.
+WCD_SKIP_RE = re.compile(r'^\[wc-d\] verify win=(\d+)\b.*-> SKIP \(([^)]*)\)')
+WCD_SKIP_NUM_RE = re.compile(r'\d+')
 # `coverage=` is an INSERTION on a sample line. Absent on any build without the knob, which
 # is a different thing from `coverage=full` and is counted apart: an unmarked pass says
 # nothing about what it covered.
@@ -557,7 +567,7 @@ def paygo_stats(chunk, tag='wc-g'):
                 # the pass columns did to the honesty check.
                 w = win(m.group(1))
                 w['skips'] += 1
-                reason = m.group(2).strip()
+                reason = WCD_SKIP_NUM_RE.sub('N', m.group(2).strip())
                 w['skip_reasons'][reason] = w['skip_reasons'].get(reason, 0) + 1
                 continue
         m = sample_re.match(body)
@@ -1333,6 +1343,8 @@ WCD_FIXTURE_ABORT = """\
 [   8990ms] [wc-d] verify win=4 surf=128x128 band=none scale=6x at (9,21) panel=2880x1800 checked=36864 coverage=full bad_cache=0 bad_ram=0 ram_indep=no moved=12 nonzero=36864 cksum=0x1122334455667788 first=(9,21) got=0x000000 want=0x1e1e1e rect=768x768+9+21 fills=15->17 fact=0/1 desk=3->4 dact=0/0 aborts=7/6 retry=no -> SKIP (teardown)
 [   9000ms] [wc-d] paygo win=4 state=sealed emit=2 lattice_n=16 deferred=2 defer_ms=15000 since_entry_ms=9000 clock=entry taken=1 budget=2 -> UNPAID
 [   9100ms] [wc-d] verify win=5 -> SKIP (degenerate row/geometry)
+[   9200ms] [wc-d] verify win=6 -> SKIP (no memory for 128x128 source snapshot)
+[   9300ms] [wc-d] verify win=6 -> SKIP (no memory for 8x8 source snapshot)
 """
 
 
@@ -1363,6 +1375,13 @@ def paygo_expect_abort(pg):
         ('win5 declined verifies', w5['skips'], 1),
         ('win5 skip reasons', w5['skip_reasons'], {'degenerate row/geometry': 1}),
         ('win5 WARN', w5['warn'], False),
+        # The OOM arm interpolates the surface geometry. Two skips at DIFFERENT sizes must
+        # fold to ONE census key: a character-class cut keyed this "no memory for" (reads like
+        # a truncation bug) and a paren cut alone would open a bucket per geometry.
+        ('win6 declined verifies', paygo_window(pg, '6')['skips'], 2),
+        ('win6 skip reasons (geometry folded to one key)',
+         paygo_window(pg, '6')['skip_reasons'],
+         {'no memory for NxN source snapshot': 2}),
         ('windows warned', [w['id'] for w in pg['wins'] if w['warn']], ['4']),
     ]
 
@@ -1670,8 +1689,22 @@ def selftest(top):
     with contextlib.redirect_stdout(_buf):
         wcg_report('<report-path fixture>', WCD_FIXTURE_ABORT, None)
     _out = _buf.getvalue()
-    wired = [(f"--wcg report carries the [{t}] census", f"paygo battery [{t}]" in _out
-              or f"paygo [{t}]: no" in _out) for t in PAYGO_TAGS]
+    # ASSERTED PER TAG, not "either shape appeared". An `A or B` test passes when a boot WITH
+    # data is routed down the absence path -- which is a regression that silently deletes a
+    # census, i.e. exactly the class of bug this case was added to catch. The fixture's content
+    # is known, so the expectation is known: WCD_FIXTURE_ABORT carries wc-d paygo lines and no
+    # wc-g ones, so wc-d MUST print a battery table and wc-g MUST print the absence notice --
+    # and each must NOT print the other's.
+    wired = [
+        ("--wcg prints the [wc-d] battery table (fixture has wc-d data)",
+         "paygo battery [wc-d]" in _out),
+        ("--wcg does NOT route [wc-d] to the absence path",
+         "paygo [wc-d]: no" not in _out),
+        ("--wcg prints the [wc-g] absence notice (fixture has no wc-g data)",
+         "paygo [wc-g]: no" in _out),
+        ("--wcg does NOT invent a [wc-g] battery table",
+         "paygo battery [wc-g]" not in _out),
+    ]
     wired_ok = all(good for _, good in wired)
     if not wired_ok:
         ok = False
