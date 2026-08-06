@@ -3280,29 +3280,41 @@ impl XhciController {
                                         let vid = (desc_data[8] as u16) | ((desc_data[9] as u16) << 8);
                                     let pid = (desc_data[10] as u16) | ((desc_data[11] as u16) << 8);
 
-                                    serial_println!(">>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<");
-                                    serial_println!(">>> [CONTACT ESTABLISHED] SLOT {}", slot_id);
-                                    serial_println!(">>> VENDOR ID : [{:04x}]", vid);
-                                    serial_println!(">>> PRODUCT ID: [{:04x}]", pid);
-
-                                    // U2.5: persist idVendor/idProduct on the slot — but ONLY from a
-                                    // DEVICE descriptor (bDescriptorType 0x01). This same block also
-                                    // handles config-descriptor events, where desc_data[8..12] are
-                                    // interface/endpoint bytes, not vid/pid; guarding here keeps the
-                                    // FTDI's real 0403:6001 from being clobbered. The FT232's
-                                    // vendor-specific interface later keys on these to identify itself.
+                                    // U2.5: idVendor/idProduct are real ONLY in a DEVICE descriptor
+                                    // (bDescriptorType 0x01). This same block also handles
+                                    // config-descriptor events, where desc_data[8..12] are
+                                    // bMaxPower/interface bytes — a prior arc guarded the slot
+                                    // STATE here (keeping the FTDI's real 0403:6001 from being
+                                    // clobbered) but left the BANNER unguarded, so every device
+                                    // printed one true VID:PID and one fabricated pair per boot
+                                    // (the tell: "PID" 0004 with "VID" high byte 09 = a config
+                                    // descriptor misread; convicted byte-by-byte in bootpace §8g's
+                                    // follow-up). The banner and the class-code line now sit under
+                                    // the same guard: a config event prints its own honest line.
                                     if desc_data[1] == 0x01 {
+                                        serial_println!(">>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<");
+                                        serial_println!(">>> [CONTACT ESTABLISHED] SLOT {}", slot_id);
+                                        serial_println!(">>> VENDOR ID : [{:04x}]", vid);
+                                        serial_println!(">>> PRODUCT ID: [{:04x}]", pid);
                                         self.slots[slot_id as usize].vid = vid;
                                         self.slots[slot_id as usize].pid = pid;
+                                    } else {
+                                        serial_println!(
+                                            "xHCI: descriptor event slot {} type={:#04x} (not a device descriptor; no VID/PID banner)",
+                                            slot_id, desc_data[1]
+                                        );
                                     }
 
-                                    // UNA-22-HAUL: Inspect Class Code
+                                    // UNA-22-HAUL: Inspect Class Code — device-descriptor fields;
+                                    // meaningless on a config event, guarded for the same reason.
                                     let class_code = desc_data[4];
                                     let subclass = desc_data[5];
                                     let protocol = desc_data[6];
 
-                                    serial_println!("xHCI: Device Found. Class={:#x} Sub={:#x} Proto={:#x}",
-                                        class_code, subclass, protocol);
+                                    if desc_data[1] == 0x01 {
+                                        serial_println!("xHCI: Device Found. Class={:#x} Sub={:#x} Proto={:#x}",
+                                            class_code, subclass, protocol);
+                                    }
 
                                     if class_code == 0x08 { // 0x08 = Mass Storage (device-level)
                                         serial_println!("xHCI: >>> CARGO DETECTED (MASS STORAGE) <<<");
