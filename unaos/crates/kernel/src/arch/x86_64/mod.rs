@@ -34,6 +34,10 @@ pub fn init() {
     // U1a: SYSCALL/SYSRET MSRs + NX/SMEP for the BSP. After gdt (STAR needs the selectors) and
     // percpu (GS base + KERNEL_GS_BASE); before `sti`.
     syscall::init();
+    // WXAUDIT: audit the live map now that EFER.NXE and CR4.SMEP are set — before this point an NX
+    // bit in a PTE means nothing to the hardware, so an audit here would be reporting on a protection
+    // that is not yet armed. Read-only walk; publishes the negative control and the map's W^X census.
+    memory::wx_audit_report();
     x86_64::instructions::interrupts::enable();
 }
 

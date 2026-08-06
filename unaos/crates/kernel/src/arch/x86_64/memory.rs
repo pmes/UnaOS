@@ -16,7 +16,7 @@
 
 
 use alloc::alloc::{alloc_zeroed, Layout};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use unaos_boot_info::{BootInfo, MemoryRegion, MemoryRegionKind};
 
 /// The UEFI memory map (as converted by the bootloader), published once at `init` so later
@@ -281,6 +281,15 @@ unsafe fn next_table(entry: *mut u64) -> *mut u64 {
 /// as requested. Asserts the leaf was previously empty (caller must `translate` it first). NX
 /// requires EFER.NXE, enabled in `syscall::init` before any mapping.
 pub unsafe fn map_user_page(va: u64, phys: u64, writable: bool, nx: bool) {
+    // WXAUDIT: the W^X gate on the ONE ring-3 mapping seam that lacked it. `protect_user_slot_range`
+    // already refuses a W+X segment and `map_slot_fb_page`/`build_slot` mint constant shapes, but this
+    // helper takes `writable` and `nx` as INDEPENDENT arguments, so nothing stopped a future caller from
+    // asking for a ring-3 page that is both writable and executable. Fail-closed at the seam, matching
+    // `protect_user_slot_range`'s assert — a W+X user page is a kernel bug, never bad input.
+    assert!(
+        !(writable && !nx),
+        "WXAUDIT: W^X — a ring-3 page may not be both writable and executable"
+    );
     let pdpt = next_table(cr3_table().add(pml4_index(va)));
     let pd = next_table(pdpt.add(pdpt_index(va)));
     let pt = next_table(pd.add(pd_index(va)));
@@ -726,6 +735,11 @@ pub fn alloc_user_space() -> Option<usize> {
             .is_ok()
         {
             unsafe { build_slot(s) };
+            // WXAUDIT: verify the window we just built against the LIVE table bytes before the slot can
+            // be dispatched. `build_slot` writes constants that are correct today; this checks what is
+            // actually in the PT, so a future edit that makes a user page W+X fails here — at the
+            // allocation that would have handed it to ring 3 — instead of silently shipping.
+            wx_check_slot(s);
             return Some(s);
         }
     }
@@ -815,6 +829,319 @@ pub fn probe_isolation(
     // Review fold (M6d): distinct-value assert — identical reads mean the windows aliased.
     debug_assert!(a_val != b_val, "U3: isolation probe read identical values — windows not isolated");
     (a_val, b_val, a_val == sent_a && b_val == sent_b)
+}
+
+// =================================================================================================
+// WXAUDIT — the x86_64 W^X map audit. The twin of the aarch64 H1/M6c audit table in
+// `docs/SECURITY.md`, which x86 has never had: the x86 ledger's "W^X audit of kernel mappings (no
+// page both writable and executable)" box has been open since U1a.
+// -------------------------------------------------------------------------------------------------
+// WHAT IT MEASURES, AND WHY LEAF BITS ALONE WOULD BE WRONG. On x86-64 a page's effective permission
+// is not its leaf entry — it is the FOLD of every entry on the PML4→PDPT→PD→PT path:
+//   * ring-3 reachable  = AND of U/S over the path (one supervisor parent hides the whole subtree);
+//   * writable          = AND of W over the path;
+//   * executable        = NOT (OR of NX over the path)  — NX anywhere above vetoes execution.
+// A checker that read only the leaf would BOTH miss violations (a W leaf under a non-U parent is not
+// really user-reachable — a false positive) and manufacture them. `wx_fold` is that accumulation,
+// and it is a pure function precisely so the negative control below can drive it.
+//
+// THE VACUITY LEG (the reason this is not a decorative counter). Every NX conclusion above is void
+// unless EFER.NXE is actually set — with NXE=0 the hardware IGNORES bit 63 and every present page is
+// executable, so a report of "0 W^X violations" computed from NX bits would be a lie. The audit
+// therefore READS EFER.NXE and, when it is clear, classifies with NX disregarded (every writable page
+// counts as W∧X) and says so on the line. The audit cannot report a clean map on a kernel whose NX is
+// not armed.
+//
+// SCOPE. Read-only: it walks the live tables and writes nothing. It is not WXN/`CR0.WP` enforcement —
+// the kernel's own coarse RWX identity RAM (the aarch64 H1 finding, and, as the boot line now shows,
+// the x86 finding too) is REPORTED, not fixed; splitting the kernel identity map into RO-executable
+// text and NX data is a separate, review-gated arc. What IS enforced here is the ring-3 half, which is
+// where the security boundary actually lives: `wx_check_slot` refuses to hand out an address space
+// whose user window contains a W∧X page, and `map_user_page`'s gate refuses to mint one.
+// =================================================================================================
+
+/// Outcome of a W^X walk. All counts are of PRESENT leaves (4 KiB / 2 MiB / 1 GiB), classified by the
+/// FOLDED path permission, never by the leaf entry alone.
+#[derive(Clone, Copy, Default)]
+pub struct WxAudit {
+    /// Present leaves visited.
+    pub leaves: u32,
+    /// Leaves reachable from ring 3 (U/S set at every level).
+    pub user_leaves: u32,
+    /// Ring-3-reachable leaves that are BOTH writable and executable. **Must be 0** — this is the
+    /// invariant the ledger's "user code page W^X enforced across cores" claim rests on.
+    pub user_wx: u32,
+    /// Supervisor-only leaves that are both writable and executable (the kernel's coarse identity RAM).
+    /// Reported, not asserted: the kernel executes from it, so this is the H1 refactor's debt, not a bug.
+    pub kern_wx: u32,
+    /// Bytes covered by `kern_wx` leaves.
+    pub kern_wx_bytes: u64,
+    /// Page-table pages read during the walk (the walk's cost, made visible rather than assumed).
+    pub tables: u32,
+    /// True if the table budget was exhausted — the counts are then a LOWER BOUND and the audit
+    /// must not be read as a clean bill of health.
+    pub truncated: bool,
+    /// EFER.NXE as read at audit time. When false, NX was disregarded in the classification above.
+    pub nxe: bool,
+}
+
+/// Fold one page-table entry into the running `(user, writable, nx)` effective triple.
+/// Pure — the negative control drives this directly.
+#[inline]
+fn wx_fold(acc: (bool, bool, bool), e: u64) -> (bool, bool, bool) {
+    (
+        acc.0 && (e & PTE_USER != 0),
+        acc.1 && (e & PTE_WRITABLE != 0),
+        acc.2 || (e & PTE_NX != 0),
+    )
+}
+
+/// True iff a folded triple describes a page that is simultaneously writable and executable.
+/// `nx_honoured` is EFER.NXE: with NX disabled the hardware ignores bit 63, so EVERY writable page is
+/// executable and the NX term drops out. Pure — the negative control drives this directly.
+#[inline]
+fn wx_violates(acc: (bool, bool, bool), nx_honoured: bool) -> bool {
+    acc.1 && !(nx_honoured && acc.2)
+}
+
+/// The identity accumulator a walk starts from: reachable, writable, not-NX — every restriction must
+/// be earned from an actual entry on the path.
+const WX_TOP: (bool, bool, bool) = (true, true, false);
+
+/// Read EFER.NXE (bit 11 of IA32_EFER). The audit's honesty hinges on this.
+fn efer_nxe() -> bool {
+    const IA32_EFER: u32 = 0xC000_0080;
+    const EFER_NXE: u64 = 1 << 11;
+    // SAFETY: reading IA32_EFER is a pure ring-0 MSR read with no side effects.
+    unsafe { x86_64::registers::model_specific::Msr::new(IA32_EFER).read() & EFER_NXE != 0 }
+}
+
+impl WxAudit {
+    /// Classify one present leaf of `size` bytes under the folded permission `acc`.
+    fn record(&mut self, acc: (bool, bool, bool), size: u64, nxe: bool) {
+        self.leaves += 1;
+        if acc.0 {
+            self.user_leaves += 1;
+        }
+        if wx_violates(acc, nxe) {
+            if acc.0 {
+                self.user_wx += 1;
+            } else {
+                self.kern_wx += 1;
+                self.kern_wx_bytes += size;
+            }
+        }
+    }
+}
+
+/// Walk the 4-level hierarchy rooted at physical `root` (identity-mapped, so it is directly
+/// addressable) and classify every present leaf. Honors 1 GiB / 2 MiB huge leaves. Read-only.
+///
+/// `TABLE_BUDGET` bounds the walk so a pathological map cannot stall boot; exhausting it sets
+/// `truncated`, which the report prints — a truncated audit is explicitly NOT a pass.
+pub fn wx_audit_root(root: u64) -> WxAudit {
+    const TABLE_BUDGET: u32 = 4096;
+    let nxe = efer_nxe();
+    let mut a = WxAudit { nxe, ..Default::default() };
+    let pml4 = root as *const u64;
+    a.tables = 1;
+    'walk: for i in 0..512 {
+        // SAFETY: every page-table frame is identity-mapped, so `root` and each child physical
+        // address below are directly readable at ring 0. Reads only.
+        let e4 = unsafe { *pml4.add(i) };
+        if e4 & PTE_PRESENT == 0 {
+            continue;
+        }
+        let acc4 = wx_fold(WX_TOP, e4);
+        if a.tables >= TABLE_BUDGET {
+            a.truncated = true;
+            break 'walk;
+        }
+        a.tables += 1;
+        let pdpt = (e4 & PTE_ADDR) as *const u64;
+        for j in 0..512 {
+            let e3 = unsafe { *pdpt.add(j) };
+            if e3 & PTE_PRESENT == 0 {
+                continue;
+            }
+            let acc3 = wx_fold(acc4, e3);
+            if e3 & PTE_HUGE != 0 {
+                a.record(acc3, 1 << 30, nxe); // 1 GiB leaf
+                continue;
+            }
+            if a.tables >= TABLE_BUDGET {
+                a.truncated = true;
+                break 'walk;
+            }
+            a.tables += 1;
+            let pd = (e3 & PTE_ADDR) as *const u64;
+            for k in 0..512 {
+                let e2 = unsafe { *pd.add(k) };
+                if e2 & PTE_PRESENT == 0 {
+                    continue;
+                }
+                let acc2 = wx_fold(acc3, e2);
+                if e2 & PTE_HUGE != 0 {
+                    a.record(acc2, 1 << 21, nxe); // 2 MiB leaf
+                    continue;
+                }
+                if a.tables >= TABLE_BUDGET {
+                    a.truncated = true;
+                    break 'walk;
+                }
+                a.tables += 1;
+                let pt = (e2 & PTE_ADDR) as *const u64;
+                for l in 0..512 {
+                    let e1 = unsafe { *pt.add(l) };
+                    if e1 & PTE_PRESENT == 0 {
+                        continue;
+                    }
+                    a.record(wx_fold(acc2, e1), 1 << 12, nxe); // 4 KiB leaf
+                }
+            }
+        }
+    }
+    a
+}
+
+/// **WXAUDIT-0 — the negative control.** An audit that only ever prints `user_WX=0` proves nothing:
+/// a classifier hard-wired to say "clean" would print the same line. This drives the two pure
+/// functions the whole audit rests on with hand-built entries and demands all four verdicts:
+///
+///   1. a ring-3 W+X leaf under permissive parents **is** flagged (the instrument can fire at all);
+///   2. the real U1b B4 code-page shape (USER, read-only, executable) is **not** flagged (no false
+///      positive — otherwise the audit would fail every boot and be switched off);
+///   3. an NX parent vetoes an executable leaf (the OR-accumulation leg — a leaf-only checker fails this);
+///   4. with NXE clear, that same NX-protected page **is** flagged (the vacuity leg — proof the audit
+///      really does void its NX conclusions when the hardware is ignoring bit 63).
+///
+/// Returns true iff all four hold.
+pub fn wx_selftest() -> bool {
+    // Permissive intermediate: PRESENT|WRITABLE|USER — exactly what `build_slot` writes.
+    let inter = PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+    let path = |leaf: u64| {
+        wx_fold(wx_fold(wx_fold(wx_fold(WX_TOP, inter), inter), inter), leaf)
+    };
+
+    // 1. the shape the audit exists to catch: ring-3, writable, executable.
+    let bad = path(PTE_PRESENT | PTE_USER | PTE_WRITABLE);
+    let fires = bad.0 && wx_violates(bad, true);
+
+    // 2. the real code page: ring-3, read-only, executable. Must stay clean.
+    let code = path(PTE_PRESENT | PTE_USER);
+    let no_false_positive = code.0 && !wx_violates(code, true);
+
+    // 3. NX on a PARENT must make a writable+executable-looking leaf non-executable.
+    let veto = wx_fold(wx_fold(WX_TOP, inter | PTE_NX), PTE_PRESENT | PTE_USER | PTE_WRITABLE);
+    let parent_nx_vetoes = !wx_violates(veto, true);
+
+    // 4. ...but only while the hardware honours NX. With NXE clear the same page is W∧X again.
+    let vacuity = wx_violates(veto, false);
+
+    fires && no_false_positive && parent_nx_vetoes && vacuity
+}
+
+/// Number of ring-3 address spaces `wx_check_slot` has cleared, and a one-shot latch for the armed
+/// line (slot builds recur for every spawned child; the ASSERT runs every time, the line does not).
+static WX_SLOTS_CHECKED: AtomicU32 = AtomicU32::new(0);
+static WX_SLOT_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Audit slot `s`'s ring-3 window and refuse to hand it out if any page is both writable and
+/// executable. Walks the slot's OWN user branch (`SLOT_PML4[2]`→`SLOT_PDPT`→`SLOT_PD`→`SLOT_PT`)
+/// rather than re-walking the shared kernel half for every slot, folding the three intermediates into
+/// each leaf exactly as hardware would. Returns `(leaves, violations)`.
+///
+/// This is the enforcement half of the audit: it runs on every `alloc_user_space`, so no ring-3
+/// address space in this kernel is ever dispatched without its W^X shape having been verified against
+/// the LIVE table bytes — not against the constants `build_slot` intended to write.
+pub fn wx_check_slot(s: usize) -> (u32, u32) {
+    assert!(s < USER_SLOTS, "wx_check_slot: slot out of range");
+    let nxe = efer_nxe();
+    let ui = pml4_index(super::syscall::USER_BASE);
+    // SAFETY: the slot tables are `.bss` arrays, identity-mapped; reads only.
+    let (e4, e3, e2) = unsafe {
+        (
+            *slot_pml4_ptr(s).add(ui),
+            *slot_pdpt_ptr(s).add(pdpt_index(super::syscall::USER_BASE)),
+            *slot_pd_ptr(s).add(pd_index(super::syscall::USER_BASE)),
+        )
+    };
+    if e4 & PTE_PRESENT == 0 || e3 & PTE_PRESENT == 0 || e2 & PTE_PRESENT == 0 {
+        return (0, 0); // window not built — nothing ring-3-reachable to violate
+    }
+    let acc = wx_fold(wx_fold(wx_fold(WX_TOP, e4), e3), e2);
+    let (mut leaves, mut viol) = (0u32, 0u32);
+    for l in 0..512 {
+        // SAFETY: as above — the slot PT is an identity-mapped `.bss` page.
+        let e1 = unsafe { *slot_pt_ptr(s).add(l) };
+        if e1 & PTE_PRESENT == 0 {
+            continue;
+        }
+        leaves += 1;
+        let f = wx_fold(acc, e1);
+        if f.0 && wx_violates(f, nxe) {
+            viol += 1;
+        }
+    }
+    assert!(
+        viol == 0,
+        "WXAUDIT: ring-3 window of slot {} has {} page(s) both writable and executable",
+        s,
+        viol
+    );
+    let n = WX_SLOTS_CHECKED.fetch_add(1, Ordering::Relaxed) + 1;
+    if !WX_SLOT_LOGGED.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            ":: WXAUDIT-SLOT: ring-3 window W^X verified (slot {}, leaves={}, wx=0, nxe={}) ::",
+            s,
+            leaves,
+            nxe as u8
+        );
+    }
+    let _ = n;
+    (leaves, viol)
+}
+
+/// Ring-3 address spaces cleared by `wx_check_slot` so far (for a later spec/witness rollup).
+pub fn wx_slots_checked() -> u32 {
+    WX_SLOTS_CHECKED.load(Ordering::Relaxed)
+}
+
+/// **The armed-proof line.** Run the negative control, then audit the live kernel map and publish
+/// both. Called once from `arch::init` after `syscall::init` has set EFER.NXE and CR4.SMEP, so the
+/// numbers describe an actually-enforcing kernel. Panics if a ring-3-reachable page is W∧X.
+pub fn wx_audit_report() {
+    if wx_selftest() {
+        serial_println!(
+            ":: WXAUDIT-0: classifier fires on W+X, clears RO-X, honours parent NX, voids on NXE=0 -> PASS ::"
+        );
+    } else {
+        serial_println!(":: WXAUDIT-0: classifier negative control FAILED -> FAIL ::");
+        panic!("WXAUDIT: the W^X classifier failed its own negative control — the audit is not trustworthy");
+    }
+    // Cost, measured rather than assumed: this walk is now on every boot, in a kernel whose last
+    // several arcs were spent buying back boot milliseconds. Raw rdtsc (the APIC/PM-timer rate
+    // calibration has not run this early, so cycles is the only honest unit here).
+    let t0 = super::now_cycles();
+    let a = wx_audit_root(cr3_table() as u64);
+    let cycles = super::now_cycles().wrapping_sub(t0);
+    serial_println!(
+        ":: WXAUDIT x86: leaves={} user={} user_WX={} kern_WX={} ({} MiB) tables={} nxe={} walk={}kcyc{} ::",
+        a.leaves,
+        a.user_leaves,
+        a.user_wx,
+        a.kern_wx,
+        a.kern_wx_bytes / (1024 * 1024),
+        a.tables,
+        a.nxe as u8,
+        cycles / 1000,
+        if a.truncated { " TRUNCATED" } else { "" }
+    );
+    assert!(
+        a.user_wx == 0,
+        "WXAUDIT: {} ring-3-reachable page(s) are both writable and executable",
+        a.user_wx
+    );
 }
 
 // =================================================================================================
