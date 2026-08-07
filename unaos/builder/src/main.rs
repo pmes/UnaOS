@@ -145,6 +145,7 @@ fn main() {
     if std::env::var("UNAOS_KEPLER").is_ok() { feats.push("nvidia-kepler"); }
     if std::env::var("UNAOS_KEPLER_TAKEOVER").is_ok() { feats.push("nvidia-kepler-takeover"); }
     if std::env::var("UNAOS_KEPLER_FIFO").is_ok() { feats.push("nvidia-kepler-fifo"); }
+    if std::env::var("UNAOS_KDISP_HOLD").is_ok() { feats.push("nvidia-kepler-kdisp-hold"); }
     // WC-X86: UNAOS_WC=1 arms the window compositor on the x86 panel path (video/wcx.rs) — activated
     // at the END of the Kepler takeover seam, after `fbcon::panel_console_resume`. x86_64-only
     // module; DEFAULT OFF => module + call site unlinked => byte-identical media. Needs

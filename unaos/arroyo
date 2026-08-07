@@ -228,6 +228,7 @@ _feats=""
 [ -n "${UNAOS_KEPLER:-}" ] && _feats="${_feats}nvidia-kepler,"
 [ -n "${UNAOS_KEPLER_TAKEOVER:-}" ] && _feats="${_feats}nvidia-kepler-takeover,"
 [ -n "${UNAOS_KEPLER_FIFO:-}" ] && _feats="${_feats}nvidia-kepler-fifo,"
+[ -n "${UNAOS_KDISP_HOLD:-}" ] && _feats="${_feats}nvidia-kepler-kdisp-hold,"
 # WC-X86: UNAOS_WC=1 arms the window compositor on the x86 panel path (video/wcx.rs) — it activates
 # at the END of the Kepler takeover seam, reserves a provisional console band and opens one
 # kernel-drawn demo window. x86_64-only module; DEFAULT OFF => the module and its single call site

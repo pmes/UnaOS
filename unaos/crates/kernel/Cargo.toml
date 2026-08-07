@@ -10,6 +10,7 @@ default = []
 nvidia-kepler = []
 nvidia-kepler-takeover = []
 nvidia-kepler-fifo = []
+nvidia-kepler-kdisp-hold = []
 # WC-X86: bring the window compositor (`video::wm`) up on the x86 panel path. Compiles
 # `video/wcx.rs` — the activation seam and the one kernel-drawn demo window — plus fbcon's
 # CONSOLE-WINDOW route (`panel_console_window_open`: the kernel console becomes an ordinary row in

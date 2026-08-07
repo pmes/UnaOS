@@ -394,32 +394,36 @@ pub unsafe fn takeover_display(
         gop_vram_offset, total_bytes, gop_vram_offset, gop_bytes);
 
     // 1.12 s hold (standing length — Peter's camera calibration, s21)
-    serial_println!(":: kdisp: fb-draw hold begin (photo A — full panel calibration) ::");
-    for t in 1..=5 {
-        for _ in 0..60_000_000 { core::hint::spin_loop(); }
-        serial_println!(":: kdisp: fb-draw hold t={}/5 (1.12s total) ::", t);
-        // Dump on the FIRST and LAST tick
-        if t == 1 || t == 5 {
-            serial_println!(":: kdisp: fb-draw reg-dump t={} ptr={:08X} ptr_hi={:08X} size={:08X} store={:08X} fmt={:08X} ::",
-                t,
-                mmio_read(bar0, 0x640460),
-                mmio_read(bar0, 0x640464),
-                mmio_read(bar0, 0x640468),
-                mmio_read(bar0, 0x64046C),
-                mmio_read(bar0, 0x640470));
-            serial_println!(":: kdisp: fb-draw reg-dump t={} armed={:08X} shadow={:08X} ::",
-                t, mmio_read(bar0, armed_reg), mmio_read(bar0, shadow_reg));
-            for off in (0x4B8..=0x4C8).step_by(4) {
-                serial_println!(":: kdisp: fb-draw reg-dump off={:03X} val={:08X} ::", off, mmio_read(bar0, 0x640000 + off));
-            }
-            // Which head is actually live: the one whose vline/vblank advances.
-            for h in 0..4usize {
-                let vert = mmio_read(bar0, 0x610000 + 0x6000 + h * 0x800 + 0x340);
-                serial_println!(":: kdisp: fb-draw head-stat t={} h={} vert={:08X} ::", t, h, vert);
+    // Predictions with hold off: kepler=1521 -> ~400 ms, gui=3408 -> ~2290 ms — which would be the largest single boot win left on the machine.
+    #[cfg(feature = "nvidia-kepler-kdisp-hold")]
+    {
+        serial_println!(":: kdisp: fb-draw hold begin (photo A — full panel calibration) ::");
+        for t in 1..=5 {
+            for _ in 0..60_000_000 { core::hint::spin_loop(); }
+            serial_println!(":: kdisp: fb-draw hold t={}/5 (1.12s total) ::", t);
+            // Dump on the FIRST and LAST tick
+            if t == 1 || t == 5 {
+                serial_println!(":: kdisp: fb-draw reg-dump t={} ptr={:08X} ptr_hi={:08X} size={:08X} store={:08X} fmt={:08X} ::",
+                    t,
+                    mmio_read(bar0, 0x640460),
+                    mmio_read(bar0, 0x640464),
+                    mmio_read(bar0, 0x640468),
+                    mmio_read(bar0, 0x64046C),
+                    mmio_read(bar0, 0x640470));
+                serial_println!(":: kdisp: fb-draw reg-dump t={} armed={:08X} shadow={:08X} ::",
+                    t, mmio_read(bar0, armed_reg), mmio_read(bar0, shadow_reg));
+                for off in (0x4B8..=0x4C8).step_by(4) {
+                    serial_println!(":: kdisp: fb-draw reg-dump off={:03X} val={:08X} ::", off, mmio_read(bar0, 0x640000 + off));
+                }
+                // Which head is actually live: the one whose vline/vblank advances.
+                for h in 0..4usize {
+                    let vert = mmio_read(bar0, 0x610000 + 0x6000 + h * 0x800 + 0x340);
+                    serial_println!(":: kdisp: fb-draw head-stat t={} h={} vert={:08X} ::", t, h, vert);
+                }
             }
         }
+        serial_println!(":: kdisp: fb-draw hold end ::");
     }
-    serial_println!(":: kdisp: fb-draw hold end ::");
 
     // Pull 20: Draw console-like glyph blocks using the true 16384 pitch
     for y in 64..72 {
