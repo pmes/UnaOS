@@ -86,6 +86,7 @@ pub mod instgui;
 pub use framebuffer::FrameBuffer;
 pub use screen::Screen;
 
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use spin::Mutex;
 use unaos_boot_info::FrameBufferInfo;
 
@@ -115,4 +116,129 @@ pub fn init_panel(base: usize, len: usize, info: FrameBufferInfo) {
     surface.fill_screen(PANEL_BG);
 
     serial_println!(":: Framebuffer painted #1E1E1E ::");
+}
+
+// ---------------------------------------------------------------------------------------------
+// EDID-CARRY — the panel's own descriptor, from firmware to the display lane.
+//
+// The UEFI bootloader has always read the panel's EDID (EFI_EDID_ACTIVE_PROTOCOL, falling back to
+// EFI_EDID_DISCOVERED_PROTOCOL) and then thrown the bytes away, keeping only the native width and
+// height for the mode-selection branch. Width and height cannot program a display pipe: the pixel
+// clock and the h/v blanking and sync numbers live in the block and were discarded with it. The
+// bootloader now carries the 128-byte base block through `BootInfo::edid_block`; this module is
+// where it lands, is checked, and is published.
+//
+// The block is stored raw and validated on the way out, so the wire and the consumers disagree
+// only in the direction that is safe: [`init_edid`]'s witness line reports exactly what arrived
+// (including a bad header or a bad checksum), while [`edid_block`] — the accessor a mode-set is
+// meant to build on — returns nothing unless the block passed both checks.
+// ---------------------------------------------------------------------------------------------
+
+/// EDID 1.x fixed header pattern — the first eight bytes of every base block.
+const EDID_HEADER: [u8; 8] = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+
+/// The raw base block as it arrived from the bootloader. `None` until [`init_edid`] runs, and after
+/// it whenever the firmware exposed no EDID at all.
+static EDID_BLOCK: Mutex<Option<[u8; 128]>> = Mutex::new(None);
+
+/// Set only when the stored block's header magic AND 128-byte checksum both passed.
+static EDID_OK: AtomicBool = AtomicBool::new(false);
+
+/// The firmware-reported size of the whole EDID in bytes (0 = none). Greater than 128 means
+/// extension blocks exist and were NOT carried — only the base block is.
+static EDID_TOTAL_LEN: AtomicU16 = AtomicU16::new(0);
+
+/// The panel's EDID base block, or `None` if this boot has no trustworthy one.
+///
+/// **This is the supported reader.** `BootInfo` is consumed by `arch::memory::init` early in
+/// `kernel_main`, so after that point nothing but this static can answer the question.
+///
+/// Fail-closed: the 128 bytes come back only when the EDID header magic matched and the block's
+/// bytes summed to 0 mod 256. `None` therefore means one of — no EDID protocol on the firmware's
+/// GOP handle, a non-UEFI boot (aarch64 bare-metal), a bad header, or a bad checksum. Which one it
+/// was is on the serial wire, in [`init_edid`]'s `:: video: edid ... ::` line; use
+/// [`edid_block_raw`] if the bytes themselves are what you need to look at.
+///
+/// **For the iGPU display lane (Flight 1c).** The bytes are the EDID BASE block, verbatim. The
+/// offsets a mode-set wants, all inside the first Detailed Timing Descriptor at `[54..72]`:
+/// `[54..56]` pixel clock in 10 kHz units, little-endian (0 there means the descriptor is a monitor
+/// descriptor, not a timing); `[56]`/`[58]>>4` horizontal active; `[57]`/`[58]&0xF` horizontal
+/// blanking; `[59]`/`[61]>>4` vertical active; `[60]`/`[61]&0xF` vertical blanking; `[62..66]` the
+/// four sync numbers (h offset, h width, then v offset and v width as the two nibbles of `[64]`,
+/// with every high bit pair packed into `[65]`). Byte `[126]` is the extension-block count — see
+/// [`edid_total_len`] for whether any existed.
+///
+/// This block is the FIRMWARE's view of the panel. A rung-3 I2C-over-AUX read talks to the panel
+/// directly; the two agreeing is a result, and the two disagreeing is a finding.
+pub fn edid_block() -> Option<[u8; 128]> {
+    if !EDID_OK.load(Ordering::Relaxed) {
+        return None;
+    }
+    *EDID_BLOCK.lock()
+}
+
+/// The EDID base block exactly as it was carried, **without** the header/checksum gate that
+/// [`edid_block`] applies. For diagnosis only: a block that reaches here but not `edid_block` is
+/// one whose own integrity checks failed, and nothing may be programmed into a display pipe from it.
+pub fn edid_block_raw() -> Option<[u8; 128]> {
+    *EDID_BLOCK.lock()
+}
+
+/// The firmware-reported size of the whole EDID in bytes; 0 when none was read. A value above 128
+/// means the panel published extension blocks (CEA-861 timings and the like) which this path does
+/// NOT carry — only the base block crosses `BootInfo`.
+pub fn edid_total_len() -> u16 {
+    EDID_TOTAL_LEN.load(Ordering::Relaxed)
+}
+
+/// Publish the panel's EDID base block from `BootInfo`, and witness it.
+///
+/// Called from `kernel_main` alongside the framebuffer handoff, before `arch::memory::init`
+/// consumes `BootInfo`, on both arches and in every build. The one serial line it prints is the
+/// only independent statement of what the firmware knew about the panel, and it is written so that
+/// it can say NO: `present=0` when nothing was carried, `hdr=BAD` when the 128 bytes are not an
+/// EDID base block, `sum=BAD` when they are one but corrupt. On QEMU, where no EDID protocol is
+/// published, `present=0` is the expected reading and is not a fault.
+///
+/// `valid` is the bootloader's "I copied 128 bytes from firmware" flag — it says nothing about the
+/// content, which is what this function is here to check.
+pub fn init_edid(block: &[u8; 128], valid: bool, total_len: u16) {
+    if !valid {
+        serial_println!(":: video: edid present=0 hdr=- sum=- native=- len=0 ::");
+        return;
+    }
+
+    let hdr_ok = block[0..8] == EDID_HEADER;
+    // EDID 1.x §3.1: the 128 bytes of the base block sum to 0 mod 256, checksum byte included.
+    let sum_ok = block.iter().fold(0u8, |acc, b| acc.wrapping_add(*b)) == 0;
+
+    // First Detailed Timing Descriptor, offset 54. A zero pixel clock marks it a monitor descriptor
+    // rather than a timing, and then there is no native mode to report.
+    let d = &block[54..72];
+    let pclk_khz = ((d[0] as u32) | ((d[1] as u32) << 8)) * 10;
+    let (nat_w, nat_h) = if pclk_khz == 0 {
+        (0u32, 0u32)
+    } else {
+        (
+            (d[2] as u32) | (((d[4] as u32) >> 4) << 8),
+            (d[5] as u32) | (((d[7] as u32) >> 4) << 8),
+        )
+    };
+    let ext = block[126];
+
+    *EDID_BLOCK.lock() = Some(*block);
+    EDID_OK.store(hdr_ok && sum_ok, Ordering::Relaxed);
+    EDID_TOTAL_LEN.store(total_len, Ordering::Relaxed);
+
+    let yn = |b: bool| if b { "OK" } else { "BAD" };
+    serial_println!(
+        ":: video: edid present=1 hdr={} sum={} native={}x{} pclk_khz={} ext={} len={} ::",
+        yn(hdr_ok),
+        yn(sum_ok),
+        nat_w,
+        nat_h,
+        pclk_khz,
+        ext,
+        total_len
+    );
 }

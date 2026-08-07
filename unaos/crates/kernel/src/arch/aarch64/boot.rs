@@ -1126,6 +1126,13 @@ static mut BOOT_INFO: BootInfo = BootInfo {
     edid_native_height: 0,
     edid_source: 0,
     mode_action: 0,
+    // EDID-CARRY: the Pi 4 bare-metal path never runs the UEFI bootloader, so there is no EDID
+    // protocol to read — the VideoCore mailbox hands over a framebuffer, not a panel descriptor.
+    // `edid_block_valid: false` is the absent sentinel: `video::init_edid` prints `present=0` and
+    // publishes nothing, rather than letting 128 zero bytes pass for a panel.
+    edid_block: [0; 128],
+    edid_block_valid: false,
+    edid_total_len: 0,
     // INSTALL-SELF: aarch64 does not boot through the UEFI bootloader that reads its own ESP's FAT
     // volume serial, so the boot volume is unidentified here. 0 is the absent sentinel; the
     // installer's boot-device guard disarms on it (with a witness line) rather than guessing.

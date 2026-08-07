@@ -157,6 +157,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // 0a2. EDID-CARRY. The UEFI bootloader reads the panel's EDID (ACTIVE protocol, then
+    //      DISCOVERED) to pick the display mode, and until now kept only the native width and
+    //      height out of it — the pixel clock and the h/v blanking and sync numbers, which is what
+    //      programming a display pipe actually needs, were read and dropped inside the bootloader.
+    //      `BootInfo::edid_block` now carries the 128-byte base block, and this is where it is
+    //      published (`video::edid_block()`) and witnessed.
+    //
+    //      UNCONDITIONAL, on both arches and every build, for the same reason the WRITER seed above
+    //      is: a panel descriptor that exists only under one feature flag cannot be read from a
+    //      metal capture of the build that is actually flown. It must also be able to say NO — on
+    //      QEMU and on the Pi's bare-metal path there is no EDID protocol at all, and the line
+    //      prints `present=0` there. Runs before `arch::memory::init` consumes `boot_info`.
+    unaos_kernel::video::init_edid(
+        &boot_info.edid_block,
+        boot_info.edid_block_valid,
+        boot_info.edid_total_len,
+    );
+
     // 0b. Jetson Orin Nano (tegra): install the kernel's own MMU (JM3), bring up the GIC + timer on the
     //     boot core (JM4), then drop EL2 -> EL1 and run the scheduler + CAPSTONE at EL1 (JM6). The
     //     UEFI-handoff tables map RAM but NOT the Tegra peripheral MMIO (JM2 R4: the kernel faulted on its

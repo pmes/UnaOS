@@ -32,6 +32,18 @@ struct EdidDiscoveredProtocol {
     edid: *const u8,
 }
 
+/// EDID 1.x fixed header pattern — the first eight bytes of every base block.
+const EDID_HEADER: [u8; 8] = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+
+/// EDID-CARRY: one firmware EDID read — the 128-byte base block copied out of the firmware's buffer,
+/// which protocol produced it, and the size the firmware reported for the WHOLE EDID (greater than
+/// 128 means extension blocks exist; only the base block is carried to the kernel).
+struct EdidRead {
+    block: [u8; 128],
+    source: u32,
+    total_len: u32,
+}
+
 /// Parse the monitor's native (preferred) resolution from a raw EDID block: the first Detailed
 /// Timing Descriptor (offset 54). `None` if the block is too short/malformed or that descriptor is
 /// actually a monitor descriptor (zero pixel clock) rather than a timing.
@@ -39,8 +51,7 @@ fn parse_edid_native(bytes: &[u8]) -> Option<(usize, usize)> {
     if bytes.len() < 128 {
         return None;
     }
-    // EDID 1.x fixed header pattern.
-    if bytes[0..8] != [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00] {
+    if bytes[0..8] != EDID_HEADER {
         return None;
     }
     let d = &bytes[54..72];
@@ -56,29 +67,72 @@ fn parse_edid_native(bytes: &[u8]) -> Option<(usize, usize)> {
     Some((w, h))
 }
 
-/// Read the monitor's native resolution from EDID on `handle`, trying the ACTIVE then DISCOVERED
-/// protocol. `None` if no EDID is exposed — callers then fall back to the firmware's current mode.
-/// Returns `(width, height, source)` where source is 1 = ACTIVE protocol, 2 = DISCOVERED protocol.
-fn edid_native_resolution(handle: uefi::Handle) -> Option<(usize, usize, u32)> {
-    // Safety: the firmware owns the EDID buffer; it's valid while boot services are live (we read
-    // it now, before exit_boot_services). `size_of_edid` is the firmware-reported length.
+/// EDID-CARRY: copy the 128-byte base block out of a firmware EDID buffer. `None` unless the
+/// pointer is non-null and the firmware reports at least one full base block — the same two
+/// preconditions the native-resolution read has always applied. Nothing here judges the CONTENT;
+/// the header and checksum are the kernel's witness to report (`video::init_edid`).
+///
+/// # Safety
+/// `ptr`/`size` must be a firmware EDID buffer from a live EDID protocol instance. The firmware
+/// owns the memory and it is valid only while boot services are live, so this must run before
+/// `exit_boot_services` — which is where the one call site sits.
+unsafe fn edid_copy_base(ptr: *const u8, size: u32, source: u32) -> Option<EdidRead> {
+    if ptr.is_null() || size < 128 {
+        return None;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, 128) };
+    let mut block = [0u8; 128];
+    block.copy_from_slice(bytes);
+    Some(EdidRead { block, source, total_len: size })
+}
+
+/// How good a candidate block is: 2 = header valid AND the first Detailed Timing Descriptor decodes
+/// (exactly what the mode-selection path has always demanded of an EDID), 1 = header valid only,
+/// 0 = the firmware handed us 128 bytes that are not an EDID base block.
+fn edid_rank(block: &[u8; 128]) -> u8 {
+    if parse_edid_native(block).is_some() {
+        2
+    } else if block[0..8] == EDID_HEADER {
+        1
+    } else {
+        0
+    }
+}
+
+/// Read the panel's EDID base block on `handle`, trying ACTIVE then DISCOVERED and keeping the
+/// higher-ranked block (ACTIVE wins a tie — the pre-existing preference: the EDID the firmware is
+/// actually using, before the one it merely discovered).
+///
+/// `None` if neither protocol is present — callers then fall back to the firmware's current mode.
+/// Mode selection is unchanged by construction: a rank-2 block is returned in preference to
+/// everything else and is the only kind `parse_edid_native` accepts, so the native resolution this
+/// still yields is byte-for-byte the one the old `edid_native_resolution` yielded. What is new is
+/// that a rank-1/rank-0 block is now CARRIED instead of dropped, so the kernel can say on the wire
+/// that the firmware published something that is not a usable EDID.
+fn read_edid(handle: uefi::Handle) -> Option<EdidRead> {
+    let mut best: Option<EdidRead> = None;
+    let mut best_rank: u8 = 0;
+
+    // Safety (both blocks): `size_of_edid`/`edid` are the firmware's own buffer descriptor, read
+    // here while boot services are live (this runs before exit_boot_services).
     if let Ok(p) = boot::open_protocol_exclusive::<EdidActiveProtocol>(handle) {
-        if !p.edid.is_null() && p.size_of_edid >= 128 {
-            let bytes = unsafe { core::slice::from_raw_parts(p.edid, p.size_of_edid as usize) };
-            if let Some((w, h)) = parse_edid_native(bytes) {
-                return Some((w, h, 1));
+        if let Some(r) = unsafe { edid_copy_base(p.edid, p.size_of_edid, 1) } {
+            let rank = edid_rank(&r.block);
+            if rank == 2 {
+                return Some(r); // nothing DISCOVERED can beat a fully-decoding ACTIVE block
             }
+            best_rank = rank;
+            best = Some(r);
         }
     }
     if let Ok(p) = boot::open_protocol_exclusive::<EdidDiscoveredProtocol>(handle) {
-        if !p.edid.is_null() && p.size_of_edid >= 128 {
-            let bytes = unsafe { core::slice::from_raw_parts(p.edid, p.size_of_edid as usize) };
-            if let Some((w, h)) = parse_edid_native(bytes) {
-                return Some((w, h, 2));
+        if let Some(r) = unsafe { edid_copy_base(p.edid, p.size_of_edid, 2) } {
+            if best.is_none() || edid_rank(&r.block) > best_rank {
+                best = Some(r);
             }
         }
     }
-    None
+    best
 }
 
 /// INSTALL-SELF: parse a FAT `BS_VolID` (volume serial) out of a candidate boot sector.
@@ -409,6 +463,10 @@ fn main() -> Status {
     let mut edid_native_h: u32 = 0;
     let mut edid_source: u32 = 0;
     let mut mode_action: u32 = 0;
+    // EDID-CARRY: the raw base block itself, on its way to the kernel (see BootInfo::edid_block).
+    let mut edid_block: [u8; 128] = [0; 128];
+    let mut edid_block_valid: bool = false;
+    let mut edid_total_len: u16 = 0;
 
     'gop: {
         // Acquire the GraphicsOutput protocol. On firmware that publishes no GOP at all — a headless
@@ -478,15 +536,34 @@ fn main() -> Status {
             log::info!("  GOP mode: {}x{} stride={} fmt={:?}", w, h, mi.stride(), mi.pixel_format());
         }
 
-        // The monitor's native resolution from EDID, if the firmware exposes it.
-        let edid = edid_native_resolution(gop_handle);
-        let native = edid.map(|(w, h, _)| (w, h));
-        match edid {
-            Some((w, h, s)) => {
-                edid_native_w = w as u32;
-                edid_native_h = h as u32;
-                edid_source = s;
-                log::info!("EDID: monitor native resolution {}x{} (source {})", w, h, s);
+        // The panel's EDID, if the firmware exposes it: the raw base block goes to the kernel via
+        // BootInfo (EDID-CARRY), and the native resolution parsed out of it drives mode selection
+        // below exactly as before.
+        let edid = read_edid(gop_handle);
+        let native = edid.as_ref().and_then(|r| parse_edid_native(&r.block));
+        match &edid {
+            Some(r) => {
+                edid_block = r.block;
+                edid_block_valid = true;
+                edid_total_len = r.total_len.min(u16::MAX as u32) as u16;
+                edid_source = r.source;
+                match native {
+                    Some((w, h)) => {
+                        edid_native_w = w as u32;
+                        edid_native_h = h as u32;
+                        log::info!(
+                            "EDID: {} bytes from source {}; monitor native resolution {}x{}",
+                            r.total_len, r.source, w, h
+                        );
+                    }
+                    // Carried anyway: the kernel's witness names what is wrong with it, which is
+                    // strictly more than the silence this used to produce.
+                    None => log::info!(
+                        "EDID: {} bytes from source {} but no usable preferred timing; \
+                         carrying the raw block, using the firmware's current mode",
+                        r.total_len, r.source
+                    ),
+                }
             }
             None => log::info!("EDID: not available; using the firmware's current mode"),
         }
@@ -854,6 +931,9 @@ fn main() -> Status {
         edid_native_height: edid_native_h,
         edid_source,
         mode_action,
+        edid_block,
+        edid_block_valid,
+        edid_total_len,
         boot_volume_serial,
         #[cfg(feature = "unaos_ivb")]
         igpu_trace_0: t0,
